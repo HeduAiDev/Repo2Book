@@ -21,8 +21,11 @@ class ReviewerAgent(BaseAgent):
     """Agent-4: Reviews from a zero-background reader perspective."""
 
     REVIEW_DIMENSIONS = [
-        "source_grounding",           # v2: vLLM源码根基 — auto-REJECT if missing
-        "formula_renderability",      # v1: 公式可渲染性 — auto-REJECT on failure
+        "code_walkthrough",           # v6: 源码手撕 — auto-REJECT if no code section
+        "chapter_structure",          # v6: 章节结构 — auto-REJECT on duplicate IDs
+        "algorithm_comprehension",    # v3: 0基础算法可理解性
+        "source_grounding",           # v2: vLLM源码根基
+        "formula_renderability",      # v1: 公式可渲染性
         "coherence",
         "readability",
         "engagement",

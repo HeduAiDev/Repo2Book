@@ -78,10 +78,28 @@ Every significant function in our implementation must map to a specific vLLM fun
 - The real API surface (same method names and signatures as vLLM where possible)
 - The real data structures (BlockTable, slot_mapping, block_table tensor)
 - The real interaction pattern with attention (block_table passed to kernel)
+- **CRITICAL: Implementation language MUST match the vLLM source language.**
+  If vLLM uses CUDA (`csrc/attention/attention_kernels.cuh`) → implement in Triton (educational, vLLM-production-relevant) or simplified CUDA.
+  If vLLM uses Triton (`triton_decode_attention.py`) → implement in Triton.
+  If vLLM uses Python (`block_pool.py`) → implement in Python.
+  **NEVER implement in Python what vLLM implements in CUDA/Triton.** The reader
+  must see the actual kernel structure — thread blocks, warps, shared memory.
+- **CRITICAL: The implementation must be RUNNABLE and produce the same output as the vLLM reference.**
 - At minimum explain (and ideally implement a simplified version of):
   - Block allocation strategy
   - Eviction / retention policy
   - How the scheduler triggers allocation and free
+
+### Code Walkthrough Requirement (NEW — v2)
+For every algorithm described in the chapter, the implementation MUST include a working
+Python script that the reader can run and step through. The Writer will use this script
+to produce a line-by-line code walkthrough.
+
+The implementation must:
+1. Have clear function names matching vLLM's naming
+2. Include print statements or logging showing intermediate values (m, l, correction, O_acc)
+3. Be runnable with `python3 implementation/{module}.py` to produce annotated output
+4. Serve as the bridge between the chapter's theory and vLLM's production CUDA code
 
 ### What We May Simplify
 - CUDA kernel internals → Python reference + Triton educational kernel

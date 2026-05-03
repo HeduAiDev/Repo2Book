@@ -22,6 +22,61 @@ navigate vLLM's codebase with confidence?**
 Both must be true. A section that is ALL source references with no theory is just
 as bad as a section that is ALL theory with no source references.
 
+## CRITICAL: Zero-Basis Algorithm Explanation Rule
+
+When explaining a complex algorithm (FlashAttention, PagedAttention, Online Softmax,
+Ring Attention, etc.), you MUST assume the reader has NEVER seen it before.
+
+**For EVERY non-trivial algorithm, your section MUST include ALL of:**
+
+1. **Tiling Visualization (MANDATORY for tiled algorithms):**
+   - Show how the input is split into tiles/blocks with a concrete diagram
+   - **Diagram method: invoke the `svg-diagram` skill.**
+     Call `Skill(skill="svg-diagram", args="<describe the diagram needed>")`.
+     The skill handles: Python→SVG generation, xmllint validation, PNG conversion.
+     Reference the output `.png` in markdown.
+     NO manual coordinate calculation, NO Excalidraw, NO Mermaid for dense graphs.
+     Two built-in patterns: tiling (many-to-many connections) and state-table (value evolution).
+   - For numerical traces only → **Markdown tables** (most precise, no diagram needed).
+   - For simple flows (≤5 nodes) → Mermaid is acceptable as lightweight alternative.
+   - Use a small concrete size (e.g., L=12, BLOCK=4) that the reader can trace mentally
+   - NEVER jump from "Q [L×d]" to "for each Q block" without drawing the tiling pattern
+
+2. **Step-by-Step Numerical Trace (MANDATORY):**
+   - Pick concrete numbers (e.g., "3 KV tiles, S₀=[2.0, 1.0, 0.5, 3.0]")
+   - Walk through EVERY variable update for at least 2 full iterations
+   - Show intermediate values: m, l, P, correction, O_acc at each step
+   - The reader should be able to reproduce the calculation with pencil and paper
+
+3. **Mathematical Proof (MANDATORY for any algorithm with non-obvious correctness):**
+   - After the numerical trace, provide a FORMAL proof that the algorithm is correct
+   - Use mathematical induction where applicable (e.g., online softmax, prefix scan)
+   - **Every equation must be surrounded by plain-language explanation.** Pattern:
+     * Before the equation: "What are we trying to compute here? Why?"
+     * The equation
+     * After the equation: "What just happened? Each term means..."
+   - **Always provide intuition before formal symbols.** Start each proof step with
+     a one-sentence intuitive summary (e.g., "情况 B 的本质：之前的 max 错了，现在发现了正确的 max，需要把旧结果缩小")
+   - **Translate key algebraic steps into plain language.** Example:
+     * "这一步用了 exp 的性质：e^{a-b} · e^{b-c} = e^{a-c}"
+     * "correction = 0.368 意味着：旧结果整体缩小到原来的 37%"
+   - **End each proof with a takeaway.** "所以 Online Softmax 是精确算法，不是近似。"
+   - The proof should be readable by someone who skips the equations and reads only the text.
+   - A numerical trace alone is NOT sufficient — it demonstrates HOW, not WHY
+
+4. **Memory/Compute Quantification (MANDATORY for systems chapters):**
+   - After explaining the algorithm, quantify the costs
+   - HBM reads, HBM writes, SRAM usage per tile, total HBM traffic
+   - Compare against naive baseline with concrete numbers
+   - NEVER use vague terms like "much faster" — give ratios and absolute bytes
+
+**Anti-patterns for algorithm explanation (auto-REJECT by Reviewer):**
+- ❌ "FlashAttention computes attention in tiles" — without showing the tiling pattern
+- ❌ "K and V are re-read L/BLOCK times" — without first establishing what BLOCK is and why
+- ❌ Jumping from math notation to CUDA kernel without a numerical trace in between
+- ❌ Using the algorithm's final optimized form without showing the naive version first
+- ❌ "The online softmax algorithm is [pseudocode]" — without walking through 2+ iterations with numbers
+
 **Pattern for every major section:**
 ```
 1. 打开 vllm/xxx.py:L123 → ClassName.method()     ← Source Trail (入口)
@@ -45,6 +100,68 @@ it is WRONG. Rewrite it.
 3. The vLLM source files referenced in impl-notes.md
 
 Your chapter narrative must bridge these three: **vLLM source → our reimplementation → reader's understanding.**
+
+## CRITICAL: 源码手撕 (Code Walkthrough) — MANDATORY, NOT OPTIONAL
+
+**本书的核心价值是"手撕源码"——读者要用代码理解原理，不是读概念描述。**
+每一章如果只有理论没有走读实现代码，这章就是废的。Implementer 的存在意义就是
+为 Writer 提供可走读的实现。
+
+### 硬性要求
+
+**每一个算法/机制，章节必须包含以下三个环节：**
+
+1. **我们的实现（源码走读）：** 逐行解释 Implementer 产出的代码。引用具体文件、
+   行号、变量名。读者要能对着代码看。不允许只说概念不说代码。
+
+2. **运行验证：** 展示运行实现代码的实际输出。`python3 implementation/xxx.py` 的
+   stdout 直接贴在章节里。数值要和理论部分的数值 trace 一致。
+
+3. **与官方实现的差异分析：** 解释我们的实现和 vLLM 源码的区别——我们简化了什么、
+   保留了什"么、为什么简化。不允许只说"我们的实现"而不提官方的不同。
+
+### 如果代码不符合写作要求
+
+Writer 有权要求 Implementer 重写实现。如果发现以下情况，**必须要求 Implementer 修改**：
+- 实现语言与 vLLM 源码不匹配（vLLM 用 CUDA/Triton，实现用纯 Python）
+- 实现缺少关键中间变量的输出（m, l, correction 等）
+- 函数命名与 vLLM 不一致（读者无法对照源码）
+- 实现缺少 `# REFERENCE:` 注释（读者不知道对应哪行 vLLM 代码）
+- 实现无法直接 `python3` 运行并产出有意义的输出
+
+要求方式：在 impl-notes.md 或 narrative 中写明 "Implementer 需要补充: ..."，
+并列出具体修改要求。
+
+### 代码走读模板
+
+```
+## 代码走读 / Code Walkthrough
+
+> 在看 vLLM 源码之前，先看我们的简化实现。
+> 运行 `python3 implementation/fused_attention_demo.py`：
+
+[贴实际运行输出]
+
+### 核心循环 (implementation/fused_attention_demo.py:L45-L78)
+
+```python
+# 对应 vLLM: csrc/attention/attention_kernels.cuh:L85-L490
+for kv_block in range(num_kv_blocks):
+    phys = block_table[seq_idx, kv_block]   # ← L49: PA indirection
+    K_blk = K_cache[phys]                    # ← L50: load from non-contiguous block
+    ...
+```
+
+逐行解释...
+
+### 与 vLLM 官方实现的差异
+
+| 我们的实现 | vLLM 源码 | 差异原因 |
+|---|---|---|
+| Python for loop | CUDA warp-level loop (L222) | 教学清晰；warp 概念在 Triton 章节讲 |
+| 每 block 加载整个 K/V | 向量化加载 (L275-L284) | 简化内存访问；向量化是 CUDA 优化细节 |
+| ... | ... | ... |
+```
 
 ## Chapter Structure (with vLLM grounding)
 

@@ -1,5 +1,21 @@
 # vLLM Book Factory — Multi-Agent Writing System
 
+## ⛔ HARD RULE: Narrative Guardian
+
+**You (the main orchestrator) CANNOT directly write or edit any
+`artifacts/*/narrative/chapter.md` file.** These files are OWNED by the Writer agent.
+
+Every narrative edit MUST go through the Writer subagent or the Chapter Pipeline.
+If you find yourself wanting to `Edit` or `Write` a narrative file — STOP.
+Run `python3 scripts/guard_narrative.py check <chapter_id>` first.
+If locked, invoke Writer instead.
+
+**Only modify:** prompts/, agents/, pipelines/, schemas/, scripts/, CLAUDE.md, book-outline.json.
+**FORBIDDEN to modify directly:** artifacts/*/narrative/chapter.md.
+
+If the chapter quality is wrong, fix the PROMPTS, not the chapter content.
+The prompts produce the content. Fix the cause, not the symptom.
+
 Architecture: MetaGPT-style Role agents + Ralph Backpressure gates.
 本书是一套**多 Agent 协作写作系统**产生的技术书籍。每章由 4 个 Agent 串行完成。
 
@@ -105,6 +121,9 @@ Implementer ──[implementation_exists]──→
 
 ### Agent 3 — Writer (prompts/writer.md)
 - CRITICAL: Balance source grounding AND theoretical depth — NOT one or the other
+- **Diagrams: use `svg-diagram` skill.** Invoke with Skill tool: `Skill(skill="svg-diagram", args="...")`.
+  The skill encapsulates Python→SVG→xmllint→PNG workflow. NEVER use Excalidraw or Mermaid for
+  diagrams with >3 connected elements. Markdown tables for numerical data.
 - Every Cell (2-7) must have at least one `vllm/xxx.py:L123` reference
 - Chapter structure: Hook (Cell 2) → Problem Demo (3) → Theory (4) → Walkthrough (5) → Implementation (6) → Demo/Viz (7) → Source Mapping (9) → Verification (10) → Summary (11)
 - Chinese: 大白话, no 书面语. Formality spectrum per cell (see style-guide in prompts)

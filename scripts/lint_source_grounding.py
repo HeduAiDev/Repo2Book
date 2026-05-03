@@ -42,7 +42,12 @@ def lint_source_grounding(chapter_dir: str) -> dict:
             refs = vllm_ref_pattern.findall(sec)
             refs_per_section[title] = len(refs)
 
-        sections_without_refs = [t for t, n in refs_per_section.items() if n == 0]
+        # Meta sections that don't need source refs
+        meta_patterns = [r'验证', r'总结', r'这章要做什么', r'^#\s*第\d+章']
+        sections_without_refs = [
+            t for t, n in refs_per_section.items()
+            if n == 0 and not any(re.search(p, t) for p in meta_patterns)
+        ]
         if sections_without_refs:
             issues.append(
                 f"  Sections without vLLM source references: {sections_without_refs}"

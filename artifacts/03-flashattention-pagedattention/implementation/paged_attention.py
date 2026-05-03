@@ -31,6 +31,8 @@ from typing import Optional, Tuple, List
 # 3.2 HBM Traffic Analysis: Naive vs FlashAttention
 # ═══════════════════════════════════════════════════════════════════════════
 
+# REFERENCE: vllm/v1/attention/backends/flash_attn.py:L682 — FlashAttentionImpl.forward() HBM traffic
+# REFERENCE: Dao et al. "FlashAttention" (2022) — IO complexity analysis
 def calculate_hbm_traffic(
     seq_len: int, num_heads: int, head_dim: int, dtype_bytes: int = 2,
     num_layers: int = 1,
@@ -89,6 +91,8 @@ def calculate_hbm_traffic(
 # REFERENCE: csrc/attention/attention_kernels.cuh:L202, L252-L253
 # ═══════════════════════════════════════════════════════════════════════════
 
+# REFERENCE: csrc/attention/attention_kernels.cuh:L202,L252-L253 — block_table indirection
+# REFERENCE: vllm/v1/attention/ops/triton_decode_attention.py:L119-L126 — Triton decode block_table
 def paged_attention_with_block_table(
     Q: torch.Tensor,
     K_cache: torch.Tensor,
@@ -166,6 +170,8 @@ def paged_attention_with_block_table(
 # 3.5 Fused Attention + Block Table (Educational Triton-like logic)
 # ═══════════════════════════════════════════════════════════════════════════
 
+# REFERENCE: csrc/attention/attention_kernels.cuh:L85 — paged_attention_kernel (CUDA)
+# REFERENCE: vllm/v1/attention/ops/triton_unified_attention.py:L58 — unified Triton kernel
 def fused_paged_attention_tiled(
     Q: torch.Tensor,
     K_cache: torch.Tensor,
