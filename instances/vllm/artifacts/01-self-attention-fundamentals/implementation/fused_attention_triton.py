@@ -139,9 +139,13 @@ if HAS_TRITON:
         # Initialize accumulators for online softmax
         # m: row-wise max (for numerical stability)
         # l: row-wise sum of exp(scores - m) (for normalization)
-        m_i = tl.full([q_len], float("-inf"), dtype=tl.float32)
-        l_i = tl.zeros([q_len], dtype=tl.float32)
-        O_acc = tl.zeros([q_len, HEAD_DIM], dtype=tl.float32)
+        # REFERENCE: triton_prefill_attention.py:L97-L99
+        # vLLM: m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+        # Must use BLOCK_Q (constexpr) for tl.full/tl.zeros shapes,
+        # not q_len (runtime tensor). Output masking handles partial last block.
+        m_i = tl.full([BLOCK_Q], float("-inf"), dtype=tl.float32)
+        l_i = tl.zeros([BLOCK_Q], dtype=tl.float32)
+        O_acc = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.float32)
 
         # Load Q block once (reused across all KV blocks)
         Q_offs = (
