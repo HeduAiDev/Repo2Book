@@ -240,21 +240,41 @@ class GroupedQueryAttention(nn.Module):
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 1.5 Attention Masks
-# REFERENCE: vllm/v1/attention/backends/flash_attn.py
-#            → FlashAttentionMetadataBuilder.build() constructs per-request metadata
-#            including seq_lens, block_tables, and mask parameters.
-#            The actual masking happens INSIDE the kernel — vLLM does not
-#            materialize mask tensors. We create them explicitly for visualization.
+# REFERENCE: flash_attn.py:L276-L299 — FlashAttentionMetadataBuilder
+#            Builds per-request metadata (seq_lens, block_table, slot_mapping).
+#            The causal mask is a boolean flag (L256: causal: bool = True),
+#            applied INSIDE the kernel — vLLM NEVER materializes mask tensors.
+#            Sliding window: flash_attn.py:L617-L623 — stored as (left, right) tuple.
+#            We create masks explicitly here for visualization and testing.
 # ═══════════════════════════════════════════════════════════════════════════
 
 def create_causal_mask(seq_len: int, device=None) -> torch.Tensor:
-    """Causal mask — GPT-style decoder attention."""
+    """Causal mask — GPT-style decoder attention.
+
+    REFERENCE: vllm/v1/attention/backends/flash_attn.py:L256
+               → FlashAttentionMetadata.causal: bool = True — causal is a boolean flag,
+               NEVER a materialized tensor. Applied inside FlashAttention via
+               flash_attn_varlen_func(..., causal=attn_metadata.causal) at L807.
+    REFERENCE: vllm/v1/attention/ops/triton_prefill_attention.py:L122-L123
+               → mask &= pos_q >= pos_k — causal mask computed inside Triton kernel.
+    vLLM does NOT create mask tensors — we create them here for visualization & testing.
+    """
     return torch.tril(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool)
                      ).unsqueeze(0).unsqueeze(0)
 
 
 def create_padding_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
-    """Padding mask — variable-length batch support."""
+    """Padding mask — variable-length batch support.
+
+    REFERENCE: vllm/v1/attention/backends/flash_attn.py:L276-L298
+               → FlashAttentionMetadataBuilder.build() — padding is handled via
+               cu_seqlens_q (query_start_loc) and seqused_k (per-request seq lengths),
+               NOT an explicit mask tensor. The kernel only computes attention within
+               each request's valid range.
+    REFERENCE: vllm/v1/attention/ops/triton_prefill_attention.py:L68, L120
+               → cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
+               → mask = pos_k < cur_batch_seq_len — variable-length mask inside kernel.
+    """
     B = lengths.size(0)
     positions = torch.arange(max_len, device=lengths.device).unsqueeze(0)
     return (positions < lengths.unsqueeze(1)).unsqueeze(1).unsqueeze(2)
@@ -262,7 +282,18 @@ def create_padding_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
 
 def create_sliding_window_mask(seq_len: int, window_size: int,
                                device=None) -> torch.Tensor:
-    """Sliding window mask — Mistral/Gemma attention pattern."""
+    """Sliding window mask — Mistral/Gemma attention pattern.
+
+    REFERENCE: vllm/v1/attention/backends/flash_attn.py:L604, L618-L623
+               → FlashAttentionImpl.__init__() — sliding_window parameter converted
+               to (left, right) tuple: encoder gets (W-1, W-1), decoder gets (W-1, 0).
+               Applied via flash_attn_varlen_func(..., window_size=...) at L809.
+    REFERENCE: vllm/v1/attention/ops/triton_prefill_attention.py:L126-L135
+               → SLIDING_WINDOW_Q / SLIDING_WINDOW_K constexprs, bidirectional
+               sliding window mask computed inside kernel:
+               sliding_mask_q = (pos_q - pos_k <= SLIDING_WINDOW_Q)
+               sliding_mask_k = (pos_k - pos_q <= SLIDING_WINDOW_K)
+    """
     positions = torch.arange(seq_len, device=device)
     dist = positions.unsqueeze(1) - positions.unsqueeze(0)
     return ((dist >= 0) & (dist < window_size)).unsqueeze(0).unsqueeze(0)
