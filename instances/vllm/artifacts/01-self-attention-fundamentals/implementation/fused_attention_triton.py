@@ -29,7 +29,7 @@ This kernel is a simplified version of:
 For vLLM's production attention, see:
     vllm/v1/attention/backends/flash_attn.py → FlashAttentionImpl (L594-L681)
     vllm/v1/attention/backends/triton_attn.py → TritonAttentionImpl
-    vllm/v1/attention/ops/triton_prefill_attention.py → _fwd_kernel (L36-L177)
+    vllm/v1/attention/ops/triton_prefill_attention.py → _fwd_kernel (L37-L177)
         — vLLM's actual Triton kernel: handles variable-length sequences,
            GQA grouping (cur_kv_head = cur_head // kv_group_num),
            bidirectional sliding window, and uses tl.math.exp2 for speed.
@@ -148,25 +148,32 @@ if HAS_TRITON:
         O_acc = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.float32)
 
         # Load Q block once (reused across all KV blocks)
+        # REFERENCE: triton_prefill_attention.py:L77-L91
+        #   off_q = (cur_batch_in_all_start_index + offs_m[:, None]) * stride_qbs
+        #           + cur_head * stride_qh + offs_d[None, :]
         Q_offs = (
             (q_start + tl.arange(0, BLOCK_Q))[:, None] * stride_qs
             + tl.arange(0, HEAD_DIM)[None, :] * stride_qd
         )
-        Q_block = tl.load(Q_ptr_block + Q_offs, mask=(tl.arange(0, BLOCK_Q)[:, None] < q_len))
-        Q_block = Q_block * SCALE
+        Q_block = tl.load(Q_ptr_block + Q_offs,
+                          mask=(tl.arange(0, BLOCK_Q)[:, None] < q_len),
+                          other=0.0)
 
         # Loop over KV blocks
         for kv_start in range(0, SEQ_LEN, BLOCK_KV):
             kv_end = min(kv_start + BLOCK_KV, SEQ_LEN)
+            kv_len = kv_end - kv_start
 
             # --- Load K block ---
+            # REFERENCE: triton_prefill_attention.py:L93-L94, L139-L143
             K_offs = (
                 (kv_start + tl.arange(0, BLOCK_KV))[:, None] * stride_ks
                 + tl.arange(0, HEAD_DIM)[None, :] * stride_kd
             )
             K_block = tl.load(
                 K_ptr + pid_batch * stride_kb + pid_head * stride_kh + K_offs,
-                mask=(tl.arange(0, BLOCK_KV)[:, None] < (kv_end - kv_start)),
+                mask=(tl.arange(0, BLOCK_KV)[:, None] < kv_len),
+                other=0.0,
             )  # [BLOCK_KV, HEAD_DIM]
 
             # --- Compute S = Q @ K^T ---
@@ -174,17 +181,24 @@ if HAS_TRITON:
             # S: [BLOCK_Q, BLOCK_KV]
             S = tl.dot(Q_block, tl.trans(K_block))
 
-            # --- Apply causal mask ---
-            # For causal attention: position i can only attend to positions ≤ i.
-            # REFERENCE: triton_prefill_attention.py:L122-L123
-            #   pos_q = offs_m[:, None]; pos_k = start_n + offs_n[None, :]
-            #   mask &= pos_q >= pos_k   (IS_CAUSAL)
+            # --- Apply scale + causal mask ---
+            # REFERENCE: triton_prefill_attention.py:L145-L146
+            #   qk = tl.where(mask, qk * sm_scale, -1.0e8)
+            # vLLM applies scale AFTER dot product, not before.
+            S = S * SCALE
+
+            # Build position-aware mask: valid K positions + causal
+            # Mask out K rows that are padding (beyond kv_len)
+            kv_valid = tl.arange(0, BLOCK_KV) < kv_len  # [BLOCK_KV]
+            mask = kv_valid[None, :]  # [1, BLOCK_KV] — broadcast to [BLOCK_Q, BLOCK_KV]
+
             if IS_CAUSAL:
                 # Q positions: q_start + [0..BLOCK_Q), K positions: kv_start + [0..BLOCK_KV)
                 q_pos = (q_start + tl.arange(0, BLOCK_Q))[:, None]  # [BLOCK_Q, 1]
                 k_pos = (kv_start + tl.arange(0, BLOCK_KV))[None, :]  # [1, BLOCK_KV]
-                causal_mask = q_pos >= k_pos  # [BLOCK_Q, BLOCK_KV]
-                S = tl.where(causal_mask, S, float("-inf"))
+                mask &= q_pos >= k_pos  # [BLOCK_Q, BLOCK_KV]
+
+            S = tl.where(mask, S, -1.0e8)
 
             # --- Online Softmax Update ---
             # m_new = max(m_prev, row_max(S))
@@ -258,15 +272,6 @@ if HAS_TRITON:
         Returns:
             O: [batch, seq_len, num_heads, head_dim]
 
-        REFERENCE: triton_prefill_attention.py:L36-L177 — vLLM's _fwd_kernel
-        Differences from vLLM's kernel:
-          - Ours is simplified: fixed-length sequences, no GQA grouping,
-            no sliding window, uses tl.exp (not tl.math.exp2).
-          - vLLM handles variable-length per batch (B_Start_Loc, B_Seqlen),
-            GQA (cur_kv_head = cur_head // kv_group_num), and uses
-            tl.math.exp2 for a small speedup on supported hardware.
-          - vLLM's grid is (batch, heads, M_blocks) — same as ours.
-
         Tuning notes:
             - Larger BLOCK_Q/BLOCK_KV → more SRAM usage, fewer HBM passes
             - BLOCK_Q × BLOCK_KV × HEAD_DIM × sizeof(dtype) must fit in L1 cache
@@ -274,6 +279,17 @@ if HAS_TRITON:
             - H100 has 228 KB L1 + shared memory per SM
             - Our tiles: 64×64×128×2 bytes ≈ 1 MB (fits easily)
         """
+        # REFERENCE: vllm/v1/attention/ops/triton_prefill_attention.py:L37-L177
+        #   → _fwd_kernel — vLLM's production Triton fused attention kernel.
+        #   Handles variable-length (B_Start_Loc, B_Seqlen), GQA grouping
+        #   (cur_kv_head = cur_head // kv_group_num), bidirectional sliding window,
+        #   and uses tl.math.exp2 for speed. Ours is simplified for pedagogy.
+        # REFERENCE: vllm/v1/attention/backends/flash_attn.py:L797-L819
+        #   → FlashAttentionImpl.forward() calls flash_attn_varlen_func() with
+        #   softmax_scale=self.scale and causal=attn_metadata.causal.
+        # REFERENCE: vllm/model_executor/layers/attention/attention.py:L473-L500
+        #   → Attention.forward() calls unified_attention_with_output(), dispatching
+        #   to self.impl.forward() — the backend abstraction.
         B, SEQ_LEN, N_HEADS, HEAD_DIM = Q.shape
 
         if scale is None:
@@ -333,6 +349,14 @@ def validate_triton_vs_pytorch(d_model: int = 256, num_heads: int = 8, seq_len: 
     Verify our Triton kernel produces the same output as PyTorch reference.
     This is the correctness oracle for our implementation.
     """
+    # REFERENCE: tests/kernels/attention/test_flash_attn.py → ref_paged_attn()
+    #   — vLLM validates FlashAttention output against a PyTorch reference
+    #   implementation. Same pattern: generate inputs, run kernel + reference,
+    #   compare with tolerance. vLLM's test covers variable-length, GQA, sliding
+    #   window, and multiple dtypes.
+    # REFERENCE: vllm/v1/attention/backends/flash_attn.py:L797-L819
+    #   — flash_attn_varlen_func() call with softmax_scale=self.scale.
+    #   The scale and causal parameters are what we validate against.
     from reference_attention import MultiHeadAttention, create_causal_mask
 
     head_dim = d_model // num_heads

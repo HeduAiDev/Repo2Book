@@ -52,6 +52,14 @@ def analyze_variance_empirically(
     Returns:
         dict with variance before/after scaling, softmax entropy, etc.
     """
+    # REFERENCE: vllm/model_executor/layers/attention/attention.py:L193, L348
+    #   → Attention.__init__() takes scale: float — pre-computed by model config
+    #   as 1 / sqrt(head_size). Passed to backend impl at L348.
+    #   This scale factor is NOT tuned — it's derived from Var(q·k) = d_k.
+    # REFERENCE: vllm/v1/attention/backends/flash_attn.py:L613
+    #   → self.scale = float(scale) — stored as float in FlashAttentionImpl.
+    #   Applied at L806: softmax_scale=self.scale in flash_attn_varlen_func().
+    #   This is the exact point where 1/√d_k prevents softmax saturation.
     torch.manual_seed(seed)
 
     # Generate random Q,K vectors with μ=0, σ²=1
@@ -80,6 +88,10 @@ def analyze_variance_empirically(
     attn_scaled = F.softmax(scores_scaled, dim=-1)
 
     # Entropy: higher = more uniform (better for gradient flow)
+    # REFERENCE: vllm/v1/attention/ops/triton_prefill_attention.py:L149-L154
+    #   → p = tl.math.exp2(qk) — softmax output computed inside kernel.
+    #   Entropy measures how "spread out" the attention distribution is;
+    #   low entropy (near one-hot) → vanishing gradients.
     def entropy(p):
         return -(p * torch.log(p + 1e-10)).sum().item()
 
@@ -107,6 +119,14 @@ def demonstrate_variance_problem():
     collapses to nearly one-hot — meaning at most one token gets gradient,
     and learning becomes extremely slow.
     """
+    # REFERENCE: vllm/model_executor/layers/attention/attention.py:L193
+    #   → scale: float — the 1/√d_k factor, pre-computed by model config
+    #   (e.g., llama.py: scale = 1 / (head_size ** 0.5)). For Llama's typical
+    #   head_size=128: scale = 1/√128 ≈ 0.0884. Without this, Var(Q@K^T)=128,
+    #   softmax collapses to one-hot → gradient ~ 0.
+    # REFERENCE: vllm/v1/attention/backends/flash_attn.py:L806
+    #   → softmax_scale=self.scale passed to flash_attn_varlen_func().
+    #   Every attention backend receives this scale. It's NOT optional.
     print("=" * 76)
     print("VARIANCE ANALYSIS: Why 1/√d_k is NOT optional")
     print("=" * 76)
@@ -153,6 +173,11 @@ def manual_softmax_example():
     A concrete, hand-calculable example showing the softmax collapse.
     This is the exact example from the chapter narrative.
     """
+    # REFERENCE: vllm/v1/attention/backends/flash_attn.py:L613, L806
+    #   → FlashAttentionImpl stores self.scale = float(scale) at L613,
+    #   then passes softmax_scale=self.scale to flash_attn_varlen_func() at L806.
+    #   This example shows WHY: without scaling, softmax with d_k=64 (Llama typical)
+    #   would have variance ~64, making the softmax near one-hot → gradient ~ 0.
     print()
     print("=" * 76)
     print("CONCRETE EXAMPLE: Hand-calculable softmax collapse")

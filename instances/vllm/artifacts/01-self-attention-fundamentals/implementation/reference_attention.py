@@ -30,9 +30,10 @@ def scaled_dot_product_attention(
     """
     Mathematical attention — what vLLM's backends compute under the hood.
 
-    REFERENCE: vllm/v1/attention/backends/flash_attn.py
-               → FlashAttentionImpl.forward() calls flash_attn_varlen_func()
-               which computes this exact operation, but tiled in SRAM.
+    REFERENCE: flash_attn.py:L797-L819 — FlashAttentionImpl.forward()
+               calls flash_attn_varlen_func() with softmax_scale=self.scale
+               and causal=attn_metadata.causal. The kernel computes
+               softmax(QK^T / sqrt(d_k)) @ V, tiled in SRAM.
 
     vLLM does NOT have this function as-is. Instead, the Attention layer
     (attention.py:L177) delegates to self.impl.forward() which is a
@@ -59,7 +60,7 @@ class MultiHeadAttention(nn.Module):
     """
     Our reimplementation of vLLM's Attention layer.
 
-    REFERENCE: vllm/model_executor/layers/attention/attention.py:L177-L582
+    REFERENCE: vllm/model_executor/layers/attention/attention.py:L177-L519
                Class: Attention (the main attention layer in vLLM)
 
     KEY DIFFERENCES from vLLM's Attention:
@@ -84,7 +85,7 @@ class MultiHeadAttention(nn.Module):
 
     def __init__(self, d_model: int, num_heads: int, bias: bool = False):
         super().__init__()
-        # REFERENCE: attention.py:L177-L376 — Attention.__init__()
+        # REFERENCE: attention.py:L189-L384 — Attention.__init__()
         # vLLM takes (num_heads, head_size, scale, num_kv_heads, ...) — NOT d_model.
         # Check at L278: assert num_heads % num_kv_heads == 0
         # At L344-L357: self.impl = impl_cls(num_heads, head_size, scale, ...)
