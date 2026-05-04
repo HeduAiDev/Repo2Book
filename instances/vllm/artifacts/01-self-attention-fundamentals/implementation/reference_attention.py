@@ -111,10 +111,11 @@ class MultiHeadAttention(nn.Module):
 
     def _reshape_for_heads(self, x: torch.Tensor) -> torch.Tensor:
         """
-        REFERENCE: attention.py:L410-L450 — Attention.forward()
-        vLLM reshapes Q/K/V to [num_tokens, num_heads, head_size] before
-        passing to the backend. In our implementation, this is the key
-        operation that enables multi-head parallelism.
+        REFERENCE: attention.py:L455-L460 — Attention.forward() inline reshape.
+        vLLM reshapes to [num_tokens, num_heads, head_size] (3D, sequence-pack).
+        We use [B, L, num_heads, head_dim].transpose(1,2) (4D, batch-aware).
+        The 4D format is easier to visualize; vLLM packs all tokens into dim 0
+        because the backend kernel operates on flat token sequences.
         """
         B, L, _ = x.shape
         return x.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
@@ -129,14 +130,15 @@ class MultiHeadAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        REFERENCE: attention.py:L410-L530 — Attention.forward()
+        REFERENCE: attention.py:L409-L501 — Attention.forward()
 
         vLLM's forward does:
-        1. Reshape Q/K/V to [num_tokens, num_heads, head_size]
-        2. Allocate output tensor (empty_like)
-        3. Call torch.ops.vllm.unified_attention_with_output(Q, K, V, ...)
-           → which calls self.impl.forward() → FlashAttention/Triton/etc.
-        4. Return output
+        1. Optional: quantize query for FP8 KV cache (L433-L443)
+        2. Allocate output tensor (L450)
+        3. Reshape Q/K/V to [num_tokens, num_heads, head_size] (L455-L460)
+        4. Call unified_attention_with_output(Q, K, V, ...) (L473-L480)
+           → dispatches to self.impl.forward() → FlashAttention/Triton/etc.
+        5. Return output.view(-1, hidden_size) (L501)
 
         We compute the attention explicitly for learning purposes.
         """
@@ -162,10 +164,17 @@ class GroupedQueryAttention(nn.Module):
     """
     GQA — Our reimplementation with vLLM's convention.
 
-    REFERENCE: attention.py:L177 — Attention class
-               The same Attention class handles GQA by accepting num_kv_heads.
-               vLLM's FlashAttention backend handles GQA natively in the kernel,
-               without expanding K,V in memory. We expand explicitly for clarity.
+    REFERENCE: attention.py:L276-L280 — GQA is handled by the SAME Attention class.
+               When num_kv_heads < num_heads, the backend kernel reads K,V with
+               stride = num_kv_heads, computing attention without expanding in HBM.
+               Source: flash_attn.py:L682-L703 — FlashAttentionImpl.forward()
+               receives query=[num_tokens, num_heads, head_size] and
+               key=[num_tokens, num_kv_heads, head_size] — no expansion.
+               We expand here so readers can SEE the sharing pattern.
+
+    REFERENCE: attention.py:L286 — head_size_v: vLLM supports different head sizes
+               for V vs Q/K (used by MLA and some architectures). For GQA/MHA,
+               head_size_v == head_size; we keep them equal for Ch01 scope.
 
     vLLM's KV cache shape (preview of Chapter 2):
         [2, num_blocks, block_size, num_kv_heads, head_size]
@@ -207,10 +216,12 @@ class GroupedQueryAttention(nn.Module):
         K = K.view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2)
         V = V.view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        # REFERENCE: flash_attn.py — FlashAttentionImpl.forward()
-        # vLLM's flash attention kernel handles GQA natively — it reads K,V
-        # with a stride of num_kv_heads, without ever expanding in memory.
-        # We expand here so you can SEE the sharing pattern.
+        # REFERENCE: flash_attn.py:L682-L703 — FlashAttentionImpl.forward()
+        # receives query=[num_tokens, num_heads, head_size] and
+        # key/value=[num_tokens, num_kv_heads, head_size].
+        # The kernel handles GQA natively (stride-based K,V reads).
+        # We expand K,V here so you can SEE the sharing pattern in the
+        # attention matrix — num_queries_per_kv heads share each KV.
         if self.num_kv_heads != self.num_heads:
             K = K.repeat_interleave(self.num_queries_per_kv, dim=1)
             V = V.repeat_interleave(self.num_queries_per_kv, dim=1)
