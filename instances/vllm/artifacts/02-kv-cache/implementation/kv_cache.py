@@ -580,7 +580,7 @@ def llama_3_2_1b_kv_cache_example():
     config = KVCacheConfig(
         num_layers=32,      # Llama-3.2-1B
         num_kv_heads=8,     # GQA
-        head_dim=128,       # 2048/32... wait, 4096/32=128 for 3.2-1B
+        head_dim=128,       # hidden_size / num_attention_heads = 4096/32
         block_size=16,      # vLLM default for this model size
         dtype_bytes=2,      # bf16
     )

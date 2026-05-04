@@ -18,7 +18,7 @@
 这章的路线：
 
 1. **直觉先行**（2.1）：用一个数字让你感受浪费——4096 token 生成，不缓存=840 万次 attention，缓存=4096 次
-2. **逐字节拆解**（2.2）：KV Cache 占多少显存？每项代表什么硬件约束？用 Llama-3.2-1B 算三组真实数字
+2. **逐字节拆解**（2.2）：KV Cache 占多少显存？每项代表什么硬件约束？用 32-Layer GQA Transformer 算三组真实数字
 3. **Block 管理的数学**（2.3-2.4）：为什么连续分配会死？为什么手写双向链表而不是用 `deque`？
 4. **逐行手撕源码**（2.5-2.6）：`allocate_slots()` 的三阶段 + Prefix Cache 的 Merkle 链
 5. **全景交互**（2.7）：Scheduler → KVCacheManager → BlockPool → FreeKVCacheBlockQueue 的完整数据流
@@ -34,7 +34,9 @@
 
 ### 直觉
 
-你正在写第 $N$ 个字。要决定第 $N$ 个字写什么，你得看一眼前面 $N-1$ 个字。第 $N+1$ 个字呢？得看一眼前面 $N$ 个字。之前那 $N-1$ 个字跟写第 $N$ 个字时看到的完全一样——位置没变，内容没变，一个字都没改。
+LLM 生成文本时，一次只输出一个 token。每个新 token 的 attention 计算需要之前所有 token 的 K 和 V——这就是自回归生成。关键是：这些 K 和 V 在上一步已经算过了，一模一样，一个都没变。
+
+用写字来理解：你正在写第 $N$ 个字。要决定第 $N$ 个字写什么，你得看一眼前面 $N-1$ 个字。第 $N+1$ 个字呢？得看一眼前面 $N$ 个字。之前那 $N-1$ 个字跟写第 $N$ 个字时看到的完全一样——位置没变，内容没变，一个字都没改。
 
 如果你把每次"看前面所有字"的结果（K 和 V 投影）扔掉，下次再从头算——你在做 $1 + 2 + 3 + \cdots + L$ 次计算。
 
@@ -168,25 +170,26 @@ $$
 
 逐项物理含义：
 
-| 项 | 物理含义 | 为什么不能省 |
-|---|---|---|
-| **× 2** | K 和 V 各一份 | **最容易漏的一项。** 很多人只算了 K |
-| **× $N_{\mathrm{layers}}$** | 每层 Transformer 的 K、V 表达不同 | 浅层学语法，深层学语义，不能共享 |
-| **× $B$** | Batch size — 每用户独立 | 不同请求的 KV 不能混（除非 prefix cache） |
-| **× $L$** | 序列长度 | 线性增长。128K 上下文 → 128K × baseline |
-| **× $N_{\mathrm{kv\_heads}}$** | KV head 数 | **GQA 砍的就是这项。** 32 Q head → 8 KV head，缓存/4 |
-| **× $d_{\mathrm{head}}$** | 每个 head 的维度 | 架构决定的常数 |
-| **× dtype_bytes** | bf16=2, fp8=1, int4=0.5 | 量化直接线性缩缓存大小 |
+| 项 | 32-Layer GQA Transformer 值 | 物理含义 | 为什么不能省 |
+|---|---|---|---|---|
+| **× 2** | 2 | K 和 V 各一份 | **最容易漏的一项。** 很多人只算了 K |
+| **× $N_{\mathrm{layers}}$** | 32 | 每层 Transformer 的 K、V 表达不同 | 浅层学语法，深层学语义，不能共享 |
+| **× $B$** | 1~8 | Batch size — 每用户独立 | 不同请求的 KV 不能混（除非 prefix cache） |
+| **× $L$** | 128K max | 序列长度 | 线性增长。128K 上下文 → 128K × baseline |
+| **× $N_{\mathrm{kv\_heads}}$** | 8 (GQA) | KV head 数 | **GQA 砍的就是这项。** 32 Q head → 8 KV head，缓存/4 |
+| **× $d_{\mathrm{head}}$** | 128 | 每个 head 的维度 | 架构决定的常数 |
+| **× dtype_bytes** | 2 (bf16) | bf16=2, fp8=1, int4=0.5 | 量化直接线性缩缓存大小 |
 
-### 数值追踪：Llama-3.2-1B
+### 数值追踪：典型 32 层 GQA Transformer
 
-用真实参数计算。数据来自 Llama-3.2-1B 的 `config.json`：
+用真实参数计算。数据来自某典型 32 层 GQA 模型的 `config.json`：
 
 ```
-Model: Llama-3.2-1B
+Model: 32-Layer GQA Transformer (Llama-3.1-8B 参数级)
 num_layers    = 32
-num_kv_heads  = 8      (GQA: 32 Q heads → 8 KV heads)
-head_dim      = 128    (hidden_size=2048 / num_attention_heads=16 = 128)
+num_q_heads   = 32      (Q 头数)
+num_kv_heads  = 8       (GQA: 32 Q heads → 8 KV heads, KV 压缩 4×)
+head_dim      = 128     (hidden_size=4096 / num_q_heads=32 ≈ 128)
 dtype         = bf16 (2 bytes)
 block_size    = 16     (vLLM 默认，定义在 vllm/config/vllm.py:L1840)
 
@@ -205,7 +208,7 @@ KV Cache = 128 KB × 4096 = 512 MB
 KV Cache = 512 MB × 8 = 4 GB
 ```
 
-**场景 3：1 用户，131K 超长上下文（Llama-3.2-1B 最大 128K）**
+**场景 3：1 用户，131K 超长上下文（32-Layer GQA Transformer 最大 128K）**
 ```
 KV Cache = 128 KB × 131072 = 16 GB
 ```
