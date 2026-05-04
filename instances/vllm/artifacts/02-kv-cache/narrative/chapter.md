@@ -90,6 +90,10 @@ $$
 
 这个数字从根本上决定了：**KV Cache 不是锦上添花，是推理可行的前提条件。**
 
+![Without vs With KV Cache](../diagrams/02-kv-cache-waste-pattern.png)
+
+> *图注：L=4 时的累积重算（左）vs 缓存复用（右）。红色=重算旧 K,V（浪费），绿色=新算 K,V，蓝色=从缓存读取。L=4096 时加速比 = 2048。*
+
 ### 一般化证明
 
 第 1 章推导了 Attention：
@@ -196,6 +200,8 @@ block_size    = 16     (vLLM 默认，定义在 vllm/config/vllm.py:L1840)
 per_token_kv = 2 × 32 × 8 × 128 × 2 = 131,072 bytes = 128 KB/token
 ```
 
+（公式中 batch=1、seq_len=1 是隐含的——per_token 本身就是单 token 基准。实际显存 = per_token_kv × batch × seq_len。）
+
 `kv_cache.py:L566` 的 `per_token_kv_bytes()` 实现了完全相同的计算。
 
 **场景 1：1 用户，4096 token 上下文**
@@ -213,7 +219,7 @@ KV Cache = 512 MB × 8 = 4 GB
 KV Cache = 128 KB × 131072 = 16 GB
 ```
 
-模型权重本身约 2.5 GB（fp16）。KV Cache 是权重的 6.4 倍——**超长上下文场景下，KV Cache 才是显存的主要消费者。**
+模型权重约 15 GB（fp16，8B 参数）。超长上下文场景下，KV Cache 可达 16 GB——**与权重同等量级，是显存预算的两大支柱之一。**
 
 运行 `python3 kv_cache.py` 的输出与上述计算完全一致：
 
@@ -261,6 +267,10 @@ def calculate_num_blocks(self, total_gpu_memory: int, model_weight_size: int) ->
 现在来一辆 500 格的车。空位 = 300（前面）+ 500（后面）= 800 > 500。但停不进去——因为前面空位不够 500，后面空位也不够 500，合起来够但连不起来。
 
 这就是**外部碎片**。KV Cache 面对的不是一辆车，而是数百个长度差异巨大的请求。
+
+![External vs Internal Fragmentation](../diagrams/02-kv-cache-fragmentation.png)
+
+> *图注：连续分配（上）— 释放 30 格后出现空洞，50 格的车无法停入（外部碎片）。Block 分配（下）— 每块独立，最后一块可能浪费 ≤ 15 格（内部碎片，block_size=16）。内部碎片的可控小浪费，远好于外部碎片的不可控大浪费。*
 
 ### 源码定位
 
@@ -360,6 +370,10 @@ class FreeKVCacheBlockQueue:
 | `remove(item)` (中间删) | **O(n) ✗** | **O(1) ✓** |
 
 `remove()` 的 O(1) 来自于：block 本身存储了 `prev_free_block` / `next_free_block` 指针。删除时不需要搜索——直接操作邻居的指针。
+
+![FreeKVCacheBlockQueue doubly-linked list](../diagrams/02-kv-cache-linked-list.png)
+
+> *图注：HEAD 和 TAIL 是 sentinel 节点，消除边界条件。新 block 从 TAIL 端插入（MRU），驱逐从 HEAD 端取出（LRU）。prefix cache 命中时 touch() 直接从链表中间 O(1) 删除——这是 deque 做不到的。*
 
 ### 驱逐顺序的数学
 
