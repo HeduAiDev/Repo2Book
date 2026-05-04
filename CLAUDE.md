@@ -14,11 +14,10 @@ repo2book/                              ← Framework (this repo)
 │
 ├── .claude/                            ← Project-scoped config
 │   ├── settings.local.json
-│   ├── agents/                         # (implementer, tester, writer, reviewer)
+│   ├── agents/                         # (book-editor, implementer, tester, writer, reviewer, archivist)
+│   ├── teams/book-factory.json
 │   └── skills/svg-diagram/
 │
-├── agents/                             ← Python Role classes (legacy)
-├── pipelines/chapter_pipeline.py
 ├── schemas/
 │
 ├── scripts/                            ← Framework CLI tools
@@ -54,7 +53,7 @@ Every narrative edit MUST go through the Writer agent or the Chapter Pipeline.
 If you find yourself wanting to `Edit` or `Write` a narrative file — STOP.
 Run `python3 scripts/guard_narrative.py check {chapter_id}` first.
 
-**Only modify:** .claude/agents/, pipelines/, schemas/, scripts/, CLAUDE.md, repo2book.json.
+**Only modify:** .claude/agents/, schemas/, scripts/, CLAUDE.md, repo2book.json.
 **FORBIDDEN to modify directly:** artifacts/*/narrative/chapter.md.
 
 If the chapter quality is wrong, fix the PROMPTS, not the chapter content.
@@ -369,7 +368,7 @@ python3 scripts/team_orchestrator.py pipeline {chapter_id}
 ## Current Instance: vLLM
 
 - **Repo**: https://github.com/vllm-project/vllm
-- **Source dir**: `vllm/`
+- **Source dir**: `instances/vllm/source/`
 - **Outline**: 28 chapters, 5 parts (see `book/book-outline.json`)
 - **Progress**: 13 chapters published (Parts 1-2 complete), 15 remaining (Parts 3-5)
 

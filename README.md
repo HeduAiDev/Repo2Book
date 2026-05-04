@@ -78,7 +78,7 @@ repo2book/
 │
 ├── instances/vllm/                     ← vLLM 书籍实例（完整、自包含）
 │   ├── repo2book.json                  # 实例配置
-│   ├── artifacts/                      # 全29章内容（实现、测试、叙事、审查）
+│   ├── artifacts/                      # 28章内容（实现、测试、叙事、审查）
 │   ├── book/book-outline.json           # 28章5部分大纲
 │   ├── source/                         # Git submodule: vllm-project/vllm（锁定提交）
 │   ├── knowledge/                      # 仓库专属知识（TTL过期、按模块组织）
@@ -98,7 +98,7 @@ repo2book/
 │   ├── writing.md                      # 公式规范、代码走读、大白话谱系
 │   └── architecture.md                 # 反压闸门、横向通信、拓扑模式
 │
-├── scripts/                            ← CLI 工具链（8个脚本）
+├── scripts/                            ← CLI 工具链（9个脚本）
 │   ├── setup.py                        # 克隆后一次性初始化
 │   ├── team_orchestrator.py            # 创建任务、启动 agent、监控流水线
 │   ├── hook_pipeline.py                # TaskCompleted → 下一 agent 收件箱通知
