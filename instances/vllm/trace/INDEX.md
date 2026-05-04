@@ -7,7 +7,8 @@ Master index of all significant events. Query this first before any work.
 <!-- ARCHIVIST: Update on every recorded event. Keep to last 10. -->
 
 | Date | Type | Chapter | Summary | File |
-| 2026-05-04 | delivery | 01-self-attention-fundamentals | Ch01 v5 Rewrite Complete | [2026-05-04_ch01-self-attention-fundamentals-ch01-v5-rewrite-complete.md](deliverys/2026-05-04_ch01-self-attention-fundamentals-ch01-v5-rewrite-complete.md) |
+| 2026-05-04 | delivery | 01-self-attention-fundamentals | Ch01 v5 Creative Rewrite | [2026-05-04_ch01-self-attention-fundamentals-ch01-v5-creative-rewrite.md](deliveries/2026-05-04_ch01-self-attention-fundamentals-ch01-v5-creative-rewrite.md) |
+| 2026-05-04 | delivery | 01-self-attention-fundamentals | Ch01 v5 Rewrite Complete | [2026-05-04_ch01-self-attention-fundamentals-ch01-v5-rewrite-complete.md](deliveries/2026-05-04_ch01-self-attention-fundamentals-ch01-v5-rewrite-complete.md) |
 | 2026-05-04 | decision | 01-self-attention-fundamentals | v5 Rewrite Started — Ch01 Self-Attention | [2026-05-04_ch01-self-attention-fundamentals-v5-rewrite-started-—-ch01-self-attention.md](decisions/2026-05-04_ch01-self-attention-fundamentals-v5-rewrite-started-—-ch01-self-attention.md) |
 |------|------|---------|---------|------|
 | 2026-05-04 | delivery | 04 | Ch4 v5 rewrite complete: 14/14 tests, 0 blocking formula issues | [delivery-04-v5.md](deliveries/delivery-04-v5.md) |
@@ -17,7 +18,7 @@ Master index of all significant events. Query this first before any work.
 
 | Chapter | Status | Last Delivery | Key Decisions | Open Issues |
 |---------|--------|--------------|---------------|-------------|
-| 01 | published | 2026-04 (v3) | — | — |
+| 01 | published | 2026-05-04 (v5 creative rewrite) | Intuition-first, 4 diagrams, Bahdanau→Dao | — |
 | 02 | published | 2026-04 (v3) | — | — |
 | 03 | published | 2026-05 (v5 rewrite) | Proof structure, diagram method | — |
 | 04 | published | 2026-05-04 (v5 rewrite) | Preemption bug fix, bubble proof | — |
@@ -31,6 +32,8 @@ Master index of all significant events. Query this first before any work.
 - [2026-05-04_repo2book-migration.md](decisions/2026-05-04_repo2book-migration.md) — Framework architecture
 
 ### Deliveries
+- [2026-05-04_ch01-self-attention-fundamentals-ch01-v5-creative-rewrite.md](deliveries/2026-05-04_ch01-self-attention-fundamentals-ch01-v5-creative-rewrite.md) — Ch01 v5 Creative Rewrite: intuition-first, 4 diagrams, Bahdanau→Dao, 9/9 pass
+- [2026-05-04_ch01-self-attention-fundamentals-ch01-v5-rewrite-complete.md](deliveries/2026-05-04_ch01-self-attention-fundamentals-ch01-v5-rewrite-complete.md) — Ch01 v5 Rewrite Complete (implementation + tests)
 - [delivery-04-v5.md](deliveries/delivery-04-v5.md) — Ch4 v5 rewrite complete
 
 ### User Interactions

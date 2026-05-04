@@ -183,7 +183,7 @@ class BlockPool:
         self.free_queue = FreeKVCacheBlockQueue(list(self.blocks))
 
         # Hash index for prefix caching
-        # REFERENCE: block_pool.py:L130 — BlockHashToBlockMap
+        # REFERENCE: block_pool.py:L34 — BlockHashToBlockMap
         self.cached_block_hash_to_block: Dict[int, KVCacheBlock] = {}
 
     # ── Allocation ──
@@ -329,10 +329,13 @@ class KVCacheBlocks:
     blocks: List[KVCacheBlock] = field(default_factory=list)
 
     def get_block_ids(self) -> List[int]:
-        """Convert to raw block IDs for the model runner's block table."""
+        """Convert to raw block IDs for the model runner's block table.
+        REFERENCE: kv_cache_manager.py:L65-L80 — get_block_ids()
+        """
         return [b.block_id for b in self.blocks if not b.is_null]
 
     def __add__(self, other: 'KVCacheBlocks') -> 'KVCacheBlocks':
+        """REFERENCE: kv_cache_manager.py:L44-L51 — KVCacheBlocks.__add__()"""
         return KVCacheBlocks(blocks=self.blocks + other.blocks)
 
 
@@ -545,6 +548,10 @@ class KVCacheConfig:
         """
         How vLLM calculates num_gpu_blocks.
 
+        REFERENCE: vllm/v1/kv_cache_interface.py:L145-L167 — page_size_bytes
+                   (block_bytes = 2 * block_size * num_kv_heads * dtype_size * num_layers)
+                   vllm/config/vllm.py:L1840-L1865 — block_size, gpu_memory_utilization
+
         available = total_memory * gpu_memory_utilization - model_weight_size
         block_bytes = 2 * block_size * num_kv_heads * head_dim * dtype_bytes * num_layers
         num_blocks = floor(available / block_bytes)
@@ -557,7 +564,9 @@ class KVCacheConfig:
         return available // block_bytes
 
     def per_token_kv_bytes(self) -> int:
-        """KV cache size per token (all layers, one K+V)."""
+        """KV cache size per token (all layers, one K+V).
+        REFERENCE: kv_cache_interface.py:L145 — 2 * block_size * num_kv_heads * dtype_size (per-layer page_bytes)
+        """
         return 2 * self.num_kv_heads * self.head_dim * self.dtype_bytes * self.num_layers
 
 
