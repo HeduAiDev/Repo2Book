@@ -4,6 +4,14 @@ Variance Analysis — Why sqrt(d_k)?
 This script PROVES why the scale factor 1/√d_k is necessary.
 It's not a hyperparameter someone tuned — it's a mathematical necessity.
 
+REFERENCE: attention.py:L193, L345 — scale is a constructor parameter of Attention.
+    class Attention.__init__(self, num_heads, head_size, scale, ...):
+        self.impl = impl_cls(num_heads, head_size, scale, num_kv_heads, ...)
+    The scale comes pre-computed from model config files (e.g., llama.py):
+        scale = 1 / (head_size ** 0.5)
+    It is NOT computed inside the Attention class — it's elevated to an
+    immutable constructor parameter, which signals its theoretical importance.
+
 THE PROBLEM:
     attention = softmax(Q @ K^T / scale) @ V
 

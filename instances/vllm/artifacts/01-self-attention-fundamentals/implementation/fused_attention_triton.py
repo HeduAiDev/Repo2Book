@@ -27,8 +27,12 @@ This kernel is a simplified version of:
     with IO-Awareness", NeurIPS 2022.
 
 For vLLM's production attention, see:
-    vllm/v1/attention/backends/flash_attn.py (FlashAttention backend)
-    vllm/v1/attention/ops/triton_prefill_attention.py (Triton prefill)
+    vllm/v1/attention/backends/flash_attn.py → FlashAttentionImpl (L594-L681)
+    vllm/v1/attention/backends/triton_attn.py → TritonAttentionImpl
+    vllm/v1/attention/ops/triton_prefill_attention.py → _fwd_kernel (L36-L177)
+        — vLLM's actual Triton kernel: handles variable-length sequences,
+           GQA grouping (cur_kv_head = cur_head // kv_group_num),
+           bidirectional sliding window, and uses tl.math.exp2 for speed.
 """
 
 import math
@@ -69,6 +73,7 @@ if HAS_TRITON:
         N_HEADS: tl.constexpr, # number of heads
         HEAD_DIM: tl.constexpr,# head dimension
         SCALE: tl.constexpr,   # 1/sqrt(head_dim) — the scale factor
+        IS_CAUSAL: tl.constexpr, # whether to apply causal mask
         # Tuning parameters
         BLOCK_Q: tl.constexpr, # Q block size (rows)
         BLOCK_KV: tl.constexpr,# KV block size (rows)
@@ -165,10 +170,17 @@ if HAS_TRITON:
             # S: [BLOCK_Q, BLOCK_KV]
             S = tl.dot(Q_block, tl.trans(K_block))
 
-            # --- Apply causal mask (if needed) ---
-            # For causal attention: position i can only see positions ≤ i
-            # This is a simple modification: mask S[i,j] = -inf where j > i + (q_start - kv_start)
-            # (We skip this in the basic version for clarity; see causal variant below)
+            # --- Apply causal mask ---
+            # For causal attention: position i can only attend to positions ≤ i.
+            # REFERENCE: triton_prefill_attention.py:L122-L123
+            #   pos_q = offs_m[:, None]; pos_k = start_n + offs_n[None, :]
+            #   mask &= pos_q >= pos_k   (IS_CAUSAL)
+            if IS_CAUSAL:
+                # Q positions: q_start + [0..BLOCK_Q), K positions: kv_start + [0..BLOCK_KV)
+                q_pos = (q_start + tl.arange(0, BLOCK_Q))[:, None]  # [BLOCK_Q, 1]
+                k_pos = (kv_start + tl.arange(0, BLOCK_KV))[None, :]  # [1, BLOCK_KV]
+                causal_mask = q_pos >= k_pos  # [BLOCK_Q, BLOCK_KV]
+                S = tl.where(causal_mask, S, float("-inf"))
 
             # --- Online Softmax Update ---
             # m_new = max(m_prev, row_max(S))
@@ -223,6 +235,7 @@ if HAS_TRITON:
         K: torch.Tensor,
         V: torch.Tensor,
         scale: float = None,
+        causal: bool = False,
         BLOCK_Q: int = 64,
         BLOCK_KV: int = 64,
     ) -> torch.Tensor:
@@ -234,11 +247,21 @@ if HAS_TRITON:
             K: [batch, seq_len, num_heads, head_dim]
             V: [batch, seq_len, num_heads, head_dim]
             scale: 1/sqrt(head_dim). If None, computed automatically.
+            causal: apply causal mask (position i sees only positions ≤ i).
             BLOCK_Q: Q tile size (rows). Tune this for your GPU.
             BLOCK_KV: KV tile size (rows).
 
         Returns:
             O: [batch, seq_len, num_heads, head_dim]
+
+        REFERENCE: triton_prefill_attention.py:L36-L177 — vLLM's _fwd_kernel
+        Differences from vLLM's kernel:
+          - Ours is simplified: fixed-length sequences, no GQA grouping,
+            no sliding window, uses tl.exp (not tl.math.exp2).
+          - vLLM handles variable-length per batch (B_Start_Loc, B_Seqlen),
+            GQA (cur_kv_head = cur_head // kv_group_num), and uses
+            tl.math.exp2 for a small speedup on supported hardware.
+          - vLLM's grid is (batch, heads, M_blocks) — same as ours.
 
         Tuning notes:
             - Larger BLOCK_Q/BLOCK_KV → more SRAM usage, fewer HBM passes
@@ -268,6 +291,7 @@ if HAS_TRITON:
             N_HEADS=N_HEADS,
             HEAD_DIM=HEAD_DIM,
             SCALE=scale,
+            IS_CAUSAL=causal,
             BLOCK_Q=BLOCK_Q,
             BLOCK_KV=BLOCK_KV,
         )
@@ -282,6 +306,7 @@ else:
         K: torch.Tensor,
         V: torch.Tensor,
         scale: float = None,
+        causal: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -290,7 +315,9 @@ else:
 
         This lets you run the code to learn, even without a GPU.
         """
-        return F.scaled_dot_product_attention(Q, K, V, scale=scale)
+        return F.scaled_dot_product_attention(
+            Q, K, V, scale=scale, is_causal=causal
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -302,7 +329,7 @@ def validate_triton_vs_pytorch(d_model: int = 256, num_heads: int = 8, seq_len: 
     Verify our Triton kernel produces the same output as PyTorch reference.
     This is the correctness oracle for our implementation.
     """
-    from reference_attention import MultiHeadAttention
+    from reference_attention import MultiHeadAttention, create_causal_mask
 
     head_dim = d_model // num_heads
     scale = 1.0 / math.sqrt(head_dim)
@@ -342,7 +369,23 @@ def validate_triton_vs_pytorch(d_model: int = 256, num_heads: int = 8, seq_len: 
     else:
         print("✗ Kernel diverges — check online softmax logic")
 
-    return max_err
+    # Also test causal masking
+    print("\n--- Causal variant ---")
+    with torch.no_grad():
+        tri_out_causal = fused_attention_triton(Q, K, V, scale=scale, causal=True)
+        tri_out_causal = tri_out_causal.transpose(1, 2).contiguous().view(2, seq_len, d_model)
+        tri_out_causal = mha.W_o(tri_out_causal)
+
+    # Reference with causal mask
+    causal_mask = create_causal_mask(seq_len, device=x.device).to(torch.bool)
+    with torch.no_grad():
+        ref_out_causal, _ = mha(x, attention_mask=causal_mask)
+
+    max_err_causal = (ref_out_causal - tri_out_causal).abs().max().item()
+    print(f"Max absolute error (causal): {max_err_causal:.6f}")
+    print(f"Causal match: {'PASS' if max_err_causal < 0.1 else 'FAIL — check causal mask logic'}")
+
+    return max(max_err, max_err_causal)
 
 
 if __name__ == "__main__":

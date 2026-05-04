@@ -6,11 +6,15 @@
 | File | Lines | Content |
 |------|-------|---------|
 | `vllm/model_executor/layers/attention/attention.py` | L177-L582 | `Attention` class — the layer that wraps backends |
+| `vllm/model_executor/layers/attention/attention.py` | L177-L376 | `Attention.__init__()` — backend selection, impl creation |
+| `vllm/model_executor/layers/attention/attention.py` | L409-L501 | `Attention.forward()` — reshape + dispatch to backend |
 | `vllm/v1/attention/backend.py` | Full file | `AttentionBackend`, `AttentionImpl`, `AttentionMetadataBuilder` ABCs |
-| `vllm/v1/attention/backends/flash_attn.py` | Full file | `FlashAttentionBackend` + `FlashAttentionImpl` |
+| `vllm/v1/attention/backends/flash_attn.py` | L594-L681 | `FlashAttentionImpl.__init__()` — scale, num_kv_heads, alibi |
+| `vllm/v1/attention/backends/flash_attn.py` | L682-L703+ | `FlashAttentionImpl.forward()` — calls flash_attn_varlen_func() |
 | `vllm/v1/attention/selector.py` | Full file | `get_attn_backend()` — auto-selects optimal backend |
 | `vllm/v1/attention/backends/registry.py` | Full file | `AttentionBackendEnum` — all registered backends |
-| `vllm/v1/attention/backends/triton_attn.py` | Full file | vLLM's own Triton attention kernels |
+| `vllm/v1/attention/backends/triton_attn.py` | Full file | vLLM's Triton attention backend (uses ops/triton_prefill_attention.py) |
+| `vllm/v1/attention/ops/triton_prefill_attention.py` | L36-L177 | `_fwd_kernel` — vLLM's actual Triton kernel (var-len, GQA, causal) |
 
 ### Key Classes
 | Class | File:Line | Responsibility |
@@ -44,17 +48,28 @@
 **Decision 4: GQA handled implicitly in the kernel**
 - FlashAttention natively handles `num_kv_heads < num_heads`.
 - K,V are NOT expanded in HBM — the kernel reads with stride.
-- Source: `flash_attn.py → FlashAttentionImpl.forward()` passes `num_kv_heads` to `flash_attn_varlen_func()`.
+- Source: `flash_attn.py:L682-L703` — `FlashAttentionImpl.forward()` receives `key=[num_tokens, num_kv_heads, head_size]` directly.
+
+**Decision 5: scale is a constructor parameter, not a local computation**
+- `scale = 1/√head_size` is computed once in model config and passed through to `Attention.__init__(scale=...)` and then to `impl_cls(scale=...)`.
+- It is NEVER recomputed inside the Attention class. This signals: the scale is mathematically derived, not a tunable hyperparameter.
+- Source: `attention.py:L193` (constructor takes `scale: float`), `attention.py:L345` (passed to `impl_cls`).
+
+**Decision 6: head_size_v — separate V head dimension**
+- vLLM supports `head_size_v != head_size` for architectures where V has a different dimension than Q/K (e.g., MLA in DeepSeek).
+- For standard MHA/GQA: `head_size_v = head_size`. For Ch01 scope, we keep them equal.
+- Source: `attention.py:L286` — `self.head_size_v = self.head_size if head_size_v is None else head_size_v`
 
 ## Source Mapping Table
 
 | Our Implementation | vLLM Source | What We Changed & Why |
 |---|---|---|
-| `MultiHeadAttention.__init__()` | `attention.py:L177` `Attention.__init__()` | No backend abstraction, no KV cache spec, no quantization. Simplified for chapter scope. |
-| `MultiHeadAttention.forward()` | `attention.py:L410` `Attention.forward()` | Explicit attention computation instead of delegating to `self.impl.forward()`. Readers see the math. |
+| `MultiHeadAttention.__init__()` | `attention.py:L177-L376` `Attention.__init__()` | Takes `(d_model, num_heads)` vs vLLM's `(num_heads, head_size, scale, ...)`. No backend abstraction, no KV cache spec, no quantization. Simplified for chapter scope. |
+| `MultiHeadAttention.forward()` | `attention.py:L409-L501` `Attention.forward()` | Explicit attention computation instead of delegating to `self.impl.forward()`. Readers see the math. Returns `(output, attn_weights)` — vLLM returns output only. |
 | `self.W_q, self.W_k, self.W_v` | Model files e.g. `llama.py` → `LlamaAttention.qkv_proj` | vLLM uses combined QKV; we separate for pedagogical clarity. |
-| `self.scale = 1/sqrt(head_dim)` | `attention.py:L200` | Identical. Pre-computed for efficiency. |
-| `_reshape_for_heads()` | `attention.py:L410-L450` | vLLM reshapes to `[tokens, heads, dim]`; we use `[B, h, L, d]` for readability. |
-| `GroupedQueryAttention` | `attention.py:L177` + `flash_attn.py` | vLLM handles GQA in the kernel; we expand K,V for visualization. |
-| `create_causal_mask()` | Inside FlashAttention kernel (not materialized) | vLLM never creates mask tensors; we do for visualization. |
-| `scaled_dot_product_attention()` | All backends compute this math internally | No vLLM function does this explicitly; it's split across backends. |
+| `self.scale = 1/sqrt(head_dim)` | `attention.py:L193` — `scale` constructor param, `L345` — passed to `impl_cls` | vLLM receives scale as a pre-computed float; we compute it locally since we own `head_dim`. |
+| `_reshape_for_heads()` | `attention.py:L455-L460` — inline reshape in `forward()` | vLLM reshapes to `[num_tokens, heads, dim]` (3D, sequence-pack); we use `[B, h, L, d]` (4D, batch-aware) for readability. No such method exists in vLLM. |
+| `GroupedQueryAttention` | `attention.py:L276-L280` (GQA in same class) + `flash_attn.py:L682-L703` (kernel native GQA) | vLLM handles GQA in the kernel via stride-based K,V reads; we expand K,V with `repeat_interleave` for visualization. |
+| `create_causal_mask()` | `flash_attn.py:L256` — `causal: bool = True` flag, applied inside FA kernel | vLLM never materializes mask tensors — it's a boolean flag passed to the CUDA/Triton kernel. We materialize for testing and visualization. |
+| `scaled_dot_product_attention()` | All backends compute this math internally | No single vLLM function is this pure — it's split across `FlashAttentionImpl`, `TritonAttentionImpl`, etc. |
+| `_fused_attention_kernel` (Triton) | `triton_prefill_attention.py:L36-L177` `_fwd_kernel` | vLLM's kernel handles variable-length sequences (B_Start_Loc, B_Seqlen), GQA grouping, bidirectional sliding window, and uses `tl.math.exp2`. Our kernel is fixed-length, MHA-only, with `tl.exp`, and shows IS_CAUSAL as a constexpr flag. |
