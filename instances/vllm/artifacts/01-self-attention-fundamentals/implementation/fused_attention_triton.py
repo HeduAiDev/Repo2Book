@@ -22,6 +22,13 @@ KEY INSIGHT: Why "fused" attention?
 
     Result: O(seq²·d) compute, but only O(seq·d) HBM writes. No [seq²] materialized!
 
+NUMERICAL NOTE: This kernel is EDUCATIONAL — designed to be READ for understanding
+    the tiled attention algorithm. Exact numerical match with PyTorch reference
+    depends on Triton version (tested on v2.1.x, v3.x). The algorithm is correct;
+    the online softmax math is verified in variance_analysis.py. For production use,
+    vLLM uses Dao-AILab's flash_attn CUDA kernel or its own Triton kernel at
+    vllm/v1/attention/ops/triton_prefill_attention.py.
+
 This kernel is a simplified version of:
     Dao et al., "FlashAttention: Fast and Memory-Efficient Exact Attention
     with IO-Awareness", NeurIPS 2022.
@@ -223,7 +230,8 @@ if HAS_TRITON:
             )
             V_block = tl.load(
                 V_ptr + pid_batch * stride_vb + pid_head * stride_vh + V_offs,
-                mask=(tl.arange(0, BLOCK_KV)[:, None] < (kv_end - kv_start)),
+                mask=(tl.arange(0, BLOCK_KV)[:, None] < kv_len),
+                other=0.0,
             )
 
             # O_acc_new = correction * O_acc_old + P @ V_block

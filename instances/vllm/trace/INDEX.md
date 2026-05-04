@@ -7,6 +7,7 @@ Master index of all significant events. Query this first before any work.
 <!-- ARCHIVIST: Update on every recorded event. Keep to last 10. -->
 
 | Date | Type | Chapter | Summary | File |
+| 2026-05-04 | delivery | 01-self-attention-fundamentals | Ch01 v5 Rewrite Complete | [2026-05-04_ch01-self-attention-fundamentals-ch01-v5-rewrite-complete.md](deliverys/2026-05-04_ch01-self-attention-fundamentals-ch01-v5-rewrite-complete.md) |
 | 2026-05-04 | decision | 01-self-attention-fundamentals | v5 Rewrite Started — Ch01 Self-Attention | [2026-05-04_ch01-self-attention-fundamentals-v5-rewrite-started-—-ch01-self-attention.md](decisions/2026-05-04_ch01-self-attention-fundamentals-v5-rewrite-started-—-ch01-self-attention.md) |
 |------|------|---------|---------|------|
 | 2026-05-04 | delivery | 04 | Ch4 v5 rewrite complete: 14/14 tests, 0 blocking formula issues | [delivery-04-v5.md](deliveries/delivery-04-v5.md) |
