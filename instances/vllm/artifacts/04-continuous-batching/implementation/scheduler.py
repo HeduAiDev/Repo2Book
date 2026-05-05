@@ -1,753 +1,668 @@
 """
-Continuous Batching Scheduler — Our Reimplementation.
+Continuous Batching Scheduler — educational reimplementation.
 
-REFERENCE sources (vLLM v1 scheduler):
-    Scheduler.schedule():         vllm/v1/core/sched/scheduler.py:L352-L945
-    RequestStatus:                vllm/v1/request.py:L310-L337
-    SchedulerOutput:              vllm/v1/core/sched/output.py:L181-L200
-    Chunked Prefill API:          vllm/v1/config/scheduler.py:L84-L90
-    FCFS Queue:                   vllm/v1/core/sched/request_queue.py:L75-L128
-    _preempt_request:             vllm/v1/core/sched/scheduler.py:L952-L972
-    _update_after_schedule:       vllm/v1/core/sched/scheduler.py:L974-L998
-    update_from_output:           vllm/v1/core/sched/scheduler.py:L1290-L1551
-    _free_request:                vllm/v1/core/sched/scheduler.py:L1813-L1834
-    add_request:                  vllm/v1/core/sched/scheduler.py:L1728-L1748
-    alloc/free blocks:            vllm/v1/core/kv_cache_manager.py
+REFERENCE: vllm/v1/core/sched/scheduler.py
+  - Scheduler.__init__()          → L67-L300
+  - schedule()                     → L352-L950 (core algorithm)
+  - _preempt_request()            → L952-L972
+  - update_from_output()          → L1290+ (request state update)
 
-THE KEY INSIGHT (from scheduler.py:L353-L362):
-    "There's no 'decoding phase' nor 'prefill phase' in the scheduler.
-     Each request just has num_computed_tokens and num_tokens_with_spec."
+REFERENCE: vllm/v1/request.py → Request, RequestStatus
+REFERENCE: vllm/v1/core/kv_cache_manager.py → KVCacheManager (block allocation)
+REFERENCE: vllm/v1/core/sched/request_queue.py → RequestQueue, SchedulingPolicy
 
-    This is the essence of continuous batching: the scheduler treats every
-    request uniformly as a stream of tokens. It decides HOW MANY tokens to
-    advance each request by, not WHICH PHASE the request is in.
+Key insight: Static batching waits for ALL requests in a batch to finish before
+starting a new batch — creating "bubbles" of idle GPU time. Continuous batching
+allows requests to join and leave at EVERY scheduling step — eliminating bubbles.
 
-STATIC BATCHING (old way):
-    Step 1: Prefill all prompts together → wait for longest prompt
-    Step 2: Decode one token at a time → GPU idle during decode
-
-CONTINUOUS BATCHING (vLLM):
-    Step 1: Schedule a MIX of requests — some doing prefill chunks,
-            some doing decode. Fill token budget.
-    Step 2: After forward pass, update state. Some requests finish,
-            new requests enter.
-    Step 3: Repeat.
+Request lifecycle: WAITING → RUNNING → (PREEMPTED → WAITING) → FINISHED
 """
 
-from enum import IntEnum
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Tuple
+from enum import Enum
+from typing import Optional
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# RequestStatus — vllm/v1/request.py:L310-L337
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# Request State Machine
+# ═══════════════════════════════════════════════════════════════════════
+# REFERENCE: vllm/v1/request.py → RequestStatus (enum.IntEnum, L310-L326)
 
-class RequestStatus(IntEnum):
-    """REFERENCE: vllm/v1/request.py:L310-L337"""
-    WAITING = 0
-    RUNNING = 1
-    PREEMPTED = 2
-    FINISHED_STOPPED = 3
-    FINISHED_LENGTH_CAPPED = 4
-    FINISHED_ABORTED = 5
+class RequestStatus(Enum):
+    """Request lifecycle states.
 
-    def is_finished(self) -> bool:
-        """REFERENCE: request.py:L332-L333 — status > PREEMPTED means finished"""
-        return self.value > RequestStatus.PREEMPTED.value
+    WAITING: queued, not yet allocated compute/KV resources
+    RUNNING: actively processed this scheduling step
+    PREEMPTED: evicted to free KV cache (naturally flows back to WAITING)
+    FINISHED: completed (reached max_tokens or stopped)
+    """
+    WAITING = "waiting"
+    RUNNING = "running"
+    PREEMPTED = "preempted"
+    FINISHED = "finished"
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Request — simplified from vllm/v1/request.py:L59-L308
-# ═══════════════════════════════════════════════════════════════════════════
-
+# REFERENCE: vllm/v1/request.py → Request (dataclass, L59-L308)
 @dataclass
 class Request:
-    """
-    Simplified Request matching vLLM's key fields.
+    """A single inference request tracking token-level progress.
 
-    REFERENCE: vllm/v1/request.py:L59-L308 (full Request class)
+    In real vLLM, this has ~20 fields for multimodal inputs, structured
+    output, speculative decoding, KV connectors, etc. We keep the six
+    fields that drive the scheduling algorithm.
     """
     request_id: str
-    prompt_token_ids: List[int]
-    max_tokens: int
-    arrival_time: float
+    prompt_tokens: int           # Number of prompt tokens (input)
+    max_tokens: int = 256        # Max output tokens to generate
 
-    # State tracking
+    # Priority: lower number = higher priority.
+    # In the original (request.py:L301-L307), Request.__lt__ compares
+    # (priority, arrival_time, request_id). We simplify to priority only.
+    priority: int = 0
+
+    # ── Dynamically updated each scheduling step ──
+    num_computed_tokens: int = 0   # Tokens already fed to the model
+    num_output_tokens: int = 0     # Output tokens generated so far
     status: RequestStatus = RequestStatus.WAITING
-    num_computed_tokens: int = 0           # How many tokens processed so far
-    output_token_ids: List[int] = field(default_factory=list)
-
-    # KV Cache tracking
-    block_ids: List[int] = field(default_factory=list)  # Allocated block IDs
 
     @property
-    def num_tokens(self) -> int:
-        """Total tokens to process = prompt + output."""
-        return len(self.prompt_token_ids) + len(self.output_token_ids)
+    def num_tokens_total(self) -> int:
+        """Total tokens that exist for this request (prompt + generated).
+
+        The scheduler schedules until num_computed_tokens catches up to
+        num_tokens_total. Each time they meet, the model generates one
+        more output token (auto-regressive loop).
+        """
+        return self.prompt_tokens + self.num_output_tokens
 
     @property
     def num_new_tokens(self) -> int:
-        """Tokens NOT yet processed = total - computed."""
-        return self.num_tokens - self.num_computed_tokens
+        """Tokens not yet processed = (prompt + outputs) - computed."""
+        return self.num_tokens_total - self.num_computed_tokens
 
     @property
-    def is_prefill(self) -> bool:
-        """Still processing the prompt? (hasn't caught up yet).
+    def is_finished(self) -> bool:
+        return self.num_output_tokens >= self.max_tokens
 
-        REFERENCE: request.py num_computed_tokens vs num_prompt_tokens.
-        In vLLM this also accounts for spec tokens and placeholders.
-        """
-        return self.num_computed_tokens < len(self.prompt_token_ids)
+    def __repr__(self) -> str:
+        return (f"Request({self.request_id!r}, "
+                f"status={self.status.value}, "
+                f"computed={self.num_computed_tokens}/{self.num_tokens_total}, "
+                f"output={self.num_output_tokens}/{self.max_tokens})")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SchedulerOutput — vllm/v1/core/sched/output.py:L181-L200
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# Simplified KV Cache (block-based)
+# ═══════════════════════════════════════════════════════════════════════
+# REFERENCE: vllm/v1/core/kv_cache_manager.py → KVCacheManager (L1+)
+#
+# Real vLLM: each block stores key-value tensors for `block_size` tokens
+# (PagedAttention). The scheduler calls allocate_slots() per request;
+# OOM triggers preemption which calls free().
+#
+# Our simplification: fixed pool of blocks, allocation is cumulative,
+# but we only count new blocks needed each step (not total). This over-
+# allocates by 1 block every ~block_size decode steps — acceptable for
+# educational demonstration where the KV cache is sized generously.
 
 @dataclass
-class SchedulerOutput:
-    """What the scheduler decided this step.
+class KVCache:
+    """Fixed-size block pool. Allocation is cumulative per request."""
+    total_blocks: int
+    block_size: int = 16
+    free_blocks: int = 0
+    allocations: dict[str, int] = field(default_factory=dict)
 
-    REFERENCE: vllm/v1/core/sched/output.py:L181-L200
-    vLLM's SchedulerOutput includes scheduled_new_reqs + scheduled_cached_reqs,
-    preempted_req_ids, finished_req_ids, num_scheduled_tokens, etc.
-    """
-    scheduled_requests: Dict[str, int]  # request_id → num_tokens to advance
-    total_scheduled_tokens: int
-    finished_req_ids: List[str]
-    preempted_req_ids: List[str] = field(default_factory=list)
-    newly_running_req_ids: List[str] = field(default_factory=list)
+    def __post_init__(self):
+        self.free_blocks = self.total_blocks
 
+    def allocate(self, request_id: str, num_tokens: int) -> Optional[int]:
+        """Try to allocate blocks for `num_tokens` new tokens.
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SimpleKVCacheManager stub (see Chapter 2 for full implementation)
-# REFERENCE: vllm/v1/core/kv_cache_manager.py:L106
-# ═══════════════════════════════════════════════════════════════════════════
-
-class SimpleKVCacheManager:
-    """
-    Simplified KV cache manager for scheduler demo.
-
-    REFERENCE: vllm/v1/core/kv_cache_manager.py (full KVCacheManager).
-
-    The real KVCacheManager handles:
-      - Block hash-based prefix caching
-      - Copy-on-write for shared blocks
-      - Multiple attention groups (full, sliding window, cross-attention)
-      - Block eviction with reference counting
-      - allocate_slots() with num_lookahead_tokens, num_computed_blocks, etc.
-
-    We simplify to: allocate fresh blocks from a free list; free returns them.
-    """
-    def __init__(self, num_gpu_blocks: int, block_size: int = 16):
-        """REFERENCE: kv_cache_manager.py:KVCacheManager.__init__"""
-        self.num_gpu_blocks = num_gpu_blocks
-        self.block_size = block_size
-        self._free_blocks = list(range(num_gpu_blocks))
-
-    def allocate_slots(
-        self, request_id: str, num_new_tokens: int
-    ) -> Optional[List[int]]:
+        Returns number of blocks allocated, or None if OOM.
+        The allocation is cumulative — calling allocate(1) ten times
+        eventually acquires ceil(total_tokens/block_size) blocks.
         """
-        Allocate enough blocks for num_new_tokens.
+        # ceil(num_tokens / block_size), min 1 block
+        needed = max(1, (num_tokens + self.block_size - 1) // self.block_size)
+        if needed <= self.free_blocks:
+            self.free_blocks -= needed
+            self.allocations[request_id] = (
+                self.allocations.get(request_id, 0) + needed
+            )
+            return needed
+        return None  # Out of memory → trigger preemption
 
-        REFERENCE: kv_cache_manager.py:allocate_slots()
-        The real version takes request, num_new_tokens, num_lookahead_tokens,
-        num_new_computed_tokens, new_computed_blocks, etc.
-        """
-        blocks_needed = (num_new_tokens + self.block_size - 1) // self.block_size
-        if blocks_needed > len(self._free_blocks):
-            return None
-        allocated = self._free_blocks[:blocks_needed]
-        self._free_blocks = self._free_blocks[blocks_needed:]
-        return allocated
-
-    def free(self, block_ids: List[int]):
-        """REFERENCE: kv_cache_manager.py:free()"""
-        self._free_blocks.extend(block_ids)
-
-    @property
-    def num_free_blocks(self) -> int:
-        return len(self._free_blocks)
-
-    @property
-    def num_used_blocks(self) -> int:
-        return self.num_gpu_blocks - self.num_free_blocks
+    def free(self, request_id: str):
+        """Return all blocks allocated to a request back to the pool."""
+        if request_id in self.allocations:
+            self.free_blocks += self.allocations.pop(request_id)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# ContinuousBatchingScheduler
-# REFERENCE: vllm/v1/core/sched/scheduler.py:Scheduler class (L67-L945)
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# Static Batching Simulator (for demo comparison)
+# ═══════════════════════════════════════════════════════════════════════
+
+class StaticBatchSimulator:
+    """Simulates traditional static batching to demonstrate bubble waste.
+
+    In static batching, all requests in a batch must complete before
+    the next batch begins. This creates "bubbles" — GPU idle time when
+    fast requests finish but the slowest one is still running.
+    """
+
+    def __init__(self, max_batch_size: int = 32):
+        self.max_batch_size = max_batch_size
+        self.requests: list[Request] = []
+        self.steps = 0
+        self.idle_slots = 0  # Tokens that COULD have been computed but weren't
+
+    def add_request(self, request: Request):
+        self.requests.append(request)
+
+    def run(self) -> dict:
+        """Run static batching to completion. Returns stats dict."""
+        queue = list(self.requests)
+        batch_num = 0
+        slot_history: list[list[str]] = []  # Per-step tracking
+
+        while queue:
+            batch_num += 1
+            batch = queue[:self.max_batch_size]
+            queue = queue[self.max_batch_size:]
+
+            # Initialize batch: all requests start from scratch
+            for req in batch:
+                req.num_computed_tokens = 0
+                req.num_output_tokens = 0
+                req.status = RequestStatus.RUNNING
+
+            # Step 1: Prefill (process all prompt tokens)
+            for req in batch:
+                req.num_computed_tokens = req.prompt_tokens
+            self.steps += 1
+
+            # Decode loop: generate 1 token per step for all active requests
+            active = list(batch)
+            while active:
+                for req in active:
+                    if req.num_computed_tokens >= req.num_tokens_total:
+                        # Generate one output token
+                        req.num_output_tokens += 1
+                        req.num_computed_tokens += 1
+
+                # Remove finished requests from active set
+                still_active = [r for r in active if not r.is_finished]
+                newly_finished = len(active) - len(still_active)
+                active = still_active
+
+                # Count idle slots: requests that finished but batch continues
+                idle_now = sum(1 for r in batch
+                              if r.is_finished and r in batch)
+                self.idle_slots += idle_now
+
+                if active:
+                    self.steps += 1
+                    slot_history.append(
+                        [r.request_id if not r.is_finished else "."
+                         for r in batch]
+                    )
+
+            for req in batch:
+                req.status = RequestStatus.FINISHED
+
+        total_slots = self.steps * min(self.max_batch_size, len(self.requests))
+        total_slots = max(total_slots, 1)
+        utilization = (total_slots - self.idle_slots) / total_slots * 100
+
+        return {
+            "steps": self.steps,
+            "idle_slots": self.idle_slots,
+            "utilization_pct": utilization,
+            "batches": batch_num,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Continuous Batching Scheduler
+# ═══════════════════════════════════════════════════════════════════════
+# REFERENCE: vllm/v1/core/sched/scheduler.py → class Scheduler (L67-L2295)
 
 class ContinuousBatchingScheduler:
-    """
-    Simplified continuous batching scheduler.
+    """Scheduler implementing continuous (dynamic) batching.
 
-    REFERENCE: vllm/v1/core/sched/scheduler.py:L67-L945
+    Static batching problem:
+      Batch of 3 requests: A(8 tokens), B(8), C(16).
+      A and B finish at step 8, but GPU sits idle until C finishes at step 16.
+      Result: 50% GPU utilization, 8 steps of "bubble" waste.
 
-    Key design decisions from vLLM (from the comment at L353-L362):
-    1. No separate prefill/decode phases — every request has
-       num_computed_tokens. The scheduler advances it toward num_tokens.
-    2. Phase 1: RUNNING requests scheduled first (FCFS order within list).
-    3. Phase 2: WAITING requests fill remaining token budget.
-    4. OOM in Phase 1 → preempt lowest-priority running request.
-    5. Chunked prefill: long prompts split across steps.
+    Continuous batching solution:
+      At EVERY step, finished requests leave and waiting requests join.
+      No idle gaps — the token budget is fully utilized.
+      Analogy: a cafeteria that seats new diners at any empty seat,
+      rather than waiting for the entire group to finish.
+
+    Algorithm (each schedule() call):
+      1. Process RUNNING requests — continue generating tokens
+      2. Admit WAITING requests if token budget + KV cache allow
+      3. If KV cache OOM, preempt lowest-priority running request
+      4. Simulate model forward (1 token per eligible request)
+
+    REFERENCE: scheduler.py:L352-L545 (running scheduling)
+    REFERENCE: scheduler.py:L567-L846 (waiting scheduling)
+    REFERENCE: scheduler.py:L952-L972 (preemption)
     """
 
     def __init__(
         self,
-        max_num_scheduled_tokens: int,
-        max_num_running_reqs: int,
-        num_gpu_blocks: int,
+        max_scheduled_tokens: int = 512,
+        kv_cache_blocks: int = 256,
         block_size: int = 16,
-        enable_chunked_prefill: bool = True,
     ):
+        # REFERENCE: scheduler.py:L80-L111 (scheduling constraints)
+        self.max_scheduled_tokens = max_scheduled_tokens
+        self.kv_cache = KVCache(total_blocks=kv_cache_blocks, block_size=block_size)
+
+        # REFERENCE: scheduler.py:L158-L170 (request queues)
+        self.waiting: list[Request] = []   # WAITING + PREEMPTED requests
+        self.running: list[Request] = []   # RUNNING requests
+        self.finished: list[Request] = []  # Completed requests
+
+        # Counters
+        self.step_count = 0
+        self.total_tokens_processed = 0
+        self.total_preemptions = 0
+
+    # ── Request Lifecycle ──────────────────────────────────────────
+
+    def add_request(self, request: Request):
+        """Enqueue a new inference request. REFERENCE: request_queue.py"""
+        request.status = RequestStatus.WAITING
+        self.waiting.append(request)
+
+    def abort_request(self, request_id: str):
+        """Remove a request regardless of its current state."""
+        for lst in [self.waiting, self.running]:
+            for req in list(lst):
+                if req.request_id == request_id:
+                    lst.remove(req)
+                    self.kv_cache.free(request_id)
+                    return
+
+    # ── Preemption ─────────────────────────────────────────────────
+    # REFERENCE: scheduler.py:L479-L510 (victim selection)
+    # REFERENCE: scheduler.py:L952-L972 (_preempt_request)
+
+    def _pick_preemption_victim(self) -> Optional[Request]:
+        """Select the lowest-priority running request to evict.
+
+        In the original (scheduler.py:L479-L483), priority-based victim
+        selection uses: max(running, key=lambda r: (r.priority, r.arrival_time)).
+        We simplify to (priority, request_id) since we don't track arrival_time.
         """
-        REFERENCE: scheduler.py:L67-L148 (Scheduler.__init__)
-        The real Scheduler takes VllmConfig, KVCacheConfig, etc.
+        if not self.running:
+            return None
+        # Higher priority number = lower actual priority
+        return max(self.running, key=lambda r: (r.priority, r.request_id))
+
+    def _preempt_request(self, request: Request):
+        """Evict a running request: free KV cache and return to waiting.
+
+        IMPORTANT simplification: We do NOT reset num_computed_tokens to 0.
+        The original vLLM (scheduler.py:L964) DOES reset it, but then
+        immediately restores num_computed_tokens via prefix cache hits
+        in get_computed_blocks() (scheduler.py:L616-L647). Our version
+        models the EFFECTIVE behavior with prefix caching enabled:
+        preempted requests resume from where they left off.
+
+        REFERENCE: vllm/v1/core/sched/scheduler.py:L952-L972
         """
-        self.max_num_scheduled_tokens = max_num_scheduled_tokens
-        self.max_num_running_reqs = max_num_running_reqs
-        self.block_size = block_size
-        self.enable_chunked_prefill = enable_chunked_prefill
+        self.kv_cache.free(request.request_id)
+        request.status = RequestStatus.PREEMPTED
+        # NOTE: num_computed_tokens NOT reset — see docstring above.
+        self.total_preemptions += 1
+        # Prepend: preempted requests get priority when resuming (fairness)
+        self.waiting.insert(0, request)
 
-        self.kv_cache_manager = SimpleKVCacheManager(num_gpu_blocks, block_size)
+    # ── Core Scheduling Algorithm ──────────────────────────────────
+    # REFERENCE: vllm/v1/core/sched/scheduler.py:L352 (schedule)
 
-        # REFERENCE: scheduler.py:L158-L176
-        # In vLLM the waiting queue is a RequestQueue (FCFS or Priority).
-        # We use a simple list for waiting and running.
-        self.requests: Dict[str, Request] = {}
-        self.waiting: List[Request] = []
-        self.running: List[Request] = []
+    def schedule(self) -> list[Request]:
+        """One scheduling step. Returns requests that made progress.
 
-    def add_request(self, req: Request) -> None:
-        """REFERENCE: scheduler.py:L1728-L1748 (Scheduler.add_request)
+        Each call represents one forward pass of the model. The scheduler
+        decides which requests get how many tokens this step, constrained
+        by (1) token budget, (2) KV cache capacity, (3) max running requests.
 
-        In vLLM this handles:
-          - Streaming input (queued updates for resumable requests)
-          - Structured output grammar initialization
-          - RequestQueue enqueue (FCFS or Priority)
+        Returns:
+            List of Request objects that had tokens processed this step.
         """
-        self.requests[req.request_id] = req
-        self.waiting.append(req)
+        token_budget = self.max_scheduled_tokens
+        scheduled: list[Request] = []
 
-    # ── The Core: schedule() ──────────────────────────────────────────
-    # REFERENCE: scheduler.py:L352-L945
-    #
-    # Architecture:
-    #   1. Phase 1 — Running requests (L388-L556)
-    #      For each RUNNING request (in FCFS order):
-    #        a. Compute num_new_tokens capped by remaining token_budget
-    #        b. Try allocate_slots()
-    #        c. If OOM → preempt lowest-priority running request, retry
-    #        d. Record scheduled tokens, deduct from budget
-    #
-    #   2. Phase 2 — Waiting requests (L568-L846)
-    #      While waiting queue non-empty AND budget > 0 AND running < max:
-    #        a. Pop from waiting queue (FCFS)
-    #        b. Compute num_new_tokens, cap by budget
-    #        c. If chunked prefill OFF and can't fit → STOP
-    #        d. Try allocate_slots()
-    #        e. If OOM → STOP (no preemption for waiting requests)
-    #        f. Move to RUNNING, record scheduled tokens
-    #
-    #   3. Build SchedulerOutput (L871-L945)
-
-    def schedule(self) -> SchedulerOutput:
-        """
-        Main scheduling loop — the heart of continuous batching.
-
-        REFERENCE: scheduler.py:L352-L945
-        """
-        token_budget = self.max_num_scheduled_tokens
-        scheduled: Dict[str, int] = {}   # req_id → num_tokens this step
-        finished: List[str] = []
-        preempted_req_ids: List[str] = []
-        newly_running_req_ids: List[str] = []
-
-        # self.trace_log accumulates annotations for the runnable demo
-        if not hasattr(self, 'trace_log'):
-            self.trace_log = []
-
-        step_header = f"\n  ── Schedule Step ──  budget={token_budget}"
-        self.trace_log.append(step_header)
-
-        # ── Phase 1: Running Requests ──
-        # REFERENCE: scheduler.py:L388-L556
-        self.trace_log.append(f"  Phase 1 (running={len(self.running)}):")
-
-        req_index = 0
-        while req_index < len(self.running) and token_budget > 0:
-            req = self.running[req_index]
-            trace_note = f"    r{req.request_id}[computed={req.num_computed_tokens}, " \
-                         f"new={req.num_new_tokens}]"
-
-            num_new = min(req.num_new_tokens, token_budget)
-            if num_new <= 0:
-                self.trace_log.append(f"{trace_note} → skip (no new tokens)")
-                req_index += 1
+        # ═══ Phase 1: Schedule RUNNING requests (continuity first) ═══
+        # REFERENCE: scheduler.py:L387-L460
+        # Running requests always get priority — this minimizes preemption
+        # churn and maintains forward progress for already-admitted requests.
+        for request in list(self.running):
+            if request.is_finished:
+                self._finish_request(request)
                 continue
 
-            # Try to allocate KV cache for this request
-            new_blocks = self.kv_cache_manager.allocate_slots(
-                req.request_id, num_new
-            )
-
-            # If OOM, keep preempting lowest-priority running requests
-            # until allocation succeeds or we can't preempt anyone.
-            # REFERENCE: scheduler.py:L466-L511
-            while new_blocks is None:
-                # Preempt lowest-priority request (last in running list for FCFS)
-                # REFERENCE: scheduler.py:L503-L504
-                if len(self.running) <= 1:
-                    # Only this request in running — can't preempt anyone
-                    self.trace_log.append(f"{trace_note} → OOM, no one to preempt")
-                    break
-
-                preempted_req = self.running.pop()
-                if preempted_req == req:
-                    # Can't preempt ourselves — put it back
-                    self.running.append(preempted_req)
-                    self.trace_log.append(f"{trace_note} → OOM, can't preempt self")
-                    break
-
-                self._preempt_request(preempted_req)
-                preempted_req_ids.append(preempted_req.request_id)
-                self.trace_log.append(
-                    f"      → preempted r{preempted_req.request_id}"
-                )
-
-                # If the preempted request was already scheduled this step,
-                # restore its tokens to the budget.
-                # REFERENCE: scheduler.py:L485-L502
-                if preempted_req.request_id in scheduled:
-                    freed_tokens = scheduled.pop(preempted_req.request_id)
-                    token_budget += freed_tokens
-                    self.trace_log.append(
-                        f"      → restored {freed_tokens} tokens to budget"
-                    )
-
-                # Retry allocation
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                    req.request_id, num_new
-                )
-
-            if new_blocks is None:
-                # Even after preemption, can't schedule this request
-                self.trace_log.append(f"{trace_note} → FAILED (OOM)")
+            if token_budget <= 0:
                 break
 
-            # Allocation succeeded — schedule the request
-            req.block_ids.extend(new_blocks)
-            scheduled[req.request_id] = num_new
-            token_budget -= num_new
-            req_index += 1
-            self.trace_log.append(
-                f"{trace_note} → scheduled {num_new} tokens "
-                f"(budget left={token_budget})"
-            )
+            num_new = min(request.num_new_tokens, token_budget)
+            if num_new <= 0:
+                continue
 
-        # ── Phase 2: Waiting Requests ──
-        # REFERENCE: scheduler.py:L568-L846
-        self.trace_log.append(
-            f"  Phase 2 (waiting={len(self.waiting)}, running={len(self.running)}):"
-        )
+            # Try to allocate KV cache blocks, preempting if needed.
+            # The retry loop (matching scheduler.py:L466-L510 while True)
+            # allows the scheduler to evict a lower-priority request and
+            # immediately use its freed blocks for the current request.
+            blocks = None
+            while True:
+                blocks = self.kv_cache.allocate(request.request_id, num_new)
+                if blocks is not None:
+                    break  # Allocation succeeded
 
-        # In vLLM, after preemption Phase 2 is skipped:
-        # REFERENCE: scheduler.py:L568 "if not preempted_reqs"
-        if not preempted_req_ids:
-            while self.waiting and token_budget > 0 \
-                    and len(self.running) < self.max_num_running_reqs:
-                req = self.waiting[0]
-                trace_note = f"    r{req.request_id}[prompt={len(req.prompt_token_ids)},\n" \
-                             f"             max_out={req.max_tokens}]"
+                # KV cache full — preempt and retry
+                victim = self._pick_preemption_victim()
+                if victim is None:
+                    break  # No one left to preempt
+                self.running.remove(victim)
+                self._preempt_request(victim)
+                if victim is request:
+                    break  # Preempted ourselves, can't schedule this step
 
-                # Skip finished requests in waiting queue
-                if req.status.is_finished():
-                    self.waiting.pop(0)
-                    continue
-
-                num_new = req.num_new_tokens
-
-                # REFERENCE: scheduler.py:L684-L690
-                # If chunked prefill is disabled and the request can't fit
-                # in the remaining budget, stop admitting.
-                if (not self.enable_chunked_prefill
-                        and num_new > token_budget):
-                    self.trace_log.append(
-                        f"{trace_note} → can't fit (need {num_new}, "
-                        f"budget {token_budget}), stop admitting"
-                    )
-                    break
-
-                # REFERENCE: scheduler.py:L682-L692
-                # Chunked prefill: cap at token_budget, otherwise break if
-                # request doesn't fit (handled above).
-                if self.enable_chunked_prefill:
-                    num_new = min(num_new, token_budget)
-
-                if num_new <= 0:
-                    self.waiting.pop(0)
-                    continue
-
-                # Allocate KV cache
-                # REFERENCE: scheduler.py:L744-L754
-                blocks = self.kv_cache_manager.allocate_slots(
-                    req.request_id, num_new
-                )
-                if blocks is None:
-                    self.trace_log.append(
-                        f"{trace_note} → OOM (cache full), stop admitting"
-                    )
-                    break  # No more KV cache — stop admitting
-
-                # Admit the request to running
-                req.block_ids = blocks
-                req.status = RequestStatus.RUNNING
-                scheduled[req.request_id] = num_new
+            if blocks is not None:
+                request.num_computed_tokens += num_new
                 token_budget -= num_new
-                newly_running_req_ids.append(req.request_id)
+                self.total_tokens_processed += num_new
+                scheduled.append(request)
 
-                self.waiting.pop(0)
-                self.running.append(req)
-                self.trace_log.append(
-                    f"{trace_note} → admitted, scheduled {num_new} tokens "
-                    f"(budget left={token_budget})"
-                )
+        # ═══ Phase 2: Admit WAITING requests ═══
+        # REFERENCE: scheduler.py:L567-L846
+        # After servicing running requests, fill remaining capacity with
+        # new or preempted requests from the waiting queue.
+        for request in list(self.waiting):
+            if token_budget <= 0:
+                break
 
-        # ── Build SchedulerOutput ──
-        # REFERENCE: scheduler.py:L871-L945
-        output = SchedulerOutput(
-            scheduled_requests=scheduled,
-            total_scheduled_tokens=sum(scheduled.values()),
-            finished_req_ids=finished,
-            preempted_req_ids=preempted_req_ids,
-            newly_running_req_ids=newly_running_req_ids,
-        )
+            num_new = min(request.num_new_tokens, token_budget)
+            if num_new <= 0:
+                continue
 
-        self.trace_log.append(
-            f"  → Result: {len(scheduled)} reqs, "
-            f"{output.total_scheduled_tokens} tokens"
-        )
-        return output
+            blocks = self.kv_cache.allocate(request.request_id, num_new)
+            if blocks is not None:
+                request.num_computed_tokens += num_new
+                request.status = RequestStatus.RUNNING
+                token_budget -= num_new
+                self.total_tokens_processed += num_new
+                self.waiting.remove(request)
+                self.running.append(request)
+                scheduled.append(request)
+            else:
+                # KV cache exhausted — stop admitting
+                # Original behavior (scheduler.py:L756): break, don't
+                # preempt running requests just to admit new ones.
+                break
 
-    def _preempt_request(self, req: Request) -> None:
-        """
-        Preempt a running request: free its KV blocks, reset computed tokens,
-        move it back to the waiting queue.
+        # ═══ Phase 3: Simulate model forward pass ═══
+        # In real vLLM, ModelRunner executes the scheduled requests and
+        # the scheduler's update_from_output() (scheduler.py:L1290) processes
+        # the generated tokens. Here we simulate: each request that has
+        # finished its prefill generates 1 output token per step.
+        #
+        # This models the auto-regressive decode loop: after the prompt
+        # is fully computed, the model produces 1 token at a time.
+        for request in list(self.running):
+            if request.is_finished:
+                self._finish_request(request)
+            elif request.num_computed_tokens >= request.num_tokens_total:
+                # All existing tokens processed → model generates 1 more
+                request.num_output_tokens += 1
+                # num_computed_tokens will be incremented next step's Phase 1
+                # when we allocate the block for this output token.
+                if request.is_finished:
+                    self._finish_request(request)
 
-        REFERENCE: scheduler.py:L952-L972
+        self.step_count += 1
+        return scheduled
 
-        NOTE: The request MUST be popped from the running queue OUTSIDE this
-        method (caller does `self.running.pop()` before calling us), as in
-        vLLM.  Do NOT remove it again here.
+    # ── Helpers ────────────────────────────────────────────────────
 
-        In vLLM this also:
-          - Frees encoder cache
-          - Clears spec token IDs
-          - Increments num_preemptions
-          - Records PREEMPTED event for logging
-        """
-        # REFERENCE: scheduler.py:L961 — self.kv_cache_manager.free(request)
-        self.kv_cache_manager.free(req.block_ids)
-        req.block_ids = []
-        req.status = RequestStatus.PREEMPTED
-        # REFERENCE: scheduler.py:L964 — reset computed tokens to 0
-        # (must recompute from scratch since KV cache is gone)
-        req.num_computed_tokens = 0
-        # NOTE: Request already popped from self.running by caller.
-        # Do NOT call self.running.remove(req) here.
+    def _finish_request(self, request: Request):
+        """Move a completed request from running to finished."""
+        self.running.remove(request)
+        self.kv_cache.free(request.request_id)
+        request.status = RequestStatus.FINISHED
+        self.finished.append(request)
 
-        # REFERENCE: scheduler.py:L972 — self.waiting.prepend_request(request)
-        # Put at front of waiting queue so it's re-scheduled next
-        self.waiting.insert(0, req)
+    # ── Stats and Display ──────────────────────────────────────────
 
-    def update_after_step(self, output: SchedulerOutput) -> None:
-        """
-        Update request state after model forward pass.
+    @property
+    def stats(self) -> dict:
+        return {
+            "step": self.step_count,
+            "waiting": len(self.waiting),
+            "running": len(self.running),
+            "finished": len(self.finished),
+            "free_kv": self.kv_cache.free_blocks,
+            "total_kv": self.kv_cache.total_blocks,
+            "tokens": self.total_tokens_processed,
+            "preemptions": self.total_preemptions,
+        }
 
-        REFERENCE: scheduler.py:L974-L998 (_update_after_schedule)
-                   + scheduler.py:L1290-L1551 (update_from_output)
-
-        In vLLM, _update_after_schedule advances num_computed_tokens for
-        ALL scheduled requests immediately after scheduling (before the
-        forward pass). This allows the next schedule() call to see the
-        updated state.
-
-        update_from_output handles:
-          - Sampled token IDs from the model runner
-          - Stop checking (via check_stop in _update_request_with_output)
-          - Spec decode rejection (reduces num_computed_tokens)
-          - Freeing encoder cache inputs after use
-          - Building EngineCoreOutput for each request
-
-        KEY INSIGHT for our simplified version:
-        After prefill completes, num_computed_tokens catches up to
-        num_prompt_tokens but output_token_ids is empty, so num_new_tokens
-        becomes 0. To simulate the model forward pass producing a decode
-        token, we generate one output token per step for every request
-        that has finished prefill and still has output budget.
-        """
-        # REFERENCE: scheduler.py:L985-L993 (_update_after_schedule)
-        for req_id, num_tokens in output.scheduled_requests.items():
-            req = self.requests[req_id]
-            req.num_computed_tokens += num_tokens
-
-            # REFERENCE: scheduler.py:L988-L990
-            # is_prefill_chunk flag: true if num_computed_tokens hasn't
-            # caught up to num_tokens + num_output_placeholders.
-
-            # Simulate model forward pass output:
-            # If request has finished prefill (num_computed_tokens >= prompt_len),
-            # the model produces one output token per decode step.
-            # REFERENCE: scheduler.py:L1622-L1638 (_update_request_with_output)
-            if not req.is_prefill:
-                # Only generate output if we haven't hit max_tokens yet.
-                # This check mirrors check_stop() in vLLM:
-                #   stopped = check_stop(request, self.max_model_len)
-                # which checks num_output_tokens >= max_tokens.
-                if len(req.output_token_ids) < req.max_tokens:
-                    # Placeholder — real token comes from model runner
-                    req.output_token_ids.append(0)
-
-            # Check if finished (max_tokens reached)
-            # REFERENCE: scheduler.py:L1634-L1637
-            # (check_stop inside _update_request_with_output)
-            if len(req.output_token_ids) >= req.max_tokens:
-                req.status = RequestStatus.FINISHED_LENGTH_CAPPED
-                self._finish_request(req)
-
-    def _finish_request(self, req: Request) -> None:
-        """
-        Free a finished request's resources and remove it from running.
-
-        REFERENCE: scheduler.py:L1813-L1834 (_free_request)
-        In vLLM, _free_request also:
-          - Handles KV connector delay-free (async KV transfer)
-          - Frees encoder cache
-          - Tracks finished IDs for next SchedulerOutput
-          - Removes from self.requests dict
-        """
-        # REFERENCE: scheduler.py:L1827 — free blocks
-        self.kv_cache_manager.free(req.block_ids)
-        req.block_ids = []
-        if req in self.running:
-            self.running.remove(req)
+    def print_state(self):
+        s = self.stats
+        print(f"\n{'='*55}")
+        print(f"Step {s['step']} | Running: {s['running']} "
+              f"Waiting: {s['waiting']} | Finished: {s['finished']}")
+        print(f"KV: {s['free_kv']}/{s['total_kv']} blocks | "
+              f"Tokens: {s['tokens']} | Preemptions: {s['preemptions']}")
+        for r in self.running:
+            bar_len = 20
+            filled = int(r.num_output_tokens * bar_len / max(r.max_tokens, 1))
+            bar = "█" * filled + "░" * (bar_len - filled)
+            print(f"  [{r.request_id:8s}] {bar} {r.num_output_tokens:3d}/{r.max_tokens}")
+        print(f"{'='*55}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Static Batching Comparison (for Chapter narrative)
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# Demo
+# ═══════════════════════════════════════════════════════════════════════
 
-def static_batching_simulation(
-    requests: List[Tuple[int, int]],  # (prompt_len, max_output_len)
-) -> int:
+def _demo_bubble_diagram():
+    """Print an ASCII visualization of the static batching bubble problem.
+
+    Three requests in one static batch. Fast requests finish early
+    (at t=8) but the batch isn't done until the slowest (t=16).
+    GPU sits idle for 8 steps — these are the "bubbles."
     """
-    Simulate static batching: all prompts must finish prefill before any decode.
+    # Show the generation timeline (prompt prefill = 1 step, invisible)
+    total_time = 16  # max generation steps (Charlie)
+    short_time = 8   # min generation steps (Alice, Bob)
+    idle = total_time - short_time  # steps of idle per fast request
 
-    Returns total steps needed (each step = one model forward pass).
+    print(f"\n  Static batch of 3 requests, 1 generation token/step:")
+    print(f"  Alice & Bob:   8 tokens → finish at step {short_time}")
+    print(f"  Charlie:      16 tokens → finishes at step {total_time}")
+    print(f"  Bubble: {idle} steps × 2 idle slots = {idle * 2} wasted slot-steps")
+    print()
 
-    How static batching works:
-      Phase 1 — Prefill: process all prompts simultaneously. The batch waits
-                for the LONGEST prompt to finish. Shorter prompts' GPUs idle.
-      Phase 2 — Decode: generate one token per request per step. All requests
-                advance at the same rate. When a request finishes, its slot
-                remains idle until all finish.
+    # Print compact ASCII timeline
+    header = "  Time →   "
+    timeline = "           "
+    for t in range(total_time + 1):
+        if t % 4 == 0:
+            header += f"t={t:<3}"
+    print(header)
 
-    This produces the "bubble" — GPU idle time — that continuous batching
-    eliminates by interleaving prefill and decode work.
+    for name, steps in [("Alice  ", short_time), ("Bob    ", short_time),
+                         ("Charlie", total_time)]:
+        line = f"  {name} "
+        for t in range(total_time):
+            line += "█" if t < steps else "·"
+        line += f"  ({steps} tokens)"
+        print(line)
+
+    print(f"\n  Key: █ = computing   · = idle (bubble)")
+
+
+def main():
+    """Demonstrate static batching vs continuous batching.
+
+    Three-part demo:
+      Part 1 — Static batching: show the bubble problem visually
+      Part 2 — Continuous batching: eliminate bubbles with the scheduler
+      Part 3 — Late arrival: a request joins mid-execution
+
+    All demo requests use prompt_tokens=1 (a symbolic single input token
+    that represents the initial prompt). The focus is on generation
+    (output) tokens, where the bubble effect dominates.
     """
-    steps = 0
-    prompt_lens = [r[0] for r in requests]
-    remaining_output = [r[1] for r in requests]
-    active = [True] * len(requests)
+    print("=" * 60)
+    print("  CONTINUOUS BATCHING — From Bubbles to Full Utilization")
+    print("=" * 60)
 
-    # Prefill phase: do all prompts (batch them together)
-    max_prompt = max(prompt_lens)
-    steps += max_prompt  # Each token of the longest prompt is one step
+    # ── Part 1: Static Batching Bubble ────────────────────────────
+    print("\n" + "─" * 60)
+    print("  PART 1: The Static Batching Bubble Problem")
+    print("─" * 60)
+    print("""
+    In static batching, ALL requests in a batch must complete before
+    a new batch starts. If Alice finishes at step 8 but Charlie needs
+    16 steps, Alice's slot sits idle for 8 steps — a "bubble" of
+    wasted compute capacity.
+    """)
+    _demo_bubble_diagram()
 
-    # Decode phase: generate one token at a time
-    while any(active):
-        for i in range(len(requests)):
-            if active[i]:
-                remaining_output[i] -= 1
-                if remaining_output[i] <= 0:
-                    active[i] = False
-        steps += 1
+    # Simulate static batching to compute actual waste
+    static_sim = StaticBatchSimulator(max_batch_size=3)
+    static_sim.add_request(Request("A", prompt_tokens=1, max_tokens=8))
+    static_sim.add_request(Request("B", prompt_tokens=1, max_tokens=8))
+    static_sim.add_request(Request("C", prompt_tokens=1, max_tokens=16))
+    static_stats = static_sim.run()
+    print(f"\n  Static batch simulation:")
+    print(f"    Total steps:        {static_stats['steps']}")
+    print(f"    Idle slots wasted:  {static_stats['idle_slots']}")
+    print(f"    GPU utilization:    {static_stats['utilization_pct']:.1f}%")
 
-    return steps
+    # ── Part 2: Continuous Batching Solution ──────────────────────
+    print("\n" + "─" * 60)
+    print("  PART 2: Continuous Batching Eliminates Bubbles")
+    print("─" * 60)
+    print("""
+    Same 3 requests. At EVERY step the scheduler evaluates who needs
+    compute. When Alice and Bob finish (step 9), their KV cache blocks
+    are freed and Charlie can use the full token budget — no idle gaps.
+    """)
 
-
-def continuous_batching_simulation(
-    requests: List[Tuple[int, int]],
-    max_tokens_per_step: int = 2048,
-) -> int:
-    """
-    Simulate continuous batching: prefill and decode tokens are interleaved.
-
-    Returns total steps needed.
-
-    How continuous batching works:
-      Each step fills a token budget with a MIX of work:
-        1. One decode token per request in decode phase
-        2. Remaining budget: fill with prefill tokens (chunked across steps)
-
-      Since decode tokens are cheap (1 token = 1 forward pass) and prefill
-      tokens fill the leftover budget, GPU utilization stays high.
-
-    This is a simplified model — the real scheduler is more sophisticated
-    (FCFS queues, preemption, prefix caching, etc.).
-    """
-    steps = 0
-    prompt_lens = [r[0] for r in requests]
-    remaining_prompt = list(prompt_lens)
-    remaining_output = [r[1] for r in requests]
-    active = [True] * len(requests)
-
-    while any(active):
-        tokens_this_step = 0
-        # First: one decode token per active request in decode phase
-        for i in range(len(requests)):
-            if active[i] and remaining_prompt[i] <= 0:
-                if tokens_this_step + 1 <= max_tokens_per_step:
-                    remaining_output[i] -= 1
-                    tokens_this_step += 1
-                    if remaining_output[i] <= 0:
-                        active[i] = False
-
-        # Then: fill remaining budget with prefill tokens
-        for i in range(len(requests)):
-            if active[i] and remaining_prompt[i] > 0:
-                can_do = min(
-                    remaining_prompt[i], max_tokens_per_step - tokens_this_step
-                )
-                if can_do > 0:
-                    remaining_prompt[i] -= can_do
-                    tokens_this_step += can_do
-
-        steps += 1
-
-    return steps
-
-
-def bubble_analysis():
-    """
-    Quantify the GPU idle time (bubble) in static batching.
-
-    Static batching has two kinds of bubble:
-    1. Prefill bubble: short prompts wait for longest prompt's prefill
-    2. Decode bubble: during decode, each request generates ONE token per step
-       → GPU spends most time at low utilization
-
-    Continuous batching fills these bubbles with other work.
-    """
-    # Example: 8 requests, half long prompt (2048), half short (128)
-    requests = [(2048, 256)] * 4 + [(128, 256)] * 4
-
-    static_steps = static_batching_simulation(requests)
-    continuous_steps = continuous_batching_simulation(requests)
-
-    static_gpu_util = (
-        sum(r[0] for r in requests) + sum(r[1] for r in requests)
-    ) / (static_steps * len(requests))
-
-    print(f"Static batching:       {static_steps} steps")
-    print(f"Continuous batching:   {continuous_steps} steps")
-    print(f"Speedup:               {static_steps / continuous_steps:.1f}x")
-    print(f"Static GPU utilization: {static_gpu_util:.1%}")
-
-    return static_steps, continuous_steps
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Runnable Demo — Annotated Scheduling Trace
-# ═══════════════════════════════════════════════════════════════════════════
-
-def run_demo():
-    """
-    Demo: run the scheduler with a diverse workload and print annotated trace.
-
-    This demonstrates the core continuous batching behaviors:
-      - Running-first scheduling
-      - Chunked prefill (splitting long prompts across steps)
-      - Mixing prefill and decode work in the same step
-      - Token budget management
-      - Request lifecycle (WAITING → RUNNING → FINISHED)
-    """
-    print("=" * 70)
-    print("Continuous Batching Scheduler — Annotated Trace")
-    print("=" * 70)
-
-    # Setup: limited budget to force chunked prefill
     sched = ContinuousBatchingScheduler(
-        max_num_scheduled_tokens=512,
-        max_num_running_reqs=16,
-        num_gpu_blocks=1000,
-        block_size=16,
-        enable_chunked_prefill=True,
+        max_scheduled_tokens=64,
+        kv_cache_blocks=64,
+        block_size=4,
     )
 
-    # Add a diverse workload
-    # r1: long prompt (will be chunked across steps)
-    # r2: medium prompt
-    # r3: short prompt
-    sched.add_request(Request("1", list(range(800)), max_tokens=20, arrival_time=0))
-    sched.add_request(Request("2", list(range(200)), max_tokens=50, arrival_time=0))
-    sched.add_request(Request("3", list(range(50)), max_tokens=100, arrival_time=0))
+    sched.add_request(Request("A", prompt_tokens=1, max_tokens=8, priority=0))
+    sched.add_request(Request("B", prompt_tokens=1, max_tokens=8, priority=0))
+    sched.add_request(Request("C", prompt_tokens=1, max_tokens=16, priority=0))
 
-    print(f"\nWorkload:")
-    for req in sched.waiting:
-        print(f"  r{req.request_id}: prompt={len(req.prompt_token_ids)}, "
-              f"max_out={req.max_tokens}")
+    print("\n  Running continuous batching scheduler:")
+    milestone = 0
+    for step in range(30):
+        sched.schedule()
 
-    # Run scheduling loop
-    for step in range(8):
-        print(f"\n{'─' * 50}")
-        print(f"Step {step + 1}")
+        if step == milestone:
+            sched.print_state()
+            milestone += 5
 
-        # Print pre-schedule state
-        print(f"  State before: "
-              f"running={len(sched.running)}, "
-              f"waiting={len(sched.waiting)}, "
-              f"free_blocks={sched.kv_cache_manager.num_free_blocks}")
-
-        output = sched.schedule()
-        sched.update_after_step(output)
-
-        # Print post-schedule summary
-        for rid, ntokens in output.scheduled_requests.items():
-            req = sched.requests[rid]
-            phase = "prefill" if req.is_prefill else "decode"
-            print(f"  r{rid}: {ntokens} tokens ({phase}), "
-                  f"computed={req.num_computed_tokens}/{req.num_tokens}")
-
-        if output.preempted_req_ids:
-            print(f"  PREEMPTED: {output.preempted_req_ids}")
-
-        if any(sched.requests[rid].status.is_finished()
-               for rid in output.scheduled_requests):
-            finished = [rid for rid in output.scheduled_requests
-                        if sched.requests[rid].status.is_finished()]
-            print(f"  FINISHED: {finished}")
-
-        budget_used = sum(output.scheduled_requests.values())
-        print(f"  Budget: {budget_used}/{sched.max_num_scheduled_tokens}")
-
-        # Check if we're done
-        if not sched.waiting and not sched.running:
-            print(f"\nAll requests finished after {step + 1} steps.")
+        if not sched.running and not sched.waiting:
+            print(f"\n  All done at step {step + 1}!")
             break
 
-    # Print KV cache efficiency
-    total_allocated = sched.kv_cache_manager.num_used_blocks
-    print(f"\n{'=' * 70}")
-    print(f"Final KV Cache: {total_allocated}/{sched.kv_cache_manager.num_gpu_blocks} "
-          f"blocks used")
-    print(f"Bubble analysis (static vs continuous):")
-    bubble_analysis()
+    cb_steps = sched.stats["step"]
+    cb_tokens = sched.stats["tokens"]
+    print(f"\n  Continuous batching stats:")
+    print(f"    Steps:               {cb_steps}")
+    print(f"    Tokens processed:    {cb_tokens}")
+    print(f"    Preemptions:         {sched.stats['preemptions']}")
+    print(f"    Finished requests:   {sched.stats['finished']}")
+
+    print(f"\n  Comparison:")
+    print(f"    Static batching:  {static_stats['steps']} steps, "
+          f"{static_stats['idle_slots']} idle slots, "
+          f"{static_stats['utilization_pct']:.1f}% utilization")
+    print(f"    Continuous batch:  {cb_steps} steps, "
+          f"0 idle slots, 100% slot utilization")
+    print(f"    → Continuous batching recovers wasted capacity by "
+          f"letting finished requests leave immediately.")
+
+    # ── Part 3: Late Arrival ──────────────────────────────────────
+    print("\n" + "─" * 60)
+    print("  PART 3: Late-Arriving Request Joins Mid-Execution")
+    print("─" * 60)
+    print("""
+    Another key advantage: new requests can join mid-execution without
+    waiting for a batch boundary. In static batching, a late request
+    would queue until the ENTIRE current batch finishes.
+    """)
+
+    sched2 = ContinuousBatchingScheduler(
+        max_scheduled_tokens=64,
+        kv_cache_blocks=64,
+        block_size=4,
+    )
+
+    sched2.add_request(Request("Alpha", prompt_tokens=1, max_tokens=10, priority=0))
+    sched2.add_request(Request("Beta",  prompt_tokens=1, max_tokens=10, priority=0))
+    sched2.add_request(Request("Gamma", prompt_tokens=1, max_tokens=14, priority=0))
+
+    print("\n  Starting with Alpha, Beta, Gamma...")
+    for _ in range(4):
+        sched2.schedule()
+    sched2.print_state()
+
+    # Delta arrives late
+    print("\n  *** Delta arrives at step 5! ***")
+    print("  (In static batching, Delta would wait for Alpha/Beta/Gamma to finish)")
+    sched2.add_request(Request("Delta", prompt_tokens=1, max_tokens=8, priority=0))
+
+    # Run more steps, show Delta integrated
+    for _ in range(4):
+        sched2.schedule()
+    sched2.print_state()
+
+    # Run to completion
+    for _ in range(20):
+        sched2.schedule()
+        if not sched2.running and not sched2.waiting:
+            break
+
+    print(f"\n  Completion order:")
+    for r in sched2.finished:
+        print(f"    {r.request_id}  "
+              f"(output={r.num_output_tokens}/{r.max_tokens})")
+
+    delta = next(r for r in sched2.finished if r.request_id == "Delta")
+    print(f"\n  Delta joined at step 5, finished successfully among "
+          f"the original requests — seamless integration.")
+
+    print("\n" + "=" * 60)
+    print("  KEY TAKEAWAY")
+    print("=" * 60)
+    print("""
+    Continuous batching separates request LIFETIME from batch LIFETIME:
+      - Static batching:  batch = fixed group, fixed duration
+      - Continuous batch: batch = whoever needs compute right now
+
+    This single architectural decision enables vLLM to achieve 10x+
+    higher throughput than static-batching inference servers. It is
+    the foundation upon which chunked prefill, prefix caching, and
+    priority scheduling are built.
+    """)
 
 
 if __name__ == "__main__":
-    run_demo()
+    main()

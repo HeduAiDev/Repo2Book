@@ -1,151 +1,134 @@
-# Implementation Notes — Ch4 Continuous Batching
+# Implementation Notes — Ch04 Continuous Batching
 
-## Source Analysis (HARD GATE)
+## Source Analysis
 
-### 1. What vLLM files implement this feature?
+### 1. What files implement this feature?
 
-| File | Path (relative to vllm/) | Role |
-|------|--------------------------|------|
-| Scheduler | `vllm/v1/core/sched/scheduler.py` | Core two-phase scheduling: schedule() L352, preempt L952, update L974, update_from_output L1290, free L1813 |
-| Scheduler Output | `vllm/v1/core/sched/output.py` | SchedulerOutput dataclass L181, NewRequestData L31, CachedRequestData L112 |
-| Request Queue | `vllm/v1/core/sched/request_queue.py` | FCFSQueue L75, PriorityQueue L131, SchedulingPolicy L13 |
-| Request | `vllm/v1/request.py` | Request class L59, RequestStatus L310 |
-| Scheduler Config | `vllm/config/scheduler.py` | SchedulerConfig L26: max_num_scheduled_tokens, max_num_seqs, enable_chunked_prefill, long_prefill_token_threshold |
-| Scheduler Interface | `vllm/v1/core/sched/interface.py` | SchedulerInterface ABC, PauseState enum |
-| KV Cache Manager | `vllm/v1/core/kv_cache_manager.py` | KVCacheManager: allocate_slots(), free(), get_computed_blocks() |
+The continuous batching scheduler spans ~2300 lines in vLLM's V1 engine. The core scheduling logic is in `scheduler.py`, with supporting infrastructure in the request queue, KV cache manager, and request data structure.
 
-### 2. Key classes and their responsibilities
+| File | Lines | Role |
+|------|-------|------|
+| `vllm/v1/core/sched/scheduler.py` | L67-L300 | `Scheduler.__init__()` — constructor, KV cache config, scheduling constraints, encoder setup |
+| `vllm/v1/core/sched/scheduler.py` | L352-L950 | `schedule()` — **core algorithm**: running-first scheduling, waiting admission, KV cache allocation, preemption, output construction |
+| `vllm/v1/core/sched/scheduler.py` | L952-L972 | `_preempt_request()` — evict a running request back to waiting |
+| `vllm/v1/core/sched/scheduler.py` | L974-L998 | `_update_after_schedule()` — advance `num_computed_tokens` post-schedule |
+| `vllm/v1/core/sched/scheduler.py` | L1290-L1500+ | `update_from_output()` — process model output, detect stops, update request states |
+| `vllm/v1/core/sched/request_queue.py` | full | `RequestQueue`, `SchedulingPolicy` (FCFS/PRIORITY) — waiting request queue with priority ordering |
+| `vllm/v1/request.py` | L59-L308 | `Request` dataclass — ~20 fields tracking token progress, status, multimodal inputs |
+| `vllm/v1/request.py` | L310-L352 | `RequestStatus` enum — 11 status values (WAITING through FINISHED_REPETITION) |
+| `vllm/v1/core/kv_cache_manager.py` | full | `KVCacheManager` — block-based KV cache allocation, `allocate_slots()`, `free()`, `get_computed_blocks()` |
+| `vllm/v1/core/sched/output.py` | full | `SchedulerOutput`, `NewRequestData`, `CachedRequestData` — output data structures |
+| `vllm/config/scheduler.py` | L56-L84 | `SchedulerConfig` — `max_num_scheduled_tokens`, `max_num_seqs`, `policy`, chunked prefill thresholds |
 
-**Scheduler (scheduler.py:L67):**
-- Owns: `self.running` (list), `self.waiting` (RequestQueue), `self.requests` (dict)
-- Owns: `self.kv_cache_manager` (KVCacheManager)
-- Owns: `self.finished_req_ids` (set), `self.prev_step_scheduled_req_ids` (set)
-- Key methods: `schedule()` (L352), `_preempt_request()` (L952), `_update_after_schedule()` (L974), `update_from_output()` (L1290), `_free_request()` (L1813), `add_request()` (L1728)
-- Delegates to: KVCacheManager for block allocation, RequestQueue for FCFS/Priority ordering
+### 2. Key classes and responsibilities
 
-**Request (request.py:L59):**
-- Owns: token IDs (prompt + output), status, computed tokens count
-- Key properties: `num_tokens`, `num_tokens_with_spec`, `num_computed_tokens`, `num_output_tokens`
-- State machine: WAITING → RUNNING → PREEMPTED → WAITING | FINISHED_*
+- **Scheduler** (`scheduler.py:L67`): Central orchestrator. Maintains `self.waiting` (priority queue), `self.running` (list), `self.finished_req_ids` (set). The `schedule()` method is called once per model forward step and decides which requests get how many tokens.
 
-**RequestQueue (request_queue.py):**
-- FCFSRequestQueue (L75): deque-based, O(1) append/popleft
-- PriorityRequestQueue (L131): heap-based, O(log n) push/pop
+- **RequestQueue** (`request_queue.py`): Priority-ordered queue for waiting requests. Supports `SchedulingPolicy.FCFS` (first-come-first-served) and `SchedulingPolicy.PRIORITY` (priority-based). Methods: `peek_request()`, `pop_request()`, `prepend_request()`.
 
-**KVCacheManager (kv_cache_manager.py):**
-- Owns: block pools, prefix cache hash table, block-to-block mapping
-- Key methods: `allocate_slots()`, `free()`, `get_computed_blocks()`, `get_blocks()`
+- **KVCacheManager** (`kv_cache_manager.py`): Manages KV cache blocks using PagedAttention. Key method `allocate_slots(request, num_new_tokens)` returns `KVCacheBlocks` or `None` (OOM). Also handles prefix caching via `get_computed_blocks()`.
 
-### 3. Data flow
+- **Request** (`request.py:L59`): Per-request state machine. Key fields: `num_computed_tokens` (tokens fed to model), `num_tokens` (total tokens including prompt + output), `status` (RequestStatus), `priority`, `arrival_time`.
+
+- **SchedulingPolicy** (`request_queue.py`): Enum controlling which waiting request goes next. FCFS uses arrival order; PRIORITY uses `(priority, arrival_time, request_id)` tuple ordering.
+
+### 3. Data flow (one scheduling step)
 
 ```
-Client sends request
-  → Scheduler.add_request() (L1728)
-    → self.waiting.add_request(request) [FCFS or Priority]
-  
-Engine loop: schedule() → model_runner → update_from_output() → repeat
-
-schedule() (L352):
-  1. token_budget = max_num_scheduled_tokens
-  2. Phase 1 — Running requests (L388-L556):
-     For each running request (FCFS order):
-       a. num_new = min(request.num_tokens - num_computed_tokens, budget)
-       b. Try kv_cache_manager.allocate_slots(request, num_new, ...)
-       c. If OOM: preempt lowest-priority running request (pop last),
-          free its blocks, retry allocation
-       d. If allocation succeeds: add to scheduled_running_reqs
-  3. Phase 2 — Waiting requests (L568-L846):
-     While waiting queue not empty AND budget > 0 AND running < max:
-       a. Pop from waiting (FCFS)
-       b. num_new = min(request.num_tokens - num_computed_tokens, budget)
-       c. If chunked prefill disabled and doesn't fit: break
-       d. Try allocate_slots()
-       e. If allocation succeeds: append to running, set status=RUNNING
-  4. Build SchedulerOutput (L871-L945) with:
-     - new_reqs_data, cached_reqs_data
-     - num_scheduled_tokens, total_num_scheduled_tokens
-     - preempted_req_ids, finished_req_ids
-
-_update_after_schedule() (L974):
-  - Advance num_computed_tokens for all scheduled requests
-  - Clear self.finished_req_ids for next step
-
-update_from_output() (L1290):
-  - Process sampled token IDs from model runner
-  - Check stop conditions (check_stop → FINISHED_STOPPED/LENGTH_CAPPED)
-  - Handle spec decode rejections (reduce num_computed_tokens)
-  - Free encoder cache inputs
-  - Build EngineCoreOutput per request
-
-_free_request() (L1813):
-  - Free KV cache blocks (self.kv_cache_manager.free(request))
-  - Free encoder cache
-  - Track in self.finished_req_ids
-  - Remove from self.requests dict
+┌─────────────────────────────────────────────────────────────────┐
+│ schedule() called once per model forward step                    │
+│                                                                  │
+│  1. For each RUNNING request:                                   │
+│     ├─ if finished → free KV cache → FINISHED                    │
+│     ├─ compute num_new_tokens (catch-up to num_tokens)           │
+│     ├─ allocate KV blocks (retry + preempt if OOM)               │
+│     └─ if allocated → advance num_computed_tokens, deduct budget │
+│                                                                  │
+│  2. For each WAITING request (while budget > 0):                 │
+│     ├─ compute num_new_tokens (prompt + any pre-generated output)│
+│     ├─ allocate KV blocks                                        │
+│     ├─ if allocated → promote to RUNNING, deduct budget          │
+│     └─ if OOM → break (don't preempt for new requests)           │
+│                                                                  │
+│  3. Build SchedulerOutput → pass to ModelRunner                  │
+│                                                                  │
+│  4. ModelRunner.forward() → sampled tokens, logprobs             │
+│                                                                  │
+│  5. update_from_output():                                        │
+│     ├─ append new token IDs to request                           │
+│     ├─ check stop conditions (max_tokens, EOS, structured output)│
+│     └─ if stopped → mark FINISHED, free resources                │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### 4. Design decisions and WHY
+In our educational reimplementation, steps 3-5 are simplified into Phase 3 (simulate 1 token per eligible request per step).
 
-**Decision 1: No separate prefill/decode phases (scheduler.py:L353-L362)**
-- Why: Every request is just a stream of tokens. The scheduler advances `num_computed_tokens` toward `num_tokens_with_spec`. This naturally handles chunked prefill, prefix caching, and speculative decoding with the same mechanism.
-- Trade-off: Requires careful tracking of computed vs. total tokens per request.
-- Alternative: Separate prefill/decode mode switching. vLLM chose unified because it's more general.
+### 4. Design decisions (from source with line references)
 
-**Decision 2: Running-first scheduling (Phase 1 before Phase 2)**
-- Why: Running requests have already paid the overhead of KV cache allocation. Preempting them wastes work. FCFS order within running ensures fairness.
-- Trade-off: Can starve waiting requests under heavy load. Mitigated by preemption (OOM preempts lowest-priority running request).
-- Source: scheduler.py:L388-L846 — the two-phase structure is explicit.
+1. **Running-first scheduling** (`scheduler.py:L387`): RUNNING requests are always scheduled before WAITING requests. This maximizes continuity (fewer preemptions) and ensures that already-admitted requests make steady progress. The comment at L389 says "First, schedule the RUNNING requests."
 
-**Decision 3: Preempt lowest-priority (last in FCFS), not the one being scheduled**
-- Why: The request being scheduled is higher-priority (earlier in FCFS running list). Preempting a different request keeps the most "senior" running request alive.
-- Trade-off: More complex code (retry loop). But prevents one request's OOM from cascading.
-- Source: scheduler.py:L503-L504 — `preempted_req = self.running.pop()` for FCFS.
+2. **Token budget** (`scheduler.py:L371`): `max_num_scheduled_tokens` caps tokens per step. This prevents a single long-prompt request from monopolizing the entire step. Multiplied by model size, this determines the maximum memory for intermediate activations.
 
-**Decision 4: Chunked prefill (scheduler_config.py:L84)**
-- Why: Long prompts otherwise block the entire batch for many steps. Chunking interleaves prefill and decode work, keeping GPU utilization high.
-- Trade-off: Slightly more scheduler complexity. Need to track `is_prefill_chunk` flag.
-- Source: scheduler_config.py:L84 `enable_chunked_prefill: bool = True`
+3. **Priority-based preemption** (`scheduler.py:L479-L484`): When KV cache is full during a running request's allocation, the lowest-priority running request is evicted. In PRIORITY mode: `max(running, key=lambda r: (r.priority, r.arrival_time))`. In FCFS mode: the last request in the running list is popped (L504: `self.running.pop()`).
 
-**Decision 5: Token budget limit (max_num_scheduled_tokens)**
-- Why: Prevents out-of-memory in the model runner. Each forward pass has a maximum token capacity (max_num_batched_tokens).
-- Trade-off: Can artificially limit throughput if set too low.
-- Source: scheduler.py:L371 `token_budget = self.max_num_scheduled_tokens`
+4. **No prefill/decoding phase distinction** (`scheduler.py:L353-L362`): There is no explicit "prefill phase" or "decoding phase." Each request simply has `num_computed_tokens` catching up to `num_tokens_with_spec`. This unified model naturally handles chunked prefill (limit tokens per step), prefix caching (restore computed tokens from cache), and speculative decoding (extra tokens in `spec_token_ids`).
+
+5. **Chunked prefill** (`scheduler.py:L413-L414`, `L678-L690`): If `long_prefill_token_threshold` is set and `num_new_tokens` exceeds it, the allocation is capped at the threshold. This breaks long prompts into multiple forward passes, interleaving them with decode tokens for better latency.
+
+6. **Preempted-request requeue** (`scheduler.py:L972`): Preempted requests are prepended to the waiting queue (`prepend_request`), not appended. This ensures they get priority when rescheduling — a fairness mechanism.
 
 ### 5. Complexity preserved in our implementation
 
-- **Two-phase scheduling** (running first, then waiting) — the core architecture
-- **Token budget management** — per-step cap on total scheduled tokens
-- **FCFS ordering** — within both running and waiting queues
-- **Chunked prefill** — long prompts split across steps when budget is tight
-- **Preemption with retry** — OOM triggers preemption of lowest-priority running request, not just failure
-- **Request state machine** — WAITING → RUNNING → PREEMPTED → WAITING | FINISHED
-- **KV cache block lifecycle** — allocate on schedule, free on preemption/finish
-
-### What we simplified (for pedagogy)
-
-- **RequestQueue** — used Python list instead of deque/heap (same FCFS semantics)
-- **KVCacheManager** — free-list-based allocation instead of prefix-cache-aware block management
-- **update_from_output** — collapsed into update_after_step (no spec decode, no logprobs, no stop strings)
-- **No encoder cache / multimodal support** — irrelevant to core continuous batching concept
-- **No speculative decoding** — out of scope for this chapter
-- **No skipped_waiting queue** — handles blocked statuses (WAITING_FOR_REMOTE_KVS, etc.)
+| Mechanism | Original Location | Why Preserved |
+|-----------|------------------|---------------|
+| Running-first scheduling | `scheduler.py:L387` | Core of continuous batching — running requests never starved |
+| Token budget | `scheduler.py:L371` | Required for fair scheduling; prevents monopolization |
+| KV cache block allocation + OOM preemption | `scheduler.py:L466-L510` | Demonstrates the resource-constrained scheduling problem |
+| Priority-based victim selection | `scheduler.py:L479-L483` | Shows how preemption chooses victims (max priority number = lowest priority) |
+| Request state machine (WAITING->RUNNING->PREEMPTED->FINISHED) | `request.py:L310-L326` | The backbone that all scheduling logic operates on |
+| Preemption retry loop | `scheduler.py:L466-L510` | After preempting, re-attempt allocation for the current request |
+| Prepend-on-preempt | `scheduler.py:L972` | Preempted requests get priority when resumed (fairness) |
 
 ## Source Mapping Table
 
-| Our Code | vLLM Source | What We Changed | Why |
-|----------|------------|-----------------|-----|
-| `ContinuousBatchingScheduler.__init__()` | `scheduler.py:L67-L148` | Simplified constructor params | Remove VllmConfig dependency |
-| `ContinuousBatchingScheduler.schedule()` | `scheduler.py:L352-L945` | Same two-phase structure; simplified preemption retry | Core algorithm unchanged |
-| `schedule() Phase 1` | `scheduler.py:L388-L556` | Same FCFS iteration + preempt-on-OOM | Identical algorithm |
-| `schedule() Phase 2` | `scheduler.py:L568-L846` | Same budget check + chunked prefill | Identical algorithm |
-| `_preempt_request()` | `scheduler.py:L952-L972` | Same: free blocks, reset tokens, requeue | Identical algorithm |
-| `update_after_step()` | `scheduler.py:L974-L998`, `L1290-L1551` | Merged _update_after_schedule + update_from_output | Simplified (no spec decode, logprobs, stop strings) |
-| `_finish_request()` | `scheduler.py:L1813-L1834` | Same: free blocks, remove from running | Simplified (no connector, encoder cache) |
-| `add_request()` | `scheduler.py:L1728-L1748` | Same: add to waiting queue | Simplified (no streaming, structured output) |
-| `SimpleKVCacheManager.allocate_slots()` | `kv_cache_manager.py:allocate_slots()` | Free-list instead of block pool | Simplified for demo |
-| `SimpleKVCacheManager.free()` | `kv_cache_manager.py:free()` | Same: return blocks to free list | Identical semantics |
-| `Request` | `vllm/v1/request.py:L59-L308` | Minimal subset of fields | Only the fields scheduler needs |
-| `RequestStatus` | `vllm/v1/request.py:L310-L337` | Same enum semantics | Trimmed finished variants |
-| `SchedulerOutput` | `vllm/v1/core/sched/output.py:L181-L200` | Simplified fields | Only what tests + narrative need |
-| `static_batching_simulation()` | — | New (pedagogical) | Chapter narrative comparison |
-| `continuous_batching_simulation()` | — | New (pedagogical) | Chapter narrative comparison |
+| Our Code | Original Source | What We Changed | Why |
+|----------|----------------|-----------------|-----|
+| `ContinuousBatchingScheduler.__init__()` | `scheduler.py:L67-L300` | No KVConnector, no encoder-decoder, no speculative config, no structured output, no LoRA, no CUDA graph, no Mamba, no multi-GPU; simplified config to three numeric params | Educational clarity — ~30 lines vs ~230 |
+| `schedule()` (3-phase) | `scheduler.py:L352-L950` | 3 explicit phases (running, waiting, model forward) vs original's two while-loops with nested allocation; removed encoder budget, speculative tokens, async KV loading, block hashing, common prefix computation | Easier to trace the algorithm flow; ~50 lines vs ~600 |
+| `_preempt_request()` | `scheduler.py:L952-L972` | Simplified: no encoder cache free, no event recording, no spec token cleanup; num_computed_tokens NOT reset (modeled as prefix-cache-enabled, matching effective behavior after `get_computed_blocks()` restoration at L616-L647) | Core preemption concept: free KV cache, move to waiting, prepend for fairness |
+| `_pick_preemption_victim()` | `scheduler.py:L479-L483` | Extracted as a separate method; uses `(priority, request_id)` ordering vs `(priority, arrival_time, request_id)` (we don't track arrival_time) | Single responsibility; priority-based victim selection clearly visible |
+| `KVCache` | `kv_cache_manager.py` | Fixed block pool with cumulative allocation; no PagedAttention block table, no prefix caching, no block hashing; simplified: allocate(num_tokens) returns block count | PagedAttention details are covered in Ch03; we only need OOM→preemption trigger |
+| `Request` | `request.py:L59-L308` | 6 fields vs ~20; no multimodal, structured output, KV transfer, block hashing, encoder inputs, streaming, spec decode, pooling, trace headers | Only the fields that drive scheduling decisions are kept |
+| `RequestStatus` | `request.py:L310-L326` | 4 states vs 11; WAITING/RUNNING/PREEMPTED/FINISHED vs the full enum with WAITING_FOR_* variants and 6 FINISHED_* sub-states | The core lifecycle is preserved; sub-states are async/debug details |
+| `StaticBatchSimulator` | N/A (educational addition) | Pure demo class: simulates static batching with max_batch_size, counts idle slots, computes utilization | Side-by-side comparison with continuous batching to show the bubble problem |
+| `add_request()` | `request_queue.py` | Direct list append; no priority queue integration | Simpler, but the priority ordering is demonstrated via `_pick_preemption_victim()` |
+| `abort_request()` | `scheduler.py` (via `finish_requests`) | Linear scan of running+waiting lists; original uses dict lookup and status-based removal | Adequate for educational context; real implementation uses `self.requests` dict for O(1) lookup |
+
+### What we simplified (and why it's OK for education)
+
+| Original Complexity | Our Simplification | Justification |
+|---------------------|-------------------|---------------|
+| Multi-GPU coordination (tensor/pipeline/context parallelism) | Single-device | Distributed scheduling is a separate concern (Ch11 DCP/PCP) |
+| Encoder-decoder models + multimodal inputs | Text-only generative models | Encoder-decoder is a specialization; core scheduling is the same |
+| Speculative decoding (draft tokens, rejection sampling) | None | Covered in Ch21; the scheduler treats spec tokens as extra `num_tokens_with_spec` |
+| Structured output (grammar-constrained generation) | None | Separate feature; status checks add complexity without insight |
+| KV Connectors (P/D disaggregation, offloading) | None | Covered in Ch12; scheduling-wise it's just async state transitions |
+| Streaming requests (resumable input) | None | Edge case; streaming statuses add 3 WAITING_FOR_* variants |
+| LoRA (adapter scheduling constraints) | None | max_loras constraint is simple but orthogonal to core algorithm |
+| Prefix caching (block hashing, cache-aware scheduling) | Simplified: preempted requests keep `num_computed_tokens` | Effectively models prefix-cache-enabled behavior; full hashing covered in Ch05 |
+| Chunked prefill (long_prefill_token_threshold) | Uniform token budget for all | The budget cap already demonstrates chunking; the threshold is a tuning detail |
+
+### Key formula: how num_new_tokens works
+
+In the original (scheduler.py:L408-L411):
+```
+num_new_tokens = num_tokens_with_spec + num_output_placeholders - num_computed_tokens
+```
+
+In our simplified version:
+```
+num_new_tokens = num_tokens_total - num_computed_tokens
+              = (prompt_tokens + num_output_tokens) - num_computed_tokens
+```
+
+This represents "how many tokens do I need to feed the model so it can see all existing tokens?" For decode, this is typically 1 (one new output token). For prefill, this is the entire prompt. The scheduler caps this at the token budget and KV cache capacity.
