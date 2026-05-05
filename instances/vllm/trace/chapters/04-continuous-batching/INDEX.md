@@ -2,11 +2,12 @@
 
 ## Delivery
 
-- **Date**: 2026-05-04
-- **Status**: published (v5 rewrite)
-- **Gate results**: implementation_exists=true, tests_pass=true, narrative_complete=true, review_approved=true
-- **Tests**: 14/14 passed
-- **Formula lint**: 0 blocking issues
+- **2026-05-05** (v5 final): 854 lines, APPROVED by reviewer, Part 1 complete
+  - State: published, state.json updated, session summary created
+- **2026-05-04** (v5 rewrite): published
+  - Gate results: implementation_exists=true, tests_pass=true, narrative_complete=true, review_approved=true
+  - Tests: 14/14 passed
+  - Formula lint: 0 blocking issues
 
 ## Decisions
 
@@ -26,6 +27,7 @@
 
 | Date | Agent | Transcript |
 |------|-------|-----------|
+| 2026-05-05 | archivist | [sessions/2026-05-05_archivist.md](../../deliveries/2026-05-05_ch04-continuous-batching-ch04-v5.md) |
 | 2026-05-04 | implementer | [sessions/2026-05-04_implementer.json](sessions/2026-05-04_implementer.json) |
 | 2026-05-04 | writer | [sessions/2026-05-04_writer.json](sessions/2026-05-04_writer.json) |
 | 2026-05-04 | reviewer | [sessions/2026-05-04_reviewer.json](sessions/2026-05-04_reviewer.json) |

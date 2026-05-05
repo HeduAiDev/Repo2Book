@@ -7,6 +7,7 @@ Master index of all significant events. Query this first before any work.
 <!-- ARCHIVIST: Update on every recorded event. Keep to last 10. -->
 
 | Date | Type | Chapter | Summary | File |
+| 2026-05-05 | delivery | 04-continuous-batching | Ch04 v5 | [2026-05-05_ch04-continuous-batching-ch04-v5.md](deliverys/2026-05-05_ch04-continuous-batching-ch04-v5.md) |
 | 2026-05-04 | delivery | 03-flashattention-pagedattention | Ch03 Creative Rewrite | [2026-05-04_ch03-flashattention-pagedattention-ch03-creative-rewrite.md](deliverys/2026-05-04_ch03-flashattention-pagedattention-ch03-creative-rewrite.md) |
 | 2026-05-04 | delivery | 02-kv-cache | Ch02 v5 Creative Rewrite | [2026-05-04_ch02-kv-cache-ch02-v5-creative-rewrite.md](deliverys/2026-05-04_ch02-kv-cache-ch02-v5-creative-rewrite.md) |
 | 2026-05-04 | delivery | 01-self-attention-fundamentals | Ch01 v5 Creative Rewrite | [2026-05-04_ch01-self-attention-fundamentals-ch01-v5-creative-rewrite.md](deliveries/2026-05-04_ch01-self-attention-fundamentals-ch01-v5-creative-rewrite.md) |
