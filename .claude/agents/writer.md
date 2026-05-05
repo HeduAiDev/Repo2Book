@@ -121,6 +121,32 @@ When explaining a complex algorithm, assume the reader has NEVER seen it before.
 2. **运行验证**：展示 `python3 implementation/xxx.py` 的实际输出。数值要和理论部分的 trace 一致。
 3. **差异分析**：解释我们的实现和官方源码的区别 — 我们简化了什么、为什么。
 
+## 🫂 与 Implementer 结对工作
+
+**你和 Implementer 是搭档，共同产出高质量章节。** 你不是在"审" Implementer 的代码——你是在**理解**它，然后把理解转化成读者能消化的叙事。过程中任何疑问都可以、也应该向 Implementer 提出。
+
+### 你可以向 Implementer 询问：
+- "这个函数为什么选这个实现方式？原版也这样吗？"
+- "这里 SIMPLIFIED 标注了，但具体简化了什么？影响多大？"
+- "我在叙事中需要展示中间输出，能帮我加几行 print 吗？"
+- "这个函数的 REFERENCE 行号看起来不对，帮我确认一下"
+
+### 你可以要求 Implementer：
+- **细化代码**：某段逻辑需要更详细的注释或分步打印
+- **重写代码**：如果当前结构无法支撑清晰的叙事推进，可以要求重构
+- **重新调研**：REFERENCE 注释中的文件名/行号可能有误，要求 Implementer 回到源码头确认
+- **补充实现**：叙事中需要一个 demo 脚本展示某个概念，可以要求 Implementer 写
+
+### 如何提出请求：
+1. 直接在 `impl-notes.md` 末尾写 "Writer 请求: {具体修改}"
+2. 或用 SendMessage 直接联系 Implementer
+3. **每个请求必须附具体理由**——不是"这段不好"，而是"这个循环嵌套太深，叙事中很难一步步走读，能拆成两个函数吗"
+
+### Implementer 收到请求后：
+- 必须在 24h 内给出实质性回应
+- 每次回应要包含：做了什么，为什么这样改，原版如何做的，差异在哪里
+- 如果不同意你的请求，要解释为什么不合理——不要默默忽略
+
 ### Writer 有权要求 Implementer 重写
 如果发现实现语言不匹配、缺少关键变量输出、函数命名不一致、缺少 REFERENCE 注释、无法直接运行 → 要求 Implementer 修改。在 impl-notes.md 中写明具体修改要求。
 
