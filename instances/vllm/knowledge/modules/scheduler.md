@@ -106,3 +106,26 @@ order. The LAST request in `self.running` is the lowest priority for preemption.
 This is why `self.running.pop()` preempts the lowest-priority request.
 
 **For testers**: When testing preemption, the request added LAST should be preempted first.
+
+---
+
+## K07: Config file path — no /v1/ directory
+
+**Module**: scheduler
+**Chapter**: 04-continuous-batching
+**Discovered by**: reviewer (source grounding spot-check)
+**TTL**: 60 days
+**Access count**: 1
+
+The scheduler config is at `vllm/config/scheduler.py`, NOT `vllm/v1/config/scheduler.py`.
+The `/v1/` prefix applies to `core/sched/` (scheduler.py, output.py) and `request.py`, but
+NOT to the `config/` directory. The config tree lives directly under `vllm/config/`.
+
+**For writers/reviewers**: Always verify source paths against the actual repo. The source
+grounding linter doesn't verify individual file:line references in narrative prose — it
+only checks implementation REFERENCE comments and source mapping rows.
+
+**Key defaults in config/scheduler.py**:
+- L56: `max_num_scheduled_tokens: int | None = None` (computed dynamically at runtime)
+- L63: `max_num_seqs: int = Field(default=DEFAULT_MAX_NUM_SEQS, ge=1)`
+- L84: `enable_chunked_prefill: bool = True`
