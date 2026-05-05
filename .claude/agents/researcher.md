@@ -66,9 +66,7 @@ Writer 在开始叙事之前（或叙事过程中）向你请求调研：
 - 重点是**深度**和**权衡**——不只是"vLLM 做什么"，而是"为什么不那样做"
 - 如果某个调研太复杂，分两次回复：先给时间线+关键决策，再给细节
 
-## ✅ AFTER WORK — 知识提取（强制执行）
+## ✅ AFTER WORK — 知识记录
 
-1. 输出 research-brief.md
-2. 写知识 JSON 到 `/tmp/book-factory/{chapter}/knowledge-researcher.json`：
-   - 发现的论文链、源码演进关键commit、竞品关键差异
-3. `python3 scripts/learn.py extract {chapter_id} researcher --input /tmp/book-factory/{chapter}/knowledge-researcher.json`
+1. Output research-brief.md
+2. 在 `instances/vllm/knowledge/modules/{module}.md` 末尾追加：论文链、关键 commit、竞品差异要点

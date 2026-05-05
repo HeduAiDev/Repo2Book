@@ -34,24 +34,16 @@ You run in a persistent tmux pane. Your session survives across ALL chapters. Wh
 2. **Query knowledge base** for repo-specific facts about the relevant module: `python3 scripts/learn.py query {chapter_id} implementer`
 3. **Read wisdom files** ranked by your role's priority: `wisdom/debugging.md` (shapes, imports, CUDA gotchas) → `wisdom/architecture.md` (backpressure gates, source grounding)
 
-## ✅ AFTER WORK — 知识提取（强制执行）
+## ✅ AFTER WORK — 知识记录
 
-完成工作后，写知识 JSON 并入库：
+在 `instances/vllm/knowledge/modules/{module}.md` 末尾追加你发现的：
 
-1. **写知识文件** `/tmp/book-factory/{chapter}/knowledge-{role}.json`：
-```json
-{
-  "knowledge": {
-    "module_name": [
-      {"fact": "scheduler.py:L352 是主调度入口，Phase1+Phase2", "source": "vllm/v1/core/sched/scheduler.py:L352", "tags": ["scheduling"]},
-      {"fact": "KV cache 分配在 allocate_slots() 中，返回 None 表示 OOM", "source": "kv_cache_manager.py:L300", "tags": ["kv-cache", "allocation"]}
-    ]
-  }
-}
-```
-fact 格式: "文件名:L行号 做了什么——一句话说清"。source 必须精确到文件:行号。tags 2-5 个关键词。
+- 源文件位置和行号（精确）
+- 容易写错的 API 或参数
+- 简化时踩的坑
+- 下一章的 implementer 需要知道什么
 
-2. **入库**: `python3 scripts/learn.py extract {chapter_id} implementer --input /tmp/book-factory/{chapter}/knowledge-implementer.json`
+格式随意，重点是**内容能被下一个 implementer 读到**。
 
 ## Before Starting: Resolve the Target
 

@@ -48,13 +48,11 @@ You are the **Reviewer** running in a persistent session. This means:
 3. Read `wisdom/writing.md` (auto-REJECT triggers, formula rules) → `wisdom/architecture.md` (lateral communication)
 4. Check `instances/vllm/knowledge/modules/` for relevant module facts (verify line number references)
 
-## ✅ AFTER WORK — 知识提取（强制执行）
+## ✅ AFTER WORK — 知识记录
 
-1. Output `review-report.json`
-2. 写知识 JSON 到 `/tmp/book-factory/{chapter}/knowledge-reviewer.json`：
-   - 发现的常见问题、auto-REJECT 新触发条件、跨章一致性断裂
-3. `python3 scripts/learn.py extract {chapter_id} reviewer --input /tmp/book-factory/{chapter}/knowledge-reviewer.json`
-4. If REVISE: SendMessage **directly to writer**
+1. Output review-report.json
+2. 在 `instances/vllm/knowledge/modules/{module}.md` 末尾追加：常见问题模式、新的 auto-REJECT 触发条件
+3. If REVISE: SendMessage **directly to writer**
 
 ## Your Role — The 0-Basis Reader
 
