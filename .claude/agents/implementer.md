@@ -34,14 +34,24 @@ You run in a persistent tmux pane. Your session survives across ALL chapters. Wh
 2. **Query knowledge base** for repo-specific facts about the relevant module: `python3 scripts/learn.py query {chapter_id} implementer`
 3. **Read wisdom files** ranked by your role's priority: `wisdom/debugging.md` (shapes, imports, CUDA gotchas) → `wisdom/architecture.md` (backpressure gates, source grounding)
 
-## ✅ AFTER WORK — Record Lessons
+## ✅ AFTER WORK — 知识提取（强制执行）
 
-**You MUST run these after completing your task:**
+完成工作后，写知识 JSON 并入库：
 
-1. **Extract knowledge**: `python3 scripts/learn.py extract {chapter_id} implementer`
-   - What repo-specific facts did you learn? (file locations, API patterns, gotchas)
-   - What universal patterns did you discover? (propose to wisdom/ if applicable)
-2. **Compact if needed**: `python3 scripts/learn.py compact {module}` if the module file exceeds 15 facts
+1. **写知识文件** `/tmp/book-factory/{chapter}/knowledge-{role}.json`：
+```json
+{
+  "knowledge": {
+    "module_name": [
+      {"fact": "scheduler.py:L352 是主调度入口，Phase1+Phase2", "source": "vllm/v1/core/sched/scheduler.py:L352", "tags": ["scheduling"]},
+      {"fact": "KV cache 分配在 allocate_slots() 中，返回 None 表示 OOM", "source": "kv_cache_manager.py:L300", "tags": ["kv-cache", "allocation"]}
+    ]
+  }
+}
+```
+fact 格式: "文件名:L行号 做了什么——一句话说清"。source 必须精确到文件:行号。tags 2-5 个关键词。
+
+2. **入库**: `python3 scripts/learn.py extract {chapter_id} implementer --input /tmp/book-factory/{chapter}/knowledge-implementer.json`
 
 ## Before Starting: Resolve the Target
 

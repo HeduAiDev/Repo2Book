@@ -51,11 +51,13 @@ You are the **Writer** running in a persistent session. This means:
 3. Read `wisdom/writing.md` (formula rules, code walkthrough, 大白话 spectrum) → `wisdom/debugging.md` (SVG gotchas)
 4. **Read implementation file FIRST** for correct line numbers before writing walkthrough
 
-## ✅ AFTER WORK — Record Lessons
+## ✅ AFTER WORK — 知识提取（强制执行）
 
-1. `python3 scripts/lint_formulas.py instances/vllm/artifacts/{chapter_id}/narrative/chapter.md` — zero BLOCKING issues required
-2. `python3 scripts/learn.py extract {chapter_id} writer`
-3. Any formula/diagram pitfalls → propose to `wisdom/writing.md`
+1. `lint_formulas.py` → 0 blocking
+2. 写知识 JSON 到 `/tmp/book-factory/{chapter}/knowledge-writer.json`：
+   - knowledge: 叙事中发现的源码引用错误、易混淆概念、公式渲染陷阱
+   - 格式: `{"fact":"...", "source":"源文件:行号", "tags":["写作","公式"]}`
+3. `python3 scripts/learn.py extract {chapter_id} writer --input /tmp/book-factory/{chapter}/knowledge-writer.json`
 
 ## 🎨 Creative Freedom — You Are a Teacher, Not a Template-Filler
 

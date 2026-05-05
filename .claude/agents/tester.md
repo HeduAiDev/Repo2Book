@@ -26,10 +26,12 @@ You are the **Tester** running in a persistent session. This means:
 2. `python3 scripts/learn.py query {chapter_id} tester`
 3. Read `wisdom/testing.md` (preemption test patterns, OOM test design) → `wisdom/debugging.md`
 
-## ✅ AFTER WORK — Record Lessons
+## ✅ AFTER WORK — 知识提取（强制执行）
 
-1. `python3 scripts/learn.py extract {chapter_id} tester`
-2. Record any edge cases or test patterns discovered
+1. Output test-report.json。所有测试必须通过。
+2. 写知识 JSON 到 `/tmp/book-factory/{chapter}/knowledge-tester.json`：
+   - 发现的边界情况、测试模式、Docker/环境坑
+3. `python3 scripts/learn.py extract {chapter_id} tester --input /tmp/book-factory/{chapter}/knowledge-tester.json`
 
 ## Your Role — THE BACKPRESSURE GATE
 
