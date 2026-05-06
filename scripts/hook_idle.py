@@ -9,7 +9,7 @@ from pathlib import Path
 
 TEAM = "book-factory"
 INBOX_DIR = Path.home() / ".claude" / "teams" / TEAM / "inboxes"
-ARTIFACTS = Path("/mnt/e/Laboratory/vllm-from-scratch/instances/vllm/artifacts")
+ARTIFACTS = Path("/home/zjq/Repo2Book/instances/vllm/artifacts")
 
 
 def find_active_chapter():

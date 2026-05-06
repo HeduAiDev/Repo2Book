@@ -23,10 +23,24 @@ from pathlib import Path
 from typing import Optional
 
 ROOT = Path(__file__).parent.parent
-KNOWLEDGE_DIR = ROOT / "knowledge"
+
+
+def _resolve_instance_dir() -> Path:
+    """Derive current instance dir from framework repo2book.json (source_dir's parent)."""
+    fw_config = ROOT / "repo2book.json"
+    if fw_config.exists():
+        cfg = json.loads(fw_config.read_text())
+        sd = cfg.get("source", {}).get("source_dir")
+        if sd:
+            return ROOT / Path(sd).parent  # e.g. instances/vllm
+    return ROOT  # fallback (single-instance dev mode)
+
+
+INSTANCE_DIR = _resolve_instance_dir()
+KNOWLEDGE_DIR = INSTANCE_DIR / "knowledge"
 MODULES_DIR = KNOWLEDGE_DIR / "modules"
 ARCHIVE_DIR = KNOWLEDGE_DIR / "archive"
-WISDOM_DIR = ROOT / "wisdom"
+WISDOM_DIR = ROOT / "wisdom"  # framework-shared, stays at root per CLAUDE.md
 
 MAX_FACTS_PER_MODULE = 15
 COMPACT_COUNT = 5       # Oldest N facts to compact when limit exceeded
@@ -128,42 +142,100 @@ def extract(chapter_id: str, role: str) -> dict:
 
 
 def save_knowledge(module: str, facts: list, chapter_id: str, role: str) -> Path:
-    """Save repo-specific facts to a knowledge module file."""
+    """Append repo-specific facts to a knowledge module file (never rewrites existing content).
+
+    The module file's existing entries set the heading prefix convention
+    (`K`, `T`, `P`, `M`, ...). New entries continue that prefix; if the
+    module is empty, default to `K`. Title bodies that already start with
+    a `<PREFIX>NN:` token are stripped to avoid `## K01: K01: ...` duplication.
+    """
     MODULES_DIR.mkdir(parents=True, exist_ok=True)
     module_file = MODULES_DIR / f"{module}.md"
 
-    # Read existing facts
-    existing = _parse_module_file(module_file)
-    next_id = len(existing) + 1
+    existing_entries = _parse_module_file(module_file)
+    prefix = _detect_module_prefix(module_file, default="K")
+    # Continue from the highest existing numeric id under that prefix.
+    existing_ids = [
+        int(e["id"][len(prefix):]) for e in existing_entries
+        if e.get("id", "").startswith(prefix) and e["id"][len(prefix):].isdigit()
+    ]
+    next_id = (max(existing_ids) + 1) if existing_ids else 1
+    existing_count = len(existing_entries)
 
-    # Append new facts
-    for fact in facts:
-        entry = {
-            "id": f"K{next_id:02d}",
-            "module": module,
-            "chapter": chapter_id,
-            "discovered_by": role,
-            "ttl_days": TTL_DAYS,
-            "decay_after": (datetime.now(timezone.utc) + timedelta(days=TTL_DAYS)).strftime("%Y-%m-%d"),
-            "access_count": 0,
-            "fact": fact.get("fact", ""),
-            "source": fact.get("source", ""),
-            "tags": fact.get("tags", []),
-        }
-        existing.append(entry)
-        next_id += 1
+    if not module_file.exists():
+        with open(module_file, "w") as f:
+            f.write(f"# {module.replace('-', ' ').title()} Knowledge\n")
 
-    # Write back
-    _write_module_file(module_file, existing)
-    print(f"  → Saved {len(facts)} facts to knowledge/modules/{module}.md")
+    import re
+    dup_prefix_re = re.compile(r"^\s*[A-Z]\d{1,3}\s*:\s*")
+    decay = (datetime.now(timezone.utc) + timedelta(days=TTL_DAYS)).strftime("%Y-%m-%d")
+    with open(module_file, "a") as f:
+        for fact in facts:
+            # Accept either {fact: "..."} (legacy) or {title: "...", body: "..."} (rich).
+            raw_title = fact.get("title") or (fact.get("fact", "")[:60] if fact.get("fact") else "(untitled)")
+            # Strip a leading `Xnn:` prefix from the title body so the heading
+            # never reads `## K01: K01: ...` (the bug observed in kv-cache.md
+            # and memory.md prior to this fix).
+            title = dup_prefix_re.sub("", raw_title).strip() or "(untitled)"
+            body = fact.get("body") or fact.get("fact", "")
+            tags = fact.get("tags", [])
+            source = fact.get("source", "")
 
-    # Check anti-bloat
-    if len(existing) > MAX_FACTS_PER_MODULE:
-        print(f"  ⚠ Module {module} has {len(existing)} facts (max {MAX_FACTS_PER_MODULE}).")
+            f.write("\n---\n\n")
+            f.write(f"## {prefix}{next_id:02d}: {title}\n\n")
+            f.write(f"**Module**: {module}\n")
+            f.write(f"**Chapter**: {chapter_id}\n")
+            f.write(f"**Discovered by**: {role}\n")
+            f.write(f"**TTL**: {decay}\n")
+            f.write(f"**Access count**: 0\n")
+            f.write(f"**Tags**: {', '.join(tags)}\n\n")
+            f.write(f"{body}\n")
+            if source:
+                f.write(f"\n**Source**: {source}\n")
+            next_id += 1
+
+    new_total = existing_count + len(facts)
+    try:
+        rel = module_file.relative_to(ROOT)
+    except ValueError:
+        rel = module_file
+    print(f"  → Appended {len(facts)} facts to {rel} (total now: {new_total})")
+
+    if new_total > MAX_FACTS_PER_MODULE:
+        print(f"  ⚠ Module {module} has {new_total} facts (max {MAX_FACTS_PER_MODULE}).")
         print(f"    Run: python3 scripts/learn.py compact {module}")
-        compact(module)
 
     return module_file
+
+
+def _detect_module_prefix(file_path: Path, default: str = "K") -> str:
+    """Return the single-letter heading prefix used by an existing module
+    file (e.g. 'K', 'T', 'P', 'M'). Falls back to `default` when the file
+    is empty or missing.
+    """
+    if not file_path.exists():
+        return default
+    import re
+    from collections import Counter
+    matches = re.findall(
+        r"^##+ ([A-Z])\d+:", file_path.read_text(), flags=re.MULTILINE
+    )
+    if not matches:
+        return default
+    # Use the most common prefix to be robust to one-off typos in the file.
+    return Counter(matches).most_common(1)[0][0]
+
+
+def _count_facts(file_path: Path) -> int:
+    """Count `##`/`###` `<PREFIX>NN:` sections in a module file.
+    `### K01:` sub-entries (preserved during compaction inside a `## K01–K05:`
+    parent block) count as full facts — they represent the original distinct
+    entries before compaction."""
+    if not file_path.exists():
+        return 0
+    import re
+    text = file_path.read_text()
+    return len(re.findall(r"^##+ [A-Z]\d+:", text, flags=re.MULTILINE))
 
 
 def propose_wisdom(category: str, pattern: dict, chapter_id: str, role: str) -> Path:
@@ -208,17 +280,42 @@ def compact(module: str) -> Optional[Path]:
     to_compact = sorted_facts[:COMPACT_COUNT]
     to_keep = sorted_facts[COMPACT_COUNT:]
 
+    # Preserve the module's existing heading prefix (T/P/M/K/...) when
+    # naming the synthetic summary entry, and use the next available
+    # numeric id under that prefix.
+    prefix = _detect_module_prefix(module_file, default="K")
+    used_ids = [
+        int(e["id"][len(prefix):]) for e in to_keep
+        if e.get("id", "").startswith(prefix) and e["id"][len(prefix):].isdigit()
+    ]
+    summary_num = (max(used_ids) + 1) if used_ids else 1
+    summary_id = f"{prefix}{summary_num:02d}"
+
     # Create a summary fact from the compacted ones
-    compacted_texts = [f['fact'] for f in to_compact]
+    compacted_titles = [f.get("title") or f.get("id", "") for f in to_compact]
+    compacted_ids = [f.get("id", "?") for f in to_compact]
+    summary_body = (
+        f"**Module**: {module}\n"
+        f"**Chapter**: compacted\n"
+        f"**Discovered by**: learn.py (auto-compact)\n"
+        f"**TTL**: {(datetime.now(timezone.utc) + timedelta(days=TTL_DAYS)).strftime('%Y-%m-%d')}\n"
+        f"**Access count**: 0\n"
+        f"**Tags**: compacted\n\n"
+        f"[COMPACTED from {len(to_compact)} facts: {', '.join(compacted_ids)}]\n\n"
+        + "; ".join(compacted_titles[:3])
+        + ("..." if len(compacted_titles) > 3 else "")
+    )
     summary_fact = {
-        "id": f"K{len(to_keep) + 1:02d}",
+        "id": summary_id,
+        "title": f"[COMPACTED] {', '.join(compacted_ids)}",
         "module": module,
         "chapter": "compacted",
         "discovered_by": "learn.py (auto-compact)",
         "ttl_days": TTL_DAYS,
         "decay_after": (datetime.now(timezone.utc) + timedelta(days=TTL_DAYS)).strftime("%Y-%m-%d"),
         "access_count": 0,
-        "fact": f"[COMPACTED from {len(to_compact)} facts] " + "; ".join(compacted_texts[:3]) + "...",
+        "body": summary_body,
+        "fact": summary_body,
         "source": "auto-compaction",
         "tags": ["compacted"],
     }
@@ -239,7 +336,10 @@ def compact(module: str) -> Optional[Path]:
     _write_module_file(module_file, new_facts)
 
     print(f"Compacted {module}: {len(existing)} → {len(new_facts)} facts")
-    print(f"  Archived: {archive_file.relative_to(ROOT)}")
+    try:
+        print(f"  Archived: {archive_file.relative_to(ROOT)}")
+    except ValueError:
+        print(f"  Archived: {archive_file}")
     return module_file
 
 
@@ -293,10 +393,10 @@ def stats() -> dict:
 
     if MODULES_DIR.exists():
         for mf in MODULES_DIR.glob("*.md"):
-            facts = _parse_module_file(mf)
+            n = _count_facts(mf)
             stats["knowledge_modules"] += 1
-            stats["knowledge_facts"] += len(facts)
-            if len(facts) > MAX_FACTS_PER_MODULE:
+            stats["knowledge_facts"] += n
+            if n > MAX_FACTS_PER_MODULE:
                 stats["needs_compaction"].append(mf.stem)
 
     if WISDOM_DIR.exists():
@@ -352,40 +452,93 @@ def _get_relevant_knowledge(chapter_id: str) -> list:
 
 
 def _parse_module_file(file_path: Path) -> list:
-    """Parse a module file containing structured entries."""
+    """Parse a module file into a list of structured entries.
+
+    Each entry is delimited by a `## <PREFIX>NN: <title>` heading (any
+    uppercase letter prefix: K/T/P/M/W/...). Returns dicts with keys:
+    `id`, `title`, `body`, `module`, `chapter`, `discovered_by`,
+    `decay_after`, `access_count`, `tags`, `source`, `fact`.
+
+    `fact` is set to `body` for backward compatibility with compact()'s
+    summary pipeline. The bullet-style `**Field**: value` lines are
+    extracted when present; missing fields default to "unknown" / 0 / [].
+    """
     if not file_path.exists():
         return []
-    # For .md files, entries are separated by --- yaml frontmatter blocks
-    # For now, return empty (the agent writes structured content directly)
-    # The actual parsing would extract YAML frontmatter blocks
-    return []
+    import re
+    text = file_path.read_text()
+
+    # Match both `## K01:` (top-level fact) and `### K01:` (preserved
+    # sub-entry inside a compacted parent like `## K01–K05: [COMPACTED]`).
+    # The compacted parent itself doesn't match because its ID range
+    # `K01–K05` contains an en-dash, not a `:`-terminated single ID.
+    heading_re = re.compile(r"^##+ ([A-Z]\d+):\s*(.*?)\s*$", re.MULTILINE)
+    headings = list(heading_re.finditer(text))
+    if not headings:
+        return []
+
+    entries: list = []
+    for i, m in enumerate(headings):
+        body_start = m.end()
+        body_end = headings[i + 1].start() if i + 1 < len(headings) else len(text)
+        section = text[body_start:body_end]
+        # Trim a trailing `---` separator (and surrounding whitespace) belonging
+        # to the *next* entry, not this one.
+        section = re.sub(r"\n\s*---\s*\n?\s*$", "\n", section).strip("\n")
+
+        entry = {
+            "id": m.group(1),
+            "title": m.group(2).strip(),
+            "body": section,
+            "fact": section,  # back-compat alias used by compact()
+        }
+
+        # Pull out the `**Field**: value` bullet lines if they're present.
+        for field, key in (
+            ("Module", "module"),
+            ("Chapter", "chapter"),
+            ("Discovered by", "discovered_by"),
+            ("TTL", "decay_after"),
+            ("Source", "source"),
+        ):
+            mm = re.search(rf"^\*\*{re.escape(field)}\*\*:\s*(.+)$", section, re.MULTILINE)
+            if mm:
+                entry[key] = mm.group(1).strip()
+
+        ac = re.search(r"^\*\*Access count\*\*:\s*(\d+)", section, re.MULTILINE)
+        entry["access_count"] = int(ac.group(1)) if ac else 0
+
+        tags_m = re.search(r"^\*\*Tags\*\*:\s*(.*)$", section, re.MULTILINE)
+        if tags_m:
+            entry["tags"] = [t.strip() for t in tags_m.group(1).split(",") if t.strip()]
+        else:
+            entry["tags"] = []
+
+        entries.append(entry)
+
+    return entries
 
 
 def _write_module_file(file_path: Path, entries: list):
-    """Write structured entries to a module file."""
-    # Rebuild the file with entries as markdown sections
-    lines = [f"# {file_path.stem.replace('-', ' ').title()} Knowledge\n"]
+    """Write structured entries to a module file, preserving each entry's
+    original heading id (so a T-prefixed module stays T-prefixed after
+    compaction) and the full body text returned by `_parse_module_file`."""
+    title_h1 = f"# {file_path.stem.replace('-', ' ').title()} Knowledge"
+    lines = [title_h1, ""]
     for entry in entries:
-        lines.append("")
+        eid = entry.get("id", "K??")
+        title = entry.get("title") or (entry.get("body", "")[:60] if entry.get("body") else "")
         lines.append("---")
         lines.append("")
-        lines.append(f"## {entry.get('id', 'K??')}: {entry.get('fact', '')[:60]}")
+        lines.append(f"## {eid}: {title}".rstrip())
         lines.append("")
-        lines.append(f"**Module**: {entry.get('module', 'unknown')}")
-        lines.append(f"**Chapter**: {entry.get('chapter', 'unknown')}")
-        lines.append(f"**Discovered by**: {entry.get('discovered_by', 'unknown')}")
-        lines.append(f"**TTL**: {entry.get('decay_after', 'N/A')}")
-        lines.append(f"**Access count**: {entry.get('access_count', 0)}")
-        lines.append(f"**Tags**: {', '.join(entry.get('tags', []))}")
+        body = entry.get("body") or entry.get("fact", "")
+        lines.append(body.rstrip("\n"))
         lines.append("")
-        lines.append(entry.get('fact', ''))
-        if entry.get('source'):
-            lines.append(f"\n**Source**: {entry['source']}")
-    lines.append("")
 
     file_path.parent.mkdir(parents=True, exist_ok=True)
     with open(file_path, "w") as f:
-        f.write("\n".join(lines))
+        f.write("\n".join(lines).rstrip() + "\n")
 
 
 def _append_module_file(file_path: Path, entry: dict):
