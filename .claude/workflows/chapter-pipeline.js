@@ -14,14 +14,14 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch10',
-  slug: 'ch10-logprobs',
-  focus: 'Logprobs 装配与字节回退修正：从 EngineCore 张量取 sample/prompt logprobs、上下文感知 UTF-8 多字节重建、累计 logprob 跟踪、flat vs nested 格式',
-  highlight: 'output-processor',
+  chapter_id: 'ch11',
+  slug: 'ch11-engine-core',
+  focus: 'EngineCore.step() 编排(schedule → execute_model non_block → grammar bitmask → sample_tokens → update_from_output)、run_busy_loop、生命周期(pause/resume/sleep)、batch queue 接入点',
+  highlight: 'engine-core',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
-  paths: ['vllm/v1/engine/logprobs.py', 'vllm/v1/engine/output_processor.py', 'vllm/v1/engine/detokenizer.py'],
+  paths: ['vllm/v1/engine/core.py', 'vllm/v1/engine/core_client.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
@@ -138,6 +138,7 @@ writeV = await agent(
   { schema: STATUS_SCHEMA, label: 'write r' + w, phase: 'Write', agentType: 'general-purpose' }
 )
 }
+if (!writeV) return { chapter: A.chapter_id, escalated: 'write-failed', stage: 'Write', note: 'writer 多轮失败(限流/崩溃)，无 chapter.md，不进评审' }
 if (writeV && writeV.status === 'BLOCKED') return { escalated: 'write', stage: 'Write', reason: writeV.blocker_reason }
 
 // ---------- Phase E: Review (多维并行 → 协作回环) ----------
@@ -157,6 +158,7 @@ for (let r = 1; r <= 3; r++) {
     }
   }))
   const ok = dims.filter(Boolean)
+  if (ok.length < DIMS.length) return { chapter: A.chapter_id, escalated: 'review-agents-failed', stage: 'Review', round: r, note: '部分评审 agent 失败(限流/崩溃)，评审未完成，不假通过' }
   const issues = ok.flatMap(function (d) { return d.issues || [] })
   const blocking = issues.filter(function (i) { return i.blocking })
   if (!ok.some(function (d) { return !d.pass }) && blocking.length === 0) {
