@@ -89,6 +89,19 @@ jq -r '.overall_verdict' $D/reviews/review-report.json
 - 重大决策/转向 → `python3 scripts/archivist.py record --type decision ...` 存进 trace，并更新本手册 + CLAUDE.md。
 - superpowers skills 落点见 spec §8（brainstorming/writing-plans/TDD/verification/receiving-code-review/...）。
 
+## 9.5 全书批量循环（goal: 完成全书编写）
+
+被压缩/换会话后，照此续跑批量，**不靠记忆**：
+
+1. **进度真相** = `ls instances/vllm/artifacts/`（有目录=已写）。队列与参数 = `instances/vllm/book/cartography/chapter-queue.json`（每章 slug/focus/highlight/paths/mode/deps）。
+2. **选下一章**：chapter-queue 里 mode=code 且无 artifacts 目录的、依赖已满足的最前一章（数字序）。**ch01/ch02 是 mode=meta（概览，无精简版），留到所有 code 章之后，用定制轻量流写**。
+3. **发车**：把 `.claude/workflows/chapter-pipeline.js` 顶部的 `CFG` 改成该章参数（本机 args 注入不可靠，靠 CFG），`node --check` 后 `Workflow({scriptPath, args:{同 CFG}})`。
+4. **验收**（流水线完成后，逐条亲跑）：5 linter（fidelity/chapter_structure/formulas/source_grounding/diagrams）全过 + pytest 过 + 脱节体检（叙事引真 vllm/ ≫ 引精简版 implementation/）+ **亲眼看 1 张图确认中文渲染**（lint 查不出 rsvg 与否）+ review verdict=APPROVED + 无 negotiable=false 未修项。
+5. **提交**（事故教训：通过即提交）：`git add` 该章 artifacts + bible + trace，commit（带 Co-Authored-By）。
+6. **回到 2**，直到 ch01-ch33 全 done；其间**每完成一个 Part** 跑一次连贯性审计 + 批量润色（读各章 review-report.json 的 negotiable 项，派 writer 批量定点修）。
+- 串行（整章级，避免 bible 竞争）；逃生舱触发则按 §5 处理后续跑。
+- 进度（2026-06-21 起）：ch03/04/05 已成；其余在循环中。
+
 ## 9. 当前状态 & 下一步
 - 系统重建完成（地基 12/12 测试、6 角色、Roadmap、Bible、workflow+逃生舱、架构师文档）。**冷启动 Team Lead 文档考 v2 已 PASS 60/60**。
 - 首跑前 `instances/vllm/artifacts/` 不存在属正常——workflow 内 agent 会按绝对路径自建章节目录；`state.json` 已 bootstrap。

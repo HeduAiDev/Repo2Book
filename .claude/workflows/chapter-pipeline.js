@@ -14,14 +14,14 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch03',
-  slug: 'ch03-config-and-wiring',
-  focus: 'EngineArgs → VllmConfig 组装：ModelConfig/CacheConfig/ParallelConfig/SchedulerConfig/CompilationConfig，O0-O3 优化级，工厂式选择 Executor/Scheduler/EngineCoreClient',
-  highlight: '',
+  chapter_id: 'ch06',
+  slug: 'ch06-input-processor',
+  focus: 'Parallel Sampling 扇出 (n>1)：ParentRequest 派生 n 个独立 child EngineCoreRequest（唯一 id + 确定性种子递进），为何独立调度优于批量 n；兑现 ch04 延迟的 n>1',
+  highlight: 'input-processor',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
-  paths: ['vllm/config/vllm.py', 'vllm/engine/arg_utils.py', 'vllm/v1/engine/llm_engine.py', 'vllm/v1/engine/core.py'],
+  paths: ['vllm/v1/engine/parallel_sampling.py', 'vllm/v1/engine/async_llm.py', 'vllm/v1/engine/input_processor.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
