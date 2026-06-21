@@ -30,6 +30,13 @@ def test_good_chapter_passes(tmp_path):
     assert not res["no_roadmap"] and not res["no_embedded_source"] and not res["scaffold_leak"]
 
 
+def test_halfwidth_comma_blocking(tmp_path):
+    text = ("## Roadmap 你在这里\n不管走哪条路,出来的形状一致\n"
+            "```python\n# vllm/v1/engine/async_llm.py:L280\nx=1, y=2\n```\n"
+            "```python\n# vllm/v1/engine/async_llm.py:L637\nz=3\n```\n")
+    assert lint_structure(_w(tmp_path, text))["halfwidth_punct"]
+
+
 def test_scaffold_leak_blocking(tmp_path):
     text = ("## Roadmap 你在这里\n"
             "```python\n# instances/vllm/source/vllm/v1/engine/async_llm.py:L280\nx=1\n```\n"

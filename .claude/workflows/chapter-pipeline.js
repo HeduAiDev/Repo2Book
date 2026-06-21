@@ -14,14 +14,14 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch04',
-  slug: 'ch04-async-llm',
-  focus: 'AsyncLLM 三段式异步解耦',
-  highlight: 'async-engine',
+  chapter_id: 'ch03',
+  slug: 'ch03-config-and-wiring',
+  focus: 'EngineArgs → VllmConfig 组装：ModelConfig/CacheConfig/ParallelConfig/SchedulerConfig/CompilationConfig，O0-O3 优化级，工厂式选择 Executor/Scheduler/EngineCoreClient',
+  highlight: '',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
-  skip_dossier: true,
-  paths: ['vllm/v1/engine/async_llm.py', 'vllm/v1/engine/__init__.py', 'vllm/v1/engine/output_processor.py'],
+  skip_dossier: false,
+  paths: ['vllm/config/vllm.py', 'vllm/engine/arg_utils.py', 'vllm/v1/engine/llm_engine.py', 'vllm/v1/engine/core.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'

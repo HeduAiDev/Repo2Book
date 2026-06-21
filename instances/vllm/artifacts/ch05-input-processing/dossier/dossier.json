@@ -1,0 +1,191 @@
+{
+  "chapter_id": "ch05",
+  "title": "Stage 1 输入处理：Prompt 到 EngineCoreRequest（tokenize / 多模态 / 参数校验 / 请求 id）",
+  "scope_note": "本章解读 AsyncLLM / LLMEngine 进入 EngineCore 之前的『输入处理』阶段：InputProcessor.process_inputs() 如何把用户的 PromptType（文本/token/embeds/多模态）和 SamplingParams/PoolingParams 转换成一个 msgspec 结构体 EngineCoreRequest，期间完成参数校验、LoRA 校验、（在 deprecated 路径上）tokenize / 多模态处理、模型输入校验、SamplingParams 补全克隆、多模态 placeholder 排序展平、cache_salt 透传、以及通过 assign_request_id() 注入 8 字符随机后缀保证请求 id 唯一。最后解读 n>1 并行采样如何在 ParentRequest 里 fan-out 出 n 个子请求并聚合子输出。注意：真实源码里 tokenize/多模态的『重活』已下沉到 Renderer（render_cmpl/render_chat），InputProcessor 主线吃的是已渲染好的 EngineInput dict；只有 deprecated 的 raw-prompt 兜底路径才会现场调 InputPreprocessor.preprocess() 做 tokenize。本章把这两条路径都讲清，且明确指出主路径已不在 InputProcessor 做 tokenize（避免 writer 误导读者）。",
+
+  "code_spine": [
+    "vllm/v1/engine/async_llm.py:L349-L398 — add_request() 调用 process_inputs() → assign_request_id() → 按 n 是否为 1 决定单请求或 ParentRequest fan-out",
+    "vllm/v1/engine/input_processor.py:L234-L259 — process_inputs() 入口：先 _validate_params + _validate_lora，再校验 data_parallel_rank 范围",
+    "vllm/v1/engine/input_processor.py:L261-L286 — 两条 prompt 路径：已渲染 EngineInput dict（含 'type'）直接透传；raw prompt（deprecated）现场走 input_preprocessor.preprocess() tokenize",
+    "vllm/inputs/preprocess.py:L274-L291 — InputPreprocessor.preprocess()：enc-dec 与 decoder-only 分流",
+    "vllm/inputs/preprocess.py:L161-L188 — _process_text()：无多模态时 _tokenize_prompt() 出 token ids，封装 TokensInput",
+    "vllm/v1/engine/input_processor.py:L288-L291 — current_platform.validate_request() + split_enc_dec_input() + _validate_model_inputs()",
+    "vllm/v1/engine/input_processor.py:L293-L322 — 从 decoder_inputs 取 prompt_token_ids/prompt_embeds/prompt_is_token_ids；SamplingParams.clone() 后补全 max_tokens / update_from_generation_config / update_from_tokenizer",
+    "vllm/v1/engine/input_processor.py:L324-L360 — 多模态：校验 mm_hashes 为字符串、argsort_mm_positions 排序、展平成 list[MultiModalFeatureSpec]",
+    "vllm/v1/engine/input_processor.py:L362-L377 — 组装并返回 EngineCoreRequest",
+    "vllm/v1/engine/input_processor.py:L214-L232 — assign_request_id()：把 request_id 拷到 external_req_id，再追加 8 字符随机后缀写回 request_id",
+    "vllm/v1/engine/parallel_sampling.py:L36-L94 — ParentRequest 构造 + get_child_info()/_get_child_sampling_params() 生成 n 个子请求 id 与子采样参数",
+    "vllm/v1/engine/parallel_sampling.py:L100-L126 — get_outputs() 聚合子输出（流式直接转发 / FINAL_ONLY 聚合 n 个最终输出）"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/engine/input_processor.py",
+      "lines": "L234-L291",
+      "code": "    def process_inputs(\n        self,\n        request_id: str,\n        prompt: PromptType | EngineInput,\n        params: SamplingParams | PoolingParams,\n        supported_tasks: tuple[SupportedTask, ...],\n        arrival_time: float | None = None,\n        lora_request: LoRARequest | None = None,\n        tokenization_kwargs: dict[str, Any] | None = None,\n        trace_headers: Mapping[str, str] | None = None,\n        priority: int = 0,\n        data_parallel_rank: int | None = None,\n        resumable: bool = False,\n    ) -> EngineCoreRequest:\n        self._validate_params(params, supported_tasks)\n        self._validate_lora(lora_request)\n\n        parallel_config = self.vllm_config.parallel_config\n        dp_size = parallel_config.data_parallel_size\n        dp_local_size = parallel_config.data_parallel_size_local\n        num_ranks = dp_local_size if parallel_config.local_engines_only else dp_size\n        if data_parallel_rank is not None and not (0 <= data_parallel_rank < num_ranks):\n            raise ValueError(\n                f\"data_parallel_rank {data_parallel_rank} \"\n                f\"is out of range [0, {num_ranks}).\"\n            )\n\n        if isinstance(prompt, dict) and \"type\" in prompt:\n            if arrival_time is None:\n                arrival_time = prompt.get(\"arrival_time\", time.time())\n\n            processed_inputs: EngineInput = prompt\n        else:\n            logger.warning_once(\n                \"Passing raw prompts to InputProcessor is deprecated ...\"\n            )\n            if arrival_time is None:\n                arrival_time = time.time()\n\n            processed_inputs = self.input_preprocessor.preprocess(\n                prompt,\n                tokenization_kwargs=tokenization_kwargs,\n            )\n\n        current_platform.validate_request(processed_inputs, params)\n\n        encoder_inputs, decoder_inputs = split_enc_dec_input(processed_inputs)\n        self._validate_model_inputs(encoder_inputs, decoder_inputs)",
+      "elide": [
+        "L262-L267 的 tokenization_kwargs deprecation 警告分支（提示应改传给 Renderer）可省略，不影响主控制流",
+        "L274-L278 raw-prompt deprecation 警告文案可简写为一行注释"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/input_processor.py",
+      "lines": "L293-L322",
+      "code": "        # Mypy can be conservative for TypedDict unions; normalize access.\n        if decoder_inputs[\"type\"] == \"embeds\":\n            prompt_embeds = decoder_inputs[\"prompt_embeds\"]\n            prompt_token_ids = decoder_inputs.get(\"prompt_token_ids\")\n            prompt_is_token_ids = decoder_inputs.get(\"is_token_ids\")\n        else:\n            prompt_token_ids = decoder_inputs[\"prompt_token_ids\"]\n            prompt_embeds = None\n            prompt_is_token_ids = None\n\n        sampling_params = None\n        pooling_params = None\n        if isinstance(params, SamplingParams):\n            # TODO: can we avoid cloning here in multiproc case?\n            sampling_params = params.clone()\n            # If unset max tokens, then generate up to the max_model_len.\n            if sampling_params.max_tokens is None:\n                seq_len = length_from_prompt_token_ids_or_embeds(\n                    prompt_token_ids, prompt_embeds\n                )\n                sampling_params.max_tokens = self.model_config.max_model_len - seq_len\n\n            sampling_params.update_from_generation_config(\n                self.generation_config_fields,\n                self.renderer.get_eos_token_id(),\n            )\n            if self.tokenizer is not None:\n                sampling_params.update_from_tokenizer(self.tokenizer)\n        else:\n            pooling_params = params.clone()",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/input_processor.py",
+      "lines": "L324-L377",
+      "code": "        # Multimodal related.\n        mm_features: list[MultiModalFeatureSpec] | None = None\n\n        if decoder_inputs[\"type\"] == \"multimodal\":\n            decoder_mm_inputs = decoder_inputs[\"mm_kwargs\"]\n            decoder_mm_positions = decoder_inputs[\"mm_placeholders\"]\n            decoder_mm_hashes = decoder_inputs[\"mm_hashes\"]\n\n            if not all(\n                isinstance(leaf, str) for leaf in json_iter_leaves(decoder_mm_hashes)\n            ):\n                raise ValueError(\n                    f\"mm_hashes must contain only strings, got: {decoder_mm_hashes}. ...\"\n                )\n\n            # Merge and flatten multimodal placeholders, hashes and inputs\n            # from dictionaries to lists, and sort them by each item's position\n            # in the input sequence.\n            sorted_mm_idxs = argsort_mm_positions(decoder_mm_positions)\n\n            mm_features = []\n            for modality, idx in sorted_mm_idxs:\n                base_mm_hash = decoder_mm_hashes[modality][idx]\n                mm_features.append(\n                    MultiModalFeatureSpec(\n                        data=decoder_mm_inputs[modality][idx],\n                        modality=modality,\n                        identifier=self._get_mm_identifier(\n                            base_mm_hash,\n                            lora_request,\n                        ),\n                        mm_position=decoder_mm_positions[modality][idx],\n                        mm_hash=base_mm_hash,\n                    )\n                )\n\n        return EngineCoreRequest(\n            request_id=request_id,\n            prompt_token_ids=prompt_token_ids,\n            prompt_embeds=prompt_embeds,\n            prompt_is_token_ids=prompt_is_token_ids,\n            mm_features=mm_features,\n            sampling_params=sampling_params,\n            pooling_params=pooling_params,\n            arrival_time=arrival_time,\n            lora_request=lora_request,\n            cache_salt=decoder_inputs.get(\"cache_salt\"),\n            priority=priority,\n            data_parallel_rank=data_parallel_rank,\n            trace_headers=trace_headers,\n            resumable=resumable,\n        )",
+      "elide": ["L335-L339 的错误文案可简写"]
+    },
+    {
+      "path": "vllm/v1/engine/input_processor.py",
+      "lines": "L214-L232",
+      "code": "    @staticmethod\n    def assign_request_id(request: EngineCoreRequest):\n        \"\"\"Replace the externally supplied request ID with an internal request ID\n        that adds 8 random characters in order to ensure uniqueness.\n        \"\"\"\n        if request.external_req_id is not None:\n            raise ValueError(\n                \"The external_req_id field should not be set on EngineCoreRequests\"\n                \" passed to vLLM; use the request_id field.\"\n            )\n        request.external_req_id = request.request_id\n        if envs.VLLM_DISABLE_REQUEST_ID_RANDOMIZATION:\n            logger.warning_once(\n                \"VLLM_DISABLE_REQUEST_ID_RANDOMIZATION is set and will be ...\"\n            )\n        else:\n            request.request_id = f\"{request.external_req_id}-{random_uuid():.8}\"",
+      "elide": ["L226-L230 的 deprecation 警告文案可简写"]
+    },
+    {
+      "path": "vllm/v1/engine/input_processor.py",
+      "lines": "L81-L136",
+      "code": "    def _validate_params(\n        self,\n        params: SamplingParams | PoolingParams,\n        supported_tasks: tuple[SupportedTask, ...],\n    ) -> None:\n        \"\"\"Raise `ValueError` if SamplingParams or PoolingParams is not valid.\"\"\"\n        if isinstance(params, SamplingParams):\n            supported_generation_tasks = [\n                task for task in supported_tasks if task in GENERATION_TASKS\n            ]\n            if not supported_generation_tasks:\n                raise ValueError(\"This model does not support generation\")\n\n            params.verify(\n                self.model_config,\n                self.speculative_config,\n                self.structured_outputs_config,\n                self.tokenizer,\n            )\n            ...\n        elif isinstance(params, PoolingParams):\n            supported_pooling_tasks = [\n                task for task in supported_tasks if task in POOLING_TASKS\n            ]\n            if not supported_pooling_tasks:\n                raise ValueError(\"This model does not support pooling\")\n            ...\n            params.verify(self.model_config)\n        else:\n            raise TypeError(\n                f\"params must be either SamplingParams or PoolingParams, ...\"\n            )",
+      "elide": [
+        "L101-L109 thinking_token_budget 与 reasoning_config 的一致性校验，属次要分支可省略",
+        "L117-L130 PoolingParams 的 task 默认补全/校验细节可压缩为一行说明"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/input_processor.py",
+      "lines": "L426-L486",
+      "code": "    def _validate_model_input(\n        self,\n        prompt_input: SingletonInput,\n        prompt_type: Literal[\"encoder\", \"decoder\"],\n    ) -> None:\n        model_config = self.model_config\n        tokenizer = self.tokenizer\n\n        prompt_ids = (\n            None\n            if prompt_input[\"type\"] == \"embeds\"\n            else prompt_input[\"prompt_token_ids\"]\n        )\n        prompt_embeds = (\n            prompt_input[\"prompt_embeds\"] if prompt_input[\"type\"] == \"embeds\" else None\n        )\n\n        prompt_len = length_from_prompt_token_ids_or_embeds(prompt_ids, prompt_embeds)\n        self._validate_prompt_len(prompt_len, prompt_type)\n\n        if prompt_input[\"type\"] == \"multimodal\":\n            decoder_mm_positions = prompt_input[\"mm_placeholders\"]\n            for modality, mm_positions in decoder_mm_positions.items():\n                for mm_position in mm_positions:\n                    num_embeds = mm_position.get_num_embeds()\n                    if num_embeds > self.mm_encoder_cache_size:\n                        raise ValueError(...)\n\n        if prompt_ids and tokenizer is not None:\n            max_input_id = max(prompt_ids, default=0)\n            model_vocab_size = model_config.get_vocab_size()\n            if max_input_id > max(tokenizer.max_token_id, model_vocab_size - 1):\n                raise ValueError(f\"Token id {max_input_id} is out of vocabulary\")",
+      "elide": [
+        "L451-L459 编码器缓存超限错误文案可简写",
+        "L464-L473 关于 Qwen3 tokenizer/model vocab 不一致的长注释保留要点即可：取 tokenizer.max_token_id 与 model_vocab_size-1 的较大者判越界"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/input_processor.py",
+      "lines": "L379-L424",
+      "code": "    def _validate_prompt_len(\n        self,\n        prompt_len: int,\n        prompt_type: Literal[\"encoder\", \"decoder\"],\n    ):\n        if self.skip_prompt_length_check:\n            return\n\n        if prompt_len == 0 and prompt_type == \"decoder\":\n            raise ValueError(f\"The {prompt_type} prompt cannot be empty\")\n\n        model_config = self.model_config\n        max_prompt_len = (\n            model_config.max_model_len\n            if prompt_type == \"decoder\"\n            else self.mm_encoder_cache_size\n        )\n        if prompt_len > max_prompt_len:\n            ...\n            raise ValueError(\n                f\"The {prompt_type} prompt (length {prompt_len}) is \"\n                f\"longer than the maximum model length of {max_prompt_len}. ...\"\n            )\n        elif prompt_len == max_prompt_len and model_config.runner_type == \"generate\":\n            ...\n            raise ValueError(\n                f\"The {prompt_type} prompt (length {prompt_len}) plus the number of \"\n                f\"requested output tokens (at least 1) is longer than the maximum \"\n                f\"model length of {max_prompt_len}. ...\"\n            )",
+      "elide": ["L397-L409 与 L416-L419 的 suggestion 文案分支可压缩"]
+    },
+    {
+      "path": "vllm/v1/engine/parallel_sampling.py",
+      "lines": "L36-L94",
+      "code": "    def __init__(self, request: EngineCoreRequest) -> None:\n        assert request.external_req_id is not None\n        sampling_params = request.params\n        self.request_id = request.request_id\n        self.external_req_id = request.external_req_id\n        self.sampling_params = sampling_params\n\n        self.child_requests = set()\n        self.output_aggregator = (\n            [cast(CompletionOutput, None)] * sampling_params.n\n            if (sampling_params.output_kind == RequestOutputKind.FINAL_ONLY)\n            else []\n        )\n        self.max_num_generation_tokens = 0\n        self.cached_child_sampling_params = None\n\n    def _get_child_sampling_params(\n        self,\n        index: int,\n    ) -> SamplingParams:\n        seed = self.sampling_params.seed\n        if self.cached_child_sampling_params:\n            # Reuse child sampling_params data structure\n            return self.cached_child_sampling_params\n        # Build child sampling_params\n        child_sampling_params = copy(self.sampling_params)\n        child_sampling_params.n = 1\n        if seed is None:\n            # Cache child sampling_params for later reuse\n            self.cached_child_sampling_params = child_sampling_params\n        else:\n            # Each child gets a clone with a unique seed\n            child_sampling_params.seed = seed + index\n        return child_sampling_params\n\n    def get_child_info(self, index: int) -> tuple[str, SamplingParams]:\n        child_req_id = f\"{index}_{self.request_id}\"\n        self.child_requests.add(child_req_id)\n        return child_req_id, self._get_child_sampling_params(index)",
+      "elide": ["类属性声明块 L20-L34 及 docstring 可省略"]
+    },
+    {
+      "path": "vllm/v1/engine/async_llm.py",
+      "lines": "L381-L398",
+      "code": "        if is_pooling or params.n == 1:\n            await self._add_request(request, prompt_text, None, 0, queue)\n            return queue\n\n        parent_params = params\n        assert isinstance(parent_params, SamplingParams)\n\n        # Fan out child requests (for n>1).\n        parent_request = ParentRequest(request)\n        for idx in range(parent_params.n):\n            request_id, child_params = parent_request.get_child_info(idx)\n            child_request = request if idx == parent_params.n - 1 else copy(request)\n            child_request.request_id = request_id\n            child_request.sampling_params = child_params\n            await self._add_request(\n                child_request, prompt_text, parent_request, idx, queue\n            )\n        return queue",
+      "elide": []
+    }
+  ],
+
+  "key_classes": [
+    {"name": "InputProcessor", "file": "vllm/v1/engine/input_processor.py", "responsibility": "把 PromptType/EngineInput + SamplingParams/PoolingParams 转成 EngineCoreRequest：参数校验、LoRA 校验、（兜底）tokenize/多模态、模型输入校验、SamplingParams 克隆补全、多模态 placeholder 排序展平、组装 EngineCoreRequest，并经 assign_request_id() 注入唯一 id。"},
+    {"name": "EngineCoreRequest", "file": "vllm/v1/engine/__init__.py", "responsibility": "进入 EngineCore 的请求载荷，msgspec.Struct（array_like/omit_defaults/gc=False，为跨进程 IPC 优化）。承载 request_id/external_req_id、prompt_token_ids/prompt_embeds/prompt_is_token_ids、mm_features、sampling_params 或 pooling_params、arrival_time、lora_request、cache_salt、priority、data_parallel_rank 等。.params 属性统一返回 sampling 或 pooling 参数。"},
+    {"name": "InputPreprocessor", "file": "vllm/inputs/preprocess.py", "responsibility": "raw-prompt（deprecated）兜底路径的预处理：enc-dec 与 decoder-only 分流，文本经 _tokenize_prompt 出 token ids，多模态委托 renderer._process_multimodal，embeds 委托 renderer._process_embeds，产出统一的 EngineInput TypedDict。真实主路径已由 Renderer 完成，这里仅兜底。"},
+    {"name": "EngineInput / SingletonInput", "file": "vllm/inputs/engine.py", "responsibility": "已渲染输入的 TypedDict 家族：TokensInput(type='token')、EmbedsInput(type='embeds')、MultiModalInput(type='multimodal')、以及 enc-dec 复合类型；split_enc_dec_input 把复合拆成 (encoder, decoder)。"},
+    {"name": "MultiModalFeatureSpec", "file": "vllm/multimodal/inputs.py", "responsibility": "单个多模态 item 的处理结果与元数据：data(MultiModalKwargsItem 或 None)、modality、identifier(含 LoRA 前缀的缓存键)、mm_position(PlaceholderRange)、mm_hash。InputProcessor 把按 dict 组织的多模态数据展平排序成 list[MultiModalFeatureSpec]。"},
+    {"name": "PlaceholderRange", "file": "vllm/multimodal/inputs.py", "responsibility": "多模态占位符在 prompt_token_ids 中的位置(offset/length/is_embed mask)。get_num_embeds() 给出该 item 实际嵌入 token 数，用于编码器缓存超限校验。"},
+    {"name": "ParentRequest", "file": "vllm/v1/engine/parallel_sampling.py", "responsibility": "n>1 并行采样的父请求状态机：记录 n 个子请求 id，按 index 生成子 SamplingParams（n=1；有 seed 时 seed+index，无 seed 时复用同一克隆），并聚合子 CompletionOutput（流式逐个转发 / FINAL_ONLY 攒齐 n 个再回）。"}
+  ],
+
+  "data_flow": [
+    "1. async_llm.add_request() / llm_engine.add_request() : 调 input_processor.process_inputs(request_id, prompt, params, supported_tasks=...)",
+    "2. InputProcessor._validate_params : SamplingParams 走 GENERATION_TASKS 校验 + params.verify(model_config, speculative, structured_outputs, tokenizer)；PoolingParams 走 POOLING_TASKS 校验 + task 默认补全 + params.verify(model_config)",
+    "3. InputProcessor._validate_lora : 无 LoRA 配置却传了 lora_request 则报错",
+    "4. InputProcessor.process_inputs : 校验 data_parallel_rank ∈ [0, num_ranks)",
+    "5. 分流 : prompt 是带 'type' 的 dict（已渲染 EngineInput）→ 直接当 processed_inputs；否则（deprecated raw prompt）→ input_preprocessor.preprocess() 现场 tokenize/多模态",
+    "6. InputPreprocessor.preprocess (仅兜底) : is_encoder_decoder ? _process_encoder_decoder_prompt : _process_decoder_only_prompt → _prompt_to_llm_inputs 按 embeds/tokens/text 分派 → _process_text 调 _tokenize_prompt（Renderer）",
+    "7. current_platform.validate_request(processed_inputs, params) : 平台级请求校验",
+    "8. split_enc_dec_input : 拆出 (encoder_inputs, decoder_inputs)",
+    "9. InputProcessor._validate_model_inputs → _validate_model_input → _validate_prompt_len : 空 prompt、超 max_model_len、编码器缓存超限、token id 越界（max > max(tokenizer.max_token_id, model_vocab_size-1)）",
+    "10. 取出 decoder_inputs 的 prompt_token_ids/prompt_embeds/prompt_is_token_ids（按 type=='embeds' 区分）",
+    "11. SamplingParams.clone() : max_tokens 未设则补 max_model_len - seq_len；update_from_generation_config(eos/stop)；update_from_tokenizer(bad_words)。PoolingParams 仅 clone()",
+    "12. 多模态展平 (type=='multimodal') : 校验 mm_hashes 全字符串；argsort_mm_positions 按 offset 升序；逐 item 造 MultiModalFeatureSpec(identifier 经 _get_mm_identifier 可加 LoRA 前缀)",
+    "13. 组装 EngineCoreRequest(...) 返回（cache_salt 从 decoder_inputs.get('cache_salt') 透传）",
+    "14. assign_request_id : external_req_id ← request_id；request_id ← f'{external_req_id}-{random_uuid():.8}'（除非 VLLM_DISABLE_REQUEST_ID_RANDOMIZATION）",
+    "15. n 路由 (async_llm) : is_pooling 或 n==1 → 单请求 _add_request；否则 ParentRequest fan-out：每 idx 取 get_child_info → child_req_id='{idx}_{request_id}'、child_params（n=1，seed 处理），最后一个复用 request，其余 copy(request)",
+    "16. _add_request : output_processor.add_request(...) + engine_core.add_request_async(EngineCoreRequest) 过进程边界"
+  ],
+
+  "design_decisions": [
+    {"decision": "tokenize/多模态重活下沉到 Renderer，InputProcessor 主路径只吃已渲染的 EngineInput dict", "why": "render_cmpl/render_chat 已在 API 层完成渲染；InputProcessor 对带 'type' 的 dict 直接透传，raw prompt 路径打 deprecation 警告并将在 v0.18 移除。这样 InputProcessor 聚焦校验+组装，避免重复 tokenize。", "evidence": "vllm/v1/engine/input_processor.py:L261-L286"},
+    {"decision": "请求 id 注入 8 字符随机后缀，保留原 id 到 external_req_id", "why": "保证内部 request_id 唯一（外部 id 可能重复），同时外部 id 仍用于输出回传与 abort(internal=False)。可用 VLLM_DISABLE_REQUEST_ID_RANDOMIZATION 关闭但会告警（未来移除）。", "evidence": "vllm/v1/engine/input_processor.py:L214-L232"},
+    {"decision": "SamplingParams/PoolingParams 一律 clone() 后再改", "why": "process_inputs 会就地补全 max_tokens、注入 eos/stop、bad_words，必须避免污染调用方传入的参数对象；n>1 时每个子请求也基于克隆派生。", "evidence": "vllm/v1/engine/input_processor.py:L305-L322"},
+    {"decision": "max_tokens 未设时补成 max_model_len - seq_len", "why": "让未显式限制输出长度的请求最多生成到模型上下文上限，避免越界。", "evidence": "vllm/v1/engine/input_processor.py:L308-L313"},
+    {"decision": "多模态从 dict-of-list 展平为按 offset 排序的 list[MultiModalFeatureSpec]", "why": "下游（EngineCore/调度/编码器缓存）需要按 item 在序列中的位置有序处理；argsort_mm_positions 按 PlaceholderRange.offset 升序统一不同模态的交错顺序。", "evidence": "vllm/v1/engine/input_processor.py:L341-L360, vllm/multimodal/utils.py:L112-L133"},
+    {"decision": "mm identifier 在 enable_tower_connector_lora 时加 LoRA 名前缀", "why": "该模式下多模态嵌入随 LoRA 变化，缓存键必须含 LoRA 以防错误命中；否则直接用 mm_hash。", "evidence": "vllm/v1/engine/input_processor.py:L157-L173"},
+    {"decision": "token id 越界判定取 tokenizer.max_token_id 与 model_vocab_size-1 的较大者", "why": "Qwen3 等模型语言模型多出 token、tokenizer 多出多模态 placeholder token，两侧 vocab 不一致；取较大者避免误判 OOV。", "evidence": "vllm/v1/engine/input_processor.py:L461-L476"},
+    {"decision": "EngineCoreRequest 用 msgspec.Struct(array_like, omit_defaults, gc=False)", "why": "请求要跨进程 IPC 序列化到 EngineCore；array_like+omit_defaults 减小序列化体积、gc=False 降 GC 开销。", "evidence": "vllm/v1/engine/__init__.py:L80-L85"},
+    {"decision": "n>1 的 fan-out 在 AsyncLLM/LLMEngine 层（add_request）而非 InputProcessor 内", "why": "process_inputs 只产出单个父 EngineCoreRequest；并行采样的子请求拆分是『请求接入』职责，由 ParentRequest 协调子 id 与子参数、并负责后续输出聚合，与输入处理解耦。", "evidence": "vllm/v1/engine/async_llm.py:L381-L398, vllm/v1/engine/parallel_sampling.py:L83-L94"},
+    {"decision": "子采样参数：无 seed 时所有子请求共享一份缓存克隆，有 seed 时每个 seed+index", "why": "无 seed 时各子请求采样独立，可复用同一 n=1 参数对象省内存；有 seed 时为保证 n 个子请求结果不同且可复现，给每个子请求一个确定且不同的 seed。", "evidence": "vllm/v1/engine/parallel_sampling.py:L52-L81"}
+  ],
+
+  "theory": [
+    {"topic": "请求 id 随机后缀的唯一性", "detail": "random_uuid() 取 uuid4().hex（128 bit 随机），`:.8` 截前 8 个十六进制字符 = 32 bit。冲突概率按生日界 ~ n^2/2^33，单实例内同一外部 id 重复时再撞 8 字符后缀的概率极低；目的是消歧外部重复 id，而非全局密码学唯一。"},
+    {"topic": "max_tokens 默认补全", "detail": "seq_len = length_from_prompt_token_ids_or_embeds(prompt_token_ids, prompt_embeds)（token 数或 embeds 行数）；max_tokens = max_model_len - seq_len，确保 prompt+输出 ≤ 上下文窗口。"},
+    {"topic": "多模态 placeholder 排序复杂度", "detail": "argsort_mm_positions 先把 dict-of-list 摊平成 (modality, idx, item) 再按 item.offset 排序，O(M log M)（M = 总 item 数）。展平后下游可单遍按序处理交错的图/音/视频。"},
+    {"topic": "编码器缓存超限校验", "detail": "对每个 PlaceholderRange，get_num_embeds() = is_embed 为空则 length，否则 is_embed.cumsum 末值（真实嵌入位数）；> mm_encoder_cache_size 则报错。mm_encoder_cache_size 来自 MultiModalBudget(vllm_config).encoder_cache_size。"},
+    {"topic": "并行采样输出聚合两种模式", "detail": "ParentRequest.get_outputs：非 FINAL_ONLY（流式）直接转发当前 child output（已完成且已返回过的不再发）；FINAL_ONLY 把每个 child 的最终 output 按 index 写入 output_aggregator，待 child_requests 清空后整批返回。finished = not child_requests。"}
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "inject_into_mm_cache() 整个方法（L175-L212）", "why_safe": "这是前端把已处理 mm_kwargs 注入 processor cache 的旁路优化，不在 process_inputs 主控制流上，删去不影响『prompt→EngineCoreRequest』主线。"},
+      {"what": "_validate_params 中 thinking_token_budget / reasoning_config 一致性校验分支（L101-L109）", "why_safe": "针对 reasoning 特性的次要校验，与 tokenize/多模态/id 主线无关，精简版可只保留 GENERATION/POOLING 任务校验与 params.verify。"},
+      {"what": "_validate_params 中 PoolingParams 的 task 默认补全细节（L117-L124）", "why_safe": "pooling task 自动选择是次要旁支；精简版保留『不支持 pooling 报错 + params.verify(model_config)』即可体现校验骨架。"},
+      {"what": "tokenization_kwargs 与 raw-prompt 的 deprecation 警告文案（L262-L267, L274-L278, L226-L230）", "why_safe": "纯日志告警，不改变数据流；保留分支结构、删冗长文案不影响正确性。"},
+      {"what": "_validate_model_input 关于 Qwen3 vocab 的长注释（L464-L473）", "why_safe": "注释不影响执行；保留 `max(tokenizer.max_token_id, model_vocab_size-1)` 的判定逻辑即可，注释可压成一行。"},
+      {"what": "_validate_prompt_len 中各 suggestion 文案构造分支（L397-L409, L416-L419）", "why_safe": "仅错误信息措辞，保留『空/超长/等长』三类 raise 即可保住校验语义。"},
+      {"what": "ParentRequest.observe_num_generation_tokens / observe_finished_request（L128-L151）", "why_safe": "属 metrics/IterationStats 统计旁路，不影响子请求 fan-out 与输出聚合主线，可删。"}
+    ],
+    "must_keep": [
+      {"symbol": "InputProcessor.process_inputs", "why": "主入口，全章数据流主线。"},
+      {"symbol": "InputProcessor._validate_params", "why": "参数校验骨架（生成/池化任务路由 + params.verify）必须讲清。"},
+      {"symbol": "InputProcessor._validate_lora", "why": "LoRA 校验是参数校验的一环，读者需理解。"},
+      {"symbol": "InputProcessor.assign_request_id", "why": "请求 id 唯一化是本章四大主题之一（external_req_id + 8 字符后缀）。"},
+      {"symbol": "InputProcessor._validate_model_inputs", "why": "模型输入校验入口，分发到 encoder/decoder。"},
+      {"symbol": "InputProcessor._validate_model_input", "why": "token id 越界、多模态嵌入数校验的核心逻辑。"},
+      {"symbol": "InputProcessor._validate_prompt_len", "why": "空 prompt / 超 max_model_len 校验，读者必懂。"},
+      {"symbol": "InputProcessor._get_mm_identifier", "why": "多模态缓存键（含 LoRA 前缀）生成，writer 需讲。"},
+      {"symbol": "split_enc_dec_input", "why": "enc/dec 拆分，决定后续取 decoder_inputs 的路径。"},
+      {"symbol": "argsort_mm_positions", "why": "多模态按 offset 排序展平的关键，是本章多模态主题核心。"},
+      {"symbol": "MultiModalFeatureSpec", "why": "多模态展平后的目标结构，必须出现。"},
+      {"symbol": "EngineCoreRequest", "why": "本阶段产物，整章终点，所有字段需可见。"},
+      {"symbol": "update_from_generation_config", "why": "SamplingParams 补全 eos/stop，参数补全主题。"},
+      {"symbol": "update_from_tokenizer", "why": "bad_words 校验/补全，参数补全主题。"},
+      {"symbol": "ParentRequest", "why": "n>1 并行采样核心类。"},
+      {"symbol": "get_child_info", "why": "生成子请求 id 与子参数，fan-out 主线。"},
+      {"symbol": "_get_child_sampling_params", "why": "子采样参数派生（seed 处理 + 缓存复用），读者必懂。"},
+      {"symbol": "get_outputs", "why": "子输出聚合（流式 vs FINAL_ONLY），并行采样下游闭环。"}
+    ]
+  },
+
+  "diagram_plan": [
+    {
+      "name": "01-input-processing-pipeline",
+      "type": "flow",
+      "spec": "竖向流水线：用户 prompt+params → process_inputs → [_validate_params/_validate_lora/dp_rank 校验] → 分流(已渲染 EngineInput 透传 | raw prompt→InputPreprocessor.preprocess tokenize) → current_platform.validate_request → split_enc_dec_input → _validate_model_inputs(空/超长/越界/编码器缓存) → SamplingParams.clone+补全 → 多模态展平(argsort_mm_positions→MultiModalFeatureSpec[]) → EngineCoreRequest → assign_request_id(注入 8 字符后缀)。每个框标注 vllm/v1/engine/input_processor.py:Lxxx。",
+      "roadmap_highlight": "input-processing (Stage 1)"
+    },
+    {
+      "name": "02-request-id-and-fanout",
+      "type": "flow",
+      "spec": "两段：上半 assign_request_id —— request_id 'req-abc' 拷到 external_req_id，再变 'req-abc-3f9a2b1c'；下半 n>1 fan-out —— 一个父 EngineCoreRequest 经 ParentRequest 派生 n 个子请求(child id='{idx}_{request_id}'、child sampling n=1、seed 分支)，最后一个复用父对象、其余 copy。标 async_llm.py:L381-L398 与 parallel_sampling.py:L52-L94。",
+      "roadmap_highlight": "input-processing (Stage 1)"
+    },
+    {
+      "name": "03-multimodal-flatten",
+      "type": "table+arrows",
+      "spec": "展示 dict-of-list(mm_placeholders/mm_hashes/mm_kwargs 按 modality 分组，交错 offset) → argsort_mm_positions 按 offset 升序 → 扁平 list[MultiModalFeatureSpec]（每行 data/modality/identifier/mm_position/mm_hash）。用一个含 image+audio 交错的小例子。",
+      "roadmap_highlight": "input-processing (Stage 1)"
+    }
+  ],
+
+  "foreshadow_due": {"plant": [], "payoff": [], "note": "bible.py due ch05 返回空（无应埋伏笔、无应回收）。建议本章可主动为后续章节埋点（writer 视全书大纲决定）：(a) EngineCoreRequest 跨进程 IPC 序列化 → Stage 2 EngineCore；(b) mm_features / PlaceholderRange / encoder_cache_size → 后续多模态编码器缓存与调度章；(c) ParentRequest 输出聚合 → Stage 3 输出处理章；(d) cache_salt / prompt_token_ids → 前缀缓存章。这些为建议性伏笔，非 bible 强制项。"}
+}

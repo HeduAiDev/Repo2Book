@@ -13,7 +13,7 @@ MIN_SOURCE_BLOCKS = 2
 
 def lint_structure(md_path: str) -> dict:
     text = Path(md_path).read_text(encoding="utf-8")
-    res = {"no_roadmap": [], "no_embedded_source": [], "scaffold_leak": []}
+    res = {"no_roadmap": [], "no_embedded_source": [], "scaffold_leak": [], "halfwidth_punct": []}
 
     head = "\n".join(text.splitlines()[:60])
     if not re.search(r"(roadmap|路线图|你在这里)", head, re.I):
@@ -35,6 +35,12 @@ def lint_structure(md_path: str) -> dict:
     for pat, msg in scaffold:
         if re.search(pat, text):
             res["scaffold_leak"].append(f"  {msg}")
+
+    # 中文之间误用半角逗号（应全角 '，'）；排除代码块
+    no_code = re.sub(r'```.*?```', '', text, flags=re.S)
+    for mm in re.finditer(r'[一-鿿],', no_code):
+        ctx = no_code[max(0, mm.start() - 6):mm.start() + 2].replace('\n', ' ')
+        res["halfwidth_punct"].append(f"  中文后误用半角逗号（应 '，'）：…{ctx}…")
     return res
 
 
