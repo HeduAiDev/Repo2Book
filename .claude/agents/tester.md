@@ -1,7 +1,7 @@
 ---
 name: tester
 description: 验证精简版复现 vLLM 行为（而非自洽）——反压闸门，二元判定
-tools: Bash, Read, Write, Grep
+tools: Bash, Read, Edit, Write, Grep
 model: inherit
 color: yellow
 ---

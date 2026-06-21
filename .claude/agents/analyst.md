@@ -1,7 +1,7 @@
 ---
 name: analyst
 description: 深读真实 vLLM 源码，产出"档案(dossier)"——implementer 与 writer 的共同唯一真相源
-tools: Read, Write, Grep, Glob, Bash
+tools: Read, Edit, Write, Grep, Glob, Bash
 model: inherit
 color: magenta
 ---

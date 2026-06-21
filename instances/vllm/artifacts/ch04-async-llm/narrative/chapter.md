@@ -6,7 +6,7 @@
 
 > *图注：全书 15 个子系统的路线图。本章点亮 `async-engine`——也就是 `AsyncLLM` 这层异步前端。它的左右两侧（`input-processor` / `engine-core` / `output-processor`）是三段式的三个去处，分别留给后面的章节展开。*
 
-前面几章，我们把一个推理引擎该有的零件摆了出来：连续批处理在 GPU 上怎么把请求拼成一批跑（ch03），以及 vLLM v1 的整体骨架长什么样。但有个问题一直没回答：**一个请求从 HTTP 进来、到 token 一个一个吐回客户端，中间到底经过几只手？**
+前面几章，我们已经有了纵览全局的底子：[vLLM v1 的整体心智模型](../ch01-overview/narrative/chapter.md)、[一个请求端到端的鸟瞰路径](../ch02-request-lifecycle/narrative/chapter.md)，以及[从 `EngineArgs` 怎么组装出 `VllmConfig`](../ch03-config-assembly/narrative/chapter.md)——本章构造三段所依赖的那套配置，正是上一章拼出来的。但有个问题一直没回答：**一个请求从 HTTP 进来、到 token 一个一个吐回客户端，中间到底经过几只手？**
 
 这章给答案。主角是 `vllm/v1/engine/async_llm.py:L70` 里的 `AsyncLLM` 类。它是 OpenAI 兼容服务器背后的异步引擎前端，一个不到 800 行的 facade。它干的事可以浓缩成一句话：
 
@@ -14,11 +14,11 @@
 
 这章我们只讲清楚 `AsyncLLM` 这一层怎么**编排**这三段——它怎么接请求、怎么把请求扇出到三段、怎么用一个背景任务把结果收回来再分发给成百上千个并发的 `generate()` 协程。三段各自的内部细节会在后面解锁：
 
-- **Stage1 输入预处理**（tokenize、校验）→ `ch05`
-- **Stage2 EngineCore 跨进程 IPC**（ZMQ、msgpack、进程编排）→ `ch07`
-- **Stage3 输出后处理**（detokenize、累积、停止串检测）→ `ch08`
+- **Stage1 输入预处理**（tokenize、校验）—— [第 5 章：输入处理](../ch05-input-processing/narrative/chapter.md)
+- **Stage2 EngineCore 跨进程 IPC**（ZMQ、msgpack、进程编排）—— [第 7 章：IPC 边界](../ch07-ipc-boundary/narrative/chapter.md)
+- **Stage3 输出后处理**（detokenize、累积、停止串检测）—— [第 8 章：输出处理](../ch08-output-processing/narrative/chapter.md)
 
-下一章 `ch05` 会钻进 Stage1；本章只把它当黑盒用。读完这章，你会对"一个 token 怎么流回客户端"有一张完整的地图。
+下一章会钻进 [Stage1 的输入处理](../ch05-input-processing/narrative/chapter.md)；本章只把它当黑盒用。读完这章，你会对"一个 token 怎么流回客户端"有一张完整的地图。
 
 ---
 
@@ -28,7 +28,7 @@
 
 ![AsyncLLM 三段式异步解耦总览](../diagrams/fig-3stage-pipeline.png)
 
-> *图注：三条泳道。左边「本进程 Frontend」做 CPU 活（tokenize/detokenize）；右边「独立进程 EngineCore」做 GPU 活（调度+执行）；中间虚线是进程边界（IPC，机制留 ch07）。蓝线是请求进入引擎的方向（`EngineCoreRequest`），红线是结果返回前端的方向（`EngineCoreOutput`）。三个圆角编号是本章埋的三个伏笔：① per-request 队列、② 进程边界、③ 生产者-消费者背景任务。*
+> *图注：三条泳道。左边「本进程 Frontend」做 CPU 活（tokenize/detokenize）；右边「独立进程 EngineCore」做 GPU 活（调度+执行）；中间虚线是进程边界（IPC，机制留 [第 7 章：IPC 边界](../ch07-ipc-boundary/narrative/chapter.md)）。蓝线是请求进入引擎的方向（`EngineCoreRequest`），红线是结果返回前端的方向（`EngineCoreOutput`）。图里特意标出的三处，是本章会逐一拆开的三块骨架：每请求一条的队列、把前后端分到两个进程的边界，以及在后台把结果收回来再分发的生产者-消费者背景任务。*
 
 为什么非要拆成三段、还要跨进程？答案藏在一个朴素的事实里：**tokenize 是 CPU 干的纯 Python 活，模型前向是 GPU 干的活，这两件事如果挤在同一个进程同一个线程，会被 Python 的 GIL 逼着串行。**
 
@@ -63,7 +63,7 @@
 - `OutputProcessor` —— Converts EngineCoreOutputs → RequestOutput（Stage3，本进程）
 - `EngineCoreClient` —— **starts the engine in background process**（Stage2，独立进程）
 
-注意第三行那句注释：`make_async_mp_client` 不是构造一个对象那么简单，它会**起一个独立的子进程**把 EngineCore 跑起来。这个进程边界（伏笔 ②）是三段式的物理前提，它的 IPC 机制（ZMQ + msgpack）留到 `ch07` 揭晓；本章只需要知道：**Stage2 在另一个进程里，前端通过两个异步方法跟它对话。**
+注意第三行那句注释：`make_async_mp_client` 不是构造一个对象那么简单，它会**起一个独立的子进程**把 EngineCore 跑起来。这个进程边界是三段式的物理前提，它的 IPC 机制（ZMQ + msgpack）留到 [第 7 章：IPC 边界](../ch07-ipc-boundary/narrative/chapter.md) 揭晓；本章只需要知道：**Stage2 在另一个进程里，前端通过两个异步方法跟它对话。**
 
 ### 拆段到底省了多少？给个数
 
@@ -87,7 +87,7 @@ $$
 \frac{1}{T_{cpu}+T_{gpu}} \;\longrightarrow\; \frac{1}{\max(T_{cpu},\, T_{gpu})}
 $$
 
-**翻译成人话**：假设 tokenize 一批要 8ms、GPU 跑一步也要 8ms。不拆，每步 16ms；拆了，两件事并排跑，每步约 8ms——**吞吐近乎翻倍**。当 $T_{cpu}$ 和 $T_{gpu}$ 同量级时收益最大，这也是连续批处理（ch03）能持续把 GPU 喂饱的前提：前端不停接客、预处理，后端不停跑批，谁也别等谁。
+**翻译成人话**：假设 tokenize 一批要 8ms、GPU 跑一步也要 8ms。不拆，每步 16ms；拆了，两件事并排跑，每步约 8ms——**吞吐近乎翻倍**。当 $T_{cpu}$ 和 $T_{gpu}$ 同量级时收益最大，这也是后面[连续批处理](../ch13-continuous-batching/narrative/chapter.md)能持续把 GPU 喂饱的前提：前端不停接客、预处理，后端不停跑批，谁也别等谁。
 
 ---
 
@@ -117,7 +117,7 @@ $$
 
 为什么要兼容"事件循环还没起"这种情况？因为 OpenAI 兼容服务器的启动顺序：服务器框架往往先构造引擎对象，**之后**才进入 asyncio 事件循环。如果 `__init__` 里硬要 `asyncio.create_task`，启动期就会炸。把启动失败优雅地推迟，是这五行的全部用意。那"等首个请求再启"在哪兑现？下一节的 `add_request` 里。
 
-`output_handler` 这个背景任务就是伏笔 ③ 的生产者实体——它在后台不停从 EngineCore 拉结果、推回各请求的队列。它和 `generate()` 协程构成一对生产者-消费者关系，这层关系会在 `ch08` 回收。本节先记住它的名字和"懒/急启"的双保险。
+`output_handler` 这个背景任务就是那个生产者实体——它在后台不停从 EngineCore 拉结果、推回各请求的队列。它和 `generate()` 协程构成一对生产者-消费者关系，这层关系在流式输出里的完整角色会在 [第 8 章：输出处理](../ch08-output-processing/narrative/chapter.md) 接着讲。本节先记住它的名字和"懒/急启"的双保险。
 
 ---
 
@@ -192,7 +192,7 @@ $$
 
 把它拆开看，`generate()` 其实只做三件事：
 
-**第一步：登记，拿队列。** `q = await self.add_request(...)`。这一句把请求送进登记流程，**返回本请求专属的一个队列** `q`（类型 `RequestOutputCollector`，伏笔 ①）。注意它返回的是队列，不是结果——结果稍后由背景任务往这个队列里塞。`add_request` 内部干了什么，下一节细讲。
+**第一步：登记，拿队列。** `q = await self.add_request(...)`。这一句把请求送进登记流程，**返回本请求专属的一个队列** `q`（类型 `RequestOutputCollector`，它的真身见 [§4.6](#46-队列的真身requestoutputcollector)）。注意它返回的是队列，不是结果——结果稍后由背景任务往这个队列里塞。`add_request` 内部干了什么，下一节细讲。
 
 **第二步：拉取与判停的主循环。** 看这一行，是本章最值得品的设计之一：
 
@@ -271,11 +271,11 @@ $$
         # … 省略：n>1 的 ParentRequest 扇出子请求（并行采样）…
 ```
 
-四步，对应 docstring 列的前三项加一个埋的伏笔：
+四步，对应 docstring 列的前三项，外加一个为后文埋下的种子——每请求专属队列：
 
-1. **`process_inputs(...)`** —— Stage1，把原始 prompt + 采样参数转成已 tokenize 的 `EngineCoreRequest`。本章把它当黑盒；内部 tokenize/校验留 `ch05`。
+1. **`process_inputs(...)`** —— Stage1，把原始 prompt + 采样参数转成已 tokenize 的 `EngineCoreRequest`。本章把它当黑盒；内部 tokenize/校验留 [第 5 章：输入处理](../ch05-input-processing/narrative/chapter.md)。
 2. **`self._run_output_handler()`** —— 这就是 4.2 节说的"等首个请求再启"的兑现点。注释（vLLM 原文）写得明明白白：之所以放在首个 `add_request`，是为了让 `__init__` 能早于事件循环跑、从而在 OpenAI server 启动失败时优雅处理。`_run_output_handler` 内部有幂等保护，重复调用安全（4.5 节看到）。
-3. **`queue = RequestOutputCollector(...)`** —— 为**这一个请求**新建一个专属队列（伏笔 ①）。注意是"每请求一个"，不是全局共享。这是异步多路复用的关键，理由在 4.7 节量化。
+3. **`queue = RequestOutputCollector(...)`** —— 为**这一个请求**新建一个专属队列。注意是"每请求一个"，不是全局共享。这是异步多路复用的关键，理由在 [§4.7](#47-解多路复用一批输出怎么分回-n-个队列) 量化。
 4. **`await self._add_request(...)` 然后 `return queue`** —— 走 `n == 1` 主路径（`n>1` 并行采样是同机制重复，本章不展开），把活儿交给 `_add_request`，最后把队列还给 `generate()`。
 
 ### 4.4.2 `_add_request`：全章最关键的 16 行
@@ -301,14 +301,14 @@ $$
         # … 省略：log_requests 日志 …
 ```
 
-两条注释（vLLM 原文）逐字点破了进程边界（伏笔 ②）：
+两条注释（vLLM 原文）逐字点破了进程边界：
 
 - `# Add the request to OutputProcessor (this process).` —— **本进程**：把队列 `queue` 登记进 Stage3 的 OutputProcessor，建立 `req_id → queue` 的映射。这一步在本进程同步完成。
 - `# Add the EngineCoreRequest to EngineCore (separate process).` —— **独立进程**：把 `EngineCoreRequest` 经 `add_request_async` 投递到另一个进程的 EngineCore。这一步是 `await`，因为它要过 IPC。
 
 **同一个请求，同时往两个方向登记**：一路留在本进程等着接收结果（OutputProcessor 那条），一路送出进程去真正干活（EngineCore 那条）。这就是"扇出"。注意这两路是不对称的——本进程那路只是建个映射表项，跨进程那路才是把 tokenize 好的请求真正送进引擎。
 
-`add_request_async` 是 Stage2 的 IPC 接缝（伏笔 ②）：它 encode 后经 ZMQ 把 `EngineCoreRequest` 发到 EngineCore 进程。`AsyncLLM` 只看到这一个 `await`，进程/ZMQ/序列化全在幕后——这些是 `ch07` 的主题。
+`add_request_async` 是 Stage2 的 IPC 接缝：它 encode 后经 ZMQ 把 `EngineCoreRequest` 发到 EngineCore 进程。`AsyncLLM` 只看到这一个 `await`，进程/ZMQ/序列化全在幕后——这些是 [第 7 章：IPC 边界](../ch07-ipc-boundary/narrative/chapter.md) 的主题。
 
 ---
 
@@ -316,7 +316,7 @@ $$
 
 来源：`vllm/v1/engine/async_llm.py:L637-L707`。
 
-请求送出去了，token 一个个在 EngineCore 进程里生出来。谁负责把它们收回前端、再分给对应的 `generate()`？就是那个一直在后台转的 `output_handler` 任务。它是伏笔 ③ 的生产者实体，和 `generate()` 主循环（消费者）配成一对。
+请求送出去了，token 一个个在 EngineCore 进程里生出来。谁负责把它们收回前端、再分给对应的 `generate()`？就是那个一直在后台转的 `output_handler` 任务。它就是那个生产者实体，和 `generate()` 主循环（消费者）配成一对。
 
 ```python
     # vllm/v1/engine/async_llm.py:L637-L707
@@ -379,7 +379,7 @@ $$
 
 **`while True` 的三步循环：**
 
-1. **拉一批**：`outputs = await engine_core.get_output_async()`。这是 Stage2 IPC 接缝的另一半（伏笔 ②/③）——`get_output_async` 从一个 asyncio 队列里 `await` 出一批 `EngineCoreOutputs`，这个队列由幕后的 ZMQ 接收任务填充。**一个 IPC 出口，统一收所有请求的输出**，而不是每请求各开一条 IPC 流。机制留 `ch07`。
+1. **拉一批**：`outputs = await engine_core.get_output_async()`。这是 Stage2 IPC 接缝的另一半——`get_output_async` 从一个 asyncio 队列里 `await` 出一批 `EngineCoreOutputs`，这个队列由幕后的 ZMQ 接收任务填充。**一个 IPC 出口，统一收所有请求的输出**，而不是每请求各开一条 IPC 流。机制留 [第 7 章：IPC 边界](../ch07-ipc-boundary/narrative/chapter.md)。
 2. **分块处理**：按 `VLLM_V1_OUTPUT_PROC_CHUNK_SIZE` 把这一批切成小块，每块调 `output_processor.process_outputs(...)`。注意那句 `assert not processed_outputs.request_outputs`——异步路径下 `process_outputs` **不返回**结果列表，结果是被直接 `put` 进各请求队列的（注释 vLLM 原文：`RequestOutputs are pushed to their queues`）。这条 `assert` 是个忠实性自检：异步路径就不该有返回值。
 3. **块间让步**：`if end < num_outputs: await asyncio.sleep(0)`。这一句是单线程协作式调度的精髓，单开一节讲（4.5.1）。
 
@@ -414,7 +414,7 @@ $$
 
 ---
 
-## 4.6 队列的真身：`RequestOutputCollector`（伏笔 ①）
+## 4.6 队列的真身：`RequestOutputCollector`
 
 来源：`vllm/v1/engine/output_processor.py:L45-L106`。
 
@@ -533,10 +533,12 @@ class RequestOutputCollector:
 **归纳**：每个操作都保持 I：
 
 - **`put` 到空槽**（`self.output is None`，`output_processor.py:L64-66`）：新块整体进槽，"槽内未取"延长一块，I 保持。
-- **`put` 到非空槽**（`self.output.add(...)`，`L67-72`）：走到 `outputs.py:L145` 的 `add`。DELTA 分支对同 `index` 的 completion 执行 `completion.token_ids.extend(next_completion.token_ids)`（`outputs.py:L159`）——把新块按序 **append 到旧块尾**。槽内子序列因此是"有序前缀的延长"，I 保持。这正是轮 4 的合帧。
+- **`put` 到非空槽**（`self.output.add(...)`，`L67-72`）：走到 `outputs.py:L145` 的 `add`，两种输出模式各有一条分支，都保持 I：
+  - **DELTA 模式**（`aggregate=True`）对同 `index` 的 completion 执行 `completion.token_ids.extend(next_completion.token_ids)`（`outputs.py:L159`）——把新块按序 **append 到旧块尾**。这里每个 `RequestOutput` 携带的是**增量** token，所以 extend 才是正确的拼接。槽内子序列因此是"有序前缀的延长"，I 保持。这正是轮 4 的合帧。
+  - **FINAL 模式**（`aggregate=False`）执行 `self.outputs[i] = next_completion`（`outputs.py:L169`）——直接用新块**覆盖**旧块。乍看像会丢 token，其实不会：FINAL 模式下每个 `RequestOutput` 携带的不是增量，而是**到目前为止的累计全量**（完整前缀）。后到的块本身就是旧块的超集，覆盖等价于"取最新的那份完整前缀"。槽内子序列仍是同一条有序前缀（只是换成了更长的那份），并集与顺序都不变，I 保持。换句话说，DELTA 靠"拼接"、FINAL 靠"取最新全量"，殊途同归地不丢、不乱序。
 - **`get` / `get_nowait`**（`L78-96`）：把整个槽内块移到"已取走"侧、置槽为 `None`、`ready.clear()`。两部分之间搬了一块，并集与顺序都不变，I 保持。
 
-由归纳，无论操作以何种次序交错，消费者最终取走的并集**等于生产者 put 的全部 token 且保持产出顺序**——永不丢、永不乱序。同时，`put` 的三个分支全是 O(1)（写槽 / `extend` / 替换），**生产者从不阻塞**。这就是"merge 作为背压替代"这一设计决策能成立的全部依据：合帧不破坏正确性，于是用合帧换"永不回压 GPU"才是笔划算的买卖。
+由归纳，无论操作以何种次序交错、无论 DELTA 还是 FINAL 模式，消费者最终取走的并集**等于生产者 put 的全部 token 且保持产出顺序**——永不丢、永不乱序。同时，`put` 的三个分支全是 O(1)（写槽 / `extend` / 替换），**生产者从不阻塞**。这就是"merge 作为背压替代"这一设计决策能成立的全部依据：合帧不破坏正确性，于是用合帧换"永不回压 GPU"才是笔划算的买卖。
 
 ---
 
@@ -596,6 +598,7 @@ class RequestOutputCollector:
                 new_token_ids,
                 # … 省略：pooling_output / finish_reason / stop_reason 等 …
             ):
+                # … 省略：流式输入下的 finished 改写（output_processor.py:L652-653，正交特性，本章不展开）…
                 if req_state.queue is not None:
                     # AsyncLLM: put into queue for handling by generate().
                     req_state.queue.put(request_output)
@@ -608,7 +611,7 @@ class RequestOutputCollector:
 
 1. **读 `req_id`**，按它查 `request_states` 表。
 2. **查不到（`req_state is None`）就跳过**——注释（vLLM 原文）说这是已经 abort 的请求的残留输出，忽略即可（比如客户端早断开、4.3 节那条 abort 路径已清掉它）。
-3. **生成 `RequestOutput`**（detokenize 等装配细节是 Stage3 的活，留 `ch08`）。
+3. **生成 `RequestOutput`**（detokenize 等装配细节是 Stage3 的活，留 [第 8 章：输出处理](../ch08-output-processing/narrative/chapter.md)）。
 4. **关键的分流**：`if req_state.queue is not None: req_state.queue.put(request_output)`——有队列（AsyncLLM 用法），就 `put` 回**这个请求专属的队列**；`else` 收集成 list 返回（同步 `LLMEngine` 用法）。
 
 这条 `queue is not None` 的分流很优雅：**同一套 Stage3 逻辑同时服务异步和同步两种引擎**。本章只走"有队列"分支，但保留这个判断能让你看清 `AsyncLLM` 与 `LLMEngine` 的关系。
@@ -631,7 +634,7 @@ $$
 
 也就是**一次 `put` + 一次协程恢复**，与系统总并发量**无关**——量级 $O(1)$。
 
-**翻译成人话**：共享队列像一个收银台排长队，人越多越慢；per-request 队列像每人一个专属取餐口，叫到号直接取，别人多少跟你无关。这就是 `AsyncLLM` 能在高并发下保持低尾延迟的核心原因，也是伏笔 ① 留给 `ch08` 进一步展开的种子。
+**翻译成人话**：共享队列像一个收银台排长队，人越多越慢；per-request 队列像每人一个专属取餐口，叫到号直接取，别人多少跟你无关。这就是 `AsyncLLM` 能在高并发下保持低尾延迟的核心原因，per-request 队列在流式输出里的完整角色，[第 8 章：输出处理](../ch08-output-processing/narrative/chapter.md) 还会进一步展开。
 
 ---
 
@@ -639,7 +642,7 @@ $$
 
 来源：`vllm/v1/engine/__init__.py:L80-L131`（`EngineCoreRequest`）、`L161-L191`（`EngineCoreOutput`）。
 
-进程边界（伏笔 ②）的机制留 `ch07`，但有一点本章必须交代清楚：**那条虚线上流过去、流回来的，到底是什么对象？** 看清这个，三段式的数据流就闭合了。
+进程边界的机制留 [第 7 章：IPC 边界](../ch07-ipc-boundary/narrative/chapter.md)，但有一点本章必须交代清楚：**那条虚线上流过去、流回来的，到底是什么对象？** 看清这个，三段式的数据流就闭合了。
 
 ```python
     # vllm/v1/engine/__init__.py:L80-L191
@@ -679,7 +682,7 @@ class EngineCoreOutput(
 
 特别留意末尾那个 `finished` 属性：`return self.finish_reason is not None`。**这就是 4.3 节 `generate()` 主循环 `finished = out.finished` 判停的最终来源**——一路从 EngineCore 进程的采样结果，经 IPC、经 `process_outputs` 装配进 `RequestOutput`，最后让消费者协程知道"可以收工了"。
 
-这几个 `msgspec.Struct` 上的 `array_like=True` / `gc=False` 是为了跨进程序列化时更紧凑、更快——但具体怎么 encode、怎么过 ZMQ，是 `ch07` 的事。本章你只要记住：**IPC 上进去的是 tokenize 好的请求，回来的是新 token + 完成标志。**
+这几个 `msgspec.Struct` 上的 `array_like=True` / `gc=False` 是为了跨进程序列化时更紧凑、更快——但具体怎么 encode、怎么过 ZMQ，是 [第 7 章：IPC 边界](../ch07-ipc-boundary/narrative/chapter.md) 的事。本章你只要记住：**IPC 上进去的是 tokenize 好的请求，回来的是新 token + 完成标志。**
 
 ---
 
@@ -699,12 +702,12 @@ class EngineCoreOutput(
 2. `generate` 内部 `q = await self.add_request(...)`（`generate L559`）→ 进入登记，返回本请求专属队列 `q`。
 3. `add_request` 调 `input_processor.process_inputs(...)`（`add_request L349`）[Stage1，本进程] 把 prompt 转成 `EngineCoreRequest`。
 4. `add_request` 调 `self._run_output_handler()`（`add_request L373`）懒启背景任务（若尚未启）。
-5. `add_request` 建 `queue = RequestOutputCollector(...)`（`add_request L376`）[伏笔 ①]。
+5. `add_request` 建 `queue = RequestOutputCollector(...)`（`add_request L376`）[每请求专属队列]。
 6. `add_request → _add_request`（`_add_request L400`）**扇出两路**：
    - 6a. `output_processor.add_request(request, ..., queue)`（`output_processor.py:add_request L508`）[本进程] 把 `queue` 存进 `req_id → RequestState` 表。
-   - 6b. `await engine_core.add_request_async(request)`（`_add_request L412`）[跨进程，IPC] 把 `EngineCoreRequest` 投递到独立进程 EngineCore [伏笔 ②]。
-7. [独立进程，留 `ch07`] EngineCore 调度+执行，产出 `EngineCoreOutputs`。
-8. 背景任务 `output_handler` `await engine_core.get_output_async()`（`_run_output_handler L660`）[跨进程，IPC] 收一批 [伏笔 ③]。
+   - 6b. `await engine_core.add_request_async(request)`（`_add_request L412`）[跨进程，IPC] 把 `EngineCoreRequest` 投递到独立进程 EngineCore [跨过进程边界]。
+7. [独立进程，留 [第 7 章：IPC 边界](../ch07-ipc-boundary/narrative/chapter.md)] EngineCore 调度+执行，产出 `EngineCoreOutputs`。
+8. 背景任务 `output_handler` `await engine_core.get_output_async()`（`_run_output_handler L660`）[跨进程，IPC] 收一批 [生产者拉取]。
 9. `output_handler` 分块调 `output_processor.process_outputs(...)`（`_run_output_handler L675`）。
 10. `process_outputs` 按 `req_id` 查表并 `req_state.queue.put(request_output)`（`output_processor.py L655-657`）解多路复用回各请求队列。
 11. `put` 唤醒对应队列的 `asyncio.Event`（`RequestOutputCollector.put L66`）。
@@ -719,7 +722,7 @@ class EngineCoreOutput(
 
 来源：`vllm/v1/engine/async_llm.py`、`vllm/v1/engine/output_processor.py`。
 
-光读代码容易"觉得懂了"，实际未必。为了能在本地（无 GPU/CUDA）把上面这套编排亲手跑一遍、打断点观察生产者-消费者关系，我们做了一个**只做减法**的精简版：把和"三段式如何编排请求"正交的分支（观测/profiler/DP/流式输入/`n>1`/错误分类）删掉，唯一的替换是把 Stage2 的"独立进程 EngineCore + ZMQ"换成一个**同进程的替身**——它对外仍暴露同名的 `add_request_async` / `get_output_async` / `abort_requests_async` 三个异步方法。这样 `AsyncLLM` 的 `__init__` / `add_request` / `_add_request` / `generate` / `_run_output_handler` 几乎一字不改，三段式骨架与生产者-消费者关系原样可见，只是进程边界被换成了同进程的队列（真实 IPC 留 `ch07`）。
+光读代码容易"觉得懂了"，实际未必。为了能在本地（无 GPU/CUDA）把上面这套编排亲手跑一遍、打断点观察生产者-消费者关系，我们做了一个**只做减法**的精简版：把和"三段式如何编排请求"正交的分支（观测/profiler/DP/流式输入/`n>1`/错误分类）删掉，唯一的替换是把 Stage2 的"独立进程 EngineCore + ZMQ"换成一个**同进程的替身**——它对外仍暴露同名的 `add_request_async` / `get_output_async` / `abort_requests_async` 三个异步方法。这样 `AsyncLLM` 的 `__init__` / `add_request` / `_add_request` / `generate` / `_run_output_handler` 几乎一字不改，三段式骨架与生产者-消费者关系原样可见，只是进程边界被换成了同进程的队列（真实 IPC 留 [第 7 章：IPC 边界](../ch07-ipc-boundary/narrative/chapter.md)）。
 
 这个精简版**不是主角**，只是一面镜子，用来印证上面读到的控制流真的成立。几个值得亲手验证的点：
 
@@ -750,8 +753,8 @@ class EngineCoreOutput(
 
 三段式留了三个去处给后面：
 
-- **Stage1 `InputProcessor`**：prompt 怎么 tokenize、校验、装成 `EngineCoreRequest`——下一章 `ch05`。
-- **Stage2 进程边界（伏笔 ②）**：`add_request_async` / `get_output_async` 背后的 ZMQ + msgpack + 进程编排——`ch07`。
-- **Stage3 `OutputProcessor`（伏笔 ①③）**：`process_outputs` 里被我们省略的 detokenize、累积、停止串检测，以及 per-request 队列在流式输出里的完整角色——`ch08`。
+- **Stage1 `InputProcessor`**：prompt 怎么 tokenize、校验、装成 `EngineCoreRequest`——下一章 [第 5 章：输入处理](../ch05-input-processing/narrative/chapter.md)。
+- **Stage2 进程边界**：`add_request_async` / `get_output_async` 背后的 ZMQ + msgpack + 进程编排——[第 7 章：IPC 边界](../ch07-ipc-boundary/narrative/chapter.md)。
+- **Stage3 `OutputProcessor`**：`process_outputs` 里被我们省略的 detokenize、累积、停止串检测，以及 per-request 队列在流式输出里的完整角色——[第 8 章：输出处理](../ch08-output-processing/narrative/chapter.md)。
 
 下一章，我们就从 Stage1 进去，看一段 prompt 文本怎么变成引擎能吃的 token。

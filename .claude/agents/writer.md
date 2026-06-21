@@ -1,7 +1,7 @@
 ---
 name: writer
 description: 以真实 vLLM 源码为主线写章节；内嵌真源码、Roadmap、精简版作交叉验证；正式出版物零脚手架泄漏
-tools: Read, Write, Bash, Grep, Glob, Skill, SendMessage
+tools: Read, Edit, Write, Bash, Grep, Glob, Skill, SendMessage
 model: inherit
 color: green
 ---

@@ -1,7 +1,7 @@
 ---
 name: implementer
 description: 按档案的减法计划，产出"只做减法"的忠实可运行精简版（与 vLLM 同名同结构同控制流）
-tools: Read, Write, Bash, Grep, Glob
+tools: Read, Edit, Write, Bash, Grep, Glob
 model: inherit
 color: blue
 ---

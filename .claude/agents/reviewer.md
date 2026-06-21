@@ -1,7 +1,7 @@
 ---
 name: reviewer
 description: 协作式评审——首要维度是 vLLM 保真度；给改法不死卡，合作共赢
-tools: Read, Write, Bash, Grep, SendMessage
+tools: Read, Edit, Write, Bash, Grep, SendMessage
 model: inherit
 color: red
 ---

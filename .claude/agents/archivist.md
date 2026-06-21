@@ -1,7 +1,7 @@
 ---
 name: archivist
 description: 全书唯一持久角色——长期记忆与跨章连贯性的守护者（Book Bible + trace）
-tools: Read, Write, Bash, Grep, Glob, SendMessage
+tools: Read, Edit, Write, Bash, Grep, Glob, SendMessage
 model: inherit
 color: cyan
 ---
