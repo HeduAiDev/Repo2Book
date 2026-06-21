@@ -1,0 +1,197 @@
+{
+  "chapter_id": "ch10",
+  "title": "Logprobs 装配与字节回退修正：从 EngineCore 张量取 sample/prompt logprobs、上下文感知 UTF-8 多字节重建、累计 logprob 跟踪、flat vs nested 格式",
+  "source_pin": "f3fef123",
+  "scope": "把 EngineCore 输出里的 logprobs 张量（LogprobsLists / LogprobsTensors）装配成 OpenAI 兼容的 sample/prompt logprobs 容器：逐位置 Pythonize、非增量去 token、上下文感知的 UTF-8 字节回退修正（U+FFFD 重建）、累计 logprob 跟踪、以及 FlatLogprobs vs list[dict] 两种存储格式。下游如何被 OutputProcessor 在 DELTA/FINAL 模式下取用。",
+
+  "code_spine": [
+    "vllm/v1/engine/output_processor.py:L639-L641  process_outputs 调用 logprobs_processor.update_from_output(engine_core_output)（唯一对全 batch 的循环内）",
+    "vllm/v1/engine/logprobs.py:L348-L352  LogprobsProcessor.update_from_output：分派 new_logprobs→_update_sample_logprobs，new_prompt_logprobs_tensors→_update_prompt_logprobs",
+    "vllm/v1/engine/logprobs.py:L42-L67  from_new_request：从 sampling_params 取 num_logprobs/num_prompt_logprobs/flat_logprobs，建容器、cumulative_logprob 初值 0.0",
+    "vllm/logprobs.py:L162-L172  create_prompt_logprobs / create_sample_logprobs：FlatLogprobs() 或 []；prompt 容器首位 append(None)",
+    "vllm/v1/engine/logprobs.py:L69-L119  _update_sample_logprobs：逐 step 解包 LogprobsLists、tolist()、convert_ids_list_to_tokens、_verify_tokens、累计 logprob、append_logprobs_for_next_position",
+    "vllm/v1/engine/logprobs.py:L121-L187  _update_prompt_logprobs：从 LogprobsTensors 恢复 [num_tok,num_lps] 形状、flatten 去 token、逐位置切片 + UTF-8 修正",
+    "vllm/v1/engine/logprobs.py:L208-L247  _get_sampled_context_ids：取最近 ≤4 个已采样 token id 作为字节修正上下文（FlatLogprobs 直接索引 / list[dict] 取 first key）",
+    "vllm/v1/engine/logprobs.py:L312-L346  _verify_tokens：检测以 U+FFFD 结尾的 decoded token，逐个调 _correct_decoded_token",
+    "vllm/v1/engine/logprobs.py:L249-L310  _correct_decoded_token：用 1..4 个上下文 token 拼接重解码，剥掉干净前缀，得到本 token 应归属的文本",
+    "vllm/logprobs.py:L175-L206  append_logprobs_for_next_position：把 (sampled rank, top-k ranks) 链接，写入 FlatLogprobs.append_fast 或 list[dict].append",
+    "vllm/v1/engine/logprobs.py:L189-L206  pop_prompt_logprobs：DELTA 语义下一次性返回并清空 prompt logprobs",
+    "vllm/v1/engine/output_processor.py:L376-L407  _new_completion_output：取 logprobs（DELTA 下切尾 -len(token_ids)）、cumulative_logprob 进 CompletionOutput",
+    "vllm/v1/engine/output_processor.py:L356-L374  _new_request_output：DELTA 下 pop_prompt_logprobs，否则读 prompt_logprobs，进 RequestOutput"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/engine/logprobs.py",
+      "lines": "L29-L67",
+      "what": "LogprobsProcessor 数据类定义 + from_new_request 工厂",
+      "code": "@dataclass\nclass LogprobsProcessor:\n    # Tokenizer for this request,\n    # None if detokenization is disabled.\n    tokenizer: TokenizerLike | None\n\n    # Logprobs for this request\n    logprobs: SampleLogprobs | None\n    prompt_logprobs: PromptLogprobs | None\n    cumulative_logprob: float | None\n    num_logprobs: int | None\n    num_prompt_logprobs: int | None\n\n    @classmethod\n    def from_new_request(\n        cls,\n        tokenizer: TokenizerLike | None,\n        request: EngineCoreRequest,\n    ) -> \"LogprobsProcessor\":\n        sampling_params = request.sampling_params\n        assert sampling_params is not None\n        num_logprobs = sampling_params.num_logprobs\n        num_prompt_logprobs = sampling_params.prompt_logprobs\n        return cls(\n            tokenizer=tokenizer,\n            cumulative_logprob=(None if num_logprobs is None else 0.0),\n            logprobs=(\n                None\n                if num_logprobs is None\n                else create_sample_logprobs(sampling_params.flat_logprobs)\n            ),\n            prompt_logprobs=(\n                None\n                if num_prompt_logprobs is None\n                else create_prompt_logprobs(sampling_params.flat_logprobs)\n            ),\n            num_prompt_logprobs=num_prompt_logprobs,\n            num_logprobs=num_logprobs,\n        )",
+      "elide": ["无可省略分支——这是完整的容器初始化逻辑，三个 None/0.0 三元分支都要讲：num_logprobs is None ⇒ 整条 sample logprobs 链路关闭（容器与 cumulative 都为 None）。"]
+    },
+    {
+      "path": "vllm/v1/engine/logprobs.py",
+      "lines": "L69-L119",
+      "what": "_update_sample_logprobs：sample logprobs 主装配路径",
+      "code": "def _update_sample_logprobs(self, logprobs_lists: LogprobsLists) -> None:\n    \"\"\"Update with sample logprobs from EngineCore.\n\n    Outer lists are only of len > 1 if EngineCore made\n    >1 tokens in prior step (e.g. in spec decoding).\n    \"\"\"\n    assert self.num_logprobs is not None\n    assert self.logprobs is not None\n    assert self.cumulative_logprob is not None\n\n    token_ids_lst, logprobs_lst, ranks_lst, _ = logprobs_lists\n\n    for rank_np, logprobs_np, token_ids_np in zip(\n        ranks_lst, logprobs_lst, token_ids_lst\n    ):\n        rank = rank_np.tolist()\n        logprobs = logprobs_np.tolist()\n        token_ids = token_ids_np.tolist()\n        # Detokenize (non-incrementally).\n        decoded_tokens: list[str] | Iterable[None]\n        if self.tokenizer is None:\n            decoded_tokens = NONES\n        else:\n            decoded_tokens_list = convert_ids_list_to_tokens(\n                self.tokenizer, token_ids\n            )\n            context_token_ids = self._get_sampled_context_ids(self.logprobs)\n            decoded_tokens = self._verify_tokens(\n                decoded_tokens_list=decoded_tokens_list,\n                tokens=token_ids,\n                context_token_ids=context_token_ids,\n            )\n\n        # Sampler puts the sampled logprob in first.\n        sampled_token_logprob = logprobs[0]\n        self.cumulative_logprob += sampled_token_logprob\n\n        # Update with the Logprob container for this pos.\n        append_logprobs_for_next_position(\n            self.logprobs,\n            token_ids,\n            logprobs,\n            decoded_tokens,\n            rank,\n            self.num_logprobs,\n        )",
+      "elide": ["外层 for 循环只有在前一步 EngineCore 产出 >1 token（投机解码）时长度 >1，普通解码每次只有 1 个位置——讲解时可先按‘每步 1 个位置’理解，再补一句投机解码会多位置。", "NONES = itertools.repeat(None) 是禁用去 token 时的占位 iterable（L26）。", "logprobs[0] 是 sampled token 的 logprob——sampler 约定把被采样 token 放在每行第一个（rank 数组的语义来源）。"]
+    },
+    {
+      "path": "vllm/v1/engine/logprobs.py",
+      "lines": "L121-L187",
+      "what": "_update_prompt_logprobs：从 2D 张量装配 prompt logprobs",
+      "code": "def _update_prompt_logprobs(\n    self,\n    prompt_logprobs_tensors: LogprobsTensors,\n) -> None:\n    \"\"\"Update with prompt logprobs from EngineCore.\"\"\"\n    # Prompt logprobs are enabled.\n    assert self.num_prompt_logprobs is not None\n    assert self.prompt_logprobs is not None\n\n    token_ids, logprobs, ranks, _ = prompt_logprobs_tensors\n\n    # Recover shapes.\n    num_prompt_tokens, num_logprobs = logprobs.shape\n\n    # Detokenize non-incrementally.\n    # Output is flat: [num_tok, num_lps] -> [num_tok * num_lps]\n    all_decoded_tokens: list[str] | None = (\n        None\n        if self.tokenizer is None\n        else convert_ids_list_to_tokens(\n            self.tokenizer, token_ids.flatten().tolist()\n        )\n    )\n\n    # Pythonize the torch tensors.\n    prompt_token_ranks = ranks.tolist()\n    prompt_logprobs = logprobs.tolist()\n    token_ids_list = token_ids.tolist()\n\n    # Make Logprob for each position.\n    for pos in range(num_prompt_tokens):\n        # Handle flattening and UTF-8 correction per position\n        offset = pos * num_logprobs\n        offset_end = offset + num_logprobs\n\n        decoded_tokens_for_pos: list[str] | Iterable[None]\n        if all_decoded_tokens is None:\n            decoded_tokens_for_pos = NONES\n        else:\n            # Extract decoded tokens for this position\n            decoded_tokens_slice = all_decoded_tokens[offset:offset_end]\n            # Context: preceding prompt tokens accumulated in\n            # self.prompt_logprobs from previous loop iterations.\n            context_token_ids = self._get_sampled_context_ids(self.prompt_logprobs)\n            # Apply UTF-8 correction within this position's token boundaries\n            decoded_tokens_for_pos = self._verify_tokens(\n                decoded_tokens_list=decoded_tokens_slice,\n                tokens=token_ids_list[pos],\n                context_token_ids=context_token_ids,\n            )\n\n        # Update with the Logprob container for this pos.\n        append_logprobs_for_next_position(\n            self.prompt_logprobs,\n            token_ids_list[pos],\n            prompt_logprobs[pos],\n            decoded_tokens_for_pos,\n            prompt_token_ranks[pos],\n            self.num_prompt_logprobs,\n        )",
+      "elide": ["关键对比点：sample logprobs 收到的是已 tolist 的 LogprobsLists（numpy），prompt logprobs 收到的是 LogprobsTensors（torch 张量），所以这里要先 .flatten().tolist()/.tolist() 自己 Pythonize；且没有 cumulative_logprob（prompt 不参与累计）。", "扁平化技巧：整段 [num_tok, num_lps] 一次性 flatten 去 token（减少 tokenizer 调用），再用 offset=pos*num_logprobs 切回每位置 num_logprobs 个候选。", "上下文来源不同：sample 用 self.logprobs（已生成序列）做上下文，prompt 用 self.prompt_logprobs（本次循环已累计的前序 prompt 位置）做上下文。"]
+    },
+    {
+      "path": "vllm/v1/engine/logprobs.py",
+      "lines": "L208-L247",
+      "what": "_get_sampled_context_ids：取最近 ≤4 个已落定 token id 作字节修正上下文",
+      "code": "@staticmethod\ndef _get_sampled_context_ids(\n    logprobs_source: SampleLogprobs | PromptLogprobs | None,\n    max_context: int = 4,\n) -> list[int]:\n    \"\"\"Extract recent sampled token IDs from a logprobs source.\n\n    The sampled (or prompt) token at each position is the first\n    entry, since it is always inserted first by\n    append_logprobs_for_next_position.\n    \"\"\"\n    if not logprobs_source:\n        return []\n\n    n = len(logprobs_source)\n    start = max(0, n - max_context)\n\n    # Efficient path for FlatLogprobs: access token_ids directly.\n    if isinstance(logprobs_source, FlatLogprobs):\n        return [\n            logprobs_source.token_ids[logprobs_source.start_indices[i]]\n            for i in range(start, n)\n            if logprobs_source.start_indices[i] < logprobs_source.end_indices[i]\n        ]\n\n    # list[dict] path\n    result: list[int] = []\n    for i in range(start, n):\n        entry = logprobs_source[i]\n        if entry is not None:\n            result.append(next(iter(entry)))\n    return result",
+      "elide": ["max_context=4 不是随意值：UTF-8 单字符最多 4 字节，所以至多 4 个 byte-fallback token 拼出一个完整字符。", "两条路径取的都是‘每位置第一个 entry’——因为 append_logprobs_for_next_position 总是把 sampled/prompt token 第一个写入（rank 链以 (rank,) 开头），所以 FlatLogprobs 走 start_indices[i]（该位置第一个 token_id），list[dict] 走 next(iter(entry))（dict 第一个 key）。", "FlatLogprobs 路径里 start_indices[i] < end_indices[i] 的判断：跳过空位置（如 prompt 首位 append(None) 产生的零长度区间）。"]
+    },
+    {
+      "path": "vllm/v1/engine/logprobs.py",
+      "lines": "L249-L310",
+      "what": "_correct_decoded_token：上下文感知的 UTF-8 多字节重建（本章技术核心）",
+      "code": "def _correct_decoded_token(\n    self, token_id: int, context_token_ids: list[int]\n) -> str:\n    \"\"\"Correct a decoded token that contains the replacement character.\n\n    When byte-fallback tokenization splits multi-byte UTF-8\n    characters across tokens, individual token decoding produces\n    the replacement character U+FFFD. This method uses preceding\n    sampled tokens as context to reconstruct the correct text.\n    \"\"\"\n    assert self.tokenizer is not None\n\n    max_ctx = min(len(context_token_ids), 4)\n\n    for num_ctx in range(1, max_ctx + 1):\n        context = context_token_ids[-num_ctx:]\n        full_decoded = self.tokenizer.decode(context + [token_id])\n\n        if full_decoded.endswith(\"\\ufffd\"):\n            continue\n\n        # Find the boundary between \"clean\" context tokens and\n        # byte-fallback tokens that are part of the same incomplete\n        # sequence. Byte-fallback context tokens returned \"\" when\n        # they were processed, so their text must be attributed to\n        # this completing token.\n        clean_end = len(context)\n        for j in range(len(context) - 1, -1, -1):\n            if self.tokenizer.decode([context[j]]).endswith(\"\\ufffd\"):\n                clean_end = j\n            else:\n                break\n\n        # Decode only the clean (non-byte-fallback) prefix.\n        if clean_end > 0:\n            clean_prefix = self.tokenizer.decode(context[:clean_end])\n        else:\n            clean_prefix = \"\"\n\n        if full_decoded.startswith(clean_prefix):\n            return full_decoded[len(clean_prefix) :]\n\n        # Tokenizer normalization may cause prefix mismatch.\n        # Find the longest common prefix between them.\n        common_len = 0\n        for a, b in zip(clean_prefix, full_decoded):\n            if a != b:\n                break\n            common_len += 1\n        return full_decoded[common_len:]\n\n    return \"\"",
+      "elide": ["注意源码用字面量 '\\ufffd'（U+FFFD 替换字符 �）；讲解时统一称 U+FFFD / �。", "算法三段：①逐步增大上下文 num_ctx=1..4，拼 context+[token_id] 重解码，仍以 U+FFFD 结尾说明还没拼全 → continue；②一旦解出完整字符，回溯找 clean_end（哪些上下文 token 本身解码就是 U+FFFD，属于同一未完成序列，其文本应归属当前完成 token）；③用 startswith 剥掉干净前缀；若 tokenizer 归一化导致前缀不严格匹配，退化为最长公共前缀。", "返回 '' 的语义：到 4 个上下文仍拼不出完整字符（byte 序列在此处确实不完整），本 token 文本暂记为空（会由后续完成 token 一次性补出）。"]
+    },
+    {
+      "path": "vllm/v1/engine/logprobs.py",
+      "lines": "L312-L346",
+      "what": "_verify_tokens：批量检测并修正以 U+FFFD 结尾的 decoded token",
+      "code": "def _verify_tokens(\n    self,\n    decoded_tokens_list: list[str],\n    tokens: list[int],\n    context_token_ids: list[int] | None = None,\n) -> list[str]:\n    \"\"\"Verify and correct decoded tokens with replacement characters.\n\n    Args:\n        decoded_tokens_list: Decoded token strings to verify.\n        tokens: Token IDs corresponding to decoded_tokens_list.\n            These are alternatives at the SAME position (e.g.\n            [sampled, top1, top2]), NOT sequential tokens.\n        context_token_ids: Preceding sampled token IDs providing\n            sequential context. If None, extracted from\n            self.logprobs.\n    \"\"\"\n    if context_token_ids is None:\n        context_token_ids = self._get_sampled_context_ids(self.logprobs)\n\n    corrected_decoded_token_map = dict()\n    for idx, text in enumerate(decoded_tokens_list):\n        if text.endswith(\"\\ufffd\"):\n            # Replacement char at the end means a potential\n            # unfinished byte sequence from byte-fallback\n            # tokenization. Correct each token independently\n            # using only the sequential context.\n            corrected_decoded_token_map[idx] = self._correct_decoded_token(\n                tokens[idx], context_token_ids\n            )\n\n    for idx, text in corrected_decoded_token_map.items():\n        decoded_tokens_list[idx] = text\n\n    return decoded_tokens_list",
+      "elide": ["关键概念区分（docstring 明确）：tokens 是同一位置的候选（[sampled, top1, top2...]），是‘横向’的 top-k 替代；context_token_ids 是‘纵向’的序列前文。每个候选都用同一份序列上下文独立修正。", "context_token_ids is None 的回退分支只在没显式传上下文时走 self.logprobs——实际两个调用方（sample/prompt）都显式传了上下文，所以这是防御性默认。"]
+    },
+    {
+      "path": "vllm/v1/engine/logprobs.py",
+      "lines": "L189-L206 + L348-L352",
+      "what": "pop_prompt_logprobs（DELTA 语义）与 update_from_output 分派入口",
+      "code": "def pop_prompt_logprobs(self) -> PromptLogprobs | None:\n    \"\"\"Pop and return all request prompt logprobs\n\n    The logprobs processor aggregates prompt chunk logprobs\n    over one or more prefill chunks. This method returns\n    all prompt logprobs at once and then forgets them.\n    Ensures correct RequestOutputKind.DELTA semantics\n    wherein all prompt logprobs are returned at once at\n    the end of prefill.\n    \"\"\"\n    plp = self.prompt_logprobs\n    if plp:\n        self.prompt_logprobs = []\n    return plp\n\n# ... (other methods) ...\n\ndef update_from_output(self, output: EngineCoreOutput) -> None:\n    if output.new_logprobs is not None:\n        self._update_sample_logprobs(output.new_logprobs)\n    if output.new_prompt_logprobs_tensors is not None:\n        self._update_prompt_logprobs(output.new_prompt_logprobs_tensors)",
+      "elide": ["pop 把 prompt_logprobs 重置为 []（list），即便原本是 FlatLogprobs——DELTA 下 prompt logprobs 只发一次，发完清空避免重复发送。", "update_from_output 是唯一对外入口，两个 if 互不排斥：一个 EngineCoreOutput 可能同时携带 sample 与 prompt logprobs。"]
+    },
+    {
+      "path": "vllm/logprobs.py",
+      "lines": "L162-L206",
+      "what": "容器构造 + append_logprobs_for_next_position：flat vs nested 写入分叉",
+      "code": "def create_prompt_logprobs(flat_logprobs: bool) -> PromptLogprobs:\n    \"\"\"Creates a container to store prompt logprobs for a request\"\"\"\n    logprobs: PromptLogprobs = FlatLogprobs() if flat_logprobs else []\n    # NOTE: logprob of first prompt token is None.\n    logprobs.append(None)\n    return logprobs\n\n\ndef create_sample_logprobs(flat_logprobs: bool) -> SampleLogprobs:\n    \"\"\"Creates a container to store decode logprobs for a request\"\"\"\n    return FlatLogprobs() if flat_logprobs else []\n\n\ndef append_logprobs_for_next_position(\n    request_logprobs: PromptLogprobs | SampleLogprobs,\n    token_ids: list[int],\n    logprobs: list[float],\n    decoded_tokens: Iterable[str | None],\n    rank: int,\n    num_logprobs: int,\n) -> None:\n    \"\"\"Appends logprobs for the next position\"\"\"\n    if num_logprobs == -1:\n        num_logprobs = len(logprobs)\n    # We do not need a special case for the sampled token\n    # being in the topk, since inserting duplicated data\n    # into a dictionary twice is the same as doing it once.\n    topk_ranks = range(1, num_logprobs + 1)\n    ranks = itertools.chain((rank,), topk_ranks)\n\n    if isinstance(request_logprobs, FlatLogprobs):\n        request_logprobs.append_fast(token_ids, logprobs, ranks, decoded_tokens)\n    else:\n        request_logprobs.append(\n            {\n                token_id: Logprob(\n                    logprob=logprob,\n                    rank=rank,\n                    decoded_token=token,\n                )\n                for token_id, logprob, rank, token in zip(\n                    token_ids, logprobs, ranks, decoded_tokens\n                )\n            }\n        )",
+      "elide": ["rank 链 itertools.chain((rank,), range(1, num_logprobs+1))：第一个是 sampled/prompt token 的真实 vocab rank，后面 1..num_logprobs 是 top-k 候选的固定名次。这解释了为什么‘每位置第一个就是被选中 token’（_get_sampled_context_ids 据此取上下文）。", "num_logprobs == -1 ⇒ 返回全词表，用 len(logprobs) 顶替。", "去重注释：sampled token 若也在 top-k 里，dict 写两次等价写一次（同 key 覆盖）；FlatLogprobs 走 append_fast 不去重但下游按 token_id 索引。"]
+    },
+    {
+      "path": "vllm/logprobs.py",
+      "lines": "L30-L72",
+      "what": "FlatLogprobs 数据结构（降 GC 的扁平存储）+ append_fast",
+      "code": "@dataclass\nclass FlatLogprobs(MutableSequence[LogprobsOnePosition | None]):\n    \"\"\"Flat logprobs of a request into multiple primitive type lists.\n\n    Compared to list[dict[int, Logprob]], this data structure reduced GC\n    overhead significantly. ... regardless of the sequence length and\n    top_logprobs setup, FlatLogprobs would only introduce a constant\n    amount of objects.\n    \"\"\"\n\n    # Start / end indices to indicate the range of logprobs for each position.\n    start_indices: list[int] = field(default_factory=list)\n    end_indices: list[int] = field(default_factory=list)\n\n    # Flatten Logprob information for (each position, rank).\n    token_ids: list[int] = field(default_factory=list)\n    logprobs: list[float] = field(default_factory=list)\n    ranks: list[int | None] = field(default_factory=list)\n    decoded_tokens: list[str | None] = field(default_factory=list)\n\n    def append(self, logprobs_one_position: LogprobsOnePosition | None) -> None:\n        \"\"\"Appends the container with logprobs for the next position\"\"\"\n        self.start_indices.append(len(self.logprobs))\n        if logprobs_one_position:\n            for token_id, logprob in logprobs_one_position.items():\n                self.token_ids.append(token_id)\n                self.logprobs.append(logprob.logprob)\n                self.ranks.append(logprob.rank)\n                self.decoded_tokens.append(logprob.decoded_token)\n        self.end_indices.append(len(self.logprobs))\n\n    def append_fast(\n        self,\n        token_ids: list[int],\n        logprobs: list[float],\n        ranks: itertools.chain[int],\n        decoded_tokens: Iterable[str | None],\n    ) -> None:\n        self.start_indices.append(len(self.logprobs))\n        for token_id, logprob, rank, decoded_token in zip(\n            token_ids, logprobs, ranks, decoded_tokens\n        ):\n            self.token_ids.append(token_id)\n            self.logprobs.append(logprob)\n            self.ranks.append(rank)\n            self.decoded_tokens.append(decoded_token)\n        self.end_indices.append(len(self.logprobs))",
+      "elide": ["核心思想：把 list[dict[int, Logprob]] 的每位置一个 dict + 每候选一个 Logprob 对象，压成 6 条平行原生列表 + 每位置 [start_indices[i], end_indices[i]) 区间索引。对象数从 O(序列长×top_k) 降到常数，显著降 GC。", "__getitem__(int) 现造一个 {token_id: Logprob} dict 还原 LogprobsOnePosition（向后兼容 list[dict] 接口）；__setitem__/__delitem__/insert 全部 raise（只追加不可变）——讲解时可只点这个不变式，不必逐个嵌入。", "append(None) 用于 prompt 首位占位：写入空区间（start==end）。"]
+    },
+    {
+      "path": "vllm/v1/engine/output_processor.py",
+      "lines": "L376-L407",
+      "what": "_new_completion_output：sample logprobs/cumulative 进 CompletionOutput（DELTA 切尾）",
+      "code": "def _new_completion_output(\n    self,\n    token_ids: list[int],\n    finish_reason: FinishReason | None,\n    stop_reason: int | str | None,\n    routed_experts: np.ndarray | None = None,\n) -> CompletionOutput:\n    assert self.detokenizer is not None\n    assert self.logprobs_processor is not None\n    finished = finish_reason is not None\n    delta = self.output_kind == RequestOutputKind.DELTA\n\n    # Prepare text and token_ids, based on delta mode\n    text = self.detokenizer.get_next_output_text(finished, delta)\n    if not delta:\n        token_ids = self.detokenizer.output_token_ids\n\n    # Prepare logprobs, based on delta mode\n    logprobs = self.logprobs_processor.logprobs\n    if delta and logprobs:\n        logprobs = logprobs[-len(token_ids) :]\n\n    return CompletionOutput(\n        index=self.request_index,\n        text=text,\n        token_ids=token_ids,\n        routed_experts=routed_experts,\n        logprobs=logprobs,\n        cumulative_logprob=self.logprobs_processor.cumulative_logprob,\n        finish_reason=str(finish_reason) if finished else None,\n        stop_reason=stop_reason if finished else None,\n    )",
+      "elide": ["DELTA 模式只回传本批新增 token 的 logprobs：logprobs[-len(token_ids):] 切尾。FlatLogprobs 的 __getitem__(slice) 会返回一个新 FlatLogprobs（vllm/logprobs.py:L121-133）；list[dict] 直接切片。", "cumulative_logprob 始终是整段累计值（不随 DELTA 切片重置）。"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "LogprobsProcessor", "file": "vllm/v1/engine/logprobs.py", "responsibility": "每请求的 logprobs 装配器：持有 tokenizer、sample/prompt logprobs 容器、cumulative_logprob 与 num_logprobs/num_prompt_logprobs。把 EngineCore 的张量装配成 OpenAI 兼容容器，含字节回退修正与累计跟踪。"},
+    {"name": "FlatLogprobs", "file": "vllm/logprobs.py", "responsibility": "扁平存储格式（6 条平行原生列表 + 每位置区间索引），对外仍实现 MutableSequence[LogprobsOnePosition] 接口；对象数恒定、显著降 GC。flat_logprobs=True 时启用。"},
+    {"name": "Logprob", "file": "vllm/logprobs.py", "responsibility": "单条 logprob 记录：logprob 值、vocab rank、decoded_token。nested 格式 list[dict[int, Logprob]] 的叶子。"},
+    {"name": "LogprobsLists", "file": "vllm/v1/outputs.py", "responsibility": "EngineCore 传给 sample logprobs 的 NamedTuple（logprob_token_ids/logprobs/sampled_token_ranks 三个 numpy 数组 + cu_num_generated_tokens），已是 list/numpy 形态。"},
+    {"name": "LogprobsTensors", "file": "vllm/v1/outputs.py", "responsibility": "EngineCore 传给 prompt logprobs 的 NamedTuple（三个 torch 张量），需在 _update_prompt_logprobs 内自行 Pythonize。"},
+    {"name": "RequestState", "file": "vllm/v1/engine/output_processor.py", "responsibility": "每请求状态容器，持有 logprobs_processor；在 _new_completion_output / _new_request_output 取 sample/prompt logprobs 装入 CompletionOutput/RequestOutput，按 DELTA/FINAL 区分。"}
+  ],
+
+  "data_flow": [
+    "OutputProcessor.process_outputs (output_processor.py): batch 循环内对每个 EngineCoreOutput 调 req_state.logprobs_processor.update_from_output",
+    "LogprobsProcessor.update_from_output (logprobs.py): new_logprobs→_update_sample_logprobs; new_prompt_logprobs_tensors→_update_prompt_logprobs",
+    "_update_sample_logprobs: 解包 LogprobsLists → 逐 step .tolist() → convert_ids_list_to_tokens 非增量去 token → _get_sampled_context_ids(self.logprobs) 取上下文 → _verify_tokens 修正 → cumulative_logprob += logprobs[0] → append_logprobs_for_next_position",
+    "_update_prompt_logprobs: 解包 LogprobsTensors → 恢复 [num_tok,num_lps] → flatten 一次性去 token → 逐 pos 切片 num_logprobs 候选 → _get_sampled_context_ids(self.prompt_logprobs) → _verify_tokens → append_logprobs_for_next_position（无 cumulative）",
+    "_verify_tokens: 对每个以 U+FFFD 结尾的 decoded token → _correct_decoded_token(token_id, context)",
+    "_correct_decoded_token: num_ctx=1..4 增长上下文 → tokenizer.decode(context+[token_id]) → 若仍 U+FFFD continue → 回溯 clean_end → 剥 clean_prefix → 返回补全文本或 ''",
+    "append_logprobs_for_next_position (logprobs.py): rank 链 = chain((rank,), 1..num_logprobs) → FlatLogprobs.append_fast 或 list[dict].append",
+    "RequestState._new_completion_output: 取 logprobs_processor.logprobs（DELTA 切尾 -len(token_ids)）+ cumulative_logprob → CompletionOutput",
+    "RequestState._new_request_output: DELTA 调 pop_prompt_logprobs（取后清空），FINAL 读 prompt_logprobs → RequestOutput"
+  ],
+
+  "design_decisions": [
+    {"decision": "sample 收 LogprobsLists（numpy，已 tolists），prompt 收 LogprobsTensors（torch，需自行 Pythonize）", "why": "两路在 EngineCore 侧形态不同；prompt logprobs 在 _update_prompt_logprobs 内才 .flatten().tolist()/.tolist()。这是两条更新方法看似重复却必须分开的根因。", "evidence": "vllm/v1/engine/logprobs.py:L84, L137-L155; vllm/v1/outputs.py:L26-L69"},
+    {"decision": "上下文感知的 UTF-8 多字节重建：以 U+FFFD 结尾的 token 用前 ≤4 个落定 token 拼接重解码", "why": "byte-fallback tokenizer 会把一个多字节 UTF-8 字符拆到多个 token，单 token 解码出替换字符 �。只有结合前文真实序列才能还原文本；4 = UTF-8 单字符最大字节数。", "evidence": "vllm/v1/engine/logprobs.py:L249-L310, L221-L222"},
+    {"decision": "top-k 候选（横向）与序列上下文（纵向）严格区分", "why": "_verify_tokens 的 tokens 是同位置的 [sampled, top1, top2...] 替代项，context_token_ids 才是序列前文。每个候选用同一份序列上下文独立修正——不能拿候选互相当上下文。", "evidence": "vllm/v1/engine/logprobs.py:L312-L341（docstring 明确）"},
+    {"decision": "每位置第一个 entry 恒为被选中 token", "why": "append_logprobs_for_next_position 把 rank 链以 (rank,) 开头，sampler 把 sampled token 放第一个。故 _get_sampled_context_ids 可直接取‘每位置第一个 token_id’做上下文（FlatLogprobs 走 start_indices[i]，list[dict] 走 next(iter)）。", "evidence": "vllm/logprobs.py:L186-L193; vllm/v1/engine/logprobs.py:L208-L247"},
+    {"decision": "FlatLogprobs 扁平存储 vs list[dict[int,Logprob]] nested", "why": "nested 每位置一个 dict、每候选一个 Logprob 对象，长序列×大 top_k 时对象数爆炸、GC 压力大。Flat 压成 6 条原生列表 + 区间索引，对象数恒定，仍兼容 MutableSequence 接口。由 sampling_params.flat_logprobs 选择。", "evidence": "vllm/logprobs.py:L30-L49, L162-L172"},
+    {"decision": "prompt logprobs 首位为 None 占位", "why": "首个 prompt token 没有前驱、无法定义条件 logprob，create_prompt_logprobs 直接 append(None)。", "evidence": "vllm/logprobs.py:L162-L167"},
+    {"decision": "DELTA 语义：prompt logprobs 一次性发完即清空，sample logprobs 按新 token 数切尾", "why": "DELTA 流式只回传增量；prompt logprobs 跨多个 prefill chunk 聚合，到 prefill 末一次性返回后 pop 清空避免重发；sample logprobs 取 logprobs[-len(token_ids):]。cumulative_logprob 不切。", "evidence": "vllm/v1/engine/logprobs.py:L189-L206; vllm/v1/engine/output_processor.py:L356-L361, L394-L396"},
+    {"decision": "cumulative_logprob 仅 sample 维护，prompt 不累计", "why": "cumulative_logprob 是生成序列的累计对数概率，只在 _update_sample_logprobs 里 += logprobs[0]；num_logprobs is None 时整条关闭（连同容器为 None）。", "evidence": "vllm/v1/engine/logprobs.py:L54, L108-L109; L121-L187（prompt 无累计）"}
+  ],
+
+  "theory": [
+    {"topic": "为什么需要字节回退修正", "content": "BPE/SentencePiece 类 tokenizer 的 byte-fallback 机制会把罕见多字节字符（中文、emoji 等）拆成多个 byte 级 token。单独 tokenizer.decode([one_token]) 得到不完整 UTF-8 字节序列 → Python 解码为 U+FFFD（�）。logprobs 的 decoded_token 是逐 token 解的，必然踩这个坑，必须用上下文重建。"},
+    {"topic": "UTF-8 字节数上界 = 4", "content": "UTF-8 编码单个码点最多 4 字节，故任意未完成多字节序列最多跨 4 个 byte-fallback token。这是 max_context=4 / max_ctx=min(len,4) 的数学依据，保证有限上下文足够还原。"},
+    {"topic": "FlatLogprobs 复杂度/对象数分析", "content": "nested：对象数 O(L × K)（L=位置数，K=top_logprobs，每位置 1 dict + K 个 Logprob）。Flat：对象数 O(1)（6 个 list，元素是原生 int/float/str）。Python 对象多→GC 扫描成本高，Flat 把 GC 压力降为常数级。访问单位置 O(K) 现造 dict（__getitem__）。"},
+    {"topic": "累计 logprob 的数值含义", "content": "cumulative_logprob = Σ log P(被采样 token | 前文)。每步 += logprobs[0]（sampler 约定第一个是被采样 token 的 logprob）。可用于 beam/序列打分；prompt logprobs 不参与（prompt 非模型生成）。"}
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "output_processor.py 中与 logprobs 无关的 RequestOutputCollector 队列合并细节、abort_requests、do_tracing/统计（_update_stats_*）、streaming_input/StreamingUpdate、parallel sampling 合并", "why_safe": "本章只解读 logprobs 装配链路；精简版只需保留 process_outputs 里调 update_from_output 的那一处调用 + _new_completion_output/_new_request_output 取 logprobs 的部分作为下游接口示意，其余编排逻辑属于其它章节，删去不影响 logprobs 正确性。"},
+      {"what": "FlatLogprobs 的 __getitem__(slice)、extend、__iter__、__setitem__/__delitem__/insert 的完整实现体（可保留方法签名/raise 占位以示不变式）", "why_safe": "本章核心路径只用到 append/append_fast/__len__/__getitem__(int) 与 token_ids/start_indices 直接索引；slice/iter 仅在 DELTA 切尾时被 _new_completion_output 间接用到，精简版可用更短实现或注释说明，不增逻辑。"},
+      {"what": "convert_ids_list_to_tokens 之外的 detokenizer_utils（detokenize_incrementally 全部增量去 token 逻辑）", "why_safe": "logprobs 用的是‘非增量’去 token（convert_ids_list_to_tokens），增量去 token 属于 detokenizer 章节，本章不需要。"},
+      {"what": "sampling_params.py 的完整 _validate_logprobs 校验体与无关字段", "why_safe": "精简版只需 num_logprobs/prompt_logprobs/flat_logprobs 三个属性取值语义；校验是入口防御，不影响装配算法。"},
+      {"what": "LogprobsLists/LogprobsTensors 的 slice_request/filter/to_cpu_nonblocking/empty_cpu/tolists 等工具方法", "why_safe": "本章只消费这两个 NamedTuple 的字段解包；其构造/搬运/切片发生在 sampler 与 EngineCore（其它章节）。保留字段定义即可。"}
+    ],
+    "must_keep": [
+      {"symbol": "LogprobsProcessor", "why": "本章主角类，writer 全程围绕它讲。"},
+      {"symbol": "from_new_request", "why": "容器初始化 + 三个 None/0.0 分支语义（哪些 logprobs 被开启）。"},
+      {"symbol": "_update_sample_logprobs", "why": "sample logprobs 主装配路径，含累计与去 token。"},
+      {"symbol": "_update_prompt_logprobs", "why": "prompt logprobs 装配，展示 torch 张量自行 Pythonize 与扁平化切片。"},
+      {"symbol": "_get_sampled_context_ids", "why": "字节修正上下文的来源；体现‘每位置第一个=被选中 token’不变式与 flat/nested 双路径。"},
+      {"symbol": "_correct_decoded_token", "why": "上下文感知 UTF-8 多字节重建——本章技术核心，必须完整保留。"},
+      {"symbol": "_verify_tokens", "why": "批量检测 U+FFFD 并触发修正；区分横向候选 vs 纵向上下文。"},
+      {"symbol": "pop_prompt_logprobs", "why": "DELTA 语义下 prompt logprobs 一次性返回并清空。"},
+      {"symbol": "update_from_output", "why": "唯一对外入口与 sample/prompt 分派。"},
+      {"symbol": "cumulative_logprob", "why": "累计 logprob 跟踪的状态字段，读者需理解其只在 sample 路径累加。"},
+      {"symbol": "num_logprobs", "why": "控制 sample logprobs 是否启用 + 决定 top-k 名次链长度。"},
+      {"symbol": "num_prompt_logprobs", "why": "控制 prompt logprobs 是否启用。"},
+      {"symbol": "FlatLogprobs", "why": "flat 格式核心数据结构，writer 需讲清降 GC 设计。"},
+      {"symbol": "append_fast", "why": "FlatLogprobs 的写入路径，避免造中间 dict。"},
+      {"symbol": "append", "why": "FlatLogprobs 含 None 占位 / nested 写入；首位 None 语义。"},
+      {"symbol": "Logprob", "why": "nested 叶子记录（logprob/rank/decoded_token）。"},
+      {"symbol": "create_prompt_logprobs", "why": "构造容器 + prompt 首位 append(None) 占位。"},
+      {"symbol": "create_sample_logprobs", "why": "构造 sample 容器，对照 flat/nested 选择。"},
+      {"symbol": "append_logprobs_for_next_position", "why": "flat vs nested 写入分叉 + rank 链 chain((rank,), topk) 的构造，是‘第一个=被选中 token’的源头。"},
+      {"symbol": "convert_ids_list_to_tokens", "why": "非增量逐 token 去 token 的来源，正是产生 U+FFFD 的地方。"},
+      {"symbol": "_new_completion_output", "why": "下游接口：sample logprobs/cumulative 进 CompletionOutput，DELTA 切尾。"}
+    ]
+  },
+
+  "diagram_plan": [
+    {
+      "id": "01-logprobs-assembly-pipeline",
+      "type": "flow",
+      "title": "Logprobs 双路装配总览",
+      "spec": "两条平行泳道。上泳道 sample：EngineCoreOutput.new_logprobs(LogprobsLists, numpy) → 逐 step tolist → convert_ids_list_to_tokens → _get_sampled_context_ids(self.logprobs) → _verify_tokens → cumulative += logprobs[0] → append_logprobs_for_next_position → self.logprobs。下泳道 prompt：new_prompt_logprobs_tensors(LogprobsTensors, torch) → flatten().tolist() Pythonize → 逐 pos 切片 → _get_sampled_context_ids(self.prompt_logprobs) → _verify_tokens → append → self.prompt_logprobs。两泳道共享中间的 _verify_tokens/_correct_decoded_token 框。右侧汇入 _new_completion_output/_new_request_output。标注差异：numpy vs torch、有/无 cumulative。",
+      "roadmap_highlight": "vllm/v1/engine/logprobs.py (LogprobsProcessor)"
+    },
+    {
+      "id": "02-byte-fallback-reconstruction",
+      "type": "state-trace",
+      "title": "字节回退 UTF-8 多字节重建（_correct_decoded_token 逐步追踪）",
+      "spec": "以一个 3-token 拆分的中文字符为例（如 token A,B 解码为 ''/'�'，token C 完成）。表格列：num_ctx=1,2,3；行：context、tokenizer.decode(context+[token_id])、是否 endswith �、clean_end 回溯、clean_prefix、返回值。展示 num_ctx 从 1 增长到拼出完整字符、回溯找 byte-fallback 边界、剥干净前缀得到归属本 token 的文本。终态：本 token 返回完整字符串，前序 byte token 返回 ''。",
+      "roadmap_highlight": "vllm/v1/engine/logprobs.py:_correct_decoded_token"
+    },
+    {
+      "id": "03-flat-vs-nested",
+      "type": "data-structure",
+      "title": "FlatLogprobs vs list[dict[int,Logprob]] 内存布局对比",
+      "spec": "左：nested——3 个位置，每位置一个 dict，每 dict 含 K 个 Logprob 对象方框，画出对象数 O(L×K)。右：Flat——6 条平行原生列表（token_ids/logprobs/ranks/decoded_tokens + start_indices/end_indices），用 start/end 区间箭头指回每位置切片，标注对象数 O(1)。底部对照：GC 压力、访问单位置 __getitem__ 现造 dict。",
+      "roadmap_highlight": "vllm/logprobs.py (FlatLogprobs)"
+    }
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recover": [],
+    "note": "scripts/bible.py due ch10 返回空（无应埋/应回收伏笔）。"
+  }
+}
