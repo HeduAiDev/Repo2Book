@@ -1,0 +1,216 @@
+{
+  "chapter": "ch06",
+  "title": "Parallel Sampling 扇出 (n>1)：ParentRequest 派生 n 个独立 child EngineCoreRequest（唯一 id + 确定性种子递进），为何独立调度优于批量 n；兑现 ch04 延迟的 n>1",
+  "scope_note": "本章聚焦真实 vLLM v1 的 parallel sampling 扇出机制：AsyncLLM.add_request() 在 n>1 时不把 n 当作引擎内部批量参数下发，而是在客户端进程把一个父请求扇出为 n 个 n=1 的 child EngineCoreRequest，各自带唯一 request_id（前缀 idx_）与（在指定 seed 时）确定性递进种子，由 ParentRequest 跟踪 n 个 child 的完成、并在输出侧把 n 路结果归并回单一 external_req_id 返还给调用方。ch04 在讲三段式 add_request 时把 n>1 分支跳过/延迟，本章兑现该分支。",
+  "code_spine": [
+    "vllm/v1/engine/async_llm.py:L368 — assign_request_id(): 外部 request_id -> 内部 request_id(+8 hex 随机)，原值存入 external_req_id",
+    "vllm/v1/engine/async_llm.py:L376-L383 — 建 RequestOutputCollector；is_pooling 或 params.n==1 走单请求 fast path（parent_req=None）",
+    "vllm/v1/engine/async_llm.py:L385-L398 — n>1 扇出：建 ParentRequest，循环 range(n) 派生 child（唯一 id + child_params），逐个 _add_request",
+    "vllm/v1/engine/parallel_sampling.py:L36-L50 — ParentRequest.__init__：保存 request_id/external_req_id/parent sampling_params，按 output_kind 预置 output_aggregator，child_requests 集合",
+    "vllm/v1/engine/parallel_sampling.py:L83-L94 — get_child_info(index)：child_req_id = f\"{index}_{request_id}\"，登记进 child_requests，返回 (id, child_params)",
+    "vllm/v1/engine/parallel_sampling.py:L52-L81 — _get_child_sampling_params(index)：copy 父 params 并强制 n=1；seed None 时缓存复用，seed 非 None 时每个 child 取 seed+index",
+    "vllm/v1/engine/async_llm.py:L400-L415 — _add_request：把 child 同时挂到 OutputProcessor(本进程) 与 EngineCore(独立进程)",
+    "vllm/v1/engine/output_processor.py:L508-L537 — OutputProcessor.add_request：建 RequestState(带 parent_req/request_index)，登记 parent_requests 与 external_req_ids[external] -> [internal...] 映射",
+    "vllm/v1/engine/output_processor.py:L321-L331 — 单次输出归并：parent_req.get_outputs(child_id, output) 决定本批向客户端吐什么，并把 request_id 改回 parent.external_req_id",
+    "vllm/v1/engine/parallel_sampling.py:L100-L126 — get_outputs：流式逐条转发(去重已完成已返还的 child) / FINAL_ONLY 按 index 聚合，攒齐 n 个再一次性吐出；finished = child_requests 空",
+    "vllm/v1/engine/parallel_sampling.py:L128-L150 — 指标观测：max_num_generation_tokens / n_params_iter（n 路里最长那路）",
+    "vllm/v1/engine/output_processor.py:L499-L506 — abort 父请求时级联 abort 所有未完成 child"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/engine/async_llm.py",
+      "lines": "L368-L398",
+      "code": "        self.input_processor.assign_request_id(request)\n\n        # We start the output_handler on the first call to add_request() so\n        # we can call __init__ before the event loop, which enables us\n        # to handle startup failure gracefully in the OpenAI server.\n        self._run_output_handler()\n\n        # Create a new output collector for the request.\n        queue = RequestOutputCollector(params.output_kind, request.request_id)\n\n        # Use cloned params that may have been updated in process_inputs()\n        params = request.params\n\n        if is_pooling or params.n == 1:\n            await self._add_request(request, prompt_text, None, 0, queue)\n            return queue\n\n        parent_params = params\n        assert isinstance(parent_params, SamplingParams)\n\n        # Fan out child requests (for n>1).\n        parent_request = ParentRequest(request)\n        for idx in range(parent_params.n):\n            request_id, child_params = parent_request.get_child_info(idx)\n            child_request = request if idx == parent_params.n - 1 else copy(request)\n            child_request.request_id = request_id\n            child_request.sampling_params = child_params\n            await self._add_request(\n                child_request, prompt_text, parent_request, idx, queue\n            )\n        return queue",
+      "elide": [
+        "此处之前的分支：EngineCoreRequest 直接传入的 deprecated 路径、AsyncGenerator 流式输入路径、reasoning_ended/reasoning_parser_kwargs 注入，与 n>1 扇出主线无关",
+        "params.n==1 与 pooling 是 fast path：parent_req=None、index=0，直接单请求下发（这是 ch04 已讲的主路径，本章只需点出它是 n>1 的对照）",
+        "child_request = request if idx == n-1 else copy(request)：最后一个 child 复用原 request 对象，前面的用浅 copy；这是省一次拷贝的微优化，控制流上等价于全部 copy"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/parallel_sampling.py",
+      "lines": "L36-L94",
+      "code": "    def __init__(self, request: EngineCoreRequest) -> None:\n        assert request.external_req_id is not None\n        sampling_params = request.params\n        self.request_id = request.request_id\n        self.external_req_id = request.external_req_id\n        self.sampling_params = sampling_params\n\n        self.child_requests = set()\n        self.output_aggregator = (\n            [cast(CompletionOutput, None)] * sampling_params.n\n            if (sampling_params.output_kind == RequestOutputKind.FINAL_ONLY)\n            else []\n        )\n        self.max_num_generation_tokens = 0\n        self.cached_child_sampling_params = None\n\n    def _get_child_sampling_params(\n        self,\n        index: int,\n    ) -> SamplingParams:\n        seed = self.sampling_params.seed\n        if self.cached_child_sampling_params:\n            # Reuse child sampling_params data structure\n            return self.cached_child_sampling_params\n        # Build child sampling_params\n        child_sampling_params = copy(self.sampling_params)\n        child_sampling_params.n = 1\n        if seed is None:\n            # Cache child sampling_params for later reuse\n            self.cached_child_sampling_params = child_sampling_params\n        else:\n            # Each child gets a clone with a unique seed\n            child_sampling_params.seed = seed + index\n        return child_sampling_params\n\n    def get_child_info(self, index: int) -> tuple[str, SamplingParams]:\n        child_req_id = f\"{index}_{self.request_id}\"\n        self.child_requests.add(child_req_id)\n        return child_req_id, self._get_child_sampling_params(index)",
+      "elide": [
+        "原始 docstring 已删以省篇幅；语义已由代码注释体现",
+        "注意 _get_child_sampling_params 的关键不对称：seed is None 走缓存复用同一个对象（所有 child 共享，因为无 seed 时随机性本就独立、无需差异化），seed 非 None 才每个 child copy 并取 seed+index"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/parallel_sampling.py",
+      "lines": "L100-L132",
+      "code": "    def get_outputs(\n        self,\n        child_request_id: str,\n        completion_output: CompletionOutput,\n    ) -> tuple[list[CompletionOutput], bool]:\n        already_finished_and_returned: bool = False\n        if completion_output.finished():\n            if child_request_id in self.child_requests:\n                self.child_requests.remove(child_request_id)\n            else:\n                # child request ID is not available in child_requests\n                # which means the request had finished in previous\n                # batch step and returned to the client earlier\n                already_finished_and_returned = True\n\n        if self.sampling_params.output_kind != RequestOutputKind.FINAL_ONLY:\n            # If streaming, just return the current output\n            #\n            # DO NOT output finished and already returned child request to client again\n            outputs = [] if already_finished_and_returned else [completion_output]\n        else:\n            # If not streaming, aggregate the n final outputs.\n            self.output_aggregator[completion_output.index] = completion_output\n            outputs = [] if self.child_requests else self.output_aggregator\n\n        finished = not self.child_requests\n        return outputs, finished\n\n    def observe_num_generation_tokens(self, num_generation_tokens: int):\n        self.max_num_generation_tokens = max(\n            num_generation_tokens, self.max_num_generation_tokens\n        )\n        return self.max_num_generation_tokens",
+      "elide": [
+        "observe_finished_request 静态方法（L134-L150）：把 n 路里最长那路写进 iteration_stats（max_num_generation_tokens_iter / n_params_iter），属指标侧，正文可一句带过"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/output_processor.py",
+      "lines": "L321-L331",
+      "code": "        if self.parent_req is None:\n            outputs = [output]\n        else:\n            outputs, finished = self.parent_req.get_outputs(self.request_id, output)\n            if not outputs:\n                return None\n            external_req_id = self.parent_req.external_req_id\n\n        return self._new_request_output(\n            external_req_id, outputs, finished, kv_transfer_params\n        )",
+      "elide": [
+        "上文 _new_completion_output / pooling 分支与 delta token 偏移属 ch08 输出处理范畴；这里只需看：有 parent_req 时输出经 get_outputs 归并、且 request_id 被改回 external_req_id（n 路对外是同一个请求 id）",
+        "outputs 为空（[]）时返回 None：表示这一批 child 没有应当对客户端展示的内容（已返还过 / FINAL_ONLY 尚未攒齐）"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/output_processor.py",
+      "lines": "L508-L537",
+      "code": "    def add_request(\n        self,\n        request: EngineCoreRequest,\n        prompt: str | None,\n        parent_req: ParentRequest | None = None,\n        request_index: int = 0,\n        queue: RequestOutputCollector | None = None,\n    ) -> None:\n        request_id = request.request_id\n        req_state = self.request_states.get(request_id)\n        if req_state is not None:\n            self._update_streaming_request_state(req_state, request, prompt)\n            return\n\n        req_state = RequestState.from_new_request(\n            tokenizer=self.tokenizer,\n            request=request,\n            prompt=prompt,\n            parent_req=parent_req,\n            request_index=request_index,\n            queue=queue,\n            log_stats=self.log_stats,\n            stream_interval=self.stream_interval,\n        )\n        self.request_states[request_id] = req_state\n        if parent_req:\n            self.parent_requests[parent_req.request_id] = parent_req\n\n        # Track the external_req_id -> [internal_req_id, ...] mapping\n        self.external_req_ids[req_state.external_req_id].append(request_id)",
+      "elide": [
+        "streaming 输入复用 req_state 的分支与本章无关",
+        "关键：每个 child 在 OutputProcessor 里有独立 RequestState（独立 detokenizer/logprobs）；request_index 即扇出时的 idx，最终成为 CompletionOutput.index（output_processor.py:L399），ParentRequest.output_aggregator 据此定位归位"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/input_processor.py",
+      "lines": "L214-L232",
+      "code": "    @staticmethod\n    def assign_request_id(request: EngineCoreRequest):\n        \"\"\"Replace the externally supplied request ID with an internal request ID\n        that adds 8 random characters in order to ensure uniqueness.\n        \"\"\"\n        if request.external_req_id is not None:\n            raise ValueError(\n                \"The external_req_id field should not be set on EngineCoreRequests\"\n                \" passed to vLLM; use the request_id field.\"\n            )\n        request.external_req_id = request.request_id\n        ...\n            request.request_id = f\"{request.external_req_id}-{random_uuid():.8}\"",
+      "elide": [
+        "VLLM_DISABLE_REQUEST_ID_RANDOMIZATION 分支（关闭随机化、保留原 id 并告警）已用 ... 省略",
+        "这一步发生在扇出之前（async_llm.py:L368），先把外部 id 存进 external_req_id、再给父 request 生成带 8 hex 后缀的内部 request_id；child id 即在这个内部 id 前缀 'idx_'，保证全局唯一",
+        "random_uuid() 实为 16 hex 字符（uuid4.int & 64bit mask），:.8 格式化截断为前 8 字符"
+      ]
+    }
+  ],
+  "key_classes": [
+    {
+      "name": "ParentRequest",
+      "file": "vllm/v1/engine/parallel_sampling.py",
+      "responsibility": "封装 n>1 父请求的状态与处理：保存父 request_id/external_req_id/sampling_params；通过 get_child_info(idx) 派生唯一 child id 与 n=1 child 采样参数（seed 递进/无 seed 复用）；通过 child_requests 集合跟踪 n 路完成；通过 get_outputs 把 n 路 child 输出归并（流式逐条转发 / FINAL_ONLY 按 index 聚合）。"
+    },
+    {
+      "name": "AsyncLLM.add_request",
+      "file": "vllm/v1/engine/async_llm.py",
+      "responsibility": "请求入口：先 assign_request_id 内部化 id、起 output_handler、建 RequestOutputCollector；n==1/pooling 走单请求 fast path；n>1 时建 ParentRequest 并循环扇出 n 个独立 child EngineCoreRequest 下发。是 ch04 三段式 add_request 延迟讲解的 n>1 分支兑现处。"
+    },
+    {
+      "name": "OutputProcessor.add_request",
+      "file": "vllm/v1/engine/output_processor.py",
+      "responsibility": "本进程侧为每个 child 建独立 RequestState（独立 detokenizer/logprobs，request_index=idx）；登记 parent_requests[parent_id]=parent 与 external_req_ids[external] -> [internal...] 反查表，使输出归并与级联 abort 成为可能。"
+    },
+    {
+      "name": "EngineCoreRequest",
+      "file": "vllm/v1/engine/__init__.py",
+      "responsibility": "跨进程 IPC 载荷。本章关注其 request_id（child 唯一内部 id）、external_req_id（n 路共享的对外 id）、sampling_params（child 被强制 n=1，可能带 seed+index）三字段在扇出/归并中的角色。"
+    }
+  ],
+  "data_flow": [
+    "1. AsyncLLM.add_request → input_processor.assign_request_id(request)：外部 id 存入 external_req_id，request_id 改为 内部id-8hex（async_llm.py:L368, input_processor.py:L214）",
+    "2. 建 RequestOutputCollector(queue)，params = request.params（process_inputs 已 clone 补全）（async_llm.py:L376-L379）",
+    "3. 若 pooling 或 params.n==1：单请求 fast path，_add_request(parent_req=None, index=0)，直接 return queue（async_llm.py:L381-L383）",
+    "4. 否则 n>1：parent_request = ParentRequest(request)（parallel_sampling.py:__init__）",
+    "5. for idx in range(n)：get_child_info(idx) → child_req_id=f\"{idx}_{request_id}\"、child_params=copy(parent).n=1(+seed+index)（parallel_sampling.py:get_child_info/_get_child_sampling_params）",
+    "6. child_request = request(最后一个) 或 copy(request)，覆写 request_id/sampling_params；_add_request(child, parent_request, idx, queue)（async_llm.py:L390-L397）",
+    "7. _add_request：output_processor.add_request(child, parent_req, request_index=idx) 建独立 RequestState；engine_core.add_request_async(child) 经 IPC 下发独立请求（async_llm.py:_add_request, output_processor.py:add_request）",
+    "8. EngineCore 把 n 个 child 当作 n 个普通独立请求调度（连续批处理里各自占一槽，与他人请求平等竞争）",
+    "9. 输出回流：每个 child 的 EngineCoreOutput → RequestState.make_request_output → parent_req.get_outputs(child_id, output) 归并（output_processor.py:L321-L331, parallel_sampling.py:get_outputs）",
+    "10. 流式：逐条转发该 child 的增量（去重已完成已返还）；FINAL_ONLY：写 output_aggregator[output.index]，攒齐 n 个（child_requests 空）才一次性吐出",
+    "11. 归并后的 RequestOutput.request_id 被改回 parent.external_req_id（对外是单一请求），put 进同一 queue → generate() 消费者拿到（output_processor.py:L327, L363）",
+    "12. abort：external id 经 external_req_ids 反查到所有 internal child；abort 父则级联 abort 未完成 child（output_processor.py:abort_requests L499-L506）"
+  ],
+  "design_decisions": [
+    {
+      "decision": "n>1 在客户端进程扇出为 n 个独立 n=1 请求下发，而非把 n 作为引擎内部批量参数",
+      "why": "把'生成 n 个候选'还原成 n 个对等的普通请求，复用引擎已有的连续批处理/调度/抢占/KV cache 全套机制，无需在 scheduler/attention 里特设 n>1 的批量语义。各 child 与其他用户请求平等竞争资源，调度更均衡、抢占/抢占恢复更简单，且 prefix caching 可让 n 路共享同一段 prompt 前缀的 KV。",
+      "evidence": "vllm/v1/engine/async_llm.py:L385-L398；child_params.n 被强制为 1 见 vllm/v1/engine/parallel_sampling.py:L74"
+    },
+    {
+      "decision": "child id = f\"{index}_{request_id}\"（index 前缀于已随机化的内部父 id）",
+      "why": "父 request_id 已带 8 hex 随机后缀（assign_request_id）保证跨请求唯一；再以 index 前缀派生 child id 即可保证 n 路内部唯一，同时通过去掉前缀/查表能反向关联回父，便于级联 abort 与归并。",
+      "evidence": "vllm/v1/engine/parallel_sampling.py:L92；vllm/v1/engine/input_processor.py:L224-L232"
+    },
+    {
+      "decision": "确定性种子：指定 seed 时 child i 用 seed+index；未指定 seed 时所有 child 复用同一缓存 params",
+      "why": "若所有 child 共用同一 seed，n 路采样会完全相同、退化为 1 个结果——失去 parallel sampling 的意义。故对显式 seed 做确定性递进 seed+index，既保证 n 路互异、又保证整次请求可复现。未指定 seed 时随机性天然独立，无需差异化，复用同一 params 对象省内存/拷贝。",
+      "evidence": "vllm/v1/engine/parallel_sampling.py:L68-L81"
+    },
+    {
+      "decision": "最后一个 child 复用原 request 对象，前 n-1 个用 copy(request)",
+      "why": "原父 request 对象在扇出后不再作为独立请求使用，可被最后一个 child 直接复用以省一次浅拷贝；这是纯微优化，控制流上与'全部 copy'等价。",
+      "evidence": "vllm/v1/engine/async_llm.py:L392"
+    },
+    {
+      "decision": "输出归并集中在 ParentRequest.get_outputs：流式逐条转发 / FINAL_ONLY 按 index 聚合攒齐",
+      "why": "对外 n>1 仍是一个请求一个 queue。流式下每个 child 的增量直接转发（CompletionOutput.index 标明是第几路），客户端自行拼装；FINAL_ONLY 下需把 n 个最终结果按 index 归位到 output_aggregator，全部 child 完成后一次性返还，符合'非流式只给最终一批'的语义。",
+      "evidence": "vllm/v1/engine/parallel_sampling.py:L100-L126；output_aggregator 预分配见 L44-L48"
+    },
+    {
+      "decision": "n 路共享同一 external_req_id 与同一 RequestOutputCollector",
+      "why": "调用方只发了一个请求、只应看到一个请求 id。内部 n 路 child 各有内部 request_id，但归并后 RequestOutput.request_id 被改回 external_req_id，且所有 child 的输出都 put 进同一个 queue，对 generate() 消费者透明。",
+      "evidence": "vllm/v1/engine/output_processor.py:L327, L350, L364；queue 在 async_llm.py:L376 建一次、扇出时共享传入 L396"
+    }
+  ],
+  "theory": [
+    "复杂度：扇出本身 O(n) 次 add_request 与 IPC 下发；引擎侧 n 个 child 是 n 个独立 sequence，prefill 阶段若 prefix caching 命中可共享 prompt 的 KV（n 路 prompt 完全相同），decode 阶段各自独立推进，KV cache 占用 ≈ prompt_kv（可共享一份）+ n × 各自 output_kv。对比'引擎内特设批量 n'方案，独立调度不额外增加调度器复杂度，但代价是 n 个请求的元数据/RequestState 各一份。",
+    "确定性：child i 的种子 = seed + i 是确定性单调递进；给定 (prompt, seed, n) 整次结果可复现，且 n 路两两不同（前提：底层采样对相邻 seed 不产生碰撞，实践中独立）。无 seed 时依赖全局 RNG 的独立抽样保证 n 路互异。",
+    "为何独立调度优于批量 n：(1) 资源公平——每个 child 与其他请求在同一调度队列里平等竞争，避免'一个 n=64 请求霸占调度'；(2) 抢占/恢复/finish 粒度更细——某一路先完成即可释放其 KV 并提前返还给客户端（流式），无需等齐；(3) 复用既有机制零特判——scheduler/block manager/attention 都只见'普通请求'。"
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {
+        "what": "async_llm.py add_request 中 AsyncGenerator 流式输入分支（_add_streaming_input_request 及其校验 _validate_streaming_input_sampling_params）",
+        "why_safe": "流式输入与 n>1 扇出互斥（流式明确禁止 n>1），与本章主线无关；删除不影响 n>1 扇出控制流。"
+      },
+      {
+        "what": "async_llm.py add_request 中 EngineCoreRequest 直传的 deprecated 分支与 reasoning_ended/reasoning_parser_kwargs 注入",
+        "why_safe": "deprecated 兼容路径与 reasoning 注入不参与扇出/归并逻辑，删后 process_inputs->扇出主路径完整。"
+      },
+      {
+        "what": "kv_sharing_fast_prefill + prompt_logprobs 的 ValueError 前置校验（async_llm.py:L305-L314）",
+        "why_safe": "纯配置冲突校验，与 parallel sampling 机制无关。"
+      },
+      {
+        "what": "ParentRequest.observe_num_generation_tokens / observe_finished_request 指标观测（parallel_sampling.py:L128-L150）",
+        "why_safe": "仅向 IterationStats 记录 n 路最长生成长度与 n 值，属可观测性旁路，删除不改变扇出/归并的功能正确性。可在正文一句带过。"
+      },
+      {
+        "what": "output_processor.py 中 pooling_output 分支、delta token 偏移、logprobs/prompt_logprobs 细节、_new_request_output 的 PoolingRequestOutput 构造",
+        "why_safe": "这些属 ch08 输出处理/detokenize 范畴；本章只需保留 parent_req.get_outputs 归并与 external_req_id 改写两条关键线。"
+      },
+      {
+        "what": "input_processor.py 的完整 process_inputs（tokenize/多模态/校验/clone）实现细节，只保留 assign_request_id",
+        "why_safe": "process_inputs 是 ch04/ch05 主题；本章仅需 assign_request_id 提供的 external_req_id/内部 id 语义作为 child id 派生的前提。"
+      }
+    ],
+    "must_keep": [
+      { "symbol": "ParentRequest", "why": "本章核心类，扇出与归并的载体。" },
+      { "symbol": "ParentRequest.__init__", "why": "展示 output_aggregator 按 output_kind 预置、child_requests 初始化——读者需理解归并状态来源。" },
+      { "symbol": "get_child_info", "why": "派生唯一 child id 并登记 child_requests，是扇出的关键步。" },
+      { "symbol": "_get_child_sampling_params", "why": "确定性 seed+index 与无 seed 复用的不对称逻辑，是'n 路互异/可复现'的核心，writer 必须讲清。" },
+      { "symbol": "child_requests", "why": "跟踪 n 路完成的集合；finished = not child_requests 的判据。" },
+      { "symbol": "cached_child_sampling_params", "why": "无 seed 时复用同一 params 的缓存机制，体现优化与正确性边界。" },
+      { "symbol": "output_aggregator", "why": "FINAL_ONLY 下按 index 归位 n 个结果的容器。" },
+      { "symbol": "get_outputs", "why": "归并核心：流式逐条转发 vs FINAL_ONLY 聚合、去重已返还 child、finished 判定。" },
+      { "symbol": "add_request", "why": "AsyncLLM.add_request 的 n>1 扇出循环是本章主控制流（兑现 ch04 延迟分支）。" },
+      { "symbol": "assign_request_id", "why": "child id 派生前提：external_req_id 与内部随机化 request_id 的来源。" },
+      { "symbol": "external_req_id", "why": "n 路对外共享的单一请求 id，归并时 RequestOutput.request_id 被改回它。" },
+      { "symbol": "request_id", "why": "child 的唯一内部 id（idx_ 前缀），与 external_req_id 区分。" },
+      { "symbol": "parent_req", "why": "RequestState/输出归并据此区分单请求与 n>1 child。" },
+      { "symbol": "request_index", "why": "扇出 idx 贯穿到 CompletionOutput.index，FINAL_ONLY 归位依据。" }
+    ]
+  },
+  "diagram_plan": [
+    {
+      "name": "06-parallel-sampling-fanout",
+      "type": "svg-diagram",
+      "spec": "横向三栏数据流图。左栏：调用方一个 generate(prompt, n=3, seed=42) → external_req_id=R。中栏 AsyncLLM.add_request：assign_request_id 把 R 内部化为 R-ab12cd34；ParentRequest 扇出三个 child：'0_R-ab12cd34'(seed=42) / '1_...'(seed=43) / '2_...'(seed=44)，标注 child.n=1。三个 child 经 IPC 各自下发 EngineCore（画成三条平行箭头进同一 EngineCore 框，强调'当作 3 个独立请求调度'）。右栏归并：三路 EngineCoreOutput 回流 → ParentRequest.get_outputs 归并 → 单一 RequestOutput(request_id=R) → 同一 RequestOutputCollector → 调用方。强调对外只有 R 一个 id，一个 queue。"
+    },
+    {
+      "name": "06-get-outputs-streaming-vs-final",
+      "type": "svg-diagram",
+      "spec": "对照表/双泳道：上半 STREAMING(非 FINAL_ONLY)——每个 child 增量直接转发，标 CompletionOutput.index 0/1/2，child 完成即从 child_requests 移除并去重；下半 FINAL_ONLY——output_aggregator[index] 逐个填位，child_requests 非空时返回 []，攒齐 3 路后一次性返回 [out0,out1,out2]，finished=True。"
+    },
+    {
+      "name": "roadmap-ch06-highlight",
+      "type": "roadmap",
+      "spec": "复用 instances/vllm/book/assets/roadmap/roadmap.py，高亮节点：input-processor/parallel-sampling（本章），前接 ch04 异步三段式 add_request（标注'兑现这里延迟的 n>1 分支'）、ch05 process_inputs，后接 ch08 输出处理/RequestOutputCollector 消费（归并结果的消费端）。"
+    }
+  ],
+  "foreshadow_due": {
+    "due_to_plant_ch06": [],
+    "due_to_payoff_ch06": [],
+    "bible_due_raw": "scripts/bible.py due ch06 返回空（== ch06 应埋伏笔 == / == ch06 应回收 == 均无条目）。arc-map.json 现有 f1..f7 无 plant/payoff 落在 ch06。",
+    "note_for_lead": "章题点名'兑现 ch04 延迟的 n>1'，但该叙事线索未在 bible/arc-map.json 注册为正式伏笔。建议 Lead/Archivist 在 arc-map.json 补一条 {plant: ch04, payoff: ch06, what: 'AsyncLLM.add_request 的 n>1 扇出分支（ch04 三段式讲解时跳过/延迟）'}，以便连贯性审计能追踪到这次回收。Writer 在正文应显式回指 ch04 的延迟承诺。"
+  }
+}
