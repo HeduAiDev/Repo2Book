@@ -1,0 +1,213 @@
+{
+  "chapter": "ch08-output-processor",
+  "title": "Stage 3 输出处理：单循环 OutputProcessor.process_outputs()、per-request RequestState、RequestOutputCollector 队列 DELTA 归并、stream_interval、完成处理、n>1 父聚合",
+  "source_pin": "f3fef123",
+  "scope_note": "本章解读 AsyncLLM 三段式中的 Stage 3（输出侧）：背景 output_handler 任务从 EngineCore 拉到 list[EngineCoreOutput] 后，唯一允许遍历整批的函数 OutputProcessor.process_outputs() 如何 per-request 地：算 stats → 增量去 token → 停止串检测 → 算 logprobs → 造 RequestOutput → 推进 per-request 的 RequestOutputCollector 队列（或在 LLMEngine 同步路径下返回列表）→ 完成清理。重点兑现 ch04 埋的 f1（per-request 队列做异步多路复用）与 f3（背景任务 vs generate() 的生产者-消费者）。detokenizer/logprobs 作为 process_outputs 的两个被调用子系统讲清接口与增量算法，不喧宾夺主。",
+
+  "code_spine": [
+    "vllm/v1/engine/async_llm.py:L656-L707  output_handler 背景任务：拉 EngineCoreOutputs → 分块 → 调 process_outputs → 推队列（f3 生产者）",
+    "vllm/v1/engine/output_processor.py:L572-L687  process_outputs：唯一遍历整批的单循环（本章主轴）",
+    "vllm/v1/engine/output_processor.py:L602-L607  per-request 取 RequestState；已 abort 的 output 直接跳过",
+    "vllm/v1/engine/output_processor.py:L621-L626  prefill→decode 状态翻转 + num_cached_tokens",
+    "vllm/v1/engine/detokenizer.py:L95-L142  IncrementalDetokenizer.update：增量去 token + 停止串检测",
+    "vllm/v1/engine/logprobs.py:L348-L353  LogprobsProcessor.update_from_output：sample/prompt logprobs 增量累积",
+    "vllm/v1/engine/output_processor.py:L269-L331  RequestState.make_request_output：stream_interval 节流 + DELTA/FINAL_ONLY + 父聚合分流",
+    "vllm/v1/engine/output_processor.py:L376-L407  _new_completion_output：delta vs 全量 text/token_ids/logprobs",
+    "vllm/v1/engine/parallel_sampling.py:L100-L126  ParentRequest.get_outputs：n>1 子→父聚合 + finished 判定",
+    "vllm/v1/engine/output_processor.py:L644-L661  造出的 RequestOutput 入队（AsyncLLM）或入返回列表（LLMEngine）的分叉",
+    "vllm/v1/engine/output_processor.py:L62-L96  RequestOutputCollector.put/get：DELTA 归并 + asyncio.Event 唤醒（f1 队列）",
+    "vllm/v1/engine/async_llm.py:L576-L586  generate() 消费侧：get_nowait()/get() 拉队列并 yield（f3 消费者）",
+    "vllm/v1/engine/output_processor.py:L662-L687  完成处理：_finish_request 注销 + stop-string 反向 abort EngineCore",
+    "vllm/v1/engine/output_processor.py:L689-L701  _finish_request：从 request_states / external_req_ids / parent_requests 注销"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/engine/async_llm.py",
+      "lines": "L656-L691",
+      "what": "f3 生产者：背景 output_handler 任务的核心循环——拉 EngineCore 输出、按 VLLM_V1_OUTPUT_PROC_CHUNK_SIZE 分块、调 process_outputs（断言其不回填 request_outputs，因为异步路径全走队列）、对 stop-string 触发的请求反向 abort EngineCore。",
+      "code": "        async def output_handler():\n            try:\n                while True:\n                    # 1) Pull EngineCoreOutputs from the EngineCore.\n                    outputs = await engine_core.get_output_async()\n                    num_outputs = len(outputs.outputs)\n\n                    iteration_stats = (\n                        IterationStats() if (log_stats and num_outputs) else None\n                    )\n\n                    # Split outputs into chunks of at most\n                    # VLLM_V1_OUTPUT_PROC_CHUNK_SIZE, so that we don't block the\n                    # event loop for too long.\n                    engine_core_outputs = outputs.outputs\n                    for start in range(0, num_outputs, chunk_size):\n                        end = start + chunk_size\n                        outputs_slice = engine_core_outputs[start:end]\n                        # 2) Process EngineCoreOutputs.\n                        processed_outputs = output_processor.process_outputs(\n                            outputs_slice, outputs.timestamp, iteration_stats\n                        )\n                        # NOTE: RequestOutputs are pushed to their queues.\n                        assert not processed_outputs.request_outputs\n\n                        # Allow other asyncio tasks to run between chunks\n                        if end < num_outputs:\n                            await asyncio.sleep(0)\n\n                        # 3) Abort any reqs that finished due to stop strings.\n                        if processed_outputs.reqs_to_abort:\n                            await engine_core.abort_requests_async(\n                                processed_outputs.reqs_to_abort\n                            )",
+      "elide": ["L657 前的闭包变量捕获（engine_core/output_processor/log_stats/logger_ref/renderer/chunk_size）——纯为避免对 self 的循环引用，讲一句即可；L693-L702 的 logger_ref[0].record 指标记录，属于 metrics 子系统不在本章；L703-L707 的 except 调 propagate_error（可在 design_decisions 提一句错误广播）"]
+    },
+    {
+      "path": "vllm/v1/engine/output_processor.py",
+      "lines": "L572-L687",
+      "what": "本章主轴：process_outputs 的完整单循环。docstring 明确这是『唯一应该遍历 EngineCoreOutputs 的函数』（V1 把对整批的 python 循环降到最少）。逐 request：取 state（已 abort 则跳过）→ 算 stats → prefill 翻 decode → 去 token + 停止串 → logprobs → 造 RequestOutput 并入队/入列表 → 完成则清理 + stop-string 反向 abort。",
+      "code": "    def process_outputs(\n        self,\n        engine_core_outputs: list[EngineCoreOutput],\n        engine_core_timestamp: float | None = None,\n        iteration_stats: IterationStats | None = None,\n    ) -> OutputProcessorOutput:\n        request_outputs: list[RequestOutput | PoolingRequestOutput] = []\n        reqs_to_abort: list[str] = []\n        for engine_core_output in engine_core_outputs:\n            req_id = engine_core_output.request_id\n            req_state = self.request_states.get(req_id)\n            if req_state is None:\n                # Ignore output for already-aborted request.\n                continue\n\n            # 1) Compute stats for this iteration.\n            self._update_stats_from_output(\n                req_state, engine_core_output, engine_core_timestamp, iteration_stats\n            )\n\n            new_token_ids = engine_core_output.new_token_ids\n            pooling_output = engine_core_output.pooling_output\n            finish_reason = engine_core_output.finish_reason\n            stop_reason = engine_core_output.stop_reason\n            kv_transfer_params = engine_core_output.kv_transfer_params\n            routed_experts = engine_core_output.routed_experts\n\n            if req_state.is_prefilling:\n                if engine_core_output.prefill_stats is not None:\n                    req_state.num_cached_tokens = (\n                        engine_core_output.prefill_stats.num_cached_tokens\n                    )\n                req_state.is_prefilling = False\n\n            if pooling_output is None:\n                assert req_state.detokenizer is not None\n                assert req_state.logprobs_processor is not None\n                # 2) Detokenize the token ids into text and perform stop checks.\n                stop_string = req_state.detokenizer.update(\n                    new_token_ids, finish_reason == FinishReason.STOP\n                )\n                if stop_string:\n                    finish_reason = FinishReason.STOP\n                    stop_reason = stop_string\n\n                # 3) Compute sample and prompt logprobs for request,\n                # if required.\n                req_state.logprobs_processor.update_from_output(engine_core_output)\n\n            # 4) Create and handle RequestOutput objects.\n            if request_output := req_state.make_request_output(\n                new_token_ids,\n                pooling_output,\n                finish_reason,\n                stop_reason,\n                kv_transfer_params,\n                routed_experts,\n            ):\n                if req_state.streaming_input:\n                    request_output.finished = False\n\n                if req_state.queue is not None:\n                    # AsyncLLM: put into queue for handling by generate().\n                    req_state.queue.put(request_output)\n                else:\n                    # LLMEngine: return list of RequestOutputs.\n                    request_outputs.append(request_output)\n\n            # Free completed requests.\n            if finish_reason is not None:\n                if req_state.streaming_input:\n                    if req_state.input_chunk_queue:\n                        update = req_state.input_chunk_queue.popleft()\n                        req_state.apply_streaming_update(update)\n                    else:\n                        req_state.input_chunk_queue = None\n                else:\n                    self._finish_request(req_state)\n                    if not engine_core_output.finished:\n                        # If req not finished in EngineCore, but Detokenizer\n                        # detected stop string, abort needed in EngineCore.\n                        reqs_to_abort.append(req_id)\n\n                    # Track per-request stats\n                    self._update_stats_from_finished(\n                        req_state, finish_reason, iteration_stats\n                    )\n                    if self.tracing_enabled:\n                        self.do_tracing(engine_core_output, req_state, iteration_stats)\n\n        return OutputProcessorOutput(\n            request_outputs=request_outputs,\n            reqs_to_abort=reqs_to_abort,\n        )",
+      "elide": ["docstring 正文（L578-L598）可改述为旁白：『此为唯一遍历整批的函数，need-to-touch-every-element 都塞进这个循环』；pooling 分支（pooling_output 非 None）属嵌入/池化模型，正文用一句带过『非生成式请求走 pooling 分支，跳过去 token/logprobs』；streaming_input 分支（resumable 流式输入）是边角特性，正文一句带过：完成时不立即注销而是消费 input_chunk_queue 中的下一个输入块"]
+    },
+    {
+      "path": "vllm/v1/engine/output_processor.py",
+      "lines": "L269-L331",
+      "what": "RequestState.make_request_output：把本步 token 变成（或不变成）一个 RequestOutput。三个节流/分流闸门：(a) FINAL_ONLY 模式未完成则返回 None；(b) stream_interval>1 时仅在『完成 / 首 token / 攒够 interval 个 token』时才发，DELTA 模式从 sent_tokens_offset 切片；(c) parent_req 非空则交给 ParentRequest.get_outputs 做 n>1 父聚合，聚合不出东西则返回 None。",
+      "code": "    def make_request_output(\n        self,\n        new_token_ids: list[int],\n        pooling_output: torch.Tensor | None,\n        finish_reason: FinishReason | None,\n        stop_reason: int | str | None,\n        kv_transfer_params: dict[str, Any] | None = None,\n        routed_experts: np.ndarray | None = None,\n    ) -> RequestOutput | PoolingRequestOutput | None:\n        finished = finish_reason is not None\n        final_only = self.output_kind == RequestOutputKind.FINAL_ONLY\n\n        if not finished and final_only:\n            # Only the final output is required in FINAL_ONLY mode.\n            return None\n\n        if self.stream_interval > 1:\n            assert self.detokenizer is not None\n\n            # Send output request only when\n            # 1. It has finished, or\n            # 2. It is the first token, or\n            # 3. It has reached the stream interval number of tokens\n            if not (\n                finished\n                or self.sent_tokens_offset == 0\n                or self.detokenizer.num_output_tokens() - self.sent_tokens_offset\n                >= self.stream_interval\n            ):\n                return None\n\n            if self.output_kind == RequestOutputKind.DELTA:\n                # Send tokens from the offset in DELTA mode, otherwise all\n                # tokens are sent.\n                new_token_ids = self.detokenizer.output_token_ids[\n                    self.sent_tokens_offset :\n                ]\n                self.sent_tokens_offset = self.detokenizer.num_output_tokens()\n\n        external_req_id = self.external_req_id\n\n        if pooling_output is not None:\n            return self._new_request_output(\n                external_req_id,\n                [self._new_pooling_output(pooling_output)],\n                finished,\n            )\n\n        output = self._new_completion_output(\n            new_token_ids, finish_reason, stop_reason, routed_experts\n        )\n\n        if self.parent_req is None:\n            outputs = [output]\n        else:\n            outputs, finished = self.parent_req.get_outputs(self.request_id, output)\n            if not outputs:\n                return None\n            external_req_id = self.parent_req.external_req_id\n\n        return self._new_request_output(\n            external_req_id, outputs, finished, kv_transfer_params\n        )",
+      "elide": ["pooling 分支（pooling_output 非 None → _new_pooling_output）正文一句带过"]
+    },
+    {
+      "path": "vllm/v1/engine/output_processor.py",
+      "lines": "L376-L407",
+      "what": "_new_completion_output：构造单个 CompletionOutput。核心是 delta 模式分叉——text 由 detokenizer.get_next_output_text(finished, delta) 给出（delta=只给新增），非 delta 则 token_ids 取全量 output_token_ids，logprobs 在 delta 下只切最后 len(token_ids) 个。index=request_index 用于 n>1 时区分各子序列。",
+      "code": "    def _new_completion_output(\n        self,\n        token_ids: list[int],\n        finish_reason: FinishReason | None,\n        stop_reason: int | str | None,\n        routed_experts: np.ndarray | None = None,\n    ) -> CompletionOutput:\n        assert self.detokenizer is not None\n        assert self.logprobs_processor is not None\n        finished = finish_reason is not None\n        delta = self.output_kind == RequestOutputKind.DELTA\n\n        # Prepare text and token_ids, based on delta mode\n        text = self.detokenizer.get_next_output_text(finished, delta)\n        if not delta:\n            token_ids = self.detokenizer.output_token_ids\n\n        # Prepare logprobs, based on delta mode\n        logprobs = self.logprobs_processor.logprobs\n        if delta and logprobs:\n            logprobs = logprobs[-len(token_ids) :]\n\n        return CompletionOutput(\n            index=self.request_index,\n            text=text,\n            token_ids=token_ids,\n            routed_experts=routed_experts,\n            logprobs=logprobs,\n            cumulative_logprob=self.logprobs_processor.cumulative_logprob,\n            finish_reason=str(finish_reason) if finished else None,\n            stop_reason=stop_reason if finished else None,\n        )",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/output_processor.py",
+      "lines": "L45-L96",
+      "what": "f1 队列：RequestOutputCollector——per-request 的单槽『邮箱』。aggregate 由 output_kind==DELTA 决定。put 是非阻塞的：空槽直接放并 set Event；若槽里已有 RequestOutput 且新来的也是，则调 self.output.add(output, aggregate)『生产者跑在消费者前面时归并 deltas』；异常优先覆盖。get 阻塞在 ready Event 上，取走后清槽 clear Event；get_nowait 非阻塞快取。",
+      "code": "class RequestOutputCollector:\n    \"\"\"\n    Collects streamed RequestOutputs per individual request,\n    for hand-off to the consuming asyncio generate task.\n\n    When streaming deltas, RequestOutputs are merged if the\n    producer gets ahead of the consumer.\n    \"\"\"\n\n    def __init__(self, output_kind: RequestOutputKind, request_id: str):\n        self.aggregate = output_kind == RequestOutputKind.DELTA\n        self.request_id = request_id\n        self.output: RequestOutput | PoolingRequestOutput | Exception | None = None\n        self.ready = asyncio.Event()\n\n        self._input_stream_task: asyncio.Task | None = None\n\n    def put(self, output: RequestOutput | PoolingRequestOutput | Exception) -> None:\n        \"\"\"Non-blocking put operation.\"\"\"\n        if self.output is None or isinstance(output, Exception):\n            self.output = output\n            self.ready.set()\n        elif isinstance(self.output, RequestOutput) and isinstance(\n            output, RequestOutput\n        ):\n            # This ensures that request outputs with different request indexes\n            # (if n > 1) do not override each other.\n            self.output.add(output, aggregate=self.aggregate)\n        elif isinstance(self.output, PoolingRequestOutput) and isinstance(\n            output, PoolingRequestOutput\n        ):\n            self.output = output\n\n    async def get(self) -> RequestOutput | PoolingRequestOutput:\n        \"\"\"Get operation blocks on put event.\"\"\"\n        while (output := self.output) is None:\n            await self.ready.wait()\n        self.output = None\n        self.ready.clear()\n        if isinstance(output, Exception):\n            raise output\n        return output\n\n    def get_nowait(self) -> RequestOutput | PoolingRequestOutput | None:\n        \"\"\"Non-blocking get operation.\"\"\"\n        output = self.output\n        if output is not None:\n            self.output = None\n            self.ready.clear()\n        if isinstance(output, Exception):\n            raise output\n        return output",
+      "elide": ["close/__del__/_input_stream_task（L98-L106）属流式输入任务清理，正文一句带过"]
+    },
+    {
+      "path": "vllm/outputs.py",
+      "lines": "L145-L173",
+      "what": "RequestOutput.add：DELTA 归并的真正实现，被 RequestOutputCollector.put 调用。按 CompletionOutput.index 配对：aggregate=True（DELTA）时拼接 text/token_ids/logprobs、刷新 cumulative_logprob/finish_reason/stop_reason；aggregate=False（CUMULATIVE）时整体替换。新 index（如 n>1 的另一子序列）则 append——这正是注释里『不同 request index 不互相覆盖』的保证。",
+      "code": "    def add(self, next_output: \"RequestOutput\", aggregate: bool) -> None:\n        \"\"\"Merge subsequent RequestOutput into this one\"\"\"\n\n        self.finished |= next_output.finished\n        self.kv_transfer_params = next_output.kv_transfer_params\n\n        for next_completion in next_output.outputs:\n            for i, completion in enumerate(self.outputs):\n                if completion.index == next_completion.index:\n                    if aggregate:\n                        # Merge outputs with same index\n                        completion.text += next_completion.text\n                        if not isinstance(completion.token_ids, MutableSequence):\n                            completion.token_ids = list(completion.token_ids)\n                        completion.token_ids.extend(next_completion.token_ids)\n                        if next_completion.logprobs:\n                            assert completion.logprobs is not None\n                            completion.logprobs.extend(next_completion.logprobs)  # type: ignore[arg-type]\n                        completion.cumulative_logprob = (\n                            next_completion.cumulative_logprob\n                        )\n                        completion.finish_reason = next_completion.finish_reason\n                        completion.stop_reason = next_completion.stop_reason\n                    else:\n                        # Replace the output with the new one\n                        self.outputs[i] = next_completion\n                    break\n            else:\n                self.outputs.append(next_completion)",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/async_llm.py",
+      "lines": "L576-L586",
+      "what": "f3 消费者：generate() 的拉取-yield 循环，与 output_handler 生产者形成生产者-消费者。get_nowait() or await get() 的写法是性能优化（注释：尽量非阻塞 drain，避免高负载下的任务切换）。finished 由 out.finished 驱动；STREAM_FINISHED 哨兵不 yield 给调用者，只用来终止循环。",
+      "code": "            # The output_handler task pushes items into the queue.\n            # This task pulls from the queue and yields to caller.\n            finished = False\n            while not finished:\n                # Note: drain queue without await if possible (avoids\n                # task switching under load which helps performance).\n                out = q.get_nowait() or await q.get()\n\n                # Note: both OutputProcessor and EngineCore handle their\n                # own request cleanup based on finished.\n                assert isinstance(out, RequestOutput)\n                finished = out.finished\n                if out is not STREAM_FINISHED:\n                    yield out",
+      "elide": ["外层 add_request / 各类 except 错误处理（L557-L635）属 ch04 已讲的请求生命周期，正文只引用此循环体"]
+    },
+    {
+      "path": "vllm/v1/engine/detokenizer.py",
+      "lines": "L95-L142",
+      "what": "BaseIncrementalDetokenizer.update：增量去 token 的入口。stop_terminated 且不含停止串入输出时跳过最后一个 token 的去 token（但仍记入 token_ids）；逐 token 调抽象 decode_next 追加到 output_text；min_tokens 之前不允许停止串生效（推进 stop_check_offset）；最后 check_stop_strings 在新增字符范围内查停止串，命中则按规则截断 output_text 并返回 stop_string。",
+      "code": "    def update(self, new_token_ids: list[int], stop_terminated: bool) -> str | None:\n        \"\"\"\n        Update RequestState for the request_id by:\n            1) Detokenize the new token ids incrementally.\n            2) Evaluate stop criteria.\n\n        Return matched stop string or None.\n        \"\"\"\n        if not new_token_ids:\n            # Skip detokenization if no new token ids.\n            return None\n\n        if stop_terminated and not self.include_stop_str_in_output:\n            # If stop-terminated, exclude last token from detokenization\n            # based on include_stop_str_in_output parameter.\n            skipped_stop_token_id = new_token_ids[-1]\n            new_token_ids = new_token_ids[:-1]\n        else:\n            skipped_stop_token_id = None\n\n        # 1) Detokenize the new token ids incrementally.\n        stop_check_offset = len(self.output_text)\n        for new_token_id in new_token_ids:\n            self.token_ids.append(new_token_id)\n            self.output_text += self.decode_next(new_token_id)\n            # Support min_tokens, see https://github.com/vllm-project/vllm/pull/22014\n            if self.min_tokens and self.num_output_tokens() <= self.min_tokens:\n                stop_check_offset = len(self.output_text)\n\n        if skipped_stop_token_id is not None:\n            # Cleanup after skipping detokenization.\n            self.token_ids.append(skipped_stop_token_id)\n\n        # 2) Evaluate stop strings.\n        stop_string = None\n        if self.stop and self.num_output_tokens() > self.min_tokens:\n            stop = check_stop_strings(\n                output_text=self.output_text,\n                new_char_count=len(self.output_text) - stop_check_offset,\n                stop=self.stop,\n                include_in_output=self.include_stop_str_in_output,\n            )\n            if stop is not None:\n                stop_string, truncate_to = stop\n                if truncate_to != -1:\n                    self.output_text = self.output_text[:truncate_to]\n\n        return stop_string",
+      "elide": ["Fast/Slow 两个具体 decode_next 实现（DecodeStream vs detokenize_incrementally）属 tokenizer 内部，正文用一句区分『Fast 走 tokenizers 库 DecodeStream，Slow 走 python 增量 detokenize_incrementally』，不展开 byte-fallback 细节"]
+    },
+    {
+      "path": "vllm/v1/engine/detokenizer.py",
+      "lines": "L148-L164",
+      "what": "get_next_output_text：delta vs 全量文本的产出口，被 _new_completion_output 调用。delta=True 只回 _last_output_text_offset 之后的新增文本并推进 offset；delta=False 回全量。stop_buffer_length 是为『排除停止串』时少回尾部 buffer 个字符（未 finished 时），避免把可能属于停止串的尾巴提前 yield 出去。",
+      "code": "    def get_next_output_text(self, finished: bool, delta: bool) -> str:\n        \"\"\"If delta is True, only new text since the last call to\n        this method is returned\"\"\"\n\n        # We return the full output text if the sequence is finished.\n        buffer_length = 0 if finished else self.stop_buffer_length\n        if not delta:\n            if not buffer_length:\n                return self.output_text\n            return self.output_text[:-buffer_length]\n\n        length = len(self.output_text) - buffer_length\n        last_offset = self._last_output_text_offset\n        if last_offset < length:\n            self._last_output_text_offset = length\n            return self.output_text[last_offset:length]\n        return \"\"",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/parallel_sampling.py",
+      "lines": "L100-L126",
+      "what": "ParentRequest.get_outputs：n>1 的子→父聚合核心。子完成时从 child_requests 移除（若不在集合里说明已在上一步完成并返回过，标记 already_finished_and_returned 以免重复发给客户端）。流式（非 FINAL_ONLY）：直接转发当前子输出；FINAL_ONLY：把子输出按 index 填进 output_aggregator，仅当所有子都完成（child_requests 空）才一次性返回全部 n 个。finished = 所有子都完成。",
+      "code": "    def get_outputs(\n        self,\n        child_request_id: str,\n        completion_output: CompletionOutput,\n    ) -> tuple[list[CompletionOutput], bool]:\n        already_finished_and_returned: bool = False\n        if completion_output.finished():\n            if child_request_id in self.child_requests:\n                self.child_requests.remove(child_request_id)\n            else:\n                # child request ID is not available in child_requests\n                # which means the request had finished in previous\n                # batch step and returned to the client earlier\n                already_finished_and_returned = True\n\n        if self.sampling_params.output_kind != RequestOutputKind.FINAL_ONLY:\n            # If streaming, just return the current output\n            #\n            # DO NOT output finished and already returned child request to client again\n            outputs = [] if already_finished_and_returned else [completion_output]\n        else:\n            # If not streaming, aggregate the n final outputs.\n            self.output_aggregator[completion_output.index] = completion_output\n            outputs = [] if self.child_requests else self.output_aggregator\n\n        finished = not self.child_requests\n        return outputs, finished",
+      "elide": ["_get_child_sampling_params / get_child_info（L52-L94）属请求拆分侧（ch04/input 侧已涉及），本章只引用聚合侧"]
+    },
+    {
+      "path": "vllm/v1/engine/output_processor.py",
+      "lines": "L689-L701",
+      "what": "_finish_request：完成请求的注销。从 request_states 弹出；从 external_req_ids[external] 反向映射中移除内部 id，空则删键；若父请求且其 child_requests 已空则弹出 parent_requests。这是 process_outputs 完成分支调用的清理逻辑，确保 has_unfinished_requests/get_num_unfinished_requests 准确。",
+      "code": "    def _finish_request(self, req_state: RequestState) -> None:\n        req_id = req_state.request_id\n        self.request_states.pop(req_id)\n\n        internal_ids = self.external_req_ids[req_state.external_req_id]\n        internal_ids.remove(req_id)\n        if not internal_ids:\n            del self.external_req_ids[req_state.external_req_id]\n\n        # Remove parent request if applicable.\n        parent_req = req_state.parent_req\n        if parent_req and not parent_req.child_requests:\n            self.parent_requests.pop(parent_req.request_id, None)",
+      "elide": []
+    }
+  ],
+
+  "key_classes": [
+    {"name": "OutputProcessor", "file": "vllm/v1/engine/output_processor.py", "responsibility": "Stage 3 总入口。持有 request_states(内部 id→RequestState)、parent_requests、external_req_ids(外部 id→[内部 id]) 三张表。process_outputs 是唯一遍历整批的单循环；abort_requests/propagate_error 处理异常路径；_finish_request 注销。同时服务 AsyncLLM（入队）与 LLMEngine（返回列表）两条路径。"},
+    {"name": "RequestState", "file": "vllm/v1/engine/output_processor.py", "responsibility": "per-request 累积状态：detokenizer、logprobs_processor、queue(RequestOutputCollector)、parent_req、output_kind、stream_interval/sent_tokens_offset、is_prefilling、num_cached_tokens、stats。make_request_output 把本步增量变成 RequestOutput（含 stream_interval 节流、DELTA/FINAL_ONLY 分支、父聚合分流）。from_new_request 是工厂。"},
+    {"name": "RequestOutputCollector", "file": "vllm/v1/engine/output_processor.py", "responsibility": "f1：per-request 单槽队列/邮箱，连接 output_handler 生产者与 generate() 消费者。aggregate(DELTA) 时 put 调 RequestOutput.add 归并落后于消费者的 deltas；asyncio.Event 做唤醒；put 非阻塞、get 阻塞、get_nowait 快取。"},
+    {"name": "IncrementalDetokenizer", "file": "vllm/v1/engine/detokenizer.py", "responsibility": "增量去 token + 停止串检测。基类 update 逐 token 追加 output_text、min_tokens 保护、check_stop_strings 截断；get_next_output_text 给 delta/全量文本。from_new_request 按 tokenizer 类型选 Fast(DecodeStream)/Slow(python 增量)/空(无 tokenizer) 三种实现。"},
+    {"name": "LogprobsProcessor", "file": "vllm/v1/engine/logprobs.py", "responsibility": "sample/prompt logprobs 增量累积与去 token。update_from_output 分发到 _update_sample_logprobs（累 cumulative_logprob）与 _update_prompt_logprobs；pop_prompt_logprobs 在 DELTA 下一次性吐出并清空 prompt logprobs。"},
+    {"name": "ParentRequest", "file": "vllm/v1/engine/parallel_sampling.py", "responsibility": "n>1 并行采样的父请求聚合器。get_outputs 把各子 CompletionOutput 按 index 聚合（流式转发 / FINAL_ONLY 攒齐 n 个一次返回），并维护 child_requests 决定整体 finished。"},
+    {"name": "OutputProcessorOutput", "file": "vllm/v1/engine/output_processor.py", "responsibility": "process_outputs 的返回值：request_outputs(仅 LLMEngine 同步路径非空) + reqs_to_abort(因检测到停止串而需反向 abort EngineCore 的请求)。"}
+  ],
+
+  "data_flow": [
+    "1. async_llm.output_handler: engine_core.get_output_async() 拉到一批 EngineCoreOutputs（f3 生产者起点）",
+    "2. async_llm.output_handler: 按 chunk_size 分块，逐块调 OutputProcessor.process_outputs(slice, ts, iteration_stats)",
+    "3. OutputProcessor.process_outputs: for each EngineCoreOutput → request_states.get(req_id)；None(已 abort) 则跳过",
+    "4. OutputProcessor._update_stats_from_output: 累计本步 iteration/request stats",
+    "5. RequestState: is_prefilling 首次翻转为 False，记 num_cached_tokens（来自 prefill_stats）",
+    "6. IncrementalDetokenizer.update: 增量去 token 进 output_text + check_stop_strings；命中停止串→finish_reason=STOP/stop_reason=stop_string",
+    "7. LogprobsProcessor.update_from_output: 增量累积 sample/prompt logprobs",
+    "8. RequestState.make_request_output: FINAL_ONLY 节流 → stream_interval 节流 → _new_completion_output(delta 文本/token/logprob) → parent_req 分流",
+    "9a. ParentRequest.get_outputs (若 n>1): 子→父聚合，返回 outputs + finished；空则 make_request_output 返回 None",
+    "10. process_outputs 分叉：req_state.queue 非空(AsyncLLM)→queue.put(request_output)；否则(LLMEngine)→request_outputs.append",
+    "11. RequestOutputCollector.put: 空槽放+set Event；已有 RequestOutput→add(归并 DELTA)；异常优先覆盖",
+    "12. async_llm.generate (f3 消费者): out = q.get_nowait() or await q.get() → 非 STREAM_FINISHED 则 yield；finished 终止",
+    "13. 完成分支: _finish_request 注销三张表；若 EngineCore 未标完成(stop-string 提前停)→reqs_to_abort.append → output_handler 反向 abort_requests_async EngineCore",
+    "14. _update_stats_from_finished + do_tracing(可选)",
+    "15. process_outputs 返回 OutputProcessorOutput(request_outputs, reqs_to_abort)；output_handler 断言 AsyncLLM 路径下 request_outputs 为空"
+  ],
+
+  "design_decisions": [
+    {"decision": "process_outputs 是『唯一应遍历整批 EngineCoreOutputs 的函数』，凡需 touch 每个元素的逻辑都塞进这个循环", "why": "V1 显式把对整批的 python 循环次数压到最少以降低系统开销；分散遍历会引入额外 O(batch) 循环和缓存不友好", "evidence": "vllm/v1/engine/output_processor.py:L590-L598"},
+    {"decision": "同一份 OutputProcessor 同时服务 AsyncLLM(入 per-request 队列) 与 LLMEngine(返回列表)，靠 req_state.queue 是否为 None 分叉", "why": "复用 Stage 3 全部去 token/logprob/停止串/聚合逻辑，避免同步/异步两套实现", "evidence": "vllm/v1/engine/output_processor.py:L643-L660"},
+    {"decision": "f1 per-request RequestOutputCollector 单槽队列 + DELTA 归并", "why": "异步多路复用：每请求一个独立邮箱使 generate() 任务互不干扰；生产者(output_handler)跑在消费者(generate)前面时，把多个 delta 用 RequestOutput.add 归并成一个，避免无界堆积且保证 delta 不丢", "evidence": "vllm/v1/engine/output_processor.py:L45-L72; vllm/outputs.py:L145-L173"},
+    {"decision": "f3 背景 output_handler 任务 vs generate() 生产者-消费者解耦", "why": "单个背景任务集中拉 EngineCore、跑 process_outputs、推队列；N 个 generate() 各自从自己的队列消费——把『一次拉一批、扇出到 N 个流』的多路复用做成单生产者多消费者，且 chunk + asyncio.sleep(0) 避免长时间阻塞事件循环", "evidence": "vllm/v1/engine/async_llm.py:L656-L691; L576-L586"},
+    {"decision": "stream_interval>1 时按『完成/首token/攒够 interval』节流发送", "why": "降低高频小增量带来的序列化/网络/事件循环开销；DELTA 模式用 sent_tokens_offset 保证攒批后仍只发未发过的 token", "evidence": "vllm/v1/engine/output_processor.py:L285-L306"},
+    {"decision": "停止串由 detokenizer 在 OutputProcessor 侧检测，命中后若 EngineCore 未自行停止则反向 abort", "why": "停止串是文本级（跨 token）判定，只有去 token 后才知道；EngineCore 只懂 token 级停止，故需 OutputProcessor 反向通知 abort 以释放 EngineCore 资源", "evidence": "vllm/v1/engine/output_processor.py:L632-L637, L672-L675; async_llm.py:L685-L689"},
+    {"decision": "n>1 父聚合：流式逐子转发、FINAL_ONLY 攒齐 n 个一次返回；用 child_requests 集合判 finished", "why": "对客户端，n>1 是一个外部请求返回 n 个 CompletionOutput；按 index 聚合 + already_finished_and_returned 防重复，保证语义正确", "evidence": "vllm/v1/engine/parallel_sampling.py:L100-L126; output_processor.py:L321-L331"},
+    {"decision": "DELTA 模式下 prompt logprobs 在 prefill 末尾一次性 pop 出来再忘记", "why": "prompt logprobs 跨多个 prefill chunk 累积，DELTA 语义要求它们整体在一次输出中返回而非分摊", "evidence": "vllm/v1/engine/logprobs.py:L189-L206; output_processor.py:L357-L361"},
+    {"decision": "已 abort 请求的 EngineCore 输出在 process_outputs 里静默跳过(request_states.get 为 None)", "why": "abort 与 EngineCore 输出之间存在天然竞态（abort 已删 state 但 EngineCore 仍可能吐出在途 token），跳过是幂等且安全的", "evidence": "vllm/v1/engine/output_processor.py:L604-L607"},
+    {"decision": "output_handler 异常时 propagate_error 把异常 put 进所有 RequestState 的队列", "why": "背景任务死亡需让每个等待的 generate() 也抛错而非永久挂起；RequestOutputCollector.put 对 Exception 优先覆盖、get 重新 raise", "evidence": "vllm/v1/engine/output_processor.py:L439-L444; L84-L86; async_llm.py:L703-L705"}
+  ],
+
+  "theory": [
+    {"topic": "增量去 token 的正确性与复杂度", "content": "逐 token 去 token 不能简单地 decode(单 token) 再拼接，因为 BPE/byte-fallback 下相邻 token 的文本边界相互依赖（多字节 UTF-8 可能跨 token）。Fast 实现用 tokenizers 的 DecodeStream 维护内部状态；Slow 实现用 prefix_offset/read_offset 滑窗（detokenize_incrementally）。单步成本约 O(单 token 解码)，全序列 O(L)；stop_buffer_length 保证流式时不会把可能属于停止串的尾字符过早发出（需回收，见伏笔解释）。"},
+    {"topic": "停止串检测的窗口", "content": "check_stop_strings 只在新增字符范围内搜索（stop_index 起点 = 1 - new_char_count - len(stop_str)），避免每步重扫全文 → 摊还 O(L) 而非 O(L^2)。min_tokens 之前不允许停止串生效（推进 stop_check_offset）。"},
+    {"topic": "单生产者-多消费者多路复用", "content": "EngineCore 一步产出整批（混合 N 个请求的 token）；output_handler 单任务解复用：按 req_id 路由到各 RequestState，再 put 到各自的 RequestOutputCollector。N 个 generate() 协程各阻塞在自己队列的 asyncio.Event 上。这把『1 批 → N 流』变成单生产者多消费者，避免 N 个任务争抢同一队列。DELTA 归并是背压安全阀：消费者慢时多个 delta 合并为一个，内存 O(每请求 1 槽) 而非 O(未消费 delta 数)。"},
+    {"topic": "stream_interval 节流的权衡", "content": "interval=k 时把发送频率降到约 1/k（首 token 与完成强制发），用稍高的首字延迟换取更低的 per-token 序列化/事件循环开销；DELTA 下 sent_tokens_offset 保证语义不变（仍是无重叠的增量拼接）。"}
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "do_tracing 整个方法及 process_outputs 里 self.tracing_enabled 分支（output_processor.py:L681-L682, L706-L766）", "why_safe": "OpenTelemetry 链路追踪是可选观测特性，删后输出处理主控制流不变；tracing_enabled 默认 False"},
+      {"what": "_update_stats_from_output / _update_stats_from_finished / update_scheduler_stats / do_tracing 内部对 IterationStats/RequestStateStats/LoRARequestStates 的细节累积（保留调用点占位）", "why_safe": "metrics/stats 属独立子系统（前序章节），精简版可把 iteration_stats 传 None 走早返回分支，主输出路径与去 token/聚合无关"},
+      {"what": "LoRA 相关：lora_request/lora_name/lora_states 字段与 LoRARequestStates 调用（output_processor.py:L157-L158, L430, L482, L808）", "why_safe": "LoRA 是正交特性，删后单请求输出处理正确；精简版聚焦核心数据流"},
+      {"what": "pooling 分支：pooling_output 路径、_new_pooling_output、PoolingRequestOutput、EMPTY_CPU_TENSOR（output_processor.py:L310-L315, L409-L410）", "why_safe": "本章聚焦生成式(completion)请求；池化/嵌入模型是另一条产品线，删后生成路径完整"},
+      {"what": "streaming_input / resumable 流式输入：StreamingUpdate、input_chunk_queue、apply_streaming_update、_update_streaming_request_state、process_outputs 里 streaming_input 分支（output_processor.py:L115-L127, L182-L206, L539-L570, L652-L653, L664-L669）与 RequestOutputCollector._input_stream_task/close/__del__", "why_safe": "流式『输入』(resumable) 是边角实验特性，与 Stage 3 主线（流式输出）正交；删后普通一次性 prompt 请求路径完整正确"},
+      {"what": "logprobs 的 UTF-8 字节回退纠正：_correct_decoded_token / _verify_tokens / _get_sampled_context_ids（logprobs.py:L208-L346）", "why_safe": "byte-fallback 多字节字符的 U+FFFD 纠正是去 token 正确性的边角优化，精简版可对 logprobs token 直接用 convert_ids_list_to_tokens 结果；不影响 logprobs 数值与主控制流"},
+      {"what": "detokenizer 的 byte-fallback 异常恢复：_protected_step 的 INVALID_PREFIX 重置分支、added_token_ids/spaces_between_special_tokens 处理（detokenizer.py:L185-L242 的容错与特殊 token 间距细节）", "why_safe": "属罕见 tokenizer 边角容错，精简版 decode_next 走正常路径即可；增量去 token 的核心算法（output_text 累积 + offset）保留"},
+      {"what": "routed_experts / kv_transfer_params 在输出对象上的透传字段", "why_safe": "MoE 专家路由记录与 P/D 分离 KV 传输参数是正交特性，删后核心 CompletionOutput/RequestOutput 字段完整"}
+    ],
+    "must_keep": [
+      {"symbol": "process_outputs", "why": "本章主轴：唯一遍历整批的单循环，读者必须看到完整 5 步（stats→prefill 翻转→去 token+停止串→logprobs→造输出/入队/完成清理）"},
+      {"symbol": "OutputProcessor", "why": "Stage 3 总入口与三张映射表的持有者"},
+      {"symbol": "RequestState", "why": "per-request 累积状态容器，writer 需讲清它聚合 detokenizer/logprobs/queue/parent_req"},
+      {"symbol": "make_request_output", "why": "节流与分流闸门：FINAL_ONLY/stream_interval/DELTA/父聚合都在此"},
+      {"symbol": "_new_completion_output", "why": "delta vs 全量 的 text/token_ids/logprobs 产出，DELTA 语义关键"},
+      {"symbol": "RequestOutputCollector", "why": "f1 必须回收：per-request 队列本体"},
+      {"symbol": "aggregate", "why": "DELTA 归并的开关（output_kind==DELTA），决定 put 是否调 add"},
+      {"symbol": "put", "why": "RequestOutputCollector 生产者侧入口，含 DELTA 归并与异常优先逻辑"},
+      {"symbol": "get", "why": "消费者侧阻塞取，配合 asyncio.Event"},
+      {"symbol": "get_nowait", "why": "generate() 的非阻塞快取路径（性能优化点）"},
+      {"symbol": "ready", "why": "asyncio.Event，f1/f3 唤醒机制的核心同步原语"},
+      {"symbol": "add", "why": "RequestOutput.add——DELTA 归并的真正实现（拼接 text/token/logprob 或替换）"},
+      {"symbol": "IncrementalDetokenizer", "why": "去 token 子系统接口，writer 需讲增量去 token"},
+      {"symbol": "update", "why": "detokenizer 增量去 token + 停止串检测入口"},
+      {"symbol": "get_next_output_text", "why": "delta/全量文本产出口，被 _new_completion_output 调用"},
+      {"symbol": "check_stop_strings", "why": "停止串匹配与截断算法，writer 需讲清窗口与截断规则"},
+      {"symbol": "output_token_ids", "why": "供 DELTA 切片与全量 token 的属性"},
+      {"symbol": "sent_tokens_offset", "why": "stream_interval 节流下的已发偏移，DELTA 攒批正确性关键"},
+      {"symbol": "stream_interval", "why": "节流参数本身"},
+      {"symbol": "LogprobsProcessor", "why": "logprobs 子系统接口"},
+      {"symbol": "update_from_output", "why": "logprobs 增量累积入口"},
+      {"symbol": "pop_prompt_logprobs", "why": "DELTA 下 prompt logprobs 一次性吐出的语义"},
+      {"symbol": "ParentRequest", "why": "n>1 父聚合器"},
+      {"symbol": "get_outputs", "why": "子→父聚合核心（流式转发 / FINAL_ONLY 攒齐）"},
+      {"symbol": "child_requests", "why": "决定整体 finished 的子请求集合"},
+      {"symbol": "output_aggregator", "why": "FINAL_ONLY 下按 index 攒 n 个输出的数组"},
+      {"symbol": "_finish_request", "why": "完成注销三张表，读者需理解请求生命周期收尾"},
+      {"symbol": "reqs_to_abort", "why": "停止串触发的反向 abort 列表，连到 output_handler"},
+      {"symbol": "make_request_output", "why": "已列（去重忽略）"},
+      {"symbol": "is_prefilling", "why": "prefill→decode 翻转标志，与 num_cached_tokens 记录相关"},
+      {"symbol": "from_new_request", "why": "RequestState/IncrementalDetokenizer/LogprobsProcessor 的工厂，读者需理解三者如何随请求一起建立"}
+    ]
+  },
+
+  "diagram_plan": [
+    {"name": "stage3-overview", "type": "architecture/flow", "spec": "f3 单生产者-多消费者全景：EngineCore --get_output_async--> output_handler(单背景任务) --process_outputs--> [RequestState_1..N] --put--> [RequestOutputCollector_1..N 队列] --get/get_nowait--> [generate()_1..N 协程] --yield--> 客户端。标出 chunk 分块、asyncio.sleep(0) 让步、reqs_to_abort 反向箭头回 EngineCore。Roadmap 高亮：Stage 3 输出处理节点。", "roadmap_highlight": "ch08 Stage3 输出处理"},
+    {"name": "process-outputs-loop", "type": "flowchart", "spec": "process_outputs 单循环 5 步竖向流程：取 state(None→跳过) → stats → prefill 翻转 → detokenize.update(命中停止串置 finish_reason) → logprobs.update → make_request_output(三道闸门:FINAL_ONLY/stream_interval/父聚合) → queue.put 或 list.append → 完成则 _finish_request + reqs_to_abort。"},
+    {"name": "delta-merge-mailbox", "type": "state/sequence", "spec": "RequestOutputCollector DELTA 归并时序：消费者慢时，put(delta1)→槽=d1；put(delta2)→槽=add(d1,d2) 文本/ token 拼接；consumer get()→拿到合并结果。对比 CUMULATIVE(替换) vs DELTA(拼接)。展示 asyncio.Event set/clear。"},
+    {"name": "n-gt-1-aggregation", "type": "state/table", "spec": "n=3 父聚合两种模式：流式(逐子 delta 转发, child_requests 递减) vs FINAL_ONLY(output_aggregator[index] 填格, 三格齐才整体返回, finished=child_requests 空)。"},
+    {"name": "stream-interval-throttle", "type": "timeline/table", "spec": "stream_interval=4 的发送决策表：token#0(首,发) #1-3(攒,不发) #4(攒够,发增量[1..4]) ... 完成(强发余量)。DELTA 下 sent_tokens_offset 推进可视化。"}
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recover": [
+      {"id": "f1", "desc": "per-request RequestOutputCollector 队列（异步多路复用的关键）", "planted_in": "ch04", "recover_how": "本章正式展开 RequestOutputCollector：单槽邮箱 + asyncio.Event + DELTA 归并(put 调 RequestOutput.add)，说明它如何让 output_handler(单生产者) 扇出到 N 个 generate()(多消费者) 而互不干扰，并用归并做背压安全阀。引用 output_processor.py:L45-L96 与 outputs.py:L145-L173。"},
+      {"id": "f3", "desc": "output_handler 背景 asyncio 任务与 generate() 的生产者-消费者关系", "planted_in": "ch04", "recover_how": "本章展开 output_handler 循环(async_llm.py:L656-L691, 生产者)与 generate() 拉取循环(L576-L586, 消费者)：前者拉 EngineCore 一批→分块跑 process_outputs→put 队列；后者 get_nowait()/get() 拉自己队列→yield。点明 chunk+sleep(0) 让步、STREAM_FINISHED 哨兵、propagate_error 错误广播。"}
+    ]
+  }
+}
