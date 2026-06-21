@@ -96,6 +96,7 @@ jq -r '.overall_verdict' $D/reviews/review-report.json
 1. **进度真相** = `ls instances/vllm/artifacts/`（有目录=已写）。队列与参数 = `instances/vllm/book/cartography/chapter-queue.json`（每章 slug/focus/highlight/paths/mode/deps）。
 2. **选下一章**：chapter-queue 里 mode=code 且无 artifacts 目录的、依赖已满足的最前一章（数字序）。**ch01/ch02 是 mode=meta（概览，无精简版），留到所有 code 章之后，用定制轻量流写**。
 3. **发车**：把 `.claude/workflows/chapter-pipeline.js` 顶部的 `CFG` 改成该章参数（本机 args 注入不可靠，靠 CFG），`node --check` 后 `Workflow({scriptPath, args:{同 CFG}})`。
+3b. **挂看门狗（必做，别盲等）**：workflow **崩溃是静默的**——只等完成通知会永远等不到。发车后立刻 `Bash(run_in_background)` 一个 for-loop：每 60s 检 `{chapter_dir}/reviews/review-report.json`，出现即报"完成"、逾期(~70min)报"逾期可能崩溃"。崩了就 `TaskStop {taskId}` 再 `Workflow({scriptPath, resumeFromRunId})`（缓存命中已完成阶段，从崩溃点重跑）。判活/判崩：resume 报 "still running" = 活着（别 stop）；"started 无 result" 只是进行中，不等于崩溃。
 4. **验收**（流水线完成后，逐条亲跑）：5 linter（fidelity/chapter_structure/formulas/source_grounding/diagrams）全过 + pytest 过 + 脱节体检（叙事引真 vllm/ ≫ 引精简版 implementation/）+ **亲眼看 1 张图确认中文渲染**（lint 查不出 rsvg 与否）+ review verdict=APPROVED + 无 negotiable=false 未修项。
 5. **提交**（事故教训：通过即提交）：`git add` 该章 artifacts + bible + trace，commit（带 Co-Authored-By）。
 6. **回到 2**，直到 ch01-ch33 全 done；其间**每完成一个 Part** 跑一次连贯性审计 + 批量润色（读各章 review-report.json 的 negotiable 项，派 writer 批量定点修）。

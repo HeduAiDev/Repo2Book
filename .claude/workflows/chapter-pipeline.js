@@ -14,14 +14,14 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch06',
-  slug: 'ch06-input-processor',
-  focus: 'Parallel Sampling 扇出 (n>1)：ParentRequest 派生 n 个独立 child EngineCoreRequest（唯一 id + 确定性种子递进），为何独立调度优于批量 n；兑现 ch04 延迟的 n>1',
-  highlight: 'input-processor',
+  chapter_id: 'ch09',
+  slug: 'ch09-detokenization',
+  focus: '增量去 token 化与 stop string：IncrementalDetokenizer 层级(Fast tokenizers.DecodeStream vs Slow Python)、stop-string 缓冲 holdback、min_tokens 守卫、UTF-8 多字节边界恢复',
+  highlight: 'output-processor',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
-  paths: ['vllm/v1/engine/parallel_sampling.py', 'vllm/v1/engine/async_llm.py', 'vllm/v1/engine/input_processor.py'],
+  paths: ['vllm/v1/engine/detokenizer.py', 'vllm/v1/engine/output_processor.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
