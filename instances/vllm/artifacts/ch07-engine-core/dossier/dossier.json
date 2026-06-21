@@ -1,0 +1,138 @@
+{
+  "chapter_id": "ch07-engine-core",
+  "title": "IPC 边界：EngineCoreClient 层级、ZMQ DEALER、字节标签协议、msgpack 编解码、EngineCoreProc 输入/输出线程、TensorIpc 零拷贝",
+  "scope_note": "本章揭开 ch04 留下的两个黑盒：(1) ch04 用替身 InProcessEngineCore（'Stage2 IPC 接缝替身, 同名同签名, IPC 留 ch07'）占位的真实进程接缝 —— 它在生产中是 AsyncMPClient；(2) ch03 提到的 make_async_mp_client/AsyncMPClient 起子进程后，客户端与子进程之间到底如何通信。本章只讲 IPC 边界本身（client 三层 + ZMQ socket 拓扑 + 字节标签协议 + msgpack 多帧编解码 + EngineCoreProc 的两个 IO 线程 + 多模态张量零拷贝）。EngineCore 内部的 busy loop / scheduler / executor / batch_queue / 数据并行(DP) 细节不是本章主线（DP/EEP 弹性扩缩属另章），本章只在数据流必要处点到 run_busy_loop 如何消费 input_queue、生产 output_queue。",
+
+  "code_spine": [
+    "vllm/v1/engine/core_client.py:L80-L130  EngineCoreClient.make_client / make_async_mp_client —— 按 (multiprocess_mode, asyncio_mode) 选三种 client",
+    "vllm/v1/engine/core_client.py:L274-L364  InprocClient —— 进程内直连 EngineCore（无 ZMQ）",
+    "vllm/v1/engine/core_client.py:L460-L606  MPClient.__init__ —— ZMQ context / ROUTER input_socket(bind) + PULL output_socket / 等待每个 engine 的 ready / 编解码器 + TensorIpcSender 装配",
+    "vllm/v1/engine/__init__.py:L237-L251  EngineCoreRequestType —— 6 个十六进制字节标签 (ADD/ABORT/START_DP_WAVE/UTILITY/EXECUTOR_FAILED/WAKEUP)",
+    "vllm/v1/engine/core_client.py:L716-L818  SyncMPClient —— 后台线程 process_outputs_socket + _send_input 三帧多帧消息 + call_utility(Future)",
+    "vllm/v1/engine/core_client.py:L887-L1053  AsyncMPClient —— asyncio 版: _ensure_output_queue_task / process_outputs_socket 协程 / _send_input / call_utility_async(asyncio.Future)",
+    "vllm/v1/engine/core.py:L806-L920  EngineCoreProc.__init__ —— input_queue/output_queue + 起 process_input_sockets / process_output_sockets 两个 IO 线程",
+    "vllm/v1/engine/core.py:L1372-L1464  EngineCoreProc.process_input_sockets —— DEALER socket / 发 ready_payload / 收 type_frame 解字节标签 / 按类型用不同 decoder 解 data_frames / 投 input_queue",
+    "vllm/v1/engine/core.py:L1466-L1531  EngineCoreProc.process_output_sockets —— PUSH socket / 从 output_queue 取 (client_index, outputs) / encode_into 复用 buffer / send_multipart 零拷贝 track / ENGINE_CORE_DEAD 哨兵",
+    "vllm/v1/engine/core.py:L1164-L1223  EngineCore.run_busy_loop / _process_input_queue / _process_engine_step —— busy loop 消费 input_queue、生产 output_queue（IPC 的另一端消费者/生产者）",
+    "vllm/v1/engine/core.py:L1266-L1320  EngineCoreProc._handle_client_request —— busy loop 按字节标签分派 ADD/ABORT/UTILITY/...",
+    "vllm/v1/serial_utils.py:L166-L273  MsgpackEncoder.encode / encode_into / _encode_tensor —— 多帧编码: bufs[0] 主帧 + aux_buffers 零拷贝张量帧 + OOB 旁路",
+    "vllm/v1/serial_utils.py:L340-L425  MsgpackDecoder.decode / _decode_tensor —— 多帧解码: aux_buffers 索引零拷贝 / OOB dict 走 tensor_provider",
+    "vllm/v1/engine/tensor_ipc.py:L45-L179  TensorIpcSender / TensorIpcReceiver —— 多模态张量经 torch.multiprocessing.Queue 共享内存零拷贝 + drain-and-buffer 乱序重组"
+  ],
+
+  "key_classes": [
+    {"name": "EngineCoreClient", "file": "vllm/v1/engine/core_client.py", "responsibility": "抽象基类 + make_client 工厂。定义前端向 EngineCore 推请求/拉输出的统一接口（同步与 async_ 两套方法签名），三个子类用不同传输策略实现。这就是 ch04 三段式 Stage2 的真实接缝抽象。"},
+    {"name": "InprocClient", "file": "vllm/v1/engine/core_client.py", "responsibility": "进程内 client：直接持有一个 EngineCore 实例，add_request 直接调用、get_output 直接 step_fn()，无 ZMQ、无序列化、无 busy loop。用于 V0 风格 LLMEngine（同步、单进程）。它正是 ch04 替身 InProcessEngineCore 在真实代码里的对应物之一。"},
+    {"name": "MPClient", "file": "vllm/v1/engine/core_client.py", "responsibility": "多进程 client 基类：建立 ZMQ context、ROUTER input_socket(bind)、PULL output_socket，启动/连接 EngineCore 子进程，等待每个 engine 的 ready 握手，装配 MsgpackEncoder/Decoder 与可选 TensorIpcSender，并起后台线程监控子进程存活。"},
+    {"name": "SyncMPClient", "file": "vllm/v1/engine/core_client.py", "responsibility": "MPClient 的同步子类（用于 LLM 离线 API）：用 threading.Thread 跑 process_outputs_socket 把 EngineCoreOutputs 投入 queue.Queue；call_utility 用 concurrent.futures.Future 做请求-响应配对。"},
+    {"name": "AsyncMPClient", "file": "vllm/v1/engine/core_client.py", "responsibility": "MPClient 的 asyncio 子类（用于 AsyncLLM/OpenAI 服务）：用 asyncio.Task 跑 process_outputs_socket 协程把输出投入 asyncio.Queue；call_utility_async 用 asyncio.Future 配对。这是 ch04 生产路径真正用的 client。"},
+    {"name": "EngineCoreRequestType", "file": "vllm/v1/engine/__init__.py", "responsibility": "enum.Enum，值为单字节 hex bytes（ADD=b'\\x00' 等）。'so it can be sent over sockets without separate encoding step' —— 作为 ZMQ 多帧消息的首帧直接发送，省一次编码。"},
+    {"name": "EngineCoreProc", "file": "vllm/v1/engine/core.py", "responsibility": "EngineCore 的 ZMQ 包装子类，运行在后台进程。__init__ 起两个 IO 线程：process_input_sockets（DEALER 收、解码、投 input_queue）与 process_output_sockets（PUSH 发、编码 output_queue）。run_busy_loop 在主线程消费 input_queue、生产 output_queue。三者通过两个内部 queue.Queue 解耦，使 ZMQ IO/序列化与 GPU forward 重叠。"},
+    {"name": "MsgpackEncoder", "file": "vllm/v1/serial_utils.py", "responsibility": "自定义 msgpack 编码器：返回多帧序列 bufs（bufs[0] 为主结构帧，其后为大张量/ndarray 的零拷贝 backing buffer 帧）。enc_hook 处理 torch.Tensor / np.ndarray / MultiModal* / slice 等；小张量内联、大张量进 aux_buffers 或交给 OOB consumer。"},
+    {"name": "MsgpackDecoder", "file": "vllm/v1/serial_utils.py", "responsibility": "对应解码器：decode(bufs) 用 bufs[0] 解主结构、aux_buffers[idx] 零拷贝还原张量；遇到 OOB dict 占位则调用 oob_tensor_provider（TensorIpcReceiver）取真张量。"},
+    {"name": "OOBTensorConsumer / OOBTensorProvider", "file": "vllm/v1/serial_utils.py", "responsibility": "out-of-band 张量旁路协议：consumer(__call__) 在编码时被调用，返回 dict 占位（张量走带外通道）或 None（回退普通序列化）；provider 在解码时按 (dtype, shape, meta) 取回张量。TensorIpcSender 实现前者，TensorIpcReceiver 充当后者。"},
+    {"name": "TensorIpcData", "file": "vllm/v1/engine/tensor_ipc.py", "responsibility": "经 torch.multiprocessing.Queue 传递的载荷 dataclass：sender_id + message_id + tensor_id + 实际 tensor（已 share_memory_）。"},
+    {"name": "TensorIpcSender", "file": "vllm/v1/engine/tensor_ipc.py", "responsibility": "发送端（实现 OOBTensorConsumer）：把多模态张量 share_memory_() 后 put 进 queue，返回 {sender_id,message_id,tensor_id} 元数据嵌入 msgpack 主帧。new_message() 每条消息重置 tensor 计数。"},
+    {"name": "TensorIpcReceiver", "file": "vllm/v1/engine/tensor_ipc.py", "responsibility": "接收端（充当 OOBTensorProvider）：按元数据从 queue 取张量，用 drain-and-buffer 模式排空队列并缓冲，处理多生产者乱序到达，丢弃过期张量。"},
+    {"name": "BackgroundResources", "file": "vllm/v1/engine/core_client.py", "responsibility": "weakref.finalize 终结器持有的资源包（ctx/sockets/tasks/engine_manager），保证 client 被 GC 或构造中途异常时干净关闭 socket 与子进程，避免循环引用。含 validate_alive 检测 ENGINE_CORE_DEAD 帧并抛 EngineDeadError。"}
+  ],
+
+  "data_flow": [
+    "选型: EngineCoreClient.make_client(multiprocess, asyncio) -> InprocClient | SyncMPClient | AsyncMPClient（asyncio 但非多进程会 NotImplementedError）。AsyncLLM 走 make_async_mp_client -> AsyncMPClient（DP 时 DPAsyncMPClient/DPLBAsyncMPClient）。",
+    "装配(client 侧, MPClient.__init__): zmq.Context(io_threads=2) -> input_socket=ROUTER bind / output_socket=PULL connect -> launch_core_engines 起 EngineCoreProc 子进程 -> 在 input_socket 上轮询等待每个 core_engine 身份发来的 ready 帧 -> _apply_ready_response 同步回 max_model_len/num_gpu_blocks -> 建 MsgpackEncoder(oob=TensorIpcSender?) / MsgpackDecoder(EngineCoreOutputs)。",
+    "握手(engine 侧, process_input_sockets): EngineCoreProc 起 DEALER socket(identity=engine_index 2字节LE) connect 到 client 的 ROUTER -> 主动 send(ready_payload=msgpack(EngineCoreReadyResponse)) 作为首帧，让 ROUTER 知道该 DEALER 身份后才能回发。",
+    "发请求(client->engine, AsyncMPClient.add_request_async): request.client_index=client_index -> _send_input(ADD, request) -> encoder.encode(request) 得多帧 -> msg=(engine_identity, type.value, *encoded_frames) -> input_socket.send_multipart(copy=False[, track=True 当有张量 backing buffer])；含 tensor 时把 MessageTracker+对象存 pending_messages 防 GC。",
+    "收请求(engine 侧, process_input_sockets 循环): poller.poll -> recv_multipart(copy=False) 得 type_frame + data_frames -> request_type=EngineCoreRequestType(bytes(type_frame.buffer)) -> ADD 用 add_request_decoder（带 oob_tensor_provider=TensorIpcReceiver）解码并 preprocess_add_request；ABORT 也投 aborts_queue 以便急停 -> input_queue.put_nowait((type, request))。",
+    "消费(engine 主线程, run_busy_loop): _process_input_queue 取 input_queue 调 _handle_client_request 按字节标签分派(ADD->add_request / ABORT->abort_requests / UTILITY->反射调用方法 / WAKEUP->no-op / EXECUTOR_FAILED->raise) -> _process_engine_step 调 step_fn() -> 把每个 (client_index, EngineCoreOutputs) put_nowait 进 output_queue。",
+    "发输出(engine->client, process_output_sockets): 从 output_queue 取 (client_index, outputs) -> outputs.engine_index=engine_index -> encode_into(outputs, 复用buffer) 得多帧 -> sockets[client_index].send_multipart(copy=False, track=True) PUSH 回 client；含张量时把 (tracker,ref,buffer) 入 pending 待 zmq 用完回收 buffer。client_index==-1 走 coordinator socket。",
+    "收输出(client 侧, process_outputs_socket 线程/协程): recv_multipart(copy=False) -> resources.validate_alive(检测 ENGINE_CORE_DEAD) -> decoder.decode(frames) 还原 EngineCoreOutputs -> 若 utility_output 则 _process_utility_output 解决对应 Future；否则投 outputs_queue 供 get_output(_async) 拉取（即 ch04 output_handler 的上游）。",
+    "工具RPC(call_utility/_async): 生成 call_id(uuid1>>64) -> 建 Future 存 utility_results[call_id] -> _send_input(UTILITY,(client_index,call_id,method,args)) -> engine 侧 _handle_client_request 反射查 method、_convert_msgspec_args 还原参数类型、调用、把结果包成 UtilityOutput 回发 -> client 侧 _process_utility_output 用 call_id 找回 Future 置结果/异常。",
+    "多模态张量零拷贝(可选, mm_tensor_ipc=='torch_shm'): encode 时 _encode_tensor 把大张量交 TensorIpcSender.__call__ -> share_memory_() + queue.put(TensorIpcData) -> 返回 {sender_id,message_id,tensor_id} dict 嵌入 msgpack 主帧（张量本体不进 ZMQ 帧）。engine 侧 decode 时 _decode_tensor 见 dict -> TensorIpcReceiver(dtype,shape,meta) -> drain-and-buffer 从 queue 取回共享内存张量。",
+    "故障/关闭: 子进程异常 -> run_engine_core 调 _send_engine_dead 把 ENGINE_CORE_DEAD 哨兵投 output_queue -> output 线程 send 给所有 socket 后退出；client 监控线程 monitor_engine_cores 检测进程死亡置 engine_dead 并 shutdown。client GC/异常 -> BackgroundResources.__call__ 关 socket、cancel task、向 sync 输出线程发 shutdown 信号。"
+  ],
+
+  "design_decisions": [
+    {"decision": "三层 client（Inproc/Sync/Async）共享同一抽象基类与方法签名", "why": "把'请求语义'与'传输策略'解耦：同一套 add_request/get_output/abort 接口，进程内直连、同步多进程、异步多进程三种实现自由替换。这正是 ch04 把 Stage2 抽象成可替换接缝（书中用 InProcessEngineCore 替身演示）的真实落地。", "evidence": "vllm/v1/engine/core_client.py:L69-L103"},
+    {"decision": "请求类型用十六进制单字节 enum 作为 ZMQ 消息首帧，不经 msgpack 编码", "why": "request_type.value 是 b'\\x00'..b'\\x05'，可直接作为多帧消息第一帧发送，engine 侧 EngineCoreRequestType(bytes(type_frame.buffer)) 一步还原；省一次序列化、且类型与负载分帧便于按类型选不同 decoder。", "evidence": "vllm/v1/engine/__init__.py:L237-L251, vllm/v1/engine/core.py:L1442"},
+    {"decision": "client 侧 input_socket 用 ROUTER(bind)，engine 侧用 DEALER(connect, identity=engine_index)；output 方向 engine 用 PUSH、client 用 PULL", "why": "ROUTER 按 identity 帧把消息精确路由到指定 engine（多 DP engine 时按 rank 选），DEALER 自带 identity 让 ROUTER 知道回发地址；输出方向用 PUSH/PULL 单向汇聚多 engine 的输出到一个 client。DEALER 必须先发 ready 帧，ROUTER 才能回发。", "evidence": "vllm/v1/engine/core_client.py:L511-L533, vllm/v1/engine/core.py:L1388-L1423, L1483-L1488"},
+    {"decision": "EngineCoreProc 用两个 IO 线程 + 两个内部 queue.Queue 把 ZMQ socket 与 busy loop 解耦", "why": "ZMQ recv/send 与 msgpack 编解码会释放 GIL，独立线程让它们与主线程的 GPU forward 重叠；input_queue/output_queue 把'网络字节流'与'引擎步进'解耦，busy loop 永不直接碰 socket。", "evidence": "vllm/v1/engine/core.py:L825-L911, L884-L888(注释)"},
+    {"decision": "msgpack 多帧编码 + aux_buffers 零拷贝大张量/数组", "why": "小数组(<256B,VLLM_MSGPACK_ZERO_COPY_THRESHOLD)内联；大张量不复制进主帧，而把其 backing buffer 追加到 aux_buffers，主帧里只存索引；send_multipart(copy=False) 直接发这些 buffer 指针，解码端 aux_buffers[idx] 零拷贝还原。", "evidence": "vllm/v1/serial_utils.py:L166-L273, L389-L425"},
+    {"decision": "发送带张量的消息时用 track=True 保留 MessageTracker 与对象引用", "why": "copy=False 意味着 ZMQ 直接引用 Python 内存的 backing buffer；必须保留对象引用到 zmq 发送完成（tracker.done）才能释放，否则数据被 GC/复用会损坏。pending_messages/pending deque 做此事，并复用 bytearray buffer 减少分配。", "evidence": "vllm/v1/engine/core_client.py:L600-L636, L804-L810, vllm/v1/engine/core.py:L1517-L1531"},
+    {"decision": "UTILITY 请求用 (call_id, method, args) + Future 实现跨进程 RPC", "why": "ZMQ 是单向流，没有内建 request-response；用唯一 call_id 把发出的 Future 与回来的 UtilityOutput 配对，engine 侧反射调用任意 EngineCore 方法（get_supported_tasks/profile/add_lora/collective_rpc...）。_convert_msgspec_args 把 msgpack 还原的原生类型转回 msgspec.Struct 参数。", "evidence": "vllm/v1/engine/core_client.py:L694-L713, L812-L818, vllm/v1/engine/core.py:L1280-L1293, L1341-L1356"},
+    {"decision": "多模态大张量走 torch.multiprocessing.Queue 共享内存旁路(OOB)，不进 ZMQ 帧", "why": "图像/视频特征张量很大（可能在 GPU），share_memory_() 后经 torch 的 mp.Queue 传句柄，避免 pickle 与 GPU->CPU->GPU 拷贝。msgpack 主帧只带 {sender_id,message_id,tensor_id} 占位，接收端 drain-and-buffer 取回。仅 mm_tensor_ipc=='torch_shm' 且单 engine 启用。", "evidence": "vllm/v1/engine/core_client.py:L547-L555, vllm/v1/engine/tensor_ipc.py:L45-L106, vllm/v1/serial_utils.py:L257-L273, L399-L405"},
+    {"decision": "drain-and-buffer 处理张量乱序到达", "why": "多个生产者/多张量可能乱序进 mp.Queue；receiver 排空队列把所有取到的张量按 (sender_id,message_id,tensor_id) 缓冲，直到找到所需那个；推进 current_message_id 时丢弃更早的过期张量防止泄漏。", "evidence": "vllm/v1/engine/tensor_ipc.py:L114-L179"},
+    {"decision": "ENGINE_CORE_DEAD 哨兵帧 + linger=4000 + 后台监控线程", "why": "子进程崩溃时把 b'ENGINE_CORE_DEAD' 投 output_queue，输出线程 send 给所有 socket（linger 保证发出后再关）；client 的 validate_alive 见此单帧抛 EngineDeadError，监控线程检测进程死亡置 engine_dead 并 shutdown，使后续操作快速失败而非挂死。", "evidence": "vllm/v1/engine/core.py:L809, L1358-L1370, L1480-L1505, vllm/v1/engine/core_client.py:L447-L450, L641-L665"},
+    {"decision": "weakref.finalize + BackgroundResources 做无环终结清理", "why": "输出处理线程/协程不能持有 client 强引用（否则永不被 GC）；把 ctx/sockets/tasks 放进独立 dataclass 由 finalizer 持有，client 被回收或构造中途异常都能干净关 socket、cancel task、停子进程，且避免循环引用。", "evidence": "vllm/v1/engine/core_client.py:L367-L451, L490-L491, L609-L611"},
+    {"decision": "ABORT 同时投 input_queue 与 aborts_queue", "why": "abort 既要保持与其他请求在 input_queue 中的顺序（避免漏 abort 导致请求泄漏），又要能在 busy loop 阻塞等待时被急切处理；scheduler 的 abort 幂等，重复处理无害。", "evidence": "vllm/v1/engine/core.py:L1456-L1464, L1181-L1184"}
+  ],
+
+  "theory": [
+    "ZMQ socket 类型语义：ROUTER<->DEALER 是带 identity 的双向异步对（ROUTER 收发都带身份帧，DEALER 自带 identity）；PUSH<->PULL 是单向负载均衡/汇聚管道。本章用 ROUTER(client,bind)+DEALER(engine,connect) 做请求方向（client 需按 engine 身份定向路由），PUSH(engine)+PULL(client) 做输出方向（多 engine 输出汇聚到一个 client）。需向读者说明为何握手时 DEALER 必须先发 ready 帧：ROUTER 只有见过某 identity 才能向其回发。",
+    "零拷贝代价/收益量化：msgpack 内联阈值 VLLM_MSGPACK_ZERO_COPY_THRESHOLD（默认 256B）。小于阈值的张量/数组内联进主帧（一次拷贝，省去多帧管理开销）；大于阈值走 aux_buffers + send_multipart(copy=False)（零拷贝，但需 track + 保留引用直到发送完成）。OOB 共享内存路径进一步对超大/GPU 多模态张量省掉序列化与跨设备拷贝。",
+    "三个解耦层次的延迟来源：(1) client 内部 outputs_queue/utility Future；(2) ZMQ socket 跨进程；(3) engine 内部 input_queue/output_queue。三层 queue 使每段 IO/序列化/GPU 计算可流水重叠，但也引入排队延迟——这是吞吐换延迟的工程权衡，呼应 ch04 三段式解耦的'物理前提'。",
+    "RPC 在单向消息流上的实现：ZMQ DEALER/ROUTER 本身无 request-response 配对，靠应用层 call_id + Future/字典 实现关联；这是分布式系统中 correlation-id 模式的典型应用。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "DPAsyncMPClient / DPLBAsyncMPClient 两个数据并行子类及其 run_engine_stats_update_task / get_core_engine_for_request / lb 负载均衡逻辑（core_client.py:L1137-L1696）", "why_safe": "数据并行的多 engine 负载均衡与 coordinator stats 订阅是独立主题（另章），与本章 IPC 边界主线无关；删除后单 engine 的 AsyncMPClient 路径完整自洽。"},
+      {"what": "弹性 EP 扩缩容：scale_elastic_ep / _scale_up_elastic_ep / _scale_down_elastic_ep / ElasticScalingCache / eep_process_engine_core_notification / ReconfigureDistributedRequest 相关（core_client.py 与 __init__.py 中 EEP* 项）", "why_safe": "运行时增减 DP rank 是高级特性，不影响 IPC 基本通路；精简版聚焦稳态收发。"},
+      {"what": "DP 相关握手分支与 coordinator socket：_perform_handshakes 的双握手、coord_input/coord_output(XSUB/PUSH) socket、START_DP_WAVE 处理、DPEngineCoreProc / DPMoEEngineCoreActor / EngineCoreActor* (core.py:L1622-L2145)", "why_safe": "coordinator/DP-wave 是数据并行编排，本章只需单 engine 的单次握手（DEALER 发 ready / client 收 ready）。"},
+      {"what": "shutdown 优雅排空状态机细节：EngineShutdownState / _handle_shutdown 的 draining/timeout 分支、pause_scheduler 的 wait/keep 模式与 idle callback (core.py:L800-L804,L1230-L1264,L1542-L1589)", "why_safe": "关闭语义可保留最小路径（ENGINE_CORE_DEAD 哨兵 + BackgroundResources 清理即足以讲清故障传播）；复杂排空模式不影响正常收发协议的理解。"},
+      {"what": "结构化输出/LoRA/profile/sleep/wake_up 等具体 utility 方法体（仅保留 1-2 个作 RPC 示例，如 get_supported_tasks）", "why_safe": "这些只是 call_utility 反射 RPC 机制的不同实参，机制讲清后逐个保留属冗余；保留 call_utility + 一个示例方法即可演示协议。"},
+      {"what": "tracing/instrument 装饰器、numa/gc_debug/process_title/decorate_logs 等运维旁支 (core.py 顶部与 run_engine_core 内非协议代码)", "why_safe": "可观测性与进程命名不参与 IPC 数据通路，删除不改变控制流。"},
+      {"what": "msgpack 中 MultiModalKwargsItems/slice/UtilityResult 的 pickle/cloudpickle 回退分支与 _encode_type_info_recursive 递归类型编码 (serial_utils.py 的 mm/pickle 分支)", "why_safe": "本章只需讲清 tensor/ndarray 的多帧零拷贝与 OOB 旁路两条主线；多模态嵌套字段与不安全 pickle 回退是边缘分支，可在 must_keep 之外裁掉。"}
+    ],
+    "must_keep": [
+      {"symbol": "EngineCoreClient", "why": "三层 client 抽象的根，ch04 接缝的真实对应物，必须出现。"},
+      {"symbol": "make_client", "why": "(multiprocess,asyncio)->三种 client 的选型工厂，读者需看到分支。"},
+      {"symbol": "InprocClient", "why": "进程内直连对照组，凸显'无 IPC'与'有 IPC'的差异。"},
+      {"symbol": "AsyncMPClient", "why": "ch04 生产路径真正使用的 client，本章主角之一。"},
+      {"symbol": "SyncMPClient", "why": "同步路径，展示线程版 vs 协程版输出处理的对称结构。"},
+      {"symbol": "MPClient", "why": "ZMQ socket 装配与 ready 握手在基类，必须保留。"},
+      {"symbol": "EngineCoreRequestType", "why": "字节标签协议的定义，全章核心概念。"},
+      {"symbol": "ADD", "why": "EngineCoreRequestType.ADD=b'\\x00'，最主要的请求标签。"},
+      {"symbol": "ABORT", "why": "abort 双队列设计的标签。"},
+      {"symbol": "UTILITY", "why": "跨进程 RPC 的标签。"},
+      {"symbol": "EngineCoreProc", "why": "engine 侧 ZMQ 包装类，两个 IO 线程的宿主。"},
+      {"symbol": "process_input_sockets", "why": "输入 IO 线程：DEALER 收、字节标签解析、按类型选 decoder、投 input_queue。"},
+      {"symbol": "process_output_sockets", "why": "输出 IO 线程：PUSH 发、encode_into 复用 buffer、零拷贝 track、ENGINE_CORE_DEAD 哨兵。"},
+      {"symbol": "input_queue", "why": "IO 线程与 busy loop 的解耦点（输入方向）。"},
+      {"symbol": "output_queue", "why": "busy loop 与 IO 线程的解耦点（输出方向）。"},
+      {"symbol": "_handle_client_request", "why": "busy loop 按字节标签分派请求，读者需看到字节标签如何驱动行为。"},
+      {"symbol": "run_busy_loop", "why": "IPC 另一端的消费者/生产者，说明 input_queue->step->output_queue 闭环。"},
+      {"symbol": "_send_input", "why": "client 侧打包 (identity,type,encoded) 多帧并 send_multipart 的关键方法。"},
+      {"symbol": "call_utility", "why": "同步版 RPC 的 call_id+Future 配对。"},
+      {"symbol": "call_utility_async", "why": "asyncio 版 RPC 配对。"},
+      {"symbol": "MsgpackEncoder", "why": "多帧零拷贝编码器，序列化主线。"},
+      {"symbol": "MsgpackDecoder", "why": "对应解码器。"},
+      {"symbol": "encode_into", "why": "复用 bytearray buffer 的零拷贝编码入口（输出热路径用）。"},
+      {"symbol": "_encode_tensor", "why": "演示内联/aux_buffers/OOB 三条分支的核心。"},
+      {"symbol": "_decode_tensor", "why": "演示 aux_buffers 索引零拷贝 与 OOB dict 旁路的还原。"},
+      {"symbol": "aux_buffers", "why": "零拷贝多帧的机制载体，必须出现且讲清。"},
+      {"symbol": "OOBTensorConsumer", "why": "OOB 旁路协议抽象，连接 msgpack 与 TensorIpc。"},
+      {"symbol": "TensorIpcSender", "why": "多模态张量零拷贝发送端。"},
+      {"symbol": "TensorIpcReceiver", "why": "接收端 + drain-and-buffer 乱序重组。"},
+      {"symbol": "TensorIpcData", "why": "共享内存载荷结构。"},
+      {"symbol": "EngineCoreReadyResponse", "why": "握手 ready 帧的载荷，DEALER 必须先发它。"},
+      {"symbol": "ENGINE_CORE_DEAD", "why": "故障传播哨兵帧。"},
+      {"symbol": "BackgroundResources", "why": "无环终结清理，解释为何线程不持 client 强引用。"},
+      {"symbol": "validate_alive", "why": "client 侧检测 ENGINE_CORE_DEAD 抛 EngineDeadError。"}
+    ]
+  },
+
+  "diagram_plan": [
+    {"name": "01-ipc-socket-topology", "type": "architecture/graph", "spec": "ZMQ socket 拓扑总图：左 client 进程框内 [ROUTER input_socket(bind) | PULL output_socket]，右 EngineCoreProc 进程框内 [DEALER input(connect,identity) | PUSH output] + 两个 IO 线程 + input_queue/output_queue + run_busy_loop。箭头标注方向：请求 ROUTER->DEALER，握手 ready DEALER->ROUTER（虚线，先发），输出 PUSH->PULL。再画一条独立的 torch.mp.Queue 共享内存通道连 TensorIpcSender->TensorIpcReceiver（标'OOB 大张量旁路'）。用 svg-diagram skill 画（多对多+分组框，Mermaid 自动布局不可靠）。Roadmap 高亮节点: engine-core / IPC 边界。", "highlight_nodes": ["EngineCoreClient", "EngineCoreProc", "ZMQ DEALER/ROUTER"]},
+    {"name": "02-byte-tag-multiframe-message", "type": "wire-format/table", "spec": "ZMQ 多帧消息逐帧布局：请求方向 [frame0: engine identity(2B LE)] [frame1: type tag b'\\x00'..b'\\x05'] [frame2: msgpack 主帧 bufs[0]] [frame3..N: aux_buffers 零拷贝张量 backing buffers]。并列展示 ADD 请求（带张量，>3 帧）与无张量请求（=3 帧，走 copy=False 快路径）两例，标注 send_multipart 的 track=True 触发条件。", "highlight_nodes": ["EngineCoreRequestType", "aux_buffers"]},
+    {"name": "03-rpc-correlation-flow", "type": "sequence", "spec": "call_utility RPC 时序：client 生成 call_id -> 存 utility_results[call_id]=Future -> send UTILITY 帧 (client_index,call_id,method,args) -> engine _handle_client_request 反射调用 -> 回发 UtilityOutput(call_id,result) -> output 线程 _process_utility_output 用 call_id 找回 Future 置结果。强调 correlation-id 在单向 ZMQ 流上模拟 request-response。", "highlight_nodes": ["call_utility", "UtilityOutput"]},
+    {"name": "04-tensor-ipc-zerocopy", "type": "sequence/state", "spec": "多模态张量零拷贝旁路：encode 时 _encode_tensor 见大张量 -> TensorIpcSender.share_memory_()+queue.put(TensorIpcData) -> msgpack 主帧只嵌 {sender_id,message_id,tensor_id} dict。decode 时 _decode_tensor 见 dict -> TensorIpcReceiver drain-and-buffer 从 queue 取回。对照普通 ZMQ 帧路径（一次进程间拷贝）vs OOB 共享内存路径（零进程间拷贝）。", "highlight_nodes": ["TensorIpcSender", "TensorIpcReceiver", "_encode_tensor"]}
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_payoff": [
+      {"id": "f2", "what": "EngineCore 进程边界 / IPC 是三段式解耦的物理前提", "planted_at": "ch04", "payoff_here": "本章是 f2 的兑现章：揭示 ch04 用 InProcessEngineCore 替身占位的 Stage2 接缝在生产中就是 AsyncMPClient + EngineCoreProc，二者经 ZMQ(DEALER/ROUTER + PUSH/PULL) + 字节标签协议 + msgpack 多帧 跨进程通信。writer 须明确回指 ch04：'当时的同名同签名替身，真身在此'。"},
+      {"id": "f5", "what": "IPC 客户端的内部机制（ZMQ + msgpack + 跨进程通信）", "planted_at": "ch03", "payoff_here": "本章是 f5 的兑现章：ch03 提到 make_async_mp_client 起独立子进程后只留'IPC 留 ch07'，此处给出客户端三层结构、socket 拓扑、字节标签编解码、IO 线程与零拷贝的完整机制。"}
+    ]
+  }
+}
