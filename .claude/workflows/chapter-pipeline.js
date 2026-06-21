@@ -131,14 +131,14 @@ const writeV = await agent(
   '若发现精简版缺了你要讲清的细节 → 用逃生舱拉闸（status=BLOCKED）让 implementer 补回，别将就。\n' +
   '埋伏笔、`python3 ' + REPO + '/scripts/bible.py payoff --resolve` 回收应回收项。\n' +
   '**零脚手架泄漏**：规范 vllm/ 路径、自然标题(无 Cell N)、不提内部文件。\n' +
-  '完成后自跑四个 linter（chapter_structure/formulas/source_grounding/fidelity）均无 BLOCKING。返回 status/note。' + ESC,
+  '完成后自跑五个 linter（chapter_structure/formulas/source_grounding/fidelity/diagrams）均无 BLOCKING。返回 status/note。' + ESC,
   { schema: STATUS_SCHEMA, label: 'write', phase: 'Write', agentType: 'general-purpose' }
 )
 if (writeV && writeV.status === 'BLOCKED') return { escalated: 'write', stage: 'Write', reason: writeV.blocker_reason }
 
 // ---------- Phase E: Review (多维并行 → 协作回环) ----------
 let reviewV = null
-const DIMS = ['fidelity（保真度+过度删减+零脚手架泄漏）', 'readability（可读/不枯燥/连贯）', 'algorithm（算法可理解性：图/数值/证明）', 'formula-structure（公式可渲染+Roadmap+自包含，跑 linter）']
+const DIMS = ['fidelity（保真度+过度删减+零脚手架泄漏）', 'readability（可读/不枯燥/连贯）', 'algorithm（算法可理解性：图/数值/证明）', 'formula-structure-diagrams（公式可渲染+Roadmap+自包含+图示质量，跑 lint_formulas/chapter_structure/source_grounding/diagrams）']
 for (let r = 1; r <= 3; r++) {
   phase('Review')
   const dims = await parallel(DIMS.map(function (dim) {

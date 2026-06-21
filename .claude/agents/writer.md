@@ -31,4 +31,4 @@ color: green
 逐条采纳或带理由反驳，不表演式同意。你和 reviewer 是搭档，目标是做出完美作品，不是互相挑刺。
 
 ## 收工前自检（均须无 BLOCKING）
-`lint_chapter_structure`、`lint_formulas`、`lint_source_grounding`、`lint_fidelity`。收工后 `python3 scripts/learn.py extract {chapter_id} writer`。
+`lint_chapter_structure`、`lint_formulas`、`lint_source_grounding`、`lint_fidelity`、`lint_diagrams`（图：SVG 有效/PNG 在位且被引用/中文可渲染）。收工后 `python3 scripts/learn.py extract {chapter_id} writer`。

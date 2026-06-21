@@ -6,11 +6,34 @@ Usage: python3 roadmap.py --highlight async-engine --out roadmap.svg
 Coordinates are computed (svg-diagram skill convention); text is escaped.
 """
 import argparse
+import re
 import xml.sax.saxutils as xs
 
 
 def esc(s):
     return xs.escape(s)
+
+
+_CJK = re.compile(r'[㐀-䶿一-鿿　-〿＀-￯]')
+
+
+_CJK_FONT = "Droid Sans Fallback"  # host 上唯一带 CJK 字形的字体
+
+
+def cjk_font(svg: str) -> str:
+    """PNG 渲染器（ImageMagick）对 sans-serif/monospace 的中文不做逐字回退 → 中文丢字形。
+    凡 <text> 内容含中文的，把其 font-family 强制为单独的 "Droid Sans Fallback"
+    （绝不与 latin 族逗号并列，否则又会丢字），让中文在 PNG 里正确渲染。
+    latin/数字文本（不含 CJK）保持原 font-family 不变。惠及全书所有章节的 Roadmap。"""
+    def repl(m):
+        attrs, content = m.group(1), m.group(2)
+        if not _CJK.search(content):
+            return m.group(0)
+        new_attrs, n = re.subn(r'font-family="[^"]*"', f'font-family="{_CJK_FONT}"', attrs)
+        if n == 0:
+            new_attrs = attrs + f' font-family="{_CJK_FONT}"'
+        return f'<text{new_attrs}>{content}</text>'
+    return re.sub(r'<text\b([^>]*)>(.*?)</text>', repl, svg, flags=re.S)
 
 
 # (highlight-key, 标题, 副标题) — 请求生命周期主线
@@ -68,5 +91,5 @@ if __name__ == "__main__":
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     with open(a.out, "w", encoding="utf-8") as f:
-        f.write(build(a.highlight))
+        f.write(cjk_font(build(a.highlight)))
     print("wrote", a.out)
