@@ -14,14 +14,14 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch09',
-  slug: 'ch09-detokenization',
-  focus: '增量去 token 化与 stop string：IncrementalDetokenizer 层级(Fast tokenizers.DecodeStream vs Slow Python)、stop-string 缓冲 holdback、min_tokens 守卫、UTF-8 多字节边界恢复',
+  chapter_id: 'ch10',
+  slug: 'ch10-logprobs',
+  focus: 'Logprobs 装配与字节回退修正：从 EngineCore 张量取 sample/prompt logprobs、上下文感知 UTF-8 多字节重建、累计 logprob 跟踪、flat vs nested 格式',
   highlight: 'output-processor',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
-  paths: ['vllm/v1/engine/detokenizer.py', 'vllm/v1/engine/output_processor.py'],
+  paths: ['vllm/v1/engine/logprobs.py', 'vllm/v1/engine/output_processor.py', 'vllm/v1/engine/detokenizer.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
@@ -122,18 +122,22 @@ for (let r = 1; r <= 3; r++) {
 
 // ---------- Phase D: Write (真源码主线) ----------
 phase('Write')
-const writeV = await agent(
+let writeV = null
+for (let w = 1; w <= 2 && !writeV; w++) {
+if (w > 1) log('write 上轮中断(API崩)，第 ' + w + ' 轮重试：chapter.md 已存在就用 Edit 续完/校验，否则新建')
+writeV = await agent(
   head('writer') +
   '任务：以**真实 vLLM 源码为主线**写 ' + CH + '/narrative/chapter.md（你唯一有权写它）。\n' +
   '读 dossier、implementation、' + REPO + '/instances/vllm/book/bible/voice-guide.md，并跑 `python3 ' + REPO + '/scripts/bible.py due ' + A.chapter_id + '`。\n' +
-  '开场 Roadmap：跑 `python3 ' + REPO + '/instances/vllm/book/assets/roadmap/roadmap.py --highlight ' + HL + ' --out ' + CH + '/diagrams/roadmap.svg`，convert 成 PNG，正文引用该 PNG。\n' +
+  '开场 Roadmap：跑 `python3 ' + REPO + '/instances/vllm/book/assets/roadmap/roadmap.py --highlight ' + HL + ' --out ' + CH + '/diagrams/roadmap.svg`，用 rsvg-convert -z 2 转 PNG（**勿用 ImageMagick convert**，会丢中文/错位），正文引用该 PNG。\n' +
   '正文内嵌**真实源码片段**(裁剪无关分支用 `# … 省略 …`)，逐段解读设计决策；精简版只作"运行看数值"的交叉验证，不是主角。\n' +
   '若发现精简版缺了你要讲清的细节 → 用逃生舱拉闸（status=BLOCKED）让 implementer 补回，别将就。\n' +
   '埋伏笔、`python3 ' + REPO + '/scripts/bible.py payoff --resolve` 回收应回收项。\n' +
   '**零脚手架泄漏**：规范 vllm/ 路径、自然标题(无 Cell N)、不提内部文件。\n' +
   '完成后自跑五个 linter（chapter_structure/formulas/source_grounding/fidelity/diagrams）均无 BLOCKING。返回 status/note。' + ESC,
-  { schema: STATUS_SCHEMA, label: 'write', phase: 'Write', agentType: 'general-purpose' }
+  { schema: STATUS_SCHEMA, label: 'write r' + w, phase: 'Write', agentType: 'general-purpose' }
 )
+}
 if (writeV && writeV.status === 'BLOCKED') return { escalated: 'write', stage: 'Write', reason: writeV.blocker_reason }
 
 // ---------- Phase E: Review (多维并行 → 协作回环) ----------
