@@ -1,0 +1,266 @@
+{
+  "chapter": "ch03",
+  "title": "From EngineArgs to VllmConfig: Assembling the Stack",
+  "source_pin": "f3fef123",
+  "scope_note": "本章追踪一条配置数据流：用户给的扁平 EngineArgs（dataclass，字段默认值大多直接借自各子 Config 类）经 create_engine_config() 组装成若干结构化子 Config（ModelConfig/CacheConfig/ParallelConfig/SchedulerConfig/CompilationConfig 等），再封装进 VllmConfig；VllmConfig.__post_init__ 做跨子配置的交叉校验与默认值推导（含 O0-O3 优化级应用、async_scheduling 自动开关、compilation/cudagraph 模式落定）；最后由三个工厂——Executor.get_class / SchedulerConfig.get_scheduler_cls / EngineCoreClient.make_client——依据 VllmConfig 里的 feature flag 选出具体执行/调度/IPC 实现类。compute_hash() 把影响计算图结构的所有因子哈希成一个短指纹（用于 torch.compile 缓存）。",
+
+  "code_spine": [
+    "vllm/engine/arg_utils.py:L403-L462  EngineArgs 字段定义（扁平 CLI 参数，默认值取自各子 Config 类属性）",
+    "vllm/engine/arg_utils.py:L690-L720  EngineArgs.__post_init__（dict→Config 对象升格、加载插件）",
+    "vllm/v1/engine/llm_engine.py:L151-L177  LLMEngine.from_engine_args → create_engine_config + Executor.get_class（入口）",
+    "vllm/engine/arg_utils.py:L1622-L1659  create_engine_config 开头：speculator 覆盖、create_model_config()",
+    "vllm/engine/arg_utils.py:L1660-L1698  默认值推导（chunked prefill / prefix caching）+ 构造 CacheConfig",
+    "vllm/engine/arg_utils.py:L1886-L1933  构造 ParallelConfig（DP/TP/PP 与 executor backend 传入）",
+    "vllm/engine/arg_utils.py:L1956-L1974  构造 SchedulerConfig（max_num_batched_tokens/max_num_seqs 已默认化）",
+    "vllm/engine/arg_utils.py:L2113-L2130  CompilationConfig 深拷贝 + cudagraph 覆盖",
+    "vllm/engine/arg_utils.py:L2149-L2177  组装并返回 VllmConfig",
+    "vllm/config/vllm.py:L274-L366  VllmConfig dataclass 字段（含 optimization_level=O2、performance_mode）",
+    "vllm/config/vllm.py:L721-L981  VllmConfig.__post_init__ 主体：交叉校验、async_scheduling 决策、O0-O3 应用",
+    "vllm/config/vllm.py:L184-L270  O0-O3 优化级配置字典 + OPTIMIZATION_LEVEL_TO_CONFIG 表",
+    "vllm/config/vllm.py:L652-L679  _apply_optimization_level_defaults（递归只填 None 项）",
+    "vllm/config/vllm.py:L367-L473  VllmConfig.compute_hash（计算图指纹）",
+    "vllm/v1/executor/abstract.py:L47-L92  Executor.get_class 工厂（按 distributed_executor_backend 选类）",
+    "vllm/config/parallel.py:L829-L874  distributed_executor_backend 的默认推导（mp/uni/ray）",
+    "vllm/config/scheduler.py:L168-L188  SchedulerConfig.get_scheduler_cls 工厂（async→AsyncScheduler）",
+    "vllm/v1/engine/core_client.py:L80-L130  EngineCoreClient.make_client / make_async_mp_client 工厂",
+    "vllm/v1/engine/core.py:L94-L153  EngineCore.__init__：实例化 executor_class、get_scheduler_cls 选调度器"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/engine/llm_engine.py",
+      "lines": "L151-L177",
+      "note": "整章的起点。LLMEngine（以及 AsyncLLM，见 ch04）都走这条路：扁平 EngineArgs → create_engine_config() 得到 VllmConfig → Executor.get_class(vllm_config) 选执行器类 → 把二者交给 __init__。注意 executor_class 是『类』不是『实例』，真正实例化推迟到 EngineCore 内。",
+      "code": "    @classmethod\n    def from_engine_args(\n        cls,\n        engine_args: EngineArgs,\n        usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,\n        stat_loggers: list[StatLoggerFactory] | None = None,\n        enable_multiprocessing: bool = False,\n    ) -> \"LLMEngine\":\n        \"\"\"Creates an LLM engine from the engine arguments.\"\"\"\n\n        # Create the engine configs.\n        vllm_config = engine_args.create_engine_config(usage_context)\n        executor_class = Executor.get_class(vllm_config)\n\n        if envs.VLLM_ENABLE_V1_MULTIPROCESSING:\n            logger.debug(\"Enabling multiprocessing for LLMEngine.\")\n            enable_multiprocessing = True\n\n        # Create the LLMEngine.\n        return cls(\n            vllm_config=vllm_config,\n            executor_class=executor_class,\n            log_stats=not engine_args.disable_log_stats,\n            usage_context=usage_context,\n            stat_loggers=stat_loggers,\n            multiprocess_mode=enable_multiprocessing,\n        )"
+    },
+    {
+      "path": "vllm/engine/arg_utils.py",
+      "lines": "L406-L440",
+      "note": "EngineArgs 是一个扁平 dataclass：每个字段默认值直接引用对应子 Config 类的同名属性（如 model=ModelConfig.model、kv_cache_dtype=CacheConfig.cache_dtype）。这是『单一真相源』模式——CLI 默认值与子配置默认值天然同步。distributed_executor_backend 默认 None（后续推导）。此处只摘取代表性字段，完整字段达数百个（已省略多模态/LoRA/投机/KV-transfer 等大段）。",
+      "code": "class EngineArgs:\n    \"\"\"Arguments for vLLM engine.\"\"\"\n\n    model: str = ModelConfig.model\n    served_model_name: str | list[str] | None = ModelConfig.served_model_name\n    tokenizer: str | None = ModelConfig.tokenizer\n    runner: RunnerOption = ModelConfig.runner\n    skip_tokenizer_init: bool = ModelConfig.skip_tokenizer_init\n    dtype: ModelDType = ModelConfig.dtype\n    kv_cache_dtype: CacheDType = CacheConfig.cache_dtype\n    seed: int = ModelConfig.seed\n    max_model_len: int = ModelConfig.max_model_len\n    # Note: Specifying a custom executor backend by passing a class\n    # is intended for expert use only. The API may change without\n    # notice.\n    distributed_executor_backend: (\n        str | DistributedExecutorBackend | type[Executor] | None\n    ) = ParallelConfig.distributed_executor_backend"
+    },
+    {
+      "path": "vllm/engine/arg_utils.py",
+      "lines": "L690-L710",
+      "note": "__post_init__ 的关键职责：把用户以 dict 传进来的子配置（如 EngineArgs(compilation_config={...})）升格为真正的 Config 对象，免去手工构造。同时加载插件（可能往 CLI 注入新量化/设备选项）。已省略：HF offline 路径替换、在线量化解析等分支。",
+      "code": "    def __post_init__(self):\n        # support `EngineArgs(compilation_config={...})`\n        # without having to manually construct a\n        # CompilationConfig object\n        if isinstance(self.compilation_config, dict):\n            self.compilation_config = CompilationConfig(**self.compilation_config)\n        if isinstance(self.attention_config, dict):\n            self.attention_config = AttentionConfig(**self.attention_config)\n        if isinstance(self.mamba_config, dict):\n            self.mamba_config = MambaConfig(**self.mamba_config)\n        if isinstance(self.kernel_config, dict):\n            self.kernel_config = KernelConfig(**self.kernel_config)\n        if isinstance(self.eplb_config, dict):\n            self.eplb_config = EPLBConfig(**self.eplb_config)"
+    },
+    {
+      "path": "vllm/engine/arg_utils.py",
+      "lines": "L1622-L1662",
+      "note": "create_engine_config 的开场：先让平台注册/更新（per-platform 钩子），建 DeviceConfig，检测 speculator 模型可能覆盖 model/tokenizer，然后 create_model_config()（最重的一步，读 HF config）。随后把 ModelConfig 推回 self（model/tokenizer 已被规范化）。_set_default_chunked_prefill_and_prefix_caching_args 依据模型能力补默认。已省略：cloud storage 判断、environ 校验细节。",
+      "code": "    def create_engine_config(\n        self,\n        usage_context: UsageContext | None = None,\n        headless: bool = False,\n    ) -> VllmConfig:\n        \"\"\"\n        Create the VllmConfig.\n\n        NOTE: If VllmConfig is incompatible, we raise an error.\n        \"\"\"\n        current_platform.pre_register_and_update()\n\n        device_config = DeviceConfig(device=cast(Device, current_platform.device_type))\n\n        envs.validate_environ(self.fail_on_environ_validation)\n\n        # ... (speculator detection elided) ...\n\n        model_config = self.create_model_config()\n        self.model = model_config.model\n        self.model_weights = model_config.model_weights\n        self.tokenizer = model_config.tokenizer\n\n        self._check_feature_supported()\n        self._set_default_chunked_prefill_and_prefix_caching_args(model_config)\n        self._set_default_reasoning_config_args()"
+    },
+    {
+      "path": "vllm/engine/arg_utils.py",
+      "lines": "L1679-L1698",
+      "note": "CacheConfig 的构造是『把扁平 self.* 字段重新打包成结构化子配置』的典型样板：每个关键字参数直接来自 EngineArgs 字段或上面推导出的局部变量（如 resolved_cache_dtype、sliding_window）。SchedulerConfig/ParallelConfig/LoadConfig 等都是同样的样板。已省略：TurboQuant 边界层跳过等罕见分支。",
+      "code": "        cache_config = CacheConfig(\n            block_size=self.block_size,  # type: ignore[arg-type]\n            gpu_memory_utilization=self.gpu_memory_utilization,\n            kv_cache_memory_bytes=self.kv_cache_memory_bytes,\n            cache_dtype=resolved_cache_dtype,  # type: ignore[arg-type]\n            is_attention_free=model_config.is_attention_free,\n            num_gpu_blocks_override=self.num_gpu_blocks_override,\n            sliding_window=sliding_window,\n            enable_prefix_caching=self.enable_prefix_caching,\n            prefix_caching_hash_algo=self.prefix_caching_hash_algo,\n            calculate_kv_scales=self.calculate_kv_scales,\n            kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,\n            kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,\n            mamba_cache_dtype=self.mamba_cache_dtype,\n            mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,\n            mamba_block_size=self.mamba_block_size,\n            mamba_cache_mode=self.mamba_cache_mode,\n            kv_offloading_size=self.kv_offloading_size,\n            kv_offloading_backend=self.kv_offloading_backend,\n        )"
+    },
+    {
+      "path": "vllm/engine/arg_utils.py",
+      "lines": "L1956-L1974",
+      "note": "SchedulerConfig 构造。注意此时 max_num_batched_tokens/max_num_seqs/enable_chunked_prefill 已被 _set_default_max_num_seqs_and_batched_tokens_args 等填好（紧邻的 assert 强保证非 None）。runner_type/is_multimodal_model/is_encoder_decoder 来自 ModelConfig——子配置之间通过 model_config 派生而非重复定义。policy/scheduler_cls/async_scheduling 是后续调度器工厂选择的输入。",
+      "code": "        scheduler_config = SchedulerConfig(\n            runner_type=model_config.runner_type,\n            max_num_batched_tokens=self.max_num_batched_tokens,\n            max_num_seqs=self.max_num_seqs,\n            max_model_len=model_config.max_model_len,\n            enable_chunked_prefill=self.enable_chunked_prefill,\n            disable_chunked_mm_input=self.disable_chunked_mm_input,\n            is_multimodal_model=model_config.is_multimodal_model,\n            is_encoder_decoder=model_config.is_encoder_decoder,\n            policy=self.scheduling_policy,\n            scheduler_cls=self.scheduler_cls,\n            max_num_partial_prefills=self.max_num_partial_prefills,\n            max_long_partial_prefills=self.max_long_partial_prefills,\n            long_prefill_token_threshold=self.long_prefill_token_threshold,\n            scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,\n            disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,\n            async_scheduling=self.async_scheduling,\n            stream_interval=self.stream_interval,\n        )"
+    },
+    {
+      "path": "vllm/engine/arg_utils.py",
+      "lines": "L2149-L2177",
+      "note": "create_engine_config 的收尾：把全部子配置塞进 VllmConfig 一次性构造。注意 optimization_level 和 performance_mode 也在此传入——它们将在 VllmConfig.__post_init__ 里被『应用』到 compilation_config/kernel_config。VllmConfig 是一个『配置聚合体』，下游所有模块只需传一个 VllmConfig 即可拿到全部上下文。",
+      "code": "        config = VllmConfig(\n            model_config=model_config,\n            cache_config=cache_config,\n            parallel_config=parallel_config,\n            scheduler_config=scheduler_config,\n            device_config=device_config,\n            load_config=load_config,\n            offload_config=offload_config,\n            attention_config=attention_config,\n            mamba_config=mamba_config,\n            kernel_config=kernel_config,\n            lora_config=lora_config,\n            speculative_config=speculative_config,\n            structured_outputs_config=self.structured_outputs_config,\n            observability_config=observability_config,\n            compilation_config=compilation_config,\n            kv_transfer_config=self.kv_transfer_config,\n            kv_events_config=self.kv_events_config,\n            ec_transfer_config=self.ec_transfer_config,\n            reasoning_config=self.reasoning_config,\n            profiler_config=self.profiler_config,\n            additional_config=self.additional_config,\n            optimization_level=self.optimization_level,\n            performance_mode=self.performance_mode,\n            weight_transfer_config=self.weight_transfer_config,\n            shutdown_timeout=self.shutdown_timeout,\n        )\n\n        return config"
+    },
+    {
+      "path": "vllm/config/vllm.py",
+      "lines": "L68-L80",
+      "note": "优化级语义的权威定义。O0=纯启动（无编译/无 cudagraph），O1=Dynamo+Inductor 编译 + Piecewise cudagraph，O2=O1 + Full&Piecewise cudagraph（默认），O3 当前等同 O2。这是『启动时间 vs 运行性能』的旋钮。VllmConfig 字段默认 optimization_level=OptimizationLevel.O2。",
+      "code": "class OptimizationLevel(IntEnum):\n    \"\"\"Optimization level enum.\"\"\"\n\n    O0 = 0\n    \"\"\"O0 : No optimization. no compilation, no cudagraphs, no other\n    optimization, just starting up immediately\"\"\"\n    O1 = 1\n    \"\"\"O1: Quick optimizations. Dynamo+Inductor compilation and Piecewise\n    cudagraphs\"\"\"\n    O2 = 2\n    \"\"\"O2: Full optimizations. -O1 as well as Full and Piecewise cudagraphs.\"\"\"\n    O3 = 3\n    \"\"\"O3: Currently the same as -O2s.\"\"\""
+    },
+    {
+      "path": "vllm/config/vllm.py",
+      "lines": "L184-L270",
+      "note": "O0-O3 实际是『预设字典』：每级给出 compilation_config.pass_config 各 fusion 开关、cudagraph_mode、kernel_config.enable_flashinfer_autotune 的默认值。注意取值可以是布尔常量，也可以是『谓词函数』（如 enable_norm_fusion，运行时按平台/模型决定）。O0 全关；O1 开 Inductor 融合 + PIECEWISE cudagraph；O2/O3 进一步开 FULL_AND_PIECEWISE + allreduce-rms 融合等。已省略各 enable_*_fusion 谓词函数体（仅保留 O0/O2 字典看出差异）。OPTIMIZATION_LEVEL_TO_CONFIG 是从枚举到字典的查表。",
+      "code": "OPTIMIZATION_LEVEL_00 = {\n    \"compilation_config\": {\n        \"pass_config\": {\n            \"fuse_norm_quant\": False,\n            \"fuse_act_quant\": False,\n            \"fuse_allreduce_rms\": False,\n            \"fuse_attn_quant\": False,\n            \"enable_sp\": False,\n            \"fuse_gemm_comms\": False,\n            \"fuse_act_padding\": False,\n            \"fuse_mla_dual_rms_norm\": False,\n            \"fuse_rope_kvcache\": False,\n        },\n        \"cudagraph_mode\": CUDAGraphMode.NONE,\n        \"use_inductor_graph_partition\": False,\n    },\n    \"kernel_config\": {\n        \"enable_flashinfer_autotune\": False,\n    },\n}\n# ... O1 elided (PIECEWISE cudagraph + inductor fusions) ...\nOPTIMIZATION_LEVEL_02 = {\n    \"compilation_config\": {\n        \"pass_config\": {\n            \"fuse_norm_quant\": enable_norm_fusion,\n            \"fuse_act_quant\": enable_act_fusion,\n            \"fuse_allreduce_rms\": enable_allreduce_rms_fusion,\n            \"fuse_attn_quant\": IS_QUANTIZED,\n            \"enable_sp\": IS_DENSE,\n            \"fuse_gemm_comms\": IS_DENSE,\n            \"fuse_act_padding\": enable_norm_pad_fusion,\n            \"fuse_mla_dual_rms_norm\": enable_mla_dual_rms_norm_fusion,\n            \"fuse_rope_kvcache\": enable_rope_kvcache_fusion,\n        },\n        \"cudagraph_mode\": CUDAGraphMode.FULL_AND_PIECEWISE,\n        \"use_inductor_graph_partition\": False,\n    },\n    \"kernel_config\": {\n        \"enable_flashinfer_autotune\": True,\n    },\n}\n\nOPTIMIZATION_LEVEL_TO_CONFIG = {\n    OptimizationLevel.O0: OPTIMIZATION_LEVEL_00,\n    OptimizationLevel.O1: OPTIMIZATION_LEVEL_01,\n    OptimizationLevel.O2: OPTIMIZATION_LEVEL_02,\n    OptimizationLevel.O3: OPTIMIZATION_LEVEL_03,\n}"
+    },
+    {
+      "path": "vllm/config/vllm.py",
+      "lines": "L652-L679",
+      "note": "优化级如何被『应用』：递归遍历预设字典，只对『当前还是 None』的字段写默认值（_set_config_default 保证不覆盖用户显式设置）。这就是注释里说的『user specified fields will not be overridden』。谓词函数会在 _set_config_default 内被调用以求值（按当前 VllmConfig 计算实际布尔值）。",
+      "code": "    def _apply_optimization_level_defaults(self, defaults: dict[str, Any]) -> None:\n        \"\"\"Apply optimization level defaults using self as root.\n\n        Recursively applies values from defaults into nested config objects.\n        Only fields present in defaults are overwritten.\n\n        If the user configuration does not specify a value for a default field\n        and if the default field is still None after all user selections are\n        applied, then default values will be applied to the field. User specified\n        fields will not be overridden by the default.\n        \"\"\"\n\n        def apply_recursive(config_obj: Any, config_defaults: dict[str, Any]) -> None:\n            \"\"\"Recursively apply defaults to config_obj, using self as root.\"\"\"\n            for key, value in config_defaults.items():\n                if not hasattr(config_obj, key):\n                    continue\n\n                current = getattr(config_obj, key)\n                if isinstance(value, dict) and is_dataclass(current):\n                    apply_recursive(current, value)\n                else:\n                    self._set_config_default(config_obj, key, value)\n\n        apply_recursive(self, defaults)"
+    },
+    {
+      "path": "vllm/config/vllm.py",
+      "lines": "L721-L756",
+      "note": "VllmConfig.__post_init__ 是『跨子配置交叉校验 + 推导』的中枢，全章第二主角。给 instance_id（唯一），跑 try_verify_and_update_config（按模型架构做特定改写），让 model_config 与 parallel_config 互验，回填 parallel_config.is_moe_model（子配置间补全），lora 与 model 互验，mamba 校验，最后在缺省时推导量化配置。这是『扁平参数无法表达的约束』集中落地的地方。已省略 deep_gemm 自动禁用等分支。",
+      "code": "    def __post_init__(self):\n        \"\"\"Verify configs are valid & consistent with each other.\"\"\"\n\n        # To give each torch profile run a unique instance name.\n        self.instance_id = f\"{time.time_ns()}\"\n\n        if self.performance_mode != \"balanced\":\n            logger.info_once(\"Performance mode set to '%s'.\", self.performance_mode)\n\n        self.try_verify_and_update_config()\n\n        if self.model_config is not None:\n            self.model_config.verify_with_parallel_config(self.parallel_config)\n            self.model_config.verify_dual_chunk_attention_config(self.load_config)\n\n            self.parallel_config.is_moe_model = self.model_config.is_moe\n\n        if self.lora_config is not None:\n            self.lora_config.verify_with_model_config(self.model_config)\n\n        # ... (mamba stochastic-rounding check elided) ...\n\n        if self.quant_config is None and self.model_config is not None:\n            self.quant_config = VllmConfig._get_quantization_config(\n                self.model_config, self.load_config\n            )"
+    },
+    {
+      "path": "vllm/config/vllm.py",
+      "lines": "L777-L852",
+      "note": "async_scheduling 三态决策——本章一个核心『推导』示例，也是 ch04/ch06 的伏笔。先用 Executor.get_class 拿到执行器类，问它 supports_async_scheduling()。若用户显式 True：硬校验投机解码兼容性 + 执行器支持，不兼容直接 raise。若为 None（默认）：逐条排除——pooling 模型关、不兼容投机方法关、disable_padded_drafter_batch 关、执行器不支持关，否则开。最后 info 一行最终值。这解释了为什么『默认就有 async scheduling 但某些组合会自动退化』。",
+      "code": "        from vllm.v1.executor.abstract import Executor\n\n        executor_backend = self.parallel_config.distributed_executor_backend\n        executor_class = Executor.get_class(self)\n        executor_supports_async_sched = executor_class.supports_async_scheduling()\n\n        if self.scheduler_config.async_scheduling:\n            # Async scheduling explicitly enabled, hard fail any incompatibilities.\n            # ... (speculative-method / disable_padded_drafter_batch checks elided) ...\n            if not executor_supports_async_sched:\n                raise ValueError(\n                    f\"`{executor_backend}` does not support async scheduling yet.\"\n                )\n        elif self.scheduler_config.async_scheduling is None:\n            # Enable async scheduling unless there is an incompatible option.\n            if (\n                self.model_config is not None\n                and self.model_config.runner_type == \"pooling\"\n            ):\n                self.scheduler_config.async_scheduling = False\n            elif (\n                self.speculative_config is not None\n                and self.speculative_config.method not in get_args(EagleModelTypes)\n                and self.speculative_config.method not in get_args(NgramGPUTypes)\n            ):\n                self.scheduler_config.async_scheduling = False\n            elif not executor_supports_async_sched:\n                self.scheduler_config.async_scheduling = False\n            else:\n                self.scheduler_config.async_scheduling = True\n\n        logger.info_once(\n            \"Asynchronous scheduling is %s.\",\n            \"enabled\" if self.scheduler_config.async_scheduling else \"disabled\",\n        )"
+    },
+    {
+      "path": "vllm/config/vllm.py",
+      "lines": "L904-L976",
+      "note": "compilation/cudagraph 最终落定 + 优化级应用，__post_init__ 尾段。enforce_eager 或 TORCH_COMPILE_DISABLE 会强制 mode=NONE、cudagraph=NONE（覆盖优化级）。然后若 mode 仍是 None：optimization_level>O0 → VLLM_COMPILE，否则 NONE。kernel_config.set_platform_defaults 后，按 optimization_level 查表 _apply_optimization_level_defaults 落实 fusion/cudagraph 默认。这一段说明优先级：用户显式 > enforce_eager/环境变量 > 优化级预设。",
+      "code": "        if self.model_config is not None and self.model_config.enforce_eager:\n            logger.warning(\n                \"Enforce eager set, disabling torch.compile and CUDAGraphs. \"\n                \"This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none\"\n            )\n            self.compilation_config.mode = CompilationMode.NONE\n            self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE\n\n        if os.environ.get(\"TORCH_COMPILE_DISABLE\") == \"1\":\n            self.compilation_config.mode = CompilationMode.NONE\n\n        # ... (custom-op enable for blocked weights elided) ...\n\n        current_platform.apply_config_platform_defaults(self)\n\n        if self.compilation_config.mode is None:\n            if self.optimization_level > OptimizationLevel.O0:\n                self.compilation_config.mode = CompilationMode.VLLM_COMPILE\n            else:\n                self.compilation_config.mode = CompilationMode.NONE\n\n        # ... (ir_enable_torch_wrap / custom_ops default elided) ...\n\n        self.kernel_config.set_platform_defaults(self)\n\n        default_config = OPTIMIZATION_LEVEL_TO_CONFIG[self.optimization_level]\n        self._apply_optimization_level_defaults(default_config)"
+    },
+    {
+      "path": "vllm/config/vllm.py",
+      "lines": "L367-L473",
+      "note": "compute_hash 把『影响计算图结构』的所有因子哈希成 10 位短指纹，用于 torch.compile 编译产物缓存。做法：收集 vLLM 版本 + 每个子配置的 compute_hash()（model/cache/parallel/scheduler/device/load/.../compilation/kernel），拼成 factors 列表，safe_hash 后取前 10 位。注释强调：新增字段若影响计算图必须加入 factors。注意 quant_config 故意不单列（已被 model_config.quantization 覆盖）。已省略中段大量 if/else 子配置追加（结构高度重复，保留代表性几项）。",
+      "code": "    def compute_hash(self) -> str:\n        \"\"\"\n        WARNING: Whenever a new field is added to this config,\n        ensure that it is included in the factors list if\n        it affects the computation graph.\n\n        Provide a hash that uniquely identifies all the configs\n        that affect the structure of the computation\n        graph from input ids/embeddings to the final hidden states,\n        ...\n        \"\"\"\n        factors: list[Any] = []\n\n        # summarize vllm config\n        vllm_factors: list[Any] = []\n        from vllm import __version__\n\n        vllm_factors.append(__version__)\n        if self.model_config:\n            vllm_factors.append(self.model_config.compute_hash())\n            # ... (mm encoder hash elided) ...\n        else:\n            vllm_factors.append(\"None\")\n        if self.cache_config:\n            vllm_factors.append(self.cache_config.compute_hash())\n        else:\n            vllm_factors.append(\"None\")\n        if self.parallel_config:\n            vllm_factors.append(self.parallel_config.compute_hash())\n        else:\n            vllm_factors.append(\"None\")\n        if self.scheduler_config:\n            vllm_factors.append(self.scheduler_config.compute_hash())\n        else:\n            vllm_factors.append(\"None\")\n        # ... (device/load/offload/attention/lora/speculative/... follow the\n        #      same if-present-append-hash-else-\"None\" pattern, elided) ...\n        if self.compilation_config:\n            vllm_factors.append(self.compilation_config.compute_hash())\n        else:\n            vllm_factors.append(\"None\")\n        if self.kernel_config:\n            vllm_factors.append(self.kernel_config.compute_hash())\n        else:\n            vllm_factors.append(None)\n        # ... (kv_transfer / ec_transfer / additional_config elided) ...\n        factors.append(vllm_factors)\n\n        hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()[\n            :10\n        ]\n        return hash_str"
+    },
+    {
+      "path": "vllm/v1/executor/abstract.py",
+      "lines": "L47-L92",
+      "note": "执行器工厂——三个工厂之一。Executor.get_class 按 parallel_config.distributed_executor_backend 字符串选具体类：'ray'→RayDistributedExecutor（或 V2）、'mp'→MultiprocExecutor、'uni'→UniProcExecutor、'external_launcher'→ExecutorWithExternalLauncher；也可直接传 Executor 子类，或传 qualname 字符串动态解析。注释点明 backend 必须在 VllmConfig.__post_init__ 前被设好（实际是 ParallelConfig.__post_init__ 推导，见下一片段）。这是『字符串 flag → 具体实现类』的查表式工厂。",
+      "code": "    @staticmethod\n    def get_class(vllm_config: VllmConfig) -> type[\"Executor\"]:\n        executor_class: type[Executor]\n        parallel_config = vllm_config.parallel_config\n        distributed_executor_backend = parallel_config.distributed_executor_backend\n        # distributed_executor_backend must be set in VllmConfig.__post_init__\n        if isinstance(distributed_executor_backend, type):\n            if not issubclass(distributed_executor_backend, Executor):\n                raise TypeError(\n                    \"distributed_executor_backend must be a subclass of \"\n                    f\"Executor. Got {distributed_executor_backend}.\"\n                )\n            executor_class = distributed_executor_backend\n        elif distributed_executor_backend == \"ray\":\n            if envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:\n                from vllm.v1.executor.ray_executor_v2 import RayExecutorV2\n\n                executor_class = RayExecutorV2\n            else:\n                from vllm.v1.executor.ray_executor import RayDistributedExecutor\n\n                executor_class = RayDistributedExecutor\n        elif distributed_executor_backend == \"mp\":\n            from vllm.v1.executor.multiproc_executor import MultiprocExecutor\n\n            executor_class = MultiprocExecutor\n        elif distributed_executor_backend == \"uni\":\n            from vllm.v1.executor.uniproc_executor import UniProcExecutor\n\n            executor_class = UniProcExecutor\n        elif distributed_executor_backend == \"external_launcher\":\n            executor_class = ExecutorWithExternalLauncher\n        elif isinstance(distributed_executor_backend, str):\n            executor_class = resolve_obj_by_qualname(distributed_executor_backend)\n            if not issubclass(executor_class, Executor):\n                raise TypeError(\n                    \"distributed_executor_backend must be a subclass of \"\n                    f\"Executor. Got {executor_class}.\"\n                )\n        else:\n            raise ValueError(\n                f\"Unknown distributed executor backend: {distributed_executor_backend}\"\n            )\n        return executor_class"
+    },
+    {
+      "path": "vllm/config/parallel.py",
+      "lines": "L829-L874",
+      "note": "distributed_executor_backend 的默认推导（在 ParallelConfig.__post_init__ 内，先于上面的工厂）。world_size = TP×PP×PCP。若 backend=None 且 world_size_across_dp>1：默认 'mp'，但 TPU+SPMD→'uni'、单节点 GPU 数不足→报错、data_parallel_backend=='ray' 或检测到 Ray 已初始化/placement group→'ray'。若 backend=None 且 world_size==1：'uni'（单卡单进程）。这解释了『单卡跑默认 uni、多卡默认 mp』的来历。已省略 elastic-ep / external_launcher 早段分支。",
+      "code": "        if self.distributed_executor_backend is None and self.world_size_across_dp > 1:\n            # We use multiprocessing by default if world_size fits on the\n            # current node and we aren't in a ray placement group.\n\n            from vllm.v1.executor import ray_utils\n\n            backend: DistributedExecutorBackend = \"mp\"\n            ray_found = ray_utils.ray_is_available()\n            if current_platform.is_tpu() and envs.VLLM_XLA_USE_SPMD:\n                backend = \"uni\"\n            elif current_platform.is_cuda() and self.nnodes > 1:\n                backend = \"mp\"\n            elif (\n                current_platform.is_cuda()\n                and current_platform.device_count() < self.world_size\n            ):\n                gpu_count = current_platform.device_count()\n                raise ValueError(\n                    f\"World size ({self.world_size}) is larger than the number of \"\n                    f\"available GPUs ({gpu_count}) in this node. ...\"\n                )\n            elif self.data_parallel_backend == \"ray\":\n                backend = \"ray\"\n            elif ray_found:\n                # ... (placement-group / ray-initialized checks elided) ...\n                backend = \"ray\"\n            self.distributed_executor_backend = backend\n            logger.debug(\"Defaulting to use %s for distributed inference\", backend)\n\n        if self.distributed_executor_backend is None and self.world_size == 1:\n            self.distributed_executor_backend = \"uni\""
+    },
+    {
+      "path": "vllm/config/scheduler.py",
+      "lines": "L168-L188",
+      "note": "调度器工厂——三个工厂之二。get_scheduler_cls：若未指定 scheduler_cls，则按 async_scheduling 选 AsyncScheduler 或 Scheduler（默认）。可传自定义类或 qualname 字符串（会 warn『接口非公开』）。这把 __post_init__ 里推导出的 async_scheduling 布尔值转成具体调度器类。被 EngineCore.__init__ 调用。",
+      "code": "    def get_scheduler_cls(self) -> type[\"SchedulerInterface\"]:\n        if self.scheduler_cls is None:\n            if self.async_scheduling:\n                from vllm.v1.core.sched.async_scheduler import AsyncScheduler\n\n                return AsyncScheduler\n            from vllm.v1.core.sched.scheduler import Scheduler\n\n            return Scheduler\n\n        # This warning can be removed once the Scheduler interface is\n        # finalized and we can maintain support for scheduler classes that\n        # implement it\n        logger.warning_once(\n            \"Using custom scheduler class %s. This scheduler interface is \"\n            \"not public and compatibility may not be maintained.\",\n            self.scheduler_cls,  # type: ignore[arg-type]\n        )\n        if not isinstance(self.scheduler_cls, str):\n            return cast(type[\"SchedulerInterface\"], self.scheduler_cls)\n        return resolve_obj_by_qualname(self.scheduler_cls)"
+    },
+    {
+      "path": "vllm/v1/engine/core_client.py",
+      "lines": "L80-L130",
+      "note": "IPC 客户端工厂——三个工厂之三，连接 ch04（异步三段式）。make_client 按两维布尔 (multiprocess_mode, asyncio_mode) 选：async 但非 mp → 不支持（raise）；mp+async → make_async_mp_client；mp+sync → SyncMPClient；都否 → InprocClient（同进程，LLMEngine 调试/简单场景）。make_async_mp_client 再按 DP 维度细分：external LB → DPAsyncMPClient、internal LB → DPLBAsyncMPClient、单 DP → AsyncMPClient。这是『按执行模式 flag 选 IPC 实现』的二维查表。LLMEngine 传 asyncio_mode=False；AsyncLLM 走 make_async_mp_client。",
+      "code": "    @staticmethod\n    def make_client(\n        multiprocess_mode: bool,\n        asyncio_mode: bool,\n        vllm_config: VllmConfig,\n        executor_class: type[Executor],\n        log_stats: bool,\n    ) -> \"EngineCoreClient\":\n        # TODO: support this for debugging purposes.\n        if asyncio_mode and not multiprocess_mode:\n            raise NotImplementedError(\n                \"Running EngineCore in asyncio without multiprocessing \"\n                \"is not currently supported.\"\n            )\n\n        if multiprocess_mode and asyncio_mode:\n            return EngineCoreClient.make_async_mp_client(\n                vllm_config, executor_class, log_stats\n            )\n\n        if multiprocess_mode and not asyncio_mode:\n            return SyncMPClient(vllm_config, executor_class, log_stats)\n\n        return InprocClient(vllm_config, executor_class, log_stats)\n\n    @staticmethod\n    @instrument(span_name=\"Overall Loading\")\n    def make_async_mp_client(\n        vllm_config: VllmConfig,\n        executor_class: type[Executor],\n        log_stats: bool,\n        client_addresses: dict[str, str] | None = None,\n        client_count: int = 1,\n        client_index: int = 0,\n    ) -> \"AsyncMPClient\":\n        parallel_config = vllm_config.parallel_config\n        # ... (client_args tuple build elided) ...\n        if parallel_config.data_parallel_size > 1:\n            if parallel_config.data_parallel_external_lb:\n                return DPAsyncMPClient(*client_args)\n            return DPLBAsyncMPClient(*client_args)\n        return AsyncMPClient(*client_args)"
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L116-L153",
+      "note": "工厂产物的汇合点：EngineCore.__init__ 真正『实例化』executor_class（之前一直是类），完成 KV cache 初始化，再用 vllm_config.scheduler_config.get_scheduler_cls() 选调度器类并实例化。这印证了本章主题：VllmConfig 是唯一上下文容器，三个工厂从它派生出具体的 executor / scheduler 实例。EngineCore 自身的运行细节属 ch05/ch06，本章止于『装配完成』。已省略 KV-connector/batch-queue/prefix-hasher 等初始化。",
+      "code": "        # Setup Model.\n        self.model_executor = executor_class(vllm_config)\n        if executor_fail_callback is not None:\n            self.model_executor.register_failure_callback(executor_fail_callback)\n\n        self.available_gpu_memory_for_kv_cache = -1\n\n        # ... (elastic-ep early init elided) ...\n\n        # Setup KV Caches and update CacheConfig after profiling.\n        kv_cache_config = self._initialize_kv_caches(vllm_config)\n        self.structured_output_manager = StructuredOutputManager(vllm_config)\n\n        # Setup scheduler.\n        Scheduler = vllm_config.scheduler_config.get_scheduler_cls()\n\n        # ... (chunked-prefill-without-kvcache guard + block-size resolve elided) ...\n\n        self.scheduler: SchedulerInterface = Scheduler(\n            vllm_config=vllm_config,\n            kv_cache_config=kv_cache_config,\n            structured_output_manager=self.structured_output_manager,\n            include_finished_set=include_finished_set,\n            log_stats=self.log_stats,\n            block_size=scheduler_block_size,\n            hash_block_size=hash_block_size,\n        )"
+    }
+  ],
+
+  "key_classes": [
+    {"name": "EngineArgs", "file": "vllm/engine/arg_utils.py", "responsibility": "扁平的用户级参数 dataclass（字段默认值借自各子 Config 类）；__post_init__ 做 dict→Config 升格与插件加载；create_engine_config() 是核心：把扁平参数组装成 VllmConfig；create_model_config/create_load_config/create_speculative_config 为子构造器。AsyncEngineArgs 是其子类（多 enable_log_requests）。"},
+    {"name": "AsyncEngineArgs", "file": "vllm/engine/arg_utils.py", "responsibility": "EngineArgs 的异步变体（AsyncLLM/OpenAI server 用），仅增加 enable_log_requests 与异步专属 CLI 参数。"},
+    {"name": "VllmConfig", "file": "vllm/config/vllm.py", "responsibility": "聚合所有子配置（model/cache/parallel/scheduler/compilation/kernel/...）的总配置体，下游只需传它一个。__post_init__ 做跨子配置交叉校验与默认推导（async_scheduling 决策、O0-O3 应用、compilation/cudagraph 落定）；compute_hash() 产计算图指纹；持 optimization_level(默认 O2)/performance_mode(默认 balanced)。"},
+    {"name": "OptimizationLevel", "file": "vllm/config/vllm.py", "responsibility": "IntEnum O0-O3，表达启动时间 vs 运行性能权衡；经 OPTIMIZATION_LEVEL_TO_CONFIG 映射到一组 compilation/kernel 默认值字典。"},
+    {"name": "ModelConfig", "file": "vllm/config/model.py", "responsibility": "模型相关配置（HF config、dtype、max_model_len、runner_type、is_moe/is_multimodal 等派生属性）；许多其他子配置从它派生关键标志。"},
+    {"name": "CacheConfig", "file": "vllm/config/cache.py", "responsibility": "KV cache 配置（block_size、gpu_memory_utilization、enable_prefix_caching、cache_dtype 等）。"},
+    {"name": "ParallelConfig", "file": "vllm/config/parallel.py", "responsibility": "并行配置（TP/PP/DP/CP 各 size、distributed_executor_backend）；其 __post_init__ 推导 world_size 与 executor backend 默认值（mp/uni/ray）。"},
+    {"name": "SchedulerConfig", "file": "vllm/config/scheduler.py", "responsibility": "调度配置（max_num_batched_tokens/max_num_seqs、enable_chunked_prefill、policy、async_scheduling、scheduler_cls）；get_scheduler_cls() 是调度器工厂。"},
+    {"name": "CompilationConfig", "file": "vllm/config/compilation.py", "responsibility": "torch.compile 与 cudagraph 配置（mode、cudagraph_mode、pass_config 各 fusion 开关）；优化级默认值落到此对象。"},
+    {"name": "Executor", "file": "vllm/v1/executor/abstract.py", "responsibility": "执行器抽象基类；静态方法 get_class(vllm_config) 是执行器工厂，按 distributed_executor_backend 选 Uni/Multiproc/Ray/ExternalLauncher 子类；supports_async_scheduling() 反哺 async_scheduling 决策。"},
+    {"name": "EngineCoreClient", "file": "vllm/v1/engine/core_client.py", "responsibility": "IPC 客户端抽象基类；make_client/make_async_mp_client 是 IPC 工厂，按 (multiprocess_mode, asyncio_mode) 与 DP 维度选 Inproc/SyncMP/AsyncMP/DP* 客户端。"},
+    {"name": "EngineCore", "file": "vllm/v1/engine/core.py", "responsibility": "引擎核心；__init__ 是三工厂产物的汇合点——实例化 executor_class、调用 get_scheduler_cls 选并实例化调度器、初始化 KV cache。本章止于此（运行循环属后续章节）。"},
+    {"name": "LLMEngine", "file": "vllm/v1/engine/llm_engine.py", "responsibility": "v1 同步引擎门面；from_engine_args 串起 create_engine_config + Executor.get_class + EngineCoreClient.make_client(asyncio_mode=False)，是本章数据流的起点入口。"}
+  ],
+
+  "data_flow": [
+    "1. 用户构造 EngineArgs(...)（或 CLI → from_cli_args）；EngineArgs.__post_init__ 把 dict 形式子配置升格为 Config 对象、加载插件 [vllm/engine/arg_utils.py:__post_init__]",
+    "2. LLMEngine.from_engine_args 调用 engine_args.create_engine_config(usage_context) [vllm/v1/engine/llm_engine.py:from_engine_args]",
+    "3. create_engine_config：平台预注册 → DeviceConfig → (speculator 覆盖) → create_model_config() 读 HF 配置 [vllm/engine/arg_utils.py:create_engine_config]",
+    "4. 默认值推导：_set_default_chunked_prefill_and_prefix_caching_args / _set_default_max_num_seqs_and_batched_tokens_args 依模型能力与 usage_context 补默认 [vllm/engine/arg_utils.py:_set_default_*]",
+    "5. 逐个打包子配置：CacheConfig / ParallelConfig / SchedulerConfig / LoadConfig / CompilationConfig 等（扁平 self.* → 结构化）[vllm/engine/arg_utils.py:create_engine_config]",
+    "6. VllmConfig(...) 构造（含 optimization_level/performance_mode）[vllm/engine/arg_utils.py:create_engine_config 末]",
+    "7. VllmConfig.__post_init__：try_verify_and_update_config 按架构改写 → model/parallel/lora 交叉校验 → 量化推导 [vllm/config/vllm.py:__post_init__]",
+    "8. async_scheduling 决策：Executor.get_class(self).supports_async_scheduling() + 三态逐条排除 [vllm/config/vllm.py:__post_init__]",
+    "9. compilation/cudagraph 落定：enforce_eager/环境变量覆盖 → mode 默认按 optimization_level → _apply_optimization_level_defaults 落实 O0-O3 预设 [vllm/config/vllm.py:__post_init__ + _apply_optimization_level_defaults]",
+    "10. 回到 from_engine_args：executor_class = Executor.get_class(vllm_config) [vllm/v1/executor/abstract.py:get_class]（backend 已在 ParallelConfig.__post_init__ 推导）",
+    "11. LLMEngine.__init__ → EngineCoreClient.make_client(multiprocess_mode, asyncio_mode=False, ...) 选 IPC 客户端 [vllm/v1/engine/core_client.py:make_client]",
+    "12. （inproc 或子进程内）EngineCore.__init__：executor_class(vllm_config) 实例化执行器 → get_scheduler_cls() 选并实例化调度器 → 初始化 KV cache [vllm/v1/engine/core.py:__init__]",
+    "13. （任意时刻）vllm_config.compute_hash() 产 10 位计算图指纹，供 torch.compile 编译缓存 [vllm/config/vllm.py:compute_hash]"
+  ],
+
+  "design_decisions": [
+    {"decision": "EngineArgs 扁平、字段默认值直接引用子 Config 类属性（如 model=ModelConfig.model）", "why": "单一真相源：CLI 默认值与子配置默认值天然同步，避免两处维护漂移", "evidence": "vllm/engine/arg_utils.py:L406-L440"},
+    {"decision": "把数百个扁平参数集中在 create_engine_config 里重新打包成结构化子 Config，再聚合进 VllmConfig", "why": "下游所有模块只需传一个 VllmConfig 即拿到全部上下文；扁平参数便于 CLI，结构化便于内部传递与校验", "evidence": "vllm/engine/arg_utils.py:L1679-L1698, L2149-L2177"},
+    {"decision": "跨子配置的约束/默认推导集中在 VllmConfig.__post_init__，而非散落各子配置", "why": "很多约束跨多个子配置（async_scheduling 取决于 executor+speculative+model；cudagraph 取决于 enforce_eager+optimization_level），单点落地避免顺序依赖错误", "evidence": "vllm/config/vllm.py:L721-L981"},
+    {"decision": "优化级 O0-O3 用『预设字典 + 递归只填 None』而非命令式 if-else", "why": "声明式表达每级的 fusion/cudagraph/autotune 默认；_set_config_default 保证用户显式设置永不被覆盖（优先级：用户>enforce_eager/env>优化级预设）", "evidence": "vllm/config/vllm.py:L184-L270, L652-L679, L948-L976"},
+    {"decision": "优化级预设值可以是谓词函数（如 enable_norm_fusion）而非纯常量", "why": "某些 fusion 是否启用需运行时按平台/模型/量化动态决定，函数延迟求值正好表达此意", "evidence": "vllm/config/vllm.py:L95-L181, L224-L243"},
+    {"decision": "三个『工厂』(Executor.get_class / get_scheduler_cls / make_client) 都按 VllmConfig 里的 flag 查表选具体类", "why": "把『配置』与『实现选择』解耦：同一套配置在单卡/多卡/Ray/同步/异步下选出不同实现，调用方无需关心分支", "evidence": "vllm/v1/executor/abstract.py:L47-L92, vllm/config/scheduler.py:L168-L188, vllm/v1/engine/core_client.py:L80-L130"},
+    {"decision": "distributed_executor_backend 默认 None，由 ParallelConfig.__post_init__ 按 world_size/平台/Ray 推导（单卡 uni、多卡 mp、Ray 环境 ray）", "why": "让用户零配置即得合理后端；显式指定仍优先", "evidence": "vllm/config/parallel.py:L829-L874"},
+    {"decision": "async_scheduling 三态 (True/False/None)，None 表示『自动』并逐条排除不兼容项后默认开启", "why": "异步调度默认有益但与 pooling/部分投机方法/部分执行器不兼容；三态既支持用户强开（硬校验）又支持自动安全退化", "evidence": "vllm/config/vllm.py:L777-L852"},
+    {"decision": "compute_hash 只收『影响计算图结构』的因子（含 vLLM 版本 + 各子配置 hash），取前 10 位", "why": "作为 torch.compile 编译产物缓存键：配置变了→指纹变→重编译；排除不影响图的字段以提高缓存命中", "evidence": "vllm/config/vllm.py:L367-L473"},
+    {"decision": "executor_class 在 from_engine_args 阶段只『选类』不『实例化』，真正实例化推迟到 EngineCore.__init__", "why": "执行器实例化涉及 GPU/子进程等重资源，应在引擎核心（可能在独立进程）内完成，而非配置组装阶段", "evidence": "vllm/v1/engine/llm_engine.py:L163, vllm/v1/engine/core.py:L118"}
+  ],
+
+  "theory": [
+    "配置组装的本质是一次『扁平参数空间 → 结构化配置空间 → 实现选择空间』的两级映射：第一级 create_engine_config（参数→VllmConfig），第二级三工厂（VllmConfig→具体类）。理解 vLLM 启动只需抓这两级。",
+    "优化级 O0-O3 是单调旋钮：随级别升高，编译与 cudagraph 越激进，启动越慢但稳态吞吐/延迟越好。O0 适合快速迭代/调试，O2(默认) 适合生产，O3 当前等同 O2（为未来预留）。",
+    "compute_hash 的作用域被刻意限定为『从 input ids/embeddings 到 final hidden states 的计算图结构』——前处理(tokenize)与后处理(detokenize)不影响图，故不入哈希。这决定了哪些配置改动会触发昂贵的 torch.compile 重编译。",
+    "复杂度直觉：create_engine_config 是 O(参数数) 的一次性线性打包，无热点；__post_init__ 的代价主要在 create_model_config 内读 HF config（IO）与可能的内存 profiling（在 EngineCore 内，不在本章）。配置层本身极轻量。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "create_engine_config 中 Ray runtime env / placement group 收集（L1725-L1750）", "why_safe": "仅多机 Ray 部署用，单机精简版用不到；删除不改变单机 mp/uni 路径的配置正确性"},
+      {"what": "DP(数据并行) 的 hybrid/external load-balancer 推导大段（L1752-L1880，data_parallel_* 系列）", "why_safe": "本章主线是单 DP 的配置组装；DP 负载均衡是独立子系统，删除后 data_parallel_size=1 路径完全等价"},
+      {"what": "TurboQuant 边界层跳过（L1700-L1723）与 turboquant flash_attn 覆盖（L2031-L2042）", "why_safe": "特定量化方案的边角处理，非主线；非 turboquant 路径不触及"},
+      {"what": "mamba_config / kernel_config / offload_config / observability_config / attention_config 的逐字段覆盖样板（L2018-L2144）", "why_safe": "与 CacheConfig 构造同构的重复打包，保留一个代表（CacheConfig + SchedulerConfig + CompilationConfig）即可讲清模式，其余删除不损主线理解"},
+      {"what": "__post_init__ 中 deep_gemm 自动禁用、Turing float32 警告、blocked-weights custom op、KV-connector cudagraph 降级、sequence-parallelism 阈值推导（L758-L776, L879-L946, L995-L1094 大部）", "why_safe": "都是特定硬件/特性的边角校验分支，与『配置组装+三工厂+优化级+async决策+compute_hash』主线无关，删后主线分支保持原控制流"},
+      {"what": "compute_hash 中除 model/cache/parallel/scheduler/compilation/kernel 之外的子配置追加（device/load/offload/attention/lora/speculative/structured/observability/profiler/kv_transfer/ec_transfer/additional）", "why_safe": "全是同构的 if-present-append-else-None 重复；保留代表性几项即可讲清『收集因子→哈希』算法，删除其余不改变算法本质"},
+      {"what": "EngineCore.__init__ 中 KV-connector handshake、batch_queue(PP)、prefix hasher、GC freeze 等初始化（L154-L229）", "why_safe": "属引擎运行准备，非本章配置→工厂主线；保留到 scheduler 实例化即止"},
+      {"what": "Executor.get_class 中 Ray V2 / 自定义类/qualname 分支（L60-L68, L81-L87）", "why_safe": "保留 mp/uni/external_launcher 三个主分支即可讲清工厂模式；Ray 与动态解析为高级用法"}
+    ],
+    "must_keep": [
+      {"symbol": "EngineArgs", "why": "本章数据流起点，扁平参数容器"},
+      {"symbol": "create_engine_config", "why": "参数→VllmConfig 的核心组装方法，第一级映射"},
+      {"symbol": "create_model_config", "why": "最重的子构造器，其他子配置从 ModelConfig 派生标志"},
+      {"symbol": "VllmConfig", "why": "聚合总配置体，全章中枢"},
+      {"symbol": "OptimizationLevel", "why": "O0-O3 优化级枚举，本章明确点名的主题"},
+      {"symbol": "OPTIMIZATION_LEVEL_TO_CONFIG", "why": "优化级→预设字典的查表，读者需理解优化级如何落地"},
+      {"symbol": "_apply_optimization_level_defaults", "why": "优化级应用机制（递归只填 None），解释用户优先级"},
+      {"symbol": "compute_hash", "why": "计算图指纹，本章明确点名；torch.compile 缓存键"},
+      {"symbol": "CacheConfig", "why": "代表性子配置之一，本章点名"},
+      {"symbol": "ParallelConfig", "why": "持 distributed_executor_backend，驱动执行器工厂；本章点名"},
+      {"symbol": "SchedulerConfig", "why": "本章点名；持 async_scheduling/scheduler_cls，驱动调度器工厂"},
+      {"symbol": "CompilationConfig", "why": "本章点名；优化级默认值落点（mode/cudagraph_mode）"},
+      {"symbol": "get_scheduler_cls", "why": "调度器工厂（三工厂之二），本章核心"},
+      {"symbol": "async_scheduling", "why": "三态决策的核心字段，驱动调度器选择，伏笔 ch06"},
+      {"symbol": "Executor", "why": "执行器抽象基类，工厂宿主"},
+      {"symbol": "get_class", "why": "执行器工厂（三工厂之一），本章点名"},
+      {"symbol": "distributed_executor_backend", "why": "执行器工厂的选择依据；其默认推导(mp/uni/ray)是读者关键困惑点"},
+      {"symbol": "supports_async_scheduling", "why": "async_scheduling 决策依赖执行器能力的关键回路"},
+      {"symbol": "EngineCoreClient", "why": "IPC 客户端抽象基类，工厂宿主"},
+      {"symbol": "make_client", "why": "IPC 工厂（三工厂之三），按执行模式选 Inproc/SyncMP/AsyncMP；连接 ch04"},
+      {"symbol": "make_async_mp_client", "why": "异步 IPC 客户端的细分工厂，ch04 异步三段式的入口"},
+      {"symbol": "EngineCore", "why": "三工厂产物的汇合点，本章终点"},
+      {"symbol": "LLMEngine", "why": "本章数据流入口门面"},
+      {"symbol": "from_engine_args", "why": "串起 create_engine_config + get_class + make_client 的入口方法"}
+    ]
+  },
+
+  "diagram_plan": [
+    {
+      "id": "ch03-two-level-mapping",
+      "title": "两级映射：EngineArgs → VllmConfig → 具体实现类",
+      "type": "flow / layered",
+      "spec": "三列泳道。左列『扁平参数』(EngineArgs 字段示例：model/tensor_parallel_size/optimization_level/async_scheduling)；中列『结构化配置』(VllmConfig 含 ModelConfig/CacheConfig/ParallelConfig/SchedulerConfig/CompilationConfig 方块)；右列『实现选择』(Executor 子类 / Scheduler|AsyncScheduler / Inproc|SyncMP|AsyncMP)。中间用 create_engine_config 箭头连左→中，三工厂(get_class/get_scheduler_cls/make_client)箭头连中→右。VllmConfig.__post_init__ 标在中列内做交叉校验/推导。建议 svg-diagram 生成（多对多连线，Mermaid 易乱）。",
+      "roadmap_highlight": "config-and-wiring (ch03)"
+    },
+    {
+      "id": "ch03-optimization-levels",
+      "title": "O0-O3 优化级与落地的 compilation/cudagraph 默认",
+      "type": "table / matrix",
+      "spec": "行=O0/O1/O2/O3，列=compilation mode、cudagraph_mode、关键 fusion 开关(fuse_norm_quant/fuse_allreduce_rms 等)、enable_flashinfer_autotune。单元格填实际默认值(NONE/PIECEWISE/FULL_AND_PIECEWISE/谓词)。底部一行注：用户显式 > enforce_eager/env > 优化级预设。",
+      "roadmap_highlight": "config-and-wiring (ch03)"
+    },
+    {
+      "id": "ch03-async-scheduling-decision",
+      "title": "async_scheduling 三态决策树",
+      "type": "decision tree",
+      "spec": "根：async_scheduling 值？分三支。True→硬校验(投机方法兼容? 执行器支持?)→否则 raise / 否则 enabled。False→disabled。None→逐条排除(pooling? 不兼容投机方法? disable_padded_drafter_batch? 执行器不支持?)→全否则 enabled。叶子标 enabled/disabled/raise。",
+      "roadmap_highlight": "config-and-wiring (ch03)"
+    }
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recover": [],
+    "note": "bible.py due ch03 返回空（应埋/应回收均无）。本章天然埋下伏笔供后续回收（建议 Archivist 登记）：(a) async_scheduling 决策与 AsyncScheduler 选择 → ch06 调度章；(b) EngineCoreClient.make_async_mp_client / AsyncMPClient → ch04 异步三段式；(c) CacheConfig.enable_prefix_caching/block_size → ch05 内存管理章；(d) compute_hash 作为 torch.compile 缓存键 → 编译/cudagraph 章。"
+  }
+}
