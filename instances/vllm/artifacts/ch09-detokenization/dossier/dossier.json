@@ -1,0 +1,264 @@
+{
+  "chapter_id": "ch09",
+  "title": "增量去 token 化与 stop string：IncrementalDetokenizer 层级、stop-string holdback、min_tokens 守卫、UTF-8 多字节边界恢复",
+  "source_pin": "f3fef123",
+  "code_spine": [
+    "vllm/v1/engine/output_processor.py:L621-L687  —— process_outputs 单循环里调用 detokenizer.update() 拿 stop_string，并据此改写 finish_reason/stop_reason、决定是否回灌 reqs_to_abort",
+    "vllm/v1/engine/detokenizer.py:L48-L65  —— IncrementalDetokenizer.from_new_request 工厂：tokenizer 缺失→空壳；Fast tokenizer 且 tokenizers>=0.22.0→FastIncrementalDetokenizer；否则→SlowIncrementalDetokenizer",
+    "vllm/v1/engine/detokenizer.py:L68-L93  —— BaseIncrementalDetokenizer.__init__：解析 stop/min_tokens/include_stop_str_in_output，算 stop_buffer_length=max(len(s))-1",
+    "vllm/v1/engine/detokenizer.py:L95-L142  —— BaseIncrementalDetokenizer.update：跳过 stop token、逐 token decode_next 累积 output_text、min_tokens 推进 stop_check_offset、check_stop_strings 并截断",
+    "vllm/v1/engine/detokenizer.py:L207-L242  —— FastIncrementalDetokenizer.decode_next + _protected_step：DecodeStream.step、特殊 token 空格抑制、UTF-8 无效前缀错误恢复（重建 DecodeStream）",
+    "vllm/v1/engine/detokenizer.py:L286-L301  —— SlowIncrementalDetokenizer.decode_next：调 detokenize_incrementally，维护 tokens/prefix_offset/read_offset",
+    "vllm/tokenizers/detokenizer_utils.py:L110-L202  —— detokenize_incrementally：prefix/read offset 双窗口对抗 decode 的空格清理算法 + UTF-8 byte-fallback 未完成字节序列（末尾 '\\ufffd'）防吐",
+    "vllm/v1/engine/detokenizer.py:L304-L339  —— check_stop_strings：仅在新增字符窗口内 find，按 include_in_output 决定截断到 stop 串首/尾，返回 (stop_str, truncate_to)",
+    "vllm/v1/engine/detokenizer.py:L148-L164  —— BaseIncrementalDetokenizer.get_next_output_text：delta/cumulative 两种取文本，finished 前扣留 stop_buffer_length 个尾字符"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/engine/detokenizer.py",
+      "lines": "L22-L27",
+      "code": "# Only tokenizers >= 0.22.0 supports DecodeStream with native prefill\n# (ids parameter) used for FastIncrementalDetokenizer.\nUSE_FAST_DETOKENIZER = version.parse(tokenizers.__version__) >= version.parse(\"0.22.0\")\n\n# Error string from https://github.com/huggingface/tokenizers/blob/909fdde2a4ffedd9295206f705eb612be2a91b12/tokenizers/src/tokenizer/mod.rs#L1042\nINVALID_PREFIX_ERR_MSG = \"Invalid prefix encountered\"",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/detokenizer.py",
+      "lines": "L48-L65",
+      "code": "    @classmethod\n    def from_new_request(\n        cls,\n        tokenizer: TokenizerLike | None,\n        request: EngineCoreRequest,\n    ) -> \"IncrementalDetokenizer\":\n        assert request.sampling_params is not None\n\n        if tokenizer is None:\n            # No tokenizer => skipping detokenization.\n            return IncrementalDetokenizer()\n\n        if USE_FAST_DETOKENIZER and isinstance(tokenizer, PreTrainedTokenizerFast):\n            # Fast tokenizer => use tokenizers library DecodeStream.\n            return FastIncrementalDetokenizer(tokenizer, request)\n\n        # Fall back to slow python-based incremental detokenization.\n        return SlowIncrementalDetokenizer(tokenizer, request)",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/detokenizer.py",
+      "lines": "L72-L90",
+      "code": "        # Stop strings\n        params = request.sampling_params\n        assert params is not None\n        if params.stop is None:\n            self.stop = []\n        elif isinstance(params.stop, str):\n            self.stop = [params.stop]\n        else:\n            self.stop = params.stop\n        self.min_tokens = params.min_tokens\n        self.include_stop_str_in_output = params.include_stop_str_in_output\n\n        # Number of chars to hold back when stop strings are to be excluded\n        # from streamed output.\n        if self.stop and not self.include_stop_str_in_output:\n            self.stop_buffer_length = max(len(s) for s in self.stop) - 1\n        else:\n            self.stop_buffer_length = 0\n        self._last_output_text_offset: int = 0",
+      "elide": ["__init__ 开头 super().__init__() 与结尾 self.output_text = \"\" 省略，保留 stop/min_tokens/holdback 核心"]
+    },
+    {
+      "path": "vllm/v1/engine/detokenizer.py",
+      "lines": "L95-L142",
+      "code": "    def update(self, new_token_ids: list[int], stop_terminated: bool) -> str | None:\n        \"\"\"\n        Update RequestState for the request_id by:\n            1) Detokenize the new token ids incrementally.\n            2) Evaluate stop criteria.\n\n        Return matched stop string or None.\n        \"\"\"\n        if not new_token_ids:\n            # Skip detokenization if no new token ids.\n            return None\n\n        if stop_terminated and not self.include_stop_str_in_output:\n            # If stop-terminated, exclude last token from detokenization\n            # based on include_stop_str_in_output parameter.\n            skipped_stop_token_id = new_token_ids[-1]\n            new_token_ids = new_token_ids[:-1]\n        else:\n            skipped_stop_token_id = None\n\n        # 1) Detokenize the new token ids incrementally.\n        stop_check_offset = len(self.output_text)\n        for new_token_id in new_token_ids:\n            self.token_ids.append(new_token_id)\n            self.output_text += self.decode_next(new_token_id)\n            # Support min_tokens, see https://github.com/vllm-project/vllm/pull/22014\n            if self.min_tokens and self.num_output_tokens() <= self.min_tokens:\n                stop_check_offset = len(self.output_text)\n\n        if skipped_stop_token_id is not None:\n            # Cleanup after skipping detokenization.\n            self.token_ids.append(skipped_stop_token_id)\n\n        # 2) Evaluate stop strings.\n        stop_string = None\n        if self.stop and self.num_output_tokens() > self.min_tokens:\n            stop = check_stop_strings(\n                output_text=self.output_text,\n                new_char_count=len(self.output_text) - stop_check_offset,\n                stop=self.stop,\n                include_in_output=self.include_stop_str_in_output,\n            )\n            if stop is not None:\n                stop_string, truncate_to = stop\n                if truncate_to != -1:\n                    self.output_text = self.output_text[:truncate_to]\n\n        return stop_string",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/detokenizer.py",
+      "lines": "L148-L164",
+      "code": "    def get_next_output_text(self, finished: bool, delta: bool) -> str:\n        \"\"\"If delta is True, only new text since the last call to\n        this method is returned\"\"\"\n\n        # We return the full output text if the sequence is finished.\n        buffer_length = 0 if finished else self.stop_buffer_length\n        if not delta:\n            if not buffer_length:\n                return self.output_text\n            return self.output_text[:-buffer_length]\n\n        length = len(self.output_text) - buffer_length\n        last_offset = self._last_output_text_offset\n        if last_offset < length:\n            self._last_output_text_offset = length\n            return self.output_text[last_offset:length]\n        return \"\"",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/detokenizer.py",
+      "lines": "L180-L183",
+      "code": "        # Use native prefill to prime the decode stream with prompt tokens.\n        self.stream = DecodeStream(\n            ids=request.prompt_token_ids,\n            skip_special_tokens=self.skip_special_tokens,\n        )",
+      "elide": ["__init__ 前半 self.request_id/skip_special_tokens/self.tokenizer 赋值省略；后半 spaces_between_special_tokens 与 added_token_ids 预计算省略（仅在禁用特殊 token 间空格时使用）"]
+    },
+    {
+      "path": "vllm/v1/engine/detokenizer.py",
+      "lines": "L207-L242",
+      "code": "    def decode_next(self, next_token_id: int) -> str:\n        token = self._protected_step(next_token_id)\n\n        if not self.spaces_between_special_tokens:\n            special_token = self.added_token_ids.get(next_token_id)\n            is_special = special_token is not None\n            if is_special and self.last_special:\n                # Return raw token string without any prefixed spaces.\n                token = special_token\n            self.last_special = is_special\n\n        return token or \"\"\n\n    def _protected_step(self, next_token_id: int) -> str | None:\n        try:\n            token = self.stream.step(self.tokenizer, next_token_id)\n        except (OverflowError, TypeError):\n            # Handle rare observed overflow, still to be diagnosed.\n            # See https://github.com/vllm-project/vllm/issues/21951.\n            logger.exception(\"Encountered invalid token id: %r\", next_token_id)\n            token = None\n        except Exception as e:\n            if not str(e).startswith(INVALID_PREFIX_ERR_MSG):\n                raise e\n            # Recover from edge case where tokenizer can produce non-monotonic,\n            # invalid UTF-8 output, which breaks the internal state of\n            # tokenizers' DecodeStream.\n            # See https://github.com/vllm-project/vllm/issues/17448.\n            logger.warning(\n                \"Encountered invalid prefix detokenization error\"\n                \" for request %s, resetting decode stream.\",\n                self.request_id,\n            )\n            self.stream = DecodeStream(skip_special_tokens=self.skip_special_tokens)\n            token = self.stream.step(self.tokenizer, next_token_id)\n        return token",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/detokenizer.py",
+      "lines": "L286-L301",
+      "code": "    def decode_next(self, next_token_id: int) -> str:\n        new_tokens, decoded_text, prefix_offset, read_offset = detokenize_incrementally(\n            tokenizer=self.tokenizer,\n            all_input_ids=self.token_ids,\n            prev_tokens=self.tokens,\n            prefix_offset=self.prefix_offset,\n            read_offset=self.read_offset,\n            skip_special_tokens=self.skip_special_tokens,\n            spaces_between_special_tokens=self.spaces_between_special_tokens,\n        )\n\n        self.tokens.extend(new_tokens)\n        self.prefix_offset = prefix_offset\n        self.read_offset = read_offset\n\n        return decoded_text",
+      "elide": []
+    },
+    {
+      "path": "vllm/tokenizers/detokenizer_utils.py",
+      "lines": "L143-L202",
+      "code": "    new_token_id = all_input_ids[-1]\n    # This is the first iteration for this sequence\n    is_first_iter = prev_tokens is None\n    if is_first_iter:\n        (prev_tokens, prefix_offset, read_offset) = convert_prompt_ids_to_tokens(\n            tokenizer, all_input_ids[:-1], skip_special_tokens=skip_special_tokens\n        )\n    assert prev_tokens is not None\n\n    # If the new token id is out of bounds, return an empty string.\n    if 0 <= new_token_id < len(tokenizer):\n        # Put new_token_id in a list so skip_special_tokens is respected\n        new_tokens = tokenizer.convert_ids_to_tokens(\n            [new_token_id], skip_special_tokens=skip_special_tokens\n        )\n        if isinstance(new_tokens, str):\n            new_tokens = [new_tokens]\n        else:\n            # This is required to guard against out-of-vocab prompt token ids\n            # (for example when using dummy weights)\n            _replace_none_with_empty(new_tokens)  # type: ignore[arg-type]\n    else:\n        new_tokens = [\"\"]\n    output_tokens = prev_tokens + new_tokens\n\n    # If this is the first iteration, return all tokens.\n    if is_first_iter:\n        new_tokens = output_tokens\n\n    # The prefix text is necessary only to defeat cleanup algorithms in\n    # the decode which decide to add a space or not depending on the\n    # surrounding ids.\n    if tokenizer.is_fast or not tokenizer.get_added_vocab():\n        prefix_text = tokenizer.convert_tokens_to_string(\n            output_tokens[prefix_offset:read_offset]\n        )\n        new_text = tokenizer.convert_tokens_to_string(output_tokens[prefix_offset:])\n    else:\n        prefix_text = _convert_tokens_to_string_with_added_encoders(...)\n        new_text = _convert_tokens_to_string_with_added_encoders(...)\n\n    if len(new_text) <= len(prefix_text) or new_text.endswith(\"\\ufffd\"):\n        # utf-8 char at the end means it's a potential unfinished byte sequence\n        # from byte fallback tokenization.\n        # If it's in the middle, it's probably a real invalid id generated\n        # by the model\n        return new_tokens, \"\", prefix_offset, read_offset\n\n    new_text = new_text[len(prefix_text) :]\n    return new_tokens, new_text, read_offset, len(output_tokens)",
+      "elide": ["else 分支（有 added vocab 的非 fast tokenizer）展开成 _convert_tokens_to_string_with_added_encoders(tokenizer, output_tokens[...], skip_special_tokens=..., spaces_between_special_tokens=...)，逻辑同上只是逐 added-token 切段，故折叠为 (...)"]
+    },
+    {
+      "path": "vllm/tokenizers/detokenizer_utils.py",
+      "lines": "L54-L80",
+      "code": "# 5 is an arbitrary value that should work for all\n# tokenizers (bigger = more conservative).\nINITIAL_INCREMENTAL_DETOKENIZATION_OFFSET = 5\n\n\ndef convert_prompt_ids_to_tokens(\n    tokenizer: TokenizerLike,\n    prompt_ids: list[int],\n    skip_special_tokens: bool = False,\n) -> tuple[list[str], int, int]:\n    \"\"\"Converts the prompt ids to tokens and returns the tokens and offsets\n    for incremental detokenization.\n\n    Note that not all tokens are converted to strings. Only the tokens that\n    are necessary for incremental detokenization are converted to strings.\n    \"\"\"\n    # We do not need to convert the whole prompt to tokens.\n    # Offset a little more in case we have special tokens.\n    new_tokens = tokenizer.convert_ids_to_tokens(\n        prompt_ids[-INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET - 2 :],\n        skip_special_tokens=skip_special_tokens,\n    )\n    read_offset = len(new_tokens)\n    prefix_offset = max(read_offset - INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET, 0)\n    # This is required to guard against out-of-vocab prompt token ids\n    _replace_none_with_empty(new_tokens)  # type: ignore[arg-type]\n    return new_tokens, prefix_offset, read_offset",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/detokenizer.py",
+      "lines": "L304-L339",
+      "code": "def check_stop_strings(\n    output_text: str,\n    new_char_count: int,\n    stop: list[str],\n    include_in_output: bool,\n) -> tuple[str, int] | None:\n    \"\"\"Check if any stop strings are matched and truncate sequence\n    output text accordingly.\n\n    Returns tuple (stop_string, offset) if matched or else None.\n\n    Where stop_string is the matched stop string and offset is the\n    length to which output_text should be truncated, or -1 for no\n    truncation.\n    \"\"\"\n    if not new_char_count or not stop:\n        return None\n\n    for stop_str in stop:\n        stop_string_len = len(stop_str)\n        # Avoid searching already-searched text.\n        stop_index = output_text.find(stop_str, 1 - new_char_count - stop_string_len)\n        if stop_index == -1:\n            continue\n\n        if include_in_output:\n            # Truncate to end of stop string.\n            stop_index += stop_string_len\n            if stop_index >= len(output_text):\n                # No truncation required.\n                return stop_str, -1\n\n        # Truncate the output text to either the beginning\n        # or end of the stop string.\n        return stop_str, stop_index\n    return None",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/output_processor.py",
+      "lines": "L628-L675",
+      "code": "            if pooling_output is None:\n                assert req_state.detokenizer is not None\n                assert req_state.logprobs_processor is not None\n                # 2) Detokenize the token ids into text and perform stop checks.\n                stop_string = req_state.detokenizer.update(\n                    new_token_ids, finish_reason == FinishReason.STOP\n                )\n                if stop_string:\n                    finish_reason = FinishReason.STOP\n                    stop_reason = stop_string\n\n                # 3) Compute sample and prompt logprobs for request,\n                # if required.\n                req_state.logprobs_processor.update_from_output(engine_core_output)\n            # ... (RequestOutput assembly elided) ...\n            # Free completed requests.\n            if finish_reason is not None:\n                # ... streaming-input branch elided ...\n                    self._finish_request(req_state)\n                    if not engine_core_output.finished:\n                        # If req not finished in EngineCore, but Detokenizer\n                        # detected stop string, abort needed in EngineCore.\n                        reqs_to_abort.append(req_id)",
+      "elide": ["第 4 步 make_request_output 与 queue/return 分派、streaming_input 回灌、stats/tracing 在本章不展开，仅保留 detokenize + stop_string 改写 finish_reason + reqs_to_abort 三处与去 token 化直接相关的逻辑"]
+    }
+  ],
+  "key_classes": [
+    {
+      "name": "IncrementalDetokenizer",
+      "file": "vllm/v1/engine/detokenizer.py",
+      "responsibility": "层级根 + 空壳实现（无 tokenizer 或 detokenize=False 时使用）：只累积 token_ids，update 返回 None、get_next_output_text 返回空串。同时持有工厂 from_new_request，按 tokenizers 版本与 tokenizer 类型三路分派。"
+    },
+    {
+      "name": "BaseIncrementalDetokenizer",
+      "file": "vllm/v1/engine/detokenizer.py",
+      "responsibility": "抽象基类（ABC）：承载与具体 tokenizer 无关的全部公共逻辑——stop/min_tokens 解析、stop_buffer_length holdback 计算、update 主流程（跳过 stop token、逐 token decode_next、min_tokens 推进 stop_check_offset、check_stop_strings 截断）、get_next_output_text 的 delta/cumulative 取文本与尾字符扣留。decode_next 是抽象方法，两个子类各自实现。"
+    },
+    {
+      "name": "FastIncrementalDetokenizer",
+      "file": "vllm/v1/engine/detokenizer.py",
+      "responsibility": "快路径：用 Rust tokenizers 库的 DecodeStream，构造时以 prompt_token_ids 做 native prefill 预热流；decode_next 调 stream.step；_protected_step 兜两类异常——(OverflowError, TypeError) 吞掉返回 None，'Invalid prefix encountered' 则重建 DecodeStream 恢复（修复 UTF-8 非单调无效输出破坏内部状态）。可选抑制相邻特殊 token 间空格。"
+    },
+    {
+      "name": "SlowIncrementalDetokenizer",
+      "file": "vllm/v1/engine/detokenizer.py",
+      "responsibility": "慢路径（纯 Python 回退，非 fast tokenizer 或 tokenizers<0.22.0）：以 prompt 预填 tokens 并算初始 prefix_offset/read_offset；decode_next 调 detokenize_incrementally 维护双 offset 窗口。覆写 output_token_ids/num_output_tokens 以剔除 prompt 部分（token_ids 含 prompt，与 Fast 路径不同）。"
+    },
+    {
+      "name": "OutputProcessor",
+      "file": "vllm/v1/engine/output_processor.py",
+      "responsibility": "Stage-3 输出处理器，唯一遍历 EngineCoreOutputs 的单循环。本章只关心其 process_outputs 中对 detokenizer.update() 的调用：把返回的 stop_string 转成 finish_reason=STOP / stop_reason，并在 EngineCore 自己没结束时把 req_id 放入 reqs_to_abort 回灌给 EngineCore。"
+    }
+  ],
+  "data_flow": [
+    "1. 建请求：RequestState.from_new_request → IncrementalDetokenizer.from_new_request(tokenizer, request) 按 USE_FAST_DETOKENIZER + PreTrainedTokenizerFast 选 Fast/Slow/空壳（vllm/v1/engine/output_processor.py:L227-L230, detokenizer.py:L48-L65）。",
+    "2. 每步输出：OutputProcessor.process_outputs 循环里调 detokenizer.update(new_token_ids, finish_reason==STOP)（output_processor.py:L632-L634）。",
+    "3. update 跳 stop token：若 stop_terminated 且 not include_stop_str_in_output，弹出末 token 不参与 decode，事后补回 token_ids（detokenizer.py:L107-L114, L124-L126）。",
+    "4. update 逐 token 解码：for 循环里 token_ids.append + output_text += decode_next(id)；min_tokens 期间把 stop_check_offset 推到当前文末，阻止 stop 命中（detokenizer.py:L117-L122）。",
+    "5. decode_next（Fast）：_protected_step → DecodeStream.step（detokenizer.py:L207-L242）；或（Slow）detokenize_incrementally（detokenizer.py:L286-L301 → detokenizer_utils.py:L110-L202）。",
+    "6. detokenize_incrementally 用 prefix_offset/read_offset 双窗口：prefix_text = decode(tokens[prefix:read])，new_text = decode(tokens[prefix:])，截掉 prefix 部分得增量文本；若 new_text 没增长或末尾是 '\\ufffd' 则吐空串等下一 token（detokenizer_utils.py:L172-L202）。",
+    "7. update 查 stop：仅当 self.stop 且 num_output_tokens()>min_tokens 时调 check_stop_strings，命中则 truncate_to!=-1 时截断 output_text（detokenizer.py:L130-L142）。",
+    "8. check_stop_strings 在 [1-new_char_count-len(stop)] 起的窗口 find，按 include_in_output 决定截到 stop 串首或尾，返回 (stop_str, truncate_to)（detokenizer.py:L319-L339）。",
+    "9. 取文本：make_request_output → _new_completion_output → get_next_output_text(finished, delta)；未结束时尾部扣 stop_buffer_length 个字符 holdback，结束时全吐（detokenizer.py:L148-L164, output_processor.py:L389）。",
+    "10. 回灌：若 detokenizer 命中 stop_string，OutputProcessor 设 finish_reason=STOP；EngineCore 没自己结束则把 req_id 加入 reqs_to_abort（output_processor.py:L635-L637, L672-L675）。"
+  ],
+  "design_decisions": [
+    {
+      "decision": "三路工厂分派：无 tokenizer→空壳 IncrementalDetokenizer；Fast tokenizer 且 tokenizers>=0.22.0→FastIncrementalDetokenizer（DecodeStream native prefill）；否则→SlowIncrementalDetokenizer。",
+      "why": "DecodeStream 的 ids 参数（native prefill）需 tokenizers>=0.22.0；只有 PreTrainedTokenizerFast 暴露底层 Rust _tokenizer。条件不满足时退回纯 Python 增量去 token 化，保证任何 tokenizer 都能工作。",
+      "evidence": "vllm/v1/engine/detokenizer.py:L22-L24, L56-L65"
+    },
+    {
+      "decision": "stop-string holdback：流式输出时尾部扣留 max(len(s) for s in stop)-1 个字符不吐，序列结束才释放。",
+      "why": "stop 串可能跨多个 token / 多个 decode step 才拼完。若流式时把可能是 stop 串前缀的尾字符提前吐给用户，事后又要截断就晚了。扣 max_len-1 个字符保证任何 stop 串在完整出现前其全部前缀字符都还在缓冲里、可被回收。-1 是因为 stop 串完整出现的那一刻一定会被 check_stop_strings 截掉，无需扣到 max_len。",
+      "evidence": "vllm/v1/engine/detokenizer.py:L84-L89, L148-L164"
+    },
+    {
+      "decision": "min_tokens 守卫双重生效：(a) 解码循环里 num_output_tokens<=min_tokens 期间持续把 stop_check_offset 推到文末；(b) 仅 num_output_tokens()>min_tokens 才调 check_stop_strings。",
+      "why": "min_tokens 语义是「至少生成这么多 token 再允许停」。stop string 不得在达到 min_tokens 前命中并截断输出，否则违反下限保证。两处配合既排除 min_tokens 期间产生的字符，又整体门控查 stop 的时机。",
+      "evidence": "vllm/v1/engine/detokenizer.py:L120-L122, L130; PR https://github.com/vllm-project/vllm/pull/22014"
+    },
+    {
+      "decision": "stop token 排除：stop_terminated（EngineCore 因 EOS/stop_token 结束）且 not include_stop_str_in_output 时，从 new_token_ids 末尾弹出该 token 不解码进 output_text，但事后仍补进 token_ids。",
+      "why": "用户不想在输出里看到触发停止的那个 token 文本；但 token_ids（供下游/统计）仍需完整。文本与 id 两条账分开处理。",
+      "evidence": "vllm/v1/engine/detokenizer.py:L107-L126"
+    },
+    {
+      "decision": "增量去 token 化的 prefix_offset/read_offset 双窗口。",
+      "why": "tokenizer 的 convert_tokens_to_string 会按相邻 token 决定是否加空格（cleanup 算法）。逐 token 解码若只看单 token 会丢上下文空格。做法：保留一段前缀 tokens 作为「上下文锚」，解码 [prefix:read] 得 prefix_text、解码 [prefix:] 得 new_text，二者相减得真正的增量文本，从而让空格判断有足够上下文。",
+      "evidence": "vllm/tokenizers/detokenizer_utils.py:L127-L131, L172-L202; 初始 offset INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET=5"
+    },
+    {
+      "decision": "UTF-8 多字节边界：new_text 末尾为 '\\ufffd'（U+FFFD 替换字符）或长度未增长时，吐空串、不推进 read_offset，等下一 token 补全字节序列。",
+      "why": "byte-fallback tokenizer 把一个多字节 UTF-8 字符拆到多个 token 上，单个 token 解出来是半截字节、显示为 '\\ufffd'。末尾的替换字符意味着字节序列未完成，应等下一 token；中间的替换字符才是模型真生成的非法 id。",
+      "evidence": "vllm/tokenizers/detokenizer_utils.py:L194-L199"
+    },
+    {
+      "decision": "Fast 路径的 DecodeStream 错误恢复：捕获以 'Invalid prefix encountered' 开头的异常 → 重建 DecodeStream 并重放该 token；另吞掉 (OverflowError, TypeError) 返回 None。",
+      "why": "tokenizers 的 DecodeStream 内部维护增量状态，遇到非单调/无效 UTF-8 输出会损坏状态并抛 'Invalid prefix encountered'（issue #17448）。重建流可恢复。罕见 overflow/type 错误（issue #21951）暂吞掉避免整请求崩溃。",
+      "evidence": "vllm/v1/engine/detokenizer.py:L220-L242, L26-L27"
+    },
+    {
+      "decision": "Slow 路径 token_ids 含 prompt，Fast 路径不含；故 Slow 覆写 output_token_ids/num_output_tokens 减去 prompt_len。",
+      "why": "Slow 路径的 detokenize_incrementally 需要 all_input_ids 含完整上下文（prompt+output）才能算双窗口；Fast 路径 DecodeStream 已用 prompt 做 native prefill，token_ids 只存 output。两路对「输出 token」的统计口径必须统一对外，故 Slow 覆写访问器。",
+      "evidence": "vllm/v1/engine/detokenizer.py:L272, L277-L284; 对比基类 L34-L39"
+    },
+    {
+      "decision": "stop_string 命中后 OutputProcessor 把 finish_reason 改成 STOP 并在 EngineCore 未结束时回灌 reqs_to_abort。",
+      "why": "stop string 是文本层概念，EngineCore（token 层）不感知；detokenizer 在输出层检测到后必须反向通知 EngineCore 终止该请求、释放 KV 资源。",
+      "evidence": "vllm/v1/engine/output_processor.py:L632-L637, L672-L675"
+    }
+  ],
+  "theory": [
+    {
+      "topic": "holdback 长度 max(len(s))-1 的正确性",
+      "content": "设最长 stop 串长 L。任意 stop 串完整出现前，其前缀长度 <= L-1。流式时若把尾部 L-1 个字符全部扣住不吐，则任何尚未完整出现的 stop 串前缀都仍在缓冲内；一旦完整出现，check_stop_strings 会在同一次 update 里命中并截断，被截掉的字符还没流出，故无须扣到 L。结论：扣 L-1 是充分且最省的 holdback。"
+    },
+    {
+      "topic": "增量去 token 化的复杂度与 offset 窗口",
+      "content": "朴素做法每步对全序列 detokenize 是 O(n) 每步、O(n^2) 总。双 offset 窗口把每步解码限制在 [prefix_offset:] 的尾部 token 上（约 O(INITIAL_OFFSET) 量级的上下文），把每步摊到接近 O(1) 上下文，整体趋近 O(n)。窗口存在的唯一理由是给 tokenizer 的空格 cleanup 算法提供足够的相邻 token 上下文，而非正确性必需的全量重解。"
+    },
+    {
+      "topic": "check_stop_strings 的搜索窗口下界 1-new_char_count-stop_string_len",
+      "content": "find 的 start 参数取负索引 1-new_char_count-L：只回看「本次新增 new_char_count 个字符 + 可能与旧文本拼接成 stop 串的 L-1 个旧字符」，避免重复扫描早已检查过的文本，把 stop 匹配从每步 O(全文) 降到 O(新增+L)。"
+    }
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {
+        "what": "OutputProcessor 中与去 token 化无关的成员：tracing（do_tracing、tracing_enabled、_update_stats_from_output/_update_stats_from_finished 的内部）、LoRA 状态（lora_states/lora_name）、parallel sampling（parent_req/parent_requests/get_outputs）、streaming input（StreamingUpdate/apply_streaming_update/input_chunk_queue/_update_streaming_request_state）、pooling 分支、stream_interval>1 的节流逻辑、abort_requests 的外部 id 映射细节。",
+        "why_safe": "本章只讲 detokenizer.update→stop_string→finish_reason/reqs_to_abort 这条线（ch08/ch10/其他章覆盖 streaming/logprobs/parallel sampling）。精简版保留 process_outputs 的单循环骨架 + detokenize+stop_string+reqs_to_abort 三处即可演示去 token 化的对外契约，删掉其余横切关注点不影响去 token 化正确性。"
+      },
+      {
+        "what": "FastIncrementalDetokenizer 中 spaces_between_special_tokens=False 时的 added_token_ids 预计算与 decode_next 里的特殊 token 空格抑制分支。",
+        "why_safe": "这是默认开启 spaces 时不触发的可选优化分支（绝大多数请求 skip_special_tokens 或 spaces_between_special_tokens 为真，直接走 spaces=True 短路）。删后 decode_next 退化为 return (token or 空串)，对主线 UTF-8/stop 行为无影响。须在叙事里以一句话说明该分支存在。"
+      },
+      {
+        "what": "detokenizer_utils 中 _convert_tokens_to_string_with_added_encoders（非 fast 且有 added vocab 的 tokenizer 路径）与 convert_ids_list_to_tokens（本层级未用）。",
+        "why_safe": "精简版以 fast/无 added-vocab 路径（tokenizer.is_fast or not get_added_vocab() 为真）为主线，该 else 分支只是逐 added-token 切段后同样 convert_tokens_to_string，行为等价、不改变 offset/UTF-8 逻辑。convert_ids_list_to_tokens 在 detokenizer.py 调用链里完全没用到。"
+      }
+    ],
+    "must_keep": [
+      {"symbol": "IncrementalDetokenizer", "why": "层级根 + 工厂，读者需理解三路分派"},
+      {"symbol": "from_new_request", "why": "工厂方法：USE_FAST_DETOKENIZER + isinstance 分派逻辑"},
+      {"symbol": "USE_FAST_DETOKENIZER", "why": "tokenizers>=0.22.0 版本闸，决定走 Fast/Slow"},
+      {"symbol": "BaseIncrementalDetokenizer", "why": "公共逻辑承载者，update/holdback/min_tokens 都在此"},
+      {"symbol": "FastIncrementalDetokenizer", "why": "DecodeStream 快路径，UTF-8 错误恢复主角"},
+      {"symbol": "SlowIncrementalDetokenizer", "why": "纯 Python 慢路径，双 offset 窗口主角"},
+      {"symbol": "update", "why": "主流程：跳 stop token、逐 token decode、min_tokens、查 stop"},
+      {"symbol": "decode_next", "why": "抽象方法，Fast/Slow 各自实现的解码核心"},
+      {"symbol": "_protected_step", "why": "Fast 路径 UTF-8 无效前缀错误恢复（重建 DecodeStream）"},
+      {"symbol": "DecodeStream", "why": "Rust tokenizers 增量解码流，native prefill 预热"},
+      {"symbol": "INVALID_PREFIX_ERR_MSG", "why": "错误恢复分支的判别字符串"},
+      {"symbol": "stop_buffer_length", "why": "holdback 长度 max(len(s))-1，流式扣字符核心"},
+      {"symbol": "min_tokens", "why": "min_tokens 守卫，stop 命中下限"},
+      {"symbol": "include_stop_str_in_output", "why": "决定是否排除 stop token / 截断到 stop 串首尾"},
+      {"symbol": "get_next_output_text", "why": "delta/cumulative 取文本 + 尾字符 holdback 释放"},
+      {"symbol": "check_stop_strings", "why": "stop 串匹配 + 截断 offset 计算"},
+      {"symbol": "detokenize_incrementally", "why": "Slow 路径增量去 token 化 + UTF-8 边界 + 双 offset"},
+      {"symbol": "convert_prompt_ids_to_tokens", "why": "Slow 路径初始 prefix_offset/read_offset 计算"},
+      {"symbol": "prefix_offset", "why": "增量解码上下文窗口左界"},
+      {"symbol": "read_offset", "why": "增量解码上下文窗口右界 / 已读位"},
+      {"symbol": "INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET", "why": "初始 offset 常量 5，窗口大小依据"},
+      {"symbol": "num_output_tokens", "why": "输出 token 计数，min_tokens 与 stop 门控依赖"},
+      {"symbol": "output_token_ids", "why": "对外输出 token 列表，Slow 覆写剔 prompt"},
+      {"symbol": "process_outputs", "why": "OutputProcessor 单循环，调 update 拿 stop_string"},
+      {"symbol": "reqs_to_abort", "why": "stop_string 命中后回灌 EngineCore 终止"}
+    ]
+  },
+  "diagram_plan": [
+    {
+      "id": "ch09-detok-hierarchy",
+      "title": "IncrementalDetokenizer 三路分派与层级",
+      "spec": "类层级图 + 工厂决策树：from_new_request 顶部 → 三分支（tokenizer is None→空壳 IncrementalDetokenizer；USE_FAST_DETOKENIZER and PreTrainedTokenizerFast→FastIncrementalDetokenizer；else→SlowIncrementalDetokenizer）。下半画继承：IncrementalDetokenizer←BaseIncrementalDetokenizer←{Fast,Slow}，标注各自 decode_next 后端（DecodeStream vs detokenize_incrementally）。",
+      "tool": "svg-diagram"
+    },
+    {
+      "id": "ch09-stop-holdback",
+      "title": "stop-string holdback 时间线",
+      "spec": "状态演化表/时间线：逐步 decode token，output_text 增长，尾部 stop_buffer_length=L-1 个字符标「扣留区」（流式不吐），展示 stop 串逐步拼出→check_stop_strings 命中→截断；对照 finished=True 时 holdback=0 全吐。突出 min_tokens 期间 stop_check_offset 随文末推进。",
+      "tool": "svg-diagram"
+    },
+    {
+      "id": "ch09-offset-window",
+      "title": "增量去 token 化的 prefix/read 双 offset 窗口",
+      "spec": "token 序列横条，标 prefix_offset/read_offset 两条竖线；prefix_text=decode([prefix:read])，new_text=decode([prefix:])，相减得增量文本；新增一格画 UTF-8 半字节→末尾 '\\ufffd'→吐空串、offset 不动，下一 token 补全后才推进。",
+      "tool": "svg-diagram"
+    },
+    {
+      "id": "ch09-roadmap",
+      "title": "Roadmap 高亮",
+      "spec": "复用 roadmap.py，高亮 Stage-3 输出处理 / OutputProcessor 子系统下的 detokenizer 节点；前接 ch08（输出处理器/RequestState），后接 ch10（logprobs）。",
+      "tool": "roadmap"
+    }
+  ],
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recover": [],
+    "raw": "== ch09 应埋伏笔 == (空)\n== ch09 应回收 == (空)"
+  }
+}
