@@ -4,8 +4,9 @@ import pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from lint_diagrams import lint_diagrams
 
-SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 100"><text {attrs}>多路复用解扇出</text></svg>'
-SAFE = 'x="10" font-size="12" font-family="Droid Sans Fallback"'
+# 干净 SVG：sans-serif 混排，交给 rsvg-convert 逐字回退（不强制 CJK 字体）
+SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 100">'
+       '<text x="10" y="40" font-family="sans-serif" font-size="14">AsyncLLM 三段式 → 队列</text></svg>')
 
 
 def _mk(tmp, svgs: dict, pngs: list, narrative: str = ""):
@@ -20,38 +21,22 @@ def _mk(tmp, svgs: dict, pngs: list, narrative: str = ""):
     return str(d)
 
 
-def test_cjk_unsafe_font_blocking(tmp_path):
-    # CJK with sans-serif (the real bug) → flagged
-    d = _mk(tmp_path, {"fig-x.svg": SVG.format(attrs='x="10" font-size="12" font-family="sans-serif"')},
-            ["fig-x.png"], "![](../diagrams/fig-x.png)")
-    assert lint_diagrams(d)["cjk_font"]
-
-
-def test_cjk_no_font_blocking(tmp_path):
-    d = _mk(tmp_path, {"fig-x.svg": SVG.format(attrs='x="10" font-size="12"')},
-            ["fig-x.png"], "![](../diagrams/fig-x.png)")
-    assert lint_diagrams(d)["cjk_font"]
-
-
-def test_cjk_comma_mixed_blocking(tmp_path):
-    # listing a latin family alongside breaks CJK render → flagged
-    d = _mk(tmp_path, {"fig-x.svg": SVG.format(attrs='x="10" font-size="12" font-family="Droid Sans Fallback, sans-serif"')},
-            ["fig-x.png"], "![](../diagrams/fig-x.png)")
-    assert lint_diagrams(d)["cjk_font"]
-
-
-def test_cjk_safe_font_passes(tmp_path):
-    d = _mk(tmp_path, {"fig-x.svg": SVG.format(attrs=SAFE)},
-            ["fig-x.png"], "![](../diagrams/fig-x.png)")
+def test_valid_diagram_passes(tmp_path):
+    d = _mk(tmp_path, {"fig-x.svg": SVG}, ["fig-x.png"], "![](../diagrams/fig-x.png)")
     r = lint_diagrams(d)
-    assert not r["cjk_font"] and not r["orphan"] and not r["png_missing"] and not r["svg_invalid"]
+    assert not r["svg_invalid"] and not r["png_missing"] and not r["orphan"]
 
 
 def test_orphan_png_blocking(tmp_path):
-    d = _mk(tmp_path, {"fig-x.svg": SVG.format(attrs=SAFE)}, ["fig-x.png"], "正文没有引用这张图")
+    d = _mk(tmp_path, {"fig-x.svg": SVG}, ["fig-x.png"], "正文没有引用这张图")
     assert lint_diagrams(d)["orphan"]
 
 
 def test_missing_png_blocking(tmp_path):
-    d = _mk(tmp_path, {"fig-x.svg": SVG.format(attrs=SAFE)}, [], "![](../diagrams/fig-x.png)")
+    d = _mk(tmp_path, {"fig-x.svg": SVG}, [], "![](../diagrams/fig-x.png)")
     assert lint_diagrams(d)["png_missing"]
+
+
+def test_invalid_svg_blocking(tmp_path):
+    d = _mk(tmp_path, {"fig-x.svg": "<svg><text>未闭合"}, ["fig-x.png"], "![](../diagrams/fig-x.png)")
+    assert lint_diagrams(d)["svg_invalid"]

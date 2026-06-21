@@ -36,7 +36,7 @@ After multiple failed attempts with Excalidraw (manual coordinate bugs, text ove
 
 All tools are pre-installed on standard Linux. Verify before first use:
 - `xmllint` — XML validation (from libxml2)
-- `convert` — ImageMagick SVG→PNG conversion
+- `rsvg-convert` — librsvg/Pango SVG→PNG（**优先用它**：逐字 CJK 字体回退 + 正确文本排版；`apt install librsvg2-bin`）。**勿用 ImageMagick `convert`**：它不做 CJK 回退、混排排版差，会丢中文/错位。
 - `python3` — with xml.sax.saxutils (stdlib)
 
 ## Workflow (Follow Exactly)
@@ -94,8 +94,10 @@ If EITHER fails, fix before proceeding. Both must pass.
 ### Step 4: Convert to PNG
 
 ```bash
-convert -density 150 diagram.svg diagram.png
+rsvg-convert -z 2 diagram.svg -o diagram.png   # 2x 清晰度；自动 CJK 逐字回退
 ```
+
+> 含中文的图：SVG 用普通 `font-family="sans-serif"` 即可，**不要**强制 CJK 字体（会把 latin 也汉化、错位）；rsvg-convert 会自动为中文字形回退到系统 CJK 字体。
 
 Reference the `.png` file in markdown, NOT the `.svg`. SVG rendering varies by viewer; PNG is universal.
 

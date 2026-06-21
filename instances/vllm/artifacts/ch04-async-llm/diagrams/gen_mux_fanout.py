@@ -1,33 +1,11 @@
 #!/usr/bin/env python3
 """fig-mux-fanout: 一个 EngineCore 批 -> 按 req_id 分发回 N 个 per-request 队列。"""
-import re, sys, os, subprocess
+import sys, os, subprocess
 from pathlib import Path
 import xml.sax.saxutils as xs
 
 
 def esc(s): return xs.escape(s)
-
-
-_CJK = re.compile(r'[㐀-䶿一-鿿　-〿＀-￯]')
-
-
-_CJK_FONT = "Droid Sans Fallback"  # host 上唯一带 CJK 字形的字体
-
-
-def cjk_font(svg: str) -> str:
-    """PNG 渲染器（ImageMagick）对 sans-serif/monospace 的中文不做逐字回退 → 中文丢字形。
-    凡 <text> 内容含中文的，把其 font-family 强制为单独的 "Droid Sans Fallback"
-    （绝不与 latin 族逗号并列，否则又会丢字），让中文在 PNG 里正确渲染。
-    latin/数字文本（不含 CJK）保持原 font-family 不变。"""
-    def repl(m):
-        attrs, content = m.group(1), m.group(2)
-        if not _CJK.search(content):
-            return m.group(0)
-        new_attrs, n = re.subn(r'font-family="[^"]*"', f'font-family="{_CJK_FONT}"', attrs)
-        if n == 0:
-            new_attrs = attrs + f' font-family="{_CJK_FONT}"'
-        return f'<text{new_attrs}>{content}</text>'
-    return re.sub(r'<text\b([^>]*)>(.*?)</text>', repl, svg, flags=re.S)
 
 
 C_TXT = "#1e293b"
@@ -112,7 +90,7 @@ def build():
 
 if __name__ == '__main__':
     base = sys.argv[1]
-    svg = cjk_font(build())
+    svg = build()
     Path(base + '.svg').write_text(svg)
     print(f"SVG {len(svg)}B")
     assert subprocess.run(['xmllint', '--noout', base + '.svg']).returncode == 0
@@ -120,5 +98,5 @@ if __name__ == '__main__':
     r = subprocess.run([sys.executable, str(vs), base + '.svg'], capture_output=True, text=True)
     print(r.stdout)
     assert r.returncode == 0, r.stdout
-    subprocess.run(['convert', '-density', '150', base + '.svg', base + '.png'], check=True)
+    subprocess.run(['rsvg-convert', '-z', '2', base + '.svg', '-o', base + '.png'], check=True)
     print(f"PNG {os.path.getsize(base+'.png')//1024}KB")
