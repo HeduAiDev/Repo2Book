@@ -1,382 +1,76 @@
-# repo2book — Multi-Agent Book Factory
+# repo2book — vLLM 源码解读书工厂（v2，2026-06-21 重建）
 
-Turn any code repository into a source-grounded technical book. This is the **framework** — the current instance is `vllm-from-scratch` (a 28-chapter book on the vLLM inference engine).
+把真实代码仓库变成**源码解读型**技术书。当前实例：vLLM v1 推理引擎，中文，高级读者。
 
-See `repo2book.json` for instance-specific config (source repo, outline path, reader profile).
+> **2026-06-21 重大转向**：旧的"从零简化重写 + 理论推导"产出太抽象、脱离代码，**全部废弃**。新书 = **直接解读真实 vLLM v1 源码**，按真实模块组织，异步三段式解耦为旗舰。旧 agent 提示词/经验仅作批判参考。
 
-## Architecture
+## 📍 先读这些（架构师/编排者的持久文档）
 
-```
-repo2book/                              ← Framework (this repo)
-├── repo2book.json                      ← Master config
-├── CLAUDE.md                           ← You are here
-├── .gitmodules                         ← Submodule tracking
-│
-├── .claude/                            ← Project-scoped config
-│   ├── settings.local.json
-│   ├── agents/                         # (book-editor, implementer, tester, writer, reviewer, archivist)
-│   ├── teams/book-factory.json
-│   └── skills/svg-diagram/
-│
-├── schemas/
-│
-├── scripts/                            ← Framework CLI tools
-│   ├── archivist.py, learn.py, decide.py
-│   ├── hook_pipeline.py, team_orchestrator.py
-│   ├── lint_formulas.py, lint_source_grounding.py
-│   └── guard_narrative.py
-│
-├── wisdom/                             ← Shared across ALL instances
-│
-└── instances/
-    └── vllm/                           ← vLLM book instance (complete)
-        ├── repo2book.json              ← Instance config
-        ├── artifacts/                  ← Chapter content (all chapters)
-        ├── book/book-outline.json       ← 28-chapter outline
-        ├── source/                     ← Git submodule: vllm-project/vllm
-        │   └── (vllm source at tracked commit)
-        ├── knowledge/                  ← Repo-specific facts
-        ├── trace/                      ← Project long-term memory
-        │   ├── INDEX.md, state.json
-        │   ├── chapters/               # Per-chapter trace entries
-        │   ├── cross-chapter/          # Framework-wide decisions
-        │   └── sessions/               # Session summaries
-        └── .claude/agents/archivist.md ← Per-instance archivist
-```
+你（主 session）是 **Team Lead / 架构师**，也会被上下文压缩。**不要靠记忆运转工厂**——靠这些持久文档：
 
-## ⛔ HARD RULE: Narrative Guardian
+- **操作手册**：`docs/superpowers/ARCHITECT-RUNBOOK.md` ← 怎么发车/监控/处理逃生舱/续跑（**运转工厂先读它**）
+- **设计依据**：`docs/superpowers/specs/2026-06-21-vllm-source-reading-book-system.md`（方法论/角色/workflow/连贯性/协同/逃生舱）
+- **实施计划**：`docs/superpowers/plans/2026-06-21-vllm-book-system-rebuild.md`
+- **架构地图 + 大纲**：`instances/vllm/book/cartography/`（`ARCHITECTURE.md` 全量、`outline-final.json` 8 Part/33 章、`map.json` 结构化）
+- **Book Bible**：`instances/vllm/book/bible/`（术语/接口/伏笔回收/声线——跨章连贯性真相源）
+- **源码 pin**：`f3fef123`，根 `instances/vllm/source/`（blobless clone）
 
-**You (the main orchestrator) CANNOT directly write or edit any
-`artifacts/*/narrative/chapter.md` file.** These files are OWNED by the Writer agent.
+## ⛔ HARD RULES
 
-Every narrative edit MUST go through the Writer agent or the Chapter Pipeline.
-If you find yourself wanting to `Edit` or `Write` a narrative file — STOP.
-Run `python3 scripts/guard_narrative.py check {chapter_id}` first.
+1. **叙事守护**：主编排者**不得**直接写/编 `artifacts/*/narrative/chapter.md`——只有 Writer 角色可写。质量不对就**改提示词，不改章节内容**。
+2. **只做减法不做加法**：implementer 产出的精简版与 vLLM 同名/同结构/同控制流，**只删不增**，不杜撰任何 vLLM 没有的东西。
+3. **零脚手架泄漏**：正文是正式出版物——规范 `vllm/...` 路径（**绝不** `instances/vllm/source/`）、自然标题（**绝不** "Cell N"）、不提内部文件（impl-notes.md/dossier）。
+4. **vLLM 相关代码调试一律进 Docker 容器**（host 无 CUDA/vLLM）：`scripts/vllm_docker.sh ...`，镜像 `vllm/vllm-openai:latest`。
+- 可改：`.claude/agents/`、`.claude/workflows/`、`scripts/`、`docs/`、`CLAUDE.md`、`repo2book.json`、`instances/vllm/book/`。
 
-**Only modify:** .claude/agents/, schemas/, scripts/, CLAUDE.md, repo2book.json.
-**FORBIDDEN to modify directly:** artifacts/*/narrative/chapter.md.
+## 核心方法论（修复旧体系脱节）
 
-If the chapter quality is wrong, fix the PROMPTS, not the chapter content.
+三支柱 + 写作规则：
+- **A 档案即唯一真相源**：analyst 深读真实源码产出 `dossier.json`（含**要内嵌的真实源码片段** + 减法计划）。implementer 和 writer 都吃这份，**不以对方产物为准** → 结构性根除"writer 花篇幅讲 implementer 杜撰代码"的脱节。
+- **B 只做减法的可运行精简版**：忠实子集，`# SOURCE:`/`# SUBTRACTED:` 全标注。**防过度删减**：只删 dossier `delete` 批准项、`must_keep` 符号必保留（`lint_fidelity` 校验）。
+- **C 自包含、内嵌真源码**：不指望读者开着源码——正文直接内嵌真实源码片段（裁剪无关分支），逐段解读。精简版作"跑起来看数值"的交叉验证，不是主角。
+- **每章开场 Roadmap**：复用 `instances/vllm/book/assets/roadmap/roadmap.py` 出"你在这里"图 + 前后衔接。
 
-## Agent Teams Pipeline
+## 运转工厂：混合编排（Workflow + 少量持久角色）
 
-### 架构
+- **per-chapter workflow** `.claude/workflows/chapter-pipeline.js`：6 阶段 `Dossier→Implement→Test→Write→Review→Archive`，含 impl↔test / write↔review 有界回环、多维并行评审、**逃生舱**（任一阶段返回 `status=BLOCKED` → 立即中止升级 Lead）、dossier 对抗性自核。
+- **发车**（详见 RUNBOOK）：`Workflow({name:"chapter-pipeline", args:{chapter_id, slug, source_root, focus, highlight, paths}})`。后台跑，完成/逃生舱触发会通知我；可 `/workflows` 看进度、`TaskStop` 急停、`resumeFromRunId` 续跑。
+- **6 角色 = 持久提示词**（`.claude/agents/{analyst,implementer,tester,writer,reviewer,archivist}.md`），workflow 经 agentType 调用 / 或 agent 自读契约。**持久分两层**：提示词+经验持久（文件），进程按任务 spawn（迭代靠 dossier+ledger+SendMessage 续接）。
+- **活体双向迭代 / 升级**：workflow 做不到的，由 Lead（我）+ 命名 agent + SendMessage 编排。
 
-**子 agent 没有 Agent 工具，无法嵌套 spawn。** Team Lead 角色由主 session（我，即 Claude Code 主进程）扮演。
+## 质量闸门（确定性 linter，前置于 LLM 评审）
 
 ```
-用户 ⇄ 主 session (Team Lead)  ← 唯一有 Agent 工具，可 spawn/kill/restart
-         │
-         ├── book-editor   ← 内容调度（TaskCreate、SendMessage、拓扑决策）
-         │
-         └── Pipeline: implementer → tester → writer → reviewer → archivist
-              │              │           │          │            │
-              源码实现      反压闸门    教育叙事    最终闸门    终端备份
-
-    Lateral: Reviewer ↔ Writer (REVISE, 直接 SendMessage)
-             Writer ↔ Implementer (修改请求, 直接 SendMessage)
-    Loop >3 → 升级到 Team Lead (主 session)
+python3 scripts/lint_fidelity.py {chapter_dir}            # 保真度：# SOURCE 全覆盖/无杜撰/不喧宾夺主/无过度删减(must_keep)
+python3 scripts/lint_chapter_structure.py {chapter}/narrative/chapter.md  # Roadmap + 内嵌真源码 + 零脚手架泄漏
+python3 scripts/lint_formulas.py {chapter}/narrative/chapter.md           # 公式可渲染
+python3 scripts/lint_source_grounding.py {chapter}/                        # 源码根基
 ```
+机械问题让 writer 定点小修，不退整章。
 
-### Startup（主 session 执行）
+## 跨章连贯性（不赌易失记忆 → 显式持久工件）
 
-```
-1. python3 scripts/setup.py                         # 一次性初始化
-2. 主 session 用 Agent 工具 spawn 全部 6 个 agent    # 后台运行
-   - book-editor (内容调度)
-   - implementer, tester, writer, reviewer, archivist (流水线)
-3. 报告用户: "团队就绪"
-```
+- **Book Bible**（`instances/vllm/book/bible/`，Archivist 持有）：术语译名、精简版接口注册表、**伏笔/回收登记**、声线指南。
+- `python3 scripts/bible.py due {chapter_id}` → 本章应埋/应回收项；写后回写。
+- **伏笔是自顶向下设计的**（大纲+依赖图开局即全知），注入每章 dossier。
+- **连贯性审计**：每完成一个 Part 跑并行审计（未回收伏笔/术语漂移/接口不符）。
 
-### 每章流程
+## 记忆体系
+- **Archivist**（唯一全书持久角色）：trace 长期记忆 + Book Bible + 再水化简报。`scripts/archivist.py`。
+- **knowledge/**（仓库特定事实，TTL）+ **wisdom/**（跨实例模式）：写前查、收工后 `scripts/learn.py extract`。
+- **架构师自身连贯性**：本 CLAUDE.md + RUNBOOK + trace 决策记录——保证失忆/换会话后仍能运转工厂。
 
-```
-用户提需求 → 主 session 判断意图：
-  - "写第N章" → 告诉 book-editor 启动 pipeline
-  - "全书进度" → 读 state.json，汇总
-  - "第N章太枯燥" → 调度 writer 重写 → reviewer 重审
-  - agent 挂了 → 主 session 重新 spawn
-```
+## 公式规则（NON-NEGOTIABLE，auto-REJECT）
+`\text{}`→`\mathrm{}`；`\boxed{}`→markdown 粗体标题；`\tag*{}`→`$$` 外；inline `\frac`→提升为 `$$` 块；`$$` 与内容分行。inline 仅限单符号/简单式。
 
-### Per-Chapter Pipeline (book-editor 调度)
+## 当前状态（2026-06-21）
+- 系统重建完成：地基 linter（12/12 测试过）、6 角色提示词、Roadmap 生成器、Book Bible、chapter-pipeline workflow（含逃生舱）、架构师文档。
+- **ch04（AsyncLLM 三段式）试点待发车**——首章验证新体系是否根除脱节。
+- 新书章节用 `ch`-前缀 slug（如 `ch04-async-llm`），置于 `instances/vllm/artifacts/`，与旧 `NN-*` 区分。
 
-```
-book-editor 创建 5 个 tasks → SendMessage 给 implementer
-  → implementer 完成 → hook → tester
-  → tester 完成 → hook → writer
-  → writer 完成 → hook → reviewer
-  → reviewer APPROVED → hook → archivist 备份 → 章节发布
-```
-
-### Lateral Communication
-- **Reviewer → Writer**: REVISE，直接 SendMessage
-- **Writer → Implementer**: 修改请求，直接 SendMessage
-- **Loop >3**: 升级到主 session (Team Lead)
-
-### Organizational Topology
-
-The pipeline topology is NOT fixed. Each chapter can override the default `linear` mode.
-
-| Mode | Agents/Stage | When to Use |
-|------|-------------|-------------|
-| `linear` (default) | 1 per stage | Standard chapters, well-understood concepts |
-| `pair` | 2 on implementer | Complex algorithms, unfamiliar code patterns |
-| `panel` | 2 reviewers | First-of-part chapters (set pattern for all subsequent) |
-| `writer_editor` | 2 on writer (writer+editor) | Style-critical chapters, many formulas |
-| `swarm` | 2+ on all stages | Very complex, brand new concepts, Part-openers |
-
-**Changing topology for a chapter:**
-```bash
-python3 scripts/decide.py propose-topology {chapter_id} {mode} "Reason for change"
-```
-
-**Decision protocols** (see `repo2book.json` → `pipeline.topology.decision_protocol`):
-- **Vote**: Proposal → agents vote (APPROVE/REJECT/ABSTAIN) → tally → decision
-  - majority (>50%): standard decisions
-  - supermajority (>66%): structural decisions (topology change, chapter redesign)
-  - consensus (100%): fundamental decisions (outline changes, prompt rewrites)
-- **Discuss**: Proposal → round 1 arguments → round 2 counter → synthesis → vote_or_escalate
-- **Escalate**: Any agent can escalate to Lead when stuck (>3 review cycles, pair deadlock, pipeline stalled)
-
-## Agent Memory System — Knowledge & Wisdom
-
-Agents **self-improve through experience**. This is a two-tier system:
-
-### Knowledge (知识) — Repo-Specific Facts
-
-**Location**: `knowledge/` (per-instance)
-**What**: File locations, API patterns, gotchas, conventions of THIS repo
-**Growth**: Linear (one fact per encounter)
-**Lifespan**: TTL with decay — unused facts archived after 30 days
-**Anti-bloat**: Max 15 facts per module file; oldest 5 get LLM-compacted into summary
-
-```
-knowledge/
-├── INDEX.md                    ← Module map: which chapters use which modules
-├── modules/
-│   ├── scheduler.md            ← Facts about scheduler.py
-│   ├── attention.md            ← Facts about attention backends
-│   └── kv-cache.md             ← Facts about KV cache
-└── archive/                    ← Stale facts (unused > 30 days)
-```
-
-### Wisdom (智慧) — Universal Patterns
-
-**Location**: `wisdom/` (framework-level, shared across all instances)
-**What**: High-level patterns that apply to ANY repo2book project
-**Growth**: Logarithmic (pattern must re-occur in 2+ repos)
-**Lifespan**: Permanent, refined over time
-**Gating**: Must appear in 2+ repos → book-editor promotes
-
-```
-wisdom/
-├── INDEX.md                    ← Pattern catalog with role relevance
-├── debugging.md                ← F.linear shapes, CUDA mismatches, SVG clipping
-├── testing.md                  ← Preemption test design, OOM paths, Docker cmd
-├── writing.md                  ← Formula rules, code walkthrough, 大白话 spectrum
-└── architecture.md             ← Backpressure gates, lateral comm, fix prompts not chapters
-```
-
-### The Self-Learning Loop
-
-```
-Agent works on chapter → encounters issue → resolves it
-  ↓
-Was this a repo-specific fact or a universal pattern?
-  ↓                    ↓
-Knowledge DB          Wisdom DB
-(tagged, TTL'd)       (gated, categorized)
-  ↓                    ↓
-Future agents         Future agents
-query before work     always have access
-
-Cross-role enrichment:
-  Implementer discovers source gotcha → tester benefits when writing tests
-  Tester discovers edge case → writer explains it in narrative
-  Writer discovers formula pitfall → reviewer adds to auto-REJECT list
-```
-
-### Learning Protocol (per agent, per task)
-
-**Before work**: Query `knowledge/INDEX.md` for the relevant module. Read the module file.
-Filter by your role. Also read `wisdom/` category files ranked by your role's priority.
-
-**After work**: Run `python3 scripts/learn.py extract {chapter_id} {role}`. This prompts
-you to:
-1. Extract: What facts did you learn about THIS repo?
-2. Classify: Repo-specific → `knowledge/modules/`. Universal pattern → propose to `wisdom/`.
-3. Compact: If module file exceeds 15 facts, oldest 5 are LLM-summarized into one.
-
-**Role-specific query priorities** (which wisdom categories to read first):
-- implementer: debugging > architecture > testing > writing
-- tester: testing > debugging > architecture > writing
-- writer: writing > architecture > debugging > testing
-- reviewer: writing > architecture > testing > debugging
-- book-editor: architecture > all equally
-
-## Writing Standard
-
-### Every chapter section MUST have BOTH:
-1. **Source Trail:** Open a specific source file, show the code, explain where it lives
-   - Format: `{source_dir}/path/to/file.py:L123`
-2. **Theory Deep Dive:** Derive the math, prove correctness, explain the WHY
-
-### The 5-step rhythm per major section:
-```
-1. Open {source_dir}/xxx.py:L123 → ClassName.method()     ← Source Trail
-2. What does this method do? Why?                          ← Bridge
-3. Let's derive the principle from scratch...              ← Theory Deep Dive
-4. Our simplified implementation: [code]                   ← Implementation
-5. Original adds X and Y because...                        ← Source Diff
-```
-
-### Anti-patterns (both extremes are WRONG):
-- ALL source references, zero theory → "source dump" — reader learns nothing
-- ALL theory, zero source refs → "textbook copy" — not about the source
-- EVERY section: source entry point + theory derivation
-
-## Formula Rules (NON-NEGOTIABLE)
-
-### Blocking (auto-REJECT):
-- `\text{}` → use `\mathrm{}`
-- `\boxed{}` → use markdown bold header above formula
-- `\tag*{}` → put annotation outside `$$` block
-- `\frac` inside inline `$...$` → promote to `$$...$$` block
-- `$$` on same line as formula content → separate lines
-
-### Allowed inline ($...$):
-- Single symbols: `$x$`, `$\alpha$`
-- Simple expressions: `$d_k$`, `$\sqrt{2}$`, `$1/\sqrt{d_k}$`
-
-Run `python3 scripts/lint_formulas.py artifacts/{chapter_id}/narrative/chapter.md` before marking complete.
-
-## Source Grounding Rules (NON-NEGOTIABLE)
-
-### Requirements:
-- Every Cell (2-7) must have 1+ source file reference
-- Every implementation function must have `# REFERENCE: ...` comment
-- Source Mapping Table must have 5+ rows
-- impl-notes.md must list 3+ source files
-
-### Reference format:
-- Full path: `{source_dir}/path/to/file.py:L123`
-- Short path: `file.py:L123` (after full path established)
-- Class.method: `flash_attn.py → FlashAttentionImpl.forward()`
-
-Run `python3 scripts/lint_source_grounding.py artifacts/{chapter_id}/` before marking complete.
-
-## By-Repo Instance Structure
-
-Each repo lives in `instances/{repo_name}/` with its own team, knowledge, trace, and artifacts.
-
-```
-repo2book/
-├── repo2book.json              ← Framework config (shared)
-├── wisdom/                     ← Shared wisdom (all instances)
-├── scripts/                    ← Framework CLI tools
-├── .claude/agents/             ← Agent definitions & prompts
-│
-└── instances/
-    └── vllm/                   ← vLLM book instance
-        ├── repo2book.json      ← Instance config
-        ├── knowledge/          ← Repo-specific facts (TTL'd)
-        ├── trace/              ← ★ Project long-term memory
-        │   ├── INDEX.md         # Master index of everything
-        │   ├── state.json       # Single source of truth
-        │   ├── decisions/       # Every design decision + rationale
-        │   ├── deliveries/      # Per-chapter delivery records
-        │   ├── user_interactions/ # User feedback, Q&A
-        │   └── context_summaries/ # Session summaries for rehydration
-        └── .claude/
-            └── agents/
-                └── archivist.md  # ★ Per-instance archivist agent
-```
-
-**artifacts/ and book/ stay at root** for the current instance (referenced by instance config).
-
-## The Archivist — Long-Term Memory System
-
-**Why this exists**: Claude Code sessions compress context after ~50 turns. After weeks of work, agents forget why decisions were made. The user has to re-explain preferences. Bugs are re-discovered. Chapter quality degrades.
-
-**The archivist agent is the project's long-term memory.** One archivist per instance.
-
-### Archivist Duties
-1. **Record** every significant event (decisions, deliveries, user feedback, bugs)
-2. **Rehydrate** agents with context briefs before they start work
-3. **Summarize** sessions for continuity across session boundaries
-4. **Answer** queries about past work from agents or the user
-5. **Alert** when context loss risk is high (>50 turns, >24h sessions)
-6. **Cross-reference** related entries (bug→fix→test→chapter section)
-
-### Context Rehydration Protocol
-
-Before ANY agent works on a chapter, the archivist provides:
-```
-1. Current project state (from state.json)
-2. Relevant past decisions (from trace/decisions/)
-3. Previous deliveries for this chapter (from trace/deliveries/)
-4. User feedback about this chapter (from trace/user_interactions/)
-5. Most recent session summary (from trace/context_summaries/)
-6. Wisdom entries relevant to the agent's role
-7. Knowledge entries for the relevant module
-```
-
-### Trace Entry Format
-```markdown
-# [Title]
-- Type: decision | delivery | user_interaction | bug | design_change
-- Chapter: (if applicable)
-- Date: YYYY-MM-DD
-- Agents involved: [agent1, agent2]
-- User present: true/false
-- Tags: [tag1, tag2]
-
-## What happened
-(factual account)
-
-## Why it matters
-(impact on future work)
-
-## What to remember
-(for context rehydration — under 200 words)
-```
-
-### Archivist CLI
-```bash
-python3 scripts/archivist.py record --type decision --chapter 04 --title "..." --what "..." --why "..."
-python3 scripts/archivist.py brief --chapter 14 --role implementer
-python3 scripts/archivist.py summary --date 2026-05-04 --accomplishments "..."
-python3 scripts/archivist.py alert --session-turns 45
-python3 scripts/archivist.py state  # View current state
-python3 scripts/archivist.py query --chapter 04 --type delivery
-```
-
-## Creating a New Book Instance
-
-1. Clone repo2book as template
-2. Clone the target repo into `{source_dir}/`
-3. Initialize instance: `python3 scripts/archivist.py init --instance {repo_name}`
-4. Configure `instances/{repo_name}/repo2book.json`
-5. Write `book/book-outline.json` for the target repo
-6. Create the team via `TeamCreate` with name `book-factory-{repo_name}`
-7. Spawn the archivist first (records everything from the start)
-8. Start the pipeline:
-```bash
-python3 scripts/team_orchestrator.py pipeline {chapter_id}
-```
-
-## Current Instance: vLLM
-
-- **Repo**: https://github.com/vllm-project/vllm
-- **Source dir**: `instances/vllm/source/`
-- **Outline**: 28 chapters, 5 parts (see `book/book-outline.json`)
-- **Progress**: 13 chapters published (Parts 1-2 complete), 15 remaining (Parts 3-5)
-
-## Common Pitfalls
-
-1. **Don't write generic textbook chapters.** Every concept must trace to a source file:line.
-2. **Don't over-correct to source-only.** Theory and source references are NOT mutually exclusive.
-3. **Run formula linter before claiming complete.** `\text{}` in formulas is the #1 issue.
-4. **Run source grounding linter before claiming complete.**
-5. **`F.linear` weight shape is `[out, in]`.** `nn.Linear(in, out)` stores weight as `[out, in]` and `F.linear(x, weight)` does `x @ weight^T`.
-6. **Chapter IDs must be unique across old and new outlines.**
+## 常见坑
+1. 别写脱离代码的抽象——正文以真实 vllm 源码为主线、自包含内嵌。
+2. implementer 别过度删减/误删——只删 `delete` 批准项，`must_keep` 必保留。
+3. 标记完成前跑全部四个 linter。
+4. vLLM 相关运行进容器；行号以 `f3fef123` 为准（容器 vllm 0.15.1 可能有行号差，仅用于观察行为）。
+5. 别赌自己的上下文——决策/状态写进 trace、Bible、本文档。

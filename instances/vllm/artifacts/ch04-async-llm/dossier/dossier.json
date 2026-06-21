@@ -1,0 +1,459 @@
+{
+  "_meta": {
+    "chapter_id": "ch04",
+    "title": "AsyncLLM: 三段式异步解耦",
+    "source_pin": "f3fef123504db07b3ac83ad4ef677915b53e8386",
+    "subsystem": "async-engine",
+    "scope_note": "本章只讲 AsyncLLM 这层 facade 如何编排三段：in-process 输入预处理 -> out-of-process EngineCore(经 IPC) -> in-process 背景 output_handler。IPC 物理机制留 ch07；Stage1(InputProcessor)细节留 ch05；Stage3(OutputProcessor 去 tokenize/累积)细节留 ch08。本章焦点是 generate() 异步生成器、add_request() 双登记(OutputProcessor 建 per-request 队列 + EngineCore 投递)、output_handler 背景任务的生产者-消费者+多路复用。"
+  },
+  "code_spine": [
+    "vllm/v1/engine/async_llm.py:L132-L153  (__init__: 三段构造 InputProcessor / OutputProcessor / EngineCoreClient)",
+    "vllm/v1/engine/async_llm.py:L170-L176  (__init__: 急切尝试启动 output_handler 背景任务，无事件循环则跳过)",
+    "vllm/v1/engine/async_llm.py:L280-L398  (add_request: 输入->请求, 建 per-request RequestOutputCollector, 懒启 output_handler, n==1 走 _add_request)",
+    "vllm/v1/engine/async_llm.py:L400-L415  (_add_request: 同时登记 OutputProcessor[本进程] + 投递 EngineCore[独立进程] — 三段解耦的扇出点)",
+    "vllm/v1/engine/async_llm.py:L524-L635  (generate: 返回 AsyncGenerator, await add_request 拿队列, while 循环 get_nowait()/await get() 拉取并 yield, 取消则 abort)",
+    "vllm/v1/engine/async_llm.py:L637-L707  (_run_output_handler: 背景 asyncio.Task, while True 拉 get_output_async() -> 分块 process_outputs() -> 队列, sleep(0) 让出)",
+    "vllm/v1/engine/output_processor.py:L45-L106  (RequestOutputCollector: 单槽+asyncio.Event 的 per-request 收集器, put/get/get_nowait, 生产者超前则 merge)",
+    "vllm/v1/engine/output_processor.py:L508-L537  (OutputProcessor.add_request: 把 queue 存进 per-request RequestState, 建立 req_id->state 映射)",
+    "vllm/v1/engine/output_processor.py:L572-L660  (OutputProcessor.process_outputs: 按 req_id 查 state, queue is not None 则 put 回该请求队列 — 多路复用解扇出)",
+    "vllm/v1/engine/core_client.py:L990-L999, L1058-L1061  (AsyncMPClient.get_output_async / add_request_async: IPC 接缝, 本章只标边界, ch07 展开)",
+    "vllm/v1/engine/__init__.py:L80-L131, L161-L191  (EngineCoreRequest / EngineCoreOutput: 跨进程边界的 msgspec 消息)"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/engine/async_llm.py",
+      "lines": "L132-L153",
+      "purpose": "三段式的物理诞生地：__init__ 一次性构造三个组件。InputProcessor(本进程, Stage1) + OutputProcessor(本进程, Stage3) + EngineCoreClient.make_async_mp_client(启动独立进程的 EngineCore, Stage2)。三行注释逐字点明三段职责。",
+      "code": "        self.renderer = renderer = renderer_from_config(self.vllm_config)\n\n        # Convert EngineInput --> EngineCoreRequest.\n        self.input_processor = InputProcessor(self.vllm_config, renderer)\n\n        # Converts EngineCoreOutputs --> RequestOutput.\n        self.output_processor = OutputProcessor(\n            renderer.tokenizer,\n            log_stats=self.log_stats,\n            stream_interval=self.vllm_config.scheduler_config.stream_interval,\n            tracing_enabled=tracing_endpoint is not None,\n        )\n\n        # EngineCore (starts the engine in background process).\n        self.engine_core = EngineCoreClient.make_async_mp_client(\n            vllm_config=vllm_config,\n            executor_class=executor_class,\n            log_stats=self.log_stats,\n            client_addresses=client_addresses,\n            client_count=client_count,\n            client_index=client_index,\n        )",
+      "elide": [
+        "前面的 maybe_register_config_serialize_by_value()/tracing/log_stats/custom_stat_loggers 配置(L107-131)与本章主线无关",
+        "make_async_mp_client 的 client_addresses/client_count/client_index 是多前端/DP 扩展参数, 精简版可省"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/async_llm.py",
+      "lines": "L170-L176",
+      "purpose": "output_handler 的懒/急切双重启动：__init__ 里 try get_running_loop() 急切启, 失败(无事件循环, 如 OpenAI server 启动早于 loop)就静默跳过, 等到首个 add_request 再启。解释了为何 output_handler 不是构造即起。",
+      "code": "        self.output_handler: asyncio.Task | None = None\n        try:\n            # Start output handler eagerly if we are in the asyncio eventloop.\n            asyncio.get_running_loop()\n            self._run_output_handler()\n        except RuntimeError:\n            pass",
+      "elide": [
+        "紧随其后的 torch profiler 配置(L178-200)与主线无关"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/async_llm.py",
+      "lines": "L280-L398",
+      "purpose": "add_request 主干：把用户 prompt 经 input_processor.process_inputs() 转成 EngineCoreRequest(L349), 懒启 output_handler(L373), 为本请求建专属 RequestOutputCollector(L376), n==1 走 _add_request 并返回该队列(L381-383)。这是 generate() 第一步的落点。",
+      "code": "    async def add_request(\n        self,\n        request_id: str,\n        prompt: EngineCoreRequest\n        | PromptType\n        | EngineInput\n        | AsyncGenerator[StreamingInput, None],\n        params: SamplingParams | PoolingParams,\n        ...\n    ) -> RequestOutputCollector:\n        \"\"\"Add new request to the AsyncLLM.\"\"\"\n\n        if self.errored:\n            raise EngineDeadError()\n\n        ...\n\n        # Convert Input --> Request.\n        ...\n        request = self.input_processor.process_inputs(\n            request_id,\n            prompt,\n            params,\n            supported_tasks=await self.get_supported_tasks(),\n            ...\n        )\n        ...\n\n        self.input_processor.assign_request_id(request)\n\n        # We start the output_handler on the first call to add_request() so\n        # we can call __init__ before the event loop, which enables us\n        # to handle startup failure gracefully in the OpenAI server.\n        self._run_output_handler()\n\n        # Create a new output collector for the request.\n        queue = RequestOutputCollector(params.output_kind, request.request_id)\n\n        # Use cloned params that may have been updated in process_inputs()\n        params = request.params\n\n        if is_pooling or params.n == 1:\n            await self._add_request(request, prompt_text, None, 0, queue)\n            return queue\n        ...",
+      "elide": [
+        "errored 检查 + kv_sharing_fast_prefill 的 prompt_logprobs 校验(L300-314): 错误/特性分支",
+        "isinstance(prompt, AsyncGenerator) 的流式输入分支(L316-331)与 EngineCoreRequest 直传的 deprecated 分支(L334-347): 本章删, 只讲常规 prompt",
+        "reasoning_ended/reasoning_parser_kwargs 透传(L363-366): 推理解析特性",
+        "n>1 的 ParentRequest 扇出子请求(L385-398): 并行采样, 留作 must_keep 提及但精简版可简化到 n==1 主路径"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/async_llm.py",
+      "lines": "L400-L415",
+      "purpose": "全章最关键的 16 行——三段解耦的扇出点。_add_request 把同一个请求同时(a)登记到本进程 OutputProcessor(建立 req_id->queue 映射, L409)、(b)经 engine_core.add_request_async 投递到独立进程 EngineCore(L412)。两条注释 'this process' / 'separate process' 逐字点破进程边界(f2)。",
+      "code": "    async def _add_request(\n        self,\n        request: EngineCoreRequest,\n        prompt: str | None,\n        parent_req: ParentRequest | None,\n        index: int,\n        queue: RequestOutputCollector,\n    ):\n        # Add the request to OutputProcessor (this process).\n        self.output_processor.add_request(request, prompt, parent_req, index, queue)\n\n        # Add the EngineCoreRequest to EngineCore (separate process).\n        await self.engine_core.add_request_async(request)\n\n        if self.log_requests:\n            logger.info(\"Added request %s.\", request.request_id)",
+      "elide": [
+        "log_requests 日志(L414-415)"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/async_llm.py",
+      "lines": "L524-L635",
+      "purpose": "generate() 异步生成器——消费者侧。docstring 逐字列出 4 步并点明 'A separate output_handler loop runs in a background AsyncIO task'。核心是 while 循环 L579 `out = q.get_nowait() or await q.get()`: 先非阻塞快取, 取不到才 await, 注释逐字解释这是为减少高负载下任务切换。取消(客户端断开)走 abort(L591-596), finally close(L633-635)。",
+      "code": "    async def generate(\n        self,\n        prompt: ...,\n        sampling_params: SamplingParams,\n        request_id: str,\n        ...\n    ) -> AsyncGenerator[RequestOutput, None]:\n        \"\"\"\n        Main function called by the API server to kick off a request\n            * 1) Making an AsyncStream corresponding to the Request.\n            * 2) Processing the Input.\n            * 3) Adding the Request to the Detokenizer.\n            * 4) Adding the Request to the EngineCore (separate process).\n\n        A separate output_handler loop runs in a background AsyncIO task,\n        pulling outputs from EngineCore and putting them into the\n        per-request AsyncStream.\n\n        The caller of generate() iterates the returned AsyncGenerator,\n        returning the RequestOutput back to the caller.\n        \"\"\"\n\n        q: RequestOutputCollector | None = None\n        try:\n            q = await self.add_request(\n                request_id,\n                prompt,\n                sampling_params,\n                ...\n            )\n\n            # The output_handler task pushes items into the queue.\n            # This task pulls from the queue and yields to caller.\n            finished = False\n            while not finished:\n                # Note: drain queue without await if possible (avoids\n                # task switching under load which helps performance).\n                out = q.get_nowait() or await q.get()\n\n                # Note: both OutputProcessor and EngineCore handle their\n                # own request cleanup based on finished.\n                assert isinstance(out, RequestOutput)\n                finished = out.finished\n                if out is not STREAM_FINISHED:\n                    yield out\n\n        # If the request is disconnected by the client, generate()\n        # is cancelled or the generator is garbage collected. So,\n        # we abort the request if we end up here.\n        except (asyncio.CancelledError, GeneratorExit):\n            if q is not None:\n                await self.abort(q.request_id, internal=True)\n            ...\n            raise\n        ...\n        finally:\n            if q is not None:\n                q.close()",
+      "elide": [
+        "EngineDeadError/ValueError/InputStreamError/通用 Exception 的多个 except 分支(L598-632): 错误分类与日志, 精简版保留 CancelledError->abort 一条即可演示生命周期",
+        "generate 入参中 lora/trace_headers/priority/data_parallel_rank/reasoning_* 透传"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/async_llm.py",
+      "lines": "L637-L707",
+      "purpose": "_run_output_handler——生产者侧背景任务(f3)。先用局部变量捕获 engine_core/output_processor(注释逐字说明: 避免闭包回指 self 形成循环引用妨碍 GC, L643-644)。内层协程 while True: (1)await get_output_async() 拉一批(L660); (2)按 VLLM_V1_OUTPUT_PROC_CHUNK_SIZE 分块, 每块 process_outputs() 把 RequestOutput 推回各请求队列(注释 'RequestOutputs are pushed to their queues', assert 无返回值 L678-679); (3)块间 await asyncio.sleep(0) 让出事件循环(L682-683); (4)stop-string 完成的请求回投 abort(L686-689)。末尾 asyncio.create_task 真正起任务(L707)。",
+      "code": "    def _run_output_handler(self):\n        \"\"\"Background loop: pulls from EngineCore and pushes to AsyncStreams.\"\"\"\n\n        if self.output_handler is not None:\n            return\n\n        # Ensure that the task doesn't have a circular ref back to the AsyncLLM\n        # object, or else it won't be garbage collected and cleaned up properly.\n        engine_core = self.engine_core\n        output_processor = self.output_processor\n        log_stats = self.log_stats\n        ...\n        chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE\n\n        async def output_handler():\n            try:\n                while True:\n                    # 1) Pull EngineCoreOutputs from the EngineCore.\n                    outputs = await engine_core.get_output_async()\n                    num_outputs = len(outputs.outputs)\n\n                    iteration_stats = (\n                        IterationStats() if (log_stats and num_outputs) else None\n                    )\n\n                    # Split outputs into chunks of at most\n                    # VLLM_V1_OUTPUT_PROC_CHUNK_SIZE, so that we don't block the\n                    # event loop for too long.\n                    engine_core_outputs = outputs.outputs\n                    for start in range(0, num_outputs, chunk_size):\n                        end = start + chunk_size\n                        outputs_slice = engine_core_outputs[start:end]\n                        # 2) Process EngineCoreOutputs.\n                        processed_outputs = output_processor.process_outputs(\n                            outputs_slice, outputs.timestamp, iteration_stats\n                        )\n                        # NOTE: RequestOutputs are pushed to their queues.\n                        assert not processed_outputs.request_outputs\n\n                        # Allow other asyncio tasks to run between chunks\n                        if end < num_outputs:\n                            await asyncio.sleep(0)\n\n                        # 3) Abort any reqs that finished due to stop strings.\n                        if processed_outputs.reqs_to_abort:\n                            await engine_core.abort_requests_async(\n                                processed_outputs.reqs_to_abort\n                            )\n                    ...\n            except Exception as e:\n                logger.exception(\"AsyncLLM output_handler failed.\")\n                output_processor.propagate_error(e)\n\n        self.output_handler = asyncio.create_task(output_handler())",
+      "elide": [
+        "iteration_stats/logger_ref/renderer 等统计与日志(L647-652, L691-702): 精简版删 log_stats",
+        "_logger_ref 用 mutable list 以支持 elastic EP scaling(L648-651): 弹性扩缩特性",
+        "except Exception -> propagate_error(L703-705) 保留要点(背景任务故障要传播给所有等待的 generate), 但实现可简化"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/output_processor.py",
+      "lines": "L45-L106",
+      "purpose": "RequestOutputCollector——per-request 队列的真身(f1)。注意它不是 asyncio.Queue, 而是 单槽(self.output) + asyncio.Event(self.ready) 的轻量收集器。put(L62): 空槽则置位 Event; 若消费者没跟上(槽已有 RequestOutput)则 self.output.add(...) 合并(支持 DELTA 聚合与 n>1 不互相覆盖)。get(L78): await ready.wait() 直到有值。get_nowait(L88): 有则取走清 Event 否则返回 None。这正是 generate() L579 `get_nowait() or await get()` 的对端。",
+      "code": "class RequestOutputCollector:\n    \"\"\"\n    Collects streamed RequestOutputs per individual request,\n    for hand-off to the consuming asyncio generate task.\n\n    When streaming deltas, RequestOutputs are merged if the\n    producer gets ahead of the consumer.\n    \"\"\"\n\n    def __init__(self, output_kind: RequestOutputKind, request_id: str):\n        self.aggregate = output_kind == RequestOutputKind.DELTA\n        self.request_id = request_id\n        self.output: RequestOutput | PoolingRequestOutput | Exception | None = None\n        self.ready = asyncio.Event()\n\n        self._input_stream_task: asyncio.Task | None = None\n\n    def put(self, output: RequestOutput | PoolingRequestOutput | Exception) -> None:\n        \"\"\"Non-blocking put operation.\"\"\"\n        if self.output is None or isinstance(output, Exception):\n            self.output = output\n            self.ready.set()\n        elif isinstance(self.output, RequestOutput) and isinstance(\n            output, RequestOutput\n        ):\n            # This ensures that request outputs with different request indexes\n            # (if n > 1) do not override each other.\n            self.output.add(output, aggregate=self.aggregate)\n        elif isinstance(self.output, PoolingRequestOutput) and isinstance(\n            output, PoolingRequestOutput\n        ):\n            self.output = output\n\n    async def get(self) -> RequestOutput | PoolingRequestOutput:\n        \"\"\"Get operation blocks on put event.\"\"\"\n        while (output := self.output) is None:\n            await self.ready.wait()\n        self.output = None\n        self.ready.clear()\n        if isinstance(output, Exception):\n            raise output\n        return output\n\n    def get_nowait(self) -> RequestOutput | PoolingRequestOutput | None:\n        \"\"\"Non-blocking get operation.\"\"\"\n        output = self.output\n        if output is not None:\n            self.output = None\n            self.ready.clear()\n        if isinstance(output, Exception):\n            raise output\n        return output",
+      "elide": [
+        "close()/__del__ 里取消 _input_stream_task(L98-106): 流式输入清理, 精简版删流式输入即可一并删, 但 close 方法骨架可保留为空清理"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/output_processor.py",
+      "lines": "L508-L537",
+      "purpose": "OutputProcessor.add_request——队列登记侧。把 generate/add_request 传进来的 queue 存入 per-request RequestState(L528), 并把 RequestState 记入 self.request_states[request_id](L532)。这建立了 req_id -> RequestState(含 queue) 的查找表, 是后面 process_outputs 按 req_id 解多路复用的前提。",
+      "code": "    def add_request(\n        self,\n        request: EngineCoreRequest,\n        prompt: str | None,\n        parent_req: ParentRequest | None = None,\n        request_index: int = 0,\n        queue: RequestOutputCollector | None = None,\n    ) -> None:\n        request_id = request.request_id\n        req_state = self.request_states.get(request_id)\n        ...\n        req_state = RequestState.from_new_request(\n            tokenizer=self.tokenizer,\n            request=request,\n            prompt=prompt,\n            parent_req=parent_req,\n            request_index=request_index,\n            queue=queue,\n            log_stats=self.log_stats,\n            stream_interval=self.stream_interval,\n        )\n        self.request_states[request_id] = req_state\n        ...",
+      "elide": [
+        "已存在 req_state 的流式更新分支 _update_streaming_request_state(L517-520): 流式输入",
+        "parent_requests / external_req_ids 映射(L533-537): n>1 与外部 id 追踪, 精简版可省"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/output_processor.py",
+      "lines": "L600-L660",
+      "purpose": "process_outputs 的多路复用解扇出——和 add_request_async 的扇入相对称。for 每个 EngineCoreOutput: 读 req_id(L603) -> 查本请求 req_state(L604, None 则说明已 abort, 跳过) -> 生成 RequestOutput -> 关键的 L655-657 `if req_state.queue is not None: req_state.queue.put(request_output)` 把结果投回该请求专属队列。else 分支(L658-660)是同步 LLMEngine 用法。一个 EngineCore 批 -> 按 req_id 分发回 N 个 per-request 队列。",
+      "code": "        for engine_core_output in engine_core_outputs:\n            req_id = engine_core_output.request_id\n            req_state = self.request_states.get(req_id)\n            if req_state is None:\n                # Ignore output for already-aborted request.\n                continue\n            ...\n            # 4) Create and handle RequestOutput objects.\n            if request_output := req_state.make_request_output(\n                new_token_ids,\n                pooling_output,\n                finish_reason,\n                stop_reason,\n                kv_transfer_params,\n                routed_experts,\n            ):\n                ...\n                if req_state.queue is not None:\n                    # AsyncLLM: put into queue for handling by generate().\n                    req_state.queue.put(request_output)\n                else:\n                    # LLMEngine: return list of RequestOutputs.\n                    request_outputs.append(request_output)",
+      "elide": [
+        "_update_stats_from_output 统计(L609-612)",
+        "is_prefilling/prefill_stats 处理(L621-626)",
+        "detokenizer.update + stop-string 检测 + logprobs_processor(L628-641): Stage3 去 tokenize 细节, 留 ch08",
+        "make_request_output 的具体字段(L644-651)与 streaming_input finished 改写(L652-653)",
+        "完成请求的 free/abort 收尾(L662 起): 留 ch08"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/core_client.py",
+      "lines": "L990-L999, L1058-L1061",
+      "purpose": "IPC 接缝(f2)——本章只标边界, 不展开。add_request_async(L1058): encode 后经 _send_input 走 ZMQ input_socket 发到 EngineCore 进程。get_output_async(L990): await self.outputs_queue.get(), 该 asyncio 队列由背景 process_outputs_socket 任务消费 ZMQ output_socket 填充。AsyncLLM 只看到这两个 await, 进程/ZMQ/msgpack 全在幕后 -> ch07。",
+      "code": "    async def get_output_async(self) -> EngineCoreOutputs:\n        self._ensure_output_queue_task()\n        ...\n        assert self.outputs_queue is not None\n        outputs = await self.outputs_queue.get()\n        if isinstance(outputs, Exception):\n            raise self._format_exception(outputs) from None\n        return outputs\n\n    ...\n\n    async def add_request_async(self, request: EngineCoreRequest) -> None:\n        request.client_index = self.client_index\n        await self._send_input(EngineCoreRequestType.ADD, request)\n        self._ensure_output_queue_task()",
+      "elide": [
+        "_send_input/_send_input_message 的 ZMQ MessageTracker 零拷贝细节(L1001-1036): ch07",
+        "_ensure_output_queue_task / process_outputs_socket 背景任务(L942-988): ch07",
+        "call_utility_async 等控制面方法"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/__init__.py",
+      "lines": "L80-L131, L161-L191",
+      "purpose": "跨进程边界的两种消息。EngineCoreRequest(L80): 进入引擎方向, 已 tokenize 的 prompt_token_ids + sampling_params 等(msgspec.Struct, array_like 紧凑序列化)。EngineCoreOutput(L161): 返回方向, request_id + new_token_ids + finish_reason, finished 属性(L189)是 generate() 判停的依据。读者由此看清 IPC 上'流动的是什么', 即便机制留到 ch07。",
+      "code": "class EngineCoreRequest(\n    msgspec.Struct,\n    array_like=True,\n    omit_defaults=True,\n    gc=False,\n):\n    request_id: str\n    prompt_token_ids: list[int] | None\n    mm_features: list[MultiModalFeatureSpec] | None\n    sampling_params: SamplingParams | None\n    pooling_params: PoolingParams | None\n    arrival_time: float\n    lora_request: LoRARequest | None\n    ...\n\nclass EngineCoreOutput(\n    msgspec.Struct,\n    array_like=True,\n    omit_defaults=True,\n    gc=False,\n):\n    request_id: str\n    new_token_ids: list[int]\n\n    new_logprobs: LogprobsLists | None = None\n    ...\n    finish_reason: FinishReason | None = None\n    stop_reason: int | str | None = None\n    ...\n\n    @property\n    def finished(self) -> bool:\n        return self.finish_reason is not None",
+      "elide": [
+        "EngineCoreRequest 的 mm_features/cache_salt/data_parallel_rank/current_wave/trace_headers/resumable/external_req_id/reasoning_* 等次要字段",
+        "EngineCoreOutput 的 logprobs/pooling/events/kv_transfer/prefill_stats/routed_experts/num_nans 等次要字段",
+        "EngineCoreOutputs(批容器, L206)/UtilityOutput/EngineCoreRequestType 等可只点名不展开"
+      ]
+    }
+  ],
+  "key_classes": [
+    {
+      "name": "AsyncLLM",
+      "file": "vllm/v1/engine/async_llm.py:L70",
+      "responsibility": "三段式异步 facade(继承 EngineClient)。__init__ 构造三段并急切/懒启 output_handler；对外暴露 generate()(异步生成器)与 add_request()/abort()；持有 input_processor/output_processor/engine_core/output_handler 四个核心成员。"
+    },
+    {
+      "name": "RequestOutputCollector",
+      "file": "vllm/v1/engine/output_processor.py:L45",
+      "responsibility": "每个请求一个的输出收集器(f1)。单槽 self.output + asyncio.Event self.ready 实现 put(生产者, output_handler 调)/get(消费者, generate 调)/get_nowait(消费者快路径)；生产者超前时 merge(支持 DELTA 聚合)。是连接背景任务与 per-request generate 协程的解耦队列。"
+    },
+    {
+      "name": "OutputProcessor",
+      "file": "vllm/v1/engine/output_processor.py:L413",
+      "responsibility": "Stage3 后处理与 per-request 队列登记/分发。add_request 把 queue 存入 req_id->RequestState 表；process_outputs 按 req_id 把 EngineCoreOutput 解多路复用、生成 RequestOutput 并 put 回各请求队列。(去 tokenize/累积细节留 ch08, 本章只用其'登记+分发'骨架。)"
+    },
+    {
+      "name": "InputProcessor",
+      "file": "vllm/v1/engine/input_processor.py:L36 (process_inputs L234, assign_request_id L215)",
+      "responsibility": "Stage1 前处理。process_inputs(prompt,params,...) 把原始 prompt + 采样参数转成已 tokenize 的 EngineCoreRequest。本章只把它当作 add_request 的第一步黑盒；内部 tokenize/校验留 ch05。"
+    },
+    {
+      "name": "EngineCoreClient / AsyncMPClient",
+      "file": "vllm/v1/engine/core_client.py:L69 / L887",
+      "responsibility": "Stage2 的进程边界客户端(f2)。make_async_mp_client 启动独立进程的 EngineCore；add_request_async 经 ZMQ 投递 EngineCoreRequest, get_output_async 经 asyncio 队列收 EngineCoreOutputs。本章只用这两个异步方法标 IPC 接缝；ZMQ/msgpack/进程编排留 ch07。"
+    },
+    {
+      "name": "EngineCoreRequest / EngineCoreOutput",
+      "file": "vllm/v1/engine/__init__.py:L80 / L161",
+      "responsibility": "跨进程边界的 msgspec 消息。前者承载已 tokenize 的请求进入引擎, 后者承载 new_token_ids + finish_reason 返回；EngineCoreOutput.finished 是 generate() 判停依据。"
+    }
+  ],
+  "data_flow": [
+    "1. 调用方(API server) await-iterate `AsyncLLM.generate(prompt, sampling_params, request_id)` (async_llm.py:generate L524) -> 拿到一个 AsyncGenerator。",
+    "2. generate 内部 `q = await self.add_request(...)` (async_llm.py:generate L559) -> 进入登记流程, 返回本请求专属队列 q。",
+    "3. add_request 调 `input_processor.process_inputs(...)` (async_llm.py:add_request L349) [Stage1, 本进程] 把 prompt 转成 EngineCoreRequest。",
+    "4. add_request 调 `self._run_output_handler()` (async_llm.py:add_request L373) 懒启背景任务(若尚未启)。",
+    "5. add_request `queue = RequestOutputCollector(...)` (async_llm.py:add_request L376) 为本请求建专属队列(f1)。",
+    "6. add_request -> `_add_request` (async_llm.py:_add_request L400) 扇出两路：",
+    "6a. `output_processor.add_request(request, ..., queue)` (output_processor.py:add_request L508) [本进程] 把 queue 存入 req_id->RequestState 表。",
+    "6b. `await engine_core.add_request_async(request)` (async_llm.py:_add_request L412 -> core_client.py:add_request_async L1058) [跨进程, IPC] 把 EngineCoreRequest 投递到独立进程 EngineCore(f2)。",
+    "7. [独立进程, 留 ch07] EngineCore 调度+执行, 产出 EngineCoreOutputs。",
+    "8. 背景任务 `output_handler` `await engine_core.get_output_async()` (async_llm.py:_run_output_handler L660 -> core_client.py:get_output_async L990) [跨进程, IPC] 收一批 EngineCoreOutputs(f3)。",
+    "9. output_handler 分块调 `output_processor.process_outputs(outputs_slice, ...)` (async_llm.py:_run_output_handler L675 -> output_processor.py:process_outputs L572)。",
+    "10. process_outputs 按 `req_id` 查 RequestState 并 `req_state.queue.put(request_output)` (output_processor.py:process_outputs L655-657) 把结果解多路复用回各请求专属队列。",
+    "11. put 唤醒对应队列的 asyncio.Event (output_processor.py:RequestOutputCollector.put L66)。",
+    "12. generate 的 while 循环 `out = q.get_nowait() or await q.get()` (async_llm.py:generate L579) 取出 RequestOutput, `if out.finished` 判停, `yield out` 给调用方(async_llm.py:generate L584-586)。",
+    "13. 调用方断开 -> generate 收 CancelledError/GeneratorExit -> `await self.abort(...)` (async_llm.py:generate L591-593) 在 OutputProcessor 与 EngineCore 双向清理。"
+  ],
+  "design_decisions": [
+    {
+      "decision": "三段式解耦：Stage1 输入预处理(本进程) | Stage2 EngineCore 调度+执行(独立进程, 经 IPC) | Stage3 输出后处理(本进程背景 asyncio 任务)。",
+      "why": "把 CPU 密集的 tokenize/detokenize(本进程)与 GPU 密集的调度/执行(独立进程)拆开, 让前端可在 GPU 跑批的同时持续接收/预处理新请求, 减少同步点 -> 支撑连续批处理、提吞吐、降尾延迟。三段以消息(EngineCoreRequest/Output)通信而非共享状态。",
+      "evidence": "vllm/v1/engine/async_llm.py:L135-L153 (三组件构造, 注释逐字标 in-process / separate process); vllm/v1/engine/async_llm.py:L408-L412 (_add_request 注释 'this process' vs 'separate process')"
+    },
+    {
+      "decision": "每请求一个 RequestOutputCollector 队列, 而非全局共享队列。",
+      "why": "per-request 隔离让每个 generate() 协程只等自己的输出, 避免在共享队列上互相抢占/过滤; 单槽+Event 比 asyncio.Queue 更轻, 且生产者超前时可 merge(DELTA 聚合) 而非堆积。是异步多路复用的关键(f1)。",
+      "evidence": "vllm/v1/engine/async_llm.py:L376 (每请求 new RequestOutputCollector); vllm/v1/engine/output_processor.py:L45-L106 (单槽+Event+merge 实现)"
+    },
+    {
+      "decision": "generate() 用 `get_nowait() or await get()` 的快路径优先模式。",
+      "why": "高负载下输出常已就绪, 先非阻塞 get_nowait() 命中就免去一次事件循环任务切换(协程挂起/恢复有成本); 只有真没数据才 await。源码注释逐字: 'avoids task switching under load which helps performance'。",
+      "evidence": "vllm/v1/engine/async_llm.py:L577-L579"
+    },
+    {
+      "decision": "output_handler 是单个长驻背景 asyncio.Task, 与各 generate() 协程构成单生产者-多消费者; 且懒/急切双启动。",
+      "why": "一个 IPC 出口(get_output_async)统一收所有请求的输出再按 req_id 分发, 避免每请求各开一条 IPC 流; 懒启(首个 add_request)让 __init__ 可早于事件循环创建(OpenAI server 启动期), 优雅处理启动失败。闭包用局部变量避免回指 self 造成循环引用妨碍 GC。",
+      "evidence": "vllm/v1/engine/async_llm.py:L170-L176 (__init__ 急切尝试); vllm/v1/engine/async_llm.py:L370-L373 (首个 add_request 懒启); vllm/v1/engine/async_llm.py:L637-L645,L707 (单任务+局部变量避免循环引用+create_task)"
+    },
+    {
+      "decision": "output_handler 把一批输出按 VLLM_V1_OUTPUT_PROC_CHUNK_SIZE 分块, 块间 await asyncio.sleep(0)。",
+      "why": "一批可能含上百请求的输出, 一次性处理会长时间霸占事件循环, 饿死其它任务(尤其 add_request 接收新请求)。分块+sleep(0) 主动让出, 保证高输出吞吐下前端仍能及时接客 -> 降低请求接收尾延迟。",
+      "evidence": "vllm/v1/engine/async_llm.py:L667-L683"
+    },
+    {
+      "decision": "OutputProcessor 同时服务异步(AsyncLLM, 有 queue) 与同步(LLMEngine, 无 queue) 两种用法, 用 `req_state.queue is not None` 分流。",
+      "why": "复用同一套去 tokenize/状态机逻辑: 有队列就 put 回 per-request 队列(异步流式), 无队列就收集成 list 返回(同步批)。本章只走有队列分支, 但保留该判断让读者理解 AsyncLLM 与 LLMEngine 的关系。",
+      "evidence": "vllm/v1/engine/output_processor.py:L655-L660"
+    }
+  ],
+  "theory": [
+    {
+      "topic": "为何进程级解耦能提吞吐(打破 GIL + 重叠 CPU/GPU)",
+      "derivation": "若 tokenize/detokenize(CPU, Python) 与 schedule/execute(驱动 GPU) 在同一进程同一线程, 受 GIL 制约二者串行: 每步总时 T = T_cpu + T_gpu。拆到两进程后, 前端 CPU 处理第 i+1 个请求可与后端 GPU 跑第 i 批重叠, 稳态每步时间趋近 max(T_cpu, T_gpu) 而非二者之和。吞吐上界从 1/(T_cpu+T_gpu) 提到 1/max(T_cpu,T_gpu)。当 T_cpu 与 T_gpu 同量级时, 近似翻倍。这是三段式的核心收益, 也是连续批处理(ch03)能持续喂饱 GPU 的前提。"
+    },
+    {
+      "topic": "为何 async 单线程事件循环不需要锁, 以及 sleep(0) 的让步语义",
+      "derivation": "AsyncLLM 的前端(generate 协程们 + output_handler)全跑在一个事件循环、单 OS 线程上, 协程只在 await 点切换 -> 临界区天然原子(RequestOutputCollector 的单槽 put/get 无需 Lock)。但'单线程协作式'的代价是任何不 await 的长循环都会阻塞全部其它协程。process_outputs 处理一大批是纯 CPU 循环(无 await), 故需人为插入 await asyncio.sleep(0) 把控制权交还事件循环——sleep(0) 不真正睡, 只是'排到就绪队列末尾让别人先跑一轮'。这量化了为何要分块: 设单请求处理耗 c, 批大小 N, 不分块则其它协程最坏等待 N*c; 分块为 K, 则最坏等待降到 K*c。"
+    },
+    {
+      "topic": "单生产者-多消费者 + per-request 队列如何降尾延迟",
+      "derivation": "若所有请求共享一条输出流, 第 j 个请求的 token 要等队头其它请求的 token 被消费才轮到, 尾延迟随并发数线性恶化。per-request 队列把 N 路输出物理隔离: output_handler 一次 put 直接命中目标请求的 Event, 该请求的 generate 协程立即就绪, 与其它请求互不排队。配合 get_nowait() 快路径(命中即免一次调度往返), 单请求从'EngineCore 产出 token'到'yield 给客户端'的延迟 ≈ 一次 put + 一次协程恢复, 与系统总并发量解耦(O(1) 而非 O(N))。"
+    },
+    {
+      "topic": "生产者超前时的 merge 语义(背压的替代)",
+      "derivation": "当 output_handler(生产者)比某请求的 generate(消费者)快, 单槽已有未取的 RequestOutput。RequestOutputCollector.put 不丢弃也不阻塞, 而是 self.output.add(new, aggregate=...): DELTA 模式累加增量 token, FINAL 模式以最新覆盖。效果等价于'对慢消费者自动合帧'——消费者下次 get 一次拿到合并结果, 既不丢 token 也不让生产者阻塞(无背压回压到 GPU)。代价是慢客户端看到的是合并后的更大块, 但语义正确(token 序列完整)。"
+    }
+  ],
+  "subtraction_plan": {
+    "_principle": "精简版 = 用 in-process stub 替 IPC, 完整保留三段式编排骨架。具体: 把 EngineCoreClient.make_async_mp_client(...) 换成一个 in-process 假引擎(持一个 asyncio.Queue 收 EngineCoreRequest, 一个背景协程模拟'产 token'并把 EngineCoreOutput 放入另一队列), 但其对外仍暴露同名的 add_request_async / get_output_async / abort_requests_async 三个 async 方法 —— 这样 AsyncLLM 的 __init__/add_request/_add_request/generate/_run_output_handler 几乎一字不改, 三段式结构与生产者-消费者关系原样可见, 只是 Stage2 的物理进程边界被替换成同进程的队列(真实的 IPC 机制由 ch07 揭示)。",
+    "delete": [
+      {
+        "what": "DP / 数据并行协调(client_addresses/client_count/client_index 参数, DPCoordinator, current_wave/start_wave/wave_complete, START_DP_WAVE)",
+        "why_safe": "本章 scope 明确把 DP 留给 ch21; 单引擎下这些全是惰性/默认值(client_count=1, wave=0), 删去不影响三段式主路径正确性。"
+      },
+      {
+        "what": "multiproc/ZMQ/msgpack 的真实 IPC 实现(core_client.py 的 _send_input/MessageTracker/process_outputs_socket/握手, EngineCoreProc 的 socket 线程)",
+        "why_safe": "用 in-process stub 替代后, AsyncLLM 看到的 add_request_async/get_output_async 接口语义不变; IPC 物理机制是 ch07 的主题, 本章只标边界。"
+      },
+      {
+        "what": "log_stats / StatLoggerManager / IterationStats / SchedulerStats / Prometheus / metrics 记录(__init__ L120-166, output_handler L663-665,L691-702)",
+        "why_safe": "纯观测旁路, 不参与请求->输出的数据流; 删后三段编排与队列分发逻辑完全不变。"
+      },
+      {
+        "what": "流式输入(_add_streaming_input_request L417-501, add_request 中 isinstance(prompt, AsyncGenerator) 分支 L316-331, StreamingUpdate/input_chunk_queue/STREAM_FINISHED 相关, _validate_streaming_input_sampling_params)",
+        "why_safe": "本章焦点是'输出流式'(generate 异步生成器), 不是'输入流式'。常规一次性 prompt 即可完整演示三段式; 流式输入是正交特性。"
+      },
+      {
+        "what": "n>1 并行采样(ParentRequest 扇出 L385-398, RequestOutputCollector.add 中 n>1 防覆盖逻辑, parent_requests/external_req_ids 映射)",
+        "why_safe": "n==1 主路径已含完整三段+per-request 队列+多路复用; n>1 只是把一个父请求扇成多子请求(同机制重复), 精简版收敛到 n==1 不损害对核心的理解。"
+      },
+      {
+        "what": "EngineCoreRequest 直传的 deprecated 分支(add_request L334-347)",
+        "why_safe": "已标记 v0.18 移除的兼容路径, 与主线无关。"
+      },
+      {
+        "what": "torch profiler 配置(__init__ L178-200)、tracing/otlp(init_tracer)、reasoning_parser 透传、kv_sharing_fast_prefill 校验、weight_transfer/pause/resume/elastic-EP scaling(scale_elastic_ep, _logger_ref mutable list 的弹性用途)",
+        "why_safe": "全是与'三段式如何编排请求'正交的特性/可观测/运维分支; 删后核心数据流不变。"
+      },
+      {
+        "what": "generate() 中除 CancelledError 外的多个 except 分支(EngineDeadError/ValueError/InputStreamError/通用 Exception 的精细分类与日志, L598-632)",
+        "why_safe": "保留 CancelledError->abort 一条已足够演示'客户端断开则中止'的生命周期; 其余是错误分类与日志细化, 不改变正常路径。"
+      },
+      {
+        "what": "process_outputs 中 Stage3 的去 tokenize/logprobs/prefill_stats/make_request_output 字段细节(output_processor.py L609-651 大部分)及完成请求的 free/abort 收尾(L662+)",
+        "why_safe": "Stage3 的内部细节是 ch08 主题; 本章 stub 版只需让 process_outputs 产出一个带 finished 标志的 RequestOutput 并 put 回队列, 即可展示多路复用解扇出。"
+      }
+    ],
+    "must_keep": [
+      {
+        "symbol": "AsyncLLM",
+        "why": "本章主角类名; 三段式 facade 的载体。"
+      },
+      {
+        "symbol": "AsyncLLM.__init__",
+        "why": "三段(InputProcessor/OutputProcessor/EngineCore-stub)的构造地与 output_handler 的初始化点, 读者必须看到三段在此诞生。"
+      },
+      {
+        "symbol": "generate",
+        "why": "异步生成器入口; while + get_nowait()/await get() + yield + finished 判停 是消费者侧骨架(f3 生产者-消费者的消费端)。"
+      },
+      {
+        "symbol": "add_request",
+        "why": "登记主干: process_inputs -> 建 RequestOutputCollector -> 懒启 output_handler -> _add_request; 是 generate 第一步落点。"
+      },
+      {
+        "symbol": "_add_request",
+        "why": "三段解耦的扇出点(双登记 OutputProcessor + EngineCore); 'this process'/'separate process' 两行注释体现进程边界(f2)。"
+      },
+      {
+        "symbol": "_run_output_handler",
+        "why": "背景 asyncio 任务的创建函数; 生产者侧 while True 拉取->分块 process_outputs->队列 的骨架(f3)。"
+      },
+      {
+        "symbol": "output_handler",
+        "why": "_run_output_handler 内层协程名; asyncio.create_task 包的实际后台循环体, 是 f3 的生产者实体。"
+      },
+      {
+        "symbol": "RequestOutputCollector",
+        "why": "per-request 队列类(f1); 异步多路复用的关键, ch08 回收。"
+      },
+      {
+        "symbol": "RequestOutputCollector.put",
+        "why": "生产者(output_handler/OutputProcessor)写入端; 体现 merge 语义与 Event 唤醒。"
+      },
+      {
+        "symbol": "RequestOutputCollector.get",
+        "why": "消费者阻塞读端; await ready.wait() 的生产者-消费者同步点。"
+      },
+      {
+        "symbol": "RequestOutputCollector.get_nowait",
+        "why": "消费者快路径; generate L579 `get_nowait() or await get()` 的左操作数, 性能设计的体现。"
+      },
+      {
+        "symbol": "OutputProcessor",
+        "why": "Stage3 后处理器; 本章用其 add_request(登记 queue) 与 process_outputs(分发) 两个骨架方法。"
+      },
+      {
+        "symbol": "OutputProcessor.add_request",
+        "why": "把 per-request queue 登记进 req_id->RequestState 表, 是后续按 req_id 解多路复用的前提。"
+      },
+      {
+        "symbol": "OutputProcessor.process_outputs",
+        "why": "多路复用解扇出: 按 req_id 把一批 EngineCoreOutput 分发回各请求队列(req_state.queue.put)。"
+      },
+      {
+        "symbol": "InputProcessor",
+        "why": "Stage1; 即便内部留 ch05, 三段式必须出现这一段的占位与 process_inputs 调用。"
+      },
+      {
+        "symbol": "process_inputs",
+        "why": "add_request 第一步: prompt -> EngineCoreRequest, 三段式的入口转换。"
+      },
+      {
+        "symbol": "add_request_async",
+        "why": "Stage2 IPC 接缝的投递方法名(f2); stub 版须保留同名以体现'投递到引擎'语义, ch07 回收。"
+      },
+      {
+        "symbol": "get_output_async",
+        "why": "Stage2 IPC 接缝的收取方法名(f3 的拉取源); stub 版须保留同名, ch07 回收。"
+      },
+      {
+        "symbol": "EngineCoreRequest",
+        "why": "跨进程边界 进入引擎方向 的消息类型; 读者需看清'流过 IPC 的是什么'。"
+      },
+      {
+        "symbol": "EngineCoreOutput",
+        "why": "跨进程边界 返回方向 的消息类型; 其 finished 属性是 generate 判停依据。"
+      },
+      {
+        "symbol": "abort",
+        "why": "客户端断开/取消时在 OutputProcessor 与 EngineCore 双向清理, 是 generate 生命周期的收尾(CancelledError 分支)。"
+      },
+      {
+        "symbol": "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE",
+        "why": "分块常量; 块间 asyncio.sleep(0) 让出事件循环的设计要靠它体现, writer 要讲清为何分块。"
+      },
+      {
+        "symbol": "asyncio.sleep(0)",
+        "why": "output_handler 块间主动让步的语义点; 单线程协作式调度的关键, 必须可检测保留。"
+      }
+    ]
+  },
+  "diagram_plan": [
+    {
+      "id": "fig-3stage-pipeline",
+      "title": "三段式异步解耦总览(进程边界 + 数据流)",
+      "kind": "svg-diagram (architecture / dataflow)",
+      "spec": "三个泳道横排: [本进程 Frontend] | [IPC 接缝(虚线进程边界)] | [独立进程 EngineCore]。本进程泳道内含三块: Stage1 InputProcessor(prompt->EngineCoreRequest) -> add_request 扇出节点 -> 上路 OutputProcessor(本进程, Stage3) / 下路 经 add_request_async 穿过虚线到 EngineCore。EngineCore 块标 '调度+执行(ch07/ch03)' 灰显。返回方向: EngineCore --EngineCoreOutput--> 穿虚线 --get_output_async--> output_handler(本进程背景 asyncio.Task) --process_outputs--> 多个 per-request RequestOutputCollector 队列 --get_nowait/get--> 多个 generate() 协程 --yield--> 客户端。用不同颜色标 EngineCoreRequest(进) 与 EngineCoreOutput(出) 两种消息。虚线进程边界上标注 'f2: IPC, 详见 ch07'。",
+      "annotations": [
+        "进程边界用虚线; 三段用三种底色",
+        "标 f1(per-request 队列)/f2(进程边界)/f3(output_handler 生产者-消费者) 三个伏笔锚点",
+        "EngineCore 内部灰显, 提示本章不展开"
+      ]
+    },
+    {
+      "id": "fig-producer-consumer-seq",
+      "title": "output_handler 与 generate 的生产者-消费者时序(单请求)",
+      "kind": "svg-diagram (sequence)",
+      "spec": "五条生命线: Client | generate()协程 | RequestOutputCollector | output_handler任务 | EngineCore(stub)。时序: Client->generate: iterate; generate->add_request->建 Collector + 投递 EngineCore; generate 进入 while: get_nowait()返回None -> await get()(挂起在 ready.wait()); 并行 output_handler: await get_output_async() 收到 EngineCoreOutput -> process_outputs -> Collector.put() -> ready.set(); 唤醒 generate.get() 返回 RequestOutput -> yield 给 Client; 循环直到 EngineCoreOutput.finished=True。额外画一条'生产者超前'分支: 连续两次 put 触发 self.output.add() merge。",
+      "annotations": [
+        "突出 get_nowait() or await get() 的快路径/慢路径分叉",
+        "突出 asyncio.Event(ready) 作为唤醒信号",
+        "merge 分支标注'消费者跟不上时自动合帧'"
+      ]
+    },
+    {
+      "id": "fig-mux-fanout",
+      "title": "多路复用: 一个 EngineCore 批 -> 按 req_id 分发回 N 个队列",
+      "kind": "svg-diagram (dataflow / fan-out)",
+      "spec": "左: 一个 EngineCoreOutputs 批(含 req_A/req_B/req_C 三条 EngineCoreOutput)。中: output_handler.process_outputs 的 for 循环 + req_id->RequestState 查找表。右: 三个独立的 RequestOutputCollector(队列 A/B/C), 各连到自己的 generate() 协程。箭头按 req_id 着色, 体现'扇入(IPC 单出口) -> 解扇出(per-request 多队列)'。",
+      "annotations": [
+        "对照: add_request 时的'扇出登记'(_add_request) 与 process_outputs 时的'解扇出分发'对称",
+        "强调 per-request 隔离 = 尾延迟与并发数解耦"
+      ]
+    },
+    {
+      "roadmap_highlight": {
+        "node": "async-engine",
+        "all_nodes": [
+          "entrypoints",
+          "async-engine",
+          "engine-core",
+          "input-processor",
+          "output-processor",
+          "scheduler",
+          "kv-cache",
+          "model-runner",
+          "worker-and-executor",
+          "attention",
+          "sampling",
+          "spec-decode",
+          "model-definitions",
+          "distributed-parallelism",
+          "config-and-wiring"
+        ],
+        "note": "Roadmap 全书 15 子系统(取自 cartography/map.json 的 maps 顺序)。本章点亮 async-engine; 同时把 input-processor(ch05)/engine-core(ch07)/output-processor(ch08) 标为'相邻待解锁'(灰色虚线), 呼应三段式的三个去处。"
+      }
+    }
+  ],
+  "foreshadow_due": {
+    "should_plant": [
+      {
+        "id": "f1",
+        "what": "per-request RequestOutputCollector 队列（异步多路复用的关键）",
+        "plant": "ch04",
+        "payoff": "ch08",
+        "anchor": "vllm/v1/engine/output_processor.py:L45-L106 + async_llm.py:L376,L579",
+        "status": "open"
+      },
+      {
+        "id": "f2",
+        "what": "EngineCore 进程边界 / IPC 是三段式解耦的物理前提",
+        "plant": "ch04",
+        "payoff": "ch07",
+        "anchor": "vllm/v1/engine/async_llm.py:L146,L408-L412 + core_client.py:L990,L1058",
+        "status": "open"
+      },
+      {
+        "id": "f3",
+        "what": "output_handler 背景 asyncio 任务与 generate() 的生产者-消费者关系",
+        "plant": "ch04",
+        "payoff": "ch08",
+        "anchor": "vllm/v1/engine/async_llm.py:L637-L707(生产者) + L576-L586(消费者)",
+        "status": "open"
+      }
+    ],
+    "should_payoff": []
+  }
+}

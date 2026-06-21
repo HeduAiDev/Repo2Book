@@ -1,8 +1,11 @@
+> ⚠️ **本 README 为旧体系存档，已过时。** 权威文档见 `CLAUDE.md`（每会话自动加载）+ `docs/superpowers/ARCHITECT-RUNBOOK.md`（编排者操作手册）。
+> 现行（2026-06-21 重建）：vLLM v1 **源码解读**书，编排为 `.claude/workflows/chapter-pipeline.js`（dossier→implement→test→write→review→archive，含逃生舱）。不要按下文旧体系（tmux 团队/hook 交接）操作。
+
 # repo2book
 
 > 将任意代码仓库转化为源码级深度技术书籍的多智能体写作系统。
 
-当前实例：**vLLM 从零到专家**（28章，5部分，已发布13章）。
+当前实例：**vLLM v1 源码解读**（8 Part / 33 章，大纲见 `instances/vllm/book/cartography/outline-final.json`）。
 
 ---
 

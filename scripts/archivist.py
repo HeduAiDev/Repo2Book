@@ -328,8 +328,23 @@ def session_summary(date: str = None, accomplishments: str = "",
 def manage_state(action: str = "view", key: str = None, value: str = None) -> dict:
     """View or update project state."""
     if not STATE_FILE.exists():
-        print("No state.json found. Creating default.")
-        return {}
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        default = {
+            "project": "vllm-source-reading-book (v2, 2026-06-21 重建)",
+            "outline": "instances/vllm/book/cartography/outline-final.json",
+            "outline_size": "8 Parts / 33 chapters",
+            "source_pin": "f3fef123",
+            "status": "系统重建完成；ch04（AsyncLLM 三段式）试点尚未发车",
+            "chapters": {},
+            "updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "updated_by": "archivist",
+        }
+        with open(STATE_FILE, "w") as f:
+            json.dump(default, f, indent=2, ensure_ascii=False)
+        print(f"Created default state.json at {STATE_FILE}")
+        if action == "view":
+            print(json.dumps(default, indent=2, ensure_ascii=False))
+        return default
 
     with open(STATE_FILE) as f:
         state = json.load(f)
