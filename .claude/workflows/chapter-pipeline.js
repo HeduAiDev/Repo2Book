@@ -14,14 +14,14 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch11',
-  slug: 'ch11-engine-core',
-  focus: 'EngineCore.step() 编排(schedule → execute_model non_block → grammar bitmask → sample_tokens → update_from_output)、run_busy_loop、生命周期(pause/resume/sleep)、batch queue 接入点',
+  chapter_id: 'ch12',
+  slug: 'ch12-engine-core',
+  focus: 'step_with_batch_queue(): 缓冲 (SchedulerOutput, future) 对填满流水线并行 stage 消除气泡(appendleft/pop deque、填管道优先、batch_queue_size)、结构化输出的 deferred sampling、async_scheduling 标志决定绑定哪个 step；兑现 ch11 埋的 batch queue 接入点(f9)',
   highlight: 'engine-core',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
-  paths: ['vllm/v1/engine/core.py', 'vllm/v1/engine/core_client.py'],
+  paths: ['vllm/v1/engine/core.py', 'vllm/v1/engine/core_client.py', 'vllm/v1/engine/tensor_ipc.py', 'vllm/v1/engine/__init__.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'

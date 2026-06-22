@@ -1,0 +1,234 @@
+{
+  "chapter_id": "ch12",
+  "title": "step_with_batch_queue()：用 (SchedulerOutput, future) 对填满流水线、消除 PP 气泡",
+  "scope_note": "ch11 已经把 EngineCore 与忙循环讲完，并在 §11.7 把 step_with_batch_queue 当作『接入点』点到为止（埋下 f9：完整的 batch queue 流水线机制留给本章）。ch12 是 f9 的兑现章：不重复讲忙循环/InprocClient/step()，而是把 step_with_batch_queue 这一个方法拆到底——deque(appendleft/pop) 的时间轴、为什么『填管道优先于取结果』、batch_queue_size 从哪来（max_concurrent_batches=PP-size 或 async_scheduling 的 2）、deferred sampling（结构化输出 + 投机解码）那条小众分支、以及 async_scheduling 标志如何经由 max_concurrent_batches 间接决定 step_fn 绑定哪个 step。ch11 已内嵌过 step_with_batch_queue 全文与上/下半段，本章可复用同一份真实源码但解读深度/角度不同（聚焦机制本身，非『忙循环驱动它』）。",
+  "code_spine": [
+    "vllm/v1/engine/core.py:L184-L216  EngineCore.__init__ 尾段 —— batch_queue_size = max_concurrent_batches、batch_queue=deque(maxlen)、step_fn 静态绑定、self.async_scheduling 落地",
+    "vllm/v1/executor/multiproc_executor.py:L474-L478  MultiprocExecutor.max_concurrent_batches —— PP 用 pp_size；pp<=1 且 async_scheduling 用 2",
+    "vllm/v1/executor/uniproc_executor.py:L63-L65  UniProcExecutor.max_concurrent_batches —— async_scheduling 时 2，否则 1",
+    "vllm/v1/executor/abstract.py:L256-L258  Executor.max_concurrent_batches 基类默认 1",
+    "vllm/v1/engine/core.py:L443-L507  step_with_batch_queue 上半段 —— 不阻塞调度新批、execute_model(non_block) 拿 exec_future、按 pending_structured_output_tokens 决定立即采样还是 deferred、appendleft 入队、填管道未满则 return (None, True)",
+    "vllm/v1/engine/core.py:L509-L559  step_with_batch_queue 下半段 —— pop 队首阻塞取结果、future.result()、update_from_output、deferred_scheduler_output 的延迟采样（投机解码取 draft token 再算 bitmask）后重新 appendleft",
+    "vllm/v1/core/sched/output.py:L221-L227  SchedulerOutput.has_structured_output_requests / pending_structured_output_tokens 两个标志",
+    "vllm/v1/core/sched/scheduler.py:L1266-L1288  Scheduler.get_grammar_bitmask —— bitmask 计算依赖 scheduled_spec_decode_tokens（解释为何 spec+structured 必须 defer）",
+    "vllm/v1/engine/core.py:L1152-L1158  has_work() —— bool(self.batch_queue) 让队列里还有在飞的批时忙循环不退出（与本章队列语义相关）"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L184-L216",
+      "code": "        # Setup batch queue for pipeline parallelism.\n        # Batch queue for scheduled batches. This enables us to asynchronously\n        # schedule and execute batches, and is required by pipeline parallelism\n        # to eliminate pipeline bubbles.\n        self.batch_queue_size = self.model_executor.max_concurrent_batches\n        self.batch_queue: (\n            deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None\n        ) = None\n        if self.batch_queue_size > 1:\n            logger.debug(\"Batch queue is enabled with size %d\", self.batch_queue_size)\n            self.batch_queue = deque(maxlen=self.batch_queue_size)\n\n        # ... (is_ec_consumer / is_pooling_model / request_block_hasher 省略，与 batch queue 无关) ...\n\n        self.step_fn = (\n            self.step if self.batch_queue is None else self.step_with_batch_queue\n        )\n        self.async_scheduling = vllm_config.scheduler_config.async_scheduling",
+      "elide": [
+        "L196-L211 之间的 is_ec_consumer / is_pooling_model / request_block_hasher 初始化，与 batch queue 主线无关，可省略",
+        "队列元素类型注解 tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]] 要保留——它就是『(采样结果 future, 调度输出, execute_model future) 三元组』，是全章的核心数据结构"
+      ]
+    },
+    {
+      "path": "vllm/v1/executor/multiproc_executor.py",
+      "lines": "L474-L478",
+      "code": "    @cached_property\n    def max_concurrent_batches(self) -> int:\n        # PP requires PP-size concurrent batches to fill the pipeline.\n        pp_size = self.parallel_config.pipeline_parallel_size\n        return 2 if pp_size <= 1 and self.scheduler_config.async_scheduling else pp_size",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/executor/uniproc_executor.py",
+      "lines": "L63-L65",
+      "code": "    @cached_property\n    def max_concurrent_batches(self) -> int:\n        return 2 if self.scheduler_config.async_scheduling else 1",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L443-L507",
+      "code": "    def step_with_batch_queue(\n        self,\n    ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:\n        \"\"\"Schedule and execute batches with the batch queue.\n        Note that if nothing to output in this step, None is returned.\n\n        The execution flow is as follows:\n        1. Try to schedule a new batch if the batch queue is not full.\n        If a new batch is scheduled, directly return an empty engine core\n        output. In other words, fulfilling the batch queue has a higher priority\n        than getting model outputs.\n        2. If there is no new scheduled batch, meaning that the batch queue\n        is full or no other requests can be scheduled, we block until the first\n        batch in the job queue is finished.\n        3. Update the scheduler from the output.\n        \"\"\"\n\n        batch_queue = self.batch_queue\n        assert batch_queue is not None\n\n        # Try to schedule a new batch if the batch queue is not full, but\n        # the scheduler may return an empty batch if all requests are scheduled.\n        # Note that this is not blocking.\n        assert len(batch_queue) < self.batch_queue_size\n\n        model_executed = False\n        deferred_scheduler_output = None\n        if self.scheduler.has_requests():\n            scheduler_output = self.scheduler.schedule()\n            with self.log_error_detail(scheduler_output):\n                exec_future = self.model_executor.execute_model(\n                    scheduler_output, non_block=True\n                )\n            if self.is_ec_consumer:\n                model_executed = scheduler_output.total_num_scheduled_tokens > 0\n\n            if self.is_pooling_model or not model_executed:\n                # No sampling required (no requests scheduled).\n                future = cast(Future[ModelRunnerOutput], exec_future)\n            else:\n                if not scheduler_output.pending_structured_output_tokens:\n                    # We aren't waiting for any tokens, get any grammar output\n                    # and sample immediately.\n                    grammar_output = self.scheduler.get_grammar_bitmask(\n                        scheduler_output\n                    )\n                    future = self.model_executor.sample_tokens(\n                        grammar_output, non_block=True\n                    )\n                else:\n                    # We need to defer sampling until we have processed the model output\n                    # from the prior step.\n                    deferred_scheduler_output = scheduler_output\n\n            if not deferred_scheduler_output:\n                # Add this step's future to the queue.\n                batch_queue.appendleft((future, scheduler_output, exec_future))\n                if (\n                    model_executed\n                    and len(batch_queue) < self.batch_queue_size\n                    and not batch_queue[-1][0].done()\n                ):\n                    # Don't block on next worker response unless the queue is full\n                    # or there are no more requests to schedule.\n                    return None, True\n\n        elif not batch_queue:\n            # Queue is empty. We should not reach here since this method should\n            # only be called when the scheduler contains requests or the queue\n            # is non-empty.\n            return None, False",
+      "elide": [
+        "is_ec_consumer 分支（L476-477）：仅 encoder-cache transfer 的非消费端场景把 model_executed 强制为 False，是分布式 encoder cache 的小众情况，正文可一句带过『常规部署 is_ec_consumer 恒 True，故 model_executed = 是否真的调度了 token』",
+        "is_pooling_model 分支：pooling（embedding）模型无需采样，exec_future 直接 cast 成最终 future——正文点明『非生成模型走这条快路』即可"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L509-L559",
+      "code": "        elif not batch_queue:\n            # Queue is empty.\n            return None, False\n\n        # Block until the next result is available.\n        future, scheduler_output, exec_model_fut = batch_queue.pop()\n        with (\n            self.log_error_detail(scheduler_output),\n            self.log_iteration_details(scheduler_output),\n        ):\n            model_output = future.result()\n            if model_output is None:\n                # None from sample_tokens() implies that the original execute_model()\n                # call failed - raise that exception.\n                exec_model_fut.result()\n                raise RuntimeError(\"unexpected error\")\n\n        # Before processing the model output, process any aborts that happened\n        # during the model execution.\n        self._process_aborts_queue()\n        engine_core_outputs = self.scheduler.update_from_output(\n            scheduler_output, model_output\n        )\n\n        # NOTE(nick): We can either handle the deferred tasks here or save\n        # in a field and do it immediately once step_with_batch_queue is\n        # re-called. The latter slightly favors TTFT over TPOT/throughput.\n        if deferred_scheduler_output:\n            # If we are doing speculative decoding with structured output,\n            # we need to get the draft token ids from the prior step before\n            # we can compute the grammar bitmask for the deferred request.\n            if self.use_spec_decode:\n                draft_token_ids = self.model_executor.take_draft_token_ids()\n                assert draft_token_ids is not None\n                # Update the draft token ids in the scheduler output to\n                # filter out the invalid spec tokens, which will be padded\n                # with -1 and skipped by the grammar bitmask computation.\n                self.scheduler.update_draft_token_ids_in_output(\n                    draft_token_ids, deferred_scheduler_output\n                )\n            # We now have the tokens needed to compute the bitmask for the\n            # deferred request. Get the bitmask and call sample tokens.\n            grammar_output = self.scheduler.get_grammar_bitmask(\n                deferred_scheduler_output\n            )\n            future = self.model_executor.sample_tokens(grammar_output, non_block=True)\n            batch_queue.appendleft((future, deferred_scheduler_output, exec_future))\n\n        return engine_core_outputs, model_executed",
+      "elide": [
+        "重复的 elif not batch_queue:（L509-513）已在上半段出现，下半段从 L515 的 pop 开始即可——拆分内嵌时上半段到 return (None, True) 收尾、下半段从『# Block until the next result』起",
+        "注意 L557 deferred 分支里 appendleft 用的是 exec_future（外层变量名，与上半段同一个），不是新 execute——deferred 路径不重新跑 execute_model，只补一次 sample_tokens"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/output.py",
+      "lines": "L221-L227",
+      "code": "    # Whether any of the scheduled requests use structured output.\n    # Set only in async scheduling case.\n    has_structured_output_requests: bool = False\n\n    # Whether the scheduled requests have all the output tokens they\n    # need to perform grammar bitmask computation.\n    pending_structured_output_tokens: bool = False",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1266-L1288",
+      "code": "    def get_grammar_bitmask(\n        self, scheduler_output: SchedulerOutput\n    ) -> GrammarOutput | None:\n        # Collect list of scheduled request ids that use structured output.\n        # The corresponding rows of the bitmask will be in this order.\n        if not scheduler_output.has_structured_output_requests:\n            return None\n\n        structured_output_request_ids = [\n            req_id\n            for req_id in scheduler_output.num_scheduled_tokens\n            if (req := self.requests.get(req_id))\n            and (req.use_structured_output and not req.is_prefill_chunk)\n        ]\n        if not structured_output_request_ids:\n            return None\n\n        bitmask = self.structured_output_manager.grammar_bitmask(\n            self.requests,\n            structured_output_request_ids,\n            scheduler_output.scheduled_spec_decode_tokens,\n        )\n        return GrammarOutput(structured_output_request_ids, bitmask)",
+      "elide": [
+        "正文只需引用尾段 grammar_bitmask(..., scheduled_spec_decode_tokens) 这一句，证明 bitmask 计算依赖『本步草稿 token』，从而解释 spec+structured 为何必须 defer 到拿到上一步 draft token 之后"
+      ]
+    }
+  ],
+  "key_classes": [
+    {
+      "name": "EngineCore.step_with_batch_queue",
+      "file": "vllm/v1/engine/core.py",
+      "responsibility": "本章主角。流水线并行（或 async_scheduling）下取代普通 step 的单步方法：维护一个深度 = batch_queue_size 的 deque，新批 appendleft 入队、队首 pop 取结果；『填满流水线优先于取模型输出』，让多个批在 PP 不同 stage 上同时在飞以消除气泡。返回 (engine_core_outputs|None, model_executed)。"
+    },
+    {
+      "name": "EngineCore.batch_queue",
+      "file": "vllm/v1/engine/core.py",
+      "responsibility": "deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]]，maxlen=batch_queue_size。元素 = (采样结果 future, 该批的 SchedulerOutput, execute_model 的 future) 三元组。仅当 batch_queue_size>1 时创建，否则为 None。"
+    },
+    {
+      "name": "EngineCore.batch_queue_size / step_fn / async_scheduling",
+      "file": "vllm/v1/engine/core.py",
+      "responsibility": "batch_queue_size = model_executor.max_concurrent_batches；step_fn 在 __init__ 静态绑定为 step（队列为 None）或 step_with_batch_queue（队列存在）；async_scheduling 是 SchedulerConfig 标志，间接经 max_concurrent_batches 决定队列是否启用。"
+    },
+    {
+      "name": "Executor.max_concurrent_batches",
+      "file": "vllm/v1/executor/abstract.py / multiproc_executor.py / uniproc_executor.py",
+      "responsibility": "决定 batch_queue_size 的源头。基类默认 1；MultiprocExecutor 返回 pp_size（或 pp<=1 且 async_scheduling 时 2）；UniProcExecutor 返回 2（async_scheduling）或 1。这是『async_scheduling 标志决定绑定哪个 step』的实现路径。"
+    },
+    {
+      "name": "SchedulerOutput.has_structured_output_requests / pending_structured_output_tokens",
+      "file": "vllm/v1/core/sched/output.py",
+      "responsibility": "两个布尔标志（仅 async scheduling 下置位）：前者表示本批有结构化输出请求；后者表示本批还缺算 grammar bitmask 所需的输出 token，是触发 deferred sampling 的开关。"
+    },
+    {
+      "name": "Scheduler.get_grammar_bitmask",
+      "file": "vllm/v1/core/sched/scheduler.py",
+      "responsibility": "为结构化输出请求计算 grammar bitmask，依赖 scheduled_spec_decode_tokens——这正是 spec decode + structured output 必须把采样推迟到拿到上一步 draft token 之后的根因。"
+    }
+  ],
+  "data_flow": [
+    "1. 启动期绑定：EngineCore.__init__ 读 model_executor.max_concurrent_batches → batch_queue_size。>1 则 batch_queue = deque(maxlen=size)，step_fn 绑到 step_with_batch_queue（core.py:L188-L214）。",
+    "2. max_concurrent_batches 取值：MultiprocExecutor = pp_size（PP>1），或 pp<=1 且 async_scheduling 时 2；UniProcExecutor = 2(async_scheduling) / 1。故 async_scheduling 单卡也会启用深度-2 队列 → step_with_batch_queue（executor 三处）。",
+    "3. 入队（填管道优先）：step_with_batch_queue 上半段——若 scheduler.has_requests()，不阻塞地 schedule() + execute_model(non_block=True) 拿 exec_future；非 pooling 且真调度了 token 则按 pending_structured_output_tokens 决定立即 sample_tokens(non_block) 还是 defer；非 defer 则 (future, scheduler_output, exec_future) appendleft 入队（core.py:L470-L499）。",
+    "4. 填管道判定：若 model_executed 且 len(batch_queue) < size 且队尾 batch_queue[-1][0]（最早入队那批的 future）还没 done() → return (None, True)，立刻让忙循环转下一圈再调度一批，不阻塞等结果（core.py:L500-L507）。",
+    "5. 出队取结果：队满 / 无更多可调度 / 队尾已完成 时落到下半段——future, scheduler_output, exec_model_fut = batch_queue.pop() 取最早入队那批；future.result() 阻塞拿 model_output；None 表示 execute_model 失败，靠 exec_model_fut.result() 抛真异常（core.py:L516-L526）。",
+    "6. 提交输出：_process_aborts_queue() 先消化执行期到达的 abort，再 scheduler.update_from_output(scheduler_output, model_output) 得 engine_core_outputs（core.py:L530-L533）。",
+    "7. 兑现 deferred：若本步是 deferred_scheduler_output——spec decode 先 take_draft_token_ids() + update_draft_token_ids_in_output() 过滤无效草稿 token；再 get_grammar_bitmask()（现在有齐 token 了）→ sample_tokens(non_block) → appendleft 重新入队，待后续轮次 pop 取其采样结果（core.py:L538-L557）。",
+    "8. 队列保活：has_work() 含 bool(self.batch_queue)，只要队列里还有在飞的批，忙循环就不会判定无事可做而睡去（core.py:L1152-L1158）。"
+  ],
+  "design_decisions": [
+    {
+      "decision": "队列元素是 (采样 future, SchedulerOutput, execute_model future) 三元组，而非单个 future",
+      "why": "需要在 pop 时同时拿到：① 阻塞取采样结果的 future；② 喂给 update_from_output 的 SchedulerOutput；③ 当采样 future 返回 None 时，靠 execute_model 的 future.result() 抛出真正的底层异常（采样 None 只是『前序 execute_model 失败』的信号）。",
+      "evidence": "vllm/v1/engine/core.py:L189-L191, L516-L526"
+    },
+    {
+      "decision": "appendleft 入队、pop 出队——deque 当 FIFO 用，新批进左端、最早批从右端出",
+      "why": "保证『先调度的批先取结果』的 FIFO 语义；同时『填管道判定』要看最早入队那批是否算完，用 batch_queue[-1][0]（右端=最旧）。appendleft+pop 让最旧批稳定停在右端便于检查与取出。",
+      "evidence": "vllm/v1/engine/core.py:L499, L503, L516, L557"
+    },
+    {
+      "decision": "填满流水线优先于取模型输出：能调度且队未满且队尾未完成就直接 return (None, True)",
+      "why": "PP 下每个批要顺序流过 P 个 stage，单批串行时同一时刻只有 1/P 的硬件在干活。先把队列填到 batch_queue_size，让各 stage 都有批在算，才能让流水线满载、消除气泡。只有队满或无更多可调度请求时才阻塞 pop 取结果。",
+      "evidence": "vllm/v1/engine/core.py:L450-L453（docstring）, L500-L507"
+    },
+    {
+      "decision": "batch_queue_size = max_concurrent_batches，由 executor 类型 + PP size + async_scheduling 共同决定",
+      "why": "PP 需要 pp_size 个并发批才能填满 pp_size 级流水线；单卡 async_scheduling 用 2 个批做 CPU 调度与 GPU 执行的重叠（一个批在 GPU 跑时下一个批在 CPU 调度）。把『要多深的队列』交给 executor 决定，EngineCore 只读结果。",
+      "evidence": "vllm/v1/executor/multiproc_executor.py:L474-L478；uniproc_executor.py:L63-L65；core.py:L188"
+    },
+    {
+      "decision": "async_scheduling 标志间接（经 max_concurrent_batches）决定绑定哪个 step",
+      "why": "EngineCore 不直接看 async_scheduling 来选 step_fn——它看 batch_queue 是否为 None。但 executor 的 max_concurrent_batches 在 async_scheduling=True 时返回 2（>1），于是 batch_queue 被建、step_fn 绑到 step_with_batch_queue。这条间接链是『async_scheduling 决定 step 绑定』的真实机制，不是直接 if async_scheduling。",
+      "evidence": "vllm/v1/engine/core.py:L213-L216；uniproc_executor.py:L64；multiproc_executor.py:L478"
+    },
+    {
+      "decision": "结构化输出在 async scheduling 下要 deferred sampling",
+      "why": "grammar bitmask 必须基于本批将要采样的位置（含投机解码的草稿 token）计算。async scheduling 下，调度新批时上一步的输出 token 可能还没处理完（pending_structured_output_tokens），缺 token 就算不出正确 bitmask，于是把采样推迟到 pop 出上一步结果、update_from_output 之后再做。",
+      "evidence": "vllm/v1/engine/core.py:L483-L495, L538-L556；scheduler.py:L1283-L1287（bitmask 依赖 scheduled_spec_decode_tokens）"
+    },
+    {
+      "decision": "deferred + spec decode 时先 take_draft_token_ids + update_draft_token_ids_in_output 再算 bitmask",
+      "why": "投机解码的草稿 token 来自上一步 worker 输出；无效草稿用 -1 填充并被 bitmask 计算跳过。必须先把这一步的 draft token 取回并写进 deferred 的 SchedulerOutput，bitmask 才对得上实际采样的 token 位置。",
+      "evidence": "vllm/v1/engine/core.py:L542-L550"
+    },
+    {
+      "decision": "deferred 分支不重跑 execute_model，只补一次 sample_tokens",
+      "why": "deferred 批在上半段已经 execute_model(non_block) 跑过（exec_future 在），只是当时缺 token 算不了 bitmask 没法采样。下半段补算 bitmask 后只需 sample_tokens，复用同一个 exec_future 重新 appendleft 入队。",
+      "evidence": "vllm/v1/engine/core.py:L497（不入队）, L556-L557（补采样后入队，仍用 exec_future）"
+    },
+    {
+      "decision": "has_work() 把 bool(self.batch_queue) 算作有活",
+      "why": "队列里还有在飞的批（已调度未取结果）时，即便 scheduler 暂时没有新请求，忙循环也不能睡——必须继续转去 pop 取这些批的结果。",
+      "evidence": "vllm/v1/engine/core.py:L1152-L1158"
+    }
+  ],
+  "theory": [
+    "PP 气泡与队列深度：无 batch queue（深度 1）时，单批串行流过 P 个 pipeline stage，任一时刻只有 1 个 stage 在算 → 硬件利用率约 1/P，其余 (P-1)/P 是气泡。batch_queue_size = P 允许同时有 ≤P 个批分布在不同 stage，稳态下每个 stage 都满载 → 利用率趋近 1，吞吐近似 ×P 提升。上限受调度/采样的串行依赖、队列深度、以及 deferred 路径打断流水线的影响。",
+    "单卡 async_scheduling 的深度 2：不是为 PP，而是为重叠『CPU 端 schedule』与『GPU 端 execute』——批 i 在 GPU 跑前向时，批 i+1 在 CPU 做调度，两段流水化把调度开销藏进 GPU 计算时间里。深度 2 即足够形成这种双缓冲。",
+    "FIFO + 填管道判定的稳态：appendleft 进、pop 出构成 FIFO；判定条件 (model_executed and len<size and not 队尾.done()) 三者同时满足才『只填不取』。一旦队满（len==size，触发上半段开头 assert 前的状态）或队尾批已算完（done()），就切换到取结果模式，保证队列既不溢出也不让已完成结果干等。",
+    "deferred 对延迟指标的取舍：源码 NOTE(nick) 指出 deferred 任务可以『当场处理』或『存字段下轮处理』，当前选当场——略偏向 TTFT 而非 TPOT/吞吐。这是结构化输出 + async scheduling 叠加时的一个微观调度选择。"
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {
+        "what": "is_ec_consumer 分支（core.py:L476-L477）——把 model_executed 在非 encoder-cache 消费端置 False 的逻辑",
+        "why_safe": "仅用于分布式 encoder cache transfer 的非消费端（ec_transfer_config 配置）。常规部署 is_ec_consumer 恒 True，精简版可直接令 model_executed = scheduler_output.total_num_scheduled_tokens > 0，不影响 PP/async_scheduling 主线行为。"
+      },
+      {
+        "what": "is_pooling_model 快路（core.py:L479 中的 is_pooling_model 条件分支部分）",
+        "why_safe": "pooling/embedding 模型无采样，把 exec_future 直接 cast 成最终 future。本章聚焦生成路径的 batch queue + deferred sampling，pooling 快路与流水线机制正交，精简版可省略 is_pooling_model 这一支（保留 `not model_executed` 那支即可覆盖『没调度到 token 无需采样』）。"
+      },
+      {
+        "what": "log_error_detail / log_iteration_details 上下文管理器（core.py:L472, L517-L520）",
+        "why_safe": "纯日志/诊断上下文，不改变控制流与数值。精简版可去掉 with 包裹直接调用，便于读者聚焦队列机制。"
+      },
+      {
+        "what": "_perform_handshakes / DP coordinator / tensor_ipc / EngineCoreProc 的 ZMQ 线程等（core.py EngineCoreProc 及以下、tensor_ipc.py、core_client.py 大部分）",
+        "why_safe": "本章主题是 step_with_batch_queue 这一方法的内部机制，不涉及进程/IPC 编排（那是 ch07/ch11 的内容）。精简版只需一个能驱动 step_with_batch_queue 的最小 EngineCore + Fake executor/scheduler，IPC/handshake 全部不纳入。"
+      }
+    ],
+    "must_keep": [
+      {"symbol": "step_with_batch_queue", "why": "本章绝对主角，f9 兑现点，必须原样保留方法名与控制流。"},
+      {"symbol": "batch_queue", "why": "deque 缓冲本体，appendleft/pop 都作用于它，读者与 writer 都要讲清。"},
+      {"symbol": "batch_queue_size", "why": "队列深度=填管道判定阈值=max_concurrent_batches，是 PP 气泡消除的关键参数。"},
+      {"symbol": "appendleft", "why": "新批入队的 deque 操作；与 pop 配成 FIFO，章节标题点名。"},
+      {"symbol": "pop", "why": "队首取结果的 deque 操作；填管道 vs 取结果两态切换的标志动作。"},
+      {"symbol": "max_concurrent_batches", "why": "batch_queue_size 的来源；async_scheduling→step 绑定这条间接链的枢纽。"},
+      {"symbol": "step_fn", "why": "静态绑定 step / step_with_batch_queue，读者需理解二选一与 async_scheduling 的关系。"},
+      {"symbol": "async_scheduling", "why": "章节明确要求讲清『async_scheduling 标志决定绑定哪个 step』。"},
+      {"symbol": "deferred_scheduler_output", "why": "结构化输出 deferred sampling 的核心变量，决定是否推迟采样与重新入队。"},
+      {"symbol": "pending_structured_output_tokens", "why": "触发 deferred 的开关标志，writer 需解释其语义。"},
+      {"symbol": "sample_tokens", "why": "采样从前向里拆出的非阻塞调用；立即采样与 deferred 采样都靠它。"},
+      {"symbol": "execute_model", "why": "non_block 提交执行拿 exec_future；deferred 复用同一 exec_future。"},
+      {"symbol": "get_grammar_bitmask", "why": "deferred 路径补算 bitmask 的方法，依赖本步草稿 token，解释 defer 的根因。"},
+      {"symbol": "update_from_output", "why": "pop 取结果后提交给 scheduler 产出 engine_core_outputs。"},
+      {"symbol": "has_work", "why": "bool(self.batch_queue) 让在飞的批保活忙循环，队列语义的一部分。"},
+      {"symbol": "model_executed", "why": "返回值第二位 & 填管道判定条件；标记本步是否真的执行了模型。"},
+      {"symbol": "take_draft_token_ids", "why": "deferred + spec decode 取上一步草稿 token，先于 bitmask 计算。"}
+    ]
+  },
+  "diagram_plan": [
+    {
+      "type": "流水线时间轴对比图（svg-diagram）",
+      "spec": "横轴时间，纵轴 pipeline stage（或并发批槽位）。上半：深度-1（普通 step）——单批串行流过 schedule→exec→sample→update，stage 利用率 1/P，画出气泡（空白格）。下半：深度-N batch_queue——多个批错位填进各 stage，appendleft 新批进、pop 老批出，稳态各 stage 满载无气泡。标注『填管道优先』那一步 return (None, True)。",
+      "roadmap_highlight": "EngineCore / step（PP 流水线变体）"
+    },
+    {
+      "type": "step_with_batch_queue 状态机/控制流图（svg-diagram）",
+      "spec": "单次调用的两态：A『填管道』(has_requests → schedule+execute → 立即采样 or defer → appendleft → 队未满&队尾未完成 → return None,True) 与 B『取结果』(pop → future.result → update_from_output → 处理 deferred → return outputs)。中间画出从 A 落到 B 的三个触发条件（队满 / 无更多请求 / 队尾已完成）。把 deferred_scheduler_output 那条（缺 token→存起来→下半段补 bitmask+采样+重入队）标成支线。",
+      "roadmap_highlight": "EngineCore / step_with_batch_queue"
+    },
+    {
+      "type": "deque 三元组结构小图（svg-diagram，可选）",
+      "spec": "画 deque 三个槽，每槽 = (sample future, SchedulerOutput, exec_future) 三元组；左端 appendleft 箭头、右端 pop 箭头、右端槽标『最旧，填管道判定看它的 future.done()』。",
+      "roadmap_highlight": "batch_queue 数据结构"
+    }
+  ],
+  "foreshadow_due": {
+    "due_to_plant": [],
+    "due_to_recover": [
+      {
+        "id": "f9",
+        "desc": "batch queue / step_with_batch_queue 的完整流水线并行机制（appendleft/pop deque、填管道优先、deferred 采样）——ch11 点到接入点，ch12 展开",
+        "planted_in": "ch11",
+        "recover_in": "ch12",
+        "how_recovered": "本章是 f9 的兑现章：完整拆 step_with_batch_queue 的 deque 时间轴（appendleft/pop FIFO）、『填管道优先于取结果』的 return (None, True) 判定、batch_queue_size 来源（max_concurrent_batches = PP size 或 async_scheduling 的 2）、deferred sampling（结构化输出 + 投机解码）支线，并讲清 async_scheduling 经 max_concurrent_batches 间接决定 step_fn 绑定。回写 bible 标记 f9 已回收。"
+      }
+    ]
+  }
+}
