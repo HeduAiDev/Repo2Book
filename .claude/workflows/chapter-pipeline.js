@@ -14,14 +14,14 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch12',
-  slug: 'ch12-engine-core',
-  focus: 'step_with_batch_queue(): 缓冲 (SchedulerOutput, future) 对填满流水线并行 stage 消除气泡(appendleft/pop deque、填管道优先、batch_queue_size)、结构化输出的 deferred sampling、async_scheduling 标志决定绑定哪个 step；兑现 ch11 埋的 batch queue 接入点(f9)',
+  chapter_id: 'ch13',
+  slug: 'ch13-scheduler',
+  focus: 'Token 为中心的连续批处理: schedule() 不分 prefill/decode 相、RUNNING 优先、max_num_scheduled_tokens 预算分配、SchedulerOutput(NewRequestData 首次 vs CachedRequestData 持久增量)、AsyncScheduler vs Scheduler 的差异；回收 f6(async_scheduling 推导出的实例如何驱动连续批处理)+f10(schedule() 每拍推哪些请求/多少 token)',
   highlight: 'engine-core',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
-  paths: ['vllm/v1/engine/core.py', 'vllm/v1/engine/core_client.py', 'vllm/v1/engine/tensor_ipc.py', 'vllm/v1/engine/__init__.py'],
+  paths: ['vllm/v1/core/sched/scheduler.py', 'vllm/v1/core/sched/async_scheduler.py', 'vllm/v1/core/sched/output.py', 'vllm/v1/core/sched/interface.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
