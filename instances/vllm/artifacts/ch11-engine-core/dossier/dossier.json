@@ -1,0 +1,350 @@
+{
+  "chapter_id": "ch11",
+  "title": "EngineCore 与忙循环：step() 编排、run_busy_loop、生命周期",
+  "source_pin": "f3fef123",
+  "code_spine": [
+    "vllm/v1/engine/core.py:L91-L229  EngineCore.__init__ —— 建 executor / KV cache / scheduler / structured_output_manager / batch_queue / step_fn 选择",
+    "vllm/v1/engine/core.py:L315-L346  EngineCore.add_request —— 校验后转交 scheduler.add_request",
+    "vllm/v1/engine/core.py:L348-L354  EngineCore.abort_requests —— scheduler.finish_requests(FINISHED_ABORTED)",
+    "vllm/v1/engine/core.py:L402-L431  EngineCore.step —— 本章核心：schedule → execute_model(non_block) → get_grammar_bitmask → future.result → sample_tokens → update_from_output",
+    "vllm/v1/engine/core.py:L433-L441  EngineCore.post_step —— spec-decode 取 draft token",
+    "vllm/v1/engine/core.py:L443-L559  EngineCore.step_with_batch_queue —— PP 用的异步流水线版 step（batch queue 接入点）",
+    "vllm/v1/engine/core.py:L561-L569  EngineCore._process_aborts_queue —— 执行期到达的 abort 在出输出前批量处理",
+    "vllm/v1/engine/core.py:L634-L729  生命周期：pause_scheduler / resume_scheduler / sleep / wake_up / is_sleeping",
+    "vllm/v1/engine/core.py:L806-L920  EngineCoreProc.__init__ —— ZMQ 包装：input_queue/output_queue + 两个 IO 线程",
+    "vllm/v1/engine/core.py:L1064-L1147  run_engine_core —— 子进程入口、信号处理、调 run_busy_loop",
+    "vllm/v1/engine/core.py:L1152-L1172  has_work / is_running / run_busy_loop —— 忙循环骨架",
+    "vllm/v1/engine/core.py:L1174-L1223  _process_input_queue / _process_engine_step —— 取请求 + 跑一步",
+    "vllm/v1/engine/core.py:L1230-L1299  _handle_shutdown / _handle_client_request —— 关停与请求分派",
+    "vllm/v1/engine/core.py:L1372-L1531  process_input_sockets / process_output_sockets —— ZMQ IO 线程（解释 input_queue/output_queue 两端）",
+    "vllm/v1/engine/core.py:L1542-L1589  EngineCoreProc.pause_scheduler / _pause_complete —— 多进程版暂停（异步 idle 回调）",
+    "vllm/v1/engine/core_client.py:L274-L364  InprocClient —— 进程内：add_request 直推、get_output 直接 step",
+    "vllm/v1/engine/core_client.py:L942-L999  AsyncMPClient.process_outputs_socket / get_output_async —— output_queue 如何被异步前端消费",
+    "vllm/v1/engine/core_client.py:L1001-L1061  AsyncMPClient._send_input / add_request_async —— 请求如何过 ZMQ 进 input_queue"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L402-L431",
+      "what": "EngineCore.step()——全书最该逐行讲清的方法：一次推理迭代的完整编排",
+      "code": "    def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:\n        \"\"\"Schedule, execute, and make output.\n\n        Returns tuple of outputs and a flag indicating whether the model\n        was executed.\n        \"\"\"\n\n        # Check for any requests remaining in the scheduler - unfinished,\n        # or finished and not yet removed from the batch.\n        if not self.scheduler.has_requests():\n            return {}, False\n        scheduler_output = self.scheduler.schedule()\n        future = self.model_executor.execute_model(scheduler_output, non_block=True)\n        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)\n        with (\n            self.log_error_detail(scheduler_output),\n            self.log_iteration_details(scheduler_output),\n        ):\n            model_output = future.result()\n            if model_output is None:\n                model_output = self.model_executor.sample_tokens(grammar_output)\n\n        # Before processing the model output, process any aborts that happened\n        # during the model execution.\n        self._process_aborts_queue()\n        engine_core_outputs = self.scheduler.update_from_output(\n            scheduler_output, model_output\n        )\n\n        return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0",
+      "elide": [
+        "两个 with 上下文管理器（log_error_detail / log_iteration_details）是诊断/观测包装，不改变数据流：前者在 execute_model 抛异常时 dump_engine_exception，后者在开启 observability_config.enable_logging_iteration_details 时打印 iteration 统计。讲解时可简述为'故障转储 + 可选迭代日志'。"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L1164-L1172",
+      "what": "run_busy_loop——忙循环骨架，整章第二条主线",
+      "code": "    def run_busy_loop(self):\n        \"\"\"Core busy loop of the EngineCore.\"\"\"\n        while self._handle_shutdown():\n            # 1) Poll the input queue until there is work to do.\n            self._process_input_queue()\n            # 2) Step the engine core and return the outputs.\n            self._process_engine_step()\n\n        raise SystemExit",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L1152-L1162",
+      "what": "has_work / is_running——忙循环的两个谓词，决定何时阻塞、何时退出",
+      "code": "    def has_work(self) -> bool:\n        \"\"\"Returns true if the engine should be stepped.\"\"\"\n        return (\n            self.engines_running\n            or self.scheduler.has_requests()\n            or bool(self.batch_queue)\n        )\n\n    def is_running(self) -> bool:\n        \"\"\"Returns true if shutdown has not been requested.\"\"\"\n        return self.shutdown_state == EngineShutdownState.RUNNING",
+      "elide": [
+        "engines_running 只在 DP 场景下为 True（DPEngineCoreProc 全局 all-reduce 后写入）；单引擎读者可视其恒为 False。"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L1174-L1203",
+      "what": "_process_input_queue——把 ZMQ 线程塞进 input_queue 的请求取出并 dispatch；空闲时阻塞等待",
+      "code": "    def _process_input_queue(self):\n        \"\"\"Exits when an engine step needs to be performed.\"\"\"\n\n        waited = False\n        while not self.has_work() and self.is_running():\n            # Notify callbacks waiting for engine to become idle.\n            self._notify_idle_state_callbacks()\n            if self.input_queue.empty():\n                # Drain aborts queue; all aborts are also processed via input_queue.\n                with self.aborts_queue.mutex:\n                    self.aborts_queue.queue.clear()\n                if logger.isEnabledFor(DEBUG):\n                    logger.debug(\"EngineCore waiting for work.\")\n                    waited = True\n            block = self.process_input_queue_block\n            try:\n                req = self.input_queue.get(block=block)\n                self._handle_client_request(*req)\n            except queue.Empty:\n                break\n            if not block:\n                break\n\n        if waited:\n            logger.debug(\"EngineCore loop active.\")\n\n        # Handle any more client requests.\n        while not self.input_queue.empty():\n            req = self.input_queue.get_nowait()\n            self._handle_client_request(*req)",
+      "elide": [
+        "DEBUG 日志分支（logger.isEnabledFor(DEBUG) 两处）只影响日志，不影响控制流，讲解可略。"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L1205-L1223",
+      "what": "_process_engine_step——调用 step_fn()、把输出塞进 output_queue、post_step 钩子",
+      "code": "    def _process_engine_step(self) -> bool:\n        \"\"\"Called only when there are unfinished local requests.\"\"\"\n\n        # Step the engine core.\n        outputs, model_executed = self.step_fn()\n        # Put EngineCoreOutputs into the output queue.\n        for output in outputs.items() if outputs else ():\n            self.output_queue.put_nowait(output)\n        # Post-step hook.\n        self.post_step(model_executed)\n\n        # If no model execution happened but there are waiting requests\n        # (e.g., WAITING_FOR_REMOTE_KVS), yield the GIL briefly to allow\n        # background threads (like NIXL handshake) to make progress.\n        # Without this, the tight polling loop can starve background threads.\n        if not model_executed and self.scheduler.has_unfinished_requests():\n            time.sleep(0.001)\n\n        return model_executed",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L1266-L1299",
+      "what": "_handle_client_request——把队列里的 (type, payload) 分派到 add/abort/utility 等",
+      "code": "    def _handle_client_request(\n        self, request_type: EngineCoreRequestType, request: Any\n    ) -> None:\n        \"\"\"Dispatch request from client.\"\"\"\n\n        if request_type == EngineCoreRequestType.WAKEUP:\n            return\n        elif request_type == EngineCoreRequestType.ADD:\n            req, request_wave = request\n            if self._reject_add_in_shutdown(req):\n                return\n            self.add_request(req, request_wave)\n        elif request_type == EngineCoreRequestType.ABORT:\n            self.abort_requests(request)\n        elif request_type == EngineCoreRequestType.UTILITY:\n            client_idx, call_id, method_name, args = request\n            if self._reject_utility_in_shutdown(client_idx, call_id, method_name):\n                return\n            output = UtilityOutput(call_id)\n            # Lazily look-up utility method so that failure will be handled/returned.\n            get_result = lambda: (\n                (method := getattr(self, method_name))\n                and method(*self._convert_msgspec_args(method, args))\n            )\n            enqueue_output = lambda out: self.output_queue.put_nowait(\n                (client_idx, EngineCoreOutputs(utility_output=out))\n            )\n            self._invoke_utility_method(method_name, get_result, output, enqueue_output)\n        elif request_type == EngineCoreRequestType.EXECUTOR_FAILED:\n            raise RuntimeError(\"Executor failed.\")\n        else:\n            logger.error(\n                \"Unrecognized input request type encountered: %s\", request_type\n            )",
+      "elide": [
+        "WAKEUP 是关停时唤醒阻塞中的 input_queue.get() 的哨兵，命中即 return；UTILITY 分支是把 sleep/wake_up/reset_prefix_cache 等控制方法以 RPC 形式经队列调用——讲解时点明'生命周期方法多数走 UTILITY 路径'即可，无需逐字展开 lambda。"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L443-L513",
+      "what": "step_with_batch_queue 上半段——batch queue 接入点：调度新批不阻塞、未满则直接返回让流水线填满",
+      "code": "    def step_with_batch_queue(\n        self,\n    ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:\n        \"\"\"Schedule and execute batches with the batch queue.\n        ...\n        \"\"\"\n\n        batch_queue = self.batch_queue\n        assert batch_queue is not None\n\n        assert len(batch_queue) < self.batch_queue_size\n\n        model_executed = False\n        deferred_scheduler_output = None\n        if self.scheduler.has_requests():\n            scheduler_output = self.scheduler.schedule()\n            with self.log_error_detail(scheduler_output):\n                exec_future = self.model_executor.execute_model(\n                    scheduler_output, non_block=True\n                )\n            if self.is_ec_consumer:\n                model_executed = scheduler_output.total_num_scheduled_tokens > 0\n\n            if self.is_pooling_model or not model_executed:\n                # No sampling required (no requests scheduled).\n                future = cast(Future[ModelRunnerOutput], exec_future)\n            else:\n                if not scheduler_output.pending_structured_output_tokens:\n                    # We aren't waiting for any tokens, get any grammar output\n                    # and sample immediately.\n                    grammar_output = self.scheduler.get_grammar_bitmask(\n                        scheduler_output\n                    )\n                    future = self.model_executor.sample_tokens(\n                        grammar_output, non_block=True\n                    )\n                else:\n                    # We need to defer sampling until we have processed the model output\n                    # from the prior step.\n                    deferred_scheduler_output = scheduler_output\n\n            if not deferred_scheduler_output:\n                # Add this step's future to the queue.\n                batch_queue.appendleft((future, scheduler_output, exec_future))\n                if (\n                    model_executed\n                    and len(batch_queue) < self.batch_queue_size\n                    and not batch_queue[-1][0].done()\n                ):\n                    # Don't block on next worker response unless the queue is full\n                    # or there are no more requests to schedule.\n                    return None, True\n\n        elif not batch_queue:\n            # Queue is empty.\n            return None, False",
+      "elide": [
+        "docstring 中段三步说明已用 ... 省略（正文可用 design_decisions 概述）；is_ec_consumer 与 ec_transfer（encoder-cache 跨实例传输）属边缘特性，正文可一句带过 'EC 生产者不在本机采样'。deferred 分支仅在 spec-decode + structured-output 同时启用时触发。"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L515-L559",
+      "what": "step_with_batch_queue 下半段——阻塞取队首结果、update_from_output、处理延迟采样",
+      "code": "        # Block until the next result is available.\n        future, scheduler_output, exec_model_fut = batch_queue.pop()\n        with (\n            self.log_error_detail(scheduler_output),\n            self.log_iteration_details(scheduler_output),\n        ):\n            model_output = future.result()\n            if model_output is None:\n                # None from sample_tokens() implies that the original execute_model()\n                # call failed - raise that exception.\n                exec_model_fut.result()\n                raise RuntimeError(\"unexpected error\")\n\n        # Before processing the model output, process any aborts that happened\n        # during the model execution.\n        self._process_aborts_queue()\n        engine_core_outputs = self.scheduler.update_from_output(\n            scheduler_output, model_output\n        )\n\n        if deferred_scheduler_output:\n            # ... (spec-decode + structured output) get bitmask then sample\n            if self.use_spec_decode:\n                draft_token_ids = self.model_executor.take_draft_token_ids()\n                assert draft_token_ids is not None\n                self.scheduler.update_draft_token_ids_in_output(\n                    draft_token_ids, deferred_scheduler_output\n                )\n            grammar_output = self.scheduler.get_grammar_bitmask(\n                deferred_scheduler_output\n            )\n            future = self.model_executor.sample_tokens(grammar_output, non_block=True)\n            batch_queue.appendleft((future, deferred_scheduler_output, exec_future))\n\n        return engine_core_outputs, model_executed",
+      "elide": [
+        "deferred 块内注释已压缩为一行说明；这是 spec-decode 与 structured-output 交叉的小众路径，正文可放在'进阶'小节。"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L634-L663",
+      "what": "EngineCore.pause_scheduler——三种 pause 模式语义（in-proc 版，同步返回 None）",
+      "code": "    def pause_scheduler(\n        self, mode: PauseMode = \"abort\", clear_cache: bool = True\n    ) -> Future | None:\n        \"\"\"Pause generation; behavior depends on mode.\n        - ``abort``: PAUSED_NEW + abort all + (optional) clear caches.\n        - ``wait``: PAUSED_NEW, keep stepping until drained (not allowed in-proc).\n        - ``keep``: PAUSED_ALL; queue completes when output queue empty.\n        \"\"\"\n        if mode not in (\"keep\", \"abort\", \"wait\"):\n            raise ValueError(f\"Invalid pause mode: {mode}\")\n        if mode == \"wait\":\n            raise ValueError(\"'wait' mode can't be used in inproc-engine mode\")\n\n        if mode == \"abort\":\n            self.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)\n\n        pause_state = PauseState.PAUSED_ALL if mode == \"keep\" else PauseState.PAUSED_NEW\n        self.scheduler.set_pause_state(pause_state)\n        if clear_cache:\n            self._reset_caches()\n\n        return None",
+      "elide": [
+        "docstring 中各模式的细节已压缩；EngineCoreProc 在 L1542 有覆写版（异步：未排空时挂 idle 回调返回 Future），正文用 design_decision 对比两者即可。"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L673-L725",
+      "what": "sleep / wake_up——分级休眠（0 仅暂停调度 / 1 卸权重弃KV / 2 弃全部GPU显存）",
+      "code": "    def sleep(self, level: int = 1, mode: PauseMode = \"abort\") -> None | Future:\n        \"\"\"Put the engine to sleep at the specified level.\n            - Level 0: Pause scheduling only. No GPU memory changes.\n            - Level 1: Offload model weights to CPU, discard KV cache.\n            - Level 2: Discard all GPU memory.\n        \"\"\"\n\n        # Pause scheduler before sleeping.\n        clear_prefix_cache = level >= 1\n        pause_future = self.pause_scheduler(mode=mode, clear_cache=clear_prefix_cache)\n        if level < 1:\n            return pause_future\n\n        # Level 1+: Delegate to executor for GPU memory management\n        model_executor = self.model_executor\n        if pause_future is None:\n            model_executor.sleep(level)\n            return None\n\n        future = Future[Any]()\n\n        def pause_complete(f: Future):\n            try:\n                f.result()  # propagate any exception\n                future.set_result(model_executor.sleep(level))\n            except Exception as e:\n                future.set_exception(e)\n\n        logger.info(\"Waiting for in-flight requests to complete before sleeping...\")\n        pause_future.add_done_callback(pause_complete)\n        return future\n\n    def wake_up(self, tags: list[str] | None = None):\n        \"\"\"Wake up the engine from sleep.\"\"\"\n        if tags is not None and \"scheduling\" in tags:\n            tags = [t for t in tags if t != \"scheduling\"]\n\n        if tags is None or tags:\n            self.model_executor.wake_up(tags)\n\n        # Resume scheduling (applies to all levels)\n        self.resume_scheduler()",
+      "elide": [
+        "sleep 中 'pause_future is None vs Future' 两分支对应 in-proc（同步）与 multi-proc（异步等排空）；wake_up 中 'scheduling' tag 是 level-0 专用，正文一句带过。"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/core_client.py",
+      "lines": "L287-L301",
+      "what": "InprocClient——进程内客户端，揭示 step() 与 add_request 在无 ZMQ 时如何被直接驱动（与忙循环对照）",
+      "code": "    def get_output(self) -> EngineCoreOutputs:\n        outputs, model_executed = self.engine_core.step_fn()\n        self.engine_core.post_step(model_executed=model_executed)\n        return outputs and outputs.get(0) or EngineCoreOutputs()\n\n    def get_supported_tasks(self) -> tuple[SupportedTask, ...]:\n        return self.engine_core.get_supported_tasks()\n\n    def add_request(self, request: EngineCoreRequest) -> None:\n        req, request_wave = self.engine_core.preprocess_add_request(request)\n        self.engine_core.add_request(req, request_wave)\n\n    def abort_requests(self, request_ids: list[str]) -> None:\n        if len(request_ids) > 0:\n            self.engine_core.abort_requests(request_ids)",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/core_client.py",
+      "lines": "L979-L999",
+      "what": "AsyncMPClient——output_queue 的另一端：ZMQ 收到 EngineCoreOutputs 后塞进 asyncio 队列供 get_output_async 消费（连回 ch04 三段式）",
+      "code": "                    if outputs.outputs or outputs.scheduler_stats:\n                        outputs_queue.put_nowait(outputs)\n            except Exception as e:\n                outputs_queue.put_nowait(e)\n            except asyncio.CancelledError:\n                outputs_queue.put_nowait(EngineDeadError())\n\n        resources.output_queue_task = asyncio.create_task(\n            process_outputs_socket(), name=\"EngineCoreOutputQueueTask\"\n        )\n\n    async def get_output_async(self) -> EngineCoreOutputs:\n        self._ensure_output_queue_task()\n        assert self.outputs_queue is not None\n        outputs = await self.outputs_queue.get()\n        if isinstance(outputs, Exception):\n            raise self._format_exception(outputs) from None\n        return outputs",
+      "elide": [
+        "process_outputs_socket 上半段（utility_output / EEP notification 分派）已省略，正文只需点明：utility 结果走 utility_results future，正常 token 输出走 outputs_queue。"
+      ]
+    }
+  ],
+  "key_classes": [
+    {
+      "name": "EngineCore",
+      "file": "vllm/v1/engine/core.py:L91",
+      "responsibility": "推理引擎的'内循环'：持有 model_executor + scheduler + structured_output_manager，提供 step()/step_with_batch_queue() 单步编排、add_request/abort_requests、以及 pause/resume/sleep/wake_up 生命周期。无 IPC，可被 InprocClient 直接驱动。"
+    },
+    {
+      "name": "EngineCoreProc",
+      "file": "vllm/v1/engine/core.py:L806",
+      "responsibility": "EngineCore 的 ZMQ 子进程包装。新增 input_queue/output_queue 两个线程安全队列 + 两个守护 IO 线程（process_input_sockets / process_output_sockets），实现 run_busy_loop：取请求→step→出输出。处理握手、关停、信号。"
+    },
+    {
+      "name": "DPEngineCoreProc",
+      "file": "vllm/v1/engine/core.py:L1622",
+      "responsibility": "数据并行版 EngineCoreProc。覆写 run_busy_loop，加入 wave 机制、execute_dummy_batch（让空闲 rank 与忙 rank 对齐）、每 32 步一次全局 all-reduce 判断 global unfinished。本章只需高层提及，不展开。"
+    },
+    {
+      "name": "InprocClient",
+      "file": "vllm/v1/engine/core_client.py:L274",
+      "responsibility": "进程内客户端：直接持有一个 EngineCore，add_request 直推、get_output 调 step_fn()。是 LLMEngine 同步路径，用来对照'没有忙循环/没有 ZMQ 时 step() 怎么被驱动'。"
+    },
+    {
+      "name": "AsyncMPClient",
+      "file": "vllm/v1/engine/core_client.py:L887",
+      "responsibility": "异步多进程客户端：经 ZMQ DEALER/PULL 把 add_request_async 发到子进程 input_queue，并以后台 task 把子进程 output_queue 的 EngineCoreOutputs 搬进 asyncio outputs_queue 供 get_output_async 消费。是 ch04 AsyncLLM 三段式与本章 step() 之间的桥。"
+    },
+    {
+      "name": "EngineCoreRequestType",
+      "file": "vllm/v1/engine/__init__.py:L237",
+      "responsibility": "input_queue 里 (type, payload) 的类型枚举：ADD/ABORT/START_DP_WAVE/UTILITY，以及进程内哨兵 EXECUTOR_FAILED/WAKEUP。十六进制字节串，便于直接走 socket。"
+    },
+    {
+      "name": "EngineShutdownState",
+      "file": "vllm/v1/engine/core.py:L800",
+      "responsibility": "IntEnum：RUNNING / REQUESTED / SHUTTING_DOWN。_handle_shutdown 据此决定继续、开始排空、还是退出。"
+    },
+    {
+      "name": "PauseState",
+      "file": "vllm/v1/core/sched/interface.py:L22",
+      "responsibility": "IntEnum：UNPAUSED=0 / PAUSED_NEW=1（排队新增、可继续 step 现有）/ PAUSED_ALL=2（全停）。pause/sleep 通过 scheduler.set_pause_state 写入。"
+    }
+  ],
+  "data_flow": [
+    "1. 请求入队：AsyncMPClient.add_request_async → _send_input(ADD) 经 ZMQ → 子进程 process_input_sockets 线程 decode + preprocess_add_request → input_queue.put_nowait((ADD, (req, wave)))（core.py:L1446-L1464）",
+    "2. 忙循环取请求：run_busy_loop → _process_input_queue → input_queue.get(block) → _handle_client_request(ADD) → EngineCore.add_request → scheduler.add_request（core.py:L1174-L1203, L1266-L1277, L315-L346）",
+    "3. 单步编排：_process_engine_step → step_fn()（= step 或 step_with_batch_queue）",
+    "3a. step：scheduler.has_requests? → scheduler.schedule() → model_executor.execute_model(non_block=True) 得 future → scheduler.get_grammar_bitmask() → future.result() →（若 None）model_executor.sample_tokens(grammar) → _process_aborts_queue → scheduler.update_from_output() → 返回 (outputs, executed)（core.py:L402-L431）",
+    "4. 输出入队：_process_engine_step 把 outputs.items() 逐个 output_queue.put_nowait；post_step 处理 spec-decode draft token（core.py:L1205-L1214, L433-L441）",
+    "5. 输出出队（多进程）：process_output_sockets 线程 output_queue.get() → encode → ZMQ PUSH 到客户端（core.py:L1500-L1531）",
+    "6. 客户端消费：AsyncMPClient.process_outputs_socket recv → decode → outputs_queue.put_nowait → get_output_async 取出（core_client.py:L942-L999），再进 ch04 OutputProcessor",
+    "7. 进程内路径（对照）：InprocClient.add_request 直推 scheduler；InprocClient.get_output 直接调 step_fn() + post_step（core_client.py:L287-L297）——无忙循环、无 ZMQ",
+    "8. 中止/生命周期：ABORT 经 input_queue 与 aborts_queue 双投（core.py:L1456-L1464），执行期到达的 abort 在 step 出输出前由 _process_aborts_queue 批量落地（core.py:L426, L561-L569）；sleep/wake_up/pause 多走 UTILITY 路径调到 EngineCore 同名方法"
+  ],
+  "design_decisions": [
+    {
+      "decision": "execute_model 用 non_block=True 返回 Future，且把 get_grammar_bitmask 夹在 execute_model 与 future.result() 之间",
+      "why": "让 GPU 前向与 CPU 上的 grammar bitmask 计算重叠：发起前向不阻塞，立刻在主线程算 structured-output 掩码，再 future.result() 等前向。隐藏了掩码计算延迟。",
+      "evidence": "vllm/v1/engine/core.py:L414-L422"
+    },
+    {
+      "decision": "sample_tokens 与 execute_model 分离——execute_model 返回 None 时才在主进程 sample_tokens(grammar_output)",
+      "why": "采样需要 grammar bitmask（结构化输出约束），而 bitmask 依赖调度结果；把采样从前向里拆出，使前向能先发起、bitmask 后算。future.result() 为 None 即'worker 未就地采样，需主进程用掩码采样'。",
+      "evidence": "vllm/v1/engine/core.py:L420-L422"
+    },
+    {
+      "decision": "执行期到达的 abort 推进独立 aborts_queue，并在 update_from_output 之前 _process_aborts_queue 批量处理",
+      "why": "step 跨越一次 GPU 前向（耗时），其间客户端可能 abort。把这些 abort 暂存，统一在出输出前落地，避免对已调度但本步要被中止的请求继续产出 token；批量 abort 比逐个高效。",
+      "evidence": "vllm/v1/engine/core.py:L424-L426, L561-L569；ABORT 在 input socket 线程双投 input_queue+aborts_queue 见 L1456-L1461"
+    },
+    {
+      "decision": "step_fn 在 __init__ 时静态绑定为 step 或 step_with_batch_queue（取决于 batch_queue_size>1）",
+      "why": "batch_queue 仅在 max_concurrent_batches>1（即流水线并行 PP）时启用，用于异步调度多批、消除 PP 气泡。普通情况零开销走简单 step。绑定一次避免每步分支。",
+      "evidence": "vllm/v1/engine/core.py:L188-L194, L213-L215, L443-L458"
+    },
+    {
+      "decision": "batch queue：先填满流水线优先于取结果——调度到新批且队列未满且队尾未完成则直接 return None 让下一轮继续调度",
+      "why": "PP 下要让各 stage 都有活干，'填满 batch queue'优先级高于'取模型输出'，从而消除流水线气泡。只有队列满或无更多可调度请求时才阻塞取队首结果。",
+      "evidence": "vllm/v1/engine/core.py:L449-L507"
+    },
+    {
+      "decision": "EngineCoreProc 用两个守护 IO 线程 + 线程安全 input_queue/output_queue，与忙循环解耦",
+      "why": "ZMQ socket IO 与序列化释放 GIL，可与 GPU 前向重叠；忙循环只跟内存队列打交道，逻辑简单且不被网络 IO 阻塞。",
+      "evidence": "vllm/v1/engine/core.py:L884-L911, L1372-L1531"
+    },
+    {
+      "decision": "忙循环空闲时阻塞在 input_queue.get(block=True)，靠 WAKEUP 哨兵在关停时唤醒",
+      "why": "无请求时不空转烧 CPU；关停信号处理器无法安全操作非可重入队列锁，故改为往 input_queue 投 WAKEUP 哨兵唤醒阻塞的 get()。",
+      "evidence": "vllm/v1/engine/core.py:L1114-L1127, L1188-L1195, L1271-L1272"
+    },
+    {
+      "decision": "pause 三模式（abort/wait/keep）+ 三级 sleep（0/1/2）分离'停调度'与'释放显存'",
+      "why": "abort 立刻中止全部并清缓存；wait 排空在途（仅多进程）；keep 全停但保留状态。sleep level 0 只停调度（无显存变化），1 卸权重弃 KV，2 弃全部 GPU 显存——按需在'快速复用'与'彻底让出显存'间取舍。",
+      "evidence": "vllm/v1/engine/core.py:L634-L663, L673-L709；EngineCoreProc 异步版 L1542-L1582"
+    },
+    {
+      "decision": "EngineCoreProc.pause_scheduler 在仍有在途工作时挂 idle 回调返回 Future，而非同步返回",
+      "why": "多进程下 abort 输出要先经 output_queue 真正发给客户端、在途请求要排空，才能安全清缓存/休眠。用 _idle_state_callbacks 在忙循环 _process_input_queue 检测到 has_work()==False 时回调完成 Future，实现异步等待。",
+      "evidence": "vllm/v1/engine/core.py:L1542-L1589, L1178-L1180, L1225-L1228"
+    },
+    {
+      "decision": "_process_engine_step 在'未执行模型但仍有未完成请求'时 time.sleep(0.001) 让出 GIL",
+      "why": "请求可能卡在 WAITING_FOR_REMOTE_KVS（等 NIXL KV 传输握手）。紧轮询会饿死做握手的后台线程，短 sleep 让其推进。",
+      "evidence": "vllm/v1/engine/core.py:L1216-L1221"
+    }
+  ],
+  "theory": [
+    "step() 的延迟构成：一次迭代 ≈ max(execute_model 前向, get_grammar_bitmask) + sample_tokens + update_from_output。grammar bitmask 与前向重叠后，其计算成本被前向掩盖（前提：bitmask 计算 < 前向耗时）。",
+    "batch queue 与 PP 气泡：无 batch queue 时单批串行经过 P 个 pipeline stage，每步只有 1/P 的硬件在干活；batch_queue_size>1 允许同时有 ≤size 个批在流水线不同 stage，理论吞吐提升趋近 P 倍（受调度/采样依赖与队列深度限制）。",
+    "忙循环 CPU 占用：有请求时 step_fn 主导（GPU bound）；无请求时阻塞 input_queue.get 零占用。WAITING_FOR_REMOTE_KVS 等特殊态下 1ms sleep 把轮询频率限到 ~1000Hz，给后台握手线程留时间片。",
+    "DP wave 同步成本：每 32 步一次 all-reduce 判断 global unfinished（DPEngineCoreProc._has_global_unfinished_reqs），把跨 rank 同步摊薄到 1/32，是吞吐与'及时检测全局空闲'的折中。"
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {
+        "what": "EEP（Elastic Expert Parallel）相关：_eep_scale_up_before_kv_init / _eep_send_engine_core_notification / eep_handle_engine_core_notification / VLLM_ELASTIC_EP_SCALE_UP_LAUNCH 分支 / EEPNotificationType",
+        "why_safe": "弹性专家并行是 MoE 动态扩缩容特性，与 step()/忙循环/生命周期主线无关；删除后 EngineCore 在非 EEP 下行为完全一致。"
+      },
+      {
+        "what": "DPEngineCoreProc / DPMoEEngineCoreActor / EngineCoreActor / EngineCoreActorMixin 整类，以及 has_coordinator/wave/all-reduce/_maybe_publish_request_counts/barrier/reinitialize_distributed",
+        "why_safe": "数据并行与 Ray actor 是多引擎部署形态。本章讲单 EngineCore 的 step 与忙循环；DP 仅在 design_decisions/theory 中高层提及。精简版保留单进程 EngineCoreProc.run_busy_loop 即可。"
+      },
+      {
+        "what": "KV connector / kv_transfer 握手元数据收集（__init__ 中 L163-L182）、scheduler.connector 相关、WAITING_FOR_REMOTE_KVS 的 1ms sleep 可保留但 connector 装配删除",
+        "why_safe": "分离式 KV 传输（disaggregated prefill）是独立子系统，不影响单机 step 数据流。注意：_process_engine_step 里 time.sleep(0.001) 那一行属忙循环行为，建议保留（见 must_keep）。"
+      },
+      {
+        "what": "tensor IPC（TensorIpcReceiver / tensor_queue / oob_tensor_provider）",
+        "why_safe": "多模态张量零拷贝跨进程共享是 IO 优化，msgpack 普通解码已能跑通文本路径；删除不影响 step/busy loop 控制流。"
+      },
+      {
+        "what": "tracing / instrument 装饰器 / maybe_init_worker_tracer / numa_utils / decorate_logs / set_process_title / gc 调优（freeze_gc_heap / maybe_attach_gc_debug_callback / enable_envs_cache）",
+        "why_safe": "观测、NUMA 绑定、进程命名、GC 调优均为运维/性能旁路，不改变功能数据流。"
+      },
+      {
+        "what": "log_iteration_details 上下文管理器主体（compute_iteration_details 那段日志），保留 with 占位或直接内联 future.result()",
+        "why_safe": "仅在 enable_logging_iteration_details 时打印统计，默认 yield 透传，删除不改 step 语义。log_error_detail 建议保留（dump_engine_exception 是故障可观测主线，且与 must_keep 的异常路径相关）。"
+      },
+      {
+        "what": "LoRA 方法（add_lora/remove_lora/list_loras/pin_lora）、save_sharded_state、profile、reset_mm_cache/reset_encoder_cache 等 UTILITY 转发方法（保留 reset_prefix_cache 因 sleep 依赖 _reset_caches）",
+        "why_safe": "这些是经 UTILITY 路径转发给 executor 的管理 API，与 step/忙循环/sleep 主线无关；逐个 return self.model_executor.xxx 的转发删除不影响核心。"
+      },
+      {
+        "what": "握手机制 _perform_handshakes/_perform_handshake/startup_handshake、DP coordinator socket（XSUB）、EngineCoreReadyResponse 协议细节",
+        "why_safe": "启动期握手是部署编排，精简版可用固定地址直接建 socket；不影响运行期 step/忙循环。"
+      }
+    ],
+    "must_keep": [
+      {"symbol": "step", "why": "本章第一主线，必须逐行保留 schedule→execute_model→grammar→sample→update_from_output 顺序"},
+      {"symbol": "step_with_batch_queue", "why": "batch queue 接入点；PP 异步流水线的核心，章节明确要求讲清"},
+      {"symbol": "execute_model", "why": "step 中 non_block=True 调用，读者需理解前向是异步发起的"},
+      {"symbol": "get_grammar_bitmask", "why": "夹在 execute_model 与 result 之间，体现 CPU/GPU 重叠的关键"},
+      {"symbol": "sample_tokens", "why": "future.result() 为 None 时主进程用 grammar 采样——step 编排不可删的一环"},
+      {"symbol": "update_from_output", "why": "step 末端把 model_output 转 EngineCoreOutputs 的收口"},
+      {"symbol": "non_block", "why": "execute_model 的关键参数，决定返回 Future 而非阻塞，是重叠机制的根"},
+      {"symbol": "post_step", "why": "spec-decode draft token 钩子，_process_engine_step 在 step 后调用"},
+      {"symbol": "_process_aborts_queue", "why": "执行期 abort 在出输出前批量落地，正确性相关"},
+      {"symbol": "aborts_queue", "why": "执行期 abort 的暂存队列，ABORT 双投机制的一端"},
+      {"symbol": "run_busy_loop", "why": "本章第二主线：while _handle_shutdown: _process_input_queue + _process_engine_step"},
+      {"symbol": "_process_input_queue", "why": "从 input_queue 取请求并 dispatch；空闲阻塞逻辑"},
+      {"symbol": "_process_engine_step", "why": "调 step_fn、把 outputs 塞 output_queue、post_step、WAITING_FOR_REMOTE_KVS 让步"},
+      {"symbol": "_handle_client_request", "why": "(type,payload)→add/abort/utility 分派；忙循环与请求类型的接合点"},
+      {"symbol": "_handle_shutdown", "why": "三态关停：RUNNING→REQUESTED→SHUTTING_DOWN，控制忙循环退出"},
+      {"symbol": "has_work", "why": "忙循环阻塞/退出的核心谓词（scheduler.has_requests / batch_queue / engines_running）"},
+      {"symbol": "is_running", "why": "shutdown_state==RUNNING 判定，配合 _process_input_queue"},
+      {"symbol": "input_queue", "why": "忙循环输入侧线程安全队列，IO 线程与 step 解耦的接合点"},
+      {"symbol": "output_queue", "why": "忙循环输出侧队列，step 产物经此发往客户端"},
+      {"symbol": "step_fn", "why": "静态绑定 step 或 step_with_batch_queue，读者需理解二选一机制"},
+      {"symbol": "batch_queue", "why": "PP 异步流水线缓冲；batch_queue_size>1 时启用"},
+      {"symbol": "add_request", "why": "请求入调度器入口，校验后转 scheduler.add_request"},
+      {"symbol": "abort_requests", "why": "中止入口，scheduler.finish_requests(FINISHED_ABORTED)"},
+      {"symbol": "preprocess_add_request", "why": "EngineCoreRequest→Request 转换 + grammar_init，input 线程并行预处理"},
+      {"symbol": "pause_scheduler", "why": "生命周期：三模式暂停，set_pause_state 写 PauseState"},
+      {"symbol": "resume_scheduler", "why": "恢复：set_pause_state(UNPAUSED)，与 wake_up 配对"},
+      {"symbol": "sleep", "why": "生命周期主线：三级休眠，章节明确要求"},
+      {"symbol": "wake_up", "why": "与 sleep 配对的唤醒：executor.wake_up + resume_scheduler"},
+      {"symbol": "is_sleeping", "why": "休眠状态查询，依赖 is_scheduler_paused 与 executor.is_sleeping"},
+      {"symbol": "set_pause_state", "why": "暂停语义落到 scheduler 的实际写入点（PauseState）"},
+      {"symbol": "PauseState", "why": "UNPAUSED/PAUSED_NEW/PAUSED_ALL 三态，pause/sleep 语义基础"},
+      {"symbol": "EngineCoreRequestType", "why": "input_queue payload 类型 ADD/ABORT/UTILITY/WAKEUP，_handle_client_request 分派依据"},
+      {"symbol": "EngineShutdownState", "why": "RUNNING/REQUESTED/SHUTTING_DOWN 三态枚举，_handle_shutdown 依赖"},
+      {"symbol": "WAKEUP", "why": "关停时唤醒阻塞 input_queue.get 的哨兵"},
+      {"symbol": "run_engine_core", "why": "子进程入口：建 EngineCoreProc、装信号处理器、调 run_busy_loop"},
+      {"symbol": "process_input_sockets", "why": "input IO 线程：ZMQ recv→decode→preprocess→input_queue（请求如何进队列）"},
+      {"symbol": "process_output_sockets", "why": "output IO 线程：output_queue→encode→ZMQ PUSH（输出如何出队列）"},
+      {"symbol": "InprocClient", "why": "进程内对照：get_output 直接 step_fn()，揭示无忙循环时 step 的驱动"},
+      {"symbol": "get_output", "why": "InprocClient 同步取输出，调 step_fn+post_step"},
+      {"symbol": "get_output_async", "why": "AsyncMPClient 异步取输出，连回 ch04 三段式"},
+      {"symbol": "add_request_async", "why": "AsyncMPClient 经 ZMQ 发 ADD 进子进程 input_queue 的入口"}
+    ]
+  },
+  "diagram_plan": [
+    {
+      "name": "ch11-step-orchestration",
+      "type": "时序/数据流图（svg-diagram）",
+      "spec": "EngineCore.step() 一次迭代的纵向时序：scheduler.schedule() → execute_model(non_block=True) 返回 future（GPU 前向异步发起）→ 与之并行的 get_grammar_bitmask（CPU）→ future.result() 汇合 →（None 时）sample_tokens(grammar)→ _process_aborts_queue → update_from_output → EngineCoreOutputs。用并排泳道强调 CPU(bitmask) 与 GPU(forward) 重叠。标注 must_keep 符号名。",
+      "roadmap_highlight": "engine-core"
+    },
+    {
+      "name": "ch11-busy-loop",
+      "type": "状态/循环图（svg-diagram）",
+      "spec": "run_busy_loop 主循环：while _handle_shutdown() → _process_input_queue（阻塞等 input_queue，dispatch ADD/ABORT/UTILITY/WAKEUP）→ _process_engine_step（step_fn → output_queue → post_step）。旁挂两条 ZMQ IO 线程（process_input_sockets 喂 input_queue，process_output_sockets 抽 output_queue），以及 shutdown 三态机 RUNNING→REQUESTED→SHUTTING_DOWN→exit。",
+      "roadmap_highlight": "engine-core"
+    },
+    {
+      "name": "ch11-batch-queue-pipeline",
+      "type": "流水线对比图（svg-diagram）",
+      "spec": "对比 step（串行：schedule→exec→sample→update 单批）与 step_with_batch_queue（batch queue 深度 N，先填满流水线优先于取结果，appendleft/pop 的 deque 时间轴，PP 各 stage 重叠消除气泡）。标 deferred_scheduler_output 小众分支。",
+      "roadmap_highlight": "engine-core"
+    },
+    {
+      "name": "ch11-lifecycle-states",
+      "type": "状态机图（svg-diagram）",
+      "spec": "PauseState（UNPAUSED↔PAUSED_NEW↔PAUSED_ALL）与 sleep level（0 仅停调度 / 1 卸权重弃KV / 2 弃全显存）叠加；箭头标 pause_scheduler(abort/wait/keep)、resume_scheduler、sleep(level)、wake_up；多进程版用 idle 回调异步完成 Future 的支线。",
+      "roadmap_highlight": "engine-core"
+    }
+  ],
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_payoff": [],
+    "note": "scripts/bible.py due ch11 返回空（无登记的应埋/应回收项）。建议本章自然回收 ch04 AsyncLLM 三段式伏笔：get_output_async/output_queue 正是三段式中 EngineCore 段的真身；并为后续 scheduler 章（schedule/update_from_output 细节）、executor 章（execute_model/sample_tokens non_block 实现）埋接口锚点。"
+  }
+}
