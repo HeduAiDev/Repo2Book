@@ -1,0 +1,215 @@
+{
+  "chapter_id": "ch16",
+  "title": "KV 块分配与多注意力协调：allocate_slots 三阶段、Unitary vs Hybrid 协调、cache-hit 不动点迭代收敛",
+  "scope_note": "本章承接 ch15（已讲透 KVCacheBlock/FreeKVCacheBlockQueue LRU/块哈希/BlockHashToBlockMap/BlockPool 的 get_new_blocks·touch·free·evict·cache_full_blocks，并以『单组 + 全注意力 + 开启前缀缓存』主路径过了一遍 allocate_slots 三段式与 FullAttentionManager.find_longest_cache_hit）。ch16 不重复块池/LRU/哈希内部，聚焦三件 ch15 显式留作可省略分支的『分配决策与多注意力协调』深水区：(1) allocate_slots 三阶段的完整决策——释放 skipped 块（滑窗/分块本地把窗外块换成 null_block 并归还 free queue）、前缀命中 + 外部命中（connector 缓存）两类已算 token 如何挂块、新建块 + lookahead（投机解码草稿 token）预留与 num_tokens_to_cache 的封顶；(2) KVCacheCoordinator 三态工厂——KVCacheCoordinatorNoPrefixCache / UnitaryKVCacheCoordinator（单一注意力类型）/ HybridKVCacheCoordinator（混合，多 KV cache group），以及『按 spec 分桶 + full attn 排首』的 verify_and_split_kv_cache_groups；(3) Hybrid 的 find_longest_cache_hit 不动点迭代：各注意力类型对候选命中长度只接受或缩短，任一缩短则重启全类型校验，因长度单调递减且下界为 0 而收敛；(4) get_num_blocks_to_allocate 在不同 spec 下的需块数推算（含 num_skipped_blocks 折抵与可驱逐块计数）与 SWA/chunked-local 的 recycling-aware 准入上限（max_admission_blocks_per_request）。每个具体注意力类型的 spec 与 prefix-caching 内部细节（Mamba 对齐模式、cross-attn 全量静态分配）只点到协调层面，不展开为独立小节。",
+  "code_spine": [
+    "vllm/v1/core/kv_cache_manager.py:L225-L416  KVCacheManager.allocate_slots —— 三阶段分配总控（本章主骨架；ch15 走的是无 skipped/无 external 的简化主路径，本章补全两端）",
+    "vllm/v1/core/kv_cache_manager.py:L312-L334  入口校验 + num_local/total_computed_tokens 计算（本地命中 + 外部命中合并并 min(max_model_len) 封顶）",
+    "vllm/v1/core/kv_cache_manager.py:L335-L354  full_sequence_must_fit 准入闸（apply_admission_cap=True，整条序列预算检查）+ num_tokens_need_slot（含 lookahead 并封顶）",
+    "vllm/v1/core/kv_cache_manager.py:L356-L378  阶段一：remove_skipped_blocks 释放窗外块 → get_num_blocks_to_allocate → 与 free 块数比，不足返 None",
+    "vllm/v1/core/kv_cache_manager.py:L380-L398  阶段二：allocate_new_computed_blocks（挂前缀命中块 + 为 external 命中分配块）→ 阶段三：allocate_new_blocks（新建 new+lookahead 槽位）",
+    "vllm/v1/core/kv_cache_manager.py:L400-L416  收尾：delay_cache_blocks/enable_caching 早退；否则 num_tokens_to_cache=min(total_computed+new, request.num_tokens) 封顶后 cache_blocks",
+    "vllm/v1/core/kv_cache_coordinator.py:L594-L642  get_kv_cache_coordinator —— 三态工厂：不缓存 / 单组 Unitary / 多组 Hybrid",
+    "vllm/v1/core/kv_cache_coordinator.py:L28-L78  KVCacheCoordinator.__init__ —— 建 BlockPool + eagle_group_ids + 每组一个 single_type_manager",
+    "vllm/v1/core/kv_cache_coordinator.py:L80-L135  get_num_blocks_to_allocate —— 跨组累加，CrossAttention 走 num_encoder_tokens 静态分配",
+    "vllm/v1/core/kv_cache_coordinator.py:L137-L196  allocate_new_computed_blocks / allocate_new_blocks —— 逐组转发（CrossAttention 用 encoder token 数）",
+    "vllm/v1/core/kv_cache_coordinator.py:L238-L260  remove_skipped_blocks / get_blocks —— 逐组转发",
+    "vllm/v1/core/kv_cache_coordinator.py:L276-L321  KVCacheCoordinatorNoPrefixCache —— 关缓存时的退化协调器（支持任意组数，命中恒为 0）",
+    "vllm/v1/core/kv_cache_coordinator.py:L324-L389  UnitaryKVCacheCoordinator —— 单 KV cache group；find_longest_cache_hit 直接委托唯一 manager",
+    "vllm/v1/core/kv_cache_coordinator.py:L436-L485  HybridKVCacheCoordinator.verify_and_split_kv_cache_groups —— 按 spec 分桶、full attn 排首、算 lcm_block_size、标 eagle 桶",
+    "vllm/v1/core/kv_cache_coordinator.py:L487-L591  HybridKVCacheCoordinator.find_longest_cache_hit —— 不动点迭代收敛 + full-attn 下闭包早停 + 末尾截断",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L88-L167  SingleTypeKVCacheManager.get_num_blocks_to_allocate —— 需块数推算（running 快路 / skipped 折抵 / 可驱逐块计数）",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L120-L132  apply_admission_cap 把 num_required_blocks 夹到 _max_admission_blocks_per_request（SWA/chunked-local）",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L169-L240  allocate_new_computed_blocks —— touch 命中块 + 用 null_block 填 skipped 段 + 为 external 命中分配块",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L385-L426  remove_skipped_blocks —— 逆序把窗外块换成 null_block 并 free_blocks（遇已 null 早停）",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L428-L439  get_num_skipped_tokens —— 基类默认 0（全注意力永不释放）",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L606-L632  SlidingWindowManager.get_num_skipped_tokens —— max(0, num_computed - sliding_window + 1)",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L741-L785  ChunkedLocalAttentionManager.get_num_skipped_tokens —— 向下取整到 chunk 边界",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L1155-L1173  get_manager_for_kv_cache_spec —— spec→manager 映射 + 给 SWA/chunked-local 注入 admission cap"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/core/kv_cache_manager.py",
+      "lines": "L312-L378",
+      "elide": [
+        "full_sequence_must_fit 准入闸（L335-L349）是一个可选的『整条序列必须放得下』前置检查，仅由调度器在 chunked prefill 防过度准入时传 True；可保留但讲清它复用了 apply_admission_cap=True 走 recycling-aware 上限这一点即可。",
+        "num_encoder_tokens（cross-attention，Whisper 类编码器-解码器）一路透传，decoder-only 恒为 0，可在 cross-attn 处一句话带过。"
+      ],
+      "code": "        # When loading KV data asynchronously, we may have zero new tokens to\n        # compute while still allocating slots for externally computed tokens.\n        if num_new_tokens == 0 and num_external_computed_tokens == 0:\n            raise ValueError(\n                \"num_new_tokens must be greater than 0 when there are no \"\n                \"external computed tokens\"\n            )\n\n        if new_computed_blocks is not None:\n            new_computed_block_list = new_computed_blocks.blocks\n        else:\n            new_computed_block_list = self.empty_kv_cache_blocks.blocks\n\n        # The number of computed tokens is the number of computed tokens plus\n        # the new prefix caching hits\n        num_local_computed_tokens = (\n            request.num_computed_tokens + num_new_computed_tokens\n        )\n        total_computed_tokens = min(\n            num_local_computed_tokens + num_external_computed_tokens,\n            self.max_model_len,\n        )\n\n        if full_sequence_must_fit:\n            # First check and fail if the full request sequence won't fit.\n            full_num_tokens = min(request.num_tokens, self.max_model_len)\n\n            num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(\n                request_id=request.request_id,\n                num_tokens=full_num_tokens,\n                new_computed_blocks=new_computed_block_list,\n                num_encoder_tokens=num_encoder_tokens,\n                total_computed_tokens=total_computed_tokens,\n                num_tokens_main_model=full_num_tokens,\n                apply_admission_cap=True,\n            )\n            if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():\n                return None\n\n        num_tokens_main_model = total_computed_tokens + num_new_tokens\n        num_tokens_need_slot = min(\n            num_tokens_main_model + num_lookahead_tokens, self.max_model_len\n        )\n\n        # Free the blocks that are skipped during the attention computation\n        # (e.g., tokens outside the sliding window).\n        # We can do this even if we cannot schedule this request due to\n        # insufficient free blocks.\n        # Should call this function before allocating new blocks to reduce\n        # the number of evicted blocks.\n        self.coordinator.remove_skipped_blocks(\n            request.request_id, total_computed_tokens\n        )\n\n        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(\n            request_id=request.request_id,\n            num_tokens=num_tokens_need_slot,\n            new_computed_blocks=new_computed_block_list,\n            num_encoder_tokens=num_encoder_tokens,\n            total_computed_tokens=num_local_computed_tokens\n            + num_external_computed_tokens,\n            num_tokens_main_model=num_tokens_main_model,\n        )\n\n        if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():\n            # Cannot allocate new blocks\n            return None"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_manager.py",
+      "lines": "L380-L416",
+      "elide": [
+        "delay_cache_blocks（L402）是 P/D 分离时延迟缓存的标志，与 enable_caching=False 共用早退分支；点到即可。"
+      ],
+      "code": "        if (\n            new_computed_block_list is not self.empty_kv_cache_blocks.blocks\n            or num_external_computed_tokens > 0\n        ):\n            # Append the new computed blocks to the request blocks until now to\n            # avoid the case where the new blocks cannot be allocated.\n            self.coordinator.allocate_new_computed_blocks(\n                request_id=request.request_id,\n                new_computed_blocks=new_computed_block_list,\n                num_local_computed_tokens=num_local_computed_tokens,\n                num_external_computed_tokens=num_external_computed_tokens,\n            )\n\n        new_blocks = self.coordinator.allocate_new_blocks(\n            request.request_id,\n            num_tokens_need_slot,\n            num_tokens_main_model,\n            num_encoder_tokens,\n        )\n\n        # P/D: delay caching blocks if we have to recv from\n        # remote. Update state for locally cached blocks.\n        if not self.enable_caching or delay_cache_blocks:\n            return self.create_kv_cache_blocks(new_blocks)\n\n        # NOTE(woosuk): We want to commit (cache) up to num_local_computed_tokens\n        # + num_external_computed_tokens + num_new_tokens, but must exclude\n        # \"non-committable\" tokens (e.g., draft tokens that could be rejected).\n        # Therefore, we cap the number at `request.num_tokens`, ensuring only\n        # \"finalized\" tokens are cached.\n        num_tokens_to_cache = min(\n            total_computed_tokens + num_new_tokens,\n            request.num_tokens,\n        )\n        self.coordinator.cache_blocks(request, num_tokens_to_cache)\n\n        return self.create_kv_cache_blocks(new_blocks)"
+    },
+    {
+      "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+      "lines": "L385-L439",
+      "elide": [],
+      "code": "    def remove_skipped_blocks(\n        self, request_id: str, total_computed_tokens: int\n    ) -> None:\n        # Remove the blocks that will be skipped during attention computation.\n        num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)\n        if num_skipped_tokens <= 0:\n            # This indicates that ALL tokens are inside attention window.\n            # Thus we do not need to free any blocks outside attention window.\n            # A typical case is full attention that we never free any token\n            # before the request is finished.\n            return\n        blocks = self.req_to_blocks[request_id]\n        num_skipped_blocks = num_skipped_tokens // self.block_size\n        # `num_skipped_tokens` may include tokens that haven't been allocated yet\n        # (e.g., when the attention window moves into the external computed tokens\n        # range), so we must cap to the number of blocks that currently exist for\n        # this request.\n        num_skipped_blocks = min(num_skipped_blocks, len(blocks))\n        removed_blocks: list[KVCacheBlock] = []\n        # Because the block starts from index 0, the num_skipped_block-th block\n        # corresponds to index num_skipped_blocks - 1.\n        for i in range(num_skipped_blocks - 1, -1, -1):\n            if blocks[i] == self._null_block:\n                # If the block is already a null block, the blocks before it\n                # should also have been set to null blocks by the previous calls\n                # to this function.\n                break\n            removed_blocks.append(blocks[i])\n            blocks[i] = self._null_block\n        self.block_pool.free_blocks(removed_blocks)\n\n    def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:\n        # The default behavior is to not skip any tokens.\n        return 0"
+    },
+    {
+      "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+      "lines": "L606-L632",
+      "elide": ["docstring 中的 ASCII 示例图（L612-L624）信息量大，可在正文用文字+图复述，不必逐字内嵌注释。"],
+      "code": "    def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:\n        # For sliding window, this corresponds to the tokens that are prior to\n        # the current sliding window.\n        # Example: sliding_window=4, num_computed_tokens=7 -> skip 4 (tokens 0~3).\n        return max(0, num_computed_tokens - self.sliding_window + 1)"
+    },
+    {
+      "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+      "lines": "L169-L240",
+      "elide": [
+        "running 请求（request_id in num_cached_block）的 fast-path（L192-L196）只断言无新命中块后直接返回，可一句话带过。",
+        "enable_caching=False 时 touch 改为断言命中块为空（L219-L222）。"
+      ],
+      "code": "    def allocate_new_computed_blocks(\n        self,\n        request_id: str,\n        new_computed_blocks: Sequence[KVCacheBlock],\n        num_local_computed_tokens: int,\n        num_external_computed_tokens: int,\n    ) -> None:\n        # ... fast-path for running requests elided ...\n        # A new request.\n        req_blocks = self.req_to_blocks[request_id]\n        assert len(req_blocks) == 0\n        num_total_computed_tokens = (\n            num_local_computed_tokens + num_external_computed_tokens\n        )\n        num_skipped_tokens = self.get_num_skipped_tokens(num_total_computed_tokens)\n        num_skipped_blocks = num_skipped_tokens // self.block_size\n        if num_skipped_blocks > 0:\n            # It is possible that all new computed blocks are skipped when\n            # num_skipped_blocks > len(new_computed_blocks).\n            new_computed_blocks = new_computed_blocks[num_skipped_blocks:]\n            # Some external computed tokens may be skipped too.\n            num_external_computed_tokens = min(\n                num_total_computed_tokens - num_skipped_tokens,\n                num_external_computed_tokens,\n            )\n\n        # Touch the computed blocks to make sure they won't be evicted.\n        if self.enable_caching:\n            self.block_pool.touch(new_computed_blocks)\n        # Skip blocks are padded with null blocks.\n        req_blocks.extend([self._null_block] * num_skipped_blocks)\n        # Add the remaining computed blocks.\n        req_blocks.extend(new_computed_blocks)\n        self.num_cached_block[request_id] = len(req_blocks)\n\n        if num_external_computed_tokens > 0:\n            # Allocate new blocks for external computed tokens.\n            allocated_blocks = self.block_pool.get_new_blocks(\n                cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)\n            )\n            req_blocks.extend(allocated_blocks)\n            if type(self.kv_cache_spec) in (FullAttentionSpec, TQFullAttentionSpec):\n                self.new_block_ids.extend(b.block_id for b in allocated_blocks)"
+    },
+    {
+      "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+      "lines": "L88-L167",
+      "elide": [
+        "running 请求 fast-path（L135-L141）：num_cached_block 命中时直接 max(num_required-num_req,0)，投机解码可能 num_required<num_req；可简述。"
+      ],
+      "code": "    def get_num_blocks_to_allocate(\n        self,\n        request_id: str,\n        num_tokens: int,\n        new_computed_blocks: Sequence[KVCacheBlock],\n        total_computed_tokens: int,\n        num_tokens_main_model: int,\n        apply_admission_cap: bool = False,\n    ) -> int:\n        num_required_blocks = cdiv(num_tokens, self.block_size)\n        if apply_admission_cap and self._max_admission_blocks_per_request is not None:\n            # Recycling-aware specs (SWA, chunked-local) cap the per-request\n            # reservation here so admission matches the startup pool sizer.\n            num_required_blocks = min(\n                num_required_blocks, self._max_admission_blocks_per_request\n            )\n        num_req_blocks = len(self.req_to_blocks.get(request_id, ()))\n\n        if request_id in self.num_cached_block:\n            # Fast-path: a running request won't have any new prefix-cache hits.\n            assert len(new_computed_blocks) == 0\n            return max(num_required_blocks - num_req_blocks, 0)\n\n        num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)\n        num_local_computed_blocks = len(new_computed_blocks) + num_req_blocks\n        # Number of whole blocks that are skipped by the attention window.\n        num_skipped_blocks = num_skipped_tokens // self.block_size\n        # We need blocks for the non-skipped suffix.\n        num_new_blocks = max(\n            num_required_blocks - max(num_skipped_blocks, num_local_computed_blocks),\n            0,\n        )\n\n        # Among the `new_computed_blocks`, the first `num_skipped_blocks` worth\n        # of blocks are skipped; `num_req_blocks` of those may already be in\n        # `req_to_blocks`, so only skip the remainder from `new_computed_blocks`.\n        num_skipped_new_computed_blocks = max(0, num_skipped_blocks - num_req_blocks)\n\n        # If a computed block is an eviction candidate (in the free queue and\n        # ref_cnt == 0), it will be removed from the free queue when touched by\n        # the allocated request, so we must count it in the free-capacity check.\n        num_evictable_blocks = self._get_num_evictable_blocks(\n            new_computed_blocks[num_skipped_new_computed_blocks:]\n        )\n        return num_new_blocks + num_evictable_blocks"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_coordinator.py",
+      "lines": "L594-L642",
+      "elide": ["三个分支的构造参数逐字相同，可只展示分支判断逻辑，构造参数省略为 (...)。"],
+      "code": "def get_kv_cache_coordinator(\n    kv_cache_config, max_model_len, max_num_batched_tokens, use_eagle,\n    enable_caching, enable_kv_cache_events, dcp_world_size, pcp_world_size,\n    hash_block_size, metrics_collector=None,\n) -> KVCacheCoordinator:\n    if not enable_caching:\n        return KVCacheCoordinatorNoPrefixCache(...)\n    if len(kv_cache_config.kv_cache_groups) == 1:\n        return UnitaryKVCacheCoordinator(...)\n    return HybridKVCacheCoordinator(...)"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_coordinator.py",
+      "lines": "L373-L389",
+      "elide": ["dcp/pcp_world_size>1 时 block_size 翻倍（L360-L363，构造期）属并行扩展，find 时透传即可。"],
+      "code": "    def find_longest_cache_hit(\n        self,\n        block_hashes: list[BlockHash],\n        max_cache_hit_length: int,\n    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:\n        hit_blocks = self.single_type_managers[0].find_longest_cache_hit(\n            block_hashes=block_hashes,\n            max_length=max_cache_hit_length,\n            kv_cache_group_ids=[0],\n            block_pool=self.block_pool,\n            kv_cache_spec=self.kv_cache_spec,\n            use_eagle=0 in self.eagle_group_ids,\n            alignment_tokens=self.block_size,\n            dcp_world_size=self.dcp_world_size,\n            pcp_world_size=self.pcp_world_size,\n        )\n        return hit_blocks, len(hit_blocks[0]) * self.block_size"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_coordinator.py",
+      "lines": "L436-L485",
+      "elide": [
+        "eagle_attn_group_indices（L481-L485）只在投机解码草稿层用到，标注其用途后可在不动点正文略过其分支。"
+      ],
+      "code": "    def verify_and_split_kv_cache_groups(self) -> None:\n        attention_groups: list[\n            tuple[KVCacheSpec, list[int], type[SingleTypeKVCacheManager]]\n        ] = []\n\n        for i, g in enumerate(self.kv_cache_config.kv_cache_groups):\n            manager_cls = self.single_type_managers[i].__class__\n            spec = g.kv_cache_spec\n            # Try to find an existing group with the same spec\n            for existing_spec, group_ids, existing_cls in attention_groups:\n                if existing_spec == spec:\n                    assert manager_cls is existing_cls\n                    group_ids.append(i)\n                    break\n            else:\n                attention_groups.append((spec, [i], manager_cls))\n\n        assert len(attention_groups) > 1, (\n            \"HybridKVCacheCoordinator requires at least two attention groups.\"\n        )\n\n        # Put full attention first: its efficient left-to-right scan provides\n        # a tighter initial bound, reducing work for subsequent groups.\n        self.attention_groups = sorted(\n            attention_groups,\n            key=lambda x: not isinstance(x[0], FullAttentionSpec),\n        )\n\n        # The cache hit length must be a multiple of the LCM of the block sizes\n        # to make sure the cache hit length is a multiple of the block size of\n        # each attention type.\n        block_sizes = [spec.block_size for spec, _, _ in attention_groups]\n        self.lcm_block_size = lcm(*block_sizes)"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_coordinator.py",
+      "lines": "L487-L591",
+      "elide": [
+        "_get_block_hashes 内部分支（L510-L515）处理 block_size != hash_block_size 的多块尺寸情形，属 ch15 已点过的哈希粒度换算，可一句话带过。",
+        "eagle 相关分支（use_eagle / eagle_verified / +block_size 的 _max_length，L530-L567 散点）属投机解码，标注用途后可在主线略过。"
+      ],
+      "code": "    def find_longest_cache_hit(\n        self,\n        block_hashes: list[BlockHash],\n        max_cache_hit_length: int,\n    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:\n        # Find the longest cache hit using an iterative fixed-point algorithm.\n        # Each attention type either accepts the current candidate length or\n        # reduces it. If any type reduces the length, restart checks over all\n        # types. This converges because length monotonically decreases and is\n        # bounded below by 0.\n\n        num_groups = len(self.kv_cache_config.kv_cache_groups)\n        hit_length = max_cache_hit_length\n        hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups\n\n        # Simple hybrid (1 full attn + 1 other): one iteration suffices.\n        is_simple_hybrid = len(self.attention_groups) == 2 and isinstance(\n            self.attention_groups[0][0], FullAttentionSpec\n        )\n\n        while True:\n            curr_hit_length = hit_length\n\n            for idx, (spec, group_ids, manager_cls) in enumerate(self.attention_groups):\n                cached_blocks = hit_blocks_by_group[group_ids[0]]\n                if isinstance(spec, FullAttentionSpec) and cached_blocks is not None:\n                    # Full attention is downward-closed: look up cached blocks\n                    # once; on subsequent iterations just trim to current length.\n                    curr_hit_length = (\n                        curr_hit_length // spec.block_size * spec.block_size\n                    )\n                    continue\n\n                hit_blocks = manager_cls.find_longest_cache_hit(\n                    block_hashes=_get_block_hashes(spec),\n                    max_length=curr_hit_length,\n                    kv_cache_group_ids=group_ids,\n                    block_pool=self.block_pool,\n                    kv_cache_spec=spec,\n                    use_eagle=use_eagle,\n                    alignment_tokens=self.lcm_block_size,\n                )\n                _new_hit_length = len(hit_blocks[0]) * spec.block_size\n                curr_hit_length = _new_hit_length\n                for group_id, blocks in zip(group_ids, hit_blocks):\n                    hit_blocks_by_group[group_id] = blocks\n\n            if curr_hit_length >= hit_length:\n                break\n            hit_length = curr_hit_length\n            if is_simple_hybrid:\n                break\n\n        # Truncate full attention blocks to final hit_length (if present)\n        spec, group_ids, _ = self.attention_groups[0]\n        if isinstance(spec, FullAttentionSpec):\n            num_blocks = hit_length // spec.block_size\n            for group_id in group_ids:\n                if (blks := hit_blocks_by_group[group_id]) is not None:\n                    del blks[num_blocks:]\n\n        return tuple(\n            blocks if blocks is not None else [] for blocks in hit_blocks_by_group\n        ), hit_length"
+    },
+    {
+      "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+      "lines": "L1155-L1173",
+      "elide": [],
+      "code": "def get_manager_for_kv_cache_spec(\n    kv_cache_spec: KVCacheSpec,\n    max_num_batched_tokens: int,\n    max_model_len: int,\n    **kwargs,\n) -> SingleTypeKVCacheManager:\n    manager_class = spec_manager_map[type(kv_cache_spec)]\n    # SlidingWindow / ChunkedLocalAttention managers recycle blocks across\n    # chunks; the runtime admission cap must match the recycling-aware bound\n    # the startup pool sizer uses (single source of truth: the spec method).\n    if isinstance(kv_cache_spec, (SlidingWindowSpec, ChunkedLocalAttentionSpec)):\n        kwargs[\"max_admission_blocks_per_request\"] = (\n            kv_cache_spec.max_admission_blocks_per_request(\n                max_num_batched_tokens=max_num_batched_tokens,\n                max_model_len=max_model_len,\n            )\n        )\n    manager = manager_class(kv_cache_spec, **kwargs)\n    return manager"
+    }
+  ],
+  "key_classes": [
+    {"name": "KVCacheManager.allocate_slots", "file": "vllm/v1/core/kv_cache_manager.py", "responsibility": "对外分配入口；编排三阶段（释放 skipped → 挂前缀/外部命中块 → 新建 new+lookahead 块 → 缓存满块）。委托 coordinator 做跨组逻辑；预算不足返回 None。本章主骨架。"},
+    {"name": "KVCacheCoordinator (ABC)", "file": "vllm/v1/core/kv_cache_coordinator.py", "responsibility": "协调多个 KV cache group 的抽象基类。持有 BlockPool + 每组一个 single_type_manager + eagle_group_ids。把 get_num_blocks_to_allocate / allocate_new_computed_blocks / allocate_new_blocks / cache_blocks / remove_skipped_blocks / free 逐组转发并累加。find_longest_cache_hit 为抽象方法。"},
+    {"name": "KVCacheCoordinatorNoPrefixCache", "file": "vllm/v1/core/kv_cache_coordinator.py", "responsibility": "关前缀缓存时的退化实现；支持任意组数（含 0 组），find_longest_cache_hit 恒返回空命中、common prefix 恒 0。"},
+    {"name": "UnitaryKVCacheCoordinator", "file": "vllm/v1/core/kv_cache_coordinator.py", "responsibility": "单一注意力类型（恰好 1 个 KV cache group）。断言 hash_block_size==block_size、组数==1；find_longest_cache_hit 直接委托唯一 manager，命中长度 = 命中块数 * block_size。最常见路径。"},
+    {"name": "HybridKVCacheCoordinator", "file": "vllm/v1/core/kv_cache_coordinator.py", "responsibility": "混合注意力（多 KV cache group，如 full + sliding window）。verify_and_split_kv_cache_groups 按 spec 分桶、full attn 排首、算 lcm_block_size；find_longest_cache_hit 用不动点迭代让所有注意力类型对同一命中长度达成一致。断言 DCP/PCP==1、至少两类注意力组。"},
+    {"name": "SingleTypeKVCacheManager (ABC)", "file": "vllm/v1/core/single_type_kv_cache_manager.py", "responsibility": "单一注意力类型的块管理：get_num_blocks_to_allocate（需块数推算）、allocate_new_computed_blocks（挂命中+null 填 skipped+external 分配）、remove_skipped_blocks（窗外块换 null 并归还）、get_num_skipped_tokens（基类默认 0）。"},
+    {"name": "SlidingWindowManager", "file": "vllm/v1/core/single_type_kv_cache_manager.py", "responsibility": "滑动窗口注意力管理器；get_num_skipped_tokens=max(0,num_computed-sliding_window+1)，使窗外块被 remove_skipped_blocks 换成 null 回收。携带 recycling-aware admission cap。"},
+    {"name": "ChunkedLocalAttentionManager", "file": "vllm/v1/core/single_type_kv_cache_manager.py", "responsibility": "分块本地注意力管理器；get_num_skipped_tokens 向下取整到 chunk 边界，复用 FullAttentionManager 的命中查找但窗外块归零。携带 recycling-aware admission cap。"},
+    {"name": "get_kv_cache_coordinator", "file": "vllm/v1/core/kv_cache_coordinator.py", "responsibility": "三态工厂：!enable_caching → NoPrefixCache；单组 → Unitary；多组 → Hybrid。"},
+    {"name": "get_manager_for_kv_cache_spec", "file": "vllm/v1/core/single_type_kv_cache_manager.py", "responsibility": "spec 类型 → manager 类映射（spec_manager_map）；对 SWA/chunked-local 注入 max_admission_blocks_per_request。"}
+  ],
+  "data_flow": [
+    "1. 调度器对一个待分配请求调 KVCacheManager.allocate_slots(request, num_new_tokens, num_new_computed_tokens, new_computed_blocks, num_lookahead_tokens, num_external_computed_tokens, ...)（kv_cache_manager.py:allocate_slots）",
+    "2. 合并已算 token：num_local_computed_tokens = request.num_computed_tokens + num_new_computed_tokens；total_computed_tokens = min(num_local + num_external, max_model_len)。num_tokens_need_slot = min(total_computed + num_new_tokens + num_lookahead, max_model_len)（kv_cache_manager.py:allocate_slots）",
+    "3.（可选准入闸）full_sequence_must_fit=True 时，先用整条序列长度 + apply_admission_cap=True 走 recycling-aware 上限算需块数，放不下立即返回 None（kv_cache_manager.py:allocate_slots）",
+    "4. 阶段一·释放 skipped：coordinator.remove_skipped_blocks(req_id, total_computed_tokens) 逐组转发到 manager.remove_skipped_blocks —— 调 get_num_skipped_tokens 算窗外 token 数，逆序把窗外块换成 null_block 并 block_pool.free_blocks 归还（遇已 null 早停）。全注意力 get_num_skipped_tokens 恒 0 → 直接返回不释放（single_type_kv_cache_manager.py:remove_skipped_blocks）",
+    "5. 阶段一·预算检查：coordinator.get_num_blocks_to_allocate 逐组累加 manager.get_num_blocks_to_allocate —— 需块数 = (num_required - max(num_skipped_blocks, num_local_computed_blocks)) + 可驱逐命中块数；与 block_pool.get_num_free_blocks() 比，不足返回 None（single_type_kv_cache_manager.py:get_num_blocks_to_allocate）",
+    "6. 阶段二·挂前缀/外部命中：若有命中块或 external>0，coordinator.allocate_new_computed_blocks → manager.allocate_new_computed_blocks：touch 命中块（ref_cnt+1，在 free queue 则出队），用 null_block 填 num_skipped_blocks 段，把剩余命中块挂进 req_to_blocks，再为 external 命中 get_new_blocks 分配真实块（single_type_kv_cache_manager.py:allocate_new_computed_blocks）",
+    "7. 阶段三·新建 new+lookahead：coordinator.allocate_new_blocks → manager.allocate_new_blocks(num_tokens_need_slot, num_tokens_main_model)：num_new = cdiv(num_tokens_need_slot,block_size) - len(req_blocks)，>0 则 block_pool.get_new_blocks 取块挂进 req_to_blocks（含 lookahead 投机草稿槽位）（single_type_kv_cache_manager.py:allocate_new_blocks）",
+    "8. 收尾·缓存：除非 !enable_caching 或 delay_cache_blocks，num_tokens_to_cache = min(total_computed + num_new_tokens, request.num_tokens)（封掉未定稿草稿 token），coordinator.cache_blocks → manager.cache_blocks → block_pool.cache_full_blocks 给新满块写哈希入 map（kv_cache_manager.py:allocate_slots）",
+    "9. 前缀命中查找（多组路径）：get_computed_blocks → coordinator.find_longest_cache_hit。Unitary 直接委托唯一 manager。Hybrid 走不动点迭代：以 max_cache_hit_length 为初值，逐注意力类型 manager_cls.find_longest_cache_hit 校验该类型在当前候选长度下的命中（full attn 下闭包只查一次后只截断；其余类型可能缩短长度），任一类型缩短就重启全类型校验；curr_hit_length>=hit_length 时收敛退出（simple hybrid 一轮即停）（kv_cache_coordinator.py:find_longest_cache_hit）",
+    "10. 协调器构造期分桶：HybridKVCacheCoordinator.verify_and_split_kv_cache_groups 把同 spec 的 group 合并成一个 attention_group，full attn 排首（更紧初始上界），算 lcm_block_size 作为对齐粒度（kv_cache_coordinator.py:verify_and_split_kv_cache_groups）"
+  ],
+  "design_decisions": [
+    {"decision": "协调层三态工厂：不缓存 / 单组 Unitary / 多组 Hybrid，三类各有独立 find_longest_cache_hit 实现", "why": "把『有几种注意力类型』这一拓扑差异在构造期一次性解析为不同协调器，让运行时热路径（单组占绝大多数模型）避开混合模型才需要的不动点迭代与分桶开销；关缓存时退化为支持任意组数（含 0）的最简实现。", "evidence": "vllm/v1/core/kv_cache_coordinator.py:L594-L642"},
+    {"decision": "Hybrid find_longest_cache_hit 用不动点迭代而非一次扫描", "why": "不同注意力类型（full / sliding window / chunked local）对『前缀命中到哪』的判定不一致：滑窗只要求窗内连续命中、full attn 要求从头连续命中。命中长度必须让所有类型同时成立，故让每类型对候选长度『接受或缩短』，缩短即重启；因长度单调递减且下界 0 而必收敛。simple hybrid（1 full + 1 other）可证一轮足够，直接早停。", "evidence": "vllm/v1/core/kv_cache_coordinator.py:L487-L591"},
+    {"decision": "verify_and_split_kv_cache_groups 把 full attention 排在分桶首位", "why": "full attn 的左到右扫描能给出最紧的初始命中上界，先跑它能压缩后续注意力类型的搜索区间，减少不动点迭代的总工作量。", "evidence": "vllm/v1/core/kv_cache_coordinator.py:L464-L469"},
+    {"decision": "命中长度对齐到所有块尺寸的 lcm（lcm_block_size）", "why": "不同 KV cache group 可有不同 block_size；尚不支持部分块命中，故命中长度必须是各 block_size 的公倍数，才能保证对每个类型都落在整块边界。", "evidence": "vllm/v1/core/kv_cache_coordinator.py:L471-L477"},
+    {"decision": "remove_skipped_blocks 在 allocate_slots 中先于 get_num_blocks_to_allocate 调用", "why": "先把窗外块换成 null 并归还 free queue，能在预算检查前增大可用块数，减少本次分配触发的驱逐数量；窗外块对后续注意力计算无用，提前释放不损正确性。", "evidence": "vllm/v1/core/kv_cache_manager.py:L356-L364"},
+    {"decision": "skipped 块用 null_block 占位而非从 req_to_blocks 删除", "why": "block table 是 append-only 设计，块下标即逻辑位置，删除会打乱后续块的逻辑偏移；换成共享 null_block 既释放真实显存又保持下标稳定，逆序释放且遇已 null 早停以幂等。", "evidence": "vllm/v1/core/single_type_kv_cache_manager.py:L418-L426"},
+    {"decision": "num_tokens_to_cache 封顶到 request.num_tokens", "why": "lookahead 草稿 token（投机解码）可能被拒，不能把未定稿 token 缓存进前缀缓存供他人命中，否则会污染缓存；故只缓存『已定稿』token。", "evidence": "vllm/v1/core/kv_cache_manager.py:L405-L414"},
+    {"decision": "SWA/chunked-local 引入 recycling-aware 准入上限 max_admission_blocks_per_request", "why": "这两类 spec 会跨 chunk 回收块（窗外块被 remove_skipped_blocks 归还），其每请求峰值真实持块数远小于 cdiv(全长)。准入用同一上界（spec 方法是唯一真相源，同时供启动池 sizer 与运行时准入），保证『启动能放下的请求运行时也能被准入』，避免 issue#39734 的死锁或 prefill 中途 OOM。", "evidence": "vllm/v1/core/single_type_kv_cache_manager.py:L120-L132, vllm/v1/kv_cache_interface.py:L431-L451"},
+    {"decision": "get_num_blocks_to_allocate 把可驱逐命中块计入预算", "why": "命中块若是 ref_cnt==0 的驱逐候选（在 free queue 中），touch 时会被移出 free queue 占用容量；不计入会高估可用块导致超分配。", "evidence": "vllm/v1/core/single_type_kv_cache_manager.py:L161-L167"},
+    {"decision": "external computed tokens（connector 缓存）在 allocate_new_computed_blocks 内单独分配真实块", "why": "external token 的 KV 由外部 connector 持有但 vLLM 侧需为其分配显存块来接收/承载；它们不是 vLLM 前缀缓存的命中块，故走 get_new_blocks 而非 touch。", "evidence": "vllm/v1/core/single_type_kv_cache_manager.py:L233-L240"}
+  ],
+  "theory": [
+    "不动点收敛性证明：定义候选命中长度 L（token 数）。每轮迭代中，每个注意力类型把 L 映射为 L' <= L（接受则 L'==L，缩短则 L'<L）。一轮内 L 单调不增，且任一类型的命中长度 >= 0。若某轮无任何类型缩短（curr_hit_length >= hit_length），到达不动点退出；否则 L 严格下降。L 取值在 {0, lcm_block_size, 2*lcm_block_size, ...} 的有限集合内，故至多 max_cache_hit_length / lcm_block_size 轮收敛。simple hybrid（1 full + 1 other，full 排首）下，full 给出上界后单个 other 类型至多缩短一次即定，故一轮足够。",
+    "复杂度：单组 Unitary 命中查找 O(max_num_blocks)（沿哈希链逐块 get_cached_block）。Hybrid 不动点最坏 O(轮数 * sum_类型(该类型单次查找)) ，轮数上界 max_cache_hit_length/lcm_block_size；实践中 full attn 早停 + simple hybrid 一轮使常见情形退化为线性。",
+    "三阶段分配的块数守恒：阶段一释放 num_skipped_blocks 个真实块（换 null），阶段三新建 num_required - len(req_blocks) 个；get_num_blocks_to_allocate 用 num_required - max(num_skipped_blocks, num_local_computed_blocks) + num_evictable 预测的正是阶段二/三将向 BlockPool 净申请的真实块数，故『预测 == 实际申请』，预算检查精确无近似。",
+    "SWA 准入上界推导：滑窗下每请求峰值真实持块 = cdiv(sliding_window-1 + 新调度 token, block_size) + 1（+1 因窗口可能不从块边界起）。sum(各请求上界) <= 池容量 <=> sum(峰值真实持块) <= 池，等价性依赖 remove_skipped_blocks 每 chunk 前运行使持块不超上界。"
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {"what": "kv_cache_manager.py 中 full_sequence_must_fit 准入闸分支（L335-L349）", "why_safe": "可选准入优化，只由 chunked prefill 防过度准入时启用；精简版默认 full_sequence_must_fit=False，删去该分支不改主路径分配正确性。但需在 allocate_slots 签名保留参数并在 must_keep 标注 apply_admission_cap 概念由 get_num_blocks_to_allocate 仍承载。"},
+      {"what": "所有 metrics_collector 相关调用（block_pool / manager 内 on_block_* 与构造参数）", "why_safe": "ch15 已删，纯观测埋点，不影响分配/命中/释放控制流。"},
+      {"what": "enable_kv_cache_events 与 KVCacheEvent 发布（BlockStored/BlockRemoved/AllBlocksCleared、take_events、kv_event_queue）", "why_safe": "ch15 已删，外部事件订阅用，与本章分配协调逻辑正交。"},
+      {"what": "Mamba 系列：MambaManager 的 align 模式（last_state_block_idx / _allocated_block_reqs / cached_blocks_this_step / num_speculative_blocks 分支）及其 get_num_blocks_to_allocate/allocate_new_blocks 重写", "why_safe": "本章聚焦 full/sliding-window/chunked-local 三类注意力的分配与协调；Mamba 状态空间模型的块语义自成体系，留作后续章节，删除不影响本章三类路径。须在精简版保留 MambaManager 类壳与 spec_manager_map 条目以保持映射完整，但内部 align 逻辑可删。"},
+      {"what": "CrossAttentionManager 的 encoder-decoder（Whisper）专用逻辑：cache_blocks 抛错、find_longest_cache_hit 抛 NotImplementedError、num_encoder_tokens 静态分配在 coordinator 的 CrossAttention 分支", "why_safe": "decoder-only 模型 num_encoder_tokens 恒 0，cross-attn 分支不触发；保留类壳与映射条目，删除其专用分配体即可，不影响 decoder-only 主路径。"},
+      {"what": "SinkFullAttentionManager（attention sink 预留块）", "why_safe": "FullAttentionManager 的特化（构造期摘 sink 块），仅 sink-attention 模型用；保留 spec_manager_map 条目，删 __init__ 内 sink 块摘取，不影响普通 full attn。"},
+      {"what": "dcp_world_size / pcp_world_size > 1 的并行扩展分支（block_size 翻倍、相关 assert）", "why_safe": "解码/预填上下文并行；默认均为 1，分支不触发，删去并固定为 1 不改单卡主路径。"},
+      {"what": "eagle/投机解码在 find_longest_cache_hit 中的分支（use_eagle、eagle_group_ids、eagle_verified、eagle_attn_group_indices、+block_size 的丢尾块）", "why_safe": "投机解码草稿头专用；非投机路径 use_eagle=False，分支不触发。但 num_lookahead_tokens 在 allocate_slots 主流程的预留语义须保留（见 must_keep），不可一并删。"},
+      {"what": "block_size != hash_block_size 的多块尺寸换算（_get_block_hashes 的 BlockHashListWithBlockSize 分支、cache_full_blocks 重算）", "why_safe": "ch15 已点为可省略；不同组不同块尺寸的罕见配置，常见情形 block_size==hash_block_size 直接走 block_hashes，删换算分支不影响等块尺寸主路径。"},
+      {"what": "log_stats / prefix_cache_stats 记录（get_computed_blocks 内 record、make_prefix_cache_stats）", "why_safe": "ch15 已删，纯统计。"}
+    ],
+    "must_keep": [
+      {"symbol": "allocate_slots", "why": "本章主骨架，三阶段编排入口，writer 全章围绕它展开。"},
+      {"symbol": "remove_skipped_blocks", "why": "阶段一释放 skipped 块的核心；本章新增深度相对 ch15。"},
+      {"symbol": "get_num_skipped_tokens", "why": "决定释放/跳过多少块，base=0、SWA、chunked-local 三态须可对比，是本章『各注意力类型差异』的落点。"},
+      {"symbol": "null_block", "why": "skipped 块占位符；解释 append-only block table 与显存释放并存的关键。"},
+      {"symbol": "allocate_new_computed_blocks", "why": "阶段二挂前缀命中 + external 命中块；本章须讲清 touch/null 填充/external 分配三步。"},
+      {"symbol": "num_external_computed_tokens", "why": "external（connector）命中 token，本章相对 ch15 新展开的分支入口。"},
+      {"symbol": "allocate_new_blocks", "why": "阶段三新建 new+lookahead 块。"},
+      {"symbol": "num_lookahead_tokens", "why": "投机解码草稿预留槽位，影响 num_tokens_need_slot；本章须讲清其与 num_tokens_to_cache 封顶的关系。"},
+      {"symbol": "get_num_blocks_to_allocate", "why": "预算检查核心；skipped 折抵 + 可驱逐块计数的精确预测是本章理论落点。"},
+      {"symbol": "num_required_blocks", "why": "需块数推算的基量。"},
+      {"symbol": "_max_admission_blocks_per_request", "why": "SWA/chunked-local recycling-aware 准入上限，本章设计决策关键。"},
+      {"symbol": "max_admission_blocks_per_request", "why": "spec 侧单一真相源方法，启动池 sizer 与运行时准入共用，须可检测。"},
+      {"symbol": "apply_admission_cap", "why": "准入上限开关参数，连接 spec 方法与运行时夹取。"},
+      {"symbol": "num_tokens_to_cache", "why": "封顶到 request.num_tokens 防草稿污染缓存，收尾决策。"},
+      {"symbol": "get_kv_cache_coordinator", "why": "三态工厂，本章协调层入口。"},
+      {"symbol": "KVCacheCoordinator", "why": "协调层抽象基类，逐组转发逻辑承载者。"},
+      {"symbol": "KVCacheCoordinatorNoPrefixCache", "why": "三态之一（关缓存退化），须与另两态对比。"},
+      {"symbol": "UnitaryKVCacheCoordinator", "why": "单一注意力类型协调器，最常见路径。"},
+      {"symbol": "HybridKVCacheCoordinator", "why": "混合注意力协调器，本章核心。"},
+      {"symbol": "find_longest_cache_hit", "why": "命中查找；Unitary 委托 vs Hybrid 不动点两种实现是本章对照主线。"},
+      {"symbol": "verify_and_split_kv_cache_groups", "why": "Hybrid 构造期按 spec 分桶、full attn 排首、算 lcm 的逻辑。"},
+      {"symbol": "attention_groups", "why": "分桶结果，不动点迭代遍历对象。"},
+      {"symbol": "lcm_block_size", "why": "命中长度对齐粒度，多块尺寸正确性关键。"},
+      {"symbol": "is_simple_hybrid", "why": "1 full + 1 other 的一轮早停优化，复杂度论述落点。"},
+      {"symbol": "single_type_managers", "why": "协调器持有的每组 manager 元组，逐组转发的对象。"},
+      {"symbol": "SingleTypeKVCacheManager", "why": "单类型块管理抽象基类。"},
+      {"symbol": "SlidingWindowManager", "why": "滑窗 manager，get_num_skipped_tokens 差异化的代表。"},
+      {"symbol": "ChunkedLocalAttentionManager", "why": "分块本地 manager，skipped 到 chunk 边界的代表。"},
+      {"symbol": "get_manager_for_kv_cache_spec", "why": "spec→manager 映射 + admission cap 注入。"},
+      {"symbol": "spec_manager_map", "why": "spec 类型到 manager 类的注册表，本章须展示完整映射以解释多注意力类型分发。"},
+      {"symbol": "req_to_blocks", "why": "每请求块表，三阶段读写对象（ch15 已引入，本章继续依赖，保留以保连贯）。"},
+      {"symbol": "num_cached_block", "why": "running 请求快路与 cache_blocks 增量判定依据。"},
+      {"symbol": "touch", "why": "命中块 ref_cnt+1 并出 free queue（ch15 已讲，本章阶段二复用，须保留可检测）。"}
+    ]
+  },
+  "diagram_plan": [
+    {"name": "01-allocate-slots-three-stages", "type": "flow/pipeline", "spec": "三阶段时间线泳道图：输入参数（num_new/num_new_computed/new_computed_blocks/num_external/num_lookahead）汇入；阶段一『释放 skipped + 预算检查（不足→return None 逃生）』；阶段二『touch 命中块 + null 填 skipped + external get_new_blocks』；阶段三『新建 new+lookahead 块』；收尾『num_tokens_to_cache 封顶 → cache_full_blocks』。横轴标出 req_to_blocks 的块布局演化（comp | new_comp | ext_comp | new | lookahead 对应文档 L262-L283 的 layout）。", "roadmap_highlight": "KVCacheManager.allocate_slots"},
+    {"name": "02-coordinator-three-states", "type": "decision-tree/architecture", "spec": "工厂决策树：get_kv_cache_coordinator →(!enable_caching)→ NoPrefixCache /(单组)→ Unitary /(多组)→ Hybrid。每态下方画其 single_type_managers 拓扑：Unitary=1 manager；Hybrid=多 manager 按 spec 分桶（full attn 桶排首 + sliding-window 桶 + ...）。标出 lcm_block_size 对齐粒度。", "roadmap_highlight": "KVCacheCoordinator"},
+    {"name": "03-fixed-point-iteration-trace", "type": "state-evolution-table", "spec": "不动点迭代逐轮追踪表：列=注意力类型（full / sliding window），行=迭代轮次；单元格记 curr_hit_length 的接受/缩短。示例：初值 max_cache_hit_length=512，第1轮 full 接受 512、SW 缩短到 384 → 长度变了重启；第2轮 full 截断到 384、SW 接受 384 → curr>=hit 收敛退出。底部标注单调递减 + 下界 0 = 收敛。配 simple-hybrid 一轮早停对照。", "roadmap_highlight": "HybridKVCacheCoordinator.find_longest_cache_hit"},
+    {"name": "04-skipped-blocks-recycle", "type": "before-after-blocks", "spec": "滑窗 skipped 块回收前后对比：sliding_window=8、block_size=4、num_computed=11。前：req_to_blocks=[B0,B1,B2]；get_num_skipped_tokens(11)=4 → num_skipped_blocks=1 → 逆序把 B0 换 null 并归还 free queue；后：[NULL,B1,B2]。标注 append-only 下标不变、真实显存释放。", "roadmap_highlight": "remove_skipped_blocks"}
+  ],
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recover": [],
+    "note": "bible.py due ch16 返回空（无应埋/应回收伏笔）。"
+  }
+}

@@ -14,9 +14,9 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch15',
-  slug: 'ch15-kv-cache',
-  focus: '分页 KV 缓存机制: BlockPool 与 KVCacheBlock、FreeKVCacheBlockQueue 双向链表 LRU、带 extra keys(多模态/LoRA/cache_salt) 的块哈希、BlockHashToBlockMap 去重、引用计数 touch/free、前缀缓存命中复用前缀块；回收 f7(CacheConfig.block_size/enable_prefix_caching 真正发挥作用)+f11(抢占请求重算靠前缀缓存命中缓解, 未驱逐前缀块直接复用)',
+  chapter_id: 'ch16',
+  slug: 'ch16-kv-cache',
+  focus: 'KV 块分配与多注意力协调: KVCacheManager.allocate_slots 三阶段(释放 skipped / 前缀命中+外部命中 / 新建+lookahead 预留)、KVCacheCoordinator(Unitary 单一 vs Hybrid 混合注意力类型协调)、cache-hit 的不动点迭代收敛。承接 ch15 块池/前缀缓存数据结构, 聚焦分配决策与多注意力协调, 不重复块池/LRU/哈希内部',
   highlight: 'kv-cache',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
@@ -183,12 +183,21 @@ if (reviewV && reviewV.verdict !== 'APPROVED') {
 
 // ---------- Phase F: Archive ----------
 phase('Archive')
-await agent(
-  head('archivist') +
-  '任务：写 ' + CH + '/reviews/review-report.json（overall_verdict=' + (reviewV ? reviewV.verdict : 'UNKNOWN') + '，附上述 issues）。\n' +
-  '回写 Book Bible：登记本章精简版新接口（`python3 ' + REPO + '/scripts/bible.py iface --add ' + A.chapter_id + " '<sig>'`)，确认已回收伏笔。\n" +
-  '在 ' + REPO + '/instances/vllm/trace/ 记 delivery 并更新 state.json。返回一句话状态。',
-  { label: 'archive', phase: 'Archive', agentType: 'general-purpose' }
-)
+// 完整 review 对象注入提示词 → review-report.json 忠实落盘(含 verdict 与全部 issues)，
+// 不让 archivist 凭记忆重建出有损版本。
+const reviewJson = JSON.stringify(reviewV || { overall_verdict: 'UNKNOWN', issues: [] })
+const archiveTask = head('archivist') +
+  '任务一(务必先做)：把下面这个完整 review 对象**原样**写入 ' + CH + '/reviews/review-report.json（保留 verdict 与全部 issues，不要删改、不要自己重写摘要）：\n' +
+  reviewJson + '\n' +
+  '任务二：回写 Book Bible —— 登记本章精简版新接口（`python3 ' + REPO + '/scripts/bible.py iface --add ' + A.chapter_id + " '<sig>'`)，确认已回收伏笔。\n" +
+  '任务三：在 ' + REPO + '/instances/vllm/trace/ 记 delivery 并更新 state.json。返回一句话状态。'
+let archV = null
+for (let a = 1; a <= 2 && !archV; a++) {
+  if (a > 1) log('archive 上轮中断(API崩)，第 ' + a + ' 轮重试：已写的(review-report.json/bible 接口/trace)校验后跳过，只补未完成的')
+  archV = await agent(
+    archiveTask + (a > 1 ? '\n注意：这是重试。先检查 review-report.json 是否已存在且为合法完整 JSON、bible 是否已登记本章接口，已做的别重复，只补未完成的。' : ''),
+    { label: 'archive r' + a, phase: 'Archive', agentType: 'general-purpose' }
+  )
+}
 
 return { chapter: A.chapter_id, test: testV, review: reviewV }
