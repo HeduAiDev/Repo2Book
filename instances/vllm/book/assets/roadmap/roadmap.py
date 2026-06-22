@@ -14,18 +14,28 @@ def esc(s):
 
 
 # (highlight-key, 标题, 副标题) — 请求生命周期主线
+# ⚠️ 键名即语义：每个键对应它所高亮的那个框。调度器(ch13/14)并入「EngineCore 循环」
+#    框，故用 'engine-core'；IPC 章(ch07)用 'ipc'。（历史上 engine-core/scheduler 两键
+#    与标签错位、坑过 ch12，已理顺：键名与框语义一一对应。）
 STAGES = [
     ("entrypoints", "入口", "LLM.generate / OpenAI server"),
     ("input-processor", "Stage 1 输入", "tokenize → EngineCoreRequest"),
     ("async-engine", "AsyncLLM 解耦", "三段式 / output_handler"),
-    ("engine-core", "IPC 边界", "ZMQ + msgpack 跨进程"),
-    ("scheduler", "EngineCore 循环", "schedule → execute → sample"),
+    ("ipc", "IPC 边界", "ZMQ + msgpack 跨进程"),
+    ("engine-core", "EngineCore 循环", "schedule → execute → sample"),
     ("output-processor", "Stage 3 输出", "detokenize → RequestOutput"),
     ("stream", "流式返回", "SSE / generate() 产出"),
 ]
 
 
 def build(highlight: str) -> str:
+    keys = [k for k, _, _ in STAGES]
+    if highlight and highlight not in keys:
+        raise SystemExit(
+            f"未知 --highlight {highlight!r}。可用键: {', '.join(keys)}。"
+            "（调度器/EngineCore 循环类章节用 'engine-core'；IPC 章用 'ipc'。"
+            "off-spine 子系统暂用 '' 不高亮，待分层 roadmap 落地。）"
+        )
     bw, bh, gap, x0, y0 = 168, 72, 38, 30, 92
     w = x0 * 2 + len(STAGES) * bw + (len(STAGES) - 1) * gap
     h = 200
