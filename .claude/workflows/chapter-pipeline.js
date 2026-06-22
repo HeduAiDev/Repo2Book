@@ -14,9 +14,9 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch13',
-  slug: 'ch13-scheduler',
-  focus: 'Token 为中心的连续批处理: schedule() 不分 prefill/decode 相、RUNNING 优先、max_num_scheduled_tokens 预算分配、SchedulerOutput(NewRequestData 首次 vs CachedRequestData 持久增量)、AsyncScheduler vs Scheduler 的差异；回收 f6(async_scheduling 推导出的实例如何驱动连续批处理)+f10(schedule() 每拍推哪些请求/多少 token)',
+  chapter_id: 'ch14',
+  slug: 'ch14-scheduler',
+  focus: '抢占与请求生命周期回流: 分配失败时的抢占循环(LIFO 抢占 RUNNING 末尾、KV 释放、回 waiting)、waiting/skipped 双队列避免队头阻塞、update_from_output(追加 token + 停止检测 stop string/EOS + 请求完成态迁移 + spec 回退)。承接 ch13 的 schedule(), 聚焦其未展开的抢占/回流分支, 不重复 token 预算主线',
   highlight: 'engine-core',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',

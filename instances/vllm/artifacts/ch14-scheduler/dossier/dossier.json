@@ -1,0 +1,261 @@
+{
+  "chapter": "ch14",
+  "title": "抢占与请求生命周期回流",
+  "scope_note": "本章承接 ch13《schedule() 主线 + token 预算》，聚焦 ch13 未展开的两条分支：(1) RUNNING 阶段 allocate_slots 失败时的抢占循环（LIFO 抢占、KV 释放、回 waiting），(2) update_from_output 中追加 token / 停止检测 / 完成态迁移 / spec 回退的请求生命周期回流细节。以及支撑这两条分支的 waiting/skipped_waiting 双队列（避免队头阻塞）。token 预算主线、SchedulerOutput 增量/全量组装由 ch13 负责，本章不重复。",
+  "scope_caveat_stop_string": "章节标题中的“stop string”需要澄清：在 vLLM v1 中，scheduler 侧的 check_stop()(vllm/v1/core/sched/utils.py:L94) 只判定 EOS / stop_token_ids（整型 token id）/ 长度上限 / 重复检测——它不处理字符串级 stop。真正的 stop **string** 子串匹配发生在前端 detokenizer 的 check_stop_strings()(vllm/v1/engine/detokenizer.py:L304)，那是增量去 token 化后在文本空间做的，已由 Part II 的 ch09《增量去 token 化与 stop string》覆盖。本章正文应明确区分这两处，writer 不可把 stop string 子串匹配画进 scheduler——会杜撰 vLLM 没有的逻辑。本章 update_from_output 中讲的是 stop_token_ids/EOS/length/repetition 这一类 token 级停止。",
+  "code_spine": [
+    "vllm/v1/core/sched/scheduler.py:L464-L514  —— RUNNING 阶段核心：allocate_slots 失败进入 while True 抢占循环；FCFS 用 self.running.pop()（LIFO 抢最后一个），PRIORITY 用 max(running) 抢优先级最低/最晚到达者",
+    "vllm/v1/core/sched/scheduler.py:L508-L514  —— 抢占终止条件：preempted_req == request（把自己都抢了仍分不到）则 break；new_blocks is None 则跳出整个 RUNNING 循环",
+    "vllm/v1/core/sched/scheduler.py:L952-L972  —— _preempt_request()：free KV + free encoder cache + status→PREEMPTED + num_computed_tokens 清零 + 清 spec_token_ids + num_preemptions++ + waiting.prepend_request 回队头",
+    "vllm/v1/core/sched/scheduler.py:L567-L573  —— WAITING 阶段入口守卫：仅当 not preempted_reqs（本拍发生过抢占就不再放新请求进来）且 UNPAUSED 才调度 waiting；max_num_running_reqs 上限",
+    "vllm/v1/core/sched/scheduler.py:L569-L592  —— 双队列遍历：step_skipped_waiting 临时队列 + _select_waiting_queue_for_scheduling 选 waiting/skipped_waiting；阻塞态请求 _try_promote 失败则 pop 出来 prepend 进 step_skipped_waiting（跳过而非卡住后面的请求）",
+    "vllm/v1/core/sched/scheduler.py:L844-L846  —— step 末把本拍跳过的请求 prepend 回 self.skipped_waiting（插到更老的 skipped 之前）",
+    "vllm/v1/core/sched/scheduler.py:L807-L817  —— WAITING 成功调度：append 进 running；status==WAITING→scheduled_new_reqs，status==PREEMPTED→scheduled_resumed_reqs（这就是抢占请求“回流”后被重新拉起的落点）",
+    "vllm/v1/core/sched/scheduler.py:L1561-L1577  —— _enqueue_waiting_request / _select_waiting_queue_for_scheduling / _is_blocked_waiting_status：双队列的归类与选择策略（FCFS skipped 优先；PRIORITY 比队头）",
+    "vllm/v1/core/sched/scheduler.py:L2061-L2092  —— _try_promote_blocked_waiting_request()：把 WAITING_FOR_REMOTE_KVS / WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR 等阻塞态在条件满足时提升回 WAITING/PREEMPTED",
+    "vllm/v1/core/sched/scheduler.py:L1331-L1433  —— update_from_output 主循环：spec 回退（num_rejected 调整 num_computed_tokens / num_output_placeholders）、_update_request_with_output 追加 token + check_stop、stopped 时分流 stopped_running_reqs / stopped_preempted_reqs",
+    "vllm/v1/core/sched/scheduler.py:L1420-L1481  —— stopped 处理：get_finished_reason 抓取（在状态被改回 WAITING 前）→ _handle_stopped_request → 真完成则 _free_request；末尾用 remove_all 从 running、remove_requests 从 waiting 批量摘除已停请求",
+    "vllm/v1/core/sched/scheduler.py:L1622-L1638  —— _update_request_with_output()：逐 token append_output_token_ids + check_stop，命中则 del 截断 new_token_ids",
+    "vllm/v1/core/sched/utils.py:L94-L130  —— check_stop()：min_tokens 门槛 → EOS → stop_token_ids → max_model_len/max_tokens 长度封顶 → repetition；分别置 FINISHED_STOPPED / FINISHED_LENGTH_CAPPED / FINISHED_REPETITION",
+    "vllm/v1/core/sched/scheduler.py:L1579-L1595  —— _handle_stopped_request()：resumable（streaming-input 会话）请求并非真完成——可能从 streaming_queue 取下一段，或转 WAITING_FOR_STREAMING_REQ 重新入队；返回 True 才是真 finish",
+    "vllm/v1/core/sched/scheduler.py:L1813-L1834  —— _free_request / _free_blocks：connector 收尾 + encoder cache free + finished_req_ids 登记 + KV 块释放 + 从 self.requests 删除",
+    "vllm/v1/request.py:L310-L352  —— RequestStatus 枚举 + is_finished（> PREEMPTED 即 finished）+ _FINISHED_REASON_MAP；理解状态机迁移的真相源",
+    "vllm/v1/core/sched/async_scheduler.py:L37-L60  —— AsyncScheduler._update_request_with_output：num_output_placeholders 随实际 token 回扣、discard_latest_async_tokens 处理强制抢占下的异步 token 丢弃"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L464-L514",
+      "what": "RUNNING 阶段的抢占循环（本章绝对核心）。当 allocate_slots 为当前 request 分不出 KV 块时，进入 while True 抢占其他 RUNNING 请求腾空间。",
+      "code": "            # Schedule newly needed KV blocks for the request.\n            with record_function_or_nullcontext(\"schedule: allocate_slots\"):\n                while True:\n                    new_blocks = self.kv_cache_manager.allocate_slots(\n                        request,\n                        num_new_tokens,\n                        num_lookahead_tokens=self.num_lookahead_tokens,\n                    )\n\n                    if new_blocks is not None:\n                        # The request can be scheduled.\n                        break\n\n                    # The request cannot be scheduled.\n                    # Preempt the lowest-priority request.\n                    if self.policy == SchedulingPolicy.PRIORITY:\n                        preempted_req = max(\n                            self.running,\n                            key=lambda r: (r.priority, r.arrival_time),\n                        )\n                        self.running.remove(preempted_req)\n                        if preempted_req in scheduled_running_reqs:\n                            preempted_req_id = preempted_req.request_id\n                            scheduled_running_reqs.remove(preempted_req)\n                            token_budget += num_scheduled_tokens.pop(preempted_req_id)\n                            req_to_new_blocks.pop(preempted_req_id)\n                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)\n                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(\n                                preempted_req_id, None\n                            )\n                            if preempted_encoder_inputs:\n                                ...  # 省略：归还 encoder compute 预算\n                                req_index -= 1\n                    else:\n                        preempted_req = self.running.pop()\n\n                    self._preempt_request(preempted_req, scheduled_timestamp)\n                    preempted_reqs.append(preempted_req)\n                    if preempted_req == request:\n                        # No more request to preempt. Cannot schedule this request.\n                        break\n\n            if new_blocks is None:\n                # Cannot schedule this request.\n                break",
+      "elide": [
+        "L494-L501 的 encoder compute 预算归还分支（preempted_req 本拍已被调度过 encoder input 时回退 encoder_compute_budget）——与抢占主逻辑正交，可在正文一句话带过",
+        "record_function_or_nullcontext 是 profiling 上下文管理器，无功能影响"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L952-L972",
+      "what": "_preempt_request：抢占的实际副作用——释放被抢者的 KV/encoder 资源、状态回退、重置已算 token、清 spec、计数、回 waiting 队头。这是“回流”的关键一步。",
+      "code": "    def _preempt_request(self, request: Request, timestamp: float) -> None:\n        \"\"\"Preempt a request and put it back to the waiting queue.\n\n        NOTE: The request should be popped from the running queue outside of this\n        method.\n        \"\"\"\n        assert request.status == RequestStatus.RUNNING, (\n            \"Only running requests can be preempted\"\n        )\n        self.kv_cache_manager.free(request)\n        self.encoder_cache_manager.free(request)\n        request.status = RequestStatus.PREEMPTED\n        request.num_computed_tokens = 0\n        if request.spec_token_ids:\n            request.spec_token_ids = []\n        request.num_preemptions += 1\n        if self.log_stats:\n            request.record_event(EngineCoreEventType.PREEMPTED, timestamp)\n\n        # Put the request back to the waiting queue.\n        self.waiting.prepend_request(request)",
+      "elide": [
+        "log_stats 分支只记录事件，可省略"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L567-L592",
+      "what": "WAITING 阶段入口 + 双队列防队头阻塞。关键点：本拍若发生过抢占（preempted_reqs 非空）就完全跳过 WAITING——抢占说明已经缺内存，没必要再放新请求进来。step_skipped_waiting 收集本拍被跳过的请求，避免一个阻塞态请求卡死整条 waiting 队列。",
+      "code": "        # Next, schedule the WAITING requests.\n        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:\n            step_skipped_waiting = create_request_queue(self.policy)\n\n            while (self.waiting or self.skipped_waiting) and token_budget > 0:\n                if len(self.running) == self.max_num_running_reqs:\n                    break\n\n                request_queue = self._select_waiting_queue_for_scheduling()\n                assert request_queue is not None\n\n                request = request_queue.peek_request()\n                request_id = request.request_id\n\n                # try to promote blocked statuses while traversing skipped queue.\n                if self._is_blocked_waiting_status(\n                    request.status\n                ) and not self._try_promote_blocked_waiting_request(request):\n                    if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:\n                        logger.debug(\n                            \"%s is still in WAITING_FOR_REMOTE_KVS state.\",\n                            request_id,\n                        )\n                    request_queue.pop_request()\n                    step_skipped_waiting.prepend_request(request)\n                    continue",
+      "elide": [
+        "logger.debug 仅日志"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L807-L817",
+      "what": "WAITING 请求成功调度后的落点：进 running，并按来时状态分流——WAITING 是首次（new），PREEMPTED 是被抢占后回流又拉起（resumed）。这把抢占的“回流”闭环画完整。",
+      "code": "                self.running.append(request)\n                if self.log_stats:\n                    request.record_event(\n                        EngineCoreEventType.SCHEDULED, scheduled_timestamp\n                    )\n                if request.status == RequestStatus.WAITING:\n                    scheduled_new_reqs.append(request)\n                elif request.status == RequestStatus.PREEMPTED:\n                    scheduled_resumed_reqs.append(request)\n                else:\n                    raise RuntimeError(f\"Invalid request status: {request.status}\")",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L844-L846",
+      "what": "step 收尾：把本拍跳过的请求整体 prepend 回持久 skipped_waiting 队列，插在更老的 skipped 项之前，保证下拍优先重试。",
+      "code": "            # re-queue requests skipped in this pass ahead of older skipped items.\n            if step_skipped_waiting:\n                self.skipped_waiting.prepend_requests(step_skipped_waiting)",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1561-L1577",
+      "what": "双队列归类与选择策略。阻塞态（等远程 KV / 等 grammar / 等流式输入）进 skipped_waiting，可调度态进 waiting。FCFS 下 skipped 优先；PRIORITY 下比较两队队头。",
+      "code": "    @staticmethod\n    def _is_blocked_waiting_status(status: RequestStatus) -> bool:\n        return status in (\n            RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,\n            RequestStatus.WAITING_FOR_REMOTE_KVS,\n            RequestStatus.WAITING_FOR_STREAMING_REQ,\n        )\n\n    def _enqueue_waiting_request(self, request: Request) -> None:\n        if self._is_blocked_waiting_status(request.status):\n            self.skipped_waiting.add_request(request)\n        else:\n            self.waiting.add_request(request)\n\n    def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:\n        if self.policy == SchedulingPolicy.FCFS:\n            return self.skipped_waiting or self.waiting or None\n\n        # PRIORITY mode: compare queue heads when both queues are non-empty.\n        if self.waiting and self.skipped_waiting:\n            waiting_req = self.waiting.peek_request()\n            skipped_req = self.skipped_waiting.peek_request()\n            return self.waiting if waiting_req < skipped_req else self.skipped_waiting\n\n        return self.waiting or self.skipped_waiting or None",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1331-L1433",
+      "what": "update_from_output 的请求生命周期回流：spec 回退（拒绝的草稿 token 回扣 num_computed_tokens / num_output_placeholders）、追加 token + 停止检测、停止时分流到 stopped_running / stopped_preempted。这是 ch13 update_from_output 留给本章展开的细节区。",
+      "code": "        stopped_running_reqs: set[Request] = set()\n        stopped_preempted_reqs: set[Request] = set()\n        for req_id, num_tokens_scheduled in num_scheduled_tokens.items():\n            ...  # 省略：跳过已 finished/aborted 请求、取 req_index 与 generated_token_ids\n            scheduled_spec_token_ids = (\n                scheduler_output.scheduled_spec_decode_tokens.get(req_id)\n            )\n            if scheduled_spec_token_ids and generated_token_ids:\n                num_draft_tokens = len(scheduled_spec_token_ids)\n                num_accepted = len(generated_token_ids) - 1\n                num_rejected = num_draft_tokens - num_accepted\n                # ... num_computed_tokens 减去被拒绝的草稿 token 数\n                if request.num_computed_tokens > 0:\n                    request.num_computed_tokens -= num_rejected\n                if request.num_output_placeholders > 0:\n                    request.num_output_placeholders -= num_rejected\n                ...  # 省略：make_spec_decoding_stats 统计\n\n            ...  # 省略：encoder input free\n\n            stopped = False\n            new_token_ids = generated_token_ids\n            status_before_stop = request.status\n\n            # Check for stop and update request status.\n            if new_token_ids:\n                new_token_ids, stopped = self._update_request_with_output(\n                    request, new_token_ids\n                )\n            elif request.pooling_params and pooler_output is not None:\n                request.status = RequestStatus.FINISHED_STOPPED\n                stopped = True\n\n            ...  # 省略：structured output grammar.accept_tokens 失败则 FINISHED_ERROR\n\n            finish_reason = None\n            if stopped:\n                routed_experts = self._get_routed_experts(request)\n                # Capture finish_reason BEFORE _handle_stopped_request, which may\n                # reset the status to WAITING for streaming requests that continue.\n                finish_reason = request.get_finished_reason()\n                finished = self._handle_stopped_request(request)\n                if finished:\n                    kv_transfer_params = self._free_request(request)\n\n                if status_before_stop == RequestStatus.RUNNING:\n                    stopped_running_reqs.add(request)\n                else:\n                    stopped_preempted_reqs.add(request)",
+      "elide": [
+        "L1335-L1352 跳过 failed_kv_load / 已 finished 请求、取 generated_token_ids 的样板",
+        "L1372-L1378 make_spec_decoding_stats 统计聚合",
+        "L1380-L1382 _free_encoder_inputs",
+        "L1401-L1416 structured output grammar 校验（与 stop 回流正交，可一句带过）",
+        "L1435-L1474 logprobs 切片与 EngineCoreOutput 组装（输出装配由 Part II 覆盖）"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1476-L1481",
+      "what": "停止请求的批量摘除：已停的 RUNNING 请求从 running 摘除，已停的 PREEMPTED（仍在 waiting）请求从 waiting 摘除。对应前面 status_before_stop 的分流。",
+      "code": "        # Remove the stopped requests from the running and waiting queues.\n        if stopped_running_reqs:\n            self.running = remove_all(self.running, stopped_running_reqs)\n        if stopped_preempted_reqs:\n            # This is a rare case and unlikely to impact performance.\n            self.waiting.remove_requests(stopped_preempted_reqs)",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1622-L1638",
+      "what": "_update_request_with_output：逐个 append 输出 token、每个 token 后 check_stop，命中停止则截断 new_token_ids（停止 token 之后的不再返回）。",
+      "code": "    def _update_request_with_output(\n        self, request: Request, new_token_ids: list[int]\n    ) -> tuple[list[int], bool]:\n        # Append generated tokens and check for stop. Note that if\n        # a request is still being prefilled, we expect the model runner\n        # to return empty token ids for the request.\n        stopped = False\n        for num_new, output_token_id in enumerate(new_token_ids, 1):\n            request.append_output_token_ids(output_token_id)\n\n            # Check for stop and update request state.\n            # This must be called before we make the EngineCoreOutput.\n            stopped = check_stop(request, self.max_model_len)\n            if stopped:\n                del new_token_ids[num_new:]  # Trim new tokens if needed.\n                break\n        return new_token_ids, stopped",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/core/sched/utils.py",
+      "lines": "L94-L130",
+      "what": "check_stop：scheduler 侧的 token 级停止判定。注意——这里是 stop_token_ids（整型 id）不是 stop string（字符串子串，那在 detokenizer）。优先级：min_tokens 门槛 → EOS → stop_token_ids → 长度封顶 → 重复检测。",
+      "code": "def check_stop(request: Request, max_model_len: int) -> bool:\n    assert not request.pooling_params\n\n    sampling_params = request.sampling_params\n    assert sampling_params is not None\n\n    if request.num_output_tokens < sampling_params.min_tokens:\n        return False\n\n    last_token_id = request.output_token_ids[-1]\n    if last_token_id == sampling_params.eos_token_id:\n        request.status = RequestStatus.FINISHED_STOPPED\n        return True\n\n    if last_token_id in (sampling_params.stop_token_ids or ()):\n        request.status = RequestStatus.FINISHED_STOPPED\n        request.stop_reason = last_token_id\n        return True\n    if (\n        request.num_tokens >= max_model_len\n        or request.num_output_tokens >= request.max_tokens\n    ):\n        request.status = RequestStatus.FINISHED_LENGTH_CAPPED\n        return True\n\n    repetition_detection = sampling_params.repetition_detection\n    if repetition_detection is not None and (\n        check_sequence_repetition(\n            request.output_token_ids,\n            repetition_detection,\n        )\n    ):\n        request.status = RequestStatus.FINISHED_REPETITION\n        request.stop_reason = \"repetition_detected\"\n        return True\n\n    return False",
+      "elide": [
+        "check_sequence_repetition 的具体模式匹配算法（utils.py:L10-L59）属重复检测细节，正文可一句话带过，不必逐字内嵌"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1579-L1595",
+      "what": "_handle_stopped_request：并非所有 stopped 都真完成。resumable（streaming-input 多轮会话）请求可能只是一段输入算完——从 streaming_queue 取下一段继续，或转 WAITING_FOR_STREAMING_REQ 重新入队等待后续输入。返回 True 才是真 finish。",
+      "code": "    def _handle_stopped_request(self, request: Request) -> bool:\n        \"\"\"Return True if finished (can be False for resumable requests).\"\"\"\n        if not request.resumable:\n            return True\n\n        if request.streaming_queue:\n            update = request.streaming_queue.popleft()\n            if update is None:\n                # Streaming request finished.\n                return True\n            self._update_request_as_session(request, update)\n        else:\n            request.status = RequestStatus.WAITING_FOR_STREAMING_REQ\n            self.num_waiting_for_streaming_input += 1\n\n        self._enqueue_waiting_request(request)\n        return False",
+      "elide": [
+        "_update_request_as_session 的会话续接细节（L1000+）属流式输入特性，正文点到即可"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1813-L1834",
+      "what": "_free_request / _free_blocks：真完成的请求的资源回收闭环——connector 收尾、encoder cache free、登记 finished_req_ids（下拍 SchedulerOutput 通知 worker 释放缓存）、KV 块释放、从 self.requests 字典删除。",
+      "code": "    def _free_request(\n        self, request: Request, delay_free_blocks: bool = False\n    ) -> dict[str, Any] | None:\n        assert request.is_finished()\n\n        connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)\n        self.encoder_cache_manager.free(request)\n        request_id = request.request_id\n        self.finished_req_ids.add(request_id)\n        if self.finished_req_ids_dict is not None:\n            self.finished_req_ids_dict[request.client_index].add(request_id)\n\n        delay_free_blocks |= connector_delay_free_blocks\n        if not delay_free_blocks:\n            self._free_blocks(request)\n\n        return kv_xfer_params\n\n    def _free_blocks(self, request: Request):\n        assert request.is_finished()\n        self.kv_cache_manager.free(request)\n        del self.requests[request.request_id]",
+      "elide": [
+        "delay_free_blocks 分支服务于异步 KV 传输（连接器还在用块）的延迟释放，正文一句话说明即可"
+      ]
+    },
+    {
+      "path": "vllm/v1/request.py",
+      "lines": "L310-L352",
+      "what": "RequestStatus 状态机真相源。关键设计：IntEnum 顺序排布，is_finished 直接用 status > PREEMPTED 判定（PREEMPTED 之后全是 finished 态）。_FINISHED_REASON_MAP 把状态映射为对外 FinishReason。",
+      "code": "class RequestStatus(enum.IntEnum):\n    \"\"\"Status of a request.\"\"\"\n\n    WAITING = enum.auto()\n    WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR = enum.auto()\n    WAITING_FOR_REMOTE_KVS = enum.auto()\n    WAITING_FOR_STREAMING_REQ = enum.auto()\n    RUNNING = enum.auto()\n    PREEMPTED = enum.auto()\n    # Note: anything after PREEMPTED will be considered\n    # as a finished status.\n    FINISHED_STOPPED = enum.auto()\n    FINISHED_LENGTH_CAPPED = enum.auto()\n    FINISHED_ABORTED = enum.auto()\n    FINISHED_IGNORED = enum.auto()\n    FINISHED_ERROR = enum.auto()\n    FINISHED_REPETITION = enum.auto()\n\n    @staticmethod\n    def is_finished(status: \"RequestStatus\") -> bool:\n        return status > RequestStatus.PREEMPTED\n\n    @staticmethod\n    def get_finished_reason(status: \"RequestStatus\") -> FinishReason | None:\n        return _FINISHED_REASON_MAP.get(status)\n\n\n_FINISHED_REASON_MAP = {\n    RequestStatus.FINISHED_STOPPED: FinishReason.STOP,\n    RequestStatus.FINISHED_LENGTH_CAPPED: FinishReason.LENGTH,\n    RequestStatus.FINISHED_ABORTED: FinishReason.ABORT,\n    RequestStatus.FINISHED_IGNORED: FinishReason.LENGTH,\n    RequestStatus.FINISHED_ERROR: FinishReason.ERROR,\n    RequestStatus.WAITING_FOR_STREAMING_REQ: FinishReason.STOP,\n    RequestStatus.FINISHED_REPETITION: FinishReason.REPETITION,\n}",
+      "elide": [
+        "__str__ 方法"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/async_scheduler.py",
+      "lines": "L37-L60",
+      "what": "AsyncScheduler 覆写 _update_request_with_output：异步调度下 num_output_placeholders 随实际 token 回扣；强制抢占（reset_prefix_cache）时 discard_latest_async_tokens 丢弃在途异步 token；只有 RUNNING（非被抢占）请求才 cache_blocks。补充 ch14 spec 回退在异步语境的占位簿记。",
+      "code": "    def _update_request_with_output(\n        self, request: Request, new_token_ids: list[int]\n    ) -> tuple[list[int], bool]:\n        if request.discard_latest_async_tokens:\n            # If the request is force preempted in reset_prefix_cache, we\n            # should discard the latest async token.\n            request.discard_latest_async_tokens = False\n            return [], False\n\n        status_before_update = request.status\n        new_token_ids, stopped = super()._update_request_with_output(\n            request, new_token_ids\n        )\n\n        # Update the number of output placeholders.\n        request.num_output_placeholders -= len(new_token_ids)\n        assert request.num_output_placeholders >= 0\n\n        # Cache the new tokens. Preempted requests should be skipped.\n        if status_before_update == RequestStatus.RUNNING:\n            self.kv_cache_manager.cache_blocks(\n                request, request.num_computed_tokens - request.num_output_placeholders\n            )\n        return new_token_ids, stopped",
+      "elide": []
+    }
+  ],
+  "key_classes": [
+    {"name": "Scheduler", "file": "vllm/v1/core/sched/scheduler.py", "responsibility": "持有 running/waiting/skipped_waiting 三队列；schedule() 内嵌抢占循环；_preempt_request 执行抢占副作用；update_from_output 驱动请求生命周期回流（追加 token/停止/完成/spec 回退）"},
+    {"name": "AsyncScheduler", "file": "vllm/v1/core/sched/async_scheduler.py", "responsibility": "Scheduler 子类；覆写 _update_request_with_output 处理 num_output_placeholders 回扣与强制抢占下的异步 token 丢弃；spec 占位簿记"},
+    {"name": "RequestStatus", "file": "vllm/v1/request.py", "responsibility": "IntEnum 请求状态机；WAITING/RUNNING/PREEMPTED + 6 个 FINISHED_* 态；is_finished 用 > PREEMPTED 判定"},
+    {"name": "FCFSRequestQueue / PriorityRequestQueue", "file": "vllm/v1/core/sched/request_queue.py", "responsibility": "队列抽象。FCFS 是 deque，prepend_request=appendleft（抢占回队头、skipped 重排靠它）；PRIORITY 是 heap，prepend 退化为按 (priority, arrival_time) 入堆"},
+    {"name": "SchedulerOutput", "file": "vllm/v1/core/sched/output.py", "responsibility": "本章相关字段：preempted_req_ids（本拍被抢占的请求集，给 v2 model runner）、finished_req_ids（通知 worker 释放）"}
+  ],
+  "data_flow": [
+    "1. schedule() RUNNING 阶段：scheduler.py:schedule — 遍历 self.running，对每个请求算 num_new_tokens 后 allocate_slots",
+    "2. 分配失败 → 抢占循环：scheduler.py:schedule(L466-510) — FCFS self.running.pop()（LIFO 抢末尾），PRIORITY max(running) 抢最低优先级",
+    "3. 抢占副作用：scheduler.py:_preempt_request — free KV+encoder、status→PREEMPTED、num_computed_tokens=0、清 spec、num_preemptions++、waiting.prepend_request 回队头",
+    "4. 终止判定：scheduler.py:schedule(L508) — preempted_req==request 说明无可抢者，break；外层 new_blocks is None 再 break 退出 RUNNING 循环",
+    "5. WAITING 阶段守卫：scheduler.py:schedule(L568) — not preempted_reqs（本拍抢占过就不放新请求）且 UNPAUSED",
+    "6. 双队列遍历：scheduler.py:_select_waiting_queue_for_scheduling — 选 waiting/skipped；阻塞态 _try_promote 失败 → pop 出来 prepend 进 step_skipped_waiting（跳过不阻塞后续）",
+    "7. 抢占请求重新拉起：scheduler.py:schedule(L807-816) — status==PREEMPTED → scheduled_resumed_reqs（回流闭环）",
+    "8. step 末：scheduler.py:schedule(L845) — step_skipped_waiting prepend 回 self.skipped_waiting",
+    "9. forward 后 update_from_output：scheduler.py:update_from_output — 逐请求 spec 回退调整 num_computed_tokens",
+    "10. 追加 token + 停止检测：scheduler.py:_update_request_with_output → utils.py:check_stop（EOS/stop_token_ids/length/repetition）",
+    "11. 停止分流：scheduler.py:update_from_output(L1430) — RUNNING→stopped_running_reqs，PREEMPTED→stopped_preempted_reqs",
+    "12. 完成态迁移：scheduler.py:_handle_stopped_request（resumable 可回 WAITING）→ 真完成则 _free_request → _free_blocks 释放 KV + 删 self.requests",
+    "13. 批量摘除：scheduler.py:update_from_output(L1477) — remove_all 从 running、remove_requests 从 waiting"
+  ],
+  "design_decisions": [
+    {"decision": "FCFS 抢占采用 LIFO（self.running.pop() 抢 RUNNING 末尾）", "why": "running 列表按调度/到达顺序排列，末尾是最晚加入/进度最新的请求；抢它能最小化对老请求公平性的破坏，且被抢者重算成本相对可控。抢占即整体重算（num_computed_tokens 清零），不做 KV swap-out。", "evidence": "vllm/v1/core/sched/scheduler.py:L504; L964"},
+    {"decision": "抢占是“丢弃重算”而非“换出换入”——直接 free KV、num_computed_tokens=0", "why": "v1 不实现 KV cache swap to CPU；被抢请求的 KV 块直接归还块池，回 waiting 后从 0 重新 prefill（可借前缀缓存命中加速）。简化内存管理、避免 swap I/O。", "evidence": "vllm/v1/core/sched/scheduler.py:L961-L964"},
+    {"decision": "被抢请求 prepend 到 waiting 队头（FCFS appendleft）", "why": "被抢者本是 RUNNING 进度领先者，回队头能在下拍内存富余时优先恢复，减少抖动；PRIORITY 模式退化为按 (priority, arrival_time) 入堆，保持优先级序。", "evidence": "vllm/v1/core/sched/scheduler.py:L972; request_queue.py:L92-L94, L160-L165"},
+    {"decision": "本拍发生过抢占就完全跳过 WAITING 调度（not preempted_reqs 守卫）", "why": "抢占本身就是内存不足的信号，此时再尝试放入新 WAITING 请求几乎必然又触发抢占，徒增抖动。直接跳过，把本拍交给已恢复的 RUNNING。", "evidence": "vllm/v1/core/sched/scheduler.py:L568"},
+    {"decision": "waiting / skipped_waiting 双队列分离，避免队头阻塞", "why": "等远程 KV / 等 grammar / 等流式输入的阻塞态请求若留在 waiting 队头，会卡住后面本可调度的请求（队头阻塞）。把它们分流到 skipped_waiting，遍历时 _try_promote 失败就跳过，让后续请求得以调度。", "evidence": "vllm/v1/core/sched/scheduler.py:L1554-L1565; L581-L592"},
+    {"decision": "step_skipped_waiting 临时队列 + prepend_requests 重排", "why": "本拍跳过的请求收集到临时队列，step 末整体 prepend 回持久 skipped_waiting，插在更老 skipped 之前——保证下拍优先重试本拍刚跳过的，避免饿死。", "evidence": "vllm/v1/core/sched/scheduler.py:L569, L844-L846; request_queue.py:L96-L103"},
+    {"decision": "RequestStatus 用 IntEnum 顺序排布，is_finished = status > PREEMPTED", "why": "把所有 FINISHED_* 态排在 PREEMPTED 之后，一次整型比较即可判 finished，热路径 update_from_output 里高频调用，省去集合查找。", "evidence": "vllm/v1/request.py:L319-L333"},
+    {"decision": "update_from_output 中先 get_finished_reason 再 _handle_stopped_request", "why": "_handle_stopped_request 对 streaming-input 会话可能把 status 改回 WAITING，导致 get_finished_reason 失真；故必须在改状态前抓取 finish_reason。", "evidence": "vllm/v1/core/sched/scheduler.py:L1423-L1426"},
+    {"decision": "停止请求按 status_before_stop 分流到 running/waiting 两套摘除", "why": "一个请求被调度时是 RUNNING，但若同拍它已被抢占成 PREEMPTED（在 waiting 里），停止后要从对应队列摘除。分流确保从正确队列移除，避免悬挂引用。", "evidence": "vllm/v1/core/sched/scheduler.py:L1430-L1433; L1476-L1481"},
+    {"decision": "spec decode 拒绝时回扣 num_computed_tokens 与 num_output_placeholders", "why": "草稿 token 被调度时已乐观地计入 computed/placeholder，验证阶段拒绝后必须回退这部分计数，否则下拍 num_new_tokens 计算会错位、跳过本应重算的位置。", "evidence": "vllm/v1/core/sched/scheduler.py:L1357-L1371"}
+  ],
+  "theory": [
+    {"topic": "抢占重算成本", "detail": "FCFS LIFO 抢占被抢请求 num_computed_tokens 清零、整段重 prefill。最坏情形：一个请求被反复抢占（num_preemptions 累加），其有效吞吐退化。但 v1 借 prefix caching——回 waiting 重新 get_computed_blocks 时，之前算过的前缀块若未被驱逐可直接命中，把重算成本从 O(已生成长度) 降回 O(未命中部分)。"},
+    {"topic": "队头阻塞复杂度", "detail": "无双队列时，一个阻塞态请求卡在 FCFS 队头，后面 N 个可调度请求全部饿死（吞吐塌缩）。双队列把阻塞态隔离到 skipped_waiting，单拍遍历时每个阻塞请求 O(1) 跳过，可调度请求得以前进；代价是每拍最多遍历 |waiting|+|skipped| 次 peek/pop。"},
+    {"topic": "停止判定优先级与正确性", "detail": "check_stop 顺序固定：min_tokens 门槛优先（未达不停）→ EOS → stop_token_ids → 长度封顶 → 重复。该顺序决定 finish_reason：同一 token 同时是 EOS 又触发 length 时，EOS（FINISHED_STOPPED→STOP）优先。stop string（字符串子串）不在此处，由 detokenizer 在文本空间另判，二者可能给出不同截断点。"}
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {"what": "PRIORITY 策略下的抢占分支（schedule L479-L502 的 if self.policy == SchedulingPolicy.PRIORITY 整块，以及 _select_waiting_queue_for_scheduling 的 PRIORITY 比较分支）", "why_safe": "精简版只演示 FCFS LIFO 抢占主线；PRIORITY 是另一条等价路径，删除不影响 FCFS 抢占/回流正确性。须保留 FCFS 的 self.running.pop() 与 skipped 优先分支。"},
+      {"what": "encoder 相关：has_encoder_inputs / _try_schedule_encoder_inputs / scheduled_encoder_inputs / encoder_cache_manager.allocate / 抢占时的 encoder 预算归还（L494-L501）/ _free_encoder_inputs", "why_safe": "多模态 encoder 与抢占/回流主线正交。删除后纯文本请求的抢占、回 waiting、停止检测、free 完全正确。"},
+      {"what": "KV connector / 远程 KV 传输：connector、ec_connector、WAITING_FOR_REMOTE_KVS 提升分支、load_kv_async、_update_from_kv_xfer_finished、_handle_invalid_blocks、failed_kv_load_req_ids、delay_free_blocks", "why_safe": "P/D 分离与外部 KV 是可选特性；删除后本地内存抢占/回流不受影响。但 skipped_waiting 双队列机制本身必须保留（结构核心），仅删 connector 相关的具体阻塞态处理。"},
+      {"what": "structured output / grammar：WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR 提升分支、should_advance/accept_tokens 校验、has_structured_output_requests、pending_structured_output_tokens", "why_safe": "约束解码正交于抢占/停止主线。删除后普通采样请求行为不变。"},
+      {"what": "streaming-input 会话：resumable / streaming_queue / WAITING_FOR_STREAMING_REQ / _update_request_as_session / num_waiting_for_streaming_input。_handle_stopped_request 简化为直接 return True", "why_safe": "多轮流式输入是高级特性。精简版假设请求一次性输入，停止即真完成——_handle_stopped_request 返回常 True 即可，停止→free 闭环仍完整正确。"},
+      {"what": "spec decode 占位：AsyncScheduler 的 num_output_placeholders / discard_latest_async_tokens / _spec_token_placeholders，以及 update_from_output 中 spec 拒绝回扣分支（可选保留）", "why_safe": "若精简版用同步 Scheduler（非 AsyncScheduler），num_output_placeholders 恒为 0，spec 回退分支不触发。但应在 must_keep 保留同步路径下的停止/抢占骨架。注意：若 writer 要讲 spec 回退，则该分支需保留——见 must_keep 标注。"},
+      {"what": "perf/stats/events：perf_metrics、make_stats、make_spec_decoding_stats、kv_event_publisher、record_event、log_stats、prefill_stats、routed_experts、_get_routed_experts、num_nans_in_logits", "why_safe": "纯观测/统计，无控制流副作用。删除不改变调度与生命周期决策。"},
+      {"what": "logprobs / prompt_logprobs / EngineCoreOutput 的完整字段组装（logprobs.slice_request、pooler_output、kv_transfer_params 等）", "why_safe": "输出装配是 Part II 主题，本章只关心状态迁移；EngineCoreOutput 可精简为最小字段（request_id/new_token_ids/finish_reason）。"},
+      {"what": "mamba/hybrid：need_mamba_block_aligned_split / _mamba_block_aligned_split", "why_safe": "特定架构的块对齐分裂，与抢占/回流正交。"},
+      {"what": "PAUSED/pause_state 控制（PAUSED_ALL token_budget=0、PAUSED_NEW、set_pause_state 等）", "why_safe": "暂停是生命周期管理边角；精简版恒 UNPAUSED，删除后正常调度路径完整。但 schedule 中 `not preempted_reqs and UNPAUSED` 守卫里的 `not preempted_reqs` 部分必须保留（抢占后跳过 WAITING 是本章核心）。"}
+    ],
+    "must_keep": [
+      {"symbol": "_preempt_request", "why": "抢占的实际副作用入口——free KV、status→PREEMPTED、清零 num_computed_tokens、回 waiting。本章绝对核心，writer 必讲。"},
+      {"symbol": "allocate_slots", "why": "抢占触发条件：它返回 None 才进抢占循环。须保留以体现“分配失败→抢占”因果。"},
+      {"symbol": "preempted_reqs", "why": "本拍被抢占请求列表；既用于 WAITING 守卫（not preempted_reqs），也用于组装 preempted_req_ids。"},
+      {"symbol": "PREEMPTED", "why": "RequestStatus.PREEMPTED 是回流的核心状态；scheduled_resumed_reqs 分流、停止分流都依赖它。"},
+      {"symbol": "num_preemptions", "why": "抢占计数，体现“可被反复抢占”及前缀缓存对重算的缓解，writer 讲重算成本时需要。"},
+      {"symbol": "num_computed_tokens", "why": "抢占清零它=丢弃重算；spec 回退回扣它。是抢占语义与回流的关键状态。"},
+      {"symbol": "running", "why": "self.running.pop() 即 LIFO 抢占的对象队列；停止后 remove_all 也作用其上。"},
+      {"symbol": "waiting", "why": "被抢请求 prepend 回此队列（回流落点）；停止的 PREEMPTED 请求从此摘除。"},
+      {"symbol": "skipped_waiting", "why": "双队列防队头阻塞的核心——阻塞态请求的隔离区。本章核心机制，必保留。"},
+      {"symbol": "step_skipped_waiting", "why": "单拍内跳过请求的临时收集队列，step 末 prepend 回 skipped_waiting，体现重排逻辑。"},
+      {"symbol": "_is_blocked_waiting_status", "why": "判定一个请求该进 waiting 还是 skipped_waiting 的规则函数。"},
+      {"symbol": "_enqueue_waiting_request", "why": "按阻塞态把请求路由到 waiting/skipped 两队列的入口。"},
+      {"symbol": "_select_waiting_queue_for_scheduling", "why": "每拍从两队列择一调度的策略；FCFS skipped 优先。"},
+      {"symbol": "scheduled_resumed_reqs", "why": "抢占请求回流后被重新拉起的落点列表（status==PREEMPTED 分流到此）。"},
+      {"symbol": "scheduled_new_reqs", "why": "与 resumed 对照——首次调度的 WAITING 请求；分流逻辑需两者并存才能讲清。"},
+      {"symbol": "update_from_output", "why": "请求生命周期回流的驱动入口：追加 token、停止、完成、spec 回退都在此。"},
+      {"symbol": "_update_request_with_output", "why": "逐 token append + check_stop + 截断；停止检测的实际循环。"},
+      {"symbol": "check_stop", "why": "token 级停止判定（EOS/stop_token_ids/length/repetition）；writer 讲停止时必讲，且要与 detokenizer 的 stop string 区分。"},
+      {"symbol": "append_output_token_ids", "why": "把采样 token 追加进请求；停止检测前置动作。"},
+      {"symbol": "stopped_running_reqs", "why": "停止请求按 RUNNING 分流的集合，决定从 running 摘除。"},
+      {"symbol": "stopped_preempted_reqs", "why": "停止请求按 PREEMPTED 分流的集合，决定从 waiting 摘除。"},
+      {"symbol": "_handle_stopped_request", "why": "区分“真完成”与“可恢复（streaming 会话）”；返回 True 才 _free_request。生命周期迁移枢纽。"},
+      {"symbol": "_free_request", "why": "真完成的资源回收闭环入口：登记 finished_req_ids、触发 _free_blocks。"},
+      {"symbol": "_free_blocks", "why": "释放 KV 块 + 从 self.requests 删除——请求生命周期终点。"},
+      {"symbol": "finished_req_ids", "why": "已完成请求集，下拍经 SchedulerOutput 通知 worker 释放缓存。"},
+      {"symbol": "is_finished", "why": "status > PREEMPTED 的完成判定；update_from_output 跳过已完成请求、_free_request 断言都用它。"},
+      {"symbol": "RequestStatus", "why": "状态机真相源（WAITING/RUNNING/PREEMPTED/FINISHED_*），全章迁移围绕它。"},
+      {"symbol": "FINISHED_STOPPED", "why": "EOS/stop_token 命中的终态，writer 讲停止原因映射时需要。"},
+      {"symbol": "FINISHED_LENGTH_CAPPED", "why": "长度封顶终态，停止原因之一。"},
+      {"symbol": "get_finished_reason", "why": "状态→FinishReason 映射；须在 _handle_stopped_request 前调用（设计决策点）。"},
+      {"symbol": "prepend_request", "why": "FCFS appendleft——抢占回队头、阻塞请求重排的底层操作，体现双队列/抢占的“插队头”语义。"},
+      {"symbol": "remove_all", "why": "从 running 批量摘除停止请求的工具，单元素快路径。"},
+      {"symbol": "num_output_placeholders", "why": "AsyncScheduler 占位簿记；spec 回退与 schedule 跳步都依赖它。若精简版含异步路径须保留。"}
+    ]
+  },
+  "diagram_plan": [
+    {
+      "name": "preemption-loop-flow",
+      "spec": "抢占循环流程图（svg-diagram）。节点：[RUNNING 请求 allocate_slots] → 判定 {new_blocks?} → 成功:调度;失败:[FCFS self.running.pop() 抢末尾] → [_preempt_request: free KV / status→PREEMPTED / num_computed=0 / waiting.prepend] → 判定{preempted_req==request?} 是:break(放弃本请求) 否:回 allocate_slots 重试。高亮 LIFO 与“丢弃重算”。",
+      "highlight_nodes": ["allocate_slots 失败", "self.running.pop()", "_preempt_request", "waiting.prepend"]
+    },
+    {
+      "name": "dual-queue-anti-hol",
+      "spec": "waiting/skipped_waiting 双队列防队头阻塞示意（svg-diagram）。左：单队列时阻塞态请求 R0 卡队头，R1..Rn 全部饿死。右：双队列——阻塞态进 skipped_waiting，_select 选 waiting 调度 R1..Rn；阻塞请求 _try_promote 失败 → step_skipped_waiting → step 末 prepend 回 skipped。对照展示吞吐差异。",
+      "highlight_nodes": ["队头阻塞(单队列)", "skipped_waiting 隔离", "_try_promote", "step 末 prepend 重排"]
+    },
+    {
+      "name": "request-lifecycle-statemachine",
+      "spec": "请求状态机迁移图（svg-diagram）。状态节点：WAITING → RUNNING → (PREEMPTED → WAITING 回流环) / (FINISHED_STOPPED|FINISHED_LENGTH_CAPPED|FINISHED_REPETITION|FINISHED_ERROR|FINISHED_ABORTED)。边标注触发：schedule 拉起、_preempt_request 抢占、check_stop 命中、finish_requests 外部 abort、_handle_stopped_request 可恢复回 WAITING。用 is_finished=status>PREEMPTED 的分界线视觉化。",
+      "highlight_nodes": ["PREEMPTED 回流环", "RUNNING→FINISHED_* 多终态", "is_finished 分界线", "resumable 回 WAITING"]
+    },
+    {
+      "name": "roadmap-highlight",
+      "spec": "复用 instances/vllm/book/assets/roadmap/roadmap.py。本章高亮 scheduler 子系统的“抢占/回流”节点；前接 ch13《schedule 主线+token 预算》，后接后续 KV/前缀缓存章节。",
+      "highlight_nodes": ["scheduler: 抢占与生命周期回流"]
+    }
+  ],
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recover": [],
+    "raw": "python3 scripts/bible.py due ch14 返回：== ch14 应埋伏笔 ==（空）/ == ch14 应回收 ==（空）。本章无显式登记的伏笔埋设或回收项。建议 Archivist 在写后登记两项：(1) PREEMPTED→prefix cache 重算缓解 的伏笔，回收点指向后续前缀缓存章；(2) skipped_waiting 中 WAITING_FOR_REMOTE_KVS 阻塞态，回收点指向 P/D 分离章。"
+  }
+}
