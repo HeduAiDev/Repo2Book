@@ -14,14 +14,14 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch14',
-  slug: 'ch14-scheduler',
-  focus: '抢占与请求生命周期回流: 分配失败时的抢占循环(LIFO 抢占 RUNNING 末尾、KV 释放、回 waiting)、waiting/skipped 双队列避免队头阻塞、update_from_output(追加 token + 停止检测 stop string/EOS + 请求完成态迁移 + spec 回退)。承接 ch13 的 schedule(), 聚焦其未展开的抢占/回流分支, 不重复 token 预算主线',
-  highlight: 'engine-core',
+  chapter_id: 'ch15',
+  slug: 'ch15-kv-cache',
+  focus: '分页 KV 缓存机制: BlockPool 与 KVCacheBlock、FreeKVCacheBlockQueue 双向链表 LRU、带 extra keys(多模态/LoRA/cache_salt) 的块哈希、BlockHashToBlockMap 去重、引用计数 touch/free、前缀缓存命中复用前缀块；回收 f7(CacheConfig.block_size/enable_prefix_caching 真正发挥作用)+f11(抢占请求重算靠前缀缓存命中缓解, 未驱逐前缀块直接复用)',
+  highlight: 'kv-cache',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
-  paths: ['vllm/v1/core/sched/scheduler.py', 'vllm/v1/core/sched/async_scheduler.py', 'vllm/v1/core/sched/output.py', 'vllm/v1/core/sched/interface.py'],
+  paths: ['vllm/v1/core/kv_cache_manager.py', 'vllm/v1/core/block_pool.py', 'vllm/v1/core/kv_cache_coordinator.py', 'vllm/v1/core/single_type_kv_cache_manager.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'

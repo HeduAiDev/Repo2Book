@@ -1,0 +1,243 @@
+{
+  "chapter_id": "ch15",
+  "title": "分页 KV 缓存机制：BlockPool 与前缀缓存",
+  "scope_note": "本章以单 KV cache group + 全注意力（FullAttention）+ 开启前缀缓存的主路径为骨架，自底向上解读真实分页 KV 缓存：KVCacheBlock 元数据、FreeKVCacheBlockQueue 双向链表 LRU、带 extra keys 的块哈希、BlockHashToBlockMap 去重映射、BlockPool 的分配/touch/free/evict、KVCacheManager.allocate_slots 三段式、前缀缓存命中（find_longest_cache_hit）。混合模型（SlidingWindow / ChunkedLocal / Mamba / 多组 Hybrid 协调器）与 eagle/DCP/PCP/connector/P-D 为可省略分支，仅点到为止。",
+  "code_spine": [
+    "vllm/v1/core/kv_cache_utils.py:L113-L160  KVCacheBlock 元数据（block_id/ref_cnt/_block_hash/prev_free/next_free/is_null）",
+    "vllm/v1/core/kv_cache_utils.py:L162-L370  FreeKVCacheBlockQueue 双向链表 LRU（fake head/tail 哨兵、popleft/popleft_n/remove/append/append_n）",
+    "vllm/v1/core/kv_cache_utils.py:L373-L536  extra keys 生成（need_extra_keys / _gen_mm / _gen_lora / cache_salt / generate_block_hash_extra_keys）",
+    "vllm/v1/core/kv_cache_utils.py:L539-L566  hash_block_tokens：链式块哈希（parent_hash + token_ids + extra_keys）",
+    "vllm/v1/core/kv_cache_utils.py:L635-L686  get_request_block_hasher：每次新满块就追加哈希到 request.block_hashes",
+    "vllm/v1/core/block_pool.py:L34-L127     BlockHashToBlockMap：hash→block(s) 去重映射（单块/多块 union）",
+    "vllm/v1/core/block_pool.py:L130-L182     BlockPool.__init__：blocks 列表、free_block_queue、cached_block_hash_to_block、null_block",
+    "vllm/v1/core/block_pool.py:L184-L209     get_cached_block：按 hash 查每组缓存块",
+    "vllm/v1/core/block_pool.py:L211-L320     cache_full_blocks：满块写哈希、注册进 map（含 extra_keys 重算与事件）",
+    "vllm/v1/core/block_pool.py:L322-L352     get_new_blocks：从 free queue 取块 + 惰性驱逐 + ref_cnt+=1",
+    "vllm/v1/core/block_pool.py:L354-L389     _maybe_evict_cached_block：从 map 摘除被复用块的旧哈希",
+    "vllm/v1/core/block_pool.py:L391-L422     touch / free_blocks：引用计数 ±1 与回收进 free queue",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L446-L494  FullAttentionManager.find_longest_cache_hit：沿哈希链查最长前缀命中",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L88-L167   get_num_blocks_to_allocate：算需新分配块数（含可驱逐块计数）",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L169-L301  allocate_new_computed_blocks / allocate_new_blocks / cache_blocks / free",
+    "vllm/v1/core/kv_cache_coordinator.py:L324-L389  UnitaryKVCacheCoordinator.find_longest_cache_hit（单组协调）",
+    "vllm/v1/core/kv_cache_manager.py:L183-L223  get_computed_blocks：对外的前缀命中入口",
+    "vllm/v1/core/kv_cache_manager.py:L225-L416  allocate_slots：三段式分配（检查→挂前缀块→分配新块→缓存满块）"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L113-L147",
+      "elide": ["__repr__（L148-L159）仅调试打印，可省略"],
+      "code": "@dataclass(slots=True)\nclass KVCacheBlock:\n    \"\"\"KV-cache block metadata.\"\"\"\n\n    # Block ID, ranging from 0 to num_gpu_blocks - 1.\n    block_id: int\n    # Reference count.\n    ref_cnt: int = 0\n    # The hash key (block hash + group id) of the block, only available\n    # when the block is full and cached.\n    _block_hash: BlockHashWithGroupId | None = None\n\n    # Used to construct a doubly linked list for free blocks.\n    # These two attributes should only be manipulated by FreeKVCacheBlockQueue.\n    prev_free_block: \"KVCacheBlock | None\" = None\n    next_free_block: \"KVCacheBlock | None\" = None\n\n    # Whether the block is a null block that should never be cached.\n    is_null: bool = False\n\n    @property\n    def block_hash(self) -> BlockHashWithGroupId | None:\n        return self._block_hash\n\n    @block_hash.setter\n    def block_hash(self, block_hash: BlockHashWithGroupId):\n        assert self.block_hash is None, (\n            \"The block already has a hash. This should not happen.\"\n        )\n        self._block_hash = block_hash\n\n    def reset_hash(self):\n        \"\"\"Reset the block hash when the block is evicted.\"\"\"\n        self._block_hash = None"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L184-L213",
+      "elide": ["空列表 else 分支（L209-L212）只接哨兵，可一句话带过"],
+      "code": "    def __init__(self, blocks: list[KVCacheBlock]) -> None:\n        self.num_free_blocks = len(blocks)\n\n        # Initialize doubly links of consecutive blocks\n        for i in range(self.num_free_blocks):\n            if i > 0:\n                blocks[i].prev_free_block = blocks[i - 1]\n            if i < self.num_free_blocks - 1:\n                blocks[i].next_free_block = blocks[i + 1]\n\n        # Create a fake head and a tail block for the doubly linked list to\n        # reduce branching in the code\n        #\n        # The implementation guaranteed that the fake head and tail\n        # are NEVER got popped, so we could safely assume each real blocks\n        # in the queue has prev and next blocks.\n        self.fake_free_list_head = KVCacheBlock(block_id=-1)\n        self.fake_free_list_tail = KVCacheBlock(block_id=-1)\n        if self.num_free_blocks > 0:\n            self.fake_free_list_head.next_free_block = blocks[0]\n            blocks[0].prev_free_block = self.fake_free_list_head\n            self.fake_free_list_tail.prev_free_block = blocks[-1]\n            blocks[-1].next_free_block = self.fake_free_list_tail"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L214-L249",
+      "elide": [],
+      "code": "    def popleft(self) -> KVCacheBlock:\n        \"\"\"Pop the first free block and reduce num_free_blocks by 1.\"\"\"\n        if (\n            self.fake_free_list_head.next_free_block is self.fake_free_list_tail\n            or self.fake_free_list_head.next_free_block is None\n        ):\n            assert self.num_free_blocks == 0, (\n                f\"num_free_blocks ({self.num_free_blocks}) is out of sync \"\n                \"with the free list.\"\n            )\n            raise ValueError(\"No free blocks available\")\n\n        first_block: KVCacheBlock = self.fake_free_list_head.next_free_block\n\n        if first_block.next_free_block is None:\n            raise RuntimeError(\n                \"Invalid block found in popleft() \"\n                \"which doesn't have a valid next_free_block\"\n            )\n\n        # Connect fake_head and the next block of first_block.\n        self.fake_free_list_head.next_free_block = first_block.next_free_block\n        first_block.next_free_block.prev_free_block = self.fake_free_list_head\n\n        # Remove the block from the linked list.\n        first_block.prev_free_block = first_block.next_free_block = None\n\n        self.num_free_blocks -= 1\n        return first_block"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L284-L302",
+      "elide": [],
+      "code": "    def remove(self, block: KVCacheBlock) -> None:\n        \"\"\"Remove a block in the free list and reduce num_free_blocks by 1.\"\"\"\n        if block.prev_free_block is None or block.next_free_block is None:\n            raise RuntimeError(f\"remove() called on an invalid block: {block}\")\n\n        # Link the previous block to the next block.\n        block.prev_free_block.next_free_block = block.next_free_block\n        # Link the next block to the previous block.\n        block.next_free_block.prev_free_block = block.prev_free_block\n\n        # Remove the block from the linked list.\n        block.prev_free_block = block.next_free_block = None\n        self.num_free_blocks -= 1"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L373-L390",
+      "elide": [],
+      "code": "def need_extra_keys(request: Request) -> bool:\n    \"\"\"Check whether the blocks allocated to this request need extra hash keys.\"\"\"\n    # Multimodal requests need to include the MM hash.\n    # LoRA requests need to include the LoRA name.\n    # Request with provided cache salt need to include the salt.\n    return (\n        bool(request.mm_features)\n        or (request.lora_request is not None)\n        or (request.cache_salt is not None)\n    )"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L501-L536",
+      "elide": ["_gen_mm_extra_hash_keys 内部遍历 mm_features 的细节（L393-L457）可概述：返回 (mm_hash, 块内偏移)；prompt_embeds 分支（L475-L498）属可省略"],
+      "code": "def generate_block_hash_extra_keys(\n    request: Request, start_token_idx: int, end_token_idx: int, start_mm_idx: int\n) -> tuple[tuple[Any, ...] | None, int]:\n    \"\"\"Generate extra keys for the block hash. The extra keys can come from\n    the multi-modal inputs, request specific metadata (e.g., LoRA names), and\n    hashed data from prompt embeddings.\"\"\"\n    mm_extra_keys: list[Any]\n    mm_extra_keys, new_start_mm_idx = _gen_mm_extra_hash_keys(\n        request, start_token_idx, end_token_idx, start_mm_idx\n    )\n    lora_extra_keys: list[str] = _gen_lora_extra_hash_keys(request)\n    cache_salt_keys: list[str] = (\n        [request.cache_salt] if (start_token_idx == 0 and request.cache_salt) else []\n    )\n    prompt_embeds_keys = _gen_prompt_embeds_extra_hash_keys(\n        request, start_token_idx, end_token_idx\n    )\n\n    extra_keys: list[Any] = (\n        lora_extra_keys + mm_extra_keys + cache_salt_keys + prompt_embeds_keys\n    )\n\n    if not extra_keys:\n        return None, new_start_mm_idx\n\n    return tuple(extra_keys), new_start_mm_idx"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L539-L566",
+      "elide": [],
+      "code": "def hash_block_tokens(\n    hash_function: Callable[[Any], bytes],\n    parent_block_hash: BlockHash | None,\n    curr_block_token_ids: Sequence[int],\n    extra_keys: tuple[Any, ...] | None = None,\n) -> BlockHash:\n    \"\"\"Computes a hash value corresponding to the contents of a block and\n    the contents of the preceding block(s). The hash value is used for\n    prefix caching.\"\"\"\n    if not parent_block_hash:\n        parent_block_hash = NONE_HASH\n\n    curr_block_token_ids_tuple = tuple(curr_block_token_ids)\n    return BlockHash(\n        hash_function((parent_block_hash, curr_block_token_ids_tuple, extra_keys))\n    )"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L643-L684",
+      "elide": ["start_token_idx>0 时 curr_mm_idx=-1（只看最后一个 mm 输入）的优化（L652-L657）可一句话带过"],
+      "code": "    def request_block_hasher(request: Request) -> list[BlockHash]:\n        start_token_idx = len(request.block_hashes) * block_size\n        num_tokens = request.num_tokens\n\n        if start_token_idx + block_size > num_tokens:\n            # Early stop when there no new full blocks created.\n            return []\n\n        curr_mm_idx = 0\n        if start_token_idx > 0:\n            curr_mm_idx = -1\n\n        prev_block_hash_value = (\n            request.block_hashes[-1] if request.block_hashes else None\n        )\n        new_block_hashes: list[BlockHash] = []\n        while True:\n            end_token_idx = start_token_idx + block_size\n            if end_token_idx > num_tokens:\n                # We only hash full blocks\n                break\n\n            extra_keys, curr_mm_idx = generate_block_hash_extra_keys(\n                request, start_token_idx, end_token_idx, curr_mm_idx\n            )\n\n            block_tokens = request.all_token_ids[start_token_idx:end_token_idx]\n            block_hash = hash_block_tokens(\n                caching_hash_fn, prev_block_hash_value, block_tokens, extra_keys\n            )\n\n            new_block_hashes.append(block_hash)\n            start_token_idx += block_size\n            prev_block_hash_value = block_hash\n\n        return new_block_hashes"
+    },
+    {
+      "path": "vllm/v1/core/block_pool.py",
+      "lines": "L62-L92",
+      "elide": ["_unexpected_blocks_type / __len__ 可省略"],
+      "code": "    def get_one_block(self, key: BlockHashWithGroupId) -> KVCacheBlock | None:\n        \"\"\"Gets any block with the given block hash key.\"\"\"\n        blocks = self._cache.get(key)\n        if blocks is not None:\n            if isinstance(blocks, KVCacheBlock):\n                return blocks\n            if isinstance(blocks, dict):\n                return next(iter(blocks.values()))\n            self._unexpected_blocks_type(blocks)\n        return None\n\n    def insert(self, key: BlockHashWithGroupId, block: KVCacheBlock) -> None:\n        \"\"\"Inserts the KVCacheBlock to the cache\"\"\"\n        blocks = self._cache.get(key)\n        if blocks is None:\n            # When key is not found, attach a single block to the key\n            self._cache[key] = block\n        elif isinstance(blocks, KVCacheBlock):\n            # If there's a block with the same key, merge the original block\n            # and the new block into a dict\n            self._cache[key] = {blocks.block_id: blocks, block.block_id: block}\n        elif isinstance(blocks, dict):\n            # If it's already a dict, simply insert the block\n            blocks[block.block_id] = block\n        else:\n            self._unexpected_blocks_type(blocks)"
+    },
+    {
+      "path": "vllm/v1/core/block_pool.py",
+      "lines": "L149-L182",
+      "elide": ["enable_kv_cache_events / metrics_collector 相关字段（L179-L182）属可选可省略"],
+      "code": "    def __init__(\n        self,\n        num_gpu_blocks: int,\n        enable_caching: bool,\n        hash_block_size: int,\n        enable_kv_cache_events: bool = False,\n        metrics_collector: KVCacheMetricsCollector | None = None,\n    ):\n        assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0\n        self.num_gpu_blocks = num_gpu_blocks\n        self.enable_caching = enable_caching\n        self.hash_block_size = hash_block_size\n        # All kv-cache blocks.\n        self.blocks: list[KVCacheBlock] = [\n            KVCacheBlock(idx) for idx in range(num_gpu_blocks)\n        ]\n        # Free block queue that constructs and manipulates a doubly linked\n        # list of free blocks (including eviction candidates when caching is\n        # enabled).\n        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)\n\n        # Cache for block lookup\n        self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()\n\n        # To represent a placeholder block with block_id=0.\n        # The ref_cnt of null_block is not maintained, needs special care to\n        # avoid freeing it.\n        self.null_block = self.free_block_queue.popleft()\n        self.null_block.is_null = True"
+    },
+    {
+      "path": "vllm/v1/core/block_pool.py",
+      "lines": "L184-L209",
+      "elide": [],
+      "code": "    def get_cached_block(\n        self, block_hash: BlockHash, kv_cache_group_ids: list[int]\n    ) -> list[KVCacheBlock] | None:\n        \"\"\"Get the cached block by the block hash for each group in\n        `kv_cache_group_ids`, or None if cache miss for any group.\"\"\"\n        cached_blocks = []\n        for group_id in kv_cache_group_ids:\n            block_hash_with_group_id = make_block_hash_with_group_id(\n                block_hash, group_id\n            )\n            block = self.cached_block_hash_to_block.get_one_block(\n                block_hash_with_group_id\n            )\n            if not block:\n                return None\n            cached_blocks.append(block)\n        return cached_blocks"
+    },
+    {
+      "path": "vllm/v1/core/block_pool.py",
+      "lines": "L322-L352",
+      "elide": ["enable_caching=False 的对称分支（L346-L351）与 metrics_collector 调用可省略——只删指标与事件，控制流不变"],
+      "code": "    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:\n        \"\"\"Get new blocks from the free block pool.\n        Note that we do not check block cache in this function.\"\"\"\n        if num_blocks > self.get_num_free_blocks():\n            raise ValueError(f\"Cannot get {num_blocks} free blocks from the pool\")\n\n        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)\n\n        # In order to only iterate the list once, we duplicated code a bit\n        if self.enable_caching:\n            for block in ret:\n                self._maybe_evict_cached_block(block)\n                assert block.ref_cnt == 0\n                block.ref_cnt += 1\n        else:\n            for block in ret:\n                assert block.ref_cnt == 0\n                block.ref_cnt += 1\n        return ret"
+    },
+    {
+      "path": "vllm/v1/core/block_pool.py",
+      "lines": "L354-L389",
+      "elide": ["metrics_collector（L365-L367）与 enable_kv_cache_events 发 BlockRemoved（L381-L388）可省略"],
+      "code": "    def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:\n        \"\"\"If a block is cached in `cached_block_hash_to_block`, we reset its hash\n        metadata and evict it from the cache.\"\"\"\n        block_hash = block.block_hash\n        if block_hash is None:\n            # The block doesn't have hash, eviction is not needed\n            return False\n\n        if self.cached_block_hash_to_block.pop(block_hash, block.block_id) is None:\n            # block not found in cached_block_hash_to_block,\n            # eviction is not needed\n            return False\n\n        block.reset_hash()\n        return True"
+    },
+    {
+      "path": "vllm/v1/core/block_pool.py",
+      "lines": "L391-L422",
+      "elide": ["metrics_collector 调用（L405-L406）可省略"],
+      "code": "    def touch(self, blocks: Sequence[KVCacheBlock]) -> None:\n        \"\"\"Touch a block increases its reference count by 1, and may remove\n        the block from the free queue. This is used when a block is hit by\n        another request with the same prefix.\"\"\"\n        for block in blocks:\n            # ref_cnt=0 means this block is in the free list (i.e. eviction\n            # candidate), so remove it.\n            if block.ref_cnt == 0 and not block.is_null:\n                self.free_block_queue.remove(block)\n            block.ref_cnt += 1\n\n    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:\n        \"\"\"Free a list of blocks. The blocks should be ordered by their\n        eviction priority, where the first block will be evicted first.\"\"\"\n        # Materialize the iterable to allow multiple passes.\n        blocks_list = list(ordered_blocks)\n        for block in blocks_list:\n            block.ref_cnt -= 1\n        self.free_block_queue.append_n(\n            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]\n        )"
+    },
+    {
+      "path": "vllm/v1/core/block_pool.py",
+      "lines": "L237-L272",
+      "elide": ["block_size != hash_block_size 的多组重算分支（L244-L252）属混合模型，可一句话带过；is_null 跳过（L262-L263）；事件发布块（L276-L320）整体可省略"],
+      "code": "        if num_cached_blocks >= num_full_blocks:\n            return\n        new_full_blocks = blocks[num_cached_blocks:num_full_blocks]\n        assert len(request.block_hashes) >= num_full_blocks\n        # Common case: block_size == hash_block_size.\n        block_hashes: BlockHashList = request.block_hashes\n\n        new_block_hashes = block_hashes[num_cached_blocks:]\n        for i, blk in enumerate(new_full_blocks):\n            assert blk.block_hash is None\n            block_hash = new_block_hashes[i]\n\n            # Update and added the full block to the cache.\n            block_hash_with_group_id = make_block_hash_with_group_id(\n                block_hash, kv_cache_group_id\n            )\n            blk.block_hash = block_hash_with_group_id\n            self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)"
+    },
+    {
+      "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+      "lines": "L448-L494",
+      "elide": ["use_eagle 丢尾块分支（L484-L487）与 alignment_tokens 对齐裁剪（L488-L493，单组时 block_size==alignment 不触发）属可省略；dcp/pcp 乘子（L470-L471）单组为 1"],
+      "code": "    @classmethod\n    def find_longest_cache_hit(\n        cls,\n        block_hashes: BlockHashList,\n        max_length: int,\n        kv_cache_group_ids: list[int],\n        block_pool: BlockPool,\n        kv_cache_spec: KVCacheSpec,\n        use_eagle: bool,\n        alignment_tokens: int,\n        dcp_world_size: int = 1,\n        pcp_world_size: int = 1,\n    ) -> tuple[list[KVCacheBlock], ...]:\n        computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(\n            [] for _ in range(len(kv_cache_group_ids))\n        )\n        block_size = kv_cache_spec.block_size\n        max_num_blocks = max_length // block_size\n        for block_hash in itertools.islice(block_hashes, max_num_blocks):\n            # block_hashes is a chain of block hashes. If a block hash is not\n            # in the cached_block_hash_to_id, the following block hashes are\n            # not computed yet for sure.\n            if cached_block := block_pool.get_cached_block(\n                block_hash, kv_cache_group_ids\n            ):\n                for computed, cached in zip(computed_blocks, cached_block):\n                    computed.append(cached)\n            else:\n                break\n        return computed_blocks"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_manager.py",
+      "lines": "L183-L223",
+      "elide": ["log_stats 记录前缀命中统计（L215-L221）属可选可省略"],
+      "code": "    def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:\n        \"\"\"Get the computed (cached) blocks for the request.\n        Note that the computed blocks must be full.\"\"\"\n        # We skip finding the prefix cache hit when prefix caching is\n        # disabled or the request is marked as skipping kv cache read.\n        if not self.enable_caching or request.skip_reading_prefix_cache:\n            return self.empty_kv_cache_blocks, 0\n\n        # NOTE: When all tokens hit the cache, we must recompute the last token\n        # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.\n        max_cache_hit_length = request.num_tokens - 1\n        computed_blocks, num_new_computed_tokens = (\n            self.coordinator.find_longest_cache_hit(\n                request.block_hashes, max_cache_hit_length\n            )\n        )\n\n        return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_manager.py",
+      "lines": "L314-L416",
+      "elide": ["full_sequence_must_fit 准入闸（L335-L349）、num_external_computed_tokens / connector / delay_cache_blocks / num_lookahead_tokens / num_encoder_tokens 等分支属可省略；remove_skipped_blocks（L362-L364）单组全注意力为 no-op"],
+      "code": "        if num_new_tokens == 0 and num_external_computed_tokens == 0:\n            raise ValueError(...)\n\n        if new_computed_blocks is not None:\n            new_computed_block_list = new_computed_blocks.blocks\n        else:\n            new_computed_block_list = self.empty_kv_cache_blocks.blocks\n\n        num_local_computed_tokens = (\n            request.num_computed_tokens + num_new_computed_tokens\n        )\n        total_computed_tokens = min(\n            num_local_computed_tokens + num_external_computed_tokens,\n            self.max_model_len,\n        )\n\n        num_tokens_main_model = total_computed_tokens + num_new_tokens\n        num_tokens_need_slot = min(\n            num_tokens_main_model + num_lookahead_tokens, self.max_model_len\n        )\n\n        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(...)\n\n        if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():\n            # Cannot allocate new blocks\n            return None\n\n        if (\n            new_computed_block_list is not self.empty_kv_cache_blocks.blocks\n            or num_external_computed_tokens > 0\n        ):\n            # Append the new computed blocks to the request blocks.\n            self.coordinator.allocate_new_computed_blocks(...)\n\n        new_blocks = self.coordinator.allocate_new_blocks(...)\n\n        if not self.enable_caching or delay_cache_blocks:\n            return self.create_kv_cache_blocks(new_blocks)\n\n        num_tokens_to_cache = min(\n            total_computed_tokens + num_new_tokens,\n            request.num_tokens,\n        )\n        self.coordinator.cache_blocks(request, num_tokens_to_cache)\n\n        return self.create_kv_cache_blocks(new_blocks)"
+    }
+  ],
+  "key_classes": [
+    {"name": "KVCacheBlock", "file": "vllm/v1/core/kv_cache_utils.py", "responsibility": "单个 KV 块的元数据：block_id、ref_cnt 引用计数、_block_hash（满块且被缓存时的 hash+group_id 键）、prev/next_free_block（构成 free 链表的指针）、is_null（占位块标记）。@dataclass(slots=True)。"},
+    {"name": "FreeKVCacheBlockQueue", "file": "vllm/v1/core/kv_cache_utils.py", "responsibility": "空闲块的双向链表，用 fake head/tail 哨兵；前端=LRU 最先驱逐，尾端=最近释放。直接操作块上的 prev/next 指针不分配 Python 对象，支持 O(1) 中间删除（remove）以便 touch 时把命中块从驱逐候选中摘除。"},
+    {"name": "BlockHashToBlockMap", "file": "vllm/v1/core/block_pool.py", "responsibility": "前缀缓存的查找表：{BlockHashWithGroupId -> KVCacheBlock | dict[block_id, KVCacheBlock]}。同一 hash 可对应多块（不去重内容、保证 block_id 不变以维持 block table append-only），union 类型省 GC。"},
+    {"name": "BlockPool", "file": "vllm/v1/core/block_pool.py", "responsibility": "全局块管家：持有 blocks 列表、free_block_queue、cached_block_hash_to_block、null_block。提供 get_new_blocks（取块+惰性驱逐+引用计数）、touch、free_blocks、cache_full_blocks、get_cached_block、_maybe_evict_cached_block。"},
+    {"name": "SingleTypeKVCacheManager / FullAttentionManager", "file": "vllm/v1/core/single_type_kv_cache_manager.py", "responsibility": "单一注意力类型的块账本：req_to_blocks（请求→已分配块）、num_cached_block（请求→已缓存满块数）。负责 get_num_blocks_to_allocate、allocate_new_(computed_)blocks、cache_blocks、free，以及类方法 find_longest_cache_hit（沿哈希链查最长前缀命中）。"},
+    {"name": "UnitaryKVCacheCoordinator", "file": "vllm/v1/core/kv_cache_coordinator.py", "responsibility": "单 KV cache group 的协调器（本章主路径）：直接把请求委派给唯一的 single_type_manager；find_longest_cache_hit 返回命中块与命中 token 数。HybridKVCacheCoordinator（多组）为可省略分支。"},
+    {"name": "KVCacheManager / KVCacheBlocks", "file": "vllm/v1/core/kv_cache_manager.py", "responsibility": "对 Scheduler 的门面：get_computed_blocks（查前缀命中）、allocate_slots（三段式分配）、free、reset_prefix_cache。KVCacheBlocks 是隐藏内部结构的分配结果（按 group 分组的块序列）。"}
+  ],
+  "data_flow": [
+    "1. Request 创建/追加 token：Request.update_block_hashes → get_request_block_hasher.request_block_hasher 对每个新满块调 hash_block_tokens（链式：parent_hash + 块 token_ids + extra_keys），追加进 request.block_hashes（kv_cache_utils.py:request_block_hasher）",
+    "2. 调度时查前缀命中：KVCacheManager.get_computed_blocks → coordinator.find_longest_cache_hit → FullAttentionManager.find_longest_cache_hit 沿 block_hashes 逐块 block_pool.get_cached_block，命中链断即停（kv_cache_manager.py:get_computed_blocks）",
+    "3. get_cached_block：把 block_hash 与 group_id 打包成 BlockHashWithGroupId，去 cached_block_hash_to_block.get_one_block 查（block_pool.py:get_cached_block）",
+    "4. allocate_slots 段一：算 num_blocks_to_allocate（coordinator.get_num_blocks_to_allocate，含可驱逐块计数），与 free 块数比较，不足返回 None（kv_cache_manager.py:allocate_slots）",
+    "5. allocate_slots 段二：若有命中块，allocate_new_computed_blocks → block_pool.touch(命中块)：ref_cnt+1，若该块在 free queue（ref_cnt==0）则 remove 出队，挂进 req_to_blocks（single_type_kv_cache_manager.py:allocate_new_computed_blocks）",
+    "6. allocate_slots 段三：allocate_new_blocks → block_pool.get_new_blocks(n) → free_block_queue.popleft_n(n)，对每块 _maybe_evict_cached_block（若有旧 hash 则从 map 摘除并 reset_hash）后 ref_cnt+1（block_pool.py:get_new_blocks）",
+    "7. allocate_slots 收尾：cache_blocks → block_pool.cache_full_blocks 给新满块写 block_hash 并 insert 进 cached_block_hash_to_block（block_pool.py:cache_full_blocks）",
+    "8. 请求结束/被抢占：KVCacheManager.free → manager.free 逆序 block_pool.free_blocks：每块 ref_cnt-1，归零且非 null 的 append_n 回 free queue 尾部（保留 hash，成为可复用的驱逐候选）（single_type_kv_cache_manager.py:free, block_pool.py:free_blocks）"
+  ],
+  "design_decisions": [
+    {"decision": "空闲块用自实现双向链表（FreeKVCacheBlockQueue）而非 deque", "why": "需要 O(1) 从队列中间删除任意块——当某缓存块被新请求前缀命中（touch）时要立即从驱逐候选中摘除；deque 做不到中间 O(1) 删除。fake head/tail 哨兵消除边界分支，直接操作块上指针不分配 Python 对象逼近 C 实现性能。", "evidence": "vllm/v1/core/kv_cache_utils.py:L162-L213, L284-L302"},
+    {"decision": "释放块仅 ref_cnt 减到 0 时回 free queue，但保留 block_hash 不立即清", "why": "实现前缀缓存：被释放的满块仍带 hash 留在 cached_block_hash_to_block，成为可复用候选；只有真正被 get_new_blocks 取走复用时才 _maybe_evict_cached_block 清 hash。这正是 f11——被抢占请求重 prefill 时，之前算过的前缀块若未驱逐可直接命中复用，免去重算。", "evidence": "vllm/v1/core/block_pool.py:L391-L422, L354-L389"},
+    {"decision": "驱逐顺序 = LRU + 同请求内尾块优先", "why": "free queue 前端是最久未用块（LRU）；free_blocks 由上层逆序传入（manager.free 用 reversed），使同一请求的尾块排在更前——尾块前缀更长、被复用概率更低，应先驱逐。", "evidence": "vllm/v1/core/single_type_kv_cache_manager.py:L313-L317, vllm/v1/core/kv_cache_utils.py:L171-L178"},
+    {"decision": "块哈希链式（含 parent_block_hash）", "why": "前缀缓存要求命中是连续前缀；把上一块的 hash 拌进当前块 hash，使相同 token 序列只有在前缀完全一致时才得到相同 hash，天然保证 find_longest_cache_hit 沿链一断即停即正确。NONE_HASH 随机种子防跨进程碰撞。", "evidence": "vllm/v1/core/kv_cache_utils.py:L539-L566, L83-L110"},
+    {"decision": "extra keys（mm_hash/lora_name/cache_salt/prompt_embeds）拌入块哈希", "why": "防止跨语义复用：相同 token id 但属于不同多模态特征、不同 LoRA 适配器、或显式不同 cache_salt 命名空间的块，必须算出不同 hash，否则会错误命中别人的 KV。cache_salt 仅在首块（start_token_idx==0）注入。", "evidence": "vllm/v1/core/kv_cache_utils.py:L373-L390, L501-L536"},
+    {"decision": "block_hash 与 group_id 打包成 BlockHashWithGroupId（bytes，大端 4 字节）", "why": "同一 token 前缀在不同 KV cache group（混合模型）需区分缓存；用纯 bytes 拼接而非 tuple 省 GC、查表更快。单组时 group_id 恒为 0。", "evidence": "vllm/v1/core/kv_cache_utils.py:L53-L72, vllm/v1/core/block_pool.py:L200-L205"},
+    {"decision": "BlockHashToBlockMap 不去重相同内容的块", "why": "若去重会改变已分配 block_id，破坏 block table 的 append-only 不变量（worker 侧按 block_id 寻址 KV）。故同 hash 允许多块共存（union 退化为 dict），命中时取任一即可。", "evidence": "vllm/v1/core/block_pool.py:L48-L55, L75-L91"},
+    {"decision": "null_block（block_id=0）占位、ref_cnt 不维护、永不缓存/释放", "why": "用作被跳过位置（滑窗外、稀疏注意力）的占位，使 block table 长度对齐；特殊处理避免误回收。BlockPool 初始化即 popleft 取出并置 is_null。", "evidence": "vllm/v1/core/block_pool.py:L173-L177, L401-L402, L420-L421"},
+    {"decision": "命中全部 token 时 max_cache_hit_length = num_tokens - 1", "why": "至少要重算最后一个 token 才能拿到 logits；又因 allocate_slots 要求 num_computed_tokens 块对齐，可能回退整块重算。", "evidence": "vllm/v1/core/kv_cache_manager.py:L202-L213"}
+  ],
+  "theory": [
+    "分页思想（f7 回收）：物理 KV 显存被切成 num_gpu_blocks 个等长 block，每块 CacheConfig.block_size 个 token 的 KV。请求的逻辑 token 序列经 block table 映射到任意物理块，消除连续显存需求与外部碎片——CacheConfig.block_size 在此真正发挥作用：决定哈希/分配/命中的最小粒度。",
+    "前缀缓存命中长度推导：请求 prompt 共 P token、block_size=B，则有 ⌊P/B⌋ 个满块哈希。find_longest_cache_hit 沿链查到第一个 miss 即停，命中 k 块 ⇒ 复用 k·B 个 token 的 KV，num_new_computed_tokens=k·B，本次只需 prefill 剩余 P−k·B token。命中率越高、实际计算量越省。",
+    "引用计数语义：block 被多少个活跃请求/缓存引用即 ref_cnt。ref_cnt>0 不在 free queue（不可驱逐）；ref_cnt==0 在 free queue 尾（可驱逐但仍可被 touch 救回）。touch=+1（可能 remove 出队），free=−1（归零则入队）。",
+    "复杂度：get_new_blocks O(n) 取 n 块；touch/free 单块 O(1)（哨兵双链表）；find_longest_cache_hit O(命中块数) 次哈希查表；cache_full_blocks O(新满块数)。整体每步分配/释放与块数线性，无显存拷贝。",
+    "f11 量化：被抢占请求 num_computed_tokens 清零后回 waiting 从 0 重 prefill。若其前缀块在抢占→重排期间未被 get_new_blocks 取走复用（hash 仍在 map、块仍在 free queue 或被他人 touch），get_computed_blocks 会直接命中这些块，touch 救回，重算成本退化为仅命中长度之外的部分——抢占重算代价被前缀缓存大幅缓解。"
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {"what": "KV cache events 全套（enable_kv_cache_events、kv_event_queue、BlockStored/BlockRemoved/AllBlocksCleared 发布、maybe_convert_block_hash、take_events、cache_full_blocks 中 L276-L320 的事件块）", "why_safe": "仅供外部 KV 事件订阅者（offloading/observability），不影响块分配/命中/驱逐控制流；默认 False。"},
+      {"what": "metrics_collector / KVCacheMetricsCollector 全部调用（on_block_allocated/evicted/accessed/reset）", "why_safe": "纯统计旁路，删除后行为不变。"},
+      {"what": "HybridKVCacheCoordinator、SlidingWindowManager、ChunkedLocalAttentionManager、MambaManager、CrossAttentionManager、SinkFullAttentionManager 及 verify_and_split_kv_cache_groups / lcm_block_size / 多组 find_longest_cache_hit 定点迭代", "why_safe": "本章锁定单组全注意力主路径；保留 UnitaryKVCacheCoordinator + FullAttentionManager 即可完整演示分页与前缀缓存。多组/混合属另一维度。"},
+      {"what": "use_eagle 相关（eagle_group_ids、find_longest_cache_hit 丢尾块、HybridKVCacheCoordinator 中 eagle_verified/eagle_attn_group_indices）", "why_safe": "投机解码草稿头专用，与基础分页/前缀缓存正交。"},
+      {"what": "DCP/PCP（dcp_world_size/pcp_world_size、block_size 乘子）", "why_safe": "上下文并行，单卡为 1，乘子无效果。"},
+      {"what": "external computed tokens / connector / P-D（num_external_computed_tokens、delay_cache_blocks、allocate_new_computed_blocks 中外部块分配、evict_blocks）", "why_safe": "P/D 解耦与 KV connector 路径，不影响本地前缀缓存主流程。"},
+      {"what": "full_sequence_must_fit 准入闸（allocate_slots 中 L335-L349 + get_num_blocks_to_allocate 的 apply_admission_cap / _max_admission_blocks_per_request）", "why_safe": "SWA/chunked-local 的回收感知准入，对全注意力恒为 no-op。"},
+      {"what": "remove_skipped_blocks / get_num_skipped_tokens（基类默认返回 0 的版本可保留为 no-op，子类实现删）", "why_safe": "全注意力从不跳过块，基类默认 num_skipped_tokens=0，相关逻辑空转。"},
+      {"what": "prompt_embeds extra keys（_gen_prompt_embeds_extra_hash_keys、_prompt_embeds_per_block_hashes）", "why_safe": "prompt embeds 输入专用，常规 token 请求不触发；保留 mm/lora/cache_salt 三类 extra keys 已足够演示语义隔离。"},
+      {"what": "reset_prefix_cache、get_num_common_prefix_blocks、take_new_block_ids/new_step_starts、get_usage/PrefixCacheStats 日志统计", "why_safe": "运维/级联前缀/调度旁路接口，非分页与命中核心控制流。"},
+      {"what": "block_size != hash_block_size 的多组重算分支（cache_full_blocks L244-L252、BlockHashListWithBlockSize）", "why_safe": "仅当不同组块大小不同才触发；单组下 block_size==hash_block_size，走 common case。"}
+    ],
+    "must_keep": [
+      {"symbol": "KVCacheBlock", "why": "分页核心数据结构，block_id/ref_cnt/_block_hash/prev_free_block/next_free_block/is_null 字段都要读者理解。"},
+      {"symbol": "ref_cnt", "why": "引用计数是驱逐/复用的判定核心，writer 要讲清 +1/-1 与归零入队语义。"},
+      {"symbol": "is_null", "why": "null_block 占位与永不释放的特殊处理依赖它。"},
+      {"symbol": "reset_hash", "why": "块被复用驱逐时清 hash 的关键动作。"},
+      {"symbol": "FreeKVCacheBlockQueue", "why": "双向链表 LRU，本章核心机制之一。"},
+      {"symbol": "popleft", "why": "从队首取最久未用块的取块原语。"},
+      {"symbol": "popleft_n", "why": "get_new_blocks 批量取块依赖它。"},
+      {"symbol": "remove", "why": "O(1) 中间删除——touch 救回命中块的关键，必须演示。"},
+      {"symbol": "append_n", "why": "free_blocks 归还块到队尾。"},
+      {"symbol": "num_free_blocks", "why": "分配前与之比较判断是否容量不足。"},
+      {"symbol": "fake_free_list_head", "why": "哨兵设计，writer 要讲清为何消除边界分支。"},
+      {"symbol": "BlockHashToBlockMap", "why": "前缀缓存查找表，去重/多块 union 的语义要讲。"},
+      {"symbol": "get_one_block", "why": "命中查询的取块入口。"},
+      {"symbol": "insert", "why": "缓存满块注册进 map。"},
+      {"symbol": "BlockPool", "why": "全局块管家，组织以上结构。"},
+      {"symbol": "get_cached_block", "why": "按 hash+group_id 查命中块。"},
+      {"symbol": "get_new_blocks", "why": "取块+惰性驱逐+引用计数，分配主干。"},
+      {"symbol": "_maybe_evict_cached_block", "why": "复用块时从 map 摘旧 hash——前缀缓存正确性关键。"},
+      {"symbol": "touch", "why": "命中复用时 ref_cnt+1 并把块从驱逐候选救回。"},
+      {"symbol": "free_blocks", "why": "释放块 ref_cnt-1、归零入队，f11 的复用前提（保留 hash）。"},
+      {"symbol": "cache_full_blocks", "why": "满块写 hash 并入 map，缓存登记主干。"},
+      {"symbol": "null_block", "why": "占位块，BlockPool 初始化即取出。"},
+      {"symbol": "make_block_hash_with_group_id", "why": "block_hash 与 group_id 打包，查表键构造。"},
+      {"symbol": "hash_block_tokens", "why": "链式块哈希（parent+tokens+extra_keys）。"},
+      {"symbol": "generate_block_hash_extra_keys", "why": "extra keys（mm/lora/cache_salt）生成，语义隔离核心。"},
+      {"symbol": "need_extra_keys", "why": "判定是否需 extra keys 的入口谓词。"},
+      {"symbol": "request_block_hasher", "why": "请求侧逐满块算 hash 追加 block_hashes。"},
+      {"symbol": "find_longest_cache_hit", "why": "沿哈希链查最长前缀命中——前缀缓存命中算法。"},
+      {"symbol": "get_num_blocks_to_allocate", "why": "算需新分配块数（含可驱逐块计数），容量检查依据。"},
+      {"symbol": "allocate_new_computed_blocks", "why": "把命中块 touch 并挂进 req_to_blocks。"},
+      {"symbol": "allocate_new_blocks", "why": "为待计算 token 分配新块。"},
+      {"symbol": "cache_blocks", "why": "把新满块交给 block_pool 缓存。"},
+      {"symbol": "req_to_blocks", "why": "请求→已分配块账本，free 时据此回收。"},
+      {"symbol": "num_cached_block", "why": "请求→已缓存满块数，避免重复缓存。"},
+      {"symbol": "free", "why": "请求结束逆序释放块。"},
+      {"symbol": "UnitaryKVCacheCoordinator", "why": "单组协调器，本章主路径委派点。"},
+      {"symbol": "KVCacheManager", "why": "对 Scheduler 的门面类。"},
+      {"symbol": "get_computed_blocks", "why": "前缀命中对外入口。"},
+      {"symbol": "allocate_slots", "why": "三段式分配的总控方法。"},
+      {"symbol": "KVCacheBlocks", "why": "隐藏内部结构的分配结果接口。"}
+    ]
+  },
+  "diagram_plan": [
+    {"name": "ch15-roadmap", "type": "roadmap", "spec": "复用 instances/vllm/book/assets/roadmap/roadmap.py，高亮节点：KV Cache / BlockPool（Part 调度与内存）；前接 ch14 调度与抢占，后接后续 attention backend 写入 KV。"},
+    {"name": "ch15-paging-overview", "type": "svg-diagram", "spec": "分页总览：左=请求逻辑 token 序列按 block_size 切块；中=block table（逻辑块号→物理 block_id）；右=BlockPool 物理块网格。展示一个物理块可被多请求前缀共享（多箭头指向同一 block_id）。强调 CacheConfig.block_size 是切块粒度（回收 f7）。"},
+    {"name": "ch15-free-queue-lru", "type": "svg-diagram", "spec": "FreeKVCacheBlockQueue 双向链表状态演化：fake_head ⇄ 块A ⇄ 块B ⇄ ... ⇄ fake_tail。三联画：(1)初始按 block_id 顺序；(2)popleft 取队首；(3)free_blocks 把请求块逆序 append 到队尾、touch 用 remove 从中间 O(1) 摘除某块。标注 LRU=队首先驱逐。"},
+    {"name": "ch15-block-hash-chain", "type": "svg-diagram", "spec": "链式块哈希：block0_hash=H(NONE_HASH, tok[0:B], extra0)；block1_hash=H(block0_hash, tok[B:2B], extra1)... 横向链。下方分支标出 extra_keys 来源：mm_hash / lora_name / cache_salt(仅首块)。强调前缀一致才同 hash。"},
+    {"name": "ch15-prefix-hit-alloc", "type": "svg-diagram", "spec": "allocate_slots 三段式 + 前缀命中时序：get_computed_blocks 沿 block_hashes 查 cached_block_hash_to_block（命中 k 块）→ touch(命中块) ref_cnt+1 出 free queue → get_new_blocks 取剩余 token 的新块（含 _maybe_evict_cached_block）→ cache_full_blocks 登记新满块。下方一行点出 f11：被抢占请求重 prefill 在此命中未驱逐前缀块直接复用。"}
+  ],
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recover": [
+      {"id": "f7", "desc": "CacheConfig.block_size / enable_prefix_caching 字段在分页 KV cache 中真正发挥作用（埋于 ch03）", "recover_how": "在分页总览与块哈希粒度处点明 block_size 即切块/哈希/分配/命中的最小粒度；enable_prefix_caching=enable_caching 决定 get_computed_blocks 是否查命中、get_new_blocks 是否惰性驱逐、coordinator 选 Unitary 还是 NoPrefixCache。"},
+      {"id": "f11", "desc": "被抢占请求 num_computed_tokens 清零后回 waiting 从 0 重 prefill；重算成本靠前缀缓存命中缓解——之前算过的前缀块若未驱逐可直接复用（埋于 ch14）", "recover_how": "在 free_blocks 保留 hash + find_longest_cache_hit 命中复用处收回：被抢占请求释放的前缀块带 hash 留在 free queue 作驱逐候选，重排回来重 prefill 时 get_computed_blocks 命中、touch 救回，省去重算。"}
+    ]
+  }
+}
