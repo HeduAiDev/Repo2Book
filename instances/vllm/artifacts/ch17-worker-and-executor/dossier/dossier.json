@@ -1,0 +1,225 @@
+{
+  "chapter_id": "ch17",
+  "title": "执行器与 Worker 生命周期",
+  "source_pin": "f3fef123504db07b3ac83ad4ef677915b53e8386",
+  "scope_note": "本章是 Part V 执行层开篇，讲清调度器与真正跑模型的 worker 之间的『控制平面』：Executor 工厂三态分发、collective_rpc 把一次调用广播给所有 worker、MultiprocExecutor 用共享内存 MessageQueue + FutureWrapper 实现异步 RPC、worker 子进程的拉起/就绪握手/失败监控/关停，以及 WorkerWrapperBase 的延迟初始化。GPU 模型前向（execute_model 内部 PP 通信）、KV 内存剖析（determine_available_memory）、模型加载本身只作生命周期『锚点』点到为止，留给后续章节（ch18/ch19/ch20）。",
+
+  "code_spine": [
+    "vllm/v1/executor/abstract.py:L47-L92 — Executor.get_class()：按 distributed_executor_backend 分发 uni/mp/ray/external/自定义",
+    "vllm/v1/executor/abstract.py:L94-L116 — Executor.__init__ → _init_executor() 抽象钩子（子类拉起 worker）",
+    "vllm/v1/executor/abstract.py:L152-L202 — collective_rpc 抽象契约（含 non_block / 返回 list 语义）",
+    "vllm/v1/executor/abstract.py:L221-L247 — execute_model / sample_tokens：薄封装，转调 collective_rpc 取 output[0]",
+    "vllm/v1/executor/uniproc_executor.py:L26-L100 — UniProcExecutor：同进程直调 run_method，无子进程，作为最简对照",
+    "vllm/v1/executor/multiproc_executor.py:L102-L246 — MultiprocExecutor._init_executor：建广播 MQ、逐 local_rank 拉起 WorkerProc、wait_for_ready、起监控线程、装配 response_mqs",
+    "vllm/v1/executor/multiproc_executor.py:L339-L403 — MultiprocExecutor.collective_rpc：enqueue 广播 + 构造 FutureWrapper",
+    "vllm/v1/executor/multiproc_executor.py:L69-L100 — FutureWrapper：异步结果占位 + 顺序排空 futures_queue",
+    "vllm/v1/executor/multiproc_executor.py:L267-L304 — start_worker_monitor + register_failure_callback：sentinel 监控 + 失败传播",
+    "vllm/v1/executor/multiproc_executor.py:L578-L694 — WorkerProc.__init__ / make_worker_process：子进程包装、init_worker→init_device→load_model、ready/death pipe",
+    "vllm/v1/executor/multiproc_executor.py:L717-L753 — WorkerProc.wait_for_ready：READY 握手、收集 response MQ handle",
+    "vllm/v1/executor/multiproc_executor.py:L791-L895 — WorkerProc.worker_main：子进程入口、信号处理、READY 发送、busy_loop、异常→FAILURE",
+    "vllm/v1/executor/multiproc_executor.py:L897-L970 — ResponseStatus / enqueue_output / worker_busy_loop：取 RPC、调 worker 方法、回写结果或 FAILURE",
+    "vllm/v1/worker/worker_base.py:L179-L320 — WorkerWrapperBase：延迟初始化、按 worker_cls 字符串解析真实 Worker、__getattr__ 透传",
+    "vllm/v1/worker/worker_base.py:L38-L177 — WorkerBase：硬件无关的 worker 接口（execute_model/sample_tokens/init_device 等纯虚）",
+    "vllm/v1/worker/gpu_worker.py:L106-L156 — Worker(WorkerBase) GPU 具体实现的构造（生命周期锚点）",
+    "vllm/v1/worker/gpu_worker.py:L236-L333 — Worker.init_device：设备/分布式环境/内存快照/构造 model_runner",
+    "vllm/v1/worker/gpu_worker.py:L772-L861 — Worker.execute_model：包 model_runner.execute_model（PP 通信细节作锚点）"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/executor/abstract.py",
+      "lines": "L47-L92",
+      "purpose": "工厂三态分发的全貌——读者要看清字符串后端名如何映射到具体 Executor 子类",
+      "code": "    @staticmethod\n    def get_class(vllm_config: VllmConfig) -> type[\"Executor\"]:\n        executor_class: type[Executor]\n        parallel_config = vllm_config.parallel_config\n        distributed_executor_backend = parallel_config.distributed_executor_backend\n        # distributed_executor_backend must be set in VllmConfig.__post_init__\n        if isinstance(distributed_executor_backend, type):\n            if not issubclass(distributed_executor_backend, Executor):\n                raise TypeError(\n                    \"distributed_executor_backend must be a subclass of \"\n                    f\"Executor. Got {distributed_executor_backend}.\"\n                )\n            executor_class = distributed_executor_backend\n        elif distributed_executor_backend == \"ray\":\n            if envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:\n                from vllm.v1.executor.ray_executor_v2 import RayExecutorV2\n                executor_class = RayExecutorV2\n            else:\n                from vllm.v1.executor.ray_executor import RayDistributedExecutor\n                executor_class = RayDistributedExecutor\n        elif distributed_executor_backend == \"mp\":\n            from vllm.v1.executor.multiproc_executor import MultiprocExecutor\n            executor_class = MultiprocExecutor\n        elif distributed_executor_backend == \"uni\":\n            from vllm.v1.executor.uniproc_executor import UniProcExecutor\n            executor_class = UniProcExecutor\n        elif distributed_executor_backend == \"external_launcher\":\n            # TODO: make v1 scheduling deterministic\n            # to support external launcher\n            executor_class = ExecutorWithExternalLauncher\n        elif isinstance(distributed_executor_backend, str):\n            executor_class = resolve_obj_by_qualname(distributed_executor_backend)\n            if not issubclass(executor_class, Executor):\n                raise TypeError(\n                    \"distributed_executor_backend must be a subclass of \"\n                    f\"Executor. Got {executor_class}.\"\n                )\n        else:\n            raise ValueError(\n                f\"Unknown distributed executor backend: {distributed_executor_backend}\"\n            )\n        return executor_class",
+      "elide": ["ray 分支的两条具体实现（RayExecutorV2 / RayDistributedExecutor）只需点到分发存在，本章不展开 ray 内部；`isinstance(...,type)` 与最后的 `str` qualname 分支是『用户自定义 Executor 子类』的扩展点，讲一句即可"]
+    },
+    {
+      "path": "vllm/v1/executor/abstract.py",
+      "lines": "L94-L116, L221-L227",
+      "purpose": "Executor 基类构造把 _init_executor 留给子类；execute_model 只是 collective_rpc 的薄封装——这是『所有引擎指令都走 collective_rpc』的统一入口",
+      "code": "    def __init__(\n        self,\n        vllm_config: VllmConfig,\n    ) -> None:\n        self.vllm_config = vllm_config\n        # ... 把各 sub-config 摊平到 self ...\n        self._init_executor()\n        self.is_sleeping = False\n        self.sleeping_tags: set[str] = set()\n        self.kv_output_aggregator: KVOutputAggregator | None = None\n\n    @abstractmethod\n    def _init_executor(self) -> None:\n        raise NotImplementedError\n\n    # ... 其余方法均以 collective_rpc 实现，例如 ...\n    def execute_model(\n        self, scheduler_output: SchedulerOutput, non_block: bool = False\n    ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:\n        output = self.collective_rpc(\n            \"execute_model\", args=(scheduler_output,), non_block=non_block\n        )\n        return output[0]",
+      "elide": ["__init__ 中把 model_config/cache_config/... 逐个赋值给 self 的样板行可省略为注释；determine_available_memory/get_kv_cache_specs/add_lora/sleep/wake_up 等十余个方法全是同模式的 collective_rpc 封装，正文挑 1-2 个示范即可，不必逐个抄"]
+    },
+    {
+      "path": "vllm/v1/executor/abstract.py",
+      "lines": "L199-L202 (契约), L221-L247",
+      "purpose": "collective_rpc 的语义契约：广播到所有 worker，可传方法名或可序列化 callable，non_block 时返回 Future——这是控制平面的核心抽象",
+      "code": "    @abstractmethod\n    def collective_rpc(\n        self, method, timeout=None, args=(), kwargs=None, non_block: bool = False\n    ):\n        raise NotImplementedError\n    # 契约（见 overload docstring）：\n    #   method: worker 方法名 str，或被序列化后发给所有 worker 执行的 callable\n    #           （callable 额外接收 worker 自身作为首个 self 参数）\n    #   timeout: 秒；超时抛 TimeoutError；None 表示无限等\n    #   args/kwargs: 透传给 worker 方法\n    #   non_block: True 时返回 Future（列表），不阻塞\n    #   返回: 每个 worker 结果组成的 list\n    #   建议仅用于传控制消息，数据平面另设通道",
+      "elide": ["两个 @overload 签名（non_block Literal[False]/[True]）只是类型层面的精确化，正文用一句话概括返回类型随 non_block 变化即可，不必抄两段重复签名"]
+    },
+    {
+      "path": "vllm/v1/executor/uniproc_executor.py",
+      "lines": "L26-L52, L67-L100",
+      "purpose": "最简对照：uni 后端没有子进程，driver_worker 就在本进程，collective_rpc 退化为同进程直调——让读者先理解『一个 worker 时控制平面是什么』，再看 mp 如何复杂化",
+      "code": "class UniProcExecutor(Executor):\n    def _init_executor(self) -> None:\n        \"\"\"Initialize the worker and load the model.\"\"\"\n        self.driver_worker = WorkerWrapperBase(rpc_rank=0)\n        distributed_init_method, rank, local_rank = self._distributed_args()\n        kwargs = dict(\n            vllm_config=self.vllm_config,\n            local_rank=local_rank,\n            rank=rank,\n            distributed_init_method=distributed_init_method,\n            is_driver_worker=True,\n            shared_worker_lock=Lock(),\n        )\n        # ... async_output_thread 略 ...\n        self.driver_worker.init_worker(all_kwargs=[kwargs])\n        self.driver_worker.init_device()\n        self.driver_worker.load_model()\n        current_platform.update_block_size_for_backend(self.vllm_config)\n\n    def collective_rpc(\n        self,\n        method: str | Callable,\n        timeout: float | None = None,\n        args: tuple = (),\n        kwargs: dict | None = None,\n        non_block: bool = False,\n        single_value: bool = False,\n    ) -> Any:\n        if kwargs is None:\n            kwargs = {}\n        if not non_block:\n            result = run_method(self.driver_worker, method, args, kwargs)\n            return result if single_value else [result]\n        # ... non_block 分支：直接同步算出结果，包进一个已完成的 Future ...",
+      "elide": ["async_output_thread / max_concurrent_batches>1 的线程池分支、non_block 里 AsyncModelRunnerOutput 的 get_output 处理，对『理解 uni 是 mp 的最简退化』不是必需，省略为注释；ExecutorWithExternalLauncher 子类（torchrun 多引擎）整体省略"]
+    },
+    {
+      "path": "vllm/v1/executor/multiproc_executor.py",
+      "lines": "L130-L205",
+      "purpose": "MultiprocExecutor 拉起子进程的主干：建一个广播 MessageQueue（rpc_broadcast_mq）→ 逐 local_rank fork/spawn 出 WorkerProc → wait_for_ready 握手 → 起监控线程。这是『一个执行器进程 + N 个 worker 子进程』拓扑的诞生现场",
+      "code": "        self.rpc_broadcast_mq: MessageQueue | None = None\n        scheduler_output_handle: Handle | None = None\n        if self.parallel_config.node_rank_within_dp == 0:\n            max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024\n            mq_connect_ip = get_ip()\n            self.rpc_broadcast_mq = MessageQueue(\n                self.world_size,\n                self.local_world_size,\n                max_chunk_bytes=max_chunk_bytes,\n                connect_ip=mq_connect_ip,\n            )\n            scheduler_output_handle = self.rpc_broadcast_mq.export_handle()\n        # Create workers\n        context = get_mp_context()\n        shared_worker_lock = context.Lock()\n        unready_workers: list[UnreadyWorkerProcHandle] = []\n        success = False\n        try:\n            global_start_rank = (\n                self.local_world_size * self.parallel_config.node_rank_within_dp\n            )\n            # ... inherited_fds / cpu_omp_manager 略 ...\n            for local_rank in range(self.local_world_size):\n                global_rank = global_start_rank + local_rank\n                is_driver_worker = self._is_driver_worker(global_rank)\n                unready_worker_handle = WorkerProc.make_worker_process(\n                    vllm_config=self.vllm_config,\n                    local_rank=local_rank,\n                    rank=global_rank,\n                    distributed_init_method=distributed_init_method,\n                    input_shm_handle=scheduler_output_handle,\n                    shared_worker_lock=shared_worker_lock,\n                    is_driver_worker=is_driver_worker,\n                    inherited_fds=inherited_fds,\n                )\n                unready_workers.append(unready_worker_handle)\n            # Workers must be created before wait_for_ready to avoid deadlock,\n            # since worker.init_device() does a device sync.\n            self.workers = WorkerProc.wait_for_ready(unready_workers)\n            if self.monitor_workers:\n                self.start_worker_monitor()\n            # ... 装配 self.response_mqs（单节点取 worker_response_mq）...\n            if self.rpc_broadcast_mq is not None:\n                self.rpc_broadcast_mq.wait_until_ready()\n            for response_mq in self.response_mqs:\n                response_mq.wait_until_ready()\n            self.futures_queue = deque[FutureWrapper]()\n            success = True\n        finally:\n            if not success:\n                # 失败则关 death_writer 通知 worker 退出，并强制终止\n                for uw in unready_workers:\n                    if uw.death_writer is not None:\n                        uw.death_writer.close()\n                        uw.death_writer = None\n                self._ensure_worker_termination([uw.proc for uw in unready_workers])",
+      "elide": ["多节点（nnodes_within_dp>1）的 DP-leader 日志、远程 response_mqs 跨节点装配（self.workers[0].peer_worker_response_mqs[rank]）属于多机分布式细节，本章聚焦单节点路径，跨节点装配可一句话带过；OMPProcessManager/inherited_fds(fork) 是平台/启动法适配，省略为注释"]
+    },
+    {
+      "path": "vllm/v1/executor/multiproc_executor.py",
+      "lines": "L339-L403",
+      "purpose": "mp 版 collective_rpc 全貌：把 (method,args,kwargs,output_rank) enqueue 进广播 MQ，然后构造 FutureWrapper 异步等回复。这是控制平面『一次广播、N 路应答』的实现核心",
+      "code": "    def collective_rpc(\n        self,\n        method: str | Callable,\n        timeout: float | None = None,\n        args: tuple = (),\n        kwargs: dict | None = None,\n        non_block: bool = False,\n        unique_reply_rank: int | None = None,\n        kv_output_aggregator: KVOutputAggregator | None = None,\n    ) -> Any:\n        \"\"\"Returns single result if unique_reply_rank and/or kv_output_aggregator\n        is provided, otherwise list.\"\"\"\n        assert self.rpc_broadcast_mq is not None, (\n            \"collective_rpc should not be called on follower node\"\n        )\n        if self.is_failed:\n            raise RuntimeError(\"Executor failed.\")\n        deadline = None if timeout is None else time.monotonic() + timeout\n        kwargs = kwargs or {}\n        if kv_output_aggregator is not None:\n            output_rank = None\n            aggregate = partial(\n                kv_output_aggregator.aggregate, output_rank=unique_reply_rank or 0\n            )\n        else:\n            output_rank = unique_reply_rank\n            aggregate = lambda x: x\n        if isinstance(method, str):\n            send_method = method\n        else:\n            send_method = cloudpickle.dumps(method, protocol=pickle.HIGHEST_PROTOCOL)\n        self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))\n        response_mqs: Sequence[MessageQueue] = self.response_mqs\n        if output_rank is not None:\n            response_mqs = (response_mqs[output_rank],)\n        def get_response():\n            responses = []\n            for mq in response_mqs:\n                dequeue_timeout = (\n                    None if deadline is None else (deadline - time.monotonic())\n                )\n                try:\n                    status, result = mq.dequeue(timeout=dequeue_timeout)\n                except TimeoutError as e:\n                    raise TimeoutError(f\"RPC call to {method} timed out.\") from e\n                if status != WorkerProc.ResponseStatus.SUCCESS:\n                    raise RuntimeError(\n                        f\"Worker failed with error '{result}', please check the\"\n                        \" stack trace above for the root cause\"\n                    )\n                responses.append(result)\n            return responses[0] if output_rank is not None else responses\n        future = FutureWrapper(\n            self.futures_queue,\n            get_response=get_response,\n            aggregate=aggregate,\n        )\n        return future if non_block else future.result()",
+      "elide": ["kv_output_aggregator 分支（PD 解耦/KV 连接器聚合多 rank 输出）属于 ch15/16 主题，本章只需说明『有 unique_reply_rank 就只收一个 rank 的回复』；cloudpickle.dumps 那行对应『method 是 callable 时序列化整个函数发出去』，要讲清这一能力"]
+    },
+    {
+      "path": "vllm/v1/executor/multiproc_executor.py",
+      "lines": "L69-L100",
+      "purpose": "FutureWrapper：把『回复还没到』包成 concurrent.futures.Future。关键巧思是 result() 会顺序排空 futures_queue 中排在自己前面的 future——因为底层 MQ 是 FIFO，必须按发出顺序取回复",
+      "code": "class FutureWrapper(Future):\n    def __init__(\n        self,\n        futures_queue: deque[\"FutureWrapper\"],\n        get_response: Callable[[], Any],\n        aggregate: Callable = lambda x: x,\n    ):\n        self.futures_queue = futures_queue\n        self.get_response = get_response\n        self.aggregate = aggregate\n        super().__init__()\n        self.futures_queue.appendleft(self)\n\n    def result(self, timeout=None):\n        if timeout is not None:\n            raise RuntimeError(\"timeout not implemented\")\n        # Drain any futures ahead of us in the queue.\n        while not self.done():\n            future = self.futures_queue.pop()\n            future._wait_for_response()\n        return super().result()\n\n    def _wait_for_response(self):\n        try:\n            response = self.aggregate(self.get_response())\n            with suppress(InvalidStateError):\n                self.set_result(response)\n        except Exception as e:\n            with suppress(InvalidStateError):\n                self.set_exception(e)",
+      "elide": ["无可省略分支——这是个小而完整的类，appendleft/pop 的 FIFO 配对是理解点，必须逐字讲"]
+    },
+    {
+      "path": "vllm/v1/executor/multiproc_executor.py",
+      "lines": "L267-L304",
+      "purpose": "失败监控与传播：监控线程用 multiprocessing.connection.wait 阻塞在所有 worker 的 sentinel 上，任一 worker 进程死亡即 wait 返回 → 置 is_failed、关停执行器、调失败回调通知引擎",
+      "code": "    def start_worker_monitor(self, inline=False) -> None:\n        workers = self.workers\n        self_ref = weakref.ref(self)\n        # Monitors worker process liveness. If any die unexpectedly,\n        # logs an error, shuts down the executor and invokes the failure\n        # callback to inform the engine.\n        def monitor_workers():\n            sentinels = [h.proc.sentinel for h in workers]\n            died = multiprocessing.connection.wait(sentinels)\n            _self = self_ref()\n            if not _self or getattr(_self, \"shutting_down\", False):\n                logger.debug(\"MultiprocWorkerMonitor: shutdown already initiated\")\n                return\n            _self.is_failed = True\n            proc_name = next(h.proc.name for h in workers if h.proc.sentinel == died[0])\n            logger.error(\n                \"Worker proc %s died unexpectedly, shutting down executor.\", proc_name\n            )\n            _self.shutdown()\n            callback = _self.failure_callback\n            if callback is not None:\n                _self.failure_callback = None\n                callback()\n        if not inline:\n            Thread(\n                target=monitor_workers, daemon=True, name=\"MultiprocWorkerMonitor\"\n            ).start()\n            return\n        monitor_workers()\n\n    def register_failure_callback(self, callback: FailureCallback):\n        if self.is_failed:\n            callback()\n        else:\n            self.failure_callback = callback",
+      "elide": ["weakref.ref 用来避免监控线程持有 executor 强引用导致无法 GC，讲一句即可；inline 分支仅测试用"]
+    },
+    {
+      "path": "vllm/v1/executor/multiproc_executor.py",
+      "lines": "L578-L641",
+      "purpose": "WorkerProc.__init__（子进程内执行）：用 WorkerWrapperBase 延迟初始化真实 worker → init_device 加载/建分布式组 → load_model → 建 response MQ。这是『一个子进程里 worker 从无到可服务』的生命周期主线",
+      "code": "    def __init__(\n        self,\n        vllm_config: VllmConfig,\n        local_rank: int,\n        rank: int,\n        distributed_init_method: str,\n        input_shm_handle: Handle,\n        shared_worker_lock: LockType,\n        is_driver_worker: bool,\n    ):\n        self.rank = rank\n        wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)\n        # TODO: move `init_worker` to executor level as a collective rpc call\n        all_kwargs: list[dict] = [\n            {} for _ in range(vllm_config.parallel_config.world_size)\n        ]\n        all_kwargs[local_rank] = {\n            \"vllm_config\": vllm_config,\n            \"local_rank\": local_rank,\n            \"rank\": rank,\n            \"distributed_init_method\": distributed_init_method,\n            \"is_driver_worker\": is_driver_worker,\n            \"shared_worker_lock\": shared_worker_lock,\n        }\n        wrapper.init_worker(all_kwargs)\n        self.worker = wrapper\n        self.setup_proc_title_and_log_prefix(...)\n        # Load model\n        self.worker.init_device()\n        self.setup_proc_title_and_log_prefix(...)\n        self.worker.load_model()\n        scheduler_config = vllm_config.scheduler_config\n        self.use_async_scheduling = scheduler_config.async_scheduling\n        if self.use_async_scheduling:\n            self.async_output_queue: queue.Queue = queue.Queue()\n            self.async_output_copy_thread = Thread(\n                target=self.async_output_busy_loop, daemon=True,\n                name=\"WorkerAsyncOutputCopy\",\n            )\n            self.async_output_copy_thread.start()\n        current_platform.update_block_size_for_backend(vllm_config)\n        # Initialize message queues after init_device()\n        self._init_message_queues(input_shm_handle, vllm_config)\n        enable_envs_cache()",
+      "elide": ["all_kwargs 用 world_size 长度的 list 占位、只填本 rpc_rank 槽位，是为兼容 SPMD（多执行器各 1 worker）；VLLM_ELASTIC_EP_SCALE_UP_LAUNCH 分支、enable_ep 进程名都是次要；_init_message_queues 内部单/多节点两条路径，单节点是 `MessageQueue(1,1)`，正文以单节点为主"]
+    },
+    {
+      "path": "vllm/v1/executor/multiproc_executor.py",
+      "lines": "L791-L861",
+      "purpose": "WorkerProc.worker_main——子进程真正的入口（context.Process target）：装信号处理、构造 WorkerProc、发 READY 握手回父进程、进 busy_loop；任何异常都被捕获并转成 shutdown，避免裸抛污染。生命周期的『出生→服役→死亡』在此一览",
+      "code": "    @staticmethod\n    def worker_main(*args, **kwargs):\n        \"\"\"Worker initialization and execution loops. This runs a background process\"\"\"\n        shutdown_requested = threading.Event()\n        def signal_handler(signum, frame):\n            nonlocal shutdown_requested\n            if not shutdown_requested.is_set():\n                shutdown_requested.set()\n                raise SystemExit()\n        signal.signal(signal.SIGTERM, signal_handler)\n        signal.signal(signal.SIGINT, signal_handler)\n        worker = None\n        ready_writer = kwargs.pop(\"ready_pipe\")\n        death_pipe = kwargs.pop(\"death_pipe\", None)\n        for fd in kwargs.pop(\"inherited_fds\", []):\n            try:\n                os.close(fd)\n            except Exception as e:\n                logger.warning(\"Error closing inherited connection: %s: %s\", type(e), e)\n        try:\n            worker = WorkerProc(*args, **kwargs)\n            assert worker.worker_response_mq is not None\n            worker.monitor_death_pipe(death_pipe, shutdown_requested)\n            # Send READY once we know everything is loaded\n            ready_writer.send(\n                {\n                    \"status\": WorkerProc.READY_STR,\n                    \"handle\": worker.worker_response_mq.export_handle(),\n                    \"peer_response_handles\": worker.peer_response_handles,\n                }\n            )\n            if worker.rpc_broadcast_mq is not None:\n                worker.rpc_broadcast_mq.wait_until_ready()\n            worker.worker_response_mq.wait_until_ready()\n            ready_writer.close()\n            ready_writer = None\n            worker.worker_busy_loop()\n        except Exception:\n            # NOTE: if an Exception arises in busy_loop, we send a FAILURE\n            # message over the MQ RPC to notify the Executor.\n            if ready_writer is not None:\n                logger.exception(\"WorkerProc failed to start.\")\n            elif shutdown_requested.is_set():\n                logger.info(\"WorkerProc shutting down.\")\n            else:\n                logger.exception(\"WorkerProc failed.\")\n            shutdown_requested.set()\n        except SystemExit as e:\n            logger.warning(\"WorkerProc was terminated\")\n            raise e\n        finally:\n            if ready_writer is not None:\n                ready_writer.close()\n            if death_pipe is not None:\n                death_pipe.close()\n            if worker is not None:\n                worker.shutdown()",
+      "elide": ["maybe_init_worker_tracer、numa 亲和日志是可观测性细节；ready_writer 是否为 None 用来区分『启动期失败 vs 运行期失败』，这点要讲清"]
+    },
+    {
+      "path": "vllm/v1/executor/multiproc_executor.py",
+      "lines": "L897-L970",
+      "purpose": "worker 服役主循环 + 结果回写：busy_loop 阻塞 dequeue 一条 RPC → getattr 取方法或反序列化 callable → 执行 → 仅当 output_rank 匹配本 rank 时回写结果；异常被转成 FAILURE 状态回写。这是控制平面在 worker 侧的闭环",
+      "code": "    class ResponseStatus(Enum):\n        SUCCESS = auto()\n        FAILURE = auto()\n\n    def enqueue_output(self, output: Any):\n        \"\"\"Prepares output from the worker and enqueues it to the\n        worker_response_mq. If the output is an Exception, it is\n        converted to a FAILURE response.\n        \"\"\"\n        if isinstance(output, AsyncModelRunnerOutput):\n            output = output.get_output()\n        if isinstance(output, Exception):\n            result = (WorkerProc.ResponseStatus.FAILURE, str(output))\n        else:\n            result = (WorkerProc.ResponseStatus.SUCCESS, output)\n        if (response_mq := self.worker_response_mq) is not None:\n            response_mq.enqueue(result)\n\n    def handle_output(self, output: Any):\n        if self.use_async_scheduling:\n            self.async_output_queue.put(output)\n        else:\n            self.enqueue_output(output)\n\n    def worker_busy_loop(self):\n        \"\"\"Main busy loop for Multiprocessing Workers\"\"\"\n        assert self.rpc_broadcast_mq is not None\n        while True:\n            method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(\n                indefinite=True\n            )\n            try:\n                if isinstance(method, str):\n                    func = getattr(self.worker, method)\n                elif isinstance(method, bytes):\n                    func = partial(cloudpickle.loads(method), self.worker)\n                output = func(*args, **kwargs)\n            except Exception as e:\n                if hasattr(e, \"add_note\"):\n                    e.add_note(traceback.format_exc())\n                logger.exception(\"WorkerProc hit an exception.\")\n                if output_rank is None or self.rank == output_rank:\n                    self.handle_output(e)\n                continue\n            if output_rank is None or self.rank == output_rank:\n                self.handle_output(output)",
+      "elide": ["async_output_busy_loop 线程（异步调度时把输出拷贝挪到后台线程）可一句带过；add_note(traceback) 是把子进程栈带回主进程的小技巧，值得提一句"]
+    },
+    {
+      "path": "vllm/v1/worker/worker_base.py",
+      "lines": "L179-L320",
+      "purpose": "WorkerWrapperBase：延迟初始化的核心。先只记住 rpc_rank，待 init_worker 时按 parallel_config.worker_cls（字符串 qualname）解析出真实 Worker 类再实例化；__getattr__ 把一切未知属性透传给内部 worker——这就是 collective_rpc 能用 getattr(self.worker, method) 调到具体方法的根基",
+      "code": "class WorkerWrapperBase:\n    \"\"\"This class represents one process in an executor/engine. It is responsible\n    for lazily initializing the worker and handling the worker's lifecycle.\"\"\"\n    def __init__(\n        self,\n        rpc_rank: int = 0,\n        global_rank: int | None = None,\n    ) -> None:\n        self.rpc_rank: int = rpc_rank\n        self.global_rank: int = self.rpc_rank if global_rank is None else global_rank\n        # Initialized after init_worker is called\n        self.worker: WorkerBase\n        self.vllm_config: VllmConfig\n\n    def update_environment_variables(self, envs_list: list[dict[str, str]]) -> None:\n        envs = envs_list[self.rpc_rank]\n        update_environment_variables(envs)\n\n    def init_worker(self, all_kwargs: list[dict[str, Any]]) -> None:\n        \"\"\"Here we inject some common logic before initializing the worker.\"\"\"\n        kwargs = all_kwargs[self.rpc_rank]\n        vllm_config: VllmConfig | None = kwargs.get(\"vllm_config\")\n        assert vllm_config is not None\n        self.vllm_config = vllm_config\n        vllm_config.enable_trace_function_call_for_thread()\n        from vllm.plugins import load_general_plugins\n        load_general_plugins()\n        parallel_config = vllm_config.parallel_config\n        if isinstance(parallel_config.worker_cls, str):\n            worker_class: type[WorkerBase] = resolve_obj_by_qualname(\n                parallel_config.worker_cls\n            )\n        else:\n            raise ValueError(\"passing worker_cls is no longer supported. ...\")\n        # ... worker_extension_cls 动态注入（扩展 collective_rpc 可调方法）略 ...\n        with set_current_vllm_config(self.vllm_config):\n            self.worker = worker_class(**kwargs)\n\n    def init_device(self):\n        assert self.vllm_config is not None\n        with set_current_vllm_config(self.vllm_config):\n            self.worker.init_device()\n\n    def __getattr__(self, attr: str):\n        return getattr(self.worker, attr)\n\n    def execute_model(\n        self, scheduler_output: SchedulerOutput\n    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:\n        self._apply_mm_cache(scheduler_output)\n        return self.worker.execute_model(scheduler_output)",
+      "elide": ["worker_extension_cls 动态把扩展类塞进 worker_class.__bases__（RLHF/外部插件扩展 collective_rpc 可调方法）讲一句即可；shared_worker_lock / mm_receiver_cache(shm 多模态缓存) 分支属于多模态，本章省略；initialize_from_config 同模式透传"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "Executor", "file": "vllm/v1/executor/abstract.py", "responsibility": "执行器抽象基类：静态工厂 get_class() 三态分发；__init__→_init_executor() 钩子；把 execute_model/sample_tokens/determine_available_memory/add_lora/sleep 等所有引擎指令统一实现为 collective_rpc 调用（控制平面唯一入口）"},
+    {"name": "UniProcExecutor", "file": "vllm/v1/executor/uniproc_executor.py", "responsibility": "单进程执行器：driver_worker 就在本进程，collective_rpc 退化为同进程 run_method 直调。作为 mp 的最简对照"},
+    {"name": "MultiprocExecutor", "file": "vllm/v1/executor/multiproc_executor.py", "responsibility": "多进程执行器：一个执行器进程 + N 个 worker 子进程；建广播 MessageQueue 把 RPC 一次性发给所有 worker、用 FutureWrapper 异步收回复、起监控线程做失败传播、统一关停"},
+    {"name": "FutureWrapper", "file": "vllm/v1/executor/multiproc_executor.py", "responsibility": "concurrent.futures.Future 子类：把『worker 回复尚未到达』包成 future；result() 按发出顺序排空 futures_queue（底层 MQ 是 FIFO），可选 aggregate 聚合多 rank 输出"},
+    {"name": "WorkerProc", "file": "vllm/v1/executor/multiproc_executor.py", "responsibility": "把一个 Worker 跑在独立子进程里的包装：worker_main 入口、READY/death pipe 握手、worker_busy_loop 取 RPC 执行回写、异常转 FAILURE、shutdown 清理分布式组"},
+    {"name": "UnreadyWorkerProcHandle / WorkerProcHandle", "file": "vllm/v1/executor/multiproc_executor.py", "responsibility": "父进程侧对 worker 子进程的句柄：进程对象、rank、response MQ、death_writer。Unready→Ready 经 wait_for_ready 转换"},
+    {"name": "WorkerWrapperBase", "file": "vllm/v1/worker/worker_base.py", "responsibility": "进程内对 worker 的延迟初始化包装：先记 rpc_rank，init_worker 时按 worker_cls qualname 解析真实 Worker 类实例化；__getattr__ 透传——使 collective_rpc 的 getattr 能命中具体方法"},
+    {"name": "WorkerBase", "file": "vllm/v1/worker/worker_base.py", "responsibility": "硬件无关的 worker 接口：execute_model/sample_tokens/init_device/load_model/determine_available_memory/add_lora 等纯虚方法，供各硬件后端实现"},
+    {"name": "Worker", "file": "vllm/v1/worker/gpu_worker.py", "responsibility": "WorkerBase 的 GPU/CUDA 具体实现：init_device 建设备+分布式环境+内存快照并构造 model_runner，execute_model 包 model_runner 前向（含 PP 通信），determine_available_memory 剖析显存定 KV 容量。本章作生命周期锚点，前向/KV 剖析细节留后章"}
+  ],
+
+  "data_flow": [
+    "构造选型：上层（EngineCore/AsyncLLM）调 Executor.get_class(vllm_config) — abstract.py:Executor.get_class，按 parallel_config.distributed_executor_backend ∈ {type, 'ray','mp','uni','external_launcher', 自定义 qualname} 返回对应 Executor 子类",
+    "执行器构造：executor_class(vllm_config) → Executor.__init__ 摊平 config 并调 _init_executor() — abstract.py:Executor.__init__",
+    "mp 路径拉起 worker：MultiprocExecutor._init_executor 建 rpc_broadcast_mq（共享内存广播 MessageQueue）→ 循环 local_rank 调 WorkerProc.make_worker_process 起子进程 — multiproc_executor.py:_init_executor / make_worker_process",
+    "子进程出生：WorkerProc.worker_main 装信号 → WorkerProc.__init__ 内 WorkerWrapperBase.init_worker（按 worker_cls 解析真实 Worker）→ init_device → load_model — multiproc_executor.py:worker_main/__init__ + worker_base.py:WorkerWrapperBase.init_worker",
+    "就绪握手：子进程 worker_main 经 ready_pipe 发 {status:READY, handle:response_mq} → 父进程 WorkerProc.wait_for_ready 收齐所有 worker — multiproc_executor.py:worker_main/wait_for_ready",
+    "监控挂载：父进程 start_worker_monitor 起线程阻塞在所有 worker sentinel — multiproc_executor.py:start_worker_monitor",
+    "一次引擎指令（如 execute_model）：Executor.execute_model → collective_rpc('execute_model', args, non_block) — abstract.py / multiproc_executor.py:collective_rpc",
+    "广播：collective_rpc 把 (send_method,args,kwargs,output_rank) enqueue 进 rpc_broadcast_mq；method 为 callable 时 cloudpickle.dumps 序列化整函数 — multiproc_executor.py:collective_rpc",
+    "worker 执行：每个 WorkerProc.worker_busy_loop dequeue 到 RPC → getattr(self.worker, method) 或反序列化 callable → func(*args) → handle_output 回写 worker_response_mq（仅 output_rank 匹配者回写）— multiproc_executor.py:worker_busy_loop/enqueue_output",
+    "收回复：父进程 FutureWrapper.result() 排空 futures_queue 并对各 response_mq dequeue，status≠SUCCESS 则抛 RuntimeError；non_block 时直接返回 future — multiproc_executor.py:FutureWrapper/get_response",
+    "失败传播：任一 worker 子进程死亡 → monitor 线程 wait 返回 → is_failed=True → shutdown() → 调 failure_callback 通知引擎 — multiproc_executor.py:start_worker_monitor",
+    "关停：Executor.shutdown→collective_rpc('shutdown') 或 MultiprocExecutor.shutdown 关 death_writer→_ensure_worker_termination（graceful→SIGTERM→SIGKILL）→关各 MQ — multiproc_executor.py:shutdown/_ensure_worker_termination"
+  ],
+
+  "design_decisions": [
+    {"decision": "Executor 用静态工厂 get_class() 按字符串后端名分发 uni/mp/ray/external/自定义，而非在引擎里硬编码", "why": "把『同一份引擎逻辑跑在单卡/多进程/Ray/外部启动器』的差异收敛到一个分发点；后端可由配置或用户自定义 Executor 子类（qualname 或 type）扩展", "evidence": "vllm/v1/executor/abstract.py:L47-L92"},
+    {"decision": "所有引擎指令统一走 collective_rpc 这一个抽象，而非每个动作各设接口", "why": "把『把一次调用送达所有 worker 并收齐结果』这件事抽象成唯一控制平面入口，execute_model/sleep/add_lora/check_health 全是它的薄封装，子类只需实现 collective_rpc 一处即定义整套语义", "evidence": "vllm/v1/executor/abstract.py:L221-L312"},
+    {"decision": "mp 后端用共享内存 MessageQueue 广播，而非逐 worker 单独 RPC/pickle over pipe", "why": "调度产物（SchedulerOutput）要一次发给所有 TP/PP worker，shm 广播 MQ 让一次 enqueue 被所有 reader 看到，零拷贝大块数据，避免 N 份序列化", "evidence": "vllm/v1/executor/multiproc_executor.py:L150-L156,L373"},
+    {"decision": "用 FutureWrapper + futures_queue(deque) 而非给每个 RPC 配独立通道", "why": "底层 response MQ 是 FIFO，回复顺序 = 发出顺序；FutureWrapper.result() 在等自己之前先按序排空前面的 future，既支持 non_block 流水线（连发多个 RPC 不立即阻塞）又保证回复正确配对", "evidence": "vllm/v1/executor/multiproc_executor.py:L69-L100,L397-L403"},
+    {"decision": "WorkerWrapperBase 延迟初始化：先存 rpc_rank，待 init_worker 才按 worker_cls 字符串 qualname 解析真实 Worker 类", "why": "子进程/分布式环境变量、CUDA 设备、插件需在 worker 真正实例化前就位；用字符串类名（不直接传类对象）便于跨进程序列化与平台/插件按需注入；__getattr__ 透传让包装对调用方透明", "evidence": "vllm/v1/worker/worker_base.py:L179-L320"},
+    {"decision": "worker 子进程异常不裸抛，而是转成 (FAILURE, str(e)) 经 response MQ 回报，并由 monitor 线程独立监控进程死亡两条失败路径", "why": "RPC 级错误（func 抛异常）经 MQ 回到 collective_rpc 抛 RuntimeError 给调用方；进程级崩溃（segfault/OOM kill）经 sentinel 监控触发 failure_callback——两条路径覆盖『方法失败』与『进程没了』，保证引擎不会静默挂死", "evidence": "vllm/v1/executor/multiproc_executor.py:L389-L393,L901-L914,L274-L290"},
+    {"decision": "用 ready pipe + death pipe 两条单向管道做生命周期握手", "why": "ready pipe 让父进程等到 worker 把模型加载完、response MQ 建好才认为 READY（避免对未就绪 worker 发 RPC 死锁）；death pipe 反向让子进程感知父进程退出（EOFError）从而自清理，避免孤儿进程", "evidence": "vllm/v1/executor/multiproc_executor.py:L655-L694,L766-L789,L844-L857"},
+    {"decision": "关停走 graceful→SIGTERM→SIGKILL 三级升级 + weakref.finalize 兜底", "why": "先关 death_writer 让 worker 自然退出，超时再 terminate、再 kill；weakref.finalize 保证即便 executor 被 GC 也触发 shutdown，杜绝 GPU 显存/共享内存泄漏与僵尸 worker", "evidence": "vllm/v1/executor/multiproc_executor.py:L405-L439,L112"},
+    {"decision": "execute_model 只从单一 output_rank（最后一个 PP 段的 TP rank0）收回复", "why": "TP 下各 rank 输出冗余、PP 下只有最后一段产出最终 token；OPTIMIZATION 上只收一个 rank 的结果避免无谓数据搬运与聚合", "evidence": "vllm/v1/executor/multiproc_executor.py:L306-L316,L480-L494"}
+  ],
+
+  "theory": [
+    "拓扑与进程数：MultiprocExecutor 下 world_size = tp_size × pp_size × pcp_size（断言见 _init_executor:L117-L122），单节点起 local_world_size 个 worker 子进程，每子进程持有一张 GPU。控制平面是 1 个执行器进程 ⇄ N 个 worker 的星形广播。",
+    "广播一对多 vs 应答多对一的不对称：一次 collective_rpc 只 enqueue 一次（O(1) 次发送，shm 让 N 个 reader 共享同块数据），但要 dequeue N 个 response MQ（O(world_size) 次接收）；execute_model 通过 output_rank 把应答收敛到 1 个 rank，降到 O(1)。",
+    "FIFO 配对的正确性论证：futures_queue 用 appendleft 入队、pop 出队（两端配合即 FIFO），与底层 response MQ 的 FIFO 同序；只要每个 FutureWrapper.result() 在取自己前先排空更早的 future，就保证『第 k 个发出的 RPC 对应第 k 个回复』，无需给每个 RPC 配 id 或独立通道。",
+    "两类失败的覆盖性：worker 方法抛异常 → busy_loop 捕获 → enqueue (FAILURE,msg) → collective_rpc 的 get_response 抛 RuntimeError（同步失败可恢复/可定位）；worker 进程被 OS 杀死（OOM/segfault，根本到不了 except）→ sentinel 就绪 → monitor 线程置 is_failed 并回调引擎（异步致命）。两路并存才能既报方法错又报进程死。",
+    "延迟初始化的必要性（时序约束）：环境变量/CUDA 可见设备/插件必须在 worker_class(**kwargs) 之前设好，否则 torch/CUDA 上下文绑错卡；故 WorkerWrapperBase 把『记住类名』与『真正实例化』拆成两步，中间留出 update_environment_variables / init_device 的窗口。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "ray 后端的两条分支（RayExecutorV2 / RayDistributedExecutor）及 VLLM_USE_RAY_V2_EXECUTOR_BACKEND 判断", "why_safe": "本章 mp/uni 已能讲清工厂分发与控制平面；ray 是另一套编排（独立章节/超纲），删去不影响 mp/uni 控制流的正确性，工厂保留 elif 'mp'/'uni' 即可示范分发"},
+      {"what": "多节点路径：nnodes_within_dp>1 的 DP-leader、create_mq_broadcaster、peer_worker_response_mqs 跨节点装配、_init_message_queues 的 else 分支", "why_safe": "精简版聚焦单节点（nnodes_within_dp==1），worker_response_mq = MessageQueue(1,1) 这条路径自洽；删跨节点装配不破坏单节点广播/应答闭环"},
+      {"what": "kv_output_aggregator 聚合分支（collective_rpc 内 partial(aggregate) 与 KVOutputAggregator）", "why_safe": "属于 PD 解耦/KV 连接器（ch15/16）主题，default aggregate=lambda x:x 时控制平面完全等价；删聚合保留 unique_reply_rank 的单 rank 应答即可"},
+      {"what": "OMPProcessManager/cpu_omp_manager、numa_utils 绑定、inherited_fds(fork 适配)、VLLM_ELASTIC_EP_SCALE_UP_LAUNCH/elastic_ep_execute、worker_extension_cls 动态注入、mm_receiver_cache(shm 多模态缓存)、async_output_busy_loop 异步调度线程、setup_proc_title_and_log_prefix 的并行组命名", "why_safe": "均为平台适配/可观测性/特性开关，与『拉起 worker→广播 RPC→收结果→失败/关停』主控制流正交；删后默认路径（CUDA 单节点同步调度）行为不变"},
+      {"what": "gpu_worker.Worker 的 sleep/wake_up/profiler/weight_transfer/update_weights/save_sharded_state/determine_available_memory 完整体、execute_model 内 PP irecv/isend 通信细节", "why_safe": "本章把 Worker 当生命周期锚点，只需保留 __init__/init_device 主干 + execute_model 调 model_runner 的骨架；KV 内存剖析与前向/PP 通信是 ch18/ch19 主题，删其实现不影响『WorkerWrapperBase→Worker→model_runner』的调用链展示"}
+    ],
+    "must_keep": [
+      {"symbol": "Executor.get_class", "why": "工厂三态分发是本章主线，writer 必须讲；精简版须保留该静态方法及 mp/uni/自定义 三条分支"},
+      {"symbol": "Executor._init_executor", "why": "抽象钩子，子类拉起 worker 的入口；连接 __init__ 与各 Executor 的关键"},
+      {"symbol": "collective_rpc", "why": "控制平面唯一抽象入口，所有指令的统一实现路径；uni/mp 两版都须保留以对照"},
+      {"symbol": "FutureWrapper", "why": "异步结果 + FIFO 排空是核心巧思，必须可见可讲"},
+      {"symbol": "futures_queue", "why": "FutureWrapper 顺序排空依赖的 deque，FIFO 配对正确性的载体"},
+      {"symbol": "MultiprocExecutor", "why": "本章主角执行器，承载广播 MQ/监控/关停"},
+      {"symbol": "rpc_broadcast_mq", "why": "共享内存广播 MessageQueue，一对多广播的实体"},
+      {"symbol": "response_mqs", "why": "多对一应答通道，collective_rpc 收结果的来源"},
+      {"symbol": "WorkerProc", "why": "把 worker 跑进子进程的包装类，生命周期主线"},
+      {"symbol": "worker_main", "why": "子进程入口，出生→READY→服役→死亡全在此"},
+      {"symbol": "worker_busy_loop", "why": "worker 侧取 RPC 执行回写的闭环主循环"},
+      {"symbol": "enqueue_output", "why": "结果/异常→(SUCCESS/FAILURE) 回写，失败传播的 worker 侧"},
+      {"symbol": "ResponseStatus", "why": "SUCCESS/FAILURE 枚举，定义失败回报协议"},
+      {"symbol": "start_worker_monitor", "why": "进程级失败监控线程，sentinel 机制"},
+      {"symbol": "register_failure_callback", "why": "把 worker 死亡传播给引擎的回调注册"},
+      {"symbol": "wait_for_ready", "why": "READY 握手，父进程等 worker 就绪，避免对未就绪 worker 发 RPC 死锁"},
+      {"symbol": "make_worker_process", "why": "拉起子进程 + 建 ready/death pipe 的工厂方法"},
+      {"symbol": "_ensure_worker_termination", "why": "graceful→SIGTERM→SIGKILL 三级关停，writer 须讲关停语义"},
+      {"symbol": "WorkerWrapperBase", "why": "延迟初始化包装，本章四大主题之一"},
+      {"symbol": "init_worker", "why": "按 worker_cls qualname 解析真实 Worker 类的延迟实例化点"},
+      {"symbol": "WorkerBase", "why": "硬件无关 worker 接口，Worker 的基类，说明 execute_model 等纯虚契约来源"},
+      {"symbol": "Worker", "why": "GPU 具体 worker，生命周期锚点（init_device/load_model/execute_model 骨架）"},
+      {"symbol": "init_device", "why": "worker 出生关键步：建设备+分布式环境+构造 model_runner"},
+      {"symbol": "UniProcExecutor", "why": "最简对照执行器，帮助理解 mp 是其多进程化"},
+      {"symbol": "run_method", "why": "uni 同进程直调底层（str→getattr / bytes→cloudpickle / callable→直接调），与 worker_busy_loop 的派发同构"}
+    ]
+  },
+
+  "diagram_plan": [
+    {
+      "name": "ch17-control-plane-topology",
+      "intent": "星形控制平面拓扑：1 个 MultiprocExecutor 进程 ⇄ N 个 WorkerProc 子进程；展示 rpc_broadcast_mq（一对多广播）与 N 条 worker_response_mq（多对一应答），标出 output_rank 只收一个 rank",
+      "svg_spec": "顶部一个 Executor 进程框，内含 rpc_broadcast_mq / response_mqs[] / futures_queue / monitor 线程；下方 4 个 WorkerProc 子进程框（rank0..3），每框含 worker_busy_loop + Worker(GPU)。一条粗箭头 broadcast MQ→所有 worker（标 enqueue 一次），4 条细箭头 worker_response_mq→Executor（其中仅 output_rank 高亮）。虚线 sentinel 从各 worker→monitor 线程",
+      "roadmap_highlight": "worker-and-executor（Part V 执行层入口）"
+    },
+    {
+      "name": "ch17-worker-lifecycle-timeline",
+      "intent": "worker 子进程生命周期时序：make_worker_process→worker_main→WorkerWrapperBase.init_worker(解析 worker_cls)→init_device→load_model→发 READY→wait_until_ready→worker_busy_loop→(失败/SIGTERM)→shutdown",
+      "svg_spec": "双泳道时序图：左泳道=Executor(父)，右泳道=WorkerProc(子)。自上而下：父 make_worker_process(起进程+pipe)→子 worker_main→子 init_worker/init_device/load_model→子经 ready_pipe 发 READY→父 wait_for_ready 收齐→父 start_worker_monitor→稳态 busy_loop 循环（父 enqueue broadcast / 子 dequeue+exec+回写）。底部两条失败支线：方法异常→(FAILURE)回写；进程死→sentinel→failure_callback",
+      "roadmap_highlight": "worker-and-executor"
+    },
+    {
+      "name": "ch17-future-fifo-pairing",
+      "intent": "FutureWrapper + futures_queue 的 FIFO 配对：连发 3 个 non_block RPC，第 3 个 result() 时如何顺序排空前两个 future，与底层 response MQ 的 FIFO 同序",
+      "svg_spec": "上半：调用方依次发 RPC#1/#2/#3，各生成 FutureWrapper appendleft 进 deque（画 deque 三格）。下半：对 future#3 调 result()→while not done: pop 出 #1 排空、pop 出 #2 排空、再取 #3；右侧画 response MQ 三格 FIFO，箭头标明 deque pop 顺序与 MQ dequeue 顺序一致",
+      "roadmap_highlight": "worker-and-executor"
+    }
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_payoff": [],
+    "note": "scripts/bible.py due ch17 输出为空（无应埋/应回收登记项）。本章作为 Part V 执行层开篇，自然向后衔接：KV 内存剖析 determine_available_memory→后续 KV cache 章；execute_model 内 model_runner 前向/PP 通信→模型运行器章；ray 后端→分布式编排章。这些是叙事层面的『前向指针』，非 bible 登记的硬伏笔。"
+  }
+}

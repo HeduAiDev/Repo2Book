@@ -14,14 +14,14 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch16',
-  slug: 'ch16-kv-cache',
-  focus: 'KV 块分配与多注意力协调: KVCacheManager.allocate_slots 三阶段(释放 skipped / 前缀命中+外部命中 / 新建+lookahead 预留)、KVCacheCoordinator(Unitary 单一 vs Hybrid 混合注意力类型协调)、cache-hit 的不动点迭代收敛。承接 ch15 块池/前缀缓存数据结构, 聚焦分配决策与多注意力协调, 不重复块池/LRU/哈希内部',
-  highlight: 'kv-cache',
+  chapter_id: 'ch17',
+  slug: 'ch17-worker-and-executor',
+  focus: '执行器与 Worker 生命周期: Executor.get_class() 工厂(uni/mp/ray 三态分发)、collective_rpc 向所有 worker 广播调用、MultiprocExecutor 的共享内存 MessageQueue + FutureWrapper(异步结果) + worker 子进程监控/失败传播、WorkerWrapperBase 延迟初始化包装。Part V 执行层开篇',
+  highlight: 'worker-and-executor',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
-  paths: ['vllm/v1/core/kv_cache_manager.py', 'vllm/v1/core/block_pool.py', 'vllm/v1/core/kv_cache_coordinator.py', 'vllm/v1/core/single_type_kv_cache_manager.py'],
+  paths: ['vllm/v1/worker/worker_base.py', 'vllm/v1/worker/gpu_worker.py', 'vllm/v1/executor/abstract.py', 'vllm/v1/executor/multiproc_executor.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'

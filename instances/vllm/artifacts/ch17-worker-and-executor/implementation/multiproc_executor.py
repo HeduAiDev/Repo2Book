@@ -1,0 +1,915 @@
+# 只做减法的忠实精简版 —— 镜像 vllm/v1/executor/multiproc_executor.py（pin f3fef123）。
+# 与 vLLM 同名、同结构、同控制流；只删不增。
+#
+# 本章主角。聚焦单节点（nnodes_within_dp==1）控制平面：
+#   FutureWrapper            —— 异步结果 + FIFO 顺序排空 futures_queue；
+#   MultiprocExecutor        —— 建广播 MQ → 逐 local_rank 拉起 WorkerProc → wait_for_ready →
+#                               起监控线程 → collective_rpc 广播 + 收应答；失败传播 / 三级关停；
+#   WorkerProc               —— 把 Worker 跑进子进程：worker_main 入口、READY/death pipe 握手、
+#                               worker_busy_loop 取 RPC 执行回写、异常转 FAILURE。
+#
+# SUBTRACTED: 模块顶部 SPDX 版权头（vllm/v1/executor/multiproc_executor.py:L1-L2）。
+# SUBTRACTED: torch / vllm.config / vllm.distributed.* (destroy_*, parallel_state 的各 get_*_group) /
+#   KVOutputAggregator / instrument / maybe_init_worker_tracer / numa_utils / OMPProcessManager /
+#   network_utils 的真实 IP/端口工具 / set_process_title / decorate_logs / AsyncModelRunnerOutput
+#   等真实 import（vllm/v1/executor/multiproc_executor.py:L26-L64 大部分）—— 牵入 CUDA/torch/
+#   分布式组/NUMA/tracing；本章用本地 shm_broadcast(MessageQueue 的 FIFO 镜像) + worker_base，
+#   并把 destroy_model_parallel/destroy_distributed_environment 等分布式拆解作 SUBTRACTED 锚点。
+
+import multiprocessing
+import os
+import pickle
+import queue
+import signal
+import threading
+import time
+import traceback
+import weakref
+from collections import deque
+from collections.abc import Callable, Sequence
+from concurrent.futures import Future, InvalidStateError
+from contextlib import suppress
+from dataclasses import dataclass
+from enum import Enum, auto
+from functools import cached_property, partial
+from multiprocessing.connection import Connection
+from multiprocessing.process import BaseProcess
+from threading import Thread
+from typing import Any, cast
+
+import cloudpickle
+
+from abstract import Executor, FailureCallback
+from shm_broadcast import Handle, MessageQueue
+from worker_base import WorkerWrapperBase
+
+
+# SOURCE: vllm/v1/executor/multiproc_executor.py:L69-L99
+class FutureWrapper(Future):
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L70-L80
+    def __init__(
+        self,
+        futures_queue: deque["FutureWrapper"],
+        get_response: Callable[[], Any],
+        aggregate: Callable = lambda x: x,
+    ):
+        self.futures_queue = futures_queue
+        self.get_response = get_response
+        self.aggregate = aggregate
+        super().__init__()
+        self.futures_queue.appendleft(self)
+
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L82-L90
+    def result(self, timeout=None):
+        if timeout is not None:
+            raise RuntimeError("timeout not implemented")
+
+        # Drain any futures ahead of us in the queue.
+        while not self.done():
+            future = self.futures_queue.pop()
+            future._wait_for_response()
+        return super().result()
+
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L92-L99
+    def _wait_for_response(self):
+        try:
+            response = self.aggregate(self.get_response())
+            with suppress(InvalidStateError):
+                self.set_result(response)
+        except Exception as e:
+            with suppress(InvalidStateError):
+                self.set_exception(e)
+
+
+# SOURCE: vllm/v1/executor/multiproc_executor.py:L102-L498
+class MultiprocExecutor(Executor):
+    supports_pp: bool = True
+
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L105-L107
+    def __init__(self, vllm_config, monitor_workers: bool = True):
+        self.monitor_workers = monitor_workers
+        super().__init__(vllm_config)
+
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L109-L246
+    def _init_executor(self) -> None:
+        # Call self.shutdown at exit to clean up
+        # and ensure workers will be terminated.
+        self._finalizer = weakref.finalize(self, self.shutdown)
+        self.is_failed = False
+        self.failure_callback: FailureCallback | None = None
+
+        tp_size, pp_size, pcp_size = self._get_parallel_sizes()
+        assert self.world_size == tp_size * pp_size * pcp_size, (
+            f"world_size ({self.world_size}) must be equal to the "
+            f"tensor_parallel_size ({tp_size}) x pipeline"
+            f"_parallel_size ({pp_size}) x prefill_context"
+            f"_parallel_size ({pcp_size}). "
+        )
+
+        set_multiprocessing_worker_envs()
+
+        # SUBTRACTED: distributed_init_method = get_distributed_init_method(get_loopback_ip(),
+        #   get_open_port())（vllm/v1/executor/multiproc_executor.py:L127-L129）—— 真实回环 IP/端口；
+        #   本镜像用占位字符串，worker 不真正建分布式组。
+        distributed_init_method = "local"
+        self.rpc_broadcast_mq: MessageQueue | None = None
+        scheduler_output_handle: Handle | None = None
+        # Initialize worker and set up message queues for SchedulerOutputs
+        # and ModelRunnerOutputs
+        if self.parallel_config.node_rank_within_dp == 0:
+            # For leader node within each dp rank,
+            # each dp will have its own leader multiproc executor.
+            # SUBTRACTED: max_chunk_bytes / mq_connect_ip / DP-leader 日志
+            #   （vllm/v1/executor/multiproc_executor.py:L137-L149）—— shm 分块参数与多节点日志。
+            self.rpc_broadcast_mq = MessageQueue(
+                self.world_size,
+                self.local_world_size,
+            )
+            scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
+        # Create workers
+        context = get_mp_context()
+        shared_worker_lock = context.Lock()
+        unready_workers: list[UnreadyWorkerProcHandle] = []
+        success = False
+        try:
+            global_start_rank = (
+                self.local_world_size * self.parallel_config.node_rank_within_dp
+            )
+            # SUBTRACTED: inherited_fds(fork 适配，跟踪并关闭被继承的 socket fd) 与
+            #   OMPProcessManager(CPU OpenMP 线程亲和)（vllm/v1/executor/multiproc_executor.py
+            #   :L166-L174,L178-L180,L192-L194）—— 平台/启动法适配，与拉起 worker 主控制流正交。
+            for local_rank in range(self.local_world_size):
+                global_rank = global_start_rank + local_rank
+                is_driver_worker = self._is_driver_worker(global_rank)
+                unready_worker_handle = WorkerProc.make_worker_process(
+                    vllm_config=self.vllm_config,
+                    local_rank=local_rank,
+                    rank=global_rank,
+                    distributed_init_method=distributed_init_method,
+                    input_shm_handle=scheduler_output_handle,
+                    shared_worker_lock=shared_worker_lock,
+                    is_driver_worker=is_driver_worker,
+                    inherited_fds=None,
+                )
+                unready_workers.append(unready_worker_handle)
+
+            # Workers must be created before wait_for_ready to avoid
+            # deadlock, since worker.init_device() does a device sync.
+
+            # Wait for all local workers to be ready.
+            self.workers = WorkerProc.wait_for_ready(unready_workers)
+
+            # Start background thread to monitor worker health if not in headless mode.
+            if self.monitor_workers:
+                self.start_worker_monitor()
+
+            self.response_mqs = []
+            # Only leader node have remote response mqs
+            if self.parallel_config.node_rank_within_dp == 0:
+                for rank in range(self.world_size):
+                    # SUBTRACTED: rank >= local_world_size 的跨节点 remote response mq 装配
+                    #   （取 self.workers[0].peer_worker_response_mqs[rank]，
+                    #   vllm/v1/executor/multiproc_executor.py:L214-L219）—— 多节点路径，本章单节点。
+                    local_message_queue = self.workers[rank].worker_response_mq
+                    assert local_message_queue is not None
+                    self.response_mqs.append(local_message_queue)
+
+            # Ensure message queues are ready. Will deadlock if re-ordered
+            # Must be kept consistent with the WorkerProc.
+
+            # Wait for all input mqs to be ready.
+            if self.rpc_broadcast_mq is not None:
+                self.rpc_broadcast_mq.wait_until_ready()
+            # Wait for all remote response mqs to be ready.
+            for response_mq in self.response_mqs:
+                response_mq.wait_until_ready()
+
+            self.futures_queue = deque[FutureWrapper]()
+
+            success = True
+        finally:
+            if not success:
+                # Clean up the worker procs if there was a failure.
+                # Close death_writers first to signal workers to exit
+                for uw in unready_workers:
+                    if uw.death_writer is not None:
+                        uw.death_writer.close()
+                        uw.death_writer = None
+                self._ensure_worker_termination([uw.proc for uw in unready_workers])
+
+        self.output_rank = self._get_output_rank()
+
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L248-L259
+    def _get_parallel_sizes(self) -> tuple[int, int, int]:
+        self.world_size = self.parallel_config.world_size
+        assert self.world_size % self.parallel_config.nnodes_within_dp == 0, (
+            f"global world_size ({self.parallel_config.world_size}) must be "
+            f"divisible by nnodes_within_dp "
+            f"({self.parallel_config.nnodes_within_dp}). "
+        )
+        self.local_world_size = self.parallel_config.local_world_size
+        tp_size = self.parallel_config.tensor_parallel_size
+        pp_size = self.parallel_config.pipeline_parallel_size
+        pcp_size = self.parallel_config.prefill_context_parallel_size
+        return tp_size, pp_size, pcp_size
+
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L264-L265
+    def _is_driver_worker(self, rank: int) -> bool:
+        return rank % self.parallel_config.tensor_parallel_size == 0
+
+    def start_worker_monitor(self, inline=False) -> None:
+        workers = self.workers
+        self_ref = weakref.ref(self)
+
+        # Monitors worker process liveness. If any die unexpectedly,
+        # logs an error, shuts down the executor and invokes the failure
+        # callback to inform the engine.
+        # SOURCE: vllm/v1/executor/multiproc_executor.py:L274-L290
+        def monitor_workers():
+            sentinels = [h.proc.sentinel for h in workers]
+            died = multiprocessing.connection.wait(sentinels)
+            _self = self_ref()
+            if not _self or getattr(_self, "shutting_down", False):
+                return
+            _self.is_failed = True
+            proc_name = next(h.proc.name for h in workers if h.proc.sentinel == died[0])
+            # SUBTRACTED: logger.error(...) 失败日志（vllm/v1/executor/multiproc_executor.py:L283-L285）。
+            _self.shutdown()
+            callback = _self.failure_callback
+            if callback is not None:
+                _self.failure_callback = None
+                callback()
+
+        if not inline:
+            Thread(
+                target=monitor_workers, daemon=True, name="MultiprocWorkerMonitor"
+            ).start()
+            return
+
+        monitor_workers()
+
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L300-L304
+    def register_failure_callback(self, callback: FailureCallback):
+        if self.is_failed:
+            callback()
+        else:
+            self.failure_callback = callback
+
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L306-L316
+    def execute_model(  # type: ignore[override]
+        self, scheduler_output, non_block: bool = False
+    ):
+        return self.collective_rpc(
+            "execute_model",
+            args=(scheduler_output,),
+            unique_reply_rank=self.output_rank,
+            non_block=non_block,
+        )
+
+    # SUBTRACTED: sample_tokens / execute_dummy_batch / take_draft_token_ids 的 mp 重写
+    #   （vllm/v1/executor/multiproc_executor.py:L318-L337）—— 与 execute_model 同模式，仅传
+    #   unique_reply_rank=self.output_rank；execute_model 一例已示范单 rank 应答。
+
+    def collective_rpc(  # type: ignore[override]
+        self,
+        method: str | Callable,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict | None = None,
+        non_block: bool = False,
+        unique_reply_rank: int | None = None,
+    ) -> Any:
+        """Returns single result if unique_reply_rank is provided, otherwise list."""
+        assert self.rpc_broadcast_mq is not None, (
+            "collective_rpc should not be called on follower node"
+        )
+        if self.is_failed:
+            raise RuntimeError("Executor failed.")
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        kwargs = kwargs or {}
+
+        # SUBTRACTED: kv_output_aggregator 分支（partial(kv_output_aggregator.aggregate, ...) 聚合
+        #   多 rank 输出，vllm/v1/executor/multiproc_executor.py:L347,L360-L364）—— PD 解耦/KV 连接器
+        #   主题（ch15/16）；default aggregate=lambda x:x 时控制平面完全等价。
+        output_rank = unique_reply_rank
+        aggregate: Callable[[Any], Any] = lambda x: x
+
+        if isinstance(method, str):
+            send_method = method
+        else:
+            send_method = cloudpickle.dumps(method, protocol=pickle.HIGHEST_PROTOCOL)
+        self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))
+
+        response_mqs: Sequence[MessageQueue] = self.response_mqs
+        if output_rank is not None:
+            response_mqs = (response_mqs[output_rank],)
+
+        # SOURCE: vllm/v1/executor/multiproc_executor.py:L379-L395
+        def get_response():
+            responses = []
+            for mq in response_mqs:
+                dequeue_timeout = (
+                    None if deadline is None else (deadline - time.monotonic())
+                )
+                try:
+                    status, result = mq.dequeue(timeout=dequeue_timeout)
+                except TimeoutError as e:
+                    raise TimeoutError(f"RPC call to {method} timed out.") from e
+                if status != WorkerProc.ResponseStatus.SUCCESS:
+                    raise RuntimeError(
+                        f"Worker failed with error '{result}', please check the"
+                        " stack trace above for the root cause"
+                    )
+                responses.append(result)
+            return responses[0] if output_rank is not None else responses
+
+        future = FutureWrapper(
+            self.futures_queue,
+            get_response=get_response,
+            aggregate=aggregate,
+        )
+
+        return future if non_block else future.result()
+
+    @staticmethod
+    def _ensure_worker_termination(worker_procs: list[BaseProcess]):
+        """Ensure that all worker processes are terminated. Assumes workers have
+        received termination requests. Waits for processing, then sends
+        termination and kill signals if needed."""
+
+        # SOURCE: vllm/v1/executor/multiproc_executor.py:L411-L421
+        def wait_for_termination(procs, timeout):
+            if not time:
+                # If we are in late stage shutdown, the interpreter may replace
+                # `time` with `None`.
+                return all(not proc.is_alive() for proc in procs)
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                if all(not proc.is_alive() for proc in procs):
+                    return True
+                time.sleep(0.1)
+            return False
+
+        active_procs = lambda: [proc for proc in worker_procs if proc.is_alive()]
+        # Give processes time to clean themselves up properly first
+        if wait_for_termination(active_procs(), 4):
+            return
+
+        # Send SIGTERM if still running
+        for p in active_procs():
+            p.terminate()
+        if not wait_for_termination(active_procs(), 4):
+            # Send SIGKILL if still running
+            for p in active_procs():
+                p.kill()
+
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L441-L468
+    def shutdown(self):
+        """Properly shut down the executor and its workers"""
+        if not getattr(self, "shutting_down", False):
+            self.shutting_down = True
+
+            # Make sure all the worker processes are terminated first.
+            if workers := getattr(self, "workers", None):
+                for w in workers:
+                    # Close death_writer to signal child processes to exit
+                    if w.death_writer is not None:
+                        w.death_writer.close()
+                        w.death_writer = None
+                self._ensure_worker_termination([w.proc for w in workers])
+
+                for w in workers:
+                    # Shutdown response queues
+                    if w.worker_response_mq is not None:
+                        w.worker_response_mq.shutdown()
+                        w.worker_response_mq = None
+
+        if rpc_broadcast_mq := getattr(self, "rpc_broadcast_mq", None):
+            rpc_broadcast_mq.shutdown()
+            self.rpc_broadcast_mq = None
+        if response_mqs := getattr(self, "response_mqs", None):
+            for mq in response_mqs:
+                mq.shutdown()
+            self.response_mqs = []
+
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L470-L472
+    def check_health(self) -> None:
+        self.collective_rpc("check_health", timeout=10)
+        return
+
+    @cached_property
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L474-L478
+    def max_concurrent_batches(self) -> int:
+        # PP requires PP-size concurrent batches to fill the pipeline.
+        pp_size = self.parallel_config.pipeline_parallel_size
+        return 2 if pp_size <= 1 and self.scheduler_config.async_scheduling else pp_size
+
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L480-L494
+    def _get_output_rank(self) -> int:
+        # Only returns ModelRunnerOutput from TP rank=0 and PP rank=-1
+        # (the first TP worker of the last PP stage).
+        # Example:
+        # Assuming TP=8, PP=4, then the world_size=32
+        # 0-7, PP rank 0 ... 24-31, PP rank 3
+        # so world_size - tp_size = 32 - 8 = 24 should be PP rank = -1 (i.e. 3)
+        return (
+            self.world_size
+            - self.parallel_config.tensor_parallel_size
+            * self.parallel_config.prefill_context_parallel_size
+        )
+
+
+# SOURCE: vllm/v1/executor/multiproc_executor.py:L501-L509
+@dataclass
+# SOURCE: vllm/v1/executor/multiproc_executor.py:L501-L509
+class UnreadyWorkerProcHandle:
+    """WorkerProcess handle before READY."""
+
+    proc: BaseProcess
+    rank: int
+    ready_pipe: Connection
+    death_writer: Connection | None = None
+    # 减法边界（见 make_worker_process 注释）：父进程预创建的 response MQ handle。真实 vLLM 里
+    #   该 handle 由子进程经 ready pipe 发回，此处父进程自留，避免 spawn 下二次 pickle ctx.Queue。
+    response_shm_handle: object = None
+
+
+# SOURCE: vllm/v1/executor/multiproc_executor.py:L511-L536
+@dataclass
+# SOURCE: vllm/v1/executor/multiproc_executor.py:L511-L536
+class WorkerProcHandle:
+    proc: BaseProcess
+    rank: int
+    # The worker process writes to this MQ in single-node mode
+    worker_response_mq: MessageQueue | None
+    # This is only non empty on driver node,
+    # the peer worker process i writes to MQ `peer_worker_response_mqs[i]`
+    peer_worker_response_mqs: list[MessageQueue | None]
+    death_writer: Connection | None = None
+
+    @classmethod
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L523-L536
+    def from_unready_handle(
+        cls,
+        unready_handle: UnreadyWorkerProcHandle,
+        worker_response_mq: MessageQueue | None,
+        peer_worker_response_mqs: list[MessageQueue | None],
+    ) -> "WorkerProcHandle":
+        return cls(
+            proc=unready_handle.proc,
+            rank=unready_handle.rank,
+            worker_response_mq=worker_response_mq,
+            peer_worker_response_mqs=peer_worker_response_mqs,
+            death_writer=unready_handle.death_writer,
+        )
+
+
+# SOURCE: vllm/v1/executor/multiproc_executor.py:L539-L1006
+class WorkerProc:
+    """Wrapper that runs one Worker in a separate process."""
+
+    READY_STR = "READY"
+    rpc_broadcast_mq: MessageQueue | None
+    worker_response_mq: MessageQueue | None
+
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L546-L576
+    def _init_message_queues(
+        self, input_shm_handle: Handle, response_shm_handle: Handle, vllm_config
+    ) -> None:
+        # SUBTRACTED: nnodes_within_dp != 1 的多节点分支（get_inner_dp_world_group().
+        #   create_mq_broadcaster / create_single_reader_mq_broadcasters，
+        #   vllm/v1/executor/multiproc_executor.py:L558-L576）—— 跨节点 MQ 装配；本章单节点。
+        # Initialize MessageQueue for receiving SchedulerOutput
+        self.rpc_broadcast_mq = MessageQueue.create_from_handle(
+            input_shm_handle, self.worker.rank
+        )
+
+        # Initializes a message queue for sending the model output.
+        # 减法边界（见 make_worker_process 注释）：真实 vLLM 此处 MessageQueue(1,1) 新建 response MQ；
+        #   本镜像绑定到父进程预创建并经 kwargs 继承下来的 response_shm_handle（spawn 下底层 Queue
+        #   只能继承传递，不能经 Pipe 二次 pickle）。单 reader 应答 MQ 的语义不变。
+        self.worker_response_mq = MessageQueue.create_from_handle(response_shm_handle, 0)
+        self.peer_response_handles = []
+
+    # SUBTRACTED: @instrument(span_name="Worker init") 装饰器（vllm/v1/executor/multiproc_executor.py
+    #   :L578）—— tracing 埋点。
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L578-L641
+    def __init__(
+        self,
+        vllm_config,
+        local_rank: int,
+        rank: int,
+        distributed_init_method: str,
+        input_shm_handle: Handle,
+        response_shm_handle: Handle,
+        shared_worker_lock,
+        is_driver_worker: bool,
+    ):
+        self.rank = rank
+        wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
+        # TODO: move `init_worker` to executor level as a collective rpc call
+        all_kwargs: list[dict] = [
+            {} for _ in range(vllm_config.parallel_config.world_size)
+        ]
+        all_kwargs[local_rank] = {
+            "vllm_config": vllm_config,
+            "local_rank": local_rank,
+            "rank": rank,
+            "distributed_init_method": distributed_init_method,
+            "is_driver_worker": is_driver_worker,
+            "shared_worker_lock": shared_worker_lock,
+        }
+        wrapper.init_worker(all_kwargs)
+        self.worker = wrapper
+
+        # SUBTRACTED: setup_proc_title_and_log_prefix（按并行组命名进程/日志前缀，调用两次，
+        #   vllm/v1/executor/multiproc_executor.py:L606-L608,L613-L615）—— 可观测性。
+
+        # Load model
+        self.worker.init_device()
+        # SUBTRACTED: VLLM_ELASTIC_EP_SCALE_UP_LAUNCH 分支（vllm/v1/executor/multiproc_executor.py
+        #   :L616-L618）—— EP 扩容特例，默认走 load_model。
+        self.worker.load_model()
+
+        scheduler_config = vllm_config.scheduler_config
+        self.use_async_scheduling = scheduler_config.async_scheduling
+        if self.use_async_scheduling:
+            self.async_output_queue: queue.Queue = queue.Queue()
+            self.async_output_copy_thread = Thread(
+                target=self.async_output_busy_loop,
+                daemon=True,
+                name="WorkerAsyncOutputCopy",
+            )
+            self.async_output_copy_thread.start()
+
+        # SUBTRACTED: current_platform.update_block_size_for_backend（vllm/v1/executor/
+        #   multiproc_executor.py:L633）—— 平台 block size 调整。
+
+        # Initialize message queues after init_device() since multi-node setups
+        # (nnodes_within_dp > 1) require distributed groups to be initialized
+        self._init_message_queues(input_shm_handle, response_shm_handle, vllm_config)
+
+        # SUBTRACTED: enable_envs_cache()（vllm/v1/executor/multiproc_executor.py:L641）—— 环境变量
+        #   缓存固化，与控制流无关。
+
+    @staticmethod
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L643-L694
+    def make_worker_process(
+        vllm_config,
+        local_rank: int,
+        rank: int,
+        distributed_init_method: str,
+        input_shm_handle,  # Receive SchedulerOutput
+        shared_worker_lock,
+        is_driver_worker: bool,
+        inherited_fds: list[int] | None = None,
+    ) -> UnreadyWorkerProcHandle:
+        context = get_mp_context()
+        # Ready pipe to communicate readiness from child to parent
+        ready_reader, ready_writer = context.Pipe(duplex=False)
+        # Death pipe to let child detect parent process exit
+        death_reader, death_writer = context.Pipe(duplex=False)
+        # SUBTRACTED: inherited_fds 收集（fork 下跟踪被继承的 pipe fd 以便后续 worker 关闭，
+        #   vllm/v1/executor/multiproc_executor.py:L659-L661）—— fork 适配。
+        #
+        # 减法边界（明确注明）：真实 vLLM 里 worker 子进程在 _init_message_queues 内**自行 create**
+        #   worker_response_mq，再经 ready pipe 把它的 shm handle 发回父进程（worker_main 的 READY
+        #   消息）。本镜像底层 FIFO 是 spawn 上下文的 multiprocessing.Queue，只能经『进程参数继承』
+        #   跨进程传递、不能再经 Pipe 二次 pickle，故把 response MQ 改在父进程预创建、作为
+        #   response_shm_handle 由 kwargs 传入子进程，子进程 create_from_handle 绑定之；父进程直接
+        #   保留同一 handle 装配 response_mqs。READY 握手协议、handle 字段、控制流全部保持不变，
+        #   仅『response MQ 在谁那里 new 出来』这一处从子进程上移到父进程。原
+        #   vllm/v1/executor/multiproc_executor.py:L556。
+        response_mq = MessageQueue(1, 1)
+        response_shm_handle = response_mq.export_handle()
+        process_kwargs = {
+            "vllm_config": vllm_config,
+            "local_rank": local_rank,
+            "rank": rank,
+            "distributed_init_method": distributed_init_method,
+            "input_shm_handle": input_shm_handle,
+            "response_shm_handle": response_shm_handle,
+            "ready_pipe": ready_writer,
+            "death_pipe": death_reader,
+            "shared_worker_lock": shared_worker_lock,
+            "is_driver_worker": is_driver_worker,
+            # Have the worker close parent end of this worker's pipes too
+            "inherited_fds": [],
+        }
+        # Run EngineCore busy loop in background process.
+        proc = context.Process(
+            target=WorkerProc.worker_main,
+            kwargs=process_kwargs,
+            name=f"VllmWorker-{rank}",
+            daemon=True,
+        )
+
+        # SUBTRACTED: numa_utils.configure_subprocess 上下文（NUMA 绑定，
+        #   vllm/v1/executor/multiproc_executor.py:L684-L686）—— 直接 proc.start()。
+        proc.start()
+
+        # Close child ends of pipes here in the parent
+        ready_writer.close()
+        death_reader.close()
+        # Keep death_writer open in parent - when parent exits,
+        # death_reader in child will get EOFError
+        return UnreadyWorkerProcHandle(
+            proc, rank, ready_reader, death_writer,
+            response_shm_handle=response_shm_handle,
+        )
+
+    @staticmethod
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L696-L715
+    def wait_for_response_handle_ready(
+        handles: dict[str, Any], proc_handle: UnreadyWorkerProcHandle
+    ) -> WorkerProcHandle:
+        # 减法边界：真实 vLLM 从 READY 消息（handles["handle"]）取 worker 自创的 response handle；
+        #   本镜像改从父进程预创建并自留的 proc_handle.response_shm_handle 取，避免二次 pickle
+        #   ctx.Queue。create_from_handle / 单 reader 绑定的语义不变。
+        response_handle = proc_handle.response_shm_handle
+        worker_response_mq: MessageQueue | None = None
+        if len(response_handle.local_reader_ranks) > 0:
+            worker_response_mq = MessageQueue.create_from_handle(response_handle, 0)
+        # SUBTRACTED: peer_worker_response_mqs 跨节点装配（vllm/v1/executor/multiproc_executor.py
+        #   :L704-L710）—— 多节点；本章单节点 peer_response_handles 恒为空。
+        peer_worker_response_mqs: list = []
+        return WorkerProcHandle.from_unready_handle(
+            proc_handle,
+            worker_response_mq,
+            peer_worker_response_mqs=peer_worker_response_mqs,
+        )
+
+    @staticmethod
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L717-L753
+    def wait_for_ready(
+        unready_proc_handles: list[UnreadyWorkerProcHandle],
+    ) -> list[WorkerProcHandle]:
+        e = Exception(
+            "WorkerProc initialization failed due to an exception in a "
+            "background process. See stack trace for root cause."
+        )
+
+        pipes = {handle.ready_pipe: handle for handle in unready_proc_handles}
+        ready_proc_handles: list[WorkerProcHandle | None] = [None] * len(
+            unready_proc_handles
+        )
+        while pipes:
+            ready = multiprocessing.connection.wait(pipes.keys())
+            for pipe in ready:
+                assert isinstance(pipe, Connection)
+                try:
+                    # Wait until the WorkerProc is ready.
+                    unready_proc_handle = pipes.pop(pipe)
+                    response: dict[str, Any] = pipe.recv()
+                    if response["status"] != "READY":
+                        raise e
+
+                    idx = unready_proc_handle.rank % len(ready_proc_handles)
+                    ready_proc_handles[idx] = WorkerProc.wait_for_response_handle_ready(
+                        response, unready_proc_handle
+                    )
+                except EOFError:
+                    e.__suppress_context__ = True
+                    raise e from None
+
+                finally:
+                    # Close connection.
+                    pipe.close()
+
+        return cast(list[WorkerProcHandle], ready_proc_handles)
+
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L755-L764
+    def shutdown(self):
+        if self.rpc_broadcast_mq is not None:
+            self.rpc_broadcast_mq.shutdown()
+        if self.worker_response_mq is not None:
+            self.worker_response_mq.shutdown()
+        self.worker.shutdown()
+        self.rpc_broadcast_mq = None
+        self.worker_response_mq = None
+        # SUBTRACTED: destroy_model_parallel() / destroy_distributed_environment()
+        #   （vllm/v1/executor/multiproc_executor.py:L763-L764）—— 拆解 torch.distributed 进程组；
+        #   本镜像 worker 未真正建分布式组，无需拆解。
+
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L766-L789
+    def monitor_death_pipe(self, death_pipe, shutdown_requested: threading.Event):
+        if death_pipe is None:
+            return
+
+        # SOURCE: vllm/v1/executor/multiproc_executor.py:L770-L781
+        def death_pipe_monitor(queues_to_shutdown: list[MessageQueue]):
+            try:
+                # This will block until parent process exits (pipe closes)
+                death_pipe.recv()
+            except EOFError:
+                shutdown_requested.set()
+                for mq in queues_to_shutdown:
+                    if mq is not None:
+                        mq.shutdown()
+            except Exception:
+                pass
+
+        # Pass queue references directly to avoid gc issues if passing self
+        Thread(
+            target=death_pipe_monitor,
+            args=([self.rpc_broadcast_mq, self.worker_response_mq],),
+            daemon=True,
+            name="DeathPipeMonitor",
+        ).start()
+
+    @staticmethod
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L791-L895
+    def worker_main(*args, **kwargs):
+        """Worker initialization and execution loops.
+        This runs a background process"""
+
+        # Signal handler used for graceful termination.
+        # SystemExit exception is only raised once to allow this and worker
+        # processes to terminate without error
+        shutdown_requested = threading.Event()
+
+        # SOURCE: vllm/v1/executor/multiproc_executor.py:L801-L808
+        def signal_handler(signum, frame):
+            nonlocal shutdown_requested
+            if not shutdown_requested.is_set():
+                shutdown_requested.set()
+                raise SystemExit()
+
+        # Either SIGTERM or SIGINT will terminate the worker
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+
+        worker = None
+        ready_writer = kwargs.pop("ready_pipe")
+        death_pipe = kwargs.pop("death_pipe", None)
+
+        # Close inherited pipes from parent (incl. other worker pipes)
+        # Explicitly passing in existing pipes and closing them makes the pipe
+        # behave when using fork. Otherwise, a hidden reference to the pipes
+        # exist in the child process and prevents EOF closure.
+        for fd in kwargs.pop("inherited_fds", []):
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+
+        try:
+            # SUBTRACTED: maybe_init_worker_tracer（vllm/v1/executor/multiproc_executor.py:L830-L835）
+            #   —— 子进程 tracer 初始化。
+
+            worker = WorkerProc(*args, **kwargs)
+            assert worker.worker_response_mq is not None
+            # SUBTRACTED: numa_bind 时的 log_current_affinity_state（同上文件:L839-L840）—— 可观测性。
+
+            worker.monitor_death_pipe(death_pipe, shutdown_requested)
+
+            # Send READY once we know everything is loaded.
+            # 减法边界（见 make_worker_process 注释）：真实 vLLM 这里把 worker_response_mq 的 shm
+            #   handle 经 ready pipe 发回父进程。本镜像底层是 spawn 上下文的 multiprocessing.Queue，
+            #   不能经 Pipe 二次 pickle，故 READY 只发状态——response handle 已由父进程预创建自留。
+            #   READY/握手时序、wait_until_ready 顺序约束完全不变。
+            ready_writer.send(
+                {
+                    "status": WorkerProc.READY_STR,
+                    "peer_response_handles": worker.peer_response_handles,
+                }
+            )
+
+            # Ensure message queues are ready. Will deadlock if re-ordered.
+            # Must be kept consistent with the Executor
+            if worker.rpc_broadcast_mq is not None:
+                worker.rpc_broadcast_mq.wait_until_ready()
+            worker.worker_response_mq.wait_until_ready()
+            ready_writer.close()
+            ready_writer = None
+
+            worker.worker_busy_loop()
+
+        except Exception:
+            # NOTE: if an Exception arises in busy_loop, we send
+            # a FAILURE message over the MQ RPC to notify the Executor,
+            # which triggers system shutdown.
+            # TODO(rob): handle case where the MQ itself breaks.
+
+            # ready_writer 是否为 None 用来区分『启动期失败 vs 运行期失败』：
+            #   非 None ⇒ 还没发 READY，是启动失败；None ⇒ 已服役，是运行期失败。
+            # SUBTRACTED: 三个分支的 logger.exception/info 文案
+            #   （vllm/v1/executor/multiproc_executor.py:L869-L874）—— 仅日志，保留分支结构。
+            if ready_writer is not None:
+                pass
+            elif shutdown_requested.is_set():
+                pass
+            else:
+                pass
+
+            # The parent sends a SIGTERM to all worker processes if
+            # any worker dies. Set this value so we don't re-throw
+            # SystemExit() to avoid zmq exceptions in __del__.
+            shutdown_requested.set()
+
+        except SystemExit as e:
+            # SystemExit is raised on SIGTERM or SIGKILL, which usually indicates that
+            # the graceful shutdown process did not succeed
+            # SystemExit must never be ignored
+            raise e
+
+        finally:
+            if ready_writer is not None:
+                ready_writer.close()
+            if death_pipe is not None:
+                death_pipe.close()
+            # Clean up once worker exits busy loop
+            if worker is not None:
+                worker.shutdown()
+
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L897-L899
+    class ResponseStatus(Enum):
+        SUCCESS = auto()
+        FAILURE = auto()
+
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L901-L914
+    def enqueue_output(self, output: Any):
+        """Prepares output from the worker and enqueues it to the
+        worker_response_mq. If the output is an Exception, it is
+        converted to a FAILURE response.
+        """
+        # SUBTRACTED: isinstance(output, AsyncModelRunnerOutput): output = output.get_output()
+        #   （vllm/v1/executor/multiproc_executor.py:L906-L907）—— 异步调度输出物化；同步路径下
+        #   output 已是最终结果。
+        if isinstance(output, Exception):
+            result = (WorkerProc.ResponseStatus.FAILURE, str(output))
+        else:
+            result = (WorkerProc.ResponseStatus.SUCCESS, output)
+        if (response_mq := self.worker_response_mq) is not None:
+            response_mq.enqueue(result)
+
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L916-L924
+    def handle_output(self, output: Any):
+        """Handles output from the worker. If async scheduling is enabled,
+        it is passed to the async_output_busy_loop thread. Otherwise, it is
+        enqueued directly to the worker_response_mq.
+        """
+        if self.use_async_scheduling:
+            self.async_output_queue.put(output)
+        else:
+            self.enqueue_output(output)
+
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L926-L942
+    def async_output_busy_loop(self):
+        """Entrypoint for the thread which handles outputs asynchronously."""
+        # SUBTRACTED: current_platform.set_device(self.worker.device) 把线程绑到 worker 设备
+        #   （vllm/v1/executor/multiproc_executor.py:L929-L938）—— CUDA 上下文绑定。
+        while True:
+            output = self.async_output_queue.get()
+            self.enqueue_output(output)
+
+    # SOURCE: vllm/v1/executor/multiproc_executor.py:L944-L970
+    def worker_busy_loop(self):
+        """Main busy loop for Multiprocessing Workers"""
+        assert self.rpc_broadcast_mq is not None
+        while True:
+            method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
+                indefinite=True
+            )
+            try:
+                if isinstance(method, str):
+                    func = getattr(self.worker, method)
+                elif isinstance(method, bytes):
+                    func = partial(cloudpickle.loads(method), self.worker)
+
+                output = func(*args, **kwargs)
+            except Exception as e:
+                # Notes have been introduced in python 3.11
+                if hasattr(e, "add_note"):
+                    e.add_note(traceback.format_exc())
+                # SUBTRACTED: logger.exception("WorkerProc hit an exception.")（同上文件:L962）。
+                # exception might not be serializable, so we convert it to
+                # string, only for logging purpose.
+                if output_rank is None or self.rank == output_rank:
+                    self.handle_output(e)
+                continue
+
+            if output_rank is None or self.rank == output_rank:
+                self.handle_output(output)
+
+    # SUBTRACTED: setup_proc_title_and_log_prefix（按 DP/PP/PCP/TP/DCP/EP 并行组拼进程名 + decorate_logs，
+    #   vllm/v1/executor/multiproc_executor.py:L972-L1006）—— 纯可观测性命名，与控制流无关。
+
+
+# SOURCE: vllm/v1/executor/multiproc_executor.py:L1009-L1037
+def set_multiprocessing_worker_envs():
+    """Set up environment variables that should be used when there are workers
+    in a multiprocessing environment. This should be called by the parent
+    process before worker processes are created"""
+    # SUBTRACTED: _maybe_force_spawn() 与 OMP_NUM_THREADS / torch.set_num_threads 调优
+    #   （vllm/v1/executor/multiproc_executor.py:L1014-L1037）—— 启动法强制与 CPU 线程数调优；
+    #   本镜像保留该函数作为『拉起 worker 前设环境』的钩子位，函数体留空。
+    return
+
+
+def get_mp_context():
+    # SOURCE: vllm/utils/system_utils.py  get_mp_context (最小镜像)
+    # SUBTRACTED: 真实实现按 VLLM_WORKER_MULTIPROC_METHOD 选 spawn/fork/forkserver；这里固定 spawn
+    #   —— 与 vllm 默认行为一致（_maybe_force_spawn：fork 在带 CUDA 的真实进程里不安全，故强制 spawn）。
+    return multiprocessing.get_context("spawn")
