@@ -14,14 +14,14 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch23',
-  slug: 'ch23-custom-ops-and-compilation',
-  focus: '模型层如何变成融合、图捕获的 kernel: CustomOp 基类的两级 dispatch(__init__ 时一次性选 forward_cuda vs forward_native、enabled() 按平台/配置决定)、@support_torch_compile 装饰器把 nn.Module 包成可编译、compilation backend 的 piecewise 图捕获(在 attention 等不可融合算子处切图、其余段走 CUDA graph)、自定义算子注册进 torch 图避免 graph break。回收 f17(Attention 吞掉的 self.attn 算子进 torch.compile 图)。以 RMSNorm 为 CustomOp 实例',
-  highlight: 'custom-ops-and-compilation',
+  chapter_id: 'ch24',
+  slug: 'ch24-attention',
+  focus: '注意力后端抽象与元数据: AttentionBackend 抽象 + registry + selector(get_attn_backend 按 head_size/dtype/平台选 FlashAttention/FlashInfer/Triton 后端)、CommonAttentionMetadata→后端专属 metadata(model_runner 那头组装、backend 这头消费)、KV cache 的 shape/stride 约定、PagedAttention 照 slot_mapping/block_table 读写 KV 显存。回收 f14(slot_mapping/block_table_tensor 作 CommonAttentionMetadata 接口字段)+f18(Attention 按 prefix 从 forward_context 取 kv_cache/attn_metadata、后端选择)',
+  highlight: 'attention',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
-  paths: ['vllm/model_executor/custom_op.py', 'vllm/compilation/decorators.py', 'vllm/compilation/backends.py', 'vllm/model_executor/layers/layernorm.py'],
+  paths: ['vllm/v1/attention/backend.py', 'vllm/v1/attention/selector.py', 'vllm/v1/attention/backends/registry.py', 'vllm/v1/attention/backends/flash_attn.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
