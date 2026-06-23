@@ -14,14 +14,14 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch27',
-  slug: 'ch27-sampling',
-  focus: 'Sampler 的 9 步采样流水线: raw logprobs 抽取、重复/存在/频率惩罚、bad words 屏蔽、logits processors(argmax-invariant 与否决定能否走 greedy 快路)、温度缩放、top-k/top-p 截断、随机 vs 贪心采样、TopKTopPSampler 多后端(flashinfer/triton/torch native)分发。SamplingMetadata 承载逐请求参数, 全程批量张量化',
-  highlight: 'sampling',
+  chapter_id: 'ch28',
+  slug: 'ch28-spec-decode',
+  focus: '投机解码: proposers(ngram CPU/GPU、EAGLE、DFlash、以及 ch25 DeepSeek-V4 的 MTP draft via DeepSeekV4MTP)产出 k 个草稿 token、SpecDecodeMetadata 的 index 间接(把变长草稿摊平进批、cu_num_draft_tokens)、rejection sampling(逐位置按目标/草稿概率比接受或拒绝、保证输出分布与无投机时严格等价)、bonus token。承接 ch27 采样 + ch25 MTP',
+  highlight: 'spec-decode',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
-  paths: ['vllm/v1/sample/sampler.py', 'vllm/v1/sample/metadata.py', 'vllm/v1/sample/ops/topk_topp_sampler.py', 'vllm/v1/sample/ops/topk_topp_triton.py'],
+  paths: ['vllm/v1/spec_decode/llm_base_proposer.py', 'vllm/v1/sample/rejection_sampler.py', 'vllm/v1/spec_decode/metadata.py', 'vllm/v1/spec_decode/utils.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
