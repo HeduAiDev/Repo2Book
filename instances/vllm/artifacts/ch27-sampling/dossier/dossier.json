@@ -1,0 +1,224 @@
+{
+  "chapter_id": "ch27",
+  "title": "Sampler 的 9 步采样流水线",
+  "source_pin": "f3fef123",
+  "scope": "深读 vLLM v1 的 token 采样层。主线是 Sampler.forward 文档化的 9 步流水线：raw logprobs 抽取（在任何惩罚/温度之前）、fp32 转换、allowed-token 白名单、bad words 屏蔽、非 argmax-invariant logits processors（min_tokens / logit_bias，能改 argmax 故必须在 greedy 之前生效）、惩罚（repetition / frequency / presence）、sample（greedy 早退、温度缩放、argmax-invariant processor=min_p、top-k/top-p 截断、随机 vs 贪心 torch.where 合并）、logprobs gather。再下钻 TopKTopPSampler 的 init-time 多后端分发（flashinfer / triton / torch-native / cpu / aiter）与 apply_top_k_top_p 的 batch>=8 走 triton、否则 pytorch sort 的分流；以及 SamplingMetadata 如何把逐请求参数批量张量化。三角洲 Park et al. 的 Qrita pivot-truncation triton 内核作为'为何不排序整个 vocab'的性能证据，但不逐行讲其内部 18 次三分搜索。",
+  "code_spine": [
+    "vllm/v1/sample/sampler.py:L68-143  Sampler.forward — 9 步主干编排",
+    "vllm/v1/sample/sampler.py:L80-91   step1-2: raw logprobs 抽取 + fp32 转换",
+    "vllm/v1/sample/sampler.py:L357-406 apply_logits_processors — step3-6: allowed/bad_words/non_argmax_invariant/penalties",
+    "vllm/v1/sample/ops/bad_words.py:L9-35  bad words 前缀匹配屏蔽",
+    "vllm/v1/sample/logits_processor/builtin.py:L167-238  MinTokens / LogitBias（non-argmax-invariant）",
+    "vllm/v1/sample/ops/penalties.py:L11-39  apply_all_penalties 张量化",
+    "vllm/model_executor/layers/utils.py:L51-89  apply_penalties 真正算式",
+    "vllm/v1/sample/sampler.py:L232-288 sample — step7: greedy 早退/温度/min_p/topk-topp/torch.where",
+    "vllm/v1/sample/sampler.py:L216-230 apply_temperature + greedy_sample",
+    "vllm/v1/sample/logits_processor/builtin.py:L22-115  MinP（argmax-invariant）",
+    "vllm/v1/sample/ops/topk_topp_sampler.py:L30-104  TopKTopPSampler.__init__ 后端分发",
+    "vllm/v1/sample/ops/topk_topp_sampler.py:L106-152 forward_native / forward_cuda",
+    "vllm/v1/sample/ops/topk_topp_sampler.py:L257-358 apply_top_k_top_p 分流 + pytorch sort 实现 + random_sample",
+    "vllm/v1/sample/ops/topk_topp_sampler.py:L361-403 flashinfer_sample（rejection sampling）",
+    "vllm/v1/sample/ops/topk_topp_triton.py:L965-1051 apply_top_k_top_p_triton wrapper（kernel launch / 缓存表）",
+    "vllm/v1/sample/sampler.py:L290-342 compute_logprobs + gather_logprobs — step8",
+    "vllm/v1/sample/metadata.py:L14-56  SamplingMetadata 批量张量载体"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/sample/sampler.py",
+      "lines": "L21-60",
+      "what": "Sampler 类的 9 步 docstring —— 这是全章的目录与契约，正文应直接以它为骨架逐步解读。",
+      "code": "class Sampler(nn.Module):\n    \"\"\"\n    A layer that samples the next tokens from the model's outputs\n    with the following steps in order:\n\n    1. If logprobs are requested:\n        a) If `logprobs_mode` is `raw_logprobs`, compute logprobs\n           as the final logprobs to return.\n        b) If `logprobs_mode` is `raw_logits`, clone the logits\n           as the final logprobs to return.\n    2. Convert logits to float32.\n    3. Apply allowed token ids whitelist.\n    4. Apply bad words exclusion.\n    5. Apply logit processors which are not argmax-invariant,\n       i.e. that can impact greedy sampling.\n        a) Min tokens processor\n        b) Logit bias processor\n    6. Apply penalties\n        a) Repetition penalty\n        b) Frequency penalty\n        c) Presence penalty\n    7. Sample the next tokens. `sample` method performs the following steps:\n        a) If not `all_random`, perform greedy sampling. If `all_greedy`,\n           return the greedily sampled tokens and final logprobs if requested.\n        b) Apply temperature.\n        c) Apply logit processors which are argmax-invariant, by default\n           the min_p processor.\n        d) Apply top_k and/or top_p.\n        e) Sample the next tokens with the probability distribution.\n        f) If `all_random` or temperature >= epsilon (1e-5), return the\n           randomly sampled tokens and final logprobs if requested. Else,\n           return the greedily sampled tokens and logprobs if requested.\n    8. Gather the logprobs of the top `max_num_logprobs` and sampled token\n       (if requested). ...\n    9. Return the final `SamplerOutput`.\n    \"\"\"",
+      "elide": ["docstring 第8步关于 max_num_logprobs+1/+0 合并的长注释，讲 logprobs gather 时再展开"]
+    },
+    {
+      "path": "vllm/v1/sample/sampler.py",
+      "lines": "L68-104",
+      "what": "forward 主干：step1（raw logprobs 在任何修改之前抽取，区别于 V0）+ step2 fp32 + 调 apply_logits_processors + 调 sample + int64 化采样结果。注意 raw_logprobs 是 NOTE(woosuk) 强调的'未经惩罚/温度的原始 logits'，与采样所用 logits 解耦。",
+      "code": "def forward(\n        self,\n        logits: torch.Tensor,\n        sampling_metadata: SamplingMetadata,\n        predict_bonus_token: bool = False,\n        logprobs_mode_override: LogprobsMode | None = None,\n    ) -> SamplerOutput:\n        logprobs_mode = logprobs_mode_override or self.logprobs_mode\n        # NOTE(woosuk): Use the original logits (before any penalties or\n        # temperature scaling) for the top-k logprobs.\n        # This is different from the V0 sampler, which uses the logits that\n        # is used for sampling (after penalties and temperature scaling).\n        num_logprobs = sampling_metadata.max_num_logprobs\n        if num_logprobs is not None:\n            if logprobs_mode == \"raw_logprobs\":\n                raw_logprobs = self.compute_logprobs(logits)\n            elif logprobs_mode == \"raw_logits\":\n                if logits.dtype == torch.float32:\n                    raw_logprobs = logits.clone()\n                else:\n                    raw_logprobs = logits.to(torch.float32)\n\n        # Use float32 for the logits.\n        logits = logits.to(torch.float32)\n\n        logits = self.apply_logits_processors(\n            logits, sampling_metadata, predict_bonus_token\n        )\n        # Sample the next token.\n        sampled, processed_logprobs = self.sample(logits, sampling_metadata)\n        if processed_logprobs is not None:\n            raw_logprobs = processed_logprobs\n        # Convert sampled token ids to int64 (long) type ...\n        sampled = sampled.long()",
+      "elide": ["L106-131 logprob_token_ids（generative_scoring API 专用）与 L114-130 的 logprobs_tensors 三分支选择 —— 本章只讲 num_logprobs 主路径，logprob_token_ids 旁路标记为 subtract"]
+    },
+    {
+      "path": "vllm/v1/sample/sampler.py",
+      "lines": "L357-406",
+      "what": "apply_logits_processors —— 流水线 step3-6 的实际落地：allowed_token_ids_mask（白名单，masked_fill 把非白名单置 -inf）→ bad_words → 非 argmax-invariant processors 循环 → penalties。这一组都在 greedy 之前，因为它们都能改变 argmax。",
+      "code": "    def apply_logits_processors(\n        self,\n        logits: torch.Tensor,\n        sampling_metadata: SamplingMetadata,\n        predict_bonus_token: bool,\n    ) -> torch.Tensor:\n        bad_words_token_ids = sampling_metadata.bad_words_token_ids\n        ...\n        output_token_ids = sampling_metadata.output_token_ids\n        ...\n        # Apply allowed token ids.\n        if sampling_metadata.allowed_token_ids_mask is not None:\n            logits.masked_fill_(sampling_metadata.allowed_token_ids_mask, float(\"-inf\"))\n\n        # Apply bad words exclusion.\n        if bad_words_token_ids:\n            apply_bad_words(logits, bad_words_token_ids, output_token_ids)\n\n        # Apply logits processors which can impact greedy sampling.\n        for processor in sampling_metadata.logitsprocs.non_argmax_invariant:\n            logits = processor.apply(logits)\n\n        # Apply penalties (e.g., freq_penalties).\n        logits = self.apply_penalties(logits, sampling_metadata, output_token_ids)\n        ...\n        return logits",
+      "elide": ["L364-380 predict_bonus_token / thinking_budget 的 spec-decode 组合分支（_combine_outputs_with_spec_tokens、holder）", "L395-405 thinking_budget holder.apply_to_logits —— 均标记 subtract，正文只讲非投机解码主路径"]
+    },
+    {
+      "path": "vllm/v1/sample/ops/bad_words.py",
+      "lines": "L9-35",
+      "what": "bad words 屏蔽的核心：对每个被禁短语，若其 (长度-1) 前缀恰好等于该请求最近输出的同长后缀，则把该短语最后一个 token 的 logit 置 -inf。即'只在会补全成被禁短语时才屏蔽末 token'。apply_bad_words 按 req_index 逐行调用单批版本。",
+      "code": "_SMALLEST_LOGIT = float(\"-inf\")\n\n\ndef _apply_bad_words_single_batch(\n    logits: torch.Tensor,\n    bad_words_token_ids: list[list[int]],\n    past_tokens_ids: list[int],\n) -> None:\n    for bad_word_ids in bad_words_token_ids:\n        if len(bad_word_ids) > len(past_tokens_ids) + 1:\n            continue\n\n        prefix_length = len(bad_word_ids) - 1\n        last_token_id = bad_word_ids[-1]\n        actual_prefix = past_tokens_ids[-prefix_length:] if prefix_length > 0 else []\n        expected_prefix = bad_word_ids[:prefix_length]\n\n        assert len(actual_prefix) == len(expected_prefix)\n\n        if actual_prefix == expected_prefix:\n            logits[last_token_id] = _SMALLEST_LOGIT\n\n\ndef apply_bad_words(\n    logits: torch.Tensor,\n    bad_words_token_ids: dict[int, list[list[int]]],\n    past_tokens_ids: list[list[int]],\n) -> None:\n    for i, bad_words_ids in bad_words_token_ids.items():\n        _apply_bad_words_single_batch(logits[i], bad_words_ids, past_tokens_ids[i])",
+      "elide": ["L38-57 apply_bad_words_with_drafts（spec-decode 变体）—— subtract"]
+    },
+    {
+      "path": "vllm/v1/sample/logits_processor/builtin.py",
+      "lines": "L186-238",
+      "what": "MinTokens 与 LogitBias 都声明 is_argmax_invariant()=False —— 它们能改变 argmax 结果，所以被分类进 non_argmax_invariant、在 greedy 之前生效。MinTokens.apply 把未达 min_tokens 请求的所有 stop/EOS token logit 置 -inf（index_put_）；LogitBias.apply 把逐请求偏置直接加到对应 (req,token) 位置。这正是 step5。",
+      "code": "class MinTokensLogitsProcessor(LogitsProcessor):\n    ...\n    def is_argmax_invariant(self) -> bool:\n        \"\"\"By censoring stop tokens, min-tokens can change the outcome\n        of the argmax operation in greedy sampling.\"\"\"\n        return False\n    ...\n    def apply(self, logits: torch.Tensor) -> torch.Tensor:\n        if self.min_toks:\n            # Inhibit EOS token for requests which have not reached min length\n            logits.index_put_(self.logits_slice, self.neg_inf_tensor)\n        return logits\n\n# ---- LogitBias ----\n    def is_argmax_invariant(self) -> bool:\n        \"\"\"Logit bias can rebalance token probabilities and change the\n        outcome of argmax in greedy sampling.\"\"\"\n        return False\n\n    def apply(self, logits: torch.Tensor) -> torch.Tensor:\n        if self.biases:\n            logits[self.logits_slice] += self.bias_tensor\n        return logits",
+      "elide": ["update_state / BatchUpdate 持久批维护逻辑（L53-99 MinP，L135-227 各 processor）—— 该机制属 persistent batch 章节，本章只需点明'state 按 req_index 维护、apply 时已是张量切片'，详细 subtract"]
+    },
+    {
+      "path": "vllm/v1/sample/logits_processor/state.py",
+      "lines": "L148-165",
+      "what": "LogitsProcessors 容器在构造时就按 is_argmax_invariant() 把 processor 分进两个 list——这是 step5（non_argmax_invariant，greedy 前）与 step7c（argmax_invariant=min_p，温度后随机路径）能分两处生效的结构基础。",
+      "code": "class LogitsProcessors:\n    \"\"\"Encapsulates initialized logitsproc objects.\"\"\"\n\n    def __init__(self, logitsprocs: Iterable[\"LogitsProcessor\"] | None = None) -> None:\n        self.argmax_invariant: list[LogitsProcessor] = []\n        self.non_argmax_invariant: list[LogitsProcessor] = []\n        if logitsprocs:\n            for logitproc in logitsprocs:\n                (\n                    self.argmax_invariant\n                    if logitproc.is_argmax_invariant()\n                    else self.non_argmax_invariant\n                ).append(logitproc)",
+      "elide": ["BatchUpdateBuilder（L18-145）全部 —— 属持久批章节"]
+    },
+    {
+      "path": "vllm/model_executor/layers/utils.py",
+      "lines": "L51-89",
+      "what": "三种惩罚的真正算式（step6）。repetition 用自定义 op（按 prompt_mask/output_mask 对已出现 token 缩放 logit）；frequency 按 output_bin_counts（出现次数）线性扣减；presence 按 output_mask（是否出现过）扣减。遵循 OpenAI API 定义。SamplingMetadata 已把三个 penalty 做成逐请求张量。",
+      "code": "def apply_penalties(\n    logits: torch.Tensor,\n    prompt_tokens_tensor: torch.Tensor,\n    output_tokens_tensor: torch.Tensor,\n    presence_penalties: torch.Tensor,\n    frequency_penalties: torch.Tensor,\n    repetition_penalties: torch.Tensor,\n) -> torch.Tensor:\n    num_seqs, vocab_size = logits.shape\n    _, prompt_mask = get_token_bin_counts_and_mask(\n        prompt_tokens_tensor, vocab_size, num_seqs\n    )\n    output_bin_counts, output_mask = get_token_bin_counts_and_mask(\n        output_tokens_tensor, vocab_size, num_seqs\n    )\n\n    # Apply repetition penalties as a custom op\n    from vllm._custom_ops import apply_repetition_penalties\n\n    apply_repetition_penalties(logits, prompt_mask, output_mask, repetition_penalties)\n\n    # We follow the definition in OpenAI API.\n    logits -= frequency_penalties.unsqueeze(dim=1) * output_bin_counts\n    logits -= presence_penalties.unsqueeze(dim=1) * output_mask\n    return logits",
+      "elide": ["get_token_bin_counts_and_mask 内部 scatter_add_ 细节（L40-48），点明它产出 (出现次数, 出现mask) 即可", "apply_all_penalties wrapper 的 -1 占位符替换（penalties.py:L27-30）异步调度边界情况，可简述"]
+    },
+    {
+      "path": "vllm/v1/sample/sampler.py",
+      "lines": "L216-288",
+      "what": "step7 全貌。apply_temperature：非 all_random 时把 temp<eps 的请求温度替成 1.0（避免除零），再 in-place 除。sample：all_random 跳过 greedy；否则先 greedy_sample(argmax)，若 all_greedy 直接早退（不做温度/top-k/top-p，这是 greedy 快路）；随机路径=温度→argmax_invariant processors(min_p)→topk_topp_sampler→最后用 torch.where 按逐请求 temp<eps 在 greedy 与 random 间逐行选择。",
+      "code": "    @staticmethod\n    def apply_temperature(logits, temp, all_random):\n        # Use in-place division to avoid creating a new tensor.\n        # Avoid division by zero if there are greedy requests.\n        if not all_random:\n            temp = torch.where(temp < _SAMPLING_EPS, 1.0, temp)\n        return logits.div_(temp.unsqueeze(dim=1))\n\n    @staticmethod\n    def greedy_sample(logits):\n        return logits.argmax(dim=-1).view(-1)\n\n    def sample(self, logits, sampling_metadata, logprobs_mode_override=None):\n        logprobs_mode = logprobs_mode_override or self.logprobs_mode\n        assert not (sampling_metadata.all_greedy and sampling_metadata.all_random)\n        if sampling_metadata.all_random:\n            greedy_sampled = None\n        else:\n            greedy_sampled = self.greedy_sample(logits)\n            if sampling_metadata.all_greedy:\n                processed_logprobs = None\n                if sampling_metadata.max_num_logprobs is not None:\n                    if logprobs_mode == \"processed_logits\":\n                        processed_logprobs = logits\n                    elif logprobs_mode == \"processed_logprobs\":\n                        processed_logprobs = self.compute_logprobs(logits)\n                return greedy_sampled, processed_logprobs\n\n        assert sampling_metadata.temperature is not None\n        # Apply temperature.\n        logits = self.apply_temperature(\n            logits, sampling_metadata.temperature, sampling_metadata.all_random\n        )\n        # Apply logits processors that only apply to random sampling\n        # (argmax invariant)\n        for processor in sampling_metadata.logitsprocs.argmax_invariant:\n            logits = processor.apply(logits)\n        # Apply top_k and/or top_p.\n        random_sampled, processed_logprobs = self.topk_topp_sampler(\n            logits,\n            sampling_metadata.generators,\n            sampling_metadata.top_k,\n            sampling_metadata.top_p,\n        )\n        if greedy_sampled is None:\n            return random_sampled, processed_logprobs\n\n        sampled = torch.where(\n            sampling_metadata.temperature < _SAMPLING_EPS,\n            greedy_sampled,\n            random_sampled,\n            out=greedy_sampled,  # Reuse tensor\n        )\n        return sampled, processed_logprobs",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/sample/logits_processor/builtin.py",
+      "lines": "L46-115",
+      "what": "MinP 声明 is_argmax_invariant()=True（min_p 永不改 argmax，因为它只砍掉概率 < min_p*max_prob 的尾部，最高 logit 必留），故归入 argmax_invariant、在温度之后随机路径里生效（step7c）。apply 仅在 min_p_count>0 时才 softmax、求每行最大概率、按阈值 mask。",
+      "code": "    def is_argmax_invariant(self) -> bool:\n        \"\"\"Min-p never impacts greedy sampling\"\"\"\n        return True\n    ...\n    def apply(self, logits: torch.Tensor) -> torch.Tensor:\n        if not self.min_p_count:\n            return logits\n\n        # Convert logits to probability distribution\n        probability_values = torch.nn.functional.softmax(logits, dim=-1)\n        # Calculate maximum probabilities per sequence\n        max_probabilities = torch.amax(probability_values, dim=-1, keepdim=True)\n        # Adjust min_p\n        adjusted_min_p = max_probabilities.mul_(self.min_p)\n        # Identify valid tokens using threshold comparison\n        invalid_token_mask = probability_values < adjusted_min_p\n        # Apply mask using boolean indexing\n        logits.masked_fill_(invalid_token_mask, -float(\"inf\"))\n        return logits",
+      "elide": ["__init__ 的双 tensor(cpu/device)预分配与 update_state（L23-99）—— persistent batch 机制，subtract"]
+    },
+    {
+      "path": "vllm/v1/sample/ops/topk_topp_sampler.py",
+      "lines": "L30-104",
+      "what": "TopKTopPSampler.__init__ 的 init-time 后端分发——把 self.forward 绑成具体后端方法。CUDA+flashinfer 可用→forward_cuda；CUDA 但硬件不支持→静默回退 forward_native；显式关→forward_native；CPU→forward_cpu（POWERPC/RISCV 回退 native）；ROCm+aiter→forward_hip；其余→forward_native。关键约束：logprobs_mode 为 processed_* 时 flashinfer 无法返回中间 logits，强制走 native。",
+      "code": "    def __init__(self, logprobs_mode: LogprobsMode = \"raw_logprobs\") -> None:\n        super().__init__()\n        self.logprobs_mode = logprobs_mode\n        # flashinfer optimization does not apply if intermediate\n        # logprobs/logits after top_k/top_p need to be returned\n        if (\n            logprobs_mode not in (\"processed_logits\", \"processed_logprobs\")\n            and current_platform.is_cuda()\n        ):\n            if envs.VLLM_USE_FLASHINFER_SAMPLER:\n                from vllm.v1.attention.backends.flashinfer import FlashInferBackend\n                capability = current_platform.get_device_capability()\n                assert capability is not None\n                if FlashInferBackend.supports_compute_capability(capability):\n                    logger.info_once(\"Using FlashInfer for top-p & top-k sampling.\", scope=\"global\")\n                    self.forward = self.forward_cuda\n                elif envs.is_set(\"VLLM_USE_FLASHINFER_SAMPLER\"):\n                    ...\n                    raise RuntimeError(...)\n                else:\n                    # Default-on path; hardware can't run FlashInfer ->\n                    # quietly fall back to the PyTorch-native sampler\n                    self.forward = self.forward_native\n            else:\n                self.forward = self.forward_native\n        elif current_platform.is_cpu():\n            arch = current_platform.get_cpu_architecture()\n            if arch in (CpuArchEnum.RISCV, CpuArchEnum.POWERPC):\n                self.forward = self.forward_native\n            else:\n                self.forward = self.forward_cpu\n        elif (\n            logprobs_mode not in (\"processed_logits\", \"processed_logprobs\")\n            and rocm_aiter_ops.is_enabled()\n        ):\n            ...\n            self.forward = self.forward_hip\n        else:\n            self.forward = self.forward_native",
+      "elide": ["各分支的 logger.info/warning_once 措辞", "forward_hip / aiter 路径细节（L184-244）—— 正文点名存在即可，详细 subtract"]
+    },
+    {
+      "path": "vllm/v1/sample/ops/topk_topp_sampler.py",
+      "lines": "L106-152",
+      "what": "forward_native 与 forward_cuda 对比。native：apply_top_k_top_p 截断 logits → softmax 成 probs → random_sample。cuda：若无 k/p 或存在逐请求 generators（flashinfer 0.2.3+ 不支持），回退 native；否则 flashinfer_sample（直接对 logits 走拒绝采样，不排序）。这就是'多后端分发'的两个代表。",
+      "code": "    def forward_native(self, logits, generators, k, p):\n        logits = apply_top_k_top_p(logits, k, p)\n        logits_to_return = None\n        if self.logprobs_mode == \"processed_logits\":\n            logits_to_return = logits\n        elif self.logprobs_mode == \"processed_logprobs\":\n            logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)\n        probs = logits.softmax(dim=-1, dtype=torch.float32)\n        return random_sample(probs, generators), logits_to_return\n\n    def forward_cuda(self, logits, generators, k, p):\n        # Fall back to the PyTorch-native path when FlashInfer has nothing\n        # to do (no top-k / top-p filter) or when per-request generators\n        # are present (unsupported by FlashInfer 0.2.3+).\n        if (k is None and p is None) or generators:\n            return self.forward_native(logits, generators, k, p)\n        assert self.logprobs_mode not in (\"processed_logits\", \"processed_logprobs\"), (\n            \"FlashInfer does not support returning logits/logprobs\"\n        )\n        return flashinfer_sample(logits.contiguous(), k, p, generators), None",
+      "elide": ["forward_cpu（L154-182）的 exponential_ 采样与 compiled_random_sample 分支—— 可简述为'CPU 专路，逐 generator 重采样'"]
+    },
+    {
+      "path": "vllm/v1/sample/ops/topk_topp_sampler.py",
+      "lines": "L257-358",
+      "what": "apply_top_k_top_p 的二级分流（HAS_TRITON 且 batch>=8 走 triton，否则 pytorch sort）+ pytorch 实现 + random_sample。pytorch 实现是教学主角：升序 sort → top-k 用第 (V-k) 大值做阈值 mask → top-p 用 softmax 累积和 mask（保证至少留 1 个）→ scatter 回原位。random_sample 用 Gumbel-max 技巧（exp 分布 q，probs/q 取 argmax）避免 multinomial 的 CPU-GPU 同步。",
+      "code": "def apply_top_k_top_p(logits, k, p):\n    if p is None and k is None:\n        return logits\n    if HAS_TRITON and logits.shape[0] >= 8:\n        return apply_top_k_top_p_triton(logits, k, p)\n    # Use pytorch sort implementation for small batch sizes.\n    return apply_top_k_top_p_pytorch(logits, k, p)\n\n\ndef apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=False):\n    if p is None:\n        if k is None:\n            return logits\n        if allow_cpu_sync:\n            return apply_top_k_only(logits, k)\n    logits_sort, logits_idx = logits.sort(dim=-1, descending=False)\n    if k is not None:\n        # Apply top-k.\n        top_k_mask = logits_sort.size(1) - k.to(torch.long)  # shape: B\n        top_k_mask = logits_sort.gather(1, top_k_mask.unsqueeze(dim=1))\n        top_k_mask = logits_sort < top_k_mask\n        logits_sort.masked_fill_(top_k_mask, -float(\"inf\"))\n    if p is not None:\n        # Apply top-p.\n        probs_sort = logits_sort.softmax(dim=-1)\n        probs_sum = torch.cumsum(probs_sort, dim=-1, out=probs_sort)\n        top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)\n        top_p_mask[:, -1] = False  # at least one\n        logits_sort.masked_fill_(top_p_mask, -float(\"inf\"))\n    # Re-sort the probabilities.\n    return logits.scatter_(dim=-1, index=logits_idx, src=logits_sort)\n\n\ndef random_sample(probs, generators):\n    q = torch.empty_like(probs)\n    if len(generators) != probs.shape[0]:\n        q.exponential_()\n    if generators:\n        for i, generator in generators.items():\n            q[i].exponential_(generator=generator)\n    return probs.div_(q).argmax(dim=-1).view(-1)",
+      "elide": ["apply_top_k_only（L314-334）的免排序 top-k-only 路径（含 GPU->CPU sync 注意）—— 可简述", "random_sample 里关于'无种子先批量、有种子覆写'的 NOTE 注释可保留要点"]
+    },
+    {
+      "path": "vllm/v1/sample/ops/topk_topp_sampler.py",
+      "lines": "L361-403",
+      "what": "flashinfer_sample：统计等价于 random_sample 但用拒绝采样避免排序整个 vocab（更快但输出不必逐位相同）。按 k/p 是否为 None 走三条 flashinfer API：top_p_sampling_from_probs / top_k_sampling_from_probs / top_k_top_p_sampling_from_logits，全部 deterministic=True。",
+      "code": "def flashinfer_sample(logits, k, p, generators):\n    \"\"\"Sample from the logits using FlashInfer.\n\n    Statistically, this function is equivalent to the `random_sample` function.\n    However, this function is faster because it avoids sorting the logits tensor\n    via rejection sampling.\n    ...\n    \"\"\"\n    import flashinfer\n    if version.parse(flashinfer.__version__) < version.parse(\"0.2.3\"):\n        raise ImportError(...)\n    assert not (k is None and p is None)\n    if k is None:\n        probs = logits.softmax(dim=-1, dtype=torch.float32)\n        next_token_ids = flashinfer.sampling.top_p_sampling_from_probs(probs, p, deterministic=True)\n    elif p is None:\n        probs = logits.softmax(dim=-1, dtype=torch.float32)\n        next_token_ids = flashinfer.sampling.top_k_sampling_from_probs(probs, k, deterministic=True)\n    else:\n        next_token_ids = flashinfer.sampling.top_k_top_p_sampling_from_logits(logits, k, p, deterministic=True)\n    return next_token_ids.view(-1)",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/sample/ops/topk_topp_triton.py",
+      "lines": "L965-1051",
+      "what": "apply_top_k_top_p_triton wrapper（不进 kernel 内部）：断言 fp32 2D，k/p 缺省用 dummy 指针，按 SM 数定 NUM_PROGRAMS=min(num_sm,batch)，缓存每设备 buffer 与两张正态分位查找表，启动 _topk_topp_kernel。内核基于 Park et al. 'Qrita' pivot-truncation 三分搜索（不排序整 vocab），先 top-k 后 top-p，in-place 写回。正文用它论证'batch>=8 时为何另起内核'，不逐行讲三分搜索。",
+      "code": "def apply_top_k_top_p_triton(logits, k, p, mask_value=float(\"-inf\")):\n    \"\"\"Apply combined top-k and top-p masking using Triton.\n\n    Top-k is applied first (by logit value), then top-p is applied\n    to the remaining k values (by probability).\n    \"\"\"\n    assert logits.ndim == 2\n    assert logits.dtype == torch.float32\n    batch_size, vocab_size = logits.shape\n    topk_enabled = k is not None\n    topp_enabled = p is not None\n    if batch_size == 0 or not (topk_enabled or topp_enabled):\n        return logits\n    if k is not None:\n        k_ptr = k.to(torch.int32)\n    else:\n        k_ptr = logits  # Dummy pointer (won't be read)\n    if p is not None:\n        p_ptr = p.to(torch.float32)\n    else:\n        p_ptr = logits  # Dummy pointer (won't be read)\n    num_sm = num_compute_units(logits.device.index)\n    NUM_PROGRAMS = min(num_sm, batch_size)\n    ...  # buffer / table caches keyed per device\n    _topk_topp_kernel[(NUM_PROGRAMS,)](\n        logits, buffer, percentile_to_std_table, normal_cdf_to_sigma_table,\n        k_ptr, p_ptr, BATCH_SIZE=batch_size, MASK_VALUE=mask_value,\n        VOCAB_SIZE=vocab_size, BLOCK_SIZE=8192, BLOCK_SIZE_TRUNC=4096,\n        TOPK_ENABLED=topk_enabled, TOPP_ENABLED=topp_enabled,\n    )\n    return logits",
+      "elide": ["_topk_topp_kernel（L93-962）全部三分搜索/outlier gather/duplicate handling 实现 —— 920 行 GPU 内核，本章只讲其外部契约与算法思想（Qrita pivot truncation），逐行内核标记 subtract"]
+    },
+    {
+      "path": "vllm/v1/sample/sampler.py",
+      "lines": "L290-342",
+      "what": "step8 logprobs gather。compute_logprobs=log_softmax。gather_logprobs：对 raw_logprobs（注意是第1步抽取的、未经惩罚/温度的）topk 取 num_logprobs 个 + gather 出采样 token 自身的 logprob + batched_count_greater_than 算 rank，拼接成 (token + topk) 一并返回。mark_unbacked 避免 batch=1->2 的 dynamo 重编译。",
+      "code": "    @staticmethod\n    def compute_logprobs(logits: torch.Tensor) -> torch.Tensor:\n        return logits.log_softmax(dim=-1, dtype=torch.float32)\n\n    @staticmethod\n    def gather_logprobs(logprobs, num_logprobs, token_ids):\n        assert token_ids.dtype == torch.int64\n        # Find the topK values.\n        topk_logprobs, topk_indices = torch.topk(logprobs, num_logprobs, dim=-1)\n        # Get with the logprob of the prompt or sampled token.\n        token_ids = token_ids.unsqueeze(-1)\n        token_logprobs = logprobs.gather(-1, token_ids)\n        # Compute the ranks of the actual token.\n        torch._dynamo.decorators.mark_unbacked(logprobs, 0)\n        torch._dynamo.decorators.mark_unbacked(token_logprobs, 0)\n        token_ranks = batched_count_greater_than(logprobs, token_logprobs)\n        # Concatenate together with the topk.\n        indices = torch.cat((token_ids, topk_indices), dim=1)\n        logprobs = torch.cat((token_logprobs, topk_logprobs), dim=1)\n        indices = indices.to(torch.int32)\n        return LogprobsTensors(indices, logprobs, token_ranks)",
+      "elide": ["docstring 长说明可压缩"]
+    },
+    {
+      "path": "vllm/v1/sample/metadata.py",
+      "lines": "L14-56",
+      "what": "SamplingMetadata —— 把整批逐请求的采样参数批量张量化的载体。temperature/top_p/top_k/三种 penalty 都是 [batch] 张量；all_greedy/all_random 是批级布尔快路标志；generators 是逐请求 seed 字典；output_token_ids 是逐请求历史 list；logitsprocs 是已按 argmax-invariance 分好的容器。Sampler 全程吃这一个对象。",
+      "code": "@dataclass\nclass SamplingMetadata:\n    temperature: torch.Tensor | None\n    all_greedy: bool\n    all_random: bool\n\n    top_p: torch.Tensor | None\n    top_k: torch.Tensor | None\n\n    generators: dict[int, torch.Generator]\n\n    # None means no logprobs, 0 means sampled token logprobs only\n    max_num_logprobs: int | None\n\n    no_penalties: bool\n    prompt_token_ids: torch.Tensor | None\n    frequency_penalties: torch.Tensor\n    presence_penalties: torch.Tensor\n    repetition_penalties: torch.Tensor\n\n    output_token_ids: list[list[int]]\n\n    # 2D bool tensor (max batch size, vocab size)\n    allowed_token_ids_mask: torch.Tensor | None\n\n    # req_index -> bad_words_token_ids\n    bad_words_token_ids: dict[int, list[list[int]]]\n\n    # Loaded logits processors\n    logitsprocs: LogitsProcessors",
+      "elide": ["L49-56 logprob_token_ids / spec_token_ids / thinking_budget_state_holder 三个旁路字段 —— 标记 subtract，但 must_keep 不含它们"]
+    }
+  ],
+  "key_classes": [
+    {"name": "Sampler", "file": "vllm/v1/sample/sampler.py", "responsibility": "nn.Module，9 步采样流水线的编排者：forward 做 step1-2/8-9，apply_logits_processors 做 step3-6，sample 做 step7。全程吃 SamplingMetadata，输出 SamplerOutput（sampled_token_ids + logprobs_tensors）。"},
+    {"name": "SamplingMetadata", "file": "vllm/v1/sample/metadata.py", "responsibility": "dataclass，把整批逐请求采样参数批量张量化：temperature/top_k/top_p/penalties 张量、all_greedy/all_random 快路标志、generators、output_token_ids、allowed/bad_words、已分类的 logitsprocs 容器。"},
+    {"name": "TopKTopPSampler", "file": "vllm/v1/sample/ops/topk_topp_sampler.py", "responsibility": "nn.Module，构造时按 device/platform/logprobs_mode 把 self.forward 绑定到具体后端（forward_cuda/native/cpu/hip）。call 时执行 top-k/top-p 截断 + 随机采样，返回 (sampled, optional_processed_logprobs)。"},
+    {"name": "LogitsProcessors", "file": "vllm/v1/sample/logits_processor/state.py", "responsibility": "容器，构造时按 is_argmax_invariant() 把 processor 分进 argmax_invariant / non_argmax_invariant 两个 list，决定它在流水线 step5（greedy 前）还是 step7c（温度后随机路径）生效。"},
+    {"name": "MinPLogitsProcessor", "file": "vllm/v1/sample/logits_processor/builtin.py", "responsibility": "argmax-invariant=True。砍掉概率 < min_p*max_prob 的尾部 token；仅 min_p_count>0 时才 softmax。"},
+    {"name": "MinTokensLogitsProcessor", "file": "vllm/v1/sample/logits_processor/builtin.py", "responsibility": "argmax-invariant=False。未达 min_tokens 的请求屏蔽其 stop/EOS token（置 -inf）。"},
+    {"name": "LogitBiasLogitsProcessor", "file": "vllm/v1/sample/logits_processor/builtin.py", "responsibility": "argmax-invariant=False。把逐请求 logit_bias 加到对应 (req,token) 位置。"}
+  ],
+  "data_flow": [
+    "1. Sampler.forward 入口：logits [batch, vocab]（fp16/fp32），SamplingMetadata。sampler.py:forward",
+    "2. step1：若 max_num_logprobs 非空，按 logprobs_mode 抽 raw_logprobs（raw_logprobs→log_softmax；raw_logits→clone/转 fp32）——在任何修改之前。sampler.py:compute_logprobs",
+    "3. step2：logits.to(float32)。sampler.py:forward L91",
+    "4. step3-6：apply_logits_processors —— allowed_token_ids_mask 白名单 masked_fill → apply_bad_words → non_argmax_invariant processors(min_tokens/logit_bias) → apply_penalties(rep/freq/presence)。sampler.py:apply_logits_processors",
+    "5. step7：sample —— 非 all_random 先 greedy_sample(argmax)；all_greedy 早退（greedy 快路，不做温度/截断）；随机路径=apply_temperature → argmax_invariant processors(min_p) → topk_topp_sampler → torch.where 逐请求按 temp<eps 在 greedy/random 间选。sampler.py:sample",
+    "6. step7d 内部：TopKTopPSampler.forward(=绑定的后端)。apply_top_k_top_p 按 HAS_TRITON 且 batch>=8 走 triton，否则 pytorch sort；或 forward_cuda 走 flashinfer_sample。ops/topk_topp_sampler.py",
+    "7. step8：若 num_logprobs，gather_logprobs(raw_logprobs, num_logprobs, sampled) —— topk + 采样 token logprob + rank，拼成 LogprobsTensors。sampler.py:gather_logprobs",
+    "8. step9：SamplerOutput(sampled.unsqueeze(-1) int32, logprobs_tensors) 返回。sampler.py:forward L136-143"
+  ],
+  "design_decisions": [
+    {"decision": "raw logprobs 在任何惩罚/温度之前抽取（区别于 V0）", "why": "返回给用户的 top-k logprobs 应反映模型原始分布，而非采样所用的被惩罚/缩放后分布；二者解耦后 logprobs 语义干净。", "evidence": "vllm/v1/sample/sampler.py:L76-88（NOTE woosuk 明示与 V0 不同）"},
+    {"decision": "logits processors 按 argmax-invariant 与否分两处生效", "why": "greedy 只取 argmax，不影响 argmax 的 processor（min_p 等阈值类）可推迟到温度后、且只在随机路径执行，从而 greedy 快路能完全跳过温度/min_p/top-k/top-p；能改 argmax 的（min_tokens/logit_bias）必须在 greedy 之前。", "evidence": "vllm/v1/sample/sampler.py:L245-257（all_greedy 早退）, L268-269（argmax_invariant 仅随机路径）; logits_processor/state.py:L148-160（构造时分类）; builtin.py:L46-48/L130-133/L186-189（三个 is_argmax_invariant）"},
+    {"decision": "greedy 快路：all_greedy 时早退，跳过温度/截断/min_p", "why": "贪心采样结果与温度、top-k/top-p、min_p 无关（只取 argmax），提前 return 省掉整条随机路径计算。", "evidence": "vllm/v1/sample/sampler.py:L250-257"},
+    {"decision": "混合批用 torch.where 逐请求合并 greedy 与 random", "why": "同一 batch 可同时含 greedy(temp<eps) 与 random 请求；先全算 greedy_sampled 与 random_sampled，再按逐请求 temperature<eps 在两者间逐行选择（out=greedy_sampled 复用张量省内存）。", "evidence": "vllm/v1/sample/sampler.py:L282-288"},
+    {"decision": "TopKTopPSampler 在 __init__ 而非每次调用时绑定后端", "why": "device/platform/logprobs_mode 在生命周期内不变，init-time 把 self.forward 绑成具体方法避免每 token 的分发开销；多级回退（flashinfer 不支持硬件→静默 native、CPU 特例、ROCm aiter）保证启动不崩。", "evidence": "vllm/v1/sample/ops/topk_topp_sampler.py:L30-104"},
+    {"decision": "top-k/top-p 截断按 batch 规模二级分流（triton vs pytorch sort）", "why": "pytorch 的 sort 在大 batch 上昂贵；batch>=8 且有 triton 时改用 Qrita pivot-truncation 内核（不排序整 vocab，三分搜索定 pivot），小 batch 仍用直观的 sort 实现。", "evidence": "vllm/v1/sample/ops/topk_topp_sampler.py:L263-267; ops/topk_topp_triton.py:L965-1051 + Park et al. 引用 L6-9"},
+    {"decision": "flashinfer 用拒绝采样替代排序，statistically equivalent 而非逐位相同", "why": "拒绝采样避免 O(V log V) 排序，吞吐更高；代价是输出与 random_sample 不必逐 token 相同，仅分布等价；且 flashinfer 0.2.3+ 不支持逐请求 generator，存在 generator 时回退 native。", "evidence": "vllm/v1/sample/ops/topk_topp_sampler.py:L361-376 docstring; L138-145 generator 回退"},
+    {"decision": "random_sample 用 Gumbel/exp 技巧取代 torch.multinomial", "why": "multinomial 触发 CPU-GPU 同步；改用 q~Exp(1)、probs/q 取 argmax 等价于按 probs 采样，纯 GPU 无同步；逐请求 seed 仅覆写对应行的 q。", "evidence": "vllm/v1/sample/ops/topk_topp_sampler.py:L337-358"},
+    {"decision": "采样参数全程批量张量化，逐请求差异编码进张量/字典", "why": "v1 连续批处理一次采样整批；temperature/top_k/top_p/penalty 做成 [batch] 张量、generators/output_token_ids/bad_words 用 req_index 字典/list，避免 Python 逐请求循环。", "evidence": "vllm/v1/sample/metadata.py:L14-56"}
+  ],
+  "theory": [
+    "温度缩放：logits/T 后 softmax，T->0 退化为 argmax（greedy），T 越大分布越平。代码用 temp<1e-5 判定 greedy 并以 1.0 替换避免除零。",
+    "top-k：保留 logit 最大的 k 个。pytorch 路径用第 (V-k) 大（升序第 V-k 位）做阈值；triton 路径用高斯 sigma 截断 + 三分搜索逼近 pivot，复杂度由 O(V log V) 排序降到 ~O(V) 多趟扫描。",
+    "top-p（nucleus）：按概率降序累积，保留累积概率刚超过 p 的最小集合（至少 1 个）。pytorch 用升序 cumsum<=1-p 反向 mask。",
+    "min-p：阈值=min_p*max_prob，砍掉低于阈值的尾部；因最高概率 token 必留，argmax 不变，故 argmax-invariant。",
+    "频率/存在惩罚（OpenAI 定义）：logit -= freq_penalty*出现次数；logit -= presence_penalty*是否出现。重复惩罚对已出现 token 按正/负 logit 分别除/乘 penalty（自定义 op）。",
+    "拒绝采样 vs 逆变换采样：flashinfer 对 top-k/top-p 截断后分布做拒绝采样，期望意义上等价于先归一化再采样，但避免显式排序与归一化整 vocab。",
+    "rank 计算：token_rank = #{logprob > 该 token logprob}，用 batched_count_greater_than（torch.compile）批量求，避免逐行 Python。"
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {"what": "Sampler.gather_specific_token_logprobs 整个方法及 forward 中 logprob_token_ids 相关分支（sampler.py:L106-131, L145-214）", "why_safe": "generative_scoring API 专用旁路，与 9 步主流水线正交；删除不影响标准采样路径。"},
+      {"what": "thinking_budget_state_holder 相关逻辑（sampler.py:L367-368, L395-405）及 SamplingMetadata.thinking_budget_state_holder 字段处理", "why_safe": "thinking 模型推理预算属独立特性，holder 为 None 时整段不执行；本章聚焦通用采样，可整段去除而主路径行为不变。"},
+      {"what": "predict_bonus_token / _combine_outputs_with_spec_tokens / spec_token_ids 投机解码组合（sampler.py:L344-355, L371-379）及 bad_words.py 的 apply_bad_words_with_drafts（L38-57）", "why_safe": "投机解码在专门章节讲；非 spec 路径 predict_bonus_token=False，这些分支不触发。"},
+      {"what": "forward_hip / aiter_sample / forward_cpu 的逐 generator exponential 实现与 compiled_random_sample（topk_topp_sampler.py:L154-244, L249-254）", "why_safe": "ROCm/CPU 后端是平台变体，与 CUDA 主路径算法同构；保留 forward_native/forward_cuda 两个代表即可讲清多后端分发思想。"},
+      {"what": "_topk_topp_kernel triton 内核全部实现体（topk_topp_triton.py:L70-962），含 _NORMAL_CDF_TO_SIGMA_TABLE/_PERCENTILE_TO_STD_TABLE 查找表、_update_min_larger_stats、三分搜索/outlier gather/duplicate handling", "why_safe": "920 行 GPU 内核是 Qrita 论文的工程实现，正文只需其外部契约（apply_top_k_top_p_triton wrapper）与算法思想；逐行内核超出'读者不开源码也能懂主流程'的目标，且不影响对 sampler 主线的理解。精简版保留 wrapper 签名与一句算法说明即可。"},
+      {"what": "apply_top_k_only 免排序 top-k-only 路径（topk_topp_sampler.py:L314-334）", "why_safe": "仅 allow_cpu_sync 且 p is None 时走，含 GPU->CPU sync 的特化优化；主路径 pytorch sort 已覆盖 top-k 语义，可省略以聚焦主线。"},
+      {"what": "logits_processor 的 BatchUpdate/BatchUpdateBuilder/update_state/process_dict_updates 持久批维护（state.py:L18-145, builtin.py 各 update_state 与 __init__ 双张量预分配）", "why_safe": "persistent batch 的 add/remove/move 状态机属另一子系统；本章只需 apply() 时 state 已是张量切片这一结果，不需重现维护逻辑。"}
+    ],
+    "must_keep": [
+      {"symbol": "Sampler", "why": "全章主类，9 步编排者。"},
+      {"symbol": "forward", "why": "9 步主干入口，step1-2/8-9 在此。"},
+      {"symbol": "apply_logits_processors", "why": "step3-6（白名单/bad words/non-argmax processor/penalties）落地。"},
+      {"symbol": "sample", "why": "step7：greedy 早退/温度/min_p/截断/torch.where 合并。"},
+      {"symbol": "apply_temperature", "why": "温度缩放 + 除零保护，温度→argmax 的桥。"},
+      {"symbol": "greedy_sample", "why": "贪心 argmax，与随机路径对照。"},
+      {"symbol": "compute_logprobs", "why": "log_softmax，raw/processed logprobs 共用。"},
+      {"symbol": "gather_logprobs", "why": "step8 topk+采样 token+rank 拼装。"},
+      {"symbol": "apply_penalties", "why": "Sampler 内 penalties 入口（step6）。"},
+      {"symbol": "SamplingMetadata", "why": "批量张量化载体，逐请求参数承载。"},
+      {"symbol": "TopKTopPSampler", "why": "多后端分发核心类。"},
+      {"symbol": "forward_native", "why": "PyTorch-native 后端代表（截断→softmax→random_sample）。"},
+      {"symbol": "forward_cuda", "why": "flashinfer 后端 + generator 回退逻辑。"},
+      {"symbol": "apply_top_k_top_p", "why": "triton vs pytorch sort 二级分流入口。"},
+      {"symbol": "apply_top_k_top_p_pytorch", "why": "top-k/top-p 截断的教学主实现（sort+mask+scatter）。"},
+      {"symbol": "random_sample", "why": "Gumbel/exp 采样，避免 multinomial 同步。"},
+      {"symbol": "flashinfer_sample", "why": "拒绝采样后端，三条 flashinfer API 分发。"},
+      {"symbol": "apply_top_k_top_p_triton", "why": "triton 后端外部契约（kernel launch wrapper），论证 batch>=8 另起内核。"},
+      {"symbol": "apply_bad_words", "why": "step4 屏蔽入口。"},
+      {"symbol": "_apply_bad_words_single_batch", "why": "bad words 前缀匹配 + 末 token 置 -inf 的核心逻辑。"},
+      {"symbol": "apply_all_penalties", "why": "penalties 张量化 + -1 占位替换。"},
+      {"symbol": "LogitsProcessors", "why": "argmax_invariant/non_argmax_invariant 分类容器，决定两处生效。"},
+      {"symbol": "MinPLogitsProcessor", "why": "argmax-invariant=True 的代表（min_p 阈值砍尾）。"},
+      {"symbol": "MinTokensLogitsProcessor", "why": "non-argmax-invariant 代表（屏蔽 EOS）。"},
+      {"symbol": "LogitBiasLogitsProcessor", "why": "non-argmax-invariant，逐请求偏置加 logit。"},
+      {"symbol": "is_argmax_invariant", "why": "决定 processor 进哪条流水线，章节核心概念的可检测锚点。"}
+    ]
+  },
+  "diagram_plan": [
+    {"name": "9 步采样流水线总览", "type": "vertical pipeline / flow", "spec": "竖向 9 个 step 方块，标注每步所属方法（forward / apply_logits_processors / sample / gather_logprobs）。在 step7 处分叉出 greedy 快路（all_greedy 早退）与随机路径（温度→min_p→top-k/p→采样），末端 torch.where 汇合。左侧标'能改 argmax'区（step3-6）与右侧'argmax-invariant'区（step7c）。Roadmap 高亮节点：sampling 子系统。"},
+    {"name": "TopKTopPSampler 后端分发决策树", "type": "decision tree", "spec": "根节点 __init__，按 logprobs_mode/platform/flashinfer 可用性/CPU arch/ROCm aiter 分支，叶子为 forward_cuda/forward_native/forward_cpu/forward_hip。再画 call 时 apply_top_k_top_p 的 batch>=8?→triton : pytorch-sort 二级分流，与 forward_cuda→flashinfer 并列。"},
+    {"name": "top-k/top-p 截断示意（pytorch sort 路径）", "type": "state evolution table", "spec": "一行 8~10 个 logit 的小例子，分列：原始 logit → 升序排序 → top-k 阈值 mask（第 V-k 大）→ softmax 累积和 → top-p mask（cumsum<=1-p）→ scatter 回原位。直观展示两次 mask 叠加。"},
+    {"name": "SamplingMetadata 批量张量化", "type": "table / many-to-one", "spec": "上方 N 个请求各自的 SamplingParams（temp/top_k/top_p/penalty/seed/min_tokens），下方汇成 [batch] 张量列 + generators 字典 + output_token_ids list + logitsprocs 容器。强调'逐请求 → 批量张量'的转换。"}
+  ],
+  "foreshadow_due": {"should_plant": [], "should_recover": []}
+}

@@ -14,15 +14,14 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch26',
-  slug: 'ch26-model-architecture',
-  focus: '方法论章(无精简版): 把 DeepSeek-V4 源码(ch25)转成精确架构图的可复用流程。教一套可照搬的 code→diagram 程序: 从 (vllm_config,prefix) 构造函数读出 submodule 树 → 识别每层 nn.Module 子模块与命名 → 跟 forward 画数据流向 → 标注张量形状变化 → 用泳道/层级/对照布局组织成图。以 DeepSeek-V4(MLA/MoE/MTP)为 worked example, 产出架构图并逐一讲每个图元怎么从源码推出来。强调"读代码画图"是可迁移技能',
-  highlight: 'model-architecture',
+  chapter_id: 'ch27',
+  slug: 'ch27-sampling',
+  focus: 'Sampler 的 9 步采样流水线: raw logprobs 抽取、重复/存在/频率惩罚、bad words 屏蔽、logits processors(argmax-invariant 与否决定能否走 greedy 快路)、温度缩放、top-k/top-p 截断、随机 vs 贪心采样、TopKTopPSampler 多后端(flashinfer/triton/torch native)分发。SamplingMetadata 承载逐请求参数, 全程批量张量化',
+  highlight: 'sampling',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
-  skip_impl: true,
-  paths: ['vllm/model_executor/models/deepseek_v4.py', 'vllm/model_executor/models/llama.py'],
+  paths: ['vllm/v1/sample/sampler.py', 'vllm/v1/sample/metadata.py', 'vllm/v1/sample/ops/topk_topp_sampler.py', 'vllm/v1/sample/ops/topk_topp_triton.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
