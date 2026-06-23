@@ -1,0 +1,330 @@
+{
+  "chapter_id": "ch18-model-runner",
+  "title": "持久化批次与输入准备",
+  "source_pin": "f3fef123504db07b3ac83ad4ef677915b53e8386",
+  "one_line": "GPUModelRunner 每拍以 SchedulerOutput 为差量增量地维护一个跨迭代存活的 InputBatch（slot 复用、不重建），再从中收集 token/位置/slot_mapping 与 attention metadata，喂给前向。",
+
+  "code_spine": [
+    "vllm/v1/worker/gpu_model_runner.py:L3825-L3913  execute_model 入口：synchronize_input_prep 下先 _update_states 再 _prepare_inputs",
+    "vllm/v1/worker/gpu_model_runner.py:L1065-L1419  _update_states：用 SchedulerOutput 调和增删/重排，维护 self.requests(CachedRequestState 字典) 与 self.input_batch(持久批次)",
+    "vllm/v1/worker/gpu_input_batch.py:L510-L565    InputBatch.remove_request：标记 slot 为 removed（不立即压实），clear block_table 行",
+    "vllm/v1/worker/gpu_input_batch.py:L310-L334     InputBatch._register_add_request：batch_update_builder.pop_removed() 复用最小空 slot，否则追加到末尾",
+    "vllm/v1/worker/gpu_input_batch.py:L336-L482     InputBatch.add_request：把 CachedRequestState 写入 slot 的各 CPU 镜像数组（token_ids_cpu/num_*_cpu/block_table/采样参数）",
+    "vllm/v1/worker/gpu_input_batch.py:L684-L810     InputBatch.condense：把尾部存活请求滑入前部空洞，使 [0, num_reqs) 连续",
+    "vllm/v1/worker/gpu_model_runner.py:L1370-L1373  _may_reorder_batch（attention backend 重排）+ refresh_metadata（重建 SamplingMetadata）",
+    "vllm/v1/worker/gpu_model_runner.py:L1787-L2096  _prepare_inputs：commit_block_table → np.repeat 展开 req_indices → token index_select 收集 input_ids → positions → compute_slot_mapping",
+    "vllm/v1/worker/block_table.py:L141-L167         BlockTable.commit_block_table（CPU→GPU 拷贝）+ compute_slot_mapping（启动 Triton kernel）",
+    "vllm/v1/worker/block_table.py:L318-L373         _compute_slot_mapping_kernel：position→block_index→物理 slot_id 的 Triton 内核",
+    "vllm/v1/worker/gpu_model_runner.py:L2098-L2199  _build_attention_metadata：用持久批次的 block_table GPU 镜像 + slot_mapping + seq_lens 装配 CommonAttentionMetadata"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L1065-L1120",
+      "what": "_update_states 第一段：移除已完成请求、移除未被调度（被抢占/未排）请求。展示『持久批次只对差量动手』。",
+      "code": "    def _update_states(self, scheduler_output: \"SchedulerOutput\") -> Callable | None:\n        # Remove finished requests from the cached states.\n        for req_id in scheduler_output.finished_req_ids:\n            self.requests.pop(req_id, None)\n            self.num_prompt_logprobs.pop(req_id, None)\n        ...\n        # Remove the finished requests from the persistent batch.\n        for req_id in scheduler_output.finished_req_ids:\n            self.input_batch.remove_request(req_id)\n        ...\n        # Remove the unscheduled requests from the persistent batch.\n        scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()\n        cached_req_ids = self.input_batch.req_id_to_index.keys()\n        resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids\n        unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)\n        for req_id in unscheduled_req_ids:\n            self.input_batch.remove_request(req_id)",
+      "elide": [
+        "L1079-L1081 late_interaction_runner.on_requests_finished（迟交互/ColBERT 池化路径）",
+        "L1091-L1094 _zero_block_ids（新分配块清零，防 NaN，可在正文一句话带过）",
+        "L1096-L1098 free_encoder_mm_hashes（多模态 encoder cache 释放，本章不展开）",
+        "L1083-L1113 关于 abort+resubmit 同 ID、reset_prefix_cache 强制抢占的两段长 NOTE 注释——保留要旨即可"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L1132-L1176",
+      "what": "_update_states：新请求 → 构造 CachedRequestState 存入 self.requests，加入 reqs_to_add 待并入持久批次。这是 worker 端缓存请求快照、后续只收差量的根本原因。",
+      "code": "        reqs_to_add: list[CachedRequestState] = []\n        # Add new requests to the cached states.\n        for new_req_data in scheduler_output.scheduled_new_reqs:\n            req_id = new_req_data.req_id\n            ...\n            req_state = CachedRequestState(\n                req_id=req_id,\n                prompt_token_ids=new_req_data.prompt_token_ids,\n                prompt_embeds=new_req_data.prompt_embeds,\n                prompt_is_token_ids=new_req_data.prompt_is_token_ids,\n                mm_features=new_req_data.mm_features,\n                sampling_params=sampling_params,\n                pooling_params=pooling_params,\n                generator=generator,\n                block_ids=new_req_data.block_ids,\n                num_computed_tokens=new_req_data.num_computed_tokens,\n                output_token_ids=[],\n                lora_request=new_req_data.lora_request,\n            )\n            self.requests[req_id] = req_state\n            ...\n            reqs_to_add.append(req_state)",
+      "elide": [
+        "L1135-L1139 streaming（同 req_id 复用）分支",
+        "L1144-L1160 RANDOM_SEED generator 与 pooling 模型 pooler.get_pooling_updates 两分支",
+        "L1179-L1197 prompt_logprobs、M-RoPE/XD-RoPE init、ngram_gpu 跟踪——均为可省略特性分支"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L1222-L1366",
+      "what": "_update_states：对运行中/恢复请求逐个更新缓存态（num_computed_tokens、block_ids 追加、token_ids_cpu 增量写入）并把不在持久批次里的请求并入；最后统一 add_request + condense + refresh_metadata。这是『增量调和』的核心。",
+      "code": "        req_data = scheduler_output.scheduled_cached_reqs\n        scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens\n        for i, req_id in enumerate(req_data.req_ids):\n            req_state = self.requests[req_id]\n            num_computed_tokens = req_data.num_computed_tokens[i]\n            new_block_ids = req_data.new_block_ids[i]\n            resumed_from_preemption = req_id in req_data.resumed_req_ids\n            req_index = self.input_batch.req_id_to_index.get(req_id)\n            ...\n            # Update the cached states.\n            req_state.num_computed_tokens = num_computed_tokens\n            ...\n            # Update the block IDs.\n            if not resumed_from_preemption:\n                if new_block_ids is not None:\n                    # Append the new blocks to the existing block IDs.\n                    for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):\n                        block_ids.extend(new_ids)\n            else:\n                assert req_index is None\n                assert new_block_ids is not None\n                # The request is resumed from preemption.\n                # Replace the existing block IDs with the new ones.\n                req_state.block_ids = new_block_ids\n\n            if req_index is None:\n                # The request is not in the persistent batch.\n                ...\n                reqs_to_add.append(req_state)\n                continue\n\n            # Update the persistent batch.\n            self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens\n            if new_block_ids is not None:\n                self.input_batch.block_table.append_row(new_block_ids, req_index)\n            ...\n            self.input_batch.update_req_spec_token_ids(req_state, scheduled_spec_tokens)\n\n        # Add the new or resumed requests to the persistent batch.\n        # The smaller empty indices are filled first.\n        for request in reqs_to_add:\n            self.input_batch.add_request(request)\n            self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)\n        # Condense the batched states if there are gaps left by removed requests\n        self.input_batch.condense()\n        # Allow attention backend to reorder the batch, potentially\n        self._may_reorder_batch(scheduler_output)\n        # Refresh batch metadata with any pending updates.\n        self.input_batch.refresh_metadata()",
+      "elide": [
+        "L1230-L1270 prev_num_draft_len / 异步 spec decode 乐观计数与 deferred 修正（高级特性，本章只点名存在）",
+        "L1275-L1306 非末 PP rank 的 token 回填、KV-load 失败回滚对齐（PP/KV-connector 边角）",
+        "L1326-L1335 异步调度恢复请求的 output_token_ids 重建、ngram_gpu 跟踪",
+        "L1343-L1353 非末 rank token_ids_cpu 增量写入（PP 专用；末 rank 由采样直接写入，第 11 步讲）",
+        "L1375-L1419 ngram_gpu 增量张量更新 + deferred_spec_decode_corrections 闭包返回"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_input_batch.py",
+      "lines": "L310-L334",
+      "what": "_register_add_request：slot 复用的关键——优先弹出最小的『已移除空 slot』，没有才追加到末尾。这是『不每拍重建』的机制核心。",
+      "code": "    def _register_add_request(self, request: \"CachedRequestState\") -> int:\n        \"\"\"Track add-request operations for logits processors.\"\"\"\n        # Fill the next empty index if there is one.\n        if (new_req_index := self.batch_update_builder.pop_removed()) is None:\n            # Append to end otherwise.\n            new_req_index = self.num_reqs\n        assert new_req_index < self.max_num_reqs\n        self.batch_update_builder.batch_changed = True\n        if request.sampling_params:\n            self.batch_update_builder.added.append(\n                (\n                    new_req_index,\n                    request.sampling_params,\n                    request.prompt_token_ids,\n                    request.output_token_ids,\n                )\n            )\n        return new_req_index",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/worker/gpu_input_batch.py",
+      "lines": "L354-L379",
+      "what": "add_request 写入核心：把 prompt/output token 写入 token_ids_cpu 该 slot 的行，记录 num_prompt_tokens/num_tokens_no_spec/num_computed_tokens，并 block_table.add_row。展示『一行 = 一个请求的全长 token 缓冲』的内存布局。",
+      "code": "        self.req_id_to_index[req_id] = req_index\n        # Copy the prompt token ids and output token ids.\n        num_prompt_tokens = length_from_prompt_token_ids_or_embeds(\n            request.prompt_token_ids, request.prompt_embeds\n        )\n        self.num_prompt_tokens[req_index] = num_prompt_tokens\n        start_idx = num_prompt_tokens\n        end_idx = start_idx + len(request.output_token_ids)\n        if request.prompt_token_ids is not None:\n            self.token_ids_cpu[req_index, :num_prompt_tokens] = request.prompt_token_ids\n            ...\n        self.token_ids_cpu[req_index, start_idx:end_idx] = request.output_token_ids\n        self.is_token_ids[req_index, start_idx:end_idx] = True\n        # Number of tokens without spec decode tokens.\n        self.num_tokens_no_spec[req_index] = request.num_tokens\n        self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens\n        self.block_table.add_row(request.block_ids, req_index)",
+      "elide": [
+        "L363-L370 is_token_ids（prompt_embeds 混合模式标记）",
+        "L381-L477 采样参数装填（temperature/top_p/top_k/penalties/generator/logprobs/allowed_token_ids/bad_words/LoRA）——结构对称，正文可摘要『把该请求的全部采样参数写入对应 slot 列』",
+        "L454-L464 pooling 模型分支"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_input_batch.py",
+      "lines": "L510-L528",
+      "what": "remove_request：移除只是『标记空洞 + 解绑映射 + 清块表行』，不立即搬数据。配 condense 形成『先打洞、批末统一压实』的两段式。",
+      "code": "    def remove_request(self, req_id: str) -> int | None:\n        \"\"\"This method must always be followed by a call to condense().\"\"\"\n        req_index = self.req_id_to_index.pop(req_id, None)\n        if req_index is None:\n            return None\n        self.batch_update_builder.removed_append(req_index)\n        self._req_ids[req_index] = None\n        self.req_output_token_ids[req_index] = None\n        self.spec_token_ids[req_index].clear()\n        self.block_table.clear_row(req_index)\n        ...",
+      "elide": [
+        "L530-L564 LoRA 解绑、pooling 早退、各采样参数集合 discard、prev_req_id_to_index 清理——对称清理，摘要即可"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_input_batch.py",
+      "lines": "L684-L758",
+      "what": "condense：核心压实循环。把最大的存活索引搬到最小的空洞，使 [0, num_reqs) 连续。token_ids_cpu 只搬活跃前缀（num_tokens 列）而非全 max_model_len 行，block_table.move_row 同步搬块表。",
+      "code": "    def condense(self) -> None:\n        \"\"\"Slide non-empty requests down into lower, empty indices.\"\"\"\n        num_reqs = self.num_reqs\n        if not (empty_req_indices := self.batch_update_builder.removed):\n            # All removed requests were replaced by added requests, or else no\n            # requests were removed at all. No condense() needed\n            return\n        ...\n        # NOTE: empty_req_indices is sorted in descending order.\n        last_req_index = num_reqs + len(empty_req_indices) - 1\n        while empty_req_indices:\n            # Find the largest non-empty index.\n            while last_req_index in empty_req_indices:\n                last_req_index -= 1\n            # Find the smallest empty index.\n            empty_index = self.batch_update_builder.peek_removed()\n            if empty_index >= last_req_index:\n                break\n            # Move active request down into empty request index.\n            self.batch_update_builder.pop_removed()\n            req_id = self._req_ids[last_req_index]\n            ...\n            self._req_ids[empty_index] = req_id\n            self._req_ids[last_req_index] = None\n            self.req_id_to_index[req_id] = empty_index\n            num_tokens = self._get_active_token_count(last_req_index)\n            ...\n            self.token_ids_cpu[empty_index, :num_tokens] = self.token_ids_cpu[\n                last_req_index, :num_tokens\n            ]\n            ...\n            self.num_computed_tokens_cpu[empty_index] = self.num_computed_tokens_cpu[\n                last_req_index\n            ]\n            self.block_table.move_row(last_req_index, empty_index)\n            ...\n            last_req_index -= 1",
+      "elide": [
+        "L764-L805 pooling 早退、logitsprocs moved 记录、各采样参数列搬移（对称）、generator/allowed_token_ids/bad_words 搬移",
+        "L807-L810 尾部多余 list 截断"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L1800-L1852",
+      "what": "_prepare_inputs 收集逻辑：先启动 block_table CPU→GPU 拷贝（与后续 CPU 计算重叠）；用 np.repeat 把 [2,5,3] 展开成 req_indices=[0,0,1,1,1,1,1,2,2,2]；算 positions；再算扁平 token_indices 并用 torch.index_select 一次性从 token_ids_cpu 收集本拍要算的 input_ids。这是『token index_select 收集』的精髓。",
+      "code": "        num_reqs = self.input_batch.num_reqs\n        # OPTIMIZATION: Start copying the block table first.\n        # This way, we can overlap the copy with the following CPU operations.\n        self.input_batch.block_table.commit_block_table(num_reqs)\n        # Get request indices.\n        # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]\n        req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)\n        # cu_num_tokens: [2, 5, 3] -> [2, 7, 10]\n        # self.query_pos.np[:10]: [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]\n        cu_num_tokens = self._get_cumsum_and_arange(\n            num_scheduled_tokens, self.query_pos.np\n        )\n        # Get positions.\n        positions_np = (\n            self.input_batch.num_computed_tokens_cpu[req_indices]\n            + self.query_pos.np[: cu_num_tokens[-1]]\n        )\n        # Get token indices.\n        # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]\n        # -> [0, 1, M, M + 1, ..., 2 * M, 2 * M + 1, 2 * M + 2]  where M is max_model_len.\n        token_indices = (\n            positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]\n        )\n        token_indices_tensor = torch.from_numpy(token_indices)\n        # NOTE(woosuk): torch.index_select is much faster than np.take.\n        torch.index_select(\n            self.input_batch.token_ids_cpu_tensor.flatten(),\n            0,\n            token_indices_tensor,\n            out=self.input_ids.cpu[:total_num_scheduled_tokens],\n        )",
+      "elide": [
+        "L1827-L1833 M-RoPE/XD-RoPE position 计算（多模态）",
+        "L1853-L1898 prompt_embeds 的 is_token_ids 收集与逐请求 embeds 填充（prompt_embeds 特性）"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L1901-L2012",
+      "what": "_prepare_inputs 装配 attention 输入：query_start_loc（CU 偏移，并 pad 成非递减以满足 FlashAttention）；把 num_computed_tokens / positions / seq_lens 拷到 GPU；调用 block_table.compute_slot_mapping 算出每个 token 的物理 slot。这是『位置与 slot mapping』的落点。",
+      "code": "        # Prepare the attention metadata.\n        self.query_start_loc.np[0] = 0\n        self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens\n        # Note: pad query_start_loc to be non-decreasing, as kernels\n        # like FlashAttention requires that\n        self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])\n        self.query_start_loc.copy_to_gpu()\n        query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]\n        ...\n        self.num_computed_tokens[:num_reqs].copy_(\n            self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],\n            non_blocking=True,\n        )\n        ...\n        self.positions[:total_num_scheduled_tokens] = (\n            self.num_computed_tokens[req_indices_gpu].to(torch.int64)\n            + self.query_pos.gpu[:total_num_scheduled_tokens]\n        )\n        self.seq_lens[:num_reqs] = (\n            self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu\n        )\n        self.seq_lens[num_reqs:].fill_(0)\n        self.input_batch.block_table.compute_slot_mapping(\n            num_reqs,\n            self.query_start_loc.gpu[: num_reqs + 1],\n            self.positions[:total_num_scheduled_tokens],\n        )\n        # Copy the tensors to the GPU.\n        self._prepare_input_ids(\n            scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens,\n        )",
+      "elide": [
+        "L1909-L1961 optimistic_seq_lens / discard_request_mask / num_accepted_tokens（异步 spec decode 乐观序列长，本章点名）",
+        "L1963-L1992 async_spec_decode 下用 GPU kernel 修正 num_computed_tokens 的分支",
+        "L2022-L2096 M-RoPE/XD-RoPE GPU 拷贝、spec_decode_metadata 构建、LoRA 热切换——非本章主线"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/block_table.py",
+      "lines": "L102-L167",
+      "what": "BlockTable：append_row 把新块号写入该请求行的 CPU 镜像；commit_block_table 把整个 CPU 镜像批量拷到 GPU（这就是 block_table 的『GPU 端镜像』）；compute_slot_mapping 启动 Triton kernel。",
+      "code": "    def append_row(self, block_ids: list[int], row_idx: int) -> None:\n        if not block_ids:\n            return\n        if self.use_hybrid_blocks:\n            block_ids = self.map_to_kernel_blocks(\n                np.array(block_ids), self.blocks_per_kv_block, self._kernel_block_arange\n            )\n        num_blocks = len(block_ids)\n        start = self.num_blocks_per_row[row_idx]\n        self.num_blocks_per_row[row_idx] += num_blocks\n        self.block_table.np[row_idx, start : start + num_blocks] = block_ids\n\n    def add_row(self, block_ids: list[int], row_idx: int) -> None:\n        self.num_blocks_per_row[row_idx] = 0\n        self.append_row(block_ids, row_idx)\n\n    def move_row(self, src: int, tgt: int) -> None:\n        num_blocks = self.num_blocks_per_row[src]\n        block_table_np = self.block_table.np\n        block_table_np[tgt, :num_blocks] = block_table_np[src, :num_blocks]\n        self.num_blocks_per_row[tgt] = num_blocks\n\n    def compute_slot_mapping(\n        self, num_reqs, query_start_loc, positions,\n    ) -> None:\n        num_tokens = positions.shape[0]\n        total_cp_world_size = self.pcp_world_size * self.dcp_world_size\n        total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank\n        _compute_slot_mapping_kernel[(num_reqs + 1,)](\n            num_tokens, self.max_num_batched_tokens,\n            query_start_loc, positions,\n            self.block_table.gpu, self.block_table.gpu.stride(0),\n            self.block_size, self.slot_mapping.gpu,\n            TOTAL_CP_WORLD_SIZE=total_cp_world_size, TOTAL_CP_RANK=total_cp_rank,\n            CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,\n            PAD_ID=PAD_SLOT_ID, BLOCK_SIZE=1024,\n        )\n\n    def commit_block_table(self, num_reqs: int) -> None:\n        self.block_table.copy_to_gpu(num_reqs)",
+      "elide": [
+        "L110-L113 use_hybrid_blocks（kernel block 细分）分支——正文一句话带过，配 design_decision",
+        "L136-L139 swap_row（双向交换，attention 重排用）",
+        "L173-L201 map_to_kernel_blocks 实现（混合块映射示例）"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/block_table.py",
+      "lines": "L334-L373",
+      "what": "_compute_slot_mapping_kernel：每个 program 负责一个请求。block_index = pos // virtual_block_size 选中该请求 block_table 行里的逻辑块号 block_numbers，slot_id = block_numbers * block_size + block_offset。最后一个 program 把尾部 padding 成 PAD_ID 供 CUDA graph。这是 page→物理 slot 的真实映射公式。",
+      "code": "    req_idx = tl.program_id(0)\n    if req_idx == tl.num_programs(0) - 1:\n        # Pad remaining slots for CUDA graph compatibility.\n        for i in range(num_tokens, max_num_tokens, BLOCK_SIZE):\n            offsets = i + tl.arange(0, BLOCK_SIZE)\n            tl.store(slot_mapping_ptr + offsets, PAD_ID, mask=offsets < max_num_tokens)\n        return\n    start_idx = tl.load(query_start_loc_ptr + req_idx).to(tl.int64)\n    end_idx = tl.load(query_start_loc_ptr + req_idx + 1).to(tl.int64)\n    virtual_block_size = block_size * TOTAL_CP_WORLD_SIZE\n    row_offset = req_idx * block_table_stride\n    for i in range(start_idx, end_idx, BLOCK_SIZE):\n        offsets = i + tl.arange(0, BLOCK_SIZE)\n        mask = offsets < end_idx\n        pos = tl.load(positions_ptr + offsets, mask=mask, other=0)\n        block_indices = pos // virtual_block_size\n        block_numbers = tl.load(block_table_ptr + row_offset + block_indices).to(tl.int64)\n        virtual_block_offsets = pos - block_indices * virtual_block_size\n        ...\n        slot_ids = block_numbers * block_size + local_block_offsets\n        slot_ids = tl.where(is_local, slot_ids, PAD_ID)\n        tl.store(slot_mapping_ptr + offsets, slot_ids, mask=mask)",
+      "elide": [
+        "L362-L369 is_local / local_block_offsets：上下文并行(CP)分片下判断 token 是否属本 rank、并折算本地块内偏移。非 CP 时 TOTAL_CP_WORLD_SIZE=1，virtual_block_size=block_size、is_local 恒真、local_block_offsets 退化为 pos % block_size。正文应给出『非 CP 简化形态』再点名 CP 推广。"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L2138-L2199",
+      "what": "_build_attention_metadata：取持久批次 block_table 的 GPU 镜像（get_device_tensor）与 slot_mapping、seq_lens、query_start_loc，装配成 CommonAttentionMetadata 交给各 attention backend。把『持久批次 + slot_mapping』收束到 attention 接口。",
+      "code": "        def _get_block_table(kv_cache_gid: int):\n            ...\n            blk_table = self.input_batch.block_table[kv_cache_gid]\n            blk_table_tensor = blk_table.get_device_tensor(num_reqs_padded)\n            # Fill unused block table entries with NULL_BLOCK_ID for CUDAGraph padding.\n            blk_table_tensor[num_reqs:num_reqs_padded].fill_(NULL_BLOCK_ID)\n            return blk_table_tensor\n        block_table_gid_0 = _get_block_table(0)\n        slot_mapping_gid_0 = slot_mappings[0]\n        ...\n        cm_base = CommonAttentionMetadata(\n            query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],\n            query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],\n            seq_lens=self.seq_lens[:num_reqs_padded],\n            ...\n            num_reqs=num_reqs_padded,\n            num_actual_tokens=num_tokens_padded,\n            max_query_len=max_query_len,\n            max_seq_len=max_seq_len,\n            block_table_tensor=block_table_gid_0,\n            slot_mapping=slot_mapping_gid_0,\n            causal=True,\n            is_prefilling=is_prefilling,\n            positions=self.positions[:num_tokens_padded],\n        )",
+      "elide": [
+        "L2141-L2146 EncoderOnlyAttentionSpec 零块表分支",
+        "L2160-L2182 routed_experts、async_spec_decode 下 CPU 字段置 None 的高级分支",
+        "L2201-L2220 DCP local seq_lens、kv_sharing_fast_prefill",
+        "L2222-末 hybrid KV-cache group 的 metadata 复用缓存（update_block_table）——正文一句话带过即可"
+      ]
+    }
+  ],
+
+  "key_classes": [
+    {
+      "name": "GPUModelRunner",
+      "file": "vllm/v1/worker/gpu_model_runner.py",
+      "responsibility": "每拍编排器：execute_model 在 synchronize_input_prep 上下文里先 _update_states(用 SchedulerOutput 调和持久批次)、再 _prepare_inputs(收集 input_ids/positions/slot_mapping)、_build_attention_metadata(装配 attn 输入)，然后前向。持有 self.requests(req_id→CachedRequestState 全量缓存) 与 self.input_batch(持久批次)。"
+    },
+    {
+      "name": "InputBatch",
+      "file": "vllm/v1/worker/gpu_input_batch.py",
+      "responsibility": "跨迭代存活的多请求容器：token_ids_cpu(max_num_reqs × max_model_len 的 int32 全长缓冲，一行一请求)、num_prompt_tokens/num_computed_tokens_cpu/num_tokens_no_spec 等 CPU 镜像、block_table(MultiGroupBlockTable)、全套采样参数列、req_id_to_index 映射。增删通过 add_request/remove_request+condense，靠 batch_update_builder 复用空 slot。"
+    },
+    {
+      "name": "CachedRequestState",
+      "file": "vllm/v1/worker/gpu_input_batch.py",
+      "responsibility": "worker 端单请求快照(dataclass)：prompt_token_ids、output_token_ids、block_ids(每 KV group 一个 list)、num_computed_tokens、sampling_params、generator、(可选) mrope/xdrope positions。num_tokens = num_prompt_tokens + len(output_token_ids)。让 worker 缓存请求、调度器后续只发差量。"
+    },
+    {
+      "name": "BatchUpdateBuilder",
+      "file": "vllm/v1/sample/logits_processor/state.py",
+      "responsibility": "记录本拍持久批次的 removed(降序)/added/moved 变更。pop_removed() 返回当前最小空 slot 供复用，peek_removed() 配合 condense 找最小空洞；get_and_reset 生成 logitsprocs 的 BatchUpdate。slot 复用的真正实现者。"
+    },
+    {
+      "name": "MultiGroupBlockTable / BlockTable",
+      "file": "vllm/v1/worker/block_table.py",
+      "responsibility": "MultiGroupBlockTable 按 KV cache group 持有多个 BlockTable。BlockTable 维护 block_table(CpuGpuBuffer, max_num_reqs × max_num_blocks_per_req)：append_row/add_row 改 CPU 镜像，commit_block_table 批量拷到 GPU，compute_slot_mapping 启动 Triton kernel 把 position 映射成物理 slot；支持 hybrid kernel block 细分与 CP/DCP 分片。"
+    },
+    {
+      "name": "_compute_slot_mapping_kernel",
+      "file": "vllm/v1/worker/block_table.py",
+      "responsibility": "Triton JIT kernel：每个 program 处理一请求，slot_id = block_table[req, pos//block_size] * block_size + pos%block_size（非 CP 简化形态）；最后一 program 把尾部 padding 成 PAD_SLOT_ID 以适配 CUDA graph。"
+    }
+  ],
+
+  "data_flow": [
+    "1. gpu_worker 在 scheduler.schedule() 后调用 GPUModelRunner.execute_model(scheduler_output) [gpu_model_runner.py:L3825]",
+    "2. _update_states(scheduler_output)：① pop finished_req_ids 出 self.requests + input_batch.remove_request；② 算 unscheduled_req_ids(被抢占/未排) 并 remove_request；③ 为 scheduled_new_reqs 建 CachedRequestState 存入 self.requests、入 reqs_to_add [L1065-L1197]",
+    "3. _update_states 续：遍历 scheduled_cached_reqs，对仍在批次内的请求就地更新 num_computed_tokens_cpu / block_table.append_row / token_ids_cpu；不在批次内(恢复/上拍未排)的入 reqs_to_add [L1222-L1360]",
+    "4. _update_states 收尾：reqs_to_add 逐个 add_request(经 batch_update_builder.pop_removed 复用最小空 slot) → condense(尾部活请求滑入空洞，使索引连续) → _may_reorder_batch(attention backend 可重排) → refresh_metadata(重建 SamplingMetadata) [L1362-L1373]",
+    "5. _prepare_inputs：先 block_table.commit_block_table(CPU→GPU 异步拷贝)；np.repeat 把 num_scheduled_tokens 展开成 req_indices；_get_cumsum_and_arange 得 cu_num_tokens 与每请求内偏移 query_pos [block_table.py:L166, gpu_model_runner.py:L1800-L1817]",
+    "6. positions_np = num_computed_tokens_cpu[req_indices] + query_pos；token_indices = positions_np + req_indices*max_model_len；torch.index_select 从 token_ids_cpu 扁平视图一次性收集本拍要算的 input_ids [L1819-L1852]",
+    "7. 装配 query_start_loc(CU 偏移并 pad 非递减)，把 num_computed_tokens/positions/seq_lens 拷到 GPU [L1901-L2006]",
+    "8. block_table.compute_slot_mapping(num_reqs, query_start_loc_gpu, positions_gpu) 启动 _compute_slot_mapping_kernel，按 GPU 端 block_table 镜像把每个 token 的 position 映射成物理 slot_id 写入 slot_mapping.gpu [block_table.py:L141-L164, gpu_model_runner.py:L2008-L2012]",
+    "9. _prepare_input_ids 把 input_ids 拷到 GPU(异步调度时还从 prev_sampled_token_ids 回填上拍采样的 token) [L2015, L1613-L1636]",
+    "10. _build_attention_metadata 取 block_table.get_device_tensor + slot_mapping + seq_lens + query_start_loc 装配 CommonAttentionMetadata 交给 attention backend [L2098-L2199]",
+    "11. 前向 → 采样 → bookkeeping 把新采样 token 写回 input_batch.token_ids_cpu 对应 slot 行、output_token_ids 增长 → 持久批次留存到下一拍(ch19 衔接) [L3825-, _bookkeeping_sync L3397]"
+  ],
+
+  "design_decisions": [
+    {
+      "decision": "持久批次跨迭代存活、按差量增量维护，而非每拍重建",
+      "why": "连续两拍的请求集合高度重叠(多数是同一批 decode 请求)。每拍重建意味着重写 max_num_reqs×max_model_len 的 CPU 缓冲与全部采样参数；增量维护只动『新增/移除/重排』的少量 slot，CPU 开销与变更量成正比。注释明示该优化假设批次重叠度高，若两拍请求集合频繁交替则退化。",
+      "evidence": "vllm/v1/worker/gpu_model_runner.py:L1115-L1118 'The persistent batch optimization assumes that consecutive batches contain mostly the same requests'"
+    },
+    {
+      "decision": "remove 只『打洞标记』、批末统一 condense 压实；新 add 优先复用最小空 slot",
+      "why": "移除时立即搬移数据会产生 O(N) 的重复拷贝。改为 remove_request 只把索引记进 batch_update_builder.removed 并清块表行；同一拍的 add_request 通过 pop_removed() 直接填回这些空洞(slot 复用)；只有当空洞仍存在时 condense 才把尾部活请求滑下来一次填平。摊还后搬移量最小。",
+      "evidence": "gpu_input_batch.py:L316 'Fill the next empty index if there is one'；L696-L699 'All removed requests were replaced by added requests ... No condense() needed'；state.py:L33-L37 removed 始终降序、pop/peek 返回最小空 slot"
+    },
+    {
+      "decision": "token_ids_cpu 用 max_num_reqs × max_model_len 的固定全长 2D 缓冲(一行一请求)，搬移/收集只触及活跃前缀",
+      "why": "固定形状让 slot 复用与 index_select 收集都成为纯索引算术，无需动态分配。代价是内存大(源码 TODO 承认 max_model_len 大时缓冲过大)。condense/swap 只拷 num_tokens 活跃列、不拷满行，避免无谓带宽。",
+      "evidence": "gpu_input_batch.py:L127-L137 'This buffer could be too large if max_model_len is big'；L607-L611 swap 只拷 max_active_token_count 列；L741-L743 condense 只拷 :num_tokens"
+    },
+    {
+      "decision": "token 收集用 torch.index_select(扁平 token_ids_cpu) 而非 np.take",
+      "why": "把 (req_index, position) 二维坐标编码成 token_indices = position + req_index*max_model_len 的一维扁平索引，再对 token_ids_cpu_tensor.flatten() 做 index_select。源码注释实测 torch.index_select 在大张量上远快于 np.take。",
+      "evidence": "gpu_model_runner.py:L1844-L1852 'We use torch.index_select instead of np.take ... much faster'"
+    },
+    {
+      "decision": "block_table 维护 CPU+GPU 双镜像，commit_block_table 在 _prepare_inputs 最前批量拷贝以与后续 CPU 计算重叠",
+      "why": "块号在 _update_states 阶段以 CPU numpy 增量写入(append_row)，最廉价；前向需要 GPU 上的块表。把 CPU→GPU 拷贝提到收集逻辑最前面，让拷贝与 np.repeat/index_select 等 CPU 工作并行，隐藏 PCIe 延迟。",
+      "evidence": "gpu_model_runner.py:L1805-L1807 'OPTIMIZATION: Start copying the block table first ... overlap the copy with the following CPU operations'；block_table.py:L166-L167 commit_block_table=copy_to_gpu"
+    },
+    {
+      "decision": "slot_mapping 由 Triton kernel 在 GPU 端算，并把尾部 padding 成 PAD_SLOT_ID",
+      "why": "slot 映射对每个 token 独立，天然并行；放 GPU 避免大数组往返。最后一个 program 专门把 [num_tokens, max_num_batched_tokens) 填 PAD_SLOT_ID，使 batch 形状对 CUDA graph 固定可捕获。",
+      "evidence": "block_table.py:L150 kernel 启动 grid=(num_reqs+1,)；L336-L345 最后一 program 做 padding 'for CUDA graph compatibility'"
+    },
+    {
+      "decision": "hybrid kernel block：分配块大小与 attention kernel 块大小解耦，append 时按 blocks_per_kv_block 细分",
+      "why": "KV 管理器按某块大小分配，但底层 attention kernel 可能要求更小块。map_to_kernel_blocks 把一个管理块展开成连续多个 kernel 块号(块 b → [b*k, b*k+1, ...])，使两层块大小可独立选择。block_size==kernel_block_size 时该路径完全跳过。",
+      "evidence": "block_table.py:L47-L68 use_hybrid_blocks 判定与 max_num_blocks_per_req 放大；L173-L201 map_to_kernel_blocks"
+    },
+    {
+      "decision": "positions = num_computed_tokens + 请求内偏移；这统一覆盖 prefill/chunked-prefill/decode",
+      "why": "无离散 prefill/decode 阶段。每请求本拍起算位置就是它已算 token 数 num_computed_tokens，加上 [0, num_scheduled_tokens) 的请求内偏移，自然得到绝对位置；chunked prefill 与 decode 只是 num_scheduled_tokens 大小不同。承接 ch14 调度器的 token-centric 模型。",
+      "evidence": "gpu_model_runner.py:L1819-L1823 positions_np = num_computed_tokens_cpu[req_indices] + query_pos；L1999-L2002 GPU 端同公式"
+    }
+  ],
+
+  "theory": [
+    {
+      "topic": "持久批次增量维护的复杂度",
+      "content": "设 max_num_reqs=R、max_model_len=L、本拍变更(增+删+移)请求数 ΔN。全量重建每拍 O(R·L) 写入；增量维护：remove O(删数)、add O(增数·该请求列数)、condense 最多搬 O(空洞数) 个请求且每个只拷活跃前缀 num_tokens 列。当 ΔN≪R 且批次重叠度高时，单拍成本从 O(R·L) 降到 ~O(ΔN·avg_tokens)，这是持久批次的核心收益。"
+    },
+    {
+      "topic": "token 收集的二维→一维扁平化",
+      "content": "token_ids_cpu 形状 (R, L) 行优先存储，元素 (r, p) 的扁平偏移 = r·L + p。本拍要算的 token 由 (req_indices[i], positions[i]) 给出，故 token_indices[i] = positions[i] + req_indices[i]·L。一次 index_select 即把 total_num_scheduled_tokens 个分散 token 收集成连续 input_ids。np.repeat 与 _get_cumsum_and_arange 负责把每请求 num_scheduled_tokens 展开成 req_indices 与请求内偏移。"
+    },
+    {
+      "topic": "PagedAttention 的 position→slot 映射公式",
+      "content": "KV cache 被切成 block_size 个 token 的物理块。token 绝对位置 pos 落在第 block_index = pos // block_size 个逻辑块，块内偏移 = pos % block_size。该请求的逻辑块→物理块号查表 block_numbers = block_table[req, block_index]，故物理 slot_id = block_numbers · block_size + (pos % block_size)（非 CP 简化形态）。上下文并行(CP)下 virtual_block_size = block_size · CP_world_size，并按 interleave_size 判断 token 是否属本 rank(否则置 PAD)。"
+    }
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "M-RoPE / XD-RoPE 相关分支：_init_mrope_positions / _init_xdrope_positions / _calc_mrope_positions / _calc_xdrope_positions 调用与 uses_mrope/uses_xdrope_dim 守卫块 (gpu_model_runner.py L1186-L1192, L1825-L1833, L2022-L2042)", "why_safe": "仅多模态/特定模型用；删后纯文本模型 positions 计算路径完整无缺。"},
+      {"what": "prompt_embeds 路径：is_token_ids 收集与逐请求 embeds 填充 (gpu_model_runner.py L1853-L1898)、req_prompt_embeds 字典与 add_request 中 prompt_embeds 分支 (gpu_input_batch.py L371-L372)", "why_safe": "仅 enable_prompt_embeds 时启用；token-only 主线不触及。"},
+      {"what": "async spec decode 乐观计数与修正：prev_num_draft_len 块、deferred_spec_decode_corrections 闭包、ngram_gpu 增量更新、optimistic_seq_lens/discard_request_mask/num_accepted_tokens 的异步分支、update_num_computed_tokens_for_batch_change (gpu_model_runner.py L1219-L1271, L1326-L1335, L1356-L1419, L1909-L1992)", "why_safe": "高级 spec decode 加速路径；删后非投机的常规 prefill/decode 数值正确。must_keep 保留基础 spec_decode_metadata 入口供讲解。"},
+      {"what": "pooling 模型分支：is_pooling_model 早退/pooling_params 装填 (gpu_input_batch.py L153-L160, L454-L464, L540-L543, L764-L767, L815-L819)、pooler 更新 (gpu_model_runner.py L1153-L1160)", "why_safe": "生成式主线为 sampling 路径；pooling 是 embedding/分类模型独立分支。"},
+      {"what": "LoRA：request_lora_mapping/lora_id_to_* 装填与 set_active_loras (gpu_input_batch.py L242-L245, L469-L481, L530-L538；gpu_model_runner.py L2083-L2091)", "why_safe": "可选适配器特性，删后基础推理完整。"},
+      {"what": "KV-connector / EC-connector / PP 非末 rank token 回填 / external_launcher+DP 边角 (gpu_model_runner.py L1275-L1306, L1343-L1353, L3860-L3897 中相关分支)", "why_safe": "分布式/PP/连接器路径；单机单卡纯文本主线不经过。"},
+      {"what": "CP/DCP 上下文并行分片：_compute_slot_mapping_kernel 中 is_local/local_block_offsets 计算 (block_table.py L362-L369)、dcp_local_seq_lens (gpu_model_runner.py L2201-L2214)", "why_safe": "TOTAL_CP_WORLD_SIZE=1 时这些项退化为恒等(is_local 恒真、offset=pos%block_size)；精简版固定单 rank，保留简化公式即可。"},
+      {"what": "hybrid kernel block 细分：use_hybrid_blocks 分支与 map_to_kernel_blocks (block_table.py L47-L66, L79-L84, L110-L113, L173-L201)", "why_safe": "block_size==kernel_block_size 时该路径完全跳过(blocks_per_kv_block=1，map_to_kernel_blocks 直接返回)；精简版取标准等块大小即可。"},
+      {"what": "thinking budget、late_interaction_runner、routed_experts、kv_sharing_fast_prefill、num_decode_draft_tokens cudagraph 特例 (各处守卫块)", "why_safe": "均为可选/特定后端特性，与持久批次+输入准备主干正交。"}
+    ],
+    "must_keep": [
+      {"symbol": "_update_states", "why": "本章主方法之一：用 SchedulerOutput 调和增删/重排。"},
+      {"symbol": "_prepare_inputs", "why": "本章主方法之一：token 收集/位置/slot mapping。"},
+      {"symbol": "InputBatch", "why": "持久批次容器，全章围绕它。"},
+      {"symbol": "CachedRequestState", "why": "worker 端请求快照，新增/恢复请求的载体。"},
+      {"symbol": "add_request", "why": "把请求写入 slot；slot 复用入口。"},
+      {"symbol": "remove_request", "why": "打洞标记移除；与 condense 配对。"},
+      {"symbol": "condense", "why": "压实空洞使索引连续，持久批次核心机制。"},
+      {"symbol": "_register_add_request", "why": "pop_removed() 复用最小空 slot 的实现点。"},
+      {"symbol": "batch_update_builder", "why": "removed/added/moved 记录器，slot 复用与压实都靠它。"},
+      {"symbol": "pop_removed", "why": "返回最小空 slot，slot 复用的关键调用。"},
+      {"symbol": "refresh_metadata", "why": "批次变更后重建 SamplingMetadata 的收尾。"},
+      {"symbol": "token_ids_cpu", "why": "持久全长 token 缓冲，收集与搬移的对象。"},
+      {"symbol": "num_computed_tokens_cpu", "why": "位置计算与 seq_lens 的基准，跨迭代累积。"},
+      {"symbol": "num_tokens_no_spec", "why": "活跃 token 计数，决定收集/搬移的前缀长度。"},
+      {"symbol": "req_id_to_index", "why": "req_id→slot 映射，增量调和的索引基础。"},
+      {"symbol": "block_table", "why": "持久批次内的 KV 块表(对象)。"},
+      {"symbol": "MultiGroupBlockTable", "why": "按 KV group 持有多块表的封装。"},
+      {"symbol": "BlockTable", "why": "单 group 块表，CPU/GPU 双镜像。"},
+      {"symbol": "append_row", "why": "向块表行追加新块号(增量)。"},
+      {"symbol": "add_row", "why": "重置并写入块表行(新增/恢复请求)。"},
+      {"symbol": "move_row", "why": "condense 时同步搬块表行。"},
+      {"symbol": "commit_block_table", "why": "block_table CPU→GPU 镜像拷贝，GPU 端镜像的来源。"},
+      {"symbol": "compute_slot_mapping", "why": "启动 Triton kernel 算物理 slot。"},
+      {"symbol": "_compute_slot_mapping_kernel", "why": "position→slot 映射内核，PagedAttention 落点。"},
+      {"symbol": "get_device_tensor", "why": "取块表 GPU 镜像供 attention metadata。"},
+      {"symbol": "_get_cumsum_and_arange", "why": "把 num_scheduled_tokens 展开成 cu 偏移与请求内 arange。"},
+      {"symbol": "index_select", "why": "token 收集的实际算子(扁平索引)。"},
+      {"symbol": "query_start_loc", "why": "每请求 CU token 偏移，attention 与 slot kernel 都用。"},
+      {"symbol": "slot_mapping", "why": "每 token 物理 slot 张量，前向写 KV 用。"},
+      {"symbol": "positions", "why": "每 token 绝对位置张量。"},
+      {"symbol": "seq_lens", "why": "每请求当前序列长，attention metadata 用。"},
+      {"symbol": "_build_attention_metadata", "why": "把持久批次块表+slot_mapping 收束成 attention 输入。"},
+      {"symbol": "_may_reorder_batch", "why": "attention backend 重排钩子，与持久批次重排相关。"}
+    ]
+  },
+
+  "diagram_plan": [
+    {
+      "id": "ch18-persistent-batch-update",
+      "title": "持久批次跨拍演化：打洞→复用 slot→压实",
+      "spec": "三拍时间线状态表。每拍画 max_num_reqs 个 slot 行(如 6 个)，列出 slot index 与其 req_id/状态。拍1：slot0=A,1=B,2=C,3=D(满)。拍2：B、D 完成 → remove 打洞(slot1,3 标 removed 空洞)，新请求 E 到来 → _register_add_request 经 pop_removed 复用 slot1，再 F 复用 slot3。拍3：再有 slot2(C)移除留洞且无新请求填 → condense 把尾部活请求(slot5 若有)滑入 slot2。用不同底色区分 active/removed-hole/reused/condensed-moved，箭头标 pop_removed 与 move_row。配 batch_update_builder.removed(降序) 小注。",
+      "roadmap_highlight": "model-runner / persistent-batch"
+    },
+    {
+      "id": "ch18-prepare-inputs-gather",
+      "title": "_prepare_inputs：从持久批次到 input_ids 的扁平收集",
+      "spec": "左：token_ids_cpu 二维网格(行=req slot 0..2，每行 max_model_len 长，标出 num_computed_tokens 与本拍 num_scheduled_tokens 窗口)。中：np.repeat 把 num_scheduled_tokens=[2,5,3] 展开成 req_indices=[0,0,1,1,1,1,1,2,2,2]，query_pos=[0,1,0,1,2,3,4,0,1,2]，token_indices=positions + req_indices*M。右：index_select 把分散窗口收集成一维连续 input_ids。底部并列：同套 req_indices/positions 经 compute_slot_mapping 产出 slot_mapping。强调『二维坐标→一维扁平索引』。",
+      "roadmap_highlight": "model-runner / prepare-inputs"
+    },
+    {
+      "id": "ch18-slot-mapping",
+      "title": "position → 物理 KV slot：block_table 镜像 + Triton 映射",
+      "spec": "上：某请求 block_table 行 = [逻辑块0→物理7, 1→物理3, 2→物理9]（CPU 镜像 commit 到 GPU 镜像，画一条 CPU→GPU 拷贝箭头）。中：取 pos(如 pos=33, block_size=16) → block_index=2 → block_numbers=9 → slot_id=9*16+1=145。下：一行 token 序列 pos=[16..]，逐个映射到 slot_mapping 物理槽，尾部填 PAD_SLOT_ID(标 CUDA graph 占位)。给出非 CP 公式 slot=block_table[req,pos//bs]*bs+pos%bs。",
+      "roadmap_highlight": "block-table / slot-mapping"
+    }
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_payoff": [],
+    "note": "bible.py due ch18 返回空：本章无登记的应埋/应回收伏笔。建议 archivist 在写后登记两项跨章接口供后续回收：(1) execute_model→sample_tokens 的 ExecuteModelState 解耦(异步调度，ch19/采样章回收)；(2) slot_mapping/block_table_tensor 作为 attention backend 接口(attention 实现章回收)。"
+  }
+}

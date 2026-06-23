@@ -14,14 +14,14 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch17',
-  slug: 'ch17-worker-and-executor',
-  focus: '执行器与 Worker 生命周期: Executor.get_class() 工厂(uni/mp/ray 三态分发)、collective_rpc 向所有 worker 广播调用、MultiprocExecutor 的共享内存 MessageQueue + FutureWrapper(异步结果) + worker 子进程监控/失败传播、WorkerWrapperBase 延迟初始化包装。Part V 执行层开篇',
-  highlight: 'worker-and-executor',
+  chapter_id: 'ch18',
+  slug: 'ch18-model-runner',
+  focus: '持久化批次与输入准备: InputBatch 跨迭代持久化(batch_update_builder 复用 slot, 不每拍重建)、_update_states 用 SchedulerOutput 调和增删/重排请求、_prepare_inputs(token index_select 收集、位置与 slot mapping、attention metadata 构建)、block_table 的 GPU 端镜像。承接 ch17 worker',
+  highlight: 'model-runner',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
-  paths: ['vllm/v1/worker/worker_base.py', 'vllm/v1/worker/gpu_worker.py', 'vllm/v1/executor/abstract.py', 'vllm/v1/executor/multiproc_executor.py'],
+  paths: ['vllm/v1/worker/gpu_model_runner.py', 'vllm/v1/worker/gpu_input_batch.py', 'vllm/v1/worker/block_table.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
