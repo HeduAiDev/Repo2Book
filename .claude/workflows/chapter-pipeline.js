@@ -14,9 +14,9 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch18',
-  slug: 'ch18-model-runner',
-  focus: '持久化批次与输入准备: InputBatch 跨迭代持久化(batch_update_builder 复用 slot, 不每拍重建)、_update_states 用 SchedulerOutput 调和增删/重排请求、_prepare_inputs(token index_select 收集、位置与 slot mapping、attention metadata 构建)、block_table 的 GPU 端镜像。承接 ch17 worker',
+  chapter_id: 'ch19',
+  slug: 'ch19-model-runner',
+  focus: '前向与采样解耦: execute_model() 两阶段(non_block 发起前向、返回 None + 缓存 ExecuteModelState)、sample_tokens() 解包 state 做采样、_bookkeeping_sync 把新 token 写回 input_batch、CUDA graph dispatch(piecewise/full)。回收 f13(持久批次跨拍存活: 新 token 写回 token_ids_cpu slot 行/output_token_ids 增长)。承接 ch18 持久批次, 呼应 ch11 EngineCore 层重叠机制',
   highlight: 'model-runner',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',

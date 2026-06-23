@@ -1,0 +1,271 @@
+{
+  "chapter_id": "ch19",
+  "title": "前向与采样解耦：execute_model() 两阶段、sample_tokens() 解包、_bookkeeping_sync 写回持久批次、CUDA graph dispatch",
+  "summary": "GPUModelRunner 把一拍推理切成两个可分别调用的阶段：execute_model() 发起前向（非阻塞 issue 到 GPU）后并不等结果落地，而是把 logits/hidden_states/spec 元数据等打包进 ExecuteModelState 缓存进 self.execute_model_state，立即 return None；随后 sample_tokens() 解包这份 state、做采样、再 _bookkeeping_sync() 把新 token 写回 input_batch.token_ids_cpu 的对应 slot 行并增长 req_state.output_token_ids——持久批次因此带着这拍新长出的 token 活到下一拍（回收 f13）。前向走哪条 CUDA graph 由 CudagraphDispatcher.dispatch() 在 PIECEWISE / FULL / NONE 之间按批次描述符选择。本章承接 ch18 持久批次，呼应 ch11 EngineCore 层的执行/调度重叠机制。",
+
+  "code_spine": [
+    "vllm/v1/worker/gpu_model_runner.py:L378-L391  ExecuteModelState NamedTuple——execute_model→sample_tokens 的临时载荷定义",
+    "vllm/v1/worker/gpu_model_runner.py:L3825-L3834  execute_model() 入口 + 状态机断言（必须先消费上一份 state）",
+    "vllm/v1/worker/gpu_model_runner.py:L3866-L3916  preprocess 段：_update_states 归一持久批次 → _prepare_inputs 建张量",
+    "vllm/v1/worker/gpu_model_runner.py:L3928-L3941  _determine_batch_execution_and_padding 决定 cudagraph_mode / batch_desc",
+    "vllm/v1/worker/gpu_model_runner.py:L4071-L4095  set_forward_context(cudagraph_runtime_mode=...) 包裹 _model_forward 发起前向",
+    "vllm/v1/worker/gpu_model_runner.py:L4124-L4154  logits = compute_logits(hidden_states[logits_indices])",
+    "vllm/v1/worker/gpu_model_runner.py:L4156-L4175  打包 ExecuteModelState 缓存进 self.execute_model_state，return None",
+    "vllm/v1/worker/gpu_model_runner.py:L4178-L4213  sample_tokens() 解包 state、清空 self.execute_model_state",
+    "vllm/v1/worker/gpu_model_runner.py:L4221-L4226  _sample(logits) → sampler_output；_update_states_after_model_execute",
+    "vllm/v1/worker/gpu_model_runner.py:L4333-L4348  _bookkeeping_sync(...) 调用点",
+    "vllm/v1/worker/gpu_model_runner.py:L3480-L3505  _bookkeeping_sync 写回循环：token_ids_cpu[slot, start:end]=sampled_ids、num_tokens_no_spec 推进、output_token_ids.extend（f13 写回侧）",
+    "vllm/v1/worker/gpu_model_runner.py:L4376-L4414  组装 ModelRunnerOutput / AsyncGPUModelRunnerOutput 返回",
+    "vllm/v1/worker/gpu_model_runner.py:L1839-L1852  _prepare_inputs：torch.index_select 从 token_ids_cpu 取出下一拍 input_ids（f13 读回侧）",
+    "vllm/v1/worker/gpu_input_batch.py:L336-L379  InputBatch.add_request 把请求装入 slot 行（token_ids_cpu / num_tokens_no_spec / req_output_token_ids 别名）",
+    "vllm/v1/worker/gpu_input_batch.py:L131-L166  InputBatch 持久 CPU 张量（token_ids_cpu / num_tokens_no_spec / num_computed_tokens_cpu）",
+    "vllm/v1/cudagraph_dispatcher.py:L234-L323  CudagraphDispatcher.dispatch：PIECEWISE/FULL/NONE 选择",
+    "vllm/v1/worker/block_table.py:L141-L164  BlockTable.compute_slot_mapping 触发 Triton kernel（_prepare_inputs 内）"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L378-L391",
+      "code": "class ExecuteModelState(NamedTuple):\n    \"\"\"Ephemeral cached state transferred between execute_model() and\n    sample_tokens(), after execute_model() returns None.\"\"\"\n\n    scheduler_output: \"SchedulerOutput\"\n    logits: torch.Tensor\n    spec_decode_metadata: SpecDecodeMetadata | None\n    spec_decode_common_attn_metadata: CommonAttentionMetadata | None\n    hidden_states: torch.Tensor\n    sample_hidden_states: torch.Tensor\n    aux_hidden_states: list[torch.Tensor] | None\n    ec_connector_output: ECConnectorOutput | None\n    cudagraph_stats: CUDAGraphStat | None\n    slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L3825-L3834",
+      "code": "    def execute_model(\n        self,\n        scheduler_output: \"SchedulerOutput\",\n        intermediate_tensors: IntermediateTensors | None = None,\n    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:\n        if self.execute_model_state is not None:\n            raise RuntimeError(\n                \"State error: sample_tokens() must be called \"\n                \"after execute_model() returns None.\"\n            )",
+      "elide": ["紧随其后是 RoutedExpertsCapturer 清缓冲、ngram_gpu 复制 scheduler_output、KV/EC connector 抢占处理等可选分支——与两阶段骨架无关，讲解时一句带过"]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L3866-L3916",
+      "code": "        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens\n        with (\n            record_function_or_nullcontext(\"gpu_model_runner: preprocess\"),\n            self.synchronize_input_prep(),\n        ):\n            # Update persistent batch states.\n            deferred_state_corrections_fn = self._update_states(scheduler_output)\n            ...\n            if not num_scheduled_tokens:\n                ...\n                # Return empty ModelRunnerOutput if no work to do.\n                return EMPTY_MODEL_RUNNER_OUTPUT\n            ...\n            num_reqs = self.input_batch.num_reqs\n            req_ids = self.input_batch.req_ids\n            tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]\n            num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)\n            max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())\n            num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens\n\n            logits_indices, spec_decode_metadata = self._prepare_inputs(\n                scheduler_output,\n                num_scheduled_tokens_np,\n            )",
+      "elide": ["EC connector consumer 分支、kv_sharing_fast_prefill assert、cascade attention prefix 预计算均为可选；省略号处原文有 mm-encoder/连接器细节"]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L3928-L3941",
+      "code": "            (\n                cudagraph_mode,\n                batch_desc,\n                should_ubatch,\n                num_tokens_across_dp,\n                cudagraph_stats,\n            ) = self._determine_batch_execution_and_padding(\n                num_tokens=num_tokens_unpadded,\n                num_reqs=num_reqs,\n                num_scheduled_tokens_np=num_scheduled_tokens_np,\n                max_num_scheduled_tokens=max_num_scheduled_tokens,\n                use_cascade_attn=cascade_attn_prefix_lens is not None,\n                num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),\n            )",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L4071-L4095",
+      "code": "        with (\n            set_forward_context(\n                attn_metadata,\n                self.vllm_config,\n                num_tokens=num_tokens_padded,\n                num_tokens_across_dp=num_tokens_across_dp,\n                cudagraph_runtime_mode=cudagraph_mode,\n                batch_descriptor=batch_desc,\n                ubatch_slices=ubatch_slices_padded,\n                slot_mapping=slot_mappings,\n                skip_compiled=has_encoder_input,\n            ),\n            record_function_or_nullcontext(\"gpu_model_runner: forward\"),\n            self.maybe_get_kv_connector_output(\n                scheduler_output,\n                defer_finalize=defer_kv_connector_finalize,\n            ) as kv_connector_output,\n        ):\n            model_output = self._model_forward(\n                input_ids=input_ids,\n                positions=positions,\n                intermediate_tensors=intermediate_tensors,\n                inputs_embeds=inputs_embeds,\n                **model_kwargs,\n            )",
+      "elide": ["set_forward_context 把 cudagraph_runtime_mode 与 batch_descriptor 推入全局上下文，编译后的模型在内部据此 replay 对应 CUDA graph；KV connector 上下文管理器为可选分支"]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L4097-L4125",
+      "code": "        with record_function_or_nullcontext(\"gpu_model_runner: postprocess\"):\n            if self.use_aux_hidden_state_outputs:\n                # True when EAGLE 3 is used.\n                hidden_states, aux_hidden_states = model_output\n            else:\n                # Common case.\n                hidden_states = model_output\n                aux_hidden_states = None\n\n            if not self.broadcast_pp_output:\n                # Common case.\n                if not get_pp_group().is_last_rank:\n                    # Return the intermediate tensors.\n                    assert isinstance(hidden_states, IntermediateTensors)\n                    hidden_states.kv_connector_output = kv_connector_output\n                    self.kv_connector_output = kv_connector_output\n                    return hidden_states\n                ...\n                sample_hidden_states = hidden_states[logits_indices]\n                logits = self.model.compute_logits(sample_hidden_states)",
+      "elide": ["pooling 模型走 _pool 早返回、broadcast_pp_output=True 的 PP 广播 logits 分支为可选；只取 hidden_states→logits_indices→compute_logits 主干"]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L4156-L4175",
+      "code": "        self.execute_model_state = ExecuteModelState(\n            scheduler_output,\n            logits,\n            spec_decode_metadata,\n            spec_decode_common_attn_metadata,\n            hidden_states,\n            sample_hidden_states,\n            aux_hidden_states,\n            ec_connector_output,\n            cudagraph_stats,\n            slot_mappings,\n        )\n        self.kv_connector_output = kv_connector_output\n\n        # Now the batch has been launched we can wait for corrections from the\n        # previous model forward without breaking async scheduling.\n        if deferred_state_corrections_fn:\n            deferred_state_corrections_fn()\n\n        return None",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L4178-L4226",
+      "code": "    @torch.inference_mode\n    def sample_tokens(\n        self, grammar_output: \"GrammarOutput | None\"\n    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:\n        if self.execute_model_state is None:\n            ...\n            return ...  # PP non-last-rank / 无前向可采样的早返回\n\n        # Unpack ephemeral state.\n        (\n            scheduler_output,\n            logits,\n            spec_decode_metadata,\n            spec_decode_common_attn_metadata,\n            hidden_states,\n            sample_hidden_states,\n            aux_hidden_states,\n            ec_connector_output,\n            cudagraph_stats,\n            slot_mappings,\n        ) = self.execute_model_state\n        # Clear ephemeral state.\n        self.execute_model_state = None\n\n        # Apply structured output bitmasks if present.\n        if grammar_output is not None:\n            apply_grammar_bitmask(\n                scheduler_output, grammar_output, self.input_batch, logits\n            )\n\n        with record_function_or_nullcontext(\"gpu_model_runner: sample\"):\n            sampler_output = self._sample(logits, spec_decode_metadata)\n\n        self._update_states_after_model_execute(\n            sampler_output.sampled_token_ids, scheduler_output\n        )",
+      "elide": ["execute_model_state is None 分支处理 PP 非最后 rank 与纯 KV-transfer 的早返回（L4181-L4197），讲解时概括即可"]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L4333-L4348",
+      "code": "        with record_function_or_nullcontext(\"gpu_model_runner: bookkeep\"):\n            (\n                num_nans_in_logits,\n                logprobs_lists,\n                valid_sampled_token_ids,\n                prompt_logprobs_dict,\n                req_ids_output_copy,\n                req_id_to_index_output_copy,\n                invalid_req_indices,\n            ) = self._bookkeeping_sync(\n                scheduler_output,\n                sampler_output,\n                logits,\n                hidden_states,\n                scheduler_output.total_num_scheduled_tokens,\n            )",
+      "elide": ["此前的投机解码 propose_draft_token_ids 分支（spec_config is not None）为可选，与持久批次写回主线无关"]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L3479-L3505",
+      "code": "        req_ids = self.input_batch.req_ids\n        for req_idx in range(num_sampled_tokens):\n            if self.use_async_scheduling:\n                sampled_ids = [-1] if req_idx not in invalid_req_indices_set else None\n            else:\n                sampled_ids = valid_sampled_token_ids[req_idx]\n\n            num_sampled_ids: int = len(sampled_ids) if sampled_ids else 0\n\n            if not sampled_ids:\n                continue\n\n            start_idx = self.input_batch.num_tokens_no_spec[req_idx]\n            end_idx = start_idx + num_sampled_ids\n            assert end_idx <= self.max_model_len, (\n                \"Sampled token IDs exceed the max model length. \"\n                f\"Total number of tokens: {end_idx} > max_model_len: \"\n                f\"{self.max_model_len}\"\n            )\n\n            self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids\n            self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True\n            self.input_batch.num_tokens_no_spec[req_idx] = end_idx\n\n            req_id = req_ids[req_idx]\n            req_state = self.requests[req_id]\n            req_state.output_token_ids.extend(sampled_ids)",
+      "elide": ["在 async 模式下写入 token_ids_cpu 的是占位 -1（真实 token 通过 prev_sampled_token_ids 缓存在 GPU，下拍 _prepare_input_ids 再 scatter 进 input_ids）；同步模式直接写入真实采样 id"]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L1839-L1852",
+      "code": "        # Get token indices.\n        # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]\n        # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]\n        # where M is the max_model_len.\n        token_indices = (\n            positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]\n        )\n        token_indices_tensor = torch.from_numpy(token_indices)\n\n        # NOTE(woosuk): We use torch.index_select instead of np.take here\n        # because torch.index_select is much faster than np.take for large\n        # tensors.\n        torch.index_select(\n            self.input_batch.token_ids_cpu_tensor.flatten(),\n            0,\n            token_indices_tensor,\n            out=self.input_ids.cpu[:total_num_scheduled_tokens],\n        )",
+      "elide": ["positions_np = num_computed_tokens_cpu[req_indices] + query_pos（L1820-1823）；这正是把上一拍写回 token_ids_cpu 的新 token 读回来当本拍输入的环节（f13 读回侧）"]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_input_batch.py",
+      "lines": "L342-L379",
+      "code": "        req_id = request.req_id\n        if req_index == len(self._req_ids):\n            self._req_ids.append(req_id)\n            self.req_output_token_ids.append(request.output_token_ids)\n            self.spec_token_ids.append([])\n        else:\n            self._req_ids[req_index] = req_id\n            self.req_output_token_ids[req_index] = request.output_token_ids\n            self.spec_token_ids[req_index].clear()\n\n        self.req_id_to_index[req_id] = req_index\n\n        # Copy the prompt token ids and output token ids.\n        num_prompt_tokens = length_from_prompt_token_ids_or_embeds(\n            request.prompt_token_ids, request.prompt_embeds\n        )\n        self.num_prompt_tokens[req_index] = num_prompt_tokens\n        start_idx = num_prompt_tokens\n        end_idx = start_idx + len(request.output_token_ids)\n        if request.prompt_token_ids is not None:\n            self.token_ids_cpu[req_index, :num_prompt_tokens] = request.prompt_token_ids\n            ...\n        self.token_ids_cpu[req_index, start_idx:end_idx] = request.output_token_ids\n        self.is_token_ids[req_index, start_idx:end_idx] = True\n        # Number of tokens without spec decode tokens.\n        self.num_tokens_no_spec[req_index] = request.num_tokens\n\n        self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens\n        self.block_table.add_row(request.block_ids, req_index)",
+      "elide": ["省略号处是 is_token_ids / prompt_embeds 填充与 sampling_params 解析（temperature/top_p/top_k/penalties），与 slot 行装载主线相关但偏采样元数据；关键是 req_output_token_ids[req_index] 与 request.output_token_ids 是同一 list 对象别名"]
+    },
+    {
+      "path": "vllm/v1/cudagraph_dispatcher.py",
+      "lines": "L273-L323",
+      "code": "        if (\n            not self.keys_initialized\n            or self.cudagraph_mode == CUDAGraphMode.NONE\n            or max_size is None\n            or num_tokens > max_size\n            or allowed_modes <= {CUDAGraphMode.NONE}\n        ):\n            return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)\n        ...\n        normalized_uniform = uniform_decode and self.cudagraph_mode.separate_routine()\n        batch_desc = self._create_padded_batch_descriptor(\n            num_tokens, normalized_uniform, has_lora, effective_num_active_loras\n        )\n\n        if CUDAGraphMode.FULL in allowed_modes:\n            # check if key exists for full cudagraph\n            batch_desc_to_check = batch_desc\n            if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.FULL]:\n                return CUDAGraphMode.FULL, batch_desc_to_check\n\n        if CUDAGraphMode.PIECEWISE in allowed_modes:\n            # also check if the relaxed key exists for more \"general\"\n            # piecewise cudagraph\n            batch_desc_to_check = replace(batch_desc, num_reqs=None, uniform=False)\n            if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.PIECEWISE]:\n                return CUDAGraphMode.PIECEWISE, batch_desc_to_check\n\n        assert CUDAGraphMode.NONE in allowed_modes, ...\n        return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)",
+      "elide": ["省略 LoRA num_active_loras 归一（specialize/bisect）细节；核心是：超 max_size 或未初始化→NONE；否则先查 FULL（需精确 num_reqs）再查 relaxed PIECEWISE（num_reqs=None），都没命中→NONE 回退 eager"]
+    }
+  ],
+
+  "key_classes": [
+    {
+      "name": "GPUModelRunner",
+      "file": "vllm/v1/worker/gpu_model_runner.py",
+      "responsibility": "持久 GPU 模型运行器。一拍循环：_update_states 按 SchedulerOutput 归一持久批次 → _prepare_inputs 建 GPU 张量 → execute_model 发起前向并把结果缓存进 ExecuteModelState（return None）→ sample_tokens 解包采样 → _bookkeeping_sync 把新 token 写回持久批次。持有 self.execute_model_state（两阶段桥）、self.input_batch（持久批次）、self.requests（req_id→CachedRequestState）。"
+    },
+    {
+      "name": "ExecuteModelState",
+      "file": "vllm/v1/worker/gpu_model_runner.py",
+      "responsibility": "10 字段 NamedTuple，execute_model() 与 sample_tokens() 之间的临时载荷。携带 logits、hidden_states、sample_hidden_states、spec 元数据、cudagraph_stats、slot_mappings 等。缓存在 self.execute_model_state，sample_tokens 解包后置 None。execute_model 入口断言它必须为 None——强制两阶段严格配对调用。"
+    },
+    {
+      "name": "InputBatch",
+      "file": "vllm/v1/worker/gpu_input_batch.py",
+      "responsibility": "持久批次容器，跨调度拍存活。持有 token_ids_cpu(max_reqs×max_model_len)、num_tokens_no_spec(每请求已落位 token 数)、num_computed_tokens_cpu、req_output_token_ids（与各 CachedRequestState.output_token_ids 同一 list 别名）、block_table、采样元数据。add_request 把请求装入某 slot 行；_bookkeeping_sync 把新 token 写进这些行使批次活到下一拍。"
+    },
+    {
+      "name": "CachedRequestState",
+      "file": "vllm/v1/worker/gpu_input_batch.py",
+      "responsibility": "每请求快照 dataclass：prompt_token_ids、output_token_ids(list，随采样 extend 增长)、block_ids、num_computed_tokens、sampling_params。num_tokens = num_prompt_tokens + len(output_token_ids)。其 output_token_ids 与 InputBatch.req_output_token_ids[slot] 是同一对象——这是 f13『output_token_ids 增长』的物理载体。"
+    },
+    {
+      "name": "CudagraphDispatcher",
+      "file": "vllm/v1/cudagraph_dispatcher.py",
+      "responsibility": "持有 PIECEWISE 与 FULL 两套 dispatch key 集合。dispatch() 据 num_tokens/uniform_decode/has_lora 构造 BatchDescriptor，先查 FULL（要求精确 num_reqs）、再查 relaxed PIECEWISE（num_reqs=None），命中返回对应 mode 与描述符；超过 max_cudagraph_capture_size 或未初始化则回退 NONE（eager）。"
+    },
+    {
+      "name": "BlockTable / MultiGroupBlockTable",
+      "file": "vllm/v1/worker/block_table.py",
+      "responsibility": "把逻辑块号映射成 paged attention 物理 slot id。commit_block_table 把 CPU block_table 拷到 GPU；compute_slot_mapping 启动 Triton kernel _compute_slot_mapping_kernel 据 positions 算每 token 的 slot id（含 CP/DCP 交错与 PAD_ID 填充）。本章只在 _prepare_inputs 内作为 slot_mapping 来源出现。"
+    }
+  ],
+
+  "data_flow": [
+    "1. gpu_worker 调 GPUModelRunner.execute_model(scheduler_output) [gpu_model_runner.py:execute_model]",
+    "2. 断言 self.execute_model_state is None（上一拍的 state 必须已被 sample_tokens 消费）[execute_model]",
+    "3. synchronize_input_prep() 上下文内 _update_states(scheduler_output) 归一持久批次（add/remove/resume），返回 deferred_state_corrections_fn [execute_model → _update_states]",
+    "4. _prepare_inputs(scheduler_output, num_scheduled_tokens_np)：commit_block_table → 由 num_computed_tokens_cpu+query_pos 算 positions → token_indices → torch.index_select 从 token_ids_cpu 取出 input_ids（f13 读回侧）→ compute_slot_mapping → 返回 logits_indices/spec_decode_metadata [_prepare_inputs]",
+    "5. _determine_batch_execution_and_padding(...) → CudagraphDispatcher.dispatch 得 cudagraph_mode(PIECEWISE/FULL/NONE) 与 batch_desc [_determine_batch_execution_and_padding → cudagraph_dispatcher.dispatch]",
+    "6. set_forward_context(cudagraph_runtime_mode=cudagraph_mode, batch_descriptor=batch_desc, slot_mapping=...) 包裹 _model_forward 发起前向（非阻塞 issue）[execute_model → _model_forward]",
+    "7. postprocess：sample_hidden_states = hidden_states[logits_indices]；logits = model.compute_logits(...) [execute_model]",
+    "8. 打包 ExecuteModelState(scheduler_output, logits, ..., slot_mappings) 存入 self.execute_model_state；执行 deferred_state_corrections_fn；return None [execute_model]",
+    "9. gpu_worker 调 GPUModelRunner.sample_tokens(grammar_output) [sample_tokens]",
+    "10. 解包 self.execute_model_state 并置 None；若有 grammar_output 则 apply_grammar_bitmask；_sample(logits, spec_decode_metadata) → sampler_output [sample_tokens → _sample]",
+    "11. _update_states_after_model_execute（仅 hybrid+spec 生效，记 num_accepted_tokens）[sample_tokens]",
+    "12. _bookkeeping_sync(scheduler_output, sampler_output, logits, hidden_states, ...)：对每个采样到的 req_idx，start=num_tokens_no_spec[req_idx]，token_ids_cpu[req_idx, start:end]=sampled_ids，num_tokens_no_spec[req_idx]=end，req_state.output_token_ids.extend(sampled_ids)（f13 写回侧）[_bookkeeping_sync]",
+    "13. 组装 ModelRunnerOutput（同步）或 AsyncGPUModelRunnerOutput（async：sampled_token_ids 留在 GPU，set_async_sampled_token_ids 注册延后 CPU 拷贝）返回给 worker [sample_tokens]",
+    "14. 下一拍 execute_model 的 _prepare_inputs 再次从 token_ids_cpu（或 async 的 prev_sampled_token_ids）读出第 12 步写回的 token 作输入——持久批次带着多出的 token 活到下一拍闭环 [_prepare_inputs / _prepare_input_ids]"
+  ],
+
+  "design_decisions": [
+    {
+      "decision": "前向与采样拆成两个独立可调用方法：execute_model() 发起前向后立即 return None 并把结果缓存进 ExecuteModelState，sample_tokens() 再解包采样",
+      "why": "前向是 GPU 异步 issue 的——execute_model 提交完前向 kernel 不必等其落地即可返回，让 worker/EngineCore 层把『发起下一拍前向』与『对上一拍采样』在时间上重叠（呼应 ch11 EngineCore 的执行/调度重叠）。采样依赖 logits 落地，单独放进 sample_tokens 这一较晚的同步点，避免在前向发起处就被迫 GPU↔CPU 同步。",
+      "evidence": "vllm/v1/worker/gpu_model_runner.py:L4175 (return None), L4156-L4167 (缓存 state), L4178-L4213 (sample_tokens 解包)"
+    },
+    {
+      "decision": "用 self.execute_model_state（单槽）+ 入口断言强制两阶段严格配对：execute_model 必须发现槽为空，sample_tokens 必须发现槽非空",
+      "why": "两阶段间靠一个实例字段传递重型张量，单槽设计杜绝两次 execute_model 未配对采样就堆叠状态（会泄漏上一拍 GPU 张量并产生错误采样）。断言把错误调用序列变成显式 RuntimeError 而非静默数据损坏。",
+      "evidence": "vllm/v1/worker/gpu_model_runner.py:L3830-L3834 (execute_model 入口断言), L4181 (sample_tokens 对 None 的处理), L4213 (消费后置 None)"
+    },
+    {
+      "decision": "新采样 token 在 _bookkeeping_sync 中『就地写回』持久批次的 token_ids_cpu 对应 slot 行并推进 num_tokens_no_spec，同时 extend 同一请求的 output_token_ids list",
+      "why": "持久批次跨拍复用同一组大 CPU 张量（max_reqs×max_model_len），不每拍重建；新 token 只需在已有 slot 行尾部追加，下一拍 _prepare_inputs 用 num_computed_tokens_cpu+query_pos 索引即可读回作输入。因 req_output_token_ids[slot] 与 CachedRequestState.output_token_ids 是同一 list 对象，extend 一处即让批次视图与请求快照同步增长——这正是 f13 的物理实现。",
+      "evidence": "vllm/v1/worker/gpu_model_runner.py:L3499-L3505 (写回 token_ids_cpu/num_tokens_no_spec/output_token_ids), gpu_input_batch.py:L345/L349 (req_output_token_ids 别名 output_token_ids), gpu_model_runner.py:L1839-L1852 (下拍 index_select 读回)"
+    },
+    {
+      "decision": "异步调度下 token_ids_cpu 写入占位 -1，真实采样 token 留在 GPU 的 prev_sampled_token_ids，下一拍 _prepare_input_ids 再 scatter 进 input_ids.gpu",
+      "why": "async scheduling 要避免在 sample_tokens 处做 GPU→CPU 同步（会破坏前向/采样重叠）。把真实 token 留在 GPU、CPU 侧仅占位 -1 推进计数，等下一拍准备输入时用 GPU scatter 直接搬，整拍无需为采样结果同步回 CPU。",
+      "evidence": "vllm/v1/worker/gpu_model_runner.py:L3461-L3472 (prev_sampled_token_ids 缓存 + 占位), L3482 (sampled_ids=[-1]), L1630-L1740 (_prepare_input_ids 的 GPU scatter 路径)"
+    },
+    {
+      "decision": "CUDA graph 走哪条由 CudagraphDispatcher.dispatch 在 PIECEWISE / FULL / NONE 间选：先查 FULL（需精确 num_reqs 匹配），再查 relaxed PIECEWISE（num_reqs=None 的更通用图），超 capture size 或未初始化回退 NONE(eager)",
+      "why": "FULL graph 把整个前向（含 attention）录成一张图，replay 最省 launch 开销但要求批次形状精确匹配捕获时的 key；PIECEWISE 只把非 attention 的连续算子段录成图、attention 留动态，对 num_reqs 更宽容（key 用 num_reqs=None），覆盖更多批次形状。dispatch 优先用更省的 FULL，退而求其次 PIECEWISE，再不行 eager——在性能与形状覆盖间分级取舍。",
+      "evidence": "vllm/v1/cudagraph_dispatcher.py:L306-L317 (FULL 后 PIECEWISE 的查找顺序), L273-L280 (NONE 回退条件), vllm/config/compilation.py:L60-L63 (CUDAGraphMode enum)"
+    }
+  ],
+
+  "theory": [
+    "两阶段重叠的收益量化：设单拍前向耗时 T_fwd、采样+簿记耗时 T_samp、调度构建下批耗时 T_sched。单体 forward+sample 的串行拍周期 ≈ T_fwd + T_samp（且采样处必同步）。两阶段下 execute_model 发起前向后立即返回，使 sample_tokens(第 n 拍) 可与 execute_model(第 n+1 拍发起) / 调度构建在流水线上交错——稳态吞吐受 max(T_fwd, T_samp+T_sched) 约束而非其和。这是 ch11 重叠机制在 worker 层的落点。",
+    "f13 闭环的不变式：每拍结束后对参与采样的请求有 num_tokens_no_spec[slot] += num_sampled_ids 且 len(output_token_ids) 同步增长；下一拍 positions = num_computed_tokens_cpu + query_pos，token_indices = positions + slot*max_model_len，保证 index_select 取到的恰是上一拍写回 [start:end) 区间的新 token。持久批次因此无需每拍重建，新 token 只在 slot 行尾部增量追加。",
+    "CUDA graph 三态的取舍：NONE(eager) 每拍重走 Python 算子派发，launch 开销 O(算子数)；PIECEWISE 把算子连续段录图、attention 动态，launch 开销降为 O(段数) 且对 num_reqs 宽容；FULL 整图 replay，launch 开销近 O(1) 但要求批次描述符精确命中捕获 key。dispatch 的 FULL→PIECEWISE→NONE 顺序即按 launch 开销升序优先。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "execute_model 中 RoutedExpertsCapturer 清/存缓冲分支（L3836-L3842, L4369-L4374）", "why_safe": "MoE 专家路由捕获是可选诊断特性，与两阶段前向/采样骨架无关，删去不影响主控制流。"},
+      {"what": "ngram_gpu 的 scheduler_output replace 复制分支（L3846-L3858）", "why_safe": "仅 ngram GPU 投机解码为避免改到 EngineCore 进程内对象而做的浅复制，非投机路径不触发。"},
+      {"what": "KV transfer / EC connector 相关分支（has_kv_transfer_group、maybe_get_ec_connector_output、maybe_get_kv_connector_output、handle_preemptions、finalize_kv_connector）", "why_safe": "PD 分离 / encoder cache 连接器是可选部署形态，单机非分离推理全程不进这些分支。"},
+      {"what": "mamba/hybrid 相关（mamba_cache_mode 预处理、_update_states_after_model_execute 的 hybrid 体、num_accepted_tokens 同步）", "why_safe": "仅 Mamba/线性注意力 hybrid 模型生效，纯 Transformer 模型 is_hybrid=False 直接早返回，删去不改 Transformer 路径。"},
+      {"what": "ubatching / DBO 微批分支（maybe_create_ubatch_slices、should_ubatch、ubatch_slices*）", "why_safe": "DBO 微批是可选优化，关闭时 should_ubatch=False、ubatch_slices=None，主路径退化为单批，删去等价于关闭该特性。"},
+      {"what": "PP 相关分支（broadcast_pp_output、get_pp_group().is_last_rank 早返回、_pp_broadcast/_pp_receive_prev_sampled_token_ids）", "why_safe": "流水并行 PP=1 时 is_last_rank 恒真、world_size=1，这些分支不触发；本章聚焦单 rank 两阶段语义。"},
+      {"what": "cascade attention prefix 预计算（_compute_cascade_attn_prefix_lens 及其禁用 FULL 的联动）", "why_safe": "级联注意力是可选 attention 优化，cascade_attn_enabled=False 时 cascade_attn_prefix_lens=None，dispatch 不被禁用 FULL，主路径不变。"},
+      {"what": "prompt_embeds / is_token_ids 填充分支（enable_prompt_embeds、req_prompt_embeds、is_token_ids 写入）", "why_safe": "prompt embeddings 输入是可选特性，enable_prompt_embeds=False 时整段跳过；token_ids 输入路径不依赖它。"},
+      {"what": "block_table.py 中 hybrid block（use_hybrid_blocks/map_to_kernel_blocks）与 CP/DCP 交错（pcp/dcp world_size、kernel 中 is_local/local_block_offsets）", "why_safe": "kernel_block_size==block_size 且无 context parallel 时 blocks_per_kv_block=1、TOTAL_CP_WORLD_SIZE=1，slot_ids 退化为 block_number*block_size+offset；删去这些只保留标准 paged 映射不改单卡行为。"},
+      {"what": "LoRA num_active_loras 归一（dispatch 中 specialize_lora_count/bisect/max_loras 分支）", "why_safe": "无 LoRA 时 has_lora=False，effective_num_active_loras 保持 0，整段跳过，不影响 PIECEWISE/FULL/NONE 的核心选择逻辑。"}
+    ],
+    "must_keep": [
+      {"symbol": "execute_model", "why": "两阶段第一阶段入口，读者必须看到它发起前向后 return None。"},
+      {"symbol": "sample_tokens", "why": "两阶段第二阶段入口，解包 state 并采样。"},
+      {"symbol": "ExecuteModelState", "why": "两阶段间的临时载荷 NamedTuple，是『缓存 state』这一设计的物理体现。"},
+      {"symbol": "execute_model_state", "why": "缓存 ExecuteModelState 的单槽实例字段，承载两阶段配对断言。"},
+      {"symbol": "_bookkeeping_sync", "why": "把新 token 写回持久批次的方法，f13 写回侧核心。"},
+      {"symbol": "_prepare_inputs", "why": "建 input_ids/positions/slot_mapping，f13 读回侧（index_select from token_ids_cpu）。"},
+      {"symbol": "_determine_batch_execution_and_padding", "why": "决定 cudagraph_mode 与 batch_desc 的调用点。"},
+      {"symbol": "_model_forward", "why": "实际发起前向的方法，被 set_forward_context 包裹。"},
+      {"symbol": "_sample", "why": "sample_tokens 内做采样产出 sampler_output 的方法。"},
+      {"symbol": "_update_states_after_model_execute", "why": "采样后状态更新调用点（即使精简到空体也要保留调用点以示流程位置）。"},
+      {"symbol": "token_ids_cpu", "why": "持久批次的 token 主张量，写回与读回都落在它上；f13 真相源。"},
+      {"symbol": "num_tokens_no_spec", "why": "每请求已落位 token 数，写回时作 start_idx 并推进——批次『多出 token』的计数。"},
+      {"symbol": "num_computed_tokens_cpu", "why": "读回时与 query_pos 相加算 positions，定位本拍要读的 token。"},
+      {"symbol": "output_token_ids", "why": "CachedRequestState 的输出 token list，extend 增长；f13『output_token_ids 增长』。"},
+      {"symbol": "req_output_token_ids", "why": "InputBatch 中与 output_token_ids 同一对象的别名列表，体现两者同步增长。"},
+      {"symbol": "add_request", "why": "请求装入持久批次 slot 行的入口，建立 token_ids_cpu 行与 output_token_ids 别名。"},
+      {"symbol": "CachedRequestState", "why": "每请求快照，承载 output_token_ids 与 num_computed_tokens。"},
+      {"symbol": "InputBatch", "why": "持久批次容器本体。"},
+      {"symbol": "CudagraphDispatcher", "why": "CUDA graph 选择器类。"},
+      {"symbol": "dispatch", "why": "PIECEWISE/FULL/NONE 选择方法。"},
+      {"symbol": "CUDAGraphMode", "why": "PIECEWISE/FULL/NONE 枚举，dispatch 返回值类型。"},
+      {"symbol": "set_forward_context", "why": "把 cudagraph_runtime_mode/batch_descriptor 推入全局上下文、驱动 graph replay 的包裹点。"},
+      {"symbol": "compute_slot_mapping", "why": "_prepare_inputs 内由 block_table 产出 slot_mapping 的方法。"},
+      {"symbol": "commit_block_table", "why": "把 CPU block_table 拷到 GPU，_prepare_inputs 起手第一步。"}
+    ]
+  },
+
+  "diagram_plan": [
+    {
+      "name": "two-phase-timeline",
+      "kind": "svg-diagram",
+      "spec": "横向时间轴泳道图。三条泳道：worker/EngineCore、execute_model(前向)、sample_tokens(采样+簿记)。展示第 n 拍：execute_model 发起前向(非阻塞)→缓存 ExecuteModelState→return None；前向在 GPU 上跑的同时 worker 可推进；随后 sample_tokens 解包 state→采样→_bookkeeping_sync 写回。用错位的色块体现第 n 拍采样与第 n+1 拍前向发起的时间重叠。标注 self.execute_model_state 单槽在两阶段间传递。",
+      "highlight": "对照 ch11 EngineCore 重叠：本图是该重叠在 worker 层的落点。"
+    },
+    {
+      "name": "f13-persistent-batch-writeback",
+      "kind": "svg-diagram",
+      "spec": "持久批次 token_ids_cpu 表（行=slot/请求，列=token 位置）的两拍演化。第 n 拍 _bookkeeping_sync：在 slot r 的 [num_tokens_no_spec, end) 区间写入新采样 token（高亮该格），num_tokens_no_spec 右移，output_token_ids list 尾部追加同一 token（画出 req_output_token_ids[r] 与 CachedRequestState.output_token_ids 是同一对象的双向箭头）。第 n+1 拍 _prepare_inputs：positions=num_computed_tokens_cpu+query_pos，index_select 从同一格读出作 input_ids（高亮读箭头）。体现『写回→活到下一拍→读回』闭环。",
+      "highlight": "回收 f13：埋于 ch18 的持久批次跨拍存活在此闭环。"
+    },
+    {
+      "name": "cudagraph-dispatch-tree",
+      "kind": "svg-diagram",
+      "spec": "决策树：输入 num_tokens/uniform_decode/has_lora → 若未初始化/超 max_cudagraph_capture_size/mode==NONE → NONE(eager)；否则构造 BatchDescriptor → 查 FULL keys(精确 num_reqs)命中→FULL → 否则查 PIECEWISE relaxed keys(num_reqs=None)命中→PIECEWISE → 否则→NONE。每个终态旁注 launch 开销量级（O(1)/O(段数)/O(算子数)）。",
+      "highlight": "无"
+    },
+    {
+      "name": "roadmap-ch19",
+      "kind": "roadmap",
+      "spec": "复用 instances/vllm/book/assets/roadmap/roadmap.py，高亮 model-runner 子系统的『前向/采样解耦』节点；前接 ch18 持久批次与 _prepare_inputs，后接 attention 章（slot_mapping 从另一头接住）。",
+      "highlight": "model-runner 节点；标注承接 ch18、呼应 ch11。"
+    }
+  ],
+
+  "foreshadow_due": {
+    "plant": [],
+    "payoff": [
+      {
+        "id": "f13",
+        "what": "持久批次跨拍存活：前向+采样后把新 token 写回 input_batch.token_ids_cpu 对应 slot 行、output_token_ids 增长，批次带着多出的 token 活到下一拍",
+        "plant": "ch18",
+        "payoff": "ch19",
+        "where_in_chapter": "_bookkeeping_sync 写回循环（token_ids_cpu[req_idx,start:end]=sampled_ids、num_tokens_no_spec 推进、output_token_ids.extend）+ 下一拍 _prepare_inputs 的 index_select 读回；配 f13-persistent-batch-writeback 图闭环。"
+      }
+    ]
+  }
+}
