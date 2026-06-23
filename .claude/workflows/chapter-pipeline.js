@@ -14,14 +14,14 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch21',
-  slug: 'ch21-async-engine',
-  focus: '异步通信与数据并行: AsyncIntermediateTensors 的惰性 PP 同步(isend/irecv 推迟到真正用时)、DPCoordinator 的 wave 同步(all-reduce 共识决定全体是否继续/空转)、DP 负载均衡(DPLBAsyncMPClient 按各 engine 负载分发请求)、gpu_worker 的 DP 维度。承接 ch20 分布式集合通信 + ch12 batch queue',
-  highlight: 'async-engine',
+  chapter_id: 'ch22',
+  slug: 'ch22-model-definitions',
+  focus: '确立 vLLM v1 模型契约(以 Llama 为最简参考): (vllm_config, prefix) 构造约定、QKV/Row/MergedColumnParallelLinear 等 TP 切分线性层、Attention 层作为统一封装入口、权重加载(model_loader 按 packed_modules_mapping 装载并切分到各 TP rank)、LlamaModel/LlamaForCausalLM 结构。Part VI 模型层开篇',
+  highlight: 'model-definitions',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
-  paths: ['vllm/v1/engine/async_llm.py', 'vllm/v1/engine/core_client.py', 'vllm/v1/engine/coordinator.py', 'vllm/v1/engine/core.py'],
+  paths: ['vllm/model_executor/models/llama.py', 'vllm/model_executor/layers/attention/attention.py', 'vllm/model_executor/layers/linear.py', 'vllm/model_executor/model_loader/__init__.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'

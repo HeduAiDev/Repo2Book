@@ -1,0 +1,266 @@
+{
+  "chapter_id": "ch22",
+  "title": "确立 vLLM v1 模型契约（以 Llama 为最简参考）",
+  "source_pin": "f3fef123",
+  "code_spine": [
+    "vllm/model_executor/model_loader/__init__.py:L128-L140  get_model() → get_model_loader() 按 load_format 选 loader，loader.load_model()",
+    "vllm/model_executor/model_loader/base_loader.py:L42-L82  BaseModelLoader.load_model()：set_default_torch_dtype + target_device 上下文 → initialize_model() 建空壳 → self.load_weights() → process_weights_after_loading() → model.eval()",
+    "vllm/model_executor/model_loader/utils.py:L40-L63  initialize_model()：get_model_architecture() 拿到模型类（LlamaForCausalLM），校验其 __init__ 接受 (vllm_config, prefix)，在 set_current_vllm_config() 内 model_class(vllm_config=..., prefix=...)",
+    "vllm/model_executor/models/llama.py:L515-L560  LlamaForCausalLM.__init__：从 vllm_config 取 hf_config/quant_config → _init_model() 建 LlamaModel → 末段 rank 建 ParallelLMHead + LogitsProcessor",
+    "vllm/model_executor/models/llama.py:L350-L390  LlamaModel.__init__：VocabParallelEmbedding + make_layers(num_hidden_layers, LlamaDecoderLayer) + 末段 RMSNorm",
+    "vllm/model_executor/models/llama.py:L253-L314  LlamaDecoderLayer.__init__：从 vllm_config 解包 config/cache_config/quant_config → self_attn=LlamaAttention + mlp=LlamaMLP + 两个 RMSNorm",
+    "vllm/model_executor/models/llama.py:L124-L221  LlamaAttention.__init__：TP 切头数 → QKVParallelLinear(qkv_proj) + RowParallelLinear(o_proj) + get_rope() + Attention(self.attn) 统一封装",
+    "vllm/model_executor/models/llama.py:L81-L121  LlamaMLP.__init__/forward：MergedColumnParallelLinear(gate_up_proj) + RowParallelLinear(down_proj) + SiluAndMul",
+    "vllm/model_executor/model_loader/default_loader.py:L376-L388  DefaultModelLoader.load_weights() → model.load_weights(self.get_all_weights(...)) 把磁盘上的 checkpoint 张量流喂给模型",
+    "vllm/model_executor/models/llama.py:L584-L589  LlamaForCausalLM.load_weights：AutoWeightsLoader 递归分发 → LlamaModel.load_weights",
+    "vllm/model_executor/models/llama.py:L436-L498  LlamaModel.load_weights：stacked_params_mapping 把 checkpoint 的 q/k/v_proj、gate/up_proj 名字重写成 qkv_proj/gate_up_proj 并带 shard_id 调用各层 weight_loader",
+    "vllm/model_executor/layers/linear.py:L1187-L1389  QKVParallelLinear.weight_loader：按 shard_id(q/k/v) 算 offset/size，对 q 用 tp_rank、对 k/v 用 tp_rank//num_kv_head_replicas，narrow 出本 rank 切片 copy 进 fused 参数",
+    "vllm/model_executor/layers/linear.py:L694-L868  MergedColumnParallelLinear.weight_loader：按 shard_id(0=gate,1=up) 算 offset/size，narrow 本 rank 切片填入 gate_up_proj",
+    "vllm/model_executor/layers/linear.py:L1499-L1532  RowParallelLinear.weight_loader：沿 input_dim 按 tp_rank narrow（行切分）",
+    "vllm/model_executor/model_loader/utils.py:L99-L122  process_weights_after_loading：先各层 quant_method.process_weights_after_loading()，再对 Attention 层调 module.process_weights_after_loading(dtype)",
+    "vllm/model_executor/models/llama.py:L395-L434  LlamaModel.forward：embed → 逐层 LlamaDecoderLayer(positions,hidden,residual) → 末 RMSNorm；前向数据流",
+    "vllm/model_executor/models/llama.py:L223-L233  LlamaAttention.forward：qkv_proj → split(q,k,v) → rotary_emb → self.attn(q,k,v) → o_proj",
+    "vllm/model_executor/layers/attention/attention.py:L409-L501  Attention.forward：reshape q/k/v → unified_kv_cache_update + unified_attention_with_output（自定义算子，经 forward_context 取 attn_metadata/kv_cache）"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/model_executor/models/llama.py",
+      "lines": "L501-L560",
+      "what": "LlamaForCausalLM —— 模型契约的顶层入口：类属性 packed_modules_mapping、(vllm_config, prefix) 构造、按 PP rank 建 lm_head/logits_processor",
+      "code": "class LlamaForCausalLM(\n    nn.Module, SupportsLoRA, SupportsPP, SupportsEagle, SupportsEagle3\n):\n    packed_modules_mapping = {\n        \"qkv_proj\": [\"q_proj\", \"k_proj\", \"v_proj\"],\n        \"gate_up_proj\": [\"gate_proj\", \"up_proj\"],\n    }\n\n    # LoRA specific attributes\n    embedding_modules = {\n        \"embed_tokens\": \"input_embeddings\",\n        \"lm_head\": \"output_embeddings\",\n    }\n\n    def __init__(\n        self,\n        *,\n        vllm_config: VllmConfig,\n        prefix: str = \"\",\n        layer_type: type[nn.Module] = LlamaDecoderLayer,\n    ):\n        super().__init__()\n        config = vllm_config.model_config.hf_config\n        quant_config = vllm_config.quant_config\n        self.config = config\n\n        self.model = self._init_model(\n            vllm_config=vllm_config,\n            prefix=maybe_prefix(prefix, \"model\"),\n            layer_type=layer_type,\n        )\n\n        if get_pp_group().is_last_rank:\n            self.lm_head = ParallelLMHead(\n                config.vocab_size,\n                config.hidden_size,\n                quant_config=quant_config,\n                prefix=maybe_prefix(prefix, \"lm_head\"),\n            )\n            if config.tie_word_embeddings:\n                self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)\n\n            logit_scale = getattr(config, \"logit_scale\", 1.0)\n            self.logits_processor = LogitsProcessor(\n                config.vocab_size, scale=logit_scale\n            )\n        else:\n            self.lm_head = PPMissingLayer()\n\n        self.make_empty_intermediate_tensors = (\n            self.model.make_empty_intermediate_tensors\n        )",
+      "elide": [
+        "embedding_modules 是 LoRA 用的子串映射，正文可一句带过",
+        "tie_word_embeddings / PP 非末段建 PPMissingLayer() 分支可简述：单卡 PP=1 走 is_last_rank=True 主路径"
+      ]
+    },
+    {
+      "path": "vllm/model_executor/models/llama.py",
+      "lines": "L350-L390",
+      "what": "LlamaModel.__init__ —— embedding + make_layers 堆叠 decoder + 末段 norm；@support_torch_compile 装饰整个 LlamaModel",
+      "code": "@support_torch_compile(\n    dynamic_arg_dims={\n        \"input_ids\": {0: \"b\"},\n        \"positions\": {0: \"b\"},\n        \"intermediate_tensors\": {0: \"b\"},\n        \"inputs_embeds\": {0: \"b\"},\n    },\n)\nclass LlamaModel(nn.Module, EagleModelMixin):\n    def __init__(\n        self,\n        *,\n        vllm_config: VllmConfig,\n        prefix: str = \"\",\n        layer_type: type[nn.Module] = LlamaDecoderLayer,\n    ):\n        super().__init__()\n\n        config = vllm_config.model_config.hf_config\n        quant_config = vllm_config.quant_config\n\n        self.config = config\n        self.quant_config = quant_config\n        self.vocab_size = config.vocab_size\n\n        if get_pp_group().is_first_rank or (\n            config.tie_word_embeddings and get_pp_group().is_last_rank\n        ):\n            self.embed_tokens = VocabParallelEmbedding(\n                self.vocab_size,\n                config.hidden_size,\n                quant_config=quant_config,\n            )\n        else:\n            self.embed_tokens = PPMissingLayer()\n        self.start_layer, self.end_layer, self.layers = make_layers(\n            config.num_hidden_layers,\n            lambda prefix: layer_type(vllm_config=vllm_config, prefix=prefix),\n            prefix=f\"{prefix}.layers\",\n        )\n        if get_pp_group().is_last_rank:\n            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)\n        else:\n            self.norm = PPMissingLayer()",
+      "elide": [
+        "@support_torch_compile 的 dynamic_arg_dims 标注 batch 维可动态，正文点到为止（torch.compile 是后续 custom-ops 章主题）",
+        "make_empty_intermediate_tensors_factory 为 PP 间传 hidden/residual 用，单卡可略",
+        "make_layers 内部按 PP 把 start..end 之外填 PPMissingLayer()，单卡 start=0 end=num_layers"
+      ]
+    },
+    {
+      "path": "vllm/model_executor/models/llama.py",
+      "lines": "L124-L182",
+      "what": "LlamaAttention.__init__ 上半 —— TP 切头数学 + 三个并行线性层的构造（QKV/o_proj）",
+      "code": "class LlamaAttention(nn.Module):\n    def __init__(\n        self,\n        config: LlamaConfig,\n        hidden_size: int,\n        num_heads: int,\n        num_kv_heads: int,\n        ...\n        prefix: str = \"\",\n        attn_type: str = AttentionType.DECODER,\n    ) -> None:\n        super().__init__()\n        layer_idx = extract_layer_index(prefix)\n        self.hidden_size = hidden_size\n        tp_size = get_tensor_model_parallel_world_size()\n        self.total_num_heads = num_heads\n        assert self.total_num_heads % tp_size == 0\n        self.num_heads = self.total_num_heads // tp_size\n        self.total_num_kv_heads = num_kv_heads\n        if self.total_num_kv_heads >= tp_size:\n            # Number of KV heads is greater than TP size, so we partition\n            # the KV heads across multiple tensor parallel GPUs.\n            assert self.total_num_kv_heads % tp_size == 0\n        else:\n            # Number of KV heads is less than TP size, so we replicate\n            # the KV heads across multiple tensor parallel GPUs.\n            assert tp_size % self.total_num_kv_heads == 0\n        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)\n\n        head_dim = getattr(config, \"head_dim\", None)\n        self.head_dim = head_dim or self.hidden_size // self.total_num_heads\n        self.q_size = self.num_heads * self.head_dim\n        self.kv_size = self.num_kv_heads * self.head_dim\n        self.scaling = self.head_dim**-0.5\n        self.max_position_embeddings = max_position_embeddings\n\n        self.qkv_proj = QKVParallelLinear(\n            hidden_size=hidden_size,\n            head_size=self.head_dim,\n            total_num_heads=self.total_num_heads,\n            total_num_kv_heads=self.total_num_kv_heads,\n            bias=bias,\n            quant_config=quant_config,\n            prefix=f\"{prefix}.qkv_proj\",\n        )\n\n        self.o_proj = RowParallelLinear(\n            input_size=self.total_num_heads * self.head_dim,\n            output_size=hidden_size,\n            bias=bias_o_proj,\n            quant_config=quant_config,\n            prefix=f\"{prefix}.o_proj\",\n        )",
+      "elide": [
+        "签名里的 max_position_embeddings/bias/bias_o_proj/cache_config/quant_config 略写为 ...",
+        "GQA 的 KV 复制分支（tp_size > total_num_kv_heads）可作脚注：Llama-3-8B 8 个 KV 头通常 tp_size<=8 不触发复制"
+      ]
+    },
+    {
+      "path": "vllm/model_executor/models/llama.py",
+      "lines": "L205-L233",
+      "what": "LlamaAttention：Attention 统一封装入口 + forward 主线（qkv→split→rope→attn→o_proj）",
+      "code": "        attn_cls = (\n            EncoderOnlyAttention\n            if attn_type == AttentionType.ENCODER_ONLY\n            else Attention\n        )\n\n        self.attn = attn_cls(\n            self.num_heads,\n            self.head_dim,\n            self.scaling,\n            num_kv_heads=self.num_kv_heads,\n            cache_config=cache_config,\n            quant_config=quant_config,\n            per_layer_sliding_window=sliding_window,\n            attn_type=attn_type,\n            prefix=f\"{prefix}.attn\",\n        )\n\n    def forward(\n        self,\n        positions: torch.Tensor,\n        hidden_states: torch.Tensor,\n    ) -> torch.Tensor:\n        qkv, _ = self.qkv_proj(hidden_states)\n        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)\n        q, k = self.rotary_emb(positions, q, k)\n        attn_output = self.attn(q, k, v)\n        output, _ = self.o_proj(attn_output)\n        return output",
+      "elide": [
+        "decoder-only 的 Llama attn_type 恒为 DECODER → attn_cls=Attention，EncoderOnlyAttention 分支可一句带过（嵌入模型才用）",
+        "qkv_proj 返回 (tensor, bias) 元组，bias 被 _ 丢弃（无 bias）"
+      ]
+    },
+    {
+      "path": "vllm/model_executor/models/llama.py",
+      "lines": "L316-L333",
+      "what": "LlamaDecoderLayer.forward —— pre-norm + fused add_residual 的 RMSNorm 协议（第二参 residual）",
+      "code": "    def forward(\n        self,\n        positions: torch.Tensor,\n        hidden_states: torch.Tensor,\n        residual: torch.Tensor | None,\n    ) -> tuple[torch.Tensor, torch.Tensor]:\n        # Self Attention\n        if residual is None:\n            residual = hidden_states\n            hidden_states = self.input_layernorm(hidden_states)\n        else:\n            hidden_states, residual = self.input_layernorm(hidden_states, residual)\n        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)\n\n        # Fully Connected\n        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)\n        hidden_states = self.mlp(hidden_states)\n        return hidden_states, residual",
+      "elide": [
+        "RMSNorm 的双参形态（hidden, residual）把残差加法 fuse 进 norm kernel，正文需点明：residual 在层间显式穿针引线，不是隐式 +="
+      ]
+    },
+    {
+      "path": "vllm/model_executor/models/llama.py",
+      "lines": "L436-L498",
+      "what": "LlamaModel.load_weights —— stacked_params_mapping 把 checkpoint 的独立 q/k/v、gate/up 重命名+带 shard_id 装入 fused 参数；否则走 default 路径",
+      "code": "    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:\n        stacked_params_mapping = [\n            # (param_name, shard_name, shard_id)\n            (\".qkv_proj\", \".q_proj\", \"q\"),\n            (\".qkv_proj\", \".k_proj\", \"k\"),\n            (\".qkv_proj\", \".v_proj\", \"v\"),\n            (\".gate_up_proj\", \".gate_proj\", 0),\n            (\".gate_up_proj\", \".up_proj\", 1),\n        ]\n        params_dict = dict(self.named_parameters())\n        loaded_params: set[str] = set()\n        for name, loaded_weight in weights:\n            if \"rotary_emb.inv_freq\" in name:\n                continue\n            ...\n            for param_name, weight_name, shard_id in stacked_params_mapping:\n                if weight_name not in name:\n                    continue\n                name = name.replace(weight_name, param_name)\n                # Skip loading extra bias for GPTQ models.\n                if name.endswith(\".bias\") and name not in params_dict:\n                    continue\n                if is_pp_missing_parameter(name, self):\n                    continue\n                param = params_dict[name]\n                weight_loader = param.weight_loader\n                weight_loader(param, loaded_weight, shard_id)\n                break\n            else:\n                # Skip loading extra bias for GPTQ models.\n                if name.endswith(\".bias\") and name not in params_dict:\n                    continue\n                if is_pp_missing_parameter(name, self):\n                    continue\n                param = params_dict[name]\n                weight_loader = getattr(param, \"weight_loader\", default_weight_loader)\n                weight_loader(param, loaded_weight)\n            loaded_params.add(name)\n        return loaded_params",
+      "elide": [
+        "rotary_emb.cos_cached/sin_cached、kv-scale/zero_point 重映射等量化/兼容分支用 ... 省略，正文一句概括：跳过非参数与量化 scale 的特例",
+        "for/else：for 内 break 表示命中 stacked 映射；未命中走 else 用 default_weight_loader 直装（embed/norm/lm_head 等非 fused 权重）"
+      ]
+    },
+    {
+      "path": "vllm/model_executor/layers/linear.py",
+      "lines": "L1005-L1060",
+      "what": "QKVParallelLinear.__init__ —— GQA 下 KV 头按 tp 切分或复制、把 q/k/v 三段宽度记进 output_sizes（沿 output 维 fuse）",
+      "code": "    def __init__(\n        self,\n        hidden_size: int,\n        head_size: int,\n        total_num_heads: int,\n        total_num_kv_heads: int | None = None,\n        ...\n    ):\n        self.hidden_size = hidden_size\n        self.head_size = head_size\n        self.v_head_size = v_head_size if v_head_size is not None else head_size\n        self.total_num_heads = total_num_heads\n        if total_num_kv_heads is None:\n            total_num_kv_heads = total_num_heads\n        self.total_num_kv_heads = total_num_kv_heads\n        # Divide the weight matrix along the last dimension.\n        tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1\n        self.num_heads = divide(self.total_num_heads, tp_size)\n        if tp_size >= self.total_num_kv_heads:\n            self.num_kv_heads = 1\n            self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)\n        else:\n            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)\n            self.num_kv_head_replicas = 1\n        input_size = self.hidden_size\n        output_size = (\n            self.num_heads * self.head_size\n            + self.num_kv_heads * self.head_size\n            + self.num_kv_heads * self.v_head_size\n        ) * tp_size\n        self.output_sizes = [\n            self.num_heads * self.head_size * tp_size,  # q_proj\n            self.num_kv_heads * self.head_size * tp_size,  # k_proj\n            self.num_kv_heads * self.v_head_size * tp_size,  # v_proj\n        ]\n\n        super().__init__(\n            input_size=input_size,\n            output_size=output_size,\n            ...\n        )",
+      "elide": [
+        "v_head_size 默认等于 head_size（Llama 用），MLA 等才区分 → 正文统一用 head_size",
+        "super().__init__ 的完整 kwargs 省略；关键是 output_sizes 三段交给 ColumnParallelLinear 切 partition"
+      ]
+    },
+    {
+      "path": "vllm/model_executor/layers/linear.py",
+      "lines": "L436-L461",
+      "what": "ColumnParallelLinear.__init__ —— 沿 output(列) 维按 tp_size 切分；output_sizes 存在时逐段切",
+      "code": "    def __init__(\n        self,\n        input_size: int,\n        output_size: int,\n        ...\n    ):\n        # Divide the weight matrix along the last dimension.\n        self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0\n        self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1\n        self.input_size_per_partition = input_size\n        self.output_size_per_partition = divide(output_size, self.tp_size)\n        self.output_partition_sizes = [self.output_size_per_partition]\n        # If QKV or MergedColumn, use output size of each partition.\n        if hasattr(self, \"output_sizes\"):\n            self.output_partition_sizes = [\n                divide(output_size, self.tp_size) for output_size in self.output_sizes\n            ]",
+      "elide": [
+        "create_weights/bias/quant_method 分配权重的细节用 ... 略；核心是列切分 = output_size//tp_size，input 不切"
+      ]
+    },
+    {
+      "path": "vllm/model_executor/layers/linear.py",
+      "lines": "L1304-L1389",
+      "what": "QKVParallelLinear.weight_loader 的 v1 装载主路径 —— 按 shard_id 算 fused 参数内 offset/size，再按 rank narrow 出磁盘切片",
+      "code": "        assert loaded_shard_id in [\"q\", \"k\", \"v\"]\n\n        # If output dim is defined, use the default loading process.\n        if output_dim is not None:\n            if loaded_shard_id == \"q\":\n                shard_offset = 0\n                shard_size = self.num_heads * self.head_size\n            elif loaded_shard_id == \"k\":\n                shard_offset = self.num_heads * self.head_size\n                shard_size = self.num_kv_heads * self.head_size\n            elif loaded_shard_id == \"v\":\n                shard_offset = (self.num_heads + self.num_kv_heads) * self.head_size\n                shard_size = self.num_kv_heads * self.v_head_size\n            ...\n            param_data = param_data.narrow(output_dim, shard_offset, shard_size)\n            if loaded_shard_id == \"q\":\n                shard_rank = self.tp_rank\n            else:\n                shard_rank = self.tp_rank // self.num_kv_head_replicas\n            start_idx = shard_rank * shard_size\n\n            if not is_sharded_weight:\n                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)\n        ...\n        assert param_data.shape == loaded_weight.shape\n        param_data.copy_(loaded_weight)",
+      "elide": [
+        "BlockQuantScale/packed_dim/Marlin/bitsandbytes 量化分支用 ... 省略——正文只讲非量化主路径",
+        "loaded_shard_id is None（磁盘已 fuse 的 Phi-3 式 qkv）分支可一句带过：拆成 q/k/v 递归调用",
+        "关键对比：q 用 tp_rank，k/v 用 tp_rank//num_kv_head_replicas → GQA 复制时多个 q-rank 共享同一份 kv 切片"
+      ]
+    },
+    {
+      "path": "vllm/model_executor/layers/linear.py",
+      "lines": "L1543-L1570",
+      "what": "RowParallelLinear.forward —— 行切分 + all_reduce 把各 rank 部分和归约（o_proj/down_proj 的归约点）",
+      "code": "    def forward(\n        self,\n        input_,\n    ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:\n        if self.input_is_parallel:\n            input_parallel = input_\n        else:\n            split_input = split_tensor_along_last_dim(\n                input_, num_partitions=self.tp_size\n            )\n            input_parallel = split_input[self.tp_rank].contiguous()\n\n        # Matrix multiply.\n        assert self.quant_method is not None\n        # Only fuse bias add into GEMM for rank 0 (this ensures that\n        # bias will not get added more than once in TP>1 case)\n        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias\n        output_parallel = self.quant_method.apply(self, input_parallel, bias_)\n\n        if self.reduce_results and self.tp_size > 1:\n            output = tensor_model_parallel_all_reduce(output_parallel)\n        else:\n            output = output_parallel\n        ...\n        return output, output_bias",
+      "elide": [
+        "input_is_parallel=True（来自 ColumnParallel 的列切输出）是默认路径；正文点明：列并行产出已切好的 input 直接喂行并行，无需再切",
+        "bias 只在 rank0 加、其余 rank 加完 all_reduce 会重复——这是 TP 正确性细节"
+      ]
+    },
+    {
+      "path": "vllm/model_executor/layers/attention/attention.py",
+      "lines": "L177-L207",
+      "what": "Attention 统一封装层的职责声明与构造签名（num_heads/head_size/scale/num_kv_heads/prefix）",
+      "code": "class Attention(nn.Module, AttentionLayerBase):\n    \"\"\"Attention layer.\n\n    This class takes query, key, and value tensors as input. The input tensors\n    can either contain prompt tokens or generation tokens.\n    The class does the following:\n\n    1. Store the input key and value tensors in the KV cache.\n    2. Perform (multi-head/multi-query/grouped-query) attention.\n    3. Return the output tensor.\n    \"\"\"\n\n    def __init__(\n        self,\n        num_heads: int,\n        head_size: int,\n        scale: float,\n        num_kv_heads: int | None = None,\n        ...\n        prefix: str = \"\",\n        attn_type: str = AttentionType.DECODER,\n        ...\n    ) -> None:",
+      "elide": [
+        "大量量化/sliding_window/alibi/backend 选择 kwargs 用 ... 省略——正文只讲：Attention 把 backend 选择(get_attn_backend)与 KV cache 收口，模型定义只需给 heads/scale"
+      ]
+    },
+    {
+      "path": "vllm/model_executor/layers/attention/attention.py",
+      "lines": "L366-L387",
+      "what": "Attention 把自身注册进 static_forward_context（按 layer_name=prefix）——prefix 即 KV cache 与 attn_metadata 的寻址键",
+      "code": "        compilation_config = vllm_config.compilation_config\n        if prefix in compilation_config.static_forward_context:\n            raise ValueError(f\"Duplicate layer name: {prefix}\")\n        compilation_config.static_forward_context[prefix] = self\n        self.attn_type = attn_type\n        ...\n        # use a placeholder kv cache tensor during init, which will be replaced\n        # by bind_kv_cache\n        self.kv_cache = torch.tensor([])\n\n        # Initialize KV cache quantization attributes\n        _init_kv_cache_quant(self, quant_config, prefix)",
+      "elide": [
+        "kv_sharing_target / query_quant 等分支省略；核心：prefix 唯一标识本层 → forward 时经 forward_context 按 layer_name 取回 kv_cache/attn_metadata（呼应 (vllm_config, prefix) 契约的 prefix 用途）"
+      ]
+    }
+  ],
+  "key_classes": [
+    {"name": "LlamaForCausalLM", "file": "vllm/model_executor/models/llama.py", "responsibility": "顶层模型契约入口：(vllm_config, prefix) 构造，持有类属性 packed_modules_mapping，建 self.model + lm_head + logits_processor；forward 透传给 self.model，compute_logits 经 lm_head 出 logits；load_weights 用 AutoWeightsLoader 分发"},
+    {"name": "LlamaModel", "file": "vllm/model_executor/models/llama.py", "responsibility": "embedding + make_layers 堆叠 N 个 LlamaDecoderLayer + 末段 RMSNorm；前向 embed→逐层→norm；load_weights 持有 stacked_params_mapping 把 q/k/v、gate/up fuse 装载；被 @support_torch_compile 包裹"},
+    {"name": "LlamaDecoderLayer", "file": "vllm/model_executor/models/llama.py", "responsibility": "单层 transformer block：self_attn(LlamaAttention)+mlp(LlamaMLP)+两个 RMSNorm；forward 走 pre-norm + 显式 residual 穿针；从 vllm_config 解包 config/cache/quant"},
+    {"name": "LlamaAttention", "file": "vllm/model_executor/models/llama.py", "responsibility": "注意力子模块：TP 切头数学，构造 qkv_proj(QKVParallelLinear)+o_proj(RowParallelLinear)+rotary_emb(get_rope)+attn(Attention 统一封装)；forward: qkv→split→rope→attn→o_proj"},
+    {"name": "LlamaMLP", "file": "vllm/model_executor/models/llama.py", "responsibility": "前馈子模块：gate_up_proj(MergedColumnParallelLinear)+down_proj(RowParallelLinear)+SiluAndMul；列并行升维→SiLU 门控→行并行降维归约"},
+    {"name": "Attention", "file": "vllm/model_executor/layers/attention/attention.py", "responsibility": "统一注意力封装：吸收 backend 选择(get_attn_backend)、KV cache 存储/量化、按 prefix 注册进 static_forward_context；forward 经自定义算子 unified_attention_with_output 经 forward_context 取 attn_metadata/kv_cache，对模型定义透明"},
+    {"name": "ColumnParallelLinear", "file": "vllm/model_executor/layers/linear.py", "responsibility": "列并行线性层：权重沿 output 维按 tp_size 切，output_size_per_partition=output_size//tp_size，input 不切；weight_loader 按 tp_rank narrow 出本 rank 列切片；forward 可选 gather_output"},
+    {"name": "MergedColumnParallelLinear", "file": "vllm/model_executor/layers/linear.py", "responsibility": "ColumnParallel 子类：把多段(gate,up)沿 output 维 fuse，按 output_sizes 各自切分；weight_loader 带 shard_id(0/1) 定位段 offset 再按 rank narrow"},
+    {"name": "QKVParallelLinear", "file": "vllm/model_executor/layers/linear.py", "responsibility": "ColumnParallel 子类：把 q/k/v fuse 成一个权重；GQA 下 KV 头数<tp 时复制(num_kv_head_replicas)否则切分；weight_loader 按 shard_id(q/k/v) 定位段，q 用 tp_rank、k/v 用 tp_rank//replicas"},
+    {"name": "RowParallelLinear", "file": "vllm/model_executor/layers/linear.py", "responsibility": "行并行线性层：权重沿 input 维按 tp_size 切，input_size_per_partition=input_size//tp_size；forward 后 all_reduce 归约各 rank 部分和；bias 只在 rank0 加避免重复"},
+    {"name": "LinearBase", "file": "vllm/model_executor/layers/linear.py", "responsibility": "线性层基类：持 quant_method(默认 UnquantizedLinearMethod)，统一 forward 经 quant_method.apply 做 GEMM；记 tp_rank/tp_size"},
+    {"name": "DefaultModelLoader / BaseModelLoader", "file": "vllm/model_executor/model_loader/default_loader.py, base_loader.py", "responsibility": "load_model 编排：initialize_model 建空壳→load_weights(get_all_weights 流式喂 checkpoint)→process_weights_after_loading→eval；load_weights 调 model.load_weights 并可 track 已加载参数集"},
+    {"name": "AutoWeightsLoader", "file": "vllm/model_executor/models/utils.py", "responsibility": "递归权重分发器：按子模块名匹配，遇到自带 load_weights 的子模块(如 LlamaModel)就委派；支持 skip_prefixes(tie 时跳 lm_head)"}
+  ],
+  "data_flow": [
+    {"step": 1, "where": "vllm/model_executor/model_loader/__init__.py:get_model", "what": "按 load_config.load_format 取 DefaultModelLoader，调 load_model(vllm_config, model_config, prefix)"},
+    {"step": 2, "where": "base_loader.py:BaseModelLoader.load_model", "what": "set_default_torch_dtype + 在 target_device 上下文里 initialize_model() 建空壳模型（参数尚未填值）"},
+    {"step": 3, "where": "utils.py:initialize_model", "what": "get_model_architecture 拿 LlamaForCausalLM，校验其 __init__ 接受 (vllm_config, prefix)，在 set_current_vllm_config 内实例化 → 触发 LlamaForCausalLM→LlamaModel→DecoderLayer→{Attention,MLP} 四级嵌套构造，各并行线性层在构造时即按 tp_rank/tp_size 分配自己那份空参数"},
+    {"step": 4, "where": "default_loader.py:load_weights", "what": "model.load_weights(get_all_weights(...))：把磁盘 checkpoint 的 (name, tensor) 流喂给 LlamaForCausalLM.load_weights"},
+    {"step": 5, "where": "llama.py:LlamaForCausalLM.load_weights", "what": "AutoWeightsLoader 递归，遇 self.model 委派给 LlamaModel.load_weights；tie 时 skip lm_head"},
+    {"step": 6, "where": "llama.py:LlamaModel.load_weights", "what": "对每个 checkpoint 权重名：若匹配 stacked_params_mapping(.q_proj→.qkv_proj 等) 则重写名并带 shard_id 调该 fused 参数的 weight_loader；否则 default_weight_loader 直装"},
+    {"step": 7, "where": "linear.py:QKVParallelLinear.weight_loader / MergedColumnParallelLinear.weight_loader", "what": "按 shard_id 算 fused 参数内 offset/size，再按 tp_rank narrow 出本 rank 的磁盘切片 copy 进去——一次完成 fuse + TP 切分"},
+    {"step": 8, "where": "utils.py:process_weights_after_loading", "what": "各层 quant_method.process_weights_after_loading（重排 kernel 格式）；对 Attention 层调 module.process_weights_after_loading(dtype)（初始化/校正 kv scale）；model.eval()"},
+    {"step": 9, "where": "llama.py:LlamaModel.forward (运行期)", "what": "embed_input_ids → 逐层 LlamaDecoderLayer(positions, hidden, residual) → 末 RMSNorm；input_ids/positions/inputs_embeds 由 model runner 喂入"},
+    {"step": 10, "where": "llama.py:LlamaAttention.forward", "what": "qkv_proj(列并行,产本 rank 的 q/k/v)→split→rotary_emb→self.attn(Attention)→o_proj(行并行+all_reduce)"},
+    {"step": 11, "where": "attention/attention.py:Attention.forward", "what": "reshape q/k/v→unified_kv_cache_update 写 KV cache + unified_attention_with_output；二者经 forward_context 按 layer_name(prefix) 取 attn_metadata/kv_cache，再 self.impl.forward 调具体 backend"}
+  ],
+  "design_decisions": [
+    {"decision": "(vllm_config, prefix) 统一构造契约：所有 v1 模型类 __init__ 只接受 vllm_config 与 prefix 两个关键字参数", "why": "把全局配置收口成单一对象，模型从中自取 hf_config/quant_config/cache_config；prefix 编码模块在 state-dict 中的全路径，既用于权重名匹配，也用于 Attention 注册 static_forward_context 的 layer_name。initialize_model 显式校验该签名，老式签名走 deprecation 兼容路径", "evidence": "vllm/model_executor/model_loader/utils.py:L56-L63; vllm/model_executor/models/llama.py:L515-L531"},
+    {"decision": "prefix 既是权重名又是 KV cache/metadata 寻址键", "why": "make_layers 用 f'{prefix}.layers.{idx}' 命名每层，逐级下传到 qkv_proj/o_proj/attn；Attention 把 prefix 作 layer_name 注册进 static_forward_context，运行期 forward_context 据此取回本层 kv_cache 与 attn_metadata——一根 prefix 串起静态权重与动态缓存", "evidence": "vllm/model_executor/models/utils.py:L644-L650; vllm/model_executor/layers/attention/attention.py:L366-L384"},
+    {"decision": "QKV 三投影 fuse 成单个 QKVParallelLinear、gate/up fuse 成 MergedColumnParallelLinear", "why": "把三次(两次)小 GEMM 合成一次大 GEMM 提升带宽利用与 kernel 效率；fuse 与 TP 列切分天然兼容（每段独立按 output 维切）。代价是 checkpoint 里是分开的 q/k/v、gate/up，需 stacked_params_mapping + shard_id 在装载时重组", "evidence": "vllm/model_executor/models/llama.py:L164-L180, L94-L110; vllm/model_executor/layers/linear.py:L1043-L1047"},
+    {"decision": "列并行(QKV/gate_up)接行并行(o_proj/down_proj)的成对结构，归约只在行并行末尾发生一次", "why": "ColumnParallel 输出已沿 head/intermediate 维切好(input_is_parallel)，直接喂 RowParallel 无需通信；RowParallel 在 forward 末用 all_reduce 把各 rank 部分和汇总。整个 attention/MLP 子块内通信被压到一次 all_reduce", "evidence": "vllm/model_executor/layers/linear.py:L1547-L1563; vllm/model_executor/models/llama.py:L228-L232"},
+    {"decision": "GQA 下 KV 头数小于 TP size 时复制而非切分（num_kv_head_replicas）", "why": "KV 头数(如 8)可能小于 tp_size，无法整切；此时 num_kv_heads=1，num_kv_head_replicas=tp//total_kv，多个 q-rank 共享同一份 K/V。weight_loader 对 k/v 用 tp_rank//num_kv_head_replicas 定位，保证复制 rank 拿到同一磁盘切片", "evidence": "vllm/model_executor/layers/linear.py:L1031-L1036, L1364-L1372"},
+    {"decision": "Attention 作统一封装入口，吸收 backend 选择与 KV cache，模型定义对后端无感", "why": "LlamaAttention 只给 num_heads/head_size/scale/num_kv_heads；Attention 内部 get_attn_backend 选 FlashAttn/Triton 等、管 KV cache 与量化 scale、注册 forward_context。模型代码不碰 backend 细节，换后端不改模型——这是 vLLM 支持多模型×多后端的解耦点", "evidence": "vllm/model_executor/layers/attention/attention.py:L298-L308, L344-L357, L177-L187"},
+    {"decision": "RMSNorm 采用 (hidden, residual) 双参形态，把残差加法 fuse 进 norm，residual 在层间显式传递", "why": "pre-norm transformer 里 residual 不是隐式 x+=，而是显式张量沿层链穿针；第一层 residual=None 时取 hidden 初始化。fuse add+norm 省一次 kernel 启动与一次显存往返", "evidence": "vllm/model_executor/models/llama.py:L316-L333"},
+    {"decision": "权重装载三段式 initialize_model → load_weights → process_weights_after_loading，且 load_weights 流式消费 checkpoint", "why": "先建空壳（参数按 TP 分好形状但未填值），再流式喂 checkpoint（边读边切边填，峰值显存可控），最后 process 阶段做 kernel 重排与 kv scale 初始化。三段职责清晰、与量化/PP/TP 正交", "evidence": "vllm/model_executor/model_loader/base_loader.py:L53-L82; vllm/model_executor/model_loader/utils.py:L99-L122"},
+    {"decision": "AutoWeightsLoader 递归委派 + stacked_params_mapping 的 for/else 双路", "why": "顶层 AutoWeightsLoader 按子模块名递归，遇自带 load_weights 的 LlamaModel 即委派，使复合模型(带 adapter/draft)可复用；LlamaModel 内 for 命中 stacked 映射走 fused 装载(break)，未命中走 else 用 default_weight_loader 直装 embed/norm/lm_head 等非 fused 权重", "evidence": "vllm/model_executor/models/utils.py:L342-L356; vllm/model_executor/models/llama.py:L471-L497"},
+    {"decision": "Llama 作最简基线：无压缩/无专家/无潜在瓶颈/无混合计算残差", "why": "Llama 是后续所有模型章(custom ops、DeepSeek-V4)的对照基准。显式标注其'缺'什么，让 DeepSeek-V4 章把每个新增(MLA latent bottleneck、MoE experts、量化压缩、hybrid 残差)作为对 Llama 的 delta 引入", "evidence": "outline-final.json ch22 scope contrast hook; 全文无 MoE/MLA/quant-fuse 结构"}
+  ],
+  "theory": [
+    {"topic": "TP 列切分 vs 行切分的形状与通信代价", "content": "ColumnParallel：W∈R^{in×out} 沿 out 切成 tp 份，每 rank 持 W_i∈R^{in×(out/tp)}，输出 Y_i=XW_i 已沿 out 维切；无 forward 通信。RowParallel：W 沿 in 切成 W_i∈R^{(in/tp)×out}，输入 X_i 已切，Y_i=X_iW_i 是部分和，需 all_reduce 求 Y=ΣY_i。一个 attention/MLP 子块=列并行(无通信)+行并行(1 次 all_reduce)，单层通信量 O(batch×seq×hidden)"},
+    {"topic": "QKV fuse 后的内存布局与 shard_id offset 公式", "content": "fused qkv 权重沿 output 维布局为 [q段 | k段 | v段]，每 rank 段宽 = num_heads×head_size(q)、num_kv_heads×head_size(k)、num_kv_heads×v_head_size(v)。weight_loader 按 shard_id 取 offset：q→0、k→num_heads×head_size、v→(num_heads+num_kv_heads)×head_size，size 为各自段宽；再按 rank 在磁盘全量上 narrow(start_idx=shard_rank×shard_size)。GQA 复制时 k/v 的 shard_rank=tp_rank//num_kv_head_replicas"},
+    {"topic": "GQA 的 num_kv_heads / num_kv_head_replicas 推导", "content": "设 total_num_kv_heads=K、tp_size=P。若 K≥P：num_kv_heads=K/P，replicas=1（正常切分）。若 K<P：num_kv_heads=1，replicas=P/K（复制），即每 K 个连续 rank 共享一份 KV。Llama-3-8B K=8，常见 P≤8 故多走切分；P=8 时每 rank 恰 1 个 KV 头"},
+    {"topic": "四级模块嵌套与 prefix 串联", "content": "LlamaForCausalLM(prefix='') → model(prefix='model') → layers.{i}(prefix='model.layers.{i}') → self_attn(prefix='model.layers.{i}.self_attn') → qkv_proj/attn(prefix='....qkv_proj'/'....attn')。prefix 既是 state-dict 权重名前缀（决定 checkpoint 匹配），也是 Attention 在 static_forward_context 的 key（决定运行期 kv_cache/metadata 寻址）"}
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {"what": "GGUF 相关全部分支：is_gguf_weight / is_gguf_weight_type / materialize / data_container（linear.py 各 weight_loader 内；llama.py load_weights 的 rotary_emb.cos_cached/sin_cached skip）", "why_safe": "GGUF 是特定量化格式，与 Llama BF16 主线无关；精简版只跑非量化 safetensors，删后主路径 copy_ 不变"},
+      {"what": "量化分支：BlockQuantScaleParameter / packed_dim / packed_factor / adjust_marlin_shard / adjust_block_scale_shard / use_bitsandbytes_4bit / needs_scalar_to_array / adjust_scalar_to_fused_array（各 weight_loader 内）", "why_safe": "精简版 quant_config=None 走 UnquantizedLinearMethod，这些分支恒不触发；删后非量化 narrow+copy 主路径完整"},
+      {"what": "weight_loader_v2 / load_column_parallel_weight / load_row_parallel_weight / BasevLLMParameter 体系及 WEIGHT_LOADER_V2_SUPPORTED 选择逻辑", "why_safe": "v2 loader 仅量化方法(Fp8/AWQ/GPTQ 等)走；非量化用 v1 weight_loader，create_weights 的 weight_loader 选择恒选 v1。精简版只留 v1"},
+      {"what": "Attention.__init__ 的 KV cache 量化(_init_kv_cache_quant 内 should_load_quant_weights 分支)、query_quant/QuantFP8、kv_cache_dtype_skip_layers、calculate_kv_scales、alibi_sqrt、prefix-caching+batch-invariant 警告", "why_safe": "均为量化/特殊 backend/sink 路径；BF16 Llama 不触发。保留 backend 选择、static_forward_context 注册、kv_cache 占位与 reshape 主线即可"},
+      {"what": "Attention.forward 的 use_direct_call=False 分支(torch.ops.vllm.* 包装)，只保留 use_direct_call=True 的直接调用路径", "why_safe": "二者语义等价(一个走 custom op、一个直调)；精简版选其一即可示意 unified_kv_cache_update + unified_attention_with_output 两步，不必两路都留"},
+      {"what": "PP(pipeline parallel)相关：PPMissingLayer / is_pp_missing_parameter / get_pp_group().is_first/last_rank 的非主分支 / make_empty_intermediate_tensors / intermediate_tensors 在 forward 的 PP 路径 / make_layers 的 start..end 之外填充", "why_safe": "精简版聚焦单 PP-stage(world=1)，is_first=is_last=True 恒成立，PP 占位层从不命中；删后 forward 主线 embed→layers→norm 完整"},
+      {"what": "EncoderOnlyAttention 分支 / attn_type==ENCODER_ONLY / is_causal=False / Bidirectional 子类(LlamaBidirectional*)", "why_safe": "Llama 解码器恒 DECODER；嵌入模型变体不在本章范围。保留 attn_type=DECODER 主线"},
+      {"what": "Eagle/Eagle3/draft 相关：EagleModelMixin._maybe_add_hidden_state / aux_hidden_states / SupportsEagle* / target_layer_count 的 layer_types 调整 / layer_type 可替换参数", "why_safe": "投机解码 draft 模型特性，与基线推理无关；删后 forward 返回单 hidden_states 主路径完整"},
+      {"what": "LoRA 相关：SupportsLoRA / embedding_modules / packed_modules_mapping 仅作为类属性保留其值但删去 LoRA 用途说明分支", "why_safe": "packed_modules_mapping 本身要 must_keep（解释 fuse 来源）；但 LoRA 注入逻辑不在本章，类属性留值即可"},
+      {"what": "logits_soft_cap / per_layer_sliding_window 非 None 分支 / layer_types sliding_attention / get_quant_config 覆写 / _maybe_allow_fp8_block_shape_mismatch", "why_safe": "Llama 标准配置无 soft cap、无 sliding window、无 fp8 block；这些分支恒为默认值，删后构造主线不变"}
+    ],
+    "must_keep": [
+      {"symbol": "LlamaForCausalLM", "why": "顶层契约入口，读者必须看到 (vllm_config, prefix) 构造与 self.model/lm_head 组织"},
+      {"symbol": "LlamaModel", "why": "embedding+堆叠+norm 的容器，承载 stacked_params_mapping 装载逻辑"},
+      {"symbol": "LlamaDecoderLayer", "why": "单层 block，pre-norm+residual 协议在此体现"},
+      {"symbol": "LlamaAttention", "why": "TP 切头 + qkv/o_proj + rope + Attention 封装的汇合点"},
+      {"symbol": "LlamaMLP", "why": "gate_up/down + SiluAndMul，列并行接行并行的最简范例"},
+      {"symbol": "packed_modules_mapping", "why": "声明 qkv_proj←q/k/v、gate_up_proj←gate/up 的 fuse 来源，writer 需据此讲清装载重命名"},
+      {"symbol": "stacked_params_mapping", "why": "load_weights 核心：把 checkpoint 独立投影名重写并带 shard_id，读者必须理解这步"},
+      {"symbol": "QKVParallelLinear", "why": "QKV fuse + GQA 切分/复制的关键类"},
+      {"symbol": "MergedColumnParallelLinear", "why": "gate/up fuse 的列并行类"},
+      {"symbol": "ColumnParallelLinear", "why": "列切分基类，output_size_per_partition 的来源"},
+      {"symbol": "RowParallelLinear", "why": "行切分 + all_reduce 归约，TP 通信点"},
+      {"symbol": "Attention", "why": "统一封装入口，吸收 backend/KV cache，模型定义与后端解耦的核心"},
+      {"symbol": "weight_loader", "why": "各并行线性层的装载方法名，lint 需见其按 shard_id/tp_rank narrow"},
+      {"symbol": "num_kv_head_replicas", "why": "GQA 复制语义的可检测符号，k/v 装载 rank 计算依赖它"},
+      {"symbol": "output_sizes", "why": "fused 层各段宽度，切 partition 与算 offset 的依据"},
+      {"symbol": "get_rope", "why": "rotary embedding 工厂，LlamaAttention 必用"},
+      {"symbol": "tensor_model_parallel_all_reduce", "why": "RowParallel forward 的归约调用，TP 正确性可检测点"},
+      {"symbol": "get_tensor_model_parallel_world_size", "why": "TP 切分的 tp_size 来源"},
+      {"symbol": "initialize_model", "why": "三段式装载第一段：建空壳并校验 (vllm_config, prefix) 签名"},
+      {"symbol": "process_weights_after_loading", "why": "三段式第三段：kernel 重排 + Attention kv scale 初始化"},
+      {"symbol": "AutoWeightsLoader", "why": "递归权重分发器，顶层 load_weights 委派机制"},
+      {"symbol": "default_weight_loader", "why": "非 fused 权重(embed/norm/lm_head)的直装路径，for/else 的 else 分支"},
+      {"symbol": "make_layers", "why": "按 prefix 命名堆叠 decoder layer，prefix 串联的体现"},
+      {"symbol": "maybe_prefix", "why": "prefix 拼接工具，模块命名契约的一环"},
+      {"symbol": "extract_layer_index", "why": "从 prefix 解析层号，attention 构造需要"},
+      {"symbol": "RMSNorm", "why": "pre-norm + fused residual 的归一化层"},
+      {"symbol": "SiluAndMul", "why": "MLP 门控激活，gate_up 拆两半相乘"},
+      {"symbol": "VocabParallelEmbedding", "why": "词嵌入并行层，模型入口"},
+      {"symbol": "ParallelLMHead", "why": "输出投影层，compute_logits 用"}
+    ]
+  },
+  "diagram_plan": [
+    {
+      "name": "module-nesting",
+      "title": "四级模块嵌套与 prefix 串联",
+      "spec": "树形图：LlamaForCausalLM(prefix='') → [model: LlamaModel, lm_head: ParallelLMHead] → LlamaModel → [embed_tokens, layers.0..N-1: LlamaDecoderLayer, norm] → LlamaDecoderLayer → [input_layernorm, self_attn: LlamaAttention, post_attention_layernorm, mlp: LlamaMLP] → LlamaAttention → [qkv_proj: QKVParallelLinear, rotary_emb, attn: Attention, o_proj: RowParallelLinear] → LlamaMLP → [gate_up_proj: MergedColumnParallelLinear, act_fn: SiluAndMul, down_proj: RowParallelLinear]。每个节点标注其 prefix(如 model.layers.0.self_attn.qkv_proj)，右侧注明 prefix 同时是权重名前缀与(Attention 处)KV cache key",
+      "engine": "svg-diagram (graphviz/tree)"
+    },
+    {
+      "name": "tp-sharding-flow",
+      "title": "TP 列并行接行并行：一个 attention 子块内的切分与归约",
+      "spec": "横向数据流：hidden_states(全量) →[QKVParallelLinear 列切, 各 rank 持 q/k/v 部分头]→ q_i,k_i,v_i →[rope]→[Attention 本 rank 头]→ attn_out_i →[RowParallelLinear o_proj 行切]→ partial_i →[all_reduce]→ output(全量)。上方标注 ColumnParallel=沿 output 切/无通信，RowParallel=沿 input 切/末尾 1 次 all_reduce。用 2 个 rank(tp=2)示意，画出权重矩阵被切成两块的色块",
+      "engine": "svg-diagram"
+    },
+    {
+      "name": "weight-load-pipeline",
+      "title": "权重装载三段式与 qkv fuse",
+      "spec": "三阶段泳道：(1) initialize_model 建空壳[qkv_proj 空参数, 形状已按 tp 切]；(2) load_weights：checkpoint 中独立 q_proj/k_proj/v_proj 经 stacked_params_mapping 重命名→qkv_proj + shard_id(q/k/v)，weight_loader 按 offset+tp_rank narrow 切片填入 fused 参数对应段；(3) process_weights_after_loading: kernel 重排 + Attention kv scale。中央画 fused qkv 参数 [q段|k段|v段] 三色块，三个 checkpoint 张量箭头各指向对应段",
+      "engine": "svg-diagram"
+    }
+  ],
+  "roadmap_highlight": {
+    "node": "model-definitions",
+    "label": "模型定义层",
+    "context": "Part VI 模型层开篇。上游：ch20/ch21 model runner 把 input_ids/positions/inputs_embeds 喂入；本章确立 (vllm_config, prefix) 契约 + TP 线性层 + Attention 封装 + 权重装载；下游：custom-ops 章与 DeepSeek-V4 章在此基线上叠加 MLA/MoE/量化等 delta"
+  },
+  "foreshadow_due": {
+    "bury": [],
+    "recover": [],
+    "note": "scripts/bible.py due ch22 返回空(无应埋/应回收登记)。本章为 Part VI 开篇基线，建议埋设供后续模型章回收的伏笔(非强制，由 writer/archivist 决定)：(a) Llama '缺'压缩/专家/潜在瓶颈/混合残差 → DeepSeek-V4 章作 delta 回收；(b) Attention 统一封装抽象 backend → custom-ops 章回收；(c) packed_modules_mapping/stacked_params_mapping fuse 模式 → 后续异构模型权重装载回收。"
+  }
+}
