@@ -14,14 +14,15 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch25',
-  slug: 'ch25-model-architecture',
-  focus: 'capstone 模型解读: 把 DeepSeek-V4 当作对 Llama 基线(ch22)的一叠 delta 端到端拼起来。(1) 骨架 DeepseekV4ForCausalLM/Model/DecoderLayer 与 Llama 的同构与差异; (2) MLA 注意力(DeepseekV4Attention: 低秩 KV 压缩 q_lora/kv_lora、解耦 RoPE)对标准 MHA 的 delta; (3) MoE(DeepseekV4MoE/MegaMoEExperts: 路由 top-k 专家 + 共享专家 + FusedMoE)对 dense MLP 的 delta; (4) MTP(deepseek_v4_mtp 多 token 预测头) 与混合残差。回收 f16(Llama 刻意缺的 MoE/MLA/量化作为对 Llama 的 delta 回收)',
+  chapter_id: 'ch26',
+  slug: 'ch26-model-architecture',
+  focus: '方法论章(无精简版): 把 DeepSeek-V4 源码(ch25)转成精确架构图的可复用流程。教一套可照搬的 code→diagram 程序: 从 (vllm_config,prefix) 构造函数读出 submodule 树 → 识别每层 nn.Module 子模块与命名 → 跟 forward 画数据流向 → 标注张量形状变化 → 用泳道/层级/对照布局组织成图。以 DeepSeek-V4(MLA/MoE/MTP)为 worked example, 产出架构图并逐一讲每个图元怎么从源码推出来。强调"读代码画图"是可迁移技能',
   highlight: 'model-architecture',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
-  paths: ['vllm/model_executor/models/deepseek_v4.py', 'vllm/model_executor/layers/fused_moe/layer.py', 'vllm/model_executor/layers/mla.py', 'vllm/model_executor/models/deepseek_v4_mtp.py'],
+  skip_impl: true,
+  paths: ['vllm/model_executor/models/deepseek_v4.py', 'vllm/model_executor/models/llama.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
@@ -94,6 +95,7 @@ log('dossier 已通过对抗性核对')
 // ---------- Phase B/C: Implement (TDD) + Test，有界回环 ----------
 let ledger = []
 let testV = null
+if (!A.skip_impl) {
 for (let r = 1; r <= 3; r++) {
   phase('Implement')
   const impl = await agent(
@@ -119,6 +121,7 @@ for (let r = 1; r <= 3; r++) {
   ledger.push('[round ' + r + '] ' + (testV ? testV.failures : 'tester error'))
   log('test 第 ' + r + ' 轮未过，回 implementer')
 }
+} else { log('skip_impl: 本章无精简版（方法论/概览章），跳过 Implement+Test') }
 
 // ---------- Phase D: Write (真源码主线) ----------
 phase('Write')
@@ -130,11 +133,13 @@ writeV = await agent(
   '任务：以**真实 vLLM 源码为主线**写 ' + CH + '/narrative/chapter.md（你唯一有权写它）。\n' +
   '读 dossier、implementation、' + REPO + '/instances/vllm/book/bible/voice-guide.md，并跑 `python3 ' + REPO + '/scripts/bible.py due ' + A.chapter_id + '`。\n' +
   '开场 Roadmap：跑 `python3 ' + REPO + '/instances/vllm/book/assets/roadmap/roadmap.py --highlight ' + HL + ' --out ' + CH + '/diagrams/roadmap.svg`，用 rsvg-convert -z 2 转 PNG（**勿用 ImageMagick convert**，会丢中文/错位），正文引用该 PNG。\n' +
-  '正文内嵌**真实源码片段**(裁剪无关分支用 `# … 省略 …`)，逐段解读设计决策；精简版只作"运行看数值"的交叉验证，不是主角。\n' +
-  '若发现精简版缺了你要讲清的细节 → 用逃生舱拉闸（status=BLOCKED）让 implementer 补回，别将就。\n' +
+  '正文内嵌**真实源码片段**(裁剪无关分支用 `# … 省略 …`)，逐段解读设计决策。' +
+  (A.skip_impl
+    ? '本章无精简版（方法论/概览章）——以真实源码 + 架构图为主线，不要提"精简版"。\n'
+    : '精简版只作"运行看数值"的交叉验证，不是主角。\n若发现精简版缺了你要讲清的细节 → 用逃生舱拉闸（status=BLOCKED）让 implementer 补回，别将就。\n') +
   '埋伏笔、`python3 ' + REPO + '/scripts/bible.py payoff --resolve` 回收应回收项。\n' +
   '**零脚手架泄漏**：规范 vllm/ 路径、自然标题(无 Cell N)、不提内部文件。\n' +
-  '完成后自跑五个 linter（chapter_structure/formulas/source_grounding/fidelity/diagrams）均无 BLOCKING。返回 status/note。' + ESC,
+  '完成后自跑' + (A.skip_impl ? '四个 linter（chapter_structure/formulas/source_grounding/diagrams，本章无精简版故不跑 fidelity）' : '五个 linter（chapter_structure/formulas/source_grounding/fidelity/diagrams）') + '均无 BLOCKING。返回 status/note。' + ESC,
   { schema: STATUS_SCHEMA, label: 'write r' + w, phase: 'Write', agentType: 'general-purpose' }
 )
 }
