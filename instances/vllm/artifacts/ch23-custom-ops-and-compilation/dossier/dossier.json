@@ -1,0 +1,232 @@
+{
+  "chapter_id": "ch23",
+  "title": "模型层如何变成融合、图捕获的 kernel：CustomOp 两级 dispatch、@support_torch_compile、piecewise 图捕获",
+  "source_pin": "f3fef123",
+  "code_spine": [
+    "vllm/model_executor/custom_op.py:L103-L207 (CustomOp 基类 + __init__ 时一次性 dispatch_forward → 选 forward_cuda/forward_native)",
+    "vllm/model_executor/custom_op.py:L271-L304 (enabled() 按 CompilationConfig.custom_ops 决定开关 + default_on 的 Inductor='none'/否则='all')",
+    "vllm/model_executor/layers/layernorm.py:L102-L256 (RMSNorm 作为 CustomOp 实例：register + forward_native + forward_cuda)",
+    "vllm/compilation/decorators.py:L118-L252 (@support_torch_compile：从 forward 注解推断 dynamic_arg_dims，分派到 _support_torch_compile)",
+    "vllm/compilation/decorators.py:L331-L412 (_support_torch_compile：把 TorchCompileWithNoGuardsWrapper 注入基类、改写 __init__ 决定 do_not_compile)",
+    "vllm/compilation/decorators.py:L502-L590 (改写 __call__：首次调用 mark_dynamic_inputs + 进入 wrapper 触发 VllmBackend；后续走缓存)",
+    "vllm/compilation/backends.py:L996-L1197 (VllmBackend.__call__：split_graph 在 splitting_ops 处切图，PiecewiseCompileInterpreter 逐段编译)",
+    "vllm/compilation/backends.py:L547-L621 (split_graph：按 should_split 在 attention 等算子处切子图)",
+    "vllm/compilation/backends.py:L681-L770 (PiecewiseCompileInterpreter.call_module：非切分子图建 PiecewiseBackend，按需包 CUDA graph wrapper)",
+    "vllm/compilation/partition_rules.py:L14-L38 (should_split：node.target 的 namespace::name 是否在 splitting_ops)",
+    "vllm/config/compilation.py:L738-L753 (_attention_ops：默认切图点列表，含 unified_attention_with_output) + L1082-L1123 (set_splitting_ops_for_v1)",
+    "vllm/model_executor/layers/attention/attention.py:L462-L500 (f17 回收：forward 内调用 torch.ops.vllm.unified_attention_with_output 自定义算子) + L705-L754 (注册)"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/model_executor/custom_op.py",
+      "lines": "L103-L136",
+      "code": "class CustomOp(nn.Module):\n    \"\"\"\n    Base class for custom ops.\n    Dispatches the forward method to the appropriate backend.\n    \"\"\"\n\n    def __new__(cls, *args, **kwargs):\n        try:\n            op_name = cls.__name__\n        except AttributeError:\n            raise TypeError(...) from None\n\n        if op_name not in op_registry_oot:\n            op_cls_to_instantiate = cls\n        else:\n            op_cls_to_instantiate = op_registry_oot[op_name]\n            ...\n        return super().__new__(op_cls_to_instantiate)\n\n    def __init__(self, *, enforce_enable: bool = False, compile_native: bool = False):\n        super().__init__()\n        self._enforce_enable = enforce_enable\n        self._forward_method = self.dispatch_forward(compile_native=compile_native)\n\n    def forward(self, *args, **kwargs):\n        return self._forward_method(*args, **kwargs)",
+      "elide": [
+        "__new__ 的 OOT(out-of-tree)替换分支：若某 op 名注册到 op_registry_oot（硬件插件提供的替换类），实例化替换类；正文以默认 in-tree 路径为主线，OOT 只需一句话带过",
+        "TypeError 异常消息全文可省略"
+      ]
+    },
+    {
+      "path": "vllm/model_executor/custom_op.py",
+      "lines": "L174-L207",
+      "code": "    def dispatch_forward(self, compile_native: bool):\n        # NOTE(woosuk): Here we assume that vLLM was built for only one\n        # specific backend. Currently, we do not support dynamic dispatching.\n        compilation_config = get_cached_compilation_config()\n\n        enabled = self._enforce_enable or self.enabled()\n        if enabled:\n            compilation_config.enabled_custom_ops.update([self.__class__.name])\n        else:\n            compilation_config.disabled_custom_ops.update([self.__class__.name])\n\n        if not enabled:\n            # Compile forward_native to avoid eager torch ops if inside\n            # opaque torch custom op (e.g. fused_moe, unified_attention, etc.)\n            return self.maybe_compile(self.forward_native, enable=compile_native)\n\n        if current_platform.is_rocm():\n            return self.forward_hip\n        elif current_platform.is_cpu():\n            return self.forward_cpu\n        elif current_platform.is_tpu():\n            return self.forward_tpu\n        elif current_platform.is_xpu():\n            return self.forward_xpu\n        elif current_platform.is_out_of_tree():\n            return self.forward_oot\n        else:\n            return self.forward_cuda",
+      "elide": [
+        "is_rocm/is_cpu/is_tpu/is_xpu/is_out_of_tree 多平台分支：正文以 CUDA(forward_cuda) 与 enabled=False(forward_native) 两条主路为主，其余平台一句话说明 forward_hip/cpu/tpu/xpu/oot 默认回退到 cuda 或 native（见 L149-L172）",
+        "enabled/disabled_custom_ops.update 只是把决定记账到 config，供日志/调试，正文可一笔带过"
+      ]
+    },
+    {
+      "path": "vllm/model_executor/custom_op.py",
+      "lines": "L271-L304",
+      "code": "    @classmethod\n    def enabled(cls) -> bool:\n        # if no name, then it was not registered\n        compilation_config = get_cached_compilation_config()\n        custom_ops = compilation_config.custom_ops\n        if not hasattr(cls, \"name\"):\n            ...\n            return CustomOp.default_on()\n\n        enabled = f\"+{cls.name}\" in custom_ops\n        disabled = f\"-{cls.name}\" in custom_ops\n        assert not (enabled and disabled), f\"Cannot enable and disable {cls.name}\"\n\n        return (CustomOp.default_on() or enabled) and not disabled\n\n    @staticmethod\n    def default_on() -> bool:\n        \"\"\"\n        Behavior controlled by `CompilationConfig.custom_ops`: On by default if\n        'all', off by default if 'none'.\n        When PyTorch Inductor is used, 'none' is the default value,\n        otherwise 'all'.\n        \"\"\"\n        compilation_config = get_cached_compilation_config()\n        count_none = compilation_config.custom_ops.count(\"none\")\n        count_all = compilation_config.custom_ops.count(\"all\")\n        assert count_none + count_all == 1\n\n        return not count_none > 0 or count_all > 0",
+      "elide": [
+        "未注册(无 name)的 warning_once 文本可省略"
+      ]
+    },
+    {
+      "path": "vllm/model_executor/layers/layernorm.py",
+      "lines": "L102-L131",
+      "code": "@CustomOp.register(\"rms_norm\")\nclass RMSNorm(CustomOp):\n    \"\"\"Root mean square normalization.\n\n    Computes x -> w * x / sqrt(E[x^2] + eps) where w is the learned weight.\n    Refer to https://arxiv.org/abs/1910.07467\n    \"\"\"\n\n    def __init__(\n        self,\n        hidden_size: int,\n        eps: float = 1e-6,\n        var_hidden_size: int | None = None,\n        has_weight: bool = True,\n        dtype: torch.dtype | None = None,\n    ) -> None:\n        super().__init__()\n\n        self.hidden_size = hidden_size\n        self.variance_epsilon = eps\n        self.variance_size_override = (\n            None if var_hidden_size == hidden_size else var_hidden_size\n        )\n        weight_dtype = dtype or torch.get_default_dtype()\n        self.has_weight = has_weight\n        self.weight = torch.ones(hidden_size, dtype=weight_dtype)\n        if self.has_weight:\n            self.weight = nn.Parameter(self.weight)",
+      "elide": [
+        "super().__init__() 即触发 CustomOp.__init__ → dispatch_forward，正文需点出这一隐式连接",
+        "is_rocm 的 aiter 分派(L133-137)与 Oink SM100 fast-path 检测(L139-185)：硬件特例，正文用一句话概括为可选加速路径，删不影响理解 dispatch 主线"
+      ]
+    },
+    {
+      "path": "vllm/model_executor/layers/layernorm.py",
+      "lines": "L233-L266",
+      "code": "    def forward_native(\n        self,\n        x: torch.Tensor,\n        residual: torch.Tensor | None = None,\n    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:\n        \"\"\"PyTorch-native implementation equivalent to forward().\"\"\"\n        if residual is None:\n            # TODO(luka): address the weight=None passing issue more generally\n            return ir.ops.rms_norm(\n                x,\n                self.weight.data if self.has_weight else None,\n                self.variance_epsilon,\n                self.variance_size_override,\n            )\n\n        return self.forward_static(\n            x,\n            self.variance_epsilon,\n            self.hidden_size,\n            x.dtype,\n            self.weight.data if self.has_weight else None,\n            residual,\n            self.variance_size_override,\n        )\n\n    def forward_cuda(\n        self,\n        x: torch.Tensor,\n        residual: torch.Tensor | None = None,\n    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:\n        if residual is None and not envs.VLLM_BATCH_INVARIANT:\n            return ir.ops.rms_norm(\n                x, self.weight.data, self.variance_epsilon, self.variance_size_override\n            )\n        ...\n        if residual is not None:\n            return fused_add_rms_norm(\n                x, residual, self.weight.data, self.variance_epsilon\n            )",
+      "elide": [
+        "forward_static(L187-231) 是纯 torch 算子的逐步 RMSNorm（fp32 上变、pow/mean/rsqrt、可选 weight、可选 residual-add），正文可内嵌讲清两路等价；",
+        "forward_cuda 的 Oink SM100 in-place fast-path(L268-318) 与 VLLM_BATCH_INVARIANT 分支：可选/特例，正文一句话概括为 '调用融合 CUDA kernel ops.fused_add_rms_norm'，删之不损主线",
+        "关键对照点：forward_native 用一串可被 Inductor 看见/融合的纯 torch 算子；forward_cuda 调用 ir.ops.rms_norm / fused_add_rms_norm 这类对编译器不透明的预编译 kernel"
+      ]
+    },
+    {
+      "path": "vllm/compilation/decorators.py",
+      "lines": "L201-L245",
+      "code": "    def cls_decorator_helper(cls: type[_T]) -> type[_T]:\n        if not hasattr(cls, \"forward\"):\n            raise TypeError(\"decorated class should have a forward method.\")\n        sig = inspect.signature(cls.forward)\n        inferred_dynamic_arg_dims = dynamic_arg_dims\n        if inferred_dynamic_arg_dims is None:\n            inferred_dynamic_arg_dims = {}\n            for k, v in sig.parameters.items():\n                if v.annotation in [\n                    torch.Tensor,\n                    torch.Tensor | None,\n                    torch.FloatTensor,\n                    torch.FloatTensor | None,\n                    IntermediateTensors,\n                    IntermediateTensors | None,\n                ]:\n                    inferred_dynamic_arg_dims[k] = 0\n            ...\n        if len(inferred_dynamic_arg_dims) == 0:\n            raise ValueError(...)\n        ...\n        return _support_torch_compile(\n            cls,\n            inferred_dynamic_arg_dims,\n            mark_unbacked_dims,\n            enable_if,\n            is_encoder,\n        )",
+      "elide": [
+        "@overload 签名(L85-115) 只是类型重载，可省略；",
+        "shape_id/dict 分支与未找到参数的 ValueError 文本可省略；核心：从 forward 的 torch.Tensor 注解推断哪一维(默认 dim 0=token/batch)是动态的"
+      ]
+    },
+    {
+      "path": "vllm/compilation/decorators.py",
+      "lines": "L331-L412",
+      "code": "def _support_torch_compile(\n    cls: type[_T],\n    dynamic_arg_dims: dict[str, int | list[int] | dict[int, str]],\n    ...\n) -> type[_T]:\n    \"\"\"Internal implementation of support_torch_compile decorator.\"\"\"\n\n    if TorchCompileWithNoGuardsWrapper in cls.__bases__:\n        # support decorating multiple times\n        return cls\n\n    # take care of method resolution order\n    # make sure super().__init__ is called on the base class\n    #  other than TorchCompileWithNoGuardsWrapper\n    cls.__bases__ = cls.__bases__ + (TorchCompileWithNoGuardsWrapper,)\n\n    old_init = cls.__init__\n    setattr(cls, IGNORE_COMPILE_KEY, False)\n\n    def __init__(self, *args, vllm_config=None, prefix=\"\", **kwargs):\n        if vllm_config is None:\n            vllm_config = get_current_vllm_config()\n        ...\n        old_init(self, *args, **kwargs)\n\n        self.vllm_config = vllm_config\n        self.compilation_config = self.vllm_config.compilation_config\n        enable_compile = enable_if is None or enable_if(vllm_config)\n        self.do_not_compile = (\n            self.compilation_config.mode\n            in [CompilationMode.NONE, CompilationMode.STOCK_TORCH_COMPILE]\n            or _should_ignore_torch_compile(self.__class__)\n            or not enable_compile\n        )\n        if self.do_not_compile:\n            return\n\n        self._dynamic_arg_dims = dynamic_arg_dims\n        ...\n        TorchCompileWithNoGuardsWrapper.__init__(\n            self, compile_prefix=cls.__name__ if is_encoder else \"\", is_encoder=is_encoder,\n        )\n    cls.__init__ = __init__",
+      "elide": [
+        "位置参数类型校验循环(L365-383)可缩为一句话；",
+        "AOT 相关计数器与 was_aot_compile_fn_loaded_from_disk 可省略；核心：装饰器把 wrapper 类塞进 __bases__ 并改写 __init__，据 mode 决定 do_not_compile"
+      ]
+    },
+    {
+      "path": "vllm/compilation/decorators.py",
+      "lines": "L502-L513, L576-L685",
+      "code": "    def __call__(self, *args, **kwargs):\n        # torch.compiler.is_compiling() means we are inside the compilation\n        if self.do_not_compile or torch.compiler.is_compiling():\n            return self.forward(*args, **kwargs)\n\n        if is_forward_context_available() and get_forward_context().skip_compiled:\n            return self.forward(*args, **kwargs)\n        ...\n        if self.compiled:\n            return TorchCompileWithNoGuardsWrapper.__call__(self, *args, **kwargs)\n\n        # This is the path for the first compilation.\n        # the first compilation needs to have dynamic shapes marked\n        _mark_dynamic_inputs(self, ds_type, *args, **kwargs)\n        original_code_object = self.original_code_object()\n        ...\n        # collect all relevant files traced by Dynamo (for cache invalidation)\n        self.compilation_config.traced_files.add(original_code_object.co_filename)\n        inline_call = InliningInstructionTranslator.inline_call_\n        def patched_inline_call(self_):\n            code = self_.f_code\n            self.compilation_config.traced_files.add(code.co_filename)\n            return inline_call(self_)\n        ...\n        with (\n            patch.object(InliningInstructionTranslator, \"inline_call_\", patched_inline_call),\n            ...\n            maybe_use_cudagraph_partition_wrapper(self.vllm_config),\n            ...\n        ):\n            ...\n            output = TorchCompileWithNoGuardsWrapper.__call__(self, *args, **kwargs)\n        self.compiled = True\n        return output",
+      "elide": [
+        "整段 AOT(VLLM_USE_AOT_COMPILE)缓存路径(L515-575, L652-670, save_aot_compiled_function)：默认关闭，正文用一句话说明可把编译结果序列化到磁盘，删之不损 JIT 主线",
+        "dynamo/inductor config patch(L617-650) 可一句话概括；核心：首次调用走 wrapper.__call__ 触发 VllmBackend；compiled 后走缓存"
+      ]
+    },
+    {
+      "path": "vllm/compilation/backends.py",
+      "lines": "L547-L587, L596-L621",
+      "code": "def split_graph(\n    graph: fx.GraphModule, splitting_ops: list[str]\n) -> tuple[fx.GraphModule, list[SplitItem]]:\n    _decompose_size_nodes(graph)\n\n    # split graph by ops\n    subgraph_id = 0\n    node_to_subgraph_id: dict[fx.Node, int] = {}\n    split_op_graphs: list[int] = []\n    for node in graph.graph.nodes:\n        if node.op in (\"output\", \"placeholder\"):\n            continue\n        ...\n        if should_split(node, splitting_ops):\n            subgraph_id += 1\n            node_to_subgraph_id[node] = subgraph_id\n            split_op_graphs.append(subgraph_id)\n            # keep consecutive splitting ops together\n            if should_split(node.next, splitting_ops):\n                subgraph_id -= 1\n            else:\n                subgraph_id += 1\n        else:\n            node_to_subgraph_id[node] = subgraph_id\n    ...\n    split_gm = torch.fx.passes.split_module.split_module(\n        graph, None, lambda node: node_to_subgraph_id[node],\n        keep_original_order=True, **tuple_return_kwarg,\n    )\n    ...\n    return split_gm, outputs",
+      "elide": [
+        "_decompose_size_nodes(L478-544) 与 getitem 归并(L564-570)、_merge_empty_only_subgraphs(L436-475)：FX 正确性细节，正文一句话带过；核心：在 splitting_ops 命中的节点处递增 subgraph_id 切图，把切分算子单独成段，其余连续段各自成一个可编译/可 CUDA-graph 子图"
+      ]
+    },
+    {
+      "path": "vllm/compilation/backends.py",
+      "lines": "L724-L770",
+      "code": "    def call_module(self, target, args, kwargs):\n        assert isinstance(target, str)\n        gm = getattr(self.module, target)\n        outputs = gm.graph.output_node().args[0]\n        output = fx.map_arg(outputs, lambda node: node.meta[\"example_value\"])\n\n        if target in self.compile_submod_names:\n            index = self.compile_submod_names.index(target)\n            submod = self.fetch_attr(target)\n            sym_shape_indices = [\n                i for i, x in enumerate(args) if isinstance(x, torch.SymInt)\n            ]\n            from .piecewise_backend import PiecewiseBackend\n            piecewise_backend = PiecewiseBackend(\n                submod, self.vllm_config, index,\n                len(self.compile_submod_names),\n                sym_shape_indices, self.vllm_backend,\n                graph_returns_tuple(submod), submod_name=target,\n            )\n            self.module.__dict__[target] = wrap_with_cudagraph_if_needed(\n                piecewise_backend, self.vllm_config, self.compilation_config,\n                piecewise_backend.is_first_graph, piecewise_backend.is_last_graph,\n            )\n            compilation_counter.num_piecewise_capturable_graphs_seen += 1\n        return output",
+      "elide": [
+        "只对 compile_submod_names（非切分子图）建 PiecewiseBackend 并按需包 CUDA graph wrapper；切分算子(attention)所在子图不编译/不进 CUDA graph，eager 执行"
+      ]
+    },
+    {
+      "path": "vllm/compilation/partition_rules.py",
+      "lines": "L14-L38",
+      "code": "def should_split(node: torch.fx.Node, splitting_ops: list[str]) -> bool:\n    if node.op != \"call_function\":\n        return False\n    target = node.target\n    if isinstance(target, torch._ops.OpOverloadPacket):\n        # Example: \"aten::add\"\n        return target._qualified_op_name in splitting_ops\n    if isinstance(target, torch._ops.OpOverload):\n        packet_name = target.name()\n        op_overload_name = f\"{packet_name}.{target._overloadname}\"\n        return op_overload_name in splitting_ops or packet_name in splitting_ops\n    return False",
+      "elide": []
+    },
+    {
+      "path": "vllm/config/compilation.py",
+      "lines": "L738-L753",
+      "code": "    # Attention ops; used for piecewise cudagraphs\n    # Use PyTorch operator format: \"namespace::name\"\n    _attention_ops: ClassVar[list[str]] = [\n        \"vllm::unified_attention_with_output\",\n        \"vllm::unified_mla_attention_with_output\",\n        \"vllm::mamba_mixer2\",\n        ...\n    ]",
+      "elide": [
+        "列表其余条目(mamba/short_conv/linear_attention/gdn/...)：都是同类 '不可融合、需在此切图' 的算子，正文以 unified_attention_with_output 为代表，其余一句话概括"
+      ]
+    },
+    {
+      "path": "vllm/model_executor/layers/attention/attention.py",
+      "lines": "L462-L500",
+      "code": "        if self.use_direct_call:\n            # Skip this if sharing KV cache with an earlier attention layer.\n            if (\n                not self.attn_backend.forward_includes_kv_cache_update\n                and self.kv_sharing_target_layer_name is None\n                and key is not None and value is not None\n            ):\n                kv_cache_dummy_dep = unified_kv_cache_update(key, value, self.layer_name)\n            unified_attention_with_output(\n                query, key, value, output, self.layer_name,\n                kv_cache_dummy_dep=kv_cache_dummy_dep,\n            )\n        else:\n            encoded = _encode_layer_name(self.layer_name)\n            if (...):\n                kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(key, value, encoded)\n            torch.ops.vllm.unified_attention_with_output(\n                query, key, value, output, encoded,\n                kv_cache_dummy_dep=kv_cache_dummy_dep,\n            )",
+      "elide": [
+        "use_direct_call=not current_platform.opaque_attention_op()(L365)：CUDA/ROCm/CPU 上 opaque_attention_op()==True → use_direct_call=False → 走 else 分支 torch.ops.vllm.unified_attention_with_output（不透明 torch op 边界）；只有其它平台 opaque_attention_op()==False → use_direct_call=True → 直接 Python 调用。源码注释明文：为 cuda-alike/cpu 把 attention 注册成一个 opaque custom op，其它平台才直接调用。正文需点出：CUDA 上正是 torch.ops.vllm.unified_attention_with_output 这个'不透明算子'成为 split_graph 的切点，回收 f17"
+      ]
+    },
+    {
+      "path": "vllm/model_executor/layers/attention/attention.py",
+      "lines": "L736-L754",
+      "code": "def unified_attention_with_output_fake(\n    query, key, value, output, layer_name,\n    output_scale=None, output_block_scale=None, kv_cache_dummy_dep=None,\n) -> None:\n    return\n\ndirect_register_custom_op(\n    op_name=\"unified_attention_with_output\",\n    op_func=unified_attention_with_output,\n    mutates_args=[\"output\", \"output_block_scale\"],\n    fake_impl=unified_attention_with_output_fake,\n)",
+      "elide": [
+        "unified_attention_with_output 真实实现(L706-733)：从 layer_name 取回 attn_metadata/self/kv_cache 再 self.impl.forward；正文已在前面章节讲过 attention forward，这里重点是'注册成 torch 自定义算子 + fake_impl' 让 Dynamo 看到一个不透明的图节点（不内联、不 graph break）"
+      ]
+    },
+    {
+      "path": "vllm/utils/torch_utils.py",
+      "lines": "direct_register_custom_op (摘录)",
+      "code": "def direct_register_custom_op(op_name, op_func, mutates_args=None, fake_impl=None, ...):\n    ...\n    schema_str = infer_schema(op_func, mutates_args=mutates_args)\n    my_lib = target_lib or vllm_lib\n    my_lib.define(op_name + schema_str, tags=tags)\n    my_lib.impl(op_name, op_func, dispatch_key=dispatch_key)\n    if fake_impl is not None:\n        my_lib._register_fake(op_name, fake_impl)",
+      "elide": [
+        "绕过 torch.library.custom_op 的 dispatch 开销，直接 define+impl(+register_fake) 到 vllm Library；正文一句话即可：fake_impl 让 Dynamo 在 trace 时不需真执行就知道输出形状，从而把它当成一个稳定的、不可融合的图节点"
+      ]
+    }
+  ],
+  "key_classes": [
+    {"name": "CustomOp", "file": "vllm/model_executor/custom_op.py", "responsibility": "所有可切换 native/平台 kernel 的算子基类。__init__ 时一次性 dispatch_forward 选定 self._forward_method（forward_cuda 或 forward_native...），之后 forward 零开销转发。enabled()/default_on() 决定走融合 kernel 还是纯 torch（让 Inductor 融合）"},
+    {"name": "RMSNorm", "file": "vllm/model_executor/layers/layernorm.py", "responsibility": "本章 CustomOp 的范例实例。@CustomOp.register('rms_norm')；forward_native 用一串纯 torch 算子（可被 Inductor 看见/融合），forward_cuda 调用预编译融合 kernel ir.ops.rms_norm/fused_add_rms_norm（对编译器不透明）"},
+    {"name": "support_torch_compile / _support_torch_compile", "file": "vllm/compilation/decorators.py", "responsibility": "类装饰器，把一个 nn.Module 变成可编译：从 forward 注解推断动态维、注入 TorchCompileWithNoGuardsWrapper、改写 __init__（定 do_not_compile）与 __call__（首次触发 VllmBackend、后续走缓存）"},
+    {"name": "VllmBackend", "file": "vllm/compilation/backends.py", "responsibility": "torch.compile 的 vLLM 自定义后端（CompilationMode.VLLM_COMPILE）。核心工作：split_graph 把整图按 splitting_ops 切成 piecewise 子图，PiecewiseCompileInterpreter 逐段送 Inductor 编译并按需包 CUDA graph"},
+    {"name": "PiecewiseCompileInterpreter", "file": "vllm/compilation/backends.py", "responsibility": "遍历切分后的 split_gm，对非切分子图建 PiecewiseBackend 编译、对其加 CUDA graph wrapper；切分算子(attention)所在子图保持 eager"},
+    {"name": "should_split / splitting_ops(_attention_ops)", "file": "vllm/compilation/partition_rules.py + vllm/config/compilation.py", "responsibility": "决定在哪些算子处切图：node 的 namespace::name 在 splitting_ops 即切。默认 splitting_ops=_attention_ops（unified_attention_with_output 等），即在 attention 处切图"},
+    {"name": "unified_attention_with_output + direct_register_custom_op", "file": "vllm/model_executor/layers/attention/attention.py + vllm/utils/torch_utils.py", "responsibility": "f17 回收：Attention.forward 调用的 torch.ops.vllm.unified_attention_with_output 是用 direct_register_custom_op 注册的不透明 torch 自定义算子（带 fake_impl）。它让 Dynamo 不 graph break，并成为 split_graph 的稳定切点"}
+  ],
+  "data_flow": [
+    "构造期(模型搭建): RMSNorm(...) → CustomOp.__init__ → dispatch_forward(custom_op.py:L174) 读 CompilationConfig.custom_ops，调 enabled()(L271)/default_on()(L291) 决定 enabled",
+    "若 enabled 且 CUDA → self._forward_method = self.forward_cuda（预编译融合 kernel）；若 disabled（Inductor 默认 'none'）→ self._forward_method = forward_native（纯 torch，留给 Inductor 融合）",
+    "构造期(整模型): 被 @support_torch_compile 装饰的顶层 Module → __init__(decorators.py:L353) 据 compilation_config.mode 设 do_not_compile",
+    "首次前向: 装饰器 __call__(decorators.py:L502) → _mark_dynamic_inputs 标记 token 维动态 → TorchCompileWithNoGuardsWrapper.__call__ 触发 torch.compile → Dynamo 追踪 forward",
+    "Dynamo 追踪中遇到 torch.ops.vllm.unified_attention_with_output（不透明 custom op，attention.py:L493）→ 不内联、不 graph break，留作一个图节点(f17)",
+    "Dynamo 把整图交给 VllmBackend.__call__(backends.py:L996) → split_graph(L547) 用 should_split 在 splitting_ops(=_attention_ops) 命中处切图",
+    "PiecewiseCompileInterpreter(L681).call_module: 非切分子图 → PiecewiseBackend 送 Inductor 编译 + wrap_with_cudagraph_if_needed 包 CUDA graph；attention 子图 → 保持 eager",
+    "运行期: 每个 piecewise 子图按形状重放 CUDA graph，attention 段以 eager 执行真实 attention kernel；CustomOp 各算子已在构造期定死 forward_method"
+  ],
+  "design_decisions": [
+    {"decision": "CustomOp 在 __init__ 一次性 dispatch（self._forward_method = dispatch_forward(...)），运行期 forward 只做一次转发", "why": "避免每次前向重复判断平台/配置；注释明言假设 vLLM 只为单一后端构建、不支持动态 dispatch，故可一次性定死", "evidence": "vllm/model_executor/custom_op.py:L130-136, L174-177"},
+    {"decision": "enabled()/default_on()：用 Inductor(backend=inductor) 时 custom_ops 默认 'none'（→ forward_native），否则 'all'（→ forward_cuda）。可用 '+name'/'-name' 单独覆盖", "why": "Inductor 路径下让纯 torch 的 forward_native 暴露给编译器去做算子融合，效果常优于零散调用预编译 kernel；非编译路径下直接用手写融合 kernel 更快", "evidence": "vllm/model_executor/custom_op.py:L285-304, layernorm.py:L149-151 注释"},
+    {"decision": "@support_torch_compile 通过把 TorchCompileWithNoGuardsWrapper 注入 cls.__bases__ 并改写 __init__/__call__ 来'包装'模型，而非要求模型显式继承", "why": "对模型代码零侵入：模型作者只加一行装饰器；wrapper 处理动态维标记、首编/缓存、CUDA graph partition context", "evidence": "vllm/compilation/decorators.py:L340-347, L412, L719-720"},
+    {"decision": "动态维默认从 forward 的 torch.Tensor 注解推断为 dim 0", "why": "vLLM 一个编译图要服务变化的 token 数（batch）；把 token 维标 dynamic 避免按每个 batch size 重编译", "evidence": "vllm/compilation/decorators.py:L207-219"},
+    {"decision": "piecewise 切图：在 attention 等不可融合算子(splitting_ops=_attention_ops)处切，其余连续段各自编译+CUDA graph 捕获", "why": "attention 涉及变长 KV cache、可变 metadata、原位写 output，无法被 Inductor 融合也难以单图 CUDA-graph；切出来让它 eager，其余规整段享受融合+CUDA graph 的低开销", "evidence": "vllm/compilation/backends.py:L547-587, L724-770; config/compilation.py:L738-753, L1104"},
+    {"decision": "attention 用 direct_register_custom_op 注册成带 fake_impl 的不透明 torch 自定义算子(f17)", "why": "若 attention 内部逻辑暴露给 Dynamo，会因变长/数据依赖导致 graph break 或巨量重编译；包成不透明 op 让 Dynamo 看到稳定图节点（fake_impl 提供输出形状），既不 graph break 又天然成为 split 切点", "evidence": "vllm/model_executor/layers/attention/attention.py:L493, L749-754; utils/torch_utils.py direct_register_custom_op"},
+    {"decision": "kv_cache_dummy_dep：unified_kv_cache_update 的返回值作为假数据依赖传入 attention op", "why": "强制 torch.compile 保持 KV cache 更新 与 attention 之间的执行顺序（否则可能被重排）", "evidence": "vllm/model_executor/layers/attention/attention.py:L470-480, L714-719 注释"}
+  ],
+  "theory": [
+    "两级 dispatch 的'级'指：第1级=CustomOp.dispatch_forward 在构造期按 enabled() + 平台选 forward_cuda/native/hip/...; 第2级=@support_torch_compile/VllmBackend 在图层面决定整段是否进 Inductor 编译/CUDA graph。前者是单算子粒度的实现选择，后者是整图粒度的捕获/融合策略",
+    "为什么 enabled=False 时还要 maybe_compile(forward_native)：当 CustomOp 被夹在一个不透明 torch op 内部（如 fused_moe/unified_attention），模型级 torch.compile 看不到它，于是单独对 forward_native 做一次 torch.compile，避免它退化成零散 eager 算子（不跨 op 融合）。见 custom_op.py:L191-194, L209-269",
+    "piecewise CUDA graph 的收益量化（定性）：一个 N 层 transformer，若整图无法 CUDA-graph（因 attention），则每层每算子都有 CPU launch 开销；切图后，attention 之外的规整段（norm/linear/激活/残差）被编成少数几个 CUDA graph，按 batch size 重放，CPU 开销近乎为零，仅 attention 段 eager。切点数≈attention 层数，子图数≈层数×2+1",
+    "CustomOp.forward_native vs forward_cuda 与编译的关系：forward_native 由一串可被 Inductor 模式匹配/融合的纯 torch 算子组成（RMSNorm: cast→pow→mean→rsqrt→mul→weight）；forward_cuda 调用 ir.ops.rms_norm 这类预编译 kernel，对 Inductor 是黑盒。所以 Inductor 路径选 native 才能让 RMSNorm 与相邻算子融合"
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {"what": "custom_op.py 的 PluggableLayer 类(L32-100) 及 op_registry_oot / maybe_get_oot_by_class / register_oot 这套 out-of-tree 硬件插件替换机制", "why_safe": "本章主线是 in-tree CustomOp 两级 dispatch；OOT 替换是给硬件厂商插件用的旁路，删去不影响 RMSNorm/CUDA 主路径与 dispatch 逻辑的正确性，精简版只需保留 register + __new__ 的 in-tree 分支"},
+      {"what": "RMSNorm 的 Oink SM100 fast-path（layernorm.py:L139-185 检测、L268-310 in-place 调用）、_can_view_as_2d/_is_oink_stride_compatible_2d、ROCm aiter 分派(L133-137, dispatch_rocm_rmsnorm_func)、VLLM_BATCH_INVARIANT 分支、GemmaRMSNorm/RMSNormGated/LayerNorm 其他类", "why_safe": "都是硬件/特性特例或同模式的其他 norm 变体；本章只需一个 RMSNorm 实例讲清 register+forward_native+forward_cuda 两路对照，删之不损 dispatch 主线"},
+      {"what": "decorators.py 整个 AOT 编译路径：_try_load_aot_compiled_fn、_verify_source_unchanged、_model_hash_key、save_aot_compiled_function、__call__ 中 VLLM_USE_AOT_COMPILE 分支(L515-575,L652-670)", "why_safe": "AOT(把编译产物序列化磁盘)默认关闭，是缓存优化；JIT 主路径(首次 __call__→VllmBackend→后续缓存)完整保留即可讲清装饰器工作原理"},
+      {"what": "decorators.py 的 mark_unbacked/shape_id/DynamicShapesType 多分支(L420-500 内 unbacked 路径)、dynamo/inductor config patch(L617-650)、_verify、ignore_torch_compile/should_torch_compile_mm_encoder", "why_safe": "细粒度动态形状策略与多版本兼容；保留 mark_dynamic(dim 0) 主路径足以说明动态 token 维，其余为边角"},
+      {"what": "backends.py 的缓存/哈希子系统(CompilerManager.compute_hash/load/save_to_file、__call__ 中 L1005-1122 的 env/config/code/compiler hash 与 cache_dir 计算、cache_key_factors.json 写出)、StandaloneCompiledArtifacts/collect_standalone_compile_artifacts、make_copy_and_call/cudagraph_copy_inputs 分支、_decompose_size_nodes/_merge_empty_only_subgraphs/_is_empty_allocation_node", "why_safe": "缓存与 FX 正确性细节不改变'切图→逐段编译→包 CUDA graph'主流程；精简版保留 split_graph 主体 + PiecewiseCompileInterpreter.call_module + wrap_with_cudagraph_if_needed 即可"},
+      {"what": "attention.py 中非主线分支：use_direct_call=True 的直接调用支(L462-480 可只留 else 的 torch.ops.vllm.* 编译路径)、quant/output_scale/output_block_scale、maybe_transfer_kv_layer 装饰器细节、unified_attention(无 output 版,L612 注册)", "why_safe": "本章回收 f17 只需展示'attention 被注册成不透明 torch custom op 且在编译路径被调用、成为切点'，量化/KV-transfer/直接调用是旁支"}
+    ],
+    "must_keep": [
+      {"symbol": "CustomOp", "why": "本章核心基类，dispatch 主体"},
+      {"symbol": "dispatch_forward", "why": "第1级 dispatch 的发生地，writer 须讲清它在 __init__ 时一次性选 forward_method"},
+      {"symbol": "_forward_method", "why": "dispatch 结果的存放处，运行期 forward 转发到它"},
+      {"symbol": "enabled", "why": "决定走 forward_cuda 还是 forward_native 的开关逻辑"},
+      {"symbol": "default_on", "why": "Inductor='none'/否则='all' 的默认策略，读者须理解为何编译路径默认走 native"},
+      {"symbol": "forward_native", "why": "纯 torch 实现，可被 Inductor 融合的一路；与 forward_cuda 对照是本章关键"},
+      {"symbol": "forward_cuda", "why": "预编译融合 kernel 一路，与 native 对照"},
+      {"symbol": "RMSNorm", "why": "本章 CustomOp 范例实例"},
+      {"symbol": "register", "why": "@CustomOp.register('rms_norm') 装饰器，把类登记进 op_registry 并赋 name"},
+      {"symbol": "support_torch_compile", "why": "把 nn.Module 包成可编译的入口装饰器"},
+      {"symbol": "_support_torch_compile", "why": "装饰器内部实现：注入 wrapper 基类、改写 __init__/__call__"},
+      {"symbol": "do_not_compile", "why": "据 CompilationMode 决定是否真编译的开关"},
+      {"symbol": "dynamic_arg_dims", "why": "动态 token 维推断结果，避免按 batch size 重编译"},
+      {"symbol": "VllmBackend", "why": "piecewise 编译后端主体"},
+      {"symbol": "split_graph", "why": "按 splitting_ops 切图的核心函数"},
+      {"symbol": "should_split", "why": "判定某节点是否为切点"},
+      {"symbol": "splitting_ops", "why": "切点算子名清单（默认 _attention_ops）"},
+      {"symbol": "PiecewiseCompileInterpreter", "why": "逐段编译/包 CUDA graph 的解释器"},
+      {"symbol": "wrap_with_cudagraph_if_needed", "why": "对非切分子图加 CUDA graph wrapper 的判定"},
+      {"symbol": "unified_attention_with_output", "why": "f17 回收：被注册为不透明 torch custom op 的 attention 算子，也是默认切点"},
+      {"symbol": "direct_register_custom_op", "why": "把 attention 注册成带 fake_impl 的不透明 op、避免 graph break 的机制"}
+    ]
+  },
+  "diagram_plan": [
+    {
+      "name": "two-level-dispatch",
+      "spec": "两栏对照图。左栏'第1级：单算子 dispatch'：RMSNorm(...) → CustomOp.__init__ → dispatch_forward → 分叉 [enabled & CUDA → forward_cuda(预编译融合kernel)] / [disabled(Inductor默认none) → forward_native(纯torch, 待Inductor融合)]。右栏'第2级：整图 dispatch'：@support_torch_compile 模型 forward → Dynamo trace → 遇 unified_attention_with_output(不透明op) 不graph-break → VllmBackend.split_graph 在attention处切 → [规整段→Inductor编译+CUDA graph] / [attention段→eager]。底部箭头说明两级是不同粒度",
+      "roadmap_highlight": "ch23 节点(custom-ops & compilation)，上游高亮 ch22(Attention 封装) 标注 f17 回收来源"
+    },
+    {
+      "name": "piecewise-split",
+      "spec": "横向流水线图：一个 N 层 transformer 的 FX 整图 → split_graph 在每个 unified_attention_with_output 处切 → 交替条带 [submod_0: norm+qkv_proj+rope (编译, CUDA graph)] | [attn_0: eager] | [submod_1: o_proj+norm+mlp (编译, CUDA graph)] | [attn_1: eager] | ... 标注：编译段=Inductor融合+CUDA graph重放(CPU开销≈0)，attn段=eager真kernel。下方小注：切点数≈层数",
+      "roadmap_highlight": "ch23"
+    }
+  ],
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recover": [
+      {"id": "f17", "desc": "Attention 封装吞掉的 self.attn 自定义算子(unified_kv_cache_update/unified_attention_with_output)与进 torch.compile 图 → custom-ops 章回收（埋于 ch22）", "how_recovered": "本章在'f17 回收'段展示：attention.py 用 direct_register_custom_op 把 unified_attention_with_output 注册为带 fake_impl 的不透明 torch.ops.vllm 算子；编译路径下 Attention.forward 调用 torch.ops.vllm.unified_attention_with_output(L493)，Dynamo 不内联不 graph break，它正好成为 split_graph 的默认切点(_attention_ops)。这把 ch22 埋下的'self.attn 算子如何进 torch.compile 图'闭环"}
+    ]
+  }
+}

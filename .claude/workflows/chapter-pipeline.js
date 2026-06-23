@@ -14,14 +14,14 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch22',
-  slug: 'ch22-model-definitions',
-  focus: '确立 vLLM v1 模型契约(以 Llama 为最简参考): (vllm_config, prefix) 构造约定、QKV/Row/MergedColumnParallelLinear 等 TP 切分线性层、Attention 层作为统一封装入口、权重加载(model_loader 按 packed_modules_mapping 装载并切分到各 TP rank)、LlamaModel/LlamaForCausalLM 结构。Part VI 模型层开篇',
-  highlight: 'model-definitions',
+  chapter_id: 'ch23',
+  slug: 'ch23-custom-ops-and-compilation',
+  focus: '模型层如何变成融合、图捕获的 kernel: CustomOp 基类的两级 dispatch(__init__ 时一次性选 forward_cuda vs forward_native、enabled() 按平台/配置决定)、@support_torch_compile 装饰器把 nn.Module 包成可编译、compilation backend 的 piecewise 图捕获(在 attention 等不可融合算子处切图、其余段走 CUDA graph)、自定义算子注册进 torch 图避免 graph break。回收 f17(Attention 吞掉的 self.attn 算子进 torch.compile 图)。以 RMSNorm 为 CustomOp 实例',
+  highlight: 'custom-ops-and-compilation',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
-  paths: ['vllm/model_executor/models/llama.py', 'vllm/model_executor/layers/attention/attention.py', 'vllm/model_executor/layers/linear.py', 'vllm/model_executor/model_loader/__init__.py'],
+  paths: ['vllm/model_executor/custom_op.py', 'vllm/compilation/decorators.py', 'vllm/compilation/backends.py', 'vllm/model_executor/layers/layernorm.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
