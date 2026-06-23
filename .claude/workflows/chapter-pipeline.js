@@ -14,14 +14,14 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch19',
-  slug: 'ch19-model-runner',
-  focus: '前向与采样解耦: execute_model() 两阶段(non_block 发起前向、返回 None + 缓存 ExecuteModelState)、sample_tokens() 解包 state 做采样、_bookkeeping_sync 把新 token 写回 input_batch、CUDA graph dispatch(piecewise/full)。回收 f13(持久批次跨拍存活: 新 token 写回 token_ids_cpu slot 行/output_token_ids 增长)。承接 ch18 持久批次, 呼应 ch11 EngineCore 层重叠机制',
-  highlight: 'model-runner',
+  chapter_id: 'ch20',
+  slug: 'ch20-distributed-parallelism',
+  focus: '分布式并行的群组与集合通信: GroupCoordinator(TP/PP/DP/EP 各维度进程组的统一抽象)、CPU(gloo)+device(NCCL) 双群组、all_reduce/all_gather/reduce_scatter 集合原语、为 torch.compile 注册的 custom-op 封装(避免 graph break)、PP 的 P2P send/recv。Part V 执行层并行收官',
+  highlight: 'distributed-parallelism',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
-  paths: ['vllm/v1/worker/gpu_model_runner.py', 'vllm/v1/worker/gpu_input_batch.py', 'vllm/v1/worker/block_table.py'],
+  paths: ['vllm/distributed/parallel_state.py', 'vllm/v1/executor/multiproc_executor.py', 'vllm/v1/executor/ray_executor.py', 'vllm/distributed/device_communicators/base_device_communicator.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
