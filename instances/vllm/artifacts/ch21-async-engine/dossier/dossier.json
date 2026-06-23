@@ -1,0 +1,241 @@
+{
+  "chapter": "ch21",
+  "title": "异步通信与数据并行：惰性 PP 同步、DP wave 共识、负载均衡",
+  "source_pin": "f3fef123",
+  "scope_note": "本章讲分布式异步引擎的三个互相独立的机制，全部建立在 ch20（集合通信 all-reduce/isend/irecv）与 ch12（batch queue）之上：(1) AsyncIntermediateTensors 把 PP 的 irecv 句柄推迟到真正读 .tensors 时才 wait（计算/通信重叠）；(2) DPEngineCoreProc 用周期性 all-reduce 在多个 DP rank 间就『全体是否继续』达成共识，并以 wave 编号划分『全体运行→全体暂停』的周期；(3) DPCoordinator 进程居中收集各 engine 负载并广播 wave 状态，DPLBAsyncMPClient 据此把请求按负载分发到最空的 engine。注意 ch04 已讲三段式异步外观（AsyncLLM/AsyncMPClient 的 ZMQ 收发与 output handler），本章不重复，只补 DP/PP 维度。",
+
+  "code_spine": [
+    "vllm/v1/worker/gpu_worker.py:L772-861  Worker.execute_model：上一轮 isend 收尾 → 非首 rank irecv 包成 AsyncIntermediateTensors → execute → 非末 rank isend（惰性 PP 同步全链路）",
+    "vllm/v1/worker/gpu_worker.py:L74-103   AsyncIntermediateTensors：__getattribute__ 拦截 .tensors，首次访问才 wait_for_comm()",
+    "vllm/distributed/parallel_state.py:L954-1023  irecv_tensor_dict：发出 torch.distributed.irecv，返回 (tensor_dict, handles, postprocess)，不阻塞",
+    "vllm/v1/engine/core_client.py:L107-130  make_async_mp_client：dp_size>1 时按 external_lb 选 DPAsyncMPClient / 否则 DPLBAsyncMPClient",
+    "vllm/v1/engine/core_client.py:L1296-1314 DPAsyncMPClient.add_request_async：盖 current_wave、选 engine、engines 暂停时发 FIRST_REQ 唤醒",
+    "vllm/v1/engine/core_client.py:L1350-1378 DPLBAsyncMPClient.get_core_engine_for_request：score=waiting*4+running 选最小，本地预增 waiting",
+    "vllm/v1/engine/core_client.py:L1188-1294 run_engine_stats_update_task：订阅 coordinator stats、更新 lb_engines/current_wave/engines_running",
+    "vllm/v1/engine/coordinator.py:L194-448  DPCoordinatorProc.process_input_socket：三 socket 轮询，聚合各 engine stats，处理 wave_complete/start_wave/FIRST_REQ，向前端广播 (counts,wave,running)",
+    "vllm/v1/engine/core.py:L1790-1844  DPEngineCoreProc.run_busy_loop：step → 发布 counts → 必要时 dummy batch → all-reduce 共识 → 暂停则 rank0 报 wave_complete、wave++",
+    "vllm/v1/engine/core.py:L1846-1863  DPEngineCoreProc._has_global_unfinished_reqs：每 32 步一次 sync_dp_state，达成 pause 共识则置 ignore_start_dp_wave",
+    "vllm/config/parallel.py:L666-691  ParallelConfig.sync_dp_state：单次 2 元素 SUM all-reduce 同时得『是否有未完成』与『是否全体 pause 共识』"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/worker/gpu_worker.py",
+      "lines": "L74-103",
+      "code": "class AsyncIntermediateTensors(IntermediateTensors):\n    \"\"\"IntermediateTensors with lazy comm synchronization\"\"\"\n\n    def __init__(\n        self,\n        tensors: dict[str, torch.Tensor],\n        comm_handles: list[Handle] | None = None,\n        comm_postprocess: list[Callable[[], None]] | None = None,\n    ) -> None:\n        super().__init__(tensors)\n        self._comm_handles = comm_handles\n        self._comm_postprocess = comm_postprocess\n        self._comm_waited = False\n\n    def wait_for_comm(self) -> None:\n        if self._comm_waited:\n            return\n        if self._comm_handles:\n            for handle in self._comm_handles:\n                handle.wait()\n        if self._comm_postprocess:\n            for fn in self._comm_postprocess:\n                fn()\n        self._comm_waited = True\n\n    def __getattribute__(self, name: str):\n        # ensure `.tensors` is ready before use\n        if name == \"tensors\" and not object.__getattribute__(self, \"_comm_waited\"):\n            object.__getattribute__(self, \"wait_for_comm\")()\n        return object.__getattribute__(self, name)",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/worker/gpu_worker.py",
+      "lines": "L772-861",
+      "code": "    @torch.inference_mode()\n    def execute_model(\n        self, scheduler_output: \"SchedulerOutput\"\n    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:\n        # ensure any previous non-blocking PP sends are complete\n        if self._pp_send_work:\n            for handle in self._pp_send_work:\n                handle.wait()\n            self._pp_send_work = []\n\n        intermediate_tensors = None\n        forward_pass = scheduler_output.total_num_scheduled_tokens > 0\n        ...\n        if forward_pass and not get_pp_group().is_first_rank:\n            tensor_dict, comm_handles, comm_postprocess = (\n                get_pp_group().irecv_tensor_dict(\n                    all_gather_group=get_tp_group(),\n                    all_gather_tensors=all_gather_tensors,\n                )\n            )\n            assert tensor_dict is not None\n            intermediate_tensors = AsyncIntermediateTensors(\n                tensor_dict,\n                comm_handles=comm_handles,\n                comm_postprocess=comm_postprocess,\n            )\n\n        with self.annotate_profile(scheduler_output):\n            output = self.model_runner.execute_model(\n                scheduler_output, intermediate_tensors\n            )\n            ...\n            if isinstance(\n                output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType\n            ):\n                return output\n\n        assert isinstance(output, IntermediateTensors)\n        ...\n        # launch non-blocking send of intermediate tensors\n        self._pp_send_work = get_pp_group().isend_tensor_dict(\n            output.tensors,\n            all_gather_group=get_tp_group(),\n            all_gather_tensors=all_gather_tensors,\n        )\n\n        return None",
+      "elide": [
+        "L786-816: SP（sequence-parallel）下计算 all_gather_tensors 的分支——只影响 residual 是否需要 all-gather，PP 惰性同步主线可省略",
+        "L836-845: pooling 模型 output is None 时调 pool() 的旁支",
+        "L848-852: external_launcher / is_last_rank 的断言，正常 PP 中间 rank 恒不触发"
+      ]
+    },
+    {
+      "path": "vllm/distributed/parallel_state.py",
+      "lines": "L954-1013",
+      "code": "    def irecv_tensor_dict(\n        self,\n        src: int | None = None,\n        all_gather_group: \"GroupCoordinator | None\" = None,\n        all_gather_tensors: dict[str, bool] | None = None,\n    ) -> tuple[\n        dict[str, torch.Tensor | Any] | None,\n        list[Handle],\n        list[Callable[[], None]],\n    ]:\n        if not torch.distributed.is_initialized() or self.world_size == 1:\n            return None, [], []\n\n        if src is None:\n            src = (self.rank_in_group - 1) % self.world_size\n        ...\n        recv_metadata_list = self.recv_object(src=src)\n        tensor_dict: dict[str, Any] = {}\n        handles: list[Handle] = []\n        postprocess: list[Callable[[], None]] = []\n\n        for key, value in recv_metadata_list:\n            if isinstance(value, TensorMetadata):\n                full_tensor = torch.empty(\n                    value.size, dtype=value.dtype, device=value.device\n                )\n                ...\n                if self._should_use_all_gather(...):\n                    ...\n                    handle = torch.distributed.irecv(\n                        slice_tensor, src=self.ranks[src], group=comm_group\n                    )\n                    handles.append(handle)\n                    # postprocess closure does the all_gather once handle is waited\n                    postprocess.append(_postprocess)\n                else:\n                    handle = torch.distributed.irecv(\n                        full_tensor, src=self.ranks[src], group=comm_group\n                    )\n                    handles.append(handle)\n                tensor_dict[key] = full_tensor",
+      "elide": [
+        "L971-978: use_cpu_custom_send_recv 的同步快路径（自定义 CPU communicator，返回空 handles 列表）——非 GPU 主线",
+        "L998-1000: numel()==0 空张量直接放入、不发 irecv 的边界处理",
+        "L1015-1023: _postprocess 闭包内部用 all_gather_group.all_gather 重组分片的细节",
+        "省略号处为元数据 recv（先收 shape/dtype，再据此 torch.empty 预分配接收缓冲区），这是 irecv 之所以能异步的前提"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/core_client.py",
+      "lines": "L107-130",
+      "code": "    def make_async_mp_client(\n        vllm_config: VllmConfig,\n        executor_class: type[Executor],\n        log_stats: bool,\n        client_addresses: dict[str, str] | None = None,\n        client_count: int = 1,\n        client_index: int = 0,\n    ) -> \"AsyncMPClient\":\n        parallel_config = vllm_config.parallel_config\n        client_args = (\n            vllm_config,\n            executor_class,\n            log_stats,\n            client_addresses,\n            client_count,\n            client_index,\n        )\n        if parallel_config.data_parallel_size > 1:\n            if parallel_config.data_parallel_external_lb:\n                # External load balancer - client per DP rank.\n                return DPAsyncMPClient(*client_args)\n            # Internal load balancer - client balances to all DP ranks.\n            return DPLBAsyncMPClient(*client_args)\n        return AsyncMPClient(*client_args)",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/core_client.py",
+      "lines": "L1296-1314",
+      "code": "    async def add_request_async(self, request: EngineCoreRequest) -> None:\n        self._ensure_stats_update_task()\n\n        request.current_wave = self.current_wave\n        request.client_index = self.client_index\n\n        chosen_engine = self.get_core_engine_for_request(request)\n        to_await = self._send_input(EngineCoreRequestType.ADD, request, chosen_engine)\n        if not self.engines_running:\n            # Notify coordinator that we're sending a request\n            req_msg = msgspec.msgpack.encode((\"FIRST_REQ\", chosen_engine))\n            await self.first_req_send_socket.send(req_msg)\n\n        await to_await\n\n        self._ensure_output_queue_task()\n\n    def get_core_engine_for_request(self, request: EngineCoreRequest):\n        return self.core_engine",
+      "elide": [
+        "get_core_engine_for_request 这里是 DPAsyncMPClient（external LB）的默认实现，恒返回本 client 绑定的单个 engine；DPLBAsyncMPClient 覆盖它做真正的负载均衡（见下一段）"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/core_client.py",
+      "lines": "L1350-1378",
+      "code": "    def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:\n        # Engines are in rank order.\n        if (eng_index := request.data_parallel_rank) is None and (\n            eng_index := get_late_interaction_engine_index(\n                request.pooling_params, len(self.core_engines)\n            )\n        ) is None:\n            current_counts = self.lb_engines\n            # TODO use P2C alg for larger DP sizes\n            num_engines = len(current_counts)\n            min_score = sys.maxsize\n            eng_index = 0\n            for i in range(num_engines):\n                # Start from client_index to help with balancing when engines\n                # are empty.\n                idx = (self.eng_start_index + i) % num_engines\n                waiting, running = current_counts[idx]\n                score = waiting * 4 + running\n                if score < min_score:\n                    min_score = score\n                    eng_index = idx\n            # Increment local waiting count for better balancing between stats\n            # updates from the coordinator (which happen every 100ms).\n            current_counts[eng_index][0] += self.client_count\n\n        chosen_engine = self.core_engines[eng_index]\n        # Record which engine is chosen for this request, to handle aborts.\n        self.reqs_in_flight[request.request_id] = chosen_engine\n        return chosen_engine",
+      "elide": [
+        "前两个 walrus 分支：请求显式指定了 data_parallel_rank，或 late-interaction pooling 模型按 hash 固定路由——都跳过负载均衡直接定 engine"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/core_client.py",
+      "lines": "L1266-1290",
+      "code": "                    buf = None\n                    while True:\n                        # Drain all stats events (we only care about latest).\n                        future: asyncio.Future[bytes] = socket.recv(flags=zmq.NOBLOCK)\n                        if isinstance(future.exception(), zmq.Again):\n                            break\n                        buf = future.result()\n                    if buf is None:\n                        continue\n\n                    # Update local load-balancing state.\n                    counts, wave, running = msgspec.msgpack.decode(buf)\n                    self.current_wave = wave\n                    self.engines_running = running\n                    if counts is not None:\n                        # Running and waiting counts are global from the\n                        # Coordinator including all EngineCores. Slice to get\n                        # just the cores managed by this client.\n                        ranks = self.engine_ranks_managed\n                        count_slice = slice(ranks[0], ranks[-1] + 1)\n                        sliced_counts = counts[count_slice]\n                        self.lb_engines = sliced_counts",
+      "elide": [
+        "前半段（L1206-1264）：FIRST_REQ / SCALE_ELASTIC_EP 的 XSUB 上行处理——本段聚焦下行 stats 的消费：client 只信任 coordinator 周期广播的全局 (counts,wave,running)，并切片出自己管的 rank 区间"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/coordinator.py",
+      "lines": "L368-448",
+      "code": "                if output_back in events:\n                    # We received a message from one of the engines.\n\n                    buffer = output_back.recv()\n                    outputs: EngineCoreOutputs = decoder.decode(buffer)\n\n                    assert not outputs.outputs\n                    assert outputs.utility_output is None\n\n                    eng_index = outputs.engine_index\n                    scheduler_stats = outputs.scheduler_stats\n                    if scheduler_stats:\n                        # 1. Updated request load stats - update our local\n                        # state with these.\n                        stats = self.engines[eng_index].request_counts\n                        ...\n                        stats[0] = scheduler_stats.num_waiting_reqs\n                        stats[1] = scheduler_stats.num_running_reqs\n                        stats_changed = True\n\n                    # Wave coordination: handle wave completion and start notifications\n                    if self.enable_wave_coordination:\n                        if (wave := outputs.wave_complete) is not None:\n                            # 2. Notification from rank 0 engine that we've\n                            # moved into the global paused state\n                            # (engines_running==False).\n                            if current_wave <= wave:\n                                new_wave = wave + 1\n                                current_wave = new_wave\n                                engines_running = False\n                                wave_state_changed = True\n                        elif (wave := outputs.start_wave) is not None and (\n                            wave > current_wave\n                            or (wave == current_wave and not engines_running)\n                        ):\n                            # 3. The engine received request for a non-current wave\n                            # so we must ensure that other engines progress to the\n                            # next wave (race condition handling).\n                            current_wave = wave\n                            engines_running = True\n                            wave_state_changed = True\n                            self._send_start_wave(publish_back, wave, eng_index)\n\n                if wave_state_changed:\n                    message = (None, current_wave, engines_running)\n                    publish_front.send(msgspec.msgpack.encode(message))",
+      "elide": [
+        "L385-409 内部 stats_step/stats_wave 的乱序检测（out-of-order step 的 warning、last_step_counts 缓存）——只为正确排序统计快照，不影响 wave 状态机主线",
+        "省略号处为 stats 乱序判定细节"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/coordinator.py",
+      "lines": "L306-366",
+      "code": "                if publish_front in events:\n                    buffer = publish_front.recv()\n                    if buffer in (b\"\\x01\", b\"\\x00\"):\n                        # Ignore subscription messages.\n                        continue\n\n                    decoded = msgspec.msgpack.decode(buffer)\n                    ...\n                    # Wave coordination: handle new-request messages from front-end.\n                    if self.enable_wave_coordination:\n                        # We received a message on the front-end XPUB socket,\n                        # from an API server sending a new request while the\n                        # engines are paused, so that we can wake the other\n                        # engines.\n                        engine_to_exclude, wave = decoded\n                        if not engines_running:\n                            if wave < current_wave:\n                                # If the wave number is stale, ensure the message\n                                # is handled by all the engines.\n                                engine_to_exclude = None\n\n                            engines_running = True\n                            wave_state_changed = True\n                            self._send_start_wave(\n                                publish_back, current_wave, engine_to_exclude\n                            )",
+      "elide": [
+        "L313-346: SCALE_ELASTIC_EP（弹性扩缩容）分支——动态增删 EngineState，与 wave 主线正交"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/coordinator.py",
+      "lines": "L449-465",
+      "code": "    @staticmethod\n    def _send_start_wave(\n        socket: zmq.Socket, wave: int, exclude_engine_index: int | None\n    ):\n        \"\"\"Broadcast the START_DP_WAVE message to all the engines.\n        It includes the current wave number and index of engine which\n        has already received a request with this wave number and so doesn't\n        require additional notification.\n        \"\"\"\n        wave_encoded = msgspec.msgpack.encode((wave, exclude_engine_index))\n        socket.send_multipart((EngineCoreRequestType.START_DP_WAVE.value, wave_encoded))\n\n    def _get_engine_counts(self, do_copy=False) -> list[list[int]]:\n        \"\"\"Return list of [waiting, running] count lists for each engine.\"\"\"\n        if do_copy:\n            return [copy.copy(e.request_counts) for e in self.engines]\n        return [e.request_counts for e in self.engines]",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L1790-1844",
+      "code": "    def run_busy_loop(self):\n        \"\"\"Core busy loop of the EngineCore for data parallel case.\"\"\"\n\n        # Loop until process is sent a SIGINT or SIGTERM\n        while self._handle_shutdown():\n            # 1) Poll the input queue until there is work to do.\n            self._process_input_queue()\n            ...\n            executed = self._process_engine_step()\n            self._maybe_publish_request_counts()\n\n            local_unfinished_reqs = self.scheduler.has_unfinished_requests()\n            if not executed:\n                if not local_unfinished_reqs and not self.engines_running:\n                    # All engines are idle.\n                    continue\n\n                # We are in a running state and so must execute a dummy pass\n                # if the model didn't execute any ready requests.\n                self.execute_dummy_batch()\n\n            # 3) All-reduce operation to determine global unfinished reqs.\n            self.engines_running = self._has_global_unfinished_reqs(\n                local_unfinished_reqs\n            )\n\n            if not self.engines_running:\n                if self.dp_rank == 0 or not self.has_coordinator:\n                    # Notify client that we are pausing the loop.\n                    # In the coordinator case, dp rank 0 sends updates to the\n                    # coordinator. Otherwise (offline spmd case), each rank\n                    # sends the update to its colocated front-end process.\n                    client_index = -1 if self.has_coordinator else 0\n                    self.output_queue.put_nowait(\n                        (\n                            client_index,\n                            EngineCoreOutputs(wave_complete=self.current_wave),\n                        )\n                    )\n                # Increment wave count and reset step counter.\n                self.current_wave += 1\n                self.step_counter = 0\n\n        raise SystemExit",
+      "elide": [
+        "L1798-1804: eep_scaling_state 弹性 EP 扩缩容进度推进——与 wave 主线正交"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L1846-1863",
+      "code": "    def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:\n        # Optimization - only perform finish-sync all-reduce every 32 steps.\n        self.step_counter += 1\n        if self.step_counter % 32 != 0:\n            return True\n\n        has_unfinished, pause_consensus = ParallelConfig.sync_dp_state(\n            self.dp_group,\n            has_unfinished=local_unfinished,\n            pending_pause=self.pending_pause,\n        )\n\n        if pause_consensus:\n            self.ignore_start_dp_wave = True\n            self.pending_pause = False\n            logger.debug(\"DP pause consensus reached, ignoring START_DP_WAVE.\")\n\n        return has_unfinished",
+      "elide": []
+    },
+    {
+      "path": "vllm/config/parallel.py",
+      "lines": "L666-691",
+      "code": "    @staticmethod\n    def sync_dp_state(\n        dp_group: ProcessGroup, has_unfinished: bool, pending_pause: bool\n    ) -> tuple[bool, bool]:\n        \"\"\"Combined all-reduce for DP state synchronization.\n\n        Uses a single SUM all-reduce on a 2-element tensor:\n          [0] = 1 if this rank has unfinished work, else 0.\n                SUM > 0 ≡ logical OR across ranks → any rank has work.\n          [1] = 1 if this rank has a pending pause request, else 0.\n                SUM == dp_size ≡ all ranks reached pause consensus.\n        ...\n        Returns:\n            (has_unfinished_global, pause_consensus)\n        \"\"\"\n        tensor = torch.tensor(\n            [int(has_unfinished), int(pending_pause)], dtype=torch.int32, device=\"cpu\"\n        )\n        torch.distributed.all_reduce(tensor, op=ReduceOp.SUM, group=dp_group)\n        dp_size = dp_group.size()\n        pause_count = tensor[1].item()\n        has_unfinished_global = tensor[0].item() > 0 or pause_count % dp_size != 0\n        return has_unfinished_global, pause_count == dp_size",
+      "elide": [
+        "对照旧版 has_unfinished_dp（L656-664）：那是单元素 MAX all-reduce（纯 OR），sync_dp_state 把『有无未完成(OR)』与『是否全体 pause(SUM==dp_size)』合进一次 all-reduce 省一轮通信"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L1710-1775",
+      "code": "    def add_request(self, request: Request, request_wave: int = 0):\n        super().add_request(request, request_wave)\n        if self.has_coordinator and request_wave != self.current_wave:\n            if request_wave > self.current_wave:\n                self.current_wave = request_wave\n            elif (\n                not self.engines_running\n                and self.scheduler.pause_state == PauseState.UNPAUSED\n            ):\n                # Request received for an already-completed wave, notify\n                # front-end that we need to start the next one.\n                self.engines_running = True\n                self.output_queue.put_nowait(\n                    (-1, EngineCoreOutputs(start_wave=self.current_wave))\n                )\n    ...\n    def _handle_client_request(\n        self, request_type: EngineCoreRequestType, request: Any\n    ) -> None:\n        if request_type == EngineCoreRequestType.START_DP_WAVE:\n            if self.ignore_start_dp_wave:\n                return\n            new_wave, exclude_eng_index = request\n            if exclude_eng_index != self.engine_index and (\n                new_wave >= self.current_wave\n            ):\n                self.current_wave = new_wave\n                if not self.engines_running:\n                    self.engines_running = True\n        else:\n            super()._handle_client_request(request_type, request)",
+      "elide": [
+        "L1726-1755 之间的 resume_scheduler / barrier 等方法——与 add_request/START_DP_WAVE 的 wave 唤醒主线相邻但非本段重点",
+        "START_DP_WAVE 处理里 exclude_eng_index==self.engine_index 时跳过，是因为该 engine 已直接收到带新 wave 号的请求、无需重复唤醒"
+      ]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "AsyncIntermediateTensors", "file": "vllm/v1/worker/gpu_worker.py", "responsibility": "IntermediateTensors 子类，持有 PP irecv 的 comm_handles 与 postprocess 闭包；重写 __getattribute__，首次访问 .tensors 时才调 wait_for_comm() 等待 irecv 完成并重组分片——把 PP 接收的同步点推迟到真正用到隐藏状态时，让接收通信与其它准备工作重叠。"},
+    {"name": "Worker.execute_model", "file": "vllm/v1/worker/gpu_worker.py", "responsibility": "PP 流水线一格的执行：先 wait 上一轮挂起的 isend；非首 rank 用 irecv_tensor_dict 拿到惰性接收句柄包成 AsyncIntermediateTensors 传给 model_runner；非末 rank 执行后用 isend_tensor_dict 非阻塞发送，句柄存入 _pp_send_work 留待下一轮 wait。"},
+    {"name": "GroupCoordinator.irecv_tensor_dict / isend_tensor_dict", "file": "vllm/distributed/parallel_state.py", "responsibility": "PP 组的张量字典异步收发。irecv 先收元数据（shape/dtype）预分配缓冲，再对每个张量发 torch.distributed.irecv，返回 (tensor_dict, handles, postprocess) 而不阻塞；postprocess 闭包在 handle.wait 后做可能的 all_gather 重组。"},
+    {"name": "DPEngineCoreProc", "file": "vllm/v1/engine/core.py", "responsibility": "DP 上下文里运行 EngineCore 的后台进程（仅 MoE）。维护 current_wave/step_counter/pending_pause/ignore_start_dp_wave；run_busy_loop 每步后对 dp_group 做周期性 all-reduce 共识决定全体是否继续，全体空闲则 rank0 报 wave_complete 并 wave++；处理 START_DP_WAVE 唤醒。"},
+    {"name": "DPCoordinator / DPCoordinatorProc", "file": "vllm/v1/engine/coordinator.py", "responsibility": "DP>1 时的独立协调进程，居中于多个 DP engine rank 与多个前端 API server 之间。三 ZMQ socket（前端 XPUB / 后端 PULL 收 stats / 后端 XPUB 发指令）：收集各 engine 的 [waiting,running] 负载并周期广播给前端；跟踪全局 wave 号与 running 状态；engines 暂停时收到新请求则广播 START_DP_WAVE 唤醒全体。"},
+    {"name": "DPAsyncMPClient", "file": "vllm/v1/engine/core_client.py", "responsibility": "external-LB 默认的 DP 异步客户端：每 client 绑一个 DP rank。add_request_async 给请求盖 current_wave，engines 暂停时经 first_req_socket 发 FIRST_REQ 通知 coordinator 唤醒；run_engine_stats_update_task 订阅 coordinator 广播更新 current_wave/engines_running/lb_engines。"},
+    {"name": "DPLBAsyncMPClient", "file": "vllm/v1/engine/core_client.py", "responsibility": "internal-LB（无外部负载均衡器时默认）：在所有 DP engine 间分发。get_core_engine_for_request 用 score=waiting*4+running 选最空 engine，并本地预增 waiting 抵消 100ms stats 刷新延迟；reqs_in_flight 记录路由以便 abort 定向。"},
+    {"name": "ParallelConfig.sync_dp_state", "file": "vllm/config/parallel.py", "responsibility": "DP 状态同步原语：单次 2 元素 int32 SUM all-reduce，[0] OR 得『全局是否有未完成请求』，[1] 计数得『是否所有 rank 都 pending_pause（达成暂停共识）』，一次通信解决两个共识问题。"}
+  ],
+
+  "data_flow": [
+    "PP 惰性同步：Worker.execute_model 进入 → 若 _pp_send_work 非空，先 handle.wait() 收尾上一轮 isend（gpu_worker.py:L777-780）",
+    "PP-2：非首 rank 调 get_pp_group().irecv_tensor_dict → 收元数据、预分配、发 torch.distributed.irecv，立即返回 (tensor_dict,handles,postprocess)（parallel_state.py:L988-1013）",
+    "PP-3：包成 AsyncIntermediateTensors(tensor_dict, handles, postprocess)，此时尚未 wait（gpu_worker.py:L826-830）",
+    "PP-4：model_runner.execute_model 内部首次读 intermediate_tensors.tensors → __getattribute__ 触发 wait_for_comm() → handle.wait()+postprocess（gpu_worker.py:L99-103, L88-97）",
+    "PP-5：非末 rank 执行完用 isend_tensor_dict 非阻塞发送，句柄存 _pp_send_work 留到下一轮（gpu_worker.py:L855-859）",
+    "DP wave-1：DPEngineCoreProc.run_busy_loop 每轮 _process_input_queue → _process_engine_step → _maybe_publish_request_counts 把 [waiting,running]+step_counter+current_wave 发给 coordinator（core.py:L1796-1807, L1777-1788）",
+    "DP wave-2：本地无 ready 但 engines_running 则 execute_dummy_batch 保持各 rank 步调一致（core.py:L1815-1817）",
+    "DP wave-3：_has_global_unfinished_reqs 每 32 步调 sync_dp_state 做 all-reduce，得『全局是否还有未完成』(OR) 与『是否全体 pause 共识』(SUM==dp_size)（core.py:L1846-1856, parallel.py:L684-691）",
+    "DP wave-4：若 all-reduce 判定全体无未完成 → engines_running=False → rank0 经 output_queue 发 EngineCoreOutputs(wave_complete=current_wave) 给 coordinator，current_wave++、step_counter 归零（core.py:L1824-1842）",
+    "DP coord-1：DPCoordinatorProc 从 output_back PULL 收到 wave_complete → current_wave=wave+1、engines_running=False、wave_state_changed=True（coordinator.py:L414-427）",
+    "DP coord-2：coordinator 周期/状态变化时经 publish_front 向前端广播 (counts, current_wave, engines_running)（coordinator.py:L282-284, L445-447）",
+    "DP client-1：DP*AsyncMPClient.run_engine_stats_update_task 收到广播 → 更新 self.current_wave/engines_running，counts 切片成 self.lb_engines（core_client.py:L1277-1287）",
+    "DP route：DPLBAsyncMPClient.get_core_engine_for_request 按 lb_engines 的 score=waiting*4+running 选最空 engine、预增本地 waiting、记 reqs_in_flight（core_client.py:L1357-1377）",
+    "DP wake：add_request_async 给请求盖 current_wave；若 engines 暂停，经 first_req_socket 发 ('FIRST_REQ', chosen_engine) → coordinator 广播 START_DP_WAVE 唤醒全体（core_client.py:L1299-1307, coordinator.py:L355-366, L459）",
+    "DP wake-recv：各 DPEngineCoreProc._handle_client_request 收 START_DP_WAVE → 非 exclude 且 new_wave>=current_wave 则置 engines_running=True 进入空转步进（core.py:L1760-1773）"
+  ],
+
+  "design_decisions": [
+    {"decision": "PP 接收用 AsyncIntermediateTensors 把 irecv 的 wait 推迟到首次访问 .tensors", "why": "irecv 发出后接收方还要做 input 准备、KV 取址、attention metadata 构建等与接收无关的工作；推迟 wait 让这段 CPU/GPU 准备与 NCCL 接收重叠，缩短 PP bubble。__getattribute__ 钩子保证『谁先碰 .tensors 谁负责 wait』，对 model_runner 透明。", "evidence": "vllm/v1/worker/gpu_worker.py:L99-103"},
+    {"decision": "PP 发送也是非阻塞 isend，句柄延迟到下一轮 execute_model 开头才 wait", "why": "发送方发完隐藏状态即可继续下一轮调度/前处理，不必原地等对端收完；把 send 完成检查推迟一整轮，进一步重叠跨 stage 通信与本地计算。", "evidence": "vllm/v1/worker/gpu_worker.py:L776-780, L855-859"},
+    {"decision": "DP 用周期性 all-reduce（每 32 步）就『全局是否继续』达成共识，而非每步同步", "why": "每步 all-reduce 通信开销大；MoE 的 DP 要求各 rank 步调一致（否则 expert all-to-all 会 hang），但『是否还有请求』变化不频繁，32 步一次足够，期间无 ready 请求的 rank 跑 dummy batch 维持对齐。", "evidence": "vllm/v1/engine/core.py:L1847-1850, L1815-1817"},
+    {"decision": "用单次 2 元素 SUM all-reduce 同时解决『有无未完成』与『是否全体暂停共识』", "why": "把两个独立共识合进一次集合通信：[0] 的 SUM>0 等价 OR（任一 rank 有活就继续），[1] 的 SUM==dp_size 表示所有 rank 都请求暂停。省一轮 all-reduce，且 pause 计数非整除时 has_unfinished_global 也为真，避免半数 rank 暂停导致 all-to-all 错配。", "evidence": "vllm/config/parallel.py:L672-691"},
+    {"decision": "wave 编号 = 全体从 running→paused 的次数，由 rank0 经 coordinator 单点广播", "why": "用一个单调递增计数把『全体运行→全体暂停』的周期离散化，作为请求归属与唤醒去重的依据。请求盖上发起时的 current_wave，engine 收到 stale wave（< 自身 current_wave）的请求时主动报 start_wave，coordinator 据此把落后的 rank 推进到正确 wave，处理唤醒竞态。", "evidence": "vllm/v1/engine/coordinator.py:L33-49, L414-443; vllm/v1/engine/core.py:L1841"},
+    {"decision": "暂停共识达成后置 ignore_start_dp_wave，丢弃在途的 START_DP_WAVE", "why": "两阶段暂停：阶段1 各 rank 设 pending_pause 并继续空转步进直到 all-reduce 确认全体同意；阶段2 一旦共识达成就忽略此前可能在管道里飞行的唤醒消息，否则会出现『刚共识暂停又被旧唤醒拉起』、破坏全体一致暂停。", "evidence": "vllm/v1/engine/core.py:L1646-1652, L1858-1861, L1761-1762"},
+    {"decision": "DPCoordinator 独立进程居中，前端不直接与 engine 交换 wave/负载", "why": "多前端 + 多 engine 的 N×M 拓扑下，让一个 coordinator 聚合 stats 并单点决定 wave 状态，避免每个前端各自 all-reduce/广播；用 ZMQ XPUB/XSUB 发布订阅天然支持多前端多 engine 扇出。stats 仅在变化时按 100ms 间隔发、否则 5s 心跳。", "evidence": "vllm/v1/engine/coordinator.py:L23-57, L262-285"},
+    {"decision": "internal LB 用 score=waiting*4+running 选 engine，并本地预增 waiting", "why": "waiting 队列对延迟的影响远大于已在跑的 running（权重 4:1）；coordinator 广播间隔 100ms，期间多个请求若都看同一份旧 counts 会全挤到同一 engine，故每选中一次就本地 +client_count 预增，近似实时均衡。从 eng_start_index 起轮询让空集群也能打散。", "evidence": "vllm/v1/engine/core_client.py:L1367, L1373, L1363-1365"},
+    {"decision": "external LB 模式（DPAsyncMPClient）每 client 绑一个 rank、不在 client 侧均衡", "why": "外部已有负载均衡器（如 K8s/router）按 rank 分流时，client 只需把请求送到自己绑定的 engine，且此模式下 engine 不发 stats，coordinator 仅在 wave/running 变化时通知前端，省掉负载统计通路。", "evidence": "vllm/v1/engine/core_client.py:L125-127, L1313-1314; coordinator.py:L54-56"},
+    {"decision": "engines 暂停时新请求经独立 first_req_socket 抢先通知 coordinator 唤醒", "why": "请求落到某个 engine 前，需先把全体从 paused 拉回 running（MoE all-to-all 要求全员在场）。client 在 _send_input 的同时（不等其完成）经 PAIR socket 发 FIRST_REQ，coordinator 立即广播 START_DP_WAVE，最小化唤醒延迟。", "evidence": "vllm/v1/engine/core_client.py:L1304-1309, coordinator.py:L348-366"}
+  ],
+
+  "theory": [
+    "PP bubble 与重叠：朴素 PP 中，stage k 收到 stage k-1 的隐藏状态前必须空等（bubble）。惰性 wait 把『接收完成』推迟到隐藏状态真正被读取的瞬间，使 recv 与中间的 input/metadata 准备并行。理想情况下 bubble 缩短约等于这段准备时间，但不改变 PP 固有的首/尾流水填充开销。",
+    "DP all-reduce 共识的正确性：sync_dp_state 的 [0] 维 SUM>0 等价跨 rank 的逻辑 OR——只要任一 rank 还有请求，全体继续，保证不会有 rank 提前退出导致 MoE expert all-to-all 缺人而 hang。[1] 维 SUM==dp_size 是全员一致的 AND（计数等于规模）。两者用一次 all_reduce(SUM) 完成。",
+    "通信频率权衡：每 32 步才 all-reduce 一次（core.py:L1849）。设单步 t_step、all-reduce t_ar，则均摊同步开销 ≈ t_ar/32；代价是最坏情况某 rank 空闲后最多多跑 31 步 dummy batch 才被发现，换取通信开销下降一个数量级。",
+    "负载均衡评分：score=4·waiting+running 是一个把队首延迟近似为线性的启发式——waiting 中的请求要等当前 batch 跑完才上车，对尾延迟贡献被赋更高权重 4。本地预增 +client_count 是对 coordinator 100ms 刷新滞后的前馈补偿，避免羊群效应。注释标注 P2C（power-of-two-choices）是更大 DP 规模下的待办优化方向。",
+    "wave 状态机：全局状态在 (current_wave, engines_running) 二元组上演化。running→paused 由 rank0 的 all-reduce 触发 wave_complete（wave++）；paused→running 由任一前端的 FIRST_REQ 或 engine 报 start_wave 触发 START_DP_WAVE。stale-wave（请求带的 wave < engine current_wave）和共识窗口内的迟到唤醒是两类竞态，分别由 engine_to_exclude=None 全播 和 ignore_start_dp_wave 处理。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "弹性 EP 扩缩容（Elastic EP / SCALE_ELASTIC_EP）全部路径：DPEngineCoreProc.reinitialize_distributed、_eep_send_engine_core_notification、eep_scaling_state 及 run_busy_loop 中 eep 分支（core.py:L1798-1804, L1865-1921+）；coordinator.py:L313-346 的 SCALE_ELASTIC_EP 处理与 self.engines 动态增删；core_client.py 的 scale_elastic_ep/eep_* 系列、ElasticScalingCache、L1218-1253 的扩缩容分支", "why_safe": "弹性扩缩容是正交的运维特性，与本章三主题（惰性 PP 同步、wave 共识、负载均衡）无控制流耦合；删后 DP 在固定规模下行为完全不变。"},
+      {"what": "stats 乱序检测细节：coordinator.py:L385-406 的 last_stats_step/last_stats_wave 比较与 out-of-order warning、last_step_counts 缓存", "why_safe": "仅为统计快照排序与日志，删后负载数值可能少一层时序保护但 wave 状态机与路由主线不受影响；属于鲁棒性增强而非正确性骨架。"},
+      {"what": "SP（sequence-parallel）相关的 all_gather_tensors 计算分支：gpu_worker.py:L789-816 及 irecv_tensor_dict 内 _should_use_all_gather/postprocess all_gather 重组（parallel_state.py:L1002-1023）", "why_safe": "SP 是与 PP 叠加的可选优化；不开 SP 时 all_gather_tensors 为空、postprocess 为空列表，AsyncIntermediateTensors 的惰性 wait 主线（handle.wait）完整保留。可保留为『无 all-gather 的纯 irecv』形态。"},
+      {"what": "use_cpu_custom_send_recv 同步快路径（parallel_state.py:L971-978）与 numel()==0 空张量分支（L998-1000）", "why_safe": "前者是自定义 CPU communicator 的旁路（非 GPU NCCL 主线），后者是边界处理；删后标准 GPU irecv 异步主线不变。"},
+      {"what": "barrier()（test-only）、reinitialize_distributed、profiler/sleep/wake_up 等 Worker 非 PP-通信方法", "why_safe": "与惰性 PP 同步无关的工具/测试/运维方法。"},
+      {"what": "has_unfinished_dp（旧版单元素 MAX all-reduce，parallel.py:L656-664）的独立使用点若仅作对照可不在精简版重复实现", "why_safe": "sync_dp_state 已是当前 run_busy_loop 的同步入口；保留 sync_dp_state 即可，has_unfinished_dp 仅在 resume_scheduler 屏障用到，可按需保留单点。"}
+    ],
+    "must_keep": [
+      {"symbol": "AsyncIntermediateTensors", "why": "惰性 PP 同步的核心载体，读者必须看到它如何持有 handles 并延迟 wait。"},
+      {"symbol": "wait_for_comm", "why": "实际执行 handle.wait()+postprocess 的方法，是『推迟到真正用时』的兑现点。"},
+      {"symbol": "__getattribute__", "why": "拦截 .tensors 访问触发 wait 的钩子；没有它惰性就是空话。"},
+      {"symbol": "_comm_handles", "why": "挂起的 irecv 句柄列表，是惰性同步的状态。"},
+      {"symbol": "irecv_tensor_dict", "why": "返回 (tensor_dict, handles, postprocess) 的非阻塞接收，惰性的来源。"},
+      {"symbol": "isend_tensor_dict", "why": "非阻塞发送，对应 _pp_send_work 的延迟 wait。"},
+      {"symbol": "_pp_send_work", "why": "跨轮挂起的 isend 句柄，体现发送侧也惰性。"},
+      {"symbol": "execute_model", "why": "PP 一格的完整收发控制流（wait→irecv→exec→isend）必须保留。"},
+      {"symbol": "DPEngineCoreProc", "why": "DP engine 进程主体，wave 状态机宿主。"},
+      {"symbol": "run_busy_loop", "why": "DP 忙循环：step→发布 counts→dummy batch→共识→暂停/wave++ 的骨架。"},
+      {"symbol": "_has_global_unfinished_reqs", "why": "每 32 步 all-reduce 共识入口，决定全体是否继续。"},
+      {"symbol": "sync_dp_state", "why": "单次 SUM all-reduce 同时得 has_unfinished 与 pause_consensus 的原语。"},
+      {"symbol": "current_wave", "why": "wave 编号，请求归属与唤醒去重的核心状态。"},
+      {"symbol": "step_counter", "why": "32 步同步节流计数，必须可见。"},
+      {"symbol": "pending_pause", "why": "两阶段暂停的本地标志，进 all-reduce 的 [1] 维。"},
+      {"symbol": "ignore_start_dp_wave", "why": "暂停共识后丢弃迟到唤醒的开关，处理竞态。"},
+      {"symbol": "execute_dummy_batch", "why": "无 ready 请求但仍 running 时维持各 rank 步调一致的空转。"},
+      {"symbol": "wave_complete", "why": "rank0 报给 coordinator 的 running→paused 信号字段。"},
+      {"symbol": "start_wave", "why": "engine 报告 stale-wave 请求、请求推进的字段。"},
+      {"symbol": "_handle_client_request", "why": "DP 版处理 START_DP_WAVE 唤醒的入口。"},
+      {"symbol": "DPCoordinator", "why": "协调进程对外句柄类，前后端地址与生命周期。"},
+      {"symbol": "DPCoordinatorProc", "why": "协调主体进程。"},
+      {"symbol": "process_input_socket", "why": "coordinator 的三 socket 轮询主循环（聚合 stats + wave 状态机 + 广播）。"},
+      {"symbol": "_send_start_wave", "why": "广播 START_DP_WAVE（含 exclude 去重）的方法。"},
+      {"symbol": "_get_engine_counts", "why": "组装各 engine [waiting,running] 负载列表。"},
+      {"symbol": "EngineState", "why": "coordinator 侧每 engine 的 [waiting,running] 计数容器。"},
+      {"symbol": "DPAsyncMPClient", "why": "external-LB DP 客户端基类，wave 盖章与唤醒。"},
+      {"symbol": "DPLBAsyncMPClient", "why": "internal-LB 客户端，负载均衡路由主体。"},
+      {"symbol": "get_core_engine_for_request", "why": "score=waiting*4+running 选 engine 的路由决策点。"},
+      {"symbol": "run_engine_stats_update_task", "why": "订阅 coordinator 广播、更新 lb_engines/current_wave/engines_running。"},
+      {"symbol": "lb_engines", "why": "本 client 视角的各 engine 负载快照，路由依据。"},
+      {"symbol": "add_request_async", "why": "盖 current_wave + 选 engine + 暂停时发 FIRST_REQ 的客户端入口。"},
+      {"symbol": "reqs_in_flight", "why": "请求→engine 映射，用于 abort 定向路由。"},
+      {"symbol": "engines_running", "why": "client/engine/coordinator 三处共享的全局运行态标志。"},
+      {"symbol": "make_async_mp_client", "why": "按 dp_size/external_lb 选 client 类型的工厂，读者据此定位三种部署形态。"}
+    ]
+  },
+
+  "diagram_plan": [
+    {"name": "ch21-roadmap", "kind": "roadmap", "spec": "复用 instances/vllm/book/assets/roadmap/roadmap.py，高亮节点：async-engine 子系统的 DP/PP 维度；前接 ch20（distributed-parallelism: all-reduce/isend/irecv）与 ch12（batch queue），本章把这些原语用在 PP 惰性同步与 DP wave 共识上。"},
+    {"name": "lazy-pp-sync-timeline", "kind": "svg-diagram", "spec": "时序泳道图：横轴时间，三泳道=stage k-1 / NCCL / stage k。展示 stage k 的 execute_model：[wait 上轮 isend] → [irecv 发出(不阻塞)] → [input/metadata 准备 与 irecv 并行(重叠区高亮)] → [首次读 .tensors 触发 wait_for_comm] → [model forward] → [isend(不阻塞)，句柄留到下一轮]。重点标注『推迟的 wait』那条虚线与重叠区。"},
+    {"name": "dp-wave-state-machine", "kind": "svg-diagram", "spec": "状态机图：两状态 RUNNING / PAUSED，状态附 (current_wave, engines_running)。RUNNING→PAUSED 边标『rank0 all-reduce 判定全体无未完成 → wave_complete, wave++』；PAUSED→RUNNING 边标『FIRST_REQ / START_DP_WAVE / 收到 stale-wave 请求 → engines_running=True』。旁注两阶段暂停的 pending_pause→共识→ignore_start_dp_wave。"},
+    {"name": "dp-topology-and-loadbalance", "kind": "svg-diagram", "spec": "拓扑图：N 个前端(DPLBAsyncMPClient) ── XPUB/XSUB ── 1 个 DPCoordinator ── XPUB/PULL ── M 个 DPEngineCoreProc(各含 dp_group all-reduce 环)。标注三类消息流：engine→coord 的 stats(waiting,running)+wave_complete；coord→front 的 (counts,wave,running) 广播；front→coord 的 FIRST_REQ → coord→engine 的 START_DP_WAVE。并在某 client 上叠加 score=waiting*4+running 选最空 engine 的小表。"}
+  ],
+
+  "foreshadow_due": {"应埋伏笔": [], "应回收": [], "raw": "bible.py due ch21 返回空：无显式登记的应埋/应回收项。本章作为 Part V 分布式收尾，自然回收 ch20 的 all-reduce/isend/irecv 原语与 ch12 batch queue，并为后续 MoE/EP 章节（DPEngineCoreProc 仅 MoE）埋下 expert 并行需要全员同步的动机。"}
+}
