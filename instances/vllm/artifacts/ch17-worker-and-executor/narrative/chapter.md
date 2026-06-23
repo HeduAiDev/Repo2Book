@@ -160,7 +160,7 @@ def execute_model(
 
 就三行。把方法名 `"execute_model"` 和工单 `scheduler_output` 交给 `collective_rpc`，收回一个结果 list，取 `output[0]`。
 
-> 为什么取 `[0]`？因为这里只关心**一个** worker 的输出。张量并行下各 rank 的最终 token 是冗余的，流水线并行下只有最后一段产出真 token——所以执行器只需要其中一个 rank 的回复。这个「只收一个 rank」的优化，[§17.6](#176-execute_model-为什么只收一个-rank) 会落实到 mp 版的 `output_rank` 上。
+> 为什么取 `[0]`？因为这里只关心**一个** worker 的输出。张量并行下各 rank 的最终 token 是冗余的，流水线并行下只有最后一段产出真 token——所以执行器只需要其中一个 rank 的回复。这个「只收一个 rank」的优化，[§17.6](#execute_model-为什么只收一个-rank) 会落实到 mp 版的 `output_rank` 上。
 
 `sample_tokens`、`determine_available_memory`、`add_lora`、`sleep`、`wake_up`、`check_health`……翻一遍 `abstract.py`，十几个方法全是同一个模子：包一层 `collective_rpc`，换个方法名。这意味着**子类只要实现 `collective_rpc` 这一处，整套指令的语义就齐了**。`UniProcExecutor` 和 `MultiprocExecutor` 的全部差异，浓缩在这一个方法的两种实现里。
 
@@ -393,7 +393,7 @@ if output_rank is not None:
 
 `output_rank is None` 时，`get_response` 遍历**所有** worker 的应答队列，收齐 N 个结果——这是「上行多对一」。但若指定了 `output_rank`，就只从**那一个** worker 的队列收一个。`execute_model` 走的就是后者。
 
-**收的过程里就把失败查了。** `get_response` 里 `dequeue` 回来的是 `(status, result)`。`status != SUCCESS` 直接抛 `RuntimeError`，把 worker 侧的错误抬到调用方。这是**两条失败路径**里的第一条——「方法在 worker 上抛了异常」——[§17.9](#179-两条失败路径方法错与进程死) 会和第二条对照。
+**收的过程里就把失败查了。** `get_response` 里 `dequeue` 回来的是 `(status, result)`。`status != SUCCESS` 直接抛 `RuntimeError`，把 worker 侧的错误抬到调用方。这是**两条失败路径**里的第一条——「方法在 worker 上抛了异常」——[§17.9](#179-两条失败路径方法错-vs-进程死) 会和第二条对照。
 
 最后，`non_block` 决定**当场返回 future 还是等到结果**：`return future if non_block else future.result()`。这个 `FutureWrapper` 是本章最妙的一个小零件，单开一节讲。
 
@@ -592,7 +592,7 @@ def worker_main(*args, **kwargs):
 
 读这段抓三个点：
 
-1. **先装信号处理。** `SIGTERM` / `SIGINT` 来了，置 `shutdown_requested`、抛 `SystemExit`——把「被外面要求关停」变成一个能被 finally 接住的正常退出路径。父进程三级关停（[§17.10](#1710-三级关停优雅sigtermsigkill)）发的 `SIGTERM`，就是被这里接住的。
+1. **先装信号处理。** `SIGTERM` / `SIGINT` 来了，置 `shutdown_requested`、抛 `SystemExit`——把「被外面要求关停」变成一个能被 finally 接住的正常退出路径。父进程三级关停（[§17.10](#1710-三级关停优雅--sigterm--sigkill)）发的 `SIGTERM`，就是被这里接住的。
 2. **READY 卡在加载之后。** `ready_writer.send({status: READY, ...})` 这行，前面是 `WorkerProc(*args)` 的完整构造——也就是模型已经加载完、应答队列已经建好。**先就绪、后报告**，父进程收到 READY 就能放心发 RPC。
 3. **`ready_writer is not None` 用来区分两种失败。** 注意这个细节：发完 READY 后代码把 `ready_writer` 置 `None`。所以 except 里判断 `ready_writer is not None`，就能区分「**启动期**就崩了（还没发 READY）」和「**运行期**才崩（busy_loop 里出事）」——两种失败该打的日志、该走的恢复路径不一样。无论哪种，`finally` 都保证 `worker.shutdown()` 被调，资源不泄漏。
 
