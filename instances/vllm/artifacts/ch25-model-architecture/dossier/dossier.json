@@ -1,0 +1,250 @@
+{
+  "chapter_id": "ch25",
+  "title": "读一个完整模型：DeepSeek-V4 —— 把 MLA + MoE + MTP 当作对 Llama 基线(ch22)的一叠 delta 端到端拼起来",
+  "framing": {
+    "spine_idea": "ch22 已把 Llama 当作最简基线（QKV-MHA + dense SwiGLU MLP + 标准 add-norm 残差 + 单 lm_head）。本章把 DeepSeek-V4 拆成对这个基线的四类 delta：(1) 注意力：MHA → MLA 低秩压缩 + 解耦 RoPE；(2) FFN：dense MLP → 路由 top-k 专家 + 共享专家的 MoE；(3) 残差：标准 add-norm → Hybrid-Computation(hc) 多流残差；(4) 解码头：单 lm_head → 多 token 预测(MTP) draft。回收 ch22 埋下的 f16 伏笔。",
+    "honesty_note": "真实 deepseek_v4.py 远比'标准 DeepSeek-V2/V3 MLA+MoE'复杂：它有 Hybrid-Computation 超连接(hc_mult 多残差流)、V4 专属的 DeepseekV4MultiHeadLatentAttentionWrapper(稀疏 SWA/indexer/compressor/FP8 einsum/多 stream GEMM)、双后端 MoE(DeepGEMM MegaMoE 或 TP FusedMoE)、MXFP4/FP8 expert_dtype、需要 SM100+DeepGEMM+tilelang。outline-final.json 的 ch25 scope 对此完全知情并已点名。本章以'delta over Llama'为叙事主线，但不得把 V4 简化成 V2/V3——真实存在的 hc/MegaMoE/FP8 复杂度要如实呈现，attention 内核细节按 scope 下放 ch24，仅讲模型侧的投影/低秩结构与多流 GEMM。",
+    "delta_table": [
+      "注意力: Llama LlamaAttention.qkv_proj(QKVParallelLinear 全量 Q/K/V) + o_proj  →  V4 DeepseekV4Attention.fused_wqa_wkv(低秩 q_lora_rank + 压缩 kv) + q_norm/kv_norm + wq_b(latent→full q) + wo_a/wo_b(输出也低秩 o_lora_rank/o_groups) + attn_sink + 解耦 RoPE(nope/rope 拆分)",
+      "FFN: Llama LlamaMLP(单个 dense gate_up_proj/down_proj SwiGLU)  →  V4 DeepseekV4MoE(gate 路由 → top-k 个 routed expert + 始终走的 shared_experts，两条后端:DeepseekV4MegaMoEExperts 或 FusedMoE)",
+      "残差: Llama input_layernorm/post_attention_layernorm 的标准融合 add-norm(hidden,residual)  →  V4 hc_pre/hc_post 在 hc_mult 条残差流上做学习式混合(torch.ops.vllm.mhc_pre/mhc_post)，最后 hc_head 把多流压回单流",
+      "解码头: Llama 单 lm_head/compute_logits  →  V4 主模型 lm_head + 旁路 DeepSeekV4MTP draft(消费 _mtp_hidden_buffer 的 pre-hc_head 残差)做多 token 预测，由投机解码(ch28)驱动",
+      "数值类型: Llama 通常 bf16  →  V4 强制 FP8 block 量化(DeepseekV4FP8Config)，专家 MXFP4(fp4) 或 FP8(fp8)，e8m0fnu scale 以 uint8 原始字节装载"
+    ]
+  },
+  "code_spine": [
+    "vllm/model_executor/models/deepseek_v4.py:L1507-L1565  DeepseekV4ForCausalLM: 入口/forward/compute_logits/get_mtp_target_hidden_states/load_weights",
+    "vllm/model_executor/models/deepseek_v4.py:L1219-L1338  DeepseekV4Model.__init__/forward: embed → unsqueeze.repeat(hc_mult) 多流展开 → 逐层 → 暂存 _mtp_hidden_buffer → hc_head 压回单流 → norm",
+    "vllm/model_executor/models/deepseek_v4.py:L1089-L1216  DeepseekV4DecoderLayer.forward: hc_pre→attn_norm→attn→hc_post，再 hc_pre→ffn_norm→ffn→hc_post（超连接残差是骨架核心）",
+    "vllm/model_executor/models/deepseek_v4.py:L921-L1086  DeepseekV4Attention.__init__/forward: fused_wqa_wkv/q_norm/wq_b/kv_norm/wo_a/wo_b/attn_sink/解耦 RoPE，包成 DeepseekV4MultiHeadLatentAttentionWrapper",
+    "vllm/model_executor/layers/deepseek_v4_attention.py:L281-L335  Wrapper.forward: deepseek_v4_attention 自定义算子 + fused_inv_rope_fp8_quant + deepseek_v4_fp8_einsum(wo_a) + wo_b（输出低秩两段投影）",
+    "vllm/model_executor/layers/deepseek_v4_attention.py:L392-L412  attention_impl: attn_gemm_parallel_execute(多 stream 并行输入 GEMM) → split(q_lora_rank, head_dim) → fused_q_kv_rmsnorm",
+    "vllm/model_executor/layers/deepseek_v4_attention.py:L337-L390  attn_gemm_parallel_execute: fused_wqa_wkv 走默认流，compressor/indexer 三个轻 GEMM 走 aux stream，execute_in_parallel 重叠",
+    "vllm/model_executor/models/deepseek_v4.py:L707-L914  DeepseekV4MoE.__init__/forward: gate(GateLinear) + 可选 shared_experts + use_mega_moe 选 MegaMoE 或 FusedMoE 两条后端",
+    "vllm/model_executor/models/deepseek_v4.py:L854-L893  DeepseekV4MoE.forward(mega 路径): gate → fused_topk_bias(sqrtsoftplus 路由) → experts(MegaMoE) → += shared_experts",
+    "vllm/model_executor/models/deepseek_v4.py:L895-L914  DeepseekV4MoE._forward_fused_moe(TP 路径): gate → FusedMoE(内部已聚合 shared_experts)",
+    "vllm/model_executor/models/deepseek_v4.py:L392-L661  DeepseekV4MegaMoEExperts: w13/w2 量化权重 + finalize_weights(DeepGEMM scale 布局) + forward 走 torch.ops.vllm.deepseek_v4_mega_moe_experts 自定义算子",
+    "vllm/model_executor/models/deepseek_v4.py:L1450-L1466  hc_head: 多残差流 → RMSNorm → sigmoid 门控加权求和压回单流（torch.compile）",
+    "vllm/model_executor/models/deepseek_v4.py:L1166-L1193  DeepseekV4DecoderLayer.hc_pre/hc_post: torch.ops.vllm.mhc_pre/mhc_post 超连接前后处理",
+    "vllm/model_executor/models/deepseek_v4.py:L1340-L1443  DeepseekV4Model.load_weights/get_expert_mapping: stacked 映射(fused_wqa_wkv/gate_up)、专家映射、attn_sink 按 TP 切、e8m0fnu→uint8 原始字节",
+    "vllm/model_executor/models/deepseek_v4.py:L121-L209  DeepseekV4FP8Config: expert_dtype(fp4/fp8) 惰性解析 → 选 Mxfp4MoEMethod 或 Fp8MoEMethod",
+    "vllm/model_executor/models/deepseek_v4_mtp.py:L61-L150  DeepSeekV4MultiTokenPredictorLayer.forward: enorm/hnorm + e_proj/h_proj 融合 embed 与 previous_hidden → mtp_block(复用 DeepseekV4DecoderLayer) → 返回 pre-hc_head 残差",
+    "vllm/model_executor/models/deepseek_v4_mtp.py:L153-L275  DeepSeekV4MultiTokenPredictor/DeepSeekV4MTP: 多 MTP 层 ModuleDict、forward 按 spec_step 选层、compute_logits 里补 hc_head 再过 shared_head",
+    "vllm/model_executor/models/llama.py:L253-L333 (基线对照) LlamaDecoderLayer.forward: 标准 input_layernorm/post_attention_layernorm 融合 add-norm 残差",
+    "vllm/model_executor/models/llama.py:L124-L194 (基线对照) LlamaAttention: QKVParallelLinear 全量 Q/K/V + o_proj，标准 MHA",
+    "vllm/model_executor/models/llama.py:L81-L121 (基线对照) LlamaMLP: 单个 dense gate_up_proj/down_proj SwiGLU"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/model_executor/models/llama.py",
+      "lines": "L316-L333",
+      "purpose": "基线锚点：Llama 的标准融合 add-norm 残差——后面 V4 的 hc_pre/hc_post 就是替换这一段。",
+      "code": "    def forward(\n        self,\n        positions: torch.Tensor,\n        hidden_states: torch.Tensor,\n        residual: torch.Tensor | None,\n    ) -> tuple[torch.Tensor, torch.Tensor]:\n        # Self Attention\n        if residual is None:\n            residual = hidden_states\n            hidden_states = self.input_layernorm(hidden_states)\n        else:\n            hidden_states, residual = self.input_layernorm(hidden_states, residual)\n        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)\n\n        # Fully Connected\n        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)\n        hidden_states = self.mlp(hidden_states)\n        return hidden_states, residual",
+      "elide": ["LlamaDecoderLayer.__init__ 中的 attention_bias/qkv_bias/is_causal 等兼容分支与本对照无关"]
+    },
+    {
+      "path": "vllm/model_executor/models/deepseek_v4.py",
+      "lines": "L1195-L1216",
+      "purpose": "骨架核心 delta：V4 解码层 forward 用 hc_pre/hc_post 包住 attn 和 ffn，取代 Llama 的 add-norm。对照 LlamaDecoderLayer.forward 即见 delta。",
+      "code": "    def forward(\n        self,\n        x: torch.Tensor,\n        positions: torch.Tensor,\n        input_ids: torch.Tensor | None,\n    ) -> torch.Tensor:\n        residual = x\n        x, post, comb = self.hc_pre(\n            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base\n        )\n        x = self.attn_norm(x)\n        x = self.attn(positions, x, None)\n        x = self.hc_post(x, residual, post, comb)\n\n        residual = x\n        x, post, comb = self.hc_pre(\n            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base\n        )\n        x = self.ffn_norm(x)\n        x = self.ffn(x, input_ids)\n        x = self.hc_post(x, residual, post, comb)\n        return x",
+      "elide": ["hc_pre/hc_post 内部委托给 torch.ops.vllm.mhc_pre/mhc_post(tilelang 内核)，本章只讲它在残差骨架中的位置，不展开 Sinkhorn 迭代细节"]
+    },
+    {
+      "path": "vllm/model_executor/models/deepseek_v4.py",
+      "lines": "L1314-L1338",
+      "purpose": "骨架 delta：embed 后 unsqueeze.repeat(hc_mult) 把单残差流展开成 hc_mult 条流逐层穿过，末尾 hc_head 压回单流；中途暂存 _mtp_hidden_buffer 给 MTP。这是 hc 多流贯穿整模型的证据。",
+      "code": "        hidden_states = self.embed_input_ids(input_ids)\n        hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)\n        if self.use_mega_moe:\n            input_ids = input_ids.to(torch.int64)\n        for layer in islice(self.layers, self.start_layer, self.end_layer):\n            hidden_states = layer(\n                hidden_states,\n                positions,\n                input_ids,\n            )\n\n        # Stash pre-hc_head residual for the MTP draft (captured copy_).\n        num_tokens = hidden_states.shape[0]\n        self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))\n\n        hidden_states = hc_head(\n            hidden_states,\n            self.hc_head_fn,\n            self.hc_head_scale,\n            self.hc_head_base,\n            self.rms_norm_eps,\n            self.hc_eps,\n        )\n        hidden_states = self.norm(hidden_states)\n        return hidden_states",
+      "elide": ["intermediate_tensors/inputs_embeds 的 PP 分支在 V4 里未走（无 PPMissingLayer），略"]
+    },
+    {
+      "path": "vllm/model_executor/models/deepseek_v4.py",
+      "lines": "L1450-L1466",
+      "purpose": "hc 收尾 delta：hc_head 把 hc_mult 条残差流经 RMSNorm + sigmoid 门控加权求和压回单流，喂给最终 norm/lm_head。也被 MTP 在 compute_logits 里复用。",
+      "code": "@torch.compile(backend=current_platform.simple_compile_backend)\ndef hc_head(\n    hidden_states: torch.Tensor,\n    hc_fn: torch.Tensor,\n    hc_scale: torch.Tensor,\n    hc_base: torch.Tensor,\n    rms_norm_eps: float,\n    hc_eps: float,\n) -> torch.Tensor:\n    x = hidden_states\n    shape, dtype = x.size(), x.dtype\n    x = x.flatten(1).float()\n    rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + rms_norm_eps)\n    mixes = F.linear(x, hc_fn) * rsqrt\n    pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps\n    y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)\n    return y.to(dtype)",
+      "elide": []
+    },
+    {
+      "path": "vllm/model_executor/models/deepseek_v4.py",
+      "lines": "L967-L1003",
+      "purpose": "MLA delta 的权重骨架：与 Llama 的 qkv_proj/o_proj 对照。fused_wqa_wkv 把 hidden 压成 [q_lora_rank, head_dim] 低秩潜变量；wq_b 把 q 潜变量升回 full Q；wo_a/wo_b 让输出也走 o_lora_rank/o_groups 低秩两段——这是'连输出投影都低秩'的 V4 特征。",
+      "code": "        self.fused_wqa_wkv = MergedColumnParallelLinear(\n            self.hidden_size,\n            [self.q_lora_rank, self.head_dim],\n            bias=False,\n            quant_config=quant_config,\n            prefix=f\"{prefix}.fused_wqa_wkv\",\n            disable_tp=True,  # fused ReplicatedLinear\n        )\n        self.q_norm = RMSNorm(self.q_lora_rank, self.eps)\n        self.wq_b = ColumnParallelLinear(\n            self.q_lora_rank,\n            self.n_heads * self.head_dim,\n            bias=False,\n            quant_config=quant_config,\n            return_bias=False,\n            prefix=f\"{prefix}.wq_b\",\n        )\n\n        self.kv_norm = RMSNorm(self.head_dim, self.eps)\n        self.wo_a = ColumnParallelLinear(\n            self.n_heads * self.head_dim // self.n_groups,\n            self.n_groups * self.o_lora_rank,\n            bias=False,\n            quant_config=quant_config,\n            return_bias=False,\n            prefix=f\"{prefix}.wo_a\",\n        )\n        self.wo_a.is_bmm = True\n        self.wo_a.bmm_batch_size = self.n_local_groups\n        self.wo_b = RowParallelLinear(\n            self.n_groups * self.o_lora_rank,\n            self.hidden_size,\n            bias=False,\n            quant_config=quant_config,\n            return_bias=False,\n            prefix=f\"{prefix}.wo_b\",\n        )",
+      "elide": ["__init__ 中的 indexer/compress_ratio/rope_parameters yarn 标志/attn_sink 维度初始化此处不展开，分别下放到对应小节/ch24"]
+    },
+    {
+      "path": "vllm/model_executor/layers/deepseek_v4_attention.py",
+      "lines": "L401-L412",
+      "purpose": "MLA 前处理 delta：低秩 latent 在 split 后分别对 q 段(q_lora_rank)和 kv 段(head_dim)做 fused RMSNorm——对应 mla.py 标准 MLA 里的 q_a_layernorm/kv_a_layernorm，但 V4 融成一个算子。展示'低秩压缩 + 归一化'的 MLA 骨架。",
+      "code": "        qr_kv, kv_score, indexer_kv_score, indexer_weights = (\n            self.attn_gemm_parallel_execute(hidden_states)\n        )\n\n        qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)\n        qr, kv = fused_q_kv_rmsnorm(\n            qr,\n            kv,\n            self.q_norm.weight.data,\n            self.kv_norm.weight.data,\n            self.eps,\n        )",
+      "elide": ["attn_gemm_parallel_execute 的多 stream 编排见单独 excerpt；indexer/compressor 分支(稀疏注意力)按 scope 下放 ch24，本章只点明它们存在并解释 aux-stream 重叠动机"]
+    },
+    {
+      "path": "vllm/model_executor/layers/deepseek_v4_attention.py",
+      "lines": "L337-L390",
+      "purpose": "MLA 性能 delta：多 stream GEMM 并行。fused_wqa_wkv(最重)走默认流，compressor/indexer 的三个轻 GEMM 放 aux stream，用 execute_in_parallel + CUDA event 重叠。这是 V4 模型侧值得讲的工程亮点(对照 ch22 Llama 单 qkv_proj 一把过)。",
+      "code": "    def attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:\n        assert self.aux_stream_list is not None\n        assert len(self.aux_stream_list) >= 3\n\n        # fused_wqa_wkv (heaviest) on default; the three lighter input GEMMs\n        # on aux streams 0..2 when their owning module exists. ln_events[0]\n        # is the fan-out start event; ln_events[1..3] are per-aux done events.\n        aux_fns: list[Callable[[], Any] | None] = [None, None, None]\n\n        if self.compressor is not None:\n            # Local ref so the closure keeps a non-None type for mypy.\n            compressor = self.compressor\n\n            def compressor_kv_score() -> torch.Tensor:\n                return torch.mm(\n                    hidden_states,\n                    compressor.fused_wkv_wgate.weight.T,\n                    out_dtype=torch.float32,\n                )\n\n            aux_fns[0] = compressor_kv_score\n\n        if self.indexer is not None:\n            indexer = self.indexer\n\n            def indexer_weights_proj() -> torch.Tensor:\n                # ReplicatedLinear returns (output, bias); bias is None.\n                weights, _ = indexer.weights_proj(hidden_states)\n                return weights\n\n            def indexer_compressor_kv_score() -> torch.Tensor:\n                return torch.mm(\n                    hidden_states,\n                    indexer.compressor.fused_wkv_wgate.weight.T,\n                    out_dtype=torch.float32,\n                )\n\n            aux_fns[1] = indexer_weights_proj\n            aux_fns[2] = indexer_compressor_kv_score\n\n        def fused_wqa_wkv() -> torch.Tensor:\n            # MergedColumnParallelLinear returns (output, bias); bias is None.\n            qr_kv, _ = self.fused_wqa_wkv(hidden_states)\n            return qr_kv\n\n        qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(\n            fused_wqa_wkv,\n            aux_fns,\n            self.ln_events[0],\n            self.ln_events[1:4],\n            self.aux_stream_list[:3],\n        )\n\n        return qr_kv, kv_score, indexer_kv_score, indexer_weights",
+      "elide": []
+    },
+    {
+      "path": "vllm/model_executor/layers/mla.py",
+      "lines": "L138-L181",
+      "purpose": "MLA 概念对照锚点：标准(V2/V3) MLA 的 forward，比 V4 wrapper 干净，最清楚地展示'fused_qkv_a_proj 低秩 → q_a_layernorm/kv_a_layernorm → q_b_proj 升维 → 解耦 RoPE 只作用在 rope 段'的 MLA 本质。本章用它解释 MLA 原理，再说明 V4 在此之上叠了什么(输出低秩/稀疏/FP8/多流)。",
+      "code": "            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]\n            q_c, kv_lora = qkv_lora.split(\n                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],\n                dim=-1,\n            )\n            q_c = self.q_a_layernorm(q_c)\n            q = self.q_b_proj(q_c)[0]\n        else:\n            assert self.kv_a_proj_with_mqa is not None, (\n                \"kv_a_proj_with_mqa is required when q_lora_rank is None\"\n            )\n            assert self.q_proj is not None, (\n                \"q_proj is required when q_lora_rank is None\"\n            )\n            kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]\n            q = self.q_proj(hidden_states)[0]\n\n        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)\n        kv_c_normed = self.kv_a_layernorm(kv_c)\n\n        q = q.view(-1, self.num_heads, self.qk_head_dim)\n        # Add head dim of 1 to k_pe\n        k_pe = k_pe.unsqueeze(1)\n\n        if self.rotary_emb is not None:\n            q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(\n                positions, q[..., self.qk_nope_head_dim :], k_pe\n            )",
+      "elide": ["indexer/llama_4_scaling 分支与本对照无关；mla_attn 调用后的 o_proj 略——V4 的输出投影已在 deepseek_v4_attention excerpt 单独讲"]
+    },
+    {
+      "path": "vllm/model_executor/models/deepseek_v4.py",
+      "lines": "L746-L795",
+      "purpose": "MoE delta 骨架：gate 路由 + 可选 shared_experts(对 dense MLP 的 delta 关键——共享专家就是每 token 必走的那条'dense 残留')，再按 use_mega_moe 选两条专家后端。对照 LlamaMLP 单 dense 即见'稀疏路由 + 共享 dense'的混合。",
+      "code": "        self.gate = GateLinear(\n            config.hidden_size,\n            config.n_routed_experts,\n            out_dtype=torch.float32,\n            bias=False,\n            prefix=f\"{prefix}.gate\",\n        )\n        self.gate.e_score_correction_bias = None\n        self.gate.tid2eid = None\n        is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers\n        self.hash_indices_dtype = torch.int64 if self.use_mega_moe else torch.int32\n\n        if is_hash_moe:\n            # hash MoE doesn't use e_score_correction_bias\n            # Use randint instead of empty to avoid garbage values causing\n            # invalid memory access in dummy mode (--load-format=\"dummy\")\n            self.gate.tid2eid = nn.Parameter(\n                torch.randint(\n                    0,\n                    config.n_routed_experts,\n                    (config.vocab_size, config.num_experts_per_tok),\n                    dtype=self.hash_indices_dtype,\n                ),\n                requires_grad=False,\n            )\n        elif getattr(config, \"topk_method\", None) == \"noaux_tc\":\n            self.gate.e_score_correction_bias = nn.Parameter(\n                torch.empty(config.n_routed_experts, dtype=torch.float32),\n                requires_grad=False,\n            )\n\n        if config.n_shared_experts is None:\n            self.shared_experts = None\n        else:\n            intermediate_size = config.moe_intermediate_size * config.n_shared_experts\n\n            self.shared_experts = DeepseekV4MLP(\n                hidden_size=config.hidden_size,\n                intermediate_size=intermediate_size,\n                hidden_act=config.hidden_act,\n                swiglu_limit=self.swiglu_limit,\n                quant_config=quant_config,\n                reduce_results=self.use_mega_moe,\n                prefix=f\"{prefix}.shared_experts\",\n            )",
+      "elide": ["routed_scaling_factor/scoring_func 等字段读取略；hash-MoE(tid2eid 用 input_ids 查表确定专家)是 V4 特有的一类层，本章点名但不深挖"]
+    },
+    {
+      "path": "vllm/model_executor/models/deepseek_v4.py",
+      "lines": "L854-L893",
+      "purpose": "MoE forward delta 主线(mega 路径)：gate → fused_topk_bias(sqrtsoftplus 打分 + e_score_correction_bias + top-k + renormalize)选专家 → MegaMoE 算专家输出 → 再加上 shared_experts。最清楚地展示'top-k 路由 + 共享专家相加'的数据流。",
+      "code": "        if not self.use_mega_moe:\n            return self._forward_fused_moe(hidden_states, input_ids)\n\n        org_shape = hidden_states.shape\n        router_logits, _ = self.gate(hidden_states)\n        topk_weights, topk_ids = fused_topk_bias(\n            hidden_states=hidden_states,\n            gating_output=router_logits,\n            scoring_func=self.scoring_func,\n            e_score_correction_bias=self.gate.e_score_correction_bias.data\n            if self.gate.e_score_correction_bias is not None\n            else None,\n            topk=self.n_activated_experts,\n            renormalize=self.renormalize,\n            indices_type=self.hash_indices_dtype,\n            input_tokens=input_ids,\n            hash_indices_table=self.gate.tid2eid,\n            routed_scaling_factor=self.routed_scaling_factor,\n        )\n        activation_clamp = (\n            float(self.swiglu_limit) if self.swiglu_limit is not None else None\n        )\n        final_hidden_states = self.experts(\n            hidden_states,\n            topk_weights,\n            topk_ids,\n            activation_clamp=activation_clamp,\n        )\n\n        if self.shared_experts is not None:\n            shared_output = self.shared_experts(hidden_states)\n            final_hidden_states += shared_output\n\n        return final_hidden_states.view(org_shape)",
+      "elide": ["_forward_fused_moe(TP 后端)里 FusedMoE 内部已聚合 shared_experts，两条路径聚合位置不同——本章对照说明，TP 路径细节交给 fused_moe 专章/ch26"]
+    },
+    {
+      "path": "vllm/model_executor/models/deepseek_v4.py",
+      "lines": "L599-L623",
+      "purpose": "MoE 后端 delta：MegaMoE 专家把整批专家计算塞进一个 DeepGEMM 自定义算子(torch.ops.vllm.deepseek_v4_mega_moe_experts)，需要对称缓冲 + FP4/FP8 权重 + SM100。说明为何 V4 的 MoE 不是'for 循环跑每个专家'，而是单 kernel。",
+      "code": "    def forward(\n        self,\n        hidden_states: torch.Tensor,\n        topk_weights: torch.Tensor,\n        topk_ids: torch.Tensor,\n        *,\n        activation_clamp: float | None,\n        fast_math: bool = True,\n    ) -> torch.Tensor:\n        if hidden_states.shape[0] > self.max_num_tokens:\n            raise ValueError(\n                f\"DeepSeek V4 MegaMoE got {hidden_states.shape[0]} tokens, \"\n                f\"but the symmetric buffer was sized for {self.max_num_tokens}.\"\n            )\n        y = torch.empty_like(hidden_states, dtype=torch.bfloat16)\n        torch.ops.vllm.deepseek_v4_mega_moe_experts(\n            hidden_states,\n            topk_weights,\n            topk_ids,\n            y,\n            self.prefix,\n            activation_clamp,\n            fast_math,\n        )\n        return y",
+      "elide": ["_run_mega_moe/_stage_..._kernel/finalize_weights 里 DeepGEMM scale 布局变换、symm_buffer 缓存、Triton staging kernel 是 ch26/DeepGEMM 专章内容，本章只点到算子边界与'单 kernel 跑全部专家'的事实"]
+    },
+    {
+      "path": "vllm/model_executor/models/deepseek_v4_mtp.py",
+      "lines": "L122-L150",
+      "purpose": "MTP delta：draft 层把 (a) 当前 token 的 embedding(enorm 归一) 与 (b) target 模型暂存的 pre-hc_head 残差(hnorm 归一)经 e_proj/h_proj 融合，再跑一个完整的 DeepseekV4DecoderLayer，输出又一个 pre-hc_head 残差以便多步串联。这是'多 token 预测'与'混合残差(融合两路信号)'的真身。",
+      "code": "    def forward(\n        self,\n        input_ids: torch.Tensor,\n        positions: torch.Tensor,\n        previous_hidden_states: torch.Tensor,\n        inputs_embeds: torch.Tensor | None = None,\n        spec_step_index: int = 0,\n    ) -> torch.Tensor:\n        assert inputs_embeds is not None\n        # masking inputs at position 0, as not needed by MTP\n        inputs_embeds = torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)\n        inputs_embeds = self.enorm(inputs_embeds)\n\n        # Target stashes pre-hc_head residual as flat (T, hc_mult * D);\n        # reshape to (T, hc_mult, D) — the training-time layout.\n        previous_hidden_states = previous_hidden_states.view(\n            -1, self.hc_mult, self.config.hidden_size\n        )\n        previous_hidden_states = self.hnorm(previous_hidden_states)\n        hidden_states = self.h_proj(previous_hidden_states) + self.e_proj(\n            inputs_embeds\n        ).unsqueeze(-2)\n        hidden_states = self.mtp_block(\n            positions=positions, x=hidden_states, input_ids=None\n        )\n        # Return the flat pre-hc_head residual so it can be re-fed as the\n        # next spec step's `previous_hidden_states` when\n        # num_speculative_tokens > 1. hc_head is deferred to compute_logits.\n        return hidden_states.flatten(1)",
+      "elide": ["DeepSeekV4MTP.load_weights 的检查/remap 细节(450+ 行)略；与 ch28 投机解码驱动 MTP 的协议(num_speculative_tokens 多步)在 ch28 讲，本章只交付接口边界"]
+    },
+    {
+      "path": "vllm/model_executor/models/deepseek_v4.py",
+      "lines": "L1379-L1419",
+      "purpose": "权重装载 delta：MoE 专家 e8m0fnu scale 必须以 uint8 原始字节 view 装入(否则 copy_ 会做数值转换毁掉指数字节)；专家走 expert_mapping 多副本 weight_loader；attn_sink 按 TP head 区间切。回收'量化作为对 Llama 的 delta'。",
+      "code": "                if \".experts.\" in name:\n                    # E8M0 scales are stored as float8_e8m0fnu in\n                    # checkpoints but the MoE param is uint8. copy_()\n                    # would do a numeric conversion (e.g. 2^-7 → 0),\n                    # destroying the raw exponent bytes.\n                    if (\n                        \"weight_scale\" in name\n                        and loaded_weight.dtype == torch.float8_e8m0fnu\n                    ):\n                        loaded_weight = loaded_weight.view(torch.uint8)\n                    for mapping in expert_mapping:\n                        param_name, weight_name, expert_id, shard_id = mapping\n                        if weight_name not in name:\n                            continue\n                        name_mapped = name.replace(weight_name, param_name)\n                        param = params_dict[name_mapped]\n                        weight_loader = typing.cast(\n                            Callable[..., bool], param.weight_loader\n                        )\n                        success = weight_loader(\n                            param,\n                            loaded_weight,\n                            name_mapped,\n                            shard_id=shard_id,\n                            expert_id=expert_id,\n                            return_success=True,\n                        )\n                        if success:\n                            name = name_mapped\n                            break\n                    loaded_params.add(name_mapped)\n                    continue\n                elif \"attn_sink\" in name:\n                    narrow_weight = loaded_weight[head_rank_start:head_rank_end]\n                    n = narrow_weight.shape[0]\n                    params_dict[name][:n].copy_(narrow_weight)\n                    loaded_params.add(name)\n                    continue",
+      "elide": ["stacked_params_mapping 的 fused_wqa_wkv/gate_up/compressor 合并、else 普通分支略——本章点出三类特殊装载即可"]
+    }
+  ],
+  "key_classes": [
+    {"name": "DeepseekV4ForCausalLM", "file": "vllm/model_executor/models/deepseek_v4.py:L1507", "responsibility": "顶层入口：持有 DeepseekV4Model + lm_head + logits_processor；forward 转发；compute_logits；get_mtp_target_hidden_states 暴露 pre-hc_head 残差给 MTP；load_weights 经 AutoWeightsLoader(skip mtp.) 装载并 finalize MegaMoE。对照 LlamaForCausalLM。"},
+    {"name": "DeepseekV4Model", "file": "vllm/model_executor/models/deepseek_v4.py:L1220", "responsibility": "主干：embed → repeat 成 hc_mult 条残差流 → 逐 DeepseekV4DecoderLayer → 暂存 _mtp_hidden_buffer → hc_head 压回单流 → norm。持有 topk_indices_buffer 与 3 条 aux_stream。对照 LlamaModel。"},
+    {"name": "DeepseekV4DecoderLayer", "file": "vllm/model_executor/models/deepseek_v4.py:L1089", "responsibility": "单层：attn(MLA) + ffn(MoE)，但残差用 hc_pre/hc_post 超连接(mhc_pre/mhc_post 算子)而非 Llama 的融合 add-norm。持有 hc_{attn,ffn}_{fn,base,scale} 学习参数。被主模型和 MTP 复用。"},
+    {"name": "DeepseekV4Attention", "file": "vllm/model_executor/models/deepseek_v4.py:L921", "responsibility": "MLA 权重定义层：fused_wqa_wkv(低秩 q_lora_rank/压缩 kv)、q_norm/kv_norm、wq_b(q 升维)、wo_a/wo_b(输出低秩 o_lora_rank/o_groups)、attn_sink、解耦 RoPE(nope/rope 拆)，包成 wrapper。对照 LlamaAttention(qkv_proj/o_proj)。"},
+    {"name": "DeepseekV4MultiHeadLatentAttentionWrapper", "file": "vllm/model_executor/layers/deepseek_v4_attention.py:L106", "responsibility": "MLA 执行层(V4 专属)：forward 调 deepseek_v4_attention 自定义算子 + 输出端 inverse-RoPE/FP8 einsum/wo_b；attention_impl 做多 stream 并行输入 GEMM + fused RMSNorm；含稀疏 SWA/indexer/compressor。内核细节下放 ch24。"},
+    {"name": "DeepseekV4MoE", "file": "vllm/model_executor/models/deepseek_v4.py:L707", "responsibility": "MoE 层：gate(GateLinear) 路由 + 可选 shared_experts(每 token 必走的 dense 残留) + 双后端(use_mega_moe ? DeepseekV4MegaMoEExperts : FusedMoE)。对照 LlamaMLP 单 dense。"},
+    {"name": "DeepseekV4MegaMoEExperts", "file": "vllm/model_executor/models/deepseek_v4.py:L392", "responsibility": "MegaMoE 专家后端：FP4/FP8 量化 w13/w2 权重，finalize_weights 转 DeepGEMM scale 布局，forward 走单个 deepseek_v4_mega_moe_experts 自定义算子(对称缓冲, SM100)。一 kernel 跑全部专家。"},
+    {"name": "DeepseekV4MLP", "file": "vllm/model_executor/models/deepseek_v4.py:L70", "responsibility": "SwiGLU MLP(gate_up_proj/down_proj，可选 swiglu_limit clamp)，作 shared_experts 复用。结构与 LlamaMLP 同构，是 MoE 里那条 dense 共享路径。"},
+    {"name": "DeepseekV4FP8Config", "file": "vllm/model_executor/models/deepseek_v4.py:L121", "responsibility": "V4 量化配置：linear/attn 走 FP8 block；专家按 expert_dtype 惰性解析 fp4(MXFP4) 或 fp8(block FP8)，决定 scale e8m0/float32 与 weight 映射。回收'量化 delta'。"},
+    {"name": "hc_head", "file": "vllm/model_executor/models/deepseek_v4.py:L1450", "responsibility": "torch.compile 函数：把 hc_mult 条残差流经 RMSNorm + sigmoid 门控加权求和压回单流。主模型末尾与 MTP compute_logits 都用。"},
+    {"name": "DeepSeekV4MultiTokenPredictorLayer", "file": "vllm/model_executor/models/deepseek_v4_mtp.py:L61", "responsibility": "MTP draft 单层：enorm/hnorm + e_proj/h_proj 融合 token embedding 与 target 的 pre-hc_head 残差，跑一个 DeepseekV4DecoderLayer，输出新 pre-hc_head 残差(可多步串联)。"},
+    {"name": "DeepSeekV4MTP", "file": "vllm/model_executor/models/deepseek_v4_mtp.py:L244", "responsibility": "MTP draft 顶层：持有多 MTP 层 + embed + logits_processor；forward 按 spec_step 选层；compute_logits 补 hc_head 再过 shared_head。被投机解码(ch28)消费。"},
+    {"name": "LlamaDecoderLayer / LlamaAttention / LlamaMLP", "file": "vllm/model_executor/models/llama.py:L253/L124/L81", "responsibility": "基线对照(ch22)：标准 add-norm 残差 + QKV-MHA + dense SwiGLU。本章每个 delta 都回到这三处对照。"}
+  ],
+  "data_flow": [
+    "1. DeepseekV4ForCausalLM.forward → DeepseekV4Model.forward (deepseek_v4.py:L1543/L1307)",
+    "2. embed_input_ids → hidden.unsqueeze(-2).repeat(1, hc_mult, 1) 展开成 hc_mult 条残差流 (deepseek_v4.py:L1314-1315)",
+    "3. 逐层 DeepseekV4DecoderLayer.forward: residual=x → hc_pre(attn 分支门控) → attn_norm → attn(MLA) → hc_post 写回多流 (deepseek_v4.py:L1201-1207)",
+    "4.   MLA: DeepseekV4Attention.forward → Wrapper.forward → attention_impl: attn_gemm_parallel_execute(多 stream: fused_wqa_wkv 默认流 + compressor/indexer aux 流) (deepseek_v4_attention.py:L337-390)",
+    "5.   split [q_lora_rank, head_dim] → fused_q_kv_rmsnorm → wq_b 升 q → 解耦 RoPE(只作用 rope 段) + kv_insert → 注意力内核(ch24) (deepseek_v4_attention.py:L405-412)",
+    "6.   输出: o → fused_inv_rope_fp8_quant → deepseek_v4_fp8_einsum(wo_a 低秩) → wo_b 回 hidden (deepseek_v4_attention.py:L305-335)",
+    "7. 同层 FFN: residual=x → hc_pre(ffn 分支) → ffn_norm → ffn(MoE) → hc_post (deepseek_v4.py:L1209-1215)",
+    "8.   MoE: gate 路由 → fused_topk_bias(sqrtsoftplus top-k) → experts(MegaMoE 单算子 或 TP FusedMoE) → += shared_experts (deepseek_v4.py:L864-891)",
+    "9. 全层结束: copy_ 暂存 pre-hc_head 残差到 _mtp_hidden_buffer (deepseek_v4.py:L1326-1327)",
+    "10. hc_head 把 hc_mult 流压回单流 → norm → 主模型 lm_head/compute_logits (deepseek_v4.py:L1329-1337)",
+    "11. (投机解码旁路) MTP: DeepSeekV4MTP.forward 取 _mtp_hidden_buffer 作 previous_hidden + 下一 token embedding → enorm/hnorm + e_proj/h_proj 融合 → mtp_block(DeepseekV4DecoderLayer) → 返回新 pre-hc_head 残差 (deepseek_v4_mtp.py:L122-150)",
+    "12. MTP.compute_logits: 补 hc_head → shared_head → draft logits (deepseek_v4_mtp.py:L217-240)"
+  ],
+  "design_decisions": [
+    {"decision": "注意力用 MLA 低秩压缩取代全量 QKV", "why": "把 K/V 压成低秩潜变量(kv_lora)缓存，大幅减小 KV cache；q 也走 q_lora_rank 低秩后再 wq_b 升维。V4 更进一步让输出投影也低秩(wo_a/wo_b, o_lora_rank/o_groups)。对照 LlamaAttention 的全量 qkv_proj。", "evidence": "vllm/model_executor/models/deepseek_v4.py:L967-1003"},
+    {"decision": "解耦 RoPE：位置编码只作用在 q/k 的 rope 段(qk_rope_head_dim)，nope 段不旋转", "why": "MLA 的 latent 压缩与 RoPE 不相容，故把每个 head 拆成 nope(可被低秩吸收) + rope(单独保留位置)两段，只对 rope 段施加旋转。", "evidence": "vllm/model_executor/layers/mla.py:L156-166（标准 MLA 拆 kv_c/k_pe 并只旋 rope 段）"},
+    {"decision": "FFN 用 MoE：top-k 路由专家 + 始终走的共享专家", "why": "稀疏激活放大参数量而不放大每 token FLOPs；共享专家(shared_experts)保留一条每 token 必走的 dense 路径稳住基础能力。对照 LlamaMLP 单 dense。", "evidence": "vllm/model_executor/models/deepseek_v4.py:L777-790, L864-891"},
+    {"decision": "MoE 双后端：DeepGEMM MegaMoE(EP) 或 TP FusedMoE", "why": "开启 expert parallel + moe_backend=deep_gemm_mega_moe 时走单 kernel 全专家(SM100/FP4)；否则退回张量并行 FusedMoE。聚合 shared_experts 的位置两路不同(mega 在外相加, TP 在 FusedMoE 内)。", "evidence": "vllm/model_executor/models/deepseek_v4.py:L719-724, L792-852, L889-912"},
+    {"decision": "残差用 Hybrid-Computation 超连接(hc_pre/hc_post + hc_mult 多流)", "why": "把单残差流扩成 hc_mult 条，逐层用学习式门控(mhc_pre/mhc_post, Sinkhorn 归一)混合，末尾 hc_head 压回单流。比 Llama 的固定 add-norm 表达力更强。这是 V4 骨架的核心 delta，不是简单'混合残差'。", "evidence": "vllm/model_executor/models/deepseek_v4.py:L1201-1216, L1314-1336, L1450-1466"},
+    {"decision": "多 stream GEMM 并行(aux_stream_list)", "why": "MLA 有多个独立输入投影(fused_wqa_wkv 重 + compressor/indexer 轻)，放不同 CUDA stream + event 重叠以打满 GPU。对照 Llama 单 qkv_proj。", "evidence": "vllm/model_executor/layers/deepseek_v4_attention.py:L337-390"},
+    {"decision": "MTP 多 token 预测 draft", "why": "训练时多头预测下 N 个 token；推理时作投机解码 draft：融合 target 的 pre-hc_head 残差(经 _mtp_hidden_buffer)与下一 token embedding，跑一层得 draft logits，可多步串联。", "evidence": "vllm/model_executor/models/deepseek_v4_mtp.py:L122-150, L217-240；vllm/model_executor/models/deepseek_v4.py:L1297-1302, L1555-1559"},
+    {"decision": "强制 FP8 + 专家 MXFP4/FP8 量化与 e8m0fnu 原始字节装载", "why": "V4 checkpoint 永远 FP8 block 量化 linear/attn；专家按 expert_dtype 用 MXFP4 或 block FP8。e8m0fnu scale 必须 view 成 uint8 装入，否则 copy_ 的数值转换会毁掉指数字节。", "evidence": "vllm/model_executor/models/deepseek_v4.py:L121-209, L1379-1388"}
+  ],
+  "theory": [
+    "MLA KV cache 节省：标准 MHA 每 token 缓存 2 * n_kv_heads * head_dim；MLA 只缓存 kv_lora_rank(+ qk_rope_head_dim) 维的潜变量(decode 端 MQA 化)。压缩比约 (2 * n_heads * head_dim) / (kv_lora_rank + qk_rope_head_dim)。本章给出 V4 配置下的量化对比即可，内核侧推导/复杂度在 ch24。",
+    "MoE FLOPs：dense MLP 每 token FLOPs ∝ 全部参数；MoE 每 token 只激活 top-k 个 routed 专家 + 共享专家，激活参数 ∝ (num_experts_per_tok + n_shared) / n_routed_experts 的比例。说明'参数量涨、每 token 算力近似不变'。",
+    "解耦 RoPE 维度账：head_dim = qk_nope_head_dim + qk_rope_head_dim；nope 段可被低秩 kv_b 吸收进 latent，rope 段必须显式保留并旋转——解释为何 head 要拆两段。",
+    "hc 多流开销：hidden 被 repeat 成 hc_mult 份，逐层残差/归一在 hc_mult * hidden 维上做；hc_head 一次性 sigmoid 门控加权求和压回。给出'多流 = 表达力换显存/算力'的定性权衡即可，mhc 内核(Sinkhorn)细节下放。"
+  ],
+  "subtraction_plan": {
+    "_note": "本章是'读真实大模型'的 capstone，目标是让读者看懂 deltas-over-Llama 的真身。embed_excerpts 全部逐字真实源码、不动。实现侧(implementer)只允许从下列 delete 清单删除明确无关于'骨架/MLA/MoE/MTP/hc/量化装载'主线的旁支；must_keep 的符号必须在精简版里原样出现且可被 lint 检测。严禁把 V4 简化成 V2/V3，严禁删掉 hc_*/MegaMoE/FP8 让它'看起来像标准 MLA+MoE'。",
+    "delete": [
+      {"what": "DeepseekV4Indexer / DeepseekCompressor / 稀疏 SWA(compress_ratio>1, indexer 分支) 的实现体", "why_safe": "稀疏注意力/索引器是 V4 的可选注意力变体，按 outline scope 内核细节明确下放 ch24；本章只需在 attention_impl 里保留'存在 indexer/compressor 时走 aux stream 重叠'的分支注释，不需其实现。删其实现不影响 dense 路径数据流正确性。"},
+      {"what": "_deepseek_v4_stage_mega_moe_inputs_kernel / _stage_deepseek_v4_mega_moe_inputs / _run_mega_moe / get_symm_buffer / finalize_weights 的 DeepGEMM 内部布局变换与 Triton staging 实现", "why_safe": "这些是 DeepGEMM/MegaMoE 内核实现细节，按 scope 下放专章；本章保留 DeepseekV4MegaMoEExperts.forward 到 torch.ops.vllm.deepseek_v4_mega_moe_experts 的算子边界即可表达'单 kernel 全专家'。删内部实现不改变 MoE 数据流语义。"},
+      {"what": "load_weights 中 stacked_params_mapping 全量条目、_make_deepseek_v4_weights_mapper 的全部 regex、DeepSeekV4MTP.load_weights 的 _rewrite_spec_layer_name/逐层缺失校验等装载长尾", "why_safe": "权重装载的完整映射是工程长尾；本章只需保留三类代表性特例(e8m0fnu→uint8 view、expert_mapping 多副本、attn_sink TP 切)说明'量化 delta'。删长尾不影响读者理解装载要点，且不在前向数据流路径上。"},
+      {"what": "PP/intermediate_tensors/inputs_embeds 分支、DeepseekV4FP8Config 的 override_quantization_method/is_mxfp4_quant 等配置分发样板", "why_safe": "V4 未走 PP(无 PPMissingLayer)，这些分支在本章场景恒不触发；量化方法分发是配置层样板，保留 expert_dtype 惰性解析的概念说明即可。删之不改主数据流。"}
+    ],
+    "must_keep": [
+      {"symbol": "DeepseekV4ForCausalLM", "why": "顶层入口，读者从这里进入整模型；compute_logits/get_mtp_target_hidden_states 是与 MTP/采样的接口边界。"},
+      {"symbol": "DeepseekV4Model", "why": "主干 forward + hc_mult 多流展开 + _mtp_hidden_buffer 暂存 + hc_head 压回，骨架核心。"},
+      {"symbol": "DeepseekV4DecoderLayer", "why": "单层 hc_pre/attn/hc_post + hc_pre/ffn/hc_post 控制流，是 delta-over-Llama 的对照焦点；被主模型与 MTP 复用。"},
+      {"symbol": "hc_pre", "why": "超连接前处理，残差 delta 的入口，writer 必须讲清它取代了 Llama 的 input/post_attention_layernorm。"},
+      {"symbol": "hc_post", "why": "超连接后处理，把分支输出写回多残差流。"},
+      {"symbol": "hc_head", "why": "多流压回单流的收尾函数，主模型与 MTP 都依赖，量化门控混合的真身。"},
+      {"symbol": "DeepseekV4Attention", "why": "MLA 权重骨架(fused_wqa_wkv/wq_b/wo_a/wo_b/q_norm/kv_norm/attn_sink)，对照 LlamaAttention 的 delta 焦点。"},
+      {"symbol": "fused_wqa_wkv", "why": "MLA 低秩压缩入口(q_lora_rank + 压缩 kv)，读者必须看到'不是全量 QKV'。"},
+      {"symbol": "wq_b", "why": "q 潜变量升回 full Q 的升维投影，MLA 低秩-升维结构的另一半。"},
+      {"symbol": "wo_a", "why": "V4 输出投影也低秩(o_lora_rank/o_groups)的第一段，区别于标准 MLA 直接 o_proj。"},
+      {"symbol": "wo_b", "why": "输出低秩第二段，回 hidden_size。"},
+      {"symbol": "q_norm", "why": "q latent 的 RMSNorm，对应标准 MLA q_a_layernorm。"},
+      {"symbol": "kv_norm", "why": "kv latent 的 RMSNorm，对应标准 MLA kv_a_layernorm。"},
+      {"symbol": "attn_sink", "why": "V4 注意力 sink 参数(padded heads, -inf 初始化)，weight 装载特例之一。"},
+      {"symbol": "DeepseekV4MultiHeadLatentAttentionWrapper", "why": "MLA 执行层 + 多 stream GEMM 并行(attn_gemm_parallel_execute)，性能 delta 的载体。"},
+      {"symbol": "attn_gemm_parallel_execute", "why": "多 CUDA stream 重叠输入 GEMM，本章工程亮点，对照 Llama 单 qkv_proj。"},
+      {"symbol": "DeepseekV4MoE", "why": "MoE 层 delta 焦点：gate 路由 + shared_experts + 双后端选择。"},
+      {"symbol": "shared_experts", "why": "每 token 必走的 dense 共享路径，是'MoE 对 dense MLP 的 delta'的关键概念。"},
+      {"symbol": "fused_topk_bias", "why": "路由打分 + top-k 专家选择(sqrtsoftplus + e_score_correction_bias)，路由 delta 的算子。"},
+      {"symbol": "DeepseekV4MegaMoEExperts", "why": "MegaMoE 专家后端，单算子全专家，量化 MoE 的真身；保留其 forward 算子边界。"},
+      {"symbol": "DeepseekV4MLP", "why": "SwiGLU MLP，作 shared_experts 复用，结构同构 LlamaMLP，是 MoE 内那条 dense 路径。"},
+      {"symbol": "DeepseekV4FP8Config", "why": "量化配置 delta(expert_dtype fp4/fp8 惰性解析)，回收 f16 中的'量化'分支。"},
+      {"symbol": "DeepSeekV4MultiTokenPredictorLayer", "why": "MTP draft 单层，融合 embedding 与 pre-hc_head 残差(e_proj/h_proj)，多 token 预测真身。"},
+      {"symbol": "DeepSeekV4MTP", "why": "MTP draft 顶层，与投机解码(ch28)的接口边界。"},
+      {"symbol": "_mtp_hidden_buffer", "why": "target 与 draft 之间传递 pre-hc_head 残差的桥，可检测符号，连接主模型 forward 与 MTP。"},
+      {"symbol": "get_mtp_target_hidden_states", "why": "暴露 _mtp_hidden_buffer 的接口方法，ch28 据此取目标隐状态。"}
+    ]
+  },
+  "diagram_plan": [
+    {
+      "name": "ch25-roadmap",
+      "kind": "roadmap",
+      "spec": "复用 assets/roadmap/roadmap.py。高亮节点：model-architecture / DeepSeek-V4 capstone。前接 ch22(Llama 基线)/ch23(注意力后端)/ch24(MLA 内核)，后接 ch26(FusedMoE/EP)与 ch28(投机解码消费 MTP)。"
+    },
+    {
+      "name": "ch25-delta-stack",
+      "kind": "svg-diagram",
+      "spec": "四象限'delta over Llama'对照图：左列 Llama 基线(QKV-MHA | dense SwiGLU MLP | add-norm 残差 | 单 lm_head)，右列 V4 delta(MLA fused_wqa_wkv/wq_b/wo_a/wo_b 解耦RoPE | MoE gate+shared+routed | hc_pre/hc_post 多流残差 | lm_head + MTP draft)。每行一个箭头标 delta 名。强调这是'一叠 delta'而非全新架构(回收 f16)。"
+    },
+    {
+      "name": "ch25-mla-projection-flow",
+      "kind": "svg-diagram",
+      "spec": "MLA 投影数据流：hidden → fused_wqa_wkv →split→ [q_lora(→q_norm→wq_b→full Q) | kv(head_dim, →kv_norm)] ；head 拆 nope/rope，RoPE 只旋 rope 段；attn 内核(ch24 占位框) → o → wo_a(低秩,FP8 einsum) → wo_b → hidden。并在输入 GEMM 处标多 stream(默认流 fused_wqa_wkv + aux 流 compressor/indexer)。对照旁注 Llama qkv_proj/o_proj。"
+    },
+    {
+      "name": "ch25-moe-dual-backend",
+      "kind": "svg-diagram",
+      "spec": "MoE 数据流 + 双后端：hidden → gate → fused_topk_bias(top-k 路由) → 分叉(use_mega_moe? MegaMoE 单算子 : TP FusedMoE) → routed 输出；并行 shared_experts(dense) → 相加。标注两路 shared_experts 聚合位置差异。对照旁注 LlamaMLP 单 dense。"
+    },
+    {
+      "name": "ch25-hc-residual-and-mtp",
+      "kind": "svg-diagram",
+      "spec": "hc 多流残差 + MTP 桥：embed →repeat hc_mult→ 逐层(hc_pre→attn→hc_post, hc_pre→ffn→hc_post) 多条平行残差流；末尾分两路——(a) copy_ 到 _mtp_hidden_buffer (b) hc_head 压回单流→norm→lm_head。下方画 MTP draft：取 _mtp_hidden_buffer + 下一 token embed →(hnorm/h_proj + enorm/e_proj)融合→ mtp_block → 新 pre-hc_head 残差 → (compute_logits 补 hc_head) draft logits。"
+    }
+  ],
+  "foreshadow_due": {
+    "due_to_plant": [],
+    "due_to_recover": [
+      {
+        "id": "f16",
+        "planted_in": "ch22",
+        "what": "Llama 作最简基线刻意缺 MoE/MLA/量化压缩/混合残差 → DeepSeek-V4 章把每个新增作为对 Llama 的 delta 回收",
+        "how_recovered_here": "本章 framing.delta_table 与 ch25-delta-stack 图正面回收：MLA 回收'低秩压缩(KV/输出)+解耦RoPE'、MoE 回收'路由专家+共享专家'、hc_pre/hc_post/hc_head 回收'混合残差'(并升级为 hc 多流超连接)、DeepseekV4FP8Config + e8m0fnu 装载回收'量化压缩'。每个 delta 都显式回到 ch22 的 Llama 对照(LlamaAttention/LlamaMLP/LlamaDecoderLayer)。"
+      }
+    ]
+  }
+}

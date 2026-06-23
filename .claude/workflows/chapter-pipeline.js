@@ -14,14 +14,14 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch24',
-  slug: 'ch24-attention',
-  focus: '注意力后端抽象与元数据: AttentionBackend 抽象 + registry + selector(get_attn_backend 按 head_size/dtype/平台选 FlashAttention/FlashInfer/Triton 后端)、CommonAttentionMetadata→后端专属 metadata(model_runner 那头组装、backend 这头消费)、KV cache 的 shape/stride 约定、PagedAttention 照 slot_mapping/block_table 读写 KV 显存。回收 f14(slot_mapping/block_table_tensor 作 CommonAttentionMetadata 接口字段)+f18(Attention 按 prefix 从 forward_context 取 kv_cache/attn_metadata、后端选择)',
-  highlight: 'attention',
+  chapter_id: 'ch25',
+  slug: 'ch25-model-architecture',
+  focus: 'capstone 模型解读: 把 DeepSeek-V4 当作对 Llama 基线(ch22)的一叠 delta 端到端拼起来。(1) 骨架 DeepseekV4ForCausalLM/Model/DecoderLayer 与 Llama 的同构与差异; (2) MLA 注意力(DeepseekV4Attention: 低秩 KV 压缩 q_lora/kv_lora、解耦 RoPE)对标准 MHA 的 delta; (3) MoE(DeepseekV4MoE/MegaMoEExperts: 路由 top-k 专家 + 共享专家 + FusedMoE)对 dense MLP 的 delta; (4) MTP(deepseek_v4_mtp 多 token 预测头) 与混合残差。回收 f16(Llama 刻意缺的 MoE/MLA/量化作为对 Llama 的 delta 回收)',
+  highlight: 'model-architecture',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
-  paths: ['vllm/v1/attention/backend.py', 'vllm/v1/attention/selector.py', 'vllm/v1/attention/backends/registry.py', 'vllm/v1/attention/backends/flash_attn.py'],
+  paths: ['vllm/model_executor/models/deepseek_v4.py', 'vllm/model_executor/layers/fused_moe/layer.py', 'vllm/model_executor/layers/mla.py', 'vllm/model_executor/models/deepseek_v4_mtp.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
