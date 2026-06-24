@@ -1,0 +1,247 @@
+{
+  "chapter_id": "ch33",
+  "title": "高级引擎运维: 弹性 EP 扩缩状态机 + Responses API 多轮会话",
+  "summary": "全书 code 章收官，两条独立主线。(A) 弹性专家并行 (Elastic EP) 扩缩：ElasticEPScalingState 把'不停机增删 DP 引擎'拆成确定性状态机——scale_up 存在引擎 9 状态 / 新引擎 4 状态、scale_down 余留引擎 4 状态 / 移除引擎 3 状态；DPEngineCoreProc.reinitialize_distributed 在 busy loop 里逐步 progress() 重建 DP 进程组而不阻塞；_eep_scale_up_before_kv_init 让新引擎在 KV cache 初始化之前就完成扩入（拿到统一的 available_gpu_memory_for_kv_cache）。这条线深度依赖 ch21 DP wave (engines_running/current_wave/step_counter) 与 ch07 EngineCore busy loop。(B) Responses API 多轮：OpenAIServingResponses 用 response_store/msg_store 把上一轮的 output 喂给下一轮——previous_response_id → 取回 prev_response，construct_input_messages（普通）或 _construct_input_messages_with_harmony（harmony 格式）拼接历史，msg_store 因 context 与其共享同一 list 而在生成后自动含本轮 output，形成有状态会话。",
+  "code_spine": [
+    "=== A. Elastic EP 扩缩 ===",
+    "vllm/v1/engine/core.py:L1865-L1911  DPEngineCoreProc.reinitialize_distributed —— 收到 ReconfigureDistributedRequest，深拷贝 parallel_config、判断 scale_up/scale_down 与是否 shutdown，构造 ElasticEPScalingState，process_input_queue_block=False（busy loop 转非阻塞）",
+    "vllm/v1/engine/core.py:L1790-L1804  run_busy_loop —— 每轮先 _process_input_queue，若 eep_scaling_state 非空则调用 progress()，complete 后清空状态（removing 引擎 SystemExit 退出）",
+    "vllm/distributed/elastic_ep/elastic_state.py:L82-L118  ElasticEPScalingState.__init__ —— 按 worker_type(existing/new/removing) + scale_type 选初始状态，持 old/new dp_group/dp_store（weakref 持 executor/engine_core）",
+    "vllm/distributed/elastic_ep/elastic_state.py:L133-L145  progress() —— 分派到 4 个 _progress_* 之一",
+    "vllm/distributed/elastic_ep/elastic_state.py:L227-L307  _progress_existing_engine —— scale_up 存在引擎 9 状态推进（建 standby 组→传专家映射→传权重→同步 KV mem→切换→EPLB reshuffle）",
+    "vllm/distributed/elastic_ep/elastic_state.py:L309-L361  _progress_new_engine —— scale_up 新引擎 4 状态（PRE_KV_INIT 收权重/同步 KV mem→PREPARE all_reduce 拿 wave 状态→EPLB→COMPLETE）",
+    "vllm/distributed/elastic_ep/elastic_state.py:L363-L401  _progress_remaining_engine —— scale_down 余留引擎",
+    "vllm/distributed/elastic_ep/elastic_state.py:L403-L433  _progress_removing_engine —— scale_down 移除引擎，结束发 SHUTDOWN_COMPLETE",
+    "vllm/distributed/elastic_ep/elastic_state.py:L182-L225  _staged_barrier —— 两阶段 TCPStore barrier，解决 DP 各 rank 收到 reconfig 通知有先后的竞态",
+    "vllm/v1/engine/core.py:L1965-L1978  _eep_scale_up_before_kv_init —— 新引擎在 KV init 之前构造 worker_type='new' 的状态机并跑 run_pre_kv_init_states",
+    "vllm/v1/engine/core.py:L124-L126, L240-L246  EngineCore.__init__ / _initialize_kv_caches —— VLLM_ELASTIC_EP_SCALE_UP_LAUNCH 下先扩再用同步得到的显存初始化 KV cache",
+    "vllm/v1/engine/core.py:L435-L450 (elastic_state.py) handle_notification —— existing 引擎据 EEPNotificationType 推进 WAIT_* 状态",
+    "=== B. Responses API 多轮 ===",
+    "vllm/entrypoints/openai/responses/serving.py:L318-L368  create_responses —— 取 previous_response_id→prev_response，按 use_harmony 走 _make_request 或 _make_request_with_harmony",
+    "vllm/entrypoints/openai/responses/utils.py:L79-L121  construct_input_messages —— 普通路径：system(instructions)+过滤后的 prev_msg+prev_response_output(assistant)+本轮 input",
+    "vllm/entrypoints/openai/responses/serving.py:L1133-L1210  _construct_input_messages_with_harmony —— harmony 路径：新会话建 system/developer 消息，续轮取 msg_store[prev_id] 拼接，再 append 本轮 input",
+    "vllm/entrypoints/openai/responses/serving.py:L497-L499  create_responses —— request.store 时 msg_store[request_id]=messages（与 context._messages 共享同一 list）",
+    "vllm/entrypoints/openai/responses/context.py:L559-L583  HarmonyContext.append_output/append_tool_output —— 解析输出 token→messages，extend 进 _messages（即 msg_store 中的 list），使续轮可见本轮 output",
+    "vllm/entrypoints/openai/responses/serving.py:L874-L893  responses_full_generator —— 生成结束后 response_store[response.id]=response（output 即下一轮的 prev_response.output）"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/distributed/elastic_ep/elastic_state.py",
+      "lines": "L33-L70",
+      "code": "class ScaleUpExistingEngineState(enum.IntEnum):\n    WAIT_NEW_CORE_ENGINES_INIT = 0\n    CREATE_STANDBY_GROUPS = 1\n    TRANSFER_EXPERT_MAPPING = 2\n    WAIT_NEW_CORE_ENGINES_WEIGHTS_INIT = 3\n    TRANSFER_WEIGHTS = 4\n    SYNC_KV_CACHE_MEMORY_SIZE = 5\n    SWITCH_AND_PREPARE = 6\n    EPLB_RESHUFFLE = 7\n    COMPLETE = 8\n\n\nclass ScaleUpNewEngineState(enum.IntEnum):\n    PRE_KV_INIT = 0\n    PREPARE = 1\n    EPLB_RESHUFFLE = 2\n    COMPLETE = 3\n\n\nclass ScaleDownRemainingEngineState(enum.IntEnum):\n    PREPARE = 0\n    EPLB_RESHUFFLE = 1\n    SWITCH_AND_PREPARE = 2\n    COMPLETE = 3\n\n\nclass ScaleDownRemovingEngineState(enum.IntEnum):\n    PREPARE = 0\n    EPLB_RESHUFFLE = 1\n    COMPLETE = 2",
+      "elide": ["EngineState TypeAlias（四枚举的联合）与 _BarrierTimeoutError 异常类未列；它们仅是类型/异常声明"]
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L1865-L1911",
+      "code": "    def reinitialize_distributed(\n        self, reconfig_request: ReconfigureDistributedRequest\n    ) -> None:\n        from copy import deepcopy\n        from vllm.distributed.elastic_ep.elastic_state import ElasticEPScalingState\n\n        new_parallel_config = deepcopy(self.vllm_config.parallel_config)\n        old_dp_size = new_parallel_config.data_parallel_size\n        new_parallel_config.data_parallel_size = reconfig_request.new_data_parallel_size\n        if (\n            reconfig_request.new_data_parallel_rank\n            != ReconfigureRankType.KEEP_CURRENT_RANK\n        ):\n            new_parallel_config.data_parallel_rank = (\n                reconfig_request.new_data_parallel_rank\n            )\n        # ... 其余 master_ip/master_port/port_list/coord_store_port 同样从 reconfig_request 拷入 new_parallel_config\n\n        is_scale_down = reconfig_request.new_data_parallel_size < old_dp_size\n        is_shutdown = (\n            reconfig_request.new_data_parallel_rank\n            == ReconfigureRankType.SHUTDOWN_CURRENT_RANK\n        )\n\n        self.eep_scaling_state = ElasticEPScalingState(\n            model_executor=self.model_executor,\n            engine_core=self,\n            vllm_config=self.vllm_config,\n            new_parallel_config=new_parallel_config,\n            worker_type=\"removing\" if is_shutdown else \"existing\",\n            scale_type=\"scale_down\" if is_scale_down else \"scale_up\",\n            reconfig_request=reconfig_request,\n        )\n        self.process_input_queue_block = False\n        logger.info(\n            \"[Elastic EP] Received reconfiguration request and starting scaling up/down\"\n        )",
+      "elide": ["中段 5 行把 new_data_parallel_master_ip/master_port/_data_parallel_master_port_list/_coord_store_port 从 reconfig_request 逐字段拷入，已折叠为注释——逻辑是机械赋值"]
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L1790-L1804",
+      "code": "    def run_busy_loop(self):\n        \"\"\"Core busy loop of the EngineCore for data parallel case.\"\"\"\n        # Loop until process is sent a SIGINT or SIGTERM\n        while self._handle_shutdown():\n            # 1) Poll the input queue until there is work to do.\n            self._process_input_queue()\n\n            if self.eep_scaling_state is not None:\n                _ = self.eep_scaling_state.progress()\n                if self.eep_scaling_state.is_complete():\n                    if self.eep_scaling_state.worker_type == \"removing\":\n                        raise SystemExit\n                    self.process_input_queue_block = True\n                    self.eep_scaling_state = None",
+      "elide": ["此后是 ch21 已讲的 DP wave 逻辑（_process_engine_step / _has_global_unfinished_reqs / wave++）——本章只截到 eep 钩子，wave 部分交叉引用 ch21"]
+    },
+    {
+      "path": "vllm/distributed/elastic_ep/elastic_state.py",
+      "lines": "L133-L150",
+      "code": "    def progress(self) -> bool:\n        if self.scale_type == \"scale_up\":\n            return (\n                self._progress_new_engine()\n                if self.worker_type == \"new\"\n                else self._progress_existing_engine()\n            )\n        return (\n            self._progress_removing_engine()\n            if self.worker_type == \"removing\"\n            else self._progress_remaining_engine()\n        )\n\n    def run_pre_kv_init_states(self) -> None:\n        assert self.scale_type == \"scale_up\" and self.worker_type == \"new\"\n        assert self.state == ScaleUpNewEngineState.PRE_KV_INIT\n        assert self.progress()\n        assert self.state == ScaleUpNewEngineState.PREPARE",
+      "elide": []
+    },
+    {
+      "path": "vllm/distributed/elastic_ep/elastic_state.py",
+      "lines": "L227-L307",
+      "code": "    def _progress_existing_engine(self) -> bool:\n        state = self.state\n        assert self.old_dp_group is not None and self.old_dp_store is not None\n\n        if state == ScaleUpExistingEngineState.WAIT_NEW_CORE_ENGINES_INIT:\n            return False\n\n        elif state == ScaleUpExistingEngineState.CREATE_STANDBY_GROUPS:\n            # NOTE: wait for all existing workers to receive the request\n            if (int(self.old_dp_store.get(\"eep_barrier_engine_count\"))\n                    < self.old_dp_group.size()):\n                return False\n            if not self._staged_barrier(use_new_group=False,\n                                        barrier_name=\"create_standby_groups\"):\n                return False\n            if self.old_dp_group.rank() == 0:\n                self.old_dp_store.delete_key(\"eep_barrier_engine_count\")\n            self._create_standby_groups()\n            self.state = ScaleUpExistingEngineState.TRANSFER_EXPERT_MAPPING\n            return True\n\n        elif state == ScaleUpExistingEngineState.TRANSFER_EXPERT_MAPPING:\n            self._transfer_expert_mapping()\n            self.state = ScaleUpExistingEngineState.WAIT_NEW_CORE_ENGINES_WEIGHTS_INIT\n            return True\n\n        elif state == ScaleUpExistingEngineState.WAIT_NEW_CORE_ENGINES_WEIGHTS_INIT:\n            return False\n\n        elif state == ScaleUpExistingEngineState.TRANSFER_WEIGHTS:\n            # ...（同 CREATE_STANDBY_GROUPS：先等 engine_count 齐、再 staged_barrier）\n            self._transfer_weights()\n            self.state = ScaleUpExistingEngineState.SYNC_KV_CACHE_MEMORY_SIZE\n            return True\n\n        elif state == ScaleUpExistingEngineState.SYNC_KV_CACHE_MEMORY_SIZE:\n            self._sync_kv_cache_memory_size()\n            self.state = ScaleUpExistingEngineState.SWITCH_AND_PREPARE\n            return True\n\n        elif state == ScaleUpExistingEngineState.SWITCH_AND_PREPARE:\n            self._switch_and_prepare()\n            self.state = ScaleUpExistingEngineState.EPLB_RESHUFFLE\n            assert self.new_dp_store is not None\n            self.new_dp_store.add(\"eep_barrier_engine_count\", 1)\n            return True\n\n        elif state == ScaleUpExistingEngineState.EPLB_RESHUFFLE:\n            # ...（等 new 组 engine_count 齐、staged_barrier(use_new_group=True)）\n            self._eplb_reshuffle()\n            self.state = ScaleUpExistingEngineState.COMPLETE\n            self._update_parallel_config()\n            return True\n\n        else:\n            assert self.state == ScaleUpExistingEngineState.COMPLETE\n            return True",
+      "elide": ["TRANSFER_WEIGHTS 与 EPLB_RESHUFFLE 分支里重复的'读 eep_barrier_engine_count < group.size() → return False；_staged_barrier 失败 → return False；rank0 delete_key'三段已折叠为注释——与 CREATE_STANDBY_GROUPS 分支结构完全一致，writer 讲一次即可"]
+    },
+    {
+      "path": "vllm/distributed/elastic_ep/elastic_state.py",
+      "lines": "L309-L361",
+      "code": "    def _progress_new_engine(self) -> bool:\n        state = self.state\n        assert self.new_dp_group is not None and self.new_dp_store is not None\n\n        if state == ScaleUpNewEngineState.PRE_KV_INIT:\n            self.engine_core._eep_send_engine_core_notification(\n                EEPNotificationType.NEW_CORE_ENGINES_WEIGHTS_INIT_READY\n            )\n            self.model_executor.collective_rpc(\n                \"elastic_ep_execute\", args=(\"receive_weights\",)\n            )\n            self.engine_core.available_gpu_memory_for_kv_cache = (\n                ParallelConfig.sync_kv_cache_memory_size(self.new_dp_group, -1)\n            )\n            self.model_executor.collective_rpc(\n                \"elastic_ep_execute\", args=(\"prepare_new_worker\",)\n            )\n            self.state = ScaleUpNewEngineState.PREPARE\n            return True\n\n        elif state == ScaleUpNewEngineState.PREPARE:\n            tensor = torch.tensor([0, 0, 0], dtype=torch.int32, device=\"cpu\")\n            torch.distributed.all_reduce(\n                tensor, op=torch.distributed.ReduceOp.MAX, group=self.new_dp_group,\n            )\n            data = tensor.tolist()\n            self.engine_core.engines_running = bool(data[0])\n            self.engine_core.current_wave = int(data[1])\n            self.engine_core.step_counter = int(data[2])\n            self.state = ScaleUpNewEngineState.EPLB_RESHUFFLE\n            self.new_dp_store.add(\"eep_barrier_engine_count\", 1)\n            return True\n\n        elif state == ScaleUpNewEngineState.EPLB_RESHUFFLE:\n            # ...（等 engine_count 齐 + staged_barrier(use_new_group=True)）\n            assert self.new_dp_group.rank() > 0\n            self._eplb_reshuffle()\n            self.state = ScaleUpNewEngineState.COMPLETE\n            return True\n\n        else:\n            assert self.state == ScaleUpNewEngineState.COMPLETE\n            return True",
+      "elide": ["EPLB_RESHUFFLE 分支的 barrier 样板（同前）折叠为注释。关键点：PREPARE 用 all_reduce MAX 从全 DP 组拿到统一的 engines_running/current_wave/step_counter —— 这正是与 ch21 DP wave 的接缝"]
+    },
+    {
+      "path": "vllm/distributed/elastic_ep/elastic_state.py",
+      "lines": "L363-L401",
+      "code": "    def _progress_remaining_engine(self) -> bool:\n        state = self.state\n        assert self.old_dp_group is not None and self.old_dp_store is not None\n\n        if state == ScaleDownRemainingEngineState.PREPARE:\n            self.state = ScaleDownRemainingEngineState.EPLB_RESHUFFLE\n            self.old_dp_store.add(\"eep_barrier_engine_count\", 1)\n            return True\n\n        elif state == ScaleDownRemainingEngineState.EPLB_RESHUFFLE:\n            # ...（等 engine_count 齐 + staged_barrier(use_new_group=False)）\n            self._eplb_reshuffle_before_scale_down()\n            self.state = ScaleDownRemainingEngineState.SWITCH_AND_PREPARE\n            # NOTE: EPLB reshuffle 把 experts 重分配到余留 worker 后，\n            # 待移除 worker 立即开始 shutdown；余留 worker 不能再用旧 setup forward\n            self._create_standby_groups()\n            self._switch_and_prepare()\n            self._update_parallel_config()\n            self.state = ScaleDownRemainingEngineState.COMPLETE\n            return True\n\n        else:\n            assert self.state == ScaleDownRemainingEngineState.COMPLETE\n            return True",
+      "elide": ["EPLB_RESHUFFLE 分支的 barrier 样板折叠。注意：scale_down 在一个 EPLB_RESHUFFLE 状态里连做 reshuffle→建组→切换→更新 config，比 scale_up 紧凑"]
+    },
+    {
+      "path": "vllm/distributed/elastic_ep/elastic_state.py",
+      "lines": "L403-L433",
+      "code": "    def _progress_removing_engine(self) -> bool:\n        state = self.state\n        assert self.old_dp_group is not None and self.old_dp_store is not None\n\n        if state == ScaleDownRemovingEngineState.PREPARE:\n            self.state = ScaleDownRemovingEngineState.EPLB_RESHUFFLE\n            self.old_dp_store.add(\"eep_barrier_engine_count\", 1)\n            return True\n\n        if state == ScaleDownRemovingEngineState.EPLB_RESHUFFLE:\n            # ...（等 engine_count 齐 + staged_barrier(use_new_group=False)）\n            assert self.old_dp_group.rank() > 0\n            self._eplb_reshuffle_before_scale_down()\n            self._switch_and_remove()\n            self.state = ScaleDownRemovingEngineState.COMPLETE\n            self.engine_core._eep_send_engine_core_notification(\n                EEPNotificationType.SHUTDOWN_COMPLETE\n            )\n            return True\n\n        else:\n            assert self.state == ScaleDownRemovingEngineState.COMPLETE\n            return True",
+      "elide": ["barrier 样板折叠。移除引擎走 _switch_and_remove 而非 _switch_and_prepare，结束发 SHUTDOWN_COMPLETE，随后 run_busy_loop 见 is_complete()+worker_type=='removing' → raise SystemExit"]
+    },
+    {
+      "path": "vllm/distributed/elastic_ep/elastic_state.py",
+      "lines": "L182-L225",
+      "code": "    def _staged_barrier(self, use_new_group: bool, barrier_name: str) -> bool:\n        \"\"\"Execute a two-staged barrier to synchronize all engines in the DP group.\n\n        Some DP EngineCores may receive the reconfiguration notifications\n        later than others, and already proceed to engine step (model forward).\n        In this case, EngineCores that already proceeded to reconfiguration\n        should skip reconfiguration and execute model forward for one more\n        step, so in the next step, all EngineCores will be synchronized.\n        ...\n        \"\"\"\n        dp_group = self.new_dp_group if use_new_group else self.old_dp_group\n        dp_store = self.new_dp_store if use_new_group else self.old_dp_store\n        assert dp_group is not None and dp_store is not None\n\n        group_rank = dp_group.rank()\n        group_size = dp_group.size()\n        barrier_id = f\"eep_barrier_{barrier_name}\"\n        sync_key = f\"{barrier_id}_sync\"\n\n        # TODO: figure out appropriate timeout for the barrier\n        timeout = None if dp_store.check([sync_key]) else timedelta(seconds=5)\n\n        try:\n            self._execute_tcp_store_barrier(\n                dp_store, group_rank, group_size, barrier_id, timeout=timeout\n            )\n            torch.distributed.barrier(dp_group)\n            if group_rank == 0:\n                dp_store.delete_key(sync_key)\n                for i in range(group_size):\n                    dp_store.delete_key(f\"arrival_{barrier_id}_{i}\")\n            return True\n        except _BarrierTimeoutError as e:\n            if timeout is None:\n                raise RuntimeError(\"Unexpected timeout encountered\") from e\n            dp_store.compare_set(sync_key, \"\", b\"1\")\n            return False",
+      "elide": ["_execute_tcp_store_barrier 的实现（L152-L180：每 rank 在 TCPStore set arrival_{id}_{rank}=1，轮询直到 group_size 个到齐或超时）单独 embed；docstring 中段省略号处解释了'第一次 barrier 超时→该 rank 去 engine step，下一 step 用 timeout=None 的 barrier 再同步'"]
+    },
+    {
+      "path": "vllm/distributed/elastic_ep/elastic_state.py",
+      "lines": "L505-L535",
+      "code": "    def _switch_and_prepare(self):\n        self.model_executor.collective_rpc(\n            \"elastic_ep_execute\", args=(\"switch_and_prepare\",)\n        )\n        old_dp_group = self.old_dp_group\n        stateless_destroy_torch_distributed_process_group(old_dp_group)\n        assert self.new_dp_group is not None\n        new_dp_group = self.new_dp_group\n        self.engine_core.dp_group = new_dp_group\n        self.engine_core.dp_rank = new_dp_group.rank()\n        self.engine_core.dp_store = self.new_dp_store\n        engines_running = int(self.engine_core.engines_running)\n        current_wave = self.engine_core.current_wave\n        step_counter = self.engine_core.step_counter\n        tensor = torch.tensor(\n            [engines_running, current_wave, step_counter],\n            dtype=torch.int32, device=\"cpu\",\n        )\n        torch.distributed.all_reduce(\n            tensor, op=torch.distributed.ReduceOp.MAX, group=new_dp_group\n        )\n        # data 回写 engine_core.engines_running/current_wave/step_counter\n        if new_dp_group.rank() == 0:\n            self.engine_core._eep_send_engine_core_notification(\n                EEPNotificationType.RECONFIGURE_FINISHED\n            )",
+      "elide": ["all_reduce 后把 data[0/1/2] 回写 engine_core 三字段（与 PREPARE 同模式）折叠为注释。要点：销毁旧 dp_group、把 engine_core.dp_group/dp_rank/dp_store 切到新组、跨新组 all_reduce MAX 对齐 DP wave 状态——这是'不停机'切换的核心"]
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L1965-L1978",
+      "code": "    def _eep_scale_up_before_kv_init(self):\n        from vllm.distributed.elastic_ep.elastic_state import ElasticEPScalingState\n\n        self.eep_scaling_state = ElasticEPScalingState(\n            model_executor=self.model_executor,\n            engine_core=self,\n            vllm_config=self.vllm_config,\n            new_parallel_config=self.vllm_config.parallel_config,\n            worker_type=\"new\",\n            scale_type=\"scale_up\",\n            reconfig_request=None,\n        )\n        self.eep_scaling_state.run_pre_kv_init_states()\n        self.process_input_queue_block = False",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L124-L126, L240-L251",
+      "code": "        # EngineCore.__init__ 中，profiling 之前：\n        if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:\n            self._eep_scale_up_before_kv_init()\n        # 随后 _initialize_kv_caches(vllm_config) 中：\n        if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:\n            # NOTE: should already be set during _eep_scale_up_before_kv_init\n            assert self.available_gpu_memory_for_kv_cache > 0\n            available_gpu_memory = [self.available_gpu_memory_for_kv_cache] * len(\n                kv_cache_specs\n            )\n        else:\n            available_gpu_memory = self.model_executor.determine_available_memory()\n            self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]",
+      "elide": ["这是两个不连续片段的拼接，展示'KV init 之前扩'的因果：新引擎先 _eep_scale_up_before_kv_init（PRE_KV_INIT 里 sync_kv_cache_memory_size 拿到与全组一致的显存额度），_initialize_kv_caches 才据此分配——避免新引擎自己 profiling 出不一致的显存"]
+    },
+    {
+      "path": "vllm/distributed/elastic_ep/elastic_state.py",
+      "lines": "L435-L450",
+      "code": "    def handle_notification(self, notification_type: EEPNotificationType):\n        assert self.worker_type != \"new\"\n        assert self.old_dp_store is not None\n        if (notification_type == EEPNotificationType.NEW_CORE_ENGINES_INIT_READY\n                and self.state == ScaleUpExistingEngineState.WAIT_NEW_CORE_ENGINES_INIT):\n            self.old_dp_store.add(\"eep_barrier_engine_count\", 1)\n            self.state = ScaleUpExistingEngineState.CREATE_STANDBY_GROUPS\n        elif (notification_type == EEPNotificationType.NEW_CORE_ENGINES_WEIGHTS_INIT_READY\n                and self.state\n                == ScaleUpExistingEngineState.WAIT_NEW_CORE_ENGINES_WEIGHTS_INIT):\n            self.old_dp_store.add(\"eep_barrier_engine_count\", 1)\n            self.state = ScaleUpExistingEngineState.TRANSFER_WEIGHTS",
+      "elide": ["存在引擎的两个 WAIT_* 状态是被动的：progress() 在这两态返回 False（空转），靠 EngineCoreClient 转发来的新引擎通知 handle_notification 把状态推进——这是新旧引擎跨进程握手的关键"]
+    },
+    {
+      "path": "vllm/entrypoints/openai/responses/serving.py",
+      "lines": "L350-L368",
+      "code": "        # Handle the previous response ID.\n        prev_response_id = request.previous_response_id\n        if prev_response_id is not None:\n            async with self.response_store_lock:\n                prev_response = self.response_store.get(prev_response_id)\n            if prev_response is None:\n                return self._make_not_found_error(prev_response_id)\n        else:\n            prev_response = None\n\n        lora_request = self._maybe_get_adapters(request)\n        model_name = self.models.model_name(lora_request)\n\n        if self.use_harmony:\n            messages, engine_inputs = self._make_request_with_harmony(\n                request, prev_response\n            )\n        else:\n            messages, engine_inputs = await self._make_request(request, prev_response)",
+      "elide": ["前面的 _check_model / _validate_create_responses_input / engine 死检 / store!enable_store 时静默关 store 已折叠——多轮主线从 previous_response_id 取回 prev_response 起"]
+    },
+    {
+      "path": "vllm/entrypoints/openai/responses/utils.py",
+      "lines": "L79-L121",
+      "code": "def construct_input_messages(\n    *,\n    request_instructions: str | None = None,\n    request_input: str | list[ResponseInputOutputItem],\n    prev_msg: list[ChatCompletionMessageParam] | None = None,\n    prev_response_output: list[ResponseOutputItem] | None = None,\n):\n    messages: list[ChatCompletionMessageParam] = []\n    if request_instructions:\n        messages.append({\"role\": \"system\", \"content\": request_instructions})\n\n    # Prepend the conversation history.\n    if prev_msg is not None:\n        # Filter out system messages from previous conversation -- per the\n        # OpenAI spec, instructions should NOT carry over across responses.\n        messages.extend(m for m in prev_msg if m.get(\"role\") != \"system\")\n    if prev_response_output is not None:\n        # Add the previous output.\n        for output_item in prev_response_output:\n            # NOTE: We skip the reasoning output.\n            if isinstance(output_item, ResponseOutputMessage):\n                for content in output_item.content:\n                    messages.append({\"role\": \"assistant\", \"content\": content.text})\n\n    # Append the new input.\n    if isinstance(request_input, str):\n        messages.append({\"role\": \"user\", \"content\": request_input})\n    else:\n        input_messages = construct_chat_messages_with_tool_call(request_input)\n        messages.extend(input_messages)\n    return messages",
+      "elide": ["非 harmony 路径。要点：上轮历史(prev_msg)滤掉 system 消息后前置，上轮 output 中的 ResponseOutputMessage 转成 assistant 消息（跳过 reasoning），再 append 本轮 input"]
+    },
+    {
+      "path": "vllm/entrypoints/openai/responses/serving.py",
+      "lines": "L1133-L1185",
+      "code": "    def _construct_input_messages_with_harmony(\n        self, request, prev_response,\n    ) -> list[OpenAIHarmonyMessage]:\n        messages: list[OpenAIHarmonyMessage] = []\n        if prev_response is None:\n            # New conversation.\n            tool_types = extract_tool_types(request.tools)\n            with_custom_tools = has_custom_tools(tool_types)\n            sys_msg = self._construct_harmony_system_input_message(\n                request, with_custom_tools, tool_types\n            )\n            messages.append(sys_msg)\n            if with_custom_tools:\n                dev_msg = get_developer_message(\n                    instructions=request.instructions, tools=request.tools\n                )\n                messages.append(dev_msg)\n            messages += construct_harmony_previous_input_messages(request)\n        else:\n            # Continue the previous conversation.\n            # FIXME: Currently, request params like reasoning and\n            # instructions are ignored.\n            prev_msgs = self.msg_store[prev_response.id]\n            # ... (见下文 slice-delete-reappend 段)\n            messages.extend(prev_msgs)\n        # 之后 append 本轮 input（str 或 list，见 L1186-L1210）",
+      "elide": ["harmony 路径。新会话建 system(+可选 developer)消息；续轮直接取 msg_store[prev_response.id]（含上轮 input+output 的完整 harmony 消息序列）extend 进来。中段 slice-delete-reappend 单独 embed"]
+    },
+    {
+      "path": "vllm/entrypoints/openai/responses/serving.py",
+      "lines": "L1161-L1185",
+      "code": "            # FIXME(woosuk): The slice-delete-reappend cycle below is\n            # currently a no-op --- it removes messages then puts them all\n            # back unfiltered. It may be intentionally deferred (see FIXME\n            # above) or redundant if the Harmony encoder already strips\n            # analysis messages at render time. ...\n            if len(prev_msgs) > 0:\n                last_msg = prev_msgs[-1]\n                assert isinstance(last_msg, OpenAIHarmonyMessage)\n                if last_msg.channel == \"final\":\n                    prev_final_msg_idx = -1\n                    for i in range(len(prev_msgs) - 2, -1, -1):\n                        prev_msg_i = prev_msgs[i]\n                        if prev_msg_i.channel == \"final\":\n                            prev_final_msg_idx = i\n                            break\n                    recent_turn_msgs = prev_msgs[prev_final_msg_idx + 1 :]\n                    del prev_msgs[prev_final_msg_idx + 1 :]\n                    for msg in recent_turn_msgs:\n                        prev_msgs.append(msg)\n            messages.extend(prev_msgs)",
+      "elide": ["源码自带 FIXME 直言这段当前是 no-op（删了又原样加回）。本意是若末条是 final channel，定位上一条 final 之间的'最近一轮'消息——但缺过滤条件故无实际效果。writer 应据 FIXME 如实指出，不可美化为'清洗 analysis 消息'"]
+    },
+    {
+      "path": "vllm/entrypoints/openai/responses/serving.py",
+      "lines": "L494-L499",
+      "code": "        assert len(generators) == 1\n        (result_generator,) = generators\n\n        # Store the input messages.\n        if request.store:\n            self.msg_store[request.request_id] = messages",
+      "elide": ["关键接缝：messages 这个 list 同时被传入 context（HarmonyContext._messages 即同一对象）。生成时 context.append_output extend 进 _messages，于是 msg_store 里这条 list 在生成后自动含上'本轮 output'——续轮取它即得完整历史"]
+    },
+    {
+      "path": "vllm/entrypoints/openai/responses/context.py",
+      "lines": "L559-L583",
+      "code": "    def append_output(self, output: RequestOutput) -> None:\n        output_token_ids = output.outputs[0].token_ids\n        self.parser = get_streamable_parser_for_assistant()\n        for token_id in output_token_ids:\n            self.parser.process(token_id)\n            self._update_num_reasoning_tokens()\n        self._update_prefill_token_usage(output)\n        self._update_decode_token_usage(output)\n        if output.kv_transfer_params is not None:\n            self.kv_transfer_params = output.kv_transfer_params\n        self.all_turn_metrics.append(self.current_turn_metrics.copy())\n        self.current_turn_metrics.reset()\n        # append_output is called only once before tool calling\n        # in non-streaming case so we can append all parser messages\n        output_msgs = self.parser.messages\n        self.finish_reason = output.outputs[0].finish_reason\n        self._messages.extend(output_msgs)",
+      "elide": ["token usage / TurnMetrics 细节是 token 计数旁路；本章主线只需看末行 self._messages.extend(output_msgs)——把 harmony parser 解出的输出消息追加进共享 list（即 msg_store 中的那条）"]
+    },
+    {
+      "path": "vllm/entrypoints/openai/responses/serving.py",
+      "lines": "L874-L893",
+      "code": "        response = ResponsesResponse.from_request(\n            request, sampling_params,\n            input_messages=input_messages,\n            output_messages=output_messages,\n            model_name=model_name,\n            created_time=created_time,\n            output=output,\n            status=status,\n            usage=usage,\n            kv_transfer_params=context.kv_transfer_params,\n        )\n        if request.store:\n            async with self.response_store_lock:\n                stored_response = self.response_store.get(response.id)\n                # If the response is already cancelled, don't update it.\n                if stored_response is None or stored_response.status != \"cancelled\":\n                    self.response_store[response.id] = response\n        return response",
+      "elide": ["from_request 的字段拼装细节省略。要点：response.output 进 response_store，下一轮 previous_response_id 命中后由 construct_input_messages 的 prev_response_output 参数（非 harmony）读取"]
+    }
+  ],
+  "key_classes": [
+    {"name": "ElasticEPScalingState", "file": "vllm/distributed/elastic_ep/elastic_state.py", "responsibility": "弹性扩缩的确定性状态机。一个实例代表'本引擎在本次 reconfig 中的角色与进度'（worker_type×scale_type 决定状态枚举），每次 progress() 推进一步且非阻塞，靠 TCPStore eep_barrier_engine_count 计数 + 两阶段 barrier 跨 rank 同步。weakref 持有 executor/engine_core 避免循环引用。"},
+    {"name": "ScaleUpExistingEngineState / ScaleUpNewEngineState / ScaleDownRemainingEngineState / ScaleDownRemovingEngineState", "file": "vllm/distributed/elastic_ep/elastic_state.py", "responsibility": "四种角色各自的 IntEnum 状态序列。scale_up 把扩入拆成'存在引擎 9 态 / 新引擎 4 态'，scale_down 拆成'余留引擎 4 态 / 移除引擎 3 态'。"},
+    {"name": "DPEngineCoreProc", "file": "vllm/v1/engine/core.py", "responsibility": "数据并行的 EngineCore 进程（ch07/ch21）。本章新增视角：reinitialize_distributed 在 busy loop 里挂上 eep_scaling_state、置 process_input_queue_block=False 进入非阻塞推进；run_busy_loop 每轮调 progress()；_eep_scale_up_before_kv_init 用于'KV init 前扩'的新引擎；_eep_send_engine_core_notification/eep_handle_engine_core_notification 跨进程握手。"},
+    {"name": "ReconfigureDistributedRequest", "file": "vllm/v1/engine/__init__.py", "responsibility": "msgspec.Struct，携带新 DP 维度（new_data_parallel_size/rank/rank_local）与新 master ip/port/port_list/coord_store_port，是触发整套扩缩的指令载荷。"},
+    {"name": "EEPNotificationType", "file": "vllm/v1/engine/__init__.py", "responsibility": "扩缩跨进程通知枚举：NEW_CORE_ENGINES_INIT_READY / NEW_CORE_ENGINES_WEIGHTS_INIT_READY / RECONFIGURE_FINISHED / SHUTDOWN_COMPLETE。经 EngineCoreClient 转发，驱动 existing 引擎 handle_notification 推进 WAIT_* 状态。"},
+    {"name": "OpenAIServingResponses", "file": "vllm/entrypoints/openai/responses/serving.py", "responsibility": "Responses API handler。持有 response_store（id→ResponsesResponse）、msg_store（id→消息序列）、event_store、background_tasks。create_responses 据 previous_response_id 取回上轮、拼接历史、调度生成；多轮有状态会话的真相源。"},
+    {"name": "construct_input_messages", "file": "vllm/entrypoints/openai/responses/utils.py", "responsibility": "非 harmony 多轮拼接：滤掉上轮 system 消息后前置历史、上轮 output 转 assistant、再接本轮 input。"},
+    {"name": "HarmonyContext / StreamingHarmonyContext", "file": "vllm/entrypoints/openai/responses/context.py", "responsibility": "harmony 格式的会话上下文。_messages 与 msg_store 中的 list 共享同一对象；append_output 把 harmony parser 解出的输出消息 extend 进去，从而'本轮 output 自动留存供下一轮读取'。render_for_completion 把消息序列渲染回 token ids 喂引擎。"},
+    {"name": "_construct_input_messages_with_harmony", "file": "vllm/entrypoints/openai/responses/serving.py", "responsibility": "harmony 多轮拼接：新会话造 system(+developer) 消息，续轮直接取 msg_store[prev_id]（含上轮完整 harmony 序列）extend，再 append 本轮 input。"}
+  ],
+  "data_flow": [
+    "=== A. scale_up（增引擎）端到端 ===",
+    "1. 外部 scale 工具 → EngineCoreClient 向各存在引擎下发 ReconfigureDistributedRequest",
+    "2. core.py:DPEngineCoreProc.reinitialize_distributed — 据 new_dp_size>old 判 scale_up、worker_type='existing'，建 eep_scaling_state，process_input_queue_block=False",
+    "3. 同时新引擎进程启动，core.py:EngineCore.__init__ 见 VLLM_ELASTIC_EP_SCALE_UP_LAUNCH → _eep_scale_up_before_kv_init（worker_type='new'）→ run_pre_kv_init_states 先发 ...WEIGHTS_INIT_READY、receive_weights、sync_kv_cache_memory_size 拿统一显存额度",
+    "4. 新引擎 EngineCoreProc.__init__ 发 NEW_CORE_ENGINES_INIT_READY（core.py:L869-873）→ 经 client 转发",
+    "5. existing 引擎 elastic_state.py:handle_notification 收 INIT_READY → 状态 WAIT_NEW_CORE_ENGINES_INIT→CREATE_STANDBY_GROUPS，eep_barrier_engine_count++",
+    "6. run_busy_loop 每轮 progress() → _progress_existing_engine 依次：CREATE_STANDBY_GROUPS(_create_standby_groups 建新 dp_group + worker 建 standby 通信组) → TRANSFER_EXPERT_MAPPING(broadcast 专家映射) → WAIT_WEIGHTS_INIT(空转) → TRANSFER_WEIGHTS(向新 worker 传权重) → SYNC_KV_CACHE_MEMORY_SIZE → SWITCH_AND_PREPARE(_switch_and_prepare 销毁旧组、切 engine_core.dp_group 到新组、all_reduce 对齐 wave 状态、发 RECONFIGURE_FINISHED) → EPLB_RESHUFFLE → COMPLETE(_update_parallel_config)",
+    "7. 新引擎 _progress_new_engine：PRE_KV_INIT(已在 step3 完成)→PREPARE(all_reduce MAX 拿 engines_running/current_wave/step_counter)→EPLB_RESHUFFLE→COMPLETE，融入新 DP 组的 wave 节律（ch21）",
+    "8. 每个 barrier 点用 _staged_barrier 两阶段同步，容忍各 rank 收到 reconfig 通知的先后差",
+    "=== B. scale_down（减引擎）端到端 ===",
+    "9. reconfig new_dp_size<old → 余留引擎 worker_type='existing'+scale_down → _progress_remaining_engine；被裁引擎 new_data_parallel_rank==SHUTDOWN_CURRENT_RANK → worker_type='removing' → _progress_removing_engine",
+    "10. 余留：PREPARE→EPLB_RESHUFFLE(reshuffle_before_scale_down 把 experts 收回余留 worker→建新组→switch_and_prepare→update_config)→COMPLETE",
+    "11. 移除：PREPARE→EPLB_RESHUFFLE(reshuffle→switch_and_remove→发 SHUTDOWN_COMPLETE)→COMPLETE → run_busy_loop 见 worker_type=='removing'&is_complete → raise SystemExit 退出进程",
+    "=== C. Responses 多轮端到端 ===",
+    "12. serving.py:create_responses — 取 request.previous_response_id → response_store.get 拿 prev_response（None 则 404）",
+    "13. use_harmony? → _make_request_with_harmony : _make_request",
+    "14a. 非 harmony：construct_input_messages 用 prev_msg=msg_store[prev_id]（滤 system）+ prev_response_output（output→assistant）+ 本轮 input 拼成 chat 消息 → preprocess_chat 渲染 token",
+    "14b. harmony：_construct_input_messages_with_harmony 新会话造 system/developer、续轮取 msg_store[prev_id] 完整 harmony 序列 + 本轮 input → render_for_completion 渲染 token",
+    "15. request.store → msg_store[request_id]=messages（与 context._messages 同一 list）",
+    "16. _generate_with_builtin_tools 生成 → context.append_output 把输出消息 extend 进 _messages（即 msg_store 那条），含工具轮则 call_tool+append_tool_output 再渲染下一子轮",
+    "17. responses_full_generator 收尾 → response_store[response.id]=response，其 output 即下一轮的 prev_response.output / msg_store 即下一轮历史，闭环成有状态会话"
+  ],
+  "design_decisions": [
+    {"decision": "扩缩做成'每步非阻塞推进'的状态机而非一次性阻塞调用", "why": "DP busy loop 不能长时间停在 reconfig 上——其它 rank 可能还在 forward。状态机让每个引擎每轮 busy loop 只推进一步、空转态 return False，与正常 step 交织，实现'不停机重建分布式组'。", "evidence": "vllm/v1/engine/core.py:L1798-1804 + elastic_state.py:L133-145"},
+    {"decision": "两阶段 TCPStore barrier（先带 5s 超时、超时则下一步用无超时 barrier）", "why": "DP 各 EngineCore 收到 reconfig 通知有先后；先到的不能干等死锁，应再 forward 一步，让落后者追上后在无超时 barrier 上汇合。", "evidence": "vllm/distributed/elastic_ep/elastic_state.py:L182-225 docstring"},
+    {"decision": "新引擎在 KV cache 初始化之前就完成扩入（_eep_scale_up_before_kv_init）", "why": "新引擎不能各自 profiling 出不同的 KV 显存额度；必须先经 sync_kv_cache_memory_size 从全 DP 组拿到统一额度，再据此分配 KV cache，否则 DP 组内显存/块数不一致。", "evidence": "vllm/v1/engine/core.py:L124-126 + L240-251 + elastic_state.py:L313-327"},
+    {"decision": "切换时跨新 DP 组 all_reduce(MAX) 对齐 engines_running/current_wave/step_counter", "why": "新旧引擎合入同一 DP wave 节律（ch21）必须共识 wave/step；MAX 让新引擎采纳全组最大 wave，避免落后 rank 拖慢或重放旧 wave。", "evidence": "vllm/distributed/elastic_ep/elastic_state.py:L519-530 + L330-339"},
+    {"decision": "移除引擎走独立的 removing 状态序列并以 SHUTDOWN_COMPLETE + SystemExit 收尾", "why": "被裁引擎完成 EPLB 把 experts 交还后即可退出；用专门状态机与通知让 client 能释放其 ray placement group，干净下线。", "evidence": "vllm/distributed/elastic_ep/elastic_state.py:L403-433 + core.py:L1801-1802"},
+    {"decision": "Responses 多轮用进程内 response_store/msg_store 字典（非持久存储）", "why": "实现有状态会话最小代价：previous_response_id 索引上轮 response 与消息序列。源码自承认是 HACK / 可能内存泄漏（从不清理），是务实折中。", "evidence": "vllm/entrypoints/openai/responses/serving.py:L232-246"},
+    {"decision": "msg_store 存的 list 与 HarmonyContext._messages 是同一对象", "why": "生成时 append_output 直接 extend 进该 list，使'本轮 output'无需额外写回即自动留存于 msg_store，下一轮 previous_response_id 命中即得完整历史——简洁但隐式。", "evidence": "vllm/entrypoints/openai/responses/serving.py:L497-499 + context.py:L579"},
+    {"decision": "非 harmony 续轮过滤掉上轮的 system 消息", "why": "遵循 OpenAI 规范——instructions 不跨 response 携带，每轮 instructions 由当前请求决定。", "evidence": "vllm/entrypoints/openai/responses/utils.py:L97-100"}
+  ],
+  "theory": [
+    {"topic": "扩缩状态数与复杂度", "content": "scale_up 存在引擎 9 状态、新引擎 4 状态；scale_down 余留 4、移除 3。状态推进总轮数随阶段线性，但每个 barrier 点是 O(group_size) 的 TCPStore 轮询（_execute_tcp_store_barrier 对 group_size 个 arrival key 轮询）。两阶段 barrier 把'通知到达偏序'转成最多一次额外 forward step 的代价。"},
+    {"topic": "为何 scale_down 在单状态里连做多步而 scale_up 拆细", "content": "scale_up 需与正在初始化的新引擎跨进程握手（多个 WAIT_*/通知点），故拆成 9/4 态；scale_down 的余留引擎无需等外部，EPLB_RESHUFFLE 一态内即可顺序完成 reshuffle→建组→切换→更新 config，状态更紧凑。"},
+    {"topic": "DP wave 一致性传播", "content": "扩缩两端都用 all_reduce(ReduceOp.MAX) 在 [engines_running, current_wave, step_counter] 三元组上取最大，作为合组后的统一 DP wave 状态——这是把 ch21 的 wave 协议无缝延展到'成员数变化'场景的关键不变量。"},
+    {"topic": "多轮 token 增长与缓存", "content": "有状态会话每轮把上轮全部历史重新喂入，prompt 随轮数累积线性增长；harmony 路径 render_for_completion 每轮重渲染完整消息序列。这正是 prefix caching（前文章节）在多轮场景价值最大化之处——历史前缀可命中缓存。"}
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {"what": "elastic_state.py 中 _update_prefill/_decode 无关的 logger.info 行（L245-246 等仅打印的 rank0 log）", "why_safe": "纯日志，不影响状态机控制流；保留少量代表性 log 即可。"},
+      {"what": "context.py HarmonyContext 的 token-usage 统计细节：_update_num_reasoning_tokens、_update_prefill_token_usage、_update_decode_token_usage 的完整实现体（保留方法名与调用点占位）", "why_safe": "token 计数是旁路统计，不参与'本轮 output 留存→下一轮读取'的多轮主线；删其内部实现不改变会话拼接正确性。"},
+      {"what": "serving.py 中 background / streaming 分支（_run_background_request_stream、responses_background_stream_generator、event_store 相关）", "why_safe": "本章主线是同步多轮拼接；background/streaming 是正交特性，删后非流式多轮路径完整自洽。"},
+      {"what": "serving.py builtin tool_server 探测块（browser/python/container 的 has_tool 判断 L384-405）", "why_safe": "工具服务器集成是可选特性；本章聚焦跨轮历史，available_tools 置空列表即可保留主控制流。"},
+      {"what": "elastic_execute.py 的 worker 侧具体实现（receive_weights/transfer_weights/EPLB 等的内部体）", "why_safe": "本章解读引擎进程侧的状态机编排（elastic_state.py + core.py）；worker 侧执行细节仅以 collective_rpc('elastic_ep_execute', args=(...)) 的方法名形式出现，保留调用即可，不必内联 worker 实现。"}
+    ],
+    "must_keep": [
+      {"symbol": "ElasticEPScalingState", "why": "扩缩状态机主类，读者与 writer 的核心对象。"},
+      {"symbol": "progress", "why": "每轮非阻塞推进的入口，体现'不停机'。"},
+      {"symbol": "_progress_existing_engine", "why": "scale_up 存在引擎 9 状态推进，主线。"},
+      {"symbol": "_progress_new_engine", "why": "scale_up 新引擎 4 状态，含 KV-init-前同步显存。"},
+      {"symbol": "_progress_remaining_engine", "why": "scale_down 余留引擎，紧凑状态序列。"},
+      {"symbol": "_progress_removing_engine", "why": "scale_down 移除引擎，SHUTDOWN_COMPLETE 收尾。"},
+      {"symbol": "_staged_barrier", "why": "两阶段 barrier，解决通知到达偏序竞态，必须讲清。"},
+      {"symbol": "_switch_and_prepare", "why": "销毁旧组/切到新组/all_reduce 对齐 wave，'不停机切换'核心。"},
+      {"symbol": "ScaleUpExistingEngineState", "why": "9 状态枚举，状态机骨架。"},
+      {"symbol": "ScaleUpNewEngineState", "why": "新引擎 4 状态枚举。"},
+      {"symbol": "ScaleDownRemainingEngineState", "why": "余留引擎状态枚举。"},
+      {"symbol": "ScaleDownRemovingEngineState", "why": "移除引擎状态枚举。"},
+      {"symbol": "reinitialize_distributed", "why": "core.py 触发扩缩、转非阻塞 busy loop 的入口。"},
+      {"symbol": "run_busy_loop", "why": "busy loop 里每轮调 progress() 的挂钩点（与 ch21 接缝）。"},
+      {"symbol": "_eep_scale_up_before_kv_init", "why": "'KV init 前扩'的入口方法。"},
+      {"symbol": "run_pre_kv_init_states", "why": "新引擎 KV-init 前预跑 PRE_KV_INIT 状态。"},
+      {"symbol": "handle_notification", "why": "existing 引擎据 EEPNotificationType 推进 WAIT_* 的握手点。"},
+      {"symbol": "EEPNotificationType", "why": "扩缩跨进程通知枚举。"},
+      {"symbol": "ReconfigureDistributedRequest", "why": "触发扩缩的指令载荷。"},
+      {"symbol": "available_gpu_memory_for_kv_cache", "why": "KV-init 前同步得到的统一显存额度，串起 _initialize_kv_caches。"},
+      {"symbol": "OpenAIServingResponses", "why": "Responses 多轮 handler 主类。"},
+      {"symbol": "create_responses", "why": "多轮入口：取 prev_response、拼历史、调度。"},
+      {"symbol": "previous_response_id", "why": "续轮的关键请求字段。"},
+      {"symbol": "response_store", "why": "id→ResponsesResponse，存上轮 output。"},
+      {"symbol": "msg_store", "why": "id→消息序列，存上轮完整历史（与 context 共享）。"},
+      {"symbol": "construct_input_messages", "why": "非 harmony 多轮拼接函数。"},
+      {"symbol": "_construct_input_messages_with_harmony", "why": "harmony 多轮拼接函数。"},
+      {"symbol": "HarmonyContext", "why": "harmony 会话上下文，_messages 共享语义。"},
+      {"symbol": "append_output", "why": "把本轮 output extend 进共享 list，多轮留存机制核心。"},
+      {"symbol": "render_for_completion", "why": "消息序列→token ids 喂引擎。"}
+    ]
+  },
+  "diagram_plan": [
+    {"id": "01-eep-scaleup-state-machine", "kind": "state-machine / swimlane", "spec": "两泳道（existing 引擎 9 态 / new 引擎 4 态）并排的状态机图，标出跨进程通知（NEW_CORE_ENGINES_INIT_READY / WEIGHTS_INIT_READY / RECONFIGURE_FINISHED）作为泳道间的横向箭头，barrier 点用同步条标注。用 svg-diagram skill（多对多、auto-layout 会乱，需脚本精确坐标）。", "roadmap_highlight": "ch33 / DPEngineCoreProc"},
+    {"id": "02-eep-scaledown-states", "kind": "state-machine", "spec": "余留引擎(4 态) 与 移除引擎(3 态) 两条短链，标 EPLB reshuffle 把 experts 收回、移除引擎 SHUTDOWN_COMPLETE→SystemExit。", "roadmap_highlight": "ch33"},
+    {"id": "03-kv-init-before-scale", "kind": "sequence", "spec": "时序图：新引擎 EngineCore.__init__ → _eep_scale_up_before_kv_init(PRE_KV_INIT: receive_weights / sync_kv_cache_memory_size 拿统一额度) → _initialize_kv_caches 用该额度分配。强调'扩在 KV init 之前'的因果。", "roadmap_highlight": "ch33"},
+    {"id": "04-responses-multiturn-stores", "kind": "data-flow / sequence", "spec": "两轮会话时序：轮1 create_responses→生成→append_output 写共享 list→msg_store/response_store 落库；轮2 携 previous_response_id→取回 prev_response/msg_store→construct_input_messages(_with_harmony) 拼历史→再生成。突出 msg_store list 与 context._messages 同一对象的共享箭头。", "roadmap_highlight": "ch33 / OpenAIServingResponses"}
+  ],
+  "foreshadow_due": {"should_plant": [], "should_recover": [], "note": "bible.py due ch33 返回'应埋伏笔'与'应回收'均为空。ch33 是全书 code 章收官，无新伏笔需埋；如全书 Part 收官审计需回收，归 Archivist 在 Part 级连贯性审计处理。"}
+}
