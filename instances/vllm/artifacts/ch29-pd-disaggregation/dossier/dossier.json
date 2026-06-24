@@ -1,0 +1,263 @@
+{
+  "chapter_id": "ch29",
+  "title": "PD 分离的抽象与调度器集成",
+  "source_pin": "f3fef123",
+  "one_liner": "为什么把 prefill 和 decode 拆到不同 engine：KVConnectorBase_V1 用 KVConnectorRole 把『决策侧（scheduler 进程）』与『搬运侧（worker 进程）』切成两半契约；scheduler 调 connector 查远程命中→把等远程 KV 的请求隔离到 skipped_waiting 避队头阻塞→KV 到位后提升回 WAITING/PREEMPTED。回收 f12。",
+
+  "code_spine": [
+    "vllm/distributed/kv_transfer/kv_connector/v1/base.py:L123-L129 (KVConnectorRole 枚举：SCHEDULER=0 / WORKER=1，role-split 的根)",
+    "vllm/distributed/kv_transfer/kv_connector/v1/base.py:L449-L518 (Scheduler-side 三抽象方法 get_num_new_matched_tokens / update_state_after_alloc / build_connector_meta)",
+    "vllm/distributed/kv_transfer/kv_connector/v1/base.py:L298-L361 (Worker-side 抽象方法 start_load_kv / wait_for_layer_load / save_kv_layer / wait_for_save)",
+    "vllm/distributed/kv_transfer/kv_connector/v1/base.py:L363-L379 (Worker-side get_finished：上报已完成的异步收/发 req_id)",
+    "vllm/distributed/kv_transfer/kv_connector/factory.py:L27-L82 (KVConnectorFactory：懒加载注册表 + create_connector 按 role 单独构造)",
+    "vllm/distributed/kv_transfer/kv_connector/factory.py:L149-L153 (注册 ExampleConnector 等)",
+    "vllm/v1/core/sched/scheduler.py:L118-L138 (Scheduler 构造 SCHEDULER-role connector)",
+    "vllm/v1/core/sched/scheduler.py:L167-L184 (waiting / skipped_waiting 双队列 + finished_recving_kv_req_ids 状态集)",
+    "vllm/v1/core/sched/scheduler.py:L571-L592 (WAITING 调度循环入口：双队列遍历 + 阻塞态提升尝试)",
+    "vllm/v1/core/sched/scheduler.py:L613-L646 (request.num_computed_tokens==0 时调 get_num_new_matched_tokens 查远程命中)",
+    "vllm/v1/core/sched/scheduler.py:L668-L671 (load_kv_async 时 num_new_tokens=0：本步不为新计算分配)",
+    "vllm/v1/core/sched/scheduler.py:L744-L754 (allocate_slots 带 num_external_computed_tokens + delay_cache_blocks=load_kv_async)",
+    "vllm/v1/core/sched/scheduler.py:L765-L783 (update_state_after_alloc 通知 connector 已分配的 blocks)",
+    "vllm/v1/core/sched/scheduler.py:L785-L805 (load_kv_async：置 WAITING_FOR_REMOTE_KVS、隔离进 step_skipped_waiting、记 num_computed_tokens)",
+    "vllm/v1/core/sched/scheduler.py:L844-L846 (本步 skipped 回灌 skipped_waiting 队头)",
+    "vllm/v1/core/sched/scheduler.py:L932-L934 (schedule 末尾 build_connector_meta，打包 KV 搬运计划送 worker)",
+    "vllm/v1/core/sched/scheduler.py:L1498-L1506 (update_from_output：消化 worker 回传的 kv_connector_output + take_events)",
+    "vllm/v1/core/sched/scheduler.py:L2094-L2121 (_update_from_kv_xfer_finished：finished_recving 入集 / finished_sending 释放块)",
+    "vllm/v1/core/sched/scheduler.py:L2061-L2092 (_try_promote_blocked_waiting_request：recv 完成→提升回 WAITING/PREEMPTED)",
+    "vllm/v1/core/sched/scheduler.py:L2027-L2059 (_update_waiting_for_remote_kv：缓存到位的 blocks、整 prompt 命中回退一个 token)",
+    "vllm/v1/core/sched/scheduler.py:L1996-L2025 (_connector_finished：请求结束时 request_finished，可异步延迟释放块)"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/base.py",
+      "lines": "L123-L129",
+      "code": "class KVConnectorRole(enum.Enum):\n    # Connector running in the scheduler process\n    SCHEDULER = 0\n\n    # Connector running in the worker process\n    WORKER = 1",
+      "elide": []
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/base.py",
+      "lines": "L449-L482",
+      "code": "    @abstractmethod\n    def get_num_new_matched_tokens(\n        self,\n        request: \"Request\",\n        num_computed_tokens: int,\n    ) -> tuple[int | None, bool]:\n        \"\"\"\n        Get number of new tokens that can be loaded from the\n        external KV cache beyond the num_computed_tokens.\n\n        Returns:\n            A tuple with the following elements:\n                - An optional number of tokens that can be loaded from the\n                  external KV cache beyond what is already computed.\n                  If None, it means that the connector needs more time to\n                  determine the number of matched tokens, and the scheduler\n                  should query for this request again later.\n                - `True` if external KV cache tokens will be loaded\n                  asynchronously (between scheduler steps). Must be\n                  'False' if the first element is 0.\n        \"\"\"\n        pass",
+      "elide": ["完整 Args 文档与 Notes 段（largest prefix / eviction 注意事项）已省，正文用散文转述"]
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/base.py",
+      "lines": "L484-L518",
+      "code": "    @abstractmethod\n    def update_state_after_alloc(\n        self, request: \"Request\", blocks: \"KVCacheBlocks\", num_external_tokens: int\n    ):\n        \"\"\"\n        Update KVConnector state after block allocation.\n\n        If get_num_new_matched_tokens previously returned True for a\n        request, this function may be called twice for that same request -\n        first when blocks are allocated for the connector tokens to be\n        asynchronously loaded into, and second when any additional blocks\n        are allocated, after the load/transfer is complete.\n        \"\"\"\n        pass\n\n    @abstractmethod\n    def build_connector_meta(\n        self, scheduler_output: SchedulerOutput\n    ) -> KVConnectorMetadata:\n        \"\"\"\n        Build the connector metadata for this step.\n\n        This function should NOT modify fields in the scheduler_output.\n        Also, calling this function will reset the state of the connector.\n        \"\"\"\n        pass",
+      "elide": ["Args 文档段省略"]
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/base.py",
+      "lines": "L298-L361",
+      "code": "    @abstractmethod\n    def start_load_kv(self, forward_context: \"ForwardContext\", **kwargs: Any) -> None:\n        \"\"\"\n        Start loading the KV cache from the connector to vLLM's paged\n        KV buffer. This is called from the forward context before the\n        forward pass to enable async loading during model execution.\n        \"\"\"\n        pass\n\n    @abstractmethod\n    def wait_for_layer_load(self, layer_name: str) -> None:\n        \"\"\"\n        Block until the KV for a specific layer is loaded into vLLM's\n        paged buffer. This is called from within attention layer to ensure\n        async copying from start_load_kv is complete.\n        \"\"\"\n        pass\n\n    @abstractmethod\n    def save_kv_layer(\n        self,\n        layer_name: str,\n        kv_layer: torch.Tensor,\n        attn_metadata: \"AttentionMetadata\",\n        **kwargs: Any,\n    ) -> None:\n        \"\"\"\n        Start saving a layer of KV cache from vLLM's paged buffer\n        to the connector. This is called from within attention layer to\n        enable async copying during execution.\n        \"\"\"\n        pass\n\n    @abstractmethod\n    def wait_for_save(self):\n        \"\"\"\n        Block until all the save operations is done. This is called\n        as the forward context exits to ensure that the async saving\n        from save_kv_layer is complete before finishing the forward.\n        \"\"\"\n        pass",
+      "elide": ["各方法 Args 详细文档省略；docstring 正文保留要点"]
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/factory.py",
+      "lines": "L42-L82",
+      "code": "    @classmethod\n    def create_connector(\n        cls,\n        config: \"VllmConfig\",\n        role: KVConnectorRole,\n        kv_cache_config: \"KVCacheConfig | None\" = None,\n    ) -> KVConnectorBase:\n        kv_transfer_config = config.kv_transfer_config\n        if kv_transfer_config is None:\n            raise ValueError(\"kv_transfer_config must be set to create a connector\")\n        connector_cls, compat_sig = cls._get_connector_class_with_compat(\n            kv_transfer_config\n        )\n        ...\n        # NOTE(Kuntai): v1 connector is explicitly separated into two roles.\n        # Scheduler connector:\n        # - Co-locate with scheduler process\n        # - Should only be used inside the Scheduler class\n        # Worker connector:\n        # - Co-locate with worker process\n        # - Should only be used inside the forward context & attention layer\n        # We build separately to enforce strict separation\n        if compat_sig:\n            # Old signature: __init__(self, vllm_config, role)\n            return connector_cls(config, role)\n        else:\n            # New signature: __init__(self, vllm_config, role, kv_cache_config)\n            return connector_cls(config, role, kv_cache_config)",
+      "elide": ["HMA 校验与 logger.info 段以 ... 略去（正文说明：HMA 不支持则报错）"]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L118-L132",
+      "code": "        # Create KVConnector for the Scheduler. Note that each Worker\n        # will have a corresponding KVConnector with Role=WORKER.\n        # KV Connector pushes/pull of remote KVs for P/D and offloading.\n        self.connector = None\n        ...\n        if self.vllm_config.kv_transfer_config is not None:\n            assert not self.is_encoder_decoder, (\n                \"Encoder-decoder models are not currently supported with KV connectors\"\n            )\n            self.connector = KVConnectorFactory.create_connector(\n                config=self.vllm_config,\n                role=KVConnectorRole.SCHEDULER,\n                kv_cache_config=self.kv_cache_config,\n            )",
+      "elide": ["connector_prefix_cache_stats / recompute_kv_load_failures 初始化以 ... 略去"]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L167-L169",
+      "code": "        self.waiting = create_request_queue(self.policy)\n        # requests skipped in waiting flow due async deps or constraints.\n        self.skipped_waiting = create_request_queue(self.policy)",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L571-L592",
+      "code": "            while (self.waiting or self.skipped_waiting) and token_budget > 0:\n                if len(self.running) == self.max_num_running_reqs:\n                    break\n\n                request_queue = self._select_waiting_queue_for_scheduling()\n                assert request_queue is not None\n\n                request = request_queue.peek_request()\n                request_id = request.request_id\n\n                # try to promote blocked statuses while traversing skipped queue.\n                if self._is_blocked_waiting_status(\n                    request.status\n                ) and not self._try_promote_blocked_waiting_request(request):\n                    if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:\n                        logger.debug(\n                            \"%s is still in WAITING_FOR_REMOTE_KVS state.\",\n                            request_id,\n                        )\n                    request_queue.pop_request()\n                    step_skipped_waiting.prepend_request(request)\n                    continue",
+      "elide": ["lora max_loras 约束分支（L594-607）正文不展开"]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L613-L646",
+      "code": "                # Get already-cached tokens.\n                if request.num_computed_tokens == 0:\n                    # Get locally-cached tokens.\n                    new_computed_blocks, num_new_local_computed_tokens = (\n                        self.kv_cache_manager.get_computed_blocks(request)\n                    )\n\n                    # Get externally-cached tokens if using a KVConnector.\n                    if self.connector is not None:\n                        ext_tokens, load_kv_async = (\n                            self.connector.get_num_new_matched_tokens(\n                                request, num_new_local_computed_tokens\n                            )\n                        )\n\n                        if ext_tokens is None:\n                            # The request cannot be scheduled because\n                            # the KVConnector couldn't determine\n                            # the number of matched tokens.\n                            request_queue.pop_request()\n                            step_skipped_waiting.prepend_request(request)\n                            continue\n\n                        num_external_computed_tokens = ext_tokens\n\n                        connector_prefix_cache_queries = (\n                            request.num_tokens - num_new_local_computed_tokens\n                        )\n                        connector_prefix_cache_hits = num_external_computed_tokens\n\n                    # Total computed tokens (local + external).\n                    num_computed_tokens = (\n                        num_new_local_computed_tokens + num_external_computed_tokens\n                    )",
+      "elide": ["prefill_stats 记录块、else 分支（num_computed_tokens>0 的已恢复请求）正文转述"]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L668-L671",
+      "code": "                if load_kv_async:\n                    # KVTransfer: loading remote KV, do not allocate for new work.\n                    assert num_external_computed_tokens > 0\n                    num_new_tokens = 0",
+      "elide": ["else 分支（正常 num_new_tokens 计算 + chunked prefill 截断）正文简述"]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L744-L774",
+      "code": "                new_blocks = self.kv_cache_manager.allocate_slots(\n                    request,\n                    num_new_tokens,\n                    num_new_computed_tokens=num_new_local_computed_tokens,\n                    new_computed_blocks=new_computed_blocks,\n                    num_lookahead_tokens=effective_lookahead_tokens,\n                    num_external_computed_tokens=num_external_computed_tokens,\n                    delay_cache_blocks=load_kv_async,\n                    num_encoder_tokens=num_encoder_tokens,\n                    full_sequence_must_fit=self.scheduler_reserve_full_isl,\n                )\n\n                if new_blocks is None:\n                    # The request cannot be scheduled.\n                    ...\n                    break\n\n                # KVTransfer: the connector uses this info to determine\n                # if a load is needed.\n                if self.connector is not None:\n                    self.connector.update_state_after_alloc(\n                        request,\n                        self.kv_cache_manager.get_blocks(request_id),\n                        num_external_computed_tokens,\n                    )",
+      "elide": ["encoder_cache free 与 connector_prefix_cache_stats.record 分支以 ... 略去"]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L785-L805",
+      "code": "                request = request_queue.pop_request()\n                if load_kv_async:\n                    # If loading async, allocate memory and put request\n                    # into the WAITING_FOR_REMOTE_KV state.\n                    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS\n                    step_skipped_waiting.prepend_request(request)\n                    # Set num_computed_tokens even though KVs are not yet loaded.\n                    # request.num_computed_tokens will not be used anywhere until\n                    # the request finished the KV transfer.\n                    request.num_computed_tokens = num_computed_tokens\n                    continue",
+      "elide": ["注释中关于 transfer error 重置 num_computed_tokens 的长说明保留要点"]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L844-L846",
+      "code": "            # re-queue requests skipped in this pass ahead of older skipped items.\n            if step_skipped_waiting:\n                self.skipped_waiting.prepend_requests(step_skipped_waiting)",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L928-L934",
+      "code": "        # NOTE(Kuntai): this function is designed for multiple purposes:\n        # 1. Plan the KV cache store\n        # 2. Wrap up all the KV cache load / save ops into an opaque object\n        # 3. Clear the internal states of the connector\n        if self.connector is not None:\n            meta = self._build_kv_connector_meta(self.connector, scheduler_output)\n            scheduler_output.kv_connector_metadata = meta",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1553-L1559",
+      "code": "    @staticmethod\n    def _is_blocked_waiting_status(status: RequestStatus) -> bool:\n        return status in (\n            RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,\n            RequestStatus.WAITING_FOR_REMOTE_KVS,\n            RequestStatus.WAITING_FOR_STREAMING_REQ,\n        )",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1567-L1577",
+      "code": "    def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:\n        if self.policy == SchedulingPolicy.FCFS:\n            return self.skipped_waiting or self.waiting or None\n\n        # PRIORITY mode: compare queue heads when both queues are non-empty.\n        if self.waiting and self.skipped_waiting:\n            waiting_req = self.waiting.peek_request()\n            skipped_req = self.skipped_waiting.peek_request()\n            return self.waiting if waiting_req < skipped_req else self.skipped_waiting\n\n        return self.waiting or self.skipped_waiting or None",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L2094-L2121",
+      "code": "    def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):\n        \"\"\"\n        KV Connector: update the scheduler state based on the output.\n        The Worker side connectors add finished_recving and\n        finished_sending reqs to the output.\n        * if finished_sending: free the blocks\n        # if finished_recving: add to state so we can\n            schedule the request during the next step.\n        \"\"\"\n        if self.connector is not None:\n            self.connector.update_connector_output(kv_connector_output)\n\n        for req_id in kv_connector_output.finished_recving or ():\n            logger.debug(\"Finished recving KV transfer for request %s\", req_id)\n            assert req_id in self.requests\n            req = self.requests[req_id]\n            if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:\n                self.finished_recving_kv_req_ids.add(req_id)\n            else:\n                assert RequestStatus.is_finished(req.status)\n                self._free_blocks(self.requests[req_id])\n        for req_id in kv_connector_output.finished_sending or ():\n            logger.debug(\"Finished sending KV transfer for request %s\", req_id)\n            assert req_id in self.requests\n            self._free_blocks(self.requests[req_id])",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L2061-L2076",
+      "code": "    def _try_promote_blocked_waiting_request(self, request: Request) -> bool:\n        \"\"\"\n        Try to promote a blocked waiting request back to schedulable states.\n        \"\"\"\n        if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:\n            # finished_recving_kv_req_ids is populated during\n            # update_from_output(), based on worker-side connector signals\n            # in KVConnectorOutput.finished_recving\n            if request.request_id not in self.finished_recving_kv_req_ids:\n                return False\n            self._update_waiting_for_remote_kv(request)\n            if request.num_preemptions:\n                request.status = RequestStatus.PREEMPTED\n            else:\n                request.status = RequestStatus.WAITING\n            return True",
+      "elide": ["WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR / WAITING_FOR_STREAMING_REQ 两个分支与本章无关，正文不展开"]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L2027-L2059",
+      "code": "    def _update_waiting_for_remote_kv(self, request: Request) -> None:\n        \"\"\"\n        KV Connector: update request state after async recv is finished.\n        When the kv transfer is ready, we cache the blocks\n        and the request state will be moved back to WAITING from\n        WAITING_FOR_REMOTE_KV.\n        \"\"\"\n        assert self.connector is not None\n\n        if request.request_id in self.failed_recving_kv_req_ids:\n            # Request had KV load failures; num_computed_tokens was already\n            # updated in _update_requests_with_invalid_blocks\n            ...\n            self.failed_recving_kv_req_ids.remove(request.request_id)\n        else:\n            # Now that the blocks are ready, actually cache them.\n            self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)\n\n            # on a full prompt hit, we need to re-compute the last token\n            # in order to be able to sample the next token\n            if request.num_computed_tokens == request.num_tokens:\n                request.num_computed_tokens = request.num_tokens - 1\n\n        self.finished_recving_kv_req_ids.remove(request.request_id)",
+      "elide": ["failed_recving 分支内部（缓存有效 token 或释放块）以 ... 略去，正文转述"]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1996-L2025",
+      "code": "    def _connector_finished(\n        self, request: Request\n    ) -> tuple[bool, dict[str, Any] | None]:\n        \"\"\"\n        Invoke the KV connector request_finished() method if applicable.\n        Returns optional kv transfer parameters to be included with the\n        request outputs.\n        \"\"\"\n        if self.connector is None:\n            return False, None\n\n        # Free any out-of-window prefix blocks before we hand the block table to\n        # the connector.\n        self.kv_cache_manager.remove_skipped_blocks(\n            request_id=request.request_id,\n            total_computed_tokens=request.num_computed_tokens,\n        )\n        block_ids = self.kv_cache_manager.get_block_ids(request.request_id)\n\n        if not isinstance(self.connector, SupportsHMA):\n            assert len(self.kv_cache_config.kv_cache_groups) == 1\n            return self.connector.request_finished(request, block_ids[0])\n\n        return self.connector.request_finished_all_groups(request, block_ids)",
+      "elide": []
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/example_connector.py",
+      "lines": "L262-L297",
+      "code": "    def get_num_new_matched_tokens(\n        self,\n        request: \"Request\",\n        num_computed_tokens: int,\n    ) -> tuple[int | None, bool]:\n        # NOTE: in this debug implementation, we assume that the prompt is\n        # cached_prompt + newly_generated_single_token\n        if not self._found_match_for_request(request):\n            return 0, False\n\n        logger.info(\"External Cache Hit!\")\n\n        token_ids = request.prompt_token_ids or []\n        num_tokens_to_check = align_to_block_size(len(token_ids) - 1, self._block_size)\n\n        return num_tokens_to_check - num_computed_tokens, False",
+      "elide": ["NOTE 注释中关于 block 粒度对齐的说明保留要点"]
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/example_connector.py",
+      "lines": "L299-L309",
+      "code": "    def update_state_after_alloc(\n        self, request: \"Request\", blocks: \"KVCacheBlocks\", num_external_tokens: int\n    ):\n        \"\"\"\n        Update KVConnector state after block allocation.\n        If blocks were allocated, add to _requests_need_load,\n        such that we load the KVs in the next forward pass.\n        \"\"\"\n        if num_external_tokens > 0:\n            self._requests_need_load[request.request_id] = request",
+      "elide": []
+    }
+  ],
+
+  "key_classes": [
+    {"name": "KVConnectorRole", "file": "vllm/distributed/kv_transfer/kv_connector/v1/base.py", "responsibility": "枚举 SCHEDULER=0 / WORKER=1。同一 connector 类被实例化两份、各持一个 role，决定它运行在调度器进程（决策侧）还是 worker 进程（搬运侧）。role-split 契约的根。"},
+    {"name": "KVConnectorBase_V1", "file": "vllm/distributed/kv_transfer/kv_connector/v1/base.py", "responsibility": "所有 KV connector 的抽象基类。把方法显式切成两组：Scheduler-side（get_num_new_matched_tokens / update_state_after_alloc / build_connector_meta / update_connector_output / request_finished / take_events）与 Worker-side（start_load_kv / wait_for_layer_load / save_kv_layer / wait_for_save / get_finished / build_connector_worker_meta）。abstractmethod 强制子类实现六个核心方法。"},
+    {"name": "KVConnectorMetadata", "file": "vllm/distributed/kv_transfer/kv_connector/v1/base.py", "responsibility": "Scheduler connector → Worker connector 的单向不透明信使。决策侧 build_connector_meta 产出、挂到 SchedulerOutput.kv_connector_metadata，worker 侧 bind_connector_metadata 取用。"},
+    {"name": "KVConnectorFactory", "file": "vllm/distributed/kv_transfer/kv_connector/factory.py", "responsibility": "懒加载注册表（name → loader）+ create_connector：按 role 单独构造 SCHEDULER 与 WORKER 两份实例，强制两进程严格隔离；校验 HMA 支持；兼容旧两参签名。"},
+    {"name": "ExampleConnector", "file": "vllm/distributed/kv_transfer/kv_connector/v1/example_connector.py", "responsibility": "把 KV cache 存/取磁盘 safetensors 的调试参考实现。给出每个抽象方法最朴素的真实落地：决策侧靠文件夹是否存在判命中，搬运侧逐层 inject/extract KV。本章用它作『契约如何被填实』的范例。"},
+    {"name": "Scheduler (KV-connector 集成部分)", "file": "vllm/v1/core/sched/scheduler.py", "responsibility": "持有 SCHEDULER-role connector，在 WAITING 调度循环中查远程命中、把等远程 KV 的请求隔离到 skipped_waiting、KV 到位后提升回 WAITING/PREEMPTED；维护 waiting/skipped_waiting 双队列与 finished_recving_kv_req_ids/failed_recving_kv_req_ids 状态集。"},
+    {"name": "RequestStatus", "file": "vllm/v1/request.py", "responsibility": "请求状态枚举。WAITING_FOR_REMOTE_KVS 是本章核心阻塞态，介于 WAITING 与 RUNNING 之间，表示已分配 block 但 KV 还在远程传输中。"}
+  ],
+
+  "data_flow": [
+    "Scheduler.__init__ : kv_transfer_config 非空 → KVConnectorFactory.create_connector(role=SCHEDULER) 建决策侧 connector（每个 worker 另有 role=WORKER 一份）。",
+    "Scheduler.schedule(WAITING 循环) : _select_waiting_queue_for_scheduling 选 waiting/skipped_waiting；peek 一个请求。",
+    "若该请求处阻塞态（含 WAITING_FOR_REMOTE_KVS）: _try_promote_blocked_waiting_request 尝试提升，未成功则 pop 并 prepend 进 step_skipped_waiting（隔离避队头阻塞），continue。",
+    "新请求(num_computed_tokens==0) : kv_cache_manager.get_computed_blocks 取本地命中 → connector.get_num_new_matched_tokens(request, 本地命中数) 取远程命中数 + load_kv_async 标志。",
+    "若返回 ext_tokens is None : connector 尚不能判定，pop 并隔离进 step_skipped_waiting，下步再试。",
+    "num_computed_tokens = 本地 + 远程；load_kv_async 时 num_new_tokens=0（本步不为新计算分配，只为远程 KV 预留 block）。",
+    "kv_cache_manager.allocate_slots(... num_external_computed_tokens, delay_cache_blocks=load_kv_async) 分配 block。",
+    "connector.update_state_after_alloc(request, blocks, num_external_computed_tokens) : 决策侧据此登记『此请求下一步需要 load KV』。",
+    "load_kv_async 分支 : request.status=WAITING_FOR_REMOTE_KVS、记 num_computed_tokens、pop 并 prepend 进 step_skipped_waiting、continue（不进 running）。",
+    "循环末尾 : step_skipped_waiting prepend 回 self.skipped_waiting（本步隔离的排在更早隔离项之前）。",
+    "schedule 末尾 : connector.build_connector_meta(scheduler_output) 打包本步所有 load/save 计划成不透明 meta，挂到 scheduler_output.kv_connector_metadata 送 worker；同时 reset connector 内部状态。",
+    "[worker 进程，本章只点到] : bind_connector_metadata → start_load_kv 启动异步搬运 → 各层 wait_for_layer_load/save_kv_layer/wait_for_save → get_finished 返回完成收/发的 req_id，经 KVConnectorOutput 回传。",
+    "Scheduler.update_from_output : 拿到 model_runner_output.kv_connector_output → _update_from_kv_xfer_finished。",
+    "_update_from_kv_xfer_finished : connector.update_connector_output(...)；对 finished_recving 的 req，若状态仍是 WAITING_FOR_REMOTE_KVS 则加入 finished_recving_kv_req_ids（否则该 req 已 finished → 直接 _free_blocks）；对 finished_sending 的 req 直接 _free_blocks。",
+    "下一步 schedule 遍历 skipped_waiting 再遇到该 WAITING_FOR_REMOTE_KVS 请求 : _try_promote_blocked_waiting_request 见其在 finished_recving_kv_req_ids 中 → _update_waiting_for_remote_kv 缓存到位的 block（整 prompt 命中则 num_computed_tokens 回退 1 以便采样下一 token）→ 据 num_preemptions 提升为 PREEMPTED 或 WAITING，从 finished_recving_kv_req_ids 移除。【f12 回收闭环】",
+    "提升后请求重新进入正常调度，被 allocate_slots/进 running，正式开始 decode。",
+    "请求结束 : _free_request → _connector_finished → connector.request_finished(request, block_ids)，connector 可返回 True 接管块的异步释放（延迟到 get_finished 上报 finished_sending 后再 _free_blocks）。"
+  ],
+
+  "design_decisions": [
+    {"decision": "为什么要 PD 分离 / 把 prefill 与 decode 拆到不同 engine", "why": "prefill 是计算密集（一次吃整段 prompt，吞吐受算力限）、decode 是访存/延迟密集（逐 token，受显存带宽与批大小限），两者在同一 engine 内互相挤占、相互抖动（prefill 长尾拖慢 decode 的 ITL）。拆开后各自独立扩缩容、各自调度，prefill 算完把 KV 经 connector 搬给 decode engine。connector 抽象就是这条 KV 搬运通道的统一接口。", "evidence": "vllm/distributed/kv_transfer/kv_connector/v1/base.py:L3-L41 (模块 docstring 明言 Scheduler-side / Worker-side 用于 P/D 与 offloading)"},
+    {"decision": "role-split：同一 connector 类按 SCHEDULER / WORKER 各实例化一份，方法显式两分", "why": "决策（要不要 load、load 多少、登记元数据）发生在调度器进程，搬运（真正拷贝 KV tensor 进/出 paged buffer）发生在 worker 进程；两进程内存/上下文完全不同。显式 role + 分组方法 + 工厂分别构造，强制开发者不会在错的进程里调错的方法（如在 scheduler 里碰 GPU tensor）。", "evidence": "vllm/distributed/kv_transfer/kv_connector/factory.py:L69-L82 (NOTE(Kuntai): explicitly separated into two roles ... build separately to enforce strict separation)"},
+    {"decision": "决策侧只产出不透明 KVConnectorMetadata，不直接搬数据", "why": "调度器进程不持有 KV tensor，也不该阻塞在 IO 上。它只把『谁要 load/save、对应哪些 block』打包成 meta 随 SchedulerOutput 下发，worker 侧自行解读执行。build_connector_meta 顺带 reset connector 内部状态，保证每步干净。", "evidence": "vllm/v1/core/sched/scheduler.py:L928-L934 + base.py:L505-L518"},
+    {"decision": "等远程 KV 的请求隔离到 skipped_waiting 而非堵在 waiting 队头", "why": "远程 KV 传输跨进程/跨节点，可能耗时多个调度步。若让它占着 waiting 队头，后面本可立即调度的请求全被阻塞（队头阻塞 HoL）。隔离到独立 skipped_waiting 队列后，主 waiting 队列继续流动，被阻塞请求每步只做一次廉价的『能否提升』检查。", "evidence": "vllm/v1/core/sched/scheduler.py:L168-L169 (注释 skipped in waiting flow due async deps) + L785-L790 + L581-L592"},
+    {"decision": "get_num_new_matched_tokens 可返回 None（need more time）", "why": "远程命中查询本身可能异步（要去远端探测），一次问不出确定答案。返回 None 让调度器先跳过、下步再问，避免在调度热路径上同步阻塞等待远端应答。", "evidence": "vllm/distributed/kv_transfer/kv_connector/v1/base.py:L466-L470 + scheduler.py:L628-L634"},
+    {"decision": "load_kv_async 时 num_new_tokens=0 且 delay_cache_blocks=True", "why": "异步加载远程 KV 时，本步不能为该请求计算任何新 token（KV 还没到），只能预分配 block 当作落地缓冲。num_new_tokens=0 防止误调度计算；delay_cache_blocks 推迟把这些 block 注册进 prefix cache，直到 KV 真正到位（_update_waiting_for_remote_kv 里才 cache_blocks），避免脏数据被别的请求命中。", "evidence": "vllm/v1/core/sched/scheduler.py:L668-L671 + L744-L751 + L2050-L2052"},
+    {"decision": "整 prompt 全命中时 num_computed_tokens 回退一个 token", "why": "若远程 KV 覆盖了全部 prompt token，则没有任何 token 需要再过一遍前向，也就采不出下一个 token。回退一个 token 保证至少有一个位置参与前向以产生 logits 采样。", "evidence": "vllm/v1/core/sched/scheduler.py:L2054-L2057"},
+    {"decision": "提升时按 num_preemptions 区分回 PREEMPTED 还是 WAITING", "why": "WAITING_FOR_REMOTE_KVS 的请求既可能是全新请求（回 WAITING），也可能是被抢占后重新等远程 KV 的请求（回 PREEMPTED，走 resumed 路径）。两条路径在后续 allocate/scheduled_*_reqs 分类上不同。", "evidence": "vllm/v1/core/sched/scheduler.py:L2072-L2075"},
+    {"decision": "KVConnectorFactory 懒加载注册表", "why": "vLLM 支持十余种 connector（Nixl/LMCache/Mooncake/Offloading...），每个都拖一堆重依赖。注册表只存 (name → loader)，create 时才 import_module 实际加载当前选中的那一个，避免无关重依赖被全部拉起。", "evidence": "vllm/distributed/kv_transfer/kv_connector/factory.py:L30-L40 + L149-L229"},
+    {"decision": "request_finished 允许 connector 接管块的异步释放", "why": "decode 结束后 prefill 端（或 offload 端）可能还要把 KV 异步发出去/落盘，此时块不能立刻释放否则数据被覆盖。返回 True 让调度器延迟释放，直到 connector 经 get_finished 上报 finished_sending 才真正 _free_blocks。", "evidence": "vllm/v1/core/sched/scheduler.py:L1996-L2025 + L2118-L2121 + base.py:L530-L549"}
+  ],
+
+  "theory": [
+    "PD 分离的负载差异本质：prefill 复杂度 ~ O(L^2 d)（L=prompt 长度），一次性计算密集；decode 每步 ~ O(L d) 访存密集且逐 token 串行。同 engine 共置时二者争抢同一批 slot 与算力，prefill 的突发会推高 decode 的 inter-token latency。拆分后可分别按各自瓶颈（算力 vs 显存带宽）独立配比与扩缩。",
+    "队头阻塞（HoL）量化：设远程 KV 传输需 k 个调度步完成。若不隔离，被阻塞请求占据 waiting 队头会让其后 m 个本可调度请求各推迟约 k 步；隔离到 skipped_waiting 后，主队列吞吐不受影响，被阻塞请求每步成本仅为一次 O(1) 的『是否在 finished_recving_kv_req_ids 中』检查。",
+    "block 粒度对齐：远程命中数与 num_computed_tokens 都要对齐到 block_size（ExampleConnector.align_to_block_size = (n-1)//block_size*block_size）。v1 scheduler 期望返回的 block 数与 token 数同为 block 粒度，未对齐会导致 slot_mapping 错位。",
+    "状态机：WAITING --(查到远程命中 & load_kv_async)--> WAITING_FOR_REMOTE_KVS --(worker 报 finished_recving)--> finished_recving_kv_req_ids --(下步遍历 skipped 提升)--> WAITING/PREEMPTED --> RUNNING。失败路径经 failed_recving_kv_req_ids 走 _update_requests_with_invalid_blocks 重设 num_computed_tokens。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "ec_connector（Encoder Cache Connector）全部分支：base.py 无关、scheduler L144-148/L548-555/L834-842/L937-941", "why_safe": "EC connector 是与 KV connector 平行的另一套（编码器缓存），与 PD 分离的 KV 搬运主线无关，删掉不影响 KV connector 控制流的完整性。"},
+      {"what": "base.py 中与本章无关的可选钩子：register_kv_caches / register_cross_layers_kv_cache / set_host_xfer_buffer_ops / handle_preemptions / get_block_ids_with_load_errors / get_kv_connector_stats / get_kv_connector_kv_cache_events / get_handshake_metadata / set_xfer_handshake_metadata / build_prom_metrics / build_kv_connector_stats / reset_cache / get_required_kvcache_layout / requires_piecewise_for_cudagraph / get_finished_count / prefer_cross_layer_blocks", "why_safe": "这些是特定 connector（NIXL/offloading/cudagraph/metrics）的可选扩展点，基类给的都是 no-op 默认。本章讲 role-split 契约骨架与调度集成，保留六个 abstractmethod + 关键 worker 收尾方法即可，删这些不破坏契约可读性。"},
+      {"what": "SupportsHMA / supports_hma / request_finished_all_groups（HMA 多 kv_cache_group 路径）", "why_safe": "HMA（混合内存分配器，多 group）是与 PD 分离正交的进阶特性；精简版只保留单 group 的 request_finished 路径（scheduler L2017-L2023 的 not isinstance 分支），与正文一致。"},
+      {"what": "ExampleConnector 的 MLA / Triton 后端分支（inject/extract 中 isinstance MLACommonMetadata / TritonAttentionMetadata 的两支）", "why_safe": "这些是不同 attention 后端的 tensor reshape 差异，与 connector 契约/调度无关；精简版保留默认（非 MLA）一支即可演示 KV inject/extract 思路。"},
+      {"what": "scheduler 中 lora max_loras 约束分支（L594-607）、encoder_inputs 调度（L664-742 中 encoder 相关）、mamba_block_aligned_split、spec-decode lookahead 边角（L713-730）", "why_safe": "都是与 KV connector 主线正交的其它调度约束；删后 connector 查命中→隔离→提升的主控制流仍完整闭合。"},
+      {"what": "connector_prefix_cache_stats 统计记录（L633-641 hits/queries、L775-783 record、L1937-1959 stats payload）", "why_safe": "纯指标统计，删除不影响调度正确性与 KV 传输闭环。"}
+    ],
+    "must_keep": [
+      {"symbol": "KVConnectorRole", "why": "role-split 契约的根，读者必须看到 SCHEDULER/WORKER 二分。"},
+      {"symbol": "get_num_new_matched_tokens", "why": "决策侧查远程命中的入口，调度集成第一步。"},
+      {"symbol": "update_state_after_alloc", "why": "决策侧在 block 分配后登记 load 计划，承上启下。"},
+      {"symbol": "build_connector_meta", "why": "决策侧打包 load/save 计划下发 worker，role-split 的信使生成点。"},
+      {"symbol": "start_load_kv", "why": "搬运侧异步加载入口，与决策侧对称。"},
+      {"symbol": "wait_for_save", "why": "搬运侧保存收尾，防 paged buffer 被覆盖；与 save_kv_layer 配对体现 worker 侧契约。"},
+      {"symbol": "save_kv_layer", "why": "搬运侧逐层保存，体现 worker 侧 load/save 对称结构。"},
+      {"symbol": "get_finished", "why": "搬运侧上报异步收/发完成的 req_id，是 finished_recving/finished_sending 的源头，连回决策侧提升路径。"},
+      {"symbol": "request_finished", "why": "请求结束时 connector 可接管异步释放块，PD 分离尾部关键。"},
+      {"symbol": "KVConnectorFactory", "why": "按 role 分别构造两份实例，强制进程隔离；懒加载注册表。"},
+      {"symbol": "create_connector", "why": "工厂核心方法，role 参数在此分流。"},
+      {"symbol": "WAITING_FOR_REMOTE_KVS", "why": "f12 回收的核心阻塞态，必须出现。"},
+      {"symbol": "skipped_waiting", "why": "隔离避队头阻塞的独立队列，本章主题之一。"},
+      {"symbol": "finished_recving_kv_req_ids", "why": "记录 worker 报告已收完 KV 的 req_id，是提升的触发条件。"},
+      {"symbol": "_try_promote_blocked_waiting_request", "why": "把 WAITING_FOR_REMOTE_KVS 提升回 WAITING/PREEMPTED 的判定点，f12 闭环关键。"},
+      {"symbol": "_update_waiting_for_remote_kv", "why": "KV 到位后缓存 block、整 prompt 命中回退 token，提升的实际副作用。"},
+      {"symbol": "_update_from_kv_xfer_finished", "why": "消化 worker 回传的 finished_recving/finished_sending，把 req 加入 finished_recving_kv_req_ids 或释放块。"},
+      {"symbol": "load_kv_async", "why": "区分同步/异步远程加载的标志变量，驱动 num_new_tokens=0 与进 WAITING_FOR_REMOTE_KVS 的分支。"},
+      {"symbol": "num_external_computed_tokens", "why": "远程命中 token 数，贯穿 allocate_slots / update_state_after_alloc。"},
+      {"symbol": "_select_waiting_queue_for_scheduling", "why": "双队列（waiting/skipped_waiting）选取逻辑，FCFS/PRIORITY 两策略。"},
+      {"symbol": "_is_blocked_waiting_status", "why": "判定请求是否处阻塞态（含 WAITING_FOR_REMOTE_KVS），遍历时决定是否走提升路径。"},
+      {"symbol": "_connector_finished", "why": "请求结束时调 request_finished，决定块是否延迟释放。"}
+    ]
+  },
+
+  "diagram_plan": [
+    {"name": "ch29-role-split", "kind": "svg-diagram", "spec": "左右两栏对照图。左栏『SCHEDULER role（调度器进程，决策侧）』列 get_num_new_matched_tokens / update_state_after_alloc / build_connector_meta / update_connector_output / request_finished；右栏『WORKER role（worker 进程，搬运侧）』列 start_load_kv / wait_for_layer_load / save_kv_layer / wait_for_save / get_finished / build_connector_worker_meta。中间一条粗箭头『KVConnectorMetadata（随 SchedulerOutput 下发）』从左指向右，一条细回传箭头『KVConnectorOutput.finished_recving/finished_sending』从右指回左。顶部标 KVConnectorFactory.create_connector(role=...) 分别实例化两份。", "roadmap_highlight": "kv_transfer / pd_disaggregation 子系统节点"},
+    {"name": "ch29-remote-kv-state-machine", "kind": "svg-diagram", "spec": "请求状态机 + 队列泳道图。状态节点：WAITING → (get_num_new_matched_tokens 命中且 load_kv_async) → WAITING_FOR_REMOTE_KVS（隔离进 skipped_waiting 泳道）→ (worker 报 finished_recving，入 finished_recving_kv_req_ids) → (_try_promote_blocked_waiting_request + _update_waiting_for_remote_kv) → WAITING/PREEMPTED → RUNNING。旁注：waiting 队列继续流动不被阻塞（避队头阻塞）；失败经 failed_recving_kv_req_ids 回退。这是 f12 回收的主图。", "roadmap_highlight": "scheduler / WAITING 调度循环节点"},
+    {"name": "ch29-schedule-loop-flow", "kind": "svg-diagram", "spec": "调度循环单次迭代流程图：select queue → peek → 阻塞态? →(是)try_promote→失败则隔离 / →(否)num_computed_tokens==0? → get_computed_blocks + get_num_new_matched_tokens → ext_tokens None?隔离 / load_kv_async? → allocate_slots → update_state_after_alloc → load_kv_async?置 WAITING_FOR_REMOTE_KVS+隔离 / 否则进 running。末尾 build_connector_meta 挂 scheduler_output。", "roadmap_highlight": "scheduler.schedule"}
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recover": [
+      {"id": "f12", "desc": "skipped_waiting 中的 WAITING_FOR_REMOTE_KVS 阻塞态：等远程 KV 传输的请求被隔离到 skipped 队列避免队头阻塞 —— 本章给出远程 KV 加载与提升回 WAITING 的完整路径（埋于 ch14）", "recovery_anchor": "data_flow 步骤 13-15 + design_decisions『隔离到 skipped_waiting』『整 prompt 命中回退 token』『按 num_preemptions 提升』 + embed_excerpts L2061-L2092 / L2027-L2059 / L2094-L2121 + diagram ch29-remote-kv-state-machine"}
+    ]
+  }
+}

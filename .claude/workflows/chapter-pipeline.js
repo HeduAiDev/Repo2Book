@@ -14,14 +14,14 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch28',
-  slug: 'ch28-spec-decode',
-  focus: '投机解码: proposers(ngram CPU/GPU、EAGLE、DFlash、以及 ch25 DeepSeek-V4 的 MTP draft via DeepSeekV4MTP)产出 k 个草稿 token、SpecDecodeMetadata 的 index 间接(把变长草稿摊平进批、cu_num_draft_tokens)、rejection sampling(逐位置按目标/草稿概率比接受或拒绝、保证输出分布与无投机时严格等价)、bonus token。承接 ch27 采样 + ch25 MTP',
-  highlight: 'spec-decode',
+  chapter_id: 'ch29',
+  slug: 'ch29-pd-disaggregation',
+  focus: 'PD 分离的抽象与调度器集成: 为什么把 prefill 和 decode 拆到不同 engine、KVConnectorBase_V1 的 role-split 契约(KVConnectorRole.SCHEDULER 决策侧 get_num_new_matched_tokens/update_state_after_alloc/build_connector_meta vs WORKER 搬运侧 start_load_kv/wait_for_save)、调度器集成(scheduler 调 connector 查远程命中→请求进 WAITING_FOR_REMOTE_KVS 等远程 KV 传输→隔离到 skipped 队列避队头阻塞→KV 到位提升回 WAITING)、KVConnectorFactory。回收 f12(WAITING_FOR_REMOTE_KVS 阻塞态的完整远程 KV 加载与提升路径)',
+  highlight: 'pd-disaggregation',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
-  paths: ['vllm/v1/spec_decode/llm_base_proposer.py', 'vllm/v1/sample/rejection_sampler.py', 'vllm/v1/spec_decode/metadata.py', 'vllm/v1/spec_decode/utils.py'],
+  paths: ['vllm/distributed/kv_transfer/kv_connector/v1/base.py', 'vllm/v1/core/sched/scheduler.py', 'vllm/distributed/kv_transfer/kv_connector/factory.py', 'vllm/distributed/kv_transfer/kv_connector/v1/example_connector.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
