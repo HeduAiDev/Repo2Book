@@ -1,0 +1,293 @@
+{
+  "chapter_id": "ch32",
+  "title": "OpenAI 兼容服务器：从 HTTP 请求到 AsyncLLM 的异步桥",
+  "source_pin": "f3fef123",
+  "one_liner": "一条 HTTP 请求如何穿过 FastAPI lifespan / build_async_engine_client（起 AsyncLLM）→ OpenAIServing 基类的校验与 request_id → Renderer 把 chat messages 渲染成 token prompt → AsyncLLM.generate 产出的异步生成器，再分流成 SSE 逐 token 流（DELTA）或聚合成单个 JSON（FINAL_ONLY），最后被 uvicorn launcher 优雅关停。承接 ch31 离线 LLM 对照与 ch04 异步三段式。",
+
+  "code_spine": [
+    "vllm/entrypoints/openai/api_server.py:L671-L703 — run_server → run_server_worker：单 worker 入口，进入 build_async_engine_client 上下文，再 build_and_serve，最后 await shutdown_task",
+    "vllm/entrypoints/openai/api_server.py:L77-L106 — build_async_engine_client：从 CLI args 造 AsyncEngineArgs，委托 build_async_engine_client_from_engine_args",
+    "vllm/entrypoints/openai/api_server.py:L108-L155 — build_async_engine_client_from_engine_args：AsyncLLM.from_vllm_config 起引擎，finally shutdown（对接 ch04 三段式）",
+    "vllm/entrypoints/openai/api_server.py:L533-L575 — setup_server：校验 args、SIGTERM handler、绑定 socket（先于引擎启动以避免端口竞争）",
+    "vllm/entrypoints/openai/api_server.py:L578-L623 — build_and_serve：get_supported_tasks → build_app → init_app_state → serve_http",
+    "vllm/entrypoints/openai/api_server.py:L157-L314 — build_app：FastAPI(lifespan=lifespan)、注册路由、CORS、鉴权/X-Request-Id 中间件、6 个 exception_handler",
+    "vllm/entrypoints/openai/api_server.py:L317-L429 — init_app_state：构造 OpenAIServingModels / OpenAIServingRender / OpenAIServingTokenization，并经 init_generate_state 造 OpenAIServingChat/Completion，挂到 app.state",
+    "vllm/entrypoints/openai/server_utils.py:L446-L472 — lifespan：启动期 _force_log 后台任务、freeze_gc_heap、yield 后清理",
+    "vllm/entrypoints/openai/chat_completion/api_router.py:L40-L74 — POST /v1/chat/completions handler：with_cancellation + load_aware_call 装饰，按返回类型分流 JSONResponse vs StreamingResponse(text/event-stream)",
+    "vllm/entrypoints/openai/chat_completion/serving.py:L229-L384 — create_chat_completion：渲染 → request_id → 取 LoRA → 算 max_tokens/SamplingParams → engine_client.generate → 按 request.stream 分流两条生成器",
+    "vllm/entrypoints/serve/render/serving.py:L184-L267 — render_chat：chat template 校验 → preprocess_chat → (conversation, engine_inputs)",
+    "vllm/entrypoints/serve/render/serving.py:L523-L606 — preprocess_chat：build_chat_params/build_tok_params → renderer.render_chat_async（chat template→prompt token_ids），再做 reasoning/tool parser 的 adjust_request",
+    "vllm/entrypoints/openai/engine/serving.py:L592-L602 — _base_request_id：X-Request-Id 头优先，否则 random_uuid",
+    "vllm/entrypoints/openai/engine/serving.py:L417-L445 — _check_model：模型名/LoRA 校验，404",
+    "vllm/entrypoints/openai/chat_completion/serving.py:L408-L1146 — chat_completion_stream_generator：SSE，逐 res 逐 output 推 DeltaMessage，首块带 role，末块带 finish_reason，可选 usage，最后 [DONE]",
+    "vllm/entrypoints/openai/chat_completion/serving.py:L1148-L1555 — chat_completion_full_generator：async for 聚合到 final_res，组装 ChatCompletionResponse + UsageInfo 一次返回",
+    "vllm/entrypoints/launcher.py:L26-L142 — serve_http：建 uvicorn.Config/Server，watchdog_task + server_task + handle_shutdown，SIGINT/SIGTERM → shutdown_event → engine.shutdown → server.should_exit",
+    "vllm/entrypoints/launcher.py:L144-L167 — watchdog_loop / terminate_if_errored：每 5s 检查引擎 errored，触发优雅退出（修复 StreamingResponse 生成器内异常不会自动关停的问题）"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm/entrypoints/openai/api_server.py",
+      "lines": "L671-L703",
+      "elide": ["decorate_logs 仅给日志加进程前缀，可一句话带过"],
+      "code": "async def run_server(args, **uvicorn_kwargs) -> None:\n    \"\"\"Run a single-worker API server.\"\"\"\n\n    # Add process-specific prefix to stdout and stderr.\n    decorate_logs(\"APIServer\")\n\n    listen_address, sock = setup_server(args)\n    await run_server_worker(listen_address, sock, args, **uvicorn_kwargs)\n\n\nasync def run_server_worker(\n    listen_address, sock, args, client_config=None, **uvicorn_kwargs\n) -> None:\n    \"\"\"Run a single API server worker.\"\"\"\n\n    if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:\n        ToolParserManager.import_tool_parser(args.tool_parser_plugin)\n\n    if args.reasoning_parser_plugin and len(args.reasoning_parser_plugin) > 3:\n        ReasoningParserManager.import_reasoning_parser(args.reasoning_parser_plugin)\n\n    async with build_async_engine_client(\n        args,\n        client_config=client_config,\n    ) as engine_client:\n        shutdown_task = await build_and_serve(\n            engine_client, listen_address, sock, args, **uvicorn_kwargs\n        )\n    # NB: Await server shutdown only after the backend context is exited\n    try:\n        await shutdown_task\n    finally:\n        sock.close()"
+    },
+    {
+      "path": "vllm/entrypoints/openai/api_server.py",
+      "lines": "L77-L106",
+      "elide": ["forkserver 预导入分支（仅当 VLLM_WORKER_MULTIPROC_METHOD==forkserver）可省略，主线是 from_cli_args + 委托"],
+      "code": "@asynccontextmanager\nasync def build_async_engine_client(\n    args: Namespace,\n    *,\n    usage_context: UsageContext = UsageContext.OPENAI_API_SERVER,\n    client_config: dict[str, Any] | None = None,\n) -> AsyncIterator[EngineClient]:\n    # ... forkserver pre-import branch elided ...\n\n    # Context manager to handle engine_client lifecycle\n    # Ensures everything is shutdown and cleaned up on error/exit\n    engine_args = AsyncEngineArgs.from_cli_args(args)\n    if client_config:\n        engine_args._api_process_count = client_config.get(\"client_count\", 1)\n        engine_args._api_process_rank = client_config.get(\"client_index\", 0)\n\n    async with build_async_engine_client_from_engine_args(\n        engine_args,\n        usage_context=usage_context,\n        client_config=client_config,\n    ) as engine:\n        yield engine"
+    },
+    {
+      "path": "vllm/entrypoints/openai/api_server.py",
+      "lines": "L108-L155",
+      "elide": ["client_config 的 client_count/client_index 拆分仅多 API 进程时有意义，单进程默认 1/0"],
+      "code": "@asynccontextmanager\nasync def build_async_engine_client_from_engine_args(\n    engine_args: AsyncEngineArgs,\n    *,\n    usage_context: UsageContext = UsageContext.OPENAI_API_SERVER,\n    client_config: dict[str, Any] | None = None,\n) -> AsyncIterator[EngineClient]:\n    # Create the EngineConfig (determines if we can use V1).\n    vllm_config = engine_args.create_engine_config(usage_context=usage_context)\n\n    from vllm.v1.engine.async_llm import AsyncLLM\n\n    async_llm: AsyncLLM | None = None\n\n    # Don't mutate the input client_config\n    client_config = dict(client_config) if client_config else {}\n    client_count = client_config.pop(\"client_count\", 1)\n    client_index = client_config.pop(\"client_index\", 0)\n\n    try:\n        async_llm = AsyncLLM.from_vllm_config(\n            vllm_config=vllm_config,\n            usage_context=usage_context,\n            enable_log_requests=engine_args.enable_log_requests,\n            aggregate_engine_logging=engine_args.aggregate_engine_logging,\n            disable_log_stats=engine_args.disable_log_stats,\n            client_addresses=client_config,\n            client_count=client_count,\n            client_index=client_index,\n        )\n\n        # Don't keep the dummy data in memory\n        assert async_llm is not None\n        await async_llm.reset_mm_cache()\n\n        yield async_llm\n    finally:\n        if async_llm:\n            async_llm.shutdown()"
+    },
+    {
+      "path": "vllm/entrypoints/openai/api_server.py",
+      "lines": "L533-L575",
+      "elide": ["log_version_and_model/log_non_default_args 仅日志；reasoning/tool parser plugin 导入可省；uds/ipv6 分支非主线"],
+      "code": "@instrument(span_name=\"API server setup\")\ndef setup_server(args):\n    \"\"\"Validate API server args, set up signal handler, create socket\n    ready to serve.\"\"\"\n    # ... logging + plugin imports elided ...\n\n    validate_api_server_args(args)\n\n    # workaround to make sure that we bind the port before the engine is set up.\n    # This avoids race conditions with ray.\n    # see https://github.com/vllm-project/vllm/issues/8204\n    if args.uds:\n        sock = create_server_unix_socket(args.uds)\n    else:\n        sock_addr = (args.host or \"\", args.port)\n        sock = create_server_socket(sock_addr)\n\n    # workaround to avoid footguns where uvicorn drops requests with too\n    # many concurrent requests active\n    set_ulimit()\n\n    def signal_handler(*_) -> None:\n        # Interrupt server on sigterm while initializing\n        raise KeyboardInterrupt(\"terminated\")\n\n    signal.signal(signal.SIGTERM, signal_handler)\n    # ... compute listen_address string elided ...\n    return listen_address, sock"
+    },
+    {
+      "path": "vllm/entrypoints/openai/api_server.py",
+      "lines": "L578-L623",
+      "elide": ["serve_http 的一大串 ssl_*/h11_* 参数透传可缩写；log_config 取值非主线"],
+      "code": "async def build_and_serve(\n    engine_client: EngineClient,\n    listen_address: str,\n    sock: socket.socket,\n    args: Namespace,\n    **uvicorn_kwargs,\n) -> asyncio.Task:\n    \"\"\"Build FastAPI app, initialize state, and start serving.\n\n    Returns the shutdown task for the caller to await.\n    \"\"\"\n    # ... log_config setup elided ...\n\n    supported_tasks = await engine_client.get_supported_tasks()\n    model_config = engine_client.model_config\n\n    logger.info(\"Supported tasks: %s\", supported_tasks)\n    app = build_app(args, supported_tasks, model_config)\n    await init_app_state(engine_client, app.state, args, supported_tasks)\n\n    logger.info(\"Starting vLLM server on %s\", listen_address)\n\n    return await serve_http(\n        app,\n        sock=sock,\n        host=args.host,\n        port=args.port,\n        log_level=args.uvicorn_log_level,\n        access_log=not args.disable_uvicorn_access_log,\n        timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,\n        # ... ssl_* / h11_* kwargs elided ...\n        **uvicorn_kwargs,\n    )"
+    },
+    {
+      "path": "vllm/entrypoints/openai/api_server.py",
+      "lines": "L157-L184, L264-L280",
+      "elide": ["build_app 中按 supported_tasks 条件注册大量子路由（pooling/transcription/realtime/disagg/rlhf 等）只需点到为止；中间件循环、sagemaker bootstrap 非主线"],
+      "code": "def build_app(\n    args: Namespace,\n    supported_tasks: tuple[\"SupportedTask\", ...] | None = None,\n    model_config: ModelConfig | None = None,\n) -> FastAPI:\n    # ... disable_fastapi_docs / offline_docs branches elided ...\n    app = FastAPI(lifespan=lifespan)\n    app.state.args = args\n\n    # ... register_vllm_serve_api_routers / models / sagemaker / generate / ... elided ...\n    if \"generate\" in supported_tasks:\n        from vllm.entrypoints.openai.generate.api_router import (\n            register_generate_api_routers,\n        )\n        register_generate_api_routers(app)\n        # ... other conditional routers elided ...\n\n    app.root_path = args.root_path\n    app.add_middleware(CORSMiddleware, allow_origins=args.allowed_origins, ...)\n\n    app.exception_handler(HTTPException)(http_exception_handler)\n    app.exception_handler(RequestValidationError)(validation_exception_handler)\n    app.exception_handler(EngineGenerateError)(engine_error_handler)\n    app.exception_handler(EngineDeadError)(engine_error_handler)\n    app.exception_handler(GenerationError)(generation_error_handler)\n    app.exception_handler(Exception)(exception_handler)\n    # ... AuthenticationMiddleware / XRequestIdMiddleware / ScalingMiddleware elided ...\n    return app"
+    },
+    {
+      "path": "vllm/entrypoints/openai/api_server.py",
+      "lines": "L317-L401",
+      "elide": ["lora_modules 合并、transcription/realtime/pooling 等条件分支可省，主线是把各 OpenAIServing* 对象挂到 state"],
+      "code": "async def init_app_state(\n    engine_client: EngineClient,\n    state: State,\n    args: Namespace,\n    supported_tasks: tuple[\"SupportedTask\", ...] | None = None,\n) -> None:\n    vllm_config = engine_client.vllm_config\n    # ... served_model_names / request_logger / base_model_paths setup elided ...\n\n    state.engine_client = engine_client\n    state.log_stats = not args.disable_log_stats\n    state.vllm_config = vllm_config\n    state.args = args\n    resolved_chat_template = load_chat_template(args.chat_template)\n\n    state.openai_serving_models = OpenAIServingModels(\n        engine_client=engine_client,\n        base_model_paths=base_model_paths,\n        lora_modules=lora_modules,\n    )\n    await state.openai_serving_models.init_static_loras()\n\n    state.openai_serving_render = OpenAIServingRender(\n        model_config=engine_client.model_config,\n        renderer=engine_client.renderer,\n        model_registry=state.openai_serving_models.registry,\n        request_logger=request_logger,\n        chat_template=resolved_chat_template,\n        chat_template_content_format=args.chat_template_content_format,\n        # ... tool/reasoning parser names + flags elided ...\n    )\n\n    state.openai_serving_tokenization = OpenAIServingTokenization(...)\n\n    if \"generate\" in supported_tasks:\n        from vllm.entrypoints.openai.generate.api_router import init_generate_state\n        await init_generate_state(\n            engine_client, state, args, request_logger, supported_tasks\n        )\n    # ... transcription / realtime / pooling branches elided ..."
+    },
+    {
+      "path": "vllm/entrypoints/openai/server_utils.py",
+      "lines": "L446-L472",
+      "elide": ["yield 后的最终 finally（gc app state）只读到 L472，主线为启动 _force_log 后台任务 + freeze_gc_heap"],
+      "code": "@asynccontextmanager\nasync def lifespan(app: FastAPI):\n    try:\n        if app.state.log_stats:\n            engine_client: EngineClient = app.state.engine_client\n\n            async def _force_log():\n                while True:\n                    await asyncio.sleep(envs.VLLM_LOG_STATS_INTERVAL)\n                    await engine_client.do_log_stats()\n\n            task = asyncio.create_task(_force_log())\n            _running_tasks.add(task)\n            task.add_done_callback(_running_tasks.remove)\n        else:\n            task = None\n\n        # Mark the startup heap as static so that it's ignored by GC.\n        # Reduces pause times of oldest generation collections.\n        freeze_gc_heap()\n        try:\n            yield\n        finally:\n            if task is not None:\n                task.cancel()\n    finally:\n        # Ensure app state including engine ref is gc'd\n        ..."
+    },
+    {
+      "path": "vllm/entrypoints/openai/chat_completion/api_router.py",
+      "lines": "L40-L74",
+      "elide": ["batch endpoint 与 metrics_header 细节非主线"],
+      "code": "@router.post(\n    \"/v1/chat/completions\",\n    dependencies=[Depends(validate_json_request)],\n    responses={\n        HTTPStatus.OK.value: {\"content\": {\"text/event-stream\": {}}},\n        HTTPStatus.BAD_REQUEST.value: {\"model\": ErrorResponse},\n        HTTPStatus.NOT_FOUND.value: {\"model\": ErrorResponse},\n        HTTPStatus.INTERNAL_SERVER_ERROR.value: {\"model\": ErrorResponse},\n        HTTPStatus.NOT_IMPLEMENTED.value: {\"model\": ErrorResponse},\n    },\n)\n@with_cancellation\n@load_aware_call\nasync def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):\n    metrics_header_format = raw_request.headers.get(\n        ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, \"\"\n    )\n    handler = chat(raw_request)\n    if handler is None:\n        raise NotImplementedError(\"The model does not support Chat Completions API\")\n\n    generator = await handler.create_chat_completion(request, raw_request)\n\n    if isinstance(generator, ErrorResponse):\n        return JSONResponse(\n            content=generator.model_dump(), status_code=generator.error.code\n        )\n\n    elif isinstance(generator, ChatCompletionResponse):\n        return JSONResponse(\n            content=generator.model_dump(),\n            headers=metrics_header(metrics_header_format),\n        )\n\n    return StreamingResponse(content=generator, media_type=\"text/event-stream\")"
+    },
+    {
+      "path": "vllm/entrypoints/openai/chat_completion/serving.py",
+      "lines": "L229-L373",
+      "elide": ["多 engine_input 的 sub_request_id 循环（n>1/多 prompt）、beam_search 分支、reasoning_ended 预判分支可压缩为注释；主线：render → request_id → SamplingParams → engine_client.generate → 按 stream 分流"],
+      "code": "async def create_chat_completion(\n    self,\n    request: ChatCompletionRequest,\n    raw_request: Request | None = None,\n) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:\n    tokenizer = self.renderer.tokenizer\n    assert tokenizer is not None\n    chat_template_kwargs = self._effective_chat_template_kwargs(request)\n    reasoning_parser: ReasoningParser | None = None\n    if self.reasoning_parser_cls:\n        reasoning_parser = self.reasoning_parser_cls(tokenizer, ...)\n    result = await self.render_chat_request(request)\n    if isinstance(result, ErrorResponse):\n        return result\n\n    conversation, engine_inputs = result\n\n    request_id = (\n        f\"chatcmpl-{self._base_request_id(raw_request, request.request_id)}\"\n    )\n\n    request_metadata = RequestResponseMetadata(request_id=request_id)\n    if raw_request:\n        raw_request.state.request_metadata = request_metadata\n\n    lora_request = self._maybe_get_adapters(request, supports_default_mm_loras=True)\n    model_name = self.models.model_name(lora_request)\n    data_parallel_rank = self._get_data_parallel_rank(raw_request)\n\n    max_model_len = self.model_config.max_model_len\n    generators: list[AsyncGenerator[RequestOutput, None]] = []\n    for i, engine_input in enumerate(engine_inputs):\n        # ... sub_request_id, max_tokens, SamplingParams, _log_inputs, trace_headers ...\n        sampling_params = request.to_sampling_params(\n            max_tokens, self.default_sampling_params,\n        )\n        # ... reasoning_ended pre-check elided ...\n        generator = self.engine_client.generate(\n            engine_input,\n            sampling_params,\n            sub_request_id,\n            lora_request=lora_request,\n            trace_headers=trace_headers,\n            priority=request.priority,\n            data_parallel_rank=data_parallel_rank,\n            reasoning_ended=reasoning_ended,\n            reasoning_parser_kwargs=...,\n        )\n        generators.append(generator)\n\n    assert len(generators) == 1\n    (result_generator,) = generators\n\n    if request.stream:\n        return self.chat_completion_stream_generator(\n            request, result_generator, request_id, model_name,\n            conversation, tokenizer, request_metadata, reasoning_parser,\n            chat_template_kwargs=chat_template_kwargs,\n        )\n\n    return await self.chat_completion_full_generator(\n        request, result_generator, request_id, model_name,\n        conversation, tokenizer, request_metadata, reasoning_parser,\n    )"
+    },
+    {
+      "path": "vllm/entrypoints/openai/chat_completion/serving.py",
+      "lines": "L202-L227",
+      "elide": [],
+      "code": "async def render_chat_request(\n    self,\n    request: ChatCompletionRequest,\n) -> tuple[list[ConversationMessage], list[EngineInput]] | ErrorResponse:\n    error_check_ret = await self._check_model(request)\n    if error_check_ret is not None:\n        logger.error(\"Error with model %s\", error_check_ret)\n        return error_check_ret\n\n    # If the engine is dead, raise the engine's DEAD_ERROR.\n    # This is required for the streaming case, where we return a\n    # success status before we actually start generating text :).\n    if self.engine_client.errored:\n        raise self.engine_client.dead_error\n\n    return await self.openai_serving_render.render_chat(request)"
+    },
+    {
+      "path": "vllm/entrypoints/serve/render/serving.py",
+      "lines": "L551-L570",
+      "elide": ["preprocess_chat 头部 default_template_kwargs 合并、mistral 重序列化、reasoning/tool adjust_request 后处理只需点到；主线是 build_chat_params + renderer.render_chat_async"],
+      "code": "tok_params = request.build_tok_params(self.model_config)\nchat_params = request.build_chat_params(\n    default_template, default_template_content_format\n).with_defaults(\n    default_template_kwargs,\n    default_media_io_kwargs=(mm_config.media_io_kwargs if mm_config else None),\n    default_mm_processor_kwargs=getattr(request, \"mm_processor_kwargs\", None),\n)\n\n(conversation,), (engine_input,) = await renderer.render_chat_async(\n    [messages],\n    chat_params,\n    tok_params,\n    prompt_extras={\n        k: v\n        for k in (\"mm_processor_kwargs\", \"cache_salt\")\n        if (v := getattr(request, k, None)) is not None\n    },\n    skip_mm_cache=skip_mm_cache,\n)"
+    },
+    {
+      "path": "vllm/entrypoints/openai/engine/serving.py",
+      "lines": "L592-L602",
+      "elide": [],
+      "code": "@staticmethod\ndef _base_request_id(\n    raw_request: Request | None, default: str | None = None\n) -> str | None:\n    \"\"\"Pulls the request id to use from a header, if provided\"\"\"\n    if raw_request is not None and (\n        (req_id := raw_request.headers.get(\"X-Request-Id\")) is not None\n    ):\n        return req_id\n\n    return random_uuid() if default is None else default"
+    },
+    {
+      "path": "vllm/entrypoints/openai/engine/serving.py",
+      "lines": "L372-L405",
+      "elide": [],
+      "code": "@staticmethod\ndef create_error_response(\n    message: str | Exception,\n    err_type: str = \"BadRequestError\",\n    status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,\n    param: str | None = None,\n) -> ErrorResponse:\n    return create_error_response(message, err_type, status_code, param)\n\ndef create_streaming_error_response(\n    self,\n    message: str | Exception,\n    err_type: str = \"BadRequestError\",\n    status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,\n    param: str | None = None,\n) -> str:\n    json_str = json.dumps(\n        self.create_error_response(\n            message=message, err_type=err_type,\n            status_code=status_code, param=param,\n        ).model_dump()\n    )\n    return json_str\n\ndef _raise_if_error(self, finish_reason: str | None, request_id: str) -> None:\n    \"\"\"Raise GenerationError if finish_reason indicates an error.\"\"\"\n    if finish_reason == \"error\":\n        logger.error(\n            \"Request %s failed with an internal error during generation\",\n            request_id,\n        )\n        raise GenerationError(\"Internal server error\")"
+    },
+    {
+      "path": "vllm/entrypoints/openai/engine/serving.py",
+      "lines": "L417-L445",
+      "elide": ["运行时 LoRA 加载分支（VLLM_ALLOW_RUNTIME_LORA_UPDATING）非主线"],
+      "code": "async def _check_model(\n    self,\n    request: AnyRequest,\n) -> ErrorResponse | None:\n    error_response = None\n\n    if self._is_model_supported(request.model):\n        return None\n    if request.model in self.models.lora_requests:\n        return None\n    # ... runtime LoRA resolve branch elided ...\n\n    return error_response or self.create_error_response(\n        message=f\"The model `{request.model}` does not exist.\",\n        err_type=\"NotFoundError\",\n        status_code=HTTPStatus.NOT_FOUND,\n        param=\"model\",\n    )"
+    },
+    {
+      "path": "vllm/entrypoints/openai/chat_completion/serving.py",
+      "lines": "L517-L569, L606-L671",
+      "elide": ["use_harmony / mistral grammar / 多 num_choices 分支大幅省略；只保留首块发 role、跳空块、普通 delta_text=output.text 主线"],
+      "code": "try:\n    async for res in result_generator:\n        if res.prompt_token_ids is not None:\n            num_prompt_tokens = len(res.prompt_token_ids)\n            # ... encoder prompt add elided ...\n\n        # We need to do it here, because if there are exceptions in\n        # the result_generator, it needs to be sent as the FIRST\n        # response (by the try...catch).\n        if first_iteration:\n            num_cached_tokens = res.num_cached_tokens\n            role = self.get_chat_request_role(request)\n            for i in range(num_choices):\n                choice_data = ChatCompletionResponseStreamChoice(\n                    index=i,\n                    delta=DeltaMessage(role=role, content=\"\"),\n                    logprobs=None,\n                    finish_reason=None,\n                )\n                chunk = ChatCompletionStreamResponse(\n                    id=request_id,\n                    object=chunk_object_type,\n                    created=created_time,\n                    choices=[choice_data],\n                    model=model_name,\n                    prompt_token_ids=(...),\n                )\n                data = chunk.model_dump_json(exclude_unset=True)\n                yield f\"data: {data}\\n\\n\"\n            # ... echo branch elided ...\n            first_iteration = False\n\n        for output in res.outputs:\n            i = output.index\n            # ... parser / logprobs / harmony branches elided ...\n            delta_text = output.text\n\n            if (\n                not delta_text\n                and not output.token_ids\n                and not previous_num_tokens[i]\n            ):\n                # Chunked prefill case, don't return empty chunks\n                continue\n            # ... build delta_message via tool/reasoning parsers (elided) ..."
+    },
+    {
+      "path": "vllm/entrypoints/openai/chat_completion/serving.py",
+      "lines": "L1054-L1083, L1085-L1146",
+      "elide": ["include_continuous_usage 的每块 usage、enable_log_outputs 收尾日志可省"],
+      "code": "                choice_data = maybe_filter_parallel_tool_calls(choice_data, request)\n                chunk = ChatCompletionStreamResponse(\n                    id=request_id,\n                    object=chunk_object_type,\n                    created=created_time,\n                    choices=[choice_data],\n                    model=model_name,\n                )\n                # Stamp the fingerprint on terminal chunks only ...\n                if (\n                    not include_usage\n                    and self.system_fingerprint is not None\n                    and choice_data.finish_reason is not None\n                ):\n                    chunk.system_fingerprint = self.system_fingerprint\n                # ... continuous usage elided ...\n                data = chunk.model_dump_json(exclude_unset=True)\n                yield f\"data: {data}\\n\\n\"\n\n    # once the final token is handled, if stream_options.include_usage\n    # is sent, send the usage\n    if include_usage:\n        completion_tokens = sum(previous_num_tokens)\n        final_usage = UsageInfo(\n            prompt_tokens=num_prompt_tokens,\n            completion_tokens=completion_tokens,\n            total_tokens=num_prompt_tokens + completion_tokens,\n        )\n        # ... prompt_tokens_details elided ...\n        final_usage_chunk = ChatCompletionStreamResponse(\n            id=request_id, object=chunk_object_type, created=created_time,\n            choices=[], model=model_name, usage=final_usage,\n            system_fingerprint=self.system_fingerprint,\n        )\n        final_usage_data = final_usage_chunk.model_dump_json(\n            exclude_unset=True, exclude_none=True\n        )\n        yield f\"data: {final_usage_data}\\n\\n\"\n\n    # report to FastAPI middleware aggregate usage across all choices\n    request_metadata.final_usage_info = UsageInfo(...)\n    # ... enable_log_outputs branch elided ...\n\nexcept GenerationError as e:\n    yield f\"data: {self._convert_generation_error_to_streaming_response(e)}\\n\\n\"\nexcept Exception as e:\n    logger.exception(\"Error in chat completion stream generator.\")\n    data = self.create_streaming_error_response(e)\n    yield f\"data: {data}\\n\\n\"\n# Send the final done message after all response.n are finished\nyield \"data: [DONE]\\n\\n\""
+    },
+    {
+      "path": "vllm/entrypoints/openai/chat_completion/serving.py",
+      "lines": "L1148-L1201, L1457-L1521",
+      "elide": ["use_harmony 分支、各 tool_choice 组装 message 的长 if/elif 链可压缩为『按 tool_choice 组装 ChatMessage』一句；只保留聚合 + 组装 ChatCompletionResponse 主线"],
+      "code": "async def chat_completion_full_generator(\n    self,\n    request: ChatCompletionRequest,\n    result_generator: AsyncIterator[RequestOutput],\n    request_id: str,\n    model_name: str,\n    conversation: list[ConversationMessage],\n    tokenizer: TokenizerLike,\n    request_metadata: RequestResponseMetadata,\n    reasoning_parser: ReasoningParser | None = None,\n) -> ErrorResponse | ChatCompletionResponse:\n    created_time = int(time.time())\n    final_res: RequestOutput | None = None\n\n    try:\n        async for res in result_generator:\n            final_res = res\n    except asyncio.CancelledError:\n        return self.create_error_response(\"Client disconnected\")\n\n    if final_res is None:\n        return self.create_error_response(\n            \"No output received from the engine.\",\n            err_type=\"InternalServerError\",\n            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,\n        )\n\n    choices: list[ChatCompletionResponseChoice] = []\n    role = self.get_chat_request_role(request)\n    for output in final_res.outputs:\n        self._raise_if_error(output.finish_reason, request_id)\n        # ... logprobs + reasoning/tool parsing build `message` (elided long if-chain) ...\n        choice_data = ChatCompletionResponseChoice(\n            index=output.index,\n            message=message,\n            logprobs=logprobs,\n            finish_reason=\"tool_calls\" if is_finish_reason_tool_calls\n            else output.finish_reason if output.finish_reason else \"stop\",\n            stop_reason=output.stop_reason,\n            token_ids=(...),\n        )\n        choices.append(choice_data)\n\n    num_prompt_tokens = len(final_res.prompt_token_ids)\n    num_generated_tokens = sum(len(o.token_ids) for o in final_res.outputs)\n    usage = UsageInfo(\n        prompt_tokens=num_prompt_tokens,\n        completion_tokens=num_generated_tokens,\n        total_tokens=num_prompt_tokens + num_generated_tokens,\n    )\n    request_metadata.final_usage_info = usage\n\n    response = ChatCompletionResponse(\n        id=request_id, created=created_time, model=model_name,\n        choices=choices, usage=usage,\n        system_fingerprint=self.system_fingerprint,\n        prompt_logprobs=clamp_prompt_logprobs(final_res.prompt_logprobs),\n        prompt_token_ids=(...),\n        kv_transfer_params=final_res.kv_transfer_params,\n    )\n    return response"
+    },
+    {
+      "path": "vllm/entrypoints/launcher.py",
+      "lines": "L71-L142",
+      "elide": ["serve_http 开头打印路由列表、h11 header 限制取默认、SSLCertRefresher 分支非主线"],
+      "code": "    config = uvicorn.Config(app, **uvicorn_kwargs)\n    # Set header limits\n    config.h11_max_incomplete_event_size = h11_max_incomplete_event_size\n    config.h11_max_header_count = h11_max_header_count\n    config.load()\n    server = uvicorn.Server(config)\n    app.state.server = server\n\n    loop = asyncio.get_running_loop()\n\n    watchdog_task = loop.create_task(watchdog_loop(server, app.state.engine_client))\n    server_task = loop.create_task(server.serve(sockets=[sock] if sock else None))\n    # ... ssl_cert_refresher elided ...\n\n    shutdown_event = asyncio.Event()\n\n    def signal_handler() -> None:\n        shutdown_event.set()\n\n    async def dummy_shutdown() -> None:\n        pass\n\n    loop.add_signal_handler(signal.SIGINT, signal_handler)\n    loop.add_signal_handler(signal.SIGTERM, signal_handler)\n\n    async def handle_shutdown() -> None:\n        await shutdown_event.wait()\n\n        engine_client = app.state.engine_client\n        timeout = engine_client.vllm_config.shutdown_timeout\n\n        await loop.run_in_executor(\n            None, partial(engine_client.shutdown, timeout=timeout)\n        )\n\n        server.should_exit = True\n        server_task.cancel()\n        watchdog_task.cancel()\n        # ... ssl_cert_refresher.stop() elided ...\n\n    shutdown_task = loop.create_task(handle_shutdown())\n\n    try:\n        await server_task\n        return dummy_shutdown()\n    except asyncio.CancelledError:\n        # ... log process using port elided ...\n        logger.info(\"Shutting down FastAPI HTTP server.\")\n        return server.shutdown()\n    finally:\n        shutdown_task.cancel()\n        watchdog_task.cancel()"
+    },
+    {
+      "path": "vllm/entrypoints/launcher.py",
+      "lines": "L144-L167",
+      "elide": [],
+      "code": "async def watchdog_loop(server: uvicorn.Server, engine: EngineClient):\n    \"\"\"\n    # Watchdog task that runs in the background, checking\n    # for error state in the engine. Needed to trigger shutdown\n    # if an exception arises is StreamingResponse() generator.\n    \"\"\"\n    VLLM_WATCHDOG_TIME_S = 5.0\n    while True:\n        await asyncio.sleep(VLLM_WATCHDOG_TIME_S)\n        terminate_if_errored(server, engine)\n\n\ndef terminate_if_errored(server: uvicorn.Server, engine: EngineClient):\n    \"\"\"\n    See discussions here on shutting down a uvicorn server\n    https://github.com/encode/uvicorn/discussions/1103\n    In this case we cannot await the server shutdown here\n    because handler must first return to close the connection\n    for this request.\n    \"\"\"\n    engine_errored = engine.errored and not engine.is_running\n    if not envs.VLLM_KEEP_ALIVE_ON_ENGINE_DEATH and engine_errored:\n        server.should_exit = True"
+    },
+    {
+      "path": "vllm/engine/protocol.py",
+      "lines": "L44-L84",
+      "elide": ["其余抽象方法（encode/abort/check_health/...）非本章主线"],
+      "code": "    model_config: ModelConfig\n    renderer: BaseRenderer\n    input_processor: InputProcessor\n\n    @property\n    @abstractmethod\n    def errored(self) -> bool: ...\n\n    @property\n    @abstractmethod\n    def dead_error(self) -> BaseException: ...\n\n    @abstractmethod\n    def generate(\n        self,\n        prompt: EngineCoreRequest | PromptType | EngineInput | AsyncGenerator[StreamingInput, None],\n        sampling_params: SamplingParams,\n        request_id: str,\n        *,\n        prompt_text: str | None = None,\n        lora_request: LoRARequest | None = None,\n        tokenization_kwargs: dict[str, Any] | None = None,\n        trace_headers: Mapping[str, str] | None = None,\n        priority: int = 0,\n        data_parallel_rank: int | None = None,\n        reasoning_ended: bool | None = None,\n        reasoning_parser_kwargs: dict[str, Any] | None = None,\n    ) -> AsyncGenerator[RequestOutput, None]:\n        \"\"\"Generate outputs for a request.\"\"\"\n        ..."
+    },
+    {
+      "path": "vllm/entrypoints/openai/server_utils.py",
+      "lines": "L38-L86",
+      "elide": ["XRequestIdMiddleware 同文件，主线展示鉴权一项即可"],
+      "code": "class AuthenticationMiddleware:\n    \"\"\"\n    Pure ASGI middleware that authenticates each request by checking\n    if the Authorization Bearer token exists and equals anyof \"{api_key}\".\n    \"\"\"\n\n    def __init__(self, app: ASGIApp, tokens: list[str]) -> None:\n        self.app = app\n        self.api_tokens = [hashlib.sha256(t.encode(\"utf-8\")).digest() for t in tokens]\n\n    def verify_token(self, headers: Headers) -> bool:\n        authorization_header_value = headers.get(\"Authorization\")\n        if not authorization_header_value:\n            return False\n        scheme, _, param = authorization_header_value.partition(\" \")\n        if scheme.lower() != \"bearer\":\n            return False\n        param_hash = hashlib.sha256(param.encode(\"utf-8\")).digest()\n        token_match = False\n        for token_hash in self.api_tokens:\n            token_match |= secrets.compare_digest(param_hash, token_hash)\n        return token_match\n\n    def __call__(self, scope: Scope, receive: Receive, send: Send) -> Awaitable[None]:\n        if (\n            scope[\"type\"] not in (\"http\", \"websocket\")\n            or scope.get(\"method\") == \"OPTIONS\"\n        ):\n            return self.app(scope, receive, send)\n        root_path = scope.get(\"root_path\", \"\")\n        url_path = URL(scope=scope).path.removeprefix(root_path)\n        headers = Headers(scope=scope)\n        if url_path.startswith(\"/v1\") and not self.verify_token(headers):\n            response = JSONResponse(content={\"error\": \"Unauthorized\"}, status_code=401)\n            return response(scope, receive, send)\n        return self.app(scope, receive, send)"
+    },
+    {
+      "path": "vllm/entrypoints/utils.py",
+      "lines": "L56-L98",
+      "elide": ["docstring 大段可缩"],
+      "code": "def with_cancellation(handler_func):\n    \"\"\"Decorator that allows a route handler to be cancelled by client\n    disconnections. ... (follows starlette.StreamingResponse pattern:\n    race the handler task against a disconnect-listener task) ...\"\"\"\n\n    @functools.wraps(handler_func)\n    async def wrapper(*args, **kwargs):\n        # The request is either the second positional arg or `raw_request`\n        request = args[1] if len(args) > 1 else kwargs[\"raw_request\"]\n\n        handler_task = asyncio.create_task(handler_func(*args, **kwargs))\n        cancellation_task = asyncio.create_task(listen_for_disconnect(request))\n\n        done, pending = await asyncio.wait(\n            [handler_task, cancellation_task], return_when=asyncio.FIRST_COMPLETED\n        )\n        for task in pending:\n            task.cancel()\n\n        if handler_task in done:\n            return handler_task.result()\n        return None\n\n    return wrapper"
+    }
+  ],
+
+  "key_classes": [
+    {"name": "OpenAIServing", "file": "vllm/entrypoints/openai/engine/serving.py", "responsibility": "所有 OpenAI handler 的基类：持有 engine_client/models/renderer/input_processor；提供模型校验(_check_model)、request_id 解析(_base_request_id)、LoRA 适配(_maybe_get_adapters)、错误响应工厂(create_error_response/create_streaming_error_response)、GenerationError 触发(_raise_if_error)、trace headers、tool-call 提取(_parse_tool_calls_from_content)、token 解码(_get_decoded_token)、system_fingerprint。beam_search 也定义在此。"},
+    {"name": "OpenAIServingChat", "file": "vllm/entrypoints/openai/chat_completion/serving.py", "responsibility": "chat/completions handler：create_chat_completion 渲染请求、造 request_id、算 SamplingParams、调 engine_client.generate，按 request.stream 分流到 chat_completion_stream_generator（SSE DELTA）或 chat_completion_full_generator（聚合 JSON）。装配 reasoning/tool parser，构造 logprobs。"},
+    {"name": "OpenAIServingRender", "file": "vllm/entrypoints/serve/render/serving.py", "responsibility": "Renderer 适配层：render_chat 把 ChatCompletionRequest 的 messages + chat template 经 renderer.render_chat_async 渲染成 (conversation, engine_inputs=token prompt)；做 chat-template 信任校验、tool_choice 合法性校验、harmony(gpt_oss) 特例。OpenAIServingChat 委托给它。"},
+    {"name": "build_async_engine_client", "file": "vllm/entrypoints/openai/api_server.py", "responsibility": "@asynccontextmanager：从 CLI args 造 AsyncEngineArgs，经 build_async_engine_client_from_engine_args 用 AsyncLLM.from_vllm_config 起异步引擎（对接 ch04 三段式 + AsyncMPClient），退出时 shutdown。EngineClient 生命周期边界。"},
+    {"name": "serve_http", "file": "vllm/entrypoints/launcher.py", "responsibility": "uvicorn 启动与优雅关停：建 uvicorn.Config/Server、watchdog_task（监控引擎 errored）、server_task、handle_shutdown（SIGINT/SIGTERM → 关引擎 → server.should_exit）。返回 shutdown_task 供上层 await。"},
+    {"name": "lifespan", "file": "vllm/entrypoints/openai/server_utils.py", "responsibility": "FastAPI lifespan：启动期拉起周期性 do_log_stats 后台任务 + freeze_gc_heap，yield 期间服务，关停期 cancel 任务并 gc app.state。"},
+    {"name": "AuthenticationMiddleware / XRequestIdMiddleware", "file": "vllm/entrypoints/openai/server_utils.py", "responsibility": "纯 ASGI 中间件：Bearer token 鉴权（仅 /v1 路径、跳过 OPTIONS）；X-Request-Id 注入响应头。"},
+    {"name": "EngineClient", "file": "vllm/engine/protocol.py", "responsibility": "handler 依赖的协议：暴露 generate()(异步生成器)、renderer/input_processor/model_config/vllm_config、errored/dead_error/is_running、shutdown/get_supported_tasks/do_log_stats。AsyncLLM 是其 v1 实现（ch04）。"}
+  ],
+
+  "data_flow": [
+    "1. 进程入口 api_server.__main__ → uvloop.run(run_server(args))；run_server → setup_server（绑 socket，先于引擎以避端口竞争）→ run_server_worker。",
+    "2. run_server_worker: async with build_async_engine_client(args) → AsyncLLM.from_vllm_config 起异步引擎（ch04）→ build_and_serve。",
+    "3. build_and_serve: engine_client.get_supported_tasks → build_app（FastAPI(lifespan)，注册 /v1/* 路由 + CORS/鉴权/X-Request-Id 中间件 + 6 个 exception_handler）→ init_app_state（造 OpenAIServingModels/Render/Tokenization，init_generate_state 造 OpenAIServingChat/Completion，挂 app.state）→ serve_http。",
+    "4. serve_http(launcher): 起 uvicorn server_task + watchdog_task + handle_shutdown，返回 shutdown_task；lifespan 在 server 启动时拉起 _force_log + freeze_gc_heap。",
+    "5. 请求到来: POST /v1/chat/completions → validate_json_request 依赖 → with_cancellation/load_aware_call 装饰的 create_chat_completion handler → 取 app.state.openai_serving_chat。",
+    "6. OpenAIServingChat.create_chat_completion: render_chat_request → _check_model + 引擎存活检查 → OpenAIServingRender.render_chat → renderer.render_chat_async（chat template→prompt token_ids 即 engine_inputs）。",
+    "7. request_id = 'chatcmpl-' + _base_request_id（X-Request-Id 头或 random_uuid）；_maybe_get_adapters 取 LoRA；get_max_tokens → to_sampling_params。",
+    "8. engine_client.generate(engine_input, sampling_params, sub_request_id, ...) 返回 AsyncGenerator[RequestOutput]（对接 ch04 output_handler 背景任务多路分发）。",
+    "9a. 流式(request.stream): chat_completion_stream_generator —— 首块发 role 空 delta；逐 res 逐 output 把 delta_text 包成 DeltaMessage 的 SSE 'data: {json}\\n\\n'；末块带 finish_reason；可选 usage 块；最后 'data: [DONE]\\n\\n'。handler 返回 StreamingResponse(media_type=text/event-stream)。",
+    "9b. 非流式: chat_completion_full_generator —— async for 聚合到最后一个 RequestOutput(FINAL_ONLY 语义)，组装 choices + UsageInfo → ChatCompletionResponse，handler 返回 JSONResponse。",
+    "10. 关停: SIGINT/SIGTERM → launcher signal_handler set shutdown_event → handle_shutdown 调 engine_client.shutdown(timeout) → server.should_exit；或 watchdog 每 5s 检测引擎 errored 触发 server.should_exit；run_server_worker 退出 build_async_engine_client 上下文 → async_llm.shutdown，await shutdown_task，sock.close。"
+  ],
+
+  "design_decisions": [
+    {"decision": "先绑 socket 再起引擎", "why": "引擎初始化耗时长且涉及 ray，提前绑端口避免与 ray 的端口竞争（race condition）", "evidence": "vllm/entrypoints/openai/api_server.py:L549-L556"},
+    {"decision": "EngineClient 用 async 上下文管理器包裹", "why": "保证任何错误/退出路径都能 shutdown 引擎、清理子进程；run_server_worker 故意在退出 backend 上下文后才 await server shutdown", "evidence": "vllm/entrypoints/openai/api_server.py:L152-L154, L692-L703"},
+    {"decision": "请求渲染前先检查 engine.errored 并抛 dead_error", "why": "流式场景下 HTTP 200 在生成开始前就发出，必须在渲染阶段（200 之前）暴露引擎已死，否则客户端拿不到错误", "evidence": "vllm/entrypoints/openai/chat_completion/serving.py:L221-L225"},
+    {"decision": "SSE 首块单独发只含 role 的空 delta", "why": "对齐 OpenAI 协议：流首先声明 assistant 角色，后续块只追加 content/tool_calls 增量", "evidence": "vllm/entrypoints/openai/chat_completion/serving.py:L527-L569"},
+    {"decision": "stream generator 内异常不抛而是写成 SSE error chunk", "why": "200 已发出无法改状态码，只能把错误作为下一个 chunk 推给客户端；因此引擎死亡需靠 launcher 的 watchdog 后台任务而非异常来触发关停", "evidence": "vllm/entrypoints/openai/chat_completion/serving.py:L1139-L1146 + vllm/entrypoints/launcher.py:L144-L167"},
+    {"decision": "watchdog 每 5s 轮询 engine.errored and not is_running", "why": "StreamingResponse 生成器吞掉异常后服务器不会自动退出；watchdog 兜底设置 server.should_exit（除非 VLLM_KEEP_ALIVE_ON_ENGINE_DEATH）", "evidence": "vllm/entrypoints/launcher.py:L156-L167"},
+    {"decision": "优雅关停经 run_in_executor 调 engine.shutdown", "why": "engine.shutdown 是同步阻塞调用，放到 executor 避免阻塞事件循环；之后才 cancel server_task/watchdog_task", "evidence": "vllm/entrypoints/launcher.py:L106-L120"},
+    {"decision": "with_cancellation 装饰器用双任务竞速监听客户端断连", "why": "request.is_disconnected 在中间件下不可靠；改为同时 await handler_task 与 disconnect-listener，先完成者取消另一个，实现请求级取消", "evidence": "vllm/entrypoints/utils.py:L56-L96"},
+    {"decision": "request_id 优先取 X-Request-Id 头", "why": "便于路由/网关贯穿追踪同一请求；否则 random_uuid；chat 前缀 'chatcmpl-'", "evidence": "vllm/entrypoints/openai/engine/serving.py:L592-L602 + chat_completion/serving.py:L257-L259"},
+    {"decision": "鉴权与 request_id 用纯 ASGI 中间件而非 FastAPI 依赖", "why": "纯 ASGI 在更低层拦截、跳过非 /v1 路径与 OPTIONS（CORS 预检），用 sha256+compare_digest 防时序侧信道", "evidence": "vllm/entrypoints/openai/server_utils.py:L38-L86"},
+    {"decision": "system_fingerprint 仅盖在非流式响应与流式终止块", "why": "启动期算一次缓存；逐块盖会有 per-chunk 开销，故流式只在 finish_reason 块或末尾 usage 块标注", "evidence": "vllm/entrypoints/openai/engine/serving.py:L160-L171 + chat_completion/serving.py:L1062-L1071"},
+    {"decision": "render 与 engine 解耦（OpenAIServingRender 可无引擎独立运行）", "why": "支持 GPU-less render server；OpenAIServingChat 仅在其上加引擎相关校验（LoRA/健康），渲染逻辑单一真相源在 render serving", "evidence": "vllm/entrypoints/openai/api_server.py:L432-L493 + serve/render/serving.py:L184-L267"}
+  ],
+
+  "theory": [
+    "流式 vs 非流式的本质差异：二者消费的是同一个 engine_client.generate 异步生成器（ch04 中 output_handler 把 EngineCoreOutput 经 per-request asyncio.Queue 多路分发）。流式把每个 RequestOutput.outputs[i].text 作为增量 delta 立即 yield 成 SSE；非流式 async for 直到生成器耗尽，只保留最后一个 RequestOutput（vLLM v1 增量输出语义下末个累积了全文）再聚合。延迟权衡：流式 TTFT 低、逐 token 推送；非流式一次性返回、聚合 usage/logprobs/prompt_logprobs。",
+    "SSE 帧格式：每条消息为 'data: ' + JSON + '\\n\\n'，终止哨兵 'data: [DONE]\\n\\n'；media_type='text/event-stream'。错误在流中表现为含 error 字段的 data 帧（因 200 已发出无法改状态码）。",
+    "异步背压与取消：handler 是协程，with_cancellation 让客户端断连能取消 handler_task；非流式 full_generator 捕获 asyncio.CancelledError 返回 'Client disconnected'。整条链路无阻塞调用（除 engine.shutdown 显式丢进 executor）。",
+    "并发模型：单事件循环（uvloop）+ uvicorn；多请求共享一个 AsyncLLM，靠 ch04 的 per-request 队列与背景 output_handler 实现 fan-out，不为每请求开线程。",
+    "request_id 复杂度与幂等：n>1 或多 prompt 时派生 sub_request_id = f'{request_id}_{i}' 保证引擎侧唯一；本章主线 assert len(generators)==1（n==1 单 prompt）。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "build_app 中除 chat/completion 之外的条件路由注册（pooling/transcription/realtime/speech_to_text/disagg/rlhf/elastic_ep/generative_scoring/sagemaker/render router）", "why_safe": "本章只讲 generate 任务的 chat/completion 主线；这些路由是平行的其他 API surface，删去不影响 chat 请求从 HTTP 到 AsyncLLM 的控制流。"},
+      {"what": "use_harmony (gpt_oss) 全部分支：harmony_parsers、extract_harmony_streaming_delta、parse_chat_output、stream_harmony、_make_request_with_harmony", "why_safe": "harmony 是 gpt_oss 专用渲染/解析路径，与普通 chat template→prompt 主线正交；删去后普通模型路径完整。"},
+      {"what": "mistral grammar 路径（_grammar_from_tool_parser、extract_maybe_reasoning_and_tool_streaming、MistralToolParser 特例、is_mistral_* 分支）", "why_safe": "Mistral 工具语法是特定 tokenizer 的特殊处理，普通 tool_parser/reasoning_parser 路径不依赖它。"},
+      {"what": "beam_search 方法及 use_beam_search 分支", "why_safe": "beam search 不是 OpenAI 兼容流式/非流式主线，且自成一套多 beam 调度，删去不影响普通采样请求。"},
+      {"what": "tool_choice 的 named/required 流式与非流式细分组装（extract_named_tool_call_streaming/extract_required_tool_call_streaming、_create_remaining_args_delta、kimi_k2 history_tool_call_cnt、make_tool_call_id 多分支）的逐分支实现", "why_safe": "可保留『按 tool_choice 组装 ChatMessage/DeltaMessage』的骨架与一条 auto 路径作示例，删去 named/required/各 id_type 的穷举分支不破坏主控制流；精简版保留 tool_calls 字段存在性即可。"},
+      {"what": "OpenAIServingTokenization/embed/pooling、init_render_app_state、build_and_serve_renderer、speech_to_text 等非 chat 服务对象的实例化", "why_safe": "与 chat 请求路径无关的平行服务，删去不影响主线。"},
+      {"what": "load_aware_call / ScalingMiddleware / server_load_metrics 负载追踪、orca metrics_header、enable_log_outputs/enable_log_deltas 日志", "why_safe": "可观测性/负载均衡侧路，删去不改变请求语义。"},
+      {"what": "SSLCertRefresher、uds(unix socket)、ipv6、h11 header 限制、forkserver 预导入、multi-API-process 的 client_count/client_index 拆分", "why_safe": "部署期可选项，主线单进程 TCP 无 SSL 场景不触及。"},
+      {"what": "logprobs / prompt_logprobs / clamp_prompt_logprobs / _create_chat_logprobs / _get_top_logprobs 全部", "why_safe": "logprobs 装配在 ch10 已专门讲；本章可在响应里保留 logprobs 字段占位而省略其计算细节，不影响流式/非流式骨架。"}
+    ],
+    "must_keep": [
+      {"symbol": "build_async_engine_client", "why": "EngineClient 生命周期边界、起 AsyncLLM 的入口，是承接 ch04 的关键。"},
+      {"symbol": "build_async_engine_client_from_engine_args", "why": "实际调用 AsyncLLM.from_vllm_config 与 finally shutdown 的地方。"},
+      {"symbol": "run_server_worker", "why": "展示『async with 引擎上下文 → build_and_serve → await shutdown_task』的顶层编排。"},
+      {"symbol": "setup_server", "why": "先绑 socket、装 SIGTERM handler 的启动序，体现『先于引擎绑端口』设计。"},
+      {"symbol": "build_and_serve", "why": "get_supported_tasks → build_app → init_app_state → serve_http 的串联。"},
+      {"symbol": "build_app", "why": "FastAPI(lifespan=lifespan) + 注册路由 + exception_handler 的装配中心。"},
+      {"symbol": "init_app_state", "why": "把 OpenAIServingChat 等 handler 挂到 app.state 的地方，连接路由与 handler。"},
+      {"symbol": "lifespan", "why": "FastAPI 生命周期：启动后台 log task + freeze_gc_heap，本章明确点名。"},
+      {"symbol": "OpenAIServing", "why": "handler 基类，request_id/校验/错误处理/tool 提取的真相源。"},
+      {"symbol": "_base_request_id", "why": "request_id 解析（X-Request-Id 优先），读者需理解。"},
+      {"symbol": "_check_model", "why": "请求校验（模型名/LoRA/404）核心。"},
+      {"symbol": "create_error_response", "why": "统一错误响应工厂，writer 需讲错误处理。"},
+      {"symbol": "create_streaming_error_response", "why": "流式错误以 data 帧返回的机制。"},
+      {"symbol": "_raise_if_error", "why": "finish_reason=='error' → GenerationError 的桥。"},
+      {"symbol": "OpenAIServingChat", "why": "chat handler 主体。"},
+      {"symbol": "create_chat_completion", "why": "渲染→request_id→SamplingParams→generate→分流的主方法。"},
+      {"symbol": "render_chat_request", "why": "OpenAIServingChat 加引擎校验后委托 render 的桥。"},
+      {"symbol": "chat_completion_stream_generator", "why": "SSE 流式 DELTA 主路径。"},
+      {"symbol": "chat_completion_full_generator", "why": "非流式 FINAL_ONLY 聚合主路径。"},
+      {"symbol": "OpenAIServingRender", "why": "Renderer 适配层，chat template→prompt 的归宿。"},
+      {"symbol": "render_chat", "why": "渲染核心方法（preprocess_chat 入口）。"},
+      {"symbol": "preprocess_chat", "why": "build_chat_params + renderer.render_chat_async 的实际渲染点。"},
+      {"symbol": "serve_http", "why": "uvicorn 启动 + 优雅关停 + watchdog 的中枢。"},
+      {"symbol": "watchdog_loop", "why": "引擎死亡兜底关停，本章重点。"},
+      {"symbol": "terminate_if_errored", "why": "engine.errored → server.should_exit 的判定。"},
+      {"symbol": "handle_shutdown", "why": "SIGINT/SIGTERM → 关引擎 → server.should_exit 的优雅关停（注意此为 serve_http 内嵌函数，精简版应作为 serve_http 内部逻辑保留，可检测为 server.should_exit 赋值 + engine shutdown 调用）。"},
+      {"symbol": "create_chat_completion", "why": "API router handler 同名（serving 与 router 两处），SSE vs JSON 分流体现在 router 的 StreamingResponse/JSONResponse。"},
+      {"symbol": "with_cancellation", "why": "客户端断连取消请求的装饰器，异步语义关键。"},
+      {"symbol": "AuthenticationMiddleware", "why": "Bearer 鉴权中间件，请求校验一环。"},
+      {"symbol": "StreamingResponse", "why": "SSE 的 FastAPI 出口（media_type=text/event-stream），区分流式/非流式的落点。"},
+      {"symbol": "ChatCompletionResponse", "why": "非流式 JSON 响应模型。"},
+      {"symbol": "ChatCompletionStreamResponse", "why": "流式 chunk 响应模型。"},
+      {"symbol": "DeltaMessage", "why": "流式增量载体（role/content/tool_calls）。"},
+      {"symbol": "UsageInfo", "why": "用量聚合，流式末块/非流式都需。"}
+    ]
+  },
+
+  "diagram_plan": [
+    {
+      "name": "ch32-request-lifecycle",
+      "type": "flow",
+      "spec": "竖向泳道流程图：HTTP POST /v1/chat/completions → [FastAPI: validate_json_request + with_cancellation + Auth/X-Request-Id 中间件] → create_chat_completion handler → OpenAIServingChat.create_chat_completion → [render_chat_request: _check_model + engine.errored 检查] → OpenAIServingRender.render_chat → renderer.render_chat_async(chat template→prompt token_ids) → [request_id + SamplingParams] → engine_client.generate(AsyncLLM, 异步生成器) → 分叉：(stream) chat_completion_stream_generator → SSE 'data:{}\\n\\n' .. '[DONE]' → StreamingResponse；(非stream) chat_completion_full_generator → 聚合 → ChatCompletionResponse → JSONResponse。高亮 engine_client.generate 为与 ch04 的接缝。",
+      "roadmap_highlight": "entrypoints / openai server (ch32)，标注上游 ch31 离线 LLM、ch04 AsyncLLM 三段式 + output_handler"
+    },
+    {
+      "name": "ch32-startup-shutdown",
+      "type": "sequence",
+      "spec": "启动+关停时序：run_server → setup_server(绑 socket, SIGTERM) → build_async_engine_client(起 AsyncLLM) → build_and_serve(build_app/init_app_state/serve_http) → serve_http 起 server_task+watchdog_task+handle_shutdown；lifespan 拉起 _force_log + freeze_gc_heap。关停分支：SIGINT/SIGTERM→shutdown_event→handle_shutdown→engine.shutdown(run_in_executor)→server.should_exit；并行 watchdog 每 5s 检 engine.errored→server.should_exit。退出 build_async_engine_client 上下文→async_llm.shutdown→sock.close。",
+      "roadmap_highlight": "launcher / lifespan 节点"
+    },
+    {
+      "name": "ch32-stream-vs-final",
+      "type": "table",
+      "spec": "对照表两列：流式(DELTA) vs 非流式(FINAL_ONLY)。行：消费方式(逐 RequestOutput yield / async for 取末个)、首块(role 空 delta / 无)、增量载体(DeltaMessage SSE / ChatMessage)、用量(可选末块 usage / response.usage)、错误处理(error data 帧, 200 已发 / ErrorResponse JSON 可改状态码)、终止(data:[DONE] / 直接返回)、FastAPI 出口(StreamingResponse text/event-stream / JSONResponse)、同源(同一 engine_client.generate 生成器)。",
+      "roadmap_highlight": "无"
+    }
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recover": [],
+    "note": "scripts/bible.py due ch32 返回空（无应埋/应回收登记项）。本章是 entrypoints 子系统收尾章，依赖 ch31(离线 LLM 对照) 与 ch04(AsyncLLM 三段式/output_handler)；engine_client.generate 异步生成器、AsyncLLM.from_vllm_config、output_handler 多路分发为承接 ch04 的接缝，logprobs 装配承接 ch10。"
+  }
+}

@@ -14,14 +14,14 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch31',
-  slug: 'ch31-entrypoints',
-  focus: '离线 LLM API: LLM 类的 generate/chat/embed/encode 接口、EngineArgs→LLMEngine。【关键澄清, 勿讲错】默认离线路径用 SyncMPClient(后台进程 EngineCore + ZMQ, 因 VLLM_ENABLE_V1_MULTIPROCESSING 默认 True, llm_engine.py:L165-167 强制 enable_multiprocessing=True); InprocClient(真进程内/无 ZMQ)只是 VLLM_ENABLE_V1_MULTIPROCESSING=0 的回退(测试/调试/V0 风格), 不是默认。与 ch04 AsyncLLM 的真正对比 = 同步阻塞 while step() 驱动(_run_engine) + FINAL_ONLY 批量收集 vs 异步事件循环 + 背景 output_handler + DELTA 流式——该对比对 SyncMPClient 也成立, 不依赖 in-process。请求批量提交与渲染(chat 走 _render_and_run_requests 打包+warning; completion 走 _render_and_add+单独 run 不 warning)、LLMEngine.step() 同步循环、tqdm 进度。Part VIII 离线侧',
+  chapter_id: 'ch32',
+  slug: 'ch32-entrypoints',
+  focus: 'OpenAI 兼容服务器: FastAPI lifespan + build_async_engine_client(起 AsyncLLM/AsyncMPClient, 复用 ch04/ch31 的异步路径)、OpenAIServing 基类(请求校验/tokenize/错误处理/request_id)、chat/completion handler、Renderer(chat template→prompt)、SSE 流式(DELTA 逐 token 推, 对接 ch04 output_handler) vs 非流式 JSON(FINAL_ONLY 聚合)、tool/reasoning parser、launcher(uvicorn serve + 优雅关停信号)。承接 ch31 离线对照 + ch04 异步三段式',
   highlight: 'entrypoints',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
-  paths: ['vllm/entrypoints/llm.py', 'vllm/v1/engine/llm_engine.py'],
+  paths: ['vllm/entrypoints/openai/api_server.py', 'vllm/entrypoints/openai/engine/serving.py', 'vllm/entrypoints/openai/chat_completion/serving.py', 'vllm/entrypoints/launcher.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
