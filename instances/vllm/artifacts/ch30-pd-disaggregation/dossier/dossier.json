@@ -1,0 +1,259 @@
+{
+  "chapter_id": "ch30",
+  "title": "PD 分离的 worker 侧执行与可插拔传输后端",
+  "source_pin": "f3fef123",
+  "one_liner": "ch29 讲完决策侧契约（scheduler 进程查命中/隔离/提升），ch30 落到 worker 侧：KVConnectorModelRunnerMixin._get_kv_connector_output 用一个 context manager 把 WORKER-role connector 的整条生命周期（bind_connector_metadata→start_load_kv 异步发起→[forward 内逐层 wait_for_layer_load/save_kv_layer]→wait_for_save 收齐→get_finished 上报）夹在 model forward 两侧，使 KV load 与 compute 重叠；同一套 KVConnectorBase_V1 worker 契约被三类传输各自填实——P2P NCCL 点对点 NCCL send/recv、NIXL 高性能 RDMA READ、Offloading CPU/磁盘 transfer_async——facade 模式把 scheduler/worker 两半拆进各自子对象。",
+
+  "code_spine": [
+    "vllm/v1/worker/gpu_model_runner.py:L4070-L4095 (execute_model：set_forward_context + maybe_get_kv_connector_output 包住 _model_forward —— compute 与 KV 搬运交织的物理位置)",
+    "vllm/v1/worker/kv_connector_model_runner_mixin.py:L57-L68 (maybe_get_kv_connector_output：有 kv_transfer_group 才进 _get_kv_connector_output，否则 nullcontext)",
+    "vllm/v1/worker/kv_connector_model_runner_mixin.py:L83-L119 (_get_kv_connector_output：worker 侧生命周期 context manager —— bind→start_load_kv→yield→wait_for_save→get_finished→get_block_ids_with_load_errors→build_connector_worker_meta→clear)",
+    "vllm/model_executor/layers/attention/kv_transfer_utils.py:L15-L61 (maybe_transfer_kv_layer 装饰器：每个 attention 层执行前 wait_for_layer_load、执行后 save_kv_layer —— forward 内部的逐层 hook)",
+    "vllm/v1/worker/kv_connector_model_runner_mixin.py:L37-L55 (kv_connector_no_forward：本步无 token 也要走 KV send/recv，wait_for_save=False)",
+    "vllm/v1/worker/kv_connector_model_runner_mixin.py:L70-L79 (finalize_kv_connector：defer_finalize=True 时 draft forward 后补做 wait_for_save+clear)",
+    "vllm/distributed/kv_transfer/kv_connector/v1/base.py:L298-L361 (worker 侧抽象契约：start_load_kv / wait_for_layer_load / save_kv_layer / wait_for_save)",
+    "vllm/distributed/kv_transfer/kv_connector/v1/base.py:L363-L399 (get_finished 上报异步收/发完成 + get_block_ids_with_load_errors)",
+    "vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py:L111-L229 (P2P：start_load_kv —— consumer 端逐请求逐层 recv_tensor + inject_kv_into_layer 写回 paged buffer)",
+    "vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py:L242-L312 (P2P：save_kv_layer —— producer 端 extract_kv_from_layer + send_tensor；wait_for_save→wait_for_sent)",
+    "vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py:L235-L306 (P2P 引擎：send_tensor 的 PUT/PUT_ASYNC/GET 三模式 —— PUT_ASYNC 入队后台线程发，体现『异步』)",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py:L87-L108 (NIXL：__init__ 按 role 建 NixlConnectorScheduler 或 NixlConnectorWorker —— facade 模式)",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py:L241-L264 (NIXL：start_load_kv→worker.start_load_kv；wait_for_layer_load/save_kv_layer 为 no-op；wait_for_save 仅 host buffer 才回拷)",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/worker.py:L1840-L1896 (NIXL worker：start_load_kv 逐请求 _read_blocks_for_req，握手未完成则后台握手延后 read)",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/worker.py:L1980-L2109 (NIXL worker：_read_blocks 发起非阻塞 RDMA READ —— make_prepped_xfer('READ')+transfer，handle 存入 _recving_transfers)",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/worker.py:L1651-L1730 (NIXL worker：get_finished 轮询 _pop_done_transfers/_get_new_notifs，DONE 才报完成)",
+    "vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py:L46-L119 (Offloading：facade，role 建 scheduler/worker 子对象；start_load_kv→start_kv_transfers、wait_for_save→prepare_store_kv)",
+    "vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py:L295-L344 (Offloading worker：start_kv_transfers 提交 load job、prepare_store_kv 延迟入队 store、get_finished 轮询 worker.get_finished)"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L4071-L4095",
+      "code": "        with (\n            set_forward_context(\n                attn_metadata,\n                self.vllm_config,\n                num_tokens=num_tokens_padded,\n                ...\n            ),\n            record_function_or_nullcontext(\"gpu_model_runner: forward\"),\n            self.maybe_get_kv_connector_output(\n                scheduler_output,\n                defer_finalize=defer_kv_connector_finalize,\n            ) as kv_connector_output,\n        ):\n            model_output = self._model_forward(\n                input_ids=input_ids,\n                positions=positions,\n                intermediate_tensors=intermediate_tensors,\n                inputs_embeds=inputs_embeds,\n                **model_kwargs,\n            )",
+      "elide": ["set_forward_context 的 cudagraph/ubatch/slot_mapping 参数以 ... 略去，正文只点出『forward 被夹在 KV connector context manager 内』这一关键结构"]
+    },
+    {
+      "path": "vllm/v1/worker/kv_connector_model_runner_mixin.py",
+      "lines": "L57-L68",
+      "code": "    @staticmethod\n    def maybe_get_kv_connector_output(\n        scheduler_output: \"SchedulerOutput\",\n        defer_finalize: bool = False,\n    ) -> AbstractContextManager[KVConnectorOutput | None]:\n        return (\n            KVConnectorModelRunnerMixin._get_kv_connector_output(\n                scheduler_output, defer_finalize=defer_finalize\n            )\n            if has_kv_transfer_group()\n            else nullcontext()\n        )",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/worker/kv_connector_model_runner_mixin.py",
+      "lines": "L81-L119",
+      "code": "    # This context manager must be used within an active forward context.\n    # It encapsulates the entire KV connector lifecycle within execute_model\n    @staticmethod\n    @contextmanager\n    def _get_kv_connector_output(\n        scheduler_output: \"SchedulerOutput\",\n        wait_for_save: bool = True,\n        defer_finalize: bool = False,\n    ) -> Generator[KVConnectorOutput, None, None]:\n        output = KVConnectorOutput()\n\n        # Update KVConnector with the KVConnector metadata forward().\n        kv_connector = get_kv_transfer_group()\n        assert isinstance(kv_connector, KVConnectorBase)\n        assert scheduler_output.kv_connector_metadata is not None\n        kv_connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)\n\n        # Background KV cache transfers happen here.\n        # These transfers are designed to be async and the requests\n        # involved may be disjoint from the running requests.\n        # Do this here to save a collective_rpc.\n        kv_connector.start_load_kv(get_forward_context())\n        try:\n            yield output\n        finally:\n            if wait_for_save and not defer_finalize:\n                kv_connector.wait_for_save()\n\n            output.finished_sending, output.finished_recving = (\n                kv_connector.get_finished(scheduler_output.finished_req_ids)\n            )\n            output.invalid_block_ids = kv_connector.get_block_ids_with_load_errors()\n\n            output.kv_connector_stats = kv_connector.get_kv_connector_stats()\n            output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()\n            output.kv_connector_worker_meta = kv_connector.build_connector_worker_meta()\n\n            if not defer_finalize:\n                kv_connector.clear_connector_metadata()",
+      "elide": []
+    },
+    {
+      "path": "vllm/model_executor/layers/attention/kv_transfer_utils.py",
+      "lines": "L15-L61",
+      "code": "def maybe_transfer_kv_layer(func: Callable) -> Callable:\n    \"\"\"Decorator that handles KV layer transfer prior and after execution of\n    an attention layer, if enabled. Otherwise, the wrapper is a no-op.\n\n    On entry: waits for the KV layer from the connector.\n    On exit: saves the KV layer to the connector.\n    \"\"\"\n    ...\n    @wraps(func)\n    def wrapper(*args, **kwargs):\n        if not has_kv_transfer_group() or not is_v1_kv_transfer_group():\n            return func(*args, **kwargs)\n\n        layer_name = _resolve_layer_name(args[layer_name_index])\n\n        # Extract attention context (metadata, layer, kv_cache, layer_slot_mapping)\n        attn_metadata, _, kv_cache, _ = get_attention_context(layer_name)\n        connector = get_kv_transfer_group()\n        if attn_metadata is None or not connector.has_connector_metadata():\n            return func(*args, **kwargs)\n\n        # Wait for KV layer on entry\n        connector.wait_for_layer_load(layer_name)\n\n        # Execute the function\n        result = func(*args, **kwargs)\n\n        # Save KV cache layer on exit\n        connector.save_kv_layer(layer_name, kv_cache, attn_metadata)\n\n        return result\n\n    return wrapper",
+      "elide": ["inspect.signature 取 layer_name 参数索引的样板（L25-L35）以 ... 略去，正文只点出『装饰器在每个 attention 层前后插 wait_for_layer_load / save_kv_layer』"]
+    },
+    {
+      "path": "vllm/v1/worker/kv_connector_model_runner_mixin.py",
+      "lines": "L37-L55",
+      "code": "    @staticmethod\n    def kv_connector_no_forward(\n        scheduler_output: \"SchedulerOutput\", vllm_config: VllmConfig\n    ) -> ModelRunnerOutput:\n        # KV send/recv even if no work to do.\n        with (\n            set_forward_context(None, vllm_config),\n            KVConnectorModelRunnerMixin._get_kv_connector_output(\n                scheduler_output, wait_for_save=False\n            ) as kv_connector_output,\n        ):\n            pass\n\n        if kv_connector_output.is_empty():\n            return EMPTY_MODEL_RUNNER_OUTPUT\n\n        output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)\n        output.kv_connector_output = kv_connector_output\n        return output",
+      "elide": []
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/base.py",
+      "lines": "L298-L361",
+      "code": "    @abstractmethod\n    def start_load_kv(self, forward_context: \"ForwardContext\", **kwargs: Any) -> None:\n        \"\"\"\n        Start loading the KV cache from the connector to vLLM's paged\n        KV buffer. This is called from the forward context before the\n        forward pass to enable async loading during model execution.\n        \"\"\"\n        pass\n\n    @abstractmethod\n    def wait_for_layer_load(self, layer_name: str) -> None:\n        \"\"\"\n        Block until the KV for a specific layer is loaded into vLLM's\n        paged buffer. This is called from within attention layer to ensure\n        async copying from start_load_kv is complete.\n        \"\"\"\n        pass\n\n    @abstractmethod\n    def save_kv_layer(\n        self,\n        layer_name: str,\n        kv_layer: torch.Tensor,\n        attn_metadata: \"AttentionMetadata\",\n        **kwargs: Any,\n    ) -> None:\n        \"\"\"\n        Start saving a layer of KV cache from vLLM's paged buffer\n        to the connector. This is called from within attention layer to\n        enable async copying during execution.\n        \"\"\"\n        pass\n\n    @abstractmethod\n    def wait_for_save(self):\n        \"\"\"\n        Block until all the save operations is done. This is called\n        as the forward context exits to ensure that the async saving\n        from save_kv_layer is complete before finishing the forward.\n        This prevents overwrites of paged KV buffer before saving done.\n        \"\"\"\n        pass",
+      "elide": ["各方法 Args 详细文档省略；docstring 正文保留要点"]
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/base.py",
+      "lines": "L363-L379",
+      "code": "    def get_finished(\n        self, finished_req_ids: set[str]\n    ) -> tuple[set[str] | None, set[str] | None]:\n        \"\"\"\n        Notifies worker-side connector ids of requests that have\n        finished generating tokens on the worker.\n        The scheduler process (via the Executors) will use this output\n        to track which workers are done.\n\n        Returns:\n            ids of requests that have finished asynchronous transfer\n            (requests that previously returned True from request_finished()),\n            tuple of (sending/saving ids, recving/loading ids).\n        \"\"\"\n        return None, None",
+      "elide": ["Returns 段末尾关于『必属于某次本调用或先前调用传入集合』的细节保留要点"]
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py",
+      "lines": "L111-L132",
+      "code": "    def start_load_kv(self, forward_context: \"ForwardContext\", **kwargs: Any) -> None:\n        \"\"\"Start loading the KV cache from the connector buffer to vLLM's\n        paged KV buffer.\n        \"\"\"\n        # Only consumer/decode loads KV Cache\n        if self.is_producer:\n            return\n\n        assert self.p2p_nccl_engine is not None\n\n        attn_metadata = forward_context.attn_metadata\n        if attn_metadata is None:\n            return",
+      "elide": ["内嵌的 inject_kv_into_layer 闭包定义（L134-L193）在下一段单独展示"]
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py",
+      "lines": "L195-L229",
+      "code": "        # Get the metadata\n        metadata: KVConnectorMetadata = self._get_connector_metadata()\n        assert isinstance(metadata, P2pNcclConnectorMetadata)\n\n        # Load the KV for each request each layer\n        for request in metadata.requests:\n            request_id = request.request_id\n            ip, port = self.parse_request_id(request_id, False)\n            remote_address = ip + \":\" + str(port + self._rank)\n            for layer_name in forward_context.no_compile_layers:\n                layer = forward_context.no_compile_layers[layer_name]\n\n                # Only process layers that have kv_cache attribute (attention\n                # layers) Skip non-attention layers like FusedMoE\n                kv_cache = getattr(layer, \"kv_cache\", None)\n                if kv_cache is None:\n                    continue\n\n                layer = kv_cache\n\n                kv_cache = self.p2p_nccl_engine.recv_tensor(\n                    request.request_id + \"#\" + layer_name, remote_address\n                )\n\n                if kv_cache is None:\n                    logger.warning(\"\\U0001f6a7kv_cache is None, %s\", request.request_id)\n                    continue\n\n                inject_kv_into_layer(\n                    layer, kv_cache, request.block_ids, request.request_id\n                )",
+      "elide": ["remote_address 由 request_id 里编码的 prefill 地址 parse 出来（parse_request_id 正则）—— 正文转述『请求 id 自带对端地址』"]
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py",
+      "lines": "L242-L312",
+      "code": "    def save_kv_layer(\n        self,\n        layer_name: str,\n        kv_layer: torch.Tensor,\n        attn_metadata: AttentionMetadata,\n        **kwargs: Any,\n    ) -> None:\n        # Only producer/prefill saves KV Cache\n        if not self.is_producer:\n            return\n\n        assert self.p2p_nccl_engine is not None\n\n        def extract_kv_from_layer(\n            layer: torch.Tensor,\n            block_ids: torch.Tensor,\n        ) -> torch.Tensor:\n            if (\n                isinstance(attn_metadata, MLACommonMetadata) or layer.shape[1] == 2\n            ):  # MLA or FlashInfer\n                return layer[block_ids, ...]\n            if layer.shape[0] == 2:  # FlashAttention\n                return layer[:, block_ids, ...]\n            return None\n\n        connector_metadata = self._get_connector_metadata()\n        assert isinstance(connector_metadata, P2pNcclConnectorMetadata)\n        for request in connector_metadata.requests:\n            request_id = request.request_id\n            ip, port = self.parse_request_id(request_id, True)\n            remote_address = ip + \":\" + str(port + self._rank)\n\n            kv_cache = extract_kv_from_layer(kv_layer, request.block_ids)\n            self.p2p_nccl_engine.send_tensor(\n                request_id + \"#\" + layer_name, kv_cache, remote_address\n            )\n\n    def wait_for_save(self):\n        if self.is_producer:\n            assert self.p2p_nccl_engine is not None\n            self.p2p_nccl_engine.wait_for_sent()",
+      "elide": ["extract_kv_from_layer 的 docstring 省略；正文点出『按 attention 后端 layout 沿不同维度切片提取本请求 block 的 KV』"]
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py",
+      "lines": "L314-L331",
+      "code": "    def get_finished(\n        self, finished_req_ids: set[str], **kwargs: Any\n    ) -> tuple[set[str] | None, set[str] | None]:\n        \"\"\"\n        Notifies worker-side connector ids of requests that have\n        finished generating tokens.\n        \"\"\"\n        assert self.p2p_nccl_engine is not None\n\n        no_compile_layers = self._vllm_config.compilation_config.static_forward_context\n        return self.p2p_nccl_engine.get_finished(finished_req_ids, no_compile_layers)",
+      "elide": []
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py",
+      "lines": "L247-L258",
+      "code": "        item = SendQueueItem(\n            tensor_id=tensor_id, remote_address=remote_address, tensor=tensor\n        )\n\n        if self.send_type == \"PUT\":\n            return self.send_sync(item)\n\n        if self.send_type == \"PUT_ASYNC\":\n            with self.send_queue_cv:\n                self.send_queue.append(item)\n                self.send_queue_cv.notify()\n            return True",
+      "elide": ["GET 模式（把 tensor 暂存 send_store 等对端来拉、含 LRU 驱逐）以 ... 略去；正文点出『PUT 同步发、PUT_ASYNC 入队后台线程发、GET 暂存待拉』三模式 —— 这就是 connector wait_for_save 必须存在的理由』"]
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py",
+      "lines": "L486-L498",
+      "code": "    def wait_for_sent(self):\n        if self.send_type == \"PUT_ASYNC\":\n            start_time = time.time()\n            with self.send_queue_cv:\n                while self.send_queue:\n                    self.send_queue_cv.wait()\n            duration = time.time() - start_time\n            logger.debug(\n                \"\\U0001f6a7[PUT_ASYNC]It took %.3fms to wait for the send_queue\"\n                \" to be empty, rank:%d\",\n                duration * 1000,\n                self.rank,\n            )",
+      "elide": []
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py",
+      "lines": "L87-L108",
+      "code": "    def __init__(\n        self,\n        vllm_config: VllmConfig,\n        role: KVConnectorRole,\n        kv_cache_config: \"KVCacheConfig\",\n    ):\n        super().__init__(vllm_config, role, kv_cache_config)\n        ...\n        if role == KVConnectorRole.SCHEDULER:\n            self.connector_scheduler: NixlConnectorScheduler | None = (\n                NixlConnectorScheduler(vllm_config, self.engine_id, kv_cache_config)\n            )\n            self.connector_worker: NixlConnectorWorker | None = None\n        elif role == KVConnectorRole.WORKER:\n            self.connector_scheduler = None\n            self.connector_worker = NixlConnectorWorker(\n                vllm_config, self.engine_id, kv_cache_config\n            )",
+      "elide": ["engine_id / kv_transfer_config 赋值省略 —— 正文点出『facade：顶层 NixlConnector 按 role 只建半边子对象，每个 worker-side 调用 assert connector_worker is not None 后转发』，这是与 P2P 单类自包含的对照"]
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py",
+      "lines": "L241-L264",
+      "code": "    def start_load_kv(self, forward_context: \"ForwardContext\", **kwargs) -> None:\n        assert self.connector_worker is not None\n        assert isinstance(self._connector_metadata, NixlConnectorMetadata)\n        self.connector_worker.start_load_kv(self._connector_metadata)\n\n    def wait_for_layer_load(self, layer_name: str) -> None:\n        \"\"\"NixlConnector does not do layerwise saving.\"\"\"\n        pass\n\n    def save_kv_layer(\n        self,\n        layer_name: str,\n        kv_layer: torch.Tensor,\n        attn_metadata: AttentionMetadata,\n        **kwargs,\n    ) -> None:\n        \"\"\"NixlConnector does not save explicitly.\"\"\"\n        pass\n\n    def wait_for_save(self):\n        assert self.connector_worker is not None\n        assert isinstance(self._connector_metadata, NixlConnectorMetadata)\n        if self.connector_worker.use_host_buffer and self.connector_worker.copy_blocks:\n            self.connector_worker.save_kv_to_host(self._connector_metadata)",
+      "elide": []
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/worker.py",
+      "lines": "L1840-L1875",
+      "code": "    def start_load_kv(self, metadata: NixlConnectorMetadata):\n        \"\"\"\n        Start loading by triggering non-blocking nixl_xfer.\n        We check for these trnxs to complete in each step().\n        \"\"\"\n        for req_id, meta in metadata.reqs_to_recv.items():\n            meta.local_physical_block_ids = self._logical_to_kernel_block_ids(\n                meta.local_block_ids\n            )\n            assert meta.remote is not None\n            remote_engine_id = meta.remote.engine_id\n            ...\n            # always store metadata for failure recovery\n            self._recving_metadata[req_id] = meta\n            if remote_engine_id not in self._remote_agents:\n                # Initiate handshake with remote engine to exchange metadata.\n                with self._handshake_lock:\n                    if remote_engine_id not in self._remote_agents:\n                        self._background_nixl_handshake(req_id, remote_engine_id, meta)\n                        continue\n\n            # Handshake already completed, start async read xfer.\n            self._read_blocks_for_req(req_id, meta)\n\n        # Start transfers for requests whose handshakes have now finished.\n        while not self._ready_requests.empty():\n            self._read_blocks_for_req(*self._ready_requests.get_nowait())",
+      "elide": ["logger.debug 与 reqs_in_batch/reqs_not_processed/reqs_to_send 的过期管理（L1877-L1895）以 ... 略去；正文点出『首遇远端先后台握手交换内存注册元数据，握手完成才发 READ —— 这是 RDMA 单边读的前置』"]
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/worker.py",
+      "lines": "L2093-L2109",
+      "code": "        # Prepare transfer with Nixl.\n        handle = None\n        try:\n            handle = self.nixl_wrapper.make_prepped_xfer(\n                \"READ\",\n                local_xfer_side_handle,\n                local_block_descs_ids,\n                remote_xfer_side_handle,\n                remote_block_descs_ids,\n                notif_msg=notif_id,\n            )\n\n            # Begin async xfer.\n            self.nixl_wrapper.transfer(handle)\n\n            # Use handle to check completion in future step().\n            self._recving_transfers[request_id].append(handle)",
+      "elide": ["block_descs_ids 由 (engine_id, block_ids) 算出、异常分支以 ... 略去；正文点出『RDMA 单边 READ：D 主动从 P 显存读 KV，P 侧 CPU 不参与拷贝；handle 留待后续 step 轮询 DONE』"]
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/worker.py",
+      "lines": "L1651-L1672",
+      "code": "    def get_finished(self) -> tuple[set[str], set[str]]:\n        \"\"\"\n        Get requests that are done sending or recving on this specific worker.\n        The scheduler process (via the MultiprocExecutor) will use this output\n        to track which workers are done.\n        \"\"\"\n        assert self.transfer_topo is not None\n        done_sending = self._get_new_notifs()\n        done_recving = self._pop_done_transfers(self._recving_transfers)\n\n        # add requests that skipped transfer to done_recving\n        done_recving.update(self._failed_recv_reqs)\n        self._failed_recv_reqs.clear()\n        ...\n        return done_sending, done_recving",
+      "elide": ["host buffer 回拷 / 异构 TP 块后处理 / reqs_to_send 过期回收（L1674-L1729）以 ... 略去；正文点出『发完成 = 收到对端 READ-done 通知(_get_new_notifs)；收完成 = 本地 xfer handle 转 DONE(_pop_done_transfers)』"]
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/worker.py",
+      "lines": "L1786-L1822",
+      "code": "        for req_id, handles in list(transfers.items()):\n            in_progress = []\n            for handle in handles:\n                try:\n                    xfer_state = self.nixl_wrapper.check_xfer_state(handle)\n                    if xfer_state == \"DONE\":\n                        ...\n                        self.nixl_wrapper.release_xfer_handle(handle)\n                    elif xfer_state == \"PROC\":\n                        in_progress.append(handle)\n                        continue\n                    else:\n                        ...\n                        self._handle_failed_transfer(req_id, handle)\n                except Exception as e:\n                    ...\n                    self._handle_failed_transfer(req_id, handle)\n\n            if not in_progress:\n                # Only report request as completed when all transfers are done.\n                done_req_ids.add(req_id)\n                del transfers[req_id]\n            else:\n                transfers[req_id] = in_progress",
+      "elide": ["telemetry/stats 记录与日志以 ... 略去；正文点出『PROC=仍在传留着，全部 DONE 才把 req 报完成 —— 这是非阻塞 READ 的轮询收尾』"]
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py",
+      "lines": "L51-L119",
+      "code": "    def __init__(\n        self,\n        vllm_config: VllmConfig,\n        role: KVConnectorRole,\n        kv_cache_config: KVCacheConfig | None = None,\n    ):\n        super().__init__(vllm_config, role, kv_cache_config)\n        assert kv_cache_config is not None\n        spec = OffloadingSpecFactory.create_spec(vllm_config, kv_cache_config)\n\n        self.connector_scheduler: OffloadingConnectorScheduler | None = None\n        self.connector_worker: OffloadingConnectorWorker | None = None\n        if role == KVConnectorRole.SCHEDULER:\n            self.connector_scheduler = OffloadingConnectorScheduler(spec)\n        elif role == KVConnectorRole.WORKER:\n            self.connector_worker = OffloadingConnectorWorker(spec)\n    ...\n    def start_load_kv(self, forward_context: \"ForwardContext\", **kwargs) -> None:\n        assert self.connector_worker is not None\n        assert isinstance(self._connector_metadata, OffloadingConnectorMetadata)\n        self.connector_worker.start_kv_transfers(self._connector_metadata)\n\n    def wait_for_layer_load(self, layer_name: str) -> None:\n        pass\n\n    def save_kv_layer(\n        self,\n        layer_name: str,\n        kv_layer: torch.Tensor,\n        attn_metadata: \"AttentionMetadata\",\n        **kwargs,\n    ) -> None:\n        pass\n\n    def wait_for_save(self):\n        assert self.connector_worker is not None\n        assert isinstance(self._connector_metadata, OffloadingConnectorMetadata)\n        self.connector_worker.prepare_store_kv(self._connector_metadata)\n\n    def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:\n        assert self.connector_worker is not None\n        return self.connector_worker.get_finished(finished_req_ids)",
+      "elide": ["register_kv_caches / handle_preemptions / build_connector_worker_meta 等转发方法以 ... 略去；正文点出『与 NIXL 同构的 facade，但 wait_for_save 不是真等保存完成，而是把 store『准备』入队 —— 注意语义差异』"]
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py",
+      "lines": "L295-L344",
+      "code": "    def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):\n        for job_id, transfer_spec in self._unsubmitted_store_jobs:\n            success = self.worker.transfer_async(job_id, transfer_spec)\n            assert success\n        self._unsubmitted_store_jobs.clear()\n\n        for job_id, entry in metadata.load_jobs.items():\n            self._load_jobs[job_id] = entry.req_id\n            success = self.worker.transfer_async(job_id, entry.transfer_spec)\n            assert success\n\n    def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):\n        for job_id, entry in metadata.store_jobs.items():\n            # NOTE(orozery): defer the store to the beginning of the next\n            # engine step, so that offloading starts AFTER transfers related\n            # to token sampling, thereby avoiding delays to token generation.\n            self._unsubmitted_store_jobs.append((job_id, entry.transfer_spec))\n\n    def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:\n        finished_recving: set[str] = set()\n        for transfer_result in self.worker.get_finished():\n            # we currently do not support job failures\n            job_id = transfer_result.job_id\n            assert transfer_result.success\n            ...\n            self._connector_worker_meta.mark_completed(job_id)\n            req_id = self._load_jobs.pop(job_id, None)\n            if req_id is not None:\n                finished_recving.add(req_id)\n\n        return set(), finished_recving",
+      "elide": ["stats 记录分支以 ... 略去；正文点出三个关键：(1) start_kv_transfers 同时提交『上一步排队的 store』和『本步 load』；(2) prepare_store_kv 只入队不真发 —— 推迟到下一步开头避免拖慢采样；(3) get_finished 永远返回空 finished_sending（store 不走 finished_sending，而是经 worker_meta.completed_jobs + jobs_to_flush 围栏块复用），只为 load 报 finished_recving"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "KVConnectorModelRunnerMixin", "file": "vllm/v1/worker/kv_connector_model_runner_mixin.py", "responsibility": "给 GPU/TPU ModelRunner 混入 KV connector 能力的纯静态 mixin。核心是 _get_kv_connector_output：一个把 WORKER-role connector 整条生命周期（bind_connector_metadata→start_load_kv→[yield forward]→wait_for_save→get_finished→build_connector_worker_meta→clear）封装进 context manager，使 load 与 model forward 在物理上交织（compute 期间后台搬 KV）。还含 kv_connector_no_forward（无 token 也要收发 KV）、finalize_kv_connector（spec-decode 推迟收尾）、use_uniform_kv_cache/allocate_uniform_kv_caches（跨层统一 layout，便于整块多层一次性传）。"},
+    {"name": "maybe_transfer_kv_layer", "file": "vllm/model_executor/layers/attention/kv_transfer_utils.py", "responsibility": "装饰 attention 层 forward 的装饰器：进入层前 connector.wait_for_layer_load(layer_name)（确保该层 KV 已 load 到 paged buffer），离开层后 connector.save_kv_layer(...)（把该层 KV 异步搬出）。这是 start_load_kv 之外、forward 内部的逐层 hook —— 让 load/save 能按层流水线，与计算重叠到层粒度。未启用 connector 时是 no-op。"},
+    {"name": "KVConnectorBase_V1 (worker 侧契约)", "file": "vllm/distributed/kv_transfer/kv_connector/v1/base.py", "responsibility": "定义所有 connector 必须实现的 worker 侧抽象方法：start_load_kv（forward 前异步发起 load）、wait_for_layer_load（层内阻塞等该层 load 完）、save_kv_layer（层内异步发起 save）、wait_for_save（forward 收尾前阻塞等所有 save 完，防 paged buffer 被覆盖）；以及非抽象默认的 get_finished（上报异步收/发完成的 req_id）、get_block_ids_with_load_errors、bind/clear_connector_metadata、build_connector_worker_meta。本章三类后端都在填这同一套契约。"},
+    {"name": "P2pNcclConnector", "file": "vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py", "responsibility": "点对点 NCCL 后端，单类自包含（不拆 scheduler/worker 子对象）。靠 is_producer 区分 P/D：producer 在 save_kv_layer 里 extract_kv_from_layer + send_tensor 发，consumer 在 start_load_kv 里逐请求逐层 recv_tensor + inject_kv_into_layer 写回 paged buffer。对端地址直接编码在 request_id 里（parse_request_id 正则解析）。底层 P2pNcclEngine 用 pynccl 建点对点 comm + ZMQ 控制面。"},
+    {"name": "P2pNcclEngine", "file": "vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py", "responsibility": "P2P 后端的实际收发引擎。send_tensor 三模式：PUT（同步发）、PUT_ASYNC（入 send_queue 后台 _send_thread 发）、GET（暂存 send_store 等对端拉，带 LRU 驱逐）。wait_for_sent 在 PUT_ASYNC 下阻塞等 send_queue 排空 —— 这正是 connector.wait_for_save 落到的实处。用 TensorMemoryPool 管缓冲、ZMQ listener 做握手/控制。"},
+    {"name": "NixlConnector / NixlConnectorWorker", "file": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py + nixl/worker.py", "responsibility": "高性能 RDMA 后端，facade 模式：顶层 NixlConnector 按 role 只建 NixlConnectorScheduler 或 NixlConnectorWorker 半边，worker 侧方法全转发给 connector_worker。worker.start_load_kv 对每个待收请求发非阻塞 RDMA READ（make_prepped_xfer('READ')+transfer），D 端主动从 P 端显存单边读 KV，P 端 CPU 不参与拷贝；首遇远端先后台握手交换内存注册元数据。get_finished 轮询：本地 xfer handle 转 DONE 算收完成、收到对端通知算发完成。wait_for_layer_load/save_kv_layer 为 no-op（NIXL 不做逐层、不显式 save）。"},
+    {"name": "OffloadingConnector / OffloadingConnectorWorker", "file": "vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py + offloading/worker.py", "responsibility": "CPU/磁盘卸载后端，同样 facade。但语义有别：它不是 P/D 跨节点搬，而是把 GPU KV 卸到 CPU/磁盘当二级缓存（prefer_cross_layer_blocks=True，整块多层一次性传）。wait_for_save→prepare_store_kv 只把 store job 入队（不真等完成），推迟到下一步 start_kv_transfers 开头才 transfer_async 提交，避免拖慢本步采样。get_finished 只为 load 报 finished_recving，store 完成走 build_connector_worker_meta 的 completed_jobs + 调度侧 jobs_to_flush 围栏，而非 finished_sending。"},
+    {"name": "KVConnectorOutput", "file": "vllm/v1/outputs.py", "responsibility": "worker→scheduler 的回传载体（挂在 ModelRunnerOutput 上）。字段 finished_sending / finished_recving / invalid_block_ids / kv_connector_worker_meta / kv_connector_stats / kv_cache_events。_get_kv_connector_output 在 forward 收尾时由 get_finished 等填充，回到 scheduler 后驱动 ch29 的 _update_from_kv_xfer_finished（finished_recving 触发提升、finished_sending 释放块）。"}
+  ],
+
+  "data_flow": [
+    "execute_model（gpu_model_runner）：若本步无 scheduled token 但有 kv_transfer_group → kv_connector_no_forward（仍要走一遍收发，wait_for_save=False）；否则进入带 forward 的主路径。",
+    "主路径：with set_forward_context(attn_metadata, ...), maybe_get_kv_connector_output(scheduler_output, defer_finalize=spec_decode?) as kv_connector_output: _model_forward(...) —— forward 被夹在 connector context manager 内（compute 与 KV 搬运交织的物理位置）。",
+    "maybe_get_kv_connector_output → has_kv_transfer_group 才进 _get_kv_connector_output，否则 nullcontext（无 connector 零开销）。",
+    "_get_kv_connector_output 进入段：get_kv_transfer_group 取 WORKER-role connector → bind_connector_metadata(scheduler_output.kv_connector_metadata)（吃 ch29 决策侧 build_connector_meta 打包下发的不透明 meta）→ start_load_kv(get_forward_context())（异步发起本步所有 load，立即返回不阻塞）。",
+    "yield → 控制权回到 forward：模型逐层前向。每个 attention 层被 maybe_transfer_kv_layer 装饰：进层前 wait_for_layer_load(layer_name)（阻塞到该层 KV load 完，与前面层的计算重叠）、出层后 save_kv_layer(layer_name, kv_cache, attn_metadata)（异步发起该层 save）。",
+    "forward 结束，context manager finally 段：wait_for_save()（阻塞到所有 save 完，防 paged buffer 在保存前被下一步覆盖；defer_finalize 时跳过、留给 finalize_kv_connector 在 draft forward 后补做）。",
+    "get_finished(scheduler_output.finished_req_ids) → (finished_sending, finished_recving) 填进 output；get_block_ids_with_load_errors 填 invalid_block_ids；build_connector_worker_meta 填 worker meta；clear_connector_metadata 清当前步状态。",
+    "kv_connector_output 随 ModelRunnerOutput 回传 scheduler → 接 ch29 _update_from_kv_xfer_finished：finished_recving 入 finished_recving_kv_req_ids 驱动提升、finished_sending 释放块。【接 ch29 决策侧闭环】",
+    "—— 三类后端如何各自填实同一套 worker 契约 ——",
+    "P2P NCCL：start_load_kv（仅 consumer）逐请求逐层 recv_tensor + inject_kv_into_layer 写回 paged buffer；save_kv_layer（仅 producer）逐层 extract_kv_from_layer + send_tensor（PUT/PUT_ASYNC/GET）；wait_for_save→wait_for_sent 等 send_queue 排空；get_finished 委托引擎。对端地址编码在 request_id 内。",
+    "NIXL RDMA：start_load_kv 逐请求发非阻塞 RDMA READ（先后台握手交换内存注册元数据，再 make_prepped_xfer('READ')+transfer，handle 存 _recving_transfers）；wait_for_layer_load/save_kv_layer 为 no-op（不逐层、不显式 save）；wait_for_save 仅 host buffer 模式才回拷设备；get_finished 轮询 _pop_done_transfers（handle 转 DONE 算收完成）+ _get_new_notifs（对端 READ-done 通知算发完成）。",
+    "Offloading CPU/磁盘：start_load_kv→start_kv_transfers 提交『上一步排队的 store』+『本步 load』的 transfer_async；wait_for_save→prepare_store_kv 只入队 store（推迟到下一步开头发，避免拖慢采样）；get_finished 只为 load 报 finished_recving，store 完成经 build_connector_worker_meta 的 completed_jobs + 调度侧 jobs_to_flush 围栏。"
+  ],
+
+  "design_decisions": [
+    {"decision": "worker 侧整条 connector 生命周期收进一个 context manager（_get_kv_connector_output），把 forward 夹在中间", "why": "load 必须在 forward 开始前发起（start_load_kv）才能与 compute 重叠；save 必须在 forward 结束后、buffer 被覆盖前收齐（wait_for_save）。用 enter/finally 的 context manager 天然表达『前发起、后收尾』这对生命周期边界，且异常路径也保证 wait_for_save/get_finished/clear 一定执行，不漏块、不脏状态。", "evidence": "vllm/v1/worker/kv_connector_model_runner_mixin.py:L81-L119（注释明言 encapsulates the entire KV connector lifecycle within execute_model）"},
+    {"decision": "start_load_kv 在 forward 前异步发起、wait_for_layer_load 在层内才阻塞 —— load 与 compute 重叠", "why": "若 load 同步阻塞到全部 KV 到位再 forward，decode engine 就在干等网络/磁盘，GPU 空转。改为：forward 一开始就异步发起所有 load，模型照常逐层前向，只有真要用到某层 KV 时才 wait_for_layer_load 等那一层 —— 把传输延迟藏进前面层的计算里，理想下隐藏大部分传输时间。", "evidence": "vllm/v1/worker/kv_connector_model_runner_mixin.py:L98-L104（注释 Background KV cache transfers ... designed to be async）+ kv_transfer_utils.py:L50-L57"},
+    {"decision": "wait_for_save 必须存在且阻塞 —— 保存未完成不许结束 forward", "why": "save_kv_layer 是异步发起的；若 forward 直接结束、下一步把这些 paged block 复用/覆盖，正在被异步读出的 KV 就会被改写产生脏数据。wait_for_save 在 context manager 退出前阻塞到所有 save 真正完成，是数据正确性的硬围栏。P2P 的 wait_for_sent（等 send_queue 排空）就是它的落地。", "evidence": "vllm/distributed/kv_transfer/kv_connector/v1/base.py:L352-L361（This prevents overwrites of paged KV buffer before saving done）+ p2p_nccl_engine.py:L486-L498"},
+    {"decision": "本步无 token 也要走一遍 KV 收发（kv_connector_no_forward）", "why": "PD 分离下，一个 engine 可能本步没有任何要计算的请求，但仍可能有正在进行的异步 send/recv 需要推进或收尾（disjoint from running requests）。若无 token 就直接返回 EMPTY，这些传输会卡住。所以即便无 forward 也要进 connector context（wait_for_save=False）跑一遍 get_finished 推进状态。", "evidence": "vllm/v1/worker/kv_connector_model_runner_mixin.py:L37-L55 + gpu_model_runner.py:L3894-L3897"},
+    {"decision": "facade 模式（NIXL/Offloading）vs 单类自包含（P2P）", "why": "NIXL/Offloading 的 scheduler 侧与 worker 侧逻辑都很重（握手拓扑/内存注册 vs 命中查询/job 规划），拆成 connector_scheduler/connector_worker 两个子对象、顶层只按 role 建半边并转发，物理上保证决策侧代码进不了 worker 进程（assert connector_worker is not None）。P2P 逻辑较轻，用 is_producer/role 分支在单类内区分即可。两种风格填的是同一套 KVConnectorBase_V1 契约。", "evidence": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py:L99-L108 + offloading_connector.py:L64-L67 + p2p_nccl_connector.py:L88-L105"},
+    {"decision": "NIXL 用 RDMA 单边 READ（D 主动读 P），且 wait_for_layer_load/save_kv_layer 为 no-op", "why": "RDMA READ 让 decode worker 直接从 prefill worker 显存拉 KV，P 端 CPU/GPU 完全不介入传输（真正零拷贝、跳过 host）。因为是整请求一把 READ、靠 handle 轮询完成，没有逐层 pipeline 的必要，故 wait_for_layer_load 空实现；KV 由 D 端主动读、不存在 P 端『主动 save』动作，故 save_kv_layer 也空（保存=让 D 来读）。", "evidence": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/worker.py:L2096-L2106（make_prepped_xfer 'READ' + transfer）+ connector.py:L246-L258（does not do layerwise saving / does not save explicitly）"},
+    {"decision": "NIXL 首遇远端先后台握手再发 READ", "why": "RDMA 单边读需要先知道对端的内存注册描述符（agent metadata）。第一次给某 remote engine 发请求时 _remote_agents 里没有它，于是 _background_nixl_handshake 后台交换元数据、本请求先挂起，待握手回来再从 _ready_requests 取出补发 READ —— 把握手开销摊到后台、不阻塞调度热路径。", "evidence": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/worker.py:L1863-L1875"},
+    {"decision": "NIXL get_finished 双源：本地 handle 转 DONE = 收完成，对端通知 = 发完成", "why": "RDMA READ 是 D 单边读：D 这边能直接 check_xfer_state(handle) 知道自己读完没（_pop_done_transfers→收完成）；但 P 这边没参与传输，无从知道 D 读完没、何时能释放被读的 block，只能靠 D 读完后 send_notif 通知（_get_new_notifs→发完成）。两个完成信号来源天然不对称。还含 reqs_to_send 超时兜底，防 D 崩了把 P 的块永久占住。", "evidence": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/worker.py:L1658-L1659 + L1732-L1775 + L1710-L1728"},
+    {"decision": "Offloading 的 wait_for_save 只『准备/入队』store，不真等保存完成；store 推迟到下一步", "why": "卸载是把 GPU KV 存到 CPU/磁盘当二级缓存，不在解码关键路径上、不需要立刻完成。若在 wait_for_save 里同步等磁盘写完，会直接拖慢本步的 token 采样。故 prepare_store_kv 只把 job 入 _unsubmitted_store_jobs，留到下一步 start_kv_transfers 开头（采样相关传输之后）才 transfer_async 真发 —— 用调度时机换 ITL。", "evidence": "vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py:L306-L311（NOTE: defer the store to the beginning of the next engine step）+ L295-L304"},
+    {"decision": "Offloading 的 store 完成不走 finished_sending，而走 worker_meta.completed_jobs + jobs_to_flush 围栏", "why": "P/D 场景里 finished_sending 用来通知 scheduler『块发完了可以释放』；但卸载里块不是要释放给别人，而是 GPU 块要被复用前必须确保已落盘。这用一套不同机制：worker 经 build_connector_worker_meta 上报 completed_jobs，调度侧据此在复用前用 jobs_to_flush 等待对应 store 完成（围栏 fence）。所以 get_finished 的 finished_sending 永远空，只为 load 报 finished_recving。", "evidence": "vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py:L313-L344（docstring：Stores never emit finished_sending）+ L346-L352"},
+    {"decision": "defer_finalize（spec-decode）：wait_for_save 推迟到 draft model forward 之后", "why": "投机解码里主模型 forward 后还要跑 draft model；若在主 forward 退出时就 wait_for_save，会在两次 forward 之间插入一段阻塞等待，且 draft 还可能再动 KV。defer_finalize=True 让主 forward 退出时跳过 wait_for_save，由 finalize_kv_connector 在 draft forward 完成后统一补做 wait_for_save+clear。", "evidence": "vllm/v1/worker/kv_connector_model_runner_mixin.py:L70-L79 + L106-L107 + gpu_model_runner.py:L4070（defer_kv_connector_finalize = self.speculative_config is not None）"}
+  ],
+
+  "theory": [
+    "load/compute 重叠的延迟隐藏：设模型 N 层、每层计算时间 t_c、整请求 KV 传输时间 T_xfer。同步方案总时间 ≈ T_xfer + N·t_c。重叠方案下 start_load_kv 在第 0 层前发起，第一次真正阻塞发生在用到 KV 的层的 wait_for_layer_load；只要 T_xfer ≲ Σt_c（传输能藏进前面层计算），总时间 ≈ max(T_xfer, N·t_c) ≈ N·t_c，传输延迟被近乎完全隐藏。逐层粒度（save_kv_layer 边算边发）进一步把 save 也摊进计算。",
+    "三类后端的传输路径与瓶颈对照：P2P NCCL 走 GPU↔GPU 的 NCCL p2p（NVLink/IB），瓶颈是带宽与 send_queue 串行度，对称 TP；NIXL RDMA READ 走网卡单边读对端显存，瓶颈是网络 RTT+带宽，但 P 端 CPU 零参与、支持异构 TP（一个 D 读多个 P rank、或 tp_ratio<0 多读），握手有一次性开销；Offloading 走 GPU↔CPU/磁盘（PCIe/NVMe），不是跨节点而是本地分级缓存，瓶颈是 PCIe/磁盘带宽，靠『推迟到下一步』避开关键路径。",
+    "完成信号的对称性差异：P2P 收发都在本进程引擎内可见（send/recv 各自记账）；NIXL 因 RDMA 单边读而不对称——收方靠轮询本地 handle（DONE），发方靠收对端通知（read-done notif），并需超时兜底防对端失联占块；Offloading 不存在跨进程发方，store 完成纯本地 worker.get_finished 可见，故 finished_sending 恒空、改用 completed_jobs 围栏。理解这点才能读懂为何三者 get_finished 返回值结构不同却都满足同一契约。",
+    "wait_for_save 的正确性论证：paged KV buffer 是被反复复用的物理块。save 异步发起后，若不在 forward 退出前 fence，调度器下一步可能把同一物理块分配给新请求并写入，而异步 save 仍在读这块旧 KV → 读到混合/错乱数据。wait_for_save 把『所有 save 完成』设为 forward 退出的前置条件，等价于在 buffer 复用与异步读之间加一道 happens-before，是 disaggregation 下数据一致性的关键不变式。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "KVConnectorModelRunnerMixin.use_uniform_kv_cache / allocate_uniform_kv_caches 两个方法（mixin L121-L283）", "why_safe": "跨层统一 KV layout（cross-layer blocks）是为『整块多层一次性传』做的物理布局优化，与 worker 生命周期主线（bind→start_load_kv→层 hook→wait_for_save→get_finished）正交。精简版讲清生命周期 context manager 即可，删这两个方法不影响主控制流。"},
+      {"what": "kv_transfer_utils.maybe_transfer_kv_layer 中 inspect.signature 取 layer_name 参数索引的样板（L25-L35）", "why_safe": "纯属把 layer_name 从位置参数里定位出来的工程样板，与『进层前 wait_for_layer_load、出层后 save_kv_layer』的语义无关，精简版直接用固定签名演示 hook 即可。"},
+      {"what": "NIXL worker 的异构 TP / MLA / Mamba-HMA / host buffer / block_size_ratio 分支：_read_blocks_for_req 的 remote_ranks 多读循环与 tp_ratio<0 分支、_read_blocks 的 block_size_ratio>1 重映射段（L2000-L2024）、get_finished 的 host buffer 回拷与块后处理（L1674-L1709）、reqs_to_send 过期回收（L1710-L1728）、所有 _has_mamba/_is_mamba_group 分支", "why_safe": "这些是对称 TP 之外的进阶配置路径（异构并行/MLA 复制/SSM 状态/主机缓冲）。本章讲『同一套 worker 契约的三类填法对照』，NIXL 只需保留对称 TP 下『握手→发 READ→轮询 DONE/通知』主干，删这些分支不破坏 RDMA READ 的契约可读性。must_keep 已锁定 start_load_kv/_read_blocks/get_finished 主干符号。"},
+      {"what": "P2P 引擎的 GET 模式与 send_store LRU 驱逐（send_tensor 的 GET 分支 L260-L306）、ZMQ listener/ping/握手线程细节", "why_safe": "PUT/PUT_ASYNC 已足够展示『同步发 vs 异步入队后台发』与 wait_for_save→wait_for_sent 的配对。GET（暂存待拉+LRU）是第三种传输策略，与本章『worker 契约如何被填实』主线无关；控制面握手是底层网络细节，正文以散文交代即可。"},
+      {"what": "三个 connector 的 stats/metrics/prom 相关方法（get_kv_connector_stats / build_kv_connector_stats / build_prom_metrics / get_kv_connector_kv_cache_events）与对应 worker 内 stats 记账", "why_safe": "纯可观测性扩展点，基类默认 None。删除不影响 load/save/finished 的传输闭环。"},
+      {"what": "P2P save_kv_layer/start_load_kv 中 inject/extract 的 MLA-vs-FlashAttention layout 分支里非默认那一支（保留 FlashAttention 即 layer.shape[0]==2 一支，删 MLA/FlashInfer 一支或反之，二选一）", "why_safe": "两支只是不同 attention 后端沿不同维度切片的差异，与 connector 收发契约无关；精简版保留单一 layout 演示『按 block_ids 提取/写回本请求 KV』思路即可，须保留一支不可全删。"},
+      {"what": "NIXL/Offloading facade 中与 worker 生命周期无关的转发方法：set_xfer_handshake_metadata / get_handshake_metadata / set_host_xfer_buffer_ops / register_cross_layers_kv_cache / handle_preemptions / take_events / get_required_kvcache_layout / prefer_cross_layer_blocks", "why_safe": "这些是特定后端的可选扩展点（握手元数据/主机缓冲/抢占/事件/布局偏好），基类多为 no-op 默认。本章只需保留 __init__ 按 role 建半边 + start_load_kv/wait_for_layer_load/save_kv_layer/wait_for_save/get_finished 五个 worker 契约方法的转发，删这些不破坏 facade 结构可读性。"}
+    ],
+    "must_keep": [
+      {"symbol": "KVConnectorModelRunnerMixin", "why": "本章 worker 侧主类，承载整条生命周期。"},
+      {"symbol": "_get_kv_connector_output", "why": "把 connector 生命周期封进 context manager 的核心，bind→start_load_kv→yield→wait_for_save→get_finished 的骨架必须在精简版可见。"},
+      {"symbol": "maybe_get_kv_connector_output", "why": "has_kv_transfer_group 才进 connector context 的分流入口，无 connector 零开销。"},
+      {"symbol": "bind_connector_metadata", "why": "worker 吃 scheduler 下发的 meta 的入口，承接 ch29 build_connector_meta。"},
+      {"symbol": "start_load_kv", "why": "forward 前异步发起 load，load/compute 重叠的起点，worker 契约第一方法。"},
+      {"symbol": "wait_for_layer_load", "why": "层内阻塞等该层 KV load 完，逐层 pipeline 的关键；读者须理解它与 start_load_kv 的异步—阻塞配对。"},
+      {"symbol": "save_kv_layer", "why": "层内异步发起 save，与 wait_for_layer_load 对称的层 hook。"},
+      {"symbol": "wait_for_save", "why": "forward 收尾前阻塞等所有 save 完，防 paged buffer 被覆盖 —— 数据正确性硬围栏，本章核心不变式。"},
+      {"symbol": "get_finished", "why": "上报异步收/发完成的 req_id，是回传 scheduler 驱动 ch29 提升/释放的源头；三类后端在此体现完成信号差异。"},
+      {"symbol": "clear_connector_metadata", "why": "每步收尾清状态，与 bind 配对保证步间干净。"},
+      {"symbol": "maybe_transfer_kv_layer", "why": "attention 层装饰器，wait_for_layer_load/save_kv_layer 的实际插入点，读者须看到逐层 hook 在哪发生。"},
+      {"symbol": "kv_connector_no_forward", "why": "无 token 也要走收发的特殊路径，体现『传输与 running 请求 disjoint』。"},
+      {"symbol": "P2pNcclConnector", "why": "P2P 后端主类，单类自包含范式。"},
+      {"symbol": "is_producer", "why": "P2P 区分 P/D 角色的开关，决定 save（producer）还是 load（consumer）。"},
+      {"symbol": "inject_kv_into_layer", "why": "P2P consumer 把收到的 KV 写回 paged buffer 的实际动作。"},
+      {"symbol": "extract_kv_from_layer", "why": "P2P producer 从 paged buffer 按 block_ids 切出本请求 KV 的实际动作。"},
+      {"symbol": "send_tensor", "why": "P2P 发送入口，PUT/PUT_ASYNC 体现同步/异步两种语义。"},
+      {"symbol": "recv_tensor", "why": "P2P 接收入口，start_load_kv 逐层调它取 KV。"},
+      {"symbol": "wait_for_sent", "why": "P2P 的 wait_for_save 落地，等 send_queue 排空 —— 异步发为何需要 fence 的实证。"},
+      {"symbol": "NixlConnectorWorker", "why": "NIXL worker 侧实体，facade 转发目标。"},
+      {"symbol": "_read_blocks", "why": "NIXL 发起 RDMA READ（make_prepped_xfer('READ')+transfer）的核心，单边读的实证。"},
+      {"symbol": "_recving_transfers", "why": "存 NIXL xfer handle 待轮询完成的容器，get_finished 据它判收完成。"},
+      {"symbol": "_pop_done_transfers", "why": "NIXL 轮询 handle 转 DONE 判『收完成』，PROC 留着、全 DONE 才报。"},
+      {"symbol": "_get_new_notifs", "why": "NIXL 靠对端通知判『发完成』，体现 RDMA 单边读完成信号的不对称。"},
+      {"symbol": "OffloadingConnectorWorker", "why": "Offloading worker 侧实体。"},
+      {"symbol": "start_kv_transfers", "why": "Offloading 提交 load + 上步排队 store 的 transfer_async。"},
+      {"symbol": "prepare_store_kv", "why": "Offloading 的 wait_for_save 落地，只入队不真发 —— 推迟到下一步避免拖慢采样，本章关键语义差异。"},
+      {"symbol": "transfer_async", "why": "Offloading 实际发起卸载/回载传输的底层调用。"},
+      {"symbol": "KVConnectorOutput", "why": "worker→scheduler 回传载体，finished_sending/finished_recving 字段连回 ch29 闭环。"},
+      {"symbol": "finished_recving", "why": "收完成 req 集合，驱动 ch29 提升 WAITING_FOR_REMOTE_KVS 回 WAITING。"},
+      {"symbol": "finished_sending", "why": "发完成 req 集合，驱动 ch29 释放块；Offloading 恒空体现机制差异。"}
+    ]
+  },
+
+  "diagram_plan": [
+    {"name": "ch30-worker-lifecycle", "kind": "svg-diagram", "spec": "时间轴生命周期泳道图，横轴为时间，纵轴三条：connector 调用 / model forward / 后台传输。标出关键时刻：[bind_connector_metadata] → [start_load_kv 异步发起，立即返回] → forward 开始逐层；后台传输条与 forward 并行（重叠区高亮）；层 i 处画 [wait_for_layer_load(layer_i)]（阻塞到该层 KV 到位）和层结束 [save_kv_layer(layer_i) 异步发起]；forward 结束处 [wait_for_save 阻塞收齐] → [get_finished 填 finished_sending/recving] → [clear]。底部注：这一切被 _get_kv_connector_output context manager 的 enter/finally 夹住；输出 KVConnectorOutput 回传 scheduler（接 ch29）。", "roadmap_highlight": "kv_transfer / worker 侧 model_runner 节点"},
+    {"name": "ch30-three-backends", "kind": "svg-diagram", "spec": "三列对照表图，列=P2P NCCL / NIXL RDMA / Offloading CPU·磁盘，行=结构(单类自包含 vs facade 拆 worker)、start_load_kv(consumer recv_tensor+inject / 发非阻塞 RDMA READ / 提交 load+上步 store 的 transfer_async)、save 路径(producer save_kv_layer send_tensor / no-op，靠 D 来读 / wait_for_save 只入队推迟)、wait_for_save(wait_for_sent 等队空 / 仅 host buffer 回拷 / prepare_store_kv 入队)、get_finished 完成信号(引擎双向记账 / 收=handle DONE·发=对端通知 / 仅 load 报 recving，store 走 completed_jobs 围栏)、传输介质·瓶颈(GPU↔GPU NCCL·带宽 / 网卡单边读·RTT·零拷贝 / GPU↔CPU·磁盘·PCIe)。顶部一行『同一套 KVConnectorBase_V1 worker 契约』横跨三列，强调对照。", "roadmap_highlight": "kv_transfer 子系统：三类 connector 节点"},
+    {"name": "ch30-nixl-read-flow", "kind": "svg-diagram", "spec": "NIXL RDMA READ 单边读时序图，两个泳道 D-worker(decode) 与 P-worker(prefill)。步骤：D.start_load_kv 首遇 P → 后台握手交换内存注册元数据(agent metadata) → 握手回 → D.make_prepped_xfer('READ')+transfer 直接从 P 显存单边读 KV(粗箭头 P显存→D paged buffer，标注 P-CPU 不参与)→ D 后续 step 轮询 check_xfer_state(handle)==DONE → D 读完 send_notif 通知 P → D.get_finished 报 finished_recving、P.get_finished 收到通知报 finished_sending 释放块。旁注超时兜底防 D 失联占块。", "roadmap_highlight": "kv_transfer / NIXL worker 节点"}
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recover": []
+  }
+}

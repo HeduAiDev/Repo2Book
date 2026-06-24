@@ -14,14 +14,14 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch29',
-  slug: 'ch29-pd-disaggregation',
-  focus: 'PD 分离的抽象与调度器集成: 为什么把 prefill 和 decode 拆到不同 engine、KVConnectorBase_V1 的 role-split 契约(KVConnectorRole.SCHEDULER 决策侧 get_num_new_matched_tokens/update_state_after_alloc/build_connector_meta vs WORKER 搬运侧 start_load_kv/wait_for_save)、调度器集成(scheduler 调 connector 查远程命中→请求进 WAITING_FOR_REMOTE_KVS 等远程 KV 传输→隔离到 skipped 队列避队头阻塞→KV 到位提升回 WAITING)、KVConnectorFactory。回收 f12(WAITING_FOR_REMOTE_KVS 阻塞态的完整远程 KV 加载与提升路径)',
+  chapter_id: 'ch30',
+  slug: 'ch30-pd-disaggregation',
+  focus: 'PD 分离的 worker 侧执行与可插拔传输后端: KVConnectorModelRunnerMixin 的 worker 生命周期(pre_forward 绑定 metadata + start_load_kv 异步发起、逐层 save_kv_layer、wait_for_save 收齐)、与 model_runner forward 交织(load 与 compute 重叠)、三类具体传输的对照(P2P NCCL 点对点、NIXL 高性能 RDMA、Offloading CPU/磁盘卸载)如何各自实现同一套 KVConnectorBase_V1 worker 契约。承接 ch29 决策侧契约',
   highlight: 'pd-disaggregation',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
-  paths: ['vllm/distributed/kv_transfer/kv_connector/v1/base.py', 'vllm/v1/core/sched/scheduler.py', 'vllm/distributed/kv_transfer/kv_connector/factory.py', 'vllm/distributed/kv_transfer/kv_connector/v1/example_connector.py'],
+  paths: ['vllm/v1/worker/kv_connector_model_runner_mixin.py', 'vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py', 'vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py', 'vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
