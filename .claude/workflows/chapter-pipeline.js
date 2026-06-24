@@ -14,14 +14,15 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch33',
-  slug: 'ch33-engine-core',
-  focus: '高级引擎运维: (1) 弹性 EP 扩缩状态机(ElasticEPScalingState 的 scale_up/scale_down 各阶段、core.py reinitialize_distributed 不停机重建分布式组、_eep_scale_up_before_kv_init 在 KV init 前扩、专家迁移/DP 维度重分配), 与 ch21 DP wave + ch07 EngineCore 的关系; (2) Responses API 多轮(OpenAIServingResponses 跨轮对话/工具上下文: context.py 保存前轮 output 喂下轮、harmony 格式、有状态会话)。全书 code 章收官',
-  highlight: 'engine-core',
+  chapter_id: 'ch01',
+  slug: 'ch01-config-and-wiring',
+  focus: '全书开篇/导读(meta 概览, 无精简版): vLLM v1 的心智模型(一个请求如何从 API 走到 token)、v1 相比 v0 的关键转变(异步三段式解耦、跨拍持久批次、torch.compile piecewise 编译、分页 KV cache)、离线 LLM vs OpenAI server 两个使用面、本书读法(以真实 vLLM 源码为主线 + 只做减法的可运行精简版作"跑起来看数值"的交叉验证 + 每章开场 Roadmap 定位)、全书地图(8 Part/33 章怎么组织、读者可按需跳读)。绝不泄漏脚手架内部文件名(dossier/impl-notes 等), 概览图用全书地图(无高亮)。【勿讲错, 上轮自核已抓】(a) CompilationMode 枚举(compilation.py:L37)成员只有 NONE=0/STOCK_TORCH_COMPILE=1/DYNAMO_TRACE_ONCE=2/VLLM_COMPILE=3——"piecewise 图切分编译"= VLLM_COMPILE, **CompilationMode 没有 PIECEWISE 成员**; PIECEWISE=1 属另一个枚举 CUDAGraphMode(compilation.py:L60, 分段 CUDA graph 捕获)。别混。(b) embed_excerpts 必须逐字: llm.py:L382 是 usage_context=UsageContext.LLM_CLASS(不是 =usage_context); AsyncLLM output handler 引用内层 output_handler 协程区间 L656-L691',
+  highlight: '',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
-  paths: ['vllm/v1/engine/core.py', 'vllm/distributed/elastic_ep/elastic_state.py', 'vllm/entrypoints/openai/responses/serving.py', 'vllm/entrypoints/openai/responses/context.py'],
+  skip_impl: true,
+  paths: ['vllm/config/vllm.py', 'vllm/engine/arg_utils.py', 'vllm/v1/engine/llm_engine.py', 'vllm/v1/engine/core.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
@@ -131,7 +132,7 @@ writeV = await agent(
   head('writer') +
   '任务：以**真实 vLLM 源码为主线**写 ' + CH + '/narrative/chapter.md（你唯一有权写它）。\n' +
   '读 dossier、implementation、' + REPO + '/instances/vllm/book/bible/voice-guide.md，并跑 `python3 ' + REPO + '/scripts/bible.py due ' + A.chapter_id + '`。\n' +
-  '开场 Roadmap：跑 `python3 ' + REPO + '/instances/vllm/book/assets/roadmap/roadmap.py --highlight ' + HL + ' --out ' + CH + '/diagrams/roadmap.svg`，用 rsvg-convert -z 2 转 PNG（**勿用 ImageMagick convert**，会丢中文/错位），正文引用该 PNG。\n' +
+  '开场 Roadmap：跑 `python3 ' + REPO + '/instances/vllm/book/assets/roadmap/roadmap.py --highlight "' + HL + '" --out ' + CH + '/diagrams/roadmap.svg`，用 rsvg-convert -z 2 转 PNG（**勿用 ImageMagick convert**，会丢中文/错位），正文引用该 PNG。\n' +
   '正文内嵌**真实源码片段**(裁剪无关分支用 `# … 省略 …`)，逐段解读设计决策。' +
   (A.skip_impl
     ? '本章无精简版（方法论/概览章）——以真实源码 + 架构图为主线，不要提"精简版"。\n'

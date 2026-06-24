@@ -74,8 +74,12 @@ def build(highlight: str) -> str:
     L.append(f'<rect width="{w}" height="{h}" fill="white"/>')
     L.append(f'<text x="{w // 2}" y="38" text-anchor="middle" font-size="20" '
              f'font-weight="bold" fill="#0f172a">vLLM v1 请求生命周期 · 全书地图</text>')
+    # 无 highlight（ch01/03 等 meta 导读章）：图是全局鸟瞰，不承诺"你在这里"高亮，
+    # 否则副标题承诺高亮、视觉却无高亮，自相矛盾。有 highlight 才用定位副标题。
+    subtitle = ("你在这里（高亮处为本章所在阶段）" if hl_key
+                else "全程总览（后续各章逐站放大）")
     L.append(f'<text x="{w // 2}" y="62" text-anchor="middle" font-size="13" '
-             f'fill="#64748b">你在这里（高亮处为本章所在阶段）</text>')
+             f'fill="#64748b">{subtitle}</text>')
     hl_x = None
     for i, (key, label, sub) in enumerate(STAGES):
         x = x0 + i * (bw + gap)
