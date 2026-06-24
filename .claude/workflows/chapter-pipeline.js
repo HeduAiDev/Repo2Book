@@ -14,14 +14,14 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch30',
-  slug: 'ch30-pd-disaggregation',
-  focus: 'PD 分离的 worker 侧执行与可插拔传输后端: KVConnectorModelRunnerMixin 的 worker 生命周期(pre_forward 绑定 metadata + start_load_kv 异步发起、逐层 save_kv_layer、wait_for_save 收齐)、与 model_runner forward 交织(load 与 compute 重叠)、三类具体传输的对照(P2P NCCL 点对点、NIXL 高性能 RDMA、Offloading CPU/磁盘卸载)如何各自实现同一套 KVConnectorBase_V1 worker 契约。承接 ch29 决策侧契约',
-  highlight: 'pd-disaggregation',
+  chapter_id: 'ch31',
+  slug: 'ch31-entrypoints',
+  focus: '离线 LLM API: LLM 类的 generate/chat/embed/encode 接口、EngineArgs→LLMEngine。【关键澄清, 勿讲错】默认离线路径用 SyncMPClient(后台进程 EngineCore + ZMQ, 因 VLLM_ENABLE_V1_MULTIPROCESSING 默认 True, llm_engine.py:L165-167 强制 enable_multiprocessing=True); InprocClient(真进程内/无 ZMQ)只是 VLLM_ENABLE_V1_MULTIPROCESSING=0 的回退(测试/调试/V0 风格), 不是默认。与 ch04 AsyncLLM 的真正对比 = 同步阻塞 while step() 驱动(_run_engine) + FINAL_ONLY 批量收集 vs 异步事件循环 + 背景 output_handler + DELTA 流式——该对比对 SyncMPClient 也成立, 不依赖 in-process。请求批量提交与渲染(chat 走 _render_and_run_requests 打包+warning; completion 走 _render_and_add+单独 run 不 warning)、LLMEngine.step() 同步循环、tqdm 进度。Part VIII 离线侧',
+  highlight: 'entrypoints',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
-  paths: ['vllm/v1/worker/kv_connector_model_runner_mixin.py', 'vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py', 'vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py', 'vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py'],
+  paths: ['vllm/entrypoints/llm.py', 'vllm/v1/engine/llm_engine.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'

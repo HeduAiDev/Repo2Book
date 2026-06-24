@@ -1,0 +1,242 @@
+{
+  "chapter": "ch31",
+  "title": "离线 LLM API：LLM 类的 generate/chat/embed/encode 与同步 step() 驱动",
+  "source_pin": "f3fef123",
+  "thesis": "vllm.LLM 是离线批量推理的门面：构造期把所有参数装进 EngineArgs → create_engine_config → LLMEngine.from_engine_args，得到一个【同步】LLMEngine。【关键澄清，勿讲错】离线默认路径用 SyncMPClient——因为 envs.VLLM_ENABLE_V1_MULTIPROCESSING 默认为 True（envs.py:L129/L1109），from_engine_args 据此把 enable_multiprocessing 强翻为 True（llm_engine.py:L165-167），于是 make_client(multiprocess_mode=True, asyncio_mode=False) 返回 SyncMPClient（EngineCore 跑在【后台独立进程】、经 ZMQ 通信、主进程侧有后台收数线程喂阻塞队列）。InprocClient（真·进程内、无 ZMQ、直接 step_fn()）只是 VLLM_ENABLE_V1_MULTIPROCESSING=0 时的回退（测试/调试/V0 风格），不是默认。与 ch04 AsyncLLM 的【真正】对比 = 同步阻塞 while step() 驱动（_run_engine）+ FINAL_ONLY 批量收集 vs 异步事件循环 + 背景 output_handler 协程 + DELTA 流式——该对比对 SyncMPClient 同样成立，不依赖 in-process。generate/chat/embed/encode 最终都汇流到同一条脊：渲染(Renderer)→逐条 _add_request 入队(output_kind=FINAL_ONLY)→_run_engine 的 while has_unfinished_requests: step() 同步驱动→按 request_id 排序收集 finished 输出。",
+
+  "code_spine": [
+    "vllm/entrypoints/llm.py:L212-L408 — LLM.__init__：构造参数归一为 EngineArgs → LLMEngine.from_engine_args(usage_context=LLM_CLASS) → 缓存 model_config/renderer/input_processor/request_counter/supported_tasks/pooling_io_processors",
+    "vllm/entrypoints/llm.py:L381-L383 — self.llm_engine = LLMEngine.from_engine_args(...)：离线侧引擎入口",
+    "vllm/v1/engine/llm_engine.py:L151-L177 — LLMEngine.from_engine_args：create_engine_config→VllmConfig；【关键】envs.VLLM_ENABLE_V1_MULTIPROCESSING(默认True)→强制 enable_multiprocessing=True",
+    "vllm/v1/engine/llm_engine.py:L50-L132 — LLMEngine.__init__：renderer_from_config → InputProcessor → OutputProcessor → EngineCoreClient.make_client(multiprocess_mode, asyncio_mode=False)",
+    "vllm/v1/engine/core_client.py:L80-L103 — EngineCoreClient.make_client：三分支工厂。离线默认 (mp=True, async=False) → SyncMPClient（后台进程 EngineCore + ZMQ）；(mp=False) 回退 → InprocClient（进程内）",
+    "vllm/v1/engine/core_client.py:L716-L796 — SyncMPClient：__init__ 起后台 daemon 线程从 ZMQ output_socket 收 EngineCoreOutputs 入 outputs_queue；get_output() 同步阻塞 outputs_queue.get()",
+    "vllm/v1/engine/core_client.py:L274-L298 — InprocClient（回退）：__init__ 直接 new EngineCore；get_output→step_fn()+post_step；add_request→preprocess+add（无 ZMQ/无后台进程）",
+    "vllm/entrypoints/llm.py:L446-L509 — generate：runner=='generate' 守卫 → 缺省 sampling_params → _run_completion(output_type=RequestOutput)",
+    "vllm/entrypoints/llm.py:L1592-L1651 — _add_completion_requests / _run_completion：completion 路径逐 prompt 渲染并 add（不打 warning）→ _run_engine",
+    "vllm/entrypoints/llm.py:L981-L1073 — chat：runner=='generate' 守卫 → _run_chat",
+    "vllm/entrypoints/llm.py:L1653-L1711 — _run_chat：conversation_to_seq + 逐 conversation 生成器渲染 → _render_and_run_requests",
+    "vllm/entrypoints/llm.py:L1760-L1787 — _render_and_run_requests：若 prompts 已物化成 list/tuple 则 warning_once（建议传生成器流水渲染）→ _render_and_add_requests → _run_engine",
+    "vllm/entrypoints/llm.py:L1789-L1837 — _render_and_add_requests / _add_request：遍历提交；SamplingParams.output_kind=FINAL_ONLY、自增 request_id、llm_engine.add_request；异常时 abort 已加项",
+    "vllm/entrypoints/llm.py:L1075-L1160 — encode：pooling 守卫 → io_processor.pre_process_offline → _render_and_add_requests → _run_engine(PoolingRequestOutput) → post_process_offline",
+    "vllm/entrypoints/llm.py:L1223-L1266 — embed：encode(pooling_task='embed') → EmbeddingRequestOutput.from_base",
+    "vllm/v1/engine/llm_engine.py:L209-L285 — LLMEngine.add_request：input_processor.process_inputs → output_processor.add_request + engine_core.add_request；n>1 走 ParentRequest 扇出",
+    "vllm/entrypoints/llm.py:L1839-L1892 — _run_engine：【核心】同步阻塞 while has_unfinished_requests(): step()；tqdm 进度+toks/s；收集 finished；按 request_id 排序返回",
+    "vllm/v1/engine/llm_engine.py:L287-L325 — LLMEngine.step：get_output()（SyncMPClient 阻塞取队列）→ output_processor.process_outputs → abort 停止串触发的请求 → 记 stats"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm/entrypoints/llm.py",
+      "lines": "L381-L399",
+      "code": "        self.llm_engine = LLMEngine.from_engine_args(\n            engine_args=engine_args, usage_context=UsageContext.LLM_CLASS\n        )\n        self.model_config = self.llm_engine.model_config\n        self.engine_class = type(self.llm_engine)\n\n        self.request_counter = Counter()\n        self.default_sampling_params: dict[str, Any] | None = None\n\n        supported_tasks = self.llm_engine.get_supported_tasks()\n        self.supported_tasks = supported_tasks\n        self.pooling_task = self.model_config.get_pooling_task(supported_tasks)\n        if self.pooling_task is not None:\n            logger.info(\"Supported pooling task: %s\", self.pooling_task)\n\n        self.runner_type = self.model_config.runner_type\n        self.renderer = self.llm_engine.renderer\n        self.chat_template = load_chat_template(chat_template)\n        self.input_processor = self.llm_engine.input_processor",
+      "elide": [
+        "L212-L380 的 __init__ 形参（数十个）与配置归一化（swap_space 弃用、worker_cls cloudpickle、kv_transfer_config/compilation_config/structured_outputs 的 _make_config 转换）只为把零散参数拼成 EngineArgs，正文一句带过即可：'LLM 把构造参数收拢成 EngineArgs'。",
+        "L400-L408 chat_template_config / pooling_io_processors / _cached_repr 初始化与本章主线（同步驱动）弱相关，可略。"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/llm_engine.py",
+      "lines": "L151-L177",
+      "code": "    @classmethod\n    def from_engine_args(\n        cls,\n        engine_args: EngineArgs,\n        usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,\n        stat_loggers: list[StatLoggerFactory] | None = None,\n        enable_multiprocessing: bool = False,\n    ) -> \"LLMEngine\":\n        \"\"\"Creates an LLM engine from the engine arguments.\"\"\"\n\n        # Create the engine configs.\n        vllm_config = engine_args.create_engine_config(usage_context)\n        executor_class = Executor.get_class(vllm_config)\n\n        if envs.VLLM_ENABLE_V1_MULTIPROCESSING:\n            logger.debug(\"Enabling multiprocessing for LLMEngine.\")\n            enable_multiprocessing = True\n\n        # Create the LLMEngine.\n        return cls(\n            vllm_config=vllm_config,\n            executor_class=executor_class,\n            log_stats=not engine_args.disable_log_stats,\n            usage_context=usage_context,\n            stat_loggers=stat_loggers,\n            multiprocess_mode=enable_multiprocessing,\n        )",
+      "elide": [
+        "形参默认 enable_multiprocessing=False 是【误导性】的——真实默认路径靠 envs.VLLM_ENABLE_V1_MULTIPROCESSING（默认 True，见 envs.py:L129/L1109-1110）把它强翻为 True。这是【关键澄清】的源码锚点：离线默认 multiprocess_mode=True，必须讲清，切勿据形参默认误判为 InprocClient。"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/llm_engine.py",
+      "lines": "L103-L110",
+      "code": "        # EngineCore (gets EngineCoreRequests and gives EngineCoreOutputs)\n        self.engine_core = EngineCoreClient.make_client(\n            multiprocess_mode=multiprocess_mode,\n            asyncio_mode=False,\n            vllm_config=vllm_config,\n            executor_class=executor_class,\n            log_stats=self.log_stats,\n        )",
+      "elide": [
+        "asyncio_mode=False 是离线侧与 ch04 AsyncLLM（asyncio_mode=True）的硬分叉点：同步引擎绝不进 asyncio 事件循环。multiprocess_mode 由上游 from_engine_args 传入，默认 True。"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/core_client.py",
+      "lines": "L80-L103",
+      "code": "    @staticmethod\n    def make_client(\n        multiprocess_mode: bool,\n        asyncio_mode: bool,\n        vllm_config: VllmConfig,\n        executor_class: type[Executor],\n        log_stats: bool,\n    ) -> \"EngineCoreClient\":\n        # TODO: support this for debugging purposes.\n        if asyncio_mode and not multiprocess_mode:\n            raise NotImplementedError(\n                \"Running EngineCore in asyncio without multiprocessing \"\n                \"is not currently supported.\"\n            )\n\n        if multiprocess_mode and asyncio_mode:\n            return EngineCoreClient.make_async_mp_client(\n                vllm_config, executor_class, log_stats\n            )\n\n        if multiprocess_mode and not asyncio_mode:\n            return SyncMPClient(vllm_config, executor_class, log_stats)\n\n        return InprocClient(vllm_config, executor_class, log_stats)",
+      "elide": [
+        "离线默认命中倒数第二个分支：(multiprocess_mode=True, asyncio_mode=False) → SyncMPClient。最后一行 InprocClient 只有 multiprocess_mode=False 才到达（VLLM_ENABLE_V1_MULTIPROCESSING=0 回退）。make_async_mp_client（L105-L130）的 DP 分支（DPAsyncMPClient/DPLBAsyncMPClient）是 ch04/数据并行侧，本章只需指出 (mp,sync)→SyncMPClient。类 docstring（L74-L78）一句话点明：SyncMPClient='ZMQ + background proc EngineCore (for LLM)'，InprocClient='In process EngineCore (for V0-style LLMEngine use)'。"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/core_client.py",
+      "lines": "L716-L796 (节选)",
+      "code": "class SyncMPClient(MPClient):\n    \"\"\"Synchronous client for multi-proc EngineCore.\"\"\"\n\n    def __init__(self, vllm_config, executor_class, log_stats):\n        super().__init__(asyncio_mode=False, vllm_config=vllm_config,\n                         executor_class=executor_class, log_stats=log_stats)\n        self.outputs_queue = queue.Queue[EngineCoreOutputs | Exception]()\n        ...\n        def process_outputs_socket():\n            ...\n            while True:\n                socks = poller.poll()\n                ...\n                frames = out_socket.recv_multipart(copy=False)\n                outputs: EngineCoreOutputs = decoder.decode(frames)\n                ...\n                outputs_queue.put_nowait(outputs)\n            ...\n        # Process outputs from engine in separate thread.\n        self.output_queue_thread = Thread(\n            target=process_outputs_socket,\n            name=\"EngineCoreOutputQueueThread\", daemon=True)\n        self.output_queue_thread.start()\n\n    def get_output(self) -> EngineCoreOutputs:\n        outputs = self.outputs_queue.get()\n        if isinstance(outputs, Exception):\n            raise self._format_exception(outputs) from None\n        ...\n        return outputs\n\n    def add_request(self, request: EngineCoreRequest) -> None:\n        ...\n        self._send_input(EngineCoreRequestType.ADD, request)",
+      "elide": [
+        "SyncMPClient.get_output 是 outputs_queue.get() —— 一个【同步阻塞】的线程安全队列取数；队列由后台 daemon 线程 process_outputs_socket 从 ZMQ output_socket 收 EngineCoreOutputs 后 put 进来。这条线区分 ch04：AsyncLLM 是 asyncio 后台 output_handler 协程 + DELTA 流式；这里是后台线程喂队列 + 主线程 step() 阻塞取 + FINAL_ONLY 批量收。两者都跨进程（EngineCore 在后台进程），区别在主进程侧是阻塞线程队列还是事件循环协程。L731-L784 线程/socket 建立细节、L798-L810 _send_input ZMQ 多帧细节可略（ch05/ch06 已细讲字节标签协议）。"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/core_client.py",
+      "lines": "L274-L298",
+      "code": "class InprocClient(EngineCoreClient):\n    \"\"\"\n    InprocClient: client for in-process EngineCore. Intended\n    for use in LLMEngine for V0-style add_request() and step()\n        EngineCore setup in this process (no busy loop).\n\n        * pushes EngineCoreRequest directly into the EngineCore\n        * pulls EngineCoreOutputs by stepping the EngineCore\n    \"\"\"\n\n    def __init__(self, *args, **kwargs):\n        self.engine_core = EngineCore(*args, **kwargs)\n\n    def get_output(self) -> EngineCoreOutputs:\n        outputs, model_executed = self.engine_core.step_fn()\n        self.engine_core.post_step(model_executed=model_executed)\n        return outputs and outputs.get(0) or EngineCoreOutputs()\n\n    def add_request(self, request: EngineCoreRequest) -> None:\n        req, request_wave = self.engine_core.preprocess_add_request(request)\n        self.engine_core.add_request(req, request_wave)",
+      "elide": [
+        "用于【对照澄清】：InprocClient 才是'真·进程内、无 ZMQ'（get_output 直接调 engine_core.step_fn()，无后台进程/无序列化）。但它只在 VLLM_ENABLE_V1_MULTIPROCESSING=0 时回退使用，不是离线默认。务必讲清这是回退而非默认，避免重蹈'离线=进程内'的误判。L299-L333 其余转发方法可略。"
+      ]
+    },
+    {
+      "path": "vllm/entrypoints/llm.py",
+      "lines": "L446-L509",
+      "code": "    def generate(\n        self,\n        prompts: PromptType | Sequence[PromptType],\n        sampling_params: SamplingParams | Sequence[SamplingParams] | None = None,\n        *,\n        use_tqdm: bool | Callable[..., tqdm] = True,\n        lora_request=None,\n        priority: list[int] | None = None,\n        tokenization_kwargs: dict[str, Any] | None = None,\n        mm_processor_kwargs: dict[str, Any] | None = None,\n    ) -> list[RequestOutput]:\n        runner_type = self.model_config.runner_type\n        if runner_type != \"generate\":\n            raise ValueError(\n                \"LLM.generate() is only supported for generative models. \"\n                \"Try passing `--runner generate` to use the model as a \"\n                \"generative model.\"\n            )\n\n        if sampling_params is None:\n            sampling_params = self.get_default_sampling_params()\n\n        return self._run_completion(\n            prompts=prompts,\n            params=sampling_params,\n            output_type=RequestOutput,\n            use_tqdm=use_tqdm,\n            lora_request=lora_request,\n            tokenization_kwargs=tokenization_kwargs,\n            priority=priority,\n            mm_processor_kwargs=mm_processor_kwargs,\n        )",
+      "elide": [
+        "docstring（L457-L488）可压缩为一句。runner_type 守卫在 generate/chat/encode 三处同构（generate/chat 要 'generate'，encode 要 'pooling'），讲一处即可。"
+      ]
+    },
+    {
+      "path": "vllm/entrypoints/llm.py",
+      "lines": "L1628-L1651",
+      "code": "    def _run_completion(\n        self, prompts, params, output_type: type[_O], *,\n        use_tqdm: bool | Callable[..., tqdm] = True,\n        lora_request=None, priority=None,\n        tokenization_kwargs=None, mm_processor_kwargs=None,\n    ):\n        self._add_completion_requests(\n            prompts=prompts, params=params, use_tqdm=use_tqdm,\n            lora_request=lora_request, priority=priority,\n            tokenization_kwargs=tokenization_kwargs,\n            mm_processor_kwargs=mm_processor_kwargs,\n        )\n        return self._run_engine(use_tqdm=use_tqdm, output_type=output_type)",
+      "elide": [
+        "completion 路径直接 _add_completion_requests（L1592-1626：prompt_to_seq 拆批、生成器逐条 _preprocess_cmpl_one 渲染、maybe_tqdm 'Rendering prompts'），【不】经 _render_and_run_requests，所以不打印那条物化 warning——这是与 chat 路径的关键对照点。"
+      ]
+    },
+    {
+      "path": "vllm/entrypoints/llm.py",
+      "lines": "L1760-L1787",
+      "code": "    def _render_and_run_requests(\n        self,\n        prompts: Iterable[EngineInput],\n        params: Sequence[SamplingParams | PoolingParams],\n        output_type: type[_O],\n        *,\n        lora_requests=None, priorities=None,\n        use_tqdm: bool | Callable[..., tqdm] = True,\n    ):\n        if isinstance(prompts, (list, tuple)):\n            logger.warning_once(\n                \"Rendering all prompts before adding them to the engine \"\n                \"is less efficient than performing both on the same prompt \"\n                \"before processing the next prompt. You should instead pass \"\n                \"a generator that renders one prompt per iteration, as that allows \"\n                \"engine execution to begin for the first prompt while processing \"\n                \"the next prompt.\"\n            )\n\n        self._render_and_add_requests(\n            prompts=prompts, params=params,\n            lora_requests=lora_requests, priorities=priorities,\n        )\n\n        return self._run_engine(output_type, use_tqdm=use_tqdm)",
+      "elide": [
+        "chat 路径（_run_chat, L1688-1711）传入的是逐 conversation 渲染的【生成器】，故正常不触发 warning；warning_once 只在调用方把 prompts 提前物化成 list/tuple 时打印。这正是题目要求讲清的 'chat 走 _render_and_run_requests 打包+warning' 的真实语义。"
+      ]
+    },
+    {
+      "path": "vllm/entrypoints/llm.py",
+      "lines": "L1789-L1837",
+      "code": "    def _render_and_add_requests(\n        self, prompts, params, *, lora_requests=None, priorities=None,\n    ) -> list[str]:\n        added_request_ids: list[str] = []\n        try:\n            for i, prompt in enumerate(prompts):\n                request_id = self._add_request(\n                    prompt, params[i],\n                    lora_request=self._resolve_mm_lora(\n                        prompt,\n                        None if lora_requests is None else lora_requests[i]),\n                    priority=0 if priorities is None else priorities[i],\n                )\n                added_request_ids.append(request_id)\n        except Exception as e:\n            if added_request_ids:\n                self.llm_engine.abort_request(added_request_ids, internal=True)\n            raise e\n        return added_request_ids\n\n    def _add_request(\n        self, prompt, params, lora_request=None, priority=0,\n    ) -> str:\n        if isinstance(params, SamplingParams):\n            # We only care about the final output\n            params.output_kind = RequestOutputKind.FINAL_ONLY\n        request_id = str(next(self.request_counter))\n        return self.llm_engine.add_request(\n            request_id, prompt, params,\n            lora_request=lora_request, priority=priority,\n        )",
+      "elide": [
+        "_resolve_mm_lora（L594-L644，多模态默认 LoRA 选择）属边角，正文可略或一句带过。核心两点：(1) 批量逐个 add，任一失败就 abort 已加的（事务性回滚）；(2) 离线把 output_kind 强设为 FINAL_ONLY——只要最终结果、不要增量 DELTA，是与 ch04 流式 DELTA 的关键对照。"
+      ]
+    },
+    {
+      "path": "vllm/entrypoints/llm.py",
+      "lines": "L1839-L1892",
+      "code": "    def _run_engine(\n        self, output_type, *, use_tqdm: bool | Callable[..., tqdm] = True,\n    ) -> list[_O]:\n        if use_tqdm:\n            num_requests = self.llm_engine.get_num_unfinished_requests()\n            tqdm_func = use_tqdm if callable(use_tqdm) else tqdm\n            pbar = tqdm_func(\n                total=num_requests, desc=\"Processed prompts\",\n                dynamic_ncols=True,\n                postfix=(f\"est. speed input: {0:.2f} toks/s, output: {0:.2f} toks/s\"),\n            )\n\n        outputs: list[_O] = []\n        total_in_toks = 0\n        total_out_toks = 0\n        while self.llm_engine.has_unfinished_requests():\n            step_outputs = self.llm_engine.step()\n            for output in step_outputs:\n                assert isinstance(output, output_type)\n                if output.finished:\n                    outputs.append(output)\n                    if use_tqdm:\n                        if isinstance(output, RequestOutput):\n                            n = len(output.outputs)\n                            total_in_toks += len(output.prompt_token_ids) * n\n                            in_spd = total_in_toks / pbar.format_dict[\"elapsed\"]\n                            total_out_toks += sum(\n                                len(stp.token_ids) for stp in output.outputs)\n                            out_spd = total_out_toks / pbar.format_dict[\"elapsed\"]\n                            pbar.postfix = (f\"est. speed input: {in_spd:.2f} toks/s, \"\n                                            f\"output: {out_spd:.2f} toks/s\")\n                            pbar.update(n)\n                        else:\n                            pbar.update(1)\n                        if pbar.n == num_requests:\n                            pbar.refresh()\n\n        if use_tqdm:\n            pbar.close()\n        # Sort the outputs by request ID.\n        return sorted(outputs, key=lambda x: int(x.request_id))",
+      "elide": [
+        "tqdm 的 toks/s 估算块可在正文裁掉 RequestOutput 分支细节、保留 'while has_unfinished_requests(): step()' 这条同步驱动主干。最后 sorted(by request_id) 必讲：请求可能乱序完成，离线 API 按提交序还原（与 _add_request 自增 id 配套）。"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/llm_engine.py",
+      "lines": "L287-L325",
+      "code": "    def step(self) -> list[RequestOutput | PoolingRequestOutput]:\n        if self.should_execute_dummy_batch:\n            self.should_execute_dummy_batch = False\n            self.engine_core.execute_dummy_batch()\n            return []\n\n        # 1) Get EngineCoreOutput from the EngineCore.\n        outputs = self.engine_core.get_output()\n\n        # 2) Process EngineCoreOutputs.\n        iteration_stats = IterationStats() if self.log_stats else None\n        processed_outputs = self.output_processor.process_outputs(\n            outputs.outputs,\n            engine_core_timestamp=outputs.timestamp,\n            iteration_stats=iteration_stats,\n        )\n        self.output_processor.update_scheduler_stats(outputs.scheduler_stats)\n\n        # 3) Abort any reqs that finished due to stop strings.\n        self.engine_core.abort_requests(processed_outputs.reqs_to_abort)\n\n        # 4) Record stats\n        ...\n\n        return processed_outputs.request_outputs",
+      "elide": [
+        "should_execute_dummy_batch 是数据并行专用分支（DP 时空跑一拍对齐），非 DP 场景恒 False，正文可一句注明或略。L311-L323 record_stats 块裁成 '...'（依赖 logger_manager/scheduler_stats，与主线弱相关）。record_function_or_nullcontext 是 torch profiler 包裹，正文已删，只讲 4 步：取输出→process_outputs(去token化/装配 RequestOutput)→abort 停止串触发的请求→记 stats。第 2 步把 ch08-ch10 的 OutputProcessor 串进来（前序已细讲），此处只点其在 step 中的位置。"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/llm_engine.py",
+      "lines": "L209-L285",
+      "code": "    def add_request(\n        self, request_id: str, prompt, params, ...\n    ) -> str:\n        if not isinstance(request_id, str):\n            raise TypeError(f\"request_id must be a string, got {type(request_id)}\")\n\n        if isinstance(prompt, EngineCoreRequest):\n            ...  # deprecated path (v0.18 移除)\n        else:\n            request = self.input_processor.process_inputs(\n                request_id, prompt, params,\n                supported_tasks=self.get_supported_tasks(), ...,\n            )\n            prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)\n\n        self.input_processor.assign_request_id(request)\n        req_id = request.request_id\n        params = request.params\n        n = params.n if isinstance(params, SamplingParams) else 1\n\n        if n == 1:\n            self.output_processor.add_request(request, prompt_text, None, 0)\n            self.engine_core.add_request(request)\n            return req_id\n\n        # Fan out child requests (for n>1).\n        parent_req = ParentRequest(request)\n        for idx in range(n):\n            request_id, child_params = parent_req.get_child_info(idx)\n            child_request = request if idx == n - 1 else copy(request)\n            child_request.request_id = request_id\n            child_request.sampling_params = child_params\n            self.output_processor.add_request(child_request, prompt_text, parent_req, idx)\n            self.engine_core.add_request(child_request)\n        return req_id",
+      "elide": [
+        "L226-L239 的 EngineCoreRequest 弃用分支（warning_once，v0.18 移除）正文可略。核心：每请求双注册——output_processor.add_request（建 RequestState 用于去 token 化/装配）+ engine_core.add_request（送进后台 EngineCore 调度，SyncMPClient 经 ZMQ）；n>1 时 ParentRequest 扇出子请求（并行采样，ch04/ch06 已讲，此处只点其复用）。"
+      ]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "LLM", "file": "vllm/entrypoints/llm.py", "responsibility": "离线推理门面。构造时拼 EngineArgs 起 LLMEngine；对外暴露 generate/chat/embed/encode/classify/score 等任务方法；内部把'渲染→批量提交→同步 _run_engine 驱动→按 request_id 排序'统一成一条流水。持有 request_counter（自增 id）、renderer、input_processor、pooling_io_processors。"},
+    {"name": "LLMEngine", "file": "vllm/v1/engine/llm_engine.py", "responsibility": "v1 同步引擎（注释为 'Legacy LLMEngine for backwards compatibility'，但仍是 LLM 离线默认引擎）。from_engine_args 建 VllmConfig 并据 VLLM_ENABLE_V1_MULTIPROCESSING 决定 multiprocess_mode（默认 True）；持有 renderer/InputProcessor/OutputProcessor/EngineCoreClient；核心方法 add_request() 和同步 step()（无 asyncio、无后台 output_handler 协程）。"},
+    {"name": "EngineCoreClient (make_client 工厂)", "file": "vllm/v1/engine/core_client.py", "responsibility": "抽象客户端，make_client 按 (multiprocess_mode, asyncio_mode) 三分支选实现。离线默认 (True, False)→SyncMPClient（ZMQ+后台进程 EngineCore，get_output 阻塞取队列）；VLLM_ENABLE_V1_MULTIPROCESSING=0 回退 (False,False)→InprocClient（真进程内、无 ZMQ、直接 step_fn()）；(True,True)→AsyncMP（ch04）。"},
+    {"name": "SyncMPClient", "file": "vllm/v1/engine/core_client.py", "responsibility": "【离线默认】EngineCore 客户端。__init__ 起后台 daemon 线程从 ZMQ output_socket 收 EngineCoreOutputs 入 outputs_queue；get_output() 同步阻塞 outputs_queue.get()；add_request 经 ZMQ 字节标签协议 _send_input(ADD,...) 送往后台 EngineCore 进程。是 ch04 AsyncMPClient 的同步对照面。"},
+    {"name": "InprocClient", "file": "vllm/v1/engine/core_client.py", "responsibility": "进程内 EngineCore 回退实现（V0 风格）。无 ZMQ/无后台进程：get_output 直接 engine_core.step_fn()+post_step()，add_request 直接 preprocess+add。仅在 VLLM_ENABLE_V1_MULTIPROCESSING=0（测试/调试）时使用，【非默认】——本章必须澄清的反直觉点。"}
+  ],
+
+  "data_flow": [
+    "1. LLM.__init__ → 归一化参数为 EngineArgs → LLMEngine.from_engine_args (llm.py:L381)",
+    "2. from_engine_args: create_engine_config()→VllmConfig；envs.VLLM_ENABLE_V1_MULTIPROCESSING(默认True)→enable_multiprocessing=True (llm_engine.py:L165-167)",
+    "3. LLMEngine.__init__: 建 renderer/InputProcessor/OutputProcessor + EngineCoreClient.make_client(mp=True, async=False) (llm_engine.py:L90-110)",
+    "4. make_client: (True,False)→SyncMPClient（后台进程 EngineCore + ZMQ + 后台收数 daemon 线程喂 outputs_queue）(core_client.py:L100-101)",
+    "5. 用户调 generate(prompts, sampling_params)：runner_type=='generate' 守卫 + 默认采样参数 (llm.py:L489-498)",
+    "6. _run_completion → _add_completion_requests：prompt_to_seq 拆批，逐 prompt 经生成器 _preprocess_cmpl_one 渲染（不打 warning）(llm.py:L1605-1626)",
+    "7. _render_and_add_requests：遍历 _add_request → output_kind=FINAL_ONLY、自增 request_id、llm_engine.add_request；异常则 abort 已加请求 (llm.py:L1799-1816, L1825-1837)",
+    "8. LLMEngine.add_request：input_processor.process_inputs → output_processor.add_request + engine_core.add_request(经 SyncMPClient ZMQ 送后台 EngineCore)；n>1 走 ParentRequest 扇出 (llm_engine.py:L240-285)",
+    "9. _run_engine：建 tqdm（total=未完成数）；while llm_engine.has_unfinished_requests(): step() —— 同步阻塞主循环 (llm.py:L1846-1861)",
+    "10. LLMEngine.step：engine_core.get_output()（SyncMPClient 阻塞 outputs_queue.get()，数据由后台线程从 ZMQ 喂）→ output_processor.process_outputs（去 token 化、装配 RequestOutput）→ abort 停止串触发的请求 (llm_engine.py:L293-309)",
+    "11. _run_engine：收集 output.finished 的结果，更新 tqdm toks/s；循环至无未完成请求 (llm.py:L1862-1885)",
+    "12. 返回前 sorted(outputs, key=request_id)：还原提交序（请求可能乱序完成）(llm.py:L1892)",
+    "chat 变体：步 6 改走 _run_chat→conversation_to_seq→逐 conversation 生成器渲染→_render_and_run_requests（若 prompts 被物化成 list/tuple 才打 warning_once 建议传生成器）→同上 _render_and_add_requests + _run_engine (llm.py:L1673-1711, L1770-1787)",
+    "encode/embed 变体：步 5-7 改走 io_processor 预处理 → _render_and_add_requests → _run_engine(output_type=PoolingRequestOutput)；embed 再 EmbeddingRequestOutput.from_base 包一层 (llm.py:L1129-1160, L1257-1266)"
+  ],
+
+  "design_decisions": [
+    {"decision": "离线默认走 SyncMPClient（后台进程 EngineCore + ZMQ），而非进程内 InprocClient", "why": "envs.VLLM_ENABLE_V1_MULTIPROCESSING 默认 True，from_engine_args 据此把 enable_multiprocessing 强翻为 True；EngineCore 跑在独立后台进程，主进程经 ZMQ 通信。InprocClient（真进程内、无 ZMQ）只是 VLLM_ENABLE_V1_MULTIPROCESSING=0 的回退（测试/调试/V0 风格）。这是反直觉的关键澄清：'同步 LLM' ≠ '进程内引擎'。", "evidence": "vllm/v1/engine/llm_engine.py:L165-167 + vllm/envs.py:L129,L1109-1110 + vllm/v1/engine/core_client.py:L100-103"},
+    {"decision": "与 ch04 AsyncLLM 的真正区别 = 同步阻塞 while step() 驱动 + FINAL_ONLY 批量收集，vs 异步事件循环 + 后台 output_handler 协程 + DELTA 流式", "why": "该对比对 SyncMPClient 同样成立、不依赖 in-process：离线侧 _run_engine 用 while has_unfinished_requests(): step() 阻塞拉动 EngineCore（SyncMPClient.get_output 是 outputs_queue.get() 阻塞取，后台是收数线程而非 asyncio 协程）；_add_request 把 output_kind 设 FINAL_ONLY 只要最终结果。ch04 则是 asyncio 事件循环 + 背景 output_handler 协程逐步推 DELTA 流式 token。", "evidence": "vllm/entrypoints/llm.py:L1827(FINAL_ONLY),L1860-1861(while step) + vllm/v1/engine/core_client.py:L786-796(SyncMPClient.get_output 阻塞) vs ch04 AsyncLLM output_handler"},
+    {"decision": "completion 与 chat 走不同内部路径：completion 走 _render_and_add（逐 prompt 渲染+add，无 warning），chat 走 _render_and_run_requests（含物化 warning）", "why": "chat 经 _run_chat 传入逐 conversation 渲染的生成器，_render_and_run_requests 检测到若 prompts 被提前物化成 list/tuple 才 warning_once，提示'传生成器可让首个 prompt 的引擎执行与后续渲染重叠'。completion 路径直接 _add_completion_requests 不经此检查，故不打 warning。", "evidence": "vllm/entrypoints/llm.py:L1642-1651(completion) vs L1688-1711(chat→_render_and_run_requests) + L1770-1778(warning_once)"},
+    {"decision": "_add_request 把 SamplingParams.output_kind 强设 FINAL_ONLY", "why": "离线 API 一次性返回完整结果列表，无需增量；FINAL_ONLY 让 OutputProcessor 只在请求 finished 时产出 RequestOutput，避免逐 token DELTA 的开销与缓冲。与 ch08-ch10 的去 token 化/增量装配呼应。", "evidence": "vllm/entrypoints/llm.py:L1825-1827"},
+    {"decision": "_run_engine 末尾按 int(request_id) 排序返回", "why": "请求并发执行、可能乱序完成（短请求先 finished）；request_counter 给提交序分配自增 id，最后排序还原输入顺序，保证 generate 返回列表与 prompts 输入一一对应。", "evidence": "vllm/entrypoints/llm.py:L1829(自增id),L1889-1892(sorted)"},
+    {"decision": "批量提交具事务性：_render_and_add_requests 任一请求 add 失败即 abort 已加的全部", "why": "防止半批请求悬挂在 EngineCore（部分已入调度、部分未入），用 try/except + abort_request(internal=True) 回滚，保证 add 阶段的原子语义。", "evidence": "vllm/entrypoints/llm.py:L1799-1814"},
+    {"decision": "n>1（并行采样）在 LLMEngine.add_request 处 ParentRequest 扇出子请求", "why": "离线侧不在 entrypoint 处理 n>1，而是下沉到 add_request：建 ParentRequest，按 n 拆出子请求各自 output_processor.add_request + engine_core.add_request。复用 ch04/ch06 的并行采样机制，entrypoint 无感。", "evidence": "vllm/v1/engine/llm_engine.py:L261-285"}
+  ],
+
+  "theory": [
+    "同步驱动的吞吐含义：_run_engine 是单线程 while 循环，每个 step() 阻塞等一拍 EngineCore 输出。但批内所有请求由后台 EngineCore 连续批处理（continuous batching）一起前进，所以离线吞吐来自'一次提交大批 prompt'（docstring 明确建议 put all prompts into a single list），而非多线程并发——主循环阻塞期间 GPU 满载跑整批。",
+    "FINAL_ONLY vs DELTA 的开销差：FINAL_ONLY 下 OutputProcessor 只在 finished 装配一次完整文本；DELTA（ch04 流式）每步推增量、需维护增量去 token 化状态。离线选 FINAL_ONLY 省去逐步装配/传输开销，契合'拿完整结果'语义。",
+    "SyncMPClient 的'同步'本质：主线程 step→get_output→outputs_queue.get() 阻塞；后台 daemon 线程独立从 ZMQ output_socket 收 EngineCoreOutputs 入队。这是'后台线程喂队列 + 主线程阻塞取'的生产者-消费者，区别于 ch04 的 asyncio 协程模型。两者都跨进程（EngineCore 在后台进程），区别仅在主进程侧是阻塞线程队列还是事件循环协程——所以同步 vs 异步的对比不依赖 in-process。",
+    "排序还原的必要性（复杂度）：完成顺序由各请求生成长度/调度决定，与提交序无关；O(n log n) 排序把乱序完成的 n 个输出按提交序还原，是离线 API 顺序保证的代价。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "LLM.__init__ 中 L259-L380 的参数归一化细节（swap_space 弃用警告、worker_cls cloudpickle、kv_transfer_config/compilation_config/structured_outputs 的 _make_config 转换、数十个构造形参的展开）", "why_safe": "纯参数装配，与'同步驱动 + 批量渲染提交'主线无关；精简版保留 __init__ 调用 LLMEngine.from_engine_args 这一句骨架即可，读者只需知道 LLM 把参数拼成 EngineArgs 起引擎。"},
+      {"what": "beam_search 方法（L691-L846）及 classify/reward/score（L1268-L1465）等非主线任务方法", "why_safe": "本章聚焦 generate/chat/embed/encode 四个核心入口与同步 step 驱动；beam_search 与 score 是独立特性（beam 自维护多实例、score 走配对渲染），删之不影响主线控制流。embed 作为 encode 的薄封装保留即可代表 pooling 家族。"},
+      {"what": "_adjust_params_for_parsing 的 Gemma4 特判（L1713-L1758）、_resolve_mm_lora 多模态默认 LoRA 选择（L594-L644）", "why_safe": "都是针对特定模型/多模态的边角分支，对'渲染→提交→驱动'主控制流是旁路 hook；删后 chat/_render_and_add_requests 主干完整。"},
+      {"what": "LLMEngine 中 sleep/wake_up/profile/add_lora/remove_lora/list_loras/pin_lora/collective_rpc/reset_*cache/get_metrics/__del__ 等运维转发方法（L327-L423）", "why_safe": "都是转发给 engine_core 的运维/控制接口，与本章'add_request + step + _run_engine'的推理主干无关，删后核心数据流不变。"},
+      {"what": "LLMEngine.step 中 record_function_or_nullcontext profiler 包裹与 record_stats 块（L294,L298,L308,L311-323 的 with 包裹与 logger_manager 记录）", "why_safe": "torch profiler 与 stat logging 是可观测性旁路，不影响 step 的 4 步主干（get_output→process_outputs→abort→return）；精简版保留 4 步逻辑、去掉 with 包裹即可。"},
+      {"what": "SyncMPClient/InprocClient 中与本章无关的转发方法（profile/reset_*/sleep/wake_up/add_lora/call_utility 的非 add/get_output 部分），以及 _send_input 的 ZMQ 多帧/pending message 细节（core_client.py:L798-810）", "why_safe": "ZMQ 字节协议在 ch05/ch06 已细讲；本章只需 SyncMPClient 的 __init__(起后台收数线程)、get_output(阻塞队列)、add_request(送 ADD) 三个方法体现'后台进程 + 阻塞队列'即可，其余转发删之不损主线。"},
+      {"what": "LLMEngine 中 data-parallel 相关分支：dp_group/external_launcher_dp/has_unfinished_requests_dp/should_execute_dummy_batch 及 step 开头的 dummy batch 分支（L74-88,L126-130,L188-194,L288-291）", "why_safe": "数据并行是 ch04/DP 侧主题；单卡离线场景 dp_group=None、should_execute_dummy_batch 恒 False，删后非 DP 主控制流完全等价。"},
+      {"what": "InprocClient 的 sleep/wake_up/profile/reset_* 等转发方法（core_client.py:L299-L333），仅保留 __init__/get_output/add_request/abort_requests", "why_safe": "InprocClient 在本章只作'回退对照'出现，保留三方法已足以对比 SyncMPClient（无 ZMQ、直接 step_fn），其余转发与对照无关。"}
+    ],
+    "must_keep": [
+      {"symbol": "LLM", "why": "本章主门面类，generate/chat/embed/encode 都挂其上。"},
+      {"symbol": "LLMEngine", "why": "离线同步引擎类，step/add_request/from_engine_args 的宿主。"},
+      {"symbol": "from_engine_args", "why": "VLLM_ENABLE_V1_MULTIPROCESSING 强翻 enable_multiprocessing 的源码锚点，必须呈现以讲清 SyncMPClient 默认。"},
+      {"symbol": "VLLM_ENABLE_V1_MULTIPROCESSING", "why": "默认 True、决定走 SyncMPClient 的关键 env 标志，澄清的核心。"},
+      {"symbol": "make_client", "why": "三分支工厂，区分 SyncMPClient vs InprocClient vs AsyncMP，澄清离线默认路径的关键。"},
+      {"symbol": "SyncMPClient", "why": "离线默认 EngineCore 客户端（后台进程+ZMQ+阻塞队列），必须出现以反驳'离线=进程内'误解。"},
+      {"symbol": "InprocClient", "why": "真·进程内回退实现，须保留以对照说明它不是默认、只是 VLLM_ENABLE_V1_MULTIPROCESSING=0 时使用。"},
+      {"symbol": "generate", "why": "核心生成入口，runner_type 守卫 + _run_completion 路径。"},
+      {"symbol": "chat", "why": "对话入口，走 _render_and_run_requests 打包 + warning 路径。"},
+      {"symbol": "encode", "why": "pooling 入口，_run_engine(output_type=PoolingRequestOutput) 路径。"},
+      {"symbol": "embed", "why": "encode(pooling_task='embed') 的薄封装，代表 embed 家族。"},
+      {"symbol": "_run_engine", "why": "同步驱动核心：while has_unfinished_requests(): step()，本章的灵魂。"},
+      {"symbol": "_render_and_run_requests", "why": "chat 路径专用，含物化 warning_once（completion 不走），是两路径区分的锚点。"},
+      {"symbol": "_render_and_add_requests", "why": "批量提交 + 事务性 abort 回滚的所在。"},
+      {"symbol": "_add_request", "why": "设置 output_kind=FINAL_ONLY、自增 request_id 的所在，FINAL_ONLY 对照点。"},
+      {"symbol": "_run_completion", "why": "completion 路径（不打 warning），与 chat 路径对照。"},
+      {"symbol": "step", "why": "LLMEngine 同步单拍驱动，4 步主干（get_output/process_outputs/abort/return）。"},
+      {"symbol": "add_request", "why": "请求双注册（output_processor + engine_core）与 n>1 ParentRequest 扇出。"},
+      {"symbol": "get_output", "why": "SyncMPClient 阻塞 outputs_queue.get() vs InprocClient 直接 step_fn()，体现同步阻塞本质。"},
+      {"symbol": "FINAL_ONLY", "why": "RequestOutputKind.FINAL_ONLY，离线只要最终结果，与 ch04 DELTA 流式对照。"},
+      {"symbol": "has_unfinished_requests", "why": "_run_engine while 循环的终止条件，同步驱动的边界。"},
+      {"symbol": "outputs_queue", "why": "SyncMPClient 主线程与后台收数线程之间的阻塞队列，体现'后台线程喂、主线程阻塞取'。"},
+      {"symbol": "ParentRequest", "why": "n>1 并行采样扇出，add_request 中复用 ch04/ch06 机制。"}
+    ]
+  },
+
+  "diagram_plan": [
+    {
+      "name": "ch31-offline-vs-async-spine",
+      "purpose": "并排对比离线同步路径（本章）与 ch04 异步路径，落点在'同步阻塞 while step() + FINAL_ONLY'。",
+      "spec": "svg-diagram，左右两栏。左栏（离线/本章）：用户 generate() → _render_and_add_requests(批量提交, output_kind=FINAL_ONLY) → _run_engine: while has_unfinished_requests(): LLMEngine.step() → SyncMPClient.get_output()[阻塞 outputs_queue.get()] ⇠ 后台收数 daemon 线程 ⇠ ZMQ ⇠ 后台进程 EngineCore；末尾 sorted(by request_id)。右栏（异步/ch04，灰显对照）：asyncio 事件循环 + 背景 output_handler 协程 + DELTA 流式 → AsyncMPClient。中间标注两条核心区别：[同步阻塞 vs 事件循环] [FINAL_ONLY 批量 vs DELTA 流式]。强调两侧 EngineCore 都在后台进程（区别在主进程侧驱动方式，非 in-process）。",
+      "roadmap_highlight": "Part VIII 离线侧 / vllm/entrypoints/llm.py + vllm/v1/engine/llm_engine.py"
+    },
+    {
+      "name": "ch31-make-client-decision",
+      "purpose": "澄清反直觉点：离线默认 SyncMPClient（非 InprocClient）。",
+      "spec": "svg-diagram 决策树。根：from_engine_args → 检查 envs.VLLM_ENABLE_V1_MULTIPROCESSING。分支1（默认=True，加粗高亮'默认路径'）→ multiprocess_mode=True, asyncio_mode=False → make_client → SyncMPClient（后台进程 EngineCore + ZMQ + 后台收数线程 + 阻塞队列）。分支2（=0，标'测试/调试/V0 回退'）→ multiprocess_mode=False → InprocClient（真进程内, 无 ZMQ, get_output 直接 step_fn()）。第三分支（asyncio_mode=True，灰显）→ AsyncMP（ch04）。",
+      "roadmap_highlight": "vllm/v1/engine/core_client.py:make_client"
+    },
+    {
+      "name": "ch31-request-lifecycle",
+      "purpose": "一个 generate 调用内单请求的生命周期：渲染→双注册→同步拉动→排序还原。",
+      "spec": "svg-diagram 时序/泳道（LLM | LLMEngine | OutputProcessor | EngineCore）。LLM: _add_request(FINAL_ONLY, 自增id) → LLMEngine.add_request: input_processor.process_inputs → [双注册] output_processor.add_request + engine_core.add_request → 回到 LLM._run_engine: while step() 循环 → LLMEngine.step: get_output→process_outputs(去token化/装配)→abort停止串 → 直到 finished → LLM 收集 → sorted(by request_id) 返回。标注 n>1 时 add_request 内 ParentRequest 扇出（虚线旁注）。",
+      "roadmap_highlight": "vllm/entrypoints/llm.py + vllm/v1/engine/llm_engine.py 协作"
+    }
+  ],
+
+  "foreshadow_due": {
+    "plant": [],
+    "payoff": [],
+    "note": "bible.py due ch31 返回空（无应埋/应回收伏笔）。arc-map.json 中 ch31 既非任何伏笔的 plant 也非 payoff。本章作为 Part VIII 离线侧，主要回收/呼应（非 bible 登记的强制项）：ch04 AsyncLLM 三段式（对照同步 vs 异步）、ch05/ch06 EngineCore+ZMQ 字节标签协议（SyncMPClient 复用，本章不重讲）、ch06 ParentRequest 并行采样扇出（add_request 复用）、ch08-ch10 OutputProcessor 去 token 化/RequestOutput 装配（step 第 2 步复用）。writer 应以'此前已细讲、此处只点其在同步主干中的位置'的口吻引用，不重复展开。"
+  }
+}
