@@ -93,7 +93,7 @@ def setup_server(args):
 
 那两条 `# workaround` 注释不是随口写的——它们各自指向一次踩过的坑。绑端口的注释挂着 issue 链接；`set_ulimit()` 则是为了防止 uvicorn 在并发请求过多时直接丢请求。源码里这种"伤疤注释"很值钱，它告诉你哪一行不能随手删。
 
-这里还顺手装了个 `SIGTERM` handler：初始化阶段收到 SIGTERM，就抛 `KeyboardInterrupt` 把启动打断。注意这只是**初始化期**的兜底；等服务器真正跑起来，关停信号会被 launcher 里另一套机制接管（见 [§32.7](#327-优雅关停信号-watchdog-与那个晚-await-的-shutdown_task)）。
+这里还顺手装了个 `SIGTERM` handler：初始化阶段收到 SIGTERM，就抛 `KeyboardInterrupt` 把启动打断。注意这只是**初始化期**的兜底；等服务器真正跑起来，关停信号会被 launcher 里另一套机制接管（见 [§32.7](#327-优雅关停信号watchdog与那个晚-await-的-shutdown_task)）。
 
 **第二，`async with build_async_engine_client(...)` 把引擎的整个生命周期框成了一个上下文。** 这是本章和第 4 章的接缝。进入这个 `with`，`AsyncLLM` 就起来了；离开它（无论正常退出还是抛异常），引擎一定被 shutdown。我们来看框子里装的是什么：
 
@@ -659,7 +659,7 @@ yield "data: [DONE]\n\n"
 
 这里有个一眼容易滑过、却是整章关停设计的命门的细节：看那两个 `except`。**流里出了异常，不是抛出去，而是 `yield` 成一个 error data 帧。** 为什么不抛？因为流式响应一旦开始，HTTP 200 状态码**早就发出去了**——回想 [§32.4](#324-请求的一生上从-http-到-token) 那个 `StreamingResponse`，它在第一个字节落地时状态行就定了。状态码改不了，错误就只能作为流里的下一帧推给客户端。
 
-这个"200 已发、改不了状态码"的约束会留下一个尾巴：如果引擎在流式生成途中**彻底死了**，异常被吞进了 error 帧，服务器进程本身怎么知道该退出？这个问题留到 [§32.7](#327-优雅关停信号-watchdog-与那个晚-await-的-shutdown_task)，那里有个 watchdog 专门兜底。
+这个"200 已发、改不了状态码"的约束会留下一个尾巴：如果引擎在流式生成途中**彻底死了**，异常被吞进了 error 帧，服务器进程本身怎么知道该退出？这个问题留到 [§32.7](#327-优雅关停信号watchdog与那个晚-await-的-shutdown_task)，那里有个 watchdog 专门兜底。
 
 ### 32.5.2 非流式：攒到末个再聚合
 

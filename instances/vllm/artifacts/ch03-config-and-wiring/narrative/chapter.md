@@ -106,7 +106,7 @@ class EngineArgs:
 
 这是「单一真相源」（single source of truth）模式。子配置类 `ModelConfig` 里的 `max_model_len` 默认值改了，CLI 的默认值**自动跟着变**——因为它们引用的是同一个东西，不存在两处维护、互相漂移的可能。如果哪天你看到 vLLM 文档里说某个 CLI 参数的默认值是 X，去翻 `EngineArgs` 发现写的是 `= SomeConfig.foo`，别困惑，那就是说「默认值跟 `SomeConfig.foo` 保持一致」。
 
-还有一个有意思的字段：`distributed_executor_backend` 默认是 `None`。它不是「没设置」的意思那么简单——`None` 是一个**待推导**的信号，后面 vLLM 会根据你的卡数、平台、是否有 Ray 来填它。这是本章第一个「三态/可推导默认」的例子，[3.6 节](#36-第二级映射之一执行器工厂executorget_class) 会接着讲。
+还有一个有意思的字段：`distributed_executor_backend` 默认是 `None`。它不是「没设置」的意思那么简单——`None` 是一个**待推导**的信号，后面 vLLM 会根据你的卡数、平台、是否有 Ray 来填它。这是本章第一个「三态/可推导默认」的例子，[3.6 节](#36-第二级映射之一执行器工厂-executorget_class) 会接着讲。
 
 ### dict 自动升格成 Config 对象
 
@@ -215,7 +215,7 @@ class EngineArgs:
 
 第一，`runner_type` / `is_multimodal_model` / `is_encoder_decoder` 都来自 `model_config`，不是从 `EngineArgs` 重复读一遍。**子配置之间通过 `model_config` 派生，而不是各自重复定义同一个事实**——这避免了「模型说自己是多模态，调度器却以为不是」这种不一致。
 
-第二，`policy` / `scheduler_cls` / `async_scheduling` 这三个字段，是后面调度器工厂（[3.7 节](#37-第二级映射之二调度器工厂get_scheduler_cls)）的输入。此刻 `async_scheduling` 很可能还是 `None`（用户没指定），它的最终值要等 `VllmConfig.__post_init__` 推导。先记住这条线。
+第二，`policy` / `scheduler_cls` / `async_scheduling` 这三个字段，是后面调度器工厂（[3.7 节](#37-第二级映射之二调度器工厂-get_scheduler_cls)）的输入。此刻 `async_scheduling` 很可能还是 `None`（用户没指定），它的最终值要等 `VllmConfig.__post_init__` 推导。先记住这条线。
 
 打包完所有子配置，方法的收尾就是把它们一次性塞进 `VllmConfig`：
 
@@ -344,7 +344,7 @@ class EngineArgs:
         )
 ```
 
-先注意头三行：它**提前调用了 `Executor.get_class(self)`**，问执行器类「你支持异步调度吗」（`supports_async_scheduling()`）。这是一个有意思的回路——执行器工厂在这里被借来当「能力查询」用，而不是真去实例化执行器。这也是为什么前面强调 `distributed_executor_backend` 必须在这之前就推导好（[下一节](#36-第二级映射之一执行器工厂executorget_class) 讲它在哪推导的）。
+先注意头三行：它**提前调用了 `Executor.get_class(self)`**，问执行器类「你支持异步调度吗」（`supports_async_scheduling()`）。这是一个有意思的回路——执行器工厂在这里被借来当「能力查询」用，而不是真去实例化执行器。这也是为什么前面强调 `distributed_executor_backend` 必须在这之前就推导好（[下一节](#36-第二级映射之一执行器工厂-executorget_class) 讲它在哪推导的）。
 
 然后三态分流：
 
@@ -675,7 +675,7 @@ OPTIMIZATION_LEVEL_TO_CONFIG = {
 
 它递归遍历预设字典：遇到「字典 + 对应字段是个 dataclass」就往下钻（`pass_config` 是嵌套的，所以要递归），否则调 `_set_config_default` 写值。
 
-注释里那句话是整个机制的灵魂：**「user specified fields will not be overridden by the default」**——用户显式设的字段，预设绝不覆盖。怎么做到的？看 `_set_config_default`：它只在「字段当前还是 `None`」时才写默认值。换句话说，**`None` 表示「用户没碰过这个字段，你可以填」**；非 `None` 表示「用户已经表态了，别动」。这跟 [3.5 节](#35-async_scheduling-三态决策默认开但会自动退化) 的 `async_scheduling`、[3.6 节](#36-第二级映射之一执行器工厂executorget_class) 的 `distributed_executor_backend` 是同一个哲学——`None` 是「待填」的信号。前面提到的那些函数值，也是在这一步被调用求值的。
+注释里那句话是整个机制的灵魂：**「user specified fields will not be overridden by the default」**——用户显式设的字段，预设绝不覆盖。怎么做到的？看 `_set_config_default`：它只在「字段当前还是 `None`」时才写默认值。换句话说，**`None` 表示「用户没碰过这个字段，你可以填」**；非 `None` 表示「用户已经表态了，别动」。这跟 [3.5 节](#35-async_scheduling-三态决策默认开但会自动退化) 的 `async_scheduling`、[3.6 节](#36-第二级映射之一执行器工厂-executorget_class) 的 `distributed_executor_backend` 是同一个哲学——`None` 是「待填」的信号。前面提到的那些函数值，也是在这一步被调用求值的。
 
 ### 优先级是怎么排出来的
 
@@ -874,7 +874,7 @@ EngineArgs(tensor_parallel_size=4)   # 但本机只有 1 张卡
   → raise ValueError("World size (4) is larger than the number of available GPUs (1)")
 ```
 
-跟 [3.6 节](#36-第二级映射之一执行器工厂executorget_class) 读到的逻辑一致：单卡 `uni`、多卡 `mp`、要的卡比有的多直接报错。
+跟 [3.6 节](#36-第二级映射之一执行器工厂-executorget_class) 读到的逻辑一致：单卡 `uni`、多卡 `mp`、要的卡比有的多直接报错。
 
 ### 数值 2：async_scheduling 的三态退化
 
@@ -930,7 +930,7 @@ optimization_level=O0 但用户显式 cudagraph_mode=PIECEWISE
 
 - **第一级**（[3.2](#32-第一级映射engineargs-是个扁平的参数袋子)–[3.3](#33-create_engine_config把扁平参数重新打包) 节）：`EngineArgs` 扁平、默认值借自子配置（单一真相源）；`create_engine_config` 把几百个扁平参数重新打包成十几个结构化子配置，聚合进 `VllmConfig`。扁平适合 CLI，结构化适合内部传递。
 - **推导中枢**（[3.4](#34-vllmconfig__post_init__跨子配置的校验与推导中枢)–[3.5](#35-async_scheduling-三态决策默认开但会自动退化)、[3.9](#39-o0o3-优化级一个声明式的旋钮) 节）：`vllm/config/vllm.py` 里的 `VllmConfig.__post_init__` 集中处理所有跨子配置的校验和推导——`async_scheduling` 三态决策、`O0–O3` 优化级落地。一个反复出现的模式：**`None` = 「待填/自动」，非 `None` = 「用户表态、别动」**；优先级靠「按顺序执行 + 只填 None」自然涌现。
-- **第二级**（[3.6](#36-第二级映射之一执行器工厂executorget_class)–[3.8](#38-第二级映射之三ipc-客户端工厂make_client) 节）：三个工厂——`Executor.get_class` / `get_scheduler_cls` / `make_client`——都从 `VllmConfig` 的 flag 查表选出具体类。把「配置」和「实现选择」解耦：同一套配置在单卡/多卡、同步/异步下选出不同实现，调用方无感。
+- **第二级**（[3.6](#36-第二级映射之一执行器工厂-executorget_class)–[3.8](#38-第二级映射之三ipc-客户端工厂-make_client) 节）：三个工厂——`Executor.get_class` / `get_scheduler_cls` / `make_client`——都从 `VllmConfig` 的 flag 查表选出具体类。把「配置」和「实现选择」解耦：同一套配置在单卡/多卡、同步/异步下选出不同实现，调用方无感。
 - **指纹**（[3.10](#310-compute_hash计算图的-10-位指纹) 节）：`compute_hash` 只收影响计算图结构的因子，产 10 位指纹做 `torch.compile` 缓存键。理解它的作用域，就能预测哪些改动会触发重编译。
 - **汇合**（[3.11](#311-汇合点enginecore__init__三个工厂的产物落地) 节）：`EngineCore.__init__` 是终点——执行器类在这里才实例化（重资源推迟），调度器工厂在这里兑现。装配到此完成。
 
