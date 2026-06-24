@@ -63,10 +63,13 @@ python3 scripts/lint_source_grounding.py {chapter}/                        # 源
 ## 公式规则（NON-NEGOTIABLE，auto-REJECT）
 `\text{}`→`\mathrm{}`；`\boxed{}`→markdown 粗体标题；`\tag*{}`→`$$` 外；inline `\frac`→提升为 `$$` 块；`$$` 与内容分行。inline 仅限单符号/简单式。
 
-## 当前状态（2026-06-21）
-- 系统重建完成：地基 linter（12/12 测试过）、6 角色提示词、Roadmap 生成器、Book Bible、chapter-pipeline workflow（含逃生舱）、架构师文档。
-- **ch04（AsyncLLM 三段式）试点待发车**——首章验证新体系是否根除脱节。
-- 新书章节用 `ch`-前缀 slug（如 `ch04-async-llm`），置于 `instances/vllm/artifacts/`，与旧 `NN-*` 区分。
+## 当前状态（2026-06-25）：📕 全书 33 章草稿全部完成
+- **ch01–ch33 全部完成**（31 源码解读章 + ch01/ch02/ch26 三个 meta 概览章，meta 走 `skip_impl` 轻流程无精简版）。全 APPROVED、已推 `vllm-book-v2-rebuild` 远程。规模 ≈24.5k 行正文 + 142 图。
+- **连贯性干净**：26/26 伏笔全回收；glossary/interfaces 登记 30 章；全书 0 断裂章内锚点（`scripts/lint_anchors.py --all` 校验）。
+- 旧 `NN-*` 文章已从 main 与 vllm-book-v2-rebuild 两分支删除。
+- 体系经实战加固：archive 注入完整 reviewV+崩溃重试、防假通过 escape hatch（评审 agent 全失败不静默 APPROVE）、dossier-verify 对抗自核（实战拦下 ch31 SyncMPClient/ch01 CompilationMode 等事实错误）、off-spine 分层 roadmap、写手提示词强化、git push 须前台（后台 SSH 失败）。
+- **剩余 = 全书润色**（非 draft）：各章 review-report.json 的 negotiable 项（半角标点、术语对齐 glossary、算法维度的逐拍 tick 表/归纳证明增补、个别图标签重叠、lint_formulas 内联密度软噪声）。ch03–16 的 review-report 为 archivist 有损重建(约 3 条/章)，ch17+ 忠实全量；完整 issues 在工作流通知里。
+- 新书章节用 `ch`-前缀 slug，置于 `instances/vllm/artifacts/`。
 
 ## 常见坑
 1. 别写脱离代码的抽象——正文以真实 vllm 源码为主线、自包含内嵌。

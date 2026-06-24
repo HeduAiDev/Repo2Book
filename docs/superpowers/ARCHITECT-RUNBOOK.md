@@ -101,7 +101,8 @@ jq -r '.overall_verdict' $D/reviews/review-report.json
 5. **提交**（事故教训：通过即提交）：`git add` 该章 artifacts + bible + trace，commit（带 Co-Authored-By）。
 6. **回到 2**，直到 ch01-ch33 全 done；其间**每完成一个 Part** 跑一次连贯性审计 + 批量润色（读各章 review-report.json 的 negotiable 项，派 writer 批量定点修）。
 - 串行（整章级，避免 bible 竞争）；逃生舱触发则按 §5 处理后续跑。
-- 进度（2026-06-21 起）：ch03/04/05 已成；其余在循环中。
+- 进度（2026-06-25）：✅ **全书 ch01–ch33 草稿全部完成**（全 APPROVED + 推远程，26/26 伏笔回收，0 断锚）。循环已跑完；剩余为全书润色（清各章 negotiable）。详见 CLAUDE.md「当前状态」。
+  - 实战经验补：① 会话用量上限约每 6 章触发一次→escape hatch 防假通过 + 限额重置后 `resumeFromRunId` 续跑；② git push 必须前台（后台 shell SSH 鉴权失败）；③ 监控在 review-report.json 出现即报 DONE，但 archive 的 bible/trace 回写稍后→提交前确认 bible interfaces 有本章；④ meta/概览章用 CFG `skip_impl:true` 走轻流程（无精简版、不跑 fidelity）；⑤ off-spine 章 highlight 用子系统键（roadmap 自动高亮父阶段+「本章深入」框）。
 
 ## 9. 当前状态 & 下一步
 - 系统重建完成（地基 12/12 测试、6 角色、Roadmap、Bible、workflow+逃生舱、架构师文档）。**冷启动 Team Lead 文档考 v2 已 PASS 60/60**。
