@@ -281,7 +281,9 @@ draft_token_ids = self.input_ids.gpu[logits_indices]
 draft_token_ids = draft_token_ids[target_logits_indices + 1]
 ```
 
-草稿 token 其实早就**被填进了目标模型的输入流**——投机的本质就是"把草稿当输入喂给目标模型验证"。所以草稿 token 不用单独存，从 `input_ids` 里按 index 取出来就行。但要错位一格：位置 `p` 的草稿，是去预测位置 `p+1` 的，所以 `target_logits_indices + 1` 才是草稿 token 本身落在 `logits_indices` 序列里的下标。两跳 gather 下来，`draft_token_ids = [1, 2, 3, 105, 106, 208]`——这就是摊平后的 6 个草稿。
+草稿 token 其实早就**被填进了目标模型的输入流**——投机的本质就是"把草稿当输入喂给目标模型验证"。所以草稿 token 不用单独存，从 `input_ids` 里按 index 取出来就行。但要错位一格：位置 `p` 的草稿，是去预测位置 `p+1` 的，所以 `target_logits_indices + 1` 才是草稿 token 本身落在 `logits_indices` 序列里的下标。
+
+拿 req0 的第一个草稿走一遍这两跳就具象了：它在 `target_logits_indices` 里是第 0 项，值为 0，`+1` 得下标 1；去 `logits_indices`（`= [0, 1, 2, 3, 103, ...]`）里取第 1 个，得到 logits 行号 1；最后 `input_ids.gpu[1]` 取出的，正是被填在输入流位置 1 的那个草稿 token（下面追踪里的 1）。其余草稿照此类推。两跳 gather 下来，`draft_token_ids = [1, 2, 3, 105, 106, 208]`——这就是摊平后的 6 个草稿。
 
 这套索引算术全在 CPU 上用 numpy 完成，复杂度 `O(num_tokens)`，没有任何 padding 浪费。精简版把它逐行搬下来，可以直接断言它复现源码注释里的每一个数字：
 
@@ -312,6 +314,7 @@ class RejectionSampler(nn.Module):
     """
     The implementation strictly follows the algorithm described in
         https://arxiv.org/abs/2211.17192.
+    # … 省略：术语前言 …
     accepted tokens: tokens that are accepted based on the relationship
             between the "raw" draft and target probabilities.
     recovered tokens: tokens that are sampled based on the adjusted probability
@@ -326,6 +329,7 @@ class RejectionSampler(nn.Module):
         bonus tokens, while spec decode does not support these sampling
         strategies.
     output tokens:
+        # … 省略：一行说明 …
         output tokens = accepted tokens + recovered tokens + bonus tokens
     """
 ```
@@ -473,7 +477,7 @@ def rejection_greedy_sample_kernel(
   → 输出 [5, 3, 7]            # 两个 accept + bonus，这一轮吐 3 个 token
 
 单请求 2 个草稿 [5, 3]，目标 argmax = [5, 6]（pos1 不中）
-  → 输出 [5, 6, -1]          # pos0 接受=5；pos1 拒绝→写 recovered=6 并截断；无 bonus
+  → 输出 [5, 6, -1]          # pos0 接受=5；pos1 拒绝→写目标 argmax=6 并截断；无 bonus
 ```
 
 ### random 路径：算法的心脏
@@ -536,7 +540,7 @@ $$
 P(\mathrm{accept}\ x) = \min\Bigl(1,\ \frac{p(x)}{q(x)}\Bigr)
 $$
 
-因为 $u$ 服从均匀分布，"$p(x)/q(x) \ge u$ 成立"的概率正好等于上式。**这就是以 $\min(1, p/q)$ 的概率接受草稿 token x**——比值 ≥1 时（目标比草稿更看好 x）必接受，小于 1 时按比值的概率接受。
+因为 $u$ 服从均匀分布，"$p(x)/q(x) \ge u$ 成立"的概率正好等于上式。把它落到具体数字上就一目了然：比值 $p/q = 0.3$ 时，$u$ 只有落在 $[0, 0.3)$ 才接受，而 $u$ 在 $[0,1)$ 上均匀，落进去的概率正好 0.3；比值 $\ge 1$ 时门槛恒过、必接受。**这就是以 $\min(1, p/q)$ 的概率接受草稿 token x**——比值 ≥1 时（目标比草稿更看好 x）必接受，小于 1 时按比值的概率接受。
 
 那 `NO_DRAFT_PROBS` 分支是什么？n-gram 这类 proposer 没有概率分布（它是确定性复制），所以 `draft_prob` 直接当作 1，准则退化成"以 $p_{\mathrm{target}}(x)$ 的概率接受"。一个 `constexpr` 开关，让同一个内核兼容"有概率"和"无概率"两类 proposer。
 
@@ -551,6 +555,24 @@ $$
 
 接受率实测约 0.5，正好等于 $p_{\mathrm{target}}(0)$——准则被验证了。这不是定性的"差不多"，是 2 万样本统计出的硬数字。
 
+### 这条接受率换来多少加速
+
+接受准则验证了"正确"，那"快"能快多少？也可以量化。设每个位置的接受率为 $\alpha$（位置间近似独立），一次投机里草稿从前往后逐位接受，直到首个拒绝。那么一次目标前向接受的草稿数是个几何截断，期望接受长度为：
+
+$$
+\mathbb{E}[L] \approx \frac{1 - \alpha^{k+1}}{1 - \alpha}
+$$
+
+再加上全接受时白嫖的那个 bonus，单次前向期望净产出 token 数就是 $\mathbb{E}[L]$ 量级。两个极端能帮你建立直觉：$\alpha \to 1$（草稿几乎全中）时 $\mathbb{E}[L] \to k+1$，k 个草稿全白嫖再加 bonus，加速比逼近 k+1 倍；$\alpha \to 0$（草稿几乎全错）时 $\mathbb{E}[L] \to 1$，退化成无投机、一次前向只产一个 token。加速比正比于 $\mathbb{E}[L]$，因为投机的开销（一次目标前向）和不投机时一模一样，多产出的 token 全是净赚。
+
+代入刚才那个实测的 $\alpha \approx 0.5$、取 $k = 3$：
+
+$$
+\mathbb{E}[L] \approx \frac{1 - 0.5^{4}}{1 - 0.5} \approx 1.875
+$$
+
+即便接受率只有一半，一次目标前向也平均吐出近 2 个 token——这就是投机解码存在的理由。"正确性"那边用 2 万次实测锚定了 $\alpha$，"速度"这边就用同一个 $\alpha$ 算出了收益，两头对称。
+
 ---
 
 ## 28.5 拒绝时采什么：残差分布与分布等价性
@@ -559,7 +581,7 @@ $$
 
 ### 为什么接受准则 + 残差分布 = 目标分布
 
-设目标分布 $p(x)$、草稿分布 $q(x)$。我们对草稿 token 以 $\min(1, p(x)/q(x))$ 的概率接受。问题是：被接受的 token，其分布并不是 $p$——它偏向了草稿青睐的那些 token。光靠接受，输出会跑偏。
+设目标分布 $p(x)$、草稿分布 $q(x)$。我们对草稿 token 以 $\min(1, p(x)/q(x))$ 的概率接受。先建立一个画面感：草稿猜得多的 token 更容易被提议、也更容易被接受，于是结果会被草稿的偏好带偏。落成一句话就是：被接受的 token，其分布并不是 $p$——它偏向了草稿青睐的那些 token。光靠接受，输出会跑偏。
 
 补救办法是：拒绝时，从**残差分布**采一个 token：
 
@@ -582,6 +604,8 @@ $$
 > *接受覆盖 min(p,q)，残差补上 p 超出 q 的部分，合起来还原成目标分布 p。*
 
 可以一句话归纳这个不变量为什么成立：对任意 token x，它最终被输出的概率 = "x 被当作草稿提议且被接受" + "某次拒绝后从残差分布采到 x"，两项之和恰好等于 $p(x)$。完整证明见 Leviathan 等人的论文（arXiv:2211.17192），代码注释里也指明了"严格遵循"它。
+
+但上面证的是**单个位置**的边缘分布等于 $p$。我们真正想要的，是整条 k 位草稿序列、连同首个拒绝处的截断，联合起来仍等价于目标模型逐 token 自回归采出来的序列——这才是读者最容易犯嘀咕的地方：**截断后续草稿，会不会偷偷改了分布？** 把它按位置归纳一遍就清楚了。把投机解码看成一条逐位置的条件采样链：位置 $i$ 是在"前 $i-1$ 个草稿都已被接受"这个条件下处理的，它的输出（接受草稿，或拒绝后取 recovered）的边缘分布，正是上面那条单位置结论给出的"目标模型在该前缀下的条件分布"。于是：基例是位置 0，结论直接成立；归纳步是，若前 $i$ 个位置的联合分布已等于目标自回归分布，那么位置 $i$ 在该前缀条件下输出仍是这条目标条件分布，接上去后前 $i+1$ 个位置的联合分布仍等于目标自回归分布。而"首个拒绝即截断"恰好对应：在拒绝处用该位置的 recovered（已经是从目标条件分布重采的）续上一个 token，后续位置则交还给下一轮目标前向继续这条链。单位置正确 × 拒绝即截断 = 在该位置回到目标条件分布，链式连乘下来，整条输出序列的联合分布严格等于目标模型自回归采样的分布。截断没有破坏分布，它只是把链交接给了下一轮。
 
 n-gram 那种情况（`NO_DRAFT_PROBS`，$q$ 是确定性的 one-hot），残差就退化成"把草稿那个 token 屏蔽掉之后的目标分布"——接受准则以 $p(x)$ 接受草稿，拒了就从剩下的目标分布里采。同样严格等价。
 

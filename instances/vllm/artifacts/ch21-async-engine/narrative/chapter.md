@@ -76,7 +76,12 @@ class AsyncIntermediateTensors(IntermediateTensors):
 
 这个设计的妙处在于**对 model_runner 完全透明**。下游的 model_runner 拿到这个对象，照常写 `intermediate_tensors.tensors["hidden_states"]`，它根本不知道背后有个 `irecv` 在飞。谁先碰 `.tensors`，谁就在那一刻替大家把 wait 补上。`_comm_waited` 标志保证 wait 只发生一次——读第二次 `.tensors` 时 `wait_for_comm` 直接短路返回，是**幂等**的。
 
-注意 `wait_for_comm` 内部为什么不用 `self._comm_waited`、`self._comm_handles`，而是绕一圈写 `object.__getattribute__(self, "wait_for_comm")()`？因为 `__getattribute__` 拦的是**所有**属性访问，如果 `wait_for_comm` 里直接写 `self.xxx`，又会触发钩子，钩子里再调 `wait_for_comm`，无穷递归。绕过钩子直接走 `object.__getattribute__` 是为了打破这个环——只对 `.tensors` 这一个名字做拦截，别的属性老老实实直读。
+注意 `wait_for_comm` 内部为什么不用 `self._comm_waited`、`self._comm_handles`，而是绕一圈写 `object.__getattribute__(self, "wait_for_comm")()`？因为 `__getattribute__` 拦的是**所有**属性访问。把递归链显式走两步就清楚了——假设 `wait_for_comm` 里图省事直接写 `self._comm_handles`：
+
+1. 读 `self._comm_handles` → 触发 `__getattribute__` 钩子 → 钩子里又调 `wait_for_comm()`；
+2. `wait_for_comm()` 里再读 `self._comm_handles` → 又触发钩子 → 又调 `wait_for_comm()` → 回到第 1 步……
+
+这就是无穷递归。绕过钩子直接走 `object.__getattribute__` 正是为了打破这个环：`object.__getattribute__` 是「不过钩子的原始属性访问」，从它读 `_comm_handles` 不会再触发拦截。所以钩子只对 `.tensors` 这一个名字做拦截，类内部读自己的状态全走 `object.__getattribute__` 直读，环就断了。
 
 ### irecv 为什么能不阻塞
 
@@ -359,6 +364,17 @@ $$
 
 这样就堵住了「刚共识暂停、又被旧唤醒拉起」的窗口。后面讲唤醒时会看到 `START_DP_WAVE` 的处理入口正是先查这个标志。
 
+把这套 AND 共识也追成一张表。仍设 dp_size=2，看第 1 维（`pending_pause` 的 SUM）怎么从「半数举手」走到「全员举手」。这正好和上一节那张追第 0 维（OR）的表互补——这次盯的是第 1 维：
+
+| sync 轮 | rank0 pending_pause | rank1 pending_pause | all-reduce[1] SUM | SUM % dp_size | has_unfinished_global | pause_consensus（SUM==2） | 动作 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 第一次 sync | 1 | 0 | 1 | 1（≠0） | **True** | False | 半数举手 → 判仍有活，继续空转步进 |
+| 第二次 sync | 1 | 1 | 2 | 0 | False | **True** | 全员举手 → 共识达成，置 `ignore_start_dp_wave`、清 `pending_pause` |
+
+读这张表：第一次 sync 只有 rank0 想暂停，SUM=1，`1 % 2 ≠ 0` 这道保险把 `has_unfinished_global` 顶成 `True`——于是全体继续空转，绝不会出现「rank0 停了、rank1 还在跑 all-to-all」的错配。直到第二次 sync 两个 rank 都举手，SUM=2 整除 dp_size，`pause_consensus` 才翻 `True`，两阶段暂停的第二阶段（丢弃迟到唤醒）这时才启动。
+
+**这条「要停就全体停」的正确性**靠一个不变量：只要 `pending_pause` 的 SUM 不等于 `dp_size`，`has_unfinished_global` 必为真（`pause_count % dp_size != 0` 那一项兜底），全体一定继续。换言之 `engines_running` 只在 SUM 严格等于 dp_size 那一刻才被允许翻 `False`——半数同意永远不够，杜绝了部分暂停。
+
 ### 在 host 上追一轮 wave
 
 把忙循环的状态连续追几拍，看 wave 怎么收敛。设 dp_size=2，两个引擎，构造一个「全体即将跑干净」的场景，逐拍记录关键标量（用整数 all-reduce 替身驱动真实控制流）：
@@ -472,7 +488,7 @@ $$
 
 解法是**本地预增**：每选中一个引擎，就在本地立刻把它的 `waiting` 加上 `client_count`，假装这个请求已经排上了。这样紧接着来的下一个请求，看到的就是「这引擎刚被占了一格」的更新后视图，自然会去找次空的。这是对 100ms 刷新滞后的**前馈补偿**。
 
-用一个突发场景看效果。两个引擎初始都空 `[[0,0], [0,0]]`，`eng_start_index=0`，连发两个请求：
+用一个突发场景看效果。两个引擎初始都空 `[[0,0], [0,0]]`，`eng_start_index=0`，设 `client_count=1`（单前端，故每次预增 `waiting += 1`），连发两个请求：
 
 | 请求 | 选前 lb_engines | eng0 score | eng1 score | 选中 | 预增后 lb_engines |
 | --- | --- | --- | --- | --- | --- |

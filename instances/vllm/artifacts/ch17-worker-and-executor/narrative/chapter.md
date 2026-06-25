@@ -456,7 +456,7 @@ class FutureWrapper(Future):
 | 2 | 仍未 done → `pop` 出 #2 | `[#3]` | reply#2 | Future#2 ✓ |
 | 3 | 仍未 done → `pop` 出 #3（自己） | `[]` | reply#3 | Future#3 ✓ → 返回 |
 
-**为什么这样必然对得上？** 这就是一句话能归纳的不变量：底层应答 MQ 是 FIFO，回复的入队顺序 = RPC 的发出顺序；`futures_queue` 用 `appendleft` / `pop` 也维持同一个 FIFO 序。两个 FIFO 同序，所以「逐个排空、第 i 次 `dequeue` 配第 i 个 `pop` 出来的 future」必然让第 k 个请求对上第 k 个回复——**无需给每个 RPC 配 id，也无需为每个 RPC 开独立通道**。一个 deque + 一条 FIFO 队列，就把异步流水线的配对问题解决了。
+**为什么这样必然对得上？** 这里说的是非阻塞流水线连发的场景——此时各回复都走**同一条**应答 MQ（指定了单一 `output_rank`，或全收时逐条 MQ 顺序排空），不变量才单一而清晰。归纳骨架是这样：**基例**，队列里只有 1 个 future 时，`result()` 一 `pop` 就是它自己，配第 1 个回复，平凡成立。**归纳步**，假设前 `k-1` 个 future 已按序配到前 `k-1` 个回复；现在轮到第 `k` 个 `result()`，`while not self.done()` 会从队尾 `pop` 出仍未取的最早那个 future，对它做一次 `dequeue`——底层 MQ 是 FIFO，这次 `dequeue` 拿到的正是第 `k` 个回复（前 `k-1` 个已被取走），于是第 `k` 个 future 也对上号。单调量是「队列中未排空的 future 数」：每 `pop` 一次严格减 1，是个递减的非负整数，故有限步内必排到自己、循环必终止。两个 FIFO 同序，所以「逐个排空、第 `i` 次 `dequeue` 配第 `i` 个 `pop` 出来的 future」必然让第 `k` 个请求对上第 `k` 个回复——**无需给每个 RPC 配 id，也无需为每个 RPC 开独立通道**。一个 deque + 一条 FIFO 队列，就把异步流水线的配对问题解决了。
 
 > 精简版把这个类**字面照搬**，底层应答队列换成等价的 FIFO（语义不变）。你可以连发几个 non_block RPC、打印 `futures_queue` 的长度，亲眼看 `result()` 怎么把它从 3 排空到 0。
 
@@ -482,9 +482,9 @@ def _get_output_rank(self) -> int:
     )
 ```
 
-逻辑落到一个简单算式：**最后一段流水线的第一个张量并行 worker**，全局 rank = `world_size - tp_size × pcp_size`。为什么是它？流水线并行下，只有**最后一段**算出最终 logits / token；张量并行下，同一段的各 rank 输出是冗余的，取 **rank 0** 即可。把这个 rank 当 `output_rank` 传进 `collective_rpc`，应答就只从这一条队列收。
+逻辑落到一个简单算式：**最后一段流水线的第一个张量并行 worker**，全局 rank = `world_size - tp_size × pcp_size`。源码注释里那行 `world_size - tp_size = 32 - 8 = 24` 省掉了 `pcp_size`，是**默认 `pcp_size=1`** 时的特例（`8 × 1 = 8`）；一般式里 `pcp_size` 不能漏，否则前缀上下文并行开启时定位会偏。为什么是这个 rank？流水线并行下，只有**最后一段**算出最终 logits / token；张量并行下，同一段的各 rank 输出是冗余的，取 **rank 0** 即可。把这个 rank 当 `output_rank` 传进 `collective_rpc`，应答就只从这一条队列收。
 
-这是个量化得很清楚的优化：广播仍是一次（O(1) 次发送），但**应答从 O(world_size) 次 `dequeue` 降到 O(1) 次**。32 卡时，不必从 32 条队列收 32 份冗余结果，只收 1 份。
+这是个量化得很清楚的优化：广播仍是一次（O(1) 次发送），但**应答从 O(world_size) 次 `dequeue` 降到 O(1) 次**。32 卡时，不必从 32 条队列收 32 份冗余结果，只收 1 份——省掉 31 次跨进程 `dequeue` 与 31 份冗余 `ModelRunnerOutput` 的搬运。
 
 ---
 

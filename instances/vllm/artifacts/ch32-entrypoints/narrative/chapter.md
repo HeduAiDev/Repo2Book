@@ -661,6 +661,18 @@ yield "data: [DONE]\n\n"
 
 这个"200 已发、改不了状态码"的约束会留下一个尾巴：如果引擎在流式生成途中**彻底死了**，异常被吞进了 error 帧，服务器进程本身怎么知道该退出？这个问题留到 [§32.7](#327-优雅关停信号watchdog与那个晚-await-的-shutdown_task)，那里有个 watchdog 专门兜底。
 
+把上面这些规则落到一个具体的两 token 回答 `"Hi there"`（`include_usage=False`，单 choice）上，整个流逐帧长这样：
+
+| 帧 | 触发分支 | `delta` | `finish_reason` | yield 出去的内容 |
+|---|---|---|---|---|
+| 1 | `first_iteration` 首块 | `{role:"assistant", content:""}` | `null` | `data: {…delta 只有 role…}\n\n` |
+| 2 | `output.text="Hi"` | `{content:"Hi"}` | `null` | `data: {…content 增量…}\n\n` |
+| 3 | `output.text=" there"` | `{content:" there"}` | `null` | `data: {…content 增量…}\n\n` |
+| 4 | 末块带 finish | `{}` | `"stop"` | `data: {…只剩 finish_reason…}\n\n` |
+| 5 | 终止哨兵 | — | — | `data: [DONE]\n\n` |
+
+读这张表只盯一件事：`role` 只在第 1 帧出现一次，之后每帧只追加 `content` 增量，`finish_reason` 直到末块才从 `null` 翻成 `"stop"`。客户端把第 2、3 帧的 `content` 顺序拼接，就还原出完整答案——这就是"打字机"效果的物理来源。
+
 ### 32.5.2 非流式：攒到末个再聚合
 
 非流式简单得多，因为它不在乎中间过程，只要最终结果：
@@ -734,7 +746,18 @@ async def chat_completion_full_generator(
         final_res = res
 ```
 
-它把每个 `RequestOutput` 赋给 `final_res`，循环结束后 `final_res` 就是**最后一个**。为什么只留最后一个就够？因为 vLLM v1 的增量输出语义下，末个 `RequestOutput` 累积了到目前为止的全文——它不是只含最后一个 token 的片段，而是完整答案。所以非流式只要"喝到最后一口"。这正是图里标的 `FINAL_ONLY`。
+它把每个 `RequestOutput` 赋给 `final_res`，循环结束后 `final_res` 就是**最后一个**。为什么只留最后一个就够？答案不在这个循环里，而在 [§32.4](#324-请求的一生上从-http-到-token) 那一步算 `SamplingParams` 时——`request.to_sampling_params` 会按 `request.stream` 给引擎设一个开关：
+
+```python
+# vllm/entrypoints/openai/chat_completion/protocol.py:L586-L588
+output_kind=RequestOutputKind.DELTA
+if self.stream
+else RequestOutputKind.FINAL_ONLY,
+```
+
+这一行才是流式/非流式真正分家的地方。流式设 `DELTA`，引擎每拍只回一个**只含本拍增量**的 `RequestOutput`——所以 [§32.5.1](#3251-流式逐-token-推成-sse) 里 `delta_text = output.text` 直接当增量推是对的。非流式设 `FINAL_ONLY`，引擎干脆**只在终止那一拍回唯一一个 `RequestOutput`**，且它携带全文。
+
+把"只留最后一个就够"说成一句归纳：在 `FINAL_ONLY` 下，`async for` 循环体只会执行**恰好一次**（生成器只 yield 一个元素），所以"循环结束后 `final_res` 等于最后一个"与"`final_res` 等于那唯一一个全文 `RequestOutput`"是同一件事——不存在被丢弃的中间帧。换句话说，所谓"同一个生成器"，准确说是同一个 `generate` API 被 `output_kind` 配置成了两种产出语义，而不是非流式自己手动丢掉中间结果。这正是图里标的 `FINAL_ONLY`。
 
 非流式因为还没发任何字节，错误处理就比流式体面得多：
 

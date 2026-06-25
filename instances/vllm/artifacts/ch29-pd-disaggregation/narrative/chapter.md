@@ -748,9 +748,22 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
 
 第一轮返回 `False`、请求被继续隔离；中间 worker 信号把 req 加进标记集；第二轮命中标记、提升回 `WAITING`、并从集合移除。如果把 `num_preemptions` 设成非零，第二轮出状态就变成 `PREEMPTED`——和 §29.5 的分支一致。
 
-**为什么这个循环一定会收敛、不会无限隔离？** 关键在于**每个请求至多触发一次提升**：worker 的异步传输只会"完成"一次，完成后 `finished_recving` 把 req_id 一次性加进 `finished_recving_kv_req_ids`；下一个调度步遍历到它，标记命中即提升，`_update_waiting_for_remote_kv` 顺手把它从集合移出、状态不再阻塞。设传输需 $k$ 步，则前 $k$ 步该请求每步付出一次 $O(1)$ 检查后被隔离回去，第 $k+1$ 步标记到位、提升、移出集合——之后它不再是阻塞态，至多被检查 $k+1$ 步、永不重入这条路径。有限步内必然提升或失败，不存在活锁。
+**为什么这个循环一定会收敛、不会无限隔离？** 关键在于**每个请求至多触发一次提升**：worker 的异步传输只会"完成"一次，完成后 `finished_recving` 把 req_id 一次性加进 `finished_recving_kv_req_ids`；下一个调度步遍历到它，标记命中即提升，`_update_waiting_for_remote_kv` 顺手把它从集合移出、状态不再阻塞。设传输需 $k$ 步，则前 $k$ 步该请求每步付出一次 $O(1)$ 检查后被隔离回去，第 $k+1$ 步标记到位、提升、移出集合。之后它不再是阻塞态，至多被检查 $k+1$ 步、永不重入这条路径。有限步内必然提升或失败，不存在活锁。
+
+失败路径同理收敛。worker 对一次传输只上报一次终结信号（`finished_recving` 或失败标记），`_update_waiting_for_remote_kv` 处理后都会把 req 移出对应集合、状态不再阻塞。失败后即便重试，那也是一次全新的远程查询、重新从头计数 $k$，而不是在同一阻塞态里空转。这样"每个请求至多被提升一次"的不变量就覆盖到了状态机里的全部箭头——成功支与红色失败回退支都闭合。
 
 再配一个 `align_to_block_size` 的边界数值，确认 block 粒度对齐没记错。函数本身按 `(n-1)//b*b` 算，对直接传入的实参：`align(9, 4) = 8`、`align(8, 4) = 4`、`align(1, 4) = 0`——命中数永远落在 block 边界上。但别忘了 `ExampleConnector` 调用时先减一（`len(token_ids) - 1`），所以一个 9-token prompt 真实命中是 `align(9-1, 4) = align(8, 4) = 4`，与 §29.4 那个数对上。
+
+把这个数继续往下串，就能把全章最微妙的两个数值点接成一条端到端追踪：`block_size=4`、prompt 共 9 token、远程**全命中**。`num_computed_tokens` 随调度阶段的演化如下。
+
+| 阶段 | 触发点 | `num_computed_tokens` | 含义 |
+|---|---|---|---|
+| 查命中 | `get_num_new_matched_tokens` | `0 + align(8,4) = 4` | 本地 0、远程命中对齐到 4（§29.4） |
+| 隔离 | 置 `WAITING_FOR_REMOTE_KVS` | `4` | 记下但暂不使用（L553） |
+| KV 到位 | `_update_waiting_for_remote_kv` 入口 | `4`（=`num_tokens-…`，仍 < 9） | `cache_blocks` 登记到位的 block |
+| 回退判定 | 若 `==num_tokens` | （此例 4≠9，不触发） | 全命中边界仅在覆盖满 9 token 时触发 |
+
+第三、四行就是边界的关键：只有当远程**真覆盖到全部** prompt token（`num_computed_tokens == num_tokens`，即对齐数恰好等于 `num_tokens`）时，回退分支才把它压回 `num_tokens - 1`，留最后一个 token 走前向产生 logits。本例对齐到 4、不等于 9，所以不触发回退；剩下的零头 token 正常走前向。把这条数值线在脑子里走一遍，§29.3 的"对齐"与 §29.5 的"回退"就拧成了同一根线。
 
 精简版与真实 `f3fef123` 源码逐行对照，测试全绿。但请记住：精简版只是"剥掉无关分支后能在本地跑的这几十行"，本章的主线，始终是真实源码本身。
 

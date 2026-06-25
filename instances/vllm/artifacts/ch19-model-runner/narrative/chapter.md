@@ -169,6 +169,14 @@ $$
 
 人话翻译：前向在 GPU 上跑的那段时间，CPU 没闲着，它在采上一拍的 token、排下一拍的活。一拍的实际墙钟时间，被压到「GPU 算前向」和「CPU 采样加排活」两者中更长的那个——而不是把它们排成一条直线挨个等。
 
+举个数量级（示意值，非实测）。设前向 8 毫秒、采样加排活 5 毫秒：
+
+$$
+T_\mathrm{fwd} \approx 8\,\mathrm{ms}, \qquad T_\mathrm{samp} + T_\mathrm{sched} \approx 5\,\mathrm{ms}
+$$
+
+串行拍周期约 $8+5=13$ 毫秒；两阶段下稳态拍周期约 $\max(8,5)=8$ 毫秒，省下约 38%。前向越重、采样排活越能藏进它的影子里，这个比例就越可观。
+
 ## 19.3 阶段一全景：从工单到一份缓存的 state
 
 `execute_model()` 这半拍做的事，可以按顺序拆成五步：归一持久批次 → 建输入张量 → 决定 CUDA graph → 发起前向 → 算 logits 并缓存。我们顺着源码走一遍主干。
@@ -432,9 +440,11 @@ $$
 
 写回与读回为什么严丝合缝？因为有一个单调推进的计数撑着它。
 
-先看起点：请求装入 slot 行时（`add_request`，本节上面那段 `gpu_input_batch.py:L385`），`num_tokens_no_spec = num_prompt_tokens`，首个生成 token 就写在第 `num_prompt_tokens` 格；下一拍 `num_computed_tokens` 恰好推进到该格——递推由此起步。
+先看起点：请求装入 slot 行时（`add_request`，本节上面那段 `gpu_input_batch.py:L342`），`num_tokens_no_spec = num_prompt_tokens`，首个生成 token 就写在第 `num_prompt_tokens` 格；下一拍 `num_computed_tokens` 恰好推进到该格——递推由此起步。
 
-归纳步：每拍结束，对每个采到 token 的请求，`num_tokens_no_spec[r]` 加上新 token 数、`len(output_token_ids)` 同步增长。下一拍 `num_computed_tokens_cpu[r]` 单调推进，且每拍恰好停在「上拍最后写入格」；于是 `positions = num_computed_tokens_cpu + query_pos`、`token_indices = positions + r·max_model_len`，保证 `index_select` 取到的恰是上拍写进 `[start, end)` 区间的新 token。写指针（`num_tokens_no_spec`）和读指针（`num_computed_tokens`）由此一拍拍咬在同一格上——持久批次因此不必每拍重建，新 token 只在 slot 行尾部增量追加，一拍接一拍地长下去。
+归纳步：每拍结束，写回循环对每个采到 token 的请求把 `num_tokens_no_spec[r]` 加上 `num_sampled_ids`、`len(output_token_ids)` 同步增长。读指针为什么恰好咬住这一格？关键在它的推进量和写指针是同一个数。decode 拍里调度器给该请求新调度 1 个 token，拍间它把 `num_computed_tokens_cpu[r]` 也加上上拍采到的 `num_sampled_ids`；而上拍写回时 `num_tokens_no_spec[r]` 加的正是同一个量。
+
+说白了：两个计数从同一起点（`add_request` 处 `num_tokens_no_spec` 与 `num_computed_tokens` 都从 `num_prompt_tokens` 一侧出发）启动，每拍各加同一增量，所以恒等。于是 `positions = num_computed_tokens_cpu + query_pos`、`token_indices = positions + r·max_model_len`，落点必是上拍写进 `[start, end)` 区间那一格，`index_select` 取到的恰是刚写回的新 token。写指针（`num_tokens_no_spec`）和读指针（`num_computed_tokens`）由此一拍拍咬在同一格上——持久批次因此不必每拍重建，新 token 只在 slot 行尾部增量追加，一拍接一拍地长下去。
 
 用精简版把两拍连起来跑，看这个计数和位置怎么递进。第一拍前批次某请求 `num_tokens_no_spec[0] = 4`，采样器固定吐 token `Z`：
 

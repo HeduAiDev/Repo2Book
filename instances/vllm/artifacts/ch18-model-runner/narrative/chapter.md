@@ -373,7 +373,9 @@ def condense(self) -> None:
 
 > *图注：拍 1 四请求满载。拍 2 中 B、D 完成被打洞（slot 1、3），E、F 到来——`pop_removed()` 让它们直接复用 slot 1、3，无洞无搬移；同到的 G 已无洞可填，追加到末尾的 slot 5。拍 3 中 C 完成留洞且无新请求填补，`condense` 把尾部活请求 G 从 slot 5 搬进 slot 2，使 `[0, num_reqs)` 重新连续。*
 
-**为什么 `condense` 一定会终止？** 看那个不变量：`last_req_index` 每轮要么因内层 `while` 自减、要么因外层尾部 `-= 1` 自减，**严格单调递减的非负整数**。`empty_index` 则单调递增（`removed` 降序弹出，每次弹最小）。两个指针一升一降相向而行，要么 `removed` 弹空、要么 `empty_index >= last_req_index` 触发 `break`——有限步必停。压实后 `[0, num_reqs)` 连续无洞，正好满足 `_prepare_inputs` 那道契约。
+**为什么 `condense` 一定会终止？** 看那个不变量：`last_req_index` 每轮要么因内层 `while` 自减、要么因外层尾部 `-= 1` 自减，**严格单调递减的非负整数**。`empty_index` 则单调递增（`removed` 降序弹出，每次弹最小）。两个指针一升一降相向而行，要么 `removed` 弹空、要么 `empty_index >= last_req_index` 触发 `break`——有限步必停。
+
+终止只是一半，还得确认搬移**既不丢请求、也不覆盖活数据**。这靠一条循环不变量撑住：每轮搬移前，`[0, empty_index)` 区间内已无空洞，`(last_req_index, 末尾]` 区间内已无活请求。于是被搬的 `last_req_index` 一定是**待安置的最大活请求**，目标 `empty_index` 一定是**最小空洞**；而循环条件 `empty_index < last_req_index` 保证二者不重叠——源数据是活的、目标格子是空的，搬移既不丢也不重。两个指针每动一步都维持这条不变量，直到相遇。压实后 `[0, num_reqs)` 连续无洞，正好满足 `_prepare_inputs` 那道契约。
 
 这套两段式的复杂度收益是实打实的。设批大小 `R`、最大序列长 `L`、本拍变更（增删移）请求数 `ΔN`：
 
@@ -650,7 +652,7 @@ def test_add_reuses_smallest_empty_slot():
     assert batch.req_id_to_index["E"] == 1
 ```
 
-这两个断言把 §18.5 的机制钉死了：`remove` 后 `removed = [1]` 而 `req_id_to_index` 里只是少了 B——证明**洞被标记、数据没搬**；接着 `add("E")` 让 E 落在 slot 1 而非 slot 4——证明 `pop_removed()` 确实**复用了最小空洞**。
+这两个断言把 §18.5 的机制钉死了：`remove` 后 `removed = [1]` 而 `req_id_to_index` 里只是少了 B——证明**洞被标记、数据没搬**；接着 `add("E")` 让 E 落在 slot 1 而非 slot 4——证明 `pop_removed()` 确实**复用了最小空洞**。这里只打了一个洞，看不出账本的排序约定；多个洞时 `removed` 始终按**降序**存——比如同拍移除 B、D 会得到 `removed = [3, 1]`，`pop_removed()` 总从尾部弹出最小的那个，与 §18.5「最小空洞优先」严丝合缝。
 
 token 收集的拍扁公式也能逐元素核对：
 

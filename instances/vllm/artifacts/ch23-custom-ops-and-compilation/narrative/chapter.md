@@ -144,6 +144,8 @@ def default_on() -> bool:
 
 `custom_ops` 列表里必定恰好有一个 `"all"` 或 `"none"`（那句 `assert count_none + count_all == 1` 保证了这一点），它定下全局基调。返回值 `not count_none > 0 or count_all > 0` 翻译成人话：**只要不是 `none`，就默认开**。
 
+这里有个优先级陷阱要点破：`not` 只作用在 `count_none > 0` 上，整式等价于 `(count_none == 0) or (count_all > 0)`，**不是** `not (count_none > 0 or count_all > 0)`——按字面从左读容易读反。又因恰有一个 `all`/`none`，这两半其实殊途同归，都归结为「不是 `none` 就开」。
+
 最妙的一句话在 docstring 里：**用 PyTorch Inductor 时，默认值是 `none`；否则是 `all`。**
 
 为什么这么设计？这正是两级 dispatch 咬合的地方。
@@ -174,6 +176,17 @@ assert RMSNorm.enabled() is False
 ```
 
 这就是真实 `enabled()`/`default_on()` 的控制流，一条不差。把它跑起来，那句拗口的布尔表达式就不再抽象了。
+
+不必死记四种配置的结论——把上面四行当成对 `(default_on() or enabled) and not disabled` 的逐拍求值，每一行哪个中间量翻了、最后落到哪，一目了然：
+
+| `custom_ops` 配置 | `default_on()` | `enabled`(有 `+name`) | `disabled`(有 `-name`) | `(default_on or enabled) and not disabled` | `enabled()` |
+| --- | --- | --- | --- | --- | --- |
+| `['all']` | `True` | `False` | `False` | `(T or F) and not F` | **`True`** |
+| `['none']` | `False` | `False` | `False` | `(F or F) and not F` | **`False`** |
+| `['none','+rms_norm']` | `False` | `True` | `False` | `(F or T) and not F` | **`True`** |
+| `['all','-rms_norm']` | `True` | `False` | `True` | `(T or F) and not T` | **`False`** |
+
+盯住最后一行：`default_on()=True`（有 `all`）、`enabled=False`（没写 `+rms_norm`）、`disabled=True`（写了 `-rms_norm`），代进去是 `(True or False) and not True = True and False = False`。`-name` 那个 `not disabled` 在最外层一票否决，这就是「`-` 优先级最高」可见的计算支撑，而不是一句断言。
 
 还有一个细节值得点一句。`enabled` 为假时走的不是裸的 `forward_native`，而是 `maybe_compile(self.forward_native)`。注释解释了原因：当一个 `CustomOp` 被夹在某个**不透明的 torch 自定义算子内部**（比如 `fused_moe`、`unified_attention`），模型级的 `torch.compile` 根本看不到它——它藏在不透明算子的黑箱里。这时如果直接用 `forward_native`，那串纯 torch 算子会退化成一个个零散的 eager 调用，谁也不帮它融合。于是 vLLM 对它**单独**做一次 `torch.compile`，至少在算子内部把这几行编起来。这是个边角补丁，记住它的存在即可。
 
@@ -576,7 +589,9 @@ assert n_split == 2
 assert torch.allclose(split_gm(*inputs), graph(*inputs))
 ```
 
-为什么「按连续区段切 + 保持原顺序」就一定保留同一个函数？把节点按拓扑序排成一条链，`split_graph` 只做两件事：一是给每个节点贴一个**单调不减**的 `subgraph_id`（遇切点 +1，普通点沿用前驱的 id）；二是 `split_module(keep_original_order=True)` 按这个 id 把连续区段打包成子模块，且**不改节点间的相对顺序**。于是有一个贯穿全图的不变量：对任意前缀，「每个节点的输入都在它自己之前求值」这条性质始终成立——因为 id 单调、顺序不变，任何一条数据依赖边都不会被跨段倒置。整图作为函数因此与切分前逐点等价；连原地 `mutation` 的算子（`output` 被写）也因顺序不变而读到正确的前驱值。这正好和 23.8 的 `kv_cache_dummy_dep` 呼应：段**内**顺序由 `split_module` 锁住，跨「KV 更新 → attention」的顺序则另靠那个假依赖锁住，两道锁各管一段，谁都不会踩到重排的坑。
+为什么「按连续区段切 + 保持原顺序」就一定保留同一个函数？贪心地讲：节点按拓扑序排成一条链，`split_graph` 只贴**单调不减**的 `subgraph_id`（遇切点 +1，普通点沿用前驱的 id），再用 `split_module(keep_original_order=True)` 按这个 id 把连续区段打包成子模块、且**不改节点间的相对顺序**。归纳骨架就一句：基例是空前缀（平凡成立）；归纳步里每新增一个节点，它的 `subgraph_id` 不小于任何前驱、相对顺序又没动，于是「每个节点的输入都在它自己之前求值」这条不变量逐节点保持——任何一条数据依赖边都不会被跨段倒置。整图作为函数因此与切分前逐点等价；连原地 `mutation` 的算子（`output` 被写）也因顺序不变而读到正确的前驱值。切完仍是同一个函数。
+
+这正好和 23.8 的 `kv_cache_dummy_dep` 呼应：段**内**顺序由 `split_module` 锁住，跨「KV 更新 → attention」的顺序则另靠那个假依赖锁住，两道锁各管一段，谁都不会踩到重排的坑。
 
 所以切完语义不变，但图已经被分成了可分别处理的段。
 
@@ -660,7 +675,7 @@ for name, mod in split_gm.named_children():
 
 答案是：attention 被**注册成了一个不透明的 torch 自定义算子**。
 
-先看它在 `Attention.forward` 里怎么被调用的。attention 是否被包成不透明 torch op，由平台的 `opaque_attention_op()` 说了算：`self.use_direct_call = not current_platform.opaque_attention_op()`。CUDA、ROCm、CPU 上它返回 `True`，于是 `use_direct_call=False`，走 `else` 那一支的 `torch.ops.vllm.unified_attention_with_output`——正是 Dynamo 要看到的那个干净节点。只有少数其它平台 `opaque_attention_op()` 为 `False`、`use_direct_call=True`，直接 Python 调用、交给 `torch.compile` 自行处理（`vllm/model_executor/layers/attention/attention.py:L462`）：
+先看它在 `Attention.forward` 里怎么被调用的。记住结论：CUDA、ROCm、CPU 上，attention 走的是 `else` 分支里的 `torch.ops.vllm.unified_attention_with_output`——正是 Dynamo 要看到的那个干净节点。推导是这样：是否包成不透明 torch op 由平台的 `opaque_attention_op()` 说了算，而 `self.use_direct_call = not current_platform.opaque_attention_op()`；这几个平台上 `opaque_attention_op()` 返回 `True`，于是 `use_direct_call = not True = False`，自然落到 `else`。只有少数其它平台 `opaque_attention_op()` 为 `False`、`use_direct_call=True`，才直接 Python 调用、交给 `torch.compile` 自行处理（`vllm/model_executor/layers/attention/attention.py:L462`）：
 
 ```python
 # vllm/model_executor/layers/attention/attention.py:L462

@@ -266,7 +266,14 @@ def apply_penalties(
 - **presence penalty**：`logits -= presence * 是否出现`。只要出现过就扣一个固定值，不管出现几次。
 - **repetition penalty**：稍特殊，是个自定义 op，不是简单减法。它对在 prompt 或输出里出现过的 token 做乘除——正 logit 除以 penalty、负 logit 乘以 penalty。这样 `penalty > 1` 时，无论原来 logit 正负，都朝"更不可能"的方向压。
 
-repetition 这个"正除负乘"的不对称，精简版里把那个自定义 op 的 torch 实现也复刻了（`vllm/_custom_ops.py` 里的派发器），核心就一句 `torch.where(logits > 0, 1.0 / penalties, penalties)`。你在 CPU 上喂一行 logits，会看到正分数被除小、负分数被乘得更负，正好把"已出现的 token"整体往下压。
+repetition 这个"正除负乘"的不对称，精简版里把那个自定义 op 的 torch 实现也复刻了（`vllm/_custom_ops.py` 里的派发器），核心就一句 `torch.where(logits > 0, 1.0 / penalties, penalties)`。这个方向最容易记反，代入 `penalty = 1.5` 走两个数就清楚了：
+
+| 原 logit | 符号判定 | 缩放算式 | 新 logit | 效果 |
+| --- | --- | --- | --- | --- |
+| `+2.0` | `> 0`，除 | `2.0 × (1/1.5)` | `1.333` | 正分被除小，更不可能 |
+| `-2.0` | `≤ 0`，乘 | `-2.0 × 1.5` | `-3.0` | 负分被乘得更负，更不可能 |
+
+两行一对照就抓住要害：`penalty > 1` 时，正分往 0 压、负分往负无穷拉，无论原 logit 正负都朝"更不可能"的方向走——这正是"压住已出现 token"的统一效果。你在 CPU 上喂这一行 logits，断点看 `scaling` 那步，会精确还原上表的 `1.333` 与 `-3.0`。
 
 外层还有个张量化的 wrapper `apply_all_penalties`，它把逐请求的 `output_token_ids`（一个 list of list）补齐成定长张量，顺手处理一个异步调度的边角（`vllm/v1/sample/ops/penalties.py:L11`）：
 
@@ -445,6 +452,17 @@ def apply(self, logits: torch.Tensor) -> torch.Tensor:
 `logit_bias` 直接给某些 token 加偏置——加多了当然能把座次顶起来。`min_tokens` 在没到最小长度前把 EOS/stop token 摁成 `-inf`——万一 EOS 本来是最高分，摁掉它 argmax 就换人了。所以这俩必须前置（第 5 步），在 greedy 之前就生效；而 `min_p` 不影响 argmax，就能推迟到温度之后、且只在随机路跑。
 
 这套分类带来一个干净的不变量：**贪心快路上，凡是能改 argmax 的处理（第 3–6 步）都已生效，凡是不改 argmax 的（min_p、温度、截断）都被合法跳过**。所以快路早退取的那个 argmax，跟"老老实实走完随机路再取 argmax"是同一个 token——只是省掉了中间所有计算。这不是近似，是严格相等。
+
+为什么敢说"严格相等"而不是"约等于"？把它收成一条逐算子可检验的论证链就清楚了。
+
+- **命题**：设 `t* = argmax(logits)` 是快路早退取的 token；走完随机路（温度→min_p→top-k/top-p）后再取 argmax，得到的仍是同一个 `t*`。
+- **逐算子保 argmax 位置**：随机路上每个算子都不改"谁是最大项"这件事——
+  - *温度*：`logits / T`（`T > 0`）是一个单调正变换，除以正数不改任何两元素的大小次序，最大值的位置自然不动。
+  - *min_p*：它砍掉概率 `< min_p × max_prob` 的尾部。关键一步是最高概率项 `max_prob` 本身永远在阈值之上——因为 `min_p ≤ 1`，所以 `max_prob ≥ min_p × max_prob`，等号仅在 `min_p = 1` 时取到，`max_prob` 恒不小于阈值，永不被砍。
+  - *top-k / top-p*：两者都只从"非最大"的那一侧往下砍（top-k 砍升序最前的小值、top-p 砍累积尾部），最大项永远落在保留集里。
+- **归纳收束**：从 `logits` 出发，每过一个算子，"当前最大项仍是 `t*`"这条性质都被保持（基例=进入随机路前最大项是 `t*`，归纳步=上面三类算子各自保位）；走到末尾再取 argmax，必然还是 `t*`。
+
+链里唯一容易留隐患的环就是 min_p 那条不等式——补上 `min_p ≤ 1 ⇒ max_prob ≥ min_p × max_prob` 这半句，整条等价就闭合、可被读者逐项验证了。正因每个算子都保位，快路早退才敢省掉它们而不影响结果。
 
 **决策三：混合批用 torch.where 逐请求合并。** 真实负载里一个 batch 常常贪心、随机请求混着。代码的处理很聪明：不分流，而是**两条路都全算一遍**——`greedy_sampled` 算了，随机路 `random_sampled` 也算了——最后用 `torch.where(temperature < eps, greedy_sampled, random_sampled)` 按逐请求温度在两个结果里逐行挑。温度近 0 的行取 greedy 的结果，其余取 random 的。那个 `out=greedy_sampled` 是复用张量、省一次分配的小动作。
 
