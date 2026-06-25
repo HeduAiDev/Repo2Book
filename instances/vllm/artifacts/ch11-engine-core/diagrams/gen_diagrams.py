@@ -156,7 +156,7 @@ def step_orchestration2():
     mid_x = (cpu_x + bw // 2 + gpu_x - bw // 2) // 2
     B.append(txt(mid_x, ys[2] + bh // 2 - 8, "重叠区", 12, anchor="middle",
                  fill="#16a34a", weight="bold"))
-    B.append(txt(mid_x, ys[2] + bh // 2 + 10, "掩码(CPU) 与 前向(GPU) 并行", 10.5,
+    B.append(txt(mid_x, ys[2] + bh // 2 + 10, "掩码与前向并行", 10.5,
                  anchor="middle", fill="#16a34a"))
     return w, h, B
 

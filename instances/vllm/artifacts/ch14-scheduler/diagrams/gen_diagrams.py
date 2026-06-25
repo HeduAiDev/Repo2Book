@@ -172,7 +172,12 @@ def diagram2():
     b.append(box(rx, schy, 230, 44, "#dcfce7", "#15803d"))
     b.append(txt(rx+115, schy+19, "_select → 调度 R1, R2, R3", 12, fill="#15803d"))
     b.append(txt(rx+115, schy+35, "可调度请求照常前进", 10.5, fill="#15803d"))
-    b.append(line(rx+slot_w/2, wy+slot_h, rx+slot_w/2, schy, color="#15803d", marker="agrn"))
+    # green waiting→_select arrow routed down the LEFT of R0 so it never crosses
+    # the skipped_waiting box (R0 spans rx..rx+slot_w).
+    gx = rx - 14
+    b.append(line(rx+slot_w/2, wy+slot_h, gx, wy+slot_h+10, color="#15803d", marker=None))
+    b.append(line(gx, wy+slot_h+10, gx, schy+22, color="#15803d", marker=None))
+    b.append(line(gx, schy+22, rx, schy+22, color="#15803d", marker="agrn"))
 
     # R0 try_promote fail -> step_skipped_waiting -> prepend back
     b.append(box(rx+270, schy, 220, 44, "#fff7ed", "#b45309"))

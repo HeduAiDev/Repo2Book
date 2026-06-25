@@ -53,7 +53,7 @@ draw_col(x1, [
 
 # 拍2
 x2 = x1 + col_gap + 60
-title(x2-100, 70, "拍 2：B、D 完成 + E、F、G 到来")
+title(x2-100, 70, "拍 2：B/D 走，E/F/G 来")
 draw_col(x2, [
     ("A", C_ACTIVE, "#1e3a8a"),
     ("E  (复用 slot1)", C_REUSE, "#166534"),
