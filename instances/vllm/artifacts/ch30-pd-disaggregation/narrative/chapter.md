@@ -203,7 +203,7 @@ def maybe_transfer_kv_layer(func: Callable) -> Callable:
 
 把这个和 §30.2 的 `start_load_kv` 拼起来，重叠的完整机制就清楚了：
 
-`start_load_kv` 在第 0 层之前就把**所有层**的 load 一把发起。模型照常往前跑，层 0、层 1……每跑一层，`wait_for_layer_load` 只等**当前这一层**的 KV 到位。理想情况下，第 0 层算的时候，后面层的 KV 正在后台搬；等模型算到第 k 层，第 k 层的 KV 早就搬完了，`wait_for_layer_load` 立刻返回，不阻塞。**传输延迟被藏进了前面层的计算里。**
+`start_load_kv` 在第 0 层之前就把**所有层**的 load 一把发起——具体而言，P2P 把每一层的 recv 任务依次入队给后台传输线程，NIXL 则向网卡提交一次覆盖所有块的非阻塞 READ，两种方式都由后端引擎自己管并发，mixin 只负责"发起"和"按层等待"这两端。模型照常往前跑，层 0、层 1……每跑一层，`wait_for_layer_load` 只等**当前这一层**的 KV 到位。理想情况下，第 0 层算的时候，后面层的 KV 正在后台搬；等模型算到第 k 层，第 k 层的 KV 早就搬完了，`wait_for_layer_load` 立刻返回，不阻塞。**传输延迟被藏进了前面层的计算里。**
 
 ### 量化一下这个收益
 
@@ -225,7 +225,7 @@ $$
 
 举个数：一个 32 层的模型，每层算 1 ms（合计 32 ms），整请求 KV 传输要 20 ms。同步方案要 20 + 32 = 52 ms；重叠方案只要 max(20, 32) = 32 ms。**只要传输能藏进计算，也就是 $T_{xfer} \lesssim N t_c$，那 20 ms 的传输延迟就近乎被完全隐藏**，总时间退化成纯计算时间。这就是把 `start_load_kv` 拆成"早发起 + 逐层等"而非"一把等齐"的全部理由。
 
-把上面这组数（32 层、每层 1 ms、传输 20 ms）按层逐拍追一遍，就能看见"阻塞点在前几层、之后立刻返回"这个转折。假设后台传输匀速、20 ms 内搬完全部 32 层，则每 0.625 ms 搬完一层；而计算每层 1 ms。`wait_for_layer_load(layer_k)` 在算到第 k 层时只需等"第 k 层是否已搬完"：
+把上面这组数（32 层、每层 1 ms、传输 20 ms）按层逐拍追一遍，就能看见"阻塞点在前几层、之后立刻返回"这个转折。假设后台传输匀速、20 ms 内搬完全部 32 层，则每 0.625 ms 搬完一层（20 ms ÷ 32 = 0.625 ms/层）；而计算每层 1 ms。表中"已耗时"列是到达第 k 层时的累计时间（第 0 层为 0 ms，第 1 层为第 0 层的等待 0.625 ms 加计算 1 ms，合计 ≈ 1.6 ms，依此累加）。`wait_for_layer_load(layer_k)` 在算到第 k 层时只需等"第 k 层是否已搬完"：
 
 | 算到第 k 层（已耗时） | 已搬完层数 | wait_for_layer_load(layer_k) 等多久 | 阻塞？ |
 |---|---|---|---|
@@ -234,7 +234,7 @@ $$
 | 第 8 层（≈8.6 ms） | ≈13.8 层 | 第 8 层早搬完 | 立即返回 |
 | 第 31 层（≈31.6 ms） | 32 层（≈20 ms 时已全搬完） | 第 31 层早搬完 | 立即返回 |
 
-读这张表的方式是看后两列：只有最前面那一两层可能真的等（传输刚起步、计算进度暂时领先搬运进度），一旦"已搬完层数"反超"算到第几层"——这里发生在第 1 层附近——之后每一层的 `wait_for_layer_load` 都立即返回。计算进度（每拍 +1 层）始终慢于传输进度（每拍 +1.6 层），二者的差单调拉开，阻塞窗口只在开头出现一次。这就是"传输藏进计算"在逐层粒度上的真实形状：不是从头到尾零等待，而是开头交一点过路费、之后全程畅通。
+读这张表的方式是看后两列：只有最前面那一两层可能真的等（传输刚起步、计算进度暂时领先搬运进度），一旦"已搬完层数"反超"算到第几层"——这里发生在第 1 层附近——之后每一层的 `wait_for_layer_load` 都立即返回。计算进度（每拍 +1 层，即每 1 ms 推进 1 层）始终慢于传输进度（每 1 ms 搬完 1÷0.625 ≈ 1.6 层），二者的差单调拉开，阻塞窗口只在开头出现一次。这就是"传输藏进计算"在逐层粒度上的真实形状：不是从头到尾零等待，而是开头交一点过路费、之后全程畅通。
 
 而出层后的 `save_kv_layer` 是对称的另一半：边算后面的层，边把前面层的 KV 异步搬出去，把 save 也摊进计算。
 
@@ -488,7 +488,7 @@ def wait_for_save(self):
         self.p2p_nccl_engine.wait_for_sent()
 ```
 
-`extract_kv_from_layer` 按 attention 后端的 layout（FlashAttention 沿一个维度、MLA 沿另一个）从 paged buffer 里切出本请求 `block_ids` 对应的 KV，然后 `send_tensor` 发出去。tensor 的 key 是 `request_id#layer_name`——和 consumer 那边 `recv_tensor` 用的 key 严丝合缝对上。
+`extract_kv_from_layer` 按 attention 后端的 layout 从 paged buffer 里切出本请求 `block_ids` 对应的 KV，然后 `send_tensor` 发出去。`shape[0] == 2` 对应 FlashAttention layout——该 layout 把 K 和 V 堆叠在 dim 0，形如 `[2, num_blocks, ...]`，第 0 维就是 (K, V) 这个二元组；其它 layout（MLA、FlashInfer 等）则沿不同维度组织，`shape[0]` 不等于 2，走后续分支处理。tensor 的 key 是 `request_id#layer_name`——和 consumer 那边 `recv_tensor` 用的 key 严丝合缝对上。两端协调靠 P2P NCCL 引擎内部的 rendezvous：consumer 的 `recv_tensor` 按 key 阻塞等待，producer 的 `send_tensor` 用同一个 key 发出后唤醒对端，无需额外的信令通道。
 
 ### wait_for_save 落在哪：异步发为什么需要 fence
 
@@ -784,7 +784,7 @@ def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
 
 三个设计点，每个都因为"这是二级缓存、不在解码关键路径上"而和前两个后端不同：
 
-**一、store 推迟到下一步发。** `prepare_store_kv`（即 `wait_for_save` 的落点）**只把 store job 入队** `_unsubmitted_store_jobs`，**不真发**。真正的 `transfer_async` 推迟到下一步 `start_kv_transfers` 的开头才做。源码注释写明了为什么：让卸载发生在"和 token 采样相关的传输之后"，避免拖慢 token 生成。卸载不急，何必在 `wait_for_save` 里同步等磁盘写完、白白拖慢本步的采样？**用调度时机换 ITL**（inter-token latency）。所以 `start_kv_transfers` 一进来先发"上一步排队的 store"，再发"本步的 load"。
+**一、store 推迟到下一步发。** `prepare_store_kv`（即 `wait_for_save` 的落点）**只把 store job 入队** `_unsubmitted_store_jobs`，**不真发**。真正的 `transfer_async` 推迟到下一步 `start_kv_transfers` 的开头才做。源码注释写明了为什么：让卸载发生在"和 token 采样相关的传输之后"，避免拖慢 token 生成。具体冲突是：GPU→CPU 的 KV store 和 sampling 阶段的 logits 传输共享同一条 PCIe/NVLink 带宽，若两者同步发起，store 会抢占 sampling 的带宽窗口，直接拉高 ITL。推迟到下一步 `start_kv_transfers` 开头再发，sampling 此时已完成，带宽完全让给 store。卸载不急，何必在 `wait_for_save` 里同步等磁盘写完、白白拖慢本步的采样？**用调度时机换 ITL**（inter-token latency）。所以 `start_kv_transfers` 一进来先发"上一步排队的 store"，再发"本步的 load"。
 
 **二、`finished_sending` 恒空。** P/D 场景里 `finished_sending` 是用来通知 scheduler"块发完了可以释放给别人"。但卸载里块不是要释放给别人——是 GPU 块在被复用前必须确保已落盘。这用一套不同机制：worker 经 `build_connector_worker_meta` 上报 `completed_jobs`，调度侧据此在复用前用 `jobs_to_flush` 等对应 store 完成（一道围栏）。所以你看 `get_finished` 永远 `return set(), finished_recving`——**第一个集合恒空**，store 完成根本不走 `finished_sending` 这条道。
 

@@ -132,7 +132,7 @@ for out in outputs:
 
 `getenv(..., "1")`——你不设它，它就是 `1`，就是 `True`。
 
-所以默认情况下，那个 `if` 必然进，`enable_multiprocessing` 必然变 `True`，`multiprocess_mode=True` 必然传给 `LLMEngine.__init__`。形参默认值 `False` 在实践中**从来不会生效**。这就是为什么"离线 = 进程内"是错的：决定权根本不在那个形参手里，而在这个默认开启的环境变量手里。
+所以默认情况下，那个 `if` 必然进，`enable_multiprocessing` 必然变 `True`，`multiprocess_mode=True` 必然传给 `LLMEngine.__init__`。形参默认值 `False` 在实践中**从来不会生效**。这就是为什么"离线 = 进程内"是错的：决定权根本不在那个形参手里，而在这个默认开启的环境变量手里。默认开启多进程的理由也很直接：把 EngineCore 隔离在独立进程里，既避开了 Python GIL 对主进程 CPU 端（tokenize、输出装配）的争抢，也让 GPU 侧崩溃不会把整个应用进程带死。
 
 > 用精简版亲手验证这一点很简单：构造一个 `LLM`，看它内部的引擎客户端是哪个类。默认下你会拿到 `SyncMPClient`；只有把 `VLLM_ENABLE_V1_MULTIPROCESSING=0` 显式关掉，才会回退到 `InprocClient`。
 

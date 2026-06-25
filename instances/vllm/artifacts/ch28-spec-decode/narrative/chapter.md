@@ -336,7 +336,7 @@ class RejectionSampler(nn.Module):
 
 四类 token，记住这个加法式：**输出 = 接受的草稿 + 拒绝处的 recovered + 全接受时的 bonus**。
 
-这里藏着一个值得停一下的设计决策：**bonus token 不在 rejection sampler 内部采，而是外面传进来**。为什么要绕这一手？因为投机解码的接受准则只支持基本采样，配不上 `top_p`、`top_k` 这些高级策略。把 bonus token 单独交给上一章那个完整的 9 步 sampler 去采，它就能享受全套采样参数。这就是 `forward` 开头先采 bonus 的原因：
+这里藏着一个值得停一下的设计决策：**bonus token 不在 rejection sampler 内部采，而是外面传进来**。为什么要绕这一手？因为投机解码的接受准则只支持基本采样，配不上 `top_p`、`top_k` 这些高级策略。把 bonus token 单独交给[第 27 章那个完整的 9 步 sampler](../ch27-sampling/narrative/chapter.md) 去采，它就能享受全套采样参数。这就是 `forward` 开头先采 bonus 的原因：
 
 ```python
 # vllm/v1/sample/rejection_sampler.py:L120
@@ -464,7 +464,7 @@ def rejection_greedy_sample_kernel(
         )
 ```
 
-每个 Triton program 处理一个请求。第一件事就是用 `cu_num_draft_tokens` 反推本请求的草稿区间 `[start, end)`——这正是 28.2 那个累积和的用途。
+每个 Triton program 处理一个请求。第一件事就是用 `cu_num_draft_tokens` 反推本请求的草稿区间 `[start, end)`——这正是 28.2 那个累积和的用途。以 28.2 的例子说：`cu = [3, 3, 5, 5, 6]`，req2 的区间是 `[cu[1], cu[2]) = [3, 5)`，即摊平张量的第 3、4 位是它的两个草稿。
 
 准则很简单：greedy 采样就是取概率最高的 token，所以目标模型在这个位置的"标准答案"是 `target_argmax`。草稿等于 argmax 就接受、否则拒绝。注意一个细节：**拒绝位仍然写入 `target_argmax_id`**——因为 greedy 语义下，纠正后的 token 就是目标的 argmax。而且一旦 `rejected = True`，`if not rejected` 这一守卫让后续位置不再写，自然保留预填的 −1。
 
@@ -657,7 +657,7 @@ def sample_recovered_tokens_kernel(
 
 `prob = tl.maximum(target_prob - draft_prob, 0.0)` 正是残差的分子 $(p-q)_+$。但注意：代码**没有**除以 $\sum_y (p-q)_+$ 来归一化，而是直接 `score = prob * inv_q`，再取 `argmax`。
 
-这用的是 **Gumbel-max 技巧**的一个等价形式。`inv_q` 是 $1/q'$，其中 $q'$ 取自指数分布 $\mathrm{Exp}(1)$。可以证明，对未归一化的权重 `prob`：
+这用的是 **Gumbel-max 技巧**的一个等价形式。`inv_q` 是 $1/q'$，其中 $q'$ 取自指数分布 $\mathrm{Exp}(1)$。直觉：指数分布的 CDF 是 $1 - e^{-\lambda t}$，当用权重 $w$ 缩放参数时，两个 token 中权重更大的那个"等待时间更短"，赢得 argmax 的概率正比于其权重——本质是对指数随机变量取 argmax 就等价于按权重比例抽签。可以证明，对未归一化的权重 `prob`：
 
 $$
 \arg\max_x\ \bigl(\mathrm{prob}(x) \cdot \mathrm{inv\_q}(x)\bigr)\ \sim\ \frac{\mathrm{prob}(x)}{\sum_y \mathrm{prob}(y)}
@@ -701,7 +701,7 @@ def parse_output(output_token_ids, vocab_size, discard_req_indices=(), logprobs_
 
 一个 `valid_mask` 同时干两件事：过滤掉 `PLACEHOLDER_TOKEN_ID`（−1，被拒截断和未填的位置）和越界 token（`>= vocab_size`）。然后逐行取出有效 token，紧凑张量就还原成了变长 list。
 
-这里也体现了一个设计取舍：内核拒绝后**不再写后续位置、保留 −1**，而不是在 GPU 内做变长写。投机的语义本就是"首个拒绝即截断后续草稿"，留着 −1 哨兵让 CPU 端用单一 mask 一次性过滤，避开了 GPU 里麻烦的变长输出。精简版可以验证这个闭环：
+这里也体现了一个设计取舍：内核拒绝后**不再写后续位置、保留 −1**，而不是在 GPU 内做变长写。GPU 做变长输出需要原子计数器（每个请求动态确定写入偏移）或两遍 kernel（先统计输出长度再写），都有额外同步开销；而固定形状 `[batch_size, max_spec_len+1]` 的哨兵张量可以在 CPU 端用一次向量化 mask 过滤，代价极低。投机的语义本就是"首个拒绝即截断后续草稿"，这里用哨兵实现截断恰好是零开销的。精简版可以验证这个闭环：
 
 ```text
 output = [[5, 6, -1], [5, 3, 7]]    # req0 在 pos1 被拒截断；req1 全接受 + bonus

@@ -340,7 +340,7 @@ def collective_rpc(
     deadline = None if timeout is None else time.monotonic() + timeout
     kwargs = kwargs or {}
     # … 省略：kv_output_aggregator 聚合分支（PD 解耦专用，默认 aggregate = 恒等）…
-    output_rank = unique_reply_rank
+    output_rank = unique_reply_rank  # 对外叫 unique_reply_rank，内部用 output_rank
     aggregate = lambda x: x
     if isinstance(method, str):
         send_method = method
@@ -484,6 +484,12 @@ def _get_output_rank(self) -> int:
 
 逻辑落到一个简单算式：**最后一段流水线的第一个张量并行 worker**，全局 rank = `world_size - tp_size × pcp_size`。源码注释里那行 `world_size - tp_size = 32 - 8 = 24` 省掉了 `pcp_size`，是**默认 `pcp_size=1`** 时的特例（`8 × 1 = 8`）；一般式里 `pcp_size` 不能漏，否则前缀上下文并行开启时定位会偏。为什么是这个 rank？流水线并行下，只有**最后一段**算出最终 logits / token；张量并行下，同一段的各 rank 输出是冗余的，取 **rank 0** 即可。把这个 rank 当 `output_rank` 传进 `collective_rpc`，应答就只从这一条队列收。
 
+下图用 TP=4、PP=3（world_size=12）直观展示这个几何关系：
+
+![output_rank 在 TP×PP rank 网格中的位置](../diagrams/ch17-output-rank-grid.png)
+
+> *图注：行是 PP 阶段、列是 TP rank，格子里是全局 rank 编号。黄色高亮（rank 8）是 `output_rank`——最后一段 PP（stage 2）的第一个 TP worker（rank 0）。广播仍是 1 次，应答从 12 次 dequeue 降到 1 次。*
+
 这是个量化得很清楚的优化：广播仍是一次（O(1) 次发送），但**应答从 O(world_size) 次 `dequeue` 降到 O(1) 次**。32 卡时，不必从 32 条队列收 32 份冗余结果，只收 1 份——省掉 31 次跨进程 `dequeue` 与 31 份冗余 `ModelRunnerOutput` 的搬运。
 
 ---
@@ -518,7 +524,10 @@ def make_worker_process(...) -> UnreadyWorkerProcHandle:
     )
     # … 省略：NUMA 绑定 …
     proc.start()
-    # 父进程关掉子进程那端的管道口
+    # 父进程关掉已交给子进程的那端：
+    #   ready_writer 交给了子进程（子写 READY）→ 父不再需要，关掉
+    #   death_reader 交给了子进程（子等 EOF）→ 父不再需要，关掉
+    # 父进程保留：ready_reader（读 READY）、death_writer（持有写端、触发 EOF）
     ready_writer.close()
     death_reader.close()
     # 保留 death_writer：父进程一退出，子进程的 death_reader 收到 EOFError
@@ -526,6 +535,10 @@ def make_worker_process(...) -> UnreadyWorkerProcHandle:
 ```
 
 两条管道各司其职，这是个干净的设计：
+
+![ready / death 管道端点归属](../diagrams/ch17-pipe-topology.png)
+
+> *图注：ready pipe 的写端交给子进程（子发 READY），父进程保留读端；death pipe 的读端交给子进程（子等 EOF），父进程保留写端。spawn 后父进程立刻关掉已交出的那两端。*
 
 - **ready pipe（子→父）**：子进程把模型加载完、应答队列建好之后，才往这条管道发 READY。父进程靠它知道「这个 worker 可以收 RPC 了」。**没就绪就别发指令**，否则对着没建好队列的 worker 广播，死锁。
 - **death pipe（父→子）**：父进程**握着写端不放**。一旦父进程崩了 / 退出了，写端关闭，子进程那端的 `recv()` 收到 `EOFError`——子进程借此**感知父进程死了**，自己清理退出，不当孤儿。
@@ -669,7 +682,7 @@ def worker_busy_loop(self):
 
 - `dequeue` 拿到的 `(method, args, kwargs, output_rank)`，正是执行器 `enqueue` 进去的四元组。
 - `method` 是字符串就 `getattr(self.worker, method)` 取方法——这正是 [§17.8](#178-workerwrapperbase延迟出生) 那个 `__getattr__` 透传能命中具体方法的地方；是 bytes 就 `cloudpickle.loads` 反序列化成 callable，把 worker 绑成首参。这和执行器侧 `cloudpickle.dumps` 严格对偶。
-- **只有 `output_rank` 匹配本 rank（或 None）才回写。** 这就是 [§17.6](#execute_model-为什么只收一个-rank) 那个「只收一个 rank」在 worker 侧的另一半：不该回的 worker 算完就算完，不往应答队列写。
+- **只有 `output_rank` 匹配本 rank（或 None）才回写。** 这就是 [§17.6](#execute_model-为什么只收一个-rank) 那个「只收一个 rank」在 worker 侧的另一半：不该回的 worker 算完就算完，不往应答队列写。执行器侧已经只监听一条应答 MQ，但若不在 worker 侧过滤，其余 worker 的应答 MQ 会持续积压无人消费的数据，最终撑满共享内存；worker 侧的这道过滤正是为此兜底。
 - `add_note(traceback.format_exc())` 是个小技巧：把子进程的**栈**附在异常上带回父进程，否则跨进程后栈信息就丢了。
 
 **失败也通过同一条队列回报。** `worker_busy_loop` 里 `func` 抛异常，被 `except` 接住，`handle_output(e)` → `enqueue_output` 把它包成 `(FAILURE, str(e))` 写回应答队列；执行器侧 `get_response` 一看 `status != SUCCESS` 就抛 `RuntimeError`。注意 `continue`——**worker 不死**，报完这次错继续循环服役。这是第一条失败路径。

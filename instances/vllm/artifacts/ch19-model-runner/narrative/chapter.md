@@ -210,7 +210,7 @@ $$
             )
 ```
 
-第二步，`_prepare_inputs()` 把持久批次里的 token 取出来，拼成本拍的 `input_ids`、`positions`、`slot_mapping`。这一步藏着 f13 闭环的「读回侧」，我们留到 [§19.5](#195-f13-闭环新-token-怎么活到下一拍) 细讲。它返回 `logits_indices`——每个请求最后一个 token 在扁平张量里的下标，用来从一大片 `hidden_states` 里挑出真正要算 logits 的那几行。
+第二步，`_prepare_inputs()` 把持久批次里的 token 取出来，拼成本拍的 `input_ids`、`positions`、`slot_mapping`。这一步藏着 f13 闭环的「读回侧」，我们留到 [§19.5](#195-f13-闭环新-token-怎么活到下一拍) 细讲。它返回 `logits_indices`——每个请求最后一个 token 在扁平张量里的下标，用来从一大片 `hidden_states` 里挑出真正要算 logits 的那几行。`hidden_states` 的形状是 `[total_tokens, hidden_dim]`，第一维把本拍所有请求的所有 token 按请求顺序拼扁，`logits_indices` 是一个长度等于批次请求数的一维整数数组，每个元素是对应请求最后一个 token 在这条 `total_tokens` 轴上的行号。
 
 第三步，决定这一拍走哪条 CUDA graph：
 
@@ -442,7 +442,7 @@ $$
 
 先看起点：请求装入 slot 行时（`add_request`，本节上面那段 `gpu_input_batch.py:L342`），`num_tokens_no_spec = num_prompt_tokens`，首个生成 token 就写在第 `num_prompt_tokens` 格；下一拍 `num_computed_tokens` 恰好推进到该格——递推由此起步。
 
-归纳步：每拍结束，写回循环对每个采到 token 的请求把 `num_tokens_no_spec[r]` 加上 `num_sampled_ids`、`len(output_token_ids)` 同步增长。读指针为什么恰好咬住这一格？关键在它的推进量和写指针是同一个数。decode 拍里调度器给该请求新调度 1 个 token，拍间它把 `num_computed_tokens_cpu[r]` 也加上上拍采到的 `num_sampled_ids`；而上拍写回时 `num_tokens_no_spec[r]` 加的正是同一个量。
+归纳步：每拍结束，写回循环对每个采到 token 的请求把 `num_tokens_no_spec[r]` 加上 `num_sampled_ids`、`len(output_token_ids)` 同步增长。读指针为什么恰好咬住这一格？关键在它的推进量和写指针是同一个数。decode 拍里调度器从 EngineCore 收到上拍的 `ModelRunnerOutput` 后，会把已计算 token 数推进——下一拍 `execute_model()` 进门调 `_update_states()`（`vllm/v1/worker/gpu_model_runner.py:L1339`）时，`num_computed_tokens_cpu[r]` 被赋成调度器传来的 `num_computed_tokens`，正是上拍写回量；而上拍写回时 `num_tokens_no_spec[r]` 加的正是同一个量。
 
 说白了：两个计数从同一起点（`add_request` 处 `num_tokens_no_spec` 与 `num_computed_tokens` 都从 `num_prompt_tokens` 一侧出发）启动，每拍各加同一增量，所以恒等。于是 `positions = num_computed_tokens_cpu + query_pos`、`token_indices = positions + r·max_model_len`，落点必是上拍写进 `[start, end)` 区间那一格，`index_select` 取到的恰是刚写回的新 token。写指针（`num_tokens_no_spec`）和读指针（`num_computed_tokens`）由此一拍拍咬在同一格上——持久批次因此不必每拍重建，新 token 只在 slot 行尾部增量追加，一拍接一拍地长下去。
 

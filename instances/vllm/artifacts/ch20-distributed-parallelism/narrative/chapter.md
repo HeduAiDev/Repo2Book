@@ -85,6 +85,8 @@ class GroupCoordinator:
         self.device_group = self_device_group
 ```
 
+头两行 `_get_unique_name` / `_register_group` 是为 custom-op 路径铺底：构造时把实例登记进进程级字典 `_groups`，`torch.ops.vllm.all_reduce` 运行期凭 `unique_name` 查回这个 `GroupCoordinator`——为什么需要这个间接层，[§20.3](#203-让集合通信进-torchcompile-图custom-op) 会完整交代。这里先记住：注册即为「让字符串 group_name 能找回对象」。
+
 注意那个 `for ranks in group_ranks` 循环。传进来的 `group_ranks` 是**该维度所有组**的 rank 列表——比如 TP=2、world=8 时，它是 `[[0,1],[2,3],[4,5],[6,7]]` 四个组。每个组都得 `new_group` 出来（NCCL 集合通信要求**所有** rank 都参与建组，哪怕本进程不在那个组里），但本进程只**记住**自己所在的那一组：`self.ranks`、`self.world_size`、`self.rank_in_group`。
 
 这里出现了第一个容易绊倒人的点：**三套 rank 坐标**。
@@ -508,7 +510,7 @@ direct_register_custom_op(
 
 整个流程拆成三步，分工一目了然：
 
-1. **元数据先行，走 CPU 群组**。`_split_tensor_dict` 把字典拆成两半：张量 → `(key, TensorMetadata(device_type, dtype, size))`，非张量 → `(key, value)`。这份 `metadata_list` 用 `broadcast_object` 走 `cpu_group` 发出去。接收侧拿到它，就知道每个张量该是什么形状、在哪个设备。
+1. **元数据先行，走 CPU 群组**。`_split_tensor_dict` 把字典拆成两半：张量 → `(key, TensorMetadata(device_type, dtype, size))`（`TensorMetadata` 是个轻量命名元组，三个字段：设备类型、数据类型、形状 `torch.Size`，pickle 后在 CPU 上走 gloo），非张量 → `(key, value)`。这份 `metadata_list` 用 `broadcast_object` 走 `cpu_group` 发出去。接收侧拿到它，就知道每个张量该是什么形状、在哪个设备。
 2. **张量随后，按 `is_cpu` 选群组**。源 rank 遍历张量，CPU 张量走 `metadata_group`（即 `cpu_group`），GPU 张量走 `group`（即 `device_group`）。全部 `async_op=True` 先发起、攒一把 handle，最后统一 `wait`——并发发、一起等，不串行卡。
 3. **接收侧据元数据重建占位**。非源 rank 先收 `metadata_list`，对每个 `TensorMetadata` 用 `torch.empty` 开一个对应形状/设备的占位张量，再 `broadcast` 把数据填进去，同样按 `is_cpu` 选群组。
 
@@ -772,7 +774,7 @@ def tensor_model_parallel_reduce_scatter(
 
 骨架四步：建一个共享内存广播队列 `rpc_broadcast_mq`（控制面 RPC 的**输入端**，把 handle 导出去）；按 local world size 逐个 spawn `WorkerProc`（每 GPU 一个进程，handle 传进去让它连上同一队列）；spawn 完才 `wait_for_ready` 收齐 worker，收集各 worker 的 `worker_response_mq` 成 `response_mqs`（**输出端**）；最后按固定顺序 `wait_until_ready`。
 
-那行 `Will deadlock if re-ordered` 不是吓唬人——这些队列的就绪握手有严格的先后依赖，顺序换了真会死锁。还有 `worker.init_device() does a device sync`，所以必须先 spawn 全部 worker、再统一等就绪，否则第一个 worker 的 device sync 会等不到别人。
+那行 `Will deadlock if re-ordered` 不是吓唬人——这些队列的就绪握手有严格的先后依赖，顺序换了真会死锁。还有 `worker.init_device() does a device sync`，所以必须先 spawn 全部 worker、再统一等就绪：`init_device()` 内部会调 `init_distributed_environment` 建 NCCL 通信组，NCCL 建组是**集合操作**（所有参与方必须同时到达）；若边 spawn 边 wait，先启动的 worker 会卡在 NCCL 建组的 barrier，等不到还没 spawn 的邻居，陷入永久等待。先 spawn 全部、统一 wait，保证 NCCL 建组时所有进程都已在线。
 
 `init_device()` 里发生的，正是本章前半的全部内容：每个 worker 调 `init_distributed_environment`（建 torch.distributed WORLD + `_WORLD`），再调 `initialize_model_parallel`（[§20.6](#206-5-维-rank-张量一套变换切出所有群组) 那套 5 维切分，建起 `_TP`/`_PP`/`_DP`/`_EP`）。**群组就是在这里、在每个 worker 进程内，真正拉起来的。**
 

@@ -274,7 +274,7 @@ def remove_request(self, req_id: str) -> int | None:
 
 为什么不立刻搬？因为移除时立刻搬移会产生 `O(N)` 的重复拷贝——删一个就搬一片，删几个就搬几片。两段式把搬移推迟、合并，摊还后搬移量最小。
 
-`batch_update_builder` 是这套机制的账本。它把空洞行号存在一个**始终降序**的列表里，提供两个动作：`pop_removed()` 弹出并返回当前**最小**的空洞，`peek_removed()` 只看不弹。「最小空洞优先」是后面一切的基础。
+`batch_update_builder` 是这套机制的账本。它把空洞行号存在一个**始终降序**的列表里，提供两个动作：`pop_removed()` 弹出并返回当前**最小**的空洞，`peek_removed()` 只看不弹。降序存储的意思是最小行号压在列表尾部——从尾部弹就等于永远取最小，不需要搜索。「最小空洞优先」是后面一切的基础。
 
 新增请求时，`_register_add_request` 第一件事就是问账本要个空位：
 
@@ -436,7 +436,7 @@ torch.index_select(
 
 **`np.repeat` 展开请求索引。** `[2, 5, 3]` → `req_indices = [0,0, 1,1,1,1,1, 2,2,2]`。每个要算的 token 都标上它属于哪个请求。
 
-**`_get_cumsum_and_arange` 一箭双雕。** 它同时算出 `cu_num_tokens = [2, 7, 10]`（累积偏移，标出每个请求在扁平数组里的边界）和 `query_pos = [0,1, 0,1,2,3,4, 0,1,2]`（每个 token 在它自己请求内的偏移）。
+**`_get_cumsum_and_arange` 一箭双雕。** 三步推出两个数组：① `np.cumsum([2,5,3])` → `cu_num_tokens = [2, 7, 10]`；② `np.repeat(cu_num_tokens - [2,5,3], [2,5,3])` → `[0,0, 2,2,2,2,2, 7,7,7]`（每个 token 对应的组起点）；③ `arange[:10] - 组起点` → `query_pos = [0,1, 0,1,2,3,4, 0,1,2]`（每个 token 的请求内偏移）。全程无循环，把 `np.concatenate([np.arange(n) for n in num_tokens])` 的逐段生成替换为向量减法。`cu_num_tokens` 和 `query_pos` 是这三步的两个输出，所以叫「一箭双雕」。
 
 **算绝对位置。** `positions = num_computed_tokens[req_indices] + query_pos`。每个请求本拍从它「已算到第几个 token」起步，加上请求内偏移，就是 token 的绝对位置。假设三个请求已算 `[4, 1, 6]` 个 token，那 `positions = [4,5, 1,2,3,4,5, 6,7,8]`。
 

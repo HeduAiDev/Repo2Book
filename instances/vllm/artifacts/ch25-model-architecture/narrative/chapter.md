@@ -119,7 +119,7 @@ $$
 
 那个 2 是 K 和 V 各一份。头数多、维度大，KV cache 就吃显存——长上下文场景下，它常常比模型权重还大。
 
-MLA（Multi-head Latent Attention，多头潜变量注意力）的思路是：别缓存满血的 K/V，缓存一个**低秩潜变量**。把 K/V 压到一个远小于 `n_heads × d_head` 的 `kv_lora_rank` 维，缓存这个压缩版；真正算注意力时再升回去。压缩比（缓存满血 K/V 的字节 ÷ 缓存潜变量的字节）大致是
+MLA（Multi-head Latent Attention，多头潜变量注意力）的思路是：别缓存满血的 K/V，缓存一个**低秩潜变量**。`kv_lora_rank` 是该潜变量的维数（DeepSeek-V4 取 512），远小于 `n_heads × d_head` 的几千维。把 K/V 压到这个 `kv_lora_rank` 维，缓存这个压缩版；真正算注意力时再升回去。压缩比（缓存满血 K/V 的字节 ÷ 缓存潜变量的字节）大致是
 
 $$
 \frac{2 \times n_{\mathrm{heads}} \times d_{\mathrm{head}}}{kv\_lora\_rank + qk\_rope\_head\_dim}
@@ -226,7 +226,7 @@ self.wo_b = RowParallelLinear(
 把它和标准 MLA、再和 Llama 的 `qkv_proj`/`o_proj` 三方对照：
 
 - **输入端**：`fused_wqa_wkv` ↔ 标准 MLA 的 `fused_qkv_a_proj`，都是「压成 `[q_lora_rank, head_dim]` 低秩潜变量」；`q_norm`/`kv_norm` ↔ `q_a_layernorm`/`kv_a_layernorm`；`wq_b` ↔ `q_b_proj`，把 q 潜变量升回 `n_heads * head_dim`。这部分 V4 和标准 MLA 同构，只是名字短了。
-- **输出端**：这才是 V4 的加码。标准 MLA 算完注意力直接一个 `o_proj` 回 `hidden`。V4 偏不——它让**输出投影也低秩**：`wo_a` 先把输出压到 `o_lora_rank`（还按 `n_groups` 分组、`is_bmm=True` 走批量矩阵乘），`wo_b` 再升回 `hidden_size`。
+- **输出端**：这才是 V4 的加码。标准 MLA 算完注意力直接一个 `o_proj` 回 `hidden`。V4 偏不——它让**输出投影也低秩**：`wo_a` 先把输出压到 `o_lora_rank`（`n_groups` 是头的分组数，用于把 `n_heads` 分批——每组 `n_heads/n_groups` 个头的输出分别压缩，`is_bmm=True` 告知线性层走批量矩阵乘以处理这个分组布局），`wo_b` 再升回 `hidden_size`。
 
 对照 Llama，delta 就很清楚了：
 
@@ -442,7 +442,7 @@ V4 的专家计算有两条后端，由 `use_mega_moe` 分叉：
 > *MegaMoE 把全部专家塞进一个 DeepGEMM 算子（EP / FP4 / SM100）；FusedMoE 走张量并行。*
 > *`shared_experts` 那条 dense 始终并行走；两路聚合它的位置不同——mega 在外相加，TP 在 FusedMoE 内部。*
 
-**MegaMoE 路径**（开了 expert parallel + DeepGEMM 后端）把所有路由专家的计算塞进**一个**自定义算子，`vllm/model_executor/models/deepseek_v4.py`：
+**MegaMoE 路径**（开了 expert parallel + DeepGEMM 后端）把所有路由专家的计算塞进**一个**自定义算子（DeepGEMM 是 DeepSeek 开源的低比特矩阵乘内核库，专为 FP4/FP8 精度和 Hopper/Blackwell SM100 架构优化，能在单次 kernel launch 内处理全部专家的 GEMM），`vllm/model_executor/models/deepseek_v4.py`：
 
 ```python
 # vllm/model_executor/models/deepseek_v4.py:L599
@@ -515,7 +515,7 @@ return hidden_states
 
 关键就第二行：`hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)`。embedding 出来本是 `[T, hidden]`，这里 unsqueeze 加一维、repeat 成 `[T, hc_mult, hidden]`——**一条流复制成 `hc_mult` 条平行残差流**，一起穿过所有层。
 
-回头看 §25.1 那个 `DeepseekV4DecoderLayer.forward`：每层用 `hc_pre`（前处理）和 `hc_post`（后处理）包住 attn 和 ffn。Llama 的 layernorm 是固定的「加回上一段输出」，而 hc 在 `hc_mult` 条流之间做**学习式的门控混合**——`hc_attn_fn`/`hc_attn_scale`/`hc_attn_base` 这些都是可学习参数。`hc_pre` 决定这一段从多条流里怎么取输入，`hc_post` 决定算出来的结果怎么写回多条流。这套混合的内核（`torch.ops.vllm.mhc_pre`/`mhc_post`，含 Sinkhorn 归一）是 GPU-only 的，本章只读它在残差骨架里的位置——它**取代了 Llama 的 `input_layernorm`/`post_attention_layernorm`**。
+回头看 §25.1 那个 `DeepseekV4DecoderLayer.forward`：每层用 `hc_pre`（前处理）和 `hc_post`（后处理）包住 attn 和 ffn。`hc_pre` 返回三元组 `(x, post, comb)`——`x` 是本段（attn 或 ffn）的输入张量，`post` 和 `comb` 是 `hc_pre` 内部学习的门控信息（混合系数与残差组合参数），被原封不动传给 `hc_post`，让 `hc_post` 知道该如何把本段的输出写回多条残差流。Llama 的 layernorm 是固定的「加回上一段输出」，而 hc 在 `hc_mult` 条流之间做**学习式的门控混合**——`hc_attn_fn`/`hc_attn_scale`/`hc_attn_base` 这些都是可学习参数。这套混合的内核（`torch.ops.vllm.mhc_pre`/`mhc_post`，含 Sinkhorn 归一）是 GPU-only 的，本章只读它在残差骨架里的位置——它**取代了 Llama 的 `input_layernorm`/`post_attention_layernorm`**。
 
 直觉上，Llama 的 add-norm 是「一条信息高速路，每层上下匝道」；hc 是「`hc_mult` 条平行车道，每层之间可以学习着变道、并道」。表达力更强，代价是 hidden 翻了 `hc_mult` 倍的显存和算力——典型的「容量换资源」。
 

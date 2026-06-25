@@ -175,7 +175,13 @@ def apply_logits_processors(
 3. **第 5 步：non-argmax-invariant 处理器**——`min_tokens` 和 `logit_bias`。它们能改 argmax，所以排在这里。
 4. **第 6 步：三种惩罚**——repetition / frequency / presence。
 
-为什么这四道偏偏都在 greedy 之前？因为它们有个共同的危险能力：**改变"谁是最高分"**。白名单可能把原本的最高分 token 直接划掉；bad words 把某个 token 摁成 `-inf`；惩罚扣分扣多了也能让座次换人。greedy 采样只认最高分，所以任何能动最高分的工序，都必须赶在 greedy 之前生效——否则 greedy 取到的就是个没被处理过的错答案。这条"能改 argmax 就得前置"的原则，下一节会被 `is_argmax_invariant` 这个方法显式编码进代码。
+为什么这四道偏偏都在 greedy 之前？因为它们有个共同的危险能力：**改变"谁是最高分"**。白名单可能把原本的最高分 token 直接划掉；bad words 把某个 token 摁成 `-inf`；惩罚扣分扣多了也能让座次换人。greedy 采样只认最高分，所以任何能动最高分的工序，都必须赶在 greedy 之前生效——否则 greedy 取到的就是个没被处理过的错答案。这条"能改 argmax 就得前置"的原则，27.6 节会被 `is_argmax_invariant` 这个方法显式编码进代码。
+
+把全部处理器按这个分水岭归一张表，分两列看最清楚：
+
+![logits 处理器 argmax-invariance 分类表](../diagrams/05-argmax-invariant.png)
+
+> *图注：左列（红）= `is_argmax_invariant() == False`，这些处理器能改变最高分 token，必须前置于 greedy 采样（step 3–6）；右列（绿）= `is_argmax_invariant() == True`，这些处理器不改 argmax，greedy 路可安全跳过，推迟到随机路的 step 7c。每个条目下的斜体说明了对应的不变性论据。*
 
 ## 27.4 bad words：只在"快补全成禁词"时才动手
 
@@ -321,7 +327,7 @@ def greedy_sample(logits):
     return logits.argmax(dim=-1).view(-1)
 ```
 
-温度的数学很直白：把 logits 除以 T 再 softmax。T 越大分布越平（更随机），T 越小越尖（更确定）；T→0 时 softmax 退化成 one-hot，等价于直接取 argmax。代码用 `temp < 1e-5` 判定"这其实是个贪心请求"，但贪心请求温度是 0，直接除会出 `inf`，所以 `torch.where` 先把这些位置的温度替成 1.0（反正它们的结果待会儿不用随机路的）。`greedy_sample` 就是一行 `argmax`。
+温度的数学很直白：把 logits 除以 T 再 softmax。T 越大分布越平（更随机），T 越小越尖（更确定）；T→0 时 softmax 退化成 one-hot，等价于直接取 argmax。代码里 `_SAMPLING_EPS = 1e-5`（`vllm/v1/sample/sampler.py:L18`）是区分"是否贪心"的浮点阈值——用户传入的 `temperature=0` 在 Python 层就是精确 0，但张量参数经历了 dtype 转换后可能变成非零的极小值，1e-5 是工程上统一的截断点。凡是 `temp < 1e-5` 的请求都当贪心处理，但贪心请求温度是 0，直接除会出 `inf`，所以 `torch.where` 先把这些位置的温度替成 1.0（反正它们的结果待会儿不用随机路的）。`greedy_sample` 就是一行 `argmax`。
 
 现在看主干 `sample` 怎么把这些零件拼起来（`vllm/v1/sample/sampler.py:L232`）：
 
@@ -473,6 +479,8 @@ def apply(self, logits: torch.Tensor) -> torch.Tensor:
 ## 27.7 第 7d 步：top-k/top-p 截断的多后端分发
 
 第 7d 步——top-k/top-p 截断——是采样里最吃算力的环节（要对整个词表动手），于是 vLLM 给它配了一整套后端分发。核心类是 `TopKTopPSampler`，它的精明之处在于：**后端绑定发生在 `__init__`，不是每次调用**。
+
+> **FlashInfer** 是 OccamLabs 开源的 GPU 采样/注意力算子库，专为 LLM 推理设计，提供 fused top-k/top-p 采样等高吞吐 CUDA 内核；vLLM 把它作为可选后端，在满足条件时替换掉 PyTorch 原生实现。
 
 ```python
 # vllm/v1/sample/ops/topk_topp_sampler.py:L30

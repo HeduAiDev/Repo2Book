@@ -92,7 +92,7 @@ self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]]
 ```
 
-队列里每个元素是一个**三元组**：`(采样结果 future, 这个批的 SchedulerOutput, execute_model 的 future)`。为什么要存三个、而不是一个 future，§12.4 出队时自会明白。
+队列里每个元素是一个**三元组**：`(采样结果 future, 这个批的 SchedulerOutput, execute_model 的 future)`。三个字段各司其职：采样 future 取结果、`SchedulerOutput` 对账、`exec_future` 在采样失败时供出真因——[§12.4](#124-下半段pop-队尾取出最旧那个批) 出队时逐一拆开说。
 
 **第三，`step_fn` 二选一。** 一句话：`batch_queue is None` 就绑 `step`，否则绑 `step_with_batch_queue`。绑定**一次**，之后每拍直接调 `self.step_fn()`，不再判断分支——[第 11 章](../ch11-engine-core/narrative/chapter.md#你在这里) 的忙循环对此完全透明，它不知道也不关心自己驱动的是哪个 step。
 
@@ -312,7 +312,7 @@ if not deferred_scheduler_output:
 
 三个条件只要有一个不成立，就**不**进 `if`、不返回，控制流自然往下落到下半段去取结果。换句话说，「该停止填管道、回头取结果」的时机正好是这三条的反面：队满了（`len == size`）、或队尾批已经算完了（`done()`）、或这是个空批（`not model_executed`）。
 
-精简版用一个「永远 `done()` 返回 `False`」的 future 替身，就能在本地复现「填管道优先」这一态：
+精简版用一个测试替身——`_NeverDoneFuture`，`.done()` 始终返回 `False`——来模拟「在飞批还没算完」的状态，从而在本地复现「填管道优先」这一态：
 
 ```python
 core = _MinimalEngineCore(FakeExecutor(max_concurrent_batches=3), sched)
@@ -377,7 +377,7 @@ future, scheduler_output, exec_model_fut = batch_queue.pop()
 
 - **`future`（采样结果）**：`future.result()` 阻塞到拿到这个批的 `model_output`。这是「取结果」真正等的东西。
 - **`scheduler_output`（调度清单）**：马上要喂给 `update_from_output`，告诉调度器「这个批当初调度了什么」，它才能把输出对回到正确的请求上。入队时不存它，出队时就无从知道这堆 token 是谁的。
-- **`exec_model_fut`（execute_model 的 future）**：用来在出错时**抛出真异常**。看那个 `if model_output is None` 分支——采样 future 返回 `None`，不是正常情况（这条路径下采样总该出 `ModelRunnerOutput`），它是个**信号**：上游的 `execute_model` 失败了，采样拿不到输入。这时 `exec_model_fut.result()` 会把 worker 里那个**真正的底层异常**重新抛出来；后面那句 `raise RuntimeError("unexpected error")` 只是兜底，正常到不了。
+- **`exec_model_fut`（execute_model 的 future）**：用来在出错时**抛出真异常**。看那个 `if model_output is None` 分支——采样 future 返回 `None`，不是正常情况（这条路径下采样总该出 `ModelRunnerOutput`），它是个**约定信号**（见 `vllm/v1/engine/core.py:L522`）：`execute_model` 失败时 worker 的 `sample_tokens` 会以 `None` 回报，表示「我没有合法的输入可采样」。这时 `exec_model_fut.result()` 会把 worker 里那个**真正的底层异常**重新抛出来；后面那句 `raise RuntimeError("unexpected error")` 只是兜底，正常到不了。
 
 一句话：采样 future 负责拿结果，`SchedulerOutput` 负责对账，`exec_future` 负责在采样 future 撒谎说 `None` 时供出真凶。三个缺一不可，所以队列存三元组。
 
@@ -460,6 +460,8 @@ def has_work(self) -> bool:
 ## 12.5 deferred sampling：当采样必须等上一步
 
 前面一直把 `pending_structured_output_tokens` 那条岔路按下不表。现在补上。它是 `step_with_batch_queue` 里最绕、也最能体现「异步发批」代价的一段：**结构化输出叠加投机解码时，采样没法在发批的同一拍完成，必须推迟。**
+
+简单交代背景：**投机解码**（speculative decoding）是一种加速策略——用一个轻量草稿模型（draft model）先猜测几个 token（称为**草稿 token**，draft tokens），再由主模型一次性验证；猜对的 token 免费得到，猜错的丢弃重算。草稿 token 由 worker 在 `execute_model` 结束时一并返回。
 
 ### 为什么会缺 token
 

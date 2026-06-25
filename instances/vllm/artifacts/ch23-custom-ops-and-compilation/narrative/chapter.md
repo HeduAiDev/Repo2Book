@@ -300,7 +300,7 @@ def forward_cuda(
         return ir.ops.rms_norm(
             x, self.weight.data, self.variance_epsilon, self.variance_size_override
         )
-    # … 省略：variance_size_override 与 SM100 fast-path、batch-invariant 等特例 …
+    # … 省略：variance_size_override 与 SM100 fast-path、batch-invariant 等特例（均为硬件兼容分支，不改变两路等价性这一主结论）…
     if residual is not None:
         return fused_add_rms_norm(
             x, residual, self.weight.data, self.variance_epsilon
@@ -716,7 +716,7 @@ direct_register_custom_op(
 
 两个关键点。
 
-第一，`fake_impl`（这里是 `unified_attention_with_output_fake`）。它什么也不算，直接 `return`。它的作用是给 Dynamo 一个「假实现」——追踪时 Dynamo 不需要真跑 attention，只要从 fake_impl 知道**输出的形状**（这里是原地写 output、无返回），就能把这个节点接进图里。没有 fake_impl，Dynamo 没法在不真执行的情况下推断输出，就只能 graph break。**fake_impl 是「不 graph break」的技术前提。**
+第一，`fake_impl`（这里是 `unified_attention_with_output_fake`）。它什么也不算，直接 `return`。它的作用是给 Dynamo 一个「假实现」——追踪时 Dynamo 用 fake tensor 逐算子传播形状，对内置 torch 算子有内建规则；但对一个全新注册的 C++ 算子，它没有任何形状推断规则。这时 Dynamo 只能真执行一次来推断输出，而真执行 attention 涉及变长 KV cache 等外部状态，Dynamo 无法安全完成，就只能 graph break。有了 fake_impl，Dynamo 调它（什么也不算、直接 return）就知道**输出形状**（原地写 `output`、无返回值），可以安全地把节点接进图里。**fake_impl 是「不 graph break」的技术前提。**
 
 第二，`mutates_args=["output", ...]`。它告诉 torch：这个算子会**原地改写** `output`。这让 `torch.compile` 知道 output 是被这个算子写的，从而正确处理依赖关系、不会把它当成纯函数乱优化。
 

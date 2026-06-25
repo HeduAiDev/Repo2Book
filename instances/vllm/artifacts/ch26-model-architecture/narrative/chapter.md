@@ -299,11 +299,11 @@ P1 照搬：数 `self.X =`。这里三条——`self.model`、`self.lm_head`、`
 
 P2 照 tensor 赋值顺序自上而下读，每一句 `hidden_states = ...(...)` 画一条有向边。这段里有四个值得专门标注的动作：
 
-**一、形状变化要标在边上。** 第二行 `hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)`——这不是一个子模块（所以不进模块树），但它把张量从 `[T, H]` 变成了 `[T, hc_mult, H]`。`unsqueeze`、`repeat`、`view`、`flatten` 这类纯形状算子，**画图时不画框，但必须在那条边上标形状**：`[T,H]→[T,hc_mult,H]`。不标的话，读者后面会一脸懵——中途怎么凭空多出来一个 `hc_mult` 维？这个维就是 hc 多流，标在边上它才有来处。
+**一、形状变化要标在边上。** 第二行 `hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)`——这不是一个子模块（所以不进模块树），但它把张量从 `[T, H]` 变成了 `[T, hc_mult, H]`（以 DeepSeek-V4 为例：H=7168，hc\_mult=4，即从 `[T, 7168]` 展开到 `[T, 4, 7168]`）。`unsqueeze`、`repeat`、`view`、`flatten` 这类纯形状算子，**画图时不画框，但必须在那条边上标形状**：`[T,H]→[T,hc_mult,H]`。不标的话，读者后面会一脸懵——中途怎么凭空多出来一个 `hc_mult` 维？这个维就是 hc 多流，标在边上它才有来处。
 
 **二、`for` 循环就是穿过堆叠层的那一条边。** `for layer in islice(self.layers, ...)` 对应 P1 里那个 `× N` 复数框——数据流箭头穿过这个复数框一次，代表它依次流过所有层。
 
-**三、`copy_` 是一条分叉旁路。** `self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))` 把主干上的隐状态拷一份进 `_mtp_hidden_buffer`。这就是 §26.3 说的那个 buffer——它不在模块树里，现在以**数据流端点**的身份出现：主干上分一条旁路出去，喂给 MTP 草稿。旁路边画成一条岔出去的箭头，指向那个 buffer 框。
+**三、`copy_` 是一条分叉旁路。** `self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))` 把主干上的隐状态拷一份进 `_mtp_hidden_buffer`（这就是[上一章](../ch25-model-architecture/narrative/chapter.md)介绍的 MTP 草稿共享缓冲区）。这就是 §26.3 说的那个 buffer——它不在模块树里，现在以**数据流端点**的身份出现：主干上分一条旁路出去，喂给 MTP 草稿。旁路边画成一条岔出去的箭头，指向那个 buffer 框。
 
 **四、`hc_head` 把形状压回来。** `hc_head(...)` 接收 `[T, hc_mult, H]`，内部做完混合后输出 `[T, H]`——又一条要标形状的边，`[T,hc_mult,H]→[T,H]`，和开头那次展开正好对称。最后 `self.norm(...)` 收尾。
 
@@ -410,7 +410,7 @@ def hc_head(
 
 其三，内部 `x.flatten(1)` → `x.view(shape)` → `torch.sum(..., dim=1)` 这串，就是把 `[T, hc_mult, H]` 坍缩回 `[T, H]` 的形状变化——标在「压回单流」那条边上，和 §26.4 开头那次 `repeat` 展开首尾呼应。
 
-**判据三：并行类名 + `FusedMoE` + aux CUDA stream，是并行/通信子系统。** §26.3 已经用类名给 MLA 投影上了色（`Column`/`Row`/`Merged ParallelLinear`）。同一条判据在 MoE 里还要再用一次，下一节展开。`DeepseekV4Model.__init__` 里那行 `aux_stream_list = [torch.cuda.Stream() for _ in range(3)]` 则标出了辅助 CUDA 流这个并行子系统——三条 aux 流让注意力里的几个输入 GEMM 并行跑。
+**判据三：并行类名 + `FusedMoE` + aux CUDA stream，是并行/通信子系统。** §26.3 已经用类名给 MLA 投影上了色（`Column`/`Row`/`Merged ParallelLinear`）。同一条判据在 MoE 里还要再用一次，下一节展开。`DeepseekV4Model.__init__` 里那行 `aux_stream_list = [torch.cuda.Stream() for _ in range(3)]` 则标出了辅助 CUDA 流这个并行子系统——aux stream 本身代表独立的 GPU 执行队列，看到它被创建并传给子模块，就说明这里有算子要在主流之外异步并发执行（三条 aux 流让注意力里的几个输入 GEMM 并行跑）。
 
 三条判据合起来，每一种着色都能指回源码的一个装饰器、一个类名、或一个 `torch.ops` 前缀。把它们叠到 §26.4 的数据流图上：
 

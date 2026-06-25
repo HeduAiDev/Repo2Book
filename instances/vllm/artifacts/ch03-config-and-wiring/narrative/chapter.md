@@ -344,7 +344,7 @@ class EngineArgs:
         )
 ```
 
-先注意头三行：它**提前调用了 `Executor.get_class(self)`**，问执行器类「你支持异步调度吗」（`supports_async_scheduling()`）。这是一个有意思的回路——执行器工厂在这里被借来当「能力查询」用，而不是真去实例化执行器。这也是为什么前面强调 `distributed_executor_backend` 必须在这之前就推导好（[下一节](#36-第二级映射之一执行器工厂-executorget_class) 讲它在哪推导的）。
+先注意头三行：它**提前调用了 `Executor.get_class(self)`**，问执行器类「你支持异步调度吗」（`supports_async_scheduling()`）。这是一个有意思的回路——执行器工厂在这里被借来当「能力查询」用，而不是真去实例化执行器。这也是为什么 `distributed_executor_backend` 必须在这之前就推导好：`ParallelConfig` 在 [3.3 节](#33-create_engine_config把扁平参数重新打包) 的 `create_engine_config` 里构造，它的 `__post_init__` 那时候就已经把 `None` 填成了 `"uni"` 或 `"mp"`——早于外层 `VllmConfig(...)` 构造才触发的这个 `__post_init__`（[下一节](#36-第二级映射之一执行器工厂-executorget_class) 详述推导规则）。
 
 然后三态分流：
 

@@ -147,7 +147,7 @@ def _preempt_request(self, request: Request, timestamp: float) -> None:
 
 逐行看这套副作用，它们合起来就是「让请求干净地退回未调度状态」：
 
-1. **`kv_cache_manager.free(request)`**：把请求占的 KV 块全部还给块池。这正是腾出来给别人用的空间——抢占的目的。
+1. **`kv_cache_manager.free(request)`** + **`encoder_cache_manager.free(request)`**：把请求占的 KV 块和多模态 encoder 缓存块全部还给各自的块池。多模态请求（图片/音频）prefill 阶段会把 encoder 中间结果缓存下来复用；抢占时同样要还掉，否则那部分显存白占着。这正是腾出来给别人用的空间——抢占的目的。
 2. **`status = RequestStatus.PREEMPTED`**：状态从 `RUNNING` 改成 `PREEMPTED`。这个状态很关键，它是「曾经跑过、现在被抢、等着复活」的标记。后面拉它复活时，靠这个状态认出它是「老兵回归」而不是「新兵入伍」。
 3. **`num_computed_tokens = 0`**：已算 token 数清零。这一行就是「丢弃重算」的字面意思——调度器从此认为这个请求**一个 token 都没算过**，下次得从头 prefill。（前缀缓存能让「从头」变快，但调度器的账面上确实归零了。）
 4. **`spec_token_ids = []`**：清掉投机解码的草稿 token。这些草稿是基于「当前进度」猜的，进度都归零了，草稿自然作废。

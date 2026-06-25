@@ -207,6 +207,8 @@ $$
 n-(e-|s|) = |s|-(e-n) \le |s|-1 \le L-1
 $$
 
+（第一个 $\le$：因为 $n < e$，故 $e-n \ge 1$；第二个 $\le$：$|s| \le L$ 即任意 stop 串不超过最长串。）
+
 这段长度不超过 $L-1$ 的前缀，右端正好是 $n$，所以整个落在扣留区 $[n-(L-1),\ n)$ 里——**未完成的 stop 前缀从不外流**。
 
 而当文末抵达终点（$n=e$、stop 串完整出现）时，update 直接截断，根本不依赖 holdback。
@@ -332,7 +334,7 @@ $$
 
 现在轮到 `decode_next` 的两种后端。先看慢路径——它把"逐 token 解码为什么难"讲得最透。
 
-难点在开篇提过的坑 1：**tokenizer 的 `convert_tokens_to_string` 会按相邻 token 决定加不加空格**（这叫 cleanup 算法）。你要是只把单个新 token 拿去解码，就丢了它和左邻右舍的关系，空格全错。
+难点在开篇提过的坑 1：**tokenizer 的 `convert_tokens_to_string` 会按相邻 token 决定加不加空格**（这叫 cleanup 算法——HuggingFace tokenizer 在把 token 列表转为字符串时，用前后邻居判断要不要在 `"▁world"` 这类以下划线/空格标记开头的 token 前补一个空格）。你要是只把单个新 token 拿去解码，就丢了它和左邻右舍的关系，空格全错。
 
 慢路径的对策是 `detokenize_incrementally`，核心是一对 offset——`prefix_offset` 和 `read_offset`——圈出一段上下文窗口。先看慢路径子类怎么调它（`vllm/v1/engine/detokenizer.py`）：
 

@@ -139,7 +139,7 @@ self.start_layer, self.end_layer, self.layers = make_layers(
 )
 ```
 
-每一层都拿到 `f"{prefix}.layers.{idx}"` 当自己的 `prefix`。这个拼出来的全路径，**恰好就是 checkpoint 里这一层权重的名字前缀**——`model.layers.0.self_attn.qkv_proj.weight` 既是模块路径，也是 state-dict 的键。装载时按名字匹配，靠的就是它。
+每一层都拿到 `f"{prefix}.layers.{idx}"` 当自己的 `prefix`。这个拼出来的全路径，**恰好就是 checkpoint 里这一层权重的名字前缀**——例如第 0 层经过逐级拼接后，`qkv_proj` 拿到 prefix `model.layers.0.self_attn.qkv_proj`，HuggingFace checkpoint 里对应权重的键名也正是 `model.layers.0.self_attn.q_proj.weight`（fuse 前）或 `model.layers.0.self_attn.qkv_proj.weight`（fuse 后）——前缀是一样的。装载时按名字匹配，靠的就是它。
 
 但 `prefix` 不止管权重。走到 `Attention` 那一层，它又被拿去当 `layer_name`，注册进一张全局表（`vllm/model_executor/layers/attention/attention.py:L367`）：
 
@@ -358,7 +358,9 @@ self.output_sizes = [
 
 `num_kv_head_replicas` 是这一节的主角。现代 Llama 用 GQA：query 头多（比如 32 个），KV 头少（比如 8 个），多个 query 头共享一组 K/V。问题来了——KV 头数（8）可能**小于** TP size（比如 16 卡）。8 个头切不进 16 张卡。
 
-vLLM 的应对：**复制**。看上面那段的 `else` 分支——当 `tp_size >= total_num_kv_heads`，`num_kv_heads = 1`、`num_kv_head_replicas = tp_size // total_num_kv_heads`。意思是每张卡持有 1 个 KV 头，但每 `replicas` 张相邻的卡持有**同一份** K/V。
+vLLM 的应对：**复制**。为什么不是"把一个 KV 头的 `head_size` 维再切小"？因为 attention 是 q 与完整 K 做点积——如果某张卡只持有 K 的一半维度，点积结果就是无意义的残缺向量，无法与其他卡的结果简单 concat 还原。KV 头必须保持完整，超配的卡只能拿一份完整副本。
+
+看上面那段的 `else` 分支——当 `tp_size >= total_num_kv_heads`，`num_kv_heads = 1`、`num_kv_head_replicas = tp_size // total_num_kv_heads`。意思是每张卡持有 1 个 KV 头，但每 `replicas` 张相邻的卡持有**同一份** K/V。
 
 这个推导可以写成两条规则。设 KV 头数 `K`、TP size `P`：
 

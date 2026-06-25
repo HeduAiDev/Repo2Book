@@ -447,7 +447,7 @@ def generate_block_hash_extra_keys(
 
 ### 谁来算这些哈希
 
-哈希不是分配时才算，而是请求每次新凑满一个块时**立刻**算好、追加到 `request.block_hashes` 列表：
+哈希不是分配时才算，而是请求每次新凑满一个块时**立刻**算好、追加到 `request.block_hashes` 列表。触发时机是 `Request.append_output_token_ids`——每次新 token 追加时都会调 `update_block_hashes()`，它再调这里的 `request_block_hasher`，增量补算新满块的哈希：
 
 ```python
 # vllm/v1/core/kv_cache_utils.py:L643
@@ -520,7 +520,7 @@ def insert(self, key: BlockHashWithGroupId, block: KVCacheBlock) -> None:
 
 > We currently don't de-duplicate the blocks in the cache ... This is because we want to make sure the allocated block IDs won't change so that block tables are append-only.
 
-回到 §15.2 那个不变量——`block_id` 一经分配永不改变。如果强行去重（发现内容相同就把两个块合并成一个），就得改某个请求 block table 里的 `block_id`，破坏了 block table 的 append-only 性质（worker 侧正按这些 `block_id` 寻址 KV）。所以宁可让同哈希挂多块，命中时取任意一个即可。union 退化成 dict 也是为了省 GC——绝大多数哈希只对一块，不必为它们都建字典。精简版 `test_map_single_then_dict_on_duplicate` 走了一遍「单块 → 插第二块退化成 dict → pop 一个剩一个」的完整路径。
+回到 §15.2 那个不变量——`block_id` 一经分配永不改变。如果强行去重（发现内容相同就把两个块合并成一个），就得改某个请求 block table 里的 `block_id`，破坏了 block table 的 append-only 性质（worker 侧正按这些 `block_id` 寻址 KV）。所以宁可让同哈希挂多块，命中时取任意一个即可（`get_one_block` 实现是 `next(iter(blocks.values()))`，Python 3.7+ dict 保持插入顺序，所以实际取到的是最早登记的那块）。union 退化成 dict 也是为了省 GC——绝大多数哈希只对一块，不必为它们都建字典。精简版 `test_map_single_then_dict_on_duplicate` 走了一遍「单块 → 插第二块退化成 dict → pop 一个剩一个」的完整路径。
 
 查询入口是 `get_cached_block`：
 
@@ -707,7 +707,7 @@ def get_num_blocks_to_allocate(
     return num_new_blocks + num_evictable_blocks
 ```
 
-`num_new_blocks` 是「装下所有 token 需要的块数，减去已有的和命中的」，再加上 `num_evictable_blocks`（命中块里 `ref_cnt == 0` 的那些）。注释把理由写得清清楚楚。
+`req_to_blocks` 是 `FullAttentionManager` 持有的一个 `defaultdict(list)`，键是 `request_id`，值是该请求当前已分配的块列表——全新请求为空 `()`，`get` 配默认值即可安全读空。`num_new_blocks` 是「装下所有 token 需要的块数，减去已有的和命中的」，再加上 `num_evictable_blocks`（命中块里 `ref_cnt == 0` 的那些）。注释把理由写得清清楚楚。
 
 **段二：挂前缀命中块。** 如果有命中块，`allocate_new_computed_blocks` 把它们 `touch` 一下（`ref_cnt += 1`、必要时从 free queue 救回），挂进请求的块账本 `req_to_blocks`：
 

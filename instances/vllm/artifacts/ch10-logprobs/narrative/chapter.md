@@ -411,7 +411,7 @@ def _get_sampled_context_ids(
 三个要点：
 
 - **只取最近 ≤4 个**。`start = max(0, n - max_context)`，`max_context=4`。为什么是 4？因为 UTF-8 单个字符最多 4 字节，所以任何一个没拼完的多字节序列，至多跨 4 个 byte-fallback token。4 个上下文 token 一定够把它拼全——这是个数学上界，不是拍脑袋。
-- **每位置取"第一个 entry"**。无论 flat 还是 nested，取的都是每个位置的第一个 token id。这正是 §10.3 立下的不变式：`append_logprobs_for_next_position` 总把被采样/被选中的 token 第一个写入。所以 FlatLogprobs 直接走 `token_ids[start_indices[i]]`（该位置区间的头一个），nested 走 `next(iter(entry))`（dict 的第一个 key）。两条路殊途同归。
+- **每位置取"第一个 entry"**。无论 flat 还是 nested，取的都是每个位置的第一个 token id。这正是 §10.3 立下的不变式：`append_logprobs_for_next_position` 总把被采样/被选中的 token 第一个写入。所以 FlatLogprobs 直接走 `token_ids[start_indices[i]]`（`start_indices[i]` 是位置 `i` 在扁平 `token_ids` 列表里的起始下标，§10.6 详述该结构，这里只需知道它指向该位置的第一个候选），nested 走 `next(iter(entry))`（dict 的第一个 key）。两条路殊途同归。
 - **flat 路径跳过空位置**。`if start_indices[i] < end_indices[i]`——prompt 首位那个 `append(None)` 写出的是个零长度区间（start == end），它没有真实 token，得跳过。
 
 ### 10.5.3 核心算法：增长上下文 → 拼出字符 → 剥干净前缀
@@ -807,7 +807,7 @@ def _new_completion_output(
 
 关键是 DELTA 模式下那行 `logprobs = logprobs[-len(token_ids):]`。
 
-[第 8 章](../ch08-output-processor/narrative/chapter.md) 讲过 `RequestOutputKind` 有 DELTA（流式只发增量）和非 DELTA（每次发全量）之分。流式输出每一步只该回传**本批新增 token** 的 logprobs，于是切尾：取最后 `len(token_ids)` 个位置。如果容器是 `FlatLogprobs`，它的 `__getitem__(slice)` 会返回一个 0-indexed 平移过的新 `FlatLogprobs`；如果是 `list[dict]`，就是普通切片。
+[第 8 章](../ch08-output-processor/narrative/chapter.md) 讲过 `RequestOutputKind` 有 DELTA（流式只发增量）和非 DELTA（每次发全量）之分。流式输出每一步只该回传**本批新增 token** 的 logprobs，于是切尾：取最后 `len(token_ids)` 个位置。如果容器是 `FlatLogprobs`，切片（如 `[-1:]`）会把对应区间的 `start_indices`/`end_indices` 整体减去偏移量，新对象里位置 0 指向原对象的切片起始位置，是一个独立的 0-indexed 新 `FlatLogprobs`；如果是 `list[dict]`，就是普通切片。
 
 **`cumulative_logprob` 不切**。它始终是整段序列的累计值，跟着 `CompletionOutput` 原样带出去——切尾只切逐位置的 logprobs，累计概率是整体打分，不能被切片重置。
 

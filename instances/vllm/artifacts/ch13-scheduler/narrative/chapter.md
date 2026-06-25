@@ -344,7 +344,7 @@ RUNNING 都伺候完、预算还有剩，才轮到 WAITING 队列里的新请求
 
 `num_new_tokens = request.num_tokens - num_computed_tokens`——还是那条减法。注释特意说明用 `num_tokens`（含已生成的输出）而非 `num_prompt_tokens`，因为这条路径也走「被抢占后恢复」的请求（它们有输出 token）。
 
-这里出现了一个重要分叉：**chunked prefill 开没开**。`enable_chunked_prefill` 控制「prompt 能不能拆成几拍算」。如果**关了**，而这个请求要算的 token 超过了剩余预算，直接 `break`——整个 prompt 要么一拍装下，要么这一拍干脆不调度它。如果**开了**（默认），下面 `min(num_new_tokens, token_budget)` 会把它截到预算大小，prompt 分几拍算完。
+这里出现了一个重要分叉：**chunked prefill 开没开**。`enable_chunked_prefill` 控制「prompt 能不能拆成几拍算」。如果**关了**，而这个请求要算的 token 超过了剩余预算，直接 `break`——整个 prompt 要么一拍装下，要么这一拍干脆不调度它。注意这里 `break` 退出的是整个 WAITING 循环，不只是跳过当前请求：关掉 chunked prefill 的场景下，同一应用提交的 prompt 长度往往相近，队首装不下意味着后面的大概率也装不下，与其逐一试探浪费，不如直接截断本轮 WAITING 调度。如果**开了**（默认），下面 `min(num_new_tokens, token_budget)` 会把它截到预算大小，prompt 分几拍算完。
 
 精简版把这两条路都跑给你看。chunked prefill 开着、50 token 的 prompt、预算只有 16：
 
@@ -731,7 +731,7 @@ def test_second_schedule_emits_cached_request_data():
 
 逐个追加 token，每加一个就 `check_stop`——到 `max_tokens` 了？吐出 EOS 了？命中 stop string 了？一旦停了，把多余的 token 截掉（停下之后的 token 不该返回给用户）。
 
-停了的请求走 `_free_request`——释放 KV 块、把 id 记进 `finished_req_ids`（这一拍要随 `SchedulerOutput` 告诉 worker「这些请求结束了，清掉缓存」）、从 `self.requests` 删除。最后从 `running` 或 `waiting` 里把停掉的请求摘出去。
+停了的请求走 `_free_request`——释放 KV 块、把 id 记进 `finished_req_ids`（这一拍要随 `SchedulerOutput` 告诉 worker「这些请求结束了，清掉缓存」）、从 `self.requests` 删除。两个 stopped 集合的区分不是形式主义：`stopped_running_reqs` 在 `self.running` 里（正常情况），`stopped_preempted_reqs` 则在 `self.waiting` 里（该请求上一拍被抢占后退回 waiting 队列、还没恢复，但客户端这一拍发来了取消信号）——两个队列的删除 API 不同，所以分开记。最后从 `running` 或 `waiting` 里把停掉的请求摘出去。
 
 精简版验「达到 max_tokens 就停」的完整闭环：
 

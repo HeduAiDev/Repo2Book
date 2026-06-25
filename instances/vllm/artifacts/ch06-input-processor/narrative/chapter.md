@@ -337,7 +337,7 @@ def get_outputs(
     return outputs, finished
 ```
 
-开头那段是两套模式共用的**记账**：如果这一批输出标记了 `finished()`，就尝试把对应的 child id 从 `child_requests` 集合移除。移除不掉（id 不在集合里）说明这个 child 上一批就完成并返还过了，于是把 `already_finished_and_returned` 标真——这是给流式去重用的。
+开头那段是两套模式共用的**记账**：如果这一批输出标记了 `finished()`，就尝试把对应的 child id 从 `child_requests` 集合移除。移除不掉（id 不在集合里）说明这个 child 上一批就完成并返还过了，于是把 `already_finished_and_returned` 标真——这是给流式去重用的。触发场景是异步时序：OutputProcessor 上一批已把 child 从集合移除并向 EngineCore 发出 abort，但 abort 尚未到达时 EngineCore 又跑了一批、再次产出该 child 的 `finished` 输出——这一"迟到的终态"走到这里就被截住、不重复吐给客户端。
 
 记完账，分流：
 

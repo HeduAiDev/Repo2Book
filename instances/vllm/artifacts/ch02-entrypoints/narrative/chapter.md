@@ -242,6 +242,10 @@ def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
 
 这里要建立一个关键直觉：**一拍处理的是「一批」请求，不是一个**。同一拍里，可能有刚进来、正在 prefill（吃 prompt）的请求，也有跑了很久、正在 decode（逐 token 吐）的请求，它们被混在一个连续批里一起算——这就是连续批处理（continuous batching）。所以一个用户请求的「一生」会**横跨很多拍**，每拍只往前挪几个 token。[第 11 章](../ch11-engine-core/narrative/chapter.md) 会从引擎核心和这个 busy loop 整章讲起。
 
+![连续批处理时间线：每拍混跑多个不同阶段的请求](../diagrams/03-continuous-batching.png)
+
+> *图注：三个请求同时在引擎里跑。Req A 在 Step t 以 prefill 姿态入队，t+1 起进入 decode；Req B 已在 decode 中途，t+1 后结束离队；Req C 在 Step t+2 才入队，直接进 prefill。每拍 `EngineCore.step()` 同时推进这整批——这就是 prefill 与 decode 混跑、「连续」之所在。*
+
 `step()` 吐出的 `EngineCoreOutputs` 被 put 进输出队列，经 ZMQ 送回 API 进程。请求又一次穿过进程边界，这回是往回走。
 
 ---

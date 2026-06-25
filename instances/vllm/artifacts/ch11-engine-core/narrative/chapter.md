@@ -442,7 +442,7 @@ def test_utility_method_invoked_and_enqueued():
 
 ## 11.5 关停：怎么叫醒一个睡着的引擎
 
-现在回收 §11.4 留的悬念。忙循环没活时阻塞睡在 `input_queue.get(block=True)` 上。要关掉这个进程，信号处理器（收到 SIGTERM/SIGINT）能做的很有限——它在中断主线程的任意时刻触发，**不能安全操作非可重入的队列锁**。它没法直接「叫停」那个阻塞的 `get`。
+现在回收 §11.4 留的悬念。忙循环没活时阻塞睡在 `input_queue.get(block=True)` 上。要关掉这个进程，信号处理器（收到 SIGTERM/SIGINT）能做的很有限——它在中断主线程的任意时刻触发，**不能安全操作非可重入的队列锁**（Python 的 `queue.Queue` 内部用 `threading.Lock` 保护，该锁不支持同一线程嵌套获取；若信号恰好在主线程持锁期间打断并再次调用 `put_nowait`，就会死锁）。它没法直接「叫停」那个阻塞的 `get`。
 
 vLLM 的解法分两半。信号处理器只做两件最小的事：把状态标记为「请求关停」，再往队列里投一个 `WAKEUP` 哨兵：
 
@@ -671,7 +671,7 @@ def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None | Future:
 
 读法是「sleep = pause + 委托 executor 管显存」：
 
-- **不管哪一级，先 `pause_scheduler`**。停了调度才能安全动显存。
+- **不管哪一级，先 `pause_scheduler`**。停了调度才能安全动显存。`level >= 1` 时还传 `clear_cache=True`——即顺便清掉 prefix cache（KV-cache 前缀复用表：把历史 prompt 对应的 KV 向量缓存起来，避免重复计算；显存释放后这些缓存失效，不清则变「野指针」）。
 - **level 0**——到此为止。`level < 1` 直接返回 pause 的结果，**不碰 executor、不碰显存**。它就是个「只停调度」的别名，醒来快。
 - **level 1+**——把活委托给 executor 的 `sleep(level)`：level 1 卸权重到 CPU、丢 KV cache；level 2 干脆丢掉全部 GPU 显存。这里又出现了 §11.6 那个同步/异步的分叉——`pause_future is None`（in-proc，已同步排空）就直接 `executor.sleep`；否则（multi-proc，要等排空）挂 `pause_complete` 回调，等 pause 的 Future 完成了再 `executor.sleep`，并把它链到自己返回的 Future 上。
 
@@ -753,7 +753,7 @@ self.step_fn = (
 
 逻辑很简单：executor 的 `max_concurrent_batches > 1` 时（也就是开了流水线并行 PP），启用 `batch_queue` 并把 `step_fn` 绑到 `step_with_batch_queue`；否则零开销走普通 `step`。绑定一次，之后每拍不再判断分支。
 
-`step_with_batch_queue` 是 PP 的核心——它允许同时有多个批在流水线的不同 stage 上飞，靠「先填满流水线优先于取结果」消除 PP 气泡。把收益量化一下：流水线切成 $P$ 个 stage，一个批串行穿过这些 stage。若同一时刻只有一个批在飞，那么任一时刻只有一个 stage 在干活、其余的全空着——硬件利用率只有
+`step_with_batch_queue` 是 PP 的核心——它允许同时有多个批在流水线的不同 stage 上飞，靠「先填满流水线优先于取结果」消除 PP 气泡。把收益量化一下：流水线并行（Pipeline Parallelism，PP）把模型的 Transformer 层**按层切割**分配到多个 GPU（或 GPU 组）上，每个 GPU 负责若干层，称为一个 stage——batch 先经 stage 0 的前几层、再传 stage 1、……、最终从末级 stage 出来。整体切成 $P$ 个 stage，一个批串行穿过这些 stage。若同一时刻只有一个批在飞，那么任一时刻只有一个 stage 在干活、其余的全空着——硬件利用率只有
 
 $$
 \mathrm{利用率} \;=\; \frac{1}{P}

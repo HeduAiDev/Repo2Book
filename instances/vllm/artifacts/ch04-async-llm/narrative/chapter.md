@@ -496,7 +496,7 @@ class RequestOutputCollector:
 - **DELTA 模式**（`aggregate=True`，流式增量）：把新一块的 token **累加**到现有这块后面。消费者下次 `get` 一次拿到合并后的更大块。
 - **FINAL 模式**（`aggregate=False`）：以最新的覆盖旧的。
 
-为什么这么设计？因为另一条路——**背压**（生产者阻塞等消费者）——会很糟糕：慢客户端会把背压一路顶回 GPU，拖累所有其他请求。merge 让生产者永不阻塞：
+为什么这么设计？因为另一条路——**背压**（生产者阻塞等消费者）——会很糟糕：`put()` 如果要等消费者腾出空间，`output_handler` 就会卡在这里，进而堵住 `get_output_async()` 的下一次拉取，IPC 接收队列积压，最终让 EngineCore 进程的输出无处发送、反过来拖慢 GPU 调度循环。merge 让生产者永不阻塞：
 
 > **merge = 对慢消费者自动合帧**
 >
@@ -626,7 +626,7 @@ class RequestOutputCollector:
 
 **反例：共享一条输出流。** 第 $j$ 个请求的 token 要排在队列里，等前面其它请求的 token 被消费完才轮到它。它的尾延迟随并发数**线性恶化**——并发越高，每个请求等得越久，量级 $O(N)$。
 
-**per-request 队列：物理隔离 N 路。** `output_handler` 一次 `put` 直接命中目标请求的 `Event`，**只唤醒那一个请求的 `generate()`**，跟其它请求完全不排队。配合 4.6 节的 `get_nowait()` 快路径，单个请求从"EngineCore 产出 token"到"`yield` 给客户端"的延迟约等于：
+**per-request 队列：物理隔离 N 路。** `output_handler` 一次 `put` 直接命中目标请求的 `Event`，**只唤醒那一个请求的 `generate()`**，跟其它请求完全不排队。每个 `asyncio.Event` 最多只有一个等待者（该请求的 `generate()` 协程），所以 `Event.set()` 的唤醒成本恒为 O(1)，与系统并发总量 N 无关。配合 4.6 节的 `get_nowait()` 快路径，单个请求从"EngineCore 产出 token"到"`yield` 给客户端"的延迟约等于：
 
 $$
 T_{\mathrm{tok2cli}} \approx T_{\mathrm{put}} + T_{\mathrm{resume}}
@@ -682,7 +682,7 @@ class EngineCoreOutput(
 
 特别留意末尾那个 `finished` 属性：`return self.finish_reason is not None`。**这就是 4.3 节 `generate()` 主循环 `finished = out.finished` 判停的最终来源**——一路从 EngineCore 进程的采样结果，经 IPC、经 `process_outputs` 装配进 `RequestOutput`，最后让消费者协程知道"可以收工了"。
 
-这几个 `msgspec.Struct` 上的 `array_like=True` / `gc=False` 是为了跨进程序列化时更紧凑、更快——但具体怎么 encode、怎么过 ZMQ，是 [第 7 章：IPC 边界](../ch07-ipc-boundary/narrative/chapter.md) 的事。本章你只要记住：**IPC 上进去的是 tokenize 好的请求，回来的是新 token + 完成标志。**
+两个结构体都继承自 `msgspec.Struct`——`msgspec` 是 Python 的高性能序列化库，类似 `dataclasses` 但支持直接 encode 成 MessagePack 二进制，反序列化速度比 `pickle`/`json` 快一个数量级，专为进程间高频消息设计。`array_like=True` 让它序列化成数组（省字段名开销），`gc=False` 告诉 Python GC 不必追踪这个对象（纯值对象，无循环引用）——具体怎么 encode、怎么过 ZMQ，是 [第 7 章：IPC 边界](../ch07-ipc-boundary/narrative/chapter.md) 的事。本章你只要记住：**IPC 上进去的是 tokenize 好的请求，回来的是新 token + 完成标志。**
 
 ---
 

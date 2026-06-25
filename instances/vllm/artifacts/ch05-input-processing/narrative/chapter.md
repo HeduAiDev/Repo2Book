@@ -24,7 +24,7 @@
 
 先纠正一个很容易踩的直觉。
 
-「输入处理」四个字，多数人第一反应是 **tokenize**——把文本切成 token id。在老版本的 vLLM 里确实如此，`process_inputs` 是 tokenize 的主战场。但 v1 的真实源码已经变了：**tokenize 和多模态的重活，都下沉到了 API 层的 Renderer**（`render_cmpl` / `render_chat`）。等输入流到 `InputProcessor` 时，文本早已变成 token id，图片早已被处理成嵌入。
+「输入处理」四个字，多数人第一反应是 **tokenize**——把文本切成 token id。在老版本的 vLLM 里确实如此，`process_inputs` 是 tokenize 的主战场。但 v1 的真实源码已经变了：**tokenize 和多模态的重活，都下沉到了 API 层的 Renderer**（`render_cmpl` / `render_chat`）。Renderer 是 `vllm/renderers/base.py` 里的 `BaseRenderer` 抽象类（`HfRenderer` 是最常用的 HuggingFace 实现），它在 OpenAI 兼容 entrypoint 层负责把用户的文本/图片调用 tokenizer 和多模态预处理器转成 `EngineInput` dict，然后才往下传。等输入流到 `InputProcessor` 时，文本早已变成 token id，图片早已被处理成嵌入。
 
 证据就在 `process_inputs` 的分流处：
 
@@ -150,7 +150,7 @@ def _validate_lora(self, lora_request):
 
 [§5.1](#51-一句话钩子tokenize-已经不在这里了) 已经把这个分流讲透了——主路径透传 `EngineInput`，兜底路径走 `InputPreprocessor.preprocess()`。这里补一句兜底路径里发生了什么。
 
-`InputPreprocessor.preprocess()` 是老路径的预处理总入口：它先按是否 encoder-decoder 架构分流，decoder-only 的文本会走到 `_process_text()`，在那里调 `_tokenize_prompt()` 真正切词，再包成统一的 `TokensInput`。多模态、纯嵌入也各有委托。它的产物和主路径透传的 `EngineInput` 是**同一种 TypedDict 家族**——这正是设计的巧妙处：不管走哪条路，出来的 `processed_inputs` 形状一致，后面的代码不用区分来源。
+`InputPreprocessor.preprocess()` 是老路径的预处理总入口：它先按是否 encoder-decoder 架构分流，decoder-only 的文本会走到 `_process_text()`，在那里调 `_tokenize_prompt()` 真正切词，再包成统一的 `TokensInput`。多模态、纯嵌入也各有委托。它的产物和主路径透传的 `EngineInput` 是**同一种 TypedDict 家族**（`vllm/inputs/engine.py` 里以 `type` 字面量判别的三种变体：`TokensInput`、`EmbedsInput`、`MultiModalInput`，统一别名为 `DecoderOnlyEngineInput`）——这正是设计的巧妙处：不管走哪条路，出来的 `processed_inputs` 形状一致，后面的代码只靠 `type` 字段区分内容，不用区分来源。
 
 两条路汇合后，立刻是一道平台级校验和一次结构拆分：
 
@@ -238,7 +238,7 @@ def _validate_prompt_len(self, prompt_len, prompt_type):
 
 三种死法在这一个函数里：**空**（decoder prompt 长度为 0）、**超长**（`> max_model_len`）、以及一个容易被忽略的**等长**——`prompt_len == max_model_len` 且模型是生成型。为什么「正好等于」也要拒？因为生成至少要吐 1 个 token，prompt 占满了整个上下文窗口，连一个输出 token 的位置都不剩了。这是个边界条件，但漏掉它会让请求进了引擎才在某一步崩掉，那时排查成本高得多。
 
-**第二类：多模态嵌入超限。** 每个多模态 item（一张图、一段音频）会展开成若干个嵌入 token，由 `PlaceholderRange.get_num_embeds()` 算出。如果单个 item 的嵌入数超过编码器缓存 `mm_encoder_cache_size`，直接拒——因为编码器缓存根本装不下它。
+**第二类：多模态嵌入超限。** 每个多模态 item（一张图、一段音频）会展开成若干个嵌入 token，由 `PlaceholderRange.get_num_embeds()` 算出。`PlaceholderRange`（`vllm/multimodal/inputs.py`）是一个带 `offset: int`、`length: int` 两个字段的数据类，记录某个多模态 item 在 prompt token 序列里的起始位置与占位长度；`get_num_embeds()` 返回该 item 实际占用的嵌入 token 数（等于 `length`，或者在有掩码时取掩码累加值）。如果单个 item 的嵌入数超过编码器缓存 `mm_encoder_cache_size`（对应 vLLM 配置里的 `mm_encoder_cache_size`，一个按模型规格静态设定的整数），直接拒——因为编码器缓存根本装不下它。
 
 **第三类：token id 越界。** 这一句藏着一个真实世界的坑：
 
@@ -628,7 +628,7 @@ def get_outputs(self, child_request_id, completion_output):
 ```
 
 - **流式**（非 `FINAL_ONLY`）：哪个子请求有新输出就立刻转发哪个，不等齐。已经完成并返回过的不重复发。
-- **非流式**（`FINAL_ONLY`）：把每个子请求的最终结果按 `index` 写进 `output_aggregator`，**等所有子请求都完成**（`child_requests` 清空）才整批返回这 n 个结果。
+- **非流式**（`FINAL_ONLY`，即 `RequestOutputKind.FINAL_ONLY`——`vllm/sampling_params.py` 的枚举值，语义是「不下发中间输出，只在全部完成时返回最终结果」）：把每个子请求的最终结果按 `index` 写进 `output_aggregator`，**等所有子请求都完成**（`child_requests` 清空）才整批返回这 n 个结果。
 
 判定整个并行采样请求是否结束，就一句 `finished = not self.child_requests`——子请求集合空了就完事。这套聚合逻辑会在 [Stage 3 输出处理](../ch08-output-processing/narrative/chapter.md) 里被真正驱动，本章只看它的内部状态机。
 

@@ -92,7 +92,7 @@ async def output_handler():
 
 **第一件，拉。** `await engine_core.get_output_async()` 从 EngineCore 拉来一整批 `EngineCoreOutput`。注意这个 `await`——它正是第 4 章那条进程虚线、第 7 章拆开的 IPC 协议的前端落点。本章不关心这一批是怎么跨进程回来的，只关心它回来之后怎么处理。
 
-**第二件，分块。** 一批可能有几百个输出，如果一口气全丢给 `process_outputs` 跑完，这个协程会长时间霸占事件循环，期间没有任何 `generate()` 协程能拿到 CPU 把已处理好的 token `yield` 出去——首字延迟会被整批拖累。所以这里按 `VLLM_V1_OUTPUT_PROC_CHUNK_SIZE` 切片，**每跑完一块就 `await asyncio.sleep(0)` 主动让出一次**，给别的协程插队的机会。`sleep(0)` 是 asyncio 的惯用让步法：不真睡，只是把控制权交还事件循环转一圈。
+**第二件，分块。** 一批可能有几百个输出，如果一口气全丢给 `process_outputs` 跑完，这个协程会长时间霸占事件循环，期间没有任何 `generate()` 协程能拿到 CPU 把已处理好的 token `yield` 出去——首字延迟会被整批拖累。所以这里按 `VLLM_V1_OUTPUT_PROC_CHUNK_SIZE` 切片（默认 128 个输出一块），**每跑完一块就 `await asyncio.sleep(0)` 主动让出一次**，给别的协程插队的机会。`sleep(0)` 是 asyncio 的惯用让步法：不真睡，只是把控制权交还事件循环转一圈。
 
 **第三件，反向 abort。** `process_outputs` 返回一个 `reqs_to_abort` 列表——那些"前端检测到停止串、但 EngineCore 自己还不知道该停"的请求。为什么会有这种错位？因为停止串是**文本级**判定（比如 stop=`"\n\n"`，得把 token 去成文字才看得出来），而 EngineCore 只懂 **token 级**停止。所以去 token 这一侧发现该停时，得反向通知 EngineCore：别再为这个请求算了，把它的 KV cache 资源放掉。这条反向通道就是图里那根红色虚线，§8.6 会接住它的另一头。
 
@@ -301,7 +301,11 @@ def check_stop_strings(
     return None
 ```
 
-`find` 的起点是 `1 - new_char_count - stop_string_len`（负索引，从尾部往回数），而不是 `0`。为什么不从头扫？因为前面的文本上一步已经扫过了。一个停止串要在本步**首次**出现，它的尾巴必然落在新增字符里，所以只需从"新增字符开头再往前 `stop_string_len - 1` 个字符"扫起，就能覆盖所有可能跨步边界的命中。
+`find` 的起点是 `1 - new_char_count - stop_string_len`（负索引，从尾部往回数），而不是 `0`。为什么不从头扫？因为前面的文本上一步已经扫过了。一个停止串要在本步**首次**出现，它的尾巴必然落在新增字符里，所以只需从"新增字符开头再往前 `stop_string_len - 1` 个字符"扫起，就能覆盖所有可能跨步边界的命中。举个例子：停止串 `"ab"`（长 2），本步新增 3 个字符，则搜索起点 = `1 - 3 - 2 = -4`，即从文本末尾往前数第 4 个字符开始扫——这刚好把"停止串头部来自旧字符、尾部落在新字符"的跨步情况覆盖进来，既不回扫更早的旧字符（那里上一步已扫过），也不可能漏掉本步新出现的任何命中。
+
+![停止串窗口搜索：两步走查](../diagrams/05-stop-string-window.png)
+
+> *图注：stop_str=`"ab"`（长 2）。Step 1 新增 1 个字符，搜索窗口（蓝色虚线框）覆盖末尾 2 个字符 `"zc"`，未命中。Step 2 新增 2 个字符 `'a'+'b'`，搜索窗口覆盖末尾 3 个字符 `"cab"`，命中 `"ab"`（红色高亮）。灰色 = 已被上一步扫过的旧字符，绿色 = 本步新增字符。窗口大小 = new\_char\_count + stop\_len − 1，始终精确覆盖跨步边界，不多扫也不漏扫。*
 
 **这把复杂度从平方级摊薄到线性级。** 朴素做法每步都重扫全文：第 $k$ 步扫 $k$ 个字符，$L$ 步累计起来是
 
@@ -423,7 +427,7 @@ def make_request_output(
 
 > *图注：`stream_interval=4`。token#0 是首 token，发，offset 推到 1；#1~#3 攒着不发；#4 时"已去 token 数 5 − offset 1 = 4"攒够，发增量 `[t1..t4]`，offset 推到 5；#5~#6 又攒着；完成时强制把余量 `[t5..t7]` 发出。`sent_tokens_offset` 只在实际发送时推进，所以各次 DELTA 增量首尾相接，既不重叠也不丢失。*
 
-**闸门三：`n>1` 父聚合。** 如果这个请求是某个 `n>1` 并行采样请求的子序列（`parent_req` 非空），单条子输出不直接成为对客户端的 `RequestOutput`，得先交给 `parent_req.get_outputs(...)` 做父聚合，聚合不出东西（比如 FINAL_ONLY 下还没攒齐 n 个）就 `return None`。这是 §8.6 的主题。
+**闸门三：`n>1` 父聚合。** 如果这个请求是某个 `n>1` 并行采样请求的子序列（`parent_req` 非空），单条子输出不直接成为对客户端的 `RequestOutput`，得先交给 `parent_req.get_outputs(...)` 做父聚合，聚合不出东西（比如 FINAL_ONLY 下还没攒齐 n 个）就 `return None`。有东西时，返回的 `finished` 表示是否所有子都完成——它随 `outputs` 一起传给 `_new_request_output`，决定这个 `RequestOutput.finished` 标志，从而驱动消费者侧的 `generate()` 循环退出。这是 §8.6 的主题。
 
 发出去的那个 `RequestOutput` 里装的 `CompletionOutput` 由 `_new_completion_output` 造：
 

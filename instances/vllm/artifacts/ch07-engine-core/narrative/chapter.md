@@ -618,7 +618,7 @@ def call_utility(self, method: str, *args) -> Any:
 
 四步走：
 
-1. `call_id = uuid.uuid1().int >> 64`——生成一个唯一 id（取 uuid1 的高 64 位）。
+1. `call_id = uuid.uuid1().int >> 64`——生成一个唯一 id。`uuid.uuid1()` 产出 128 位 UUID，其高 64 位是时间戳 + 时钟序列，右移 64 位取的正是这部分，得到一个 64 位整数，可直接被 msgpack 原生编码、无需额外类型包装。RPC 频率远低于 UUID1 时间戳粒度，碰撞概率可忽略不计。
 2. 建一个空 `Future`，存进 `utility_results[call_id]`——这是"在此等待这个 id 的返回"的登记。
 3. `_send_input(UTILITY, (0, call_id, method, args))`——把 `(client_index, call_id, method, args)`（即客户端号、调用号、方法名、参数）当负载发出去。
 4. `future.result()`——**阻塞**等结果（同步版会卡住调用线程，直到 Future 被置值）。
@@ -854,7 +854,7 @@ def process_output_sockets(
 
 这里有两层巧思：
 
-**第一层：buffer 复用池（`reuse_buffers`）。** 编码用的是 `encode_into(outputs, buffer)`——把结果写进一块**已有的 `bytearray`**，而不是每次新分配。用完的 buffer 等 ZMQ 发完（`tracker.done`）后回收进池子，下次直接 `pop` 出来重用。`max_reuse_bufs` 限制池子大小，避免无界增长。高频热路径上，这省掉了海量的内存分配/回收。
+**第一层：buffer 复用池（`reuse_buffers`）。** 编码用的是 `encode_into(outputs, buffer)`——把结果写进一块**已有的 `bytearray`**，而不是每次新分配。用完的 buffer 等 ZMQ 发完（`tracker.done`）后回收进池子，下次直接 `pop` 出来重用。`max_reuse_bufs = len(sockets) + 1` 限制池子大小，避免无界增长。数字的来源：每轮循环最多向**一个** socket 发送（`sockets[client_index]`），因此同时在途的 buffer 最多 `len(sockets)` 块（若每个 client 各有一条 pending）；再加 1 是为了让下一次 encode 有 buffer 可直接 `pop`，而不必等上一条发完。池子超过这个上限就不再回收，多余的 buffer 让 GC 处理。高频热路径上，这省掉了海量的内存分配/回收。
 
 **第二层：零拷贝引用保管（`pending`）。** 和 [§7.6.2](#762-copyfalse-与-tracktrue零拷贝的代价) 前端那套一个道理：`send_multipart(copy=False, track=True)` 后，如果还没发完（`not tracker.done`），就把 `(tracker, ref, buffer)` 攥进 `pending`——`ref` 是输出对象（当含张量/多帧时要保住张量内存）,`buffer` 是那块 bytearray（发完才能回收复用）。每轮循环开头 `while pending and pending[-1][0].done` 检查最老的发完没，发完了就把它的 buffer 还给复用池。
 

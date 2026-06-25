@@ -319,7 +319,7 @@ def _progress_existing_engine(self) -> bool:
 5. **`TRANSFER_WEIGHTS`** — 把模型权重传给新 worker。
 6. **`SYNC_KV_CACHE_MEMORY_SIZE`** — 把自己的 KV 显存额度同步给新引擎（为什么是存在引擎给新引擎，§33.8 揭晓）。
 7. **`SWITCH_AND_PREPARE`** — 真正的切换：销毁旧组、所有引擎改用新组。这是全程最关键的一步，下面单独看。
-8. **`EPLB_RESHUFFLE`** — 专家负载再均衡，把 expert 在新的引擎集合上重新摊匀。
+8. **`EPLB_RESHUFFLE`** — Elastic Expert Parallel Load Balancing（弹性专家并行负载均衡）的缩写；专家负载再均衡，把 expert 在新的引擎集合上重新摊匀。
 9. **`COMPLETE`** — `_update_parallel_config` 把新配置正式生效。
 
 **第 7 步 `_switch_and_prepare` 是"不停机切换"的核心**，值得逐行看：
@@ -714,7 +714,7 @@ Responses API 的卖点是**有状态会话**：客户端第一轮发"我叫 Bob
             messages, engine_inputs = await self._make_request(request, prev_response)
 ```
 
-逻辑直白：有 `previous_response_id` 就去 `response_store` 把上一轮的 `ResponsesResponse` 捞出来（捞不到就 404）；没有就是新会话。然后按 `use_harmony` 分两条拼接路径——普通路径和 harmony 路径。
+逻辑直白：有 `previous_response_id` 就去 `response_store` 把上一轮的 `ResponsesResponse` 捞出来（捞不到就 404）；没有就是新会话。然后按 `use_harmony` 分两条拼接路径——普通路径和 harmony 路径。Harmony 是 vLLM 内部的一种增强消息格式，在标准 `role/content` 之外还带 `channel` 字段（如 `"final"` / `"analysis"`），用于区分思维链与正式输出，§33.12 会细看。
 
 这里出现了两个"店"：`response_store` 和（下面会见到的）`msg_store`。它们是什么来头？看构造：
 

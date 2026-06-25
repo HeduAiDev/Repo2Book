@@ -297,7 +297,7 @@ async def init_app_state(
 
 这里把一组 `OpenAIServing*` 对象造出来、塞进 `app.state`。路由函数运行时会从 `app.state` 里取出对应的 handler。`init_generate_state` 进一步造出 `OpenAIServingChat`（chat handler 主体）和 completion handler。
 
-注意 `OpenAIServingRender` 拿的是 `engine_client.renderer`——渲染器本身来自引擎，但 `OpenAIServingRender` 把渲染逻辑独立成一个对象。这不是随意的拆分：它让渲染能脱离引擎单独运行（比如一台没有 GPU 的纯渲染服务器），而 `OpenAIServingChat` 只在渲染之上叠加"引擎相关"的校验（LoRA、引擎是否还活着）。渲染逻辑有唯一真相源，引擎相关校验是另一层薄壳。这个分层马上就会在请求路径里现形。
+注意 `OpenAIServingRender` 拿的是 `engine_client.renderer`——渲染器本身来自引擎，但 `OpenAIServingRender` 把渲染逻辑独立成一个对象。这不是随意的拆分：它让渲染能脱离引擎单独运行（比如网关前置一台只做 chat template 展开和 tokenize 的轻量服务，把 token_ids 传给后端多个 GPU 节点，而不必在每个 GPU 节点上各跑一份渲染逻辑），而 `OpenAIServingChat` 只在渲染之上叠加"引擎相关"的校验（LoRA、引擎是否还活着）。渲染逻辑有唯一真相源，引擎相关校验是另一层薄壳。这个分层马上就会在请求路径里现形。
 
 ---
 
@@ -538,7 +538,7 @@ def _base_request_id(
         ...
 ```
 
-handler 只认这个协议——它不知道、也不需要知道背后是 `AsyncLLM`、是几个子进程、output_handler 怎么多路分发。它要的就是一个会持续吐 `RequestOutput` 的异步生成器。`errored` / `dead_error` 这两个属性也在协议里，下一节就要用到。
+handler 只认这个协议——它不知道、也不需要知道背后是 `AsyncLLM`、是几个子进程、output_handler 怎么多路分发。它要的就是一个会持续吐 `RequestOutput` 的异步生成器。`RequestOutput` 的核心字段有：`prompt_token_ids`（输入 token 列表）、`outputs`（一组 `CompletionOutput`，每个含 `text` 增量或全文、`token_ids`、`finish_reason`、`index`）、`num_cached_tokens`（KV 缓存命中数）——下面两个分支直接从这些字段取值。`errored` / `dead_error` 这两个属性也在协议里，下一节就要用到。
 
 主线里那句 `assert len(generators) == 1` 值得解释。当 `n > 1`（要多个候选回答）或一次塞多段 prompt 时，代码会派生出多个 `sub_request_id = f"{request_id}_{i}"` 并起多个生成器；但最常见的单回答单 prompt 场景就是一个。本章盯着这条主线走。
 
@@ -885,7 +885,7 @@ async def lifespan(app: FastAPI):
 
 **二是 `freeze_gc_heap()`**。那句注释说得明白：把启动期堆上那一大坨常驻对象标记成"静态"，让垃圾回收器以后别再扫它们。模型权重、引擎对象这些东西活得和进程一样长，每次 GC 都去扫一遍纯属浪费，还会拉长最老一代回收的停顿。启动时冻一次，后续 GC 停顿更短。这是个不起眼但很实在的延迟优化。
 
-关停期就一件事：`task.cancel()` 把那个 `_force_log` 后台循环停掉。再加最外层 `finally` 确保 app.state（含引擎引用）被 GC 掉。
+关停期就一件事：`task.cancel()` 把那个 `_force_log` 后台循环停掉。再加最外层 `finally` 确保 app.state（含引擎引用）被 GC 掉——`lifespan` 退出后，FastAPI 内部会释放 `app.state` 的引用，Python 引用计数归零，引擎对象才能真正被回收，防止内存在关停后仍被 model weight 占用。
 
 至此启动链完整了：`setup_server` 绑 socket → `build_async_engine_client` 起 `AsyncLLM` → `build_and_serve` 造 app、`init_app_state` 挂 handler → `serve_http` 起 uvicorn，期间 `lifespan` 拉起后台日志任务并冻结堆。下一节看最后一环——`serve_http` 和它的优雅关停。
 

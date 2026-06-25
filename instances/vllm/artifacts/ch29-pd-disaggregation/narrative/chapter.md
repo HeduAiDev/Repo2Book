@@ -656,7 +656,7 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
 
 逻辑很清爽：请求**不在** `finished_recving_kv_req_ids` 里 → KV 还没到 → 返回 `False`（调度器把它继续隔离回 `skipped_waiting`，下步再试）。**在**里面 → KV 到了 → 调 `_update_waiting_for_remote_kv` 做实际副作用，然后按 `num_preemptions` 决定提升回 `WAITING` 还是 `PREEMPTED`。
 
-为什么要区分这两个目标态？因为 `WAITING_FOR_REMOTE_KVS` 的请求有两种出身：全新请求第一次等远程 KV（提升回 `WAITING`），或者**曾被抢占**、重新等远程 KV 的请求（提升回 `PREEMPTED`，走 resumed 恢复路径）。`num_preemptions` 非零就是被抢占过。两条路径在后续 `allocate_slots` 和调度分类上走法不同，所以必须分开。
+为什么要区分这两个目标态？因为 `WAITING_FOR_REMOTE_KVS` 的请求有两种出身：全新请求第一次等远程 KV（提升回 `WAITING`），或者**曾被抢占**、重新等远程 KV 的请求（提升回 `PREEMPTED`，走 resumed 恢复路径，即[第 14 章](../ch14-scheduler/narrative/chapter.md)讲的抢占重放机制）。`num_preemptions` 非零就是被抢占过。两条路径在后续 `allocate_slots` 和调度分类上走法不同，所以必须分开。
 
 实际副作用在 `_update_waiting_for_remote_kv` 里。这里有个微妙但关键的处理：
 
