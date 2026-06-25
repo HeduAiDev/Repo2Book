@@ -17,7 +17,7 @@
 - **§13.3** 阶段一调度 RUNNING：追赶公式、`allocate_slots` 失败时的 FCFS 抢占；
 - **§13.4** 阶段二调度 WAITING：`if not preempted_reqs` 守卫、chunked prefill 的截断；
 - **§13.5** `SchedulerOutput` 的二分：首次发 `NewRequestData`（全量）、后续发 `CachedRequestData`（增量）；
-- **§13.6** `update_from_output()`：反馈环的另一半，追加 token、判 stop、释放;
+- **§13.6** `update_from_output()`：反馈环的另一半，追加 token、判 stop、释放；
 - **§13.7** `AsyncScheduler`：`num_output_placeholders` 占位机制，如何让调度和执行重叠。
 
 为了能在本地（无 GPU）把这套逻辑亲手跑一遍、打断点看每个标量怎么变，本章配了一份**只做减法**的精简版：和真实 vLLM 同名、同结构、同控制流，只删掉与连续批处理主干无关的子系统（KV connector、多模态、结构化输出、LoRA、流水线并行等），删除点都原样标注。它是「跑起来看数值」的交叉验证物——正文的主线，始终是真实 `vllm/v1/core/sched/` 的源码。

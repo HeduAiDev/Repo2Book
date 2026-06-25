@@ -225,7 +225,7 @@ else:
 
 单循环第 ③ 步只有一行 `detokenizer.update(...)`，但这一行背后是 V1 去 token 的全部精华。先讲清"为什么不能简单地一个 token 一个 token 各自解码再拼起来"。
 
-**为什么去 token 必须增量。** BPE/byte-fallback 分词下，相邻 token 的文本边界是**相互依赖**的：一个多字节 UTF-8 字符（比如一个中文字、一个 emoji）可能被切成两个 token，单独解码任何一个都得不到完整字符。所以不能 `decode(单 token)` 再拼接——必须维护跨 token 的解码状态。真实 vLLM 为此有两套 `decode_next` 实现:Fast 走 `tokenizers` 库的 `DecodeStream`（库内部维护状态），Slow 走 Python 的 `detokenize_incrementally`（用 `prefix_offset`/`read_offset` 滑窗）。这两套都属 tokenizer 库内部，本章把它抽象成"给一个 token、吐出它新增的那段文字"这个接口，不展开 byte-fallback 细节。
+**为什么去 token 必须增量。** BPE/byte-fallback 分词下，相邻 token 的文本边界是**相互依赖**的：一个多字节 UTF-8 字符（比如一个中文字、一个 emoji）可能被切成两个 token，单独解码任何一个都得不到完整字符。所以不能 `decode(单 token)` 再拼接——必须维护跨 token 的解码状态。真实 vLLM 为此有两套 `decode_next` 实现：Fast 走 `tokenizers` 库的 `DecodeStream`（库内部维护状态），Slow 走 Python 的 `detokenize_incrementally`（用 `prefix_offset`/`read_offset` 滑窗）。这两套都属 tokenizer 库内部，本章把它抽象成"给一个 token、吐出它新增的那段文字"这个接口，不展开 byte-fallback 细节。
 
 来看 `update` 本身的算法（`vllm/v1/engine/detokenizer.py`）——这部分 V1 是自己写的，是本章要讲清的：
 
@@ -692,7 +692,7 @@ $ python3 -m pytest tests/ -q
 35 passed
 ```
 
-35 个断言全过，覆盖了：邮箱 put/Event/DELTA 归并/CUMULATIVE 替换/不同 index 不互覆盖/异常优先/get 阻塞；增量去 token/停止串截断/stop-terminated 末 token 排除但留 id/min_tokens 延迟/delta vs 全量;`n>1` 流式逐子转发与 FINAL_ONLY 攒齐;单循环跳过已 abort/prefill 翻转/两条路径分叉/停止串反向 abort/三表注销;以及 `output_handler` 单生产者扇出多消费者、chunk 分块。
+35 个断言全过，覆盖了：邮箱 put/Event/DELTA 归并/CUMULATIVE 替换/不同 index 不互覆盖/异常优先/get 阻塞；增量去 token/停止串截断/stop-terminated 末 token 排除但留 id/min_tokens 延迟/delta vs 全量；`n>1` 流式逐子转发与 FINAL_ONLY 攒齐；单循环跳过已 abort/prefill 翻转/两条路径分叉/停止串反向 abort/三表注销；以及 `output_handler` 单生产者扇出多消费者、chunk 分块。
 
 这些数值不是新东西——它们是前面读过的真实源码控制流的运行投影。精简版的价值就在这里：你可以打开 `make_request_output`、在 `sent_tokens_offset` 那行打个断点，亲眼看着它随发送一步步推进，把 §8.5 的决策表从"我相信"变成"我看见了"。
 

@@ -271,7 +271,7 @@ if self._is_blocked_waiting_status(
 
 读这段。`peek_request` 只看队头、不取出。如果队头是阻塞态，就调 `_try_promote_blocked_waiting_request` 试着「提升」它——比如远程 KV 这拍到货了，就能从 `WAITING_FOR_REMOTE_KVS` 转回 `WAITING`、变成可调度。提升成功就往下走正常调度。
 
-提升**失败**（条件还没满足）呢？关键就在 `pop_request()` + `prepend_request` + `continue` 这三步:
+提升**失败**（条件还没满足）呢？关键就在 `pop_request()` + `prepend_request` + `continue` 这三步：
 
 - `pop_request()`：把这个阻塞请求从当前队列**取出来**——别让它继续占着队头堵后面。
 - `step_skipped_waiting.prepend_request(request)`：放进一个**本拍临时队列** `step_skipped_waiting`。
