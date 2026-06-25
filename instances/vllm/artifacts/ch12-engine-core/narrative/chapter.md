@@ -422,9 +422,23 @@ assert collected == [1, 2]                       # 先调度的批先收口
 
 `test_appendleft_then_pop_is_fifo` 断言的就是这个：批 1 先 `appendleft`、批 2 后 `appendleft`，但 `pop` 从右端取，于是批 1 先被 `update_from_output`——`appendleft + pop` = FIFO，名副其实。
 
+### 逐拍看队列怎么涨、怎么切
+
+把上面那个 `batch_queue_size = 2`、连发批 1 / 批 2 的场景按拍展开，就能看清「填管道」和「取结果」两态是怎么交替的——关键在那三行判定每拍取什么值：
+
+| 拍 | 动作 | 队尾批 `.done()` | `len < size`(2) | 判定 | 返回 | 队列(左→右) |
+|----|------|------|------|------|------|------|
+| 1 | `schedule` 批1 → `appendleft` | 队尾未完成 → `False` | `1<2` 真 | 三条全真 → 只填不取 | `(None, True)` | `[批1]` |
+| 2 | `schedule` 批2 → `appendleft` | （队已满，第二条先短路） | `2<2` 假 | 第二条假 → 落下半段 | `(outputs, True)` | `pop` 批1 → `[批2]` |
+| 3 | 无新请求，队非空 | — | — | `has_requests` 假 → 直接下半段 | `(outputs, True)` | `pop` 批2 → `[]` |
+
+读这张表的两个要点：第 1 拍队还没满、最老批也没算完，三条件全真，于是 `return (None, True)` 只把批 1 灌进流水线、一个结果都不取；第 2 拍批 2 一入队，`len(batch_queue)` 变成 2，`len < size` 当场为假，判定短路落到下半段，`pop` 出最老的批 1 收口。队列就这样在「填到满」和「pop 一个」之间稳态摆动，长度始终在 `[0, size]` 内。第 1、2 拍正是 `test_appendleft_then_pop_is_fifo` 实测的两步（批 1 先于批 2 收口），第 3 拍对应「无更多请求也得把在飞批 `pop` 干净」。
+
 ### 回头印证那条不变量
 
 还记得 §12.3 开头那个 `assert len(batch_queue) < self.batch_queue_size` 吗？现在能看清它为什么永远成立了。每一拍要么在上半段 `return None, True`（此时队列恰好填了一个、但条件保证填之前 `len < size`），要么落到下半段 `pop` 掉一个。队列只在「填管道判定」的保护下增长——而那个判定的第二个条件 `len(batch_queue) < self.batch_queue_size` 一旦不满足（队满），就不返回、直接落下来 `pop`。于是下一拍进来时，必然刚 `pop` 过、或刚好没填满。队列**永远不会溢出**，`maxlen` 只是双保险。
+
+把这件事写成一句归纳骨架就是：**基例**——方法第一次被调用时 `len(batch_queue) == 0 < size`；**归纳步**——假设某拍进入时 `len < size`，这一拍至多 `appendleft` 一次（`+1`），且只有在 `appendleft` 前 `len < size`（即填后 `len ≤ size`）的前提下才执行，凡填到 `len == size` 就不再走 `return`、必落到下半段 `pop`（`−1`）。两个方向都被夹住，于是「进入方法时 `len < size`」这个不变量逐拍保持，`len(batch_queue)` 这个非负整数被牢牢锁在 `[0, size]` 内——上半段开头那个 `assert len(batch_queue) < self.batch_queue_size` 永不触发。
 
 最后看一眼队列对忙循环的影响。[第 11 章](../ch11-engine-core/narrative/chapter.md) 提过 `has_work()`：
 

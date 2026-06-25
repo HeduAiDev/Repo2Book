@@ -798,6 +798,17 @@ def free(self, request_id: str) -> None:
 - **`allocate_slots`** 三段式总装：查容量（不够返 `None` 触发抢占）、`touch` 挂前缀命中块、`get_new_blocks` 补新块、`cache_full_blocks` 登记。
 - **引用计数 + 惰性驱逐**（`vllm/v1/core/block_pool.py` 的 `free_blocks` / `get_new_blocks`）：块释放时 `ref_cnt` 归零回队列但**保留哈希**，拖到真被复用才清——这是前缀缓存能跨请求、跨抢占复用的全部秘密。
 
+把这套机制的代价摆到一张表上，能看清它为什么扛得住高并发——每一步要么和块数线性、要么单块常数，而且全程**不搬运任何 KV 显存**（块号在变，显存原地不动）：
+
+| 操作 | 复杂度 | 说明 |
+|---|---|---|
+| `get_new_blocks(n)` | O(n) | 队首 `popleft_n` 取 n 块 |
+| `touch` / `free`（单块） | O(1) | 哨兵双向链表，`remove` / `append` 四次指针赋值，与队列长无关 |
+| `find_longest_cache_hit` | O(命中块数) | 沿哈希链查表、一断即停，与请求总长无关 |
+| `cache_full_blocks` | O(新满块数) | 只登记本次新凑满的块 |
+
+这里两个对比最该记住：空闲块的中间删除是 **O(1)** 而非 `deque` 的 O(n)——这是 `touch` 救回命中块的前提；命中查询是 **O(命中块数)** 而非 O(请求长度)——所以前缀越长、命中越多，省得越多而查询本身不变贵。
+
 我们也结清了两笔账。[第 3 章](../ch03-config-and-wiring/narrative/chapter.md) 的 `CacheConfig.block_size` 在这一章无处不在——切块、哈希、分配、命中的最小粒度都是它；`enable_prefix_caching` 则是 `get_computed_blocks` 查不查命中、`get_new_blocks` 惰不惰性驱逐的总闸。[第 14 章](../ch14-scheduler/narrative/chapter.md) 的抢占重算，靠 `free_blocks` 保留哈希 + `find_longest_cache_hit` 命中复用，把代价从「整段重 prefill」压到「只算未命中部分」。
 
 下一章接着往下：这些块分好了，attention backend 怎么把算出来的 Key/Value 真正写进它们对应的物理显存。块是地址，KV 是内容——我们刚铺好了地址簿。

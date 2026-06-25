@@ -232,6 +232,8 @@ def schedule(self) -> SchedulerOutput:
 
 显存满了怎么办？看那个 `while True` 循环——它在**抢占**。`self.running.pop()` 弹出队列**最后一个**请求（FCFS 下，最后一个 = 最晚到达的，最该让位），调 `_preempt_request` 把它踢回 waiting 队列，然后回到循环顶部**重试** `allocate_slots`。抢一个不够就再抢一个，直到分配成功，或者抢到把自己都抢了（`preempted_req == request`，说明队列里只剩它自己还分不到，彻底没救，`break`）。
 
+这个 `while True` 看着像可能空转的死循环，其实必然终止：每转一圈要么 `allocate_slots` 成功 `break`，要么必然执行一次 `self.running.pop()`——`len(self.running)` 是个**严格递减的非负整数**，单调下降的非负量有限步内必触底。一旦 `pop` 到弹出的正是当前请求自己（`preempted_req == request`，此时 `request` 已不在 `running` 里、再无别人可抢），`break` 兜底。所以最坏情况下，循环至多转 `len(self.running)` 圈就停——抢占永远不会卡死调度。
+
 被抢占的请求经历了什么：
 
 ```python
@@ -644,6 +646,17 @@ def test_second_schedule_emits_cached_request_data():
 
 这就是 §13.4 那个测试里「第一拍算 16、第二拍立刻续 16」能成立的原因：第一拍调度后 `num_computed_tokens` 立刻变成 16，第二拍的追赶公式 `50 - 16 = 34`，再截到预算 16——续上了。乐观推进是 chunked prefill 能流水起来的引擎。
 
+把这个 50-token prompt、预算 16 的请求逐拍追踪一遍，就能看到追赶公式如何在 `num_computed_tokens` 单调爬升中收敛（数值取自 §13.4 的 `test_token_budget_chunks_long_prefill`，最后一拍 `50 − 48 = 2`）：
+
+| 拍 | 追赶公式 `num_tokens − computed` | `min(预算16)` → `num_new_tokens` | `token_budget` 末值 | 调度后 `num_computed_tokens` | `is_prefill_chunk` |
+|----|------|------|------|------|------|
+| 1 | 50 − 0 = 50 | 16 | 0 | 0 → 16 | 是（16 < 50） |
+| 2 | 50 − 16 = 34 | 16 | 0 | 16 → 32 | 是（32 < 50） |
+| 3 | 50 − 32 = 18 | 16 | 0 | 32 → 48 | 是（48 < 50） |
+| 4 | 50 − 48 = 2 | 2 | 14 | 48 → 50 | 否（50 = 50，prefill 读完） |
+
+每拍 `num_computed_tokens` 严格增加（增量 = 上一拍乐观推进的 `num_new_tokens` > 0），它是个**有上界 `num_tokens` 的单调递增整数**——必在有限拍内追上，公式收敛、`is_prefill_chunk` 翻假，请求转入 decode。第 4 拍只剩 2 token，预算没花满（末值 14），同一拍里这 14 的余量正好留给别的 decode 请求共享——「不分相」在 chunked prefill 收尾时自然让出预算。
+
 `is_prefill_chunk` 也在这里更新：如果 `num_computed_tokens` 还没追上总数，说明 prompt 还没读完，这个请求还在 prefill 中途。这个标志位 §13.7 异步调度会用到。
 
 ---
@@ -808,7 +821,7 @@ class AsyncScheduler(Scheduler):
         return new_token_ids, stopped
 ```
 
-调父类把 token 真正追加上去之后，`num_output_placeholders -= len(new_token_ids)`——产出几个真 token，就把几个占位减回去。`assert num_output_placeholders >= 0` 钉死了配平：占位永远不会减成负数，因为「先记上的占位」和「后兑现的真 token」严格一一对应。（注意这里才 `cache_blocks`——同步版在 `allocate_slots` 时就缓存了 KV 块，异步版因为真 token 滞后一拍，得等 token 回来才缓存。）
+调父类把 token 真正追加上去之后，`num_output_placeholders -= len(new_token_ids)`——产出几个真 token，就把几个占位减回去。`assert num_output_placeholders >= 0` 钉死了配平，而它为什么恒成立可以写成一句归纳：把 `num_output_placeholders` 看成一个量，**基例**是请求刚进 decode 时它为 0；**归纳步**是每一次只有两种改动——调度一拍 `+= 1 + cur_num_spec_tokens`（先记上将出的 1 真 + 若干草稿），真 token 回流一拍 `-= len(new_token_ids)`（兑现已出的）。每个「记上」的占位都对应一个「将由前向产出」的 token，而前向最多产出当初记的那么多（草稿被拒只会少产、对应在 `update_from_output` 里少减甚至回退 `num_computed_tokens`），所以减量永远 ≤ 当前累计的加量——这个量恒 ≥ 0，永不透支。这就是「占位计数与真实／草稿 token 的产出严格配平」背后的归纳依据，不是一句断言。（注意这里才 `cache_blocks`——同步版在 `allocate_slots` 时就缓存了 KV 块，异步版因为真 token 滞后一拍，得等 token 回来才缓存。）
 
 精简版可以把这个占位计数的「加上去、减回来」全程跑出来：
 

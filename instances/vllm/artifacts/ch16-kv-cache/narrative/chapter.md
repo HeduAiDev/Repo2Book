@@ -322,7 +322,13 @@ if apply_admission_cap and self._max_admission_blocks_per_request is not None:
     )
 ```
 
-问题的根源：滑窗请求的 `cdiv(全长)` 是按**整条序列长度**算的，但它实际**同时持有**的真实块远没那么多——因为窗外块一直在被 `remove_skipped_blocks` 回收。一个 max_model_len=32768 的滑窗请求，窗口才 4096，它任何时刻真实持块也就 `cdiv(4096)` 出头，而不是 `cdiv(32768)`。
+问题的根源：滑窗请求的 `cdiv(全长)` 是按**整条序列长度**算的，但它实际**同时持有**的真实块远没那么多——因为窗外块一直在被 `remove_skipped_blocks` 回收。每请求峰值真实持块约为
+
+$$
+\mathrm{cdiv}(\mathrm{sliding\_window} - 1 + \mathrm{newly\_scheduled\_tokens},\ \mathrm{block\_size}) + 1
+$$
+
+那个 `+1` 是因为窗口左边界未必落在块边界上，可能多压半个块。代入数值看量级差：max_model_len=32768、sliding_window=4096、block_size=16，全长口径要 `cdiv(32768,16)=2048` 块，而峰值持块只有 `cdiv(4096-1,16)+1≈257` 块——相差近 **8 倍**。按全长留量等于把一个请求的占用虚报了 8 倍，准入会无谓地拒掉本能放下的请求。
 
 如果准入时按 `cdiv(全长)` 留量，会发生什么？要么过度保守、明明放得下却拒了（吞吐塌方），要么——更糟——启动时的池大小估算器（pool sizer）按「回收后的峰值」算了池容量，运行时准入却按「全长」检查，两套口径打架。源码注释把后果点名了：
 
@@ -743,6 +749,16 @@ def find_longest_cache_hit(
 - **第 1 轮。** `curr_hit_length=512` 起步。full 首次查表，从头连续命中到 512，接受。SW 在 512 处查，发现窗内只连续命中到 384，把 `curr_hit_length` 缩短到 384。一轮结束 `curr_hit_length=384 < hit_length=512`——变了，`hit_length=384`，重启。
 - **第 2 轮。** `curr_hit_length=384`。full 走 `continue` 分支，把自己截到 384（不重查表）。SW 在 384 处查，这次窗内连续命中到 384，接受。一轮结束 `curr_hit_length=384 >= hit_length=384`——没变，`break`。
 - **收尾。** full 的命中块从 512 那次查得的长度截回 384 块数。返回每组命中块 + 最终长度 384。
+
+把这两轮 `while` 的逐拍状态摊成一张表，循环怎么收敛一目了然（`block_size=128`，`lcm=128`，full 排首）：
+
+| 轮次 | 动作（依次处理两组） | `hit_length`（轮初） | `curr_hit_length`（轮末） | 判定（`curr ≥ hit`?） | 返回 |
+| --- | --- | --- | --- | --- | --- |
+| 第 1 轮 | full 首查表→接受 512；SW 在 512 处查→缩短到 384 | 512 | 384 | 384 < 512，否 → `hit_length=384` 重启 | 继续 |
+| 第 2 轮 | full 走 `continue` 截到 384；SW 在 384 处查→接受 384 | 384 | 384 | 384 ≥ 384，是 → `break` | 收敛 |
+| 收尾 | full 命中块 `del blks[384//128:]` 截回 3 块 | — | — | — | 返回（每组命中块，384） |
+
+关键标量只有一个 `curr_hit_length`，它每轮**只减不增**：512 → 384 → 384（不动）。第二轮谁都没把它压下去，就是不动点。
 
 精简版 `test_hybrid_find_longest_cache_hit_converges_to_min` 构造了一个 full 命中更长、SWA 命中更短的场景，断言最终收敛到两者一致的较短长度。`test_hybrid_verify_and_split_full_attn_first` 验证 full 桶确实排在 `attention_groups[0]`。
 

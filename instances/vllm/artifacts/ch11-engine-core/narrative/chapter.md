@@ -504,6 +504,17 @@ def _handle_shutdown(self) -> bool:
 
 `_handle_shutdown` 返回 `False`，`run_busy_loop` 的 while 退出，`raise SystemExit`，进程干净结束。
 
+非零超时（排空模式）下，`SHUTTING_DOWN` 这态不是一锤子退出，而是要在忙循环里转好几圈、把在途请求一拍一拍跑完才退。这个「排空」必然终止吗？逐拍追一遍就清楚了——设关停被请求那一刻调度器手上还有 3 个未完成请求，每圈一拍 `step` 至少跑完一个（最坏一拍只完成一个）：
+
+| 圈次 | 进 `_handle_shutdown` 时的状态 | 该圈动作 | `get_num_unfinished_requests()` | `has_work()` | 返回 |
+|---|---|---|---|---|---|
+| 1 | `REQUESTED` | 转 `SHUTTING_DOWN`，有活 | 3 | True | True（再转一圈） |
+| 2 | `SHUTTING_DOWN` | 跑一拍，完成 1 个 | 3→2 | True | True |
+| 3 | `SHUTTING_DOWN` | 跑一拍，完成 1 个 | 2→1 | True | True |
+| 4 | `SHUTTING_DOWN` | 跑一拍，完成 1 个 | 1→0 | False | **False（退出）** |
+
+终止性的一句话骨架：进入 `SHUTTING_DOWN` 后不再接收新请求（`_reject_add_in_shutdown` 挡掉 ADD），于是「未完成请求数」是一个**只减不增的非负整数**——每跑一拍至少递减 1，单调递减的非负整数序列必在有限步内触底为 0，`has_work()` 转 `False`，循环退出。这就把「排空一定会结束」从断言变成了可数的有限步。
+
 把整条链连起来看，关停其实是一次精心编排的握手：信号处理器不敢碰队列锁 → 投 `WAKEUP` 哨兵 → 叫醒阻塞的 `get` → 忙循环转一圈撞上 `_handle_shutdown` → 三态机排空 → 退出。每一环都绕开了「在信号上下文里做危险操作」这个雷区。
 
 精简版把三态迁移和有活退出验证了：
@@ -742,7 +753,13 @@ self.step_fn = (
 
 逻辑很简单：executor 的 `max_concurrent_batches > 1` 时（也就是开了流水线并行 PP），启用 `batch_queue` 并把 `step_fn` 绑到 `step_with_batch_queue`；否则零开销走普通 `step`。绑定一次，之后每拍不再判断分支。
 
-`step_with_batch_queue` 是 PP 的核心——它允许同时有多个批在流水线的不同 stage 上飞，靠「先填满流水线优先于取结果」消除 PP 气泡。它的关键一手是：调度到新批、且队列没满、且队尾那个批还没算完时，**直接返回 `(None, True)`**，让忙循环立刻转下一圈再去调度一个批，而不是傻等当前批：
+`step_with_batch_queue` 是 PP 的核心——它允许同时有多个批在流水线的不同 stage 上飞，靠「先填满流水线优先于取结果」消除 PP 气泡。把收益量化一下：流水线切成 $P$ 个 stage，一个批串行穿过这些 stage。若同一时刻只有一个批在飞，那么任一时刻只有一个 stage 在干活、其余的全空着——硬件利用率只有
+
+$$
+\mathrm{利用率} \;=\; \frac{1}{P}
+$$
+
+`batch_queue_size>1` 让同时有至多 `batch_queue_size` 个批分布在不同 stage 上，各 stage 都有活干，理论吞吐上限趋近 P 倍（实际受队列深度与调度/采样依赖封顶）。它的关键一手是：调度到新批、且队列没满、且队尾那个批还没算完时，**直接返回 `(None, True)`**，让忙循环立刻转下一圈再去调度一个批，而不是傻等当前批：
 
 ```python
 # vllm/v1/engine/core.py:L498（step_with_batch_queue 上半段节选）

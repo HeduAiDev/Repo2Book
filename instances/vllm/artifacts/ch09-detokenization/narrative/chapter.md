@@ -391,6 +391,8 @@ def convert_prompt_ids_to_tokens(
 
 注意它**不解码整个 prompt**，只取末尾 `INITIAL_OFFSET+2 = 7` 个 token。因为增量解码只需要"紧邻新 token 的那一小段上下文"就够判断空格了，整段 prompt 解码纯属浪费。`read_offset` 指向已读到的位置，`prefix_offset` 往前退 5 个 token 作为上下文锚。
 
+**量化一下这个窗口省了多少。** 朴素做法每步都把"到目前为止的全序列"重新 detokenize 一遍——第 $k$ 步要解 $k$ 个 token，$n$ 步累计 $O(n^2)$。双 offset 窗口把每步的解码范围钉死在 `[prefix_offset:]` 这一小段尾部 token 上，长度恒为 `INITIAL_OFFSET=5` 量级、与已生成多少 token 无关，于是每步降到 $O(\mathrm{INITIAL\_OFFSET})$、整体趋近 $O(n)$。和 §9.4 的 stop 搜索窗口是同一招、同一收益：把"每步重扫全文"压成"每步只看尾部常数段"，二次降到近线性。窗口存在的唯一理由是给空格 cleanup 喂足相邻上下文，而非正确性需要全量重解。
+
 真正干活的是 `detokenize_incrementally`（函数定义在 `vllm/tokenizers/detokenizer_utils.py:L110`，下面截取的是它 L143 起的函数体主干）：
 
 ```python

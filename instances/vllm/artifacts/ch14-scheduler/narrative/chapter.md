@@ -85,6 +85,18 @@ if preempted_req == request:
 
 这里有个微妙的设计。当 `running` 里只剩 `request` 自己时，`self.running.pop()` 抢到的就是 `request` 本身。`preempted_req == request` 成立——意思是「我把自己都抢了，没人可抢了」。这时候认输 `break`，外层再看 `new_blocks is None` 成立，连整个 RUNNING 循环都退出。本拍这个请求排不进去，它已经被自己的抢占动作塞回了 `waiting`，下一拍再说。
 
+把这个 `while True` 逐拍跑一遍，比读流程图更直观。设块池只剩 0 块、`running = [A, B, C]`（C 最晚加入），新来的 `request = D` 这一拍要 1 个 token：
+
+| 轮 | `allocate_slots` | 动作 | `running` | `preempted_reqs` | `preempted_req==request`? | 返回 |
+|---|---|---|---|---|---|---|
+| 1 | `None`（块池空） | `pop()→C`，`_preempt_request(C)`：free C 的块 | `[A, B]` | `[C]` | 否 | `continue` 重试 |
+| 2 | 仍 `None`（D 要的块还不够） | `pop()→B`，`_preempt_request(B)` | `[A]` | `[C, B]` | 否 | `continue` 重试 |
+| 3 | 非 `None`（B 的块够 D 用了） | — | `[A]` | `[C, B]` | — | `break` 正常调度 D |
+
+每抢一个就 `free` 一批块、回 `allocate_slots` 再要一次；要到就停。换个极端场景——块池碎到怎么抢都不够：第 1、2 轮抢掉 C、B 后 `running` 只剩 `[A]`，第 3 轮 `allocate_slots` 还是 `None`，`pop()` 抢到 A，第 4 轮再 `None` 时 `running` 已空，`pop()` 抢到的就是 D 自己——`preempted_req == request` 成立，`break` 放弃本请求。
+
+这个循环为什么一定会停？因为每一轮要么 `break`（要到块），要么 `self.running.pop()` 让 `running` 长度严格减 1。`len(running)` 是个**单调递减的非负整数**，最多减到 0；减到 0 后下一次 `pop()` 必然抢到 `request` 自己，触发 `preempted_req == request` 的 `break`。所以无论块池多紧，循环至多 `len(running) + 1` 轮必然终止——不会空转。
+
 整个流程，一张图说清：
 
 ![RUNNING 阶段的抢占循环](../diagrams/preemption-loop-flow.png)
@@ -93,7 +105,15 @@ if preempted_req == request:
 
 这里值得停一下，对比一下别的引擎的做法。很多推理系统遇到内存压力，会把被抢请求的 KV 缓存**换出（swap）到 CPU 内存**，等内存松了再换回来。这样被抢请求不用重算。vLLM v1 **不这么做**——它直接把 KV 块还给块池，被抢请求回头从 0 重新 prefill。
 
-为什么宁可重算也不换出？换出换入要走 PCIe，KV 缓存动辄几 GB，I/O 开销大、还得管理 CPU 侧的缓冲区。而 vLLM 有一张底牌：前缀缓存。被抢请求回 `waiting` 重新调度时，它之前算过的那些 token 的前缀块，只要还没被别的请求挤掉，就能直接命中、跳过重算。于是「重算」的实际成本，往往远小于「从头算一遍」——这套前缀缓存的机制，**第 15 章** 会拆开讲。v1 用「简单的内存模型 + 前缀缓存兜底」换掉了「复杂的 swap 管理」。
+为什么宁可重算也不换出？换出换入要走 PCIe，KV 缓存动辄几 GB，I/O 开销大、还得管理 CPU 侧的缓冲区。而 vLLM 有一张底牌：前缀缓存。被抢请求回 `waiting` 重新调度时，它之前算过的那些 token 的前缀块，只要还没被别的请求挤掉，就能直接命中、跳过重算。
+
+把成本量级写明白：记被抢请求已生成长度为 $L$、前缀缓存未命中的部分为 $L_{\mathrm{miss}}$。朴素的「丢弃重算」要重新 prefill 整段，但前缀缓存命中后只需重算没命中的那部分：
+
+$$
+O(L) \;\longrightarrow\; O(L_{\mathrm{miss}})
+$$
+
+命中率越高，$L_{\mathrm{miss}}$ 越接近 0，重算成本越低。这就是 v1 敢用「丢弃」替「换出」的底气——这套前缀缓存的机制，**第 15 章** 会拆开讲。v1 用「简单的内存模型 + 前缀缓存兜底」换掉了「复杂的 swap 管理」。
 
 ---
 
@@ -211,9 +231,15 @@ if not preempted_reqs:
 - 等结构化输出的语法对象编译好（约束解码，`WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR`）；
 - 等流式输入的下一段（多轮会话，`WAITING_FOR_STREAMING_REQ`）。
 
-这些叫**阻塞态**。问题来了：如果一个阻塞态请求恰好排在 FCFS 队头，而 FCFS 必须按顺序来——它没准备好，就轮不到后面的人。哪怕后面有一堆「完全可以跑」的请求，全被这一个堵在身后**饿死**。这就是经典的**队头阻塞（head-of-line blocking）**。
+这些叫**阻塞态**。问题来了：如果一个阻塞态请求恰好排在 FCFS 队头，而 FCFS 必须按顺序来——它没准备好，就轮不到后面的人。哪怕队头后面排着 $N$ 个「完全可以跑」的请求，全被这一个堵在身后**饿死**——单队列下队头阻塞的代价是 $O(N)$ 个本可调度的请求被白白拖住，吞吐塌缩到 0。
 
-vLLM 的解法：把阻塞态请求**隔离**到第二个队列 `skipped_waiting`，让可调度的请求在 `waiting` 里畅通无阻。
+vLLM 的解法：把阻塞态请求**隔离**到第二个队列 `skipped_waiting`，让可调度的请求在 `waiting` 里畅通无阻。隔离后，每个阻塞请求只是被 $O(1)$ 地 `pop` + `prepend` 跳过一次，后面 $N$ 个可调度请求照常前进；单拍的额外代价不过是最多遍历两队总长一遍，即每拍 `peek`/`pop` 次数满足：
+
+$$
+C_{\mathrm{step}} \le |waiting| + |skipped\_waiting|
+$$
+
+也就是把 $O(N)$ 的队头阻塞换成了对两队的线性一遍扫描。
 
 ![单队列队头阻塞 vs 双队列隔离](../diagrams/dual-queue-anti-hol.png)
 
@@ -658,7 +684,7 @@ def _update_request_with_output(
 三个关键点：
 
 1. **`discard_latest_async_tokens`**：如果请求在 `reset_prefix_cache` 里被**强制抢占**了，在途的那个异步 token 是基于旧进度算的，作废——直接返回 `[]`，啥也不追加。这是异步重叠和抢占撞在一起时的特判。
-2. **占位回扣**：实际生成了 `len(new_token_ids)` 个 token，就从 `num_output_placeholders` 里扣掉这么多——占的位兑现了。`assert >= 0` 守住不会扣穿。（§14.5 的投机解码回退也扣这个计数，同一个簿记。）
+2. **占位回扣**：实际生成了 `len(new_token_ids)` 个 token，就从 `num_output_placeholders` 里扣掉这么多——占的位兑现了。`assert >= 0` 守住不会扣穿。（§14.5 的投机解码回退也扣这个计数，同一个簿记。）这条 `>= 0` 不变量为什么恒成立？看它的增减：调度一拍时**每占一个位 `+1`**（含投机草稿），回流时**每兑现一个 token `-1`**、每拒一个草稿 `-1`——扣减的来源（实际 token + 被拒草稿）和当初占位的来源（乐观计入的每个被调度 token）**一一配对**，扣减量永远不超过当初占的量。基例占位为 0，每步净变化让它回不到负数，故 `num_output_placeholders` 恒 $\ge 0$——`assert` 只是把这条归纳出来的不变量钉成运行期防线。
 3. **只有 RUNNING 才缓存块**：被抢占的请求（`status != RUNNING`）跳过 `cache_blocks`——它的块都 free 了，没什么可缓存的。这和 §14.2 的抢占语义一致：抢占即丢弃，别再往一个已经被回退的请求上写缓存。
 
 精简版同样覆写了这个方法，保留了三个分支，你能在本地构造「强制抢占丢弃异步 token」「占位回扣到 0」这些边界，亲眼确认 `num_output_placeholders` 的账永远平。
