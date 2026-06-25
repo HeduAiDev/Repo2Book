@@ -62,7 +62,9 @@ for y, h, fill, stroke, label in lanes:
         f'<rect x="{lane_x}" y="{y}" width="{lane_w}" height="{h}" rx="10" '
         f'fill="{fill}" stroke="{stroke}" stroke-width="1.5"/>'
     )
-    text(lane_x + 14, y + 22, label, size=14, weight="bold", fill="#334155")
+    # ZMQ lane label moved down to avoid collision with process_outputs box text
+    label_dy = 42 if "ZMQ" in label else 22
+    text(lane_x + 14, y + label_dy, label, size=14, weight="bold", fill="#334155")
 
 # ── API process lane content ──
 # Row 1: add_request chain (top)

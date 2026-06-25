@@ -49,14 +49,14 @@ box(LCX - 150, 64, 300, 40, "#e0e7ff")
 text(LCX, 89, "RMSNorm(...)  →  CustomOp.__init__", 14, mono=True)
 arrow(LCX, 104, LCX, 128)
 
-box(LCX - 150, 130, 300, 40, "#e0e7ff")
-text(LCX, 155, "dispatch_forward()", 14, mono=True, weight="bold")
+box(LCX - 150, 130, 300, 100, "#e0e7ff")
+text(LCX, 158, "dispatch_forward()", 14, mono=True, weight="bold")
 text(LCX, 192, "读 CompilationConfig.custom_ops", 13, fill="#475569")
-text(LCX, 210, "调 enabled() / default_on()", 13, fill="#475569")
+text(LCX, 213, "调 enabled() / default_on()", 13, fill="#475569")
 
 # 分叉
-arrow(LCX, 216, LCX - 130, 248)
-arrow(LCX, 216, LCX + 130, 248)
+arrow(LCX, 230, LCX - 130, 248)
+arrow(LCX, 230, LCX + 130, 248)
 
 box(LCX - 240, 250, 220, 96, "#dcfce7", "#16a34a")
 text(LCX - 130, 274, "enabled 且 CUDA", 13, weight="bold", fill="#166534")

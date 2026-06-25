@@ -7,7 +7,7 @@ def esc(s):
     return xs.escape(s)
 
 
-W, H = 920, 430
+W, H = 920, 490
 L = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">']
 L.append(
     '<defs>'
@@ -49,10 +49,10 @@ LABEL_W = 108      # left label column width
 STEP_COLS = 4      # number of time steps
 COL_W = 190        # each step column width
 ROW_H = 74         # each request row height
-GAP = 8            # gap between cells
+GAP = 28           # gap between cells (wider to give room for between-row annotations)
 GRID_X = LABEL_W + 10   # grid starts here (x)
 HEADER_Y = 52      # top of header row
-GRID_Y = HEADER_Y + 38  # top of first data row
+GRID_Y = HEADER_Y + 60  # top of first data row (increased to give space for annotation labels)
 
 steps = ["Step  t−1", "Step  t", "Step  t+1", "Step  t+2"]
 reqs  = ["Req A", "Req B", "Req C"]
@@ -92,24 +92,24 @@ for ri in range(len(reqs)):
 # ── "enters batch" annotation arrows for Req A col t and Req C col t+2 ──
 # Req A enters at col t (ci=1, ri=0)
 ax = GRID_X + 1 * (COL_W + GAP)
-ay = GRID_Y + 0 * (ROW_H + GAP) + ROW_H / 2
-# small downward arrow from above
+ay = GRID_Y + 0 * (ROW_H + GAP)  # top of the cell
+# small downward arrow from above cell
 L.append(
-    f'<line x1="{ax + COL_W/2}" y1="{ay - 30}" '
-    f'x2="{ax + COL_W/2}" y2="{ay - 6}" '
+    f'<line x1="{ax + COL_W/2}" y1="{ay - 18}" '
+    f'x2="{ax + COL_W/2}" y2="{ay - 3}" '
     f'stroke="#d97706" stroke-width="2" marker-end="url(#a)"/>'
 )
-t(ax + COL_W / 2, ay - 34, "新请求入队", size=11, fill="#b45309", weight="bold")
+t(ax + COL_W / 2, ay - 22, "新请求入队", size=11, fill="#b45309", weight="bold")
 
 # Req C enters at col t+2 (ci=3, ri=2)
 cx3 = GRID_X + 3 * (COL_W + GAP)
-cy3 = GRID_Y + 2 * (ROW_H + GAP) + ROW_H / 2
+cy3 = GRID_Y + 2 * (ROW_H + GAP)  # top of the cell
 L.append(
-    f'<line x1="{cx3 + COL_W/2}" y1="{cy3 - 30}" '
-    f'x2="{cx3 + COL_W/2}" y2="{cy3 - 6}" '
+    f'<line x1="{cx3 + COL_W/2}" y1="{cy3 - 18}" '
+    f'x2="{cx3 + COL_W/2}" y2="{cy3 - 3}" '
     f'stroke="#d97706" stroke-width="2" marker-end="url(#a)"/>'
 )
-t(cx3 + COL_W / 2, cy3 - 34, "新请求入队", size=11, fill="#b45309", weight="bold")
+t(cx3 + COL_W / 2, cy3 - 22, "新请求入队", size=11, fill="#b45309", weight="bold")
 
 # ── Req B "finished" callout ─────────────────────────────────────
 bx = GRID_X + 2 * (COL_W + GAP) + COL_W / 2

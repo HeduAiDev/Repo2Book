@@ -64,7 +64,7 @@ def build():
     # ===== 右：flatten list =====
     rx = 680
     L.append(f'<text x="{rx}" y="95" font-family="sans-serif" font-size="13" font-weight="bold" fill="{C_TXT}">{esc("输出：list[MultiModalFeatureSpec]（按序列位置有序）")}</text>')
-    L.append(f'<path d="M630,210 L{rx-10},150" fill="none" stroke="{C_BD}" stroke-width="2.2" marker-end="url(#a)"/>')
+    L.append(f'<path d="M630,210 L{rx},150" fill="none" stroke="{C_BD}" stroke-width="2.2" marker-end="url(#a)"/>')
 
     rows = [
         ("image", "offset=5", C_IMG, C_IMG_BD),

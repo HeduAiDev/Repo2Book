@@ -100,8 +100,8 @@ def build():
     # f3 anchor
     L.append(f'<rect x="954" y="488" width="20" height="20" rx="10" fill="{C_OUT}"/>')
     L.append(f'<text x="964" y="502" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="bold" fill="white">{esc("3")}</text>')
-    # EngineCoreOutput 消息标签
-    L.append(f'<text x="610" y="450" text-anchor="middle" font-family="monospace" font-size="11" font-weight="bold" fill="{C_OUT}">{esc("← EngineCoreOutput（new_token_ids + finished）")}</text>')
+    # EngineCoreOutput 消息标签（start anchor, x=667 确保不侵入 Frontend 泳道区域）
+    L.append(f'<text x="667" y="430" text-anchor="start" font-family="monospace" font-size="11" font-weight="bold" fill="{C_OUT}">{esc("← EngineCoreOutput（new_token_ids + finished）")}</text>')
 
     # output_handler -> process_outputs -> 多个队列
     box(L, 300, 470, 230, 56, "process_outputs", "按 req_id 解多路复用", fill="#fff", bd=C_OUT)

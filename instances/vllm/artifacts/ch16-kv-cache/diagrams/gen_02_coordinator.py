@@ -44,7 +44,7 @@ for cx, fill, stroke, title, cond, body in children:
     box(cx, cy, cw, 56, fill, stroke, [title], 13.5, "bold")
     # condition label on edge
     midx = cx + cw/2
-    L.append(f'<line x1="{rx+rw/2}" y1="{ry+rh}" x2="{midx}" y2="{cy-4}" stroke="#475569" stroke-width="1.6" marker-end="url(#a)"/>')
+    L.append(f'<line x1="{rx+rw/2}" y1="{ry+rh}" x2="{midx}" y2="{cy}" stroke="#475569" stroke-width="1.6" marker-end="url(#a)"/>')
     lx = (rx+rw/2 + midx)/2
     ly = (ry+rh + cy)/2
     L.append(f'<rect x="{lx-50}" y="{ly-13}" width="100" height="22" rx="4" fill="white" stroke="#cbd5e1"/>')

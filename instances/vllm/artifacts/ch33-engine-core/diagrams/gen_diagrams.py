@@ -107,10 +107,10 @@ def diagram_scaleup():
 
     # 跨进程通知（横向箭头）—— 从 new 指向 existing 的两个 WAIT 态
     def notify(from_y, to_y, txt):
-        x1 = nw_x - 12
-        x2 = ex_x + bx_w + 12
+        x1 = nw_x          # 从新引擎框左边缘出发
+        x2 = ex_x + bx_w  # 落在存在引擎框右边缘
         ymid = (from_y + to_y) / 2
-        L.append(f'<path d="M{x1},{from_y+bh/2} C{(x1+x2)/2},{from_y+bh/2} {(x1+x2)/2},{to_y+bh/2} {x2+4},{to_y+bh/2}" '
+        L.append(f'<path d="M{x1},{from_y+bh/2} C{(x1+x2)/2},{from_y+bh/2} {(x1+x2)/2},{to_y+bh/2} {x2},{to_y+bh/2}" '
                  f'fill="none" stroke="#b45309" stroke-width="1.6" stroke-dasharray="5,3" marker-end="url(#ah)"/>')
         text(L, (x1 + x2) / 2, ymid - 4, txt, 11, "middle", "#b45309", "bold")
 
@@ -207,10 +207,10 @@ def diagram_kvinit():
         if i:
             vline(L, x + bw / 2, ys[i - 1] + bh, y, "#475569", arrow=True)
 
-    # 高亮“额度从 step4 流到 step5”
+    # 高亮"额度从 step4 流到 step5"
     y4 = ys[3] + bh / 2
     y5 = ys[4] + bh / 2
-    L.append(f'<path d="M{x+bw+10},{y4} C{x+bw+70},{y4} {x+bw+70},{y5} {x+bw+10},{y5}" '
+    L.append(f'<path d="M{x+bw+10},{y4} C{x+bw+70},{y4} {x+bw+70},{y5} {x+bw},{y5}" '
              f'fill="none" stroke="#b45309" stroke-width="2" marker-end="url(#ah)"/>')
     text(L, x + bw + 76, (y4 + y5) / 2, "复用", 12, "start", "#b45309", "bold")
     text(L, x + bw + 76, (y4 + y5) / 2 + 16, "额度", 12, "start", "#b45309", "bold")
@@ -249,7 +249,7 @@ def diagram_multiturn():
     msg(176, sx + 160, stx, "store: msg_store[id1] = messages", "#16a34a")
     box(L, sx - 150, 196, 300, 38, "生成 → context.append_output", "#dcfce7", "#16a34a", 11, "self._messages.extend(output)")
     # 共享对象指示
-    L.append(f'<path d="M{sx+150},215 C{(sx+stx)/2},215 {(sx+stx)/2},176 {stx-6},176" fill="none" stroke="#b45309" stroke-width="1.6" stroke-dasharray="5,3" marker-end="url(#ah)"/>')
+    L.append(f'<path d="M{sx+150},215 C{(sx+stx)/2},215 {(sx+stx)/2},176 {stx},176" fill="none" stroke="#b45309" stroke-width="1.6" stroke-dasharray="5,3" marker-end="url(#ah)"/>')
     text(L, (sx + stx) / 2 + 20, 250, "同一 list 对象 → output 自动留存", 11, "middle", "#b45309", "bold")
     msg(290, sx + 160, stx, "response_store[id1] = response", "#16a34a")
 
@@ -259,8 +259,9 @@ def diagram_multiturn():
     # 轮2
     text(L, 70, 340, "── 轮 2 ──", 13, "start", "#0369a1", "bold")
     msg(360, cx, sx, "create_responses(prev_id=id1, input=\"what is my name?\")")
-    msg(404, sx + 160, stx, "prev = response_store.get(id1)  ·  hist = msg_store[id1]", "#0369a1")
+    # store 返回数据给 serving（右 → 左），只画单向箭头
     hline(L, stx, sx + 160, 404, "#0369a1", arrow=True)
+    text(L, (stx + sx + 160) / 2, 398, "prev = response_store.get(id1)  ·  hist = msg_store[id1]", 11, "middle", "#0369a1", "bold")
     box(L, sx - 150, 424, 300, 42, "拼历史 + 本轮 input", "#eef2ff", "#6366f1", 12,
         "construct_input_messages(_with_harmony)")
     msg(496, sx, cx, "resp2（已知 \"Bob\"）", "#475569")

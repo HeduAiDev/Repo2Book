@@ -81,7 +81,7 @@ draw_col(x3, [
 # arrow showing move from slot5 to slot2
 y5 = top + 5*slot_h + (slot_h-6)//2
 y2c = top + 2*slot_h + (slot_h-6)//2
-L.append(f'<path d="M {x3+slot_w+8} {y5} C {x3+slot_w+70} {y5}, {x3+slot_w+70} {y2c}, {x3+slot_w+8} {y2c}" fill="none" stroke="#b45309" stroke-width="2" marker-end="url(#arr)"/>')
+L.append(f'<path d="M {x3+slot_w} {y5} C {x3+slot_w+70} {y5}, {x3+slot_w+70} {y2c}, {x3+slot_w} {y2c}" fill="none" stroke="#b45309" stroke-width="2" marker-end="url(#arr)"/>')
 L.append(f'<text x="{x3+slot_w+78} " y="{(y5+y2c)//2+4}" font-family="sans-serif" font-size="12" fill="#b45309">condense</text>')
 
 # legend

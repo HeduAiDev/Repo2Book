@@ -82,7 +82,7 @@ for name, lines, compiled in items:
 
 # 顺序箭头
 for i in range(n - 1):
-    arrow(centers[i] + bw / 2 - 4, y0 + bh / 2, centers[i + 1] - bw / 2 + 2, y0 + bh / 2)
+    arrow(centers[i] + bw / 2, y0 + bh / 2, centers[i + 1] - bw / 2, y0 + bh / 2)
 
 # 图例
 ly = y0 + bh + 40

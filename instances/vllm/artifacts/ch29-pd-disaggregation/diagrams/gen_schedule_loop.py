@@ -54,7 +54,7 @@ y=104
 diamond(y+24, [("_is_blocked_waiting_status?", False)])
 # yes branch -> right
 L.append(f'<line x1="{cx+180}" y1="{y+24}" x2="{isox}" y2="{y+24}" stroke="#c2410c" stroke-width="2" marker-end="url(#ao)"/>')
-L.append(f'<text x="{cx+200}" y="{y+16}" font-size="11" fill="#c2410c">是 → try_promote</text>')
+L.append(f'<text x="{cx+190}" y="{y+16}" text-anchor="middle" font-size="11" fill="#c2410c">是 → try_promote</text>')
 L.append(f'<rect x="{isox}" y="{y+2}" width="300" height="44" rx="8" fill="#fef9c3" stroke="#eab308" stroke-width="2"/>')
 L.append(f'<text x="{isox+150}" y="{y+22}" text-anchor="middle" font-size="12" font-weight="bold" fill="#854d0e">_try_promote_blocked_waiting_request</text>')
 L.append(f'<text x="{isox+150}" y="{y+39}" text-anchor="middle" font-size="11" fill="#854d0e">成功→提升；失败→隔离</text>')
@@ -73,7 +73,7 @@ y=386
 diamond(y+24, [("ext_tokens is None ?", True)])
 # yes -> isolate
 L.append(f'<line x1="{cx+180}" y1="{y+24}" x2="{isox}" y2="{y+24}" stroke="#c2410c" stroke-width="2" marker-end="url(#ao)"/>')
-L.append(f'<text x="{cx+186}" y="{y+16}" font-size="11" fill="#c2410c">是 → 隔离，下步再问</text>')
+L.append(f'<text x="{cx+190}" y="{y+16}" text-anchor="middle" font-size="11" fill="#c2410c">是 → 隔离，下步再问</text>')
 isolate(y+24)
 varrow(y+66, y+96, "否")
 

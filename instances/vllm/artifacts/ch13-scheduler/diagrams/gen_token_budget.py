@@ -7,14 +7,14 @@ def esc(s):
     return xs.escape(str(s))
 
 
-w, h = 880, 420
+w, h = 880, 460
 L = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}">']
 L.append('<rect width="%d" height="%d" fill="white"/>' % (w, h))
 L.append(f'<text x="{w//2}" y="34" text-anchor="middle" font-size="21" '
          'font-weight="bold" fill="#0f172a">一拍 token_budget = 64 的分配（批大小 = token 数）</text>')
 
-# budget bar geometry
-bx, by, bw, bh = 60, 90, 760, 56
+# budget bar geometry — by=130 gives enough room above for 3 staggered callout labels
+bx, by, bw, bh = 60, 130, 760, 56
 budget = 64
 scale = bw / budget
 
@@ -70,7 +70,7 @@ L.append(f'<text x="{bx}" y="{by+bh+74}" font-size="14" fill="#0f172a" '
          f'font-family="monospace">{esc(steps)}</text>')
 
 # legend
-ly = 300
+ly = 340
 L.append(f'<rect x="{bx}" y="{ly}" width="22" height="22" fill="#22c55e"/>')
 L.append(f'<text x="{bx+30}" y="{ly+16}" font-size="13.5" fill="#0f172a">'
          'RUNNING 的 decode：每请求 1 token（追赶公式 = 1）</text>')
@@ -79,7 +79,7 @@ L.append(f'<text x="{bx+30}" y="{ly+50}" font-size="13.5" fill="#0f172a">'
          'WAITING 的 prefill chunk：数十~数百 token，按剩余预算截断</text>')
 
 # punchline
-L.append(f'<text x="{w//2}" y="394" text-anchor="middle" font-size="13.5" '
+L.append(f'<text x="{w//2}" y="434" text-anchor="middle" font-size="13.5" '
          'fill="#475569" font-style="italic">'
          'prefill 的大块与 decode 的单 token 共享同一个预算池 —— 同一拍混批，不分相</text>')
 

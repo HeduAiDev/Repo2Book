@@ -123,7 +123,7 @@ def diagram1():
 # Diagram 2: all_reduce dispatch paths
 # ============================================================
 def diagram2():
-    w, h = 900, 640
+    w, h = 900, 720
     P = []
     P.append(txt(w/2, 30, "all_reduce 的两条派发路径", 18, DARK, weight="bold"))
 

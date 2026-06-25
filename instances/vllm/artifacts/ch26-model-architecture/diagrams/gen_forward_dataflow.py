@@ -60,7 +60,7 @@ comp_top = y - 8
 
 # 逐层堆叠（×N）容器
 ly = y
-lay_h = 360
+lay_h = 490
 L.append(f'<rect x="{bx-60}" y="{ly}" width="{bw+170}" height="{lay_h}" rx="12" fill="#fff7ed" stroke="#9a3412" stroke-width="2"/>')
 L.append(f'<text x="{bx-50}" y="{ly+22}" font-size="13.5" font-weight="bold" fill="#9a3412">for layer in layers   (× num_hidden_layers)</text>')
 
@@ -89,7 +89,7 @@ for i, (nm, sub, (st, fl)) in enumerate(seq):
 # 残差回边：residual=x → hc_post（两段）
 ratt0 = seg_centers[0][0]
 ratt1 = seg_centers[3][1]
-rx = bx - 38
+rx = bx - 68
 L.append(f'<path d="M {bx} {ratt0+6} L {rx} {ratt0+6} L {rx} {ratt1-6} L {bx} {ratt1-6}" fill="none" stroke="#b45309" stroke-width="2" stroke-dasharray="5,3" marker-end="url(#res)"/>')
 L.append(f'<text x="{rx-4}" y="{(ratt0+ratt1)/2}" text-anchor="end" font-size="11" fill="#b45309" font-weight="bold">residual</text>')
 rffn0 = seg_centers[4][0]
@@ -126,7 +126,7 @@ L.append(f'<rect x="{bx-12}" y="{mtp_y-8}" width="{bw+24}" height="{comp_y2-mtp_
 L.append(f'<text x="{bx-16}" y="{mtp_y-14}" font-size="11" fill="#7c3aed" font-weight="bold">torch.compile 编译区</text>')
 
 # 图例
-lg_y = H - 18
+lg_y = H - 10
 legend = [("普通 nn.Module", COL), ("MLA 注意力", ("#1d4ed8", "#dbeafe")), ("MoE", ("#047857", "#d1fae5")), ("torch.ops.vllm.* 算子", OP), ("编译区/旁路", ("#7c3aed", "#ede9fe"))]
 lx0 = 30
 for nm, (st, fl) in legend:

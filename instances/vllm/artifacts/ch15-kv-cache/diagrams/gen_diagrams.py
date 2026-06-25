@@ -37,6 +37,11 @@ def line(x1, y1, x2, y2, color="#475569", marker="a", dash=None, width=1.6):
     return (f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{color}" '
             f'stroke-width="{width}"{d}{m}/>')
 
+def path(d_attr, color="#475569", marker="a", width=1.6, fill="none"):
+    m = f' marker-end="url(#{marker})"' if marker else ""
+    return (f'<path d="{d_attr}" stroke="{color}" stroke-width="{width}" '
+            f'fill="{fill}"{m}/>')
+
 def svg(w, h, body):
     return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}">'
             + DEFS + f'<rect width="{w}" height="{h}" fill="white"/>' + body + '</svg>')
@@ -86,11 +91,25 @@ def paging_overview():
         lab = f"blk {bid}" + (" (null)" if bid == 0 else "")
         b.append(txt(x+39, y+21, lab, 10.5, mono=True))
         cell_y[bid] = (x, y)
-    # arrows from btables to shared physical blocks 3,4 (both requests)
-    bx, by = cell_y[3]
-    b.append(line(525, 110, bx, by+10, color="#1d4ed8", marker="ablu", width=1.4))
-    b.append(line(525, 276, bx, by+24, color="#15803d", marker="agrn", width=1.4))
-    b.append(txt((525+bx)/2, by-6, "同物理块被两请求前缀共享", 10, fill="#15803d", weight="bold"))
+    # arrows from btables to shared physical blocks 3 (both requests)
+    # Physical grid: left col x=660..738, right col x=746..824, col-gap x=738..746 (8px)
+    #   row0 y=86..120, row1 y=128..162, gap between rows ≈8px.
+    # blk3 is right col row1: x=746..824, y=128..162; left-edge x=746, center-y=145.
+    bx, by = cell_y[3]        # bx=746, by=128
+    blk3_rx = bx + 78         # right edge of blk3 = 824
+    # Blue (req A table, right edge x=525, row y≈106):
+    #   Right to x=656 (left of grid), down to y=124 (gap between row0 and row1),
+    #   right to x=744 (column gap), down to y=145 (blk3 center-y),
+    #   right 2px to blk3 left edge.
+    b.append(path("M 525,106 L 656,106 L 656,124 L 744,124 L 744,145 L 746,145",
+                  color="#1d4ed8", marker="ablu", width=1.4))
+    # Green (req B table, right edge x=525, row y≈272):
+    #   Right past entire grid right edge (x=828, below grid bottom y=246),
+    #   up to blk3 center-y, left to blk3 right edge.  Enters blk3 from the right.
+    b.append(path(f"M 525,272 L 828,272 L 828,145 L {blk3_rx},145",
+                  color="#15803d", marker="agrn", width=1.4))
+    # Label in the open space left of the grid between the two arrow routes
+    b.append(txt(590, 200, "同物理块被两请求前缀共享", 10, fill="#15803d", weight="bold"))
 
     b.append(txt(w/2, h-22, "CacheConfig.block_size 决定切块/哈希/分配/命中的最小粒度（这里 = 4）",
                  11.5, fill="#b91c1c"))
@@ -114,8 +133,8 @@ def free_queue_lru():
             out.append(node(x, y, lab, fill, stroke))
             cx = x + 35
             if prev_cx is not None:
-                out.append(line(prev_cx+35, y+18, cx-37, y+18, color="#94a3b8", marker=None, width=1.3))
-                out.append(line(cx-37, y+24, prev_cx+35, y+24, color="#cbd5e1", marker=None, width=1.0))
+                out.append(line(prev_cx+35, y+18, cx-35, y+18, color="#94a3b8", marker=None, width=1.3))
+                out.append(line(cx-35, y+24, prev_cx+35, y+24, color="#cbd5e1", marker=None, width=1.0))
             prev_cx = cx
             x += 96
         if note:

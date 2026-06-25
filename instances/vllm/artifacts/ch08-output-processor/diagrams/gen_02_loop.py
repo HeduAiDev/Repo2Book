@@ -6,7 +6,7 @@ def esc(s):
     return xs.escape(str(s))
 
 
-w, h = 760, 880
+w, h = 760, 980
 L = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}">']
 L.append(
     '<defs>'

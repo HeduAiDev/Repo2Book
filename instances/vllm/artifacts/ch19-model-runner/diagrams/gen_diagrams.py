@@ -45,7 +45,7 @@ def text(L, x, y, s, fs=13, col="#1e293b", anchor="start", weight="normal", styl
 # Diagram 1: two-phase timeline (execute_model / sample_tokens overlap)
 # ============================================================ #
 def two_phase_timeline():
-    w, h = 1180, 560
+    w, h = 1180, 610
     L = header(w, h)
     text(L, w/2, 34, "execute_model() 发起前向 / sample_tokens() 采样 —— 两阶段在时间上交错", 18, "#0f172a", "middle", "bold")
 
@@ -174,7 +174,7 @@ def f13_writeback():
 
     # write-back equation block
     eqy = grid_bottom + 40
-    L.append(f'<rect x="{gx-14}" y="{eqy}" width="{640}" height="120" rx="8" fill="#fef2f2" stroke="#fca5a5" stroke-width="1.2"/>')
+    L.append(f'<rect x="{gx-14}" y="{eqy}" width="{560}" height="120" rx="8" fill="#fef2f2" stroke="#fca5a5" stroke-width="1.2"/>')
     text(L, gx, eqy + 26, "_bookkeeping_sync 第 n 拍写回（红格）：", 14, "#b91c1c", "start", "bold")
     text(L, gx, eqy + 48, "start = num_tokens_no_spec[r];  end = start + 1", 13, "#7f1d1d")
     text(L, gx, eqy + 68, "token_ids_cpu[r, start:end] = sampled_ids", 13, "#7f1d1d")

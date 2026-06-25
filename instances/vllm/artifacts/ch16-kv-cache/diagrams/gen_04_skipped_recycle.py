@@ -4,7 +4,7 @@ import xml.sax.saxutils as xs
 
 def esc(s): return xs.escape(str(s))
 
-w, h = 1000, 540
+w, h = 1000, 580
 L = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" font-family="sans-serif">']
 L.append('<defs>'
          '<marker id="a" viewBox="0 0 10 6" refX="9" refY="3" markerWidth="8" markerHeight="6" orient="auto">'
@@ -47,14 +47,14 @@ L.append(f'<line x1="{ax}" y1="{by+bh+50}" x2="{ax}" y2="{by+bh+95}" stroke="#47
 txt(ax+18, by+bh+80, "B0 换成 null_block，真实显存归还 free queue", 13.5, "start", "#475569", "bold")
 
 # AFTER
-ay = 360
-txt(60, ay-20, "后　req_to_blocks", 16, "start", "#0f172a", "bold")
+ay = 385
+txt(60, ay-24, "后　req_to_blocks", 16, "start", "#0f172a", "bold")
 for i, (lab, sub, fill, stroke) in enumerate([
         ("NULL", "占位 / 不缓存", "#e2e8f0", "#94a3b8"),
         ("B1", "token 4~7", "#bbf7d0", "#22c55e"),
         ("B2", "token 8~11", "#bbf7d0", "#22c55e")]):
     blk(bx + i*(bw+gap), ay, bw, bh, fill, stroke, lab, sub)
-    txt(bx + i*(bw+gap)+bw/2, ay-4, f"下标 {i}", 12, "middle", "#94a3b8")
+    txt(bx + i*(bw+gap)+bw/2, ay-10, f"下标 {i}", 12, "middle", "#94a3b8")
 
 # annotations
 ny = ay + bh + 36

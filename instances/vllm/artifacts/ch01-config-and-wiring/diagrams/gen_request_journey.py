@@ -107,8 +107,6 @@ for i, (t, s) in enumerate(steps):
     prev_r = x + sw_
 # update -> schedule 回环（跨拍持久）
 loop_y = step_y + step_h + 16
-arr(sx0 + 2 * (sw_ + gap) + sw_ // 2, step_y + step_h,
-    sx0 + sw_ // 2, step_y + step_h, "#d97706", dash="5 4")
 L.append(f'<path d="M{sx0+2*(sw_+gap)+sw_//2},{step_y+step_h} '
          f'V{loop_y} H{sx0+sw_//2} V{step_y+step_h}" '
          f'fill="none" stroke="#d97706" stroke-width="2" stroke-dasharray="5 4" '

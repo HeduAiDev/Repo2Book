@@ -7,7 +7,7 @@ def esc(s):
     return xs.escape(s)
 
 
-W, H = 1180, 760
+W, H = 1300, 760
 L = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">']
 L.append(
     '<defs><marker id="a" viewBox="0 0 10 6" refX="9" refY="3" '
@@ -57,10 +57,10 @@ box(640, 140, 230, 44, "ParallelLMHead", "lm_head", GRAY, GRAY_E)
 arrow(560, 78, 420, 140)
 arrow(640, 78, 730, 140)
 # Level 2 children of model: embed, layers, norm
-box(70, 248, 200, 44, "VocabParallelEmbedding", "model.embed_tokens", GRAY, GRAY_E)
+box(60, 248, 220, 44, "VocabParallelEmbedding", "model.embed_tokens", GRAY, GRAY_E)
 box(300, 248, 240, 48, "LlamaDecoderLayer ×N", "model.layers.{i}", BLUE, BLUE_E)
 box(570, 248, 150, 44, "RMSNorm", "model.norm", GRAY, GRAY_E)
-arrow(330, 188, 200, 248)
+arrow(330, 188, 170, 248)
 arrow(400, 188, 410, 248)
 arrow(470, 188, 600, 248)
 # Level 3 children of decoder layer
@@ -80,15 +80,15 @@ for cx in (127, 297, 460, 647):
     arrow(312, 408, cx, ay)
 # Level 4 children of MLP
 my = 480
-box(770, my, 185, 56, "MergedColumnParallelLinear", "...mlp.gate_up_proj", GREEN, GREEN_E)
-box(970, my, 110, 48, "SiluAndMul", "...mlp.act_fn", GRAY, GRAY_E)
-box(1090, my, 75, 56, "RowParallel", "down_proj", GREEN, GREEN_E)
-for cx in (862, 1025, 1130):
+box(770, my, 215, 56, "MergedColumnParallelLinear", "...mlp.gate_up_proj", GREEN, GREEN_E)
+box(1000, my, 120, 48, "SiluAndMul", "...mlp.act_fn", GRAY, GRAY_E)
+box(1135, my, 130, 56, "RowParallel", "down_proj", GREEN, GREEN_E)
+for cx in (877, 1060, 1200):
     arrow(722, 408, cx, my)
 
 # prefix annotation banner
 L.append(
-    f'<rect x="40" y="600" width="1100" height="120" rx="8" '
+    f'<rect x="40" y="600" width="1220" height="120" rx="8" '
     f'fill="#fffbeb" stroke="#d97706" stroke-width="1.4"/>'
 )
 L.append(

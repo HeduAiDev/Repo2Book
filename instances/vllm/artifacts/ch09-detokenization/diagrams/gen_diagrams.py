@@ -27,7 +27,7 @@ def text(x, y, s, size=13, anchor="middle", fill="#0f172a", weight="normal",
 
 # ───────────────────────── 图1：三路分派 + 层级 ─────────────────────────
 def diagram_hierarchy():
-    w, h = 880, 600
+    w, h = 880, 630
     L = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}">', HEAD,
          f'<rect width="{w}" height="{h}" fill="white"/>']
     L.append(text(w // 2, 34, "from_new_request 工厂：三路分派", 19, weight="bold"))
@@ -55,10 +55,10 @@ def diagram_hierarchy():
     ]
     for i, (cond, name, backend, fill, stroke, tc) in enumerate(branches):
         x = bx[i]
-        # 条件连线
+        # 条件连线 — 端点落在框边上，无间隙
         sx, sy = cx, 124
         tx, ty = x + bw // 2, by
-        L.append(f'<line x1="{sx}" y1="{sy}" x2="{tx}" y2="{ty - 2}" '
+        L.append(f'<line x1="{sx}" y1="{sy}" x2="{tx}" y2="{ty}" '
                  f'stroke="#64748b" stroke-width="1.6" marker-end="url(#a)"/>')
         # 条件标签
         for j, line in enumerate(cond.split("\n")):
@@ -83,7 +83,8 @@ def diagram_hierarchy():
                   weight="bold", fill="#713f12"))
     L.append(text(cx, basey + 38, "update / holdback / min_tokens / check_stop_strings",
                   10, fill="#a16207"))
-    L.append(f'<line x1="{cx}" y1="{hy + 54}" x2="{cx}" y2="{basey - 2}" '
+    # 箭头从 IncrementalDetokenizer 底边到 Base 顶边，端点无间隙
+    L.append(f'<line x1="{cx}" y1="{hy + 54}" x2="{cx}" y2="{basey}" '
              f'stroke="#64748b" stroke-width="1.6" marker-end="url(#a)"/>')
     # 两子类
     suby = basey + 86
@@ -98,7 +99,8 @@ def diagram_hierarchy():
         L.append(text(x + 70, suby + 20, name, 9.6, mono=True, weight="bold", fill=tc))
         L.append(text(x + 70, suby + 38, "↑ 各自实现", 9.6, fill="#475569"))
         L.append(text(x + 70, suby + 52, "decode_next", 9.2, mono=True, fill=tc))
-        L.append(f'<line x1="{cx}" y1="{basey + 50}" x2="{x + 70}" y2="{suby - 2}" '
+        # 箭头端点落在子类框顶边，无间隙
+        L.append(f'<line x1="{cx}" y1="{basey + 50}" x2="{x + 70}" y2="{suby}" '
                  f'stroke="#64748b" stroke-width="1.4" marker-end="url(#a)"/>')
     L.append('</svg>')
     return '\n'.join(L)
@@ -106,7 +108,7 @@ def diagram_hierarchy():
 
 # ───────────────────────── 图2：holdback 时间线 ─────────────────────────
 def diagram_holdback():
-    w, h = 900, 520
+    w, h = 900, 540
     L = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}">', HEAD,
          f'<rect width="{w}" height="{h}" fill="white"/>']
     L.append(text(w // 2, 32, "stop-string holdback 时间线", 19, weight="bold"))

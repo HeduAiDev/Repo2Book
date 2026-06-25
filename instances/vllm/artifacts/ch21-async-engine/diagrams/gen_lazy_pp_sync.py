@@ -107,8 +107,8 @@ L.append(f'<line x1="{ncl_end}" y1="{y_ncl + 15}" x2="{b_read[0] + 20}" '
          f'y2="{b_read[1]}" stroke="#7c3aed" stroke-width="1.5" '
          'stroke-dasharray="4 3" marker-end="url(#a)"/>')
 
-# next-round wait note under isend
-L.append(f'<text x="{b_send[0] + b_send[2] // 2}" y="{b_send[1] + b_send[3] + 22}" '
+# next-round wait note under isend — placed below swimlane + red arrow label
+L.append(f'<text x="{b_send[0] + b_send[2] // 2}" y="{b_send[1] + b_send[3] + 45}" '
          'font-size="11" text-anchor="middle" fill="#64748b" '
          'font-family="sans-serif">下一轮开头才 wait</text>')
 

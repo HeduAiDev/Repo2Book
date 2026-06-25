@@ -74,7 +74,7 @@ box(470, dy + 6, 320, 56,
     "#fee2e2", "#ef4444", 11.5)
 arrow(360, dy + 34, 470, dy + 34, "#dc2626", "是")
 # loop back from preempt up-and-over to allocate box (right edge -> top of allocate)
-L.append(f'<path d="M790,{dy+6} L820,{dy+6} L820,252 L450,252" fill="none" '
+L.append(f'<path d="M790,{dy+6} L820,{dy+6} L820,252 L430,252" fill="none" '
          'stroke="#dc2626" stroke-width="1.8" stroke-dasharray="5,4" marker-end="url(#ar)"/>')
 L.append(f'<text x="700" y="247" font-size="11" fill="#dc2626">重试分配</text>')
 

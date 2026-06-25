@@ -51,13 +51,13 @@ cy0 = 210
 for i, (cid, params, fill, stroke) in enumerate(children):
     cy = cy0 + i * 80
     box(398, cy, 384, 60, fill, stroke, [f"child {i}:  request_id = {cid}", params], fs=13, weight="bold")
-    # arrow to EngineCore
-    L.append(f'<line x1="782" y1="{cy+30}" x2="848" y2="{cy+30}" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>')
+    # arrow to EngineCore (x2=850 = EngineCore left edge)
+    L.append(f'<line x1="782" y1="{cy+30}" x2="850" y2="{cy+30}" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>')
 
-# arrow assign -> parent
-L.append(f'<line x1="590" y1="126" x2="590" y2="148" stroke="#64748b" stroke-width="1.6" marker-end="url(#a)"/>')
-# arrow caller -> middle
-L.append(f'<line x1="332" y1="120" x2="386" y2="98" stroke="#2563eb" stroke-width="1.8" marker-end="url(#a)"/>')
+# arrow assign -> parent (y1=126=assign bottom, y2=150=parent top)
+L.append(f'<line x1="590" y1="126" x2="590" y2="150" stroke="#64748b" stroke-width="1.6" marker-end="url(#a)"/>')
+# arrow caller -> assign (from caller right-center to assign left-center)
+L.append(f'<line x1="330" y1="275" x2="390" y2="98" stroke="#2563eb" stroke-width="1.8" marker-end="url(#a)"/>')
 
 # Right: EngineCore
 L.append(f'<rect x="850" y="190" width="300" height="220" rx="10" fill="#f8fafc" stroke="#334155" stroke-width="1.8"/>')
@@ -73,8 +73,8 @@ for i, (_, _, fill, stroke) in enumerate(children):
 L.append(f'<text x="590" y="500" text-anchor="middle" font-size="13" font-weight="bold" fill="#16a34a">归并回流：ParentRequest.get_outputs → RequestOutput(request_id = R) → 同一队列</text>')
 # return arrow EngineCore bottom -> parent bottom
 L.append(f'<path d="M 1000 410 L 1000 524 L 802 524" fill="none" stroke="#16a34a" stroke-width="1.8" marker-end="url(#ag)"/>')
-# parent -> caller
-L.append(f'<path d="M 378 524 L 185 524 L 185 322" fill="none" stroke="#16a34a" stroke-width="1.8" marker-end="url(#ag)"/>')
+# parent -> caller (endpoint y=320 = caller box bottom)
+L.append(f'<path d="M 378 524 L 185 524 L 185 320" fill="none" stroke="#16a34a" stroke-width="1.8" marker-end="url(#ag)"/>')
 
 L.append('</svg>')
 open("/mnt/e/Laboratory/Repo2Book/instances/vllm/artifacts/ch06-input-processor/diagrams/06-parallel-sampling-fanout.svg", "w").write('\n'.join(L))

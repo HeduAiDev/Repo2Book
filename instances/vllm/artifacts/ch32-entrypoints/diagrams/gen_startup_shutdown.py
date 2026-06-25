@@ -50,6 +50,9 @@ for i in range(len(steps) - 1):
 
 # serving steady state
 serv_y = y + 6
+# arrow from last step (lifespan) bottom to steady-state box top
+L.append(f'<line x1="{cx}" y1="{bottoms[-1]}" x2="{cx}" y2="{serv_y}" '
+         f'stroke="#475569" stroke-width="1.8" marker-end="url(#ar)"/>')
 L.append(f'<rect x="{x0}" y="{serv_y}" width="{bw}" height="42" rx="8" '
          f'fill="#ffffff" stroke="#475569" stroke-width="1.6" stroke-dasharray="6 4"/>')
 L.append(f'<text x="{cx}" y="{serv_y + 26}" text-anchor="middle" font-size="14" '

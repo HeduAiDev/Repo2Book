@@ -87,9 +87,9 @@ stagebody(sx3, sy, sw, ["allocate_new_blocks", "新建 new + lookahead 槽位", 
                         "get_new_blocks 取真实块", "（含投机草稿预留）"])
 
 # arrows between
-L.append(f'<line x1="240" y1="{iy+65}" x2="{sx-4}" y2="{sy+sh/2}" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>')
-L.append(f'<line x1="{sx+sw}" y1="{sy+sh/2}" x2="{sx2-4}" y2="{sy+sh/2}" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>')
-L.append(f'<line x1="{sx2+sw}" y1="{sy+sh/2}" x2="{sx3-4}" y2="{sy+sh/2}" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>')
+L.append(f'<line x1="240" y1="{iy+65}" x2="{sx}" y2="{sy+sh/2}" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>')
+L.append(f'<line x1="{sx+sw}" y1="{sy+sh/2}" x2="{sx2}" y2="{sy+sh/2}" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>')
+L.append(f'<line x1="{sx2+sw}" y1="{sy+sh/2}" x2="{sx3}" y2="{sy+sh/2}" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>')
 
 # finalize box (bottom)
 fy = 470
@@ -99,7 +99,7 @@ txt(sx3-40+fw2/2, fy+26, "收尾　缓存满块", 15, "middle", "#5b21b6", "bold
 stagebody(sx3-40, fy, fw2, ["num_tokens_to_cache =",
                             "min(total_computed+new, request.num_tokens)",
                             "→ cache_full_blocks 写哈希入表"], fs=12.5, y_top=48)
-L.append(f'<line x1="{sx3+sw/2}" y1="{sy+sh}" x2="{sx3+sw/2-20}" y2="{fy-4}" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>')
+L.append(f'<line x1="{sx3+sw/2}" y1="{sy+sh}" x2="{sx3+sw/2-20}" y2="{fy}" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>')
 txt(sx3-40, fy+118, "未定稿草稿 token 被 min() 封掉，不污染前缀缓存", 12, "start", "#6d28d9")
 
 svg = '\n'.join(L) + '\n</svg>\n'

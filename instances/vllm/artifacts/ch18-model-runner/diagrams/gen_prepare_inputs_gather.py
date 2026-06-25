@@ -75,7 +75,7 @@ for i,(v,col) in enumerate(flat):
 text(rx, ry0+fc_w+22, "total_num_scheduled_tokens = 10 个 token 收成一行", 12.5, fill="#475569")
 
 # arrow from arithmetic to input_ids
-L.append(f'<path d="M {mx+430} {my+150} C {rx-60} {my+150}, {rx-60} {ry0+20}, {rx-8} {ry0+20}" fill="none" stroke="#0e7490" stroke-width="2" marker-end="url(#arr)"/>')
+L.append(f'<path d="M {mx+430} {my+150} C {rx-60} {my+150}, {rx-60} {ry0+17}, {rx} {ry0+17}" fill="none" stroke="#0e7490" stroke-width="2" marker-end="url(#arr)"/>')
 
 # === BOTTOM: same req_indices/positions → slot_mapping ===
 sy = my + 230

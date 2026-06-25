@@ -36,9 +36,9 @@ for i,(lg,phys) in enumerate(logical):
     L.append(f'<rect x="{x}" y="{gy}" width="{cell_w}" height="{cell_h}" fill="#f5f3ff" stroke="#a78bfa" stroke-width="1.5"/>')
     text(x+cell_w//2, gy+20, lg, 13, anchor="middle", fill="#5b21b6")
     text(x+cell_w//2, gy+40, "→ phys "+phys, 13.5, anchor="middle", weight="bold", fill="#4c1d95")
-# copy arrow
+# copy arrow — start at bottom edge of CPU row, end at top edge of GPU row
 cax = bx + 3*cell_w + 30
-L.append(f'<path d="M {cax} {by+cell_h//2} L {cax} {gy+cell_h//2}" fill="none" stroke="#475569" stroke-width="2" marker-end="url(#arr2)"/>')
+L.append(f'<path d="M {cax} {by+cell_h} L {cax} {gy}" fill="none" stroke="#475569" stroke-width="2" marker-end="url(#arr2)"/>')
 text(cax+12, (by+gy)//2+30, "commit_block_table", 13, fill="#475569")
 text(cax+12, (by+gy)//2+48, "CPU→GPU 拷贝", 12.5, fill="#94a3b8")
 

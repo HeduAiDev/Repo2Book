@@ -30,7 +30,7 @@ PLN = ("#475569", "#f1f5f9")   # 普通 nn.Module (RMSNorm/gate/...)
 EMB = ("#b45309", "#fef3c7")   # 嵌入 / lm_head (Vocab/ParallelLMHead)
 
 # 最外层：DeepseekV4ForCausalLM
-ox, oy, ow, oh = 30, 80, W - 60, H - 110
+ox, oy, ow, oh = 30, 80, W - 60, H - 130
 L.append(f'<rect x="{ox}" y="{oy}" width="{ow}" height="{oh}" rx="12" fill="none" stroke="#0f172a" stroke-width="2.5"/>')
 L.append(f'<text x="{ox+18}" y="{oy+26}" font-size="16" font-weight="bold" fill="#0f172a">DeepseekV4ForCausalLM  (从这里开读)</text>')
 

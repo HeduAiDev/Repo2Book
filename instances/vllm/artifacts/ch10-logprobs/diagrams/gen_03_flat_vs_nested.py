@@ -66,7 +66,7 @@ arrays = [
     ("decoded", ["A", "B", "C", "D", "E", "F"], "#dbeafe", "#3b82f6"),
 ]
 ay = 100
-cellw = 56
+cellw = 55
 for ai, (name, vals, bg, st) in enumerate(arrays):
     yy = ay + ai * 50
     txt(rx0, yy + 22, name, 12, "#166534", weight="bold")

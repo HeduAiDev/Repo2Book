@@ -50,12 +50,12 @@ def arrow(x1, y1, x2, y2, color="#64748b"):
 
 # Lane labels
 txt(70, 105, "rank 0", 13, "middle", R0E, "bold")
-txt(70, 300, "rank 1", 13, "middle", R1E, "bold")
+txt(70, 245, "rank 1", 13, "middle", R1E, "bold")
 
 # 1. hidden_states (full, replicated)
 rect(40, 250, 120, 60, GRAY, GRAY_E)
-txt(100, 275, "hidden_states", 12, "middle", "#111827", "bold")
-txt(100, 293, "(全量，两 rank 同)", 10.5, "middle", "#475569")
+txt(100, 272, "hidden_states", 12, "middle", "#111827", "bold")
+txt(100, 287, "(全量，两 rank 同)", 10.5, "middle", "#475569")
 
 # 2. QKVParallelLinear column-shard
 qx = 215

@@ -62,8 +62,8 @@ for i, (name, cls, st, fl) in enumerate(tree_boxes):
     mid_centers.append((tx, y + th / 2, tx + tw, y + th / 2))
 
 # 父框 LlamaDecoderLayer 包住四个
-L.append(f'<rect x="{tx-16}" y="{ty0-26}" width="{tw+32}" height="{4*(th+tgap)+18}" rx="10" fill="none" stroke="#7c3aed" stroke-width="2" stroke-dasharray="6,4"/>')
-L.append(f'<text x="{tx+tw/2}" y="{ty0-32}" text-anchor="middle" font-size="13" fill="#7c3aed" font-weight="bold">LlamaDecoderLayer</text>')
+L.append(f'<rect x="{tx-16}" y="{ty0-36}" width="{tw+32}" height="{4*(th+tgap)+28}" rx="10" fill="none" stroke="#7c3aed" stroke-width="2" stroke-dasharray="6,4"/>')
+L.append(f'<text x="{tx+tw/2}" y="{ty0-42}" text-anchor="middle" font-size="13" fill="#7c3aed" font-weight="bold">LlamaDecoderLayer</text>')
 
 # 左→中映射线（每条代码 → 框）
 left_pts = [(cy0 + 28 + 0 * 26 - 5), (cy0 + 28 + 2 * 26 - 5), (cy0 + 28 + 4 * 26 - 5), (cy0 + 28 + 5 * 26 - 5)]

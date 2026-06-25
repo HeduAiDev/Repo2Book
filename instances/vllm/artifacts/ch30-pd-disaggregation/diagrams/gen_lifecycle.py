@@ -4,7 +4,7 @@
 import xml.sax.saxutils as xs
 def esc(s): return xs.escape(s)
 
-w, h = 1300, 620
+w, h = 1300, 660
 L = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}">']
 L.append('<defs>')
 L.append('<marker id="ar" viewBox="0 0 10 6" refX="9" refY="3" markerWidth="7" markerHeight="5" orient="auto"><path d="M0,0 L10,3 L0,6 Z" fill="#475569"/></marker>')
@@ -21,7 +21,7 @@ lane_w = w - lane_x - 30
 lanes = [
     ("connector 调用", 90, "#eff6ff"),
     ("model forward", 230, "#f0fdf4"),
-    ("后台传输", 370, "#fef2f2"),
+    ("后台传输", 410, "#fef2f2"),
 ]
 lane_h = 110
 for name, y, bg in lanes:
@@ -29,7 +29,7 @@ for name, y, bg in lanes:
     L.append(f'<text x="{lane_x-14}" y="{y+lane_h/2+5}" text-anchor="end" font-size="15" font-weight="bold" fill="#334155">{esc(name)}</text>')
 
 # time axis bottom
-ty = 500
+ty = 545
 L.append(f'<line x1="{lane_x}" y1="{ty}" x2="{lane_x+lane_w}" y2="{ty}" stroke="#475569" stroke-width="1.5" marker-end="url(#ar)"/>')
 L.append(f'<text x="{lane_x+lane_w}" y="{ty+22}" text-anchor="end" font-size="13" fill="#64748b">时间 →</text>')
 
@@ -58,17 +58,28 @@ for i in range(nlayers):
     x = lx0 + i*(lw+gap)
     fill = "#bbf7d0" if i in (0,) else "#dcfce7"
     box(x, f_y, lw, 70, f"层 {i}", fill, "#22c55e", fs=14)
-# wait_for_layer_load marker on layer 2 (where KV first needed)
-wll_x = lx0 + 2*(lw+gap)
-# callout placed to the RIGHT, below forward lane, clear of the load bar
-box(wll_x+lw+8, 250, 170, 64, "wait_for_layer_load\n(阻塞到该层 KV 到位,\n与前面层计算重叠)", "#fee2e2", "#ef4444", fs=11, tcol="#b91c1c")
-L.append(f'<line x1="{wll_x+lw+8}" y1="282" x2="{wll_x+lw+1}" y2="{f_y+35}" stroke="#b91c1c" stroke-width="1.4" stroke-dasharray="4,3" marker-end="url(#arR)"/>')
-# save_kv_layer marker on layer exit
+
+# wait_for_layer_load callout: placed BELOW the forward lane (y=345),
+# aligned with layer 2 horizontally, so arrow goes straight up — no box crossing.
+wll_x = lx0 + 2*(lw+gap)          # x of layer 2 = 580 + 188 = 768
+callout_w = 180
+callout_h = 56
+callout_x = wll_x - (callout_w - lw) // 2  # center callout under layer 2
+callout_y = 348                              # just below forward lane bottom (340)
+box(callout_x, callout_y, callout_w, callout_h,
+    "wait_for_layer_load\n(阻塞到该层 KV 到位,\n与前面层计算重叠)",
+    "#fee2e2", "#ef4444", fs=11, tcol="#b91c1c")
+# arrow from callout top-center UP to layer 2 bottom-center
+L.append(f'<line x1="{callout_x + callout_w//2}" y1="{callout_y}" '
+         f'x2="{wll_x + lw//2}" y2="{f_y+70+2}" '
+         f'stroke="#b91c1c" stroke-width="1.4" stroke-dasharray="4,3" marker-end="url(#arR)"/>')
+
+# save_kv_layer marker on layer exit (layer 4 bottom → transfer lane)
 skl_x = lx0 + 4*(lw+gap)
-L.append(f'<line x1="{skl_x+lw/2}" y1="{f_y+72}" x2="{skl_x+lw/2}" y2="{390}" stroke="#0891b2" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#ar)"/>')
+t_y = 430
+L.append(f'<line x1="{skl_x+lw/2}" y1="{f_y+72}" x2="{skl_x+lw/2}" y2="{t_y-2}" stroke="#0891b2" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#ar)"/>')
 
 # background transfer lane: overlap region
-t_y = 390
 # load bar overlapping with forward
 load_x0 = lane_x+230
 load_x1 = lx0 + 2*(lw+gap) + lw/2
@@ -84,8 +95,8 @@ L.append(f'<text x="{(save_x0+save_x1)/2}" y="{t_y+27}" text-anchor="middle" fon
 L.append(f'<line x1="{lane_x+230}" y1="180" x2="{load_x0+4}" y2="{t_y-2}" stroke="#475569" stroke-width="1.3" marker-end="url(#ar)"/>')
 
 # bottom note
-L.append(f'<text x="{lane_x}" y="540" font-size="13" fill="#334155">enter：bind → start_load_kv（发起即返回）。finally：wait_for_save → get_finished → clear。异常路径也保证收尾不漏块。</text>')
-L.append(f'<text x="{lane_x}" y="562" font-size="13" fill="#334155">输出 KVConnectorOutput（finished_sending / finished_recving）随 ModelRunnerOutput 回传 scheduler，接第 29 章的提升 / 释放闭环。</text>')
+L.append(f'<text x="{lane_x}" y="582" font-size="13" fill="#334155">enter：bind → start_load_kv（发起即返回）。finally：wait_for_save → get_finished → clear。异常路径也保证收尾不漏块。</text>')
+L.append(f'<text x="{lane_x}" y="604" font-size="13" fill="#334155">输出 KVConnectorOutput（finished_sending / finished_recving）随 ModelRunnerOutput 回传 scheduler，接第 29 章的提升 / 释放闭环。</text>')
 
 L.append('</svg>')
 open("/mnt/e/Laboratory/Repo2Book/instances/vllm/artifacts/ch30-pd-disaggregation/diagrams/ch30-worker-lifecycle.svg","w").write('\n'.join(L))

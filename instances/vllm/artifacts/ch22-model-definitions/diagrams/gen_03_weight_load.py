@@ -106,11 +106,10 @@ txt(fx + 130, 250, "qkv_proj.weight（已填，本 rank 的切片）", 10.5, "mi
 txt(fx + 55, 145, "offset 0", 9.5, "middle", QE)
 txt(fx + 147, 145, "+q宽", 9.5, "middle", KE)
 txt(fx + 222, 145, "+q+k宽", 9.5, "middle", VE)
-# arrows from checkpoint to fused segments
-arrow(cx + 262, 200, fx + 55, 195, QE, 1.6)
-arrow(cx + 262, 290, fx + 147, 195, KE, 1.6)
-arrow(cx + 350, 360, fx + 222, 195, VE, 1.6)
-txt(cx + 380, 360, "v_proj 同理 →", 10, "start", VE)
+# arrows from stacked_params_mapping right edge to fused segments
+arrow(cx + 350, 235, fx + 55, 195, QE, 1.6)
+arrow(cx + 350, 255, fx + 147, 195, KE, 1.6)
+arrow(cx + 350, 272, fx + 222, 195, VE, 1.6)
 
 # big arrows between stages
 arrow(305, 160, 405, 160, "#1e293b", 2.2)

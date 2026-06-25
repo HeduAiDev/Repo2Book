@@ -40,7 +40,7 @@ def save(name, parts, w, h):
 # Diagram 1: delta-stack (Llama 基线 | V4 delta), 4 行
 # ============================================================
 def delta_stack():
-    W, H = 940, 470
+    W, H = 940, 500
     P = []
     P.append(text(W/2, 32, "DeepSeek-V4 = Llama 基线 + 一叠 delta", 19, weight="bold"))
     colL_x, colR_x = 60, 540
@@ -79,7 +79,7 @@ def delta_stack():
         ax1, ax2 = colL_x + colW + 6, colR_x - 6
         P.append(line(ax1, y + rh/2, ax2, y + rh/2, stroke="#b45309", marker="ar", width="2"))
         P.append(text((ax1+ax2)/2, y + rh/2 - 8, delta, 11, fill="#b45309", weight="bold"))
-    P.append(text(W/2, H-14, "四类 delta：低秩压缩 · 稀疏路由 · 多流残差 · 多 token 预测 —— 都叠在同一份 decoder-only 骨架上", 12, fill="#64748b"))
+    P.append(text(W/2, H-15, "四类 delta：低秩压缩 · 稀疏路由 · 多流残差 · 多 token 预测 —— 都叠在同一份 decoder-only 骨架上", 12, fill="#64748b"))
     save("ch25-delta-stack.svg", P, W, H)
 
 

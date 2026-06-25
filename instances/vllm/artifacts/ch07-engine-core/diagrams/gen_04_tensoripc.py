@@ -52,11 +52,11 @@ txt(825, 400, "TensorIpcReceiver", 12, fill="#475569")
 txt(825, 420, "drain-and-buffer 取回", 11, fill="#475569")
 L.append('<line x1="280" y1="395" x2="390" y2="395" stroke="#9333ea" stroke-width="2.5" marker-end="url(#ap)"/>')
 L.append('<line x1="610" y1="395" x2="720" y2="395" stroke="#9333ea" stroke-width="2.5" marker-end="url(#ap)"/>')
-# shared memory channel
-L.append('<line x1="175" y1="440" x2="175" y2="478" stroke="#9333ea" stroke-width="2" stroke-dasharray="3 3"/>')
-L.append('<line x1="825" y1="478" x2="825" y2="440" stroke="#9333ea" stroke-width="2" stroke-dasharray="3 3" marker-end="url(#ap)"/>')
+# shared memory channel – U-shaped dashed path connecting left box → shm box → right box
 box(280, 470, 440, 36, "#ddd6fe", "#7c3aed")
 txt(500, 493, "torch.mp.Queue 共享内存（张量本体走此通道，不进 ZMQ 帧）", 12, weight="bold", fill="#5b21b6")
+# U-shaped path: left box bottom (175,440) → down to y=510 → right to (825,510) → up to right box bottom (825,440)
+L.append('<path d="M175,440 L175,510 L825,510 L825,440" stroke="#9333ea" stroke-width="2" stroke-dasharray="3 3" fill="none" marker-end="url(#ap)"/>')
 
 L.append('</svg>')
 open("04-tensor-ipc-zerocopy.svg", "w").write('\n'.join(L))

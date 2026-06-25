@@ -5,7 +5,7 @@ import xml.sax.saxutils as xs
 def esc(s):
     return xs.escape(s)
 
-W, H = 1040, 880
+W, H = 1040, 1160
 L = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">']
 L.append('<defs>'
          '<marker id="a" viewBox="0 0 10 6" refX="9" refY="3" markerWidth="7" markerHeight="5" orient="auto">'

@@ -58,7 +58,9 @@ def build():
     box(L, bx, 80, bw, 50, "用户 prompt + SamplingParams / PoolingParams", "supported_tasks / lora_request / data_parallel_rank", fill="#f1f5f9", fs=13)
 
     # 校验三连
+    arrow(L, cx, 130, cx, 165, color=C_MUT)
     box(L, bx, 165, bw, 64, "_validate_params + _validate_lora", "生成/池化任务路由 → params.verify；LoRA 一致性", "L234-L249 / L81 / L138", fill=C_VALID, bd=C_VALID_BD)
+    arrow(L, cx, 229, cx, 264, color=C_MUT)
     box(L, bx, 264, bw, 50, "校验 data_parallel_rank ∈ [0, num_ranks)", "", "L251-L259", fill=C_VALID, bd=C_VALID_BD)
 
     # 分流

@@ -32,8 +32,8 @@ node(620, 470, 240, 56, "RUNNING（开始 decode）", "#d1fae5", "#10b981", "#06
 
 # Arrow WAITING -> WAITING_FOR_REMOTE_KVS
 L.append(f'<line x1="210" y1="278" x2="330" y2="278" stroke="#475569" stroke-width="2.5" marker-end="url(#a)"/>')
-L.append(f'<text x="270" y="232" text-anchor="middle" font-size="12" fill="#334155">命中且</text>')
-L.append(f'<text x="270" y="248" text-anchor="middle" font-size="12" font-family="monospace" fill="#334155">load_kv_async</text>')
+L.append(f'<text x="230" y="232" text-anchor="middle" font-size="12" fill="#334155">命中且</text>')
+L.append(f'<text x="230" y="248" text-anchor="middle" font-size="12" font-family="monospace" fill="#334155">load_kv_async</text>')
 
 # Arrow WAITING_FOR_REMOTE_KVS -> finished_recving set
 L.append(f'<line x1="560" y1="278" x2="620" y2="278" stroke="#475569" stroke-width="2.5" marker-end="url(#a)"/>')

@@ -6,7 +6,7 @@ import xml.sax.saxutils as xs
 def esc(s):
     return xs.escape(s)
 
-W, H = 880, 500
+W, H = 880, 640
 L = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">']
 L.append(f'<rect width="{W}" height="{H}" fill="white"/>')
 

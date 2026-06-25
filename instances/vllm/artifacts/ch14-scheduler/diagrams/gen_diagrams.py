@@ -99,7 +99,7 @@ def diagram1():
     b.append(line(cx-diamond_w/2, y4+25, lx, y4+25, color="#475569", marker=None))
     b.append(line(lx, y4+25, lx, ys['alloc'][0]+25, color="#475569", marker=None))
     b.append(line(lx, ys['alloc'][0]+25, cx-diamond_w/2, ys['alloc'][0]+25, color="#475569", marker="a"))
-    b.append(txt(lx-4, (y4+25+ys['alloc'][0]+25)/2, "否：重试分配", 11, anchor="middle", fill="#475569"))
+    b.append(txt(lx+8, (y4+25+ys['alloc'][0]+25)/2, "否：重试分配", 11, anchor="start", fill="#475569"))
     b.append(txt(lx+30, y4+18, "否", 11, fill="#475569"))
 
     # yes -> give up
@@ -261,8 +261,12 @@ def diagram3():
     b.append(line(rx+bw, ry+bh/2, rdx, ry+bh/2, color="#6d28d9", marker=None, dash="4,3"))
     b.append(line(rdx, ry+bh/2, rdx, fy-4, color="#6d28d9", marker="a", dash="4,3"))
     b.append(txt(rdx+8, ry+bh/2-8, "check_stop 命中 → 终态", 11, fill="#6d28d9", anchor="start"))
-    # from PREEMPTED: stopped while preempted (rare) -> band, straight down its left side
-    b.append(line(px+bw/2, py+bh, px+bw/2, fy-4, color="#6d28d9", marker="a", dash="4,3"))
+    # from PREEMPTED: stopped while preempted (rare) -> FINISHED_LENGTH_CAPPED top-center
+    # route: down to dividing line level, then left to box center, then down to box top
+    flc_cx = startx + fw + fgap + fw/2   # center x of FINISHED_LENGTH_CAPPED = 315
+    b.append(line(px+bw/2, py+bh, px+bw/2, divy+6, color="#6d28d9", marker=None, dash="4,3"))
+    b.append(line(px+bw/2, divy+6, flc_cx, divy+6, color="#6d28d9", marker=None, dash="4,3"))
+    b.append(line(flc_cx, divy+6, flc_cx, fy-4, color="#6d28d9", marker="a", dash="4,3"))
 
     return svg(w, h, "".join(b))
 

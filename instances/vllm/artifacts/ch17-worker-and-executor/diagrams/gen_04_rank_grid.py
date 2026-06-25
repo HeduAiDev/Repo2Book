@@ -6,7 +6,7 @@ import xml.sax.saxutils as xs
 
 def esc(s): return xs.escape(str(s))
 
-W, H = 900, 580
+W, H = 1100, 620
 L = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" font-family="sans-serif">']
 L.append(f'<rect width="{W}" height="{H}" fill="white"/>')
 
@@ -77,8 +77,16 @@ for pp in range(PP):
         elif is_last_pp and tp == 0:
             pass  # no extra label
 
-# Legend
-lx, ly = 30, margin_top + PP * cell_h + 30
+# Annotation box below grid (comes first, placed at top of bottom section)
+ax = margin_left
+ay = margin_top + PP * cell_h + 22
+note_w = TP * cell_w
+L.append(f'<rect x="{ax}" y="{ay}" width="{note_w}" height="50" rx="5" fill="#fffbeb" stroke="#f59e0b" stroke-width="1.2"/>')
+txt(ax + note_w//2, ay + 18, "广播仍是 1 次 enqueue（O(1) 次发送）", 12, "middle", "#92400e")
+txt(ax + note_w//2, ay + 36, "应答从 O(world_size=12) 次 dequeue 降到 O(1) 次，省掉 11 次跨进程搬运", 11.5, "middle", "#78350f")
+
+# Legend placed below annotation box (annotation box ends at ay+50)
+lx, ly = 30, ay + 60
 txt(lx, ly + 14, "图例：", 12, "start", "#0f172a", "bold")
 items = [
     (colors["output"], colors["output_stroke"], "output_rank（最后一段 PP 的第一个 TP worker）返回 ModelRunnerOutput"),
@@ -90,14 +98,6 @@ for i, (f, s, label) in enumerate(items):
     by = ly + 32 + i * 26
     L.append(f'<rect x="{bx}" y="{by - 12}" width="20" height="16" rx="3" fill="{f}" stroke="{s}" stroke-width="1.5"/>')
     txt(bx + 28, by, label, 11.5, "start", "#334155")
-
-# Annotation box below grid
-ax = margin_left
-ay = margin_top + PP * cell_h + 22
-note_w = TP * cell_w
-L.append(f'<rect x="{ax}" y="{ay}" width="{note_w}" height="50" rx="5" fill="#fffbeb" stroke="#f59e0b" stroke-width="1.2"/>')
-txt(ax + note_w//2, ay + 18, "广播仍是 1 次 enqueue（O(1) 次发送）", 12, "middle", "#92400e")
-txt(ax + note_w//2, ay + 36, "应答从 O(world_size=12) 次 dequeue 降到 O(1) 次，省掉 11 次跨进程搬运", 11.5, "middle", "#78350f")
 
 svg = '\n'.join(L) + '\n</svg>\n'
 out = "/mnt/e/Laboratory/Repo2Book/instances/vllm/artifacts/ch17-worker-and-executor/diagrams/ch17-output-rank-grid.svg"

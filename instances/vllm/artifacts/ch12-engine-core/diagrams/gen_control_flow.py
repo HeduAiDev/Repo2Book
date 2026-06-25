@@ -63,7 +63,7 @@ arrow(ax+200, 400, ax+225, 432)
 box(ax-10, 516, 200, 40, "#dbeafe", "#3b82f6", ["appendleft((future, so, exec_f))"], lab_weight="bold")
 arrow(ax+65, 488, ax+88, 516)
 arrow(cx-30, 166, ax+115, 212, color="#3b82f6")
-text(ax+30, 192, "有请求", size=12, fill="#1d4ed8")
+text(242, 183, "有请求", size=12, fill="#1d4ed8")
 
 # fill-priority decision after appendleft
 box(ax-30, 580, 250, 56, "#fef9c3", "#ca8a04",

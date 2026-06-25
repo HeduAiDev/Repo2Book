@@ -82,8 +82,8 @@ for i in range(len(xs_s) - 1):
 # 入口 → sample 第一步
 arrow(140, 101, 110, SY)
 # context → 修正框 → 累计
-arrow(xs_s[2] + bw, SY + bh/2, 545, 270)
-arrow(655, 280, xs_s[3], SY + bh/2, col="#475569")
+arrow(xs_s[2] + bw, SY + bh/2, 540, 280)
+arrow(660, 280, xs_s[3], SY + bh/2, col="#475569")
 # self.logprobs 容器
 box(835, SY+92, bw, 30, "#bfdbfe", "#2563eb", ["self.logprobs"], fs=12, weight="bold")
 arrow(835+bw/2, SY+bh, 835+bw/2, SY+92)
@@ -102,8 +102,8 @@ for i in range(len(xs_p) - 1):
     arrow(xs_p[i] + bw, PY + bh/2, xs_p[i+1], PY + bh/2, col="#15803d", marker="ag")
 arrow(140, 101, 110, PY, col="#15803d", marker="ag")
 # context → 修正框（下行进，上行出到 append）
-arrow(xs_p[2] + bw, PY + bh/2, 545, 292)
-arrow(655, 300, xs_p[3], PY + bh/2, col="#15803d", marker="ag")
+arrow(xs_p[2] + bw, PY + bh/2, 540, 280)
+arrow(660, 280, xs_p[3], PY + bh/2, col="#15803d", marker="ag")
 box(835, PY+92, bw, 30, "#bbf7d0", "#16a34a", ["self.prompt_logprobs"], fs=11, weight="bold")
 arrow(835+bw/2, PY+bh, 835+bw/2, PY+92, col="#15803d", marker="ag")
 
