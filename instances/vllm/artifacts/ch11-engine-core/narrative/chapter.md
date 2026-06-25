@@ -10,7 +10,7 @@
 
 [第 7 章](../ch07-engine-core/narrative/chapter.md) 接着把「另一个进程」这件事坐实了：ZMQ 的 socket 拓扑、msgpack 多帧编解码、两个 IO 线程怎么把请求塞进 `input_queue`、把输出从 `output_queue` 抽走。但它刻意没碰进程内部的引擎本体。
 
-**本章结清这笔账。** 那个在独立进程里独立转动的引擎，它的「心跳」是什么样的？请求进了 `input_queue` 之后会发生什么？一次 `step()` 凭什么能让 GPU 前向、grammar 掩码计算、token 采样三件事咬合得严丝合缝？引擎要睡觉、要暂停、要被关掉，又是怎么做到的？
+**本章结清这笔账。** 那个在独立进程里独立转动的引擎，它的「心跳」是什么样的？请求进了 `input_queue` 之后会发生什么？一次 `step()` 凭什么能让 GPU 前向、语法掩码（grammar bitmask）计算、token 采样三件事咬合得严丝合缝？引擎要睡觉、要暂停、要被关掉，又是怎么做到的？
 
 本章的代码主线集中在一个文件——`vllm/v1/engine/core.py`——里的两个类：
 
@@ -79,7 +79,7 @@ def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
 1. **`has_requests()` 守门**——调度器手上一个请求都没有，直接返回 `({}, False)`，这一拍空转都不空转。注意注释：这里的「有请求」既包括没跑完的，也包括跑完了但还没从批次里清走的。
 2. **`schedule()`**——调度器决定这一拍要推哪些请求、各推多少 token，产出一个 `scheduler_output`。它是连续批处理的大脑，细节是 [第 13 章](../ch13-continuous-batching/narrative/chapter.md) 的主场，这里我们只把它当作「这一批要算什么」的清单。
 3. **`execute_model(..., non_block=True)`**——发起 GPU 前向。注意 `non_block=True`：它**不等前向跑完**，立刻返回一个 `future`。
-4. **`get_grammar_bitmask()`**——算结构化输出的 grammar 掩码（下一节细讲它为什么夹在这）。
+4. **`get_grammar_bitmask()`**——算结构化输出的语法掩码（下一节细讲它为什么夹在这）。
 5. **`future.result()`**——到这里才真正等前向结束。
 6. **`sample_tokens(grammar_output)`**——`if model_output is None` 时才采样。这个分支条件值得停一下：为什么前向跑完了，输出还可能是 `None`？
 7. **`_process_aborts_queue()` + `update_from_output()`**——先把执行期间到达的中止请求批量落地，再把模型输出转成 `EngineCoreOutputs` 交出去。
@@ -90,9 +90,9 @@ def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
 
 ## 11.2 采样为什么从前向里拆出来
 
-`execute_model` 返回的 `future`，`result()` 出来可能是 `None`。这不是出错——它是一个**约定信号**：「前向我跑完了，但 token 我没采，因为采样要用 grammar 掩码，而掩码这会儿还没算好，你（主进程）拿着掩码自己采。」
+`execute_model` 返回的 `future`，`result()` 出来可能是 `None`。这不是出错——它是一个**约定信号**：「前向我跑完了，但 token 我没采，因为采样要用语法掩码，而掩码这会儿还没算好，你（主进程）拿着掩码自己采。」
 
-为什么要这样拆？因为结构化输出（structured output，比如强制模型只输出合法 JSON）的工作方式是：在采样那一步，往 logits 上盖一张「bitmask」掩码，把不合法的 token 概率压成负无穷。而这张掩码依赖**这一拍调度了哪些请求、各自的语法状态走到哪了**——也就是说，它依赖 `scheduler_output`，必须在 `schedule()` 之后才能算。
+为什么要这样拆？因为结构化输出（structured output，比如强制模型只输出合法 JSON）的工作方式是：在采样那一步，往 logits 上盖一张语法掩码，把不合法的 token 概率压成负无穷。而这张掩码依赖**这一拍调度了哪些请求、各自的语法状态走到哪了**——也就是说，它依赖 `scheduler_output`，必须在 `schedule()` 之后才能算。
 
 如果把采样焊死在前向里（worker 一口气算完前向就采样），那掩码就得在发起前向**之前**算好。可那样一来，CPU 算掩码的时间和 GPU 跑前向的时间就**串行**了，谁也盖不住谁。
 
@@ -846,7 +846,7 @@ def test_inproc_client_get_output_steps_engine():
 
 回到开头那个比喻。本章这台节拍器的全部源码就在 `vllm/v1/engine/core.py` 一个文件里——`EngineCore` 是节拍器本体，`run_busy_loop`（`vllm/v1/engine/core.py:L1164`）是带动它的发条，`step()`（`vllm/v1/engine/core.py:L402`）是每一拍：
 
-- **一拍（`step`）** 做七件事：守门 → 调度 → 异步发起前向 → **趁前向在跑算 grammar 掩码** → 等前向 → 用掩码采样 → 落地执行期 abort 后出输出。最精巧的是那个重叠——CPU 算掩码藏进 GPU 前向的影子里，`non_block=True` 是它的开关。
+- **一拍（`step`）** 做七件事：守门 → 调度 → 异步发起前向 → **趁前向在跑算语法掩码** → 等前向 → 用掩码采样 → 落地执行期 abort 后出输出。最精巧的是那个重叠——CPU 算掩码藏进 GPU 前向的影子里，`non_block=True` 是它的开关。
 - **发条（`run_busy_loop`）** 每圈两步：从 `input_queue` 收请求（没活就阻塞睡，零 CPU），敲一拍把输出塞 `output_queue`。靠一对内存队列和第 7 章那两个 IO 线程解耦，互不阻塞。
 - **关停** 是一场绕开信号雷区的握手：`WAKEUP` 哨兵叫醒睡着的队列，三态机排空后退出。
 - **生命周期** 把「停调度」（pause 三模式）和「让出显存」（sleep 三级）拆成正交的旋钮，多进程下用 idle 回调实现「等排空再动手」的异步语义。

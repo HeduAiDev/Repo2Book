@@ -236,7 +236,7 @@ def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
 一拍只有四步，但每一步都是后面一整章（甚至几章）的主题：
 
 1. **`schedule()`**——决定这一拍跑哪些请求、各自跑多少 token。它要在显存预算内塞进尽可能多的请求，是「连续批处理」的大脑。[第 13 章](../ch13-scheduler/narrative/chapter.md)、[第 14 章](../ch14-scheduler/narrative/chapter.md) 讲调度与 KV 预算。
-2. **`execute_model()`**——把这一批喂进模型跑前向。注意 `non_block=True`：执行和采样在 v1 里被解耦成两步，执行可以异步。模型执行、persistent batch、输入组装见 [第 17](../ch17-worker-and-executor/narrative/chapter.md)–[19 章](../ch19-model-runner/narrative/chapter.md)。
+2. **`execute_model()`**——把这一批喂进模型跑前向。注意 `non_block=True`：执行和采样在 v1 里被解耦成两步，执行可以异步。模型执行、持久批次（persistent batch）、输入组装见 [第 17](../ch17-worker-and-executor/narrative/chapter.md)–[19 章](../ch19-model-runner/narrative/chapter.md)。
 3. **`sample_tokens()`**——从 logits 采出这一拍每个请求的下一个 token。采样管线见 [第 27 章](../ch27-sampling/narrative/chapter.md)。
 4. **`update_from_output()`**——把采出的 token 写回各请求状态、判断谁结束了，组装成 `EngineCoreOutputs` 返回。它的内部簿记 [第 14 章](../ch14-scheduler/narrative/chapter.md) 一并讲。
 
