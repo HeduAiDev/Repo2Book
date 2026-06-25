@@ -68,7 +68,8 @@ python3 scripts/lint_source_grounding.py {chapter}/                        # 源
 - **连贯性干净**：26/26 伏笔全回收；glossary/interfaces 登记 30 章；全书 0 断裂章内锚点（`scripts/lint_anchors.py --all` 校验）。
 - 旧 `NN-*` 文章已从 main 与 vllm-book-v2-rebuild 两分支删除。
 - 体系经实战加固：archive 注入完整 reviewV+崩溃重试、防假通过 escape hatch（评审 agent 全失败不静默 APPROVE）、dossier-verify 对抗自核（实战拦下 ch31 SyncMPClient/ch01 CompilationMode 等事实错误）、off-spine 分层 roadmap、写手提示词强化、git push 须前台（后台 SSH 失败）。
-- **剩余 = 全书润色**（非 draft）：各章 review-report.json 的 negotiable 项（半角标点、术语对齐 glossary、算法维度的逐拍 tick 表/归纳证明增补、个别图标签重叠、lint_formulas 内联密度软噪声）。ch03–16 的 review-report 为 archivist 有损重建(约 3 条/章)，ch17+ 忠实全量；完整 issues 在工作流通知里。
+- **润色已大体完成**：断锚(10, `lint_anchors.py`)、半角标点(11, `lint_punct.py`)、图标签重叠(3)、术语对齐 glossary(6)、**算法维度增补 24 章**(Wave1 ch17-33 按 reviewer 点名 + Wave2 ch09-16 按 dossier.theory：逐拍 tick 表/归纳证明/复杂度量化, 全锚定 dossier 数字无杜撰)均已做并推远程。复验全书 structure/formulas/fidelity 无 BLOCKING、0 断锚、0 半角。
+- **剩余仅余最低价值可选项**：个别长句拆分/过渡句/`本章只…`模板等纯声线微调、lint_formulas 内联密度软噪声。ch03–16 的 on-disk review-report 为 archivist 有损重建(约 3 条/章)，完整 issues 在工作流通知里。
 - 新书章节用 `ch`-前缀 slug，置于 `instances/vllm/artifacts/`。
 
 ## 常见坑
