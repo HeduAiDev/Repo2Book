@@ -7,7 +7,7 @@ def esc(s):
     return xs.escape(s)
 
 
-W, H = 920, 490
+W, H = 990, 490   # widened so the t+2 column (ends at x≈962) is not clipped
 L = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">']
 L.append(
     '<defs>'

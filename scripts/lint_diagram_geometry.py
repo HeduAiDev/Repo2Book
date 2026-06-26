@@ -118,12 +118,18 @@ def check(path):
     texts, rects, arrows = collect(root)
     issues = []
     PAD = 2.0
-    # (1) overflow
+    # (1) overflow — 文字盒越出画布
     for t in texts:
         if t['x1'] > vx + vw + PAD or t['x0'] < vx - PAD or t['yb'] > vy + vh + PAD or t['yt'] < vy - PAD:
             over = round(max(t['x1'] - (vx + vw), vx - t['x0'], t['yb'] - (vy + vh), vy - t['yt']))
             if over > 4:
                 issues.append(f"overflow: 「{t['s'][:24]}」越出画布约 {over}px")
+    # (1b) rect-overflow — 框越出画布(被裁切)。文字居中时字不越界但框边被切, 故单独查。
+    for r in rects:
+        if r['x1'] > vx + vw + PAD or r['x0'] < vx - PAD or r['y1'] > vy + vh + PAD or r['y0'] < vy - PAD:
+            over = round(max(r['x1'] - (vx + vw), vx - r['x0'], r['y1'] - (vy + vh), vy - r['y0']))
+            if over > 4:
+                issues.append(f"rect-overflow: 一个 {round(r['w'])}×{round(r['h'])} 框越出画布约 {over}px(被裁切)")
     # (2) text-text
     for i in range(len(texts)):
         for j in range(i + 1, len(texts)):
