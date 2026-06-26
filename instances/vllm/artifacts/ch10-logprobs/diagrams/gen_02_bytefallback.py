@@ -53,14 +53,15 @@ for r in rows:
         if i == 6:
             col = retcol
             wcol = "bold"
-        # wrap long
-        maxc = max(8, int(cw[i] / 7.5))
+        # 按列宽断行（CJK 计 12px、其余 7px），在分隔符处断，避免 CJK 长串溢出邻列
+        maxw = cw[i] - 12
         words = v
         chunks = []
         cur = ""
         for ch in words:
             cur += ch
-            if len(cur) >= maxc and (ch in " ,)]"):
+            vw = sum(12 if ord(c) > 0x2E7F else 7 for c in cur)
+            if vw >= maxw and (ch in " ,)]→"):
                 chunks.append(cur)
                 cur = ""
         if cur:

@@ -47,8 +47,9 @@ for name, cn, fill, sw in segs:
     box(lx, ly, sw, 46, fill, "#94a3b8", [f"{name}", cn], 13)
     lx += sw
 # bracket annotations
-txt(90+150+150, ly+108, "↑ 已缓存（vLLM 或 connector）", 12, "start", "#2563eb")
-txt(90+150+150+150, ly+108, "↑ 待计算（new + lookahead）", 12, "start", "#b45309")
+# 居中到各自的框组(comp~ext_comp=90~540 心 315; new+lookahead=540~850 心 695)，两标签互不相压
+txt(315, ly+108, "↑ 已缓存（vLLM 或 connector）", 12, "middle", "#2563eb")
+txt(695, ly+108, "↑ 待计算（new + lookahead）", 12, "middle", "#b45309")
 
 # inputs box
 iy = 215

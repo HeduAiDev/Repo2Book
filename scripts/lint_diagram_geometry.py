@@ -154,6 +154,26 @@ def check(path):
             if ox > 0.30 * tw and oy > 0.4 * (t['yb'] - t['yt']):  # 横向插进>30%字宽 且 纵向明显
                 issues.append(f"text-rect 侵入: 「{t['s'][:18]}」插进别的框内")
                 break
+    # (3b) tag-on-title: 同一个框内两段文字的盒子相交=角标压住框内正文。
+    # 合法的多行标签是竖向堆叠、互不相交; 角标(贴右上角)会与居中标题重叠 → 抓它。
+    for r in rects:
+        if r['w'] < 55 or r['h'] < 26:
+            continue
+        inside = [t for t in texts
+                  if r['x0'] <= (t['x0'] + t['x1']) / 2 <= r['x1']
+                  and r['y0'] <= (t['yt'] + t['yb']) / 2 <= r['y1']]
+        flagged = False
+        for i in range(len(inside)):
+            for j in range(i + 1, len(inside)):
+                a, b = inside[i], inside[j]
+                ox = min(a['x1'], b['x1']) - max(a['x0'], b['x0'])
+                oy = min(a['yb'], b['yb']) - max(a['yt'], b['yt'])
+                if ox > 3 and oy > 3:   # 框内两段文字真正二维相交(留 3px 容差)
+                    issues.append(f"tag-on-title: 框内「{a['s'][:12]}」与「{b['s'][:12]}」相压")
+                    flagged = True
+                    break
+            if flagged:
+                break
     # (4) arrow-loose: 带 marker 的连线端点悬空
     all_ep = [p for a in arrows for p in a['pts']]
     for a in arrows:

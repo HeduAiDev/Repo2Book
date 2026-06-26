@@ -30,7 +30,7 @@ bw, bh = 150, 70
 gap = 16
 
 # BEFORE
-txt(60, 150, "前　req_to_blocks", 16, "start", "#0f172a", "bold")
+txt(60, 144, "前　req_to_blocks", 16, "start", "#0f172a", "bold")
 bx = 60
 by = 170
 for i, (lab, sub, fill, stroke) in enumerate([
@@ -38,7 +38,7 @@ for i, (lab, sub, fill, stroke) in enumerate([
         ("B1", "token 4~7", "#bbf7d0", "#22c55e"),
         ("B2", "token 8~11", "#bbf7d0", "#22c55e")]):
     blk(bx + i*(bw+gap), by, bw, bh, fill, stroke, lab, sub)
-    txt(bx + i*(bw+gap)+bw/2, by-12, f"下标 {i}", 12, "middle", "#94a3b8")
+    txt(bx + i*(bw+gap)+bw/2, by-10, f"下标 {i}", 12, "middle", "#94a3b8")
 txt(bx, by+bh+30, "B0 落在滑窗之外（逆序扫描第一个待回收块）", 13, "start", "#b91c1c")
 
 # arrow down

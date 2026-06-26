@@ -106,7 +106,8 @@ for c in (0, 1):
         L.append(f'<rect x="{x0}" y="{y}" width="6" height="{ph}" rx="3" fill="{accent}"/>')
         L.append(f'<text x="{x0+18}" y="{y+25}" font-size="16" font-weight="bold" fill="{accent}">{esc(p[0])}</text>')
         sub = p[1]
-        L.append(f'<text x="{x0+78}" y="{y+25}" font-size="13" fill="#475569">{esc(sub)}</text>')
+        # 副标起点右移到 x0+104：让位给最宽的罗马数字(Part VIII 粗体到 x0+97)，避免压标题
+        L.append(f'<text x="{x0+104}" y="{y+25}" font-size="13" fill="#475569">{esc(sub)}</text>')
         if flagship:
             L.append(f'<rect x="{x0+COL_W-58}" y="{y+9}" width="46" height="20" rx="10" fill="#f59e0b"/>')
             L.append(f'<text x="{x0+COL_W-35}" y="{y+23}" text-anchor="middle" font-size="12" font-weight="bold" fill="white">旗舰</text>')

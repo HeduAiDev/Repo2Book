@@ -113,8 +113,11 @@ for ay in right_anchor_ys:
     L.append(f'<line x1="{arrow_x1}" y1="{ay + 20}" x2="{arrow_x2}" y2="{ay + 10}" '
              f'stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>')
 mid_right_label_cx = (mx + mw + rx_col) // 2  # = (960 + 1040) // 2 = 1000
-L.append(f'<text x="{mid_right_label_cx}" y="60" text-anchor="middle" '
-         f'font-size="12.5" fill="#334155">三个工厂（第二级映射）</text>')
+# 标签拆两行落进 80px 列间隙(x969-1031, 与两侧框零重叠), 放在 group1↔group2 的纵向空档
+L.append(f'<text x="{mid_right_label_cx}" y="255" text-anchor="middle" '
+         f'font-size="12.5" fill="#334155">三个工厂</text>')
+L.append(f'<text x="{mid_right_label_cx}" y="272" text-anchor="middle" '
+         f'font-size="11" fill="#64748b">第二级映射</text>')
 
 # Footer note
 L.append(f'<text x="40" y="{H - 18}" font-size="12" fill="#64748b">'
