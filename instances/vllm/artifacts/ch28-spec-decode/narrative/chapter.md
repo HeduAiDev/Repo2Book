@@ -110,7 +110,7 @@ n-gram 还有一个全张量的 GPU 版本（`vllm/v1/spec_decode/ngram_proposer
 n-gram 是确定性复制，没有"概率"可言。真正的草稿模型——EAGLE/EAGLE3/DFlash/MTP——是一个小神经网络，吃目标模型的 hidden states，自己跑前向采草稿。它们全部走 `SpecDecodeBaseProposer.propose`（`vllm/v1/spec_decode/llm_base_proposer.py`）这条统一入口：
 
 ```python
-# vllm/v1/spec_decode/llm_base_proposer.py:L413
+# vllm/v1/spec_decode/llm_base_proposer.py:L392
 def propose(
     self,
     target_token_ids, target_positions, target_hidden_states,
@@ -145,7 +145,7 @@ def propose(
 有两条早退路径只跑一遍前向就够：`num_speculative_tokens == 1`（只要 1 个草稿）和 `parallel_drafting`（DFlash 这类"一次并行吐出全部 k 个草稿"的方法）。否则就要自回归地一步步往下猜：
 
 ```python
-# vllm/v1/spec_decode/llm_base_proposer.py:L554
+# vllm/v1/spec_decode/llm_base_proposer.py:L525
 draft_token_ids_list = [draft_token_ids]
 # … 省略：把 query_start_loc / seq_lens 设成单 token decode 步 …
 for token_index in range(self.num_speculative_tokens - 1):
@@ -215,7 +215,7 @@ class SpecDecodeMetadata:
 真正把这套 index 造出来的，是模型运行器里的 `_calc_spec_decode_metadata`（`vllm/v1/worker/gpu_model_runner.py`）。它的源码注释里带了一组**具体数字**，是理解整套间接寻址最好的脚手架。直接读它：
 
 ```python
-# vllm/v1/worker/gpu_model_runner.py:L2596
+# vllm/v1/worker/gpu_model_runner.py:L2627
 def _calc_spec_decode_metadata(self, num_draft_tokens, cu_num_scheduled_tokens):
     # Inputs:
     # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]

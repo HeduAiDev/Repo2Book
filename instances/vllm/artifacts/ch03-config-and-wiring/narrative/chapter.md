@@ -80,7 +80,7 @@
 先看 `EngineArgs` 长什么样。它是一个普通的 dataclass，字段多到几百个，但有一个非常漂亮的设计决策藏在默认值里：
 
 ```python
-# vllm/engine/arg_utils.py:L406
+# vllm/engine/arg_utils.py:L415
 class EngineArgs:
     """Arguments for vLLM engine."""
 
@@ -117,7 +117,7 @@ class EngineArgs:
 `EngineArgs` 还有个贴心的 `__post_init__`，处理用户用 dict 传子配置的情况：
 
 ```python
-# vllm/engine/arg_utils.py:L690
+# vllm/engine/arg_utils.py:L701
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
@@ -140,7 +140,7 @@ class EngineArgs:
 现在进入第一级映射的主体。`create_engine_config` 是个挺长的方法（一千多行的文件里它占了五百多行），但它的结构其实很规律。先看开场：
 
 ```python
-# vllm/engine/arg_utils.py:L1622
+# vllm/engine/arg_utils.py:L1636
     def create_engine_config(
         self,
         usage_context: UsageContext | None = None,
@@ -179,7 +179,7 @@ class EngineArgs:
 接着是一连串「打包」。这是整个方法的核心套路，看一个代表就懂了——`CacheConfig`：
 
 ```python
-# vllm/engine/arg_utils.py:L1679
+# vllm/engine/arg_utils.py:L1693
         cache_config = CacheConfig(
             block_size=self.block_size,
             gpu_memory_utilization=self.gpu_memory_utilization,
@@ -201,7 +201,7 @@ class EngineArgs:
 `SchedulerConfig`、`ParallelConfig`、`LoadConfig`、`CompilationConfig`……全是**同一个套路**。看 `SchedulerConfig`，注意它怎么从 `model_config` 派生标志：
 
 ```python
-# vllm/engine/arg_utils.py:L1956
+# vllm/engine/arg_utils.py:L1966
         scheduler_config = SchedulerConfig(
             runner_type=model_config.runner_type,
             max_num_batched_tokens=self.max_num_batched_tokens,
@@ -226,7 +226,7 @@ class EngineArgs:
 打包完所有子配置，方法的收尾就是把它们一次性塞进 `VllmConfig`：
 
 ```python
-# vllm/engine/arg_utils.py:L2149
+# vllm/engine/arg_utils.py:L2159
         config = VllmConfig(
             model_config=model_config,
             cache_config=cache_config,
@@ -264,7 +264,7 @@ class EngineArgs:
 先看 `__post_init__` 的开头：
 
 ```python
-# vllm/config/vllm.py:L721
+# vllm/config/vllm.py:L758
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
@@ -318,7 +318,7 @@ class EngineArgs:
 `async_scheduling` 有三个值：`True`（用户显式要开）、`False`（用户显式要关）、`None`（默认，意思是「你看着办」）。看决策代码：
 
 ```python
-# vllm/config/vllm.py:L777
+# vllm/config/vllm.py:L814
         from vllm.v1.executor.abstract import Executor
 
         executor_backend = self.parallel_config.distributed_executor_backend
@@ -420,7 +420,7 @@ class EngineArgs:
 注意工厂里那行注释：`distributed_executor_backend must be set in VllmConfig.__post_init__`——到工厂被调用时，这个字段**必须已经不是 `None` 了**。那它是在哪从 `None` 变成 `"mp"`/`"uni"` 的呢？答案在 `ParallelConfig.__post_init__`，比这个工厂更早执行：
 
 ```python
-# vllm/config/parallel.py:L829
+# vllm/config/parallel.py:L831
         if self.distributed_executor_backend is None and self.world_size_across_dp > 1:
             # We use multiprocessing by default if world_size fits on the
             # current node and we aren't in a ray placement group.
@@ -604,7 +604,7 @@ class OptimizationLevel(IntEnum):
 关键问题是：`-O3` 这个枚举值，怎么变成「开这几个 fusion、用那个 cudagraph 模式」的具体设置？答案是 vLLM 没用一大坨 if-else，而是用了**预设字典 + 查表**：
 
 ```python
-# vllm/config/vllm.py:L184
+# vllm/config/vllm.py:L175
 OPTIMIZATION_LEVEL_00 = {
     "compilation_config": {
         "pass_config": {
@@ -660,7 +660,7 @@ OPTIMIZATION_LEVEL_TO_CONFIG = {
 字典有了，怎么把它落到 `compilation_config` / `kernel_config` 上？看应用机制：
 
 ```python
-# vllm/config/vllm.py:L652
+# vllm/config/vllm.py:L647
     def _apply_optimization_level_defaults(self, defaults: dict[str, Any]) -> None:
         """Apply optimization level defaults using self as root.
 
@@ -696,7 +696,7 @@ OPTIMIZATION_LEVEL_TO_CONFIG = {
 把 `__post_init__` 尾段的 compilation 落定逻辑看完，整个优先级链就清楚了：
 
 ```python
-# vllm/config/vllm.py:L904
+# vllm/config/vllm.py:L941
         if self.model_config is not None and self.model_config.enforce_eager:
             logger.warning(
                 "Enforce eager set, disabling torch.compile and CUDAGraphs. "
@@ -746,7 +746,7 @@ OPTIMIZATION_LEVEL_TO_CONFIG = {
 `compute_hash` 的答案是：**只收集「影响计算图结构」的因子，哈希成一个 10 位短指纹**。
 
 ```python
-# vllm/config/vllm.py:L367
+# vllm/config/vllm.py:L362
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

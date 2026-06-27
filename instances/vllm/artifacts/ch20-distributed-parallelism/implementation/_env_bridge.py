@@ -21,7 +21,7 @@ vllm_lib = Library("vllm", "FRAGMENT")
 
 # direct_register_custom_op：按 CPU 主线裁剪 dispatch_key（原版从
 # current_platform.dispatch_key 取，这里固定 CPU）。
-# SOURCE: vllm/utils/torch_utils.py:L899
+# SOURCE: vllm/utils/torch_utils.py:L931
 def direct_register_custom_op(
     op_name: str,
     op_func: Callable,
@@ -39,7 +39,7 @@ def direct_register_custom_op(
         mutates_args = []
     if dispatch_key is None:
         # SUBTRACTED: 原版 `dispatch_key = current_platform.dispatch_key`
-        # (vllm/utils/torch_utils.py:L926-L929) 在 CUDA 上取 "CUDA"；host 无 CUDA，
+        # (vllm/utils/torch_utils.py:L958-L961) 在 CUDA 上取 "CUDA"；host 无 CUDA，
         # 固定 "CompositeExplicitAutograd" 使算子在 CPU 上可派发，语义等价。
         dispatch_key = "CompositeExplicitAutograd"
     schema_str = infer_schema(op_func, mutates_args=mutates_args)
@@ -90,11 +90,11 @@ class _Platform:
     def is_tpu(self) -> bool:
         return False
 
-    # SOURCE: vllm/platforms/interface.py:L899
+    # SOURCE: vllm/platforms/interface.py:L935
     def use_custom_op_collectives(self) -> bool:
         return False
 
-    # SOURCE: vllm/platforms/interface.py:L734
+    # SOURCE: vllm/platforms/interface.py:L770
     def get_device_communicator_cls(self) -> str:
         # 真实 CUDA 平台返回 CudaCommunicator 的全限定名；本章默认实现用
         # DeviceCommunicatorBase（torch.distributed/gloo 后端），语义一致。

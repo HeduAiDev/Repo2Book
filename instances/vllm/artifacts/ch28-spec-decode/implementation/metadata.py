@@ -79,7 +79,7 @@ class SpecDecodeMetadata:
         )
 
 
-# SOURCE: vllm/v1/worker/gpu_model_runner.py:L1572-L1596 (_get_cumsum_and_arange)
+# SOURCE: vllm/v1/worker/gpu_model_runner.py:L1600-L1624 (_get_cumsum_and_arange)
 # SUBTRACTED: 这是 GpuModelRunner 的一个方法；精简版提为自由函数，去掉
 #             self.arange_np / arange_out 预分配 scratch（纯性能复用），
 #             直接用临时数组，算出的累积和与 batched arange 数值完全一致。
@@ -91,7 +91,7 @@ def _get_cumsum_and_arange(
 
     E.g. [2, 5, 3] -> cumsum=[2, 7, 10], arange=[0,1, 0,1,2,3,4, 0,1,2]。
     """
-    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L1572-L1596
+    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L1600-L1624
     # Step 1. [2, 5, 3] -> [2, 7, 10]
     cu_num_tokens = np.cumsum(num_tokens, dtype=cumsum_dtype)
     total_num_tokens = int(cu_num_tokens[-1])
@@ -102,7 +102,7 @@ def _get_cumsum_and_arange(
     return cu_num_tokens, arange
 
 
-# SOURCE: vllm/v1/worker/gpu_model_runner.py:L2596-L2674 (_calc_spec_decode_metadata)
+# SOURCE: vllm/v1/worker/gpu_model_runner.py:L2627-L2705 (_calc_spec_decode_metadata)
 # SUBTRACTED: 提为自由函数；input_ids 由参数显式传入而非 self.input_ids.gpu；
 #             CPU->GPU non_blocking 拷贝细节省略（device 由 input_ids 决定）。
 #             三组 index 的构造算术与真实 vLLM 逐行一致。
@@ -111,7 +111,7 @@ def calc_spec_decode_metadata(
     cu_num_scheduled_tokens: np.ndarray,
     input_ids: torch.Tensor,
 ) -> SpecDecodeMetadata:
-    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L2596-L2674
+    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L2627-L2705
     device = input_ids.device
     # Inputs:
     # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]

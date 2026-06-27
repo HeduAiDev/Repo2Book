@@ -187,10 +187,10 @@ with pytest.raises(ValueError, match="Duplicate layer name"):
 
 ### 列并行：沿 output 切，零通信
 
-`ColumnParallelLinear` 把权重矩阵沿 output（最后一维）切。看它的 `__init__`（`vllm/model_executor/layers/linear.py:L436`）：
+`ColumnParallelLinear` 把权重矩阵沿 output（最后一维）切。看它的 `__init__`（`vllm/model_executor/layers/linear.py:L440`）：
 
 ```python
-# vllm/model_executor/layers/linear.py:L436
+# vllm/model_executor/layers/linear.py:L440
 def __init__(self, input_size, output_size, ...):
     # Divide the weight matrix along the last dimension.
     self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
@@ -226,10 +226,10 @@ assert torch.equal(layer.weight.data, full[4:8])
 
 ### 行并行：沿 input 切，末尾一次 all_reduce
 
-`RowParallelLinear` 反过来——沿 input（权重的 dim1）切。每张卡持有 `[input/tp, output]` 的一块。它的 `forward` 是整个 TP 子块**唯一**发生通信的地方（`vllm/model_executor/layers/linear.py:L1543`）：
+`RowParallelLinear` 反过来——沿 input（权重的 dim1）切。每张卡持有 `[input/tp, output]` 的一块。它的 `forward` 是整个 TP 子块**唯一**发生通信的地方（`vllm/model_executor/layers/linear.py:L1544`）：
 
 ```python
-# vllm/model_executor/layers/linear.py:L1543
+# vllm/model_executor/layers/linear.py:L1544
 def forward(self, input_):
     if self.input_is_parallel:
         input_parallel = input_
@@ -333,10 +333,10 @@ self.o_proj = RowParallelLinear(
 
 注意那段 `if self.total_num_kv_heads >= tp_size`——这是 **GQA（grouped-query attention）** 的分叉，下一小节细讲。先记住结构：`qkv_proj` 是列并行（fuse q/k/v），`o_proj` 是行并行——又是一对列并行接行并行。
 
-`QKVParallelLinear` 在 `__init__` 里把三段的「全量宽度」记进 `output_sizes`（`vllm/model_executor/layers/linear.py:L1005`）：
+`QKVParallelLinear` 在 `__init__` 里把三段的「全量宽度」记进 `output_sizes`（`vllm/model_executor/layers/linear.py:L1007`）：
 
 ```python
-# vllm/model_executor/layers/linear.py:L1030
+# vllm/model_executor/layers/linear.py:L1032
 self.num_heads = divide(self.total_num_heads, tp_size)
 if tp_size >= self.total_num_kv_heads:
     self.num_kv_heads = 1
@@ -478,10 +478,10 @@ assert "model.layers.0.self_attn.q_proj.weight" not in loaded
 
 ### weight_loader：一次完成 fuse + TP 切分
 
-`shard_id` 传到 `QKVParallelLinear.weight_loader` 后，offset 公式登场（`vllm/model_executor/layers/linear.py:L1304`）：
+`shard_id` 传到 `QKVParallelLinear.weight_loader` 后，offset 公式登场（`vllm/model_executor/layers/linear.py:L1306`）：
 
 ```python
-# vllm/model_executor/layers/linear.py:L1304
+# vllm/model_executor/layers/linear.py:L1306
 assert loaded_shard_id in ["q", "k", "v"]
 
 # If output dim is defined, use the default loading process.
@@ -549,7 +549,7 @@ assert torch.equal(seen[2], seen[3])
 assert not torch.equal(seen[0], seen[2])  # 不同 KV 头
 ```
 
-`MergedColumnParallelLinear.weight_loader` 同理，只是 `shard_id` 是 0（gate）/1（up），offset 用 `sum(output_sizes[:id])`（`vllm/model_executor/layers/linear.py:L808`）。两段都用各自的 `tp_rank` narrow，没有复制语义。
+`MergedColumnParallelLinear.weight_loader` 同理，只是 `shard_id` 是 0（gate）/1（up），offset 用 `sum(output_sizes[:id])`（`vllm/model_executor/layers/linear.py:L810`）。两段都用各自的 `tp_rank` narrow，没有复制语义。
 
 ### 第三段：process_weights_after_loading
 

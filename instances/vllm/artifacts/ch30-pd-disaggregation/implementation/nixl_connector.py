@@ -122,7 +122,7 @@ class NixlConnectorWorker:
         self._handshake_lock = threading.Lock()
 
     def start_load_kv(self, metadata: NixlConnectorMetadata):
-        # SOURCE: vllm/.../nixl/worker.py:L1840-L1895
+        # SOURCE: vllm/.../nixl/worker.py:L1843-L1898
         """Start loading by triggering non-blocking nixl_xfer.
         We check for these trnxs to complete in each step()."""
         for req_id, meta in metadata.reqs_to_recv.items():
@@ -231,7 +231,7 @@ class NixlConnectorWorker:
             raise
 
     def get_finished(self):
-        # SOURCE: vllm/.../nixl/worker.py:L1651-L1730
+        # SOURCE: vllm/.../nixl/worker.py:L1654-L1733
         """Get requests that are done sending or recving on this specific
         worker."""
         done_sending = self._get_new_notifs()
@@ -253,7 +253,7 @@ class NixlConnectorWorker:
         return done_sending, done_recving
 
     def _get_new_notifs(self):
-        # SOURCE: vllm/.../nixl/worker.py:L1732-L1775
+        # SOURCE: vllm/.../nixl/worker.py:L1735-L1778
         """Get req_ids which got a remote xfer message."""
         # SUBTRACTED: 多消费者 (异构 TP) 计数等齐再释放（worker L1755-L1773）。对称 TP
         #             下一条通知即代表该 P 侧请求被读完，可释放。
@@ -269,7 +269,7 @@ class NixlConnectorWorker:
         return notified_req_ids
 
     def _pop_done_transfers(self, transfers):
-        # SOURCE: vllm/.../nixl/worker.py:L1777-L1822
+        # SOURCE: vllm/.../nixl/worker.py:L1780-L1825
         """Pop completed xfers by checking for DONE state. Returns set of
         req_ids that have all done xfers."""
         done_req_ids = set()
@@ -295,7 +295,7 @@ class NixlConnectorWorker:
         return done_req_ids
 
     def _handle_failed_transfer(self, req_id, handle):
-        # SOURCE: vllm/.../nixl/worker.py:L1824
+        # SOURCE: vllm/.../nixl/worker.py:L1827
         # SUBTRACTED: 把该请求所有逻辑块标 invalid 并记 stats（worker L1824+）。精简版
         #             只把请求记入 _failed_recv_reqs（让 get_finished 仍上报，满足契约）。
         self.nixl_wrapper.release_xfer_handle(handle)

@@ -17,7 +17,7 @@ from backend import AttentionBackend, AttentionType
 from registry import resolve_obj_by_qualname
 
 
-# SOURCE: vllm/v1/attention/selector.py:L22 (AttentionSelectorConfig)
+# SOURCE: vllm/v1/attention/selector.py:L21 (AttentionSelectorConfig)
 class AttentionSelectorConfig(NamedTuple):
     head_size: int
     dtype: torch.dtype
@@ -33,7 +33,7 @@ class AttentionSelectorConfig(NamedTuple):
     use_batch_invariant: bool = False
 
 
-# SOURCE: vllm/v1/attention/selector.py:L53 (get_attn_backend)
+# SOURCE: vllm/v1/attention/selector.py:L52 (get_attn_backend)
 def get_attn_backend(
     head_size: int,
     dtype: torch.dtype,
@@ -79,7 +79,7 @@ def get_attn_backend(
 
 
 @cache
-# SOURCE: vllm/v1/attention/selector.py:L106 (_cached_get_attn_backend)
+# SOURCE: vllm/v1/attention/selector.py:L105 (_cached_get_attn_backend)
 def _cached_get_attn_backend(
     backend,
     attn_selector_config: AttentionSelectorConfig,

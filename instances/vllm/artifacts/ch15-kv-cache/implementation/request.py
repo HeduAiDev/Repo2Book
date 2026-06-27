@@ -36,49 +36,49 @@ class Request:
         skip_reading_prefix_cache: bool = False,
     ) -> None:
         self.request_id = request_id
-        # SOURCE: vllm/v1/request.py:L85
+        # SOURCE: vllm/v1/request.py:L86
         self.lora_request = lora_request
-        # SOURCE: vllm/v1/request.py:L146
+        # SOURCE: vllm/v1/request.py:L147
         self.cache_salt: str | None = cache_salt
-        # SOURCE: vllm/v1/request.py:L149
+        # SOURCE: vllm/v1/request.py:L150
         self.mm_features = mm_features or []
 
-        # SOURCE: vllm/v1/request.py:L133 / L155 (all_token_ids 视图)
+        # SOURCE: vllm/v1/request.py:L134 / L155 (all_token_ids 视图)
         self._all_token_ids: list[int] = list(prompt_token_ids)
         self.all_token_ids = self._all_token_ids
 
-        # SOURCE: vllm/v1/request.py:L145
+        # SOURCE: vllm/v1/request.py:L146
         self.num_computed_tokens = 0
-        # SOURCE: vllm/v1/request.py:L144
+        # SOURCE: vllm/v1/request.py:L145
         self.spec_token_ids: list[int] = []
         # SOURCE: vllm/v1/request.py (num_preemptions — 抢占计数，f11)
         self.num_preemptions = 0
-        # SOURCE: vllm/v1/request.py:L128 (_prompt_embeds_per_block_hashes)
+        # SOURCE: vllm/v1/request.py:L129 (_prompt_embeds_per_block_hashes)
         self._prompt_embeds_per_block_hashes: dict[tuple[int, int], bytes] = {}
         # SUBTRACTED: prompt_embeds —— 仅 prompt-embeds 输入触发（_gen_prompt_embeds_extra_hash_keys
-        # 已 SUBTRACTED）；常规 token 请求恒 None。原 vllm/v1/request.py:L121。
+        # 已 SUBTRACTED）；常规 token 请求恒 None。原 vllm/v1/request.py:L122。
         self.prompt_embeds = None
 
-        # SOURCE: vllm/v1/request.py:L171
+        # SOURCE: vllm/v1/request.py:L172
         self.block_hashes: list[Any] = []
-        # SOURCE: vllm/v1/request.py:L175
-        self._block_hasher = block_hasher
         # SOURCE: vllm/v1/request.py:L176
+        self._block_hasher = block_hasher
+        # SOURCE: vllm/v1/request.py:L177
         self.update_block_hashes()
-        # SOURCE: vllm/v1/request.py:L178 (skip_reading_prefix_cache — 需 prompt
+        # SOURCE: vllm/v1/request.py:L179 (skip_reading_prefix_cache — 需 prompt
         # logprobs / 全 pooling 时跳过前缀缓存读)
         self.skip_reading_prefix_cache = skip_reading_prefix_cache
 
-    # SOURCE: vllm/v1/request.py:L211 (append_output_token_ids)
+    # SOURCE: vllm/v1/request.py:L217 (append_output_token_ids)
     def append_output_token_ids(self, token_ids: int | list[int]) -> None:
         if isinstance(token_ids, int):
             self._all_token_ids.append(token_ids)
         else:
             self._all_token_ids.extend(token_ids)
-        # SOURCE: vllm/v1/request.py:L222
+        # SOURCE: vllm/v1/request.py:L228
         self.update_block_hashes()
 
-    # SOURCE: vllm/v1/request.py:L224 (update_block_hashes)
+    # SOURCE: vllm/v1/request.py:L230 (update_block_hashes)
     def update_block_hashes(self) -> None:
         """Compute block hashes for any new full blocks and append them."""
         if self._block_hasher is not None:
@@ -86,5 +86,5 @@ class Request:
 
     @property
     def num_tokens(self) -> int:
-        # SOURCE: vllm/v1/request.py:L234
+        # SOURCE: vllm/v1/request.py:L240
         return len(self._all_token_ids)

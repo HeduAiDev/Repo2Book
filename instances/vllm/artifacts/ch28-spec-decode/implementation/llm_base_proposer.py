@@ -13,17 +13,17 @@ from __future__ import annotations
 import torch
 
 
-# SOURCE: vllm/v1/spec_decode/llm_base_proposer.py:L60 (SpecDecodeBaseProposer)
+# SOURCE: vllm/v1/spec_decode/llm_base_proposer.py:L55 (SpecDecodeBaseProposer)
 class SpecDecodeBaseProposer:
     # 以下属性由真实 __init__ 从 SpeculativeConfig 派生（见
-    # vllm/v1/spec_decode/llm_base_proposer.py:L61-L110）。精简版仅列出 propose
+    # vllm/v1/spec_decode/llm_base_proposer.py:L56-L111）。精简版仅列出 propose
     # 主路径用到的几个，作为契约说明；不内嵌完整构造。
     #   self.method: str                 # "eagle"/"eagle3"/"dflash"/"mtp"/"draft_model"
     #   self.num_speculative_tokens: int # 每请求要产的草稿数 k
     #   self.parallel_drafting: bool     # DFlash 一次出全部 k 个草稿
     #   self.model: nn.Module            # 草稿模型（EAGLE 头 / MTP，见 ch25）
 
-    # SOURCE: vllm/v1/spec_decode/llm_base_proposer.py:L407-L411
+    # SOURCE: vllm/v1/spec_decode/llm_base_proposer.py:L386-L390
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Greedy-sample draft tokens from hidden states."""
         # SUBTRACTED: use_local_argmax_reduction 分支（L409-L410）—— 局部 argmax 归约
@@ -139,7 +139,7 @@ class SpecDecodeBaseProposer:
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         return draft_token_ids
 
-    # SOURCE: vllm/v1/spec_decode/llm_base_proposer.py:L657-L689 (默认 EAGLE 分支)
+    # SOURCE: vllm/v1/spec_decode/llm_base_proposer.py:L646-L678 (默认 EAGLE 分支)
     # SUBTRACTED: needs_extra_input_slots==True 的 DFlash/draft_model 分支
     #             （copy_and_expand_eagle_inputs_kernel 等，L690-L756）——
     #             subtraction_plan.delete 批准；精简版仅保留 EAGLE 主路径。
@@ -153,7 +153,7 @@ class SpecDecodeBaseProposer:
         token_indices_to_sample: torch.Tensor | None,
         cad,
     ):
-        # SOURCE: vllm/v1/spec_decode/llm_base_proposer.py:L657-L689
+        # SOURCE: vllm/v1/spec_decode/llm_base_proposer.py:L646-L678
         # Default EAGLE pathway: rotate input ids, insert next token ids at the
         # last slot in each request.
         if token_indices_to_sample is None:

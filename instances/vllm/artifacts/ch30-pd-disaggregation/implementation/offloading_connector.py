@@ -154,32 +154,32 @@ class OffloadingConnector(KVConnectorBase_V1):
     # ==============================
 
     def start_load_kv(self, forward_context, **kwargs) -> None:
-        # SOURCE: vllm/.../offloading_connector.py:L90-L93
+        # SOURCE: vllm/.../offloading_connector.py:L89-L92
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, OffloadingConnectorMetadata)
         self.connector_worker.start_kv_transfers(self._connector_metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        # SOURCE: vllm/.../offloading_connector.py:L95-L96
+        # SOURCE: vllm/.../offloading_connector.py:L94-L95
         pass
 
     def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs) -> None:
-        # SOURCE: vllm/.../offloading_connector.py:L98-L105
+        # SOURCE: vllm/.../offloading_connector.py:L97-L104
         pass
 
     def wait_for_save(self):
-        # SOURCE: vllm/.../offloading_connector.py:L107-L110
+        # SOURCE: vllm/.../offloading_connector.py:L106-L109
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, OffloadingConnectorMetadata)
         self.connector_worker.prepare_store_kv(self._connector_metadata)
 
     def get_finished(self, finished_req_ids):
-        # SOURCE: vllm/.../offloading_connector.py:L112-L114
+        # SOURCE: vllm/.../offloading_connector.py:L111-L113
         assert self.connector_worker is not None
         return self.connector_worker.get_finished(finished_req_ids)
 
     def build_connector_worker_meta(self):
-        # SOURCE: vllm/.../offloading_connector.py:L116-L119
+        # SOURCE: vllm/.../offloading_connector.py:L115-L118
         if self.connector_worker is not None:
             return self.connector_worker.build_connector_worker_meta()
         return None

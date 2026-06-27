@@ -38,7 +38,7 @@ class RequestOutput:
         self.finished = finished
         self.kv_transfer_params = kv_transfer_params
 
-    # SOURCE: vllm/outputs.py:L145
+    # SOURCE: vllm/outputs.py:L147
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""
 
@@ -70,7 +70,7 @@ class RequestOutput:
                 self.outputs.append(next_completion)
 
 
-# SOURCE: vllm/outputs.py:L192 STREAM_FINISHED sentinel
+# SOURCE: vllm/outputs.py:L196 STREAM_FINISHED sentinel
 # A finished sentinel pushed to a collector to unblock generate() with no payload.
 STREAM_FINISHED = RequestOutput(
     request_id="",

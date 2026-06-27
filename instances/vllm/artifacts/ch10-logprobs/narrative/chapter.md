@@ -6,10 +6,10 @@
 
 > *图注：全书地图高亮当前位置。[第 8 章](../ch08-output-processor/narrative/chapter.md) 拆开了 Stage 3 那条单循环 `process_outputs()`——一整批混着 N 个请求的输出，怎么被解多路复用、扇出回 N 个客户端流。[第 9 章](../ch09-detokenization/narrative/chapter.md) 钻进那循环里的 `detokenizer.update()`，讲了把 token id 增量解成会停的文字流。本章接着讲同一循环里被一笔带过的另一笔账：`logprobs_processor.update_from_output()`——把 EngineCore 吐回来的一堆 logprobs 张量，装配成 OpenAI 兼容的 sample / prompt logprobs 容器。再往后，这些容器随 `RequestOutput` 一起返回给调用者，请求生命周期就走完了。*
 
-第 8 章那条单循环里，每个请求都会走到这么一行（`vllm/v1/engine/output_processor.py:L639-L641`）：
+第 8 章那条单循环里，每个请求都会走到这么一行（`vllm/v1/engine/output_processor.py:L664-L666`）：
 
 ```python
-# vllm/v1/engine/output_processor.py:L639
+# vllm/v1/engine/output_processor.py:L664
 req_state.logprobs_processor.update_from_output(engine_core_output)
 ```
 
@@ -767,10 +767,10 @@ assert flat.token_ids[flat.start_indices[0]] == 1065
 
 ## 10.8 下游取用：DELTA 切尾、prompt 一次性发完
 
-装配完的容器，怎么被 Stage 3 取走？回到 `output_processor.py`。先看 sample 路进 `CompletionOutput`（`vllm/v1/engine/output_processor.py:L376-L407`）：
+装配完的容器，怎么被 Stage 3 取走？回到 `output_processor.py`。先看 sample 路进 `CompletionOutput`（`vllm/v1/engine/output_processor.py:L401-L432`）：
 
 ```python
-# vllm/v1/engine/output_processor.py:L376
+# vllm/v1/engine/output_processor.py:L401
 def _new_completion_output(
     self,
     token_ids: list[int],

@@ -416,12 +416,12 @@ $$
 
 ## 4.6 队列的真身：`RequestOutputCollector`
 
-来源：`vllm/v1/engine/output_processor.py:L45-L106`。
+来源：`vllm/v1/engine/output_processor.py:L48-L109`。
 
 前面反复提到"每请求一个队列"，现在拆开看它到底是什么。它的名字叫 `RequestOutputCollector`，但**它不是 `asyncio.Queue`**——而是一个更轻的东西：**一个单槽 + 一个 `asyncio.Event`**。
 
 ```python
-# vllm/v1/engine/output_processor.py:L45-L106
+# vllm/v1/engine/output_processor.py:L48-L109
 class RequestOutputCollector:
     """
     Collects streamed RequestOutputs per individual request,
@@ -491,7 +491,7 @@ class RequestOutputCollector:
 
 当 `output_handler`（生产者）比某个慢客户端的 `generate()`（消费者）跑得快，单槽里已经有一个还没被取走的 `RequestOutput`，又来了新的一块。`put` 的选择是 `self.output.add(new, aggregate=...)`——合帧。
 
-来源：`vllm/outputs.py:L145`（`RequestOutput.add`）。合并的语义按输出模式分两种：
+来源：`vllm/outputs.py:L147`（`RequestOutput.add`）。合并的语义按输出模式分两种：
 
 - **DELTA 模式**（`aggregate=True`，流式增量）：把新一块的 token **累加**到现有这块后面。消费者下次 `get` 一次拿到合并后的更大块。
 - **FINAL 模式**（`aggregate=False`）：以最新的覆盖旧的。
@@ -544,7 +544,7 @@ class RequestOutputCollector:
 
 ## 4.7 解多路复用：一批输出怎么分回 N 个队列
 
-来源：`vllm/v1/engine/output_processor.py:L508-L537`（`add_request`）、`L600-L660`（`process_outputs`）。
+来源：`vllm/v1/engine/output_processor.py:L533-L562`（`add_request`）、`L600-L660`（`process_outputs`）。
 
 最后一块拼图：`output_handler` 从 IPC 单出口拉回的是**一整批**混着不同请求的 `EngineCoreOutput`，怎么把它们准确分回各自的队列？这就是"解多路复用"（de-multiplex）。
 
@@ -555,7 +555,7 @@ class RequestOutputCollector:
 **先看登记侧** `OutputProcessor.add_request`——它就是 4.4.2 节 `_add_request` 里"本进程那一路"落到的地方：
 
 ```python
-    # vllm/v1/engine/output_processor.py:L508-L537
+    # vllm/v1/engine/output_processor.py:L533-L562
     def add_request(
         self,
         request: EngineCoreRequest,
@@ -585,7 +585,7 @@ class RequestOutputCollector:
 **再看分发侧** `process_outputs`——`output_handler` 每块调的就是它：
 
 ```python
-        # vllm/v1/engine/output_processor.py:L600-L660
+        # vllm/v1/engine/output_processor.py:L625-L685
         for engine_core_output in engine_core_outputs:
             req_id = engine_core_output.request_id
             req_state = self.request_states.get(req_id)
@@ -640,12 +640,12 @@ $$
 
 ## 4.8 IPC 上流动的是什么：两种跨进程消息
 
-来源：`vllm/v1/engine/__init__.py:L80-L131`（`EngineCoreRequest`）、`L161-L191`（`EngineCoreOutput`）。
+来源：`vllm/v1/engine/__init__.py:L80-L137`（`EngineCoreRequest`）、`L161-L191`（`EngineCoreOutput`）。
 
 进程边界的机制留 [第 7 章：IPC 边界](../ch07-ipc-boundary/narrative/chapter.md)，但有一点本章必须交代清楚：**那条虚线上流过去、流回来的，到底是什么对象？** 看清这个，三段式的数据流就闭合了。
 
 ```python
-    # vllm/v1/engine/__init__.py:L80-L191
+    # vllm/v1/engine/__init__.py:L80-L197
 class EngineCoreRequest(
     msgspec.Struct,
     array_like=True,

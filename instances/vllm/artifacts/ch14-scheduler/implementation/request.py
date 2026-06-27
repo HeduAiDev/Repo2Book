@@ -13,7 +13,7 @@ class FinishReason(enum.IntEnum):
     REPETITION = 4
 
 
-# SOURCE: vllm/v1/request.py:L310 (class RequestStatus)
+# SOURCE: vllm/v1/request.py:L316 (class RequestStatus)
 class RequestStatus(enum.IntEnum):
     """Status of a request."""
 
@@ -34,16 +34,16 @@ class RequestStatus(enum.IntEnum):
 
     @staticmethod
     def is_finished(status: "RequestStatus") -> bool:
-        # SOURCE: vllm/v1/request.py:L332
+        # SOURCE: vllm/v1/request.py:L338
         return status > RequestStatus.PREEMPTED
 
     @staticmethod
     def get_finished_reason(status: "RequestStatus") -> "FinishReason | None":
-        # SOURCE: vllm/v1/request.py:L335
+        # SOURCE: vllm/v1/request.py:L341
         return _FINISHED_REASON_MAP.get(status)
 
 
-# SOURCE: vllm/v1/request.py:L339 (_FINISHED_REASON_MAP)
+# SOURCE: vllm/v1/request.py:L345 (_FINISHED_REASON_MAP)
 _FINISHED_REASON_MAP = {
     RequestStatus.FINISHED_STOPPED: FinishReason.STOP,
     RequestStatus.FINISHED_LENGTH_CAPPED: FinishReason.LENGTH,
@@ -81,24 +81,24 @@ class Request:
             max_tokens=max_tokens, min_tokens=min_tokens,
             eos_token_id=eos_token_id, stop_token_ids=stop_token_ids,
         )
-        # SOURCE: vllm/v1/request.py:L98
+        # SOURCE: vllm/v1/request.py:L99
         self.stop_reason = None
-        # SOURCE: vllm/v1/request.py:L109
+        # SOURCE: vllm/v1/request.py:L110
         self.max_tokens = max_tokens
         self.status = RequestStatus.WAITING
 
         self._all_token_ids = list(prompt_token_ids)
         self._output_token_ids: list[int] = []
 
-        # SOURCE: vllm/v1/request.py:L140
+        # SOURCE: vllm/v1/request.py:L141
         self.num_output_placeholders = 0
-        # SOURCE: vllm/v1/request.py:L144
-        self.spec_token_ids: list[int] = []
         # SOURCE: vllm/v1/request.py:L145
+        self.spec_token_ids: list[int] = []
+        # SOURCE: vllm/v1/request.py:L146
         self.num_computed_tokens = 0
-        # SOURCE: vllm/v1/request.py:L167
+        # SOURCE: vllm/v1/request.py:L168
         self.num_preemptions = 0
-        # SOURCE: vllm/v1/request.py:L181 (resumable — streaming-input 会话)
+        # SOURCE: vllm/v1/request.py:L182 (resumable — streaming-input 会话)
         # SUBTRACTED: streaming_queue / 会话续接状态 —— streaming-input 多轮是
         # 高级特性；精简版恒 resumable=False，停止即真完成。原 vllm/v1/request.py。
         self.resumable = False
@@ -112,7 +112,7 @@ class Request:
         # 约束解码/LoRA/pooling/编码器输入与抢占·回流主线正交。原 vllm/v1/request.py:L40+。
         self.pooling_params = None
 
-    # SOURCE: vllm/v1/request.py:L211 (append_output_token_ids)
+    # SOURCE: vllm/v1/request.py:L217 (append_output_token_ids)
     def append_output_token_ids(self, token_ids) -> None:
         if isinstance(token_ids, int):
             self._output_token_ids.append(token_ids)
@@ -121,7 +121,7 @@ class Request:
             self._output_token_ids.extend(token_ids)
             self._all_token_ids.extend(token_ids)
         # SUBTRACTED: update_block_hashes() —— 前缀缓存块哈希更新，属 KV 缓存子系统，
-        # 与停止检测正交。原 vllm/v1/request.py:L222。
+        # 与停止检测正交。原 vllm/v1/request.py:L228。
 
     @property
     def output_token_ids(self) -> list[int]:
@@ -130,18 +130,18 @@ class Request:
 
     @property
     def num_tokens(self) -> int:
-        # SOURCE: vllm/v1/request.py:L234
+        # SOURCE: vllm/v1/request.py:L240
         return len(self._all_token_ids)
 
     @property
     def num_output_tokens(self) -> int:
-        # SOURCE: vllm/v1/request.py:L242
+        # SOURCE: vllm/v1/request.py:L248
         return len(self._output_token_ids)
 
     def is_finished(self) -> bool:
-        # SOURCE: vllm/v1/request.py:L266
+        # SOURCE: vllm/v1/request.py:L272
         return RequestStatus.is_finished(self.status)
 
     def get_finished_reason(self) -> "FinishReason | None":
-        # SOURCE: vllm/v1/request.py:L269
+        # SOURCE: vllm/v1/request.py:L275
         return RequestStatus.get_finished_reason(self.status)

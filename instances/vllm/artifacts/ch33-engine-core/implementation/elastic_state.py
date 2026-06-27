@@ -614,7 +614,7 @@ class ElasticEPScalingState:
             # SUBTRACTED: logger.info("[Elastic EP] Switched to new setup")
             #   纯日志。原 elastic_state.py:L535。
 
-    # SOURCE: vllm/distributed/elastic_ep/elastic_state.py:L537-L543
+    # SOURCE: vllm/distributed/elastic_ep/elastic_state.py:L537-L548
     def _eplb_reshuffle(self):
         self.model_executor.collective_rpc(
             "elastic_ep_execute", args=("perform_eplb_reshuffle",)
@@ -622,7 +622,7 @@ class ElasticEPScalingState:
         assert self.new_dp_group is not None
         # SUBTRACTED: rank0 logger.info(...) 纯日志。原 elastic_state.py:L542-543。
 
-    # SOURCE: vllm/distributed/elastic_ep/elastic_state.py:L545-L555
+    # SOURCE: vllm/distributed/elastic_ep/elastic_state.py:L550-L560
     def _eplb_reshuffle_before_scale_down(self):
         assert self.reconfig_request is not None and self.old_dp_group is not None
         self.model_executor.collective_rpc(
@@ -634,13 +634,13 @@ class ElasticEPScalingState:
         )
         # SUBTRACTED: rank0 logger.info(...) 纯日志。原 elastic_state.py:L554-555。
 
-    # SOURCE: vllm/distributed/elastic_ep/elastic_state.py:L557-L560
+    # SOURCE: vllm/distributed/elastic_ep/elastic_state.py:L562-L565
     def _switch_and_remove(self):
         self.model_executor.collective_rpc(
             "elastic_ep_execute", args=("switch_and_remove",)
         )
 
-    # SOURCE: vllm/distributed/elastic_ep/elastic_state.py:L562-L588
+    # SOURCE: vllm/distributed/elastic_ep/elastic_state.py:L567-L593
     def _update_parallel_config(self):
         assert self.reconfig_request is not None
         reconfig_request = self.reconfig_request

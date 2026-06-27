@@ -131,13 +131,13 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
         return hidden_states.flatten(1)
 
 
-# SOURCE: vllm/model_executor/models/deepseek_v4_mtp.py:153 (class DeepSeekV4MultiTokenPredictor)
+# SOURCE: vllm/model_executor/models/deepseek_v4_mtp.py:156 (class DeepSeekV4MultiTokenPredictor)
 class DeepSeekV4MultiTokenPredictor(nn.Module):
     """多 MTP 层容器：ModuleDict 按层 idx 持有若干 draft 层；forward 按 spec_step 选层；
     compute_logits 补 hc_head 再过 shared_head 出 draft logits。"""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        # SOURCE: vllm/model_executor/models/deepseek_v4_mtp.py:154 (DeepSeekV4MultiTokenPredictor.__init__)
+        # SOURCE: vllm/model_executor/models/deepseek_v4_mtp.py:157 (DeepSeekV4MultiTokenPredictor.__init__)
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.mtp_start_layer_idx = config.num_hidden_layers
@@ -168,12 +168,12 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        # SOURCE: vllm/model_executor/models/deepseek_v4_mtp.py:195 (embed_input_ids)
+        # SOURCE: vllm/model_executor/models/deepseek_v4_mtp.py:202 (embed_input_ids)
         return self.embed_tokens(input_ids)
 
     def forward(self, input_ids, positions, previous_hidden_states,
                 inputs_embeds=None, spec_step_idx: int = 0) -> torch.Tensor:
-        # SOURCE: vllm/model_executor/models/deepseek_v4_mtp.py:198 (DeepSeekV4MultiTokenPredictor.forward)
+        # SOURCE: vllm/model_executor/models/deepseek_v4_mtp.py:205 (DeepSeekV4MultiTokenPredictor.forward)
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         current_step_idx = spec_step_idx % self.num_mtp_layers
@@ -182,7 +182,7 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         )
 
     def compute_logits(self, hidden_states, spec_step_idx: int = 0) -> torch.Tensor:
-        # SOURCE: vllm/model_executor/models/deepseek_v4_mtp.py:217 (DeepSeekV4MultiTokenPredictor.compute_logits)
+        # SOURCE: vllm/model_executor/models/deepseek_v4_mtp.py:224 (DeepSeekV4MultiTokenPredictor.compute_logits)
         # MTP forward 返回 pre-hc_head 残差 (T, hc_mult*D)；这里补 hc_head 压回单流，再过 shared_head。
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
@@ -197,14 +197,14 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         return logits
 
 
-# SOURCE: vllm/model_executor/models/deepseek_v4_mtp.py:243 (class DeepSeekV4MTP)
+# SOURCE: vllm/model_executor/models/deepseek_v4_mtp.py:250 (class DeepSeekV4MTP)
 @support_torch_compile
 class DeepSeekV4MTP(nn.Module):
     """MTP draft 顶层（与投机解码 ch28 的接口边界）：持有 DeepSeekV4MultiTokenPredictor；
     forward 转发；compute_logits 出 draft logits。被投机解码消费。"""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        # SOURCE: vllm/model_executor/models/deepseek_v4_mtp.py:245 (DeepSeekV4MTP.__init__)
+        # SOURCE: vllm/model_executor/models/deepseek_v4_mtp.py:252 (DeepSeekV4MTP.__init__)
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.quant_config = vllm_config.quant_config
@@ -213,20 +213,20 @@ class DeepSeekV4MTP(nn.Module):
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        # SOURCE: vllm/model_executor/models/deepseek_v4_mtp.py:253 (DeepSeekV4MTP.embed_input_ids)
+        # SOURCE: vllm/model_executor/models/deepseek_v4_mtp.py:260 (DeepSeekV4MTP.embed_input_ids)
         return self.model.embed_input_ids(input_ids)
 
     def forward(self, input_ids, positions, hidden_states,
                 intermediate_tensors: IntermediateTensors | None = None,
                 inputs_embeds=None, spec_step_idx: int = 0) -> torch.Tensor:
-        # SOURCE: vllm/model_executor/models/deepseek_v4_mtp.py:256 (DeepSeekV4MTP.forward)
+        # SOURCE: vllm/model_executor/models/deepseek_v4_mtp.py:263 (DeepSeekV4MTP.forward)
         hidden_states = self.model(
             input_ids, positions, hidden_states, inputs_embeds, spec_step_idx
         )
         return hidden_states
 
     def compute_logits(self, hidden_states, spec_step_idx: int = 0) -> torch.Tensor | None:
-        # SOURCE: vllm/model_executor/models/deepseek_v4_mtp.py:270 (DeepSeekV4MTP.compute_logits)
+        # SOURCE: vllm/model_executor/models/deepseek_v4_mtp.py:277 (DeepSeekV4MTP.compute_logits)
         return self.model.compute_logits(hidden_states, spec_step_idx)
 
     # SUBTRACTED: load_weights（_rewrite_spec_layer_name / 逐层缺失校验 / 450+ 行 remap 长尾）

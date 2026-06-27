@@ -25,7 +25,7 @@
 进程的入口在 `vllm/entrypoints/openai/api_server.py`。剥掉日志装饰后，启动逻辑只有两层薄薄的协程：
 
 ```python
-# vllm/entrypoints/openai/api_server.py:L671-L703
+# vllm/entrypoints/openai/api_server.py:L686-L718
 async def run_server(args, **uvicorn_kwargs) -> None:
     """Run a single-worker API server."""
 
@@ -62,7 +62,7 @@ async def run_server_worker(
 **第一，`setup_server` 在引擎启动之前就把 socket 绑好了。** 注意顺序：`run_server` 先调 `setup_server(args)` 拿到 `sock`，再进 `run_server_worker` 去起引擎。为什么不等引擎起来再绑端口？因为引擎初始化又慢又重——它要拉起子进程、可能还要走 ray 的分布式编排，这期间 ray 自己也会去抢端口。提前把端口攥在手里，就避开了和 ray 的竞态：
 
 ```python
-# vllm/entrypoints/openai/api_server.py:L533-L575
+# vllm/entrypoints/openai/api_server.py:L548-L590
 @instrument(span_name="API server setup")
 def setup_server(args):
     """Validate API server args, set up signal handler, create socket
@@ -178,7 +178,7 @@ async def build_async_engine_client_from_engine_args(
 `async with` 拿到 `engine_client` 后，`build_and_serve` 负责把这台引擎"接线"到一个 FastAPI 应用上：
 
 ```python
-# vllm/entrypoints/openai/api_server.py:L578-L623
+# vllm/entrypoints/openai/api_server.py:L593-L638
 async def build_and_serve(
     engine_client: EngineClient,
     listen_address: str,
@@ -252,7 +252,7 @@ def build_app(
 `build_app` 造的是个"空壳应用"——路由注册了，但路由背后的 handler 对象还没造。这件事交给 `init_app_state`：
 
 ```python
-# vllm/entrypoints/openai/api_server.py:L317-L401
+# vllm/entrypoints/openai/api_server.py:L317-L416
 async def init_app_state(
     engine_client: EngineClient,
     state: State,
@@ -384,7 +384,7 @@ def with_cancellation(handler_func):
 现在进 handler 内部。`OpenAIServingChat.create_chat_completion` 是 chat 请求的主方法，骨架如下：
 
 ```python
-# vllm/entrypoints/openai/chat_completion/serving.py:L229-L373
+# vllm/entrypoints/openai/chat_completion/serving.py:L225-L379
 async def create_chat_completion(
     self,
     request: ChatCompletionRequest,
@@ -442,7 +442,7 @@ async def create_chat_completion(
 **渲染：`render_chat_request`。** 它是 [§32.3](#323-装配现场fastapi-app中间件与那一票-handler) 提到的"两层分层"的现形处：
 
 ```python
-# vllm/entrypoints/openai/chat_completion/serving.py:L202-L227
+# vllm/entrypoints/openai/chat_completion/serving.py:L198-L223
 async def render_chat_request(
     self,
     request: ChatCompletionRequest,
@@ -464,7 +464,7 @@ async def render_chat_request(
 它先做两件"引擎相关"的事，再把渲染本身委托出去。第一件是 `_check_model`——校验请求里的模型名存不存在；第二件是那条带笑脸注释的引擎存活检查，下一节专门讲。最后 `self.openai_serving_render.render_chat(request)` 才是真正把 chat messages 渲染成 prompt 的地方，它在 `vllm/entrypoints/serve/render/serving.py`：
 
 ```python
-# vllm/entrypoints/serve/render/serving.py:L551-L570
+# vllm/entrypoints/serve/render/serving.py:L553-L572
 tok_params = request.build_tok_params(self.model_config)
 chat_params = request.build_chat_params(
     default_template, default_template_content_format
@@ -486,7 +486,7 @@ chat_params = request.build_chat_params(
 **取 request_id。** 这一步看着不起眼，却是分布式追踪的命脉：
 
 ```python
-# vllm/entrypoints/openai/engine/serving.py:L592-L602
+# vllm/entrypoints/openai/engine/serving.py:L596-L606
 @staticmethod
 def _base_request_id(
     raw_request: Request | None, default: str | None = None
@@ -565,7 +565,7 @@ handler 只认这个协议——它不知道、也不需要知道背后是 `Asyn
 先看流式。`chat_completion_stream_generator` 是个 async 生成器，它 `async for` 地消费 `result_generator`，每来一个 `RequestOutput` 就吐若干 SSE 帧。开头第一拍很特别：
 
 ```python
-# vllm/entrypoints/openai/chat_completion/serving.py:L517-L569, L606-L671
+# vllm/entrypoints/openai/chat_completion/serving.py:L495-L551, L606-L671
 try:
     async for res in result_generator:
         if res.prompt_token_ids is not None:
@@ -624,7 +624,7 @@ try:
 收尾部分管两件事：可选的用量统计，和那个雷打不动的终止哨兵：
 
 ```python
-# vllm/entrypoints/openai/chat_completion/serving.py:L1054-L1083, L1085-L1146
+# vllm/entrypoints/openai/chat_completion/serving.py:L909-L938, L1085-L1146
                 # … 省略：组装 choice_data、盖 system_fingerprint …
                 data = chunk.model_dump_json(exclude_unset=True)
                 yield f"data: {data}\n\n"
@@ -684,7 +684,7 @@ yield "data: [DONE]\n\n"
 非流式简单得多，因为它不在乎中间过程，只要最终结果：
 
 ```python
-# vllm/entrypoints/openai/chat_completion/serving.py:L1148-L1201, L1457-L1521
+# vllm/entrypoints/openai/chat_completion/serving.py:L1003-L1056, L1457-L1521
 async def chat_completion_full_generator(
     self,
     request: ChatCompletionRequest,
@@ -755,7 +755,7 @@ async def chat_completion_full_generator(
 它把每个 `RequestOutput` 赋给 `final_res`，循环结束后 `final_res` 就是**最后一个**。为什么只留最后一个就够？答案不在这个循环里，而在 [§32.4](#324-请求的一生上从-http-到-token) 那一步算 `SamplingParams` 时——`request.to_sampling_params` 会按 `request.stream` 给引擎设一个开关：
 
 ```python
-# vllm/entrypoints/openai/chat_completion/protocol.py:L586-L588
+# vllm/entrypoints/openai/chat_completion/protocol.py:L605-L607
 output_kind=RequestOutputKind.DELTA
 if self.stream
 else RequestOutputKind.FINAL_ONLY,
@@ -780,7 +780,7 @@ else RequestOutputKind.FINAL_ONLY,
 上面两个分支用到的 `create_error_response`、`create_streaming_error_response`、`_raise_if_error`，都不在 chat handler 里，而在它的基类 `OpenAIServing`（`vllm/entrypoints/openai/engine/serving.py`）。这个基类是所有 OpenAI handler 的共同地基——request_id 解析、模型校验、错误工厂，都在这儿统一：
 
 ```python
-# vllm/entrypoints/openai/engine/serving.py:L372-L405
+# vllm/entrypoints/openai/engine/serving.py:L376-L409
 @staticmethod
 def create_error_response(
     message: str | Exception,
@@ -820,7 +820,7 @@ def _raise_if_error(self, finish_reason: str | None, request_id: str) -> None:
 模型校验也在基类：
 
 ```python
-# vllm/entrypoints/openai/engine/serving.py:L417-L445
+# vllm/entrypoints/openai/engine/serving.py:L421-L449
 async def _check_model(
     self,
     request: AnyRequest,
@@ -843,7 +843,7 @@ async def _check_model(
 
 请求里点名的模型若既不是本服务加载的模型、也不是已注册的 LoRA，就回一个 `404 NotFoundError`。这就是 [§32.4](#324-请求的一生上从-http-到-token) 里 `render_chat_request` 开头那次校验的落点。
 
-> **v0.21.0 更新**：基类统一兜错在 v0.21.0 多了一条专为分离式 prefill 设的补偿路径。在第 7 章那种 P/D 分离架构下，带 `do_remote_prefill` 的请求会让 P 节点先**预占**远端 KV 块；如果这条请求在抵达引擎之前就被拒（`_check_model` 回 `ErrorResponse`、或前置校验抛错），那些块就成了没人认领的孤儿。v0.21.0 把每个 `create_*` 入口拆成两层——公开方法只是 `_with_kv_transfer_rejection_cleanup`（`vllm/entrypoints/openai/engine/serving.py:L623`）包住的薄壳，真身挪进 `_create_chat_completion`（调用点 `chat_completion/serving.py:L237`）。这个包裹器仅在构造期 `self.has_kv_connector` 为真且请求带 `do_remote_prefill` 时生效，用 `try/finally` 在请求未触达引擎时回调 `engine_client.notify_kv_transfer_request_rejected(...)`，通知连接器释放被钉住的远端块。这把"早退即资源泄漏"从隐患变成了显式的补偿回边，正是"基类统一兜错"这条论点在分离架构下的自然延伸。
+> **v0.21.0 更新**：基类统一兜错在 v0.21.0 多了一条专为分离式 prefill 设的补偿路径。在第 7 章那种 P/D 分离架构下，带 `do_remote_prefill` 的请求会让 P 节点先**预占**远端 KV 块；如果这条请求在抵达引擎之前就被拒（`_check_model` 回 `ErrorResponse`、或前置校验抛错），那些块就成了没人认领的孤儿。v0.21.0 把每个 `create_*` 入口拆成两层——公开方法只是 `_with_kv_transfer_rejection_cleanup`（`vllm/entrypoints/openai/engine/serving.py:L661`）包住的薄壳，真身挪进 `_create_chat_completion`（调用点 `chat_completion/serving.py:L237`）。这个包裹器仅在构造期 `self.has_kv_connector` 为真且请求带 `do_remote_prefill` 时生效，用 `try/finally` 在请求未触达引擎时回调 `engine_client.notify_kv_transfer_request_rejected(...)`，通知连接器释放被钉住的远端块。这把"早退即资源泄漏"从隐患变成了显式的补偿回边，正是"基类统一兜错"这条论点在分离架构下的自然延伸。
 
 ---
 

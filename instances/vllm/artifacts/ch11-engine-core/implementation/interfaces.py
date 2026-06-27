@@ -35,7 +35,7 @@ class FinishReason(enum.IntEnum):
         return FINISH_REASON_STRINGS[self.value]
 
 
-# SOURCE: vllm/v1/engine/__init__.py:L237-L250
+# SOURCE: vllm/v1/engine/__init__.py:L243-L256
 class EngineCoreRequestType(enum.Enum):
     """
     Request types defined as hex byte strings, so it can be sent over sockets
@@ -67,7 +67,7 @@ class PauseState(enum.IntEnum):
     PAUSED_ALL = 2
 
 
-# SOURCE: vllm/v1/request.py:L310-L323
+# SOURCE: vllm/v1/request.py:L316-L329
 class RequestStatus(enum.IntEnum):
     # SUBTRACTED: 其余状态枚举值（WAITING/RUNNING/FINISHED_STOPPED 等）——
     #             本章只用到 FINISHED_ABORTED（abort/pause 落地）。
@@ -82,40 +82,40 @@ class UtilityResult:
     result: Any = None
 
 
-# SOURCE: vllm/v1/engine/__init__.py:L161-L191
+# SOURCE: vllm/v1/engine/__init__.py:L167-L197
 @dataclass
 class EngineCoreOutput:
-    # SOURCE: vllm/v1/engine/__init__.py:L161-L191
+    # SOURCE: vllm/v1/engine/__init__.py:L167-L197
     request_id: str
     new_token_ids: list[int]
     # SUBTRACTED: new_logprobs / pooling_output / stop_reason / events /
     #             kv_transfer_params / trace_headers / prefill_stats / routed_experts /
-    #             num_nans_in_logits（vllm/v1/engine/__init__.py:L170-L187）——
+    #             num_nans_in_logits（vllm/v1/engine/__init__.py:L176-L193）——
     #             logprobs/pooling/观测字段属其它章节，不参与 step 编排。
     finish_reason: FinishReason | None = None
 
     @property
-    def finished(self) -> bool:  # SOURCE: vllm/v1/engine/__init__.py:L189-L191
+    def finished(self) -> bool:  # SOURCE: vllm/v1/engine/__init__.py:L195-L197
         return self.finish_reason is not None
 
 
-# SOURCE: vllm/v1/engine/__init__.py:L194-L203
+# SOURCE: vllm/v1/engine/__init__.py:L200-L209
 @dataclass
 class UtilityOutput:
-    # SOURCE: vllm/v1/engine/__init__.py:L194-L203
+    # SOURCE: vllm/v1/engine/__init__.py:L200-L209
     call_id: int
     # Non-None implies the call failed, result should be None.
     failure_message: str | None = None
     result: UtilityResult | None = None
 
 
-# SOURCE: vllm/v1/engine/__init__.py:L206-L220
+# SOURCE: vllm/v1/engine/__init__.py:L212-L226
 @dataclass
 class EngineCoreOutputs:
-    # SOURCE: vllm/v1/engine/__init__.py:L206-L220
+    # SOURCE: vllm/v1/engine/__init__.py:L212-L226
     engine_index: int = 0
     # [num_reqs]
     outputs: list = field(default_factory=list)
-    # SUBTRACTED: scheduler_stats / timestamp（vllm/v1/engine/__init__.py:L219-L220）。
+    # SUBTRACTED: scheduler_stats / timestamp（vllm/v1/engine/__init__.py:L225-L226）。
     finished_requests: Any = None
     utility_output: UtilityOutput | None = None

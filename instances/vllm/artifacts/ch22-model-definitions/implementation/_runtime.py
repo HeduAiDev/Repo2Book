@@ -82,12 +82,12 @@ def set_weight_attrs(weight: torch.Tensor, weight_attrs: dict | None) -> None:
 # ----------------------------------------------------------------------------
 
 
-# SOURCE: vllm/model_executor/layers/layernorm.py:103 (class RMSNorm)
+# SOURCE: vllm/model_executor/layers/layernorm.py:38 (class RMSNorm)
 class RMSNorm(nn.Module):
     # SUBTRACTED: 真实 RMSNorm 是 CustomOp，forward 经平台分派到 fused CUDA kernel；
     # 精简版只保留其 forward_static 的 native 数学（含 (hidden, residual) 双参 fuse）。
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
-        # SOURCE: vllm/model_executor/layers/layernorm.py:112 (RMSNorm.__init__)
+        # SOURCE: vllm/model_executor/layers/layernorm.py:47 (RMSNorm.__init__)
         super().__init__()
         self.hidden_size = hidden_size
         self.variance_epsilon = eps
@@ -120,7 +120,7 @@ class RMSNorm(nn.Module):
         return x, residual
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None):
-        # SOURCE: vllm/model_executor/layers/layernorm.py:233 (RMSNorm.forward_native)
+        # SOURCE: vllm/model_executor/layers/layernorm.py:82 (RMSNorm.forward_native)
         return self.forward_static(
             x, self.variance_epsilon, self.hidden_size, x.dtype, self.weight.data, residual
         )
@@ -366,7 +366,7 @@ class Attention(nn.Module):
 # ----------------------------------------------------------------------------
 
 
-# SOURCE: vllm/model_executor/model_loader/weight_utils.py:1361 (default_weight_loader)
+# SOURCE: vllm/model_executor/model_loader/weight_utils.py:1399 (default_weight_loader)
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
     if param.numel() == 1 and loaded_weight.numel() == 1:
@@ -533,11 +533,11 @@ def load_model(model_class, vllm_config: VllmConfig, weights, prefix: str = "") 
     """三段式装载编排：initialize_model → load_weights → process_weights_after_loading → eval。
 
     对应 vllm/model_executor/model_loader/base_loader.py:43 (BaseModelLoader.load_model) 与
-    vllm/model_executor/model_loader/default_loader.py:376 (DefaultModelLoader.load_weights)。
+    vllm/model_executor/model_loader/default_loader.py:382 (DefaultModelLoader.load_weights)。
     """
     # SOURCE: vllm/model_executor/model_loader/base_loader.py:43 (BaseModelLoader.load_model)
     model = initialize_model(vllm_config, prefix=prefix, model_class=model_class)
-    # SOURCE: vllm/model_executor/model_loader/default_loader.py:376 (DefaultModelLoader.load_weights)
+    # SOURCE: vllm/model_executor/model_loader/default_loader.py:382 (DefaultModelLoader.load_weights)
     model.load_weights(weights)
     process_weights_after_loading(model, vllm_config)
     return model.eval()

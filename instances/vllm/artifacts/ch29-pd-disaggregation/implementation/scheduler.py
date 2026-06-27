@@ -43,7 +43,7 @@ class Scheduler:
         # Create KVConnector for the Scheduler. Note that each Worker
         # will have a corresponding KVConnector with Role=WORKER.
         # KV Connector pushes/pull of remote KVs for P/D and offloading.
-        # SOURCE: vllm/v1/core/sched/scheduler.py:L118
+        # SOURCE: vllm/v1/core/sched/scheduler.py:L113
         self.connector: KVConnectorBase_V1 | None = None
         if self.vllm_config.kv_transfer_config is not None:
             self.connector = KVConnectorFactory.create_connector(
@@ -59,14 +59,14 @@ class Scheduler:
         self.requests: dict[str, Request] = {}
 
         # Priority queues for requests.
-        # SOURCE: vllm/v1/core/sched/scheduler.py:L167
+        # SOURCE: vllm/v1/core/sched/scheduler.py:L162
         self.waiting = create_request_queue(self.policy)
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
 
         # KV Connector: requests in process of async KV loading or recving
-        # SOURCE: vllm/v1/core/sched/scheduler.py:L183
+        # SOURCE: vllm/v1/core/sched/scheduler.py:L178
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
 
@@ -79,10 +79,10 @@ class Scheduler:
         scheduled_resumed_reqs: list[Request] = []
 
         # Next, schedule the WAITING requests.
-        # SOURCE: vllm/v1/core/sched/scheduler.py:L568
+        # SOURCE: vllm/v1/core/sched/scheduler.py:L526
         step_skipped_waiting = create_request_queue(self.policy)
 
-        # SOURCE: vllm/v1/core/sched/scheduler.py:L571
+        # SOURCE: vllm/v1/core/sched/scheduler.py:L529
         while self.waiting or self.skipped_waiting:
             request_queue = self._select_waiting_queue_for_scheduling()
             assert request_queue is not None
@@ -91,7 +91,7 @@ class Scheduler:
             request_id = request.request_id
 
             # try to promote blocked statuses while traversing skipped queue.
-            # SOURCE: vllm/v1/core/sched/scheduler.py:L581
+            # SOURCE: vllm/v1/core/sched/scheduler.py:L539
             if self._is_blocked_waiting_status(
                 request.status
             ) and not self._try_promote_blocked_waiting_request(request):
@@ -108,7 +108,7 @@ class Scheduler:
             load_kv_async = False
 
             # Get already-cached tokens.
-            # SOURCE: vllm/v1/core/sched/scheduler.py:L614
+            # SOURCE: vllm/v1/core/sched/scheduler.py:L572
             if request.num_computed_tokens == 0:
                 # Get locally-cached tokens.
                 new_computed_blocks, num_new_local_computed_tokens = (
@@ -143,12 +143,12 @@ class Scheduler:
             else:
                 # KVTransfer: WAITING reqs have num_computed_tokens > 0
                 # after async KV recvs are completed.
-                # SOURCE: vllm/v1/core/sched/scheduler.py:L657
+                # SOURCE: vllm/v1/core/sched/scheduler.py:L615
                 new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                 num_new_local_computed_tokens = 0
                 num_computed_tokens = request.num_computed_tokens
 
-            # SOURCE: vllm/v1/core/sched/scheduler.py:L668
+            # SOURCE: vllm/v1/core/sched/scheduler.py:L626
             if load_kv_async:
                 # KVTransfer: loading remote KV, do not allocate for new work.
                 assert num_external_computed_tokens > 0
@@ -166,12 +166,12 @@ class Scheduler:
 
             # Handles an edge case when P/D Disaggregation
             # is used with Spec Decoding where an extra block gets allocated.
-            # SOURCE: vllm/v1/core/sched/scheduler.py:L728
+            # SOURCE: vllm/v1/core/sched/scheduler.py:L686
             effective_lookahead_tokens = (
                 0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
             )
 
-            # SOURCE: vllm/v1/core/sched/scheduler.py:L744
+            # SOURCE: vllm/v1/core/sched/scheduler.py:L702
             new_blocks = self.kv_cache_manager.allocate_slots(
                 request,
                 num_new_tokens,
@@ -188,7 +188,7 @@ class Scheduler:
 
             # KVTransfer: the connector uses this info to determine
             # if a load is needed.
-            # SOURCE: vllm/v1/core/sched/scheduler.py:L769
+            # SOURCE: vllm/v1/core/sched/scheduler.py:L727
             if self.connector is not None:
                 self.connector.update_state_after_alloc(
                     request,
@@ -197,7 +197,7 @@ class Scheduler:
                 )
                 # SUBTRACTED: connector_prefix_cache_stats.record（原 L775-783），指标。
 
-            # SOURCE: vllm/v1/core/sched/scheduler.py:L785
+            # SOURCE: vllm/v1/core/sched/scheduler.py:L743
             request = request_queue.pop_request()
             if load_kv_async:
                 # If loading async, allocate memory and put request
@@ -226,7 +226,7 @@ class Scheduler:
             # 都是正常调度记账，非 KV 主线（原 L808-842）。
 
         # re-queue requests skipped in this pass ahead of older skipped items.
-        # SOURCE: vllm/v1/core/sched/scheduler.py:L844
+        # SOURCE: vllm/v1/core/sched/scheduler.py:L802
         if step_skipped_waiting:
             self.skipped_waiting.prepend_requests(step_skipped_waiting)
 
@@ -239,21 +239,21 @@ class Scheduler:
         # 1. Plan the KV cache store
         # 2. Wrap up all the KV cache load / save ops into an opaque object
         # 3. Clear the internal states of the connector
-        # SOURCE: vllm/v1/core/sched/scheduler.py:L928
+        # SOURCE: vllm/v1/core/sched/scheduler.py:L886
         if self.connector is not None:
             meta = self._build_kv_connector_meta(self.connector, scheduler_output)
             scheduler_output.kv_connector_metadata = meta
 
         return scheduler_output
 
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L947
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L905
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: "SchedulerOutput"
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
 
     @staticmethod
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L1553
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L1515
     def _is_blocked_waiting_status(status: RequestStatus) -> bool:
         return status in (
             RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
@@ -261,7 +261,7 @@ class Scheduler:
             RequestStatus.WAITING_FOR_STREAMING_REQ,
         )
 
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L1567
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L1529
     def _select_waiting_queue_for_scheduling(self):
         if self.policy == SchedulingPolicy.FCFS:
             return self.skipped_waiting or self.waiting or None
@@ -278,7 +278,7 @@ class Scheduler:
     # KV Connector Related Methods
     ########################################################################
 
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L1996
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L1933
     def _connector_finished(
         self, request: Request
     ) -> tuple[bool, dict[str, Any] | None]:
@@ -304,7 +304,7 @@ class Scheduler:
         # 与 PD 分离正交；精简版只走单 group 的 request_finished（原 L2017-2025）。
         return self.connector.request_finished(request, block_ids[0])
 
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L2027
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L1964
     def _update_waiting_for_remote_kv(self, request: Request) -> None:
         """
         KV Connector: update request state after async recv is finished.
@@ -337,7 +337,7 @@ class Scheduler:
 
         self.finished_recving_kv_req_ids.remove(request.request_id)
 
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L2061
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L1998
     def _try_promote_blocked_waiting_request(self, request: Request) -> bool:
         """
         Try to promote a blocked waiting request back to schedulable states.
@@ -362,7 +362,7 @@ class Scheduler:
             f"{request.status} for request {request.request_id}"
         )
 
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L2094
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L2031
     def _update_from_kv_xfer_finished(self, kv_connector_output: "KVConnectorOutput"):
         """
         KV Connector: update the scheduler state based on the output.

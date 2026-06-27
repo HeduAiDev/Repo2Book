@@ -38,21 +38,21 @@ class CachedRequestState:
     #   lora_request / prompt_embeds / prompt_is_token_ids / prev_num_draft_len /
     #   pooling_params / pooling_states fields. Approved deletions (multimodal,
     #   M-RoPE/XD-RoPE, LoRA, prompt_embeds, async spec decode, pooling).
-    #   Orig: vllm/v1/worker/gpu_input_batch.py:L37-L62
+    #   Orig: vllm/v1/worker/gpu_input_batch.py:L37-L64
 
     def __post_init__(self):
-        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L64
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L66
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             self.prompt_token_ids, None
         )
 
-    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L72  num_tokens
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L74  num_tokens
     @property
     def num_tokens(self) -> int:
-        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L72
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L74
         return self.num_prompt_tokens + len(self.output_token_ids)
 
-    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L76  get_token_id
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L78  get_token_id
     def get_token_id(self, idx: int) -> int:
         if idx < self.num_prompt_tokens:
             if self.prompt_token_ids is None:
@@ -66,7 +66,7 @@ class CachedRequestState:
         return -1
 
 
-# SOURCE: vllm/v1/worker/gpu_input_batch.py:L89  InputBatch
+# SOURCE: vllm/v1/worker/gpu_input_batch.py:L91  InputBatch
 class InputBatch:
     def __init__(
         self,
@@ -80,10 +80,10 @@ class InputBatch:
         kernel_block_sizes: list[int],
         max_num_blocks_per_req: list[int] | None = None,
     ):
-        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L90
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L92
         # SUBTRACTED: thinking_budget_state_holder / is_pooling_model / num_spec_tokens
         #   / reasoning_config / logitsprocs init args. Approved deletions.
-        #   Orig: vllm/v1/worker/gpu_input_batch.py:L101-L116
+        #   Orig: vllm/v1/worker/gpu_input_batch.py:L103-L118
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
         self.max_num_batched_tokens = max_num_batched_tokens
@@ -103,7 +103,7 @@ class InputBatch:
         )
         self.token_ids_cpu = self.token_ids_cpu_tensor.numpy()
         # SUBTRACTED: is_token_ids / req_prompt_embeds (prompt_embeds mixed-mode).
-        #   Orig: vllm/v1/worker/gpu_input_batch.py:L138-L145
+        #   Orig: vllm/v1/worker/gpu_input_batch.py:L140-L147
         self.num_tokens_no_spec_cpu_tensor = torch.zeros(
             (max_num_reqs,), device="cpu", dtype=torch.int32, pin_memory=pin_memory
         )
@@ -174,7 +174,7 @@ class InputBatch:
         self.num_accepted_tokens_cpu = self.num_accepted_tokens_cpu_tensor.numpy()
 
         # SUBTRACTED: LoRA mapping dicts (request_lora_mapping / lora_id_to_*).
-        #   Approved LoRA deletion. Orig: vllm/v1/worker/gpu_input_batch.py:L242-L245
+        #   Approved LoRA deletion. Orig: vllm/v1/worker/gpu_input_batch.py:L244-L247
 
         # req_index -> generator
         self.generators: dict[int, torch.Generator] = {}
@@ -206,13 +206,13 @@ class InputBatch:
         self.prev_sampled_token_ids: torch.Tensor | None = None
         self.prev_req_id_to_index: dict[str, int] | None = None
 
-    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L304  req_ids
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L303  req_ids
     @property
     def req_ids(self) -> list[str]:
-        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L304
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L303
         return self._req_ids  # type: ignore[return-value]
 
-    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L310  _register_add_request
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L309  _register_add_request
     def _register_add_request(self, request: "CachedRequestState") -> int:
         """Track add-request operations for logits processors."""
         # Fill the next empty index if there is one.
@@ -234,7 +234,7 @@ class InputBatch:
 
         return new_req_index
 
-    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L336  add_request
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L335  add_request
     def add_request(self, request: "CachedRequestState") -> int:
         req_index = self._register_add_request(request)
 
@@ -260,7 +260,7 @@ class InputBatch:
         if request.prompt_token_ids is not None:
             self.token_ids_cpu[req_index, :num_prompt_tokens] = request.prompt_token_ids
         # SUBTRACTED: is_token_ids / req_prompt_embeds writes (prompt_embeds).
-        #   Orig: vllm/v1/worker/gpu_input_batch.py:L363-L372
+        #   Orig: vllm/v1/worker/gpu_input_batch.py:L362-L371
         self.token_ids_cpu[req_index, start_idx:end_idx] = request.output_token_ids
         # Number of tokens without spec decode tokens.
         self.num_tokens_no_spec[req_index] = request.num_tokens
@@ -331,14 +331,14 @@ class InputBatch:
             self.bad_words_token_ids[req_index] = sampling_params.bad_words_token_ids
 
         # SUBTRACTED: pooling_params branch + lora_request mapping. Approved
-        #   pooling/LoRA deletions. Orig: vllm/v1/worker/gpu_input_batch.py:L454-L481
+        #   pooling/LoRA deletions. Orig: vllm/v1/worker/gpu_input_batch.py:L453-L480
 
         # Speculative decoding: by default 1 token is generated.
         self.num_accepted_tokens_cpu[req_index] = 1
 
         return req_index
 
-    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L484  update_req_spec_token_ids
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L483  update_req_spec_token_ids
     def update_req_spec_token_ids(
         self, request: CachedRequestState, scheduled_spec_tokens: dict[str, list[int]]
     ) -> None:
@@ -390,10 +390,10 @@ class InputBatch:
             self.allowed_token_ids_mask_cpu_tensor[req_index].fill_(False)
         self.bad_words_token_ids.pop(req_index, None)
         # SUBTRACTED: thinking_token_budget_reqs.discard (thinking budget feature).
-        #   Orig: vllm/v1/worker/gpu_input_batch.py:L564
+        #   Orig: vllm/v1/worker/gpu_input_batch.py:L563
         return req_index
 
-    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L567  swap_states
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L566  swap_states
     def swap_states(self, i1: int, i2: int) -> None:
         old_id_i1 = self._req_ids[i1]
         old_id_i2 = self._req_ids[i2]
@@ -437,12 +437,12 @@ class InputBatch:
         self.token_ids_cpu[i2, :max_active_token_count] = tmp_token_ids
 
         # SUBTRACTED: is_token_ids / req_prompt_embeds swap (prompt_embeds).
-        #   Orig: vllm/v1/worker/gpu_input_batch.py:L613-L627
+        #   Orig: vllm/v1/worker/gpu_input_batch.py:L612-L626
 
         self.block_table.swap_row(i1, i2)
 
         # SUBTRACTED: request_lora_mapping swap + pooling early-return. Approved.
-        #   Orig: vllm/v1/worker/gpu_input_batch.py:L631-L638
+        #   Orig: vllm/v1/worker/gpu_input_batch.py:L630-L637
 
         self.batch_update_builder.moved.append((i1, i2, MoveDirectionality.SWAP))
 
@@ -471,15 +471,15 @@ class InputBatch:
 
         # SUBTRACTED: generators / bad_words / allowed_token_ids_mask swap and
         #   LoRA mapping swap — symmetric sampler-state moves off the ch18 spine.
-        #   Orig: vllm/v1/worker/gpu_input_batch.py:L667-L677
+        #   Orig: vllm/v1/worker/gpu_input_batch.py:L666-L676
 
-    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L679  _get_active_token_count
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L678  _get_active_token_count
     def _get_active_token_count(self, req_index: int) -> int:
         return int(self.num_tokens_no_spec[req_index]) + len(
             self.spec_token_ids[req_index]
         )
 
-    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L684  condense
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L683  condense
     def condense(self) -> None:
         """Slide non-empty requests down into lower, empty indices.
 
@@ -536,7 +536,7 @@ class InputBatch:
                 last_req_index, :num_tokens
             ]
             # SUBTRACTED: is_token_ids / req_prompt_embeds move (prompt_embeds).
-            #   Orig: vllm/v1/worker/gpu_input_batch.py:L744-L750
+            #   Orig: vllm/v1/worker/gpu_input_batch.py:L743-L749
             self.num_tokens_no_spec[empty_index] = self.num_tokens_no_spec[
                 last_req_index
             ]
@@ -547,7 +547,7 @@ class InputBatch:
             self.block_table.move_row(last_req_index, empty_index)
 
             # SUBTRACTED: request_lora_mapping move + pooling early-continue.
-            #   Orig: vllm/v1/worker/gpu_input_batch.py:L760-L767
+            #   Orig: vllm/v1/worker/gpu_input_batch.py:L759-L766
 
             self.batch_update_builder.moved.append(
                 (last_req_index, empty_index, MoveDirectionality.UNIDIRECTIONAL)
@@ -589,39 +589,39 @@ class InputBatch:
         del self.req_output_token_ids[num_reqs:]
         del self.spec_token_ids[num_reqs:]
 
-    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L812  refresh_metadata
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L811  refresh_metadata
     def refresh_metadata(self):
         """Apply any batch updates to sampling metadata."""
         # SUBTRACTED: is_pooling_model branch + logitsprocs.update_state loop +
         #   thinking_budget sync. Approved pooling / logits-processor deletions.
-        #   Orig: vllm/v1/worker/gpu_input_batch.py:L815-L828
+        #   Orig: vllm/v1/worker/gpu_input_batch.py:L814-L827
         batch_update = self.batch_update_builder.get_and_reset(self.num_reqs)
         # Update sampling metadata if batch state is changed.
         if batch_update:
             self.sampling_metadata = self._make_sampling_metadata()
 
-    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L832  _make_sampling_metadata
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L831  _make_sampling_metadata
     def _make_sampling_metadata(self):
         # SUBTRACTED: full SamplingMetadata assembly (temperature/top_p/top_k/
         #   penalties GPU copies, prompt/output token id tensors, logitsprocs,
         #   allowed_token_ids mask, thinking budget). The sampler & its metadata
         #   belong to the sampling chapter; ch18 only needs the snapshot to be
         #   rebuilt when the batch changes.
-        #   Orig: vllm/v1/worker/gpu_input_batch.py:L833-L935
+        #   Orig: vllm/v1/worker/gpu_input_batch.py:L832-L934
         return {
             "num_reqs": self.num_reqs,
             "all_greedy": self.all_greedy,
             "req_ids": list(self.req_ids),
         }
 
-    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1082  num_reqs
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1081  num_reqs
     @property
     def num_reqs(self) -> int:
-        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1082
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1081
         return len(self.req_id_to_index)
 
-    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1086  all_greedy
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1085  all_greedy
     @property
     def all_greedy(self) -> bool:
-        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1086
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1085
         return len(self.random_reqs) == 0

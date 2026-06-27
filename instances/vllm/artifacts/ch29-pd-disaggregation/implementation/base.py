@@ -103,7 +103,7 @@ class KVConnectorBase_V1(ABC):
         # 仅是提示，不影响契约（原 L189-206）。
 
     @property
-    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L209
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L202
     def role(self) -> KVConnectorRole:
         return self._role
 
@@ -111,7 +111,7 @@ class KVConnectorBase_V1(ABC):
     # Worker-side methods
     # ==============================
 
-    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L217
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L210
     def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
         """Set the connector metadata from the scheduler.
 
@@ -121,12 +121,12 @@ class KVConnectorBase_V1(ABC):
         """
         self._connector_metadata = connector_metadata
 
-    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L229
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L222
     def clear_connector_metadata(self) -> None:
         """Clear the connector metadata after model execution."""
         self._connector_metadata = None
 
-    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L237
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L230
     def _get_connector_metadata(self) -> KVConnectorMetadata:
         """Get the connector metadata. Should only be called inside the connector."""
         # Should only be called while set to valid metadata.
@@ -138,7 +138,7 @@ class KVConnectorBase_V1(ABC):
     # 的可选钩子，基类均为 no-op 默认，本章 role-split 骨架不展开（原 L257-296）。
 
     @abstractmethod
-    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L298
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L291
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """
         Start loading the KV cache from the connector to vLLM's paged
@@ -148,7 +148,7 @@ class KVConnectorBase_V1(ABC):
         pass
 
     @abstractmethod
-    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L316
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L309
     def wait_for_layer_load(self, layer_name: str) -> None:
         """
         Block until the KV for a specific layer is loaded into vLLM's
@@ -158,7 +158,7 @@ class KVConnectorBase_V1(ABC):
         pass
 
     @abstractmethod
-    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L330
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L323
     def save_kv_layer(
         self,
         layer_name: str,
@@ -174,7 +174,7 @@ class KVConnectorBase_V1(ABC):
         pass
 
     @abstractmethod
-    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L352
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L345
     def wait_for_save(self):
         """
         Block until all the save operations is done. This is called
@@ -185,7 +185,7 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
-    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L363
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L356
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
@@ -210,7 +210,7 @@ class KVConnectorBase_V1(ABC):
     # ==============================
 
     @abstractmethod
-    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L449
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L442
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -236,7 +236,7 @@ class KVConnectorBase_V1(ABC):
         pass
 
     @abstractmethod
-    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L484
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L477
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
@@ -252,7 +252,7 @@ class KVConnectorBase_V1(ABC):
         pass
 
     @abstractmethod
-    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L505
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L498
     def build_connector_meta(
         self, scheduler_output: "SchedulerOutput"
     ) -> KVConnectorMetadata:
@@ -264,14 +264,14 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
-    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L520
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L513
     def update_connector_output(self, connector_output: "KVConnectorOutput"):
         """
         Update KVConnector state from worker-side connectors output.
         """
         return
 
-    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L530
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L523
     def request_finished(
         self,
         request: "Request",

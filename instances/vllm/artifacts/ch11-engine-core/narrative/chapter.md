@@ -37,7 +37,7 @@
 来看 `step()` 的真身：
 
 ```python
-# vllm/v1/engine/core.py:L402
+# vllm/v1/engine/core.py:L406
 def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
     """Schedule, execute, and make output.
 
@@ -99,7 +99,7 @@ def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
 vLLM 的选择是把采样从前向里拆出来：
 
 ```python
-# vllm/v1/engine/core.py:L414
+# vllm/v1/engine/core.py:L418
 future = self.model_executor.execute_model(scheduler_output, non_block=True)
 grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
 # … 省略：log 上下文 …
@@ -167,7 +167,7 @@ def test_step_skips_sample_when_executor_returns_output():
 vLLM 的处理是：执行期间到达的 abort 不立刻落地，而是先塞进一个独立的 `aborts_queue`，等前向回来、**在出输出之前**统一处理：
 
 ```python
-# vllm/v1/engine/core.py:L424（step 尾段）
+# vllm/v1/engine/core.py:L428（step 尾段）
 # Before processing the model output, process any aborts that happened
 # during the model execution.
 self._process_aborts_queue()
@@ -179,7 +179,7 @@ engine_core_outputs = self.scheduler.update_from_output(
 `_process_aborts_queue` 把队里攒下的中止请求**一次性批量**交给调度器：
 
 ```python
-# vllm/v1/engine/core.py:L561
+# vllm/v1/engine/core.py:L565
 def _process_aborts_queue(self):
     if not self.aborts_queue.empty():
         request_ids = []
@@ -239,7 +239,7 @@ def test_aborts_queue_batched_into_single_finish():
 它短得惊人：
 
 ```python
-# vllm/v1/engine/core.py:L1164
+# vllm/v1/engine/core.py:L1168
 def run_busy_loop(self):
     """Core busy loop of the EngineCore."""
     while self._handle_shutdown():
@@ -258,7 +258,7 @@ def run_busy_loop(self):
 `_process_input_queue` 干两件事：有活时把 `input_queue` 里的请求 dispatch 掉、然后退出去让引擎跑一拍；没活时**阻塞**在队列上，不空转烧 CPU。
 
 ```python
-# vllm/v1/engine/core.py:L1174
+# vllm/v1/engine/core.py:L1178
 def _process_input_queue(self):
     """Exits when an engine step needs to be performed."""
 
@@ -290,7 +290,7 @@ def _process_input_queue(self):
 读懂它的关键是那个 `while not self.has_work()`：**只有在没活可干时才进这个循环**。`has_work()` 是引擎「该不该敲一拍」的总判据：
 
 ```python
-# vllm/v1/engine/core.py:L1152
+# vllm/v1/engine/core.py:L1156
 def has_work(self) -> bool:
     """Returns true if the engine should be stepped."""
     return (
@@ -316,7 +316,7 @@ def has_work(self) -> bool:
 `_process_engine_step` 调 `step_fn()`、把产出塞进 `output_queue`、跑 post-step 钩子：
 
 ```python
-# vllm/v1/engine/core.py:L1205
+# vllm/v1/engine/core.py:L1209
 def _process_engine_step(self) -> bool:
     """Called only when there are unfinished local requests."""
 
@@ -380,7 +380,7 @@ def test_busy_loop_runs_step_then_exits_on_shutdown():
 `_process_input_queue` 取出的每个请求都交给 `_handle_client_request`，由它按类型分派。请求的类型用第 7 章那套[字节标签协议](../ch07-engine-core/narrative/chapter.md)（byte-tag protocol）标着——`ADD`、`ABORT`、`UTILITY` 等，各是一个单字节：
 
 ```python
-# vllm/v1/engine/core.py:L1266
+# vllm/v1/engine/core.py:L1270
 def _handle_client_request(
     self, request_type: EngineCoreRequestType, request: Any
 ) -> None:
@@ -447,7 +447,7 @@ def test_utility_method_invoked_and_enqueued():
 vLLM 的解法分两半。信号处理器只做两件最小的事：把状态标记为「请求关停」，再往队列里投一个 `WAKEUP` 哨兵：
 
 ```python
-# vllm/v1/engine/core.py:L1114（run_engine_core 内）
+# vllm/v1/engine/core.py:L1118（run_engine_core 内）
 def wakeup_engine():
     # Wakes up idle engine via input_queue when shutdown is requested
     # Not safe in a signal handler - we may interrupt the main thread
@@ -466,7 +466,7 @@ def signal_handler(signum, frame):
 `_handle_shutdown` 是一个三态状态机，它既是 while 的闸门，也是排空逻辑的所在：
 
 ```python
-# vllm/v1/engine/core.py:L1230
+# vllm/v1/engine/core.py:L1234
 def _handle_shutdown(self) -> bool:
     # Check if shutdown was requested and handle it
     if self.shutdown_state == EngineShutdownState.RUNNING:
@@ -540,7 +540,7 @@ def test_handle_shutdown_three_states():
 `pause_scheduler` 有三种模式，对应三种「停」的语义：
 
 ```python
-# vllm/v1/engine/core.py:L634（in-proc 版）
+# vllm/v1/engine/core.py:L638（in-proc 版）
 def pause_scheduler(
     self, mode: PauseMode = "abort", clear_cache: bool = True
 ) -> Future | None:
@@ -586,7 +586,7 @@ def pause_scheduler(
 因为多进程下，「中止」这件事不是设个状态就完。被 abort 的请求，它们的 abort 输出得**真的经 `output_queue` 发回客户端**、在途请求得**真的排空**，之后清缓存才安全。这是个要等的异步过程。多进程版于是这样写：
 
 ```python
-# vllm/v1/engine/core.py:L1542（EngineCoreProc 覆写版，节选）
+# vllm/v1/engine/core.py:L1546（EngineCoreProc 覆写版，节选）
 def engine_idle_callback(engine: "EngineCoreProc", future: Future[Any]) -> None:
     if clear_cache:
         engine._reset_caches()
@@ -635,7 +635,7 @@ def test_proc_pause_returns_future_when_work_pending():
 pause 只是停调度，显存一点没动。要真把 GPU 显存让出来，得 `sleep`。它分三级：
 
 ```python
-# vllm/v1/engine/core.py:L673
+# vllm/v1/engine/core.py:L677
 def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None | Future:
     """Put the engine to sleep at the specified level.
         - Level 0: Pause scheduling only. No GPU memory changes.
@@ -678,7 +678,7 @@ def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None | Future:
 `wake_up` 是逆操作，把 executor 唤醒、再 resume 调度：
 
 ```python
-# vllm/v1/engine/core.py:L709
+# vllm/v1/engine/core.py:L713
 def wake_up(self, tags: list[str] | None = None):
     """Wake up the engine from sleep."""
     if tags is not None and "scheduling" in tags:
@@ -696,7 +696,7 @@ def wake_up(self, tags: list[str] | None = None):
 `is_sleeping` 把两层状态合一——只要调度器在暂停态、**或** executor 在睡，就算在睡：
 
 ```python
-# vllm/v1/engine/core.py:L727
+# vllm/v1/engine/core.py:L731
 def is_sleeping(self) -> bool:
     """Check if engine is sleeping at any level."""
     return self.is_scheduler_paused() or self.model_executor.is_sleeping
@@ -762,7 +762,7 @@ $$
 `batch_queue_size>1` 让同时有至多 `batch_queue_size` 个批分布在不同 stage 上，各 stage 都有活干，理论吞吐上限趋近 P 倍（实际受队列深度与调度/采样依赖封顶）。它的关键一手是：调度到新批、且队列没满、且队尾那个批还没算完时，**直接返回 `(None, True)`**，让忙循环立刻转下一圈再去调度一个批，而不是傻等当前批：
 
 ```python
-# vllm/v1/engine/core.py:L498（step_with_batch_queue 上半段节选）
+# vllm/v1/engine/core.py:L502（step_with_batch_queue 上半段节选）
 if not deferred_scheduler_output:
     # Add this step's future to the queue.
     batch_queue.appendleft((future, scheduler_output, exec_future))
@@ -861,7 +861,7 @@ def test_inproc_client_get_output_steps_engine():
 
 ## 小结：一台节拍器
 
-回到开头那个比喻。本章这台节拍器的全部源码就在 `vllm/v1/engine/core.py` 一个文件里——`EngineCore` 是节拍器本体，`run_busy_loop`（`vllm/v1/engine/core.py:L1164`）是带动它的发条，`step()`（`vllm/v1/engine/core.py:L402`）是每一拍：
+回到开头那个比喻。本章这台节拍器的全部源码就在 `vllm/v1/engine/core.py` 一个文件里——`EngineCore` 是节拍器本体，`run_busy_loop`（`vllm/v1/engine/core.py:L1168`）是带动它的发条，`step()`（`vllm/v1/engine/core.py:L406`）是每一拍：
 
 - **一拍（`step`）** 做七件事：守门 → 调度 → 异步发起前向 → **趁前向在跑算语法掩码** → 等前向 → 用掩码采样 → 落地执行期 abort 后出输出。最精巧的是那个重叠——CPU 算掩码藏进 GPU 前向的影子里，`non_block=True` 是它的开关。
 - **发条（`run_busy_loop`）** 每圈两步：从 `input_queue` 收请求（没活就阻塞睡，零 CPU），敲一拍把输出塞 `output_queue`。靠一对内存队列和第 7 章那两个 IO 线程解耦，互不阻塞。

@@ -18,9 +18,9 @@ from .types import (
 )
 
 
-# SOURCE: vllm/v1/engine/output_processor.py:L128 class RequestState（本章只保留归并相关）
+# SOURCE: vllm/v1/engine/output_processor.py:L131 class RequestState（本章只保留归并相关）
 class RequestState:
-    # SOURCE: vllm/v1/engine/output_processor.py:L130 def __init__
+    # SOURCE: vllm/v1/engine/output_processor.py:L133 def __init__
     def __init__(
         self,
         request_id: str,
@@ -35,7 +35,7 @@ class RequestState:
         self.request_index = request_index
         self.queue = queue
         # SUBTRACTED: detokenizer/logprobs_processor/stats/lora_name/prompt 等真实字段
-        #            （vllm/v1/engine/output_processor.py:L130-L160）——属 ch08 输出处理，
+        #            （vllm/v1/engine/output_processor.py:L133-L163）——属 ch08 输出处理，
         #            本章只需 parent_req/request_index/external_req_id/queue。
 
     @classmethod
@@ -46,9 +46,9 @@ class RequestState:
         request_index: int,
         queue: RequestOutputCollector | None,
     ) -> "RequestState":
-        # SOURCE: vllm/v1/engine/output_processor.py:L243 @classmethod def from_new_request
+        # SOURCE: vllm/v1/engine/output_processor.py:L246 @classmethod def from_new_request
         assert request.external_req_id is not None
-        # SUBTRACTED: tokenizer/detokenizer/logprobs/stats 构造（vllm/v1/engine/output_processor.py:L243-L290）
+        # SUBTRACTED: tokenizer/detokenizer/logprobs/stats 构造（vllm/v1/engine/output_processor.py:L246-L293）
         return cls(
             request_id=request.request_id,
             external_req_id=request.external_req_id,
@@ -77,7 +77,7 @@ class RequestState:
             external_req_id = self.parent_req.external_req_id
 
         # SUBTRACTED: _new_request_output 的 prompt/kv_transfer_params 组装
-        #            （vllm/v1/engine/output_processor.py:L332-L365）——只保留 request_id 改回
+        #            （vllm/v1/engine/output_processor.py:L355-L389）——只保留 request_id 改回
         #            external_req_id 这一关键不变量。
         return RequestOutput(
             request_id=external_req_id,  # request_id is what was provided externally
@@ -86,17 +86,17 @@ class RequestState:
         )
 
 
-# SOURCE: vllm/v1/engine/output_processor.py:L415 class OutputProcessor
+# SOURCE: vllm/v1/engine/output_processor.py:L440 class OutputProcessor
 class OutputProcessor:
-    # SOURCE: vllm/v1/engine/output_processor.py:L416 def __init__
+    # SOURCE: vllm/v1/engine/output_processor.py:L441 def __init__
     def __init__(self) -> None:
         # SUBTRACTED: log_stats/tokenizer/stream_interval/lora_states/tracing_enabled
-        #            （vllm/v1/engine/output_processor.py:L424-L431）——非本章主线。
+        #            （vllm/v1/engine/output_processor.py:L449-L456）——非本章主线。
         self.request_states: dict[str, RequestState] = {}
         self.parent_requests: dict[str, ParentRequest] = {}
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
 
-    # SOURCE: vllm/v1/engine/output_processor.py:L466 def abort_requests
+    # SOURCE: vllm/v1/engine/output_processor.py:L491 def abort_requests
     def abort_requests(
         self, request_ids: Iterable[str], internal: bool
     ) -> list[str]:
@@ -127,7 +127,7 @@ class OutputProcessor:
             if req_state is not None:
                 request_ids_to_abort.append(request_id)
                 # SUBTRACTED: lora_states.request_finished + 产出 abort 终态 output
-                #            （vllm/v1/engine/output_processor.py:L484-L498）——本章只演示
+                #            （vllm/v1/engine/output_processor.py:L509-L523）——本章只演示
                 #            「父→级联未完成 child」的 id 归集。
             elif parent := self.parent_requests.get(request_id):
                 # Abort children prior to removing the parent.
@@ -138,7 +138,7 @@ class OutputProcessor:
                 self.parent_requests.pop(request_id, None)
         return request_ids_to_abort
 
-    # SOURCE: vllm/v1/engine/output_processor.py:L508 def add_request
+    # SOURCE: vllm/v1/engine/output_processor.py:L533 def add_request
     def add_request(
         self,
         request: EngineCoreRequest,
@@ -150,7 +150,7 @@ class OutputProcessor:
         req_state = self.request_states.get(request_id)
         if req_state is not None:
             # SUBTRACTED: _update_streaming_request_state（流式输入复用，
-            #            vllm/v1/engine/output_processor.py:L518-L520）——与本章无关。
+            #            vllm/v1/engine/output_processor.py:L543-L545）——与本章无关。
             return
 
         req_state = RequestState.from_new_request(

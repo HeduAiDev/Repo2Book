@@ -36,7 +36,7 @@
 
 这张图里藏着 V1 输出侧的两条核心设计：
 
-**第一，"整批只遍历一次"。** EngineCore 一步可能同时推进几百个请求，每个都吐出新 token。所有"需要逐个 token 碰一下"的活——算 stats、去 token、检测停止串、算 logprobs、造输出对象——全塞进**同一个** for 循环里跑完。这不是偷懒，是 V1 刻意把"对整批的 Python 循环"压到最少，因为 Python 层每多绕一圈 `for`，在高吞吐下都是实打实的系统开销。承担这个职责的函数只有一个：`process_outputs()`（`vllm/v1/engine/output_processor.py:L572`）。
+**第一，"整批只遍历一次"。** EngineCore 一步可能同时推进几百个请求，每个都吐出新 token。所有"需要逐个 token 碰一下"的活——算 stats、去 token、检测停止串、算 logprobs、造输出对象——全塞进**同一个** for 循环里跑完。这不是偷懒，是 V1 刻意把"对整批的 Python 循环"压到最少，因为 Python 层每多绕一圈 `for`，在高吞吐下都是实打实的系统开销。承担这个职责的函数只有一个：`process_outputs()`（`vllm/v1/engine/output_processor.py:L597`）。
 
 **第二，"一请求一邮箱"。** 解多路复用（把一批 N 个请求的 token 分回 N 条流）不是靠一个全局大队列让 N 个协程去抢，而是每个请求一个独立的单槽邮箱 `RequestOutputCollector`。生产者按 `req_id` 精确投递，消费者各守各的邮箱——互不干扰，也不用加锁抢。
 
@@ -107,7 +107,7 @@ async def output_handler():
 现在进主轴。这是全书你会反复回来看的一个函数。先看它的源码（`vllm/v1/engine/output_processor.py`），它的 docstring 把自己的定位写得毫不含糊：
 
 ```python
-# vllm/v1/engine/output_processor.py:L572
+# vllm/v1/engine/output_processor.py:L597
 def process_outputs(
     self,
     engine_core_outputs: list[EngineCoreOutput],
@@ -280,7 +280,7 @@ def update(self, new_token_ids: list[int], stop_terminated: bool) -> str | None:
 **(c) 停止串检测只扫新增字符。** 关键在传给 `check_stop_strings` 的 `new_char_count`——只有本步新增的那几个字符。来看它怎么用：
 
 ```python
-# vllm/v1/engine/detokenizer.py:L304
+# vllm/v1/engine/detokenizer.py:L309
 def check_stop_strings(
     output_text: str, new_char_count: int, stop: list[str], include_in_output: bool,
 ) -> tuple[str, int] | None:
@@ -361,7 +361,7 @@ sample logprobs 这边每步把采样 token 的 logprob 累加进 `cumulative_lo
 单循环第 ⑤ 步那个 `make_request_output(...)`，是"本步增量到底发不发、发多少"的总闸门。看真实源码（`vllm/v1/engine/output_processor.py`）：
 
 ```python
-# vllm/v1/engine/output_processor.py:L269
+# vllm/v1/engine/output_processor.py:L272
 def make_request_output(
     self, new_token_ids, pooling_output, finish_reason, stop_reason,
     kv_transfer_params=None, routed_experts=None,
@@ -432,7 +432,7 @@ def make_request_output(
 发出去的那个 `RequestOutput` 里装的 `CompletionOutput` 由 `_new_completion_output` 造：
 
 ```python
-# vllm/v1/engine/output_processor.py:L376
+# vllm/v1/engine/output_processor.py:L401
 def _new_completion_output(
     self, token_ids, finish_reason, stop_reason, routed_experts=None,
 ) -> CompletionOutput:
@@ -460,14 +460,14 @@ def _new_completion_output(
 
 DELTA 与全量的三处分叉对照清楚：`text` 由 `get_next_output_text(finished, delta)` 给出，delta 模式只给新增那段（§8.4）；`token_ids` 在非 delta 下整体取 `output_token_ids`（全量），delta 下用传进来的增量切片；`logprobs` 在 delta 下只切最后 `len(token_ids)` 个，对齐本次发的 token。`index=self.request_index` 是 `n>1` 时区分各子序列的关键，下一节会看到它撑起整个父聚合。
 
-> **v0.21.0 更新**：上面那个 `routed_experts` 形参（MoE 路由捕获）现在会被拆成两段挂到不同层级。`RequestState` 调 `split_routed_experts(routed_experts, prompt_len, num_gen)`（`vllm/v1/engine/output_processor.py:L323`，`prompt_len` 取自 `self.prompt_token_ids`、`num_gen` 取自 `self.detokenizer.num_output_tokens()`）把路由数据切开：**prompt 段**回填到请求级 `RequestOutput.prompt_routed_experts`（`n>1` 时被多个 `CompletionOutput` 共享，故挂在请求级而非每个 completion 上），**generation 段**挂到每个 `CompletionOutput`。这与本节 `index`/父聚合的层级划分同构——"共享的提示路由"与"各自的生成路由"在数据结构上也就此分离。
+> **v0.21.0 更新**：上面那个 `routed_experts` 形参（MoE 路由捕获）现在会被拆成两段挂到不同层级。`RequestState` 调 `split_routed_experts(routed_experts, prompt_len, num_gen)`（`vllm/v1/engine/output_processor.py:L342`，`prompt_len` 取自 `self.prompt_token_ids`、`num_gen` 取自 `self.detokenizer.num_output_tokens()`）把路由数据切开：**prompt 段**回填到请求级 `RequestOutput.prompt_routed_experts`（`n>1` 时被多个 `CompletionOutput` 共享，故挂在请求级而非每个 completion 上），**generation 段**挂到每个 `CompletionOutput`。这与本节 `index`/父聚合的层级划分同构——"共享的提示路由"与"各自的生成路由"在数据结构上也就此分离。
 
 ### 8.5.1 队列的真身：`RequestOutputCollector`
 
 第 4 章在 [§4.6](../ch04-async-llm/narrative/chapter.md) 给过队列一个剪影，说它的归并真身留待本章。现在揭开。它就是图里那个"单槽邮箱"：
 
 ```python
-# vllm/v1/engine/output_processor.py:L45
+# vllm/v1/engine/output_processor.py:L48
 class RequestOutputCollector:
     """
     Collects streamed RequestOutputs per individual request,
@@ -531,7 +531,7 @@ class RequestOutputCollector:
 `aggregate` 这个开关由 `output_kind == DELTA` 决定，它直接控制 `put` 里归并要不要"拼接"。归并的真正实现在 `RequestOutput.add`（`vllm/outputs.py`）：
 
 ```python
-# vllm/outputs.py:L145
+# vllm/outputs.py:L147
 def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
     """Merge subsequent RequestOutput into this one"""
     self.finished |= next_output.finished
@@ -625,7 +625,7 @@ def get_outputs(
 请求收尾时，单循环调 `_finish_request` 把它从 `OutputProcessor` 的账本里彻底抹掉：
 
 ```python
-# vllm/v1/engine/output_processor.py:L689
+# vllm/v1/engine/output_processor.py:L714
 def _finish_request(self, req_state: RequestState) -> None:
     req_id = req_state.request_id
     self.request_states.pop(req_id)
@@ -708,7 +708,7 @@ $ python3 -m pytest tests/ -q
 
 请求生命周期的最后一棒跑完了。回头看这一章立了什么：
 
-- **`process_outputs` 是唯一遍历整批的单循环**（`vllm/v1/engine/output_processor.py:L572`）。 V1 把对整批的 Python 循环压到最少——取 state、stats、prefill 翻转、去 token+停止串、logprobs、造输出/分发、完成清理，全在一个 for 里跑完（§8.3）。
+- **`process_outputs` 是唯一遍历整批的单循环**（`vllm/v1/engine/output_processor.py:L597`）。 V1 把对整批的 Python 循环压到最少——取 state、stats、prefill 翻转、去 token+停止串、logprobs、造输出/分发、完成清理，全在一个 for 里跑完（§8.3）。
 - **一套逻辑服务两条路径。** `queue is None` 一个判断，分出 AsyncLLM（入队）和 LLMEngine（返回列表），不写两套（§8.3）。
 - **增量去 token 是必须的，停止串检测是摊还 $O(L)$ 的。** 跨 token 文本边界相互依赖，所以维护解码状态；停止串只扫新增字符，避免重扫退化（§8.4）。
 - **三道闸门控制发不发。** FINAL_ONLY / stream_interval 节流 / `n>1` 父聚合，每道都能让本步不发；DELTA 靠 `sent_tokens_offset` 保证增量首尾相接（§8.5）。

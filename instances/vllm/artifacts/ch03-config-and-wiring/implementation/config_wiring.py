@@ -200,7 +200,7 @@ class ParallelConfig:
     def __post_init__(self) -> None:
         # SUBTRACTED: external_launcher early branch, max_parallel_loading_workers
         #   warning, allowed_backends/nnodes validation, elastic-EP
-        #   (vllm/config/parallel.py:L825-L827, L876+) — orthogonal to backend
+        #   (vllm/config/parallel.py:L827-L829, L876+) — orthogonal to backend
         #   selection traced here.
         if (self.distributed_executor_backend is None
                 and self.world_size_across_dp > 1):
@@ -209,7 +209,7 @@ class ParallelConfig:
             backend = "mp"
             # SUBTRACTED: ray_utils.ray_is_available() probe + the TPU/SPMD,
             #   data_parallel_backend=="ray", ray-initialized/placement-group
-            #   branches (vllm/config/parallel.py:L833-L869) — Ray is a dossier
+            #   branches (vllm/config/parallel.py:L835-L871) — Ray is a dossier
             #   delete item; single-node mp/uni path keeps its exact logic.
             if current_platform.is_cuda() and self.nnodes > 1:
                 backend = "mp"
@@ -479,7 +479,7 @@ OPTIMIZATION_LEVEL_TO_CONFIG = {
 
 # ============================================================================
 # VllmConfig — the aggregate config + cross-config derivation hub.
-# vllm/config/vllm.py:L274-L981
+# vllm/config/vllm.py:L269-L1018
 # ============================================================================
 
 
@@ -503,7 +503,7 @@ class VllmConfig:
     performance_mode: PerformanceMode = "balanced"
     # SUBTRACTED: load/offload/attention/mamba/structured_outputs/observability/
     #   profiler/kv_transfer/kv_events/ec_transfer/reasoning/additional/
-    #   weight_transfer/shutdown_timeout fields (vllm/config/vllm.py:L291-L365)
+    #   weight_transfer/shutdown_timeout fields (vllm/config/vllm.py:L286-L360)
     #   — carried verbatim into VllmConfig in real vLLM but not read by this
     #   chapter's derivation or by the three factories.
 
@@ -517,13 +517,13 @@ class VllmConfig:
 
         # summarize vllm config
         vllm_factors: list[Any] = []
-        # SUBTRACTED: from vllm import __version__ (vllm/config/vllm.py:L383-L385)
+        # SUBTRACTED: from vllm import __version__ (vllm/config/vllm.py:L378-L380)
         #   — host has no vllm package; use a fixed stand-in so the algorithm
         #   (collect factors -> hash -> first 10 chars) stays identical.
         vllm_factors.append("0.15.1")
         if self.model_config:
             vllm_factors.append(self.model_config.compute_hash())
-            # SUBTRACTED: multimodal-encoder hash append (vllm/config/vllm.py:L388-L393)
+            # SUBTRACTED: multimodal-encoder hash append (vllm/config/vllm.py:L383-L388)
         else:
             vllm_factors.append("None")
         if self.cache_config:
@@ -540,7 +540,7 @@ class VllmConfig:
             vllm_factors.append("None")
         # SUBTRACTED: device/load/offload/attention/lora/speculative/
         #   structured_outputs/profiler/observability/quant/kv_transfer/
-        #   ec_transfer/additional_config appends (vllm/config/vllm.py:L408-L467)
+        #   ec_transfer/additional_config appends (vllm/config/vllm.py:L403-L462)
         #   — all the same if-present-append-hash-else-"None" shape; keeping
         #   model/cache/parallel/scheduler/compilation/kernel is enough to show
         #   the algorithm. (dossier delete item.)
@@ -596,23 +596,23 @@ class VllmConfig:
         self.instance_id = f"{time.time_ns()}"
 
         # SUBTRACTED: performance_mode info_once log + try_verify_and_update_config
-        #   (vllm/config/vllm.py:L727-L730) — the latter does architecture-specific
+        #   (vllm/config/vllm.py:L764-L767) — the latter does architecture-specific
         #   model rewrites (HF-driven); no-op on this chapter's path.
 
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)
-            # SUBTRACTED: verify_dual_chunk_attention_config (vllm/config/vllm.py:L734)
+            # SUBTRACTED: verify_dual_chunk_attention_config (vllm/config/vllm.py:L771)
             self.parallel_config.is_moe_model = self.model_config.is_moe
 
         if self.lora_config is not None:
             self.lora_config.verify_with_model_config(self.model_config)
 
         # SUBTRACTED: mamba stochastic-rounding check + deep_gemm auto-disable
-        #   (vllm/config/vllm.py:L741-L775) — hardware/feature edge cases.
+        #   (vllm/config/vllm.py:L778-L812) — hardware/feature edge cases.
 
         if self.quant_config is None and self.model_config is not None:
             # SUBTRACTED: VllmConfig._get_quantization_config(...) call
-            #   (vllm/config/vllm.py:L753-L756) — reads model quant metadata;
+            #   (vllm/config/vllm.py:L790-L793) — reads model quant metadata;
             #   left None on the unquantized path this chapter traces.
             pass
 
@@ -626,7 +626,7 @@ class VllmConfig:
             if self.speculative_config is not None:
                 # SUBTRACTED: EAGLE/MTP/Draft/NGram method allow-list +
                 #   disable_padded_drafter_batch hard checks
-                #   (vllm/config/vllm.py:L787-L802) — speculative decoding is out
+                #   (vllm/config/vllm.py:L824-L839) — speculative decoding is out
                 #   of this chapter's single-path scope (speculative_config None).
                 pass
             if not executor_supports_async_sched:
@@ -641,7 +641,7 @@ class VllmConfig:
                 self.scheduler_config.async_scheduling = False
             elif self.speculative_config is not None:
                 # SUBTRACTED: split into method-allow-list + disable_padded_drafter
-                #   branches (vllm/config/vllm.py:L819-L838) — collapsed because
+                #   branches (vllm/config/vllm.py:L856-L875) — collapsed because
                 #   speculative_config is None on this path; behavior preserved:
                 #   any speculative_config disables auto async scheduling here.
                 self.scheduler_config.async_scheduling = False
@@ -654,7 +654,7 @@ class VllmConfig:
 
         # SUBTRACTED: disable_nccl_for_dp_synchronization derivation, cascade-attn
         #   disable for async speculative, torch_shm spawn check, Turing float32
-        #   warning (vllm/config/vllm.py:L854-L902) — DP/spec/hardware edge cases.
+        #   warning (vllm/config/vllm.py:L891-L939) — DP/spec/hardware edge cases.
 
         # ---- compilation / cudagraph final resolution + opt-level apply (L904-L976) ----
         if self.model_config is not None and self.model_config.enforce_eager:
@@ -666,7 +666,7 @@ class VllmConfig:
             self.compilation_config.mode = CompilationMode.NONE
 
         # SUBTRACTED: inductor-disabled warning, has_blocked_weights custom_ops
-        #   append (vllm/config/vllm.py:L919-L944) — logging + quant edge case.
+        #   append (vllm/config/vllm.py:L956-L981) — logging + quant edge case.
 
         current_platform.apply_config_platform_defaults(self)
 
@@ -677,7 +677,7 @@ class VllmConfig:
                 self.compilation_config.mode = CompilationMode.NONE
 
         # SUBTRACTED: ir_enable_torch_wrap + custom_ops "all"/"none" defaulting
-        #   (vllm/config/vllm.py:L954-L968) — depends on SUBTRACTED custom_ops field.
+        #   (vllm/config/vllm.py:L991-L1005) — depends on SUBTRACTED custom_ops field.
 
         # Populate IR op priorities before fusion defaults are applied.
         self.kernel_config.set_platform_defaults(self)
@@ -691,7 +691,7 @@ class VllmConfig:
             )
 
         # SUBTRACTED: cudagraph-mode requires_piecewise_compilation vs mode
-        #   consistency guard + tail validations (vllm/config/vllm.py:L983+) —
+        #   consistency guard + tail validations (vllm/config/vllm.py:L1020+) —
         #   final-state assertions; the kept flow already lands the values.
 
 
@@ -739,7 +739,7 @@ class EngineArgs:
     compilation_config: Any = field(default_factory=CompilationConfig)
     # SUBTRACTED: the several-hundred remaining EngineArgs fields — multimodal /
     #   LoRA / speculative / KV-transfer / quantization / load / observability /
-    #   etc. (vllm/engine/arg_utils.py:L403-L690) — not on this chapter's
+    #   etc. (vllm/engine/arg_utils.py:L412-L701) — not on this chapter's
     #   single-DP, unquantized assembly path.
 
     # SOURCE: vllm/engine/arg_utils.py EngineArgs.__post_init__ (L690-L720)
@@ -781,7 +781,7 @@ class EngineArgs:
         device_config = DeviceConfig(device=current_platform.device_type)
 
         # SUBTRACTED: envs.validate_environ + speculator-model detection that can
-        #   override model/tokenizer (vllm/engine/arg_utils.py:L1633-L1655).
+        #   override model/tokenizer (vllm/engine/arg_utils.py:L1647-L1669).
 
         model_config = self.create_model_config()
         self.model = model_config.model
@@ -790,7 +790,7 @@ class EngineArgs:
 
         # SUBTRACTED: _check_feature_supported / _set_default_reasoning_config_args
         #   and the chunked-prefill + prefix-caching default derivation helpers
-        #   (vllm/engine/arg_utils.py:L1657-L1678) — capability-driven defaulting;
+        #   (vllm/engine/arg_utils.py:L1671-L1692) — capability-driven defaulting;
         #   on this path the EngineArgs defaults already hold.
 
         # CacheConfig is the representative "flat self.* -> structured sub-config"
@@ -938,7 +938,7 @@ class ExecutorWithExternalLauncher(UniProcExecutor):
     # override supports_async_scheduling, so it INHERITS True (external launcher
     # DOES support async scheduling).
     # SUBTRACTED: _init_executor / _distributed_args / collective_rpc torchrun
-    #   plumbing (vllm/v1/executor/uniproc_executor.py:L144-L210) — these spawn a
+    #   plumbing (vllm/v1/executor/uniproc_executor.py:L149-L196) — these spawn a
     #   real worker via torchrun env vars (RANK/LOCAL_RANK/MASTER_*); this chapter
     #   only observes which CLASS the factory selects and its inherited
     #   supports_async_scheduling, so the body is reduced to the subclass marker.

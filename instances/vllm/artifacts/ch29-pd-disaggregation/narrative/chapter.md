@@ -91,7 +91,7 @@ The class provides the following primitives:
 决策侧的契约就三个 `@abstractmethod`，子类必须实现。先看查远程命中的入口：
 
 ```python
-# vllm/distributed/kv_transfer/kv_connector/v1/base.py:L449-L470（Args 文档已略）
+# vllm/distributed/kv_transfer/kv_connector/v1/base.py:L442-L463（Args 文档已略）
     @abstractmethod
     def get_num_new_matched_tokens(
         self,
@@ -125,7 +125,7 @@ The class provides the following primitives:
 第二个方法在 block 分配之后被调用，让 connector 登记"这个请求下一步需要 load KV"：
 
 ```python
-# vllm/distributed/kv_transfer/kv_connector/v1/base.py:L484-L518（Args 文档已略）
+# vllm/distributed/kv_transfer/kv_connector/v1/base.py:L477-L511（Args 文档已略）
     @abstractmethod
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
@@ -163,7 +163,7 @@ The class provides the following primitives:
 搬运侧也是一组 `@abstractmethod`，结构上和决策侧对称——load 一套、save 一套：
 
 ```python
-# vllm/distributed/kv_transfer/kv_connector/v1/base.py:L298-L361（Args 文档已略，docstring 要点保留）
+# vllm/distributed/kv_transfer/kv_connector/v1/base.py:L291-L354（Args 文档已略，docstring 要点保留）
     @abstractmethod
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """
@@ -219,7 +219,7 @@ The class provides the following primitives:
 最后一个搬运侧方法不是抽象的，但它是连回决策侧的关键一环——上报异步收/发的完成情况：
 
 ```python
-# vllm/distributed/kv_transfer/kv_connector/v1/base.py:L363-L378
+# vllm/distributed/kv_transfer/kv_connector/v1/base.py:L356-L371
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
@@ -245,7 +245,7 @@ The class provides the following primitives:
 先看注册：
 
 ```python
-# vllm/distributed/kv_transfer/kv_connector/factory.py:L149-L157（节选）
+# vllm/distributed/kv_transfer/kv_connector/factory.py:L135-L143（节选）
 KVConnectorFactory.register_connector(
     "ExampleConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.example_connector",
@@ -295,7 +295,7 @@ KVConnectorFactory.register_connector(
 调度器这一头的构造发生在 `Scheduler.__init__`：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L118-L132（统计字段初始化已略）
+# vllm/v1/core/sched/scheduler.py:L113-L127（统计字段初始化已略）
         # Create KVConnector for the Scheduler. Note that each Worker
         # will have a corresponding KVConnector with Role=WORKER.
         # KV Connector pushes/pull of remote KVs for P/D and offloading.
@@ -367,7 +367,7 @@ KVConnectorFactory.register_connector(
 第 14 章讲过，`waiting` 不是一个队列而是两个：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L167-L169
+# vllm/v1/core/sched/scheduler.py:L162-L164
         self.waiting = create_request_queue(self.policy)
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
@@ -394,7 +394,7 @@ KVConnectorFactory.register_connector(
 我们沿着图走一遍源码。循环入口先选队列、取队头：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L571-L592（lora 约束分支已略）
+# vllm/v1/core/sched/scheduler.py:L529-L550（lora 约束分支已略）
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
@@ -422,7 +422,7 @@ KVConnectorFactory.register_connector(
 `_select_waiting_queue_for_scheduling` 在两个队列里选一个。这就是第 14 章 §14.4 的双队列选取：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L1567-L1577
+# vllm/v1/core/sched/scheduler.py:L1529-L1539
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         if self.policy == SchedulingPolicy.FCFS:
             return self.skipped_waiting or self.waiting or None
@@ -441,7 +441,7 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
 取到请求后，第一道分叉：它是不是**阻塞态**？阻塞态的判定集合包括我们关心的 `WAITING_FOR_REMOTE_KVS`：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L1553-L1559
+# vllm/v1/core/sched/scheduler.py:L1515-L1521
     @staticmethod
     def _is_blocked_waiting_status(status: RequestStatus) -> bool:
         return status in (
@@ -456,7 +456,7 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
 如果**不是**阻塞态（全新请求），走查命中主线。先看本地命中，再问 connector 要远程命中：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L613-L646（prefill_stats / else 分支已略）
+# vllm/v1/core/sched/scheduler.py:L571-L604（prefill_stats / else 分支已略）
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
@@ -494,7 +494,7 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
 接下来 `load_kv_async` 标志开始驱动分支。异步加载时，本步**一个新 token 都不能算**：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L668-L671（else 正常分支转述见下）
+# vllm/v1/core/sched/scheduler.py:L626-L629（else 正常分支转述见下）
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
                     assert num_external_computed_tokens > 0
@@ -506,7 +506,7 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
 然后分配 block。注意两个为远程 KV 专设的参数：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L744-L774（encoder/stats 分支已略）
+# vllm/v1/core/sched/scheduler.py:L702-L732（encoder/stats 分支已略）
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -541,7 +541,7 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
 最后是 `load_kv_async` 的收尾分支，请求进入阻塞态被隔离：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L785-L805（transfer error 长注释保留要点）
+# vllm/v1/core/sched/scheduler.py:L743-L763（transfer error 长注释保留要点）
                 request = request_queue.pop_request()
                 if load_kv_async:
                     # If loading async, allocate memory and put request
@@ -561,7 +561,7 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
 循环跑完所有请求后，把这一步攒下的隔离请求回灌：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L844-L846
+# vllm/v1/core/sched/scheduler.py:L802-L804
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
@@ -572,7 +572,7 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
 `schedule` 的最末尾，决策侧的信使生成：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L928-L934
+# vllm/v1/core/sched/scheduler.py:L886-L892
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
         # 2. Wrap up all the KV cache load / save ops into an opaque object
@@ -599,7 +599,7 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
 唤醒的源头，是 worker 回传的 `KVConnectorOutput`。每个调度步 `update_from_output` 消化 worker 输出时，调到这个方法：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L2094-L2121
+# vllm/v1/core/sched/scheduler.py:L2031-L2058
     def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):
         """
         KV Connector: update the scheduler state based on the output.
@@ -637,7 +637,7 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
 下一步 `schedule` 的 WAITING 循环遍历 `skipped_waiting`，又遇到这个 `WAITING_FOR_REMOTE_KVS` 请求。回到 §29.4 那个分叉：它是阻塞态，调 `_try_promote_blocked_waiting_request`。这次标记已经在了：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L2061-L2076（grammar/streaming 分支与本章无关，已略）
+# vllm/v1/core/sched/scheduler.py:L1998-L2013（grammar/streaming 分支与本章无关，已略）
     def _try_promote_blocked_waiting_request(self, request: Request) -> bool:
         """
         Try to promote a blocked waiting request back to schedulable states.
@@ -663,7 +663,7 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
 实际副作用在 `_update_waiting_for_remote_kv` 里。这里有个微妙但关键的处理：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L2027-L2059（failed 分支内部已略，正文转述）
+# vllm/v1/core/sched/scheduler.py:L1964-L1996（failed 分支内部已略，正文转述）
     def _update_waiting_for_remote_kv(self, request: Request) -> None:
         """
         KV Connector: update request state after async recv is finished.
@@ -709,7 +709,7 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
 还有最后一环。decode 结束、请求 finished 时，block 能立刻释放吗？不一定——prefill 端（或 offload 端）可能还要把这段 KV 异步发出去/落盘，此刻释放就把正在外发的数据覆盖了。所以释放权交给 connector 裁决：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L1996-L2018（HMA 多 group 分支已略）
+# vllm/v1/core/sched/scheduler.py:L1933-L1955（HMA 多 group 分支已略）
     def _connector_finished(
         self, request: Request
     ) -> tuple[bool, dict[str, Any] | None]:

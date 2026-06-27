@@ -55,7 +55,7 @@ def get_kv_cache_layout() -> str:
 # PagedAttention 的两个真实 CUDA 算子（host 用 CPU 等价实现复现可观察语义）
 # ============================================================================
 
-# SOURCE: vllm/_custom_ops.py:L2713 (reshape_and_cache_flash)
+# SOURCE: vllm/_custom_ops.py:L2714 (reshape_and_cache_flash)
 def reshape_and_cache_flash(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -159,7 +159,7 @@ def flash_attn_varlen_func(
 # FlashAttention 四件套
 # ============================================================================
 
-# SOURCE: vllm/v1/attention/backends/flash_attn.py:L66 (FlashAttentionBackend)
+# SOURCE: vllm/v1/attention/backends/flash_attn.py:L69 (FlashAttentionBackend)
 class FlashAttentionBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[str]] = ["auto", "float16", "bfloat16"]
@@ -167,25 +167,25 @@ class FlashAttentionBackend(AttentionBackend):
     forward_includes_kv_cache_update: bool = False
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int]:  # SOURCE: vllm/v1/attention/backends/flash_attn.py:L74 (get_supported_kernel_block_sizes)
+    def get_supported_kernel_block_sizes() -> list[int]:  # SOURCE: vllm/v1/attention/backends/flash_attn.py:L77 (get_supported_kernel_block_sizes)
         # SUBTRACTED: 真实返回 [MultipleOf(16)]（混合 mamba float32 cache 时 [16,32,64]，
         # flash_attn.py:L74-L92）；本章用 16 表达「块大小须为 16 的倍数」这一 FA 约束。
         return [16]
 
     @staticmethod
-    def get_name() -> str:  # SOURCE: vllm/v1/attention/backends/flash_attn.py:L102 (get_name)
+    def get_name() -> str:  # SOURCE: vllm/v1/attention/backends/flash_attn.py:L105 (get_name)
         return "FLASH_ATTN"
 
     @classmethod
-    def supports_batch_invariance(cls) -> bool:  # SOURCE: vllm/v1/attention/backends/flash_attn.py:L106 (supports_batch_invariance)
+    def supports_batch_invariance(cls) -> bool:  # SOURCE: vllm/v1/attention/backends/flash_attn.py:L109 (supports_batch_invariance)
         return True
 
     @classmethod
-    def supports_non_causal(cls) -> bool:  # SOURCE: vllm/v1/attention/backends/flash_attn.py:L110 (supports_non_causal)
+    def supports_non_causal(cls) -> bool:  # SOURCE: vllm/v1/attention/backends/flash_attn.py:L113 (supports_non_causal)
         return True
 
     @classmethod
-    # SOURCE: vllm/v1/attention/backends/flash_attn.py:L112 (supports_attn_type)
+    # SOURCE: vllm/v1/attention/backends/flash_attn.py:L115 (supports_attn_type)
     def supports_attn_type(cls, attn_type: str) -> bool:
         """FlashAttention supports all attention types."""
         return attn_type in (
@@ -196,17 +196,17 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
     @staticmethod
-    # SOURCE: vllm/v1/attention/backends/flash_attn.py:L129 (get_impl_cls)
+    # SOURCE: vllm/v1/attention/backends/flash_attn.py:L132 (get_impl_cls)
     def get_impl_cls() -> type["FlashAttentionImpl"]:
         return FlashAttentionImpl
 
     @staticmethod
-    # SOURCE: vllm/v1/attention/backends/flash_attn.py:L133 (get_builder_cls)
+    # SOURCE: vllm/v1/attention/backends/flash_attn.py:L136 (get_builder_cls)
     def get_builder_cls() -> type["FlashAttentionMetadataBuilder"]:
         return FlashAttentionMetadataBuilder
 
     @staticmethod
-    # SOURCE: vllm/v1/attention/backends/flash_attn.py:L137 (get_kv_cache_shape)
+    # SOURCE: vllm/v1/attention/backends/flash_attn.py:L140 (get_kv_cache_shape)
     def get_kv_cache_shape(
         num_blocks: int,
         block_size: int,
@@ -219,7 +219,7 @@ class FlashAttentionBackend(AttentionBackend):
         return (2, num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod
-    # SOURCE: vllm/v1/attention/backends/flash_attn.py:L148 (get_kv_cache_stride_order)
+    # SOURCE: vllm/v1/attention/backends/flash_attn.py:L151 (get_kv_cache_stride_order)
     def get_kv_cache_stride_order(
         include_num_layers_dimension: bool = False,
     ) -> tuple[int, ...]:
@@ -237,7 +237,7 @@ class FlashAttentionBackend(AttentionBackend):
         return stride_order
 
     @classmethod
-    # SOURCE: vllm/v1/attention/backends/flash_attn.py:L181 (supports_head_size)
+    # SOURCE: vllm/v1/attention/backends/flash_attn.py:L184 (supports_head_size)
     def supports_head_size(cls, head_size: int) -> bool:
         if head_size % 8 != 0:
             return False
@@ -248,7 +248,7 @@ class FlashAttentionBackend(AttentionBackend):
         return False
 
     @classmethod
-    # SOURCE: vllm/v1/attention/backends/flash_attn.py:L208 (supports_compute_capability)
+    # SOURCE: vllm/v1/attention/backends/flash_attn.py:L211 (supports_compute_capability)
     def supports_compute_capability(cls, capability) -> bool:
         from platform_cuda import DeviceCapability
 
@@ -256,7 +256,7 @@ class FlashAttentionBackend(AttentionBackend):
 
 
 @dataclass
-# SOURCE: vllm/v1/attention/backends/flash_attn.py:L222 (FlashAttentionMetadata)
+# SOURCE: vllm/v1/attention/backends/flash_attn.py:L225 (FlashAttentionMetadata)
 class FlashAttentionMetadata:
     # NOTE(sang): Definition of context_len, query_len, and seq_len.
     # |---------- N-1 iteration --------|
@@ -294,12 +294,12 @@ class FlashAttentionMetadata:
     # 不影响标准 decoder 主路径。
 
 
-# SOURCE: vllm/v1/attention/backends/flash_attn.py:L308 (FlashAttentionMetadataBuilder)
+# SOURCE: vllm/v1/attention/backends/flash_attn.py:L311 (FlashAttentionMetadataBuilder)
 class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
     supports_update_block_table: bool = True
 
-    def __init__(  # SOURCE: vllm/v1/attention/backends/flash_attn.py:L597 (FlashAttentionImpl.__init__)
+    def __init__(  # SOURCE: vllm/v1/attention/backends/flash_attn.py:L600 (FlashAttentionImpl.__init__)
         self,
         kv_cache_spec=None,
         layer_names=None,
@@ -318,7 +318,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         self.dcp_world_size = 1
         self.aot_schedule = False
 
-    # SOURCE: vllm/v1/attention/backends/flash_attn.py:L388 (build)
+    # SOURCE: vllm/v1/attention/backends/flash_attn.py:L391 (build)
     def build(
         self,
         common_prefix_len: int,
@@ -365,9 +365,9 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         return attn_metadata
 
 
-# SOURCE: vllm/v1/attention/backends/flash_attn.py:L594 (FlashAttentionImpl)
+# SOURCE: vllm/v1/attention/backends/flash_attn.py:L597 (FlashAttentionImpl)
 class FlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
-    # SOURCE: vllm/v1/attention/backends/flash_attn.py:L597 (__init__)
+    # SOURCE: vllm/v1/attention/backends/flash_attn.py:L600 (__init__)
     def __init__(
         self,
         num_heads: int,
@@ -403,7 +403,7 @@ class FlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
         self.sinks = None
         self.supports_quant_query_input = False
 
-    # SOURCE: vllm/v1/attention/backends/flash_attn.py:L682 (forward)
+    # SOURCE: vllm/v1/attention/backends/flash_attn.py:L677 (forward)
     def forward(
         self,
         layer,
@@ -473,7 +473,7 @@ class FlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
         )
         return output
 
-    # SOURCE: vllm/v1/attention/backends/flash_attn.py:L851 (do_kv_cache_update)
+    # SOURCE: vllm/v1/attention/backends/flash_attn.py:L863 (do_kv_cache_update)
     def do_kv_cache_update(
         self,
         layer,

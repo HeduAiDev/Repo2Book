@@ -221,23 +221,23 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
         )
 
         # SUBTRACTED: the spaces_between_special_tokens computation +
-        #   added_token_ids precompute (vllm/v1/engine/detokenizer.py:L185-L205).
+        #   added_token_ids precompute (vllm/v1/engine/detokenizer.py:L188-L208).
         #   This only feeds the optional space-suppression branch in decode_next,
         #   which is off whenever skip_special_tokens or
         #   spaces_between_special_tokens is true (the default) — orthogonal to the
         #   UTF-8 / stop behaviour studied here (subtraction_plan.delete).
 
-    # SOURCE: vllm/v1/engine/detokenizer.py:L207
+    # SOURCE: vllm/v1/engine/detokenizer.py:L210
     def decode_next(self, next_token_id: int) -> str:
         token = self._protected_step(next_token_id)
 
         # SUBTRACTED: `if not self.spaces_between_special_tokens:` adjacent-special-
-        #   token space suppression branch (vllm/v1/engine/detokenizer.py:L210-L216)
+        #   token space suppression branch (vllm/v1/engine/detokenizer.py:L213-L219)
         #   — see __init__ note (subtraction_plan.delete).
 
         return token or ""
 
-    # SOURCE: vllm/v1/engine/detokenizer.py:L220
+    # SOURCE: vllm/v1/engine/detokenizer.py:L223
     def _protected_step(self, next_token_id: int) -> str | None:
         try:
             token = self.stream.step(self.tokenizer, next_token_id)
@@ -263,10 +263,10 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
         return token
 
 
-# SOURCE: vllm/v1/engine/detokenizer.py:L245
+# SOURCE: vllm/v1/engine/detokenizer.py:L250
 class SlowIncrementalDetokenizer(BaseIncrementalDetokenizer):
     def __init__(self, tokenizer: TokenizerLike, request: EngineCoreRequest):
-        # SOURCE: vllm/v1/engine/detokenizer.py:L246
+        # SOURCE: vllm/v1/engine/detokenizer.py:L251
         super().__init__(request)
 
         self.tokenizer = tokenizer
@@ -299,16 +299,16 @@ class SlowIncrementalDetokenizer(BaseIncrementalDetokenizer):
 
     @property
     def output_token_ids(self) -> list[int]:
-        # SOURCE: vllm/v1/engine/detokenizer.py:L277
+        # SOURCE: vllm/v1/engine/detokenizer.py:L282
         if self.prompt_len:
             return self.token_ids[self.prompt_len :]
         return self.token_ids
 
-    # SOURCE: vllm/v1/engine/detokenizer.py:L283
+    # SOURCE: vllm/v1/engine/detokenizer.py:L288
     def num_output_tokens(self) -> int:
         return len(self.token_ids) - self.prompt_len
 
-    # SOURCE: vllm/v1/engine/detokenizer.py:L286
+    # SOURCE: vllm/v1/engine/detokenizer.py:L291
     def decode_next(self, next_token_id: int) -> str:
         new_tokens, decoded_text, prefix_offset, read_offset = detokenize_incrementally(
             tokenizer=self.tokenizer,
@@ -327,7 +327,7 @@ class SlowIncrementalDetokenizer(BaseIncrementalDetokenizer):
         return decoded_text
 
 
-# SOURCE: vllm/v1/engine/detokenizer.py:L304
+# SOURCE: vllm/v1/engine/detokenizer.py:L309
 def check_stop_strings(
     output_text: str,
     new_char_count: int,

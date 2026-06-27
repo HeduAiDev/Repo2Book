@@ -25,7 +25,7 @@ from ._runtime import (
 )
 
 
-# SOURCE: vllm/model_executor/layers/linear.py:182 (class UnquantizedLinearMethod)
+# SOURCE: vllm/model_executor/layers/linear.py:183 (class UnquantizedLinearMethod)
 class UnquantizedLinearMethod:
     """Linear method without quantization."""
 
@@ -39,7 +39,7 @@ class UnquantizedLinearMethod:
         params_dtype: torch.dtype,
         weight_loader,
     ) -> None:
-        # SOURCE: vllm/model_executor/layers/linear.py:185 (UnquantizedLinearMethod.create_weights)
+        # SOURCE: vllm/model_executor/layers/linear.py:186 (UnquantizedLinearMethod.create_weights)
         weight = Parameter(
             torch.empty(
                 sum(output_partition_sizes), input_size_per_partition, dtype=params_dtype
@@ -50,12 +50,12 @@ class UnquantizedLinearMethod:
         layer.register_parameter("weight", weight)
 
     def apply(self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
-        # SOURCE: vllm/model_executor/layers/linear.py:220 (UnquantizedLinearMethod.apply)
+        # SOURCE: vllm/model_executor/layers/linear.py:224 (UnquantizedLinearMethod.apply)
         # SUBTRACTED: 真实经 dispatch_unquantized_gemm / batch-invariant 分派；精简版直调 F.linear。
         return torch.nn.functional.linear(x, layer.weight, bias)
 
 
-# SOURCE: vllm/model_executor/layers/linear.py:231 (class LinearBase)
+# SOURCE: vllm/model_executor/layers/linear.py:235 (class LinearBase)
 class LinearBase(nn.Module):
     """Base linear layer。持 quant_method 统一经其 apply 做 GEMM，记 tp_rank/tp_size。"""
 
@@ -72,7 +72,7 @@ class LinearBase(nn.Module):
         return_bias: bool = True,
         disable_tp: bool = False,
     ) -> None:
-        # SOURCE: vllm/model_executor/layers/linear.py:245 (LinearBase.__init__)
+        # SOURCE: vllm/model_executor/layers/linear.py:249 (LinearBase.__init__)
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
@@ -90,7 +90,7 @@ class LinearBase(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
 
 
-# SOURCE: vllm/model_executor/layers/linear.py:410 (class ColumnParallelLinear)
+# SOURCE: vllm/model_executor/layers/linear.py:414 (class ColumnParallelLinear)
 class ColumnParallelLinear(LinearBase):
     """Linear layer with column parallelism。权重沿 output(列)维按 tp_size 切，input 不切。
 
@@ -111,7 +111,7 @@ class ColumnParallelLinear(LinearBase):
         return_bias: bool = True,
         disable_tp: bool = False,
     ) -> None:
-        # SOURCE: vllm/model_executor/layers/linear.py:436 (ColumnParallelLinear.__init__)
+        # SOURCE: vllm/model_executor/layers/linear.py:440 (ColumnParallelLinear.__init__)
         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
         self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
         self.input_size_per_partition = input_size
@@ -157,7 +157,7 @@ class ColumnParallelLinear(LinearBase):
             self.register_parameter("bias", None)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor) -> None:
-        # SOURCE: vllm/model_executor/layers/linear.py:534 (ColumnParallelLinear.weight_loader)
+        # SOURCE: vllm/model_executor/layers/linear.py:537 (ColumnParallelLinear.weight_loader)
         output_dim = getattr(param, "output_dim", None)
         # SUBTRACTED: GGUF（is_gguf_weight*/materialize）、bitsandbytes/is_sharded_weight 分支。
         param_data = param.data
@@ -170,7 +170,7 @@ class ColumnParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, input_):
-        # SOURCE: vllm/model_executor/layers/linear.py:579 (ColumnParallelLinear.forward)
+        # SOURCE: vllm/model_executor/layers/linear.py:582 (ColumnParallelLinear.forward)
         bias = self.bias if not self.skip_bias_add else None
         output_parallel = self.quant_method.apply(self, input_, bias)
         if self.gather_output and self.tp_size > 1:
@@ -183,7 +183,7 @@ class ColumnParallelLinear(LinearBase):
         return output, output_bias
 
 
-# SOURCE: vllm/model_executor/layers/linear.py:609 (class MergedColumnParallelLinear)
+# SOURCE: vllm/model_executor/layers/linear.py:611 (class MergedColumnParallelLinear)
 class MergedColumnParallelLinear(ColumnParallelLinear):
     """把多段(gate, up)沿 output 维 fuse 的列并行层，按 output_sizes 各自切分。"""
 
@@ -201,7 +201,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         return_bias: bool = True,
         disable_tp: bool = False,
     ) -> None:
-        # SOURCE: vllm/model_executor/layers/linear.py:635 (MergedColumnParallelLinear.__init__)
+        # SOURCE: vllm/model_executor/layers/linear.py:637 (MergedColumnParallelLinear.__init__)
         self.output_sizes = output_sizes
         self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
@@ -222,7 +222,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     def weight_loader(
         self, param: Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int | None = None
     ) -> None:
-        # SOURCE: vllm/model_executor/layers/linear.py:694 (MergedColumnParallelLinear.weight_loader)
+        # SOURCE: vllm/model_executor/layers/linear.py:696 (MergedColumnParallelLinear.weight_loader)
         # SUBTRACTED: GGUF / BlockQuantScale / packed_dim / bitsandbytes / needs_scalar_to_array
         # 分支，以及 loaded_shard_id is None（磁盘已 fuse 的 Phi-3 式 gate_up）的拆分递归路径。
         param_data = param.data
@@ -239,7 +239,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         param_data.copy_(loaded_weight)
 
 
-# SOURCE: vllm/model_executor/layers/linear.py:977 (class QKVParallelLinear)
+# SOURCE: vllm/model_executor/layers/linear.py:979 (class QKVParallelLinear)
 class QKVParallelLinear(ColumnParallelLinear):
     """把 q/k/v fuse 成一个列并行权重。GQA 下 KV 头数<tp 时复制(num_kv_head_replicas)否则切分。"""
 
@@ -259,7 +259,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         disable_tp: bool = False,
         v_head_size: int | None = None,
     ) -> None:
-        # SOURCE: vllm/model_executor/layers/linear.py:1005 (QKVParallelLinear.__init__)
+        # SOURCE: vllm/model_executor/layers/linear.py:1007 (QKVParallelLinear.__init__)
         self.hidden_size = hidden_size
         self.head_size = head_size
         self.v_head_size = v_head_size if v_head_size is not None else head_size
@@ -305,7 +305,7 @@ class QKVParallelLinear(ColumnParallelLinear):
     def weight_loader(
         self, param: Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str | None = None
     ) -> None:
-        # SOURCE: vllm/model_executor/layers/linear.py:1187 (QKVParallelLinear.weight_loader)
+        # SOURCE: vllm/model_executor/layers/linear.py:1189 (QKVParallelLinear.weight_loader)
         assert loaded_shard_id in ["q", "k", "v"]
         param_data = param.data
         output_dim = getattr(param, "output_dim", None)
@@ -336,7 +336,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         param_data.copy_(loaded_weight)
 
 
-# SOURCE: vllm/model_executor/layers/linear.py:1394 (class RowParallelLinear)
+# SOURCE: vllm/model_executor/layers/linear.py:1396 (class RowParallelLinear)
 class RowParallelLinear(LinearBase):
     """Linear layer with row parallelism。权重沿 input(行)维按 tp_size 切，forward 末 all_reduce。
 
@@ -358,7 +358,7 @@ class RowParallelLinear(LinearBase):
         return_bias: bool = True,
         disable_tp: bool = False,
     ) -> None:
-        # SOURCE: vllm/model_executor/layers/linear.py:1429 (RowParallelLinear.__init__)
+        # SOURCE: vllm/model_executor/layers/linear.py:1431 (RowParallelLinear.__init__)
         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
         self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
         self.input_size_per_partition = divide(input_size, self.tp_size)
@@ -401,7 +401,7 @@ class RowParallelLinear(LinearBase):
             self.register_parameter("bias", None)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor) -> None:
-        # SOURCE: vllm/model_executor/layers/linear.py:1499 (RowParallelLinear.weight_loader)
+        # SOURCE: vllm/model_executor/layers/linear.py:1500 (RowParallelLinear.weight_loader)
         input_dim = getattr(param, "input_dim", None)
         # SUBTRACTED: GGUF / bitsandbytes / is_sharded_weight 分支。
         param_data = param.data
@@ -414,7 +414,7 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, input_):
-        # SOURCE: vllm/model_executor/layers/linear.py:1543 (RowParallelLinear.forward)
+        # SOURCE: vllm/model_executor/layers/linear.py:1544 (RowParallelLinear.forward)
         if self.input_is_parallel:
             input_parallel = input_
         else:

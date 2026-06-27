@@ -15,7 +15,7 @@ HAS_TRITON = False
 
 
 class TopKTopPSampler(nn.Module):
-    # SOURCE: vllm/v1/sample/ops/topk_topp_sampler.py:L22-104
+    # SOURCE: vllm/v1/sample/ops/topk_topp_sampler.py:L22-L109
     """
     Module that performs optional top-k and top-p filtering followed by
     weighted random sampling of logits.
@@ -24,7 +24,7 @@ class TopKTopPSampler(nn.Module):
     """
 
     def __init__(self, logprobs_mode: str = "raw_logprobs") -> None:
-        # SOURCE: vllm/v1/sample/ops/topk_topp_sampler.py:L30-104
+        # SOURCE: vllm/v1/sample/ops/topk_topp_sampler.py:L30-L109
         super().__init__()
         self.logprobs_mode = logprobs_mode
         # flashinfer optimization does not apply if intermediate
@@ -44,7 +44,7 @@ class TopKTopPSampler(nn.Module):
         k: torch.Tensor | None,
         p: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # SOURCE: vllm/v1/sample/ops/topk_topp_sampler.py:L106-125
+        # SOURCE: vllm/v1/sample/ops/topk_topp_sampler.py:L111-L130
         """
         PyTorch-native implementation of top-k and top-p sampling.
 
@@ -66,7 +66,7 @@ class TopKTopPSampler(nn.Module):
         k: torch.Tensor | None,
         p: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # SOURCE: vllm/v1/sample/ops/topk_topp_sampler.py:L127-152
+        # SOURCE: vllm/v1/sample/ops/topk_topp_sampler.py:L132-L157
         """More optimized implementation for top-k and top-p sampling."""
         # Fall back to the PyTorch-native path when FlashInfer has nothing
         # to do (no top-k / top-p filter) or when per-request generators
@@ -92,7 +92,7 @@ class TopKTopPSampler(nn.Module):
 def apply_top_k_top_p(
     logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
 ) -> torch.Tensor:
-    # SOURCE: vllm/v1/sample/ops/topk_topp_sampler.py:L257-267
+    # SOURCE: vllm/v1/sample/ops/topk_topp_sampler.py:L305-L315
     if p is None and k is None:
         return logits
 
@@ -110,7 +110,7 @@ def apply_top_k_top_p_pytorch(
     p: torch.Tensor | None,
     allow_cpu_sync: bool = False,
 ) -> torch.Tensor:
-    # SOURCE: vllm/v1/sample/ops/topk_topp_sampler.py:L270-311
+    # SOURCE: vllm/v1/sample/ops/topk_topp_sampler.py:L318-L359
     """Apply top-k and top-p masks to the logits.
 
     If a top-p is used, this function will sort the logits tensor,
@@ -155,7 +155,7 @@ def random_sample(
     probs: torch.Tensor,
     generators: dict[int, torch.Generator],
 ) -> torch.Tensor:
-    # SOURCE: vllm/v1/sample/ops/topk_topp_sampler.py:L337-358
+    # SOURCE: vllm/v1/sample/ops/topk_topp_sampler.py:L385-L406
     """Randomly sample from the probabilities.
 
     We use this function instead of torch.multinomial because torch.multinomial
@@ -180,7 +180,7 @@ def flashinfer_sample(
     p: torch.Tensor | None,
     generators: dict[int, torch.Generator],
 ) -> torch.Tensor:
-    # SOURCE: vllm/v1/sample/ops/topk_topp_sampler.py:L361-403
+    # SOURCE: vllm/v1/sample/ops/topk_topp_sampler.py:L409-L451
     """Sample from the logits using FlashInfer.
 
     Statistically, this function is equivalent to the `random_sample` function.

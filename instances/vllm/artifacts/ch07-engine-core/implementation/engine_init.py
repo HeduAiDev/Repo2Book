@@ -13,7 +13,7 @@ import msgspec
 from serial_utils import UtilityResult
 
 
-# SOURCE: vllm/v1/engine/__init__.py:L237  EngineCoreRequestType
+# SOURCE: vllm/v1/engine/__init__.py:L243  EngineCoreRequestType
 class EngineCoreRequestType(enum.Enum):
     """
     Request types defined as hex byte strings, so it can be sent over sockets
@@ -65,7 +65,7 @@ class EngineCoreRequest(
     client_index: int = 0
 
 
-# SOURCE: vllm/v1/engine/__init__.py:L194  UtilityOutput
+# SOURCE: vllm/v1/engine/__init__.py:L200  UtilityOutput
 class UtilityOutput(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]
@@ -78,7 +78,7 @@ class UtilityOutput(
     result: UtilityResult | None = None
 
 
-# SOURCE: vllm/v1/engine/__init__.py:L161  EngineCoreOutput
+# SOURCE: vllm/v1/engine/__init__.py:L167  EngineCoreOutput
 class EngineCoreOutput(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]
@@ -90,10 +90,10 @@ class EngineCoreOutput(
     # SUBTRACTED: logprobs / pooling_output / finish_reason / events /
     # kv_transfer_params / trace_headers / prefill_stats / routed_experts /
     # num_nans_in_logits —— 输出语义负载，与跨进程多帧传输无关。
-    # 原 vllm/v1/engine/__init__.py:L170-L187。
+    # 原 vllm/v1/engine/__init__.py:L176-L193。
 
 
-# SOURCE: vllm/v1/engine/__init__.py:L206  EngineCoreOutputs
+# SOURCE: vllm/v1/engine/__init__.py:L212  EngineCoreOutputs
 class EngineCoreOutputs(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]
@@ -109,9 +109,9 @@ class EngineCoreOutputs(
 
     utility_output: UtilityOutput | None = None
     # SUBTRACTED: finished_requests / wave_complete / start_wave（DP 编排，另章）。
-    # 原 vllm/v1/engine/__init__.py:L223-L230。
+    # 原 vllm/v1/engine/__init__.py:L229-L236。
 
     def __post_init__(self):
-        # SOURCE: vllm/v1/engine/__init__.py:L232  EngineCoreOutputs.__post_init__
+        # SOURCE: vllm/v1/engine/__init__.py:L238  EngineCoreOutputs.__post_init__
         if self.timestamp == 0.0:
             self.timestamp = time.monotonic()

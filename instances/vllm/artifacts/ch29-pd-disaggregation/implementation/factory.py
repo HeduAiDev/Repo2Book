@@ -67,7 +67,7 @@ class KVConnectorFactory:
         # 精简版只演示新三参签名（原 L77-82）。
 
     @classmethod
-    # SOURCE: vllm/distributed/kv_transfer/kv_connector/factory.py:L84
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/factory.py:L77
     def get_connector_class_by_name(
         cls, connector_name: str
     ) -> type[KVConnectorBase_V1]:
@@ -77,7 +77,7 @@ class KVConnectorFactory:
         return cls._registry[connector_name]()
 
 
-# SOURCE: vllm/distributed/kv_transfer/kv_connector/factory.py:L149
+# SOURCE: vllm/distributed/kv_transfer/kv_connector/factory.py:L135
 # Register various connectors here.
 # The registration should not be done in each individual file, as we want to
 # only load the files corresponding to the current connector.

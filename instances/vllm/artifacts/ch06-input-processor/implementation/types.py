@@ -77,8 +77,8 @@ class EngineCoreRequest:
 
     @property
     def params(self) -> SamplingParams:
-        # SOURCE: vllm/v1/engine/__init__.py:L125 @property def params
-        # SUBTRACTED: pooling_params 分支（vllm/v1/engine/__init__.py:L128-L132）——
+        # SOURCE: vllm/v1/engine/__init__.py:L131 @property def params
+        # SUBTRACTED: pooling_params 分支（vllm/v1/engine/__init__.py:L134-L138）——
         #            本章只走 sampling 路径。
         assert self.sampling_params is not None
         return self.sampling_params

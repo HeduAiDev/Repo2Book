@@ -104,7 +104,7 @@ class OpenAIServingRender:
         *,
         skip_mm_cache: bool = False,
     ):
-        # SOURCE: vllm/entrypoints/serve/render/serving.py:L184 render_chat
+        # SOURCE: vllm/entrypoints/serve/render/serving.py:L185 render_chat
         """Core preprocessing logic for chat requests (no model/engine check)."""
         tool_parser = self.tool_parser
 
@@ -169,7 +169,7 @@ class OpenAIServingRender:
         skip_mm_cache=False,
         reasoning_parser=None,
     ):
-        # SOURCE: vllm/entrypoints/serve/render/serving.py:L523 preprocess_chat
+        # SOURCE: vllm/entrypoints/serve/render/serving.py:L525 preprocess_chat
         renderer = self.renderer
 
         # SUBTRACTED: build_tok_params / build_chat_params.with_defaults 的参数合并细节

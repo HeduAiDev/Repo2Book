@@ -19,7 +19,7 @@ import torch
 _vllm_lib = torch.library.Library("vllm", "FRAGMENT")
 
 
-# SOURCE: vllm/utils/torch_utils.py:L899 (direct_register_custom_op)
+# SOURCE: vllm/utils/torch_utils.py:L931 (direct_register_custom_op)
 def direct_register_custom_op(
     op_name: str,
     op_func,

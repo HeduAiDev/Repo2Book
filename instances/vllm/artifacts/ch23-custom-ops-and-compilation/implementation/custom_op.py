@@ -233,7 +233,7 @@ def fused_add_rms_norm(
     return x, residual
 
 
-# SOURCE: vllm/model_executor/layers/layernorm.py:L102 (RMSNorm — 本章 CustomOp 范例)
+# SOURCE: vllm/model_executor/layers/layernorm.py:L37 (RMSNorm — 本章 CustomOp 范例)
 @CustomOp.register("rms_norm")
 class RMSNorm(CustomOp):
     """Root mean square normalization.
@@ -242,7 +242,7 @@ class RMSNorm(CustomOp):
     Refer to https://arxiv.org/abs/1910.07467
     """
 
-    # SOURCE: vllm/model_executor/layers/layernorm.py:L112 (__init__)
+    # SOURCE: vllm/model_executor/layers/layernorm.py:L47 (__init__)
     def __init__(
         self,
         hidden_size: int,
@@ -313,7 +313,7 @@ class RMSNorm(CustomOp):
         else:
             return x, residual
 
-    # SOURCE: vllm/model_executor/layers/layernorm.py:L233 (forward_native — 可被 Inductor 融合的一路)
+    # SOURCE: vllm/model_executor/layers/layernorm.py:L82 (forward_native — 可被 Inductor 融合的一路)
     def forward_native(
         self,
         x: torch.Tensor,
@@ -344,7 +344,7 @@ class RMSNorm(CustomOp):
             self.variance_size_override,
         )
 
-    # SOURCE: vllm/model_executor/layers/layernorm.py:L258 (forward_cuda — 预编译融合 kernel 一路)
+    # SOURCE: vllm/model_executor/layers/layernorm.py:L104 (forward_cuda — 预编译融合 kernel 一路)
     def forward_cuda(
         self,
         x: torch.Tensor,

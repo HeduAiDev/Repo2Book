@@ -43,10 +43,10 @@
 
 **第一扇门是离线的 `LLM`**——你在 Python 脚本里 `llm.generate(prompts, sampling_params)` 批量跑一堆 prompt。**第二扇门是在线的 HTTP 服务器**——`OpenAIServingChat` 接住 `/v1/chat/completions` 请求，渲染成引擎输入后，落到 `AsyncLLM.generate()`。
 
-HTTP 这扇门的落点长这样（`vllm/entrypoints/openai/chat_completion/serving.py:L341`）：
+HTTP 这扇门的落点长这样（`vllm/entrypoints/openai/chat_completion/serving.py:L347`）：
 
 ```python
-# vllm/entrypoints/openai/chat_completion/serving.py:L341
+# vllm/entrypoints/openai/chat_completion/serving.py:L347
 generator = self.engine_client.generate(
     engine_input,
     sampling_params,
@@ -195,10 +195,10 @@ async def add_request_async(self, request: EngineCoreRequest) -> None:
 
 ## 2.6 引擎段：一个独立进程，不停地算「一拍」
 
-请求穿过 ZMQ，进了引擎进程。这个进程有自己的心跳——`run_busy_loop`（`vllm/v1/engine/core.py:L1164`）：
+请求穿过 ZMQ，进了引擎进程。这个进程有自己的心跳——`run_busy_loop`（`vllm/v1/engine/core.py:L1168`）：
 
 ```python
-# vllm/v1/engine/core.py:L1164
+# vllm/v1/engine/core.py:L1168
 def run_busy_loop(self):
     """Core busy loop of the EngineCore."""
     while self._handle_shutdown():
@@ -212,10 +212,10 @@ def run_busy_loop(self):
 
 干净利落：只要没收到关停信号，就反复「取入队的请求 → 跑一拍 → 把结果出队」。它和 API 进程完全异步——API 那边的事件循环忙它的，这边的 `while` 循环忙这边的，两者只经 ZMQ 队列对话。注意这里的「异步」是**进程间的解耦**，引擎自己内部是一个老老实实的同步 `while` 循环，不是多线程。
 
-核心在 `_process_engine_step` 里调的 `step()`——vLLM 的「一拍」。它就是这本书后半本的总锚点（`vllm/v1/engine/core.py:L402`）：
+核心在 `_process_engine_step` 里调的 `step()`——vLLM 的「一拍」。它就是这本书后半本的总锚点（`vllm/v1/engine/core.py:L406`）：
 
 ```python
-# vllm/v1/engine/core.py:L402
+# vllm/v1/engine/core.py:L406
 def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
     """Schedule, execute, and make output."""
     # … 省略：scheduler 没有请求时直接返回 …
@@ -320,10 +320,10 @@ async def get_output_async(self) -> EngineCoreOutputs:
 
 ## 2.8 Stage 3：去 token 化、判停止、组装 `RequestOutput`
 
-`process_outputs()` 是输出段的主体，也是全章唯一**遍历整批**的函数。它把引擎吐回来的一批 `EngineCoreOutput` 一个个拆开处理（`vllm/v1/engine/output_processor.py:L572`）：
+`process_outputs()` 是输出段的主体，也是全章唯一**遍历整批**的函数。它把引擎吐回来的一批 `EngineCoreOutput` 一个个拆开处理（`vllm/v1/engine/output_processor.py:L597`）：
 
 ```python
-# vllm/v1/engine/output_processor.py:L572
+# vllm/v1/engine/output_processor.py:L597
 def process_outputs(
     self,
     engine_core_outputs: list[EngineCoreOutput],
@@ -338,10 +338,10 @@ def process_outputs(
     """
 ```
 
-每个 `EngineCoreOutput` 都是某个请求这一拍新产出的几个 token。对它，Stage 3 做三件正事，最后做一个分流（`vllm/v1/engine/output_processor.py:L631`）：
+每个 `EngineCoreOutput` 都是某个请求这一拍新产出的几个 token。对它，Stage 3 做三件正事，最后做一个分流（`vllm/v1/engine/output_processor.py:L656`）：
 
 ```python
-# vllm/v1/engine/output_processor.py:L631
+# vllm/v1/engine/output_processor.py:L656
 # 2) Detokenize the token ids into text and perform stop checks.
 stop_string = req_state.detokenizer.update(
     new_token_ids, finish_reason == FinishReason.STOP
@@ -385,10 +385,10 @@ if request_output := req_state.make_request_output(
 
 ## 2.9 出口：`generate()` 只消费队列
 
-回到本章主线的出口。先看那个「信箱」`RequestOutputCollector` 的本体——它简单得出人意料（`vllm/v1/engine/output_processor.py:L45`）：
+回到本章主线的出口。先看那个「信箱」`RequestOutputCollector` 的本体——它简单得出人意料（`vllm/v1/engine/output_processor.py:L48`）：
 
 ```python
-# vllm/v1/engine/output_processor.py:L45
+# vllm/v1/engine/output_processor.py:L48
 class RequestOutputCollector:
     """
     Collects streamed RequestOutputs per individual request,

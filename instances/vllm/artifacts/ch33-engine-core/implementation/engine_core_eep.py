@@ -81,7 +81,7 @@ class EngineCore:
             available_gpu_memory = [0] * len(kv_cache_specs)
         return available_gpu_memory
 
-    # SOURCE: vllm/v1/engine/core.py:L1965-L1978
+    # SOURCE: vllm/v1/engine/core.py:L1969-L1982
     def _eep_scale_up_before_kv_init(self):
         from elastic_state import ElasticEPScalingState
 
@@ -106,7 +106,7 @@ class DPEngineCoreProc(EngineCore):
     #   只读其 busy loop 的 eep 钩子与 reinitialize_distributed，故省略构造，
     #   由测试注入 dp_group/dp_store/engines_running/current_wave/step_counter。
 
-    # SOURCE: vllm/v1/engine/core.py:L1790-L1844 (run_busy_loop, eep 钩子段)
+    # SOURCE: vllm/v1/engine/core.py:L1794-L1848 (run_busy_loop, eep 钩子段)
     def run_busy_loop(self):
         """Core busy loop of the EngineCore for data parallel case."""
 
@@ -127,13 +127,13 @@ class DPEngineCoreProc(EngineCore):
             #   _maybe_publish_request_counts / execute_dummy_batch /
             #   _has_global_unfinished_reqs / current_wave++ / step_counter 重置。
             #   本章只截到 eep 钩子，wave 部分交叉引用 ch21。
-            #   原 vllm/v1/engine/core.py:L1806-L1842。
+            #   原 vllm/v1/engine/core.py:L1810-L1846。
             self._process_engine_step()
 
-        # SOURCE: vllm/v1/engine/core.py:L1844
+        # SOURCE: vllm/v1/engine/core.py:L1848
         raise SystemExit
 
-    # SOURCE: vllm/v1/engine/core.py:L1865-L1911
+    # SOURCE: vllm/v1/engine/core.py:L1869-L1915
     def reinitialize_distributed(self, reconfig_request) -> None:
         from copy import deepcopy
 
@@ -177,9 +177,9 @@ class DPEngineCoreProc(EngineCore):
         )
         self.process_input_queue_block = False
         # SUBTRACTED: logger.info("[Elastic EP] Received reconfiguration ...")
-        #   纯日志。原 vllm/v1/engine/core.py:L1909-1911。
+        #   纯日志。原 vllm/v1/engine/core.py:L1913-L1915。
 
-    # SOURCE: vllm/v1/engine/core.py:L1953-L1963 (eep_handle_engine_core_notification)
+    # SOURCE: vllm/v1/engine/core.py:L1957-L1967 (eep_handle_engine_core_notification)
     def eep_handle_engine_core_notification(self, notification_type) -> None:
         """
         Handle notification received from EngineCoreClient
@@ -190,10 +190,10 @@ class DPEngineCoreProc(EngineCore):
             notification_type = EEPNotificationType(notification_type)
         self.eep_scaling_state.handle_notification(notification_type)
 
-    # SOURCE: vllm/v1/engine/core.py:L1913 (_eep_send_engine_core_notification)
+    # SOURCE: vllm/v1/engine/core.py:L1917 (_eep_send_engine_core_notification)
     def _eep_send_engine_core_notification(self, notification_type, vllm_config=None):
         # SUBTRACTED: 真实方法把通知经 output_queue/ZMQ 发回 EngineCoreClient
-        #   再转发给其它引擎（vllm/v1/engine/core.py:L1913-L1951）。本章只读
+        #   再转发给其它引擎（vllm/v1/engine/core.py:L1917-L1955）。本章只读
         #   状态机调用此发送点的时机，故委派给可观察的注入回调，保留调用语义。
         if getattr(self, "_eep_notification_sink", None) is not None:
             self._eep_notification_sink(notification_type)

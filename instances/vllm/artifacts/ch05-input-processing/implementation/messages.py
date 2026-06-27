@@ -308,7 +308,7 @@ class EngineCoreRequest:
 
     @property
     def params(self):
-        # SOURCE: vllm/v1/engine/__init__.py:L125 (params)
+        # SOURCE: vllm/v1/engine/__init__.py:L131 (params)
         """Return the processed params (sampling or pooling)."""
         if self.sampling_params is not None:
             return self.sampling_params

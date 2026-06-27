@@ -44,20 +44,20 @@ class UniProcExecutor(Executor):
         self.driver_worker.init_device()
 
         # SUBTRACTED: VLLM_ELASTIC_EP_SCALE_UP_LAUNCH 分支（弹性专家并行扩容时走 elastic_ep_execute，
-        #   vllm/v1/executor/uniproc_executor.py:L49-L52）—— EP 特性开关，默认走 load_model。
+        #   vllm/v1/executor/uniproc_executor.py:L62-L65）—— EP 特性开关，默认走 load_model。
         self.driver_worker.load_model()
         # SUBTRACTED: current_platform.update_block_size_for_backend(self.vllm_config)
-        #   （vllm/v1/executor/uniproc_executor.py:L53）—— 平台相关 block size 调整。
+        #   （vllm/v1/executor/uniproc_executor.py:L66）—— 平台相关 block size 调整。
 
-    # SOURCE: vllm/v1/executor/uniproc_executor.py:L55-L61
+    # SOURCE: vllm/v1/executor/uniproc_executor.py:L68-L74
     def _distributed_args(self) -> tuple[str, int, int]:
         """Return (distributed_init_method, rank, local_rank)."""
         # SUBTRACTED: 真实实现用 get_distributed_init_method(get_ip(), get_open_port()) 取真实端口，
-        #   并按 device_config 解析 local_rank（vllm/v1/executor/uniproc_executor.py:L57-L61）——
+        #   并按 device_config 解析 local_rank（vllm/v1/executor/uniproc_executor.py:L70-L74）——
         #   牵入网络/设备；单 worker 演示用占位 ("local", 0, 0) 即可。
         return "local", 0, 0
 
-    # SUBTRACTED: max_concurrent_batches（vllm/v1/executor/uniproc_executor.py:L63-L65）—— 异步调度
+    # SUBTRACTED: max_concurrent_batches（vllm/v1/executor/uniproc_executor.py:L76-L78）—— 异步调度
     #   并发批数，本章不展开异步调度流水。
 
     # SOURCE: vllm/v1/executor/uniproc_executor.py:L67-L100
@@ -90,16 +90,16 @@ class UniProcExecutor(Executor):
         return future
 
     # SUBTRACTED: uni 版 execute_model / sample_tokens / take_draft_token_ids 的 single_value 重写
-    #   （vllm/v1/executor/uniproc_executor.py:L102-L128）—— 与基类同语义，仅多传 single_value=True；
+    #   （vllm/v1/executor/uniproc_executor.py:L107-L133）—— 与基类同语义，仅多传 single_value=True；
     #   本章用基类 execute_model（走 collective_rpc 默认 list 返回）即可对照 mp。
 
-    # SOURCE: vllm/v1/executor/uniproc_executor.py:L130-L133
+    # SOURCE: vllm/v1/executor/uniproc_executor.py:L135-L138
     def check_health(self) -> None:
         # UniProcExecutor will always be healthy as long as
         # it's running.
         return
 
-    # SOURCE: vllm/v1/executor/uniproc_executor.py:L135-L137
+    # SOURCE: vllm/v1/executor/uniproc_executor.py:L140-L142
     def shutdown(self) -> None:
         if worker := self.driver_worker:
             worker.shutdown()

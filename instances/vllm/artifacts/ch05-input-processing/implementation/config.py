@@ -97,7 +97,7 @@ class Renderer:
 class _CurrentPlatform:
     @staticmethod
     def validate_request(processed_inputs, params) -> None:
-        # SOURCE: vllm/platforms/interface.py:L812 (Platform.validate_request)
+        # SOURCE: vllm/platforms/interface.py:L848 (Platform.validate_request)
         """Raises if this request is unsupported on this platform.
 
         基类实现为 no-op（CUDA 等平台可覆盖）；精简版保留调用点即可。

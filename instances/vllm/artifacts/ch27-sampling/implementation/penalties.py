@@ -22,7 +22,7 @@ def is_pin_memory_available() -> bool:
 def make_tensor_with_pad(
     x, pad, dtype, *, max_len=None, device=None, pin_memory=False
 ):
-    # SOURCE: vllm/utils/torch_utils.py:L612-634（+ 内联 make_ndarray_with_pad:L587-609）
+    # SOURCE: vllm/utils/torch_utils.py:L644-L666（+ 内联 make_ndarray_with_pad:L587-609）
     if max_len is None:
         max_len = max(map(len, x), default=0)
     np_dtype = {torch.int64: np.int64, torch.int32: np.int32}[dtype]
@@ -48,7 +48,7 @@ def apply_repetition_penalties_torch(
     output_mask: torch.Tensor,
     repetition_penalties: torch.Tensor,
 ) -> None:
-    # SOURCE: vllm/_custom_ops.py:L471-484
+    # SOURCE: vllm/_custom_ops.py:L472-L485
     repetition_penalties = repetition_penalties.unsqueeze(dim=1).repeat(
         1, logits.size(1)
     )
@@ -65,7 +65,7 @@ def apply_repetition_penalties(
     output_mask: torch.Tensor,
     repetition_penalties: torch.Tensor,
 ) -> None:
-    # SOURCE: vllm/_custom_ops.py:L498-519
+    # SOURCE: vllm/_custom_ops.py:L499-L520
     """Apply repetition penalties to logits in-place."""
     if logits.is_cuda and logits.is_contiguous():
         # SUBTRACTED: apply_repetition_penalties_cuda 分支（_custom_ops.py:L512-515）——

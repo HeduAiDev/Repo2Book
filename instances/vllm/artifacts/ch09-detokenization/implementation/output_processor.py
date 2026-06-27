@@ -41,7 +41,7 @@ class OutputProcessor:
         #   log_stats / tokenizer — orthogonal to the stop-string slice.
         self.request_states: dict[str, RequestState] = {}
 
-    # SOURCE: vllm/v1/engine/output_processor.py:L572
+    # SOURCE: vllm/v1/engine/output_processor.py:L597
     def process_outputs(
         self,
         engine_core_outputs: list[EngineCoreOutput],
@@ -99,7 +99,7 @@ class OutputProcessor:
             reqs_to_abort=reqs_to_abort,
         )
 
-    # SOURCE: vllm/v1/engine/output_processor.py:L689
+    # SOURCE: vllm/v1/engine/output_processor.py:L714
     def _finish_request(self, req_state: RequestState) -> None:
         # SUBTRACTED: external_req_ids cleanup + parent_req aggregation
         #   (parallel sampling / external id mapping — subtraction_plan.delete).

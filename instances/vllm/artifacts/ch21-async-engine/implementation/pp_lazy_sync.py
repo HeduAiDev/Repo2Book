@@ -255,7 +255,7 @@ class Worker:
     def get_pp_group(self) -> PPGroupCoordinator:
         return self._pp_group
 
-    # SOURCE: vllm/v1/worker/gpu_worker.py:L772
+    # SOURCE: vllm/v1/worker/gpu_worker.py:L782
     def execute_model(self, scheduler_output: Any) -> Any:
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:
@@ -268,7 +268,7 @@ class Worker:
         all_gather_tensors: dict[str, bool] = {}
         # SUBTRACTED: sequence-parallel all_gather_tensors computation (PP+SP) —
         #   only affects whether residual needs all-gather; lazy-sync main line
-        #   is unaffected with SP off · vllm/v1/worker/gpu_worker.py:L789-816
+        #   is unaffected with SP off · vllm/v1/worker/gpu_worker.py:L799-L826
 
         if forward_pass and not self.get_pp_group().is_first_rank:
             tensor_dict, comm_handles, comm_postprocess = (
@@ -288,13 +288,13 @@ class Worker:
             scheduler_output, intermediate_tensors
         )
         # SUBTRACTED: pooling-model output is None → pool() side-branch ·
-        #   vllm/v1/worker/gpu_worker.py:L836-841
+        #   vllm/v1/worker/gpu_worker.py:L846-L851
         if isinstance(output, _ModelRunnerOutputMarker) or output is None:
             return output
 
         assert isinstance(output, IntermediateTensors)
         # SUBTRACTED: external_launcher / is_last_rank asserts — never fire for a
-        #   normal PP middle rank · vllm/v1/worker/gpu_worker.py:L848-852
+        #   normal PP middle rank · vllm/v1/worker/gpu_worker.py:L858-L862
 
         # launch non-blocking send of intermediate tensors
         self._pp_send_work = self.get_pp_group().isend_tensor_dict(

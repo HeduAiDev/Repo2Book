@@ -64,5 +64,5 @@ class UniProcExecutor(AbstractExecutor):
 
     @cached_property
     def max_concurrent_batches(self) -> int:
-        # SOURCE: vllm/v1/executor/uniproc_executor.py:L63-L65
+        # SOURCE: vllm/v1/executor/uniproc_executor.py:L76-L78
         return 2 if self.scheduler_config.async_scheduling else 1

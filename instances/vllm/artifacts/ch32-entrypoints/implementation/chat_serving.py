@@ -60,7 +60,7 @@ class OpenAIServingChat(OpenAIServing):
         return request.chat_template_kwargs or {}
 
     async def render_chat_request(self, request):
-        # SOURCE: vllm/entrypoints/openai/chat_completion/serving.py:L202 render_chat_request
+        # SOURCE: vllm/entrypoints/openai/chat_completion/serving.py:L198 render_chat_request
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             return error_check_ret
@@ -78,7 +78,7 @@ class OpenAIServingChat(OpenAIServing):
         request,
         raw_request=None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
-        # SOURCE: vllm/entrypoints/openai/chat_completion/serving.py:L229 create_chat_completion
+        # SOURCE: vllm/entrypoints/openai/chat_completion/serving.py:L225 create_chat_completion
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
         chat_template_kwargs = self._effective_chat_template_kwargs(request)
@@ -172,7 +172,7 @@ class OpenAIServingChat(OpenAIServing):
         tokenizer,
         request_metadata,
     ) -> AsyncGenerator[str, None]:
-        # SOURCE: vllm/entrypoints/openai/chat_completion/serving.py:L408 chat_completion_stream_generator
+        # SOURCE: vllm/entrypoints/openai/chat_completion/serving.py:L397 chat_completion_stream_generator
         created_time = int(time.time())
         chunk_object_type = "chat.completion.chunk"
         num_choices = 1  # SUBTRACTED: n>1 多 choice 扇出（主线 assert len(generators)==1）
@@ -293,7 +293,7 @@ class OpenAIServingChat(OpenAIServing):
         tokenizer,
         request_metadata,
     ) -> ErrorResponse | ChatCompletionResponse:
-        # SOURCE: vllm/entrypoints/openai/chat_completion/serving.py:L1148 chat_completion_full_generator
+        # SOURCE: vllm/entrypoints/openai/chat_completion/serving.py:L1003 chat_completion_full_generator
         created_time = int(time.time())
         final_res: RequestOutput | None = None
 

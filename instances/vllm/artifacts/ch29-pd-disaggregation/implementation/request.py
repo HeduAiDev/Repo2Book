@@ -8,7 +8,7 @@
 import enum
 
 
-# SOURCE: vllm/v1/request.py:L310 (RequestStatus)
+# SOURCE: vllm/v1/request.py:L316 (RequestStatus)
 class RequestStatus(enum.IntEnum):
     """Status of a request."""
 
@@ -24,14 +24,14 @@ class RequestStatus(enum.IntEnum):
     FINISHED_STOPPED = enum.auto()
     # SUBTRACTED: 其余 FINISHED_* 细分原因（LENGTH_CAPPED/ABORTED/IGNORED/ERROR/
     # REPETITION）与本章 KV-connector 调度集成无关，仅保留一个代表 is_finished
-    # 判定即可（原 vllm/v1/request.py:L322-326）。
+    # 判定即可（原 vllm/v1/request.py:L328-L332）。
 
-    # SOURCE: vllm/v1/request.py:L328
+    # SOURCE: vllm/v1/request.py:L334
     def __str__(self) -> str:
         return self.name
 
     @staticmethod
-    # SOURCE: vllm/v1/request.py:L332 (is_finished)
+    # SOURCE: vllm/v1/request.py:L338 (is_finished)
     def is_finished(status: "RequestStatus") -> bool:
         return status > RequestStatus.PREEMPTED
 

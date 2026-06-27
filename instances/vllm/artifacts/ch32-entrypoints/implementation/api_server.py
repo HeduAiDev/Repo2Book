@@ -102,7 +102,7 @@ async def build_async_engine_client_from_engine_args(
 async def run_server_worker(
     listen_address, sock, args, client_config=None, **uvicorn_kwargs
 ) -> None:
-    # SOURCE: vllm/entrypoints/openai/api_server.py:L681 run_server_worker
+    # SOURCE: vllm/entrypoints/openai/api_server.py:L696 run_server_worker
     """Run a single API server worker."""
     # SUBTRACTED: tool/reasoning parser plugin 导入（部署期可选，dossier delete 批准）。
 
@@ -123,7 +123,7 @@ async def run_server_worker(
 # --- 启动序：先绑 socket（先于引擎，避端口竞争） ---
 
 def setup_server(args):
-    # SOURCE: vllm/entrypoints/openai/api_server.py:L533 setup_server
+    # SOURCE: vllm/entrypoints/openai/api_server.py:L548 setup_server
     """Validate API server args, set up signal handler, create socket
     ready to serve."""
     # SUBTRACTED: log_version_and_model / log_non_default_args / parser plugin 导入（仅日志/插件）。
@@ -159,7 +159,7 @@ async def build_and_serve(
     args,
     **uvicorn_kwargs,
 ) -> asyncio.Task:
-    # SOURCE: vllm/entrypoints/openai/api_server.py:L578 build_and_serve
+    # SOURCE: vllm/entrypoints/openai/api_server.py:L593 build_and_serve
     """Build FastAPI app, initialize state, and start serving.
 
     Returns the shutdown task for the caller to await.

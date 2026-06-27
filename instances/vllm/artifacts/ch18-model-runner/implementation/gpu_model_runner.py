@@ -111,12 +111,12 @@ class GPUModelRunner:
         # SOURCE: vllm/v1/worker/gpu_model_runner.py (CpuGpuBuffer factory in __init__)
         return CpuGpuBuffer(*size, dtype=dtype, device=self.device, pin_memory=False)
 
-    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L1003  _may_reorder_batch
+    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L1011  _may_reorder_batch
     def _may_reorder_batch(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the order of requests in the batch based on the attention
         backend's needs (e.g. MLA may separate compute- vs memory-bound)."""
         # SUBTRACTED: kv_cache_groups emptiness guard (attention-free models).
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1018-L1019
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1026-L1027
         if self.reorder_batch_threshold is not None:
             reorder_batch_to_split_decodes_and_prefills(
                 self.input_batch,
@@ -124,7 +124,7 @@ class GPUModelRunner:
                 decode_threshold=self.reorder_batch_threshold,
             )
 
-    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L1065  _update_states
+    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L1073  _update_states
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
         output. The updated states are used by `_prepare_inputs`."""
@@ -133,7 +133,7 @@ class GPUModelRunner:
             self.requests.pop(req_id, None)
         # SUBTRACTED: num_prompt_logprobs.pop / late_interaction_runner.on_requests_
         #   finished. Approved (prompt logprobs / late interaction pooling).
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1078-L1081
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1086-L1089
 
         # Remove the finished requests from the persistent batch.
         for req_id in scheduler_output.finished_req_ids:
@@ -141,7 +141,7 @@ class GPUModelRunner:
 
         # SUBTRACTED: _zero_block_ids (fresh-block NaN zeroing) + encoder_cache
         #   free. Approved — orthogonal to the persistent-batch reconciliation.
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1091-L1098
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1105-L1112
 
         # Remove the unscheduled requests from the persistent batch.
         # NOTE(woosuk): The unscheduled requests are either preempted requests
@@ -158,7 +158,7 @@ class GPUModelRunner:
             self.input_batch.remove_request(req_id)
 
         # SUBTRACTED: ngram_gpu tracking lists init. Approved (async spec decode).
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1122-L1127
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1136-L1141
 
         reqs_to_add: list[CachedRequestState] = []
 
@@ -166,12 +166,12 @@ class GPUModelRunner:
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
             # SUBTRACTED: streaming same-req_id reuse branch. Approved.
-            #   Orig: vllm/v1/worker/gpu_model_runner.py:L1135-L1139
+            #   Orig: vllm/v1/worker/gpu_model_runner.py:L1149-L1153
 
             sampling_params = new_req_data.sampling_params
             # SUBTRACTED: RANDOM_SEED generator construction + pooling pooler
             #   updates. Approved (seeded RNG plumbing / pooling).
-            #   Orig: vllm/v1/worker/gpu_model_runner.py:L1144-L1160
+            #   Orig: vllm/v1/worker/gpu_model_runner.py:L1158-L1174
             generator = None
 
             req_state = CachedRequestState(
@@ -186,7 +186,7 @@ class GPUModelRunner:
             self.requests[req_id] = req_state
             # SUBTRACTED: late_interaction_runner.register_request / num_prompt_logprobs
             #   / M-RoPE / XD-RoPE init / ngram_gpu tracking. Approved.
-            #   Orig: vllm/v1/worker/gpu_model_runner.py:L1177-L1197
+            #   Orig: vllm/v1/worker/gpu_model_runner.py:L1191-L1211
             reqs_to_add.append(req_state)
 
         # Update the states of the running/resumed requests.
@@ -196,7 +196,7 @@ class GPUModelRunner:
 
         # SUBTRACTED: ngram_gpu original_num_spec_per_req / async spec-decode
         #   prev_num_draft_tokens bookkeeping. Approved.
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1204-L1220
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1218-L1234
 
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests[req_id]
@@ -208,7 +208,7 @@ class GPUModelRunner:
 
             # SUBTRACTED: async-scheduling prev_num_draft_len optimistic counting +
             #   deferred spec-decode corrections. Approved.
-            #   Orig: vllm/v1/worker/gpu_model_runner.py:L1230-L1271
+            #   Orig: vllm/v1/worker/gpu_model_runner.py:L1244-L1285
 
             # Update the cached states.
             req_state.num_computed_tokens = num_computed_tokens
@@ -216,7 +216,7 @@ class GPUModelRunner:
             # SUBTRACTED: non-last-rank token backfill (PP). On the last rank the
             #   sampled tokens are already cached, so no token_ids update needed
             #   here. Approved (pipeline parallelism).
-            #   Orig: vllm/v1/worker/gpu_model_runner.py:L1275-L1295
+            #   Orig: vllm/v1/worker/gpu_model_runner.py:L1289-L1309
             if num_output_tokens < len(req_state.output_token_ids):
                 # Some output tokens were discarded due to a sync-KV-load failure.
                 # Align the cached state.
@@ -247,7 +247,7 @@ class GPUModelRunner:
                 # previous step and needs to be added again.
                 # SUBTRACTED: async-scheduling output_token_ids recovery +
                 #   ngram_gpu tracking. Approved.
-                #   Orig: vllm/v1/worker/gpu_model_runner.py:L1326-L1335
+                #   Orig: vllm/v1/worker/gpu_model_runner.py:L1340-L1349
                 reqs_to_add.append(req_state)
                 continue
 
@@ -263,7 +263,7 @@ class GPUModelRunner:
             # Add spec_token_ids to token_ids_cpu.
             self.input_batch.update_req_spec_token_ids(req_state, scheduled_spec_tokens)
             # SUBTRACTED: ngram trimming restore of prev_num_draft_len. Approved.
-            #   Orig: vllm/v1/worker/gpu_model_runner.py:L1356-L1360
+            #   Orig: vllm/v1/worker/gpu_model_runner.py:L1384-L1388
 
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
@@ -280,9 +280,9 @@ class GPUModelRunner:
 
         # SUBTRACTED: ngram_gpu incremental tensor update + deferred spec-decode
         #   correction closure return. Approved (async spec decode).
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1375-L1419
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1403-L1447
 
-    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L1572  _get_cumsum_and_arange
+    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L1600  _get_cumsum_and_arange
     def _get_cumsum_and_arange(
         self,
         num_tokens: np.ndarray,
@@ -305,7 +305,7 @@ class GPUModelRunner:
         )
         return cu_num_tokens
 
-    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L1787  _prepare_inputs
+    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L1815  _prepare_inputs
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -341,7 +341,7 @@ class GPUModelRunner:
         )
 
         # SUBTRACTED: M-RoPE / XD-RoPE position calc. Approved (multimodal).
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1825-L1833
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1853-L1861
 
         # Get token indices.
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
@@ -380,7 +380,7 @@ class GPUModelRunner:
 
         # SUBTRACTED: prev_positions / discard_request_mask / num_accepted_tokens
         #   sync + async spec-decode num_computed_tokens GPU correction. Approved.
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1920-L1984
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1948-L2012
         self.num_computed_tokens[:num_reqs].copy_(
             self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
             non_blocking=True,
@@ -412,16 +412,16 @@ class GPUModelRunner:
         # Copy the input ids to the GPU.
         # SUBTRACTED: _prepare_input_ids prev_sampled_token_ids backfill (async
         #   scheduling). Reduced companion does the normal-scheduling copy.
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1613-L1636, L2015
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1641-L1664, L2015
         self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
 
         # SUBTRACTED: spec_decode_metadata branch + LoRA hot-swap. Approved.
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L2043-L2091
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L2071-L2119
         query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
         logits_indices = query_start_loc[1:] - 1
         return logits_indices
 
-    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L2098  _build_attention_metadata
+    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L2126  _build_attention_metadata
     def _build_attention_metadata(
         self,
         num_tokens: int,

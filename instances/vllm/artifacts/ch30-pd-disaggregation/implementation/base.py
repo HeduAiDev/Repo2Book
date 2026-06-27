@@ -46,7 +46,7 @@ class KVConnectorBase_V1(ABC):
     # ==============================
 
     def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L217-L227
+        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L210-L220
         """Set the connector metadata from the scheduler.
 
         Called by the model runner every time before model execution. The
@@ -55,18 +55,18 @@ class KVConnectorBase_V1(ABC):
         self._connector_metadata = connector_metadata
 
     def clear_connector_metadata(self) -> None:
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L229-L235
+        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L222-L228
         """Clear the connector metadata. Called after model execution."""
         self._connector_metadata = None
 
     def _get_connector_metadata(self) -> KVConnectorMetadata:
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L237-L247
+        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L230-L240
         # Should only be called while set to valid metadata.
         assert self._connector_metadata is not None
         return self._connector_metadata
 
     def has_connector_metadata(self) -> bool:
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L249-L255
+        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L242-L248
         return self._connector_metadata is not None
 
     # ==============================
@@ -75,7 +75,7 @@ class KVConnectorBase_V1(ABC):
 
     @abstractmethod
     def start_load_kv(self, forward_context, **kwargs) -> None:
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L298-L314
+        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L291-L307
         """
         Start loading the KV cache from the connector to vLLM's paged
         KV buffer. This is called from the forward context before the
@@ -85,7 +85,7 @@ class KVConnectorBase_V1(ABC):
 
     @abstractmethod
     def wait_for_layer_load(self, layer_name: str) -> None:
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L316-L328
+        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L309-L321
         """
         Block until the KV for a specific layer is loaded into vLLM's
         paged buffer. This is called from within attention layer to ensure
@@ -95,7 +95,7 @@ class KVConnectorBase_V1(ABC):
 
     @abstractmethod
     def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs) -> None:
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L330-L350
+        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L323-L343
         """
         Start saving a layer of KV cache from vLLM's paged buffer
         to the connector. This is called from within attention layer to
@@ -105,7 +105,7 @@ class KVConnectorBase_V1(ABC):
 
     @abstractmethod
     def wait_for_save(self):
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L352-L361
+        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L345-L354
         """
         Block until all the save operations is done. This is called
         as the forward context exits to ensure that the async saving
@@ -115,7 +115,7 @@ class KVConnectorBase_V1(ABC):
         pass
 
     def get_finished(self, finished_req_ids):
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L363-L379
+        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L356-L372
         """
         Notifies worker-side connector ids of requests that have
         finished generating tokens on the worker. The scheduler process
@@ -126,7 +126,7 @@ class KVConnectorBase_V1(ABC):
         return None, None
 
     def get_block_ids_with_load_errors(self) -> set:
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L381-L399
+        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L374-L392
         return set()
 
     # ==============================

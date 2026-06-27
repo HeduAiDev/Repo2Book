@@ -82,13 +82,13 @@ class EngineCore:
         # SUBTRACTED: 真实从 self.model_executor.supported_tasks 取。固定示例值。原 :L313。
         return ("generate",)
 
-    # SOURCE: vllm/v1/engine/core.py:L765  EngineCore.preprocess_add_request
+    # SOURCE: vllm/v1/engine/core.py:L769  EngineCore.preprocess_add_request
     def preprocess_add_request(
         self, request: EngineCoreRequest
     ) -> tuple["Request", int]:
         # SUBTRACTED: mm hashing / block hasher / Request.from_engine_core_request
         #   的完整字段映射（属输入处理另章）。保留 (Request, request_wave) 二元组返回结构。
-        #   原 vllm/v1/engine/core.py:L765-L798。
+        #   原 vllm/v1/engine/core.py:L769-L802。
         req = Request(request.request_id, request.client_index)
         return req, 0
 
@@ -103,14 +103,14 @@ class EngineCore:
         # self.scheduler.add_request(request) -> 最小登记。
         self._requests[request.request_id] = request
 
-    # SOURCE: vllm/v1/engine/core.py:L348  EngineCore.abort_requests
+    # SOURCE: vllm/v1/engine/core.py:L352  EngineCore.abort_requests
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
         # self.scheduler.finish_requests(request_ids, FINISHED_ABORTED) -> 最小登记。
         for rid in request_ids:
             self._requests.pop(rid, None)
 
-    # SOURCE: vllm/v1/engine/core.py:L402  EngineCore.step
+    # SOURCE: vllm/v1/engine/core.py:L406  EngineCore.step
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -120,28 +120,28 @@ class EngineCore:
         # SUBTRACTED: scheduler.schedule() / model_executor.execute_model() /
         #   update_from_output() 三段实体（属调度/执行另章，且不可杜撰伪 forward）。
         #   保留"无请求即空返回"的真实短路；有请求时返回空步进，由注入的 step_fn 决定产出。
-        #   原 vllm/v1/engine/core.py:L409-L431。
+        #   原 vllm/v1/engine/core.py:L413-L435。
         if not self._requests:
             return {}, False
         return {}, False
 
-    # SOURCE: vllm/v1/engine/core.py:L433  EngineCore.post_step
+    # SOURCE: vllm/v1/engine/core.py:L437  EngineCore.post_step
     def post_step(self, model_executed: bool) -> None:
         # SUBTRACTED: spec decode draft token 更新（非本章主线）。原 :L437-L439。
         pass
 
-    # SOURCE: vllm/v1/engine/core.py:L1152  EngineCore.has_work
+    # SOURCE: vllm/v1/engine/core.py:L1156  EngineCore.has_work
     def has_work(self) -> bool:
         # SUBTRACTED: 真实判 scheduler.has_requests() or batch_queue / DP engines_running。
-        #   原 vllm/v1/engine/core.py:L1152-L1158。
+        #   原 vllm/v1/engine/core.py:L1156-L1162。
         return bool(self._requests)
 
-    # SOURCE: vllm/v1/engine/core.py:L1160  EngineCore.is_running
+    # SOURCE: vllm/v1/engine/core.py:L1164  EngineCore.is_running
     def is_running(self) -> bool:
         """Returns true if shutdown has not been requested."""
         return self.shutdown_state == EngineShutdownState.RUNNING
 
-    # SOURCE: vllm/v1/engine/core.py:L1164  EngineCore.run_busy_loop
+    # SOURCE: vllm/v1/engine/core.py:L1168  EngineCore.run_busy_loop
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
         while self._handle_shutdown():
@@ -152,7 +152,7 @@ class EngineCore:
 
         raise SystemExit
 
-    # SOURCE: vllm/v1/engine/core.py:L1174  EngineCore._process_input_queue
+    # SOURCE: vllm/v1/engine/core.py:L1178  EngineCore._process_input_queue
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
 
@@ -178,7 +178,7 @@ class EngineCore:
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
 
-    # SOURCE: vllm/v1/engine/core.py:L1205  EngineCore._process_engine_step
+    # SOURCE: vllm/v1/engine/core.py:L1209  EngineCore._process_engine_step
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
 
@@ -192,20 +192,20 @@ class EngineCore:
         # SUBTRACTED: WAITING_FOR_REMOTE_KVS 让步 sleep（NIXL 旁支）。原 :L1216-L1221。
         return model_executed
 
-    # SOURCE: vllm/v1/engine/core.py:L1225  EngineCore._notify_idle_state_callbacks
+    # SOURCE: vllm/v1/engine/core.py:L1229  EngineCore._notify_idle_state_callbacks
     def _notify_idle_state_callbacks(self) -> None:
         while self._idle_state_callbacks:
             callback = self._idle_state_callbacks.pop()
             callback(self)
 
-    # SOURCE: vllm/v1/engine/core.py:L1230  EngineCore._handle_shutdown
+    # SOURCE: vllm/v1/engine/core.py:L1234  EngineCore._handle_shutdown
     def _handle_shutdown(self) -> bool:
         # SUBTRACTED: EngineShutdownState.REQUESTED 的 draining/timeout 排空状态机
         #   （delete 第4项批准）。保留 RUNNING 直通 + 哨兵驱动的硬退出。
-        #   原 vllm/v1/engine/core.py:L1232-L1264。
+        #   原 vllm/v1/engine/core.py:L1236-L1268。
         return self.shutdown_state == EngineShutdownState.RUNNING
 
-    # SOURCE: vllm/v1/engine/core.py:L1266  EngineCore._handle_client_request
+    # SOURCE: vllm/v1/engine/core.py:L1270  EngineCore._handle_client_request
     def _handle_client_request(
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
@@ -241,7 +241,7 @@ class EngineCore:
     def _invoke_utility_method(
         name: str, get_result: Callable, output: UtilityOutput, enqueue_output: Callable
     ):
-        # SOURCE: vllm/v1/engine/core.py:L1322  EngineCore._invoke_utility_method
+        # SOURCE: vllm/v1/engine/core.py:L1326  EngineCore._invoke_utility_method
         try:
             result = get_result()
             # SUBTRACTED: isinstance(result, Future) 的延迟回调分支（async utility）。原 :L1328-L1334。
@@ -254,7 +254,7 @@ class EngineCore:
     def _convert_msgspec_args(method, args):
         """If a provided arg type doesn't match corresponding target method
         arg type, try converting to msgspec object."""
-        # SOURCE: vllm/v1/engine/core.py:L1341  EngineCore._convert_msgspec_args
+        # SOURCE: vllm/v1/engine/core.py:L1345  EngineCore._convert_msgspec_args
         if not args:
             return args
         arg_types = signature(method).parameters.values()
@@ -278,20 +278,20 @@ class Request:
         self.client_index = client_index
 
 
-# SOURCE: vllm/v1/engine/core.py:L800  EngineShutdownState
+# SOURCE: vllm/v1/engine/core.py:L804  EngineShutdownState
 class EngineShutdownState:
     RUNNING = 0
     REQUESTED = 1
     SHUTTING_DOWN = 2
 
 
-# SOURCE: vllm/v1/engine/core.py:L806  EngineCoreProc
+# SOURCE: vllm/v1/engine/core.py:L810  EngineCoreProc
 class EngineCoreProc(EngineCore):
     """ZMQ-wrapper for running EngineCore in background process."""
 
     ENGINE_CORE_DEAD = b"ENGINE_CORE_DEAD"
 
-    # SOURCE: vllm/v1/engine/core.py:L812  EngineCoreProc.__init__
+    # SOURCE: vllm/v1/engine/core.py:L816  EngineCoreProc.__init__
     def __init__(
         self,
         input_address: str,
@@ -307,7 +307,7 @@ class EngineCoreProc(EngineCore):
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
         self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
         # SUBTRACTED: executor_fail_callback 经 EXECUTOR_FAILED 投 input_queue（保留概念，
-        #   不接真实 executor）。原 vllm/v1/engine/core.py:L827-L829。
+        #   不接真实 executor）。原 vllm/v1/engine/core.py:L831-L833。
 
         self.engine_index = engine_index
         identity = self.engine_index.to_bytes(length=2, byteorder="little")
@@ -319,7 +319,7 @@ class EngineCoreProc(EngineCore):
             self.tensor_ipc_receiver = TensorIpcReceiver(tensor_queue)
 
         # SUBTRACTED: _perform_handshakes 的 DP 双握手 / coordinator socket（delete 第3项）。
-        #   原 vllm/v1/engine/core.py:L842-L848,L921+。本章单 engine 单次握手在 IO 线程内完成。
+        #   原 vllm/v1/engine/core.py:L846-L852,L921+。本章单 engine 单次握手在 IO 线程内完成。
         super().__init__(vllm_config, executor_class, log_stats)
         self.process_input_queue_block = True
         self._ctx = ctx
@@ -349,7 +349,7 @@ class EngineCoreProc(EngineCore):
             if not input_thread.is_alive():
                 raise RuntimeError("Input socket thread died during startup")
 
-    # SOURCE: vllm/v1/engine/core.py:L1358  EngineCoreProc._send_engine_dead
+    # SOURCE: vllm/v1/engine/core.py:L1362  EngineCoreProc._send_engine_dead
     def _send_engine_dead(self):
         """Send EngineDead status to the EngineCoreClient."""
         # Put ENGINE_CORE_DEAD in the queue.
@@ -357,7 +357,7 @@ class EngineCoreProc(EngineCore):
         # Wait until msg sent by the daemon before shutdown.
         self.output_thread.join(timeout=5.0)
 
-    # SOURCE: vllm/v1/engine/core.py:L1372  EngineCoreProc.process_input_sockets
+    # SOURCE: vllm/v1/engine/core.py:L1376  EngineCoreProc.process_input_sockets
     def process_input_sockets(
         self,
         input_addresses: list[str],
@@ -383,7 +383,7 @@ class EngineCoreProc(EngineCore):
                 for input_address in input_addresses
             ]
             # SUBTRACTED: coordinator XSUB socket + START_DP_WAVE / READY 订阅（delete 第3项）。
-            #   原 vllm/v1/engine/core.py:L1396-L1409,L1426-L1429,L1437-L1441。
+            #   原 vllm/v1/engine/core.py:L1400-L1413,L1426-L1429,L1437-L1441。
 
             # Register sockets with poller.
             poller = zmq.Poller()
@@ -430,7 +430,7 @@ class EngineCoreProc(EngineCore):
                     # Push to input queue for core busy loop.
                     self.input_queue.put_nowait((request_type, request))
 
-    # SOURCE: vllm/v1/engine/core.py:L1466  EngineCoreProc.process_output_sockets
+    # SOURCE: vllm/v1/engine/core.py:L1470  EngineCoreProc.process_output_sockets
     def process_output_sockets(
         self, output_paths: list[str], coord_output_path: str | None, engine_index: int
     ):
@@ -455,7 +455,7 @@ class EngineCoreProc(EngineCore):
                 for output_path in output_paths
             ]
             # SUBTRACTED: coordinator PUSH socket（client_index==-1 路径，delete 第3项）。
-            #   原 vllm/v1/engine/core.py:L1489-L1497,L1510-L1515。
+            #   原 vllm/v1/engine/core.py:L1493-L1501,L1510-L1515。
             max_reuse_bufs = len(sockets) + 1
 
             while True:

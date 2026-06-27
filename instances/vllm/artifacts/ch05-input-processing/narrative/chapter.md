@@ -454,7 +454,7 @@ return EngineCoreRequest(
 `EngineCoreRequest` 不是普通 dataclass，它是个为**跨进程 IPC** 量身定做的 msgspec 结构体：
 
 ```python
-# vllm/v1/engine/__init__.py:L80-L131
+# vllm/v1/engine/__init__.py:L80-L137
 class EngineCoreRequest(
     msgspec.Struct,
     array_like=True,        # 序列化成数组而非字典，省掉字段名开销

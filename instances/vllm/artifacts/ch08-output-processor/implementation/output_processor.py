@@ -25,7 +25,7 @@ from .outputs import RequestOutput
 from .parallel_sampling import ParentRequest
 
 
-# SOURCE: vllm/v1/engine/output_processor.py:L45
+# SOURCE: vllm/v1/engine/output_processor.py:L48
 class RequestOutputCollector:
     """
     Collects streamed RequestOutputs per individual request,
@@ -35,22 +35,22 @@ class RequestOutputCollector:
     producer gets ahead of the consumer.
     """
 
-    # SOURCE: vllm/v1/engine/output_processor.py:L54
+    # SOURCE: vllm/v1/engine/output_processor.py:L57
     # SUBTRACTED: self._input_stream_task (resumable streaming-input cleanup,
     #   subtraction_plan).
     def __init__(self, output_kind: RequestOutputKind, request_id: str):
-        # SOURCE: vllm/v1/engine/output_processor.py:L54
+        # SOURCE: vllm/v1/engine/output_processor.py:L57
         self.aggregate = output_kind == RequestOutputKind.DELTA
         self.request_id = request_id
         self.output: RequestOutput | Exception | None = None
         self.ready = asyncio.Event()
 
-    # SOURCE: vllm/v1/engine/output_processor.py:L62
+    # SOURCE: vllm/v1/engine/output_processor.py:L65
     # SUBTRACTED: PoolingRequestOutput merge branch (pooling product line,
     #   subtraction_plan).
     def put(self, output: RequestOutput | Exception) -> None:
         """Non-blocking put operation."""
-        # SOURCE: vllm/v1/engine/output_processor.py:L62
+        # SOURCE: vllm/v1/engine/output_processor.py:L65
         if self.output is None or isinstance(output, Exception):
             self.output = output
             self.ready.set()
@@ -61,7 +61,7 @@ class RequestOutputCollector:
             # (if n > 1) do not override each other.
             self.output.add(output, aggregate=self.aggregate)
 
-    # SOURCE: vllm/v1/engine/output_processor.py:L78
+    # SOURCE: vllm/v1/engine/output_processor.py:L81
     async def get(self) -> RequestOutput:
         """Get operation blocks on put event."""
         while (output := self.output) is None:
@@ -72,7 +72,7 @@ class RequestOutputCollector:
             raise output
         return output
 
-    # SOURCE: vllm/v1/engine/output_processor.py:L88
+    # SOURCE: vllm/v1/engine/output_processor.py:L91
     def get_nowait(self) -> RequestOutput | None:
         """Non-blocking get operation."""
         output = self.output
@@ -87,10 +87,10 @@ class RequestOutputCollector:
     #   :L98-L106 — resumable streaming-input, subtraction_plan).
 
 
-# SOURCE: vllm/v1/engine/output_processor.py:L109
+# SOURCE: vllm/v1/engine/output_processor.py:L112
 @dataclass
 class OutputProcessorOutput:
-    # SOURCE: vllm/v1/engine/output_processor.py:L109
+    # SOURCE: vllm/v1/engine/output_processor.py:L112
     request_outputs: list[RequestOutput]
     reqs_to_abort: list[str]
 
@@ -99,9 +99,9 @@ class OutputProcessorOutput:
 #   resumable streaming-input (subtraction_plan).
 
 
-# SOURCE: vllm/v1/engine/output_processor.py:L129
+# SOURCE: vllm/v1/engine/output_processor.py:L132
 class RequestState:
-    # SOURCE: vllm/v1/engine/output_processor.py:L130
+    # SOURCE: vllm/v1/engine/output_processor.py:L133
     # SUBTRACTED: lora_request/lora_name, prompt_embeds, max_tokens_param,
     #   top_p/n/temperature (tracing inputs), stats(RequestStateStats),
     #   stream_input/input_chunk_queue/streaming_input — orthogonal
@@ -120,7 +120,7 @@ class RequestState:
         queue: RequestOutputCollector | None,
         stream_interval: int,
     ):
-        # SOURCE: vllm/v1/engine/output_processor.py:L130
+        # SOURCE: vllm/v1/engine/output_processor.py:L133
         self.request_id = request_id
         self.external_req_id = external_req_id
         self.parent_req = parent_req
@@ -138,7 +138,7 @@ class RequestState:
         self.stream_interval = stream_interval
         self.sent_tokens_offset = 0  # Offset of sent tokens
 
-    # SOURCE: vllm/v1/engine/output_processor.py:L207
+    # SOURCE: vllm/v1/engine/output_processor.py:L210
     # SUBTRACTED: tokenizer/log_stats/max_tokens/top_p/n/temperature/stream_input
     #   wiring + pooling_params branch — orthogonal (subtraction_plan).
     @classmethod
@@ -152,7 +152,7 @@ class RequestState:
         queue: RequestOutputCollector | None,
         stream_interval: int,
     ) -> "RequestState":
-        # SOURCE: vllm/v1/engine/output_processor.py:L207
+        # SOURCE: vllm/v1/engine/output_processor.py:L210
         sampling_params = request.sampling_params
         assert sampling_params is not None
         output_kind = sampling_params.output_kind
@@ -178,7 +178,7 @@ class RequestState:
             stream_interval=stream_interval,
         )
 
-    # SOURCE: vllm/v1/engine/output_processor.py:L269
+    # SOURCE: vllm/v1/engine/output_processor.py:L272
     # SUBTRACTED: pooling_output branch (_new_pooling_output) — pooling product
     #   line (subtraction_plan).
     def make_request_output(
@@ -188,7 +188,7 @@ class RequestState:
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
     ) -> RequestOutput | None:
-        # SOURCE: vllm/v1/engine/output_processor.py:L269
+        # SOURCE: vllm/v1/engine/output_processor.py:L272
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
 
@@ -235,7 +235,7 @@ class RequestState:
             external_req_id, outputs, finished, kv_transfer_params
         )
 
-    # SOURCE: vllm/v1/engine/output_processor.py:L333
+    # SOURCE: vllm/v1/engine/output_processor.py:L356
     # SUBTRACTED: prompt_embeds placeholder, PoolingRequestOutput branch, LoRA /
     #   metrics / num_cached_tokens carry — orthogonal (subtraction_plan).
     def _new_request_output(
@@ -245,7 +245,7 @@ class RequestState:
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
     ) -> RequestOutput:
-        # SOURCE: vllm/v1/engine/output_processor.py:L333
+        # SOURCE: vllm/v1/engine/output_processor.py:L356
         prompt_token_ids = self.prompt_token_ids
         assert self.logprobs_processor is not None
         if self.output_kind == RequestOutputKind.DELTA:
@@ -264,7 +264,7 @@ class RequestState:
             kv_transfer_params=kv_transfer_params,
         )
 
-    # SOURCE: vllm/v1/engine/output_processor.py:L376
+    # SOURCE: vllm/v1/engine/output_processor.py:L401
     # SUBTRACTED: routed_experts field on CompletionOutput (MoE orthogonal,
     #   subtraction_plan).
     def _new_completion_output(
@@ -273,7 +273,7 @@ class RequestState:
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
     ) -> CompletionOutput:
-        # SOURCE: vllm/v1/engine/output_processor.py:L376
+        # SOURCE: vllm/v1/engine/output_processor.py:L401
         assert self.detokenizer is not None
         assert self.logprobs_processor is not None
         finished = finish_reason is not None
@@ -300,11 +300,11 @@ class RequestState:
         )
 
 
-# SOURCE: vllm/v1/engine/output_processor.py:L413
+# SOURCE: vllm/v1/engine/output_processor.py:L438
 class OutputProcessor:
     """Process EngineCoreOutputs into RequestOutputs."""
 
-    # SOURCE: vllm/v1/engine/output_processor.py:L416
+    # SOURCE: vllm/v1/engine/output_processor.py:L441
     # SUBTRACTED: log_stats/lora_states(LoRARequestStates)/tokenizer_field/
     #   tracing_enabled — orthogonal subsystems (subtraction_plan). tokenizer kept
     #   for from_new_request wiring.
@@ -314,29 +314,29 @@ class OutputProcessor:
         *,
         stream_interval: int = 1,
     ):
-        # SOURCE: vllm/v1/engine/output_processor.py:L416
+        # SOURCE: vllm/v1/engine/output_processor.py:L441
         self.tokenizer = tokenizer
         self.stream_interval = stream_interval
         self.request_states: dict[str, RequestState] = {}
         self.parent_requests: dict[str, ParentRequest] = {}
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
 
-    # SOURCE: vllm/v1/engine/output_processor.py:L433
+    # SOURCE: vllm/v1/engine/output_processor.py:L458
     def get_num_unfinished_requests(self):
         return len(self.request_states)
 
-    # SOURCE: vllm/v1/engine/output_processor.py:L436
+    # SOURCE: vllm/v1/engine/output_processor.py:L461
     def has_unfinished_requests(self) -> bool:
         return len(self.request_states) > 0
 
-    # SOURCE: vllm/v1/engine/output_processor.py:L439
+    # SOURCE: vllm/v1/engine/output_processor.py:L464
     def propagate_error(self, e: Exception):
         """Propagate error to all generate() tasks."""
         for _, state in self.request_states.items():
             assert state.queue is not None
             state.queue.put(e)
 
-    # SOURCE: vllm/v1/engine/output_processor.py:L508
+    # SOURCE: vllm/v1/engine/output_processor.py:L533
     # SUBTRACTED: _update_streaming_request_state branch (resumable
     #   streaming-input) + lora wiring (subtraction_plan).
     def add_request(
@@ -347,7 +347,7 @@ class OutputProcessor:
         request_index: int = 0,
         queue: RequestOutputCollector | None = None,
     ) -> None:
-        # SOURCE: vllm/v1/engine/output_processor.py:L508
+        # SOURCE: vllm/v1/engine/output_processor.py:L533
         request_id = request.request_id
         req_state = RequestState.from_new_request(
             tokenizer=self.tokenizer,
@@ -377,7 +377,7 @@ class OutputProcessor:
         if stats is None:
             return
 
-    # SOURCE: vllm/v1/engine/output_processor.py:L572
+    # SOURCE: vllm/v1/engine/output_processor.py:L597
     def process_outputs(
         self,
         engine_core_outputs: list[EngineCoreOutput],
@@ -478,7 +478,7 @@ class OutputProcessor:
             reqs_to_abort=reqs_to_abort,
         )
 
-    # SOURCE: vllm/v1/engine/output_processor.py:L689
+    # SOURCE: vllm/v1/engine/output_processor.py:L714
     def _finish_request(self, req_state: RequestState) -> None:
         req_id = req_state.request_id
         self.request_states.pop(req_id)

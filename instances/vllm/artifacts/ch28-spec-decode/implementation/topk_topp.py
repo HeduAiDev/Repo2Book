@@ -4,20 +4,20 @@
 import torch
 
 
-# SOURCE: vllm/v1/sample/ops/topk_topp_sampler.py:L257-L267 (apply_top_k_top_p)
+# SOURCE: vllm/v1/sample/ops/topk_topp_sampler.py:L305-L315 (apply_top_k_top_p)
 # SUBTRACTED: `if HAS_TRITON and logits.shape[0] >= 8: apply_top_k_top_p_triton`
 #             二级分流（L263-L264）—— 纯性能；精简版固定走 PyTorch sort 实现，
 #             对相同输入产生相同 mask。
 def apply_top_k_top_p(
     logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
 ) -> torch.Tensor:
-    # SOURCE: vllm/v1/sample/ops/topk_topp_sampler.py:L257-L267
+    # SOURCE: vllm/v1/sample/ops/topk_topp_sampler.py:L305-L315
     if p is None and k is None:
         return logits
     return apply_top_k_top_p_pytorch(logits, k, p)
 
 
-# SOURCE: vllm/v1/sample/ops/topk_topp_sampler.py:L270-L311
+# SOURCE: vllm/v1/sample/ops/topk_topp_sampler.py:L318-L359
 # SUBTRACTED: allow_cpu_sync 形参与 apply_top_k_only 免排序快路（L274, L287-L289）——
 #             纯性能；精简版始终走排序路径，行为等价。
 def apply_top_k_top_p_pytorch(
@@ -26,7 +26,7 @@ def apply_top_k_top_p_pytorch(
     p: torch.Tensor | None,
 ) -> torch.Tensor:
     """Apply top-k and top-p masks to the logits (may update in-place)."""
-    # SOURCE: vllm/v1/sample/ops/topk_topp_sampler.py:L270-L311
+    # SOURCE: vllm/v1/sample/ops/topk_topp_sampler.py:L318-L359
     if p is None:
         if k is None:
             return logits

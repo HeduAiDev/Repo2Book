@@ -16,33 +16,33 @@ def cdiv(a: int, b: int) -> int:
     return -(a // -b)
 
 
-# SOURCE: vllm/v1/kv_cache_interface.py:L81 (class KVCacheSpec)
+# SOURCE: vllm/v1/kv_cache_interface.py:L82 (class KVCacheSpec)
 @dataclass(frozen=True, kw_only=True)
 class KVCacheSpec:
-    # SOURCE: vllm/v1/kv_cache_interface.py:L81 (class KVCacheSpec / AttentionSpec)
+    # SOURCE: vllm/v1/kv_cache_interface.py:L82 (class KVCacheSpec / AttentionSpec)
     """KV cache spec 抽象基类。本章只用到 block_size 与（子类的）窗口字段。"""
     # SUBTRACTED: num_kv_heads / head_size / dtype 等张量形状字段以及 page_size_bytes /
     # max_memory_usage_bytes 等显存计量方法 —— 决定显存布局，不影响分页/哈希/命中/
-    # 准入推算的控制流。原 vllm/v1/kv_cache_interface.py:L81 (KVCacheSpec / AttentionSpec)。
+    # 准入推算的控制流。原 vllm/v1/kv_cache_interface.py:L82 (KVCacheSpec / AttentionSpec)。
     block_size: int
 
 
-# SOURCE: vllm/v1/kv_cache_interface.py:L174 (class FullAttentionSpec)
+# SOURCE: vllm/v1/kv_cache_interface.py:L175 (class FullAttentionSpec)
 @dataclass(frozen=True, kw_only=True)
 class FullAttentionSpec(KVCacheSpec):
-    # SOURCE: vllm/v1/kv_cache_interface.py:L174 (class FullAttentionSpec)
+    # SOURCE: vllm/v1/kv_cache_interface.py:L175 (class FullAttentionSpec)
     """KV cache spec for a full-attention group. 本章只用到 block_size。"""
     # SUBTRACTED: sliding_window / attention_chunk_size 可选字段与 merge_* 合并逻辑
     # （L186-L257）—— 全注意力不带窗口；本章为对照另立独立的 Sliding/Chunked spec 类。
     pass
 
 
-# SOURCE: vllm/v1/kv_cache_interface.py:L386 (class ChunkedLocalAttentionSpec)
+# SOURCE: vllm/v1/kv_cache_interface.py:L387 (class ChunkedLocalAttentionSpec)
 @dataclass(frozen=True, kw_only=True)
 class ChunkedLocalAttentionSpec(KVCacheSpec):
     attention_chunk_size: int
 
-    # SOURCE: vllm/v1/kv_cache_interface.py:L389 (max_admission_blocks_per_request)
+    # SOURCE: vllm/v1/kv_cache_interface.py:L390 (max_admission_blocks_per_request)
     def max_admission_blocks_per_request(
         self, max_num_batched_tokens: int, max_model_len: int
     ) -> int:
@@ -62,7 +62,7 @@ class ChunkedLocalAttentionSpec(KVCacheSpec):
     # 准入闸共用同一 max_admission_blocks_per_request，本章只演示运行时一侧。
 
 
-# SOURCE: vllm/v1/kv_cache_interface.py:L414 (class SlidingWindowSpec)
+# SOURCE: vllm/v1/kv_cache_interface.py:L415 (class SlidingWindowSpec)
 @dataclass(frozen=True, kw_only=True)
 class SlidingWindowSpec(KVCacheSpec):
     sliding_window: int
@@ -70,7 +70,7 @@ class SlidingWindowSpec(KVCacheSpec):
     # SUBTRACTED: head_size_v / real_page_size_bytes（L416-L429）—— 显存布局字段，
     # 不影响窗口/分配控制流。
 
-    # SOURCE: vllm/v1/kv_cache_interface.py:L431 (max_admission_blocks_per_request)
+    # SOURCE: vllm/v1/kv_cache_interface.py:L443 (max_admission_blocks_per_request)
     def max_admission_blocks_per_request(
         self, max_num_batched_tokens: int, max_model_len: int
     ) -> int:
@@ -96,10 +96,10 @@ class SlidingWindowSpec(KVCacheSpec):
     # SUBTRACTED: max_memory_usage_bytes（L453-L462）—— 见 ChunkedLocal 同名说明。
 
 
-# SOURCE: vllm/v1/kv_cache_interface.py:L744 (class KVCacheGroupSpec)
+# SOURCE: vllm/v1/kv_cache_interface.py:L756 (class KVCacheGroupSpec)
 @dataclass
 class KVCacheGroupSpec:
-    # SOURCE: vllm/v1/kv_cache_interface.py:L744 (class KVCacheGroupSpec)
+    # SOURCE: vllm/v1/kv_cache_interface.py:L756 (class KVCacheGroupSpec)
     """
     Represents a group of model layers that share the same KV cache block table.
     These layers are regarded as one layer in the KV cache manager.
@@ -110,10 +110,10 @@ class KVCacheGroupSpec:
     is_eagle_group: bool = False
 
 
-# SOURCE: vllm/v1/kv_cache_interface.py:L759 (class KVCacheConfig)
+# SOURCE: vllm/v1/kv_cache_interface.py:L771 (class KVCacheConfig)
 @dataclass
 class KVCacheConfig:
-    # SOURCE: vllm/v1/kv_cache_interface.py:L759 (class KVCacheConfig)
+    # SOURCE: vllm/v1/kv_cache_interface.py:L771 (class KVCacheConfig)
     """The KV cache configuration of a model."""
     # SUBTRACTED: kv_cache_tensors / has_mamba_layers / needs_kv_cache_zeroing
     # （L767, L778-L784）—— 张量初始化布局与 Mamba 判定，本章协调器只读 num_blocks 与
@@ -136,47 +136,47 @@ class Request:
         skip_reading_prefix_cache: bool = False,
     ) -> None:
         self.request_id = request_id
-        # SOURCE: vllm/v1/request.py:L85
+        # SOURCE: vllm/v1/request.py:L86
         self.lora_request = lora_request
-        # SOURCE: vllm/v1/request.py:L146
+        # SOURCE: vllm/v1/request.py:L147
         self.cache_salt: str | None = cache_salt
-        # SOURCE: vllm/v1/request.py:L149
+        # SOURCE: vllm/v1/request.py:L150
         self.mm_features = mm_features or []
 
-        # SOURCE: vllm/v1/request.py:L133 / L155 (all_token_ids 视图)
+        # SOURCE: vllm/v1/request.py:L134 / L155 (all_token_ids 视图)
         self._all_token_ids: list[int] = list(prompt_token_ids)
         self.all_token_ids = self._all_token_ids
 
-        # SOURCE: vllm/v1/request.py:L145
+        # SOURCE: vllm/v1/request.py:L146
         self.num_computed_tokens = 0
-        # SOURCE: vllm/v1/request.py:L144
+        # SOURCE: vllm/v1/request.py:L145
         self.spec_token_ids: list[int] = []
         # SOURCE: vllm/v1/request.py (num_preemptions — 抢占计数)
         self.num_preemptions = 0
-        # SOURCE: vllm/v1/request.py:L128 (_prompt_embeds_per_block_hashes)
+        # SOURCE: vllm/v1/request.py:L129 (_prompt_embeds_per_block_hashes)
         self._prompt_embeds_per_block_hashes: dict[tuple[int, int], bytes] = {}
         # SUBTRACTED: prompt_embeds —— 仅 prompt-embeds 输入触发；常规 token 请求恒 None。
         self.prompt_embeds = None
 
-        # SOURCE: vllm/v1/request.py:L171
+        # SOURCE: vllm/v1/request.py:L172
         self.block_hashes: list[Any] = []
-        # SOURCE: vllm/v1/request.py:L175
-        self._block_hasher = block_hasher
         # SOURCE: vllm/v1/request.py:L176
+        self._block_hasher = block_hasher
+        # SOURCE: vllm/v1/request.py:L177
         self.update_block_hashes()
-        # SOURCE: vllm/v1/request.py:L178 (skip_reading_prefix_cache)
+        # SOURCE: vllm/v1/request.py:L179 (skip_reading_prefix_cache)
         self.skip_reading_prefix_cache = skip_reading_prefix_cache
 
-    # SOURCE: vllm/v1/request.py:L211 (append_output_token_ids)
+    # SOURCE: vllm/v1/request.py:L217 (append_output_token_ids)
     def append_output_token_ids(self, token_ids: int | list[int]) -> None:
         if isinstance(token_ids, int):
             self._all_token_ids.append(token_ids)
         else:
             self._all_token_ids.extend(token_ids)
-        # SOURCE: vllm/v1/request.py:L222
+        # SOURCE: vllm/v1/request.py:L228
         self.update_block_hashes()
 
-    # SOURCE: vllm/v1/request.py:L224 (update_block_hashes)
+    # SOURCE: vllm/v1/request.py:L230 (update_block_hashes)
     def update_block_hashes(self) -> None:
         """Compute block hashes for any new full blocks and append them."""
         if self._block_hasher is not None:
@@ -184,5 +184,5 @@ class Request:
 
     @property
     def num_tokens(self) -> int:
-        # SOURCE: vllm/v1/request.py:L234
+        # SOURCE: vllm/v1/request.py:L240
         return len(self._all_token_ids)

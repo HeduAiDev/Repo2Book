@@ -236,7 +236,7 @@ def assign_request_id(request: EngineCoreRequest):
 每派生一个 child，`add_request` 都调一次 `_add_request` 把它下发。这个方法第 4 章讲过，它把同一个 child 同时挂到两个地方——本进程的 `OutputProcessor`、和独立进程的 `EngineCore`。我们重点看本进程这一侧的登记，因为归并就靠它：
 
 ```python
-# vllm/v1/engine/output_processor.py:L508-L537
+# vllm/v1/engine/output_processor.py:L533-L562
 def add_request(
     self,
     request: EngineCoreRequest,
@@ -360,7 +360,7 @@ def get_outputs(
 并行采样还有一个收尾动作：取消。用户取消「那一个请求」，引擎得把底下 n 个 child 全停掉。这件事靠的就是 [§6.5](#65-双进程登记本进程一份-requeststate跨进程一个独立请求) 织的那两张表。
 
 ```python
-# vllm/v1/engine/output_processor.py:L466-L506（节选）
+# vllm/v1/engine/output_processor.py:L491-L531（节选）
 internal_req_ids: list[str] = []
 for request_id in request_ids:
     if internal:

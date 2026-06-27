@@ -27,8 +27,8 @@ class EngineCoreRequest:  # SOURCE: vllm/v1/engine/__init__.py:L80 (class Engine
     arrival_time: float = 0.0
 
 
-# SOURCE: vllm/v1/engine/__init__.py:L161 (class EngineCoreOutput)
-# SUBTRACTED: msgspec.Struct 基类，同上理由。原 vllm/v1/engine/__init__.py:L161-L166
+# SOURCE: vllm/v1/engine/__init__.py:L167 (class EngineCoreOutput)
+# SUBTRACTED: msgspec.Struct 基类，同上理由。原 vllm/v1/engine/__init__.py:L167-L172
 @dataclass
 class EngineCoreOutput:
     request_id: str
@@ -36,11 +36,11 @@ class EngineCoreOutput:
     # SUBTRACTED: new_logprobs/new_prompt_logprobs_tensors/pooling_output/stop_reason/events/
     #   kv_transfer_params/trace_headers/prefill_stats/routed_experts/num_nans_in_logits
     #   等次要字段 —— Stage3 去 tokenize/logprobs 细节留 ch08。
-    #   原 vllm/v1/engine/__init__.py:L170-L187
+    #   原 vllm/v1/engine/__init__.py:L176-L193
     finish_reason: str | None = None
 
     @property
-    # SOURCE: vllm/v1/engine/__init__.py:L189-L191
+    # SOURCE: vllm/v1/engine/__init__.py:L195-L197
     def finished(self) -> bool:
         return self.finish_reason is not None
 
@@ -52,7 +52,7 @@ class EngineCoreOutputs:
     真实 vLLM 还带 scheduler_stats/timestamp/engine_index 等；本章只需 outputs 列表。
     """
 
-    # SOURCE: vllm/v1/engine/__init__.py:L206 (class EngineCoreOutputs)
+    # SOURCE: vllm/v1/engine/__init__.py:L212 (class EngineCoreOutputs)
     # SUBTRACTED: scheduler_stats/timestamp/engine_index/utility_results 等观测/控制字段。
     outputs: list[EngineCoreOutput]
     timestamp: float | None = None

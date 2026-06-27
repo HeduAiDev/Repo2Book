@@ -67,7 +67,7 @@ from .deepseek_v4_attention import (
 _DEEPSEEK_V4_EXPERT_DTYPES = ("fp4", "fp8")
 
 
-# SOURCE: vllm/model_executor/models/deepseek_v4.py:70 (class DeepseekV4MLP)
+# SOURCE: vllm/model_executor/models/deepseek_v4.py:73 (class DeepseekV4MLP)
 class DeepseekV4MLP(nn.Module):
     """SwiGLU MLP，与 LlamaMLP 同构；作 DeepseekV4MoE 的 shared_experts 复用——MoE 里那条
     每 token 必走的 dense 路径。区别只在多了可选的 swiglu_limit clamp。"""
@@ -83,7 +83,7 @@ class DeepseekV4MLP(nn.Module):
         is_sequence_parallel: bool = False,
         prefix: str = "",
     ) -> None:
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:71 (DeepseekV4MLP.__init__)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:74 (DeepseekV4MLP.__init__)
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -112,14 +112,14 @@ class DeepseekV4MLP(nn.Module):
             self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:114 (DeepseekV4MLP.forward)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:117 (DeepseekV4MLP.forward)
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
 
-# SOURCE: vllm/model_executor/models/deepseek_v4.py:121 (class DeepseekV4FP8Config)
+# SOURCE: vllm/model_executor/models/deepseek_v4.py:124 (class DeepseekV4FP8Config)
 class DeepseekV4FP8Config(Fp8Config):
     """V4 量化配置：linear/attention 恒 FP8 block；MoE 专家按 expert_dtype 惰性解析为 fp4(MXFP4)
     或 fp8(block FP8)。回收 ch22 的 f16「量化压缩」delta。
@@ -129,13 +129,13 @@ class DeepseekV4FP8Config(Fp8Config):
     """
 
     def __init__(self, *args, **kwargs):
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:141 (DeepseekV4FP8Config.__init__)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:144 (DeepseekV4FP8Config.__init__)
         super().__init__(*args, **kwargs)
         self._resolved_expert_dtype: str | None = None
 
     @property
     def expert_dtype(self) -> str:
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:147 (DeepseekV4FP8Config.expert_dtype)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:150 (DeepseekV4FP8Config.expert_dtype)
         if self._resolved_expert_dtype is None:
             try:
                 hf_config = get_current_vllm_config().model_config.hf_config
@@ -153,17 +153,17 @@ class DeepseekV4FP8Config(Fp8Config):
 
     @property
     def is_scale_e8m0(self) -> bool:
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:170 (DeepseekV4FP8Config.is_scale_e8m0)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:173 (DeepseekV4FP8Config.is_scale_e8m0)
         # FP4 检查点把 FP8 linear scale 存成 e8m0fnu；FP8 专家检查点(Flash-Base)存 float32。
         return self.expert_dtype == "fp4"
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:176 (DeepseekV4FP8Config.get_name)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:179 (DeepseekV4FP8Config.get_name)
         return "deepseek_v4_fp8"
 
     def get_quant_method(self, layer, prefix):
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:194 (DeepseekV4FP8Config.get_quant_method)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:197 (DeepseekV4FP8Config.get_quant_method)
         # SUBTRACTED: override_quantization_method/is_mxfp4_quant 等配置分发样板（dossier 批准删）；
         #             保留 expert_dtype → Mxfp4MoEMethod / Fp8MoEMethod 的核心分支表达「量化 delta」。
         if isinstance(layer, FusedMoE):
@@ -179,7 +179,7 @@ class DeepseekV4FP8Config(Fp8Config):
         return super().get_quant_method(layer, prefix)
 
 
-# SOURCE: vllm/model_executor/models/deepseek_v4.py:373 (make_deepseek_v4_expert_params_mapping)
+# SOURCE: vllm/model_executor/models/deepseek_v4.py:376 (make_deepseek_v4_expert_params_mapping)
 def make_deepseek_v4_expert_params_mapping(
     num_experts: int,
 ) -> list[tuple[str, str, int, str]]:
@@ -201,7 +201,7 @@ def make_deepseek_v4_expert_params_mapping(
     ]
 
 
-# SOURCE: vllm/model_executor/models/deepseek_v4.py:392 (class DeepseekV4MegaMoEExperts)
+# SOURCE: vllm/model_executor/models/deepseek_v4.py:395 (class DeepseekV4MegaMoEExperts)
 class DeepseekV4MegaMoEExperts(nn.Module):
     """MegaMoE 专家后端：把整批专家计算塞进单个 DeepGEMM 自定义算子（对称缓冲 + FP4/FP8 权重 +
     SM100）。这是「V4 的 MoE 不是 for 循环跑每个专家，而是一 kernel 跑全部专家」的真身。
@@ -223,7 +223,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         intermediate_size: int,
         prefix: str = "",
     ):
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:395 (DeepseekV4MegaMoEExperts.__init__)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:398 (DeepseekV4MegaMoEExperts.__init__)
         super().__init__()
         self.prefix = prefix
         self.num_experts = num_experts
@@ -276,14 +276,14 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self._transformed_l2_weights = None
 
     def _map_global_expert_id(self, expert_id: int) -> int:
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:475 (DeepseekV4MegaMoEExperts._map_global_expert_id)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:478 (DeepseekV4MegaMoEExperts._map_global_expert_id)
         if expert_id < self.experts_start_idx or expert_id >= self.experts_end_idx:
             return -1
         return expert_id - self.experts_start_idx
 
     def weight_loader(self, param, loaded_weight, weight_name, shard_id, expert_id,
                       return_success: bool = False):
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:480 (DeepseekV4MegaMoEExperts.weight_loader)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:483 (DeepseekV4MegaMoEExperts.weight_loader)
         local_expert_id = self._map_global_expert_id(expert_id)
         if local_expert_id == -1:
             return False if return_success else None
@@ -308,7 +308,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         return True if return_success else None
 
     def finalize_weights(self) -> None:
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:534 (DeepseekV4MegaMoEExperts.finalize_weights)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:537 (DeepseekV4MegaMoEExperts.finalize_weights)
         # SUBTRACTED: DeepGEMM transform_sf_into_required_layout / transform_weights_for_mega_moe
         #             的 scale 布局变换与权重交织（dossier 批准删，下放 ch26）。本章保留方法存在性
         #             与「装载后把 loader 侧参数转成 kernel 消费的视图」这一职责描述。
@@ -327,7 +327,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         activation_clamp: float | None,
         fast_math: bool = True,
     ) -> torch.Tensor:
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:599 (DeepseekV4MegaMoEExperts.forward)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:602 (DeepseekV4MegaMoEExperts.forward)
         # 单 kernel 跑全部专家：所有路由、分发、量化 GEMM 都在这一个自定义算子里。
         y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
         torch.ops.vllm.deepseek_v4_mega_moe_experts(
@@ -337,14 +337,14 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         return y
 
 
-# SOURCE: vllm/model_executor/models/deepseek_v4.py:707 (class DeepseekV4MoE)
+# SOURCE: vllm/model_executor/models/deepseek_v4.py:710 (class DeepseekV4MoE)
 class DeepseekV4MoE(nn.Module):
     """MoE 层 delta 焦点：gate(GateLinear) 路由 top-k routed 专家 + 始终走的 shared_experts
     (每 token 必走的 dense 残留) + 双后端（use_mega_moe ? MegaMoE 单算子 : TP FusedMoE）。
     对照 LlamaMLP 的单 dense SwiGLU 即见「稀疏路由 + 共享 dense」混合。"""
 
     def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:708 (DeepseekV4MoE.__init__)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:711 (DeepseekV4MoE.__init__)
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         config = vllm_config.model_config.hf_config
@@ -416,7 +416,7 @@ class DeepseekV4MoE(nn.Module):
             self._init_fused_moe_experts(config, quant_config, prefix)
 
     def _init_mega_moe_experts(self, vllm_config: VllmConfig, config, prefix: str) -> None:
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:797 (DeepseekV4MoE._init_mega_moe_experts)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:803 (DeepseekV4MoE._init_mega_moe_experts)
         self.ep_group = get_ep_group()
         self.ep_size = self.ep_group.world_size
         self.ep_rank = self.ep_group.rank_in_group
@@ -436,7 +436,7 @@ class DeepseekV4MoE(nn.Module):
         )
 
     def _init_fused_moe_experts(self, config, quant_config, prefix: str) -> None:
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:823 (DeepseekV4MoE._init_fused_moe_experts)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:829 (DeepseekV4MoE._init_fused_moe_experts)
         self.tp_rank = get_tensor_model_parallel_rank()
         assert config.n_routed_experts % self.tp_size == 0
         self.n_local_experts = config.n_routed_experts // self.tp_size
@@ -463,7 +463,7 @@ class DeepseekV4MoE(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
     ) -> torch.Tensor:
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:854 (DeepseekV4MoE.forward)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:860 (DeepseekV4MoE.forward)
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
 
@@ -502,7 +502,7 @@ class DeepseekV4MoE(nn.Module):
     def _forward_fused_moe(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
     ) -> torch.Tensor:
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:895 (DeepseekV4MoE._forward_fused_moe)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:901 (DeepseekV4MoE._forward_fused_moe)
         # TP 路径：FusedMoE 内部已聚合 shared_experts（与 mega 路径在外相加的位置不同）。
         # FusedMoE 内部细节交 ch26。
         org_shape = hidden_states.shape
@@ -520,12 +520,12 @@ class DeepseekV4MoE(nn.Module):
         return final_hidden_states.view(org_shape)
 
     def finalize_mega_moe_weights(self) -> None:
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:916 (DeepseekV4MoE.finalize_mega_moe_weights)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:922 (DeepseekV4MoE.finalize_mega_moe_weights)
         if self.use_mega_moe:
             self.experts.finalize_weights()
 
 
-# SOURCE: vllm/model_executor/models/deepseek_v4.py:921 (class DeepseekV4Attention)
+# SOURCE: vllm/model_executor/models/deepseek_v4.py:927 (class DeepseekV4Attention)
 class DeepseekV4Attention(nn.Module):
     """MLA 权重定义层 delta：用低秩 fused_wqa_wkv（q_lora_rank 压缩 q + 压缩 kv）取代 Llama 的
     全量 qkv_proj；q 经 q_norm 后 wq_b 升回 full Q；kv 经 kv_norm；输出也走低秩 wo_a/wo_b
@@ -539,7 +539,7 @@ class DeepseekV4Attention(nn.Module):
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list | None = None,
     ):
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:922 (DeepseekV4Attention.__init__)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:928 (DeepseekV4Attention.__init__)
         super().__init__()
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
@@ -651,11 +651,11 @@ class DeepseekV4Attention(nn.Module):
         )
 
     def forward(self, positions, hidden_states, llama_4_scaling):
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1080 (DeepseekV4Attention.forward)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1086 (DeepseekV4Attention.forward)
         return self.mla_attn(positions, hidden_states, llama_4_scaling)
 
 
-# SOURCE: vllm/model_executor/models/deepseek_v4.py:1089 (class DeepseekV4DecoderLayer)
+# SOURCE: vllm/model_executor/models/deepseek_v4.py:1095 (class DeepseekV4DecoderLayer)
 class DeepseekV4DecoderLayer(nn.Module):
     """单层 delta-over-Llama 焦点：attn(MLA) + ffn(MoE)，但残差用 hc_pre/hc_post 超连接
     (torch.ops.vllm.mhc_pre/mhc_post，hc_mult 多流) 取代 Llama 的融合 add-norm。
@@ -668,7 +668,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list | None = None,
     ):
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1090 (DeepseekV4DecoderLayer.__init__)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1096 (DeepseekV4DecoderLayer.__init__)
         super().__init__()
         # SUBTRACTED: 真实在此 lazy import vllm.model_executor.layers.mhc 注册 mhc_pre/mhc_post
         #             tilelang 内核（GPU-only）；本章只保留 hc_pre/hc_post 对算子的调用边界。
@@ -701,7 +701,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32), requires_grad=False)
 
     def hc_pre(self, x, hc_fn, hc_scale, hc_base):
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1166 (DeepseekV4DecoderLayer.hc_pre)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1172 (DeepseekV4DecoderLayer.hc_pre)
         # 超连接前处理：取代 Llama 的 input/post_attention_layernorm——在 hc_mult 条残差流上做
         # Sinkhorn 归一的学习式混合，产出本分支输入 + 写回时要用的 post/res 混合系数。
         post_mix, res_mix, layer_input = torch.ops.vllm.mhc_pre(
@@ -718,12 +718,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         return layer_input, post_mix, res_mix
 
     def hc_post(self, x, residual, post, comb):
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1186 (DeepseekV4DecoderLayer.hc_post)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1192 (DeepseekV4DecoderLayer.hc_post)
         # 超连接后处理：把分支输出 x 按 post/comb 系数写回 hc_mult 条残差流。
         return torch.ops.vllm.mhc_post(x, residual, post, comb)
 
     def forward(self, x, positions, input_ids):
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1195 (DeepseekV4DecoderLayer.forward)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1201 (DeepseekV4DecoderLayer.forward)
         # 对照 LlamaDecoderLayer.forward 的 add-norm：这里 hc_pre/hc_post 包住 attn 和 ffn。
         residual = x
         x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
@@ -739,7 +739,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         return x
 
 
-# SOURCE: vllm/model_executor/models/deepseek_v4.py:1219 (class DeepseekV4Model)
+# SOURCE: vllm/model_executor/models/deepseek_v4.py:1255 (class DeepseekV4Model)
 @support_torch_compile
 class DeepseekV4Model(nn.Module):
     """主干 delta：embed → unsqueeze.repeat(hc_mult) 展开成 hc_mult 条残差流逐层穿过 →
@@ -747,7 +747,7 @@ class DeepseekV4Model(nn.Module):
     对照 LlamaModel 的单残差流。持有 3 条 aux_stream 给 MLA 多 stream GEMM。"""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1221 (DeepseekV4Model.__init__)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1257 (DeepseekV4Model.__init__)
         super().__init__()
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
@@ -804,11 +804,11 @@ class DeepseekV4Model(nn.Module):
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1304 (DeepseekV4Model.embed_input_ids)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1360 (DeepseekV4Model.embed_input_ids)
         return self.embed_tokens(input_ids)
 
     def forward(self, input_ids, positions, intermediate_tensors, inputs_embeds=None):
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1307 (DeepseekV4Model.forward)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1383 (DeepseekV4Model.forward)
         # SUBTRACTED: PP/intermediate_tensors/inputs_embeds 分支（V4 无 PPMissingLayer，恒不触发）。
         hidden_states = self.embed_input_ids(input_ids)
         # delta：把单残差流展开成 hc_mult 条平行流逐层穿过。
@@ -831,7 +831,7 @@ class DeepseekV4Model(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1340 (DeepseekV4Model.load_weights)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1434 (DeepseekV4Model.load_weights)
         # SUBTRACTED: stacked_params_mapping 全量条目仅保留代表性几条（compressor 条目随稀疏分支删）；
         #             本方法保留三类特例装载：①expert e8m0fnu→uint8 view ②expert_mapping 多副本
         #             ③attn_sink 按 TP head 切。其余 regex/长尾按 dossier 批准删。
@@ -908,7 +908,7 @@ class DeepseekV4Model(nn.Module):
         return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1431 (DeepseekV4Model.get_expert_mapping)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1533 (DeepseekV4Model.get_expert_mapping)
         first_layer = next(iter(islice(self.layers, self.start_layer, self.end_layer)))
         if first_layer.ffn.use_mega_moe:
             return make_deepseek_v4_expert_params_mapping(self.config.n_routed_experts)
@@ -918,12 +918,12 @@ class DeepseekV4Model(nn.Module):
         )
 
     def finalize_mega_moe_weights(self) -> None:
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1445 (DeepseekV4Model.finalize_mega_moe_weights)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1547 (DeepseekV4Model.finalize_mega_moe_weights)
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             layer.ffn.finalize_mega_moe_weights()
 
 
-# SOURCE: vllm/model_executor/models/deepseek_v4.py:1450 (hc_head)
+# SOURCE: vllm/model_executor/models/deepseek_v4.py:1552 (hc_head)
 @torch.compile(backend=current_platform.simple_compile_backend)
 def hc_head(hidden_states, hc_fn, hc_scale, hc_base, rms_norm_eps, hc_eps):
     # SOURCE: vllm/model_executor/models/deepseek_v4.py (hc_head)
@@ -940,7 +940,7 @@ def hc_head(hidden_states, hc_fn, hc_scale, hc_base, rms_norm_eps, hc_eps):
     return y.to(dtype)
 
 
-# SOURCE: vllm/model_executor/models/deepseek_v4.py:1469 (_make_deepseek_v4_weights_mapper)
+# SOURCE: vllm/model_executor/models/deepseek_v4.py:1582 (_make_deepseek_v4_weights_mapper)
 def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
     # SUBTRACTED: 完整 regex 改名映射（fp4/fp8 两套 scale 名称 remap 长尾）按 dossier 批准删，
     #             下放装载专题。本章只保留它存在、按 expert_dtype 分发这一事实。
@@ -958,7 +958,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper("fp4")
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1514 (DeepseekV4ForCausalLM.__init__)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1627 (DeepseekV4ForCausalLM.__init__)
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.config = config
@@ -972,32 +972,32 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1533 (DeepseekV4ForCausalLM.embed_input_ids)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1652 (DeepseekV4ForCausalLM.embed_input_ids)
         return self.model.embed_input_ids(input_ids)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1536 (DeepseekV4ForCausalLM.compute_logits)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1655 (DeepseekV4ForCausalLM.compute_logits)
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
     def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None):
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1543 (DeepseekV4ForCausalLM.forward)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1662 (DeepseekV4ForCausalLM.forward)
         hidden_states = self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
         return hidden_states
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1555 (DeepseekV4ForCausalLM.get_mtp_target_hidden_states)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1674 (DeepseekV4ForCausalLM.get_mtp_target_hidden_states)
         # 暴露 pre-hc_head 残差缓冲 (max_num_batched_tokens, hc_mult*hidden) 给 MTP draft；
         # forward() 填充，每个 target step 后有效。ch28 投机解码据此取目标隐状态。
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1561 (DeepseekV4ForCausalLM.load_weights)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1680 (DeepseekV4ForCausalLM.load_weights)
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         self.model.finalize_mega_moe_weights()
         return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1567 (DeepseekV4ForCausalLM.get_expert_mapping)
+        # SOURCE: vllm/model_executor/models/deepseek_v4.py:1686 (DeepseekV4ForCausalLM.get_expert_mapping)
         return self.model.get_expert_mapping()

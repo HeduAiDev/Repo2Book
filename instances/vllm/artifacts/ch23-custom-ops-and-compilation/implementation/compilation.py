@@ -55,7 +55,7 @@ def should_split(node: torch.fx.Node, splitting_ops: list[str]) -> bool:
 # backends.py — split_graph / PiecewiseCompileInterpreter / VllmBackend
 # ===========================================================================
 @dataclasses.dataclass
-# SOURCE: vllm/compilation/backends.py:L405 (SplitItem)
+# SOURCE: vllm/compilation/backends.py:L406 (SplitItem)
 class SplitItem:
     submod_name: str
     graph_id: int
@@ -63,7 +63,7 @@ class SplitItem:
     graph: fx.GraphModule
 
 
-# SOURCE: vllm/compilation/backends.py:L547 (split_graph)
+# SOURCE: vllm/compilation/backends.py:L548 (split_graph)
 def split_graph(
     graph: fx.GraphModule, splitting_ops: list[str]
 ) -> tuple[fx.GraphModule, list[SplitItem]]:
@@ -127,7 +127,7 @@ def split_graph(
     return split_gm, outputs
 
 
-# SOURCE: vllm/compilation/backends.py:L627 (wrap_with_cudagraph_if_needed)
+# SOURCE: vllm/compilation/backends.py:L628 (wrap_with_cudagraph_if_needed)
 def wrap_with_cudagraph_if_needed(
     piecewise_backend: Any,
     vllm_config: Any,
@@ -149,13 +149,13 @@ def wrap_with_cudagraph_if_needed(
     return piecewise_backend
 
 
-# SOURCE: vllm/compilation/backends.py:L681 (PiecewiseCompileInterpreter)
+# SOURCE: vllm/compilation/backends.py:L682 (PiecewiseCompileInterpreter)
 class PiecewiseCompileInterpreter(torch.fx.Interpreter):
     """It runs the given split graph interpreter, and for each submodule in
     `compile_submod_names`, creates a PiecewiseBackend and compiles all
     ranges up front."""
 
-    # SOURCE: vllm/compilation/backends.py:L705 (__init__)
+    # SOURCE: vllm/compilation/backends.py:L706 (__init__)
     def __init__(
         self,
         module: torch.fx.GraphModule,
@@ -169,7 +169,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         self.vllm_config = vllm_config
         self.vllm_backend = vllm_backend
 
-    # SOURCE: vllm/compilation/backends.py:L724 (call_module)
+    # SOURCE: vllm/compilation/backends.py:L725 (call_module)
     def call_module(self, target, args, kwargs):
         assert isinstance(target, str)
 
@@ -247,7 +247,7 @@ class VllmBackend:
         self.split_gm: fx.GraphModule | None = None
         self.piecewise_graphs: list[SplitItem] = []
 
-    # SOURCE: vllm/compilation/backends.py:L996 (__call__ — 切图→逐段编译)
+    # SOURCE: vllm/compilation/backends.py:L1015 (__call__ — 切图→逐段编译)
     def __call__(self, graph: fx.GraphModule, example_inputs) -> Any:
         # SUBTRACTED: 真实 __call__ 开头是一大段缓存/哈希子系统（env/config/compiler/code
         # hash、cache_dir 计算、cache_key_factors.json 写出，backends.py:L997-L1122）与

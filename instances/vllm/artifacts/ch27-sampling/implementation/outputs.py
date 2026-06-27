@@ -11,7 +11,7 @@ import torch
 
 
 class LogprobsTensors(NamedTuple):
-    # SOURCE: vllm/v1/outputs.py:L51-57
+    # SOURCE: vllm/v1/outputs.py:L51-L57
     # [num_reqs x num_generated_tokens, max_num_logprobs + 1]
     logprob_token_ids: torch.Tensor
     # [num_reqs x num_generated_tokens, max_num_logprobs + 1]
@@ -22,7 +22,7 @@ class LogprobsTensors(NamedTuple):
 
 @dataclass
 class SamplerOutput:
-    # SOURCE: vllm/v1/outputs.py:L117-124
+    # SOURCE: vllm/v1/outputs.py:L117-L124
     # [num_reqs, max_num_generated_tokens]
     sampled_token_ids: torch.Tensor
     logprobs_tensors: LogprobsTensors | None

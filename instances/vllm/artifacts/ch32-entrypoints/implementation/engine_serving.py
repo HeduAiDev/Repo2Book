@@ -80,7 +80,7 @@ class OpenAIServingModels:
 class OpenAIServing:
     """所有 OpenAI handler 的基类。"""
 
-    # SOURCE: vllm/entrypoints/openai/engine/serving.py:L135 OpenAIServing
+    # SOURCE: vllm/entrypoints/openai/engine/serving.py:L136 OpenAIServing
     def __init__(
         self,
         engine_client,
@@ -89,7 +89,7 @@ class OpenAIServing:
         request_logger=None,
         return_tokens_as_token_ids: bool = False,
     ):
-        # SOURCE: vllm/entrypoints/openai/engine/serving.py:L140 OpenAIServing.__init__
+        # SOURCE: vllm/entrypoints/openai/engine/serving.py:L141 OpenAIServing.__init__
         self.engine_client = engine_client
         self.models = models
         self.request_logger = request_logger
@@ -110,7 +110,7 @@ class OpenAIServing:
             self.system_fingerprint = None
 
     # SUBTRACTED: beam_search 方法（自成一套多 beam 调度，dossier delete 批准）。
-    #   原 vllm/entrypoints/openai/engine/serving.py:L173-L370。
+    #   原 vllm/entrypoints/openai/engine/serving.py:L177-L374。
 
     @staticmethod
     def create_error_response(
@@ -119,7 +119,7 @@ class OpenAIServing:
         status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
         param: str | None = None,
     ) -> ErrorResponse:
-        # SOURCE: vllm/entrypoints/openai/engine/serving.py:L372 create_error_response
+        # SOURCE: vllm/entrypoints/openai/engine/serving.py:L376 create_error_response
         return create_error_response(message, err_type, status_code, param)
 
     def create_streaming_error_response(
@@ -129,7 +129,7 @@ class OpenAIServing:
         status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
         param: str | None = None,
     ) -> str:
-        # SOURCE: vllm/entrypoints/openai/engine/serving.py:L381 create_streaming_error_response
+        # SOURCE: vllm/entrypoints/openai/engine/serving.py:L385 create_streaming_error_response
         json_str = json.dumps(
             self.create_error_response(
                 message=message, err_type=err_type,
@@ -139,13 +139,13 @@ class OpenAIServing:
         return json_str
 
     def _raise_if_error(self, finish_reason: str | None, request_id: str) -> None:
-        # SOURCE: vllm/entrypoints/openai/engine/serving.py:L398 _raise_if_error
+        # SOURCE: vllm/entrypoints/openai/engine/serving.py:L402 _raise_if_error
         """Raise GenerationError if finish_reason indicates an error."""
         if finish_reason == "error":
             raise GenerationError("Internal server error")
 
     async def _check_model(self, request) -> ErrorResponse | None:
-        # SOURCE: vllm/entrypoints/openai/engine/serving.py:L417 _check_model
+        # SOURCE: vllm/entrypoints/openai/engine/serving.py:L421 _check_model
         error_response = None
 
         if self._is_model_supported(request.model):
@@ -153,7 +153,7 @@ class OpenAIServing:
         if request.model in self.models.lora_requests:
             return None
         # SUBTRACTED: 运行时 LoRA 加载分支（VLLM_ALLOW_RUNTIME_LORA_UPDATING），dossier
-        #   标注非主线。原 vllm/entrypoints/openai/engine/serving.py:L425-L443。
+        #   标注非主线。原 vllm/entrypoints/openai/engine/serving.py:L429-L447。
 
         return error_response or self.create_error_response(
             message=f"The model `{request.model}` does not exist.",
@@ -163,11 +163,11 @@ class OpenAIServing:
         )
 
     def _maybe_get_adapters(self, request, supports_default_mm_loras: bool = False):
-        # SOURCE: vllm/entrypoints/openai/engine/serving.py:L470 _maybe_get_adapters
+        # SOURCE: vllm/entrypoints/openai/engine/serving.py:L474 _maybe_get_adapters
         if request.model in self.models.lora_requests:
             return self.models.lora_requests[request.model]
         # SUBTRACTED: default_mm_loras 多模态默认 LoRA 匹配分支。
-        #   原 vllm/entrypoints/openai/engine/serving.py:L478-L483。
+        #   原 vllm/entrypoints/openai/engine/serving.py:L482-L487。
         if self._is_model_supported(request.model):
             return None
         # if _check_model has been called earlier, this will be unreachable
@@ -177,7 +177,7 @@ class OpenAIServing:
     def _base_request_id(
         raw_request: Request | None, default: str | None = None
     ) -> str | None:
-        # SOURCE: vllm/entrypoints/openai/engine/serving.py:L592 _base_request_id
+        # SOURCE: vllm/entrypoints/openai/engine/serving.py:L596 _base_request_id
         """Pulls the request id to use from a header, if provided"""
         if raw_request is not None and (
             (req_id := raw_request.headers.get("X-Request-Id")) is not None
@@ -188,7 +188,7 @@ class OpenAIServing:
 
     @staticmethod
     def _get_data_parallel_rank(raw_request: Request | None) -> int | None:
-        # SOURCE: vllm/entrypoints/openai/engine/serving.py:L605 _get_data_parallel_rank
+        # SOURCE: vllm/entrypoints/openai/engine/serving.py:L609 _get_data_parallel_rank
         """Pulls the data parallel rank from a header, if provided"""
         if raw_request is None:
             return None
@@ -201,7 +201,7 @@ class OpenAIServing:
             return None
 
     def _is_model_supported(self, model_name: str | None) -> bool:
-        # SOURCE: vllm/entrypoints/openai/engine/serving.py:L755 _is_model_supported
+        # SOURCE: vllm/entrypoints/openai/engine/serving.py:L795 _is_model_supported
         if not model_name:
             return True
         # SUBTRACTED: VLLM_SKIP_MODEL_NAME_VALIDATION 短路分支（部署开关）。

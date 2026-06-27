@@ -32,7 +32,7 @@ class ModelRunnerOutput:  # SOURCE: vllm/v1/outputs.py:L166 (占位替身)
 
 
 @dataclass
-class EngineCoreOutputs:  # SOURCE: vllm/v1/engine/__init__.py:L206 (占位替身)
+class EngineCoreOutputs:  # SOURCE: vllm/v1/engine/__init__.py:L212 (占位替身)
     """精简的引擎输出占位（真实定义 vllm/v1/engine/__init__.py）。"""
 
     batch_id: int = -1
@@ -118,12 +118,12 @@ class FakeScheduler:
     def has_requests(self) -> bool:
         return bool(self._pending)
 
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L352 (schedule)
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L310 (schedule)
     def schedule(self) -> SchedulerOutput:
         return self._pending.popleft()
 
     def get_grammar_bitmask(self, scheduler_output: SchedulerOutput):
-        # SOURCE: vllm/v1/core/sched/scheduler.py:L1266-L1288
+        # SOURCE: vllm/v1/core/sched/scheduler.py:L1224-L1246
         # 真实实现：为结构化输出请求计算 grammar bitmask，依赖
         # scheduler_output.scheduled_spec_decode_tokens —— 这正是 spec decode +
         # structured output 必须把采样推迟到拿到上一步 draft token 之后的根因。
@@ -131,13 +131,13 @@ class FakeScheduler:
         self.get_grammar_bitmask_calls.append(scheduler_output)
         return None
 
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L1290 (update_from_output)
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L1248 (update_from_output)
     def update_from_output(self, scheduler_output, model_output) -> dict:
         # pop 取结果后提交给 scheduler，产出 engine_core_outputs。
         self.update_from_output_calls.append((scheduler_output, model_output))
         return {0: EngineCoreOutputs(batch_id=scheduler_output.batch_id)}
 
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L1686 (update_draft_token_ids_in_output)
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L1623 (update_draft_token_ids_in_output)
     def update_draft_token_ids_in_output(self, draft_token_ids, scheduler_output) -> None:
         self.update_draft_calls.append((draft_token_ids, scheduler_output))
 
@@ -186,7 +186,7 @@ class _MinimalEngineCore:
         # 决定 batch_queue 是否启用，从而决定 step_fn 绑哪个 step。
         # 在真实代码里这里从 vllm_config 读；精简版由构造参数注入。
 
-    # SOURCE: vllm/v1/engine/core.py:L402-L432  (EngineCore.step，非队列变体；本章对照用)
+    # SOURCE: vllm/v1/engine/core.py:L406-L436  (EngineCore.step，非队列变体；本章对照用)
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output."""
         if not self.scheduler.has_requests():
@@ -206,7 +206,7 @@ class _MinimalEngineCore:
         )
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
-    # SOURCE: vllm/v1/engine/core.py:L443-L559  (EngineCore.step_with_batch_queue —— 本章主角)
+    # SOURCE: vllm/v1/engine/core.py:L447-L563  (EngineCore.step_with_batch_queue —— 本章主角)
     def step_with_batch_queue(
         self,
     ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
@@ -330,13 +330,13 @@ class _MinimalEngineCore:
 
         return engine_core_outputs, model_executed
 
-    # SOURCE: vllm/v1/engine/core.py:L561-L568  (EngineCore._process_aborts_queue，精简)
+    # SOURCE: vllm/v1/engine/core.py:L565-L572  (EngineCore._process_aborts_queue，精简)
     def _process_aborts_queue(self):
         # 真实实现从 self.aborts_queue 取出执行期到达的 abort 请求并下发给 scheduler。
         # 本章只需它作为 pop 取结果后、update_from_output 前的一个调用点存在。
         self.aborts.clear()
 
-    # SOURCE: vllm/v1/engine/core.py:L1152-L1158  (EngineCore.has_work)
+    # SOURCE: vllm/v1/engine/core.py:L1156-L1162  (EngineCore.has_work)
     def has_work(self) -> bool:
         """Returns true if the engine should be stepped."""
         # SUBTRACTED: self.engines_running （DP 协调相关，core.py:L1155）—— 不在本章

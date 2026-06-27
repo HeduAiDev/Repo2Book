@@ -165,7 +165,7 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
         return ""
 
 
-# SOURCE: vllm/v1/engine/detokenizer.py:L245 SlowIncrementalDetokenizer
+# SOURCE: vllm/v1/engine/detokenizer.py:L250 SlowIncrementalDetokenizer
 # SUBTRACTED: prefix_offset/read_offset prompt-token bookkeeping +
 #   detokenize_incrementally + skip_special_tokens/spaces_between_special_tokens
 #   + byte-fallback recovery — all tokenizer-internal (subtraction_plan: only the
@@ -173,16 +173,16 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
 #   the real per-token tokenizer decode.
 class SlowIncrementalDetokenizer(BaseIncrementalDetokenizer):
     def __init__(self, tokenizer: Callable[[int], str], request):
-        # SOURCE: vllm/v1/engine/detokenizer.py:L246
+        # SOURCE: vllm/v1/engine/detokenizer.py:L251
         super().__init__(request)
         self.tokenizer = tokenizer
 
-    # SOURCE: vllm/v1/engine/detokenizer.py:L286
+    # SOURCE: vllm/v1/engine/detokenizer.py:L291
     def decode_next(self, next_token_id: int) -> str:
         return self.tokenizer(next_token_id)
 
 
-# SOURCE: vllm/v1/engine/detokenizer.py:L304
+# SOURCE: vllm/v1/engine/detokenizer.py:L309
 def check_stop_strings(
     output_text: str,
     new_char_count: int,

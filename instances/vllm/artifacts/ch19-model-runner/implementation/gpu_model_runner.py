@@ -88,7 +88,7 @@ class ModelRunnerOutput:  # SOURCE: vllm/v1/outputs.py ModelRunnerOutput
     cudagraph_stats: object | None = None
 
 
-# SOURCE: vllm/v1/worker/gpu_model_runner.py:L378  ExecuteModelState
+# SOURCE: vllm/v1/worker/gpu_model_runner.py:L383  ExecuteModelState
 class ExecuteModelState(NamedTuple):
     """Ephemeral cached state transferred between execute_model() and
     sample_tokens(), after execute_model() returns None."""
@@ -142,7 +142,7 @@ def get_forward_context() -> dict | None:  # SOURCE: vllm/forward_context.py get
     return _forward_context
 
 
-# SOURCE: vllm/v1/worker/gpu_model_runner.py:L394  GPUModelRunner (ch19 slice)
+# SOURCE: vllm/v1/worker/gpu_model_runner.py:L399  GPUModelRunner (ch19 slice)
 class GPUModelRunner:
     """Reduced GPUModelRunner exposing the ch19 two-phase spine:
 
@@ -230,7 +230,7 @@ class GPUModelRunner:
     # Preprocess (carried over from the ch18 spine, reduced).
     # ------------------------------------------------------------------ #
 
-    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L1065  _update_states
+    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L1073  _update_states
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Reconcile the cached states and the persistent batch with the
         scheduler output (remove finished/unscheduled, add new/resumed,
@@ -301,7 +301,7 @@ class GPUModelRunner:
         self.input_batch.condense()
         self.input_batch.refresh_metadata()
 
-    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L1572  _get_cumsum_and_arange
+    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L1600  _get_cumsum_and_arange
     def _get_cumsum_and_arange(
         self,
         num_tokens: np.ndarray,
@@ -320,7 +320,7 @@ class GPUModelRunner:
         )
         return cu_num_tokens
 
-    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L1787  _prepare_inputs
+    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L1815  _prepare_inputs
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -358,7 +358,7 @@ class GPUModelRunner:
         )
 
         # SUBTRACTED: M-RoPE / XD-RoPE position calc. Approved (multimodal).
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1825-L1833
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1853-L1861
 
         # token_indices = positions + req_index * max_model_len (2D -> flat 1D).
         token_indices = (
@@ -388,7 +388,7 @@ class GPUModelRunner:
         # SUBTRACTED: prev_positions / async spec-decode num_computed_tokens GPU
         #   correction + _prepare_input_ids prev_sampled_token_ids backfill
         #   (async scheduling). Reduced companion does the normal-scheduling copy.
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1613-L1636, L1920-L2015
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1641-L1664, L1920-L2015
         self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
 
         # slot_mapping via the block-table Triton kernel (CUDA only).
@@ -400,7 +400,7 @@ class GPUModelRunner:
             )
 
         # SUBTRACTED: spec_decode_metadata branch + LoRA hot-swap. Approved.
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L2043-L2091
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L2071-L2119
         spec_decode_metadata = None
         query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
         logits_indices = query_start_loc[1:] - 1
@@ -410,9 +410,9 @@ class GPUModelRunner:
     # CUDA graph dispatch.
     # ------------------------------------------------------------------ #
 
-    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L3570  _is_uniform_decode
+    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L3600  _is_uniform_decode
     @staticmethod
-    def _is_uniform_decode(  # SOURCE: vllm/v1/worker/gpu_model_runner.py:L3570
+    def _is_uniform_decode(  # SOURCE: vllm/v1/worker/gpu_model_runner.py:L3600
         max_num_scheduled_tokens: int,
         uniform_decode_query_len: int,
         num_tokens: int,
@@ -423,7 +423,7 @@ class GPUModelRunner:
             num_tokens == max_num_scheduled_tokens * num_reqs
         )
 
-    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L3591  _determine_batch_execution_and_padding
+    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L3621  _determine_batch_execution_and_padding
     def _determine_batch_execution_and_padding(
         self,
         num_tokens: int,
@@ -445,7 +445,7 @@ class GPUModelRunner:
         # SUBTRACTED: LoRA num_active_loras count, SP/DP padding, ubatching
         #   (DBO) coordination across data-parallel ranks, encoder-decoder
         #   full-graph disabling. Approved — single-rank, no-LoRA, no-DP path.
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L3626-末
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L3656-末
         has_lora = False
         num_active_loras = 0
 
@@ -473,7 +473,7 @@ class GPUModelRunner:
     # Forward.
     # ------------------------------------------------------------------ #
 
-    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L3538  _model_forward
+    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L3568  _model_forward
     def _model_forward(
         self,
         input_ids=None,
@@ -496,7 +496,7 @@ class GPUModelRunner:
     # Phase 1: execute_model — issue the forward, cache state, return None.
     # ------------------------------------------------------------------ #
 
-    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L3825  execute_model
+    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L3855  execute_model
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -525,13 +525,13 @@ class GPUModelRunner:
 
         if not num_scheduled_tokens:
             # SUBTRACTED: external-launcher+DP dummy run / KV-transfer no-forward.
-            #   Approved. Orig: vllm/v1/worker/gpu_model_runner.py:L3882-L3897
+            #   Approved. Orig: vllm/v1/worker/gpu_model_runner.py:L3910-L3925
             # Return an empty output if there is no work to do.
             return ModelRunnerOutput(req_ids=[], req_id_to_index={}, sampled_token_ids=[])
 
         # SUBTRACTED: EC connector consumer mm-encoder early return,
         #   kv_sharing_fast_prefill assert. Approved.
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L3873-L3904
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L3901-L3932
         num_reqs = self.input_batch.num_reqs
         req_ids = self.input_batch.req_ids
         tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
@@ -570,7 +570,7 @@ class GPUModelRunner:
         #   inputs_embeds / model_kwargs assembly). Reduced companion feeds the
         #   prepared input_ids/positions straight in; the attention metadata and
         #   per-backend build belong to the attention chapters. Approved.
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L3956-L4049
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L3984-L4077
         input_ids = self.input_ids.gpu[:num_tokens_unpadded]
         positions = self.positions[:num_tokens_unpadded]
         attn_metadata = None
@@ -598,7 +598,7 @@ class GPUModelRunner:
         # SUBTRACTED: EAGLE-3 aux_hidden_states unpacking, PP non-last-rank early
         #   return of IntermediateTensors, pooling-model _pool, broadcast_pp_output
         #   logits broadcast. Approved (spec decode / PP / pooling).
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L4098-L4154
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L4126-L4182
         hidden_states = model_output
         sample_hidden_states = hidden_states[logits_indices]
         logits = self.model.compute_logits(sample_hidden_states)
@@ -622,7 +622,7 @@ class GPUModelRunner:
 
         # SUBTRACTED: kv_connector_output stashing + deferred_state_corrections_fn
         #   (async scheduling waits for the previous forward's corrections here).
-        #   Approved. Orig: vllm/v1/worker/gpu_model_runner.py:L4168-L4173
+        #   Approved. Orig: vllm/v1/worker/gpu_model_runner.py:L4196-L4201
         return None
 
     # ------------------------------------------------------------------ #
@@ -630,7 +630,7 @@ class GPUModelRunner:
     # ------------------------------------------------------------------ #
 
     @torch.inference_mode()
-    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L4178  sample_tokens
+    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L4206  sample_tokens
     def sample_tokens(self, grammar_output=None) -> "ModelRunnerOutput":
         if self.execute_model_state is None:
             # SUBTRACTED: PP non-last-rank receive of sampled ids + pure
@@ -658,7 +658,7 @@ class GPUModelRunner:
         self.execute_model_state = None
 
         # SUBTRACTED: apply_grammar_bitmask (structured output). Approved.
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L4216-L4219
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L4244-L4247
 
         sampler_output = self._sample(logits, spec_decode_metadata)
 
@@ -700,20 +700,20 @@ class GPUModelRunner:
         # SUBTRACTED: AsyncGPUModelRunnerOutput wrapping + set_async_sampled_token_ids
         #   (async scheduling keeps sampled ids on the GPU and registers a deferred
         #   CPU copy). Reduced companion is synchronous. Approved.
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L4393-L4414
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L4434-L4455
         return output
 
-    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L3367  _sample
+    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L3397  _sample
     def _sample(self, logits, spec_decode_metadata) -> SamplerOutput:
         """Sample the next token (and logprobs if needed)."""
         sampling_metadata = self.input_batch.sampling_metadata
         # SUBTRACTED: update_async_output_token_ids (async sched), rejection
         #   sampler / spec-decode path. Approved — reduced companion never has
         #   spec_decode_metadata, so the plain sampler branch always runs.
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L3376, L3383-L3395
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L3406, L3383-L3395
         return self.sampler(logits=logits, sampling_metadata=sampling_metadata)
 
-    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L1421  _update_states_after_model_execute
+    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L1449  _update_states_after_model_execute
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
     ) -> None:
@@ -723,10 +723,10 @@ class GPUModelRunner:
         #   Reduced companion has speculative_config=None / is_hybrid=False, so
         #   the real method returns immediately here too. The call site is kept to
         #   show where it sits in the flow. Approved.
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1432-L1464
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1460-L1492
         return
 
-    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L3397  _bookkeeping_sync
+    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L3427  _bookkeeping_sync
     def _bookkeeping_sync(
         self,
         scheduler_output: "SchedulerOutput",
@@ -743,7 +743,7 @@ class GPUModelRunner:
         together — the batch carries the new token into the next step."""
         num_nans_in_logits: dict = {}
         # SUBTRACTED: VLLM_COMPUTE_NANS_IN_LOGITS NaN scan. Approved (diagnostic).
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L3413-L3415
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L3443-L3445
 
         num_reqs = self.input_batch.num_reqs
         discard_sampled_tokens_req_indices = np.nonzero(
@@ -765,7 +765,7 @@ class GPUModelRunner:
         # SUBTRACTED: the use_async_scheduling branch (GPU-cached sampled ids +
         #   prev_req_id_to_index). Reduced companion is synchronous, so we take
         #   the eager CPU path. Approved.
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L3456-L3472
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L3486-L3502
         max_gen_len = sampled_token_ids.shape[-1]
         if max_gen_len == 1:
             # No spec decode tokens.
@@ -777,7 +777,7 @@ class GPUModelRunner:
                 logprobs_lists = logprobs_tensors.tolists()
         else:
             # SUBTRACTED: RejectionSampler.parse_output (spec decode multi-token).
-            #   Approved. Orig: vllm/v1/worker/gpu_model_runner.py:L3448-L3455
+            #   Approved. Orig: vllm/v1/worker/gpu_model_runner.py:L3478-L3485
             raise AssertionError("spec decode is subtracted in the reduced companion")
 
         # Write the sampled tokens back into the persistent batch so the
@@ -808,7 +808,7 @@ class GPUModelRunner:
             req_state.output_token_ids.extend(sampled_ids)
 
         # SUBTRACTED: _get_prompt_logprobs_dict (prompt logprobs). Approved.
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L3507-L3511
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L3537-L3541
         prompt_logprobs_dict: dict = {}
 
         return (

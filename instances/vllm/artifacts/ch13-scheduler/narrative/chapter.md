@@ -57,7 +57,7 @@ def schedule(self) -> "SchedulerOutput":
 为什么能这么干？看 `schedule()` 开头那段 woosuk 写的注释，它是整个调度器的设计宣言：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L352
+# vllm/v1/core/sched/scheduler.py:L310
 def schedule(self) -> SchedulerOutput:
     # NOTE(woosuk) on the scheduling algorithm:
     # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -96,7 +96,7 @@ def schedule(self) -> SchedulerOutput:
 看 `schedule()` 怎么开局。它一上来初始化一堆结果容器和一个预算：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L364
+# vllm/v1/core/sched/scheduler.py:L322
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -140,7 +140,7 @@ def schedule(self) -> SchedulerOutput:
 第一阶段遍历 `self.running`——已经在跑的请求。**RUNNING 优先于 WAITING**，这是个刻意的策略：先保证在途请求往前推进（低延迟、避免吐到一半的请求被新来的饿死）。
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L387
+# vllm/v1/core/sched/scheduler.py:L345
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -179,7 +179,7 @@ def schedule(self) -> SchedulerOutput:
 差值算完，下一步是为这些新 token 找 KV cache 的空间。这里是调度和显存的耦合点：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L446
+# vllm/v1/core/sched/scheduler.py:L404
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
                 # reasons: ... (encoder budget / cache exhausted, etc.)
@@ -237,7 +237,7 @@ def schedule(self) -> SchedulerOutput:
 被抢占的请求经历了什么：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L952
+# vllm/v1/core/sched/scheduler.py:L910
     def _preempt_request(self, request, timestamp: float) -> None:
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
@@ -293,7 +293,7 @@ def test_preemption_when_out_of_blocks():
 RUNNING 都伺候完、预算还有剩，才轮到 WAITING 队列里的新请求。阶段二开头有一道关键守卫：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L567
+# vllm/v1/core/sched/scheduler.py:L525
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
@@ -317,7 +317,7 @@ RUNNING 都伺候完、预算还有剩，才轮到 WAITING 队列里的新请求
 进入循环后，`peek_request` 先看一眼队首请求（还不弹出）。然后算它要调度多少 token。和 RUNNING 阶段不同，新请求得先查**前缀缓存命中**——如果它的 prompt 前缀已经在别处算过、KV 还在缓存里，那部分直接白嫖，计进 `num_computed_tokens`，不用重算。命中查询的细节属于下一章的 KV cache 管理器，这里只需知道：查完之后 `num_computed_tokens` 可能已经 > 0。然后算追赶公式的 WAITING 变体：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L672
+# vllm/v1/core/sched/scheduler.py:L630
                 else:
                     # Number of tokens to be scheduled.
                     # We use `request.num_tokens` instead of
@@ -375,7 +375,7 @@ def test_no_chunked_prefill_breaks_when_over_budget():
 分配 token 数定了，接着同样是 `allocate_slots`（失败就 `break`——WAITING 阶段不抢占，没块就算了）。成功后，请求正式入列：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L807
+# vllm/v1/core/sched/scheduler.py:L765
                 self.running.append(request)
                 # … 省略：日志事件记录 …
                 if request.status == RequestStatus.WAITING:
@@ -400,7 +400,7 @@ def test_no_chunked_prefill_breaks_when_over_budget():
 阶段二结束，`schedule()` 做一组断言，把这一拍的资源守恒钉死：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L848
+# vllm/v1/core/sched/scheduler.py:L806
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
@@ -519,7 +519,7 @@ class SchedulerOutput:
 组装代码用 §13.3/§13.4 攒的那几个分类列表来分流：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L871
+# vllm/v1/core/sched/scheduler.py:L829
         # Construct the scheduler output.
         # … 省略：use_v2_model_runner 分支 …
         new_reqs_data = [
@@ -549,7 +549,7 @@ class SchedulerOutput:
 最后两行很关键：`prev_step_scheduled_req_ids` 被刷成「这一拍调度了哪些请求」。下一拍组装增量时，它用来判断某请求是不是「上一拍刚调过」——这决定要不要补传 `all_token_ids`。看 `_make_cached_request_data`：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L1060
+# vllm/v1/core/sched/scheduler.py:L1018
         num_running_reqs = len(running_reqs)
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
             req_id = req.request_id
@@ -609,14 +609,14 @@ def test_second_schedule_emits_cached_request_data():
 `schedule()` 的最后一步，是在返回之前就把 `num_computed_tokens` 往前推——**不等模型跑完**：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L943
+# vllm/v1/core/sched/scheduler.py:L901
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
 ```
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L974
+# vllm/v1/core/sched/scheduler.py:L932
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
         # the request is scheduled.
@@ -666,7 +666,7 @@ def test_second_schedule_emits_cached_request_data():
 `schedule()` 是「发出去」，`update_from_output()` 是「收回来」。模型跑完前向、采样出 token，[EngineCore](../ch11-engine-core/narrative/chapter.md) 把 `ModelRunnerOutput` 交给它，它负责把 token 追加到请求上、判断该不该停、停了就释放：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L1290（精简：剥去 connector/encoder/structured/pooling/logprobs/stats）
+# vllm/v1/core/sched/scheduler.py:L1248（精简：剥去 connector/encoder/structured/pooling/logprobs/stats）
     def update_from_output(self, scheduler_output, model_runner_output):
         sampled_token_ids = model_runner_output.sampled_token_ids
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
@@ -717,7 +717,7 @@ def test_second_schedule_emits_cached_request_data():
 遍历这一拍调度过的每个请求，从 `sampled_token_ids` 取出它新生成的 token。一个 prefill chunk 没生成新 token（prompt 还没读完），`generated_token_ids` 是空的，直接跳过追加。一个 decode 请求生成了 1 个 token，就走 `_update_request_with_output` 追加并判停：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L1622
+# vllm/v1/core/sched/scheduler.py:L1559
     def _update_request_with_output(self, request, new_token_ids):
         stopped = False
         for num_new, output_token_id in enumerate(new_token_ids, 1):

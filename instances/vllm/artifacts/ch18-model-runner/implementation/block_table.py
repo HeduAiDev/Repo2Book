@@ -233,32 +233,32 @@ class MultiGroupBlockTable:
             )
         ]
 
-    # SOURCE: vllm/v1/worker/block_table.py:L276  append_row
+    # SOURCE: vllm/v1/worker/block_table.py:L283  append_row
     def append_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
         for i, block_table in enumerate(self.block_tables):
             block_table.append_row(block_ids[i], row_idx)
 
-    # SOURCE: vllm/v1/worker/block_table.py:L280  add_row
+    # SOURCE: vllm/v1/worker/block_table.py:L287  add_row
     def add_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
         for i, block_table in enumerate(self.block_tables):
             block_table.add_row(block_ids[i], row_idx)
 
-    # SOURCE: vllm/v1/worker/block_table.py:L284  clear_row
+    # SOURCE: vllm/v1/worker/block_table.py:L291  clear_row
     def clear_row(self, row_idx: int) -> None:
         for block_table in self.block_tables:
             block_table.clear_row(row_idx)
 
-    # SOURCE: vllm/v1/worker/block_table.py:L288  move_row
+    # SOURCE: vllm/v1/worker/block_table.py:L295  move_row
     def move_row(self, src: int, tgt: int) -> None:
         for block_table in self.block_tables:
             block_table.move_row(src, tgt)
 
-    # SOURCE: vllm/v1/worker/block_table.py:L292  swap_row
+    # SOURCE: vllm/v1/worker/block_table.py:L299  swap_row
     def swap_row(self, src: int, tgt: int) -> None:
         for block_table in self.block_tables:
             block_table.swap_row(src, tgt)
 
-    # SOURCE: vllm/v1/worker/block_table.py:L296  compute_slot_mapping
+    # SOURCE: vllm/v1/worker/block_table.py:L303  compute_slot_mapping
     def compute_slot_mapping(
         self,
         num_reqs: int,
@@ -268,18 +268,18 @@ class MultiGroupBlockTable:
         for block_table in self.block_tables:
             block_table.compute_slot_mapping(num_reqs, query_start_loc, positions)
 
-    # SOURCE: vllm/v1/worker/block_table.py:L305  commit_block_table
+    # SOURCE: vllm/v1/worker/block_table.py:L312  commit_block_table
     def commit_block_table(self, num_reqs: int) -> None:
         for block_table in self.block_tables:
             block_table.commit_block_table(num_reqs)
 
-    # SOURCE: vllm/v1/worker/block_table.py:L313  __getitem__
+    # SOURCE: vllm/v1/worker/block_table.py:L320  __getitem__
     def __getitem__(self, idx: int) -> "BlockTable":
         """Returns the BlockTable for the i-th KV cache group."""
         return self.block_tables[idx]
 
 
-# SOURCE: vllm/v1/worker/block_table.py:L318  _compute_slot_mapping_kernel
+# SOURCE: vllm/v1/worker/block_table.py:L325  _compute_slot_mapping_kernel
 @triton.jit
 def _compute_slot_mapping_kernel(
     num_tokens,
@@ -296,7 +296,7 @@ def _compute_slot_mapping_kernel(
     PAD_ID: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    # SOURCE: vllm/v1/worker/block_table.py:L318
+    # SOURCE: vllm/v1/worker/block_table.py:L325
     req_idx = tl.program_id(0)
 
     if req_idx == tl.num_programs(0) - 1:
@@ -328,7 +328,7 @@ def _compute_slot_mapping_kernel(
         # SUBTRACTED: is_local / local_block_offsets CP-sharding math. Approved
         #   CP deletion — with TOTAL_CP_WORLD_SIZE == 1 and rank 0, is_local is
         #   always True and local_block_offsets degenerates to pos % block_size.
-        #   Orig: vllm/v1/worker/block_table.py:L362-L369
+        #   Orig: vllm/v1/worker/block_table.py:L369-L376
         local_block_offsets = virtual_block_offsets
 
         slot_ids = block_numbers * block_size + local_block_offsets

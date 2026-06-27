@@ -7,7 +7,7 @@
 #
 # SUBTRACTED: mm_features / lora_request / structured_output_request /
 #   block_hashes / _block_hasher / record_event / prefill_stats /
-#   prompt_embeds / discard_latest_async_tokens 等字段（原 vllm/v1/request.py:L60-L210）
+#   prompt_embeds / discard_latest_async_tokens 等字段（原 vllm/v1/request.py:L60-L216）
 #   —— 多模态/LoRA/约束解码/可观测性均属 dossier.delete 批准的独立子系统，
 #   纯文本采样请求不触发，删后状态机与 token 计数完整自洽。
 from __future__ import annotations
@@ -62,7 +62,7 @@ class Request:
         priority: int = 0,
         client_index: int = 0,
     ) -> None:
-        # SOURCE: vllm/v1/request.py:L96
+        # SOURCE: vllm/v1/request.py:L97
         self.request_id = request_id
         self.status = RequestStatus.WAITING
         self.arrival_time = arrival_time
@@ -70,22 +70,22 @@ class Request:
         self.client_index = client_index
 
         self.prompt_token_ids = list(prompt_token_ids)
-        # SOURCE: vllm/v1/request.py:L129
+        # SOURCE: vllm/v1/request.py:L130
         self.num_prompt_tokens = len(self.prompt_token_ids)
-        # SOURCE: vllm/v1/request.py:L136 —— _all_token_ids = prompt + output（按位置展开）
+        # SOURCE: vllm/v1/request.py:L137 —— _all_token_ids = prompt + output（按位置展开）
         self._all_token_ids: list[int] = list(self.prompt_token_ids)
         self._output_token_ids: list[int] = []
 
         self.sampling_params = sampling_params
         self.pooling_params = None  # SUBTRACTED: 池化请求（另章）
 
-        # SOURCE: vllm/v1/request.py:L140 —— AsyncScheduler 占位计数
+        # SOURCE: vllm/v1/request.py:L141 —— AsyncScheduler 占位计数
         self.num_output_placeholders = 0
-        # SOURCE: vllm/v1/request.py:L144
-        self.spec_token_ids: list[int] = []
         # SOURCE: vllm/v1/request.py:L145
+        self.spec_token_ids: list[int] = []
+        # SOURCE: vllm/v1/request.py:L146
         self.num_computed_tokens = 0
-        # SOURCE: vllm/v1/request.py:L160
+        # SOURCE: vllm/v1/request.py:L161
         self.is_prefill_chunk = False
 
         self.num_preemptions = 0
@@ -108,7 +108,7 @@ class Request:
         # SOURCE: vllm/v1/request.py:Request.all_token_ids
         return self._all_token_ids
 
-    # SOURCE: vllm/v1/request.py:L211
+    # SOURCE: vllm/v1/request.py:L217
     def append_output_token_ids(self, token_ids: int | list[int]) -> None:
         if isinstance(token_ids, int):
             self._output_token_ids.append(token_ids)
@@ -120,17 +120,17 @@ class Request:
 
     @property
     def num_tokens(self) -> int:
-        # SOURCE: vllm/v1/request.py:L234
+        # SOURCE: vllm/v1/request.py:L240
         return len(self._all_token_ids)
 
     @property
     def num_tokens_with_spec(self) -> int:
-        # SOURCE: vllm/v1/request.py:L238
+        # SOURCE: vllm/v1/request.py:L244
         return len(self._all_token_ids) + len(self.spec_token_ids)
 
     @property
     def num_output_tokens(self) -> int:
-        # SOURCE: vllm/v1/request.py:L242
+        # SOURCE: vllm/v1/request.py:L248
         return len(self._output_token_ids)
 
     # SUBTRACTED: use_structured_output 恒 False（约束解码，dossier.delete 批准）

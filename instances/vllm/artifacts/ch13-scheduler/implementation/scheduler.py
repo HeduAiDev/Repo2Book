@@ -37,9 +37,9 @@ def record_function_or_nullcontext(_name: str) -> _nullctx:
     return _nullctx()
 
 
-# SOURCE: vllm/v1/core/sched/scheduler.py:L57 class Scheduler
+# SOURCE: vllm/v1/core/sched/scheduler.py:L52 class Scheduler
 class Scheduler:
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L68 __init__
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L63 __init__
     def __init__(
         self,
         max_num_seqs: int = 256,
@@ -66,9 +66,9 @@ class Scheduler:
         self.num_lookahead_tokens = num_spec_tokens
         self.log_stats = log_stats
 
-        # SOURCE: vllm/v1/core/sched/scheduler.py:L106
+        # SOURCE: vllm/v1/core/sched/scheduler.py:L101
         self.max_num_running_reqs = max_num_seqs
-        # SOURCE: vllm/v1/core/sched/scheduler.py:L107 缺省回退到 max_num_batched_tokens
+        # SOURCE: vllm/v1/core/sched/scheduler.py:L102 缺省回退到 max_num_batched_tokens
         self.max_num_scheduled_tokens = max_num_batched_tokens
 
         self.policy = SchedulingPolicy.FCFS
@@ -79,25 +79,25 @@ class Scheduler:
 
         # req_id -> Request
         self.requests: dict[str, object] = {}
-        # SOURCE: vllm/v1/core/sched/scheduler.py:L167
+        # SOURCE: vllm/v1/core/sched/scheduler.py:L162
         self.waiting = create_request_queue(self.policy)
         # skipped_waiting：被阻塞态(本章无)暂时跳过的队列，保留以维持 schedule() 逻辑
         self.skipped_waiting = create_request_queue(self.policy)
-        # SOURCE: vllm/v1/core/sched/scheduler.py:L170
+        # SOURCE: vllm/v1/core/sched/scheduler.py:L165
         self.running: list = []
 
         # 跨拍状态
         self.finished_req_ids: set[str] = set()
         # SOURCE: vllm/v1/core/sched/scheduler.py: prev_step_scheduled_req_ids
         self.prev_step_scheduled_req_ids: set[str] = set()
-        # SOURCE: vllm/v1/core/sched/scheduler.py:L300
+        # SOURCE: vllm/v1/core/sched/scheduler.py:L258
         self._pause_state: PauseState = PauseState.UNPAUSED
         self.num_waiting_for_streaming_input = 0
 
     # ------------------------------------------------------------------ #
     # 入队
     # ------------------------------------------------------------------ #
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L1728 add_request（精简：无 streaming session）
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L1665 add_request（精简：无 streaming session）
     def add_request(self, request) -> None:
         # SUBTRACTED: streaming-input session 复用分支（_update_request_as_session），
         #   dossier.delete 批准；普通请求直接入 requests + waiting。
@@ -107,7 +107,7 @@ class Scheduler:
     # ------------------------------------------------------------------ #
     # schedule —— 连续批处理一拍的入口
     # ------------------------------------------------------------------ #
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L352 schedule
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L310 schedule
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -144,12 +144,12 @@ class Scheduler:
         #   （encoder/mm，dossier.delete 批准）。
 
         # First, schedule the RUNNING requests.
-        # SOURCE: vllm/v1/core/sched/scheduler.py:L387
+        # SOURCE: vllm/v1/core/sched/scheduler.py:L345
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
-            # SOURCE: vllm/v1/core/sched/scheduler.py:L392 async 提前剪枝
+            # SOURCE: vllm/v1/core/sched/scheduler.py:L350 async 提前剪枝
             if (
                 request.num_output_placeholders > 0
                 and request.num_computed_tokens + 2 - request.num_output_placeholders
@@ -160,7 +160,7 @@ class Scheduler:
                 req_index += 1
                 continue
 
-            # SOURCE: vllm/v1/core/sched/scheduler.py:L408 ‘追赶’公式
+            # SOURCE: vllm/v1/core/sched/scheduler.py:L366 ‘追赶’公式
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
@@ -178,7 +178,7 @@ class Scheduler:
             # SUBTRACTED: _try_schedule_encoder_inputs（encoder 预算截断）、
             #   _mamba_block_aligned_split（mamba 对齐）—— dossier.delete 批准。
 
-            # SOURCE: vllm/v1/core/sched/scheduler.py:L446
+            # SOURCE: vllm/v1/core/sched/scheduler.py:L404
             if num_new_tokens == 0:
                 # The request cannot be scheduled (e.g. PP>1 prompt fully
                 # scheduled but not finished, or async already reached max).
@@ -225,7 +225,7 @@ class Scheduler:
             token_budget -= num_new_tokens
             req_index += 1
 
-            # SOURCE: vllm/v1/core/sched/scheduler.py:L524 spec decode 占位记账
+            # SOURCE: vllm/v1/core/sched/scheduler.py:L482 spec decode 占位记账
             if request.spec_token_ids:
                 num_scheduled_spec_tokens = (
                     num_new_tokens
@@ -244,7 +244,7 @@ class Scheduler:
         # SUBTRACTED: scheduled_loras 记账（LoRA，dossier.delete 批准）。
 
         # Next, schedule the WAITING requests.
-        # SOURCE: vllm/v1/core/sched/scheduler.py:L568 —— `if not preempted_reqs` 守卫
+        # SOURCE: vllm/v1/core/sched/scheduler.py:L526 —— `if not preempted_reqs` 守卫
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
 
@@ -262,7 +262,7 @@ class Scheduler:
                 #   max_loras 约束、KVConnector 外部命中分支（dossier.delete 批准）。
 
                 # Get already-cached tokens.
-                # SOURCE: vllm/v1/core/sched/scheduler.py:L613
+                # SOURCE: vllm/v1/core/sched/scheduler.py:L571
                 if request.num_computed_tokens == 0:
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
@@ -275,7 +275,7 @@ class Scheduler:
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
-                # SOURCE: vllm/v1/core/sched/scheduler.py:L672
+                # SOURCE: vllm/v1/core/sched/scheduler.py:L630
                 # Number of tokens to be scheduled.
                 # We use `request.num_tokens` instead of
                 # `request.num_prompt_tokens` to consider the resumed
@@ -316,7 +316,7 @@ class Scheduler:
                 #   置 WAITING_FOR_REMOTE_KVS 分支（dossier.delete 批准）。
 
                 request = request_queue.pop_request()
-                # SOURCE: vllm/v1/core/sched/scheduler.py:L807
+                # SOURCE: vllm/v1/core/sched/scheduler.py:L765
                 self.running.append(request)
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
@@ -338,7 +338,7 @@ class Scheduler:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
 
         # Check if the scheduling constraints are satisfied.
-        # SOURCE: vllm/v1/core/sched/scheduler.py:L848
+        # SOURCE: vllm/v1/core/sched/scheduler.py:L806
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
 
@@ -355,7 +355,7 @@ class Scheduler:
         #   dossier.delete 批准）。
 
         # Construct the scheduler output.
-        # SOURCE: vllm/v1/core/sched/scheduler.py:L871
+        # SOURCE: vllm/v1/core/sched/scheduler.py:L829
         # SUBTRACTED: use_v2_model_runner 分支（合并 resumed 进 new + _all_token_ids）。
         new_reqs_data = [
             NewRequestData.from_request(
@@ -398,7 +398,7 @@ class Scheduler:
     # ------------------------------------------------------------------ #
     # 抢占
     # ------------------------------------------------------------------ #
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L952 _preempt_request
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L910 _preempt_request
     def _preempt_request(self, request, timestamp: float) -> None:
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
@@ -417,7 +417,7 @@ class Scheduler:
     # ------------------------------------------------------------------ #
     # 调度后乐观推进
     # ------------------------------------------------------------------ #
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L974 _update_after_schedule
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L932 _update_after_schedule
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
         # the request is scheduled. This lets us schedule the prefill request
@@ -441,7 +441,7 @@ class Scheduler:
     # ------------------------------------------------------------------ #
     # 增量打包
     # ------------------------------------------------------------------ #
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L1043 _make_cached_request_data
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L1001 _make_cached_request_data
     def _make_cached_request_data(
         self,
         running_reqs: list,
@@ -489,7 +489,7 @@ class Scheduler:
             num_output_tokens=num_output_tokens,
         )
 
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L1567 _select_waiting_queue_for_scheduling
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L1529 _select_waiting_queue_for_scheduling
     def _select_waiting_queue_for_scheduling(self):
         # SUBTRACTED: PRIORITY 比较分支（dossier.delete 批准）。FCFS：先清 skipped。
         return self.skipped_waiting or self.waiting or None
@@ -497,7 +497,7 @@ class Scheduler:
     # ------------------------------------------------------------------ #
     # 反馈环：吃模型输出
     # ------------------------------------------------------------------ #
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L1290 update_from_output
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L1248 update_from_output
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -526,7 +526,7 @@ class Scheduler:
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
 
-            # SOURCE: vllm/v1/core/sched/scheduler.py:L1354 spec 拒绝回退
+            # SOURCE: vllm/v1/core/sched/scheduler.py:L1312 spec 拒绝回退
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
@@ -589,7 +589,7 @@ class Scheduler:
 
         return dict(outputs)
 
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L1622 _update_request_with_output
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L1559 _update_request_with_output
     def _update_request_with_output(
         self, request, new_token_ids: list[int]
     ) -> tuple[list[int], bool]:
@@ -606,7 +606,7 @@ class Scheduler:
                 break
         return new_token_ids, stopped
 
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L1813 _free_request
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L1750 _free_request
     def _free_request(self, request) -> None:
         assert request.is_finished()
         # SUBTRACTED: _connector_finished / delay_free_blocks（KVConnector，delete 批准）。
@@ -615,7 +615,7 @@ class Scheduler:
         self.kv_cache_manager.free(request)
         del self.requests[request_id]
 
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L1840 set_pause_state
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L1777 set_pause_state
     def set_pause_state(self, pause_state: PauseState) -> None:
         self._pause_state = pause_state
 

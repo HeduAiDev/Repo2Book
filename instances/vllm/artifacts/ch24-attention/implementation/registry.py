@@ -69,7 +69,7 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     # set to None to avoid alias with other backend, whose value is an empty string.
     CUSTOM = None
 
-    # SOURCE: vllm/v1/attention/backends/registry.py:L90 (get_path)
+    # SOURCE: vllm/v1/attention/backends/registry.py:L92 (get_path)
     def get_path(self, include_classname: bool = True) -> str:
         """Get the class path for this backend (respects overrides)."""
         path = _ATTN_OVERRIDES.get(self, self.value)
@@ -82,17 +82,17 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
             path = path.rsplit(".", 1)[0]
         return path
 
-    # SOURCE: vllm/v1/attention/backends/registry.py:L111 (get_class)
+    # SOURCE: vllm/v1/attention/backends/registry.py:L113 (get_class)
     def get_class(self) -> "type[AttentionBackend]":
         """Get the backend class (respects overrides)."""
         return resolve_obj_by_qualname(self.get_path())
 
-    # SOURCE: vllm/v1/attention/backends/registry.py:L121 (is_overridden)
+    # SOURCE: vllm/v1/attention/backends/registry.py:L123 (is_overridden)
     def is_overridden(self) -> bool:
         """Check if this backend has been overridden."""
         return self in _ATTN_OVERRIDES
 
-    # SOURCE: vllm/v1/attention/backends/registry.py:L129 (clear_override)
+    # SOURCE: vllm/v1/attention/backends/registry.py:L131 (clear_override)
     def clear_override(self) -> None:
         """Clear any override for this backend, reverting to the default."""
         _ATTN_OVERRIDES.pop(self, None)
@@ -101,11 +101,11 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
 # SUBTRACTED: MambaAttentionBackendEnum 与 _MAMBA_ATTN_OVERRIDES（registry.py:L134-L208）
 # 是与上表完全同构的 mamba/线性注意力后端注册表；本章只讲标准注意力后端，删之不影响主链。
 
-# SOURCE: vllm/v1/attention/backends/registry.py:L207 (_ATTN_OVERRIDES)
+# SOURCE: vllm/v1/attention/backends/registry.py:L199 (_ATTN_OVERRIDES)
 _ATTN_OVERRIDES: dict[AttentionBackendEnum, str] = {}
 
 
-# SOURCE: vllm/v1/attention/backends/registry.py:L211 (register_backend)
+# SOURCE: vllm/v1/attention/backends/registry.py:L203 (register_backend)
 def register_backend(
     backend: AttentionBackendEnum,
     class_path: str | None = None,
@@ -129,7 +129,7 @@ def register_backend(
     """
     # SUBTRACTED: is_mamba 分支写 _MAMBA_ATTN_OVERRIDES（registry.py:L249-L262）——随 mamba
     # 注册表一并删去；本章只走 _ATTN_OVERRIDES 这条标准注意力路径。
-    def decorator(cls: type) -> type:  # SOURCE: vllm/v1/attention/backends/registry.py:L249 (register_backend.decorator)
+    def decorator(cls: type) -> type:  # SOURCE: vllm/v1/attention/backends/registry.py:L241 (register_backend.decorator)
         _ATTN_OVERRIDES[backend] = f"{cls.__module__}.{cls.__qualname__}"
         return cls
 

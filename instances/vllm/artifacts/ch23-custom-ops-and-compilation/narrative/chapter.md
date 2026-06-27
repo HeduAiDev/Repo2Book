@@ -192,10 +192,10 @@ assert RMSNorm.enabled() is False
 
 ## 23.3 RMSNorm：一个 CustomOp 长什么样
 
-抽象讲了两节，落到一个真实实例上。RMSNorm 是最干净的 `CustomOp` 范例（`vllm/model_executor/layers/layernorm.py:L102`）：
+抽象讲了两节，落到一个真实实例上。RMSNorm 是最干净的 `CustomOp` 范例（`vllm/model_executor/layers/layernorm.py:L37`）：
 
 ```python
-# vllm/model_executor/layers/layernorm.py:L102
+# vllm/model_executor/layers/layernorm.py:L37
 @CustomOp.register("rms_norm")
 class RMSNorm(CustomOp):
     """Root mean square normalization.
@@ -238,10 +238,10 @@ def register(cls, name, dynamic_arg_dims=None):
 
 第二个要盯住的是 `__init__` 里那行 `super().__init__()`。它看着平平无奇，其实是**第 1 级 dispatch 的扳机**——它调到 `CustomOp.__init__`，那里就把 `dispatch_forward()` 跑了。所以构造一个 `RMSNorm`，它的 `_forward_method` 当场就定死了。模型作者写 `RMSNorm(hidden_size)` 时，根本意识不到背后已经悄悄选好了 cuda 还是 native。
 
-现在看那「两份实现」到底差在哪。先看纯 torch 那份（`vllm/model_executor/layers/layernorm.py:L233`）：
+现在看那「两份实现」到底差在哪。先看纯 torch 那份（`vllm/model_executor/layers/layernorm.py:L82`）：
 
 ```python
-# vllm/model_executor/layers/layernorm.py:L233
+# vllm/model_executor/layers/layernorm.py:L82
 def forward_native(
     self,
     x: torch.Tensor,
@@ -287,10 +287,10 @@ def forward_static(x, variance_epsilon, hidden_size, orig_dtype,
     return x if residual is None else (x, residual)
 ```
 
-再看 CUDA 那份（`vllm/model_executor/layers/layernorm.py:L258`）：
+再看 CUDA 那份（`vllm/model_executor/layers/layernorm.py:L104`）：
 
 ```python
-# vllm/model_executor/layers/layernorm.py:L258
+# vllm/model_executor/layers/layernorm.py:L104
 def forward_cuda(
     self,
     x: torch.Tensor,
@@ -470,10 +470,10 @@ def _mark_dynamic_inputs(mod, *args, **kwargs):
 
 ## 23.6 split_graph：在 attention 处把图切开
 
-`VllmBackend.__call__` 是第 2 级的核心。剥掉缓存/哈希那一大段（它们不改变主流程），骨架是这样（`vllm/compilation/backends.py:L996`）：
+`VllmBackend.__call__` 是第 2 级的核心。剥掉缓存/哈希那一大段（它们不改变主流程），骨架是这样（`vllm/compilation/backends.py:L1015`）：
 
 ```python
-# vllm/compilation/backends.py:L996（剥去缓存子系统后的骨架）
+# vllm/compilation/backends.py:L1015（剥去缓存子系统后的骨架）
 def __call__(self, graph: fx.GraphModule, example_inputs):
     # 一个 VllmBackend 实例只被调用一次
     assert not self._called
@@ -497,10 +497,10 @@ def __call__(self, graph: fx.GraphModule, example_inputs):
 
 两步：先 `split_graph` 把整图切成段，再让 `PiecewiseCompileInterpreter` 逐段处理。先看切图。
 
-`split_graph` 遍历 FX 图的每个节点，决定它属于哪个子图（`vllm/compilation/backends.py:L547`）：
+`split_graph` 遍历 FX 图的每个节点，决定它属于哪个子图（`vllm/compilation/backends.py:L548`）：
 
 ```python
-# vllm/compilation/backends.py:L547
+# vllm/compilation/backends.py:L548
 def split_graph(graph, splitting_ops):
     # … 省略：_decompose_size_nodes 等 FX 正确性预处理 …
     subgraph_id = 0
@@ -599,10 +599,10 @@ assert torch.allclose(split_gm(*inputs), graph(*inputs))
 
 ## 23.7 逐段处理：规整段编译 + 图捕获，attention 段 eager
 
-切完图，`PiecewiseCompileInterpreter` 遍历这些段，决定每段怎么处理（`vllm/compilation/backends.py:L724`）：
+切完图，`PiecewiseCompileInterpreter` 遍历这些段，决定每段怎么处理（`vllm/compilation/backends.py:L725`）：
 
 ```python
-# vllm/compilation/backends.py:L724
+# vllm/compilation/backends.py:L725
 def call_module(self, target, args, kwargs):
     assert isinstance(target, str)
     gm = getattr(self.module, target)
@@ -758,9 +758,9 @@ assert should_split(attn_node, ["vllm::unified_attention_with_output"])
 
 把两级 dispatch 并排放，本章就收束了。
 
-**第 1 级，单算子，构造期。** `CustomOp.__init__` 调 `dispatch_forward`，按 `enabled()`/`default_on()` 和平台，把 `self._forward_method` 定到 `forward_cuda`（融合 kernel，对编译器不透明）或 `forward_native`（纯 torch，可被编译器融合）——全在 `vllm/model_executor/custom_op.py:L174` 一处完成。一次定死，运行期零开销转发。RMSNorm（`vllm/model_executor/layers/layernorm.py:L102`）是它的标准范例：两份实现数值等价，差别只在「快」和「可不可融合」。
+**第 1 级，单算子，构造期。** `CustomOp.__init__` 调 `dispatch_forward`，按 `enabled()`/`default_on()` 和平台，把 `self._forward_method` 定到 `forward_cuda`（融合 kernel，对编译器不透明）或 `forward_native`（纯 torch，可被编译器融合）——全在 `vllm/model_executor/custom_op.py:L174` 一处完成。一次定死，运行期零开销转发。RMSNorm（`vllm/model_executor/layers/layernorm.py:L37`）是它的标准范例：两份实现数值等价，差别只在「快」和「可不可融合」。
 
-**第 2 级，整图，首次前向。** `@support_torch_compile`（`vllm/compilation/decorators.py:L118`）把模型包成可编译：推断 token 维动态、注入 wrapper、按 `mode` 决定 `do_not_compile`。首次前向触发 `VllmBackend`，`split_graph`（`vllm/compilation/backends.py:L547`）在 `splitting_ops`（默认 attention 算子）处把整图切成交替条带，`PiecewiseCompileInterpreter` 把规整段送 Inductor 编译 + 包 CUDA graph，attention 段保持 eager。
+**第 2 级，整图，首次前向。** `@support_torch_compile`（`vllm/compilation/decorators.py:L118`）把模型包成可编译：推断 token 维动态、注入 wrapper、按 `mode` 决定 `do_not_compile`。首次前向触发 `VllmBackend`，`split_graph`（`vllm/compilation/backends.py:L548`）在 `splitting_ops`（默认 attention 算子）处把整图切成交替条带，`PiecewiseCompileInterpreter` 把规整段送 Inductor 编译 + 包 CUDA graph，attention 段保持 eager。
 
 两级的咬合点，就是那句 docstring：**用 Inductor 时算子默认 `none`**。第 1 级故意选纯 torch 的 `forward_native`，把单个算子拆成编译器看得见的零件；第 2 级的 Inductor 再把这些零件和邻居融成一个 kernel。一个在算子粒度让路，一个在整图粒度收割——这才是 vLLM 既能用手写 kernel、又能吃到编译融合红利的原因。
 

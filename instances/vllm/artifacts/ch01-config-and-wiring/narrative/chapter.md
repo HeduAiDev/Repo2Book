@@ -173,7 +173,7 @@ async def output_handler():
 看 `EngineCore.step`，一拍的全貌就三步：
 
 ```python
-# vllm/v1/engine/core.py:L402
+# vllm/v1/engine/core.py:L406
 def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
     """Schedule, execute, and make output.
 
@@ -287,7 +287,7 @@ while self.llm_engine.has_unfinished_requests():
 服务面则完全不同。`EngineCore` 在它那个独立子进程里，自己有个永不停的总循环：
 
 ```python
-# vllm/v1/engine/core.py:L1164
+# vllm/v1/engine/core.py:L1168
 def run_busy_loop(self):
     """Core busy loop of the EngineCore."""
     while self._handle_shutdown():
@@ -336,7 +336,7 @@ return cls(
 `create_engine_config` 装配出的 `VllmConfig` 是什么？一个聚合 dataclass：
 
 ```python
-# vllm/config/vllm.py:L273
+# vllm/config/vllm.py:L268
 @config(config=ConfigDict(arbitrary_types_allowed=True))
 class VllmConfig:
     """Dataclass which contains all vllm-related configuration. This

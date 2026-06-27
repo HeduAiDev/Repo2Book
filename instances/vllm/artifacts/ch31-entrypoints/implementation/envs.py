@@ -8,7 +8,7 @@ import os
 
 # SOURCE: vllm/envs.py:L129,L1109-L1110 (VLLM_ENABLE_V1_MULTIPROCESSING)
 # SUBTRACTED: 真实在 environment_variables 字典里以 lambda 惰性读 os.environ 并 bool 化（默认 "1"）。
-#   本章用模块级常量等价呈现：默认 True，可经环境变量覆盖。原 vllm/envs.py:L1109-L1110。
+#   本章用模块级常量等价呈现：默认 True，可经环境变量覆盖。原 vllm/envs.py:L1112-L1113。
 VLLM_ENABLE_V1_MULTIPROCESSING: bool = (
     os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING", "1") == "1"
 )

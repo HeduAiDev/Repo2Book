@@ -9,7 +9,7 @@
 第 8 章那条单循环里有一行，当时我们故意没展开：
 
 ```python
-# vllm/v1/engine/output_processor.py:L632
+# vllm/v1/engine/output_processor.py:L657
 stop_string = req_state.detokenizer.update(
     new_token_ids, finish_reason == FinishReason.STOP
 )
@@ -265,7 +265,7 @@ def get_next_output_text(self, finished: bool, delta: bool) -> str:
 上一节反复提到 `check_stop_strings` 会"命中并截断"。它怎么找、为什么不每次扫全文？看源码（`vllm/v1/engine/detokenizer.py`）：
 
 ```python
-# vllm/v1/engine/detokenizer.py:L304
+# vllm/v1/engine/detokenizer.py:L309
 def check_stop_strings(
     output_text: str,
     new_char_count: int,
@@ -339,7 +339,7 @@ $$
 慢路径的对策是 `detokenize_incrementally`，核心是一对 offset——`prefix_offset` 和 `read_offset`——圈出一段上下文窗口。先看慢路径子类怎么调它（`vllm/v1/engine/detokenizer.py`）：
 
 ```python
-# vllm/v1/engine/detokenizer.py:L286
+# vllm/v1/engine/detokenizer.py:L291
 def decode_next(self, next_token_id: int) -> str:
     new_tokens, decoded_text, prefix_offset, read_offset = detokenize_incrementally(
         tokenizer=self.tokenizer,
@@ -508,12 +508,12 @@ self.stream = DecodeStream(
 
 prompt 一次性喂进流里预热，之后只喂新 token。这正是 §9.1 那个版本闸卡 0.22.0 的原因——`ids` 参数那时才有。
 
-> **v0.21.0 更新**：上面构造（`vllm/v1/engine/detokenizer.py:L183`）和后面错误恢复时重建（L243）的 `DecodeStream`，现在都改成在使用点写全名 `tokenizers.decoders.DecodeStream(...)`——模块的导入也由 `from tokenizers.decoders import DecodeStream` 改成 `import tokenizers.decoders`。区别在于：原先 `DecodeStream` 在导入期就被绑成了一个局部名，谁先 import 谁说了算；改成按模块属性解析后，像 fastokens 这类后端在运行期替换 `tokenizers.decoders.DecodeStream` 的 shim 才会被尊重，不再受 import 顺序影响。`FastIncrementalDetokenizer` 的流式语义不变，只是把底层解码流实现从"导入期绑死"放开为"可热替换"。
+> **v0.21.0 更新**：上面构造（`vllm/v1/engine/detokenizer.py:L186`）和后面错误恢复时重建（L243）的 `DecodeStream`，现在都改成在使用点写全名 `tokenizers.decoders.DecodeStream(...)`——模块的导入也由 `from tokenizers.decoders import DecodeStream` 改成 `import tokenizers.decoders`。区别在于：原先 `DecodeStream` 在导入期就被绑成了一个局部名，谁先 import 谁说了算；改成按模块属性解析后，像 fastokens 这类后端在运行期替换 `tokenizers.decoders.DecodeStream` 的 shim 才会被尊重，不再受 import 顺序影响。`FastIncrementalDetokenizer` 的流式语义不变，只是把底层解码流实现从"导入期绑死"放开为"可热替换"。
 
 解码就是调 `step`（`vllm/v1/engine/detokenizer.py`）：
 
 ```python
-# vllm/v1/engine/detokenizer.py:L207
+# vllm/v1/engine/detokenizer.py:L210
 def decode_next(self, next_token_id: int) -> str:
     token = self._protected_step(next_token_id)
 
@@ -567,7 +567,7 @@ def _protected_step(self, next_token_id: int) -> str | None:
 最后回到起点。`update` 吐出 stop_string 之后，第 8 章那条单循环怎么处置它？看那一小段（`vllm/v1/engine/output_processor.py`）：
 
 ```python
-# vllm/v1/engine/output_processor.py:L628
+# vllm/v1/engine/output_processor.py:L653
 assert req_state.detokenizer is not None
 # 2) Detokenize the token ids into text and perform stop checks.
 stop_string = req_state.detokenizer.update(

@@ -46,16 +46,16 @@ class EngineCoreRequestType:
     START_DP_WAVE = b"\x05"
 
 
-# SOURCE: vllm/config/parallel.py:L666 (ParallelConfig static DP-sync helpers)
+# SOURCE: vllm/config/parallel.py:L668 (ParallelConfig static DP-sync helpers)
 class ParallelConfig:
-    @staticmethod  # SOURCE: vllm/config/parallel.py:L655 (has_unfinished_dp)
+    @staticmethod  # SOURCE: vllm/config/parallel.py:L657 (has_unfinished_dp)
     def has_unfinished_dp(dp_group: FakeDPGroup, rank: int, has_unfinished: bool) -> bool:
         # single-element MAX all-reduce ≡ OR across ranks
         tensor = [int(has_unfinished)]
         out = dp_group.all_reduce(rank, tensor, op=ReduceOp.MAX)
         return bool(out[0])
 
-    @staticmethod  # SOURCE: vllm/config/parallel.py:L666 (sync_dp_state)
+    @staticmethod  # SOURCE: vllm/config/parallel.py:L668 (sync_dp_state)
     def sync_dp_state(
         dp_group: FakeDPGroup, rank: int, has_unfinished: bool, pending_pause: bool
     ) -> tuple[bool, bool]:
@@ -73,14 +73,14 @@ class ParallelConfig:
         return has_unfinished_global, pause_count == dp_size
 
 
-# SOURCE: vllm/v1/engine/core.py:L1622 (DPEngineCoreProc — wave state machine)
+# SOURCE: vllm/v1/engine/core.py:L1626 (DPEngineCoreProc — wave state machine)
 class DPEngineCoreProc:
     """EngineCore running in a data-parallel context (MoE only).
 
     Holds the wave state machine; subtracts elastic-EP scaling entirely.
     """
 
-    # SOURCE: vllm/v1/engine/core.py:L1626 / L1671 (__init__ + _init_data_parallel)
+    # SOURCE: vllm/v1/engine/core.py:L1630 / L1671 (__init__ + _init_data_parallel)
     def __init__(
         self,
         dp_rank: int,
@@ -111,7 +111,7 @@ class DPEngineCoreProc:
         # Stand-in for the ZMQ output_queue: front-end / coordinator drain it.
         self.output_queue: list[tuple[int, EngineCoreOutputs]] = []
 
-    # SOURCE: vllm/v1/engine/core.py:L1710
+    # SOURCE: vllm/v1/engine/core.py:L1714
     def add_request(self, request: Any, request_wave: int = 0) -> None:
         # SUBTRACTED: super().add_request(...) base enqueue — base-class request
         #   admission, not the wave-wake logic this section is about ·
@@ -127,7 +127,7 @@ class DPEngineCoreProc:
                     (-1, EngineCoreOutputs(start_wave=self.current_wave))
                 )
 
-    # SOURCE: vllm/v1/engine/core.py:L1757
+    # SOURCE: vllm/v1/engine/core.py:L1761
     def _handle_client_request(self, request_type: bytes, request: Any) -> None:
         if request_type == EngineCoreRequestType.START_DP_WAVE:
             if self.ignore_start_dp_wave:
@@ -142,7 +142,7 @@ class DPEngineCoreProc:
         # SUBTRACTED: else → super()._handle_client_request (ADD/ABORT/etc base
         #   dispatch) — not the START_DP_WAVE wake path · core.py:L1774-1775
 
-    # SOURCE: vllm/v1/engine/core.py:L1777
+    # SOURCE: vllm/v1/engine/core.py:L1781
     def _maybe_publish_request_counts(self) -> None:
         if not self.publish_dp_lb_stats:
             return
@@ -154,7 +154,7 @@ class DPEngineCoreProc:
             )
             self.output_queue.append((-1, EngineCoreOutputs(scheduler_stats=stats)))
 
-    # SOURCE: vllm/v1/engine/core.py:L1790
+    # SOURCE: vllm/v1/engine/core.py:L1794
     def run_busy_loop(self) -> None:
         """Core busy loop of the EngineCore for data parallel case."""
         # SUBTRACTED: outer `while self._handle_shutdown()` + `_process_input_queue`
@@ -191,7 +191,7 @@ class DPEngineCoreProc:
             self.current_wave += 1
             self.step_counter = 0
 
-    # SOURCE: vllm/v1/engine/core.py:L1846
+    # SOURCE: vllm/v1/engine/core.py:L1850
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
         # Optimization - only perform finish-sync all-reduce every 32 steps.
         self.step_counter += 1
@@ -215,7 +215,7 @@ class DPEngineCoreProc:
     # In vLLM these dispatch into the scheduler + executor. The companion lets a
     # fake scheduler decide whether a real step executed and count dummy passes.
     def _process_engine_step(self) -> bool:
-        # SOURCE: vllm/v1/engine/core.py:L1806 (returns whether a batch executed)
+        # SOURCE: vllm/v1/engine/core.py:L1810 (returns whether a batch executed)
         return self.scheduler.process_engine_step()
 
     # SOURCE: vllm/v1/engine/core.py (execute_dummy_batch — keep ranks lock-step)

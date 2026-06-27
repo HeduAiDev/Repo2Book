@@ -173,7 +173,7 @@ def execute_model(
 单卡情形没有子进程。worker 就活在引擎进程里，叫 `driver_worker`：
 
 ```python
-# vllm/v1/executor/uniproc_executor.py:L26
+# vllm/v1/executor/uniproc_executor.py:L45
 class UniProcExecutor(Executor):
     def _init_executor(self) -> None:
         """Initialize the worker and load the model."""
@@ -199,7 +199,7 @@ class UniProcExecutor(Executor):
 `collective_rpc` 在这里**退化**成同进程直调：
 
 ```python
-# vllm/v1/executor/uniproc_executor.py:L67
+# vllm/v1/executor/uniproc_executor.py:L80
 def collective_rpc(
     self,
     method: str | Callable,

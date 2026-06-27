@@ -72,7 +72,7 @@ class CudaPlatform:
         return cls._device_capability
 
     @classmethod
-    # SOURCE: vllm/platforms/cuda.py:L248 (get_valid_backends)
+    # SOURCE: vllm/platforms/cuda.py:L252 (get_valid_backends)
     def get_valid_backends(
         cls,
         device_capability: DeviceCapability,
@@ -105,7 +105,7 @@ class CudaPlatform:
         return valid_backends_priorities, invalid_reasons
 
     @classmethod
-    # SOURCE: vllm/platforms/cuda.py:L282 (get_attn_backend_cls)
+    # SOURCE: vllm/platforms/cuda.py:L286 (get_attn_backend_cls)
     def get_attn_backend_cls(
         cls,
         selected_backend: AttentionBackendEnum | None,

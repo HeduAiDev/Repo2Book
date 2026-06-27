@@ -174,13 +174,13 @@ class HarmonyContext:
 #   的并发包装在本同步精简版中折叠（dossier 批准删 background/streaming）。
 
 
-# SOURCE: vllm/entrypoints/openai/responses/serving.py:L356 (_make_not_found_error -> ErrorResponse 404)
+# SOURCE: vllm/entrypoints/openai/responses/serving.py:L367 (_make_not_found_error -> ErrorResponse 404)
 class _NotFoundError:
     """SUBTRACTED 占位：真实 _make_not_found_error 返回 ErrorResponse(404)。
     原 serving.py:L356。"""
 
     def __init__(self, response_id):
-        # SOURCE: vllm/entrypoints/openai/responses/serving.py:L356
+        # SOURCE: vllm/entrypoints/openai/responses/serving.py:L367
         self.response_id = response_id
 
 
@@ -198,7 +198,7 @@ class OpenAIServingResponses:
         #   background_tasks 等（serving.py:L236-L246）。本同步精简版无并发/
         #   background，dossier 批准删。
 
-    # SOURCE: vllm/entrypoints/openai/responses/serving.py:L318-L575 (create_responses, 同步多轮主线)
+    # SOURCE: vllm/entrypoints/openai/responses/serving.py:L318-L589 (create_responses, 同步多轮主线)
     def create_responses(self, request):
         # SUBTRACTED: _check_model / _validate_create_responses_input /
         #   engine_client.errored 死检（serving.py:L327-339）。
@@ -239,7 +239,7 @@ class OpenAIServingResponses:
         )
 
         # Store the input messages.
-        # SOURCE: vllm/entrypoints/openai/responses/serving.py:L497-L499
+        # SOURCE: vllm/entrypoints/openai/responses/serving.py:L511-L513
         if request.store:
             self.msg_store[request.request_id] = messages
 
@@ -252,7 +252,7 @@ class OpenAIServingResponses:
             request, result_generator, context
         )
 
-    # SOURCE: vllm/entrypoints/openai/responses/serving.py:L577-L601 (_make_request, 非 harmony)
+    # SOURCE: vllm/entrypoints/openai/responses/serving.py:L591-L615 (_make_request, 非 harmony)
     def _make_request(self, request, prev_response):
         # SUBTRACTED: construct_tool_dicts(request.tools, request.tool_choice)
         #   （serving.py:L582）。
@@ -270,7 +270,7 @@ class OpenAIServingResponses:
         engine_inputs = self._preprocess_chat(messages)
         return messages, engine_inputs
 
-    # SOURCE: vllm/entrypoints/openai/responses/serving.py:L1133-L1210 (_construct_input_messages_with_harmony)
+    # SOURCE: vllm/entrypoints/openai/responses/serving.py:L1150-L1227 (_construct_input_messages_with_harmony)
     def _construct_input_messages_with_harmony(self, request, prev_response):
         messages = []
         if prev_response is None:
@@ -330,7 +330,7 @@ class OpenAIServingResponses:
                     messages.append(new_msg)
         return messages
 
-    # SOURCE: vllm/entrypoints/openai/responses/serving.py:L744-L893 (responses_full_generator, 落库主线)
+    # SOURCE: vllm/entrypoints/openai/responses/serving.py:L761-L910 (responses_full_generator, 落库主线)
     def responses_full_generator(self, request, result_generator, context):
         # SUBTRACTED: AsyncExitStack / _initialize_tool_sessions / async for 驱动
         #   生成（serving.py:L758-764）。本同步精简版直接驱动注入的 result_generator
@@ -342,10 +342,10 @@ class OpenAIServingResponses:
         # SUBTRACTED: status 判定 / use_harmony·ParsableContext·SimpleContext 三分支
         #   make_response_output_items / ResponseUsage token 统计
         #   （serving.py:L766-873，dossier 批准删 token-usage）。
-        # SOURCE: vllm/entrypoints/openai/responses/serving.py:L874-L885 (from_request)
+        # SOURCE: vllm/entrypoints/openai/responses/serving.py:L891-L902 (from_request)
         response = self._make_response_from_request(request, context)
 
-        # SOURCE: vllm/entrypoints/openai/responses/serving.py:L887-L892
+        # SOURCE: vllm/entrypoints/openai/responses/serving.py:L904-L909
         if request.store:
             stored_response = self.response_store.get(response.id)
             # If the response is already cancelled, don't update it.
@@ -355,7 +355,7 @@ class OpenAIServingResponses:
 
     # ---- 以下为被 SUBTRACTED 的真实依赖在精简版里的注入点（非 vLLM 抽象，仅替身钩子）----
 
-    # SOURCE: vllm/entrypoints/openai/responses/serving.py:L709 (_make_request_with_harmony)
+    # SOURCE: vllm/entrypoints/openai/responses/serving.py:L726 (_make_request_with_harmony)
     def _make_request_with_harmony(self, request, prev_response):
         # SUBTRACTED: 真实 _make_request_with_harmony 调
         #   _construct_input_messages_with_harmony 再 render_for_completion
@@ -365,18 +365,18 @@ class OpenAIServingResponses:
         engine_inputs = self._render_harmony(messages)
         return messages, engine_inputs
 
-    # SOURCE: vllm/entrypoints/openai/responses/serving.py:L356 (_make_not_found_error)
+    # SOURCE: vllm/entrypoints/openai/responses/serving.py:L367 (_make_not_found_error)
     def _make_not_found_error(self, response_id):
         return _NotFoundError(response_id)
 
     # 下列方法各对应真实源码中一处被 SUBTRACTED 的渲染/转换/调度调用；本精简版
     # 留作注入点（测试覆写），默认实现为最小占位，绝不杜撰 vLLM 逻辑。每个标注
     # 其在真实 serving.py 中被替代的调用点。
-    # SOURCE: vllm/entrypoints/openai/responses/serving.py:L480 (_generate_with_builtin_tools 调度) — 注入点
+    # SOURCE: vllm/entrypoints/openai/responses/serving.py:L494 (_generate_with_builtin_tools 调度) — 注入点
     def _make_generator(self, request, messages, available_tools):
         raise NotImplementedError("inject in test")
 
-    # SOURCE: vllm/entrypoints/openai/responses/serving.py:L591 (openai_serving_render.preprocess_chat) — 注入点
+    # SOURCE: vllm/entrypoints/openai/responses/serving.py:L605 (openai_serving_render.preprocess_chat) — 注入点
     def _preprocess_chat(self, messages):
         return None
 
@@ -384,18 +384,18 @@ class OpenAIServingResponses:
     def _render_harmony(self, messages):
         return None
 
-    # SOURCE: vllm/entrypoints/openai/responses/serving.py:L1144-L1153 (_construct_harmony_system_input_message/get_developer_message/construct_harmony_previous_input_messages) — 注入点
+    # SOURCE: vllm/entrypoints/openai/responses/serving.py:L1161-L1170 (_construct_harmony_system_input_message/get_developer_message/construct_harmony_previous_input_messages) — 注入点
     def _construct_harmony_new_conversation_messages(self, request):
         return []
 
-    # SOURCE: vllm/entrypoints/openai/responses/serving.py:L1193 (get_user_message) — 注入点
+    # SOURCE: vllm/entrypoints/openai/responses/serving.py:L1210 (get_user_message) — 注入点
     def _get_user_message(self, text):
         raise NotImplementedError("inject in test")
 
-    # SOURCE: vllm/entrypoints/openai/responses/serving.py:L1200 (response_input_to_harmony) — 注入点
+    # SOURCE: vllm/entrypoints/openai/responses/serving.py:L1217 (response_input_to_harmony) — 注入点
     def _response_input_to_harmony(self, response_msg, prev_outputs):
         raise NotImplementedError("inject in test")
 
-    # SOURCE: vllm/entrypoints/openai/responses/serving.py:L874-L885 (ResponsesResponse.from_request) — 注入点
+    # SOURCE: vllm/entrypoints/openai/responses/serving.py:L891-L902 (ResponsesResponse.from_request) — 注入点
     def _make_response_from_request(self, request, context):
         raise NotImplementedError("inject in test")

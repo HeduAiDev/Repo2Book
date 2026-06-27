@@ -54,7 +54,7 @@ class RequestState:
         stop_reason=None,
         routed_experts=None,
     ) -> CompletionOutput:
-        # SOURCE: vllm/v1/engine/output_processor.py:L376-L407
+        # SOURCE: vllm/v1/engine/output_processor.py:L401-L432
         assert self.detokenizer is not None
         assert self.logprobs_processor is not None
         finished = finish_reason is not None

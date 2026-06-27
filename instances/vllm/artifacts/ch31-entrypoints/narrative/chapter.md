@@ -124,7 +124,7 @@ for out in outputs:
 ```
 
 ```python
-# vllm/envs.py:L1109
+# vllm/envs.py:L1112
     "VLLM_ENABLE_V1_MULTIPROCESSING": lambda: bool(
         int(os.getenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1"))
     ),
@@ -516,10 +516,10 @@ class InprocClient(EngineCoreClient):
 > **v0.21.0 更新**：除了上面这些"喂数据—取结果"的任务方法，`LLM` 的公共面还新增了一对**权重热更新**控制方法，把一轮权重回灌显式括成事务——服务于训练—推理同进程（如 RL）下"用新权重原地换掉旧权重"的场景：
 >
 > ```python
-> # vllm/entrypoints/llm.py:L1911 (start_weight_update)
+> # vllm/entrypoints/llm.py:L1925 (start_weight_update)
 > #   self.llm_engine.collective_rpc("start_weight_update",
 > #                                  kwargs={"is_checkpoint_format": is_checkpoint_format})
-> # vllm/entrypoints/llm.py:L1940 (finish_weight_update)
+> # vllm/entrypoints/llm.py:L1958 (finish_weight_update)
 > #   self.llm_engine.collective_rpc("finish_weight_update")
 > ```
 >

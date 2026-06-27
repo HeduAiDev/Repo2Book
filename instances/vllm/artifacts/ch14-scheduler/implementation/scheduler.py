@@ -60,31 +60,31 @@ class Scheduler:
 
     # ---- 双队列归类与选择（防队头阻塞） ----
 
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L1554 (_is_blocked_waiting_status)
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L1516 (_is_blocked_waiting_status)
     @staticmethod
     def _is_blocked_waiting_status(status: RequestStatus) -> bool:
-        # SOURCE: vllm/v1/core/sched/scheduler.py:L1554
+        # SOURCE: vllm/v1/core/sched/scheduler.py:L1516
         return status in (
             RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
             RequestStatus.WAITING_FOR_REMOTE_KVS,
             RequestStatus.WAITING_FOR_STREAMING_REQ,
         )
 
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L1561 (_enqueue_waiting_request)
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L1523 (_enqueue_waiting_request)
     def _enqueue_waiting_request(self, request: Request) -> None:
         if self._is_blocked_waiting_status(request.status):
             self.skipped_waiting.add_request(request)
         else:
             self.waiting.add_request(request)
 
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L1567 (_select_waiting_queue_for_scheduling)
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L1529 (_select_waiting_queue_for_scheduling)
     def _select_waiting_queue_for_scheduling(self) -> "FCFSRequestQueue | None":
         # SUBTRACTED: PRIORITY 分支（比较两队队头）—— PRIORITY 整块按计划删除。
-        # 原 vllm/v1/core/sched/scheduler.py:L1571-L1575。
+        # 原 vllm/v1/core/sched/scheduler.py:L1533-L1537。
         # FCFS：skipped 优先，再 waiting。
         return self.skipped_waiting or self.waiting or None
 
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L2061 (_try_promote_blocked_waiting_request)
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L1998 (_try_promote_blocked_waiting_request)
     def _try_promote_blocked_waiting_request(self, request: Request) -> bool:
         # SUBTRACTED: 远程 KV / grammar / streaming 阻塞态在条件满足时提升回
         # WAITING/PREEMPTED 的具体判定 —— 对应特性（connector/约束解码/流式输入）
@@ -93,7 +93,7 @@ class Scheduler:
 
     # ---- 抢占 ----
 
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L952 (_preempt_request)
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L910 (_preempt_request)
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.
 
@@ -105,7 +105,7 @@ class Scheduler:
         )
         self.kv_cache_manager.free(request)
         # SUBTRACTED: self.encoder_cache_manager.free(request) —— 编码器缓存释放，
-        # 多模态正交。原 vllm/v1/core/sched/scheduler.py:L962。
+        # 多模态正交。原 vllm/v1/core/sched/scheduler.py:L920。
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
         if request.spec_token_ids:
@@ -116,11 +116,11 @@ class Scheduler:
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
 
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L464-L514 (schedule 内的抢占 while True 块)
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L422-L472 (schedule 内的抢占 while True 块)
     # NOTE: 真实 vLLM 中此 while True 抢占循环*内联*在 schedule() 里。精简版把它抽到
     # _allocate_with_preemption 以便讲解/单测，控制流与原内联块一一对应（无新增逻辑）。
     def _allocate_with_preemption(self, request: Request, num_new_tokens: int):
-        # SOURCE: vllm/v1/core/sched/scheduler.py:L464-L514
+        # SOURCE: vllm/v1/core/sched/scheduler.py:L422-L472
         preempted_reqs: list[Request] = []
         while True:
             new_blocks = self.kv_cache_manager.allocate_slots(
@@ -138,7 +138,7 @@ class Scheduler:
             # SUBTRACTED: if self.policy == SchedulingPolicy.PRIORITY 整块
             # （max(running, key=(priority, arrival_time)) 抢最低优先级 + encoder 预算
             # 归还）—— PRIORITY 是等价的另一条路径，按 delete 删除。精简版只演示
-            # FCFS LIFO 抢占。原 vllm/v1/core/sched/scheduler.py:L479-L502。
+            # FCFS LIFO 抢占。原 vllm/v1/core/sched/scheduler.py:L437-L460。
             preempted_req = self.running.pop()  # FCFS：抢 RUNNING 末尾（LIFO）
 
             self._preempt_request(preempted_req, 0.0)
@@ -150,7 +150,7 @@ class Scheduler:
 
     # 测试用薄封装：把当前 request 从 running 取出后驱动抢占循环（对应 schedule 内逻辑）
     def _run_preemption_loop_for(self, request: Request, num_new_tokens: int):
-        # SOURCE: vllm/v1/core/sched/scheduler.py:L464-L514 (抢占 while True 块的可单测入口)
+        # SOURCE: vllm/v1/core/sched/scheduler.py:L422-L472 (抢占 while True 块的可单测入口)
         _, preempted = self._allocate_with_preemption(request, num_new_tokens)
         return preempted
 
@@ -174,7 +174,7 @@ class Scheduler:
                 # 已在抢占循环里被抢走
                 continue
             num_new_tokens = 1
-            # SOURCE: vllm/v1/core/sched/scheduler.py:L464-L514 抢占 while True
+            # SOURCE: vllm/v1/core/sched/scheduler.py:L422-L472 抢占 while True
             new_blocks, just_preempted = self._allocate_with_preemption(
                 request, num_new_tokens
             )
@@ -190,26 +190,26 @@ class Scheduler:
             req_index += 1
 
         # ---- WAITING 阶段：本拍抢占过就完全跳过 ----
-        # SOURCE: vllm/v1/core/sched/scheduler.py:L567-L568
+        # SOURCE: vllm/v1/core/sched/scheduler.py:L525-L526
         # SUBTRACTED: and self._pause_state == PauseState.UNPAUSED —— PAUSED 控制删除
         #（精简版恒 UNPAUSED）；但 `not preempted_reqs` 守卫是本章核心，保留。原 L568。
         if not preempted_reqs:
-            # SOURCE: vllm/v1/core/sched/scheduler.py:L569
+            # SOURCE: vllm/v1/core/sched/scheduler.py:L527
             step_skipped_waiting = create_request_queue(self.policy)
 
-            # SOURCE: vllm/v1/core/sched/scheduler.py:L571
+            # SOURCE: vllm/v1/core/sched/scheduler.py:L529
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
-                # SOURCE: vllm/v1/core/sched/scheduler.py:L575
+                # SOURCE: vllm/v1/core/sched/scheduler.py:L533
                 request_queue = self._select_waiting_queue_for_scheduling()
                 assert request_queue is not None
 
                 request = request_queue.peek_request()
 
                 # try to promote blocked statuses while traversing skipped queue.
-                # SOURCE: vllm/v1/core/sched/scheduler.py:L581-L592
+                # SOURCE: vllm/v1/core/sched/scheduler.py:L539-L550
                 if self._is_blocked_waiting_status(
                     request.status
                 ) and not self._try_promote_blocked_waiting_request(request):
@@ -232,7 +232,7 @@ class Scheduler:
 
                 request_queue.pop_request()
 
-                # SOURCE: vllm/v1/core/sched/scheduler.py:L807-L817
+                # SOURCE: vllm/v1/core/sched/scheduler.py:L765-L775
                 self.running.append(request)
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
@@ -245,7 +245,7 @@ class Scheduler:
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
 
-            # SOURCE: vllm/v1/core/sched/scheduler.py:L844-L846
+            # SOURCE: vllm/v1/core/sched/scheduler.py:L802-L804
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
@@ -258,7 +258,7 @@ class Scheduler:
 
     # ---- 生命周期回流：update_from_output ----
 
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L1622 (_update_request_with_output)
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L1559 (_update_request_with_output)
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]
     ) -> "tuple[list[int], bool]":
@@ -277,7 +277,7 @@ class Scheduler:
                 break
         return new_token_ids, stopped
 
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L1579 (_handle_stopped_request)
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L1541 (_handle_stopped_request)
     def _handle_stopped_request(self, request: Request) -> bool:
         """Return True if finished (can be False for resumable requests)."""
         if not request.resumable:
@@ -286,11 +286,11 @@ class Scheduler:
         # SUBTRACTED: streaming_queue 续接 / WAITING_FOR_STREAMING_REQ 重入队 /
         # _update_request_as_session —— streaming-input 多轮会话，按 delete 删除。
         # 精简版假设请求一次性输入，停止即真完成（resumable 恒 False，上面直接 return）。
-        # 原 vllm/v1/core/sched/scheduler.py:L1584-L1594。
+        # 原 vllm/v1/core/sched/scheduler.py:L1546-L1556。
         self._enqueue_waiting_request(request)
         return False
 
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L1813 (_free_request)
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L1750 (_free_request)
     def _free_request(self, request: Request, delay_free_blocks: bool = False):
         assert request.is_finished()
 
@@ -304,7 +304,7 @@ class Scheduler:
             self._free_blocks(request)
         return None
 
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L1831 (_free_blocks)
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L1768 (_free_blocks)
     def _free_blocks(self, request: Request):
         assert request.is_finished()
         self.kv_cache_manager.free(request)
@@ -323,7 +323,7 @@ class Scheduler:
         stopped_preempted_reqs: set[Request] = set()
 
         for req_id, generated_token_ids in num_scheduled_tokens.items():
-            # SOURCE: vllm/v1/core/sched/scheduler.py:L1338-L1347
+            # SOURCE: vllm/v1/core/sched/scheduler.py:L1296-L1305
             request = self.requests.get(req_id)
             if request is None or request.is_finished():
                 # The request is already finished (e.g., aborted while executing).
@@ -332,7 +332,7 @@ class Scheduler:
             # SUBTRACTED: failed_kv_load_req_ids 跳过 / req_index 取值 / pooler_output /
             # encoder input free —— connector/pooling/encoder 正交。原 L1335-L1352,L1380-L1382。
 
-            # SOURCE: vllm/v1/core/sched/scheduler.py:L1354-L1371 (spec 回退)
+            # SOURCE: vllm/v1/core/sched/scheduler.py:L1312-L1329 (spec 回退)
             scheduled_spec_token_ids = scheduled_spec_decode_tokens.get(req_id)
             if scheduled_spec_token_ids and generated_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
@@ -350,7 +350,7 @@ class Scheduler:
             new_token_ids = generated_token_ids
             status_before_stop = request.status
 
-            # SOURCE: vllm/v1/core/sched/scheduler.py:L1391-L1395
+            # SOURCE: vllm/v1/core/sched/scheduler.py:L1349-L1353
             # Check for stop and update request status.
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
@@ -361,7 +361,7 @@ class Scheduler:
 
             finish_reason = None
             if stopped:
-                # SOURCE: vllm/v1/core/sched/scheduler.py:L1423-L1433
+                # SOURCE: vllm/v1/core/sched/scheduler.py:L1385-L1395
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
                 finish_reason = request.get_finished_reason()
@@ -378,7 +378,7 @@ class Scheduler:
             # 输出装配是 Part II 主题，本章只关心状态迁移。
             _ = finish_reason  # 真实在此组装进 EngineCoreOutput.finish_reason
 
-        # SOURCE: vllm/v1/core/sched/scheduler.py:L1476-L1481
+        # SOURCE: vllm/v1/core/sched/scheduler.py:L1438-L1443
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
             self.running = remove_all(self.running, stopped_running_reqs)

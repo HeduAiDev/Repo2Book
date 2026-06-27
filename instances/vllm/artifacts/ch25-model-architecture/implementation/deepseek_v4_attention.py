@@ -65,7 +65,7 @@ def fused_inv_rope_fp8_quant(o, positions, cos_sin_cache, *, n_groups, heads_per
     )
 
 
-# SOURCE: vllm/model_executor/layers/deepseek_v4_attention.py:106 (class DeepseekV4MultiHeadLatentAttentionWrapper)
+# SOURCE: vllm/model_executor/layers/deepseek_v4_attention.py:113 (class DeepseekV4MultiHeadLatentAttentionWrapper)
 class DeepseekV4MultiHeadLatentAttentionWrapper(nn.Module):
     """MLA 执行层（V4 专属）：持有 fused_wqa_wkv/q_norm/wq_b/kv_norm/wo_a/wo_b/attn_sink/rope，
     forward 调 deepseek_v4_attention 自定义算子 + 输出端低秩两段投影；attn_gemm_parallel_execute
@@ -102,7 +102,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        # SOURCE: vllm/model_executor/layers/deepseek_v4_attention.py:125 (__init__)
+        # SOURCE: vllm/model_executor/layers/deepseek_v4_attention.py:132 (__init__)
         super().__init__()
         self.hidden_size = hidden_size
         self.n_local_heads = num_heads
@@ -153,7 +153,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(nn.Module):
         self.ln_events = None
 
     def forward(self, positions, hidden_states, llama_4_scaling=None):
-        # SOURCE: vllm/model_executor/layers/deepseek_v4_attention.py:281 (forward)
+        # SOURCE: vllm/model_executor/layers/deepseek_v4_attention.py:287 (forward)
         # 预分配 FlashMLA-padded 头数的输出；算子写入 o_padded，再切回 n_local_heads。
         num_tokens = hidden_states.shape[0]
         o_padded = torch.empty(
@@ -187,7 +187,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(nn.Module):
         return self.wo_b(z.flatten(1))
 
     def attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:
-        # SOURCE: vllm/model_executor/layers/deepseek_v4_attention.py:337 (attn_gemm_parallel_execute)
+        # SOURCE: vllm/model_executor/layers/deepseek_v4_attention.py:356 (attn_gemm_parallel_execute)
         # 多 stream GEMM 并行：fused_wqa_wkv(最重)走默认流；compressor/indexer 三个轻 GEMM 走
         # aux stream 0..2（仅当其 owning module 存在）。这是 V4 模型侧的工程亮点 delta。
         assert self.aux_stream_list is not None
@@ -199,7 +199,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(nn.Module):
             compressor = self.compressor
 
             def compressor_kv_score() -> torch.Tensor:
-                # SOURCE: vllm/model_executor/layers/deepseek_v4_attention.py:106 (compressor_kv_score)
+                # SOURCE: vllm/model_executor/layers/deepseek_v4_attention.py:113 (compressor_kv_score)
                 return torch.mm(
                     hidden_states, compressor.fused_wkv_wgate.weight.T,
                     out_dtype=torch.float32,
@@ -210,12 +210,12 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(nn.Module):
             indexer = self.indexer
 
             def indexer_weights_proj() -> torch.Tensor:
-                # SOURCE: vllm/model_executor/layers/deepseek_v4_attention.py:106 (indexer_weights_proj)
+                # SOURCE: vllm/model_executor/layers/deepseek_v4_attention.py:113 (indexer_weights_proj)
                 weights, _ = indexer.weights_proj(hidden_states)
                 return weights
 
             def indexer_compressor_kv_score() -> torch.Tensor:
-                # SOURCE: vllm/model_executor/layers/deepseek_v4_attention.py:106 (indexer_compressor_kv_score)
+                # SOURCE: vllm/model_executor/layers/deepseek_v4_attention.py:113 (indexer_compressor_kv_score)
                 return torch.mm(
                     hidden_states, indexer.compressor.fused_wkv_wgate.weight.T,
                     out_dtype=torch.float32,
@@ -224,7 +224,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(nn.Module):
             aux_fns[2] = indexer_compressor_kv_score
 
         def fused_wqa_wkv() -> torch.Tensor:
-            # SOURCE: vllm/model_executor/layers/deepseek_v4_attention.py:106 (fused_wqa_wkv)
+            # SOURCE: vllm/model_executor/layers/deepseek_v4_attention.py:113 (fused_wqa_wkv)
             qr_kv, _ = self.fused_wqa_wkv(hidden_states)
             return qr_kv
 
@@ -237,7 +237,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(nn.Module):
         return qr_kv, kv_score, indexer_kv_score, indexer_weights
 
     def attention_impl(self, hidden_states, positions, out) -> None:
-        # SOURCE: vllm/model_executor/layers/deepseek_v4_attention.py:392 (attention_impl)
+        # SOURCE: vllm/model_executor/layers/deepseek_v4_attention.py:416 (attention_impl)
         # MLA 前处理 delta：低秩 latent split 成 q 段(q_lora_rank)与 kv 段(head_dim)，分别 fused
         # RMSNorm（对应标准 MLA 的 q_a_layernorm/kv_a_layernorm，V4 融成一个算子）。
         qr_kv, kv_score, indexer_kv_score, indexer_weights = (
