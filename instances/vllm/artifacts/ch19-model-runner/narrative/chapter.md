@@ -467,6 +467,14 @@ assert runner.input_ids.cpu[0] == Z                       # 上拍写回的 Z，
 
 写回循环开头那个 `if self.use_async_scheduling:` 分支值得提一句。异步调度为了避免在 `sample_tokens()` 里做 GPU→CPU 同步（那会破坏前向/采样重叠），CPU 侧的 `token_ids_cpu` 这一拍只写**占位** `-1`，真实采样 token 留在 GPU 上的 `prev_sampled_token_ids`，等下一拍准备输入时直接在 GPU 上 scatter 进 `input_ids`。计数照常推进，闭环逻辑不变，只是真实 token 走 GPU 这条更快的路、绕开了一次同步。这呼应了 [第11章](../ch11-engine-core/narrative/chapter.md) 异步调度对「乐观推进、占位」的处理——同一个思路在 worker 层的落点。
 
+### PP 非末位 rank 的变奏（v0.21.0）
+
+> **v0.21.0 更新**：上面整节是以**末位 rank / 非流水线并行**的视角讲的——只有末位 rank 真去采样、走 `_bookkeeping_sync()` 这条写回循环。但流水线并行（PP）下，**非末位 rank** 拿不到采样器，新 token 是上游 rank 算好后通过 `_update_states()` 传下来、并入 `token_ids_cpu` 的。这条并行的写回路径（`vllm/v1/worker/gpu_model_runner.py:GPUModelRunner._update_states`，`is_last_rank` 为否的分支）在 v0.21.0 被修正过，且修正方向与正文不变式同源。
+>
+> 基线里非末位 rank 并入新 token 时，起点直接取 `start = num_computed_tokens`、终点 `num_computed_tokens + len(new_token_ids)`，无条件覆盖写。问题是这在两种边界下会丢 token、拉低精度（#41133）：(a) chunked prefill 下 `num_computed_tokens` 可能**小于**已落位计数 `num_tokens_no_spec`，按前者起笔会回退覆盖已有 token；(b) 异步调度的 PP 下这一拍可能**没有** `new_token_ids`，此时只该按 `num_computed_tokens` 推进计数、不该写。v0.21.0 改为：起点取 `start = num_tokens_no_spec[req_index]`（与正文写回侧**同一个写指针**），终点取 `end = max(start, num_computed_tokens + len(new_token_ids))`；仅当 `end > start` 才写，且有 `new_token_ids` 时只追加尾部 `new_token_ids[-num_new_tokens:]`（避免重复覆盖），并同步置 `is_token_ids[req_index, start:end] = True`，再推进 `num_tokens_no_spec`。
+>
+> 换句话说：正文里末位 rank「写指针 `num_tokens_no_spec` 与读指针 `num_computed_tokens` 一拍拍咬在同一格」的不变式，在 PP 非末位 rank 的写回路径上被**严格化**了——写回起点统一锚到 `num_tokens_no_spec`，`max(...)` 兜住「计数已超前但本拍无新 token」的情形。主线叙事不变，只是把同一条闭环铺到了 PP 的每一段 rank 上。
+
 ## 19.6 CUDA graph 分派：FULL/PIECEWISE/NONE 的分级取舍
 
 回到 [§19.3 阶段一](#193-阶段一全景从工单到一份缓存的-state) 第三步留下的悬念：前向走哪条 CUDA graph，是谁决定的？是 `CudagraphDispatcher.dispatch()`。

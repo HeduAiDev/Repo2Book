@@ -383,6 +383,8 @@ def collective_rpc(
 
 注意 `send_method` 的两种形态。`method` 是字符串就原样发；是 callable 就 `cloudpickle.dumps` **把整个函数序列化**发出去。后者是个强能力：你可以在引擎侧写一个临时函数，让它在每个 worker 上跑——worker 侧反序列化后调用它（[§17.7](#177-worker-子进程出生服役死亡) 会看到 worker 怎么 `cloudpickle.loads` 接住）。collective_rpc 因此不只能调 worker 的**已有**方法，还能下发**任意**逻辑。RLHF 里在 worker 上同步权重、自定义诊断，靠的就是这条。
 
+> **v0.21.0 更新**：权重热更新正是这条「在 worker 上同步权重」路径上最具代表性的一例，且它的接口在 v0.21.0 里被显式拆开了。基线中 `vllm/v1/worker/gpu_worker.py` 的 `Worker` 用单方法 `update_weights()` 一把梭——内部自己串起 `initialize_layerwise_reload → receive_weights → finalize_layerwise_reload`。v0.21.0 把它拆成显式三段式：`start_weight_update(is_checkpoint_format)` 先开局（checkpoint 格式时建逐层重载状态、置守卫位 `_weight_update_active=True`）、`update_weights()` 此后可被 collective_rpc 调**一次或多次**接收权重分块（checkpoint 格式走 `receive_weights`，kernel 格式走就地 `param.copy_`）、`finish_weight_update()` 收尾跑 `finalize_layerwise_reload` 并复位守卫。它对应控制平面新增的 `/start_weight_update`、`/finish_weight_update` 端点，让训练侧能**分块流式**推权重，而非整批阻塞。形态变了，载体没变——还是这一句 `collective_rpc` 广播下去、N 个 worker 各执行一遍。
+
 **收，按 `output_rank` 决定收几个。** 关键在这两行：
 
 ```python

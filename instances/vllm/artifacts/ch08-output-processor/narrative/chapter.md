@@ -460,6 +460,8 @@ def _new_completion_output(
 
 DELTA 与全量的三处分叉对照清楚：`text` 由 `get_next_output_text(finished, delta)` 给出，delta 模式只给新增那段（§8.4）；`token_ids` 在非 delta 下整体取 `output_token_ids`（全量），delta 下用传进来的增量切片；`logprobs` 在 delta 下只切最后 `len(token_ids)` 个，对齐本次发的 token。`index=self.request_index` 是 `n>1` 时区分各子序列的关键，下一节会看到它撑起整个父聚合。
 
+> **v0.21.0 更新**：上面那个 `routed_experts` 形参（MoE 路由捕获）现在会被拆成两段挂到不同层级。`RequestState` 调 `split_routed_experts(routed_experts, prompt_len, num_gen)`（`vllm/v1/engine/output_processor.py:L323`，`prompt_len` 取自 `self.prompt_token_ids`、`num_gen` 取自 `self.detokenizer.num_output_tokens()`）把路由数据切开：**prompt 段**回填到请求级 `RequestOutput.prompt_routed_experts`（`n>1` 时被多个 `CompletionOutput` 共享，故挂在请求级而非每个 completion 上），**generation 段**挂到每个 `CompletionOutput`。这与本节 `index`/父聚合的层级划分同构——"共享的提示路由"与"各自的生成路由"在数据结构上也就此分离。
+
 ### 8.5.1 队列的真身：`RequestOutputCollector`
 
 第 4 章在 [§4.6](../ch04-async-llm/narrative/chapter.md) 给过队列一个剪影，说它的归并真身留待本章。现在揭开。它就是图里那个"单槽邮箱"：

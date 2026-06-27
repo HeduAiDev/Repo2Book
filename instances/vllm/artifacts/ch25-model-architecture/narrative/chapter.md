@@ -519,6 +519,8 @@ return hidden_states
 
 直觉上，Llama 的 add-norm 是「一条信息高速路，每层上下匝道」；hc 是「`hc_mult` 条平行车道，每层之间可以学习着变道、并道」。表达力更强，代价是 hidden 翻了 `hc_mult` 倍的显存和算力——典型的「容量换资源」。
 
+> **v0.21.0 更新**：上面这版 `forward` 把每层写成「`hc_pre` → attn → `hc_post`」「`hc_pre` → ffn → `hc_post`」四段独立调用，读起来最清楚。新版做了算子融合：把**上一层的 `hc_post` 与本层的 `hc_pre` 合并成一个自定义算子** `torch.ops.vllm.mhc_fused_post_pre`，于是 `DeepseekV4DecoderLayer.forward` 不再每层自闭收口，而是在层间流水一个 `(residual, post_mix, res_mix)` 三元组——只有第一层单独跑 `hc_pre`，最后一层的 `hc_post` 被提到 `DeepseekV4Model.forward` 末尾统一收口；前面纯 PyTorch 的 `hc_head` 也整体落进 `torch.ops.vllm.hc_head_fused_kernel`。语义不变（仍是同一套 RMSNorm + sigmoid 门控的多流合并），只是读者看到的不再是逐行可读的张量算子，而是一次 kernel 调用——把它理解成「融合算子 = 原四步的等价合并」即可，上面的数学推导依然成立。
+
 ### 25.4.2　hc_head：把多流压回单流
 
 `hc_mult` 条流穿过所有层后，总得压回一条，才能喂给最终的 `norm` 和 `lm_head`。干这活的是 `hc_head`，`vllm/model_executor/models/deepseek_v4.py`：
@@ -633,6 +635,8 @@ draft 融合**两路信号**：
 
 注意它**没**在这里调 `hc_head`——压回单流被推迟了。draft 的 `compute_logits` 才补上 `hc_head`，再过 shared_head 出 draft logits。这和主模型的收尾对称：都是「pre-hc_head 残差 → hc_head 压回 → 出 logits」，draft 只是把 `hc_head` 挪到了出 logits 那一刻。`hc_head` 被主模型和 draft 共用，又一次印证它是 hc 机制的收尾真身。
 
+> **v0.21.0 更新**：上面 `mtp_block(...)` 在新版里要接住主干层吐出的那个 `(hidden_states, residual, post_mix, res_mix)` 四元组——因为 `DeepseekV4DecoderLayer.forward` 经融合后不再层内自闭 `hc_post`（见 §25.4.1 的更新框）。`DeepSeekV4MultiTokenPredictorLayer.forward` 于是改成 `hidden_states, residual, post_mix, res_mix = self.mtp_block(...)`，再显式 `self.mtp_block.hc_post(hidden_states, residual, post_mix, res_mix)` 自己收口。语义与上面一致（draft 仍复用主干 decoder 层、`hc_head` 延后到 `compute_logits`），只是为对齐融合算子的新接口做了连带改写。
+
 下面这张图把 hc 多流和 MTP 桥的全貌串起来：
 
 ![hc 多流残差与 MTP 桥](../diagrams/ch25-hc-residual-and-mtp.png)
@@ -717,5 +721,7 @@ elif "attn_sink" in name:
 但更要紧的是那个没变的东西：**骨架**。embedding → N 层 decoder block（每层 attn 段 + ffn 段）→ 末尾 norm → lm_head。这条主线，从第 22 章的 Llama 到本章的 DeepSeek-V4，一字没动。V4 再复杂，也是在这条主线的每个槽位上换零件：attn 槽换成 MLA、ffn 槽换成 MoE、残差换成 hc、出口旁挂 MTP。
 
 这就是读复杂模型的方法论——**先认骨架，再认 delta**。任何一个新模型摆到你面前，先去找它的 decoder layer 的 `forward`（V4 的在 `vllm/model_executor/models/deepseek_v4.py:L1195`，Llama 的在 `vllm/model_executor/models/llama.py:L316`），并排对照第 22 章那份契约，看它在哪几个槽位上动了手脚。理解了 Llama 那份最简契约，再难的模型也只是它身上叠的一摞 delta。
+
+> **v0.21.0 更新**：这条骨架在新版里多了一处「按 rank 裁剪」。`DeepseekV4ForCausalLM` 现在实现 `SupportsPP`，构造时按 `get_pp_group().is_first_rank / is_last_rank` 把 `embed_tokens`、`norm`、`lm_head`、`_mtp_hidden_buffer` 这些首尾零件替换成占位的 `PPMissingLayer()`——非首 rank 不建 embedding、非末 rank 不建 norm/lm_head，权重装载也用 `is_pp_missing_parameter(...)` 跳过本 rank 不拥有的参数。也就是说，整条 embed → N 层 → norm → lm_head 的主线被沿流水线并行（PP）切成几段、分摊到不同 rank 上；段与段之间靠 `make_empty_intermediate_tensors` 约定的多流隐状态（形状 `(num_tokens, hc_mult, hidden_size)`，即 hc 多流也跨 rank 传递）在边界交接。骨架的**逻辑**仍是这一条，只是物理上被拆到了多卡——这条跨 rank 的数据流交接，正是[下一章](../ch26-model-architecture/narrative/chapter.md)在数据流层面要补的那个 PP 切分点。
 
 下一章我们换个视角：从「读模型代码」到「画模型架构图」，把这套阅读方法变成一套可复用的工序。而 MTP 这个 draft 到底怎么被投机解码驱动、怎么和主模型批量验证，会在后面讲投机解码的那一章里接上——本章交付的 `get_mtp_target_hidden_states` 和那座 `_mtp_hidden_buffer` 桥，就是那一章的入口。

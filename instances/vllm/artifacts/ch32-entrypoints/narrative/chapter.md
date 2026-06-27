@@ -504,6 +504,8 @@ def _base_request_id(
 
 **算 SamplingParams、调引擎。** `request.to_sampling_params(...)` 把 OpenAI 风格的 `temperature`/`top_p`/`max_tokens` 翻成引擎的 `SamplingParams`，然后：
 
+> **v0.21.0 更新**：被省略的 `max_tokens` 那一步走的是 `vllm/entrypoints/utils.py` 的 `get_max_tokens`——它用输入长度反推还能生成多少 token。旧版用的是**未截断**的输入长度，请求若带了 `truncate_prompt_tokens`（要求引擎只保留 prompt 的后 N 个 token）就会低估剩余预算。v0.21.0 给 `get_max_tokens` 增了 `truncate_prompt_tokens` 形参（调用点 `chat_completion/serving.py:L297`），先把 `input_length` 夹到截断上限（`-1` 表示用 `max_model_len`），再做越界检查与余量计算，让 `max_tokens` 反推与真正喂进引擎的输入长度对齐。
+
 ```python
         generator = self.engine_client.generate(
             engine_input, sampling_params, sub_request_id, ...
@@ -555,6 +557,8 @@ handler 只认这个协议——它不知道、也不需要知道背后是 `Asyn
 ![流式 vs 非流式：同源一个生成器，两种消费姿态](../diagrams/ch32-stream-vs-final.png)
 
 > *图注：左右两列共享最顶上那个生成器。流式逐个 yield 成 SSE 帧，非流式 async for 攒到末个 RequestOutput 再聚合。下面每一行都是这个根本差异的具体后果。*
+
+> **v0.21.0 更新**：新请求开关 `return_prompt_text` 是这条"两种姿态"主线的一个干净注脚。置真时，响应会回显 `prompt_text`——chat template 渲染后、真正喂给模型的那串 prompt 文本，便于调试"我到底发进去了什么"。它的填充节奏正好被两种姿态分成两半：流式只在**首个 SSE chunk** 写 `prompt_text`（取 `res.prompt`，之后的增量 chunk 故意留空，填充点 `chat_completion/serving.py:L512`），非流式则在聚合后从 `final_res.prompt` 一次性写入（`:L1379`）。同一份信息，因消费姿态不同而落在流的两端——首块 vs 末尾，恰与下面 `role`/`usage` 的发放时机同构。
 
 ### 32.5.1 流式：逐 token 推成 SSE
 
@@ -614,6 +618,8 @@ try:
 那段 `# We need to do it here` 注释点破了一个时序陷阱：`first_iteration` 的处理必须放在 `async for` **内部**。因为如果 `result_generator` 一上来就抛异常，这个异常得作为**第一个**响应（被外层 `try...except` 接住）发给客户端。要是首块在循环外提前发了，异常就没法当首响应了。
 
 接着每个 `output` 取 `delta_text = output.text` 作为本次增量。这里有个工程细节：chunked prefill 阶段可能产生空块（没有新 token），代码用那个 `if not delta_text and ...: continue` 把空块跳过——不给客户端推没意义的空帧。
+
+> **v0.21.0 更新**：上面 `# 省略：tool / reasoning parser` 那一块在 v0.21.0 做过一次大瘦身。旧版 `OpenAIServingChat` 内有一套约 130 行专为 `required` / named `tool_choice` 手写的流式增量解析分支（`extract_tool_call_required_streaming` 方法、`tool_choice_uses_parser` 门控、`function_name_returned` 数组）；v0.21.0 把它们整体下沉进 `DelegatingParser`，serving 层不再自己 `extract_*`，而是无差别调用 `parser.parse_delta(...)`（解析器内部用 `_stream_state` 携带 `tool_call_id_type` 等状态）。这是**移动 + 合并**，对 SSE 的可观察输出没有语义差异——只是上面省略号里那条控制流，在 v0.21.0 起统一收敛到了一处委派。
 
 收尾部分管两件事：可选的用量统计，和那个雷打不动的终止哨兵：
 
@@ -836,6 +842,8 @@ async def _check_model(
 ```
 
 请求里点名的模型若既不是本服务加载的模型、也不是已注册的 LoRA，就回一个 `404 NotFoundError`。这就是 [§32.4](#324-请求的一生上从-http-到-token) 里 `render_chat_request` 开头那次校验的落点。
+
+> **v0.21.0 更新**：基类统一兜错在 v0.21.0 多了一条专为分离式 prefill 设的补偿路径。在第 7 章那种 P/D 分离架构下，带 `do_remote_prefill` 的请求会让 P 节点先**预占**远端 KV 块；如果这条请求在抵达引擎之前就被拒（`_check_model` 回 `ErrorResponse`、或前置校验抛错），那些块就成了没人认领的孤儿。v0.21.0 把每个 `create_*` 入口拆成两层——公开方法只是 `_with_kv_transfer_rejection_cleanup`（`vllm/entrypoints/openai/engine/serving.py:L623`）包住的薄壳，真身挪进 `_create_chat_completion`（调用点 `chat_completion/serving.py:L237`）。这个包裹器仅在构造期 `self.has_kv_connector` 为真且请求带 `do_remote_prefill` 时生效，用 `try/finally` 在请求未触达引擎时回调 `engine_client.notify_kv_transfer_request_rejected(...)`，通知连接器释放被钉住的远端块。这把"早退即资源泄漏"从隐患变成了显式的补偿回边，正是"基类统一兜错"这条论点在分离架构下的自然延伸。
 
 ---
 

@@ -521,6 +521,8 @@ def __init__(self, logprobs_mode: LogprobsMode = "raw_logprobs") -> None:
 - **多级回退保证启动不崩**。flashinfer 默认开但硬件跑不动时，**静默回退** native（而不是崩溃）；只有用户**显式**设了 `VLLM_USE_FLASHINFER_SAMPLER` 还跑不动，才抛错——因为这是用户明确的意图，不该悄悄改。CPU 上 RISCV/POWERPC 这种小众架构也单独回退 native。
 - **logprobs_mode 是一道硬约束**。开头那个判断把 `processed_logits`/`processed_logprobs` 模式直接挡在 flashinfer 之外——flashinfer 用拒绝采样，根本不产出截断后的中间 logits，没法满足"返回处理后的 logprobs"这个要求，只能走 native。
 
+> **v0.21.0 更新**：派发链在 CUDA/CPU/ROCm 之外新增了一条 Intel GPU 分支——`elif current_platform.is_xpu():`（`vllm/v1/sample/ops/topk_topp_sampler.py`）。它受环境开关 `VLLM_XPU_USE_SAMPLER_KERNEL` 控制：开启时把 `self.forward` 绑成新的 `forward_xpu`，否则照旧回退 `forward_native`。`forward_xpu` 经 `torch.ops.vllm.xpu_topk_topp_sampler` 调用 XPU 原生 top-k/top-p kernel，并从 `torch.xpu.default_generators` 取 `(seed, offset)` 传入以复现随机性；与 `forward_cuda` 同理，它也不支持逐请求 generator（有则告警回退 native），且因 batch 侧 `top_k` 存为 int32 而 kernel 要 int64，调用前会先 `k.to(torch.int64)`。这条分支沿用了 native 这把"启动不崩"的兜底——XPU kernel 默认不开，且任何不满足的前置条件都退回 native。
+
 整套分发画成一张图，连同调用时的二级分流：
 
 ![TopKTopPSampler 后端分发](../diagrams/02-backend-dispatch.png)

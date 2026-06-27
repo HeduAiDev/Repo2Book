@@ -164,6 +164,8 @@ for new_req_data in scheduler_output.scheduled_new_reqs:
 
 这就解释了[第 13 章 §13.5](../ch13-scheduler/narrative/chapter.md) 那个「全量发一次、之后只发 diff」的设计为什么成立：**worker 缓存了每个请求的完整快照**，所以调度器后续每拍只需发增量——已算了多少 token、新分了哪些块——worker 拿差量就地更新快照即可，不必反复传整个请求。`CachedRequestState` 正是接住这份增量的容器。
 
+> **v0.21.0 更新**：这条「快照随请求存活、slot 行随批次进出」的归属原则，在 v0.21.0 多收编了一个字段。prompt logprobs 在 chunked prefill 下要跨多个 prefill 分块累积一份在途张量；基线把它存在 `InputBatch` 的一个 `req_id → LogprobsTensors` 批次级字典里，随 slot 的 `remove_request` pop。问题是请求一旦被驱逐再恢复，这份在途累积就跟着 slot 丢了（#41411）。v0.21.0 把它挪进 `CachedRequestState.in_progress_prompt_logprobs_cpu`——即 `self.requests[req_id]` 这一层、跨 slot 进出始终存活的请求快照。生命周期从此跟着请求走、而非跟着 slot 行走，于是 chunked prefill 的驱逐与恢复中不再丢累积。又一个「易变的归批次、要存活的归快照」的例子。
+
 ---
 
 ## 18.4 _update_states 之二：在途请求就地更新 + 统一并入
@@ -559,6 +561,8 @@ def commit_block_table(self, num_reqs: int) -> None:
 ```
 
 `append_row` / `add_row` / `move_row` 全改 CPU 镜像 `block_table.np`——`append_row` 追加块号，`add_row` 重置后写（新请求）,`move_row` 是 `condense` 搬行时同步搬块表。它们都廉价，因为只动 numpy。
+
+> **v0.21.0 更新**：这张表的列数由每组 `max_num_blocks` 定。v0.21.0 起，构造 `MultiGroupBlockTable` 时会把每个 KV cache group 的 `max_num_blocks` 向上对齐到 `128 / block_size` 的整数倍（`block_size ≤ 128` 时 `cdiv(n, 128//bs) * (128//bs)`，否则原样，#39324）——因为 TRTLLM MLA 等部分 attention 后端对 block table 的列数有 128 元素对齐的边角要求。对常规 `block_size` 这只会略微抬高列数，双镜像的语义与上面这套增量写法都不受影响。
 
 但前向要的是 GPU 上的块表。于是 `commit_block_table` 把整个 CPU 镜像**批量**拷到 GPU。这就是上一节 `_prepare_inputs` 开头那个 `commit_block_table`——所有块号在 `_update_states` 里以最廉价的 CPU 增量写好，到 `_prepare_inputs` 一次性刷到 GPU，还故意放在最前面与后续 CPU 工作重叠。**CPU 改、批量 commit、GPU 用**，职责清清楚楚。
 

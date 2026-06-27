@@ -513,6 +513,18 @@ class InprocClient(EngineCoreClient):
 
 `embed` = `encode(pooling_task="embed")` + 逐个 `EmbeddingRequestOutput.from_base` 包一层。它代表整个 pooling 家族——`classify`、`score` 等也是类似的"换守卫 + 换预/后处理 + 复用中间脊"的套路，本章不逐一展开。要点是：**四个入口的形态差异都在两头，中间那条同步驱动的脊是共享的。**
 
+> **v0.21.0 更新**：除了上面这些"喂数据—取结果"的任务方法，`LLM` 的公共面还新增了一对**权重热更新**控制方法，把一轮权重回灌显式括成事务——服务于训练—推理同进程（如 RL）下"用新权重原地换掉旧权重"的场景：
+>
+> ```python
+> # vllm/entrypoints/llm.py:L1911 (start_weight_update)
+> #   self.llm_engine.collective_rpc("start_weight_update",
+> #                                  kwargs={"is_checkpoint_format": is_checkpoint_format})
+> # vllm/entrypoints/llm.py:L1940 (finish_weight_update)
+> #   self.llm_engine.collective_rpc("finish_weight_update")
+> ```
+>
+> `start_weight_update(is_checkpoint_format=True)` 经 `collective_rpc` 向所有 worker 广播"开窗"（`is_checkpoint_format=True` 表示来料是 checkpoint 格式、需逐层处理，否则是可直拷的 kernel 格式），中间批量灌入新权重，最后 `finish_weight_update()` 广播"闭窗"收尾。这与第 4 章在线 `AsyncLLM` 的 `start_weight_update`/`finish_weight_update` 完全对称——同一套事务语义，一个走同步 `collective_rpc`、一个走异步。这里只是用户面的"开窗—闭窗"两段；窗口内每个 worker 究竟如何分阶段接收并就地替换权重，是[第 17 章：Worker 与 Executor](../ch17-worker-and-executor/narrative/chapter.md) 的话题。
+
 ---
 
 ## 31.5 同步驱动的灵魂：_run_engine 与 step()

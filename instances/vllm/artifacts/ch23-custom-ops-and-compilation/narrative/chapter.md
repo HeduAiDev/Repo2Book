@@ -328,6 +328,8 @@ assert torch.allclose(yn, yc, atol=1e-5) and torch.allclose(rn, rc, atol=1e-5)
 
 两路数值一致，正说明它们是「同一个数学函数的两种实现」——dispatch 只是在选用哪一种跑法，不会改变结果。这也是为什么第 1 级敢在构造期随意定死：选哪份都对，只是快慢和「可不可融合」的差别。
 
+> **v0.21.0 更新**：上面这组「`forward_cuda` 自己持有手写融合 kernel、`forward_native` 摊成纯 torch」的二元对立，在 v0.21.0 被改写——但**两级 dispatch 的主线（23.1/23.2 的 `enabled()`/`default_on()`/`custom_ops`）完全不变**，变的只是这个落地实例的下半身。新版的 `RMSNorm.forward_cuda` 不再自己调 `fused_add_rms_norm` 这个 C++/CUDA 融合 kernel：除一条 `VLLM_BATCH_INVARIANT and residual is None` 的特例走 `rms_norm_batch_invariant` 外，**一律 `return self.forward_native(x, residual)`**。而 `forward_native` 把两路都交给 `vllm.ir` 这一**中间算子层**的句柄——`residual is None` 时 `ir.ops.rms_norm(...)`，否则 `ir.ops.fused_add_rms_norm.maybe_inplace(...)`（`maybe_inplace` overload 定义在 `vllm/ir/op.py`）。换句话说，「手写 kernel vs 纯 torch」的取舍**从 `forward_*` 方法体下沉到了 `vllm.ir`**，由 `KernelConfig.ir_op_priority`（`vllm/config/kernel.py`，每个 IR 算子一份优先级列表，表头可为 `"native"`）在更靠后的阶段裁决——`forward_native` 里据这份优先级「预判会不会派发到 native」来决定是否把全 1 权重一并传下去，正是这一下沉的副产物。与之配套，旧版的 `forward_static`、`forward_hip`、ROCm `dispatch_rocm_rmsnorm_func` 一并被删。所以请把上面 `f3fef123` 的 `forward_cuda`/`forward_static` 当成**讲清 dispatch 思想的标准样本**来读，它仍然准确；只是到 v0.21.0，这份取舍的「执行权」交给了 `vllm.ir` 那层间接。
+
 到这里，第 1 级讲完了。单个算子在构造期就被定到了 cuda 或 native。接下来轮到第 2 级——整张图。
 
 ## 23.4 @support_torch_compile：给模型套上可编译的外壳
@@ -666,6 +668,8 @@ for name, mod in split_gm.named_children():
 ```
 
 「非切分子图才建 backend、才包 CUDA graph；attention 子图保持 eager」——和真实控制流一处不差。
+
+> **v0.21.0 更新**：[§23.3](#233-rmsnorm一个-customop-长什么样) 提到的 `ir.ops.fused_add_rms_norm.maybe_inplace`，它的「下半场」就落在这条编译管线上。`vllm.ir` 把带就地（in-place）语义的算子先以**函数式**形态喂给 Inductor（避免 in-place 写法干扰图追踪），再由一道 **pre-grad pass** 在编译期把它还原成就地写。这道 pass 就是 v0.21.0 新增的 `VllmIRInplaceFunctionalizationPass`：`VllmBackend.configure_post_pass`（`vllm/compilation/backends.py`）在配置 post-grad pass manager 的同时，把它注册为 Inductor 的 `pre_grad_custom_pass`，并刻意把这个 key 加入缓存忽略前缀——它不该参与编译缓存键的计算。同一区间里，codegen 侧的 `generate_execution_code(...)` 返回值也从二元组扩成**三元组**（新增 `consts`），缓存路径同步带上 `consts=consts`。这些都不改本章 `split_graph → 逐段编译 → 包 CUDA graph` 的主骨架，只是在「送进 Inductor 之前」多了一道 IR 就地函数化的工序。
 
 ## 23.8 还债：attention 算子怎么进 torch.compile 图
 

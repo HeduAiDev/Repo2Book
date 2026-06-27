@@ -508,6 +508,8 @@ self.stream = DecodeStream(
 
 prompt 一次性喂进流里预热，之后只喂新 token。这正是 §9.1 那个版本闸卡 0.22.0 的原因——`ids` 参数那时才有。
 
+> **v0.21.0 更新**：上面构造（`vllm/v1/engine/detokenizer.py:L183`）和后面错误恢复时重建（L243）的 `DecodeStream`，现在都改成在使用点写全名 `tokenizers.decoders.DecodeStream(...)`——模块的导入也由 `from tokenizers.decoders import DecodeStream` 改成 `import tokenizers.decoders`。区别在于：原先 `DecodeStream` 在导入期就被绑成了一个局部名，谁先 import 谁说了算；改成按模块属性解析后，像 fastokens 这类后端在运行期替换 `tokenizers.decoders.DecodeStream` 的 shim 才会被尊重，不再受 import 顺序影响。`FastIncrementalDetokenizer` 的流式语义不变，只是把底层解码流实现从"导入期绑死"放开为"可热替换"。
+
 解码就是调 `step`（`vllm/v1/engine/detokenizer.py`）：
 
 ```python

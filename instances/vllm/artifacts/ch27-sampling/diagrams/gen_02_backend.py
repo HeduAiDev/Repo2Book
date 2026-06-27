@@ -47,7 +47,8 @@ nodes = [
     (40, dy+234,"#fae8ff","#a21caf", ["forward_cpu", "CPU（x86 等）"], "CPU"),
     (40, dy+312,"#dbeafe","#2563eb", ["forward_native", "CPU RISCV/POWERPC"], "CPU特例"),
     (40, dy+390,"#ffedd5","#ea580c", ["forward_hip", "ROCm + aiter 启用"], "ROCm"),
-    (40, dy+468,"#dbeafe","#2563eb", ["forward_native", "其余一切（含 host 无 GPU）"], "else"),
+    (40, dy+468,"#cffafe","#0891b2", ["forward_xpu / native", "XPU：采样内核开关决定"], "XPU"),
+    (40, dy+546,"#dbeafe","#2563eb", ["forward_native", "其余一切（含 host 无 GPU）"], "else"),
 ]
 for (x, y, fill, st, lines, lab) in nodes:
     box(x, y, 260, 56, fill, st, lines, fs=13)

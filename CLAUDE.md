@@ -13,7 +13,7 @@
 - **实施计划**：`docs/superpowers/plans/2026-06-21-vllm-book-system-rebuild.md`
 - **架构地图 + 大纲**：`instances/vllm/book/cartography/`（`ARCHITECTURE.md` 全量、`outline-final.json` 8 Part/33 章、`map.json` 结构化）
 - **Book Bible**：`instances/vllm/book/bible/`（术语/接口/伏笔回收/声线——跨章连贯性真相源）
-- **源码 pin**：`f3fef123`，根 `instances/vllm/source/`（blobless clone）
+- **源码版本**：跟踪 vLLM **v0.21.0**（发布提交 `ad7125a4`）。正文内嵌源码与行号锚定其直接祖先 `f3fef123`（同一开发线、v0.21.0 前 245 提交）；v0.21.0 在其上的面向读者变更已以「v0.21.0 更新」自然织入相关章节。根 `instances/vllm/source/`（blobless clone）
 
 ## ⛔ HARD RULES
 
@@ -64,6 +64,7 @@ python3 scripts/lint_source_grounding.py {chapter}/                        # 源
 `\text{}`→`\mathrm{}`；`\boxed{}`→markdown 粗体标题；`\tag*{}`→`$$` 外；inline `\frac`→提升为 `$$` 块；`$$` 与内容分行。inline 仅限单符号/简单式。
 
 ## 当前状态（2026-06-25）：📕 全书 33 章草稿全部完成
+- **源码版本升级到 v0.21.0（2026-06-28）**：基线 `f3fef123` 是 v0.21.0 直接祖先（差 245 提交）；面向读者的增量经 8 路并行 analyst 读真实 `f3fef123..v0.21.0` diff 提语义、再由 writer 以「v0.21.0 更新」注**自然织入** 16 章（ch03/08/09/17/18/19/23/24/25/26/27/28/29/31/32 + ch27 XPU 分发图）。行号/内嵌片段仍锚定 `f3fef123`，未renumber。全 16 章 fidelity/structure/formulas/anchors 通过、几何/半角/锚点全书 0 问题；bible glossary+interfaces 已登记 v0.21.0 增量。整理稿见 `instances/vllm/book/_v021-update/`。
 - **ch01–ch33 全部完成**（31 源码解读章 + ch01/ch02/ch26 三个 meta 概览章，meta 走 `skip_impl` 轻流程无精简版）。全 APPROVED、已推 `vllm-book-v2-rebuild` 远程。规模 ≈24.5k 行正文 + 142 图。
 - **连贯性干净**：26/26 伏笔全回收；glossary/interfaces 登记 30 章；全书 0 断裂章内锚点（`scripts/lint_anchors.py --all` 校验）。
 - 旧 `NN-*` 文章已从 main 与 vllm-book-v2-rebuild 两分支删除。
@@ -76,5 +77,5 @@ python3 scripts/lint_source_grounding.py {chapter}/                        # 源
 1. 别写脱离代码的抽象——正文以真实 vllm 源码为主线、自包含内嵌。
 2. implementer 别过度删减/误删——只删 `delete` 批准项，`must_keep` 必保留。
 3. 标记完成前跑全部四个 linter。
-4. vLLM 相关运行进容器；行号以 `f3fef123` 为准（容器 vllm 0.15.1 可能有行号差，仅用于观察行为）。
+4. vLLM 相关运行进容器；行号以基线 `f3fef123` 为准（书跟踪 v0.21.0，内嵌片段/行号锚定该祖先提交，v0.21.0 增量另以更新注标出；容器 vllm 版本可能有行号差，仅用于观察行为）。
 5. 别赌自己的上下文——决策/状态写进 trace、Bible、本文档。

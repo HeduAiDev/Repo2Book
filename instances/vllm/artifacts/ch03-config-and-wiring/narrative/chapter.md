@@ -108,6 +108,10 @@ class EngineArgs:
 
 还有一个有意思的字段：`distributed_executor_backend` 默认是 `None`。它不是「没设置」的意思那么简单——`None` 是一个**待推导**的信号，后面 vLLM 会根据你的卡数、平台、是否有 Ray 来填它。这是本章第一个「三态/可推导默认」的例子，[3.6 节](#36-第二级映射之一执行器工厂-executorget_class) 会接着讲。
 
+值得一提的是，「字段类型驱动 CLI 形态」这条规则随版本还在变得更完整。`bool` 字段会自动派生出 `--x/--no-x` 这样的成对开关，这套自动化由 `arg_utils.py` 里的 `get_kwargs`（内核是 `_compute_kwargs`）统一负责——它读字段的类型注解，决定生成什么样的 argparse 参数。
+
+> **v0.21.0 更新**：早先有一类参数躲不过手写特例——类型为 `bool | str | None` 的「可裸可带值」旗标（典型是 `--hf-token`：裸写表示从环境读，带值表示直接给 token），源码里那条 `# This one is a special case ... TODO: Handle this in get_kwargs` 注释正是为它写的。`_compute_kwargs` 现在新增了对 `{bool, str, None}` 类型的识别（生成 `nargs="?"`、`const=True`），这个 TODO 被兑现，`--hf-token` 回归普通的 `**kwargs` 展开、不再特判。于是类型到 CLI 形态的映射更完整了：`bool` → 成对开关，`bool | str | None` → 可裸可带值的可选旗标。
+
 ### dict 自动升格成 Config 对象
 
 `EngineArgs` 还有个贴心的 `__post_init__`，处理用户用 dict 传子配置的情况：
@@ -191,6 +195,8 @@ class EngineArgs:
 ```
 
 就是「把扁平的 `self.*` 字段，重新打包成一个结构化的子配置对象」。每个关键字参数要么直接来自 `EngineArgs` 字段（`self.block_size`），要么来自上面推导出的局部变量（`resolved_cache_dtype`、`sliding_window`），要么从已经建好的 `model_config` 派生（`model_config.is_attention_free`）。
+
+> **v0.21.0 更新**：`LoadConfig` 的打包同样在持续长字段——新增了两个权重预取旋钮 `safetensors_prefetch_num_threads`（预取 worker 线程数）和 `safetensors_prefetch_block_size`（每文件预取读取块字节数），对应 CLI `--safetensors-prefetch-num-threads` / `--safetensors-prefetch-block-size`，由 `create_load_config` 回填进 `LoadConfig`。后者跟 `max_num_batched_tokens` 一样支持人类可读写法（如 `16M`）。这是纯加法旋钮，不改主控制流，只是「`EngineArgs` 这个扁平袋子持续长字段、CLI 自动派生」模式的又一例。
 
 `SchedulerConfig`、`ParallelConfig`、`LoadConfig`、`CompilationConfig`……全是**同一个套路**。看 `SchedulerConfig`，注意它怎么从 `model_config` 派生标志：
 
@@ -295,7 +301,13 @@ class EngineArgs:
 - `parallel_config.is_moe_model = self.model_config.is_moe` —— **子配置间补全**：`ParallelConfig` 自己不知道模型是不是 MoE，从 `model_config` 抄过来。
 - 最后推导量化配置（缺省时从模型元数据读）。
 
-这些是「热身」。接下来才是本章重点的两个推导：**异步调度决策** 和 **优化级落地**。
+这些是「热身」。`__post_init__` 还是一切「跨子配置硬约束」的兜底落地点——单看某一个子配置都合法、凑在一起才知道不行的组合，校验就集中写在这里。v0.21.0 又往这里补了两道这样的闸门，正好是这个模式的典型例证：
+
+> **v0.21.0 更新（KV transfer 兼容闸门）**：`__post_init__` 在 KV transfer 收尾处新增了 `_verify_kv_transfer_compat`。逻辑是——只要配置了任意 KV connector（NIXL / Mooncake 之类），又把环境变量 `PYTORCH_CUDA_ALLOC_CONF` 打开成 `expandable_segments:True`、且没开 sleep mode，就直接 `raise ValueError`。原因很有教学性：PyTorch 的 CUDA 虚拟内存分配器会把 KV cache 的虚拟地址重映射到不同物理页，使 connector 通过 `ibv_reg_mr` 注册（pin）的 KV 内存指向被搬走的废弃物理页，运行时触发 `IBV_WC_REM_ACCESS_ERR`。单看 `KVTransferConfig` 或那个环境变量都合法，凑在一起才知道会出错——这正是为什么这类约束必须集中在 `__post_init__`。（sleep mode 是例外，因为它的内存池作用域内会自动关掉 expandable_segments。）
+
+> **v0.21.0 更新（路由专家返回的能力边界）**：新增 CLI `--enable-return-routed-experts`（落在 `ModelConfig.enable_return_routed_experts`）。它带来的不是一段执行逻辑，而是 `__post_init__` 里一组「这个特性目前支持到哪」的校验：一旦开启，`_validate_return_routed_experts` 会拒绝尚未端到端验证的并行组合——`pipeline_parallel_size > 1`、`prefill_context_parallel_size > 1`、`decode_context_parallel_size > 1`，以及 `async_scheduling`，任一命中即报错。这也印证了本节的观点：`VllmConfig.__post_init__` 是把「能力边界」这类跨配置约束兜底落地的地方。
+
+接下来才是本章重点的两个推导：**异步调度决策** 和 **优化级落地**。
 
 ---
 
@@ -549,7 +561,9 @@ class EngineArgs:
         return AsyncMPClient(*client_args)
 ```
 
-异步客户端再按**数据并行（DP）维度**细分：单 DP → `AsyncMPClient`；多 DP 用外部负载均衡 → `DPAsyncMPClient`；多 DP 用内部负载均衡 → `DPLBAsyncMPClient`。这些客户端的内部机制——ZMQ、msgpack、跨进程怎么通信——是 [第 7 章：IPC 边界](../ch07-ipc-boundary/narrative/chapter.md) 的内容；本章只需要知道：**`make_async_mp_client` 是异步三段式的入口**，它会起一个独立子进程把 `EngineCore` 跑起来。这就是 [第 4 章](../ch04-async-llm/narrative/chapter.md) 那张三段图里「进程边界」的来源。
+异步客户端再按**数据并行（DP）维度**细分：单 DP → `AsyncMPClient`；多 DP 用外部负载均衡 → `DPAsyncMPClient`；多 DP 用内部负载均衡 → `DPLBAsyncMPClient`。
+
+> **v0.21.0 更新**：走到这条 external LB 分支之前，配置阶段收紧了它的适用范围——当 `data_parallel_size > 1` 且开了 external LB、而模型**不是 MoE** 时，`create_engine_config` 阶段就直接 `raise ValueError`，并提示「非 MoE 请改起多个独立 vLLM 实例」。换句话说，external LB 现在是 MoE 专属路径；以前非 MoE 也能进这条路（行为未定义），现在被提前挡住了。这些客户端的内部机制——ZMQ、msgpack、跨进程怎么通信——是 [第 7 章：IPC 边界](../ch07-ipc-boundary/narrative/chapter.md) 的内容；本章只需要知道：**`make_async_mp_client` 是异步三段式的入口**，它会起一个独立子进程把 `EngineCore` 跑起来。这就是 [第 4 章](../ch04-async-llm/narrative/chapter.md) 那张三段图里「进程边界」的来源。
 
 三个工厂讲完了，规律是统一的：**都从 `VllmConfig`（或它派生的 flag）出发，查表选出一个具体类**。同一套配置，在单卡/多卡、同步/异步、单 DP/多 DP 之下，选出完全不同的实现——而调用方一句都不用改。这就是「把配置和实现选择解耦」的全部含义。
 
@@ -845,6 +859,8 @@ OPTIMIZATION_LEVEL_TO_CONFIG = {
 中间那行 `_initialize_kv_caches` 是另一桩重活：它会真的去 GPU 上 profiling，量出能给 KV cache 多少显存，再回填 `CacheConfig`。这部分属于 [第 15 章：分页 KV cache](../ch15-paged-kv-cache/narrative/chapter.md)，本章不展开——`CacheConfig.block_size` 和 `enable_prefix_caching` 这两个我们 [3.3 节](#33-create_engine_config把扁平参数重新打包) 打包进去的字段，到那一章才真正发挥作用。
 
 到这里，引擎就**装配完成**了：有了实例化的执行器，有了实例化的调度器，KV cache 也初始化了。它们具体怎么跑起来——执行器怎么驱动 worker、调度器怎么连续批处理——是后面章节的事。本章的使命，到「装配到位」为止。
+
+> **v0.21.0 更新**：同在 `vllm/v1/engine/core.py`，`EngineCore.add_request` 末尾新增了一个小分支：当请求标了 `request.abort_immediately` 时，请求一进 scheduler 就被立即 abort。目的是让 KV connector 的 `request_finished` 钩子跑起来，回收预准入阶段（pre-admission）申请、但因拒绝而搁浅的 KV blocks。这属于 disaggregated / KV-transfer 的边角控制流，此处点名即可，细节留给 KV 连接器专章。
 
 ---
 

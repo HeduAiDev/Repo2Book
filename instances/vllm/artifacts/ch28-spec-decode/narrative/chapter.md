@@ -30,6 +30,8 @@
 
 为了能在本地把这条流水线亲手跑一遍、打断点看数值，本章配了一份**只做减法**的精简版：和真实 vLLM 同名、同结构、同控制流，只删掉与主线正交的分支（tree attention、M-RoPE 位置编码、多模态、cudagraph padding、合成基准模式、logprobs 装配）。纯 CPU 跑 numpy 的索引算术与 ngram，GPU 跑三个 Triton 内核。它是"跑起来看数值"的交叉验证物；正文主线仍是真实源码。
 
+> **v0.21.0 更新**：本章把 tree attention 当作与主线正交、可整条删掉的草稿路径——v0.21.0 把这件事变成了官方动向。该版本在主线**彻底移除**了树形草稿路径：`SpecDecodeBaseProposer.propose_tree` 及其 `tree_choices` / `cu_drafts_per_level` 预计算、以及 `propose` 里对 `TreeAttentionMetadata` 的分发分支全部删除（`vllm/v1/spec_decode/llm_base_proposer.py`）。于是 `propose` 退化为**纯链式（chain）草稿**——正是下文要讲的那条自回归循环。本书"减去 tree attention"从此与上游一致，不再是"真实存在但被我们删掉"的取舍。同版本还把多模态从"硬报错"放宽为"告警后降级"：原先草稿路径遇到多模态输入会直接抛 `NotImplementedError`，v0.21.0 改为打印告警并**降级为纯文本投机解码**继续运行（`_raise_if_multimodal` 改名为 `_warn_if_multimodal`），不再硬失败。
+
 ---
 
 ## 28.1 草稿从哪来：proposer 的统一契约
@@ -172,6 +174,8 @@ return draft_token_ids
 > **proposer 契约**：吃当前上下文（n-gram 吃 token 历史，模型类吃目标 hidden states），吐每请求 0 到 k 个草稿 token。模型类 proposer 还可以附带 `draft_probs`（草稿的概率分布）；n-gram 没有概率，`draft_probs` 是 `None`。
 
 这个"有没有 `draft_probs`"的区别，到了 rejection sampling 那里会分出两条路。先记住：**n-gram 无概率**。
+
+> **v0.21.0 更新**：proposer 家族在 v0.21.0 新添一名成员——Gemma4 的 MTP draft 头，通过 `Gemma4Proposer`（`vllm/v1/spec_decode/gemma4.py`，继承 `SpecDecodeBaseProposer`）接入**同一个** `propose` 入口，对外契约不变。它的特殊性恰好反衬出上面那条链式循环的默认假设：草稿模型与目标模型**跨模型共享 KV cache**，每一步草稿都从目标序列的同一个最后位置预测，于是基类新增 `constant_draft_positions` 字段（默认 `False`，Gemma4 置 `True`）。开启后，链式循环里那套"position +1、seq_lens +1、每步重建 metadata"的逐步推进被关掉：位置缓冲整轮恒定，`common_attn_metadata` 一次构建、整轮复用（守卫即 `propose` 中的 `if not self.constant_draft_positions or token_index == 0`）。换句话说，EAGLE 链式草稿的循环不变量是"位置逐拍 +1、metadata 每拍重建"，而 Gemma4 MTP 把这两个量都钉成常量——同一份 `propose` 骨架，靠一个布尔开关同时容纳了"位置递进"和"位置恒定"两种草稿语义。
 
 ---
 
