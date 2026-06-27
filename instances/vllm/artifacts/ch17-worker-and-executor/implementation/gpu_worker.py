@@ -13,7 +13,7 @@
 from worker_base import WorkerBase
 
 
-# SOURCE: vllm/v1/worker/gpu_worker.py:L106-L861
+# SOURCE: vllm/v1/worker/gpu_worker.py:L106-L871
 class Worker(WorkerBase):
     # SOURCE: vllm/v1/worker/gpu_worker.py:L107-L158
     def __init__(

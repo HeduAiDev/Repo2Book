@@ -213,7 +213,7 @@ class CustomOp(nn.Module):
     # SUBTRACTED: register_oot (custom_op.py:L331-L353) — OOT 注册旁路，本章无 OOT，删去。
 
 
-# SOURCE: vllm/model_executor/layers/layernorm.py:L56 (fused_add_rms_norm — 预编译融合 kernel 入口)
+# SOURCE: vllm/model_executor/layers/layernorm.py:L56 @ f3fef123 (fused_add_rms_norm — 预编译融合 kernel 入口；v0.21.0 已删该独立函数，融合下沉至 vllm.ir)
 def fused_add_rms_norm(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -221,7 +221,7 @@ def fused_add_rms_norm(
     variance_epsilon: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # SUBTRACTED: 真实调用 from vllm import _custom_ops as ops; ops.fused_add_rms_norm(...)
-    # 这个 C++/CUDA 预编译融合 kernel，原位写 x、residual（layernorm.py:L62-L70）。host 无该
+    # 这个 C++/CUDA 预编译融合 kernel，原位写 x、residual（layernorm.py:L62-L70 @ f3fef123）。host 无该
     # kernel，故用纯 torch 复现其「先 residual-add 再 RMSNorm」的数值语义（in-place 写回 x/residual）。
     # 关键对照点不变：forward_cuda 调用的是一个对 Inductor 不透明的预编译融合 kernel。
     orig_dtype = x.dtype
@@ -233,7 +233,7 @@ def fused_add_rms_norm(
     return x, residual
 
 
-# SOURCE: vllm/model_executor/layers/layernorm.py:L37 (RMSNorm — 本章 CustomOp 范例)
+# SOURCE: vllm/model_executor/layers/layernorm.py:L102 @ f3fef123 (RMSNorm — 本章 CustomOp 范例；v0.21.0 移至 L38)
 @CustomOp.register("rms_norm")
 class RMSNorm(CustomOp):
     """Root mean square normalization.
@@ -242,7 +242,7 @@ class RMSNorm(CustomOp):
     Refer to https://arxiv.org/abs/1910.07467
     """
 
-    # SOURCE: vllm/model_executor/layers/layernorm.py:L47 (__init__)
+    # SOURCE: vllm/model_executor/layers/layernorm.py:L112 @ f3fef123 (__init__；v0.21.0 移至 L47)
     def __init__(
         self,
         hidden_size: int,
@@ -268,7 +268,7 @@ class RMSNorm(CustomOp):
         # 硬件特例的可选加速路径，删之不损 dispatch 主线。
 
     @staticmethod
-    # SOURCE: vllm/model_executor/layers/layernorm.py:L187 (forward_static — 纯 torch RMSNorm)
+    # SOURCE: vllm/model_executor/layers/layernorm.py:L188 @ f3fef123 (forward_static — 纯 torch RMSNorm；v0.21.0 已删除)
     def forward_static(
         x: torch.Tensor,
         variance_epsilon: float,
@@ -313,7 +313,7 @@ class RMSNorm(CustomOp):
         else:
             return x, residual
 
-    # SOURCE: vllm/model_executor/layers/layernorm.py:L82 (forward_native — 可被 Inductor 融合的一路)
+    # SOURCE: vllm/model_executor/layers/layernorm.py:L233 @ f3fef123 (forward_native — 可被 Inductor 融合的一路；v0.21.0 移至 L82)
     def forward_native(
         self,
         x: torch.Tensor,
@@ -322,7 +322,7 @@ class RMSNorm(CustomOp):
         """PyTorch-native implementation equivalent to forward()."""
         if residual is None:
             # SUBTRACTED: 真实走 ir.ops.rms_norm(...)（一个走 IR 层、内部仍是纯 torch 的
-            # 无 residual RMSNorm，layernorm.py:L240-L246）。host 无 ir 层，等价改调
+            # 无 residual RMSNorm，layernorm.py:L241-L246 @ f3fef123）。host 无 ir 层，等价改调
             # forward_static（同样纯 torch、可被 Inductor 看见/融合），数值语义一致。
             return self.forward_static(
                 x,
@@ -344,7 +344,7 @@ class RMSNorm(CustomOp):
             self.variance_size_override,
         )
 
-    # SOURCE: vllm/model_executor/layers/layernorm.py:L104 (forward_cuda — 预编译融合 kernel 一路)
+    # SOURCE: vllm/model_executor/layers/layernorm.py:L258 @ f3fef123 (forward_cuda — 预编译融合 kernel 一路；v0.21.0 移至 L104)
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -352,7 +352,7 @@ class RMSNorm(CustomOp):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             # SUBTRACTED: 真实 `if residual is None and not envs.VLLM_BATCH_INVARIANT`，调
-            # ir.ops.rms_norm 预编译 kernel（layernorm.py:L263-L266）。host 无该 kernel，故用
+            # ir.ops.rms_norm 预编译 kernel（layernorm.py:L263-L266 @ f3fef123）。host 无该 kernel，故用
             # forward_static 复现数值；关键对照点：这一路对 Inductor 是黑盒（不可融合）。
             return self.forward_static(
                 x,

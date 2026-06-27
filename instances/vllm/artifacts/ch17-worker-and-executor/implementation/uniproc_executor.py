@@ -20,9 +20,9 @@ from serial_utils import run_method
 from worker_base import WorkerWrapperBase
 
 
-# SOURCE: vllm/v1/executor/uniproc_executor.py:L26-L141
+# SOURCE: vllm/v1/executor/uniproc_executor.py:L45-L146
 class UniProcExecutor(Executor):
-    # SOURCE: vllm/v1/executor/uniproc_executor.py:L27-L53
+    # SOURCE: vllm/v1/executor/uniproc_executor.py:L46-L66
     def _init_executor(self) -> None:
         """Initialize the worker and load the model."""
         self.driver_worker = WorkerWrapperBase(rpc_rank=0)
@@ -36,9 +36,9 @@ class UniProcExecutor(Executor):
             shared_worker_lock=Lock(),
         )
 
-        # SUBTRACTED: async_output_thread / max_concurrent_batches>1 的 ThreadPoolExecutor 装配
-        #   （vllm/v1/executor/uniproc_executor.py:L40-L44）—— 异步调度输出线程，与『uni 是 mp 的
-        #   最简退化』无关，默认同步调度路径不创建该线程。
+        # SUBTRACTED: 异步调度输出经 AsyncOutputFuture 包装器惰性取结果
+        #   （vllm/v1/executor/uniproc_executor.py:L26-L42）—— 异步调度输出搬运，与『uni 是 mp 的
+        #   最简退化』无关，默认同步调度路径不触发该包装。
 
         self.driver_worker.init_worker(all_kwargs=[kwargs])
         self.driver_worker.init_device()
@@ -60,7 +60,7 @@ class UniProcExecutor(Executor):
     # SUBTRACTED: max_concurrent_batches（vllm/v1/executor/uniproc_executor.py:L76-L78）—— 异步调度
     #   并发批数，本章不展开异步调度流水。
 
-    # SOURCE: vllm/v1/executor/uniproc_executor.py:L67-L100
+    # SOURCE: vllm/v1/executor/uniproc_executor.py:L80-L105
     def collective_rpc(  # type: ignore[override]
         self,
         method: str | Callable,
@@ -77,8 +77,8 @@ class UniProcExecutor(Executor):
             result = run_method(self.driver_worker, method, args, kwargs)
             return result if single_value else [result]
 
-        # SUBTRACTED: non_block 分支里 AsyncModelRunnerOutput.get_output() 的异步线程池处理
-        #   （vllm/v1/executor/uniproc_executor.py:L83-L94）—— 异步调度输出搬运；这里保留
+        # SUBTRACTED: non_block 分支里 AsyncModelRunnerOutput → AsyncOutputFuture 的异步包装
+        #   （vllm/v1/executor/uniproc_executor.py:L96-L100）—— 异步调度输出搬运；这里保留
         #   『同步算出结果 → 包进一个已完成 Future』这条核心退化路径。
         try:
             result = run_method(self.driver_worker, method, args, kwargs)

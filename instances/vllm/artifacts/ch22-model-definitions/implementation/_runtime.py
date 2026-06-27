@@ -82,12 +82,12 @@ def set_weight_attrs(weight: torch.Tensor, weight_attrs: dict | None) -> None:
 # ----------------------------------------------------------------------------
 
 
-# SOURCE: vllm/model_executor/layers/layernorm.py:38 (class RMSNorm)
+# SOURCE: vllm/model_executor/layers/layernorm.py:102 @ f3fef123 (class RMSNorm；v0.21.0 移至 L38)
 class RMSNorm(nn.Module):
     # SUBTRACTED: 真实 RMSNorm 是 CustomOp，forward 经平台分派到 fused CUDA kernel；
     # 精简版只保留其 forward_static 的 native 数学（含 (hidden, residual) 双参 fuse）。
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
-        # SOURCE: vllm/model_executor/layers/layernorm.py:47 (RMSNorm.__init__)
+        # SOURCE: vllm/model_executor/layers/layernorm.py:112 @ f3fef123 (RMSNorm.__init__；v0.21.0 移至 L47)
         super().__init__()
         self.hidden_size = hidden_size
         self.variance_epsilon = eps
@@ -102,7 +102,7 @@ class RMSNorm(nn.Module):
         weight: torch.Tensor,
         residual: torch.Tensor | None = None,
     ):
-        # SOURCE: vllm/model_executor/layers/layernorm.py:188 (RMSNorm.forward_static)
+        # SOURCE: vllm/model_executor/layers/layernorm.py:188 @ f3fef123 (RMSNorm.forward_static；v0.21.0 已删除)
         x = x.to(torch.float32)
         if residual is not None:
             x = x + residual
@@ -120,7 +120,7 @@ class RMSNorm(nn.Module):
         return x, residual
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None):
-        # SOURCE: vllm/model_executor/layers/layernorm.py:82 (RMSNorm.forward_native)
+        # SOURCE: vllm/model_executor/layers/layernorm.py:233 @ f3fef123 (RMSNorm.forward_native；v0.21.0 移至 L82)
         return self.forward_static(
             x, self.variance_epsilon, self.hidden_size, x.dtype, self.weight.data, residual
         )

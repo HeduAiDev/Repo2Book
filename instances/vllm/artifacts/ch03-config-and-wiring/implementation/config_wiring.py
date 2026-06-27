@@ -383,10 +383,10 @@ def enable_act_fusion(cfg: "VllmConfig") -> bool:
     return False
 
 
-# SOURCE: vllm/config/vllm.py enable_allreduce_rms_fusion (L119-L147)
+# SOURCE: vllm/config/vllm.py enable_allreduce_rms_fusion (L119-L139)
 def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
-    # SUBTRACTED: ROCm aiter + Hopper/Blackwell + flashinfer + TP/DP/PP gating
-    #   (vllm/config/vllm.py:L120-L147) — all platform/hardware probes; reduced
+    # SUBTRACTED: ROCm aiter + Hopper/Blackwell + flashinfer gating
+    #   (vllm/config/vllm.py:L120-L139) — all platform/hardware probes; reduced
     #   to the TP>1 prerequisite which is the user-visible knob.
     return cfg.parallel_config.tensor_parallel_size > 1
 
@@ -397,7 +397,7 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
 #   resolve to on the generic CUDA path.
 
 
-# SOURCE: vllm/config/vllm.py OPTIMIZATION_LEVEL_00 (L184-L203)
+# SOURCE: vllm/config/vllm.py OPTIMIZATION_LEVEL_00 (L175-L194)
 OPTIMIZATION_LEVEL_00 = {
     "compilation_config": {
         "pass_config": {
@@ -418,7 +418,7 @@ OPTIMIZATION_LEVEL_00 = {
         "enable_flashinfer_autotune": False,
     },
 }
-# SOURCE: vllm/config/vllm.py OPTIMIZATION_LEVEL_01 (L204-L223)
+# SOURCE: vllm/config/vllm.py OPTIMIZATION_LEVEL_01 (L195-L216)
 OPTIMIZATION_LEVEL_01 = {
     "compilation_config": {
         "pass_config": {
@@ -441,7 +441,7 @@ OPTIMIZATION_LEVEL_01 = {
         "enable_flashinfer_autotune": True,
     },
 }
-# SOURCE: vllm/config/vllm.py OPTIMIZATION_LEVEL_02 (L224-L243)
+# SOURCE: vllm/config/vllm.py OPTIMIZATION_LEVEL_02 (L217-L238)
 OPTIMIZATION_LEVEL_02 = {
     "compilation_config": {
         "pass_config": {
@@ -465,10 +465,10 @@ OPTIMIZATION_LEVEL_02 = {
         "enable_flashinfer_autotune": True,
     },
 }
-# SOURCE: vllm/config/vllm.py OPTIMIZATION_LEVEL_03 (L244-L263) — same as O2.
+# SOURCE: vllm/config/vllm.py OPTIMIZATION_LEVEL_03 (L239-L258) — same as O2.
 OPTIMIZATION_LEVEL_03 = OPTIMIZATION_LEVEL_02
 
-# SOURCE: vllm/config/vllm.py OPTIMIZATION_LEVEL_TO_CONFIG (L265-L270)
+# SOURCE: vllm/config/vllm.py OPTIMIZATION_LEVEL_TO_CONFIG (L260-L265)
 OPTIMIZATION_LEVEL_TO_CONFIG = {
     OptimizationLevel.O0: OPTIMIZATION_LEVEL_00,
     OptimizationLevel.O1: OPTIMIZATION_LEVEL_01,
@@ -806,7 +806,7 @@ class EngineArgs:
         # SUBTRACTED: TurboQuant boundary-layer skip, Ray runtime-env / placement
         #   group collection, the entire DP hybrid/external load-balancer
         #   derivation block, and the mamba/kernel/offload/observability/attention
-        #   per-field repacking (vllm/engine/arg_utils.py:L1700-L1880, L2018-L2144)
+        #   per-field repacking (vllm/engine/arg_utils.py:L1713-L1890, L2028-L2154)
         #   — all dossier delete items; structurally identical repacking samples.
 
         parallel_config = ParallelConfig(

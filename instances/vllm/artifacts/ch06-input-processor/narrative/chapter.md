@@ -285,7 +285,7 @@ def add_request(
 结果从引擎回流时，每个 child 的输出会经过它自己那份 `RequestState`，在那里碰到归并的岔路口：
 
 ```python
-# vllm/v1/engine/output_processor.py:L321-L331
+# vllm/v1/engine/output_processor.py:L340-L354
 if self.parent_req is None:
     outputs = [output]
 else:
@@ -295,7 +295,11 @@ else:
     external_req_id = self.parent_req.external_req_id
 
 return self._new_request_output(
-    external_req_id, outputs, finished, kv_transfer_params
+    external_req_id,
+    outputs,
+    finished,
+    kv_transfer_params,
+    # … 省略：prompt_routed_experts（MoE 专家路由，与归并正交）…
 )
 ```
 

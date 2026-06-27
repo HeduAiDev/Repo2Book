@@ -57,13 +57,13 @@ class RequestState:
             queue=queue,
         )
 
-    # SOURCE: vllm/v1/engine/output_processor.py — make_request_output（含 L321-L331 归并）
+    # SOURCE: vllm/v1/engine/output_processor.py — make_request_output（含 L340-L354 归并）
     def make_request_output(
         self,
         output: CompletionOutput,
     ) -> RequestOutput | None:
         # SUBTRACTED: 上文 detokenize / DELTA token 偏移 / pooling_output 分支
-        #            （vllm/v1/engine/output_processor.py:L300-L318）——属 ch08；这里直接拿到
+        #            （vllm/v1/engine/output_processor.py:L303-L336）——属 ch08；这里直接拿到
         #            本 child 的 CompletionOutput，只演示归并与 external_req_id 改写。
         external_req_id = self.external_req_id
         finished = output.finished()

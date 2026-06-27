@@ -192,10 +192,10 @@ assert RMSNorm.enabled() is False
 
 ## 23.3 RMSNorm：一个 CustomOp 长什么样
 
-抽象讲了两节，落到一个真实实例上。RMSNorm 是最干净的 `CustomOp` 范例（`vllm/model_executor/layers/layernorm.py:L37`）：
+抽象讲了两节，落到一个真实实例上。RMSNorm 是最干净的 `CustomOp` 范例（基线 `f3fef123` 的 `vllm/model_executor/layers/layernorm.py:L102`；v0.21.0 该类移到 `L38`，见本节末「v0.21.0 更新」）：
 
 ```python
-# vllm/model_executor/layers/layernorm.py:L37
+# vllm/model_executor/layers/layernorm.py:L102 (基线 f3fef123)
 @CustomOp.register("rms_norm")
 class RMSNorm(CustomOp):
     """Root mean square normalization.
@@ -238,10 +238,10 @@ def register(cls, name, dynamic_arg_dims=None):
 
 第二个要盯住的是 `__init__` 里那行 `super().__init__()`。它看着平平无奇，其实是**第 1 级 dispatch 的扳机**——它调到 `CustomOp.__init__`，那里就把 `dispatch_forward()` 跑了。所以构造一个 `RMSNorm`，它的 `_forward_method` 当场就定死了。模型作者写 `RMSNorm(hidden_size)` 时，根本意识不到背后已经悄悄选好了 cuda 还是 native。
 
-现在看那「两份实现」到底差在哪。先看纯 torch 那份（`vllm/model_executor/layers/layernorm.py:L82`）：
+现在看那「两份实现」到底差在哪。先看纯 torch 那份（基线 `f3fef123` 的 `vllm/model_executor/layers/layernorm.py:L233`）：
 
 ```python
-# vllm/model_executor/layers/layernorm.py:L82
+# vllm/model_executor/layers/layernorm.py:L233 (基线 f3fef123)
 def forward_native(
     self,
     x: torch.Tensor,
@@ -270,7 +270,7 @@ def forward_native(
 `ir.ops.rms_norm` 和 `forward_static` 内部都是**一串普通 torch 算子**：上变到 fp32、平方、求均值、`rsqrt`、乘回权重。关键不在算法（RMSNorm 谁都会写），而在**这串算子对 Inductor 是透明的**——Inductor 能逐个看见它们、做模式匹配、把它们和上下游算子融成一个 kernel。`forward_static` 把这套纯 torch 流程写得很直白：
 
 ```python
-# vllm/model_executor/layers/layernorm.py:L187
+# vllm/model_executor/layers/layernorm.py:L188 (基线 f3fef123；v0.21.0 已删除 forward_static)
 @staticmethod
 def forward_static(x, variance_epsilon, hidden_size, orig_dtype,
                    weight=None, residual=None, variance_size_override=None):
@@ -287,10 +287,10 @@ def forward_static(x, variance_epsilon, hidden_size, orig_dtype,
     return x if residual is None else (x, residual)
 ```
 
-再看 CUDA 那份（`vllm/model_executor/layers/layernorm.py:L104`）：
+再看 CUDA 那份（基线 `f3fef123` 的 `vllm/model_executor/layers/layernorm.py:L258`）：
 
 ```python
-# vllm/model_executor/layers/layernorm.py:L104
+# vllm/model_executor/layers/layernorm.py:L258 (基线 f3fef123)
 def forward_cuda(
     self,
     x: torch.Tensor,
@@ -758,7 +758,7 @@ assert should_split(attn_node, ["vllm::unified_attention_with_output"])
 
 把两级 dispatch 并排放，本章就收束了。
 
-**第 1 级，单算子，构造期。** `CustomOp.__init__` 调 `dispatch_forward`，按 `enabled()`/`default_on()` 和平台，把 `self._forward_method` 定到 `forward_cuda`（融合 kernel，对编译器不透明）或 `forward_native`（纯 torch，可被编译器融合）——全在 `vllm/model_executor/custom_op.py:L174` 一处完成。一次定死，运行期零开销转发。RMSNorm（`vllm/model_executor/layers/layernorm.py:L37`）是它的标准范例：两份实现数值等价，差别只在「快」和「可不可融合」。
+**第 1 级，单算子，构造期。** `CustomOp.__init__` 调 `dispatch_forward`，按 `enabled()`/`default_on()` 和平台，把 `self._forward_method` 定到 `forward_cuda`（融合 kernel，对编译器不透明）或 `forward_native`（纯 torch，可被编译器融合）——全在 `vllm/model_executor/custom_op.py:L174` 一处完成。一次定死，运行期零开销转发。RMSNorm（`vllm/model_executor/layers/layernorm.py:L38`）是它的标准范例：两份实现数值等价，差别只在「快」和「可不可融合」。
 
 **第 2 级，整图，首次前向。** `@support_torch_compile`（`vllm/compilation/decorators.py:L118`）把模型包成可编译：推断 token 维动态、注入 wrapper、按 `mode` 决定 `do_not_compile`。首次前向触发 `VllmBackend`，`split_graph`（`vllm/compilation/backends.py:L548`）在 `splitting_ops`（默认 attention 算子）处把整图切成交替条带，`PiecewiseCompileInterpreter` 把规整段送 Inductor 编译 + 包 CUDA graph，attention 段保持 eager。
 

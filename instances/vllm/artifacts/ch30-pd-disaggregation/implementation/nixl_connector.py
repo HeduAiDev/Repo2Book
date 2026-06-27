@@ -168,9 +168,9 @@ class NixlConnectorWorker:
         return self._remote_agents.get(remote_engine_id, remote_engine_id)
 
     def _read_blocks_for_req(self, req_id, meta):
-        # SOURCE: vllm/.../nixl/worker.py:L1897-L1978
+        # SOURCE: vllm/.../nixl/worker.py:L1900-L1984
         # SUBTRACTED: remote_ranks 多读循环 / tp_ratio<0 MLA 单读 / mamba 块展开
-        #             （worker L1900-L1978，dossier delete 项：异构 TP / MLA / SSM 路径）。
+        #             （worker L1900-L1984，dossier delete 项：异构 TP / MLA / SSM 路径）。
         #             对称 TP 下单远端 rank 直接 _read_blocks。
         self._read_blocks(
             local_block_ids=meta.local_block_ids,
@@ -186,10 +186,10 @@ class NixlConnectorWorker:
     def _read_blocks(self, local_block_ids, remote_block_ids, dst_engine_id,
                      request_id, remote_request_id, remote_rank,
                      local_xfer_side_handle, remote_xfer_side_handle):
-        # SOURCE: vllm/.../nixl/worker.py:L1980-L2109
+        # SOURCE: vllm/.../nixl/worker.py:L1985-L2136
         """Post a READ point-to-point xfer request from a single local worker
         to a single remote worker."""
-        # SUBTRACTED: block_size_ratio>1 重映射 / get_mapped_blocks（worker L1997-L2024）—
+        # SUBTRACTED: block_size_ratio>1 重映射 / get_mapped_blocks（worker L2004-L2031）—
         #             异构 block_size 路径（dossier delete 项）。
         # Number of D TP workers that will read from dst P. Propagate info
         # on notification so that dst worker can wait before freeing blocks.
@@ -203,7 +203,7 @@ class NixlConnectorWorker:
             return
 
         # SUBTRACTED: partial-prefix 裁剪 / mamba 组保护 / descs id 计算（worker
-        #             L2059-L2091）—— 对称 TP 整请求一把读，精简版直接发 READ。
+        #             L2066-L2097）—— 对称 TP 整请求一把读，精简版直接发 READ。
         remote_block_descs_ids = remote_block_ids
         local_block_descs_ids = local_block_ids
 
@@ -225,7 +225,7 @@ class NixlConnectorWorker:
             # Use handle to check completion in future step().
             self._recving_transfers[request_id].append(handle)
         except Exception:
-            # SUBTRACTED: _handle_failed_transfer 失败块标记（worker L2110+）。
+            # SUBTRACTED: _handle_failed_transfer 失败块标记（worker L2118-L2135）。
             if handle is not None:
                 self.nixl_wrapper.release_xfer_handle(handle)
             raise

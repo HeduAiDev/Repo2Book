@@ -333,7 +333,7 @@ def manage_state(action: str = "view", key: str = None, value: str = None) -> di
             "project": "vllm-source-reading-book (v2, 2026-06-21 重建)",
             "outline": "instances/vllm/book/cartography/outline-final.json",
             "outline_size": "8 Parts / 33 chapters",
-            "source_pin": "v0.21.0 (release ad7125a4; 行号基线祖先 f3fef123)",
+            "source_pin": "v0.21.0 (release ad7125a4; 行号已重映射; 升级前基线 f3fef123)",
             "status": "系统重建完成；ch04（AsyncLLM 三段式）试点尚未发车",
             "chapters": {},
             "updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

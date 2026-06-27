@@ -30,14 +30,12 @@ class SpecDecodeBaseProposer:
         #             优化；主路径直接对草稿模型 logits 取 argmax。
         return self.model.compute_logits(hidden_states).argmax(dim=-1)
 
-    # SOURCE: vllm/v1/spec_decode/llm_base_proposer.py:L413-L655
-    # SUBTRACTED: tree attention 分支（propose_tree / TreeAttentionMetadata，L502-L514,
-    #             L518-L526）—— 高级 tree drafting 路径，subtraction_plan.delete 批准。
-    # SUBTRACTED: M-RoPE / xdrope position 分支（uses_mrope / uses_xdrope_dim 三处 if/elif，
-    #             L496-L500, L562-L591）—— 位置编码工程旁路；精简版固定 1D positions。
+    # SOURCE: vllm/v1/spec_decode/llm_base_proposer.py:L392-L644
+    # SUBTRACTED: M-RoPE / xdrope position 分支（uses_mrope / uses_xdrope_dim 多处 if/elif，
+    #             L475-L478, L604-L631）—— 位置编码工程旁路；精简版固定 1D positions。
     # SUBTRACTED: 多模态（supports_mm_inputs / inputs_embeds / mm_embed_inputs）与
     #             cudagraph padding（_determine_batch_execution_and_padding / input_batch_size
-    #             vs batch_size，L464-L470, L531-L533, L616-L640）—— 性能/兼容旁路；
+    #             vs batch_size，L443-L448, L502-L504, L553-L560）—— 性能/兼容旁路；
     #             精简版令 input_batch_size==batch_size、走纯 input_ids 路径。
     # SUBTRACTED: parallel_drafting/DFlash 专属 set_inputs_first_pass 的 needs_extra_input_slots
     #             分支（copy_and_expand_eagle_inputs_kernel 等）—— 见 set_inputs_first_pass
@@ -56,7 +54,7 @@ class SpecDecodeBaseProposer:
         common_attn_metadata,
         sampling_metadata,
     ) -> torch.Tensor:
-        # SOURCE: vllm/v1/spec_decode/llm_base_proposer.py:L413-L655
+        # SOURCE: vllm/v1/spec_decode/llm_base_proposer.py:L392-L644
         batch_size = common_attn_metadata.batch_size()
 
         if self.method in ("eagle3", "dflash"):

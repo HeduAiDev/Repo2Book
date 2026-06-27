@@ -137,9 +137,9 @@ class OffloadingConnectorWorker:
 class OffloadingConnector(KVConnectorBase_V1):
     # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py:L46
     def __init__(self, vllm_config, role, kv_cache_config=None, *, spec=None):
-        # SOURCE: vllm/.../offloading_connector.py:L51-L67
+        # SOURCE: vllm/.../offloading_connector.py:L51-L66
         super().__init__(vllm_config, role, kv_cache_config)
-        # SUBTRACTED: OffloadingSpecFactory.create_spec（offloading_connector.py L60）—
+        # SUBTRACTED: OffloadingSpecFactory.create_spec（offloading_connector.py L59）—
         #             由配置造卸载策略（CPU/磁盘后端选择），精简版按需注入 spec。
         self.connector_scheduler = None
         self.connector_worker = None

@@ -13,7 +13,7 @@
 - **实施计划**：`docs/superpowers/plans/2026-06-21-vllm-book-system-rebuild.md`
 - **架构地图 + 大纲**：`instances/vllm/book/cartography/`（`ARCHITECTURE.md` 全量、`outline-final.json` 8 Part/33 章、`map.json` 结构化）
 - **Book Bible**：`instances/vllm/book/bible/`（术语/接口/伏笔回收/声线——跨章连贯性真相源）
-- **源码版本**：跟踪 vLLM **v0.21.0**（发布提交 `ad7125a4`）。正文内嵌源码与行号锚定其直接祖先 `f3fef123`（同一开发线、v0.21.0 前 245 提交）；v0.21.0 在其上的面向读者变更已以「v0.21.0 更新」自然织入相关章节。根 `instances/vllm/source/`（blobless clone）
+- **源码版本**：书锚定 vLLM **v0.21.0**（发布提交 `ad7125a4`，`instances/vllm/source/` 工作树即此版）。全书 ~3000 处精确行号引用已由 `scripts/remap_lines_v021.py` 确定性重映射到 v0.21.0（difflib 行级对齐：平移类自动改号、内容真改处定点重抽 v0.21.0 片段）；v0.21.0 引入的面向读者新特性另以「v0.21.0 更新」注织入。`f3fef123` 为升级前基线（v0.21.0 直接祖先、前 245 提交），仅作历史 diff 参考。
 
 ## ⛔ HARD RULES
 
@@ -77,5 +77,5 @@ python3 scripts/lint_source_grounding.py {chapter}/                        # 源
 1. 别写脱离代码的抽象——正文以真实 vllm 源码为主线、自包含内嵌。
 2. implementer 别过度删减/误删——只删 `delete` 批准项，`must_keep` 必保留。
 3. 标记完成前跑全部四个 linter。
-4. vLLM 相关运行进容器；行号以基线 `f3fef123` 为准（书跟踪 v0.21.0，内嵌片段/行号锚定该祖先提交，v0.21.0 增量另以更新注标出；容器 vllm 版本可能有行号差，仅用于观察行为）。
+4. vLLM 相关运行进容器；行号以 **v0.21.0**（`ad7125a4`，`source/` 工作树当前版）为准；容器 vllm 版本可能有行号差，仅用于观察行为。升级前基线 `f3fef123` 仅作历史 diff（`scripts/remap_lines_v021.py` 据此重映射行号）。
 5. 别赌自己的上下文——决策/状态写进 trace、Bible、本文档。

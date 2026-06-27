@@ -532,8 +532,8 @@ class RequestOutputCollector:
 
 **归纳**：每个操作都保持 I：
 
-- **`put` 到空槽**（`self.output is None`，`output_processor.py:L64-66`）：新块整体进槽，"槽内未取"延长一块，I 保持。
-- **`put` 到非空槽**（`self.output.add(...)`，`L67-72`）：走到 `outputs.py:L145` 的 `add`，两种输出模式各有一条分支，都保持 I：
+- **`put` 到空槽**（`self.output is None`，`output_processor.py:L67-69`）：新块整体进槽，"槽内未取"延长一块，I 保持。
+- **`put` 到非空槽**（`self.output.add(...)`，`L70-75`）：走到 `outputs.py:L145` 的 `add`，两种输出模式各有一条分支，都保持 I：
   - **DELTA 模式**（`aggregate=True`）对同 `index` 的 completion 执行 `completion.token_ids.extend(next_completion.token_ids)`（`outputs.py:L159`）——把新块按序 **append 到旧块尾**。这里每个 `RequestOutput` 携带的是**增量** token，所以 extend 才是正确的拼接。槽内子序列因此是"有序前缀的延长"，I 保持。这正是轮 4 的合帧。
   - **FINAL 模式**（`aggregate=False`）执行 `self.outputs[i] = next_completion`（`outputs.py:L169`）——直接用新块**覆盖**旧块。乍看像会丢 token，其实不会：FINAL 模式下每个 `RequestOutput` 携带的不是增量，而是**到目前为止的累计全量**（完整前缀）。后到的块本身就是旧块的超集，覆盖等价于"取最新的那份完整前缀"。槽内子序列仍是同一条有序前缀（只是换成了更长的那份），并集与顺序都不变，I 保持。换句话说，DELTA 靠"拼接"、FINAL 靠"取最新全量"，殊途同归地不丢、不乱序。
 - **`get` / `get_nowait`**（`L78-96`）：把整个槽内块移到"已取走"侧、置槽为 `None`、`ready.clear()`。两部分之间搬了一块，并集与顺序都不变，I 保持。
@@ -544,7 +544,7 @@ class RequestOutputCollector:
 
 ## 4.7 解多路复用：一批输出怎么分回 N 个队列
 
-来源：`vllm/v1/engine/output_processor.py:L533-L562`（`add_request`）、`L600-L660`（`process_outputs`）。
+来源：`vllm/v1/engine/output_processor.py:L533-L562`（`add_request`）、`L597-L685`（`process_outputs`）。
 
 最后一块拼图：`output_handler` 从 IPC 单出口拉回的是**一整批**混着不同请求的 `EngineCoreOutput`，怎么把它们准确分回各自的队列？这就是"解多路复用"（de-multiplex）。
 
@@ -585,7 +585,7 @@ class RequestOutputCollector:
 **再看分发侧** `process_outputs`——`output_handler` 每块调的就是它：
 
 ```python
-        # vllm/v1/engine/output_processor.py:L625-L685
+        # vllm/v1/engine/output_processor.py:L627-L685
         for engine_core_output in engine_core_outputs:
             req_id = engine_core_output.request_id
             req_state = self.request_states.get(req_id)
@@ -598,7 +598,7 @@ class RequestOutputCollector:
                 new_token_ids,
                 # … 省略：pooling_output / finish_reason / stop_reason 等 …
             ):
-                # … 省略：流式输入下的 finished 改写（output_processor.py:L652-653，正交特性，本章不展开）…
+                # … 省略：流式输入下的 finished 改写（output_processor.py:L677-678，正交特性，本章不展开）…
                 if req_state.queue is not None:
                     # AsyncLLM: put into queue for handling by generate().
                     req_state.queue.put(request_output)
@@ -688,7 +688,7 @@ class EngineCoreOutput(
 
 ## 4.9 把三段串起来：完整时序
 
-来源：`vllm/v1/engine/async_llm.py:L524-L707`、`vllm/v1/engine/output_processor.py:L45-L660`。
+来源：`vllm/v1/engine/async_llm.py:L524-L707`、`vllm/v1/engine/output_processor.py:L48-L685`。
 
 前面每段单看了，现在把生产者和消费者放进同一条时间线，看一个请求的完整一生。
 
@@ -704,13 +704,13 @@ class EngineCoreOutput(
 4. `add_request` 调 `self._run_output_handler()`（`add_request L373`）懒启背景任务（若尚未启）。
 5. `add_request` 建 `queue = RequestOutputCollector(...)`（`add_request L376`）[每请求专属队列]。
 6. `add_request → _add_request`（`_add_request L400`）**扇出两路**：
-   - 6a. `output_processor.add_request(request, ..., queue)`（`output_processor.py:add_request L508`）[本进程] 把 `queue` 存进 `req_id → RequestState` 表。
+   - 6a. `output_processor.add_request(request, ..., queue)`（`output_processor.py:add_request L533`）[本进程] 把 `queue` 存进 `req_id → RequestState` 表。
    - 6b. `await engine_core.add_request_async(request)`（`_add_request L412`）[跨进程，IPC] 把 `EngineCoreRequest` 投递到独立进程 EngineCore [跨过进程边界]。
 7. [独立进程，留 [第 7 章：IPC 边界](../ch07-ipc-boundary/narrative/chapter.md)] EngineCore 调度+执行，产出 `EngineCoreOutputs`。
 8. 背景任务 `output_handler` `await engine_core.get_output_async()`（`_run_output_handler L660`）[跨进程，IPC] 收一批 [生产者拉取]。
 9. `output_handler` 分块调 `output_processor.process_outputs(...)`（`_run_output_handler L675`）。
-10. `process_outputs` 按 `req_id` 查表并 `req_state.queue.put(request_output)`（`output_processor.py L655-657`）解多路复用回各请求队列。
-11. `put` 唤醒对应队列的 `asyncio.Event`（`RequestOutputCollector.put L66`）。
+10. `process_outputs` 按 `req_id` 查表并 `req_state.queue.put(request_output)`（`output_processor.py L680-682`）解多路复用回各请求队列。
+11. `put` 唤醒对应队列的 `asyncio.Event`（`RequestOutputCollector.put L69`）。
 12. `generate` 的 `while` 循环 `out = q.get_nowait() or await q.get()`（`generate L579`）取出，`if out.finished` 判停，`yield out`（`generate L584-586`）给调用方。
 13. 客户端断开 → `generate` 收 `CancelledError` → `await self.abort(...)`（`generate L591-593`）在 OutputProcessor 与 EngineCore 双向清理。
 

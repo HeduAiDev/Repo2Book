@@ -258,7 +258,7 @@ class GPUModelRunner:
 
             # SUBTRACTED: non-last-rank token_ids_cpu backfill (PP). On the last
             #   rank the sampled tokens are written by bookkeeping, not here.
-            #   Orig: vllm/v1/worker/gpu_model_runner.py:L1345-L1352
+            #   Orig: vllm/v1/worker/gpu_model_runner.py:L1359-L1381
 
             # Add spec_token_ids to token_ids_cpu.
             self.input_batch.update_req_spec_token_ids(req_state, scheduled_spec_tokens)

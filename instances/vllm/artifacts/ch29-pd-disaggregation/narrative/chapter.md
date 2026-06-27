@@ -257,21 +257,19 @@ KVConnectorFactory.register_connector(
 注册表只存 `(name → 模块路径 + 类名)`，**不 import**。为什么不直接 import？因为 vLLM 支持十几种 connector，每个都拖一堆重依赖（NIXL 要 RDMA 库、LMCache 要它自己的 runtime……），且这张表还在持续增长——v0.21.0 又添了一项 `MooncakeStoreConnector`（把 KV cache 卸载到 Mooncake 分布式存储，类在 `vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.connector`），后端越多，"启动即全量 import"的代价越不可接受。如果启动就把它们全 import 一遍，无关重依赖会拖慢甚至拖崩进程。懒加载注册表把实际 `import_module` 推迟到 `create_connector` 真要用那一个时，只加载当前选中的后端：
 
 ```python
-# vllm/distributed/kv_transfer/kv_connector/factory.py:L42-L82（HMA 校验/日志已略）
+# vllm/distributed/kv_transfer/kv_connector/factory.py:L42-L75（HMA 校验/日志已略）
     @classmethod
     def create_connector(
         cls,
         config: "VllmConfig",
         role: KVConnectorRole,
-        kv_cache_config: "KVCacheConfig | None" = None,
+        kv_cache_config: "KVCacheConfig",
     ) -> KVConnectorBase:
         kv_transfer_config = config.kv_transfer_config
         if kv_transfer_config is None:
             raise ValueError("kv_transfer_config must be set to create a connector")
-        connector_cls, compat_sig = cls._get_connector_class_with_compat(
-            kv_transfer_config
-        )
-        # … 省略：HMA（混合内存分配器）支持校验，不支持则报错 …
+        connector_cls = cls.get_connector_class(kv_transfer_config)
+        # … 省略：HMA（混合内存分配器）支持校验，不支持则报错；以及创建日志 …
         # NOTE(Kuntai): v1 connector is explicitly separated into two roles.
         # Scheduler connector:
         # - Co-locate with scheduler process
@@ -280,17 +278,12 @@ KVConnectorFactory.register_connector(
         # - Co-locate with worker process
         # - Should only be used inside the forward context & attention layer
         # We build separately to enforce strict separation
-        if compat_sig:
-            # Old signature: __init__(self, vllm_config, role)
-            return connector_cls(config, role)
-        else:
-            # New signature: __init__(self, vllm_config, role, kv_cache_config)
-            return connector_cls(config, role, kv_cache_config)
+        return connector_cls(config, role, kv_cache_config)
 ```
 
 `role` 参数在这里分流。`NOTE(Kuntai)` 那段注释把意图说白了：调度器侧 connector 和 worker 侧 connector "build separately to enforce strict separation"——分别构造，强制严格隔离。调度器进程调一次 `create_connector(role=SCHEDULER)`，每个 worker 进程各调一次 `create_connector(role=WORKER)`。同一个类，两份实例，各活在各的进程里。
 
-> **v0.21.0 更新**：上面这段 `compat_sig` 分支与 `kv_cache_config: "KVCacheConfig | None" = None` 的可选签名，是为兼容 pre-v0.12.0 的两参构造器 `__init__(self, vllm_config, role)` 留的垫片。v0.21.0 把它彻底删除：`kv_cache_config` 升为**第三个必填参数**，工厂不再做签名探测兜底，`create_connector` 一律 `return connector_cls(config, role, kv_cache_config)`；探测函数也收紧为公开的 `get_connector_class`，外部 v1 connector 若仍只接两参，会在此处直接 `raise ValueError`。`KVConnectorBase_V1.__init__` 同步把 `kv_cache_config` 改为必填、删掉"未传则告警弃用"那段。这反而强化了本节主旨——"按 role 各造一份"现在三个参数（`config, role, kv_cache_config`）齐备，进程隔离的契约更硬。
+> **版本沿革**：早期版本里这段曾有一条 `compat_sig` 兼容分支与 `kv_cache_config: "KVCacheConfig | None" = None` 的可选签名，用来兜住 pre-v0.12.0 的两参构造器 `__init__(self, vllm_config, role)`。v0.21.0 把它彻底删除：`kv_cache_config` 升为**第三个必填参数**，工厂不再做签名探测兜底，`create_connector` 一律 `return connector_cls(config, role, kv_cache_config)`；类查找也收敛为公开的 `get_connector_class`。`KVConnectorBase_V1.__init__` 同步把 `kv_cache_config` 改为必填、删掉"未传则告警弃用"那段。这反而强化了本节主旨——"按 role 各造一份"现在三个参数（`config, role, kv_cache_config`）齐备，进程隔离的契约更硬。
 
 调度器这一头的构造发生在 `Scheduler.__init__`：
 

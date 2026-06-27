@@ -1,6 +1,6 @@
 # vLLM v1 架构地图 (Architecture Map)
 
-> 跟踪版本: vLLM **v0.21.0**（发布提交 `ad7125a4`） · 行号/锚点基线: `f3fef123504db07b3ac83ad4ef677915b53e8386`（v0.21.0 直接祖先） · 生成日期: 2026-06-21（v0.21.0 增量 2026-06-28 织入）
+> 锚定版本: vLLM **v0.21.0**（发布提交 `ad7125a4`，源码工作树即此版） · 行号已确定性重映射到 v0.21.0 · 升级前基线: `f3fef123…`（v0.21.0 直接祖先，仅作历史 diff） · 生成日期: 2026-06-21（v0.21.0 重基 2026-06-28）
 
 > 产出方式: 15 个并行 cartographer agent 读真实源码 → 1 个 synthesis agent 汇总 (workflow `vllm-architecture-cartography`)
 

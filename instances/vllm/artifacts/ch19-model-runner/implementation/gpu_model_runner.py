@@ -264,7 +264,7 @@ class GPUModelRunner:
         # SUBTRACTED: M-RoPE / LoRA / pooling / async-spec / PP token-backfill /
         #   ngram_gpu bookkeeping branches of _update_states. Approved — these
         #   are the same deletions made on the ch18 spine.
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1122-L1419
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L1136-L1447
         req_data = scheduler_output.scheduled_cached_reqs
         scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
         for i, req_id in enumerate(req_data.req_ids):
@@ -516,7 +516,7 @@ class GPUModelRunner:
         # SUBTRACTED: RoutedExpertsCapturer clear, ngram_gpu scheduler_output
         #   shallow-copy, KV-transfer handle_preemptions. Approved (MoE capture /
         #   ngram spec decode / PD-disaggregation).
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L3836-L3863
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L3866-L3891
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         # Preprocess: reconcile the persistent batch, then build the per-step
@@ -637,7 +637,7 @@ class GPUModelRunner:
             #   KV-transfer pass-through early returns. In the reduced companion
             #   sample_tokens is always called right after a forward, so the
             #   bridge slot is non-None. Approved (PP / KV connector).
-            #   Orig: vllm/v1/worker/gpu_model_runner.py:L4181-L4197
+            #   Orig: vllm/v1/worker/gpu_model_runner.py:L4209-L4225
             return ModelRunnerOutput(req_ids=[], req_id_to_index={}, sampled_token_ids=[])
 
         # Unpack ephemeral state.
@@ -669,7 +669,7 @@ class GPUModelRunner:
         # SUBTRACTED: async-scheduling PP broadcast of sampled ids, draft-token
         #   proposal (EAGLE / ngram / DraftModel), KV connector finalize, eplb,
         #   RoutedExpertsCapturer save. Approved (spec decode / PP / connectors).
-        #   Orig: vllm/v1/worker/gpu_model_runner.py:L4227-L4374
+        #   Orig: vllm/v1/worker/gpu_model_runner.py:L4255-L4415
 
         (
             num_nans_in_logits,

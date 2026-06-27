@@ -310,7 +310,7 @@ class Scheduler:
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
 
-    # SOURCE: vllm/v1/core/sched/scheduler.py:L1331-L1481 (update_from_output 本章相关段)
+    # SOURCE: vllm/v1/core/sched/scheduler.py:L1289-L1443 (update_from_output 本章相关段)
     def update_from_output(self, num_scheduled_tokens: "dict[str, list[int]]",
                            scheduled_spec_decode_tokens: "dict | None" = None):
         """num_scheduled_tokens: req_id -> 本拍模型采样出的 token id 列表（精简签名）。

@@ -21,7 +21,7 @@ scripts/lint_fidelity.py  lint_chapter_structure.py  lint_formulas.py  lint_sour
 scripts/bible.py          ← 跨章连贯性 CLI（due/foreshadow/payoff/term/iface）
 scripts/vllm_docker.sh    ← 在 vLLM 容器内跑（host 无 CUDA/vLLM）
 scripts/archivist.py learn.py   ← 长期记忆 / 自学习
-instances/vllm/source/                                  ← 真实 vLLM 源码（跟踪 v0.21.0 / 行号基线 f3fef123）
+instances/vllm/source/                                  ← 真实 vLLM 源码 @ v0.21.0（行号已重映射；升级前基线 f3fef123）
 instances/vllm/book/cartography/                        ← 架构地图 + 大纲 + map.json
 instances/vllm/book/bible/                              ← Book Bible（连贯性真相源）
 instances/vllm/book/assets/roadmap/roadmap.py          ← Roadmap 母版生成器
