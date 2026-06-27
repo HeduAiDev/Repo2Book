@@ -15,8 +15,9 @@ import argparse
 import json
 import sys
 from pathlib import Path
+import instance
 
-ROOT = Path(__file__).resolve().parents[1] / "instances/vllm/book/bible"
+ROOT = instance.book_dir() / "bible"
 ARC = ROOT / "arc-map.json"
 GLOSS = ROOT / "glossary.json"
 IFACE = ROOT / "interfaces.json"

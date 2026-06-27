@@ -4,30 +4,37 @@
 > **失忆或换会话后：按本手册 + CLAUDE.md 运转工厂，不要靠记忆。**
 
 ## 0. 上手顺序（冷启动/压缩后先读）
-1. `CLAUDE.md`（自动加载）——新体系总览 + HARD RULES。
+1. `CLAUDE.md`（自动加载）——通用方法论 + HARD RULES（仓库无关）。
 2. 本手册——具体操作。
-3. `docs/superpowers/specs/2026-06-21-vllm-source-reading-book-system.md`——设计与为什么。
-4. `instances/vllm/book/cartography/ARCHITECTURE.md` + `outline-final.json`——架构地图 + 33 章大纲。
-5. `python3 scripts/archivist.py state` + `instances/vllm/book/bible/`——当前状态 + 连贯性。
+3. `repo2book.json.active_instance` → `instances/<active>/INSTANCE.md`——当前在写哪本书的源码版本/状态/专属规则。
+4. `instances/<active>/book/cartography/ARCHITECTURE.md` + `outline-final.json`——架构地图 + 大纲。
+5. `python3 scripts/archivist.py state` + `instances/<active>/book/bible/`——当前状态 + 连贯性。
+6. `docs/superpowers/specs/2026-06-21-vllm-source-reading-book-system.md`——设计与为什么（以 vLLM 为首例，方法论通用）。
+
+### 0.5 新建一本书（换实例）
+`python3 scripts/new_instance.py <name> --repo <git-url> --title "…" --prefix <规范路径前缀> --activate`
+→ scaffold `instances/<name>/` 骨架 + blobless clone 源仓 + 置为 active → 在 source/ pin commit、填 INSTANCE.md → 出架构地图 cartography/ + 大纲 → 回到 §3 逐章发车。脚本统一经 `scripts/instance.py` 认活动实例，无需改 linter。
 
 ## 1. 心智模型（一句话）
-真实 vLLM 源码是教材；analyst 把它读成 **dossier（唯一真相源）**；implementer 据此**只删不增**做可运行精简版；writer 以**真实源码为主线**写自包含章节；reviewer 协作式把关；archivist 持久化记忆。编排靠 **chapter-pipeline workflow**（并行+确定性+逃生舱），活体迭代靠我 + 命名 agent + SendMessage。
+真实源码是教材；analyst 把它读成 **dossier（唯一真相源）**；implementer 据此**只删不增**做可运行精简版；writer 以**真实源码为主线**写自包含章节；reviewer 协作式把关；archivist 持久化记忆。编排靠 **chapter-pipeline workflow**（并行+确定性+逃生舱），活体迭代靠我 + 命名 agent + SendMessage。
 
 ## 2. 目录地图
 ```
 .claude/agents/{analyst,implementer,tester,writer,reviewer,archivist}.md  ← 6 角色持久提示词
 .claude/workflows/chapter-pipeline.js                                     ← 单章流水线
 scripts/lint_fidelity.py  lint_chapter_structure.py  lint_formulas.py  lint_source_grounding.py
+scripts/instance.py       ← 活动实例解析（去仓库化核心；linter --all 据它扫）
+scripts/new_instance.py   ← 新建一本书（scaffold 实例 + 克隆源仓）
 scripts/bible.py          ← 跨章连贯性 CLI（due/foreshadow/payoff/term/iface）
-scripts/vllm_docker.sh    ← 在 vLLM 容器内跑（host 无 CUDA/vLLM）
 scripts/archivist.py learn.py   ← 长期记忆 / 自学习
-instances/vllm/source/                                  ← 真实 vLLM 源码 @ v0.21.0（行号已重映射；升级前基线 f3fef123）
-instances/vllm/book/cartography/                        ← 架构地图 + 大纲 + map.json
-instances/vllm/book/bible/                              ← Book Bible（连贯性真相源）
-instances/vllm/book/assets/roadmap/roadmap.py          ← Roadmap 母版生成器
-instances/vllm/artifacts/ch04-async-llm/               ← 新书章节（ch- 前缀 slug）
-instances/vllm/trace/                                   ← 项目长期记忆（state.json/decisions/...）
+scripts/remap_lines_v021.py     ← 源码升级时行号确定性重映射（可复用于任意实例）
+instances/<active>/repo2book.json + INSTANCE.md         ← 实例配置 + 当前状态/专属规则
+instances/<active>/source/                              ← 目标仓真实源码（blobless clone）
+instances/<active>/book/{cartography,bible,assets}/     ← 架构地图 + 大纲 / Book Bible / Roadmap 母版
+instances/<active>/artifacts/chNN-slug/                 ← 每章产物（ch- 前缀 slug）
+instances/<active>/{knowledge,trace}/                   ← 仓库事实(TTL) / 项目长期记忆
 docs/superpowers/{specs,plans}/                         ← 设计 + 计划
+（当前 active = vllm；其源码 @ v0.21.0，调试进容器 scripts/vllm_docker.sh，详见 instances/vllm/INSTANCE.md）
 ```
 
 ## 3. 发车：跑一章

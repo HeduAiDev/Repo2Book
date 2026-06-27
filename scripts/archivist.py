@@ -43,18 +43,18 @@ def get_instance_dir(instance_name: str = None) -> Path:
     """Get the instance directory from repo2book config or argument."""
     if instance_name:
         return ROOT / "instances" / instance_name
-    # Default: read from main config, resolve from config path
+    # Default: read active_instance from the top-level repo2book.json registry (v2 format)
+    import os
+    env = os.environ.get("REPO2BOOK_INSTANCE")
+    if env:
+        return ROOT / "instances" / env
     config_file = ROOT / "repo2book.json"
     if config_file.exists():
         with open(config_file) as f:
             config = json.load(f)
-        current = config.get("instances", {}).get("current", {})
-        # Use config file path to derive instance dir: "instances/vllm/repo2book.json" → "instances/vllm"
-        config_path = current.get("config", "")
-        if config_path:
-            return ROOT / Path(config_path).parent
-        instance_name = current.get("name", "vllm")
-        return ROOT / "instances" / instance_name
+        name = config.get("active_instance")
+        if name:
+            return ROOT / "instances" / name
     return ROOT / "instances" / "vllm"
 
 INSTANCE = get_instance_dir()
@@ -330,11 +330,11 @@ def manage_state(action: str = "view", key: str = None, value: str = None) -> di
     if not STATE_FILE.exists():
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         default = {
-            "project": "vllm-source-reading-book (v2, 2026-06-21 重建)",
-            "outline": "instances/vllm/book/cartography/outline-final.json",
-            "outline_size": "8 Parts / 33 chapters",
-            "source_pin": "v0.21.0 (release ad7125a4; 行号已重映射; 升级前基线 f3fef123)",
-            "status": "系统重建完成；ch04（AsyncLLM 三段式）试点尚未发车",
+            "project": f"{INSTANCE.name}-source-reading-book",
+            "outline": str((INSTANCE / "book/cartography/outline-final.json").relative_to(ROOT)),
+            "outline_size": "",
+            "source_pin": "",
+            "status": "instance bootstrap",
             "chapters": {},
             "updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "updated_by": "archivist",

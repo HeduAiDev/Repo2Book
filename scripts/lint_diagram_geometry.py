@@ -16,6 +16,7 @@ import sys
 import glob
 import math
 import xml.etree.ElementTree as ET
+import instance
 
 NS = '{http://www.w3.org/2000/svg}'
 ARROW_TOL = 6.0   # 箭头端点到框边/他端点的容差
@@ -195,7 +196,7 @@ def check(path):
 
 def main():
     args = sys.argv[1:]
-    files = sorted(glob.glob('instances/vllm/artifacts/ch*/diagrams/*.svg')) \
+    files = sorted(glob.glob(instance.diagrams_glob())) \
         if (args == ['--all'] or not args) else args
     total = 0; perch = {}
     for f in files:

@@ -20,8 +20,11 @@ import glob
 import os
 import subprocess
 import difflib
+import instance
 
-SRC = "instances/vllm/source"
+# 升级源码版本时把书里精确行号引用从 OLD 重映射到 NEW。SRC/章节路径走活动实例，
+# OLD/NEW 是本次升级的两个 git rev（按实例改这两个常量即可复用）。
+SRC = str(instance.source_dir())
 OLD = "f3fef1235"
 NEW = "v0.21.0"
 
@@ -131,8 +134,9 @@ def iter_citations(text):
 
 
 def files():
-    return (sorted(glob.glob("instances/vllm/artifacts/ch*/narrative/chapter.md"))
-            + sorted(glob.glob("instances/vllm/artifacts/ch*/implementation/*.py")))
+    art = str(instance.artifacts_dir())
+    return (sorted(glob.glob(os.path.join(art, "ch*/narrative/chapter.md")))
+            + sorted(glob.glob(os.path.join(art, "ch*/implementation/*.py"))))
 
 
 def report():
@@ -189,11 +193,14 @@ def apply():
     print(f"applied shift-remaps in {changed_files} files")
     print(f"flagged for re-sync (content-change/unmappable): {len(flagged)}")
     import json
+    flag_dir = instance.book_dir() / f"_{NEW}-update"
+    flag_dir.mkdir(parents=True, exist_ok=True)
+    flag_path = flag_dir / "_resync-flags.json"
     json.dump([{"chapter": c, "file": fn, "path": p, "old": [ls, le], "cat": cat,
                 "new_approx": nr} for (c, fn, p, ls, le, cat, nr) in flagged],
-              open("instances/vllm/book/_v021-update/_resync-flags.json", "w", encoding="utf-8"),
+              open(flag_path, "w", encoding="utf-8"),
               ensure_ascii=False, indent=2)
-    print("flags written to instances/vllm/book/_v021-update/_resync-flags.json")
+    print(f"flags written to {flag_path}")
 
 
 if __name__ == "__main__":

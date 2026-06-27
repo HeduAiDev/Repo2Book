@@ -9,6 +9,7 @@
 import re
 import sys
 import glob
+import instance
 
 # 中文字符后紧跟半角标点（句末/句中标点；句号 . 不查，因 0.5/L37 等大量合法用法）
 HALF = re.compile(r'([一-鿿])([,?!;:])')
@@ -50,7 +51,7 @@ def check(path: str):
 
 def main():
     args = sys.argv[1:]
-    files = sorted(glob.glob('instances/vllm/artifacts/ch*/narrative/chapter.md')) \
+    files = sorted(glob.glob(instance.chapters_glob())) \
         if (args == ['--all'] or not args) else args
     total = 0
     for f in files:

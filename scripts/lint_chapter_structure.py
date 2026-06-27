@@ -27,7 +27,7 @@ def lint_structure(md_path: str) -> dict:
 
     # 零脚手架泄漏（读者视角）：正文不得含本仓库脚手架痕迹
     scaffold = [
-        (r"instances/vllm/source", "出现脚手架路径 instances/vllm/source（应用规范 vllm/ 路径）"),
+        (r"instances/[\w.-]+/source", "出现脚手架路径 instances/<instance>/source（应用规范源码路径，如 vllm/…）"),
         (r"\bCell\s*\d+\b", "出现 'Cell N' 脚手架标题（应用自然标题）"),
         (r"impl-notes\.md|dossier", "引用内部脚手架文件（impl-notes.md/dossier）"),
         (r"详[见细]文档|完整文档见|这里只?截取", "提到出版物中不存在的外部文档/截取说明"),
