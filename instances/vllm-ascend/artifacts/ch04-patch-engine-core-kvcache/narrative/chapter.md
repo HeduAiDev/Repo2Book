@@ -1,11 +1,12 @@
-# 第 4 章 顶替引擎核心：KV-cache 协调器、调度与 spec 的昇腾化 patch
+# 第 4 章 顶替引擎核心：KV-cache 与内存形态层的昇腾化 patch
 
 ![本章在全书地图的位置](../diagrams/roadmap.png)
 
 > **你在这里**——Part I「接入机制」的落地章。
 > 上一章备齐了 5 种 monkey-patch 技法，那是工具箱。
 > 本章拿这套工具，钻进引擎核心最硬的一层：KV-cache。
-> 下一章起换到 Part II，讲设备与显存。
+> 下一章仍在 Part I：第三种接管手段。
+> 不改源码，只填一份 config 的 check_and_update_config。
 
 ---
 

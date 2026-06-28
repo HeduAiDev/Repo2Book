@@ -5,7 +5,7 @@
 > **你在这里**——Part I「接入机制」的旗舰地基章。
 > 上一章讲清了 vllm-ascend 怎么被 vLLM 发现、并顶替成默认平台。
 > 本章解决随之而来的硬问题：选中平台之后，怎么把 vLLM 内部跑不动的函数一段段换掉？
-> 下一章顺着这套招式，钻进引擎核心的具体 patch（KV-cache 协调器、调度器、spec（投机解码））。
+> 下一章顺着这套招式，钻进引擎核心：KV-cache 协调器与内存形态层的 patch。
 
 ---
 
@@ -523,4 +523,4 @@ wrapped() == "destroyed"                                     → True   # ④ wr
 - **触发**：没有 `apply()`，patch 全靠 import 包时的模块级副作用；`is_310p` / `HAS_TRITON` / `vllm_version_is` / 环境变量四个维度的条件加载，精确裁剪每个环境该打哪些 patch。本书钉死的 v0.21.0 基座上，`patch_v2` 整组被版本门控挡在门外。
 - **技法**：整类替换换类名（`patch_multiproc_executor.py`）；工厂替换连派发表一起改（`patch_mamba_manager.py`）；方法替换只换一个绑定方法（`patch_scheduler.py`）；库函数 wrapper 闭包包裹原 fn（`patch_triton.py`）；from-import 缓存陷阱要把同一对象的所有别名都重绑（`patch_distributed.py`）。
 
-[下一章](../ch04-patch-engine-core-kvcache/narrative/chapter.md)我们就拿着这套招式总纲，钻进引擎核心——看 KV-cache 协调器、调度器、spec（投机解码）这几处最要紧的 platform 段 patch，具体替换了 vLLM 的哪些行为、又为什么非换不可。
+[下一章](../ch04-patch-engine-core-kvcache/narrative/chapter.md)我们就拿着这套招式总纲，钻进引擎核心——看 KV-cache 协调器与内存形态层这几处最要紧的 platform 段 patch，具体替换了 vLLM 的哪些行为、又为什么非换不可。

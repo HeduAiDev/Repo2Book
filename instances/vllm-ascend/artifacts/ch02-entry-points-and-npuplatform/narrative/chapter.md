@@ -9,9 +9,9 @@
 
 ---
 
-vllm-ascend 是 vLLM 的 **out-of-tree（OOT）平台插件**。它装在 vLLM 之外、是一个独立的 pip 包，却能让 `import vllm` 之后整套引擎自动改用昇腾 NPU 的算子、通信器、worker。这件事听上去有点违反直觉：vLLM 的源码里根本没有 `vllm_ascend` 这个名字，它是怎么「认出」并交权给一个素未谋面的包的？
+vllm-ascend 是 vLLM 的 **out-of-tree（OOT，源码树外）平台插件**。它装在 vLLM 之外、是一个独立的 pip 包，却能让 `import vllm` 之后整套引擎自动改用昇腾 NPU 的算子、通信器、worker。这件事听上去有点违反直觉：vLLM 的源码里根本没有 `vllm_ascend` 这个名字，它是怎么「认出」并交权给一个素未谋面的包的？
 
-答案是一条贯穿全章的主线——**一根 qualname 字符串，被推迟到最后一刻才 import**。从安装期写进包元数据的 entry point，到平台选择期 `vllm/platforms/__init__.py` 里的 `resolve_current_platform_cls_qualname`，到首次访问 `current_platform` 的懒加载，再到运行期 `vllm_ascend/platform.py` 那批 `get_*_cls` 工厂钩子，vLLM 自始至终传递的都是 `"vllm_ascend.platform.NPUPlatform"` 这样的**字符串**，而不是类对象。看懂这个「延迟绑定」模式，本章就通了。
+答案是一条贯穿全章的主线——**一根 qualname（全限定类名）字符串，被推迟到最后一刻才 import**。从安装期写进包元数据的 entry point，到平台选择期 `vllm/platforms/__init__.py` 里的 `resolve_current_platform_cls_qualname`，到首次访问 `current_platform` 的懒加载，再到运行期 `vllm_ascend/platform.py` 那批 `get_*_cls` 工厂钩子，vLLM 自始至终传递的都是 `"vllm_ascend.platform.NPUPlatform"` 这样的**字符串**，而不是类对象。看懂这个「延迟绑定」模式，本章就通了。
 
 我们就顺着这根字符串走一遍。
 
@@ -392,7 +392,7 @@ class NPUPlatform(Platform):
         return backend_map[(attn_selector_config.use_mla, attn_selector_config.use_sparse, use_compress)]
 ```
 
-它按 `(use_mla, use_sparse[, use_compress])` 这把 key 在 `backend_map` 里查不同的昇腾 attention backend——MLA、稠密、SFA、DSA（MLA / SFA / DSA 是昇腾针对不同注意力模式的几种 backend 实现，分别对应多头潜在注意力、稀疏、压缩）。`FLASH_ATTN` 是「训推一致」场景下的特例，先经 `_validate_fa3_backend` 校验通过才走（该校验依赖外部包 `flash_attn_npu_v3`，本章不展开）。
+它按 `(use_mla, use_sparse[, use_compress])` 这把 key 在 `backend_map` 里查不同的昇腾 attention backend——MLA、稠密、SFA、DSA（MLA / SFA / DSA 是昇腾针对不同注意力模式的几种 backend 实现；MLA 即多头潜在注意力，SFA 由 `use_sparse` 稀疏路径选中，DSA（DeepSeek Sparse Attention）由 `use_compress` 量化路径选中）。`FLASH_ATTN` 是「训推一致」场景下的特例，先经 `_validate_fa3_backend` 校验通过才走（该校验依赖外部包 `flash_attn_npu_v3`，本章不展开）。
 
 这里埋着一条**横切线索**：`if is_310p()` 这一支会整个改走 `backend_map_310`。而且注意两张表的 key 维度不同——非-310P 用 3 元组 key（含 `use_compress`），310P 用 2 元组 key。310P 是昇腾的纯推理卡，能力受限，连 attention backend 都另起一套（`vllm_ascend._310p.…`）。这个 `is_310p()` 究竟从哪来，我们 [§2.10](#210-设备分代is_310p-这条横切线) 揭晓。把精简版跑起来喂不同的 key，`(True,False,False)` 会拿到 `AscendMLABackend`、`(True,True,False)` 拿到 `AscendSFABackend`，而一旦把设备分代设成 310P，同样的 `(False,False)` 就改落到 `AscendAttentionBackend310`——查表分发与分代分流都能在 host 上纯 Python 复现。
 
@@ -478,7 +478,7 @@ def register_model():
 
 还有一处细节值得记下：`register_connector / register_model_loader / register_service_profiling` 都先调一遍 `_ensure_global_patch()`。这是因为 vLLM 在子进程里加载 general plugins，而 E2E 测试的 conftest 钩子不会在子进程跑——那些影响 scheduler、engine 的进程级 monkey-patch，必须借这几个 plugin 入口在子进程里**补打**一遍。`_GLOBAL_PATCH_APPLIED` 这个模块级标志位保证它**幂等**：打过就直接 return，不会重复打。把精简版跑起来能看到，连调两次 `_ensure_global_patch()` 后标志位稳定为 `True`，第二次是空操作。
 
-这里只点出 general_plugins 会触发 `adapt_patch` 的 platform 段。`adapt_patch` 那套「platform 段 + worker 段」的两段式 monkey-patch——它具体替换了 vLLM 内部哪些函数、为什么分两段打——是 [第 3 章：两段式 monkey-patch](../ch03-two-phase-monkey-patch/narrative/chapter.md) 的主线。本章按下不表。
+这里只点出 general_plugins 会触发 `adapt_patch` 的 platform 段。`adapt_patch` 那套「platform 段 + worker 段」的两段式 monkey-patch——它具体替换了 vLLM 内部哪些函数、为什么分两段打——是 [第 3 章：两段式 monkey-patch](../ch03-two-stage-monkey-patch/narrative/chapter.md) 的主线。本章按下不表。
 
 ## 2.10 设备分代：is_310p 这条横切线
 
@@ -552,6 +552,6 @@ def is_310p():
 - 运行期，`NPUPlatform` 作为「总台」，用身份替换类属性 + 一批返回 qualname 的工厂钩子，把 attention / 通信器 / 图包装器 / worker 逐站顶替成昇腾实现；
 - 横切其间的是 `AscendDeviceType` / `is_310p` 这条设备分代线。
 
-我们在路上埋了两颗将来要回收的种子：general_plugins 触发的 `adapt_patch` 两段式 monkey-patch，是 [第 3 章](../ch03-two-phase-monkey-patch/narrative/chapter.md) 的主题；`check_and_update_config` 那套完整的配置改写，留给 [第 5 章](../ch05-check-and-update-config/narrative/chapter.md)。
+我们在路上埋了两颗将来要回收的种子：general_plugins 触发的 `adapt_patch` 两段式 monkey-patch，是 [第 3 章](../ch03-two-stage-monkey-patch/narrative/chapter.md) 的主题；`check_and_update_config` 那套完整的配置改写，留给 [第 5 章](../ch05-check-and-update-config/narrative/chapter.md)。
 
 下一章我们就顺着 `adapt_patch` 往里走——看 vllm-ascend 在「选中平台」之后，如何用 monkey-patch 把 vLLM 内部那些在昇腾上跑不动、跑不快的函数，一段一段地换掉。
