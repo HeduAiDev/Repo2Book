@@ -564,6 +564,6 @@ if hasattr(model_config_module, "is_cumem_allocator_available"):
 - **移植 = 同构换符号**：`camem.py` 与 vLLM `cumem.py` 类、方法、控制流逐行对位，只换 `cudart → acl.rt`、`cumem_allocator → vllm_ascend_C`、`torch.cuda.* → torch.npu.*`。唯一「换而非改名」的是 `acl.rt.memcpy` 多了 `destMax` 上界和显式方向枚举。
 - **接入**：`patch_camem_allocator.py` 用 `hasattr` 守护为上游未来版本预埋 fallback，但在当前 base 上是 no-op；真正放行靠 `NPUPlatform.is_sleep_mode_available()`。
 
-[上一章 pyhccl 那条线](../ch06-npu-communicator/narrative/chapter.md#63-手写-pyhccl把-pynccl-的-ctypes-范式逐符号移植)埋下的伏笔，这一章也顺手收了一半。它示范了「纯 ctypes 直接绑 `.so`、不写 C++ 扩展」的范式；本章的 camem 走的是同一脉络的另一支——靠 `from acl.rt import memcpy`、`from vllm_ascend.vllm_ascend_C import ...` 这类对底层库的薄封装，把 CANN 的虚拟内存原语接进 Python。显存与分配器这条线，已经用上了上一章那套 ctypes 绑定范式——伏笔回收了一半。而 custom all-reduce 与图捕获那一支（它顺带挂着的 `ca_comm = None`）还悬着，要等图捕获线推进时再揭。
+[上一章 pyhccl 那条线](../ch06-npu-communicator/narrative/chapter.md#63-手写-pyhccl把-pynccl-的-ctypes-范式逐符号移植)埋下的伏笔，这一章也顺手收了一半。两者的**共性**是同一个套路：把厂商的底层库薄薄封装一层、接进 Python。但**手法其实相反**——pyhccl 走的是「纯 ctypes、不编译一行 C++」直接绑 `.so`；camem 反过来，核心虚拟内存原语 `create_and_map`、`unmap_and_release` 走的是**编译出来的 C 扩展** `from vllm_ascend.vllm_ascend_C import ...`（外加用 `.so` 的 `dlopen` 给 `NPUPluggableAllocator` 拿符号、`acl.rt` 的 pybind 绑定）。所以被 camem 用上的，是「薄封装厂商原语、接进 Python」这层范式，而不是 pyhccl 那套「纯 ctypes」手法——这两支恰好站在对立面。无论如何，「薄封装」这层意思落了地，伏笔回收一半。而 custom all-reduce 与图捕获那一支（它顺带挂着的 `ca_comm = None`）还悬着，要等图捕获线推进时再揭。
 
 下一章离开显存底座，转向昇腾的并行与 KV 解耦。
