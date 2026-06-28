@@ -1,0 +1,226 @@
+{
+  "chapter_id": "ch02",
+  "title": "插件如何被 vLLM 发现并顶替：entry points 与 NPUPlatform",
+  "one_line": "讲清 vllm-ascend 这个 OOT 平台插件如何在不改 vLLM 一行源码的前提下，经 setuptools entry points 被发现、经 resolve_current_platform_cls_qualname 优先于 builtin 被激活、经 current_platform 懒加载实例化；NPUPlatform 用身份替换类属性 + 一批返回 qualname 字符串的工厂钩子把昇腾类名顶替进每一站；AscendDeviceType/310P 作为横切线索点出。",
+
+  "code_spine": [
+    "setup.py:L540-L548  —— 安装期声明两个 entry-point 组：vllm.platform_plugins(1 个 register) + vllm.general_plugins(4 个回调)",
+    "vllm/plugins/__init__.py:L28-L66  —— load_plugins_by_group：用 importlib.metadata.entry_points 发现并 plugin.load() 出回调函数（注意只 load entry-point 目标函数，不调用它）",
+    "vllm/platforms/__init__.py:L203-L252  —— resolve_current_platform_cls_qualname：把 builtin(cuda/rocm/tpu/xpu/cpu) 与 OOT 插件链在一起逐个调用 func()，谁返回非 None 谁“激活”，OOT 命中则优先于 builtin",
+    "vllm_ascend/__init__.py:L40-L43  —— register()：被 func() 调用，只 return 字符串 \"vllm_ascend.platform.NPUPlatform\"，故意不 import（不触发 torch_npu 初始化）",
+    "vllm/platforms/__init__.py:L262-L281  —— __getattr__('current_platform')：首次访问时懒加载，resolve_current_platform_cls_qualname() → resolve_obj_by_qualname()() 实例化单例",
+    "vllm/utils/import_utils.py:L104-L110  —— resolve_obj_by_qualname：rsplit('.',1) → import_module → getattr，把 qualname 字符串变成真正的类（这一刻才 import vllm_ascend.platform → torch_npu）",
+    "vllm_ascend/platform.py:L134-L151  —— NPUPlatform(Platform) 身份替换类属性：_enum=PlatformEnum.OOT、device_name/type=\"npu\"、dispatch_key=\"PrivateUse1\" …",
+    "vllm_ascend/platform.py:L739-L820  —— 一批返回 qualname 的工厂钩子：get_attn_backend_cls / get_device_communicator_cls / get_punica_wrapper / get_static_graph_wrapper_cls / get_compile_backend / get_pass_manager_cls",
+    "vllm_ascend/platform.py:L602-L612  —— check_and_update_config 内把 parallel_config.worker_cls 从 'auto' 改写成 NPUWorker 的 qualname（按设备分代分流）",
+    "vllm_ascend/utils.py:L768-L816 + L122-L123  —— AscendDeviceType 枚举 + 懒加载检测 + is_310p()：横切的“设备分代”线索",
+    "vllm_ascend/__init__.py:L20-L37,L46-L75  —— vllm.general_plugins 4 个回调（register_connector/model_loader/service_profiling/model），先 _ensure_global_patch() 再各自注册（在 engine-core 子进程里生效）"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "setup.py",
+      "lines": "L540-L548",
+      "code": "    entry_points={\n        \"vllm.platform_plugins\": [\"ascend = vllm_ascend:register\"],\n        \"vllm.general_plugins\": [\n            \"ascend_kv_connector = vllm_ascend:register_connector\",\n            \"ascend_model_loader = vllm_ascend:register_model_loader\",\n            \"ascend_service_profiling = vllm_ascend:register_service_profiling\",\n            \"ascend_model = vllm_ascend:register_model\",\n        ],\n    },",
+      "elide": ["setup() 的其余参数（packages/install_requires/ext_modules/cmdclass 等）与本章无关，只看 entry_points 这一项即可；它声明在 setup.py 的 setup(...) 调用里。"]
+    },
+    {
+      "path": "vllm_ascend/__init__.py",
+      "lines": "L40-L43",
+      "code": "def register():\n    \"\"\"Register the NPU platform.\"\"\"\n\n    return \"vllm_ascend.platform.NPUPlatform\"",
+      "elide": []
+    },
+    {
+      "path": "vllm/plugins/__init__.py",
+      "lines": "L28-L66",
+      "code": "def load_plugins_by_group(group: str) -> dict[str, Callable[[], Any]]:\n    \"\"\"Load plugins registered under the given entry point group.\"\"\"\n    from importlib.metadata import entry_points\n\n    allowed_plugins = envs.VLLM_PLUGINS\n\n    discovered_plugins = entry_points(group=group)\n    if len(discovered_plugins) == 0:\n        logger.debug(\"No plugins for group %s found.\", group)\n        return {}\n\n    plugins = dict[str, Callable[[], Any]]()\n    for plugin in discovered_plugins:\n        if allowed_plugins is None or plugin.name in allowed_plugins:\n            try:\n                func = plugin.load()\n                plugins[plugin.name] = func\n            except Exception:\n                logger.exception(\"Failed to load plugin %s\", plugin.name)\n\n    return plugins",
+      "elide": ["原文 L40-L52 一段纯日志（打印发现到的插件清单、是否受 VLLM_PLUGINS 过滤）已省略——不影响控制流。", "VLLM_PLUGINS 是一个可选白名单：为 None 时加载全部；非 None 时只加载名字在白名单里的插件。", "关键：plugin.load() 只把 entry-point 指向的对象（这里是 register 函数）导进来，并不调用它——调用发生在上层 resolve_current_platform_cls_qualname 的 func()。"]
+    },
+    {
+      "path": "vllm/platforms/__init__.py",
+      "lines": "L203-L252",
+      "code": "builtin_platform_plugins = {\n    \"tpu\": tpu_platform_plugin,\n    \"cuda\": cuda_platform_plugin,\n    \"rocm\": rocm_platform_plugin,\n    \"xpu\": xpu_platform_plugin,\n    \"cpu\": cpu_platform_plugin,\n}\n\n\ndef resolve_current_platform_cls_qualname() -> str:\n    platform_plugins = load_plugins_by_group(PLATFORM_PLUGINS_GROUP)\n\n    activated_plugins = []\n\n    for name, func in chain(builtin_platform_plugins.items(), platform_plugins.items()):\n        try:\n            assert callable(func)\n            platform_cls_qualname = func()\n            if platform_cls_qualname is not None:\n                activated_plugins.append(name)\n        except Exception:\n            pass\n\n    activated_builtin_plugins = list(\n        set(activated_plugins) & set(builtin_platform_plugins.keys())\n    )\n    activated_oot_plugins = list(set(activated_plugins) & set(platform_plugins.keys()))\n\n    if len(activated_oot_plugins) >= 2:\n        raise RuntimeError(\n            \"Only one platform plugin can be activated, but got: \"\n            f\"{activated_oot_plugins}\"\n        )\n    elif len(activated_oot_plugins) == 1:\n        platform_cls_qualname = platform_plugins[activated_oot_plugins[0]]()\n        logger.info(\"Platform plugin %s is activated\", activated_oot_plugins[0])\n    elif len(activated_builtin_plugins) >= 2:\n        raise RuntimeError(\n            \"Only one platform plugin can be activated, but got: \"\n            f\"{activated_builtin_plugins}\"\n        )\n    elif len(activated_builtin_plugins) == 1:\n        platform_cls_qualname = builtin_platform_plugins[activated_builtin_plugins[0]]()\n        logger.debug(\n            \"Automatically detected platform %s.\", activated_builtin_plugins[0]\n        )\n    else:\n        platform_cls_qualname = \"vllm.platforms.interface.UnspecifiedPlatform\"\n        logger.debug(\"No platform detected, vLLM is running on UnspecifiedPlatform\")\n    return platform_cls_qualname",
+      "elide": ["builtin 的 5 个 *_platform_plugin 函数体在别处定义（见下方 cuda_platform_plugin 片段为代表）；它们各自做“硬件是否在场”的探测，在场返回 qualname 字符串、不在场返回 None。", "关键控制流：把 builtin 与 OOT 用 chain() 串成一个循环，逐个 func() 收集“激活者”；随后用集合交集把激活者分成 builtin 一组、OOT 一组；分支判定里 OOT 一组被先判（elif 链最前），所以同时激活时 OOT 顶替 builtin。"]
+    },
+    {
+      "path": "vllm/platforms/__init__.py",
+      "lines": "L60-L57(节选)",
+      "code": "def cuda_platform_plugin() -> str | None:\n    is_cuda = False\n    ...\n        if is_cuda:\n            logger.debug(\"Confirmed CUDA platform is available.\")\n    ...\n    return \"vllm.platforms.cuda.CudaPlatform\" if is_cuda else None",
+      "elide": ["完整函数 L60-L113：用 pynvml 探测是否有 GPU、并排除 cpu build 等边界。本章只需对照它的“形态”——builtin 插件的探测函数会真去问硬件，在场才返回 qualname、否则返回 None。这正是 OOT register() 的反面：register() 无条件返回 qualname（永远“激活”），把决定权交给“是否装了 vllm-ascend”。", "代码中 ... 表示省略的探测细节（pynvml 初始化/Jetson 分支等，原文 L60-L107）；首行签名与末行 return（vllm/platforms/__init__.py:L108）为逐字，仅中间探测体被 ... 略去。writer 内嵌时建议要么补全为完整函数、要么只引用末行 return 那一句作对照。"]
+    },
+    {
+      "path": "vllm/platforms/__init__.py",
+      "lines": "L262-L281",
+      "code": "def __getattr__(name: str):\n    if name == \"current_platform\":\n        # lazy init current_platform.\n        # 1. out-of-tree platform plugins need `from vllm.platforms import\n        #    Platform` so that they can inherit `Platform` class. Therefore,\n        #    we cannot resolve `current_platform` during the import of\n        #    `vllm.platforms`.\n        # 2. when users use out-of-tree platform plugins, they might run\n        #    `import vllm`, some vllm internal code might access\n        #    `current_platform` during the import, and we need to make sure\n        #    `current_platform` is only resolved after the plugins are loaded\n        #    (we have tests for this, if any developer violate this, they will\n        #    see the test failures).\n        global _current_platform\n        if _current_platform is None:\n            platform_cls_qualname = resolve_current_platform_cls_qualname()\n            _current_platform = resolve_obj_by_qualname(platform_cls_qualname)()\n            global _init_trace\n            _init_trace = \"\".join(traceback.format_stack())\n        return _current_platform",
+      "elide": ["这是模块级 __getattr__（PEP 562），仅当属性名是 current_platform 时拦截；其余分支（elif name in globals() / else raise）已省略。", "懒加载语义：第一次有人读 vllm.platforms.current_platform 才触发解析；之后缓存在模块级 _current_platform 单例里。原文注释逐字保留，因为它正是‘为何 register 不能 import / 为何要懒加载’的官方解释。"]
+    },
+    {
+      "path": "vllm/utils/import_utils.py",
+      "lines": "L104-L110",
+      "code": "def resolve_obj_by_qualname(qualname: str) -> Any:\n    \"\"\"\n    Resolve an object by its fully-qualified class name.\n    \"\"\"\n    module_name, obj_name = qualname.rsplit(\".\", 1)\n    module = importlib.import_module(module_name)\n    return getattr(module, obj_name)",
+      "elide": ["就是把 \"vllm_ascend.platform.NPUPlatform\" 这种字符串切成 (模块, 类名)，import 该模块、取出类对象。register() 推迟的那次 import 真正发生在这里——此刻才会 import vllm_ascend.platform，连带 import torch_npu。"]
+    },
+    {
+      "path": "vllm/platforms/interface.py",
+      "lines": "L38-L47",
+      "code": "class PlatformEnum(enum.Enum):\n    \"\"\"Enumeration of supported hardware platforms.\"\"\"\n\n    CUDA = enum.auto()\n    ROCM = enum.auto()\n    TPU = enum.auto()\n    XPU = enum.auto()\n    CPU = enum.auto()\n    OOT = enum.auto()\n    UNSPECIFIED = enum.auto()",
+      "elide": ["OOT = out-of-tree。NPUPlatform 把 _enum 设成 OOT；Platform 基类的 is_out_of_tree()（interface.py:L178-L179）即 `return self._enum == PlatformEnum.OOT`。"]
+    },
+    {
+      "path": "vllm_ascend/platform.py",
+      "lines": "L134-L151",
+      "code": "class NPUPlatform(Platform):\n    _enum = PlatformEnum.OOT\n    device_name: str = \"npu\"\n    device_type: str = \"npu\"\n    simple_compile_backend: str = \"eager\"  # Disable torch.compile()\n    ray_device_key: str = \"NPU\"\n    device_control_env_var: str = \"ASCEND_RT_VISIBLE_DEVICES\"\n    ray_noset_device_env_vars: list[str] = [\n        \"RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES\",\n    ]\n    dispatch_key: str = \"PrivateUse1\"\n\n    supported_quantization: list[str] = [\n        ASCEND_QUANTIZATION_METHOD,\n        COMPRESSED_TENSORS_METHOD,\n        FP8_METHOD,\n        \"deepseek_v4_fp8\",\n    ]",
+      "elide": ["这些是“身份替换类属性”——NPUPlatform 继承 vLLM 的 Platform，靠覆盖类属性把“我是什么设备/用哪个环境变量选卡/PyTorch 用哪个 dispatch key”改成昇腾的答案。dispatch_key=\"PrivateUse1\" 是 PyTorch 给外部后端预留的派发键，torch_npu 把 NPU 注册在这个键上。ASCEND_QUANTIZATION_METHOD 等常量来自 vllm_ascend/utils.py（=\"ascend\" 等）。"]
+    },
+    {
+      "path": "vllm_ascend/platform.py",
+      "lines": "L803-L820",
+      "code": "    @classmethod\n    def get_device_communicator_cls(cls) -> str:\n        return \"vllm_ascend.distributed.device_communicators.npu_communicator.NPUCommunicator\"\n\n    @classmethod\n    def is_pin_memory_available(cls):\n        return True\n\n    @classmethod\n    def opaque_attention_op(cls) -> bool:\n        return True\n\n    @classmethod\n    def get_static_graph_wrapper_cls(cls) -> str:\n        \"\"\"\n        Get piecewise backend class for piecewise graph.\n        \"\"\"\n        return \"vllm_ascend.compilation.acl_graph.ACLGraphWrapper\"  # noqa",
+      "elide": ["这是“返回 qualname 的工厂钩子”家族的代表：vLLM 引擎在需要通信器/图包装器/punica/compile-backend 时不直接 new，而是问 current_platform 要一个 qualname 字符串，再用 resolve_obj_by_qualname 解析——和平台选择同一招。对照 vLLM 基类默认值 get_device_communicator_cls 返回 \"vllm.distributed.device_communicators.base_device_communicator.DeviceCommunicatorBase\"（interface.py:L770-L774）。"]
+    },
+    {
+      "path": "vllm_ascend/platform.py",
+      "lines": "L794-L796 + L165-L179",
+      "code": "    @classmethod\n    def get_punica_wrapper(cls) -> str:\n        return \"vllm_ascend.lora.punica_npu.PunicaWrapperNPU\"\n\n    @classmethod\n    def get_pass_manager_cls(cls) -> str:\n        return \"vllm_ascend.compilation.graph_fusion_pass_manager.GraphFusionPassManager\"\n\n    @classmethod\n    def get_compile_backend(self) -> str:\n        return \"vllm_ascend.compilation.compiler_interface.AscendCompiler\"",
+      "elide": ["原方法都带 docstring（已省略）。把这三个与 get_device_communicator_cls/get_static_graph_wrapper_cls 放在一起，是为了让读者看清“一批钩子全是同一形态：返回一个 vllm_ascend.* 的 qualname 字符串”。"]
+    },
+    {
+      "path": "vllm_ascend/platform.py",
+      "lines": "L739-L765",
+      "code": "    @classmethod\n    def get_attn_backend_cls(cls, selected_backend, attn_selector_config, num_heads: int | None = None):\n        use_compress = getattr(attn_selector_config, \"use_compress\", False)\n        key = (attn_selector_config.use_mla, attn_selector_config.use_sparse)\n\n        if selected_backend == AttentionBackendEnum.FLASH_ATTN and cls._validate_fa3_backend(key, attn_selector_config):\n            return \"vllm_ascend.attention.fa3_v1.AscendFABackend\"\n\n        backend_map = {\n            (True, False, False): \"vllm_ascend.attention.mla_v1.AscendMLABackend\",\n            (False, False, False): \"vllm_ascend.attention.attention_v1.AscendAttentionBackend\",\n            (True, True, False): \"vllm_ascend.attention.sfa_v1.AscendSFABackend\",\n            (True, False, True): \"vllm_ascend.attention.dsa_v1.AscendDSABackend\",\n        }\n        backend_map_310 = {\n            (\n                False,\n                False,\n            ): \"vllm_ascend._310p.attention.attention_v1.AscendAttentionBackend310\",\n        }\n\n        if is_310p():\n            return backend_map_310.get(key, backend_map_310[(False, False)])\n\n        return backend_map[(attn_selector_config.use_mla, attn_selector_config.use_sparse, use_compress)]",
+      "elide": ["原文 backend_map_310 内有两行 TODO 注释（说明 MLA/SFA 的 310P 实现待补）已省略。", "这是“带条件分发”的工厂钩子：按 (use_mla, use_sparse[, use_compress]) 这把 key 选不同的昇腾 attention backend qualname；FA3 是训推一致场景下的特例（先经 _validate_fa3_backend 校验）；310P（推理卡）走独立的 backend_map_310。注意非-310P 分支的查表用 3 元组 key（含 use_compress），310P 分支用 2 元组 key——这是 310P 横切线索的一个落点。"]
+    },
+    {
+      "path": "vllm_ascend/platform.py",
+      "lines": "L602-L612",
+      "code": "        if parallel_config and parallel_config.worker_cls == \"auto\":\n            # TODO: this is a tricky way to disable `use_sequence_parallel_moe` in vllm.\n            if not vllm_config.compilation_config.pass_config.enable_sp:\n                parallel_config.all2all_backend = \"flashinfer_all2allv\"\n            if is_310p():\n                parallel_config.worker_cls = \"vllm_ascend._310p.worker_310p.NPUWorker310\"\n            elif ascend_config.xlite_graph_config.enabled:\n                logger.info(\"openEuler Xlite enabled. See: https://atomgit.com/openeuler/GVirt/tree/master/xlite\")\n                parallel_config.worker_cls = \"vllm_ascend.xlite.xlite_worker.XliteWorker\"\n            else:\n                parallel_config.worker_cls = \"vllm_ascend.worker.worker.NPUWorker\"",
+      "elide": ["这段位于 check_and_update_config 方法体中部（该方法整体在 ch10/config 章深讲，本章只取 worker_cls 这一处）。worker_cls 不是 get_*_cls 钩子，而是平台直接把 parallel_config.worker_cls 这个字符串字段从 'auto' 改写成具体 NPUWorker 的 qualname——同样是“写 qualname 字符串、推迟 import”的招式，但落点在 config 而非工厂方法。按设备分代分流：310P→NPUWorker310、Xlite 图模式→XliteWorker、默认→NPUWorker。", "ascend_config 在方法前部由 init_ascend_config(vllm_config) 得到（见 L437），本章不展开。"]
+    },
+    {
+      "path": "vllm_ascend/utils.py",
+      "lines": "L768-L816",
+      "code": "class AscendDeviceType(Enum):\n    A2 = 0\n    A3 = 1\n    _310P = 2\n    A5 = 3\n\n\n_ascend_device_type = None\n\n\ndef _init_ascend_device_type():\n    global _ascend_device_type\n    from vllm_ascend import _build_info  # type: ignore\n\n    device_type = getattr(_build_info, \"__device_type__\", None)\n    if device_type is None:\n        soc_version = getattr(_build_info, \"__soc_version__\", \"ASCEND910B1\").upper()\n        device_type = \"_310P\" if \"310P\" in soc_version else \"A2\"\n    _ascend_device_type = AscendDeviceType[device_type]\n\n\ndef check_ascend_device_type():\n    global _ascend_device_type\n    if _ascend_device_type is None:\n        _init_ascend_device_type()\n\n    soc_version = torch_npu.npu.get_soc_version()\n    if 220 <= soc_version <= 225:\n        cur_device_type = AscendDeviceType.A2\n    elif 250 <= soc_version <= 255:\n        cur_device_type = AscendDeviceType.A3\n    elif 200 <= soc_version <= 205:\n        cur_device_type = AscendDeviceType._310P\n    elif soc_version == 260:\n        cur_device_type = AscendDeviceType.A5\n    else:\n        raise RuntimeError(f\"Can not support soc_version: {soc_version}.\")\n\n    assert _ascend_device_type == cur_device_type, (\n        f\"Current device type: {cur_device_type} does not match the installed version's device type: \"\n        f\"{_ascend_device_type}, please check your installation package.\"\n    )\n\n\ndef get_ascend_device_type():\n    global _ascend_device_type\n    if _ascend_device_type is None:\n        _init_ascend_device_type()\n    return _ascend_device_type",
+      "elide": ["设备分代是横切线索：A2/A3/A5 是训练-推理一体卡的几代，_310P 是纯推理卡（能力受限，自带 _310p/ 子包另写实现）。", "_init_ascend_device_type 是‘构建期烙印’：从打包时写入的 vllm_ascend._build_info（__device_type__ / __soc_version__）读出本安装包面向哪一代，缺省回退 A2(ASCEND910B1)。check_ascend_device_type 则是‘运行期复核’：用 torch_npu 真问硬件 soc_version，与安装包烙印不符就 assert 报错（防止 310P 包跑在 910 上之类）。get_ascend_device_type 是带 _ascend_device_type 模块级缓存的懒加载入口——is_310p() 等便利函数都建在它之上。"]
+    },
+    {
+      "path": "vllm_ascend/utils.py",
+      "lines": "L122-L123",
+      "code": "def is_310p():\n    return get_ascend_device_type() == AscendDeviceType._310P",
+      "elide": ["全代码库到处用 is_310p() 做分支（platform.py 里就有 worker_cls 选择、custom_ops 开关、attention backend 选择等多处）——它是‘设备分代’横切关注点最常见的入口。"]
+    },
+    {
+      "path": "vllm_ascend/__init__.py",
+      "lines": "L20-L75",
+      "code": "_GLOBAL_PATCH_APPLIED = False\n\n\ndef _ensure_global_patch():\n    \"\"\"Apply process-wide vLLM patches before engine-core initialization.\n\n    vLLM loads general plugins in engine-core subprocesses. E2E test\n    conftest hooks do not run there, so global patches that affect scheduler\n    and engine code must also be applied through these plugin entry points.\n    \"\"\"\n    global _GLOBAL_PATCH_APPLIED\n    if _GLOBAL_PATCH_APPLIED:\n        return\n\n    from vllm_ascend.utils import adapt_patch\n\n    adapt_patch(is_global_patch=True)\n    _GLOBAL_PATCH_APPLIED = True\n\n\ndef register():\n    \"\"\"Register the NPU platform.\"\"\"\n\n    return \"vllm_ascend.platform.NPUPlatform\"\n\n\ndef register_connector():\n    _ensure_global_patch()\n\n    from vllm_ascend.distributed.kv_transfer import register_connector\n\n    register_connector()\n\n\ndef register_model_loader():\n    _ensure_global_patch()\n\n    from .model_loader.netloader import register_netloader\n    from .model_loader.rfork import register_rforkloader\n\n    register_netloader()\n    register_rforkloader()\n\n\ndef register_service_profiling():\n    _ensure_global_patch()\n\n    from .profiling_config import generate_service_profiling_config\n\n    generate_service_profiling_config()\n\n\ndef register_model():\n    from .models import register_model\n\n    register_model()",
+      "elide": ["文件顶部 `import vllm_ascend.logger` 已省略。", "对比两组 entry point 的‘回调时机/副作用’差异：platform_plugins 的 register() 是纯函数（只返回字符串、零副作用），因为它在‘平台选择’这个极早期阶段被调用，此刻还不该 import torch_npu；general_plugins 的 4 个 register_* 由 vLLM 的 load_general_plugins() 在 engine-core 子进程里 func() 调用，是有副作用的真注册（注册 KV connector / model loader / 模型 / profiling 配置），且每个都先 _ensure_global_patch() 保证 platform 段 monkey-patch 在子进程也被打上（幂等，靠 _GLOBAL_PATCH_APPLIED 标志位）。adapt_patch 的两段式（platform/worker）是 ch03 的主题，本章只点出 register_* 会触发 platform 段。"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "NPUPlatform", "file": "vllm_ascend/platform.py", "responsibility": "继承 vLLM Platform 的 OOT 平台类（_enum=PlatformEnum.OOT）。两件事：(1) 用身份替换类属性宣告‘我是 npu 设备’；(2) 用一批 classmethod 工厂钩子返回 vllm_ascend.* 的 qualname 字符串，把 attention/communicator/worker/compile 等的具体类顶替成昇腾实现。是运行期分发的总台。"},
+    {"name": "Platform / PlatformEnum", "file": "vllm/platforms/interface.py", "responsibility": "vLLM 侧平台抽象基类与平台枚举。NPUPlatform 继承它、把 _enum 设为 OOT；基类给出所有 get_*_cls 钩子的 CUDA/通用默认实现，子类逐一覆盖。is_out_of_tree() = (_enum==OOT)。"},
+    {"name": "register / register_connector / register_model_loader / register_service_profiling / register_model", "file": "vllm_ascend/__init__.py", "responsibility": "两组 entry point 的目标函数。register 是 platform_plugins 的纯回调（返回 NPUPlatform 的 qualname，不 import）；后 4 个是 general_plugins 的有副作用回调（在 engine-core 子进程里注册 connector/loader/model/profiling，先 _ensure_global_patch）。"},
+    {"name": "AscendDeviceType / get_ascend_device_type / is_310p", "file": "vllm_ascend/utils.py", "responsibility": "设备分代枚举(A2/A3/_310P/A5)与其懒加载检测/便利谓词。横切关注点：全代码库用 is_310p() 等在多处分流（worker_cls、attention backend、custom_ops…）。"},
+    {"name": "resolve_current_platform_cls_qualname / __getattr__(current_platform)", "file": "vllm/platforms/__init__.py", "responsibility": "vLLM 侧的平台选择 + 懒加载单例。前者把 builtin 与 OOT 插件链起来逐个调用、按‘OOT 优先’选出 qualname；后者在首次访问 current_platform 时解析并实例化单例。"},
+    {"name": "load_plugins_by_group", "file": "vllm/plugins/__init__.py", "responsibility": "用 importlib.metadata.entry_points 发现某 group 下的插件、plugin.load() 出回调函数（不调用）。受 VLLM_PLUGINS 白名单约束。"},
+    {"name": "resolve_obj_by_qualname", "file": "vllm/utils/import_utils.py", "responsibility": "把 qualname 字符串切成 (模块, 名)、import_module + getattr 取出真实类对象。‘推迟到此刻才发生的 import’的落点。"}
+  ],
+
+  "data_flow": [
+    "安装期：pip install vllm-ascend → setuptools 把 setup.py 的 entry_points 写进包元数据（vllm.platform_plugins / vllm.general_plugins 两组）。",
+    "平台选择期：vLLM 某处首次读 vllm.platforms.current_platform → 模块级 __getattr__ 命中 → resolve_current_platform_cls_qualname()。",
+    "vllm/platforms/__init__.py:resolve_current_platform_cls_qualname → load_plugins_by_group('vllm.platform_plugins') → importlib.metadata.entry_points 发现 'ascend' → plugin.load() 得到 vllm_ascend.register 函数（此处尚未 import vllm_ascend.platform/torch_npu）。",
+    "resolve_current_platform_cls_qualname → chain(builtin, oot) 逐个 func()：builtin 的 cuda/rocm/... 探测函数因 host 无对应硬件返回 None；oot 的 register() 无条件返回 'vllm_ascend.platform.NPUPlatform' → 'ascend' 进 activated_plugins。",
+    "resolve_current_platform_cls_qualname → 集合交集分出 activated_oot=['ascend']、activated_builtin=[...]；elif 链里 OOT 分支在最前 → 即便 builtin 也激活，OOT 优先 → 取 qualname 字符串。",
+    "vllm/platforms/__init__.py:__getattr__ → resolve_obj_by_qualname('vllm_ascend.platform.NPUPlatform') → import_module('vllm_ascend.platform')（**此刻才真 import**，连带 torch_npu）→ getattr 得 NPUPlatform 类 → NPUPlatform() 实例化 → 缓存进 _current_platform 单例。",
+    "运行期分发：vLLM 引擎各处问 current_platform 要类名，如 current_platform.get_attn_backend_cls(...) / get_device_communicator_cls() → 返回 vllm_ascend.* qualname → 再经 resolve_obj_by_qualname 解析成具体昇腾类。",
+    "配置改写期：vLLM 调 current_platform.check_and_update_config(vllm_config) → 内部把 parallel_config.worker_cls 从 'auto' 改写成 NPUWorker 的 qualname（按 is_310p()/xlite 分流）。",
+    "engine-core 子进程：vLLM load_general_plugins() → func() 调用 register_connector/register_model_loader/... → 各自先 _ensure_global_patch()（打 platform 段 patch，幂等）再注册 KV connector / model loader / model / profiling。"
+  ],
+
+  "design_decisions": [
+    {"decision": "register() 只返回 qualname 字符串、绝不 import NPUPlatform", "why": "平台选择发生在极早期（vLLM 刚启动、还在探测‘我在什么硬件上’）。若此刻就 import vllm_ascend.platform 会连带 import torch_npu、触发 NPU 运行时初始化——在还没确定该不该用昇腾、甚至 ASCEND_RT_VISIBLE_DEVICES 还没生效时就初始化是错误且有副作用的。返回字符串把真正的 import 推迟到 resolve_obj_by_qualname 真要实例化平台那一刻。", "evidence": "vllm_ascend/__init__.py:L40-L43 + vllm/utils/import_utils.py:L104-L110 + book/cartography/ARCHITECTURE.md:L25"},
+    {"decision": "OOT 平台插件优先于 builtin", "why": "用户既然装了 vllm-ascend，意图就是用昇腾顶替默认探测。resolve 把 activated 拆成 builtin/oot 两组，elif 链把 OOT 分支放最前，从而‘只要有 OOT 激活就用 OOT’，无需用户显式关掉 builtin。同时‘≥2 个 OOT 同时激活’会直接 RuntimeError，保证唯一平台。", "evidence": "vllm/platforms/__init__.py:L231-L238"},
+    {"decision": "builtin 探测函数‘问硬件’、OOT register()‘无条件激活’", "why": "builtin（cuda/rocm/tpu/xpu/cpu）必须靠运行时探测硬件是否在场（如 cuda_platform_plugin 用 pynvml 数 GPU），在场才返回 qualname；而 OOT 的‘是否在场’退化成‘是否装了这个插件包’——装了就一定想用，故 register() 无条件返回 qualname。两种‘激活’语义不同，但在 resolve 里统一成‘func() 返回非 None 即激活’。", "evidence": "vllm/platforms/__init__.py:L60-L113(cuda_platform_plugin) vs vllm_ascend/__init__.py:L40-L43(register)"},
+    {"decision": "current_platform 用模块级 __getattr__ 懒加载成单例", "why": "OOT 插件需要 `from vllm.platforms import Platform` 来继承基类，所以不能在 import vllm.platforms 时就解析 current_platform（会循环依赖/在插件装好前就解析）。懒加载保证‘只有真正第一次用到平台时、且插件已加载后’才解析，并缓存单例。源码注释逐字解释了这两点。", "evidence": "vllm/platforms/__init__.py:L262-L281(含注释)"},
+    {"decision": "平台用‘返回 qualname 字符串’的工厂钩子而非直接返回类对象", "why": "与 register 同一思路：让 vLLM 在需要时才 import 具体后端类，避免在平台层就把 attention/communicator/worker/compile 等一大批昇腾模块全 import 进来（其中不少依赖 torch_npu 或特定硬件）。统一经 resolve_obj_by_qualname 解析，延迟 import 也利于按 config/设备分代选不同实现。", "evidence": "vllm_ascend/platform.py:L739-L820 + interface.py:L770-L774(基类默认 qualname)"},
+    {"decision": "设备分代（AscendDeviceType）= 构建期烙印 + 运行期复核", "why": "昇腾卡分代（A2/A3/A5 训推一体、_310P 纯推理）能力差异大、甚至有独立子包(_310p/)。_init_ascend_device_type 从打包时写入的 _build_info 读出本包面向哪代（缺省 A2）；check_ascend_device_type 再用 torch_npu 真问硬件 soc_version 复核、不符即 assert 报错，防止‘装错包跑错卡’。is_310p() 等谓词据此在全库分流。", "evidence": "vllm_ascend/utils.py:L768-L816 + L122-L123"},
+    {"decision": "worker_cls 经 config 字段改写（'auto'→qualname）而非 get_worker_cls 钩子", "why": "vLLM 的 worker 类由 parallel_config.worker_cls 字符串字段承载（默认 'auto'）。平台在 check_and_update_config 里把它改写成昇腾 NPUWorker 的 qualname——落点在 config 而非工厂方法，但‘写 qualname、推迟 import’的招式与 get_*_cls 一致。按 is_310p()/xlite 分代/图模式分流到不同 worker。", "evidence": "vllm_ascend/platform.py:L602-L612"},
+    {"decision": "两组 entry point 分工：platform_plugins 选平台、general_plugins 在子进程注册扩展", "why": "platform 选择在主进程极早期、要纯无副作用（register 只返回字符串）；而 KV connector/model loader/自定义模型/profiling 这些注册需要在 engine-core 子进程里生效（vLLM 在子进程 load_general_plugins），故走 general_plugins，且每个回调先 _ensure_global_patch() 把 platform 段 monkey-patch 也补到子进程（E2E conftest 钩子不在子进程跑）。", "evidence": "vllm_ascend/__init__.py:L20-L75 + setup.py:L542-L547"}
+  ],
+
+  "theory": [
+    "‘qualname 间接层’的本质：把‘谁来实现 X’这件事从‘编译期 import 绑定’降级成‘运行期字符串解析’，换来三个好处——(1) 延迟 import（避免过早触发 torch_npu/硬件初始化）；(2) 可替换（OOT 插件无需改 vLLM 源码即可顶替）；(3) 可按 config/设备分代动态选实现。代价是失去静态类型检查与 import 期错误前移。整章可视作‘同一个延迟-绑定模式’在四个层面的复用：平台选择(register)、平台工厂钩子(get_*_cls)、worker_cls(config 字段)、attention backend 查表。",
+    "‘OOT 优先’的判定可形式化为：设 builtin 激活集 B、OOT 激活集 O，最终平台 P = O 非空时取 O（要求 |O|≤1，否则报错）；否则 B 非空取 B（|B|≤1）；否则 UnspecifiedPlatform。这是一个带唯一性约束的优先级选择，保证‘装了插件即顶替、且平台唯一’。",
+    "懒加载单例的时序正确性：current_platform 必须在‘插件已加载’之后、‘任何引擎代码用到平台’之时解析。__getattr__ 把解析点推迟到首次属性访问，等价于把‘平台确定’这件事放到尽可能晚但仍早于一切平台相关使用——这是延迟绑定在‘时序’维度的体现。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "load_plugins_by_group 里的全部 logging（L40-L52 的日志块、各 log_level 调用）", "why_safe": "纯诊断输出，不影响‘发现→load→返回 dict’的控制流；精简版可加一行 # SUBTRACTED 注明。"},
+      {"what": "cuda_platform_plugin 的完整探测实现（pynvml 初始化、jetson 边界、cpu-build 排除等）", "why_safe": "本章只需用它作为‘builtin 探测函数会问硬件、不在场返回 None’的对照形态；精简版用一个返回 None 的占位 builtin 探测即可表达‘OOT 优先 / builtin 不在场’，无需复刻 pynvml 细节（host 也无 GPU）。须 # SOURCE 指向 vllm/platforms/__init__.py:L60-L113 并标 # SUBTRACTED。"},
+      {"what": "resolve_current_platform_cls_qualname 里的 logger.info/debug 调用", "why_safe": "诊断输出，删后控制流（chain→func()→集合交集→elif 选择）完全不变。"},
+      {"what": "__getattr__ 里的 _init_trace = traceback.format_stack() 与 global _init_trace", "why_safe": "仅用于调试时回溯‘平台在哪被首次解析’，与懒加载-缓存-返回单例的核心语义无关。"},
+      {"what": "_ensure_global_patch 的 docstring 与 register_connector/model_loader/service_profiling/model 各自 import 的真实下游注册函数体（kv_transfer/netloader/rfork/profiling_config/models）", "why_safe": "本章只讲‘general_plugins 回调先 _ensure_global_patch 再各自注册’这个骨架与时机；具体注册了什么是后续章节主题。精简版保留 4 个函数签名 + _ensure_global_patch 调用 + 一行 # SUBTRACTED 说明下游，不复刻下游模块（它们依赖 torch_npu，host 跑不动）。"},
+      {"what": "NPUPlatform.check_and_update_config 中除 worker_cls 改写(L602-L612)外的全部方法体；set_additional_forward_context 整段；npu-smi/HBM/get_device_* 等需真硬件的方法体", "why_safe": "check_and_update_config 的配置改写全流程是 ch10/config 章主题；set_additional_forward_context、npu-smi 内存查询等都需真 NPU/CANN，host 无法跑、也非本章焦点。精简版只保留：类属性块、worker_cls 改写片段、以及一批 get_*_cls 钩子的 return 语句（纯字符串，可跑），其余 # SUBTRACTED 标注并指向源码行。"},
+      {"what": "get_attn_backend_cls 里的 _validate_fa3_backend 完整校验体（flash_attn_npu_v3 探测、import_module 等）", "why_safe": "FA3 是训推一致的特例分支，依赖外部包 flash_attn_npu_v3（host 无）。精简版保留 backend_map / backend_map_310 / is_310p 分流与 key 查表（这是本章要讲的‘按 key 分发’主干），把 _validate_fa3_backend 缩成返回 False 的占位并 # SUBTRACTED。"},
+      {"what": "AscendDeviceType 相关里的 check_ascend_device_type 的 torch_npu.npu.get_soc_version() 实参分支细节可保留为常量映射；is_950/A5、enable_sp 等无关谓词", "why_safe": "check_ascend_device_type 依赖 torch_npu（host 无），精简版可把‘运行期复核’缩为注释说明 + 保留 soc_version→AscendDeviceType 的区间映射表作为可读控制流；与本章焦点（构建期烙印 + 懒加载 get_ascend_device_type + is_310p 横切）无关的谓词删去。"}
+    ],
+    "must_keep": [
+      {"symbol": "register", "why": "本章核心：返回 qualname 字符串、不 import 的纯回调。"},
+      {"symbol": "vllm_ascend.platform.NPUPlatform", "why": "register 返回的 qualname 字符串字面量，读者要看到它就是‘字符串而非类’。"},
+      {"symbol": "resolve_current_platform_cls_qualname", "why": "平台选择主函数，OOT 优先逻辑所在。"},
+      {"symbol": "builtin_platform_plugins", "why": "builtin 字典，‘OOT vs builtin 两组’对照的载体。"},
+      {"symbol": "load_plugins_by_group", "why": "entry-point 发现机制；plugin.load() 不调用的关键点。"},
+      {"symbol": "resolve_obj_by_qualname", "why": "qualname→类对象解析；‘推迟的 import 在此发生’。"},
+      {"symbol": "current_platform", "why": "懒加载单例属性名；__getattr__ 的拦截目标。"},
+      {"symbol": "_current_platform", "why": "单例缓存变量，体现‘只解析一次’。"},
+      {"symbol": "PlatformEnum", "why": "平台枚举，OOT 成员的定义处。"},
+      {"symbol": "OOT", "why": "NPUPlatform._enum 的值；‘out-of-tree 优先’的身份标记。"},
+      {"symbol": "NPUPlatform", "why": "运行期分发总台类。"},
+      {"symbol": "device_name", "why": "身份替换类属性代表（=\"npu\"）。"},
+      {"symbol": "dispatch_key", "why": "身份替换类属性（=\"PrivateUse1\"，PyTorch 外部后端派发键）。"},
+      {"symbol": "get_attn_backend_cls", "why": "带条件分发的工厂钩子代表。"},
+      {"symbol": "get_device_communicator_cls", "why": "返回 qualname 的工厂钩子代表。"},
+      {"symbol": "get_punica_wrapper", "why": "工厂钩子家族成员，体现‘一批同形态钩子’。"},
+      {"symbol": "get_static_graph_wrapper_cls", "why": "工厂钩子家族成员。"},
+      {"symbol": "get_compile_backend", "why": "工厂钩子家族成员。"},
+      {"symbol": "worker_cls", "why": "经 config 字段改写的 qualname（'auto'→NPUWorker），与 get_*_cls 同招不同落点。"},
+      {"symbol": "AscendDeviceType", "why": "设备分代枚举，横切线索。"},
+      {"symbol": "get_ascend_device_type", "why": "分代懒加载入口（带缓存）。"},
+      {"symbol": "is_310p", "why": "横切谓词，全库分流入口。"},
+      {"symbol": "_ensure_global_patch", "why": "general_plugins 回调先打 platform 段 patch 的幂等钩子。"},
+      {"symbol": "register_connector", "why": "general_plugins 有副作用回调代表。"}
+    ]
+  },
+
+  "diagram_plan": [
+    {
+      "name": "two-phase-lifecycle",
+      "intent": "一张时序/分层图：安装期(setup.py entry_points 两组) → 平台选择期(load_plugins_by_group 发现 → resolve_current_platform_cls_qualname：builtin 探测返 None vs OOT register 返字符串 → OOT 优先) → 懒加载实例化(__getattr__ → resolve_obj_by_qualname 此刻才 import → NPUPlatform 单例) → 运行期分发(current_platform.get_*_cls → qualname → resolve → 昇腾类)。强调‘字符串一直在传、import 推迟到最后一刻’。",
+      "tool": "svg-diagram",
+      "notes": "三个泳道/阶段竖排；用不同色标出‘字符串态’与‘已 import 类对象态’的边界（resolve_obj_by_qualname 那条线）。"
+    },
+    {
+      "name": "oot-vs-builtin-selection",
+      "intent": "决策图：chain(builtin, oot) 逐个 func() → activated 集合 → 集合交集分两组 → elif 优先级（OOT≥2 报错 / OOT==1 取之 / builtin≥2 报错 / builtin==1 取之 / 否则 Unspecified）。",
+      "tool": "svg-diagram",
+      "notes": "把 host 场景标注：builtin 全返 None、ascend 返字符串 → 命中 OOT==1 分支。"
+    },
+    {
+      "name": "npuplatform-hooks-map",
+      "intent": "NPUPlatform 作为‘总台’的辐射图：中心 NPUPlatform，向外射出‘身份替换类属性’(device_name/dispatch_key/...) 与‘qualname 工厂钩子’(get_attn_backend_cls→Ascend*Backend / get_device_communicator_cls→NPUCommunicator / get_static_graph_wrapper_cls / worker_cls→NPUWorker)，每条边注明对照的 vLLM 基类默认值。设备分代(is_310p)作为横切虚线穿过 get_attn_backend_cls 与 worker_cls 两处。",
+      "tool": "svg-diagram",
+      "notes": "右侧标 vLLM 基类默认 qualname 作对照（如 DeviceCommunicatorBase）。"
+    },
+    {
+      "roadmap_highlight": "ch02 节点（三支柱之‘运行期分发’的入口：entry points + NPUPlatform 总台）；前接 ch01 鸟瞰，后接 ch03 两段式 monkey-patch 与 ch10 config 改写。复用 instances/vllm-ascend/book/assets/roadmap/roadmap.py。"
+    }
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recover": [],
+    "note": "scripts/bible.py due ch02 返回空（应埋/应回收均为空）。本章可主动埋两条供后续回收（建议，非强制）：(1) adapt_patch 的两段式 platform/worker patch → 在 ch03 monkey-patch 章展开回收；(2) check_and_update_config 的 config 改写全流程 → 在 ch10 config 章展开回收。这两处本章只点到为止。"
+  }
+}
