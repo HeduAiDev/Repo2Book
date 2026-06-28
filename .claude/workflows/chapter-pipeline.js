@@ -14,16 +14,16 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch07',
-  slug: 'ch07-sleep-mode-camem-allocator',
+  chapter_id: 'ch08',
+  slug: 'ch08-ascend-parallel-groups',
   instance: 'vllm-ascend',
-  focus: '显存底座：sleep-mode 与 CANN 虚拟内存分配器（camem）。device_allocator/camem.py（273 行）是 vLLM cumem_allocator / CuMemAllocator 的昇腾移植：基于 **CANN 虚拟内存**（vllm_ascend_C.python_create_and_map / unmap_and_release）实现可插拔 allocator，支撑 **sleep mode**——offload 权重 / 丢弃 KV 后**释放物理页**、唤醒再 map（虚拟地址不变、物理页可换）。主线：①讲清 sleep mode 要解决什么（推理空窗期把显存还给系统）+ 虚拟内存「保留虚拟地址、解绑/重绑物理页」的机制；②**逐行对照 vLLM cumem.py**——find_loaded_library / AllocationData / create_and_map / sleep / wake_up 与 vLLM 版几乎逐行同构，**仅 cudart→acl.rt、libcudart→vllm_ascend_C** 换符号，看清「移植 = 同构换符号」；③ patch/platform/patch_camem_allocator.py 怎么把它挂进 vLLM（技法 d 的 fallback 写法，点名复用 ch03 技法，别重讲）。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vLLM 书 ch17/ch33 + vllm/device_allocator/cumem.py（逐行对位的 GPU 原版）· vllm/config/model.py（sleep mode 配置面）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（allocator 类结构 / ctypes 绑定 / sleep-wake 状态机是纯 Python，可跑；实际虚拟内存映射不跑）】',
-  highlight: 'ch07',
+  focus: '在 vLLM 并行组之上：MC2 / 细粒度 TP / flashcomm 与上下文并行。init_ascend_model_parallel **不替换**而是**复用** vLLM 的 init_model_parallel_group / GroupCoordinator，在其上**额外叠一批昇腾专属组**——主线讲「加法式扩展」（区别于前面几章的 patch 重绑）：①**MC2**（matmul + 通信融合组）；②**细粒度 TP**（lm-head / o-proj / embedding / mlp 各自独立 TP 宽度，而非全局一个 TP）；③**flashcomm**（通信-计算重叠组）；④**_DYNAMIC_EPLB**（动态专家负载均衡组，前向引用 ch09，别展开）。讲透 **all_ranks 张量 reshape → 各组 rank 切分的排布代数**（哪几维代表什么、怎么切出每个组的 ranks、消费方是谁），用 1-2 个并行度组合做数值排布追踪。本章也是 **context-parallel（PCP/DCP）的归口**：attention 篇只引用 enable_cp() 运行期分流，**CP 组的排布在此讲清**。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vLLM 书 ch20 + vllm/distributed/parallel_state.py（基座 init_model_parallel_group / GroupCoordinator 抽象——昇腾在其上叠加而非替换，对照看「复用了哪些、加了哪些」）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（rank 排布代数 / reshape 切分是纯 Python，可跑；实际进程组通信不跑）】',
+  highlight: 'ch08',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm-ascend/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
   skip_impl: false,
-  paths: ['vllm_ascend/device_allocator/camem.py', 'vllm_ascend/patch/platform/patch_camem_allocator.py'],
+  paths: ['vllm_ascend/distributed/parallel_state.py', 'vllm_ascend/distributed/utils.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'

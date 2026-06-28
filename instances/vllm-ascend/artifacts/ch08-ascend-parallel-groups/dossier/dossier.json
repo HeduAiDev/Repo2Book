@@ -1,0 +1,262 @@
+{
+  "chapter_id": "ch08",
+  "title": "在 vLLM 并行组之上：MC2 / 细粒度 TP / flashcomm 与上下文并行",
+  "thesis": "init_ascend_model_parallel 是一次纯粹的『加法式扩展』：它不 patch、不重绑、不替换 vLLM 的任何并行组，而是复用 vLLM 的 init_model_parallel_group / GroupCoordinator 这套现成机制，在基座已经建好的 TP/PP/DP/PCP/DCP 之上，再额外算出一批昇腾专属组的 rank 排布并注册。全章主线是一道排布代数题：把 world ranks reshape 成多维网格 → 沿不同维度 transpose / reshape / slice → 切出每个组的 group_ranks。MC2、细粒度 TP、flashcomm2 各自沿不同维度切，消费方各不相同。CP 组（PCP/DCP）虽由基座创建，但其排布同样是这套 reshape 代数，本章作归口讲清；attention 篇只在运行期用 enable_cp() 分流。",
+  "code_spine": [
+    "vllm_ascend/worker/worker.py:L839-L848 — 初始化时序：先 init_distributed_environment(hccl) → ensure_model_parallel_initialized(基座建 TP/PP/PCP/DCP) → init_ascend_model_parallel(昇腾叠加组)",
+    "vllm_ascend/distributed/parallel_state.py:L9-L27 — 模块级全局：_MC2 / _MLP_TP / _OTP / _LMTP / _EMBED_TP / _FLASHCOMM2_OTP / _FLASHCOMM2_ODP / _FC3_QUANT_X / _SHARD_WEIGHT / _P_TP / _DYNAMIC_EPLB 全初始化为 None",
+    "vllm_ascend/distributed/parallel_state.py:L30-L52 — init_ascend_model_parallel 入口：幂等守护 + 取 world_size/backend + 读 4 个 size + all_ranks 5D reshape (ExternalDP, dp, pp, pcp, tp)",
+    "vllm_ascend/distributed/parallel_state.py:L54-L82 — (旁支)PD 分离的 _P_TP / alltoall 头复制组，本章可省略",
+    "vllm_ascend/distributed/parallel_state.py:L84-L108 — MC2(EP-like)组：all_ranks.transpose(1,2).reshape(-1, dp*pcp*tp).unbind(0)；_DYNAMIC_EPLB / _FC3_QUANT_X 复用同一 group_ranks",
+    "vllm_ascend/distributed/parallel_state.py:L110-L149 — 细粒度 TP：_create_or_get_group 用独立 rank_grid=reshape(pp,dp,tp)，沿 DP 维按 group_size 切块取列，建 _OTP/_LMTP/_EMBED_TP/_MLP_TP",
+    "vllm_ascend/distributed/parallel_state.py:L151-L189 — (旁支)flashcomm2_otp / flashcomm2_odp 组的双层循环排布",
+    "vllm_ascend/distributed/parallel_state.py:L191-L226 — (旁支)shard_weight 组",
+    "vllm_ascend/distributed/parallel_state.py:L229-L284 — model_parallel_initialized(以 _MC2 为哨兵) + 各 get_*_group 取用器",
+    "vllm/distributed/parallel_state.py:L1494-L1633 — 基座 initialize_model_parallel：同样的 all_ranks 5D reshape，建 _TP / _DCP / _PCP（CP 组排布归口）",
+    "vllm/distributed/parallel_state.py:L1159-L1174 — 基座 init_model_parallel_group：昇腾复用的工厂函数",
+    "vllm/distributed/parallel_state.py:L290-L317 — 基座 GroupCoordinator：昇腾复用的进程组包装类"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm_ascend/worker/worker.py",
+      "lines": "L839-L848",
+      "code": "        init_distributed_environment(\n            self.parallel_config.world_size, self.rank, self.distributed_init_method, self.local_rank, \"hccl\"\n        )\n        ensure_model_parallel_initialized(\n            self.parallel_config.tensor_parallel_size,\n            self.parallel_config.pipeline_parallel_size,\n            self.parallel_config.prefill_context_parallel_size,\n            self.parallel_config.decode_context_parallel_size,\n        )\n        init_ascend_model_parallel(self.parallel_config)",
+      "elide": ["前面的 init_batch_invariance()、后面的 ensure_ec_transfer_initialized() 与本章无关"],
+      "note": "时序证据：基座的 ensure_model_parallel_initialized() 先建好 TP/PP/PCP/DCP，昇腾的 init_ascend_model_parallel() 才在其上叠加。后者是『加法』，不动前者建的组。"
+    },
+    {
+      "path": "vllm_ascend/distributed/parallel_state.py",
+      "lines": "L1-L27",
+      "code": "import torch\nfrom vllm.config import ParallelConfig, get_current_vllm_config\nfrom vllm.distributed.parallel_state import GroupCoordinator, get_tp_group, get_world_group, init_model_parallel_group\n\nfrom vllm_ascend.ascend_config import get_ascend_config\nfrom vllm_ascend.utils import enable_dsa_cp_with_layer_shard, flashcomm2_enable\n\n# Currently, mc2 op need their own group coordinator.\n_MC2: GroupCoordinator | None = None\n\n# Module specific tensor parallel groups\n_MLP_TP: GroupCoordinator | None = None\n_OTP: GroupCoordinator | None = None\n_LMTP: GroupCoordinator | None = None\n_EMBED_TP: GroupCoordinator | None = None\n\n# flashcomm specific groups\n_FLASHCOMM2_OTP: GroupCoordinator | None = None\n_FLASHCOMM2_ODP: GroupCoordinator | None = None\n_FC3_QUANT_X: GroupCoordinator | None = None\n\n# shard_weight across rank groups\n_SHARD_WEIGHT: GroupCoordinator | None = None\n\n_P_TP: GroupCoordinator | None = None\n\n_DYNAMIC_EPLB: GroupCoordinator | None = None",
+      "elide": [],
+      "note": "关键证据：import 行直接从 vllm.distributed.parallel_state 拿 GroupCoordinator / init_model_parallel_group / get_tp_group / get_world_group——『复用基座机制』的字面证据。每个 _XXX 全局都是一个 GroupCoordinator（与基座 _TP/_PCP 同类型），module-level 单例 + None 哨兵。"
+    },
+    {
+      "path": "vllm_ascend/distributed/parallel_state.py",
+      "lines": "L30-L52",
+      "code": "def init_ascend_model_parallel(\n    parallel_config: ParallelConfig,\n):\n    if model_parallel_initialized():\n        return\n    assert torch.distributed.is_initialized()\n    world_size = torch.distributed.get_world_size()\n    backend = torch.distributed.get_backend(get_world_group().device_group)\n    global_tp_size = parallel_config.tensor_parallel_size\n    global_dp_size = parallel_config.data_parallel_size\n    global_pp_size = parallel_config.pipeline_parallel_size\n    global_pcp_size = parallel_config.prefill_context_parallel_size\n\n    # The layout of all ranks: ExternalDP * EP\n    # ExternalDP is the data parallel group that is not part of the model,\n    # every dp rank can generate independently (in verl integration).\n    all_ranks = torch.arange(world_size).reshape(\n        -1,\n        global_dp_size,\n        global_pp_size,\n        global_pcp_size,\n        global_tp_size,\n    )",
+      "elide": [],
+      "note": "核心：(1) model_parallel_initialized() 幂等守护（哨兵是 _MC2）；(2) backend 直接复用 world group 的 backend（hccl）；(3) all_ranks 是 5D 网格 (ExternalDP, dp, pp, pcp, tp)——所有后续组都从这一张网格 reshape/transpose/slice 切出。注意这里把 pcp 显式留作一维：即便开了上下文并行，昇腾的组也能正确切分。-1 那一维是 ExternalDP（verl 集成里每个 dp rank 可独立 generate）。"
+    },
+    {
+      "path": "vllm_ascend/distributed/parallel_state.py",
+      "lines": "L84-L108",
+      "code": "    # EP like group ranks\n    group_ranks = (\n        all_ranks.transpose(1, 2)\n        .reshape(\n            -1,\n            global_dp_size * global_pcp_size * global_tp_size,\n        )\n        .unbind(0)\n    )\n    group_ranks = [x.tolist() for x in group_ranks]\n\n    global _MC2\n    _MC2 = init_model_parallel_group(group_ranks, get_world_group().local_rank, backend, group_name=\"mc2\")\n\n    if get_ascend_config().eplb_config.dynamic_eplb:\n        global _DYNAMIC_EPLB\n        _DYNAMIC_EPLB = init_model_parallel_group(\n            group_ranks, get_world_group().local_rank, backend, group_name=\"dynamic_eplb\"\n        )\n\n    if get_ascend_config().multistream_overlap_gate:\n        global _FC3_QUANT_X\n        _FC3_QUANT_X = init_model_parallel_group(\n            group_ranks, get_world_group().local_rank, backend, group_name=\"fc3_quant_x\"\n        )",
+      "elide": [],
+      "note": "MC2 = EP-like 组。排布代数：all_ranks(ExternalDP,dp,pp,pcp,tp).transpose(1,2) → (ExternalDP,pp,dp,pcp,tp)，再 reshape(-1, dp*pcp*tp) → 把同一 (ExternalDP,pp) 切片下的 dp×pcp×tp 全部 rank 收成一个组，unbind 成组列表。语义：MC2 组 = 一个 expert-parallel 域（跨 dp 与 tp，因为 MoE 专家分布在 dp×tp 上）。_DYNAMIC_EPLB（ch09 前向引用，本章不展开）与 _FC3_QUANT_X（flashcomm3 量化 all-gather）复用同一份 group_ranks——三者拓扑相同、只是各建独立 GroupCoordinator。_MC2 同时是 model_parallel_initialized() 的哨兵，所以它必须最先建且无条件建。消费方：ops/fused_moe/token_dispatcher.py、quantization/methods/{w4a8,w8a8_dynamic}.py 取 get_mc2_group().device_group。"
+    },
+    {
+      "path": "vllm_ascend/distributed/parallel_state.py",
+      "lines": "L110-L149",
+      "code": "    # Initialize fine-grained TP process groups on Ascend for four components:\n    # 1. LM Head: output logits projection (`lmhead_tensor_parallel_size`)\n    # 2. O Proj: attention output projection (`oproj_tensor_parallel_size`)\n    # 3. Embedding: The token embedding table at the input of the model (`embedding_tensor_parallel_size`)\n    # 4. MLP: feed-forward network in transformer blocks (`mlp_tensor_parallel_size`)\n    _group_cache = {}\n\n    def _create_or_get_group(group_size: int, group_name: str) -> GroupCoordinator:\n        if group_size is None:\n            return None\n        if group_size not in _group_cache:\n            rank_grid = torch.arange(world_size).reshape(global_pp_size, global_dp_size, global_tp_size)\n            num_chunks = global_dp_size // group_size\n            group_ranks = []\n            for pp_idx in range(global_pp_size):\n                stage_ranks = rank_grid[pp_idx]  # (dp, tp)\n                for chunk in range(num_chunks):\n                    for tp_idx in range(global_tp_size):\n                        group = stage_ranks[chunk * group_size : (chunk + 1) * group_size, tp_idx].tolist()\n                        group_ranks.append(group)\n            pg = init_model_parallel_group(group_ranks, get_world_group().local_rank, backend, group_name=group_name)\n            _group_cache[group_size] = pg\n\n        return _group_cache[group_size]\n\n    otp_size = get_ascend_config().finegrained_tp_config.oproj_tensor_parallel_size\n    lmhead_tp_size = get_ascend_config().finegrained_tp_config.lmhead_tensor_parallel_size\n    embedding_tp_size = get_ascend_config().finegrained_tp_config.embedding_tensor_parallel_size\n    mlp_tp_size = get_ascend_config().finegrained_tp_config.mlp_tensor_parallel_size\n\n    global _OTP, _LMTP, _EMBED_TP, _MLP_TP\n\n    if otp_size > 0:\n        _OTP = _create_or_get_group(otp_size, \"otp\")\n    if lmhead_tp_size > 0:\n        _LMTP = _create_or_get_group(lmhead_tp_size, \"lmheadtp\")\n    if embedding_tp_size > 0:\n        _EMBED_TP = _create_or_get_group(embedding_tp_size, \"emtp\")\n    if mlp_tp_size > 0:\n        _MLP_TP = _create_or_get_group(mlp_tp_size, \"mlptp\")",
+      "elide": [],
+      "note": "细粒度 TP——本章排布代数的核心样本。关键洞察：这里用的是一张【独立的】rank_grid = reshape(pp, dp, tp)（注意没有 pcp/ExternalDP 维，和 all_ranks 不同），group_size 的单位是【DP rank 数】。切法：固定 pp stage 与 tp 列，沿 DP 维按 group_size 连续切块——即模块 TP 是『跨 DP 借 rank』凑出来的，与全局 TP（同一 dp 行内的 tp）正交！num_chunks = dp // group_size 决定每个 tp 列被切成几个组。_group_cache 按 group_size 去重：若 lmhead/embedding 设了相同 size 则共享同一组。要求（ascend_config）：仅 MoE 模型可用，且 group_size 必须整除 data_parallel_size。消费方：ops/linear_op.py(mlp/oproj)、ops/vocab_parallel_embedding.py(lmhead/embed)。"
+    },
+    {
+      "path": "vllm_ascend/distributed/parallel_state.py",
+      "lines": "L151-L189",
+      "code": "    # TODO: Extract and unify the logic across different communication group.\n    flashcomm2_otp_group_ranks = []\n    if flashcomm2_enable():\n        flashcomm2_otp_size = get_ascend_config().flashcomm2_oproj_tensor_parallel_size\n        num_fc2_oproj_tensor_parallel_groups: int = global_tp_size // flashcomm2_otp_size\n        global _FLASHCOMM2_OTP\n        global _FLASHCOMM2_ODP\n\n        _FLASHCOMM2_OTP = None\n        _FLASHCOMM2_ODP = get_tp_group()\n\n        if flashcomm2_otp_size > 1:\n            odp_group_ranks: list[list[int]] = [\n                [] for _ in range(flashcomm2_otp_size * global_dp_size * global_pp_size)\n            ]\n            for dp_group_index in range(global_dp_size):\n                for pp_group_index in range(global_pp_size):\n                    dp_pp_serial_index = dp_group_index * global_pp_size + pp_group_index\n                    tp_base_rank = dp_pp_serial_index * global_tp_size\n                    odp_base_index = dp_pp_serial_index * flashcomm2_otp_size\n\n                    for i in range(num_fc2_oproj_tensor_parallel_groups):\n                        ranks = []\n                        for j in range(flashcomm2_otp_size):\n                            tp_local_rank = i + j * num_fc2_oproj_tensor_parallel_groups\n                            assert tp_local_rank < global_tp_size\n                            global_rank = tp_base_rank + tp_local_rank\n                            ranks.append(global_rank)\n\n                            odp_group_index = odp_base_index + j\n                            odp_group_ranks[odp_group_index].append(global_rank)\n                        flashcomm2_otp_group_ranks.append(ranks)\n\n            _FLASHCOMM2_OTP = init_model_parallel_group(\n                flashcomm2_otp_group_ranks, get_world_group().local_rank, backend, group_name=\"flashcomm2_otp\"\n            )\n            _FLASHCOMM2_ODP = init_model_parallel_group(\n                odp_group_ranks, get_world_group().local_rank, backend, group_name=\"flashcomm2_odp\"\n            )",
+      "elide": ["flashcomm2_otp_size == 1 的分支：此时 _FLASHCOMM2_OTP 留 None、_FLASHCOMM2_ODP 直接复用基座 get_tp_group()（不新建组）——可作为简化说明，正文点出『size==1 时退化为复用基座 TP 组』即可"],
+      "note": "flashcomm2 = 把全局 TP 在 o_proj 处『再切一刀』成 otp（otp 内做 tensor-parallel）+ odp（otp 之间做 data-parallel），用于通信-计算重叠。排布：在每个 (dp,pp) 切片内，把 global_tp_size 个 rank 用步长 num_fc2_oproj_tensor_parallel_groups 重排成 otp 组（tp_local_rank = i + j*num_groups，即 strided 而非连续）；同步把同一 j 的 rank 收进对应 odp 组。注意默认 _FLASHCOMM2_ODP = get_tp_group()——又一处『复用基座组』。本章 flashcomm 讲到此排布即可，重叠时机的算子细节属 flashcomm 专章（前向引用）。"
+    },
+    {
+      "path": "vllm_ascend/distributed/parallel_state.py",
+      "lines": "L229-L264",
+      "code": "def model_parallel_initialized():\n    return _MC2 is not None\n\n\ndef get_mc2_group() -> GroupCoordinator:\n    assert _MC2 is not None, \"mc2 group is not initialized\"\n    return _MC2\n\n\ndef get_mlp_tp_group() -> GroupCoordinator:\n    assert _MLP_TP is not None, \"mlp group is not initialized\"\n    return _MLP_TP\n\n\ndef get_otp_group() -> GroupCoordinator:\n    assert _OTP is not None, \"output tensor parallel group is not initialized\"\n    return _OTP\n\n\ndef get_lmhead_tp_group() -> GroupCoordinator:\n    assert _LMTP is not None, \"lm head tensor parallel group is not initialized\"\n    return _LMTP\n\n\ndef get_embed_tp_group() -> GroupCoordinator:\n    assert _EMBED_TP is not None, \"emtp group is not initialized\"\n    return _EMBED_TP\n\n\ndef get_flashcomm2_otp_group() -> GroupCoordinator:\n    return _FLASHCOMM2_OTP\n\n\ndef get_flashcomm2_odp_group() -> GroupCoordinator:\n    assert _FLASHCOMM2_ODP is not None, \"output data parallel group for flashcomm2 is not initialized\"\n    return _FLASHCOMM2_ODP",
+      "elide": ["其余 get_*_group（shard_weight / p_tp / fc3_quant_x / dynamic_eplb）与 destroy_ascend_model_parallel 同构，正文点出『每组配一个 getter（断言已建）+ destroy 里逐个 .destroy() 置 None』即可"],
+      "note": "取用模式：每个组一个全局单例 + 一个带断言的 getter。model_parallel_initialized() 以 _MC2 为哨兵——印证 MC2 是无条件、最先建的组。get_flashcomm2_otp_group() 不带断言（otp_size==1 时合法地返回 None）。"
+    },
+    {
+      "path": "vllm/distributed/parallel_state.py",
+      "lines": "L1569-L1633",
+      "code": "    all_ranks = torch.arange(world_size).reshape(\n        -1,\n        data_parallel_size,\n        pipeline_model_parallel_size,\n        prefill_context_model_parallel_size,\n        tensor_model_parallel_size,\n    )  # noqa\n\n    # Build the tensor model-parallel groups.\n    global _TP\n    assert _TP is None, \"tensor model parallel group is already initialized\"\n    group_ranks = all_ranks.view(-1, tensor_model_parallel_size).unbind(0)\n    group_ranks = [x.tolist() for x in group_ranks]\n    ...\n    # Build the DCP model-parallel groups.\n    global _DCP\n    # Note(hc): ... dcp_size must not exceed tp_size, because the world size does not\n    # change by DCP, it simply reuses the GPUs of TP group, and split one\n    # TP group into tp_size//dcp_size DCP groups.\n    group_ranks = all_ranks.reshape(-1, decode_context_model_parallel_size).unbind(0)\n    group_ranks = [x.tolist() for x in group_ranks]\n    _DCP = init_model_parallel_group(\n        group_ranks, get_world_group().local_rank, backend, group_name=\"dcp\"\n    )\n\n    global _PCP\n    group_ranks = (\n        all_ranks.transpose(3, 4)\n        .reshape(-1, prefill_context_model_parallel_size)\n        .unbind(0)\n    )\n    group_ranks = [x.tolist() for x in group_ranks]\n    _PCP = init_model_parallel_group(\n        group_ranks, get_world_group().local_rank, backend, group_name=\"pcp\"\n    )",
+      "elide": ["enable_elastic_ep 的 local_all_ranks 分支与各 assert/注释正文化即可", "_TP 的 use_message_queue_broadcaster=True 细节略", "中间 _PP 等组省略"],
+      "note": "CP 组排布归口：PCP/DCP 由【基座】在 init_ascend_model_parallel 之前就建好（worker 时序证据）。基座的 all_ranks 5D 网格 (ExternalDP, dp, pp, pcp, tp) 与昇腾那张【完全一致】——这就是昇腾能在其上做加法的前提。DCP = all_ranks.reshape(-1, dcp)：复用 TP 的 GPU，把一个 TP 组切成 tp//dcp 个 DCP 子组（dcp ≤ tp）。PCP = transpose(3,4) 后 reshape(-1, pcp)：把 pcp 维换到末尾再切，所以 PCP 组沿 tp 维以步长 tp 跳取。昇腾 attention 篇只用 enable_cp()（prefill_context_parallel_size>1 或 decode_context_parallel_size>1）在运行期决定是否走 CP 分支，组本身的排布就在这里。"
+    },
+    {
+      "path": "vllm/distributed/parallel_state.py",
+      "lines": "L1159-L1174",
+      "code": "def init_model_parallel_group(\n    group_ranks: list[list[int]],\n    local_rank: int,\n    backend: str,\n    use_message_queue_broadcaster: bool = False,\n    group_name: str | None = None,\n    use_device_communicator: bool = True,\n) -> GroupCoordinator:\n    return GroupCoordinator(\n        group_ranks=group_ranks,\n        local_rank=local_rank,\n        torch_distributed_backend=backend,\n        use_device_communicator=use_device_communicator,\n        use_message_queue_broadcaster=use_message_queue_broadcaster,\n        group_name=group_name,\n    )",
+      "elide": [],
+      "note": "昇腾每建一个组都调它——这是『复用』的工厂函数。输入 group_ranks（list[list[int]]，每个内层 list 是一个组的全局 rank）→ 返回一个 GroupCoordinator。昇腾自己只负责算出 group_ranks，建组/通信全交给基座。"
+    },
+    {
+      "path": "vllm/distributed/parallel_state.py",
+      "lines": "L290-L317",
+      "code": "class GroupCoordinator:\n    \"\"\"\n    PyTorch ProcessGroup wrapper for a group of processes.\n    PyTorch ProcessGroup is bound to one specific communication backend,\n        e.g. NCCL, Gloo, MPI, etc.\n    GroupCoordinator takes charge of all the communication operations among\n        the processes in the group. It manages both CPU and device\n        communication.\n    \"\"\"\n\n    rank: int  # global rank\n    ranks: list[int]  # global ranks in the group\n    world_size: int  # size of the group\n    local_rank: int  # local rank used to assign devices\n    rank_in_group: int  # rank inside the group\n    cpu_group: ProcessGroup  # group for CPU communication\n    device_group: ProcessGroup  # group for device communication",
+      "elide": ["__init__ 主体（new_group 建 device/cpu group、device_communicator 装配）与各 all_reduce/all_gather/all_to_all 方法，正文只需知道它对外暴露 world_size/rank_in_group/device_group + 通信原语"],
+      "note": "昇腾各组复用的类型。消费方只取它的 .world_size / .rank_in_group / .device_group + all_gather/all_to_all 等原语（见 token_dispatcher、vocab_parallel_embedding）。昇腾不改这个类，只是多 new 了几个实例。"
+    }
+  ],
+  "key_classes": [
+    {
+      "name": "GroupCoordinator",
+      "file": "vllm/distributed/parallel_state.py:L290",
+      "responsibility": "基座的 PyTorch ProcessGroup 包装类。封装一组进程的全部集合通信（CPU+device），对外暴露 world_size / rank_in_group / device_group 及 all_reduce/all_gather/all_to_all 等原语。昇腾的每个并行组都是它的一个实例——昇腾复用、不修改。"
+    },
+    {
+      "name": "init_model_parallel_group (函数)",
+      "file": "vllm/distributed/parallel_state.py:L1159",
+      "responsibility": "基座工厂：吃 group_ranks(list[list[int]]) → 造一个 GroupCoordinator。昇腾每建一个昇腾专属组都调它——这是『加法式复用』的接缝。"
+    },
+    {
+      "name": "init_ascend_model_parallel (函数)",
+      "file": "vllm_ascend/distributed/parallel_state.py:L30",
+      "responsibility": "本章主角。在基座组建好之后被 worker 调用，从 all_ranks 5D 网格切出 MC2 / 细粒度 TP(otp/lmtp/emtp/mlptp) / flashcomm2(otp/odp) / fc3_quant_x / dynamic_eplb / p_tp / shard_weight 一批昇腾专属组，全部经 init_model_parallel_group 注册到独立的模块级全局。纯加法，不动基座任何组。"
+    },
+    {
+      "name": "FinegrainedTPConfig",
+      "file": "vllm_ascend/ascend_config.py:L429",
+      "responsibility": "解析 additional_config.finegrained_tp_config，给出 oproj/lmhead/embedding/mlp 各自的 tensor_parallel_size（0=未启用）。校验：仅 MoE 模型可用、各 size 必须整除 data_parallel_size。"
+    }
+  ],
+  "data_flow": [
+    "worker.init_device → init_distributed_environment(hccl) 建 _WORLD",
+    "worker → ensure_model_parallel_initialized → 基座 initialize_model_parallel：从 all_ranks(ExternalDP,dp,pp,pcp,tp) 切出 _TP / _DCP / _PCP / _PP / _DP 等基座组",
+    "worker → init_ascend_model_parallel(parallel_config)：model_parallel_initialized() 幂等检查（_MC2 哨兵）→ 取 world_size/backend/4 个 size → reshape all_ranks",
+    "init_ascend_model_parallel → MC2：all_ranks.transpose(1,2).reshape(-1, dp*pcp*tp).unbind → init_model_parallel_group → _MC2（并据 config 复用 group_ranks 建 _DYNAMIC_EPLB / _FC3_QUANT_X）",
+    "init_ascend_model_parallel → 细粒度 TP：对 otp/lmhead/embedding/mlp 各 size>0 者，_create_or_get_group 用独立 rank_grid(pp,dp,tp) 沿 DP 维切块取列 → _OTP/_LMTP/_EMBED_TP/_MLP_TP",
+    "init_ascend_model_parallel → flashcomm2（若 enable）：双层循环按 strided 重排 global_tp 建 _FLASHCOMM2_OTP / _FLASHCOMM2_ODP（size==1 时退化复用 get_tp_group()）",
+    "运行期消费：fused_moe/token_dispatcher 取 get_mc2_group().device_group 做专家 dispatch；linear_op 取 get_mlp_tp_group()/get_otp_group()；vocab_parallel_embedding 取 get_lmhead_tp_group()/get_embed_tp_group()；attention 篇用 enable_cp() 决定是否经 get_pcp_group()/get_dcp_group()(基座) 做 CP all_gather",
+    "销毁：destroy_ascend_model_parallel 逐个 .destroy() 并置 None"
+  ],
+  "design_decisions": [
+    {
+      "decision": "加法式扩展而非 patch 重绑：复用基座的 init_model_parallel_group / GroupCoordinator，新组写进昇腾自己的模块级全局，不覆盖基座的 _TP/_PCP 等",
+      "why": "昇腾专属并行模式（MC2 融合、细粒度 TP、flashcomm 重叠）是基座没有的『额外』拓扑，与基座的 TP/PP/DP/CP 正交共存；用复用而非替换，既不破坏基座语义，也省掉重写一套进程组管理。import 行直接拉基座符号 + worker 时序（基座先建、昇腾后叠）是双重证据。",
+      "evidence": "vllm_ascend/distributed/parallel_state.py:L1-L6, vllm_ascend/worker/worker.py:L842-L848"
+    },
+    {
+      "decision": "所有昇腾组共享同一张 all_ranks 5D 网格 (ExternalDP, dp, pp, pcp, tp)，且与基座 initialize_model_parallel 的网格逐维一致",
+      "why": "一致的网格是『叠加』的数学前提：昇腾组只是沿不同维度 transpose/reshape/slice 出不同子集，与基座组落在同一坐标系，rank 编号自洽。显式保留 pcp 维 → 开上下文并行时昇腾组仍能正确切分。",
+      "evidence": "vllm_ascend/distributed/parallel_state.py:L46-L52 对照 vllm/distributed/parallel_state.py:L1569-L1575"
+    },
+    {
+      "decision": "MC2 用 EP-like 拓扑：transpose(1,2) 后把 dp*pcp*tp 收成一组；并让 _DYNAMIC_EPLB / _FC3_QUANT_X 复用同一份 group_ranks",
+      "why": "MC2（matmul+通信融合）服务 MoE 专家通信，专家分布在 dp×tp 域，故需要一个跨 dp 与 tp 的组。动态 EPLB（ch09）与 fc3 量化 all-gather 在同一专家域通信，拓扑相同 → 直接复用 group_ranks 只是各建独立 coordinator，省去重算。",
+      "evidence": "vllm_ascend/distributed/parallel_state.py:L84-L108"
+    },
+    {
+      "decision": "细粒度 TP 沿 DP 维切（独立 rank_grid=reshape(pp,dp,tp)，group_size 以 DP rank 计），与全局 TP 正交",
+      "why": "lm-head/o-proj/embedding/mlp 各自需要与全局 TP 不同的 TP 宽度；昇腾不动全局 TP，而是『跨 DP 借 rank』在固定 tp 列上凑出模块专属 TP 组。因此约束 group_size 必须整除 data_parallel_size，且仅 MoE 模型可用（dense 无 DP 可借）。_group_cache 按 size 去重，相同宽度的模块共享组。",
+      "evidence": "vllm_ascend/distributed/parallel_state.py:L115-L149, vllm_ascend/ascend_config.py:L481-L484"
+    },
+    {
+      "decision": "flashcomm2 在 o_proj 处把全局 TP strided 再切成 otp(TP)+odp(DP)；otp_size==1 时退化为直接复用基座 get_tp_group()",
+      "why": "为通信-计算重叠，o_proj 需要把张量并行的一部分转成数据并行维度。strided 重排（tp_local_rank = i + j*num_groups）保证 otp 组内 rank 跨步分布。size==1 无需新组，复用基座 TP 是又一处『加法式复用、能省则省』。",
+      "evidence": "vllm_ascend/distributed/parallel_state.py:L151-L189"
+    },
+    {
+      "decision": "CP 组（PCP/DCP）的排布归口在基座：DCP 复用 TP 的 GPU 把一个 TP 组切成 tp//dcp 子组（dcp≤tp）；PCP transpose(3,4) 后按 pcp 切",
+      "why": "上下文并行不增加 world_size，DCP 直接在 TP 组内细分；PCP 把 pcp 维换到末尾再切。本章作 CP 排布归口讲清，attention 篇只在运行期用 enable_cp() 分流，不重复讲排布。",
+      "evidence": "vllm/distributed/parallel_state.py:L1594-L1633, vllm_ascend/attention/utils.py:L58-L61"
+    },
+    {
+      "decision": "每组：模块级单例 + None 哨兵 + 带断言 getter + destroy 逐个置 None；model_parallel_initialized() 以 _MC2 为唯一哨兵",
+      "why": "进程组是进程级全局资源，单例 + 哨兵保证幂等与可销毁。以 _MC2 为总哨兵 → MC2 必须无条件且最先建。get_flashcomm2_otp_group() 故意不带断言（合法 None）。",
+      "evidence": "vllm_ascend/distributed/parallel_state.py:L33, L229-L284, L287-L341"
+    }
+  ],
+  "theory": [
+    {
+      "topic": "all_ranks reshape 的排布代数（本章主线）",
+      "content": "把 world ranks=arange(N) reshape 成 5D 网格后，『取某并行维度的组』= 把该维 transpose 到最后一维 → reshape(-1, 该维 size) → unbind(0)。直觉：最后一维相邻的 rank 同组，前面所有维构成『有多少个这样的组』。MC2 用 transpose(1,2) 是为把 pp 提前、让 dp*pcp*tp 落到一起；PCP 用 transpose(3,4) 把 pcp 提到末尾。掌握这一招即可手推任意组。"
+    },
+    {
+      "topic": "数值排布追踪样例 A：world=8, ExternalDP=1, dp=2, pp=1, pcp=1, tp=4",
+      "content": "all_ranks=arange(8).reshape(1,2,1,1,4) = [[[[[0,1,2,3]]],[[[4,5,6,7]]]]]。基座全局 TP（all_ranks.view(-1,4)）= [[0,1,2,3],[4,5,6,7]]（两行各是一个 TP 组）。MC2（transpose(1,2).reshape(-1, dp*pcp*tp=8)）= [[0,1,2,3,4,5,6,7]]——单个 size-8 的 EP 组，横跨两个 DP。细粒度 mlp_tp_size=2：rank_grid=arange(8).reshape(pp=1,dp=2,tp=4)=[[[0,1,2,3],[4,5,6,7]]]，num_chunks=2//2=1，沿 DP 维取每个 tp 列 → [[0,4],[1,5],[2,6],[3,7]]。结论：模块 TP 组沿 DP 列向切，与全局 TP（行向）正交。"
+    },
+    {
+      "topic": "数值排布追踪样例 B：world=8, dp=4, tp=2, pp=1, pcp=1, group_size=2",
+      "content": "rank_grid=arange(8).reshape(1,4,2)=[[[0,1],[2,3],[4,5],[6,7]]]，num_chunks=4//2=2。chunk0 取行 0:2=[[0,1],[2,3]]：tp_idx=0→[0,2]、tp_idx=1→[1,3]；chunk1 取行 2:4=[[4,5],[6,7]]：tp_idx=0→[4,6]、tp_idx=1→[5,7]。细粒度 TP 组=[[0,2],[1,3],[4,6],[5,7]]。展示 num_chunks>1 时按 DP 连续块切的效果。"
+    },
+    {
+      "topic": "数值排布追踪样例 C（CP 归口）：world=4, dp=1, pp=1, pcp=2, tp=2, dcp=2",
+      "content": "all_ranks=arange(4).reshape(1,1,1,2,2)=[[[[[0,1],[2,3]]]]]。基座 TP(view(-1,2))=[[0,1],[2,3]]。DCP(reshape(-1,dcp=2))=[[0,1],[2,3]]——dcp 复用 TP 的 GPU，把每个 TP 组整体当 DCP 组（此处 dcp==tp）。PCP(transpose(3,4).reshape(-1,pcp=2))：transpose 后 [[[[[0,2],[1,3]]]]] → [[0,2],[1,3]]——PCP 组沿 tp 维步长 tp 跳取。说明 CP 不增 world，只在已有 GPU 上换维度切。"
+    },
+    {
+      "topic": "flashcomm2 strided 重排",
+      "content": "otp 组内 tp_local_rank = i + j*num_groups（num_groups=global_tp//otp_size），故 otp 组是跨步而非连续抓取。例 global_tp=8, otp_size=2 → num_groups=4：i=0→[0,4]、i=1→[1,5]…i=3→[3,7] 为 otp 组；同一 j 收进 odp 组。与细粒度 TP（连续块）形成对照：同是『再切 TP』，切法（strided vs 连续）由各特性的通信模式决定。"
+    }
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {
+        "what": "PD 分离的 _P_TP / alltoall 头复制分支（parallel_state.py:L54-L82）",
+        "why_safe": "属于 PD 分离（prefill/decode disaggregation）特性，与本章四大主题（MC2/细粒度TP/flashcomm/CP）正交，依赖 kv_transfer_config 才触发。精简版删去不影响 rank 排布代数主线的可读性与可运行性（纯 Python 切分不依赖它）。"
+      },
+      {
+        "what": "shard_weight 组及 create_shard_weight_group 内部实现（parallel_state.py:L191-L226 的函数体细节）",
+        "why_safe": "shard_weight 是 layer_sharding 特性的辅助组，依赖 flashcomm2/dsa_cp 配置，是旁支；正文只需一句带过。删函数体不破坏其余组的排布计算（彼此独立）。保留入口注释级说明即可。"
+      },
+      {
+        "what": "FinegrainedTPConfig 中的 olora_tensor_parallel_size 相关分支（ascend_config.py:L439, L452-L461, L473）",
+        "why_safe": "o_lora 的细粒度 TP 在 parallel_state.py 的 init 里并未建组（只建 otp/lmtp/emtp/mlptp 四个），与本章无关，删之不影响四组排布。"
+      },
+      {
+        "what": "init_model_parallel_group/GroupCoordinator 的真实进程组创建（new_group / device_communicator 装配）",
+        "why_safe": "host 无 NPU/CANN，真实 hccl 通信不可跑；精简版按章末约定只验『rank 排布代数（reshape/transpose/slice 纯 Python）』，可用一个记录 group_ranks 的桩替代真实建组——控制流与排布结果逐字保留，仅不发起实际通信。"
+      }
+    ],
+    "must_keep": [
+      {"symbol": "init_ascend_model_parallel", "why": "本章主角函数，加法式扩展入口"},
+      {"symbol": "model_parallel_initialized", "why": "幂等哨兵（_MC2），读者需理解为何 MC2 无条件最先建"},
+      {"symbol": "all_ranks", "why": "5D 网格变量，全章排布代数的根，所有组从它切出"},
+      {"symbol": "global_pcp_size", "why": "证明 all_ranks 显式保留 pcp 维 → CP 归口的代数依据"},
+      {"symbol": "transpose", "why": "MC2(1,2) 与基座 PCP(3,4) 的切组手法，排布代数核心算子"},
+      {"symbol": "reshape", "why": "切组三步法(transpose→reshape→unbind)之一"},
+      {"symbol": "unbind", "why": "切组三步法之一，把网格拆成组列表"},
+      {"symbol": "_MC2", "why": "MC2(EP-like)组单例 + 总哨兵"},
+      {"symbol": "get_mc2_group", "why": "MC2 取用器，MoE token_dispatcher 消费"},
+      {"symbol": "_create_or_get_group", "why": "细粒度 TP 建组闭包，沿 DP 切块取列的算法本体"},
+      {"symbol": "rank_grid", "why": "细粒度 TP 用的独立网格 reshape(pp,dp,tp)，与 all_ranks 不同，是『沿 DP 切』的关键"},
+      {"symbol": "num_chunks", "why": "细粒度 TP 沿 DP 维的分块数 = dp//group_size"},
+      {"symbol": "_OTP", "why": "o-proj 细粒度 TP 组"},
+      {"symbol": "_LMTP", "why": "lm-head 细粒度 TP 组"},
+      {"symbol": "_EMBED_TP", "why": "embedding 细粒度 TP 组"},
+      {"symbol": "_MLP_TP", "why": "mlp 细粒度 TP 组"},
+      {"symbol": "get_mlp_tp_group", "why": "细粒度 TP 取用器（linear_op 消费）"},
+      {"symbol": "get_lmhead_tp_group", "why": "细粒度 TP 取用器（vocab_parallel_embedding 消费）"},
+      {"symbol": "_DYNAMIC_EPLB", "why": "动态 EPLB 组（ch09 前向引用），复用 MC2 group_ranks 的样例"},
+      {"symbol": "get_dynamic_eplb_group", "why": "EPLB 取用器，前向引用锚点"},
+      {"symbol": "_FLASHCOMM2_OTP", "why": "flashcomm2 o_proj TP 组（strided 重排）"},
+      {"symbol": "_FLASHCOMM2_ODP", "why": "flashcomm2 o_proj DP 组；size==1 退化复用 get_tp_group()"},
+      {"symbol": "flashcomm2_enable", "why": "flashcomm2 启用门控"},
+      {"symbol": "init_model_parallel_group", "why": "基座工厂——『复用而非替换』的接缝，每组都调它"},
+      {"symbol": "GroupCoordinator", "why": "基座进程组类型——昇腾各组都是它的实例，复用证据"},
+      {"symbol": "get_world_group", "why": "复用基座 world group 取 backend/local_rank"},
+      {"symbol": "get_tp_group", "why": "flashcomm2 size==1 时复用基座 TP 组的证据"}
+    ]
+  },
+  "diagram_plan": [
+    {
+      "name": "fig-ch08-roadmap",
+      "purpose": "每章开场 Roadmap『你在这里』",
+      "spec": "复用 instances/vllm-ascend/book/assets/roadmap/roadmap.py，高亮节点=ch08（并行组/分布式），前接 attention 篇的 enable_cp() 运行期分流、后接 ch09 动态 EPLB。",
+      "highlight_node": "ch08-ascend-parallel-groups"
+    },
+    {
+      "name": "fig-ch08-additive-layering",
+      "purpose": "总览：加法式扩展 vs patch 重绑——基座组在底，昇腾组在上叠加",
+      "spec": "svg-diagram。两层堆叠：下层『基座 initialize_model_parallel』框出 _TP/_PP/_DP/_PCP/_DCP；上层『init_ascend_model_parallel』框出 _MC2/_OTP/_LMTP/_EMBED_TP/_MLP_TP/_FLASHCOMM2_OTP/_FLASHCOMM2_ODP；中间一条『复用 init_model_parallel_group / GroupCoordinator』的接缝箭头从上层指向下层工厂。右侧 worker 时序竖箭头标 1→2→3。强调上层不覆盖下层。",
+      "highlight_node": null
+    },
+    {
+      "name": "fig-ch08-reshape-algebra",
+      "purpose": "排布代数：一张 all_ranks 网格切出不同组（样例 A, world=8/dp=2/tp=4）",
+      "spec": "svg-diagram。中心画 all_ranks 5D 网格的 2x4 投影（ranks 0-7）。三个分支：(1)全局 TP=行 [0-3][4-7]；(2)MC2=整块 [0-7]；(3)细粒度 mlp_tp=列 [0,4][1,5][2,6][3,7]。用颜色区分『行向(全局TP)』vs『列向(模块TP沿DP)』vs『整块(MC2)』，直观показ正交关系。",
+      "highlight_node": null
+    },
+    {
+      "name": "fig-ch08-cp-layout",
+      "purpose": "CP 归口：PCP/DCP 如何在不增 world 的前提下切（样例 C, world=4/tp=2/pcp=2/dcp=2）",
+      "spec": "svg-diagram。arange(4) 网格，画三种切法：TP=[0,1][2,3]、DCP=[0,1][2,3](复用TP的GPU)、PCP=transpose后[0,2][1,3](步长tp跳取)。标注『dcp≤tp，复用 TP GPU 细分』『PCP 跨 tp 跳取』。底部一行：attention 篇 enable_cp() 运行期分流箭头指向这些组。",
+      "highlight_node": null
+    }
+  ],
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recover": [],
+    "note": "bible.py due ch08 返回空（应埋/应回收均无条目）。本章自身设一个前向引用锚：_DYNAMIC_EPLB / get_dynamic_eplb_group → ch09（动态专家负载均衡），正文只点拓扑复用 MC2 group_ranks，不展开 EPLB 机制。"
+  }
+}
