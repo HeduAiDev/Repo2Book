@@ -331,9 +331,13 @@ class NPUPlatform(Platform):
     def get_punica_wrapper(cls) -> str:
         return "vllm_ascend.lora.punica_npu.PunicaWrapperNPU"
 
+    # … 省略：get_current_memory_usage 等几个非工厂方法 …
+
     @classmethod
     def get_device_communicator_cls(cls) -> str:
         return "vllm_ascend.distributed.device_communicators.npu_communicator.NPUCommunicator"
+
+    # … 省略：is_pin_memory_available / opaque_attention_op 等非工厂方法 …
 
     @classmethod
     def get_static_graph_wrapper_cls(cls) -> str:
@@ -358,7 +362,7 @@ class NPUPlatform(Platform):
 ```python
 # vllm_ascend/platform.py:L739-L765
     @classmethod
-    def get_attn_backend_cls(cls, selected_backend, attn_selector_config, num_heads=None):
+    def get_attn_backend_cls(cls, selected_backend, attn_selector_config, num_heads: int | None = None):
         use_compress = getattr(attn_selector_config, "use_compress", False)
         key = (attn_selector_config.use_mla, attn_selector_config.use_sparse)
 
