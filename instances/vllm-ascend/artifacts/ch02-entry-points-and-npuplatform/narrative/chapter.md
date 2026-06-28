@@ -78,7 +78,7 @@ def load_plugins_by_group(group: str) -> dict[str, Callable[[], Any]]:
 
 对 `ascend` 这条来说，`plugin.load()` 做的是「import `vllm_ascend` 包，取出其中的 `register` 函数对象」，然后把这个**函数**放进返回的字典里。注意 `dict[str, Callable[[], Any]]` 这个类型标注——字典的 value 是「一个可调用对象」，而不是调用它的结果。调用发生在上一层。
 
-为什么这个区分重要？因为 `import vllm_ascend` 这一步本身是「轻」的——稍后我们会看到 `vllm_ascend/__init__.py` 顶部几乎不做事，`register` 也只是个返回字符串的纯函数。真正「重」的 `import vllm_ascend.platform`（连带把 `torch_npu` 整个 NPU 运行时拉起来）被精心地藏在了 `register` 函数体之外。`load_plugins_by_group` 只是把这枚「待引爆的开关」收集起来，什么时候按、由谁按，是下一节的事。
+为什么这个区分重要？因为 `import vllm_ascend` 这一步本身是「轻」的——稍后我们会看到 `vllm_ascend/__init__.py` 顶部几乎不做事，`register` 也只是个返回字符串的纯函数。真正「重」的 `import vllm_ascend.platform`（连带把 `torch_npu` 整个 NPU 运行时拉起来）被精心地藏在了 `register` 函数体之外——这次 import 究竟「重」在哪、为什么非推迟不可，留到 [§2.5](#25-推迟的-import为什么是字符串不是类) 讲透。`load_plugins_by_group` 只是把这枚「待引爆的开关」收集起来，什么时候按、由谁按，是下一节的事。
 
 （`envs.VLLM_PLUGINS` 是个可选白名单：为 `None` 时加载全部，非 `None` 时只加载名字在册的插件。精简版里把它取成 `None`，因为 host 上没有 `vllm.envs` 这套环境配置——但控制流「发现→筛选→load→入字典」一字不差。）
 
@@ -141,6 +141,8 @@ def resolve_current_platform_cls_qualname() -> str:
 
 这个函数把 vLLM 内置的五个平台（cuda / rocm / tpu / xpu / cpu）与 OOT 插件**用 `chain()` 串成一条链**，逐个 `func()` 调用，谁返回非 `None` 谁就算「激活」。然后用集合交集把激活者分成两组——`activated_builtin` 与 `activated_oot`——再走一条 `elif` 链做最终裁决。
 
+举个具体场景：一台机器同时装了 vllm-ascend 和带 CUDA 的 torch、还插着 GPU。此时 `cuda_platform_plugin` 数到了 GPU 而激活、`ascend` 也激活——两个都在册。但 OOT 那一支先判，最终选中的是 `NPUPlatform`，而不是 `CudaPlatform`。
+
 裁决的顺序就是「OOT 优先」的全部秘密。我们把它画成一张决策图：
 
 ![平台选择决策图](../diagrams/selection.png)
@@ -181,7 +183,7 @@ def cuda_platform_plugin() -> str | None:
     return "vllm.platforms.cuda.CudaPlatform" if is_cuda else None
 ```
 
-builtin 探测函数会**真去问硬件**——`cuda_platform_plugin` 用 `pynvml` 数有没有 GPU，数到了才返回 `"vllm.platforms.cuda.CudaPlatform"` 这个 qualname，数不到就返回 `None`。也就是说，对 builtin 来说，「激活」= 「这块硬件物理在场」。
+builtin 探测函数会**真去问硬件**——`cuda_platform_plugin` 用 `pynvml`（NVIDIA 的设备查询库）数有没有 GPU，数到了才返回 `"vllm.platforms.cuda.CudaPlatform"` 这个 qualname，数不到就返回 `None`。也就是说，对 builtin 来说，「激活」= 「这块硬件物理在场」。
 
 OOT 一侧恰好是它的**反面**。看 `vllm_ascend/__init__.py` 里那个 `register`：
 
@@ -203,7 +205,11 @@ def register():
 
 `register` 大可以写成 `from vllm_ascend.platform import NPUPlatform; return NPUPlatform`，直接把类对象交出去。为什么偏偏返回一个字符串，让上层再费一道手去解析？
 
-因为 `import vllm_ascend.platform` 这一行**代价高昂且时机敏感**。`vllm_ascend/platform.py` 在 import 时会连带 `import torch_npu`，而 `torch_npu` 一旦 import 就会触发昇腾 NPU 运行时的初始化。而 `register` 被调用的时刻——平台选择期——是 vLLM 刚启动、**还在探测「我到底在什么硬件上」**的极早期。此刻：
+因为 `import vllm_ascend.platform` 这一行**代价高昂且时机敏感**。`vllm_ascend/platform.py` 在 import 时会连带 `import torch_npu`，而 `torch_npu` 一旦 import 就会触发昇腾 NPU 运行时的初始化。
+
+打个比方：import `torch_npu` 像是「点火启动整套昇腾运行时 CANN（昇腾的算子与运行时软件栈）」。点火要去抢占设备、建立上下文，本身就是个重操作。更要命的是它「一锤定音」——按点火那一刻读到的环境与配置定型，之后你再改环境变量，它也不回头重读。所以你绝不想在「还没想清楚到底用不用昇腾」时就把它点着。
+
+而 `register` 被调用的时刻——平台选择期——是 vLLM 刚启动、**还在探测「我到底在什么硬件上」**的极早期。此刻：
 
 - 还没确定该不该用昇腾（万一这台机器装了 vllm-ascend 但用户其实想跑别的？选择逻辑还没跑完）；
 - 选卡用的环境变量 `ASCEND_RT_VISIBLE_DEVICES` 可能还没生效；
@@ -386,7 +392,7 @@ class NPUPlatform(Platform):
         return backend_map[(attn_selector_config.use_mla, attn_selector_config.use_sparse, use_compress)]
 ```
 
-它按 `(use_mla, use_sparse[, use_compress])` 这把 key 在 `backend_map` 里查不同的昇腾 attention backend——MLA、稠密、SFA（稀疏）、DSA。`FLASH_ATTN` 是「训推一致」场景下的特例，先经 `_validate_fa3_backend` 校验通过才走（该校验依赖外部包 `flash_attn_npu_v3`，本章不展开）。
+它按 `(use_mla, use_sparse[, use_compress])` 这把 key 在 `backend_map` 里查不同的昇腾 attention backend——MLA、稠密、SFA、DSA（MLA / SFA / DSA 是昇腾针对不同注意力模式的几种 backend 实现，分别对应多头潜在注意力、稀疏、压缩）。`FLASH_ATTN` 是「训推一致」场景下的特例，先经 `_validate_fa3_backend` 校验通过才走（该校验依赖外部包 `flash_attn_npu_v3`，本章不展开）。
 
 这里埋着一条**横切线索**：`if is_310p()` 这一支会整个改走 `backend_map_310`。而且注意两张表的 key 维度不同——非-310P 用 3 元组 key（含 `use_compress`），310P 用 2 元组 key。310P 是昇腾的纯推理卡，能力受限，连 attention backend 都另起一套（`vllm_ascend._310p.…`）。这个 `is_310p()` 究竟从哪来，我们 [§2.10](#210-设备分代is_310p-这条横切线) 揭晓。把精简版跑起来喂不同的 key，`(True,False,False)` 会拿到 `AscendMLABackend`、`(True,True,False)` 拿到 `AscendSFABackend`，而一旦把设备分代设成 310P，同样的 `(False,False)` 就改落到 `AscendAttentionBackend310`——查表分发与分代分流都能在 host 上纯 Python 复现。
 
