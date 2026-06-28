@@ -14,16 +14,16 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch06',
-  slug: 'ch06-npu-communicator',
+  chapter_id: 'ch07',
+  slug: 'ch07-sleep-mode-camem-allocator',
   instance: 'vllm-ascend',
-  focus: '换底座的通信器：从 CudaCommunicator 到 NPUCommunicator——OOT 怎么换通信器的最干净样本。三条线并排讲：①**platform 回调注册** get_device_communicator_cls → NPUCommunicator；②**子类化 DeviceCommunicatorBase**（绝大多数集合通信直接继承——底层走 torch.distributed + HCCL backend，故只需复用基类；**仅重写 MoE 用的 all_to_all**，看清「子类化 = 只改差异点」）；③并排讲**手写 pyhccl ↔ pynccl 的 ctypes 通信器**（unique_id 建组 / warmup all_reduce / disabled 降级，逐段对位移植，看 GPU→NPU 的 ctypes 绑定怎么照搬范式只换符号）；④**patch_distributed 仅 310P** 把 broadcast / all_reduce 猴补成 all_gather 模拟，补硬件能力缺口（点名复用 ch03 技法，别重讲）。主线讲清「为什么通信器是 OOT 换底座最干净的样本」：接口窄、基类已抽象好、只露一个 all_to_all 差异点。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vLLM 书 ch20 + vllm/distributed/device_communicators/base_device_communicator.py（基类抽象）· cuda_communicator.py（对位的 GPU 实现，逐段对照 NPU 版）· pynccl.py · pynccl_wrapper.py（对照 pyhccl 的 ctypes 范式）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（通信器类结构/ctypes 绑定范式是纯 Python，可跑；实际集合通信不跑）】',
-  highlight: 'ch06',
+  focus: '显存底座：sleep-mode 与 CANN 虚拟内存分配器（camem）。device_allocator/camem.py（273 行）是 vLLM cumem_allocator / CuMemAllocator 的昇腾移植：基于 **CANN 虚拟内存**（vllm_ascend_C.python_create_and_map / unmap_and_release）实现可插拔 allocator，支撑 **sleep mode**——offload 权重 / 丢弃 KV 后**释放物理页**、唤醒再 map（虚拟地址不变、物理页可换）。主线：①讲清 sleep mode 要解决什么（推理空窗期把显存还给系统）+ 虚拟内存「保留虚拟地址、解绑/重绑物理页」的机制；②**逐行对照 vLLM cumem.py**——find_loaded_library / AllocationData / create_and_map / sleep / wake_up 与 vLLM 版几乎逐行同构，**仅 cudart→acl.rt、libcudart→vllm_ascend_C** 换符号，看清「移植 = 同构换符号」；③ patch/platform/patch_camem_allocator.py 怎么把它挂进 vLLM（技法 d 的 fallback 写法，点名复用 ch03 技法，别重讲）。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vLLM 书 ch17/ch33 + vllm/device_allocator/cumem.py（逐行对位的 GPU 原版）· vllm/config/model.py（sleep mode 配置面）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（allocator 类结构 / ctypes 绑定 / sleep-wake 状态机是纯 Python，可跑；实际虚拟内存映射不跑）】',
+  highlight: 'ch07',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm-ascend/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
-  skip_dossier: true,
+  skip_dossier: false,
   skip_impl: false,
-  paths: ['vllm_ascend/distributed/device_communicators/npu_communicator.py', 'vllm_ascend/distributed/device_communicators/pyhccl.py', 'vllm_ascend/distributed/device_communicators/pyhccl_wrapper.py', 'vllm_ascend/patch/platform/patch_distributed.py', 'vllm_ascend/platform.py'],
+  paths: ['vllm_ascend/device_allocator/camem.py', 'vllm_ascend/patch/platform/patch_camem_allocator.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'

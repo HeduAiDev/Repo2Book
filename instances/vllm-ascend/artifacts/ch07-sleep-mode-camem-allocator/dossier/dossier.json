@@ -1,0 +1,197 @@
+{
+  "chapter": "ch07",
+  "title": "显存底座：sleep-mode 与 CANN 虚拟内存分配器（camem）",
+  "one_line": "device_allocator/camem.py 是 vLLM CuMemAllocator 的昇腾移植：基于 CANN 虚拟内存「保留虚拟地址、解绑/重绑物理页」实现可插拔 allocator，支撑 sleep mode（空窗期把物理显存还给系统，唤醒再 map），移植=同构换符号（cudart→acl.rt、cumem_allocator→vllm_ascend_C）。",
+
+  "code_spine": [
+    "vllm_ascend/device_allocator/camem.py:L31-L53  find_loaded_library —— 从 /proc/self/maps 解析 vllm_ascend_C 的 .so 路径（NPUPluggableAllocator 需要 lib 路径）",
+    "vllm_ascend/device_allocator/camem.py:L56-L72  条件导入 vllm_ascend_C 的三个 C 入口 + camem_available 开关（导入失败则禁用 sleep mode）",
+    "vllm_ascend/device_allocator/camem.py:L74-L90  HandleType / AllocationData / create_and_map / unmap_and_release —— 句柄结构 + 物理页映射/解绑的薄封装",
+    "vllm_ascend/device_allocator/camem.py:L93-L110 get_pluggable_allocator + use_memory_pool_with_allocator —— 把 python_malloc/free 回调注册进 C 扩展，造出 NPUPluggableAllocator + MemPool",
+    "vllm_ascend/device_allocator/camem.py:L113-L167 CaMemAllocator 单例 + python_malloc_callback/python_free_callback —— pointer_to_data 账本",
+    "vllm_ascend/device_allocator/camem.py:L178-L208 sleep —— 遍历账本，命中 offload_tags 的拷回 CPU（aclrtMemcpy D2H）后 unmap_and_release 释放物理页；其余直接丢弃",
+    "vllm_ascend/device_allocator/camem.py:L210-L227 wake_up —— create_and_map 把物理页重新映射回原虚拟地址，有 CPU 备份的再拷回（H2D）",
+    "vllm_ascend/device_allocator/camem.py:L229-L263 use_memory_pool —— 上下文管理器：设 current_tag，让区间内分配都进 MemPool 并打标签",
+    "vllm_ascend/worker/worker.py:L544-L555 load_model —— 用 use_memory_pool(tag='weights') 把权重装进 camem 池",
+    "vllm_ascend/worker/worker.py:L766-L767 _allocate_kv_cache 路径 use_memory_pool(tag='kv_cache') —— KV cache 进 camem 池",
+    "vllm_ascend/worker/worker.py:L200-L226 NPUWorker.sleep/wake_up —— 上层入口，level 1 offload weights/丢 KV，level 2 全丢",
+    "vllm_ascend/patch/platform/patch_camem_allocator.py:L17-L28 把 ascend 的 sleep allocator 接入 vLLM 的 ModelConfig 校验门（hasattr 守护的前向兼容 fallback）"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm_ascend/device_allocator/camem.py",
+      "lines": "L17-L29",
+      "code": "# CANN-mem-based pytorch pluggable allocator to implement sleep mode.\n#\nimport dataclasses\nimport gc\nimport os\nfrom collections.abc import Callable\nfrom contextlib import contextmanager\nfrom typing import Any\n\nimport torch\nfrom acl.rt import memcpy  # type: ignore # noqa: F401\nfrom vllm.logger import logger",
+      "elide": ["开头 16 行 Apache 版权头可省略"],
+      "note": "对照 vLLM cumem.py:L4-L24：vLLM import 的是 libcudart（CudaRTLibrary）做拷贝，这里换成 from acl.rt import memcpy（CANN 的 aclrtMemcpy 绑定）。这是「移植=换符号」的第一处证据。"
+    },
+    {
+      "path": "vllm_ascend/device_allocator/camem.py",
+      "lines": "L31-L53",
+      "code": "def find_loaded_library(lib_name) -> str | None:\n    \"\"\"\n    According to according to https://man7.org/linux/man-pages/man5/proc_pid_maps.5.html,\n    the file `/proc/self/maps` contains the memory maps of the process, which includes the\n    shared libraries loaded by the process. We can use this file to find the path of the\n    a loaded library.\n    \"\"\"  # noqa\n    found_line = None\n    with open(\"/proc/self/maps\") as f:\n        for line in f:\n            if lib_name in line:\n                found_line = line\n                break\n    if found_line is None:\n        # the library is not loaded in the current process\n        return None\n    # if lib_name is libcudart, we need to match a line with:\n    # address /path/to/libcudart-hash.so.11.0\n    start = found_line.index(\"/\")\n    path = found_line[start:].strip()\n    filename = path.split(\"/\")[-1]\n    assert filename.rpartition(\".so\")[0].startswith(lib_name), f\"Unexpected filename: {filename} for library {lib_name}\"\n    return path",
+      "elide": [],
+      "note": "与 vLLM 完全同构——vLLM 把它收在 vllm/utils/system_utils.py 由 cumem.py import；ascend 直接内联到 camem.py。函数体逐字一致（连注释里残留的 'libcudart' 例子都没改）。NPUPluggableAllocator 构造需要 .so 的绝对路径，所以要从 /proc/self/maps 反查 vllm_ascend_C 被加载到哪。"
+    },
+    {
+      "path": "vllm_ascend/device_allocator/camem.py",
+      "lines": "L56-L75",
+      "code": "camem_available = False\ntry:\n    from vllm_ascend.vllm_ascend_C import (  # type: ignore # noqa: F401\n        init_module,\n        python_create_and_map,\n        python_unmap_and_release,\n    )\n\n    lib_name = find_loaded_library(\"vllm_ascend_C\")\n    camem_available = True\nexcept ImportError as e:\n    logger.warning(\"Failed to import vllm_ascend_C:%s. Sleep mode will be disabled. \", e)\n    init_module = None\n    python_create_and_map = None\n    python_unmap_and_release = None\n    lib_name = None\n    libcudart = None\n\n# py_device, py_alignedSize, py_d_mem, py_p_memHandle\nHandleType = tuple[int, int, int, int]",
+      "elide": [],
+      "note": "对照 vLLM cumem.py:L27-L48。三处换符号：①C 扩展 vllm.cumem_allocator → vllm_ascend.vllm_ascend_C；②find_loaded_library('cumem_allocator') → ('vllm_ascend_C')；③vLLM 还 import CudaRTLibrary 并实例化 libcudart，ascend 不需要（拷贝走 acl.rt.memcpy）。HandleType 四元组语义同：(设备号, 对齐后字节数, 设备虚拟地址, 物理句柄)。注意 except 抓的是 ImportError（vLLM 抓 ModuleNotFoundError），且兜底里多塞了一个无用的 libcudart=None（ascend 全文没用过 libcudart 这个名字——移植残留）。"
+    },
+    {
+      "path": "vllm_ascend/device_allocator/camem.py",
+      "lines": "L78-L99",
+      "code": "@dataclasses.dataclass\nclass AllocationData:\n    handle: HandleType\n    tag: str\n    cpu_backup_tensor: torch.Tensor | None = None\n\n\ndef create_and_map(allocation_handle: HandleType) -> None:\n    python_create_and_map(*allocation_handle)\n\n\ndef unmap_and_release(allocation_handle: HandleType) -> None:\n    python_unmap_and_release(*allocation_handle)\n\n\ndef get_pluggable_allocator(\n    python_malloc_fn: Callable[[tuple[int, int, int, int]], None],\n    python_free_func: Callable[[int], tuple[int, int, int, int]],\n) -> torch.npu.memory.NPUPluggableAllocator:\n    init_module(python_malloc_fn, python_free_func)\n    new_alloc = torch.npu.memory.NPUPluggableAllocator(lib_name, \"my_malloc\", \"my_free\")\n    return new_alloc",
+      "elide": [],
+      "note": "对照 vLLM cumem.py:L51-L74，逐行同构。create_and_map/unmap_and_release 是物理页映射/解绑的薄封装——*handle 把四元组展开传给 C 入口。get_pluggable_allocator 换符号：torch.cuda.memory.CUDAPluggableAllocator → torch.npu.memory.NPUPluggableAllocator。init_module 把 Python 的 malloc/free 回调登记进 C 扩展的全局变量（这正是 CaMemAllocator 必须单例的原因）；'my_malloc'/'my_free' 是 C 侧导出的符号名。"
+    },
+    {
+      "path": "vllm_ascend/device_allocator/camem.py",
+      "lines": "L102-L110",
+      "code": "@contextmanager\ndef use_memory_pool_with_allocator(\n    python_malloc_fn: Callable[[tuple[int, int, int, int]], None],\n    python_free_func: Callable[[int], tuple[int, int, int, int]],\n):\n    new_alloc = get_pluggable_allocator(python_malloc_fn, python_free_func)\n    mem_pool = torch.npu.memory.MemPool(new_alloc._allocator)\n    with torch.npu.memory.use_mem_pool(mem_pool):\n        yield mem_pool, new_alloc",
+      "elide": [],
+      "note": "对照 vLLM cumem.py:L77-L87。torch.cuda.memory.MemPool/use_mem_pool → torch.npu.memory.MemPool/use_mem_pool。进入 use_mem_pool 上下文后，区间内所有 torch 分配都走我们这个 pluggable allocator（即触发 python_malloc_callback）。"
+    },
+    {
+      "path": "vllm_ascend/device_allocator/camem.py",
+      "lines": "L113-L160",
+      "code": "class CaMemAllocator:\n    \"\"\"\n    A singleton class that manages a memory pool for CANN tensors.\n    ...（类 docstring，讲 sleep/wake_up 语义与为何必须单例）...\n    \"\"\"\n\n    instance = None\n    default_tag: str = \"default\"\n\n    @staticmethod\n    def get_instance() -> \"CaMemAllocator\":\n        \"\"\"\n        CaMemAllocator is a singleton class.\n        We cannot call the constructor directly.\n        Call this method to get the instance.\n        \"\"\"\n        if CaMemAllocator.instance is None:\n            CaMemAllocator.instance = CaMemAllocator()\n        return CaMemAllocator.instance\n\n    def __init__(self):\n        conf = os.environ.get(\"PYTORCH_NPU_ALLOC_CONF\", \"\")\n        assert \"expandable_segments:True\" not in conf, (\n            \"Expandable segments are not compatible with memory pool. \"\n            \"Please track https://github.com/pytorch/pytorch/issues/147851 \"\n            \"for the latest updates.\"\n        )\n\n        self.pointer_to_data: dict[int, AllocationData] = {}\n        self.current_tag: str = CaMemAllocator.default_tag\n        self.allocator_and_pools: dict[str, Any] = {}",
+      "elide": ["类 docstring（L114-L133）正文可摘讲不必逐字内嵌；单例理由：C 扩展用一个全局变量存回调函数，多实例会互相覆盖导致 free 回调失效"],
+      "note": "对照 vLLM cumem.py:L90-L138。三处差异要点：①get_instance：vLLM 开头有 assert cumem_available，ascend 没有（移植时漏掉/简化）；②__init__：ascend 在构造时就 assert PYTORCH_NPU_ALLOC_CONF 不含 expandable_segments:True（硬拒绝），而 vLLM 改成在 use_memory_pool 里临时关闭再恢复（更宽容）——这是 ascend 基于较早版本 vLLM 移植、之后上游又演进的痕迹；③vLLM __init__ 末尾给 python_malloc/free 两个回调建强引用（PR 22724 防 GC），ascend 没有这一段。pointer_to_data 是核心账本：设备指针 → AllocationData(handle, tag, cpu_backup_tensor)。"
+    },
+    {
+      "path": "vllm_ascend/device_allocator/camem.py",
+      "lines": "L161-L176",
+      "code": "    def python_malloc_callback(self, allocation_handle: HandleType) -> None:\n        \"\"\"\n        Internal method to store the allocation data\n        when memory is allocated in the memory pool.\"\"\"\n        py_d_mem = allocation_handle[2]\n        self.pointer_to_data[py_d_mem] = AllocationData(allocation_handle, self.current_tag)\n        return\n\n    def python_free_callback(self, ptr: int) -> HandleType:\n        \"\"\"\n        Internal method to look up the allocation data\n        when memory is freed in the memory pool.\"\"\"\n        data = self.pointer_to_data.pop(ptr)\n        if data.cpu_backup_tensor is not None:\n            data.cpu_backup_tensor = None\n        return data.handle",
+      "elide": [],
+      "note": "对照 vLLM cumem.py:L140-L169（vLLM 叫 _python_malloc_callback/_python_free_callback 带下划线，且各有一句 logger.debug；ascend 去了下划线、删了 debug 日志）。malloc 回调：C 扩展 reserve+map 出物理页后，回调把 handle 记进账本，并贴上 current_tag。free 回调：torch GC 释放张量时被 C 扩展调用，弹出账本项并把 handle 交还给 C 去 unmap。py_d_mem = handle[2] 即设备虚拟地址，做账本 key。"
+    },
+    {
+      "path": "vllm_ascend/device_allocator/camem.py",
+      "lines": "L178-L208",
+      "code": "    def sleep(self, offload_tags: tuple[str, ...] | str | None = None) -> None:\n        \"\"\"\n        Put the allocator in sleep mode.\n        ...\n        \"\"\"\n        if offload_tags is None:\n            offload_tags = (CaMemAllocator.default_tag,)\n        elif isinstance(offload_tags, str):\n            offload_tags = (offload_tags,)\n\n        assert isinstance(offload_tags, tuple)\n\n        for ptr, data in self.pointer_to_data.items():\n            handle = data.handle\n            if data.tag in offload_tags:\n                size_in_bytes = handle[1]\n                cpu_backup_tensor = torch.empty(size_in_bytes, dtype=torch.uint8, device=\"cpu\", pin_memory=True)\n                cpu_ptr = cpu_backup_tensor.data_ptr()\n                ACL_MEMCPY_DEVICE_TO_HOST = 2\n                dest_max = cpu_ptr + size_in_bytes * 2\n                memcpy(cpu_ptr, dest_max, ptr, size_in_bytes, ACL_MEMCPY_DEVICE_TO_HOST)\n                data.cpu_backup_tensor = cpu_backup_tensor\n            unmap_and_release(handle)\n\n        gc.collect()\n        torch.npu.empty_cache()",
+      "elide": ["docstring L179-L185 可摘讲"],
+      "note": "核心方法。对照 vLLM cumem.py:L171-L219。控制流逐行同构，差异在拷贝原语：vLLM 一句 libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)；ascend 用 acl.rt.memcpy(dest, destMax, src, count, kind)——多两个 CANN 特有参数：destMax（目的缓冲上界，这里给 size*2 的宽松上界）和 kind（ACL_MEMCPY_DEVICE_TO_HOST=2 显式方向枚举）。其余差异：①ascend pin_memory=True 写死，vLLM 用 is_pin_memory_available()；②vLLM 有 total_bytes/backup_bytes 统计 + logger.info，ascend 全删；③torch.cuda.empty_cache() → torch.npu.empty_cache()。语义：命中 offload_tags 的先拷回 CPU 备份，再无差别地 unmap_and_release 把物理页还给系统（注意 unmap 在 if 外——所有 tag 的物理页都释放，只是命中的有 CPU 备份、其余直接丢）。"
+    },
+    {
+      "path": "vllm_ascend/device_allocator/camem.py",
+      "lines": "L210-L227",
+      "code": "    def wake_up(self, tags: list[str] | None = None) -> None:\n        \"\"\"\n        Wake up the allocator from sleep mode.\n        ...\n        \"\"\"\n        for ptr, data in self.pointer_to_data.items():\n            if tags is None or data.tag in tags:\n                handle = data.handle\n                create_and_map(handle)\n                if data.cpu_backup_tensor is not None:\n                    cpu_backup_tensor = data.cpu_backup_tensor\n                    if cpu_backup_tensor is not None:\n                        size_in_bytes = cpu_backup_tensor.numel() * cpu_backup_tensor.element_size()\n                        cpu_ptr = cpu_backup_tensor.data_ptr()\n                        ACL_MEMCPY_HOST_TO_DEVICE = 1\n                        dest_max = ptr + size_in_bytes * 2\n                        memcpy(ptr, dest_max, cpu_ptr, size_in_bytes, ACL_MEMCPY_HOST_TO_DEVICE)\n                        data.cpu_backup_tensor = None",
+      "elide": ["docstring L211-L214 可摘讲"],
+      "note": "对照 vLLM cumem.py:L221-L243。逐行同构。关键点：create_and_map(handle) 用同一个 handle（含原虚拟地址 ptr=handle[2]）重新申请物理页并映射回原虚拟地址——所以 PyTorch 里现存的所有张量指针仍然有效，这是虚拟内存方案的精髓（VA 不变、物理页可换）。有 CPU 备份的（weights）再 H2D 拷回；没备份的（被丢弃的 KV）只 map 出空物理页。拷贝同样换成 acl.rt.memcpy + ACL_MEMCPY_HOST_TO_DEVICE=1 + destMax。"
+    },
+    {
+      "path": "vllm_ascend/device_allocator/camem.py",
+      "lines": "L229-L263",
+      "code": "    @contextmanager\n    def use_memory_pool(self, tag: str | None = None):\n        \"\"\"\n        A context manager to use the memory pool.\n        ...\n        \"\"\"\n        if tag is None:\n            tag = CaMemAllocator.default_tag\n\n        assert isinstance(tag, str)\n\n        old_tag = self.current_tag\n        self.current_tag = tag\n        with use_memory_pool_with_allocator(self.python_malloc_callback, self.python_free_callback) as data:\n            self.allocator_and_pools[tag] = data\n            yield\n            self.current_tag = old_tag",
+      "elide": ["docstring L230-L236；以及保留在源码里的两段 PyTorch bug 注释（L246-L262，讲为何要存 data 引用、为何 yield 后不能 empty_cache），正文可摘讲不必逐字"],
+      "note": "对照 vLLM cumem.py:L245-L302。ascend 这版明显更短：vLLM 在进出时做 expandable_segments 临时开关（try/finally 包住）、yield 后还 snapshot() 出 allocated_size==0 的分配手动 unmap 释放。ascend 全都没有——再次印证 ascend 基于较早 vLLM 移植。语义：进区间设 current_tag，区间内分配都打这个 tag；存 data 引用是绕 PyTorch 2.6 的一个 GC bug（注释链接 pytorch#146431）。worker 用 tag='weights' 装权重、tag='kv_cache' 装 KV，于是 sleep level 1 只 offload weights、丢 kv_cache 成为可能。"
+    },
+    {
+      "path": "vllm_ascend/device_allocator/camem.py",
+      "lines": "L265-L273",
+      "code": "    def get_current_usage(self) -> int:\n        \"\"\"\n        Get the total number of bytes allocated in the memory pool.\n        \"\"\"\n        sum_bytes: int = 0\n        for ptr, data in self.pointer_to_data.items():\n            handle = data.handle\n            sum_bytes += handle[1]\n        return sum_bytes",
+      "elide": [],
+      "note": "对照 vLLM cumem.py:L304-L312，逐字一致。累加账本里每个 handle[1]（对齐字节数）。worker.load_model 用它 assert==0 来保证「一进程只能一个实例用 sleep mode」。"
+    },
+    {
+      "path": "vllm_ascend/worker/worker.py",
+      "lines": "L544-L555",
+      "code": "    def load_model(self) -> None:\n        if self.vllm_config.model_config.enable_sleep_mode:\n            allocator = CaMemAllocator.get_instance()\n            assert allocator.get_current_usage() == 0, \"Sleep mode can only be used for one instance per process.\"\n            context = allocator.use_memory_pool(tag=\"weights\")\n        else:\n            from contextlib import nullcontext\n\n            context = nullcontext()  # type: ignore\n\n        with context, set_current_vllm_config(self.vllm_config):\n            self.model_runner.load_model()",
+      "elide": [],
+      "note": "调用方证据①：权重加载被 use_memory_pool(tag='weights') 包住，所以权重张量全进 camem 池并打 'weights' 标签。未开 sleep mode 时退化成 nullcontext（普通分配器），零开销。"
+    },
+    {
+      "path": "vllm_ascend/worker/worker.py",
+      "lines": "L200-L226",
+      "code": "    def sleep(self, level: int = 1) -> None:\n        free_bytes_before_sleep = torch.npu.mem_get_info()[0]\n        # Save the buffers before level 2 sleep\n        if level == 2:\n            model = self.model_runner.model\n            self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}\n        allocator = CaMemAllocator.get_instance()\n        allocator.sleep(offload_tags=(\"weights\",) if level == 1 else tuple())\n        ...\n    def wake_up(self, tags: list[str] | None = None) -> None:\n        ...\n        allocator = CaMemAllocator.get_instance()\n        allocator.wake_up(tags=tags)",
+      "elide": ["sleep 里的 free/used 字节统计与 logger.info（L208-L216）、wake_up 里的 FRACTAL_NZ 校验与 w2_weight reshape（L219-L234+）可摘讲，非本章主线"],
+      "note": "调用方证据②：sleep 的两档语义在这一行 offload_tags 体现——level 1 传 ('weights',)：weights 拷回 CPU、kv_cache 直接丢（唤醒后 KV 重算）；level 2 传 tuple()（空元组）：什么都不 offload，weights 也丢，靠 wake_up 重新 load_model 从磁盘读回（level 2 前先单独把 buffers 存 CPU）。这解释了 camem.sleep 里 offload_tags 参数为何这么设计。"
+    },
+    {
+      "path": "vllm_ascend/patch/platform/patch_camem_allocator.py",
+      "lines": "L17-L28",
+      "code": "import vllm.config.model as model_config_module\n\n\ndef _patched_is_cumem_allocator_available() -> bool:\n    # NPUPlatform declares sleep mode support and vllm-ascend uses CaMemAllocator\n    # in the worker path. Avoid importing the extension here because ModelConfig\n    # validation runs before custom op initialization.\n    return True\n\n\nif hasattr(model_config_module, \"is_cumem_allocator_available\"):\n    model_config_module.is_cumem_allocator_available = _patched_is_cumem_allocator_available",
+      "elide": ["L1-L16 版权头"],
+      "note": "接入点。这是 ch03「五种重绑技法」里的库函数替换（技法④：换 vllm.config.model 模块里的一个函数名指向）——点名复用 ch03，别重讲技法本身。本章只讲它的两个特殊之处：①hasattr 守护＝前向兼容 fallback：上游 vLLM 若有 is_cumem_allocator_available 这个校验函数就替换它（让 ascend 的 CaMem 也算「allocator 可用」），没有就什么都不做；②重要事实——本书 pin 的 vLLM v0.21.0 base 里根本没有 is_cumem_allocator_available（全仓 grep 零命中），所以在当前 base 上这个 patch 是 no-op；真正放行 sleep mode 的是 NPUPlatform.is_sleep_mode_available() 返回 True（platform.py:L153），被 ModelConfig 校验（vllm/config/model.py:L507）命中。这个 patch 是为「上游把校验改成 is_cumem_allocator_available 的未来版本」预埋的防线。writer 务必如实说清，别把它写成当前生效的关键路径。"
+    }
+  ],
+
+  "key_classes": [
+    {"name": "CaMemAllocator", "file": "vllm_ascend/device_allocator/camem.py", "responsibility": "单例 pluggable allocator：用 pointer_to_data 账本管理 camem 池里的每块物理分配（handle+tag+CPU备份），提供 sleep/wake_up/use_memory_pool/get_current_usage。vLLM CuMemAllocator 的同构移植。"},
+    {"name": "AllocationData", "file": "vllm_ascend/device_allocator/camem.py", "responsibility": "dataclass：一块分配的账本记录——handle(四元组)、tag(weights/kv_cache/default)、cpu_backup_tensor(sleep 时的 CPU 备份，None=已丢弃/未备份)。"},
+    {"name": "HandleType (tuple[int,int,int,int])", "file": "vllm_ascend/device_allocator/camem.py", "responsibility": "(py_device, py_alignedSize, py_d_mem, py_p_memHandle) = (设备号, 对齐字节数, 设备虚拟地址, 物理句柄)；create_and_map/unmap_and_release 的参数载体。"},
+    {"name": "NPUWorker.sleep / wake_up / load_model", "file": "vllm_ascend/worker/worker.py", "responsibility": "上层调用方：load_model 用 use_memory_pool(tag='weights') 装权重；sleep(level) 把 'weights'(L1)/全部(L2) 交给 allocator.sleep；wake_up 唤醒。"},
+    {"name": "_patched_is_cumem_allocator_available", "file": "vllm_ascend/patch/platform/patch_camem_allocator.py", "responsibility": "hasattr 守护的前向兼容 patch：让 ascend 的 CaMem 满足上游（未来版本）ModelConfig 的 allocator 可用性校验。当前 pin 的 v0.21.0 上为 no-op。"}
+  ],
+
+  "data_flow": [
+    "启动：vllm_ascend_C 扩展加载 → camem.py 顶层 import 三个 C 入口、find_loaded_library 反查 .so 路径、camem_available=True",
+    "load_model（开 sleep mode）：worker.py load_model → CaMemAllocator.get_instance().use_memory_pool(tag='weights') → use_memory_pool_with_allocator → get_pluggable_allocator(init_module 登记回调) → NPUPluggableAllocator+MemPool → torch.npu.use_mem_pool 区间内 model_runner.load_model 的每次分配触发 python_malloc_callback → 账本记 {设备VA: AllocationData(handle,'weights')}",
+    "KV cache 初始化：同理走 use_memory_pool(tag='kv_cache')（worker.py L766），KV 块进 camem 池打 'kv_cache' 标签",
+    "sleep(level=1)：worker.sleep → allocator.sleep(offload_tags=('weights',)) → 遍历账本：'weights' 项 aclrtMemcpy D2H 拷回 pin CPU 备份；所有项 unmap_and_release 解绑物理页（'kv_cache' 无备份＝丢弃）→ gc.collect + torch.npu.empty_cache → 物理显存还给系统（虚拟地址保留）",
+    "wake_up：worker.wake_up → allocator.wake_up(tags) → 遍历账本：create_and_map(handle) 把物理页重新映射回原虚拟地址；有 CPU 备份的 aclrtMemcpy H2D 拷回（weights 复原），无备份的得到空物理页（KV 待重算）",
+    "free（张量被 GC）：torch 调 C 扩展 free → python_free_callback(ptr) 弹账本项、清 CPU 备份引用、把 handle 交还 C 去真正 unmap"
+  ],
+
+  "design_decisions": [
+    {"decision": "移植=同构换符号：camem.py 与 vLLM cumem.py 的类/方法/控制流逐行对位，只把 cudart/libcudart→acl.rt、CUDAPluggableAllocator→NPUPluggableAllocator、torch.cuda.*→torch.npu.*、C 扩展 cumem_allocator→vllm_ascend_C 替换", "why": "sleep mode 的本质（虚拟内存保留 VA、解绑/重绑物理页 + CPU offload 账本）与硬件无关，CANN 也提供等价的 reserve/map/unmap 虚拟内存原语，故无需重新设计，照搬结构最省事且最易跟上游同步", "evidence": "vllm_ascend/device_allocator/camem.py 全文 vs vllm/device_allocator/cumem.py 全文"},
+    {"decision": "拷贝原语用 acl.rt.memcpy(dest,destMax,src,count,kind) 而非 cudaMemcpy(dst,src,count)", "why": "CANN 的 aclrtMemcpy 强制要求 destMax（目的缓冲上界，防越界）和显式 kind（方向枚举 H2D=1/D2H=2），不像 CUDA 能从指针推断方向；destMax 给 size*2 的宽松上界", "evidence": "vllm_ascend/device_allocator/camem.py:L201-L203, L224-L226"},
+    {"decision": "expandable_segments 不兼容 memory pool —— ascend 在 __init__ 直接 assert 拒绝，而非像新版 vLLM 那样在 use_memory_pool 内临时关闭再恢复", "why": "ascend 基于较早版本 vLLM 移植，当时上游就是 init 期硬 assert；上游后来（pytorch#147851 期间）才改成动态开关。属移植时点的版本差，非有意设计", "evidence": "vllm_ascend/device_allocator/camem.py:L150-L155 vs vllm/device_allocator/cumem.py:L260-L268,L299-L302"},
+    {"decision": "sleep 两档语义由 worker 传 offload_tags 决定：level 1=('weights',)（weights 留 CPU、KV 丢），level 2=tuple()（全丢，weights 也丢）", "why": "权重唤醒后必须 bit 级一致（不能重算），故 offload 到 CPU；KV cache 可重算，丢弃省 CPU 内存与拷贝带宽；level 2 更激进，连 weights 都丢、靠重新 load_model 从磁盘读回", "evidence": "vllm_ascend/worker/worker.py:L207；camem.py sleep L195-L205（unmap 在 if 外＝所有 tag 都释放物理页，仅命中 tag 有 CPU 备份）"},
+    {"decision": "CaMemAllocator 必须单例", "why": "C 扩展用一个全局变量存 malloc/free 回调函数指针；多实例会互相覆盖，导致 free 回调指向错误实例的账本", "evidence": "vllm_ascend/device_allocator/camem.py:L126-L133（类 docstring）, L138-L147（get_instance）"},
+    {"decision": "patch_camem_allocator 用 hasattr 守护做前向兼容 fallback，且在当前 pin 的 vLLM v0.21.0 上是 no-op", "why": "上游 main 把 sleep 的 allocator 可用性校验抽成 is_cumem_allocator_available()（只认 CUDA/ROCm 的 CuMem），ascend 预埋一个替换让自己的 CaMem 也被认可；但 v0.21.0 base 尚无此函数，hasattr 为 False，patch 不动手；当前实际放行靠 NPUPlatform.is_sleep_mode_available()=True 被 ModelConfig 校验命中", "evidence": "patch_camem_allocator.py:L27；vllm/config/model.py:L507（is_sleep_mode_available 门）；vllm_ascend/platform.py:L153（返回 True）；全仓 grep is_cumem_allocator_available 在 v0.21.0 零命中"}
+  ],
+
+  "theory": [
+    {"topic": "虚拟内存：VA 与物理页解耦", "content": "现代设备内存分配分两层：先 reserve 一段连续虚拟地址（VA）空间，再申请物理页（physical handle）并 map 到该 VA。指针指向的是 VA。sleep 时 unmap 并 release 物理页——VA 仍被占着（保留），物理显存却还给了系统；wake_up 时重新申请物理页 map 回同一段 VA。因为 VA 不变，PyTorch 里所有已存的张量指针、计算图引用全部依旧有效，无需重建模型。这是 sleep mode 能「原地睡醒」的根本。CANN 把 reserve/malloc-physical/map/unmap 封装进 vllm_ascend_C 的 python_create_and_map / python_unmap_and_release。"},
+    {"topic": "sleep 节省了多少 / offload vs discard 的取舍", "content": "设权重 W 字节、KV cache K 字节。level 1 sleep 后：设备物理显存释放 W+K（全 unmap），其中 W 落到 CPU pin 内存（占 CPU W 字节 + 一次 D2H 拷贝 ≈ W/带宽），K 直接丢（0 CPU、0 拷贝，代价是唤醒后 KV 需重算/重新 prefill）。wake_up 代价：重新 map W+K 物理页 + H2D 拷回 W。对照 level 2：连 W 也丢，CPU 占用≈0，但唤醒要重新 load_model 从磁盘读 W（最慢）。取舍轴＝[唤醒延迟] vs [睡眠期 CPU/host 内存占用]。"},
+    {"topic": "pluggable allocator 的回调闭环", "content": "torch 的 NPUPluggableAllocator 让用户接管 malloc/free。init_module 把 Python 的 python_malloc_callback/python_free_callback 登记进 C 扩展全局变量。此后 use_mem_pool 区间内：每次 torch 要显存 → C 扩展 reserve+map 物理页 → 回调 python_malloc_callback 记账本（贴 current_tag）；每次张量 GC → C 扩展 free → 回调 python_free_callback 弹账本、把 handle 交还 C 去 unmap。账本（pointer_to_data）就是 sleep/wake_up 能逐块 offload/重映射的依据。"}
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "camem.py 顶层 import 的版权头 L1-L16", "why_safe": "非代码逻辑，正文不内嵌版权头（零脚手架/噪声）"},
+      {"what": "except ImportError 兜底里的 libcudart = None（L72）", "why_safe": "全文再无 libcudart 引用，是移植自 vLLM 的死变量；删之不改任何控制流。但精简版若保留也无害——建议保留并加 # SUBTRACTED 注释说明它是 vLLM 残留，更利于讲'换符号'。implementer 二选一即可，勿误删其它兜底赋值"},
+      {"what": "worker.py sleep 内的 free/used 字节统计与 logger.info（L208-L216）、wake_up 内的 FRACTAL_NZ 校验与 w2_weight reshape（L219 起非 allocator 调用部分）", "why_safe": "这些是 worker 侧的日志/昇腾权重格式细节，非 camem allocator 主线；本章只需 worker 调 allocator.sleep/wake_up 的那两行。注意：这是『正文聚焦』层面的省略，不是要 implementer 删 camem.py 的精简版——camem.py 精简版应保留全部主线"}
+    ],
+    "must_keep": [
+      {"symbol": "find_loaded_library", "why": "NPUPluggableAllocator 需 .so 路径；展示从 /proc/self/maps 反查的技巧，且与 vLLM 逐字同构（换符号叙事的样本）"},
+      {"symbol": "camem_available", "why": "sleep mode 可用性开关；导入失败降级的证据"},
+      {"symbol": "HandleType", "why": "四元组语义(device,size,VA,physHandle)是理解 sleep/wake 的钥匙"},
+      {"symbol": "AllocationData", "why": "账本记录结构：handle+tag+cpu_backup_tensor 三字段是 offload/discard 取舍的载体"},
+      {"symbol": "create_and_map", "why": "wake_up 重映射物理页到原 VA 的入口——虚拟内存方案核心"},
+      {"symbol": "unmap_and_release", "why": "sleep 释放物理页的入口——把显存还给系统的核心"},
+      {"symbol": "get_pluggable_allocator", "why": "init_module 登记回调 + 造 NPUPluggableAllocator，回调闭环起点"},
+      {"symbol": "use_memory_pool_with_allocator", "why": "进入 MemPool 上下文，让区间分配走 camem"},
+      {"symbol": "CaMemAllocator", "why": "本章主角类"},
+      {"symbol": "get_instance", "why": "单例入口，与 C 扩展全局回调一致性强相关"},
+      {"symbol": "pointer_to_data", "why": "核心账本；sleep/wake_up/get_current_usage 都遍历它"},
+      {"symbol": "python_malloc_callback", "why": "分配回调记账本+贴 tag"},
+      {"symbol": "python_free_callback", "why": "释放回调弹账本+交还 handle"},
+      {"symbol": "sleep", "why": "本章核心方法之一——offload+unmap"},
+      {"symbol": "wake_up", "why": "本章核心方法之一——remap+拷回"},
+      {"symbol": "use_memory_pool", "why": "打 tag 的上下文，weights/kv_cache 分流的来源"},
+      {"symbol": "get_current_usage", "why": "worker.load_model 用它 assert 单实例"},
+      {"symbol": "memcpy", "why": "acl.rt.memcpy；ACL_MEMCPY_DEVICE_TO_HOST/HOST_TO_DEVICE + destMax 是与 cudaMemcpy 的关键差异点"},
+      {"symbol": "current_tag", "why": "use_memory_pool 设置、malloc 回调读取，tag 分流机制"},
+      {"symbol": "_patched_is_cumem_allocator_available", "why": "patch 接入点函数；hasattr 守护 fallback 的主体"}
+    ]
+  },
+
+  "diagram_plan": [
+    {"name": "roadmap", "spec": "复用 book/assets/roadmap/roadmap.py，高亮『显存底座 / sleep-mode』节点；前接 ch06（NPUCommunicator/ctypes 范式），本章把 ctypes-style C 扩展绑定用在 camem allocator 上；后接显存/图捕获线", "highlight_nodes": ["ch07-sleep-mode-camem"]},
+    {"name": "virtual_memory_sleep_wake", "spec": "svg-diagram：三态横向时间线。状态A『清醒』：VA 区间 ← map → 物理页(weights 实心/kv_cache 实心) + 设备显存条满。状态B『sleep(level1)』：同一 VA 区间保留(虚框)，weights 物理页→CPU pin 备份(虚线箭头 D2H)、kv_cache 物理页→丢弃(✗)，设备显存条空。状态C『wake_up』：物理页重新 map 回原 VA(实线箭头)，weights 从 CPU 拷回(H2D)、kv_cache 空页待重算。强调 VA 地址值三态不变。", "highlight_nodes": []},
+    {"name": "pluggable_allocator_callback_loop", "spec": "svg-diagram：回调闭环。左 torch(npu.use_mem_pool 区间) —分配→ NPUPluggableAllocator —C扩展 reserve+map→ 物理页 —回调→ python_malloc_callback —写→ pointer_to_data 账本(贴 current_tag)。反向：张量 GC → C free → python_free_callback → 弹账本/交还 handle。标 init_module 登记回调这条登记线。", "highlight_nodes": []},
+    {"name": "cumem_vs_camem_symbol_swap", "spec": "svg-diagram：左右两列逐行对位表（vLLM cumem.py | ascend camem.py），高亮换符号的行：vllm.cumem_allocator→vllm_ascend.vllm_ascend_C、CudaRTLibrary/libcudart.cudaMemcpy→acl.rt.memcpy、CUDAPluggableAllocator→NPUPluggableAllocator、torch.cuda.*→torch.npu.*、PYTORCH_CUDA_ALLOC_CONF→PYTORCH_NPU_ALLOC_CONF。另标几处『结构性差异(非换符号)』：expandable_segments init-assert vs use_memory_pool 动态开关、strong-ref 回调(vLLM 有/ascend 无)、snapshot 释放零分配(vLLM 有/ascend 无)。", "highlight_nodes": []}
+  ],
+
+  "foreshadow_due": {
+    "raise": [],
+    "recover": [
+      {"id": "f4", "what": "ch06 埋下：NPUCommunicator.ca_comm=None 占位 + pyhccl 的 ctypes 范式样本（显存/分配器/图捕获线推进时回收）", "how_in_ch07": "ch07 正是『显存/分配器线』的推进点：camem allocator 全程依赖 ctypes-style 的 C 扩展绑定——from acl.rt import memcpy、from vllm_ascend.vllm_ascend_C import init_module/python_create_and_map/python_unmap_and_release，与 ch06 pyhccl 用 ctypes 绑 libhccl 是同一种『Python 薄封装 C/底层库』范式。可在本章点名回收 f4 的 ctypes 范式部分（分配器侧）。注意 ca_comm（custom all-reduce）/graph capture 这一支不在 ch07 范围，f4 未完全闭合——仅回收『ctypes 范式 + 显存分配器』这一半，custom all-reduce/图捕获留待后续章节。建议 writer 在收尾点一句『分配器线已用上 ctypes 范式，图捕获线待后续』，并请 archivist 据实更新 f4 状态为部分回收。"}
+    ]
+  }
+}

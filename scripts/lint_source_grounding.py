@@ -19,8 +19,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 try:
     import instance as _instance
     _PREFIX = _instance.canonical_prefix()
+    # 姊妹篇：章节合法地同时引用本仓(vllm_ascend/)与对照基座(vllm/)源码，两者都算源码落点。
+    _BASE_PREFIX = None
+    try:
+        import json as _json
+        _root = _json.load(open(Path(__file__).resolve().parent.parent / "repo2book.json"))
+        _dep = (_root.get("instances", {}).get(_instance.active_name(), {}) or {}).get("depends_on")
+        if _dep:
+            _BASE_PREFIX = _json.load(open(
+                Path(__file__).resolve().parent.parent / "instances" / _dep / "repo2book.json"
+            )).get("source", {}).get("canonical_prefix") or _dep
+    except Exception:
+        _BASE_PREFIX = None
 except Exception:
-    _PREFIX = "vllm"
+    _PREFIX, _BASE_PREFIX = "vllm", None
+_SRC_PREFIXES = [p for p in (_PREFIX, _BASE_PREFIX) if p]
 
 
 def lint_source_grounding(chapter_dir: str) -> dict:
@@ -93,11 +106,12 @@ def lint_source_grounding(chapter_dir: str) -> dict:
     issues = []
     if impl_notes.exists():
         notes = impl_notes.read_text(encoding="utf-8")
-        # 实例无关：用活动实例的规范前缀（vllm / vllm_ascend / …）计源码文件
-        src_files = re.findall(rf'{re.escape(_PREFIX)}/[\w/]+\.py', notes)
+        # 实例无关：用活动实例规范前缀 + 对照基座前缀（姊妹篇引用基座 vllm/ 也算）计源码文件
+        alt = "|".join(re.escape(p) for p in _SRC_PREFIXES)
+        src_files = set(re.findall(rf'(?:{alt})/[\w/]+\.py', notes))
         if len(src_files) < 3:
             issues.append(
-                f"  Only {len(src_files)} {_PREFIX} files mentioned (need >= 3)"
+                f"  Only {len(src_files)} source files mentioned ({'/'.join(_SRC_PREFIXES)}; need >= 3)"
             )
     results["vllm_files_listed"] = issues
 
