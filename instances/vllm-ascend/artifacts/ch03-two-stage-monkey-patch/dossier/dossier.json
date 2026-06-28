@@ -1,0 +1,213 @@
+{
+  "chapter_id": "ch03",
+  "title": "旗舰地基章——两段式 monkey-patch：OOT 插件不改 vLLM 一行源码就整体接管",
+  "one_line_thesis": "vllm-ascend 作为 OOT（out-of-tree）插件，通过单一入口 adapt_patch(is_global_patch) 把 monkey-patch 拆成 platform（进程级、构图前）与 worker（worker.__init__ 时）两个阶段；patch 的执行靠 import 副作用；条件加载用 is_310p / HAS_TRITON / vllm_version_is 裁剪；重绑定共 5 类技法（整类替换 / 工厂(注册表)替换 / 方法替换 / 库函数 wrapper / from-import 缓存陷阱修复）。",
+
+  "code_spine": [
+    "vllm_ascend/utils.py:L511-L515  —— adapt_patch 单一入口：is_global_patch 二分，分别 import platform / worker 包",
+    "vllm_ascend/platform.py:L181-L186 —— platform 段触发点 ①：NPUPlatform.pre_register_and_update() 在构图前调用 adapt_patch(is_global_patch=True)",
+    "vllm_ascend/__init__.py:L23-L37  —— platform 段触发点 ②：_ensure_global_patch() 幂等守卫 + adapt_patch(is_global_patch=True)",
+    "vllm_ascend/__init__.py:L46-L69  —— general_plugins 入口 register_connector / register_model_loader / register_service_profiling 各自先调 _ensure_global_patch()（回收 ch02 伏笔 f1）",
+    "vllm_ascend/worker/worker.py:L99-L102 —— worker 段触发点：NPUWorker.__init__ 调 adapt_patch()（默认 is_global_patch=False）",
+    "vllm_ascend/patch/__init__.py:L17-L27 —— 两段式总纲注释：platform=worker 启动前、由 pre_register_and_update 调；worker=worker 启动时、由各 worker __init__ 调",
+    "vllm_ascend/patch/platform/__init__.py:L17-L50 —— platform 段清单：靠一串 import 触发副作用 + 条件加载（is_310p 分叉 mamba_config；EPLB 环境变量门控 multiproc_executor）",
+    "vllm_ascend/patch/worker/__init__.py:L18-L70 —— worker 段清单：HAS_TRITON 门控 triton patch；vllm_version_is('0.21.0') 决定 patch_v2 整组不加载；is_310p 分叉",
+    "vllm_ascend/patch/platform/patch_multiproc_executor.py:L24-L211 —— 技法①整类替换样本：AscendMultiprocExecutor(MultiprocExecutor) → 末行 vllm....MultiprocExecutor = AscendMultiprocExecutor",
+    "vllm_ascend/patch/platform/patch_scheduler.py:L5-L45 —— 技法③方法替换样本：模块级 _mamba_block_aligned_split → Scheduler._mamba_block_aligned_split = _mamba_block_aligned_split",
+    "vllm_ascend/patch/platform/patch_distributed.py:L33-L89 —— 技法④库函数 wrapper + 技法⑤from-import 缓存陷阱：torch.distributed.{broadcast,all_reduce} 与其 distributed_c10d 别名同时重绑",
+    "vllm_ascend/patch/worker/patch_triton.py:L1-L20 —— 技法④库函数 wrapper 极简样本：triton.next_power_of_2 = next_power_of_2",
+    "vllm_ascend/patch/platform/patch_mamba_manager.py:L18-L53 —— 技法②工厂(注册表)替换样本：类替换 + spec_manager_map[MambaSpec] = AscendMambaManager 派发表改写",
+    "vllm_ascend/patch/worker/patch_distributed.py:L79-L233 —— 综合样本（源码真实顺序：两个 helper 在前 L79-L97、class 在后 L100-L229、双绑在末 L232-L233）：destroy_distributed_environment wrapper + GroupCoordinator 整类替换 + 同名再导出双绑"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm_ascend/utils.py",
+      "lines": "L511-L515",
+      "code": "def adapt_patch(is_global_patch: bool = False):\n    if is_global_patch:\n        from vllm_ascend.patch import platform  # noqa: F401\n    else:\n        from vllm_ascend.patch import worker  # noqa: F401",
+      "elide": ["无可省略分支——整函数仅 5 行，是全章唯一入口。注意它不调用任何 apply()，patch 全靠 import 这两个包时执行的模块级副作用代码"]
+    },
+    {
+      "path": "vllm_ascend/platform.py",
+      "lines": "L181-L186",
+      "code": "    @classmethod\n    def pre_register_and_update(cls, parser: FlexibleArgumentParser | None = None) -> None:\n        # Adapt the global patch here.\n        from vllm_ascend.utils import adapt_patch\n\n        adapt_patch(is_global_patch=True)",
+      "elide": ["本方法后续还会把 'ascend' quantization 注入 argparser、按 is_310p 导入量化配置、跑 config_deprecated_logging()——与 patch 主线无关，可在正文省略，只保留 adapt_patch(is_global_patch=True) 这一句证明 platform 段在『进程早期、构图前』被触发"]
+    },
+    {
+      "path": "vllm_ascend/__init__.py",
+      "lines": "L20-L69",
+      "code": "_GLOBAL_PATCH_APPLIED = False\n\n\ndef _ensure_global_patch():\n    \"\"\"Apply process-wide vLLM patches before engine-core initialization.\n\n    vLLM loads general plugins in engine-core subprocesses. E2E test\n    conftest hooks do not run there, so global patches that affect scheduler\n    and engine code must also be applied through these plugin entry points.\n    \"\"\"\n    global _GLOBAL_PATCH_APPLIED\n    if _GLOBAL_PATCH_APPLIED:\n        return\n\n    from vllm_ascend.utils import adapt_patch\n\n    adapt_patch(is_global_patch=True)\n    _GLOBAL_PATCH_APPLIED = True\n\n\ndef register():\n    \"\"\"Register the NPU platform.\"\"\"\n\n    return \"vllm_ascend.platform.NPUPlatform\"\n\n\ndef register_connector():\n    _ensure_global_patch()\n\n    from vllm_ascend.distributed.kv_transfer import register_connector\n\n    register_connector()\n\n\ndef register_model_loader():\n    _ensure_global_patch()\n\n    from .model_loader.netloader import register_netloader\n    from .model_loader.rfork import register_rforkloader\n\n    register_netloader()\n    register_rforkloader()\n\n\ndef register_service_profiling():\n    _ensure_global_patch()\n\n    from .profiling_config import generate_service_profiling_config\n\n    generate_service_profiling_config()",
+      "elide": ["register_model() 不调 _ensure_global_patch（它只注册模型，不依赖 patch），可在正文一句带过。这里要点：进程级幂等守卫 _GLOBAL_PATCH_APPLIED 保证 platform 段只跑一次——因为多个 general_plugins 入口（connector/loader/profiling）都会抢着触发它，docstring 解释了为何 engine-core 子进程需要这条二次触发路径（conftest 钩子不在子进程跑）。这正是 ch02 埋下的 f1 伏笔的回收点"]
+    },
+    {
+      "path": "vllm_ascend/worker/worker.py",
+      "lines": "L99-L102",
+      "code": "        # register patch for vllm\n        from vllm_ascend.utils import adapt_patch\n\n        adapt_patch()",
+      "elide": ["NPUWorker.__init__ 上下文里前有 COMPILE_CUSTOM_KERNELS 告警、后有 ops.register_dummy_fusion_op()/register_ascend_customop(vllm_config)/init_ascend_config(vllm_config)——正文只需 adapt_patch() 这一句证明 worker 段在『每个 worker 进程构造时』触发，且默认 is_global_patch=False 故走 worker 包"]
+    },
+    {
+      "path": "vllm_ascend/patch/__init__.py",
+      "lines": "L17-L27",
+      "code": "# ----------------------------------------------------------------------------------\n# This module manage the patch for vllm. There are two folders in this module:\n# - platform: contains the patches applied before worker starts. It's called by\n#             `vllm_ascend.utils.adapt_patch(is_global_patch=True)` in\n#             `vllm_ascend.platform.NPUPlatform.pre_register_and_update()` function.\n# - worker: contains the patches applied when worker starts. It's called by\n#           `vllm_ascend.utils.adapt_patch(is_global_patch=False)` in\n#           each worker's `__init__` function.\n#\n# Once a new patch is added in vllm-ascend, please add the patch description into this file as well.\n# ----------------------------------------------------------------------------------",
+      "elide": ["此文件其余 800+ 行是逐个 patch 的 Why/How/Related PR/Future Plan 文档（platform 段 ~16 项、worker 段 ~28 项），是一份『patch 台账』。正文引这段总纲注释即可，无需内嵌全部台账；可挑 patch_distributed(310p 对齐)、patch_multiproc_executor(daemon=False/EPLB)、patch_scheduler(去 assert) 三条台账与样本代码对照"]
+    },
+    {
+      "path": "vllm_ascend/patch/platform/__init__.py",
+      "lines": "L17-L50",
+      "code": "import os\n\nimport vllm_ascend.patch.platform.patch_camem_allocator  # noqa\nimport vllm_ascend.patch.platform.patch_distributed  # noqa\nimport vllm_ascend.patch.platform.patch_kv_cache_interface  # noqa\nimport vllm_ascend.patch.platform.patch_kv_cache_utils  # noqa\nimport vllm_ascend.patch.platform.patch_mla_prefill_backend  # noqa\nfrom vllm_ascend.utils import is_310p\n\nif not is_310p():\n    import vllm_ascend.patch.platform.patch_mamba_config  # noqa\nelse:\n    import vllm_ascend.patch.platform.patch_mamba_config_310  # noqa\nimport vllm_ascend.patch.platform.patch_minimax_m2_config  # noqa\nimport vllm_ascend.patch.platform.patch_minimax_usage_accounting  # noqa\nimport vllm_ascend.patch.platform.patch_glm_tool_call_streaming  # noqa\nimport vllm_ascend.patch.platform.patch_glm47_tool_call_parser  # noqa\nimport vllm_ascend.patch.platform.patch_anthropic_system_message  # noqa\nimport vllm_ascend.patch.platform.patch_minimax_m2_tool_call_parser  # noqa\nimport vllm_ascend.patch.platform.patch_deepseek_v4_tool_call_parser  # noqa\nimport vllm_ascend.patch.platform.patch_deepseek_v4_thinking  # noqa\nimport vllm_ascend.patch.platform.patch_torch_accelerator  # noqa\nimport vllm_ascend.patch.platform.patch_tool_choice_none_content  # noqa\nimport vllm_ascend.patch.platform.patch_mamba_manager  # noqa\n\nif os.getenv(\"DYNAMIC_EPLB\", \"false\").lower() in (\"true\", \"1\") or os.getenv(\"EXPERT_MAP_RECORD\", \"false\") == \"true\":\n    import vllm_ascend.patch.platform.patch_multiproc_executor  # noqa\n\nimport vllm_ascend.patch.platform.patch_balance_schedule  # noqa\n\nimport vllm_ascend.patch.platform.patch_kv_cache_coordinator  # noqa\nimport vllm_ascend.patch.platform.patch_speculative_config  # noqa\n\nimport vllm_ascend.patch.platform.patch_scheduler  # noqa",
+      "elide": ["中间一长串 patch_* import（minimax/glm/deepseek/anthropic 等业务 patch）正文可折叠成『…一系列模型/协议特化 patch…』，但必须保留三处『条件加载』骨架：(1) is_310p() 二选一加载 mamba_config vs mamba_config_310；(2) os.getenv('DYNAMIC_EPLB')/'EXPERT_MAP_RECORD' 门控 patch_multiproc_executor（即整类替换样本默认不加载，只在 EPLB 场景生效）；(3) 这是一个『裸 import 列表』，每个 import 就执行一次对应模块的副作用 = 一次 patch"]
+    },
+    {
+      "path": "vllm_ascend/patch/worker/__init__.py",
+      "lines": "L18-L70",
+      "code": "from vllm.triton_utils import HAS_TRITON\n\nfrom vllm_ascend.utils import is_310p, vllm_version_is\n\n# v2 model runner patches depend on upstream main APIs beyond v0.21.0.\n_V2_MODEL_RUNNER_SUPPORTED = not vllm_version_is(\"0.21.0\")\n\nif HAS_TRITON:\n    import vllm_ascend.patch.worker.patch_triton\n\n    if _V2_MODEL_RUNNER_SUPPORTED:\n        import vllm_ascend.patch.worker.patch_v2.patch_triton  # noqa\n\n\nimport vllm_ascend.patch.worker.patch_weight_utils  # noqa\nimport vllm_ascend.patch.worker.patch_distributed  # noqa\n# ... 一系列模型/算子 worker patch（minimax / mamba_utils / qwen3_* / rejection_sampler / cudagraph / deepseek_mtp / gqa_c8 等）...\n\nif not is_310p():\n    import vllm_ascend.patch.worker.patch_qwen3_5  # noqa\n    import vllm_ascend.patch.worker.patch_gdn_attn  # noqa\n    import vllm_ascend.patch.worker.patch_qwen3_dflash  # noqa\n    import vllm_ascend.patch.worker.patch_qwen3vl  # noqa\nelse:\n    import vllm_ascend.patch.worker.patch_idex_310  # noqa\n\ntry:  # noqa: SIM105\n    import vllm_ascend.patch.worker.patch_npugraph_ex_triton  # noqa\nexcept ImportError:\n    pass\n\nif _V2_MODEL_RUNNER_SUPPORTED:\n    import vllm_ascend.patch.worker.patch_v2.patch_uva  # noqa\n    import vllm_ascend.patch.worker.patch_v2.patch_input_batch  # noqa\n    import vllm_ascend.patch.worker.patch_v2.patch_model_state  # noqa\n    import vllm_ascend.patch.worker.patch_v2.patch_block_table  # noqa\n    import vllm_ascend.patch.worker.patch_v2.patch_attn_utils  # noqa\n\n# only patch routed experts capture in main2main.\nif _V2_MODEL_RUNNER_SUPPORTED:\n    import vllm_ascend.patch.worker.patch_routed_experts_capture  # noqa",
+      "elide": ["我已折叠中段约 10 个无条件 worker patch import（patch_minimax_m2 / patch_minimax_m2_linear_attn / patch_mamba_utils / patch_qwen3_next_mtp / patch_rejection_sampler / patch_kimi_k25 / patch_draft_quarot / patch_cudagraph / patch_deepseek_mtp / patch_gqa_c8）。务必保留四处条件骨架：(1) HAS_TRITON 门控 triton patch；(2) _V2_MODEL_RUNNER_SUPPORTED = not vllm_version_is('0.21.0')——在本书 pin 的 v0.21.0 基座上为 False，故 patch_v2 整组与 patch_routed_experts_capture 全部不加载（这是『版本条件加载』最直观的例子）；(3) is_310p 二选一；(4) try/except ImportError 包住 npugraph_ex（CPU-only/无 torch_npu 环境可跳过）"]
+    },
+    {
+      "path": "vllm_ascend/patch/platform/patch_multiproc_executor.py",
+      "lines": "L24-L25, L195-L211",
+      "code": "class AscendMultiprocExecutor(MultiprocExecutor):\n    def _init_executor(self) -> None:\n        ...\n        # （子类完整重写 _init_executor / _get_parallel_sizes / _is_driver_worker，\n        #   并在 make_worker_process 中以 daemon=False 启动子进程）\n        proc = context.Process(\n            target=WorkerProc.worker_main,\n            kwargs=process_kwargs,\n            name=f\"VllmWorker-{rank}\",\n            daemon=False,\n        )\n        ...\n\n\nvllm.v1.executor.multiproc_executor.MultiprocExecutor = AscendMultiprocExecutor",
+      "elide": ["_init_executor / make_worker_process 内部约 180 行是从 vLLM 原 MultiprocExecutor 大段复制（消息队列、worker 拉起、ready/death pipe、failure 清理），与『整类替换』这一招本身无关——正文只需点出两件事：(1) 子类继承 MultiprocExecutor 后整体重写关键方法，核心差异是子进程 daemon=False（台账原因：daemon=True 不允许 EPLB 再 fork 子进程）；(2) 末行用 AscendMultiprocExecutor 直接覆盖模块属性 MultiprocExecutor —— 这就是『整类替换』。注意此 patch 仅在 DYNAMIC_EPLB/EXPERT_MAP_RECORD 环境变量开启时才被 platform/__init__ 加载"]
+    },
+    {
+      "path": "vllm_ascend/patch/platform/patch_scheduler.py",
+      "lines": "L1-L45",
+      "code": "from vllm.v1.core.sched.scheduler import Scheduler\nfrom vllm.v1.request import Request\n\n\ndef _mamba_block_aligned_split(\n    self,\n    request: Request,\n    num_new_tokens: int,\n    num_new_local_computed_tokens: int = 0,\n    num_external_computed_tokens: int = 0,\n) -> int:\n    num_computed_tokens = request.num_computed_tokens + num_new_local_computed_tokens + num_external_computed_tokens\n    if num_computed_tokens < max(request.num_prompt_tokens, request.num_tokens - 1):\n        block_size = self.cache_config.block_size\n        last_cache_position = request.num_tokens - request.num_tokens % block_size\n        if self.use_eagle:\n            last_cache_position = max(last_cache_position - block_size, 0)\n        num_computed_tokens_after_sched = num_computed_tokens + num_new_tokens\n        if num_computed_tokens_after_sched < last_cache_position:\n            num_new_tokens = num_new_tokens // block_size * block_size\n        elif num_computed_tokens < last_cache_position < num_computed_tokens_after_sched:\n            num_new_tokens = last_cache_position - num_computed_tokens\n        else:\n            pass\n    return num_new_tokens\n\n\nScheduler._mamba_block_aligned_split = _mamba_block_aligned_split",
+      "elide": ["函数体内多行块对齐/eagle 剪枝注释已删（正文可保留 1-2 行解释）。关键：定义一个带显式 self 形参的模块级普通函数，再把它赋给 Scheduler._mamba_block_aligned_split —— 这就是『方法替换』。与整类替换的区别：不新建子类、不动其它方法，只换这一个绑定方法（台账原因：原 vLLM 该方法有 assert，外部 KV connector 命中时会失败，此版去掉了 assert）"]
+    },
+    {
+      "path": "vllm_ascend/patch/platform/patch_distributed.py",
+      "lines": "L33-L89",
+      "code": "def communication_adaptation_310p():\n    def broadcast310p_wrapper(fn):\n        def broadcast310p(tensor, src=0, group=None, async_op=False, group_src=None):\n            root = group_src if group_src is not None else src\n\n            if tensor.device == torch.device(\"cpu\"):\n                return fn(tensor, src=root, group=group, async_op=async_op)\n            rank = torch.distributed.get_rank(group)\n            world_size = torch.distributed.get_world_size(group)\n            tensor_list = [torch.empty_like(tensor) for _ in range(world_size)]\n            tensor_list[rank] = tensor\n            torch.distributed.all_gather(tensor_list, tensor, group=group)\n            tensor[...] = tensor_list[src]\n            if async_op:\n                return NullHandle()\n            else:\n                return None\n\n        return broadcast310p\n\n    torch.distributed.broadcast = broadcast310p_wrapper(torch.distributed.broadcast)\n    torch.distributed.distributed_c10d.broadcast = broadcast310p_wrapper(torch.distributed.distributed_c10d.broadcast)\n\n    def all_reduce_wrapper_310p(fn):\n        def all_reduce(\n            tensor,\n            op=torch.distributed.ReduceOp.SUM,\n            group=None,\n            async_op=False,\n        ):\n            if tensor.dtype != torch.int64:\n                return fn(tensor, op, group, async_op)\n            ...\n        return all_reduce\n\n    torch.distributed.all_reduce = all_reduce_wrapper_310p(torch.distributed.all_reduce)\n    torch.distributed.distributed_c10d.all_reduce = all_reduce_wrapper_310p(\n        torch.distributed.distributed_c10d.all_reduce\n    )\n\n\nif get_ascend_device_type() == AscendDeviceType._310P:\n    communication_adaptation_310p()",
+      "elide": ["all_reduce 内 int64 路径的 all_gather + SUM/MAX 归约细节已折叠（正文保留『仅对 int64 走自定义路径，否则透传原 fn』这一控制流）。两个要点：(1) 库函数 wrapper——broadcast310p_wrapper(fn) 闭包捕获原函数 fn，新函数在前后补 310p 张量对齐逻辑、不满足条件时回落 fn(...)，是典型 wrapper（技法④）；(2) from-import 缓存陷阱修复（技法⑤）——同一个函数在 torch.distributed.broadcast 与 torch.distributed.distributed_c10d.broadcast 两个名字下都被重绑，因为不同调用方可能 `from torch.distributed.distributed_c10d import broadcast` 把引用缓存进自己模块，只改顶层名字会漏网。整个 patch 还被 `if ... _310P` 包住——非 310p 设备该文件 import 后什么都不做（运行期条件加载）"]
+    },
+    {
+      "path": "vllm_ascend/patch/worker/patch_triton.py",
+      "lines": "L1-L20",
+      "code": "import vllm.model_executor.layers.fla.ops\nimport vllm.model_executor.layers.mamba.ops.causal_conv1d\nimport vllm.v1.worker.gpu.sample.gumbel\nfrom vllm.triton_utils import HAS_TRITON, triton\nfrom vllm.utils.math_utils import next_power_of_2\n\nfrom vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule\n...\n\ntriton.next_power_of_2 = next_power_of_2\n\nvllm.model_executor.layers.mamba.ops.causal_conv1d.causal_conv1d_update = causal_conv1d_update_npu\nvllm.model_executor.layers.mamba.ops.causal_conv1d.causal_conv1d_fn = causal_conv1d_fn",
+      "elide": ["文件后半段（HAS_TRITON 为 False 时注入两个纯 PyTorch 回退函数 _fused_post_conv_prep_pytorch / _fused_recurrent_packed_decode_pytorch）正文可一句带过。这里用作技法④最干净的一行样本：triton.next_power_of_2 = next_power_of_2 —— 把 vLLM 自带的 next_power_of_2 直接挂到 triton 模块上（台账原因：torch_npu 捆绑的 Triton 没有 next_power_of_2，而 vLLM/ascend 在 94+ 处调它）。这是『给库模块补/换函数』，不涉及类或 self"]
+    },
+    {
+      "path": "vllm_ascend/patch/platform/patch_mamba_manager.py",
+      "lines": "L18-L53",
+      "code": "class AscendMambaManager(MambaManager):\n    def __init__(self, kv_cache_spec: MambaSpec, block_pool: BlockPool, **kwargs) -> None:\n        super().__init__(kv_cache_spec, block_pool, **kwargs)\n        if self.enable_caching:\n            self.block_size = kv_cache_spec.block_size\n\n    @classmethod\n    def find_longest_cache_hit(cls, ...) -> tuple[list[KVCacheBlock], ...]:\n        ...\n\n\nsingle_type_kv_cache_manager.MambaManager = AscendMambaManager\nsingle_type_kv_cache_manager.spec_manager_map[MambaSpec] = AscendMambaManager",
+      "elide": ["find_longest_cache_hit 的块命中扫描实现（约 12 行）正文可略。要点是技法②工厂/注册表替换：除了把类名 MambaManager 重绑（整类替换），还额外改写了 spec_manager_map[MambaSpec] —— 这是 vLLM 用来按 KVCacheSpec 类型派发 manager 的『工厂派发表』，若只换类名而不换表项，工厂仍会按旧表造出原版 MambaManager。故『谁来 new 这个类』决定了必须连派发表一起改"]
+    },
+    {
+      "path": "vllm_ascend/patch/worker/patch_distributed.py",
+      "lines": "L79-L233",
+      "code": "def _wrap_destroy_distributed_environment(destroy_fn):\n    if getattr(cast(Any, destroy_fn), \"_hccl_registry_clearing_wrapped\", False) is True:\n        return destroy_fn\n\n    @wraps(destroy_fn)\n    def wrapped(*args, **kwargs):\n        try:\n            return destroy_fn(*args, **kwargs)\n        finally:\n            _HCCL_PG_REGISTRY.clear()\n\n    cast(Any, wrapped)._hccl_registry_clearing_wrapped = True\n    return wrapped\n\n\ndef _patch_destroy_distributed_environment():\n    destroy_fn = _wrap_destroy_distributed_environment(vllm.distributed.parallel_state.destroy_distributed_environment)\n    vllm.distributed.parallel_state.destroy_distributed_environment = destroy_fn\n    vllm.distributed.destroy_distributed_environment = destroy_fn\n\n\nclass GroupCoordinatorPatch(GroupCoordinator):\n    def __init__(self, group_ranks, local_rank, torch_distributed_backend, use_device_communicator, ...):\n        ...  # 重写构造：HCCL pg 复用注册表、NPUCommunicator、gloo cpu_group\n\n    def destroy(self):\n        ...\n\n    def all_to_all(self, input_, scatter_dim=0, gather_dim=-1, scatter_sizes=None, gather_sizes=None):\n        if self.world_size == 1:\n            return input_\n        ...\n        return self.device_communicator.all_to_all(input_, scatter_dim, gather_dim, scatter_sizes, gather_sizes)\n\n\nvllm.distributed.parallel_state.GroupCoordinator = GroupCoordinatorPatch\n_patch_destroy_distributed_environment()",
+      "elide": ["GroupCoordinatorPatch.__init__/destroy 的 HCCL pg 注册表复用细节（约 100 行）正文可大幅折叠，只保留它新增了 all_to_all 方法这一动机（台账：vLLM 的 GroupCoordinator 不支持 all_to_all）。本片段作为『综合样本』把三招同时演示：(1) 整类替换 GroupCoordinator = GroupCoordinatorPatch；(2) 库函数 wrapper——_wrap_destroy_distributed_environment 用 @wraps + 幂等标记 _hccl_registry_clearing_wrapped 防重复包裹，在原 destroy 后 finally 清 HCCL 注册表；(3) from-import 缓存陷阱——同一 destroy_fn 同时绑到 parallel_state.destroy_distributed_environment 与再导出别名 vllm.distributed.destroy_distributed_environment"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "adapt_patch", "file": "vllm_ascend/utils.py", "responsibility": "全章唯一 patch 入口；按 is_global_patch 二分，import vllm_ascend.patch.platform 或 vllm_ascend.patch.worker，靠 import 副作用执行该阶段全部 patch"},
+    {"name": "NPUPlatform.pre_register_and_update", "file": "vllm_ascend/platform.py", "responsibility": "platform 段触发点①：进程早期、构图前由 vLLM 平台协议回调，内部调 adapt_patch(is_global_patch=True)"},
+    {"name": "_ensure_global_patch", "file": "vllm_ascend/__init__.py", "responsibility": "platform 段触发点②：带进程级幂等守卫 _GLOBAL_PATCH_APPLIED，供 general_plugins 各 register_* 入口在 engine-core 子进程中确保 platform 段已生效（回收 ch02 f1 伏笔）"},
+    {"name": "NPUWorker.__init__", "file": "vllm_ascend/worker/worker.py", "responsibility": "worker 段触发点：每个 worker 进程构造时调 adapt_patch()（默认走 worker 包）"},
+    {"name": "vllm_ascend.patch.platform (package __init__)", "file": "vllm_ascend/patch/platform/__init__.py", "responsibility": "platform 段 patch 清单：裸 import 列表 + 条件加载（is_310p 分叉 mamba_config、EPLB 环境变量门控 multiproc_executor）；每个 import = 一次 patch 副作用"},
+    {"name": "vllm_ascend.patch.worker (package __init__)", "file": "vllm_ascend/patch/worker/__init__.py", "responsibility": "worker 段 patch 清单：HAS_TRITON / vllm_version_is('0.21.0')(_V2_MODEL_RUNNER_SUPPORTED) / is_310p 条件加载；在 pin 的 v0.21.0 上 patch_v2 整组不加载"},
+    {"name": "AscendMultiprocExecutor", "file": "vllm_ascend/patch/platform/patch_multiproc_executor.py", "responsibility": "技法①整类替换样本：继承 MultiprocExecutor 整体重写，daemon=False 以支持 EPLB；末行覆盖模块属性 MultiprocExecutor"},
+    {"name": "_mamba_block_aligned_split", "file": "vllm_ascend/patch/platform/patch_scheduler.py", "responsibility": "技法③方法替换样本：模块级带 self 函数赋给 Scheduler._mamba_block_aligned_split，去掉原 assert"},
+    {"name": "communication_adaptation_310p", "file": "vllm_ascend/patch/platform/patch_distributed.py", "responsibility": "技法④库函数 wrapper + 技法⑤from-import 缓存陷阱：把 torch.distributed.{broadcast,all_reduce} 及其 distributed_c10d 别名同时换成 310p 对齐 wrapper；仅 310P 设备执行"},
+    {"name": "triton.next_power_of_2 重绑", "file": "vllm_ascend/patch/worker/patch_triton.py", "responsibility": "技法④极简样本：给 triton 模块补 next_power_of_2 函数（torch_npu 的 Triton 缺它）"},
+    {"name": "AscendMambaManager + spec_manager_map[MambaSpec]", "file": "vllm_ascend/patch/platform/patch_mamba_manager.py", "responsibility": "技法②工厂(注册表)替换样本：除类名重绑外，必须改写按 spec 类型派发 manager 的工厂表 spec_manager_map"},
+    {"name": "GroupCoordinatorPatch + _patch_destroy_distributed_environment", "file": "vllm_ascend/patch/worker/patch_distributed.py", "responsibility": "综合样本：整类替换 GroupCoordinator + @wraps 幂等 wrapper destroy + 同名再导出双绑"}
+  ],
+
+  "data_flow": [
+    "1. 进程启动，vLLM 发现 OOT 平台插件，调用 vllm_ascend.platform.NPUPlatform.pre_register_and_update()",
+    "2. pre_register_and_update → adapt_patch(is_global_patch=True)（vllm_ascend/utils.py:adapt_patch）",
+    "3. adapt_patch 执行 `from vllm_ascend.patch import platform`，触发 vllm_ascend/patch/platform/__init__.py 顶层代码",
+    "4. platform/__init__.py 自上而下逐条 import 各 patch_*.py：每条 import 执行该模块的模块级副作用（定义新类/函数 + 重绑 vllm.* 属性）= 完成一处 patch；其中 is_310p() / os.getenv(EPLB) 决定哪些模块被 import",
+    "5. （并行路径）engine-core 子进程经 general_plugins 入口 register_connector/register_model_loader/register_service_profiling 调 _ensure_global_patch()，借进程级幂等守卫确保 platform 段也在子进程生效（ch02 f1 回收）",
+    "6. 随后每个 worker 进程构造：NPUWorker.__init__ → adapt_patch()（is_global_patch=False）",
+    "7. adapt_patch 执行 `from vllm_ascend.patch import worker`，触发 vllm_ascend/patch/worker/__init__.py：HAS_TRITON / _V2_MODEL_RUNNER_SUPPORTED(=not vllm_version_is('0.21.0')) / is_310p 条件加载对应 worker patch",
+    "8. 此后 vLLM 任意位置访问被 patch 的符号（MultiprocExecutor / Scheduler._mamba_block_aligned_split / torch.distributed.broadcast / GroupCoordinator / triton.next_power_of_2 / spec_manager_map[MambaSpec]）拿到的都是 Ascend 版本——vLLM 源码一行未改"
+  ],
+
+  "design_decisions": [
+    {"decision": "单一入口 adapt_patch + 二分 is_global_patch 而非散落各处直接 import", "why": "把『何时打补丁』收敛到一个函数，时机选择只由布尔参数表达；platform 段=构图前进程级、worker 段=worker 构造时，职责清晰", "evidence": "vllm_ascend/utils.py:L511-L515"},
+    {"decision": "patch 执行完全依赖 import 副作用，无显式 apply()", "why": "Python import 天然幂等（模块只初始化一次）+ 模块顶层即重绑代码，最省事；adapt_patch 只需 import 包，包 __init__ 再 import 各子模块即级联触发", "evidence": "vllm_ascend/patch/platform/__init__.py:L19-L50 全是裸 import；各 patch_*.py 末行直接重绑"},
+    {"decision": "platform 段提供 _ensure_global_patch 第二触发路径并加进程级幂等守卫", "why": "vLLM 在 engine-core 子进程加载 general_plugins，conftest/平台回调不一定在子进程跑；需在 general_plugins 入口兜底触发，同时守卫避免重复 patch", "evidence": "vllm_ascend/__init__.py:L23-L37 docstring + _GLOBAL_PATCH_APPLIED"},
+    {"decision": "条件加载：is_310p / HAS_TRITON / vllm_version_is / 环境变量(EPLB)", "why": "不同 SoC（310P vs A2/A3/A5）、是否有 Triton、不同 vLLM 版本、是否启用 EPLB，所需 patch 集合不同；用条件 import 精确裁剪，避免给不相关环境引入错误 patch", "evidence": "platform/__init__.py:L26-L29,L42-L43；worker/__init__.py:L23,L25-L29,L39-L45,L61-L70"},
+    {"decision": "patch_v2 整组在 v0.21.0 不加载（_V2_MODEL_RUNNER_SUPPORTED = not vllm_version_is('0.21.0'))", "why": "v2 model runner patch 依赖 v0.21.0 之后的上游 main API；本书 pin 的基座正是 v0.21.0，故该组与 patch_routed_experts_capture 全部跳过", "evidence": "vllm_ascend/patch/worker/__init__.py:L22-L23,L61-L70"},
+    {"decision": "5 类重绑技法按『被替换对象的引用形态』选择", "why": "整类替换换类名属性；工厂替换还要改派发表（否则工厂仍 new 旧类）；方法替换只换一个绑定方法；库函数 wrapper 闭包捕获原 fn 增量包裹；from-import 缓存陷阱必须把同一对象在所有再导出名字下都重绑——因为调用方可能已 from-import 缓存了引用", "evidence": "multiproc_executor.py:L211 / mamba_manager.py:L52-L53 / scheduler.py:L45 / patch_distributed.py(platform):L53-L54,L82-L85 / patch_triton.py:L12"},
+    {"decision": "每个 patch 在 patch/__init__.py 留 Why/How/Related PR/Future Plan 台账", "why": "monkey-patch 是技术债，需记录动机与上游修复进度，便于将来上游合入后删除", "evidence": "vllm_ascend/patch/__init__.py:L26 注释要求 + L29-L918 逐条台账"}
+  ],
+
+  "theory": [
+    "import 副作用幂等性：Python 模块在 sys.modules 中只初始化一次，重复 import 不再执行顶层代码——因此 adapt_patch 可被多入口反复调用而 patch 只生效一次；_ensure_global_patch 额外加显式守卫是为了避免『触发 import 之前的非 import 工作（如日志/构造）』重复，而非防 import 本身重复。",
+    "名字绑定 vs 对象身份：monkey-patch 改的是『某命名空间里的名字指向哪个对象』，不改对象本身。`from M import f` 在导入方模块创建一个新名字 importer.f 指向同一函数对象；之后 `M.f = g` 只改 M.f，importer.f 仍指旧对象——这是 from-import 缓存陷阱的根因，解药是把所有持有引用的命名空间（含再导出别名、distributed_c10d 等子模块）都重绑。",
+    "wrapper 闭包语义：wrapper(fn) 用闭包捕获原 fn，返回的新函数在前后插入逻辑并在不满足条件时回落 fn(...)，等价于装饰器；@wraps 保留元信息，配合自定义幂等标记（_hccl_registry_clearing_wrapped）可防止同一函数被多次包裹导致逻辑叠加。",
+    "两段时机的依据：platform 段必须早于『vLLM 构建配置/调度器/执行器图』之前，因为它要替换的是构图阶段就被引用的类（Scheduler、MultiprocExecutor、KV cache manager 工厂表等）；worker 段可推迟到 worker 进程构造时，因为它替换的多是前向/算子/模型层符号，构图阶段尚未用到，且 worker 子进程（spawn）是全新解释器、父进程的 patch 不会继承，必须在 worker 内重新触发。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "patch/__init__.py 中与三个样本无关的逐条台账注释（minimax/glm/deepseek/anthropic/qwen 等几十条 Why/How 段）", "why_safe": "纯注释文档，不影响控制流；精简版只需保留 patch_distributed / patch_multiproc_executor / patch_scheduler 三条台账与两段式总纲注释作对照"},
+      {"what": "platform/__init__.py、worker/__init__.py 中间成段的业务/模型特化 patch import（minimax_*/glm*/deepseek_v4_*/qwen3_*/kimi/gqa_c8 等）", "why_safe": "它们都是同构的『裸 import 触发副作用』，逐条保留不增信息；精简版折叠成省略标记，但必须原样保留 is_310p / HAS_TRITON / vllm_version_is / os.getenv(EPLB) 这几处条件骨架与三个样本对应的 import"},
+      {"what": "patch_multiproc_executor.py 中 _init_executor / make_worker_process 从 vLLM 复制的 ~180 行执行器内部实现（消息队列、ready/death pipe、failure 清理）", "why_safe": "与『整类替换』招式本身无关，是被替换类的业务体；精简版保留类头 class AscendMultiprocExecutor(MultiprocExecutor)、daemon=False 那一处差异、以及末行重绑即可说明招式"},
+      {"what": "patch_distributed.py(worker) GroupCoordinatorPatch.__init__/destroy 的 HCCL pg 注册表复用细节", "why_safe": "属被替换类的业务实现；保留 all_to_all 方法签名+动机、_wrap_destroy_distributed_environment 幂等 wrapper、双名重绑三处即可演示三招"},
+      {"what": "patch_triton.py 中 HAS_TRITON=False 时的两个纯 PyTorch 回退函数实现", "why_safe": "是回退算子的数学实现，与技法④无关；保留 triton.next_power_of_2 = next_power_of_2 一行即足"},
+      {"what": "utils.py 中与 patch 无关的全部其它函数（NZ 转换、stream 管理、量化/MoE/flashcomm 判定等）", "why_safe": "本章只关心 adapt_patch；utils.py 其余是无关工具函数，精简版只截取 adapt_patch 定义"}
+    ],
+    "must_keep": [
+      {"symbol": "adapt_patch", "why": "全章唯一入口，必须呈现其 is_global_patch 二分与两条 import"},
+      {"symbol": "is_global_patch", "why": "区分 platform/worker 两段的开关参数"},
+      {"symbol": "pre_register_and_update", "why": "platform 段触发点①，证明构图前进程级时机"},
+      {"symbol": "_ensure_global_patch", "why": "platform 段触发点② + 幂等守卫，是 ch02 f1 伏笔回收点"},
+      {"symbol": "_GLOBAL_PATCH_APPLIED", "why": "进程级幂等守卫标志，解释为何多入口触发只 patch 一次"},
+      {"symbol": "register_connector", "why": "general_plugins 入口之一，展示其先调 _ensure_global_patch"},
+      {"symbol": "is_310p", "why": "条件加载关键判据（SoC 分叉），platform/worker 两清单都用"},
+      {"symbol": "HAS_TRITON", "why": "worker 段 triton patch 的条件加载判据"},
+      {"symbol": "vllm_version_is", "why": "版本条件加载判据；驱动 _V2_MODEL_RUNNER_SUPPORTED"},
+      {"symbol": "_V2_MODEL_RUNNER_SUPPORTED", "why": "在 v0.21.0 为 False → patch_v2 整组不加载，最直观的版本门控例子"},
+      {"symbol": "AscendMultiprocExecutor", "why": "技法①整类替换的子类"},
+      {"symbol": "MultiprocExecutor", "why": "被整类替换的原类；末行 `MultiprocExecutor = AscendMultiprocExecutor` 是招式核心"},
+      {"symbol": "daemon", "why": "整类替换样本的实质差异点（daemon=False 以支持 EPLB）"},
+      {"symbol": "_mamba_block_aligned_split", "why": "技法③方法替换样本函数 + 其赋值绑定"},
+      {"symbol": "Scheduler", "why": "被方法替换的目标类"},
+      {"symbol": "communication_adaptation_310p", "why": "技法④wrapper + 技法⑤缓存陷阱样本入口"},
+      {"symbol": "broadcast310p_wrapper", "why": "库函数 wrapper 闭包，演示捕获原 fn 增量包裹"},
+      {"symbol": "distributed_c10d", "why": "from-import 缓存陷阱的第二个重绑命名空间，缺它则演示不出该招"},
+      {"symbol": "next_power_of_2", "why": "技法④极简样本：triton.next_power_of_2 重绑"},
+      {"symbol": "AscendMambaManager", "why": "技法②工厂替换样本子类"},
+      {"symbol": "spec_manager_map", "why": "工厂派发表，技法②的核心——只换类名不够，必须改派发表"},
+      {"symbol": "GroupCoordinatorPatch", "why": "综合样本整类替换子类"},
+      {"symbol": "_wrap_destroy_distributed_environment", "why": "综合样本中的幂等 wrapper"},
+      {"symbol": "all_to_all", "why": "GroupCoordinatorPatch 新增方法，说明子类替换的动机（原类无此方法）"},
+      {"symbol": "destroy_distributed_environment", "why": "技法⑤from-import 缓存陷阱的再导出双绑目标名：同一 destroy_fn 同时绑到 parallel_state.destroy_distributed_environment 与 vllm.distributed.destroy_distributed_environment 两个名字（worker/patch_distributed.py:L96-L97），缺它讲不全『缓存陷阱』"},
+      {"symbol": "_hccl_registry_clearing_wrapped", "why": "幂等标记：@wraps 包裹后挂在 wrapped 上，下次再调 _wrap_destroy_distributed_environment 时先 getattr 检查、已包裹则直接返回，防止多入口触发导致 finally 清理逻辑叠加（worker/patch_distributed.py:L80,L90）"}
+    ]
+  },
+
+  "diagram_plan": [
+    {
+      "name": "two-stage-patch-timeline",
+      "type": "时序/分层图（svg-diagram）",
+      "spec": "横向时间轴两段：左『platform 段（进程早期·构图前）』，触发源画三个：NPUPlatform.pre_register_and_update、_ensure_global_patch（被 register_connector/model_loader/service_profiling 调用）→ 都汇入 adapt_patch(is_global_patch=True) → import vllm_ascend.patch.platform；右『worker 段（worker 进程构造时）』，触发源 NPUWorker.__init__ → adapt_patch() → import vllm_ascend.patch.worker。中间用一条竖虚线分隔『构图前 / worker 构造时』。底部标注：import 副作用 = 执行 patch；幂等守卫 _GLOBAL_PATCH_APPLIED 标在 _ensure_global_patch 上",
+      "highlight_roadmap_node": "ch03 两段式 monkey-patch（地基章）"
+    },
+    {
+      "name": "five-rebind-techniques",
+      "type": "对照表/卡片图（svg-diagram）",
+      "spec": "5 列卡片：①整类替换（MultiprocExecutor = AscendMultiprocExecutor）②工厂(注册表)替换（spec_manager_map[MambaSpec] = AscendMambaManager，强调若不改表工厂仍 new 旧类）③方法替换（Scheduler._mamba_block_aligned_split = fn）④库函数 wrapper（triton.next_power_of_2 / torch.distributed.broadcast = wrapper(fn)）⑤from-import 缓存陷阱修复（同时绑 torch.distributed.broadcast 与 distributed_c10d.broadcast）。每卡含：被替换引用形态 / 重绑右值 / 代表 patch 文件",
+      "highlight_roadmap_node": "5 种重绑技法"
+    },
+    {
+      "name": "from-import-cache-trap",
+      "type": "概念图（svg-diagram）",
+      "spec": "上：模块 M 定义 f；中：importer 模块执行 `from M import f` → 在 importer 命名空间新建 importer.f 指向同一对象（画两个名字一条箭头指同一函数对象）；下：执行 `M.f = g` 后，M.f 指向 g 但 importer.f 仍指旧 f（断开/未更新）。右侧给出解药：把所有再导出名字（M.f、M.sub.f）都重绑为 g。配 patch_distributed broadcast 双绑实例标注",
+      "highlight_roadmap_node": "from-import 缓存陷阱修复"
+    }
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recover": [
+      {"id": "f1", "desc": "general_plugins 触发的 adapt_patch 两段式 monkey-patch（platform 段 + worker 段）——本章只点出 register_* 会触发 platform 段（埋于 ch02）", "recover_evidence": "vllm_ascend/__init__.py:L46-L69 register_connector/register_model_loader/register_service_profiling 各调 _ensure_global_patch() → adapt_patch(is_global_patch=True)；本章完整展开 platform 段与 worker 段两阶段，正式回收 f1"}
+    ]
+  }
+}

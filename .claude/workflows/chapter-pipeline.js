@@ -14,16 +14,16 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch02',
-  slug: 'ch02-entry-points-and-npuplatform',
+  chapter_id: 'ch03',
+  slug: 'ch03-two-stage-monkey-patch',
   instance: 'vllm-ascend',
-  focus: '插件如何被 vLLM 发现并顶替：从 setup.py 两个 entry-point 组讲到 vLLM 的 resolve_current_platform_cls_qualname / current_platform 懒加载，说清 OOT 平台为何能优先于 builtin、register() 为何只返回类名字符串而不 import；NPUPlatform 的身份替换类属性与一批返回 qualname 的工厂钩子（get_attn_backend_cls / get_device_communicator_cls / worker_cls …）；设备分代 AscendDeviceType / 310P 作为横切线索点出。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/platforms/__init__.py · interface.py · plugins/__init__.py；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（platform 注册/qualname 解析是纯 Python，可跑）】',
-  highlight: 'attach',
+  focus: '旗舰地基章——两段式 monkey-patch：OOT 插件不改 vLLM 一行源码就整体接管的招式总纲。adapt_patch 单一入口 → platform 段（构图前、进程级，pre_register_and_update / _ensure_global_patch 触发）vs worker 段（worker.__init__ 触发）两阶段的时机选择依据；靠 import 副作用执行 patch；**5 种重绑定技法**（整类替换 / 工厂替换 / 方法替换 / 库函数 wrapper / from-import 缓存陷阱修复）；条件加载（is_310p / HAS_TRITON / vllm_version_is，patch_v2 在 0.21.0 不加载）。用 distributed wrapper、multiproc_executor 子类替换、scheduler 方法替换 2–3 个干净样本解剖。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vLLM 书 ch17 + vllm/plugins/__init__.py · vllm/v1/executor/multiproc_executor.py · vllm/v1/core/sched/scheduler.py · vllm/distributed/parallel_state.py（去核对被 patch 的原函数）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（patch 重绑定逻辑是纯 Python，可跑）】',
+  highlight: 'ch03',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm-ascend/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
-  skip_dossier: false,
+  skip_dossier: true,
   skip_impl: false,
-  paths: ['setup.py', 'vllm_ascend/__init__.py', 'vllm_ascend/platform.py', 'vllm_ascend/utils.py'],
+  paths: ['vllm_ascend/utils.py', 'vllm_ascend/patch/__init__.py', 'vllm_ascend/patch/platform/__init__.py', 'vllm_ascend/patch/worker/__init__.py', 'vllm_ascend/patch/platform/patch_distributed.py', 'vllm_ascend/patch/platform/patch_multiproc_executor.py', 'vllm_ascend/patch/platform/patch_scheduler.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'

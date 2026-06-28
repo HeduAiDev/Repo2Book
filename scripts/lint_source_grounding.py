@@ -15,6 +15,13 @@ Checks:
 import re, sys, json
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    import instance as _instance
+    _PREFIX = _instance.canonical_prefix()
+except Exception:
+    _PREFIX = "vllm"
+
 
 def lint_source_grounding(chapter_dir: str) -> dict:
     """Run all grounding checks."""
@@ -54,17 +61,19 @@ def lint_source_grounding(chapter_dir: str) -> dict:
             )
     results["narrative_vllm_refs"] = issues
 
-    # ── Check 2: REFERENCE comments in implementation ──
+    # ── Check 2: source-anchoring comments in implementation ──
+    # 新体系 HARD RULE 用 `# SOURCE:`（lint_fidelity 校验）标注真实 vLLM 位置；
+    # 兼容旧体系的 `# REFERENCE:`。两者任一即视为源码锚点。
     issues = []
     ref_count = 0
     if impl_dir.exists():
         for py_file in impl_dir.glob("*.py"):
             code = py_file.read_text(encoding="utf-8")
-            refs = re.findall(r'# REFERENCE:\s*(.+)', code)
+            refs = re.findall(r'#\s*(?:REFERENCE|SOURCE):\s*(.+)', code)
             ref_count += len(refs)
         if ref_count < 3:
             issues.append(
-                f"  Only {ref_count} REFERENCE comments found (need >= 3)"
+                f"  Only {ref_count} SOURCE/REFERENCE comments found (need >= 3)"
             )
     results["implementation_references"] = issues
 
@@ -84,10 +93,11 @@ def lint_source_grounding(chapter_dir: str) -> dict:
     issues = []
     if impl_notes.exists():
         notes = impl_notes.read_text(encoding="utf-8")
-        vllm_files = re.findall(r'vllm/[\w/]+\.py', notes)
-        if len(vllm_files) < 3:
+        # 实例无关：用活动实例的规范前缀（vllm / vllm_ascend / …）计源码文件
+        src_files = re.findall(rf'{re.escape(_PREFIX)}/[\w/]+\.py', notes)
+        if len(src_files) < 3:
             issues.append(
-                f"  Only {len(vllm_files)} vLLM files mentioned (need >= 3)"
+                f"  Only {len(src_files)} {_PREFIX} files mentioned (need >= 3)"
             )
     results["vllm_files_listed"] = issues
 
