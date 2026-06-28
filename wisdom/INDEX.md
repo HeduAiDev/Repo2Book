@@ -29,6 +29,7 @@
 | W22 | architecture | 实例无关化：脚本经 `instance.py` 认活动实例；`new_instance` **继承**通用约定（voice-guide/wisdom）而非退回白板 | all | vllm-ascend |
 | W23 | architecture | cartography **强制子系统覆盖交叉核对**：列源码每个顶层子系统，逐一确认被某章 key_source_paths 覆盖或显式点名，否则漏章（playbook RUNBOOK §0.6 / schema book_outline.json v2）| team-lead, analyst | vllm-ascend |
 | W24 | architecture | cartography 易低估漏掉的子系统：PD 分离(proxy 调度 + KV 亲和/命中路由)、KV 池化/外存储、KV 卸载(host/CPU 分层)、芯片分代变体(如 310P 整套子类化)、网络加载——别压成一章 | team-lead | vllm-ascend |
+| W25 | writing | Haiku 读者视角理解检查（小模型当"没读过源码的读者"，book-only/不上网）：**每章** Review 内置一维查局部读不懂（术语首现未释/逻辑跳跃/未建立概念/只结论无例子，顾问不门控）+ **每 Part/全书**顺读审计查 journey 缺口（前向引用/术语晚定义/节奏断层）| writer, reviewer, team-lead | vllm, vllm-ascend |
 
 ## Category Quick Reference
 

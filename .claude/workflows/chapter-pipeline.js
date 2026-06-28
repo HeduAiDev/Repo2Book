@@ -153,7 +153,7 @@ let reviewV = null
 const DIMS = ['fidelity（保真度+过度删减+零脚手架泄漏）', 'readability（可读/不枯燥/连贯）', 'algorithm（算法可理解性：图/数值/证明）', 'formula-structure-diagrams（公式可渲染+Roadmap+自包含+图示质量，跑 lint_formulas/chapter_structure/source_grounding/diagrams）']
 for (let r = 1; r <= 3; r++) {
   phase('Review')
-  const dims = await parallel(DIMS.map(function (dim) {
+  const dimThunks = DIMS.map(function (dim) {
     return function () {
       return agent(
         head('reviewer') +
@@ -163,10 +163,23 @@ for (let r = 1; r <= 3; r++) {
         { schema: DIM_SCHEMA, label: 'review:' + dim.slice(0, 6) + ' r' + r, phase: 'Review', agentType: 'general-purpose' }
       )
     }
-  }))
+  })
+  // Haiku 读者视角理解检查（book-only，顾问性不门控）：用小模型当"没读过源码的读者"扫局部读不懂处
+  const readerThunk = function () {
+    return agent(
+      '你是这本书的目标读者（高级工程师，但**没读过这个仓库的源码**）。只读 ' + CH + '/narrative/chapter.md（含它引用的图），把前面章节当已读背景，**不准看源码、不准上网**。\n' +
+      '站读者视角挑"读不懂/卡住"处：① 术语/缩写首现未解释；② 逻辑跳跃、缺中间步骤；③ 引入了本章没建立的概念（如某测试设施/外部机制）；④ 只有结论无直觉/例子。\n' +
+      '每条给 problem + suggested_fix（补一句话/一个例子让读者跟上）+ rationale；全部 negotiable=true、blocking=false（可读性不卡章）。读得顺则 pass=true、issues=[]。',
+      { model: 'haiku', schema: DIM_SCHEMA, label: 'review:reader r' + r, phase: 'Review', agentType: 'general-purpose' }
+    )
+  }
+  const all = await parallel(dimThunks.concat([readerThunk]))
+  const dims = all.slice(0, DIMS.length)        // 门控只看 4 个真维度
+  const reader = all[DIMS.length]               // 读者检查失败(限流)不门控
   const ok = dims.filter(Boolean)
   if (ok.length < DIMS.length) return { chapter: A.chapter_id, escalated: 'review-agents-failed', stage: 'Review', round: r, note: '部分评审 agent 失败(限流/崩溃)，评审未完成，不假通过' }
-  const issues = ok.flatMap(function (d) { return d.issues || [] })
+  const readerIssues = ((reader && reader.issues) || []).map(function (i) { return Object.assign({}, i, { dimension: 'reader-comprehension', blocking: false, negotiable: true }) })
+  const issues = ok.flatMap(function (d) { return d.issues || [] }).concat(readerIssues)
   const blocking = issues.filter(function (i) { return i.blocking })
   if (!ok.some(function (d) { return !d.pass }) && blocking.length === 0) {
     reviewV = { verdict: 'APPROVED', issues: issues }

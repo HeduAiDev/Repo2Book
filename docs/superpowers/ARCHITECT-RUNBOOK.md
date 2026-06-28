@@ -95,10 +95,13 @@ jq -r '.overall_verdict' $D/reviews/review-report.json
 ```
 全部无 BLOCKING + verdict=APPROVED 才算过。
 
-## 7. 跨章连贯性（每章/每 Part）
+## 7. 跨章连贯性 + 读者视角理解检查（每章/每 Part/全书）
 - 写前：`python3 scripts/bible.py due {chapter_id}`（应埋/应回收）。
 - 写后：archivist 回写 bible（新接口/已埋/已回收）。
-- 每完成一个 Part：跑连贯性审计（未回收伏笔/术语漂移/接口不符）。
+- **每章（自动）**：chapter-pipeline 的 Review 阶段含一维 **Haiku 读者视角理解检查**（小模型当"没读过源码的读者"，book-only、不上网，扫局部读不懂处：术语首现未释/逻辑跳跃/引入未建立的概念/只有结论无例子）——顾问性、不门控，issue 进 review-report 由 writer 顺手清。
+- 每完成一个 Part：跑连贯性审计（未回收伏笔/术语漂移/接口不符）+ **journey 理解审计**：派 Haiku 读者**按顺序连读该 Part 全部章节**（book-only、不上网），找只有顺读才暴露的问题——前向引用缺口、术语在更晚章才定义、节奏/铺垫断层。
+- **全书完成后**：再跑一次全书级 Haiku 连读理解审计（vLLM 书即如此做），把"一个读者能否只靠本书从头学懂"作为终验；发现的卡点派 writer 定点补（改正文不改结论）。
+- 何以分层：局部可读性是每章属性（inline 早抓便宜修）；journey 理解是跨章属性（必须顺读才暴露，放 Part/全书边界）。只放全书=攒满一书的困惑才发现；只放每章=漏跨章缺口。
 
 ## 8. 架构师的持续职责（用户明确要求"在工程中迭代"）
 - 试点/每章复盘 → **改提示词不改章节**（HARD RULE）。fidelity 阈值不合适 → 改 `scripts/lint_fidelity.py` 常量 + 测试。
