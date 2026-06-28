@@ -86,12 +86,17 @@ def main():
     w(inst / "book/bible/glossary.json", "{}\n")
     w(inst / "book/bible/interfaces.json", "{}\n")
     w(inst / "book/bible/arc-map.json", "[]\n")
-    w(inst / "book/bible/voice-guide.md",
-      f"# 叙述声线与风格指南（{repo_name} Book Bible）\n\n"
-      "> 全书统一声线的真相源。每位 writer 写作前必读。\n\n"
-      "## 叙述者人格\n「白板边的内行朋友」——懂得深、讲得活。带读者一起读真实源码、推原理。\n\n"
-      "## 语言\n- 大白话 + 技术深度：先直觉/类比，再上符号；公式后立刻给数值例子 + 一句人话翻译。\n"
-      f"- 目标读者：{a.reader}（{a.lang_code}）。\n")
+    # voice-guide 承袭既往实例打磨出的通用约定（templates/instance/voice-guide.md），
+    # 只替换本仓特定占位（仓名/读者/语言/规范路径前缀）——绝不退回白板，否则丢掉跨书经验。
+    vg_tpl = ROOT / "templates" / "instance" / "voice-guide.md"
+    if vg_tpl.exists():
+        vg = (vg_tpl.read_text(encoding="utf-8")
+              .replace("{{REPO}}", repo_name).replace("{{PREFIX}}", prefix)
+              .replace("{{READER}}", a.reader).replace("{{LANG_CODE}}", a.lang_code))
+    else:
+        vg = (f"# 叙述声线与风格指南（{repo_name} Book Bible）\n\n"
+              "> 模板缺失，回退最小骨架——请从 instances/vllm/book/bible/voice-guide.md 补全通用约定。\n")
+    w(inst / "book/bible/voice-guide.md", vg)
     w(inst / "knowledge/INDEX.md", f"# {repo_name} knowledge（仓库特定事实，带 TTL）\n\n（空）\n")
     w(inst / "trace/state.json", json.dumps({
         "project": f"{name}-source-reading-book", "outline": cfg["book"]["outline_file"],

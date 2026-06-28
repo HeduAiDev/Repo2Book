@@ -105,5 +105,26 @@ Always: `xmllint --noout → validate_svg.py → convert -density 150`. Three st
 must all pass. A broken diagram is worse than no diagram.
 
 ### Running output must match actual code
-The numerical trace in Cell 7 MUST be actual output from running `python3 implementation/{module}.py`.
+The numerical trace MUST be actual output from running the companion `implementation/`.
 Never fabricate output — readers will try to reproduce it and lose trust.
+
+---
+
+## v2 追加（源码解读型；取代上面旧 "Cell N / convert" 措辞）
+
+旧条目里的 "Cell N" 章节结构与 `convert -density` 渲染均已**废弃**——v2 是**源码解读型**：正文以真实源码为主线、自包含内嵌；图用 `rsvg-convert -z 2`（**勿用 ImageMagick convert**，丢中文/错位）。以下为 v2 + v0.21.0 重基 + vllm-ascend 试点打磨出的新写作经验（明细见 INDEX W13–W21）。
+
+### W13 内嵌真源码逐字保留（reviewer 必查）
+内嵌片段是"真实源码"的承诺——**逐字保留**含完整签名与类型标注（别把 `num_heads: int | None = None` 改成 `num_heads=None`）。删无关分支用 `# … 省略：… `。把**非相邻**的方法拼进一个代码块时，中间也要加省略标注，否则读者以为它们在源码里紧挨着。
+
+### W14 主线术语首现处一次性中文注解
+全章反复用的主线术语，首现处括注一次中文译名（与 glossary 对齐），如「qualname（全限定类名）」「OOT（out-of-tree）」，后文沿用英文。
+
+### W15 图：一图一核心对比，几何要干净
+`lint_diagram_geometry` 校验文字不越界/不相撞/不压框/不裁切、箭头接框边。信息密度别过高：核心对比留图里，细节下沉正文。
+
+### W16 锚点与标点（确定性 lint）
+章内回指 `#` 锚点须解析到本章标题的 GitHub-slug（`lint_anchors`）；中文句子标点全角（`lint_punct`）。
+
+### W21 姊妹篇/衍生仓的写法
+解读"插件/衍生仓"（如 vllm-ascend 之于 vLLM）：主线讲衍生仓源码（`vllm_ascend/…`），**每章钉一个对位基座章**，对照基座源码（已在 `instances/<base>/source`，直引规范 `vllm/…`）说清"它顶替/扩展了哪一站"。两边都用规范路径。
