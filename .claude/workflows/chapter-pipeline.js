@@ -14,16 +14,16 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch05',
-  slug: 'ch05-check-and-update-config',
+  chapter_id: 'ch06',
+  slug: 'ch06-npu-communicator',
   instance: 'vllm-ascend',
-  focus: 'check_and_update_config：插件改写 VllmConfig 的总闸 + AscendConfig 配置面。NPUPlatform.check_and_update_config 全流程——**init_ascend_config** → **_fix_incompatible_config**（系统性把 GPU/ROCm 专属参数 cascade_attn / cudnn_prefill / trtllm / numa_bind / nvtx … cascade reset 成昇腾安全值）→ **cudagraph / compilation / splitting_ops 改写** → **选 worker_cls** → **设环境变量**；以及 **AscendConfig 单例**如何把开放 dict additional_config 解析成强类型子配置 + **_get_config_value 的 additional_config→env→default 三级取值**。讲透两点设计哲学：①「平台 = 配置改写器」这一 vLLM 钩子约定（平台拿到完整 VllmConfig 在构图前最后改写）；②「无 schema 配置后门」additional_config 的取舍（灵活 vs 失去校验）。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vLLM 书 ch03 + vllm/platforms/interface.py（基类 check_and_update_config 钩子定义、默认实现）· vllm/config · vllm/envs.py（去核对平台钩子契约与被改写的原配置默认值）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（配置改写/三级取值是纯 Python dict 逻辑，可跑）】',
-  highlight: 'ch05',
+  focus: '换底座的通信器：从 CudaCommunicator 到 NPUCommunicator——OOT 怎么换通信器的最干净样本。三条线并排讲：①**platform 回调注册** get_device_communicator_cls → NPUCommunicator；②**子类化 DeviceCommunicatorBase**（绝大多数集合通信直接继承——底层走 torch.distributed + HCCL backend，故只需复用基类；**仅重写 MoE 用的 all_to_all**，看清「子类化 = 只改差异点」）；③并排讲**手写 pyhccl ↔ pynccl 的 ctypes 通信器**（unique_id 建组 / warmup all_reduce / disabled 降级，逐段对位移植，看 GPU→NPU 的 ctypes 绑定怎么照搬范式只换符号）；④**patch_distributed 仅 310P** 把 broadcast / all_reduce 猴补成 all_gather 模拟，补硬件能力缺口（点名复用 ch03 技法，别重讲）。主线讲清「为什么通信器是 OOT 换底座最干净的样本」：接口窄、基类已抽象好、只露一个 all_to_all 差异点。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vLLM 书 ch20 + vllm/distributed/device_communicators/base_device_communicator.py（基类抽象）· cuda_communicator.py（对位的 GPU 实现，逐段对照 NPU 版）· pynccl.py · pynccl_wrapper.py（对照 pyhccl 的 ctypes 范式）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（通信器类结构/ctypes 绑定范式是纯 Python，可跑；实际集合通信不跑）】',
+  highlight: 'ch06',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm-ascend/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
-  skip_dossier: false,
+  skip_dossier: true,
   skip_impl: false,
-  paths: ['vllm_ascend/platform.py', 'vllm_ascend/ascend_config.py', 'vllm_ascend/envs.py'],
+  paths: ['vllm_ascend/distributed/device_communicators/npu_communicator.py', 'vllm_ascend/distributed/device_communicators/pyhccl.py', 'vllm_ascend/distributed/device_communicators/pyhccl_wrapper.py', 'vllm_ascend/patch/platform/patch_distributed.py', 'vllm_ascend/platform.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'

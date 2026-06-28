@@ -1,0 +1,193 @@
+{
+  "chapter": "ch06",
+  "title": "换底座的通信器：从 CudaCommunicator 到 NPUCommunicator —— OOT 怎么换通信器的最干净样本",
+  "thesis": "通信器是 OOT 换底座最干净的样本：接口窄、基类 DeviceCommunicatorBase 已经把绝大多数集合通信抽象成 torch.distributed 调用（底层走 HCCL backend，自动复用），所以 NPUCommunicator 子类化后只露一个真正的差异点——MoE 用的 all_to_all。三条线并排：①platform 用一个字符串 qualname 回调把通信器类换成 NPUCommunicator；②子类化基类，只动差异点；③手写 pyhccl 把 pynccl 的 ctypes 范式逐符号移植（注意：pyhccl 尚未接入 NPUCommunicator，是为未来 custom-allreduce 预留的范式样本）；④patch_distributed 仅 310P 把 broadcast/all_reduce 猴补成 all_gather 模拟补硬件能力缺口（复用 ch03 技法）。",
+
+  "code_spine": [
+    "vllm/platforms/interface.py:L769-L774  —— 基座 Platform.get_device_communicator_cls 默认返回 DeviceCommunicatorBase 的 qualname（字符串回调契约）",
+    "vllm_ascend/platform.py:L803-L805  —— NPUPlatform 重写该回调，返回 NPUCommunicator 的 qualname（OOT 注入点①）",
+    "vllm/distributed/parallel_state.py:L372-L381  —— GroupCoordinator.__init__ 用 resolve_obj_by_qualname 解析字符串→类并实例化（统一构造签名 cpu_group/device/device_group/unique_name）",
+    "vllm/distributed/device_communicators/base_device_communicator.py:L118-L309  —— DeviceCommunicatorBase：所有集合通信直接 dist.xxx(group=self.device_group)，底层走 HCCL backend，子类无需重写",
+    "vllm_ascend/distributed/device_communicators/npu_communicator.py:L23-L68  —— NPUCommunicator 子类化基类，仅 __init__ 设 device/ca_comm 占位 + 新增 all_to_all（差异点②）",
+    "vllm_ascend/distributed/device_communicators/pyhccl.py:L37-L171  —— PyHcclCommunicator：pynccl 的逐符号移植（unique_id 建组 / warmup all_reduce / disabled 降级），尚未接入 NPUCommunicator（③范式样本）",
+    "vllm_ascend/distributed/device_communicators/pyhccl_wrapper.py:L34-L264  —— HCCLLibrary：ctypes 绑定 libhccl.so，对位 pynccl_wrapper 的 NCCLLibrary",
+    "vllm_ascend/patch/platform/patch_distributed.py:L33-L89  —— 仅 310P 把 torch.distributed.broadcast/all_reduce 猴补成 all_gather 模拟（④，复用 ch03 两段式猴补技法）"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm/platforms/interface.py",
+      "lines": "L769-L774",
+      "code": "    @classmethod\n    def get_device_communicator_cls(cls) -> str:\n        \"\"\"\n        Get device specific communicator class for distributed communication.\n        \"\"\"\n        return \"vllm.distributed.device_communicators.base_device_communicator.DeviceCommunicatorBase\"  # noqa",
+      "elide": []
+    },
+    {
+      "path": "vllm_ascend/platform.py",
+      "lines": "L803-L805",
+      "code": "    @classmethod\n    def get_device_communicator_cls(cls) -> str:\n        return \"vllm_ascend.distributed.device_communicators.npu_communicator.NPUCommunicator\"",
+      "elide": ["NPUPlatform 是 vllm.platforms.interface.Platform 的 OOT 子类（ch01-ch02 已讲注册机制）；这里只看「换通信器」这一个 classmethod 覆写"]
+    },
+    {
+      "path": "vllm/distributed/parallel_state.py",
+      "lines": "L370-L381",
+      "code": "        self.use_device_communicator = use_device_communicator\n        self.device_communicator = None\n        if use_device_communicator and self.world_size > 1:\n            device_comm_cls = resolve_obj_by_qualname(\n                current_platform.get_device_communicator_cls()\n            )\n            self.device_communicator = device_comm_cls(\n                cpu_group=self.cpu_group,\n                device=self.device,\n                device_group=self.device_group,\n                unique_name=self.unique_name,\n            )",
+      "elide": ["前文 L361-L368 按平台决定 self.device：is_out_of_tree() 分支 → torch.device(f\"{device_name}:{local_rank}\")，即 npu:N；可只点一句不展开"]
+    },
+    {
+      "path": "vllm/distributed/device_communicators/base_device_communicator.py",
+      "lines": "L180-L207",
+      "code": "    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:\n        dist.all_reduce(input_, group=self.device_group)\n        return input_\n\n    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:\n        if dim < 0:\n            # Convert negative dim to positive.\n            dim += input_.dim()\n        input_size = input_.size()\n        # NOTE: we have to use concat-style all-gather here,\n        # stack-style all-gather has compatibility issues with\n        # torch.compile . see https://github.com/pytorch/pytorch/issues/138795\n        output_size = (input_size[0] * self.world_size,) + input_size[1:]\n        # Allocate output tensor.\n        output_tensor = torch.empty(\n            output_size, dtype=input_.dtype, device=input_.device\n        )\n        # All-gather.\n        dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)\n        # Reshape\n        output_tensor = output_tensor.reshape((self.world_size,) + input_size)\n        output_tensor = output_tensor.movedim(0, dim)\n        output_tensor = output_tensor.reshape(\n            input_size[:dim]\n            + (self.world_size * input_size[dim],)\n            + input_size[dim + 1 :]\n        )\n        return output_tensor",
+      "elide": ["base 里同款还有 reduce_scatter/gather/send/recv/broadcast（L217-L309），全都是 dist.xxx(group=self.device_group) 一行壳——目的只是让读者看清：基类把集合通信全抽象成 torch.distributed 调用，NPU 选了 HCCL backend 后这些方法零修改即复用，故子类不必重写"]
+    },
+    {
+      "path": "vllm_ascend/distributed/device_communicators/npu_communicator.py",
+      "lines": "L23-L68",
+      "code": "class NPUCommunicator(DeviceCommunicatorBase):\n    def __init__(\n        self,\n        cpu_group: dist.ProcessGroup,\n        device: torch.device | None = None,\n        device_group: dist.ProcessGroup | None = None,\n        unique_name: str = \"\",\n    ):\n        super().__init__(cpu_group, device, device_group, unique_name)\n        # TODO(hz): Refer to CudaCommunicator's implementation to integrate PyHcclCommunicator\n        # init device according to rank\n        self.device = torch.npu.current_device()\n\n        # For compatibility (mainly for reusing graph capturing code in vllm),\n        # init custom all-reduce implementation interface as in CUDACommunicator.\n        self.ca_comm = None\n\n    def all_to_all(\n        self,\n        input_: torch.Tensor,\n        scatter_dim: int = 0,\n        gather_dim: int = -1,\n        scatter_sizes: list[int] | None = None,\n        gather_sizes: list[int] | None = None,\n    ) -> torch.Tensor:\n        if scatter_dim < 0:\n            scatter_dim += input_.dim()\n        if gather_dim < 0:\n            gather_dim += input_.dim()\n\n        if scatter_sizes is not None and gather_sizes is not None:\n            input_list = [t.contiguous() for t in torch.split(input_, scatter_sizes, scatter_dim)]\n            output_list = []\n            tensor_shape_base = input_list[self.rank].size()\n            for i in range(self.world_size):\n                tensor_shape = list(tensor_shape_base)\n                tensor_shape[gather_dim] = gather_sizes[i]\n                output_list.append(torch.empty(tensor_shape, dtype=input_.dtype, device=input_.device))\n\n        else:\n            input_list = [t.contiguous() for t in torch.tensor_split(input_, self.world_size, scatter_dim)]\n            output_list = [torch.empty_like(input_list[i]) for i in range(self.world_size)]\n\n        dist.all_to_all(output_list, input_list, group=self.device_group)\n        output_tensor = torch.cat(output_list, dim=gather_dim).contiguous()\n        return output_tensor",
+      "elide": ["这就是整个文件——68 行，子类化基类后只动两处：__init__ 把 self.device 改成 torch.npu.current_device()、self.ca_comm=None 占位（兼容 vllm graph capture 复用），以及新增 all_to_all。注意 all_to_all 仍是 dist.all_to_all(group=self.device_group) 包一层 split/cat，本质是基类范式的延伸，不碰底层 HCCL"]
+    },
+    {
+      "path": "vllm_ascend/distributed/device_communicators/pyhccl.py",
+      "lines": "L37-L128",
+      "code": "class PyHcclCommunicator:\n    def __init__(\n        self,\n        group: ProcessGroup | StatelessProcessGroup,\n        device: int | str | torch.device,\n        library_path: str | None = None,\n    ):\n        \"\"\"...docstring elided...\"\"\"\n\n        if not isinstance(group, StatelessProcessGroup):\n            assert dist.is_initialized()\n            assert dist.get_backend(group) != dist.Backend.HCCL, (\n                \"PyHcclCommunicator should be attached to a non-HCCL group.\"\n            )\n            # note: this rank is the rank in the group\n            self.rank = dist.get_rank(group)\n            self.world_size = dist.get_world_size(group)\n        else:\n            self.rank = group.rank\n            self.world_size = group.world_size\n\n        self.group = group\n\n        # if world_size == 1, no need to create communicator\n        if self.world_size == 1:\n            self.available = False\n            self.disabled = True\n            return\n\n        try:\n            self.hccl = HCCLLibrary(library_path)\n        except Exception:\n            # disable because of missing HCCL library\n            # e.g. in a non-NPU environment\n            self.available = False\n            self.disabled = True\n            return\n\n        self.available = True\n        self.disabled = False\n\n        logger.info(\"vLLM is using pyhccl\")\n\n        if isinstance(device, int):\n            device = torch.device(f\"npu:{device}\")\n        elif isinstance(device, str):\n            device = torch.device(device)\n        # now `device` is a `torch.device` object\n        assert isinstance(device, torch.device)\n        self.device = device\n\n        if self.rank == 0:\n            # get the unique id from HCCL\n            with torch.npu.device(device):\n                self.unique_id = self.hccl.hcclGetUniqueId()\n        else:\n            # construct an empty unique id\n            self.unique_id = hcclUniqueId()\n\n        if not isinstance(group, StatelessProcessGroup):\n            tensor = torch.ByteTensor(list(self.unique_id.internal))\n            ranks = dist.get_process_group_ranks(group)\n            # arg `src` in `broadcast` is the global rank\n            dist.broadcast(tensor, src=ranks[0], group=group)\n            byte_list = tensor.tolist()\n            for i, byte in enumerate(byte_list):\n                self.unique_id.internal[i] = byte\n        else:\n            self.unique_id = group.broadcast_obj(self.unique_id, src=0)\n\n        # hccl communicator and stream will use this device\n        # `torch.npu.device` is a context manager that changes the\n        # current npu device to the specified one\n        with torch.npu.device(device):\n            self.comm: hcclComm_t = self.hccl.hcclCommInitRank(self.world_size, self.unique_id, self.rank)\n\n            stream = current_stream()\n            # A small all_reduce for warmup.\n            data = torch.zeros(1, device=device)\n            self.all_reduce(data)\n            stream.synchronize()\n            del data",
+      "elide": ["L44-L54 的 docstring 解释 group/device/library_path 三参语义，逐字保留可，但讲解时可缩；逐符号对位 pynccl.py:L57-L150：唯一差异是 NCCL→HCCL、cuda→npu、torch.cuda.device→torch.npu.device，控制流（rank==0 取 unique_id、broadcast 建组、CommInitRank、warmup all_reduce）完全一致。pynccl 多一个 envs.VLLM_DISABLE_PYNCCL 开关，pyhccl 没有"]
+    },
+    {
+      "path": "vllm_ascend/distributed/device_communicators/pyhccl.py",
+      "lines": "L130-L171",
+      "code": "    def all_reduce(self, in_tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM, stream=None) -> torch.Tensor:\n        if self.disabled:\n            return None\n        # hccl communicator created on a specific device\n        # will only work on tensors on the same device\n        # otherwise it will cause \"illegal memory access\"\n        assert in_tensor.device == self.device, (\n            f\"this hccl communicator is created to work on {self.device}, but the input tensor is on {in_tensor.device}\"\n        )\n\n        out_tensor = torch.empty_like(in_tensor)\n\n        if stream is None:\n            stream = current_stream()\n        self.hccl.hcclAllReduce(\n            buffer_type(in_tensor.data_ptr()),\n            buffer_type(out_tensor.data_ptr()),\n            in_tensor.numel(),\n            hcclDataTypeEnum.from_torch(in_tensor.dtype),\n            hcclRedOpTypeEnum.from_torch(op),\n            self.comm,\n            aclrtStream_t(stream.npu_stream),\n        )\n        return out_tensor\n\n    def broadcast(self, tensor: torch.Tensor, src: int, stream=None):\n        if self.disabled:\n            return\n        assert tensor.device == self.device, (\n            f\"this hccl communicator is created to work on {self.device}, but the input tensor is on {tensor.device}\"\n        )\n        if stream is None:\n            stream = current_stream()\n        buffer = buffer_type(tensor.data_ptr())\n        self.hccl.hcclBroadcast(\n            buffer,\n            tensor.numel(),\n            hcclDataTypeEnum.from_torch(tensor.dtype),\n            src,\n            self.comm,\n            aclrtStream_t(stream.npu_stream),\n        )",
+      "elide": ["disabled 降级（world_size==1 或缺库时返回 None/no-op）、device 一致性 assert、把 torch tensor 的 data_ptr() 包成 ctypes buffer_type 传给 .so —— 这套范式与 pynccl all_reduce/broadcast 一一对位，只换 stream.npu_stream（pynccl 是 stream.cuda_stream）"]
+    },
+    {
+      "path": "vllm_ascend/distributed/device_communicators/pyhccl_wrapper.py",
+      "lines": "L34-L45",
+      "code": "hcclResult_t = ctypes.c_int\nhcclComm_t = ctypes.c_void_p\n\n\nclass hcclUniqueId(ctypes.Structure):\n    _fields_ = [(\"internal\", ctypes.c_byte * 4108)]\n\n\naclrtStream_t = ctypes.c_void_p\nbuffer_type = ctypes.c_void_p\n\nhcclDataType_t = ctypes.c_int",
+      "elide": ["这些是 C 类型到 ctypes 的别名映射；hcclUniqueId 的 4108 字节缓冲区即 HCCL 的 root info（pynccl_wrapper 的 ncclUniqueId 是 128 字节，这是 HCCL/NCCL 唯一的尺寸差异，必须照搬头文件定义不能臆造）"]
+    },
+    {
+      "path": "vllm_ascend/distributed/device_communicators/pyhccl_wrapper.py",
+      "lines": "L48-L103",
+      "code": "class hcclDataTypeEnum:\n    hcclInt8 = 0\n    hcclInt16 = 1\n    hcclInt32 = 2\n    hcclFloat16 = 3\n    hcclFloat32 = 4\n    hcclInt64 = 5\n    hcclUint64 = 6\n    hcclUint8 = 7\n    hcclUint16 = 8\n    hcclUint32 = 9\n    hcclFloat64 = 10\n    hcclBfloat16 = 11\n    hcclInt128 = 12\n\n    @classmethod\n    def from_torch(cls, dtype: torch.dtype) -> int:\n        if dtype == torch.int8:\n            return cls.hcclInt8\n        if dtype == torch.uint8:\n            return cls.hcclUint8\n        if dtype == torch.int32:\n            return cls.hcclInt32\n        if dtype == torch.int64:\n            return cls.hcclInt64\n        if dtype == torch.float16:\n            return cls.hcclFloat16\n        if dtype == torch.float32:\n            return cls.hcclFloat32\n        if dtype == torch.float64:\n            return cls.hcclFloat64\n        if dtype == torch.bfloat16:\n            return cls.hcclBfloat16\n        raise ValueError(f\"Unsupported dtype: {dtype}\")\n\n\nhcclRedOp_t = ctypes.c_int\n\n\nclass hcclRedOpTypeEnum:\n    hcclSum = 0\n    hcclProd = 1\n    hcclMax = 2\n    hcclMin = 3\n\n    @classmethod\n    def from_torch(cls, op: ReduceOp) -> int:\n        if op == ReduceOp.SUM:\n            return cls.hcclSum\n        if op == ReduceOp.PRODUCT:\n            return cls.hcclProd\n        if op == ReduceOp.MAX:\n            return cls.hcclMax\n        if op == ReduceOp.MIN:\n            return cls.hcclMin\n        raise ValueError(f\"Unsupported op: {op}\")",
+      "elide": ["两个枚举把 torch.dtype / ReduceOp 翻译成 HCCL 头文件里的整型常量——枚举值序与 NCCL 不同（如 NCCL float16=6，HCCL float16=3），必须按 hccl_types.h 抄死，这是「照搬范式只换符号」里『符号值本身也要换』的关键点。讲解可只取 from_torch 的两三个分支示意"]
+    },
+    {
+      "path": "vllm_ascend/distributed/device_communicators/pyhccl_wrapper.py",
+      "lines": "L106-L167",
+      "code": "@dataclass\nclass Function:\n    name: str\n    restype: Any\n    argtypes: list[Any]\n\n\nclass HCCLLibrary:\n    exported_functions = [\n        # const char* HcclGetErrorString(HcclResult code);\n        Function(\"HcclGetErrorString\", ctypes.c_char_p, [hcclResult_t]),\n        # HcclResult HcclGetRootInfo(HcclRootInfo *rootInfo);\n        Function(\"HcclGetRootInfo\", hcclResult_t, [ctypes.POINTER(hcclUniqueId)]),\n        # HcclResult HcclCommInitRootInfo(\n        #   uint32_t nRanks, const HcclRootInfo *rootInfo, uint32_t rank, HcclComm *comm);\n        # note that HcclComm is a pointer type, so the last argument is a pointer to a pointer\n        Function(\n            \"HcclCommInitRootInfo\",\n            hcclResult_t,\n            [\n                ctypes.c_int,\n                ctypes.POINTER(hcclUniqueId),\n                ctypes.c_int,\n                ctypes.POINTER(hcclComm_t),\n            ],\n        ),\n        # HcclResult HcclAllReduce(\n        #   void *sendBuf, void *recvBuf, uint64_t count,\n        #   HcclDataType dataType, HcclReduceOp op, HcclComm comm,\n        #   aclrtStream stream);\n        Function(\n            \"HcclAllReduce\",\n            hcclResult_t,\n            [\n                buffer_type,\n                buffer_type,\n                ctypes.c_size_t,\n                hcclDataType_t,\n                hcclRedOp_t,\n                hcclComm_t,\n                aclrtStream_t,\n            ],\n        ),\n        # HcclResult HcclBroadcast(\n        #   void *buf, uint64_t count,\n        #   HcclDataType dataType, uint32_t root,\n        #   HcclComm comm, aclrtStream stream);\n        Function(\n            \"HcclBroadcast\",\n            hcclResult_t,\n            [\n                buffer_type,\n                ctypes.c_size_t,\n                hcclDataType_t,\n                ctypes.c_int,\n                hcclComm_t,\n                aclrtStream_t,\n            ],\n        ),\n        # HcclResult HcclCommDestroy(HcclComm comm);\n        Function(\"HcclCommDestroy\", hcclResult_t, [hcclComm_t]),\n    ]",
+      "elide": ["exported_functions 是「C 函数签名声明表」：每个 Function(name, restype, argtypes) 对应 hccl.h 里一个 C 函数原型，逐字照抄注释里的 C 签名。这与 pynccl_wrapper 的 NCCLLibrary.exported_functions 结构完全同构，只是函数名 Hccl* / 参数表按 HCCL 头文件写。HcclCommInitRootInfo 末参是 HcclComm*（指针的指针）这一点务必讲清——对应 hcclCommInitRank 里 ctypes.byref(comm)"]
+    },
+    {
+      "path": "vllm_ascend/distributed/device_communicators/pyhccl_wrapper.py",
+      "lines": "L177-L228",
+      "code": "    def __init__(self, so_file: str | None = None):\n        so_file = so_file or find_hccl_library()\n\n        try:\n            if so_file not in HCCLLibrary.path_to_dict_mapping:\n                lib = ctypes.CDLL(so_file)\n                HCCLLibrary.path_to_library_cache[so_file] = lib\n            self.lib = HCCLLibrary.path_to_library_cache[so_file]\n        except Exception as e:\n            logger.error(...)\n            raise e\n\n        if so_file not in HCCLLibrary.path_to_dict_mapping:\n            _funcs: dict[str, Any] = {}\n            for func in HCCLLibrary.exported_functions:\n                f = getattr(self.lib, func.name)\n                f.restype = func.restype\n                f.argtypes = func.argtypes\n                _funcs[func.name] = f\n            HCCLLibrary.path_to_dict_mapping[so_file] = _funcs\n        self._funcs = HCCLLibrary.path_to_dict_mapping[so_file]\n\n    def hcclGetUniqueId(self) -> hcclUniqueId:\n        unique_id = hcclUniqueId()\n        self.HCCL_CHECK(self._funcs[\"HcclGetRootInfo\"](ctypes.byref(unique_id)))\n        return unique_id\n\n    def hcclCommInitRank(self, world_size: int, unique_id: hcclUniqueId, rank: int) -> hcclComm_t:\n        comm = hcclComm_t()\n        self.HCCL_CHECK(\n            self._funcs[\"HcclCommInitRootInfo\"](world_size, ctypes.byref(unique_id), rank, ctypes.byref(comm))\n        )\n        return comm",
+      "elide": ["__init__ 的核心：ctypes.CDLL(so_file) 加载 libhccl.so → 遍历 exported_functions 给每个 C 函数挂 restype/argtypes（让 ctypes 正确编组参数）→ 用类级 dict 缓存避免重复加载。logger.error 的多行提示文案可缩。HCCL_CHECK/hcclAllReduce/hcclBroadcast/hcclCommDestroy（L213-L253）是对 _funcs 的薄封装 + 非零返回码抛错，结构与 pynccl_wrapper 同构，讲解取 hcclGetUniqueId/hcclCommInitRank 看 ctypes.byref 即可"]
+    },
+    {
+      "path": "vllm_ascend/patch/platform/patch_distributed.py",
+      "lines": "L25-L89",
+      "code": "class NullHandle:\n    def __init__(self):\n        pass\n\n    def wait(self):\n        pass\n\n\ndef communication_adaptation_310p():\n    def broadcast310p_wrapper(fn):\n        def broadcast310p(tensor, src=0, group=None, async_op=False, group_src=None):\n            root = group_src if group_src is not None else src\n\n            if tensor.device == torch.device(\"cpu\"):\n                return fn(tensor, src=root, group=group, async_op=async_op)\n            rank = torch.distributed.get_rank(group)\n            world_size = torch.distributed.get_world_size(group)\n            tensor_list = [torch.empty_like(tensor) for _ in range(world_size)]\n            tensor_list[rank] = tensor\n            torch.distributed.all_gather(tensor_list, tensor, group=group)\n            tensor[...] = tensor_list[src]\n            if async_op:\n                return NullHandle()\n            else:\n                return None\n\n        return broadcast310p\n\n    torch.distributed.broadcast = broadcast310p_wrapper(torch.distributed.broadcast)\n    torch.distributed.distributed_c10d.broadcast = broadcast310p_wrapper(torch.distributed.distributed_c10d.broadcast)\n\n    def all_reduce_wrapper_310p(fn):\n        def all_reduce(\n            tensor,\n            op=torch.distributed.ReduceOp.SUM,\n            group=None,\n            async_op=False,\n        ):\n            if tensor.dtype != torch.int64:\n                return fn(tensor, op, group, async_op)\n            rank = torch.distributed.get_rank(group)\n            world_size = torch.distributed.get_world_size(group)\n            tensor_list = [torch.empty_like(tensor) for _ in range(world_size)]\n            tensor_list[rank] = tensor\n            torch.distributed.all_gather(tensor_list, tensor, group=group)\n            if op == torch.distributed.ReduceOp.SUM:\n                return torch.stack(tensor_list).sum(0)\n            elif op == torch.distributed.ReduceOp.MAX:\n                return torch.tensor(\n                    torch.stack(tensor_list).cpu().numpy().max(0),\n                    device=tensor.device,\n                )\n            else:\n                raise RuntimeError(f\"not implement op {op}\")\n\n        return all_reduce\n\n    torch.distributed.all_reduce = all_reduce_wrapper_310p(torch.distributed.all_reduce)\n    torch.distributed.distributed_c10d.all_reduce = all_reduce_wrapper_310p(\n        torch.distributed.distributed_c10d.all_reduce\n    )\n\n\nif get_ascend_device_type() == AscendDeviceType._310P:\n    communication_adaptation_310p()",
+      "elide": ["复用 ch03 讲过的「闭包 wrapper(fn) 捕获原函数 + 模块属性赋值替换」两段式猴补技法，本章不重讲机制，只讲为什么补：310P 硬件不支持原生 broadcast / int64 all_reduce，用 all_gather 在 host 侧拼装等价结果。注意降级路径：broadcast 对 cpu tensor、all_reduce 对非 int64 直接走原函数 fn，只拦截缺口场景。仅当 get_ascend_device_type()==_310P（A2/A3/A5 不触发）时在 import 期生效"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "NPUPlatform.get_device_communicator_cls", "file": "vllm_ascend/platform.py:L803-L805", "responsibility": "OOT 注入点①：classmethod 覆写返回 NPUCommunicator 的字符串 qualname，基座据此把通信器类换成 NPU 版"},
+    {"name": "DeviceCommunicatorBase", "file": "vllm/distributed/device_communicators/base_device_communicator.py:L118", "responsibility": "基座通信器基类：把 all_reduce/all_gather/reduce_scatter/gather/send/recv/broadcast 全部抽象成 dist.xxx(group=self.device_group) 一行壳，底层 backend（NCCL/HCCL）由进程组决定——这是子类只需改差异点的根因"},
+    {"name": "NPUCommunicator", "file": "vllm_ascend/distributed/device_communicators/npu_communicator.py:L23", "responsibility": "子类化基类（②）：__init__ 设 self.device=torch.npu.current_device()、self.ca_comm=None 占位；新增 MoE 用的 all_to_all（split→dist.all_to_all→cat）。其余集合通信全继承基类、零修改"},
+    {"name": "PyHcclCommunicator", "file": "vllm_ascend/distributed/device_communicators/pyhccl.py:L37", "responsibility": "pynccl 的逐符号移植（③）：unique_id 建组 / CommInitRank / warmup all_reduce / disabled 降级。注意：尚未接入 NPUCommunicator（见其 __init__ 的 TODO），当前仅被单测调用，是为未来 custom-allreduce 集成预留的范式样本"},
+    {"name": "HCCLLibrary", "file": "vllm_ascend/distributed/device_communicators/pyhccl_wrapper.py:L113", "responsibility": "ctypes 绑定 libhccl.so：exported_functions 声明 C 函数签名表、__init__ 用 CDLL 加载并挂 restype/argtypes、方法层薄封装 + HCCL_CHECK 查返回码。对位 pynccl_wrapper.NCCLLibrary"},
+    {"name": "hcclUniqueId / hcclDataTypeEnum / hcclRedOpTypeEnum", "file": "vllm_ascend/distributed/device_communicators/pyhccl_wrapper.py:L38/L48/L87", "responsibility": "C 类型与枚举映射：4108 字节 root info 结构、dtype→HCCL 整型常量、ReduceOp→HCCL op 常量——枚举值序按 HCCL 头文件，与 NCCL 不同，必须照抄"},
+    {"name": "communication_adaptation_310p", "file": "vllm_ascend/patch/platform/patch_distributed.py:L33", "responsibility": "④仅 310P：用 ch03 两段式猴补把 torch.distributed.broadcast / all_reduce(int64) 替换成 all_gather 模拟，补硬件能力缺口；import 期按 get_ascend_device_type() 守卫触发"}
+  ],
+
+  "data_flow": [
+    "①注册解析：进程组初始化时 GroupCoordinator.__init__（parallel_state.py:L372-L381）调 current_platform.get_device_communicator_cls() → 在 NPU 上被 NPUPlatform 覆写为 NPUCommunicator 的 qualname 字符串 → resolve_obj_by_qualname 把字符串解析成类 → 用统一签名 (cpu_group, device, device_group, unique_name) 实例化。self.device 此前已按 is_out_of_tree() 设为 npu:local_rank",
+    "②集合通信调用：模型/引擎调 device_communicator.all_reduce / all_gather / reduce_scatter / broadcast → 命中继承自 DeviceCommunicatorBase 的实现 → dist.xxx(group=self.device_group) → 进程组的 HCCL backend 落到 NPU。子类零参与",
+    "③MoE all_to_all：专家并行路径调 NPUCommunicator.all_to_all（基类没有此方法，子类新增）→ 按 scatter_sizes/gather_sizes 或均分切 input → dist.all_to_all(output_list, input_list, group=self.device_group) → cat 回输出张量",
+    "④pyhccl 独立路径（当前未接入 NPUCommunicator）：若被构造，PyHcclCommunicator.__init__ → rank0 调 HCCLLibrary.hcclGetUniqueId()（CDLL→HcclGetRootInfo）→ dist.broadcast 把 unique_id 散给各 rank → hcclCommInitRank（HcclCommInitRootInfo）建通信子 → warmup all_reduce → 之后 all_reduce/broadcast 把 tensor.data_ptr() 包成 ctypes buffer 直调 libhccl.so",
+    "⑤310P 能力补丁：import vllm_ascend.patch.platform 时（patch/platform/__init__.py:L20）执行 patch_distributed.py，模块尾 if get_ascend_device_type()==_310P 才把 torch.distributed.broadcast/all_reduce 猴补成 all_gather 模拟版"
+  ],
+
+  "design_decisions": [
+    {"decision": "通信器类用『字符串 qualname 回调 + resolve_obj_by_qualname 延迟解析』而非直接 import 类", "why": "OOT 插件在基座之外，基座不能 import 昇腾符号；用字符串让基座在运行期按当前平台解析，零硬依赖——这正是 OOT 换底座最干净的注入形态：一个 classmethod 返回一个字符串", "evidence": "vllm/distributed/parallel_state.py:L373-L375 + vllm_ascend/platform.py:L803-L805"},
+    {"decision": "子类化 DeviceCommunicatorBase 但只重写/新增 all_to_all，其余集合通信全继承", "why": "基类已把所有集合通信抽象成 dist.xxx(group=self.device_group)，backend 由进程组（HCCL）决定，NPU 无需改这些方法即自动走 HCCL；唯一不在基类、需 NPU 自己给的是 MoE 的 all_to_all。『子类化=只改差异点』在此体现到极致", "evidence": "vllm_ascend/distributed/device_communicators/npu_communicator.py:L23-L68 对照 base_device_communicator.py:L180-L309（基类无 all_to_all）"},
+    {"decision": "NPUCommunicator.__init__ 保留 self.ca_comm=None 占位", "why": "兼容 vLLM 复用 graph capturing 代码——该代码会访问 communicator.ca_comm（custom all-reduce 接口），NPU 暂无自定义 all-reduce，置 None 保持接口形状一致不报 AttributeError", "evidence": "vllm_ascend/distributed/device_communicators/npu_communicator.py:L36-L38（注释明示 as in CUDACommunicator）"},
+    {"decision": "手写 pyhccl 逐符号移植 pynccl 的 ctypes 范式，而非复用 torch HCCL backend", "why": "pynccl/pyhccl 这层是为绕开 torch.distributed 直接调原生集合通信库（用于 custom all-reduce / graph capture 等场景）。移植策略=照搬控制流（unique_id 建组、CommInitRank、warmup、disabled 降级）只换符号（NCCL→HCCL、cuda→npu、cuda_stream→npu_stream、枚举值按 HCCL 头文件）", "evidence": "vllm_ascend/distributed/device_communicators/pyhccl.py:L37-L171 对照 vllm/distributed/device_communicators/pynccl.py:L58-L150"},
+    {"decision": "pyhccl 当前未接入 NPUCommunicator（仅范式样本/单测）", "why": "npu_communicator.py 的 TODO(hz) 明确写『Refer to CudaCommunicator's implementation to integrate PyHcclCommunicator』——即 CudaCommunicator 已在 __init__ 里 self.pynccl_comm=PyNcclCommunicator(...)，NPU 版尚未做这步。全仓搜索 PyHcclCommunicator 的用处只有 tests/ut。writer 切不可说『NPUCommunicator 用 pyhccl 做集合通信』，真相是 NPU 集合通信走基类 dist.* + HCCL backend", "evidence": "vllm_ascend/distributed/device_communicators/npu_communicator.py:L32（TODO）+ 全仓 grep 仅 tests/ut/.../test_pyhccl.py 引用"},
+    {"decision": "310P 用猴补把 broadcast / int64 all_reduce 替换成 all_gather 模拟，且仅 310P 触发", "why": "Atlas 300I (310P) 推理卡硬件不支持原生 broadcast 与 int64 all_reduce；用 all_gather（310P 支持）在 host 侧拼出等价语义（broadcast=all_gather 后取 src 份；sum/max all_reduce=all_gather 后 stack 归约）。守卫 if 确保 A2/A3/A5 训练/推理卡不被拖慢", "evidence": "vllm_ascend/patch/platform/patch_distributed.py:L33-L89 + patch/__init__.py:L33-L43（Why: tensor alignment for 310p）"},
+    {"decision": "猴补保留降级直通路径", "why": "broadcast310p 对 CPU tensor、all_reduce_310p 对非 int64 dtype 直接调原函数 fn——只拦截 310P 真正缺能力的场景（device tensor 的 broadcast、int64 的 all_reduce），最小化对正常路径的侵入", "evidence": "vllm_ascend/patch/platform/patch_distributed.py:L38-L39, L63-L64"}
+  ],
+
+  "theory": [
+    "all_to_all 的形状代数：输入沿 scatter_dim 切成 world_size 份（均分用 torch.tensor_split，不均用 torch.split+scatter_sizes），每 rank 发出自己的 N 份、收回来自各 rank 的 N 份，再沿 gather_dim cat。不均分时输出第 i 块的 gather_dim 长度=gather_sizes[i]，故需逐 rank 预分配 output_list。复杂度：通信量 O(numel)，与 all_gather 同阶但语义是『转置式』重分发（MoE 把 token 按专家路由重排的核心原语）",
+    "broadcast=all_gather 模拟（310P）：all_gather 让每 rank 拿到全部 world_size 份，取 tensor_list[src] 即得 root 的值，等价 broadcast。代价：通信量从 broadcast 的 O(numel) 升到 all_gather 的 O(world_size·numel)，用带宽换缺失的硬件原语",
+    "int64 all_reduce=all_gather+归约（310P）：all_gather 收齐各 rank 张量后 stack 在新维度，SUM 走 .sum(0)、MAX 走 numpy().max(0)。只支持 SUM/MAX（其余 raise）。仅拦截 int64 是因为 310P 浮点 all_reduce 原生可用，int64 才是缺口",
+    "ctypes 跨语言边界：torch tensor 的 data_ptr() 是设备显存地址（整数），包成 ctypes.c_void_p(buffer_type) 直接交给 .so；stream.npu_stream 同理是 aclrtStream 句柄。argtypes/restype 的声明让 ctypes 正确编组——这是不写 C++ 扩展也能直调厂商集合通信库的关键，GPU/NPU 范式完全一致，只换 .so 名与枚举值"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "pyhccl_wrapper.HCCLLibrary.__init__ 里 logger.error 的多行提示文案（L186-L197 的字符串实参）", "why_safe": "纯日志文案，删成单行/省略号不影响加载与绑定控制流；精简版保留 try/except CDLL + 重新 raise 即可"},
+      {"what": "pyhccl.py PyHcclCommunicator.__init__ 的长 docstring（L44-L54）", "why_safe": "文档字符串，不参与运行；精简版可压成一行说明"},
+      {"what": "pyhccl_wrapper 中 hcclDataTypeEnum / hcclRedOpTypeEnum.from_torch 的部分罕用 dtype 分支（如 int8/uint8/float64 等），可保留 float16/float32/bfloat16/int64 + SUM/MAX 代表分支", "why_safe": "枚举翻译是平行 if 链，删非演示用分支不改控制流骨架；但 from_torch 方法本身与至少代表性分支必须留（must_keep）"},
+      {"what": "patch_distributed.py 对 torch.distributed.distributed_c10d.broadcast / all_reduce 的第二次赋值（L54, L83-L85）", "why_safe": "与对 torch.distributed.broadcast/all_reduce 的赋值是同一 wrapper 的重复挂载点；精简版演示『猴补一个入口』即可说清技法，保留主 torch.distributed.* 赋值，c10d 镜像赋值可作注释说明。注意：真实代码两处都需要，精简版仅为可读性删，须 # SUBTRACTED 标注"},
+      {"what": "all_reduce_wrapper_310p 中 ReduceOp.MAX 分支的 numpy 往返实现（L72-L76），可保留 SUM 分支 + 一句省略说明", "why_safe": "MAX 与 SUM 是平行分支，删 MAX 实现不影响『all_gather→stack→归约』范式的展示；SUM 分支必须留"}
+    ],
+    "must_keep": [
+      {"symbol": "NPUCommunicator", "why": "本章主角②，子类化基类的载体，类定义与继承关系必须在"},
+      {"symbol": "DeviceCommunicatorBase", "why": "NPUCommunicator 的基类，读者须看到 super().__init__ 与『继承即复用集合通信』的事实"},
+      {"symbol": "all_to_all", "why": "NPU 唯一新增/差异点方法，整章『子类化=只改差异点』的证据，split/tensor_split→dist.all_to_all→cat 控制流须完整"},
+      {"symbol": "get_device_communicator_cls", "why": "OOT 注入点①回调，writer 需对照基座默认值讲『一个字符串换底座』"},
+      {"symbol": "ca_comm", "why": "__init__ 的兼容占位，design_decision 要讲为什么置 None（graph capture 接口对齐）"},
+      {"symbol": "PyHcclCommunicator", "why": "③范式样本主体，unique_id 建组/warmup/disabled 三段控制流须保留"},
+      {"symbol": "hcclGetUniqueId", "why": "建组第一步（rank0 取 root info），ctypes.byref 调 HcclGetRootInfo 的范例"},
+      {"symbol": "hcclCommInitRank", "why": "建通信子（HcclCommInitRootInfo + 指针的指针 byref(comm)），ctypes 绑定关键演示点"},
+      {"symbol": "all_reduce", "why": "pyhccl 把 data_ptr()→buffer_type、disabled 降级、device assert 的核心方法，对位 pynccl"},
+      {"symbol": "disabled", "why": "world_size==1 或缺库时的降级标志，writer 需讲『非 NPU 环境/单卡安全降级』"},
+      {"symbol": "HCCLLibrary", "why": "ctypes 绑定 .so 的载体，exported_functions 表 + CDLL 加载范式"},
+      {"symbol": "exported_functions", "why": "C 函数签名声明表，逐字对应 hccl.h 原型，是『照搬范式只换符号』的具象"},
+      {"symbol": "from_torch", "why": "dtype/ReduceOp→HCCL 整型常量翻译，枚举值按 HCCL 头文件（与 NCCL 不同）的关键，至少代表性分支须在"},
+      {"symbol": "hcclUniqueId", "why": "4108 字节 root info 结构，HCCL 与 NCCL(128B) 唯一尺寸差异，必须照头文件定义"},
+      {"symbol": "communication_adaptation_310p", "why": "④补丁主体，broadcast/all_reduce 两个 wrapper 的容器"},
+      {"symbol": "broadcast310p", "why": "broadcast=all_gather 取 src 份的模拟实现，须保留 cpu 直通 + all_gather 核心"},
+      {"symbol": "all_gather", "why": "310P 补丁的替代原语，broadcast/all_reduce 模拟都靠它，须可见"},
+      {"symbol": "get_ascend_device_type", "why": "守卫 if 的判定函数，writer 需讲『仅 310P 触发，A2/A3/A5 不补』"},
+      {"symbol": "AscendDeviceType", "why": "_310P 枚举来源，守卫条件的另一半"}
+    ]
+  },
+
+  "diagram_plan": [
+    {
+      "name": "fig-ch06-three-lines",
+      "intent": "一张总览图把『为什么通信器是 OOT 最干净样本』的三条线并排：①platform 回调（字符串 qualname）→ resolve → 实例化；②NPUCommunicator 子类化基类，灰显继承的一堆集合通信、高亮唯一新增的 all_to_all；③pyhccl/HCCLLibrary 旁挂的 ctypes 范式样本（标注『未接入，范式样本』虚线）；④310P 猴补层拦截 broadcast/all_reduce",
+      "spec": "svg-diagram：竖向泳道。左道=基座 vLLM（Platform.get_device_communicator_cls 默认 / GroupCoordinator.__init__ resolve_obj_by_qualname / DeviceCommunicatorBase 含 all_reduce..broadcast 一列灰框）；中道=vllm_ascend（NPUPlatform 覆写→字符串箭头指向 NPUCommunicator；NPUCommunicator 框内继承箭头连基类灰框、唯一高亮 all_to_all）；右道=ctypes 范式（PyHcclCommunicator→HCCLLibrary→libhccl.so，整组虚线+『TODO 未接入』标签）；底部横贯=310P patch 拦截 torch.distributed.broadcast/all_reduce（仅 310P 虚线守卫）。颜色：继承复用=灰、差异点 all_to_all=强调色、未接入=虚线灰"
+    },
+    {
+      "name": "fig-ch06-pyhccl-vs-pynccl",
+      "intent": "并排对位表/双列图：pynccl(GPU) ↔ pyhccl(NPU) 逐行映射，凸显『照搬控制流只换符号』",
+      "spec": "svg-diagram：两列对照表。行=控制流步骤（取 unique_id / broadcast 建组 / CommInitRank / warmup all_reduce / data_ptr→buffer / stream 句柄 / 枚举值）；左列 NCCL/cuda/cuda_stream/float16=6，右列 HCCL/npu/npu_stream/float16=3。差异 cell 用强调色，相同结构 cell 用同色——一眼看出『结构同构、符号替换、枚举值需查头文件』"
+    },
+    {
+      "name": "fig-ch06-310p-fallback",
+      "intent": "310P broadcast/all_reduce 用 all_gather 模拟的数据流小图",
+      "spec": "svg-diagram：上半 broadcast310p（4 rank：all_gather 收齐→各 rank 取 tensor_list[src]）；下半 all_reduce_310p int64（all_gather→stack→sum/max）。标注通信量从 O(numel) 升到 O(world_size·numel)、降级直通条件（cpu tensor / 非 int64）"
+    },
+    {
+      "name": "roadmap-ch06",
+      "intent": "每章开场 Roadmap 高亮『通信器』节点，前接 ch03 猴补技法、平台注册，后接 MoE/专家并行章",
+      "spec": "复用 instances/vllm-ascend/book/assets/roadmap/roadmap.py，高亮 device_communicator 节点，标注复用 ch03（两段式猴补）"
+    }
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recover": [],
+    "note": "scripts/bible.py due ch06 返回空（『== ch06 应埋伏笔 ==』『== ch06 应回收 ==』均无条目）。建议本章可主动埋一笔：pyhccl 的 ctypes 范式样本 + NPUCommunicator.ca_comm=None 占位，是未来 custom-allreduce / pyhccl 接入的伏笔，可在 MoE/性能章回收。请 Lead/Archivist 决定是否登记。"
+  },
+
+  "analyst_notes_blockers": [
+    "重要保真提醒1：基座 vLLM v0.21.0 的 DeviceCommunicatorBase 与 CudaCommunicator 都【没有】all_to_all 方法（已 grep 确认）。故 NPUCommunicator.all_to_all 严格说是【新增】而非【重写】。章节标题/brief 说『仅重写 MoE 用的 all_to_all』——writer 表述时建议用『新增/提供』或注明『基类无此方法，子类补上』，避免说成 override 基类同名方法。『子类化=只改差异点』的论点仍成立（差异点=新增 all_to_all + __init__ 微调，其余全继承）。",
+    "重要保真提醒2：PyHcclCommunicator 当前【未接入】NPUCommunicator（npu_communicator.py:L32 TODO + 全仓 grep 仅 tests/ut 引用）。它是 pynccl ctypes 范式的移植样本/预留件。writer 切勿写成『NPUCommunicator 通过 pyhccl 做集合通信』——NPU 的集合通信实际走继承自基类的 dist.*(group=device_group) + 进程组 HCCL backend。pyhccl 这条线讲『ctypes 范式怎么从 GPU 照搬到 NPU』，并诚实标注其『未接入/范式样本』状态。",
+    "提醒3：310P 猴补复用 ch03 两段式技法，按 brief 不重讲机制，只讲『补什么能力缺口、为何 all_gather 能等价模拟、为何仅 310P』。",
+    "提醒4（构造签名口径）：基类 DeviceCommunicatorBase.__init__ 在锁定基座里实际有 6 个形参——cpu_group, device, device_group, unique_name, 外加带默认值的 global_ranks=None、global_world_size=None（base_device_communicator.py:L126-L134，两个新增参在 L132-L133）。dossier/code_spine 里用 4 个 kwargs (cpu_group/device/device_group/unique_name) 描述的是 GroupCoordinator 调用点（parallel_state.py:L376-L380 只传这 4 个）与 NPUCommunicator.super().__init__(cpu_group, device, device_group, unique_name) 的实际传参——这对它们是准确的，因为后两参有默认值。writer 表述时切勿声称『基类构造器只有 4 个参数』；正确说法是『调用点只用到前 4 个（后两个 global_ranks/global_world_size 走默认，仅 stateless 进程组分支才用）』。"
+  ]
+}
