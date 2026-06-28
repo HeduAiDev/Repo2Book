@@ -14,16 +14,16 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch04',
-  slug: 'ch04-patch-engine-core-kvcache',
+  chapter_id: 'ch05',
+  slug: 'ch05-check-and-update-config',
   instance: 'vllm-ascend',
-  focus: '顶替引擎核心：KV-cache 协调器、调度与 spec 的昇腾化 patch。以 KV-cache / 内存形态层的 patch 为主线，展示「为正确性与硬件约束而 patch」的真实案例群：**block_size 16→128**（mamba 在 NPU 不支持 16）、**MLAAttentionSpec 子类化**扩展 DSA/Sparse-C8、**CP+hybrid 前缀缓存**（AscendHybridKVCacheCoordinator.find_longest_cache_hit）、**bind_kv_cache 跳 NPU raise**、**int32 slot_mapping**。每个案例都对照 vLLM 原实现讲「原来怎么算、为什么 NPU 不行、patch 怎么改」——三段式：原算法 → 昇腾约束 → 重绑定手法（复用 ch03 的 5 种技法语汇，本章不再重讲技法，只点名用了哪一种）。与 ch16/ch22 的 KV 管理交叉引用（前向链接，别展开）。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vLLM 书 ch16 + vllm/v1/kv_cache_interface.py · vllm/v1/core/kv_cache_coordinator.py · vllm/v1/core/kv_cache_utils.py · vllm/v1/worker/utils.py（去核对被 patch 的原函数：原 block_size 默认、原 find_longest_cache_hit、原 bind_kv_cache、原 slot_mapping dtype）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（patch 重绑定/配置改写逻辑是纯 Python，可跑）】',
-  highlight: 'ch04',
+  focus: 'check_and_update_config：插件改写 VllmConfig 的总闸 + AscendConfig 配置面。NPUPlatform.check_and_update_config 全流程——**init_ascend_config** → **_fix_incompatible_config**（系统性把 GPU/ROCm 专属参数 cascade_attn / cudnn_prefill / trtllm / numa_bind / nvtx … cascade reset 成昇腾安全值）→ **cudagraph / compilation / splitting_ops 改写** → **选 worker_cls** → **设环境变量**；以及 **AscendConfig 单例**如何把开放 dict additional_config 解析成强类型子配置 + **_get_config_value 的 additional_config→env→default 三级取值**。讲透两点设计哲学：①「平台 = 配置改写器」这一 vLLM 钩子约定（平台拿到完整 VllmConfig 在构图前最后改写）；②「无 schema 配置后门」additional_config 的取舍（灵活 vs 失去校验）。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vLLM 书 ch03 + vllm/platforms/interface.py（基类 check_and_update_config 钩子定义、默认实现）· vllm/config · vllm/envs.py（去核对平台钩子契约与被改写的原配置默认值）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（配置改写/三级取值是纯 Python dict 逻辑，可跑）】',
+  highlight: 'ch05',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm-ascend/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
   skip_impl: false,
-  paths: ['vllm_ascend/patch/platform/patch_kv_cache_interface.py', 'vllm_ascend/patch/platform/patch_kv_cache_coordinator.py', 'vllm_ascend/patch/platform/patch_kv_cache_utils.py', 'vllm_ascend/patch/platform/patch_mamba_config.py', 'vllm_ascend/patch/worker/patch_qwen3_next_mtp.py'],
+  paths: ['vllm_ascend/platform.py', 'vllm_ascend/ascend_config.py', 'vllm_ascend/envs.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'

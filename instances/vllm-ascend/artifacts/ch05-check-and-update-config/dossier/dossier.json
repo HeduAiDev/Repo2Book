@@ -1,0 +1,230 @@
+{
+  "chapter_id": "ch05",
+  "title": "check_and_update_config：插件改写 VllmConfig 的总闸 + AscendConfig 配置面",
+  "one_line": "讲透两件事：①平台 = 配置改写器（vLLM 在构图前把完整 VllmConfig 交给 NPUPlatform.check_and_update_config 做最后改写）；②无 schema 配置后门（开放 dict additional_config 经 AscendConfig 解析成强类型子配置，_get_config_value 走 additional_config→env→default 三级取值）。",
+
+  "code_spine": [
+    "vllm/config/vllm.py:L758 VllmConfig.__post_init__ —— 构造期最后阶段，先 apply_config_platform_defaults(L983)，再 check_and_update_config(L1197) 把 self（完整 VllmConfig）按引用交给平台改写",
+    "vllm/platforms/interface.py:L432-L443 Platform.check_and_update_config —— 基类钩子契约（默认 pass，可抛异常或就地改 config）",
+    "vllm_ascend/platform.py:L413-L437 NPUPlatform.check_and_update_config 入口：device_type/model_config 守卫 → maybe_auto_detect_quantization → 两个 _validate_* → _fix_incompatible_config → init_ascend_config",
+    "vllm_ascend/platform.py:L979-L1180 _fix_incompatible_config —— 按子配置分 9 段，把 GPU/ROCm 专属参数 cascade reset 成昇腾安全值",
+    "vllm_ascend/ascend_config.py:L788-L804 init_ascend_config —— 懒加载单例（refresh / 同一 vllm_config / 完整性守卫）",
+    "vllm_ascend/ascend_config.py:L32-L283 AscendConfig.__init__ —— 把开放 dict additional_config 解析成一组强类型子配置 + 标量字段",
+    "vllm_ascend/ascend_config.py:L284-L296 _get_config_value —— additional_config→env→default 三级取值",
+    "vllm_ascend/envs.py:L30-L122 env_variables 表 + 模块级 __getattr__ 懒求值（三级取值里的 env 层）",
+    "vllm_ascend/platform.py:L444-L587 回到 check_and_update_config：cudagraph_mode / CompilationMode / splitting_ops 改写",
+    "vllm_ascend/platform.py:L602-L614 worker_cls 'auto' → NPUWorker qualname（ch02 伏笔 f2 的回收点）",
+    "vllm_ascend/platform.py:L696-L714 设环境变量 PYTORCH_NPU_ALLOC_CONF=expandable_segments:True"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm/platforms/interface.py",
+      "lines": "L432-L443",
+      "what": "基类钩子契约：默认实现是 pass，约定可抛异常拒绝、也可就地改 config（passed by reference）",
+      "code": "    @classmethod\n    def check_and_update_config(cls, vllm_config: \"VllmConfig\") -> None:\n        \"\"\"\n        Check and update the configuration for the current platform.\n\n        It can raise an exception if the configuration is not compatible with\n        the current platform, or it can update the configuration to make it\n        compatible with the current platform.\n\n        The config is passed by reference, so it can be modified in place.\n        \"\"\"\n        pass",
+      "elide": []
+    },
+    {
+      "path": "vllm/config/vllm.py",
+      "lines": "L1197",
+      "what": "调用点：在 VllmConfig.__post_init__（构造期最后阶段、CLI 解析后、构图前）把 self 交给当前平台。current_platform 在 OOT 插件场景已是 NPUPlatform。",
+      "code": "        current_platform.check_and_update_config(self)",
+      "elide": ["__post_init__ 始于 vllm/config/vllm.py:L758；同一函数更早处 L983 还调了 current_platform.apply_config_platform_defaults(self)（注入 Ascend 默认，如 max_cudagraph_capture_size），二者一前一后构成平台对 config 的两次改写窗口。"]
+    },
+    {
+      "path": "vllm_ascend/platform.py",
+      "lines": "L413-L437",
+      "what": "入口与编排骨架：device_type 不符 / model_config 缺失则早退；否则依次量化探测→两段校验→_fix_incompatible_config→init_ascend_config",
+      "code": "    @classmethod\n    def check_and_update_config(cls, vllm_config: VllmConfig) -> None:\n        from vllm_ascend.quantization.utils import maybe_auto_detect_quantization\n\n        device_config = getattr(vllm_config, \"device_config\", None)\n        if device_config is not None and getattr(device_config, \"device_type\", cls.device_type) != cls.device_type:\n            logger.debug(\n                \"Skipping Ascend-specific config updates for device type %s.\",\n                device_config.device_type,\n            )\n            return\n\n        if vllm_config.model_config is None:\n            logger.warning(\"Model config is missing. Skipping Ascend-specific config updates.\")\n            return\n\n        maybe_auto_detect_quantization(vllm_config)\n\n        cls._validate_layer_sharding_config(vllm_config)\n        cls._validate_draft_decode_context_parallel_config(vllm_config)\n\n        # initialize ascend config from vllm additional_config\n        cls._fix_incompatible_config(vllm_config)\n\n        ascend_config = init_ascend_config(vllm_config)",
+      "elide": ["L439-L468 之后是 kv_transfer_config engine_id 打补丁、把 ascend_compilation_config/ascend_fusion_config 回写进 additional_config、update_compile_ranges_split_points 等周边动作，主线可略。"]
+    },
+    {
+      "path": "vllm_ascend/platform.py",
+      "lines": "L979-L1006",
+      "what": "_fix_incompatible_config 头部 + 段1/2：函数 docstring 点明意图（GPU 专属/暂不支持参数→warn+reset 安全值）；逐段按子配置 getattr 探测再就地改",
+      "code": "    @staticmethod\n    def _fix_incompatible_config(vllm_config: VllmConfig) -> None:\n        \"\"\"\n        Check and correct parameters in VllmConfig that are incompatible with Ascend NPU.\n        If GPU-specific or currently unsupported parameters are set by the user,\n        log a warning and reset them to safe values.\n        \"\"\"\n        model_config = vllm_config.model_config\n        # ==================== 1. Model Config ====================\n        if model_config:\n            # Disable Cascade Attention (GPU feature)\n            if getattr(model_config, \"disable_cascade_attn\", False):\n                logger.warning(\n                    \"GPU-specific parameter is not supported on Ascend. \"\n                    \"parameter=disable_cascade_attn, value=True, action: resetting to False.\"\n                )\n                model_config.disable_cascade_attn = False\n\n        # ==================== 2. Cache Config ====================\n        if vllm_config.cache_config:\n            # Check and reset cpu_kvcache_space_bytes\n            if getattr(vllm_config.cache_config, \"cpu_kvcache_space_bytes\", False):\n                logger.warning(\n                    \"Parameter is tied to incompatible backend. \"\n                    \"parameter=cpu_kvcache_space_bytes, action: resetting to None for Ascend.\"\n                )\n                vllm_config.cache_config.cpu_kvcache_space_bytes = None",
+      "elide": ["每段都是同一招式：getattr 取默认值探测用户是否动过 → logger.warning → 就地写回安全默认。注意 `disable_cascade_attn` 名义是『禁用 cascade』，但 Ascend 干脆把它强行设回 False（即始终不走 cascade attn 那条 GPU 路径）。"]
+    },
+    {
+      "path": "vllm_ascend/platform.py",
+      "lines": "L1018-L1036",
+      "what": "段4/5代表：NVTX（NVIDIA 专属 tracing）、max_num_partial_prefills（ROCm partial-prefill 优化）reset 回默认",
+      "code": "        # ==================== 4. Observability Config ====================\n        if vllm_config.observability_config:\n            # NVTX tracing is NVIDIA specific\n            if getattr(vllm_config.observability_config, \"enable_layerwise_nvtx_tracing\", False):\n                logger.warning(\n                    \"Parameter relies on NVIDIA-specific tools. \"\n                    \"parameter=enable_layerwise_nvtx_tracing, action: resetting to False.\"\n                )\n                vllm_config.observability_config.enable_layerwise_nvtx_tracing = False\n\n        # ==================== 5. Scheduler Config ====================\n        if vllm_config.scheduler_config:\n            # Partial prefills are specific to ROCm optimization\n            if getattr(vllm_config.scheduler_config, \"max_num_partial_prefills\", 1) != 1:\n                logger.warning(\n                    \"Parameter is optimized for incompatible platform. \"\n                    \"parameter=max_num_partial_prefills, action: resetting to default (1). \"\n                )\n                vllm_config.scheduler_config.max_num_partial_prefills = 1",
+      "elide": ["段3（multimodal mm_encoder_attn_backend→None）、段6（speculative quantization→None）、段7（kv_transfer kv_buffer_size→1e9 / enable_permute_local_kv→False）结构同理，正文可只举其一二再概括。"]
+    },
+    {
+      "path": "vllm_ascend/platform.py",
+      "lines": "L1070-L1119",
+      "what": "段8 Attention Config：用一张 force_false_flags 列表批量把 cudnn_prefill / trtllm 等 GPU 专属布尔位归零，再单独处理 flash_attn_version / backend / cuda-graph split 数",
+      "code": "        # ==================== 8. Attention Config ====================\n        if vllm_config.attention_config:\n            att_config = vllm_config.attention_config\n\n            # Boolean flags that must be False on Ascend (typically NVIDIA-specific)\n            force_false_flags = [\n                \"use_prefill_decode_attention\",\n                \"use_cudnn_prefill\",\n                \"use_trtllm_ragged_deepseek_prefill\",\n                \"use_trtllm_attention\",\n                \"disable_flashinfer_prefill\",\n                \"disable_flashinfer_q_quantization\",\n            ]\n            for flag in force_false_flags:\n                if getattr(att_config, flag, False):\n                    logger.warning(\n                        \"Ignored GPU-specific parameter. parameter=%s, action: resetting to False. \",\n                        flag,\n                    )\n                    setattr(att_config, flag, False)\n\n            # Reset specific values to None as Ascend uses its own internal logic\n            if getattr(att_config, \"flash_attn_version\", None) is not None:\n                logger.warning(\n                    \"Ignored parameter. Ascend uses its own attention backend. \"\n                    \"parameter=flash_attn_version, action: resetting to None. \"\n                )\n                att_config.flash_attn_version = None",
+      "elide": ["L1099-L1119 后续：backend 若非 FLASH_ATTN 则 reset 为 None（FLASH_ATTN 为训推一致保留）；flash_attn_max_num_splits_for_cuda_graph!=32 时 reset 回 32。"]
+    },
+    {
+      "path": "vllm_ascend/platform.py",
+      "lines": "L1138-L1166",
+      "what": "段9 Parallel Config 亮点：--numa-bind 不是简单丢弃，而是『无损改写』——关掉 GPU 版 numa_bind，转写成 additional_config['enable_cpu_binding']=True 走昇腾原生 CPU 绑核",
+      "code": "            if getattr(vllm_config.parallel_config, \"numa_bind\", False):\n                vllm_config.parallel_config.numa_bind = False\n                if vllm_config.additional_config is None:\n                    vllm_config.additional_config = {}\n                vllm_config.additional_config.setdefault(\"enable_cpu_binding\", True)\n                logger.info(\n                    \"'--numa-bind' is not supported on Ascend NPU (GPU-to-\"\n                    \"NUMA topology detection unavailable). Automatically \"\n                    \"converted to --additional-config \"\n                    \"'{\\\"enable_cpu_binding\\\": true}' for Ascend-native \"\n                    \"CPU-core binding.\"\n                )\n\n            if getattr(vllm_config.parallel_config, \"numa_bind_nodes\", None):\n                logger.info(\n                    \"'--numa-bind-nodes' is ignored on Ascend NPU. The \"\n                    \"Ascend-native CPU binding automatically performs \"\n                    \"topo-affinity core allocation.\"\n                )\n                vllm_config.parallel_config.numa_bind_nodes = None",
+      "elide": ["段9 还含 ray_workers_use_nsight→False、numa_bind_cpus→None、enable_dbo→False、ubatch_size→0。numa_bind 这处是『改写』非『丢弃』的范式：把 vLLM 通用旗标翻译成 additional_config 后门键，正好串起本章两条主线。"]
+    },
+    {
+      "path": "vllm_ascend/platform.py",
+      "lines": "L483-L496",
+      "what": "cudagraph/compilation 改写片段：enforce_eager → CompilationMode.NONE+空 splitting_ops；非法 mode → CUDAGraphMode.NONE",
+      "code": "        if enforce_eager:\n            logger.info(\"Compilation disabled, using eager mode by default\")\n            compilation_config.mode = CompilationMode.NONE\n            if compilation_config.splitting_ops is None:\n                compilation_config.splitting_ops = []\n\n        compilation_config.cudagraph_num_of_warmups = 1\n\n        if compilation_config.mode not in [CompilationMode.NONE, CompilationMode.VLLM_COMPILE]:\n            logger.warning(\n                \"NPU does not support compilation mode. mode=%s, action: setting CUDAGraphMode to NONE.\",\n                compilation_config.mode,\n            )\n            compilation_config.cudagraph_mode = CUDAGraphMode.NONE",
+      "elide": ["L498-L586 据 cudagraph_mode 分支改写 splitting_ops（piecewise 时 set_splitting_ops_for_v1 再 extend mla_forward/dsa_forward；full cudagraph 时清空 splitting_ops=[]）；并设 oot_compiler、use_inductor=False。控制流密但同属『平台改写编译配置』，正文按需取片段。"]
+    },
+    {
+      "path": "vllm_ascend/platform.py",
+      "lines": "L602-L614",
+      "what": "worker_cls 选择（ch02 伏笔 f2 回收点）：仅当 parallel_config.worker_cls=='auto' 时按设备分代/特性把抽象 'auto' 落成昇腾 Worker 的 qualname 字符串",
+      "code": "        if parallel_config and parallel_config.worker_cls == \"auto\":\n            # TODO: this is a tricky way to disable `use_sequence_parallel_moe` in vllm.\n            if not vllm_config.compilation_config.pass_config.enable_sp:\n                parallel_config.all2all_backend = \"flashinfer_all2allv\"\n            if is_310p():\n                parallel_config.worker_cls = \"vllm_ascend._310p.worker_310p.NPUWorker310\"\n            elif ascend_config.xlite_graph_config.enabled:\n                logger.info(\"openEuler Xlite enabled. See: https://atomgit.com/openeuler/GVirt/tree/master/xlite\")\n                parallel_config.worker_cls = \"vllm_ascend.xlite.xlite_worker.XliteWorker\"\n            else:\n                parallel_config.worker_cls = \"vllm_ascend.worker.worker.NPUWorker\"\n\n        refresh_block_size(vllm_config)",
+      "elide": ["worker_cls 是字符串 qualname、由 vLLM 后续 resolve_obj_by_qualname 实例化——这正是『平台改写 config 就能顶替执行主控』的钩子兑现（详细 NPUWorker 见后续章节）。"]
+    },
+    {
+      "path": "vllm_ascend/platform.py",
+      "lines": "L700-L714",
+      "what": "设环境变量：非 sleep-mode 时给 PYTORCH_NPU_ALLOC_CONF 追加 expandable_segments:True（且与 max_split_size_mb/gc_threshold 互斥保护）",
+      "code": "        if model_config and not model_config.enable_sleep_mode:\n            npu_alloc_configs = os.getenv(\"PYTORCH_NPU_ALLOC_CONF\", \"expandable_segments:True\")\n            # This environment variable may have more than one key-value pairs.\n            # We should append \",expandable_segments:True\" to the current configs.\n            # For example: \"page_size:1g\" + \",expandable_segments:True\".\n            # NOTE: `max_split_size_mb` or `garbage_collection_threshold` cannot\n            # be enabled together with `expandable_segments=True`.\n            if (\n                \"expandable_segments\" not in npu_alloc_configs\n                and \"max_split_size_mb\" not in npu_alloc_configs\n                and \"garbage_collection_threshold\" not in npu_alloc_configs\n            ):\n                npu_alloc_configs += \",expandable_segments:True\"\n            os.environ[\"PYTORCH_NPU_ALLOC_CONF\"] = npu_alloc_configs\n            logger.info(\"Set PYTORCH_NPU_ALLOC_CONF=%s\", npu_alloc_configs)",
+      "elide": ["check_and_update_config 收尾还有若干 raise（mc2 与 hierarchy_comm 互斥等），属一致性校验，正文可概述。"]
+    },
+    {
+      "path": "vllm_ascend/ascend_config.py",
+      "lines": "L27-L55",
+      "what": "AscendConfig.__init__ 头部：从 vllm_config.additional_config（可能为 None→{}）逐键 .get(子dict, {}) 构造一组强类型子配置对象",
+      "code": "class AscendConfig:\n    \"\"\"\n    Configuration Object for additional_config from vllm.configs.\n    \"\"\"\n\n    def __init__(self, vllm_config: \"VllmConfig\"):\n        self.vllm_config = vllm_config\n        additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}\n\n        xlite_graph_config = additional_config.get(\"xlite_graph_config\", {})\n        self.xlite_graph_config = XliteGraphConfig(xlite_graph_config, vllm_config)\n\n        ascend_compilation_config = additional_config.get(\"ascend_compilation_config\", {})\n        self.ascend_compilation_config = AscendCompilationConfig(**ascend_compilation_config)\n\n        ascend_fusion_config = additional_config.get(\"ascend_fusion_config\", {})\n        self.ascend_fusion_config = AscendFusionConfig(**ascend_fusion_config)\n\n        finegrained_tp_config = additional_config.get(\"finegrained_tp_config\", {})\n        self.finegrained_tp_config = FinegrainedTPConfig(finegrained_tp_config, vllm_config)\n\n        eplb_config = additional_config.get(\"eplb_config\", {})\n        self.eplb_config = EplbConfig(eplb_config)",
+      "elide": ["__init__ 后续（L51-L283）还解析 weight_prefetch/profiling_chunk/rejection_sampler 等十余个子配置与标量字段，并做大量交叉校验（如 profiling_chunk 要求 pp>1）。范式一致：开放 dict 的某键 → 对应强类型类/标量。正文取头几个即可代表。"]
+    },
+    {
+      "path": "vllm_ascend/ascend_config.py",
+      "lines": "L77-L88",
+      "what": "三级取值的调用现场：标量布尔字段经 _get_config_value 取，传入 additional_config、config_key、env_key、以及已求值的 env_value（来自 ascend_envs）",
+      "code": "        from vllm_ascend import envs as ascend_envs\n\n        self.enable_balance_scheduling = self._get_config_value(\n            additional_config,\n            \"enable_balance_scheduling\",\n            \"VLLM_ASCEND_BALANCE_SCHEDULING\",\n            ascend_envs.VLLM_ASCEND_BALANCE_SCHEDULING,\n        )\n        self.enable_flashcomm1 = self._get_config_value(\n            additional_config,\n            \"enable_flashcomm1\",\n            \"VLLM_ASCEND_ENABLE_FLASHCOMM1\",\n            ascend_envs.VLLM_ASCEND_ENABLE_FLASHCOMM1,\n        )",
+      "elide": ["同样形态在 __init__ 中重复约十次（enable_matmul_allreduce / enable_fused_mc2 / enable_mlapo / weight_nz_mode 等）。注意第4个实参 ascend_envs.VLLM_ASCEND_* 在传入前就被 envs.__getattr__ 求值了——所以 env→default 这两级实际在 envs 表里塌缩成一个值，_get_config_value 真正抉择的是 additional_config 是否覆盖它。"]
+    },
+    {
+      "path": "vllm_ascend/ascend_config.py",
+      "lines": "L284-L296",
+      "what": "_get_config_value：三级取值的核心 —— additional_config 命中即用（最高优先级）；否则若 env_key 在环境里则提示『已弃用、请改用 additional_config』；最终都返回 env_value（其中已含 default）",
+      "code": "    @staticmethod\n    def _get_config_value(additional_config: dict[str, Any], config_key: str, env_key: str, env_value: Any) -> Any:\n        if config_key in additional_config:\n            value = additional_config[config_key]\n            logger.info_once(f\"AscendConfig.{config_key} is set from additional_config with value {value}.\")\n            return value\n        if env_key in os.environ:\n            logger.info_once(\n                f\"AscendConfig.{config_key} falls back to environment variable {env_key} with value {env_value}. \"\n                f\"Please use additional_config.{config_key} instead, because {env_key} will be removed in the \"\n                \"next release.\"\n            )\n        return env_value",
+      "elide": ["关键语义：env_value 是调用方传进来的、envs 表已对 env_key『有则取环境值、无则取 default』求好值的结果。所以本函数只决定 additional_config 是否压过 env/default 这一层；env 与 default 的分界发生在 envs.py 的 lambda 里。"]
+    },
+    {
+      "path": "vllm_ascend/envs.py",
+      "lines": "L30-L35",
+      "what": "envs 表：每个 env 变量是一个 lambda，封装 os.getenv(KEY, default) 并做类型转换——env 与 default 两级在这里塌缩",
+      "code": "env_variables: dict[str, Callable[[], Any]] = {\n    # max compile thread number for package building. Usually, it is set to\n    # the number of CPU cores. If not set, the default value is None, which\n    # means all number of CPU cores will be used.\n    \"MAX_JOBS\": lambda: os.getenv(\"MAX_JOBS\", None),",
+      "elide": ["表内约三十项，多为构建/特性开关，结构同理：lambda: <类型转换>(os.getenv(KEY, <default>))。"]
+    },
+    {
+      "path": "vllm_ascend/envs.py",
+      "lines": "L71-L75",
+      "what": "代表项：被 AscendConfig 三级取值消费的开关，且 docstring 直接标注 DEPRECATED、引导改用 additional_config",
+      "code": "    \"VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE\": lambda: bool(int(os.getenv(\"VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE\", \"0\"))),\n    # Whether to enable FlashComm optimization when tensor parallel is enabled.\n    # This feature will get better performance when concurrency is large.\n    # DEPRECATED: use additional_config.enable_flashcomm1 instead.\n    \"VLLM_ASCEND_ENABLE_FLASHCOMM1\": lambda: bool(int(os.getenv(\"VLLM_ASCEND_ENABLE_FLASHCOMM1\", \"0\"))),",
+      "elide": []
+    },
+    {
+      "path": "vllm_ascend/envs.py",
+      "lines": "L118-L122",
+      "what": "模块级 __getattr__：让 `ascend_envs.VLLM_ASCEND_*` 访问触发 lambda 懒求值（每次访问都重新读环境）",
+      "code": "def __getattr__(name: str):\n    # lazy evaluation of environment variables\n    if name in env_variables:\n        return env_variables[name]()\n    raise AttributeError(f\"module {__name__!r} has no attribute {name!r}\")",
+      "elide": []
+    },
+    {
+      "path": "vllm_ascend/ascend_config.py",
+      "lines": "L788-L804",
+      "what": "init_ascend_config：进程级懒加载单例。命中缓存条件=非 refresh、已完整初始化、且绑定同一个 vllm_config；否则新建并（完整时）回填全局",
+      "code": "def init_ascend_config(vllm_config):\n    additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}\n    refresh = additional_config.get(\"refresh\", False) if additional_config else False\n    global _ASCEND_CONFIG\n    if (\n        _ASCEND_CONFIG is not None\n        and not refresh\n        and _is_ascend_config_initialized(_ASCEND_CONFIG)\n        and getattr(_ASCEND_CONFIG, \"vllm_config\", None) is vllm_config\n    ):\n        return _ASCEND_CONFIG\n    new_config = AscendConfig(vllm_config)\n    if _is_ascend_config_initialized(new_config):\n        _ASCEND_CONFIG = new_config\n    else:\n        logger.warning(\"Ascend config instance is not fully initialized. action: skip singleton cache update. \")\n    return new_config",
+      "elide": ["配套 get_ascend_config()（L815，未初始化则 raise）、clear_ascend_config()（L807，测试用）、_is_ascend_config_initialized（L775，用 hasattr 探测 monkeypatch 出的半初始化实例）。"]
+    },
+    {
+      "path": "vllm_ascend/ascend_config.py",
+      "lines": "L498-L538",
+      "what": "强类型子配置范例 AscendCompilationConfig.__init__：用带默认值的命名形参 + **kwargs 把开放 dict 转成强类型属性，并就地校验（static_kernel 依赖 npugraph_ex）",
+      "code": "    def __init__(\n        self,\n        enable_npugraph_ex: bool = True,\n        enable_static_kernel: bool = False,\n        fuse_norm_quant: bool = True,\n        fuse_qknorm_rope: bool = True,\n        fuse_allreduce_rms: bool = False,\n        **kwargs,\n    ):\n        self.fuse_norm_quant = fuse_norm_quant\n        self.fuse_qknorm_rope = fuse_qknorm_rope\n        self.fuse_allreduce_rms = fuse_allreduce_rms\n        self.enable_npugraph_ex = enable_npugraph_ex\n        self.enable_static_kernel = enable_static_kernel\n        self.fuse_muls_add = kwargs.get(\"fuse_muls_add\", True)\n        if self.enable_static_kernel:\n            assert self.enable_npugraph_ex, \"Static kernel generation requires npugraph_ex to be enabled.\"",
+      "elide": ["原 __init__ 含一段长 docstring（L507-L530）逐项解释参数；正文若引用可压缩。**kwargs 是『无 schema 后门』的体现：未知键被静默吞掉（向前兼容），代价是拼错键名不会报错。"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "NPUPlatform", "file": "vllm_ascend/platform.py", "responsibility": "vLLM Platform 子类（_enum=OOT）。本章焦点是它对 vLLM『平台钩子』的实现：check_and_update_config（构图前总闸，编排校验→_fix_incompatible_config→init_ascend_config→cudagraph/编译/worker_cls/env 改写）、_fix_incompatible_config（9 段 cascade reset GPU/ROCm 专属参数）、apply_config_platform_defaults（更早注入 Ascend 默认）。"},
+    {"name": "AscendConfig", "file": "vllm_ascend/ascend_config.py", "responsibility": "把开放 dict vllm_config.additional_config 解析成一组强类型子配置对象 + 标量字段的聚合根；并承载 _get_config_value 三级取值与各种交叉校验。进程级单例由 init_ascend_config 管理。"},
+    {"name": "_get_config_value", "file": "vllm_ascend/ascend_config.py", "responsibility": "AscendConfig 的静态方法：实现 additional_config→env→default 三级取值优先级（env/default 已在 envs 表内塌缩为传入的 env_value，本函数决定 additional_config 是否覆盖）。"},
+    {"name": "init_ascend_config / get_ascend_config / clear_ascend_config", "file": "vllm_ascend/ascend_config.py", "responsibility": "AscendConfig 的懒加载单例生命周期：init 建/缓存（按 refresh / 同一 vllm_config / 完整性判定）、get 取（未初始化即 raise）、clear 清（测试隔离）。"},
+    {"name": "envs (module)", "file": "vllm_ascend/envs.py", "responsibility": "env_variables: dict[str, Callable] 把每个环境变量封成 lambda（os.getenv+类型转换+default），配模块级 __getattr__ 做懒求值。是三级取值里 env+default 两级的实现处。"},
+    {"name": "AscendCompilationConfig / AscendFusionConfig / XliteGraphConfig / ProfilingChunkConfig / EplbConfig / RejectionSamplerConfig / FinegrainedTPConfig / WeightPrefetchConfig", "file": "vllm_ascend/ascend_config.py", "responsibility": "additional_config 各子键对应的强类型子配置类。统一范式：从 dict 取值赋成命名属性 + 就地 _validate。正文挑 1-2 个做范例（如 AscendCompilationConfig 的 **kwargs 后门）。"},
+    {"name": "Platform.check_and_update_config (基类)", "file": "vllm/platforms/interface.py", "responsibility": "对照基座：vLLM 定义的平台钩子契约。默认 pass，约定『可抛异常拒绝、可就地改 config（passed by reference）』。在 VllmConfig.__post_init__ 末段被调用——这是『平台=配置改写器』约定的源头。"}
+  ],
+
+  "data_flow": [
+    "1. CLI/LLM(...) 收集参数 → 构造 VllmConfig，进入 vllm/config/vllm.py:VllmConfig.__post_init__",
+    "2. __post_init__ 早段 L983: current_platform.apply_config_platform_defaults(self) —— NPUPlatform 注入 Ascend 默认（如 sp_min_token_num、max_cudagraph_capture_size）",
+    "3. __post_init__ 末段 L1197: current_platform.check_and_update_config(self) —— 把完整 VllmConfig 按引用交给 NPUPlatform",
+    "4. NPUPlatform.check_and_update_config: device_type/model_config 守卫早退检查",
+    "5. → maybe_auto_detect_quantization + _validate_layer_sharding_config + _validate_draft_decode_context_parallel_config（一致性校验，不符则 raise）",
+    "6. → _fix_incompatible_config: 按 9 个子配置分段，getattr 探测用户是否设了 GPU/ROCm 专属参数 → logger.warning → 就地 reset 安全值（numa_bind 特例：转写成 additional_config['enable_cpu_binding']=True）",
+    "7. → init_ascend_config(vllm_config): 懒加载单例 → AscendConfig.__init__ 把 additional_config 解析成强类型子配置；标量字段经 _get_config_value 走三级取值（additional_config → envs 表 lambda(os.getenv+default)）",
+    "8. → 回到 check_and_update_config：据 enforce_eager/cudagraph_mode 改写 compilation_config.mode / cudagraph_mode / splitting_ops / oot_compiler",
+    "9. → worker_cls=='auto' 时按 310p/xlite/默认 落成具体 NPUWorker qualname 字符串（ch02 伏笔 f2 回收）",
+    "10. → refresh_block_size、custom_ops=['all']、若干互斥校验 raise",
+    "11. → 设进程环境变量 PYTORCH_NPU_ALLOC_CONF（非 sleep-mode）",
+    "12. 返回（None）。被改写后的 VllmConfig 继续用于后续构图/建 Worker——平台改写已生效"
+  ],
+
+  "design_decisions": [
+    {"decision": "平台 = 配置改写器：vLLM 把『按硬件改 config』做成一个钩子点，让 OOT 插件在构图前拿到完整 VllmConfig 最后改写，而非要求插件改 vLLM 源码", "why": "OOT 插件的核心诉求是『不改 vLLM 也能接管』。把改写收敛到一个 well-known 钩子（passed by reference、可就地改/可 raise），插件只需实现 Platform 子类即可重定向编译、worker、并行后端等。基类默认实现是 pass，说明这是可选扩展点。", "evidence": "vllm/platforms/interface.py:L432-L443（契约+docstring『passed by reference, can be modified in place』）, vllm/config/vllm.py:L1197（在 __post_init__ 末段调用）"},
+    {"decision": "系统性 cascade reset：用统一『getattr 探测→warn→写回安全值』范式，把 GPU/ROCm/NVIDIA 专属参数批量归零，而非逐个报错退出", "why": "用户常带着 GPU 配置习惯跑昇腾（如 --numa-bind、cudnn_prefill）。与其因不识别的参数直接失败，不如降级为 warning + reset 安全值，让服务仍能起来（容错优先）。numa_bind 更进一步『无损改写』为昇腾原生等价开关。", "evidence": "vllm_ascend/platform.py:L979-L985（docstring）, L1075-L1089（force_false_flags 批处理）, L1138-L1149（numa_bind→enable_cpu_binding 转写）"},
+    {"decision": "无 schema 配置后门 additional_config：vLLM 提供一个开放 dict 字段，插件自定义任意键；AscendConfig 负责把它解析成强类型", "why": "vLLM 不可能为每个 OOT 后端的私有开关都加 CLI 旗标。开放 dict 给插件无限扩展空间（灵活）。代价是 vLLM 侧无法校验：拼错键名/类型错不会被框架发现——这份校验责任落到 AscendConfig 各子配置的 __init__/_validate，且 **kwargs 会静默吞未知键。", "evidence": "vllm_ascend/ascend_config.py:L27-L55（dict.get 解析）, L498-L538（**kwargs 后门 + assert 自校验）"},
+    {"decision": "三级取值 additional_config→env→default，且老 env 一律标 DEPRECATED 引导迁移到 additional_config", "why": "历史上很多开关是用环境变量做的；项目正把配置面统一收敛到 additional_config。三级取值给迁移期：新键优先，旧 env 仍可用但每次命中打『将在下个版本移除』提示。env 与 default 的分界在 envs 表 lambda 内（os.getenv(KEY, default)）塌缩，_get_config_value 只决定 additional_config 这层是否覆盖。", "evidence": "vllm_ascend/ascend_config.py:L284-L296（_get_config_value）, vllm_ascend/envs.py:L72-L75（DEPRECATED 注释）, L118-L122（懒求值 __getattr__）"},
+    {"decision": "AscendConfig 用进程级懒加载单例，且缓存命中要求『同一 vllm_config 对象』并带完整性守卫", "why": "AscendConfig 解析成本不低且要被全进程多处 get_ascend_config() 读取，单例避免重复解析。但单测会 monkeypatch __init__ 产出半初始化实例污染单例，故用 _is_ascend_config_initialized（hasattr 探测关键字段）守卫缓存写入；refresh 键允许强制重建。", "evidence": "vllm_ascend/ascend_config.py:L772-L804（单例 + 守卫）, L775-L785（_is_ascend_config_initialized 注释解释 monkeypatch 场景）"},
+    {"decision": "worker_cls 用字符串 qualname 而非类对象落定", "why": "vLLM 后续用 resolve_obj_by_qualname 按字符串实例化 Worker，跨进程 spawn 也只需传字符串。check_and_update_config 把抽象 'auto' 翻译成具体昇腾 Worker 路径，正是『改 config 就能顶替执行主控』的兑现，且按设备分代（310p/xlite/默认）分流。", "evidence": "vllm_ascend/platform.py:L602-L612"}
+  ],
+
+  "theory": [
+    "钩子时机的正确性论证：check_and_update_config 在 VllmConfig.__post_init__ 末段、apply_config_platform_defaults 之后调用。意味着平台拿到的是『CLI 解析 + 平台默认注入』后的完整配置，对它的就地改写是构图前最后一道窗口——之后的 KV-cache 协调、Worker 建立、注意力后端选择都读改写后的值。两次窗口（defaults 在前、check 在后）让『先给默认、再按完整上下文修正』成为可能。",
+    "三级取值的优先级与塌缩：逻辑优先级是 additional_config > env > default，但实现上 env 与 default 在 envs.py 的 lambda 里先塌缩为单一 env_value 传入，_get_config_value 只在 additional_config 与该 env_value 之间二选一。结论：拼错 additional_config 键名 → 静默落回 env/default，不报错（这是无 schema 后门的失校验代价的量化体现）。",
+    "容错 vs 严格的权衡：_fix_incompatible_config 对 GPU 专属参数选择 warn+reset（容错）而非 raise（严格）；而真正会破坏正确性的组合（如 mc2 与 hierarchy_comm 同开、profiling_chunk 要求 pp>1）才 raise。判据是『该参数在昇腾上无对应实现但无害 → reset；语义冲突会致错 → raise』。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "_fix_incompatible_config 中段3 multimodal、段6 speculative、段7 kv_transfer、段9 中 ray_workers_use_nsight/numa_bind_cpus/enable_dbo/ubatch_size 这些『结构同构』的重复 reset 分支", "why_safe": "它们与保留的段1(cascade_attn)/段4(nvtx)/段5(partial_prefills)/段8(force_false_flags)/段9(numa_bind→enable_cpu_binding) 是同一招式的重复实例；精简版保留代表性几段即可完整演示 cascade-reset 范式，删除重复不改变所演示的控制流语义。须保留 numa_bind 那段（它是唯一『改写非丢弃』的特例）。"},
+      {"what": "check_and_update_config 中与本章主线无关的周边：kv_transfer engine_id uuid 补丁(L439-443)、ascend_compilation/fusion 回写 additional_config(L450-467)、update_compile_ranges_split_points、encoder-decoder PIECEWISE 处理(L527-542)、SP/cudagraph sizes 重算(L502-523)、各种 PD/sparse 互斥 assert(L661-694)、enable_balance_scheduling/recompute_scheduler/dynamic_batch/profiling_chunk scheduler 切换(L620-659)", "why_safe": "这些是其它子系统（编译融合、SP、PD 分离、调度器替换）的钩入点，各有专章；本章只需保留『校验→_fix_incompatible→init_ascend→编译/worker/env 改写』主骨架。删除不影响本章所讲两条主线的控制流完整性。"},
+      {"what": "AscendConfig.__init__ 中除 ascend_compilation_config 与若干 _get_config_value 标量外的十余个子配置解析与交叉校验（pd_tp_ratio 计算、sparse_c8 layer 解析、flashcomm2、hamming_sparse、dump_config 等，ascend_config.py:L56-L283 大部分）", "why_safe": "保留『开放 dict→子配置对象』+『_get_config_value 三级取值』各 1-2 个代表即可演示设计；其余是同范式重复或专属特性细节，删除不损本章要讲清的解析机制。"},
+      {"what": "NPUPlatform 中与配置改写无关的其它方法：get_device_*、num_compute_units、get_attn_backend_cls、set_additional_forward_context、import_kernels、各 get_*_cls 工厂等", "why_safe": "它们是 Platform 的其它职责（设备查询、后端选择、forward context），不在 ch05 焦点；分散在别章。精简版只围绕 check_and_update_config/_fix_incompatible_config/AscendConfig/_get_config_value 即可。"},
+      {"what": "其它子配置类的完整实现（FinegrainedTPConfig 全部校验、EplbConfig.__getattr__/_validate_config、ProfilingChunkConfig/RejectionSamplerConfig 的 _validate 细节）", "why_safe": "保留 AscendCompilationConfig 一个作『强类型 + **kwargs 后门』范例足矣；其余子配置类对本章主线是同范式重复，删除不影响演示。"}
+    ],
+    "must_keep": [
+      {"symbol": "check_and_update_config", "why": "本章总闸方法，平台=配置改写器的入口，读者/writer 都要看它的编排骨架"},
+      {"symbol": "_fix_incompatible_config", "why": "cascade-reset GPU/ROCm 专属参数的核心方法，本章一大主线"},
+      {"symbol": "init_ascend_config", "why": "AscendConfig 懒加载单例入口，check_and_update_config 调它把 additional_config 解析落地"},
+      {"symbol": "AscendConfig", "why": "把开放 dict additional_config 解析成强类型子配置的聚合根，本章第二条主线"},
+      {"symbol": "_get_config_value", "why": "additional_config→env→default 三级取值核心，须可见以讲清优先级与塌缩"},
+      {"symbol": "disable_cascade_attn", "why": "段1 cascade reset 的代表参数，演示『GPU feature 强制归零』"},
+      {"symbol": "force_false_flags", "why": "段8 用列表批量归零 cudnn_prefill/trtllm 等的范式，须保留以体现『系统性 reset』"},
+      {"symbol": "use_cudnn_prefill", "why": "force_false_flags 中的具体 GPU 专属旗标，标题点名的参数之一"},
+      {"symbol": "numa_bind", "why": "段9『改写非丢弃』特例：转写成 enable_cpu_binding，串起两条主线，writer 须讲"},
+      {"symbol": "enable_cpu_binding", "why": "numa_bind 被无损改写后落入 additional_config 的键，体现后门双向用途"},
+      {"symbol": "worker_cls", "why": "ch02 伏笔 f2 的回收点：'auto'→NPUWorker qualname，须可见"},
+      {"symbol": "NPUWorker", "why": "worker_cls 落定的具体值，伏笔回收的实体"},
+      {"symbol": "PYTORCH_NPU_ALLOC_CONF", "why": "设环境变量阶段的代表，演示平台改写也会落到进程 env"},
+      {"symbol": "additional_config", "why": "无 schema 配置后门字段本身，贯穿全章"},
+      {"symbol": "AscendCompilationConfig", "why": "强类型子配置范例，演示 **kwargs 后门 + 命名形参默认值"},
+      {"symbol": "env_variables", "why": "envs.py 的 lambda 表，三级取值里 env+default 塌缩的实现处"}
+    ]
+  },
+
+  "diagram_plan": [
+    {"name": "配置改写时序：从 VllmConfig.__post_init__ 到平台钩子", "type": "sequence/flow", "spec": "竖向时序：CLI/LLM(...) → VllmConfig.__post_init__ →(L983) apply_config_platform_defaults →(L1197) check_and_update_config(self, 按引用) → [守卫早退｜_validate_*｜_fix_incompatible_config｜init_ascend_config｜cudagraph/编译改写｜worker_cls｜env] → 改写后的 VllmConfig 流向后续构图/建Worker。高亮『passed by reference 就地改』。", "roadmap_highlight": "ch05 check_and_update_config（attach 子系统）"},
+    {"name": "_fix_incompatible_config 的 9 段 cascade reset 总览", "type": "table/grid", "spec": "表格：列=[子配置, 参数, 来源平台(GPU/NVIDIA/ROCm), reset 目标值, 招式]；行举 disable_cascade_attn→False、enable_layerwise_nvtx_tracing→False、max_num_partial_prefills→1、use_cudnn_prefill/trtllm…→False(批量)、numa_bind→False+additional_config['enable_cpu_binding']=True(改写)。末列区分『丢弃/归零』vs『无损改写』。", "roadmap_highlight": null},
+    {"name": "additional_config→env→default 三级取值与塌缩", "type": "decision/flow", "spec": "左→右三层漏斗：additional_config[key] 命中? →是→用之(最高优先级)；否→ envs 表 lambda(os.getenv(ENV_KEY, default)) 已塌缩成 env_value →用之。标注：env 与 default 的分界在 envs.py lambda 内部，_get_config_value 只裁决 additional_config 是否覆盖；并标『拼错键名→静默落回，不报错（失校验代价）』。", "roadmap_highlight": null},
+    {"name": "开放 dict → 强类型子配置 的解析映射", "type": "map/tree", "spec": "左=additional_config(开放 dict, 任意键)；右=AscendConfig 的强类型属性(xlite_graph_config:XliteGraphConfig, ascend_compilation_config:AscendCompilationConfig, eplb_config:EplbConfig, …, 标量经 _get_config_value)。箭头标 .get(key, {}) / **kwargs。点出 **kwargs 静默吞未知键。", "roadmap_highlight": null}
+  ],
+
+  "foreshadow_due": {
+    "plant": [],
+    "recover": [
+      {"id": "f2", "what": "check_and_update_config 的完整配置改写流程——本章只截取 worker_cls 'auto'→NPUWorker qualname 这一处（埋于 ch02）", "where_in_chapter": "worker_cls 选择段（vllm_ascend/platform.py:L602-L614）。本章正是 f2 约定的『完整流程』兑现：ch02 只点了 worker_cls 一处，ch05 把整条 check_and_update_config 改写流程讲透，并在 worker_cls 段显式回扣 ch02 的伏笔。"}
+    ]
+  }
+}
