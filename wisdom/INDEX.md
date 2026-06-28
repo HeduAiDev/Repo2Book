@@ -19,7 +19,7 @@
 | W12 | architecture | 单章工作流：dossier(真相源)→减法实现+test→真源码叙事→多维评审→归档；6 闸门 + 逃生舱 | all | vllm, vllm-ascend |
 | W13 | writing | 内嵌真源码**逐字保留**（含签名/类型标注，别改一行内容）；非相邻方法拼块要加 `# … 省略 …` | writer, reviewer | vllm, vllm-ascend |
 | W14 | writing | 主线术语首现处给一次性中文注解（如 qualname/OOT），后文沿用英文 | writer | vllm, vllm-ascend |
-| W15 | writing | 图几何：文字不越界/不相撞/不压框/不裁切、箭头接框边；一图一核心对比（lint_diagram_geometry）| writer | vllm, vllm-ascend |
+| W15 | writing | 图几何：文字不越界/不相撞/不压框/不裁切、箭头接框边；一图一核心对比。**lint 必要非充分→每张图 -z1 渲染目视**（漏中等溢出：框标签渲到框外、callout 框高不够 2 行）| writer | vllm, vllm-ascend |
 | W16 | writing | 章内锚点须 GitHub-slug 可解析（lint_anchors）；中文标点全角（lint_punct）| writer, reviewer | vllm |
 | W17 | architecture | 逃生舱：任一阶段发现路线错→返回 BLOCKED 早停升级 Lead；dossier 对抗性自核拦事实错（实战拦下 ch31/ch01 错误）| all | vllm |
 | W18 | architecture | 防假通过：评审 agent 全失败**不静默 APPROVE**；archive 注入完整 review 对象 + 崩溃重试 | reviewer, all | vllm |
