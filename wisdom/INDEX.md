@@ -27,6 +27,8 @@
 | W20 | debugging | **git push 须前台**（后台 shell SSH 鉴权失败）；只在用户要求时提交/推送 | all | vllm |
 | W21 | writing | 姊妹篇/衍生仓：主线讲衍生仓、每章钉一个对位基座章、对照基座源码（基座已在另一实例可直引）| writer, architecture | vllm-ascend |
 | W22 | architecture | 实例无关化：脚本经 `instance.py` 认活动实例；`new_instance` **继承**通用约定（voice-guide/wisdom）而非退回白板 | all | vllm-ascend |
+| W23 | architecture | cartography **强制子系统覆盖交叉核对**：列源码每个顶层子系统，逐一确认被某章 key_source_paths 覆盖或显式点名，否则漏章（playbook RUNBOOK §0.6 / schema book_outline.json v2）| team-lead, analyst | vllm-ascend |
+| W24 | architecture | cartography 易低估漏掉的子系统：PD 分离(proxy 调度 + KV 亲和/命中路由)、KV 池化/外存储、KV 卸载(host/CPU 分层)、芯片分代变体(如 310P 整套子类化)、网络加载——别压成一章 | team-lead | vllm-ascend |
 
 ## Category Quick Reference
 

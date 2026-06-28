@@ -13,7 +13,16 @@
 
 ### 0.5 新建一本书（换实例）
 `python3 scripts/new_instance.py <name> --repo <git-url> --title "…" --prefix <规范路径前缀> --activate`
-→ scaffold `instances/<name>/` 骨架 + blobless clone 源仓 + 置为 active → 在 source/ pin commit、填 INSTANCE.md → 出架构地图 cartography/ + 大纲 → 回到 §3 逐章发车。脚本统一经 `scripts/instance.py` 认活动实例，无需改 linter。
+→ scaffold `instances/<name>/` 骨架（含**继承的 voice-guide**，承袭既往实例约定，不退白板）+ blobless clone 源仓 + 置为 active → 在 source/ pin commit、填 INSTANCE.md → **按 §0.6 出架构地图 + 大纲** → 回到 §3 逐章发车。脚本统一经 `scripts/instance.py` 认活动实例，无需改 linter。
+
+### 0.6 出架构地图 + 大纲（cartography playbook —— 别临场拍脑袋）
+这步定全书骨架，**经验沉淀在这张清单里**（vLLM 当年的一次性 cartography workflow 已散失，故写成 playbook，别再裸手重走弯路）：
+1. **子系统测绘（fan-out）**：按源码顶层目录/子系统分组，每组派一个 analyst 读真实源码（姊妹篇还要对照基座实例 `instances/<base>/source`），产 digest：可成章单元、`key_source_paths`、`pairs_with`、教学价值、该子系统"怎么接入/改写"的主线。
+2. **综合（synthesis）**：1 个 agent 汇总成 `outline-final.json`（**遵从 `schemas/book_outline.json` v2**：`book` + `parts[]` + `chapters[]`，每章 `chapter_id/slug/title/focus/part/key_source_paths/pairs_with/deps/est_size/mode`）+ `ARCHITECTURE.md`（心智模型 + 子系统地形 + 逐 Part 大纲 + 配对脊柱）。
+3. **⚠️ 强制：子系统覆盖交叉核对**（最易漏，vLLM-ascend 试点连栽四次：PD 分离 / 池化 / kv_offload / 310P 都是用户事后揪出的）：列源码**每个顶层子系统**，逐一确认"被某章 `key_source_paths` 覆盖 / 或显式点名入横切"，**未覆盖即漏章**。死盯易被低估的：PD 分离（proxy 调度 + **KV 亲和/命中路由**）、KV 池化/外存储、KV 卸载（host/CPU 分层）、芯片/硬件分代变体（如 310P，常是整套子类化）、网络加载——这些常被压成一章或漏掉。
+4. **路径核对**：每个 `key_source_paths`（及 `pairs_with` 的基座路径）在 source/ 真实存在。
+5. **配对脊柱**（姊妹篇）：每章钉一个对位基座章，正文对照基座说"顶替/扩展了哪一站"。
+6. **用户审批闸**：把 Part/章列表 + 覆盖核对结论给用户，**批准后**才逐章发车——别跳。
 
 ## 1. 心智模型（一句话）
 真实源码是教材；analyst 把它读成 **dossier（唯一真相源）**；implementer 据此**只删不增**做可运行精简版；writer 以**真实源码为主线**写自包含章节；reviewer 协作式把关；archivist 持久化记忆。编排靠 **chapter-pipeline workflow**（并行+确定性+逃生舱），活体迭代靠我 + 命名 agent + SendMessage。
