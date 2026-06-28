@@ -14,16 +14,16 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch08',
-  slug: 'ch08-ascend-parallel-groups',
+  chapter_id: 'ch09',
+  slug: 'ch09-eplb-expert-load-balancing',
   instance: 'vllm-ascend',
-  focus: '在 vLLM 并行组之上：MC2 / 细粒度 TP / flashcomm 与上下文并行。init_ascend_model_parallel **不替换**而是**复用** vLLM 的 init_model_parallel_group / GroupCoordinator，在其上**额外叠一批昇腾专属组**——主线讲「加法式扩展」（区别于前面几章的 patch 重绑）：①**MC2**（matmul + 通信融合组）；②**细粒度 TP**（lm-head / o-proj / embedding / mlp 各自独立 TP 宽度，而非全局一个 TP）；③**flashcomm**（通信-计算重叠组）；④**_DYNAMIC_EPLB**（动态专家负载均衡组，前向引用 ch09，别展开）。讲透 **all_ranks 张量 reshape → 各组 rank 切分的排布代数**（哪几维代表什么、怎么切出每个组的 ranks、消费方是谁），用 1-2 个并行度组合做数值排布追踪。本章也是 **context-parallel（PCP/DCP）的归口**：attention 篇只引用 enable_cp() 运行期分流，**CP 组的排布在此讲清**。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vLLM 书 ch20 + vllm/distributed/parallel_state.py（基座 init_model_parallel_group / GroupCoordinator 抽象——昇腾在其上叠加而非替换，对照看「复用了哪些、加了哪些」）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（rank 排布代数 / reshape 切分是纯 Python，可跑；实际进程组通信不跑）】',
-  highlight: 'ch08',
+  focus: 'Expert 负载均衡（eplb）：子进程规划 + D2D 权重热迁移。这是 **vLLM 尚未合入、昇腾自带的重型特性**（无基座对位文件，不做逐行对照，只点明它仅借用 vLLM 通信原语 GroupCoordinator.all_gather / dist.P2POp）。主线四块串成一条「在线热迁移专家权重」的流水线：①**EplbUpdator 节拍状态机**——forward_before 启动 expert 权重 D2D 搬运 / forward_end gather moe_load 唤醒规划，靠 cur_iterations + 三个间隔常量（num_iterations / wait_worker / gate）拼出流水线节拍，用 2+ 拍数值追踪走清「哪一拍干什么」；②**EplbProcess 独立子进程**跑均衡策略（planner_q / block_update_q 两条跨进程队列怎么解耦计算与规划）；③**D2DExpertWeightLoader** 异步 P2P 搬权重（dist.P2POp 批量 isend/irecv，搬的是 expert 权重张量）；④**PolicyFactory 策略多态**——讲清接口契约（policy_abstract 抽象基类）+ DefaultEplb 一个代表走完，flashlb / swift 点到为止。讲透「为什么要子进程 + 队列 + 异步搬运」：规划是重 CPU 计算，不能卡在推理主循环里。【本章无基座对位（vLLM 无此特性）；正文写规范 vllm_ascend/… 路径，绝不带 instances/.../source/ 前缀；前置引用 ch08 的 _DYNAMIC_EPLB 组（f6 回收）；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（节拍状态机 / 队列解耦 / 策略多态是纯 Python，可跑；实际 P2P 权重搬运与子进程不真跑）】',
+  highlight: 'ch09',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm-ascend/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
   skip_impl: false,
-  paths: ['vllm_ascend/distributed/parallel_state.py', 'vllm_ascend/distributed/utils.py'],
+  paths: ['vllm_ascend/eplb/eplb_updator.py', 'vllm_ascend/eplb/core/eplb_worker.py', 'vllm_ascend/eplb/core/eplb_device_transfer_loader.py', 'vllm_ascend/eplb/adaptor/vllm_adaptor.py', 'vllm_ascend/eplb/core/policy/policy_factory.py', 'vllm_ascend/eplb/core/policy/policy_abstract.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'

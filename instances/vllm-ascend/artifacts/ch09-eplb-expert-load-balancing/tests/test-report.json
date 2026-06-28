@@ -1,0 +1,47 @@
+{
+  "chapter_id": "ch09",
+  "title": "Expert 负载均衡（eplb）：子进程规划 + D2D 权重热迁移",
+  "verdict": "APPROVED",
+  "run_env": {
+    "where": "host (no container)",
+    "why": "本章昇腾 EPLB 特性 host 无 NPU/CANN/分布式后端；精简版只验四块主线的纯 Python 控制流（节拍状态机/队列解耦/策略多态/三态机），真实 P2P 权重搬运与子进程绑 NPU 不真跑，由 eplb_runtime_stub 的 record-only dist/all_gather 接住。控制流均为纯 Python，无需加速器，host 直跑。",
+    "python": "python3 -m pytest",
+    "container_used": false
+  },
+  "commands": [
+    {
+      "cmd": "python3 -m pytest instances/vllm-ascend/artifacts/ch09-eplb-expert-load-balancing/tests -q",
+      "result": "11 passed in 1.40s"
+    },
+    {
+      "cmd": "python3 scripts/lint_fidelity.py instances/vllm-ascend/artifacts/ch09-eplb-expert-load-balancing",
+      "result": "保真度检查全部通过（无 BLOCKING）"
+    }
+  ],
+  "tests": [
+    {"name": "test_cadence_flags_fire_on_exact_iterations", "line": "主线① 节拍状态机：wakeup@interval-1 / get_update@interval+algo-1 / weight 窗口[interval+algo,+L)，逐拍验证 flag 触发点", "passed": true},
+    {"name": "test_update_iteration_resets_full_cycle", "line": "主线① update_iteration 满一整轮(interval+algo+L)归零 + clear_all_moe_loads，未满不归零", "passed": true},
+    {"name": "test_wakeup_puts_signal_and_moe_load_written", "line": "主线① wakeup_eplb_worker→planner_q.put(1)；compute_and_set_moe_load→all_gather 写 shared_dict['moe_load']", "passed": true},
+    {"name": "test_block_update_queue_is_bounded_to_one", "line": "主线② block_update_q maxsize=1（背压）/ planner_q 无界", "passed": true},
+    {"name": "test_worker_process_roundtrip_and_backpressure", "line": "主线② worker_process: planner_q.get→do_update→block_update_q.put 往返 + 背压自旋 + except break", "passed": true},
+    {"name": "test_compose_send_recv_from_map_diff", "line": "主线② compose_expert_update_info_greedy 用 expert_map 的 -1 差集算 (src→dst:expert)", "passed": true},
+    {"name": "test_policy_factory_dispatch", "line": "主线④ PolicyFactory int→策略类（0 Random/1 Default/2 Swift/3 FlashLB），未知回退 Random", "passed": true},
+    {"name": "test_default_eplb_redundancy_count", "line": "主线④ DefaultEplb.get_redundant_num = sum(counts-1)", "passed": true},
+    {"name": "test_default_eplb_rebalance_balanced_input_no_change", "line": "主线④ rebalance_experts 均衡输入无法再降5% → change=0，层数/卡数保持", "passed": true},
+    {"name": "test_d2d_three_state_transitions", "line": "主线③ D2DExpertWeightLoader WAITING→READY→TRANSFERRING→WAITING；P2POp 计数 / req.wait 收车 / copy_ 落地", "passed": true},
+    {"name": "test_d2d_rejects_new_task_while_busy", "line": "主线③ 非 WAITING 态拒收新任务（三态机互斥）", "passed": true}
+  ],
+  "fidelity_verification": {
+    "method": "逐文件比对精简版与昇腾真实源码（vllm_ascend/eplb/...）",
+    "findings": [
+      "eplb_updator.py: update_iteration / 三 flag(get_update_info/wakeup_eplb_worker/update_expert_weight) / forward_before / forward_end / compute_and_set_moe_load 与源码 L74-148 逐字一致；SUBTRACTED 仅 expert_map_record_path 落盘分支 + multi_stage(FlashLB) permute + dummy P2P 预热，均为 dossier delete 批准项",
+      "eplb_worker.py: worker_process 主循环(get→do_update→背压自旋 put→except break) / _launch_process(daemon Process) / compose_expert_update_info_greedy 的 -1 差集逻辑与源码 L342-388/L148-202 一致；SUBTRACTED ms_service_metric 块 + rank0 监控热度块 + FlashLB warm_up，均 delete 批准",
+      "eplb_device_transfer_loader.py: 三态机 generate/asyn/update 三段与源码 L46-130 逐字一致",
+      "policy_factory.py: int→策略类 dict 与源码 L12-41 一致（保留 FlashLB 类名占位，删 warm_up）",
+      "policy_default_eplb.py: rebalance_experts / add_redundant / original_compute_balanced_pack_redundancy / get_redundant_num / constraint_expert_local_exchange 与源码一致；SUBTRACTED 仅未被调用的 compute_balanced_pack_redundancy/compute_balanced_pack（grep 确认无引用，delete 批准）",
+      "must_keep 符号集（EplbUpdator/cur_iterations/三间隔常量/三 flag/EplbProcess/planner_q/block_update_q/worker_process/EplbWorker/do_update/compose_expert_update_info_greedy/D2DExpertWeightLoader/三态/PolicyFactory/EplbPolicy/DefaultEplb 等）全部保留"
+    ],
+    "stub_note": "eplb_runtime_stub.py 为测试接缝（NOT subtract-only，明确标注）：把 torch.distributed(P2POp/batch_isend_irecv/get_rank) / vllm logger / GroupCoordinator.all_gather / get_dynamic_eplb_group 在 host 用 record-only 替身接住，不真搬数据——与 dossier 明示边界一致"
+  },
+  "notes": "全 11 测试通过 + lint_fidelity 无 BLOCKING；精简版忠实复现昇腾真实源码控制流（行为以 pin 源码为准，运行环境仅观察控制流）。真实 P2P 权重搬运/子进程绑 NPU/all_gather 跨卡 host 不可跑，由 record-only 桩接住，符合本章『只验可读控制流』约定。"
+}

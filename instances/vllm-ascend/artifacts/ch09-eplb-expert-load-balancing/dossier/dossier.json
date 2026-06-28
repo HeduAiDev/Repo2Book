@@ -1,0 +1,205 @@
+{
+  "chapter_id": "ch09",
+  "title": "Expert 负载均衡（eplb）：子进程规划 + D2D 权重热迁移",
+  "premise": "本章解读 vLLM-Ascend 自带、vLLM 尚未合入的重型在线负载均衡特性（多处源码顶部 TODO 写明：待 vLLM PR/issue 22246/24069 合入后即删除本套实现）。无基座对位文件，不做逐行对照；只点明它仅借用 vLLM 通信原语 GroupCoordinator.all_gather 与 torch.distributed.P2POp/batch_isend_irecv。主线：在线把热门 expert 的权重在 NPU 之间热迁移，避免某些卡被路由打爆而其它卡空转。重 CPU 规划放进独立子进程、靠两条跨进程队列与推理主循环解耦、靠异步 P2P 搬权重不阻塞前向。",
+
+  "code_spine": [
+    "vllm_ascend/worker/model_runner_v1.py:L492-L503  推理侧构建 EPLB 三件套：D2DExpertWeightLoader + EplbProcess(_launch_process 起子进程) + EplbUpdator；shared_dict 由 multiprocessing.Manager().dict 跨进程共享",
+    "vllm_ascend/worker/model_runner_v1.py:L3615-L3616  set_adaptor(eplb_adaptor) + warm_up_eplb() 首拍预热",
+    "vllm_ascend/eplb/adaptor/vllm_adaptor.py:L29-L122  VllmEplbAdaptor：把模型 MoE 层的 expert 权重张量/expert_map/log2phy_map 登记成 per-layer 句柄表，喂给 loader 搬运、喂给 updator 采集 moe_load",
+    "vllm_ascend/eplb/eplb_updator.py:L69-L99  节拍状态机：cur_iterations 计数 + 三个判定函数（wakeup_eplb_worker_flag / get_update_info_flag / update_expert_weight_flag）由两个间隔常量 + num_moe_layers 算出",
+    "vllm_ascend/eplb/eplb_updator.py:L127-L136  forward_end：到点则 compute_and_set_moe_load + wakeup_eplb_worker（planner_q.put(1)），并在搬权重窗口内调 loader.update_expert_map_and_weight，最后 update_iteration 推进/归零",
+    "vllm_ascend/eplb/eplb_updator.py:L138-L148  compute_and_set_moe_load：comm_group.all_gather 把各 rank 本地负载 gather 成全局 moe_load 写入 shared_dict",
+    "vllm_ascend/eplb/core/eplb_worker.py:L342-L378  子进程入口 worker_process：阻塞 planner_q.get() → worker.do_update() 跑规划 → block_update_q.put(packed_update_info)",
+    "vllm_ascend/eplb/core/eplb_worker.py:L39-L107  EplbWorker.do_update：读 shared_dict 的 expert_maps/moe_load → policy.rebalance_experts 算新放置 → compose_expert_update_info_greedy 算每层 send/recv 计划 → pack_update_info 打包跨进程",
+    "vllm_ascend/eplb/eplb_updator.py:L104-L125  forward_before：到点 block_update_q.get() 取规划；搬权重窗口内逐层 generate_expert_d2d_transfer_task + asyn_expert_weight_transfer 异步发 P2P",
+    "vllm_ascend/eplb/core/eplb_device_transfer_loader.py:L26-L130  D2DExpertWeightLoader：WAITING→READY→TRANSFERRING 三态机，dist.P2POp(isend/irecv) 批量 batch_isend_irecv 搬 expert 权重张量，wait 后 copy_ 落地到模型权重并更新 expert_map/log2phy_map",
+    "vllm_ascend/eplb/core/policy/policy_factory.py:L12-L41  PolicyFactory.generate_policy：int→策略类多态分发（0 Random / 1 DefaultEplb / 2 SwiftBalanceEplb / 3 FlashLB），未知回退 RandomLoadBalance",
+    "vllm_ascend/eplb/core/policy/policy_abstract.py:L6-L30  EplbPolicy 抽象基类：rebalance_experts(current_expert_table, expert_workload) 接口契约",
+    "vllm_ascend/eplb/core/policy/policy_default_eplb.py:L283-L350  DefaultEplb.rebalance_experts：贪心装箱把热门 expert 复制成冗余 expert 再均衡铺到各卡，返回 (change, per_layer_priority, new_global_deployment)"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm_ascend/worker/model_runner_v1.py",
+      "lines": "L495-L503",
+      "code": "        if self.dynamic_eplb:\n            self.is_eplb_warmuped = False\n            self.policy_type = eplb_config.eplb_policy_type\n            self.eplb_loader = D2DExpertWeightLoader()\n            self.manager = Manager()\n            self.shared_dict = self.manager.dict({\"expert_map\": None, \"moe_load\": None, \"expert_maps\": None})\n            self.eplb_process = EplbProcess(shared_dict=self.shared_dict, policy_type=self.policy_type, enable_d2d=True)\n            self.process = self.eplb_process._launch_process()\n            self.eplb_updator = EplbUpdator(eplb_config, self.eplb_loader, self.eplb_process, self.process)",
+      "elide": ["前文 L492-L494 读 eplb_config / dynamic_eplb / eplb_enable 开关；这段只在 dynamic_eplb=True 时构建 EPLB 三件套并起子进程"]
+    },
+    {
+      "path": "vllm_ascend/eplb/eplb_updator.py",
+      "lines": "L77-L99",
+      "code": "    def update_iteration(self):\n        self.cur_iterations += 1\n        if self.cur_iterations == (\n            self.expert_heat_collection_interval + self.algorithm_execution_interval + self.num_moe_layers\n        ):\n            logger.debug(\"[eplb/updator] Full EPLB cycle completed, clearing moe loads and resetting iteration counter\")\n            if self.expert_map_record_path is not None:\n                self.adaptor._export_tensor_to_file(self.shared_dict[\"expert_maps\"], self.expert_map_record_path)\n\n            self.adaptor.model.clear_all_moe_loads()\n            self.cur_iterations = 0\n\n    def get_update_info_flag(self):\n        return self.cur_iterations == (self.expert_heat_collection_interval + self.algorithm_execution_interval - 1)\n\n    def wakeup_eplb_worker_flag(self):\n        return self.cur_iterations == (self.expert_heat_collection_interval - 1)\n\n    def update_expert_weight_flag(self):\n        weight_update_counter = self.cur_iterations - (\n            self.expert_heat_collection_interval + self.algorithm_execution_interval\n        )\n        return weight_update_counter >= 0 and weight_update_counter < self.num_moe_layers",
+      "elide": ["expert_map_record_path 分支是落盘记录路径用途，主线（在线热迁移）可省略——只看 clear_all_moe_loads + cur_iterations=0 的归零"]
+    },
+    {
+      "path": "vllm_ascend/eplb/eplb_updator.py",
+      "lines": "L101-L136",
+      "code": "    def wakeup_eplb_worker(self):\n        self.eplb_process.planner_q.put(1)\n\n    def forward_before(self):\n        # Batch after eplb process being triggered, get update info provided by eplb process\n        if self.get_update_info_flag():\n            self.update_info_all = self.eplb_process.block_update_q.get()\n        if self.update_expert_weight_flag():\n            with record_function_or_nullcontext(\"EPLB generate p2p task\"):\n                (expert_send_info, expert_recv_info, updated_expert_map, log2phy_map, layer_id) = (\n                    self.update_info_all.pop(0)\n                )\n                log2phy_map_this_rank = torch.from_numpy(numpy.array(log2phy_map))\n                self.eplb_loader.set_log2phy_map(log2phy_map_this_rank)\n                updated_expert_map_this_rank = torch.from_numpy(numpy.array(updated_expert_map))\n                self.eplb_loader.generate_expert_d2d_transfer_task(\n                    expert_send_info,\n                    expert_recv_info,\n                    updated_expert_map_this_rank,\n                    layer_id + self.adaptor.num_dense_layers,\n                )\n\n                # set asynchronous stream for d2d expert weight update\n                self.reqs = []\n                self.eplb_loader.asyn_expert_weight_transfer(self.reqs)\n\n    def forward_end(self):\n        if self.wakeup_eplb_worker_flag():\n            with record_function_or_nullcontext(\"EPLB gather moe load\"):\n                self.compute_and_set_moe_load()\n                self.wakeup_eplb_worker()\n\n        if self.update_expert_weight_flag() and self.expert_map_record_path is None:\n            self.eplb_loader.update_expert_map_and_weight(self.reqs)\n\n        self.update_iteration()",
+      "elide": ["record_function_or_nullcontext 只是 profiler 打点上下文，可视作透明；update_info_all 是一整轮各层的 send/recv 计划列表，逐层 pop(0) 消费"]
+    },
+    {
+      "path": "vllm_ascend/eplb/eplb_updator.py",
+      "lines": "L138-L148",
+      "code": "    def compute_and_set_moe_load(self):\n        local_load = self.adaptor.get_rank_expert_workload().unsqueeze(1)\n        moe_load = self.comm_group.all_gather(local_load, dim=1).cpu()\n\n        if self.multi_stage:\n            moe_load = moe_load.permute(2, 0, 1, 3)\n\n        self.shared_dict[\"moe_load\"] = moe_load\n        logger.debug(\"[eplb/updator] Updated shared_dict['moe_load'] shape=%s\", moe_load.shape)\n\n        return moe_load",
+      "elide": ["multi_stage（policy_type==3 FlashLB）才走 permute 重排，主线 DefaultEplb 可省略；comm_group 即 get_dynamic_eplb_group() 返回的 vLLM GroupCoordinator——这就是『仅借用 vLLM 通信原语』的体现"]
+    },
+    {
+      "path": "vllm_ascend/eplb/core/eplb_worker.py",
+      "lines": "L325-L388",
+      "code": "class EplbProcess:\n    def __init__(self, shared_dict, policy_type: int = 0, enable_d2d: bool = True):\n        \"\"\"\n        Args:\n            shared_dict: Cross-process shared dict returned by Manager().dict()\n            policy_type: Integer passed to PolicyFactory.generate_policy\n            enable_d2d: Whether to enable D2D loading\n        \"\"\"\n        self.shared_dict = shared_dict\n        self.policy_type = policy_type\n        self.enable_d2d = enable_d2d\n        self.planner_q: Queue[Any] = Queue()\n        self.block_update_q: Queue[Any] = Queue(maxsize=1)\n\n        # Create EplbWorker instance\n        self.worker = EplbWorker(self.shared_dict, self.policy_type, self.enable_d2d)\n\n    def worker_process(self, planner_q, block_update_q):\n        \"\"\"\n        Subprocess entry: bind to specified NPU, loop waiting for planner_q to wake up,\n        call do_update, then notify main process update is complete.\n        \"\"\"\n        try:\n            from ms_service_metric.adapters.vllm.adapter import get_vllm_adapter, initialize_vllm_metric  # type: ignore\n\n            initialize_vllm_metric()\n            adapter = get_vllm_adapter()\n            logger.info(\"[EPLB metrics] The adapter initialized: %s\", adapter.is_initialized())\n        except Exception as e:\n            logger.warning(\"[EPLB metrics] Failed to initialize metrics: %s\", e)\n\n        if self.policy_type == 3:\n            from vllm_ascend.eplb.core.policy.policy_flashlb import warm_up\n\n            warm_up()\n        while True:\n            try:\n                planner_q.get()\n\n                packed_update_info = self.worker.do_update()\n\n                while True:\n                    if not block_update_q.empty():\n                        continue\n                    block_update_q.put(packed_update_info)\n                    break\n\n            except Exception as e:\n                logger.warning(\n                    \"[eplb/worker] Subprocess crashed, EPLB optimization will stop. error=%s\",\n                    e,\n                    exc_info=True,\n                )\n                break\n\n    def _launch_process(self):\n        \"\"\"\n        Use spawn method to launch subprocess and return (planner_q, block_update_q, proc).\n        \"\"\"\n        proc = Process(target=self.worker_process, args=(self.planner_q, self.block_update_q), daemon=True)\n\n        proc.start()\n        return proc",
+      "elide": ["ms_service_metric 整块 try/except 是指标采集，与主线无关；policy_type==3 的 flashlb warm_up 是 FlashLB 专属预热，可省略；planner_q 无界（唤醒信号），block_update_q 容量 1（背压：规划结果只留最新一份）"]
+    },
+    {
+      "path": "vllm_ascend/eplb/core/eplb_worker.py",
+      "lines": "L39-L64, L95-L107",
+      "code": "    def do_update(self):\n        # put data in to queue\n        # in process self.policy.generate_policy()\n        # get epxert table && tensor\n\n        # async stream\n        # D2D\n        # H2D\n        # Get initial expert_map\n        torch.set_num_threads(1)\n        if self.old_expert_maps is None:\n            self.old_expert_maps = self.get_init_expert_maps()\n            if self.old_expert_maps is not None:\n                self.num_local_experts = self.old_expert_maps.max() + 1\n            else:\n                raise ValueError(\"Failed to get expert_maps from shared_dict.\")\n\n        # Get MOE load information\n        load_info = self.fetch_and_sum_load_info()\n        if load_info is None:\n            logger.debug(\"[eplb/worker] No moe_load data available yet, skipping this cycle\")\n            return\n\n        # Get the updated expert table based on the workload information\n        old_placement = self.global2local(self.old_expert_maps, self.num_local_experts)\n        _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)\n        ...\n        if not torch.is_tensor(new_placement):\n            new_placement = torch.tensor(new_placement)\n        self.check_expert_placement(old_placement, new_placement)\n        new_expert_maps = self.local2global(new_placement)\n        self.update_expert_map(new_expert_maps)\n\n        update_info = self.compose_expert_update_info_greedy(new_expert_maps, self.old_expert_maps)\n        self.old_expert_maps = new_expert_maps\n        logger.debug(\"[eplb/worker] EPLB Process compute complete\")\n\n        packed_update_info = self.pack_update_info(update_info)\n\n        return packed_update_info",
+      "elide": ["L66-L93 rank0 的 _calculate_hotness/_compute_imbalance 仅算热度不均衡指标喂监控（ms-service-metric），与主线无关，已用 ... 省略；torch.set_num_threads(1) 限子进程线程数避免和主进程抢核"]
+    },
+    {
+      "path": "vllm_ascend/eplb/core/eplb_worker.py",
+      "lines": "L148-L202",
+      "code": "    def compose_expert_update_info_greedy(self, updated_expert_maps, current_expert_maps):\n        num_layers = current_expert_maps.shape[0]\n        for layer_id in range(num_layers):\n            updated_expert_maps_this_layer = updated_expert_maps[layer_id]\n            current_expert_maps_this_layer = current_expert_maps[layer_id]\n\n            expert_send_info_this_layer: dict[Any, Any] = {}\n            expert_recv_info_this_layer: dict[Any, Any] = {}\n\n            # Guard Clause: if there is no expert weight update, avoid subsequent processing\n            if torch.equal(updated_expert_maps_this_layer, current_expert_maps_this_layer):\n                yield (\n                    expert_send_info_this_layer,\n                    expert_recv_info_this_layer,\n                    updated_expert_maps_this_layer,\n                    layer_id,\n                )\n\n            # Parse expert_ids each rank needs to receive from other ranks\n            dst_rank_indices, experts_to_recv = torch.where(\n                (current_expert_maps_this_layer == -1) & (updated_expert_maps_this_layer != -1)\n            )\n\n            # Parse expert_ids each rank needs to send to other ranks\n            src_rank_indices, experts_to_send = torch.where(\n                (current_expert_maps_this_layer != -1) & (updated_expert_maps_this_layer == -1)\n            )\n\n            for idx in range(len(dst_rank_indices)):\n                dst_rank_id = dst_rank_indices[idx].item()\n                expert_id = experts_to_recv[idx].item()\n                if dst_rank_id not in expert_recv_info_this_layer:\n                    expert_recv_info_this_layer[dst_rank_id] = []\n\n                if not torch.isin(torch.tensor(expert_id), experts_to_send).any():\n                    # if expert_id are not sent out from any npu, it will be copied from one npu holding this expert\n                    candidate_src_rank_indices = torch.where(current_expert_maps_this_layer[:, expert_id] != -1)[0]\n                else:\n                    candidate_src_rank_indices = src_rank_indices[experts_to_send == expert_id]\n\n                # TODO: improve selection criterion of NPU sending expert_id,\n                # considering intra-node or inter-node...\n                src_rank_id = candidate_src_rank_indices[0].item()\n                if src_rank_id not in expert_send_info_this_layer:\n                    expert_send_info_this_layer[src_rank_id] = []\n\n                expert_send_info_this_layer[src_rank_id].append((dst_rank_id, expert_id))\n                expert_recv_info_this_layer[dst_rank_id].append((src_rank_id, expert_id))\n\n            yield (\n                expert_send_info_this_layer,\n                expert_recv_info_this_layer,\n                updated_expert_maps_this_layer,\n                layer_id,\n            )",
+      "elide": ["可点到为止：核心是用 expert_map 的 -1（该 rank 不持有该 expert）做差集，算出每层『谁发给谁哪个 expert』；用 generator 逐层 yield 是为了 pack_update_info 流式打包"]
+    },
+    {
+      "path": "vllm_ascend/eplb/core/eplb_device_transfer_loader.py",
+      "lines": "L26-L91",
+      "code": "class ExpertWeightUpdateState(Enum):\n    WAITING = 0  # waiting for updated expert_map by EplbWorker\n    READY = 1  # ready for d2d expert weights updating\n    TRANSFERRING = 2  # d2d finished and waiting for updating expert_map into model\n\n\nclass D2DExpertWeightLoader:\n    def __init__(self):\n        self.comm_op_list = None\n        self.updated_expert_map = None\n        self.updated_log2phy_map = None\n        self.layer_id = -1  # layer id to be updated\n        self.state = ExpertWeightUpdateState.WAITING\n        self.recv_expert_list = []\n        self.num_layers = 0\n        self.comm_group = get_dynamic_eplb_group()\n\n    def set_adator(self, eplb_adaptor):\n        self.eplb_adaptor = eplb_adaptor\n\n    def generate_expert_d2d_transfer_task(self, expert_send_info, expert_recv_info, updated_expert_map, layer_id):\n        # When current send/recv and weight.expert_map update tasks are not finished, cannot accept new d2d task\n        if self.state != ExpertWeightUpdateState.WAITING:\n            logger.warning_once(\n                \"[eplb/d2d_loader] Current D2D weight update is on-going, cannot accept new update task\"\n            )\n            return\n\n        self.updated_expert_map = updated_expert_map\n\n        self.layer_id = layer_id\n        self.comm_op_list = []\n        for send_info in expert_send_info:\n            dst_rank, global_expert_id_to_send = send_info\n            local_expert_id = self.eplb_adaptor.expert_map_per_layer_cpu[layer_id][global_expert_id_to_send].item()\n            for src_tensor in self.eplb_adaptor.expert_param_per_layer[layer_id][local_expert_id]:\n                self.comm_op_list.append(\n                    dist.P2POp(dist.isend, src_tensor, dst_rank, group=self.comm_group.device_group)\n                )\n\n        for buffer_tensor_id, recv_info in enumerate(expert_recv_info):\n            recv_rank, global_expert_id_to_recv = recv_info\n            for buffer_tensor in self.eplb_adaptor.buffer_tensor_list[buffer_tensor_id]:\n                self.comm_op_list.append(\n                    dist.P2POp(dist.irecv, buffer_tensor, recv_rank, group=self.comm_group.device_group)\n                )\n            local_expert_to_replace = self.updated_expert_map[global_expert_id_to_recv].item()\n            self.recv_expert_list.append((local_expert_to_replace, buffer_tensor_id))\n\n        self.state = ExpertWeightUpdateState.READY\n\n    def set_log2phy_map(self, log2phy_map):\n        self.updated_log2phy_map = log2phy_map\n\n    def asyn_expert_weight_transfer(self, reqs):\n        # Only when send/recv tasks are parsed into self.comm_op_list, d2d send/recv tasks can be launched\n        if self.state != ExpertWeightUpdateState.READY:\n            return\n\n        # set asynchronous stream for d2d expert weight transfer\n        if self.comm_op_list:\n            ret_list = dist.batch_isend_irecv(self.comm_op_list)\n            reqs.extend(ret_list)\n\n        self.state = ExpertWeightUpdateState.TRANSFERRING",
+      "elide": ["每个 expert 的权重不是单张量而是张量列表（w13/w2 等多块，按量化方案可更多），故内层 for 把每块都挂一个 P2POp；buffer_tensor_list 是收方预分配的等形 buffer，先收进 buffer 再原位 copy_ 落地"]
+    },
+    {
+      "path": "vllm_ascend/eplb/core/eplb_device_transfer_loader.py",
+      "lines": "L92-L130",
+      "code": "    def update_expert_map_and_weight(self, reqs):\n        # Only after send/recv tasks have been launched, expert_map and weight can be updated\n        if self.state != ExpertWeightUpdateState.TRANSFERRING:\n            return\n\n        # Waiting for send/recv tasks finish\n        if reqs:\n            with record_function_or_nullcontext(\"EPLB weight D2D wait\"):\n                for req in reqs:\n                    req.wait()\n\n        if self.comm_op_list is not None:\n            self.comm_op_list = None\n\n        # update expert_map\n        self.eplb_adaptor.do_update_expert_map(self.layer_id, self.updated_expert_map)\n\n        # update log2phy_map\n        self.eplb_adaptor.do_update_log2phy_map(self.layer_id, self.updated_log2phy_map)\n\n        # update expert weight\n        buffer_tensor_id = 0\n        for recv_expert_info in self.recv_expert_list:\n            local_expert_to_replace, buffer_tensor_id = recv_expert_info\n            self.eplb_adaptor.do_update_expert_weight(self.layer_id, local_expert_to_replace, buffer_tensor_id)\n\n        logger.debug(\n            \"[eplb/d2d_loader] Layer %s D2D transfer completed, updated_experts=%s\",\n            self.layer_id,\n            len(self.recv_expert_list),\n        )\n\n        if self.layer_id == self.num_layers - 1:\n            logger.info(\"[eplb/d2d_loader] Full expert weight update cycle completed, total_layers=%s\", self.num_layers)\n\n        self.recv_expert_list = []\n        self.updated_expert_map = None\n        self.layer_id = -1\n        self.state = ExpertWeightUpdateState.WAITING",
+      "elide": ["req.wait() 之后才落地：先把 buffer 里收到的新权重 copy_ 进模型 expert 槽（do_update_expert_weight），同步更新 expert_map/log2phy_map 让路由指向新位置；落地后状态回 WAITING，闭环"]
+    },
+    {
+      "path": "vllm_ascend/eplb/core/policy/policy_abstract.py",
+      "lines": "L6-L30",
+      "code": "class EplbPolicy:\n    @abstractmethod\n    def rebalance_experts(self, current_expert_table, expert_workload):\n        \"\"\"\n        Pass in the weights and return expert replication and placement under relevant constraints.\n        INPUT:\n        current_expert_table: [layerId, rankId, expert_num_i]\n        expert_workload = expert_table[layer0][rankId][expert_num_i]\n\n        RETURNED: (res, expert_table)\n        res:\n        1 -- table_changed\n        0 -- not_changed\n\n        expert_table: [layerId, rankId, expert_num_i]\n        expert_num_i --- [0, MaxExpertPerRank]\n        expertID = expert_table[layer0][rankId][expert_num_i]\n        array_values:\n        [0, 1, 2, 3, 248]\n        [4, 5, 6, 7, 254]\n        [8, 9, 10, 11, 71]\n        ...\n        [252, 253, 254, 255, 0]\n        \"\"\"\n        pass",
+      "elide": []
+    },
+    {
+      "path": "vllm_ascend/eplb/core/policy/policy_factory.py",
+      "lines": "L12-L41",
+      "code": "class PolicyFactory:\n    @staticmethod\n    def generate_policy(policy_type: int) -> EplbPolicy:\n        policy: dict[int, type[EplbPolicy]] = {\n            # Constraint applying Dynamic EPLB policy V2:\n            # If there exists redundant expert:\n            # only one redundant expert can be placed in one NPU and its physical expert index must be 0\n            # Applying greedy d2d expert weight update composing\n            0: RandomLoadBalance,  # RandomLoadBalance: shuffle last physical expert on NPU 1 and 3\n            1: DefaultEplb,  # Dynamic EPLB policy: overall expert replacement based on current moe load\n            # Dynamic EPLB policy V2: expert replacement with constrained number of expert shuffle\n            2: SwiftBalanceEplb,\n            # FlashLB EPLB policy: expert replacement based on Joint Optimization,\n            # Multi-Shot Enhancement and Incremental Adjustment\n            3: FlashLB,\n        }\n        policy_class = policy.get(policy_type)\n        if policy_class is None:\n            policy_class = RandomLoadBalance\n            logger.warning(\n                \"[eplb/policy] Unrecognized policy_type=%s, falling back to %s\",\n                policy_type,\n                policy_class.__name__,\n            )\n        else:\n            logger.info(\"[eplb/policy] Policy: %s (type=%s)\", policy_class.__name__, policy_type)\n        policy_instance = policy_class()\n        if policy_type == 3:\n            warm_up()\n        return policy_instance",
+      "elide": ["policy_type==3（FlashLB）额外 warm_up()，其它策略无；这就是『策略多态』的分发点——int 配置 → 策略类实例"]
+    },
+    {
+      "path": "vllm_ascend/eplb/core/policy/policy_default_eplb.py",
+      "lines": "L283-L350",
+      "code": "    def rebalance_experts(self, current_expert_table, expert_workload):\n        info = DynamicTable()\n        info.workload_table = np.array(expert_workload)\n        info.placement_table = np.array(current_expert_table)\n        assert info.workload_table is not None\n        layer_num, num_npus, experts_per_npu = info.workload_table.shape\n        assert info.placement_table is not None\n        row = cast(np.ndarray, info.placement_table[0])\n        expert_ids, counts = np.unique(row, return_counts=True)\n        num_redundancy_expert = self.get_redundant_num(num_npus, counts)\n        num_original_expert = len(expert_ids)\n        layer_workloads = self.add_redundant(info.placement_table, info.workload_table, num_original_expert)\n        max_heat_per_layer_before = self.calculate_max_heat_per_layer(info.workload_table, layer_num)\n        npu_heat_all_origin = sum(max_heat_per_layer_before)\n        ...\n        global_deployment: list[list[list[int]]] = [[[] for _ in range(num_npus)] for _ in range(layer_num)]\n        max_heat_per_layer_after = np.zeros([layer_num])\n        for layer in range(layer_num):\n            weights = np.zeros((expert_num,), dtype=\"object\")\n            for expert_id, workload_weight in enumerate(layer_workloads[layer]):\n                weights[expert_id] = (expert_id, workload_weight)\n\n            result, layer_deployment = self.original_compute_balanced_pack_redundancy(\n                weights, num_npus, num_redundancy_expert\n            )\n\n            global_deployment[layer] = layer_deployment\n            max_heat_per_layer_after[layer] = max(result, key=lambda x: x[\"total_weight\"])[\"total_weight\"]\n\n        new_global_deployment = self.constraint_expert_local_exchange(current_expert_table, global_deployment)\n        layer_changed_ratio = []\n        for layer_idx in range(layer_num):\n            layer_changed_ratio.append(max_heat_per_layer_after[layer_idx] / max_heat_per_layer_before[layer_idx])\n\n        per_layer_priority = np.argsort(layer_changed_ratio)\n        npu_heat_all_after = sum(max_heat_per_layer_after)\n\n        change = 0\n        if npu_heat_all_after < 0.95 * npu_heat_all_origin:\n            change = 1\n\n        return change, per_layer_priority, np.array(new_global_deployment).tolist()",
+      "elide": ["L298-L317 一堆 num_npus/num_redundancy 的合法性校验 raise，已用 ... 省略；核心三步：add_redundant 把热门 expert 复制成冗余 expert → 逐层 original_compute_balanced_pack_redundancy 贪心装箱铺到各卡 → 只有总热度降到原来 95% 以下才置 change=1"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "EplbUpdator", "file": "vllm_ascend/eplb/eplb_updator.py", "responsibility": "节拍状态机（推理主进程侧）。靠 cur_iterations 计数 + expert_heat_collection_interval/algorithm_execution_interval/num_moe_layers 三个量算出『这一拍该 gather 负载 / 唤醒规划 / 取规划 / 搬第几层权重』。forward_before/forward_end 由 model_runner 每个 step 调一次。"},
+    {"name": "EplbProcess", "file": "vllm_ascend/eplb/core/eplb_worker.py", "responsibility": "子进程容器：持有 planner_q（唤醒信号，无界）与 block_update_q（规划结果，maxsize=1）两条跨进程队列，_launch_process 用 daemon Process 起子进程，worker_process 为子进程主循环。"},
+    {"name": "EplbWorker", "file": "vllm_ascend/eplb/core/eplb_worker.py", "responsibility": "子进程内真正干活者：do_update 读 shared_dict 的 expert_maps/moe_load → 调 policy.rebalance_experts 算新放置 → compose_expert_update_info_greedy 算每层 send/recv → pack_update_info 打包成可跨进程 IPC 的 list。"},
+    {"name": "D2DExpertWeightLoader", "file": "vllm_ascend/eplb/core/eplb_device_transfer_loader.py", "responsibility": "异步 P2P 权重搬运器，WAITING→READY→TRANSFERRING 三态机。generate_expert_d2d_transfer_task 攒 P2POp、asyn_expert_weight_transfer 批量 isend/irecv 发车、update_expert_map_and_weight 等回收并 copy_ 落地。"},
+    {"name": "VllmEplbAdaptor", "file": "vllm_ascend/eplb/adaptor/vllm_adaptor.py", "responsibility": "模型适配层：把 MoE 层的 expert 权重张量/expert_map/log2phy_map/预分配 buffer 登记成 per-layer 句柄表，供 loader 搬运、updator 采集 moe_load。屏蔽不同量化方案的权重命名差异。"},
+    {"name": "PolicyFactory", "file": "vllm_ascend/eplb/core/policy/policy_factory.py", "responsibility": "策略工厂：int policy_type → 策略类（0 Random/1 DefaultEplb/2 Swift/3 FlashLB），未知回退 Random。"},
+    {"name": "EplbPolicy", "file": "vllm_ascend/eplb/core/policy/policy_abstract.py", "responsibility": "策略抽象基类，定义唯一接口 rebalance_experts(current_expert_table, expert_workload) → (change, priority, new_table)。"},
+    {"name": "DefaultEplb", "file": "vllm_ascend/eplb/core/policy/policy_default_eplb.py", "responsibility": "默认动态 EPLB 策略：把热门 expert 复制成冗余 expert，逐层贪心装箱（greedy bin-pack）把 expert 按热度均衡铺到各卡。"}
+  ],
+
+  "data_flow": [
+    "1. 构建期 model_runner_v1.NPUModelRunner.__init__：dynamic_eplb 开 → 建 Manager().dict 共享字典、D2DExpertWeightLoader、EplbProcess（内含两队列 + EplbWorker），_launch_process 起 daemon 子进程，再建 EplbUpdator",
+    "2. 模型加载后 set_adaptor + warm_up_eplb：把 expert_maps 写进 shared_dict、首次 compute_and_set_moe_load，并用 dummy P2P 预热通信链路",
+    "3. 每个 step 前 forward_before：到 get_update_info_flag 拍则 block_update_q.get() 取上一轮规划；到 update_expert_weight_flag 窗口则逐层 generate_expert_d2d_transfer_task + asyn_expert_weight_transfer 异步发 P2P",
+    "4. 每个 step 后 forward_end：到 wakeup_eplb_worker_flag 拍则 compute_and_set_moe_load（all_gather 全局负载写 shared_dict）+ wakeup_eplb_worker（planner_q.put(1)）；到搬权重窗口则 update_expert_map_and_weight 等回收落地；update_iteration 推进/归零",
+    "5. 子进程 EplbProcess.worker_process：阻塞 planner_q.get() 被唤醒 → EplbWorker.do_update（读 shared_dict → policy.rebalance_experts → compose send/recv → pack）→ block_update_q.put(packed_update_info)",
+    "6. 节拍闭环：interval(=400) 拍 gather+唤醒 → 子进程算 interval+algo(=30) 拍内出结果 → 主进程取结果 → 之后 num_moe_layers 拍逐层搬权重 → 满 interval+algo+num_moe_layers 拍 clear_all_moe_loads + cur_iterations 归零，进入下一轮"
+  ],
+
+  "design_decisions": [
+    {"decision": "重 CPU 规划放进独立子进程，而非推理主循环", "why": "rebalance_experts 是纯 CPU 重计算（贪心装箱、跨层遍历、numpy unique/where），若跑在推理主线程会卡住前向、拖垮吞吐。子进程化让规划与推理并行，主进程只在节拍点 put/get 队列，几乎零阻塞。", "evidence": "vllm_ascend/eplb/core/eplb_worker.py:L342-L388（worker_process 子进程主循环 + _launch_process daemon Process）；do_update 顶部 torch.set_num_threads(1) 限子进程抢核"},
+    {"decision": "两条跨进程队列解耦：planner_q 无界、block_update_q maxsize=1", "why": "planner_q 是『唤醒信号』(put(1))，主进程只管点火；block_update_q 是『规划结果』，限容量 1 形成背压——只保留最新一份规划，旧结果若没被取走，worker_process 用 while not empty: continue 自旋等取走再 put，避免堆积过期方案。", "evidence": "vllm_ascend/eplb/core/eplb_worker.py:L336-L337（Queue() / Queue(maxsize=1)）、L366-L369（put 前自旋等队列空）"},
+    {"decision": "权重搬运用异步 P2P（generate→asyn→update 三段 + 三态机），跨多个 step 摊开", "why": "搬 expert 权重张量是大流量 D2D，同步等会阻塞前向。拆成 forward_before 发车（isend/irecv 不等）、forward_end 收车（req.wait 落地），且每个 step 只搬一层（update_expert_weight_flag 窗口 num_moe_layers 拍），把一整轮迁移摊到多个 step，单步开销可控。三态机 WAITING/READY/TRANSFERRING 防止上一轮没落地就接新任务。", "evidence": "vllm_ascend/eplb/core/eplb_device_transfer_loader.py:L26-L130；vllm_ascend/eplb/eplb_updator.py:L104-L136（forward_before 发、forward_end 收）"},
+    {"decision": "节拍状态机用纯整数计数 + 三个判定函数，而非显式状态枚举", "why": "cur_iterations 单调递增，三个 flag 函数把『何时 gather/唤醒/取规划/搬第几层』全部表达成对 interval 常量的算术比较，逻辑集中、易推演；满一整轮自动归零进入下一轮。流水线节拍：gather(interval-1) → 子进程规划(interval..interval+algo) → 取规划(interval+algo-1) → 逐层搬权重(interval+algo .. +num_moe_layers)。", "evidence": "vllm_ascend/eplb/eplb_updator.py:L77-L99（update_iteration + 三 flag）"},
+    {"decision": "send/recv 计划用 expert_map 的 -1 做差集贪心生成", "why": "current 与 updated 两张 expert_map 对比：current==-1 & updated!=-1 即该 rank 需『收』；current!=-1 & updated==-1 即该 rank 需『发』。贪心挑第一个候选源 rank，逐 expert 配对成 (src,dst,expert_id)，TODO 注明未来按 intra/inter-node 优化选源。", "evidence": "vllm_ascend/eplb/core/eplb_worker.py:L166-L195"},
+    {"decision": "策略层走工厂 + 抽象基类多态，DefaultEplb/Swift/FlashLB/Random 可插拔", "why": "rebalance_experts 是唯一接口契约，规划算法可独立演进（V2 约束 / Joint Optimization 等）；EplbWorker 只依赖抽象，不感知具体策略。policy_type==3(FlashLB) 因依赖编译/预热而有 warm_up 特殊分支。", "evidence": "vllm_ascend/eplb/core/policy/policy_factory.py:L12-L41；vllm_ascend/eplb/core/policy/policy_abstract.py:L6-L30"},
+    {"decision": "仅借用 vLLM 通信原语，不改 vLLM 核心", "why": "整套 EPLB 是 vLLM-Ascend 临时自带（源码顶部 TODO：待 vLLM PR 22246/24069 合入即删）。它只复用 vLLM 的 GroupCoordinator.all_gather（gather 全局负载）和 torch.distributed.P2POp/batch_isend_irecv（搬权重），通信组用 ch08 埋下的 get_dynamic_eplb_group()（_DYNAMIC_EPLB，拓扑复用 MC2 group_ranks）。", "evidence": "vllm_ascend/eplb/eplb_updator.py:L25,L140（get_dynamic_eplb_group / all_gather）；eplb_device_transfer_loader.py:L63-L70,L87（P2POp/batch_isend_irecv）；多文件顶部 'Todo: Once ... merged in vllm. Remove this ...'"}
+  ],
+
+  "theory": [
+    "负载不均衡度量：_compute_imbalance 用 stage_par = stage_load.max() / stage_load.mean()，即最热卡负载 / 平均卡负载。理想均衡=1，越大越偏。EPLB 目标是把它压低。",
+    "为何要冗余 expert：单纯换位无法解决『单个 expert 太热』——DefaultEplb.add_redundant 把高热 expert 复制成多份物理副本（num_redundancy_expert 个），再 original_compute_balanced_pack_redundancy 贪心装箱，使每卡总热度尽量均等（box_weights 最小者优先放）。",
+    "收益门槛：rebalance 仅当 npu_heat_all_after < 0.95 * npu_heat_all_origin 才置 change=1（至少降 5% 才认为值得迁移），避免微小收益换来昂贵 D2D 搬运。",
+    "节拍周期量化：一整轮 = expert_heat_collection_interval(默认400) + algorithm_execution_interval(默认30) + num_moe_layers 个 step。前 400 拍累积热度、第 400 拍 gather+唤醒，子进程在随后 ~30 拍内出规划，之后每拍搬一层共 num_moe_layers 拍，最后归零。即每 ~430+L 个 step 做一次全局再均衡。",
+    "复杂度直觉：rebalance_experts 对每层做 O(num_redundancy * num_expert * log) 的排序贪心装箱，跨 layer_num 层；这正是『为何不能放主循环』——计算量随专家数/层数/卡数增长，必须异步化。",
+    "权重以 buffer 中转：收方先把对端发来的权重 irecv 进预分配 buffer_tensor_list，req.wait 全部完成后再 copy_ 进真正的 expert 槽——避免半搬运状态被前向读到（先收齐再原位替换）。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "worker_process 顶部 ms_service_metric 的 try/except 初始化块（eplb_worker.py L347-L354）", "why_safe": "纯指标采集（华为内部 metric adapter），失败也只 warning；与在线热迁移主线零耦合，精简版可整块删。"},
+      {"what": "do_update 内 rank0 的 _calculate_hotness/_compute_imbalance/latest_expert_hotness 块（eplb_worker.py L66-L93）及两个 staticmethod _compute_imbalance/_calculate_hotness", "why_safe": "仅算热度不均衡指标喂监控（注释明标 ms-service-metric begin/end），不参与 new_placement 计算与 send/recv 生成，删后规划结果不变。"},
+      {"what": "DefaultEplb 中未被调用的 compute_balanced_pack_redundancy(L124-L190) 与 compute_balanced_pack(L192-L235)", "why_safe": "经 grep 确认 rebalance_experts 只调 original_compute_balanced_pack_redundancy；这两个是替代/历史装箱实现，无任何引用，删除不影响控制流。"},
+      {"what": "multi_stage / policy_type==3(FlashLB) 专属分支：compute_and_set_moe_load 的 permute、worker_process 与 PolicyFactory 的 flashlb warm_up()、do_update 中 multi_stage 的 load_info.sum(0)", "why_safe": "FlashLB 是『点到为止』的策略之一，非主线（主线走 DefaultEplb）；删后 DefaultEplb 路径完全不受影响。须在正文点名 FlashLB/Swift 存在但不展开。"},
+      {"what": "VllmEplbAdaptor.init_expert_param_per_layer 中 W8A8/W4A8/MXFP4/MXFP8 量化分支（vllm_adaptor.py L69-L102），仅保留 else 的 ['w13_weight','w2_weight'] 代表", "why_safe": "量化方案只影响 expert_weight_names 的具体张量名清单，不改搬运控制流（仍是 per-layer per-expert 张量列表）；保留非量化代表即可讲清『每 expert 是多块张量』，其余分支用 elide 说明。"},
+      {"what": "expert_map_record_path 落盘分支（updator.update_iteration L83-L84、forward_end 的 record_path is None 守卫、adaptor._export_tensor_to_file）", "why_safe": "落盘记录 expert 映射是离线分析用途，非在线热迁移主线；主线 record_path=None，删后节拍与搬运逻辑不变。"},
+      {"what": "warm_up_eplb 中的 dummy P2P 预热环（updator.py L155-L173 的 src_tensor/comm_op_list/batch_isend_irecv/wait）", "why_safe": "仅用 1 元素张量预热通信链路，不搬真实权重；可保留函数签名与 shared_dict 初始化、compute_and_set_moe_load 调用，删 dummy 通信细节用 elide 说明。"}
+    ],
+    "must_keep": [
+      {"symbol": "EplbUpdator", "why": "节拍状态机主类，全章主线①"},
+      {"symbol": "cur_iterations", "why": "节拍计数器，三个 flag 全靠它推演"},
+      {"symbol": "expert_heat_collection_interval", "why": "间隔常量①（默认400）——何时 gather+唤醒"},
+      {"symbol": "algorithm_execution_interval", "why": "间隔常量②（默认30）——留给子进程出规划的拍数"},
+      {"symbol": "num_moe_layers", "why": "间隔常量③——逐层搬权重窗口宽度"},
+      {"symbol": "update_iteration", "why": "推进/归零节拍，定义一整轮周期"},
+      {"symbol": "get_update_info_flag", "why": "判定『取规划结果』拍"},
+      {"symbol": "wakeup_eplb_worker_flag", "why": "判定『gather 负载 + 唤醒子进程』拍"},
+      {"symbol": "update_expert_weight_flag", "why": "判定『搬第几层权重』窗口"},
+      {"symbol": "wakeup_eplb_worker", "why": "planner_q.put(1) 点火子进程"},
+      {"symbol": "forward_before", "why": "step 前：取规划 + 发 P2P"},
+      {"symbol": "forward_end", "why": "step 后：gather+唤醒 / 收权重 / 推进节拍"},
+      {"symbol": "compute_and_set_moe_load", "why": "all_gather 全局负载写 shared_dict（借用 vLLM 通信原语证据点）"},
+      {"symbol": "EplbProcess", "why": "子进程容器，主线②"},
+      {"symbol": "planner_q", "why": "唤醒信号队列（无界）"},
+      {"symbol": "block_update_q", "why": "规划结果队列（maxsize=1，背压）"},
+      {"symbol": "worker_process", "why": "子进程主循环：get→do_update→put"},
+      {"symbol": "_launch_process", "why": "daemon Process 起子进程"},
+      {"symbol": "EplbWorker", "why": "子进程内规划执行者"},
+      {"symbol": "do_update", "why": "规划主流程：读共享态→策略→算 send/recv→打包"},
+      {"symbol": "compose_expert_update_info_greedy", "why": "用 expert_map 的 -1 差集生成每层 send/recv 计划"},
+      {"symbol": "pack_update_info", "why": "把规划打包成可跨进程 IPC 的结构"},
+      {"symbol": "D2DExpertWeightLoader", "why": "异步 P2P 搬运器，主线③"},
+      {"symbol": "ExpertWeightUpdateState", "why": "WAITING/READY/TRANSFERRING 三态机"},
+      {"symbol": "generate_expert_d2d_transfer_task", "why": "攒 P2POp（isend/irecv）"},
+      {"symbol": "asyn_expert_weight_transfer", "why": "batch_isend_irecv 异步发车"},
+      {"symbol": "update_expert_map_and_weight", "why": "req.wait 收车 + copy_ 落地 + 更新 map"},
+      {"symbol": "PolicyFactory", "why": "策略多态分发点，主线④"},
+      {"symbol": "generate_policy", "why": "int→策略类映射"},
+      {"symbol": "EplbPolicy", "why": "策略抽象基类（接口契约）"},
+      {"symbol": "rebalance_experts", "why": "唯一策略接口方法"},
+      {"symbol": "DefaultEplb", "why": "走完的代表策略"},
+      {"symbol": "VllmEplbAdaptor", "why": "模型权重/map 句柄表，loader 与 updator 的取数源"}
+    ]
+  },
+
+  "diagram_plan": [
+    {"name": "roadmap", "spec": "复用 book/assets/roadmap/roadmap.py 出『你在这里』图：高亮 ch09 节点；前置标注 ch08 _DYNAMIC_EPLB 组（f6 回收），点明本章是该组的『使用方』。"},
+    {"name": "eplb-pipeline-overview", "spec": "svg-diagram 流水线总览：推理主进程（model_runner forward_before/forward_end → EplbUpdator）↔ 两条队列（planner_q 单向点火↓ / block_update_q 单向回传↑）↔ EPLB 子进程（EplbWorker.do_update → policy.rebalance_experts）。旁挂 shared_dict（Manager.dict：expert_maps/moe_load）作三方共享态。再标 D2DExpertWeightLoader 的 P2P 搬权重走 NPU 间（借 get_dynamic_eplb_group）。四主线①②③④分别框出。"},
+    {"name": "cadence-state-table", "spec": "svg-diagram 节拍时间线表：横轴 cur_iterations（用具体值演示，如 interval=4,algo=2,num_moe_layers=3 的缩小例），逐拍标注触发的 flag 与动作（gather+唤醒 @interval-1；取规划 @interval+algo-1；搬第0..L-1层 @interval+algo..+num_moe_layers-1；归零 @interval+algo+num_moe_layers）。≥2 拍数值追踪，让读者走清『哪一拍干什么』。"},
+    {"name": "d2d-three-state", "spec": "svg-diagram 三态机：WAITING →(generate_expert_d2d_transfer_task)→ READY →(asyn_expert_weight_transfer/batch_isend_irecv)→ TRANSFERRING →(update_expert_map_and_weight: req.wait+copy_)→ WAITING。每条边标触发函数与所发/收的 P2POp。"},
+    {"name": "send-recv-from-map-diff", "spec": "svg-diagram 小例：两张 expert_map（current vs updated，含 -1）用差集推出 (src_rank→dst_rank: expert_id) 的 send/recv 对，配合 buffer 中转→copy_ 落地。可选，若篇幅紧可并入 overview。"}
+  ],
+
+  "foreshadow_due": {
+    "due_plant": [],
+    "due_recover": [
+      {"id": "f6", "desc": "_DYNAMIC_EPLB / get_dynamic_eplb_group——动态专家负载均衡组。ch08 只建组并点出其拓扑复用 MC2 的 group_ranks，EPLB 机制本身（专家迁移/负载再均衡）留 ch09 展开（埋于 ch08）", "recover_plan": "ch09 正文在『仅借用 vLLM 通信原语』处回收：明确 get_dynamic_eplb_group() 返回的 comm_group 正是 ch08 建的 _DYNAMIC_EPLB（GroupCoordinator），all_gather 全局 moe_load 与 P2POp 搬权重都走它的 device_group；点明拓扑复用 MC2 group_ranks 的意义（迁移走已建好的通信域）。"}
+    ]
+  },
+
+  "notes_for_writer": [
+    "章节命题里『三个间隔常量 num_iterations / wait_worker / gate』是 Lead 的早期口径；真实源码字段名为 expert_heat_collection_interval(默认400)、algorithm_execution_interval(默认30)、num_moe_layers——正文务必用真实名，可在脚注一句话点明直觉别名（采集间隔/等规划/逐层门控）。",
+    "规范路径写 vllm_ascend/...；借用的 vLLM 原语写 vllm/...（GroupCoordinator.all_gather、torch.distributed.P2POp）；绝不出现 instances/.../source/ 前缀。",
+    "无基座对位文件——不做逐行对照，反复点明『vLLM 尚未合入、源码顶部 TODO 待 PR 22246/24069 合入即删除』，这是本特性的临时性背书。",
+    "host 无 NPU/CANN/torch.distributed NPU 后端——精简版只验可读控制流：节拍状态机（cur_iterations + 三 flag 纯整数运算）、队列解耦（multiprocessing.Queue put/get）、策略多态（PolicyFactory + EplbPolicy 子类）均为纯 Python，可跑可断言；真实 P2P 权重搬运与子进程绑 NPU 不真跑，用桩/注释标注。",
+    "EplbConfig 默认值见 vllm_ascend/ascend_config.py:L709-L766（dynamic_eplb 开关须配环境变量 DYNAMIC_EPLB=true；eplb_policy_type 默认1=DefaultEplb）。"
+  ]
+}
