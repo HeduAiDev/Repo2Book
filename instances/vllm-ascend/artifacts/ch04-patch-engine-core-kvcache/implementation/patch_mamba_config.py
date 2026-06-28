@@ -1,0 +1,106 @@
+# 案例1 — block_size 16→128（mamba 在 NPU 不支持 16）
+# 技法③方法替换：模块级 classmethod 顶替 HybridAttentionMambaModelConfig.verify_and_update_config。
+# subtract-only：与 vllm_ascend/patch/platform/patch_mamba_config.py 同名/同结构/同控制流，只删不增。
+#
+# SOURCE: vllm_ascend/patch/platform/patch_mamba_config.py:L1-L9
+import math
+
+import vllm.model_executor.models.config
+from vllm.logger import logger
+from vllm.model_executor.models import ModelRegistry
+from vllm.model_executor.models.config import MambaModelConfig
+from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size
+
+
+# SOURCE: vllm_ascend/patch/platform/patch_mamba_config.py:L12-L116
+@classmethod
+def verify_and_update_config(cls, vllm_config) -> None:
+    # SOURCE: vllm_ascend/patch/platform/patch_mamba_config.py:L12-L116
+    """
+    Ensure that page size of attention layers is greater than or
+    equal to the mamba layers. If not, automatically set the attention
+    block size to ensure that it is. If the attention page size is
+    strictly greater than the mamba page size, we pad the mamba page size
+    to make them equal.
+
+    Args:
+        vllm_config: vLLM Config
+    """
+    # SUBTRACTED: using_kv_transfer_with_hybrid 计算 (patch_mamba_config.py:L24-L26)——
+    # 仅供末尾 kv_transfer/align 旁支配置使用，已随 L93-L116 一并删除，主线不依赖它。
+    # Enable FULL_AND_PIECEWISE by default
+    MambaModelConfig.verify_and_update_config(vllm_config)
+
+    cache_config = vllm_config.cache_config
+    model_config = vllm_config.model_config
+    parallel_config = vllm_config.parallel_config
+
+    if cache_config.cache_dtype == "auto":
+        kv_cache_dtype = model_config.dtype
+    else:
+        kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+
+    kernel_block_size = 128
+    model_cls, _ = ModelRegistry.resolve_model_cls(
+        model_config.architecture,
+        model_config=model_config,
+    )
+
+    # get mamba block size
+    mamba_shapes = model_cls.get_mamba_state_shape_from_config(vllm_config)
+    mamba_dtypes = model_cls.get_mamba_state_dtype_from_config(vllm_config)
+    mamba_sizes = []
+    for shape, dtype in zip(mamba_shapes, mamba_dtypes):
+        mamba_sizes.append(math.prod(shape) * get_dtype_size(dtype))
+    ssm_block_page_size, conv_block_page_size = max(mamba_sizes), min(mamba_sizes)
+
+    # Pure linear attention models (e.g. bailing 2.5) have only SSM state,
+    # no conv block. Detected by a single 3-D mamba shape (ssm only, no conv).
+    # Example shape: MambaSpec(shapes=((8, 128, 128),), mamba_type='linear_attention')
+    if len(mamba_shapes) == 1 and len(mamba_shapes[0]) == 3:
+        conv_block_page_size = 0
+
+    # NOTE(zxr): because of the limit of Ascend Hardware, we need to keep
+    # all cache tensors contiguous, so we align the page size of ssm_block
+    # and single attn_block
+    if model_config.use_mla:
+        attn_num_kv_heads = model_config.get_num_kv_heads(parallel_config)
+        kv_lora_rank = model_config.hf_text_config.kv_lora_rank
+        qk_rope_head_dim = model_config.hf_text_config.qk_rope_head_dim
+        attn_single_token_k_page_size = kv_lora_rank * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
+        attn_rope_token_page_size = qk_rope_head_dim * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
+        attn_token_page_size = attn_single_token_k_page_size + attn_rope_token_page_size
+    else:
+        attn_num_kv_heads = model_config.get_num_kv_heads(parallel_config)
+        attn_head_size = model_config.get_head_size()
+        attn_single_token_k_page_size = attn_head_size * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
+        attn_token_page_size = 2 * attn_head_size * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
+
+    attn_block_size = kernel_block_size * cdiv(ssm_block_page_size, kernel_block_size * attn_single_token_k_page_size)
+    assert attn_single_token_k_page_size * attn_block_size == ssm_block_page_size, (
+        "Cannot align ssm_page_size and attn_page_size."
+    )
+
+    # override attention block size if either (a) the
+    # user has not set it or (b) the user has set it
+    # too small.
+    if cache_config.block_size is None or cache_config.block_size < attn_block_size:
+        cache_config.block_size = attn_block_size
+        logger.info(
+            "Setting attention block size to %d tokens to ensure that attention page size is >= mamba page size.",
+            attn_block_size,
+        )
+
+    # compute new attention page size
+    attn_page_size = cache_config.block_size * attn_token_page_size
+
+    # SUBTRACTED: 把 mamba page size pad 到与 attn page size 相等（NPU 要求 cache tensor 连续）的
+    # padding 百分比日志 + using_kv_transfer_with_hybrid 下的 mamba_cache_mode='align' /
+    # mamba_block_size 设定 (patch_mamba_config.py:L93-L116)。主线（kernel_block_size=128 →
+    # attn_block_size 对齐 → 写回 cache_config.block_size）已完整，删除不影响案例1。
+
+
+# SOURCE: vllm_ascend/patch/platform/patch_mamba_config.py:L119
+# 技法③方法替换的重绑点：把整个 classmethod 顶替到 HybridAttentionMambaModelConfig.verify_and_update_config。
+vllm.model_executor.models.config.HybridAttentionMambaModelConfig.verify_and_update_config = verify_and_update_config

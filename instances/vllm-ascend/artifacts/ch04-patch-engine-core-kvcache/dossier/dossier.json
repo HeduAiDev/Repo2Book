@@ -1,0 +1,187 @@
+{
+  "chapter_id": "ch04",
+  "title": "顶替引擎核心：KV-cache 协调器、调度与 spec 的昇腾化 patch",
+  "one_line_thesis": "以 KV-cache / 内存形态层为主线，展示『为正确性与硬件约束而 patch』的真实案例群——每个案例都对照 vLLM 原实现走『原算法 → 昇腾约束 → 重绑定手法』三段式，并点名复用 ch03 的 5 类技法（①整类替换 ②工厂/注册表替换 ③方法替换 ④库函数 wrapper ⑤from-import 缓存陷阱修复），本章不再重讲技法本身。",
+  "source_pins": {
+    "vllm-ascend": "80610e44 (v0.21.0 分支)",
+    "vllm_base": "ad7125a43 (v0.21.0 对照基座)"
+  },
+  "ch03_technique_vocab_reused": [
+    "技法①整类替换：子类继承原类整体重写 + 末行把模块属性重绑到子类",
+    "技法②工厂/注册表替换：改写按类型派发的工厂函数/派发表，否则工厂仍 new 旧类",
+    "技法③方法替换：模块级函数（可带 self/cls）赋给类的某个方法属性或模块属性",
+    "技法④库函数 wrapper：闭包捕获原 fn，前后补逻辑、不满足条件回落原 fn",
+    "技法⑤from-import 缓存陷阱修复：同一对象在所有再导出/已 from-import 的命名空间都重绑"
+  ],
+  "code_spine": [
+    "案例1 block_size 16→128（mamba 在 NPU 不支持 16）：vllm_ascend/patch/platform/patch_mamba_config.py:L12-L119 整体替换 HybridAttentionMambaModelConfig.verify_and_update_config（技法③方法替换）。对照基座 vllm/model_executor/models/config.py:L195-L227（原版只关 calculate_kv_scales + 调 MambaModelConfig，把 block_size 对齐推迟到 Platform.update_block_size_for_backend）+ vllm/platforms/interface.py:L614-L644（原版用 backend 支持的最小 kernel block，CUDA mamba2 为 16）",
+    "案例2 MLAAttentionSpec 子类化扩展 DSA/Sparse-C8：vllm_ascend/patch/platform/patch_kv_cache_interface.py:L29-L196 AscendMLAAttentionSpec(MLAAttentionSpec) + L214-L261 AscendSlidingWindowMLASpec(SlidingWindowMLASpec) → L264-L266 三处模块属性重绑（技法①整类替换）。对照基座 vllm/v1/kv_cache_interface.py:L324-L383 原 MLAAttentionSpec + L131-L171 AttentionSpec.page_size_bytes/real_page_size_bytes",
+    "案例3 CP+hybrid 前缀缓存：vllm_ascend/patch/platform/patch_kv_cache_coordinator.py:L55-L297 AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator) + L300-L357 get_kv_cache_coordinator 工厂替换 + L360-L368 from-import 缓存陷阱修复（技法①+②/③+⑤）；配套 vllm_ascend/patch/platform/patch_kv_cache_utils.py:L23-L58 _ascend_resolve_kv_cache_block_sizes（技法③）+ L250-L258 双重绑。对照基座 vllm/v1/core/kv_cache_coordinator.py:L427-L434（原 HybridKVCacheCoordinator.__init__ 的 assert dcp==1/pcp==1）+ L606-L641 原 get_kv_cache_coordinator + vllm/v1/core/kv_cache_utils.py:L592-L603（原 resolve 对多组+CP 直接 raise）",
+    "案例4 bind_kv_cache 跳 NPU raise：vllm_ascend/patch/worker/patch_qwen3_next_mtp.py:L9-L50 重绑 vllm.v1.worker.utils.bind_kv_cache（技法③方法替换）。对照基座 vllm/v1/worker/utils.py:L457-L513（原版 len(layer_names)>1 时非 CUDA/CPU/XPU 走 else: raise NotImplementedError）",
+    "案例5 int32 slot_mapping：vllm_ascend/worker/v2/block_table.py:L67-L77 AscendBlockTable 删父类 int64 slot_mappings、重建 int32（非 patch 文件，是昇腾自有 worker 的子类覆盖，因 vllm-ascend reshape_and_cache 要求 int32）。对照基座 slot_mapping 默认 int64（CUDA reshape_and_cache 接受 int64）"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm_ascend/patch/platform/patch_mamba_config.py",
+      "lines": "L34-L91",
+      "code": "    if cache_config.cache_dtype == \"auto\":\n        kv_cache_dtype = model_config.dtype\n    else:\n        kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]\n\n    kernel_block_size = 128\n    model_cls, _ = ModelRegistry.resolve_model_cls(\n        model_config.architecture,\n        model_config=model_config,\n    )\n\n    # get mamba block size\n    mamba_shapes = model_cls.get_mamba_state_shape_from_config(vllm_config)\n    mamba_dtypes = model_cls.get_mamba_state_dtype_from_config(vllm_config)\n    mamba_sizes = []\n    for shape, dtype in zip(mamba_shapes, mamba_dtypes):\n        mamba_sizes.append(math.prod(shape) * get_dtype_size(dtype))\n    ssm_block_page_size, conv_block_page_size = max(mamba_sizes), min(mamba_sizes)\n\n    # ... (pure-linear-attention single-SSM-shape branch elided) ...\n\n    # NOTE(zxr): because of the limit of Ascend Hardware, we need to keep\n    # all cache tensors contiguous, so we align the page size of ssm_block\n    # and single attn_block\n    if model_config.use_mla:\n        attn_num_kv_heads = model_config.get_num_kv_heads(parallel_config)\n        kv_lora_rank = model_config.hf_text_config.kv_lora_rank\n        qk_rope_head_dim = model_config.hf_text_config.qk_rope_head_dim\n        attn_single_token_k_page_size = kv_lora_rank * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)\n        attn_rope_token_page_size = qk_rope_head_dim * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)\n        attn_token_page_size = attn_single_token_k_page_size + attn_rope_token_page_size\n    else:\n        attn_num_kv_heads = model_config.get_num_kv_heads(parallel_config)\n        attn_head_size = model_config.get_head_size()\n        attn_single_token_k_page_size = attn_head_size * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)\n        attn_token_page_size = 2 * attn_head_size * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)\n\n    attn_block_size = kernel_block_size * cdiv(ssm_block_page_size, kernel_block_size * attn_single_token_k_page_size)\n    assert attn_single_token_k_page_size * attn_block_size == ssm_block_page_size, (\n        \"Cannot align ssm_page_size and attn_page_size.\"\n    )\n\n    # override attention block size if either (a) the\n    # user has not set it or (b) the user has set it\n    # too small.\n    if cache_config.block_size is None or cache_config.block_size < attn_block_size:\n        cache_config.block_size = attn_block_size\n        logger.info(\n            \"Setting attention block size to %d tokens to ensure that attention page size is >= mamba page size.\",\n            attn_block_size,\n        )\n\nvllm.model_executor.models.config.HybridAttentionMambaModelConfig.verify_and_update_config = verify_and_update_config",
+      "elide": ["开头 using_kv_transfer_with_hybrid 计算、MambaModelConfig.verify_and_update_config(vllm_config) 调用（FULL_AND_PIECEWISE）正文可一句带过。", "纯线性注意力模型（只有 SSM 无 conv）的 len(mamba_shapes)==1 and len==3 → conv_block_page_size=0 分支可略。", "末尾 attn_page_size/mamba_page_size_padded padding + mamba_cache_mode='align' + mamba_block_size 设定（L90-L116）是 padding 细节，正文保留『把 mamba page size pad 到与 attn page size 相等』这一句即可。", "末行 L119 是技法③方法替换的重绑点（把整个 classmethod 顶替到 HybridAttentionMambaModelConfig.verify_and_update_config）。"]
+    },
+    {
+      "path": "vllm/model_executor/models/config.py",
+      "lines": "L195-L227",
+      "code": "class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):\n    @classmethod\n    def verify_and_update_config(cls, vllm_config: \"VllmConfig\") -> None:\n        \"\"\"\n        Perform early validation and setup for hybrid attention/mamba models.\n\n        Block size alignment with mamba page sizes is handled later by\n        Platform.update_block_size_for_backend(), which runs after model\n        layers are constructed and the attention backend is known.\n        ...\n        \"\"\"\n        cache_config = vllm_config.cache_config\n        # Disable calculate_kv_scales for hybrid models ...\n        if cache_config.calculate_kv_scales:\n            ...\n            cache_config.calculate_kv_scales = False\n        # Enable FULL_AND_PIECEWISE by default\n        MambaModelConfig.verify_and_update_config(vllm_config)",
+      "elide": ["calculate_kv_scales 关闭的告警文本已折叠。对照要点：原版 HybridAttentionMambaModelConfig 在此阶段**不**计算 block_size，明确把对齐推迟到 Platform.update_block_size_for_backend()；Ascend 把这步前移到本 patch 并钉死 kernel_block_size=128。"]
+    },
+    {
+      "path": "vllm/platforms/interface.py",
+      "lines": "L614-L648",
+      "code": "        # Get kernel block alignment from the backend's supported sizes\n        with set_current_vllm_config(vllm_config):\n            kernel_block_alignment_size = max(\n                min(\n                    s.base if isinstance(s, MultipleOf) else s\n                    for s in backend_cls.get_supported_kernel_block_sizes()\n                ),\n                cache_config.block_size,\n            )\n        ...\n        else:\n            # Without prefix caching, use minimum block size that satisfies\n            # both backend alignment and mamba page size compatibility\n            attn_block_size = kernel_block_alignment_size * cdiv(\n                mamba_page_size,\n                kernel_block_alignment_size * attn_page_size_1_token,\n            )\n        if cache_config.block_size < attn_block_size:\n            cache_config.block_size = attn_block_size\n            logger.info(...)",
+      "elide": ["mamba_cache_mode=='all' 的 chunk_size 分支已折叠。对照要点：原版 kernel block 对齐数来自 backend_cls.get_supported_kernel_block_sizes()（CUDA mamba2 后端最小为 16），算法形态 `kernel * cdiv(mamba_page, kernel*attn_token)` 与 Ascend 一致——Ascend 唯一的改动是把这个对齐数硬替成 128（NPU mamba kernel 不支持 16）。"]
+    },
+    {
+      "path": "vllm_ascend/patch/platform/patch_kv_cache_interface.py",
+      "lines": "L29-L89",
+      "code": "@dataclass(frozen=True)\nclass AscendMLAAttentionSpec(MLAAttentionSpec):\n    \"\"\"MLAAttentionSpec extended to support DSA models, with optional Sparse C8 support.\n\n    When Sparse C8 is enabled, the KV cache tuple changes from\n    (kv_cache[0]: bfloat16, kv_cache[1]: bfloat16, kv_cache[2]: bfloat16)\n    to\n    (kv_cache[0]: bfloat16, kv_cache[1]: bfloat16, kv_cache[2]: int8, kv_cache[3]: float16).\n    ...\n    \"\"\"\n\n    scale_dim: int = 0\n    scale_dtype: torch.dtype = torch.int8\n    sparse_head_dim: tuple[int, ...] | None = None\n    cache_sparse_c8: bool = False\n    c8_k_cache_dtype: torch.dtype = field(default_factory=_get_c8_k_cache_dtype)\n    c8_k_scale_cache_dtype: torch.dtype = field(default_factory=_get_c8_k_scale_cache_dtype)\n\n    @property\n    def page_size_bytes(self) -> int:\n        if self.cache_sparse_c8:\n            assert self.sparse_head_dim is not None\n            assert len(self.sparse_head_dim) == 3\n            num_heads_per_page = self.block_size * self.num_kv_heads\n            kv_lora_rank, qk_rope_head_dim, index_head_dim = self.sparse_head_dim\n            # A5: kv_lora and k_rope are merged into a single CKV tensor (fp8).\n            # A3: separate kv_lora + k_rope (bf16).\n            if qk_rope_head_dim == 0:\n                kv_dtype = self.c8_k_cache_dtype  # A5 CKV: float8_e4m3fn\n                kv_dim = kv_lora_rank\n            else:\n                kv_dtype = self.dtype  # A3 kv_lora + k_rope: bfloat16\n                kv_dim = kv_lora_rank + qk_rope_head_dim\n            kv_bytes = num_heads_per_page * kv_dim * get_dtype_size(kv_dtype)\n            qli_bytes = num_heads_per_page * index_head_dim * get_dtype_size(self.c8_k_cache_dtype)\n            qli_scale_bytes = num_heads_per_page * 1 * get_dtype_size(self.c8_k_scale_cache_dtype)\n            return kv_bytes + qli_bytes + qli_scale_bytes\n\n        return (\n            self.block_size\n            * self.num_kv_heads\n            * (self.head_size * get_dtype_size(self.dtype) + self.scale_dim * get_dtype_size(self.scale_dtype))\n        )",
+      "elide": ["类 docstring 中 4 条 kv_cache[i] 语义说明可保留 1-2 条要点（kv_cache[2] 从 bf16 转 int8 省显存、kv_cache[3] 存量化 scale）。", "_get_c8_k_cache_dtype/_get_c8_k_scale_cache_dtype 两个工厂函数（L21-L26）：A5 设备用 float8_e4m3fn/float32，否则 int8/float16——正文一句带过。", "sparse_kv_cache_ratio 属性（L91-L160，含 get_sparse_head_dim_virtual 内嵌函数）是各 kv_cache[i] 字节占比的虚拟维度换算，约 70 行，正文可大幅折叠，仅说明『Sparse-C8 把 3 元组 KV 扩成 4 元组（int8 key + fp16 scale），并据此重算每条 cache 的字节占比』。", "merge() classmethod（L162-L185）按 cache_dtype_str/cache_sparse_c8 一致性断言后重建 spec，保留它强制同组一致即可。", "max_memory_usage_bytes（L187-L195）保留 dcp*pcp>1 时 max_model_len 切分 + compress_ratio 这一句。"]
+    },
+    {
+      "path": "vllm_ascend/patch/platform/patch_kv_cache_interface.py",
+      "lines": "L264-L266",
+      "code": "vllm.v1.kv_cache_interface.MLAAttentionSpec = AscendMLAAttentionSpec\nvllm.v1.kv_cache_interface.SlidingWindowMLASpec = AscendSlidingWindowMLASpec\nvllm.model_executor.layers.attention.mla_attention.MLAAttentionSpec = AscendMLAAttentionSpec",
+      "elide": ["技法①整类替换的重绑点：三处——两处在 kv_cache_interface 模块（MLAAttentionSpec / SlidingWindowMLASpec），第三处是 mla_attention 模块里已 from-import 的 MLAAttentionSpec 别名（技法⑤from-import 缓存陷阱：建 spec 的调用方在 mla_attention 里持有自己的引用，只改 kv_cache_interface.MLAAttentionSpec 会漏网）。"]
+    },
+    {
+      "path": "vllm/v1/kv_cache_interface.py",
+      "lines": "L324-L355",
+      "code": "@dataclass(frozen=True, kw_only=True)\nclass MLAAttentionSpec(FullAttentionSpec):\n    # TODO(Lucas/Chen): less hacky way to do this\n    cache_dtype_str: str | None = None\n    # DeepseekV4 only fields. Non-DeepseekV4 MLA models leave these at defaults.\n    alignment: int | None = None  # Default to None for no padding.\n    compress_ratio: int = 1  # Default to 1 for no compression.\n    model_version: str | None = None\n    ...\n    @property\n    def real_page_size_bytes(self) -> int:\n        if self.cache_dtype_str == \"fp8_ds_mla\":\n            if self.model_version == \"deepseek_v4\":\n                return self.storage_block_size * 584\n            return self.block_size * 656\n        return (\n            self.storage_block_size\n            * self.num_kv_heads\n            * self.head_size\n            * get_dtype_size(self.dtype)\n        )",
+      "elide": ["原 MLAAttentionSpec 无 scale_dim / sparse_head_dim / cache_sparse_c8 / c8_* 字段——这些是 Ascend 子类为 DSA/Sparse-C8 新增的；原版 page_size_bytes 走父类 AttentionSpec.page_size_bytes（L138-L151），没有 4 元组 KV 概念。对照要点足以说明子类化的扩展面。"]
+    },
+    {
+      "path": "vllm_ascend/patch/platform/patch_kv_cache_coordinator.py",
+      "lines": "L132-L142",
+      "code": "    def _get_effective_block_size(self, kv_cache_spec: KVCacheSpec) -> int:\n        block_size = kv_cache_spec.block_size\n        if isinstance(kv_cache_spec, MambaSpec) and self.enable_caching:\n            return block_size\n        if self.dcp_world_size * self.pcp_world_size > 1:\n            block_size *= self.dcp_world_size * self.pcp_world_size\n        if hasattr(kv_cache_spec, \"compress_ratio\"):\n            compress_ratio = kv_cache_spec.compress_ratio or 1\n            compress_ratio = compress_ratio if compress_ratio >= 1 else 1\n            block_size *= compress_ratio\n        return block_size",
+      "elide": ["这是 Ascend 子类新增的核心 helper：把 spec.block_size 乘上 CP 因子（dcp*pcp）与 compress_ratio，得到『有效块大小』。原 HybridKVCacheCoordinator 没有这个方法，直接用 spec.block_size——因为原版断言 dcp==1/pcp==1。lcm_block_size、find_longest_cache_hit、末尾截断都改用 _get_effective_block_size 替换原来裸的 spec.block_size。"]
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_coordinator.py",
+      "lines": "L427-L434",
+      "code": "        self.hash_block_size = hash_block_size\n        assert all(\n            g.kv_cache_spec.block_size % hash_block_size == 0\n            for g in kv_cache_config.kv_cache_groups\n        ), \"block_size must be divisible by hash_block_size\"\n        assert dcp_world_size == 1, \"DCP not support hybrid attn now.\"\n        assert pcp_world_size == 1, \"PCP not support hybrid attn now.\"\n        self.verify_and_split_kv_cache_groups()",
+      "elide": ["对照核心：原 HybridKVCacheCoordinator.__init__ 直接断言 dcp==1/pcp==1（hybrid 不许开 context parallel）。Ascend 子类的 __init__（patch:L64-L130）去掉这两条 assert，改为保存 dcp/pcp 并在 _get_effective_block_size / _get_block_hashes 里按 CP 因子缩放块大小——这就是『CP+hybrid 前缀缓存』的解锁点。"]
+    },
+    {
+      "path": "vllm_ascend/patch/platform/patch_kv_cache_coordinator.py",
+      "lines": "L300-L368",
+      "code": "def get_kv_cache_coordinator(\n    kv_cache_config: KVCacheConfig,\n    max_model_len: int,\n    max_num_batched_tokens: int,\n    use_eagle: bool,\n    enable_caching: bool,\n    enable_kv_cache_events: bool,\n    dcp_world_size: int,\n    pcp_world_size: int,\n    hash_block_size: int,\n    eagle_attn_layer_names: list[str] | None = None,\n    metrics_collector: KVCacheMetricsCollector | None = None,\n) -> KVCacheCoordinator:\n    if _is_deepseek_v4_kv_cache_config(kv_cache_config):\n        return AscendHybridKVCacheCoordinator(...)\n\n    cp_enabled = dcp_world_size > 1 or pcp_world_size > 1\n\n    # Only CP hybrid prefix caching needs AscendHybridKVCacheCoordinator.\n    # Otherwise keep upstream coordinators (non-CP / unitary / no-prefix-cache).\n    if not cp_enabled or len(kv_cache_config.kv_cache_groups) == 1 or not enable_caching:\n        return _orig_get_kv_cache_coordinator(\n            kv_cache_config,\n            max_model_len,\n            max_num_batched_tokens,\n            use_eagle,\n            enable_caching,\n            enable_kv_cache_events,\n            dcp_world_size,\n            pcp_world_size,\n            hash_block_size,\n            metrics_collector,\n        )\n    return AscendHybridKVCacheCoordinator(...)\n\n\nvllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator = get_kv_cache_coordinator\n\n# `kv_cache_manager` imports `get_kv_cache_coordinator` with\n# `from ... import ...`, so if it was loaded before this patch runs\n# ... it keeps the old function object. Update that cached binding as well.\n_kv_cache_manager = sys.modules.get(\"vllm.v1.core.kv_cache_manager\")\nif _kv_cache_manager is not None:\n    _kv_cache_manager.get_kv_cache_coordinator = get_kv_cache_coordinator",
+      "elide": ["两处 AscendHybridKVCacheCoordinator(...) 的完整 kwargs 列表（与签名同名透传）已用 ... 省略。要点：(1) 工厂替换（技法②/③）——新 get_kv_cache_coordinator 顶替原工厂，先判 deepseek_v4，再只对『CP 开启 + 多组 + 开缓存』走 Ascend 协调器，其余情况回落 _orig_get_kv_cache_coordinator（保留上游 NoPrefixCache/Unitary/Hybrid 三分支）；(2) 关键 from-import 缓存陷阱修复（技法⑤）——kv_cache_manager 模块 `from ... import get_kv_cache_coordinator` 早绑了旧函数对象，故用 sys.modules 取到它再补绑一次。"]
+    },
+    {
+      "path": "vllm_ascend/patch/platform/patch_kv_cache_utils.py",
+      "lines": "L23-L58",
+      "code": "def _ascend_resolve_kv_cache_block_sizes(\n    kv_cache_config: KVCacheConfig,\n    vllm_config: VllmConfig,\n) -> tuple[int, int]:\n    \"\"\"Ascend-compatible resolve_kv_cache_block_sizes.\n\n    vLLM PR #40860 added a restriction that hybrid KV cache groups with\n    multiple block sizes do not support context parallelism (dcp/pcp > 1).\n    This restriction is correct for CUDA but not for Ascend, which implements\n    context parallelism for MLA and SWA-MLA layers independently.\n    ...\n    \"\"\"\n    cache_config = vllm_config.cache_config\n    dcp = vllm_config.parallel_config.decode_context_parallel_size\n    pcp = vllm_config.parallel_config.prefill_context_parallel_size\n    groups = kv_cache_config.kv_cache_groups\n\n    if len(groups) <= 1:\n        bs = cache_config.block_size * dcp * pcp\n        return bs, bs\n\n    if dcp != 1 or pcp != 1:\n        # Ascend supports CP with multiple KV cache groups; compute\n        # scheduler_block_size using the LCM of all group block sizes\n        # multiplied by the CP factors for proper alignment.\n        group_block_sizes = [g.kv_cache_spec.block_size for g in groups]\n        scheduler_block_size = math.lcm(*group_block_sizes) * dcp * pcp\n        if not cache_config.enable_prefix_caching:\n            return scheduler_block_size, scheduler_block_size\n        hash_block_size = math.gcd(*group_block_sizes)\n        return scheduler_block_size, hash_block_size\n\n    return _orig_resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)",
+      "elide": ["L250-L258 的重绑：vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes 改为本函数，并因 vllm.v1.engine.core 用 `from ... import resolve_kv_cache_block_sizes` 直接引用，额外补绑 vllm.v1.engine.core.resolve_kv_cache_block_sizes（技法⑤from-import 缓存陷阱）。dcp==pcp==1 时回落原函数，保留上游行为。"]
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L592-L603",
+      "code": "    if len(groups) <= 1:  # Single group: block_size * dcp * pcp\n        bs = cache_config.block_size * dcp * pcp\n        return bs, bs\n\n    if dcp != 1 or pcp != 1:\n        raise ValueError(\n            \"Hybrid KV cache groups with multiple block sizes do not \"\n            \"support context parallelism (dcp_world_size/pcp_world_size > 1).\"\n        )\n\n    group_block_sizes = [g.kv_cache_spec.block_size for g in groups]\n    scheduler_block_size = math.lcm(*group_block_sizes)",
+      "elide": ["对照核心（PR #40860）：原版多组 + CP>1 直接 raise ValueError 禁止；Ascend patch 把这条 raise 换成『lcm(group_block_sizes)*dcp*pcp 算 scheduler_block_size、gcd 算 hash_block_size』的真实计算——因为昇腾对 MLA / SWA-MLA 层各自独立实现了 CP。"]
+    },
+    {
+      "path": "vllm_ascend/patch/worker/patch_qwen3_next_mtp.py",
+      "lines": "L7-L50",
+      "code": "# Without this patch, it will raise an exception when initialize kv_cache.\n# TODO To remove the patch, we need check why the original bind_kv_cache raises an NotImplementedError.\ndef bind_kv_cache(\n    kv_caches: dict[str, torch.Tensor],\n    forward_context: dict[str, Attention],\n    runner_kv_caches: list[torch.Tensor],\n    num_attn_module: int = 1,\n) -> None:\n    ...\n    # Bind kv_caches to ModelRunner\n    assert len(runner_kv_caches) == 0\n\n    # Convert kv_caches dict to a list of tensors in the order of layer_index.\n    index2name = defaultdict(list)\n    for layer_name in kv_caches:\n        index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)\n\n    for layer_index in sorted(index2name.keys()):\n        layer_names = index2name[layer_index]\n        # remove some codes for the typical case of encoder-decoder model, e.g., bart.\n        layer_name = layer_names[0]\n        runner_kv_caches.append(kv_caches[layer_name])\n\n    # Bind kv_caches to forward context\n    for layer_name, kv_cache in kv_caches.items():\n        forward_context[layer_name].kv_cache = kv_cache\n\n\nutils.bind_kv_cache = bind_kv_cache",
+      "elide": ["docstring（功能 1/2 说明）可保留要点：把 kv_caches 灌进 ModelRunner 列表 + 把每个 attn 层关联到它的 KV cache。技法③方法替换重绑点在末行 utils.bind_kv_cache = bind_kv_cache。"]
+    },
+    {
+      "path": "vllm/v1/worker/utils.py",
+      "lines": "L487-L513",
+      "code": "    for layer_index in sorted(index2name.keys()):\n        layer_names = index2name[layer_index]\n        if len(layer_names) > 1:\n            # One typical case is encoder-decoder model, e.g., bart.\n            # The cross attention and self attention in the same decoder layer\n            # has different layer_name but the same layer_index.\n            ...\n            if (\n                current_platform.is_cuda_alike()\n                or current_platform.is_xpu()\n                or current_platform.is_cpu()\n            ):\n                # We know that the GPU / CPU runner is not impacted by this\n                # case. ...\n                pass\n            else:\n                raise NotImplementedError\n        for layer_name in layer_names:\n            runner_kv_caches.append(kv_caches[layer_name])\n\n    # Bind kv_caches to forward context\n    for layer_name, kv_cache in kv_caches.items():\n        forward_context[layer_name].kv_cache = kv_cache",
+      "elide": ["对照核心：原版在同一 layer_index 有多个 layer_name 时，只放行 CUDA/XPU/CPU 平台（pass），其它平台（含 NPU）走 else: raise NotImplementedError，并把该 index 下**所有** layer_name 都 append。Ascend patch 直接绕过 raise：每个 index 只取 layer_names[0] append（注释『remove some codes for the typical case of encoder-decoder model』），按单 attn 模块的常见情形处理。"]
+    },
+    {
+      "path": "vllm_ascend/worker/v2/block_table.py",
+      "lines": "L67-L77",
+      "code": "        # because we will override these attribute, delete these attribute to\n        # make sure it's collected by python gc immediately.\n        del self.slot_mappings\n        # vllm-ascend' reshape_and_cache function requires slot_mappings to be int32.\n        # so we need to redefine slot_mappings to be int32.\n        self.slot_mappings: torch.Tensor = torch.zeros(\n            self.num_kv_cache_groups,\n            self.max_num_batched_tokens,\n            dtype=torch.int32,\n            device=self.device,\n        )",
+      "elide": ["这是昇腾自有 worker 的子类覆盖（非 patch/ 目录），父类构造里 slot_mappings 默认 int64；昇腾 reshape_and_cache 算子要求 int32，故先 del 父类张量（立即 gc）再以 int32 重建。这是『硬件算子约束驱动的数据类型改写』最小样本，正文作 5 案例的收尾点名即可。"]
+    }
+  ],
+  "key_classes": [
+    {"name": "AscendMLAAttentionSpec", "file": "vllm_ascend/patch/platform/patch_kv_cache_interface.py", "responsibility": "技法①整类替换：继承 MLAAttentionSpec，为 DSA/Sparse-C8 新增 scale_dim/scale_dtype/sparse_head_dim/cache_sparse_c8/c8_* 字段，重写 page_size_bytes 支持 3→4 元组 KV（int8 key + fp16 scale），并提供 sparse_kv_cache_ratio/merge/max_memory_usage_bytes"},
+    {"name": "AscendSlidingWindowMLASpec", "file": "vllm_ascend/patch/platform/patch_kv_cache_interface.py", "responsibility": "技法①整类替换：继承 SlidingWindowMLASpec，补 cache_dtype_str/alignment/compress_ratio/model_version（DeepseekV4 用）+ storage_block_size/real_page_size_bytes/merge"},
+    {"name": "AscendHybridKVCacheCoordinator", "file": "vllm_ascend/patch/platform/patch_kv_cache_coordinator.py", "responsibility": "技法①整类替换：继承 HybridKVCacheCoordinator，去掉 dcp==1/pcp==1 断言，新增 _get_effective_block_size（block_size × CP因子 × compress_ratio）解锁 CP+hybrid 前缀缓存；find_longest_cache_hit/lcm_block_size 全改用有效块大小"},
+    {"name": "get_kv_cache_coordinator (Ascend)", "file": "vllm_ascend/patch/platform/patch_kv_cache_coordinator.py", "responsibility": "技法②/③工厂替换：先判 deepseek_v4，再只对『CP+多组+开缓存』返回 Ascend 协调器，否则回落 _orig_get_kv_cache_coordinator；末尾补绑 kv_cache_manager 的 from-import 引用（技法⑤）"},
+    {"name": "_ascend_resolve_kv_cache_block_sizes", "file": "vllm_ascend/patch/platform/patch_kv_cache_utils.py", "responsibility": "技法③方法替换：把 PR#40860『多组+CP 直接 raise』换成 lcm×dcp×pcp 算 scheduler_block_size、gcd 算 hash_block_size；双重绑 kv_cache_utils + engine.core 两处引用（技法⑤）"},
+    {"name": "bind_kv_cache (Ascend)", "file": "vllm_ascend/patch/worker/patch_qwen3_next_mtp.py", "responsibility": "技法③方法替换：重绑 vllm.v1.worker.utils.bind_kv_cache，绕过原版同 layer_index 多 layer_name 在非 CUDA 平台的 NotImplementedError，按单 attn 模块取 layer_names[0]"},
+    {"name": "AscendBlockTable.slot_mappings (int32)", "file": "vllm_ascend/worker/v2/block_table.py", "responsibility": "硬件算子约束：del 父类 int64 slot_mappings 后以 int32 重建，因 vllm-ascend reshape_and_cache 要求 int32（非 patch，子类覆盖样本）"},
+    {"name": "group_and_unify_kv_cache_specs / _get_kv_cache_groups_uniform_groups / _get_kv_cache_config_deepseek_v4", "file": "vllm_ascend/patch/platform/patch_kv_cache_utils.py", "responsibility": "DeepseekV4 专用 KV cache tensor 布局规划（技法③替换上游同名函数）——按 compress_ratio/page_size 分桶、pad 对齐使所有 cache tensor 连续。本章次要，仅点名存在与动机（昇腾要求连续布局），不逐行展开"}
+  ],
+  "data_flow": [
+    "启动期配置改写（案例1+5 的 verify_and_update_config 路线）：引擎构图前 → HybridAttentionMambaModelConfig.verify_and_update_config（被 Ascend patch 顶替）按 kernel_block_size=128 算 attn_block_size = 128 × cdiv(ssm_page, 128 × attn_token) → 写回 cache_config.block_size，并把 mamba page size pad 到与 attn page size 相等（NPU 要求 cache tensor 连续）",
+    "block size 解析（案例3 配套）：engine/core 调 resolve_kv_cache_block_sizes（被 Ascend patch 顶替）→ 多组 + CP>1 时算 lcm×dcp×pcp / gcd，而非 raise → 给出 (scheduler_block_size, hash_block_size)",
+    "协调器构造（案例3 主线）：kv_cache_manager 调 get_kv_cache_coordinator（被 Ascend patch 顶替）→ 判定 deepseek_v4 / (CP & 多组 & 缓存) → AscendHybridKVCacheCoordinator.__init__（无 dcp/pcp 断言）→ verify_and_split_kv_cache_groups 用 _get_effective_block_size 算 lcm_block_size",
+    "spec 构造（案例2）：模型层建 KV cache spec 时，类名 MLAAttentionSpec/SlidingWindowMLASpec 已被重绑为 Ascend 子类 → 走 AscendMLAAttentionSpec.page_size_bytes（Sparse-C8 时返回 4 元组字节数）",
+    "前缀缓存命中（案例3 运行期）：AscendHybridKVCacheCoordinator.find_longest_cache_hit → 不动点迭代，每类 attention 用 _get_effective_block_size 把命中长度对齐到 (block_size×CP×compress) 的倍数",
+    "KV cache 绑定（案例4）：worker 初始化 KV cache → bind_kv_cache（被 Ascend patch 顶替）→ 按 layer_index 取 layer_names[0] 填 runner_kv_caches + 给每层 attn 关联 kv_cache，绕过原 NotImplementedError",
+    "slot_mapping 生成（案例5）：AscendBlockTable 以 int32 重建 slot_mappings → compute_slot_mappings 喂给 reshape_and_cache 算子（要求 int32）"
+  ],
+  "design_decisions": [
+    {"decision": "mamba 混合模型在 NPU 把 kernel block 对齐数硬钉为 128，并把 block_size 对齐前移到 config 阶段", "why": "NPU mamba kernel 不支持 16（CUDA mamba2 后端 get_supported_kernel_block_sizes 的最小值），且昇腾硬件要求所有 cache tensor 连续，必须保证 attn_single_token_k_page_size × attn_block_size == ssm_block_page_size 严格相等", "evidence": "vllm_ascend/patch/platform/patch_mamba_config.py:L39,L75-L78 vs vllm/platforms/interface.py:L614-L644"},
+    {"decision": "用子类化扩展 MLAAttentionSpec 而非改源码，支持 DSA / Sparse-C8 的 4 元组 KV", "why": "Sparse-C8 把 indexer key 从 bf16 转 int8 省显存 + 额外存 fp16 量化 scale（kv_cache[3]），page_size_bytes 计算与原版完全不同；A5/A3 设备 dtype 还不一样（fp8 vs int8/bf16）", "evidence": "patch_kv_cache_interface.py:L29-L89 类 docstring + page_size_bytes Sparse-C8 分支"},
+    {"decision": "去掉 HybridKVCacheCoordinator 的 dcp==1/pcp==1 断言，引入 _get_effective_block_size 解锁 CP+hybrid 前缀缓存", "why": "原版禁止 hybrid 模型开 context parallel（PR#40860）；昇腾对 MLA 与 SWA-MLA 层各自独立实现了 CP，故有效块大小须乘 CP 因子与 compress_ratio 才能正确对齐命中长度", "evidence": "patch_kv_cache_coordinator.py:L132-L142 vs vllm/v1/core/kv_cache_coordinator.py:L432-L433"},
+    {"decision": "resolve_kv_cache_block_sizes 把 PR#40860 的 raise 换成真实 lcm/gcd 计算", "why": "同上——CUDA 的限制对昇腾不成立；多组 + CP 时 scheduler_block_size=lcm(blocks)×dcp×pcp、hash_block_size=gcd(blocks) 才能保持对齐", "evidence": "patch_kv_cache_utils.py:L47-L56 vs vllm/v1/core/kv_cache_utils.py:L596-L600"},
+    {"decision": "工厂 get_kv_cache_coordinator 只对必要场景接管，其余回落原工厂", "why": "最小侵入——只有 deepseek_v4 或『CP+多组+开缓存』才需要 Ascend 协调器，non-CP/单组/无缓存仍用上游成熟实现，降低维护面与回归风险", "evidence": "patch_kv_cache_coordinator.py:L313-L357"},
+    {"decision": "bind_kv_cache 直接绕过原 NotImplementedError，按单 attn 模块取首个 layer_name", "why": "原版同 layer_index 多 layer_name（encoder-decoder 交叉/自注意力）在非 CUDA 平台 raise；NPU 初始化 KV cache 会撞上，注释明确标 TODO（待查清原因后移除 patch），属『为让流程跑通而临时打补丁』", "evidence": "patch_qwen3_next_mtp.py:L7-L8 注释 + L40-L43"},
+    {"decision": "slot_mappings 在 AscendBlockTable 用 int32（先 del 再重建）", "why": "vllm-ascend reshape_and_cache 算子要求 slot_mapping 为 int32（CUDA 用 int64）；先 del 父类张量保证立即 gc 不浪费显存", "evidence": "vllm_ascend/worker/v2/block_table.py:L67-L77"},
+    {"decision": "所有重绑都覆盖 from-import 的再导出引用", "why": "技法⑤——MLAAttentionSpec 在 mla_attention 模块有别名、get_kv_cache_coordinator 被 kv_cache_manager from-import、resolve_kv_cache_block_sizes 被 engine.core from-import，只改原模块属性会被早绑的旧引用漏网", "evidence": "patch_kv_cache_interface.py:L266 / patch_kv_cache_coordinator.py:L366-L368 / patch_kv_cache_utils.py:L256-L258"}
+  ],
+  "theory": [
+    "page size 对齐恒等式（案例1）：attn_block_size = kernel_block_size × cdiv(ssm_block_page_size, kernel_block_size × attn_single_token_k_page_size)。这是把 attn 单 token K 字节数撑到刚好整除 ssm 块字节数的最小块；assert 要求 attn_single_token_k_page_size × attn_block_size == ssm_block_page_size 严格相等（否则 cache tensor 不连续，NPU 不接受）。kernel_block_size 从 CUDA 的 16 改成 128 会把 attn_block_size 抬高约 8 倍（在 cdiv 不再细分时）。",
+    "Sparse-C8 显存账（案例2）：原 3 元组 KV 全 bf16；Sparse-C8 把 indexer key（kv_cache[2]）从 bf16 降到 int8（省一半字节），再补 fp16 scale（kv_cache[3]）。page_size_bytes = kv_bytes + qli_bytes + qli_scale_bytes，其中 qli 用 c8_k_cache_dtype（A5 为 float8_e4m3fn、A3 为 int8）。A5 设备把 kv_lora+k_rope 合并成单 CKV（fp8），A3 分开（bf16）——故同一公式按 qk_rope_head_dim==0 分流。",
+    "有效块大小与命中对齐（案例3）：CP 下每个 rank 只存 max_model_len/(dcp×pcp) 的 token，但块在逻辑上仍按 block_size×dcp×pcp 对齐；find_longest_cache_hit 的命中长度必须是各类 attention 有效块大小的公倍数（lcm_block_size）的整数倍，否则无法保证每类的块边界对齐（不支持部分块命中）。compress_ratio>1（DeepseekV4 C128）再额外放大有效块。",
+    "scheduler vs hash block size（案例3）：scheduler_block_size=lcm(group_block_sizes)×dcp×pcp 是调度器对 num_computed_tokens 取整的不变量；hash_block_size=gcd(group_block_sizes) 是算 block hash 的最细粒度，要求每组 block_size 都能被它整除。CP 因子只乘进 scheduler_block_size，不进 hash_block_size。"
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {"what": "AscendMLAAttentionSpec.sparse_kv_cache_ratio 属性及其内嵌 get_sparse_head_dim_virtual（patch_kv_cache_interface.py:L91-L160）", "why_safe": "这是各 kv_cache[i] 字节占比的虚拟维度换算，A5/A3 分流细节繁复；page_size_bytes 已完整表达 Sparse-C8 显存模型，删除不影响读者理解『3→4 元组 KV』主旨。精简版保留 page_size_bytes 即可。"},
+      {"what": "DeepseekV4 专用布局函数 group_and_unify_kv_cache_specs / _get_kv_cache_groups_uniform_groups / _get_kv_cache_config_deepseek_v4 的函数体（patch_kv_cache_utils.py:L61-L247）", "why_safe": "是单一模型（DeepseekV4）的 KV cache tensor 分桶/对齐布局规划，与本章 5 个主线案例正交；保留函数名 + 一句动机（昇腾要求连续布局、按 page_size 分桶 pad）即可，逐行展开会喧宾夺主。注意 resolve_kv_cache_block_sizes 不在此列，须保留。"},
+      {"what": "patch_mamba_config.py 末尾 mamba_page_size_padded padding 百分比日志、using_kv_transfer_with_hybrid 与 mamba_cache_mode='align'/mamba_block_size 设定（L24-L25,L93-L116）", "why_safe": "是 padding 比例日志与 kv_transfer/align 模式的旁支配置，主线（kernel_block_size=128 + attn_block_size 对齐 + 写回 block_size）已完整；保留『pad mamba page size 到等于 attn page size』一句结论即可。"},
+      {"what": "AscendHybridKVCacheCoordinator.find_longest_cache_hit 内部不动点迭代的完整实现（patch_kv_cache_coordinator.py:L213-L297 的扫描/截断细节）", "why_safe": "命中扫描算法与原版同构，本章重点是『改用 _get_effective_block_size 替换裸 spec.block_size』这一处差异；保留方法签名 + _get_effective_block_size 调用点 + 末尾按有效块截断即可，逐行复述迭代收敛证明会偏题（与原版一致，非 patch 重点）。"},
+      {"what": "block_table.py compute_slot_mappings 的 triton kernel 调用体（L79 起）", "why_safe": "案例5 只演示 slot_mappings 的 int32 dtype 改写，kernel 启动细节与 dtype 主旨无关。"}
+    ],
+    "must_keep": [
+      {"symbol": "kernel_block_size", "why": "案例1 核心常量（=128），NPU 不支持 16 的落点；writer 必须讲清它替换了 CUDA 的 backend 最小 kernel block"},
+      {"symbol": "verify_and_update_config", "why": "案例1 被技法③方法替换的目标 classmethod，含 attn_block_size 对齐恒等式与 assert"},
+      {"symbol": "attn_block_size", "why": "案例1 page size 对齐结果，写回 cache_config.block_size 的值"},
+      {"symbol": "AscendMLAAttentionSpec", "why": "案例2 技法①整类替换子类，DSA/Sparse-C8 扩展载体"},
+      {"symbol": "page_size_bytes", "why": "案例2 重写的核心属性，Sparse-C8 4 元组字节模型"},
+      {"symbol": "cache_sparse_c8", "why": "案例2 Sparse-C8 开关字段，page_size_bytes 分流条件"},
+      {"symbol": "sparse_head_dim", "why": "案例2 (kv_lora_rank, qk_rope_head_dim, index_head_dim) 三元组，4 元组 KV 维度来源"},
+      {"symbol": "scale_dim", "why": "案例2 子类新增字段，非 Sparse-C8 路径 page_size_bytes 也用它"},
+      {"symbol": "AscendSlidingWindowMLASpec", "why": "案例2 第二个整类替换子类，SWA-MLA 形态"},
+      {"symbol": "AscendHybridKVCacheCoordinator", "why": "案例3 技法①整类替换子类，解锁 CP+hybrid"},
+      {"symbol": "_get_effective_block_size", "why": "案例3 解锁点核心方法：block_size × CP因子 × compress_ratio"},
+      {"symbol": "verify_and_split_kv_cache_groups", "why": "案例3 用 _get_effective_block_size 算 lcm_block_size 的方法"},
+      {"symbol": "lcm_block_size", "why": "案例3 命中长度对齐不变量"},
+      {"symbol": "find_longest_cache_hit", "why": "案例3 前缀缓存命中入口（保签名+有效块替换点）"},
+      {"symbol": "get_kv_cache_coordinator", "why": "案例3 技法②/③工厂替换函数，含 deepseek_v4 / CP 分支与回落"},
+      {"symbol": "_orig_get_kv_cache_coordinator", "why": "案例3 回落原工厂的引用，体现最小侵入"},
+      {"symbol": "_ascend_resolve_kv_cache_block_sizes", "why": "案例3 配套，把 PR#40860 的 raise 换成 lcm/gcd 计算"},
+      {"symbol": "resolve_kv_cache_block_sizes", "why": "案例3 被重绑的目标符号（kv_cache_utils + engine.core 两处）"},
+      {"symbol": "bind_kv_cache", "why": "案例4 技法③方法替换函数，绕过 NotImplementedError"},
+      {"symbol": "extract_layer_index", "why": "案例4 bind_kv_cache 里按 layer_index 分组的关键调用"},
+      {"symbol": "slot_mappings", "why": "案例5 int32 改写目标属性（del 后重建）"}
+    ]
+  },
+  "diagram_plan": [
+    {"name": "ch04-roadmap", "type": "roadmap", "spec": "复用 instances/vllm-ascend/book/assets/roadmap/roadmap.py，高亮『顶替引擎核心：KV-cache/调度/spec』节点，前接 ch03（两段式 monkey-patch 与 5 技法），后向链接 ch16/ch22（KV 管理）"},
+    {"name": "ch04-five-cases-table", "type": "table", "spec": "5 行 × 4 列表格：案例 | 原算法(vLLM) | 昇腾约束 | 重绑定手法(点名 ch03 技法)。行=① block_size 16→128 / ② MLAAttentionSpec 子类化 / ③ CP+hybrid 前缀缓存 / ④ bind_kv_cache 跳 raise / ⑤ int32 slot_mapping。用 svg-diagram 出对齐表格，避免文字越界"},
+    {"name": "ch04-sparse-c8-kv-tuple", "type": "diagram", "spec": "对比图：上半『原 3 元组 KV(全 bf16): kv_lora|k_rope|indexer_key』，下半『Sparse-C8 4 元组: kv_lora(bf16)|k_rope(bf16)|indexer_key(int8)|key_scale(fp16)』，标注 int8 省显存 + scale 补偿；A5(fp8 合并 CKV) 旁注。svg-diagram 多框对齐"},
+    {"name": "ch04-cp-hybrid-block-size", "type": "diagram", "spec": "流程图：spec.block_size →(×dcp×pcp)→(×compress_ratio)→ effective_block_size → lcm → 命中长度对齐；旁边画原版『assert dcp==1/pcp==1 → raise』被划掉。展示『去断言 + 有效块缩放』的解锁路径"}
+  ],
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_payoff": [],
+    "note": "bible.py due ch04 返回空（无应埋/应回收伏笔）。本章自身向前链接 ch16/ch22 的 KV 管理（前向引用，不展开），并复用 ch03 的 5 技法语汇（点名引用，不重讲）。"
+  }
+}
