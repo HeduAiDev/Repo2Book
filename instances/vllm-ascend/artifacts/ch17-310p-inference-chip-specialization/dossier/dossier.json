@@ -1,0 +1,283 @@
+{
+  "chapter": "ch17",
+  "title": "310P 推理芯片：受限硬件上的全栈特化",
+  "thesis": "昇腾 310P（Atlas 300I DUO，纯推理芯片，无 Triton / 不支持 MLA / KV transfer / FP32-NZ）的全栈特化不是一刀切地'把整套 Ascend 栈再子类化一层'，而是**按组件挑选继承深度**——这是更准确也更有意思的故事：(1) **主执行体走三层（vLLM → 昇腾主栈 → 310）**：`NPUModelRunner310(NPUModelRunner)`、`NPUInputBatch310(NPUInputBatch)`，而 NPUModelRunner / NPUInputBatch 自身又是 vLLM GPUModelRunner / InputBatch 的子类+猴补（ch14），故 310 是在昇腾中间层之上再继承一层。(2) **BlockTable 是特例——昇腾独立重写、310 再建其上**：昇腾主栈的 `vllm_ascend/worker/block_table.py` 是 `class BlockTable:`（**独立类，不继承 vLLM BlockTable**），只 `import` 复用 vLLM 的 Triton `_compute_slot_mapping_kernel`（worker/block_table.py:L8）；310 的 `class BlockTable(AscendBlockTable)`（_310p/block_table.py:L14，import 自 L10）再建其上。所以'vLLM BlockTable → Ascend BlockTable → 310'那条三层继承线不成立。(3) **KV 清零 / 权重加载这些与昇腾主栈无关的点，直接两层继承 vLLM 基类、跳过昇腾中间层**：`AscendKVBlockZeroer310(KVBlockZeroer)`（KVBlockZeroer 直接 from vllm.v1.worker.utils，kv_block_zeroer.py:L22/L25）、`ShardedStateLoader310(ShardedStateLoader)`（直接 from vllm.model_executor.model_loader，sharded_state_loader_310p.py:L24/L27）——中间没有昇腾层。差异始终集中在'无 Triton / 无 MLA / 受限 dtype·格式'，子类化把差异局部化、最大化复用。横切点（distributed 的 broadcast/all_reduce 模拟、attention 的 backend_map_310、ops 的 *310 变体）由 `is_310p()` 在运行期分流，集中由 platform.py 把 worker_cls 指向 NPUWorker310，链式拉起整条 310 栈。",
+
+  "code_spine": [
+    "vllm_ascend/utils.py:L768-L815  AscendDeviceType / get_ascend_device_type / is_310p —— 'Ascend310P3' SOC 字符串 → AscendDeviceType._310P，全栈分流的总开关",
+    "vllm_ascend/platform.py:L606-L607  worker_cls := NPUWorker310（is_310p 时）—— 整条 310 栈的入口选择点",
+    "vllm_ascend/platform.py:L616-L618  is_310p 时不开 custom_ops=['all']（310P 无 custom op）",
+    "vllm_ascend/platform.py:L752-L765  backend_map_310 —— attention backend 在 is_310p 时改用 AscendAttentionBackend310（无 MLA/SFA）",
+    "vllm_ascend/_310p/worker_310p.py:L48-L56  NPUWorker310.init_device → self.model_runner = NPUModelRunner310(...)",
+    "vllm_ascend/_310p/model_runner_310p.py:L60-L104  NPUModelRunner310.__init__ —— 换 NPUInputBatch310 / FRACTAL_NZ / AscendSampler310 / ngram q_len=1",
+    "vllm_ascend/_310p/npu_input_batch.py:L9-L59  NPUInputBatch310 —— 唯一改动：把 block_table 换成 _310p 的 MultiGroupBlockTable",
+    "vllm_ascend/_310p/block_table.py:L14-L88  BlockTable.compute_slot_mapping —— 用 NumPy 在 CPU 算 slot_mapping，替换基类的 Triton kernel",
+    "vllm_ascend/_310p/model_runner_310p.py:L241-L579  _prepare_inputs —— 整个 decode 元数据走 CPU NumPy + copy_to_gpu，绕开 Triton slot-mapping 与通用 NPU Add kernel",
+    "vllm_ascend/_310p/model_runner_310p.py:L703-L791  _allocate_kv_cache_tensors —— FRACTAL_NZ 格式 KV cache + block_size*head_size<=128*128 限制 + 拒绝 MLA/Sparse/KV-transfer",
+    "vllm_ascend/_310p/kv_block_zeroer.py:L25-L82  AscendKVBlockZeroer310 —— 无 Triton 的 KV block 清零，纯 tensor.zero_() 切片写",
+    "vllm_ascend/_310p/sharded_state_loader_310p.py:L27-L80  ShardedStateLoader310 —— 单 part 保存 + 生成 parameters_type_map.json 量化描述",
+    "vllm_ascend/patch/platform/patch_distributed.py:L33-L89  communication_adaptation_310p —— 310P 用 all_gather 模拟 broadcast / int64 all_reduce"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm_ascend/utils.py",
+      "lines": "L51",
+      "code": "SOC_VERSION_INFERENCE_SERIES = [\"Ascend310P3\"]",
+      "elide": [],
+      "note": "拆段1/4：310P 的 SOC 版本字符串常量（与 AscendDeviceType/is_310p 不相邻，单列）。"
+    },
+    {
+      "path": "vllm_ascend/utils.py",
+      "lines": "L768-L772",
+      "code": "class AscendDeviceType(Enum):\n    A2 = 0\n    A3 = 1\n    _310P = 2\n    A5 = 3",
+      "elide": [],
+      "note": "拆段2/4：枚举逐字（A2=0 / A3=1 / _310P=2 / A5=3，A2 是 0 不是 1，且有 A3 成员）。310P 对应 _310P=2。"
+    },
+    {
+      "path": "vllm_ascend/utils.py",
+      "lines": "L778-L786",
+      "code": "def _init_ascend_device_type():\n    global _ascend_device_type\n    from vllm_ascend import _build_info  # type: ignore\n\n    device_type = getattr(_build_info, \"__device_type__\", None)\n    if device_type is None:\n        soc_version = getattr(_build_info, \"__soc_version__\", \"ASCEND910B1\").upper()\n        device_type = \"_310P\" if \"310P\" in soc_version else \"A2\"\n    _ascend_device_type = AscendDeviceType[device_type]",
+      "elide": ["L775 的模块级 `_ascend_device_type = None` 缓存变量、L789-L809 的 check_ascend_device_type() 运行期校验可省略"],
+      "note": "拆段3/4：`device_type = \"_310P\" if \"310P\" in soc_version else \"A2\"` 这行**真实在 _init_ascend_device_type()（L778-L786）**里、读 _build_info 的 __soc_version__/__device_type__——不是 get_ascend_device_type()。这是'310P 子串 → _310P 枚举'的真正分流点（构建期烧进 _build_info，首次访问时初始化缓存）。"
+    },
+    {
+      "path": "vllm_ascend/utils.py",
+      "lines": "L812-L816",
+      "code": "def get_ascend_device_type():\n    global _ascend_device_type\n    if _ascend_device_type is None:\n        _init_ascend_device_type()\n    return _ascend_device_type",
+      "elide": [],
+      "note": "拆段4/4：get_ascend_device_type() 只做'懒初始化 + 返回缓存的 _ascend_device_type'，分流逻辑本身在 _init_ascend_device_type()。is_310p()(L122-L123)`return get_ascend_device_type() == AscendDeviceType._310P` 在其上判等，是全栈分流总开关。"
+    },
+    {
+      "path": "vllm_ascend/platform.py",
+      "lines": "L606-L618",
+      "code": "            if is_310p():\n                parallel_config.worker_cls = \"vllm_ascend._310p.worker_310p.NPUWorker310\"\n            elif ascend_config.xlite_graph_config.enabled:\n                ...\n            else:\n                parallel_config.worker_cls = \"vllm_ascend.worker.worker.NPUWorker\"\n\n        refresh_block_size(vllm_config)\n\n        # Activate custom ops for v1, except on 310P\n        if get_ascend_device_type() != AscendDeviceType._310P:\n            compilation_config.custom_ops = [\"all\"]",
+      "elide": ["xlite 分支与 refresh_block_size 内部可省略；要点：worker_cls 一旦指向 NPUWorker310，整条 310 栈被链式拉起；且 310P 不启用 custom_ops"],
+      "note": "这是'入口选择点'——单一 if 决定后面 ModelRunner310 / InputBatch310 / BlockTable310 全部被装配。"
+    },
+    {
+      "path": "vllm_ascend/platform.py",
+      "lines": "L752-L765",
+      "code": "        backend_map_310 = {\n            (\n                False,\n                False,\n            ): \"vllm_ascend._310p.attention.attention_v1.AscendAttentionBackend310\",\n            # TODO If MLA/SFA is supported in the future, consider implementing the logic described in these comments.\n            # (True, False): \"...AscendMLABackend310\",\n            # (True, True):  \"...AscendSFABackend310\",\n        }\n\n        if is_310p():\n            return backend_map_310.get(key, backend_map_310[(False, False)])\n\n        return backend_map[(attn_selector_config.use_mla, attn_selector_config.use_sparse, use_compress)]",
+      "elide": ["910B 的完整 backend_map（含 SFA/DSA）可压缩；要点：310P 的 backend_map_310 只有一个 (False,False) 条目，MLA/SFA 被注释掉=不支持"],
+      "note": "横切回收点之一：attention 维度的 310 分流。配 model_runner_310p.py L688-L690 主动拒绝 use_mla 形成闭环。"
+    },
+    {
+      "path": "vllm_ascend/_310p/worker_310p.py",
+      "lines": "L48-L56",
+      "code": "class NPUWorker310(NPUWorker):\n    def init_device(self):\n        self.device = self._init_device()\n        torch_npu.npu.set_compile_mode(jit_compile=False)\n\n        init_workspace_manager(self.device, num_ubatches=1)\n\n        self.model_runner = NPUModelRunner310(self.vllm_config, self.device)\n        logger.info_once(\"Using NPUWorker310 and NPUModelRunner310.\")",
+      "elide": ["determine_available_memory / _init_device 的 RC-device 内存细节单独讲；此处只示意 worker 子类把 runner 换成 NPUModelRunner310"],
+      "note": "NPUWorker310 是 NPUWorker 的薄子类，核心动作就是把 model_runner 换成 NPUModelRunner310（再继承一层的起点）。"
+    },
+    {
+      "path": "vllm_ascend/_310p/npu_input_batch.py",
+      "lines": "L9-L59",
+      "code": "class NPUInputBatch310(NPUInputBatch):\n    def __init__(\n        self,\n        max_num_reqs: int,\n        ... (参数与父类逐字相同)\n        kv_cache_groups: list[KVCacheGroupSpec] | None = None,\n    ):\n        super().__init__(\n            max_num_reqs=max_num_reqs,\n            ... (原样透传全部参数)\n            kv_cache_groups=kv_cache_groups,\n        )\n        self.block_table = MultiGroupBlockTable(\n            max_num_reqs=max_num_reqs,\n            max_model_len=max_model_len,\n            max_num_batched_tokens=max_num_batched_tokens,\n            pin_memory=pin_memory,\n            device=device,\n            block_sizes=block_sizes,\n            max_num_blocks=max_num_blocks_per_req,\n            num_speculative_tokens=num_speculative_tokens,\n            kernel_sizes=kernel_block_sizes,\n            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,\n            kv_cache_groups=kv_cache_groups,\n        )",
+      "elide": ["__init__ 中间透传给 super() 的参数逐字与父签名一致，正文可只摘首尾说明'原样透传'"],
+      "note": "'再向下子类化'最干净的样本：NPUInputBatch310 唯一实质改动是 __init__ 末尾用 _310p 的 MultiGroupBlockTable 覆盖父类建好的 self.block_table。其它行为全继承。这里的 MultiGroupBlockTable 是从 vllm_ascend._310p.block_table 导入的。"
+    },
+    {
+      "path": "vllm_ascend/_310p/block_table.py",
+      "lines": "L14-L88",
+      "code": "class BlockTable(AscendBlockTable):\n    def compute_slot_mapping(self, *args: Any) -> None:\n        req_indices, positions = self._normalize_slot_mapping_inputs(*args)\n        self._compute_slot_mapping_numpy(req_indices, positions)\n\n    def _compute_slot_mapping_numpy(self, req_indices: np.ndarray, positions: np.ndarray) -> None:\n        num_tokens = positions.shape[0]\n        if num_tokens == 0:\n            self.slot_mapping.copy_to_gpu(0)\n            return\n\n        if self.dcp_world_size * self.pcp_world_size > 1:\n            ... (CP/DCP 交错分支：virtual_block_size、mask、PAD_SLOT_ID，与基类 compute_slot_mapping_draft 同构)\n        else:\n            logical_block_idx = positions // self.block_size\n            block_table_indices = self._get_block_table_indices(req_indices, logical_block_idx)\n            block_numbers = self.block_table.np.ravel()[block_table_indices]\n            block_offsets = positions % self.block_size\n            np.add(block_numbers * self.block_size, block_offsets, out=self.slot_mapping.np[:num_tokens])\n\n        self.slot_mapping.copy_to_gpu(num_tokens)\n\n    def _get_block_table_indices(self, req_indices, logical_block_idx):\n        row_stride = self.max_num_blocks_per_req * self.blocks_per_phys_block\n        return req_indices * row_stride + logical_block_idx\n\n    def _normalize_slot_mapping_inputs(self, *args) -> tuple[np.ndarray, np.ndarray]:\n        if len(args) == 2:\n            req_indices, positions = args\n            return self._to_numpy(req_indices), self._to_numpy(positions)\n        if len(args) == 3:\n            num_reqs, query_start_loc, positions = args\n            query_start_loc_np = self._to_numpy(query_start_loc)[: num_reqs + 1]\n            positions_np = self._to_numpy(positions)\n            counts = np.diff(query_start_loc_np)\n            req_indices_np = np.repeat(np.arange(num_reqs, dtype=np.int64), counts)\n            ... (token 数一致性校验，不一致 raise ValueError)\n            return req_indices_np, positions_np\n        raise TypeError(\"compute_slot_mapping expects either 2 or 3 positional arguments\")\n\n    @staticmethod\n    def _to_numpy(value) -> np.ndarray:\n        if isinstance(value, np.ndarray):\n            return value.astype(np.int64, copy=False)\n        if isinstance(value, torch.Tensor):\n            if value.device.type != \"cpu\":\n                raise TypeError(\n                    \"310P slot mapping must be computed from CPU req_indices/positions; \"\n                    \"device tensor inputs would require unsupported NPU arithmetic or D2H\"\n                )\n            return value.detach().numpy().astype(np.int64, copy=False)\n        return np.asarray(value, dtype=np.int64)",
+      "elide": ["CP/DCP(dcp*pcp>1) 交错分支的逐行算式可在正文压缩为一句'与基类 compute_slot_mapping_draft 的交错算法同构'，重点讲 else 主路径；正文应同时对照基类 vllm_ascend/worker/block_table.py:L137-L160 的 Triton 版 compute_slot_mapping"],
+      "note": "核心对比：基类 compute_slot_mapping 调 _compute_slot_mapping_kernel（Triton，写 slot_mapping.gpu）；310P 子类用纯 NumPy 在 CPU 上算 block_numbers*block_size+block_offsets 再 copy_to_gpu，因为 310P 无 Triton。_to_numpy 的 'must be CPU' 守卫点明：310P 连 device 张量算术/D2H 都规避。"
+    },
+    {
+      "path": "vllm_ascend/worker/block_table.py",
+      "lines": "L137-L160",
+      "code": "    def compute_slot_mapping(\n        self,\n        num_reqs: int,\n        query_start_loc: torch.Tensor,\n        positions: torch.Tensor,\n    ) -> None:\n        num_tokens = positions.shape[0]\n        total_cp_world_size = self.pcp_world_size * self.dcp_world_size\n        total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank\n        _compute_slot_mapping_kernel[(num_reqs + 1,)](\n            num_tokens,\n            self.max_num_batched_tokens,\n            query_start_loc,\n            positions,\n            self.block_table.gpu,\n            self.block_table.gpu.stride(0),\n            self.block_size,\n            self.slot_mapping.gpu,\n            TOTAL_CP_WORLD_SIZE=total_cp_world_size,\n            TOTAL_CP_RANK=total_cp_rank,\n            CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,\n            PAD_ID=PAD_SLOT_ID,\n            BLOCK_SIZE=1024,\n        )",
+      "elide": [],
+      "note": "对照基座（Ascend 主栈，已是 vLLM Triton kernel 的复用）。310P 子类正是覆写这个方法。_compute_slot_mapping_kernel 来自 vllm.v1.worker.block_table（@triton.jit，vllm/v1/worker/block_table.py:L325）。"
+    },
+    {
+      "path": "vllm_ascend/_310p/model_runner_310p.py",
+      "lines": "L60-L104",
+      "code": "class NPUModelRunner310(NPUModelRunner):\n    \"\"\"\n    310P model runner with a distinct ACL graph capture/replay contract from 910B:\n    - Capture: ACLGraphWrapper records the full forward inside ``torch.npu.graph``.\n      310P attention calls NPU ops directly (paged / splitfuse), without mainline\n      ``full_graph_fia`` / ``full_graph_pa`` graph_task registration.\n    - Replay: refresh shared runner buffers (block_table, seq_lens, query_start_loc,\n      slot_mapping via CPU prepare + copy_to_gpu) so tensor addresses stay stable,\n      then ``aclgraph.replay()``.\n    \"\"\"\n\n    def __init__(self, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n        self.input_batch = NPUInputBatch(\n            max_num_reqs=self.max_num_reqs,\n            max_model_len=max(self.model_config.max_model_len, self.max_encoder_len),\n            ... (用 [self.block_size] / [[self.cache_config.block_size]] 重建为 310 版 input batch)\n            cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,\n        )\n        self._acl_format = ACL_FORMAT_FRACTAL_NZ\n        logger.info_once(\"Weight layout uses FRACTAL_NZ.\")\n        self.sampler = AscendSampler310()\n        if getattr(self, \"rejection_sampler\", None) is not None:\n            self.rejection_sampler = AscendRejectionSampler310(self.sampler)\n        if self.speculative_config is not None and self.speculative_config.method == \"ngram\":\n            # 310P ngram requires decode-only graph shapes to be built with q_len=1.\n            self.cudagraph_dispatcher.uniform_decode_query_len = _NGRAM_GRAPH_UNIFORM_DECODE_QUERY_LEN\n            logger.info_once(\"Ngram speculative decoding uses uniform_decode_query_len=1 for graph capture.\")",
+      "elide": ["input_batch 重建的逐个 kwargs 与父类 __init__ 内构造一致，可摘其'用 NPUInputBatch310 替换'要点；NPUInputBatch 此处是 NPUInputBatch310 的别名(import as)"],
+      "note": "再继承一层的 runner 入口：super().__init__ 后立刻用 _310p 的 NPUInputBatch310 覆盖 input_batch，并把 _acl_format 钉死为 FRACTAL_NZ、sampler 换 310 版。注意第47行 'from ... import NPUInputBatch310 as NPUInputBatch' 的别名。"
+    },
+    {
+      "path": "vllm_ascend/_310p/model_runner_310p.py",
+      "lines": "L106-L117",
+      "code": "    def _update_states(self, scheduler_output: SchedulerOutput):\n        deferred = super()._update_states(scheduler_output)\n        if scheduler_output.finished_req_ids:\n            # condense() rewrites block_table.np (move_row). Drain the previous\n            # step's ACL graph replay on the NPU stream before the condensed\n            # CPU layout is uploaded and read as attn_metadata.block_tables.\n            # Main-line Ascend relies on the end-of-_prepare_inputs Triton\n            # slot-mapping kernel (reads block_table.gpu) for stream ordering;\n            # 310P uses CPU NumPy for slot_mapping and needs this barrier on\n            # layout-change steps only.\n            torch.npu.current_stream().synchronize()\n        return deferred",
+      "elide": [],
+      "note": "把'用 CPU NumPy 替换 Triton'的连锁后果讲透：基类靠 Triton kernel(读 block_table.gpu) 天然形成流序；310P 改走 CPU，丢了这个隐式 barrier，于是在 condense()(move_row 改写 block_table.np) 发生的步骤手动 synchronize。这是'减法引出的补偿'的绝佳教学点。"
+    },
+    {
+      "path": "vllm_ascend/_310p/model_runner_310p.py",
+      "lines": "L241-L288",
+      "code": "    def _prepare_inputs(  # type: ignore[override]\n        self,\n        scheduler_output: SchedulerOutput,\n        num_scheduled_tokens: np.ndarray,\n    ) -> tuple[torch.Tensor, SpecDecodeMetadata | None, int, list[np.ndarray[Any, Any]] | None]:\n        \"\"\"\n        310P cannot use the Triton slot-mapping kernel or the generic NPU Add\n        kernels used by the base runner for decode metadata. Keep those pieces\n        on CPU and upload the prepared tensors.\n        \"\"\"\n        total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens\n        assert total_num_scheduled_tokens > 0\n        num_reqs = self.input_batch.num_reqs\n        assert num_reqs > 0\n\n        self.input_batch.block_table.commit_block_table(num_reqs)\n\n        req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)\n        ... (spec-decode 时按 scheduled_spec_decode_tokens 修正 num_valid_tokens)\n        attn_state = self._build_attn_state(num_reqs, num_scheduled_tokens, num_valid_tokens)\n\n        with_prefill = attn_state not in [AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding]\n        self.with_prefill = with_prefill\n\n        cu_num_tokens = self._get_cumsum_and_arange(num_scheduled_tokens, self.query_pos.np)\n        positions_np = self._positions_np_buf[:total_num_scheduled_tokens]\n        np.add(\n            self.input_batch.num_computed_tokens_cpu[req_indices],\n            self.query_pos.np[: cu_num_tokens[-1]],\n            out=positions_np,\n        )\n        block_table = cast(MultiGroupBlockTable310, self.input_batch.block_table)\n        block_table.compute_slot_mapping(\n            req_indices,\n            positions_np[:total_num_scheduled_tokens],\n        )",
+      "elide": ["_prepare_inputs 全长约 340 行，含 CP/PCP、prompt_embeds、async-scheduling、spec-decode 多条支路（L289-L573）。正文只需 docstring + 主干：positions 用 np.add 在 CPU 算 → block_table.compute_slot_mapping(req_indices, positions) 走 NumPy 路径 → 各 buffer copy_to_gpu。CP/spec-decode/prompt-embeds 支路标注为'与基类同构、仅把 kernel 换 CPU'即可"],
+      "note": "本章 runner 特化的主线方法。docstring 一句话点题（不能用 Triton slot-mapping、不能用通用 NPU Add kernel），落地就是大量 np.* + copy_to_gpu。must_keep compute_slot_mapping 在此被调用。"
+    },
+    {
+      "path": "vllm_ascend/_310p/model_runner_310p.py",
+      "lines": "L670-L702",
+      "code": "    def initialize_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:\n        # 310P limitation: KV transfer is not supported\n        if self.vllm_config.kv_transfer_config is not None:\n            logger.error(\"KV cache transfer is not supported.\")\n            raise ValueError(\"KV cache transfer is not supported for 310P.\")\n        if self.use_sparse:\n            logger.error(\"Deepseek Sparse Attention is not supported.\")\n            raise ValueError(\"Deepseek Sparse Attention is not supported for 310P.\")\n        if self.model_config.use_mla:\n            logger.error(\"MLAAttention is not supported.\")\n            raise ValueError(\"MLAAttention is not supported for 310P.\")\n        # Initialize the memory buffer for KV cache\n        kv_caches = self._allocate_kv_cache_tensors(kv_cache_config)\n        # Set up cross-layer KV cache sharing\n        for layer_name, target_layer_name in self.shared_kv_cache_layers.items():\n            logger.debug(\"%s reuses KV cache of %s\", layer_name, target_layer_name)\n            kv_caches[layer_name] = kv_caches[target_layer_name]\n\n        from vllm.v1.worker.utils import bind_kv_cache\n\n        bind_kv_cache(kv_caches, self.compilation_config.static_forward_context, self.kv_caches)\n        return kv_caches",
+      "elide": ["跨层 KV 共享循环可略；要点是开头三个 raise——把 310P 的能力边界写成硬失败"],
+      "note": "受限硬件最直白的体现：MLA / Sparse / KV-transfer 直接 raise ValueError。与 backend_map_310 注释掉 MLA/SFA 闭环。"
+    },
+    {
+      "path": "vllm_ascend/_310p/model_runner_310p.py",
+      "lines": "L746-L779",
+      "code": "                elif \"attn\" in layer_name and layer_name not in kv_cache:\n                    kv_cache_spec = layer_kv_cache_spec[layer_name]\n                    assert isinstance(kv_cache_spec, AttentionSpec)\n                    assert kv_cache_tensor.size % kv_cache_spec.page_size_bytes == 0\n                    num_blocks = kv_cache_tensor.size // kv_cache_spec.page_size_bytes\n                    assert num_blocks >= kv_cache_config.num_blocks\n                    # Page attention operation on 310P limits block_size * head_size <= 128 * 128\n                    supported_sizes = [\n                        support_size\n                        for support_size in self.attn_backend.get_supported_kernel_block_sizes()\n                        if support_size * kv_cache_spec.head_size <= _ATTENTION_BLOCK_SIZE_LIMIT\n                    ]\n                    if supported_sizes:\n                        block_size = supported_sizes[0]\n                        block_size_chunk = kv_cache_spec.block_size // block_size\n                        kv_cache_shape = self.attn_backend.get_kv_cache_shape(\n                            num_blocks * block_size_chunk,\n                            block_size,\n                            kv_cache_spec.num_kv_heads,\n                            kv_cache_spec.head_size,\n                        )\n                    else:\n                        kv_cache_shape = self.attn_backend.get_kv_cache_shape(\n                            num_blocks, kv_cache_spec.block_size, kv_cache_spec.num_kv_heads, kv_cache_spec.head_size\n                        )\n                    k_shape = kv_cache_shape[1:]\n                    v_shape = k_shape\n                    dtype = kv_cache_spec.dtype\n                    k_cache = torch_npu.empty_with_format(\n                        size=k_shape, dtype=dtype, device=self.device, acl_format=self._acl_format\n                    )\n                    v_cache = torch_npu.empty_with_format(\n                        size=v_shape, dtype=dtype, device=self.device, acl_format=self._acl_format\n                    )",
+      "elide": ["linear_attn(Mamba) 分支 L727-L745 可略；要点：310P 的页注意力有 block_size*head_size<=128*128 的硬约束(_ATTENTION_BLOCK_SIZE_LIMIT=128*128，L57)，并用 torch_npu.empty_with_format(acl_format=FRACTAL_NZ) 分配 KV，而非普通 torch.empty"],
+      "note": "对齐/dtype/格式受限的具体落点：_ATTENTION_BLOCK_SIZE_LIMIT 把 kernel block_size 卡到 128*128/head_size 以内；KV cache 用 FRACTAL_NZ 专用格式分配。"
+    },
+    {
+      "path": "vllm_ascend/_310p/kv_block_zeroer.py",
+      "lines": "L25-L82",
+      "code": "class AscendKVBlockZeroer310(KVBlockZeroer):\n    \"\"\"310P KV block zeroer without Triton.\n\n    Atlas 300I DUO does not support Triton. For MTP >= 2 hybrid models, newly\n    allocated attention KV blocks must be zeroed via direct tensor writes.\n    \"\"\"\n\n    def __init__(self, device: torch.device, pin_memory: bool) -> None:\n        super().__init__(device, pin_memory)\n        self._kv_tensors: list[torch.Tensor] = []\n        self._logical_page_ratio: int = 1\n\n    def init_meta(\n        self,\n        attn_groups_iter: Iterable[\"AttentionGroup\"],\n        kernel_block_sizes: list[list[int]],\n        cache_dtype: str,\n        runner_only_attn_layers: set[str],\n        static_forward_context: dict[str, Any],\n    ) -> None:\n        seen_ptrs: set[int] = set()\n        self._kv_tensors = []\n        self._logical_page_ratio = 1\n\n        for group in attn_groups_iter:\n            spec = group.kv_cache_spec\n            if not isinstance(spec, FullAttentionSpec):\n                continue\n            if group.kv_cache_group_id >= len(kernel_block_sizes):\n                continue\n            kernel_bs = kernel_block_sizes[group.kv_cache_group_id][0]\n            ratio = spec.block_size // kernel_bs\n            if not self._kv_tensors:\n                self._logical_page_ratio = ratio\n\n            for layer_name in group.layer_names:\n                if layer_name in runner_only_attn_layers:\n                    continue\n                kv_tuple = static_forward_context[layer_name].kv_cache\n                assert len(kv_tuple) == 2, \"K and V are not stored separately\"\n                for kv in kv_tuple:\n                    dp = kv.data_ptr()\n                    if dp in seen_ptrs:\n                        continue\n                    seen_ptrs.add(dp)\n                    self._kv_tensors.append(kv)\n\n    def zero_block_ids(self, block_ids: list[int]) -> None:\n        if not block_ids or not self._kv_tensors:\n            return\n\n        ratio = self._logical_page_ratio\n        for block_id in block_ids:\n            start = block_id * ratio\n            end = start + ratio\n            for kv in self._kv_tensors:\n                kv[start:end].zero_()",
+      "elide": [],
+      "note": "全长 82 行，可整段内嵌。教学对比基类 KVBlockZeroer(vllm/v1/worker/utils.py:L80)：基类用 Triton kernel + 绝对字节地址表(seg_addrs/page_size_el)；310 子类退化为收集 (k,v) 张量列表 + 逐 block 切片 .zero_()。基类 kv_cache 是单 Tensor，310 是 (k,v) 二元组(配合 _allocate 的 k_cache/v_cache 分开分配)。"
+    },
+    {
+      "path": "vllm/v1/worker/utils.py",
+      "lines": "L80-L188 (节选)",
+      "code": "class KVBlockZeroer:\n    \"\"\"Manages efficient zeroing of KV cache blocks via a Triton kernel.\"\"\"\n    ... def init_meta(...):\n        # Builds absolute-address table for the Triton zeroing kernel.\n        ... seg_addrs.append(dp + off_bytes)\n        ...\n        self._meta = (torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device), page_size_el, blk_size, len(seg_addrs))\n\n    def zero_block_ids(self, block_ids):\n        if not block_ids or self._meta is None:\n            return\n        seg_addrs, page_size_el, blk_size, n_segs = self._meta\n        ... (拷 block_ids 到 pinned→gpu，调 Triton 清零 kernel)",
+      "elide": ["完整地址表构建(stride/outer_dims/iprod)与 Triton kernel 启动细节可压缩；只需对照说明：上游靠 Triton + 绝对地址，310P 无 Triton 故退化为纯 tensor 切片"],
+      "note": "对照基座 vLLM 原版 KVBlockZeroer。证明 310 版是'去 Triton 的等价退化实现'。已逐字读过 L80-L199。"
+    },
+    {
+      "path": "vllm_ascend/_310p/sharded_state_loader_310p.py",
+      "lines": "L27-L80",
+      "code": "class ShardedStateLoader310(ShardedStateLoader):\n    def __init__(self, load_config: LoadConfig):\n        super().__init__(load_config)\n\n    @staticmethod\n    def save_model(\n        model: torch.nn.Module,\n        path: str,\n        pattern: str | None = None,\n        max_size: int | None = None,\n    ) -> None:\n        from safetensors.torch import save_file\n        from vllm.distributed import get_tensor_model_parallel_rank\n\n        rank = get_tensor_model_parallel_rank()\n        part_idx = 0\n        state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())\n\n        filename = ShardedStateLoader.DEFAULT_PATTERN.format(rank=rank, part=part_idx)\n        save_file(\n            state_dict,\n            os.path.join(path, filename),\n        )\n\n    @staticmethod\n    def generate_quant_description(\n        model: torch.nn.Module,\n        path: str,\n        quant_config: QuantizationConfig | None = None,\n    ) -> None:\n        \"\"\"Generate a mapping of parameter names to their corresponding quantization types.\"\"\"\n        quant_description = {}\n        if quant_config is None:\n            quantize_type = \"FLOAT\"\n        else:\n            try:\n                quantize_type = quant_config.quant_description.get(\"model_quant_type\", \"FLOAT\")\n            except AttributeError:\n                quantize_type = \"FLOAT\"\n        quant_description[\"model_quant_type\"] = quantize_type\n        quant_description[\"version\"] = \"1.0.0\"\n        state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())\n        for name, tensor in state_dict.items():\n            if name.endswith(\".weight\") or name.endswith(\".bias\"):\n                if tensor.dtype in [torch.int8, torch.int32, torch.int64]:\n                    quant_description[name] = quantize_type\n                else:\n                    quant_description[name] = \"FLOAT\"\n            else:\n                quant_description[name] = \"FLOAT\"\n\n        json_path = Path(path) / \"parameters_type_map.json\"\n        with json_path.open(\"w\", encoding=\"utf-8\") as f:\n            json.dump(quant_description, f, indent=2)",
+      "elide": [],
+      "note": "对照基类 ShardedStateLoader.save_model(vllm/model_executor/model_loader/sharded_state_loader.py:L178-L214)：基类支持 max_size 分多 part(part_idx 递增)；310 版无视 max_size 总是单 part(part_idx=0)，并额外产出 parameters_type_map.json(310P 的 CANN/量化加载格式需要的逐参数 dtype 描述)。save_sharded_state 在 worker_310p.py:L58-L77 串起 save_model+generate_quant_description。"
+    },
+    {
+      "path": "vllm/model_executor/model_loader/sharded_state_loader.py",
+      "lines": "L178-L214 (节选)",
+      "code": "    @staticmethod\n    def save_model(model, path, pattern=None, max_size=None):\n        from safetensors.torch import save_file\n        from vllm.distributed import get_tensor_model_parallel_rank\n        if pattern is None:\n            pattern = ShardedStateLoader.DEFAULT_PATTERN\n        rank = get_tensor_model_parallel_rank()\n        part_idx = 0\n        total_size = 0\n        state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())\n        state_dict_part: dict[str, torch.Tensor] = {}\n        for key, tensor in state_dict.items():\n            param_size = tensor.nelement() * tensor.element_size()\n            if max_size is not None and total_size + param_size > max_size:\n                ... save part, part_idx += 1, reset ...\n            state_dict_part[key] = tensor\n            total_size += param_size\n        if len(state_dict_part) > 0:\n            ... save last part ...",
+      "elide": ["分 part 写盘细节可压缩；要点：基类按 max_size 切多个 part；310 版去掉这一切，永远单 part"],
+      "note": "对照基座，证明 ShardedStateLoader310.save_model 是'去 max_size 分片 + 加量化描述'的特化。"
+    },
+    {
+      "path": "vllm_ascend/patch/platform/patch_distributed.py",
+      "lines": "L33-L89",
+      "code": "def communication_adaptation_310p():\n    def broadcast310p_wrapper(fn):\n        def broadcast310p(tensor, src=0, group=None, async_op=False, group_src=None):\n            root = group_src if group_src is not None else src\n            if tensor.device == torch.device(\"cpu\"):\n                return fn(tensor, src=root, group=group, async_op=async_op)\n            rank = torch.distributed.get_rank(group)\n            world_size = torch.distributed.get_world_size(group)\n            tensor_list = [torch.empty_like(tensor) for _ in range(world_size)]\n            tensor_list[rank] = tensor\n            torch.distributed.all_gather(tensor_list, tensor, group=group)\n            tensor[...] = tensor_list[src]\n            if async_op:\n                return NullHandle()\n            else:\n                return None\n        return broadcast310p\n\n    torch.distributed.broadcast = broadcast310p_wrapper(torch.distributed.broadcast)\n    torch.distributed.distributed_c10d.broadcast = broadcast310p_wrapper(torch.distributed.distributed_c10d.broadcast)\n\n    def all_reduce_wrapper_310p(fn):\n        def all_reduce(tensor, op=torch.distributed.ReduceOp.SUM, group=None, async_op=False):\n            if tensor.dtype != torch.int64:\n                return fn(tensor, op, group, async_op)\n            rank = torch.distributed.get_rank(group)\n            world_size = torch.distributed.get_world_size(group)\n            tensor_list = [torch.empty_like(tensor) for _ in range(world_size)]\n            tensor_list[rank] = tensor\n            torch.distributed.all_gather(tensor_list, tensor, group=group)\n            if op == torch.distributed.ReduceOp.SUM:\n                return torch.stack(tensor_list).sum(0)\n            elif op == torch.distributed.ReduceOp.MAX:\n                return torch.tensor(torch.stack(tensor_list).cpu().numpy().max(0), device=tensor.device)\n            else:\n                raise RuntimeError(f\"not implement op {op}\")\n        return all_reduce\n\n    torch.distributed.all_reduce = all_reduce_wrapper_310p(torch.distributed.all_reduce)\n    torch.distributed.distributed_c10d.all_reduce = all_reduce_wrapper_310p(torch.distributed.distributed_c10d.all_reduce)\n\n\nif get_ascend_device_type() == AscendDeviceType._310P:\n    communication_adaptation_310p()",
+      "elide": ["NullHandle 类(L25-L30)可附带一行说明（异步占位返回值）"],
+      "note": "横切回收点（ch06 点过的伏笔在此收口）：310P 的 HCCL 对 device 上的 broadcast / int64 all_reduce 支持受限，于是猴补成 all_gather 模拟——broadcast 用 all_gather 后取 src 项；int64 all_reduce 用 all_gather 后 sum/max。CPU 张量与非 int64 走原生 fn。模块尾部 if is_310P 才安装，是纯运行期分流。这段是 host 可跑的纯 Python（只要给个假 group/单卡）。"
+    }
+  ],
+
+  "key_classes": [
+    {"name": "NPUModelRunner310", "file": "vllm_ascend/_310p/model_runner_310p.py", "responsibility": "再继承 NPUModelRunner，覆写设备相关路径：换 NPUInputBatch310 / FRACTAL_NZ KV / 310 sampler；_prepare_inputs 全 CPU NumPy 算 slot_mapping & 元数据；initialize_kv_cache_tensors 拒绝 MLA/Sparse/KV-transfer + 128*128 block 约束；_update_states 在 condense 步手动 stream synchronize 补回 Triton 丢失的流序"},
+    {"name": "NPUInputBatch310", "file": "vllm_ascend/_310p/npu_input_batch.py", "responsibility": "再继承 NPUInputBatch，唯一改动：__init__ 末尾把 self.block_table 换成 _310p 的 MultiGroupBlockTable"},
+    {"name": "BlockTable (310)", "file": "vllm_ascend/_310p/block_table.py", "responsibility": "继承昇腾独立类 AscendBlockTable(vllm_ascend/worker/block_table.py 的 `class BlockTable:`，不继承 vLLM BlockTable，只 import 复用 vLLM Triton kernel)，覆写 compute_slot_mapping：用纯 NumPy 在 CPU 计算 slot_mapping(替换昇腾基类调用的 Triton _compute_slot_mapping_kernel)，_to_numpy 强制 CPU 输入"},
+    {"name": "MultiGroupBlockTable (310)", "file": "vllm_ascend/_310p/block_table.py", "responsibility": "再继承 Ascend MultiGroupBlockTable，用 310 版 BlockTable 构造每个 group，转发 compute_slot_mapping / compute_slot_mapping_draft"},
+    {"name": "AscendKVBlockZeroer310", "file": "vllm_ascend/_310p/kv_block_zeroer.py", "responsibility": "直接两层继承 vLLM 的 KVBlockZeroer(from vllm.v1.worker.utils，跳过昇腾中间层)，去 Triton：init_meta 收集 (k,v) 张量列表 + logical_page_ratio；zero_block_ids 用切片 .zero_() 直接清零(MTP>=2 hybrid 新块需清零)"},
+    {"name": "ShardedStateLoader310", "file": "vllm_ascend/_310p/sharded_state_loader_310p.py", "responsibility": "直接两层继承 vLLM 的 ShardedStateLoader(from vllm.model_executor.model_loader，跳过昇腾中间层)，save_model 永远单 part(去 max_size 分片)，额外 generate_quant_description 产出 parameters_type_map.json 供 310P/CANN 量化加载"},
+    {"name": "NPUWorker310", "file": "vllm_ascend/_310p/worker_310p.py", "responsibility": "再继承 NPUWorker，init_device 把 model_runner 换成 NPUModelRunner310；save_sharded_state 走 ShardedStateLoader310；determine_available_memory 处理 RC(共享 host/device 内存)设备"},
+    {"name": "is_310p / AscendDeviceType / get_ascend_device_type", "file": "vllm_ascend/utils.py", "responsibility": "SOC 版本字符串('Ascend310P3')→_310P 枚举，全栈横切分流的总开关"}
+  ],
+
+  "data_flow": [
+    "启动期: platform.py:check_and_update_config → is_310p() → parallel_config.worker_cls='...NPUWorker310'；并跳过 custom_ops=['all']",
+    "Worker 起: NPUWorker310.init_device → NPUModelRunner310(vllm_config, device)",
+    "Runner 构造: NPUModelRunner310.__init__ → super().__init__ → 覆盖 input_batch=NPUInputBatch310(...) → _acl_format=FRACTAL_NZ → sampler=AscendSampler310",
+    "InputBatch 构造: NPUInputBatch310.__init__ → super().__init__ → self.block_table=_310p.MultiGroupBlockTable(...) → 每 group 一个 _310p.BlockTable",
+    "Attention 后端选择: platform.get_attn_backend → is_310p() → backend_map_310 → AscendAttentionBackend310",
+    "KV 分配: NPUModelRunner310.initialize_kv_cache_tensors → 拒绝 MLA/Sparse/KV-transfer → _allocate_kv_cache_tensors → 128*128 约束选 kernel block_size → torch_npu.empty_with_format(FRACTAL_NZ) 分配 (k_cache, v_cache)",
+    "KV 清零 meta: NPUModelRunner310._init_kv_zero_meta → AscendKVBlockZeroer310.init_meta 收集 (k,v) 张量",
+    "每步前处理: NPUModelRunner310._prepare_inputs → np.repeat/np.add 在 CPU 算 req_indices/positions → block_table.compute_slot_mapping(req_indices, positions) → _compute_slot_mapping_numpy → slot_mapping.copy_to_gpu",
+    "布局变更步: _update_states → 若 finished_req_ids(触发 condense move_row) → torch.npu.current_stream().synchronize() 补流序",
+    "新块清零: AscendKVBlockZeroer310.zero_block_ids(block_ids) → 逐 block 切片 kv[start:end].zero_()",
+    "通信: 运行期 torch.distributed.broadcast/all_reduce 已被 patch_distributed.communication_adaptation_310p 替成 all_gather 模拟(仅 device 张量 / int64)",
+    "权重保存: NPUWorker310.save_sharded_state → ShardedStateLoader310.save_model(单 part) + generate_quant_description(parameters_type_map.json)"
+  ],
+
+  "design_decisions": [
+    {"decision": "310P 不重写，而是按组件挑继承深度做子类化（混合而非一刀切）：主执行体 NPUModelRunner310(NPUModelRunner)/NPUInputBatch310(NPUInputBatch) 走三层(vLLM→昇腾主栈→310)；BlockTable(AscendBlockTable) 建在'昇腾独立重写(复用 vLLM Triton kernel)'之上；AscendKVBlockZeroer310(KVBlockZeroer)/ShardedStateLoader310(ShardedStateLoader) 直接继承 vLLM 基类、跳过昇腾中间层。各类只覆写设备相关方法", "why": "Ascend 主栈已是 vLLM GPU* 的子类+猴补(ch14)；310P 与 910B 共享绝大多数控制流，差异集中在'无 Triton/无 MLA/受限 dtype·格式'，子类化把差异局部化、最大化复用——与昇腾主栈无关的点（KV 清零/权重加载）则无需经昇腾层，直接继承 vLLM 基类即可", "evidence": "vllm_ascend/_310p/model_runner_310p.py:L60(NPUModelRunner310), npu_input_batch.py:L9(NPUInputBatch310), block_table.py:L14(BlockTable(AscendBlockTable))+worker/block_table.py:L12(class BlockTable:独立类), kv_block_zeroer.py:L22/L25(KVBlockZeroer from vllm), sharded_state_loader_310p.py:L24/L27(ShardedStateLoader from vllm)"},
+    {"decision": "slot_mapping 与 decode 元数据全部退到 CPU NumPy 计算再 copy_to_gpu", "why": "310P 无 Triton，基类的 _compute_slot_mapping_kernel 与通用 NPU Add kernel 不可用", "evidence": "vllm_ascend/_310p/block_table.py:L19-L51, model_runner_310p.py:L246-L249(docstring), L278-L287"},
+    {"decision": "_to_numpy 强制要求 CPU 输入，device 张量直接 raise", "why": "310P 上 device 张量算术/D2H 不可用或代价过高，必须保证 slot_mapping 全在 host 算", "evidence": "vllm_ascend/_310p/block_table.py:L81-L87"},
+    {"decision": "在 condense（move_row 改写 block_table.np）发生的步骤手动 torch.npu.current_stream().synchronize()", "why": "基类靠步末 Triton kernel(读 block_table.gpu)隐式形成流序；310P 改 CPU NumPy 丢了这个 barrier，需在布局变更步显式补回", "evidence": "vllm_ascend/_310p/model_runner_310p.py:L106-L117"},
+    {"decision": "KV cache 用 torch_npu.empty_with_format(acl_format=FRACTAL_NZ) 分配，且 kernel block_size*head_size<=128*128", "why": "310P 始终用 FRACTAL_NZ 权重/缓存布局；其页注意力算子对 block_size*head_size 有 128*128 上限", "evidence": "vllm_ascend/_310p/model_runner_310p.py:L57(_ATTENTION_BLOCK_SIZE_LIMIT), L95-L96, L752-L779; utils.py:L218-L220(310P always NZ)"},
+    {"decision": "initialize_kv_cache_tensors 主动 raise 拒绝 MLA / Deepseek-Sparse / KV-transfer", "why": "310P 纯推理芯片不支持这些特性，把能力边界写成早失败而非静默错误", "evidence": "vllm_ascend/_310p/model_runner_310p.py:L681-L690; platform.py:L752-L760(backend_map_310 注释掉 MLA/SFA)"},
+    {"decision": "KV 清零去 Triton，退化为收集 (k,v) 张量列表 + 切片 .zero_()", "why": "Atlas 300I DUO 不支持 Triton；MTP>=2 hybrid 模型新分配 attention KV 块必须清零", "evidence": "vllm_ascend/_310p/kv_block_zeroer.py:L26-L30, L72-L82; 对照 vllm/v1/worker/utils.py:L80-L188(Triton 版)"},
+    {"decision": "ShardedStateLoader310.save_model 永远单 part 且附带 parameters_type_map.json", "why": "310P/CANN 的权重加载格式需要逐参数 dtype/量化类型描述；去掉 max_size 多 part 切分简化加载契约", "evidence": "vllm_ascend/_310p/sharded_state_loader_310p.py:L31-L80; 对照基类 L178-L214(max_size 分 part)"},
+    {"decision": "broadcast/all_reduce 用 all_gather 模拟（仅 device 张量 / 仅 int64 all_reduce），CPU/非 int64 走原生", "why": "310P 的 HCCL 对 device broadcast 与 int64 all_reduce 支持受限，用已支持的 all_gather 拼出等价语义", "evidence": "vllm_ascend/patch/platform/patch_distributed.py:L33-L89"},
+    {"decision": "is_310p() 作为全栈横切分流总开关，散落在 distributed/attention/ops/platform 各处", "why": "把 310P 改动尽量收进 _310p/，其余文件只用一个布尔分流，'keep minimal changes outside _310p'", "evidence": "vllm_ascend/utils.py:L122,L726-L742; platform.py:L606,L617,L762"}
+  ],
+
+  "theory": [
+    "FRACTAL_NZ(ACL_FORMAT=29) 是昇腾的分形 NZ 内存排布：把 [..., H, W] 重排为 16 对齐的分块以匹配 cube 单元；310P 强制 NZ(utils.py:L218-L220)，FP32 永不转(L210-L212)。对齐单位 16（aligned_16 / _round_up，utils.py:L335-L354,L249-L256）。",
+    "Block/slot 映射数学：slot = block_number*block_size + (position % block_size)，block_number = block_table[req, position//block_size]。310 NumPy 版与基类 Triton kernel 算同一公式，只是执行域从 NPU 移到 host CPU。",
+    "页注意力约束 block_size*head_size<=128*128(=16384)：从候选 kernel block sizes 中筛出满足该上限者，block_size_chunk = 逻辑 block_size // kernel block_size 用于把逻辑块拆成多个物理 kernel 块(虚拟块拆分)。",
+    "KVBlockZeroer 的 logical_page_ratio = spec.block_size // kernel_block_size：调度器给的是逻辑 block id，清零时 start=block_id*ratio，end=start+ratio，对应物理页区间。基类用绝对字节地址 page_size_el；310 版用张量切片下标 ratio。",
+    "all_gather 模拟 all_reduce 复杂度：原生 all_reduce O(N) 通信，all_gather+本地 reduce 为 O(P*N)(P=world_size)，仅用于小 int64 张量(如计数/同步标量)故可接受。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "model_runner_310p.py 中 CP/PCP 相关支路：_prepare_inputs 内 self.use_cp / self.pcp_size>1 / pcp_manager.* 全部分支(L289-L325, L357-L364, L424-L429, L518-L520, L542-L544, L562-L572)", "why_safe": "CP(context parallel) 是正交特性，与'310P 子类化'主线无关；精简版以单卡 dcp=pcp=1 路径讲清 slot_mapping/positions 主干即可，删去不影响控制流可读性"},
+      {"what": "_prepare_inputs 内 prompt_embeds / inputs_embeds 填充支路(L337-L381)、async-scheduling 的 num_accepted_tokens / prev_positions / update_num_computed_tokens_for_batch_change 支路(L438-L477, L499-L511)", "why_safe": "这些是与多模态/异步调度正交的可选支路，非 310P 特化本身；保留主干 positions→slot_mapping→copy_to_gpu 已能说明'CPU NumPy 替换 Triton'立意"},
+      {"what": "_prepare_inputs 内 spec-decode 完整分支(L513-L551)与 lmhead_tp / lora 分支(L555-L560)", "why_safe": "spec-decode(MTP/ngram)是 Part 另章主题；本章只需 use_spec_decode=False 主路径(logits_indices=query_start_loc.gpu[1:num_reqs+1]-1)"},
+      {"what": "model_runner_310p.py 的 ngram/mtp 图捕获相关方法 temporary_modify_uniform_decode_query_len / _determine_batch_execution_and_padding / _build_attention_metadata / _pad_query_start_loc_for_fia / _dummy_run / _check_and_update_cudagraph_mode(L119-L228, L581-L658)。**注意：_build_attn_state(L229-L239) 不在删除范围、须保留(或保留为 stub)**——它被保留的 _prepare_inputs 主路径调用(L271 `attn_state = self._build_attn_state(...)`)且出现在保留的 embed excerpt(L241-L288)，删了调用方还在会留悬空引用。删除范围因此止于 L228(_pad_query_start_loc_for_fia 末)，跳过 L229-L239。", "why_safe": "这些是 ACL graph 捕获/spec-decode 的细节覆写，与本章四大主线(输入批/runner设备路径/权重/KV清零)关系弱；精简版保留 __init__ / _update_states / _build_attn_state / _prepare_inputs(主干) / initialize_kv_cache_tensors / _allocate_kv_cache_tensors / _init_kv_zero_meta / _prepare_input_ids 即可。(注：_get_cumsum_and_arange 也在 _prepare_inputs 保留路径被调，但它继承自父类、本文件未定义，安全、不动)"},
+      {"what": "_allocate_kv_cache_tensors 中 linear_attn(Mamba)分支(L727-L745)", "why_safe": "Mamba/linear attention 是另一类 KV，与 310P 的 attention KV(FRACTAL_NZ + 128*128 约束)主线正交；保留 elif 'attn' 分支足以讲清格式/对齐约束"},
+      {"what": "block_table.py BlockTable._compute_slot_mapping_numpy 的 dcp*pcp>1 交错分支(L25-L43)", "why_safe": "CP 交错(virtual_block_size/mask/PAD_SLOT_ID)与单卡主线正交，且与基类 compute_slot_mapping_draft 同构；精简版保留 else 主分支(L44-L49)即可演示 NumPy slot_mapping"},
+      {"what": "MultiGroupBlockTable.__init__ 中 kv_cache_groups is None 的备用构造分支(L142-L158)与 compute_slot_mapping_draft(L187-L202)", "why_safe": "compute_slot_mapping 的转发逻辑已足以说明'多 group 转发到 310 BlockTable'；draft 版与 spec-decode 绑定，可随 spec-decode 一并略去"},
+      {"what": "worker_310p.py 的 determine_available_memory / _init_device / _warm_up_atb / _is_rc_device(L34-L45, L79-L192)", "why_safe": "RC 设备内存探测/分布式初始化是 worker 启动细节，非本章'子类化'立意；保留 init_device + save_sharded_state 即可展示 worker 如何接上 NPUModelRunner310 与 ShardedStateLoader310"}
+    ],
+    "must_keep": [
+      {"symbol": "NPUModelRunner310", "why": "本章 runner 特化主角，class XXX310(AscendXXX) 范式核心"},
+      {"symbol": "NPUInputBatch310", "why": "'唯一改动=换 block_table'的最干净子类化样本"},
+      {"symbol": "MultiGroupBlockTable", "why": "NPUInputBatch310 装配的 310 版多 group 块表"},
+      {"symbol": "compute_slot_mapping", "why": "310 BlockTable 覆写的核心方法，CPU NumPy vs 基类 Triton 的对比落点；_prepare_inputs 调用它"},
+      {"symbol": "_compute_slot_mapping_numpy", "why": "NumPy 实现本体，读者要看到 block_numbers*block_size+block_offsets 在 CPU 算"},
+      {"symbol": "_to_numpy", "why": "'必须 CPU 输入'守卫，点明 310P 规避 device 算术/D2H"},
+      {"symbol": "_prepare_inputs", "why": "runner 设备路径特化主线方法，docstring 点题(无 Triton slot-mapping/无通用 NPU Add)"},
+      {"symbol": "_build_attn_state", "why": "被保留的 _prepare_inputs 主路径调用(L271)且出现在保留 excerpt(L241-288)，删之则悬空引用——须保留(或保留为 stub)"},
+      {"symbol": "_update_states", "why": "讲'CPU 替换 Triton 的连锁后果'：手动 stream synchronize 补流序"},
+      {"symbol": "initialize_kv_cache_tensors", "why": "受限硬件能力边界(拒绝 MLA/Sparse/KV-transfer)的落点"},
+      {"symbol": "_allocate_kv_cache_tensors", "why": "FRACTAL_NZ 分配 + 128*128 block 约束的具体实现"},
+      {"symbol": "_ATTENTION_BLOCK_SIZE_LIMIT", "why": "128*128 受限约束常量，dtype/对齐主题的可检测符号"},
+      {"symbol": "ACL_FORMAT_FRACTAL_NZ", "why": "310P 权重/KV 布局格式，受限格式主题"},
+      {"symbol": "_acl_format", "why": "runner 把格式钉死为 FRACTAL_NZ 的字段"},
+      {"symbol": "_init_kv_zero_meta", "why": "runner 装配 310 版 KV zeroer 的挂点"},
+      {"symbol": "AscendKVBlockZeroer310", "why": "KV 清零主角，去 Triton 退化实现"},
+      {"symbol": "init_meta", "why": "收集 (k,v) 张量 + logical_page_ratio"},
+      {"symbol": "zero_block_ids", "why": "切片 .zero_() 清零本体，对比基类 Triton"},
+      {"symbol": "_logical_page_ratio", "why": "block_size//kernel_bs 比例，逻辑块→物理页区间换算"},
+      {"symbol": "ShardedStateLoader310", "why": "权重加载适配主角"},
+      {"symbol": "save_model", "why": "单 part 保存(去 max_size 分片)的覆写"},
+      {"symbol": "generate_quant_description", "why": "parameters_type_map.json 量化描述生成，310P 加载格式适配"},
+      {"symbol": "NPUWorker310", "why": "整条 310 栈入口 worker 子类，init_device 换 runner"},
+      {"symbol": "is_310p", "why": "全栈横切分流总开关"},
+      {"symbol": "communication_adaptation_310p", "why": "横切回收：distributed broadcast/all_reduce 模拟(ch06 伏笔收口)"},
+      {"symbol": "broadcast310p", "why": "all_gather 模拟 broadcast 本体"},
+      {"symbol": "all_reduce", "why": "all_gather 模拟 int64 all_reduce 本体(patch 内闭包名)"},
+      {"symbol": "backend_map_310", "why": "横切回收：attention 后端 310 分流(MLA/SFA 注释掉=不支持)"}
+    ]
+  },
+
+  "diagram_plan": [
+    {
+      "name": "inheritance-depth-by-component",
+      "spec": "按继承深度分三组的纵向图(svg-diagram)，立意=310P 按组件挑继承深度（不是一刀切再子类化一层）。**组1·三层(vLLM → 昇腾主栈 → 310)**：vLLM GPUModelRunner / InputBatch（顶）→ 昇腾 NPUModelRunner / NPUInputBatch（中，标注'继承+猴补 ch14'）→ 310 NPUModelRunner310 / NPUInputBatch310（底，标注'再继承一层'）；两条实线继承箭头。**组2·BlockTable 特例(昇腾独立重写、310 再建其上)**：vLLM 只贡献 Triton kernel `_compute_slot_mapping_kernel`（顶，用**虚线箭头=import 复用、非继承**指向中层）→ 昇腾 `class BlockTable:`（中，标注'独立类，不继承 vLLM BlockTable'）→ 310 `BlockTable(AscendBlockTable)`（底，实线继承）。**组3·两层直继承(跳过昇腾中间层)**：vLLM KVBlockZeroer / ShardedStateLoader（顶）—**中层留空并标注'(无昇腾中间层)'**—直接实线继承到 310 AscendKVBlockZeroer310 / ShardedStateLoader310（底）。每条竖列底部标注'310 这层改了什么'(NPUModelRunner310: Triton→CPU NumPy + FRACTAL_NZ / NPUInputBatch310: 换 _310p MultiGroupBlockTable / BlockTable310: Triton kernel→NumPy slot_mapping / AscendKVBlockZeroer310: 切片 zero_ 去 Triton / ShardedStateLoader310: 单 part + parameters_type_map.json)。关键视觉：用'箭头是否经过中层'与'实线/虚线'区分三种继承深度。",
+      "roadmap_highlight": "ch17 _310p 全栈特化(Part IV 收官)"
+    },
+    {
+      "name": "slot-mapping-triton-vs-numpy",
+      "spec": "并排对比图：左=基类路径(positions/query_start_loc on NPU → _compute_slot_mapping_kernel[Triton] → slot_mapping.gpu)，右=310 路径(req_indices/positions on CPU → np.add(block_numbers*block_size+offsets) → slot_mapping.np → copy_to_gpu)。底部加一条注:_update_states 在 condense 步补 stream.synchronize() 因右路丢了 Triton 隐式流序。",
+      "roadmap_highlight": "block_table.py / model_runner_310p._prepare_inputs"
+    },
+    {
+      "name": "310p-horizontal-cuts",
+      "spec": "中心节点 is_310p() 向外辐射到 4 个横切域：platform(worker_cls=NPUWorker310 / 关 custom_ops) / attention(backend_map_310) / distributed(broadcast·all_reduce all_gather 模拟) / ops(*310 变体 + REGISTERED_ASCEND_OPS 替换)。强调'差异收进 _310p/，外部只留一个布尔分流'。",
+      "roadmap_highlight": "横切回收：patch_distributed / backend_map_310 / utils.is_310p"
+    },
+    {
+      "name": "kv-cache-310-constraints",
+      "spec": "KV cache 分配流程图：kv_cache_spec → 拒绝 MLA/Sparse/KV-transfer(raise) → 筛 kernel block_size(block_size*head_size<=128*128) → torch_npu.empty_with_format(FRACTAL_NZ) 得 (k_cache,v_cache) → AscendKVBlockZeroer310 收集 → zero_block_ids 切片清零。标注 dtype/对齐/格式三处受限。",
+      "roadmap_highlight": "initialize_kv_cache_tensors / _allocate_kv_cache_tensors / kv_block_zeroer"
+    }
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recover": [],
+    "note": "bible.py due ch17 返回空(应埋/应回收均无条目)。但章节立意明确点名两处需在正文回收的伏笔：(1) ch06 点过的 'patch_distributed 仅 310P 的 broadcast/all_reduce 模拟' —— 本章 communication_adaptation_310p 收口；(2) ch14 'NPUModelRunner 继承 GPUModelRunner+猴补' 路线 —— 本章作为'昇腾自己的栈被再继承一层'的呼应收尾(Part IV 收官)。建议 writer 显式回指 ch06/ch14。"
+  }
+}

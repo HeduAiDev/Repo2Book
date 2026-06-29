@@ -30,6 +30,7 @@ def lint_structure(md_path: str) -> dict:
         (r"instances/[\w.-]+/source", "出现脚手架路径 instances/<instance>/source（应用规范源码路径，如 vllm/…）"),
         (r"\bCell\s*\d+\b", "出现 'Cell N' 脚手架标题（应用自然标题）"),
         (r"impl-notes\.md|dossier", "引用内部脚手架文件（impl-notes.md/dossier）"),
+        (r"must_keep|subtraction_plan|embed_excerpt", "引用内部 dossier 机制术语（must_keep/subtraction_plan/embed_excerpt——读者视角不该出现）"),
         (r"详[见细]文档|完整文档见|这里只?截取", "提到出版物中不存在的外部文档/截取说明"),
     ]
     for pat, msg in scaffold:

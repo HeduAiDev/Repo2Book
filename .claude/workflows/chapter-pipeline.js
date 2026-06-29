@@ -14,16 +14,16 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch16',
-  slug: 'ch16-kv-cache-allocation-reshape-bind',
+  chapter_id: 'ch17',
+  slug: 'ch17-310p-inference-chip-specialization',
   instance: 'vllm-ascend',
-  focus: 'KV cache 在昇腾上的落地：分配、reshape 与绑定——补全执行脊柱的**内存几何面**（ch13 算预算、ch15 跑前向，本章管 KV 张量怎么在 NPU 显存里摆）。主线顺着 KV cache 的物化走：**initialize_kv_cache_tensors** → **_allocate_kv_cache_tensors**（昇腾内存几何差异：int8 cache、sparse-c8 indexer tensors、内存对齐 _align_memory/_align_up——为什么昇腾要对齐、对齐到多少）→ **_reshape_kv_cache_tensors**（NPU 布局调整 _adjust_kv_layout——昇腾 KV 物理布局与 GPU 的差异）→ **bind**（按模型特化：DeepSeek-V4 层序 / longcat 双 module / hamming sparse）。辅以 get_kv_cache_spec 与 may_reinitialize_input_batch。**核心立意**：讲清昇腾在「KV 显存几何」上相对基座做了哪些非改不可的事（int8 量化 KV、对齐约束、布局重排），对照基座 gpu_model_runner.py 的同名方法看差异。交叉引用：KV cache spec 的 patch（AscendMLAAttentionSpec/page_size_bytes 等）已在 ch04 讲过、此处回指；KV cache 的运行期管理（block 分配/前缀缓存）留 ch22。横切点名：具体 attention 后端如何用这些 KV 张量留 Part V（ch18+）。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/v1/worker/gpu_model_runner.py（initialize/_allocate/_reshape KV cache 同名方法——昇腾覆写它们改内存几何）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（分配/对齐算术 _align_up、reshape 维度推导、bind 按模型分派是纯 Python，可跑；真实 NPU 显存分配/torch_npu 布局不真跑）】',
-  highlight: 'ch16',
+  focus: '310P 推理芯片：受限硬件上的全栈特化——Part IV 收官。昇腾 310P 是**纯推理芯片**（无 Triton / 不支持 MLA / 无 KV transfer / 显存与权重格式受限），_310p/ 对主 Ascend 执行栈做**全栈特化**以适配。**核心立意（已按真实继承结构校正）**：310P 不是一刀切「整套再子类化一层」，而是**按组件挑继承深度**——(1) 主执行体走三层（vLLM → 昇腾主栈 → 310）：NPUModelRunner310(NPUModelRunner)、NPUInputBatch310(NPUInputBatch)；(2) BlockTable 是特例——昇腾 worker/block_table.py 是独立类（不继承 vLLM BlockTable、只 import 复用 vLLM Triton kernel），310 再建其上；(3) 与昇腾主栈无关的点直接两层继承 vLLM 基类、跳过昇腾中间层：AscendKVBlockZeroer310(KVBlockZeroer)、ShardedStateLoader310(ShardedStateLoader)。与 ch14 NPUModelRunner「继承 + 猴补」路线呼应。主线四块：**(1) 输入批/块表子类化**——block_table.py / npu_input_batch.py 子类化 vLLM 输入批与块表，适配 310P 受限 dtype/对齐；**(2) ModelRunner 特化**——model_runner_310p.py 子类 NPUModelRunner、只改设备相关路径；**(3) 权重加载适配**——sharded_state_loader_310p.py 适配 310P 权重分片加载格式；**(4) KV block 清零**——kv_block_zeroer.py 处理 310P 的 KV block 清零。**横切回收**：310P 散落在分布式（patch_distributed 仅 310P 的 broadcast/all_reduce 模拟，ch06 点过）、attention（backend_map_310）、算子（各种 *310 变体）的横切点，本章集中收口讲清「为什么 310P 要在这些点各打一个补丁」。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/v1/worker/gpu_model_runner.py 与 gpu_input_batch.py 与 block_table.py（昇腾 310P 子类化的最终基座）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（子类化覆写点 / dtype·对齐约束 / 权重分片重排 / block 清零是纯 Python，可跑；真实 310P 算子/显存不真跑）】',
+  highlight: 'ch17',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm-ascend/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
-  skip_dossier: false,
+  skip_dossier: true,
   skip_impl: false,
-  paths: ['vllm_ascend/worker/model_runner_v1.py'],
+  paths: ['vllm_ascend/_310p/model_runner_310p.py', 'vllm_ascend/_310p/block_table.py', 'vllm_ascend/_310p/npu_input_batch.py', 'vllm_ascend/_310p/sharded_state_loader_310p.py', 'vllm_ascend/_310p/kv_block_zeroer.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
