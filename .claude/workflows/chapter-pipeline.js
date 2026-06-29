@@ -14,16 +14,16 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch17',
-  slug: 'ch17-310p-inference-chip-specialization',
+  chapter_id: 'ch18',
+  slug: 'ch18-attention-backend-selection',
   instance: 'vllm-ascend',
-  focus: '310P 推理芯片：受限硬件上的全栈特化——Part IV 收官。昇腾 310P 是**纯推理芯片**（无 Triton / 不支持 MLA / 无 KV transfer / 显存与权重格式受限），_310p/ 对主 Ascend 执行栈做**全栈特化**以适配。**核心立意（已按真实继承结构校正）**：310P 不是一刀切「整套再子类化一层」，而是**按组件挑继承深度**——(1) 主执行体走三层（vLLM → 昇腾主栈 → 310）：NPUModelRunner310(NPUModelRunner)、NPUInputBatch310(NPUInputBatch)；(2) BlockTable 是特例——昇腾 worker/block_table.py 是独立类（不继承 vLLM BlockTable、只 import 复用 vLLM Triton kernel），310 再建其上；(3) 与昇腾主栈无关的点直接两层继承 vLLM 基类、跳过昇腾中间层：AscendKVBlockZeroer310(KVBlockZeroer)、ShardedStateLoader310(ShardedStateLoader)。与 ch14 NPUModelRunner「继承 + 猴补」路线呼应。主线四块：**(1) 输入批/块表子类化**——block_table.py / npu_input_batch.py 子类化 vLLM 输入批与块表，适配 310P 受限 dtype/对齐；**(2) ModelRunner 特化**——model_runner_310p.py 子类 NPUModelRunner、只改设备相关路径；**(3) 权重加载适配**——sharded_state_loader_310p.py 适配 310P 权重分片加载格式；**(4) KV block 清零**——kv_block_zeroer.py 处理 310P 的 KV block 清零。**横切回收**：310P 散落在分布式（patch_distributed 仅 310P 的 broadcast/all_reduce 模拟，ch06 点过）、attention（backend_map_310）、算子（各种 *310 变体）的横切点，本章集中收口讲清「为什么 310P 要在这些点各打一个补丁」。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/v1/worker/gpu_model_runner.py 与 gpu_input_batch.py 与 block_table.py（昇腾 310P 子类化的最终基座）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（子类化覆写点 / dtype·对齐约束 / 权重分片重排 / block 清零是纯 Python，可跑；真实 310P 算子/显存不真跑）】',
-  highlight: 'ch17',
+  focus: 'Part V 开篇与注意力总入口：昇腾如何接进 vLLM 的注意力后端选择——OOT 插件契约全貌。主线：**(1) 后端路由**——NPUPlatform.get_attn_backend_cls 按 (use_mla, use_sparse, use_compress) 三元 key 路由到 4 个昇腾后端类（AscendMLABackend / AscendAttentionBackend / AscendSFABackend / AscendDSABackend——MLA/标准 MHA/稀疏 SFA/DSA）；**(2) 注册进 vLLM**——register_backend(_Backend.CUSTOM, "ASCEND") 把后端注进 vLLM backend registry；**(3) 伪装 HACK**——get_name() **故意返回 "FLASH_ATTN"** 绕过 vLLM model-runner 里的 backend name 断言（讲清这个 hack 为何必要、绕的是哪条断言）；**(4) 静态契约**——v1 后端类契约就 4 个 @abstractmethod（get_name/get_impl_cls/get_builder_cls/get_kv_cache_shape），外加可覆写的 get_supported_kernel_block_sizes 默认方法；昇腾还自带 swap_blocks/copy_blocks（v0 遗留、**非 v1 契约要求**，基座 v1 注意力层根本没有这两个方法）——讲清「哪些是必须实现的契约、哪些是昇腾额外保留的」；**(5) 运行期分流**——get_impl_cls / get_builder_cls 在 enable_cp()（上下文并行）下的运行期选择。**核心立意**：讲清「一个 OOT 后端要接进 vLLM 注意力框架，需要实现/伪装哪些契约点」——这是 Part V 五章（本章选择 → ch19 MHA → ch20 MLA → ch21 稀疏 → ch22 KV 管理）的总入口，4 个后端实体留各章展开（本章只讲选择与契约、不展开算子）。回收 ch15 留的「注意力后端实体留 ch18+」(f9)的「后端选择」部分。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/v1/attention/backends/registry.py（register_backend）与 utils.py（AttentionBackend 抽象契约）与 flash_attn.py（FlashAttentionBackend 样板——昇腾 get_name 伪装成它）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（三元 key 路由表 / register_backend 注册 / get_name 伪装 / 静态契约方法是纯 Python，可跑；真实注意力算子不真跑）】',
+  highlight: 'ch18',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm-ascend/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: true,
   skip_impl: false,
-  paths: ['vllm_ascend/_310p/model_runner_310p.py', 'vllm_ascend/_310p/block_table.py', 'vllm_ascend/_310p/npu_input_batch.py', 'vllm_ascend/_310p/sharded_state_loader_310p.py', 'vllm_ascend/_310p/kv_block_zeroer.py'],
+  paths: ['vllm_ascend/platform.py', 'vllm_ascend/attention/attention_v1.py', 'vllm_ascend/attention/abstract.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'

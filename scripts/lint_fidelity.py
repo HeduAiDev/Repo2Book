@@ -20,6 +20,31 @@ from pathlib import Path
 MIN_VLLM_REFS = 5
 INVENTION_MARKERS = ("# ADDED", "# TOY", "# FAKE", "# INVENTED")
 
+# 真实源码前缀：活动实例的规范前缀(如 vllm_ascend) + 对照基座前缀(如 vllm)。
+# 与 lint_source_grounding.py 保持一致——off-spine 实例章节的「真实源码」是本仓规范前缀，
+# 不只是基座 vllm/。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    import instance as _instance
+    _PREFIX = _instance.canonical_prefix()
+    _BASE_PREFIX = None
+    try:
+        _root = json.load(open(Path(__file__).resolve().parent.parent / "repo2book.json"))
+        _dep = (_root.get("instances", {}).get(_instance.active_name(), {}) or {}).get("depends_on")
+        if _dep:
+            _BASE_PREFIX = json.load(open(
+                Path(__file__).resolve().parent.parent / "instances" / _dep / "repo2book.json"
+            )).get("source", {}).get("canonical_prefix") or _dep
+    except Exception:
+        _BASE_PREFIX = None
+except Exception:
+    _PREFIX, _BASE_PREFIX = "vllm", None
+_SRC_PREFIXES = [p for p in (_PREFIX, _BASE_PREFIX) if p]
+# 长前缀优先，避免 vllm 抢先匹配 vllm_ascend（其实前缀后强制 '/'，二者互斥，但仍按长度排序更稳）
+_SRC_REF_RE = re.compile(
+    r"(?:" + "|".join(re.escape(p) for p in sorted(_SRC_PREFIXES, key=len, reverse=True)) + r")/[\w/]+\.py"
+)
+
 
 def _spans_missing_source(pyfile: Path):
     src = pyfile.read_text(encoding="utf-8")
@@ -45,7 +70,8 @@ def lint_fidelity(chapter_dir: str) -> dict:
     narrative = d / "narrative" / "chapter.md"
     res = {"missing_source": [], "invention": [], "narrative_grounding": [],
            "over_subtraction": [], "no_subtraction": []}
-    pyfiles = [p for p in impl.glob("*.py") if p.name != "__init__.py"] if impl.exists() else []
+    # rglob：递归扫子目录——与真实源码同构的 backend/ 等子目录布局应被支持（顶层 glob 会漏判）。
+    pyfiles = [p for p in impl.rglob("*.py") if p.name != "__init__.py"] if impl.exists() else []
     subtraction_seen = False
     for p in pyfiles:
         text = p.read_text(encoding="utf-8")
@@ -59,13 +85,13 @@ def lint_fidelity(chapter_dir: str) -> dict:
         res["no_subtraction"].append("  无任何 # SUBTRACTED: 标记（只做减法应有删除注释）")
     if narrative.exists():
         nt = narrative.read_text(encoding="utf-8")
-        vllm_refs = len(re.findall(r"vllm/[\w/]+\.py", nt))
+        vllm_refs = len(_SRC_REF_RE.findall(nt))
         comp_refs = len(re.findall(r"implementation/[\w/]+\.py", nt))
         if vllm_refs < MIN_VLLM_REFS:
-            res["narrative_grounding"].append(f"  真实 vllm/ 引用仅 {vllm_refs} 处（需 >= {MIN_VLLM_REFS}）")
+            res["narrative_grounding"].append(f"  真实源码引用仅 {vllm_refs} 处（需 >= {MIN_VLLM_REFS}）")
         if comp_refs > vllm_refs:
             res["narrative_grounding"].append(
-                f"  叙事引用精简版({comp_refs}) 多于真实 vllm/({vllm_refs}) — 喧宾夺主")
+                f"  叙事引用精简版({comp_refs}) 多于真实源码({vllm_refs}) — 喧宾夺主")
 
     # 过度删减/误删：dossier 声明的 must_keep 符号必须出现在精简版
     dossier = d / "dossier" / "dossier.json"

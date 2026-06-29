@@ -1,0 +1,152 @@
+{
+  "chapter": "ch18",
+  "title": "Part V 开篇与注意力总入口：昇腾如何接进 vLLM 的注意力后端选择——OOT 插件契约全貌",
+  "scope_note": "本章只讲『一个 OOT 后端要接进 vLLM 注意力框架需要实现/伪装哪些契约点』——后端选择(路由) + 注册 + get_name 伪装 + 静态契约 + 运行期分流。4 个昇腾后端实体(AscendMLABackend/AscendAttentionBackend/AscendSFABackend/AscendDSABackend)留 ch19-22 展开算子，本章只讲『选择与契约』，不展开 forward 内核。",
+
+  "code_spine": [
+    "vllm/v1/attention/selector.py:L98-L136  —— vLLM 选后端总入口：get_attn_backend → _cached_get_attn_backend → current_platform.get_attn_backend_cls(...) 拿到一个『点分类路径字符串』→ resolve_obj_by_qualname() 解析成后端类。这是 OOT 后端被接进来的真正解析路径。",
+    "vllm_ascend/platform.py:L738-L765  —— NPUPlatform.get_attn_backend_cls：用 (use_mla, use_sparse, use_compress) 三元 key 查 backend_map，返回 4 个昇腾后端的点分路径之一（外加 FA3 特例与 310p 特例两条可省略分支）。",
+    "vllm_ascend/platform.py:L767-L792  —— _validate_fa3_backend：FLASH_ATTN 被显式选中且满足训推一致场景时才走 FA3 后端（可省略分支，本章只点名）。",
+    "vllm_ascend/attention/attention_v1.py:L73-L82  —— @register_backend(AttentionBackendEnum.CUSTOM, \"ASCEND\") 装饰 AscendAttentionBackend(AttentionBackend)；get_name() 故意在 V2 model-runner 下返回 'FLASH_ATTN' 绕过名字断言。",
+    "vllm_ascend/attention/attention_v1.py:L84-L140  —— 静态/运行期方法：get_impl_cls/get_builder_cls(按 enable_cp() 分流，v1 @abstractmethod) + get_kv_cache_shape(v1 @abstractmethod) + get_supported_kernel_block_sizes(覆写基类默认) + swap_blocks/copy_blocks(昇腾自带、v0 遗留，非 v1 基类契约)。",
+    "vllm/v1/attention/backend.py:L55-L96  —— AttentionBackend 抽象基类：get_name/get_impl_cls/get_builder_cls/get_kv_cache_shape 四个 @abstractmethod 即昇腾后端必须实现的契约点。",
+    "vllm/v1/attention/backends/registry.py:L88-L90,L203-L256  —— AttentionBackendEnum.CUSTOM=None 占位 + register_backend() 把 override 写进 _ATTN_OVERRIDES。",
+    "vllm/v1/attention/backends/flash_attn.py:L105-L107  —— FlashAttentionBackend.get_name()(@staticmethod) 返回 'FLASH_ATTN'：昇腾伪装的样板。"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/attention/selector.py",
+      "lines": "L105-L136",
+      "what": "vLLM 选后端的真正解析路径：平台返回点分类路径字符串 → resolve_obj_by_qualname。这解释了为何昇腾 get_attn_backend_cls 返回的是字符串而非类，也解释了 OOT 后端如何被接进来。",
+      "code": "@cache\ndef _cached_get_attn_backend(\n    backend,\n    attn_selector_config: AttentionSelectorConfig,\n    num_heads: int | None = None,\n) -> type[AttentionBackend]:\n    from vllm.platforms import current_platform\n\n    attention_cls = current_platform.get_attn_backend_cls(\n        backend,\n        attn_selector_config=attn_selector_config,\n        num_heads=num_heads,\n    )\n    if not attention_cls:\n        raise ValueError(\n            f\"Invalid attention backend for {current_platform.device_name}\"\n        )\n    backend = resolve_obj_by_qualname(attention_cls)\n\n    # Adjust kv cache layout if the selected backend requires a specific one\n    required_layout = backend.get_required_kv_cache_layout()\n    if required_layout is not None:\n        from vllm.v1.attention.backends.utils import set_kv_cache_layout\n\n        set_kv_cache_layout(required_layout)\n        logger.info(\n            \"Using %s KV cache layout for %s backend.\",\n            required_layout,\n            backend.get_name(),\n        )\n\n    return backend",
+      "elide": ["required_layout 那段 KV cache layout 调整对昇腾路由立意非主线，可一句带过；@cache 表示一次进程内只解析一次。"]
+    },
+    {
+      "path": "vllm_ascend/platform.py",
+      "lines": "L738-L765",
+      "what": "本章核心：三元 key 路由表。NPUPlatform.get_attn_backend_cls 用 (use_mla, use_sparse, use_compress) 查 backend_map 返回 4 个昇腾后端点分路径之一。",
+      "code": "    @classmethod\n    def get_attn_backend_cls(cls, selected_backend, attn_selector_config, num_heads: int | None = None):\n        use_compress = getattr(attn_selector_config, \"use_compress\", False)\n        key = (attn_selector_config.use_mla, attn_selector_config.use_sparse)\n\n        if selected_backend == AttentionBackendEnum.FLASH_ATTN and cls._validate_fa3_backend(key, attn_selector_config):\n            return \"vllm_ascend.attention.fa3_v1.AscendFABackend\"\n\n        backend_map = {\n            (True, False, False): \"vllm_ascend.attention.mla_v1.AscendMLABackend\",\n            (False, False, False): \"vllm_ascend.attention.attention_v1.AscendAttentionBackend\",\n            (True, True, False): \"vllm_ascend.attention.sfa_v1.AscendSFABackend\",\n            (True, False, True): \"vllm_ascend.attention.dsa_v1.AscendDSABackend\",\n        }\n        backend_map_310 = {\n            (\n                False,\n                False,\n            ): \"vllm_ascend._310p.attention.attention_v1.AscendAttentionBackend310\",\n            # TODO If MLA/SFA is supported in the future, consider implementing the logic described in these comments.\n            # (True, False): \"...AscendMLABackend310\",\n            # (True, True):  \"...AscendSFABackend310\",\n        }\n\n        if is_310p():\n            return backend_map_310.get(key, backend_map_310[(False, False)])\n\n        return backend_map[(attn_selector_config.use_mla, attn_selector_config.use_sparse, use_compress)]",
+      "elide": ["FA3 特例(selected_backend==FLASH_ATTN 且 _validate_fa3_backend 通过→AscendFABackend)与 310p 推理卡特例(backend_map_310)是两条旁支，本章只点名『还有 FA3/310p 两条特殊路』，不展开。注意 use_compress 用 getattr(...,False) 取——基座 AttentionSelectorConfig 当前未声明该字段(只有 use_mla/use_sparse)，故 (True,False,True)→DSA 仅在带 use_compress 的 vLLM 上可达。"]
+    },
+    {
+      "path": "vllm_ascend/attention/attention_v1.py",
+      "lines": "L73-L140",
+      "what": "OOT 后端契约的昇腾实现全貌：register_backend 装饰 + get_name 伪装 HACK + get_impl_cls/get_builder_cls 运行期分流 + get_kv_cache_shape(v1 @abstractmethod)/get_supported_kernel_block_sizes(覆写基类默认)，外加 swap_blocks/copy_blocks(昇腾自带、v0 遗留，非 v1 基类契约)。",
+      "code": "@register_backend(AttentionBackendEnum.CUSTOM, \"ASCEND\")\nclass AscendAttentionBackend(AttentionBackend):\n    accept_output_buffer: bool = True\n\n    @staticmethod\n    def get_name() -> str:\n        # HACK(Ronald1995): vllm `initialize_kv_cache` method in model runner v2 make\n        # attention name assertion, we just set name to FLASH_ATTN to avoid assertion error.\n        # rectify this when vllm disable the assertion.\n        return \"CUSTOM\" if not envs_vllm.VLLM_USE_V2_MODEL_RUNNER else \"FLASH_ATTN\"\n\n    @staticmethod\n    def get_impl_cls() -> type[\"AscendAttentionBackendImpl\"]:\n        if enable_cp():\n            from vllm_ascend.attention.context_parallel.attention_cp import AscendAttentionCPImpl\n\n            return AscendAttentionCPImpl\n        return AscendAttentionBackendImpl\n\n    @staticmethod\n    def get_builder_cls() -> type[\"AscendAttentionMetadataBuilder\"]:\n        if enable_cp():\n            from vllm_ascend.attention.context_parallel.attention_cp import AscendAttentionCPMetadataBuilder\n\n            return AscendAttentionCPMetadataBuilder\n        return AscendAttentionMetadataBuilder\n\n    @staticmethod\n    def get_kv_cache_shape(\n        num_blocks: int,\n        block_size: int,\n        num_kv_heads: int,\n        head_size: int,\n        cache_dtype_str: str = \"\",\n    ) -> tuple[int, ...]:\n        return (2, num_blocks, block_size, num_kv_heads, head_size)\n\n    @staticmethod\n    def swap_blocks(\n        src_kv_cache: list[torch.Tensor],\n        dst_kv_cache: list[torch.Tensor],\n        src_to_dst: torch.Tensor,\n    ) -> None:\n        src_key_cache, src_value_cache = src_kv_cache[0], src_kv_cache[1]\n        dst_key_cache, dst_value_cache = dst_kv_cache[0], dst_kv_cache[1]\n        src_indices = src_to_dst[:, 0]\n        dst_indices = src_to_dst[:, 1]\n\n        dst_key_cache[dst_indices] = src_key_cache[src_indices].to(dst_key_cache.device)\n        dst_value_cache[dst_indices] = src_value_cache[src_indices].to(dst_key_cache.device)\n\n    @staticmethod\n    def copy_blocks(\n        kv_caches: list[torch.Tensor],\n        src_to_dists: torch.Tensor,\n    ) -> None:\n        src_indices = src_to_dists[:, 0]\n        dst_indices = src_to_dists[:, 1]\n\n        for kv_cache in kv_caches:\n            key_caches = kv_cache[0]\n            value_caches = kv_cache[1]\n            key_caches[dst_indices] = key_caches[src_indices]\n            value_caches[dst_indices] = value_caches[src_indices]\n\n    @staticmethod\n    def get_supported_kernel_block_sizes() -> list[int]:\n        return [128]",
+      "elide": ["昇腾 KV cache 形状 (2, num_blocks, block_size, num_kv_heads, head_size)：首维 2 = key/value 两半；swap/copy 都按此布局取 [0]/[1]。get_impl_cls/get_builder_cls 里的 CP 分支(enable_cp() 为 True→走 context_parallel 的 CP 实现)是 ch15 上下文并行的延伸，本章只讲『运行期才 import、按 enable_cp 二选一』，CP 内核留后续。"]
+    },
+    {
+      "path": "vllm/v1/attention/backend.py",
+      "lines": "L55-L96",
+      "what": "vLLM 侧的契约定义：AttentionBackend 抽象基类的 4 个 @abstractmethod，即任何后端(含昇腾)必须实现的接口。对照昇腾的实现一一落点。",
+      "code": "class AttentionBackend(ABC):\n    \"\"\"Abstract class for attention backends.\"\"\"\n\n    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]\n    supported_kv_cache_dtypes: ClassVar[list[\"CacheDType\"]] = [\n        \"auto\",\n        \"float16\",\n        \"bfloat16\",\n    ]\n\n    # Does attention's forward() include kv cache update?\n    forward_includes_kv_cache_update: bool = True\n\n    @staticmethod\n    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:\n        return [MultipleOf(1)]\n\n    @staticmethod\n    @abstractmethod\n    def get_name() -> str:\n        raise NotImplementedError\n\n    @staticmethod\n    @abstractmethod\n    def get_impl_cls() -> type[\"AttentionImplBase\"]:\n        raise NotImplementedError\n\n    @staticmethod\n    @abstractmethod\n    def get_builder_cls():  # -> Type[\"AttentionMetadataBuilder\"]:\n        raise NotImplementedError\n\n    @staticmethod\n    @abstractmethod\n    def get_kv_cache_shape(\n        num_blocks: int,\n        block_size: int,\n        num_kv_heads: int,\n        head_size: int,\n        cache_dtype_str: str = \"auto\",\n    ) -> tuple[int, ...]:\n        raise NotImplementedError",
+      "elide": ["基类还有很多带默认实现的 @classmethod(get_kv_cache_block_dim/get_kv_cache_stride_order/get_required_kv_cache_layout/supports_dtype 等 L98+)，本章只锁 4 个 @abstractmethod(必须实现：get_name/get_impl_cls/get_builder_cls/get_kv_cache_shape) + get_supported_kernel_block_sizes(L68-L70，有默认实现、可覆写的基类方法)。注意：swap_blocks/copy_blocks 在基座 vllm/v1/attention/ 整个目录里根本不存在(grep 全目录无 def、也无任何 backend 调用它们)——它们只在昇腾 attention_v1.py(swap L111/copy L125)出现，是昇腾自带的 v0 遗留接口方法，非当前 v1 基类契约要求。"]
+    },
+    {
+      "path": "vllm/v1/attention/backends/registry.py",
+      "lines": "L88-L90,L203-L255",
+      "what": "register_backend 机制：CUSTOM 槽位占位(=None) + register_backend 把 override 写进 _ATTN_OVERRIDES。说明昇腾 @register_backend(CUSTOM,\"ASCEND\") 实际落到哪。",
+      "code": "    # Placeholder for third-party/custom backends - must be registered before use\n    # set to None to avoid alias with other backend, whose value is an empty string\n    CUSTOM = None\n\n# ... (省略中间 get_path/get_class/is_overridden 等方法) ...\n\ndef register_backend(\n    backend: AttentionBackendEnum | MambaAttentionBackendEnum,\n    class_path: str | None = None,\n    is_mamba: bool = False,\n) -> Callable[[type], type]:\n    def decorator(cls: type) -> type:\n        if is_mamba:\n            _MAMBA_ATTN_OVERRIDES[backend] = f\"{cls.__module__}.{cls.__qualname__}\"  # type: ignore[index]\n        else:\n            _ATTN_OVERRIDES[backend] = f\"{cls.__module__}.{cls.__qualname__}\"  # type: ignore[index]\n        return cls\n\n    if class_path is not None:\n        if is_mamba:\n            _MAMBA_ATTN_OVERRIDES[backend] = class_path  # type: ignore[index]\n        else:\n            _ATTN_OVERRIDES[backend] = class_path  # type: ignore[index]\n        return lambda x: x\n\n    return decorator",
+      "elide": ["docstring 与 get_path/get_class/is_overridden/clear_override 等方法省略；要点：class_path 非 None 时把字符串写进 _ATTN_OVERRIDES[backend] 并返回 no-op 装饰器(类本身不被改写)。"]
+    },
+    {
+      "path": "vllm/v1/attention/backends/flash_attn.py",
+      "lines": "L105-L107",
+      "what": "昇腾 get_name 伪装的样板：FlashAttention 后端 get_name 返回 'FLASH_ATTN'——昇腾在 V2 model-runner 下原样冒充它。",
+      "code": "    @staticmethod\n    def get_name() -> str:\n        return \"FLASH_ATTN\"",
+      "elide": []
+    }
+  ],
+
+  "key_classes": [
+    {"name": "NPUPlatform.get_attn_backend_cls", "file": "vllm_ascend/platform.py:L738", "responsibility": "昇腾平台的后端路由总入口：按 (use_mla, use_sparse, use_compress) 三元 key 返回 4 个昇腾后端之一的点分类路径字符串(+FA3/310p 特例)。被 vLLM selector._cached_get_attn_backend 调用。"},
+    {"name": "AscendAttentionBackend", "file": "vllm_ascend/attention/attention_v1.py:L74", "responsibility": "标准 MHA 后端，也是本章讲契约的样板：实现 get_name(伪装)/get_impl_cls/get_builder_cls/get_kv_cache_shape/swap_blocks/copy_blocks/get_supported_kernel_block_sizes。被 @register_backend(CUSTOM,'ASCEND') 装饰。"},
+    {"name": "AscendMLABackend / AscendSFABackend / AscendDSABackend", "file": "vllm_ascend/attention/{mla_v1,sfa_v1,dsa_v1}.py", "responsibility": "另 3 个被路由到的后端实体(MLA / 稀疏 SFA / DSA)，本章只点名其在 backend_map 中的 key，算子留 ch20-22 展开。"},
+    {"name": "AttentionBackend (基座 ABC)", "file": "vllm/v1/attention/backend.py:L55", "responsibility": "vLLM 侧后端契约：4 个 @abstractmethod(get_name/get_impl_cls/get_builder_cls/get_kv_cache_shape) 定义『后端必须实现什么』。"},
+    {"name": "AttentionBackendEnum + register_backend", "file": "vllm/v1/attention/backends/registry.py:L34,L203", "responsibility": "后端注册表：CUSTOM=None 占位第三方后端槽；register_backend 把 override 写入 _ATTN_OVERRIDES。"},
+    {"name": "_cached_get_attn_backend", "file": "vllm/v1/attention/selector.py:L105", "responsibility": "vLLM 选后端解析器：调 current_platform.get_attn_backend_cls 拿点分路径 → resolve_obj_by_qualname 解析成类。OOT 后端被接进来的真正路径。"},
+    {"name": "FlashAttentionBackend", "file": "vllm/v1/attention/backends/flash_attn.py:L69", "responsibility": "CUDA FlashAttention 后端样板，get_name 返回 'FLASH_ATTN'——昇腾伪装的对象。"}
+  ],
+
+  "data_flow": [
+    "1. 模型层构造注意力 → vLLM 调 selector.get_attn_backend(...) 组装 AttentionSelectorConfig(含 use_mla/use_sparse/...) (vllm/v1/attention/selector.py:get_attn_backend)。",
+    "2. _cached_get_attn_backend 调 current_platform.get_attn_backend_cls(backend, attn_selector_config, num_heads) (selector.py:_cached_get_attn_backend)。",
+    "3. 昇腾平台 NPUPlatform.get_attn_backend_cls：use_compress=getattr(cfg,'use_compress',False)；若 selected_backend==FLASH_ATTN 且 _validate_fa3_backend 通过→返回 AscendFABackend 路径；否则按三元 key 查 backend_map 返回 4 后端之一(310p 走 backend_map_310) (platform.py:get_attn_backend_cls)。",
+    "4. selector 拿到点分路径字符串 → resolve_obj_by_qualname(attention_cls) 解析成后端类 (selector.py:_cached_get_attn_backend)。",
+    "5. 与此并行：模块导入期 @register_backend(AttentionBackendEnum.CUSTOM,'ASCEND') 把 'ASCEND' 写进 _ATTN_OVERRIDES[CUSTOM](占住 CUSTOM 槽) (attention_v1.py:L73 → registry.py:register_backend)。",
+    "6. 后端类拿到后，vLLM 在 model-runner 初始化 KV cache 时调 backend.get_name()——昇腾在 VLLM_USE_V2_MODEL_RUNNER 下返回 'FLASH_ATTN' 冒充，绕过名字断言 (attention_v1.py:get_name)。",
+    "7. 需要算子实现/元数据构造器时调 get_impl_cls()/get_builder_cls()——运行期按 enable_cp() 决定返回普通实现还是 CP 实现 (attention_v1.py:get_impl_cls/get_builder_cls → utils.py:enable_cp)。",
+    "8. KV cache 分配/换页时调 get_kv_cache_shape/swap_blocks/copy_blocks(纯张量索引搬运，按 (2,...) 布局) (attention_v1.py)。"
+  ],
+
+  "design_decisions": [
+    {"decision": "用 (use_mla, use_sparse, use_compress) 三元 key 一张 backend_map 路由到 4 个后端，而非 if-else 链", "why": "把『模型注意力变体 → 后端实体』的映射做成数据(字典)，新增变体只加一行；4 个 key 对应 MLA / 标准 MHA / 稀疏 SFA / DSA 四类注意力。", "evidence": "vllm_ascend/platform.py:L746-L751"},
+    {"decision": "get_attn_backend_cls 返回『点分类路径字符串』而非类对象", "why": "符合 vLLM selector 契约——selector 用 resolve_obj_by_qualname 延迟解析，避免在平台层 import 全部后端(其中 mla/sfa/dsa 各自重依赖)，做到按需加载。", "evidence": "vllm/v1/attention/selector.py:L113-L122"},
+    {"decision": "get_name() 在 V2 model-runner 下故意返回 'FLASH_ATTN'(否则 'CUSTOM')", "why": "vLLM v2 model-runner 的 initialize_kv_cache 历史上对后端名做硬断言(只认白名单内的名字)，OOT 的 'CUSTOM'/'ASCEND' 过不了断言；冒充已知的 'FLASH_ATTN' 即可绕过。源码注释明言『rectify this when vllm disable the assertion』——是临时 HACK 而非长久设计。", "evidence": "vllm_ascend/attention/attention_v1.py:L78-L82；对照 vllm/v1/attention/backends/flash_attn.py:L105-L107"},
+    {"decision": "用 @register_backend(AttentionBackendEnum.CUSTOM, 'ASCEND') 占住 vLLM 的 CUSTOM 后端槽", "why": "vLLM 把 CUSTOM=None 预留给第三方后端；昇腾导入期注册占位，声明『CUSTOM 由昇腾接管』。注意：本版基座 register_backend 第二参形参名为 class_path，传 'ASCEND' 会被写进 _ATTN_OVERRIDES[CUSTOM] 并返回 no-op 装饰器(类本身不改写)。但昇腾的真正后端解析走的是 get_attn_backend_cls 返回的点分路径(第 2-4 步)，并不依赖 CUSTOM.get_class() 去解析 'ASCEND'——故 register_backend 在此更像『声明/占位』，解析主路是 get_attn_backend_cls。writer 据此讲清『注册占位』与『真正解析路径』两条线，勿把 register_backend 说成唯一/主解析路径。", "evidence": "vllm_ascend/attention/attention_v1.py:L73；vllm/v1/attention/backends/registry.py:L88-L90,L203-L255；vllm/v1/attention/selector.py:L113-L122"},
+    {"decision": "get_impl_cls/get_builder_cls 在 enable_cp() 下运行期二选一并延迟 import CP 实现", "why": "上下文并行(CP)的实现重且仅 CP 场景需要；用 enable_cp()(prefill/decode_context_parallel_size>1)在调用时判定，命中才 import context_parallel 模块，平时不付加载成本。", "evidence": "vllm_ascend/attention/attention_v1.py:L84-L98；vllm_ascend/attention/utils.py:L59-L62"},
+    {"decision": "昇腾 KV cache 形状定为 (2, num_blocks, block_size, num_kv_heads, head_size)", "why": "首维 2 = key/value 两半合存一张；swap_blocks/copy_blocks 都据此取 [0]/[1] 做块级索引搬运，与 paged KV 的块语义对齐。", "evidence": "vllm_ascend/attention/attention_v1.py:L100-L136"}
+  ],
+
+  "theory": [
+    {"point": "OOT 后端接入 = 实现 vLLM AttentionBackend 契约的 4 个 @abstractmethod(get_name/get_impl_cls/get_builder_cls/get_kv_cache_shape) + 让平台 get_attn_backend_cls 把请求路由到自己。这 4 个 @abstractmethod 是 v1 基类硬性要求；get_supported_kernel_block_sizes 是基类自带默认实现、后端可覆写(昇腾覆写返回 [128])。而 swap_blocks/copy_blocks 并不在 v1 基类契约里(基座 vllm/v1/attention/ 全目录无此二方法的 def，也无任何调用)——它们是昇腾自带的 v0 遗留接口方法(attention_v1.py:L111/L125)，本章应如实区分『v1 契约要求』与『昇腾额外保留的 v0 遗留方法』。本章把『契约点 ↔ 昇腾落点』一一对账。"},
+    {"point": "三元 key → 4 后端是一张满射映射(本版基座只声明 use_mla/use_sparse 两字段，use_compress 经 getattr 默认 False，故 DSA 这一支在裸 v0.21.0 基座上不可达；说明昇腾代码对更新 vLLM 的前向兼容)。"},
+    {"point": "get_name 伪装的本质是『身份断言绕过』：vLLM 某些初始化路径用字符串名而非类型判定后端，OOT 后端只能借一个白名单内的名字过关——这是 OOT 插件常见的妥协，源码注释自承临时性。"}
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "FA3 特例分支(platform.py:L743-L744 的 if selected_backend==FLASH_ATTN... return AscendFABackend) 及 _validate_fa3_backend 整个方法(L767-L792) 的细节实现", "why_safe": "FA3 是训推一致场景的旁支后端，不在本章『4 后端选择 + 契约』主线；精简版保留『还有 FA3 一条特殊路』的注释占位即可，删除其 flash_attn_npu_v3 探测/报错细节不影响主路由的正确性与可读性。"},
+      {"what": "310p 推理卡分支(platform.py:L752-L763 的 backend_map_310 与 if is_310p() 返回)", "why_safe": "310p 是特定硬件型号特例，主路由(非 310p)走 backend_map；精简版保留主 backend_map 与最终 return 即可，310p 旁支可删或留注释，不影响三元 key 路由立意。"},
+      {"what": "get_impl_cls/get_builder_cls 内 enable_cp() 为 True 时 import 的 CP 实现类(AscendAttentionCPImpl/AscendAttentionCPMetadataBuilder)真实定义", "why_safe": "CP 实现属上下文并行子系统(ch15 延伸)，本章只需保留『按 enable_cp() 二选一并延迟 import』的控制流；精简版可用占位类替身，不展开 CP 内核。"},
+      {"what": "swap_blocks/copy_blocks 中 .to(device) 等真实 NPU 张量搬运语义的实际执行(host 无 NPU 不可真跑算子)", "why_safe": "精简版用 CPU torch 张量或等价索引即可验证『按 (2,...) 布局做块级索引复制』的控制流；真实 NPU 设备搬运不在可跑范围，属 C 档原则(精简版只验可读控制流)。"},
+      {"what": "attention_v1.py 顶部与本章无关的大量 import(acl_graph/flashcomm2/kvcomp/device_op 等)与 AscendAttentionBackendImpl(L357+)、AscendMetadata 等算子/元数据实体", "why_safe": "本章只讲后端类的『选择与契约方法』(L73-L140)；Impl/Metadata/算子是 ch19 MHA 的内容，删除不影响本章契约骨架。"}
+    ],
+    "must_keep": [
+      {"symbol": "get_attn_backend_cls", "why": "本章后端路由总入口，必须出现。"},
+      {"symbol": "backend_map", "why": "三元 key→4 后端的路由表本体，读者核心理解对象。"},
+      {"symbol": "use_mla", "why": "三元 key 第一维(MLA vs 标准)。"},
+      {"symbol": "use_sparse", "why": "三元 key 第二维(稀疏 SFA)。"},
+      {"symbol": "use_compress", "why": "三元 key 第三维(DSA)，含 getattr 默认 False 的前向兼容写法。"},
+      {"symbol": "AscendMLABackend", "why": "4 后端之一(MLA)，路由目标点名。"},
+      {"symbol": "AscendAttentionBackend", "why": "标准 MHA 后端，也是契约方法样板类。"},
+      {"symbol": "AscendSFABackend", "why": "4 后端之一(稀疏 SFA)。"},
+      {"symbol": "AscendDSABackend", "why": "4 后端之一(DSA)。"},
+      {"symbol": "register_backend", "why": "注册占位机制，本章点(2)。"},
+      {"symbol": "AttentionBackendEnum", "why": "CUSTOM 槽所在枚举，注册靠它。"},
+      {"symbol": "CUSTOM", "why": "OOT 后端占位的枚举成员(=None)。"},
+      {"symbol": "get_name", "why": "伪装 HACK 所在方法，本章点(3)。"},
+      {"symbol": "FLASH_ATTN", "why": "伪装返回的名字常量，绕断言的关键。"},
+      {"symbol": "VLLM_USE_V2_MODEL_RUNNER", "why": "决定 get_name 返回 'CUSTOM' 还是 'FLASH_ATTN' 的开关。"},
+      {"symbol": "get_impl_cls", "why": "运行期分流方法之一，本章点(5)。"},
+      {"symbol": "get_builder_cls", "why": "运行期分流方法之一，本章点(5)。"},
+      {"symbol": "enable_cp", "why": "get_impl/builder 的运行期分流条件。"},
+      {"symbol": "get_kv_cache_shape", "why": "v1 @abstractmethod，返回 (2, num_blocks, block_size, num_kv_heads, head_size)。"},
+      {"symbol": "swap_blocks", "why": "昇腾自带方法(v0 遗留、非 v1 基类契约)，块换出/换入；保留以对照『昇腾额外保留了哪些 v1 不要求的方法』。"},
+      {"symbol": "copy_blocks", "why": "昇腾自带方法(v0 遗留、非 v1 基类契约)，块复制；保留以对照『昇腾额外保留了哪些 v1 不要求的方法』。"},
+      {"symbol": "get_supported_kernel_block_sizes", "why": "覆写基类默认实现(基座默认 [MultipleOf(1)]，昇腾返回 [128])，非 @abstractmethod。"},
+      {"symbol": "AttentionBackend", "why": "vLLM 侧契约基类，昇腾后端继承它。"},
+      {"symbol": "resolve_obj_by_qualname", "why": "点分路径→类的解析函数，OOT 接入的真正解析步。"}
+    ]
+  },
+
+  "diagram_plan": [
+    {"id": "fig18-1-roadmap", "kind": "roadmap", "spec": "复用 instances/vllm-ascend/book/assets/roadmap/roadmap.py，高亮 Part V 入口 ch18(后端选择)，前承 ch15(注意力元数据当不透明对象塞进 forward context)、后接 ch19 MHA/ch20 MLA/ch21 稀疏/ch22 KV 管理。标注本章回收 f9 的『后端选择』部分。"},
+    {"id": "fig18-2-routing-table", "kind": "table/decision-map", "spec": "三元 key 路由表：左列 (use_mla,use_sparse,use_compress) 四行 → 右列 4 个昇腾后端类(AscendMLABackend/AscendAttentionBackend/AscendSFABackend/AscendDSABackend)；附两条旁支节点 FA3(selected==FLASH_ATTN 且 _validate_fa3 通过) 与 310p(is_310p)。用 svg-diagram 画清晰映射，避免 mermaid 自动布局错位。"},
+    {"id": "fig18-3-contract-map", "kind": "two-column-contract", "spec": "左列 vLLM AttentionBackend 契约点：分两组——(组A·v1 必须实现的 4 个 @abstractmethod) get_name/get_impl_cls/get_builder_cls/get_kv_cache_shape；(组B·基类默认实现、可覆写) get_supported_kernel_block_sizes。右列 AscendAttentionBackend 一一落点(尤其 get_name→伪装 FLASH_ATTN 标红为 HACK；get_supported_kernel_block_sizes 覆写返回 [128])。另在右列底部单列一组『昇腾额外保留、基座无此 v1 契约点』：swap_blocks/copy_blocks——这两个在 vLLM v1 侧没有对映契约点(基座 vllm/v1/attention/ 不存在)，是昇腾自带的 v0 遗留接口方法，须画成左列对应位置留空/标注『v1 无此契约』，箭头不要从 vLLM 侧引出。一图对账『哪些是 v1 强制契约、哪些是昇腾额外保留』。"},
+    {"id": "fig18-4-resolution-flow", "kind": "sequence/flow", "spec": "解析时序：selector.get_attn_backend → _cached_get_attn_backend → NPUPlatform.get_attn_backend_cls(返回点分路径字符串) → resolve_obj_by_qualname → 后端类；旁挂一条 import 期 @register_backend(CUSTOM,'ASCEND')→_ATTN_OVERRIDES 的占位虚线，标注『占位声明 vs 真正解析路径』两条线。"}
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recover": [
+      {"id": "f9", "from": "ch15", "text": "ch15 的 _build_attention_metadata / set_ascend_forward_context(attn_metadata=...) 只把注意力元数据当不透明对象塞进 forward context；其后端实体 AscendAttentionBackend/MLA 的构造与内核留 Part V(ch18 后端选择 / ch19 MHA / ch20 MLA)回收。", "recover_in_ch18": "本章回收 f9 的『后端选择』部分——讲清这些后端实体是怎么被『选中并接进 vLLM』的(路由+注册+契约)；后端实体的构造/内核(get_impl_cls 返回的 Impl、forward 算子)继续留 ch19(MHA)/ch20(MLA)/ch21(稀疏) 展开。需在叙事中显式呼应 ch15 的『不透明对象』伏笔。"}
+    ]
+  },
+
+  "open_notes_for_lead": [
+    "基座版本对账：instances/vllm/source 当前 HEAD=ad7125a4(git describe 标 v0.21.0，但含 DeepSeek V4 等较新提交)，与 vllm-ascend v0.21.0rc1 配套。get_name 注释提到的 model-runner v2 'attention name assertion' 在本基座 vllm/v1/worker/gpu/model_runner.py:initialize_kv_cache(L339) 已不见硬编码的 get_name=='FLASH_ATTN' 断言(grep 全仓未命中)——该断言系历史版本遗留，注释自承『rectify this when vllm disable the assertion』。故本章讲伪装 HACK 应据昇腾源码注释+VLLM_USE_V2_MODEL_RUNNER 开关讲『为何要伪装、绕的是哪类断言(按名字而非类型判定后端)』，不要去基座硬指一行已不存在的 assert。已在 design_decisions 注明，非阻塞。",
+    "register_backend 第二参在本基座形参名是 class_path 不是 name；昇腾传 'ASCEND' 落进 _ATTN_OVERRIDES[CUSTOM] 且装饰器为 no-op，真正后端解析走 get_attn_backend_cls 点分路径。已在 design_decisions 第 4 条讲清『占位声明 vs 真正解析路径』，提醒 writer 勿把 register_backend 写成唯一解析入口。非阻塞。"
+  ]
+}
