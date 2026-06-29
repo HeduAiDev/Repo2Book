@@ -124,7 +124,7 @@ def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", 
 
 ### 昇腾的关键分歧：layerwise 永远拿真实 blocks
 
-现在看昇腾子类 `AscendMultiConnector` 改了什么。它继承 `MultiConnector` 又混入 `SupportsHMA`（声明支持 HMA 混合内存分配器——它把 KV 分成多个 cache group，释放时得逐组上报），`__init__` 里多了一句 HMA 校验，而真正动了控制流的只有一处——`update_state_after_alloc`：
+现在看昇腾子类 `AscendMultiConnector` 改了什么。它继承 `MultiConnector` 又混入 `SupportsHMA`（声明支持 HMA——它把 KV 分成多个 cache group，释放时得逐组上报），`__init__` 里多了一句 HMA 校验，而真正动了控制流的只有一处——`update_state_after_alloc`：
 
 ```python
 # vllm_ascend/distributed/kv_transfer/ascend_multi_connector.py:L19
@@ -625,7 +625,7 @@ def lookup(self, token_len, block_hashes, kv_cache_group_ids=None) -> int:
     return result
 ```
 
-它用 `encoder`（消息编码器，如 MessagePack）把 `token_len`、各组 id、每块的内容哈希打包成 multipart 帧，经 zmq（零拷贝消息队列库）的 REQ（一种阻塞式 RPC 通信，发方发完就等着收回应）发给池，阻塞收回一个大端整数。池那边比对哈希、返回「这条 prompt 的前多少 token 我有现成 KV」。`block_hashes` 是 prompt 各块内容的指纹——内容一样哈希就一样，于是「同一段前缀」能被认出来。
+它用 `encoder`（消息编码器，如 MessagePack）把 `token_len`、各组 id、每块的内容哈希打包成 multipart 帧，经 zmq（ZeroMQ，高性能异步消息库）的 REQ（一种阻塞式 RPC 通信，发方发完就等着收回应）发给池，阻塞收回一个大端整数。池那边比对哈希、返回「这条 prompt 的前多少 token 我有现成 KV」。`block_hashes` 是 prompt 各块内容的指纹——内容一样哈希就一样，于是「同一段前缀」能被认出来。
 
 ### 算缺口：命中 − 已算
 
