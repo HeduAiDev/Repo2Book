@@ -1,0 +1,208 @@
+{
+  "chapter": "ch14",
+  "title": "NPUModelRunner(GPUModelRunner)：继承 244KB 父类、只 override 设备相关方法 + 运行时猴补",
+  "thesis": "ch13 的 NPUWorker 是『重写而非继承』（设备层基座把 cuda 钉死在 else-raise，继承走不通）；ch14 的 NPUModelRunner 恰相反——是『继承 + 运行时猴补』。父类 GPUModelRunner 没把 cuda 钉死在 else-raise，而是把设备耦合散落在两处：(a) 大量直接调 `torch.cuda.Event/Stream/synchronize/mem_get_info`；(b) 模块级符号 `graph_capture` / `CUDAGraphWrapper`。NPUModelRunner 用两个成对进出的上下文管理器 `_torch_cuda_wrapper()` + `_replace_gpu_model_runner_function_wrapper()` 在作用域内临时把这些符号换成 NPU/ACLGraph 版，于是 `capture_model` / `profile_cudagraph_memory` 这种父类巨方法可以一行不改地跑在昇腾上。猴补『安全/临时』的根据：成对进出（try/finally 必恢复）+ 仅作用域内生效。",
+
+  "code_spine": [
+    "vllm_ascend/worker/model_runner_v1.py:L255-L256  class NPUModelRunner(GPUModelRunner) 声明继承",
+    "vllm_ascend/worker/model_runner_v1.py:L274-L275  __init__ 用 with _torch_cuda_wrapper(): super().__init__() —— 父类巨构造器内的 torch.cuda.* 调用被临时改向 NPU",
+    "vllm_ascend/worker/model_runner_v1.py:L317-L318  __init__ 末尾替换设备相关实体字段：self.sampler = AscendSampler(); self.attn_state: AscendAttentionState",
+    "vllm_ascend/worker/model_runner_v1.py:L490  self.use_aclgraph = self._use_aclgraph()",
+    "vllm_ascend/worker/model_runner_v1.py:L580-L584  override 设备钩子 _init_device_properties / _sync_device（父类标注 'used for model runner override'）",
+    "vllm_ascend/worker/model_runner_v1.py:L620-L625  _use_aclgraph() 决策",
+    "vllm_ascend/worker/model_runner_v1.py:L4798-L4818  override profile_cudagraph_memory：双 wrapper 包住 GPUModelRunner.profile_cudagraph_memory(self)",
+    "vllm_ascend/worker/model_runner_v1.py:L4820-L4824  override capture_model：双 wrapper 包住 GPUModelRunner.capture_model(self)",
+    "vllm_ascend/worker/model_runner_v1.py:L4876-L4887  _get_gpu_model_runner_module_name：沿 MRO 找到父类所在模块名（替换 graph_capture/CUDAGraphWrapper 的目标）",
+    "vllm_ascend/worker/model_runner_v1.py:L4890-L4931  _torch_cuda_wrapper：临时把 torch.cuda.* 指向 torch.npu.*（finally 恢复/兜底 placeholder）",
+    "vllm_ascend/worker/model_runner_v1.py:L4934-L4953  _replace_gpu_model_runner_function_wrapper：临时把父类模块里的 graph_capture/CUDAGraphWrapper setattr 成 NPU/ACL 版（finally 还原）",
+    "vllm_ascend/worker/model_runner_v1.py:L197-L230  NPU 版 graph_capture 上下文管理器 + GraphCaptureContext（torch.npu.Stream）",
+    "对照基座 vllm/v1/worker/gpu_model_runner.py:L6049-L6147 / L6150+  父类 profile_cudagraph_memory / capture_model —— 直接用 graph_capture(device=...)、torch.cuda.mem_get_info()、CUDAGraphWrapper（猴补的真实目标）",
+    "vllm_ascend/compilation/acl_graph.py:L64-L183  ACLGraphWrapper：与 CUDAGraphWrapper 同形（同构造签名、_all_instances WeakSet、clear_all_graphs、__call__ 派发）→ 可热替换"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm_ascend/worker/model_runner_v1.py",
+      "lines": "L255-L275",
+      "code": "class NPUModelRunner(GPUModelRunner):\n    def __init__(self, vllm_config: VllmConfig, device: torch.device):\n        # TODO(qcs): These manual pad and unpad for GPUModelRunner are\n        # used to expand some buffers, which need to be reverted after\n        # the following PR is merged:\n        # https://github.com/vllm-project/vllm/pull/28988\n        max_pcp_pad_tokens = (\n            vllm_config.parallel_config.prefill_context_parallel_size * 2 * vllm_config.scheduler_config.max_num_seqs\n        )\n        vllm_config.scheduler_config.max_num_batched_tokens += max_pcp_pad_tokens\n\n        # Must be set before super().__init__() because parent init may call\n        # _allocate_kv_cache_tensors which accesses self.use_compress.\n        model_config = getattr(vllm_config, \"model_config\", None)\n        hf_config = getattr(model_config, \"hf_config\", None) if model_config else None\n        self.use_compress = (\n            hf_config is not None and hasattr(hf_config, \"compress_ratios\")\n        )\n\n        with _torch_cuda_wrapper():\n            super().__init__(vllm_config, device)",
+      "elide": [
+        "L256-L272 的 max_pcp_pad_tokens / use_compress 是与本章无关的 PCP padding 与 compress 预设，正文可一笔带过；真正关键是 L274-275：父类的 244KB __init__ 在 _torch_cuda_wrapper() 作用域内运行，其内部所有 torch.cuda.Stream()/Event() 等创建被临时改向 NPU。"
+      ]
+    },
+    {
+      "path": "vllm_ascend/worker/model_runner_v1.py",
+      "lines": "L317-L318",
+      "code": "        self.sampler = AscendSampler()\n        self.attn_state: AscendAttentionState | None = None",
+      "elide": [
+        "父类 __init__ 已把 self.sampler 设成 GPU 版 Sampler、attn 状态用 vLLM 自己的枚举；这里在 super().__init__() 之后把设备相关实体字段覆盖成昇腾版（AscendSampler / AscendAttentionState）。本章只点名替换这一事实，AscendSampler 内部留采样器章节、AscendAttentionState 的注意力后端实体留 Part V（ch18/ch19）。"
+      ]
+    },
+    {
+      "path": "vllm_ascend/worker/model_runner_v1.py",
+      "lines": "L580-L584",
+      "code": "    def _init_device_properties(self) -> None:\n        self.num_sms = None\n\n    def _sync_device(self) -> None:\n        torch.npu.synchronize()",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L1056-L1064",
+      "code": "    # Note: used for model runner override.\n    def _init_device_properties(self) -> None:\n        \"\"\"Initialize attributes from torch.cuda.get_device_properties\"\"\"\n\n        self.num_sms = num_compute_units(self.device.index)\n\n    # Note: used for model runner override.\n    def _sync_device(self) -> None:\n        torch.accelerator.synchronize()",
+      "elide": [
+        "父类亲口标注 'used for model runner override' —— 这是父类预留的设备钩子（device seam）。对照可见：这一类设备差异父类是用『override 点』而非『else-raise 钉死』来表达的，正是 ch14 能走继承路线的根本原因（与 ch13 设备层钉死 cuda 形成对照）。"
+      ]
+    },
+    {
+      "path": "vllm_ascend/worker/model_runner_v1.py",
+      "lines": "L620-L625",
+      "code": "    def _use_aclgraph(self) -> bool:\n        return (\n            self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE\n            and self.compilation_config.mode == CompilationMode.VLLM_COMPILE\n            and not self.model_config.enforce_eager\n        )",
+      "elide": [
+        "三个条件齐备才用 ACLGraph：图模式非 NONE、编译模式为 VLLM_COMPILE、未强制 eager。决定 self.use_aclgraph（L490），下游 set_graph_params 等是否触发都看它。"
+      ]
+    },
+    {
+      "path": "vllm_ascend/worker/model_runner_v1.py",
+      "lines": "L4798-L4824",
+      "code": "    def profile_cudagraph_memory(self) -> int:\n        parent_module_name = _get_gpu_model_runner_module_name(self)\n        with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):\n            result = GPUModelRunner.profile_cudagraph_memory(self)\n\n        reset_graph_params()\n\n        # NOTE: This is a serious problem that we maintain two extra copies of the KV cache as the instance\n        # variable of the attention layers, when they are local variables in the upstream vLLM code.\n        # We have to manually clear them here to release memory after profiling. \n        for layer in self.compilation_config.static_forward_context.values():\n            if hasattr(layer, \"impl\"):\n                if hasattr(layer.impl, \"key_cache\"):\n                    layer.impl.key_cache = None\n                if hasattr(layer.impl, \"value_cache\"):\n                    layer.impl.value_cache = None\n\n        gc.collect()\n        torch.accelerator.empty_cache()\n\n        return result\n\n    def capture_model(self) -> int:\n        \"\"\"Capture NPU graphs and return actual graph pool memory bytes consumed.\"\"\"\n        parent_module_name = _get_gpu_model_runner_module_name(self)\n        with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):\n            return GPUModelRunner.capture_model(self)",
+      "elide": [
+        "L4805-4816 是 profile 后手动清理两份多余 KV cache 副本 + gc，与『猴补接缝』主题相关性弱，正文可略讲。核心是两处 `with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name): GPUModelRunner.<method>(self)` —— 显式以未绑定方法调用父类实现，且只在 with 作用域内换符号。"
+      ]
+    },
+    {
+      "path": "vllm_ascend/worker/model_runner_v1.py",
+      "lines": "L4876-L4887",
+      "code": "def _get_gpu_model_runner_module_name(model_runner) -> str:\n    \"\"\"Return the module name of GPUModelRunner found in the MRO.\"\"\"\n    gpu_model_runner_cls = next(\n        (cls for cls in model_runner.__class__.__mro__ if cls.__name__ == \"GPUModelRunner\"),\n        None,\n    )\n    if gpu_model_runner_cls is None:\n        raise TypeError(\n            \"Could not find GPUModelRunner in the MRO. \"\n            \"The class hierarchy may have changed.\"\n        )\n    return gpu_model_runner_cls.__module__",
+      "elide": [
+        "沿 MRO 找到 GPUModelRunner 类，取它所在的模块名（即 vllm.v1.worker.gpu_model_runner）。这是关键：graph_capture / CUDAGraphWrapper 是被 import 进『父类那个模块的命名空间』的——要让父方法看见替换，必须改父类模块的属性，而不是改本模块。"
+      ]
+    },
+    {
+      "path": "vllm_ascend/worker/model_runner_v1.py",
+      "lines": "L4890-L4931",
+      "code": "@contextmanager\ndef _torch_cuda_wrapper():\n    class _EventPlaceholder:\n        def __init__(self, *args, **kwargs) -> None:\n            self.record = lambda *a, **kw: None\n            self.synchronize = lambda *a, **kw: None\n            self.wait = lambda *a, **kw: None\n            self.query = lambda *a, **kw: True\n\n    class _StreamPlaceholder:\n        def __init__(self, *args, **kwargs) -> None:\n            pass\n\n    try:\n        # replace cuda APIs with xpu APIs, this should work by default\n        torch.Event = torch.npu.Event\n        torch.cuda.Event = torch.npu.Event\n        torch.cuda.Stream = torch.npu.Stream\n        torch.cuda.default_stream = torch.npu.default_stream\n        torch.cuda.current_stream = torch.npu.current_stream\n        torch.cuda.stream = torch.npu.stream\n        torch.cuda.synchronize = torch.npu.synchronize\n        torch.cuda.mem_get_info = torch.npu.mem_get_info\n        yield\n    except Exception as e:\n        torch.cuda.Event = _EventPlaceholder\n        torch.cuda.Stream = _StreamPlaceholder\n        torch.cuda.default_stream = _StreamPlaceholder\n        torch.cuda.current_stream = _StreamPlaceholder\n        torch.cuda.stream = _StreamPlaceholder\n        torch.cuda.synchronize = _StreamPlaceholder\n        torch.cuda.mem_get_info = _StreamPlaceholder\n        raise RuntimeError(f\"NPUModelRunner init failed, error is {e}\")\n    finally:\n        # if anything goes wrong, just patch it with a placeholder\n        torch.cuda.Event = _EventPlaceholder\n        torch.cuda.Stream = torch.cuda.Stream\n        torch.cuda.default_stream = torch.npu.default_stream\n        torch.cuda.current_stream = torch.npu.current_stream\n        torch.cuda.stream = torch.npu.stream\n        torch.cuda.synchronize = torch.npu.synchronize\n        torch.cuda.mem_get_info = torch.npu.mem_get_info",
+      "elide": [
+        "正文需点出这是『进程级』替换 torch.cuda 模块属性（不是实例级）——所以必须配 try/finally 成对装卸。注意 except 分支会先装 placeholder 再 re-raise（init 失败时不让残留 NPU 绑定坏掉别处）；注释口误说 'xpu' 实为 npu。finally 的 Event 落到 placeholder、Stream 还原成 torch.cuda.Stream，是退出后的稳态选择，正文可点一句『退出后 torch.cuda 并非原样还原，而是落到一组安全缺省/NPU 直通』。"
+      ]
+    },
+    {
+      "path": "vllm_ascend/worker/model_runner_v1.py",
+      "lines": "L4934-L4953",
+      "code": "# TODO: This method will be removed subsequently and implemented in platform.\n@contextmanager\ndef _replace_gpu_model_runner_function_wrapper(target_module_name):\n    target_module = None\n    original_attrs = {}\n    try:\n        target_module = sys.modules[target_module_name]\n        if hasattr(target_module, \"graph_capture\"):\n            original_attrs[\"graph_capture\"] = target_module.graph_capture\n        setattr(target_module, \"graph_capture\", graph_capture)  # noqa: B010\n        if hasattr(target_module, \"CUDAGraphWrapper\"):\n            original_attrs[\"CUDAGraphWrapper\"] = target_module.CUDAGraphWrapper\n            setattr(target_module, \"CUDAGraphWrapper\", ACLGraphWrapper)  # noqa: B010\n        yield\n    except Exception as e:\n        raise RuntimeError(f\"NPUModelRunner failed, error is {e}\")\n    finally:\n        if target_module is not None:\n            for attr_name, attr_value in original_attrs.items():\n                setattr(target_module, attr_name, attr_value)  # noqa: B010",
+      "elide": [
+        "核心机制：先存 original_attrs（旧值），setattr 父类模块的 graph_capture→NPU 版、CUDAGraphWrapper→ACLGraphWrapper，yield 期间父方法引用的就是替换版；finally 逐一 setattr 还原。这才是『临时/可逆』的物证。TODO 注释表明这是过渡方案、将来移到 platform。"
+      ]
+    },
+    {
+      "path": "vllm_ascend/worker/model_runner_v1.py",
+      "lines": "L197-L230",
+      "code": "@dataclass\nclass GraphCaptureContext:\n    stream: torch.npu.Stream\n\n\n@contextmanager\ndef graph_capture(device: torch.device):\n    \"\"\"\n    `graph_capture` is a context manager which should surround the code that\n    is capturing the NPU graph. ...\n    \"\"\"\n    graph_capture_context = GraphCaptureContext(torch.npu.Stream(device=device))\n    stream = graph_capture_context.stream\n\n    # we use nullcontext now\n    maybe_ca_context = nullcontext()\n\n    # ensure all initialization operations complete before attempting to\n    # capture the graph on another stream\n    curr_stream = torch.npu.current_stream()\n    if curr_stream != stream:\n        stream.wait_stream(curr_stream)\n\n    with torch.npu.stream(stream), maybe_ca_context:\n        yield graph_capture_context",
+      "elide": [
+        "L204-216 的 docstring 已截断（只保留首句），正文不必全引。这是被塞进父类模块替换原 graph_capture 的 NPU 版：用 torch.npu.Stream 而非 cuda Stream，签名 graph_capture(device) 与 GraphCaptureContext.stream 字段与父类同形，所以父方法 `with graph_capture(device=self.device):` 一字不改即可调用它。"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L6079-L6106",
+      "code": "        set_cudagraph_capturing_enabled(True)\n        with self._freeze_gc(), graph_capture(device=self.device):\n            shared_memory_estimate = {}\n            per_graph_estimate = {}\n            torch.accelerator.synchronize()\n            torch.accelerator.empty_cache()\n\n            for mode, descs in capture_descs:\n                profile_descs = descs[:2]\n                mem_samples: list[int] = []\n\n                for i, desc in enumerate(profile_descs):\n                    mem_before = torch.cuda.mem_get_info()[0]\n                    self._warmup_and_capture(\n                        desc,\n                        ...\n                    )\n                    torch.accelerator.synchronize()\n                    free_after = torch.cuda.mem_get_info()[0]\n                    mem_samples.append(mem_before - free_after)",
+      "elide": [
+        "这是父类 profile_cudagraph_memory 的核心片段（对照基座）。它直接 `graph_capture(device=...)`（模块级符号）+ `torch.cuda.mem_get_info()`，外加 L6075/6125 处 `CUDAGraphWrapper._all_instances`。这正是 ch14 两个 wrapper 要替换的全部目标——读者看完此片段就懂『为什么父方法能一行不改跑在 NPU 上』。L6092 的 _warmup_and_capture 参数省略，正文不需展开。"
+      ]
+    },
+    {
+      "path": "vllm_ascend/compilation/acl_graph.py",
+      "lines": "L96-L105",
+      "code": "    def __init__(\n        self,\n        runnable: Callable,\n        vllm_config: VllmConfig,\n        runtime_mode: CUDAGraphMode,\n        cudagraph_options: CUDAGraphOptions | None = None,\n        *,\n        use_eagle: bool = False,\n        enable_enpu: bool = False,\n    ):",
+      "elide": [
+        "只需展示 ACLGraphWrapper 与父类 CUDAGraphWrapper 构造签名同形（runnable, vllm_config, runtime_mode, cudagraph_options），加上同名 _all_instances WeakSet / clear_all_graphs / __call__ 派发（L89-L183），这才使 setattr 热替换可行——父方法 `CUDAGraphWrapper(self.model, ...)` 拿到的其实是 ACLGraphWrapper 也不报错。ACLGraphWrapper 内部捕获/重放实现属图模式章节，本章仅点名同形可替换。"
+      ]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "NPUModelRunner", "file": "vllm_ascend/worker/model_runner_v1.py", "responsibility": "继承 GPUModelRunner（vLLM 244KB 父类），只 override 设备相关方法（_init_device_properties/_sync_device）与图捕获接缝方法（capture_model/profile_cudagraph_memory），并在 __init__ 内用 _torch_cuda_wrapper 包住父构造器；其余庞大父类逻辑原样复用。"},
+    {"name": "GPUModelRunner", "file": "vllm/v1/worker/gpu_model_runner.py", "responsibility": "对照基座父类。设备耦合不是 else-raise 钉死，而是散落为 torch.cuda.* 直调 + 模块级 graph_capture/CUDAGraphWrapper + 预留 override 钩子（标注 'used for model runner override'）——这正是可继承+猴补的前提。"},
+    {"name": "_torch_cuda_wrapper", "file": "vllm_ascend/worker/model_runner_v1.py", "responsibility": "上下文管理器：进程级临时把 torch.cuda.Event/Stream/synchronize/mem_get_info/stream/current_stream/default_stream 指向 torch.npu.*；try/except/finally 保证成对装卸与失败兜底（placeholder）。"},
+    {"name": "_replace_gpu_model_runner_function_wrapper", "file": "vllm_ascend/worker/model_runner_v1.py", "responsibility": "上下文管理器：把父类所在模块的模块级符号 graph_capture→NPU 版、CUDAGraphWrapper→ACLGraphWrapper（setattr），finally 还原 original_attrs。"},
+    {"name": "_get_gpu_model_runner_module_name", "file": "vllm_ascend/worker/model_runner_v1.py", "responsibility": "沿 MRO 找到 GPUModelRunner 的 __module__——即替换 graph_capture/CUDAGraphWrapper 的目标模块（必须改父类模块命名空间，父方法才看得见替换）。"},
+    {"name": "graph_capture (NPU 版)", "file": "vllm_ascend/worker/model_runner_v1.py", "responsibility": "与父类同签名/同 GraphCaptureContext 字段的 NPU 版图捕获上下文管理器，用 torch.npu.Stream 替换 cuda Stream，被塞进父类模块替换原版。"},
+    {"name": "ACLGraphWrapper", "file": "vllm_ascend/compilation/acl_graph.py", "responsibility": "与 CUDAGraphWrapper 同形（构造签名/_all_instances/clear_all_graphs/__call__ 派发）的 ACL 图包装器，可被 setattr 热替换；内部 ACLGraph 捕获/重放细节留图模式章节。"},
+    {"name": "AscendSampler", "file": "vllm_ascend/sample/sampler.py", "responsibility": "继承 vLLM Sampler 的昇腾采样器；__init__ 末尾替换 self.sampler。本章仅点名替换，内部留采样器章节。"},
+    {"name": "AscendAttentionState", "file": "vllm_ascend/attention/attention_v1.py", "responsibility": "枚举（PrefillNoCache/PrefillCacheHit/DecodeOnly/ChunkedPrefill/SpecDecoding），替换父类注意力状态字段。注意力后端实体留 Part V（ch18/ch19）。"}
+  ],
+
+  "data_flow": [
+    "构造期：NPUModelRunner.__init__ → with _torch_cuda_wrapper(): super().__init__()（父构造器内 torch.cuda.Stream()/Event() 等被改向 npu）→ 退出 wrapper → 覆盖 self.sampler=AscendSampler()、self.attn_state、self.use_aclgraph=_use_aclgraph()。",
+    "设备钩子：父类逻辑在需要设备信息/同步处调 self._init_device_properties()/self._sync_device()，因方法解析（MRO）落到 NPUModelRunner 的 override（num_sms=None / torch.npu.synchronize）。",
+    "图捕获期：worker 调 model_runner.capture_model() → 命中 NPUModelRunner.capture_model override → 取 parent_module_name=_get_gpu_model_runner_module_name(self) → with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name): → 在作用域内 torch.cuda.* 已指向 npu、父类模块的 graph_capture/CUDAGraphWrapper 已是 NPU/ACL 版 → 调 GPUModelRunner.capture_model(self)（未绑定方法，传 self）→ 父方法 `with graph_capture(device=self.device):` 与 `CUDAGraphWrapper(...)` 实际跑 NPU/ACL 版 → 退出 with，两个 wrapper 的 finally 还原符号。",
+    "显存预估同理：profile_cudagraph_memory override 用同一对 wrapper 包 GPUModelRunner.profile_cudagraph_memory(self)，父方法里的 torch.cuda.mem_get_info() 实测 NPU 显存；退出后 reset_graph_params + 手动清两份多余 KV cache + gc。"
+  ],
+
+  "design_decisions": [
+    {"decision": "ch14 走『继承+猴补』而非 ch13 的『重写』", "why": "父类 GPUModelRunner 把设备差异表达为『可 override 的钩子 + 散落的 torch.cuda.* + 模块级 graph_capture/CUDAGraphWrapper』，没有 else-raise 钉死，所以可以继承巨父类、只在窄接缝处临时换符号；ch13 NPUWorker 面对的设备层基座把 cuda 钉死，继承走不通只能重写。", "evidence": "vllm/v1/worker/gpu_model_runner.py:L1056-L1064（'used for model runner override' 钩子）+ L6079-L6106（散落 torch.cuda.* 与模块级 graph_capture）"},
+    {"decision": "用上下文管理器做『临时/可逆』猴补，而非进程启动时永久替换", "why": "torch.cuda.* 与父类模块符号是全局/进程级状态，永久替换会污染别处；成对进出（try/finally 必恢复 original_attrs）保证只在 capture/profile 作用域内生效、退出即还原，这正是『为什么这种猴补是安全的』的根据。", "evidence": "vllm_ascend/worker/model_runner_v1.py:L4934-L4953（original_attrs 存旧值+finally 还原）"},
+    {"decision": "替换的是父类所在模块的属性（经 MRO 取模块名），而不是本模块", "why": "graph_capture/CUDAGraphWrapper 是被 import 进 vllm.v1.worker.gpu_model_runner 的命名空间的；父方法运行时按那个模块的全局名解析，所以必须 setattr 到父类模块才能让父方法看见 NPU/ACL 版。", "evidence": "vllm_ascend/worker/model_runner_v1.py:L4876-L4887 + L4940-L4946"},
+    {"decision": "以未绑定方法 GPUModelRunner.capture_model(self) 显式调父类实现", "why": "override 方法体内要『先布置好猴补环境，再跑父类原逻辑』，用 GPUModelRunner.<method>(self) 而非 super() 更直白地表达『就是要父类那份巨方法一行不改地跑』。", "evidence": "vllm_ascend/worker/model_runner_v1.py:L4801 / L4824"},
+    {"decision": "_torch_cuda_wrapper 失败兜底用 placeholder（Event/Stream 空实现）", "why": "init/capture 失败时不让残留的坏绑定影响后续；placeholder 的 record/synchronize/wait 为 no-op、query 恒 True，保证即使异常路径 torch.cuda.* 仍可调用不崩。", "evidence": "vllm_ascend/worker/model_runner_v1.py:L4892-L4901 + L4914-L4931（except/finally 分支）"},
+    {"decision": "ACLGraphWrapper 刻意与 CUDAGraphWrapper 同形", "why": "热替换要求被换进去的类对父方法是『鸭子兼容』的——同构造签名、同 _all_instances/clear_all_graphs/__call__ 语义，父方法 `CUDAGraphWrapper(self.model, vllm_config, runtime_mode, ...)` 才能不改地构造出 ACLGraphWrapper。", "evidence": "vllm_ascend/compilation/acl_graph.py:L89-L105,L152-L164 对照 vllm/compilation/cuda_graph.py 的 CUDAGraphWrapper"}
+  ],
+
+  "theory": [
+    "猴补安全性论证（成对装卸 + 作用域隔离）：设全局符号集合 S={torch.cuda.Event,Stream,synchronize,mem_get_info,...} ∪ {module.graph_capture, module.CUDAGraphWrapper}。wrapper 进入时保存 S 的旧值 S0、置换为 NPU/ACL 版 S1，yield 期间外界看到 S1；退出时 finally 必执行还原（_replace 还原成 S0；_torch_cuda 还原成一组稳态缺省）。因 try/finally 在正常/异常/return 三条路径都跑 finally，故置换的『生存期 ⊆ with 作用域』，不泄漏到作用域外——这就是『临时』的形式保证。",
+    "为何只能改父类模块而非本模块：Python 名字解析对函数体内的自由变量（如父方法里的 graph_capture）按其『定义所在模块的 __dict__』解析（LEGB 的 G=函数 __globals__）。父方法的 __globals__ 是 vllm.v1.worker.gpu_model_runner 模块字典，故 setattr 必须打到该模块，本模块改了父方法看不见。",
+    "继承 vs 重写的判据：父类是否把设备分支表达为『可 override 的窄接缝』。若父类用 else-raise 钉死设备（ch13 worker 基座），子类继承会在父逻辑里触发 raise，无接缝可换 → 只能重写；若父类用钩子+散落 torch.cuda.*+模块级符号（本章 model runner），子类可继承+在接缝处临时换符号 → 继承+猴补。这是 ch13/ch14 对照的本质。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "__init__ 中与设备接缝无关的大段字段初始化：PCP/DCP 相关（L408-L438）、sparse/sparse_c8 分支（L349-L387）、EPLB 分支（L492-L503）、hamming sparse（L568-L574）、debugger/dump 分支（L324-L341）、multimodal/各类 buffer（L398-L406、L539-L575）", "why_safe": "这些是与本章主题（设备层猴补 + 图捕获接缝）正交的特性初始化，删后不影响读者理解『继承+猴补』机制；精简版只需保留 with _torch_cuda_wrapper(): super().__init__() 与 sampler/attn_state/use_aclgraph 三处替换即可演示控制流。"},
+      {"what": "profile_cudagraph_memory override 内 profiling 后清理两份多余 KV cache 的循环 + gc.collect()/empty_cache()（L4805-L4816）", "why_safe": "属于 profiling 善后内存清理，与『双 wrapper 包父方法』主线无关；保留两行 with ... : GPUModelRunner.profile_cudagraph_memory(self) 与 reset_graph_params() 即可。"},
+      {"what": "_torch_cuda_wrapper 中 torch.Event/default_stream/current_stream/stream 等非核心符号替换行（保留 Event/Stream/synchronize/mem_get_info 四个代表）", "why_safe": "替换模式完全一致，精简版保留代表性的四个 torch.cuda.* 替换 + try/except/finally 骨架即可说明『成对装卸』；删多余行不改变机制。注意：仍须保留 except 与 finally 两个分支以体现可逆性。"},
+      {"what": "graph_capture 的 docstring 正文（L204-L216 大段说明）", "why_safe": "纯注释，删后控制流不变（torch.npu.Stream 创建 + wait_stream + with torch.npu.stream 仍在）。"},
+      {"what": "spec_decode 多种 drafter 联合类型注解、各类 buffer 字段（_set_up_drafter L586-L615 等本章未点名部分）", "why_safe": "与设备猴补/图捕获接缝正交。"}
+    ],
+    "must_keep": [
+      {"symbol": "NPUModelRunner", "why": "本章主角类名，须可见其 `class NPUModelRunner(GPUModelRunner)` 继承声明。"},
+      {"symbol": "GPUModelRunner", "why": "被继承/被显式调用的父类；capture_model/profile_cudagraph_memory 里 `GPUModelRunner.<m>(self)` 必须原样保留以示『跑父类巨方法』。"},
+      {"symbol": "_torch_cuda_wrapper", "why": "核心猴补 #1，须保留 contextmanager + try/except/finally 成对装卸骨架。"},
+      {"symbol": "_replace_gpu_model_runner_function_wrapper", "why": "核心猴补 #2，须保留 original_attrs 存值 + setattr 替换 + finally 还原。"},
+      {"symbol": "_get_gpu_model_runner_module_name", "why": "解释『为何改父类模块而非本模块』的关键，MRO 取模块名逻辑须在。"},
+      {"symbol": "graph_capture", "why": "被替换进父模块的 NPU 版上下文管理器；须保留 torch.npu.Stream 版以对照 cuda 版。"},
+      {"symbol": "GraphCaptureContext", "why": "graph_capture 返回的同形数据类（stream 字段），与父类同形是热替换成立的依据。"},
+      {"symbol": "ACLGraphWrapper", "why": "替换 CUDAGraphWrapper 的同形类，至少须可见其名与构造签名同形（精简版可只留 __init__ 签名 stub）。"},
+      {"symbol": "_use_aclgraph", "why": "决策是否用 ACLGraph（三条件），下游图相关行为由它门控。"},
+      {"symbol": "_init_device_properties", "why": "override 设备钩子之一（num_sms=None），体现『只 override 设备相关方法』。"},
+      {"symbol": "_sync_device", "why": "override 设备钩子之二（torch.npu.synchronize），同上。"},
+      {"symbol": "capture_model", "why": "图捕获接缝 override，双 wrapper 包父方法的范例。"},
+      {"symbol": "profile_cudagraph_memory", "why": "显存预估接缝 override，双 wrapper 包父方法的范例。"},
+      {"symbol": "AscendSampler", "why": "__init__ 末尾设备相关实体替换（self.sampler）的可检测符号。"},
+      {"symbol": "AscendAttentionState", "why": "attn_state 字段替换的可检测符号。"},
+      {"symbol": "mem_get_info", "why": "父方法实测显存所依赖、被 _torch_cuda_wrapper 改向 npu 的代表符号，须在替换表里可见。"}
+    ]
+  },
+
+  "diagram_plan": [
+    {
+      "name": "ch14-monkeypatch-seam-sequence",
+      "kind": "sequence/timeline (svg-diagram)",
+      "spec": "时间轴展示 capture_model 调用：① NPUModelRunner.capture_model 进入 → ② _get_gpu_model_runner_module_name 定位父模块 → ③ 进入 _torch_cuda_wrapper（torch.cuda.* ↦ torch.npu.*）+ _replace_gpu_model_runner_function_wrapper（父模块 graph_capture↦NPU版、CUDAGraphWrapper↦ACLGraphWrapper）→ ④ GPUModelRunner.capture_model(self) 在替换态下运行（父方法里 graph_capture/mem_get_info/CUDAGraphWrapper 实跑 NPU/ACL）→ ⑤ 退出 with：finally 还原符号。强调『进入装/退出卸』的对称。",
+      "roadmap_highlight": "Part IV worker 层 · NPUModelRunner（与 ch13 NPUWorker 并列高亮，标注 ch13=重写 / ch14=继承+猴补 的对照）"
+    },
+    {
+      "name": "ch14-symbol-replacement-table",
+      "kind": "table/mapping (svg-diagram)",
+      "spec": "两张替换表：A) _torch_cuda_wrapper：torch.cuda.Event→torch.npu.Event、Stream→npu.Stream、synchronize→npu.synchronize、mem_get_info→npu.mem_get_info（+ 失败 placeholder 列）；B) _replace_...：module.graph_capture→NPU graph_capture、module.CUDAGraphWrapper→ACLGraphWrapper。标注作用域『仅 with 内有效』。",
+      "roadmap_highlight": "无（细节图）"
+    },
+    {
+      "name": "ch14-inherit-vs-rewrite",
+      "kind": "contrast (svg-diagram)",
+      "spec": "左：ch13 设备层基座 else-raise 钉死 cuda → NPUWorker 必须重写；右：ch14 父类 GPUModelRunner 用『override 钩子 + 散落 torch.cuda.* + 模块级 graph_capture/CUDAGraphWrapper』表达设备差异 → NPUModelRunner 可继承巨父类、只在窄接缝临时换符号。中间画出『接缝（seam）』概念。",
+      "roadmap_highlight": "无（概念对照图）"
+    }
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recover": [],
+    "note": "scripts/bible.py due ch14 返回空（无应埋伏笔 / 无应回收）。本章可点名前向引用：AscendSampler 内部→采样器章节；AscendAttentionBackend/MLA/AscendAttentionState 实体→Part V（ch18/ch19）；ACLGraph 捕获/重放细节→图模式章节。这些是『点名留坑』，非 bible 登记的强制伏笔。"
+  }
+}
