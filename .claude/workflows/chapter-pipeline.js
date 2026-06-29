@@ -14,16 +14,16 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch09',
-  slug: 'ch09-eplb-expert-load-balancing',
+  chapter_id: 'ch10',
+  slug: 'ch10-pd-disaggregation-mooncake',
   instance: 'vllm-ascend',
-  focus: 'Expert 负载均衡（eplb）：子进程规划 + D2D 权重热迁移。这是 **vLLM 尚未合入、昇腾自带的重型特性**（无基座对位文件，不做逐行对照，只点明它仅借用 vLLM 通信原语 GroupCoordinator.all_gather / dist.P2POp）。主线四块串成一条「在线热迁移专家权重」的流水线：①**EplbUpdator 节拍状态机**——forward_before 启动 expert 权重 D2D 搬运 / forward_end gather moe_load 唤醒规划，靠 cur_iterations + 三个间隔常量（num_iterations / wait_worker / gate）拼出流水线节拍，用 2+ 拍数值追踪走清「哪一拍干什么」；②**EplbProcess 独立子进程**跑均衡策略（planner_q / block_update_q 两条跨进程队列怎么解耦计算与规划）；③**D2DExpertWeightLoader** 异步 P2P 搬权重（dist.P2POp 批量 isend/irecv，搬的是 expert 权重张量）；④**PolicyFactory 策略多态**——讲清接口契约（policy_abstract 抽象基类）+ DefaultEplb 一个代表走完，flashlb / swift 点到为止。讲透「为什么要子进程 + 队列 + 异步搬运」：规划是重 CPU 计算，不能卡在推理主循环里。【本章无基座对位（vLLM 无此特性）；正文写规范 vllm_ascend/… 路径，绝不带 instances/.../source/ 前缀；前置引用 ch08 的 _DYNAMIC_EPLB 组（f6 回收）；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（节拍状态机 / 队列解耦 / 策略多态是纯 Python，可跑；实际 P2P 权重搬运与子进程不真跑）】',
-  highlight: 'ch09',
+  focus: 'PD 分离：连接器分发、mooncake P2P 传输与 KV 亲和调度。昇腾 PD（prefill/decode）分离的三层全貌：**(1) 连接器分发层**——AscendMultiConnector(MultiConnector, SupportsHMA) 子类化 vLLM MultiConnector 加 HMA 支持，按配置把请求路由到三个 mooncake 连接器（MooncakeConnector / MooncakeHybridConnector / MooncakeLayerwiseConnector，均子类化 vLLM KVConnectorBase_V1）；**挑 layerwise 一个讲透** connector 角色 + metadata + 异步 save/load 回调如何嵌进 vLLM 调度循环（对照基座 vllm/…/multi_connector.py 与 base.py 看「子类化加了什么」）。**(2) P2P 传输层**——mooncake_transfer_engine 做 prefill↔decode 节点间跨实例 KV 搬运。**(3) proxy/router 负载均衡层**——load_balance_proxy_server_example 在 P/D 实例间分发请求（讲 proxy 的请求分发调度逻辑）。【★重点小节·KV 亲和（cache-hit-aware）调度——本章高潮】KVPoolScheduler.get_num_new_matched_tokens 经 client.lookup 查「本请求有多少 token 已在外部 KV 命中」，据此把请求**路由/加载到 KV 所在处、最小化跨节点传输**——这是 PD 分离省传输的关键，用一个具体请求做命中→路由的数值追踪走清。本章只引用 pool_scheduler 的**命中查询**做亲和路由，其 store/pool 存取与池调度节拍机制留 ch11（前向引用，别展开）。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py 与 base.py（KVConnectorBase_V1 抽象——昇腾子类化加 HMA/亲和，对照看加了什么）；examples/ 下 proxy server 是真实示例脚本，规范路径写 examples/disaggregated_prefill_v1/…；正文写规范 vllm_ascend/… 与 vllm/… 与 examples/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（连接器分发 / 亲和路由决策 / proxy 分发是纯 Python，可跑；实际 mooncake P2P 传输不真跑）】',
+  highlight: 'ch10',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm-ascend/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
-  skip_dossier: false,
+  skip_dossier: true,
   skip_impl: false,
-  paths: ['vllm_ascend/eplb/eplb_updator.py', 'vllm_ascend/eplb/core/eplb_worker.py', 'vllm_ascend/eplb/core/eplb_device_transfer_loader.py', 'vllm_ascend/eplb/adaptor/vllm_adaptor.py', 'vllm_ascend/eplb/core/policy/policy_factory.py', 'vllm_ascend/eplb/core/policy/policy_abstract.py'],
+  paths: ['vllm_ascend/distributed/kv_transfer/ascend_multi_connector.py', 'vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_layerwise_connector.py', 'vllm_ascend/distributed/kv_transfer/utils/mooncake_transfer_engine.py', 'examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py', 'vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
