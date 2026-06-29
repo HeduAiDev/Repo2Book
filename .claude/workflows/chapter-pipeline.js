@@ -14,16 +14,16 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch14',
-  slug: 'ch14-npumodelrunner-cuda-monkeypatch',
+  chapter_id: 'ch15',
+  slug: 'ch15-single-step-forward-context-dp-sync',
   instance: 'vllm-ascend',
-  focus: '全书最具 OOT 插件味的「旗舰」一章：NPUModelRunner(GPUModelRunner) 怎么**继承 244KB 父类、只 override 设备相关方法**，让庞大的父类逻辑原样复用。**与 ch13 恰成对照**——ch13 NPUWorker 是「重写而非继承」（设备层基座钉死 cuda、继承走不通），ch14 NPUModelRunner 反过来是「**继承 + 运行时猴补**」（父类没把 cuda 钉死在 else-raise、而是散落调 torch.cuda.* 与模块级 graph_capture，于是可以临时换掉这些符号让父类跑在昇腾上）。**核心揭秘**：`_torch_cuda_wrapper()` + `_replace_gpu_model_runner_function_wrapper()`——**临时**把 torch.cuda.Event/Stream/synchronize/mem_get_info 和模块级 graph_capture/CUDAGraphWrapper 替换成 NPU/ACLGraph 版（上下文管理器进出成对装卸），让父类 `capture_model` / `profile_cudagraph_memory` **一行不改**地跑在昇腾上。再讲 `_use_aclgraph()`、CUDAGraph→ACLGraph 的对位、AscendSampler / AscendAttentionState 的替换。把「为什么这种猴补是安全的/临时的」讲透（成对进出、作用域内才生效）。横切点名：本章只讲 ModelRunner 的**设备层猴补与图捕获接缝**，注意力后端实体（AscendAttentionBackend/MLA）留 Part V（ch18/ch19），采样器内部留后续，仅点名。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/v1/worker/gpu_model_runner.py（244KB 父类——昇腾继承它、只换设备符号）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（wrapper 成对装卸 / _use_aclgraph 决策 / 符号替换表是纯 Python，可跑；真实 torch.cuda 符号/ACLGraph 捕获不真跑）】',
-  highlight: 'ch14',
+  focus: '一次 execute_model 的真实数据流——把 ch13/ch14 搭好的台子真正跑一拍。主线顺着一次前向走：NPUModelRunner.execute_model（routed-experts capturer / profiling timing / PCP+MM deepcopy 分支）→ **_prepare_inputs**（attn 元数据前的输入整形）→ **_build_attention_metadata** → **set_ascend_forward_context**（关键接缝：包住 vLLM 的 set_forward_context 再注入昇腾专属上下文——moe_comm_type/method、flashcomm v1/v2、mmrs_fusion、mc2 mask，经 select_moe_comm_method 选定）→ **_model_forward** → **_sample**。**昇腾 forward context 是本章重点**：讲清它在基座 forward_context 之上多塞了哪些「按本拍形状/并行模式动态选的通信方式与掩码」，以及为什么要在每拍前向前算这些。**DP 跨卡同步**：_sync_metadata_across_dp 把 num_tokens + cudagraph_mode 打包 all_reduce——昇腾比基座**额外同步 2 个标志**、可走 NPU device group（讲清为何 DP 各卡必须就这几个量达成一致才能一起进图）。横切点名：注意力元数据的后端实体（AscendAttentionBackend/MLA）留 Part V（ch18），采样器内部留后续，MoE 通信原语（all_to_all/mc2）的实现留 ch26，本章只讲 execute_model 这条主干怎么把它们串起来、在 forward context 里怎么选。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/v1/worker/gpu_model_runner.py（execute_model 主干）与 vllm/forward_context.py（set_forward_context——昇腾包它再注入）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（execute_model 派发骨架 / forward context 注入与 select_moe_comm_method 决策 / DP 同步打包是纯 Python，可跑；真实前向算子/all_reduce 不真跑）】',
+  highlight: 'ch15',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm-ascend/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
   skip_impl: false,
-  paths: ['vllm_ascend/worker/model_runner_v1.py'],
+  paths: ['vllm_ascend/worker/model_runner_v1.py', 'vllm_ascend/ascend_forward_context.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
