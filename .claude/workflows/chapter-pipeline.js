@@ -14,16 +14,16 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch12',
-  slug: 'ch12-kv-offloading-host-cpu',
+  chapter_id: 'ch13',
+  slug: 'ch13-npuworker-execution-control',
   instance: 'vllm-ascend',
-  focus: 'KV 卸载：host/CPU 分层与 OffloadingHandler 对位。昇腾把 KV cache **卸载到 host/CPU** 的两条实现——与 PD 分离（ch10，跨节点 P2P 直传）、KV 池化（ch11，外存储/store 复用）**并列的第三件事**，开篇先把三者边界点清（卸载=device↔host 分层搬运，省的是显存而非重算/跨节点）。两条路径：**(1) 标准路径**——CpuNpuOffloadingHandler（kv_offload/cpu_npu.py，用 torch.npu.Event 做 device↔host 异步分层搬运）+ NPUOffloadingSpec / get_manager → OffloadingManager（kv_offload/npu.py），**对位 vLLM offloading 框架**（对照基座 offloading_connector.py 与 v1/kv_offload/cpu/manager.py 看昇腾实现了哪些钩子）；**(2) 极简路径**——SimpleCPUOffloadNPUWorker.register_kv_caches 重建 block view + NPUDmaCopyBackend（DMA 直拷线程）+ npu_mem_ops。讲透**分层搬运（device↔host）的节拍**与 **block 视图重建**（为什么卸载要重建 block view）。横切点名：权重预取 model_executor/offloader/prefetch.py 是与 KV 卸载同源的「device↔host 数据搬运」一例，点一句不展开。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py 与 simple_cpu_offload_connector.py 与 v1/kv_offload/cpu/manager.py（vLLM 卸载框架——昇腾标准路径对位它）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（分层搬运节拍 / block 视图重建 / DMA 拷贝调度是纯 Python，可跑；实际 device↔host 搬运不真跑）】',
-  highlight: 'ch12',
+  focus: 'NPUWorker：从 WorkerBase 重写执行主控（设备 / 内存 / 编译预热）。进程级执行生命周期——昇腾**重写而非继承**设备层。主线四步走完一个 Worker 的生命周期：**(1) init_device**——npu set_device + workspace 申请 + torch_npu._inductor triton 初始化；**(2) determine_available_memory**——npu memory_profiling + ACLGraph 显存估算 profile_cudagraph_memory，据此回退建议 gpu-memory-utilization（KV cache 能吃多少显存）；**(3) compile_or_warm_up_model**——warmup sizes 预热 + ATB 预热 _warm_up_atb；**(4) execute_model**——派发到 ModelRunner。**核心立意：讲清「为何 Worker 选择重写而非继承」**——对照基座 vllm/v1/worker/gpu_worker.py（继承式）与 worker_base.py，看昇腾哪些方法非重写不可（设备 API/显存语义/编译栈全换）、哪些只是薄改。横切点名：profiler/torch_npu_profiler.py 的 WorkerProfiler 是 NPUWorker 内 torch_npu profiler 的薄包装，点一句不展开；另有一条轻量执行路径 xlite/（XliteModel / xlite_worker / xlite_model_runner）平行于 NPUWorker/NPUModelRunner 主线，仅点名不展开（execute_model 派发 ModelRunner 的细节留给后续 ModelRunner 章）。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/v1/worker/gpu_worker.py 与 worker_base.py（WorkerBase 抽象 + GPU 继承式实现——昇腾对位它重写）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（四步生命周期骨架 / 重写vs继承的方法对位 / 显存回退决策是纯 Python，可跑；真实 npu set_device/memory_profiling/ATB 预热不真跑）】',
+  highlight: 'ch13',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm-ascend/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
-  skip_dossier: false,
+  skip_dossier: true,
   skip_impl: false,
-  paths: ['vllm_ascend/kv_offload/cpu_npu.py', 'vllm_ascend/kv_offload/npu.py', 'vllm_ascend/simple_kv_offload/worker.py', 'vllm_ascend/simple_kv_offload/copy_backend.py', 'vllm_ascend/simple_kv_offload/npu_mem_ops.py'],
+  paths: ['vllm_ascend/worker/worker.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'

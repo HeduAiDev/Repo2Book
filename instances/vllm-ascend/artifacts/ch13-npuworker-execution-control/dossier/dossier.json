@@ -1,0 +1,219 @@
+{
+  "chapter": "ch13",
+  "title": "NPUWorker：从 WorkerBase 重写执行主控（设备 / 内存 / 编译预热）",
+  "thesis": "NPUWorker 不继承 GPU 的 Worker，而是与它平级地从抽象基类 WorkerBase 重新派生：因为 Worker 的设备层（CUDA 设备 API、CUDA 显存语义、CUDA/inductor 编译栈）被硬钉死在 cuda 上，无法只靠继承+薄改改掉。于是 vllm-ascend 把 gpu_worker.py 的『结构/控制流』几乎逐行搬过来（文件头 `Adapted from .../gpu_worker.py`），但把每一处设备调用换成 torch_npu / ATB / ACLGraph。本章用『四步走完一个 Worker 生命周期』串起这件事：init_device → determine_available_memory → compile_or_warm_up_model → execute_model，每一步对照基座看『为何非重写不可』与『哪些只是 cuda→npu 的薄改』。",
+
+  "code_spine": [
+    "vllm_ascend/worker/worker.py:L81  —— class NPUWorker(WorkerBase)：直接派生抽象基类，不继承 GPU Worker",
+    "vllm_ascend/worker/worker.py:L82-L166  —— __init__：adapt_patch / 注册 ATB & customop / init_ascend_config / super().__init__ / cache_dtype / profiler 懒初始化",
+    "vllm_ascend/worker/worker.py:L260-L315  —— _init_device：torch.npu.set_device + torch_npu._inductor + MemorySnapshot + 分布式环境 + triton device 属性",
+    "vllm_ascend/worker/worker.py:L317-L332  —— init_device：保存 self.device + init_workspace_manager + 构造 NPUModelRunner",
+    "vllm_ascend/worker/worker.py:L334-L462  —— determine_available_memory：memory_profiling 包裹 profile_run + profile_cudagraph_memory + 回退建议 gpu-memory-utilization",
+    "vllm_ascend/worker/worker.py:L557-L659  —— compile_or_warm_up_model：warmup_sizes 预热 + capture_model + kv-cache-memory 建议 + _warm_up_atb",
+    "vllm_ascend/worker/worker.py:L661-L665  —— _warm_up_atb：一发 ATB matmul 预热",
+    "vllm_ascend/worker/worker.py:L474-L538  —— execute_model：profile_memory + PP 收发 + 派发 model_runner.execute_model",
+    "对照基座 vllm/v1/worker/worker_base.py:L38-L143  —— WorkerBase 抽象：init_device/execute_model/compile_or_warm_up_model 全是 raise NotImplementedError",
+    "对照基座 vllm/v1/worker/gpu_worker.py:L106,L239-L309  —— class Worker(WorkerBase) 的 init_device 把 device_type 钉死在 'cuda'，非 cuda 直接 raise —— 这就是『不能继承只能重写』的硬证据"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm_ascend/worker/worker.py",
+      "lines": "L16-L17",
+      "code": "# This file is a part of the vllm-ascend project.\n# Adapted from vllm-project/vllm/vllm/worker/gpu_worker.py",
+      "elide": [],
+      "note": "全章立意的物证：worker.py 文件头自己写明『改编自 gpu_worker.py』——结构是搬来的，设备层是换掉的。"
+    },
+    {
+      "path": "vllm_ascend/worker/worker.py",
+      "lines": "L81-L130",
+      "code": "class NPUWorker(WorkerBase):\n    def __init__(\n        self,\n        vllm_config: VllmConfig,\n        local_rank: int,\n        rank: int,\n        distributed_init_method: str,\n        is_driver_worker: bool = False,\n        # Additional parameters for compatibility with vllm\n        **kwargs,\n    ):\n        \"\"\"Initialize the worker for Ascend.\"\"\"\n        ...\n        # register patch for vllm\n        from vllm_ascend.utils import adapt_patch\n\n        adapt_patch()\n\n        # Register ops when worker init.\n        from vllm_ascend import ops\n\n        ops.register_dummy_fusion_op()\n        if get_ascend_device_type() != AscendDeviceType.A5:\n            _register_atb_extensions()\n        register_ascend_customop(vllm_config)\n        # init ascend config and soc version\n        init_ascend_config(vllm_config)\n        check_ascend_device_type()\n\n        super().__init__(\n            vllm_config=vllm_config,\n            local_rank=local_rank,\n            rank=rank,\n            distributed_init_method=distributed_init_method,\n            is_driver_worker=is_driver_worker,\n        )\n\n        if self.cache_config.cache_dtype == \"auto\":\n            self.cache_dtype = self.model_config.dtype\n        else:\n            self.cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[self.cache_config.cache_dtype]\n\n        # Profiler is lazily initialized on first profile(is_start=True) call (RFC #6954)\n        self.profiler_config = vllm_config.profiler_config\n        self.profiler: TorchNPUProfilerWrapper | None = None",
+      "elide": [
+        "省略 COMPILE_CUSTOM_KERNELS 的 warning（L93-97）——只是缺自定义算子时的提醒，不影响主线。",
+        "省略 sleep_mode 缓冲 dict、WEIGHT_LOADER_V2_SUPPORTED 的 FixMe、use_v2_model_runner 回退判断、static_kernel 的 SIGTERM/SIGINT 信号处理（L131-166）——都是旁支特性。"
+      ],
+      "note": "重点：NPUWorker(WorkerBase) —— 基类是抽象的 WorkerBase，不是 GPU 的 Worker。__init__ 在 super() 之前先做昇腾特有的 adapt_patch / ATB 扩展注册 / ascend_config 初始化；super().__init__ 复用 WorkerBase 把 vllm_config 拆成各 config 字段、记 local_rank/rank、device 与 model_runner 置空。profiler 懒初始化、且类型是 TorchNPUProfilerWrapper（横切点，点名不展开）。"
+    },
+    {
+      "path": "vllm/v1/worker/worker_base.py",
+      "lines": "L94-L143",
+      "code": "    def init_device(self) -> None:\n        \"\"\"Initialize device state, such as loading the model or other on-device\n        memory allocations.\n        \"\"\"\n        raise NotImplementedError\n    ...\n    def compile_or_warm_up_model(self) -> CompilationTimes:\n        \"\"\"Prepare model for execution through compilation/warmup.\"\"\"\n        raise NotImplementedError\n    ...\n    def execute_model(\n        self, scheduler_output: SchedulerOutput\n    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:\n        ...\n        raise NotImplementedError",
+      "elide": [
+        "中间省略 get_kv_cache_spec / check_health / load_model 等同样 raise NotImplementedError 的接口声明。"
+      ],
+      "note": "对照基座：WorkerBase 是纯抽象——四步生命周期方法体全是 raise NotImplementedError。NPUWorker 与 GPU 的 Worker 是这同一个抽象的两个平级实现。__init__ 里 super().__init__ 复用的就是 WorkerBase 那段把 vllm_config 摊开成字段的公共逻辑（worker_base.py:L44-L88）。【重排/截断告知 writer，勿当连续逐字片段】本 excerpt 为讲解便利把三个方法按 init_device → compile_or_warm_up_model → execute_model 重排了顺序；真实 worker_base.py 的定义顺序与行号是 compile_or_warm_up_model 在前（L94-100，其 docstring 为 L95-99 共 4 行）、init_device 居中（L106-110）、execute_model 在后（L134-143）——即 L94-105 / L106-133 / L134-143 三段并非连续相邻。此外 compile_or_warm_up_model 的 4 行 docstring（源 L95-99：\"Prepare model for execution through compilation/warmup.\" + 空行 + \"Returns:\" + \"Compilation times (language_model, encoder) in seconds.\"）在此被压成一行，属截断非逐字，writer 引用时勿按连续原样源码呈现。"
+    },
+    {
+      "path": "vllm/v1/worker/gpu_worker.py",
+      "lines": "L239-L309",
+      "code": "    def init_device(self):\n        if self.device_config.device_type == \"cuda\":\n            # This env var set by Ray causes exceptions with graph building.\n            os.environ.pop(\"NCCL_ASYNC_ERROR_HANDLING\", None)\n            ...\n            self.device = torch.device(f\"cuda:{self.local_rank}\")\n            torch.accelerator.set_device_index(self.device)\n\n            current_platform.check_if_supports_dtype(self.model_config.dtype)\n            ...\n            init_worker_distributed_environment(\n                self.vllm_config,\n                self.rank,\n                self.distributed_init_method,\n                self.local_rank,\n                current_platform.dist_backend,\n            )\n            ...\n        else:\n            raise RuntimeError(f\"Not support device type: {self.device_config.device}\")",
+      "elide": [
+        "省略 DP 本地 rank 调整、visible_device_count 断言、内存快照那几段（L243-307）——保留 if cuda / else raise 的骨架即可看清要点。"
+      ],
+      "note": "『为何不能继承只能重写』的硬证据：GPU 的 Worker.init_device 把整段实现包在 `if device_type == \"cuda\"` 里，非 cuda 直接 `raise RuntimeError(Not support device type)`。设备分配（cuda:N / set_device_index）、dtype 检查、HCCL/NCCL 后端全锁死在 CUDA。昇腾若继承它，唯一能走的分支就是 raise——所以必须整方法重写。"
+    },
+    {
+      "path": "vllm_ascend/worker/worker.py",
+      "lines": "L260-L315",
+      "code": "    def _init_device(self):\n        device = torch.device(f\"npu:{self.local_rank}\")\n        torch.npu.set_device(device)\n\n        # Import _inductor for graph mode execution with triton\n        # This lazy import avoids torch_npu re-initialization in patch\n        # Note that this should be imported after torch.npu.set_device\n        # to avoid repeated set_device in extra processes\n        from vllm.triton_utils import HAS_TRITON\n\n        if HAS_TRITON:\n            import torch_npu._inductor  # noqa: F401\n\n        gc.collect()\n        torch.npu.empty_cache()\n        ...\n        # take current memory snapshot\n        self.init_snapshot = MemorySnapshot()\n        self.requested_memory = self.init_snapshot.total_memory * self.cache_config.gpu_memory_utilization\n        if self.init_snapshot.free_memory < self.requested_memory:\n            GiB = lambda b: round(b / GiB_bytes, 2)\n            raise ValueError(\n                f\"Free memory on device \"\n                ...\n            )\n        ...\n        # Initialize the distributed environment.\n        self._init_worker_distributed_environment()\n        # Set random seed.\n        set_random_seed(self.model_config.seed)\n        # Initialize device properties used by triton kernels.\n        init_device_properties_triton()\n\n        return device",
+      "elide": [
+        "省略 A5 设备的 setup_ascend_local_comm_res 分支（L276-277）。",
+        "省略 free_memory < requested_memory 的报错信息文本（L284-292）——意思是启动时空闲显存不够 gpu_memory_utilization 要求就报错。",
+        "省略 data_parallel 下 visible_device_count 的断言块（L294-306）。"
+      ],
+      "note": "重写第 1 步『设备层全换』：device 是 `npu:N`、用 torch.npu.set_device（对位 cuda:N / set_device_index）；编译栈换成 torch_npu._inductor（triton graph 模式）；显存快照 MemorySnapshot、requested_memory = 总显存×gpu_memory_utilization；分布式走 _init_worker_distributed_environment（内部 hccl 后端）；末尾 init_device_properties_triton 给 triton kernel 喂昇腾设备属性。与基座最大差异在『内存快照与分布式初始化的先后顺序』：基座 gpu_worker.py 先初始化分布式、再拍快照（init_worker_distributed_environment 在 gpu_worker.py:L283，紧邻注释 \"This ensures NCCL buffers are allocated before we measure\"；MemorySnapshot 在 L302，注释 \"Now take memory snapshot after NCCL is initialized\"），因此 NCCL 通信 buffer 被计入快照基线、会在 determine_available_memory 里从可用显存中扣除。昇腾相反：先在 worker.py:L280 拍 MemorySnapshot（init_snapshot）、到 L309 才 _init_worker_distributed_environment 初始化 HCCL，HCCL 通信 buffer 在快照之后才分配，故昇腾不把 HCCL buffer 计入快照基线（基线不扣这块）。这是本章计为『与基座最大差异』的关键点，方向务必如此。"
+    },
+    {
+      "path": "vllm_ascend/worker/worker.py",
+      "lines": "L317-L332",
+      "code": "    def init_device(self):\n        # NOTE: KEEP device the member of `NPUWorker`, as it will be checked\n        # in ray scenario. see https://github.com/vllm-project/vllm/pull/26845\n        # for more details\n        self.device = self._init_device()\n        # Initialize workspace manager\n        num_ubatches = 1\n        init_workspace_manager(self.device, num_ubatches)\n        # Init ModelRunner here, so that we have access to self.device.\n        if self.use_v2_model_runner:\n            logger.warning(\"npu model runner v2 is in developing, some features doesn't work for now.\")\n            from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV2\n\n            self.model_runner = NPUModelRunnerV2(self.vllm_config, self.device)\n        else:\n            self.model_runner = NPUModelRunner(self.vllm_config, self.device)",
+      "elide": [
+        "省略 use_v2_model_runner 分支里 V2 runner 的 import（开发中，主线走 else 的 NPUModelRunner）。"
+      ],
+      "note": "init_device 是对外契约（WorkerBase 接口），它薄薄地包住 _init_device：拿到 self.device（注释强调必须存成成员，ray 场景会检查）→ init_workspace_manager 申请 workspace（昇腾 num_ubatches=1，基座 enable_dbo 时为 2）→ 构造 NPUModelRunner（execute_model 派发对象，细节留 ModelRunner 章）。昇腾把设备初始化拆成 _init_device + init_device 两层，基座是一个 init_device。"
+    },
+    {
+      "path": "vllm_ascend/worker/worker.py",
+      "lines": "L334-L406",
+      "code": "    @torch.inference_mode()\n    def determine_available_memory(self) -> int:\n        \"\"\"Profiles the peak memory usage of the model to determine how much\n        memory can be used for KV cache without OOMs.\n        ...\n        \"\"\"\n        GiB = lambda b: b / GiB_bytes\n        ...\n        # Execute a forward pass with dummy inputs to profile the memory usage\n        # of the model.\n        with memory_profiling(\n            self.init_snapshot,\n            weights_memory=int(self.model_runner.model_memory_usage),\n        ) as profile_result:\n            self.model_runner.profile_run()\n\n            # Record torch peak INSIDE the context and BEFORE graph capture,\n            # so that graph pool allocations don't inflate the activation peak.\n            profile_torch_peak = torch.npu.memory_stats(self.device).get(\"allocated_bytes.all.peak\", 0)\n\n            npugraph_memory_estimate = 0\n            should_profile_npugraph_memory = self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE\n            ...\n            if should_profile_npugraph_memory:\n                npugraph_memory_estimate = self.model_runner.profile_cudagraph_memory()\n\n        # Override torch_peak_increase with the pre-graph-capture value to\n        # avoid double-counting graph pool memory as activation memory.\n        profile_result.torch_peak_increase = profile_torch_peak - profile_result.before_profile.torch_peak\n        profile_result.non_kv_cache_memory = (\n            profile_result.non_torch_increase + profile_result.torch_peak_increase + profile_result.weights_memory\n        )\n\n        npugraph_memory_estimate_applied = (\n            npugraph_memory_estimate if envs_vllm.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS else 0\n        )\n\n        # Save per-category memory for use in compile_or_warm_up_model() (step 5).\n        self.peak_activation_memory = profile_result.torch_peak_increase\n        self.non_torch_memory = profile_result.non_torch_increase\n        self.npugraph_memory_estimate = npugraph_memory_estimate",
+      "elide": [
+        "省略 fast path：用户用 --kv-cache-memory 显式指定 KV 大小时只 profile_run 编译模型、跳过显存估算直接返回（L348-361）。",
+        "省略 DeepSeek-V4 DSA 压缩注意力跳过 ACLGraph 显存估算的特例分支（L379-388）。"
+      ],
+      "note": "重写第 2 步『显存语义全换 + 复用基座算法骨架』：算法结构与 gpu_worker.determine_available_memory 几乎逐行同构，只把 torch.cuda.memory_stats→torch.npu.memory_stats、CUDA graph→ACL/NPU graph 换名。要点：memory_profiling 上下文里跑 profile_run（dummy 前向量峰值激活），在『图捕获之前』抓 torch peak 以免把 graph pool 误算进激活；npugraph_memory_estimate 由 model_runner.profile_cudagraph_memory() 给出（ACLGraph 显存估算）；三类显存（non_torch / torch_peak / weights）存成成员供第 3 步复用。"
+    },
+    {
+      "path": "vllm_ascend/worker/worker.py",
+      "lines": "L408-L462",
+      "code": "        free_gpu_memory = profile_result.after_profile.free_memory\n        assert self.init_snapshot.free_memory > free_gpu_memory, (\n            \"Error in memory profiling. \"\n            ...\n        )\n        self.available_kv_cache_memory_bytes = (\n            self.requested_memory - profile_result.non_kv_cache_memory - npugraph_memory_estimate_applied\n        )\n        ...\n        if npugraph_memory_estimate > 0:\n            total_mem = self.init_snapshot.total_memory\n            current_util = self.cache_config.gpu_memory_utilization\n            ng_util_delta = npugraph_memory_estimate / total_mem\n            suggested_util = min(\n                round(current_util + ng_util_delta, 4),\n                1.0,\n            )\n            if envs_vllm.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:\n                equiv_util = round(current_util - ng_util_delta, 4)\n                logger.info(\n                    \"ACL graph memory profiling is enabled (default since \"\n                    \"v0.21.0). The current --gpu-memory-utilization=%.4f is \"\n                    \"equivalent to --gpu-memory-utilization=%.4f without \"\n                    \"ACL graph memory profiling. To maintain the same \"\n                    \"effective KV cache size as before, increase \"\n                    \"--gpu-memory-utilization to %.4f. ...\",\n                    current_util, equiv_util, suggested_util,\n                )\n            else:\n                logger.warning(...)\n\n        return int(self.available_kv_cache_memory_bytes)",
+      "elide": [
+        "省略两支 logger 的完整提示文本（保留算式即可看懂回退建议如何算）。"
+      ],
+      "note": "本步落点：KV cache 能吃多少显存 = requested_memory − 非KV显存 − ACLGraph显存估算（受 VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS 开关控制是否扣）。回退建议是纯 Python 算术：ng_util_delta = ACLGraph显存/总显存，建议把 --gpu-memory-utilization 提到 current+delta（封顶 1.0）以补回被 ACLGraph 占走的那部分 KV。这段是『可跑、可验数值』的决策逻辑，精简版重点保留。"
+    },
+    {
+      "path": "vllm_ascend/worker/worker.py",
+      "lines": "L557-L583",
+      "code": "    def compile_or_warm_up_model(self) -> CompilationTimes:\n        # Note: need to adapt for graph mode.\n        warmup_sizes = (self.vllm_config.compilation_config.compile_sizes or []).copy()\n        if not self.model_config.enforce_eager:\n            cg_capture_sizes: list[int] = []\n            if self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:\n                cg_sizes = self.vllm_config.compilation_config.cudagraph_capture_sizes\n                cg_capture_sizes = [] if cg_sizes is None else cg_sizes\n                warmup_sizes = [x for x in warmup_sizes if x not in cg_capture_sizes]\n\n            compile_ranges = self.vllm_config.compilation_config.get_compile_ranges()\n            # For each compile_range, if none of the batch sizes\n            # in warmup_sizes or cudagraph_capture_sizes are in the range,\n            # add the end of the range to ensure compilation/warmup.\n            all_sizes = set(cg_capture_sizes)\n            all_sizes.update([x for x in warmup_sizes if isinstance(x, int)])\n            for compile_range in compile_ranges:\n                if not any(x in compile_range for x in all_sizes):\n                    warmup_sizes.append(compile_range.end)\n\n        for size in sorted(warmup_sizes, reverse=True):\n            logger.info(\"Compile and warming up model for size %d\", size)\n            self.model_runner._dummy_run(size)\n\n        npugraph_memory_bytes = 0\n        if not self.model_config.enforce_eager:\n            npugraph_memory_bytes = self.model_runner.capture_model()",
+      "elide": [
+        "省略 capture_model 之后『实测 vs 估算 ACLGraph 显存』对比 log（L585-595）与 --kv-cache-memory 建议块（L604-634）——都是诊断输出，不改控制流。"
+      ],
+      "note": "重写第 3 步：与基座 compile_or_warm_up_model 同构。挑出不在 cudagraph 捕获列表里的 warmup_sizes，按 compile_ranges 补端点，从大到小逐个 _dummy_run 触发编译/预热；非 enforce_eager 时 capture_model() 捕获 NPU/ACL graph 并返回其显存占用。注意基座这里还多一步 kernel_warmup(self)（CUDA kernel 调优），昇腾把『算子预热』改放到 _warm_up_atb（ATB 路线）。"
+    },
+    {
+      "path": "vllm_ascend/worker/worker.py",
+      "lines": "L636-L665",
+      "code": "        # Call ATB matmul to warm up; otherwise, the first operation (ReshapeAndCache)\n        # may cause performance degradation at runtime.\n        if get_ascend_device_type() != AscendDeviceType.A5:\n            self._warm_up_atb()\n        ...\n        # Reset the seed to ensure that the random state is not affected by\n        # the model initialization and profiling.\n        set_random_seed(self.model_config.seed)\n        return CompilationTimes(\n            language_model=self.vllm_config.compilation_config.compilation_time,\n            encoder=getattr(\n                self.vllm_config.compilation_config,\n                \"encoder_compilation_time\",\n                0.0,\n            ),\n        )\n\n    def _warm_up_atb(self):\n        x = torch.rand((2, 4), dtype=torch.float16).npu()\n        weight = torch.rand((2, 4), dtype=torch.float16).npu()\n        c = torch.rand((4, 4), dtype=torch.float32).npu()\n        torch_npu._npu_matmul_add_fp32(x, weight, c)",
+      "elide": [
+        "省略 enable_cpu_binding 时 bind_cpus 的 try/except（L642-646）——NUMA 绑核优化，旁支。"
+      ],
+      "note": "昇腾特有的算子预热：_warm_up_atb 故意打一发 ATB 的 matmul_add（torch_npu._npu_matmul_add_fp32），把 ATB 算子库的首次初始化开销提前付掉，否则运行期第一个算子（ReshapeAndCache）会卡。A5 设备跳过。最后返回 CompilationTimes(language_model, encoder)——与 WorkerBase 约定的返回类型对齐，encoder 字段用 getattr 兜底兼容老版本 vLLM。"
+    },
+    {
+      "path": "vllm_ascend/worker/worker.py",
+      "lines": "L464-L512",
+      "code": "    def profile_memory(self) -> None:\n        \"\"\"Profiles the torch reserved memory, torch allocated memory in execute_model().\"\"\"\n        self.torch_reserved = torch.npu.memory_reserved()\n        self.torch_allocated = torch.npu.memory_allocated()\n        ...\n\n    def execute_model(\n        self,\n        scheduler_output: \"SchedulerOutput\",\n    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:\n        self.profile_memory()\n        # enable msMonitor to monitor the performance of vllm-ascend\n        if get_ascend_config().msmonitor_use_daemon:\n            dp.step()\n\n        if self._pp_send_work:\n            for handle in self._pp_send_work:\n                handle.wait()\n            self._pp_send_work = []\n\n        intermediate_tensors = None\n        forward_pass = scheduler_output.total_num_scheduled_tokens > 0\n        if forward_pass and not get_pp_group().is_first_rank:\n            ...\n            intermediate_tensors = AsyncIntermediateTensors(...)\n\n        if self.profiler is not None:\n            self.profiler.step()\n\n        output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)\n        if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):\n            return output",
+      "elide": [
+        "省略非首 PP rank 接收 intermediate tensors 的 all_gather_group/irecv 细节（L490-505）。",
+        "省略 output 为 IntermediateTensors 时的 PP isend 转发与 kv_connector_output 透传（L514-538）——PP/KV 传输旁支，主线只需看『派发给 model_runner.execute_model』。"
+      ],
+      "note": "重写第 4 步『执行派发』：execute_model 本身很薄——量一下 torch 显存（profile_memory，npu 版）、msMonitor 打点（dp.step）、推进 profiler step、把 scheduler_output 直接交给 self.model_runner.execute_model。真正的前向在 NPUModelRunner（留后续章）。非 PP 单机最常路径就是『调 model_runner.execute_model → 返回 ModelRunnerOutput』。结构与基座 execute_model 同构，差别在昇腾加了 profile_memory/dp.step 这类设备侧观测点。"
+    }
+  ],
+
+  "key_classes": [
+    {"name": "NPUWorker", "file": "vllm_ascend/worker/worker.py", "responsibility": "昇腾进程级执行主控，直接派生抽象 WorkerBase（不继承 GPU Worker），负责设备初始化、KV 显存估算、编译预热、执行派发的完整生命周期。"},
+    {"name": "WorkerBase", "file": "vllm/v1/worker/worker_base.py", "responsibility": "vLLM 硬件无关的 Worker 抽象接口：四步生命周期方法全是 raise NotImplementedError，把 vllm_config 摊开成各 config 字段的公共 __init__ 由它提供。"},
+    {"name": "Worker（GPU 对位）", "file": "vllm/v1/worker/gpu_worker.py", "responsibility": "WorkerBase 的 CUDA 实现，init_device 把 device_type 钉死在 'cuda'；是 NPUWorker 的『平级兄弟 + 结构母本』（worker.py 文件头标 Adapted from 它）。"},
+    {"name": "NPUModelRunner", "file": "vllm_ascend/worker/model_runner_v1.py", "responsibility": "execute_model 的派发目标、profile_run/profile_cudagraph_memory/capture_model 的实际执行者；本章只点名，细节留后续 ModelRunner 章。"},
+    {"name": "TorchNPUProfilerWrapper", "file": "vllm_ascend/profiler/torch_npu_profiler.py", "responsibility": "vLLM WorkerProfiler 的子类，把 torch_npu.profiler 接进来；NPUWorker.profiler 的类型，横切点名不展开。"},
+    {"name": "XliteWorker", "file": "vllm_ascend/xlite/xlite_worker.py", "responsibility": "继承 NPUWorker、仅 override init_device 改用 XliteModelRunner 的轻量执行路径；平行于 NPUWorker/NPUModelRunner 主线，仅点名不展开。"}
+  ],
+
+  "data_flow": [
+    "1. WorkerWrapperBase.init_worker → 实例化 NPUWorker(vllm_config, local_rank, rank, ...)：先 adapt_patch + 注册 ATB/customop + init_ascend_config，再 super().__init__ 摊开 config（worker.py:NPUWorker.__init__）",
+    "2. init_device() → _init_device()：torch.npu.set_device(npu:N) + 懒 import torch_npu._inductor + MemorySnapshot 量空闲显存 + _init_worker_distributed_environment(hccl) + init_device_properties_triton（worker.py:_init_device）",
+    "3. init_device() 续：init_workspace_manager(device) + 构造 NPUModelRunner(vllm_config, device)（worker.py:init_device）",
+    "4. load_model() → model_runner.load_model()（worker.py:load_model）",
+    "5. determine_available_memory()：memory_profiling 包裹 model_runner.profile_run() 量峰值激活 → model_runner.profile_cudagraph_memory() 估 ACLGraph 显存 → 算 available_kv_cache_memory_bytes 并给出 gpu-memory-utilization 回退建议（worker.py:determine_available_memory）",
+    "6. initialize_from_config(kv_cache_config) → model_runner.initialize_kv_cache()（worker.py:initialize_from_config）",
+    "7. compile_or_warm_up_model()：按 warmup_sizes 逐个 model_runner._dummy_run(size) 预热 → model_runner.capture_model() 捕获 NPU graph → _warm_up_atb() 预热 ATB 算子 → 返回 CompilationTimes（worker.py:compile_or_warm_up_model）",
+    "8. 稳态循环 execute_model(scheduler_output)：profile_memory() → profiler.step() → model_runner.execute_model(scheduler_output, intermediate_tensors) → 返回 ModelRunnerOutput（worker.py:execute_model）"
+  ],
+
+  "design_decisions": [
+    {"decision": "NPUWorker 从抽象 WorkerBase 重新派生，而非继承 GPU 的 Worker", "why": "GPU Worker.init_device 把整段实现包在 if device_type=='cuda' 里、非 cuda 直接 raise RuntimeError，设备分配/dtype 检查/NCCL 后端全锁死 CUDA；继承它只能走到 raise 分支。改写设备层成本远低于在继承体系里到处打洞，故选择平级重写。", "evidence": "vllm/v1/worker/gpu_worker.py:L240,L308-L309；vllm_ascend/worker/worker.py:L81"},
+    {"decision": "重写但『搬结构、换设备层』——逐行改编自 gpu_worker.py", "why": "determine_available_memory / compile_or_warm_up_model / execute_model 的算法与控制流与基座几乎同构，只把 torch.cuda.*→torch.npu.*、CUDA graph→ACL/NPU graph、kernel_warmup→_warm_up_atb 等设备相关调用替换。复用经过验证的内存估算/预热算法，降低维护漂移。", "evidence": "vllm_ascend/worker/worker.py:L16-L17（Adapted from gpu_worker.py）；对照 L334-462 vs gpu_worker.py:L354-487"},
+    {"decision": "设备初始化拆成 _init_device + init_device 两层", "why": "_init_device 负责纯设备/分布式/显存快照并 return device；init_device 负责把 device 存成成员（ray 场景会检查）、申请 workspace、构造 ModelRunner。拆层让 XliteWorker 只 override init_device 复用 _init_device 即可换 ModelRunner。", "evidence": "vllm_ascend/worker/worker.py:L260,L317-L321；vllm_ascend/xlite/xlite_worker.py:L25-L30"},
+    {"decision": "编译栈换成 torch_npu._inductor，且在 set_device 之后懒 import", "why": "torch_npu 的 triton/inductor graph 模式需要在 set_device 之后初始化，懒 import 避免在 patch 阶段重复初始化 torch_npu、并避免在额外进程里重复 set_device。", "evidence": "vllm_ascend/worker/worker.py:L264-L271"},
+    {"decision": "ACLGraph 显存单独估算并回退建议 gpu-memory-utilization", "why": "ACL/NPU graph pool 会额外吃显存；若不从 KV 预算里扣会 OOM。profile_cudagraph_memory 估出占用，按 VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS 决定是否扣减，并算出等价/建议的 --gpu-memory-utilization 提示用户。", "evidence": "vllm_ascend/worker/worker.py:L377-L406,L427-L460"},
+    {"decision": "新增昇腾特有的 _warm_up_atb 算子预热", "why": "ATB 算子库首次调用有初始化开销，若不提前付掉，运行期第一个算子（ReshapeAndCache）会性能骤降。开服前打一发 ATB matmul 把它热起来。", "evidence": "vllm_ascend/worker/worker.py:L636-L639,L661-L665"}
+  ],
+
+  "theory": [
+    "KV cache 可用显存 = requested_memory − non_kv_cache_memory − (ACLGraph估算, 若开关启用)，其中 requested_memory = total_memory × gpu_memory_utilization，non_kv_cache_memory = non_torch_increase + torch_peak_increase + weights_memory。",
+    "gpu-memory-utilization 回退建议：设 ACLGraph 占总显存比例 delta = npugraph_memory_estimate / total_memory；启用估算时当前 util 等价于『不估算时的 util − delta』，要维持同等 KV 大小需把 util 提到 min(util + delta, 1.0)。这是纯算术、无设备依赖，精简版可跑验数值。",
+    "双计避免：torch peak 在『图捕获之前』抓取（profile_torch_peak），再用它覆写 torch_peak_increase，避免把 graph pool 分配误算成激活峰值——否则激活显存被高估、KV 预算被低估。",
+    "复杂度视角：四步生命周期里 init_device/determine_available_memory/compile_or_warm_up_model 各执行一次（O(模型规模)），execute_model 每个 step 调用一次（稳态热路径，本章只看派发骨架）。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "sleep / wake_up / _sleep_saved_buffers 及 load_model/initialize_from_config 里的 CaMemAllocator 内存池分支", "why_safe": "sleep mode（RL 场景显存腾挪）是独立特性，不在四步生命周期主线；删后用 nullcontext 等价的直路即可，不影响 init/profile/warmup/execute。"},
+      {"what": "uninstall_static_kernel 及 __init__ 里的 static_kernel SIGTERM/SIGINT 信号处理", "why_safe": "static kernel 卸载是 npugraph_ex 的进程退出清理，与执行主控正确性无关。"},
+      {"what": "profile_prefill_latency / profile / profile_memory / TorchNPUProfilerWrapper 接线", "why_safe": "性能剖析与动态分块是观测/调优旁支；execute_model 删掉 profiler.step/profile_memory 仍能正确派发。横切点保留点名即可。"},
+      {"what": "add_lora/remove_lora/list_loras/pin_lora、reset_encoder_cache、take_draft_token_ids、get_kv_connector_handshake_metadata、check_health/parse_text_output、sample_tokens、execute_dummy_batch、update_max_model_len、get_supported_tasks 等转发型方法", "why_safe": "都是薄薄一行转发给 model_runner 或独立子功能，不构成四步主线；保留会冲淡『重写 vs 继承』的核心。"},
+      {"what": "execute_model 中非首/末 PP rank 的 irecv/isend intermediate tensors 与 kv_connector_output 透传分支", "why_safe": "PP/KV transfer 是多卡分布式旁支；单机主线 forward_pass 直接 model_runner.execute_model 返回 ModelRunnerOutput，删 PP 分支不影响该路径正确性。"},
+      {"what": "determine_available_memory 的 kv_cache_memory_bytes fast path 与 DeepSeek-V4 跳过 ACLGraph 估算分支", "why_safe": "前者是用户手动指定 KV 大小的捷径、后者是单模型特例；主线（自动 profiling）不走这两支。"},
+      {"what": "compile_or_warm_up_model 里 ACLGraph 实测vs估算对比 log、--kv-cache-memory 建议 log、enable_cpu_binding 的 bind_cpus", "why_safe": "均为诊断输出/NUMA 绑核优化，不改 warmup→capture→_warm_up_atb 的控制流。"},
+      {"what": "_init_device 里 A5 设备分支、data_parallel visible_device_count 断言、DP local rank 调整", "why_safe": "特定 SoC / 多卡 DP 的环境校验，主线单卡四步生命周期不依赖。"}
+    ],
+    "must_keep": [
+      {"symbol": "NPUWorker", "why": "本章主角类名，writer 全程引用。"},
+      {"symbol": "WorkerBase", "why": "证明『派生抽象基类而非继承 GPU Worker』，是 thesis 的支点。"},
+      {"symbol": "_init_device", "why": "设备层重写第 1 步的实体，set_device/inductor/快照/分布式都在此。"},
+      {"symbol": "init_device", "why": "对外契约方法 + 拆层设计（存 device、init_workspace_manager、构造 NPUModelRunner）。"},
+      {"symbol": "determine_available_memory", "why": "第 2 步 KV 显存估算主方法。"},
+      {"symbol": "compile_or_warm_up_model", "why": "第 3 步编译预热主方法。"},
+      {"symbol": "execute_model", "why": "第 4 步执行派发主方法。"},
+      {"symbol": "_warm_up_atb", "why": "昇腾特有 ATB 算子预热，区别于基座 kernel_warmup 的关键差异点。"},
+      {"symbol": "init_workspace_manager", "why": "workspace 申请，设备初始化第二层的一步。"},
+      {"symbol": "NPUModelRunner", "why": "execute_model 派发对象、profile/capture 执行者，读者需知道控制流交棒给它。"},
+      {"symbol": "memory_profiling", "why": "显存剖析上下文，determine_available_memory 的骨架。"},
+      {"symbol": "profile_cudagraph_memory", "why": "ACLGraph 显存估算来源，回退决策的输入。"},
+      {"symbol": "capture_model", "why": "NPU/ACL graph 捕获，compile_or_warm_up_model 的核心一步。"},
+      {"symbol": "available_kv_cache_memory_bytes", "why": "KV 显存预算的落点变量，公式结论。"},
+      {"symbol": "requested_memory", "why": "= total×gpu_memory_utilization，显存公式的起点。"},
+      {"symbol": "gpu_memory_utilization", "why": "回退建议的调节量，design 立意所在。"},
+      {"symbol": "npugraph_memory_estimate", "why": "ACLGraph 估算值，扣减与建议都依赖它。"},
+      {"symbol": "init_snapshot", "why": "MemorySnapshot 实例，free/total memory 的来源。"},
+      {"symbol": "torch.npu.set_device", "why": "设备层重写最直接的物证（对位 cuda set_device_index）。"},
+      {"symbol": "_init_worker_distributed_environment", "why": "hccl 分布式初始化，设备层重写一环。"},
+      {"symbol": "init_device_properties_triton", "why": "给 triton kernel 喂昇腾设备属性，编译栈差异点。"},
+      {"symbol": "CompilationTimes", "why": "compile_or_warm_up_model 的返回类型，与 WorkerBase 契约对齐。"},
+      {"symbol": "CUDAGraphMode", "why": "判断是否估算/捕获 graph 的开关枚举，多处用到。"}
+    ]
+  },
+
+  "diagram_plan": [
+    {
+      "name": "fig-ch13-rewrite-vs-inherit",
+      "intent": "对照『继承 vs 重写』：左侧 WorkerBase（抽象，4 方法 NotImplementedError）下挂两个平级实现 Worker(GPU, init_device 钉死 cuda) 与 NPUWorker；右侧标注 NPUWorker 文件头 Adapted from gpu_worker.py（搬结构）+ 红色高亮被换掉的设备层（set_device/inductor/hccl/ATB/ACLGraph）。",
+      "spec": "svg-diagram：三层盒图。顶层 WorkerBase 抽象盒；中层两个兄弟盒 Worker / NPUWorker 用虚线箭头指向 WorkerBase（is-a）；NPUWorker→Worker 用一条灰色『Adapted from（搬结构）』注释线；NPUWorker 盒内列出 4 个被换掉的设备调用做红色标记。"
+    },
+    {
+      "name": "fig-ch13-four-step-lifecycle",
+      "intent": "Worker 生命周期四步走时间线：init_device → determine_available_memory → compile_or_warm_up_model → execute_model（稳态循环），每步标出关键设备操作与产物（device/available_kv_cache_memory_bytes/CompilationTimes/ModelRunnerOutput），并标 execute_model 派发给 NPUModelRunner。",
+      "spec": "svg-diagram：横向泳道/管线图，4 个阶段方块串联，最后一个 execute_model 画成自循环；每块下方挂 2-3 个关键调用（torch.npu.set_device / memory_profiling+profile_cudagraph_memory / _dummy_run+capture_model+_warm_up_atb / model_runner.execute_model）。"
+    },
+    {
+      "name": "fig-ch13-kv-memory-budget",
+      "intent": "显存预算分解条形图：total_memory → ×util 得 requested_memory → 扣 weights/peak_activation/non_torch/ACLGraph → 余下 available_kv_cache_memory_bytes；并标回退建议 util += ACLGraph/total。",
+      "spec": "svg-diagram：堆叠条形，从总显存到各扣减段分色，末段高亮 KV cache；旁注回退公式 suggested_util = min(util + npugraph/total, 1.0)。"
+    }
+  ],
+
+  "roadmap_highlight": ["NPUWorker", "执行主控/进程级生命周期", "ModelRunner（下一站）"],
+
+  "foreshadow_due": {"应埋伏笔": [], "应回收": []}
+}
