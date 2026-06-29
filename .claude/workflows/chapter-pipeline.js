@@ -14,16 +14,16 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch11',
-  slug: 'ch11-kv-pooling-ascend-store',
+  chapter_id: 'ch12',
+  slug: 'ch12-kv-offloading-host-cpu',
   instance: 'vllm-ascend',
-  focus: 'KV 池化与 ascend_store：外存储层与池调度。把 KV cache **卸载到独立的池化后端、跨请求/跨实例复用**。主线：①**入口**——ascend_store_connector.py（子类化 vLLM KVConnectorBase_V1）怎么把池化接进引擎；②**两端协作**——pool_scheduler.py（池调度器节拍）与 pool_worker.py（池 worker 异步搬运）如何拆成两端、与引擎主循环解耦（讲清节拍：调度器决定搬什么、worker 异步搬，背压/解耦机制）；③**数据通路**——kv_transfer.py 做实际 KV 搬运；④**可插拔后端**——backend/mooncake_backend.py 一个代表讲透后端契约，cpu_offload / lmcache / ucm 等其余后端点名。【关键对比·与 ch10 PD 分离区分清楚】PD 分离（ch10）是**节点间 P2P 直传**（prefill→decode 点对点）；KV 池化是**经外存储层中转/复用**（写进池、别的请求/实例再从池里捞）——同样是省重算，但一个是直传、一个是池化复用，节拍与拓扑不同。回收 ch10 留的「store/pool 存取与池调度节拍留 ch11」前向引用。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/distributed/kv_transfer/kv_connector/v1/base.py（KVConnectorBase_V1 抽象）与 offloading_connector.py（vLLM 的卸载连接器——对照看昇腾池化的相似与不同）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（池调度节拍 / 两端解耦 / 后端契约是纯 Python，可跑；实际池存取与搬运不真跑）】',
-  highlight: 'ch11',
+  focus: 'KV 卸载：host/CPU 分层与 OffloadingHandler 对位。昇腾把 KV cache **卸载到 host/CPU** 的两条实现——与 PD 分离（ch10，跨节点 P2P 直传）、KV 池化（ch11，外存储/store 复用）**并列的第三件事**，开篇先把三者边界点清（卸载=device↔host 分层搬运，省的是显存而非重算/跨节点）。两条路径：**(1) 标准路径**——CpuNpuOffloadingHandler（kv_offload/cpu_npu.py，用 torch.npu.Event 做 device↔host 异步分层搬运）+ NPUOffloadingSpec / get_manager → OffloadingManager（kv_offload/npu.py），**对位 vLLM offloading 框架**（对照基座 offloading_connector.py 与 v1/kv_offload/cpu/manager.py 看昇腾实现了哪些钩子）；**(2) 极简路径**——SimpleCPUOffloadNPUWorker.register_kv_caches 重建 block view + NPUDmaCopyBackend（DMA 直拷线程）+ npu_mem_ops。讲透**分层搬运（device↔host）的节拍**与 **block 视图重建**（为什么卸载要重建 block view）。横切点名：权重预取 model_executor/offloader/prefetch.py 是与 KV 卸载同源的「device↔host 数据搬运」一例，点一句不展开。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py 与 simple_cpu_offload_connector.py 与 v1/kv_offload/cpu/manager.py（vLLM 卸载框架——昇腾标准路径对位它）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（分层搬运节拍 / block 视图重建 / DMA 拷贝调度是纯 Python，可跑；实际 device↔host 搬运不真跑）】',
+  highlight: 'ch12',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm-ascend/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
   skip_impl: false,
-  paths: ['vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py', 'vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py', 'vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py', 'vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py', 'vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py'],
+  paths: ['vllm_ascend/kv_offload/cpu_npu.py', 'vllm_ascend/kv_offload/npu.py', 'vllm_ascend/simple_kv_offload/worker.py', 'vllm_ascend/simple_kv_offload/copy_backend.py', 'vllm_ascend/simple_kv_offload/npu_mem_ops.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
