@@ -14,16 +14,16 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch15',
-  slug: 'ch15-single-step-forward-context-dp-sync',
+  chapter_id: 'ch16',
+  slug: 'ch16-kv-cache-allocation-reshape-bind',
   instance: 'vllm-ascend',
-  focus: '一次 execute_model 的真实数据流——把 ch13/ch14 搭好的台子真正跑一拍。主线顺着一次前向走：NPUModelRunner.execute_model（routed-experts capturer / profiling timing / PCP+MM deepcopy 分支）→ **_prepare_inputs**（attn 元数据前的输入整形）→ **_build_attention_metadata** → **set_ascend_forward_context**（关键接缝：包住 vLLM 的 set_forward_context 再注入昇腾专属上下文——moe_comm_type/method、flashcomm v1/v2、mmrs_fusion、mc2 mask，经 select_moe_comm_method 选定）→ **_model_forward** → **_sample**。**昇腾 forward context 是本章重点**：讲清它在基座 forward_context 之上多塞了哪些「按本拍形状/并行模式动态选的通信方式与掩码」，以及为什么要在每拍前向前算这些。**DP 跨卡同步**：_sync_metadata_across_dp 把 num_tokens + cudagraph_mode 打包 all_reduce——昇腾比基座**额外同步 2 个标志**、可走 NPU device group（讲清为何 DP 各卡必须就这几个量达成一致才能一起进图）。横切点名：注意力元数据的后端实体（AscendAttentionBackend/MLA）留 Part V（ch18），采样器内部留后续，MoE 通信原语（all_to_all/mc2）的实现留 ch26，本章只讲 execute_model 这条主干怎么把它们串起来、在 forward context 里怎么选。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/v1/worker/gpu_model_runner.py（execute_model 主干）与 vllm/forward_context.py（set_forward_context——昇腾包它再注入）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（execute_model 派发骨架 / forward context 注入与 select_moe_comm_method 决策 / DP 同步打包是纯 Python，可跑；真实前向算子/all_reduce 不真跑）】',
-  highlight: 'ch15',
+  focus: 'KV cache 在昇腾上的落地：分配、reshape 与绑定——补全执行脊柱的**内存几何面**（ch13 算预算、ch15 跑前向，本章管 KV 张量怎么在 NPU 显存里摆）。主线顺着 KV cache 的物化走：**initialize_kv_cache_tensors** → **_allocate_kv_cache_tensors**（昇腾内存几何差异：int8 cache、sparse-c8 indexer tensors、内存对齐 _align_memory/_align_up——为什么昇腾要对齐、对齐到多少）→ **_reshape_kv_cache_tensors**（NPU 布局调整 _adjust_kv_layout——昇腾 KV 物理布局与 GPU 的差异）→ **bind**（按模型特化：DeepSeek-V4 层序 / longcat 双 module / hamming sparse）。辅以 get_kv_cache_spec 与 may_reinitialize_input_batch。**核心立意**：讲清昇腾在「KV 显存几何」上相对基座做了哪些非改不可的事（int8 量化 KV、对齐约束、布局重排），对照基座 gpu_model_runner.py 的同名方法看差异。交叉引用：KV cache spec 的 patch（AscendMLAAttentionSpec/page_size_bytes 等）已在 ch04 讲过、此处回指；KV cache 的运行期管理（block 分配/前缀缓存）留 ch22。横切点名：具体 attention 后端如何用这些 KV 张量留 Part V（ch18+）。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/v1/worker/gpu_model_runner.py（initialize/_allocate/_reshape KV cache 同名方法——昇腾覆写它们改内存几何）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（分配/对齐算术 _align_up、reshape 维度推导、bind 按模型分派是纯 Python，可跑；真实 NPU 显存分配/torch_npu 布局不真跑）】',
+  highlight: 'ch16',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm-ascend/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
   skip_impl: false,
-  paths: ['vllm_ascend/worker/model_runner_v1.py', 'vllm_ascend/ascend_forward_context.py'],
+  paths: ['vllm_ascend/worker/model_runner_v1.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
