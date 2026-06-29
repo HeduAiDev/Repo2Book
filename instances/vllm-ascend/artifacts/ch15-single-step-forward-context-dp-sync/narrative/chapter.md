@@ -221,7 +221,7 @@ if not is_context_moe_model:
     return True
 ```
 
-逻辑很直接：**dense（非 MoE）模型根本没有那个会错位的跨卡集合通信，直接跳。** 只有 MoE 模型才需要同步；而 MoE 里也有一类例外——PD 分离（Prefill/Decode separation，把前缀填充和解码拆到不同卡处理）的解码侧、且 prefill/decode 都走 MC2 时，这类 MoE 各卡 token 数本就允许不同，也能跳。跳过意味着各卡 token 数互不干涉，省下这次 all_reduce。
+逻辑很直接：**dense（非 MoE）模型根本没有那个会错位的跨卡集合通信，直接跳。** 只有 MoE 模型才需要同步；而 MoE 里也有一类例外——PD 分离（见 [第 10 章](../ch10-pd-disaggregation-mooncake/narrative/chapter.md)）的解码侧、且 prefill/decode 都走 MC2 时，这类 MoE 各卡 token 数本就允许不同，也能跳。跳过意味着各卡 token 数互不干涉，省下这次 all_reduce。
 
 还有那个 `dp_allreduce_on_npu` 开关，值得记一句。注释写明：某些设备上 **CPU 侧的 all_reduce 可能返回脏数据**。开启这个开关后，DP 元数据同步改走 NPU device group，规避数据损坏——代价是结果要多一次 `.cpu()` 拷回 host。这是昇腾踩过坑后留下的一道保险。
 
@@ -259,7 +259,7 @@ if self.vllm_config.parallel_config.data_parallel_size > 1:
 
 最后那行 `assert` 是道保险：重新 dispatch 出来的 batch 描述符，其 token 数必须正好等于商定值，否则 `num_tokens_across_dp` 就对不上了，后面 forward context 里的一切 padding 都会跟着错。
 
-到这里，「这一拍怎么跑」彻底定了：token 补到几、进不进图、进哪种图。中间还有一步 `_build_attention_metadata` 建注意力元数据——它产出 `attn_metadata` 交给前向，但后端实体（`AscendAttentionBackend` / MLA）是 [第 18 章](../ch18-attention-backend-mla/narrative/chapter.md) 的主角，本章只用到「建好了、能交给前向」这个接口语义。接下来就是全章的题眼——前向那层 `with` 包裹。
+到这里，「这一拍怎么跑」彻底定了：token 补到几、进不进图、进哪种图。中间还有一步 `_build_attention_metadata` 建注意力元数据——它产出 `attn_metadata` 交给前向，但「该用哪个后端」的选择机制是 [第 18 章](../ch18-attention-backend-selection/narrative/chapter.md) 的主角，而 MHA / MLA 的真实算子分别留到后面的第 19、20 章，本章只用到「建好了、能交给前向」这个接口语义。接下来就是全章的题眼——前向那层 `with` 包裹。
 
 ## 15.5 昇腾 forward context：包住基座，再注入
 
@@ -671,4 +671,4 @@ def _sample(self, logits, spec_decode_metadata):
 
 两个接缝都体现了同一种插件哲学：**不动上游，包一层、注一手，让昇腾的并行决策随前向一路流下去。**
 
-这一拍里，我们三次「点到为止」，给后面三章留了引子。注意力元数据建好了，但 `AscendAttentionBackend` / MLA 的真实算子是 [第 18 章](../ch18-attention-backend-mla/narrative/chapter.md) 的事；MoE 通信方式选定了，但 MC2 / all_to_all 这些原语怎么落地，是 [第 26 章](../ch26-moe-communication-primitives/narrative/chapter.md) 的主场；logits 派给了采样器，采样器内部留给后续的采样章。台子转起来了，下一章我们就钻进注意力，看 `attn_metadata` 背后那些真正碰 NPU 的算子。
+这一拍里，我们三次「点到为止」，给后面三章留了引子。注意力元数据建好了，但「该选哪个注意力后端」的机制是 [第 18 章](../ch18-attention-backend-selection/narrative/chapter.md) 的事，MHA / MLA 的真实算子则留到第五部分注意力后端各章（第 19、20 章）；MoE 通信方式选定了，但 MC2 / all_to_all 这些原语怎么落地，是 [第 26 章](../ch26-moe-communication-primitives/narrative/chapter.md) 的主场；logits 派给了采样器，采样器内部留给后续的采样章。台子转起来了，下一章我们就钻进注意力，看 `attn_metadata` 背后那些真正碰 NPU 的算子。

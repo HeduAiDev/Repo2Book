@@ -90,7 +90,7 @@ def initialize_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[st
 
 ## 16.2 对齐原语：为什么是 2MB，怎么对齐到 2MB
 
-分配的第一个常量，是 `_allocate_kv_cache_tensors` 开头那行 `alignment = 2 * 1024 * 1024`——2MB。为什么是 2MB？这要从 [PD 分离](../ch10-pd-disaggregation-mooncake/narrative/chapter.md)说起：PD（prefill-decode）分离把预填充与解码拆到不同节点上跑，prefill 节点算完的 KV 要跨节点搬给 decode 节点，Mooncake/ADXL 就是承担这趟搬运的分布式 KV 传输系统。它走 RDMA、把 KV 张量注册成可被远端直读的内存区间，而这套注册要求**起始地址按 2MB 大页边界对齐**。对不齐，注册就失败。
+分配的第一个常量，是 `_allocate_kv_cache_tensors` 开头那行 `alignment = 2 * 1024 * 1024`——2MB。为什么是 2MB？这要从 [PD 分离（见第 10 章）](../ch10-pd-disaggregation-mooncake/narrative/chapter.md)说起：prefill 节点算完的 KV 要跨节点搬给 decode 节点，Mooncake/ADXL 就是承担这趟搬运的分布式 KV 传输系统。它走 RDMA、把 KV 张量注册成可被远端直读的内存区间，而这套注册要求**起始地址按 2MB 大页边界对齐**。对不齐，注册就失败。
 
 要先说清楚一件事：**这段对齐只在开了 KV 传输（即配置了 `kv_transfer_config`）时才真正生效**，没开传输时分配走的是另一条不对齐的快路——下一节 [§16.3](#163-int8-裸分配--把-kv-拆成两块) 见分晓。
 

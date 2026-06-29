@@ -8,7 +8,7 @@
 
 第四部分一路走来，我们看的都是昇腾的「主力卡」——910B 这一代训推一体的芯片。它能跑 MLA、能用 Triton、能开 custom op，vLLM 上游有的能力它基本都接得住。[第 14 章](../ch14-npumodelrunner-cuda-monkeypatch/narrative/chapter.md) 里我们见过 `NPUModelRunner` 怎么靠「继承 vLLM 基类 + 临时猴补」把一整套 GPU 执行路径搬到 NPU 上。
 
-可昇腾不止一种卡。Atlas 300I DUO 上的 **310P 是一块纯推理芯片**——它没有 Triton、不支持 MLA、不支持 KV 传输、显存与权重格式都受限。把上面那套主力卡的执行栈原样搬过去，第一脚就会踩空：slot mapping 要调的 Triton kernel 不存在（Triton 是用 Python 在 GPU/NPU 上写优化算子内核的框架，下文会反复碰到），注意力后端要选的 MLA 不支持，KV 清零的 Triton 路径跑不起来。
+可昇腾不止一种卡。Atlas 300I DUO 上的 **310P 是一块纯推理芯片**——它没有 Triton、不支持 MLA、不支持 KV 传输、显存与权重格式都受限。把上面那套主力卡的执行栈原样搬过去，第一脚就会踩空：slot mapping 要调的 Triton kernel（[见第 13 章](../ch13-npuworker-execution-control/narrative/chapter.md)）不存在，注意力后端要选的 MLA 不支持，KV 清零的 Triton 路径跑不起来。
 
 那 310P 怎么办？最省事的想法是「整套再子类化一层」——把昇腾主栈的每个类都派生一个 `*310` 出来。但真实的代码没这么一刀切。`vllm_ascend/_310p/` 这个目录干的是一件更克制、也更有意思的事：**按组件挑继承深度**。有的组件三层继承（vLLM → 昇腾主栈 → 310），有的组件昇腾主栈本就是独立重写、310 建在它上面，还有的组件跟昇腾主栈八竿子打不着、310 干脆直接两层继承 vLLM 基类、跳过中间层。
 

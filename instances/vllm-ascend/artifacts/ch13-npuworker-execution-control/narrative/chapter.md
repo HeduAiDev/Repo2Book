@@ -487,7 +487,7 @@ def execute_model(
 
 剥掉多卡 PP 的收发和观测打点，单机最常走的主线只有三步：量一下 torch 显存（`profile_memory`，采样当前显存统计供调优诊断）、推进 `profiler.step()`、然后把 `scheduler_output` **直接交给 `self.model_runner.execute_model`**，拿回 `ModelRunnerOutput` 返回。开头那句 `dp.step()` 也是同一类东西——仅当 `msmonitor_use_daemon` 打开时，推进 msMonitor 性能监控守护进程。`profile_memory` / `dp.step` / `profiler.step` 三者都是**可选的观测钩子**，不参与前向计算本身，读主线时把它们当旁注略过即可。
 
-`NPUWorker` 在这一步的角色就是个**派发器**——真正的前向、采样、KV 写入，全在 `NPUModelRunner` 里。这也呼应了开头说的「本章只是脑壳」：`execute_model` 把控制权交棒出去，[第 14 章 NPUModelRunner](../ch14-npu-model-runner-monkeypatch/narrative/chapter.md) 才是接住这一棒、跑通一次真实前向的地方。和基座 `execute_model` 对比，结构同构，差别只在昇腾多了 `profile_memory` / `dp.step` 这类设备侧观测点。
+`NPUWorker` 在这一步的角色就是个**派发器**——真正的前向、采样、KV 写入，全在 `NPUModelRunner` 里。这也呼应了开头说的「本章只是脑壳」：`execute_model` 把控制权交棒出去，[第 14 章 NPUModelRunner](../ch14-npumodelrunner-cuda-monkeypatch/narrative/chapter.md) 才是接住这一棒、跑通一次真实前向的地方。和基座 `execute_model` 对比，结构同构，差别只在昇腾多了 `profile_memory` / `dp.step` 这类设备侧观测点。
 
 ## 13.8 横切两点与一条平行路径：profiler 与 xlite
 
@@ -511,4 +511,4 @@ GPU 的 `Worker.init_device` 把设备层钉死在 `if device_type == "cuda"`、
 
 而**该共用的照样共用**：`super().__init__` 复用 `WorkerBase` 摊开 config 的公共逻辑，四步生命周期的算法骨架逐行同构。重写的边界，精准地画在「碰硬件的那几行」上——这就是 vllm-ascend 在执行层最克制、也最重的一笔手术。
 
-`execute_model` 把控制权交给了 `NPUModelRunner`。它接棒之后怎么跑前向、又是怎么用「继承 + 运行时猴补」这套和 Worker 截然不同的策略顶替 GPU 的 ModelRunner——[第 14 章](../ch14-npu-model-runner-monkeypatch/narrative/chapter.md) 见分晓。
+`execute_model` 把控制权交给了 `NPUModelRunner`。它接棒之后怎么跑前向、又是怎么用「继承 + 运行时猴补」这套和 Worker 截然不同的策略顶替 GPU 的 ModelRunner——[第 14 章](../ch14-npumodelrunner-cuda-monkeypatch/narrative/chapter.md) 见分晓。
