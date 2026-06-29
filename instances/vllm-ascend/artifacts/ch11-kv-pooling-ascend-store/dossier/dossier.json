@@ -1,0 +1,254 @@
+{
+  "chapter_id": "ch11",
+  "title": "KV 池化与 ascend_store：外存储层与池调度",
+  "source_pin": "vllm-ascend v0.21.0rc1 (commit 80610e44); 对照基座 vLLM v0.21.0",
+  "one_line": "把 KV cache 卸载到一个独立的、可插拔的池化后端（Mooncake 等），按 chunk-hash 命名跨请求/跨实例复用；scheduler 端决定『搬什么』、worker 端用后台线程异步『搬』，经一层薄的 Backend put/get/exists 契约落到外存储——与 ch10 PD 分离的节点间 P2P 直传相对，这里是经外存储层中转/复用。",
+
+  "code_spine": [
+    "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py:L73-L114  AscendStoreConnector(KVConnectorBase_V1, SupportsHMA).__init__ — 入口：按 role 二选一实例化 KVPoolScheduler（SCHEDULER 进程）或 KVPoolWorker（WORKER 进程），rank0 额外起 LookupKeyServer（lookup RPC 服务端）",
+    "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py:L120-L269  连接器的薄分发层 — 调度侧方法转发给 connector_scheduler，worker 侧方法转发给 connector_worker（vLLM 引擎主循环通过 KVConnectorBase_V1 这些钩子驱动）",
+    "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py:L224-L293  KVPoolScheduler.get_num_new_matched_tokens — 经 LookupKeyClient.lookup 问外部池『本请求多少前缀 token 已在池中』，算 need_to_allocate，建 LoadSpec（决定『搬什么/搬多少』的第一步）",
+    "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py:L295-L348  KVPoolScheduler.update_state_after_alloc — vLLM 分配好临时 block 后回填 can_load=True，并校验 num_external_tokens 与 LoadSpec 缺口一致",
+    "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py:L350-L530  KVPoolScheduler.build_connector_meta — 调度器的『节拍』：把本步要 load/save 的请求打包成 AscendConnectorMetadata（每请求一个 ReqMeta，带 load_spec / can_save），随 SchedulerOutput 下发给 worker",
+    "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py:L631-L679  LookupKeyClient.lookup + get_zmq_rpc_path_lookup — 调度进程经 zmq REQ→REP（ipc socket）向 worker 端的 LookupKeyServer 查命中前缀长度",
+    "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py:L195-L211  KVPoolWorker.__init__ 后端选择 — backend_map 按 extra_config['backend'] 动态 import 一个 Backend 实现（mooncake/memcache/yuanrong），存到 self.m_store",
+    "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py:L339-L459  KVPoolWorker.register_kv_caches — 把本机 KV cache 显存区段注册进后端（register_buffer），并按 role/load_async 起后台搬运线程（KVCacheStoreSendingThread / KVCacheStoreRecvingThread）——两端解耦的 worker 侧落地",
+    "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py:L461-L574  KVPoolWorker.start_load_kv — 对每个带可 load 的 LoadSpec 的请求：load_async 时 add_request 丢进 recv 线程队列（不阻塞主循环）；同步时直接 m_store.get；失败块记入 _invalid_block_ids",
+    "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py:L619-L649  KVPoolWorker.wait_for_save — 把 can_save 的请求 add_request 进 send 线程，末尾 request_queue.join() 作背压屏障，保证 put 完成（store 可见）后才报告请求 finished",
+    "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py:L789-L847  KVPoolWorker.get_finished / get_and_clear_finished_requests — 引擎轮询哪些请求的异步收/发已完成（done_sending/done_recving），据此放行 block",
+    "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py:L24-L98  KVTransferThread(threading.Thread) — 搬运线程基类：request_queue 单消费者循环，run() 里 set_device 后 while True 取请求调 _handle_request（worker 主循环与 IO 解耦的核心）",
+    "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py:L269-L400  KVCacheStoreSendingThread._handle_request — save 路径：process_tokens 生成 (start,end,key)，先 lookup 去重（已在池中的跳过），仅对 missing 块 prepare_value 取 (addr,size) 后 m_store.put",
+    "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py:L403-L496  KVCacheStoreRecvingThread._handle_request — async load 路径：组 key/addr/size，m_store.get，失败块经 record_failed_blocks 记入 _invalid_block_ids，set_finished_request",
+    "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/config_data.py:L20-L118  KeyMetadata / PoolKey.to_string — 池中 KV 的命名：model@pcp@dcp@head_or_tp_rank@pp_rank@group@cache_role@cache_family@chunk_hash（跨请求/跨实例复用的命名空间）",
+    "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/config_data.py:L332-L383  ChunkedTokenDatabase.process_tokens — 用 prefix block_hashes 把 token 序列切成 chunk、每 chunk 生成一个 PoolKey（store/lookup/load 共用的 key 生成器）",
+    "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/config_data.py:L292-L315  ChunkedTokenDatabase.prepare_value — 由 block_id 与注册的 base_addr/block_len/stride 算出该 chunk 在显存里的 (addr, size)，喂给后端 put/get",
+    "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/backend.py:L6-L29  Backend(ABC) — 可插拔后端契约：__init__/set_device/register_buffer/exists/put/get 六个抽象方法",
+    "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py:L61-L263  MooncakeBackend(Backend) — 一个代表实现：setup 连 Mooncake 分布式 store，exists→batch_is_exist、put→batch_put_from_multi_buffers、get→batch_get_into_multi_buffers"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/backend.py",
+      "lines": "L6-L29",
+      "code": "class Backend(ABC):\n    @abstractmethod\n    def __init__(self, parallel_config: ParallelConfig):\n        pass\n\n    @abstractmethod\n    def set_device(self):\n        pass\n\n    @abstractmethod\n    def register_buffer(self, ptrs: list[int], lengths: list[int]):\n        pass\n\n    @abstractmethod\n    def exists(self, keys: list[str]) -> list[int]:\n        pass\n\n    @abstractmethod\n    def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):\n        pass\n\n    @abstractmethod\n    def get(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):\n        pass",
+      "elide": ["无可省略——这是整套可插拔后端的全部契约，只 6 个方法：注册显存区段(register_buffer)、按 key 查在不在(exists)、把 (addr,size) 区段写入池(put)、把池里的数据读回 (addr,size)(get)。"]
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py",
+      "lines": "L73-L114",
+      "code": "class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):\n    def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig | None = None):\n        super().__init__(vllm_config=vllm_config, role=role, kv_cache_config=kv_cache_config)\n        self.kv_role = vllm_config.kv_transfer_config.kv_role\n\n        self.use_layerwise = vllm_config.kv_transfer_config.kv_connector_extra_config.get(\"use_layerwise\", False)\n        self.consumer_is_to_put = vllm_config.kv_transfer_config.kv_connector_extra_config.get(\n            \"consumer_is_to_put\", False\n        )\n\n        self.kv_caches: dict[str, torch.Tensor] = {}\n\n        if role == KVConnectorRole.SCHEDULER:\n            self.connector_scheduler = KVPoolScheduler(vllm_config, self.use_layerwise, kv_cache_config)\n        else:\n            self.connector_worker = KVPoolWorker(\n                vllm_config,\n                self.use_layerwise,\n                kv_cache_config,\n            )\n\n            assert self.connector_worker is not None\n            if vllm_config.parallel_config.rank == 0:\n                self.lookup_server = LookupKeyServer(self.connector_worker, vllm_config, self.use_layerwise)",
+      "elide": ["省略：DSV4 compress 相关的 self.consumer_is_to_put/MooncakeConnectorStoreV1 弃用警告、kv_events 聚合字段(_kv_cache_events)、requires_piecewise_for_cudagraph。核心是 role 二分派 + rank0 起 lookup 服务端。"]
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py",
+      "lines": "L120-L133, L194-L210, L228-L244",
+      "code": "    # —— Scheduler 侧：转发给 connector_scheduler ——\n    def get_num_new_matched_tokens(self, request: \"Request\", num_computed_tokens: int) -> tuple[int, bool]:\n        assert self.connector_scheduler is not None\n        return self.connector_scheduler.get_num_new_matched_tokens(request, num_computed_tokens)\n\n    def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:\n        assert self.connector_scheduler is not None\n        return self.connector_scheduler.build_connector_meta(scheduler_output)\n\n    # —— Worker 侧：转发给 connector_worker ——\n    def start_load_kv(self, forward_context: \"ForwardContext\", **kwargs) -> None:\n        assert self.connector_worker is not None\n        metadata = self._get_connector_metadata()\n        self.connector_worker.start_load_kv(metadata)\n\n    def wait_for_save(self):\n        if self.kv_role == \"kv_consumer\" and not self.consumer_is_to_put:\n            return\n        if self.use_layerwise:\n            return\n        self.connector_worker.wait_for_save(self._get_connector_metadata())\n\n    def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:\n        \"\"\"Get the finished recving and sending requests.\"\"\"\n        assert self.connector_worker is not None\n        done_sending, done_recving = self.connector_worker.get_finished(\n            finished_req_ids, self._get_connector_metadata()\n        )\n        return done_sending, done_recving",
+      "elide": ["这是连接器的『薄分发层』缩影：AscendStoreConnector 本身几乎没有逻辑，KVConnectorBase_V1 的每个钩子都按 scheduler/worker 转发给两端之一。省略 update_state_after_alloc / request_finished / save_kv_layer / wait_for_layer_load 等其余同构转发（结构完全一样）。"]
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py",
+      "lines": "L224-L293",
+      "code": "    def get_num_new_matched_tokens(\n        self,\n        request: \"Request\",\n        num_computed_tokens: int,\n    ) -> tuple[int, bool]:\n        \"\"\"\n        Check for external KV cache hit.\n\n        Returns:\n            the number of tokens that can be loaded from the\n            external KV cache beyond what is already computed.\n        \"\"\"\n        if self.kv_role == \"kv_consumer\" and not self.consumer_is_to_load:\n            return 0, False\n\n        if self._discard_partial_chunks:\n            token_len = self._floor_to_cache_transfer_granularity(len(request.prompt_token_ids))\n        else:\n            token_len = len(request.prompt_token_ids)\n\n        if token_len < self.cache_transfer_granularity:\n            return 0, False\n\n        num_external_hit_tokens = self.client.lookup(\n            token_len,\n            request.block_hashes,\n            self.kv_cache_group_ids,\n        )\n\n        if num_external_hit_tokens == request.num_tokens:\n            num_external_hit_tokens -= 1\n\n        if num_external_hit_tokens < num_computed_tokens:\n            need_to_allocate = 0\n        else:\n            need_to_allocate = num_external_hit_tokens - num_computed_tokens\n\n        if need_to_allocate <= 0:\n            return 0, False\n\n        self.load_specs[request.request_id] = LoadSpec(\n            vllm_cached_tokens=num_computed_tokens,\n            kvpool_cached_tokens=num_external_hit_tokens,\n            can_load=False,\n        )\n\n        return need_to_allocate, self.load_async and not self.use_layerwise",
+      "elide": ["省略两处 logger.debug/info。要点：①问池『命中多少前缀』(client.lookup)；②若命中=全部 prompt 则减 1 保证至少 1 token 跑前向；③need_to_allocate = 命中 − vLLM 本地已算；④登记 LoadSpec(can_load 暂 False，待 alloc 后置 True)；⑤返回值第二位 = 是否异步 load。"]
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py",
+      "lines": "L631-L679",
+      "code": "class LookupKeyClient:\n    def __init__(self, vllm_config: \"VllmConfig\"):\n        self.encoder = MsgpackEncoder()\n        self.ctx = zmq.Context()\n        socket_path = get_zmq_rpc_path_lookup(vllm_config)\n        self.socket = make_zmq_socket(self.ctx, socket_path, zmq.REQ, bind=False)\n\n    def lookup(\n        self,\n        token_len: int,\n        block_hashes: list[BlockHash],\n        kv_cache_group_ids: list[int] | None = None,\n    ) -> int:\n        kv_cache_group_ids = kv_cache_group_ids or [0]\n        hash_strs = [h.hex() for h in block_hashes]\n        hash_frames = self.encoder.encode(hash_strs)\n        kv_group_frames = self.encoder.encode(kv_cache_group_ids)\n        token_len_bytes = token_len.to_bytes(4, byteorder=\"big\")\n        all_frames = [token_len_bytes] + list(kv_group_frames) + list(hash_frames)\n        self.socket.send_multipart(all_frames, copy=False)\n        resp = self.socket.recv()\n        result = int.from_bytes(resp, \"big\")\n        return result\n\n\ndef get_zmq_rpc_path_lookup(vllm_config: \"VllmConfig\") -> str:\n    dp_rank = vllm_config.parallel_config.data_parallel_rank\n    base_url = envs.VLLM_RPC_BASE_PATH\n    rpc_port = 0\n    if vllm_config is not None:\n        extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config\n        if \"lookup_rpc_port\" in extra_config:\n            rpc_port = extra_config[\"lookup_rpc_port\"]\n    return f\"ipc://{base_url}/lookup_rpc_port_{rpc_port}_dp_rank{dp_rank}\"",
+      "elide": ["省略 close() 与 mooncake_rpc_port 弃用兼容分支。要点：调度进程没有 KV、也没有后端连接，它经 zmq REQ→worker 进程的 REP 服务端(LookupKeyServer)问命中——这是『scheduler 决定搬什么』必须跨进程查 worker 的原因。"]
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py",
+      "lines": "L272-L317",
+      "code": "class LookupKeyServer:\n    def __init__(self, pool_worker, vllm_config, use_layerwise):\n        self.decoder = MsgpackDecoder()\n        self.ctx = zmq.Context()\n        socket_path = get_zmq_rpc_path_lookup(vllm_config)\n        self.socket = make_zmq_socket(self.ctx, socket_path, zmq.REP, bind=True)\n        self.pool_worker = pool_worker\n        self.running = True\n        self.use_layerwise = use_layerwise\n\n        def process_request():\n            while self.running:\n                all_frames = self.socket.recv_multipart(copy=False)\n                token_len = int.from_bytes(all_frames[0], byteorder=\"big\")\n                kv_group_ids = self.decoder.decode([all_frames[1]])\n                hash_frames = all_frames[2:]\n                hashes_str = self.decoder.decode(hash_frames)\n                result = self.pool_worker.lookup_scheduler(\n                    token_len, hashes_str, kv_group_ids, self.use_layerwise,\n                )\n                response = result.to_bytes(4, \"big\")\n                self.socket.send(response)\n\n        self.thread = threading.Thread(target=process_request, daemon=True)\n        self.thread.start()",
+      "elide": ["省略 logger.debug 与 close()。服务端把请求交给 KVPoolWorker.lookup_scheduler（它真正持有 m_store，调 m_store.exists 查池），回一个 int=命中前缀 token 数。"]
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py",
+      "lines": "L195-L211",
+      "code": "        backend = backend_map.get(self.backend.lower())\n        assert backend is not None\n        backend_path = backend.get(\"path\")\n        backend_name = backend.get(\"name\")\n        assert backend_path is not None and backend_name is not None\n        backend_module = importlib.import_module(backend_path)\n        real_backend = getattr(backend_module, backend_name)\n\n        backend_kwargs = {}\n        if self.backend.lower() in {\"mooncake\", \"memcache\"}:\n            backend_kwargs[\"lazy_init\"] = self.use_compress\n        self.m_store = real_backend(\n            parallel_config,\n            **backend_kwargs,\n        )",
+      "elide": ["backend_map（文件顶部 L47-L60）把 'mooncake'/'memcache'/'yuanrong' 映射到模块路径+类名；这里按 extra_config['backend'] 动态 import 出一个 Backend 子类实例，存进 self.m_store——可插拔后端的注入点。"]
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py",
+      "lines": "L430-L459",
+      "code": "        else:\n            if self.kv_role in [\"kv_producer\", \"kv_both\"] or self.consumer_is_to_put:\n                ready_event_sending = threading.Event()\n                self.kv_send_thread = KVCacheStoreSendingThread(\n                    self.m_store,\n                    self.token_database,\n                    self.grouped_block_size,\n                    self.tp_rank,\n                    self.dcp_size,\n                    self.put_step,\n                    self.kv_role,\n                    ready_event_sending,\n                    self.group_uses_align_state,\n                    self.enable_kv_events,\n                )\n                self.kv_send_thread.start()\n            if self.load_async:\n                ready_event = threading.Event()\n                self.kv_recv_thread = KVCacheStoreRecvingThread(\n                    self.m_store,\n                    self.token_database,\n                    self.grouped_block_size,\n                    self.tp_rank,\n                    self.dcp_size,\n                    ready_event,\n                    self._invalid_block_ids,\n                    self._invalid_block_ids_lock,\n                )\n                self.kv_recv_thread.start()\n                ready_event.wait()",
+      "elide": ["这是 register_kv_caches 末尾的非 layerwise 分支（layerwise 分支起 Layer* 线程，结构同构，可在正文点名不展开）。要点：producer 起『发』线程、load_async 起『收』线程——两端搬运是独立后台线程，与 worker 模型前向主循环解耦。前面省略的 register_kv_caches 主体把显存区段算地址后 m_store.register_buffer + token_database.set_group_buffers。"]
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py",
+      "lines": "L461-L503 (节选)",
+      "code": "    def start_load_kv(self, metadata: AscendConnectorMetadata):\n        self.current_layer = 0\n        for request in metadata.requests:\n            load_spec = request.load_spec\n            if load_spec is None or not load_spec.can_load:  # load = 0\n                continue\n            ...\n            request.load_spec.token_len = token_len\n            if self.use_layerwise:\n                layerwise_retriever = self.retrieve_layer(request)\n                next(layerwise_retriever)  # first layer load\n                self.layerwise_retrievers.append(layerwise_retriever)\n            else:\n                if self.load_async:\n                    self.kv_recv_thread.add_request(request)\n                else:\n                    # 同步直取：组 key/addr/size 后 m_store.get(...)\n                    ...\n                    ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)\n                    if ret is not None and any(r != 0 for r in ret):\n                        missing_block_ids = record_failed_blocks(block_id_list_c, ret)\n                        self._invalid_block_ids.update(missing_block_ids)",
+      "elide": ["此处用 ... 概括了同步分支里逐 group 调 token_database.process_tokens_with_block_ids→prepare_value 组装 key/addr/size、以及按 tp_rank 旋转 key 列表的细节（见 L504-L574）。核心对比：load_async=True → 只把 request 丢进 recv 线程队列(add_request) 立即返回，搬运在后台；load_async=False → 当场 m_store.get 阻塞主循环。这是『节拍/背压解耦』的开关。"]
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py",
+      "lines": "L619-L649",
+      "code": "    def wait_for_save(self, connector_metadata: AscendConnectorMetadata):\n        current_event = None\n        has_save_request = False\n        for request in connector_metadata.requests:\n            can_save = request.can_save\n            if can_save is None or not can_save:\n                continue\n            current_event = torch.npu.Event()\n            current_event.record()\n            break\n\n        for request in connector_metadata.requests:\n            can_save = request.can_save\n            if can_save is None or not can_save:\n                continue\n            request.skip_null_blocks_by_group = self.group_uses_align_state\n            request.current_event = current_event\n            self.kv_send_thread.add_stored_request(request.req_id)\n            self.kv_send_thread.add_request(request)\n            has_save_request = True\n\n        if has_save_request:\n            # vLLM expects wait_for_save() to make stores visible before the\n            # request is reported as finished. Without this barrier a following\n            # identical prompt can lookup before Mooncake put() has completed.\n            self.kv_send_thread.request_queue.join()",
+      "elide": ["torch.npu.Event() 记录一个 NPU 事件，发线程在真正 put 前 current_event.synchronize() 等显存写完。末尾 request_queue.join() 是背压屏障：阻塞直到队列里所有 put 任务 task_done——保证『存可见』后才让请求 finish，否则下一个相同 prompt 可能在 put 落地前就 lookup 到旧状态。"]
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py",
+      "lines": "L57-L98",
+      "code": "    def add_request(self, request: ReqMeta | LayerMultiBlockReqMeta) -> torch.Tensor:\n        self.request_queue.put(request)\n\n    def get_and_clear_finished_requests(self) -> set[str]:\n        with self.done_task_lock:\n            finished_requests = self.finished_requests.copy()\n            self.finished_requests.clear()\n        return finished_requests\n\n    def run(self):\n        \"\"\"Run the thread to handle KV cache transfer requests.\"\"\"\n        self.m_store.set_device()\n        self.ready_event.set()\n        while True:\n            try:\n                request_data = self.request_queue.get()\n                if request_data is None:\n                    self.request_queue.task_done()\n                    continue\n                self._handle_request(request_data)\n            except Exception as e:\n                logger.error(\n                    \"Error in KVCacheTransferThread. type=%s, error=%s. Check thread state and request processing.\",\n                    type(e).__name__, e,\n                )",
+      "elide": ["省略 __init__（建 request_queue/ThreadPoolExecutor/finished_requests 集合）、lookup()/update_kv_event() 等辅助。这是两端解耦的引擎：生产者(主循环)只管 add_request 入队，消费者(本线程)循环 get→_handle_request 真正搬运。基类 _handle_request 为空，由收/发子类实现。"]
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py",
+      "lines": "L269-L400 (节选)",
+      "code": "    def _handle_request(self, req_meta: ReqMeta):\n        token_len = req_meta.token_len_chunk\n        req_id = req_meta.req_id\n        current_event = req_meta.current_event\n        try:\n            if req_id not in self.stored_requests:\n                self.request_queue.task_done()\n                return\n            for group_id in req_meta.kv_cache_group_ids or [0]:\n                starts, ends, keys, block_hashes = [], [], [], []\n                block_ids = req_meta.block_ids_by_group[group_id]\n                for start, end, key, _ in self._process_tokens_with_block_ids(\n                    token_len, req_meta.block_hashes, block_ids,\n                    kv_cache_group_id=group_id,\n                    skip_null_blocks=self._skip_null_blocks(req_meta, group_id),\n                ):\n                    starts.append(start); ends.append(end); keys.append(key.to_string())\n                ...\n                if not keys:\n                    continue\n                exists_states = self.lookup(keys)\n                missing_indices = [index for index, exists in enumerate(exists_states) if not exists]\n                if not missing_indices:\n                    continue\n                starts = [starts[i] for i in missing_indices]\n                ends = [ends[i] for i in missing_indices]\n                keys = [keys[i] for i in missing_indices]\n                ...\n                addrs, sizes = [], []\n                for index, start in enumerate(starts):\n                    addr, size, _ = self._prepare_value(start, ends[index], block_ids, kv_cache_group_id=group_id)\n                    addrs.append(addr); sizes.append(size)\n                ...\n                if current_event is not None:\n                    current_event.synchronize()\n                self.m_store.put(keys, addrs, sizes)\n        finally:\n            self.mark_completed_events(req_meta.event_id)\n        self.dec_stored_request(req_id)\n        self.request_queue.task_done()",
+      "elide": ["用 ... 概括：按 tp_rank/put_step 对 keys 做 TP 分片(L303-L311)、kv-event 生成(L344-L395)、kv_consumer 的 decode_adaptor_prefill_pp。save 的关键三步保留：①process_tokens 生成 key；②先 lookup 去重——池里已有的 chunk 跳过（跨请求复用的直接体现，相同前缀只存一次）；③仅 missing 块 prepare_value 取 (addr,size) 后 m_store.put。末尾 task_done() 让 wait_for_save 的 join() 屏障得以解除。"]
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/config_data.py",
+      "lines": "L61-L71",
+      "code": "    def to_string(self):\n        return (\n            f\"{self.key_metadata.model_name}\"\n            f\"@pcp{self.key_metadata.pcp_rank}@dcp{self.key_metadata.dcp_rank}\"\n            f\"@head_or_tp_rank:{self.key_metadata.head_or_tp_rank}\"\n            f\"@pp_rank:{self.key_metadata.pp_rank}\"\n            f\"@group:{self.key_metadata.kv_cache_group_id}\"\n            f\"@cache_role:{self.key_metadata.cache_role}\"\n            f\"@cache_family:{self.key_metadata.cache_family}\"\n            f\"@{self.chunk_hash}\"\n        )",
+      "elide": ["PoolKey 是池中一个 KV chunk 的全局名字：模型名 + 并行坐标(pcp/dcp/tp/pp/group) + chunk_hash（由 prompt 前缀 block hash 决定）。两个请求只要前缀相同、并行布局相同，就生成同一个 key → 命中复用。chunk_hash 来自内容哈希，所以跨请求/跨实例可复用。"]
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/config_data.py",
+      "lines": "L292-L315",
+      "code": "    def prepare_value(\n        self,\n        start: int,\n        end: int,\n        block_ids: list[int],\n        kv_cache_group_id: int = 0,\n        cache_role: str = \"kv\",\n    ):\n        addr_list: list[int] = []\n        size_list: list[int] = []\n        group_block_size = self.get_block_size(kv_cache_group_id)\n        block_id = block_ids[start // group_block_size]\n        group_addrs, group_block_len, group_block_stride = self._get_group_buffers(kv_cache_group_id, cache_role)\n        length = len(group_block_len)\n        if length == 0:\n            return addr_list, size_list, block_id\n        for index, base_addr in enumerate(group_addrs):\n            block_len = group_block_len[index % length]\n            block_stride = group_block_stride[index % length] if group_block_stride else block_len\n            addr = base_addr + block_id * block_stride\n            size = int(block_len / group_block_size * (end - start))\n            addr_list.append(addr)\n            size_list.append(size)\n        return addr_list, size_list, block_id",
+      "elide": ["key 回答『搬哪个 chunk』，prepare_value 回答『它在显存里的字节区段』：由 chunk 对应的 block_id 与注册时记下的每层 base_addr/block_len/stride，算出 (addr,size) 列表（每层每 K/V 一段）喂给后端 put/get。这就是后端契约里 addrs/sizes 的来源。"]
+    },
+    {
+      "path": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py",
+      "lines": "L170-L188, L217-L234",
+      "code": "    def exists(self, keys: list[str]) -> list[int]:\n        if self._lazy_init and not self._store_initialized:\n            return [0] * len(keys)\n        assert self.store is not None\n        return self.store.batch_is_exist(keys)\n\n    def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):\n        try:\n            self._ensure_initialized()\n            assert self.store is not None\n            config = ReplicateConfig()\n            if self.config.preferred_segment:\n                config.preferred_segment = self.local_seg\n            config.prefer_alloc_in_same_node = self.config.prefer_alloc_in_same_node\n            res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes, config)\n            ...\n\n    def get(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):\n        ...\n        res = self.store.batch_get_into_multi_buffers(keys, addrs, sizes)\n        res_list = list(res)\n        ...\n        for i, value in enumerate(res_list):\n            if value > 0:\n                res_list[i] = 0\n        return res_list",
+      "elide": ["用 ... 概括失败码统计/日志与 lazy_init 容错。要点：MooncakeBackend 把抽象的 exists/put/get 直接落到 Mooncake 分布式 store 的 batch_is_exist / batch_put_from_multi_buffers / batch_get_into_multi_buffers——多 buffer 批量 RDMA 读写。setup()(L90-L157) 经 transfer engine 连 metadata_server/master_server。返回值约定：put 用负数表失败；get 把正数(读到的字节数)归一成 0=成功、非 0=失败块。"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "AscendStoreConnector", "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py", "responsibility": "★ 入口。子类化 vLLM KVConnectorBase_V1(+SupportsHMA)，被 vLLM 引擎主循环通过标准钩子驱动。本身是薄分发层：按 role 把调度侧钩子转给 KVPoolScheduler、worker 侧钩子转给 KVPoolWorker。rank0 还起 LookupKeyServer。"},
+    {"name": "KVPoolScheduler", "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py", "responsibility": "★ 池调度器（『搬什么』那一端）。运行在调度进程，无 KV、无后端连接。get_num_new_matched_tokens 经 zmq 问池命中→建 LoadSpec；build_connector_meta 每步把要 load/save 的请求打包成 AscendConnectorMetadata 下发 worker。这是『节拍』的发起端。"},
+    {"name": "LookupKeyClient", "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py", "responsibility": "调度进程侧的 zmq REQ 客户端。lookup(token_len, block_hashes, group_ids) msgpack 编码请求的逐块 hash，发到 worker 的 lookup RPC，收回一个 int = 外部命中的前缀 token 数。"},
+    {"name": "LookupKeyServer", "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py", "responsibility": "worker 进程 rank0 的 zmq REP 服务端，后台线程循环收 lookup 请求，转交 KVPoolWorker.lookup_scheduler（它持有 m_store，真正 m_store.exists 查池），回命中长度。解释了『scheduler 决定搬什么』为何要跨进程问 worker。"},
+    {"name": "KVPoolWorker", "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py", "responsibility": "★ 池 worker（『异步搬』那一端）。运行在模型 worker 进程，持有 m_store 后端与 token_database。register_kv_caches 注册显存并起收/发后台线程；start_load_kv/wait_for_save 把请求丢进线程队列；get_finished 报告异步完成。backend_map 在此动态选后端。"},
+    {"name": "KVTransferThread", "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py", "responsibility": "★ 搬运线程基类(threading.Thread)。request_queue 单消费者 while 循环，把『谁来搬』(后台线程)与『谁要搬』(主循环 add_request)解耦。子类实现 _handle_request。"},
+    {"name": "KVCacheStoreSendingThread", "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py", "responsibility": "save/put 线程：process_tokens 生成 key → lookup 去重（池里已有的 chunk 跳过，跨请求只存一次）→ 仅 missing 块 prepare_value 取 (addr,size) → m_store.put。完成 task_done() 解除 wait_for_save 的 join 屏障。"},
+    {"name": "KVCacheStoreRecvingThread", "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py", "responsibility": "async load/get 线程：组 key/addr/size → m_store.get → 失败块 record_failed_blocks 记入 _invalid_block_ids → set_finished_request（供 get_finished 上报 done_recving）。"},
+    {"name": "Backend", "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/backend.py", "responsibility": "★ 可插拔后端契约(ABC)。只 6 个方法：__init__/set_device/register_buffer/exists/put/get。所有 worker 侧搬运代码只依赖这个抽象，不依赖具体存储——换后端=换一个实现类。"},
+    {"name": "MooncakeBackend", "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py", "responsibility": "★ 后端代表实现。setup 连 Mooncake 分布式 store；exists/put/get 落到 batch_is_exist / batch_put_from_multi_buffers / batch_get_into_multi_buffers（多 buffer 批量 RDMA）。带 ascend 协议、SSD offload、lazy_init(DSV4 compress)。"},
+    {"name": "ChunkedTokenDatabase", "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/config_data.py", "responsibility": "key 与地址的生成器。process_tokens 用 prefix block_hashes 把 token 序列切 chunk、每 chunk 出一个 PoolKey；prepare_value 由 block_id+注册的 base_addr/stride 算 (addr,size)。store/lookup/load 三路共用。"},
+    {"name": "PoolKey / KeyMetadata", "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/config_data.py", "responsibility": "池中一个 KV chunk 的全局命名。to_string = model@pcp@dcp@head_or_tp_rank@pp_rank@group@cache_role@cache_family@chunk_hash。内容哈希 + 并行坐标决定 key，故相同前缀+相同布局跨请求/跨实例命中复用。"},
+    {"name": "ReqMeta / AscendConnectorMetadata / LoadSpec", "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/config_data.py", "responsibility": "scheduler→worker 的传递契约。AscendConnectorMetadata.requests 每项是一个 ReqMeta(带 block_ids/block_hashes/can_save/load_spec/is_last_chunk)；LoadSpec 记 vllm_cached_tokens/kvpool_cached_tokens/can_load——决定 worker 端搬多少。"}
+  ],
+
+  "data_flow": [
+    "① 命中查询（scheduler 进程）：vLLM 调度调用 AscendStoreConnector.get_num_new_matched_tokens → KVPoolScheduler.get_num_new_matched_tokens → LookupKeyClient.lookup 经 zmq REQ 发 (token_len, group_ids, 逐块 block_hashes) 给 worker。",
+    "② 命中应答（worker 进程）：LookupKeyServer 的后台线程收到 → KVPoolWorker.lookup_scheduler 用 token_database.process_tokens 生成 keys → m_store.exists(keys) 查池 → 算出最长命中前缀 token 数回传。",
+    "③ 决定搬多少（scheduler）：need_to_allocate = 命中 − 本地已算；登记 LoadSpec(can_load=False)。vLLM 据 need_to_allocate 分配临时 block 后回调 update_state_after_alloc → 校验缺口一致 → LoadSpec.can_load=True。",
+    "④ 下发节拍（scheduler）：每调度步 build_connector_meta 把本步要 load(带 load_spec) / 要 save(can_save) 的请求各打包成一个 ReqMeta，聚成 AscendConnectorMetadata，随 SchedulerOutput 传到 worker。",
+    "⑤ 取（worker）：start_load_kv 遍历 metadata.requests，对 can_load 的：load_async=True → kv_recv_thread.add_request(入队，主循环不阻塞)；否则当场 m_store.get。recv 线程 _handle_request 组 key/addr/size 调 m_store.get，失败块记入 _invalid_block_ids，set_finished_request。",
+    "⑥ 存（worker）：模型算完该层/该请求后，wait_for_save 把 can_save 请求 add_request 进 kv_send_thread，并 request_queue.join() 等 put 落地（背压屏障）。send 线程 _handle_request：process_tokens 生成 key → lookup 去重 → 仅 missing 块 prepare_value 取 (addr,size) → m_store.put。",
+    "⑦ 落到后端：m_store.get/put/exists 即 Backend 契约；MooncakeBackend 映射到 batch_get_into_multi_buffers / batch_put_from_multi_buffers / batch_is_exist（多 buffer 批量 RDMA 读写外部池）。",
+    "⑧ 回收：engine 轮询 AscendStoreConnector.get_finished(finished_req_ids) → KVPoolWorker.get_finished 返回 (done_sending, done_recving)，引擎据此放行/释放 block。"
+  ],
+
+  "design_decisions": [
+    {"decision": "★ 两端分进程：KVPoolScheduler 跑调度进程、KVPoolWorker 跑模型 worker 进程，连接器仅做 role 分派。", "why": "调度进程做请求编排但既没有 KV 显存也没有后端连接；worker 进程持有 KV 与后端。因此命中查询必须跨进程（zmq REQ/REP），让『决定搬什么』与『真正搬/持有数据』分离。", "evidence": "ascend_store_connector.py:L103-L114（role 二分派 + rank0 起 LookupKeyServer）；pool_scheduler.py:L631-L679（LookupKeyClient）"},
+    {"decision": "★ 异步后台线程 + 队列解耦搬运与模型主循环。", "why": "KV put/get 是慢 IO（跨网到外部池）。用 KVTransferThread 的 request_queue 让主循环 add_request 即返回，搬运在后台线程跑，再经 get_finished 回收——避免阻塞模型前向。load_async 开关在『同步当场 get』与『异步入队』间切换。", "evidence": "kv_transfer.py:L78-L98（队列消费循环）；pool_worker.py:L461-L503（load_async 分支）；L430-L459（起收/发线程）"},
+    {"decision": "★ wait_for_save 末尾 request_queue.join() 做背压/可见性屏障。", "why": "vLLM 要求 wait_for_save 返回时存已可见，否则下一个相同 prompt 可能在 Mooncake put 落地前就 lookup 到旧状态而漏命中。join() 阻塞到队列所有 put task_done。", "evidence": "pool_worker.py:L645-L649（含源码注释）"},
+    {"decision": "★ 存前先 lookup 去重，只 put missing 块。", "why": "跨请求复用的直接体现：相同前缀 chunk 的 key 相同，池里已有就跳过，避免重复写、节省带宽与池容量。", "evidence": "kv_transfer.py:L316-L325（exists→missing_indices→只留 missing）"},
+    {"decision": "★ 内容哈希命名（PoolKey.to_string 含 chunk_hash + 并行坐标）。", "why": "key 由 prompt 前缀 block hash 决定，所以相同前缀在不同请求、甚至不同实例间生成同一 key → 这是『池化复用』成立的根基（与 ch10 PD 分离的点对点直传不同：池化靠内容寻址的共享存储中转）。", "evidence": "config_data.py:L61-L71（to_string）；L332-L383（process_tokens 用 block_hashes 切 chunk）"},
+    {"decision": "★ 可插拔后端：Backend ABC + backend_map 动态 import。", "why": "worker 侧所有搬运逻辑只依赖 6 方法抽象契约，具体存储（mooncake/memcache/yuanrong/…）按配置注入。换池后端无需改调度/搬运代码。", "evidence": "backend/backend.py:L6-L29（契约）；pool_worker.py:L47-L60+L195-L211（backend_map 动态选）"},
+    {"decision": "key（搬哪个 chunk）与 value 地址（在显存哪段）解耦：process_tokens 出 key、prepare_value 出 (addr,size)。", "why": "后端契约 put/get 同时要 keys 和 (addrs,sizes)：key 是池里的名字，addr/size 是本机 KV 显存的源/目标区段（由 block_id + 注册时记录的 base_addr/stride 算出）。两者分离让命名独立于物理布局。", "evidence": "config_data.py:L292-L315（prepare_value）；L228-L252（_make_key_by_hash）"},
+    {"decision": "与 ch10 PD 分离的边界：池化经外存储层中转/复用，PD 分离是节点间 P2P 直传。", "why": "ch10 的 mooncake P2P 是 prefill 实例把 KV 直接发给 decode 实例（点对点、一次性）；ch11 是写进一个共享池、任何请求/实例之后可按 key 捞回（内容寻址、可多次复用）。拓扑与节拍不同：直传 vs 中转-复用。注：ch10 已复用 KVPoolScheduler.lookup 做 cache-hit 亲和路由，把 store/pool 存取与节拍机制显式留给 ch11——本章回收。", "evidence": "ch10 dossier 注明『store/pool tick machinery deferred to ch11』；本章覆盖 pool_worker/kv_transfer/backend 全链"}
+  ],
+
+  "theory": [
+    "命中算术：设 prompt 有 P 个 token，cache_transfer_granularity = g，则查询 token_len = floor(P/g)*g。lookup 返回外部命中前缀 H（块粒度的倍数）。本地已算 C 时 need_to_allocate = max(0, H − C)；请求从池 load H−C 个 token、本地算剩余 P−H。若 H == request.num_tokens 则 H 减 1，保证至少 1 token 跑前向。跨网字节随 (H−C) 而非 P 增长。",
+    "复用收益：一个 chunk 的 KV 字节 ≈ 2(K,V) × num_layers × num_kv_heads × head_dim × dtype_size × chunk_tokens。命中前缀越长、复用次数越多，省下的重算/重传越多。存前 lookup 去重使同一前缀在池中只存一份，写放大降为 1/(复用请求数)。",
+    "解耦与背压：主循环 add_request 是 O(1) 入队，put/get 的 RDMA 延迟被挪到后台线程，理想下与模型前向重叠。但 wait_for_save 的 join() 是必要的串行点——它把『存可见』与『请求 finish』排序，牺牲一点尾延迟换正确性（避免后续相同 prompt 漏命中）。",
+    "命名空间维度：key = model × {pcp,dcp,tp/head,pp,group} × cache_role × cache_family × chunk_hash。并行坐标进 key 意味着复用要求并行布局一致（同一 TP 分片/同一 PP 段才命中）——这是池化在分布式下能正确复用的约束。lookup_scheduler 会按 tp/pp 维度扩展 key 集合再查，处理跨 rank 命中。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "Hybrid KV cache / Mamba / SWA 全套：_uses_hybrid_kv_cache、_infer_mamba_groups、_infer_swa_blocks、get_sw_clipped_blocks、touch_sending_mamba_blocks、group_uses_align_state、mamba_cache_mode 'align' 校验、request_finished_all_groups 的 HMA 分支、normalize_block_ids_by_group 的多 group 复杂分支（保留单 group 退化）。", "why_safe": "本章主线是单 group(group_id=0) 的标准 full-attention KV 池化路径。hybrid/mamba/SWA 是正交的特殊模型支持，删后单 group 控制流完整且可运行；正文点名即可不展开。"},
+      {"what": "Compress / DSV4 cache family 体系：compress_ratios、use_compress、cache_family('c1'/'c4'/'c128'/'mixed')、infer_group_cache_families、get_cache_family_granularity 的 ratio 缩放、_is_lookup_gate_group 的 DSV4 注释逻辑、MooncakeBackend 的 lazy_init/_use_fabric_mem 路径。", "why_safe": "compress 是 DeepSeek-V4 专属优化，key 里 cache_family 退化为 'default'、granularity 退化为 block_size 即可。删后命名与命中逻辑对普通模型不变。"},
+      {"what": "Layerwise 模式整条：use_layerwise、retrieve_layer/store_layer 生成器、KVCacheStoreLayerSendingThread/KVCacheStoreLayerRecvingThread、wait_for_layer_load、save_kv_layer、LayerMultiBlockReqMeta、prepare_value_layer、split_layers/LayerPoolKey。", "why_safe": "layerwise（逐层流水搬运）是与非 layerwise（整请求搬）并列的另一条模式分支。本章主线用非 layerwise 路径讲清两端解耦与后端契约即可；layerwise 点名为『可逐层流水化的变体』不展开。但保留 KVTransferThread 基类与非 layerwise 收发线程。"},
+      {"what": "KV events 生成：enable_kv_events、AscendStoreKVEvents、KVEventAggregator、BlockStored 构造、update_kv_event/get_kv_events、take_events、_build_stored_events、layerwise_event_starts。", "why_safe": "kv-event 是给外部 prefix-cache 观测用的旁路遥测，不参与 load/save 正确性。删后搬运链路完整。"},
+      {"what": "PP partition adaptor：decode_adaptor_prefill_pp、prefill_pp_layer_partition、partitions 推断、kv_consumer 的 _decode_adaptor_prefill_pp 调用。", "why_safe": "仅 prefill PP 切分场景重写 key 的 @pp_rank，单 PP(prefill_pp_size=1)时直接 return 原值。删后 pp_rank=0 路径不变。"},
+      {"what": "TP/put_step/dcp 旋转细节：按 tp_rank 对 key/addr/size 列表的旋转(key_list_c = ...)、put_step 切片、get_group_tp_size、lookup_scheduler 的 multi_tp_keys/pp 扩展。可保留单 TP(tp_size=1,put_step=1) 退化形式。", "why_safe": "这些是多 TP rank 间分摊 put/get 负载与跨 rank 命中扩展的优化。单卡(tp_rank=0)时旋转/切片是恒等、扩展集合=原集合。删后单 rank 控制流等价。"},
+      {"what": "其余后端文件 memcache_backend.py / yuanrong_backend.py 的实现细节，以及 cpu_offload/、simple_cpu_offload/、lmcache_ascend_connector.py、ucm_connector.py 的实现。", "why_safe": "本章用 MooncakeBackend 一个代表讲透 Backend 契约，其余后端/卸载连接器仅点名（它们要么是同契约的另一实现，要么是别的池/卸载路径，详见 ch12 host/CPU 卸载）。"},
+      {"what": "NPU 硬件耦合：torch.npu.Event/record/synchronize、MooncakeBackend.set_device 的 torch.npu.set_device、register_buffer 经 global_te（mooncake transfer engine）、_get_cache_block_metadata 的真实显存指针运算。", "why_safe": "host 无 NPU/CANN 不可跑这些。精简版可把后端换成纯内存 dict 的 FakeBackend、把 npu.Event 换成 no-op，仍能验证『两端队列解耦 + lookup 去重 + 命中算术 + 后端契约调用顺序』纯 Python 控制流。实际池存取/RDMA 不真跑（与本章运行约束一致）。"}
+    ],
+    "must_keep": [
+      {"symbol": "AscendStoreConnector", "why": "入口类；读者需看到它子类化 vLLM KVConnectorBase_V1 并按 role 分派。"},
+      {"symbol": "KVConnectorBase_V1", "why": "被子类化的 vLLM 抽象基类——『池化怎么接进引擎』的接点。"},
+      {"symbol": "SupportsHMA", "why": "连接器声明支持 hybrid memory allocator 的混入；签名保真需保留。"},
+      {"symbol": "KVPoolScheduler", "why": "『搬什么』那一端的类。"},
+      {"symbol": "KVPoolWorker", "why": "『异步搬』那一端的类。"},
+      {"symbol": "get_num_new_matched_tokens", "why": "命中查询入口，决定 load 多少。"},
+      {"symbol": "update_state_after_alloc", "why": "alloc 后把 LoadSpec.can_load 置真的回调，节拍一环。"},
+      {"symbol": "build_connector_meta", "why": "调度器节拍：每步打包 load/save 请求下发。"},
+      {"symbol": "LoadSpec", "why": "vllm_cached/kvpool_cached/can_load 的载体，决定搬多少。"},
+      {"symbol": "AscendConnectorMetadata", "why": "scheduler→worker 的请求清单容器。"},
+      {"symbol": "ReqMeta", "why": "每请求的搬运元数据(block_ids/block_hashes/can_save/load_spec)。"},
+      {"symbol": "LookupKeyClient", "why": "调度进程 zmq REQ 客户端，跨进程查命中。"},
+      {"symbol": "LookupKeyServer", "why": "worker 进程 REP 服务端，证明『scheduler 查 worker』的跨进程协作。"},
+      {"symbol": "get_zmq_rpc_path_lookup", "why": "lookup RPC 的 socket 路径生成，client/server 必须一致。"},
+      {"symbol": "lookup", "why": "客户端命中查询方法。"},
+      {"symbol": "lookup_scheduler", "why": "worker 端真正调 m_store.exists 算命中前缀的方法。"},
+      {"symbol": "register_kv_caches", "why": "注册显存并起后台线程——两端解耦在 worker 侧的落地。"},
+      {"symbol": "start_load_kv", "why": "取 KV 的入口，含 load_async 同步/异步分支。"},
+      {"symbol": "wait_for_save", "why": "存 KV 的入口，含 request_queue.join() 背压屏障。"},
+      {"symbol": "get_finished", "why": "上报异步收/发完成，引擎据此回收 block。"},
+      {"symbol": "backend_map", "why": "后端名→模块/类 的映射，可插拔注入点。"},
+      {"symbol": "KVTransferThread", "why": "搬运线程基类，队列解耦的核心。"},
+      {"symbol": "request_queue", "why": "解耦主循环与搬运的队列对象（join() 屏障也靠它）。"},
+      {"symbol": "_handle_request", "why": "线程消费一个请求真正搬运的方法。"},
+      {"symbol": "KVCacheStoreSendingThread", "why": "save/put 线程，含 lookup 去重逻辑。"},
+      {"symbol": "KVCacheStoreRecvingThread", "why": "async load/get 线程。"},
+      {"symbol": "record_failed_blocks", "why": "失败块收集，错误处理路径。"},
+      {"symbol": "Backend", "why": "可插拔后端 ABC 契约（6 方法），本章支柱之一。"},
+      {"symbol": "register_buffer", "why": "后端契约方法：注册显存区段。"},
+      {"symbol": "exists", "why": "后端契约方法：查 key 在不在（命中查询底座）。"},
+      {"symbol": "put", "why": "后端契约方法：写入池。"},
+      {"symbol": "get", "why": "后端契约方法：从池读回。"},
+      {"symbol": "set_device", "why": "后端契约方法：线程绑设备。"},
+      {"symbol": "MooncakeBackend", "why": "后端代表实现，讲透契约怎么落到真实分布式 store。"},
+      {"symbol": "batch_is_exist", "why": "Mooncake 的 exists 落点。"},
+      {"symbol": "batch_put_from_multi_buffers", "why": "Mooncake 的 put 落点（多 buffer 批量写）。"},
+      {"symbol": "batch_get_into_multi_buffers", "why": "Mooncake 的 get 落点（多 buffer 批量读）。"},
+      {"symbol": "ChunkedTokenDatabase", "why": "key 与地址的生成器，store/lookup/load 共用。"},
+      {"symbol": "process_tokens", "why": "用 block_hashes 把 token 切 chunk 生成 PoolKey。"},
+      {"symbol": "prepare_value", "why": "由 block_id 算 (addr,size) 喂后端。"},
+      {"symbol": "PoolKey", "why": "池中 chunk 的命名对象。"},
+      {"symbol": "to_string", "why": "PoolKey 的字符串化——内容寻址 key 的具体格式，复用成立的根基。"},
+      {"symbol": "KeyMetadata", "why": "key 的并行坐标字段载体。"},
+      {"symbol": "m_store", "why": "KVPoolWorker 持有的后端实例字段名，搬运代码都经它调契约。"}
+    ]
+  },
+
+  "diagram_plan": [
+    {
+      "name": "ch11-roadmap",
+      "type": "roadmap",
+      "spec": "复用 instances/vllm-ascend/book/assets/roadmap/roadmap.py 出『你在这里』图。高亮 ch11 节点（KV 池化/外存储），与左邻 ch10（PD 分离·P2P 直传）、右邻 ch12（host/CPU 卸载）相连，三者同属『KV 解耦/卸载』簇。前接：ch10 已用 lookup 做亲和路由；本章补完 store/pool 存取与节拍。"
+    },
+    {
+      "name": "two-end-decoupling",
+      "type": "svg-diagram (sequence/lane)",
+      "spec": "两条泳道 + 一个外部池。左道=Scheduler 进程(KVPoolScheduler)，右道=Worker 进程(KVPoolWorker + 后台收/发线程)，底部=External Pool(Backend/Mooncake)。画 8 步节拍：①get_num_new_matched_tokens→②zmq lookup→③LookupKeyServer/lookup_scheduler→m_store.exists→④回命中→建 LoadSpec→⑤build_connector_meta 下发 metadata→⑥worker add_request 入队(主循环不阻塞)→⑦后台线程 m_store.put/get→⑧get_finished 回收。标注 request_queue 是解耦点、join() 是背压屏障。"
+    },
+    {
+      "name": "pool-vs-pd-contrast",
+      "type": "svg-diagram (two-panel contrast)",
+      "spec": "左panel『ch10 PD 分离 = P2P 直传』：Prefill 实例 ──KV──▶ Decode 实例（点对点箭头，一次性）。右panel『ch11 KV 池化 = 经外存储中转/复用』：Req A ─put→ [共享池 by key] ←get─ Req B / 另一实例（多对一存、一对多取，内容寻址）。底部一行对比表：拓扑(点对点 vs 星型经池)、节拍(随传随用 vs 存后异步复用)、复用面(单次 vs 跨请求/跨实例)。"
+    },
+    {
+      "name": "key-and-value-addressing",
+      "type": "svg-diagram (flow)",
+      "spec": "展示『搬什么(key)』与『在哪(addr)』如何分离再汇合到后端契约：token 序列 ─process_tokens(block_hashes)→ PoolKey(model@…@chunk_hash) ；block_id ─prepare_value(base_addr,stride)→ (addr,size)。两路汇入 Backend.put(keys, addrs, sizes) / get。旁注 lookup 去重：put 前 exists(keys) 命中的 chunk 被跳过。"
+    }
+  ],
+
+  "foreshadow_due": {
+    "bible_due_埋": [],
+    "bible_due_回收": [],
+    "note": "scripts/bible.py due ch11 返回空（无登记的应埋/应回收项）。但 ch10 dossier 显式留了前向引用需在本章回收：『ch10 references ONLY the cache-hit query (get_num_new_matched_tokens + LookupKeyClient.lookup) for affinity routing. Its store/pool tick machinery is deferred to ch11.』本章通过覆盖 pool_worker(start_load_kv/wait_for_save/register_kv_caches 后台线程) + kv_transfer(收/发线程节拍) + backend(put/get/exists 契约) 完成回收，并在 design_decisions 显式与 ch10 PD 分离划清边界（直传 vs 中转-复用）。"
+  }
+}
