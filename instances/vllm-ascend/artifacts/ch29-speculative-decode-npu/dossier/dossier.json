@@ -1,0 +1,176 @@
+{
+  "chapter": "ch29",
+  "title": "投机解码的 NPU 对位：proposer 工厂与薄壳继承",
+  "thesis": "投机解码在昇腾上是一个典型的「工厂分发 + 薄壳继承 + 少数重量级覆写」范式：spec_decode/__init__.py 的 get_spec_decode_method 用一处 if-elif 把 method 字符串映射到 8 个 Ascend*Proposer；多数 proposer 是极薄子类（直接继承 vLLM 的对应 proposer、几乎不改）；只有自研的 AscendSpecDecodeBaseProposer 才重量级重写（ACLGraph + 昇腾 Triton spec_decode kernel + MLA + 昇腾并行组）。本章只讲提议侧（提出 draft token），验证侧（接受/拒绝采样）由 ch28 的 AscendRejectionSampler 负责。",
+
+  "code_spine": [
+    "vllm_ascend/spec_decode/__init__.py:L21-L51  —— 工厂入口：8 个 import + get_spec_decode_method 的 if-elif 分发",
+    "vllm_ascend/spec_decode/ngram_proposer_npu.py:L1-L35  —— 薄壳之极致：AscendNgramProposerNPU(NgramProposerGPU)，把 device 专属方法全部 stub 成 no-op",
+    "vllm_ascend/spec_decode/ngram_proposer.py:L5-L64  —— 纯 CPU n-gram 薄壳：AscendNgramProposer(NgramProposer)，propose 真正调 batch_propose",
+    "vllm_ascend/spec_decode/suffix_proposer.py:L4-L24  —— 最薄薄壳：AscendSuffixDecodingProposer(SuffixDecodingProposer)，propose 一行转发",
+    "vllm_ascend/spec_decode/draft_proposer.py:L8-L16 / eagle_proposer.py:L10-L19  —— 走 LLM-base 重量级的薄入口：多继承 (基类, AscendSpecDecodeBaseProposer)，__init__ 只调 base 构造 + 少量校验",
+    "vllm_ascend/spec_decode/medusa_proposer.py:L10-L70  —— 中等薄壳：AscendMedusaProposer(MedusaProposer)，覆写 dummy_run（set_ascend_forward_context）+ propose（hidden_states 选取后 super().propose）",
+    "vllm_ascend/spec_decode/extract_hidden_states_proposer.py:L25-L116  —— 中等薄壳：覆写 dummy_run（ACL graph 签名）+ prepare_next_token_ids_padded（indices/count 模式）",
+    "vllm_ascend/spec_decode/dflash_proposer.py:L15-L267  —— AscendDflashProposer(AscendEagleProposer)：在 eagle 重量级之上再叠 DFlash 交叉注意力缓冲与 Triton kernel",
+    "vllm_ascend/spec_decode/llm_base_proposer.py:L111-L221  —— 重量级核心类 AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer) 的 __init__：建持久缓冲、昇腾并行组 patch、ACLGraph 开关",
+    "vllm_ascend/spec_decode/llm_base_proposer.py:L420-L439  —— load_model 尾段：满足条件时用 ACLGraphWrapper 包住 _run_merged_draft（FULL graph）",
+    "vllm_ascend/spec_decode/llm_base_proposer.py:L621-L760  —— _propose：draft 一步的骨架（combine_hidden_states→set_inputs_first_pass→cudagraph dispatch→_runnable）",
+    "vllm_ascend/spec_decode/llm_base_proposer.py:L1701-L1823  —— prepare_inputs：按拒绝 token 数重算 query_start_loc/seq_lens/token_indices，喂给 speculator",
+    "vllm/v1/sample/rejection_sampler.py  —— 验证侧（ch28），proposer 提出的 draft token 在此被接受/拒绝（本章不展开，仅回指）"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm_ascend/spec_decode/__init__.py",
+      "lines": "L21-L51",
+      "code": "from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer\nfrom vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer\nfrom vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer\nfrom vllm_ascend.spec_decode.extract_hidden_states_proposer import (\n    AscendExtractHiddenStatesProposer,\n)\nfrom vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer\nfrom vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer\nfrom vllm_ascend.spec_decode.ngram_proposer_npu import AscendNgramProposerNPU\nfrom vllm_ascend.spec_decode.suffix_proposer import AscendSuffixDecodingProposer\n\n\ndef get_spec_decode_method(method, vllm_config, device, runner):\n    if method == \"ngram\":\n        return AscendNgramProposer(vllm_config, runner)\n    elif method == \"ngram_gpu\":\n        return AscendNgramProposerNPU(vllm_config, device, runner)\n    elif method == \"suffix\":\n        return AscendSuffixDecodingProposer(vllm_config, runner)\n    elif method == \"medusa\":\n        return AscendMedusaProposer(vllm_config, device)\n    elif method in (\"eagle\", \"eagle3\", \"mtp\"):\n        return AscendEagleProposer(vllm_config, device, runner)\n    elif method == \"dflash\":\n        return AscendDflashProposer(vllm_config, device, runner)\n    elif method == \"draft_model\":\n        return AscendDraftModelProposer(vllm_config, device, runner)\n    elif method == \"extract_hidden_states\":\n        return AscendExtractHiddenStatesProposer(vllm_config, device, runner)\n    else:\n        raise ValueError(f\"Unknown speculative decoding method: {method}\")",
+      "elide": ["文件头 L1-L19 是 Apache 许可证抬头 + 改编自 vllm gpu_model_runner.py 的注释，可省略。注意 method 字符串与类名并非一一同名：'ngram_gpu'→NgramProposerNPU、'draft_model'→DraftModelProposer、'eagle/eagle3/mtp' 三种 method 共用 AscendEagleProposer；构造参数签名也不齐（ngram/suffix 不收 device，medusa 不收 runner）——这是工厂吸收差异、对外只暴露一个 method 字符串的体现。"]
+    },
+    {
+      "path": "vllm_ascend/spec_decode/ngram_proposer_npu.py",
+      "lines": "L1-L35",
+      "code": "import torch\nfrom vllm.v1.spec_decode.ngram_proposer_gpu import NgramProposerGPU\n\n\nclass AscendNgramProposerNPU(NgramProposerGPU):\n    def __init__(self, vllm_config, device: torch.device, runner):\n        super().__init__(vllm_config, device=device)\n\n    def load_model(self, *args, **kwargs):\n        # No model to load.\n        pass\n\n    @torch.inference_mode()\n    def dummy_run(\n        self,\n        num_tokens,\n        with_prefill=None,\n        in_graph_capturing=None,\n        num_reqs=None,\n        num_tokens_across_dp=None,\n        aclgraph_runtime_mode=None,\n        batch_descriptor=None,\n        dummy_compute_logits=lambda hidden_states: None,\n        is_profile=False,\n    ):\n        pass\n\n    def propose(\n        self,\n        num_tokens_no_spec: torch.Tensor,  # [batch_size]\n        token_ids_gpu: torch.Tensor,  # [batch_size, max_len]\n        valid_sampled_token_ids_gpu: torch.Tensor,  # [batch_size, num_spec_tokens + 1]\n        valid_sampled_tokens_count: torch.Tensor,  # [batch_size]\n    ):\n        pass",
+      "elide": ["整文件仅 35 行，无可省略分支——这正是「薄壳」的标本：直接继承 vLLM 的 NgramProposerGPU，连同 load_model/dummy_run/propose 三个 device 相关方法全部用 no-op (pass) 覆写。关键事实（写作须如实）：propose 体是 pass，并不复用父类那段 GPU 批量 n-gram kernel（对照 vllm/v1/spec_decode/ngram_proposer_gpu.py:L314 父类 propose 是真实实现且返回 (draft_tokens, num_valid)）；它继承父类只为拿到构造期的张量/形状约定，提议逻辑在此被 stub 掉。dummy_run 的长签名是为对齐昇腾 runner 的 ACL graph 捕获调用约定。"]
+    },
+    {
+      "path": "vllm_ascend/spec_decode/ngram_proposer.py",
+      "lines": "L29-L64",
+      "code": "    def propose(\n        self,\n        sampled_token_ids: list[list[int]],\n        num_tokens_no_spec=None,\n        token_ids_cpu=None,\n        slot_masks: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,\n    ) -> list[list[int]]:\n        valid_ngram_requests = []\n        for i, sampled_ids in enumerate(sampled_token_ids):\n            num_sampled_ids = len(sampled_ids)\n            if not num_sampled_ids:\n                continue\n\n            req_id = self.runner.input_batch.req_ids[i]\n            if req_id in self.runner.input_batch.spec_decode_unsupported_reqs:\n                continue\n\n            num_tokens = self.runner.input_batch.num_tokens_no_spec[i]\n            if num_tokens >= self.runner.input_batch.max_model_len:\n                # Skip requests that have already reached the max model length.\n                continue\n\n            start_idx = self.runner.input_batch.num_tokens_no_spec[i]\n            end_idx = start_idx + num_sampled_ids\n            self.runner.input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids\n\n            valid_ngram_requests.append(i)\n\n        draft_token_ids = self.batch_propose(\n            len(sampled_token_ids),\n            valid_ngram_requests,\n            self.runner.input_batch.num_tokens_no_spec,\n            self.runner.input_batch.token_ids_cpu,\n        )\n\n        return draft_token_ids",
+      "elide": ["__init__/load_model/dummy_run (L5-L27) 与 npu 版同形（保存 runner、load_model/dummy_run 为 no-op），可只点一句。这是与 ngram_gpu 形成对照的「真干活的 CPU 薄壳」：把新采样 token 写回 input_batch.token_ids_cpu，再交父类 NgramProposer.batch_propose 做纯 CPU 的 n-gram 匹配——device 无关，host 可跑读控制流。"]
+    },
+    {
+      "path": "vllm_ascend/spec_decode/suffix_proposer.py",
+      "lines": "L4-L24",
+      "code": "class AscendSuffixDecodingProposer(SuffixDecodingProposer):\n    def __init__(self, vllm_config, runner):\n        super().__init__(vllm_config)\n        self.runner = runner\n\n    def dummy_run(\n        self,\n        num_tokens,\n        with_prefill=None,\n        in_graph_capturing=None,\n        num_reqs=None,\n        num_tokens_across_dp=None,\n        aclgraph_runtime_mode=None,\n        batch_descriptor=None,\n        dummy_compute_logits=lambda hidden_states: None,\n        is_profile=False,\n    ):\n        pass\n\n    def propose(self, valid_sampled_token_ids):\n        return super().propose(self.runner.input_batch, valid_sampled_token_ids)",
+      "elide": ["无可省略分支——这是全章「最薄薄壳」标本：propose 仅一行转发给父类（补上 self.runner.input_batch 参数），dummy_run 为 no-op，新增的全部状态只有 self.runner。"]
+    },
+    {
+      "path": "vllm_ascend/spec_decode/draft_proposer.py",
+      "lines": "L8-L16",
+      "code": "class AscendDraftModelProposer(DraftModelProposer, AscendSpecDecodeBaseProposer):\n    def __init__(\n        self,\n        vllm_config: VllmConfig,\n        device: torch.device,\n        runner=None,\n    ):\n        AscendSpecDecodeBaseProposer.__init__(self, vllm_config, device, False, runner=runner)\n        self._raise_if_vocab_size_mismatch()\n        self._raise_if_draft_tp_mismatch()",
+      "elide": ["整文件 18 行。要点：多继承顺序 (DraftModelProposer, AscendSpecDecodeBaseProposer) —— 拿 vLLM DraftModelProposer 的策略语义，但 __init__ 显式只调 AscendSpecDecodeBaseProposer.__init__（pass_hidden_states_to_model=False），即「行为复用基类、构造走昇腾重量级 base」。eagle_proposer.py 同构，差别仅 pass_hidden_states_to_model=True 且无额外校验。"]
+    },
+    {
+      "path": "vllm_ascend/spec_decode/eagle_proposer.py",
+      "lines": "L10-L19",
+      "code": "class AscendEagleProposer(EagleProposer, AscendSpecDecodeBaseProposer):\n    def __init__(\n        self,\n        vllm_config: VllmConfig,\n        device: torch.device,\n        runner=None,\n    ):\n        AscendSpecDecodeBaseProposer.__init__(\n            self, vllm_config, device, pass_hidden_states_to_model=True, runner=runner\n        )",
+      "elide": ["整文件 19 行，无分支。与 draft_proposer 并列对照：同样多继承 (vLLM 策略类, AscendSpecDecodeBaseProposer)，__init__ 仅转调昇腾 base 构造，唯一差异是 pass_hidden_states_to_model=True（eagle 需把 target hidden states 喂进 draft 模型）。AscendDflashProposer 再继承 AscendEagleProposer 往上叠 DFlash 专属缓冲，是这条继承链的延伸。"]
+    },
+    {
+      "path": "vllm_ascend/spec_decode/medusa_proposer.py",
+      "lines": "L46-L70",
+      "code": "    def propose(\n        self,\n        valid_sampled_token_ids: list[list[int]],\n        sampling_metadata: SamplingMetadata,\n        spec_decode_metadata: SpecDecodeMetadata,\n        sample_hidden_states: torch.Tensor,\n    ):\n        if sample_hidden_states.shape[0] == len(valid_sampled_token_ids):\n            # The input to the target model does not include draft tokens.\n            hidden_states = sample_hidden_states\n        else:\n            num_accepted_tokens = torch.tensor(\n                [len(t) for t in valid_sampled_token_ids], device=self.device, dtype=torch.long\n            )\n            num_draft_tokens = torch.tensor(spec_decode_metadata.num_draft_tokens, device=self.device, dtype=torch.long)\n\n            offsets = torch.cumsum(num_draft_tokens + 1, dim=0) - (num_draft_tokens + 1)\n            indices = offsets + num_accepted_tokens - 1\n            hidden_states = sample_hidden_states[indices]\n\n        spec_token_ids = super().propose(\n            target_hidden_states=hidden_states,\n            sampling_metadata=sampling_metadata,\n        )\n        return spec_token_ids",
+      "elide": ["dummy_run (L15-L44) 覆写主要是把 vLLM 的前向上下文换成 set_ascend_forward_context（is_draft_model=True），骨架与父类一致，可点一句不全引。propose 体现「中等薄壳」：自己只做一段从拼接的 sample_hidden_states 里按已接受 token 数 gather 出每请求最后一个 hidden state 的索引计算（offsets/indices），真正的 medusa 提议仍 super().propose 交父类——典型「只在 device/数据布局接缝处插一层，核心算法照搬」。"]
+    },
+    {
+      "path": "vllm_ascend/spec_decode/llm_base_proposer.py",
+      "lines": "L111-L139",
+      "code": "class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):\n    _runnable: ACLGraphWrapper | Callable\n\n    def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_states_to_model: bool, runner=None):\n        super().__init__(vllm_config, device, pass_hidden_states_to_model, runner=runner)\n\n        # Assign runner before it's used in the methods below\n        self.runner = runner\n        ...\n        self.use_async_scheduling = self.vllm_config.scheduler_config.async_scheduling\n        self.use_compress = hasattr(self.vllm_config.model_config.hf_config, \"compress_ratios\")\n        self.pass_hidden_states_to_model = pass_hidden_states_to_model\n        self.decode_threshold = 1 + self.num_speculative_tokens\n        self.query_start_loc = self.runner._make_buffer(self.runner.max_num_reqs + 2, dtype=torch.int32)\n        self.arange_cpu = torch.arange(self.arange.shape[0], device=\"cpu\", dtype=torch.int32)\n        self.attn_mask_builder = AttentionMaskBuilder(self.device)",
+      "elide": ["__init__ 共 L114-L221 逾百行，重度减法：中间一大段 logger.debug、pcp/dcp 并行尺寸读取（self.pcp_size/dcp_size...）、self.full_indices、self.use_sparse、若干持久张量缓冲（token_indices_to_sample / slot_mapping_group / seq_lens_group / query_start_loc_group，各按 num_speculative_tokens 建一组）、mrope/xdrope/positions 三选一分支，均为「建持久缓冲」细节，骨架讲不逐行。务必保留并讲清的语义节点见下两个 excerpt（昇腾并行组 patch 与 ACLGraph 开关）。"]
+    },
+    {
+      "path": "vllm_ascend/spec_decode/llm_base_proposer.py",
+      "lines": "L163-L180",
+      "code": "        if vllm_config.parallel_config.tensor_parallel_size != self.speculative_config.draft_tensor_parallel_size:\n            tp_group = init_model_parallel_group(\n                [[get_world_group().rank]],\n                get_world_group().rank,\n                torch.distributed.get_backend(get_world_group().device_group),\n                use_message_queue_broadcaster=True,\n                group_name=\"tp\",\n            )\n            self.tp_group_context = patch_tensor_parallel_group(tp_group)\n        else:\n            self.tp_group_context = nullcontext()\n\n        self.use_cuda_graph = self.runner._use_aclgraph() and not self.speculative_config.enforce_eager",
+      "elide": ["前导大段注释（L154-L162，解释 draft_tensor_parallel_size 对 Eagle 不生效、故单独 patch tp=1）可压缩成一句。两处骨架节点：(1) 当 draft TP 与 target TP 不一致时，draft 模型单独建一个 tp 组并用 patch_tensor_parallel_group 覆盖（回指 ch08 昇腾并行组）；否则 nullcontext。(2) use_cuda_graph 实际由昇腾 self.runner._use_aclgraph() 决定——「cuda_graph」只是沿用 vLLM 命名，落地是 ACLGraph（回指 ch25）。"]
+    },
+    {
+      "path": "vllm_ascend/spec_decode/llm_base_proposer.py",
+      "lines": "L425-L439",
+      "code": "        if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and self.use_cuda_graph:\n            logger.info(\n                \"[spec_decode/base] Wrapping draft model with ACLGraphWrapper:\"\n                \" runtime_mode=FULL, use_eagle=%s, enable_enpu=%s\",\n                self.use_eagle,\n                self.enable_enpu,\n            )\n            self.update_stream = torch.npu.Stream()\n            self._runnable = ACLGraphWrapper(\n                self._run_merged_draft,\n                self.vllm_config,\n                runtime_mode=CUDAGraphMode.FULL,\n                use_eagle=self.use_eagle,\n                enable_enpu=self.enable_enpu,\n            )",
+      "elide": ["load_model (L246-L439) 整段很长（建 draft vllm_config、get_model、可选共享 embedding/lm_head/topk_indices、mtp 特判等），骨架只需点：尾段在 FULL graph 模式下把 self._runnable 从普通 _run_merged_draft 函数替换为 ACLGraphWrapper 包裹版（回指 ch25 ACLGraph）。默认 self._runnable = self._run_merged_draft（见 __init__ L205）。"]
+    },
+    {
+      "path": "vllm_ascend/spec_decode/llm_base_proposer.py",
+      "lines": "L621-L668",
+      "code": "    def _propose(\n        self,\n        target_token_ids: torch.Tensor,\n        target_positions: torch.Tensor,\n        target_hidden_states: torch.Tensor,\n        next_token_ids: torch.Tensor,\n        token_indices_to_sample: torch.Tensor | None,\n        common_attn_metadata: CommonAttentionMetadata,\n        target_model_batch_desc: BatchDescriptor,\n        sampling_metadata: SamplingMetadata,\n        ...\n    ) -> torch.Tensor:\n        batch_size = common_attn_metadata.batch_size()\n\n        if token_indices_to_sample is None:\n            token_indices_to_sample = common_attn_metadata.query_start_loc[1:] - 1\n\n        if self.method in (\"eagle3\", \"dflash\"):\n            assert isinstance(\n                self.get_model(), (Eagle3LlamaForCausalLM, DFlashQwen3ForCausalLM, Eagle3DeepseekV2ForCausalLM)\n            )\n            target_hidden_states = self.model.combine_hidden_states(target_hidden_states)\n            assert target_hidden_states.shape[-1] == self.hidden_size\n\n        num_tokens, token_indices_to_sample, common_attn_metadata, long_seq_args = self.set_inputs_first_pass(\n            target_token_ids=target_token_ids,\n            next_token_ids=next_token_ids,\n            target_positions=target_positions,\n            target_hidden_states=target_hidden_states,\n            token_indices_to_sample=token_indices_to_sample,\n            cad=common_attn_metadata,\n            ...\n        )",
+      "elide": ["_propose 签名很长（L621-L643，含 mm_embed_inputs/req_scheduled_tokens/long_seq_metadata/num_rejected_tokens_gpu 等多参，截断标 ...）。L668 之后（至 L953）是 cudagraph_dispatcher.dispatch、pcp/dcp 切分、调 self._runnable(...) 跑 draft 前向、多步 draft 循环、采样出 draft token——重度减法，只讲「准备输入→（ACLGraph 包裹的）draft 前向→产出 draft token」骨架，不逐行。骨架要点：eagle3/dflash 先 combine_hidden_states，再统一走 set_inputs_first_pass 准备首遍输入。"]
+    },
+    {
+      "path": "vllm_ascend/spec_decode/llm_base_proposer.py",
+      "lines": "L1701-L1733",
+      "code": "    def prepare_inputs(\n        self,\n        common_attn_metadata: CommonAttentionMetadata,\n        sampled_token_ids: list[list[int]],\n        num_draft_tokens: list[int],\n    ) -> tuple[CommonAttentionMetadata, torch.Tensor]:\n        \"\"\"\n        This function is used to prepare the inputs for speculative decoding.\n        It updates to the common_attn_metadata to account for the rejected\n        tokens (and newly sampled tokens). It also returns the token indices\n        of the tokens that should be fed to the speculator.\n        \"\"\"\n        num_actual_reqs = len(num_draft_tokens)\n        num_rejected_tokens = [\n            n + 1 - len(sampled_token_ids[i]) if n > 0 else 0 for i, n in enumerate(num_draft_tokens)\n        ]\n        num_rejected_tokens = torch.tensor(num_rejected_tokens, dtype=torch.int32)",
+      "elide": ["docstring 里那段 [0,q1,q1+q2,...] 的 ASCII 示例（L1713-L1727）说明算法意图，写作可改述为公式不必逐行引。函数体 L1734-L1823 是纯 host 端 numpy/torch 索引运算：从每请求拒绝 token 数推出 new_seq_lens_cpu、用 cumsum 重建 new_query_start_loc、用 np.repeat+token_arange 构造 token_indices，再按 token_indices 重排 slot_mapping、打包成 AscendCommonAttentionMetadata 返回。控制流 host 可跑读；骨架讲「按拒绝数把 query/seq 长度与 token 索引收缩，喂给 speculator」即可，AscendCommonAttentionMetadata 的逐字段拷贝（L1798-L1822）不必逐行。"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "get_spec_decode_method (function)", "file": "vllm_ascend/spec_decode/__init__.py", "responsibility": "工厂：按 method 字符串 if-elif 分发，返回 8 个 Ascend*Proposer 之一；method→类并非同名，参数签名按 proposer 而异。"},
+    {"name": "AscendNgramProposerNPU", "file": "vllm_ascend/spec_decode/ngram_proposer_npu.py", "responsibility": "薄壳极致：继承 vLLM NgramProposerGPU，load_model/dummy_run/propose 全 no-op（propose 为 pass，不复用父类 GPU n-gram kernel）。对应 method='ngram_gpu'。"},
+    {"name": "AscendNgramProposer", "file": "vllm_ascend/spec_decode/ngram_proposer.py", "responsibility": "CPU n-gram 薄壳：继承 NgramProposer，propose 写回 token_ids_cpu 后调父类 batch_propose（device 无关）。对应 method='ngram'。"},
+    {"name": "AscendSuffixDecodingProposer", "file": "vllm_ascend/spec_decode/suffix_proposer.py", "responsibility": "最薄薄壳：propose 一行转发父类（补 runner.input_batch），dummy_run no-op。method='suffix'。"},
+    {"name": "AscendMedusaProposer", "file": "vllm_ascend/spec_decode/medusa_proposer.py", "responsibility": "中等薄壳：覆写 dummy_run（set_ascend_forward_context）+ propose（gather 每请求末位 hidden state 后 super().propose）。method='medusa'。"},
+    {"name": "AscendExtractHiddenStatesProposer", "file": "vllm_ascend/spec_decode/extract_hidden_states_proposer.py", "responsibility": "中等薄壳：覆写 dummy_run（ACL graph 签名）+ prepare_next_token_ids_padded（indices/count 模式）；只抽取/缓存 hidden states 不真投机。method='extract_hidden_states'。"},
+    {"name": "AscendSpecDecodeBaseProposer", "file": "vllm_ascend/spec_decode/llm_base_proposer.py", "responsibility": "重量级核心（2043 行）：继承 vLLM SpecDecodeBaseProposer，重写 __init__/load_model/_propose/prepare_inputs/set_inputs_first_pass/_run_merged_draft 等，集成 ACLGraph(ch25)+昇腾 Triton spec_decode kernel+MLA(ch20)+昇腾并行组(ch08)。draft/eagle/dflash/mtp 等均经此构造。"},
+    {"name": "AscendDraftModelProposer / AscendEagleProposer / AscendDflashProposer", "file": "vllm_ascend/spec_decode/{draft,eagle,dflash}_proposer.py", "responsibility": "走重量级 base 的薄入口：多继承 (vLLM 策略类, AscendSpecDecodeBaseProposer)，__init__ 仅转调 base 构造 + 少量校验/缓冲；dflash 再继承 eagle 叠 DFlash 缓冲。"}
+  ],
+
+  "data_flow": [
+    "配置阶段：runner 据 speculative_config.method 调 get_spec_decode_method(method, vllm_config, device, runner) → 工厂 if-elif 实例化对应 Ascend*Proposer（__init__.py:get_spec_decode_method）",
+    "薄壳路径（ngram/suffix）：proposer.propose(sampled_token_ids,...) 直接转发/调父类 batch_propose，host 端产出 draft token 列表（ngram_proposer.py:propose / suffix_proposer.py:propose）",
+    "重量级路径（eagle/draft_model/mtp/dflash）：load_model 建 draft 模型并（FULL graph 时）用 ACLGraphWrapper 包裹 _run_merged_draft（llm_base_proposer.py:load_model）",
+    "每步：prepare_inputs(common_attn_metadata, sampled_token_ids, num_draft_tokens) 按拒绝 token 数收缩 query_start_loc/seq_lens、构造 token_indices，返回 AscendCommonAttentionMetadata（llm_base_proposer.py:prepare_inputs）",
+    "draft 前向：_propose 调 set_inputs_first_pass 备输入 → cudagraph_dispatcher.dispatch → self._runnable(...)（ACLGraph 包裹的 draft 模型前向，含昇腾 Triton spec_decode kernel/MLA）→ 采样得 draft token（llm_base_proposer.py:_propose）",
+    "验证侧（ch28，本章仅回指）：proposer 提出的 draft token 交 AscendRejectionSampler 做接受/拒绝采样，闭合「提议-验证」环（vllm/v1/sample/rejection_sampler.py）"
+  ],
+
+  "design_decisions": [
+    {"decision": "一处 if-elif 工厂集中分发 8 种 proposer", "why": "把「按配置选策略」收敛到单一入口，新增策略只加一支 elif + 一个薄文件；method 字符串作对外唯一旋钮，吸收各 proposer 构造签名差异。", "evidence": "vllm_ascend/spec_decode/__init__.py:L33-L51"},
+    {"decision": "能复用就薄壳继承 vLLM proposer，必须特化才重写", "why": "device 无关的算法（ngram/suffix/medusa 提议逻辑）直接继承 vLLM 实现、只在 device/上下文接缝插薄层，最大化复用、最小化维护面。", "evidence": "vllm_ascend/spec_decode/suffix_proposer.py:L23-L24（propose 一行转发）；ngram_proposer.py:L57-L62（调父类 batch_propose）"},
+    {"decision": "'ngram_gpu' 路径用 no-op 薄壳 stub 掉父类 GPU kernel", "why": "AscendNgramProposerNPU 继承 NgramProposerGPU 只为沿用其构造/形状约定，但父类那段 GPU 批量 n-gram kernel 不能在 NPU 跑，故 load_model/dummy_run/propose 全置 pass（真正的 ngram 提议走 method='ngram' 的 CPU 路径）。", "evidence": "vllm_ascend/spec_decode/ngram_proposer_npu.py:L9-L35（三方法皆 pass）对照 vllm/v1/spec_decode/ngram_proposer_gpu.py:L314（父类 propose 为真实 GPU 实现）"},
+    {"decision": "重量级 proposer 走多继承 (vLLM 策略类, AscendSpecDecodeBaseProposer)", "why": "策略语义（eagle/draft_model）从 vLLM 类继承，构造/前向/输入准备走昇腾 base，二者正交组合；pass_hidden_states_to_model 一个布尔区分 eagle(True)/draft(False)。", "evidence": "vllm_ascend/spec_decode/eagle_proposer.py:L10-L19；draft_proposer.py:L8-L16"},
+    {"decision": "draft TP 与 target TP 不一致时单独 patch tp 组", "why": "Eagle 的 draft 模型实际与 target 同 TP，但 draft_tensor_parallel_size 校验后可能为 1；用 init_model_parallel_group + patch_tensor_parallel_group 给 draft 单独建组，避免误用 target TP 组（回指 ch08 昇腾并行组）。", "evidence": "vllm_ascend/spec_decode/llm_base_proposer.py:L163-L173"},
+    {"decision": "FULL graph 时把 draft 前向包进 ACLGraphWrapper", "why": "draft 模型多步前向是 spec decode 的热路径，用 ACLGraph 捕获静态图消除每步派发开销（回指 ch25）；非 FULL 模式退回普通 _run_merged_draft 函数。", "evidence": "vllm_ascend/spec_decode/llm_base_proposer.py:L425-L439 + L205"},
+    {"decision": "prepare_inputs 在 host 端按拒绝 token 数收缩输入", "why": "验证侧拒绝了部分 draft token 后，下一步只需把未拒绝部分喂给 speculator；用 numpy cumsum/repeat 重算 query_start_loc 与 token_indices，避免把无效 token 送进 draft 前向。", "evidence": "vllm_ascend/spec_decode/llm_base_proposer.py:L1701-L1823"}
+  ],
+
+  "theory": [
+    "投机解码闭环：proposer 一步提出 k=num_speculative_tokens 个 draft token（提议侧，本章），target 模型一次前向并行验证，rejection sampler 接受最长合法前缀 + 1 个 bonus token（验证侧，ch28）。本章只覆盖提议侧产出 draft token。",
+    "提议成本 vs 收益：薄壳路径（ngram/suffix）提议成本近乎为零（CPU 匹配，不跑模型前向）；重量级路径（eagle/draft_model/mtp/dflash）每步要跑一次 draft 模型前向，故才需要 ACLGraph + Triton kernel 把每步派发与前向开销压到最低。",
+    "decode_threshold = 1 + num_speculative_tokens：每个 decode 请求一步最多产出 1（bonus）+ k 个候选位（llm_base_proposer.py:L136），prepare_inputs 的 query 长度收缩即围绕这个上界做。",
+    "工厂复杂度：策略数 N 增长时，分发开销恒为 O(N) 的一次 if-elif 串、实际命中 O(1)；新增策略的边际成本是「一支 elif + 一个薄子类」，与「能复用就薄壳」共同把扩展成本压到最低——这是本章可量化的工程立意。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "__init__.py / 各 proposer.py 文件头的 Apache 许可证抬头与「Adapted from ...」注释（如 __init__.py:L1-L19）", "why_safe": "纯版权样板，不影响控制流与读者理解；正文内嵌时省略不损失任何源码语义。"},
+      {"what": "AscendSpecDecodeBaseProposer.__init__ 中段的 logger.debug/logger.info 调用与其多行格式串（如 L120-L131、L426-L431）", "why_safe": "纯日志，不参与计算；删后行为不变。但须保留 ACLGraphWrapper 包裹这一控制流本身。"},
+      {"what": "__init__ 里 pcp/dcp 并行尺寸读取、full_indices/use_sparse/use_compress 等与本章主线（工厂+薄壳+提议骨架）无关的持久标志位（L141-L153、L207-L220 的 mrope/xdrope 分支细节）", "why_safe": "这些是长序列并行/多模态 rope 等旁支特性的缓冲初始化，本章只讲提议骨架，不展开这些子系统；保留 self.num_speculative_tokens/decode_threshold/use_cuda_graph/_runnable 等主线字段即可。"},
+      {"what": "_propose 的长参数列表中与主线无关的可选参数（mm_embed_inputs/long_seq_metadata/num_prefill_reqs/num_decode_reqs/scheduler_output/num_scheduled_tokens）及 L668 之后 pcp/dcp 切分、多步 draft 循环全部细节（L669-L953）", "why_safe": "本章对重量级 base 明确「只挑骨架讲、不逐行」（重度减法）；保留 _propose 的「combine_hidden_states→set_inputs_first_pass→dispatch→_runnable→产出 draft token」骨架即可表达提议流程，旁支参数与多步循环不影响读者理解工厂/薄壳立意。"},
+      {"what": "prepare_inputs 函数体内 AscendCommonAttentionMetadata 的逐字段拷贝（L1798-L1822）与 docstring 中 ASCII 示例（L1713-L1727）", "why_safe": "字段拷贝是把算好的张量装箱，docstring 示例可改述为一句说明；保留「按拒绝数收缩 query/seq + 构造 token_indices」的核心运算即可。"},
+      {"what": "dflash_proposer.py 中 set_inputs_first_pass/dummy_run 的 DFlash 专属 Triton kernel 调用与缓冲细节（L63-L267）", "why_safe": "DFlash 是 eagle 之上的进一步特化，本章把它作为「继承链延伸」一笔带过即可，不逐行；其 Triton kernel 需 NPU/CANN 不真跑。"}
+    ],
+    "must_keep": [
+      {"symbol": "get_spec_decode_method", "why": "本章主角：工厂入口函数名，读者须看到 if-elif 分发结构。"},
+      {"symbol": "AscendNgramProposer", "why": "method='ngram' 的 CPU 薄壳，对照 ngram_gpu。"},
+      {"symbol": "AscendNgramProposerNPU", "why": "method='ngram_gpu' 的 no-op 薄壳标本，「继承 GPU 类但 stub 掉」立意核心。"},
+      {"symbol": "NgramProposerGPU", "why": "AscendNgramProposerNPU 的 vLLM 父类，体现「直接继承基座 GPU proposer」。"},
+      {"symbol": "AscendSuffixDecodingProposer", "why": "最薄薄壳标本（propose 一行转发）。"},
+      {"symbol": "AscendMedusaProposer", "why": "中等薄壳标本（覆写 dummy_run+propose）。"},
+      {"symbol": "AscendExtractHiddenStatesProposer", "why": "中等薄壳标本（只抽取 hidden states）。"},
+      {"symbol": "AscendEagleProposer", "why": "走重量级 base 的薄入口，pass_hidden_states_to_model=True。"},
+      {"symbol": "AscendDraftModelProposer", "why": "走重量级 base 的薄入口，pass_hidden_states_to_model=False + 校验。"},
+      {"symbol": "AscendDflashProposer", "why": "继承 AscendEagleProposer 的继承链延伸标本。"},
+      {"symbol": "AscendSpecDecodeBaseProposer", "why": "重量级核心类名，读者须知所有重量级 proposer 都构造于此。"},
+      {"symbol": "SpecDecodeBaseProposer", "why": "vLLM 基类，体现昇腾 base 是其子类（重写而非从零）。"},
+      {"symbol": "pass_hidden_states_to_model", "why": "区分 eagle(True)/draft(False) 的关键构造布尔，writer 须讲清。"},
+      {"symbol": "prepare_inputs", "why": "重量级 base 的关键重写方法（按拒绝数收缩输入），章节明确点名。"},
+      {"symbol": "_propose", "why": "draft 一步提议的骨架方法，提议流程主干。"},
+      {"symbol": "ACLGraphWrapper", "why": "FULL graph 下包裹 draft 前向，回指 ch25 的接缝符号。"},
+      {"symbol": "_runnable", "why": "draft 前向可调用对象（普通函数或 ACLGraph 包裹版），骨架须保留这个分派点。"},
+      {"symbol": "num_speculative_tokens", "why": "k 值，decode_threshold 与缓冲分组都依赖它，理论量化要用。"},
+      {"symbol": "patch_tensor_parallel_group", "why": "draft TP 单独建组的昇腾并行组接缝，回指 ch08。"}
+    ]
+  },
+
+  "diagram_plan": [
+    {"name": "spec-decode-factory-dispatch", "spec": "工厂分发图：左侧 method 字符串（ngram/ngram_gpu/suffix/medusa/eagle·eagle3·mtp/dflash/draft_model/extract_hidden_states）→ 中间 get_spec_decode_method if-elif → 右侧 8 个 Ascend*Proposer 节点；右侧节点用颜色/分组标注三类：纯薄壳(ngram/suffix)、中等薄壳(ngram_gpu·no-op/medusa/extract_hidden_states)、走重量级 base(eagle/draft_model/mtp/dflash)。用 svg-diagram 画多对多映射，避免 mermaid 自动布局错位。"},
+    {"name": "shell-vs-heavyweight-inheritance", "spec": "继承结构图：上排 vLLM 基座类(NgramProposer/NgramProposerGPU/SuffixDecodingProposer/MedusaProposer/EagleProposer/DraftModelProposer/SpecDecodeBaseProposer)，下排昇腾子类；用边标注「继承+几行覆写」薄壳 vs AscendSpecDecodeBaseProposer 的「重写 __init__/_propose/prepare_inputs/...」；标出多继承 (策略类, AscendSpecDecodeBaseProposer) 的双父边，以及 dflash→eagle 的二级继承。"},
+    {"name": "propose-verify-loop", "spec": "提议-验证闭环时序：proposer 提出 k 个 draft token（本章高亮）→ target 一次前向并行验证 → AscendRejectionSampler 接受最长前缀+bonus（ch28，灰显回指）→ 下一步 prepare_inputs 按拒绝数收缩输入回到 proposer。标注本章管提议侧、ch28 管验证侧。"},
+    {"name": "roadmap-ch29", "spec": "复用 roadmap.py，高亮节点 ch29（投机解码提议侧），前承 ch28（采样/验证侧），收束投机这条线；回指节点 ch08(并行组)/ch20(MLA)/ch25(ACLGraph) 作淡色依赖。"}
+  ],
+
+  "foreshadow_due": {"应埋伏笔": [], "应回收": []},
+
+  "notes_for_lead": "路线总体成立（工厂分发+薄壳继承+一个重量级重写）。两点与章节描述的小出入，已按真实源码如实写入档案、不构成逃生舱：(1) AscendNgramProposerNPU 的 propose 体是裸 `pass`（连同 load_model/dummy_run 都是 no-op），并非『把父类 GPU propose 当 NPU 用』——它继承 NgramProposerGPU 仅为沿用构造/形状约定，真正的 ngram 提议走 method='ngram' 的 CPU 路径 AscendNgramProposer。建议正文如实讲『stub 掉 GPU kernel 的薄壳』而非『复用 GPU 实现』。(2) 工厂 method 字符串与类名非一一同名：'ngram_gpu'→NgramProposerNPU、'draft_model'→DraftModelProposer、'eagle/eagle3/mtp' 三 method 共用 AscendEagleProposer，章节简称的『draft 一支』实为 method='draft_model'。行号基线为当前 pin 源码：__init__.py 51 行、ngram_proposer_npu.py 35 行、llm_base_proposer.py 2043 行（类 def L111、prepare_inputs L1701、_propose L621）。"
+}

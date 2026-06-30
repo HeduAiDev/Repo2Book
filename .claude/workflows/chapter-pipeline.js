@@ -14,16 +14,16 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch28',
-  slug: 'ch28-sampling-npu-adaptation',
+  chapter_id: 'ch29',
+  slug: 'ch29-speculative-decode-npu',
   instance: 'vllm-ascend',
-  focus: '采样的 NPU 对位：规避 CPU-NPU 同步与 Triton 回退——子类化只覆写几处的「薄壳」典范。AscendSampler(Sampler) / AscendRejectionSampler(RejectionSampler) 继承 vLLM 采样器、只覆写少数热点方法。**(1) ★Gumbel 技巧避开 torch.multinomial 的 CPU-NPU 同步（本章算法宝石）**——random_sample（sampler.py:L19）不调 torch.multinomial（它会触发 CPU-NPU 同步、卡住流水线），改用 Gumbel-max 等价式：probs.div_(q).argmax(dim=-1)，其中 q=exponential_() 指数随机——数学上 argmax(prob/Exp(1)) 与按 prob 多项式采样同分布，但全程在 NPU 上、无同步；进一步用 npu_stream_switch(global_stream()) 把指数随机放到独立 stream 异步做。**(2) penalties / top-k-top-p 走昇腾 Triton + 优雅回退**——AscendRejectionSampler（rejection_sampler.py:L34）从 ops/triton/reject_sample 引 rejection_greedy_sample_with_triton 等 Triton kernel 做投机解码的拒绝采样；penalties.py 同理。**关键：HAS_TRITON 不可用时优雅回退 vLLM 默认实现**（if not HAS_TRITON: 走基类原版）——昇腾 Triton 是加速、不是依赖。**(3) 薄壳继承**——两个采样器都只覆写「会碰 NPU 同步/能上 Triton」的那几处，其余继承基类不动。**核心立意**：采样器是「子类化只覆写热点 + 数学等价式绕开硬件短板（CPU-NPU 同步）+ 加速器可选回退」的薄壳典范；Gumbel-max 把「按概率多项式采样」改写成「指数随机后 argmax」是全章的算法宝石——同分布、但避开 multinomial 的同步。**回收伏笔 f11（埋于 ch15）**：ch15 的 _sample 当时只做二选一派发（self.sampler / self.rejection_sampler），说采样器内部「规避 CPU-NPU 同步、Triton 回退等 NPU 对位」留采样章——本章正是兑现。承接 ch15 的派发、与 ch26 batch-invariant 的 Triton 确定性算子同源（都用 ops/triton/）。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/v1/sample/sampler.py（Sampler 基类，含原版 random_sample/torch.multinomial）+ rejection_sampler.py（RejectionSampler 基类——昇腾继承它、覆写采样热点）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；random_sample 的 Gumbel 等价式 / argmax 是纯 Python·CPU torch 可跑验同分布（精简版可在 host 验「div_(Exp).argmax 与 multinomial 同分布」），npu_stream_switch / Triton kernel 要 NPU/CANN、不真跑；HAS_TRITON 回退分支纯 Python 可跑】',
-  highlight: 'ch28',
+  focus: '投机解码的 NPU 对位：proposer 工厂与薄壳继承——「工厂分发 + 薄壳继承 + 少数重量级覆写」范式。**(1) 工厂分发**——spec_decode/__init__.py 的 get_spec_decode_method(method, ...)（L33）一个 if-elif 把 method 字符串映射到 8 个 Ascend*Proposer（ngram→AscendNgramProposer、ngram_gpu→AscendNgramProposerNPU、suffix→AscendSuffixDecodingProposer、draft/eagle/medusa/dflash/extract_hidden_states 各一支）——一处工厂、按配置选 proposer。**(2) 多数是薄壳**——大量 proposer 是极薄子类：AscendNgramProposerNPU(NgramProposerGPU)（ngram_proposer_npu.py，仅 35 行，直接继承 vLLM 的 GPU proposer、「把 GPU 当 NPU 用」只覆写 propose 一处）；draft/eagle proposer 各 17/19 行——继承基类、几乎不改。**(3) 真正重量级**——llm_base_proposer.py（2043 行）的 AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer)（L111）重写 prepare_inputs（L1701）/ propose，里头用 ACLGraph（回指 ch25）+ 昇腾 Triton spec_decode kernel + MLA（回指 ch20）+ 昇腾并行组（回指 ch08）——**只挑骨架讲、不逐行**（重度减法）。**(4) 与采样的接口**——proposer 提出 draft token、由 ch28 的 AscendRejectionSampler 做接受/拒绝采样（投机解码的「提议-验证」闭环：本章管提议、ch28 管验证）。**核心立意**：投机解码是「一个 if-elif 工厂把 N 种 proposer 策略分发开，多数策略靠薄壳继承 vLLM（甚至把 GPU proposer 直接当 NPU 用），只有自研 LLM-base proposer 才重量级重写」——典型的「能复用就薄壳、必须特化才重写」的工程取舍。本章承接 ch28 采样（投机的验证侧）、收束投机这条线。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/v1/spec_decode（NgramProposerGPU / SpecDecodeBaseProposer 等基类——昇腾工厂分发到的 proposer 或直接继承、或重写）+ vllm/v1/sample/rejection_sampler.py（验证侧，回指 ch28）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；工厂 if-elif 分发 / 薄壳继承覆写点 / prepare_inputs 骨架是纯 Python，host 可跑读控制流；真实 ACLGraph/Triton spec_decode kernel/MLA 要 NPU/CANN、不真跑】',
+  highlight: 'ch29',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm-ascend/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
   skip_impl: false,
-  paths: ['vllm_ascend/sample/sampler.py', 'vllm_ascend/sample/rejection_sampler.py', 'vllm_ascend/sample/penalties.py'],
+  paths: ['vllm_ascend/spec_decode/__init__.py', 'vllm_ascend/spec_decode/ngram_proposer_npu.py', 'vllm_ascend/spec_decode/llm_base_proposer.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
