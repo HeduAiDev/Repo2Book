@@ -1,0 +1,212 @@
+{
+  "chapter": "ch22",
+  "title": "KV cache 管理与调度器的 NPU 特化 —— Part V 收官：哪些原样复用，哪些必须特化",
+  "thesis": "一个成熟插件对宿主的『核心循环』（KV 分配 + 请求调度）应当尽量少碰。昇腾在 KV 管理上 90% 原样继承 vLLM（FullAttentionManager / BlockPool / SingleTypeKVCacheManager），只在两处开子类：(a) 压缩 KV spec 的 block 管理（CompressAttentionManager），(b) 三种特殊调度策略（SchedulerDynamicBatch / RecomputeScheduler / ProfilingChunkScheduler，均继承 vLLM Scheduler）。本章用『复用 vs 特化的边界』收束 Part V 注意力子系统，示范『该复用就复用、别为改而改』的减法哲学。承接 ch13/14/15 的 worker/runner/单步前向 —— 本章是它们上游的调度与 KV 分配层。",
+
+  "code_spine": [
+    "vllm_ascend/platform.py:L632-L659 —— 入口：check_and_update_config 按 ascend_config 三个开关把 scheduler_cls 改成三个昇腾子类之一（recompute / dynamic-batch / profiling-chunk），默认不改则用 vLLM 原生 Scheduler",
+    "vllm_ascend/patch/platform/patch_kv_cache_coordinator.py:L104-L116 —— 入口：KVCacheCoordinator.__init__ 被 patch 成调用 vllm_ascend 版 get_manager_for_kv_cache_spec（而非 vLLM 版），从而把压缩 MLA spec 的 manager 选成 CompressAttentionManager",
+    "vllm_ascend/core/single_type_kv_cache_manager.py:L236-L282 —— get_manager_for_kv_cache_spec：先用 vLLM 的 spec_manager_map 查表，再对 MLAAttentionSpec 且 compress_ratio>1 改选 CompressAttentionManager 并设 max_admission_blocks_per_request",
+    "vllm_ascend/core/single_type_kv_cache_manager.py:L28-L233 —— CompressAttentionManager(FullAttentionManager)：所有覆写都围绕『token 数 // compress_ratio』缩放与 logical_block_size 前缀命中",
+    "vllm_ascend/core/scheduler_dynamic_batch.py:L35-L119 —— BudgetRefiner：读 profile_table.csv，按 (ctx_len, d_num) 查表得动态 token 预算",
+    "vllm_ascend/core/scheduler_dynamic_batch.py:L122-L179 —— SchedulerDynamicBatch.schedule：refine_budget 调 token_budget + decode-first 重排 self.running，其余沿用 super().schedule() 的整体结构（逐字 inline 实现）",
+    "vllm_ascend/core/recompute_scheduler.py:L76-L94 —— RecomputeSchedulerConfig(SchedulerConfig)：initialize_from_config 按 async_scheduling 选 RecomputeScheduler / AsyncRecomputeScheduler",
+    "vllm_ascend/core/recompute_scheduler.py:L65-L73,L109-L128 —— register_ascend_mla_spec_in_manager + RecomputeScheduler.__init__（PD 角色判定）",
+    "vllm_ascend/core/recompute_scheduler.py:L322-L348 —— schedule() 里 allocate_slots 失败时的关键分叉：kv_consumer 侧『丢弃→recompute』而非常规 preempt",
+    "vllm_ascend/core/recompute_scheduler.py:L830-L841 —— update_from_output 把 recomputed_reqs 以 stop_reason='recomputed' 的 EngineCoreOutput 回吐给 PD proxy",
+    "vllm_ascend/core/recompute_scheduler.py:L1088-L1093 —— AsyncRecomputeScheduler(AsyncScheduler, RecomputeScheduler) 多继承组合",
+    "vllm_ascend/core/scheduler_profiling_chunk.py:L316-L329,L386-L389 —— schedule() 里用 ProfilingChunkManager.predict_chunk_size 收窄 num_new_tokens + time_budget 记账",
+    "vllm_ascend/core/profiling_chunk_predictor.py:L222-L258 —— ChunkSizePredictor.predict：解二次方程 a·x²+(2aL+b)·x−T=0 求 chunk size"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm_ascend/platform.py",
+      "lines": "L632-L658",
+      "what": "三个调度器子类的唯一启用点 —— 默认全不触发，沿用 vLLM 原生 Scheduler",
+      "code": "        if ascend_config.recompute_scheduler_enable:\n            kv_transfer_config = vllm_config.kv_transfer_config\n            kv_role = getattr(kv_transfer_config, \"kv_role\", None)\n            if kv_transfer_config is None or kv_role == \"kv_both\":\n                raise ValueError(\n                    \"recompute_scheduler_enable can only be enabled in PD-disaggregated mode \"\n                    \"(kv_role='kv_producer' or 'kv_consumer'), and is not supported in PD-mixed mode.\"\n                )\n\n            from vllm_ascend.core.recompute_scheduler import RecomputeSchedulerConfig\n\n            recompute_scheduler_config = RecomputeSchedulerConfig.initialize_from_config(vllm_config)\n            vllm_config.scheduler_config = recompute_scheduler_config\n\n        # Extend original scheduler_config to use SchedulerDynamicBatch.\n        if ascend_config.SLO_limits_for_dynamic_batch != -1:\n            vllm_config.scheduler_config.scheduler_cls = (\n                \"vllm_ascend.core.scheduler_dynamic_batch.SchedulerDynamicBatch\"\n            )\n            vllm_config.scheduler_config.enable_chunked_prefill = True\n            vllm_config.scheduler_config.SLO_limits_for_dynamic_batch = ascend_config.SLO_limits_for_dynamic_batch\n\n        # Use ProfilingChunkScheduler when profiling-based chunk sizing is on.\n        if ascend_config.profiling_chunk_config.enabled:\n            vllm_config.scheduler_config.scheduler_cls = (\n                \"vllm_ascend.core.scheduler_profiling_chunk.ProfilingChunkScheduler\"\n            )",
+      "elide": ["L659 的 patch_profiling_chunk import；前后的 cp_size / kv_load_failure 校验等无关分支"]
+    },
+    {
+      "path": "vllm_ascend/patch/platform/patch_kv_cache_coordinator.py",
+      "lines": "L104-L116",
+      "what": "KVCacheCoordinator 被 patch：用昇腾版工厂建每个 spec 的 manager —— CompressAttentionManager 由此被选中",
+      "code": "        self.single_type_managers = tuple(\n            get_manager_for_kv_cache_spec(\n                kv_cache_spec=kv_cache_group.kv_cache_spec,\n                block_pool=self.block_pool,\n                enable_caching=enable_caching,\n                kv_cache_group_id=i,\n                dcp_world_size=dcp_world_size,\n                pcp_world_size=pcp_world_size,\n                max_num_batched_tokens=max_num_batched_tokens,\n                max_model_len=max_model_len,\n            )\n            for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)\n        )",
+      "elide": ["此处 get_manager_for_kv_cache_spec 是 from vllm_ascend.core.single_type_kv_cache_manager 导入的昇腾版（见文件 L28 import）；BlockPool 构造（L90-96）原样复用 vLLM"]
+    },
+    {
+      "path": "vllm_ascend/core/single_type_kv_cache_manager.py",
+      "lines": "L236-L282",
+      "what": "manager 重映射工厂：复用 vLLM spec_manager_map，仅对压缩 MLA spec override，并把 admission 上限对齐启动池大小",
+      "code": "def get_manager_for_kv_cache_spec(\n    kv_cache_spec: KVCacheSpec,\n    max_num_batched_tokens: int | None = None,\n    max_model_len: int | None = None,\n    **kwargs,\n) -> SingleTypeKVCacheManager:\n    manager_class = spec_manager_map[type(kv_cache_spec)]\n    if isinstance(kv_cache_spec, MLAAttentionSpec) and kv_cache_spec.compress_ratio > 1:\n        manager_class = CompressAttentionManager\n        if max_model_len is not None:\n            # Compressed-MLA peak in blocks: ceil(max_model_len/compress/block).\n            compress_ratio = kv_cache_spec.compress_ratio\n            block_size = kv_cache_spec.block_size\n            max_compressed_tokens = max_model_len // compress_ratio\n            kwargs[\"max_admission_blocks_per_request\"] = cdiv(max_compressed_tokens, block_size) + 1\n    elif isinstance(kv_cache_spec, (SlidingWindowSpec, ChunkedLocalAttentionSpec)):\n        if max_num_batched_tokens is not None and max_model_len is not None:\n            kwargs[\"max_admission_blocks_per_request\"] = kv_cache_spec.max_admission_blocks_per_request(\n                max_num_batched_tokens=max_num_batched_tokens,\n                max_model_len=max_model_len,\n            )\n    manager = manager_class(kv_cache_spec, **kwargs)\n    return manager",
+      "elide": ["函数 docstring L242-L258（解释 DSv4/DSA、vLLM issue #40863 死锁背景）—— writer 可摘要不必逐字；spec_manager_map 是 vLLM 原生模块级表（FullAttentionSpec/MLAAttentionSpec→FullAttentionManager 等）"]
+    },
+    {
+      "path": "vllm_ascend/core/single_type_kv_cache_manager.py",
+      "lines": "L28-L57",
+      "what": "CompressAttentionManager 核心：继承 FullAttentionManager，所有覆写就是『token 数先整除 compress_ratio』再调父类",
+      "code": "class CompressAttentionManager(FullAttentionManager):\n    def __init__(self, kv_cache_spec: MLAAttentionSpec, block_pool: BlockPool, **kwargs) -> None:\n        super().__init__(kv_cache_spec, block_pool, **kwargs)\n        self.compress_ratio = kv_cache_spec.compress_ratio\n        self._null_block = block_pool.null_block\n\n    def get_num_blocks_to_allocate(\n        self,\n        request_id: str,\n        num_tokens: int,\n        new_computed_blocks: Sequence[KVCacheBlock],\n        total_computed_tokens: int,\n        num_tokens_main_model: int,\n        apply_admission_cap: bool = False,\n    ) -> int:\n        num_tokens //= self.compress_ratio\n        num_tokens_main_model //= self.compress_ratio\n\n        return super().get_num_blocks_to_allocate(\n            request_id,\n            num_tokens,\n            new_computed_blocks,\n            total_computed_tokens,\n            num_tokens_main_model,\n            apply_admission_cap,\n        )",
+      "elide": ["L43-L45 关于 speculative decoding/MTP 的注释；allocate_new_blocks(L129-154)/cache_blocks(L156-186) 同样是『//compress_ratio 后调父类逻辑』的同构覆写，writer 选一两个代表即可"]
+    },
+    {
+      "path": "vllm_ascend/core/single_type_kv_cache_manager.py",
+      "lines": "L188-L233",
+      "what": "前缀命中按『逻辑块』（= 物理 block_size × compress_ratio）粒度匹配 —— 压缩 KV 命中边界的关键覆写",
+      "code": "    @classmethod\n    def find_longest_cache_hit(\n        cls,\n        block_hashes: BlockHashList,\n        max_length: int,\n        kv_cache_group_ids: list[int],\n        block_pool: BlockPool,\n        kv_cache_spec: KVCacheSpec,\n        use_eagle: bool,\n        alignment_tokens: int,\n        dcp_world_size: int = 1,\n        pcp_world_size: int = 1,\n    ) -> tuple[list[KVCacheBlock], ...]:\n        computed_blocks: tuple[list[KVCacheBlock], ...] = tuple([] for _ in range(len(kv_cache_group_ids)))\n        block_size = kv_cache_spec.block_size\n        if dcp_world_size * pcp_world_size > 1:\n            block_size *= dcp_world_size * pcp_world_size\n        logical_block_size = block_size * kv_cache_spec.compress_ratio\n        logical_block_hashes = BlockHashListWithBlockSize(block_hashes, block_size, logical_block_size)\n        max_num_blocks = max_length // logical_block_size\n        for block_hash in itertools.islice(logical_block_hashes, max_num_blocks):\n            if cached_block := block_pool.get_cached_block(block_hash, kv_cache_group_ids):\n                for computed, cached in zip(computed_blocks, cached_block):\n                    computed.append(cached)\n            else:\n                break\n        if use_eagle and computed_blocks[0]:\n            for computed in computed_blocks:\n                computed.pop()\n\n        while (\n            logical_block_size != alignment_tokens\n            and len(computed_blocks[0]) * logical_block_size % alignment_tokens != 0\n        ):\n            for computed in computed_blocks:\n                computed.pop()\n        return computed_blocks",
+      "elide": ["L201-L205 被注释掉的 isinstance 断言（dead assert）；对照 vLLM 基类 FullAttentionManager.find_longest_cache_hit 不乘 compress_ratio、直接按物理 block_size 命中"]
+    },
+    {
+      "path": "vllm_ascend/core/scheduler_dynamic_batch.py",
+      "lines": "L83-L119",
+      "what": "BudgetRefiner：按当前 running 的平均 decode token 数与 decode 请求数查表，得动态 token 预算",
+      "code": "    def _align_key(self, value, valid_keys):\n        \"\"\"Align the minimum value within the valid_keys that is greater than the value.\"\"\"\n        for k in valid_keys:\n            if k >= value:\n                return k\n        return None\n\n    def _get_max_budget(self, num_decode_tokens, num_decode):\n        \"\"\"Get the maximum budget according to the number of decoding tokens and the decoding requests.\"\"\"\n        aligned_ctx = self._align_key(num_decode_tokens, self.context_keys)\n        aligned_dnum = self._align_key(num_decode, self.dnum_keys)\n        if aligned_ctx is None or aligned_dnum is None:\n            return self.default_budget\n        budget = self.lookup.get((aligned_ctx, aligned_dnum), None)\n        if budget is None:\n            logger.warning(\"Table miss for ctx,dnum%s\", (aligned_ctx, aligned_dnum))\n            budget = self.default_budget\n        return budget\n\n    def refine_budget(self, running_request, budget):\n        \"\"\"Dynamically refine the token budget according to the running request.\"\"\"\n        if not self.enabled:\n            return budget\n        # assume all running request will be scheduled.\n        num_decode_token_lst = [\n            req.num_tokens_with_spec for req in running_request if req.num_computed_tokens >= req.num_prompt_tokens\n        ]\n        num_decode = len(num_decode_token_lst)\n        if num_decode <= 0:\n            return budget\n        num_decode_tokens = sum(num_decode_token_lst) / num_decode\n        return self._get_max_budget(num_decode_tokens, num_decode)",
+      "elide": ["__init__/_read_lookup_table(L39-L81) 读 profile_table.csv 的 pandas 分组细节，writer 摘要即可；enabled = slo_limit > 0，未配 SLO 时 refine_budget 直接 return budget（恒等，零开销）"]
+    },
+    {
+      "path": "vllm_ascend/core/scheduler_dynamic_batch.py",
+      "lines": "L171-L179",
+      "what": "SchedulerDynamicBatch.schedule 唯一的两处实质改动：动态预算 + decode-first 重排，其余逐字复刻 super().schedule()",
+      "code": "        token_budget = self.max_num_scheduled_tokens\n        token_budget = self.budget_refiner.refine_budget(self.running, token_budget)\n\n        # NOTE: We move the prefill requests to the end of the self.running\n        # list and keep the relative order unchanged. This rearrangement makes this\n        # scheduling algorithm a strict decode-first chunked prefills.\n        d_lst = [req for req in self.running if req.num_computed_tokens >= req.num_prompt_tokens]\n        p_lst = [req for req in self.running if req.num_computed_tokens < req.num_prompt_tokens]\n        self.running = d_lst + p_lst",
+      "elide": ["schedule() 其余 ~400 行（L164-170 初始化、L191-574 RUNNING/WAITING 双循环、SchedulerOutput 组装）是 vLLM Scheduler.schedule 的逐字 inline 复制；昇腾因无法热补 super 内部循环只能整段重写 —— writer 应点明『为何整段重抄』而非逐行讲"]
+    },
+    {
+      "path": "vllm_ascend/core/recompute_scheduler.py",
+      "lines": "L76-L94",
+      "what": "RecomputeSchedulerConfig：dataclass 子类，按 async_scheduling 决定具体调度器类名",
+      "code": "@dataclass\nclass RecomputeSchedulerConfig(SchedulerConfig):\n    scheduler_cls: str | type[object] = \"vllm_ascend.core.recompute_scheduler.RecomputeScheduler\"\n\n    @classmethod\n    def initialize_from_config(cls, vllm_config: VllmConfig):\n        vllm_scheduler_config = vllm_config.scheduler_config\n        scheduler_config = {\n            field.name: getattr(vllm_scheduler_config, field.name)\n            for field in fields(vllm_scheduler_config)\n            if field.init\n        }\n        if vllm_scheduler_config.async_scheduling:\n            scheduler_config[\"scheduler_cls\"] = \"vllm_ascend.core.recompute_scheduler.AsyncRecomputeScheduler\"\n        else:\n            scheduler_config[\"scheduler_cls\"] = \"vllm_ascend.core.recompute_scheduler.RecomputeScheduler\"\n        scheduler_config[\"max_model_len\"] = vllm_config.model_config.max_model_len\n        scheduler_config[\"is_encoder_decoder\"] = vllm_config.model_config.is_encoder_decoder\n        return cls(**scheduler_config)",
+      "elide": []
+    },
+    {
+      "path": "vllm_ascend/core/recompute_scheduler.py",
+      "lines": "L322-L348",
+      "what": "RecomputeScheduler 的核心分叉：block 不够时，PD consumer 侧不做常规 preempt，而是 pop 出请求、free KV、记入 recomputed_reqs 丢回 proxy 让上游重算",
+      "code": "            with record_function_or_nullcontext(\"schedule: allocate_slots\"):\n                while True:\n                    new_blocks = self.kv_cache_manager.allocate_slots(\n                        request,\n                        num_new_tokens,\n                        num_lookahead_tokens=self.num_lookahead_tokens,\n                    )\n\n                    if new_blocks is not None:\n                        # The request can be scheduled.\n                        break\n\n                    # The request cannot be scheduled.\n                    # Preempt the lowest-priority request.\n                    # NOTE: We add the preempted_req to recomputed_reqs in kv_consumer to\n                    # drop the request to PD proxy.\n                    transfer_config = self.vllm_config.kv_transfer_config\n                    if transfer_config is not None and not transfer_config.is_kv_producer:\n                        recomputed_req = self.running.pop()\n                        self.kv_cache_manager.free(recomputed_req)\n                        recomputed_reqs.append(\n                            RecomputeReqInfo(\n                                recomputed_req.request_id, recomputed_req.output_token_ids, recomputed_req.client_index\n                            )\n                        )\n                        if recomputed_req == request:\n                            break",
+      "elide": ["else 分支（L349-378）是 vLLM 原生的 PRIORITY/FCFS preempt 逻辑（逐字复刻）；schedule() 其余 ~440 行同 vLLM Scheduler.schedule（含 is_mtp_kv_consumer 的 spec token 处理 L532-533/651-666）"]
+    },
+    {
+      "path": "vllm_ascend/core/recompute_scheduler.py",
+      "lines": "L831-L841",
+      "what": "update_from_output 把被丢弃的 recomputed_reqs 以 finish_reason=STOP / stop_reason='recomputed' 回吐，PD proxy 据此把请求改投他处重算",
+      "code": "        # return recomputed requests as EngineCoreOutput\n        if scheduler_output.recomputed_reqs is not None:\n            for req_info in scheduler_output.recomputed_reqs:\n                logger.warning(\"Recompute triggered for request %s.\", req_info.request_id)\n                outputs[req_info.client_index].append(\n                    EngineCoreOutput(\n                        request_id=req_info.request_id,\n                        finish_reason=FinishReason.STOP,\n                        new_token_ids=[],\n                        stop_reason=\"recomputed\",\n                    )\n                )",
+      "elide": ["update_from_output 其余 ~280 行（L795-1085）是 vLLM Scheduler.update_from_output 的逐字复刻 + routed_experts 处理（L843-862,L927-955）；这是『为塞进一段 recomputed_reqs 而不得不整段重抄父方法』的代表"]
+    },
+    {
+      "path": "vllm_ascend/core/recompute_scheduler.py",
+      "lines": "L65-L73",
+      "what": "register_ascend_mla_spec_in_manager：把 AscendMLAAttentionSpec 补登记进 vLLM 的 spec_manager_map，绕过子进程 unpickle 时序导致的 KeyError",
+      "code": "def register_ascend_mla_spec_in_manager():\n    import sys as _sys\n\n    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager\n    from vllm.v1.kv_cache_interface import MLAAttentionSpec as AscendMLAAttentionSpec\n\n    _stm = _sys.modules.get(\"vllm.v1.core.single_type_kv_cache_manager\")\n    if _stm is not None and AscendMLAAttentionSpec not in _stm.spec_manager_map:\n        _stm.spec_manager_map[AscendMLAAttentionSpec] = FullAttentionManager",
+      "elide": ["L52-L64 的长注释解释 import 时序/EngineCoreProc 子进程 unpickle 导致 spec_manager_map KeyError 的根因，writer 摘要即可；RecomputeScheduler.__init__ 与 AsyncRecomputeScheduler.__init__ 都先调它"]
+    },
+    {
+      "path": "vllm_ascend/core/recompute_scheduler.py",
+      "lines": "L1088-L1093",
+      "what": "AsyncRecomputeScheduler 用多继承把 vLLM 的 AsyncScheduler（异步调度的 _update_after_schedule placeholder 逻辑）与 RecomputeScheduler（recompute 调度）组合",
+      "code": "class AsyncRecomputeScheduler(AsyncScheduler, RecomputeScheduler):\n    def __init__(self, *args, **kwargs):\n        register_ascend_mla_spec_in_manager()\n\n        super().__init__(*args, **kwargs)",
+      "elide": ["MRO：AsyncRecomputeScheduler→AsyncScheduler→RecomputeScheduler→Scheduler；schedule() 走 RecomputeScheduler.schedule，_update_after_schedule/_update_request_with_output 走 AsyncScheduler（见基座 async_scheduler.py L18-60）"]
+    },
+    {
+      "path": "vllm_ascend/core/scheduler_profiling_chunk.py",
+      "lines": "L316-L329",
+      "what": "ProfilingChunkScheduler 唯一的实质改动：profiling 就绪后，用二次延迟模型预测的 chunk size 收窄 num_new_tokens（RUNNING 与 WAITING 各一处，逻辑同构）",
+      "code": "            # >>> PROFILING CHUNK: dynamic chunk sizing for RUNNING >>>\n            if (\n                self.profiling_chunk_manager is not None\n                and self.profiling_chunk_manager.is_ready\n                and num_new_tokens > 1\n                and request.num_computed_tokens > 0\n            ):\n                predicted_chunk = self.profiling_chunk_manager.predict_chunk_size(\n                    num_computed_tokens=request.num_computed_tokens,\n                    target_time=time_budget,\n                )\n                if predicted_chunk is not None and predicted_chunk > 0:\n                    num_new_tokens = min(predicted_chunk, num_new_tokens)\n            # <<< PROFILING CHUNK <<<",
+      "elide": ["schedule() 其余 ~480 行逐字复刻 vLLM Scheduler.schedule，仅以 >>> PROFILING CHUNK >>> 注释标出 3 处改动（while 条件加 time_budget>0 L273/L434、time_budget 记账 L386-389/L632-635、time_budget=0.01 硬编码 L252-253 因 FIA 算子问题暂禁用 target_latency）；WAITING 侧 chunk sizing(L523-536) 同构"]
+    },
+    {
+      "path": "vllm_ascend/core/profiling_chunk_predictor.py",
+      "lines": "L222-L258",
+      "what": "ChunkSizePredictor.predict：把『再算 x 个 token 的增量延迟 = 目标延迟』化为二次方程 a·x²+(2aL+b)·x−T=0 求正根，再平滑/对齐到 page",
+      "code": "    def predict(\n        self,\n        num_computed_tokens: int,\n        base_chunk_size: int,\n        page_size: int,\n    ) -> int | None:\n        \"\"\"Predict next chunk size x such that f(L+x) - f(L) = target_latency.\"\"\"\n        if not self.is_ready or self.target_latency is None:\n            return None\n\n        if self.quadratic_coeff_a <= 0:\n            return None\n\n        A = self.quadratic_coeff_a\n        B = 2 * self.quadratic_coeff_a * num_computed_tokens + self.linear_coeff_b\n        C = -self.target_latency\n\n        discriminant = B * B - 4 * A * C\n        if discriminant < 0:\n            return None\n\n        sqrt_disc = math.sqrt(discriminant)\n        x = (-B + sqrt_disc) / (2 * A)\n\n        if x <= 0:\n            return None\n\n        smoothed = base_chunk_size + self.smooth_factor * (x - base_chunk_size)\n        chunk_size = max(int(smoothed), self.min_chunk)\n\n        align = max(page_size, 64)\n        chunk_size = ((chunk_size + align - 1) // align) * align\n        if chunk_size < align:\n            chunk_size = align\n\n        logger.debug(\"[ProfilingChunk] Predicted chunk_size=%d\", chunk_size)\n        return chunk_size if chunk_size >= align else None",
+      "elide": ["延迟模型 f(l)=a·l²+b·l+c 由 fit()(L76-128) 最小二乘拟合 profiling 采样得到；history-aware 变体（fit_chunk/predict_with_history/get_time_with_history/record_batch_execution_time）默认 with_history_ready=False、schedule 路径走不到（见 subtraction_plan）"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "CompressAttentionManager", "file": "vllm_ascend/core/single_type_kv_cache_manager.py", "responsibility": "FullAttentionManager 子类。处理 compress_ratio>1 的 MLA 压缩 KV：分配/缓存/命中前都把 token 数 //= compress_ratio，前缀命中按 logical_block_size(=block_size×compress_ratio) 粒度匹配。是昇腾对 KV 管理唯一的『新增』manager。"},
+    {"name": "get_manager_for_kv_cache_spec (ascend)", "file": "vllm_ascend/core/single_type_kv_cache_manager.py", "responsibility": "重映射工厂。复用 vLLM 的 spec_manager_map 查表，仅对 MLAAttentionSpec+compress_ratio>1 改选 CompressAttentionManager 并对齐 admission 上限；对 SWA/ChunkedLocal 复刻 vLLM PR#40946 的 cap 设置（因覆盖了 vLLM 工厂，原 cap 代码成死代码须在此重设）。"},
+    {"name": "BudgetRefiner", "file": "vllm_ascend/core/scheduler_dynamic_batch.py", "responsibility": "读 profile_table.csv，按 (对齐后的 ctx_len, decode 请求数) 查表给出动态 token 预算；未配 SLO_limits 时 refine_budget 恒等返回（零开销）。"},
+    {"name": "SchedulerDynamicBatch", "file": "vllm_ascend/core/scheduler_dynamic_batch.py", "responsibility": "vLLM Scheduler 子类。仅两处实质改动：(1) refine_budget 动态调 token_budget；(2) decode-first 重排 self.running。其余 schedule() 逐字 inline 复刻父方法。"},
+    {"name": "RecomputeScheduler", "file": "vllm_ascend/core/recompute_scheduler.py", "responsibility": "vLLM Scheduler 子类，PD 分离侧。block 不够时 kv_consumer 不做常规 preempt 而是丢弃请求记入 recomputed_reqs 让 PD proxy 重算；覆写 add_request（streaming/MTP placeholder）、_update_waiting_for_remote_kv（多 KV group block_ids）、update_from_output（回吐 recomputed_reqs）。"},
+    {"name": "RecomputeSchedulerConfig / RecomputeSchedulerOutput / RecomputeReqInfo", "file": "vllm_ascend/core/recompute_scheduler.py", "responsibility": "SchedulerConfig 子类（按 async_scheduling 选具体调度器类）、SchedulerOutput 子类（多带 recomputed_reqs 字段）、被丢弃请求的轻量载体（id/output_token_ids/client_index）。"},
+    {"name": "AsyncRecomputeScheduler", "file": "vllm_ascend/core/recompute_scheduler.py", "responsibility": "多继承 AsyncScheduler+RecomputeScheduler：异步调度 placeholder 逻辑 + recompute 调度。"},
+    {"name": "ProfilingChunkScheduler", "file": "vllm_ascend/core/scheduler_profiling_chunk.py", "responsibility": "vLLM Scheduler 子类。启动期 profiling 多个 chunk size 的 prefill 延迟拟合二次模型；调度时用预测的最优 chunk size 收窄每请求 num_new_tokens。需 pp>1。"},
+    {"name": "ChunkSizePredictor / ProfilingChunkManager", "file": "vllm_ascend/core/profiling_chunk_predictor.py", "responsibility": "二次延迟模型 f(l)=a·l²+b·l+c 的拟合与求解：给定目标延迟解 chunk size；Manager 封装 profiling 状态机与 predict_chunk_size/predict_time 入口。"},
+    {"name": "FullAttentionManager / SingleTypeKVCacheManager / BlockPool", "file": "vllm/v1/core/single_type_kv_cache_manager.py, vllm/v1/core/block_pool.py", "responsibility": "vLLM 原生、昇腾原样复用的基座：per-spec KV manager 基类/全注意力实现、物理 block 分配与前缀缓存池（null_block/touch/get_new_blocks/cache_full_blocks/get_cached_block）。本章用以划『复用 vs 特化』的对照线。"}
+  ],
+
+  "data_flow": [
+    "启动 check_and_update_config：vllm_ascend/platform.py 按 ascend_config 三开关（recompute_scheduler_enable / SLO_limits_for_dynamic_batch / profiling_chunk_config.enabled）把 vllm_config.scheduler_config.scheduler_cls 改成三个昇腾子类之一；都不开 → 沿用 vLLM 原生 Scheduler。",
+    "启动建 KV manager：patch_kv_cache_coordinator 让 KVCacheCoordinator.__init__ 调 vllm_ascend 版 get_manager_for_kv_cache_spec，对每个 kv_cache_group 选 manager。",
+    "get_manager_for_kv_cache_spec：spec_manager_map[type(spec)] 查表 → 若 MLAAttentionSpec 且 compress_ratio>1 改 CompressAttentionManager + 设 max_admission_blocks_per_request；否则原样用 vLLM manager。",
+    "运行时分配（压缩 MLA 组）：allocate_slots → CompressAttentionManager.get_num_blocks_to_allocate / allocate_new_blocks / cache_blocks，各方法先 num_tokens //= compress_ratio 再走 FullAttentionManager 逻辑；前缀命中 find_longest_cache_hit 按 logical_block_size 匹配。",
+    "SchedulerDynamicBatch.schedule：token_budget = refine_budget(running, max_num_scheduled_tokens)（查 profile_table.csv）→ decode-first 重排 running → 进入与 vLLM 同构的 RUNNING/WAITING 双循环 allocate_slots。",
+    "RecomputeScheduler.schedule：RUNNING 循环 allocate_slots 失败 → kv_consumer 侧 pop+free+记 recomputed_reqs（否则常规 preempt）→ 输出 RecomputeSchedulerOutput.recomputed_reqs。",
+    "RecomputeScheduler.update_from_output：把 recomputed_reqs 以 stop_reason='recomputed' 的 EngineCoreOutput 回吐 → PD proxy 改投他节点重算。",
+    "ProfilingChunkScheduler：启动 run_profiling_chunk_init 经 collective_rpc('profile_prefill_latency') 采样→ ChunkSizePredictor.fit 拟合二次模型；schedule 时 predict_chunk_size 解二次方程得 chunk size，min() 收窄 num_new_tokens，并按 predict_time 扣 time_budget。"
+  ],
+
+  "design_decisions": [
+    {"decision": "KV 管理 90% 原样复用，只新增一个 CompressAttentionManager", "why": "FullAttentionManager/BlockPool/SingleTypeKVCacheManager 与硬件无关（纯 block 计数/前缀哈希），昇腾无需改；唯压缩 MLA 的 KV 物理长度被 compress_ratio 压缩，分配/命中粒度需相应缩放，故仅此一处开子类。体现『该复用就复用』。", "evidence": "vllm_ascend/core/single_type_kv_cache_manager.py:L28-L31,L259-L261"},
+    {"decision": "CompressAttentionManager 的覆写一律是『//= compress_ratio 后调 super()』", "why": "压缩只改变 token→block 的换算比例，不改变 block 管理算法本身，故最小侵入：复用父类全部控制流，只在入口缩放 token 数。", "evidence": "vllm_ascend/core/single_type_kv_cache_manager.py:L47-L57,L142-L144,L173"},
+    {"decision": "前缀命中按 logical_block_size = block_size × compress_ratio 匹配", "why": "压缩 KV 的一个物理 block 对应 compress_ratio 倍的逻辑 token；命中必须以逻辑块为单位对齐，否则缓存复用边界错位。", "evidence": "vllm_ascend/core/single_type_kv_cache_manager.py:L210-L212"},
+    {"decision": "get_manager_for_kv_cache_spec 覆盖 vLLM 工厂后，要在自己里重设 SWA/ChunkedLocal 的 admission cap", "why": "覆盖父工厂使 vLLM 原本设 cap 的代码成死代码（永不到达）；不重设则 SWA/ChunkedLocal 组按 full_sequence_must_fit 预留整个 max_model_len 的 block，cc>=2 时耗尽池（vLLM issue #40863）。压缩 MLA 同理需 cap=ceil(max_model_len/compress/block)+1 对齐启动池大小。", "evidence": "vllm_ascend/core/single_type_kv_cache_manager.py:L262-L280"},
+    {"decision": "三个调度器都整段重写 schedule() 而非热补内部循环", "why": "vLLM Scheduler.schedule 是单个长方法，改动点（动态预算/decode-first 重排/recompute 分叉/chunk sizing）都在循环体内部，Python 无法热补方法内片段，只能子类整段 override；这正是『改动小但文件体量大』的根因——绝大多数行是逐字复刻。writer 须讲清『为何重抄』，不逐行讲复刻部分。", "evidence": "vllm_ascend/core/scheduler_dynamic_batch.py:L151-L162; vllm_ascend/core/scheduler_profiling_chunk.py:L232-L236"},
+    {"decision": "RecomputeScheduler 在 kv_consumer 侧把『抢占』改成『丢弃重算』", "why": "PD 分离下 decode 节点的 KV 来自 prefill 节点；本地抢占重算无意义，丢回 PD proxy 由其改投他节点重算更合理。recomputed_reqs 经 RecomputeSchedulerOutput 透传、update_from_output 回吐。", "evidence": "vllm_ascend/core/recompute_scheduler.py:L336-L348,L831-L841"},
+    {"decision": "register_ascend_mla_spec_in_manager 修补 spec_manager_map 的 import 时序坑", "why": "EngineCoreProc 子进程 unpickle AscendMLAAttentionSpec 时，spec_manager_map 可能只含原 MLAAttentionSpec 键，type(实例) 查表 KeyError；故每次 patch 应用都把该 spec 补登记。", "evidence": "vllm_ascend/core/recompute_scheduler.py:L52-L73"},
+    {"decision": "ProfilingChunkScheduler 用二次模型在线选 chunk size，但 time_budget 暂硬编码 0.01、history 模型默认禁用", "why": "FIA 算子在多请求组 batch 下性能异常，target_latency 路径暂禁用（time_budget=0.01 仅作非零守卫）；history-aware 拟合需运行期 record_batch_execution_time 喂数据，调度路径默认走基础二次模型。属未完全启用的实验特性。", "evidence": "vllm_ascend/core/scheduler_profiling_chunk.py:L246-L254; vllm_ascend/core/profiling_chunk_predictor.py:L339-L349"}
+  ],
+
+  "theory": [
+    {"topic": "压缩 KV 的 block 换算", "content": "压缩 MLA 把每 compress_ratio 个逻辑 token 压成 1 个物理 KV slot。所需物理 block 数 = ceil((num_tokens // compress_ratio) / block_size)；逻辑块大小 logical_block_size = block_size × compress_ratio。CompressAttentionManager 的全部覆写都是把基类公式里的 num_tokens 替换为 num_tokens // compress_ratio。"},
+    {"topic": "压缩 MLA admission cap", "content": "每请求压缩 KV 峰值（块）= ceil(max_model_len // compress_ratio / block_size)+1。它不像 SWA 那样随窗口回收收缩，但也永不超过此界；以此为 admission 上限即与启动期池大小一致，避免 allocate_slots 在 full_sequence_must_fit 分支静默返回 None 让长输入请求卡在 waiting。"},
+    {"topic": "profiling chunk 的二次延迟模型", "content": "prefill 单步延迟随序列长 l 近似 f(l)=a·l²+b·l+c（a≥0,b≥0，由最小二乘拟合 profiling 采样）。给定目标延迟 T 与已算长度 L，求增量 chunk x 使 f(L+x)−f(L)=T，展开为 a·x²+(2aL+b)·x−T=0，取正根 x=(−B+√(B²−4AC))/(2A)（A=a,B=2aL+b,C=−T），再按 smooth_factor 平滑、对齐到 max(page_size,64)。"}
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "三个 schedule() 方法中与 vLLM Scheduler.schedule 逐字相同的 RUNNING/WAITING 双循环主体（encoder/lora/connector/spec-decode/SchedulerOutput 组装等未改部分）", "why_safe": "这些是 vLLM 原生逻辑的逐字复刻，非昇腾特化；精简版保留改动点（refine_budget+decode-first / recompute 分叉 / chunk sizing）与循环骨架即可，用 # SUBTRACTED 标注大段复刻并指明『同 vllm Scheduler.schedule』。须保留 schedule 方法签名与改动点上下文使控制流可读。"},
+      {"what": "RecomputeScheduler.update_from_output 中与 vLLM Scheduler.update_from_output 逐字相同的部分（spec-decode 统计、routed_experts 处理 L843-862/927-955、logprobs/structured-output/finished 收尾）", "why_safe": "纯复刻父方法；昇腾唯一新增是 L831-841 的 recomputed_reqs 回吐，保留该段 + 方法签名即可，其余 # SUBTRACTED 注明『同 vllm Scheduler.update_from_output』。"},
+      {"what": "ProfilingChunkScheduler.run_profiling_chunk_init 的 collective_rpc 采样循环细节（L122-198）、_build_rpc_kwargs/_extract_latency 辅助", "why_safe": "启动期一次性 profiling 采样，与调度控制流解耦；保留方法签名与『采样→predictor.fit→set_target_latency→is_ready』骨架，循环内 PP rank/日志/异常细节可删，不影响读者理解 chunk sizing 主线。"},
+      {"what": "profiling_chunk_predictor 的 history-aware 分支：fit_chunk / predict_with_history / get_time_with_history / record_batch_execution_time，及 ProfilingChunkManager.history_ready 相关", "why_safe": "默认 with_history_ready=False，schedule 路径只走基础 predict/get_time（见 predict_chunk_size L346-349）；history 模型需运行期喂数据才启用，属实验旁路。保留 ChunkSizePredictor.fit/predict/get_time + ProfilingChunkManager.predict_chunk_size/predict_time/is_ready 即可。"},
+      {"what": "BudgetRefiner._read_lookup_table 的 pandas 分组/CSV 解析细节（L54-81）", "why_safe": "只是把 profile_table.csv 读成 lookup dict 的 IO 细节；保留 __init__ 中 enabled/default_budget 设定与 refine_budget/_get_max_budget/_align_key 查表逻辑即可。须保留 lookup/context_keys/dnum_keys 字段语义。"},
+      {"what": "KV offload 双实现（cpu_offload/cpu_kv_cache_manager.py 等）仅点名为『取舍代表』，不纳入精简版", "why_safe": "本章立意是 KV 管理/调度的复用 vs 特化边界，KV offload 是另一条重度减法支线；正文点到其复用 get_manager_for_kv_cache_spec 即可，不逐行（见 chapter 任务说明的取舍点名）。"}
+    ],
+    "must_keep": [
+      {"symbol": "CompressAttentionManager", "why": "昇腾对 KV 管理唯一新增 manager，全章核心。"},
+      {"symbol": "FullAttentionManager", "why": "CompressAttentionManager 的父类，划『原样复用基类』的对照线。"},
+      {"symbol": "BlockPool", "why": "原样复用的物理 block 池，复用哲学的代表。"},
+      {"symbol": "spec_manager_map", "why": "vLLM 原生 spec→manager 表，重映射工厂的复用起点。"},
+      {"symbol": "get_manager_for_kv_cache_spec", "why": "manager 重映射工厂，特化注入点。"},
+      {"symbol": "compress_ratio", "why": "压缩缩放的关键量，所有覆写围绕它。"},
+      {"symbol": "get_num_blocks_to_allocate", "why": "压缩缩放在分配侧的代表覆写。"},
+      {"symbol": "find_longest_cache_hit", "why": "logical_block_size 前缀命中，压缩 KV 命中边界。"},
+      {"symbol": "max_admission_blocks_per_request", "why": "admission cap 对齐启动池，避免长输入卡死。"},
+      {"symbol": "BudgetRefiner", "why": "动态批的预算细化器，dynamic-batch 核心。"},
+      {"symbol": "refine_budget", "why": "动态调 token 预算的入口方法。"},
+      {"symbol": "_get_max_budget", "why": "查表得预算的核心逻辑。"},
+      {"symbol": "SchedulerDynamicBatch", "why": "三调度器子类之一。"},
+      {"symbol": "RecomputeScheduler", "why": "三调度器子类之一，PD recompute。"},
+      {"symbol": "RecomputeSchedulerConfig", "why": "按 async_scheduling 选调度器类。"},
+      {"symbol": "RecomputeSchedulerOutput", "why": "携带 recomputed_reqs 的输出子类。"},
+      {"symbol": "RecomputeReqInfo", "why": "被丢弃请求的载体。"},
+      {"symbol": "recomputed_reqs", "why": "recompute 调度的核心数据流字段。"},
+      {"symbol": "AsyncRecomputeScheduler", "why": "多继承组合异步+recompute。"},
+      {"symbol": "register_ascend_mla_spec_in_manager", "why": "spec_manager_map import 时序补丁，避免 KeyError。"},
+      {"symbol": "ProfilingChunkScheduler", "why": "三调度器子类之一，profiling 分块。"},
+      {"symbol": "ProfilingChunkManager", "why": "profiling 状态机 + predict 入口。"},
+      {"symbol": "ChunkSizePredictor", "why": "二次延迟模型拟合/求解。"},
+      {"symbol": "predict_chunk_size", "why": "调度时收窄 num_new_tokens 的入口。"},
+      {"symbol": "predict_time", "why": "time_budget 记账。"},
+      {"symbol": "predict", "why": "解二次方程求 chunk size 的核心。"},
+      {"symbol": "time_budget", "why": "profiling chunk 调度的预算变量（含 FIA 暂禁用语境）。"}
+    ]
+  },
+
+  "diagram_plan": [
+    {"name": "reuse-vs-specialize-map", "type": "对照分区图", "spec": "左列『原样复用(vLLM)』：BlockPool / SingleTypeKVCacheManager / FullAttentionManager / Scheduler.schedule 骨架 / update_from_output 骨架；右列『昇腾特化』：CompressAttentionManager(新增) / get_manager 重映射 / SchedulerDynamicBatch / RecomputeScheduler(+Config/Output) / ProfilingChunkScheduler；中间用箭头标『继承/override』。点睛 90% 复用 vs 10% 特化。", "roadmap_highlight": "Part V 收官节点 ch22（KV 管理与调度的 NPU 特化），与 ch20/21 重度特化对照"},
+    {"name": "compress-block-scaling", "type": "数据换算示意", "spec": "上：逻辑 token 序列（compress_ratio 个一组）→ 下：物理 KV block；标注 logical_block_size = block_size × compress_ratio、所需块 = ceil((num_tokens//compress_ratio)/block_size)；右侧并排 FullAttentionManager（不缩放）vs CompressAttentionManager（//compress_ratio）。", "roadmap_highlight": "回指 ch04 AscendMLAAttentionSpec / ch20 MLA"},
+    {"name": "recompute-decision-flow", "type": "调度分叉流程图", "spec": "schedule RUNNING 循环 → allocate_slots → None? → 判 kv_producer：是→常规 preempt(prepend waiting)；否(consumer)→ pop+free+append recomputed_reqs → update_from_output 以 stop_reason='recomputed' 回吐 PD proxy。", "roadmap_highlight": "回指 ch10/ch11 PD 分离与 remote KV"},
+    {"name": "profiling-chunk-quadratic", "type": "二次模型求解示意", "spec": "曲线 f(l)=a·l²+b·l+c；标 L(已算)、L+x、阴影面积=增量延迟=target_latency；旁注二次方程 a·x²+(2aL+b)·x−T=0 取正根 → smooth → 对齐 page。", "roadmap_highlight": "回指 ch15 单步前向的 padding/调度节拍"}
+  ],
+
+  "foreshadow_due": {"埋": [], "回收": [], "note": "scripts/bible.py due ch22 输出『== ch22 应埋伏笔 ==』『== ch22 应回收 ==』两节均空。"}
+}

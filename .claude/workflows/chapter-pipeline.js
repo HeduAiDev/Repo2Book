@@ -14,16 +14,16 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch21',
-  slug: 'ch21-sparse-attention-sfa-dsa',
+  chapter_id: 'ch22',
+  slug: 'ch22-kv-manager-and-schedulers',
   instance: 'vllm-ascend',
-  focus: '稀疏注意力：SFA 与 DSA（Lightning Indexer）——展示 OOT 插件不止「顶替内核」还能「**增量扩展**」：vLLM 主干**无对位**（pairs vllm_paths 为空），这是昇腾在 MLA 基础上**叠加**的稀疏注意力后端。体量极大（sfa_v1.py ~1376 行 + dsa_v1.py ~2897 行，算子私有），**聚焦机制、不逐行——重度减法**。**(1) 两者都建在 MLA 之上**——AscendSFAImpl / AscendDSAImpl 复用 MLA 的低秩 KV 压缩与 prefill/decode 拆分（回指 ch20），再叠一层「只对 top-k 个 KV 位置算注意力」的稀疏选择；SFA 的 MetadataBuilder 继承 ch20 的 MLACommonMetadataBuilder、DSA 自带 AttentionMetadataBuilder。**(2) SFA（AscendSFAImpl）**——基于 MLA + use_sparse_c8_indexer（INT8 量化索引）、q_hadamard 哈达玛变换预处理、execute_sparse_flash_attention_process 走稀疏 flash；A5 代际另有分叉（选讲）。**(3) DSA（AscendDSAImpl，DeepSeek Sparse Attention）**——核心是 Lightning Indexer：build_prefill_metadata / build_decode_metadata 各自调 npu_quant_lightning_indexer_metadata 建索引元数据（sparse_count=index_topk=512、sparse_mode=3），先用轻量 indexer 选出每个 query 最相关的 512 个 KV 位置，再只对这 512 个算注意力——把全长注意力降成 top-512 稀疏。**(4) DeviceOperator 抽象**——device/device_op.py 的 DeviceOperator（reshape_and_cache / kv_cache_load / mla_preprocess_only_decode 等）是注意力各章共用的设备算子门面（回指 ch19/ch20 已露脸）。**核心立意**：稀疏注意力 = 用一个轻量索引器先挑出少数最相关的 KV、只算这部分，把长上下文的注意力开销从 O(L) 降到 O(top-k)；它是插件在 vLLM 之外**新增**的能力（基座没有），印证插件不止替换、还能扩展。承接 ch18 路由里 use_sparse / use_compress 选到的 AscendSFABackend / AscendDSABackend → 本章是它们的 impl。【姊妹篇：本章是**增量扩展**，vLLM 主干无对位后端（不做基座算子级对照）；仅复用部分回指 ch20 的 MLA 基类 vllm/model_executor/layers/attention/mla_attention.py；正文写规范 vllm_ascend/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN（npu_quant_lightning_indexer_metadata/execute_sparse_flash_attention_process 等私有算子不真跑）：精简版只验可读控制流（SFA/DSA 如何复用 MLA 再叠稀疏选择 / Lightning Indexer 选 top-512 的元数据装配 / prefill·decode 各自 indexer 构建 / DeviceOperator 门面派发是纯 Python·形状级，可跑；真实稀疏算子不真跑）】',
-  highlight: 'ch21',
+  focus: 'KV cache 管理与调度器的 NPU 特化——Part V 收官。昇腾对 KV 管理/调度**改动小**，正好讲清「**哪些原样复用、哪些必须特化**」（与 ch20/21 的重度特化形成对照，呼应只做减法的复用哲学）。**(1) KV manager 复用 + 一处新增**——single_type_kv_cache_manager.py：FullAttentionManager / BlockPool 原样复用 vLLM；新增 CompressAttentionManager(FullAttentionManager) 处理 MLAAttentionSpec / 压缩 spec 的 block 分配与前缀命中（回指 ch04 的 AscendMLAAttentionSpec、ch20 的 MLA）；get_manager_for_kv_cache_spec 重映射——按 spec 类型把 manager_class 选成 CompressAttentionManager。**(2) 三个 Scheduler 子类**（都继承 vLLM Scheduler）——SchedulerDynamicBatch：BudgetRefiner 按当前 decode token 数查表动态调 token 预算（回指 ch15 单步前向的 padding/调度节拍）；RecomputeScheduler（+ RecomputeSchedulerConfig/Output 子类）：重算 / 异步调度 + remote KV（PD 分离侧，回指 ch10/ch11）；ProfilingChunkScheduler：profiling 期分块调度。**(3) 取舍点名**——KV offload 双实现等只点代表、不逐行（重度减法，体量集中在 recompute_scheduler.py ~1092 行）。**核心立意**：一个成熟插件对宿主的「核心循环」（KV 分配 + 请求调度）应当**尽量少碰**——昇腾这里 90% 原样继承、只在 (a) 压缩 KV spec 的 block 管理、(b) 三种特殊调度策略上开子类；正好收束 Part V「注意力子系统」、也示范「该复用就复用、别为改而改」。承接 ch13/14/15 的 worker/runner/单步前向 → 本章是它们上游的调度与 KV 分配层。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/v1/core/single_type_kv_cache_manager.py（FullAttentionManager 基类）+ block_pool.py（BlockPool 原样复用）+ sched/scheduler.py（Scheduler 基类，三子类的父）+ sched/async_scheduler.py（异步调度对照 RecomputeScheduler）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；这些是纯 Python 控制流（manager 重映射 / BudgetRefiner 查表 / scheduler 子类覆写点），host 基本可跑读：精简版验「复用 vs 特化」的边界（哪些方法原样继承、哪些 override）；真实 NPU 侧只在 KV 物理分配时才需硬件，控制流可读】',
+  highlight: 'ch22',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm-ascend/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
   skip_impl: false,
-  paths: ['vllm_ascend/attention/sfa_v1.py', 'vllm_ascend/attention/dsa_v1.py', 'vllm_ascend/device/device_op.py'],
+  paths: ['vllm_ascend/core/single_type_kv_cache_manager.py', 'vllm_ascend/core/scheduler_dynamic_batch.py', 'vllm_ascend/core/recompute_scheduler.py', 'vllm_ascend/core/scheduler_profiling_chunk.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
