@@ -14,16 +14,16 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch23',
-  slug: 'ch23-customop-oot-replacement',
+  chapter_id: 'ch24',
+  slug: 'ch24-torch-library-and-meta',
   instance: 'vllm-ascend',
-  focus: 'CustomOp 的 OOT 顶替：昇腾算子如何替换 vLLM 算子——Part VI（算子与编译层）开篇、整个插件「换头不换身」的总开关。**(1) 注册表总开关**——utils.py 的 register_ascend_customop：构造 REGISTERED_ASCEND_OPS 映射表（~30 项：RMSNorm→AscendRMSNorm、SiluAndMul→AscendSiluAndMul、QuickGELU→AscendQuickGELU、FusedMoE→AscendFusedMoE… 310P 另覆盖一批 *310），再遍历把 vLLM CustomOp 子类的注册表项逐个换成昇腾子类——一处调用，全模型的算子实现被批量顶替。**(2) 分发链**——基座 CustomOp.dispatch_forward（custom_op.py）按 enabled/compile 选 forward_oot vs forward_native；昇腾子类只覆写 forward_oot——「换头（forward 实现）不换身（CustomOp 的接口/注册位置）」。**(3) 标本两则**——AscendSiluAndMul（ops/activation.py，继承 vLLM SiluAndMul、只覆写 forward_oot）、AscendRMSNorm（ops/layernorm.py，继承 RMSNorm、forward_oot 里 **enable_custom_op() 真二分**：真→torch.ops._C_ascend.npu_add_rms_norm_bias 走 AscendC 融合算子；否→回退 torch_npu.npu_add_rms_norm / npu_rms_norm 原子算子）——讲清「融合算子 vs 原子算子回退」这条二分。**核心立意**：OOT 插件不改 vLLM 模型定义一行，靠一张注册表 + forward_oot 覆写，把每个算子的「身体」从 CUDA 实现换成昇腾实现；enable_custom_op() 决定走不走编译出来的 AscendC 融合 kernel。本章是 Part VI（算子注册 ch24 / 编译 ACLGraph ch25 / FusedMoE ch26）的总入口。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/model_executor/custom_op.py（CustomOp 基类、dispatch_forward/forward_oot/forward_native）+ layers/activation.py（SiluAndMul/QuickGELU 基类）+ layers/layernorm.py（RMSNorm 基类）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN（_C_ascend.*/torch_npu.* 算子不真跑）：精简版只验可读控制流（register_ascend_customop 建表+替换循环 / dispatch_forward 选 oot vs native / forward_oot 里 enable_custom_op() 的融合 vs 回退二分是纯 Python，可跑；真实 AscendC 融合算子不真跑）】',
-  highlight: 'ch23',
+  focus: 'torch.library 算子注册与 meta 实现：AscendC kernel 怎么进图——把「C++ kernel ↔ Python torch.ops ↔ 图捕获」打通的地基（承接 ch23：ch23 讲算子被谁顶替，本章讲被顶替的真实 AscendC kernel 怎么注册成 torch.ops 并能被 torch.compile/ACLGraph 捕获）。**(1) C++ 侧真算子注册**——csrc/torch_binding.cpp 的 TORCH_LIBRARY_EXPAND(_C_ascend, ops)（主块 63 个 ops.def 声明 schema + ops.impl 绑实现，另 310P #ifdef 分支 2 个；全 **torch::kPrivateUse1** 派发键——昇腾 NPU 在 torch 里注册为 PrivateUse1 设备），把真实 AscendC kernel 暴露成 torch.ops._C_ascend.*。**(2) meta/fake 实现——为何缺它不能进图**——csrc/torch_binding_meta.cpp 的 TORCH_LIBRARY_IMPL_EXPAND(_C_ascend, Meta, ops) 用 at::kMeta 张量（只有 shape/dtype、无真实数据）给每个算子一个「只推形状不真算」的 meta 实现；Python 侧 meta_registration.py 的 Library("_C_ascend","IMPL") + register_meta_if_necessary 补注一批 meta 函数。**核心机制：torch.compile / ACLGraph 图捕获是「假跑一遍只追踪算子与形状、不真算」——若某算子没有 meta 实现，trace 到它时无法推断输出 shape/dtype，整张图捕获就断**。**(3) 纯 Python 侧 op 包装**——ops/register_custom_ops.py 用 vLLM 的 direct_register_custom_op 把 11 个 torch.ops.vllm.*（_maybe_chunk_residual / _maybe_all_gather_and_maybe_unpad / _maybe_pad_and_reduce / _prefetch_* 等通信/预取胶水）+ triton kernel 包成可被图捕获的自定义 op，每个都配一个 `_xxx_fake`（即 Python 版 meta：给 torch.compile 推形状）。**核心立意**：一个真实 NPU kernel 要能进 torch.compile/ACLGraph 的图，必须在 torch 的算子注册系统里登记两份——真实实现（kPrivateUse1，真跑算）+ meta/fake 实现（kMeta，只推形状）；本章是 ch25 编译/ACLGraph 能成立的地基。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/_custom_ops.py（vLLM 自己用 torch.library/direct_register_custom_op 注册 CUDA 自定义算子 + fake 的同构范式——昇腾照此范式换 PrivateUse1 + AscendC）；正文写规范 vllm_ascend/…（含 csrc/…）与 vllm/… 路径，绝不带 instances/.../source/ 前缀；**C++（csrc/*.cpp）host 不可编译运行，作只读真源码片段解读**；Python 侧（meta_registration.py / register_custom_ops.py 的 direct_register_custom_op + _fake 注册）是纯 Python，精简版可在 host 跑通（注册成功、fake 能推形状），真实 AscendC kernel 不真跑】',
+  highlight: 'ch24',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm-ascend/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
-  skip_dossier: false,
+  skip_dossier: true,
   skip_impl: false,
-  paths: ['vllm_ascend/utils.py', 'vllm_ascend/ops/activation.py', 'vllm_ascend/ops/layernorm.py', 'vllm_ascend/ops/__init__.py'],
+  paths: ['csrc/torch_binding.cpp', 'csrc/torch_binding_meta.cpp', 'vllm_ascend/meta_registration.py', 'vllm_ascend/ops/register_custom_ops.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
