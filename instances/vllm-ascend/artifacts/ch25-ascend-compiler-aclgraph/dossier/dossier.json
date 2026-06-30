@@ -1,0 +1,249 @@
+{
+  "chapter_id": "ch25",
+  "title": "AscendCompiler 与 ACLGraph：torch.compile + cudagraph 栈的整体顶替",
+  "thesis": "torch.compile 与 cudagraph 是 vLLM 性能的两大支柱。昇腾不改 vLLM 编译框架一行，只靠 platform.py 上两个返回字符串的钩子，把 vLLM 的「编译后端」和「图捕获包装器」整体换成 NPU 版：编译后端 AscendCompiler.compile() 在 npugraph_ex/torchair（aclgraph 模式）与自家 GraphFusionPassManager 融合 pass 之间二选一；图捕获包装器 ACLGraphWrapper 用 torch.npu.NPUGraph 做 capture/replay、按 BatchDescriptor 分桶、并对 stream-resource 耗尽错误码 207008 兜底。",
+
+  "code_spine": [
+    "vllm_ascend/platform.py:L173-L179  get_compile_backend() → 'vllm_ascend.compilation.compiler_interface.AscendCompiler'（替换 vLLM InductorAdaptor）",
+    "vllm_ascend/platform.py:L815-L820  get_static_graph_wrapper_cls() → 'vllm_ascend.compilation.acl_graph.ACLGraphWrapper'（替换 vLLM CUDAGraphWrapper）",
+    "vllm_ascend/platform.py:L156-L171  pass_key→COMPILATION_PASS_KEY / get_pass_manager_cls()→'...GraphFusionPassManager'（替换 vLLM PostGradPassManager）",
+    "vllm_ascend/compilation/compiler_interface.py:L231-L277  AscendCompiler.compile()：deepcopy 图 + fake_mode 重绑 example_inputs → enable_npugraph_ex 二分",
+    "vllm_ascend/compilation/compiler_interface.py:L125-L199  npugraph_ex_compile()：try npugraph_ex → except ImportError 回退 torchair.get_npu_backend",
+    "vllm_ascend/compilation/compiler_interface.py:L82-L123  _configure_backend()：npugraph_ex 走 options 字典；torchair 走 config.mode='reduce-overhead'（aclgraph 模式）",
+    "vllm_ascend/compilation/compiler_interface.py:L47-L68  fusion_pass_compile()：compile_fx + aot_autograd，inner_compile 里跑 compiler_config[COMPILATION_PASS_KEY]（=GraphFusionPassManager）",
+    "vllm_ascend/compilation/graph_fusion_pass_manager.py:L36-L43  GraphFusionPassManager.__call__：按 compile_range 串跑 self.passes + graph.recompile()",
+    "vllm_ascend/compilation/graph_fusion_pass_manager.py:L49-L79  configure()：按开关把 9 个融合 pass 注册进 self.passes",
+    "vllm_ascend/ops/__init__.py:L43-L51  register_dummy_fusion_op()：给 torch.ops._C_ascend 挂占位算子，让 pattern 匹配有锚点",
+    "vllm_ascend/compilation/passes/base_pattern.py:L41-L63  BasePattern.register()：pm.register_replacement + nge.register_replacement 双注册",
+    "vllm_ascend/compilation/passes/norm_quant_fusion_pass.py:L29-L86  AddRMSNormQuantPattern：pattern(add_rms_norm_bias→quantize) → replacement(npu_add_rms_norm_quant 单算子)",
+    "vllm_ascend/compilation/passes/norm_quant_fusion_pass.py:L477-L513  AddRMSNormQuantFusionPass：循环 eps 注册多个 Pattern，__call__ 里 PatternMatcherPass.apply(graph)",
+    "vllm_ascend/compilation/acl_graph.py:L152-L246  ACLGraphWrapper.__call__ 捕获分支：mode 不匹配直跑 → 新 BatchDescriptor 建 entry → torch.npu.graph 捕获 + 207008 兜底",
+    "vllm_ascend/compilation/acl_graph.py:L248-L272  ACLGraphWrapper.__call__ 重放分支：DEBUG 校验输入地址一致 → 必要时 synchronize → entry.aclgraph.replay()"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm_ascend/platform.py",
+      "lines": "L173-L179",
+      "code": "    @classmethod\n    def get_compile_backend(self) -> str:\n        \"\"\"\n        Get the custom compile backend. Previously, we used EagerAdaptor by default.\n        To use graph fusion operations, we defined our own backend compiler.\n        \"\"\"\n        return \"vllm_ascend.compilation.compiler_interface.AscendCompiler\"",
+      "elide": []
+    },
+    {
+      "path": "vllm_ascend/platform.py",
+      "lines": "L815-L820",
+      "code": "    @classmethod\n    def get_static_graph_wrapper_cls(cls) -> str:\n        \"\"\"\n        Get piecewise backend class for piecewise graph.\n        \"\"\"\n        return \"vllm_ascend.compilation.acl_graph.ACLGraphWrapper\"  # noqa",
+      "elide": ["注意：真实方法名是 get_compile_backend 与 get_static_graph_wrapper_cls。章节焦点里把前者简写成『get_compiler_cls』，正文须以源码真名 get_compile_backend 为准。"]
+    },
+    {
+      "path": "vllm_ascend/compilation/compiler_interface.py",
+      "lines": "L231-L277",
+      "code": "    def compile(\n        self,\n        graph: fx.GraphModule,\n        example_inputs: list[Any],\n        compiler_config: dict[str, Any],\n        compile_range: Range,\n        key: str | None = None,\n    ) -> tuple[Callable | None, Any | None]:\n        # inductor can inplace modify the graph, so we need to copy it\n        # see https://github.com/pytorch/pytorch/issues/138980\n        graph = copy.deepcopy(graph)\n\n        from torch._guards import detect_fake_mode\n\n        current_fake_mode = detect_fake_mode()\n        if current_fake_mode is not None:\n            example_inputs = [\n                current_fake_mode.from_tensor(inp)\n                if (\n                    isinstance(inp, torch.Tensor)\n                    and hasattr(inp, \"fake_mode\")\n                    and inp.fake_mode is not current_fake_mode\n                )\n                else inp\n                for inp in example_inputs\n            ]\n\n        ascend_compilation_config = get_ascend_config().ascend_compilation_config\n        if ascend_compilation_config.enable_npugraph_ex:\n            cache_dir = None if getattr(self, \"disable_cache\", False) else getattr(self, \"cache_dir\", None)\n            logger.info_once(\n                \"enable_npugraph_ex is enabled, which will bring graph compilation optimization.\",\n                scope=\"global\",\n            )\n            assert hasattr(self, \"vllm_config\")\n            return npugraph_ex_compile(\n                graph,\n                example_inputs,\n                compiler_config,\n                self.vllm_config,\n                ascend_compilation_config,\n                compile_range,\n                key,\n                cache_dir,\n            )\n        else:\n            return fusion_pass_compile(graph, example_inputs, compiler_config, compile_range, key)",
+      "elide": ["deepcopy + fake_mode 重绑这段防御性预处理在 load() 的 cache-miss 重编译分支里逐字复刻；正文讲一次即可。"]
+    },
+    {
+      "path": "vllm_ascend/compilation/compiler_interface.py",
+      "lines": "L47-L68",
+      "code": "def fusion_pass_compile(\n    graph: fx.GraphModule,\n    example_inputs: list[Any],\n    compiler_config: dict[str, Any],\n    compile_range: Range,\n    key: str | None = None,\n) -> tuple[Callable | None, Any | None]:\n    def compile_inner(graph, example_inputs):\n        current_pass_manager = compiler_config[COMPILATION_PASS_KEY]\n        graph = current_pass_manager(graph)\n        return graph\n\n    decompositions = select_decomp_table()\n\n    compiled_fn = compile_fx(\n        graph=graph,\n        example_inputs=example_inputs,\n        inner_compile=compile_inner,\n        decompositions=decompositions,\n    )\n\n    return compiled_fn, None",
+      "elide": ["COMPILATION_PASS_KEY = 'graph_fusion_manager'（vllm_ascend/utils.py:L47）；compiler_config[该 key] 取出的就是已 configure 好的 GraphFusionPassManager 实例——pass manager 是经 inductor 自定义 pass 机制注入的。"]
+    },
+    {
+      "path": "vllm_ascend/compilation/compiler_interface.py",
+      "lines": "L39-L44",
+      "code": "def compile_fx(graph: GraphModule, example_inputs: list, inner_compile: Callable, decompositions: dict) -> Callable:\n    recursive_compile_fx = functools.partial(compile_fx, inner_compile=inner_compile, decompositions=decompositions)\n\n    if not graph_returns_tuple(graph):\n        return make_graph_return_tuple(graph, example_inputs, recursive_compile_fx)\n    return aot_autograd(fw_compiler=inner_compile)(graph, example_inputs)",
+      "elide": ["graph_returns_tuple / make_graph_return_tuple 这套『确保 fx 图输出是 tuple』的处理在 npugraph_ex_compile 里也反复出现——torch.compile 后端协议要求输出 flat tuple。"]
+    },
+    {
+      "path": "vllm_ascend/compilation/compiler_interface.py",
+      "lines": "L125-L199",
+      "code": "def npugraph_ex_compile(\n    graph: fx.GraphModule,\n    example_inputs: list[Any],\n    compiler_config: dict[str, Any],\n    vllm_config: VllmConfig,\n    ascend_compilation_config: AscendCompilationConfig,\n    compile_range: Range,\n    key: str | None = None,\n    cache_dir: str | None = None,\n) -> tuple[Callable | None, Any | None]:\n    # Try npugraph_ex first, fall back to torchair for backward compatibility.\n    try:\n        import npugraph_ex as nge\n        ...\n        config = nge.CompilerConfig()\n        ...\n        _configure_backend(\n            config, ascend_compilation_config, vllm_config, process_kwargs_options=_process_kwargs_options\n        )\n        ...\n        backend = nge.get_npu_backend(compiler_config=config)\n        # torch.compile requires the output of the fx graph to be a tuple\n        if not graph_returns_tuple(graph):\n            compiled_fn = make_graph_return_tuple(graph, example_inputs, backend)\n        else:\n            compiled_fn = backend(graph, example_inputs)\n        ...\n        return compiled_fn, (key, cache_path)\n    except ImportError:\n        import torchair\n\n        torch.npu.set_compile_mode(jit_compile=False)\n        config = torchair.CompilerConfig()\n        _configure_backend(config, ascend_compilation_config, vllm_config)\n        backend = torchair.get_npu_backend(compiler_config=config)\n        # torch.compile requires the output of the fx graph to be a tuple\n        if not graph_returns_tuple(graph):\n            compiled_fn = make_graph_return_tuple(graph, example_inputs, backend)\n        else:\n            compiled_fn = backend(graph, example_inputs)\n        return compiled_fn, None",
+      "elide": ["省略：cache_path 计算、_process_kwargs_options 的新旧 npugraph_ex 模块路径 try/except、以及 patched_get_compiled_gm 缓存巧思（把编译产物 py_code 写盘；含 triton_kernel_wrapper 的图因 kernel_side_table 索引进程内本地、不可跨进程序列化而跳过缓存）。主线是『try npugraph_ex，ImportError 回退 torchair.get_npu_backend』这条二分。"]
+    },
+    {
+      "path": "vllm_ascend/compilation/compiler_interface.py",
+      "lines": "L82-L123",
+      "code": "def _configure_backend(\n    config: Any,\n    ascend_compilation_config: AscendCompilationConfig,\n    vllm_config: VllmConfig,\n    process_kwargs_options: Callable | None = None,\n) -> None:\n    if process_kwargs_options is not None:\n        # npugraph_ex (both old and new): build options dict and use _process_kwargs_options.\n        # force_eager=True: execute FX graph in eager mode before graph capture.\n        # inplace_pass=False: disable reinplace pass to avoid gelu fallback to CPU.\n        options: dict[str, Any] = {\n            \"force_eager\": True,\n            \"inplace_pass\": False,\n        }\n        ...\n        process_kwargs_options(config, {\"options\": options})\n    else:\n        # torchair (reduce-overhead): use nested config structure directly.\n        # mode=\"reduce-overhead\": use aclgraph mode, avoid fx graph to Ascend IR transformation.\n        config.mode = \"reduce-overhead\"\n        config.debug.run_eagerly = True\n        # Disable reinplace pass to avoid gelu fallback to CPU causing host-device copy error.\n        config.debug.aclgraph.disable_reinplace_inplaceable_ops_pass = True\n        ...",
+      "elide": ["省略两个分支里 enable_static_kernel 开关下设置 static_kernel_compile / _aclnn_static_shape_kernel 及 sym_range（用 _compute_decode_cudagraph_batch_sizes 限定静态 kernel 编译的 batch 范围）。核心对比：npugraph_ex 走扁平 options 字典；torchair 走嵌套 config.mode='reduce-overhead'（即 aclgraph 模式，避免 fx→Ascend IR 转换）。"]
+    },
+    {
+      "path": "vllm_ascend/compilation/graph_fusion_pass_manager.py",
+      "lines": "L25-L47",
+      "code": "class GraphFusionPassManager:\n    \"\"\"\n    A pass manager for graph fusion passes.\n    It handles the configuration and execution of passes.\n    The counterpart in vllm is PostGradPassManager. Since torch_npu\n    does not support triton for now, we define our own pass manager.\n    \"\"\"\n\n    def __init__(self):\n        self.passes: list[VllmInductorPass] = []\n\n    def __call__(self, graph: fx.Graph) -> fx.Graph:\n        compile_range = get_pass_context().compile_range\n\n        for pass_ in self.passes:\n            if pass_.is_applicable_for_range(compile_range):\n                pass_(graph)\n        graph.recompile()\n        return graph\n\n    def add(self, pass_: VllmInductorPass):\n        assert isinstance(pass_, VllmInductorPass)\n        self.passes.append(pass_)",
+      "elide": []
+    },
+    {
+      "path": "vllm_ascend/compilation/graph_fusion_pass_manager.py",
+      "lines": "L49-L79",
+      "code": "    def configure(self, config: VllmConfig):\n        from vllm_ascend.utils import is_310p\n\n        # By default, we enable the graph fusion and quantization fusion pass.\n        self.ascend_compilation_config: dict = config.additional_config.get(\"ascend_compilation_config\", {})\n        if self.ascend_compilation_config.get(\"fuse_norm_quant\", True) and not is_310p():\n            from .passes.norm_quant_fusion_pass import AddRMSNormQuantFusionPass\n\n            self.passes.append(AddRMSNormQuantFusionPass(config))\n\n        if self.ascend_compilation_config.get(\"fuse_qknorm_rope\", True):\n            from .passes.qknorm_rope_fusion_pass import QKNormRopeFusionPass\n\n            self.passes.append(QKNormRopeFusionPass(config))\n\n        if self.ascend_compilation_config.get(\"fuse_allreduce_rms\", True):\n            from .passes.allreduce_rmsnorm_fusion_pass import MatmulAllReduceAddRMSNormPass\n\n            self.passes.append(MatmulAllReduceAddRMSNormPass(config))\n\n        if self.ascend_compilation_config.get(\"fuse_muls_add\", True) and not is_310p():\n            from .passes.muls_add_pass import MulsAddFusionPass\n\n            self.passes.append(MulsAddFusionPass(config))\n\n        if config.compilation_config.pass_config.enable_sp:\n            from .passes.sequence_parallelism import SequenceParallelismPass\n            from .passes.sequence_parallelism_moe import SequenceParallelismMoePass\n\n            self.passes.append(SequenceParallelismPass(config))\n            self.passes.append(SequenceParallelismMoePass(config))",
+      "elide": ["每个 pass 由 ascend_compilation_config 里的开关（fuse_norm_quant/fuse_qknorm_rope/fuse_allreduce_rms/fuse_muls_add，默认 True）+ is_310p() 平台门控；SP 两个 pass 由 pass_config.enable_sp 控制。noop_elimination/allgather_chunk_noop 在 SP pass 内部串联，不在此处显式 append。"]
+    },
+    {
+      "path": "vllm_ascend/ops/__init__.py",
+      "lines": "L36-L51",
+      "code": "class dummyFusionOp:\n    default = None\n\n    def __init__(self, name=\"\"):\n        self.name = name\n\n\ndef register_dummy_fusion_op() -> None:\n    torch.ops._C_ascend.rms_norm = dummyFusionOp(name=\"rms_norm\")\n    torch.ops._C_ascend.fused_add_rms_norm = dummyFusionOp(name=\"fused_add_rms_norm\")\n    torch.ops._C_ascend.static_scaled_fp8_quant = dummyFusionOp(name=\"static_scaled_fp8_quant\")\n    torch.ops._C_ascend.dynamic_scaled_fp8_quant = dummyFusionOp(name=\"dynamic_scaled_fp8_quant\")\n    torch.ops._C_ascend.dynamic_per_token_scaled_fp8_quant = dummyFusionOp(name=\"dynamic_per_token_scaled_fp8_quant\")\n    torch.ops._C_ascend.rms_norm_static_fp8_quant = dummyFusionOp(name=\"rms_norm_static_fp8_quant\")\n    torch.ops._C_ascend.fused_add_rms_norm_static_fp8_quant = dummyFusionOp(name=\"fused_add_rms_norm_static_fp8_quant\")\n    torch.ops._C_ascend.rms_norm_dynamic_per_token_quant = dummyFusionOp(name=\"rms_norm_dynamic_per_token_quant\")",
+      "elide": ["register_dummy_fusion_op 在 worker.py:L107 启动期调用。这些占位算子让 pattern matcher 有可匹配的『锚点』——真实算子在别处实现，这里只挂同名属性供图捕获/匹配引用。"]
+    },
+    {
+      "path": "vllm_ascend/compilation/passes/base_pattern.py",
+      "lines": "L41-L63",
+      "code": "    def register(self, pm_pass: PatternMatcherPass) -> None:\n        # Create a unique identifier for this pattern based on class name and eps\n        pattern_id = f\"{self.__class__.__name__}_{self.eps}\"\n\n        # Skip registration if this pattern has already been registered globally\n        if pattern_id in _registered_patterns:\n            return\n\n        pattern_fn = self.get_pattern()\n        replacement_fn = self.get_replacement()\n        example_inputs = self.get_inputs()\n\n        pm.register_replacement(pattern_fn, replacement_fn, example_inputs, pm.fwd_only, pm_pass)\n\n        nge.register_replacement(\n            search_fn=pattern_fn,\n            replace_fn=replacement_fn,\n            example_inputs=example_inputs,\n            extra_check=self.get_extra_stream_scope_check(),\n        )\n\n        # Mark this pattern as registered\n        _registered_patterns.add(pattern_id)",
+      "elide": ["nge = npugraph_ex（ImportError 回退 torchair，见文件头 try/except）。双注册：torch inductor pattern matcher + npugraph_ex/torchair 各注册一份替换规则，extra_check 用 extra_stream_scope_check 拒绝跨 stream 的融合。"]
+    },
+    {
+      "path": "vllm_ascend/compilation/passes/norm_quant_fusion_pass.py",
+      "lines": "L45-L86",
+      "code": "    def get_pattern(self):\n        def pattern(\n            rms_norm_input: torch.Tensor,\n            residual: torch.Tensor,\n            rms_norm_weight: torch.Tensor,\n            scale: torch.Tensor,\n            scale_reciprocal: torch.Tensor,\n            offset: torch.Tensor,\n        ):\n            output = torch.ops._C_ascend.npu_add_rms_norm_bias(\n                rms_norm_input, residual, rms_norm_weight, None, self.eps\n            )\n            out0 = output[0]\n            out1 = output[2]\n            quantized_output = torch.ops.vllm.quantize(out0, scale, scale_reciprocal, offset)\n            return quantized_output, out1\n\n        return pattern\n\n    def get_replacement(self):\n        def replacement(\n            rms_norm_input: torch.Tensor,\n            residual: torch.Tensor,\n            rms_norm_weight: torch.Tensor,\n            scale: torch.Tensor,\n            scale_reciprocal: torch.Tensor,\n            offset: torch.Tensor,\n        ):\n            output = torch.ops.npu.npu_add_rms_norm_quant(\n                rms_norm_input, residual, rms_norm_weight, scale, offset, epsilon=self.eps\n            )\n            quantized_output = output[0]\n            out1 = output[2]\n            return quantized_output, out1\n\n        return replacement",
+      "elide": ["pattern：add_rms_norm_bias 后接独立 quantize 两个算子；replacement：融合成单个 npu_add_rms_norm_quant。文件里还有 7 个变体（WithBias / SP（带 maybe_all_gather_and_maybe_unpad）/ DynamicQuant 及其组合），结构同构，正文取此一例讲透即可。"]
+    },
+    {
+      "path": "vllm_ascend/compilation/passes/norm_quant_fusion_pass.py",
+      "lines": "L477-L513",
+      "code": "class AddRMSNormQuantFusionPass(VllmInductorPass):\n    \"\"\"\n    A pass for fusing AddRMSNorm and W8A8 quantization operations on Ascend.\n    \"\"\"\n\n    def __init__(self, vllm_config: VllmConfig):\n        super().__init__(vllm_config)\n        self.pattern_match_passes: PatternMatcherPass = PatternMatcherPass(pass_name=\"rmsnorm_quant_fusion_pass\")\n\n        dtype = vllm_config.model_config.dtype\n        if dtype not in (torch.bfloat16, torch.float16):\n            logger.debug(\"Quant fusion not enabled: unsupported dtype %s\", dtype)\n            return\n\n        common_epsilons = [1e-5, 1e-6]\n        for eps in common_epsilons:\n            AddRMSNormDynamicQuantPattern(vllm_config, eps=eps).register(self.pattern_match_passes)\n            AddRMSNormDynamicQuantSPPattern(vllm_config, eps=eps).register(self.pattern_match_passes)\n            if enable_custom_op():\n                AddRMSNormQuantPattern(vllm_config, eps=eps).register(self.pattern_match_passes)\n                ...\n\n    def __call__(self, graph: torch.fx.Graph):\n        self.begin()\n        self.matched_count = self.pattern_match_passes.apply(graph)\n        logger.debug(\"Replaced %s patterns\", self.matched_count)\n        self.end_and_log()\n\n    def is_applicable_for_range(self, compile_range: Range) -> bool:\n        return True",
+      "elide": ["省略 if enable_custom_op() 块里其余 6 个 Pattern.register 调用（同构）。要点：按 eps∈{1e-5,1e-6} 与 dtype 门控注册多个 pattern，__call__ 里 PatternMatcherPass.apply(graph) 一次性替换。"]
+    },
+    {
+      "path": "vllm_ascend/compilation/acl_graph.py",
+      "lines": "L27-L51",
+      "code": "_STREAM_RESOURCE_ERROR_CODE = \"207008\"\n_STREAM_RESOURCE_ERROR_MARKERS = (\n    \"insufficient_stream_resources\",\n    \"stream resources are insufficient\",\n)\n_STREAM_RESOURCE_GUIDANCE = (\n    \"ACL graph capture failed with a known stream-resource exhaustion \"\n    \"signature. Consider upgrading to a newer HDK/CANN stack, reducing \"\n    \"cudagraph_capture_sizes, lowering max_cudagraph_capture_size, preferring \"\n    \"FULL or FULL_DECODE_ONLY for mostly uniform decode workloads, or \"\n    \"temporarily disabling graph mode to confirm the failure is capture-related.\"\n)\n\n\ndef _is_stream_resource_capture_error(exc: RuntimeError) -> bool:\n    message = str(exc)\n    lowered_message = message.lower()\n    has_error_code = _STREAM_RESOURCE_ERROR_CODE in message\n    has_stream_resource_marker = any(marker in lowered_message for marker in _STREAM_RESOURCE_ERROR_MARKERS)\n    return has_stream_resource_marker or (has_error_code and \"stream resource\" in lowered_message)\n\n\ndef _raise_stream_resource_capture_error(exc: RuntimeError) -> None:\n    raise RuntimeError(f\"{_STREAM_RESOURCE_GUIDANCE}\\nOriginal error:\\n{exc}\") from exc",
+      "elide": []
+    },
+    {
+      "path": "vllm_ascend/compilation/acl_graph.py",
+      "lines": "L152-L246",
+      "code": "    def __call__(self, *args, **kwargs):\n        forward_context = get_forward_context()\n        batch_descriptor = forward_context.batch_descriptor\n        aclgraph_runtime_mode = forward_context.cudagraph_runtime_mode\n\n        if aclgraph_runtime_mode == CUDAGraphMode.NONE or aclgraph_runtime_mode != self.runtime_mode:\n            # CUDAGraphMode.NONE could mean the profile run, a warmup run, or\n            # running without aclgraphs. ... dispatch to the correct wrapper when nesting.\n            return self.runnable(*args, **kwargs)\n\n        if batch_descriptor not in self.concrete_aclgraph_entries:\n            # create a new entry for this batch descriptor\n            self.concrete_aclgraph_entries[batch_descriptor] = ACLGraphEntry(batch_descriptor=batch_descriptor)\n\n        entry = self.concrete_aclgraph_entries[batch_descriptor]\n\n        if entry.aclgraph is None:\n            ...\n            validate_cudagraph_capturing_enabled()\n\n            input_addresses = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]\n            entry.input_addresses = input_addresses\n            aclgraph = torch.npu.NPUGraph()\n\n            with ExitStack() as stack:\n                if self.aclgraph_options.gc_disable:\n                    stack.enter_context(patch(\"gc.collect\", lambda: None))\n                    stack.enter_context(patch(\"torch.npu.empty_cache\", lambda: None))\n\n                # mind-exploding: carefully manage the reference and memory.\n                from vllm.model_executor.offloader.base import get_offloader\n                get_offloader().sync_prev_onload()\n                forward_context.capturing = True\n                try:\n                    with torch.npu.graph(aclgraph, pool=self.graph_pool):\n                        # `output` is managed by pytorch's aclgraph pool\n                        output = self.runnable(*args, **kwargs)\n                        get_offloader().join_after_forward()\n                        if self.aclgraph_options.weak_ref_output:\n                            output = weak_ref_tensors(output)\n                except RuntimeError as exc:\n                    if _is_stream_resource_capture_error(exc):\n                        _raise_stream_resource_capture_error(exc)\n                    raise\n\n            # here we always use weak ref for the workspaces to save memory\n            global _graph_params\n            global _draft_graph_params\n            global _draft_graph_prefill_params\n            weak_ref_workspaces(_graph_params)\n            weak_ref_workspaces(_draft_graph_params)\n            weak_ref_workspaces(_draft_graph_prefill_params)\n\n            entry.output = weak_ref_tensors(output)\n            entry.aclgraph = aclgraph\n\n            compilation_counter.num_cudagraph_captured += 1\n\n            # important: return real output (not weak ref) so pytorch manages memory during capture\n            return output",
+      "elide": ["weak_ref_workspaces 对三套 GraphParams（主/draft/draft-prefill）的 workspaces 转弱引用以省显存——属图捕获后的内存管理细节，正文点到为止；核心是 torch.npu.NPUGraph() + with torch.npu.graph(...) 捕获 + 207008 兜底。"]
+    },
+    {
+      "path": "vllm_ascend/compilation/acl_graph.py",
+      "lines": "L248-L272",
+      "code": "        if self.is_debugging_mode:\n            # check if the input addresses are the same\n            new_input_addresses = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]\n            assert new_input_addresses == entry.input_addresses, (\n                f\"Input addresses for aclgraphs are different \"\n                f\"during replay. Expected {entry.input_addresses}, \"\n                f\"got {new_input_addresses}\"\n            )\n\n        logger.info_once(\"Replaying aclgraph\")\n        # In async scheduling or multi-threaded (MT) scenarios ... we must call\n        # synchronize here before replaying, so that update_attn_params only\n        # executes after the previous graph replay has fully completed.\n        is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle\n        need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle\n        if not self.enable_enpu and need_sync:\n            torch.npu.current_stream().synchronize()\n        entry.aclgraph.replay()\n        return entry.output",
+      "elide": ["replay 前的 synchronize 仅在 FULL 模式且非 draft-eagle、非 enable_enpu 时触发，用于异步/多线程下保证 update_attn_params 排在上一轮 replay 之后。"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "AscendCompiler", "file": "vllm_ascend/compilation/compiler_interface.py", "responsibility": "继承 vLLM CompilerInterface 的自定义编译后端，整体替换 InductorAdaptor。compile() 按 enable_npugraph_ex 在 npugraph_ex_compile 与 fusion_pass_compile 间二选一；compute_hash/initialize_cache/load 实现编译产物缓存。platform.get_compile_backend() 返回其字符串路径。"},
+    {"name": "npugraph_ex_compile", "file": "vllm_ascend/compilation/compiler_interface.py", "responsibility": "模块级函数。try import npugraph_ex 走 nge.get_npu_backend；ImportError 回退 import torchair + torchair.get_npu_backend。两者都经 _configure_backend 设成 aclgraph 模式。"},
+    {"name": "fusion_pass_compile", "file": "vllm_ascend/compilation/compiler_interface.py", "responsibility": "模块级函数。compile_fx + aot_autograd，inner_compile 里从 compiler_config[COMPILATION_PASS_KEY] 取 GraphFusionPassManager 跑融合 pass。"},
+    {"name": "_configure_backend", "file": "vllm_ascend/compilation/compiler_interface.py", "responsibility": "配置编译后端：npugraph_ex 走扁平 options（force_eager/inplace_pass）；torchair 走 config.mode='reduce-overhead'（aclgraph 模式，避免 fx→Ascend IR 转换）。"},
+    {"name": "GraphFusionPassManager", "file": "vllm_ascend/compilation/graph_fusion_pass_manager.py", "responsibility": "对位 vLLM PostGradPassManager。__call__ 按 compile_range 串跑 self.passes 再 graph.recompile()；configure() 按开关注册 9 个融合 pass。注释自陈：torch_npu 暂不支持 triton 故自定义 pass manager。"},
+    {"name": "AddRMSNormQuantFusionPass", "file": "vllm_ascend/compilation/passes/norm_quant_fusion_pass.py", "responsibility": "VllmInductorPass 子类。按 eps 与 dtype 门控注册多个 AddRMSNorm+W8A8 量化融合 pattern，__call__ 里 PatternMatcherPass.apply(graph)。"},
+    {"name": "BasePattern", "file": "vllm_ascend/compilation/passes/base_pattern.py", "responsibility": "所有融合 pattern 的抽象基类（get_inputs/get_pattern/get_replacement）。register() 同时向 torch inductor pattern matcher 与 npugraph_ex/torchair 双注册替换规则，并用 extra_stream_scope_check 拒绝跨 stream 融合。"},
+    {"name": "register_dummy_fusion_op", "file": "vllm_ascend/ops/__init__.py", "responsibility": "给 torch.ops._C_ascend 挂一组 dummyFusionOp 占位算子（rms_norm/fused_add_rms_norm/各类 fp8_quant 等），让 pattern 匹配有可引用的锚点。worker 启动期调用。"},
+    {"name": "ACLGraphWrapper", "file": "vllm_ascend/compilation/acl_graph.py", "responsibility": "对位 vLLM CUDAGraphWrapper。__call__ 按 forward_context 的 runtime_mode/batch_descriptor 分桶：mode 不匹配直跑；新 descriptor 用 torch.npu.NPUGraph 捕获（含 207008 兜底）；已存在则 replay。__getattr__ 透传 runnable 属性。"},
+    {"name": "ACLGraphEntry", "file": "vllm_ascend/compilation/acl_graph.py", "responsibility": "dataclass，一个 batch_descriptor 对应的捕获条目：aclgraph(NPUGraph)、output、input_addresses（DEBUG 下校验 replay 输入地址一致）。"},
+    {"name": "_is_stream_resource_capture_error / _raise_stream_resource_capture_error", "file": "vllm_ascend/compilation/acl_graph.py", "responsibility": "识别 stream-resource 耗尽错误（错误码 207008 或两个标志串）并改写成带操作指引的 RuntimeError（调小 cudagraph_capture_sizes / 临时关图模式确认等）。"}
+  ],
+
+  "data_flow": [
+    "启动期：vLLM 编译框架经 current_platform.get_compile_backend() / get_static_graph_wrapper_cls() / get_pass_manager_cls() 取字符串，import 出 AscendCompiler / ACLGraphWrapper / GraphFusionPassManager，整体顶替 InductorAdaptor + CUDAGraphWrapper + PostGradPassManager。",
+    "worker.py 启动期调用 ops.register_dummy_fusion_op()，把占位算子挂到 torch.ops._C_ascend，供后续 pattern 匹配作锚点。",
+    "GraphFusionPassManager.configure(config)：按 ascend_compilation_config 开关与 is_310p() 门控，把 AddRMSNormQuantFusionPass / QKNormRopeFusionPass / MatmulAllReduceAddRMSNormPass / MulsAddFusionPass（+ enable_sp 下 SequenceParallelism(_Moe)Pass）append 进 self.passes；该实例经 inductor 自定义 pass 机制注册到 compiler_config['graph_fusion_manager']。",
+    "torch.compile 触发 → AscendCompiler.compile(graph,...)：deepcopy 图、按 fake_mode 重绑 example_inputs，再按 ascend_compilation_config.enable_npugraph_ex 二分。",
+    "分支A enable_npugraph_ex=True → npugraph_ex_compile：try nge.get_npu_backend(_configure_backend 设 aclgraph)→ 编译；ImportError 回退 torchair.get_npu_backend（config.mode='reduce-overhead'）。返回 compiled_fn（+可选 cache handle）。",
+    "分支B enable_npugraph_ex=False → fusion_pass_compile：compile_fx→aot_autograd，inner_compile 取 compiler_config['graph_fusion_manager'](=GraphFusionPassManager) 对图跑融合 pass。",
+    "GraphFusionPassManager.__call__(graph)：遍历 self.passes，is_applicable_for_range(compile_range) 通过的执行 pass_(graph)（PatternMatcherPass.apply 把 pattern 子图替换成融合算子），最后 graph.recompile()。",
+    "运行期前向：ACLGraphWrapper.__call__ 从 get_forward_context() 取 batch_descriptor 与 cudagraph_runtime_mode；mode 为 NONE 或不匹配 → 直接 self.runnable()。",
+    "首见某 batch_descriptor（entry.aclgraph is None）：validate_cudagraph_capturing_enabled() → 记录 input_addresses → aclgraph=torch.npu.NPUGraph() → with torch.npu.graph(aclgraph, pool=graph_pool) 捕获 runnable；捕获中 RuntimeError 经 _is_stream_resource_capture_error 命中 207008 则改写成带指引的报错。捕获完转弱引用存 entry。",
+    "再见同 batch_descriptor：DEBUG 下校验输入地址一致 → 必要时 torch.npu.current_stream().synchronize() → entry.aclgraph.replay() → 返回 entry.output（捕获池中复用的张量）。"
+  ],
+
+  "design_decisions": [
+    {"decision": "两个返回字符串的平台钩子整体顶替 vLLM 编译+图捕获栈，vLLM 编译框架一行不改", "why": "vLLM 把『编译后端』『图捕获包装器』『pass manager』都抽象成 current_platform 钩子返回的类路径字符串；昇腾只需各返回一个 NPU 版字符串即可整体替换 InductorAdaptor/CUDAGraphWrapper/PostGradPassManager，保持与上游框架解耦。", "evidence": "vllm_ascend/platform.py:L173-L179 / L815-L820 / L165-L171"},
+    {"decision": "compile() 按 enable_npugraph_ex 二分：图编译优化 vs 自家融合 pass", "why": "npugraph_ex/torchair 提供成熟的 NPU 图编译（aclgraph 模式，避免 fx→Ascend IR 转换）；关闭时退回 compile_fx+aot_autograd 并跑自家 GraphFusionPassManager 做手写算子融合。两条路对应『有/无 npugraph_ex 栈』。", "evidence": "vllm_ascend/compilation/compiler_interface.py:L258-L277"},
+    {"decision": "npugraph_ex 优先、torchair 作 ImportError 回退", "why": "向后兼容——新栈用 npugraph_ex，旧环境无该包时 except ImportError 落到 torchair.get_npu_backend，两者都经 _configure_backend 设成等价的 aclgraph 模式。", "evidence": "vllm_ascend/compilation/compiler_interface.py:L135-L199"},
+    {"decision": "自定义 GraphFusionPassManager 而非复用 vLLM PostGradPassManager", "why": "torch_npu 暂不支持 triton（vLLM PostGradPassManager 依赖 inductor/triton 路径），故昇腾定义只跑 pattern matcher 的精简 pass manager。", "evidence": "vllm_ascend/compilation/graph_fusion_pass_manager.py:L26-L31"},
+    {"decision": "register_dummy_fusion_op 挂占位算子作匹配锚点", "why": "融合 pattern 的 search_fn 里引用了 torch.ops._C_ascend.* 这些符号；若不存在，pattern 注册/匹配阶段就拿不到可引用的算子对象。挂一组同名 dummyFusionOp 让 pattern 有锚点。", "evidence": "vllm_ascend/ops/__init__.py:L43-L51"},
+    {"decision": "BasePattern.register 向 inductor + npugraph_ex 双注册替换规则", "why": "两条编译路（fusion_pass_compile 经 inductor pattern matcher / npugraph_ex 经 nge.register_replacement）都要识别同一融合 pattern，故同一 pattern/replacement 在两套引擎各注册一份；extra_stream_scope_check 保证跨 stream 时不误融合。", "evidence": "vllm_ascend/compilation/passes/base_pattern.py:L53-L60"},
+    {"decision": "ACLGraphWrapper 按 BatchDescriptor 分桶，每形状各捕一张 NPUGraph", "why": "NPUGraph 捕获的是固定地址/固定形状的执行序列，不能假设动态形状；按 forward_context 的 batch_descriptor 建 concrete_aclgraph_entries 字典，不同 batch 形状各捕各放，wrapper 与编译逻辑保持正交。", "evidence": "vllm_ascend/compilation/acl_graph.py:L166-L170 / L80-L86"},
+    {"decision": "stream-resource 耗尽错误码 207008 专项兜底", "why": "NPUGraph 捕获在 stream 资源不足时报 207008（或两个英文标志串），裸抛对用户不可读；命中后改写成含具体调参指引（调小 cudagraph_capture_sizes / 降 max_cudagraph_capture_size / 改 FULL 模式 / 临时关图确认）的 RuntimeError。", "evidence": "vllm_ascend/compilation/acl_graph.py:L27-L50 / L222-L225"},
+    {"decision": "捕获后对 output/workspaces 转弱引用，但返回真 output", "why": "弱引用让 pytorch 的 aclgraph 内存池能及时回收以省显存；但捕获分支必须返回真 output（非弱引用），否则 pytorch 无法在捕获期正确管理内存。", "evidence": "vllm_ascend/compilation/acl_graph.py:L227-L246"}
+  ],
+
+  "theory": [
+    "torch.compile 后端协议：Dynamo 把 Python 前向 trace 成 fx.GraphModule，交给『编译后端』(backend(graph, example_inputs)→compiled_fn)。要求图输出为 flat tuple，故反复出现 graph_returns_tuple/make_graph_return_tuple。AscendCompiler 即占住这个 backend 位。",
+    "aclgraph/cudagraph 原理：把一次前向的 device 端 kernel 序列『录制』成一张图，后续以固定输入地址 replay，省去逐 kernel 的 host 端下发开销。代价是图绑定固定形状/地址 → 必须按 batch 形状分桶捕多张图，且 replay 时输入张量地址须与捕获时一致（DEBUG 下断言校验）。",
+    "pattern-based 算子融合：把『add_rms_norm_bias→quantize』这类多算子子图，用 pattern matcher 整体替换成单个融合算子 npu_add_rms_norm_quant，减少 kernel 启动与中间张量往返。SP 变体额外插入 maybe_all_gather_and_maybe_unpad 适配序列并行。",
+    "分桶规模：_compute_decode_cudagraph_batch_sizes 由 max_num_seqs×(num_speculative_tokens+1) 与 cudagraph_capture_sizes 求交，决定 decode 阶段静态 kernel/图捕获覆盖的 batch 尺寸集合——捕得越多显存/stream 资源占用越大，正是 207008 的诱因。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "compiler_interface.py 中 patched_get_compiled_gm 缓存巧思整段（L153-L178）及 load() 的缓存读写/cache-miss 重编译分支（L279-L344）", "why_safe": "缓存只影响二次启动速度，不改变编译产物的语义；精简版讲清『二分编译 + tuple 适配』主线即可，缓存属正交优化。保留 compile() 主体与 npugraph_ex/torchair 二分。"},
+      {"what": "_configure_backend 两分支里 enable_static_kernel 的 options/config 设置与 _compute_decode_cudagraph_batch_sizes（L98-L122 部分、L71-L79）", "why_safe": "static_kernel 是可选加速开关，关掉不影响 aclgraph 模式主干（force_eager/inplace_pass 与 config.mode='reduce-overhead' 才是主线）。"},
+      {"what": "norm_quant_fusion_pass.py 中除 AddRMSNormQuantPattern 外的 7 个 Pattern 变体类（WithBias / SP / DynamicQuant 及组合，L89-L475）", "why_safe": "8 个 pattern 结构同构（仅算子签名/是否带 bias/是否 all_gather 不同），保留一个最具代表性的即可讲透融合机制；删除变体不破坏对『pattern→replacement 融合』的理解。must_keep 保留 AddRMSNormQuantPattern 与 AddRMSNormQuantFusionPass。"},
+      {"what": "acl_graph.py 中 update_full_graph_params / GraphParams dataclass 及三套 set/get/update_*_graph_params* 全局函数（L275-L419）", "why_safe": "这些是 full-graph 模式下 attn/conv1d 参数与 workspace 的更新簿记，属图捕获的周边内存管理；ACLGraphWrapper 的 capture/replay/分桶/207008 主干不依赖其细节即可读懂。保留 weak_ref_workspaces 的调用点说明即可（可在叙述中一句带过）。"},
+      {"what": "acl_graph.py 中 ACLGraphWrapper 的 clear_all_graphs/clear_graphs/unwrap/cudagraph_wrapper/__getattr__ 等辅助方法（L91-L150 部分）", "why_safe": "属生命周期/属性透传的样板，不影响 capture-replay-分桶控制流主线。保留 __init__ 中 concrete_aclgraph_entries 与 graph_pool 的建立。"}
+    ],
+    "must_keep": [
+      {"symbol": "AscendCompiler", "why": "本章主角编译后端类，writer 要讲它如何替换 InductorAdaptor。"},
+      {"symbol": "compile", "why": "AscendCompiler.compile 是二分入口，控制流核心。"},
+      {"symbol": "enable_npugraph_ex", "why": "compile() 二选一的判定开关，读者须理解两条路由此分。"},
+      {"symbol": "npugraph_ex_compile", "why": "分支A：图编译优化路 + torchair 回退。"},
+      {"symbol": "fusion_pass_compile", "why": "分支B：compile_fx+aot_autograd 跑自家融合 pass。"},
+      {"symbol": "get_npu_backend", "why": "npugraph_ex/torchair 取后端的关键调用，回退两侧都用。"},
+      {"symbol": "_configure_backend", "why": "aclgraph 模式配置点（mode='reduce-overhead'），区分两后端。"},
+      {"symbol": "reduce-overhead", "why": "torchair aclgraph 模式的字符串标志，焦点明确要求点明。"},
+      {"symbol": "compile_fx", "why": "分支B 的图编译入口，含 tuple 适配。"},
+      {"symbol": "aot_autograd", "why": "分支B 用它包 inner_compile。"},
+      {"symbol": "COMPILATION_PASS_KEY", "why": "compiler_config 里取 GraphFusionPassManager 的键（='graph_fusion_manager'）。"},
+      {"symbol": "GraphFusionPassManager", "why": "对位 PostGradPassManager 的 pass manager 主类。"},
+      {"symbol": "configure", "why": "GraphFusionPassManager.configure 按开关注册 9 个 pass。"},
+      {"symbol": "AddRMSNormQuantFusionPass", "why": "代表性融合 pass，讲 pattern→replacement 机制的载体。"},
+      {"symbol": "AddRMSNormQuantPattern", "why": "保留的代表性 pattern 类（pattern/replacement 各一）。"},
+      {"symbol": "register_dummy_fusion_op", "why": "占位算子巧思，焦点明确要求讲清。"},
+      {"symbol": "dummyFusionOp", "why": "占位算子的实现类。"},
+      {"symbol": "BasePattern", "why": "pattern 基类，register 双注册逻辑的载体。"},
+      {"symbol": "register", "why": "BasePattern.register 向 inductor+npugraph_ex 双注册。"},
+      {"symbol": "ACLGraphWrapper", "why": "对位 CUDAGraphWrapper 的图捕获包装器主类。"},
+      {"symbol": "NPUGraph", "why": "torch.npu.NPUGraph，aclgraph 捕获的载体（对位 torch.cuda.CUDAGraph）。"},
+      {"symbol": "ACLGraphEntry", "why": "分桶字典的值类型，承载 aclgraph/output/input_addresses。"},
+      {"symbol": "BatchDescriptor", "why": "分桶键，不同 batch 形状各捕一张图。"},
+      {"symbol": "concrete_aclgraph_entries", "why": "分桶缓存字典，capture/replay 分派的核心数据结构。"},
+      {"symbol": "replay", "why": "重放分支核心调用 entry.aclgraph.replay()。"},
+      {"symbol": "_is_stream_resource_capture_error", "why": "207008 识别函数。"},
+      {"symbol": "_raise_stream_resource_capture_error", "why": "207008 改写成带指引报错。"},
+      {"symbol": "_STREAM_RESOURCE_ERROR_CODE", "why": "='207008'，兜底的核心常量，焦点明确要求。"},
+      {"symbol": "validate_cudagraph_capturing_enabled", "why": "捕获前合法性校验，capture 分支必经。"},
+      {"symbol": "weak_ref_tensors", "why": "捕获后转弱引用省显存的关键调用。"}
+    ]
+  },
+
+  "diagram_plan": [
+    {
+      "name": "two_hooks_override",
+      "intent": "顶替全景：platform.py 两个（+pass_manager 一个）返回字符串的钩子，把 vLLM 三件套整体换成 NPU 版。",
+      "spec": "三行对照箭头图。左列 vLLM 原件（InductorAdaptor / CUDAGraphWrapper / PostGradPassManager）—[get_compile_backend / get_static_graph_wrapper_cls / get_pass_manager_cls 返回字符串]→ 右列 NPU 版（AscendCompiler / ACLGraphWrapper / GraphFusionPassManager）。中间标注 current_platform 钩子名。",
+      "roadmap_highlight": "P6 compilation 子系统 / ch25 节点"
+    },
+    {
+      "name": "compile_twofold",
+      "intent": "AscendCompiler.compile() 二选一控制流。",
+      "spec": "流程图：compile()→deepcopy+fake_mode 重绑→菱形 enable_npugraph_ex? →[True] npugraph_ex_compile →菱形 import npugraph_ex? →[ok] nge.get_npu_backend / [ImportError] torchair.get_npu_backend，两者经 _configure_backend(mode=reduce-overhead, aclgraph)；→[False] fusion_pass_compile → compile_fx+aot_autograd → inner_compile 取 GraphFusionPassManager 跑融合 pass。"
+    },
+    {
+      "name": "fusion_pass_stack",
+      "intent": "GraphFusionPassManager 串起的 9 个融合 pass + dummy op 锚点 + 双注册。",
+      "spec": "纵向管道：configure() 按开关 append → [AddRMSNormQuantFusionPass / QKNormRopeFusionPass / MatmulAllReduceAddRMSNormPass / MulsAddFusionPass / (enable_sp) SequenceParallelismPass / SequenceParallelismMoePass]，旁注 noop_elimination/allgather_chunk_noop 在 SP pass 内部。左侧标 register_dummy_fusion_op 提供 torch.ops._C_ascend.* 锚点，BasePattern.register 双注册到 inductor + npugraph_ex。底部一例：pattern(add_rms_norm_bias→quantize) ⇒ replacement(npu_add_rms_norm_quant)。"
+    },
+    {
+      "name": "aclgraph_capture_replay",
+      "intent": "ACLGraphWrapper.__call__ 的分桶 capture/replay 状态机 + 207008 兜底。",
+      "spec": "状态机：__call__ 取 batch_descriptor/runtime_mode → 菱形 mode 匹配? →[否] 直跑 runnable；→[是] 查 concrete_aclgraph_entries[descriptor] → 菱形 aclgraph is None? →[是/首见] NPUGraph()+with torch.npu.graph 捕获（旁挂 try/except 207008→改写报错），存 entry；→[否/已捕] (DEBUG 校验输入地址) →(FULL 模式 synchronize)→ replay()→返回 entry.output。强调每个 BatchDescriptor 一张图。"
+    }
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recycle": [
+      {"id": "f4b", "desc": "NPUCommunicator.ca_comm=None 占位 + custom all-reduce / 图捕获集成——ch06 预留、ch07 显式声明仍悬，待图捕获线（ACLGraph）推进时回收", "planted_in": "ch06", "recycle_guidance_for_writer": "诚实归口：本章源码（compiler_interface.py / acl_graph.py / graph_fusion_pass_manager.py / passes/）并未直接触及 ca_comm——ca_comm=None 仍只在 vllm_ascend/distributed/device_communicators/npu_communicator.py:L38 占位，本章编译/图捕获文件中无引用。故按『框架在此、具体接入是其上一例』口径回收：ACLGraph（torch.npu.NPUGraph capture/replay + 按 BatchDescriptor 分桶）正是『图捕获框架』本身，custom all-reduce 与图捕获的集成是建立在该框架之上的一个具体特性；当前 vllm-ascend 该集成尚未落地（ca_comm 留 None 占位）。不要硬塞源码没有的 ca_comm 调用，如实点明其在图捕获语境下的位置与现状即可。"},
+      {"id": "f12", "desc": "meta/fake 注册齐备（ch24）→ ch25 torch.compile/ACLGraph 才能真正把这些算子捕获进图", "planted_in": "ch24", "recycle_guidance_for_writer": "开篇一句点明承接：ch24 给昇腾算子备齐 meta/fake 注册，torch.compile 的 Dynamo trace 才能在不真跑 device kernel 的前提下推断形状、把这些算子纳入 fx 图；本章正是这些算子被 AscendCompiler 编译、被 ACLGraphWrapper 用 NPUGraph 真正捕获进图、replay 的兑现。meta 是『进得了图』，本章是『图怎么编、怎么捕获重放』。"}
+    ]
+  },
+
+  "notes_for_writer": [
+    "方法真名以源码为准：平台钩子是 get_compile_backend（非 get_compiler_cls，章节焦点的简写）与 get_static_graph_wrapper_cls；pass manager 钩子 get_pass_manager_cls + pass_key（=COMPILATION_PASS_KEY='graph_fusion_manager'）。",
+    "ACLGraphWrapper 大量沿用 vLLM CUDAGraphWrapper 的结构与注释（甚至 dataclass 字段、__getattr__、weak_ref 套路几乎逐字对位），差异点在：torch.npu.NPUGraph 替 torch.cuda.CUDAGraph、torch.npu.graph 替 torch.cuda.graph、新增 207008 兜底、新增 replay 前 synchronize 与 enable_enpu/use_eagle 分支、新增 weak_ref_workspaces。对照基座 vllm/compilation/cuda_graph.py 写『对位+差异』最有说服力。",
+    "fusion pass 共 9 个文件对位 PostGradPassManager，但 configure() 只显式 append 6 个 Pass 类（norm_quant / qknorm_rope / allreduce_rmsnorm / muls_add / sequence_parallelism / sequence_parallelism_moe）；noop_elimination(NoOpEliminationPass) 与 allgather_chunk_noop(AllGatherChunkNoOpCleanupPass) 是在 SP pass 内部调用的清理 pass，base_pattern.py 是基类——别误写成『configure 注册 9 个』。",
+    "norm_quant_fusion_pass.py 有 8 个同构 Pattern 变体，正文取 AddRMSNormQuantPattern 一例讲透，其余以一句话归纳差异（WithBias/SP/DynamicQuant 组合）。"
+  ]
+}
