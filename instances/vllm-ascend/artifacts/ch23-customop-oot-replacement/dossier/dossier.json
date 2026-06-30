@@ -1,0 +1,191 @@
+{
+  "chapter": "ch23",
+  "title": "CustomOp 的 OOT 顶替：昇腾算子如何替换 vLLM 算子",
+  "part": "Part VI（算子与编译层）开篇",
+  "thesis": "OOT 插件不改 vLLM 模型定义一行，靠一张注册表（REGISTERED_ASCEND_OPS）+ forward_oot 覆写，把每个算子的「身体」从 CUDA 实现换成昇腾实现。换头不换身：CustomOp 的接口/注册位置不动（身），只把被实例化的子类与 forward 实现换掉（头）。第二层二分由 enable_custom_op() 决定走不走编译出来的 AscendC 融合 kernel。",
+
+  "code_spine": [
+    "vllm_ascend/worker/worker.py:L110 register_ascend_customop(vllm_config) —— 全工厂唯一一次调用，worker 初始化时触发批量顶替",
+    "vllm_ascend/utils.py:L644-646 _ASCEND_CUSTOMOP_IS_REIGISTERED 幂等闸（已注册则直接 return）",
+    "vllm_ascend/utils.py:L649-681 import 全部 Ascend* 子类",
+    "vllm_ascend/utils.py:L683-712 构造 REGISTERED_ASCEND_OPS 映射表（基础 ~28 项）",
+    "vllm_ascend/utils.py:L714-724 deepseek_mla 时追加 GateLinear（可省略支线）",
+    "vllm_ascend/utils.py:L726-759 is_310p() 时用 *310 子类覆盖一批（可省略支线）",
+    "vllm_ascend/utils.py:L761-762 for name, op_cls: CustomOp.register_oot(_decorated_op_cls=op_cls, name=name) —— 逐个写进基座 op_registry_oot",
+    "vllm_ascend/utils.py:L765 置位幂等标志",
+    "vllm/model_executor/custom_op.py:L332-338 基座 register_oot：op_cls.name=reg_name; op_registry_oot[reg_name]=op_cls",
+    "（模型构造时）vllm/model_executor/custom_op.py:L109-128 CustomOp.__new__：op_name=cls.__name__；若在 op_registry_oot 中则实例化 OOT 子类 —— 换身",
+    "vllm/model_executor/custom_op.py:L130-133 __init__ → dispatch_forward 选定 _forward_method",
+    "vllm/model_executor/custom_op.py:L174-207 dispatch_forward：按 enabled + 平台选 forward_oot vs forward_native(compiled)；is_out_of_tree() → forward_oot",
+    "vllm_ascend/ops/layernorm.py:L63-88 AscendRMSNorm.forward_oot：enable_custom_op() 真二分 —— 融合算子 vs 原子算子回退",
+    "vllm_ascend/utils.py:L357-416 enable_custom_op：惰性 import vllm_ascend_C 成功→True（用编译出的 AscendC kernel），失败/特例→False（回退）"
+  ],
+
+  "key_classes": [
+    {"name": "register_ascend_customop", "file": "vllm_ascend/utils.py:L638", "responsibility": "注册表总开关：建 REGISTERED_ASCEND_OPS（vLLM 算子类名→昇腾子类），遍历调 CustomOp.register_oot 批量顶替；_ASCEND_CUSTOMOP_IS_REIGISTERED 保证全程只跑一次"},
+    {"name": "REGISTERED_ASCEND_OPS", "file": "vllm_ascend/utils.py:L52,L684", "responsibility": "模块级 dict，键是 vLLM CustomOp 子类的类名（如 'RMSNorm'、'SiluAndMul'、'FusedMoE'），值是对应 Ascend 子类；310P 另覆盖一批 *310"},
+    {"name": "CustomOp (基座)", "file": "vllm/model_executor/custom_op.py:L103", "responsibility": "vLLM 所有算子的基类。__new__ 按 op_registry_oot 把被实例化的类换成 OOT 子类（换身）；dispatch_forward 按平台/enabled 把 forward 绑到 forward_oot/forward_native/forward_cuda（换头）"},
+    {"name": "CustomOp.register_oot (基座)", "file": "vllm/model_executor/custom_op.py:L332", "responsibility": "把 OOT 子类登记进全局 op_registry_oot，并给子类打上 .name=reg_name"},
+    {"name": "CustomOp.dispatch_forward (基座)", "file": "vllm/model_executor/custom_op.py:L174", "responsibility": "决定 forward 走哪个后端实现。enabled 时按平台分发；昇腾平台 is_out_of_tree()→forward_oot。未 enabled 则编译 forward_native"},
+    {"name": "AscendRMSNorm", "file": "vllm_ascend/ops/layernorm.py:L28", "responsibility": "继承基座 RMSNorm，只覆写 forward_oot；forward_oot 里 enable_custom_op() 真二分：真→torch.ops._C_ascend.npu_add_rms_norm_bias（AscendC 融合算子），否→torch_npu.npu_add_rms_norm/npu_rms_norm（原子算子回退）"},
+    {"name": "AscendSiluAndMul", "file": "vllm_ascend/ops/activation.py:L31", "responsibility": "标本：继承基座 SiluAndMul，只覆写 forward_oot=torch_npu.npu_swiglu。极简覆写示范「只换头」"},
+    {"name": "AscendQuickGELU", "file": "vllm_ascend/ops/activation.py:L25", "responsibility": "标本：继承 QuickGELU，forward_oot=torch_npu.npu_fast_gelu"},
+    {"name": "enable_custom_op", "file": "vllm_ascend/utils.py:L357", "responsibility": "惰性 import vllm_ascend_C（编译出的 AscendC 算子库）；成功置 _CUSTOM_OP_ENABLED=True 表示可用融合 kernel，ImportError 或 batch-invariant/A5 特例置 False 走回退。结果缓存"}
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm_ascend/utils.py",
+      "lines": "L638-L712",
+      "what": "注册表总开关：幂等闸 + 建 REGISTERED_ASCEND_OPS 映射表（~28 项）",
+      "code": "def register_ascend_customop(vllm_config: VllmConfig | None = None):\n    \"\"\"Register Ascend CustomOP\n\n    NOTE: if the register branch requires model type, please use `vllm.config.get_current_vllm_config`,\n    and ensure this will execute after model config is initilazed.\n    \"\"\"\n    global _ASCEND_CUSTOMOP_IS_REIGISTERED\n    if _ASCEND_CUSTOMOP_IS_REIGISTERED:\n        return\n    from vllm.model_executor.custom_op import CustomOp\n\n    from vllm_ascend.ops.activation import (\n        AscendQuickGELU,\n        AscendSiluAndMul,\n        AscendSiluAndMulWithClamp,\n    )\n    from vllm_ascend.ops.layernorm import AscendGemmaRMSNorm, AscendRMSNorm, AscendRMSNormGated\n    from vllm_ascend.ops.fused_moe.fused_moe import AscendFusedMoE\n    # ... 其余 Ascend* 子类 import 省略（linear / rotary_embedding / mla / vocab_parallel_embedding 等，约 20 个）\n\n    global REGISTERED_ASCEND_OPS\n    REGISTERED_ASCEND_OPS = {\n        \"QuickGELU\": AscendQuickGELU,\n        \"SiluAndMul\": AscendSiluAndMul,\n        \"SiluAndMulClamp\": AscendSiluAndMulWithClamp,\n        \"RMSNorm\": AscendRMSNorm,\n        \"GemmaRMSNorm\": AscendGemmaRMSNorm,\n        \"FusedMoE\": AscendFusedMoE,\n        # ... 其余约 22 个 vLLM 类名→Ascend 子类 的映射省略\n    }",
+      "elide": [
+        "L649-L681 完整 import 列表（约 28 个 Ascend* 子类）—— 内嵌时保留 activation/layernorm/fused_moe 三组代表，其余以注释省略",
+        "L684-L712 完整 28 项 dict —— 内嵌时保留 QuickGELU/SiluAndMul/RMSNorm/FusedMoE 等代表项，其余以注释省略；键全部是 vLLM CustomOp 子类的「类名」字符串"
+      ]
+    },
+    {
+      "path": "vllm_ascend/utils.py",
+      "lines": "L726-L766",
+      "what": "310P 设备分支覆盖一批 *310 子类 + 替换循环 + 幂等置位",
+      "code": "    # 310P: override selected ops with 310P implementations (keep minimal changes outside _310p)\n    if is_310p():\n        from vllm_ascend._310p.ops.layernorm import (\n            AscendGemmaRMSNorm310,\n            AscendRMSNorm310,\n            AscendRMSNormGated310,\n        )\n        # ... 其余 *310 import 省略\n        REGISTERED_ASCEND_OPS.update(\n            {\n                \"SiluAndMul\": AscendSiluAndMul310,\n                \"RMSNorm\": AscendRMSNorm310,\n                # ... 其余 310P 覆盖项省略\n            }\n        )\n\n    for name, op_cls in REGISTERED_ASCEND_OPS.items():\n        CustomOp.register_oot(_decorated_op_cls=op_cls, name=name)\n\n    # NOTE: Keep this at last to ensure all custom actions are registered\n    _ASCEND_CUSTOMOP_IS_REIGISTERED = True",
+      "elide": [
+        "L714-L724 deepseek_mla 时追加 GateLinear —— 模型类型相关支线，正文可一句带过",
+        "L728-L742 / L744-L759 完整 310P import 与 update —— 内嵌保留 layernorm 代表 + RMSNorm/SiluAndMul 覆盖项，其余注释省略；核心是「同一个键被 *310 类覆盖」"
+      ]
+    },
+    {
+      "path": "vllm/model_executor/custom_op.py",
+      "lines": "L322-L338",
+      "what": "基座 register_oot：把 OOT 子类登记进全局 op_registry_oot 并打 .name",
+      "code": "    # Decorator to register out-of-tree(oot) custom ops.\n    # For OOT custom ops:\n    #   if in-tree layer class is registered with an oot_custom_op layer,\n    #   the oot_custom_op layer will be used instead.\n    @classmethod\n    def register_oot(cls, _decorated_op_cls=None, name: str | None = None):\n        def decorator(op_cls):\n            reg_name = name if name is not None else cls.__name__\n            assert reg_name not in op_registry_oot, f\"Duplicate op name: {reg_name}\"\n            op_cls.name = reg_name\n            op_registry_oot[reg_name] = op_cls\n            return op_cls",
+      "elide": ["L340-L353 装饰器有/无括号两种调用形态的分派 —— 这里以 register_oot(_decorated_op_cls=op_cls, name=name) 的「带括号传类」形态调用，等价于立即对该类执行 decorator"]
+    },
+    {
+      "path": "vllm/model_executor/custom_op.py",
+      "lines": "L109-L136",
+      "what": "换身：__new__ 按 op_registry_oot 把被实例化的类替成 OOT 子类；__init__→dispatch_forward 绑定 _forward_method",
+      "code": "    def __new__(cls, *args, **kwargs):\n        try:\n            op_name = cls.__name__\n        except AttributeError:\n            raise TypeError(...) from None\n\n        if op_name not in op_registry_oot:\n            op_cls_to_instantiate = cls\n        else:\n            op_cls_to_instantiate = op_registry_oot[op_name]\n            logger.debug(\n                \"Instantiating custom op: %s using %s\",\n                op_name,\n                str(op_cls_to_instantiate),\n            )\n        return super().__new__(op_cls_to_instantiate)\n\n    def __init__(self, *, enforce_enable: bool = False, compile_native: bool = False):\n        super().__init__()\n        self._enforce_enable = enforce_enable\n        self._forward_method = self.dispatch_forward(compile_native=compile_native)\n\n    def forward(self, *args, **kwargs):\n        return self._forward_method(*args, **kwargs)",
+      "elide": ["L113-L117 AttributeError 分支的报错文案省略要点保留：未注册的类不可实例化。关键：模型里写 RMSNorm(...) 时 cls.__name__=='RMSNorm' 命中 op_registry_oot['RMSNorm']==AscendRMSNorm，于是真正被实例化的是昇腾子类"]
+    },
+    {
+      "path": "vllm/model_executor/custom_op.py",
+      "lines": "L169-L207",
+      "what": "换头：forward_oot 默认回退 native；dispatch_forward 按 enabled + 平台分发，is_out_of_tree()→forward_oot",
+      "code": "    def forward_oot(self, *args, **kwargs):\n        # By default, we assume that OOT ops are compatible with the\n        # PyTorch-native implementation.\n        return self.forward_native(*args, **kwargs)\n\n    def dispatch_forward(self, compile_native: bool):\n        # NOTE(woosuk): Here we assume that vLLM was built for only one\n        # specific backend. Currently, we do not support dynamic dispatching.\n        compilation_config = get_cached_compilation_config()\n\n        enabled = self._enforce_enable or self.enabled()\n        if enabled:\n            compilation_config.enabled_custom_ops.update([self.__class__.name])\n        else:\n            compilation_config.disabled_custom_ops.update([self.__class__.name])\n\n        if not enabled:\n            # Compile forward_native to avoid eager torch ops if inside\n            # opaque torch custom op (e.g. fused_moe, unified_attention, etc.)\n            return self.maybe_compile(self.forward_native, enable=compile_native)\n\n        if current_platform.is_rocm():\n            return self.forward_hip\n        elif current_platform.is_cpu():\n            return self.forward_cpu\n        elif current_platform.is_tpu():\n            return self.forward_tpu\n        elif current_platform.is_xpu():\n            return self.forward_xpu\n        elif current_platform.is_out_of_tree():\n            return self.forward_oot\n        else:\n            return self.forward_cuda",
+      "elide": ["L179-L184 enforce_enable 注释要点：可强制启用（如 ViT graph mode）。核心二分：enabled→按平台选实现（昇腾走 forward_oot）；未 enabled→编译 forward_native。基座未覆写 forward_oot 时它就等于 forward_native，所以「不覆写=无顶替」"]
+    },
+    {
+      "path": "vllm_ascend/ops/activation.py",
+      "lines": "L25-L37",
+      "what": "标本一：AscendQuickGELU / AscendSiluAndMul —— 继承基座、只覆写 forward_oot",
+      "code": "class AscendQuickGELU(QuickGELU):\n    def forward_oot(self, x: torch.tensor) -> torch.Tensor:\n        out = torch_npu.npu_fast_gelu(x)\n        return out\n\n\nclass AscendSiluAndMul(SiluAndMul):\n    def forward_oot(self, x: torch.Tensor) -> torch.Tensor:\n        weight_prefetch_method = get_weight_prefetch_method()\n        weight_prefetch_method.maybe_prefetch_mlp_weight_preprocess(weight_prefetch_method.MLP_DOWN, x)\n        out = torch_npu.npu_swiglu(x)\n        weight_prefetch_method.maybe_prefetch_mlp_weight_postprocess(out)\n        return out",
+      "elide": ["weight_prefetch_method.* 是权重预取优化，正文可一句带过；核心是 forward_oot 体内一行 torch_npu.npu_swiglu(x) 顶替了基座 SiluAndMul 的 CUDA 实现"]
+    },
+    {
+      "path": "vllm/model_executor/layers/activation.py",
+      "lines": "L137-L148",
+      "what": "对照基座 SiluAndMul 的 forward_native/forward_cuda —— 说明 Ascend 只覆 forward_oot、接口与类不动",
+      "code": "    @staticmethod\n    def forward_native(x: torch.Tensor) -> torch.Tensor:\n        \"\"\"PyTorch-native implementation equivalent to forward().\"\"\"\n        d = x.shape[-1] // 2\n        return F.silu(x[..., :d]) * x[..., d:]\n\n    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:\n        d = x.shape[-1] // 2\n        output_shape = x.shape[:-1] + (d,)\n        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)\n        self.op(out, x)\n        return out",
+      "elide": ["L130-L136 __init__ 里 self.op=torch.ops._C.silu_and_mul（CUDA kernel 句柄）—— 昇腾子类不碰这些，只新增 forward_oot"]
+    },
+    {
+      "path": "vllm_ascend/ops/layernorm.py",
+      "lines": "L63-L88",
+      "what": "标本二核心：AscendRMSNorm.forward_oot —— enable_custom_op() 真二分（融合算子 vs 原子算子回退）",
+      "code": "    def forward_oot(\n        self,\n        x: torch.Tensor,\n        residual: torch.Tensor | None = None,\n    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:\n        import torch_npu\n\n        if residual is not None:\n            residual = torch.ops.vllm.maybe_chunk_residual(x, residual)\n            if enable_custom_op():\n                x, _, residual = torch.ops._C_ascend.npu_add_rms_norm_bias(\n                    x, residual, self.weight, self.bias, self.variance_epsilon\n                )\n            else:\n                x, _, residual = torch_npu.npu_add_rms_norm(x, residual, self.weight, self.variance_epsilon)\n                if self.bias is not None:\n                    x.add_(self.bias)\n            return x, residual\n\n        x, residual = torch_npu.npu_rms_norm(x, self.weight, self.variance_epsilon)\n        if self.bias_loaded:\n            x.add_(self.bias)\n\n        weight_prefetch_method = get_weight_prefetch_method()\n        weight_prefetch_method.maybe_prefetch_mlp_weight_postprocess(x)\n        return x",
+      "elide": ["L86-L87 无 residual 分支末尾的 weight_prefetch 后处理可省略。核心二分：enable_custom_op() 真→torch.ops._C_ascend.npu_add_rms_norm_bias（一颗 AscendC 融合 kernel 同时算 add+rms_norm+bias）；假→torch_npu.npu_add_rms_norm（原子算子）+ 单独 x.add_(self.bias)。这是「融合算子 vs 原子算子回退」"]
+    },
+    {
+      "path": "vllm_ascend/ops/layernorm.py",
+      "lines": "L28-L48",
+      "what": "AscendRMSNorm.__init__：继承基座 RMSNorm 的全部参数与权重，仅新增 bias（量化 anti_method m4 用）",
+      "code": "class AscendRMSNorm(RMSNorm):\n    def __init__(\n        self,\n        hidden_size: int,\n        eps: float = 1e-6,\n        var_hidden_size: int | None = None,\n        has_weight: bool = True,\n        dtype: torch.dtype | None = None,\n    ) -> None:\n        super().__init__(hidden_size, eps, var_hidden_size, has_weight, dtype)\n        vllm_config = get_current_vllm_config()\n        self.bias = None\n        self.bias_loaded = False\n\n        # quantization with anti_method m4 will generate none-zero norm bias\n        if vllm_config.quant_config is not None and any(\n            \"norm.bias\" in name for name in vllm_config.quant_config.quant_description\n        ):\n            self.bias = torch.nn.Parameter(torch.zeros(hidden_size), requires_grad=False)\n            self.bias.weight_loader = self._bias_weight_loader",
+      "elide": ["L49-L61 _bias_weight_loader 权重加载细节可省略；核心：super().__init__ 复用基座的 weight/variance_epsilon 等（身不变），仅在量化场景下追加 self.bias"]
+    },
+    {
+      "path": "vllm_ascend/utils.py",
+      "lines": "L357-L389",
+      "what": "enable_custom_op：惰性 import 编译出的 AscendC 算子库，成败决定融合 vs 回退；结果缓存",
+      "code": "def enable_custom_op():\n    \"\"\"\n    Enable lazy init for vllm_ascend_C to avoid early initialization of CANN's RTS component.\n    Ensure that ASCEND_RT_VISIBLE_DEVICES can be dynamically modified before torch.npu.set_device().\n    \"\"\"\n    import vllm.envs as envs\n\n    global _CUSTOM_OP_ENABLED\n\n    if _CUSTOM_OP_ENABLED is not None:\n        return _CUSTOM_OP_ENABLED\n\n    if envs.VLLM_BATCH_INVARIANT or get_ascend_device_type() == AscendDeviceType.A5:\n        _CUSTOM_OP_ENABLED = False\n        return _CUSTOM_OP_ENABLED\n\n    try:\n        if not torch.compiler.is_compiling():\n            bootstrap_custom_op_env()\n        # register custom ops into torch_library here\n        import vllm_ascend.vllm_ascend_C  # type: ignore  # noqa: F401\n        import vllm_ascend.meta_registration  # type: ignore  # noqa: F401\n        _CUSTOM_OP_ENABLED = True\n    except ImportError as e:\n        # ... 回退路径：尝试修正 LD_LIBRARY_PATH 后重试，仍失败则 _CUSTOM_OP_ENABLED = False\n        ...\n    return _CUSTOM_OP_ENABLED",
+      "elide": ["L390-L416 ImportError 的二次重试（libcust_opapi.so 的 rpath 兜底）与 warning 日志省略；核心：import vllm_ascend.vllm_ascend_C 成功==有编译出的 AscendC 融合 kernel→走融合分支；任何失败/特例==无→走 torch_npu 原子算子回退。布尔缓存进 _CUSTOM_OP_ENABLED 只判一次"]
+    }
+  ],
+
+  "data_flow": [
+    "1. worker.py:register_ascend_customop(vllm_config) —— worker 初始化时唯一一次调用",
+    "2. utils.py:register_ascend_customop 幂等闸 _ASCEND_CUSTOMOP_IS_REIGISTERED：已注册直接返回",
+    "3. utils.py:import 全部 Ascend* 子类（activation/layernorm/fused_moe/linear/...）",
+    "4. utils.py:构造 REGISTERED_ASCEND_OPS = {vLLM类名字符串 → Ascend子类}（基础 ~28 项）",
+    "5. utils.py:可选支线 —— deepseek_mla 追加 GateLinear；is_310p() 用 *310 子类 update 覆盖一批",
+    "6. utils.py:for name, op_cls in REGISTERED_ASCEND_OPS: CustomOp.register_oot(_decorated_op_cls=op_cls, name=name)",
+    "7. custom_op.py:register_oot —— op_cls.name=name; op_registry_oot[name]=op_cls（写进基座全局注册表）",
+    "8. utils.py:置 _ASCEND_CUSTOMOP_IS_REIGISTERED=True（一次性）",
+    "9. （之后构造模型）模型代码照常写 RMSNorm(...)/SiluAndMul(...) —— 不知昇腾存在",
+    "10. custom_op.py:CustomOp.__new__ —— op_name=cls.__name__='RMSNorm' 命中 op_registry_oot → 实例化 AscendRMSNorm（换身）",
+    "11. custom_op.py:__init__ → dispatch_forward —— enabled 且 is_out_of_tree() → _forward_method=self.forward_oot（换头）",
+    "12. 前向时 forward() 调 _forward_method=AscendRMSNorm.forward_oot",
+    "13. layernorm.py:forward_oot —— enable_custom_op() 真二分：真→torch.ops._C_ascend.npu_add_rms_norm_bias（融合）；假→torch_npu.npu_add_rms_norm/npu_rms_norm（原子算子回退）"
+  ],
+
+  "design_decisions": [
+    {"decision": "用一张注册表 + 一次遍历 register_oot 批量顶替，而非逐个 monkey-patch 模型代码", "why": "vLLM 模型定义里所有算子都继承 CustomOp，基座 __new__ 已留好「查 op_registry_oot 换实例化类」的钩子；插件只需把昇腾子类填进这张表，全模型算子一处换头。模型定义零改动。", "evidence": "vllm_ascend/utils.py:L761-762 + vllm/model_executor/custom_op.py:L119-128"},
+    {"decision": "昇腾子类继承基座算子类、只覆写 forward_oot（不碰 __init__/forward/forward_native 接口）", "why": "「换头不换身」：身=类的接口/权重/注册键不变（继承自基座），头=forward 实现换成 NPU 版。基座 dispatch_forward 在 OOT 平台自动选 forward_oot，未覆写的算子退化为 forward_native，互不影响。", "evidence": "vllm_ascend/ops/activation.py:L31-37 + vllm/model_executor/custom_op.py:L169-172,L204-205"},
+    {"decision": "register_oot 把 op.name 设成注册键（如 'RMSNorm'），覆盖基座 register 设的 lowercase 名（'rms_norm'）", "why": "dispatch_forward 的 enabled() 用 self.__class__.name 去 compilation_config.custom_ops 查启停；OOT 子类用类名做键，使昇腾算子的启停以类名为准。", "evidence": "vllm/model_executor/custom_op.py:L336 (op_cls.name=reg_name) vs L315 (基座 register: op_cls.name=name)"},
+    {"decision": "_ASCEND_CUSTOMOP_IS_REIGISTERED 幂等闸 + register_oot 内 assert not in 防重复", "why": "注册全局且一次性，多次调用（多 worker/测试）只生效一次；register_oot 对同名再注册直接 assert 失败，避免静默覆盖。", "evidence": "vllm_ascend/utils.py:L644-646,L765 + vllm/model_executor/custom_op.py:L335"},
+    {"decision": "forward_oot 内再做 enable_custom_op() 第二层二分（融合 kernel vs torch_npu 原子算子）", "why": "AscendC 融合算子需编译产物 vllm_ascend_C 才可用；惰性 import 成功才走 npu_add_rms_norm_bias 一颗 kernel 融合 add+rmsnorm+bias，否则回退到 torch_npu 多颗原子算子拼。两层二分正交：第一层(dispatch)选 oot vs native，第二层(enable_custom_op)选融合 vs 回退。", "evidence": "vllm_ascend/ops/layernorm.py:L72-79 + vllm_ascend/utils.py:L378-389"},
+    {"decision": "enable_custom_op 惰性 import + 结果缓存进 _CUSTOM_OP_ENABLED", "why": "避免提前初始化 CANN RTS（让 ASCEND_RT_VISIBLE_DEVICES 在 set_device 前还能改）；布尔只判一次，前向热路径零开销。batch-invariant 与 A5 芯片强制走回退。", "evidence": "vllm_ascend/utils.py:L357-376,L416"},
+    {"decision": "310P 设备用 *310 子类 update 覆盖部分键（最小改动隔离在 _310p/）", "why": "310P 与主芯片算子实现不同，但顶替机制完全复用；只在表里把对应键换成 *310 类，主流程不分叉。", "evidence": "vllm_ascend/utils.py:L726-759"}
+  ],
+
+  "theory": [
+    "融合算子 vs 原子算子：RMSNorm(residual) 数学上是 add(x,residual) → rms_norm → (+bias)。原子算子路径用 torch_npu.npu_add_rms_norm 等多个独立 kernel，每个 kernel 都要把张量读出 HBM、算、写回 HBM，中间结果反复进出显存。融合 kernel npu_add_rms_norm_bias 把三步编进一颗 AscendC kernel，中间量留在片上、只读写一次 HBM —— 在带宽受限的 norm 这类 element-wise+reduce 算子上，访存次数≈决定时延。这是为何要编译融合 kernel、以及为何回退路径仍正确但更慢。",
+    "「换身」的机制本质：Python 的 __new__ 先于 __init__ 决定『到底实例化哪个类』。基座 CustomOp.__new__ 用 super().__new__(op_registry_oot[name]) 把返回对象的实际类型替换掉，于是 RMSNorm(...) 这条语句构造出的是 AscendRMSNorm 实例 —— 调用方语法不变，对象身份已换。",
+    "复杂度：register_ascend_customop 是 O(N) 建表 + O(N) 注册（N≈28），仅 worker 启动期一次性成本；前向期零额外分发开销（_forward_method 已在 __init__ 绑定为具体函数引用，forward 只是一次属性调用）。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "register_ascend_customop 中 L649-681 完整 import 列表，精简版只保留 activation(QuickGELU/SiluAndMul)、layernorm(RMSNorm) 三组代表 import", "why_safe": "顶替机制与具体有多少个算子无关；保留代表项即可演示『建表→遍历注册』全流程，其余 import 是同构重复。"},
+      {"what": "REGISTERED_ASCEND_OPS 字典 L684-712 中除 QuickGELU/SiluAndMul/RMSNorm/FusedMoE 之外的约 24 项", "why_safe": "每一项都是同构 '类名字符串→Ascend子类' 映射；保留 4 个代表项足以展示表结构与替换循环，删其余不改控制流。"},
+      {"what": "L714-724 deepseek_mla→GateLinear 条件追加分支", "why_safe": "模型类型相关的可选支线，不影响主顶替路径；精简版以注释标 SUBTRACTED 即可。"},
+      {"what": "L726-759 整个 is_310p() 覆盖块", "why_safe": "310P 是另一芯片的同构覆盖（机制与主路径完全相同，只换实现类）；删后主路径行为不变，精简版保留一句注释说明『310P 会 update 覆盖一批键』。"},
+      {"what": "AscendSiluAndMul/AscendSiluAndMulWithClamp 的 weight_prefetch_method.maybe_prefetch_* 调用", "why_safe": "权重预取是性能优化，与『forward_oot 顶替为 npu_swiglu』的语义无关；删后控制流与数值口径不变。"},
+      {"what": "AscendSwigluOAIAndMul 类（activation.py:L53-61）、LayerNormFn/AscendRMSNormGated/AscendGemmaRMSNorm（layernorm.py:L91-202）", "why_safe": "本章标本只用 AscendSiluAndMul/AscendQuickGELU/AscendRMSNorm 讲清『只覆 forward_oot』与『融合 vs 回退二分』；其余子类是同模式扩展，不在本章主线。"},
+      {"what": "AscendRMSNorm.__init__ 中 L43-47 quant_config anti_method m4 的 bias 探测分支与 _bias_weight_loader(L49-61)", "why_safe": "精简版可直接 self.bias=None/bias_loaded=False，保留 self.bias 字段供 forward_oot 二分引用即可；量化探测是边缘场景，删后融合/回退二分仍可演示。"},
+      {"what": "enable_custom_op 的 ImportError 二次重试块（L390-415）与 batch-invariant/A5 特例细节", "why_safe": "精简版用一个可控布尔（或 try-import 桩）模拟『库在/不在』即可驱动二分；真实 LD_LIBRARY_PATH 兜底与日志不改二分语义。host 无 CANN 本就 import 失败走回退。"},
+      {"what": "dispatch_forward 中 rocm/cpu/tpu/xpu 各平台分支（L196-203）", "why_safe": "本章只关心 is_out_of_tree()→forward_oot 与 not enabled→forward_native 两条；其余平台分支与昇腾顶替无关，精简版保留 oot/native 二分即可。"}
+    ],
+    "must_keep": [
+      {"symbol": "register_ascend_customop", "why": "注册表总开关，本章一号主角，writer 要讲『一处调用全模型顶替』。"},
+      {"symbol": "REGISTERED_ASCEND_OPS", "why": "vLLM类名→Ascend子类 的映射表，顶替的数据结构核心。"},
+      {"symbol": "_ASCEND_CUSTOMOP_IS_REIGISTERED", "why": "幂等闸，解释『为何只生效一次』。"},
+      {"symbol": "register_oot", "why": "基座把子类写进 op_registry_oot 的真正动作，遍历调用的目标。"},
+      {"symbol": "op_registry_oot", "why": "基座全局 OOT 注册表，__new__ 据此换身的数据源。"},
+      {"symbol": "__new__", "why": "『换身』机制所在：按 op_registry_oot 把被实例化的类替成 OOT 子类。"},
+      {"symbol": "dispatch_forward", "why": "『换头』机制：按 enabled+平台把 forward 绑到 forward_oot vs forward_native。"},
+      {"symbol": "forward_oot", "why": "昇腾子类唯一覆写点，全章贯穿；基座默认回退 native（不覆写=无顶替）。"},
+      {"symbol": "forward_native", "why": "对照与回退基线，说明『身』不变、未启用时走它。"},
+      {"symbol": "is_out_of_tree", "why": "dispatch 选 forward_oot 的判定条件，昇腾平台的身份标记。"},
+      {"symbol": "AscendRMSNorm", "why": "标本二，承载『融合 vs 原子算子回退』二分。"},
+      {"symbol": "AscendSiluAndMul", "why": "标本一，最简『只覆 forward_oot』示范。"},
+      {"symbol": "AscendQuickGELU", "why": "标本一辅证，一行 forward_oot 顶替。"},
+      {"symbol": "enable_custom_op", "why": "第二层真二分的开关，决定走不走 AscendC 融合 kernel。"},
+      {"symbol": "npu_add_rms_norm_bias", "why": "融合分支的目标算子（torch.ops._C_ascend.*），读者需认得『融合 kernel』长什么样。"},
+      {"symbol": "npu_add_rms_norm", "why": "回退分支的原子算子（torch_npu.*），与融合分支构成二分对照。"}
+    ]
+  },
+
+  "diagram_plan": [
+    {"name": "roadmap", "spec": "复用 instances/vllm-ascend/book/assets/roadmap/roadmap.py 的『你在这里』图：高亮 Part VI 入口 ch23（CustomOp OOT 顶替），前接 Part V 末章、后衔 ch24(算子注册细节)/ch25(ACLGraph 编译)/ch26(FusedMoE)。", "highlight_nodes": ["ch23"]},
+    {"name": "fig-oot-replacement-overview", "spec": "svg-diagram。左：vLLM 模型定义里写 RMSNorm()/SiluAndMul()（不知昇腾）。中：register_ascend_customop 建 REGISTERED_ASCEND_OPS 表（vLLM类名→Ascend子类，画 4 条代表映射 + ...），遍历 register_oot 写入 op_registry_oot。右：构造时 CustomOp.__new__ 查表→实例化 AscendRMSNorm（换身），dispatch_forward→forward_oot（换头）。强调『模型代码 0 改动』。", "highlight_nodes": []},
+    {"name": "fig-two-binaries", "spec": "svg-diagram。两层正交二分的判定树：第一层 dispatch_forward —— enabled? 是→is_out_of_tree()→forward_oot；否→forward_native(compiled)。第二层（forward_oot 内）enable_custom_op() —— 真→torch.ops._C_ascend.npu_add_rms_norm_bias（一颗融合 kernel，标注 add+rmsnorm+bias 融合）；假→torch_npu.npu_add_rms_norm + x.add_(bias)（多颗原子算子）。标注两层正交、各判一次。", "highlight_nodes": []},
+    {"name": "fig-head-not-body", "spec": "svg-diagram。『换头不换身』示意：一个算子对象=身（接口/权重/注册键/继承自基座 SiluAndMul，灰色不变）+ 头（forward 实现，红色：CUDA forward_cuda → NPU forward_oot=npu_swiglu）。对照基座 SiluAndMul.forward_native/forward_cuda 与 AscendSiluAndMul.forward_oot。", "highlight_nodes": []}
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recycle": [],
+    "note": "bible.py due ch23 返回空（无应埋/应回收伏笔）。本章作为 Part VI 入口，可前向预告 ch24(算子注册机制细节)/ch25(ACLGraph 与 enable_custom_op 编译产物的关系)/ch26(FusedMoE 顶替)，由 writer 在 Roadmap 衔接处自然带出，非 bible 登记的强约束伏笔。"
+  }
+}

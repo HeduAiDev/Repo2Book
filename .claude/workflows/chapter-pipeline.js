@@ -14,16 +14,16 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch22',
-  slug: 'ch22-kv-manager-and-schedulers',
+  chapter_id: 'ch23',
+  slug: 'ch23-customop-oot-replacement',
   instance: 'vllm-ascend',
-  focus: 'KV cache 管理与调度器的 NPU 特化——Part V 收官。昇腾对 KV 管理/调度**改动小**，正好讲清「**哪些原样复用、哪些必须特化**」（与 ch20/21 的重度特化形成对照，呼应只做减法的复用哲学）。**(1) KV manager 复用 + 一处新增**——single_type_kv_cache_manager.py：FullAttentionManager / BlockPool 原样复用 vLLM；新增 CompressAttentionManager(FullAttentionManager) 处理 MLAAttentionSpec / 压缩 spec 的 block 分配与前缀命中（回指 ch04 的 AscendMLAAttentionSpec、ch20 的 MLA）；get_manager_for_kv_cache_spec 重映射——按 spec 类型把 manager_class 选成 CompressAttentionManager。**(2) 三个 Scheduler 子类**（都继承 vLLM Scheduler）——SchedulerDynamicBatch：BudgetRefiner 按当前 decode token 数查表动态调 token 预算（回指 ch15 单步前向的 padding/调度节拍）；RecomputeScheduler（+ RecomputeSchedulerConfig/Output 子类）：重算 / 异步调度 + remote KV（PD 分离侧，回指 ch10/ch11）；ProfilingChunkScheduler：profiling 期分块调度。**(3) 取舍点名**——KV offload 双实现等只点代表、不逐行（重度减法，体量集中在 recompute_scheduler.py ~1092 行）。**核心立意**：一个成熟插件对宿主的「核心循环」（KV 分配 + 请求调度）应当**尽量少碰**——昇腾这里 90% 原样继承、只在 (a) 压缩 KV spec 的 block 管理、(b) 三种特殊调度策略上开子类；正好收束 Part V「注意力子系统」、也示范「该复用就复用、别为改而改」。承接 ch13/14/15 的 worker/runner/单步前向 → 本章是它们上游的调度与 KV 分配层。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/v1/core/single_type_kv_cache_manager.py（FullAttentionManager 基类）+ block_pool.py（BlockPool 原样复用）+ sched/scheduler.py（Scheduler 基类，三子类的父）+ sched/async_scheduler.py（异步调度对照 RecomputeScheduler）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；这些是纯 Python 控制流（manager 重映射 / BudgetRefiner 查表 / scheduler 子类覆写点），host 基本可跑读：精简版验「复用 vs 特化」的边界（哪些方法原样继承、哪些 override）；真实 NPU 侧只在 KV 物理分配时才需硬件，控制流可读】',
-  highlight: 'ch22',
+  focus: 'CustomOp 的 OOT 顶替：昇腾算子如何替换 vLLM 算子——Part VI（算子与编译层）开篇、整个插件「换头不换身」的总开关。**(1) 注册表总开关**——utils.py 的 register_ascend_customop：构造 REGISTERED_ASCEND_OPS 映射表（~30 项：RMSNorm→AscendRMSNorm、SiluAndMul→AscendSiluAndMul、QuickGELU→AscendQuickGELU、FusedMoE→AscendFusedMoE… 310P 另覆盖一批 *310），再遍历把 vLLM CustomOp 子类的注册表项逐个换成昇腾子类——一处调用，全模型的算子实现被批量顶替。**(2) 分发链**——基座 CustomOp.dispatch_forward（custom_op.py）按 enabled/compile 选 forward_oot vs forward_native；昇腾子类只覆写 forward_oot——「换头（forward 实现）不换身（CustomOp 的接口/注册位置）」。**(3) 标本两则**——AscendSiluAndMul（ops/activation.py，继承 vLLM SiluAndMul、只覆写 forward_oot）、AscendRMSNorm（ops/layernorm.py，继承 RMSNorm、forward_oot 里 **enable_custom_op() 真二分**：真→torch.ops._C_ascend.npu_add_rms_norm_bias 走 AscendC 融合算子；否→回退 torch_npu.npu_add_rms_norm / npu_rms_norm 原子算子）——讲清「融合算子 vs 原子算子回退」这条二分。**核心立意**：OOT 插件不改 vLLM 模型定义一行，靠一张注册表 + forward_oot 覆写，把每个算子的「身体」从 CUDA 实现换成昇腾实现；enable_custom_op() 决定走不走编译出来的 AscendC 融合 kernel。本章是 Part VI（算子注册 ch24 / 编译 ACLGraph ch25 / FusedMoE ch26）的总入口。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/model_executor/custom_op.py（CustomOp 基类、dispatch_forward/forward_oot/forward_native）+ layers/activation.py（SiluAndMul/QuickGELU 基类）+ layers/layernorm.py（RMSNorm 基类）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN（_C_ascend.*/torch_npu.* 算子不真跑）：精简版只验可读控制流（register_ascend_customop 建表+替换循环 / dispatch_forward 选 oot vs native / forward_oot 里 enable_custom_op() 的融合 vs 回退二分是纯 Python，可跑；真实 AscendC 融合算子不真跑）】',
+  highlight: 'ch23',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm-ascend/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
   skip_dossier: false,
   skip_impl: false,
-  paths: ['vllm_ascend/core/single_type_kv_cache_manager.py', 'vllm_ascend/core/scheduler_dynamic_batch.py', 'vllm_ascend/core/recompute_scheduler.py', 'vllm_ascend/core/scheduler_profiling_chunk.py'],
+  paths: ['vllm_ascend/utils.py', 'vllm_ascend/ops/activation.py', 'vllm_ascend/ops/layernorm.py', 'vllm_ascend/ops/__init__.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
