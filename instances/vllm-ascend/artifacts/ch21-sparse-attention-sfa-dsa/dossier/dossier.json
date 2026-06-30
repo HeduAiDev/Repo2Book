@@ -1,0 +1,192 @@
+{
+  "chapter_id": "ch21",
+  "title": "稀疏注意力：SFA 与 DSA（Lightning Indexer）——OOT 插件如何「增量扩展」出 vLLM 主干没有的能力",
+  "thesis": "稀疏注意力 = 先用一个轻量「索引器」给每个 query 挑出少数（DSA 取 index_topk=512 / SFA 取 2048）最相关的 KV 位置，再只对这些位置算注意力，把长上下文注意力开销从 O(L) 降到 O(top-k)。它建在 ch20 的 MLA 低秩 KV 压缩之上：SFA 直接继承 vLLM 的 MLAAttentionImpl/MLACommonMetadataBuilder 再叠稀疏选择；DSA 继承昇腾自有的轻抽象 DSAAttentionImpl、自带 AttentionMetadataBuilder，内联重写 MLA 式低秩 prolog 后接 Lightning Indexer。vLLM 主干无对位后端（pairs vllm_paths 为空）——这是插件不止「顶替内核」、还能「新增能力」的活证据。承接 ch18 路由：(use_mla,use_sparse,use_compress) 三元 key 把 (T,T,F)→AscendSFABackend、(T,F,T)→AscendDSABackend。",
+  "code_spine": [
+    "vllm_ascend/platform.py:L738-L765 — ch18 路由落点：(use_mla,use_sparse,use_compress) 查 backend_map → AscendSFABackend / AscendDSABackend（主干无对位，故这两项是插件「新增」）",
+    "vllm_ascend/attention/sfa_v1.py:L170-L192 — AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata])：继承 ch20 的 MLA 元数据 builder",
+    "vllm_ascend/attention/sfa_v1.py:L390-L453 — AscendSFAImpl(MLAAttentionImpl)：直接继承 vLLM MLA impl；assert indexer is not None（稀疏选择的索引器是必备件）",
+    "vllm_ascend/attention/sfa_v1.py:L1107-L1347 — SFA forward 主脊：MLA 式 q/kv 低秩 prolog → indexer_select_pre/post_process 选 top-k → _execute_sparse_flash_attention_process 只对 top-k 算注意力 → _v_up_proj → o_proj",
+    "vllm_ascend/attention/sfa_v1.py:L1002-L1071 + device_op.py:L370-L434 — SFA Lightning Indexer：q_li/k_li 经 wq_b/wk_weights_proj 投影 + RoPE，npu_lightning_indexer(sparse_count=2048,sparse_mode=3) 出 topk_indices",
+    "vllm_ascend/device/device_op.py:L436-L468 — execute_sparse_flash_attention_process：npu_sparse_flash_attention(sparse_indices=topk_indices, sparse_mode=3) —— 把 top-k 选择喂给稀疏 flash 内核",
+    "vllm_ascend/attention/dsa_v1.py:L180-L220 — AscendDSABackend：get_builder_cls→AscendDSAMetadataBuilder、get_impl_cls→AscendDSAImpl",
+    "vllm_ascend/attention/dsa_v1.py:L343-L602 — AscendDSAMetadataBuilder(AttentionMetadataBuilder[...])：build 经 split_decodes_and_prefills 拆 decode/prefill，各自 build_prefill_metadata / build_decode_metadata",
+    "vllm_ascend/attention/dsa_v1.py:L817-L838 / L1079-L1098 — prefill/decode 各自调 npu_quant_lightning_indexer_metadata(sparse_count=index_topk=512, sparse_mode=3) 预建索引元数据",
+    "vllm_ascend/attention/dsa_v1.py:L1574-L1689 — AscendDSAImpl.forward：拆 [decode|prefill] → _forward_decode/_forward_prefill → o_proj(wo_a/wo_b)",
+    "vllm_ascend/attention/dsa_v1.py:L2660-L2737 — indexer_select_qli/_indexer_qli：npu_quant_lightning_indexer(sparse_count=index_topk=512) 出 compress_topk_idxs",
+    "vllm_ascend/attention/dsa_v1.py:L2139-L2183 — _forward_prefill：attn_op = npu_sparse_attn_sharedkv(cmp_sparse_indices=compress_topk_idxs) 只对 top-512 算注意力",
+    "vllm_ascend/device/device_op.py:L1663-L1670 — DeviceOperator = get_device_adaptor()：注意力各章共用的设备算子门面，按 AscendDeviceType 派 BaseDeviceAdaptor / A5DeviceAdaptor"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm_ascend/platform.py",
+      "lines": "L738-L765",
+      "what": "ch18 路由落点：SFA/DSA 是「新增」后端的证据（主干无对位）",
+      "code": "    @classmethod\n    def get_attn_backend_cls(cls, selected_backend, attn_selector_config, num_heads: int | None = None):\n        use_compress = getattr(attn_selector_config, \"use_compress\", False)\n        key = (attn_selector_config.use_mla, attn_selector_config.use_sparse)\n\n        if selected_backend == AttentionBackendEnum.FLASH_ATTN and cls._validate_fa3_backend(key, attn_selector_config):\n            return \"vllm_ascend.attention.fa3_v1.AscendFABackend\"\n\n        backend_map = {\n            (True, False, False): \"vllm_ascend.attention.mla_v1.AscendMLABackend\",\n            (False, False, False): \"vllm_ascend.attention.attention_v1.AscendAttentionBackend\",\n            (True, True, False): \"vllm_ascend.attention.sfa_v1.AscendSFABackend\",\n            (True, False, True): \"vllm_ascend.attention.dsa_v1.AscendDSABackend\",\n        }\n        ...\n        return backend_map[(attn_selector_config.use_mla, attn_selector_config.use_sparse, use_compress)]",
+      "elide": ["省略 backend_map_310 与 is_310p 旁支（ch17 已讲 310P）", "省略 _validate_fa3_backend 细节（FA3 早返回，非本章主题）"]
+    },
+    {
+      "path": "vllm_ascend/attention/sfa_v1.py",
+      "lines": "L170 / L390-L394 / L453",
+      "what": "SFA「建在 MLA 之上」的字面证据：builder 继承 MLACommonMetadataBuilder，impl 继承 MLAAttentionImpl，且必须有 indexer",
+      "code": "class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):\n    ...\n\nclass AscendSFAImpl(MLAAttentionImpl):\n    ...\n        assert self.indexer is not None, \"Indexer is required for DSA.\"",
+      "elide": ["builder.__init__ 与 build 的 dsa_cp/c8_reshape_optim 分支（CP/量化优化，减法删）", "impl.__init__ 大量 enable_dsa_cp* / enable_mlapo / use_sparse_c8_indexer 开关初始化（减法删，保留 indexer 必备断言）"]
+    },
+    {
+      "path": "vllm_ascend/attention/sfa_v1.py",
+      "lines": "L1328-L1347",
+      "what": "SFA 稀疏注意力的核心三步：选 top-k → 只对 top-k 算注意力",
+      "code": "        topk_num_tokens = num_input_tokens or hidden_states.shape[0]\n        if self.skip_topk:\n            topk_indices = self._get_indexcache_topk_indices(topk_num_tokens)\n        else:\n            topk_indices = self.indexer_select_post_process(\n                x=hidden_states,\n                q_c=q_c,\n                kv_cache=kv_cache,\n                attn_metadata=attn_metadata,\n                cos=cos,\n                sin=sin,\n                actual_seq_lengths_query=actual_seq_lengths_query,\n                actual_seq_lengths_key=actual_seq_lengths_key,\n            )\n            if self.use_index_cache:\n                self._update_indexcache_topk_indices(topk_indices)\n\n        attn_output = self._execute_sparse_flash_attention_process(\n            ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key\n        )",
+      "elide": ["skip_topk/use_index_cache 是 IndexCache 复用分支（跨层共享 topk，减法可压成一句旁注）"]
+    },
+    {
+      "path": "vllm_ascend/attention/sfa_v1.py",
+      "lines": "L1002-L1071（节选）",
+      "what": "SFA indexer 的 query 侧：投影出 q_li、RoPE，再交给 DeviceOperator 跑 lightning indexer",
+      "code": "    def indexer_select_post_process(self, x, q_c, kv_cache, attn_metadata, cos, sin,\n                                    actual_seq_lengths_query, actual_seq_lengths_key):\n        kw, _ = self.wk_weights_proj(x)\n        weights = kw[:, self.head_dim :]\n        ...\n        q_li, _ = self.wq_b(q_c)\n        q_li = q_li.view(-1, self.n_head, self.head_dim)  # [n_toks,64,128]\n        ...\n        q_li = torch.cat([q_li_pe, q_li_nope], dim=-1)  # [b*s,64,128]\n        ...\n        return DeviceOperator.indexer_select_post_process(\n            self, q_li, q_li_scale, q_li_shape_ori, weights, kv_cache, attn_metadata,\n            actual_seq_lengths_query, actual_seq_lengths_key,\n            self.use_sparse_c8_indexer, self.use_torch_npu_lightning_indexer,\n        )",
+      "elide": ["HAS_TRITON 与 npu_rotary_mul 两条 RoPE 等价分支，保一条即可", "use_sparse_c8_indexer 的 hadamard+dynamic_quant（INT8 量化索引）旁支——减法删，正文一句话点到"]
+    },
+    {
+      "path": "vllm_ascend/device/device_op.py",
+      "lines": "L370-L434（节选 default 分支）",
+      "what": "Lightning Indexer 真身（SFA 走的 default 分支）：npu_lightning_indexer 出 top-k 索引，sparse_count=2048",
+      "code": "    @staticmethod\n    def indexer_select_post_process(sfa_impl, q_li, q_li_scale, q_li_shape_ori, weights,\n                                   kv_cache, attn_metadata, actual_seq_lengths_query,\n                                   actual_seq_lengths_key, use_sparse_c8_indexer,\n                                   use_torch_npu_lightning_indexer):\n        ...\n        else:\n            topk_indices, _ = torch.ops._C_ascend.npu_lightning_indexer(\n                query=q_li,\n                key=kv_cache[2],\n                weights=weights,\n                actual_seq_lengths_query=actual_seq_lengths_query,\n                actual_seq_lengths_key=actual_seq_lengths_key,\n                block_table=attn_metadata.block_table,\n                layout_query=\"TND\",\n                layout_key=\"PA_BSND\",\n                sparse_count=2048,\n                sparse_mode=3,\n            )\n        return topk_indices",
+      "elide": ["use_sparse_c8_indexer 分支(npu_lightning_indexer_quant) 与 use_torch_npu_lightning_indexer 分支(torch_npu.npu_lightning_indexer)——三条等价分支只为不同代际/量化，保 default 一条，正文一句话交代另两条"]
+    },
+    {
+      "path": "vllm_ascend/device/device_op.py",
+      "lines": "L436-L468",
+      "what": "稀疏 flash 注意力：把 top-k 索引(sparse_indices)喂给内核，只对选中的 KV 位置算注意力",
+      "code": "    @staticmethod\n    def execute_sparse_flash_attention_process(sfa_impl, ql_nope, q_pe, kv_cache, topk_indices,\n                                               attn_metadata, actual_seq_lengths_query,\n                                               actual_seq_lengths_key):\n        block_table = attn_metadata.block_table\n        kv = kv_cache[0]\n        key_rope = kv_cache[1]\n\n        attn_output, _, _ = torch.ops._C_ascend.npu_sparse_flash_attention(\n            query=ql_nope,\n            key=kv,\n            value=kv,\n            sparse_indices=topk_indices,\n            scale_value=sfa_impl.scale,\n            sparse_block_size=1,\n            block_table=block_table,\n            actual_seq_lengths_query=actual_seq_lengths_query,\n            actual_seq_lengths_kv=actual_seq_lengths_key,\n            query_rope=q_pe,\n            key_rope=key_rope,\n            layout_query=\"TND\",\n            layout_kv=\"PA_BSND\",\n            sparse_mode=3,\n            attention_mode=2,\n        )\n        return attn_output",
+      "elide": []
+    },
+    {
+      "path": "vllm_ascend/attention/dsa_v1.py",
+      "lines": "L223-L316（节选）",
+      "what": "DSA 自带元数据：拆 Prefill/Decode 两份，各自携带 sas_metadata + qli_metadata（Lightning Indexer 元数据）",
+      "code": "@dataclass\nclass AscendDSAPrefillMetadata:\n    \"\"\"Prefill Specific Metadata for Ascend\"\"\"\n    attn_mask: torch.Tensor\n    query_lens: torch.Tensor\n    seq_lens: torch.Tensor\n    ...\n    sas_metadata: torch.Tensor = None\n    qli_metadata: torch.Tensor = None\n\n@dataclass\nclass AscendDSADecodeMetadata:\n    ...\n    sas_metadata: torch.Tensor = None\n    qli_metadata: torch.Tensor = None\n\n@dataclass\nclass AscendDSAMetadata:\n    num_actual_tokens: int\n    ...\n    num_decodes: int\n    num_decode_tokens: int\n    num_prefills: int\n    ...\n    decode: AscendDSADecodeMetadata | None = None\n    prefill: AscendDSAPrefillMetadata | None = None\n    hadamard: torch.Tensor | None = None",
+      "elide": ["大量 compress_*/cu_c4_/cu_c128_/cp_/start_pos 等压缩与 CP 字段（减法删，保留 sas_metadata/qli_metadata/prefill/decode 切分）"]
+    },
+    {
+      "path": "vllm_ascend/attention/dsa_v1.py",
+      "lines": "L574-L602",
+      "what": "DSA build 主入口：按 decode/prefill 计数分别装配两份元数据（沿用 ch20 MLA 的 decode/prefill 拆分范式）",
+      "code": "        prefill_metadata = None\n        if self.num_prefills > 0:\n            prefill_metadata = self.build_prefill_metadata(common_prefix_len, common_attn_metadata)\n\n        decode_metadata = None\n\n        if self.num_decodes > 0:\n            decode_metadata = self.build_decode_metadata(common_prefix_len, common_attn_metadata, num_reqs_actual)\n\n        return self.metadata_cls(\n            num_input_tokens=common_attn_metadata.num_input_tokens,\n            num_actual_tokens=self.num_actual_tokens,\n            query_lens=self.query_lens,\n            slot_mapping=None,\n            head_dim=self.model_config.get_head_size(),\n            num_decodes=self.num_decodes,\n            num_decode_tokens=self.num_decode_tokens,\n            num_prefills=self.num_prefills,\n            attn_mask=None,\n            attn_state=common_attn_metadata.attn_state,\n            prefill=prefill_metadata,\n            decode=decode_metadata,\n            query_start_loc=query_start_loc,\n            block_tables=None,\n            seq_lens=self.seq_lens,\n            cos=cos,\n            sin=sin,\n            hadamard=AscendDSAMetadataBuilder.hadamard,\n        )",
+      "elide": ["build 前半段 common_ratio_to_sas_metadata 缓存与重算两分支（缓存优化，减法压成一句）"]
+    },
+    {
+      "path": "vllm_ascend/attention/dsa_v1.py",
+      "lines": "L817-L838",
+      "what": "DSA 预建 Lightning Indexer 元数据：sparse_count=index_topk=512、sparse_mode=3（prefill 路；decode 路 L1079-L1098 对称）",
+      "code": "        if self.prefill_ratio_to_sas_metadata.get(\"qli\") is None:\n            self.prefill_ratio_to_sas_metadata[\"qli\"] = torch.ops._C_ascend.npu_quant_lightning_indexer_metadata(\n                actual_seq_lengths_query=prefill_query_start_loc[1:].clone(),\n                actual_seq_lengths_key=self.seq_lens[reqs_start:].clone(),\n                num_heads_q=self.model_config.hf_config.index_n_heads,  # 64\n                num_heads_k=1,\n                head_dim=self.model_config.hf_config.index_head_dim,  # 128\n                query_quant_mode=0,\n                key_quant_mode=0,\n                batch_size=len(self.seq_lens[reqs_start:]),\n                max_seqlen_q=seq_lens_q.max().item(),\n                max_seqlen_k=self.seq_lens[reqs_start:].max().item(),\n                layout_query=\"TND\",\n                layout_key=\"PA_BSND\",\n                sparse_count=self.model_config.hf_config.index_topk,  # 512\n                sparse_mode=3,\n                pre_tokens=(1 << 63) - 1,\n                next_tokens=(1 << 63) - 1,\n                cmp_ratio=4,\n                device=str(self.seqused_q.device),\n            )\n        qli_metadata = self.prefill_ratio_to_sas_metadata.get(\"qli\")",
+      "elide": ["同函数前半的 sas_metadata（npu_sparse_attn_sharedkv_metadata）三档 compressor_ratio(<=1/4/128) 分支——保 qli 这段，sas 那段正文一句话带过"]
+    },
+    {
+      "path": "vllm_ascend/attention/dsa_v1.py",
+      "lines": "L1574-L1689（节选）",
+      "what": "DSA forward 主脊：按 [decode|prefill] 切分 hidden_states，各自走稀疏路，再合并过 o_proj",
+      "code": "    def forward(self, layer_name, hidden_states, kv_cache, attn_metadata,\n                need_gather_q_kv=False, output=None):\n        ...\n        has_prefill = attn_metadata[0].num_prefills > 0\n        has_decode = attn_metadata[0].num_decodes > 0\n        decode_tokens = attn_metadata[0].num_decode_tokens\n        actual_tokens = attn_metadata[0].num_actual_tokens\n        ...\n        prefill_hidden_states = hidden_states[decode_tokens:actual_tokens]\n        decode_hidden_states = hidden_states[:decode_tokens]\n        ...\n        if has_prefill:\n            output_prefill = self._forward_prefill(layer_name, prefill_hidden_states, kv_cache,\n                                                   attn_metadata, need_prefill_gather)\n            o_proj_input[decode_tokens:actual_tokens] = output_prefill\n        if has_decode:\n            output_decode = self._forward_decode(layer_name, decode_hidden_states, kv_cache, attn_metadata)\n            o_proj_input[:decode_tokens] = output_decode\n        ...\n        output[...] = self.wo_b(o_proj_input)\n        return output_padded",
+      "elide": ["prefill_comm_compute_overlap / multistream_dsv4_dsa_overlap 等通信-计算重叠分支（减法删）", "A5 设备的 npu_dynamic_mx_quant + npu_transpose_quant_batchmatmul o_proj 旁支（保非 A5 主路）", "尾部 inplace_partial_rotary_mul 逆 RoPE 细节正文一句话带过"]
+    },
+    {
+      "path": "vllm_ascend/attention/dsa_v1.py",
+      "lines": "L2683-L2704",
+      "what": "DSA Lightning Indexer 真身：npu_quant_lightning_indexer 出 top-512 索引 topk_idxs",
+      "code": "        topk_idxs, _ = torch.ops._C_ascend.npu_quant_lightning_indexer(\n            query=q,\n            key=indexer_k_cache,\n            weights=DeviceOperator.prepare_dsa_indexer_weights(weights),\n            query_dequant_scale=DeviceOperator.prepare_dsa_indexer_query_scale(q_scale),\n            key_dequant_scale=DeviceOperator.prepare_dsa_indexer_key_scale(indexer_scale_cache),\n            actual_seq_lengths_query=qlens,\n            actual_seq_lengths_key=kvlens,\n            block_table=block_table,\n            metadata=qli_metadata,\n            query_quant_mode=0,\n            key_quant_mode=0,\n            layout_query=\"TND\",\n            layout_key=\"PA_BSND\",\n            sparse_count=self.index_topk,\n            sparse_mode=3,\n            pre_tokens=(1 << 63) - 1,\n            next_tokens=(1 << 63) - 1,\n            cmp_ratio=4,\n            return_value=False,\n        )\n        return topk_idxs",
+      "elide": ["_indexer_qkv_prepare 里 compressor 算子建压缩 KV、rotate_activation(hadamard) 旋转、_indexer_quant_scatter 写 indexer KV cache——可压成「先压缩+量化 KV 入 cache，再喂 indexer」一句"]
+    },
+    {
+      "path": "vllm_ascend/attention/dsa_v1.py",
+      "lines": "L2139-L2159",
+      "what": "DSA 稀疏注意力内核：把 top-512 索引(cmp_sparse_indices)喂给 npu_sparse_attn_sharedkv，只算选中位置",
+      "code": "                attn_output = attn_op(\n                    q,\n                    ori_kv=swa_kv_cache,\n                    cmp_kv=compress_kv_cache,\n                    cmp_sparse_indices=compress_topk_idxs,\n                    ori_block_table=swa_prefill_metadata.block_table,\n                    cmp_block_table=compressor_prefill_metadata.block_table,\n                    cu_seqlens_q=actual_seq_lengths_query,\n                    seqused_kv=actual_seq_lengths_key,\n                    sinks=self.attn_sink,\n                    metadata=common_prefill_metadata.sas_metadata,\n                    softmax_scale=self.softmax_scale,\n                    cmp_ratio=self.compress_ratio,\n                    ori_mask_mode=4,\n                    cmp_mask_mode=3,\n                    ori_win_left=self.window_size - 1,\n                    ori_win_right=0,\n                    layout_q=\"TND\",\n                    layout_kv=\"PA_ND\",\n                    **extra_attn_kwargs,\n                )[0]",
+      "elide": ["compress_ratio==128 旁支（无 cmp_sparse_indices）与 compress_ratio<=1 旁支（纯滑窗，无稀疏）——保 compress_ratio==4 主稀疏路"]
+    },
+    {
+      "path": "vllm_ascend/device/device_op.py",
+      "lines": "L513-L516 / L1663-L1670",
+      "what": "DeviceOperator 门面：get_dsa_sparse_attn_op 返回稀疏内核；模块级按设备代际选 Base/A5 适配器（ch19/ch20/ch21 共用）",
+      "code": "    @staticmethod\n    def get_dsa_sparse_attn_op():\n        \"\"\"Returns the sparse attention operator.\"\"\"\n        return torch.ops._C_ascend.npu_sparse_attn_sharedkv\n\n...\n\ndef get_device_adaptor() -> type[\"BaseDeviceAdaptor\"]:\n    ascend_device_type = get_ascend_device_type()\n    if ascend_device_type == AscendDeviceType.A5:\n        return A5DeviceAdaptor\n    return BaseDeviceAdaptor\n\n\nDeviceOperator: type[\"BaseDeviceAdaptor\"] = get_device_adaptor()",
+      "elide": ["A5DeviceAdaptor 对每个方法的 override 实现（A5 代际分叉，减法删，正文一句话点门面=按设备多态派发）"]
+    }
+  ],
+  "key_classes": [
+    {"name": "AscendSFABackend", "file": "vllm_ascend/attention/sfa_v1.py:L71", "responsibility": "ch18 (use_mla,use_sparse,use_compress)=(T,T,F) 选中的 SFA 后端；get_builder_cls→AscendSFAMetadataBuilder、get_impl_cls→AscendSFAImpl；get_name() 故意返回 ASCEND_SFA/FLASH_ATTN 绕过 model-runner 名断言（HACK，回指 ch18）"},
+    {"name": "AscendSFAMetadataBuilder", "file": "vllm_ascend/attention/sfa_v1.py:L170", "responsibility": "继承 ch20 的 MLACommonMetadataBuilder[AscendSFAMetadata]；build 复用 MLA 元数据装配，额外产出 cos/sin、block_table、attn_mask 供稀疏选择"},
+    {"name": "AscendSFAImpl", "file": "vllm_ascend/attention/sfa_v1.py:L390", "responsibility": "继承 vLLM MLAAttentionImpl，直接复用 MLA 的低秩 KV 压缩与 prefill/decode 范式；forward 内叠加 indexer_select_pre/post_process(选 top-k) + execute_sparse_flash_attention(只算 top-k)；assert indexer 必备"},
+    {"name": "AscendDSABackend", "file": "vllm_ascend/attention/dsa_v1.py:L180", "responsibility": "ch18 (T,F,T) 选中的 DSA 后端（DeepSeek Sparse Attention）；get_builder_cls→AscendDSAMetadataBuilder、get_impl_cls→AscendDSAImpl"},
+    {"name": "AscendDSAMetadataBuilder", "file": "vllm_ascend/attention/dsa_v1.py:L343", "responsibility": "继承 vLLM AttentionMetadataBuilder（非 MLA builder，DSA 自带一套）；build 经 split_decodes_and_prefills 拆 decode/prefill，build_prefill_metadata/build_decode_metadata 各自调 npu_quant_lightning_indexer_metadata(sparse_count=512,sparse_mode=3) 预建索引元数据 qli_metadata + sparse-attn 元数据 sas_metadata"},
+    {"name": "AscendDSAImpl", "file": "vllm_ascend/attention/dsa_v1.py:L378", "responsibility": "继承昇腾自有轻抽象 DSAAttentionImpl；内联重写 MLA 式低秩 prolog(wq_a/wq_b/wkv/q_norm/kv_norm)，forward 拆 [decode|prefill] 各自走 Lightning Indexer 选 top-512 + npu_sparse_attn_sharedkv 稀疏注意力 + wo_a/wo_b 输出投影"},
+    {"name": "DSAAttentionImpl", "file": "vllm_ascend/attention/abstract.py:L18", "responsibility": "昇腾自定义的 DSA 抽象基类(AttentionImpl[T] 子类)——DSA 不走 vLLM MLAAttentionImpl，自起一套；佐证「DSA 自带 AttentionMetadataBuilder」"},
+    {"name": "DeviceOperator / BaseDeviceAdaptor / A5DeviceAdaptor", "file": "vllm_ascend/device/device_op.py:L42,L785,L1663", "responsibility": "设备算子门面：模块级 DeviceOperator=get_device_adaptor() 按 AscendDeviceType 多态选 Base/A5；统一封装 reshape_and_cache/kv_cache_load/mla_preprocess_only_decode/execute_sparse_flash_attention_process/get_dsa_sparse_attn_op 等——注意力各章(ch19/ch20/ch21)共用的设备抽象层"}
+  ],
+  "data_flow": [
+    "ch18 路由：platform.py get_attn_backend_cls 按 (use_mla,use_sparse,use_compress) 查 backend_map → AscendSFABackend(T,T,F) 或 AscendDSABackend(T,F,T)（vLLM 主干无对位，是插件新增）",
+    "[SFA] AscendSFAMetadataBuilder.build（继承 MLACommonMetadataBuilder）：复用 ch20 MLA 元数据装配，产 cos/sin/block_table/attn_mask",
+    "[SFA] AscendSFAImpl.forward：MLA 式 q/kv 低秩 prolog（fused_qkv_a_proj → q_a_layernorm → _q_proj_and_k_up_proj 吸收 / exec_kv 写 KV cache，回指 ch20）",
+    "[SFA] indexer_select_pre_process(建 k_li) + indexer_select_post_process(建 q_li+RoPE) → DeviceOperator.indexer_select_post_process → npu_lightning_indexer(sparse_count=2048) 出 topk_indices",
+    "[SFA] _execute_sparse_flash_attention_process → DeviceOperator.execute_sparse_flash_attention_process → npu_sparse_flash_attention(sparse_indices=topk_indices) 只对 top-k 算 → _v_up_proj → o_proj",
+    "[DSA] AscendDSAMetadataBuilder.build：split_decodes_and_prefills 拆 decode/prefill → build_prefill_metadata / build_decode_metadata 各自 npu_quant_lightning_indexer_metadata(sparse_count=index_topk=512,sparse_mode=3) 建 qli_metadata + npu_sparse_attn_sharedkv_metadata 建 sas_metadata",
+    "[DSA] AscendDSAImpl.forward：hidden_states 拆 [decode|prefill] 两段，各调 _forward_decode/_forward_prefill",
+    "[DSA] _forward_prefill/_forward_decode：内联 MLA 式低秩 prolog(wq_a/wq_b/wkv/q_norm/kv_norm) → indexer_select_qli（compressor 建压缩 KV + 量化写 indexer cache）→ npu_quant_lightning_indexer(sparse_count=512) 出 compress_topk_idxs",
+    "[DSA] attn_op=npu_sparse_attn_sharedkv(cmp_sparse_indices=compress_topk_idxs) 只对 top-512 位置算注意力 → o_proj(wo_a/wo_b)",
+    "[共用] 上述 reshape_and_cache / 稀疏内核选择 / kv cache 解包 全经 DeviceOperator 门面按设备代际派发"
+  ],
+  "design_decisions": [
+    {"decision": "SFA 与 DSA 都是 vLLM 主干没有的「新增」后端，pairs vllm_paths 为空", "why": "稀疏注意力是昇腾在 MLA 之上叠加的能力，主干仅有标准/ MLA 后端；佐证 OOT 插件除了 monkey-patch「顶替」内核，还能经 entry-point 后端注册「增量扩展」出主干没有的算法", "evidence": "vllm_ascend/platform.py:L749-L750；cartography/outline-final.json ch21 pairs 为空"},
+    {"decision": "稀疏 = 轻量索引器先选 top-k、再只算 top-k 两段式", "why": "全长注意力对每个 query 要扫全部 L 个 KV，长上下文下 O(L) 主导开销；先用低维(head_dim=128, index_n_heads=64)轻量打分挑出最相关的少数 KV，把昂贵的全精度注意力限制在 top-k 个位置上，开销降到 O(top-k)", "evidence": "sfa_v1.py:L1328-L1347 + device_op.py:L451-L468；dsa_v1.py:L2683-L2704 + L2139-L2159"},
+    {"decision": "SFA 直接继承 vLLM MLAAttentionImpl/MLACommonMetadataBuilder；DSA 继承昇腾自有 DSAAttentionImpl + 自带 AttentionMetadataBuilder", "why": "SFA 是 MLA 的「稀疏增量」，复用 MLA 全套低秩压缩与权重吸收最省事；DSA(DeepSeek 新结构)带 compressor/indexer 双子模块、KV cache 多张量布局差异大，自起一套抽象更干净，但内部仍内联 MLA 式低秩 prolog", "evidence": "sfa_v1.py:L170,L390；dsa_v1.py:L343,L378 + abstract.py:L18"},
+    {"decision": "DSA index_topk(sparse_count)=512、SFA lightning indexer sparse_count=2048、统一 sparse_mode=3", "why": "DSA 与 SFA 用不同代际的 indexer 内核与 top-k 预算：DSA 取每 query 最相关 512 个 KV，SFA 取 2048；sparse_mode=3 是内核约定的稀疏模式（按 block_table 分页选择）。两值都来自模型 hf_config(index_topk)/内核常量，不可臆造为同一个", "evidence": "dsa_v1.py:L831-L832,L2697-L2698；device_op.py:L405-L406,L431-L432"},
+    {"decision": "DSA 元数据预建 + 缓存复用（prefill_ratio_to_sas_metadata/decode_ratio_to_sas_metadata 字典）", "why": "npu_quant_lightning_indexer_metadata / npu_sparse_attn_sharedkv_metadata 装配出的是与 batch 形状相关的索引元数据，按 compressor_ratio/decode-prefill 维度缓存，避免每步重算", "evidence": "dsa_v1.py:L817-L838（get('qli') is None 才建）"},
+    {"decision": "DeviceOperator 门面 = 注意力各章共用的设备多态层", "why": "reshape_and_cache、稀疏内核选择、kv cache 解包等在不同昇腾代际(A2/A5/A3)算子签名不同；用模块级 DeviceOperator=get_device_adaptor() 选 Base/A5 适配器，让 sfa/dsa/mla impl 写一份设备无关控制流（回指 ch19/ch20 已露脸）", "evidence": "device_op.py:L1663-L1670；sfa_v1.py:L37 import、L951/L1096 经门面调用"},
+    {"decision": "IndexCache（skip_topk/use_index_cache + topk_indices_buffer）跨层复用 top-k", "why": "相邻层 query 相关性相近，让带 indexer 的层算一次 top-k 写入 buffer、下游 skip_topk 层直接读，省去重复索引计算", "evidence": "sfa_v1.py:L1073-L1091,L1329-L1343；dsa_v1.py:L1532-L1550"}
+  ],
+  "theory": [
+    "复杂度：标准注意力每个 query 对全部 L 个 KV 做点积+softmax，单 query O(L·d)，整序列 O(L²·d)。稀疏注意力先用低维索引器对 L 个 KV 打分(O(L·d_idx), d_idx=128≪d)，取 top-k(k=512/2048)，再仅对 k 个 KV 做全精度注意力 O(k·d)。当 L≫k 时单 query 主导项从 O(L·d) 降到 O(L·d_idx + k·d)——索引打分仍是 O(L) 但用极小 d_idx、且高精度注意力被钉在常数 k 上，长上下文收益显著。",
+    "索引器为何能轻量：indexer 用独立的小投影(index_n_heads=64, index_head_dim=128)和 RoPE 算一个「相关性代理分数」，不需要完整的 num_heads × head_dim 注意力；DSA 还先经 compressor 把 KV 压成更短的代表(cmp_ratio=4/128)再打分，进一步压索引开销。",
+    "为何建在 MLA 之上：MLA 已把 KV 压成低秩 latent(kv_lora_rank)，稀疏注意力在该 latent KV cache 上做 top-k 选择与稀疏 flash，省显存又省带宽——稀疏(选哪些)与低秩(每个存多小)两个正交维度叠加。",
+    "近似代价：top-k 是有损近似，遗漏 top-k 外但本应有贡献的 KV 会引入误差；sparse_count 的取值(512/2048)是精度/速度权衡点，模型(DeepSeek-V3.2/V4)在训练侧已适配该稀疏度。"
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {"what": "全部 CP/上下文并行分支：enable_dsa_cp / enable_dsa_cp_with_layer_shard / enable_dsa_cp_with_o_proj_tp、DSACPContext 装配、all_gather_async、_handle_o_proj_weight_switch_and_forward、sfa_cp/dsa_cp 子类导入", "why_safe": "CP 是多卡切分优化，不改稀疏注意力的算法本质；精简版跑单卡控制流即可，删后 SFA/DSA 主路径(选 top-k→稀疏算)完整保留"},
+      {"what": "MLAPO 融合与 A5 代际全部变体：enable_mlapo、_process_weights_for_fused_mlapo / _a5 / _a5_float、_sfa_preprocess_with_mlapo、A5DeviceAdaptor 各 override、A5 的 npu_dynamic_mx_quant o_proj 旁支", "why_safe": "MLAPO 是把 prolog 多算子融成一个的性能优化，A5 是新代际算子签名分叉；保 native(非 mlapo)主路 + BaseDeviceAdaptor 即可讲清机制，A5 正文一句话点到（选讲）"},
+      {"what": "use_sparse_c8_indexer（INT8/FP8 量化索引）整条：q_hadamard/k_hadamard、npu_dynamic_quant、npu_lightning_indexer_quant 分支、kv_cache 3↔4 元组切换、store_kv_block/c8_enable_reshape_optim", "why_safe": "C8 是索引器的量化加速变体，与「选 top-k」语义无关；保非量化 default 分支(npu_lightning_indexer)即可，量化正文一句话带过"},
+      {"what": "多流重叠：multistream_dsv4_dsa_overlap / multistream_dsa_preprocess / prefill_comm_compute_overlap、cv_indexer_select_qli、_mla_prolog_multistream、_mla_prolog_prefill_overlap、dsa_warmup_with_multistream、CVLinearWrapper 拆 V/C", "why_safe": "纯调度层 V/C/AIV 并行优化，结果与串行等价；精简版保 indexer_select_qli(串行版) 主路"},
+      {"what": "drafting/投机解码 metadata：build_for_drafting / build_prefill_metadata_for_drafting / build_decode_metadata_for_drafting、speculative_config 分支、spec_slot_mapping", "why_safe": "投机解码是 ch 之外主题，删后正常 prefill/decode 元数据装配完整"},
+      {"what": "compress_ratio 的 <=1 与 128 旁支（DSA _forward_prefill/_forward_decode 与 build_*_metadata 的三档分支）", "why_safe": "保 compress_ratio==4 这条带 cmp_sparse_indices 的主稀疏路；<=1(纯滑窗无稀疏)/128 是模型变体配置，正文一句话交代三档"},
+      {"what": "KV connector / PD-disagg 钩子：wait_for_kv_layer_from_connector / maybe_save_kv_layer_to_connector / is_kv_producer / reshape_cache_event；weight_prefetch 预取", "why_safe": "PD 分离与权重预取是 ch10-12/性能主题，删后单机 KV 写读完整"},
+      {"what": "IndexCache 复用：skip_topk / use_index_cache / topk_indices_buffer / _get_indexcache_topk_indices / _update_indexcache_topk_indices", "why_safe": "跨层共享 top-k 的缓存优化，删后每层各自算 top-k，语义等价；正文一句话点到设计意图"}
+    ],
+    "must_keep": [
+      {"symbol": "AscendSFABackend", "why": "ch18 路由落点，SFA 后端入口"},
+      {"symbol": "AscendSFAMetadataBuilder", "why": "必须保留以体现继承 MLACommonMetadataBuilder（建在 MLA 之上）"},
+      {"symbol": "AscendSFAImpl", "why": "SFA 主 impl，必须可见其继承 MLAAttentionImpl"},
+      {"symbol": "indexer_select_pre_process", "why": "SFA 索引器 key 侧投影，读者需理解 top-k 选择的输入怎么来"},
+      {"symbol": "indexer_select_post_process", "why": "SFA 索引器 query 侧 + 触发 lightning indexer 的入口"},
+      {"symbol": "_execute_sparse_flash_attention_process", "why": "SFA「只对 top-k 算」的落点"},
+      {"symbol": "AscendDSABackend", "why": "ch18 路由落点，DSA 后端入口"},
+      {"symbol": "AscendDSAMetadataBuilder", "why": "DSA 自带 builder，须见其继承 AttentionMetadataBuilder（非 MLA builder）"},
+      {"symbol": "build_prefill_metadata", "why": "DSA prefill 路 indexer 元数据装配，章节立意点名"},
+      {"symbol": "build_decode_metadata", "why": "DSA decode 路 indexer 元数据装配，章节立意点名"},
+      {"symbol": "npu_quant_lightning_indexer_metadata", "why": "Lightning Indexer 元数据算子，sparse_count=512/sparse_mode=3 的承载点，章节核心符号"},
+      {"symbol": "AscendDSAImpl", "why": "DSA 主 impl，须见其继承 DSAAttentionImpl"},
+      {"symbol": "indexer_select_qli", "why": "DSA 串行版 Lightning Indexer 选择主路"},
+      {"symbol": "_indexer_qli", "why": "DSA 调 npu_quant_lightning_indexer 出 top-512 的落点"},
+      {"symbol": "index_topk", "why": "DSA top-k 预算=512，须保留以钉死稀疏度数值"},
+      {"symbol": "_forward_prefill", "why": "DSA prefill 稀疏注意力主路"},
+      {"symbol": "_forward_decode", "why": "DSA decode 稀疏注意力主路"},
+      {"symbol": "DeviceOperator", "why": "设备算子门面，注意力各章共用，章节立意(4)点名"},
+      {"symbol": "get_dsa_sparse_attn_op", "why": "DSA 稀疏内核(npu_sparse_attn_sharedkv)选择门面方法"},
+      {"symbol": "execute_sparse_flash_attention_process", "why": "DeviceOperator 上 SFA 稀疏内核(npu_sparse_flash_attention)封装"},
+      {"symbol": "reshape_and_cache", "why": "门面共用方法(回指 ch19/ch20)，立意(4)点名"},
+      {"symbol": "get_device_adaptor", "why": "门面按设备代际多态选 Base/A5 的派发点"}
+    ]
+  },
+  "diagram_plan": [
+    {"name": "ch21-sparse-two-stage", "type": "flow", "spec": "两段式稀疏注意力总览：左输入 query+全长 KV cache(L 个位置) → [阶段一 轻量 Lightning Indexer: 低维投影打分 → 选 top-k(DSA 512 / SFA 2048)] → top-k 索引 → [阶段二 稀疏 flash 注意力: 只对 top-k 个 KV 算全精度注意力] → 输出。下方对照标注 O(L²) 全长 vs O(L·d_idx+k·d) 稀疏。强调 KV cache 是 ch20 的 MLA 低秩 latent。", "roadmap_highlight": "ch21"},
+    {"name": "ch21-sfa-vs-dsa-inherit", "type": "class-relation", "spec": "继承关系对照图：左 SFA——AscendSFAMetadataBuilder→(继承)→MLACommonMetadataBuilder(ch20)、AscendSFAImpl→MLAAttentionImpl(vLLM)，标注「直接复用 MLA 全套」；右 DSA——AscendDSAMetadataBuilder→AttentionMetadataBuilder(vLLM)、AscendDSAImpl→DSAAttentionImpl(昇腾自有 abstract.py)，标注「自起一套，内联 MLA 式低秩 prolog」；中间共用底座 DeviceOperator 门面(Base/A5)。顶部横幅：vLLM 主干无对位后端（插件增量扩展）。", "roadmap_highlight": "ch21"},
+    {"name": "ch21-dsa-forward-pipeline", "type": "sequence", "spec": "DSA forward 时序：hidden_states 拆 [decode|prefill] → (build 期已预建 qli_metadata/sas_metadata, sparse_count=512) → 低秩 prolog(wq_a/wq_b/wkv) → indexer_select_qli(compressor 压缩 KV + 量化写 indexer cache) → npu_quant_lightning_indexer→compress_topk_idxs(512) → npu_sparse_attn_sharedkv(cmp_sparse_indices=512) → wo_a/wo_b。标注哪步在 build(元数据)、哪步在 forward(算)。", "roadmap_highlight": "ch21"}
+  ],
+  "foreshadow_due": {"应埋": [], "应回收": [], "note": "bible.py due ch21 返回空（无登记的应埋/应回收项）。但本章天然回指：ch18(后端路由 use_sparse/use_compress→SFA/DSA)、ch20(MLA 低秩 KV 压缩与 prefill/decode 拆分被 SFA/DSA 复用)、ch19/ch20(DeviceOperator 门面已露脸)。建议 writer 在叙事里显式回收这三处。"}
+}
