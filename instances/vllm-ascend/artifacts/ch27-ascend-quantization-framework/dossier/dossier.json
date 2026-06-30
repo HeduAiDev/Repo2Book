@@ -1,0 +1,252 @@
+{
+  "chapter_id": "ch27",
+  "title": "昇腾量化框架：把 NPU 量化方案接进 vLLM",
+  "thesis": "量化是 OOT「注册表 + 适配器」范式最干净的实证：一张 scheme 注册表（(quant_type, layer_type) -> SchemeClass）+ 三个适配 vLLM 基类的 wrapper（AscendLinearMethod / AscendKVCacheMethod / AscendFusedMoEMethod），把昇腾的 W8A8/W4A8/MXFP 整套量化方案接进 vLLM，不改 vLLM 量化框架一行。承接 ch23 算子顶替、ch26 FusedMoE（量化 MoE 经 AscendFusedMoEMethod）。",
+
+  "code_spine": [
+    "vllm_ascend/quantization/modelslim_config.py:L401-L408  @register_quantization_config(ASCEND_QUANTIZATION_METHOD) 把 AscendModelSlimConfig(QuantizationConfig) 注进 vLLM 量化注册表（入口1）",
+    "vllm_ascend/quantization/compressed_tensors_config.py:L41-L53  _remove_quantization_method() 先删 vLLM 原版 compressed-tensors，再 @register_quantization_config 替换（入口2）",
+    "vllm_ascend/quantization/fp8_config.py:L18-L25,L56-L57,L124-L125  remove_quantization_method() 删原版 fp8/deepseek_v4_fp8，@register_quantization_config(FP8_METHOD) 替换（入口3）",
+    "vllm_ascend/quantization/modelslim_config.py:L512-L581  AscendModelSlimConfig.get_quant_method(layer, prefix)：按 layer 类型（LinearBase / AttentionLayerBase / FusedMoE / VocabParallelEmbedding）分发",
+    "vllm_ascend/quantization/modelslim_config.py:L297-L398  get_linear_quant_type / get_quant_type_for_layer / create_scheme_for_layer：从 quant_description 逐层查出 quant_type，再经 registry 取 scheme",
+    "vllm_ascend/quantization/methods/registry.py:L21-L62  _SCHEME_REGISTRY + register_scheme 装饰器 + get_scheme_class：(quant_type, layer_type) -> SchemeClass",
+    "vllm_ascend/quantization/methods/w8a8_dynamic.py:L48-L54  @register_scheme(\"W8A8_DYNAMIC\", \"linear\") class AscendW8A8DynamicLinearMethod(AscendLinearScheme)：注册进表的具体 scheme",
+    "vllm_ascend/quantization/method_adapters.py:L37-L162  AscendLinearMethod(LinearMethodBase)：create_weights 按 scheme 造量化权重+scale；apply 调 scheme.apply 跑量化 matmul",
+    "vllm_ascend/quantization/methods/w8a8_dynamic.py:L59-L123  scheme 的 get_weight/get_perchannel_param/apply：int8 权重 + per-channel scale；apply 走 npu_dynamic_quant + npu_quant_matmul（NPU 硬特化）",
+    "vllm_ascend/quantization/method_adapters.py:L201-L298  AscendFusedMoEMethod(FusedMoEMethodBase)：量化版 MoE（承接 ch26 FusedMoE）",
+    "vllm_ascend/quantization/methods/base.py:L42-L298  三个 scheme 基类 AscendLinearScheme / AscendAttentionScheme / AscendMoEScheme（ABC）"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm_ascend/quantization/methods/registry.py",
+      "lines": "L20-L62",
+      "what": "scheme 注册表本体：一个 dict + 一个装饰器 + 一个查表函数。这是整章「注册表范式」的核心数据结构。",
+      "code": "# Registry: maps (quant_type, layer_type) -> SchemeClass\n_SCHEME_REGISTRY: dict[tuple[str, str], type[Any]] = {}\n\n\ndef register_scheme(quant_type: str, layer_type: str):\n    \"\"\"Decorator to register a quantization scheme.\n\n    Example:\n        @register_scheme(\"W8A8_DYNAMIC\", \"linear\")\n        class W8A8DynamicLinearScheme(AscendLinearScheme):\n            ...\n    \"\"\"\n\n    def decorator(cls: type[Any]) -> type[Any]:\n        key = (quant_type, layer_type)\n        if key in _SCHEME_REGISTRY:\n            raise ValueError(\n                f\"Scheme already registered for {quant_type}/{layer_type}: {_SCHEME_REGISTRY[key].__name__}\"\n            )\n        _SCHEME_REGISTRY[key] = cls\n        return cls\n\n    return decorator\n\n\ndef get_scheme_class(quant_type: str, layer_type: str) -> type[Any] | None:\n    \"\"\"Get scheme class for given quant_type and layer_type.\"\"\"\n    return _SCHEME_REGISTRY.get((quant_type, layer_type))",
+      "elide": ["删去了 register_scheme/get_scheme_class 的 Args/Returns docstring 细节，保留 Example 与控制流"]
+    },
+    {
+      "path": "vllm_ascend/quantization/modelslim_config.py",
+      "lines": "L401-L424",
+      "what": "入口1：@register_quantization_config(ASCEND_QUANTIZATION_METHOD='ascend') 把 AscendModelSlimConfig(QuantizationConfig) 注进 vLLM 量化注册表。继承 vLLM 基类、只实现钩子方法——OOT 注册的起点。",
+      "code": "@register_quantization_config(ASCEND_QUANTIZATION_METHOD)\nclass AscendModelSlimConfig(QuantizationConfig):\n    \"\"\"Config class for Ascend ModelSlim quantization.\n\n    This class is a general class that parses quantization configs\n    that are supported on Ascend hardware, specifically for models\n    quantized using the ModelSlim tool.\n    \"\"\"\n\n    def __init__(self, quant_config: dict[str, Any] | None = None):\n        super().__init__()\n        self.quant_description = quant_config if quant_config is not None else {}\n        self._apply_extra_quant_adaptations()\n        self.model_type: str | None = None\n        self.hf_to_vllm_mapper: WeightsMapper | None = None\n        self._mapper_applied = False\n        self._add_kvcache_quant_metadata()\n\n    @classmethod\n    def get_name(cls) -> str:\n        return ASCEND_QUANTIZATION_METHOD",
+      "elide": ["摘录在 __init__(止于 L417) 与 get_name(L422) 之间静默跳过了 __repr__（L419-L420，仅返回类名前缀字符串）——读者勿误判 L417→L422 连续", "get_supported_act_dtypes、get_min_capability 等 L424 之后的样板分类方法亦省略"]
+    },
+    {
+      "path": "vllm_ascend/quantization/compressed_tensors_config.py",
+      "lines": "L41-L52",
+      "what": "入口2 的「先删后替换」手法：vLLM 内置已有 'compressed-tensors' 方法，昇腾先从 QUANTIZATION_METHODS 移除原版，再用同名注册自己的 Config 顶替。fp8_config.py 对 'fp8' 同理。",
+      "code": "# Remove the original compressed_tensors method to replace with our implementation\ndef _remove_quantization_method():\n    if COMPRESSED_TENSORS_METHOD in QUANTIZATION_METHODS:\n        QUANTIZATION_METHODS.remove(COMPRESSED_TENSORS_METHOD)\n\n\n_remove_quantization_method()\n\nQUANTIZATION_SCHEME_MAP_TYPE = dict[str, dict[str, \"QuantizationArgs\"] | None]\n\n\n@register_quantization_config(COMPRESSED_TENSORS_METHOD)\nclass AscendCompressedTensorsConfig(QuantizationConfig):",
+      "elide": []
+    },
+    {
+      "path": "vllm_ascend/quantization/fp8_config.py",
+      "lines": "L18-L25,L56-L57,L124-L125",
+      "what": "入口3：fp8 同样「先删 vLLM 原版 fp8 / deepseek_v4_fp8 再替换」，并复用同一个 Config 给 deepseek_v4_fp8 别名注册。三入口注册手法完全一致。",
+      "code": "def remove_quantization_method():\n    if FP8_METHOD in QUANTIZATION_METHODS:\n        QUANTIZATION_METHODS.remove(FP8_METHOD)\n    if \"deepseek_v4_fp8\" in QUANTIZATION_METHODS:\n        QUANTIZATION_METHODS.remove(\"deepseek_v4_fp8\")\n\n\nremove_quantization_method()\n\n# ...\n\n@register_quantization_config(FP8_METHOD)\nclass AscendFp8Config(QuantizationConfig):\n\n# ... (文件末尾) ...\n\n# deepseek_v4_fp8 is handled identically to fp8 on Ascend — reuse the same config.\nregister_quantization_config(\"deepseek_v4_fp8\")(AscendFp8Config)",
+      "elide": ["中间 AscendFp8Config 类体省略，只示意三处注册手法"]
+    },
+    {
+      "path": "vllm_ascend/quantization/modelslim_config.py",
+      "lines": "L512-L581",
+      "what": "按层分发的总枢纽：vLLM 为每个 layer 调 get_quant_method(layer, prefix)。这里按 isinstance(layer, ...) 把 linear / attention(fa/indexer/C8) / FusedMoE / embedding 分别造出 scheme，再包进对应 wrapper。FLOAT 层走未量化方法（跳过）。",
+      "code": "    def get_quant_method(self, layer: torch.nn.Module, prefix: str, tid2eid=None) -> Optional[\"QuantizeMethodBase\"]:\n        from .method_adapters import (\n            AscendEmbeddingMethod,\n            AscendFusedMoEMethod,\n            AscendKVCacheMethod,\n            AscendLinearMethod,\n        )\n\n        vllm_config = get_current_vllm_config()\n        model_type = vllm_config.model_config.hf_config.model_type\n\n        # ... model_type 专属 prefix 改写（minimax / bailing_hybrid）省略 ...\n        if model_type in packed_modules_model_mapping:\n            self.packed_modules_mapping = packed_modules_model_mapping[model_type]\n        prefix = self.quant_prefix_mapper(model_type, prefix)\n\n        if isinstance(layer, LinearBase):\n            if self.is_layer_skipped_ascend(prefix, self.packed_modules_mapping):\n                from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod\n                return AscendUnquantizedLinearMethod()\n            scheme = create_scheme_for_layer(self.quant_description, prefix, \"linear\", self.packed_modules_mapping)\n            return AscendLinearMethod(scheme)\n        elif isinstance(layer, AttentionLayerBase) and (\n            self.is_fa_quant_layer(prefix) or self.is_indexer_quant_layer(prefix)\n        ):\n            scheme = create_scheme_for_layer(self.quant_description, prefix, \"attention\", self.packed_modules_mapping)\n            return AscendKVCacheMethod(scheme)\n        elif isinstance(layer, AttentionLayerBase) and self.is_c8_quant_layer(prefix):\n            from .methods.kv_c8 import AscendC8KVCacheAttentionMethod\n            return AscendKVCacheMethod(AscendC8KVCacheAttentionMethod(self.quant_description, prefix))\n        elif isinstance(layer, FusedMoE):\n            if self.is_layer_skipped_ascend(prefix, self.packed_modules_mapping):\n                from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod\n                return AscendUnquantizedFusedMoEMethod(layer.moe_config)\n            scheme = create_scheme_for_layer(self.quant_description, prefix, \"moe\", self.packed_modules_mapping)\n            return AscendFusedMoEMethod(scheme, layer.moe_config, tid2eid)\n        elif isinstance(layer, VocabParallelEmbedding):\n            if self.is_layer_skipped_ascend(prefix, self.packed_modules_mapping):\n                return UnquantizedEmbeddingMethod()\n            scheme = create_scheme_for_layer(self.quant_description, prefix, \"linear\", self.packed_modules_mapping)\n            return AscendEmbeddingMethod(scheme)\n        return None",
+      "elide": ["minimax/minimax_m2 与 bailing_hybrid 的 prefix.replace 改写、logger.debug 选路日志可省略（讲清分发四岔即可）"]
+    },
+    {
+      "path": "vllm_ascend/quantization/modelslim_config.py",
+      "lines": "L297-L331",
+      "what": "逐层解析：从 ModelSlim 生成的 quant_description（即 quant_model_description.json 解析出的 dict）里按 prefix 查出该层量化类型字符串（如 'W8A8_DYNAMIC'）。融合层（qkv_proj/gate_up_proj 等）要求各 shard 量化类型一致，否则报错。",
+      "code": "def get_linear_quant_type(\n    quant_description: dict[str, Any], prefix: str, packed_modules_mapping: dict[str, Any]\n) -> str | None:\n    \"\"\"Determine the quantization type for a linear layer.\"\"\"\n    proj_name = prefix.split(\".\")[-1]\n    if proj_name in packed_modules_mapping:\n        quant_type = None\n        shard_prefixes = [\n            prefix.replace(proj_name, shard_proj_name) for shard_proj_name in packed_modules_mapping[proj_name]\n        ]\n        for shard_prefix in shard_prefixes:\n            shard_quant_type = quant_description[shard_prefix + \".weight\"]\n\n            if quant_type is None:\n                quant_type = shard_quant_type\n            elif shard_quant_type != quant_type:\n                err_msg = (\n                    f\"Not all shards of {prefix} are quantized with same quant type. \"\n                    f\"Shard {proj_name} uses {shard_quant_type}, but another shard \"\n                    f\"uses {quant_type}. Please check quantization config.\"\n                )\n                logger.error(err_msg)\n                raise ValueError(err_msg)\n    else:\n        quant_type = quant_description[prefix + \".weight\"]\n    return quant_type",
+      "elide": ["函数 docstring 的 Args/Returns 细节省略"]
+    },
+    {
+      "path": "vllm_ascend/quantization/modelslim_config.py",
+      "lines": "L366-L398",
+      "what": "解析→选 scheme 的合流点：拿到 quant_type 后用 get_scheme_class(quant_type, layer_type) 查注册表，查到就实例化返回，查不到抛 NotImplementedError。这把「逐层解析」和「注册表」缝在一起。",
+      "code": "def create_scheme_for_layer(\n    quant_description: dict[str, Any],\n    prefix: str,\n    layer_type: str,\n    packed_modules_mapping: dict[str, Any] | None = None,\n):\n    \"\"\"Create a quantization scheme instance for a layer.\"\"\"\n    logger.info_once(\"Using the vLLM Ascend modelslim Quantization now!\")\n    quant_type = get_quant_type_for_layer(quant_description, prefix, layer_type, packed_modules_mapping)\n\n    if quant_type is None:\n        err_msg = f\"Could not determine quantization type for layer {prefix} (layer_type={layer_type}).\"\n        logger.error(err_msg)\n        raise ValueError(err_msg)\n\n    # Use registry to get scheme class\n    scheme_cls = get_scheme_class(quant_type, layer_type)\n    if scheme_cls is not None:\n        return scheme_cls()\n\n    err_msg = f\"Currently, vLLM Ascend doesn't support quant_type={quant_type} for layer_type={layer_type}.\"\n    logger.error(err_msg)\n    raise NotImplementedError(err_msg)",
+      "elide": []
+    },
+    {
+      "path": "vllm_ascend/quantization/method_adapters.py",
+      "lines": "L37-L98",
+      "what": "适配器 wrapper 1：AscendLinearMethod(LinearMethodBase)。__init__ 把 scheme 存进 self.quant_method。create_weights 不自己决定权重形状——全转交给 scheme（get_weight / get_pertensor_param / get_perchannel_param / get_pergroup_param），按返回的 dict 逐个 register_parameter。这是「适配器只搬运、scheme 才决定」的关键证据。",
+      "code": "class AscendLinearMethod(LinearMethodBase):\n    \"\"\"Linear method for Ascend quantization.\n\n    This wrapper class delegates to the actual quantization scheme implementation.\n    The scheme is determined by the Config class and passed directly to this wrapper.\n    \"\"\"\n\n    def __init__(self, scheme: AscendLinearScheme) -> None:\n        self.quant_method = scheme\n        self._enable_dsa_cp_with_layer_shard = enable_dsa_cp_with_layer_shard()\n\n    def create_weights(\n        self,\n        layer: torch.nn.Module,\n        input_size_per_partition: int,\n        output_partition_sizes: list[int],\n        input_size: int,\n        output_size: int,\n        params_dtype: torch.dtype,\n        **extra_weight_attrs,\n    ) -> None:\n        output_size_per_partition = sum(output_partition_sizes)\n        weight_loader = extra_weight_attrs.get(\"weight_loader\")\n\n        weight_dict = self.quant_method.get_weight(input_size_per_partition, output_size_per_partition, params_dtype)\n\n        # Extract packing information (if present)\n        packed_dim = weight_dict.pop(\"_packed_dim\", None)\n        packed_factor = weight_dict.pop(\"_packed_factor\", None)\n\n        for weight_name, weight_param in weight_dict.items():\n            param = torch.nn.Parameter(weight_param, requires_grad=False)\n            set_weight_attrs(param, {\"input_dim\": 1, \"output_dim\": 0})\n            if packed_dim is not None and packed_factor is not None:\n                set_weight_attrs(param, {\"packed_dim\": packed_dim, \"packed_factor\": packed_factor})\n            layer.register_parameter(weight_name, param)\n            set_weight_attrs(param, extra_weight_attrs)\n\n        pertensor_dict = self.quant_method.get_pertensor_param(params_dtype, layer_type=layer_type)\n        # ... register pertensor (input_scale 等) ...\n\n        perchannel_dict = self.quant_method.get_perchannel_param(output_size_per_partition, params_dtype)\n        for perchannel_name, perchannel_param in perchannel_dict.items():\n            param = torch.nn.Parameter(perchannel_param, requires_grad=False)\n            set_weight_attrs(param, {\"output_dim\": 0})\n            layer.register_parameter(perchannel_name, param)\n            set_weight_attrs(param, extra_weight_attrs)",
+      "elide": ["pertensor / pergroup 两段 register 的完整循环、layer_type='row'/'others' 分支、weight_scale_second/is_mx_quant_type 的 input_dim=1 处理可摘要——讲清「scheme 给字典、wrapper 逐个注册」即可；W4A8/MXFP 的 per-group scale 在 theory 里点出"]
+    },
+    {
+      "path": "vllm_ascend/quantization/method_adapters.py",
+      "lines": "L124-L162",
+      "what": "适配器 apply：算 tp_rank（按 o_proj/down_proj 等并行场景选 rank），其余原样转交 scheme.apply(layer, x, bias, tp_rank)。前向计算 wrapper 完全不碰，全在 scheme 里。",
+      "code": "    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:\n        if hasattr(self.quant_method, \"process_weights_after_loading\"):\n            self.quant_method.process_weights_after_loading(layer)\n\n    def apply(\n        self,\n        layer: torch.nn.Module,\n        x: torch.Tensor,\n        bias: torch.Tensor | None = None,\n    ) -> torch.Tensor:\n        if isinstance(layer, RowParallelLinear):\n            # ... 按 o_proj/down_proj/out_proj + 各并行开关选 tp_rank（多分支省略）...\n            tp_rank = get_tensor_model_parallel_rank()\n        else:\n            tp_rank = 0\n        return self.quant_method.apply(layer, x, bias, tp_rank)",
+      "elide": ["摘录在 process_weights_after_loading(L126) 与 apply(L140) 之间静默跳过了 get_computed_params 方法（L128-L138，返回 {weight_offset,quant_bias,deq_scale,weight_scale} 等『计算得出而非加载』的参数名集合）——非本章主线，读者勿误判 L126→L140 连续", "RowParallelLinear 下 oproj_tp_enable/mlp_tp_enable/flashcomm2/dsa_cp 的 5 个 tp_rank 选路分支细节省略，保留「非 row 则 tp_rank=0、最后转交 scheme.apply」骨架"]
+    },
+    {
+      "path": "vllm_ascend/quantization/methods/w8a8_dynamic.py",
+      "lines": "L48-L71",
+      "what": "走通全链的 scheme（linear 侧）：@register_scheme('W8A8_DYNAMIC','linear') 注进表。get_weight 造 int8 权重 [output, input]；get_perchannel_param 造 per-channel 的 weight_scale/weight_offset [output, 1]。这正是 create_weights 转交时要的「量化权重 + scale」。",
+      "code": "@register_scheme(\"W8A8_DYNAMIC\", \"linear\")\nclass AscendW8A8DynamicLinearMethod(AscendLinearScheme):\n    \"\"\"Linear method for Ascend W8A8_DYNAMIC.\n\n    This scheme uses dynamic per-token quantization for activations\n    and per-channel quantization for weights.\n    \"\"\"\n\n    def __init__(self):\n        pass\n\n    def get_weight(self, input_size: int, output_size: int, params_dtype: torch.dtype) -> dict[str, Any]:\n        params_dict = {\"weight\": torch.empty(output_size, input_size, dtype=torch.int8)}\n        return params_dict\n\n    def get_perchannel_param(\n        self,\n        output_size: int,\n        params_dtype: torch.dtype,\n    ) -> dict[str, Any]:\n        params_dict = {}\n        params_dict[\"weight_scale\"] = torch.empty(output_size, 1, dtype=params_dtype)\n        params_dict[\"weight_offset\"] = torch.empty(output_size, 1, dtype=params_dtype)\n        return params_dict",
+      "elide": []
+    },
+    {
+      "path": "vllm_ascend/quantization/methods/w8a8_dynamic.py",
+      "lines": "L73-L123",
+      "what": "全链终点 apply：动态量化激活 npu_dynamic_quant(x) 得 int8 quantized_x + per-token pertoken_scale，再 npu_quant_matmul(int8 权重, weight_scale, pertoken_scale) 出回 x.dtype。两个算子都是 torch_npu 提供的 NPU 硬特化 kernel（host 无法真跑，需 NPU/CANN）。chunk_size 大权重切分分支可省略。",
+      "code": "    def apply(\n        self,\n        layer: torch.nn.Module,\n        x: torch.Tensor,\n        bias: torch.Tensor | None = None,\n        tp_rank: int | None = 0,\n    ) -> torch.Tensor:\n        quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x)\n        need_unsqz = False\n        if pertoken_scale.dim() == 2:\n            need_unsqz = True\n            quantized_x = quantized_x.squeeze(dim=1)\n            pertoken_scale = pertoken_scale.squeeze(dim=1)\n\n        chunk_size = getattr(layer, \"_chunk_size\", 0)\n        if isinstance(chunk_size, int) and chunk_size > 0:\n            # ... 大权重（>=65536）切两半各跑一次 npu_quant_matmul 再 cat（省略）...\n            pass\n        else:\n            output = torch_npu.npu_quant_matmul(\n                quantized_x,\n                layer.weight,\n                layer.weight_scale,\n                pertoken_scale=pertoken_scale,\n                bias=bias,\n                output_dtype=x.dtype,\n            )\n        if need_unsqz:\n            output = output.unsqueeze(dim=1)\n        return output",
+      "elide": ["_chunk_size>0 的 wq_b 大权重切两半分支（weight_1/weight_2）省略，保留 else 主路径 npu_quant_matmul"]
+    },
+    {
+      "path": "vllm_ascend/quantization/methods/w8a8_dynamic.py",
+      "lines": "L125-L149",
+      "what": "process_weights_after_loading：把加载好的 int8 权重转置 + 转 NZ 格式（昇腾算子要的内存排布），weight_scale flatten 并备一份 fp32。讲清「权重落盘是 [out,in]，跑前要转成算子友好排布」即可。",
+      "code": "    def process_weights_after_loading(self, layer):\n        layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()\n        if \"wq_b\" in getattr(layer, \"prefix\", \"\") and layer.weight.shape[1] >= 65536 and enable_dsa_cp():\n            # ... DSA-CP 大权重切两半的 workaround（省略）...\n            pass\n        else:\n            # cast quantized weight tensors in NZ format for higher inference speed\n            layer.weight.data = maybe_trans_nz(layer.weight.data)\n            layer.weight_scale.data = layer.weight_scale.data.flatten()\n            layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)\n            layer.weight_offset.data = layer.weight_offset.data.flatten()",
+      "elide": ["wq_b/enable_dsa_cp 的 chunk 分支细节省略"]
+    },
+    {
+      "path": "vllm_ascend/quantization/method_adapters.py",
+      "lines": "L201-L248",
+      "what": "适配器 wrapper 3：AscendFusedMoEMethod(FusedMoEMethodBase)——量化版 MoE 走这里（承接 ch26 FusedMoE）。create_weights 同样把权重/scale 形状全转交 scheme.get_weight + get_dynamic_quant_param，逐 expert 注册 w13/w2 的 int8 权重与 per-channel scale。",
+      "code": "class AscendFusedMoEMethod(FusedMoEMethodBase):\n    \"\"\"FusedMoE method for Ascend quantization.\n\n    This wrapper class delegates to the actual MoE quantization scheme.\n    \"\"\"\n\n    def __init__(self, scheme: AscendMoEScheme, moe_config: FusedMoEConfig, tid2eid=None) -> None:\n        super().__init__(moe_config)\n        self.quant_method = scheme\n        self.tid2eid = tid2eid\n\n    def create_weights(\n        self,\n        layer: torch.nn.Module,\n        num_experts: int,\n        hidden_size: int,\n        intermediate_size_per_partition: int,\n        params_dtype: torch.dtype,\n        **extra_weight_attrs,\n    ) -> None:\n        weight_param = self.quant_method.get_weight(\n            num_experts, intermediate_size_per_partition, hidden_size, params_dtype\n        )\n        for param_key, param_value in weight_param.items():\n            param = torch.nn.Parameter(param_value, requires_grad=False)\n            layer.register_parameter(param_key, param)\n            set_weight_attrs(param, extra_weight_attrs)\n\n        extra_weight_attrs.update({\"quant_method\": FusedMoeWeightScaleSupported.CHANNEL.value})\n        # ... per_group_param 判定 + 逐个注册 dynamic_quant_param（weight_scale/offset），\n        #     group_size>0 的 GROUP 模式标注省略 ...",
+      "elide": ["apply 的 ~25 个透传参数、get_dynamic_quant_param 注册循环、supports_eplb/get_fused_moe_quant_config 省略；apply 本质是把所有 MoE 参数原样转交 scheme.apply（外加 tid2eid）"]
+    },
+    {
+      "path": "vllm_ascend/quantization/method_adapters.py",
+      "lines": "L165-L198",
+      "what": "适配器 wrapper 2：AscendKVCacheMethod(BaseKVCacheMethod)——KV cache 量化。注释点明：与 linear 不同，attention 在 vLLM 没有权重切分步骤，整个 create_weights 都藏进具体 scheme 里。apply 原样转交。",
+      "code": "class AscendKVCacheMethod(BaseKVCacheMethod):\n    \"\"\"KVCache method for Ascend quantization.\n\n    This wrapper class delegates to the actual attention quantization scheme.\n    \"\"\"\n\n    def __init__(self, scheme: AscendAttentionScheme) -> None:\n        self.quant_method = scheme\n\n    def create_weights(self, layer: torch.nn.Module) -> None:\n        # Different from linear method, there are no weight processing/slicing\n        # steps for attention in vllm. So the whole process of create weights\n        # is hidden into the specific quant method.\n        self.quant_method.create_weights(layer)\n\n    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:\n        self.quant_method.process_weights_after_loading(layer)\n\n    def apply(\n        self, layer, query, key, value, kv_cache, attn_metadata, attn_type, scale, output,\n    ) -> torch.Tensor:\n        return self.quant_method.apply(layer, query, key, value, kv_cache, attn_metadata, attn_type, scale, output)",
+      "elide": ["apply 的完整参数类型注解可简写"]
+    },
+    {
+      "path": "vllm_ascend/quantization/methods/base.py",
+      "lines": "L42-L63,L105-L120",
+      "what": "scheme 的契约（linear 侧 ABC）：AscendLinearScheme 强制子类实现 get_weight + apply，其余 get_pertensor/perchannel/pergroup_param 有默认空实现。这解释了 wrapper 为何能盲转交——契约固定，scheme 各自填。",
+      "code": "class AscendLinearScheme(ABC):\n    \"\"\"Base class for all linear quantization schemes.\n\n    Subclasses must implement get_weight() and apply() methods.\n    Other methods have default implementations that return empty dicts\n    or do nothing.\n    \"\"\"\n\n    @abstractmethod\n    def get_weight(self, input_size: int, output_size: int, params_dtype: torch.dtype) -> dict[str, Any]:\n        ...\n\n    # get_pertensor_param / get_perchannel_param / get_pergroup_param\n    # 默认返回 {} —— 子类按需覆写\n\n    @abstractmethod\n    def apply(\n        self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None, tp_rank: int | None = 0\n    ) -> torch.Tensor:\n        ...",
+      "elide": ["三个 get_*_param 默认实现体（return {}）与 docstring 省略；AscendAttentionScheme / AscendMoEScheme 结构同理"]
+    },
+    {
+      "path": "vllm_ascend/quantization/methods/__init__.py",
+      "lines": "L36-L65",
+      "what": "全表装载点 + MX 判定：methods/__init__.py 通过 import 各 scheme 模块触发它们的 @register_scheme 装饰器执行（这就是注册表被填满的时机）。is_mx_quant_type 标出哪些是 MXFP microscaling scheme——MXFP 是 NPU 硬特化。",
+      "code": "# Import all scheme classes for external access\nfrom .fp8 import AscendW4A8MXFPDSDynamicFusedMoEMethod, AscendW8A8MXFP8DSDynamicLinearMethod\nfrom .w4a8 import AscendW4A8DynamicFusedMoEMethod, AscendW4A8DynamicLinearMethod\nfrom .w8a8_dynamic import AscendW8A8DynamicFusedMoEMethod, AscendW8A8DynamicLinearMethod\n# ... 其余 scheme 模块 import 省略（每个 import 触发其 @register_scheme 落表）...\n\n\ndef is_mx_quant_type(instance: Any) -> bool:\n    \"\"\"Checks if the quantization method is a microscaling (MX) type.\"\"\"\n    MX_QUANT_TYPES = (\n        AscendW8A8MXFP8DynamicLinearMethod,\n        AscendW4A4MXFP4DynamicLinearMethod,\n        AscendW4A4MXFP4DynamicFusedMoEMethod,\n        AscendW4A4MXFP4FlatQuantDynamicLinearMethod,\n        AscendW4A8MXFPDynamicLinearMethod,\n        AscendW4A8MXFPDynamicFusedMoEMethod,\n    )\n    return isinstance(instance, MX_QUANT_TYPES)",
+      "elide": ["十余个 scheme 模块的完整 import 列表省略，保留代表性 3 个 + 注释说明「import 即注册」"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "AscendModelSlimConfig", "file": "vllm_ascend/quantization/modelslim_config.py", "responsibility": "入口1 Config：@register_quantization_config('ascend') 注进 vLLM；持有 quant_description（逐层量化类型）；get_quant_method 按层分发到 scheme + wrapper。"},
+    {"name": "AscendCompressedTensorsConfig", "file": "vllm_ascend/quantization/compressed_tensors_config.py", "responsibility": "入口2 Config：先 remove vLLM 原版 'compressed-tensors' 再同名注册顶替，把 LLM-Compressor 格式适配到昇腾 scheme。"},
+    {"name": "AscendFp8Config", "file": "vllm_ascend/quantization/fp8_config.py", "responsibility": "入口3 Config：先 remove vLLM 原版 'fp8'/'deepseek_v4_fp8' 再注册；同一类复用给 deepseek_v4_fp8 别名。"},
+    {"name": "_SCHEME_REGISTRY / register_scheme / get_scheme_class", "file": "vllm_ascend/quantization/methods/registry.py", "responsibility": "scheme 注册表：dict[(quant_type, layer_type) -> SchemeClass]；装饰器登记、查表选 scheme。整章范式核心。"},
+    {"name": "AscendLinearMethod", "file": "vllm_ascend/quantization/method_adapters.py", "responsibility": "适配器 wrapper（继承 vLLM LinearMethodBase）：create_weights/apply 全转交内部 scheme.quant_method；自身只搬运 + 算 tp_rank。"},
+    {"name": "AscendKVCacheMethod", "file": "vllm_ascend/quantization/method_adapters.py", "responsibility": "适配器 wrapper（继承 vLLM BaseKVCacheMethod）：KV cache 量化，create_weights/apply 转交 attention scheme。"},
+    {"name": "AscendFusedMoEMethod", "file": "vllm_ascend/quantization/method_adapters.py", "responsibility": "适配器 wrapper（继承 vLLM FusedMoEMethodBase）：量化版 MoE，承接 ch26 FusedMoE；转交 MoE scheme，多带 tid2eid。"},
+    {"name": "AscendW8A8DynamicLinearMethod", "file": "vllm_ascend/quantization/methods/w8a8_dynamic.py", "responsibility": "全链样本 scheme（linear）：@register_scheme('W8A8_DYNAMIC','linear')；int8 权重 + per-channel scale；apply 走 npu_dynamic_quant + npu_quant_matmul。"},
+    {"name": "AscendW8A8DynamicFusedMoEMethod", "file": "vllm_ascend/quantization/methods/w8a8_dynamic.py", "responsibility": "全链样本 scheme（moe）：@register_scheme('W8A8_DYNAMIC','moe')；w13/w2 int8 + per-channel scale；apply 经 moe_comm_method.fused_experts 跑量化 MoE。"},
+    {"name": "AscendLinearScheme / AscendAttentionScheme / AscendMoEScheme", "file": "vllm_ascend/quantization/methods/base.py", "responsibility": "三类 scheme 的 ABC 契约：固定 get_weight/apply 等抽象方法，使 wrapper 能盲转交。"},
+    {"name": "QuantType", "file": "vllm_ascend/quantization/quant_type.py", "responsibility": "MoE quant_type 枚举（NONE/W8A8/W4A8/MXFP8/W4A16/MXFP4/W4A8MXFP，class QuantType(Enum) 在 L26）。quant_type.py 全文仅 35 行、side-effect free，只含这一个枚举——刻意做轻，便于核心运行模块 import 不触发量化包重初始化。"},
+    {"name": "QuantTypeMapping", "file": "vllm_ascend/quantization/quant_parser.py", "responsibility": "在 quant_parser.py:L11；quant_configs 表给 MXFP 系列（W8A8_MXFP8/W4A4_MXFP4/W4A8_MXFP）指定 act/weight/scale dtype（scale_dtype=FLOAT8_E8M0FNU_DTYPE 微缩放共享指数）——NPU 硬特化。注意：quant_parser.py 的真实职责仅是 MXFP dtype 映射表 + down_proj rollback 解析（同文件 get_rollback_quant_type L38 / parse_mxfp_quant_params L46 / parse_quant_moe_down_proj_params L55），它【不】决定每层走哪个 scheme——逐层 scheme 决策在 modelslim_config.py 的 get_linear_quant_type(L297)/get_quant_type_for_layer(L334)，writer 切勿把『决定每层 scheme』写到 quant_parser 头上。"}
+  ],
+
+  "data_flow": [
+    "导入期：import vllm_ascend.quantization.{modelslim_config,compressed_tensors_config,fp8_config} 触发 @register_quantization_config 把三个 Config 注进 vLLM 量化注册表（compressed-tensors/fp8 先删原版再替换）。",
+    "导入期：import vllm_ascend.quantization.methods（其 __init__ import 各 scheme 模块）触发每个 @register_scheme 把 (quant_type, layer_type)->SchemeClass 填进 _SCHEME_REGISTRY。",
+    "加载期：vLLM 读 --quantization ascend，实例化 AscendModelSlimConfig；maybe_update_config 从模型目录读 quant_model_description.json 填 quant_description。",
+    "建层期（每层）：vLLM 调 config.get_quant_method(layer, prefix)。",
+    "get_quant_method：isinstance(layer, ...) 决定 layer_type（linear/attention/moe/embedding）；FLOAT 层 -> 未量化方法跳过。",
+    "create_scheme_for_layer -> get_quant_type_for_layer -> get_linear_quant_type：从 quant_description[prefix+'.weight'] 查出 quant_type 字符串（融合层校验各 shard 一致）。",
+    "get_scheme_class(quant_type, layer_type) 查 _SCHEME_REGISTRY 取 SchemeClass 并实例化 scheme。",
+    "把 scheme 包进对应 wrapper：AscendLinearMethod(scheme) / AscendKVCacheMethod(scheme) / AscendFusedMoEMethod(scheme, moe_config, tid2eid)，作为该层的 quant_method 返回给 vLLM。",
+    "权重创建：vLLM 调 wrapper.create_weights(...) -> scheme.get_weight/get_*_param 返回各参数空张量 -> wrapper 逐个 register_parameter（int8 权重 + per-channel/per-group scale + offset）。",
+    "加载后：wrapper.process_weights_after_loading -> scheme 同名方法（转置 + 转 NZ 格式 + scale flatten/fp32）。",
+    "前向：vLLM 调 wrapper.apply(layer, x, ...) -> scheme.apply：以 W8A8_DYNAMIC linear 为例 npu_dynamic_quant(x) 得 int8+per-token scale，再 npu_quant_matmul 出回原 dtype；MoE 侧经 select_experts + moe_comm_method.fused_experts 跑量化专家计算。"
+  ],
+
+  "design_decisions": [
+    {"decision": "用 @register_quantization_config 把三个昇腾 Config 注进 vLLM 量化注册表，不改 vLLM 量化框架一行", "why": "OOT 插件范式：vLLM 暴露注册点，昇腾只继承基类 QuantizationConfig 并实现钩子，启动期注册即可被 --quantization 选中。", "evidence": "vllm_ascend/quantization/modelslim_config.py:L401, fp8_config.py:L56, compressed_tensors_config.py:L52"},
+    {"decision": "compressed-tensors / fp8 采用「先从 QUANTIZATION_METHODS 删原版，再同名注册顶替」", "why": "这两个方法名 vLLM 内置已占用；同名重复注册会冲突，故先 remove 再 register，用昇腾实现替换通用实现。", "evidence": "vllm_ascend/quantization/compressed_tensors_config.py:L41-L52, fp8_config.py:L18-L25"},
+    {"decision": "scheme 选择用 (quant_type, layer_type) 二维 dict 注册表，而非 if/elif 长链", "why": "量化方案 ~17 个 scheme 文件、多种 layer_type 交叉，注册表让新增 scheme 只需加一个装饰器，分发逻辑零改动；重复注册立即报错防冲突。", "evidence": "vllm_ascend/quantization/methods/registry.py:L21-L49"},
+    {"decision": "三个 wrapper 分别继承 vLLM 三个方法基类（LinearMethodBase/BaseKVCacheMethod/FusedMoEMethodBase），自身只转交给内部 scheme", "why": "适配器模式：vLLM 各层只认这三个基类接口；wrapper 满足接口契约、把实现细节下沉到 scheme，使「一套 scheme 体系」能整体插进 vLLM 三类层。", "evidence": "vllm_ascend/quantization/method_adapters.py:L37,L165,L201"},
+    {"decision": "create_weights 的权重形状/参数集合完全由 scheme 的 get_weight/get_*_param 决定，wrapper 只负责 register_parameter", "why": "不同量化（W8A8 int8 per-channel / W4A8 4bit per-group + scale_bias / MXFP per-group e8m0 scale）权重布局差异极大；把布局决定权交给 scheme，wrapper 保持通用。", "evidence": "vllm_ascend/quantization/method_adapters.py:L51-L122"},
+    {"decision": "逐层量化类型来自 ModelSlim 生成的 quant_model_description.json（按 prefix 查 quant_description）", "why": "混合精度：每层量化方案可不同（如 down_proj 回退更高精度）；用 json 逐层记录、运行时按 prefix 查，支持任意混合。融合层强制各 shard 同类型保证正确性。", "evidence": "vllm_ascend/quantization/modelslim_config.py:L297-L331, L49 (MODELSLIM_CONFIG_FILENAME)"},
+    {"decision": "FLOAT 层经 is_layer_skipped_ascend 走未量化方法", "why": "quant_description 中标 'FLOAT' 的层（如未量化的 MTP / 敏感层）不应套量化 scheme，回退到 AscendUnquantized* 方法。", "evidence": "vllm_ascend/quantization/modelslim_config.py:L543-L548,L583-L610"},
+    {"decision": "量化 matmul / MXFP 走 torch_npu 算子（npu_dynamic_quant / npu_quant_matmul / npu_format_cast NZ）", "why": "真实量化 GEMM 与 microscaling 是 NPU/CANN 硬特化，host 无法执行；scheme 把这些算子封在 apply/process_weights 里。", "evidence": "vllm_ascend/quantization/methods/w8a8_dynamic.py:L80,L113,L355"},
+    {"decision": "MXFP microscaling 系列用 FLOAT8_E8M0FNU scale dtype + per-group 微缩放，并由 is_mx_quant_type 标记", "why": "MX（microscaling）是 NPU 硬特化的 per-group 量化：每组共享一个 e8m0 指数 scale；create_weights 据 is_mx_quant_type 把 scale 的 input_dim 设为 1。", "evidence": "vllm_ascend/quantization/quant_parser.py:L11-L31 (QuantTypeMapping.quant_configs，scale_dtype=FLOAT8_E8M0FNU_DTYPE 微缩放表), methods/__init__.py:L55-L65, method_adapters.py:L117-L122"}
+  ],
+
+  "theory": [
+    "W8A8_DYNAMIC（动态对称量化）：权重 per-channel 量化为 int8（每个输出通道一个 weight_scale）；激活在前向时 per-token 动态量化（npu_dynamic_quant 给每个 token 一个 pertoken_scale）。反量化：out = (Wq · xq) ⊙ weight_scale ⊙ pertoken_scale，由 npu_quant_matmul 融合完成。动态=激活 scale 运行时算、不落盘，省校准、对分布偏移更稳。",
+    "per-tensor vs per-channel vs per-group 三档粒度：per-tensor 一个 scale（最省、最糙）；per-channel 每输出通道一个 scale（W8A8 用）；per-group 每 group_size 个输入通道一个 scale（W4A8 的 weight_scale_second [output, input//group_size]，更细、护精度）。MXFP 是 per-group 的极端——每组配一个 e8m0(FLOAT8_E8M0FNU) 共享指数 scale，即 microscaling。",
+    "W4A8：权重 4bit（两个 4bit 可 pack 进一个 int8，quant_version=='1.0.0' 时沿 output 维 pack，weight 形状 [output//2, input]），激活 8bit；除 per-channel weight_scale 外还有 per-group weight_scale_second/offset_second，down_proj/o_proj 的 scale_bias 形状 [output,16] 区别于 others 的 [output,1]。",
+    "注册表复杂度：scheme 选择从 O(scheme 数) 的 if/elif 链降为 O(1) 字典查；新增 quant_type 对分发代码零侵入。三入口 × 多 scheme 的组合被一张 (quant_type, layer_type) 表统一寻址。",
+    "适配器层数：vLLM 层 -> wrapper(满足 vLLM 基类接口) -> scheme(昇腾实现) -> torch_npu 算子。每多一层换来一处解耦：wrapper 隔离 vLLM 接口变动，scheme 隔离量化算法差异，算子隔离硬件后端。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "packed_modules_model_mapping 里除 deepseek_v3 + qwen3_moe 外的二十余个模型条目（modelslim_config.py:L53-L259）", "why_safe": "纯静态数据表，结构同质；保留 2 个代表即可讲清「融合模块名->原始模块名」的用途，删其余不影响控制流。"},
+      {"what": "QUANT_MODEL_PREFIX_MAPPINGS / QUANT_MODEL_SUBSTR_MAPPINGS / quant_prefix_mapper / _apply_extra_quant_adaptations 的模型专属 key 改写细节（modelslim_config.py:L262-L281,L494-L510,L762-L819）", "why_safe": "都是把 checkpoint 命名规整到 vLLM 命名的字符串映射；与本章「注册+分发+适配」主线无关，可一句话概述后删。"},
+      {"what": "get_quant_method 中 minimax/minimax_m2、bailing_hybrid 的 prefix.replace 改写分支（modelslim_config.py:L523-L537）", "why_safe": "模型专属命名适配，不改变四岔分发骨架，删后分发逻辑仍完整。"},
+      {"what": "KV cache 量化的 fa/indexer/C8 三类细节：is_fa_quant_layer/is_indexer_quant_layer/is_c8_quant_layer/get_kv_quant_dtype/get_kv_quant_split_factor/_add_kvcache_quant_metadata、AscendC8KVCacheAttentionMethod 分支（modelslim_config.py:L612-L660,L821-L839,L558-L562）", "why_safe": "本章用 AscendKVCacheMethod wrapper 讲清「attention 量化也走同一适配器范式」即可；具体 fa/C8 算法是 ch 内可选深水区，删细节不伤范式主线（wrapper 与分发入口须保留）。"},
+      {"what": "apply 中 tp_rank 的 oproj_tp/mlp_tp/flashcomm2/dsa_cp 五分支选路（method_adapters.py:L146-L159）", "why_safe": "并行通信场景细节，与「wrapper 转交 scheme.apply」主线无关，保留 else 主路径即可。"},
+      {"what": "w8a8_dynamic apply/process_weights 的 _chunk_size>0、wq_b+enable_dsa_cp 大权重切两半 workaround（w8a8_dynamic.py:L88-L111,L127-L143）", "why_safe": "针对 >=65536 维权重的临时绕过，非主路径；保留 else 分支（单次 npu_quant_matmul / 单次 NZ cast）即讲清全链。"},
+      {"what": "AscendW8A8DynamicFusedMoEMethod.apply 中 zero_expert/multistream_overlap_gate/dynamic_eplb/fused_mc2 的分支与 scale 列表准备（w8a8_dynamic.py:L237-L321,L346-L391）", "why_safe": "MoE 量化的高级特性（零专家、EPLB、多流），与「量化 MoE 经 wrapper->scheme->fused_experts」主线正交；保留 select_experts + build_fused_experts_input + moe_comm_method.fused_experts 主干即可。"},
+      {"what": "modelslim_config 的 maybe_update_config 长篇 ValueError 用户提示文本（L704-L760）", "why_safe": "纯错误信息字符串拼接；保留「读 quant_model_description.json 填 quant_description」核心，删提示文案不影响逻辑。"},
+      {"what": "is_mx_quant_type 的完整 6 元组、quant_parser.py 的 parse_*（parse_mxfp_quant_params L46 / parse_quant_moe_down_proj_params L55 / get_rollback_quant_type L38）与 QuantTypeMapping.quant_configs 的 W4A4_MXFP4 / W4A8_MXFP 表项（保留 W8A8_MXFP8 一行作示例）", "why_safe": "MXFP 在本章是「点出 NPU 硬特化」的旁证，非主线 scheme；保留 quant_type.py 的枚举 QuantType + quant_parser.py 的一个 MXFP 配置示例即可说明 microscaling，删其余表项安全。注意 QuantType 枚举本身（quant_type.py）须保留，删的是 quant_parser.py 的 MXFP 表项与 parse_* 函数体。"}
+    ],
+    "must_keep": [
+      {"symbol": "register_quantization_config", "why": "三入口注册的 vLLM 侧装饰器，OOT 接入的关键符号，writer 必讲。"},
+      {"symbol": "AscendModelSlimConfig", "why": "入口1 Config，分发总枢纽，全链起点。"},
+      {"symbol": "AscendCompressedTensorsConfig", "why": "入口2，演示「先删后替换」手法。"},
+      {"symbol": "AscendFp8Config", "why": "入口3，演示「先删后替换」+ 别名复用。"},
+      {"symbol": "QUANTIZATION_METHODS", "why": "先删后替换操作的对象（vLLM 已注册方法列表）。"},
+      {"symbol": "_SCHEME_REGISTRY", "why": "scheme 注册表本体，整章范式核心数据结构。"},
+      {"symbol": "register_scheme", "why": "把 (quant_type, layer_type)->SchemeClass 登记进表的装饰器。"},
+      {"symbol": "get_scheme_class", "why": "据 (quant_type, layer_type) 查表选 scheme。"},
+      {"symbol": "get_quant_method", "why": "按层分发总枢纽，连接「层类型」与「scheme+wrapper」。"},
+      {"symbol": "get_linear_quant_type", "why": "逐层解析：从 quant_description 查出该层 quant_type（含融合层一致性校验）。"},
+      {"symbol": "create_scheme_for_layer", "why": "解析→查表→实例化 scheme 的合流函数。"},
+      {"symbol": "AscendLinearMethod", "why": "适配器 wrapper 1（LinearMethodBase），create_weights/apply 转交 scheme。"},
+      {"symbol": "AscendKVCacheMethod", "why": "适配器 wrapper 2（BaseKVCacheMethod），KV cache 量化。"},
+      {"symbol": "AscendFusedMoEMethod", "why": "适配器 wrapper 3（FusedMoEMethodBase），量化 MoE，承接 ch26。"},
+      {"symbol": "create_weights", "why": "wrapper 把 scheme 返回的参数 dict 逐个 register_parameter——「按 scheme 造量化权重+scale」。"},
+      {"symbol": "apply", "why": "前向入口，wrapper 转交 scheme.apply 跑量化 matmul。"},
+      {"symbol": "AscendLinearScheme", "why": "linear scheme 的 ABC 契约，使 wrapper 能盲转交。"},
+      {"symbol": "AscendMoEScheme", "why": "moe scheme 的 ABC 契约。"},
+      {"symbol": "AscendW8A8DynamicLinearMethod", "why": "走通全链的样本 scheme（linear），@register_scheme('W8A8_DYNAMIC','linear')。"},
+      {"symbol": "AscendW8A8DynamicFusedMoEMethod", "why": "走通全链的样本 scheme（moe），量化 MoE 实证。"},
+      {"symbol": "get_weight", "why": "scheme 决定量化权重张量形状/dtype（int8 [out,in]）。"},
+      {"symbol": "get_perchannel_param", "why": "scheme 给出 per-channel weight_scale/weight_offset。"},
+      {"symbol": "npu_dynamic_quant", "why": "动态 per-token 量化激活的 NPU 算子——硬特化证据。"},
+      {"symbol": "npu_quant_matmul", "why": "量化 GEMM 的 NPU 算子，apply 主路径终点。"},
+      {"symbol": "QuantType", "why": "MoE quant_type 枚举（W8A8/W4A8/MXFP...）。"},
+      {"symbol": "is_mx_quant_type", "why": "标记 MXFP microscaling scheme——点出 NPU 硬特化 per-group 微缩放。"}
+    ]
+  },
+
+  "diagram_plan": [
+    {
+      "name": "三入口注册 + 注册表 + 三 wrapper 全景",
+      "type": "svg-diagram 架构总览（many-to-many）",
+      "spec": "左列：三入口 Config（AscendModelSlimConfig/CompressedTensors/Fp8）-- @register_quantization_config --> vLLM 量化注册表 QUANTIZATION_METHODS（compressed-tensors/fp8 标注「先删后替换」）。中列：get_quant_method 按 isinstance(layer) 四岔 -> create_scheme_for_layer -> get_scheme_class 查 _SCHEME_REGISTRY[(quant_type,layer_type)]。右列：三 wrapper（AscendLinearMethod:LinearMethodBase / AscendKVCacheMethod:BaseKVCacheMethod / AscendFusedMoEMethod:FusedMoEMethodBase）各持一个 scheme。底部注：scheme 表项如 (W8A8_DYNAMIC,linear)->AscendW8A8DynamicLinearMethod。",
+      "roadmap_highlight": "ch27 量化框架（Part VII 开篇）"
+    },
+    {
+      "name": "W8A8_DYNAMIC 一条全链时序",
+      "type": "svg-diagram 纵向流程/时序",
+      "spec": "导入期：@register_quantization_config + @register_scheme 落两张表 -> 加载期：读 quant_model_description.json 填 quant_description -> 建层期：get_quant_method(layer,prefix) -> 查 quant_type='W8A8_DYNAMIC' -> get_scheme_class -> AscendLinearMethod(W8A8DynamicScheme) -> create_weights：scheme.get_weight(int8 [out,in]) + get_perchannel_param(weight_scale [out,1]) -> process_weights_after_loading：transpose+NZ -> 前向 apply：npu_dynamic_quant(x)->(int8 xq, pertoken_scale) -> npu_quant_matmul(xq, weight, weight_scale, pertoken_scale)->out。标注 npu_* 为 NPU/CANN 硬特化。",
+      "roadmap_highlight": "ch27"
+    },
+    {
+      "name": "量化粒度谱：per-tensor / per-channel / per-group(MXFP)",
+      "type": "svg-diagram 概念对照（三栏权重矩阵示意）",
+      "spec": "同一权重矩阵 [out,in] 上画三种 scale 覆盖：per-tensor 一个 scale；per-channel 每行(out)一个 scale（W8A8）；per-group 每 group_size 列(in)一个 scale（W4A8 weight_scale_second，MXFP 用 e8m0 共享指数）。点出 microscaling=per-group 极细 + e8m0 scale dtype。",
+      "roadmap_highlight": "ch27"
+    }
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recover": [],
+    "note": "bible.py due ch27 返回空（无应埋/应回收登记项）。本章作为 Part VII 开篇，承接 ch23（算子顶替的 OOT 范式）与 ch26（FusedMoE：量化 MoE 经 AscendFusedMoEMethod 接入），可由 writer 在 Roadmap 处显式回指；后续 ch28 采样 / ch29 投机 / ch30 加载续 Part VII。"
+  }
+}
