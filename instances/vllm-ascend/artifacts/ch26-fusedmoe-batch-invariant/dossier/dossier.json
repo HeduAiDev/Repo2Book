@@ -1,0 +1,270 @@
+{
+  "chapter": "ch26",
+  "title": "FusedMoE 算子与 batch-invariant 一致性 —— Part VI 收官",
+  "thesis": "AscendFusedMoE 是 ch23「CustomOp 换头不换身」机制压力最大的实证：全书最大的单个被顶替算子，靠『继承 vLLM FusedMoE + 替换 quant_method/runner + 覆写 forward_impl』完成顶替，身体（权重布局/路由/容错）原样复用基类。MoE 的真正难点不在矩阵乘，而在『token 按专家重分发』的通信——昇腾按 soc/EP/token 数把它落到 MC2 / all_to_all / all_gather 三种算子上（_MoECommMethods 三选一注册表，每种配一对 PrepareAndFinalize* + TokenDispatcher*）。这正是 ch15 select_moe_comm_method 选定 moe_comm_type 后『通信原语的真正算子落地』（回收 f10），也是 ch06 NPUCommunicator.all_to_all 留给 FusedMoE 的用武之地（回收 f3）。batch-invariant 则是昇腾对『可复现推理』的额外保证：关掉非确定性 reduce/通信 + 用固定分块的 triton kernel 顶替 matmul/softmax，使同一输入无论 batch 怎么拼结果逐位一致。",
+
+  "code_spine": [
+    "vllm_ascend/ascend_forward_context.py:L26-L31 (MoECommType 枚举：ALLGATHER/MC2/ALLTOALL/FUSED_MC2)",
+    "vllm_ascend/ascend_forward_context.py:L233-L319 (select_moe_comm_method —— ch15 埋下、按 soc/EP/token 选 comm_type，回收 f10 的起点)",
+    "vllm_ascend/ops/fused_moe/fused_moe.py:L335-L479 (AscendFusedMoE.__init__ —— 继承 FusedMoE，换 quant_method/base_quant_method、建 runner、setup_moe_comm_method)",
+    "vllm_ascend/ops/fused_moe/fused_moe.py:L590-L599 (AscendFusedMoE.forward —— 委托给 self.runner.forward)",
+    "vllm_ascend/ops/fused_moe/fused_moe.py:L601-L738 (AscendFusedMoE.forward_impl —— prepare→quant_method.apply→finalize 三段式)",
+    "vllm_ascend/ops/fused_moe/fused_moe.py:L129-L262 (AscendUnquantizedFusedMoEMethod.apply —— select_experts 选专家 → moe_comm_method.fused_experts)",
+    "vllm_ascend/ops/fused_moe/moe_comm_method.py:L48-L63 (_MoECommMethods 注册表 + setup_moe_comm_method 三选一/二)",
+    "vllm_ascend/ops/fused_moe/moe_comm_method.py:L87-L182 (MoECommMethod(ABC) —— prepare/finalize/fused_experts 通用骨架：dispatch→mlp→combine)",
+    "vllm_ascend/ops/fused_moe/moe_comm_method.py:L185-L283 (AllGatherCommImpl/MC2CommImpl/AlltoAllCommImpl/FusedMC2CommImpl —— 各自配 token_dispatcher + prepare_finalize)",
+    "vllm_ascend/ops/fused_moe/token_dispatcher.py:L101-L340 (TokenDispatcherWithMC2 —— npu_moe_distribute_dispatch/combine)",
+    "vllm_ascend/ops/fused_moe/token_dispatcher.py:L432-L545 (TokenDispatcherWithAll2AllV —— async_all_to_all 按专家重分发，回收 f3)",
+    "vllm_ascend/ops/fused_moe/comm_utils.py:L26-L62 (async_all_to_all —— dist.all_to_all_single 的封装)",
+    "vllm_ascend/ops/fused_moe/token_dispatcher.py:L343-L429 (TokenDispatcherWithAllGather —— npu_moe_init_routing + npu_moe_token_unpermute)",
+    "vllm_ascend/batch_invariant.py:L76-L150 (override_envs_for_invariance + enable_batch_invariant_mode + init_batch_invariance)",
+    "vllm_ascend/ops/triton/batch_invariant/matmul.py:L101-L175 (matmul_persistent —— 固定分块、allow_tf32=False 的确定性 matmul)"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm_ascend/ascend_forward_context.py",
+      "lines": "L26-L31",
+      "code": "class MoECommType(Enum):\n    ALLGATHER = 0\n    MC2 = 1\n    ALLTOALL = 2\n    FUSED_MC2 = 3",
+      "elide": []
+    },
+    {
+      "path": "vllm_ascend/ascend_forward_context.py",
+      "lines": "L233-L319",
+      "code": "def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_model=False) -> MoECommType | None:\n    if not is_moe_model(vllm_config):\n        return None\n    mc2_tokens_capacity = get_mc2_tokens_capacity()\n    soc_version = get_ascend_device_type()\n    ...\n    if not vllm_config.parallel_config.enable_expert_parallel or get_ep_group().world_size == 1:\n        moe_comm_type = MoECommType.ALLGATHER\n    elif soc_version in {AscendDeviceType.A2}:\n        ...\n        if num_experts_per_device <= 24 and ep_world_size >= 16 and num_tokens <= mc2_tokens_capacity:\n            moe_comm_type = MoECommType.MC2\n        else:\n            moe_comm_type = MoECommType.ALLGATHER\n    elif soc_version in {AscendDeviceType.A3}:\n        ...\n        if num_tokens <= mc2_tokens_capacity:\n            ...\n            moe_comm_type = MoECommType.FUSED_MC2 if fused_decode_enable else MoECommType.MC2\n        else:\n            ...\n            moe_comm_type = MoECommType.FUSED_MC2 if fused_prefill_enable else MoECommType.ALLTOALL\n    elif soc_version in {AscendDeviceType._310P}:\n        moe_comm_type = MoECommType.ALLGATHER\n    elif soc_version in {AscendDeviceType.A5}:\n        ...\n    else:\n        raise ValueError(f\"Unsupported soc_version: {soc_version}\")\n    return moe_comm_type",
+      "elide": [
+        "A2/A3/A5 分支里 num_experts_per_device / ep_world_size / fused_mc2_enable / quant_type 的细粒度阈值判断逐条省略，只保留『按 soc + EP + token 数选 4 种 comm_type 之一』的骨架——这是 ch15 已埋、本章回收的 f10 选择点"
+      ]
+    },
+    {
+      "path": "vllm_ascend/ops/fused_moe/fused_moe.py",
+      "lines": "L335-L377,L467-L479",
+      "code": "class AscendFusedMoE(FusedMoE):\n    moe_counter = -1\n    gate_stream: torch.npu.Stream | None = None\n\n    def __init__(self, *args, **kwargs):\n        ...\n        self._original_routed_scaling_factor = kwargs.get(\"routed_scaling_factor\", 1.0)\n        super().__init__(*args, **kwargs)\n        ...\n        if self.quant_config is None:\n            self.quant_method = AscendUnquantizedFusedMoEMethod(self.moe_config, tid2eid=self.tid2eid)\n        else:\n            self.quant_method = self.quant_config.get_quant_method(self, self.layer_name, tid2eid=self.tid2eid)\n\n        assert self.quant_method is not None\n        # Keep base_quant_method in sync with the swapped-in Ascend method,\n        # otherwise FusedMoE.maybe_init_modular_kernel ... would dispatch\n        # to the upstream UnquantizedFusedMoEMethod.maybe_make_prepare_finalize,\n        # which raises by design.\n        self.base_quant_method = self.quant_method\n        ...\n        setup_moe_comm_method(self.moe_config)\n        self.quant_type = self._get_quant_type()\n\n        self.runner = AscendMoERunner(\n            self.layer_name,\n            self.moe_config,\n            self.router,\n            self._routed_input_transform,\n            kwargs.pop(\"gate\", None),\n            kwargs.pop(\"shared_experts\", None),\n            self.quant_method,\n            self.vllm_config.parallel_config.enable_dbo,\n        )",
+      "elide": [
+        "省略 init_eplb_config / dynamic_eplb 负载表 / multistream_overlap_gate / shared_expert 一致性校验 wrapper / e_score_correction_bias dtype 调整等扩展点；保留『继承 FusedMoE → super().__init__() 建好 vLLM 那套身体 → 把 quant_method 和 base_quant_method 换成昇腾版 → setup_moe_comm_method 建三选一注册表 → 建 AscendMoERunner』这条换头主干"
+      ]
+    },
+    {
+      "path": "vllm_ascend/ops/fused_moe/fused_moe.py",
+      "lines": "L590-L599",
+      "code": "    def forward(\n        self,\n        hidden_states: torch.Tensor,\n        router_logits: torch.Tensor,\n    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:\n        self.ensure_moe_quant_config_init()\n        return self.runner.forward(\n            hidden_states,\n            router_logits,\n        )",
+      "elide": []
+    },
+    {
+      "path": "vllm_ascend/ops/fused_moe/fused_moe.py",
+      "lines": "L601-L738",
+      "code": "    def forward_impl(  # type: ignore[override]\n        self, hidden_states: torch.Tensor, router_logits: torch.Tensor, return_with_event: bool = False\n    ) -> torch.Tensor | FusedMoEResult:\n        assert self.quant_method is not None\n        ...\n        enable_force_load_balance = _EXTRA_CTX.in_profile_run\n        ...\n        prepare_output = _EXTRA_CTX.moe_comm_method.prepare(\n            hidden_states=hidden_states,\n            router_logits=router_logits,\n            replace_allreduce=_EXTRA_CTX.flash_comm_v1_enabled,\n            enable_shared_expert_dp=self.enable_shared_expert_dp,\n            quant_type=self.quant_type,\n        )\n        hidden_states = prepare_output.hidden_states\n        router_logits = prepare_output.router_logits\n        mc2_mask = prepare_output.mc2_mask\n        padded_hidden_states_shape = prepare_output.padded_hidden_states_shape\n        pertoken_scale = prepare_output.pertoken_scale\n        ...\n        # Matrix multiply.\n        fused_experts_results: FusedExpertsResult = self.quant_method.apply(\n            layer=self,\n            x=hidden_states,\n            router_logits=router_logits,\n            pertoken_scale=pertoken_scale,\n            top_k=self.top_k,\n            ...\n            expert_map=self._expert_map,\n            ...\n            mc2_mask=mc2_mask,\n        )\n        ...\n        routed_out = _EXTRA_CTX.moe_comm_method.finalize(\n            hidden_states=fused_experts_results.routed_out,\n            reduce_results=isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl),\n            padded_hidden_states_shape=padded_hidden_states_shape,\n        )\n        ...\n        return routed_out",
+      "elide": [
+        "省略 enable_npugraph_ex_static_kernel 的 moe_layer_index 回绕、multistream_overlap_gate 的 gate_stream/shared_experts 并流块（L619-L675）、dynamic_eplb 负载统计（L702-L720）、return_with_event 包成 FusedMoEResult 的分支；保留 forward_impl 的三段骨架：comm_method.prepare（通信前置：pad/slice/all-gather）→ quant_method.apply（选专家 + fused_experts）→ comm_method.finalize（通信后置：reduce-scatter/all-reduce）。注意 finalize 的 reduce_results 仅在 AllGather 时为 True"
+      ]
+    },
+    {
+      "path": "vllm_ascend/ops/fused_moe/fused_moe.py",
+      "lines": "L129-L262",
+      "code": "class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):\n    ...\n    def apply(\n        self,\n        layer: torch.nn.Module,\n        x: torch.Tensor,\n        ...\n    ) -> torch.Tensor:\n        ...\n        topk_weights, topk_ids = select_experts(\n            hidden_states=x,\n            router_logits=router_logits,\n            top_k=top_k,\n            use_grouped_topk=use_grouped_topk,\n            ...\n        )\n        ...\n        topk_weights = topk_weights.to(x.dtype)\n        ...\n        moe_comm_method = _EXTRA_CTX.moe_comm_method\n        ...\n        final_hidden_states = moe_comm_method.fused_experts(\n            fused_experts_input=build_fused_experts_input(\n                hidden_states=x,\n                topk_weights=topk_weights,\n                topk_ids=topk_ids,\n                w1=w1,\n                w2=w2,\n                ...\n                expert_map=expert_map,\n                ...\n            )\n        )\n        ...\n        return final_hidden_states",
+      "elide": [
+        "省略 zero_experts_compute / enable_force_load_balance 随机路由 / FUSED_MC2 把权重包成 list+dummy scale 的分支（L210-L233）/ routed_experts capturer；保留『路由器选 topk 专家 → 打包成 build_fused_experts_input → 交给 moe_comm_method.fused_experts』这条主线。fused_experts 才进入 token 重分发"
+      ]
+    },
+    {
+      "path": "vllm_ascend/ops/fused_moe/fused_moe.py",
+      "lines": "L265-L294",
+      "code": "class AscendMoERunner(MoERunner):\n    @property\n    def use_dp_chunking(self) -> bool:\n        \"\"\"Ascend uses its own forward_impl path, not the FlashInfer Cutlass\n        chunked path. Always return False to stay on forward_impl.\"\"\"\n        return False\n\n    @property\n    def _fused_output_is_reduced(self) -> bool:\n        # For MC2/ALLTOALL/FUSED_MC2 comm types, finalize() already includes\n        # TP all-reduce for the routed output ...\n        moe_comm_type = _EXTRA_CTX.moe_comm_type\n        return moe_comm_type in {\n            MoECommType.ALLTOALL,\n            MoECommType.MC2,\n            MoECommType.FUSED_MC2,\n        } or (moe_comm_type == MoECommType.ALLGATHER and _EXTRA_CTX.flash_comm_v1_enabled)",
+      "elide": [
+        "省略 _maybe_reduce_shared_expert_output / forward_impl(转调 layer.forward_impl) / _forward_impl 的 sequence_parallel_context 包裹；保留两个覆写属性——这是『继承 vLLM MoERunner 只改两处行为旋钮』的换头实证：use_dp_chunking 强制走 forward_impl，_fused_output_is_reduced 告诉基类 MC2/AllToAll 的 finalize 已做过 TP all-reduce、别再 double-count"
+      ]
+    },
+    {
+      "path": "vllm_ascend/ops/fused_moe/moe_comm_method.py",
+      "lines": "L48-L63",
+      "code": "_MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}\n\n\ndef get_moe_comm_method(moe_comm_type: MoECommType | None) -> MoECommMethod | None:\n    return _MoECommMethods.get(moe_comm_type)\n\n\ndef setup_moe_comm_method(moe_config):\n    if moe_config.ep_size > 1:\n        _MoECommMethods[MoECommType.ALLTOALL] = AlltoAllCommImpl(moe_config)\n        _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)\n        _MoECommMethods[MoECommType.MC2] = MC2CommImpl(moe_config)\n        _MoECommMethods[MoECommType.FUSED_MC2] = FusedMC2CommImpl(moe_config)\n    else:\n        _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)",
+      "elide": [
+        "这是回收 f10 的落地：ch15 的 select_moe_comm_method 只产出一个 MoECommType 枚举值，setup_moe_comm_method（在 AscendFusedMoE.__init__ 里调）才把每个枚举值映射到一个真正建好的 *CommImpl 实例；get_moe_comm_method 在每拍前向用 moe_comm_type 取出对应实例存进 _EXTRA_CTX.moe_comm_method。EP=1 时只注册 AllGather（无专家并行不需要跨卡重分发）"
+      ]
+    },
+    {
+      "path": "vllm_ascend/ops/fused_moe/moe_comm_method.py",
+      "lines": "L87-L182",
+      "code": "class MoECommMethod(ABC):\n    \"\"\"Base class for MoE communication methods.\"\"\"\n\n    def __init__(self, moe_config: FusedMoEConfig):\n        self.moe_config = moe_config\n        self.token_dispatcher = self._get_token_dispatcher()\n        self.prepare_finalize = self._get_prepare_finalize()\n        self.use_fusion_ops = set_gmmswigluquant_method()\n\n    def prepare(self, hidden_states, router_logits, enable_shared_expert_dp=False,\n                replace_allreduce=False, quant_type=QuantType.NONE) -> MoEPrepareOutput:\n        return self.prepare_finalize.prepare(\n            hidden_states, router_logits, enable_shared_expert_dp, replace_allreduce, quant_type)\n\n    def finalize(self, hidden_states, reduce_results, padded_hidden_states_shape=None) -> torch.Tensor:\n        hidden_states = self.prepare_finalize.finalize(hidden_states, reduce_results, padded_hidden_states_shape)\n        return hidden_states\n\n    def fused_experts(self, fused_experts_input: MoEFusedExpertsInput):\n        ...\n        moe_comm_method = _EXTRA_CTX.moe_comm_method\n        assert moe_comm_method is not None, \"Missing communication context\"\n        ...\n        routed_topk_ids = fused_experts_input.topk_ids\n        if fused_experts_input.routing.log2phy is not None:\n            routed_topk_ids = fused_experts_input.routing.log2phy[routed_topk_ids]\n\n        token_dispatch_input = build_token_dispatch_input(\n            fused_experts_input=fused_experts_input,\n            topk_ids=routed_topk_ids,\n        )\n        token_dispatch_output = self.token_dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)\n\n        mlp_compute_input = build_mlp_compute_input(\n            fused_experts_input=fused_experts_input,\n            token_dispatch_output=token_dispatch_output,\n            use_fusion_ops=self.use_fusion_ops,\n        )\n        mlp_output, before_gmm2_evt = self._apply_mlp(mlp_compute_input)\n        ...\n        routed_out = self.token_dispatcher.token_combine(\n            hidden_states=mlp_output,\n            combine_metadata=token_dispatch_output.combine_metadata,\n        )\n        return FusedExpertsResult(routed_out=routed_out, ...)\n\n    def _apply_mlp(self, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:\n        return unified_apply_mlp(mlp_compute_input=mlp_compute_input)\n\n    @abstractmethod\n    def _get_token_dispatcher(self) -> MoETokenDispatcher:\n        raise NotImplementedError(\"_get_token_dispatcher function not implemented.\")\n\n    @abstractmethod\n    def _get_prepare_finalize(self) -> PrepareAndFinalize:\n        raise NotImplementedError(\"_get_prepare_finalize function not implemented.\")",
+      "elide": [
+        "省略 fused_experts 里 record_event 计时（before_dispatch_evt/before_combine_evt，给 shared expert 并流用）和 dtype assert；保留三段流水线骨架：token_dispatch（按专家把 token 重分发到对应专家所在卡）→ _apply_mlp（每个专家算自己那摞 token 的 gmm+swiglu+gmm）→ token_combine（把结果按原顺序聚回来）。两个 @abstractmethod 是『策略模式接口』：子类只决定用哪个 dispatcher + 哪个 prepare_finalize，骨架不变"
+      ]
+    },
+    {
+      "path": "vllm_ascend/ops/fused_moe/moe_comm_method.py",
+      "lines": "L185-L256",
+      "code": "class AllGatherCommImpl(MoECommMethod):\n    \"\"\"... default implementation for MoE communication methods.\n    It uses `torch_npu.npu_moe_init_routing_v2` for pre-processing\n    and `torch_npu.npu_moe_token_unpermute` for post-processing ...\"\"\"\n    def _get_token_dispatcher(self):\n        return TokenDispatcherWithAllGather(\n            top_k=self.moe_config.experts_per_token,\n            num_experts=self.moe_config.num_experts,\n            num_local_experts=self.moe_config.num_local_experts,\n        )\n    def _get_prepare_finalize(self):\n        return PrepareAndFinalizeWithAllGather(self.moe_config)\n\n\nclass MC2CommImpl(MoECommMethod):\n    \"\"\"... uses the MC2 communication method, which is optimized for\n    Communication and Computation parallelism on Ascend devices.\"\"\"\n    def _get_token_dispatcher(self):\n        return TokenDispatcherWithMC2()\n    def _get_prepare_finalize(self):\n        return PrepareAndFinalizeWithMC2(self.moe_config)\n\n\nclass AlltoAllCommImpl(MoECommMethod):\n    \"\"\"... uses all-to-all communication to exchange tokens\n    between data parallel ranks before and after the MLP computation.\"\"\"\n    def _get_token_dispatcher(self):\n        return TokenDispatcherWithAll2AllV(\n            top_k=self.moe_config.experts_per_token,\n            num_experts=self.moe_config.num_experts,\n            num_local_experts=self.moe_config.num_local_experts,\n        )\n    def _get_prepare_finalize(self):\n        return PrepareAndFinalizeWithAll2All(self.moe_config)",
+      "elide": [
+        "FUSED_MC2 的 FusedMC2CommImpl 单独见下一条；这三个类是『二分』的实证——每种通信方式 = 一个 TokenDispatcher* + 一个 PrepareAndFinalize* 的配对，类体只有两个工厂方法，复杂度全在被它们 new 出来的 dispatcher/prepare_finalize 里"
+      ]
+    },
+    {
+      "path": "vllm_ascend/ops/fused_moe/moe_comm_method.py",
+      "lines": "L259-L348",
+      "code": "class FusedMC2CommImpl(MoECommMethod):\n    \"\"\"... uses the MC2 communication method ...\"\"\"\n    def _get_token_dispatcher(self):\n        return TokenDispatcherWithMC2()\n    def _get_prepare_finalize(self):\n        return PrepareAndFinalizeWithMC2(self.moe_config)\n\n    def fused_experts(self, fused_experts_input: MoEFusedExpertsInput):\n        ...\n        topk_ids = fused_experts_input.topk_ids\n        if fused_experts_input.routing.log2phy is not None:\n            topk_ids = fused_experts_input.routing.log2phy[topk_ids]\n\n        expert_tokens = None\n        if get_ascend_config().enable_fused_mc2 == 1:\n            out = torch.empty_like(fused_experts_input.hidden_states)\n            torch.ops._C_ascend.dispatch_ffn_combine(\n                x=fused_experts_input.hidden_states,\n                weight1=fused_experts_input.weights.w1,\n                weight2=fused_experts_input.weights.w2,\n                expert_idx=topk_ids,\n                ...\n                group=self.token_dispatcher.moe_all_to_all_group_name,\n                ...\n                out=out,\n                expert_token_nums=self.expert_token_nums,\n            )\n            expert_tokens = self.expert_token_nums\n        elif get_ascend_config().enable_fused_mc2 == 2:\n            ...\n            out, expert_tokens = torch.ops._C_ascend.dispatch_gmm_combine_decode(...)\n        else:\n            raise ValueError(...)\n        return FusedExpertsResult(routed_out=out, expert_tokens=expert_tokens, ...)",
+      "elide": [
+        "省略 dispatch_ffn_combine / dispatch_gmm_combine_decode 的完整入参列表与 scale/bias/mask 细节；保留要点：FUSED_MC2 把『dispatch + 两段 ffn(gmm1/swiglu/gmm2) + combine』融成单个 C++ 融合算子一次调完，从而覆写了基类 fused_experts 的『dispatch→mlp→combine』三步分解。这是为什么 ch23 的 process_weights_after_loading 在 enable_fused_mc2 时要把权重转成 NZ 格式（融合算子只吃 NZ）"
+      ]
+    },
+    {
+      "path": "vllm_ascend/ops/fused_moe/token_dispatcher.py",
+      "lines": "L226-L264",
+      "code": "    def token_dispatch(self, token_dispatch_input: MoETokenDispatchInput):\n        kwargs_mc2 = self.get_dispatch_mc2_kwargs(token_dispatch_input)\n        output = (\n            torch_npu.npu_moe_distribute_dispatch_v2(**kwargs_mc2)\n            if self.enable_dispatch_v2\n            else torch_npu.npu_moe_distribute_dispatch(**kwargs_mc2)\n        )\n        (\n            expand_x,\n            dynamic_scale,\n            assist_info_for_combine,\n            expert_token_nums,\n            ep_recv_counts,\n            tp_recv_counts,\n            expand_scales,\n        ) = output[0:7]\n\n        group_list_type = kwargs_mc2[\"expert_token_nums_type\"]\n        return MoETokenDispatchOutput(\n            hidden_states=expand_x,\n            dynamic_scale=dynamic_scale,\n            group_list=expert_token_nums,\n            group_list_type=group_list_type,\n            combine_metadata=MoEMC2CombineMetadata(\n                topk_ids=token_dispatch_input.topk_ids,\n                topk_weights=token_dispatch_input.topk_weights,\n                expert_map=token_dispatch_input.routing.expert_map,\n                ep_recv_counts=ep_recv_counts,\n                tp_recv_counts=tp_recv_counts,\n                assist_info_for_combine=assist_info_for_combine,\n                expand_scales=expand_scales,\n                quant=token_dispatch_input.quant,\n                mc2_mask=token_dispatch_input.routing.mc2_mask if self.global_bs == 0 else None,\n            ),\n        )",
+      "elide": [
+        "省略 get_dispatch_mc2_kwargs 里 quant_mode/A3-A5 extra_args/hierarchy comm/global_bs 的拼装细节；token_combine 对称地调 npu_moe_distribute_combine。要点：MC2 把『按专家 all-to-all 重分发 token』这件事整个塞进一个 NPU 融合算子（dispatch/combine），dispatch 返回 expand_x（本卡专家收到的 token）+ expert_token_nums（每个专家几条）+ 一堆 combine 阶段要原路返回的 metadata"
+      ]
+    },
+    {
+      "path": "vllm_ascend/ops/fused_moe/token_dispatcher.py",
+      "lines": "L465-L545",
+      "code": "    def token_dispatch(self, token_dispatch_input: MoETokenDispatchInput):\n        with_quant = token_dispatch_input.quant.is_int_quant\n        hidden_states = token_dispatch_input.hidden_states\n        topk_weights = token_dispatch_input.topk_weights\n        topk_ids = token_dispatch_input.topk_ids\n\n        (\n            permutated_local_input_tokens,\n            reversed_local_input_permutation_mapping,\n            tokens_per_expert,\n            input_splits,\n            output_splits,\n            global_input_tokens_local_experts_indices,\n            hidden_shape,\n            hidden_shape_before_permute,\n        ) = self._dispatch_preprocess(hidden_states, topk_ids)\n        ...\n        _, global_input_tokens, permute1_ep_all_to_all_handle = async_all_to_all(\n            permutated_local_input_tokens, output_splits, input_splits, self.ep_group\n        )\n        permute1_ep_all_to_all_handle.wait()\n        permutated_local_input_tokens.untyped_storage().resize_(0)\n        ...\n        return MoETokenDispatchOutput(\n            hidden_states=global_input_tokens,\n            ...\n            group_list=tokens_per_expert,\n            group_list_type=1,\n            combine_metadata=MoEAllToAllCombineMetadata(\n                input_splits=input_splits,\n                output_splits=output_splits,\n                topk_weights=topk_weights,\n                reversed_local_input_permutation_mapping=reversed_local_input_permutation_mapping,\n                reversed_global_input_permutation_mapping=reversed_global_input_permutation_mapping,\n                hidden_shape=hidden_shape,\n                hidden_shape_before_permute=hidden_shape_before_permute,\n            ),\n        )\n\n    def token_combine(self, hidden_states, combine_metadata, bias=None):\n        ...\n        hidden_states = self._combine_preprocess(hidden_states, combine_metadata)\n        _, permutated_local_input_tokens, handle = async_all_to_all(\n            hidden_states,\n            combine_metadata.input_splits,\n            combine_metadata.output_splits,\n            self.ep_group,\n        )\n        handle.wait()\n        ...\n        output = self._combine_postprocess(permutated_local_input_tokens, combine_metadata)\n        return output",
+      "elide": [
+        "省略 with_quant 的 dynamic_quant + 第二趟 all_to_all 传 scale 的分支（L485-L492）和 _dispatch_preprocess/_preprocess/_postprocess 的 histc/gather/permute 细节；这是回收 f3 的核心：dispatch 阶段先按 topk_ids 把本卡 token permute 排好（npu_moe_token_permute）→ 调 async_all_to_all 按 input_splits/output_splits 把 token 真正跨 EP 卡重分发；combine 阶段对称地再 all_to_all 一次把专家输出送回原卡、unpermute 回原顺序。ch06 NPUCommunicator.all_to_all 讲的形状代数，在这里第一次有了真正的『按专家路由』用武之地"
+      ]
+    },
+    {
+      "path": "vllm_ascend/ops/fused_moe/comm_utils.py",
+      "lines": "L26-L62",
+      "code": "def async_all_to_all(input_, output_split_sizes, input_split_sizes, group, event=None):\n    if output_split_sizes is None:\n        # Equal split (all2all)\n        a2a_out = torch.empty_like(input_)\n    else:\n        # Unequal split (all2all-v)\n        a2a_out = input_.new_empty(\n            size=[sum(output_split_sizes)] + list(input_.size()[1:]),\n            dtype=input_.dtype,\n            device=torch.npu.current_device(),\n        )\n    ...\n    handle = dist.all_to_all_single(\n        a2a_out,\n        input_.contiguous(),\n        output_split_sizes=output_split_sizes,\n        input_split_sizes=input_split_sizes,\n        group=group,\n        async_op=True,\n    )\n    return input_, a2a_out, handle",
+      "elide": [
+        "省略 event!=None 时在独立 COMM_STREAM 上等事件再发起的多流分支（L38-L52）；保留要点：all2all-v（不等长 split）按 input/output_split_sizes 给每张卡发不同条数的 token——正是 MoE『各专家收到的 token 数不均』所需。async_op=True + handle.wait() 让通信能与计算重叠"
+      ]
+    },
+    {
+      "path": "vllm_ascend/ops/fused_moe/token_dispatcher.py",
+      "lines": "L352-L429",
+      "code": "    def token_dispatch(self, token_dispatch_input: MoETokenDispatchInput):\n        ...\n        hidden_states = token_dispatch_input.hidden_states\n        topk_weights = token_dispatch_input.topk_weights\n        topk_ids = token_dispatch_input.topk_ids\n        expert_map = token_dispatch_input.routing.expert_map\n        ...\n        num_tokens = hidden_states.shape[:-1].numel()\n        ...\n        if expert_map is not None:\n            global_num_experts = len(expert_map) + global_redundant_expert_num\n            mask = expert_map[topk_ids] != -1\n            topk_weights = topk_weights * mask\n            first_expert_idx = get_ep_group().rank_in_group * self.num_experts_local\n            last_expert_idx = first_expert_idx + self.num_experts_local\n        else:\n            first_expert_idx = 0\n            last_expert_idx = self.num_experts_local\n            global_num_experts = self.num_experts_local\n        sorted_hidden_states, expanded_row_idx, expert_tokens, dynamic_scale = DeviceOperator.npu_moe_init_routing(\n            hidden_states,\n            topk_ids,\n            scale=dynamic_scale,\n            active_num=num_tokens * self.top_k,\n            expert_num=global_num_experts,\n            expert_tokens_num_type=1,\n            expert_tokens_num_flag=True,\n            active_expert_range=[first_expert_idx, last_expert_idx],\n            quant_mode=quant_mode,\n        )\n        expert_tokens = expert_tokens.to(torch.int64)\n        group_list_type = 1  # `count` mode\n        return MoETokenDispatchOutput(\n            hidden_states=sorted_hidden_states,\n            ...\n            group_list=expert_tokens,\n            group_list_type=group_list_type,\n            combine_metadata=MoEAllGatherCombineMetadata(\n                topk_weights=topk_weights,\n                expanded_row_idx=expanded_row_idx,\n                restore_shape=restore_shape,\n            ),\n        )\n\n    def token_combine(self, hidden_states, combine_metadata, bias=None):\n        final_hidden_states = torch_npu.npu_moe_token_unpermute(\n            permuted_tokens=hidden_states,\n            sorted_indices=torch.abs(combine_metadata.expanded_row_idx),\n            probs=combine_metadata.topk_weights,\n        )\n        if len(combine_metadata.restore_shape) == 3:\n            final_hidden_states = final_hidden_states.view(combine_metadata.restore_shape)\n        return final_hidden_states",
+      "elide": [
+        "省略 with_quant/MXFP4 的 quant_mode 选择和 apply_router_weight_on_input 分支；要点：AllGather 路径不跨卡 all_to_all——它假设 hidden_states 已被 prepare 阶段 all-gather 成全局张量，token_dispatch 只在本地用 npu_moe_init_routing 把 token 按 expert 排序聚拢（active_expert_range 圈出本卡负责的专家区间），token_combine 用 npu_moe_token_unpermute 按 topk_weights 加权还原。这是 EP=1 或小规模时的默认稳妥实现"
+      ]
+    },
+    {
+      "path": "vllm_ascend/batch_invariant.py",
+      "lines": "L76-L150",
+      "code": "def override_envs_for_invariance():\n    from vllm_ascend.ascend_config import get_ascend_config\n    ascend_config = get_ascend_config()\n    ascend_config.weight_nz_mode = 0\n    ascend_config.enable_matmul_allreduce = False\n    os.environ[\"HCCL_DETERMINISTIC\"] = \"strict\"\n    os.environ[\"LCCL_DETERMINISTIC\"] = \"1\"\n\n\n_batch_invariant_LIB = None\n\n\ndef enable_batch_invariant_mode():\n    global _batch_invariant_LIB\n    _batch_invariant_LIB = torch.library.Library(\"aten\", \"IMPL\")\n\n    # Register operators only implemented in triton.\n    if HAS_TRITON:\n        _batch_invariant_LIB.impl(\"aten::addmm\", addmm_batch_invariant, \"NPU\")\n        _batch_invariant_LIB.impl(\"aten::bmm\", bmm_batch_invariant, \"NPU\")\n        _batch_invariant_LIB.impl(\"aten::softmax\", softmax_batch_invariant, \"NPU\")\n        _batch_invariant_LIB.impl(\"aten::_softmax\", softmax_batch_invariant, \"NPU\")\n\n    # Register operators implemented in Ascend batch-invariant ops in priority.\n    if HAS_ASCENDC_BATCH_INVARIANT:\n        _batch_invariant_LIB.impl(\"aten::mm\", torch.ops.batch_invariant_ops.npu_mm_batch_invariant, \"NPU\")\n        _batch_invariant_LIB.impl(\"aten::matmul\", torch.ops.batch_invariant_ops.npu_matmul_batch_invariant, \"NPU\")\n        _batch_invariant_LIB.impl(\"aten::sum\", torch.ops.batch_invariant_ops.npu_reduce_sum_batch_invariant, \"NPU\")\n        torch_npu.npu_fused_infer_attention_score = (\n            torch.ops.batch_invariant_ops.npu_fused_infer_attention_score_batch_invariant\n        )\n        torch_npu.npu_add_rms_norm = add_rms_norm\n        torch.sum = reduce_sum\n    # register triton implementations if ascendc is not available.\n    elif HAS_TRITON:\n        _batch_invariant_LIB.impl(\"aten::mm\", mm_batch_invariant, \"NPU\")\n        _batch_invariant_LIB.impl(\"aten::matmul\", matmul_batch_invariant, \"NPU\")\n        _batch_invariant_LIB.impl(\"aten::linear\", linear_batch_invariant, \"NPU\")\n\n\ndef init_batch_invariance():\n    if envs.VLLM_BATCH_INVARIANT:\n        if HAS_TRITON or HAS_ASCENDC_BATCH_INVARIANT:\n            logger.info(\"Enabling batch-invariant mode for vLLM on Ascend NPU.\")\n            override_envs_for_invariance()\n            enable_batch_invariant_mode()\n        else:\n            logger.warning(\"Batch-invariant mode requested but Triton or AscendC batch-invariant ops is not available.skipping batch-invariant initialization.\")",
+      "elide": [
+        "要点：两步合力消除批内非确定性。(1) override_envs_for_invariance 关掉数值漂移源：weight_nz_mode=0 关 NZ 重排、enable_matmul_allreduce=False 关 matmul-allreduce 融合、HCCL/LCCL_DETERMINISTIC 强制集合通信走确定性 reduce 顺序。(2) enable_batch_invariant_mode 用 torch.library.Library 把 aten::mm/matmul/addmm/bmm/softmax/sum 等算子在 NPU 上整体替换成『分块固定、reduce 顺序固定』的 batch-invariant 实现（优先 AscendC 内核，回退 triton）；torch.sum/torch_npu.npu_add_rms_norm 这类非 dispatch 算子直接猴补函数指针"
+      ]
+    },
+    {
+      "path": "vllm_ascend/ops/triton/batch_invariant/matmul.py",
+      "lines": "L101-L175",
+      "code": "def matmul_persistent(x, y, bias=None):\n    \"\"\"Implement matrix multiplication with optional bias using Triton: x @ y + bias\"\"\"\n    ...\n    x = x.contiguous()\n    y = y.contiguous()\n    M, K = x.shape\n    _, N = y.shape\n    ...\n    output = torch.empty((M, N), dtype=x.dtype, device=x.device)\n    # Define block sizes (can be adjusted based on hardware)\n    BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64\n    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))\n    ...\n    matmul_bias_persistent_kernel[grid](\n        x, y, bias_to_pass, output,\n        M, N, K,\n        ...\n        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,\n    )\n    return output",
+      "elide": [
+        "kernel 体（matmul_bias_persistent_kernel）省略；批不变的关键在 kernel 里：acc 用 float32 累加、tl.dot(..., allow_tf32=False) 关 TF32、且 BLOCK_M/N/K 固定为常量——这样 K 维的累加分块数与顺序只取决于 K（与 batch 中 M 怎么拼无关），保证同一行无论和谁组 batch 都走相同的 reduce 顺序、得到逐位相同的结果。对照基类 vLLM 的 batch_invariant 是同一套设计，昇腾把它落到 NPU triton/AscendC"
+      ]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "AscendFusedMoE(FusedMoE)", "file": "vllm_ascend/ops/fused_moe/fused_moe.py:L335", "responsibility": "全书最大单体 OOT 算子。继承 vLLM FusedMoE，super().__init__ 复用基类身体（权重创建/路由参数/EP 配置），再把 quant_method+base_quant_method 换成昇腾版、建 AscendMoERunner、setup_moe_comm_method 注册三选一通信。forward 委托 runner，覆写 forward_impl 走『prepare→apply→finalize』昇腾路径。"},
+    {"name": "AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod)", "file": "vllm_ascend/ops/fused_moe/fused_moe.py:L92", "responsibility": "非量化 quant_method。apply() 用 select_experts 选 topk 专家，打包 build_fused_experts_input 后交给 _EXTRA_CTX.moe_comm_method.fused_experts。process_weights_after_loading 把 w13/w2 转置+按是否 fused_mc2 转 NZ/ND 格式（呼应 ch23）。maybe_make_prepare_finalize 返回 None 阻止上游 modular-kernel 接管。"},
+    {"name": "AscendMoERunner(MoERunner)", "file": "vllm_ascend/ops/fused_moe/fused_moe.py:L265", "responsibility": "继承 vLLM MoERunner，只覆写两处行为旋钮：use_dp_chunking=False 强制走 forward_impl（不走 FlashInfer Cutlass chunked 路径），_fused_output_is_reduced 让基类知道 MC2/AllToAll/FusedMC2 的 finalize 已做过 TP all-reduce，避免重复 reduce。"},
+    {"name": "MoECommMethod(ABC)", "file": "vllm_ascend/ops/fused_moe/moe_comm_method.py:L87", "responsibility": "MoE 通信方式基类，定义 prepare/finalize/fused_experts 通用三段流水线（dispatch→mlp→combine），把『用哪个 dispatcher / 哪个 prepare_finalize』留给 @abstractmethod 由子类决定。"},
+    {"name": "AllGatherCommImpl / MC2CommImpl / AlltoAllCommImpl / FusedMC2CommImpl", "file": "vllm_ascend/ops/fused_moe/moe_comm_method.py:L185-L348", "responsibility": "四种通信策略实现，各配一对 (TokenDispatcherWith*, PrepareAndFinalizeWith*)。FusedMC2 额外覆写 fused_experts 用 dispatch_ffn_combine/dispatch_gmm_combine_decode 把三步融成单算子。"},
+    {"name": "_MoECommMethods / setup_moe_comm_method / get_moe_comm_method", "file": "vllm_ascend/ops/fused_moe/moe_comm_method.py:L48", "responsibility": "MoECommType→实例的注册表。EP>1 注册全部四种、EP=1 只注册 AllGather；每拍前向用 ch15 选定的 moe_comm_type 取出实例（回收 f10 的落地）。"},
+    {"name": "MoETokenDispatcher(ABC) + TokenDispatcherWithMC2 / WithAll2AllV / WithAllGather", "file": "vllm_ascend/ops/fused_moe/token_dispatcher.py:L63,L101,L432,L343", "responsibility": "token 按专家重分发的三种落地。MC2 用 npu_moe_distribute_dispatch/combine 融合算子；All2AllV 用 async_all_to_all（dist.all_to_all_single）按不等长 split 跨 EP 卡重分发（回收 f3）；AllGather 假设已全局 all-gather，仅本地 npu_moe_init_routing 排序+unpermute 还原。"},
+    {"name": "PrepareAndFinalize(ABC) + WithAllGather / WithMC2 / WithAll2All", "file": "vllm_ascend/ops/fused_moe/prepare_finalize.py:L40,L321,L228,L116", "responsibility": "通信前置(prepare)/后置(finalize)。AllGather 做 DP/EP all-gather + reduce-scatter；MC2/All2All 做 pad 到 TP/mc2 边界 + TP 切片，finalize 时 all-gather 回拼并 unpad。"},
+    {"name": "async_all_to_all", "file": "vllm_ascend/ops/fused_moe/comm_utils.py:L26", "responsibility": "dist.all_to_all_single 的异步封装，支持不等长 split（all2all-v），是 All2AllV dispatcher 真正的跨卡 token 搬运原语（回收 f3 的底层落点）。"},
+    {"name": "init_batch_invariance / override_envs_for_invariance / enable_batch_invariant_mode", "file": "vllm_ascend/batch_invariant.py:L126,L76,L90", "responsibility": "昇腾可复现推理保证。前者关非确定性源（NZ重排/matmul-allreduce/HCCL/LCCL 强制确定性），后者用 torch.library 把 aten::mm/matmul/softmax/sum 等替换成固定分块的 batch-invariant 实现（AscendC 优先、triton 回退）。"},
+    {"name": "matmul_persistent / matmul_bias_persistent_kernel", "file": "vllm_ascend/ops/triton/batch_invariant/matmul.py:L101,L24", "responsibility": "batch-invariant 的 triton matmul：BLOCK_M/N/K 固定常量、float32 累加、allow_tf32=False，使 reduce 顺序与 batch 拼法无关，逐位可复现。"}
+  ],
+
+  "data_flow": [
+    "每拍前向开始（ch15）：set_ascend_forward_context → select_moe_comm_method(num_tokens, vllm_config) 按 soc/EP/token 返回一个 MoECommType → get_moe_comm_method 取出对应 *CommImpl 实例存进 _EXTRA_CTX.moe_comm_method/moe_comm_type",
+    "AscendFusedMoE.forward(hidden_states, router_logits) → self.runner.forward(...)（vLLM MoERunner.forward 骨架，但 use_dp_chunking=False 走 forward_impl）",
+    "AscendFusedMoE.forward_impl：① _EXTRA_CTX.moe_comm_method.prepare(...) —— 通信前置（AllGather: DP/EP all-gather；MC2/All2All: pad+TP切片），得到 padded/sliced hidden_states + mc2_mask",
+    "② quant_method.apply(...)：select_experts 选 topk 专家 → build_fused_experts_input 打包 → moe_comm_method.fused_experts(...)",
+    "③ fused_experts 内三段流水线：token_dispatcher.token_dispatch（按专家把 token 重分发：MC2 distribute_dispatch / All2AllV async_all_to_all / AllGather init_routing）→ _apply_mlp=unified_apply_mlp（每专家 gmm1→swiglu→gmm2）→ token_dispatcher.token_combine（结果按原顺序聚回：distribute_combine / 第二趟 all_to_all / token_unpermute）",
+    "④ moe_comm_method.finalize(...) —— 通信后置（AllGather: reduce-scatter + unpad；MC2/All2All: all-gather 回拼 + unpad），reduce_results 仅 AllGather 为 True",
+    "⑤ 回到 MoERunner.forward 尾部：_fused_output_is_reduced 决定是否对 shared_output 单独 all-reduce、避免对 routed_out 二次 reduce；shared+routed 相加得最终输出",
+    "FusedMC2 旁路：fused_experts 直接调 dispatch_ffn_combine/dispatch_gmm_combine_decode，把 dispatch+ffn+combine 融成单个 C++ 算子，跳过三步分解",
+    "batch-invariant（正交开关，VLLM_BATCH_INVARIANT=1 时启动期一次性）：init_batch_invariance → override_envs_for_invariance（关漂移源）+ enable_batch_invariant_mode（torch.library 替换 aten 算子为确定性实现），此后全程 matmul/softmax/sum/rmsnorm/attention 走 batch-invariant kernel"
+  ],
+
+  "design_decisions": [
+    {"decision": "AscendFusedMoE 继承 vLLM FusedMoE 而非重写，只换 quant_method/runner + 覆写 forward_impl", "why": "ch23『换头不换身』机制在最复杂算子上的实证：权重创建、路由参数、EP/DP/TP 配置、weight_loader 等『身体』全由 super().__init__ 复用，昇腾只替换『头』（量化方法 + 运行器 + 前向实现）。需把 base_quant_method 也同步换掉，否则 vLLM 的 maybe_init_modular_kernel 会 dispatch 回上游方法（设计上会 raise）。", "evidence": "vllm_ascend/ops/fused_moe/fused_moe.py:L335-L377"},
+    {"decision": "MoE 通信『策略模式』：MoECommType→(_get_token_dispatcher, _get_prepare_finalize) 配对，骨架 fused_experts 不变", "why": "MoE 难点是 token 按专家跨卡重分发，不同 soc/EP/token 规模最优通信原语不同（MC2 融合算子 / all_to_all / all_gather）。把『选哪种』(ch15 select_moe_comm_method) 与『怎么算』(本章 dispatcher) 解耦，每种方式只需提供一对 dispatcher+prepare_finalize，三段流水线复用。", "evidence": "vllm_ascend/ops/fused_moe/moe_comm_method.py:L87-L283"},
+    {"decision": "_fused_output_is_reduced 按 comm_type 返回 True（MC2/AllToAll/FusedMC2）", "why": "这三种的 finalize/combine 算子内部已含 TP all-reduce，若基类再 _maybe_reduce_final_output 会 double-count；AllGather 则每卡只有 partial output 仍需 all-reduce。通过覆写这个属性精确告诉 vLLM 基类该不该再 reduce。", "evidence": "vllm_ascend/ops/fused_moe/fused_moe.py:L272-L284"},
+    {"decision": "AllGather 路径用 npu_moe_token_unpermute 而非 npu_moe_finalize_routing", "why": "源码注释明示 npu_moe_finalize_routing 会导致精度问题，故 combine 用 unpermute 作 workaround。", "evidence": "vllm_ascend/ops/fused_moe/token_dispatcher.py:L419-L424; moe_comm_method.py:L195-L201"},
+    {"decision": "All2AllV 用不等长 split 的 dist.all_to_all_single + async_op", "why": "MoE 各专家收到的 token 数天然不均，需 all2all-v（按 input/output_split_sizes 给每卡不同条数）；async + handle.wait 让通信与 permute 计算重叠。这正是 ch06 NPUCommunicator.all_to_all 形状代数承诺留给 MoE 路由的落点。", "evidence": "vllm_ascend/ops/fused_moe/comm_utils.py:L26-L62; token_dispatcher.py:L494-L498"},
+    {"decision": "FusedMC2 把 dispatch+ffn+combine 融成单个 C++ 算子", "why": "decode/prefill 小 batch 下，分步 dispatch→mlp→combine 的 kernel launch + 中间张量开销显著，融合算子 dispatch_ffn_combine 一次完成、且只吃 NZ 权重格式（故 ch23 的 process_weights_after_loading 在 enable_fused_mc2 时强制 npu_format_cast 到 NZ）。", "evidence": "vllm_ascend/ops/fused_moe/moe_comm_method.py:L285-L348; fused_moe.py:L122-L124"},
+    {"decision": "batch-invariant 两步走：关漂移源 env + torch.library 替换算子", "why": "推理结果随 batch 拼法漂移的根因是 reduce 顺序（matmul K维累加分块、集合通信、TF32）非确定。override_envs 关掉 HCCL/LCCL 非确定性 reduce 与 matmul-allreduce 融合；enable_batch_invariant_mode 用固定分块 kernel 替换 mm/softmax/sum，使同一行无论和谁组 batch 都走相同 reduce 顺序、逐位复现。", "evidence": "vllm_ascend/batch_invariant.py:L76-L124; ops/triton/batch_invariant/matmul.py:L137,L82"}
+  ],
+
+  "theory": [
+    "MoE 路由的通信代数：N 个 token、每 token 选 top_k 个专家、共 E 个专家分布在 ep_size 张卡上（每卡 E/ep_size 个本地专家）。dispatch 要把 N*top_k 个 (token,expert) 对按 expert 归属卡重新分发，各卡收到的条数 = 落到本卡专家的 (token,expert) 对数，天然不等 → 需 all2all-v。combine 是其逆置换 + 按 topk_weights 加权求和还原回 N 个 token。",
+    "三种通信方式的权衡轴：AllGather 把全部 token 复制到每卡（通信量 O(N*ep_size*hidden)，但实现稳妥、EP=1 也能用）；All2AllV 只搬真正需要的 token（通信量 O(N*top_k*hidden/ep_size 量级)，DP>1 更省）；MC2/FusedMC2 用昇腾融合算子把 all2all+计算流水线化重叠（Comm-Compute parallelism），小 batch decode 最优。select_moe_comm_method 按 soc/EP/token 在这条轴上取点。",
+    "batch-invariance 的数学条件：浮点加法不满足结合律，故 sum 的结果依赖 reduce 顺序。要保证 f(x_i 在 batch A 中) == f(x_i 在 batch B 中)，需让每个输出元素的归约顺序只与该元素自身的 K/N 维有关、与 batch 维 M 怎么切分无关。固定 BLOCK_K 累加分块 + float32 累加 + 关 TF32 + 确定性集合通信，共同满足此条件。",
+    "复杂度直觉（不必精确）：AscendFusedMoE 把 ch23 的换头机制压到极限——被顶替算子约 900 行、横跨 12 个文件、4 种通信路径，却仍只通过『继承 + 替换 quant_method/runner + 覆写 forward_impl』三个接缝接入，证明 CustomOp 顶替机制的可扩展性上界足够高。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "所有量化分支：W8A8/W4A8/MXFP8/MXFP4/W4A8MXFP 的 dynamic_quant、npu_quant_matmul、dequant_swiglu_quant、comm_quant_mode、is_mxfp/_build_mxfp_params 等", "why_safe": "本章聚焦『通信方式选择 + 算子二分 + token 重分发』的控制流，量化是正交维度；精简版只跑非量化（QuantType.NONE）路径即可呈现完整骨架，量化分支删除不影响 dispatch→mlp→combine 三段结构的可读性。"},
+      {"what": "multistream/并流逻辑：multistream_overlap_gate、multistream_overlap_shared_expert、gate_stream/shared_experts_calculation_stream、npu_stream_switch、record_event/wait_event、FusedMoEEvents 全套", "why_safe": "并流是性能优化、不改变数值与数据流；删后 fused_experts/forward_impl 仍是同一条顺序流水线。事件字段在精简版可保留为 None 占位。"},
+      {"what": "dynamic_eplb 负载统计：moe_load/load_counter/multi_stage/index_add_ 及 init_eplb_config 的冗余专家 log2phy 重映射展开", "why_safe": "EPLB(专家负载均衡)是独立子系统（前面章节已覆盖伏笔），本章只需保留 expert_map/log2phy 作为路由输入的占位，负载回写逻辑删除不影响通信骨架。"},
+      {"what": "shared experts 全套：_forward_shared_experts、_shared_experts_part1/2、shared_forward_impl 的量化分支、_validate_shared_expert_consistency", "why_safe": "shared expert 是与 routed expert 并行的旁路计算，本章主线是 routed 专家的通信。精简版保留 forward_impl(routed) 主路径即可；shared 旁路删除不影响三选一通信与 token 重分发的展示。"},
+      {"what": "soc/设备细分：A2/A3/A5/310P 各自的 num_experts_per_device/ep_world_size/fused_mc2_enable 阈值；TokenDispatcherWithMC2 里 need_extra_args/a5_need_extra_args/need_comm_alg/hierarchical comm/global_bs 拼装", "why_safe": "这些是把抽象通信方式映射到具体硬件代际的细节，host 无 NPU 无法触发。精简版保留 select_moe_comm_method『按条件返回 4 种枚举之一』的骨架 + MC2 dispatcher『调 distribute_dispatch 返回 expand_x/expert_token_nums』的形状契约即可。"},
+      {"what": "PrepareAndFinalize 中 sequence-parallel(SP)/pcp_group/flashcomm 分支：_prepare_with_ep_group、_finalize_with_ep_group、pcp 相关、fc3_all_gather", "why_safe": "SP/PCP/flashcomm 是更上层并行模式的叠加，本章演示 DP/TP 基本路径（_prepare_with_dp_group + _finalize_with_dp_group / MC2 的 pad+slice）已足够说明 prepare/finalize 的职责。"},
+      {"what": "vllm_version_is('0.21.0') 兼容分叉、get_compressed_expert_map 回退定义、routed_experts capturer", "why_safe": "纯版本兼容/可观测性代码，与算子语义无关。"},
+      {"what": "triton kernel 函数体内部（matmul_bias_persistent_kernel/linear_persistent_kernel 的指针运算）与 mean/rmsnorm/softmax kernel", "why_safe": "host 无 NPU/triton 编译环境不真跑；精简版保留 matmul_persistent 的 Python 包装（固定 BLOCK + allow_tf32=False 注释）说明批不变原理即可，kernel 体可省略为说明性注释。"}
+    ],
+    "must_keep": [
+      {"symbol": "AscendFusedMoE", "why": "全书最大单体 OOT 算子、本章主角，必须呈现它继承 FusedMoE。"},
+      {"symbol": "forward_impl", "why": "昇腾覆写的核心方法，prepare→apply→finalize 三段骨架的载体。"},
+      {"symbol": "forward", "why": "委托给 runner.forward 的入口，连接 vLLM 基类调用约定。"},
+      {"symbol": "AscendUnquantizedFusedMoEMethod", "why": "quant_method 顶替对象，apply() 是选专家→fused_experts 的桥。"},
+      {"symbol": "select_experts", "why": "路由器选 topk 专家，token 重分发的输入来源。"},
+      {"symbol": "AscendMoERunner", "why": "runner 顶替对象，演示『只覆写两处行为旋钮』。"},
+      {"symbol": "use_dp_chunking", "why": "覆写为 False 强制走 forward_impl 的旋钮。"},
+      {"symbol": "_fused_output_is_reduced", "why": "按 comm_type 决定是否重复 all-reduce 的关键旋钮。"},
+      {"symbol": "setup_moe_comm_method", "why": "把 4 种 MoECommType 映射到实例的注册函数（回收 f10 落地）。"},
+      {"symbol": "_MoECommMethods", "why": "三选一注册表本体。"},
+      {"symbol": "get_moe_comm_method", "why": "每拍前向按 comm_type 取实例。"},
+      {"symbol": "MoECommMethod", "why": "通信方式基类，定义 prepare/finalize/fused_experts 骨架。"},
+      {"symbol": "fused_experts", "why": "dispatch→mlp→combine 三段流水线的骨架方法。"},
+      {"symbol": "AllGatherCommImpl", "why": "默认/EP=1 通信实现。"},
+      {"symbol": "MC2CommImpl", "why": "MC2 通信实现。"},
+      {"symbol": "AlltoAllCommImpl", "why": "all_to_all 通信实现（回收 f3 的策略层）。"},
+      {"symbol": "FusedMC2CommImpl", "why": "融合算子实现，演示覆写 fused_experts 把三步融一。"},
+      {"symbol": "_get_token_dispatcher", "why": "策略模式抽象接口，子类选 dispatcher。"},
+      {"symbol": "_get_prepare_finalize", "why": "策略模式抽象接口，子类选 prepare_finalize。"},
+      {"symbol": "MoETokenDispatcher", "why": "token 重分发基类。"},
+      {"symbol": "TokenDispatcherWithMC2", "why": "MC2 的 token 重分发（distribute_dispatch/combine）。"},
+      {"symbol": "TokenDispatcherWithAll2AllV", "why": "all_to_all 的 token 重分发（回收 f3 核心）。"},
+      {"symbol": "TokenDispatcherWithAllGather", "why": "all_gather 的 token 重分发（init_routing+unpermute）。"},
+      {"symbol": "token_dispatch", "why": "按专家把 token 重分发的方法（三种实现共有）。"},
+      {"symbol": "token_combine", "why": "把专家输出按原顺序聚回的方法。"},
+      {"symbol": "async_all_to_all", "why": "all2all-v 底层原语，f3 的真正落点。"},
+      {"symbol": "PrepareAndFinalize", "why": "通信前置/后置基类。"},
+      {"symbol": "PrepareAndFinalizeWithAllGather", "why": "AllGather 的 pad/all-gather/reduce-scatter。"},
+      {"symbol": "PrepareAndFinalizeWithMC2", "why": "MC2 的 pad+TP切片。"},
+      {"symbol": "PrepareAndFinalizeWithAll2All", "why": "All2All 的 pad+TP切片（MC2 继承它）。"},
+      {"symbol": "prepare", "why": "通信前置入口。"},
+      {"symbol": "finalize", "why": "通信后置入口。"},
+      {"symbol": "MoECommType", "why": "ALLGATHER/MC2/ALLTOALL/FUSED_MC2 枚举，连接 ch15。"},
+      {"symbol": "select_moe_comm_method", "why": "ch15 埋下的选择函数，f10 的起点。"},
+      {"symbol": "init_batch_invariance", "why": "batch-invariant 启动入口。"},
+      {"symbol": "override_envs_for_invariance", "why": "关非确定性源（HCCL/LCCL_DETERMINISTIC 等）。"},
+      {"symbol": "enable_batch_invariant_mode", "why": "torch.library 替换 aten 算子为确定性实现。"},
+      {"symbol": "matmul_persistent", "why": "batch-invariant matmul 的固定分块包装，演示批不变原理。"},
+      {"symbol": "reduce_sum", "why": "torch.sum 的确定性替换，批不变的 reduce 锚点。"}
+    ]
+  },
+
+  "diagram_plan": [
+    {"name": "moe-comm-three-way", "type": "many-to-many mapping (svg-diagram)", "spec": "三列映射图：左列 MoECommType 4 枚举(ALLGATHER/MC2/ALLTOALL/FUSED_MC2)；中列 4 个 *CommImpl 类(AllGather/MC2/AlltoAll/FusedMC2 CommImpl)；右列每个 CommImpl 连到它的 (TokenDispatcherWith*, PrepareAndFinalizeWith*) 配对。顶部标 setup_moe_comm_method 注册、底部标 ch15 select_moe_comm_method『按 soc/EP/token 选一行』。高亮 f10 回收点。", "roadmap_highlight": "ops/fused_moe (Part VI 算子层)"},
+    {"name": "token-redistribution-flow", "type": "data-flow with shapes (svg-diagram)", "spec": "横向流水线：N tokens × hidden → select_experts(topk) → token_dispatch（画 all_to_all-v 跨 4 张 EP 卡按专家归属重分发，各卡收到不等长，标 input_splits/output_splits）→ per-expert MLP(gmm1→swiglu→gmm2) → token_combine（逆置换 + topk_weights 加权聚回 N tokens）。对照标注三种实现：MC2=distribute_dispatch融合算子 / All2AllV=async_all_to_all / AllGather=全局复制+本地排序。高亮 f3 回收点(NPUCommunicator.all_to_all)。", "roadmap_highlight": "ops/fused_moe/token_dispatcher"},
+    {"name": "ascendfusedmoe-swap", "type": "inheritance/swap diagram (svg-diagram)", "spec": "上半：vLLM FusedMoE『身体』（weight创建/路由参数/EP配置/weight_loader 灰色保留）；下半：AscendFusedMoE 换的三个『头』——quant_method→AscendUnquantizedFusedMoEMethod、runner→AscendMoERunner(只改2旋钮)、forward_impl 覆写。箭头标 super().__init__ 复用 vs 替换点。呼应 ch23 换头不换身。", "roadmap_highlight": "ops/fused_moe/fused_moe.py"},
+    {"name": "batch-invariant-mechanism", "type": "two-step block diagram (svg-diagram)", "spec": "左块 override_envs_for_invariance：列出关掉的漂移源(weight_nz_mode=0 / matmul_allreduce off / HCCL=strict / LCCL=1)；右块 enable_batch_invariant_mode：torch.library 把 aten::mm/matmul/softmax/sum/rmsnorm 替换成固定分块 kernel。底部小图示意：同一行 token 在 batch=[A] vs batch=[A,B] 下因固定 BLOCK_K 累加顺序而逐位相同。", "roadmap_highlight": "batch_invariant + ops/triton/batch_invariant"}
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recycle": [
+      {"id": "f3", "planted_in": "ch06", "desc": "NPUCommunicator.all_to_all 真正被用到的地方——MoE/FusedMoE 按专家路由把 token 转置式重分发；本章兑现：TokenDispatcherWithAll2AllV.token_dispatch 调 async_all_to_all(dist.all_to_all_single, all2all-v 不等长 split) 把 token 按专家归属跨 EP 卡重分发，token_combine 再 all_to_all 一次聚回。", "evidence": "vllm_ascend/ops/fused_moe/token_dispatcher.py:L494-L498; comm_utils.py:L26-L62"},
+      {"id": "f10", "planted_in": "ch15", "desc": "ch15 的 select_moe_comm_method 在每拍前向只选定 moe_comm_type 枚举（ALLGATHER/MC2/ALLTOALL/FUSED_MC2）并经 setup_moe_comm_method 建好；本章兑现：setup_moe_comm_method 把每个枚举映射到真正的 *CommImpl 实例（_MoECommMethods 注册表），其下每对 TokenDispatcherWith*/PrepareAndFinalizeWith* 才是 MC2/all_to_all/all_gather 通信原语的真正算子落地。", "evidence": "vllm_ascend/ops/fused_moe/moe_comm_method.py:L48-L63; ascend_forward_context.py:L233-L319"}
+    ]
+  }
+}
