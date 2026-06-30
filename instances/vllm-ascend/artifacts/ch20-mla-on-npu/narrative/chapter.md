@@ -2,15 +2,15 @@
 
 ![你在这里](../diagrams/roadmap.png)
 
-> 上一章在注意力子系统里讲透了昇腾 MHA：TND 变长布局、`npu_fused_infer_attention_score` 与 LSE。
+> 上一章在注意力子系统里讲透了昇腾 MHA：TND 变长布局、`npu_fused_infer_attention_score`。
 > 本章接手同子系统的另一支——MLA：用低秩压缩把 KV cache 砍到约 1/57，再用「权重吸收」把解码期的解压省掉。
-> 下一章离开注意力，进入算子与编译层。
+> 注意力子系统还剩稀疏这一支——下一章看 SFA/DSA 怎么在 MLA 之上叠一层稀疏选择。
 
 这是本子系统 `torch_npu` 融合算子最密集的一章。`vllm_ascend/attention/mla_v1.py` 全文约 1804 行，把通用 MLA 的每一步都换成了昇腾专属的一把算子：`npu_format_cast`（权重排布）、`npu_kv_rmsnorm_rope_cache`（一把做 RMSNorm + RoPE + 写 KV cache）、`npu_fused_infer_attention_score(_v2)`（注意力）、`npu_attention_update`（在线 softmax 合并）。我们逐个拆开看。
 
 ## 20.1 先说清楚：MLA 到底省了什么
 
-MLA（Multi-head Latent Attention，多头潜在注意力）是 DeepSeek-V2/V3 带火的注意力变体。它解决的是一个很具体的痛点：**KV cache 太占显存**。
+MLA（Multi-head Latent Attention，多头潜在注意力；[首现见第 18 章](../ch18-attention-backend-selection/narrative/chapter.md)）是 DeepSeek-V2/V3 带火的注意力变体。它解决的是一个很具体的痛点：**KV cache 太占显存**。
 
 标准 MHA 每个 token、每一层，要为每个头各缓存一份 K 和一份 V。以 DeepSeek-V3 为例，128 个头、每头 K/V 各 128 维：
 
@@ -180,7 +180,7 @@ o = einsum("snl,lnv->snv", spda_o.reshape(-1, N, Lkv), W_UV)
 
 `ql_nope = einsum("snh,lnh->snl", q, W_UK)` 就是昇腾的 `torch.bmm(q_nope, W_UK_T)`——同一回事的两种写法；`scaled_dot_product_attention` 的 K、V 都传 `kv_c`，就是我们说的「对 latent 做 MQA」；末尾的 `einsum(..., W_UV)` 对应昇腾的 `_v_up_proj`。昇腾做的，是把这段伪代码的每一步换成融合算子。
 
-decode 时 K 和 V 都用缓存的同一份 `kv_c`，于是注意力退化成 **MQA**（多个 query 头共享同一份 KV）。算完之后，注意力输出还在 latent 空间，需要再投回 V，这由 `_v_up_proj` 闭合：
+decode 时 K 和 V 都用缓存的同一份 `kv_c`，于是注意力退化成前面说过的 **MQA**。算完之后，注意力输出还在 latent 空间，需要再投回 V，这由 `_v_up_proj` 闭合：
 
 ```python
 # vllm_ascend/attention/mla_v1.py:L900
@@ -805,4 +805,4 @@ $$
 - **prefill 和 decode 各走各的**：decode 数据搬运受限 → 吸收成 MQA；prefill 计算受限 → 显式 `kv_b_proj` 解压走 MHA。两路在 `forward` 内按 `has_decode` / `has_prefill` 分流，写进同一块 `o_proj_input` 的不同段。
 - **每一步都换成昇腾融合算子**：`npu_format_cast`（权重排布 ND/NZ）、`npu_kv_rmsnorm_rope_cache`（RMSNorm + RoPE + 写 cache 三合一）、`npu_fused_infer_attention_score(_v2)`（注意力）、`npu_attention_update`（chunked 历史的在线 softmax 合并）。这是本子系统算子最密集的一处。
 
-至此，注意力子系统（MHA + MLA）的昇腾实现就讲完了。这些 `torch_npu` 融合算子是从哪来的、又如何注册进 PyTorch 的算子分发体系？下一章离开注意力，进入算子与编译层，回答这个问题。
+MHA、MLA 两支在昇腾上都讲透了，但注意力子系统还剩稀疏这一支。当上下文长到几十万 token、连 MLA 的 1/57 也省不动时，就得换个思路：不再对每个历史 token 都算注意力，而是只挑出少数关键 token。这正是[下一章 SFA/DSA](../ch21-sparse-attention-sfa-dsa/narrative/chapter.md)要在 MLA 之上叠的那层稀疏选择。

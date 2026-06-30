@@ -1,12 +1,12 @@
 # 第 19 章 标准 MHA 的 NPU 内核与状态机：AscendAttentionBackendImpl
 
-![本章在全书地图中的位置](../diagrams/roadmap.png)
+![你在这里：MHA 注意力后端的 forward 实现在全书地图中的位置](../diagrams/roadmap.png)
 
-> *上一章把后端「选」了出来：`get_impl_cls` 返回 `AscendAttentionBackendImpl`。*
-> *本章钻进这个类，看 `forward` 里 NPU 到底算了什么。*
-> *下一章换 MLA 后端，对照另一种 KV 几何。*
+> 上一章把后端「选」了出来：`get_impl_cls` 返回 `AscendAttentionBackendImpl`。
+> 本章钻进这个类，看 `forward` 里 NPU 到底算了什么。
+> 下一章换 MLA 后端，对照另一种 KV 几何。
 
-[第 18 章](../ch18-attention-backend-selection/narrative/chapter.md) 结束在一个悬念上。我们看清了一个出树（out-of-tree，OOT）后端怎么接进 vLLM 的注意力框架。路由、注册、伪装、契约、分流五件事拼好后，`get_impl_cls` 交还一个类：`AscendAttentionBackendImpl`。但我们始终停在「选择」这一层，没碰任何一个真正的算子。
+[第 18 章](../ch18-attention-backend-selection/narrative/chapter.md) 结束在一个悬念上。我们看清了一个树外（out-of-tree，OOT）后端怎么接进 vLLM 的注意力框架。路由、注册、伪装、契约、分流五件事拼好后，`get_impl_cls` 交还一个类：`AscendAttentionBackendImpl`。但我们始终停在「选择」这一层，没碰任何一个真正的算子。
 
 这一章，我们就钻进那个被选中的标准 MHA 后端。先把问题摆明白：标准多头注意力（MHA）在昇腾 NPU 上，到底是怎么算的？
 
