@@ -1,0 +1,152 @@
+{
+  "chapter_id": "ch28",
+  "title": "采样的 NPU 对位：薄壳子类化 + 异步指数随机 + Triton 优雅回退",
+  "fidelity_alerts": [
+    {
+      "alert": "★最重要：Gumbel-max（probs.div_(q).argmax）不是昇腾的发明，是从 vLLM 基类原样继承的。",
+      "evidence_ascend": "vllm_ascend/sample/sampler.py:L19-L41 的模块级 random_sample",
+      "evidence_base": "vllm/v1/sample/ops/topk_topp_sampler.py:L385-L406 的 random_sample —— 逐字几乎一致，连 docstring『We use this function instead of torch.multinomial because torch.multinomial causes CPU-GPU synchronization』都相同（昇腾把 GPU 改成 NPU）。基类 forward_native(L111-130) 走的就是这个 Gumbel random_sample，不走 multinomial。",
+      "directive_to_writer": "禁止把『用 Gumbel 绕开 multinomial』说成昇腾的 NPU 对位创新。真相是：(1) Gumbel-max 等价式是 vLLM 上游为规避 multinomial 同步早就采用的，昇腾继承；(2) 昇腾真正新增的 delta 是把这段指数随机 q.exponential_() 用 npu_stream_switch(global_stream()) 放到独立 stream 异步做、再 wait_stream 汇流（sampler.py:L28-L40），以及 enable_async_exponential 下的 do_async_exponential 预计算 + Event 同步路径。算法宝石（Gumbel 数学）仍值得推导（它解释了为什么能避开 multinomial），但归属要写准：数学来自上游，异步 stream 编排来自昇腾。",
+      "base_multinomial_location": "基类里 torch.multinomial 只出现在 aiter(ROCm) 旁路 aiter_sample(L248) 与 flashinfer 路径，CUDA/CPU 的 PyTorch-native 主路同样用 Gumbel。所以『vLLM 原版 random_sample 调 multinomial』这个前提表述不准确，dossier 据真实源码纠正。"
+    }
+  ],
+  "code_spine": [
+    "vllm_ascend/sample/sampler.py:L19-L41  random_sample（Gumbel + npu_stream_switch 异步指数随机）",
+    "vllm_ascend/sample/sampler.py:L44-L125 AscendSampler(Sampler)：apply_penalties / __init__ / do_async_exponential / greedy_sample（薄壳覆写）",
+    "vllm_ascend/sample/sampler.py:L128-L185 AscendTopKTopPSampler(TopKTopPSampler).forward_native（覆写 native 路径：batch_invariant 回退 / reduce_sample / async-exponential / 普通 Gumbel）",
+    "vllm_ascend/sample/sampler.py:L188-L300 _apply_top_k_top_p_pytorch / _apply_top_k_top_p_ascendc 与 apply_top_k_top_p 派发（A2/A3 走 AscendC 自定义算子，否则 PyTorch）",
+    "vllm_ascend/sample/penalties.py:L24-L43 apply_all_penalties（与基类同接口，内部转调 Triton-Ascend apply_penalties_triton）",
+    "vllm_ascend/sample/rejection_sampler.py:L34-L198 AscendRejectionSampler(RejectionSampler)：apply_penalties / prepare_sampling / __init__ / forward（薄壳覆写）",
+    "vllm_ascend/sample/rejection_sampler.py:L289-L724 rejection_sample（每个分支 if HAS_TRITON: Triton kernel else: *_pytorch 回退）",
+    "vllm_ascend/sample/rejection_sampler.py:L770-L847 sample_recovered_tokens（被拒后从残差分布重采，同样 Triton/PyTorch 双实现）",
+    "对照基座：vllm/v1/sample/sampler.py(Sampler) / vllm/v1/sample/ops/topk_topp_sampler.py(TopKTopPSampler, random_sample) / vllm/v1/sample/rejection_sampler.py(RejectionSampler)"
+  ],
+  "key_classes": [
+    {"name": "AscendSampler", "file": "vllm_ascend/sample/sampler.py", "responsibility": "继承 vllm Sampler，只覆写会碰 NPU 同步/能上 Triton 的几处：apply_penalties（Triton+回退）、greedy_sample（可选 TP all-gather）、装配 AscendTopKTopPSampler、do_async_exponential（异步指数随机预计算）。其余采样主流程（forward/sample/温度/logprobs）继承基类不动。"},
+    {"name": "AscendTopKTopPSampler", "file": "vllm_ascend/sample/sampler.py", "responsibility": "继承 vllm TopKTopPSampler，覆写 forward_native：用 torch_npu 的 top-k/top-p + Gumbel random_sample；并接住 VLLM_BATCH_INVARIANT 回退、reduce_sample 分布式、async-exponential 三条分支。"},
+    {"name": "AscendRejectionSampler", "file": "vllm_ascend/sample/rejection_sampler.py", "responsibility": "继承 vllm RejectionSampler（投机解码拒绝采样），覆写 apply_penalties / forward / prepare_sampling / __init__；核心 rejection_sample 每个热点都是『HAS_TRITON 走昇腾 Triton kernel，否则走等价 *_pytorch 回退』。"},
+    {"name": "Sampler (基类)", "file": "vllm/v1/sample/sampler.py", "responsibility": "对照基座：采样主层。sample() 先 greedy_sample 再 topk_topp_sampler，按温度 where 选择；apply_penalties 走纯 torch apply_all_penalties。"},
+    {"name": "TopKTopPSampler (基类)", "file": "vllm/v1/sample/ops/topk_topp_sampler.py", "responsibility": "对照基座：top-k/top-p + 加权随机采样。模块级 random_sample 已用 Gumbel（probs.div_(q).argmax）规避 multinomial 同步——昇腾继承之。"},
+    {"name": "RejectionSampler (基类)", "file": "vllm/v1/sample/rejection_sampler.py", "responsibility": "对照基座：投机解码拒绝采样。定义 GREEDY_TEMPERATURE/PLACEHOLDER_TOKEN_ID/MAX_SPEC_LEN/generate_uniform_probs，__init__(sampler) 持有 bonus 采样器。昇腾继承它、覆写采样热点。"}
+  ],
+  "data_flow": [
+    "1) ch15 NPUModelRunner._sample 二选一派发（伏笔 f11）：无 spec → AscendSampler；有 spec → AscendRejectionSampler。本章承接此派发。",
+    "2) AscendSampler.forward（继承基类不覆写）→ apply_penalties（覆写：Triton 或回退）→ sample（继承）→ greedy_sample（覆写）/ topk_topp_sampler=AscendTopKTopPSampler.forward_native（覆写）。",
+    "3) forward_native 普通分支：apply_top_k_top_p(logits,k,p) 截断 → softmax 得 probs → random_sample(probs, generators)。",
+    "4) random_sample：with npu_stream_switch(global_stream())：q=empty_like(probs)；q.exponential_()（按 generator 覆写有种子的行）→ 回主 stream wait_stream → return probs.div_(q).argmax(dim=-1)。Gumbel-max 等价多项式采样、全程 NPU、无 CPU-NPU 同步。",
+    "5) async-exponential 旁路（enable_async_exponential）：模型前向期间 do_async_exponential 在 global_stream 预算好 q 并 record Event；forward_native 里 async_event.synchronize() 后直接 probs.div_(self.q).argmax，把指数随机与模型计算重叠。",
+    "6) 投机解码：AscendRejectionSampler.forward → bonus 用 self.sampler 采样 → apply_sampling_constraints（温度/top-k/top-p）→ rejection_sample。",
+    "7) rejection_sample：先 greedy 分支（target_argmax = argmax 或 reduce_sample 的 TP all-gather greedy_sample），HAS_TRITON 则 rejection_greedy_sample_with_triton，否则 rejection_greedy_sample_pytorch；再 random 分支（softmax→generate_uniform_probs→sample_recovered_tokens→rejection_random_sample_kernel 或 *_pytorch）。",
+    "8) penalties：AscendSampler/AscendRejectionSampler.apply_penalties → HAS_TRITON 则 apply_all_penalties→apply_penalties_triton；否则回退基类 Sampler.apply_penalties（纯 torch）。"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm_ascend/sample/sampler.py", "lines": "L19-L41",
+      "code": "def random_sample(\n    probs: torch.Tensor,\n    generators: dict[int, torch.Generator],\n) -> torch.Tensor:\n    \"\"\"Randomly sample from the probabilities.\n\n    We use this function instead of torch.multinomial because torch.multinomial\n    causes CPU-NPU synchronization.\n    \"\"\"\n    # NOTE(woosuk): To batch-process the requests without their own seeds,\n    # which is the common case, we first assume that every request does\n    # not have its own seed. Then, we overwrite the values for the requests\n    # that have their own seeds.\n    with npu_stream_switch(global_stream()):\n        q = torch.empty_like(probs)\n        if len(generators) != probs.shape[0]:\n            q.exponential_()\n        if generators:\n            # TODO(woosuk): This can be slow because we handle each request\n            # one by one. Optimize this.\n            for i, generator in generators.items():\n                q[i].exponential_(generator=generator)\n    torch.npu.current_stream().wait_stream(global_stream())\n    return probs.div_(q).argmax(dim=-1).view(-1)",
+      "elide": ["无可省略分支——这是全章算法核心。但 writer 须并列展示下方基座 random_sample 以点明：Gumbel 来自上游，昇腾 delta 仅是 npu_stream_switch/wait_stream 两行异步包裹。"]
+    },
+    {
+      "path": "vllm/v1/sample/ops/topk_topp_sampler.py", "lines": "L385-L406",
+      "code": "def random_sample(\n    probs: torch.Tensor,\n    generators: dict[int, torch.Generator],\n) -> torch.Tensor:\n    \"\"\"Randomly sample from the probabilities.\n\n    We use this function instead of torch.multinomial because torch.multinomial\n    causes CPU-GPU synchronization.\n    \"\"\"\n    q = torch.empty_like(probs)\n    # NOTE(woosuk): To batch-process the requests without their own seeds,\n    # which is the common case, we first assume that every request does\n    # not have its own seed. Then, we overwrite the values for the requests\n    # that have their own seeds.\n    if len(generators) != probs.shape[0]:\n        q.exponential_()\n    if generators:\n        # TODO(woosuk): This can be slow because we handle each request\n        # one by one. Optimize this.\n        for i, generator in generators.items():\n            q[i].exponential_(generator=generator)\n    return probs.div_(q).argmax(dim=-1).view(-1)",
+      "elide": ["对照基座原文：与昇腾版逐字同构，仅缺 npu_stream_switch/wait_stream 包裹、GPU vs NPU 注释。证明 Gumbel-max 系上游既有规避 multinomial 的手法。"]
+    },
+    {
+      "path": "vllm_ascend/sample/sampler.py", "lines": "L44-L72",
+      "code": "class AscendSampler(Sampler):\n    @staticmethod\n    def apply_penalties(\n        logits: torch.Tensor,\n        sampling_metadata: SamplingMetadata,\n        output_token_ids: list[list[int]],\n    ) -> torch.Tensor:\n        \"\"\"Use Triton-Ascend penalties on NPU when Triton is available; else vLLM default.\"\"\"\n        if not HAS_TRITON:\n            logger.warning_once(\n                \"[sample/sampler] Triton not available, falling back to vLLM default \"\n                \"penalty implementation. Penalty performance may be degraded on NPU. \"\n            )\n            return Sampler.apply_penalties(logits, sampling_metadata, output_token_ids)\n\n        if sampling_metadata.no_penalties:\n            return logits\n        assert sampling_metadata.prompt_token_ids is not None\n        return apply_all_penalties(\n            logits,\n            sampling_metadata.prompt_token_ids,\n            sampling_metadata.presence_penalties,\n            sampling_metadata.frequency_penalties,\n            sampling_metadata.repetition_penalties,\n            output_token_ids,\n        )",
+      "elide": ["昇腾 Triton 是加速、不是依赖：HAS_TRITON 不可用即 return Sampler.apply_penalties(...) 走基类纯 torch 原版。这是『加速器可选回退』的典范单元。"]
+    },
+    {
+      "path": "vllm_ascend/sample/sampler.py", "lines": "L91-L125",
+      "code": "    def do_async_exponential(self, b_s, head_dim, generators):\n        # Calculating exponential randoms in a different stream\n        # and overlapping with model executing.\n        with torch.npu.stream(global_stream()):\n            global_stream().wait_stream(torch.npu.current_stream())\n            q = torch.empty((b_s, head_dim), device=\"npu\", dtype=torch.float32)\n            # Goes to async exponential with AI-CPU exponential or default exponential.\n            if len(generators) != q.shape[0]:\n                q.exponential_()\n            if generators:\n                for i, generator in generators.items():\n                    q[i].exponential_(generator=generator)\n            self.async_exponential_event.record()\n        self.set_q_event(q, self.async_exponential_event)\n\n    @staticmethod\n    def greedy_sample(logits: torch.Tensor) -> torch.Tensor:\n        if get_ascend_config().enable_reduce_sample:\n            tp_group = get_tp_group()\n            B, V_local = logits.shape\n            rank = tp_group.rank_in_group\n\n            local_max_logits, local_max_indices = logits.max(dim=-1)\n            local_global_idx = local_max_indices + rank * V_local  # [B]\n            # [B, world_size]\n            gathered_logits = tp_group.all_gather(local_max_logits.unsqueeze(-1), dim=-1)\n            gathered_global_idx = tp_group.all_gather(local_global_idx.unsqueeze(-1), dim=-1)  # [B, world_size]\n            global_max_rank = gathered_logits.argmax(dim=-1)  # [B]\n            target_argmax = gathered_global_idx.gather(dim=-1, index=global_max_rank.unsqueeze(-1)).squeeze(-1)  # [B]\n            return target_argmax\n        else:\n            return logits.argmax(dim=-1).view(-1)",
+      "elide": ["greedy_sample 的 enable_reduce_sample 分支（TP all-gather 求全局 argmax，词表按 TP 切分时用）可视作次要优化；else 分支就是基类的 logits.argmax。do_async_exponential 是 async-exponential 旁路的预计算入口（debug 日志行已省略）。"]
+    },
+    {
+      "path": "vllm_ascend/sample/sampler.py", "lines": "L143-L185",
+      "code": "    def forward_native(self, logits, generators, k, p):\n        \"\"\"Override pytorch native implementation to torch_npu\"\"\"\n        # when batch_invariant mode is enabled, we should use vllm's implementation.\n        # or it will make batch_invariant mode not working.\n        if envs.VLLM_BATCH_INVARIANT:\n            return super().forward_native(logits, generators, k, p)\n\n        if get_ascend_config().enable_reduce_sample:\n            cand_logits, cand_idx = self.apply_top_k_top_p(logits, k, p, self.top_k)\n            ...\n            probs = cand_logits.softmax(dim=-1, dtype=torch.float32)\n            pos = random_sample(probs, generators)  # [B]\n            next_token = cand_idx.gather(dim=1, index=pos.unsqueeze(1)).squeeze(1)  # [B]\n            return next_token, logits_to_return\n        else:\n            logits = self.apply_top_k_top_p(logits, k, p)\n            logits_to_return = None\n            if self.logprobs_mode == \"processed_logits\":\n                logits_to_return = logits\n            elif self.logprobs_mode == \"processed_logprobs\":\n                logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)\n\n            probs = logits.softmax(dim=-1, dtype=torch.float32)\n            if get_ascend_config().enable_async_exponential:\n                # Add synchronize to prevent synchronize error.\n                self.async_event.synchronize()\n                return probs.div_(self.q).argmax(dim=-1).view(-1), logits_to_return\n            return random_sample(probs, generators), logits_to_return",
+      "elide": ["reduce_sample 分支内部的 logprobs_mode 细节用 ... 省略（与 else 分支同形）。三条分支要点：VLLM_BATCH_INVARIANT→回退基类(与 ch26 确定性同源)；enable_reduce_sample→TP 候选集采样；async_exponential→复用预计算 self.q 直接 div_/argmax。默认走 random_sample。"]
+    },
+    {
+      "path": "vllm_ascend/sample/sampler.py", "lines": "L287-L300",
+      "code": "def _apply_top_k_top_p_ascendc(\n    logits: torch.Tensor,\n    k: torch.Tensor,\n    p: torch.Tensor,\n    top_k: int | None = None,\n) -> torch.Tensor:\n    ...\n    if p is None and k is None:\n        return logits\n    return torch.ops._C_ascend.npu_apply_top_k_top_p(logits, k=k, p=p)\n\n\napply_top_k_top_p = (\n    _apply_top_k_top_p_ascendc\n    if get_ascend_device_type() in [AscendDeviceType.A2, AscendDeviceType.A3]\n    else _apply_top_k_top_p_pytorch\n)",
+      "elide": ["_apply_top_k_top_p_ascendc 的 enable_reduce_sample 分支（TP all-gather 后调 npu_apply_top_k_top_p）省略。要点：A2/A3 芯片走 AscendC 自定义算子 torch.ops._C_ascend.npu_apply_top_k_top_p，否则走 _apply_top_k_top_p_pytorch（纯 torch 的 sort/cumsum/masked_fill 截断，host 可跑）。模块加载期按芯片型号定派发。"]
+    },
+    {
+      "path": "vllm_ascend/sample/penalties.py", "lines": "L24-L43",
+      "code": "def apply_all_penalties(\n    logits: torch.Tensor,\n    prompt_token_ids: torch.Tensor,\n    presence_penalties: torch.Tensor,\n    frequency_penalties: torch.Tensor,\n    repetition_penalties: torch.Tensor,\n    output_token_ids: list[list[int]],\n) -> torch.Tensor:\n    \"\"\"Apply penalties to logits via Triton-Ascend.\"\"\"\n    _, vocab_size = logits.shape\n    output_tokens_t = _convert_to_tensors(output_token_ids, vocab_size, logits.device)\n    output_tokens_t.masked_fill_(output_tokens_t == -1, vocab_size)\n\n    return apply_penalties_triton(\n        logits,\n        prompt_token_ids,\n        output_tokens_t,\n        presence_penalties,\n        frequency_penalties,\n        repetition_penalties,\n    )",
+      "elide": ["与 vllm/v1/sample/ops/penalties.py 的 apply_all_penalties 同名同签名（薄壳的『同接口换内核』），仅把内核从纯 torch 换成 apply_penalties_triton（昇腾 Triton kernel）。_convert_to_tensors 把变长 output_token_ids padding 成张量。"]
+    },
+    {
+      "path": "vllm_ascend/sample/rejection_sampler.py", "lines": "L34-L96",
+      "code": "class AscendRejectionSampler(RejectionSampler):\n    \"\"\"Ascend-optimized rejection sampler for speculative decoding.\"\"\"\n\n    @staticmethod\n    def apply_penalties(\n        logits: torch.Tensor,\n        sampling_metadata: SamplingMetadata,\n        metadata: SpecDecodeMetadata,\n        repeat_indices: torch.Tensor,\n        output_token_ids: list[list[int]],\n    ) -> torch.Tensor:\n        if sampling_metadata.no_penalties:\n            return logits\n\n        \"\"\"Use Triton-Ascend penalties on NPU when Triton is available; else vLLM default.\"\"\"\n        if not HAS_TRITON:\n            logger.warning_once(...)\n            return Sampler.apply_penalties(logits, sampling_metadata, output_token_ids)\n\n        assert sampling_metadata.prompt_token_ids is not None\n        prompt_token_ids = sampling_metadata.prompt_token_ids[repeat_indices]\n        presence_penalties = sampling_metadata.presence_penalties[repeat_indices]\n        frequency_penalties = sampling_metadata.frequency_penalties[repeat_indices]\n        repetition_penalties = sampling_metadata.repetition_penalties[repeat_indices]\n        return apply_all_penalties(\n            logits,\n            prompt_token_ids,\n            presence_penalties,\n            frequency_penalties,\n            repetition_penalties,\n            output_token_ids,\n        )\n\n    def __init__(self, sampler):\n        super().__init__(sampler)\n        self._ascend_optimizations_enabled = True\n        self.top_k = None",
+      "elide": ["warning_once 文案、prepare_sampling、__init__ 的 debug 日志省略。薄壳证据：类体只覆写 apply_penalties / prepare_sampling / __init__ / forward 这几处；apply_penalties 同样『HAS_TRITON 否则回退 Sampler.apply_penalties』。repeat_indices 是投机解码把每请求按 draft 数展开的索引。"]
+    },
+    {
+      "path": "vllm_ascend/sample/rejection_sampler.py", "lines": "L404-L443",
+      "code": "    # For greedy sampling, we need to do allgather first to get global argmax\n    if not sampling_metadata.all_random:\n        if get_ascend_config().enable_reduce_sample:\n            target_argmax = greedy_sample(target_logits)\n        else:\n            target_argmax = target_logits.argmax(dim=-1).view(-1)\n\n        if HAS_TRITON:\n            rejection_greedy_sample_with_triton(\n                output_token_ids,\n                num_draft_tokens,\n                cu_num_draft_tokens,\n                draft_token_ids,\n                target_argmax,\n                bonus_token_ids,\n                is_greedy,\n                max_spec_len,\n                grid,\n                block_size,\n            )\n        else:\n            if min(num_draft_tokens) == 1 and max(num_draft_tokens) == 1 and sampling_metadata.all_greedy:\n                rejection_greedy_sample_spec_len_1_pytorch(\n                    output_token_ids,\n                    draft_token_ids,\n                    target_argmax,\n                    bonus_token_ids,\n                )\n            else:\n                rejection_greedy_sample_pytorch(\n                    output_token_ids,\n                    cu_num_draft_tokens,\n                    draft_token_ids,\n                    target_argmax,\n                    bonus_token_ids,\n                    num_draft_tokens,\n                    max_spec_len,\n                    is_greedy,\n                )\n        if sampling_metadata.all_greedy:\n            return output_token_ids",
+      "elide": ["这是 rejection_sample 里 greedy 接受检验的代表片段，展示全文统一的『if HAS_TRITON: 昇腾 Triton kernel else: *_pytorch 回退』骨架。random 分支(L445+)、block_verify/entropy_verify 高级模式、reduce_sample 候选集路径同构，可在精简版省略保留一条代表路径。"]
+    }
+  ],
+  "design_decisions": [
+    {"decision": "薄壳子类化：只覆写碰 NPU 同步/能上 Triton 的少数热点，其余继承基类。", "why": "AscendSampler 仅覆写 apply_penalties/greedy_sample/forward_native 装配，forward/sample/温度/logprobs 全继承；AscendRejectionSampler 仅覆写 apply_penalties/forward/prepare_sampling/__init__。降低与上游的偏离面、易随 vLLM 升级。", "evidence": "vllm_ascend/sample/sampler.py:L44, vllm_ascend/sample/rejection_sampler.py:L34"},
+    {"decision": "Gumbel-max 等价式规避 torch.multinomial（继承自上游，非昇腾原创）。", "why": "multinomial 会触发 CPU-NPU(基座是 CPU-GPU) 同步、卡流水线；probs.div_(q).argmax（q~Exp(1)）与按 prob 多项式采样同分布，全程在设备上、无同步。", "evidence": "vllm_ascend/sample/sampler.py:L19-L41 与 vllm/v1/sample/ops/topk_topp_sampler.py:L385-L406（逐字同构，docstring 相同）"},
+    {"decision": "昇腾真正的 NPU delta：把指数随机放到独立 stream 异步做。", "why": "用 npu_stream_switch(global_stream()) 把 q.exponential_() 切到 side stream，再 wait_stream 汇流；enable_async_exponential 更进一步在模型前向期间 do_async_exponential 预算 q + record Event，forward_native 里 synchronize 后直接复用，使 RNG 与模型计算重叠。", "evidence": "vllm_ascend/sample/sampler.py:L28-L40, L91-L105, L177-L183"},
+    {"decision": "penalties / top-k-top-p / 拒绝采样走昇腾 Triton，HAS_TRITON 不可用优雅回退。", "why": "Triton 是加速、不是依赖。apply_penalties / rejection_sample 每个热点都是『if not HAS_TRITON: 走基类原版 / *_pytorch』，保证无 Triton 仍正确（性能降级）。", "evidence": "vllm_ascend/sample/sampler.py:L52-L57, rejection_sampler.py:L56-L62, L410-L441"},
+    {"decision": "top-k/top-p 按芯片型号在加载期派发。", "why": "A2/A3 走 AscendC 自定义算子 npu_apply_top_k_top_p，其余走 _apply_top_k_top_p_pytorch（sort/cumsum/masked_fill 截断）。", "evidence": "vllm_ascend/sample/sampler.py:L295-L300"},
+    {"decision": "VLLM_BATCH_INVARIANT 下回退 vLLM 原生 top-k/top-p。", "why": "与 ch26 batch-invariant 确定性同源——昇腾 Triton/torch_npu 路径会破坏 batch 不变性，故确定性模式必须回退基类原生实现。", "evidence": "vllm_ascend/sample/sampler.py:L150-L154"},
+    {"decision": "可选 reduce_sample：词表按 TP 切分时用 all-gather 求全局 argmax / 候选集采样。", "why": "TP 并行下每卡只有局部词表 logits；greedy_sample 与 apply_top_k_top_p 的 reduce_sample 分支做 TP all-gather 拼全局再选。默认关闭，是次要分布式优化。", "evidence": "vllm_ascend/sample/sampler.py:L108-L122, ascend_config.py:L270"},
+    {"decision": "投机解码高级接受模式 block_verify / entropy_verify（MagicMTP）。", "why": "max_spec_len>=3 且 enable_block_verify 时用块校验、enable_entropy_verify 用熵阈值提升接受率。是 rejection_sample 的可选增强分支，默认关闭。", "evidence": "vllm_ascend/sample/rejection_sampler.py:L351-L355, ascend_config.py:L281-L282"}
+  ],
+  "theory": [
+    {"topic": "指数/Gumbel-max 采样与多项式采样同分布（算法宝石，须推导）", "content": "命题：设类别概率 p_1..p_V（Σp=1），独立抽 q_i~Exp(1)，则 argmax_i (p_i/q_i) 的分布等于 Categorical(p)。证明：argmax_i p_i/q_i = argmin_i q_i/p_i。由指数分布缩放性，q_i/p_i ~ Exp(p_i)（速率 p_i）。独立指数变量取最小值落在第 i 个的概率为 速率_i/Σ速率_j = p_i/Σp_j = p_i。故 argmin（=argmax p/q）落在 i 的概率正好是 p_i。证毕。等价 Gumbel 视角：-log q_i 服从 Gumbel 分布，argmax(log p_i + Gumbel_i) 即 Gumbel-max trick。复杂度 O(V) 逐元素 + 一次 argmax，无 CDF/无 host 回拷，故无 CPU-NPU 同步——这正是替代 torch.multinomial 的原因（multinomial 内部走 CDF + 设备-主机同步）。可在 host CPU torch 用大样本经验频率验证 div_(Exp).argmax 与 multinomial 同分布。"},
+    {"topic": "为什么独立 stream 能省时间", "content": "q.exponential_() 的 RNG 与本步 logits→probs 的矩阵计算无数据依赖。放到 global_stream 异步发起、模型计算在主 stream 推进，二者 NPU 上重叠；只在最终 div_ 前 wait_stream/Event.synchronize 一次汇流。理想下把 RNG 延迟藏进模型前向，临界路径少一段。"},
+    {"topic": "投机解码拒绝采样的接受判据", "content": "对 draft 概率 p_draft、target 概率 p_target、均匀样本 u：接受当 p_target/p_draft >= u（rejection_random_sample_pytorch:L1036）。被拒则从残差分布 max(0, p_target - p_draft) 归一后用同样的 q~Exp(1) argmax 重采（sample_recovered_tokens_pytorch）。bonus token 在全接受时追加。entropy_verify 把 u 阈值改为 min(exp(-entropy*alpha), posterior_threshold)*u 提升接受率。"}
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {"what": "enable_reduce_sample 的所有 TP all-gather 分布式分支（greedy_sample 的 reduce 分支、forward_native 的 reduce 分支、_apply_top_k_top_p_* 的 reduce 分支、rejection_sample 的 target_indices 候选集路径、reject 各 pytorch kernel 的 enable_reduce_sampling 分支）", "why_safe": "默认关闭(ascend_config.enable_reduce_sample=False)的次要分布式优化，需 get_tp_group/多卡；删后单卡主路（argmax/普通 top-k-top-p/普通 rejection）行为不变。精简版保留 else 单卡分支即可。"},
+      {"what": "_apply_top_k_top_p_ascendc 整函数与 apply_top_k_top_p 的 AscendC 派发（torch.ops._C_ascend.npu_apply_top_k_top_p）", "why_safe": "需 A2/A3 芯片 + CANN 自定义算子，host 不可跑；保留 _apply_top_k_top_p_pytorch 作唯一实现即等价（纯 torch sort/cumsum/masked_fill）。"},
+      {"what": "async-exponential 路径（do_async_exponential / set_q_event / async_exponential_event / forward_native 的 enable_async_exponential 分支）", "why_safe": "默认关闭(enable_async_exponential=False)的 NPU Event 重叠优化，需 torch.npu.Event/Stream；删后走 random_sample 主路，采样结果分布不变。"},
+      {"what": "投机解码 block_verify / entropy_verify 高级模式（rejection_random_sample_block_verify_* 两份 kernel、sample_recovered_tokens_blockwise_pytorch、using_block_verify/using_entropy_verify 相关分支与 info/debug 日志）", "why_safe": "默认关闭的接受率增强(MagicMTP)，保留基础 rejection_random_sample_pytorch / sample_recovered_tokens_pytorch 即得标准投机解码拒绝采样。"},
+      {"what": "所有 logger.debug/debug_once/info_once/warning_once 日志语句（保留 if not HAS_TRITON 的控制流，仅删其 logger 行）", "why_safe": "纯观测旁路，不影响数值与控制流。"},
+      {"what": "rejection_sample 中 target_indices is not None 的整支（候选集模式，属 reduce_sample 衍生）与最后的 else『Fallback to original mode』里与单卡重复的部分——精简版仅保留一条 random 代表路径", "why_safe": "target_indices 仅在 enable_reduce_sampling 下非 None；非 reduce 单卡走最后 else 的标准 vocab 路径，二者对单卡等价，保留其一。"}
+    ],
+    "must_keep": [
+      {"symbol": "random_sample", "why": "全章算法核心：Gumbel-max 规避 multinomial 同步，必须逐字保留含 exponential_/div_/argmax。"},
+      {"symbol": "npu_stream_switch", "why": "昇腾真正的 NPU delta（异步指数随机）的标志调用；精简版可 stub 成 nullcontext 但符号/调用须在（标 # SOURCE，注明 NPU-only 不真跑）。"},
+      {"symbol": "global_stream", "why": "与 npu_stream_switch 配套，异步 stream 来源。"},
+      {"symbol": "exponential_", "why": "指数随机 q~Exp(1)，Gumbel 等价式的随机源，host 可跑。"},
+      {"symbol": "argmax", "why": "Gumbel-max 的取胜算子，probs.div_(q).argmax。"},
+      {"symbol": "AscendSampler", "why": "薄壳子类，writer 讲『只覆写几处』的主体。"},
+      {"symbol": "AscendTopKTopPSampler", "why": "覆写 forward_native 的子类，承载 batch_invariant 回退/async/普通三分支。"},
+      {"symbol": "forward_native", "why": "覆写点，top-k-top-p→softmax→random_sample 的装配处。"},
+      {"symbol": "apply_penalties", "why": "HAS_TRITON 优雅回退的代表方法（两个采样器都有）。"},
+      {"symbol": "HAS_TRITON", "why": "『加速器可选回退』判据，writer 必讲；回退分支 host 可跑。"},
+      {"symbol": "Sampler.apply_penalties", "why": "回退目标——昇腾 Triton 不可用时调基类原版，证明 Triton 是加速非依赖。"},
+      {"symbol": "apply_all_penalties", "why": "penalties.py 与基类同接口、内核换 Triton 的薄壳证据。"},
+      {"symbol": "apply_top_k_top_p", "why": "top-k/top-p 派发入口（精简版只留 pytorch 实现）。"},
+      {"symbol": "_apply_top_k_top_p_pytorch", "why": "host 可跑的 top-k/top-p 截断实现，保留为唯一实现。"},
+      {"symbol": "greedy_sample", "why": "覆写点；else 分支 argmax 与基类一致，展示薄壳。"},
+      {"symbol": "AscendRejectionSampler", "why": "投机解码薄壳子类主体。"},
+      {"symbol": "rejection_sample", "why": "拒绝采样主函数，承载 HAS_TRITON/else 双实现骨架。"},
+      {"symbol": "rejection_greedy_sample_pytorch", "why": "greedy 接受检验的 host 可跑回退。"},
+      {"symbol": "rejection_random_sample_pytorch", "why": "random 接受检验的 host 可跑回退（含 p_target/p_draft>=u 判据）。"},
+      {"symbol": "sample_recovered_tokens", "why": "被拒后从残差分布重采的入口。"},
+      {"symbol": "sample_recovered_tokens_pytorch", "why": "残差重采的 host 可跑实现（max(0,p_target-p_draft)/q argmax）。"},
+      {"symbol": "generate_uniform_probs", "why": "拒绝采样的均匀样本来源（自基类 import）。"},
+      {"symbol": "rejection_greedy_sample_with_triton", "why": "Triton 路径的代表调用符号，须在（标 NPU-only 不真跑），与回退并列体现可选加速。"}
+    ]
+  },
+  "diagram_plan": [
+    {"name": "fig-ch28-roadmap", "type": "roadmap", "spec": "复用 roadmap.py：高亮『采样 NPU 对位』节点，前接 ch15(_sample 二选一派发, 回收 f11)、ch26(batch-invariant Triton 确定性同源)，标注 sample 子系统。"},
+    {"name": "fig-ch28-thin-shell", "type": "继承覆写对照图", "spec": "svg-diagram：左列基类 Sampler/TopKTopPSampler/RejectionSampler 的方法清单；右列 AscendSampler/AscendTopKTopPSampler/AscendRejectionSampler，仅高亮被覆写的少数方法(apply_penalties/greedy_sample/forward_native/forward)，其余灰显『继承不动』。点题薄壳。"},
+    {"name": "fig-ch28-gumbel-vs-multinomial", "type": "数据流/等价式对照", "spec": "svg-diagram：上路 torch.multinomial→CDF→CPU-NPU 同步(红色卡点)；下路 probs.div_(q).argmax, q~Exp(1)→全程 NPU 无同步(绿)。旁注同分布证明一行：argmin q_i/p_i ~ p_i。并标注『Gumbel 来自上游、昇腾加 npu_stream_switch 异步』。"},
+    {"name": "fig-ch28-async-stream", "type": "时间线/stream 重叠图", "spec": "svg-diagram：两条 stream 泳道，主 stream 跑模型前向+div_/argmax，global_stream 跑 q.exponential_()，箭头标 record/wait_stream/synchronize 汇流点；对比同步串行 vs 异步重叠的临界路径。"},
+    {"name": "fig-ch28-triton-fallback", "type": "决策分支图", "spec": "svg-diagram：HAS_TRITON? 是→昇腾 Triton kernel(apply_penalties_triton / rejection_*_with_triton)；否→基类/_pytorch 回退。强调『加速非依赖』，覆盖 penalties 与 rejection_sample 两处。"}
+  ],
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recycle": [
+      {"id": "f11", "planted_in": "ch15", "desc": "ch15 的 _sample 只做二选一派发（无 spec→self.sampler / 有 spec→self.rejection_sampler），把采样器内部『规避 CPU-NPU 同步、Triton 回退等 NPU 对位』留 ch28 回收。本章即兑现：AscendSampler/AscendRejectionSampler 的薄壳覆写、Gumbel+异步 stream、Triton 优雅回退。"}
+    ]
+  }
+}

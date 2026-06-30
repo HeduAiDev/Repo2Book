@@ -14,16 +14,16 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch27',
-  slug: 'ch27-ascend-quantization-framework',
+  chapter_id: 'ch28',
+  slug: 'ch28-sampling-npu-adaptation',
   instance: 'vllm-ascend',
-  focus: '昇腾量化框架：把 NPU 量化方案接进 vLLM——Part VII 开篇、OOT「注册表 + 适配器」范式最干净的样本（量化是全栈最大一块 ~6k LOC）。**(1) 三入口注册**——@register_quantization_config 把三个昇腾量化配置注进 vLLM 量化注册表：AscendModelSlimConfig(QuantizationConfig)（modelslim_config.py:L402，ModelSlim 量化）、compressed_tensors（先删 vLLM 原版再替换）、fp8。**(2) 按层分发**——AscendModelSlimConfig.get_quant_method(layer, prefix) 按 layer 类型（linear / kv_cache / fused_moe）+ quant_type 分发到对应 method。**(3) scheme 注册表**——methods/registry.py 的 _SCHEME_REGISTRY: dict[(quant_type, layer_type)]，register_scheme 装饰器把如 (W8A8_DYNAMIC, linear)→W8A8DynamicLinearScheme 注册进表；get_quant_method 据此选 scheme。**(4) 三个适配器 wrapper**——method_adapters.py 把昇腾量化方法适配成 vLLM 的方法基类：AscendLinearMethod(LinearMethodBase)、AscendKVCacheMethod(BaseKVCacheMethod)、AscendFusedMoEMethod(FusedMoEMethodBase)（后者正接 ch26 的 FusedMoE——量化版 MoE 走这里）。**(5) 走通一条全链**——以 W8A8_DYNAMIC（或 W4A8）为例，从 create_weights（按 scheme 造量化权重 + scale）→ apply（量化 matmul）跑通；点出 MXFP microscaling dtype 是 NPU 硬特化（per-group 微缩放）。**(6) 逐层解析**——ModelSlim 的 quant_model_description.json 逐层记每层量化类型；modelslim_config.py 的 get_linear_quant_type / get_quant_type_for_layer 据此决定每层走哪个 scheme（逐层 scheme 决策在这里）；quant_parser.py 另管 MXFP 系列 dtype 映射（QuantTypeMapping，scale_dtype=FLOAT8_E8M0FNU）与 down_proj rollback 解析。**核心立意**：量化是「OOT 注册表 + 适配器」范式最干净的实证——一张 scheme 注册表 + 三个适配 vLLM 基类的 wrapper，把昇腾的 W8A8/W4A8/MXFP 量化方案整体接进 vLLM，不改 vLLM 量化框架一行；承接 ch23 的算子顶替、ch26 的 FusedMoE（量化 MoE 经 AscendFusedMoEMethod）。本章是 Part VII（量化 / 采样 ch28 / 投机 ch29 / 加载 ch30）开篇。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/model_executor/layers/quantization（QuantizationConfig / register_quantization_config / LinearMethodBase 等量化框架基类——昇腾照此范式注册+适配）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；这些是纯 Python（注册表 + 分发 + 适配器 wrapper + scheme 选择 + json 逐层解析），host 可跑读控制流；真实量化 matmul/MXFP kernel 要 NPU/CANN、不真跑】',
-  highlight: 'ch27',
+  focus: '采样的 NPU 对位：规避 CPU-NPU 同步与 Triton 回退——子类化只覆写几处的「薄壳」典范。AscendSampler(Sampler) / AscendRejectionSampler(RejectionSampler) 继承 vLLM 采样器、只覆写少数热点方法。**(1) ★Gumbel 技巧避开 torch.multinomial 的 CPU-NPU 同步（本章算法宝石）**——random_sample（sampler.py:L19）不调 torch.multinomial（它会触发 CPU-NPU 同步、卡住流水线），改用 Gumbel-max 等价式：probs.div_(q).argmax(dim=-1)，其中 q=exponential_() 指数随机——数学上 argmax(prob/Exp(1)) 与按 prob 多项式采样同分布，但全程在 NPU 上、无同步；进一步用 npu_stream_switch(global_stream()) 把指数随机放到独立 stream 异步做。**(2) penalties / top-k-top-p 走昇腾 Triton + 优雅回退**——AscendRejectionSampler（rejection_sampler.py:L34）从 ops/triton/reject_sample 引 rejection_greedy_sample_with_triton 等 Triton kernel 做投机解码的拒绝采样；penalties.py 同理。**关键：HAS_TRITON 不可用时优雅回退 vLLM 默认实现**（if not HAS_TRITON: 走基类原版）——昇腾 Triton 是加速、不是依赖。**(3) 薄壳继承**——两个采样器都只覆写「会碰 NPU 同步/能上 Triton」的那几处，其余继承基类不动。**核心立意**：采样器是「子类化只覆写热点 + 数学等价式绕开硬件短板（CPU-NPU 同步）+ 加速器可选回退」的薄壳典范；Gumbel-max 把「按概率多项式采样」改写成「指数随机后 argmax」是全章的算法宝石——同分布、但避开 multinomial 的同步。**回收伏笔 f11（埋于 ch15）**：ch15 的 _sample 当时只做二选一派发（self.sampler / self.rejection_sampler），说采样器内部「规避 CPU-NPU 同步、Triton 回退等 NPU 对位」留采样章——本章正是兑现。承接 ch15 的派发、与 ch26 batch-invariant 的 Triton 确定性算子同源（都用 ops/triton/）。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/v1/sample/sampler.py（Sampler 基类，含原版 random_sample/torch.multinomial）+ rejection_sampler.py（RejectionSampler 基类——昇腾继承它、覆写采样热点）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；random_sample 的 Gumbel 等价式 / argmax 是纯 Python·CPU torch 可跑验同分布（精简版可在 host 验「div_(Exp).argmax 与 multinomial 同分布」），npu_stream_switch / Triton kernel 要 NPU/CANN、不真跑；HAS_TRITON 回退分支纯 Python 可跑】',
+  highlight: 'ch28',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm-ascend/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
-  skip_dossier: true,
+  skip_dossier: false,
   skip_impl: false,
-  paths: ['vllm_ascend/quantization/modelslim_config.py', 'vllm_ascend/quantization/method_adapters.py', 'vllm_ascend/quantization/methods/registry.py', 'vllm_ascend/quantization/methods/w8a8_dynamic.py'],
+  paths: ['vllm_ascend/sample/sampler.py', 'vllm_ascend/sample/rejection_sampler.py', 'vllm_ascend/sample/penalties.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
