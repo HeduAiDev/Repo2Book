@@ -8,7 +8,7 @@
 
 第 23 章立过一个总规矩：**模型代码一行不改，靠注册表在算子实例化的瞬间把它换成昇腾子类**。那一章拿 `SiluAndMul` 这种小算子举例——身（接口/权重/注册位置）继承自基座，头（forward）从 CUDA 换成 NPU。换头不换身，看着轻巧。
 
-但如果被顶替的算子有近 900 行、横跨 12 个文件、内部还分出 4 条通信路径呢？这就是 **FusedMoE**——MoE（Mixture-of-Experts，混合专家）层的融合算子。模型里每个 MoE 层都是一个 `FusedMoE` 实例：路由器给每个 token 选 top_k 个专家，token 被送到对应专家算 FFN，再加权聚回来。它（`vllm_ascend/ops/fused_moe/fused_moe.py`）是全书最大的单体 OOT（out-of-tree，树外插件——在 vLLM 主干之外单独维护、却深度嵌进主干前向的算子）算子，集成度高、影响面大，也是「换头不换身」机制压力最大的一次实测。
+但如果被顶替的算子有近 900 行、横跨 12 个文件、内部还分出 4 条通信路径呢？这就是 **FusedMoE**——MoE（Mixture-of-Experts，混合专家）层的融合算子。模型里每个 MoE 层都是一个 `FusedMoE` 实例：路由器给每个 token 选 top_k 个专家，token 被送到对应专家算 FFN，再加权聚回来。它（`vllm_ascend/ops/fused_moe/fused_moe.py`）是全书最大的单体树外（OOT）算子——深度嵌进主干前向、却在 vLLM 主干之外单独维护，集成度高、影响面大，也是「换头不换身」机制压力最大的一次实测。
 
 这一章要回答三个问题：
 
@@ -84,7 +84,7 @@ def maybe_make_prepare_finalize(self, routing_tables=None):
     return None
 ```
 
-返回 `None`，明确告诉基类：「这条 modular-kernel 流水线我不用，别替我建。」昇腾要走自己的通信路径，不接管 vLLM 那套 prepare/finalize 模块化内核。
+返回 `None`，明确告诉基类：「这条 modular-kernel 流水线我不用，别替我建。」昇腾要走自己的通信路径，不接管 vLLM 那套 prepare/finalize 模块化 kernel。
 
 ## 26.2 forward 的两段委托：runner → forward_impl
 
@@ -658,7 +658,7 @@ def fused_experts(self, fused_experts_input: MoEFusedExpertsInput):
 
 `dispatch_ffn_combine` 一个算子里把 dispatch + 两段 FFN（gmm1 / swiglu / gmm2）+ combine 全做完。为什么值得？decode/prefill 小 batch 下，分步走三个独立算子的 kernel launch 开销 + 中间张量进出显存的带宽开销很显眼；融成一个算子一次调完，省下这些。
 
-这也解释了第 23 章一个当时没说透的细节：`process_weights_after_loading` 为什么在 `enable_fused_mc2` 时要把权重 `npu_format_cast` 成 NZ 格式——因为 `dispatch_ffn_combine` 这个融合算子**只吃 NZ 排布的权重**。这里的 NZ 不是「非零」，而是昇腾硬件友好的**分形（FRACTAL）NZ 内存排布**：它把张量切成小块、按匹配 cube 矩阵计算单元吞吐形状的次序摆放，融合算子要求权重按此排布才能充分利用 cube 单元的算力。算子的格式偏好，倒逼了加载期的权重转换。换头机制的接缝，一路传导到了权重布局。
+这也呼应第 20 章见过的那个加载期钩子 [`process_weights_after_loading`](../ch20-mla-on-npu/narrative/chapter.md)——那一章用它把 MLA 权重 `npu_format_cast` 成昇腾分形排布。FusedMoE 这里是同一个钩子的另一处分支：`enable_fused_mc2` 时它要把专家权重 `npu_format_cast` 成 NZ 格式——因为 `dispatch_ffn_combine` 这个融合算子**只吃 NZ 排布的权重**。这里的 NZ 不是「非零」，而是昇腾硬件友好的**分形（FRACTAL）NZ 内存排布**：它把张量切成小块、按匹配 cube 矩阵计算单元吞吐形状的次序摆放，融合算子要求权重按此排布才能充分利用 cube 单元的算力。算子的格式偏好，倒逼了加载期的权重转换。换头机制的接缝，一路传导到了权重布局。
 
 ## 26.7 batch-invariant：可复现推理的额外保证
 
@@ -725,7 +725,7 @@ def enable_batch_invariant_mode():
 
 **第一步 `override_envs_for_invariance`——关掉漂移源**：`weight_nz_mode=0` 关 NZ 权重重排（不同排布会改变累加分块）；`enable_matmul_allreduce=False` 关 matmul-allreduce 融合；`HCCL_DETERMINISTIC="strict"` 和 `LCCL_DETERMINISTIC="1"` 强制集合通信走确定性 reduce 顺序（HCCL = 华为集合通信库 Huawei Collective Communication Library，LCCL 是其轻量版；非确定模式下各卡的归约执行顺序会浮动、从而改变 all-reduce 的累加结果，strict 模式把这个顺序钉死）。
 
-**第二步 `enable_batch_invariant_mode`——替换算子**：用 `torch.library.Library("aten", "IMPL")` 在 NPU 后端把 `aten::mm / matmul / addmm / bmm / softmax / sum` 整体替换成「固定分块、reduce 顺序固定」的 batch-invariant 实现（有 AscendC 内核就优先用、否则回退 triton）。注意最后三行——`torch.sum`、`torch_npu.npu_add_rms_norm` 这类**不走 aten dispatch** 的函数，没法用 Library 拦，就直接猴补（monkey-patch）函数指针。
+**第二步 `enable_batch_invariant_mode`——替换算子**：用 `torch.library.Library("aten", "IMPL")` 在 NPU 后端把 `aten::mm / matmul / addmm / bmm / softmax / sum` 整体替换成「固定分块、reduce 顺序固定」的 batch-invariant 实现（有 AscendC kernel 就优先用、否则回退 triton）。注意最后三行——`torch.sum`、`torch_npu.npu_add_rms_norm` 这类**不走 aten dispatch** 的函数，没法用 Library 拦，就直接猴补（monkey-patch）函数指针。
 
 ![batch-invariant：两步消除批内非确定性](../diagrams/fig26-4-batchinvariant.png)
 
@@ -789,7 +789,7 @@ def matmul_persistent(x, y, bias=None):
 
 最后一列写成符号 `bits(行A)` 而非某个具体十六进制位串——这是**示意**：host 上不真跑这个 NPU kernel，要点也不在那串 bit 等于多少，而在两场景的累加过程完全一致。看前面三列：两行的「$K$ 维分块」「累加顺序」**逐项相同**，因为分块只由 $K$ 和 `BLOCK_K` 决定，$M$ 从 1 变到 3 一点没影响它们。两列输入相同的 float32 数、按完全相同的顺序累加，结果**必然逐位相同**——所以两行的 `bits(行A)` 是同一个值。这正是 batch-invariance 想要的：你的请求和别人的请求拼不拼在一起，结果不变，推理可复现。
 
-（对照基座：vLLM 主干的 batch_invariant 是同一套设计思路，昇腾把它落到了 NPU 的 triton / AscendC 内核上，并补了 HCCL/LCCL 这层昇腾特有的集合通信确定性开关。）
+（对照基座：vLLM 主干的 batch_invariant 是同一套设计思路，昇腾把它落到了 NPU 的 triton / AscendC kernel 上，并补了 HCCL/LCCL 这层昇腾特有的集合通信确定性开关。）
 
 ## 26.8 小结：换头机制的上界，与一致性的下界
 
@@ -803,6 +803,8 @@ def matmul_persistent(x, y, bias=None):
 
 MoE 的真正难点不在矩阵乘，而在「token 按专家跨卡重分发」的通信。昇腾把它抽象成 `MoECommMethod` 的 dispatch→mlp→combine 三段骨架，差异全压进 `(TokenDispatcher*, PrepareAndFinalize*)` 配对，按 soc / EP / token 数在 MC2 / all_to_all / all_gather 三种算子上取点。第 15 章选枚举、本章建实例与落算子，伏笔在此闭合；第 6 章只讲形状代数的 `all_to_all`，在 `TokenDispatcherWithAll2AllV` 里第一次有了按专家路由的用武之地。
 
-batch-invariant 则是昇腾对「可复现推理」的额外承诺：关掉非确定性的 reduce 与通信，用固定分块的内核顶替 matmul / softmax / sum，让浮点归约的顺序只由数据维度决定、与 batch 拼法无关。
+batch-invariant 则是昇腾对「可复现推理」的额外承诺：关掉非确定性的 reduce 与通信，用固定分块的 kernel 顶替 matmul / softmax / sum，让浮点归约的顺序只由数据维度决定、与 batch 拼法无关。
+
+和前几章一样，本章这套控制流有一半能在 host 上钉死、不必上卡。`setup_moe_comm_method` 那张 `_MoECommMethods` 三选一注册表、`select_moe_comm_method` 按 token 数/soc/EP 选枚举的分流、token 重分发里 `input_splits / output_splits` 的形状代数（那张 `6/3/4/3` 落卡表的算法）、以及 batch-invariant 两步里 env/config 覆盖与 `torch.library` 算子替换分支——都是纯 Python，精简版在 host 上跑一遍就能验证选路与簿记是否正确。真正只能上 NPU 的，是 MC2 / all_to_all 的跨卡通信、`dispatch_ffn_combine` 融合算子、以及那些 triton / AscendC kernel 内部的逐位累加——它们的数值需要真实硬件才看得到。
 
 Part VI 到此收官。从第 23 章的注册表总开关，到第 24 章的 torch.library 算子注册、第 25 章的 ACLGraph 编译，再到本章最复杂算子的顶替——算子与编译层这条线，立在同一套「换头不换身」的骨架上。接下来进入 Part VII，看量化、采样、投机与模型适配怎么在这套地基上长出来。

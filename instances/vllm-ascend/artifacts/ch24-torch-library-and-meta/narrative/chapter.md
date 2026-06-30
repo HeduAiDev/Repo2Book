@@ -28,7 +28,7 @@
 
 这里有个 PyTorch 的基础心智模型要先立住：**一个算子（operator）= 一个 schema（签名）+ 多个「按派发键（DispatchKey）索引的实现」**。同一个算子名，可以对 `CPU` / `CUDA` / `PrivateUse1` / `Meta` 各注册一份不同的实现；运行时 torch 看输入张量的设备、属性，选对应的键去派发。昇腾真算走 `PrivateUse1`，图捕获走 `Meta`——**同名算子的两份实现，各管一摊**。
 
-> 为什么是 `PrivateUse1`？这是 PyTorch 给第三方加速器预留的「私有设备」派发键。昇腾 NPU 不是 torch 内建的 CUDA/CPU，作为树外（Out-Of-Tree, OOT）后端，它在 torch 里就注册成 `PrivateUse1` 设备——所有真实算子实现都挂这个键，torch 才能按张量设备把活分派到 NPU。Python 侧 `vllm_ascend/ops/register_custom_ops.py` 里直接写的就是 `dispatch_key="PrivateUse1"`。
+> 为什么是 `PrivateUse1`？这是 PyTorch 给第三方加速器预留的「私有设备」派发键。昇腾 NPU 不是 torch 内建的 CUDA/CPU，作为树外（OOT）后端，它在 torch 里就注册成 `PrivateUse1` 设备——所有真实算子实现都挂这个键，torch 才能按张量设备把活分派到 NPU。Python 侧 `vllm_ascend/ops/register_custom_ops.py` 里直接写的就是 `dispatch_key="PrivateUse1"`。
 
 vLLM-Ascend 把这两份实现，分三条线注册进 torch。下面逐条拆。
 
@@ -427,7 +427,7 @@ direct_register_custom_op(op_name="muls_add", op_func=muls_add_triton,
     fake_impl=_muls_add_impl_fake, mutates_args=[], dispatch_key="PrivateUse1")
 ```
 
-（原文每个调用展开成 8 行，这里压成两行排版，参数一字未改。）10 个算子覆盖通信胶水（`maybe_chunk_residual` / `maybe_all_gather_and_maybe_unpad` / `maybe_pad_and_reduce` / `maybe_all_reduce_tensor_model_parallel`）、预取（`prefetch_preprocess` / `postprocess`）、`matmul_and_reduce`、量化（`quantize`）、rope（`npu_rotary_embedding`）和 triton kernel（`muls_add`）——大多是 [Part III 通信章](../ch20-mla-on-npu/narrative/chapter.md)里那些算子之间的搬运/重排逻辑。注册完，它们的全名是 `torch.ops.vllm.<op>`（命名空间是 `vllm`，跟 C++ 那批 `_C_ascend` 是两个不同的库）。
+（原文每个调用展开成 8 行，这里压成两行排版，参数一字未改。）10 个算子覆盖通信胶水（`maybe_chunk_residual` / `maybe_all_gather_and_maybe_unpad` / `maybe_pad_and_reduce` / `maybe_all_reduce_tensor_model_parallel`）、预取（`prefetch_preprocess` / `postprocess`）、`matmul_and_reduce`、量化（`quantize`）、rope（`npu_rotary_embedding`）和 triton kernel（`muls_add`）——大多是 [Part III 通信章](../ch06-npu-communicator/narrative/chapter.md)里那些算子之间的搬运/重排逻辑。注册完，它们的全名是 `torch.ops.vllm.<op>`（命名空间是 `vllm`，跟 C++ 那批 `_C_ascend` 是两个不同的库）。
 
 每个都带 `dispatch_key="PrivateUse1"`（真实现派到 NPU）和一个 `fake_impl`。**`fake_impl` 就是 Python 版的 meta**——缺它，这个 op 一样进不了 `torch.compile` 的图。挑三个 fake 看看它们的样子：
 
