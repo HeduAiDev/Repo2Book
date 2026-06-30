@@ -1,0 +1,216 @@
+{
+  "chapter": "ch19",
+  "title": "标准 MHA 的 NPU 内核与状态机：AscendAttentionBackendImpl",
+  "thesis": "一个标准（非 MLA）注意力后端在昇腾 NPU 上『用一台五态机决定走哪条 torch_npu 算子路径』——把 vLLM 基座 FlashAttention 的 flash_attn_varlen_func / reshape_and_cache_flash 这两条 CUDA 内核，逐一换成 torch_npu 的 paged / fused-infer / reshape-and-cache 算子；workspace 预取是 NPU 算子相对 CUDA 内核的特有节拍。本章是 ch18 选定的 AscendAttentionBackend 的 impl_cls；并在 get_impl_cls/get_builder_cls 的 enable_cp() 分支处回收伏笔 f7（CP 组排布运行期分流在此收口）。",
+
+  "code_spine": [
+    "vllm_ascend/attention/attention_v1.py:L73-L141  AscendAttentionBackend：@register_backend 注册进 vLLM；get_impl_cls/get_builder_cls 按 enable_cp() 分流（f7 收口）；get_kv_cache_shape=(2,num_blocks,block_size,num_kv_heads,head_size)",
+    "vllm_ascend/attention/attention_v1.py:L143-L148  AscendAttentionState(Enum) 五态：PrefillNoCache=0 / PrefillCacheHit=1 / DecodeOnly=2 / ChunkedPrefill=3 / SpecDecoding=4",
+    "vllm_ascend/attention/attention_v1.py:L151-L210  AscendMetadata 数据类：attn_state + slot_mapping + block_tables + seq_lens 家族 + actual_seq_lengths_q + 各计数",
+    "vllm_ascend/attention/utils.py:L273-L315  split_decodes_and_prefills：在已重排的 batch 上找 decode|prefill 分界，返回 (num_decodes,num_prefills,num_decode_tokens,num_prefill_tokens)",
+    "vllm_ascend/attention/attention_v1.py:L272-L332  AscendAttentionMetadataBuilder.build：拆批 + 取 slot_mapping/block_table + 装 attn_mask + H2D query_start_loc → 组装 AscendMetadata",
+    "vllm_ascend/attention/attention_v1.py:L334-L354  build_for_graph_capture：图捕获分支（只对 DecodeOnly/ChunkedPrefill/SpecDecoding 造 dummy metadata）",
+    "vllm_ascend/attention/attention_v1.py:L1279-L1343  AscendAttentionBackendImpl.forward：写 KV → forward_impl",
+    "vllm_ascend/attention/attention_v1.py:L1229-L1256  reshape_and_cache → DeviceOperator.reshape_and_cache → torch_npu._npu_reshape_and_cache（KV 写回分页 cache）",
+    "vllm_ascend/attention/attention_v1.py:L1258-L1277  forward_impl：按 attn_state==DecodeOnly && using_paged_attention && 无 SWA → forward_paged_attention，否则 forward_fused_infer_attention",
+    "vllm_ascend/attention/attention_v1.py:L1166-L1185  forward_paged_attention → torch_npu._npu_paged_attention",
+    "vllm_ascend/attention/attention_v1.py:L985-L1043  _get_fia_params：按五态各自整理 key/value/block_size/block_table/actual_seq_lengths_kv",
+    "vllm_ascend/attention/attention_v1.py:L1045-L1164  forward_fused_infer_attention → torch_npu.npu_fused_infer_attention_score(_v2)",
+    "vllm_ascend/attention/attention_v1.py:L922-L983  full_graph_pa：图捕获下 _npu_paged_attention_get_workspace 预取 + _npu_paged_attention（workspace 预取节拍范例）",
+    "vllm_ascend/attention/attention_v1.py:L1346-L1783  AscendC8AttentionBackendImpl（INT8 KV 量化子类，减法候选/选讲）"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm_ascend/attention/attention_v1.py",
+      "lines": "L73-L108",
+      "code": "@register_backend(AttentionBackendEnum.CUSTOM, \"ASCEND\")\nclass AscendAttentionBackend(AttentionBackend):\n    accept_output_buffer: bool = True\n\n    @staticmethod\n    def get_name() -> str:\n        # HACK(Ronald1995): vllm `initialize_kv_cache` method in model runner v2 make\n        # attention name assertion, we just set name to FLASH_ATTN to avoid assertion error.\n        # rectify this when vllm disable the assertion.\n        return \"CUSTOM\" if not envs_vllm.VLLM_USE_V2_MODEL_RUNNER else \"FLASH_ATTN\"\n\n    @staticmethod\n    def get_impl_cls() -> type[\"AscendAttentionBackendImpl\"]:\n        if enable_cp():\n            from vllm_ascend.attention.context_parallel.attention_cp import AscendAttentionCPImpl\n\n            return AscendAttentionCPImpl\n        return AscendAttentionBackendImpl\n\n    @staticmethod\n    def get_builder_cls() -> type[\"AscendAttentionMetadataBuilder\"]:\n        if enable_cp():\n            from vllm_ascend.attention.context_parallel.attention_cp import AscendAttentionCPMetadataBuilder\n\n            return AscendAttentionCPMetadataBuilder\n        return AscendAttentionMetadataBuilder\n\n    @staticmethod\n    def get_kv_cache_shape(\n        num_blocks: int,\n        block_size: int,\n        num_kv_heads: int,\n        head_size: int,\n        cache_dtype_str: str = \"\",\n    ) -> tuple[int, ...]:\n        return (2, num_blocks, block_size, num_kv_heads, head_size)",
+      "elide": ["swap_blocks/copy_blocks（L110-L136，KV 块搬运/拷贝的纯索引赋值，非注意力前向主线）", "get_supported_kernel_block_sizes 返回 [128]（L138-L140，供 builder 算 max_num_blocks_per_req）"]
+    },
+    {
+      "path": "vllm_ascend/attention/attention_v1.py",
+      "lines": "L143-L148",
+      "code": "class AscendAttentionState(Enum):\n    PrefillNoCache = 0\n    PrefillCacheHit = 1\n    DecodeOnly = 2\n    ChunkedPrefill = 3\n    SpecDecoding = 4",
+      "elide": []
+    },
+    {
+      "path": "vllm_ascend/attention/attention_v1.py",
+      "lines": "L160-L204",
+      "code": "    # **************************** Basic Properties ************************** #\n    attn_mask: torch.Tensor | None = None\n    # Current state of this attention run.\n    attn_state: AscendAttentionState = AscendAttentionState.ChunkedPrefill\n\n    # Number of tokens excluding padding.\n    num_actual_tokens_pcp_padded: int = 0\n    num_actual_tokens: int = 0\n    num_decode_tokens: int = 0\n    num_prefills: int = 0\n    num_decodes: int = 0\n\n    seq_lens: torch.Tensor = None\n    seq_lens_cpu: torch.Tensor = None\n    seq_lens_list: list[int] = None  # type: ignore\n    actual_seq_lengths_q: list[int] = None  # type: ignore\n\n    query_start_loc: torch.Tensor = None\n    # Maximum query length in the batch (None for decoding).\n    max_query_len: int | None = None\n\n    # ********************** KV Cache Related Properties ********************* #\n    # Block addresses per sequence (Seq id -> list of physical block).\n    # (batch_size, max_blocks_per_seq)\n    block_tables: torch.Tensor = None\n\n    # The indices of the token slots that input tokens will be stored into.\n    # E.g., if `slot_mapping` is [35, 2, 17] and the block size is 16, the\n    # three tokens are stored in the 3rd slot in block 2, 2nd slot in block 0,\n    # and 1st slot in block 1, respectively.\n    # (num_tokens,)\n    slot_mapping: torch.Tensor = None\n    # pcp\n    prefill: AscendMetadataForPrefill | None = None\n    # dcp\n    decode_meta: AscendMetadataForDecode | None = None\n\n    causal: bool = True\n    # runner_type in model_config.\n    model_runner_type: str = \"\"",
+      "elide": ["dataclass 头部注释 + 部分冗余 seq_lens 字段注释（L151-L159、L172-L186）", "reshape_cache_event / kvcomp_metadata 字段（L207-L210，KV 传输事件与 hamming 稀疏元数据，非主线）"]
+    },
+    {
+      "path": "vllm_ascend/attention/utils.py",
+      "lines": "L273-L315",
+      "code": "def split_decodes_and_prefills(\n    common_attn_metadata: AscendCommonAttentionMetadata,\n    decode_threshold: int = 1,\n) -> tuple[int, int, int, int]:\n    \"\"\"\n    Assuming a reordered batch, finds the boundary between prefill and decode\n    requests.\n    ...\n    \"\"\"\n    long_seq_metadata = common_attn_metadata.prefill_context_parallel_metadata\n    query_lens_pcp_full = long_seq_metadata.query_lens_pcp_full_cpu if long_seq_metadata else None\n    max_query_len_pcp_full = long_seq_metadata.max_query_len_pcp_full if long_seq_metadata else 0\n    max_query_len = common_attn_metadata.max_query_len if max_query_len_pcp_full == 0 else max_query_len_pcp_full\n    num_reqs = common_attn_metadata.num_reqs\n    num_tokens = common_attn_metadata.num_actual_tokens\n    query_start_loc = common_attn_metadata.query_start_loc_cpu\n\n    if max_query_len <= decode_threshold:\n        return num_reqs, 0, num_tokens, 0\n\n    query_lens = (query_start_loc[1:] - query_start_loc[:-1]) if query_lens_pcp_full is None else query_lens_pcp_full\n    is_prefill = query_lens > decode_threshold\n    if not torch.any(is_prefill):\n        return num_reqs, 0, num_tokens, 0\n\n    first_prefill = is_prefill.int().argmax(dim=-1).item()\n    num_decodes = first_prefill\n    num_prefills = num_reqs - num_decodes\n    num_decode_tokens = query_start_loc[first_prefill].item()\n    num_prefill_tokens = num_tokens - num_decode_tokens\n    return (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens)",
+      "elide": ["docstring 中间说明（保留首尾意思即可）", "PCP 分支：query_lens_pcp_full 仅在 prefill_context_parallel 时非 None，非主线可一句带过（回指 ch08）"]
+    },
+    {
+      "path": "vllm_ascend/attention/attention_v1.py",
+      "lines": "L272-L332",
+      "code": "    def build(\n        self,\n        common_prefix_len: int,\n        common_attn_metadata: AscendCommonAttentionMetadata,\n        fast_build: bool = False,\n    ) -> AscendMetadata:\n        num_reqs = common_attn_metadata.num_reqs\n        num_actual_tokens = common_attn_metadata.num_actual_tokens\n        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]\n\n        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = split_decodes_and_prefills(\n            common_attn_metadata, decode_threshold=self.decode_threshold\n        )\n\n        block_table = common_attn_metadata.block_table_tensor\n        if common_attn_metadata._seq_lens_cpu is not None:\n            seq_lens = common_attn_metadata._seq_lens_cpu[:num_reqs]\n        elif common_attn_metadata.seq_lens_cpu is not None:\n            seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs]\n        else:\n            seq_lens = common_attn_metadata.seq_lens[:num_reqs].to(\"cpu\")\n\n        slot_mapping = common_attn_metadata.slot_mapping[:num_actual_tokens]\n        attn_state = common_attn_metadata.attn_state\n\n        # Get attn_mask from singleton AttentionMaskBuilder\n        attn_mask = self.attn_mask_builder.get_attention_mask(common_attn_metadata.causal, self.model_config)\n\n        # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device\n        query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)\n\n        attn_metadata = AscendMetadata(\n            num_actual_tokens=num_actual_tokens,\n            num_decode_tokens=num_decode_tokens,\n            block_tables=block_table,\n            query_start_loc=query_start_loc,\n            seq_lens=seq_lens,\n            seq_lens_cpu=seq_lens,\n            seq_lens_list=seq_lens.tolist(),\n            max_query_len=common_attn_metadata.max_query_len,\n            actual_seq_lengths_q=query_start_loc_cpu[1:].tolist(),\n            slot_mapping=slot_mapping,\n            attn_mask=attn_mask,\n            attn_state=attn_state,\n            num_prefills=num_prefills,\n            num_decodes=num_decodes,\n            causal=common_attn_metadata.causal,\n            model_runner_type=self.model_config.runner_type,\n            kvcomp_metadata=common_attn_metadata.kvcomp_metadata,\n        )\n        return attn_metadata",
+      "elide": ["CrossAttentionSpec / parallel_drafting 对 seq_lens·slot_mapping 的覆盖分支（L297-L304，encoder-decoder / 并行草稿特例）"]
+    },
+    {
+      "path": "vllm_ascend/attention/attention_v1.py",
+      "lines": "L334-L354",
+      "code": "    def build_for_graph_capture(\n        self,\n        common_attn_metadata: AscendCommonAttentionMetadata,\n        attn_state: AscendAttentionState = AscendAttentionState.DecodeOnly,\n    ):\n        if attn_state in (\n            AscendAttentionState.DecodeOnly,\n            AscendAttentionState.ChunkedPrefill,\n            AscendAttentionState.SpecDecoding,\n        ):\n            attn_metadata = self.build(\n                common_prefix_len=0,\n                common_attn_metadata=common_attn_metadata,\n            )\n        else:\n            raise NotImplementedError(\n                \"Currently we only support building dummy metadata for DecodeOnly and ChunkedPrefill state\"\n            )\n\n        attn_metadata.attn_state = attn_state\n        return attn_metadata",
+      "elide": []
+    },
+    {
+      "path": "vllm_ascend/attention/attention_v1.py",
+      "lines": "L1279-L1343",
+      "code": "    def forward(\n        self,\n        layer: AttentionLayer,\n        query: torch.Tensor,\n        key: torch.Tensor,\n        value: torch.Tensor,\n        kv_cache: tuple[torch.Tensor],\n        attn_metadata: AscendMetadata,\n        output: torch.Tensor | None = None,\n        output_scale: torch.Tensor | None = None,\n        output_block_scale: torch.Tensor | None = None,\n    ) -> torch.Tensor:\n        \"\"\"Forward pass with Ascend attention.\n        Args:\n            query: shape = [num_tokens, num_heads, head_size]\n            key: shape = [num_tokens, num_kv_heads, head_size]\n            value: shape = [num_tokens, num_kv_heads, head_size]\n            kv_cache: shape =\n                [2, num_blocks, block_size, num_kv_heads, head_size]\n            attn_metadata: Metadata for attention.\n        Returns:\n            shape = [num_tokens, num_heads * head_size]\n        \"\"\"\n        assert output is not None, \"Output tensor must be provided.\"\n        ...\n        assert layer._k_scale_float == 1.0 and layer._v_scale_float == 1.0\n        num_tokens = query.shape[0]\n        if attn_metadata is None:\n            return output.fill_(0)\n\n        # Initialize key_cache and value_cache from kv_cache if not already set.\n        if self.key_cache is None and kv_cache is not None:\n            if (\n                isinstance(kv_cache, torch.Tensor)\n                and kv_cache.dim() > 0\n                and kv_cache.shape[0] == 2\n                or isinstance(kv_cache, (list, tuple))\n                and len(kv_cache) >= 2\n            ):\n                self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]\n\n        output_padded = None\n        if key is not None and value is not None:\n            output_padded = output\n            query, key, value, output_padded = self.reshape_and_cache(\n                query, key, value, kv_cache, attn_metadata, output\n            )\n        # pooling model branch\n        if attn_metadata.model_runner_type == \"pooling\" and not attn_metadata.causal:\n            attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)\n            output[:num_tokens] = attn_output[:num_tokens]\n            return output\n        if output_padded is not None:\n            attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output_padded)\n        else:\n            attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output)\n        output[:num_tokens] = attn_output[:num_tokens]\n        return output",
+      "elide": ["enable_hamming_sparse 取 layerIndex（L1303-L1304，hamming 稀疏专用，默认关）", "fused output quantization 的 NotImplementedError 守卫（L1306-L1307）", "省略号处为上述两段守卫"]
+    },
+    {
+      "path": "vllm_ascend/attention/attention_v1.py",
+      "lines": "L1229-L1256",
+      "code": "    def reshape_and_cache(\n        self,\n        query: torch.Tensor,\n        key: torch.Tensor,\n        value: torch.Tensor,\n        kv_cache: tuple[torch.Tensor],\n        attn_metadata: AscendMetadata,\n        output: torch.Tensor,\n    ):\n        if len(kv_cache) > 1:\n            if self.is_kv_producer:\n                attn_metadata.reshape_cache_event = torch.npu.Event()\n            if self.key_cache is None:\n                self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]\n            slots = attn_metadata.slot_mapping\n            encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER\n            DeviceOperator.reshape_and_cache(\n                key=key[: attn_metadata.num_actual_tokens] if not encoder_decoder else key,\n                value=value[: attn_metadata.num_actual_tokens] if not encoder_decoder else value,\n                key_cache=self.key_cache,\n                value_cache=self.value_cache,\n                slot_mapping=slots[: attn_metadata.num_actual_tokens] if not encoder_decoder else slots.to(torch.int32),\n            )\n            if self.is_kv_producer:\n                attn_metadata.reshape_cache_event.record()\n        return query, key, value, output",
+      "elide": ["is_kv_producer 的 KV 传输事件 record（disaggregated PD 场景，可一句带过）"]
+    },
+    {
+      "path": "vllm_ascend/device/device_op.py",
+      "lines": "L42-L47",
+      "code": "class BaseDeviceAdaptor:\n    @classmethod\n    def reshape_and_cache(cls, key, value, key_cache, value_cache, slot_mapping):\n        torch_npu._npu_reshape_and_cache(\n            key=key, value=value, key_cache=key_cache, value_cache=value_cache, slot_indices=slot_mapping\n        )",
+      "elide": ["DeviceOperator 是按设备型号选适配器的别名；A5 等另有特化（L787 起），主线落到 BaseDeviceAdaptor 这条"]
+    },
+    {
+      "path": "vllm_ascend/attention/attention_v1.py",
+      "lines": "L1258-L1277",
+      "code": "    def forward_impl(\n        self,\n        query: torch.Tensor,\n        key: torch.Tensor,\n        value: torch.Tensor,\n        kv_cache: tuple[torch.Tensor],\n        attn_metadata: AscendMetadata,\n        output: torch.Tensor,\n    ):\n        num_tokens = query.shape[0]\n        if (\n            attn_metadata.attn_state == AscendAttentionState.DecodeOnly\n            and using_paged_attention(num_tokens, self.vllm_config)\n            and self.sliding_window is None\n        ):\n            output = self.forward_paged_attention(query, attn_metadata, output)\n        else:\n            output = self.forward_fused_infer_attention(query, key, value, attn_metadata, output, kv_cache)\n\n        return output",
+      "elide": []
+    },
+    {
+      "path": "vllm_ascend/attention/attention_v1.py",
+      "lines": "L1166-L1185",
+      "code": "    def forward_paged_attention(\n        self,\n        query: torch.Tensor,\n        attn_metadata: AscendMetadata,\n        output: torch.Tensor | None = None,\n    ) -> torch.Tensor:\n        if _EXTRA_CTX.capturing:\n            return self.full_graph_pa(query, attn_metadata, output)\n        torch_npu._npu_paged_attention(\n            query=query,\n            key_cache=self.key_cache,\n            value_cache=self.value_cache,\n            num_kv_heads=self.num_kv_heads,\n            num_heads=self.num_heads,\n            scale_value=self.scale,\n            block_table=attn_metadata.block_tables,\n            context_lens=attn_metadata.seq_lens,\n            out=output,\n        )\n        return output",
+      "elide": ["_EXTRA_CTX.capturing 时走 full_graph_pa（图捕获路径，见 workspace 预取片段）"]
+    },
+    {
+      "path": "vllm_ascend/attention/attention_v1.py",
+      "lines": "L985-L1043",
+      "code": "    def _get_fia_params(self, key: torch.Tensor, value: torch.Tensor, attn_metadata: AscendMetadata, kv_cache=None):\n        # PrefillNoCache doesn't need key_cache, but other modes do\n        if attn_metadata.attn_state != AscendAttentionState.PrefillNoCache:\n            if self.key_cache is None and kv_cache is not None:\n                ...\n                self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]\n            if self.key_cache is None:\n                raise RuntimeError(...)\n\n        if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:\n            block_size = 128\n            block_table = None\n            actual_seq_lengths_kv = attn_metadata.actual_seq_lengths_q\n            if self.attn_type == AttentionType.ENCODER_DECODER:\n                actual_seq_lengths_kv = torch.cumsum(attn_metadata.seq_lens, dim=0).tolist()\n        elif attn_metadata.attn_state == AscendAttentionState.PrefillCacheHit:\n            batch_size = attn_metadata.seq_lens.shape[0]\n            block_table = attn_metadata.block_tables[:batch_size, :]\n            num_block, block_size, _, _ = self.key_cache.shape  # type: ignore\n            key = self.key_cache.view(num_block, block_size, -1)\n            value = self.value_cache.view(num_block, block_size, -1)\n            actual_seq_lengths_kv = attn_metadata.seq_lens_list\n        elif attn_metadata.attn_state == AscendAttentionState.DecodeOnly:\n            num_block, block_size, _, _ = self.key_cache.shape  # type: ignore\n            key = self.key_cache.view(num_block, block_size, -1)\n            value = self.value_cache.view(num_block, block_size, -1)\n            block_table = attn_metadata.block_tables\n            actual_seq_lengths_kv = attn_metadata.seq_lens_list\n        # chunked prefill.\n        else:\n            num_block, block_size, _, _ = self.key_cache.shape  # type: ignore\n            key = self.key_cache.view(num_block, block_size, -1)\n            value = self.value_cache.view(num_block, block_size, -1)\n            block_table = attn_metadata.block_tables\n            actual_seq_lengths_kv = attn_metadata.seq_lens_list\n        return key, value, block_size, block_table, actual_seq_lengths_kv",
+      "elide": ["lazy 初始化 key_cache 的 isinstance 形状判断（L990-L1003，与 forward 顶部同套路）", "ChunkedPrefill 与 DecodeOnly 分支体一致，可合并讲"]
+    },
+    {
+      "path": "vllm_ascend/attention/attention_v1.py",
+      "lines": "L1045-L1164",
+      "code": "    def forward_fused_infer_attention(\n        self,\n        query: torch.Tensor,\n        key: torch.Tensor,\n        value: torch.Tensor,\n        attn_metadata: AscendMetadata,\n        output: torch.Tensor,\n        kv_cache=None,\n    ):\n        if _EXTRA_CTX.capturing:\n            ...\n        passed_key = key\n        key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(\n            key, value, attn_metadata, kv_cache\n        )\n        ...\n        num_tokens = attn_metadata.actual_seq_lengths_q[-1]\n        query = query[:num_tokens]\n        if (\n            attn_metadata.attn_state == AscendAttentionState.PrefillNoCache\n            and self.attn_type != AttentionType.ENCODER_DECODER\n        ):\n            key = key[:num_tokens]\n            value = value[:num_tokens]\n        if self.sinks is not None:\n            ...\n        else:\n            if not attn_metadata.causal:\n                attn_output, _ = torch_npu.npu_fused_infer_attention_score(\n                    query=query, key=key, value=value, block_table=block_table,\n                    input_layout=\"TND\", block_size=block_size,\n                    actual_seq_lengths=attn_metadata.actual_seq_lengths_q,\n                    actual_seq_lengths_kv=actual_seq_lengths_kv,\n                    num_key_value_heads=self.num_kv_heads, num_heads=self.num_heads,\n                    scale=self.scale, sparse_mode=0,\n                )\n            elif self.sliding_window is not None:\n                attn_output, _ = torch_npu.npu_fused_infer_attention_score(\n                    query=query, key=key, value=value, atten_mask=attn_metadata.attn_mask,\n                    block_table=block_table, input_layout=\"TND\", block_size=block_size,\n                    actual_seq_lengths=attn_metadata.actual_seq_lengths_q,\n                    actual_seq_lengths_kv=actual_seq_lengths_kv,\n                    num_key_value_heads=self.num_kv_heads, num_heads=self.num_heads,\n                    scale=self.scale, pre_tokens=self.sliding_window, next_tokens=0, sparse_mode=4,\n                )\n            else:\n                attn_output, _ = torch_npu.npu_fused_infer_attention_score(\n                    query=query, key=key, value=value, atten_mask=attn_metadata.attn_mask,\n                    block_table=block_table, input_layout=\"TND\", block_size=block_size,\n                    actual_seq_lengths=attn_metadata.actual_seq_lengths_q,\n                    actual_seq_lengths_kv=actual_seq_lengths_kv,\n                    num_key_value_heads=self.num_kv_heads, num_heads=self.num_heads,\n                    scale=self.scale, sparse_mode=3,\n                )\n            attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)\n        output[:num_tokens] = attn_output[:num_tokens]\n        return output",
+      "elide": ["_EXTRA_CTX.capturing 走 full_graph_fia/_v2（图捕获路径，L1057-L1065）", "enable_hamming_sparse 的 reshape_and_cache_kvcomp/get_kvcomp_decode_params 分支（L1070-L1075，默认关）", "self.sinks 分支：用 npu_fused_infer_attention_score_v2 + learnable_sink（L1085-L1110，attention-sink 模型专用），主线讲非 sinks 的三选一 sparse_mode（0 非因果 / 4 滑窗 / 3 因果）"]
+    },
+    {
+      "path": "vllm_ascend/attention/attention_v1.py",
+      "lines": "L922-L946",
+      "code": "    def full_graph_pa(\n        self,\n        query: torch.Tensor,\n        attn_metadata: AscendMetadata,\n        output: torch.Tensor | None = None,\n    ):\n        graph_params = get_graph_params()\n        num_tokens = query.shape[0]\n        if _EXTRA_CTX.capturing:\n            # Get workspace from cache or calculate it if not present.\n            workspace = graph_params.workspaces.get(num_tokens)\n            if workspace is None:\n                workspace = torch_npu._npu_paged_attention_get_workspace(\n                    query=query,\n                    key_cache=self.key_cache,\n                    value_cache=self.value_cache,\n                    num_kv_heads=self.num_kv_heads,\n                    num_heads=self.num_heads,\n                    scale_value=self.scale,\n                    block_table=attn_metadata.block_tables,\n                    context_lens=attn_metadata.seq_lens,\n                    out=output,\n                )\n                update_graph_params_workspaces(num_tokens, workspace)",
+      "elide": ["其后 ExternalEvent/graph_task_group_begin..end 把 _npu_paged_attention 录进 ACL 图（L947-L983）——只取 workspace 预取这一节拍作范例，图捕获机制不展开"]
+    },
+    {
+      "path": "vllm_ascend/attention/attention_mask.py",
+      "lines": "L53-L79",
+      "code": "    def get_splitfuse_attn_mask(self) -> torch.Tensor:\n        if self.chunked_prefill_attn_mask is None:\n            self.chunked_prefill_attn_mask = (\n                torch.triu(torch.ones(2048, 2048), diagonal=1).to(torch.int8).to(self.device)\n            )\n        return self.chunked_prefill_attn_mask\n\n    ...\n\n    def get_attention_mask(self, causal: bool, model_config: ModelConfig):\n        if model_config.runner_type == \"pooling\":\n            return self.get_attn_mask(2048, torch.bool)\n\n        return self.get_splitfuse_attn_mask()",
+      "elide": ["MLA 专用 mask（get_mla_mask/get_pcp_mla_mask/get_final_mla_mask，非本章 MHA 主线）", "@singleton 装饰：mask builder 全局唯一，2048×2048 上三角缓存一次复用"]
+    },
+    {
+      "path": "vllm_ascend/attention/utils.py",
+      "lines": "L44-L61",
+      "code": "def using_paged_attention(runtime_shape: int, vllm_config: VllmConfig) -> bool:\n    if vllm_config.speculative_config is not None:\n        return False\n    if get_ascend_device_type() == AscendDeviceType.A5:\n        return False\n    from vllm.config.compilation import CUDAGraphMode\n\n    cudagraph_mode = vllm_config.compilation_config.cudagraph_mode\n    if cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY:\n        return False\n\n    return runtime_shape in get_ascend_config().pa_shape_list\n\n\n@lru_cache(maxsize=1)\ndef enable_cp():\n    prefill_config = get_current_vllm_config().parallel_config\n    return prefill_config.prefill_context_parallel_size > 1 or prefill_config.decode_context_parallel_size > 1",
+      "elide": []
+    }
+  ],
+
+  "key_classes": [
+    {"name": "AscendAttentionBackend", "file": "vllm_ascend/attention/attention_v1.py:L73", "responsibility": "vLLM AttentionBackend 的昇腾实现，@register_backend(CUSTOM, ASCEND) 注册进 backend registry；get_impl_cls/get_builder_cls 在 enable_cp() 下切到 CP 版（f7 收口）；get_kv_cache_shape 定 (2,num_blocks,block_size,num_kv_heads,head_size)；swap/copy_blocks 块搬运"},
+    {"name": "AscendAttentionState", "file": "vllm_ascend/attention/attention_v1.py:L143", "responsibility": "五态枚举：当前 batch 形态（纯 prefill 无缓存 / prefill 命中前缀 / 纯 decode / chunked prefill / 投机解码），forward_impl 据此选算子路径"},
+    {"name": "AscendMetadata", "file": "vllm_ascend/attention/attention_v1.py:L151", "responsibility": "逐层注意力元数据：attn_state + slot_mapping(token→KV 物理槽) + block_tables + seq_lens 家族 + actual_seq_lengths_q + attn_mask + 各计数；torch_npu 算子的入参容器"},
+    {"name": "AscendAttentionMetadataBuilder", "file": "vllm_ascend/attention/attention_v1.py:L213", "responsibility": "继承 AttentionMetadataBuilder[AscendMetadata]：build 从 CommonAttentionMetadata 拆 decode/prefill、取 slot_mapping/block_table、装 attn_mask、H2D query_start_loc → AscendMetadata；build_for_graph_capture 造图捕获 dummy；reorder_batch_threshold = 1(+spec tokens)"},
+    {"name": "AscendAttentionBackendImpl", "file": "vllm_ascend/attention/attention_v1.py:L357", "responsibility": "继承 AttentionImpl：forward → reshape_and_cache 写 KV → forward_impl 按 attn_state 分流到 forward_paged_attention(_npu_paged_attention) 或 forward_fused_infer_attention(npu_fused_infer_attention_score[_v2])；非 MLA 模型主路径"},
+    {"name": "AscendC8AttentionBackendImpl", "file": "vllm_ascend/attention/attention_v1.py:L1346", "responsibility": "INT8 KV 量化(C8/QuaRot)子类：量化 K/V 写 NZ 5D paged cache(npu_scatter_pa_kv_cache)，decode 走 FIA V1 BNSD + perchannel antiquant，prefill gather+dequant。减法候选/选讲，不喧宾夺主"},
+    {"name": "AttentionMaskBuilder", "file": "vllm_ascend/attention/attention_mask.py:L35", "responsibility": "@singleton mask 工厂：get_attention_mask 给 MHA 返回 2048×2048 上三角 splitfuse mask（int8），pooling 给 bool mask；MLA mask 另列"},
+    {"name": "DeviceOperator(BaseDeviceAdaptor)", "file": "vllm_ascend/device/device_op.py:L42", "responsibility": "按设备型号选的算子适配器；reshape_and_cache 落到 torch_npu._npu_reshape_and_cache 把新算 K/V 按 slot_mapping 写回分页 cache"}
+  ],
+
+  "data_flow": [
+    "1. 选后端/实现：AscendAttentionBackend.get_impl_cls()/get_builder_cls() —— enable_cp() 为假返回 AscendAttentionBackendImpl/Builder（主线）；为真返回 CP 版（f7 收口，CP 组排布回指 ch08）",
+    "2. 建元数据（每步前向一次，逐层共享）：AscendAttentionMetadataBuilder.build → split_decodes_and_prefills 在已重排 batch 上找 decode|prefill 分界 → 取 block_table、slot_mapping[:num_actual_tokens]、seq_lens → attn_mask_builder.get_attention_mask → query_start_loc pin_memory().to(device) H2D → 组 AscendMetadata（attn_state 由上游 model runner 定）",
+    "3. 前向入口 forward：从 kv_cache 懒初始化 self.key_cache/value_cache → 若 key/value 非空，reshape_and_cache 写 KV",
+    "4. 写 KV：reshape_and_cache → DeviceOperator.reshape_and_cache → torch_npu._npu_reshape_and_cache(key,value,key_cache,value_cache,slot_indices=slot_mapping) 把本步新算 K/V 按 slot 写进分页 cache",
+    "5. 状态分流 forward_impl：若 attn_state==DecodeOnly 且 using_paged_attention(num_tokens)（无 spec、非 A5、CUDAGraph FULL_DECODE_ONLY、shape 命中 pa_shape_list）且无滑窗 → forward_paged_attention；否则 → forward_fused_infer_attention",
+    "6a. paged 路径 forward_paged_attention：torch_npu._npu_paged_attention(query,key_cache,value_cache,...,block_table=block_tables,context_lens=seq_lens,out=output)（图捕获下先 _npu_paged_attention_get_workspace 预取 workspace）",
+    "6b. fused 路径 forward_fused_infer_attention：_get_fia_params 按五态整理 key/value(view num_block,block_size,-1)/block_size/block_table/actual_seq_lengths_kv → 非因果 sparse_mode=0 / 滑窗 sparse_mode=4 / 因果 sparse_mode=3 调 torch_npu.npu_fused_infer_attention_score(input_layout=TND)（sinks 模型走 _v2 + learnable_sink）",
+    "7. 写回 output[:num_tokens]，返回 [num_tokens, num_heads*head_size]"
+  ],
+
+  "design_decisions": [
+    {"decision": "用一台五态机（AscendAttentionState）做单一分流轴", "why": "每态对应一种 batch 形态——PrefillNoCache=纯新 prefill 无历史 KV（block_table=None，KV 即本步算的）/ PrefillCacheHit=带前缀缓存的 prefill（读 paged cache）/ DecodeOnly=纯单 token 解码 / ChunkedPrefill=分块 prefill 与 decode 混批 / SpecDecoding=投机解码（每 req 多 token）。状态决定 _get_fia_params 怎么取 KV 和 forward_impl 走哪条算子", "evidence": "vllm_ascend/attention/attention_v1.py:L143-L148, L985-L1043, L1258-L1277"},
+    {"decision": "把 vLLM FlashAttention 的 CUDA 内核逐一换成 torch_npu 算子", "why": "基座 vllm/v1/attention/backends/flash_attn.py 用 flash_attn_varlen_func（前向）+ reshape_and_cache_flash（写 KV）；昇腾无这些 CUDA 内核，故 paged 解码换 _npu_paged_attention、融合 prefill/混批换 npu_fused_infer_attention_score(_v2)、写 KV 换 _npu_reshape_and_cache。后端契约（AttentionBackend/Builder/Impl）不变，只换内核——这正是 OOT 插件『顶替内核不改引擎』的范式", "evidence": "vllm_ascend/attention/attention_v1.py:L1174, L1146, L45(device_op); 对照 vllm/v1/attention/backends/flash_attn.py:L809,L887"},
+    {"decision": "decode 用 paged、prefill/混批用 fused-infer 两条算子", "why": "纯解码每序列 1 个 query token、KV 全在分页 cache → _npu_paged_attention 直接吃 block_table+context_lens 最省；prefill/chunked 有变长 query 段、需 attn_mask 与 TND 变长布局 → npu_fused_infer_attention_score 一把融合 QK^T·softmax·PV。但 paged 路径还要满足 using_paged_attention 的多重门槛（FULL_DECODE_ONLY 图模式 + shape 命中 + 非 spec/A5 + 无滑窗），否则 decode 也回落 fused", "evidence": "vllm_ascend/attention/attention_v1.py:L1258-L1277, vllm_ascend/attention/utils.py:L44-L55"},
+    {"decision": "workspace 预取——NPU 算子的特有节拍", "why": "torch_npu 的 paged/fused-infer 算子需要外部预分配的 workspace 显存；图捕获/replay 路径先调 _npu_paged_attention_get_workspace / _npu_fused_infer_attention_score_get_max_workspace 量出大小并缓存（graph_params.workspaces[num_tokens]），再把真正算子录进 ACL 图。这是 CUDA flash 内核没有的一步", "evidence": "vllm_ascend/attention/attention_v1.py:L933-L945, L740-L762, L848-L865"},
+    {"decision": "sparse_mode 编码因果/滑窗/全连接，统一 TND 变长布局", "why": "npu_fused_infer_attention_score 用 sparse_mode 选 mask 语义：0=不加 mask（非因果，如双向/encoder）、3=因果下三角、4=滑动窗口（配 pre_tokens=window）。query 用 TND（Token-Num heads-Dim）变长打平布局，actual_seq_lengths_q/kv 给出每序列边界——对应 vLLM 的 cu_seqlens 变长 flash", "evidence": "vllm_ascend/attention/attention_v1.py:L1112-L1160"},
+    {"decision": "attn_mask 单例 + 2048×2048 上三角缓存复用", "why": "AttentionMaskBuilder 是 @singleton，splitfuse mask 一次造好 torch.triu(ones(2048,2048),1).int8 全程复用，避免每步重建；按需扩容（get_attn_mask 在 max_seq_len 超缓存时重算）", "evidence": "vllm_ascend/attention/attention_mask.py:L34-L58"},
+    {"decision": "build 里多次 H2D 与 .tolist() 是已知的冗余/技术债", "why": "build 把 query_start_loc 重新 pin_memory H2D（源码 TODO 自承『device 上已有一份』），并把 seq_lens/query_start_loc 反复 .tolist() 成 Python list 喂算子；AscendMetadata dataclass 注释也自承 seq_lens 家族字段冗余待统一。读者需知这是工程现状而非设计精华", "evidence": "vllm_ascend/attention/attention_v1.py:L310-L311, L175-L178"}
+  ],
+
+  "theory": [
+    {"topic": "五态 × batch 形态映射", "detail": "decode_threshold = 1 + num_speculative_tokens（≤16，受 npu_fused_infer_attention_score TND 布局 16 限制）。split_decodes_and_prefills 在已按 query_len 重排的 batch 上，用 query_lens > decode_threshold 找第一个 prefill 的下标 first_prefill → num_decodes=first_prefill，前 first_prefill 个 token-block 是 decode 段、其后是 prefill 段。状态本身由上游 model runner 据 batch 是否含 prefill/是否 spec/是否前缀命中设好，传进 common_attn_metadata.attn_state"},
+    {"topic": "slot_mapping 的物理寻址（回指 ch16/ch17）", "detail": "slot_mapping[i] = 第 i 个 token 要写进的全局物理槽号；block_id = slot // block_size，块内偏移 = slot % block_size。KV cache 形状 (2,num_blocks,block_size,num_kv_heads,head_size)，_npu_reshape_and_cache 按 slot_indices 把 [num_tokens,num_kv_heads,head_size] 的新 K/V 散写进对应槽。block_table[req] 给出该序列占用的物理块号列表，paged/fused 算子据此 gather 历史 KV"},
+    {"topic": "TND 变长布局与 cu_seqlens 等价", "detail": "TND = 把一个 batch 里所有序列的 token 沿轴 0 打平（T=Σ序列长），actual_seq_lengths_q（= query_start_loc[1:]）给出各序列在打平轴上的累积右边界，等价于 vLLM flash 的 cu_seqlens_q/k。这让一个算子调用处理整批变长序列而无需 padding 到等长"},
+    {"topic": "FlashAttention→torch_npu 算子对照表", "detail": "vLLM CUDA 线 → 昇腾 NPU 线：flash_attn_varlen_func（变长前向）→ npu_fused_infer_attention_score(_v2)（prefill/混批，TND）+ _npu_paged_attention（纯 decode，分页）；reshape_and_cache_flash（写 KV）→ _npu_reshape_and_cache；workspace 在 CUDA 侧由内核内部管理，NPU 侧需 *_get_workspace / *_get_max_workspace 显式预取"}
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "update_graph_params 静态方法整体（L400-L673）及 full_graph_fia/full_graph_fia_v2/full_graph_pa 的图录制体（L680-L920 中除 workspace 预取范例外的 ExternalEvent/graph_task_group/attn_params 录制逻辑）", "why_safe": "这些是 ACL 图捕获/replay 的参数更新与录制路径（_EXTRA_CTX.capturing/draft model 才进）；eager 主前向 forward_impl→forward_paged/fused 不经过它们。精简版只保留 forward_paged_attention 里 _EXTRA_CTX.capturing→full_graph_pa 的一处『workspace 预取节拍』范例，删除其余图机制不影响可读控制流的正确性"},
+      {"what": "AscendC8AttentionBackendImpl 整个子类及其私有方法（_nz_5d_view/_prepare_c8_scales/_dequant_paged_kv_to_dense/_quantize_kv_to_int8/_forward_c8_decode/_forward_c8_chunked_prefill/_forward_c8_fused_infer_attention/_reshape_and_cache，L1346-L1783）", "why_safe": "C8 INT8 KV 量化是独立特性子类，经 kv_c8.py 的 class surgery 才激活；标准 MHA 主路径不走它。作为减法候选/选讲，正文点名其存在与定位即可，精简版可整段删除而不破坏 AscendAttentionBackendImpl 的主控制流"},
+      {"what": "enable_hamming_sparse / kvcomp 分支（forward L1303-1304、forward_fused_infer_attention L1070-L1075、full_graph_fia L691-L696 的 reshape_and_cache_kvcomp/get_kvcomp_decode_params）", "why_safe": "hamming 稀疏注意力默认关（is_enable_hamming_sparse() 为假），属可选稀疏特性；删后主路径 query/key/value 走默认分支，控制流不变"},
+      {"what": "self.sinks 分支（forward_fused_infer_attention L1085-L1110 的 npu_fused_infer_attention_score_v2 + learnable_sink、full_graph_fia_v2 整体）与 sinks 相关 update 路径", "why_safe": "attention-sink（如 gpt-oss）专用；标准 MHA 模型 self.sinks=None，走 else 分支的 npu_fused_infer_attention_score 三选一（sparse_mode 0/4/3）。精简版保留非 sinks 主分支即可"},
+      {"what": "PCP/DCP 相关字段与分支（AscendMetadata.prefill/decode_meta/num_actual_tokens_pcp_padded、split_decodes_and_prefills 的 query_lens_pcp_full 分支、CP 版 impl/builder 的 import）", "why_safe": "CP（上下文并行）运行期分流由 enable_cp() 控制，本章只在 get_impl_cls/get_builder_cls 处『点名收口 f7』，CP attention 算子在 context_parallel/ 子模块、非本章主线。精简版保留 enable_cp() 假分支（主线），删 CP 真分支体不影响标准路径"},
+      {"what": "swap_blocks/copy_blocks（L110-L136）、_forward_encoder_attention 与 pooling 分支（L1187-L1205, L1334-L1337）、is_kv_producer 的 reshape_cache_event 录制（L1239-1240,1254-1255）", "why_safe": "块搬运/拷贝是 KV cache 管理辅助（preemption/CoW）、encoder/pooling 是非自回归模型分支、reshape_cache_event 是 disaggregated PD 的 KV 传输同步——均非标准 MHA 自回归解码主线，删后 forward→reshape_and_cache→forward_impl 主控制流完整"}
+    ],
+    "must_keep": [
+      {"symbol": "AscendAttentionState", "why": "五态机本体，全章立意；五个成员名 PrefillNoCache/PrefillCacheHit/DecodeOnly/ChunkedPrefill/SpecDecoding 必须出现"},
+      {"symbol": "PrefillNoCache", "why": "读者需理解纯新 prefill 无历史 KV（block_table=None）这一态"},
+      {"symbol": "PrefillCacheHit", "why": "前缀缓存命中态，读 paged cache"},
+      {"symbol": "DecodeOnly", "why": "纯解码态，paged 路径的唯一触发态"},
+      {"symbol": "ChunkedPrefill", "why": "分块 prefill 与 decode 混批态，AscendMetadata 默认态"},
+      {"symbol": "SpecDecoding", "why": "投机解码态，每 req 多 token，decode_threshold>1"},
+      {"symbol": "AscendMetadata", "why": "算子入参容器，slot_mapping/block_tables/seq_lens/attn_state 都在其上，writer 需逐字段讲"},
+      {"symbol": "AscendAttentionBackend", "why": "ch18 选定后端，本章是其 impl_cls 的所在"},
+      {"symbol": "get_impl_cls", "why": "f7 收口点：enable_cp() 分流到 CP 版 impl"},
+      {"symbol": "get_builder_cls", "why": "f7 收口点：enable_cp() 分流到 CP 版 builder"},
+      {"symbol": "get_kv_cache_shape", "why": "定义 (2,num_blocks,block_size,num_kv_heads,head_size)，slot_mapping 寻址的基础"},
+      {"symbol": "enable_cp", "why": "运行期 CP 分流判据（prefill/decode_context_parallel_size>1），f7 回收的开关"},
+      {"symbol": "AscendAttentionMetadataBuilder", "why": "元数据装配类，build/build_for_graph_capture 在其上"},
+      {"symbol": "build", "why": "元数据装配主方法：拆批+slot_mapping+block_table+mask+H2D"},
+      {"symbol": "build_for_graph_capture", "why": "图捕获分支，章纲明确要求讲"},
+      {"symbol": "split_decodes_and_prefills", "why": "把一批拆成 decode/prefill 段的核心函数，返回四元组"},
+      {"symbol": "slot_mapping", "why": "token→KV 物理槽映射，回指 ch16/ch17，writer 需讲清寻址"},
+      {"symbol": "block_tables", "why": "每序列物理块号列表，paged/fused 算子据此 gather 历史 KV"},
+      {"symbol": "AscendAttentionBackendImpl", "why": "本章主角类（非 MLA 主路径 impl）"},
+      {"symbol": "forward", "why": "前向入口：写 KV → forward_impl"},
+      {"symbol": "forward_impl", "why": "状态分流核心：DecodeOnly+paged 条件 vs fused"},
+      {"symbol": "reshape_and_cache", "why": "KV 写入方法，章纲第(4)点"},
+      {"symbol": "forward_paged_attention", "why": "decode/paged 算子路径"},
+      {"symbol": "forward_fused_infer_attention", "why": "prefill/融合算子路径"},
+      {"symbol": "_get_fia_params", "why": "按五态整理 KV/block_table/seq_lens 的分流函数，状态机的另一半"},
+      {"symbol": "using_paged_attention", "why": "paged 路径的多门槛判据（FULL_DECODE_ONLY/shape/非 spec-A5/无滑窗）"},
+      {"symbol": "DeviceOperator", "why": "reshape_and_cache 经它落到 torch_npu 算子"},
+      {"symbol": "AscendC8AttentionBackendImpl", "why": "减法候选，正文需点名其存在与定位（选讲）"}
+    ]
+  },
+
+  "diagram_plan": [
+    {"name": "ch19-roadmap", "kind": "roadmap", "spec": "复用 book/assets/roadmap/roadmap.py：高亮『attention 子系统 → AscendAttentionBackendImpl（标准 MHA）』节点；前承 ch18（AscendAttentionBackend 选定/注册），后接 ch20（MLA 后端）；侧标 f7 回收（enable_cp 分流）"},
+    {"name": "ch19-state-machine", "kind": "svg-diagram (state→path table)", "spec": "五态机分流表：行=五态（PrefillNoCache/PrefillCacheHit/DecodeOnly/ChunkedPrefill/SpecDecoding），列=[batch 形态一句话 | block_table 来源 | KV 来源（本步算 vs paged cache）| forward_impl 落点（paged vs fused）| sparse_mode]。突出 DecodeOnly 是唯一可能走 forward_paged_attention 的态（还需 using_paged_attention 四门槛 + 无滑窗），其余皆 fused"},
+    {"name": "ch19-kernel-swap", "kind": "svg-diagram (two-column mapping)", "spec": "左列 vLLM CUDA 线（flash_attn_varlen_func / reshape_and_cache_flash / 内核内部 workspace），右列昇腾 NPU 线（npu_fused_infer_attention_score(_v2) + _npu_paged_attention / _npu_reshape_and_cache / *_get_workspace 预取）；箭头逐一对应。底部标注：后端契约 AttentionBackend/Builder/Impl 不变，只换内核"},
+    {"name": "ch19-forward-flow", "kind": "svg-diagram (flow)", "spec": "前向数据流：query/key/value → reshape_and_cache(_npu_reshape_and_cache 按 slot_mapping 写分页 cache) → forward_impl 菱形判定（attn_state==DecodeOnly && using_paged_attention && sliding_window is None?）→ 是→forward_paged_attention(_npu_paged_attention) / 否→forward_fused_infer_attention(_get_fia_params→npu_fused_infer_attention_score) → output[:num_tokens]。侧注 workspace 预取节拍（图捕获路径）"},
+    {"name": "ch19-slot-mapping", "kind": "svg-diagram (memory layout, 可选/复用 ch16-17 风格)", "spec": "slot_mapping 物理寻址：KV cache (2,num_blocks,block_size,...) → slot=35,block_size=16 → block 2 第 3 槽；block_table[req] 列出该序列物理块号。回指 ch16/ch17，避免重复细节，仅作本章 KV 写入/读取的锚"}
+  ],
+
+  "foreshadow_due": {
+    "plant": [],
+    "recover": [
+      {"id": "f7", "summary": "CP（PCP/DCP）组排布在 ch08 讲清（transpose(3,4) 重排、不增 world_size）；attention 篇运行期 enable_cp() 分流引用本章的 CP 组排布", "planted_in": "ch08", "recover_how": "本章在 AscendAttentionBackend.get_impl_cls/get_builder_cls 处点出：enable_cp()（utils.py:L58-L61，prefill/decode_context_parallel_size>1）为真时切到 CP 版 AscendAttentionCPImpl/Builder，AscendMetadata 带 pcp(prefill)/dcp(decode_meta) 字段——运行期 enable_cp() 分流在此收口；CP 组排布本身回指 ch08，深入的 CP attention 算子在 context_parallel/ 子模块、非本章主线（如实点出、不展开）"}
+    ]
+  }
+}

@@ -14,16 +14,16 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch18',
-  slug: 'ch18-attention-backend-selection',
+  chapter_id: 'ch19',
+  slug: 'ch19-ascend-attention-mha',
   instance: 'vllm-ascend',
-  focus: 'Part V 开篇与注意力总入口：昇腾如何接进 vLLM 的注意力后端选择——OOT 插件契约全貌。主线：**(1) 后端路由**——NPUPlatform.get_attn_backend_cls 按 (use_mla, use_sparse, use_compress) 三元 key 路由到 4 个昇腾后端类（AscendMLABackend / AscendAttentionBackend / AscendSFABackend / AscendDSABackend——MLA/标准 MHA/稀疏 SFA/DSA）；**(2) 注册进 vLLM**——register_backend(_Backend.CUSTOM, "ASCEND") 把后端注进 vLLM backend registry；**(3) 伪装 HACK**——get_name() **故意返回 "FLASH_ATTN"** 绕过 vLLM model-runner 里的 backend name 断言（讲清这个 hack 为何必要、绕的是哪条断言）；**(4) 静态契约**——v1 后端类契约就 4 个 @abstractmethod（get_name/get_impl_cls/get_builder_cls/get_kv_cache_shape），外加可覆写的 get_supported_kernel_block_sizes 默认方法；昇腾还自带 swap_blocks/copy_blocks（v0 遗留、**非 v1 契约要求**，基座 v1 注意力层根本没有这两个方法）——讲清「哪些是必须实现的契约、哪些是昇腾额外保留的」；**(5) 运行期分流**——get_impl_cls / get_builder_cls 在 enable_cp()（上下文并行）下的运行期选择。**核心立意**：讲清「一个 OOT 后端要接进 vLLM 注意力框架，需要实现/伪装哪些契约点」——这是 Part V 五章（本章选择 → ch19 MHA → ch20 MLA → ch21 稀疏 → ch22 KV 管理）的总入口，4 个后端实体留各章展开（本章只讲选择与契约、不展开算子）。回收 ch15 留的「注意力后端实体留 ch18+」(f9)的「后端选择」部分。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/v1/attention/backends/registry.py（register_backend）与 utils.py（AttentionBackend 抽象契约）与 flash_attn.py（FlashAttentionBackend 样板——昇腾 get_name 伪装成它）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN 不可跑，精简版只验可读控制流（三元 key 路由表 / register_backend 注册 / get_name 伪装 / 静态契约方法是纯 Python，可跑；真实注意力算子不真跑）】',
-  highlight: 'ch18',
+  focus: '标准 MHA 的 NPU 内核与状态机：AscendAttentionBackendImpl——非 MLA 模型的主路径，最能直观对照 FlashAttention→torch_npu 算子替换。**(1) 五态机**——AscendAttentionState(Enum) 五态：PrefillNoCache=0 / PrefillCacheHit=1 / DecodeOnly=2 / ChunkedPrefill=3 / SpecDecoding=4，前向按当前 batch 落在哪个状态分流（讲清每态对应什么 batch 形态）；**(2) 元数据装配**——AscendAttentionMetadataBuilder.build（继承 AttentionMetadataBuilder[AscendMetadata]）：split_decodes_and_prefills 把一批拆成 decode/prefill 段、算 slot_mapping（token→KV 物理槽，回指 ch16/ch17 的 slot mapping）、block_table；build_for_graph_capture 走图捕获分支；**(3) forward_impl 按状态分流**——decode/paged 路径走 forward_paged_attention（torch_npu._npu_paged_attention + _npu_paged_attention_get_workspace 预取 workspace）；prefill/融合路径走 forward_fused_infer_attention（torch_npu.npu_fused_infer_attention_score / _v2，含 get_max_workspace 预取）；**(4) KV 写入**——reshape_and_cache / reshape_and_cache_kvcomp 经 torch_npu 算子把新算的 K/V 写回分页 KV cache；**(5) 减法候选**——C8（INT8 KV 量化）子类 AscendC8AttentionBackendImpl 作 subtract-only 候选（选讲，不喧宾夺主）。**核心立意**：一个标准注意力后端在 NPU 上「状态机决定走哪条算子路径」——把 FlashAttention 的 CUDA 内核逐一换成 torch_npu 的 paged/fused-infer 算子；workspace 预取是 NPU 算子的特有节拍。承接 ch18 选定的 AscendAttentionBackend → 本章是它的 impl_cls。**回收伏笔 f7（CP 组排布，埋于 ch08）**：本章 AscendAttentionBackend.get_impl_cls/get_builder_cls 在 enable_cp()（utils.py，prefill/decode_context_parallel_size>1）下切到 CP 版实现 AscendAttentionCPImpl/Builder，AscendMetadata 带 pcp/dcp 字段——**运行期 enable_cp() 分流在本章收口**，CP 组排布本身回指 ch08；深入的 CP attention 算子在 context_parallel/ 子模块、非本章主线（如实点出、不展开）。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/v1/attention/backends/flash_attn.py（FlashAttentionImpl/MetadataBuilder——昇腾把它的 flash kernel 换成 torch_npu 算子）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；昇腾代码 host 无 NPU/CANN（torch_npu 算子不真跑）：精简版只验可读控制流（五态机分流 / split_decodes_and_prefills 拆批 / slot_mapping·block_table 装配 / forward_impl 按状态选 paged vs fused 路径是纯 Python，可跑；真实 _npu_paged_attention/npu_fused_infer_attention_score 算子不真跑）】',
+  highlight: 'ch19',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm-ascend/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
-  skip_dossier: true,
+  skip_dossier: false,
   skip_impl: false,
-  paths: ['vllm_ascend/platform.py', 'vllm_ascend/attention/attention_v1.py', 'vllm_ascend/attention/abstract.py'],
+  paths: ['vllm_ascend/attention/attention_v1.py', 'vllm_ascend/attention/attention_mask.py', 'vllm_ascend/attention/utils.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
