@@ -1,0 +1,193 @@
+{
+  "chapter_id": "ch01",
+  "title": "鸟瞰：一个不改 vLLM 却接管整条执行路径的 OOT 插件",
+  "meta": {
+    "kind": "birdseye/meta-overview",
+    "skip_impl": true,
+    "no_companion": true,
+    "note": "本章是全书开篇的元/鸟瞰章，不是逐行源码解读。主线是把读者心智模型搭起来：OOT 插件 = 装上就被发现（entry points）+ 一个平台类接管分发（NPUPlatform）+ 改不动的地方两段式打补丁（monkey-patch）+ 往每个扩展点登记昇腾实现。三支柱各只内嵌一个最小真源码锚点，其余各章 zoom-in。控制流 host 可读（纯 Python 元数据/import 机制），不涉 NPU 算子。",
+    "sister_book": "对照基座 vLLM v0.21.0（instances/vllm/source），正文写规范路径 vllm/... 与 vllm_ascend/...，绝不带 instances/.../source/ 前缀。"
+  },
+
+  "code_spine": [
+    "setup.py:L540-L547 —— 支柱1 声明：entry_points 把 5 个回调注册进 vllm.platform_plugins / vllm.general_plugins 两组",
+    "vllm/plugins/__init__.py:L28-L66 —— vLLM 侧发现：load_plugins_by_group() 用 importlib.metadata.entry_points(group=...) 发现并 load() 插件回调",
+    "vllm/platforms/__init__.py:L212-L252 —— vLLM 侧激活：resolve_current_platform_cls_qualname() probe builtin+OOT 插件，OOT 优先，得到 'vllm_ascend.platform.NPUPlatform' 字符串",
+    "vllm/platforms/__init__.py:L262-L281 —— vLLM 侧懒加载：首次访问 current_platform 才 resolve + 实例化 NPUPlatform",
+    "vllm_ascend/__init__.py:L40-L43 —— 支柱2 入口：register() 只返回字符串 'vllm_ascend.platform.NPUPlatform'（故意不 import，避免过早触发 torch_npu 初始化）",
+    "vllm_ascend/platform.py:L134-L186 —— 支柱2 主体：class NPUPlatform(Platform)，_enum=OOT，覆写身份类属性 + get_*_cls 工厂钩子；pre_register_and_update() 里调 adapt_patch(is_global_patch=True)",
+    "vllm_ascend/platform.py:L738-L765 / L804-L805 / L815-L820 —— 支柱2 分发范例：get_attn_backend_cls / get_device_communicator_cls / get_static_graph_wrapper_cls 返回昇腾类名字符串",
+    "vllm_ascend/__init__.py:L23-L37 —— 支柱3 触发点（engine-core 子进程侧）：register_connector 等 general plugin 先调 _ensure_global_patch() → adapt_patch(is_global_patch=True)",
+    "vllm_ascend/utils.py:L511-L516 —— 支柱3 机制：adapt_patch() 靠 import 副作用触发——is_global_patch=True → import patch.platform；False → import patch.worker",
+    "vllm_ascend/patch/__init__.py:L17-L27 —— 支柱3 台账：两段式 patch 的官方说明（platform 段 worker 启动前打 / worker 段每个 worker __init__ 里打）"
+  ],
+
+  "embed_excerpts": [
+    {
+      "pillar": "支柱1 · 安装期挂入（entry points）",
+      "path": "setup.py",
+      "lines": "L540-L549",
+      "code": "    entry_points={\n        \"vllm.platform_plugins\": [\"ascend = vllm_ascend:register\"],\n        \"vllm.general_plugins\": [\n            \"ascend_kv_connector = vllm_ascend:register_connector\",\n            \"ascend_model_loader = vllm_ascend:register_model_loader\",\n            \"ascend_service_profiling = vllm_ascend:register_service_profiling\",\n            \"ascend_model = vllm_ascend:register_model\",\n        ],\n    },\n)",
+      "elide": ["setup.py 前面约 530 行是 AscendC csrc 的 CMake 构建脚手架（CMakeExtension / cmake_build_ext / gen_build_info / npu-smi 芯片探测等）——与「插件如何被 vLLM 发现」无关，讲支柱1 时只需 setup() 的 entry_points 参数；正文可一句带过其余是自定义算子的构建逻辑。"],
+      "teach": "这 8 行是整个插件的『安装期声明』：pip install vllm-ascend 后，这两组 entry point 被写进包元数据。vLLM 启动时用 importlib.metadata 按组名反查，就发现了 ascend 的 5 个回调——昇腾无需改 vLLM 一行，就被挂进了 vLLM 的发现机制。platform_plugins 组决定『用哪个平台』，general_plugins 组决定『在每个进程里额外跑哪些注册/打补丁』。"
+    },
+    {
+      "pillar": "支柱1 · vLLM 侧如何发现（对照基座）",
+      "path": "vllm/plugins/__init__.py",
+      "lines": "L28-L37, L54-L66",
+      "code": "def load_plugins_by_group(group: str) -> dict[str, Callable[[], Any]]:\n    \"\"\"Load plugins registered under the given entry point group.\"\"\"\n    from importlib.metadata import entry_points\n\n    allowed_plugins = envs.VLLM_PLUGINS\n\n    discovered_plugins = entry_points(group=group)\n    if len(discovered_plugins) == 0:\n        logger.debug(\"No plugins for group %s found.\", group)\n        return {}\n    ...\n    plugins = dict[str, Callable[[], Any]]()\n    for plugin in discovered_plugins:\n        if allowed_plugins is None or plugin.name in allowed_plugins:\n            ...\n            try:\n                func = plugin.load()\n                plugins[plugin.name] = func\n            except Exception:\n                logger.exception(\"Failed to load plugin %s\", plugin.name)\n\n    return plugins",
+      "elide": ["中间省略的是日志分级（default group 用 DEBUG、其余用 INFO）与 VLLM_PLUGINS 白名单未设时的一条提示日志——纯 UX，不影响机制。DEFAULT_PLUGINS_GROUP='vllm.general_plugins'、PLATFORM_PLUGINS_GROUP='vllm.platform_plugins'（同文件 L14/L19），正好对上 setup.py 的两组名。"],
+      "teach": "这是 vLLM 预留的『接收口』：用标准库 importlib.metadata.entry_points(group=...) 按组名发现第三方插件，plugin.load() 拿到回调函数。昇腾没有 fork vLLM，而是把自己登记进这个标准发现点，被 vLLM 反向钩进来。这一句 `entry_points(group=group)` 就是整个 OOT 机制的物理基础。"
+    },
+    {
+      "pillar": "支柱1→2 · 激活并选定平台（对照基座）",
+      "path": "vllm/platforms/__init__.py",
+      "lines": "L212-L252（择要）",
+      "code": "def resolve_current_platform_cls_qualname() -> str:\n    platform_plugins = load_plugins_by_group(PLATFORM_PLUGINS_GROUP)\n\n    activated_plugins = []\n\n    for name, func in chain(builtin_platform_plugins.items(), platform_plugins.items()):\n        try:\n            assert callable(func)\n            platform_cls_qualname = func()\n            if platform_cls_qualname is not None:\n                activated_plugins.append(name)\n        except Exception:\n            pass\n    ...\n    activated_oot_plugins = list(set(activated_plugins) & set(platform_plugins.keys()))\n\n    if len(activated_oot_plugins) >= 2:\n        raise RuntimeError(...)\n    elif len(activated_oot_plugins) == 1:\n        platform_cls_qualname = platform_plugins[activated_oot_plugins[0]]()\n        logger.info(\"Platform plugin %s is activated\", activated_oot_plugins[0])\n    elif ...:\n        ...\n    return platform_cls_qualname",
+      "elide": ["省略 builtin 分支（cuda/rocm/tpu/xpu/cpu 各自的探测回调）与它们的报错/日志——鸟瞰章只需说明『OOT 插件优先于 builtin，恰好 1 个 OOT 激活就用它』。builtin_platform_plugins 定义在同文件 L203-L209。"],
+      "teach": "vLLM 把所有平台回调都 probe 一遍：谁返回非 None 就算『激活』。昇腾的 register() 永远返回字符串（恒激活），且 OOT 插件先于 builtin 判定——所以在 NPU 机器上，vLLM 选中的 current_platform 就是 NPUPlatform。注意这里只拿到『类名字符串』，还没 import 昇腾任何代码。"
+    },
+    {
+      "pillar": "支柱1→2 · current_platform 懒加载（对照基座）",
+      "path": "vllm/platforms/__init__.py",
+      "lines": "L262-L281",
+      "code": "def __getattr__(name: str):\n    if name == \"current_platform\":\n        # lazy init current_platform.\n        # 1. out-of-tree platform plugins need `from vllm.platforms import\n        #    Platform` so that they can inherit `Platform` class. Therefore,\n        #    we cannot resolve `current_platform` during the import of\n        #    `vllm.platforms`.\n        # 2. when users use out-of-tree platform plugins, they might run\n        #    `import vllm`, some vllm internal code might access\n        #    `current_platform` during the import ...\n        global _current_platform\n        if _current_platform is None:\n            platform_cls_qualname = resolve_current_platform_cls_qualname()\n            _current_platform = resolve_obj_by_qualname(platform_cls_qualname)()\n            global _init_trace\n            _init_trace = \"\".join(traceback.format_stack())\n        return _current_platform",
+      "elide": ["省略 __getattr__ 的其余分支（转发到 globals() / AttributeError）与 __setattr__（测试用注入）——鸟瞰章只需懒加载这一段。"],
+      "teach": "vLLM 用模块级 __getattr__ 实现懒加载：首次有人访问 `current_platform` 才 resolve 字符串并实例化。注释解释了为什么必须懒——OOT 平台要 `from vllm.platforms import Platform` 来继承，若在 import 时就 resolve 会成环。这解释了为什么昇腾的 register() 只敢返回字符串、不敢真的 import platform 模块。从此，vLLM 内部每次 current_platform.get_xxx_cls() 拿到的都是 NPUPlatform 的答案。"
+    },
+    {
+      "pillar": "支柱2 · 运行期分发入口（register 只返回字符串）",
+      "path": "vllm_ascend/__init__.py",
+      "lines": "L40-L43",
+      "code": "def register():\n    \"\"\"Register the NPU platform.\"\"\"\n\n    return \"vllm_ascend.platform.NPUPlatform\"",
+      "elide": [],
+      "teach": "支柱2 的入口小到只有一行返回值。vLLM 的 platform_plugins 回调约定就是『返回平台类的 qualname 字符串』——昇腾照办，返回 NPUPlatform 的全限定名。故意不在这里 import NPUPlatform：配合上面的懒加载注释，避免在平台『选择阶段』就触发 torch_npu 重初始化。真正的接管逻辑全在 NPUPlatform 类里。"
+    },
+    {
+      "pillar": "支柱2 · 一个平台类接管所有分发（NPUPlatform）",
+      "path": "vllm_ascend/platform.py",
+      "lines": "L134-L144, L181-L186",
+      "code": "class NPUPlatform(Platform):\n    _enum = PlatformEnum.OOT\n    device_name: str = \"npu\"\n    device_type: str = \"npu\"\n    simple_compile_backend: str = \"eager\"  # Disable torch.compile()\n    ray_device_key: str = \"NPU\"\n    device_control_env_var: str = \"ASCEND_RT_VISIBLE_DEVICES\"\n    ray_noset_device_env_vars: list[str] = [\n        \"RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES\",\n    ]\n    dispatch_key: str = \"PrivateUse1\"\n    ...\n    @classmethod\n    def pre_register_and_update(cls, parser: FlexibleArgumentParser | None = None) -> None:\n        # Adapt the global patch here.\n        from vllm_ascend.utils import adapt_patch\n\n        adapt_patch(is_global_patch=True)",
+      "elide": ["类头与 pre_register_and_update 之间省略 supported_quantization 列表、is_sleep_mode_available、pass_key/get_pass_manager_cls/get_compile_backend 等——都是同一类『覆写钩子』的更多实例，各章展开。pre_register_and_update 后半段（把 'ascend' 塞进 --quantization CLI choices、按 is_310p 导入量化配置、config_deprecated_logging）鸟瞰章可略。"],
+      "teach": "这是支柱2 的主体：NPUPlatform 继承 vLLM 的 Platform 基类，`_enum = PlatformEnum.OOT` 声明自己是树外平台。类属性就是一次『身份替换』——device_name/dispatch_key/device_control_env_var 全换成昇腾口径。pre_register_and_update() 是平台被选定后 vLLM 回调的第一个钩子，昇腾在这里第一次打 platform 段补丁（支柱3）。一个类，接管 vLLM 所有『问平台要组件』的分发。"
+    },
+    {
+      "pillar": "支柱2 · 覆写工厂钩子的范例（返回昇腾类名）",
+      "path": "vllm_ascend/platform.py",
+      "lines": "L738-L751, L765；L804-L805；L815-L820",
+      "code": "    @classmethod\n    def get_attn_backend_cls(cls, selected_backend, attn_selector_config, num_heads: int | None = None):\n        ...\n        backend_map = {\n            (True, False, False): \"vllm_ascend.attention.mla_v1.AscendMLABackend\",\n            (False, False, False): \"vllm_ascend.attention.attention_v1.AscendAttentionBackend\",\n            (True, True, False): \"vllm_ascend.attention.sfa_v1.AscendSFABackend\",\n            (True, False, True): \"vllm_ascend.attention.dsa_v1.AscendDSABackend\",\n        }\n        ...\n        return backend_map[(attn_selector_config.use_mla, attn_selector_config.use_sparse, use_compress)]\n\n    @classmethod\n    def get_device_communicator_cls(cls) -> str:\n        return \"vllm_ascend.distributed.device_communicators.npu_communicator.NPUCommunicator\"\n\n    @classmethod\n    def get_static_graph_wrapper_cls(cls) -> str:\n        # … 省略 docstring \"Get piecewise backend class for piecewise graph.\" …\n        return \"vllm_ascend.compilation.acl_graph.ACLGraphWrapper\"  # noqa",
+      "elide": ["get_attn_backend_cls 里省略 FA3 特判（_validate_fa3_backend）与 310P 的 backend_map_310 分支——鸟瞰章只需展示『按键路由到昇腾 backend 类名』这一模式，注意力各章（P5）细讲。vLLM 基类 Platform.get_attn_backend_cls 默认返回 ''（interface.py:L248-L255），子类必须覆写。"],
+      "teach": "这三个方法是支柱2『分发』的缩影，形态高度一致：都是 @classmethod、都不做实际计算、都只返回一个昇腾类的 qualname 字符串。vLLM 引擎要注意力后端就问 get_attn_backend_cls、要通信器就问 get_device_communicator_cls、要图捕获包装就问 get_static_graph_wrapper_cls——问的是 current_platform（=NPUPlatform），于是拿到的全是昇腾版。后面 29 章基本就是逐个展开这些『返回的类名』背后的昇腾实现。"
+    },
+    {
+      "pillar": "支柱3 · 两段式 patch 的触发点（子进程侧）",
+      "path": "vllm_ascend/__init__.py",
+      "lines": "L20-L37, L46-L52",
+      "code": "_GLOBAL_PATCH_APPLIED = False\n\n\ndef _ensure_global_patch():\n    \"\"\"Apply process-wide vLLM patches before engine-core initialization.\n\n    vLLM loads general plugins in engine-core subprocesses. E2E test\n    conftest hooks do not run there, so global patches that affect scheduler\n    and engine code must also be applied through these plugin entry points.\n    \"\"\"\n    global _GLOBAL_PATCH_APPLIED\n    if _GLOBAL_PATCH_APPLIED:\n        return\n\n    from vllm_ascend.utils import adapt_patch\n\n    adapt_patch(is_global_patch=True)\n    _GLOBAL_PATCH_APPLIED = True\n\n\ndef register_connector():\n    _ensure_global_patch()\n\n    from vllm_ascend.distributed.kv_transfer import register_connector\n\n    register_connector()",
+      "elide": ["register_connector / register_model_loader / register_service_profiling 三个回调结构相同——都先 _ensure_global_patch() 再各自注册（KV connector / loader / profiling）；鸟瞰章展示 register_connector 一个即可。**register_model（L72-75）例外——只做 `from .models import register_model; register_model()`，不打全局补丁**（模型注册无需 platform 段 patch）。"],
+      "teach": "这段揭示支柱3 的一个关键工程约束：vLLM 在 engine-core 子进程里加载 general plugins，而测试的 conftest 钩子不在子进程跑——所以影响 scheduler/engine 的全局 patch 必须经每个 general plugin 回调在每个进程重新落地。_GLOBAL_PATCH_APPLIED 是进程级幂等锁，保证同进程多次调用只打一次。这解释了为什么『打补丁』要挂在 register_* 回调里，而不是只靠 platform 那一处。"
+    },
+    {
+      "pillar": "支柱3 · patch 机制本体（import 副作用）",
+      "path": "vllm_ascend/utils.py",
+      "lines": "L511-L516",
+      "code": "def adapt_patch(is_global_patch: bool = False):\n    if is_global_patch:\n        from vllm_ascend.patch import platform  # noqa: F401\n    else:\n        from vllm_ascend.patch import worker  # noqa: F401",
+      "elide": [],
+      "teach": "支柱3 的机制小到只有一个 if：adapt_patch 不做任何显式打补丁动作，而是 import patch.platform 或 patch.worker 包——被 import 的 __init__.py 会按固定顺序逐个 import 每个 patch 模块，每个 patch 模块在 import 时执行『把 vLLM 某个符号替换成昇腾实现』的副作用。is_global_patch=True 对应 platform 段（worker 启动前，由 NPUPlatform.pre_register_and_update 调），False 对应 worker 段（每个 worker __init__ 里调）。『改不动的地方』——那些 vLLM 没留工厂钩子的函数——就靠这种 import 副作用改写。"
+    },
+    {
+      "pillar": "支柱3 · 两段式 patch 的官方台账",
+      "path": "vllm_ascend/patch/__init__.py",
+      "lines": "L17-L27",
+      "code": "# ----------------------------------------------------------------------------------\n# This module manage the patch for vllm. There are two folders in this module:\n# - platform: contains the patches applied before worker starts. It's called by\n#             `vllm_ascend.utils.adapt_patch(is_global_patch=True)` in\n#             `vllm_ascend.platform.NPUPlatform.pre_register_and_update()` function.\n# - worker: contains the patches applied when worker starts. It's called by\n#           `vllm_ascend.utils.adapt_patch(is_global_patch=False)` in\n#           each worker's `__init__` function.\n#\n# Once a new patch is added in vllm-ascend, please add the patch description into this file as well.\n# ----------------------------------------------------------------------------------",
+      "elide": ["patch/__init__.py 文件其余 ~890 行是逐条 patch 台账（每条：目标 vLLM 符号 / Why / How / Related PR / Future Plan），platform 段约 25 条 + worker 段约 22 条——鸟瞰章只引这段总述，具体条目留给对应各章。可举 1-2 条为例（如 platform/patch_multiproc_executor 把 daemon=True 改 False 以支持 EPLB；worker/patch_triton 用昇腾实现覆写 triton ops）说明『为何非 patch 不可』。"],
+      "teach": "这段官方注释是支柱3 的『两段式』定义本身：platform 段在 worker 启动『前』打（经 pre_register_and_update），worker 段在每个 worker 启动时打（经 worker __init__）。两段的差别本质是『打补丁的时机与作用域』——engine 侧全局改写 vs worker 进程内改写。整份文件还是一份罕见的一手教学材料：每条 patch 都写清了目标符号、动机、做法与未来计划，正是『为什么需要 monkey-patch 而非干净继承/工厂钩子』的最佳注脚。"
+    }
+  ],
+
+  "key_classes": [
+    {"name": "NPUPlatform", "file": "vllm_ascend/platform.py:L134", "responsibility": "支柱2 主体。继承 vLLM Platform（_enum=PlatformEnum.OOT），覆写身份类属性（device_name/dispatch_key/device_control_env_var…）与一整套 get_*_cls 工厂钩子，把 vLLM 每一处『问平台要组件』的分发都导向昇腾实现。pre_register_and_update / check_and_update_config 是它挂 patch、改配置的两大回调。"},
+    {"name": "Platform", "file": "vllm/platforms/interface.py:L105（对照基座）", "responsibility": "vLLM 的平台抽象基类，声明 _enum/device_name/dispatch_key 等契约与 get_attn_backend_cls/get_device_communicator_cls/pre_register_and_update/check_and_update_config 等钩子（多为默认返回空/NotImplemented）。NPUPlatform 覆写它——这是『扩展点—登记实现』范式的模板。"},
+    {"name": "PlatformEnum", "file": "vllm/platforms/interface.py:L38（对照基座）", "responsibility": "平台种类枚举，含 CUDA/ROCM/TPU/XPU/CPU/OOT/UNSPECIFIED。NPUPlatform._enum=OOT 标记『树外平台』，令 resolve_current_platform_cls_qualname 把它归入 activated_oot_plugins 并优先于 builtin。"},
+    {"name": "register / _ensure_global_patch / register_connector / register_model_loader / register_service_profiling / register_model", "file": "vllm_ascend/__init__.py:L40-L73", "responsibility": "支柱1→2/3 的入口函数簇。register 返回 NPUPlatform qualname；三个 general-plugin 回调（connector / model_loader / service_profiling）先 _ensure_global_patch()（进程级幂等打 platform 段补丁）再各自注册（KV connector / model loader / profiling），register_model（L72-75）例外——只做模型注册、不打全局补丁（模型注册无需 platform 段 patch）。"},
+    {"name": "adapt_patch", "file": "vllm_ascend/utils.py:L511", "responsibility": "支柱3 机制本体。按 is_global_patch 分别 import patch.platform 或 patch.worker 包，靠 import 副作用触发两段式 monkey-patch。"},
+    {"name": "load_plugins_by_group / load_general_plugins / resolve_current_platform_cls_qualname", "file": "vllm/plugins/__init__.py:L28,L69 + vllm/platforms/__init__.py:L212（对照基座）", "responsibility": "vLLM 侧的发现/激活/选定三步：entry_points(group=...) 发现→probe 激活→OOT 优先选定 qualname；current_platform 懒加载后实例化。"}
+  ],
+
+  "data_flow": [
+    "1. 安装：pip install vllm-ascend → setup.py 的 entry_points 写进包元数据（vllm.platform_plugins: ascend=register；vllm.general_plugins: 4 个 register_*）。",
+    "2. 发现：vLLM 启动，vllm/plugins/__init__.py::load_plugins_by_group 用 importlib.metadata.entry_points(group=...) 反查两组，plugin.load() 拿到 ascend 的回调函数。",
+    "3. 选定平台：vllm/platforms/__init__.py::resolve_current_platform_cls_qualname 把 builtin+OOT 回调都 probe；ascend.register() 恒返回字符串→OOT 激活→（OOT 优先）选定 qualname 'vllm_ascend.platform.NPUPlatform'。",
+    "4. 懒加载实例化：首次访问 vllm.platforms.current_platform（模块级 __getattr__）→ resolve_obj_by_qualname 实例化 NPUPlatform，成为进程内的 current_platform。",
+    "5. 平台侧打第一段补丁：平台流程回调 NPUPlatform.pre_register_and_update() → adapt_patch(is_global_patch=True) → import patch.platform → 逐个 import ~25 个 platform patch，import 副作用改写 vLLM 的 engine/scheduler 等符号。",
+    "6. general plugin 侧补打：engine-core 子进程加载 general plugins → register_connector / register_model_loader / register_service_profiling 先 _ensure_global_patch()（进程级幂等）确保子进程里 platform 段补丁也落地，再各自注册（KV connector / loader / profiling）；register_model（L72-75）例外——只做模型注册、不打全局补丁。",
+    "7. worker 侧打第二段补丁：每个 worker __init__ → adapt_patch(is_global_patch=False) → import patch.worker → 逐个 import ~22 个 worker patch，改写 worker/模型/算子层符号。",
+    "8. 运行期分发：此后 vLLM 引擎每次要某组件（注意力后端/通信器/图包装/worker_cls/编译后端…）都问 current_platform.get_*_cls()→拿到昇腾类名字符串→import 实例化昇腾实现。CUDA 整套被昇腾整套顶替，vLLM 源码一行未改。"
+  ],
+
+  "design_decisions": [
+    {"decision": "不 fork、不改 vLLM 源码，做 out-of-tree 平台插件", "why": "vLLM 处处预留扩展点（entry point 组 + Platform 工厂钩子 + general plugin 回调）；昇腾往每个扩展点登记实现即可接管，避免维护一份 vLLM 分叉、随上游漂移。", "evidence": "setup.py:L540-L547 + vllm/platforms/__init__.py:L212-L252"},
+    {"decision": "register() 只返回类名字符串，不 import NPUPlatform", "why": "vLLM 的 current_platform 是懒加载的（OOT 平台需 `from vllm.platforms import Platform` 继承，import 期不能 resolve）；过早 import platform 会触发 torch_npu 重初始化并可能成环。", "evidence": "vllm_ascend/__init__.py:L40-L43 + vllm/platforms/__init__.py:L262-L281（懒加载注释）"},
+    {"decision": "一个 NPUPlatform 类集中承载所有分发（get_*_cls 工厂钩子）", "why": "vLLM 把『问平台要组件』统一收敛到 current_platform，昇腾只需覆写一个类的一组 @classmethod 返回昇腾 qualname，就把注意力/通信/编译/worker 等整条链路切换到昇腾版——单点接管、易于对照上游。", "evidence": "vllm_ascend/platform.py:L738-L765, L804-L805, L815-L820"},
+    {"decision": "对没有工厂钩子的地方用两段式 monkey-patch（platform 段 + worker 段）", "why": "vLLM 并非处处都有平台钩子（如 distributed all_reduce、multiproc_executor daemon、triton ops、kv_cache_utils…）；对这些『改不动』的点，靠 import 副作用打补丁。分两段是因为打补丁的时机/作用域不同：platform 段在 worker 启动前作用于 engine/scheduler，worker 段在 worker 进程内作用于模型/算子。", "evidence": "vllm_ascend/patch/__init__.py:L17-L27 + vllm_ascend/utils.py:L511-L516"},
+    {"decision": "全局 patch 只经需要它的 general-plugin 回调在每个进程重打，并用进程级幂等锁；register_model 不打补丁", "why": "vLLM 在 engine-core 子进程加载 general plugins，测试 conftest 钩子不在子进程跑；影响 scheduler/engine 的补丁必须在每个进程重新落地，_GLOBAL_PATCH_APPLIED 保证同进程只打一次。注意四个回调里只有 register_connector / register_model_loader / register_service_profiling 三个先调 _ensure_global_patch()；register_model（L72-75）只做 `from .models import register_model; register_model()`、不打全局补丁——因为模型注册是往 vLLM 的 ModelRegistry 登记类名，不依赖 platform 段那批对 engine/scheduler 的符号改写。**writer 务必点出这个区别，切勿沿用『4 个回调都先 _ensure_global_patch()』的错说法。**", "evidence": "vllm_ascend/__init__.py:L23-L37（三个打补丁）+ L72-L75（register_model 不打）"},
+    {"decision": "patch/__init__.py 维护逐条补丁台账（目标符号/Why/How/PR/Future Plan）", "why": "monkey-patch 是『不得已的耦合』，需要显式记录每条补丁的动机与退出计划，便于随上游演进逐条移除——把技术债显式化。", "evidence": "vllm_ascend/patch/__init__.py:L29-L919"}
+  ],
+
+  "theory": [
+    "OOT 插件的四要素心智模型（本章的核心一句话）：装上就被发现（entry points）+ 一个平台类接管分发（NPUPlatform）+ 改不动的地方两段式打补丁（monkey-patch）+ 往每个扩展点登记昇腾实现（注册/薄壳继承/必要时特化）。",
+    "『扩展点—登记实现』范式：vLLM 处处留扩展点（entry point 组、Platform 工厂钩子、general plugin 回调、模型/连接器/加载器注册表），昇腾在每个扩展点登记昇腾实现——后面 29 章就是这一范式在每一站（入口/平台/配置 P1、通信/并行 P1-2、KV/PD/调度 P3-4、worker/runner/单步前向 P4、注意力 P5、算子/编译 P6、量化/采样/投机/加载 P7）的 zoom-in。",
+    "两段式 patch 的时机/作用域二分：platform 段（is_global_patch=True，worker 启动前，作用于 engine-core/scheduler 等全局对象）vs worker 段（is_global_patch=False，worker __init__，作用于 worker 进程内的模型/算子/采样）。判据是『这个符号在哪一层、何时被 vLLM 用到』。",
+    "分发的静态形态：get_*_cls 全部返回 qualname 字符串而非类对象——延迟 import、避免平台选择阶段就拉起重依赖，同时让『vLLM 要什么昇腾给什么类名』这层间接可被 monkey-patch/配置进一步左右。",
+    "姊妹篇对照法：本书每处都以『同一处 vLLM v0.21.0 原版长什么样 vs 昇腾改成什么样』成对呈现——鸟瞰章先立三对锚点（interface.py Platform 基类 vs NPUPlatform；plugins/platforms 发现机制 vs setup.py+register；无钩子处 vs patch/）作为全书对照法的样板。"
+  ],
+
+  "subtraction_plan": {
+    "note": "本章 skip_impl（meta 概览章，无精简版/无 companion）。因此不存在 implementer 的『只删不增』动作；subtraction_plan.delete 为空。此处 must_keep 是给 writer 的『必须在正文讲清、且引用逐字真源码』的符号清单——鸟瞰章只挑三支柱各最小锚点，具体展开留给各章。",
+    "delete": [],
+    "must_keep": [
+      {"symbol": "entry_points（setup.py）", "why": "支柱1 的物理声明；必须逐字展示 vllm.platform_plugins / vllm.general_plugins 两组与 5 个 register 回调。"},
+      {"symbol": "vllm.platform_plugins / vllm.general_plugins", "why": "两个 entry point 组名，是『安装期挂入』的接口契约，vLLM 侧按组名反查。"},
+      {"symbol": "register", "why": "支柱2 入口，返回 'vllm_ascend.platform.NPUPlatform' 字符串——读者需理解『只返回类名不 import』的设计。"},
+      {"symbol": "NPUPlatform", "why": "支柱2 主体类，一个平台类接管所有分发；全书主角之一。"},
+      {"symbol": "Platform", "why": "vLLM 基类，NPUPlatform 覆写它——『扩展点—登记实现』的模板，姊妹篇对照锚点。"},
+      {"symbol": "PlatformEnum.OOT", "why": "标记树外平台，决定 vLLM 选定它并优先于 builtin。"},
+      {"symbol": "get_attn_backend_cls", "why": "工厂钩子分发的范例，展示『按键返回昇腾 backend 类名字符串』的统一模式。"},
+      {"symbol": "get_device_communicator_cls", "why": "工厂钩子分发的第二个范例，返回 NPUCommunicator，佐证『同一形态覆写一堆钩子』。"},
+      {"symbol": "get_static_graph_wrapper_cls", "why": "工厂钩子分发的第三个范例，返回 ACLGraphWrapper，指向编译/图模式章。"},
+      {"symbol": "pre_register_and_update", "why": "平台被选定后的首个回调，昇腾在此打 platform 段补丁——连接支柱2 与支柱3。"},
+      {"symbol": "adapt_patch", "why": "支柱3 机制本体，靠 import 副作用触发两段式 patch；is_global_patch 参数区分两段。"},
+      {"symbol": "_ensure_global_patch / _GLOBAL_PATCH_APPLIED", "why": "解释『为何补丁要经 general plugin 回调在每个子进程重打』与进程级幂等——支柱3 的工程约束。"},
+      {"symbol": "resolve_current_platform_cls_qualname / load_plugins_by_group", "why": "vLLM 侧发现+激活+选定的对照基座锚点，读者需理解昇腾是被 vLLM 反向钩进来的。"},
+      {"symbol": "current_platform（懒加载 __getattr__）", "why": "运行期一切分发的问询对象；懒加载解释了 register 为何只返回字符串。"},
+      {"symbol": "patch/__init__.py 两段式说明（platform 段 vs worker 段）", "why": "支柱3 的官方定义，须逐字引用总述并点出时机/作用域二分。"}
+    ]
+  },
+
+  "diagram_plan": [
+    {
+      "name": "fig01-oot-four-pillars-overview",
+      "intent": "全书心智模型图（本章核心）：把『四要素』摆成从安装到运行的一条链——[安装期声明 entry_points] →(vLLM 发现/激活/懒加载)→ [NPUPlatform 接管分发] →(get_*_cls 返回昇腾类名)→ [各扩展点登记的昇腾实现]，旁挂 [两段式 monkey-patch：platform 段 / worker 段] 作用于『没有钩子的地方』。",
+      "svg_spec": "横向泳道/流程图：左列 vllm-ascend 侧（setup.py entry_points、__init__.register/register_*、NPUPlatform、patch.platform/patch.worker），右列 vLLM 侧（plugins.load_plugins_by_group、platforms.resolve+current_platform、Platform 基类钩子）。用带标注箭头连『声明→发现→选定→实例化→分发/打补丁』。三支柱用三种底色分区，四要素做角标。",
+      "roadmap_highlight": "全书地图根节点（本章=鸟瞰）；三支柱分别指向 P1 接入/平台/配置、以及后续各 Part 的 zoom-in 入口。"
+    },
+    {
+      "name": "fig01-two-stage-patch-timeline",
+      "intent": "两段式 patch 的时机轴：platform 段（worker 启动前，pre_register_and_update / general-plugin 回调，作用域=engine-core/scheduler）vs worker 段（每个 worker __init__，作用域=worker 进程内模型/算子）。标出 adapt_patch(is_global_patch=True/False) 两个触发点与 import 副作用。",
+      "svg_spec": "时间轴从左到右：平台选定 → pre_register_and_update(打 platform 段) → engine-core 子进程 general plugins(_ensure_global_patch 补打) → 各 worker __init__(打 worker 段)。两段用不同色，标注各自改写的 vLLM 层与幂等锁。",
+      "roadmap_highlight": "支柱3 节点，链接到讲各具体 patch 的章节（distributed / multiproc_executor / triton / kv_cache…）。"
+    },
+    {
+      "name": "fig01-platform-hook-dispatch",
+      "intent": "分发范式聚焦图：vLLM 引擎多处 → 问 current_platform.get_*_cls() → NPUPlatform 覆写返回昇腾 qualname → import 实例化昇腾类。用 3-4 个钩子（attn/communicator/static_graph_wrapper/worker_cls）示意『一处覆写、整链切换』。",
+      "svg_spec": "中心节点 current_platform(=NPUPlatform)，多条入边=vLLM 各调用点，多条出边=昇腾类名字符串→昇腾实现类；对照虚线标注 vLLM 基类默认（''/NotImplemented）。",
+      "roadmap_highlight": "支柱2 节点，出边分别指向注意力(P5)/通信(P1-2)/编译(P6)/worker(P4) 各章。"
+    }
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recycle": [],
+    "raw": "bible.py due ch01 输出为空（== ch01 应埋伏笔 == / == ch01 应回收 == 均无条目）。作为全书开篇鸟瞰章，本章天然是全书伏笔的『总起点』：三支柱 + 全书地图本身即对后续 29 章的结构性铺垫（建议 Archivist 在本章落定后，把『三支柱各自在哪些章 zoom-in』登记为显式伏笔链，供各章回收）。"
+  }
+}
