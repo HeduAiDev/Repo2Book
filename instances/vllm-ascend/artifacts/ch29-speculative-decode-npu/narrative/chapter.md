@@ -6,7 +6,7 @@
 > 本章转到提议侧：谁来提出那串 draft token。
 > 一处工厂分发 + 一批薄壳继承，收束投机这条线。
 
-第 [28 章](../ch28-sampling-npu-adaptation/narrative/chapter.md)拆采样器时，反复出现一个名字：`AscendRejectionSampler`。它做的是「接受还是拒绝 draft token」（draft token＝proposer 在验证前投机提出的候选 token）——可那串 draft token 是谁提出来的？投机解码是一组「提议-验证」的搭档：一方先猜出 $k$ 个候选 token，另一方一趟前向并行验证。验证时除了核对这 $k$ 个候选，还会顺手多采 1 个 token（即第 k+1 位）——这个白送的叫 bonus token，所以 n 个 draft token 最多能被接受 n+1 个，后面 `rejection_count = n+1-len` 里那个加一就是它。上一章讲了验证侧，这一章补上提议侧。
+第 [28 章](../ch28-sampling-npu-adaptation/narrative/chapter.md)拆采样器时，反复出现一个名字：`AscendRejectionSampler`。它做的是「接受还是拒绝 draft token」（draft token＝proposer 在验证前投机提出的候选 token）——可那串 draft token 是谁提出来的？投机解码是一组「提议-验证」的搭档：一方先猜出 $k$ 个候选 token，另一方一趟前向并行验证。验证时除了核对这 $k$ 个候选，还会顺手多采 1 个 token（即第 k+1 位）——就是上一章那个白送的 bonus token，所以 n 个 draft token 最多能被接受 n+1 个，后面 `rejection_count = n+1-len` 里那个加一就是它。上一章讲了验证侧，这一章补上提议侧。
 
 提议侧的代码全在 `vllm_ascend/spec_decode/` 这个目录里，入口是 `vllm_ascend/spec_decode/__init__.py`。打开它你会发现一件有意思的事：投机解码有 8 种策略（ngram、eagle、medusa、dflash……），但昇腾几乎没有从零写过哪一种。它的做法是一个非常典型的工程范式——**一处工厂分发，一批薄壳继承，只有少数几处重量级重写**。能直接复用 vLLM 的就套一层薄壳，必须为 NPU 特化的才动刀。这一章就来看清这三层。
 

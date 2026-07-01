@@ -8,7 +8,7 @@
 
 走到这一章，你已经看过昇腾接管 vLLM 的十几种姿势。但如果把它们抽干水分，留下的骨架其实只有一句话：**vLLM 在每个该让外人插手的地方都留了一个扩展点，昇腾的工作就是往每个扩展点登记一个昇腾实现**。
 
-第 [2 章](../ch02-entry-points-and-npuplatform/narrative/chapter.md)登记的是平台（`NPUPlatform`）；第 [23 章](../ch23-customop-oot-replacement/narrative/chapter.md)登记的是算子（`CustomOp` 子类）；第 [27 章](../ch27-ascend-quantization-framework/narrative/chapter.md)登记的是量化方法；第 [29 章](../ch29-speculative-decode-npu/narrative/chapter.md)登记的是投机 proposer。每一处的范式都一样：vLLM 留一个口，昇腾递一个名字进去。
+第 [2 章](../ch02-entry-points-and-npuplatform/narrative/chapter.md)登记的是平台（`NPUPlatform`）；第 [23 章](../ch23-customop-oot-replacement/narrative/chapter.md)登记的是算子（`CustomOp` 子类）；第 [27 章](../ch27-ascend-quantization-framework/narrative/chapter.md)登记的是量化方法；第 [29 章](../ch29-speculative-decode-npu/narrative/chapter.md)工厂分发接入的是投机 proposer。每一处的范式都一样：vLLM 留一个口，昇腾递一个名字进去。
 
 这一章把**最后三个扩展点**一并收口——它们恰好覆盖了「注册」这件事的三种典型形态：
 
@@ -16,7 +16,7 @@
 - **LoRA 类替换**：vLLM 没留显式 API，昇腾直接改写它的模块级全局元组——一个「全局类替换」的小 trick。
 - **loader 注册**：一个 `@register_model_loader("netloader")` 装饰器，把自定义加载器挂进 vLLM 的 loader 注册表。
 
-三种形态，从「最规矩」到「最野」，正好把昇腾接入 vLLM 的手法谱系补全。看完这三处，你对「OOT 插件到底在干什么」会有一个完整的答案。OOT（out-of-tree，树外插件）指不改 vLLM 源码、纯靠外部包注册进去的扩展方式——这正是 vllm-ascend 的全部立身之本。
+三种形态，从「最规矩」到「最野」，正好把昇腾接入 vLLM 的手法谱系补全。看完这三处，你对「OOT 插件到底在干什么」会有一个完整的答案。树外（OOT）插件指不改 vLLM 源码、纯靠外部包注册进去的扩展方式——这正是 vllm-ascend 的全部立身之本。
 
 ## 30.1 模型注册：一行 register_model，把整个 DeepSeek-V4 递进去
 
@@ -581,7 +581,7 @@ netloader 解决的是冷启动慢的问题。这里的**冷启动**，指推理
 
 - **平台**（第 [2 章](../ch02-entry-points-and-npuplatform/narrative/chapter.md)）：注册 `NPUPlatform`，回答「这是什么硬件」。
 - **算子**（第 [23 章](../ch23-customop-oot-replacement/narrative/chapter.md)）：注册 `CustomOp` 子类，按名替换前向实现。
-- **量化**（第 [27 章](../ch27-ascend-quantization-framework/narrative/chapter.md)）：注册 `AscendQuantConfig`，接管权重量化。
+- **量化**（第 [27 章](../ch27-ascend-quantization-framework/narrative/chapter.md)）：注册 `AscendModelSlimConfig` 等三个量化 Config（ModelSlim / compressed-tensors / fp8 三入口），接管权重量化。
 - **投机 proposer**（第 [29 章](../ch29-speculative-decode-npu/narrative/chapter.md)）：工厂分发到 `Ascend*Proposer`。
 - **模型 / LoRA / loader**（本章）：注册整模型、追加 LoRA 类、挂自定义加载器。
 
