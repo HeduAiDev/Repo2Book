@@ -14,16 +14,16 @@ export const meta = {
 // ⚠️ 本环境实测 Workflow 的 args 注入不可靠（args 未到达脚本）→ 用脚本内 CFG 作可靠配置；
 // args 可用时优先 args。换章节时改 CFG（或修复 args 注入后直接传 args）。
 const CFG = {
-  chapter_id: 'ch29',
-  slug: 'ch29-speculative-decode-npu',
+  chapter_id: 'ch30',
+  slug: 'ch30-model-lora-netloader-registration',
   instance: 'vllm-ascend',
-  focus: '投机解码的 NPU 对位：proposer 工厂与薄壳继承——「工厂分发 + 薄壳继承 + 少数重量级覆写」范式。**(1) 工厂分发**——spec_decode/__init__.py 的 get_spec_decode_method(method, ...)（L33）一个 if-elif 把 method 字符串映射到 8 个 Ascend*Proposer（ngram→AscendNgramProposer、ngram_gpu→AscendNgramProposerNPU、suffix→AscendSuffixDecodingProposer、draft/eagle/medusa/dflash/extract_hidden_states 各一支）——一处工厂、按配置选 proposer。**(2) 多数是薄壳**——大量 proposer 是极薄子类：AscendNgramProposerNPU(NgramProposerGPU)（ngram_proposer_npu.py，仅 35 行，直接继承 vLLM 的 GPU proposer、「把 GPU 当 NPU 用」只覆写 propose 一处）；draft/eagle proposer 各 17/19 行——继承基类、几乎不改。**(3) 真正重量级**——llm_base_proposer.py（2043 行）的 AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer)（L111）重写 prepare_inputs（L1701）/ propose，里头用 ACLGraph（回指 ch25）+ 昇腾 Triton spec_decode kernel + MLA（回指 ch20）+ 昇腾并行组（回指 ch08）——**只挑骨架讲、不逐行**（重度减法）。**(4) 与采样的接口**——proposer 提出 draft token、由 ch28 的 AscendRejectionSampler 做接受/拒绝采样（投机解码的「提议-验证」闭环：本章管提议、ch28 管验证）。**核心立意**：投机解码是「一个 if-elif 工厂把 N 种 proposer 策略分发开，多数策略靠薄壳继承 vLLM（甚至把 GPU proposer 直接当 NPU 用），只有自研 LLM-base proposer 才重量级重写」——典型的「能复用就薄壳、必须特化才重写」的工程取舍。本章承接 ch28 采样（投机的验证侧）、收束投机这条线。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/v1/spec_decode（NgramProposerGPU / SpecDecodeBaseProposer 等基类——昇腾工厂分发到的 proposer 或直接继承、或重写）+ vllm/v1/sample/rejection_sampler.py（验证侧，回指 ch28）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；工厂 if-elif 分发 / 薄壳继承覆写点 / prepare_inputs 骨架是纯 Python，host 可跑读控制流；真实 ACLGraph/Triton spec_decode kernel/MLA 要 NPU/CANN、不真跑】',
-  highlight: 'ch29',
+  focus: '模型、LoRA 与网络加载的昇腾接入：注册、全局类替换与 netloader——**全书最后一个代码章**，收束「注册到 vLLM 扩展点」这条贯穿全书的主线（呼应 ch02 平台注册、ch23 CustomOp 注册、ch27 量化注册、ch29 proposer 工厂——都是「往 vLLM 的扩展点登记昇腾实现」）。三个变体：**(1) 模型注册**——models/__init__.py 的 register_model() 调 ModelRegistry.register_model("DeepseekV4ForCausalLM"→"vllm_ascend.models.deepseek_v4:AscendDeepseekV4ForCausalLM") 与 MTP；AscendDeepseekV4ForCausalLM（deepseek_v4.py，昇腾唯一特化的整模型）对位 vLLM deepseek_v2，讲「同一个 DeepSeek-V4 在 NPU 上改了哪些 layer/op」（挑改动点、不逐行 1521 行）。**(2) LoRA 两招**——PunicaWrapperNPU(PunicaWrapperBase)（punica_npu.py:L14）：① 按 device/rank **二选一绑 lora ops**（大 rank/310P 走 vLLM 的 torch_ops、否则走 torch.ops._C_ascend.{bgmv,sgmv}_* 薄壳，lora_ops.py）；② __init__ 里调 refresh_all_lora_classes()（utils.py）——**全局类替换 trick**：把 4 个 Ascend*LinearWithLoRA 追加进 vLLM 全局 _all_lora_classes 元组，让 vLLM 的 LoRA 层匹配能认出昇腾版。**(3) 网络加载 netloader**——@register_model_loader("netloader")（netloader.py:L39）注册 ModelNetLoaderElastic(BaseModelLoader)，load_model 从网络弹性拉权重加速冷启动；与 rfork（fork 冷启动）并列点名（rfork 不深讲）——同一「注册到 loader 扩展点」范式。**核心立意**：全书「把昇腾接进 vLLM」到此收官——vLLM 处处留扩展点（平台/算子/量化/proposer/模型/LoRA/loader），昇腾的工作就是「往每个扩展点登记一个昇腾实现」，多数靠注册+薄壳、少数靠全局类替换 trick 或整模型特化。本章把三种最后的扩展点（ModelRegistry / 全局类元组替换 / loader 注册）一并收口，呼应全书「OOT 插件 = 注册 + 薄壳继承 + 必要时特化」的主题。【姊妹篇：对照基座 vLLM v0.21.0 在 instances/vllm/source，pairs vllm/model_executor/models/deepseek_v2.py（DeepSeek-V2/V3 基座模型——昇腾 V4 的对位）+ vllm/lora/punica_wrapper（PunicaWrapperBase + punica_gpu/selector——昇腾 NPU 版的对位）+ vllm/model_executor/model_loader（BaseModelLoader/register_model_loader 扩展点）；正文写规范 vllm_ascend/… 与 vllm/… 路径，绝不带 instances/.../source/ 前缀；三处注册/分发/类替换/loader 都是纯 Python（register_model 登记 / PunicaWrapperNPU 的 device-rank 二选一 + _all_lora_classes 元组追加 / @register_model_loader 装饰），host 可跑读控制流；真实 LoRA bgmv/sgmv kernel、网络权重拉取、模型前向要 NPU/CANN/网络，不真跑】',
+  highlight: 'ch30',
   source_root: '/mnt/e/Laboratory/Repo2Book/instances/vllm-ascend/source',
   repo_root: '/mnt/e/Laboratory/Repo2Book',
-  skip_dossier: false,
+  skip_dossier: true,
   skip_impl: false,
-  paths: ['vllm_ascend/spec_decode/__init__.py', 'vllm_ascend/spec_decode/ngram_proposer_npu.py', 'vllm_ascend/spec_decode/llm_base_proposer.py'],
+  paths: ['vllm_ascend/models/__init__.py', 'vllm_ascend/lora/punica_npu.py', 'vllm_ascend/lora/utils.py', 'vllm_ascend/model_loader/netloader/netloader.py'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'

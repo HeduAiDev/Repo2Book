@@ -1,0 +1,232 @@
+{
+  "chapter": "ch30",
+  "title": "模型、LoRA 与网络加载的昇腾接入：注册、全局类替换与 netloader",
+  "thesis": "全书最后一个代码章，收束『往 vLLM 的扩展点登记昇腾实现』这条贯穿全书的主线（ch02 平台注册 / ch23 CustomOp / ch27 量化 / ch29 proposer 工厂）。本章三个最后的扩展点：(1) ModelRegistry.register_model 注册整模型；(2) LoRA 的『全局类元组替换 trick』+ device/rank 二选一绑 ops；(3) @register_model_loader 注册自定义 loader。范式一致：vLLM 处处留扩展点，昇腾的工作就是『往每个扩展点登记一个昇腾实现』，多数靠注册+薄壳、少数靠全局类替换或整模型特化。",
+
+  "code_spine": [
+    "vllm_ascend/__init__.py:L54-L76 (register_model_loader() L54-L61 注 netloader/rfork、register_model() L72-L76 注整模型——把注册入口接到插件加载流程)",
+    "vllm_ascend/models/__init__.py:L4-L7 (register_model → ModelRegistry.register_model 注 DeepseekV4 + MTP)",
+    "vllm/model_executor/models/registry.py:L939-L985 (ModelRegistry.register_model 扩展点：<module>:<class> 字符串懒加载)",
+    "vllm_ascend/models/deepseek_v4.py:L1212-L1240 (AscendDeepseekV4ForCausalLM —— 昇腾唯一整模型特化，对位 vLLM deepseek_v2)",
+    "vllm/platforms/...:get_punica_wrapper → vllm_ascend/platform.py:L795-L796 (返回 PunicaWrapperNPU 限定名)",
+    "vllm/lora/punica_wrapper/punica_selector.py:L13-L21 (get_punica_wrapper 按平台名实例化 wrapper)",
+    "vllm_ascend/lora/punica_npu.py:L21-L50 (PunicaWrapperNPU.__init__：调 refresh_all_lora_classes + 按 device/rank 二选一绑 6 个 lora ops)",
+    "vllm_ascend/lora/utils.py:L70-L82 (refresh_all_lora_classes：把 4 个 Ascend*LinearWithLoRA 追加进 vllm.lora.utils._all_lora_classes 元组)",
+    "vllm/lora/utils.py:L78-L124 (_all_lora_classes 元组 + from_layer 遍历 can_replace_layer 选 LoRA 层)",
+    "vllm_ascend/lora/lora_ops.py:L19-L122 (6 个薄壳函数 → torch.ops._C_ascend.{bgmv,sgmv}_*)",
+    "vllm_ascend/lora/punica_npu.py:L277-L363 (add_lora_linear / add_lora_logits：调绑定好的 shrink/expand 完成 LoRA GEMM)",
+    "vllm/model_executor/model_loader/__init__.py:L48-L125 (register_model_loader 扩展点 + _LOAD_FORMAT_TO_MODEL_LOADER 注册表 + get_model_loader 分发)",
+    "vllm_ascend/model_loader/netloader/netloader.py:L39-L40 (@register_model_loader('netloader') 注 ModelNetLoaderElastic)",
+    "vllm_ascend/model_loader/netloader/netloader.py:L133-L240 (load_model：弹性网络拉权重，失败回退 DefaultModelLoader)",
+    "vllm_ascend/model_loader/netloader/netloader.py:L324-L363 (revert_to_default：兜底用 vLLM DefaultModelLoader)"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "vllm_ascend/models/__init__.py",
+      "lines": "L1-L7",
+      "code": "from vllm import ModelRegistry\n\n\ndef register_model():\n    ModelRegistry.register_model(\"DeepseekV4ForCausalLM\", \"vllm_ascend.models.deepseek_v4:AscendDeepseekV4ForCausalLM\")\n\n    ModelRegistry.register_model(\"DeepSeekV4MTPModel\", \"vllm_ascend.models.deepseek_v4_mtp:DeepSeekV4MTP\")",
+      "elide": [],
+      "note": "整文件 7 行。两个 register_model 调用：把架构名（HF config 的 architectures 字段）映射到『<module>:<class>』懒加载字符串。这是把整模型登记进 vLLM ModelRegistry 的全部代码。"
+    },
+    {
+      "path": "vllm/model_executor/models/registry.py",
+      "lines": "L939-L975",
+      "code": "    def register_model(\n        self,\n        model_arch: str,\n        model_cls: type[nn.Module] | str,\n    ) -> None:\n        \"\"\"\n        Register an external model to be used in vLLM.\n\n        `model_cls` can be either:\n\n        - A [`torch.nn.Module`][] class directly referencing the model.\n        - A string in the format `<module>:<class>` which can be used to\n          lazily import the model. ...\n        \"\"\"\n        ...\n        if model_arch in self.models:\n            logger.warning(\n                \"Model architecture %s is already registered, and will be \"\n                \"overwritten by the new model class %s.\", ...)\n\n        if isinstance(model_cls, str):\n            split_str = model_cls.split(\":\")\n            if len(split_str) != 2:\n                msg = \"Expected a string in the format `<module>:<class>`\"\n                raise ValueError(msg)\n\n            model = _LazyRegisteredModel(*split_str)\n        elif isinstance(model_cls, type) and issubclass(model_cls, nn.Module):\n            model = _RegisteredModel.from_model_cls(model_cls)",
+      "elide": ["docstring 的 CUDA fork 解释", "TypeError 校验分支", "末尾 self.models[model_arch] = model 落表"],
+      "note": "vLLM 侧扩展点。字符串 `<module>:<class>` 走 _LazyRegisteredModel 懒加载——延迟到真正用到才 import，避免在 fork 子进程里提前初始化 CUDA/NPU。已注册架构会被覆盖（这正是昇腾顶替同名模型的机制）。"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v4.py",
+      "lines": "L1212-L1216",
+      "code": "class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts, SupportsLoRA, SupportsEagle):\n    packed_modules_mapping = {\n        \"gate_up_proj\": [\"gate_proj\", \"up_proj\"],\n    }\n    model_cls = DeepseekV4Model",
+      "elide": ["__init__/forward/load_weights 等 1521 行模型实现细节（本章只点改动面，不逐行）"],
+      "note": "昇腾唯一整模型特化（1521 行），对位 vLLM 的 vllm/model_executor/models/deepseek_v2.py。改动面（imports 与类层次可见）：自定义 attention 用 vllm_ascend.ops.dsa.AscendDeepseekSparseAttention、rope 用 ComplexExpRotaryEmbedding、若干 *Cache 子类（AscendCompressorStateCache/AscendDeepseekV4IndexerCache/AscendDeepseekV4SWACache 继承 vLLM 同名基类）、用 vllm_ascend.ops.triton.mul_add 等昇腾算子。骨架（DeepseekV4MoE/Attention/Model/ForCausalLM）与 vLLM 同构，只把 layer/op 换成 NPU 版。本章只讲『同一个 DeepSeek-V4 在 NPU 上改了哪几类东西』，不深入前向。"
+    },
+    {
+      "path": "vllm_ascend/platform.py",
+      "lines": "L795-L796",
+      "code": "    def get_punica_wrapper(cls) -> str:\n        return \"vllm_ascend.lora.punica_npu.PunicaWrapperNPU\"",
+      "elide": [],
+      "note": "平台扩展点（ch02 平台主线）。vLLM 的 get_punica_wrapper() 由平台返回限定名字符串；CUDA 平台返回 vllm.lora.punica_wrapper.punica_gpu.PunicaWrapperGPU。这是 LoRA wrapper 被选中的入口。"
+    },
+    {
+      "path": "vllm_ascend/lora/punica_npu.py",
+      "lines": "L14-L50",
+      "code": "class PunicaWrapperNPU(PunicaWrapperBase):\n    \"\"\"\n    PunicaWrapperNPU is designed to manage and provide metadata for the punica\n    kernel. ...\n    \"\"\"\n\n    def __init__(self, max_num_batched_tokens: int, max_batches: int, device: torch.device | str, **kwargs):\n        PunicaWrapperBase.__init__(self, max_num_batched_tokens, max_batches, device)\n        refresh_all_lora_classes()\n        self.lora_config = kwargs.get(\"lora_config\")\n        if get_ascend_device_type() == AscendDeviceType._310P or (\n            self.lora_config is not None and self.lora_config.max_lora_rank >= 128\n        ):\n            from vllm.lora.ops.torch_ops import (\n                bgmv_expand,\n                bgmv_expand_slice,\n                bgmv_shrink,\n                sgmv_expand,\n                sgmv_expand_slice,\n                sgmv_shrink,\n            )\n        else:\n            from vllm_ascend.lora.lora_ops import (\n                bgmv_expand,\n                bgmv_expand_slice,\n                bgmv_shrink,\n                sgmv_expand,\n                sgmv_expand_slice,\n                sgmv_shrink,\n            )\n        self.bgmv_expand = bgmv_expand\n        self.bgmv_expand_slice = bgmv_expand_slice\n        self.bgmv_shrink = bgmv_shrink\n        self.sgmv_expand = sgmv_expand\n        self.sgmv_expand_slice = sgmv_expand_slice\n        self.sgmv_shrink = sgmv_shrink",
+      "elide": [],
+      "note": "LoRA 接入的两招都在 __init__：① 第一行调 refresh_all_lora_classes() 做全局类替换；② device/rank 二选一绑 6 个 lora ops——310P 芯片或 max_lora_rank≥128 时退回 vLLM 的 torch_ops（PyTorch-native，更稳/兼容大 rank），否则用昇腾自定义算子薄壳 lora_ops。绑定后存为实例属性，下面 _shrink/_expand 系列直接调。"
+    },
+    {
+      "path": "vllm_ascend/lora/utils.py",
+      "lines": "L18-L28",
+      "code": "class AscendQKVParallelLinearWithLoRA(QKVParallelLinearWithLoRA):\n    @classmethod\n    @_not_fully_sharded_can_replace\n    def can_replace_layer(\n        cls,\n        source_layer: nn.Module,\n        lora_config: LoRAConfig,\n        packed_modules_list: list,\n        model_config: PretrainedConfig | None,\n    ) -> bool:\n        return type(source_layer) is AscendQKVParallelLinear and len(packed_modules_list) == 1",
+      "elide": ["另外 3 个类 AscendMergedQKVParallelLinearWithLoRA / AscendMergedQKVParallelLinearWithShardedLoRA / AscendQKVParallelLinearWithShardedLoRA 结构同构，只是基类不同 + can_replace_layer 判 packed_modules_list 长度(1 或 3) 和 sharded 装饰器不同"],
+      "note": "4 个 Ascend*LinearWithLoRA 都是薄壳：继承 vLLM 对应 LoRA 层，只重写 can_replace_layer——把匹配条件从 vLLM 原版的 QKVParallelLinear 改成昇腾的 AscendQKVParallelLinear（type(source_layer) is AscendQKVParallelLinear）。这样 vLLM 的 LoRA 层匹配才能认出昇腾改过的 QKV 线性层。"
+    },
+    {
+      "path": "vllm_ascend/lora/utils.py",
+      "lines": "L70-L82",
+      "code": "def refresh_all_lora_classes():\n    ascend_classes = (\n        AscendQKVParallelLinearWithLoRA,\n        AscendMergedQKVParallelLinearWithLoRA,\n        AscendMergedQKVParallelLinearWithShardedLoRA,\n        AscendQKVParallelLinearWithShardedLoRA,\n    )\n    # vLLM #35077 changed _all_lora_classes from set to ordered tuple.\n    # Append the Ascend classes in a deterministic order.\n    vllm.lora.utils._all_lora_classes = (\n        *vllm.lora.utils._all_lora_classes,\n        *ascend_classes,\n    )",
+      "elide": [],
+      "note": "全局类替换 trick 的核心：直接改写 vLLM 模块级全局变量 vllm.lora.utils._all_lora_classes（一个元组），把 4 个昇腾类追加进去。vLLM 的 from_layer() 遍历这个元组、逐个 can_replace_layer 选 LoRA 层——追加后昇腾版就进了候选池。注释点出 vLLM #35077 把它从 set 改成有序 tuple，故须用确定顺序追加。"
+    },
+    {
+      "path": "vllm/lora/utils.py",
+      "lines": "L78-L124",
+      "code": "_all_lora_classes: tuple[type[BaseLayerWithLoRA], ...] = (\n    VocabParallelEmbeddingWithLoRA,\n    ColumnParallelLinearWithLoRA,\n    ...\n    FusedMoEWithLoRA,\n    FusedMoE3DWithLoRA,\n)\n\n\ndef from_layer(\n    layer: nn.Module,\n    max_loras: int,\n    lora_config: LoRAConfig,\n    packed_modules_list: list,\n    model_config: PretrainedConfig | None = None,\n) -> nn.Module:\n    for lora_cls in _all_lora_classes:\n        if lora_cls.can_replace_layer(\n            source_layer=layer,\n            lora_config=lora_config,\n            packed_modules_list=packed_modules_list,\n            model_config=model_config,\n        ):\n            instance_layer = lora_cls(layer)\n            instance_layer.create_lora_weights(max_loras, lora_config, model_config)\n            return instance_layer\n    return layer",
+      "elide": ["_all_lora_classes 中间 12 个 vLLM 内置类"],
+      "note": "vLLM 侧被替换的目标。from_layer 顺序遍历 _all_lora_classes、第一个 can_replace_layer 为 True 的类胜出。所以 refresh_all_lora_classes() 把昇腾类追加到尾部——昇腾类用 `type(source_layer) is AscendQKVParallelLinear` 严格匹配，只在源层确实是昇腾版时命中，不影响其它层。"
+    },
+    {
+      "path": "vllm_ascend/lora/lora_ops.py",
+      "lines": "L19-L49",
+      "code": "def bgmv_shrink(\n    inputs: torch.Tensor,\n    lora_a_weights: torch.Tensor,\n    output_tensor: torch.Tensor,\n    lora_indices_tensor: torch.Tensor,\n    scaling: float = 1.0,\n):\n    return torch.ops._C_ascend.bgmv_shrink(\n        inputs,\n        lora_a_weights,\n        lora_indices_tensor,\n        output_tensor,\n        scaling,\n    )\n\n\ndef bgmv_expand(\n    inputs: torch.Tensor,\n    lora_b_weights: torch.Tensor,\n    output_tensor: torch.Tensor,\n    lora_indices_tensor: torch.Tensor,\n    add_inputs: bool = True,\n):\n    return torch.ops._C_ascend.bgmv_expand(\n        inputs,\n        lora_b_weights,\n        lora_indices_tensor,\n        output_tensor,\n        0,\n        output_tensor.size(1),\n    )",
+      "elide": ["bgmv_expand_slice / sgmv_shrink / sgmv_expand / sgmv_expand_slice 4 个同构薄壳（只是参数 reorder + 取 slice_offset/slice_size 后转调 torch.ops._C_ascend.{bgmv_expand,sgmv_shrink,sgmv_expand}）"],
+      "note": "昇腾 LoRA 算子薄壳：每个 Python 函数只做参数顺序适配，转调 C++ 注册的 torch.ops._C_ascend.* kernel。bgmv=batched gather matvec（decode 单 token/请求），sgmv=segmented gather matvec（prefill 变长 segment）。真 kernel 要 NPU/CANN，host 不真跑——本章只读控制流与签名。注意 bgmv_expand 丢弃了 add_inputs 形参、固定传 offset=0/size=output_tensor.size(1)，是与 C++ 签名对齐。"
+    },
+    {
+      "path": "vllm_ascend/lora/punica_npu.py",
+      "lines": "L277-L322",
+      "code": "    def add_lora_linear(\n        self,\n        y: torch.Tensor,\n        x: torch.Tensor,\n        lora_a_stacked: tuple[torch.Tensor, ...],\n        lora_b_stacked: tuple[torch.Tensor, ...],\n        scale: float,\n        output_slices: tuple[int, ...],\n        *,\n        buffer: tuple[torch.Tensor, ...] | None = None,\n        **kwargs,\n    ) -> None:\n        ...\n        assert len(lora_a_stacked) == len(lora_b_stacked) == len(output_slices)\n\n        if buffer is None:\n            r = lora_b_stacked[0].size(-1)\n            buffer = tuple(\n                torch.zeros((x.size(0), r), dtype=torch.float32, device=x.device) for _ in range(len(output_slices))\n            )\n        self.add_shrink(buffer, x, lora_a_stacked, scale, **kwargs)\n        self.add_expand(y, buffer, lora_b_stacked, output_slices, add_inputs=True, **kwargs)",
+      "elide": ["docstring/Semantics 块", "add_shrink/add_expand/_apply_shrink/_apply_expand/_shrink_prefill/_shrink_decode 等私有方法体（都是按 is_prefill 选 sgmv(prefill)/bgmv(decode) 转调绑定好的 op）"],
+      "note": "PunicaWrapperBase 要求实现的核心抽象方法之一。LoRA 线性层前向 = 先 shrink（y += x@A，降到 rank r 的 buffer）再 expand（y += buffer@B，升回输出维）。__init__ 绑定的 sgmv/bgmv 在这里被 add_shrink/add_expand 间接调用。add_lora_logits（L324）同理走 bgmv_shrink+bgmv_expand。读者只需懂『wrapper 把 shrink/expand 分发到平台特定 kernel』，不必逐方法。"
+    },
+    {
+      "path": "vllm/model_executor/model_loader/__init__.py",
+      "lines": "L67-L125",
+      "code": "def register_model_loader(load_format: str):\n    \"\"\"Register a customized vllm model loader. ...\"\"\"\n\n    def _wrapper(model_loader_cls):\n        if load_format in _LOAD_FORMAT_TO_MODEL_LOADER:\n            logger.warning(\"Load format `%s` is already registered, ...\", ...)\n        if not issubclass(model_loader_cls, BaseModelLoader):\n            raise ValueError(\n                \"The model loader must be a subclass of `BaseModelLoader`.\"\n            )\n        _LOAD_FORMAT_TO_MODEL_LOADER[load_format] = model_loader_cls\n        logger.info(\"Registered model loader `%s` with load format `%s`\", ...)\n        return model_loader_cls\n\n    return _wrapper\n\n\ndef get_model_loader(load_config: LoadConfig) -> BaseModelLoader:\n    \"\"\"Get a model loader based on the load format.\"\"\"\n    load_format = load_config.load_format\n    if load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:\n        raise ValueError(f\"Load format `{load_format}` is not supported\")\n    return _LOAD_FORMAT_TO_MODEL_LOADER[load_format](load_config)",
+      "elide": ["docstring 的 >>> 示例", "_LOAD_FORMAT_TO_MODEL_LOADER 内置 dict（auto/hf/gguf/tensorizer/... → 各内置 loader 类）"],
+      "note": "vLLM 侧 loader 扩展点：装饰器把『load_format 字符串 → loader 类』写进全局 dict _LOAD_FORMAT_TO_MODEL_LOADER，校验须 issubclass(BaseModelLoader)。get_model_loader 按 --load-format 取类实例化。昇腾的 netloader/rfork 就是往这个 dict 各注一个键。"
+    },
+    {
+      "path": "vllm_ascend/model_loader/netloader/netloader.py",
+      "lines": "L39-L59",
+      "code": "@register_model_loader(\"netloader\")\nclass ModelNetLoaderElastic(BaseModelLoader):\n    \"\"\"\n    A model loader that uses elastic loading for loading weights.\n    \"\"\"\n\n    source: list[dict] | None\n    model_path: str | None\n    listen_port: int | None\n    int8_cache: str\n    int8_cache_name: list[str] | None\n    output_prefix: str | None\n\n    def __init__(self, load_config: LoadConfig):\n        ...\n        super().__init__(load_config)",
+      "elide": ["__init__ 里读 CONFIG_FILE / model_loader_extra_config 的一大段 (SOURCE/MODEL/LISTEN_PORT/INT8_CACHE/...) 校验+类型转换配置解析"],
+      "note": "第三个扩展点。@register_model_loader('netloader') 把 ModelNetLoaderElastic 注册成 load_format='netloader'，继承 BaseModelLoader（与 vLLM DefaultModelLoader 平级）。rfork 同范式（@register_model_loader('rfork')，本章并列点名不深讲）。两者都由 vllm_ascend/__init__.py 的 register_model_loader() 统一触发注册。"
+    },
+    {
+      "path": "vllm_ascend/model_loader/netloader/netloader.py",
+      "lines": "L163-L219",
+      "code": "        if (\n            self.source is None\n            or not isinstance(self.source, list)\n            or device_id\n            not in [\n                one_device[\"device_id\"]\n                for one_device in self.source\n                if isinstance(one_device, dict) and \"device_id\" in one_device\n            ]\n        ):\n            logger.warning(\"Did not get valid source info, use DefaultModelLoader\")\n            model, need_process_weights_after_loading = self.revert_to_default(\n                model_config, vllm_config, device_config, prefix\n            )\n\n        else:\n            target_device = torch.device(device_config.device)\n            ...\n            with set_default_torch_dtype(model_config.dtype):\n                with target_device:\n                    model = initialize_model(vllm_config=vllm_config, model_config=model_config, prefix=prefix)\n                ...\n                model = elastic_load(\n                    model=model,\n                    device_id=device_id,\n                    model_path=model_config.model,\n                    sources=sources,\n                    tp=parallel_config.tensor_parallel_size,\n                    pp=parallel_config.pipeline_parallel_size,\n                    group_name=\"netloader_draft\" if is_draft else \"netloader\",\n                )\n                ...\n                need_process_weights_after_loading = True",
+      "elide": ["quant_config/model_config 深拷贝备份", "draft 模型把 source 端口 +DRAFT_PORT_OFFSET 的重写", "elastic_load 返回 None（拉取失败）时 gc/清 NPU cache 再 revert_to_default 的兜底块"],
+      "note": "load_model 主干：先 initialize_model 建空骨架，再 elastic_load 从网络其它已加载实例弹性拉权重（加速冷启动）。source 无效或本 rank 不在 source 列表 → 直接 revert_to_default。拉取失败也回退。elastic_load 真正的网络传输（interaction/elastic.py、executor/）要 NPU+网络，本章只读这层控制流与回退策略。"
+    },
+    {
+      "path": "vllm_ascend/model_loader/netloader/netloader.py",
+      "lines": "L324-L363",
+      "code": "    def revert_to_default(self, model_config, vllm_config, device_config, prefix: str = \"\") -> tuple[nn.Module, bool]:\n        ...\n        load_config = deepcopy(self.load_config)\n        load_config.model_loader_extra_config = {}\n        load_config.load_format = \"auto\"\n        default_model_loader = DefaultModelLoader(load_config)\n\n        if model_config.quantization is None:\n            model = default_model_loader.load_model(vllm_config=vllm_config, model_config=model_config, prefix=prefix)\n            need_process_weights_after_loading = False\n        else:\n            logger.warning(\"Quantization is set, netloader use DefaultModelLoader with process_weights_after_loading \")\n            need_process_weights_after_loading = True\n            target_device = torch.device(device_config.device)\n            with set_default_torch_dtype(model_config.dtype):\n                with target_device:\n                    model = initialize_model(vllm_config=vllm_config, model_config=model_config, prefix=prefix)\n                default_model_loader.load_weights(model, model_config)\n            model = model.eval()\n\n        return model, need_process_weights_after_loading",
+      "elide": ["docstring"],
+      "note": "兜底：复制 load_config、强制 load_format='auto'，委托 vLLM 内置 DefaultModelLoader 走常规加载。体现『扩展点 loader 不接管全部职责——失败优雅回退到 vLLM 默认实现』，是 OOT 插件稳健性的范例。"
+    }
+  ],
+
+  "key_classes": [
+    {"name": "register_model（函数）", "file": "vllm_ascend/models/__init__.py:L4", "responsibility": "调 ModelRegistry.register_model 把 DeepseekV4ForCausalLM / DeepSeekV4MTPModel 两个架构名映射到昇腾实现的懒加载字符串；由 vllm_ascend/__init__.py:L72 触发"},
+    {"name": "AscendDeepseekV4ForCausalLM", "file": "vllm_ascend/models/deepseek_v4.py:L1212", "responsibility": "昇腾唯一整模型特化（1521 行），对位 vLLM deepseek_v2；骨架同构，把 attention/rope/cache/op 换成 NPU 版（AscendDeepseekSparseAttention、ComplexExpRotaryEmbedding、Ascend*Cache、triton kernels）"},
+    {"name": "PunicaWrapperNPU", "file": "vllm_ascend/lora/punica_npu.py:L14", "responsibility": "继承 vLLM PunicaWrapperBase 的 LoRA wrapper；__init__ 调 refresh_all_lora_classes + 按 device/rank 二选一绑 6 个 sgmv/bgmv op；实现 add_lora_linear/add_lora_logits/add_lora_embedding 等抽象方法（shrink→expand）"},
+    {"name": "refresh_all_lora_classes（函数）", "file": "vllm_ascend/lora/utils.py:L70", "responsibility": "全局类替换 trick：把 4 个 Ascend*LinearWithLoRA 追加进 vllm.lora.utils._all_lora_classes 元组，使 vLLM from_layer 的 LoRA 层匹配能认出昇腾 QKV 线性层"},
+    {"name": "AscendQKVParallelLinearWithLoRA 等 4 类", "file": "vllm_ascend/lora/utils.py:L18-L67", "responsibility": "继承 vLLM 同名 LoRA 层薄壳，只重写 can_replace_layer 把匹配目标从 QKVParallelLinear 改成 AscendQKVParallelLinear"},
+    {"name": "lora_ops 6 函数", "file": "vllm_ascend/lora/lora_ops.py:L19-L122", "responsibility": "bgmv/sgmv 的 shrink/expand/expand_slice 薄壳，转调 torch.ops._C_ascend.* 的 NPU C++ kernel"},
+    {"name": "ModelNetLoaderElastic", "file": "vllm_ascend/model_loader/netloader/netloader.py:L40", "responsibility": "@register_model_loader('netloader') 注册的自定义 loader，继承 BaseModelLoader；load_model 弹性网络拉权重加速冷启动，失败 revert_to_default 回退 vLLM DefaultModelLoader"},
+    {"name": "ModelRegistry.register_model（vLLM 扩展点）", "file": "vllm/model_executor/models/registry.py:L939", "responsibility": "vLLM 侧：把架构名映射到模型类或 '<module>:<class>' 懒加载字符串，已注册同名会覆盖"},
+    {"name": "register_model_loader / get_model_loader（vLLM 扩展点）", "file": "vllm/model_executor/model_loader/__init__.py:L67,L120", "responsibility": "vLLM 侧：装饰器把 load_format→loader 类写进 _LOAD_FORMAT_TO_MODEL_LOADER；get_model_loader 按 --load-format 分发"},
+    {"name": "_all_lora_classes / from_layer（vLLM 扩展点）", "file": "vllm/lora/utils.py:L78,L106", "responsibility": "vLLM 侧：候选 LoRA 层元组 + 顺序遍历 can_replace_layer 选层；被昇腾全局追加"}
+  ],
+
+  "data_flow": [
+    "插件加载：vLLM 经 entry_points 调 vllm_ascend.register_model() → vllm_ascend/models/__init__.py register_model() → ModelRegistry.register_model('DeepseekV4ForCausalLM', 'vllm_ascend.models.deepseek_v4:AscendDeepseekV4ForCausalLM')（+ MTP）",
+    "模型实例化：vLLM 据 HF config.architectures 在 ModelRegistry 查到昇腾懒加载字符串 → import AscendDeepseekV4ForCausalLM 建模型",
+    "插件加载：vllm_ascend.register_model_loader() → netloader/__init__.register_netloader() import netloader.py → @register_model_loader('netloader') 把 ModelNetLoaderElastic 写进 _LOAD_FORMAT_TO_MODEL_LOADER（rfork 同）",
+    "权重加载：vLLM get_model_loader(load_config) 按 --load-format=netloader 取 ModelNetLoaderElastic → load_model → elastic_load 网络拉权重（失败 → revert_to_default → DefaultModelLoader）",
+    "LoRA wrapper 选择：vLLM get_punica_wrapper() → platform.get_punica_wrapper() 返回 'vllm_ascend.lora.punica_npu.PunicaWrapperNPU' → punica_selector 实例化",
+    "PunicaWrapperNPU.__init__：① refresh_all_lora_classes() 把 4 个 Ascend*LinearWithLoRA 追加进 vllm.lora.utils._all_lora_classes；② 按 get_ascend_device_type()/max_lora_rank 二选一 import torch_ops（310P 或 rank≥128）或 lora_ops（默认昇腾 kernel），绑成 self.{bgmv,sgmv}_*",
+    "LoRA 层匹配：vLLM from_layer 遍历 _all_lora_classes，遇昇腾 AscendQKVParallelLinear 时昇腾类 can_replace_layer 命中 → 实例化 Ascend*LinearWithLoRA",
+    "LoRA 前向：层调 wrapper.add_lora_linear → add_shrink(sgmv/bgmv_shrink) → add_expand(sgmv/bgmv_expand) → torch.ops._C_ascend.* NPU kernel"
+  ],
+
+  "design_decisions": [
+    {"decision": "模型注册用 '<module>:<class>' 懒加载字符串而非直接传类", "why": "延迟 import 到真正用到，避免在 fork 子进程提前初始化 CUDA/NPU（vLLM registry docstring 明确此动机）", "evidence": "vllm_ascend/models/__init__.py:L5 + vllm/model_executor/models/registry.py:L947-L953"},
+    {"decision": "LoRA 类替换用『改写 vLLM 全局元组 _all_lora_classes』而非 fork/monkeypatch 整个 from_layer", "why": "vLLM from_layer 顺序遍历该元组选层，追加到尾部即可让昇腾类进候选池，且昇腾类用 `type is AscendQKVParallelLinear` 严格匹配只命中昇腾层，零侵入、不破坏原有匹配", "evidence": "vllm_ascend/lora/utils.py:L79-L82 + vllm/lora/utils.py:L113-L124"},
+    {"decision": "lora ops 按 device/rank 二选一：310P 或 max_lora_rank≥128 退回 vLLM torch_ops", "why": "昇腾自定义 bgmv/sgmv kernel 对大 rank 或老芯片(310P)支持不全/不优，退回 PyTorch-native 实现保证正确性", "evidence": "vllm_ascend/lora/punica_npu.py:L25-L44"},
+    {"decision": "refresh_all_lora_classes 用确定顺序追加（元组 splat）", "why": "vLLM #35077 把 _all_lora_classes 从 set 改成有序 tuple，匹配顺序敏感，须确定顺序避免不稳定行为", "evidence": "vllm_ascend/lora/utils.py:L77-L82（注释）"},
+    {"decision": "netloader 失败优雅回退 DefaultModelLoader", "why": "弹性网络加载是冷启动优化、非必需路径；source 无效/本 rank 不在列表/网络拉取失败都回退 vLLM 默认加载，保证可用性", "evidence": "vllm_ascend/model_loader/netloader/netloader.py:L173-L176,L221-L239,L324-L363"},
+    {"decision": "整模型特化只对 DeepSeek-V4（+MTP），其余模型复用 vLLM 注册表", "why": "DeepSeek-V4 用了 NPU 特化的稀疏注意力/rope/cache，需整模型改 layer/op；通用模型靠平台层(ch02)+CustomOp(ch23)+量化(ch27) 等下层扩展点即可在 NPU 跑，无需重写整模型", "evidence": "vllm_ascend/models/ 目录只有 deepseek_v4.py / deepseek_v4_mtp.py（cartography C7 已确认）"}
+  ],
+
+  "theory": [
+    "shrink/expand 双 GEMM 的代价：LoRA 把权重增量 ΔW=BA 分解为低秩，前向 y += (x·A)·B·scale。shrink 把 x∈R^{T×d} 降到 buffer∈R^{T×r}（r 远小于 d），expand 升回 R^{T×out}。两步 FLOPs ≈ 2·T·d·r + 2·T·r·out，相比满秩 ΔW 的 2·T·d·out 省 ~ (d·out)/((d+out)·r) 倍——这正是 LoRA 低秩的算力意义，也解释为何 max_lora_rank≥128（r 偏大、自定义 kernel 收益降）时退回通用实现。",
+    "bgmv vs sgmv：decode 阶段每请求 1 token、多请求各带不同 LoRA → batched gather matvec（bgmv），按 token_lora_indices 选每行对应的 LoRA 权重；prefill 阶段变长 prompt → segmented gather matvec（sgmv），按 seq_len/segment 边界分段。is_prefill 在 wrapper 里二选一，对应 NPU 两套 kernel。",
+    "弹性网络加载的冷启动收益：传统从磁盘/HF 读 N 个分片权重串行 IO；netloader 从已加载的对等实例经网络并行拉取，把磁盘 IO 换成网络带宽 + 跳过重复反序列化，多副本部署时显著降冷启动延迟（量化值依网络/模型大小，本章定性）。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "punica_npu.py 各 add_*/. _apply_*/_shrink_*/_expand_* 方法的 docstring 与 Semantics 伪代码块", "why_safe": "纯注释，删后控制流不变；正文用 data_flow/theory 讲清 shrink→expand 即可"},
+      {"what": "netloader.py __init__ 里 CONFIG_FILE/extra_config 的 SOURCE/MODEL/LISTEN_PORT/INT8_CACHE/INT8_CACHE_NAME/OUTPUT_PREFIX 逐项校验+类型转换循环（L60-L126）", "why_safe": "配置解析样板，与『注册到 loader 扩展点 + 弹性加载/回退』主题无关；保留 @register_model_loader 装饰、类签名、load_model、revert_to_default 即可讲清范式"},
+      {"what": "netloader.py load_model 里 elastic server 启动块（L241-L313：driver_ip 获取、端口分配、写地址文件、ElasticServer.start 的 try/except）", "why_safe": "把本实例变成下一个实例的 source 的副作用，偏离『本实例如何弹性拉权重』主干；保留 load_model 的 initialize_model→elastic_load→回退 主干"},
+      {"what": "netloader.py draft 模型把 sources 端口 +DRAFT_PORT_OFFSET 重写块（L192-L206）与 quant_config/model_config 深拷贝备份", "why_safe": "投机解码 draft 与量化回退的边角分支，主干（target 模型弹性加载+失败回退）已足以讲清范式"},
+      {"what": "deepseek_v4.py 的模型实现主体（除 L1212-L1216 类签名与 imports 改动面外的 ~1500 行 layer/forward/load_weights）", "why_safe": "本章定位是『注册+改动面概览』非逐行讲模型；只需类签名、imports 暴露的 NPU 特化点（AscendDeepseekSparseAttention/ComplexExpRotaryEmbedding/Ascend*Cache/triton）说明『改了哪几类东西』。深读整模型超本章范围（cartography 标为『中』，挑骨架）"},
+      {"what": "lora_ops.py 中 bgmv_expand_slice/sgmv_shrink/sgmv_expand/sgmv_expand_slice 4 个同构薄壳的完整函数体", "why_safe": "与 bgmv_shrink/bgmv_expand 同构（参数 reorder 后转调 torch.ops._C_ascend.*），留 2 个代表 + 列出其余签名即可，不必逐函数贴全"}
+    ],
+    "must_keep": [
+      {"symbol": "register_model", "why": "模型注册入口函数，本章变体(1)主角"},
+      {"symbol": "ModelRegistry", "why": "vLLM 模型注册表扩展点，register_model 调它的 register_model"},
+      {"symbol": "AscendDeepseekV4ForCausalLM", "why": "被注册的昇腾整模型类，对位 vLLM deepseek_v2"},
+      {"symbol": "DeepseekV4ForCausalLM", "why": "被注册的架构名字符串键，读者需看到 HF 架构名→昇腾实现的映射"},
+      {"symbol": "PunicaWrapperNPU", "why": "LoRA wrapper 主类，本章变体(2)主角"},
+      {"symbol": "PunicaWrapperBase", "why": "vLLM LoRA wrapper 基类，昇腾继承它（薄壳继承范式）"},
+      {"symbol": "refresh_all_lora_classes", "why": "全局类替换 trick 的核心函数"},
+      {"symbol": "_all_lora_classes", "why": "被改写的 vLLM 全局元组，trick 的作用对象"},
+      {"symbol": "AscendQKVParallelLinearWithLoRA", "why": "被追加的昇腾 LoRA 层之一，含 can_replace_layer 改匹配目标"},
+      {"symbol": "can_replace_layer", "why": "LoRA 层匹配判据，昇腾重写它认出 AscendQKVParallelLinear"},
+      {"symbol": "AscendQKVParallelLinear", "why": "昇腾 QKV 线性层，can_replace_layer 的匹配目标，连接 ch 线性层主线"},
+      {"symbol": "get_ascend_device_type", "why": "device/rank 二选一的判据来源"},
+      {"symbol": "max_lora_rank", "why": "≥128 时退回 torch_ops 的阈值，设计决策可检测点"},
+      {"symbol": "bgmv_shrink", "why": "昇腾 LoRA 算子薄壳代表（decode shrink），转调 torch.ops._C_ascend"},
+      {"symbol": "bgmv_expand", "why": "昇腾 LoRA 算子薄壳代表（decode expand），与 bgmv_shrink 同为内嵌保留的 2 个代表"},
+      {"symbol": "add_lora_linear", "why": "wrapper 核心抽象方法，shrink→expand 主流程"},
+      {"symbol": "register_model_loader", "why": "loader 扩展点装饰器，本章变体(3)主角"},
+      {"symbol": "ModelNetLoaderElastic", "why": "被注册的自定义 loader 类"},
+      {"symbol": "BaseModelLoader", "why": "vLLM loader 基类，netloader 继承它"},
+      {"symbol": "load_model", "why": "loader 核心方法，弹性拉权重+回退"},
+      {"symbol": "elastic_load", "why": "网络弹性加载调用点，区别于默认加载的本质"},
+      {"symbol": "revert_to_default", "why": "失败优雅回退 DefaultModelLoader，稳健性范例"},
+      {"symbol": "DefaultModelLoader", "why": "回退目标，vLLM 内置默认加载器"}
+    ]
+  },
+
+  "diagram_plan": [
+    {
+      "name": "ch30-extension-points-overview",
+      "type": "架构总览图（全书收束）",
+      "spec": "中心一列 vLLM 留出的扩展点（Platform / CustomOp / Quantization registry / Proposer factory / ModelRegistry / _all_lora_classes / model-loader registry），左侧标对应章（ch02/ch23/ch27/ch29/ch30），右侧昇腾实现挂进去；本章三个用高亮色（ModelRegistry←AscendDeepseekV4ForCausalLM、_all_lora_classes←4 个 Ascend*LinearWithLoRA、loader registry←ModelNetLoaderElastic）。立意：『往每个扩展点登记一个昇腾实现』。建议用 svg-diagram。",
+      "roadmap_highlight": "ch30 节点 + 与 ch02/ch23/ch27/ch29 的回指连线"
+    },
+    {
+      "name": "ch30-lora-class-replacement",
+      "type": "全局类替换 trick 时序/数据流图",
+      "spec": "上：vLLM 原 _all_lora_classes 元组(16 项) → refresh_all_lora_classes() splat 追加 4 个 Ascend 类 → 新元组(20 项)。下：from_layer 遍历元组，遇 AscendQKVParallelLinear 源层时昇腾类 can_replace_layer=True 命中。突出『改全局变量』而非 fork。",
+      "roadmap_highlight": "punica_npu.__init__ → utils.refresh_all_lora_classes"
+    },
+    {
+      "name": "ch30-lora-ops-dispatch",
+      "type": "device/rank 二选一 + shrink/expand 分发图",
+      "spec": "__init__ 判 get_ascend_device_type()==310P 或 max_lora_rank>=128 → 绑 vLLM torch_ops；否则绑 lora_ops(torch.ops._C_ascend.*)。下半：add_lora_linear → is_prefill? sgmv : bgmv → shrink(降到 rank r buffer) → expand(升回 out)。",
+      "roadmap_highlight": "PunicaWrapperNPU.add_lora_linear"
+    },
+    {
+      "name": "ch30-netloader-flow",
+      "type": "loader 注册+加载流程图",
+      "spec": "@register_model_loader('netloader') 写进 _LOAD_FORMAT_TO_MODEL_LOADER → get_model_loader 按 --load-format 取类 → load_model：source 有效? → initialize_model+elastic_load(网络拉) → 成功 model.eval()；source 无效/拉取失败 → revert_to_default → DefaultModelLoader。",
+      "roadmap_highlight": "ModelNetLoaderElastic.load_model + revert_to_default"
+    }
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recycle": [],
+    "note": "bible.py due ch30 返回空（应埋/应回收均无条目）。本章作为全书最后一个代码章，叙事上需回收/呼应全书『注册到 vLLM 扩展点』主线（ch02 平台 / ch23 CustomOp / ch27 量化 / ch29 proposer），这是结构性收束、非 bible 登记的具体伏笔项；writer 应在收尾显式串起这条主线。"
+  }
+}
