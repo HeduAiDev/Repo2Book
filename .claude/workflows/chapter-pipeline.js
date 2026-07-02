@@ -5,6 +5,8 @@ export const meta = {
     { title: 'Dossier', detail: 'analyst 深读真实源码产出共享档案，并对抗性自核' },
     { title: 'Implement', detail: 'implementer 产出 subtract-only 精简版 (TDD)' },
     { title: 'Test', detail: 'tester 验证复现 vLLM 行为（反压闸门）' },
+    { title: 'Explain', detail: 'explainer 跑精简版取数值轨迹，产教学素材+figure-spec' },
+    { title: 'Illustrate', detail: 'illustrator 绘图：视觉自查回环+盲审门禁' },
     { title: 'Write', detail: 'writer 以真实源码为主线写章节（内嵌源码+Roadmap）' },
     { title: 'Review', detail: '多维并行协作评审，有界回环' },
     { title: 'Archive', detail: 'archivist 归档 + 回写 Book Bible' },
@@ -76,8 +78,8 @@ const dossierV = await agent(
   head('analyst') +
   '任务：深读真实源码（重点：' + PATHS + '），产出本章**档案**并 Write 到 ' + CH + '/dossier/dossier.json。\n' +
   '先跑 `python3 ' + REPO + '/scripts/bible.py due ' + A.chapter_id + '`，结果放入 foreshadow_due。\n' +
-  'dossier.json 字段：code_spine、embed_excerpts(逐字真实源码片段+可省略分支说明，带 vllm/...:Lxxx)、key_classes、data_flow、design_decisions、theory、subtraction_plan{delete:[{what,why_safe}], must_keep:[{symbol,why} 可检测符号]}、diagram_plan、foreshadow_due。\n' +
-  'must_keep 要把"读者需理解、writer 需讲清"的符号都放进去（宁多留勿误删）。只描述真实源码，禁止杜撰。完成返回 status/note。' + ESC,
+  'dossier.json 字段：code_spine、embed_excerpts(逐字真实源码片段+可省略分支说明，带 vllm/...:Lxxx)、key_classes、data_flow、design_decisions、theory、subtraction_plan{delete:[{what,why_safe}], must_keep:[{symbol,why} 可检测符号]}、mechanisms[{id,name,kind:algorithm|dataflow|layout|protocol|config,source_anchors,needs_figure,needs_worked_example,difficulty:core|supporting}](v3 账本：宁多登记勿漏)、foreshadow_due。\n' +
+  'must_keep 要把"读者需理解、writer 需讲清"的符号都放进去（宁多留勿误删）。只描述真实源码，禁止杜撰。完成后自跑 `python3 ' + REPO + '/scripts/lint_dossier.py ' + CH + '` 确保无 BLOCKING。返回 status/note。' + ESC,
   { schema: STATUS_SCHEMA, label: 'dossier', phase: 'Dossier', agentType: 'general-purpose' }
 )
 if (dossierV && dossierV.status === 'BLOCKED') return { escalated: 'dossier', stage: 'Dossier', reason: dossierV.blocker_reason }
@@ -85,6 +87,7 @@ if (dossierV && dossierV.status === 'BLOCKED') return { escalated: 'dossier', st
 const dv = await agent(
   head('analyst') +
   '任务：**独立对抗性核对** ' + CH + '/dossier/dossier.json 是否忠于真实源码：路线是否正确？embed_excerpts 是否逐字、file:Lxxx 是否准确？subtraction_plan.delete 是否都安全、must_keep 是否完整（有无遗漏读者要学的关键符号）？\n' +
+  'mechanisms 是否完整——有无漏掉读者必须懂的机制？needs_figure/needs_worked_example/difficulty 标得对吗？\n' +
   '返回 sound（是否可放行）与 problems（具体问题列表）。',
   { schema: VERIFY_SCHEMA, label: 'dossier-verify', phase: 'Dossier', agentType: 'general-purpose' }
 )
@@ -125,6 +128,57 @@ for (let r = 1; r <= 3; r++) {
 }
 } else { log('skip_impl: 本章无精简版（方法论/概览章），跳过 Implement+Test') }
 
+// ---------- Phase C2: Explain（素材真相源：数值轨迹 + figure-spec） ----------
+phase('Explain')
+const expl = await agent(
+  head('explainer') +
+  '任务：读 ' + CH + '/dossier/dossier.json（mechanisms 账本）与 ' + CH + '/implementation/（若有），对每个 needs_worked_example 机制产出教学素材，Write 到 ' + CH + '/explainer/explainer.json；trace 原始输出与驱动脚本存 ' + CH + '/explainer/traces/。\n' +
+  (A.skip_impl
+    ? '本章无精简版：trace_source="manual"，manual_reason 写清；引用源码常量的数字标 file:Lxxx。\n'
+    : '优先写驱动脚本跑精简版取 trace（trace_source="run"）——表格每个数字必须能在 trace 里找到。\n') +
+  '每个 needs_figure 机制至少 1 个 figure-spec（claim 一句话、numbers 全带 provenance、caption_draft 给结论）。\n' +
+  '完成后自跑 `python3 ' + REPO + '/scripts/lint_explainer.py ' + CH + '` 确保无 BLOCKING。返回 status/note。' + ESC,
+  { schema: STATUS_SCHEMA, label: 'explain', phase: 'Explain', agentType: 'general-purpose' }
+)
+if (expl && expl.status === 'BLOCKED') return { escalated: 'explain', stage: 'Explain', reason: expl.blocker_reason }
+
+// ---------- Phase C3: Illustrate（绘图 → 视觉自查 → 盲审门禁，有界回环） ----------
+const BLIND_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['all_pass', 'failures'],
+  properties: {
+    all_pass: { type: 'boolean' },
+    failures: { type: 'array', items: { type: 'object', additionalProperties: false,
+      required: ['figure_id', 'problem', 'suggested_fix'],
+      properties: { figure_id: { type: 'string' }, problem: { type: 'string' }, suggested_fix: { type: 'string' } } } },
+  },
+}
+let blindV = null
+let blindLedger = []
+for (let b = 1; b <= 3; b++) {
+  phase('Illustrate')
+  const ill = await agent(
+    head('illustrator') +
+    '任务：按 ' + CH + '/explainer/explainer.json 的全部 figure_specs 绘图到 ' + CH + '/diagrams/（gen_<figure_id>.py + svg + png + figure-manifest.json）。每张图强制流程：渲染 → 用 Read 打开 PNG **亲眼看** → 六项自查全真才登记 manifest（blind_review 初写 PENDING）。\n' +
+    '并生成本章 roadmap：`python3 ' + REPO + '/instances/' + INST + '/book/assets/roadmap/roadmap.py --highlight "' + HL + '" --out ' + CH + '/diagrams/roadmap.svg`，rsvg-convert -z 2 转 PNG（**勿用 ImageMagick convert**）。\n' +
+    (blindLedger.length ? '上一轮盲审 FAIL，必须修复后重渲重看：\n' + blindLedger.join('\n') + '\n' : '') +
+    '完成后自跑 `python3 ' + REPO + '/scripts/lint_diagram_geometry.py ' + CH + '/diagrams/*.svg` 确保无问题。返回 status/note。' + ESC,
+    { schema: STATUS_SCHEMA, label: 'illustrate r' + b, phase: 'Illustrate', agentType: 'general-purpose' }
+  )
+  if (ill && ill.status === 'BLOCKED') return { escalated: 'illustrate', stage: 'Illustrate', round: b, reason: ill.blocker_reason }
+  blindV = await agent(
+    '你是插图盲审员。**只准看**：' + CH + '/diagrams/figure-manifest.json 列出的每张 PNG（用 Read 打开图片文件）+ ' + CH + '/explainer/explainer.json 里对应的 figure_spec。**禁止**看 gen_*.py 生成代码、禁止看正文章节。\n' +
+    '逐张图做四步：① 只看图，用自己的话复述这张图的论点；② 与 spec.claim 对照——复述对不上 = FAIL；③ 图上每个数字与 spec.numbers 逐个核对——对不上 = FAIL；④ 明显不可读（文字重叠/箭头悬空/不知从哪看起）= FAIL。\n' +
+    '把每张图的 verdict（PASS/FAIL）与 notes 用 Edit 回填 figure-manifest.json 的 blind_review 字段。\n' +
+    '返回 all_pass 与 failures（每条 figure_id + problem + suggested_fix）。',
+    { schema: BLIND_SCHEMA, label: 'blind-review r' + b, phase: 'Illustrate', agentType: 'general-purpose' }
+  )
+  if (blindV && blindV.all_pass) break
+  blindLedger = ((blindV && blindV.failures) || []).map(function (f) { return '[' + f.figure_id + '] ' + f.problem + ' → ' + f.suggested_fix })
+  log('盲审第 ' + b + ' 轮 FAIL：' + blindLedger.length + ' 张图打回 illustrator')
+}
+if (!blindV || !blindV.all_pass) return { chapter: A.chapter_id, escalated: 'blind-review-exhausted', stage: 'Illustrate', failures: (blindV && blindV.failures) || [] }
+log('插图全部通过视觉自查 + 盲审')
+
 // ---------- Phase D: Write (真源码主线) ----------
 phase('Write')
 let writeV = null
@@ -134,14 +188,14 @@ writeV = await agent(
   head('writer') +
   '任务：以**真实目标源码为主线**写 ' + CH + '/narrative/chapter.md（你唯一有权写它）。\n' +
   '读 dossier、implementation、' + REPO + '/instances/' + INST + '/book/bible/voice-guide.md，并跑 `python3 ' + REPO + '/scripts/bible.py due ' + A.chapter_id + '`。\n' +
-  '开场 Roadmap：跑 `python3 ' + REPO + '/instances/' + INST + '/book/assets/roadmap/roadmap.py --highlight "' + HL + '" --out ' + CH + '/diagrams/roadmap.svg`，用 rsvg-convert -z 2 转 PNG（**勿用 ImageMagick convert**，会丢中文/错位），正文引用该 PNG。\n' +
+  '素材已备好：读 ' + CH + '/explainer/explainer.json（数值轨迹/直觉/不变量）与 ' + CH + '/diagrams/（已过盲审的图 + roadmap.png——先 Read 几张 PNG 看图长什么样再落笔）。**怎么讲由你**：结构/顺序/风格/篇幅自由。**必达物要在场**：difficulty=core 机制三层递进（直觉→机制→源码）；explainer 的数值推演表进正文，表格前一行放 `<!-- trace: <mechanism_id> -->` 标记，数字一个不许改（排版随意）；每张图被引用且在其机制讲解附近；开场引用 roadmap.png。图不合适 → 用逃生舱提需求，不许自己画。\n' +
   '正文内嵌**真实源码片段**(裁剪无关分支用 `# … 省略 …`)，逐段解读设计决策。' +
   (A.skip_impl
     ? '本章无精简版（方法论/概览章）——以真实源码 + 架构图为主线，不要提"精简版"。\n'
     : '精简版只作"运行看数值"的交叉验证，不是主角。\n若发现精简版缺了你要讲清的细节 → 用逃生舱拉闸（status=BLOCKED）让 implementer 补回，别将就。\n') +
   '埋伏笔、`python3 ' + REPO + '/scripts/bible.py payoff --resolve` 回收应回收项。\n' +
   '**零脚手架泄漏**：规范 vllm/ 路径、自然标题(无 Cell N)、不提内部文件。\n' +
-  '完成后自跑' + (A.skip_impl ? '四个 linter（chapter_structure/formulas/source_grounding/diagrams，本章无精简版故不跑 fidelity）' : '五个 linter（chapter_structure/formulas/source_grounding/fidelity/diagrams）') + '均无 BLOCKING。返回 status/note。' + ESC,
+  '完成后自跑' + (A.skip_impl ? '四个 linter（chapter_structure/formulas/source_grounding/trace_consistency，本章无精简版故不跑 fidelity）' : '五个 linter（chapter_structure/formulas/source_grounding/fidelity/trace_consistency）') + '均无 BLOCKING（图的 linter 归 illustrator，不用你跑）。返回 status/note。' + ESC,
   { schema: STATUS_SCHEMA, label: 'write r' + w, phase: 'Write', agentType: 'general-purpose' }
 )
 }
@@ -150,7 +204,12 @@ if (writeV && writeV.status === 'BLOCKED') return { escalated: 'write', stage: '
 
 // ---------- Phase E: Review (多维并行 → 协作回环) ----------
 let reviewV = null
-const DIMS = ['fidelity（保真度+过度删减+零脚手架泄漏）', 'readability（可读/不枯燥/连贯）', 'algorithm（算法可理解性：图/数值/证明）', 'formula-structure-diagrams（公式可渲染+Roadmap+自包含+图示质量，跑 lint_formulas/chapter_structure/source_grounding/diagrams）']
+const DIMS = [
+  'fidelity（保真度+过度删减+零脚手架泄漏，跑 lint_fidelity/lint_source_grounding/lint_chapter_structure）',
+  'algorithm-pedagogy（逐机制对账：对 dossier.mechanisms 每条填勾选表——直觉在场？数值推演表在场且带 trace 标记？不变量论证？量化落数字？core 三层齐？先跑 lint_trace_consistency 作客观依据；输出逐机制勾选表，不是整体印象）',
+  'figure-integration（先跑 lint_diagrams；然后逐张用 Read 打开 PNG 亲眼看：图在其机制讲解附近？图注给结论而非描述画面？正文数字与图上一致？图对读懂机制真有帮助？）',
+  'formula-structure（公式规则+Roadmap 开场+自包含+锚点/半角，跑 lint_formulas/lint_anchors/lint_punct/lint_chapter_structure）',
+]
 for (let r = 1; r <= 3; r++) {
   phase('Review')
   const dimThunks = DIMS.map(function (dim) {
