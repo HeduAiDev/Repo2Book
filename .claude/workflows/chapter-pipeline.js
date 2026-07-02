@@ -128,6 +128,9 @@ for (let r = 1; r <= 3; r++) {
 }
 } else { log('skip_impl: 本章无精简版（方法论/概览章），跳过 Implement+Test') }
 
+// 实现↔测试 3 轮仍 REJECTED → 升级 Lead，不让 explainer 用被拒实现取数
+if (!A.skip_impl && (!testV || testV.verdict !== 'APPROVED')) return { chapter: A.chapter_id, escalated: 'test-exhausted', stage: 'Test', ledger: ledger }
+
 // ---------- Phase C2: Explain（素材真相源：数值轨迹 + figure-spec） ----------
 phase('Explain')
 const expl = await agent(

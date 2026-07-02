@@ -86,12 +86,13 @@ figure-integration(逐张看图) / formula-structure + haiku 读者顾问。
 - 跑偏了：`TaskStop` 急停。
 
 ## 5. 逃生舱：处理 BLOCKED / 升级
-任一阶段 agent 返回 `status="BLOCKED"` → workflow **早停**（不跑到底）、返回 `{escalated:<stage>, ...}` 并通知我。v3 8 阶段流水线（Dossier→Implement→Test→Explain→Illustrate→Write→Review→Archive）**共 11 个逃生舱点：**
+任一阶段 agent 返回 `status="BLOCKED"` → workflow **早停**（不跑到底）、返回 `{escalated:<stage>, ...}` 并通知我。v3 8 阶段流水线（Dossier→Implement→Test→Explain→Illustrate→Write→Review→Archive）**共 12 个逃生舱点：**
 | escalated | 含义 | 返回字段 | 我的动作 |
 |---|---|---|---|
 | `dossier` | analyst 产档案时源码与计划不符/无法忠实产出 | `reason` | 修 dossier 输入或 analyst 提示词 → 续跑 |
 | `dossier-verify` | 对抗性自核判定档案不可放行 | `problems`（数组） | 按 problems 修 dossier → 续跑 |
 | `implement` | 减法计划会破坏正确性/缺料 | `round`、`reason` | 修 dossier.subtraction_plan 或 implementer 提示词 → 续跑 |
+| `test-exhausted` | 实现↔测试 3 轮仍 REJECTED，不让 explainer 用被拒实现取数 | `ledger`（数组） | 修 dossier.subtraction_plan/implementer 提示词 → 续跑 |
 | `explain` | explainer 取数值轨迹/产教学素材受阻，无法忠实产出 | `reason` | 补 dossier.mechanisms 或修 explainer 提示词 → 续跑 |
 | `illustrate` | illustrator 绘图受阻（figure-spec 缺信息或画不出） | `round`、`reason` | 补 explainer 素材或修 illustrator 提示词 → 续跑 |
 | `blind-review-exhausted` | 插图盲审 3 轮仍有图 FAIL | `failures`（数组） | 我介入定点修图或改 figure-spec → 续跑 |

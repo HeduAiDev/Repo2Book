@@ -80,7 +80,8 @@ def lint_diagrams(chapter_dir: str) -> dict:
         except ValueError:
             pass
         if not man.exists():
-            res["manifest"].append("  figure-manifest.json 缺失(v3 章每张图须登记自查+盲审)")
+            if spec_ids:
+                res["manifest"].append("  figure-manifest.json 缺失(v3 章每张图须登记自查+盲审)")
         else:
             try:
                 figs = {f.get("figure_id"): f

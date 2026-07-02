@@ -17,7 +17,7 @@ h = TOP + CELL + 110
 L = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}">',
      f'<rect width="{w}" height="{h}" fill="white"/>',
      f'<text x="{PAD}" y="{TOP-28}" font-family="sans-serif" font-size="14" '
-     'font-weight="bold" fill="#0f172a">KV cache 块池(block_size=16 token/块)</text>']
+     f'font-weight="bold" fill="#0f172a">{esc("KV cache 块池(block_size=16 token/块)")}</text>']
 for i, owner in enumerate(SLOTS):
     x = PAD + i * (CELL + GAP)
     L.append(f'<rect x="{x}" y="{TOP}" width="{CELL}" height="{CELL}" rx="8" '

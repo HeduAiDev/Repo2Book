@@ -92,3 +92,29 @@ def test_figure_number_without_provenance_blocking(tmp_path):
     e = json.loads(json.dumps(GOOD_ENTRY))
     e["figure_specs"][0]["numbers"] = [{"value": "3"}]
     assert lint_explainer(_mk(tmp_path, e))["figure"]
+
+
+FIG_ONLY_DOSSIER = {"mechanisms": [{
+    "id": "m1", "name": "抢占回退循环", "kind": "layout",
+    "source_anchors": ["pkg/sched.py:L1-L2"], "needs_figure": True,
+    "needs_worked_example": False, "difficulty": "supporting"}]}
+
+FIG_ONLY_ENTRY = {
+    "mechanism_id": "m1",
+    "figure_specs": [{
+        "figure_id": "fig-m1", "claim": "抢占按 LIFO 弹出尾部",
+        "template": "state-table",
+        "numbers": [{"value": "3", "provenance": "traces/m1.json"}],
+        "elements": ["逐轮状态表"], "caption_draft": "队列长 3→2→1",
+    }],
+}
+
+
+def test_figure_only_mechanism_no_worked_example_required(tmp_path):
+    r = lint_explainer(_mk(tmp_path, FIG_ONLY_ENTRY, trace=None, dossier=FIG_ONLY_DOSSIER))
+    assert not r["mechanism"] and not r["trace"] and not r["figure"]
+
+
+def test_needs_figure_missing_entry_blocking(tmp_path):
+    r = lint_explainer(_mk(tmp_path, None, trace=None, dossier=FIG_ONLY_DOSSIER))
+    assert r["figure"]

@@ -68,7 +68,7 @@ phase('Diagnose')
 const diag = await agent(
   head('reviewer') +
   '任务：**体检本章，不做任何修改**（除按下述补 dossier 的 mechanisms 字段外）。\n' +
-  '① 读 ' + CH + '/narrative/chapter.md 与 ' + CH + '/dossier/dossier.json。若 dossier 无 mechanisms 字段：按正文与源码补一份轻量机制清单，Edit 进 dossier.json（只加 mechanisms 字段，不动其他字段）。**关键**：只把你判定需要动工的机制标 needs_worked_example/needs_figure=true，其余标 false（避免 lint 误伤未动工机制）。\n' +
+  '① 读 ' + CH + '/narrative/chapter.md 与 ' + CH + '/dossier/dossier.json。若 dossier 无 mechanisms 字段：**只登记需动工的机制**（体检判定 depth=shallow 或 figure!=ok 的），Edit 加 mechanisms 字段、不动其他字段；已合格的机制本次不登记（外科范围外，避免账本要求全书追溯）。kind 如实填，**kind=algorithm 的登记项一律 needs_worked_example=true**（lint_dossier 规则——重绘算法图也需要经运行/推演验证的数字）；needs_figure 按体检结果填。\n' +
   '② 逐机制评深度：三层递进（直觉/机制含数值推演/源码）齐吗？不变量有论证吗？→ depth: ok|shallow。\n' +
   '③ 用 Read 逐张打开 ' + CH + '/diagrams/ 的内容 PNG（roadmap 除外）**亲眼看**：该机制有图吗？图与正文数字/源码一致吗？可读吗？→ figure: ok|missing|wrong。diagrams/ 若有 svg/png 而无对应 gen_*.py，记 action="rebuild-gen"。\n' +
   '④ 写 ' + CH + '/retrofit/retrofit-plan.json：{mechanisms:[{id,name,depth,figure,evidence,actions:[]}]}——每条判定必须带 evidence（引用正文行/图名）。\n' +

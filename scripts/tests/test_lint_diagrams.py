@@ -87,3 +87,12 @@ def test_v3_selfcheck_false_blocking(tmp_path):
 def test_old_chapter_without_explainer_unaffected(tmp_path):
     d = _mk(tmp_path, {"fig-x.svg": SVG}, ["fig-x.png"], "![](../diagrams/fig-x.png)")
     assert not lint_diagrams(d)["manifest"]
+
+
+EXPL_NO_FIGS = '{"mechanisms": [{"mechanism_id": "m1", "figure_specs": []}]}'
+
+
+def test_explainer_with_zero_figure_specs_no_manifest_required(tmp_path):
+    d = _mk(tmp_path, {"fig-x.svg": SVG}, ["fig-x.png"],
+            "![](../diagrams/fig-x.png)", explainer=EXPL_NO_FIGS)
+    assert not lint_diagrams(d)["manifest"]
