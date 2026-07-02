@@ -41,6 +41,13 @@
 - The `<- KEY!` annotation uses `&lt;- KEY!` (escaped `<`)
 - Flow arrows between column boundaries with `marker-end`
 
+## v2 模板索引（figure-spec.template 对照）
+
+- **swimlane** — 跨组件/跨进程时序协议（如 Scheduler↔Worker RPC 往返）→ `references/example-swimlane.py`
+- **layout** — 内存/块表/KV 页/张量布局（如 KV cache block 占用）→ `references/example-layout.py`
+- **before-after** — 优化前后双态对比（同构双面板，仅高亮差异步骤）→ `references/example-before-after.py`
+- **state-machine** — 状态机/生命周期流转（主线横排 + 分支态下挂）→ `references/example-state-machine.py`
+
 ## When NOT to Use These Patterns
 
 - **Simple 3-node flow** → use Mermaid flowchart
