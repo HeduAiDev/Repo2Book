@@ -28,13 +28,15 @@
 - **A 档案即唯一真相源**：analyst 深读真实源码产出 `dossier.json`（含**要内嵌的真实源码片段** + 减法计划）。implementer 和 writer 都吃这份，**不以对方产物为准** → 结构性根除"writer 花篇幅讲 implementer 杜撰代码"的脱节。
 - **B 只做减法的可运行精简版**：忠实子集，`# SOURCE:`/`# SUBTRACTED:` 全标注。**防过度删减**：只删 dossier `delete` 批准项、`must_keep` 符号必保留（`lint_fidelity` 校验）。
 - **C 自包含、内嵌真源码**：不指望读者开着源码——正文直接内嵌真实源码片段（裁剪无关分支），逐段解读。精简版作"跑起来看数值"的交叉验证，不是主角。
+- **D 素材先行**：图与数值轨迹先于写作、经运行验证产出（explainer.json 素材真相源 + figure-spec）；illustrator 强制"渲染→Read PNG 亲眼看→自查→盲审"；writer 拿素材自由叙事——**写作自由、门禁从严**。
 - **每章开场 Roadmap**：复用 `instances/<active>/book/assets/roadmap/roadmap.py` 出"你在这里"图 + 前后衔接。
 
 ## 运转工厂：混合编排（Workflow + 少量持久角色）
 
-- **per-chapter workflow** `.claude/workflows/chapter-pipeline.js`：6 阶段 `Dossier→Implement→Test→Write→Review→Archive`，含 impl↔test / write↔review 有界回环、多维并行评审、**逃生舱**（任一阶段返回 `status=BLOCKED` → 立即中止升级 Lead）、dossier 对抗性自核。
+- **per-chapter workflow** `.claude/workflows/chapter-pipeline.js`：8 阶段 `Dossier→Implement→Test→Explain→Illustrate→Write→Review→Archive`，含 impl↔test / write↔review 有界回环、多维并行评审、插图盲审门禁(只看 PNG+spec 核论点/数字)、**逃生舱**（任一阶段返回 `status=BLOCKED` → 立即中止升级 Lead）、dossier 对抗性自核。
 - **发车**（详见 RUNBOOK）：`Workflow({name:"chapter-pipeline", args:{chapter_id, slug, source_root, focus, highlight, paths}})`。后台跑，完成/逃生舱触发会通知我；可 `/workflows` 看进度、`TaskStop` 急停、`resumeFromRunId` 续跑。
-- **6 角色 = 持久提示词**（`.claude/agents/{analyst,implementer,tester,writer,reviewer,archivist}.md`，已去 vLLM 化、仓库无关），workflow 经 agentType 调用 / 或 agent 自读契约。**持久分两层**：提示词+经验持久（文件），进程按任务 spawn（迭代靠 dossier+ledger+SendMessage 续接）。
+- **8 角色 = 持久提示词**（`.claude/agents/{analyst,implementer,tester,explainer,illustrator,writer,reviewer,archivist}.md`，已去 vLLM 化、仓库无关），workflow 经 agentType 调用 / 或 agent 自读契约。**持久分两层**：提示词+经验持久（文件），进程按任务 spawn（迭代靠 dossier+ledger+SendMessage 续接）。
+- **存量回修** `.claude/workflows/chapter-retrofit.js`：外科式——逐机制体检(免修早退)→增量素材→补图/换错图→定点 Edit 算法段(禁整章重写)。
 - **活体双向迭代 / 升级**：workflow 做不到的，由 Lead（我）+ 命名 agent + SendMessage 编排。
 
 ## 质量闸门（确定性 linter，前置于 LLM 评审）
@@ -44,6 +46,9 @@ python3 scripts/lint_fidelity.py {chapter_dir}                            # 保�
 python3 scripts/lint_chapter_structure.py {chapter}/narrative/chapter.md  # Roadmap + 内嵌真源码 + 零脚手架泄漏
 python3 scripts/lint_formulas.py {chapter}/narrative/chapter.md           # 公式可渲染
 python3 scripts/lint_source_grounding.py {chapter}/                        # 源码根基
+python3 scripts/lint_dossier.py {chapter_dir}             # v3:mechanisms 机制账本(锚点行号核真)
+python3 scripts/lint_explainer.py {chapter_dir}           # v3:素材真相源(表格数字可溯源到 trace)
+python3 scripts/lint_trace_consistency.py {chapter_dir}   # v3:正文数值表不漂移+机制覆盖
 python3 scripts/lint_anchors.py --all   # 章内锚点    python3 scripts/lint_punct.py --all   # 半角标点
 python3 scripts/lint_diagram_geometry.py --all   # 图：文字越界/相撞/压框/箭头悬空（--all 走活动实例）
 ```

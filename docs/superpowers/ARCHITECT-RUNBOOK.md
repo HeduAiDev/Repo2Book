@@ -64,6 +64,21 @@ Workflow({ name: "chapter-pipeline", args: {
 ### 风险高/首跑：分段发车
 先只跑到 dossier 审一眼再放行：把 workflow 临时改成 dossier 后 `return`，或直接让 analyst 角色单独产 dossier，我审"路线/减法计划/must_keep"对不对，再跑完整 pipeline。
 
+## 存量回修发车(chapter-retrofit,v3)
+
+外科式回修旧章(只动图和算法段):
+
+    Workflow({name: "chapter-retrofit", args: {chapter_id: "ch16", slug: "ch16-kv-cache-manager", instance: "vllm", highlight: "kv-cache"}})
+
+- args 注入不可靠时改脚本内 CFG(与 chapter-pipeline 同款约定)。
+- 体检 flagged_count=0 → 返回 CLEAN 免修早退,无成本浪费。
+- 批量:先对全书逐章只跑 Diagnose(便宜),按 flagged 机制数排序,算法重章优先分批发车。
+- 逃生舱/续跑与 chapter-pipeline 一致(BLOCKED 升级 Lead;resumeFromRunId 续跑)。
+
+v3 单章流水线与 v2 的差异速查:Test 后多 Explain(素材)与 Illustrate(绘图+盲审)两阶段;
+writer 不再画图;reviewer 维度为 fidelity / algorithm-pedagogy(逐机制对账) /
+figure-integration(逐张看图) / formula-structure + haiku 读者顾问。
+
 ## 4. 监控
 - `/workflows` 看实时阶段进度。
 - `TaskOutput`/读 `/tmp/.../tasks/<id>.output` 看结果。
@@ -114,7 +129,8 @@ jq -r '.overall_verdict' $D/reviews/review-report.json
 
 1. **进度真相** = `ls instances/vllm/artifacts/`（有目录=已写）。队列与参数 = `instances/vllm/book/cartography/chapter-queue.json`（每章 slug/focus/highlight/paths/mode/deps）。
 2. **选下一章**：chapter-queue 里 mode=code 且无 artifacts 目录的、依赖已满足的最前一章（数字序）。**ch01/ch02 是 mode=meta（概览，无精简版），留到所有 code 章之后，用定制轻量流写**。
-3. **发车**：把 `.claude/workflows/chapter-pipeline.js` 顶部的 `CFG` 改成该章参数（本机 args 注入不可靠，靠 CFG），`node --check` 后 `Workflow({scriptPath, args:{同 CFG}})`。
+3. **发车**：把 `.claude/workflows/chapter-pipeline.js` 顶部的 `CFG` 改成该章参数（本机 args 注入不可靠，靠 CFG），语法核验后 `Workflow({scriptPath, args:{同 CFG}})`。
+   - **语法核验（禁裸 `node --check`）**：workflow 脚本体被 Workflow host 包进 async 函数执行，顶层 `return` 运行时合法但裸 `node --check` 会拒绝——正确做法是拷到 scratch 存成 `.mjs`、去掉 `export `、把 meta 声明之后的正文包进 `async function __main__() { ... }`，再 `node --check`。
 3b. **挂看门狗（必做，别盲等）**：workflow **崩溃是静默的**——只等完成通知会永远等不到。发车后立刻 `Bash(run_in_background)` 一个 for-loop：每 60s 检 `{chapter_dir}/reviews/review-report.json`，出现即报"完成"、逾期(~70min)报"逾期可能崩溃"。崩了就 `TaskStop {taskId}` 再 `Workflow({scriptPath, resumeFromRunId})`（缓存命中已完成阶段，从崩溃点重跑）。判活/判崩：resume 报 "still running" = 活着（别 stop）；"started 无 result" 只是进行中，不等于崩溃。
 4. **验收**（流水线完成后，逐条亲跑）：5 linter（fidelity/chapter_structure/formulas/source_grounding/diagrams）全过 + pytest 过 + 脱节体检（叙事引真 vllm/ ≫ 引精简版 implementation/）+ **亲眼看 1 张图确认中文渲染**（lint 查不出 rsvg 与否）+ review verdict=APPROVED + 无 negotiable=false 未修项。
 5. **提交**（事故教训：通过即提交）：`git add` 该章 artifacts + bible + trace，commit（带 Co-Authored-By）。
