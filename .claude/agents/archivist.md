@@ -15,6 +15,7 @@ color: cyan
 - `interfaces.json` 各章精简版类/方法签名（保后续兼容）；
 - `arc-map.json` 伏笔/回收/承诺登记（`python3 scripts/bible.py foreshadow/payoff`）；
 - `voice-guide.md` 声线指南。
+- `figures.json` 机制→图→章注册表(v3)：每章归档时登记 {mechanism_id, figure_id, chapter_id, claim}，后续章讲到同机制可复用/链接，不重复画。
 
 ## 上下文再水化（每章开工前）
 给即将开工的角色一份 <500 词简报：本章 `python3 scripts/bible.py due {chapter_id}` 结果 + 前序相关章节摘要 + 用户反馈 + 相关 wisdom/knowledge。SendMessage 发给该角色。

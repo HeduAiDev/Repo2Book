@@ -21,12 +21,12 @@ color: magenta
 {
   "code_spine":      [真实数据流的 file:Lxxx 范围，有序],
   "embed_excerpts":  [{path:"<repo>/...py", lines:"L280-L360", code:"<逐字真实源码>", elide:["可省略的无关分支说明"]}],
+  "mechanisms":      [{id, name, kind: algorithm|dataflow|layout|protocol|config, source_anchors:["<repo>/x.py:Lnnn-Lnnn"], needs_figure, needs_worked_example, difficulty: core|supporting}  ← v3 账本：一图讲一机制/一例讲一算法的覆盖度依据],
   "key_classes":     [{name, file, responsibility}],
   "data_flow":       [有序步骤，每步 file:method],
   "design_decisions":[{decision, why, evidence:"<repo>/...:Lxxx"}],
   "theory":          [需推导的原理/复杂度量化],
   "subtraction_plan":{delete:[{what,why_safe} 唯一批准删除清单], must_keep:[{symbol,why} 必须保留的可检测符号]},
-  "diagram_plan":    [需要的图 + svg-diagram 规格 + Roadmap 高亮节点],
   "foreshadow_due":  <bible.py due 的结果>
 }
 ```
@@ -37,6 +37,8 @@ color: magenta
 - `subtraction_plan` 要让 implementer 能据此"只删不增"：明确删什么、为什么删了仍正确、哪些骨架必须原样保留。
 - **防过度删减（关键）**：`delete` 是 implementer **唯一被批准的删除清单**（清单外一律不许删）；`must_keep` 列**可检测的符号名**（类/方法/常量），`lint_fidelity` 会校验它们出现在精简版。凡"读者需要理解、writer 需要讲清"的细节，务必放进 `must_keep`——宁可多留，不可误删。
 - 若需确认真实行为：**按当前实例的运行约束执行**（若目标代码仓有特殊运行环境要求，如 vLLM 实例须进容器 `scripts/vllm_docker.sh ...`、host 无 CUDA/vLLM）；行号仍以 pin 的源码为准，运行环境仅用于观察行为。
+- **mechanisms 是 v3 账本**：本章每个"读者必须懂"的机制都要登记；kind=algorithm 必须 needs_worked_example=true；difficulty=core 的机制 writer 必须三层递进讲。宁可多登记，不可漏。
+- 收工自检：`python3 scripts/lint_dossier.py {chapter_dir}` 无 BLOCKING（锚点行号逐个核真）。
 
 ## 收工后
 把新发现的仓库事实 `python3 scripts/learn.py extract {chapter_id} analyst` 记入 knowledge。
