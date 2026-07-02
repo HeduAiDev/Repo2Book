@@ -248,7 +248,7 @@ for (let r = 1; r <= 3; r++) {
   const rev = await agent(
     head('writer') +
     '评审 REVISE（第 ' + r + ' 轮）。用 receiving-code-review skill 逐条处理（采纳或带理由反驳），改 ' + CH + '/narrative/chapter.md：\n' +
-    JSON.stringify(issues) + '\n完成后自跑四个 linter。返回 status/note。' + ESC,
+    JSON.stringify(issues) + '\n完成后自跑' + (A.skip_impl ? '四个 linter（chapter_structure/formulas/source_grounding/trace_consistency）' : '五个 linter（chapter_structure/formulas/source_grounding/fidelity/trace_consistency）') + '均无 BLOCKING。返回 status/note。' + ESC,
     { schema: STATUS_SCHEMA, label: 'revise r' + r, phase: 'Review', agentType: 'general-purpose' }
   )
   if (rev && rev.status === 'BLOCKED') return { escalated: 'review-revise', stage: 'Review', round: r, reason: rev.blocker_reason }
