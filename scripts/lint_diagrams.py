@@ -7,10 +7,12 @@ convert（不做 CJK 回退、排版差），也**不要**在 SVG 里强制 CJK 
 
 阻断项：SVG 未过 xmllint；SVG 无对应 PNG / PNG 过小；图 PNG 未在 narrative 引用（孤儿图）；
         环境缺 rsvg-convert（无法正确出图）。
+        v3 章(有 explainer.json):figure-manifest.json 缺失/未登记 spec 图/自查非全真/盲审非 PASS/文件不存在。
 警告项：text 估算超出 viewBox。
 
 用法：python3 lint_diagrams.py <chapter_dir>　阻断项存在则 exit 1。
 """
+import json
 import re
 import shutil
 import subprocess
@@ -23,7 +25,7 @@ CJK = re.compile(r'[㐀-䶿一-鿿]')
 def lint_diagrams(chapter_dir: str) -> dict:
     d = Path(chapter_dir)
     dia = d / "diagrams"
-    res = {"svg_invalid": [], "png_missing": [], "orphan": [], "no_renderer": [], "overflow": []}
+    res = {"svg_invalid": [], "png_missing": [], "orphan": [], "no_renderer": [], "overflow": [], "manifest": []}
     if shutil.which("rsvg-convert") is None:
         res["no_renderer"].append("  缺 rsvg-convert（apt install librsvg2-bin）——PNG 无法正确渲染中文")
     if not dia.exists():
@@ -64,6 +66,42 @@ def lint_diagrams(chapter_dir: str) -> dict:
             res["png_missing"].append(f"  {png.name}: PNG 过小/疑似空 ({png.stat().st_size}B)")
         if png.name not in nar_text:
             res["orphan"].append(f"  {png.name}: 未在正文引用（孤儿图）")
+
+    # v3:有 explainer 素材的章,每张 spec 图必须在 manifest 登记且自查全真、盲审 PASS
+    ex = d / "explainer" / "explainer.json"
+    man = dia / "figure-manifest.json"
+    if ex.exists():
+        spec_ids = []
+        try:
+            for m in json.loads(ex.read_text(encoding="utf-8")).get("mechanisms", []):
+                for s in (m.get("figure_specs") or []):
+                    if s.get("figure_id"):
+                        spec_ids.append(s["figure_id"])
+        except ValueError:
+            pass
+        if not man.exists():
+            res["manifest"].append("  figure-manifest.json 缺失(v3 章每张图须登记自查+盲审)")
+        else:
+            try:
+                figs = {f.get("figure_id"): f
+                        for f in json.loads(man.read_text(encoding="utf-8")).get("figures", [])}
+            except ValueError as e:
+                figs = {}
+                res["manifest"].append(f"  figure-manifest.json 不合法: {e}")
+            for fid in spec_ids:
+                f = figs.get(fid)
+                if not f:
+                    res["manifest"].append(f"  {fid}: figure-spec 有图,manifest 未登记")
+                    continue
+                sc = f.get("selfcheck") or {}
+                bad = [k for k, v in sc.items() if v is not True]
+                if not sc or bad:
+                    res["manifest"].append(f"  {fid}: 自查未全真({bad or '空'})——必须先 Read PNG 亲眼看再填表")
+                if ((f.get("blind_review") or {}).get("verdict")) != "PASS":
+                    res["manifest"].append(f"  {fid}: 盲审 verdict != PASS")
+                for k in ("gen", "svg", "png"):
+                    if f.get(k) and not (dia / f[k]).exists():
+                        res["manifest"].append(f"  {fid}: {k} 文件不存在 {f[k]}")
     return res
 
 
@@ -76,8 +114,8 @@ def print_report(res: dict, cd: str) -> int:
     for k, issues in res.items():
         for i in issues:
             print(f"❌ {k}: {i}")
-    blocking = (len(res["svg_invalid"]) + len(res["png_missing"])
-                + len(res["orphan"]) + len(res["no_renderer"]))
+    blocking = (len(res["svg_invalid"]) + len(res["png_missing"]) + len(res["orphan"])
+                + len(res["no_renderer"]) + len(res.get("manifest", [])))
     print(f"\n{'=' * 60}")
     print(f"🔴 {blocking} BLOCKING" if blocking else "🟢 仅警告（overflow 估算）")
     return 1 if blocking else 0
