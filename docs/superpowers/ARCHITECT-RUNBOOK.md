@@ -29,9 +29,10 @@
 
 ## 2. 目录地图
 ```
-.claude/agents/{analyst,implementer,tester,writer,reviewer,archivist}.md  ← 6 角色持久提示词
-.claude/workflows/chapter-pipeline.js                                     ← 单章流水线
+.claude/agents/{analyst,implementer,tester,explainer,illustrator,writer,reviewer,archivist}.md  ← 8 角色持久提示词
+.claude/workflows/chapter-pipeline.js                                     ← 单章流水线（v3：8 阶段）
 scripts/lint_fidelity.py  lint_chapter_structure.py  lint_formulas.py  lint_source_grounding.py
+scripts/lint_dossier.py  lint_explainer.py  lint_trace_consistency.py    ← v3 新增三闸
 scripts/instance.py       ← 活动实例解析（去仓库化核心；linter --all 据它扫）
 scripts/new_instance.py   ← 新建一本书（scaffold 实例 + 克隆源仓）
 scripts/bible.py          ← 跨章连贯性 CLI（due/foreshadow/payoff/term/iface）
@@ -85,14 +86,19 @@ figure-integration(逐张看图) / formula-structure + haiku 读者顾问。
 - 跑偏了：`TaskStop` 急停。
 
 ## 5. 逃生舱：处理 BLOCKED / 升级
-任一阶段 agent 返回 `status="BLOCKED"` → workflow **早停**（不跑到底）、返回 `{escalated:<stage>, ...}` 并通知我。**共 6 个 stage：**
+任一阶段 agent 返回 `status="BLOCKED"` → workflow **早停**（不跑到底）、返回 `{escalated:<stage>, ...}` 并通知我。v3 8 阶段流水线（Dossier→Implement→Test→Explain→Illustrate→Write→Review→Archive）**共 11 个逃生舱点：**
 | escalated | 含义 | 返回字段 | 我的动作 |
 |---|---|---|---|
 | `dossier` | analyst 产档案时源码与计划不符/无法忠实产出 | `reason` | 修 dossier 输入或 analyst 提示词 → 续跑 |
 | `dossier-verify` | 对抗性自核判定档案不可放行 | `problems`（数组） | 按 problems 修 dossier → 续跑 |
-| `implement` | 减法计划会破坏正确性/缺料 | `reason` | 修 dossier.subtraction_plan 或 implementer 提示词 → 续跑 |
-| `write` | writer 缺要讲清的细节 | `reason` | 让 implementer 补 must_keep；或命名 agent+SendMessage 活体迭代 → 续跑 |
-| `review-revise` | 评审回环中 writer 再次 BLOCKED | `reason` | 同上 → 续跑 |
+| `implement` | 减法计划会破坏正确性/缺料 | `round`、`reason` | 修 dossier.subtraction_plan 或 implementer 提示词 → 续跑 |
+| `explain` | explainer 取数值轨迹/产教学素材受阻，无法忠实产出 | `reason` | 补 dossier.mechanisms 或修 explainer 提示词 → 续跑 |
+| `illustrate` | illustrator 绘图受阻（figure-spec 缺信息或画不出） | `round`、`reason` | 补 explainer 素材或修 illustrator 提示词 → 续跑 |
+| `blind-review-exhausted` | 插图盲审 3 轮仍有图 FAIL | `failures`（数组） | 我介入定点修图或改 figure-spec → 续跑 |
+| `write-failed` | writer 多轮失败（限流/崩溃），无 chapter.md 产出，不进评审 | `note` | 排查限流/崩溃原因 → 续跑 |
+| `write` | writer 缺要讲清的细节 | `reason` | 让 implementer/explainer 补料；或命名 agent+SendMessage 活体迭代 → 续跑 |
+| `review-agents-failed` | 评审并行 agent 部分失败（限流/崩溃），评审未完成，不假通过 | `round`、`note` | 排查失败原因 → 续跑 |
+| `review-revise` | 评审回环中 writer 再次 BLOCKED | `round`、`reason` | 同上 → 续跑 |
 | `review-exhausted` | 评审 3 轮仍有 blocking（兑现">3 轮升级"） | `issues`（数组） | 我介入：修提示词/dossier，或命名 agent+SendMessage 活体迭代 → 续跑 |
 - **agent 不能自己联系我或杀 workflow**，只能返回 BLOCKED 拉闸；我也可随时 `TaskStop`。
 - **续跑**：`Workflow({scriptPath:".claude/workflows/chapter-pipeline.js", resumeFromRunId:"<上次 runId>"})`，已完成阶段命中缓存。
@@ -106,6 +112,9 @@ python3 scripts/lint_fidelity.py $D
 python3 scripts/lint_chapter_structure.py $D/narrative/chapter.md
 python3 scripts/lint_formulas.py $D/narrative/chapter.md
 python3 scripts/lint_source_grounding.py $D
+python3 scripts/lint_dossier.py $D             # v3：机制账本（锚点行号核真）
+python3 scripts/lint_explainer.py $D           # v3：素材真相源（表格数字可溯源到 trace）
+python3 scripts/lint_trace_consistency.py $D   # v3：正文数值表不漂移 + 机制覆盖
 jq -r '.overall_verdict' $D/reviews/review-report.json
 ```
 全部无 BLOCKING + verdict=APPROVED 才算过。
@@ -140,7 +149,7 @@ jq -r '.overall_verdict' $D/reviews/review-report.json
   - 实战经验补：① 会话用量上限约每 6 章触发一次→escape hatch 防假通过 + 限额重置后 `resumeFromRunId` 续跑；② git push 必须前台（后台 shell SSH 鉴权失败）；③ 监控在 review-report.json 出现即报 DONE，但 archive 的 bible/trace 回写稍后→提交前确认 bible interfaces 有本章；④ meta/概览章用 CFG `skip_impl:true` 走轻流程（无精简版、不跑 fidelity）；⑤ off-spine 章 highlight 用子系统键（roadmap 自动高亮父阶段+「本章深入」框）。
 
 ## 9. 当前状态 & 下一步
-- 系统重建完成（地基 12/12 测试、6 角色、Roadmap、Bible、workflow+逃生舱、架构师文档）。**冷启动 Team Lead 文档考 v2 已 PASS 60/60**。
+- 系统重建完成（地基 12/12 测试、6 角色、Roadmap、Bible、workflow+逃生舱、架构师文档）。**冷启动 Team Lead 文档考 v2 已 PASS 60/60**。（此为 v2 时点记录；v3 起流水线扩至 8 阶段/8 角色，见 §2/§5。）
 - 首跑前 `instances/vllm/artifacts/` 不存在属正常——workflow 内 agent 会按绝对路径自建章节目录；`state.json` 已 bootstrap。
 - **下一步：发 ch04 试点**（§3），复盘是否根除脱节 → 迭代提示词 → 再推进 outline 其余章节。
 - 未做（后续）：continuity-audit workflow、批量并行（worktree 隔离）、旧 artifacts 实际清理、repo2book.json pipeline 接线。
