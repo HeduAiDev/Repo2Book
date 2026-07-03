@@ -20,6 +20,10 @@ const CFG = {
   repo_root: '/mnt/e/Laboratory/Repo2Book',
 }
 const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
+// 模型分配（spec §7：全流水线 opus/sonnet，不继承主会话模型；args.models 可覆盖）
+const MODELS = Object.assign(
+  { diagnose: 'opus', explain: 'opus', illustrate: 'sonnet', blind: 'sonnet', patch: 'opus', review: 'sonnet', archive: 'sonnet' },
+  A.models || {})
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
 const INST = A.instance || 'vllm'
 const CH = REPO + '/instances/' + INST + '/artifacts/' + A.slug
@@ -73,7 +77,7 @@ const diag = await agent(
   '③ 用 Read 逐张打开 ' + CH + '/diagrams/ 的内容 PNG（roadmap 除外）**亲眼看**：该机制有图吗？图与正文数字/源码一致吗？可读吗？→ figure: ok|missing|wrong。diagrams/ 若有 svg/png 而无对应 gen_*.py，记 action="rebuild-gen"。\n' +
   '④ 写 ' + CH + '/retrofit/retrofit-plan.json：{mechanisms:[{id,name,depth,figure,evidence,actions:[]}]}——每条判定必须带 evidence（引用正文行/图名）。\n' +
   '返回 flagged_count（depth=shallow 或 figure!=ok 的机制数）与 summary（一句话体检结论）。' + ESC,
-  { schema: DIAG_SCHEMA, label: 'diagnose', phase: 'Diagnose', agentType: 'general-purpose' }
+  { schema: DIAG_SCHEMA, label: 'diagnose', phase: 'Diagnose', agentType: 'general-purpose', model: MODELS.diagnose }
 )
 if (!diag) return { chapter: A.chapter_id, escalated: 'diagnose-failed', stage: 'Diagnose' }
 if (diag.flagged_count === 0) { log('体检通过，本章免修'); return { chapter: A.chapter_id, verdict: 'CLEAN', summary: diag.summary } }
@@ -86,7 +90,7 @@ const expl = await agent(
   '任务：读 ' + CH + '/retrofit/retrofit-plan.json，**只**对 flagged 机制（depth=shallow 或 figure!=ok）产出教学素材，写入 ' + CH + '/explainer/explainer.json（已存在则增量 Edit 合并）；trace 存 ' + CH + '/explainer/traces/。\n' +
   '本章有 implementation/ 则跑它取 trace（trace_source="run"）；没有则 trace_source="manual" 并写 manual_reason。figure!=ok 的机制补 figure-spec（重绘错图的 spec 里写清旧图错在哪）。\n' +
   '完成后自跑 `python3 ' + REPO + '/scripts/lint_explainer.py ' + CH + '` 无 BLOCKING。返回 status/note。' + ESC,
-  { schema: STATUS_SCHEMA, label: 'explain', phase: 'Explain', agentType: 'general-purpose' }
+  { schema: STATUS_SCHEMA, label: 'explain', phase: 'Explain', agentType: 'general-purpose', model: MODELS.explain }
 )
 if (expl && expl.status === 'BLOCKED') return { escalated: 'explain', stage: 'Explain', reason: expl.blocker_reason }
 
@@ -101,14 +105,14 @@ for (let b = 1; b <= 3; b++) {
     '每张新图强制：渲染 → Read PNG 亲眼看 → 六项自查全真才登记。\n' +
     (blindLedger.length ? '上一轮盲审 FAIL，必须修复：\n' + blindLedger.join('\n') + '\n' : '') +
     '完成后自跑 `python3 ' + REPO + '/scripts/lint_diagram_geometry.py ' + CH + '/diagrams/*.svg` 无问题。返回 status/note。' + ESC,
-    { schema: STATUS_SCHEMA, label: 'illustrate r' + b, phase: 'Illustrate', agentType: 'general-purpose' }
+    { schema: STATUS_SCHEMA, label: 'illustrate r' + b, phase: 'Illustrate', agentType: 'general-purpose', model: MODELS.illustrate }
   )
   if (ill && ill.status === 'BLOCKED') return { escalated: 'illustrate', stage: 'Illustrate', round: b, reason: ill.blocker_reason }
   blindV = await agent(
     '你是插图盲审员。**只准看**：' + CH + '/diagrams/figure-manifest.json 列出的每张 PNG（用 Read 打开图片）+ ' + CH + '/explainer/explainer.json 对应 figure_spec。禁止看 gen 代码与正文。\n' +
     '逐张：① 只看图复述论点；② 对照 spec.claim——不符 = FAIL；③ 图上数字逐个核 spec.numbers——不符 = FAIL；④ 明显不可读 = FAIL。verdict/notes 用 Edit 回填 manifest 的 blind_review。\n' +
     '返回 all_pass 与 failures（figure_id + problem + suggested_fix）。',
-    { schema: BLIND_SCHEMA, label: 'blind-review r' + b, phase: 'Illustrate', agentType: 'general-purpose' }
+    { schema: BLIND_SCHEMA, label: 'blind-review r' + b, phase: 'Illustrate', agentType: 'general-purpose', model: MODELS.blind }
   )
   if (blindV && blindV.all_pass) break
   blindLedger = ((blindV && blindV.failures) || []).map(function (f) { return '[' + f.figure_id + '] ' + f.problem + ' → ' + f.suggested_fix })
@@ -132,7 +136,7 @@ for (let r = 1; r <= 2; r++) {
     '要做：按 ' + CH + '/explainer/explainer.json 素材加深讲解（直觉→机制→源码三层，怎么衔接由你）；数值推演表进正文（表格前一行 `<!-- trace: <mechanism_id> -->`，数字不许改）；更新图引用（新图 ../diagrams/<id>.png，被替换旧图的引用与图注一并更新）。\n' +
     (issuesForWriter.length ? '上轮评审 issue（逐条采纳或带理由反驳）：\n' + JSON.stringify(issuesForWriter) + '\n' : '') +
     '完成后自跑 lint_trace_consistency / lint_anchors / lint_chapter_structure / lint_formulas / lint_punct 无 BLOCKING。返回 status/note。' + ESC,
-    { schema: STATUS_SCHEMA, label: 'patch-write r' + r, phase: 'PatchWrite', agentType: 'general-purpose' }
+    { schema: STATUS_SCHEMA, label: 'patch-write r' + r, phase: 'PatchWrite', agentType: 'general-purpose', model: MODELS.patch }
   )
   if (pw && pw.status === 'BLOCKED') return { escalated: 'patch-write', stage: 'PatchWrite', round: r, reason: pw.blocker_reason }
   phase('Review')
@@ -141,7 +145,7 @@ for (let r = 1; r <= 2; r++) {
       return agent(
         head('reviewer') +
         '任务：**只**从「' + dim + '」维度评审 ' + CH + '/narrative/chapter.md（对照 retrofit-plan.json 与 explainer.json）。每条 issue 给 suggested_fix + rationale + evidence，标 negotiable/blocking。该维度无 blocking issue → pass=true。',
-        { schema: DIM_SCHEMA, label: 'review:' + dim.slice(0, 9) + ' r' + r, phase: 'Review', agentType: 'general-purpose' }
+        { schema: DIM_SCHEMA, label: 'review:' + dim.slice(0, 9) + ' r' + r, phase: 'Review', agentType: 'general-purpose', model: MODELS.review }
       )
     }
   }))
@@ -165,7 +169,7 @@ const arch = await agent(
   '任务一：把这个 review 对象**原样**写入 ' + CH + '/reviews/retrofit-review.json：\n' + JSON.stringify(reviewV) + '\n' +
   '任务二：在 bible 的 figures.json 登记本章新图（{mechanism_id, figure_id, chapter_id: "' + A.chapter_id + '", claim}，文件在 instances/' + INST + '/book/bible/figures.json，不存在则创建）。\n' +
   '任务三：`python3 ' + REPO + '/scripts/archivist.py record --type delivery` 记 retrofit 交付并更新 trace/state.json。返回一句话状态。',
-  { label: 'archive', phase: 'Archive', agentType: 'general-purpose' }
+  { label: 'archive', phase: 'Archive', agentType: 'general-purpose', model: MODELS.archive }
 )
 
 return { chapter: A.chapter_id, verdict: 'RETROFITTED', flagged: diag.flagged_count, review: reviewV, archive: arch }
