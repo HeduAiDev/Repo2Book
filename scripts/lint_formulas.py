@@ -19,6 +19,27 @@ import re
 import sys
 from pathlib import Path
 
+# ── 单符号/简单变量 inline 公式判定（lint-exp-011）──
+# 判定为"简单"（不计入 too_many_inline_formulas 的密度分母）：单个希腊/拉丁字母，
+# 可带上下标（如 \delta、W^{UK}、L_{kv}、\alpha_i），或单个数字。
+# 含运算符（=、\frac、\sum、\prod、\int 等）或组合表达式一律视为"复杂"。
+_SIMPLE_INLINE_RE = re.compile(
+    r'^\\?[A-Za-z]+(?:_\{[^{}]*\}|_[A-Za-z0-9]+|\^\{[^{}]*\}|\^[A-Za-z0-9]+)*$'
+)
+_SIMPLE_NUMBER_RE = re.compile(r'^-?\d+(?:\.\d+)?$')
+
+
+def _is_simple_inline_formula(content: str) -> bool:
+    """单符号/简单变量 → True（不计入密度）；复杂表达式 → False（计入密度）。"""
+    c = content.strip()
+    if not c:
+        return True
+    if len(c) > 30:
+        return False
+    if _SIMPLE_NUMBER_RE.match(c):
+        return True
+    return bool(_SIMPLE_INLINE_RE.match(c))
+
 
 def lint_formulas(filepath: str) -> dict:
     """Run all formula checks. Returns {check_name: [issues]}."""
@@ -91,7 +112,9 @@ def lint_formulas(filepath: str) -> dict:
         if stripped == "" or stripped.startswith("#") or stripped.startswith("```"):
             if paragraph_lines:
                 para = " ".join(paragraph_lines)
-                inline_count = len(re.findall(r'(?<!\$)\$(?!\$)[^$]+\$(?!\$)', para))
+                inline_contents = re.findall(r'(?<!\$)\$(?!\$)([^$]+)\$(?!\$)', para)
+                complex_contents = [c for c in inline_contents if not _is_simple_inline_formula(c)]
+                inline_count = len(complex_contents)
                 if inline_count >= 3:
                     issues.append(
                         f"  Lines {current_start}-{i-1}: {inline_count} inline formulas "
