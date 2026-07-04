@@ -110,9 +110,11 @@ log('dossier 已通过对抗性核对')
 
 // ---------- Phase B/C: Implement (TDD) + Test，有界回环 ----------
 let ledger = []
+let implTestRounds = 0
 let testV = null
 if (!A.skip_impl) {
 for (let r = 1; r <= 3; r++) {
+  implTestRounds = r
   phase('Implement')
   const impl = await agent(
     head('implementer') +
@@ -176,6 +178,7 @@ const BLIND_SCHEMA = {
 }
 let blindV = null
 let blindLedger = []
+let blindHistory = []
 for (let b = 1; b <= 3; b++) {
   phase('Illustrate')
   const ill = await agent(
@@ -195,6 +198,7 @@ for (let b = 1; b <= 3; b++) {
     '返回 all_pass 与 failures（每条 figure_id + problem + suggested_fix）。',
     { schema: BLIND_SCHEMA, label: 'blind-review r' + b, phase: 'Illustrate', agentType: 'general-purpose', model: MODELS.blind }
   )
+  blindHistory.push({ round: b, failures: (blindV && blindV.failures) || [] })
   if (blindV && blindV.all_pass) break
   blindLedger = ((blindV && blindV.failures) || []).map(function (f) { return '[' + f.figure_id + '] ' + f.problem + ' → ' + f.suggested_fix })
   log('盲审第 ' + b + ' 轮 FAIL：' + blindLedger.length + ' 张图打回 illustrator')
@@ -236,7 +240,9 @@ const DIMS = [
   'figure-integration（先跑 lint_diagrams；然后逐张用 Read 打开 PNG 亲眼看：图在其机制讲解附近？图注给结论而非描述画面？正文数字与图上一致？图对读懂机制真有帮助？）',
   'formula-structure（公式规则+Roadmap 开场+自包含+锚点/半角，跑 lint_formulas/lint_anchors/lint_punct/lint_chapter_structure）',
 ]
+let reviewRounds = 0
 for (let r = 1; r <= 3; r++) {
+  reviewRounds = r
   phase('Review')
   const dimThunks = DIMS.map(function (dim) {
     return function () {
@@ -291,9 +297,18 @@ phase('Archive')
 // 完整 review 对象注入提示词 → review-report.json 忠实落盘(含 verdict 与全部 issues)，
 // 不让 archivist 凭记忆重建出有损版本。
 const reviewJson = JSON.stringify(reviewV || { overall_verdict: 'UNKNOWN', issues: [] })
+const runLedger = JSON.stringify({
+  chapter_id: A.chapter_id,
+  kind: PRIMER ? 'primer' : (A.skip_impl ? 'meta' : 'code'),
+  impl_test_rounds: implTestRounds, impl_test_ledger: ledger,
+  write_review_rounds: reviewRounds,
+  blind_rounds: blindHistory.length, blind_failures: blindHistory,
+  escalated: null,
+})
 const archiveTask = head('archivist') +
   '任务一(务必先做)：把下面这个完整 review 对象**原样**写入 ' + CH + '/reviews/review-report.json（保留 verdict 与全部 issues，不要删改、不要自己重写摘要）：\n' +
   reviewJson + '\n' +
+  '任务一b：把这个 run-ledger 对象**原样**写入 ' + CH + '/reviews/run-ledger.json（经验回流的信号源，不要改写）：\n' + runLedger + '\n' +
   '任务二：回写 Book Bible —— 登记本章精简版新接口（`python3 ' + REPO + '/scripts/bible.py iface --add ' + A.chapter_id + " '<sig>'`)，确认已回收伏笔。\n" +
   '任务三：在 ' + REPO + '/instances/' + INST + '/trace/ 记 delivery 并更新 state.json。返回一句话状态。'
 let archV = null
