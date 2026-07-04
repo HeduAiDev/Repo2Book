@@ -7,7 +7,7 @@
 | id | 日期 | pattern | 落点(文件) | 针对指标 | 状态 |
 |---|---|---|---|---|---|
 | exp-0705-1 | 2026-07-05 | primer 章含 engineering-only 机制时 lint_dossier 强制 paper_origin 误伤(ch32 实例) | scripts/lint_dossier.py(paper_origin_note 豁免) | lint_dossier 对 primer 章误报数 | active |
-| exp-0705-2 | 2026-07-05 | lint_paper_grounding 只读 paper.md,多论文包(paper-mtp.md 等)小节核对误报(ch33 评审发现) | docs/superpowers/plans/briefs/lint-exp-N2.md(linter:lint_paper_grounding) | paper_ref 误报数 | pending-brief |
+| exp-0705-2 | 2026-07-05 | lint_paper_grounding 只读 paper.md,多论文包(paper-mtp.md 等)小节核对误报(ch33 评审发现) | scripts/lint_paper_grounding.py(复核:现状已 glob 全部 *.md 拼接,误报已由其他改动连带修复;仅补 scripts/tests/test_lint_paper_grounding.py 回归测试固化) | paper_ref 误报数 | active |
 | exp-0705-3 | 2026-07-05 | 术语/缩写/硬件型号/内部 flag/自定义 API 首现处不给一句人话释义,靠 reviewer 逐条枚举打回(合并 exp-wisdom-4) | .claude/agents/writer.md | reviewer reader-comprehension 维度 issue 条数 | active |
 | exp-0705-4 | 2026-07-05 | 多维并行评审的维度划分有重叠,同一处内容偏差被两个维度/两轮各写一遍近乎逐字重复的 issue | .claude/agents/reviewer.md | review-report.json 重复/近重复 issue 条数 | active |
 | exp-0705-5 | 2026-07-05 | explainer 选的 worked example 参数落在退化/巧合分支(整除嵌套/位移0/前后相等/经验=理论),机制效果数字不可见 | .claude/agents/explainer.md | reviewer algorithm 维度"示例落退化值"issue 条数 | active |
