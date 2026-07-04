@@ -33,6 +33,10 @@ const INST = A.instance || 'vllm'
 const SRC = A.source_root || (REPO + '/instances/' + INST + '/source')
 const CH = REPO + '/instances/' + INST + '/artifacts/' + A.slug
 const HL = A.highlight || A.subsystem || ''
+// 模型分配(spec §7:全流水线 opus/sonnet,不继承主会话模型;args.models 可覆盖)
+const MODELS = Object.assign(
+  { analyst: 'opus', verify: 'opus', implement: 'sonnet', test: 'sonnet', explain: 'opus', illustrate: 'sonnet', blind: 'sonnet', write: 'opus', review: 'sonnet', archive: 'sonnet' },
+  A.models || {})
 const PRIMER = A.kind === 'primer'
 const PAPERS = REPO + '/instances/' + INST + '/book/papers/' + A.slug
 const PATHS = (A.paths || []).join(', ')
@@ -84,7 +88,7 @@ const dossierV = await agent(
   'dossier.json 字段：code_spine、embed_excerpts(逐字真实源码片段+可省略分支说明，带 vllm/...:Lxxx)、key_classes、data_flow、design_decisions、theory、subtraction_plan{delete:[{what,why_safe}], must_keep:[{symbol,why} 可检测符号]}、mechanisms[{id,name,kind:algorithm|dataflow|layout|protocol|config,source_anchors,needs_figure,needs_worked_example,difficulty:core|supporting}](v3 账本：宁多登记勿漏)、foreshadow_due。\n' +
   (PRIMER ? '本章是 primer 原理章：深读论文包 ' + PAPERS + '/paper.md 与落地代码（' + PATHS + '）。dossier.json 顶层写 "kind":"primer"；每个机制**必填** paper_origin{paper,sections}；embed_excerpts 可含论文公式（带 §/Eq 锚）与代码双源；subtraction_plan 留空对象（primer 不做减法）。\n' : '') +
   'must_keep 要把"读者需理解、writer 需讲清"的符号都放进去（宁多留勿误删）。只描述真实源码，禁止杜撰。完成后自跑 `python3 ' + REPO + '/scripts/lint_dossier.py ' + CH + '` 确保无 BLOCKING。返回 status/note。' + ESC,
-  { schema: STATUS_SCHEMA, label: 'dossier', phase: 'Dossier', agentType: 'general-purpose' }
+  { schema: STATUS_SCHEMA, label: 'dossier', phase: 'Dossier', agentType: 'general-purpose', model: MODELS.analyst }
 )
 if (dossierV && dossierV.status === 'BLOCKED') return { escalated: 'dossier', stage: 'Dossier', reason: dossierV.blocker_reason }
 
@@ -94,7 +98,7 @@ const dv = await agent(
   'mechanisms 是否完整——有无漏掉读者必须懂的机制？needs_figure/needs_worked_example/difficulty 标得对吗？\n' +
   (PRIMER ? '（PRIMER）确认 dossier.json 顶层有 "kind":"primer"——没有则 sound=false。\n' : '') +
   '返回 sound（是否可放行）与 problems（具体问题列表）。',
-  { schema: VERIFY_SCHEMA, label: 'dossier-verify', phase: 'Dossier', agentType: 'general-purpose' }
+  { schema: VERIFY_SCHEMA, label: 'dossier-verify', phase: 'Dossier', agentType: 'general-purpose', model: MODELS.verify }
 )
 if (dv && dv.sound === false) return { escalated: 'dossier-verify', stage: 'Dossier', problems: dv.problems }
 log('dossier 已通过对抗性核对')
@@ -119,7 +123,7 @@ for (let r = 1; r <= 3; r++) {
         '每 def/class 标 `# SOURCE: vllm/...:Lxxx`；删除标 `# SUBTRACTED:`。\n' +
         '**只可删除 subtraction_plan.delete 批准项；must_keep 符号必须保留；不得按己见删其他细节**（lint_fidelity 会校验 must_keep 都在）。\n' +
         '完成后自跑 `python3 ' + REPO + '/scripts/lint_fidelity.py ' + CH + '` 确保无 BLOCKING。返回 status/note。' + ESC),
-    { schema: STATUS_SCHEMA, label: 'implement r' + r, phase: 'Implement', agentType: 'general-purpose' }
+    { schema: STATUS_SCHEMA, label: 'implement r' + r, phase: 'Implement', agentType: 'general-purpose', model: MODELS.implement }
   )
   if (impl && impl.status === 'BLOCKED') return { escalated: 'implement', stage: 'Implement', round: r, reason: impl.blocker_reason }
   phase('Test')
@@ -131,7 +135,7 @@ for (let r = 1; r <= 3; r++) {
         '精简版纯测试：`python3 -m pytest ' + CH + '/tests -q`（纯控制流，无需加速器）。若精简版 import 了目标仓/加速器运行时而 host 跑不动：按 ' + REPO + '/instances/' + INST + '/INSTANCE.md 的运行约束处理——只验可读控制流、行为以源码为准（vLLM 实例可用 ' + REPO + '/scripts/vllm_docker.sh）。\n' +
         '写 ' + CH + '/tests/test-report.json（含 verdict；若用容器记录 docker 命令+镜像 tag+vllm 版本）。\n' +
         '全过且 lint_fidelity 无 BLOCKING → verdict=APPROVED；否则 REJECTED 且 failures 写清失败摘要。'),
-    { schema: TEST_SCHEMA, label: 'test r' + r, phase: 'Test', agentType: 'general-purpose' }
+    { schema: TEST_SCHEMA, label: 'test r' + r, phase: 'Test', agentType: 'general-purpose', model: MODELS.test }
   )
   if (testV && testV.verdict === 'APPROVED') break
   ledger.push('[round ' + r + '] ' + (testV ? testV.failures : 'tester error'))
@@ -152,7 +156,7 @@ const expl = await agent(
     : '优先写驱动脚本跑精简版取 trace（trace_source="run"）——表格每个数字必须能在 trace 里找到。\n') +
   '每个 needs_figure 机制至少 1 个 figure-spec（claim 一句话、numbers 全带 provenance、caption_draft 给结论）。\n' +
   '完成后自跑 `python3 ' + REPO + '/scripts/lint_explainer.py ' + CH + '` 确保无 BLOCKING。返回 status/note。' + ESC,
-  { schema: STATUS_SCHEMA, label: 'explain', phase: 'Explain', agentType: 'general-purpose' }
+  { schema: STATUS_SCHEMA, label: 'explain', phase: 'Explain', agentType: 'general-purpose', model: MODELS.explain }
 )
 if (expl && expl.status === 'BLOCKED') return { escalated: 'explain', stage: 'Explain', reason: expl.blocker_reason }
 
@@ -176,7 +180,7 @@ for (let b = 1; b <= 3; b++) {
     '并生成本章 roadmap：`python3 ' + REPO + '/instances/' + INST + '/book/assets/roadmap/roadmap.py --highlight "' + HL + '" --out ' + CH + '/diagrams/roadmap.svg`，rsvg-convert -z 2 转 PNG（**勿用 ImageMagick convert**）。\n' +
     (blindLedger.length ? '上一轮盲审 FAIL，必须修复后重渲重看：\n' + blindLedger.join('\n') + '\n' : '') +
     '完成后自跑 `python3 ' + REPO + '/scripts/lint_diagram_geometry.py ' + CH + '/diagrams/*.svg` 确保无问题。返回 status/note。' + ESC,
-    { schema: STATUS_SCHEMA, label: 'illustrate r' + b, phase: 'Illustrate', agentType: 'general-purpose' }
+    { schema: STATUS_SCHEMA, label: 'illustrate r' + b, phase: 'Illustrate', agentType: 'general-purpose', model: MODELS.illustrate }
   )
   if (ill && ill.status === 'BLOCKED') return { escalated: 'illustrate', stage: 'Illustrate', round: b, reason: ill.blocker_reason }
   blindV = await agent(
@@ -184,7 +188,7 @@ for (let b = 1; b <= 3; b++) {
     '逐张图做四步：① 只看图，用自己的话复述这张图的论点；② 与 spec.claim 对照——复述对不上 = FAIL；③ 图上每个数字与 spec.numbers 逐个核对——对不上 = FAIL；④ 明显不可读（文字重叠/箭头悬空/不知从哪看起）= FAIL。\n' +
     '把每张图的 verdict（PASS/FAIL）与 notes 用 Edit 回填 figure-manifest.json 的 blind_review 字段。\n' +
     '返回 all_pass 与 failures（每条 figure_id + problem + suggested_fix）。',
-    { schema: BLIND_SCHEMA, label: 'blind-review r' + b, phase: 'Illustrate', agentType: 'general-purpose' }
+    { schema: BLIND_SCHEMA, label: 'blind-review r' + b, phase: 'Illustrate', agentType: 'general-purpose', model: MODELS.blind }
   )
   if (blindV && blindV.all_pass) break
   blindLedger = ((blindV && blindV.failures) || []).map(function (f) { return '[' + f.figure_id + '] ' + f.problem + ' → ' + f.suggested_fix })
@@ -211,7 +215,7 @@ writeV = await agent(
   '埋伏笔、`python3 ' + REPO + '/scripts/bible.py payoff --resolve` 回收应回收项。\n' +
   '**零脚手架泄漏**：规范 vllm/ 路径、自然标题(无 Cell N)、不提内部文件。\n' +
   '完成后自跑' + (PRIMER ? '五个 linter（chapter_structure/formulas/source_grounding/trace_consistency/paper_grounding --expect-primer，primer 章不跑 fidelity）' : (A.skip_impl ? '四个 linter（chapter_structure/formulas/source_grounding/trace_consistency，本章无精简版故不跑 fidelity）' : '五个 linter（chapter_structure/formulas/source_grounding/fidelity/trace_consistency）')) + '均无 BLOCKING（图的 linter 归 illustrator，不用你跑）。返回 status/note。' + ESC,
-  { schema: STATUS_SCHEMA, label: 'write r' + w, phase: 'Write', agentType: 'general-purpose' }
+  { schema: STATUS_SCHEMA, label: 'write r' + w, phase: 'Write', agentType: 'general-purpose', model: MODELS.write }
 )
 }
 if (!writeV) return { chapter: A.chapter_id, escalated: 'write-failed', stage: 'Write', note: 'writer 多轮失败(限流/崩溃)，无 chapter.md，不进评审' }
@@ -236,7 +240,7 @@ for (let r = 1; r <= 3; r++) {
         '任务：**只**从「' + dim + '」维度评审 ' + CH + '/narrative/chapter.md（对照 ' + CH + '/dossier/dossier.json 与 Book Bible）。\n' +
         '机械维度先跑对应 linter（' + REPO + '/scripts/lint_*.py）。\n' +
         '协作式：每条 issue 必须给 suggested_fix + rationale，标 negotiable/blocking。该维度无 blocking issue → pass=true。',
-        { schema: DIM_SCHEMA, label: 'review:' + dim.slice(0, 6) + ' r' + r, phase: 'Review', agentType: 'general-purpose' }
+        { schema: DIM_SCHEMA, label: 'review:' + dim.slice(0, 6) + ' r' + r, phase: 'Review', agentType: 'general-purpose', model: MODELS.review }
       )
     }
   })
@@ -266,7 +270,7 @@ for (let r = 1; r <= 3; r++) {
     head('writer') +
     '评审 REVISE（第 ' + r + ' 轮）。用 receiving-code-review skill 逐条处理（采纳或带理由反驳），改 ' + CH + '/narrative/chapter.md：\n' +
     JSON.stringify(issues) + '\n完成后自跑' + (PRIMER ? '五个 linter（chapter_structure/formulas/source_grounding/trace_consistency/paper_grounding --expect-primer，primer 章不跑 fidelity）' : (A.skip_impl ? '四个 linter（chapter_structure/formulas/source_grounding/trace_consistency）' : '五个 linter（chapter_structure/formulas/source_grounding/fidelity/trace_consistency）')) + '均无 BLOCKING。返回 status/note。' + ESC,
-    { schema: STATUS_SCHEMA, label: 'revise r' + r, phase: 'Review', agentType: 'general-purpose' }
+    { schema: STATUS_SCHEMA, label: 'revise r' + r, phase: 'Review', agentType: 'general-purpose', model: MODELS.write }
   )
   if (rev && rev.status === 'BLOCKED') return { escalated: 'review-revise', stage: 'Review', round: r, reason: rev.blocker_reason }
   reviewV = { verdict: 'REVISE', issues: issues }
@@ -292,7 +296,7 @@ for (let a = 1; a <= 2 && !archV; a++) {
   if (a > 1) log('archive 上轮中断(API崩)，第 ' + a + ' 轮重试：已写的(review-report.json/bible 接口/trace)校验后跳过，只补未完成的')
   archV = await agent(
     archiveTask + (a > 1 ? '\n注意：这是重试。先检查 review-report.json 是否已存在且为合法完整 JSON、bible 是否已登记本章接口，已做的别重复，只补未完成的。' : ''),
-    { label: 'archive r' + a, phase: 'Archive', agentType: 'general-purpose' }
+    { label: 'archive r' + a, phase: 'Archive', agentType: 'general-purpose', model: MODELS.archive }
   )
 }
 
