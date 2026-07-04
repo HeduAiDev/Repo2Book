@@ -90,7 +90,8 @@ const dossierV = await agent(
   'must_keep 要把"读者需理解、writer 需讲清"的符号都放进去（宁多留勿误删）。只描述真实源码，禁止杜撰。完成后自跑 `python3 ' + REPO + '/scripts/lint_dossier.py ' + CH + '` 确保无 BLOCKING。返回 status/note。' + ESC,
   { schema: STATUS_SCHEMA, label: 'dossier', phase: 'Dossier', agentType: 'general-purpose', model: MODELS.analyst }
 )
-if (dossierV && dossierV.status === 'BLOCKED') return { escalated: 'dossier', stage: 'Dossier', reason: dossierV.blocker_reason }
+if (!dossierV) return { chapter: A.chapter_id, escalated: 'dossier-failed', stage: 'Dossier', note: 'dossier agent 失败（限流/崩溃），无档案不得继续' }
+if (dossierV.status === 'BLOCKED') return { escalated: 'dossier', stage: 'Dossier', reason: dossierV.blocker_reason }
 
 const dv = await agent(
   head('analyst') +
@@ -100,7 +101,8 @@ const dv = await agent(
   '返回 sound（是否可放行）与 problems（具体问题列表）。',
   { schema: VERIFY_SCHEMA, label: 'dossier-verify', phase: 'Dossier', agentType: 'general-purpose', model: MODELS.verify }
 )
-if (dv && dv.sound === false) return { escalated: 'dossier-verify', stage: 'Dossier', problems: dv.problems }
+if (!dv) return { chapter: A.chapter_id, escalated: 'dossier-verify-failed', stage: 'Dossier', note: 'dossier 对抗性自核 agent 失败（限流/崩溃），未核对不得放行' }
+if (dv.sound === false) return { escalated: 'dossier-verify', stage: 'Dossier', problems: dv.problems }
 log('dossier 已通过对抗性核对')
 } else {
   log('复用已人工审核的 dossier，跳过档案阶段')
@@ -125,7 +127,8 @@ for (let r = 1; r <= 3; r++) {
         '完成后自跑 `python3 ' + REPO + '/scripts/lint_fidelity.py ' + CH + '` 确保无 BLOCKING。返回 status/note。' + ESC),
     { schema: STATUS_SCHEMA, label: 'implement r' + r, phase: 'Implement', agentType: 'general-purpose', model: MODELS.implement }
   )
-  if (impl && impl.status === 'BLOCKED') return { escalated: 'implement', stage: 'Implement', round: r, reason: impl.blocker_reason }
+  if (!impl) { ledger.push('[round ' + r + '] implementer error（限流/崩溃）'); testV = null; continue }
+  if (impl.status === 'BLOCKED') return { escalated: 'implement', stage: 'Implement', round: r, reason: impl.blocker_reason }
   phase('Test')
   testV = await agent(
     head('tester') +
@@ -158,7 +161,8 @@ const expl = await agent(
   '完成后自跑 `python3 ' + REPO + '/scripts/lint_explainer.py ' + CH + '` 确保无 BLOCKING。返回 status/note。' + ESC,
   { schema: STATUS_SCHEMA, label: 'explain', phase: 'Explain', agentType: 'general-purpose', model: MODELS.explain }
 )
-if (expl && expl.status === 'BLOCKED') return { escalated: 'explain', stage: 'Explain', reason: expl.blocker_reason }
+if (!expl) return { chapter: A.chapter_id, escalated: 'explain-failed', stage: 'Explain', note: 'explainer agent 失败（限流/崩溃），无素材不得继续' }
+if (expl.status === 'BLOCKED') return { escalated: 'explain', stage: 'Explain', reason: expl.blocker_reason }
 
 // ---------- Phase C3: Illustrate（绘图 → 视觉自查 → 盲审门禁，有界回环） ----------
 const BLIND_SCHEMA = {
@@ -182,7 +186,8 @@ for (let b = 1; b <= 3; b++) {
     '完成后自跑 `python3 ' + REPO + '/scripts/lint_diagram_geometry.py ' + CH + '/diagrams/*.svg` 确保无问题。返回 status/note。' + ESC,
     { schema: STATUS_SCHEMA, label: 'illustrate r' + b, phase: 'Illustrate', agentType: 'general-purpose', model: MODELS.illustrate }
   )
-  if (ill && ill.status === 'BLOCKED') return { escalated: 'illustrate', stage: 'Illustrate', round: b, reason: ill.blocker_reason }
+  if (!ill) return { chapter: A.chapter_id, escalated: 'illustrate-failed', stage: 'Illustrate', round: b, note: 'illustrator agent 失败（限流/崩溃）' }
+  if (ill.status === 'BLOCKED') return { escalated: 'illustrate', stage: 'Illustrate', round: b, reason: ill.blocker_reason }
   blindV = await agent(
     '你是插图盲审员。**只准看**：' + CH + '/diagrams/figure-manifest.json 列出的每张 PNG（用 Read 打开图片文件）+ ' + CH + '/explainer/explainer.json 里对应的 figure_spec。**禁止**看 gen_*.py 生成代码、禁止看正文章节。\n' +
     '逐张图做四步：① 只看图，用自己的话复述这张图的论点；② 与 spec.claim 对照——复述对不上 = FAIL；③ 图上每个数字与 spec.numbers 逐个核对——对不上 = FAIL；④ 明显不可读（文字重叠/箭头悬空/不知从哪看起）= FAIL。\n' +
