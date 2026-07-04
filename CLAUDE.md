@@ -63,9 +63,9 @@ python3 scripts/lint_diagram_geometry.py --all   # 图：文字越界/相撞/压
 - **连贯性审计**：每完成一个 Part 跑并行审计（未回收伏笔/术语漂移/接口不符）。
 
 ## 记忆体系
-- **Archivist**（唯一全书持久角色）：trace 长期记忆 + Book Bible + 再水化简报。`scripts/archivist.py`（按 `repo2book.json.active_instance` 定位实例）。
-- **knowledge/**（仓库特定事实，TTL，每实例）+ **wisdom/**（跨实例模式，2+ 实例出现才提升）：写前查、收工后 `scripts/learn.py extract`。
-- **架构师自身连贯性**：本 CLAUDE.md + RUNBOOK + 实例 INSTANCE.md + trace 决策记录——保证失忆/换会话后仍能运转工厂。
+- **Archivist**(唯一全书持久角色):trace 长期记忆 + Book Bible + concepts.json。`scripts/archivist.py`。
+- **经验回流**(替代已退役的 wisdom/knowledge):每章落盘 `reviews/run-ledger.json`(回环轮数/盲审史);批次收尾跑 `book-retro` workflow 挖经验候选(≥2 章重复才算)→ Lead 批准 → curator 落笔进 linter/契约/skill/RUNBOOK/INSTANCE → 台账 `docs/superpowers/experience-ledger.md` 记录并在下次复盘验证生效(复发即升级落点)。
+- **架构师自身连贯性**:本 CLAUDE.md + RUNBOOK + 实例 INSTANCE.md + trace 决策记录。
 
 ## 公式规则（NON-NEGOTIABLE，auto-REJECT）
 `\text{}`→`\mathrm{}`；`\boxed{}`→markdown 粗体标题；`\tag*{}`→`$$` 外；inline `\frac`→提升为 `$$` 块；`$$` 与内容分行。inline 仅限单符号/简单式。

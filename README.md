@@ -56,7 +56,7 @@ python3 scripts/new_instance.py redis \
 
 **质量闸门**（确定性 linter，前置于 LLM 评审）：保真度、章节结构、公式可渲染、源码根基、章内锚点、半角标点、图形几何（文字越界/相撞/压框/箭头悬空）。
 
-**跨章连贯性**：每实例一本 **Book Bible**（术语/接口/伏笔回收/声线），archivist 持有；**wisdom/** 收跨实例通用模式。
+**跨章连贯性**：每实例一本 **Book Bible**（术语/接口/伏笔回收/声线），archivist 持有；**经验回流**：复盘 workflow 把反复出现的问题沉淀进 linter/契约/skill（台账验证生效）。
 
 ---
 
@@ -71,14 +71,12 @@ docs/superpowers/               设计 spec / 实施 plan / ARCHITECT-RUNBOOK（
 .claude/workflows/              chapter-pipeline.js（单章）/ chapter-retrofit.js（回修）/ book-gap-audit.js（审计）
 .claude/skills/                 svg-diagram 等技能
 schemas/                        book_outline / chapter_context JSON schema
-wisdom/                         跨实例通用模式
-scripts/                        实例解析 + linter + bible/archivist/learn + new_instance
+scripts/                        实例解析 + linter + bible/archivist + retro 台账见 docs/superpowers/experience-ledger.md + new_instance
 instances/<name>/               一本书 = 一个实例
   ├── repo2book.json            实例配置（源仓 URL / 书名 / 读者画像 / 版本）
   ├── INSTANCE.md               实例的当前状态 + 专属硬规则
   ├── source/                   目标仓真实源码（blobless clone，gitignored）
   ├── book/{cartography,bible,assets}   架构地图 / Bible / Roadmap 资产
-  ├── knowledge/                仓库特定事实（TTL）
   ├── trace/                    项目长期记忆（archivist 持有）
   └── artifacts/chNN-slug/      每章：dossier/implementation/tests/narrative/diagrams/reviews
 ```
@@ -99,7 +97,6 @@ instances/<name>/               一本书 = 一个实例
 | `lint_anchors / lint_punct / lint_diagram_geometry / lint_diagrams` | 锚点 / 半角标点 / 图形几何 / 图有效性+盲审登记 |
 | `bible.py` | 跨章连贯性 CLI（伏笔 due/回收、术语、接口注册） |
 | `archivist.py` | 长期记忆 / trace / 状态 |
-| `learn.py` | 收工后抽取 knowledge / wisdom |
 | `remap_lines_v021.py` | 源码升级时把行号引用确定性重映射到新版本（difflib 行级对齐，可复用于任意实例升级） |
 
 ---
@@ -109,4 +106,4 @@ instances/<name>/               一本书 = 一个实例
 - **`CLAUDE.md`** — 通用操作手册（每会话自动加载）。
 - **`docs/superpowers/ARCHITECT-RUNBOOK.md`** — 发车 / 监控 / 逃生舱 / 续跑。
 - **`instances/<active>/INSTANCE.md`** — 当前在写这本书的源码版本、状态、专属规则。
-- **`docs/superpowers/specs/…`** — 方法论与设计依据（以 vLLM 为首例，方法论通用）。
+- **`docs/superpowers/specs/…`** — 方法论与设计依据（以 vLLM 为首例，方法论通用）。 

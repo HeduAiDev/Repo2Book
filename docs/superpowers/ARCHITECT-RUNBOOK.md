@@ -36,14 +36,15 @@ scripts/lint_dossier.py  lint_explainer.py  lint_trace_consistency.py    ← v3 
 scripts/instance.py       ← 活动实例解析（去仓库化核心；linter --all 据它扫）
 scripts/new_instance.py   ← 新建一本书（scaffold 实例 + 克隆源仓）
 scripts/bible.py          ← 跨章连贯性 CLI（due/foreshadow/payoff/term/iface）
-scripts/archivist.py learn.py   ← 长期记忆 / 自学习
+scripts/archivist.py            ← 长期记忆 / trace / 状态
 scripts/remap_lines_v021.py     ← 源码升级时行号确定性重映射（可复用于任意实例）
 instances/<active>/repo2book.json + INSTANCE.md         ← 实例配置 + 当前状态/专属规则
 instances/<active>/source/                              ← 目标仓真实源码（blobless clone）
 instances/<active>/book/{cartography,bible,assets}/     ← 架构地图 + 大纲 / Book Bible / Roadmap 母版
-instances/<active>/artifacts/chNN-slug/                 ← 每章产物（ch- 前缀 slug）
-instances/<active>/{knowledge,trace}/                   ← 仓库事实(TTL) / 项目长期记忆
+instances/<active>/artifacts/chNN-slug/                 ← 每章产物（ch- 前缀 slug，含 reviews/run-ledger.json 回环账本）
+instances/<active>/trace/                               ← 项目长期记忆
 docs/superpowers/{specs,plans}/                         ← 设计 + 计划
+docs/superpowers/experience-ledger.md                   ← 经验回流台账
 （当前 active = vllm；其源码 @ v0.21.0，调试进容器 scripts/vllm_docker.sh，详见 instances/vllm/INSTANCE.md）
 ```
 
@@ -112,6 +113,7 @@ primer 章 = 论文精读章(动机→推导→数值→落地),豁免 subtract-
 | `review-agents-failed` | 评审并行 agent 部分失败（限流/崩溃），评审未完成，不假通过 | `round`、`note` | 排查失败原因 → 续跑 |
 | `review-revise` | 评审回环中 writer 再次 BLOCKED | `round`、`reason` | 同上 → 续跑 |
 | `review-exhausted` | 评审 3 轮仍有 blocking（兑现">3 轮升级"） | `issues`（数组） | 我介入：修提示词/dossier，或命名 agent+SendMessage 活体迭代 → 续跑 |
+处理任何升级时，顺手补写该章 `reviews/run-ledger.json` 的 `escalated` 字段（早退章不经过 Archive，信号靠 Lead 补记）。
 - **agent 不能自己联系我或杀 workflow**，只能返回 BLOCKED 拉闸；我也可随时 `TaskStop`。
 - **续跑**：`Workflow({scriptPath:".claude/workflows/chapter-pipeline.js", resumeFromRunId:"<上次 runId>"})`，已完成阶段命中缓存。
 - **Workflow 入参**：发车可用 `name:"chapter-pipeline"`（已注册）或 `scriptPath`；**续跑必须 `scriptPath` + `resumeFromRunId`**。
@@ -143,6 +145,14 @@ jq -r '.overall_verdict' $D/reviews/review-report.json
 - 试点/每章复盘 → **改提示词不改章节**（HARD RULE）。fidelity 阈值不合适 → 改 `scripts/lint_fidelity.py` 常量 + 测试。
 - 重大决策/转向 → `python3 scripts/archivist.py record --type decision ...` 存进 trace，并更新本手册 + CLAUDE.md。
 - superpowers skills 落点见 spec §8（brainstorming/writing-plans/TDD/verification/receiving-code-review/...）。
+
+## 复盘发车(book-retro,经验回流)
+
+批次/Part 收尾时:`Workflow({name:"book-retro", args:{instance, chapters:[slug]|null, date:"YYYY-MM-DD"}})`
+→ 报告在 `instances/<x>/book/retro/`。Lead 逐条批(改落点/措辞/驳回)→ 派 curator(.claude/agents/curator.md)
+按批准清单落笔 → 台账 `docs/superpowers/experience-ledger.md` 自动追加。
+linter 类候选:curator 产 SDD 简报,Lead 另走 TDD 小任务。
+复发判定:retro 对照台账,active 条目 pattern 再现 = 沉淀无效 → 升级落点(契约→linter)。
 
 ## 9.5 全书批量循环（goal: 完成全书编写）
 
