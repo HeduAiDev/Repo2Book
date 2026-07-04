@@ -120,18 +120,34 @@ def lint_source_grounding(chapter_dir: str) -> dict:
             )
     results["source_mapping_table"] = issues
 
-    # ── Check 4: vLLM files listed in impl-notes ──
+    # ── Check 4: vLLM source files referenced (发布正文为准，非内部 impl-notes.md) ──
+    # 实例无关：用活动实例规范前缀 + 对照基座前缀（姊妹篇引用基座 vllm/ 也算）计源码文件
+    alt = "|".join(re.escape(p) for p in _SRC_PREFIXES)
+    src_ref_re = rf'(?:{alt})/[\w/]+\.py'
+    issues = []
+    if narrative.exists():
+        text = narrative.read_text(encoding="utf-8")
+        src_files = set(re.findall(src_ref_re, text))
+        if len(src_files) < 3:
+            issues.append(
+                f"  Only {len(src_files)} source files referenced in narrative "
+                f"({'/'.join(_SRC_PREFIXES)}; need >= 3)"
+            )
+    # chapter.md 尚不存在（写作前跑）：不判 FAIL，跳过——落到下面的 impl-notes 提示项自查即可。
+    results["vllm_files_listed"] = issues
+
+    # ── Check 4b: impl-notes.md 源文件登记完整性（非阻断提示，供 implementer 自查）──
     issues = []
     if impl_notes.exists():
         notes = impl_notes.read_text(encoding="utf-8")
-        # 实例无关：用活动实例规范前缀 + 对照基座前缀（姊妹篇引用基座 vllm/ 也算）计源码文件
-        alt = "|".join(re.escape(p) for p in _SRC_PREFIXES)
-        src_files = set(re.findall(rf'(?:{alt})/[\w/]+\.py', notes))
+        src_files = set(re.findall(src_ref_re, notes))
         if len(src_files) < 3:
             issues.append(
-                f"  Only {len(src_files)} source files mentioned ({'/'.join(_SRC_PREFIXES)}; need >= 3)"
+                f"  [info] impl-notes.md only lists {len(src_files)} source files "
+                f"({'/'.join(_SRC_PREFIXES)}; need >= 3) — internal bookkeeping only, "
+                f"does not affect narrative grounding"
             )
-    results["vllm_files_listed"] = issues
+    results["impl_notes_incomplete"] = issues
 
     return results
 
