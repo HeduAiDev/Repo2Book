@@ -55,7 +55,7 @@ const mined = await parallel(slugs.map(function (slug) {
     return agent(
       '你是经验信号挖掘员。**只读**：' + ARTS + '/' + slug + '/reviews/ 下的 review-report.json、run-ledger.json、retrofit-review.json（存在哪个读哪个）+ ' + BOOK + '/audits/ 里涉及本章的条目（目录可能不存在）。\n' +
       '任务：挑出**指向流程/提示词/门禁缺陷**的信号——不是本章内容问题本身，而是「什么样的问题反复让 agent 犯错」。看：blocking issue 的成因类型、回环 >1 轮的原因、盲审 FAIL 的原因、escalated 记录。\n' +
-      '每条返回 {signal(一句话概括问题类型), evidence(引用原文≤60字), candidate_rule(若要根除，一句话规则该写成什么), source(文件名+定位)}。\n' +
+      '每条返回 {signal(一句话概括问题类型), evidence(引用原文≤60字), candidate_rule(若要根除，一句话规则该写成什么), source(文件名+定位；**若该 issue 带 dimension 字段（如 reader-comprehension）必须在 source 里注明**——聚类的 reader 降权靠它识别)}。\n' +
       '章级一次性内容错误（如某行号写错）不算信号，返回时跳过。没有信号返回 signals=[]。',
       { schema: MINE_SCHEMA, label: 'mine:' + slug.slice(0, 12), phase: 'Mine', model: 'sonnet', agentType: 'general-purpose' }
     ).then(function (r) { return { slug: slug, signals: (r && r.signals) || [] } })
