@@ -17,7 +17,7 @@
 ## ⛔ HARD RULES
 
 1. **叙事守护**：主编排者**不得**直接写/编 `artifacts/*/narrative/chapter.md`——只有 Writer 角色可写。质量不对就**改提示词，不改章节内容**。
-2. **只做减法不做加法**：implementer 产出的精简版与源码**同名/同结构/同控制流，只删不增**，不杜撰源码没有的东西。
+2. **只做减法不做加法**：implementer 产出的精简版与源码**同名/同结构/同控制流，只删不增**，不杜撰源码没有的东西。（**唯一豁免**：kind=primer 原理章——论文忠实参考实现，成对门禁 lint_paper_grounding，见 RUNBOOK）
 3. **零脚手架泄漏**：正文是正式出版物——规范源码路径（如 `vllm/...`，**绝不** `instances/<x>/source/`）、自然标题（**绝不** "Cell N"）、不提内部文件（dossier/impl-notes.md）。
 4. **实例专属硬规则**见 `instances/<active>/INSTANCE.md`（如某栈调试须进容器、运行环境约束、源码版本/行号基线）。
 - 可改：`.claude/agents/`、`.claude/workflows/`、`scripts/`、`docs/`、`CLAUDE.md`、`repo2book.json`、`instances/<active>/`。
@@ -49,6 +49,7 @@ python3 scripts/lint_source_grounding.py {chapter}/                        # 源
 python3 scripts/lint_dossier.py {chapter_dir}             # v3:mechanisms 机制账本(锚点行号核真)
 python3 scripts/lint_explainer.py {chapter_dir}           # v3:素材真相源(表格数字可溯源到 trace)
 python3 scripts/lint_trace_consistency.py {chapter_dir}   # v3:正文数值表不漂移+机制覆盖
+python3 scripts/lint_paper_grounding.py {chapter_dir}    # primer 原理章:# PAPER 全覆盖/正文有出处(码章空跑)
 python3 scripts/lint_anchors.py --all   # 章内锚点    python3 scripts/lint_punct.py --all   # 半角标点
 python3 scripts/lint_diagram_geometry.py --all   # 图：文字越界/相撞/压框/箭头悬空（--all 走活动实例）
 ```

@@ -80,6 +80,17 @@ v3 单章流水线与 v2 的差异速查:Test 后多 Explain(素材)与 Illustra
 writer 不再画图;reviewer 维度为 fidelity / algorithm-pedagogy(逐机制对账) /
 figure-integration(逐张看图) / formula-structure + haiku 读者顾问。
 
+## 原理章(primer)发车与 gap 审计(v4)
+
+primer 章 = 论文精读章(动机→推导→数值→落地),豁免 subtract-only、成对启用 lint_paper_grounding:
+
+    Workflow({name:"chapter-pipeline", args:{kind:"primer", chapter_id:"ch31", slug:"ch31-primer-mla", instance:"vllm-ascend", highlight:"ch31", paths:[…落地代码…], focus:"…"}})
+
+- **发车前置**:论文包已在 `instances/<x>/book/papers/<slug>/paper.md`(Lead WebFetch 落盘,勿赌 workflow 内网络);papers-map.json 有该章条目。
+- 评审维度 0 自动换 paper-fidelity;lint_fidelity 不跑。
+- **gap 审计**(每 Part 收尾/全书体检):`Workflow({name:"book-gap-audit", args:{instance:"vllm-ascend", date:"YYYY-MM-DD"}})` → 报告在 book/audits/;cliff 级逐条决定 retrofit/立 primer 章/接受。
+- 新书开局(§0)同步产出 papers-map.json——论文算法在 cartography 期就规划,不等成书后盘点。
+
 ## 4. 监控
 - `/workflows` 看实时阶段进度。
 - `TaskOutput`/读 `/tmp/.../tasks/<id>.output` 看结果。
