@@ -23,20 +23,36 @@ python3 scripts/new_instance.py redis \
 #    Workflow({ name:"chapter-pipeline", args:{ chapter_id, slug, focus, highlight, paths, source_root }})
 ```
 
-主 session（你对话的 AI）就是 **Team Lead / 架构师**：它读 `CLAUDE.md` + RUNBOOK，调度 6 个角色 agent，按工作流逐章产书。
+主 session（你对话的 AI）就是 **Team Lead / 架构师**：它读 `CLAUDE.md` + RUNBOOK，调度 8 个角色 agent，按工作流逐章产书（角色分工与协作见下文两张图）。
 
 ---
 
 ## 它怎么工作
 
-**三支柱方法论**（根除"正文脱离代码"）：
+**四支柱方法论**（根除"正文脱离代码"）：
 - **A 档案即唯一真相源** — analyst 深读真实源码产出 `dossier.json`（含要内嵌的真源码片段 + 减法计划）；implementer 与 writer 都吃这份，不以对方产物为准。
 - **B 只做减法的精简版** — 与源码同名/同结构/同控制流，`# SOURCE:`/`# SUBTRACTED:` 全标注，`lint_fidelity` 防过度删减。
 - **C 自包含内嵌真源码** — 正文直接内嵌真实源码片段逐段讲，精简版只作"跑起来看数值"的交叉验证。
 
-**编排** = per-chapter 工作流 `.claude/workflows/chapter-pipeline.js`，6 阶段 `Dossier→Implement→Test→Write→Review→Archive`，含有界回环、多维并行评审、**逃生舱**（任一阶段 `BLOCKED` 即早停升级）、dossier 对抗性自核。
+- **D 素材先行** — 图与数值轨迹**先于写作**、经运行验证产出（explainer.json 素材真相源 + figure-spec）；illustrator 强制"渲染→亲眼看 PNG→自查→盲审"；writer 拿素材自由叙事——**写作自由、门禁从严**。
 
-**6 个持久角色**（`.claude/agents/`，仓库无关）：analyst / implementer / tester / writer / reviewer / archivist。
+**编排** = per-chapter 工作流 `.claude/workflows/chapter-pipeline.js`，8 阶段 `Dossier→Implement→Test→Explain→Illustrate→Write→Review→Archive`，含有界回环、插图盲审门禁、多维并行评审、**逃生舱**（任一阶段 `BLOCKED` 即早停升级）、dossier 对抗性自核。另有存量回修 `chapter-retrofit.js` 与全书概念审计 `book-gap-audit.js`。
+
+---
+
+## 角色与协作：谁在什么场景做什么
+
+**8 个持久角色**（`.claude/agents/`，仓库无关）：analyst / implementer / tester / explainer / illustrator / writer / reviewer / archivist。角色 = 提示词文件（持久），进程按任务 spawn（无常驻会话）；跨章记忆靠 Bible/trace 等显式工件，不赌任何 agent 的对话记忆。
+
+**场景一：造一章新书。** 8 角色流水线接力，每站产出一个可校验的工件交给下一站；质量问题走有界回环（≤3 轮），路线问题拉逃生舱升级 Lead——修正后从断点续跑，已完成阶段命中缓存：
+
+![单章流水线的角色接力](docs/assets/readme/roles-pipeline.png)
+
+> 关键设计：**素材先行**——图和数值轨迹在写作之前就已经过运行验证与盲审（illustrator 必须渲染后亲眼看 PNG；盲审员只看图+spec 复述论点核数字，不看生成代码）；writer 拿到的是保真的原料，怎么叙事完全自由。
+
+**场景二/三：回修与审计。** 同一批角色换编排：存量回修外科式定点动刀（体检合格的章零成本早退）；全书 gap 审计只读不改，产出按严重度分级的认知断层清单供 Lead 决策。**primer 原理章**（论文精读章）与码章共用整条流水线，只换实现关卡与门禁（唯一豁免"只做减法"的场合，成对换上论文根基门禁）：
+
+![三种编排场景](docs/assets/readme/roles-scenarios.png)
 
 **质量闸门**（确定性 linter，前置于 LLM 评审）：保真度、章节结构、公式可渲染、源码根基、章内锚点、半角标点、图形几何（文字越界/相撞/压框/箭头悬空）。
 
@@ -51,8 +67,8 @@ CLAUDE.md                       通用操作手册（仓库无关，每会话自
 repo2book.json                  顶层注册表：active_instance + 实例清单 + 共享资源
 README.md                       本文件
 docs/superpowers/               设计 spec / 实施 plan / ARCHITECT-RUNBOOK（发车手册）
-.claude/agents/                 6 个角色提示词（去仓库化）
-.claude/workflows/              chapter-pipeline.js（单章工作流）
+.claude/agents/                 8 个角色提示词（去仓库化）
+.claude/workflows/              chapter-pipeline.js（单章）/ chapter-retrofit.js（回修）/ book-gap-audit.js（审计）
 .claude/skills/                 svg-diagram 等技能
 schemas/                        book_outline / chapter_context JSON schema
 wisdom/                         跨实例通用模式
@@ -78,7 +94,9 @@ instances/<name>/               一本书 = 一个实例
 | `new_instance.py` | 新建一本书：scaffold 实例骨架 + blobless clone 源仓 |
 | `instance.py` | 解析活动实例的目录/配置/glob（去仓库化的核心） |
 | `lint_fidelity / lint_chapter_structure / lint_formulas / lint_source_grounding` | 内容质量闸门 |
-| `lint_anchors / lint_punct / lint_diagram_geometry / lint_diagrams` | 锚点 / 半角标点 / 图形几何 / 图有效性 |
+| `lint_dossier / lint_explainer / lint_trace_consistency` | v3 素材先行闸门：机制账本 / 数字可溯源到运行 / 正文数值不漂移 |
+| `lint_paper_grounding` | primer 原理章闸门：`# PAPER:` 全覆盖 + 正文有论文出处（码章空跑） |
+| `lint_anchors / lint_punct / lint_diagram_geometry / lint_diagrams` | 锚点 / 半角标点 / 图形几何 / 图有效性+盲审登记 |
 | `bible.py` | 跨章连贯性 CLI（伏笔 due/回收、术语、接口注册） |
 | `archivist.py` | 长期记忆 / trace / 状态 |
 | `learn.py` | 收工后抽取 knowledge / wisdom |
