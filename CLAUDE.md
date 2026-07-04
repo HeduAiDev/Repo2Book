@@ -42,7 +42,7 @@
 ## 质量闸门（确定性 linter，前置于 LLM 评审）
 
 ```
-python3 scripts/lint_fidelity.py {chapter_dir}                            # 保真度：# SOURCE 全覆盖/无杜撰/不喧宾夺主/无过度删减(must_keep)
+python3 scripts/lint_fidelity.py {chapter_dir}                            # 保真度：# SOURCE 全覆盖/无杜撰/不喧宾夺主/无过度删减(must_keep)(primer 章不跑——换 lint_paper_grounding)
 python3 scripts/lint_chapter_structure.py {chapter}/narrative/chapter.md  # Roadmap + 内嵌真源码 + 零脚手架泄漏
 python3 scripts/lint_formulas.py {chapter}/narrative/chapter.md           # 公式可渲染
 python3 scripts/lint_source_grounding.py {chapter}/                        # 源码根基

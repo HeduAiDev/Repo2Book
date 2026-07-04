@@ -38,13 +38,14 @@ MD_NO_ARXIV = MD_OK.replace("arXiv:2211.17192 §3.1", "论文里")
 PAPER_MD = "## 3.1 Speculative Sampling\nEq.4 acceptance...\n"
 
 
-def _mk(tmp, kind="primer", impl=IMPL_OK, md=MD_OK, paper=PAPER_MD, sections=None):
+def _mk(tmp, kind="primer", impl=IMPL_OK, md=MD_OK, paper=PAPER_MD, sections=None, paper_origin=None):
     ch = tmp / "inst" / "artifacts" / "ch33-primer-speculative-sampling"
     (ch / "dossier").mkdir(parents=True)
     (ch / "implementation").mkdir(parents=True)
     (ch / "narrative").mkdir(parents=True)
-    doc = {"mechanisms": [{"id": "m1", "paper_origin": {
-        "paper": "arXiv:2211.17192", "sections": sections or ["§3.1"]}}]}
+    po = paper_origin if paper_origin is not None else {
+        "paper": "arXiv:2211.17192", "sections": sections or ["§3.1"]}
+    doc = {"mechanisms": [{"id": "m1", "paper_origin": po}]}
     if kind:
         doc["kind"] = kind
     (ch / "dossier" / "dossier.json").write_text(json.dumps(doc), encoding="utf-8")
@@ -86,3 +87,22 @@ def test_formula_without_nearby_anchor_warns(tmp_path):
 def test_section_not_in_paper_pack_warns(tmp_path):
     r = lint_paper_grounding(_mk(tmp_path, sections=["§9.9"]))
     assert r["paper_ref"]
+
+
+def test_expect_primer_mismatch_blocks(tmp_path):
+    r = lint_paper_grounding(
+        _mk(tmp_path, kind=None, impl=IMPL_BAD, md=MD_NO_ARXIV), expect_primer=True
+    )
+    assert r["expect"]
+
+
+def test_expect_primer_with_kind_primer_passes(tmp_path):
+    r = lint_paper_grounding(_mk(tmp_path), expect_primer=True)
+    assert not r["expect"]
+
+
+def test_string_paper_origin_no_crash(tmp_path):
+    # paper_origin 本应是 {paper, sections} 对象；这里给一个字符串，
+    # 校验 lint_paper_grounding 不因 AttributeError 崩溃（跳过该机制的 paper_ref 检查即可）。
+    r = lint_paper_grounding(_mk(tmp_path, paper_origin="arXiv:2211.17192 §3.1"))
+    assert not r["paper_ref"]

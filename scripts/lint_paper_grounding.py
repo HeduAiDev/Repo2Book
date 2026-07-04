@@ -20,15 +20,20 @@ ANCHOR = re.compile(r'§|Eq\.?|arXiv|式\s*\(|PAPER', re.I)
 DEF = re.compile(r'^\s*(?:def|class)\s+(\w+)')
 
 
-def lint_paper_grounding(chapter_dir: str) -> dict:
+def lint_paper_grounding(chapter_dir: str, expect_primer: bool = False) -> dict:
     d = Path(chapter_dir)
-    res = {"impl": [], "citation": [], "formula": [], "paper_ref": [], "warn": []}
+    res = {"impl": [], "citation": [], "formula": [], "paper_ref": [], "warn": [], "expect": []}
     df = d / "dossier" / "dossier.json"
     try:
         doc = json.loads(df.read_text(encoding="utf-8")) if df.exists() else {}
     except ValueError:
         doc = {}
     if doc.get("kind") != "primer":
+        if expect_primer:
+            res["expect"].append(
+                '  期望 primer 章但 dossier 顶层缺 "kind":"primer"(lint 分流开关)——analyst 须补写'
+            )
+        res["warn"].append("  非 primer 章(dossier 顶层无 kind:primer)——本检查跳过")
         return res
 
     # 1) 参考实现每个 def/class 有 # PAPER: 锚(定义行上 3 行或下 3 行内)
@@ -66,7 +71,9 @@ def lint_paper_grounding(chapter_dir: str) -> dict:
         res["warn"].append(f"  论文包缺失:{pack}(发车前应先落盘)")
     else:
         for mech in doc.get("mechanisms", []):
-            po = mech.get("paper_origin") or {}
+            po = mech.get("paper_origin")
+            if not isinstance(po, dict):
+                continue
             for s in po.get("sections") or []:
                 key = s.replace("§", "").replace("Eq.", "").strip()
                 if key and key not in ptext:
@@ -76,20 +83,23 @@ def lint_paper_grounding(chapter_dir: str) -> dict:
 
 def print_report(res: dict, cd: str) -> int:
     print(f"Paper-Grounding Lint: {cd}\n{'=' * 60}")
-    blocking = len(res["impl"]) + len(res["citation"])
+    blocking = len(res["impl"]) + len(res["citation"]) + len(res.get("expect", []))
     for k, issues in res.items():
-        mark = "❌ " if k in ("impl", "citation") else "⚠️ "
+        mark = "❌ " if k in ("impl", "citation", "expect") else "⚠️ "
         for i in issues:
             print(mark + f"{k}: {i}")
     if blocking == 0:
-        print("✓ 论文根基检查通过(# PAPER 全覆盖 / 正文有出处)")
+        print("✓ 无 BLOCKING")
         return 0
     print(f"\n{'=' * 60}\n🔴 {blocking} BLOCKING")
     return 1
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python3 lint_paper_grounding.py <chapter_dir>")
+    argv = sys.argv[1:]
+    expect_primer = "--expect-primer" in argv
+    argv = [a for a in argv if a != "--expect-primer"]
+    if len(argv) < 1:
+        print("Usage: python3 lint_paper_grounding.py <chapter_dir> [--expect-primer]")
         sys.exit(1)
-    sys.exit(print_report(lint_paper_grounding(sys.argv[1]), sys.argv[1]))
+    sys.exit(print_report(lint_paper_grounding(argv[0], expect_primer=expect_primer), argv[0]))

@@ -12,7 +12,7 @@ GOOD_MECH = {
 }
 
 
-def _mk(tmp, mechanisms, with_source=True):
+def _mk(tmp, mechanisms, with_source=True, kind=None):
     """构造 instances 形状的树:<inst>/artifacts/ch01 + <inst>/source/pkg/sched.py(5 行)。"""
     inst = tmp / "inst"
     ch = inst / "artifacts" / "ch01"
@@ -20,8 +20,10 @@ def _mk(tmp, mechanisms, with_source=True):
     if with_source:
         (inst / "source" / "pkg").mkdir(parents=True)
         (inst / "source" / "pkg" / "sched.py").write_text("a\nb\nc\nd\ne\n", encoding="utf-8")
-    (ch / "dossier" / "dossier.json").write_text(
-        json.dumps({"mechanisms": mechanisms}), encoding="utf-8")
+    doc = {"mechanisms": mechanisms}
+    if kind:
+        doc["kind"] = kind
+    (ch / "dossier" / "dossier.json").write_text(json.dumps(doc), encoding="utf-8")
     return str(ch)
 
 
@@ -84,3 +86,20 @@ def test_prereq_missing_dir_warns_only(tmp_path):
 def test_algorithm_without_paper_origin_warns(tmp_path):
     r = lint_dossier(_mk(tmp_path, [GOOD_MECH]))   # GOOD_MECH 无 paper_origin
     assert any("paper_origin" in w for w in r["warn"])
+
+
+def test_primer_kind_missing_paper_origin_blocking(tmp_path):
+    r = lint_dossier(_mk(tmp_path, [GOOD_MECH], kind="primer"))  # GOOD_MECH 无 paper_origin
+    assert any("paper_origin" in m for m in r["mechanism"])
+
+
+def test_primer_kind_with_paper_origin_passes(tmp_path):
+    m = dict(GOOD_MECH, paper_origin={"paper": "arXiv:2211.17192", "sections": ["§3.1"]})
+    r = lint_dossier(_mk(tmp_path, [m], kind="primer"))
+    assert not r["mechanism"]
+
+
+def test_paper_origin_non_dict_blocking_no_crash(tmp_path):
+    m = dict(GOOD_MECH, paper_origin="arXiv:2211.17192 §3.1")
+    r = lint_dossier(_mk(tmp_path, [m]))
+    assert any("paper_origin" in x for x in r["mechanism"])

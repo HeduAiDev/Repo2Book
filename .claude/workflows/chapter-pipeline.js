@@ -92,6 +92,7 @@ const dv = await agent(
   head('analyst') +
   '任务：**独立对抗性核对** ' + CH + '/dossier/dossier.json 是否忠于真实源码：路线是否正确？embed_excerpts 是否逐字、file:Lxxx 是否准确？subtraction_plan.delete 是否都安全、must_keep 是否完整（有无遗漏读者要学的关键符号）？\n' +
   'mechanisms 是否完整——有无漏掉读者必须懂的机制？needs_figure/needs_worked_example/difficulty 标得对吗？\n' +
+  (PRIMER ? '（PRIMER）确认 dossier.json 顶层有 "kind":"primer"——没有则 sound=false。\n' : '') +
   '返回 sound（是否可放行）与 problems（具体问题列表）。',
   { schema: VERIFY_SCHEMA, label: 'dossier-verify', phase: 'Dossier', agentType: 'general-purpose' }
 )
@@ -110,7 +111,9 @@ for (let r = 1; r <= 3; r++) {
   const impl = await agent(
     head('implementer') +
     (PRIMER
-      ? '任务：读 ' + CH + '/dossier/dossier.json 与 ' + PAPERS + '/paper.md，产出**论文忠实的小型参考实现**到 ' + CH + '/implementation/（NumPy/纯 CPU torch，小参数可跑），TDD 先写测试到 ' + CH + '/tests/。\n每个 def/class 标 `# PAPER: §x Eq.y`（对标码章的 # SOURCE）。**不发明论文没有的机制**；实现规模以「explainer 能跑出可示教轨迹」为度。\n完成后自跑 `python3 ' + REPO + '/scripts/lint_paper_grounding.py ' + CH + '` 确保无 BLOCKING。返回 status/note。' + ESC
+      ? '任务：读 ' + CH + '/dossier/dossier.json 与 ' + PAPERS + '/paper.md，产出**论文忠实的小型参考实现**到 ' + CH + '/implementation/（NumPy/纯 CPU torch，小参数可跑），TDD 先写测试到 ' + CH + '/tests/。\n' +
+        (ledger.length ? '上一轮测试失败，必须修复：\n' + ledger.join('\n') + '\n' : '') +
+        '每个 def/class 标 `# PAPER: §x Eq.y`（对标码章的 # SOURCE）。**不发明论文没有的机制**；实现规模以「explainer 能跑出可示教轨迹」为度。\n完成后自跑 `python3 ' + REPO + '/scripts/lint_paper_grounding.py ' + CH + ' --expect-primer` 确保无 BLOCKING。返回 status/note。' + ESC
       : '任务：读 ' + CH + '/dossier/dossier.json，按 subtraction_plan 产出 **subtract-only** 精简版到 ' + CH + '/implementation/，TDD 先写测试到 ' + CH + '/tests/。\n' +
         (ledger.length ? '上一轮测试失败，必须修复：\n' + ledger.join('\n') + '\n' : '') +
         '每 def/class 标 `# SOURCE: vllm/...:Lxxx`；删除标 `# SUBTRACTED:`。\n' +
@@ -123,7 +126,7 @@ for (let r = 1; r <= 3; r++) {
   testV = await agent(
     head('tester') +
     (PRIMER
-      ? '任务：验证 ' + CH + '/implementation/ **忠实复现论文断言**（非复现仓库行为）：对 dossier 各机制的论文性质设计测试——分布保持类跑统计检验（固定随机种子、宽松阈值防 flaky）、恒等类做数值对照、优化类验证目标量改善。host `python3 -m pytest ' + CH + '/tests -q`。\n写 ' + CH + '/tests/test-report.json（含 verdict 与每个性质对应的论文锚 §/Eq）。全过且 lint_paper_grounding 无 BLOCKING → APPROVED；否则 REJECTED 且 failures 写清。'
+      ? '任务：验证 ' + CH + '/implementation/ **忠实复现论文断言**（非复现仓库行为）：对 dossier 各机制的论文性质设计测试——分布保持类跑统计检验（固定随机种子、宽松阈值防 flaky）、恒等类做数值对照、优化类验证目标量改善。host `python3 -m pytest ' + CH + '/tests -q`。\n写 ' + CH + '/tests/test-report.json（含 verdict 与每个性质对应的论文锚 §/Eq）。全过且 lint_paper_grounding --expect-primer 无 BLOCKING → APPROVED；否则 REJECTED 且 failures 写清。'
       : '任务：验证 ' + CH + '/implementation/ 复现 dossier 记录的真实 vLLM 行为（非自洽）。\n' +
         '精简版纯测试：`python3 -m pytest ' + CH + '/tests -q`（纯控制流，无需加速器）。若精简版 import 了目标仓/加速器运行时而 host 跑不动：按 ' + REPO + '/instances/' + INST + '/INSTANCE.md 的运行约束处理——只验可读控制流、行为以源码为准（vLLM 实例可用 ' + REPO + '/scripts/vllm_docker.sh）。\n' +
         '写 ' + CH + '/tests/test-report.json（含 verdict；若用容器记录 docker 命令+镜像 tag+vllm 版本）。\n' +
@@ -207,7 +210,7 @@ writeV = await agent(
     : '精简版只作"运行看数值"的交叉验证，不是主角。\n若发现精简版缺了你要讲清的细节 → 用逃生舱拉闸（status=BLOCKED）让 implementer 补回，别将就。\n') +
   '埋伏笔、`python3 ' + REPO + '/scripts/bible.py payoff --resolve` 回收应回收项。\n' +
   '**零脚手架泄漏**：规范 vllm/ 路径、自然标题(无 Cell N)、不提内部文件。\n' +
-  '完成后自跑' + (PRIMER ? '五个 linter（chapter_structure/formulas/source_grounding/trace_consistency/paper_grounding，primer 章不跑 fidelity）' : (A.skip_impl ? '四个 linter（chapter_structure/formulas/source_grounding/trace_consistency，本章无精简版故不跑 fidelity）' : '五个 linter（chapter_structure/formulas/source_grounding/fidelity/trace_consistency）')) + '均无 BLOCKING（图的 linter 归 illustrator，不用你跑）。返回 status/note。' + ESC,
+  '完成后自跑' + (PRIMER ? '五个 linter（chapter_structure/formulas/source_grounding/trace_consistency/paper_grounding --expect-primer，primer 章不跑 fidelity）' : (A.skip_impl ? '四个 linter（chapter_structure/formulas/source_grounding/trace_consistency，本章无精简版故不跑 fidelity）' : '五个 linter（chapter_structure/formulas/source_grounding/fidelity/trace_consistency）')) + '均无 BLOCKING（图的 linter 归 illustrator，不用你跑）。返回 status/note。' + ESC,
   { schema: STATUS_SCHEMA, label: 'write r' + w, phase: 'Write', agentType: 'general-purpose' }
 )
 }
@@ -218,7 +221,7 @@ if (writeV && writeV.status === 'BLOCKED') return { escalated: 'write', stage: '
 let reviewV = null
 const DIMS = [
   PRIMER
-    ? 'paper-fidelity（对照 ' + PAPERS + '/paper.md 逐公式核对：推导忠实于论文？符号一致？引用锚完备？跑 lint_paper_grounding；evidence 必须引论文小节）'
+    ? 'paper-fidelity（对照 ' + PAPERS + '/paper.md 逐公式核对：推导忠实于论文？符号一致？引用锚完备？跑 lint_paper_grounding --expect-primer；evidence 必须引论文小节）'
     : 'fidelity（保真度+过度删减+零脚手架泄漏，跑 lint_fidelity/lint_source_grounding/lint_chapter_structure）',
   'algorithm-pedagogy（逐机制对账：对 dossier.mechanisms 每条填勾选表——直觉在场？数值推演表在场且带 trace 标记？不变量论证？量化落数字？core 三层齐？先跑 lint_trace_consistency 作客观依据；输出逐机制勾选表，不是整体印象）',
   'figure-integration（先跑 lint_diagrams；然后逐张用 Read 打开 PNG 亲眼看：图在其机制讲解附近？图注给结论而非描述画面？正文数字与图上一致？图对读懂机制真有帮助？）',
@@ -262,7 +265,7 @@ for (let r = 1; r <= 3; r++) {
   const rev = await agent(
     head('writer') +
     '评审 REVISE（第 ' + r + ' 轮）。用 receiving-code-review skill 逐条处理（采纳或带理由反驳），改 ' + CH + '/narrative/chapter.md：\n' +
-    JSON.stringify(issues) + '\n完成后自跑' + (PRIMER ? '五个 linter（chapter_structure/formulas/source_grounding/trace_consistency/paper_grounding，primer 章不跑 fidelity）' : (A.skip_impl ? '四个 linter（chapter_structure/formulas/source_grounding/trace_consistency）' : '五个 linter（chapter_structure/formulas/source_grounding/fidelity/trace_consistency）')) + '均无 BLOCKING。返回 status/note。' + ESC,
+    JSON.stringify(issues) + '\n完成后自跑' + (PRIMER ? '五个 linter（chapter_structure/formulas/source_grounding/trace_consistency/paper_grounding --expect-primer，primer 章不跑 fidelity）' : (A.skip_impl ? '四个 linter（chapter_structure/formulas/source_grounding/trace_consistency）' : '五个 linter（chapter_structure/formulas/source_grounding/fidelity/trace_consistency）')) + '均无 BLOCKING。返回 status/note。' + ESC,
     { schema: STATUS_SCHEMA, label: 'revise r' + r, phase: 'Review', agentType: 'general-purpose' }
   )
   if (rev && rev.status === 'BLOCKED') return { escalated: 'review-revise', stage: 'Review', round: r, reason: rev.blocker_reason }

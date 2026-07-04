@@ -46,6 +46,18 @@ def lint_source_grounding(chapter_dir: str) -> dict:
     impl_notes = impl_dir / "impl-notes.md"
     ctx_path = base / "context.json"
 
+    # ── primer(原理章) 分支探测：dossier 顶层 "kind":"primer" ──
+    # primer 章的 动机/推导 section 天然引用论文而非源码文件，该检查由
+    # lint_paper_grounding 接管；这里只需放行、不再重复 BLOCK。
+    dossier_path = base / "dossier" / "dossier.json"
+    is_primer = False
+    if dossier_path.exists():
+        try:
+            dossier_doc = json.loads(dossier_path.read_text(encoding="utf-8"))
+            is_primer = dossier_doc.get("kind") == "primer"
+        except ValueError:
+            is_primer = False
+
     # ── Check 1: vLLM references in chapter narrative ──
     issues = []
     if narrative.exists():
@@ -68,7 +80,7 @@ def lint_source_grounding(chapter_dir: str) -> dict:
             t for t, n in refs_per_section.items()
             if n == 0 and not any(re.search(p, t) for p in meta_patterns)
         ]
-        if sections_without_refs:
+        if sections_without_refs and not is_primer:
             issues.append(
                 f"  Sections without vLLM source references: {sections_without_refs}"
             )
@@ -77,12 +89,18 @@ def lint_source_grounding(chapter_dir: str) -> dict:
     # ── Check 2: source-anchoring comments in implementation ──
     # 新体系 HARD RULE 用 `# SOURCE:`（lint_fidelity 校验）标注真实 vLLM 位置；
     # 兼容旧体系的 `# REFERENCE:`。两者任一即视为源码锚点。
+    # primer 章的参考实现用 `# PAPER:` 锚论文（lint_paper_grounding 校验其位置），
+    # 这里同样计入锚点数、不重复 BLOCK。
     issues = []
     ref_count = 0
+    anchor_pattern = (
+        r'#\s*(?:REFERENCE|SOURCE|PAPER):\s*(.+)' if is_primer
+        else r'#\s*(?:REFERENCE|SOURCE):\s*(.+)'
+    )
     if impl_dir.exists():
         for py_file in impl_dir.glob("*.py"):
             code = py_file.read_text(encoding="utf-8")
-            refs = re.findall(r'#\s*(?:REFERENCE|SOURCE):\s*(.+)', code)
+            refs = re.findall(anchor_pattern, code)
             ref_count += len(refs)
         if ref_count < 3:
             issues.append(

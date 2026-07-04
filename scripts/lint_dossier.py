@@ -65,10 +65,15 @@ def lint_dossier(chapter_dir: str) -> dict:
             res["mechanism"].append(f"  {mid}: kind=algorithm 必须 needs_worked_example=true")
         po = m.get("paper_origin")
         if po is not None:
-            if not PAPER_ID.match(str(po.get("paper", ""))):
-                res["mechanism"].append(f"  {mid}: paper_origin.paper 格式非法(应为 arXiv:NNNN.NNNNN 或 URL)")
-            if not isinstance(po.get("sections"), list) or not po.get("sections"):
-                res["mechanism"].append(f"  {mid}: paper_origin.sections 须为非空列表(§/Eq 锚)")
+            if not isinstance(po, dict):
+                res["mechanism"].append(f"  {mid}: paper_origin 须为对象 {{paper, sections}}")
+            else:
+                if not PAPER_ID.match(str(po.get("paper", ""))):
+                    res["mechanism"].append(f"  {mid}: paper_origin.paper 格式非法(应为 arXiv:NNNN.NNNNN 或 URL)")
+                if not isinstance(po.get("sections"), list) or not po.get("sections"):
+                    res["mechanism"].append(f"  {mid}: paper_origin.sections 须为非空列表(§/Eq 锚)")
+        elif doc.get("kind") == "primer":
+            res["mechanism"].append(f"  {mid}: primer 章每个机制必填 paper_origin")
         elif m.get("kind") == "algorithm":
             res["warn"].append(f"  {mid}: kind=algorithm 且无 paper_origin——确认该算法确无论文出处")
         pr = m.get("prereq")
