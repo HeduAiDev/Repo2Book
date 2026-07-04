@@ -33,6 +33,8 @@ const INST = A.instance || 'vllm'
 const SRC = A.source_root || (REPO + '/instances/' + INST + '/source')
 const CH = REPO + '/instances/' + INST + '/artifacts/' + A.slug
 const HL = A.highlight || A.subsystem || ''
+const PRIMER = A.kind === 'primer'
+const PAPERS = REPO + '/instances/' + INST + '/book/papers/' + A.slug
 const PATHS = (A.paths || []).join(', ')
 
 // 逃生舱：任何阶段发现路线/档案是错的，不许硬着头皮做错
@@ -44,6 +46,7 @@ function head(role) {
     '目标源码根目录 ' + SRC + '（引用源码写**规范路径**，如 ' + INST + ' 实例写 vllm_ascend/… / 对照基座写 vllm/…，**绝不带** instances/' + INST + '/source/ 前缀）。',
     '本章目录（绝对路径）：' + CH,
     '本章：' + A.chapter_id + ' 《' + A.focus + '》',
+    PRIMER ? '本章为 **primer 原理章**：论文包在 ' + PAPERS + '/paper.md（先读它）。硬规则 2 豁免仅限本章 kind——实现是**论文忠实的小型参考实现**（非 subtract-only），替代门禁为 lint_paper_grounding。' : '',
     'vLLM 相关运行进容器：' + REPO + '/scripts/vllm_docker.sh ...（host 无 CUDA/vLLM）。',
     '',
   ].join('\n')
@@ -79,6 +82,7 @@ const dossierV = await agent(
   '任务：深读真实源码（重点：' + PATHS + '），产出本章**档案**并 Write 到 ' + CH + '/dossier/dossier.json。\n' +
   '先跑 `python3 ' + REPO + '/scripts/bible.py due ' + A.chapter_id + '`，结果放入 foreshadow_due。\n' +
   'dossier.json 字段：code_spine、embed_excerpts(逐字真实源码片段+可省略分支说明，带 vllm/...:Lxxx)、key_classes、data_flow、design_decisions、theory、subtraction_plan{delete:[{what,why_safe}], must_keep:[{symbol,why} 可检测符号]}、mechanisms[{id,name,kind:algorithm|dataflow|layout|protocol|config,source_anchors,needs_figure,needs_worked_example,difficulty:core|supporting}](v3 账本：宁多登记勿漏)、foreshadow_due。\n' +
+  (PRIMER ? '本章是 primer 原理章：深读论文包 ' + PAPERS + '/paper.md 与落地代码（' + PATHS + '）。dossier.json 顶层写 "kind":"primer"；每个机制**必填** paper_origin{paper,sections}；embed_excerpts 可含论文公式（带 §/Eq 锚）与代码双源；subtraction_plan 留空对象（primer 不做减法）。\n' : '') +
   'must_keep 要把"读者需理解、writer 需讲清"的符号都放进去（宁多留勿误删）。只描述真实源码，禁止杜撰。完成后自跑 `python3 ' + REPO + '/scripts/lint_dossier.py ' + CH + '` 确保无 BLOCKING。返回 status/note。' + ESC,
   { schema: STATUS_SCHEMA, label: 'dossier', phase: 'Dossier', agentType: 'general-purpose' }
 )
@@ -105,21 +109,25 @@ for (let r = 1; r <= 3; r++) {
   phase('Implement')
   const impl = await agent(
     head('implementer') +
-    '任务：读 ' + CH + '/dossier/dossier.json，按 subtraction_plan 产出 **subtract-only** 精简版到 ' + CH + '/implementation/，TDD 先写测试到 ' + CH + '/tests/。\n' +
-    (ledger.length ? '上一轮测试失败，必须修复：\n' + ledger.join('\n') + '\n' : '') +
-    '每 def/class 标 `# SOURCE: vllm/...:Lxxx`；删除标 `# SUBTRACTED:`。\n' +
-    '**只可删除 subtraction_plan.delete 批准项；must_keep 符号必须保留；不得按己见删其他细节**（lint_fidelity 会校验 must_keep 都在）。\n' +
-    '完成后自跑 `python3 ' + REPO + '/scripts/lint_fidelity.py ' + CH + '` 确保无 BLOCKING。返回 status/note。' + ESC,
+    (PRIMER
+      ? '任务：读 ' + CH + '/dossier/dossier.json 与 ' + PAPERS + '/paper.md，产出**论文忠实的小型参考实现**到 ' + CH + '/implementation/（NumPy/纯 CPU torch，小参数可跑），TDD 先写测试到 ' + CH + '/tests/。\n每个 def/class 标 `# PAPER: §x Eq.y`（对标码章的 # SOURCE）。**不发明论文没有的机制**；实现规模以「explainer 能跑出可示教轨迹」为度。\n完成后自跑 `python3 ' + REPO + '/scripts/lint_paper_grounding.py ' + CH + '` 确保无 BLOCKING。返回 status/note。' + ESC
+      : '任务：读 ' + CH + '/dossier/dossier.json，按 subtraction_plan 产出 **subtract-only** 精简版到 ' + CH + '/implementation/，TDD 先写测试到 ' + CH + '/tests/。\n' +
+        (ledger.length ? '上一轮测试失败，必须修复：\n' + ledger.join('\n') + '\n' : '') +
+        '每 def/class 标 `# SOURCE: vllm/...:Lxxx`；删除标 `# SUBTRACTED:`。\n' +
+        '**只可删除 subtraction_plan.delete 批准项；must_keep 符号必须保留；不得按己见删其他细节**（lint_fidelity 会校验 must_keep 都在）。\n' +
+        '完成后自跑 `python3 ' + REPO + '/scripts/lint_fidelity.py ' + CH + '` 确保无 BLOCKING。返回 status/note。' + ESC),
     { schema: STATUS_SCHEMA, label: 'implement r' + r, phase: 'Implement', agentType: 'general-purpose' }
   )
   if (impl && impl.status === 'BLOCKED') return { escalated: 'implement', stage: 'Implement', round: r, reason: impl.blocker_reason }
   phase('Test')
   testV = await agent(
     head('tester') +
-    '任务：验证 ' + CH + '/implementation/ 复现 dossier 记录的真实 vLLM 行为（非自洽）。\n' +
-    '精简版纯测试：`python3 -m pytest ' + CH + '/tests -q`（纯控制流，无需加速器）。若精简版 import 了目标仓/加速器运行时而 host 跑不动：按 ' + REPO + '/instances/' + INST + '/INSTANCE.md 的运行约束处理——只验可读控制流、行为以源码为准（vLLM 实例可用 ' + REPO + '/scripts/vllm_docker.sh）。\n' +
-    '写 ' + CH + '/tests/test-report.json（含 verdict；若用容器记录 docker 命令+镜像 tag+vllm 版本）。\n' +
-    '全过且 lint_fidelity 无 BLOCKING → verdict=APPROVED；否则 REJECTED 且 failures 写清失败摘要。',
+    (PRIMER
+      ? '任务：验证 ' + CH + '/implementation/ **忠实复现论文断言**（非复现仓库行为）：对 dossier 各机制的论文性质设计测试——分布保持类跑统计检验（固定随机种子、宽松阈值防 flaky）、恒等类做数值对照、优化类验证目标量改善。host `python3 -m pytest ' + CH + '/tests -q`。\n写 ' + CH + '/tests/test-report.json（含 verdict 与每个性质对应的论文锚 §/Eq）。全过且 lint_paper_grounding 无 BLOCKING → APPROVED；否则 REJECTED 且 failures 写清。'
+      : '任务：验证 ' + CH + '/implementation/ 复现 dossier 记录的真实 vLLM 行为（非自洽）。\n' +
+        '精简版纯测试：`python3 -m pytest ' + CH + '/tests -q`（纯控制流，无需加速器）。若精简版 import 了目标仓/加速器运行时而 host 跑不动：按 ' + REPO + '/instances/' + INST + '/INSTANCE.md 的运行约束处理——只验可读控制流、行为以源码为准（vLLM 实例可用 ' + REPO + '/scripts/vllm_docker.sh）。\n' +
+        '写 ' + CH + '/tests/test-report.json（含 verdict；若用容器记录 docker 命令+镜像 tag+vllm 版本）。\n' +
+        '全过且 lint_fidelity 无 BLOCKING → verdict=APPROVED；否则 REJECTED 且 failures 写清失败摘要。'),
     { schema: TEST_SCHEMA, label: 'test r' + r, phase: 'Test', agentType: 'general-purpose' }
   )
   if (testV && testV.verdict === 'APPROVED') break
@@ -192,13 +200,14 @@ writeV = await agent(
   '任务：以**真实目标源码为主线**写 ' + CH + '/narrative/chapter.md（你唯一有权写它）。\n' +
   '读 dossier、implementation、' + REPO + '/instances/' + INST + '/book/bible/voice-guide.md，并跑 `python3 ' + REPO + '/scripts/bible.py due ' + A.chapter_id + '`。\n' +
   '素材已备好：读 ' + CH + '/explainer/explainer.json（数值轨迹/直觉/不变量）与 ' + CH + '/diagrams/（已过盲审的图 + roadmap.png——先 Read 几张 PNG 看图长什么样再落笔）。**怎么讲由你**：结构/顺序/风格/篇幅自由。**必达物要在场**：difficulty=core 机制三层递进（直觉→机制→源码）；explainer 的数值推演表进正文，表格前一行放 `<!-- trace: <mechanism_id> -->` 标记，数字一个不许改（排版随意）；每张图被引用且在其机制讲解附近；开场引用 roadmap.png。图不合适 → 用逃生舱提需求，不许自己画。\n' +
+  (PRIMER ? '本章四段式必达物：动机 → 数学推导（**每个关键公式给论文锚 §/Eq + arXiv id**）→ 小参数数值推演（explainer 素材）→ 落地（vllm_ascend 真实代码锚点 + 链接对应码章）。\n' : '') +
   '正文内嵌**真实源码片段**(裁剪无关分支用 `# … 省略 …`)，逐段解读设计决策。' +
   (A.skip_impl
     ? '本章无精简版（方法论/概览章）——以真实源码 + 架构图为主线，不要提"精简版"。\n'
     : '精简版只作"运行看数值"的交叉验证，不是主角。\n若发现精简版缺了你要讲清的细节 → 用逃生舱拉闸（status=BLOCKED）让 implementer 补回，别将就。\n') +
   '埋伏笔、`python3 ' + REPO + '/scripts/bible.py payoff --resolve` 回收应回收项。\n' +
   '**零脚手架泄漏**：规范 vllm/ 路径、自然标题(无 Cell N)、不提内部文件。\n' +
-  '完成后自跑' + (A.skip_impl ? '四个 linter（chapter_structure/formulas/source_grounding/trace_consistency，本章无精简版故不跑 fidelity）' : '五个 linter（chapter_structure/formulas/source_grounding/fidelity/trace_consistency）') + '均无 BLOCKING（图的 linter 归 illustrator，不用你跑）。返回 status/note。' + ESC,
+  '完成后自跑' + (PRIMER ? '五个 linter（chapter_structure/formulas/source_grounding/trace_consistency/paper_grounding，primer 章不跑 fidelity）' : (A.skip_impl ? '四个 linter（chapter_structure/formulas/source_grounding/trace_consistency，本章无精简版故不跑 fidelity）' : '五个 linter（chapter_structure/formulas/source_grounding/fidelity/trace_consistency）')) + '均无 BLOCKING（图的 linter 归 illustrator，不用你跑）。返回 status/note。' + ESC,
   { schema: STATUS_SCHEMA, label: 'write r' + w, phase: 'Write', agentType: 'general-purpose' }
 )
 }
@@ -208,7 +217,9 @@ if (writeV && writeV.status === 'BLOCKED') return { escalated: 'write', stage: '
 // ---------- Phase E: Review (多维并行 → 协作回环) ----------
 let reviewV = null
 const DIMS = [
-  'fidelity（保真度+过度删减+零脚手架泄漏，跑 lint_fidelity/lint_source_grounding/lint_chapter_structure）',
+  PRIMER
+    ? 'paper-fidelity（对照 ' + PAPERS + '/paper.md 逐公式核对：推导忠实于论文？符号一致？引用锚完备？跑 lint_paper_grounding；evidence 必须引论文小节）'
+    : 'fidelity（保真度+过度删减+零脚手架泄漏，跑 lint_fidelity/lint_source_grounding/lint_chapter_structure）',
   'algorithm-pedagogy（逐机制对账：对 dossier.mechanisms 每条填勾选表——直觉在场？数值推演表在场且带 trace 标记？不变量论证？量化落数字？core 三层齐？先跑 lint_trace_consistency 作客观依据；输出逐机制勾选表，不是整体印象）',
   'figure-integration（先跑 lint_diagrams；然后逐张用 Read 打开 PNG 亲眼看：图在其机制讲解附近？图注给结论而非描述画面？正文数字与图上一致？图对读懂机制真有帮助？）',
   'formula-structure（公式规则+Roadmap 开场+自包含+锚点/半角，跑 lint_formulas/lint_anchors/lint_punct/lint_chapter_structure）',
@@ -251,7 +262,7 @@ for (let r = 1; r <= 3; r++) {
   const rev = await agent(
     head('writer') +
     '评审 REVISE（第 ' + r + ' 轮）。用 receiving-code-review skill 逐条处理（采纳或带理由反驳），改 ' + CH + '/narrative/chapter.md：\n' +
-    JSON.stringify(issues) + '\n完成后自跑' + (A.skip_impl ? '四个 linter（chapter_structure/formulas/source_grounding/trace_consistency）' : '五个 linter（chapter_structure/formulas/source_grounding/fidelity/trace_consistency）') + '均无 BLOCKING。返回 status/note。' + ESC,
+    JSON.stringify(issues) + '\n完成后自跑' + (PRIMER ? '五个 linter（chapter_structure/formulas/source_grounding/trace_consistency/paper_grounding，primer 章不跑 fidelity）' : (A.skip_impl ? '四个 linter（chapter_structure/formulas/source_grounding/trace_consistency）' : '五个 linter（chapter_structure/formulas/source_grounding/fidelity/trace_consistency）')) + '均无 BLOCKING。返回 status/note。' + ESC,
     { schema: STATUS_SCHEMA, label: 'revise r' + r, phase: 'Review', agentType: 'general-purpose' }
   )
   if (rev && rev.status === 'BLOCKED') return { escalated: 'review-revise', stage: 'Review', round: r, reason: rev.blocker_reason }
