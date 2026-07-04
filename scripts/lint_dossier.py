@@ -73,7 +73,11 @@ def lint_dossier(chapter_dir: str) -> dict:
                 if not isinstance(po.get("sections"), list) or not po.get("sections"):
                     res["mechanism"].append(f"  {mid}: paper_origin.sections 须为非空列表(§/Eq 锚)")
         elif doc.get("kind") == "primer":
-            res["mechanism"].append(f"  {mid}: primer 章每个机制必填 paper_origin")
+            note = m.get("paper_origin_note")
+            if isinstance(note, str) and note.strip():
+                res["warn"].append(f"  {mid}: 无 paper_origin(注记豁免: {note.strip()[:40]})")
+            else:
+                res["mechanism"].append(f"  {mid}: primer 章每个机制必填 paper_origin")
         elif m.get("kind") == "algorithm":
             res["warn"].append(f"  {mid}: kind=algorithm 且无 paper_origin——确认该算法确无论文出处")
         pr = m.get("prereq")

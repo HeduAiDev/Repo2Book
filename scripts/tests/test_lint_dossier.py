@@ -99,6 +99,20 @@ def test_primer_kind_with_paper_origin_passes(tmp_path):
     assert not r["mechanism"]
 
 
+def test_primer_kind_with_paper_origin_note_warns_not_blocking(tmp_path):
+    m = dict(GOOD_MECH, paper_origin=None,
+             paper_origin_note="engineering-only:无对应论文,工程优化机制。")
+    r = lint_dossier(_mk(tmp_path, [m], kind="primer"))
+    assert not r["mechanism"]
+    assert any("paper_origin" in w for w in r["warn"])
+
+
+def test_primer_kind_missing_paper_origin_and_note_blocking(tmp_path):
+    m = dict(GOOD_MECH)  # 无 paper_origin 且无 paper_origin_note
+    r = lint_dossier(_mk(tmp_path, [m], kind="primer"))
+    assert any("paper_origin" in x for x in r["mechanism"])
+
+
 def test_paper_origin_non_dict_blocking_no_crash(tmp_path):
     m = dict(GOOD_MECH, paper_origin="arXiv:2211.17192 §3.1")
     r = lint_dossier(_mk(tmp_path, [m]))
