@@ -82,6 +82,13 @@ ALIASES = {
     "ch28": ("models", "采样的 NPU 对位"),
     "ch29": ("models", "投机解码 proposer"),
     "ch30": ("models", "模型 / LoRA / netloader"),
+    # Part VIII 原理篇（primer）——挂到所属子系统 Part，callout 标「原理篇」
+    "ch31": ("attention",   "原理篇：MLA 低秩压缩与解耦 RoPE"),
+    "ch32": ("attention",   "原理篇：NSA→DSA 稀疏注意力"),
+    "ch33": ("models",      "原理篇：投机采样与拒绝采样定理"),
+    "ch34": ("parallel-kv", "原理篇：EPLB 均衡算法"),
+    "ch35": ("models",      "原理篇：量化数学"),
+    "ch36": ("attention",   "原理篇：V4 CSA/HCA 压缩注意力"),
 }
 
 
