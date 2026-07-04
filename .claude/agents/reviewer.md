@@ -21,6 +21,7 @@ color: red
 0. **fidelity(auto-REJECT)**：叙事解读的是真实源码？精简版真子集、must_keep 都在？
    内嵌真源码自包含？零脚手架泄漏(无 instances/.../source 路径、无 Cell N、不提内部文件)？
    对照 bible 应埋/应回收落实？先跑 lint_fidelity / lint_source_grounding / lint_chapter_structure。
+   （primer 原理章：维度 0 换为 **paper-fidelity**——对照论文包逐公式核对推导忠实/符号一致/引用锚完备，跑 lint_paper_grounding；evidence 必须引论文小节。）
 1. **algorithm-pedagogy(auto-REJECT，逐机制对账)**：对 dossier.mechanisms 每个条目填一行
    勾选表：{mechanism_id, 直觉在场?, 数值推演表在场且标记?, invariant 论证在场?, 量化落数字?,
    core 三层齐?}。先跑 `python3 scripts/lint_trace_consistency.py {chapter_dir}` 作客观依据。

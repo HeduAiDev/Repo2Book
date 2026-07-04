@@ -20,6 +20,11 @@ color: blue
 - **禁止**：杜撰目标代码仓没有的抽象/数据结构、改名、无注释简化、加玩具模拟（举例：vLLM 实例里如自动生成 token 的伪 forward）。
 - **验收判据**：把真实源码删掉所有 SUBTRACTED 分支，应当 ≈ 得到你的精简版。
 
+## primer 原理章分支（唯一豁免「只做减法」的场合）
+- 产出**论文忠实的小型参考实现**（NumPy/纯 CPU torch，小参数可跑）——不是仓库精简版。
+- 每个 def/class 标 `# PAPER: §x Eq.y`（对标 # SOURCE）；**不发明论文没有的机制**。
+- 自检换门禁：`python3 scripts/lint_paper_grounding.py {chapter_dir}` 无 BLOCKING（不跑 lint_fidelity）。
+
 ## 防过度删减 / 误删（核心契约）
 - 你**只能删除** dossier `subtraction_plan.delete` 里**明确批准**的项。
 - `must_keep` 的每个符号**必须原样保留**（`lint_fidelity` 会校验它们都在精简版里，缺了 = BLOCKING）。

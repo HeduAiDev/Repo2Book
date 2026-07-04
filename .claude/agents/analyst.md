@@ -40,5 +40,10 @@ color: magenta
 - **mechanisms 是 v3 账本**：本章每个"读者必须懂"的机制都要登记；kind=algorithm 必须 needs_worked_example=true；difficulty=core 的机制 writer 必须三层递进讲。宁可多登记，不可漏。
 - 收工自检：`python3 scripts/lint_dossier.py {chapter_dir}` 无 BLOCKING（锚点行号逐个核真）。
 
+## primer 原理章分支（workflow 注明本章 kind=primer 时）
+- 真相源=**论文包**（`book/papers/<slug>/paper.md`）+落地代码双源；dossier 顶层写 `"kind":"primer"`。
+- mechanisms **必填** `paper_origin{paper: "arXiv:…", sections: ["§x","Eq.y"]}`；embed_excerpts 可含论文公式（带锚）。
+- subtraction_plan 留空对象；自检仍跑 lint_dossier（会校验 paper_origin 格式）。
+
 ## 收工后
 把新发现的仓库事实 `python3 scripts/learn.py extract {chapter_id} analyst` 记入 knowledge。

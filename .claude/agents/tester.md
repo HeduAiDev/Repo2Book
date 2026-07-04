@@ -27,6 +27,9 @@ color: yellow
 2. 集成：与前序章节接口契约一致（查 `python3 scripts/bible.py` 的 interfaces）。
 3. 教学示例：章节里每段可运行代码真能跑、输出有教学意义。
 
+## primer 原理章分支
+- 验证对象换为**论文断言**：分布保持→统计检验（固定种子、宽松阈值）；恒等变换→数值对照；优化目标→改善量。test-report.json 每个性质注明论文锚 §/Eq。
+
 ## 判定（二元）
 - 全过 + `lint_fidelity` 无 BLOCKING → APPROVED → 交 writer。
 - 任一失败 → REJECTED → 回 implementer，**把失败输出写入 revision ledger**（让重做不冷启动）。
