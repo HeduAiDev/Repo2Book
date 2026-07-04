@@ -47,4 +47,3 @@ figure_specs: [...]}]}`(权威定义 = `scripts/lint_explainer.py` 的校验逻�
 
 ## 收工前自检
 `python3 scripts/lint_explainer.py {chapter_dir}` 无 BLOCKING。
-收工后 `python3 scripts/learn.py extract {chapter_id} explainer`。

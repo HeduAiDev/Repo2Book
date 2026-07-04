@@ -8,9 +8,9 @@
       [--clone | --no-clone] [--activate]
 
 做的事:
-  1. 建 instances/<name>/{book/{cartography,bible,assets},knowledge/modules,trace/{decisions,deliveries},artifacts}
+  1. 建 instances/<name>/{book/{cartography,bible,assets},trace/{decisions,deliveries},artifacts}
   2. 写 instances/<name>/repo2book.json（实例配置）+ INSTANCE.md（实例状态/规则）
-  3. 种空的 Book Bible（glossary/interfaces/arc-map/voice-guide）+ trace/state.json + knowledge/INDEX.md
+  3. 种空的 Book Bible（glossary/interfaces/arc-map/voice-guide）+ trace/state.json
   4. （默认）把目标仓 blobless clone 进 instances/<name>/source（--no-clone 跳过）
   5. （--activate）把顶层 repo2book.json 的 active_instance 设为 <name>
 
@@ -56,7 +56,7 @@ def main():
 
     print(f"scaffold instances/{name}/ ...")
     for d in ["book/cartography", "book/bible", "book/assets/roadmap",
-              "knowledge/modules", "trace/decisions", "trace/deliveries", "artifacts"]:
+              "trace/decisions", "trace/deliveries", "artifacts"]:
         (inst / d).mkdir(parents=True, exist_ok=True)
         (inst / d / ".gitkeep").touch()
 
@@ -75,7 +75,6 @@ def main():
             "artifacts_dir": f"instances/{name}/artifacts",
             "cartography_dir": f"instances/{name}/book/cartography",
             "bible_dir": f"instances/{name}/book/bible",
-            "knowledge_dir": f"instances/{name}/knowledge",
             "trace_dir": f"instances/{name}/trace",
             "instance_doc": f"instances/{name}/INSTANCE.md",
         },
@@ -97,7 +96,6 @@ def main():
         vg = (f"# 叙述声线与风格指南（{repo_name} Book Bible）\n\n"
               "> 模板缺失，回退最小骨架——请从 instances/vllm/book/bible/voice-guide.md 补全通用约定。\n")
     w(inst / "book/bible/voice-guide.md", vg)
-    w(inst / "knowledge/INDEX.md", f"# {repo_name} knowledge（仓库特定事实，带 TTL）\n\n（空）\n")
     w(inst / "trace/state.json", json.dumps({
         "project": f"{name}-source-reading-book", "outline": cfg["book"]["outline_file"],
         "status": "instance bootstrap", "chapters": {}, "updated_by": "new_instance",

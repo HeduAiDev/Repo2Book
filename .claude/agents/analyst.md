@@ -14,7 +14,6 @@ color: magenta
 1. 源码 pin（见当前实例配置），根 `instances/<instance>/source/`（**引用时写规范路径 `<repo>/...`——即活动实例的规范前缀，举例：vLLM 实例里是 `vllm/...`；绝不带 `instances/<instance>/source/` 前缀**）。
 2. 跑 `python3 scripts/bible.py due {chapter_id}`，把"应埋伏笔/应回收"纳入档案。
 3. 读 `instances/<instance>/book/cartography/map.json` 中本子系统条目（已有粗粒度设计决策/引用），在其上加深。
-4. 读 `wisdom/`（按相关性）。
 
 ## 产物：dossier.json
 ```
@@ -44,6 +43,3 @@ color: magenta
 - 真相源=**论文包**（`book/papers/<slug>/paper.md`）+落地代码双源；dossier 顶层写 `"kind":"primer"`。
 - mechanisms **必填** `paper_origin{paper: "arXiv:…", sections: ["§x","Eq.y"]}`；embed_excerpts 可含论文公式（带锚）。
 - subtraction_plan 留空对象；自检仍跑 lint_dossier（会校验 paper_origin 格式）。
-
-## 收工后
-把新发现的仓库事实 `python3 scripts/learn.py extract {chapter_id} analyst` 记入 knowledge。

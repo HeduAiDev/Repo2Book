@@ -28,3 +28,16 @@
 3. 标记完成前跑全部 linter。
 4. vLLM 相关运行进容器；行号以 v0.21.0（`ad7125a4`）为准，升级前基线 `f3fef123` 仅作历史 diff。
 5. 别赌自己的上下文——决策/状态写进 trace、Bible、本文件。
+
+## 源码事实备忘（原 knowledge/ 归并，2026-07-04）
+ch04（async-engine，`vllm/v1/engine/`）：
+- `AsyncLLM.__init__`（L70,L132-153）一次性构好三段：InputProcessor/OutputProcessor 进程内（stage1/3），EngineCore 经 `EngineCoreClient.make_async_mp_client` 走独立进程（stage2）；源码注释原话区分 "this process" vs "separate process"。
+- 三段扇出点 `AsyncLLM._add_request`（L400-415）：`output_processor.add_request(...)` 进程内登记（L409）+ `await engine_core.add_request_async(request)` 发去独立 EngineCore 进程（L412）。
+- `RequestOutputCollector`（`output_processor.py:L45-106`）**不是** `asyncio.Queue`：单槽 `self.output`(单条) + `self.ready`(Event)；`put()` 置位 Event，消费者跟不上时用 `self.output.add(output, aggregate=...)` 合并而非排队；`get()` 等 `ready.wait()`，`get_nowait()` 是非阻塞快路径。
+- `generate()` 消费循环核心（`async_llm.py:L524-635`）：`out = q.get_nowait() or await q.get()`——先非阻塞取，空了才 await（注释：避免高负载下任务切换）；`out.finished` 收尾；`CancelledError`/`GeneratorExit` → `self.abort`（L591-593）。
+- `_run_output_handler`（L637-707）是生产者侧：单个长驻后台 `asyncio.Task`；循环 `await engine_core.get_output_async()`（L660）→ 按 `VLLM_V1_OUTPUT_PROC_CHUNK_SIZE` 分块 → `output_processor.process_outputs()`（L675）→ 块间 `await asyncio.sleep(0)`（L683）；`engine_core`/`output_processor` 捕成局部变量（L643-645）避免闭包反向引用 `self` 挡 GC。
+- `output_handler` 懒/急两种启动（L170-176,L373,L640-641）：`__init__` 先尝试 `asyncio.get_running_loop()`（急启动），拿不到就吞掉 `RuntimeError`；首次 `add_request`（L373）懒启动；`_run_output_handler`（L640-641）已启动则提前返回（幂等）——为了让 `__init__` 能在事件循环存在之前跑（OpenAI server 启动场景）。
+- 输出多路分发（demux）= `OutputProcessor.process_outputs`（`output_processor.py:L572-660`）：遍历 `EngineCoreOutputs`，按 `req_id`（L603）查 `RequestState`（L604，查不到=已 abort 则跳过），`if req_state.queue is not None: req_state.queue.put(request_output)`（L655-657）分发回该请求自己的队列；else 分支（L658-660）走同步 `LLMEngine` 路径。一批 EngineCore 输出可扇出到 N 个请求队列。
+- IPC 接缝（`core_client.py:L990-999,L1058-1061`）恰好两个 `AsyncMPClient` 方法：`add_request_async`（编码+经 ZMQ input_socket `_send_input`）与 `get_output_async`（await `self.outputs_queue`，由后台 `process_outputs_socket` 任务喂）；`AsyncLLM` 只看得到这两个 await，ZMQ/msgpack/进程管理全部藏在后面。
+- 跨进程消息是 `msgspec.Struct`（`vllm/v1/engine/__init__.py:L80-131,L161-191`）：`EngineCoreRequest`（进：tokenized prompt_token_ids + sampling_params）、`EngineCoreOutput`（出：request_id + new_token_ids + finish_reason；`.finished` 属性 L189 驱动 `generate` 停止）；`array_like`/`omit_defaults`/`gc=False` 压缩序列化。
+- `STREAM_FINISHED`（`vllm/outputs.py:L192`）是仅用于**流式输入**场景的哨兵 `RequestOutput(finished=True)`，解除 `generate` 循环阻塞；`generate` L585 跳过 yield 它。

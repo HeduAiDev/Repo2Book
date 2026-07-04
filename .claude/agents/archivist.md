@@ -19,7 +19,7 @@ color: cyan
 - `concepts.json` 概念登记表（v4-gap 治理）：`{"<术语>": "chNN"}` 记录每个核心概念**在哪章建立**——gap 审计据此判定"前章已立"。归档时把本章新建立的概念写入。
 
 ## 上下文再水化（每章开工前）
-给即将开工的角色一份 <500 词简报：本章 `python3 scripts/bible.py due {chapter_id}` 结果 + 前序相关章节摘要 + 用户反馈 + 相关 wisdom/knowledge。SendMessage 发给该角色。
+给即将开工的角色一份 <500 词简报：本章 `python3 scripts/bible.py due {chapter_id}` 结果 + 前序相关章节摘要 + 用户反馈。SendMessage 发给该角色。
 
 ## 终端归档（reviewer APPROVED 后触发）
 1. 备份本章各角色会话到 `trace/chapters/{chapter_id}/sessions/`；

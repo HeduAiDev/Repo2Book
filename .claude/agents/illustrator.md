@@ -47,4 +47,4 @@ color: purple
 ## 收工前自检
 `python3 scripts/lint_diagrams.py {chapter_dir}`(盲审 PENDING 阶段 manifest 项会报——
 正常,盲审 PASS 后消)+ `python3 scripts/lint_diagram_geometry.py {chapter_dir}/diagrams/*.svg`
-无问题。收工后 `python3 scripts/learn.py extract {chapter_id} illustrator`。
+无问题。

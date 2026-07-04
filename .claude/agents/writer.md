@@ -18,7 +18,7 @@ color: green
 ## 开工前
 读 `dossier/dossier.json`(mechanisms 清单)、`explainer/explainer.json`、`diagrams/`
 (figure-manifest + 各 PNG，**先 Read 几张 PNG 看看图长什么样再落笔**)、`implementation/`、
-`wisdom/writing.md`、`instances/<instance>/book/bible/voice-guide.md`(参考，不是枷锁)；
+`instances/<instance>/book/bible/voice-guide.md`(参考，不是枷锁)；
 跑 `python3 scripts/bible.py due {chapter_id}`；读 Archivist 再水化简报。
 
 ## 你的自由(明确授权)
@@ -46,4 +46,4 @@ color: green
 ## 收工前自检(均须无 BLOCKING)
 `lint_chapter_structure`、`lint_formulas`、`lint_source_grounding`、
 `lint_trace_consistency`(v3 新增，数字不漂移+机制覆盖)、(非 skip_impl 章)`lint_fidelity`。
-图的 linter 归 illustrator，你不用跑。收工后 `python3 scripts/learn.py extract {chapter_id} writer`。
+图的 linter 归 illustrator，你不用跑。

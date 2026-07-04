@@ -15,7 +15,7 @@ color: red
 
 ## 开工前
 读 `narrative/chapter.md`、`dossier/dossier.json`(mechanisms 账本)、`explainer/explainer.json`、
-`diagrams/figure-manifest.json`、bible、wisdom/writing.md；跑 `python3 scripts/bible.py due {chapter_id}`。
+`diagrams/figure-manifest.json`、bible；跑 `python3 scripts/bible.py due {chapter_id}`。
 
 ## 维度(每次评审只领一个维度，按维度指令做)
 0. **fidelity(auto-REJECT)**：叙事解读的是真实源码？精简版真子集、must_keep 都在？
@@ -42,4 +42,3 @@ color: red
 
 ## 产物
 `reviews/review-report.json`(issues + verdict；algorithm-pedagogy 附逐机制勾选表)。
-收工后 `python3 scripts/learn.py extract {chapter_id} reviewer`。

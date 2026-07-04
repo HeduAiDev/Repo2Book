@@ -2,7 +2,7 @@
 """repo2book 实例解析器 —— 让脚本去 vLLM 化、按「当前活动实例」运转。
 
 解析顺序：环境变量 REPO2BOOK_INSTANCE  >  顶层 repo2book.json 的 active_instance  >  "vllm"。
-每个实例 = instances/<name>/，自带 repo2book.json（源仓信息/书配置）、artifacts/、book/、knowledge/、trace/。
+每个实例 = instances/<name>/，自带 repo2book.json（源仓信息/书配置）、artifacts/、book/、trace/。
 
 CLI:  python3 scripts/instance.py [name|dir|artifacts|chapters|diagrams|source|config]
 库:   from instance import active_name, artifacts_dir, chapters_glob, ...
