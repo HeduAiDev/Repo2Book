@@ -19,7 +19,7 @@
 | exp-0705-11 | 2026-07-05 | 验证条件触发型行为(抢占/驱逐等)的测试须先证明触发条件本身成立,否则只是"没崩溃"非"验证了行为" | .claude/agents/tester.md | reviewer"测试通过但未覆盖目标分支"issue 数 | active |
 | exp-0705-12 | 2026-07-05 | 主编排者不得直接写 chapter.md 目前只是 prompt 层社会约定,无技术闸门拦截误覆盖事故 | docs/superpowers/ARCHITECT-RUNBOOK.md | narrative 被整体覆盖/清空事故次数 | active |
 | exp-0705-13 | 2026-07-05 | 衍生仓类实例(如 vllm-ascend)每章应钉住一个对位基座仓章节对照解读,现仅原则性表述未落成可检查动作 | .claude/agents/writer.md | 衍生仓连贯性审计"读者不知对应基座部分"issue 数 | active |
-| exp-0705-14 | 2026-07-05 | 内嵌源码拼接非相邻区间/静默抽行却无省略标记,标注行号区间与展示内容存在隐性缺口 | docs/superpowers/plans/briefs/lint-exp-002.md(linter:lint_fidelity) | 保真度"省略标记漏标/行号区间错位/悬空引用"issue 数 | pending-brief |
+| exp-0705-14 | 2026-07-05 | 内嵌源码拼接非相邻区间/静默抽行却无省略标记,标注行号区间与展示内容存在隐性缺口 | scripts/lint_fidelity.py(新增 elision_gap/non_adjacent_splice,按 dossier.embed_excerpts 核对;实测全书语料后降级为非阻断——dangling_reference 悬空引用检查因误报风险更高而暂缓,未实现) | 保真度"省略标记漏标/行号区间错位/悬空引用"issue 数 | active |
 | exp-0705-15 | 2026-07-05 | lint_source_grounding 源文件计数读内部 impl-notes.md 而非发布正文,对 OOT 插件类实例系统性误报 | scripts/lint_source_grounding.py(Check 4 改读 narrative,新增 impl_notes_incomplete 提示) | vllm_files_listed 非阻断误报数 | active |
 | exp-0705-16 | 2026-07-05 | difficulty=core 机制缺内嵌源码/三段式子标题,评审与结构 linter 核验粒度是全章级,个别机制漏内嵌拦不住 | docs/superpowers/plans/briefs/lint-exp-008.md(linter:lint_chapter_structure) | core 机制"缺内嵌源码/三段式不完整"blocking 条数 | pending-brief |
 | exp-0705-17 | 2026-07-05 | lint_formulas 密度启发式把单符号/简单变量 inline 也计入密度计数,数学密集章节噪音偏高 | scripts/lint_formulas.py(_is_simple_inline_formula,Check 6) | 数学密集章节 too_many_inline_formulas 告警数 | active |
