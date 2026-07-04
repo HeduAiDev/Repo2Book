@@ -99,7 +99,9 @@ rsvg-convert -z 2 <figure_id>.svg -o <figure_id>.png   # 勿用 ImageMagick conv
    `diagrams/figure-manifest.json` 对应条目的 `selfcheck`。**凭想象填表 = 造假。**
 
 3. **盲审(由流程/另一 agent 执行)**:只看 PNG + figure-spec(不看生成代码),复述图的论点、
-   逐个核数字。verdict 写进 manifest 的 `blind_review`。
+   逐个核数字。**图内演示数据须与 explainer 素材同源，不许另造**——盲审加一问:图是否真体现了
+   spec/正文强调的性质(关键现象/显式 shape),不止核对标签文字与数字正确性。verdict 写进
+   manifest 的 `blind_review`。
 
 ## Common Pitfalls(保留)
 

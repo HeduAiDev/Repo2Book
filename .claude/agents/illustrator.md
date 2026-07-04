@@ -37,6 +37,11 @@ color: purple
 
 ## 铁律
 - 图中每个数字来自 spec.numbers(带 provenance)。**禁止即兴加"示意数字"。**
+- **图数据须与 explainer 素材同源**：图中演示数据(block id、示例数值、含正文强调的边界情况如
+  非连续 id)必须与 dossier/explainer 同一组，并与 writer 定稿后的数值/计数逐字一致(图注数字、
+  alt 计数、算子总数等回填同步)；若图标题/正文声称某关键现象(如时间重叠、stride 被钉)，须核对
+  图中确实画出了该现象的可见证据；若图解对象在 dossier.theory 或正文有显式 shape 声明，图中
+  格子数/分区数须与该 shape 严格一致，不得为版式简化牺牲维度。
 - 一图一论点;每视觉组 ≤7 元素;>2 种语义色配图例;图注文案给结论。
 - 自查必须**先 Read PNG 再填表**——凭想象填表 = 造假,盲审和 linter 都会抓。
 - 收到盲审 FAIL:按 issue 的 suggested_fix 改,重渲重看,更新 manifest;不与盲审争风格,

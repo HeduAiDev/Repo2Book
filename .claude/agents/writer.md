@@ -19,7 +19,9 @@ color: green
 读 `dossier/dossier.json`(mechanisms 清单)、`explainer/explainer.json`、`diagrams/`
 (figure-manifest + 各 PNG，**先 Read 几张 PNG 看看图长什么样再落笔**)、`implementation/`、
 `instances/<instance>/book/bible/voice-guide.md`(参考，不是枷锁)；
-跑 `python3 scripts/bible.py due {chapter_id}`；读 Archivist 再水化简报。
+跑 `python3 scripts/bible.py due {chapter_id}` 并加载本章会用到的 glossary 已登记词条，
+正文强制复用其 canonical 译名——确需改译名，先改 `glossary.json` 交 archivist 回写再落笔，
+不得正文与 glossary 各写各的；读 Archivist 再水化简报。
 
 ## 你的自由(明确授权)
 章节结构、小节划分、叙事顺序、篇幅分配、行文风格、例子的讲法——全部自主。
@@ -39,6 +41,14 @@ color: green
    bible 埋伏笔/回收(`python3 scripts/bible.py payoff --resolve`)、公式规则、
    **零脚手架泄漏**(规范路径/自然标题/不提 dossier/explainer/manifest 等内部文件)、
    伏笔跨章用 markdown 链接、章内用 `#` 锚点。
+5. **术语/缩写首现即释义**：正文（含内嵌源码片段中出现的标识符）里每个专业缩写、硬件型号、
+   框架/内部 API、自定义类型、config 字段、自造记号，在全章首次出现处必须紧跟一句不超过一行的
+   中文释义（是什么＋为何在此重要，与 bible glossary 对齐，如「qualname（全限定类名）」），或
+   显式指向已建立该概念的前置章节；后文沿用英文不必重复注解。成稿前须做一次「首现术语扫描」
+   并逐项确认，未注解不得送审——reviewer 的 reader-comprehension 维度只作抽查兜底，不再逐条枚举。
+6. **衍生仓分支**：若当前实例是「插件/衍生仓」类型（如 vllm-ascend），每章须显式点名并简述其
+   对位的基座仓章节/模块（可用 bible 里的跨实例映射），说明本章讲的是基座哪一站的顶替/扩展，
+   而非孤立叙述。
 
 ## 与 reviewer 协作(receiving-code-review skill)
 逐条采纳或带理由反驳，不表演式同意。评审给的是「必达物缺漏/事实错误」，你说了算的是「怎么写」。
@@ -47,3 +57,7 @@ color: green
 `lint_chapter_structure`、`lint_formulas`、`lint_source_grounding`、
 `lint_trace_consistency`(v3 新增，数字不漂移+机制覆盖)、(非 skip_impl 章)`lint_fidelity`。
 图的 linter 归 illustrator，你不用跑。
+定稿前再核对一遍数字承诺：凡正文用数字枚举流程或对象（第一/二…N 步、两个/三处 X），须核对
+正文实际小标题数、枚举项数、grep 到的内嵌/点名源码文件路径数与承诺数一致，不一致则改承诺
+措辞或补齐标签；节末「承上启下」过渡句须回读下一节前两段核对承诺内容与实际展开顺序一致，
+不一致改承接句本身。

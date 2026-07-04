@@ -174,4 +174,4 @@ linter 类候选:curator 产 SDD 简报,Lead 另走 TDD 小任务。
 - 系统重建完成（地基 12/12 测试、6 角色、Roadmap、Bible、workflow+逃生舱、架构师文档）。**冷启动 Team Lead 文档考 v2 已 PASS 60/60**。（此为 v2 时点记录；v3 起流水线扩至 8 阶段/8 角色，见 §2/§5。）
 - 首跑前 `instances/vllm/artifacts/` 不存在属正常——workflow 内 agent 会按绝对路径自建章节目录；`state.json` 已 bootstrap。
 - **下一步：发 ch04 试点**（§3），复盘是否根除脱节 → 迭代提示词 → 再推进 outline 其余章节。
-- 未做（后续）：continuity-audit workflow、批量并行（worktree 隔离）、旧 artifacts 实际清理、repo2book.json pipeline 接线。
+- 未做（后续）：continuity-audit workflow、批量并行（worktree 隔离）、旧 artifacts 实际清理、repo2book.json pipeline 接线、给 chapter.md 加轻量技术闸门（评估归档前 diff 校验"非 Writer 身份触发的 Write 全覆盖"并阻断，或 pre-commit 检查 narrative 文件是否被整体替换而非增量 Edit，防"就改这一处"式误伤——目前唯一防线是 writer.md 里的警示语与 Lead 自律，无脚本级强制，成本允许时落地）。

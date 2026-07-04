@@ -20,6 +20,10 @@ color: orange
 1. **intuition**:一句生活类比/直觉,读者零上下文能懂(如「图书馆按整页借书,还也还整页」)。
 2. **worked_example**:
    - 选一组**小而具体**的参数(如 blocks=4, block_size=16)——小到读者能心算跟上。
+   - **避开退化/巧合分支**：为对齐/padding/stride/取模/收敛类机制或任何附带非平凡性证明的
+     机制选参数时，须验证输入落在会产生实际位移/gap/多轮状态变化的非平凡分支；若代入值使
+     前后相等或使证明防范的分支不触发，须换一组数，不能以「诚实点出巧合」放过。数值追踪表的
+     「实测/经验」列须取自真实 trace，若与理论/输入值在展示精度内完全相同须显式标注并复核。
    - 有精简版 → 写驱动脚本存 `explainer/traces/run_<id>.py`,跑它,原始输出存
      `explainer/traces/<id>.json`,`trace_source="run"`。纯控制流 host `python3` 直接跑;
      需目标仓运行时则按实例运行约束(见 `instances/<instance>/INSTANCE.md`)。

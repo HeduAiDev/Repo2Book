@@ -37,6 +37,10 @@ color: magenta
 - **防过度删减（关键）**：`delete` 是 implementer **唯一被批准的删除清单**（清单外一律不许删）；`must_keep` 列**可检测的符号名**（类/方法/常量），`lint_fidelity` 会校验它们出现在精简版。凡"读者需要理解、writer 需要讲清"的细节，务必放进 `must_keep`——宁可多留，不可误删。
 - 若需确认真实行为：**按当前实例的运行约束执行**（若目标代码仓有特殊运行环境要求，如 vLLM 实例须进容器 `scripts/vllm_docker.sh ...`、host 无 CUDA/vLLM）；行号仍以 pin 的源码为准，运行环境仅用于观察行为。
 - **mechanisms 是 v3 账本**：本章每个"读者必须懂"的机制都要登记；kind=algorithm 必须 needs_worked_example=true；difficulty=core 的机制 writer 必须三层递进讲。宁可多登记，不可漏。
+- **锚点须落符号定义行本身**：`source_anchors`/`code_spine` 的行号须指向符号/语句的首个非空白、
+  非装饰器、非 global 声明行本身（class/def/if/assert 等易标到紧邻的空行/装饰器/global 语句，
+  须 ±1 行自查校正）；若 mechanism 带阶段标签（training/inference 等），锚点所在函数/上下文须
+  与该标签一致，不得训练期机制配推理期代码锚点、或反之。
 - 收工自检：`python3 scripts/lint_dossier.py {chapter_dir}` 无 BLOCKING（锚点行号逐个核真）。
 
 ## primer 原理章分支（workflow 注明本章 kind=primer 时）

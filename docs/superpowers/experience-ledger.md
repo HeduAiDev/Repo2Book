@@ -7,4 +7,20 @@
 | id | 日期 | pattern | 落点(文件) | 针对指标 | 状态 |
 |---|---|---|---|---|---|
 | exp-0705-1 | 2026-07-05 | primer 章含 engineering-only 机制时 lint_dossier 强制 paper_origin 误伤(ch32 实例) | scripts/lint_dossier.py(paper_origin_note 豁免) | lint_dossier 对 primer 章误报数 | active |
-| exp-0705-2 | 2026-07-05 | lint_paper_grounding 只读 paper.md,多论文包(paper-mtp.md 等)小节核对误报(ch33 评审发现) | 待落:linter 多论文支持(retro 候选) | paper_ref 误报数 | pending |
+| exp-0705-2 | 2026-07-05 | lint_paper_grounding 只读 paper.md,多论文包(paper-mtp.md 等)小节核对误报(ch33 评审发现) | docs/superpowers/plans/briefs/lint-exp-N2.md(linter:lint_paper_grounding) | paper_ref 误报数 | pending-brief |
+| exp-0705-3 | 2026-07-05 | 术语/缩写/硬件型号/内部 flag/自定义 API 首现处不给一句人话释义,靠 reviewer 逐条枚举打回(合并 exp-wisdom-4) | .claude/agents/writer.md | reviewer reader-comprehension 维度 issue 条数 | active |
+| exp-0705-4 | 2026-07-05 | 多维并行评审的维度划分有重叠,同一处内容偏差被两个维度/两轮各写一遍近乎逐字重复的 issue | .claude/agents/reviewer.md | review-report.json 重复/近重复 issue 条数 | active |
+| exp-0705-5 | 2026-07-05 | explainer 选的 worked example 参数落在退化/巧合分支(整除嵌套/位移0/前后相等/经验=理论),机制效果数字不可见 | .claude/agents/explainer.md | reviewer algorithm 维度"示例落退化值"issue 条数 | active |
+| exp-0705-6 | 2026-07-05 | 配图与正文最终稿数值/计数/示例数据不一致,或图未画出正文强调的核心现象,盲审只核标签数字不核性质 | .claude/agents/illustrator.md + .claude/skills/svg-diagram/SKILL.md | figure-integration/盲审维度"图-正文数值不一致/未体现现象"issue 条数 | active |
+| exp-0705-7 | 2026-07-05 | writer 动笔前不强制核对 Book Bible glossary,为已登记 canonical 词另造新译名/用不一致译名 | .claude/agents/writer.md | coherence 维度"术语译名漂移/另造新词"issue 条数 | active |
+| exp-0705-8 | 2026-07-05 | writer 用数字承诺流程步数/对象个数,写完不回读核对,与正文实际小标题数/枚举项数不一致 | .claude/agents/writer.md | coherence 维度"承诺 N 步/N 个与实际不符"issue 条数 | active |
+| exp-0705-9 | 2026-07-05 | dossier 锚点行号系统性偏向紧邻空行/装饰器/global 语句而非符号定义行,阶段语义(训练/推理)与机制描述文不对题 | .claude/agents/analyst.md | lint_dossier/reviewer"锚点标错/阶段语义不符"blocking 条数 | active |
+| exp-0705-10 | 2026-07-05 | F.linear(x, weight) 的 weight 形状是[out,in],用错形状不报错但数值静默错 | .claude/agents/implementer.md | tester REJECTED"形状对但数值错"类原因数 | active |
+| exp-0705-11 | 2026-07-05 | 验证条件触发型行为(抢占/驱逐等)的测试须先证明触发条件本身成立,否则只是"没崩溃"非"验证了行为" | .claude/agents/tester.md | reviewer"测试通过但未覆盖目标分支"issue 数 | active |
+| exp-0705-12 | 2026-07-05 | 主编排者不得直接写 chapter.md 目前只是 prompt 层社会约定,无技术闸门拦截误覆盖事故 | docs/superpowers/ARCHITECT-RUNBOOK.md | narrative 被整体覆盖/清空事故次数 | active |
+| exp-0705-13 | 2026-07-05 | 衍生仓类实例(如 vllm-ascend)每章应钉住一个对位基座仓章节对照解读,现仅原则性表述未落成可检查动作 | .claude/agents/writer.md | 衍生仓连贯性审计"读者不知对应基座部分"issue 数 | active |
+| exp-0705-14 | 2026-07-05 | 内嵌源码拼接非相邻区间/静默抽行却无省略标记,标注行号区间与展示内容存在隐性缺口 | docs/superpowers/plans/briefs/lint-exp-002.md(linter:lint_fidelity) | 保真度"省略标记漏标/行号区间错位/悬空引用"issue 数 | pending-brief |
+| exp-0705-15 | 2026-07-05 | lint_source_grounding 源文件计数读内部 impl-notes.md 而非发布正文,对 OOT 插件类实例系统性误报 | docs/superpowers/plans/briefs/lint-exp-003.md(linter:lint_source_grounding) | vllm_files_listed 非阻断误报数 | pending-brief |
+| exp-0705-16 | 2026-07-05 | difficulty=core 机制缺内嵌源码/三段式子标题,评审与结构 linter 核验粒度是全章级,个别机制漏内嵌拦不住 | docs/superpowers/plans/briefs/lint-exp-008.md(linter:lint_chapter_structure) | core 机制"缺内嵌源码/三段式不完整"blocking 条数 | pending-brief |
+| exp-0705-17 | 2026-07-05 | lint_formulas 密度启发式把单符号/简单变量 inline 也计入密度计数,数学密集章节噪音偏高 | docs/superpowers/plans/briefs/lint-exp-011.md(linter:lint_formulas) | 数学密集章节 too_many_inline_formulas 告警数 | pending-brief |
+| exp-0705-18 | 2026-07-05 | book-retro/book-gap-audit 的 args 若被注入为 JSON 字符串,args.instance 判断为假,静默回退到脚本内 CFG 默认值 | docs/superpowers/plans/briefs/lint-exp-N1.md(workflow:book-retro.js/book-gap-audit.js) | CFG 静默回退导致报告文不对题的事故次数 | pending-brief |

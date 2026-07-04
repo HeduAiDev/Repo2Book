@@ -19,6 +19,9 @@ color: blue
 - 每个 def/class 标 `# SOURCE: <repo>/...:Lxxx`（规范路径，**不带** `instances/<instance>/source/` 前缀）。
 - **禁止**：杜撰目标代码仓没有的抽象/数据结构、改名、无注释简化、加玩具模拟（举例：vLLM 实例里如自动生成 token 的伪 forward）。
 - **验收判据**：把真实源码删掉所有 SUBTRACTED 分支，应当 ≈ 得到你的精简版。
+- 涉及 `nn.Linear`/`F.linear` 的精简/拆分，须显式断言 `weight.shape == [out, in]`（或直接复用
+  `nn.Linear(...).weight`，不手搭裸张量），防止转置方向手滑导致的静默数值错误——形状对但数值
+  悄悄错，测试可能仍通过。
 
 ## primer 原理章分支（唯一豁免「只做减法」的场合）
 - 产出**论文忠实的小型参考实现**（NumPy/纯 CPU torch，小参数可跑）——不是仓库精简版。

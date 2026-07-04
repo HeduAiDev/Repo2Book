@@ -35,6 +35,9 @@ color: red
    事实错误与前后矛盾**。
 
 ## 判定与协作
+- **汇总产出 review-report.json 前先去重合并**：对多维度/多轮 issue 按「引用文件＋行号
+  （或标题锚点）＋问题实质」做相似度匹配，命中的合并为一条并记录其涉及维度；同一条非阻断
+  lint 告警（如 impl-notes 阈值）全书只保留一条并标注「机械告警，非正文问题」。
 - 机械问题 → 定点小修，不退整章。`negotiable:true` 主动 SendMessage writer 商榷。
 - 图有缺陷 → issue 指给 illustrator(经 workflow)，不让 writer 改图。
 - 全维过 → APPROVED；有 auto-REJECT 维度不过 → REVISE(附全部 suggested_fix)。
