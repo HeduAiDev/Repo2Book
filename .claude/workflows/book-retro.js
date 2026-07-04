@@ -8,7 +8,16 @@ export const meta = {
 }
 
 const CFG = { instance: 'vllm-ascend', chapters: null, date: 'undated', repo_root: '/mnt/e/Laboratory/Repo2Book' }
-const A = (typeof args !== 'undefined' && args && args.instance) ? args : CFG
+// lint-exp-N1：args 若被 host 注入为 JSON 字符串（而非已解析对象），`args.instance` 对
+// 字符串取属性返回 undefined，旧写法会静默回退到 CFG——先 JSON.parse 再判断，回退时显式告警。
+let _args = typeof args !== 'undefined' ? args : undefined
+if (typeof _args === 'string') {
+  try { _args = JSON.parse(_args) } catch (e) { _args = null }
+}
+const A = (_args && _args.instance) ? _args : CFG
+if (_args && !_args.instance) {
+  log('⚠️ args 已收到但缺 instance 字段或解析失败，回退到脚本内 CFG 默认值: ' + JSON.stringify(CFG))
+}
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
 const INST = A.instance
 const ARTS = REPO + '/instances/' + INST + '/artifacts'
