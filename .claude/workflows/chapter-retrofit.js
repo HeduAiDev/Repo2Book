@@ -97,6 +97,7 @@ if (expl && expl.status === 'BLOCKED') return { escalated: 'explain', stage: 'Ex
 // ---------- Phase 3: Illustrate（补图/换图，视觉自查 + 盲审） ----------
 let blindV = null
 let blindLedger = []
+let blindHistory = []
 for (let b = 1; b <= 3; b++) {
   phase('Illustrate')
   const ill = await agent(
@@ -114,6 +115,7 @@ for (let b = 1; b <= 3; b++) {
     '返回 all_pass 与 failures（figure_id + problem + suggested_fix）。',
     { schema: BLIND_SCHEMA, label: 'blind-review r' + b, phase: 'Illustrate', agentType: 'general-purpose', model: MODELS.blind }
   )
+  blindHistory.push({ round: b, failures: (blindV && blindV.failures) || [] })
   if (blindV && blindV.all_pass) break
   blindLedger = ((blindV && blindV.failures) || []).map(function (f) { return '[' + f.figure_id + '] ' + f.problem + ' → ' + f.suggested_fix })
   log('盲审第 ' + b + ' 轮 FAIL：' + blindLedger.length + ' 张图打回')
@@ -127,8 +129,10 @@ const DIMS = [
 ]
 let reviewV = null
 let issuesForWriter = []
+let reviewRounds = 0
 for (let r = 1; r <= 2; r++) {
   phase('PatchWrite')
+  reviewRounds = r
   const pw = await agent(
     head('writer') +
     '任务：**外科手术式**修改 ' + CH + '/narrative/chapter.md——**只许 Edit 定点修改** flagged 机制的算法段与图引用处。\n' +
@@ -164,9 +168,18 @@ if (!reviewV || reviewV.verdict !== 'APPROVED') return { chapter: A.chapter_id, 
 
 // ---------- Phase 6: Archive ----------
 phase('Archive')
+const runLedger = JSON.stringify({
+  chapter_id: A.chapter_id, kind: 'retrofit',
+  flagged: diag.flagged_count,
+  impl_test_rounds: 0, impl_test_ledger: [],
+  write_review_rounds: reviewRounds,
+  blind_rounds: blindHistory.length, blind_failures: blindHistory,
+  escalated: null,
+})
 const arch = await agent(
   head('archivist') +
   '任务一：把这个 review 对象**原样**写入 ' + CH + '/reviews/retrofit-review.json：\n' + JSON.stringify(reviewV) + '\n' +
+  '任务一b：把这个 run-ledger 对象**原样**写入 ' + CH + '/reviews/run-ledger.json：\n' + runLedger + '\n' +
   '任务二：在 bible 的 figures.json 登记本章新图（{mechanism_id, figure_id, chapter_id: "' + A.chapter_id + '", claim}，文件在 instances/' + INST + '/book/bible/figures.json，不存在则创建）。\n' +
   '任务三：`python3 ' + REPO + '/scripts/archivist.py record --type delivery` 记 retrofit 交付并更新 trace/state.json。返回一句话状态。',
   { label: 'archive', phase: 'Archive', agentType: 'general-purpose', model: MODELS.archive }
