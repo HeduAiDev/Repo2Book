@@ -57,3 +57,30 @@ def test_missing_source_dir_warns_only(tmp_path):
 
 def test_duplicate_id_blocking(tmp_path):
     assert lint_dossier(_mk(tmp_path, [GOOD_MECH, dict(GOOD_MECH)]))["mechanism"]
+
+
+def test_paper_origin_valid_passes(tmp_path):
+    m = dict(GOOD_MECH, paper_origin={"paper": "arXiv:2211.17192", "sections": ["§3.1"]})
+    r = lint_dossier(_mk(tmp_path, [m]))
+    assert not r["mechanism"]
+
+
+def test_paper_origin_bad_id_blocking(tmp_path):
+    m = dict(GOOD_MECH, paper_origin={"paper": "某论文", "sections": ["§3"]})
+    assert lint_dossier(_mk(tmp_path, [m]))["mechanism"]
+
+
+def test_paper_origin_empty_sections_blocking(tmp_path):
+    m = dict(GOOD_MECH, paper_origin={"paper": "arXiv:2211.17192", "sections": []})
+    assert lint_dossier(_mk(tmp_path, [m]))["mechanism"]
+
+
+def test_prereq_missing_dir_warns_only(tmp_path):
+    m = dict(GOOD_MECH, prereq="ch31")
+    r = lint_dossier(_mk(tmp_path, [m]))
+    assert r["warn"] and not r["mechanism"]
+
+
+def test_algorithm_without_paper_origin_warns(tmp_path):
+    r = lint_dossier(_mk(tmp_path, [GOOD_MECH]))   # GOOD_MECH 无 paper_origin
+    assert any("paper_origin" in w for w in r["warn"])

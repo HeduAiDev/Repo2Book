@@ -5,8 +5,9 @@ mechanisms 是"一图讲一机制、一例讲一算法"的覆盖度账本:explai
 illustrator 按它配图、reviewer 按它对账。
 
 阻断项:JSON 不合法/缺 mechanisms;机制缺必填字段、枚举非法、id 重复;
-        kind=algorithm 但 needs_worked_example!=true;source_anchors 格式非法/文件不存在/行号越界。
-警告项:实例 source/ 不在(跳过锚点行号核验)。
+        kind=algorithm 但 needs_worked_example!=true;source_anchors 格式非法/文件不存在/行号越界;
+        paper_origin 格式非法(arXiv id/URL、sections 非空)。
+警告项:实例 source/ 不在(跳过锚点行号核验)。警告:algorithm 无 paper_origin;prereq 章目录缺失。
 用法:python3 lint_dossier.py <chapter_dir>   阻断项存在则 exit 1。
 """
 import json
@@ -17,6 +18,7 @@ from pathlib import Path
 KINDS = {"algorithm", "dataflow", "layout", "protocol", "config"}
 DIFF = {"core", "supporting"}
 ANCHOR = re.compile(r'^([\w./-]+\.\w+):L(\d+)(?:-L?(\d+))?$')
+PAPER_ID = re.compile(r'^(arXiv:\d{4}\.\d{4,5}(v\d+)?|https?://\S+)$')
 
 
 def _source_root(chapter_dir: Path):
@@ -61,6 +63,20 @@ def lint_dossier(chapter_dir: str) -> dict:
             res["mechanism"].append(f"  {mid}: difficulty={m.get('difficulty')!r} 非法(core|supporting)")
         if m.get("kind") == "algorithm" and m.get("needs_worked_example") is not True:
             res["mechanism"].append(f"  {mid}: kind=algorithm 必须 needs_worked_example=true")
+        po = m.get("paper_origin")
+        if po is not None:
+            if not PAPER_ID.match(str(po.get("paper", ""))):
+                res["mechanism"].append(f"  {mid}: paper_origin.paper 格式非法(应为 arXiv:NNNN.NNNNN 或 URL)")
+            if not isinstance(po.get("sections"), list) or not po.get("sections"):
+                res["mechanism"].append(f"  {mid}: paper_origin.sections 须为非空列表(§/Eq 锚)")
+        elif m.get("kind") == "algorithm":
+            res["warn"].append(f"  {mid}: kind=algorithm 且无 paper_origin——确认该算法确无论文出处")
+        pr = m.get("prereq")
+        if pr:
+            arts = d.resolve()
+            arts = next((p for p in arts.parents if p.name == "artifacts"), None)
+            if arts is None or not list(arts.glob(pr + "-*")):
+                res["warn"].append(f"  {mid}: prereq={pr} 对应章目录尚不存在(原理章未建则属正常)")
         for a in m.get("source_anchors") or []:
             am = ANCHOR.match(a)
             if not am:
