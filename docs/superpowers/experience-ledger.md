@@ -7,7 +7,7 @@
 | id | 日期 | pattern | 落点(文件) | 针对指标 | 状态 |
 |---|---|---|---|---|---|
 | exp-0705-1 | 2026-07-05 | primer 章含 engineering-only 机制时 lint_dossier 强制 paper_origin 误伤(ch32 实例) | scripts/lint_dossier.py(paper_origin_note 豁免) | lint_dossier 对 primer 章误报数 | active |
-| exp-0705-2 | 2026-07-05 | lint_paper_grounding 只读 paper.md,多论文包(paper-mtp.md 等)小节核对误报(ch33 评审发现) | scripts/lint_paper_grounding.py(复核:现状已 glob 全部 *.md 拼接,误报已由其他改动连带修复;仅补 scripts/tests/test_lint_paper_grounding.py 回归测试固化) | paper_ref 误报数 | active |
+| exp-0705-2 | 2026-07-05 | lint_paper_grounding 只读 paper.md,多论文包(paper-mtp.md 等)小节核对误报(ch33 评审发现) | scripts/lint_paper_grounding.py(Check 3 glob 全部 *.md 拼接再 grep——该修复原以未提交工作区改动形态存在,本轮正式落盘)+scripts/tests/test_lint_paper_grounding.py 回归测试 | paper_ref 误报数 | active |
 | exp-0705-3 | 2026-07-05 | 术语/缩写/硬件型号/内部 flag/自定义 API 首现处不给一句人话释义,靠 reviewer 逐条枚举打回(合并 exp-wisdom-4) | .claude/agents/writer.md | reviewer reader-comprehension 维度 issue 条数 | active |
 | exp-0705-4 | 2026-07-05 | 多维并行评审的维度划分有重叠,同一处内容偏差被两个维度/两轮各写一遍近乎逐字重复的 issue | .claude/agents/reviewer.md | review-report.json 重复/近重复 issue 条数 | active |
 | exp-0705-5 | 2026-07-05 | explainer 选的 worked example 参数落在退化/巧合分支(整除嵌套/位移0/前后相等/经验=理论),机制效果数字不可见 | .claude/agents/explainer.md | reviewer algorithm 维度"示例落退化值"issue 条数 | active |
@@ -21,6 +21,6 @@
 | exp-0705-13 | 2026-07-05 | 衍生仓类实例(如 vllm-ascend)每章应钉住一个对位基座仓章节对照解读,现仅原则性表述未落成可检查动作 | .claude/agents/writer.md | 衍生仓连贯性审计"读者不知对应基座部分"issue 数 | active |
 | exp-0705-14 | 2026-07-05 | 内嵌源码拼接非相邻区间/静默抽行却无省略标记,标注行号区间与展示内容存在隐性缺口 | scripts/lint_fidelity.py(新增 elision_gap/non_adjacent_splice,按 dossier.embed_excerpts 核对;实测全书语料后降级为非阻断——dangling_reference 悬空引用检查因误报风险更高而暂缓,未实现) | 保真度"省略标记漏标/行号区间错位/悬空引用"issue 数 | active |
 | exp-0705-15 | 2026-07-05 | lint_source_grounding 源文件计数读内部 impl-notes.md 而非发布正文,对 OOT 插件类实例系统性误报 | scripts/lint_source_grounding.py(Check 4 改读 narrative,新增 impl_notes_incomplete 提示) | vllm_files_listed 非阻断误报数 | active |
-| exp-0705-16 | 2026-07-05 | difficulty=core 机制缺内嵌源码/三段式子标题,评审与结构 linter 核验粒度是全章级,个别机制漏内嵌拦不住 | docs/superpowers/plans/briefs/lint-exp-008.md(linter:lint_chapter_structure) | core 机制"缺内嵌源码/三段式不完整"blocking 条数 | pending-brief |
+| exp-0705-16 | 2026-07-05 | difficulty=core 机制缺内嵌源码/三段式子标题,评审与结构 linter 核验粒度是全章级,个别机制漏内嵌拦不住 | scripts/lint_chapter_structure.py(新增 core_mechanism_missing_source:逐 core 机制核 source_anchors 与正文代码块区间相交;ch31/ch32 逗号列表式 marker 漏认→按防回归硬规则降级 warn,解析补全后再升 blocking;三段式子标题检查为第二迭代未做) | core 机制"缺内嵌源码/三段式不完整"blocking 条数 | active |
 | exp-0705-17 | 2026-07-05 | lint_formulas 密度启发式把单符号/简单变量 inline 也计入密度计数,数学密集章节噪音偏高 | scripts/lint_formulas.py(_is_simple_inline_formula,Check 6) | 数学密集章节 too_many_inline_formulas 告警数 | active |
 | exp-0705-18 | 2026-07-05 | book-retro/book-gap-audit 的 args 若被注入为 JSON 字符串,args.instance 判断为假,静默回退到脚本内 CFG 默认值 | .claude/workflows/book-retro.js,.claude/workflows/book-gap-audit.js(内联 JSON.parse 护栏+log 告警);.claude/workflows/lib/resolve-cfg.js(纯函数单测参照,node --test) | CFG 静默回退导致报告文不对题的事故次数 | active |
