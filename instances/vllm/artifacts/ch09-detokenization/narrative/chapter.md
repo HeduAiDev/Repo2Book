@@ -4,7 +4,7 @@
 
 ![你在这里：Stage 3 输出处理里的去 token 化](../diagrams/roadmap.png)
 
-> *图注：全书地图高亮当前位置。[第 8 章](../ch08-output-processor/narrative/chapter.md) 拆开了 Stage 3 的那条单循环 `process_outputs()`——一整批混着 N 个请求的 token，怎么被解多路复用、扇出回 N 个客户端流。本章钻进那条单循环里被一笔带过的一个调用：`detokenizer.update()`。它负责把 token id 增量地变成文字、检测 stop string、按 `min_tokens` 守住下限，还要在 UTF-8 多字节字符被拆到多个 token 上时不吐半个乱码。再往后，[第 10 章](../ch10-logprobs/narrative/chapter.md) 接着讲同一循环里的另一笔账——logprobs 的组装。*
+> *图注：全书地图高亮当前位置。[第 8 章](../../ch08-output-processor/narrative/chapter.md) 拆开了 Stage 3 的那条单循环 `process_outputs()`——一整批混着 N 个请求的 token，怎么被解多路复用、扇出回 N 个客户端流。本章钻进那条单循环里被一笔带过的一个调用：`detokenizer.update()`。它负责把 token id 增量地变成文字、检测 stop string、按 `min_tokens` 守住下限，还要在 UTF-8 多字节字符被拆到多个 token 上时不吐半个乱码。再往后，[第 10 章](../../ch10-logprobs/narrative/chapter.md) 接着讲同一循环里的另一笔账——logprobs 的组装。*
 
 第 8 章那条单循环里有一行，当时我们故意没展开：
 
@@ -611,4 +611,4 @@ if finish_reason is not None:
 - **stop string 跨 token**：流式扣住尾部 $L-1$ 个字符（`stop_buffer_length`），证明了这是充分且最省的 holdback；`check_stop_strings` 只在 `1-new_char_count-L` 起的窗口里搜，把匹配从 $O(n^2)$ 降到近线性。
 - **min_tokens**：两道闸——offset 推进排除早期字符、`num_output_tokens() > min_tokens` 门控查 stop 时机——守住"至少生成这么多"的硬下限。
 
-最后，stop string 是文本层信号，必须反向 abort 回 token 层的 EngineCore，才能真正释放资源。下一章，[第 10 章](../ch10-logprobs/narrative/chapter.md) 接着拆同一条单循环里的另一笔账——logprobs 的组装，以及它自己那套 byte-fallback 修正。
+最后，stop string 是文本层信号，必须反向 abort 回 token 层的 EngineCore，才能真正释放资源。下一章，[第 10 章](../../ch10-logprobs/narrative/chapter.md) 接着拆同一条单循环里的另一笔账——logprobs 的组装，以及它自己那套 byte-fallback 修正。

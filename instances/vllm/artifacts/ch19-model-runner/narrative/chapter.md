@@ -36,7 +36,7 @@
 
 为什么要这么拆？答案藏在一个字里——**前向是异步发起的**。`_model_forward()` 把一串 kernel 提交（issue）给 GPU 之后就立刻返回了，kernel 还在 GPU 上排队跑，`logits` 这块显存里此刻还没有真正算好的数值。要读它的值，得等一次 GPU→CPU 同步。
 
-如果在 `execute_model()` 里紧接着采样，就被迫在这里同步等待——CPU 干等 GPU。但把采样推迟到 `sample_tokens()`，CPU 在这两个方法之间的空档里就能去干别的：发起**下一拍**的前向、构建下一批的调度。这正是 [第11章](../ch11-engine-core/narrative/chapter.md) 讲的 EngineCore 执行/调度重叠机制，落到 worker 这一层的具体抓手。
+如果在 `execute_model()` 里紧接着采样，就被迫在这里同步等待——CPU 干等 GPU。但把采样推迟到 `sample_tokens()`，CPU 在这两个方法之间的空档里就能去干别的：发起**下一拍**的前向、构建下一批的调度。这正是 [第11章](../../ch11-engine-core/narrative/chapter.md) 讲的 EngineCore 执行/调度重叠机制，落到 worker 这一层的具体抓手。
 
 本章就沿着这条两阶段主线，看清三件事：
 
@@ -465,7 +465,7 @@ assert runner.input_ids.cpu[0] == Z                       # 上拍写回的 Z，
 
 ### 异步调度下的一个变奏
 
-写回循环开头那个 `if self.use_async_scheduling:` 分支值得提一句。异步调度为了避免在 `sample_tokens()` 里做 GPU→CPU 同步（那会破坏前向/采样重叠），CPU 侧的 `token_ids_cpu` 这一拍只写**占位** `-1`，真实采样 token 留在 GPU 上的 `prev_sampled_token_ids`，等下一拍准备输入时直接在 GPU 上 scatter 进 `input_ids`。计数照常推进，闭环逻辑不变，只是真实 token 走 GPU 这条更快的路、绕开了一次同步。这呼应了 [第11章](../ch11-engine-core/narrative/chapter.md) 异步调度对「乐观推进、占位」的处理——同一个思路在 worker 层的落点。
+写回循环开头那个 `if self.use_async_scheduling:` 分支值得提一句。异步调度为了避免在 `sample_tokens()` 里做 GPU→CPU 同步（那会破坏前向/采样重叠），CPU 侧的 `token_ids_cpu` 这一拍只写**占位** `-1`，真实采样 token 留在 GPU 上的 `prev_sampled_token_ids`，等下一拍准备输入时直接在 GPU 上 scatter 进 `input_ids`。计数照常推进，闭环逻辑不变，只是真实 token 走 GPU 这条更快的路、绕开了一次同步。这呼应了 [第11章](../../ch11-engine-core/narrative/chapter.md) 异步调度对「乐观推进、占位」的处理——同一个思路在 worker 层的落点。
 
 ### PP 非末位 rank 的变奏（v0.21.0）
 

@@ -112,7 +112,7 @@ self.engine_core = EngineCoreClient.make_async_mp_client(
 
 同步版用 `make_client`，服务版用 `make_async_mp_client`。后者的注释直说：`starts the engine in background process`——**引擎内核被搬进了一个独立的子进程**。
 
-这就是解耦的物理基础。GPU 重活的 `EngineCore` 在另一个进程跑，API 这边的事件循环不会被它的前向计算阻塞。两个进程之间靠进程间通信（IPC）传消息，那套 ZMQ + msgpack 的机制本身就是一章的分量，[第 7 章会专门拆开它](../ch07-engine-core/narrative/chapter.md)。
+这就是解耦的物理基础。GPU 重活的 `EngineCore` 在另一个进程跑，API 这边的事件循环不会被它的前向计算阻塞。两个进程之间靠进程间通信（IPC）传消息，那套 ZMQ + msgpack 的机制本身就是一章的分量，[第 7 章会专门拆开它](../../ch07-engine-core/narrative/chapter.md)。
 
 可一旦内核进了另一个进程，新问题来了：它在那边一拍拍吐 token，谁负责把这些输出送回每个等待中的请求？答案是一个**背景任务**：
 
@@ -164,7 +164,7 @@ async def output_handler():
 
 不用细究每一行——这里只看那个清晰的三步骨架：**1) 从内核拉一批输出 → 2) 交给 `OutputProcessor` 还原 → 3) 把因 stop string 结束的请求叫停**。中间那句 `await asyncio.sleep(0)` 是个细节伏笔：批量大时它主动让出事件循环，免得堵住其他协程。
 
-这套"输入处理在本进程、内核在外进程、背景 handler 把输出多路复用回各请求队列"的架构，是 v1 的皇冠明珠。它复杂、精巧，值得整整一个 Part。所以本书把它列为**旗舰 [Part II（第 4–10 章）](../ch04-async-llm/narrative/chapter.md)**，从 `AsyncLLM` 门面一路拆到增量 detokenize 和 logprobs 装配。本章只让你认得它的轮廓。
+这套"输入处理在本进程、内核在外进程、背景 handler 把输出多路复用回各请求队列"的架构，是 v1 的皇冠明珠。它复杂、精巧，值得整整一个 Part。所以本书把它列为**旗舰 [Part II（第 4–10 章）](../../ch04-async-llm/narrative/chapter.md)**，从 `AsyncLLM` 门面一路拆到增量 detokenize 和 logprobs 装配。本章只让你认得它的轮廓。
 
 ### 转变二：跨拍持久批次与连续批处理
 
@@ -202,7 +202,7 @@ def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
 
 三步对应函数 docstring 自己的概括：**`schedule()`（这一拍跑哪些 token）→ `execute_model`（前向）→ `update_from_output`（出 token、回收已完成、续接未完成）**。token 就是这样一拍一拍产出来的。（上面代码里 `execute_model` 触发前向，采样 `sample_tokens` 是"执行"阶段的尾子步——这里只点位置，细节留给 Part V。）
 
-调度器怎么用 token 预算挑请求、怎么抢占、批次怎么跨拍持久存在——这些是 [Part IV（第 13–16 章）](../ch13-scheduler/narrative/chapter.md) 的内容。本章只让你记住 `step` 的这个"调度—执行—更新"三拍节奏。
+调度器怎么用 token 预算挑请求、怎么抢占、批次怎么跨拍持久存在——这些是 [Part IV（第 13–16 章）](../../ch13-scheduler/narrative/chapter.md) 的内容。本章只让你记住 `step` 的这个"调度—执行—更新"三拍节奏。
 
 ### 转变三：torch.compile piecewise 编译
 
@@ -244,13 +244,13 @@ class CUDAGraphMode(enum.Enum):
 
 那 `PIECEWISE` 在哪？在下面**另一个**枚举 `CUDAGraphMode` 里（值为 1），讲的是 CUDA graph 怎么分段捕获，是完全不同的一回事。一个管 torch.compile 的编译策略，一个管 CUDA graph 的捕获模式——名字撞脸，但别混。本书讲"v1 的 piecewise 编译"时，指的永远是 `VLLM_COMPILE`。
 
-编译这条线——自定义算子怎么插进图、piecewise 后端怎么按形状区间分派 CUDA graph——是 [Part VI（第 22–28 章）](../ch23-custom-ops-and-compilation/narrative/chapter.md) 的核心。
+编译这条线——自定义算子怎么插进图、piecewise 后端怎么按形状区间分派 CUDA graph——是 [Part VI（第 22–28 章）](../../ch23-custom-ops-and-compilation/narrative/chapter.md) 的核心。
 
 ### 转变四：分页 KV cache
 
 第四个转变是内存。v1 的 KV cache 是**分页**的：先做一遍显存 profiling，按剩下多少显存切成固定大小的块，再由调度器和块池统一管理。分页之后能做前缀复用、动态分配、避免碎片——这是高吞吐推理的内存基石。
 
-它就建在 `EngineCore` 的构造里：profiling 跑完才初始化分页 KV cache，紧接着建调度器。块池、前缀缓存、块的引用计数与 LRU 回收，是 [Part IV 第 15–16 章](../ch15-kv-cache/narrative/chapter.md) 的主场。本章不展开，只标明它的位置。
+它就建在 `EngineCore` 的构造里：profiling 跑完才初始化分页 KV cache，紧接着建调度器。块池、前缀缓存、块的引用计数与 LRU 回收，是 [Part IV 第 15–16 章](../../ch15-kv-cache/narrative/chapter.md) 的主场。本章不展开，只标明它的位置。
 
 ## 1.3 两个使用面：同一个内核，两种驱动
 
@@ -309,7 +309,7 @@ def run_busy_loop(self):
 | 输出回送 | step 返回值直接拿 | 背景 `output_handler` 多路复用回各队列 |
 | 适合场景 | 离线批量、吞吐 | 在线服务、低延迟高并发 |
 
-同一个 `EngineCore.step`，离线由你的线程一拍拍敲，服务由子进程自己一拍拍转。心跳一样，握把不同。离线面的全部细节在 [第 31 章](../ch31-entrypoints/narrative/chapter.md)，服务面在 [第 32 章](../ch32-entrypoints/narrative/chapter.md)。
+同一个 `EngineCore.step`，离线由你的线程一拍拍敲，服务由子进程自己一拍拍转。心跳一样，握把不同。离线面的全部细节在 [第 31 章](../../ch31-entrypoints/narrative/chapter.md)，服务面在 [第 32 章](../../ch32-entrypoints/narrative/chapter.md)。
 
 ## 1.4 配置是怎么搭起来的
 
@@ -358,7 +358,7 @@ class VllmConfig:
 
 它的 docstring 自己点了题：`simplifies passing around the distinct configurations`——把十几个子系统的配置（模型、缓存、并行、调度、编译……）合成一个对象，全栈各层传一个 `vllm_config` 就够了，不用拖着十几个参数到处跑。
 
-本章只让你认得 `VllmConfig` 的存在和形状：它是聚合 dataclass，是"全栈传递的单一对象"。它每个子字段怎么从命令行参数装配出来、优化等级 O0–O3 怎么影响编译、工厂怎么据 flag 选 Executor，是 [第 3 章](../ch03-config-and-wiring/narrative/chapter.md) 的内容。
+本章只让你认得 `VllmConfig` 的存在和形状：它是聚合 dataclass，是"全栈传递的单一对象"。它每个子字段怎么从命令行参数装配出来、优化等级 O0–O3 怎么影响编译、工厂怎么据 flag 选 Executor，是 [第 3 章](../../ch03-config-and-wiring/narrative/chapter.md) 的内容。
 
 ## 1.5 这本书怎么读
 

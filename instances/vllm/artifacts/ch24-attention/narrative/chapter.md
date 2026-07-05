@@ -5,11 +5,11 @@
 ![你在这里：注意力后端子系统](../diagrams/roadmap.png)
 
 > *图注：全书地图高亮当前位置。*
-> *[模型定义那章](../ch22-model-definitions/narrative/chapter.md) 里，每个注意力层都建了一个 `Attention` 对象，但它具体走哪个 kernel、KV cache 长什么样，都被一句"运行时再说"带过了。*
+> *[模型定义那章](../../ch22-model-definitions/narrative/chapter.md) 里，每个注意力层都建了一个 `Attention` 对象，但它具体走哪个 kernel、KV cache 长什么样，都被一句"运行时再说"带过了。*
 > *本章把那句"再说"说清：后端怎么选、metadata 怎么从一份共享结构翻译成各 kernel 的专属结构、新算出的 KV 怎么照 `slot_mapping` 写进显存、历史 KV 怎么照 `block_table` 读回来。*
 > *再往后是各家 kernel 的内部实现细节，本章只到"调用边界"为止。*
 
-前面铺了很长的路。[KV cache 那章](../ch15-kv-cache/narrative/chapter.md) 把显存切成定长块、用 `block_table` 和 `slot_mapping` 两张表管页；[模型运行器那章](../ch18-model-runner/narrative/chapter.md) 在每步前把这两张表算好，塞进一份叫 `CommonAttentionMetadata` 的结构。但那两章都停在"算好了、放那儿了"。
+前面铺了很长的路。[KV cache 那章](../../ch15-kv-cache/narrative/chapter.md) 把显存切成定长块、用 `block_table` 和 `slot_mapping` 两张表管页；[模型运行器那章](../../ch18-model-runner/narrative/chapter.md) 在每步前把这两张表算好，塞进一份叫 `CommonAttentionMetadata` 的结构。但那两章都停在"算好了、放那儿了"。
 
 真正去用这两张表读写显存的人，是注意力后端。这一章我们就站在后端这一头，把整条链接住：
 
@@ -158,7 +158,7 @@ class AttentionBackend(ABC):
 逻辑形状恒为 `(2, num_blocks, block_size, num_kv_heads, head_size)`。逐维读一遍：
 
 - 头维 `2`：K 和 V。后面读 KV 时一句 `kv_cache.unbind(0)` 就能把它们拆成 `key_cache` 和 `value_cache`。
-- `num_blocks`：一共多少个物理块（由可用显存反推，见 [KV cache 容量规划那章](../ch16-kv-cache/narrative/chapter.md)）。
+- `num_blocks`：一共多少个物理块（由可用显存反推，见 [KV cache 容量规划那章](../../ch16-kv-cache/narrative/chapter.md)）。
 - `block_size`：每块装多少个 token（默认 16，所以这里 `block_size % 16 != 0` 直接报错）。
 - `num_kv_heads × head_size`：每个 token 的 KV 向量本体。GQA 下 `num_kv_heads < num_heads`，大幅压缩 KV。
 
@@ -561,7 +561,7 @@ class CommonAttentionMetadata:
 
 核心 8 个必填字段，认住就够了：`query_start_loc`（每请求在拼接 query 里的起点）、`seq_lens`（各请求已算了多少 token）、`num_reqs` / `num_actual_tokens`、`max_query_len` / `max_seq_len`，以及本章的两位主角——`block_table_tensor` 和 `slot_mapping`。
 
-这两个字段，正是 [模型运行器那章](../ch18-model-runner/narrative/chapter.md) 在每步算好、塞进 `CommonAttentionMetadata` 的那两张表。当时只说了"算好、放进接口字段，attention 后端那头会接住"。**现在我们接住了。** 它们就在这里，作为跨层共享的接口契约，等着被 builder 翻译、被 kernel 拿去读写显存。
+这两个字段，正是 [模型运行器那章](../../ch18-model-runner/narrative/chapter.md) 在每步算好、塞进 `CommonAttentionMetadata` 的那两张表。当时只说了"算好、放进接口字段，attention 后端那头会接住"。**现在我们接住了。** 它们就在这里，作为跨层共享的接口契约，等着被 builder 翻译、被 kernel 拿去读写显存。
 
 **为什么要分两层？** 因为 `block_table` / `slot_mapping` / `seq_lens` 这些量，对所有后端、所有层都一样。要是每个后端各算一遍，就是重复劳动。两层结构让这些共享量在运行器那头只算一次（每步与"请求数 + token 数"成线性），各后端的 builder 再按需补自己 kernel 要的特有字段。看翻译动作本身：
 
@@ -673,7 +673,7 @@ metadata 翻译好了，`block_table` 和 `slot_mapping` 都到了后端手里�
 
 ## 24.9 PagedAttention：照表读写 KV 显存
 
-[KV cache 那章](../ch15-kv-cache/narrative/chapter.md) 立下了两张表的语义，但只到"表算好了"为止。现在两张表落进了后端的手里，我们终于能看清它们怎么真正读写显存。先把寻址恒等式钉死。
+[KV cache 那章](../../ch15-kv-cache/narrative/chapter.md) 立下了两张表的语义，但只到"表算好了"为止。现在两张表落进了后端的手里，我们终于能看清它们怎么真正读写显存。先把寻址恒等式钉死。
 
 **PagedAttention 寻址恒等式。** 对第 $i$ 个 token：
 
@@ -872,7 +872,7 @@ assert torch.allclose(out, ref, atol=1e-5)
 
 最后一块拼图：一次前向里有几十个注意力层，每层有各自的 KV cache 张量、各自的 metadata。运行时怎么让"写算子"和"算算子"精确取到**本层**的料，而不是把这些当参数层层透传？
 
-答案是 `layer_name` 当键。这条线分两头——一头是 [模型定义那章](../ch22-model-definitions/narrative/chapter.md) 埋下的"后端选择"，另一头是这里要接住的"按 layer_name 取数"。先看选择那头，在 `Attention.__init__` 里（`vllm/model_executor/layers/attention/attention.py:L298`）：
+答案是 `layer_name` 当键。这条线分两头——一头是 [模型定义那章](../../ch22-model-definitions/narrative/chapter.md) 埋下的"后端选择"，另一头是这里要接住的"按 layer_name 取数"。先看选择那头，在 `Attention.__init__` 里（`vllm/model_executor/layers/attention/attention.py:L298`）：
 
 ```python
 # vllm/model_executor/layers/attention/attention.py:L298
@@ -939,7 +939,7 @@ assert torch.allclose(out, ref, atol=1e-5)
 
 > *图注：左侧主链——Attention.forward 先调 unified_kv_cache_update（写）再调 unified_attention_with_output（算+读），两者都只带 layer_name。右侧 forward_context 是 model_runner 那头按 layer_name 装好的仓库。两个算子各自经 get_attention_context(layer_name) 虚线连过去取本层的 kv_cache/metadata/slot_mapping。橙色虚线是 kv_cache_dummy_dep，串一条写→算的假依赖。*
 
-取数的落点是 `get_attention_context`，这正是 [模型定义那章](../ch22-model-definitions/narrative/chapter.md) 承诺会接住的另一头（`vllm/model_executor/layers/attention/attention.py:L642`）：
+取数的落点是 `get_attention_context`，这正是 [模型定义那章](../../ch22-model-definitions/narrative/chapter.md) 承诺会接住的另一头（`vllm/model_executor/layers/attention/attention.py:L642`）：
 
 ```python
 # vllm/model_executor/layers/attention/attention.py:L642
@@ -963,7 +963,7 @@ assert torch.allclose(out, ref, atol=1e-5)
     return attn_metadata, attn_layer, kv_cache, layer_slot_mapping
 ```
 
-这就是"取数"那头：`get_attention_context(layer_name)` 用 `layer_name` 当键，从全局 `forward_context` 里取出三样东西——本层的 `attn_metadata`（builder 在 [§24.8](#248-两层-metadata一份共享各自翻译) 翻译出来的那份）、`kv_cache`（绑定到本层的真实显存）、`slot_mapping`。`ForwardContext` 是一个全局线程局部对象（`vllm/forward_context.py`），由 [模型运行器那章](../ch18-model-runner/narrative/chapter.md) 在每步 `execute_model` 开头构造、注入当步的 metadata 与 slot_mapping，然后以 `with set_forward_context(ctx)` 的形式挂到进程上下文里——进入 `forward` 后任何代码都能 `get_forward_context()` 拿到它。模型运行器那头按 `layer_name` 把这些装进 `forward_context`，后端这头按 `layer_name` 消费。一存一取，键对上了。
+这就是"取数"那头：`get_attention_context(layer_name)` 用 `layer_name` 当键，从全局 `forward_context` 里取出三样东西——本层的 `attn_metadata`（builder 在 [§24.8](#248-两层-metadata一份共享各自翻译) 翻译出来的那份）、`kv_cache`（绑定到本层的真实显存）、`slot_mapping`。`ForwardContext` 是一个全局线程局部对象（`vllm/forward_context.py`），由 [模型运行器那章](../../ch18-model-runner/narrative/chapter.md) 在每步 `execute_model` 开头构造、注入当步的 metadata 与 slot_mapping，然后以 `with set_forward_context(ctx)` 的形式挂到进程上下文里——进入 `forward` 后任何代码都能 `get_forward_context()` 拿到它。模型运行器那头按 `layer_name` 把这些装进 `forward_context`，后端这头按 `layer_name` 消费。一存一取，键对上了。
 
 两个算子各自经 `get_attention_context` 拿到本层料后，分头干活（`vllm/model_executor/layers/attention/attention.py:L663`）：
 

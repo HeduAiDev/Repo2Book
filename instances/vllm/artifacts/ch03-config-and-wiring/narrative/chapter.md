@@ -6,7 +6,7 @@
 
 > *图注：全书路线图，画的是一个请求从入口到流式返回的生命周期。本章高亮在最左边的「入口」阶段——但严格说，本章讲的是比入口还早一拍的事：引擎被构造出来的那一瞬间。后面所有阶段（输入、调度、执行、输出）都依赖本章拼出来的那一个对象。*
 
-前两章我们已经有了底子：[vLLM v1 的整体心智模型](../ch01-overview/narrative/chapter.md)，以及[一个请求端到端的鸟瞰路径](../ch02-request-lifecycle/narrative/chapter.md)。鸟瞰那一章里，每个环节我们都假设「引擎已经建好了」——`AsyncLLM` 也好、`EngineCore` 也好、调度器也好，都是现成的。
+前两章我们已经有了底子：[vLLM v1 的整体心智模型](../../ch01-config-and-wiring/narrative/chapter.md)，以及[一个请求端到端的鸟瞰路径](../../ch02-entrypoints/narrative/chapter.md)。鸟瞰那一章里，每个环节我们都假设「引擎已经建好了」——`AsyncLLM` 也好、`EngineCore` 也好、调度器也好，都是现成的。
 
 可它们是怎么建好的？答案的入口是 `vllm/v1/engine/llm_engine.py` 里的一个类方法 `from_engine_args`——本章就从它讲起。
 
@@ -20,7 +20,7 @@
 - 为什么默认就有异步调度，但某些组合会自动退化；
 - `compute_hash` 那个 10 位短指纹是干嘛的，跟 `torch.compile` 缓存什么关系。
 
-本章的终点是 `EngineCore.__init__`——三个工厂的产物在那里汇合、实例化。它实例化出来的执行器和调度器**怎么跑**，分别留给 [第 13 章：连续批处理](../ch13-continuous-batching/narrative/chapter.md) 和 [第 17 章：执行器与 Worker 生命周期](../ch17-executors-workers/narrative/chapter.md)；本章只负责把它们**装配到位**。下一章 [第 4 章：AsyncLLM 三段式](../ch04-async-llm/narrative/chapter.md) 用的，正是本章拼出来的这个 `VllmConfig`。
+本章的终点是 `EngineCore.__init__`——三个工厂的产物在那里汇合、实例化。它实例化出来的执行器和调度器**怎么跑**，分别留给 [第 13 章：连续批处理](../../ch13-scheduler/narrative/chapter.md) 和 [第 17 章：执行器与 Worker 生命周期](../../ch17-worker-and-executor/narrative/chapter.md)；本章只负责把它们**装配到位**。下一章 [第 4 章：AsyncLLM 三段式](../../ch04-async-llm/narrative/chapter.md) 用的，正是本章拼出来的这个 `VllmConfig`。
 
 ---
 
@@ -313,7 +313,7 @@ class EngineArgs:
 
 ## 3.5 async_scheduling 三态决策：默认开，但会自动退化
 
-异步调度（async scheduling）是 vLLM v1 的一个性能特性——它让调度和执行能错开重叠（细节在 [第 4 章](../ch04-async-llm/narrative/chapter.md) 和调度章展开）。但它不是无条件能用的，跟一些特性不兼容。vLLM 用了一个很典型的「**三态字段**」来处理这种「默认想开、但有时得关」的情况。
+异步调度（async scheduling）是 vLLM v1 的一个性能特性——它让调度和执行能错开重叠（细节在 [第 4 章](../../ch04-async-llm/narrative/chapter.md) 和调度章展开）。但它不是无条件能用的，跟一些特性不兼容。vLLM 用了一个很典型的「**三态字段**」来处理这种「默认想开、但有时得关」的情况。
 
 `async_scheduling` 有三个值：`True`（用户显式要开）、`False`（用户显式要关）、`None`（默认，意思是「你看着办」）。看决策代码：
 
@@ -500,7 +500,7 @@ class EngineArgs:
 
 ## 3.8 第二级映射之三：IPC 客户端工厂 make_client
 
-第三个工厂连接的是 [第 4 章的异步三段式](../ch04-async-llm/narrative/chapter.md)。它根据「执行模式」选 IPC 客户端：
+第三个工厂连接的是 [第 4 章的异步三段式](../../ch04-async-llm/narrative/chapter.md)。它根据「执行模式」选 IPC 客户端：
 
 ```python
 # vllm/v1/engine/core_client.py:L80
@@ -539,7 +539,7 @@ class EngineArgs:
 | 是 | 是 | → `make_async_mp_client` | `AsyncLLM`（OpenAI server） |
 | 否 | 是 | `NotImplementedError`（暂不支持） | —— |
 
-回想 [3.1 节](#31-一句话钩子扁平进去结构化出来) 的入口代码，`LLMEngine` 调 `make_client` 时传的是 `asyncio_mode=False`——所以同步引擎走的是上半张表（`InprocClient` 或 `SyncMPClient`）。而 [第 4 章](../ch04-async-llm/narrative/chapter.md) 的 `AsyncLLM` 走的是 `make_async_mp_client` 这一支。来看它的细分：
+回想 [3.1 节](#31-一句话钩子扁平进去结构化出来) 的入口代码，`LLMEngine` 调 `make_client` 时传的是 `asyncio_mode=False`——所以同步引擎走的是上半张表（`InprocClient` 或 `SyncMPClient`）。而 [第 4 章](../../ch04-async-llm/narrative/chapter.md) 的 `AsyncLLM` 走的是 `make_async_mp_client` 这一支。来看它的细分：
 
 ```python
 # vllm/v1/engine/core_client.py:L105
@@ -563,7 +563,7 @@ class EngineArgs:
 
 异步客户端再按**数据并行（DP）维度**细分：单 DP → `AsyncMPClient`；多 DP 用外部负载均衡 → `DPAsyncMPClient`；多 DP 用内部负载均衡 → `DPLBAsyncMPClient`。
 
-> **v0.21.0 更新**：走到这条 external LB 分支之前，配置阶段收紧了它的适用范围——当 `data_parallel_size > 1` 且开了 external LB、而模型**不是 MoE** 时，`create_engine_config` 阶段就直接 `raise ValueError`，并提示「非 MoE 请改起多个独立 vLLM 实例」。换句话说，external LB 现在是 MoE 专属路径；以前非 MoE 也能进这条路（行为未定义），现在被提前挡住了。这些客户端的内部机制——ZMQ、msgpack、跨进程怎么通信——是 [第 7 章：IPC 边界](../ch07-ipc-boundary/narrative/chapter.md) 的内容；本章只需要知道：**`make_async_mp_client` 是异步三段式的入口**，它会起一个独立子进程把 `EngineCore` 跑起来。这就是 [第 4 章](../ch04-async-llm/narrative/chapter.md) 那张三段图里「进程边界」的来源。
+> **v0.21.0 更新**：走到这条 external LB 分支之前，配置阶段收紧了它的适用范围——当 `data_parallel_size > 1` 且开了 external LB、而模型**不是 MoE** 时，`create_engine_config` 阶段就直接 `raise ValueError`，并提示「非 MoE 请改起多个独立 vLLM 实例」。换句话说，external LB 现在是 MoE 专属路径；以前非 MoE 也能进这条路（行为未定义），现在被提前挡住了。这些客户端的内部机制——ZMQ、msgpack、跨进程怎么通信——是 [第 7 章：IPC 边界](../../ch07-engine-core/narrative/chapter.md) 的内容；本章只需要知道：**`make_async_mp_client` 是异步三段式的入口**，它会起一个独立子进程把 `EngineCore` 跑起来。这就是 [第 4 章](../../ch04-async-llm/narrative/chapter.md) 那张三段图里「进程边界」的来源。
 
 三个工厂讲完了，规律是统一的：**都从 `VllmConfig`（或它派生的 flag）出发，查表选出一个具体类**。同一套配置，在单卡/多卡、同步/异步、单 DP/多 DP 之下，选出完全不同的实现——而调用方一句都不用改。这就是「把配置和实现选择解耦」的全部含义。
 
@@ -885,7 +885,7 @@ OPTIMIZATION_LEVEL_TO_CONFIG = {
 
 （第三个工厂 `make_client` 在更外层、构造 `EngineCore` 之前就调用了——它决定了 `EngineCore` 是在本进程还是子进程里被构造的。）
 
-中间那行 `_initialize_kv_caches` 是另一桩重活：它会真的去 GPU 上 profiling，量出能给 KV cache 多少显存，再回填 `CacheConfig`。这部分属于 [第 15 章：分页 KV cache](../ch15-paged-kv-cache/narrative/chapter.md)，本章不展开——`CacheConfig.block_size` 和 `enable_prefix_caching` 这两个我们 [3.3 节](#33-create_engine_config把扁平参数重新打包) 打包进去的字段，到那一章才真正发挥作用。
+中间那行 `_initialize_kv_caches` 是另一桩重活：它会真的去 GPU 上 profiling，量出能给 KV cache 多少显存，再回填 `CacheConfig`。这部分属于 [第 15 章：分页 KV cache](../../ch15-kv-cache/narrative/chapter.md)，本章不展开——`CacheConfig.block_size` 和 `enable_prefix_caching` 这两个我们 [3.3 节](#33-create_engine_config把扁平参数重新打包) 打包进去的字段，到那一章才真正发挥作用。
 
 到这里，引擎就**装配完成**了：有了实例化的执行器，有了实例化的调度器，KV cache 也初始化了。它们具体怎么跑起来——执行器怎么驱动 worker、调度器怎么连续批处理——是后面章节的事。本章的使命，到「装配到位」为止。
 
@@ -999,4 +999,4 @@ baseline（TP=1, max_num_seqs=256, O2）
 - **指纹**（[3.10](#310-compute_hash计算图的-10-位指纹) 节）：`compute_hash` 只收影响计算图结构的因子，产 10 位指纹做 `torch.compile` 缓存键。理解它的作用域，就能预测哪些改动会触发重编译。
 - **汇合**（[3.11](#311-汇合点enginecore__init__三个工厂的产物落地) 节）：`EngineCore.__init__` 是终点——执行器类在这里才实例化（重资源推迟），调度器工厂在这里兑现。装配到此完成。
 
-读到这里，你应该能拿起任何一个 `vllm serve ...` 命令，在脑子里走一遍它会装配出什么样的引擎了。下一章我们用本章拼好的这个 `VllmConfig`，去看 [AsyncLLM 怎么把一个请求拆成三段、跨进程重叠跑](../ch04-async-llm/narrative/chapter.md)——那条进程边界，正是本章 `make_async_mp_client` 起的。
+读到这里，你应该能拿起任何一个 `vllm serve ...` 命令，在脑子里走一遍它会装配出什么样的引擎了。下一章我们用本章拼好的这个 `VllmConfig`，去看 [AsyncLLM 怎么把一个请求拆成三段、跨进程重叠跑](../../ch04-async-llm/narrative/chapter.md)——那条进程边界，正是本章 `make_async_mp_client` 起的。

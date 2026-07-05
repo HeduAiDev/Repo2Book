@@ -31,7 +31,7 @@
 2. **引擎段（独立 OS 进程）**：一个叫 `run_busy_loop` 的同步循环不停地「取请求 → 算一拍 → 吐结果」，跑模型前向、采样。它和 API 进程经 ZMQ 通信。
 3. **输出段（回到 API 进程）**：一个后台协程把引擎吐出来的 token 拉回来，去 token 化、判停止、组装成面向用户的 `RequestOutput`，再交还给等在那里的请求。
 
-为什么要拆成三段、还要把引擎单拎到另一个进程？一句话：**别让模型执行堵死 API 服务器**。模型前向是个被 GIL 绑死的重活，如果它和 HTTP 处理挤在同一个 Python 进程，一跑前向，整个事件循环就卡住，别的请求全得排队。把引擎拎进独立进程，API 进程就只剩下轻活——分词、组装、收结果、回 SSE——一个事件循环能轻松扛住大量并发连接。这条设计主线，[第 4 章](../ch04-async-llm/narrative/chapter.md) 会从 `AsyncLLM` 的搭建过程整章展开。
+为什么要拆成三段、还要把引擎单拎到另一个进程？一句话：**别让模型执行堵死 API 服务器**。模型前向是个被 GIL 绑死的重活，如果它和 HTTP 处理挤在同一个 Python 进程，一跑前向，整个事件循环就卡住，别的请求全得排队。把引擎拎进独立进程，API 进程就只剩下轻活——分词、组装、收结果、回 SSE——一个事件循环能轻松扛住大量并发连接。这条设计主线，[第 4 章](../../ch04-async-llm/narrative/chapter.md) 会从 `AsyncLLM` 的搭建过程整章展开。
 
 下面我们就顺着这张图，从入口走到出口。
 
@@ -93,7 +93,7 @@ else:
 self.input_processor.assign_request_id(request)
 ```
 
-`process_inputs()` 是 **Stage 1 的唯一出口**。它干的活包括：校验参数、把文本分词成 `prompt_token_ids`、处理多模态特征、做任务路由，最终产出一个 `EngineCoreRequest`。这个对象很关键——它就是**那个要穿过进程边界、被 ZMQ 序列化送进引擎进程的载荷**。它带着 `prompt_token_ids`、`sampling_params`、多模态特征等等，是「进引擎的到底是什么」这个问题的答案。Stage 1 的内部——分词、多模态、任务路由——[第 5 章](../ch05-input-processing/narrative/chapter.md) 会整章拆开。
+`process_inputs()` 是 **Stage 1 的唯一出口**。它干的活包括：校验参数、把文本分词成 `prompt_token_ids`、处理多模态特征、做任务路由，最终产出一个 `EngineCoreRequest`。这个对象很关键——它就是**那个要穿过进程边界、被 ZMQ 序列化送进引擎进程的载荷**。它带着 `prompt_token_ids`、`sampling_params`、多模态特征等等，是「进引擎的到底是什么」这个问题的答案。Stage 1 的内部——分词、多模态、任务路由——[第 5 章](../../ch05-input-processing/narrative/chapter.md) 会整章拆开。
 
 紧接着的 `assign_request_id` 是一笔不起眼但很重要的账。它给请求 ID 加一截随机后缀（`vllm/v1/engine/input_processor.py:L215`）：
 
@@ -147,7 +147,7 @@ if is_pooling or params.n == 1:
 # … 省略：n>1 时用 ParentRequest 扇出 n 条子请求、都挂到同一个 queue …
 ```
 
-鸟瞰主线只需记住：**单请求一条直走，`n>1` 扇出多条子请求、共用一个 collector**。并行采样扇出的扇出与合并细节，[第 6 章](../ch06-input-processor/narrative/chapter.md) 会放大。
+鸟瞰主线只需记住：**单请求一条直走，`n>1` 扇出多条子请求、共用一个 collector**。并行采样扇出的扇出与合并细节，[第 6 章](../../ch06-input-processor/narrative/chapter.md) 会放大。
 
 ---
 
@@ -189,7 +189,7 @@ async def add_request_async(self, request: EngineCoreRequest) -> None:
     self._ensure_output_queue_task()
 ```
 
-`_send_input` 就是把请求用 msgpack 序列化、经 ZMQ socket 发到引擎进程。ZMQ + msgpack + 零拷贝张量这套 IPC 机制是怎么搭的，[第 7 章](../ch07-engine-core/narrative/chapter.md) 会专门讲。本章只需记住：**这条线是进程边界，过了它请求就离开了 API 进程的地盘**。
+`_send_input` 就是把请求用 msgpack 序列化、经 ZMQ socket 发到引擎进程。ZMQ + msgpack + 零拷贝张量这套 IPC 机制是怎么搭的，[第 7 章](../../ch07-engine-core/narrative/chapter.md) 会专门讲。本章只需记住：**这条线是进程边界，过了它请求就离开了 API 进程的地盘**。
 
 ---
 
@@ -235,12 +235,12 @@ def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
 
 一拍只有四步，但每一步都是后面一整章（甚至几章）的主题：
 
-1. **`schedule()`**——决定这一拍跑哪些请求、各自跑多少 token。它要在显存预算内塞进尽可能多的请求，是「连续批处理」的大脑。[第 13 章](../ch13-scheduler/narrative/chapter.md)、[第 14 章](../ch14-scheduler/narrative/chapter.md) 讲调度与 KV 预算。
-2. **`execute_model()`**——把这一批喂进模型跑前向。注意 `non_block=True`：执行和采样在 v1 里被解耦成两步，执行可以异步。模型执行、持久批次（persistent batch）、输入组装见 [第 17](../ch17-worker-and-executor/narrative/chapter.md)–[19 章](../ch19-model-runner/narrative/chapter.md)。
-3. **`sample_tokens()`**——从 logits 采出这一拍每个请求的下一个 token。采样管线见 [第 27 章](../ch27-sampling/narrative/chapter.md)。
-4. **`update_from_output()`**——把采出的 token 写回各请求状态、判断谁结束了，组装成 `EngineCoreOutputs` 返回。它的内部簿记 [第 14 章](../ch14-scheduler/narrative/chapter.md) 一并讲。
+1. **`schedule()`**——决定这一拍跑哪些请求、各自跑多少 token。它要在显存预算内塞进尽可能多的请求，是「连续批处理」的大脑。[第 13 章](../../ch13-scheduler/narrative/chapter.md)、[第 14 章](../../ch14-scheduler/narrative/chapter.md) 讲调度与 KV 预算。
+2. **`execute_model()`**——把这一批喂进模型跑前向。注意 `non_block=True`：执行和采样在 v1 里被解耦成两步，执行可以异步。模型执行、持久批次（persistent batch）、输入组装见 [第 17](../../ch17-worker-and-executor/narrative/chapter.md)–[19 章](../../ch19-model-runner/narrative/chapter.md)。
+3. **`sample_tokens()`**——从 logits 采出这一拍每个请求的下一个 token。采样管线见 [第 27 章](../../ch27-sampling/narrative/chapter.md)。
+4. **`update_from_output()`**——把采出的 token 写回各请求状态、判断谁结束了，组装成 `EngineCoreOutputs` 返回。它的内部簿记 [第 14 章](../../ch14-scheduler/narrative/chapter.md) 一并讲。
 
-这里要建立一个关键直觉：**一拍处理的是「一批」请求，不是一个**。同一拍里，可能有刚进来、正在 prefill（吃 prompt）的请求，也有跑了很久、正在 decode（逐 token 吐）的请求，它们被混在一个连续批里一起算——这就是连续批处理（continuous batching）。所以一个用户请求的「一生」会**横跨很多拍**，每拍只往前挪几个 token。[第 11 章](../ch11-engine-core/narrative/chapter.md) 会从引擎核心和这个 busy loop 整章讲起。
+这里要建立一个关键直觉：**一拍处理的是「一批」请求，不是一个**。同一拍里，可能有刚进来、正在 prefill（吃 prompt）的请求，也有跑了很久、正在 decode（逐 token 吐）的请求，它们被混在一个连续批里一起算——这就是连续批处理（continuous batching）。所以一个用户请求的「一生」会**横跨很多拍**，每拍只往前挪几个 token。[第 11 章](../../ch11-engine-core/narrative/chapter.md) 会从引擎核心和这个 busy loop 整章讲起。
 
 ![连续批处理时间线：每拍混跑多个不同阶段的请求](../diagrams/03-continuous-batching.png)
 
@@ -296,7 +296,7 @@ async def output_handler():
 这个 `while True` 是**生产者**。它干三件事：
 
 1. **拉一批**：`await engine_core.get_output_async()` 从 ZMQ 输出队列等来一批 `EngineCoreOutputs`。注意这一批是**跨多个请求**的——引擎一拍算了一整批，吐出来的也是一整批，里面混着 N 个不同请求的 token。
-2. **分块喂给 Stage 3**：把这一批切成小块（默认每块至多 128 个输出，即 `chunk_size`），逐块交给 `process_outputs()` 去 token 化、组装。为什么要分块、还要在块间 `await asyncio.sleep(0)`？因为一批可能很大——同一拍可能有成百上千个请求在跑，吐回来的输出就是这个量级——一口气处理完会长时间霸占事件循环，别的请求的流式输出就会卡顿。切块 + 主动让出，把延迟摊匀。这个 `chunk_size` 的来历与取值动机 [第 4 章](../ch04-async-llm/narrative/chapter.md) 细说。
+2. **分块喂给 Stage 3**：把这一批切成小块（默认每块至多 128 个输出，即 `chunk_size`），逐块交给 `process_outputs()` 去 token 化、组装。为什么要分块、还要在块间 `await asyncio.sleep(0)`？因为一批可能很大——同一拍可能有成百上千个请求在跑，吐回来的输出就是这个量级——一口气处理完会长时间霸占事件循环，别的请求的流式输出就会卡顿。切块 + 主动让出，把延迟摊匀。这个 `chunk_size` 的来历与取值动机 [第 4 章](../../ch04-async-llm/narrative/chapter.md) 细说。
 3. **回头 abort**：如果某个请求是因为命中了停止字符串（stop string）而结束的——这判定发生在 API 进程的去 token 化里，引擎那边还不知道——就收集这些请求，回头通知引擎 abort 它们。
 
 `get_output_async` 这一端落在 IPC 客户端（`vllm/v1/engine/core_client.py:L990`）：
@@ -368,8 +368,8 @@ if request_output := req_state.make_request_output(
 
 三件正事：
 
-- **去 token 化**：`detokenizer.update(...)` 把新 token id 增量解成可读文字，顺带做停止字符串检查。「增量」是关键——逐 token 拼字符串远比想象的麻烦，一个中文字、一个 emoji 可能跨好几个 token，单解一个会得到半截乱码。[第 9 章](../ch09-detokenization/narrative/chapter.md) 专讲增量去 token 化与 stop string。
-- **logprobs**：`logprobs_processor.update_from_output(...)` 把引擎吐回的 logprobs 张量装配成 OpenAI 兼容的容器。[第 10 章](../ch10-logprobs/narrative/chapter.md) 专讲，还会处理上面那个 byte-fallback 乱码问题在 logprobs 里的版本。
+- **去 token 化**：`detokenizer.update(...)` 把新 token id 增量解成可读文字，顺带做停止字符串检查。「增量」是关键——逐 token 拼字符串远比想象的麻烦，一个中文字、一个 emoji 可能跨好几个 token，单解一个会得到半截乱码。[第 9 章](../../ch09-detokenization/narrative/chapter.md) 专讲增量去 token 化与 stop string。
+- **logprobs**：`logprobs_processor.update_from_output(...)` 把引擎吐回的 logprobs 张量装配成 OpenAI 兼容的容器。[第 10 章](../../ch10-logprobs/narrative/chapter.md) 专讲，还会处理上面那个 byte-fallback 乱码问题在 logprobs 里的版本。
 - **组装**：`make_request_output(...)` 把这一拍的增量包成面向用户的 `RequestOutput`——带着 `text`、`token_ids`、`finished`、`finish_reason`。
 
 最后那个 `if req_state.queue is not None` 就是**两个入口在出口处的分流闸**：
@@ -377,7 +377,7 @@ if request_output := req_state.make_request_output(
 - **在线（`AsyncLLM`）**：请求有信箱（`queue` 非 None），结果直接 `queue.put(...)`，交给搬运工流转。
 - **离线（`LLMEngine`）**：请求没信箱（`queue is None`），结果攒进一个 list 返回。
 
-一行 `if`，同一套 Stage 3 代码同时服务两种驱动方式。Stage 3 输出处理的整体——这条单循环怎么把一整批解多路复用、扇出回 N 个客户端——[第 8 章](../ch08-output-processor/narrative/chapter.md) 整章拆开。
+一行 `if`，同一套 Stage 3 代码同时服务两种驱动方式。Stage 3 输出处理的整体——这条单循环怎么把一整批解多路复用、扇出回 N 个客户端——[第 8 章](../../ch08-output-processor/narrative/chapter.md) 整章拆开。
 
 `put` 进了信箱，结果就快到家了。
 
@@ -461,7 +461,7 @@ while not finished:
 
 这就是三段式解耦最漂亮的地方：**一个 `generate()` 协程 = 一个消费者，唯一的 `output_handler` = 一个生产者，二者经各请求的信箱对接**。成百上千个 `generate()` 协程并发跑在同一个事件循环上，每个只管拉自己信箱里的东西；引擎在另一个进程里一拍拍地喂。单个事件循环扛得住这个量级，恰恰因为每个 `generate()` 只做去 token 化、`yield` 这种轻活——真正吃 GIL 的模型前向早被 [§2.5](#25-分叉点同一个请求同时挂到本进程和引擎进程) 搬去了独立的引擎进程。互不阻塞，这才扛得住高并发。
 
-至于客户端中途断开怎么办——`generate()` 会被 `CancelledError` 唤醒，顺手 abort 掉这个请求，告诉引擎别白算了。错误传播与断开处理的细节，[第 4 章](../ch04-async-llm/narrative/chapter.md) 一并展开。
+至于客户端中途断开怎么办——`generate()` 会被 `CancelledError` 唤醒，顺手 abort 掉这个请求，告诉引擎别白算了。错误传播与断开处理的细节，[第 4 章](../../ch04-async-llm/narrative/chapter.md) 一并展开。
 
 到这里，一个在线请求的一生就走完了：**prompt → 渲染 → Stage 1 `EngineCoreRequest` → ZMQ → 引擎一拍拍算 → ZMQ → Stage 3 组装 → 信箱 → `generate()` yield → 用户**。
 
@@ -497,7 +497,7 @@ return sorted(outputs, key=lambda x: int(x.request_id))
 
 但**核心是同一套**：同一个 `EngineCore.step()`（同样的 schedule → execute → sample → update 四步），同一个 `OutputProcessor.process_outputs()`（同样的去 token 化 + 组装），只是被两种不同的方式驱动。离线场景不要并发、不要流式，就用最朴素的同步循环；在线场景要扛并发、要流式，就套上跨进程 + 后台协程那层壳。理解了这一点，你就抓住了 vLLM v1 引擎的骨架——**剩下的每一章，都是在放大这副骨架上的某一块**。
 
-离线 `LLM` 这扇门的完整 API（批量、chat、beam search 等）见 [第 31 章](../ch31-entrypoints/narrative/chapter.md)；在线 OpenAI 兼容服务器的完整形态见 [第 32 章](../ch32-entrypoints/narrative/chapter.md)。
+离线 `LLM` 这扇门的完整 API（批量、chat、beam search 等）见 [第 31 章](../../ch31-entrypoints/narrative/chapter.md)；在线 OpenAI 兼容服务器的完整形态见 [第 32 章](../../ch32-entrypoints/narrative/chapter.md)。
 
 ---
 

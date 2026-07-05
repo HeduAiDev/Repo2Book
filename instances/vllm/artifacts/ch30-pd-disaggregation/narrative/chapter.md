@@ -9,7 +9,7 @@
 > *本章下沉到 worker 进程：KV 到底怎么在 GPU 之间搬，又怎么不拖慢计算。*
 > *下一章离开 PD 分离，回到引擎的其它横切面。*
 
-[上一章](../ch29-pd-disaggregation/narrative/chapter.md)我们站在 scheduler 进程里，看一个 connector 如何长出"两副面孔"：决策侧查命中、做隔离，把一个请求挂进 `WAITING_FOR_REMOTE_KVS`，等 KV 到位再提升回 `WAITING` 重新调度。但那一章始终没回答一个最实在的问题——**KV 到底是怎么搬过来的？**
+[上一章](../../ch29-pd-disaggregation/narrative/chapter.md)我们站在 scheduler 进程里，看一个 connector 如何长出"两副面孔"：决策侧查命中、做隔离，把一个请求挂进 `WAITING_FOR_REMOTE_KVS`，等 KV 到位再提升回 `WAITING` 重新调度。但那一章始终没回答一个最实在的问题——**KV 到底是怎么搬过来的？**
 
 那条 `start_load_kv → 等待 → finished_recving` 的搬运线，全部发生在 worker 进程里，被上一章刻意推给了本章。现在补上。
 
@@ -306,7 +306,7 @@ def kv_connector_no_forward(
 
 ### 投机解码：把 wait_for_save 推迟到草稿之后
 
-回头看 §30.1 那行 `defer_kv_connector_finalize = self.speculative_config is not None`。投机解码（[第 28 章](../ch28-spec-decode/narrative/chapter.md)）里，主模型 forward 之后还要跑 draft model。如果在主 forward 一退出就 `wait_for_save`，会在主、草稿两次前向之间硬插一段阻塞，而且草稿模型还可能再动 KV。
+回头看 §30.1 那行 `defer_kv_connector_finalize = self.speculative_config is not None`。投机解码（[第 28 章](../../ch28-spec-decode/narrative/chapter.md)）里，主模型 forward 之后还要跑 draft model。如果在主 forward 一退出就 `wait_for_save`，会在主、草稿两次前向之间硬插一段阻塞，而且草稿模型还可能再动 KV。
 
 所以 `defer_finalize=True` 让主 forward 退出时**跳过** `wait_for_save`（回看 §30.2 的 `if wait_for_save and not defer_finalize`），把收尾推迟。等草稿前向跑完，再由 `finalize_kv_connector` 统一补做：
 
@@ -829,4 +829,4 @@ bind_connector_metadata → start_load_kv → [forward 内：层级 hook] → wa
 
 **抽象的价值在差异里。** 三种传输南辕北辙，但生命周期骨架一个字不改就都接进来了——因为契约约束的是接口形状，不是实现语义。
 
-最后那个回传 scheduler 的 `KVConnectorOutput`，`finished_recving` 驱动[上一章](../ch29-pd-disaggregation/narrative/chapter.md)的请求提升、`finished_sending` 驱动块释放。两章合起来，PD 分离从决策到搬运的整个闭环就闭上了。下一章离开 PD 分离，回到引擎的其它横切面。
+最后那个回传 scheduler 的 `KVConnectorOutput`，`finished_recving` 驱动[上一章](../../ch29-pd-disaggregation/narrative/chapter.md)的请求提升、`finished_sending` 驱动块释放。两章合起来，PD 分离从决策到搬运的整个闭环就闭上了。下一章离开 PD 分离，回到引擎的其它横切面。

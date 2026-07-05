@@ -5,11 +5,11 @@
 ![你在这里：调度器背后的分页 KV 缓存](../diagrams/roadmap.png)
 
 > *图注：全书地图高亮主线阶段「EngineCore 循环」，本章深入它背后的 KV 缓存子系统。*
-> *[第 14 章](../ch14-scheduler/narrative/chapter.md) 讲了抢占——要不到块就丢弃重算。*
+> *[第 14 章](../../ch14-scheduler/narrative/chapter.md) 讲了抢占——要不到块就丢弃重算。*
 > *本章解决「块」本身：物理显存怎么切、怎么分配、怎么靠前缀缓存复用。*
 > *下一章接 attention backend，讲算出来的 KV 怎么写进这些块。*
 
-[第 14 章](../ch14-scheduler/narrative/chapter.md) 反复提到一个动词：`allocate_slots`。调度器给请求算 token 之前，先向它要显存块；要不到，就抢占。但那一章把 `kv_cache_manager` 当黑盒——「要块」「还块」「命中」三个动作只说了名字，没说里面发生了什么。
+[第 14 章](../../ch14-scheduler/narrative/chapter.md) 反复提到一个动词：`allocate_slots`。调度器给请求算 token 之前，先向它要显存块；要不到，就抢占。但那一章把 `kv_cache_manager` 当黑盒——「要块」「还块」「命中」三个动作只说了名字，没说里面发生了什么。
 
 这一章就掀开这个黑盒。它要回答三个问题：
 
@@ -35,7 +35,7 @@ vLLM 的解法是借操作系统的分页思想：把物理 KV 显存切成 `num
 
 看左边请求 A：12 个 token 按 `block_size=4` 切成 3 个逻辑块。中间的 block table 记下「逻辑块 0 → 物理 blk 3，逻辑块 1 → blk 4，逻辑块 2 → blk 5」。右边物理块网格里，这三块物理上并不相邻——无所谓，注意力 kernel 按 block table 寻址。需要多少算多少，块用完了归还，没有连续显存的要求，也就没有外部碎片。
 
-这里就回收了我们在 [第 3 章](../ch03-config-and-wiring/narrative/chapter.md) 配置阶段埋下的一个伏笔。当时 `CacheConfig` 里有两个字段一直没真正用上：`block_size` 和 `enable_prefix_caching`。现在它们登场了——`block_size` 就是这张图里的切块粒度（图中等于 4），它同时决定了哈希、分配、命中三件事的最小单位；`enable_prefix_caching` 则决定整个前缀缓存机制开不开。本章后面会一处处点明它们的作用。
+这里就回收了我们在 [第 3 章](../../ch03-config-and-wiring/narrative/chapter.md) 配置阶段埋下的一个伏笔。当时 `CacheConfig` 里有两个字段一直没真正用上：`block_size` 和 `enable_prefix_caching`。现在它们登场了——`block_size` 就是这张图里的切块粒度（图中等于 4），它同时决定了哈希、分配、命中三件事的最小单位；`enable_prefix_caching` 则决定整个前缀缓存机制开不开。本章后面会一处处点明它们的作用。
 
 注意图里右边那个 `blk 0 (null)`：它是个特殊的占位块，初始化时就被单独拎出来，永不参与缓存和释放。为什么要它，§15.4 讲引用计数时会说清。
 
@@ -257,7 +257,7 @@ def __init__(
     self.null_block.is_null = True
 ```
 
-三件家当：`blocks` 是全部块的列表（一次性建好，`block_id` 就是下标）；`free_block_queue` 是上节的空闲队列；`cached_block_hash_to_block` 是前缀缓存的查找表（下节讲）。这里的 `enable_caching` 就是 [第 3 章](../ch03-config-and-wiring/narrative/chapter.md) 那个 `enable_prefix_caching` 一路传下来的开关。
+三件家当：`blocks` 是全部块的列表（一次性建好，`block_id` 就是下标）；`free_block_queue` 是上节的空闲队列；`cached_block_hash_to_block` 是前缀缓存的查找表（下节讲）。这里的 `enable_caching` 就是 [第 3 章](../../ch03-config-and-wiring/narrative/chapter.md) 那个 `enable_prefix_caching` 一路传下来的开关。
 
 最后两行造了 `null_block`：构造时就 `popleft` 把 0 号块拎出来，标记 `is_null`。它是个**占位块**——某些位置（滑窗外、被跳过的 token）的 block table 需要填一个东西占位，又不希望它被当成真块缓存或释放，就填这个 null block。注释特意写「ref_cnt 不维护，需要特殊处理避免被释放」。因为它从一开始就不在 free queue 里（被 popleft 走了），后面所有涉及驱逐、释放的代码都会用 `not block.is_null` 把它跳过。本章单组全注意力主路径其实不产生 null 满块，但这个机制要认得——它解释了为什么 `block_id=0` 总是「保留位」。
 
@@ -608,7 +608,7 @@ def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
     return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
 ```
 
-第一行就是 [第 3 章](../ch03-config-and-wiring/narrative/chapter.md) 那个 `enable_prefix_caching` 的总闸：关了直接返回空命中、0 个 token，整套查表机制被旁路。这就是那个配置字段「真正发挥作用」的地方之一。
+第一行就是 [第 3 章](../../ch03-config-and-wiring/narrative/chapter.md) 那个 `enable_prefix_caching` 的总闸：关了直接返回空命中、0 个 token，整套查表机制被旁路。这就是那个配置字段「真正发挥作用」的地方之一。
 
 `max_cache_hit_length = request.num_tokens - 1` 这个 `-1` 值得停一下。哪怕一个请求的所有 token 都命中了缓存，也**必须重算最后一个 token**——因为要拿它的 logits 来采样下一个 token，而缓存里只有 KV、没有 logits。所以最多命中到「倒数第二个 token 所在的块」。又因为分配要求 `num_computed_tokens` 按块对齐，这个 `-1` 实际可能让最后一整块退回重算。
 
@@ -777,7 +777,7 @@ def free(self, request_id: str) -> None:
 
 ### 那笔账：抢占重算靠前缀命中缓解
 
-现在可以结清 [第 14 章](../ch14-scheduler/narrative/chapter.md) 欠的账了。那一章里，一个请求被抢占时，`num_computed_tokens` 被清零、请求退回 `waiting` 队头，等内存松动再从 **0 重新 prefill**。当时留了一句话：重算的代价能被前缀缓存大幅缓解。机制现在拼齐了：
+现在可以结清 [第 14 章](../../ch14-scheduler/narrative/chapter.md) 欠的账了。那一章里，一个请求被抢占时，`num_computed_tokens` 被清零、请求退回 `waiting` 队头，等内存松动再从 **0 重新 prefill**。当时留了一句话：重算的代价能被前缀缓存大幅缓解。机制现在拼齐了：
 
 抢占时调的是 `KVCacheManager.free`，它走上面的 `free_blocks`——块的 `ref_cnt` 减到 0、回 free queue，但**哈希全部保留**。这些块就成了「带身份的驱逐候选」。
 
@@ -809,6 +809,6 @@ def free(self, request_id: str) -> None:
 
 这里两个对比最该记住：空闲块的中间删除是 **O(1)** 而非 `deque` 的 O(n)——这是 `touch` 救回命中块的前提；命中查询是 **O(命中块数)** 而非 O(请求长度)——所以前缀越长、命中越多，省得越多而查询本身不变贵。
 
-我们也结清了两笔账。[第 3 章](../ch03-config-and-wiring/narrative/chapter.md) 的 `CacheConfig.block_size` 在这一章无处不在——切块、哈希、分配、命中的最小粒度都是它；`enable_prefix_caching` 则是 `get_computed_blocks` 查不查命中、`get_new_blocks` 惰不惰性驱逐的总闸。[第 14 章](../ch14-scheduler/narrative/chapter.md) 的抢占重算，靠 `free_blocks` 保留哈希 + `find_longest_cache_hit` 命中复用，把代价从「整段重 prefill」压到「只算未命中部分」。
+我们也结清了两笔账。[第 3 章](../../ch03-config-and-wiring/narrative/chapter.md) 的 `CacheConfig.block_size` 在这一章无处不在——切块、哈希、分配、命中的最小粒度都是它；`enable_prefix_caching` 则是 `get_computed_blocks` 查不查命中、`get_new_blocks` 惰不惰性驱逐的总闸。[第 14 章](../../ch14-scheduler/narrative/chapter.md) 的抢占重算，靠 `free_blocks` 保留哈希 + `find_longest_cache_hit` 命中复用，把代价从「整段重 prefill」压到「只算未命中部分」。
 
 下一章接着往下：这些块分好了，attention backend 怎么把算出来的 Key/Value 真正写进它们对应的物理显存。块是地址，KV 是内容——我们刚铺好了地址簿。

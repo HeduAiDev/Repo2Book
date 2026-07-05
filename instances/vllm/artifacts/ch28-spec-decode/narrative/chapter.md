@@ -36,7 +36,7 @@
 
 ## 28.1 草稿从哪来：proposer 的统一契约
 
-投机解码的第一步是产草稿。vLLM 里有好几种 proposer——n-gram、EAGLE、EAGLE3、DFlash、还有 [第 25 章](../ch25-model-architecture/narrative/chapter.md) 那个 DeepSeek-V4 的 MTP draft 头——但它们对外都遵守同一份契约：**吃当前上下文，吐每请求 k 个草稿 token**。本章不深挖各个 proposer 内部的模型结构（那是 ch25 的事），只看它们怎么把草稿交出来。
+投机解码的第一步是产草稿。vLLM 里有好几种 proposer——n-gram、EAGLE、EAGLE3、DFlash、还有 [第 25 章](../../ch25-model-architecture/narrative/chapter.md) 那个 DeepSeek-V4 的 MTP draft 头——但它们对外都遵守同一份契约：**吃当前上下文，吐每请求 k 个草稿 token**。本章不深挖各个 proposer 内部的模型结构（那是 ch25 的事），只看它们怎么把草稿交出来。
 
 我们从最简单的一种讲起，因为它根本不带神经网络。
 
@@ -169,7 +169,7 @@ return draft_token_ids
 
 这是一条链式生成的循环：跑 k−1 次，每次把上一步采的草稿喂回去、增量推进一格、再 greedy 采下一个草稿，最后 `stack` 成 `[batch_size, num_speculative_tokens]`。EAGLE 的"草稿链"就是这么一步步接出来的。
 
-至于内部的 EAGLE 头怎么算、DFlash 的 mask token 怎么布、MTP 的多 token 预测头长什么样——那是模型结构的事，[第 25 章](../ch25-model-architecture/narrative/chapter.md) 讲过了。本章只认它们对外的契约：
+至于内部的 EAGLE 头怎么算、DFlash 的 mask token 怎么布、MTP 的多 token 预测头长什么样——那是模型结构的事，[第 25 章](../../ch25-model-architecture/narrative/chapter.md) 讲过了。本章只认它们对外的契约：
 
 > **proposer 契约**：吃当前上下文（n-gram 吃 token 历史，模型类吃目标 hidden states），吐每请求 0 到 k 个草稿 token。模型类 proposer 还可以附带 `draft_probs`（草稿的概率分布）；n-gram 没有概率，`draft_probs` 是 `None`。
 
@@ -340,7 +340,7 @@ class RejectionSampler(nn.Module):
 
 四类 token，记住这个加法式：**输出 = 接受的草稿 + 拒绝处的 recovered + 全接受时的 bonus**。
 
-这里藏着一个值得停一下的设计决策：**bonus token 不在 rejection sampler 内部采，而是外面传进来**。为什么要绕这一手？因为投机解码的接受准则只支持基本采样，配不上 `top_p`、`top_k` 这些高级策略。把 bonus token 单独交给[第 27 章那个完整的 9 步 sampler](../ch27-sampling/narrative/chapter.md) 去采，它就能享受全套采样参数。这就是 `forward` 开头先采 bonus 的原因：
+这里藏着一个值得停一下的设计决策：**bonus token 不在 rejection sampler 内部采，而是外面传进来**。为什么要绕这一手？因为投机解码的接受准则只支持基本采样，配不上 `top_p`、`top_k` 这些高级策略。把 bonus token 单独交给[第 27 章那个完整的 9 步 sampler](../../ch27-sampling/narrative/chapter.md) 去采，它就能享受全套采样参数。这就是 `forward` 开头先采 bonus 的原因：
 
 ```python
 # vllm/v1/sample/rejection_sampler.py:L120
@@ -669,7 +669,7 @@ $$
 
 也就是说，按 `prob × inv_q` 取 argmax，分布上等价于"按 `prob` 归一化后的分布"采样。于是省掉了对整个 vocab 维度求和归一化这一步——单个内核里分块扫一遍 vocab、滚动维护最大值，直接出 recovered token。
 
-这种"不归一化、靠随机权重 argmax 代替按概率采样"的手法，[第 27 章的 Sampler](../ch27-sampling/narrative/chapter.md) 里也见过同源的思想。这里再补一个工程细节：上面那个均匀随机数 $u$，`generate_uniform_probs`（`vllm/v1/sample/rejection_sampler.py`）特意用了 **float64** 而不是 float32：
+这种"不归一化、靠随机权重 argmax 代替按概率采样"的手法，[第 27 章的 Sampler](../../ch27-sampling/narrative/chapter.md) 里也见过同源的思想。这里再补一个工程细节：上面那个均匀随机数 $u$，`generate_uniform_probs`（`vllm/v1/sample/rejection_sampler.py`）特意用了 **float64** 而不是 float32：
 
 ```python
 # vllm/v1/sample/rejection_sampler.py:L639

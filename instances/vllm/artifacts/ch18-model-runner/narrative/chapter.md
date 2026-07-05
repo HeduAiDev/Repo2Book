@@ -8,7 +8,7 @@
 > 本章推开 worker 的门：一张 `SchedulerOutput` 怎样变成喂给模型的 `input_ids`、`positions`、`slot_mapping`。
 > 下一章接着讲前向之后——采样、把新 token 写回、跨拍续跑。
 
-[上一章](../ch17-worker-and-executor/narrative/chapter.md)里，引擎大脑对着 N 个 worker 说话，就像对着一个函数说话。`collective_rpc` 把 `SchedulerOutput` 广播下去，每个 worker 的 `execute_model` 被调起。
+[上一章](../../ch17-worker-and-executor/narrative/chapter.md)里，引擎大脑对着 N 个 worker 说话，就像对着一个函数说话。`collective_rpc` 把 `SchedulerOutput` 广播下去，每个 worker 的 `execute_model` 被调起。
 
 可工单送到之后呢？`SchedulerOutput` 是一张**调度决策清单**：哪些请求本拍要算、各算几个 token、新分了哪些 KV 块。它不是张量。模型要的是连续的 `input_ids`、每个 token 的绝对 `positions`、每个 token 该往哪个物理 KV 槽写的 `slot_mapping`。
 
@@ -162,7 +162,7 @@ for new_req_data in scheduler_output.scheduled_new_reqs:
 
 `CachedRequestState` 是 worker 端的单请求快照——prompt token、已生成的 output token、每个 KV group 的块号列表、已算 token 数、采样参数。它存进 `self.requests`，又被推进 `reqs_to_add` 待会儿统一并入持久批次。
 
-这就解释了[第 13 章 §13.5](../ch13-scheduler/narrative/chapter.md) 那个「全量发一次、之后只发 diff」的设计为什么成立：**worker 缓存了每个请求的完整快照**，所以调度器后续每拍只需发增量——已算了多少 token、新分了哪些块——worker 拿差量就地更新快照即可，不必反复传整个请求。`CachedRequestState` 正是接住这份增量的容器。
+这就解释了[第 13 章 §13.5](../../ch13-scheduler/narrative/chapter.md) 那个「全量发一次、之后只发 diff」的设计为什么成立：**worker 缓存了每个请求的完整快照**，所以调度器后续每拍只需发增量——已算了多少 token、新分了哪些块——worker 拿差量就地更新快照即可，不必反复传整个请求。`CachedRequestState` 正是接住这份增量的容器。
 
 > **v0.21.0 更新**：这条「快照随请求存活、slot 行随批次进出」的归属原则，在 v0.21.0 多收编了一个字段。prompt logprobs 在 chunked prefill 下要跨多个 prefill 分块累积一份在途张量；基线把它存在 `InputBatch` 的一个 `req_id → LogprobsTensors` 批次级字典里，随 slot 的 `remove_request` pop。问题是请求一旦被驱逐再恢复，这份在途累积就跟着 slot 丢了（#41411）。v0.21.0 把它挪进 `CachedRequestState.in_progress_prompt_logprobs_cpu`——即 `self.requests[req_id]` 这一层、跨 slot 进出始终存活的请求快照。生命周期从此跟着请求走、而非跟着 slot 行走，于是 chunked prefill 的驱逐与恢复中不再丢累积。又一个「易变的归批次、要存活的归快照」的例子。
 
@@ -442,7 +442,7 @@ torch.index_select(
 
 **算绝对位置。** `positions = num_computed_tokens[req_indices] + query_pos`。每个请求本拍从它「已算到第几个 token」起步，加上请求内偏移，就是 token 的绝对位置。假设三个请求已算 `[4, 1, 6]` 个 token，那 `positions = [4,5, 1,2,3,4,5, 6,7,8]`。
 
-这个公式值得品一下。[第 13 章 §13.1](../ch13-scheduler/narrative/chapter.md) 讲过调度器「不分 prefill/decode 相」——一个请求眼里只有 `num_computed_tokens` 在追 `num_tokens`。这里的位置计算正是那个 token-centric 模型在 worker 端的延续：**没有离散的阶段**，绝对位置永远是「已算的 + 本拍内偏移」。chunked prefill 是 `num_scheduled_tokens` 大，decode 是它等于 1，公式一字不改吃下所有情况。
+这个公式值得品一下。[第 13 章 §13.1](../../ch13-scheduler/narrative/chapter.md) 讲过调度器「不分 prefill/decode 相」——一个请求眼里只有 `num_computed_tokens` 在追 `num_tokens`。这里的位置计算正是那个 token-centric 模型在 worker 端的延续：**没有离散的阶段**，绝对位置永远是「已算的 + 本拍内偏移」。chunked prefill 是 `num_scheduled_tokens` 大，decode 是它等于 1，公式一字不改吃下所有情况。
 
 **拍扁成一维。** 这是技巧的核心。`token_ids_cpu` 是 `(R, L)` 的二维行优先缓冲，元素 `(r, p)` 的扁平偏移就是 `r·L + p`(`L` = `max_model_len`)。所以：
 
@@ -693,4 +693,4 @@ def test_token_index_flattening():
 
 最后 `_build_attention_metadata` 把这些张量收束成 `CommonAttentionMetadata`，交给 attention 后端。`block_table_tensor` 和 `slot_mapping` 是这个接口的两个关键字段——后续 attention 实现章会从另一头接住它们，讲清 PagedAttention 怎么照着这张表去 KV 显存里读写。
 
-张量备齐了，attention 元数据装配好了。接下来就是真正的前向、采样、把新采的 token 写回持久批次对应的 slot 行——让这个批次带着多出来的一个 token，活到下一拍。那是[下一章](../ch19-sampler/narrative/chapter.md)的事。
+张量备齐了，attention 元数据装配好了。接下来就是真正的前向、采样、把新采的 token 写回持久批次对应的 slot 行——让这个批次带着多出来的一个 token，活到下一拍。那是[下一章](../../ch19-model-runner/narrative/chapter.md)的事。

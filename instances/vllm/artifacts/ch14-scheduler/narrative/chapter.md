@@ -4,9 +4,9 @@
 
 ![你在这里：EngineCore 循环里的调度器](../diagrams/roadmap.png)
 
-> *图注：全书地图高亮当前阶段「EngineCore 循环」。[第 13 章](../ch13-scheduler/narrative/chapter.md) 把 `schedule()` 的主线讲透了——「不分相」的连续批处理、token 预算怎么跨 RUNNING/WAITING 两阶段递减。但那一章在两个地方踩了刹车：RUNNING 阶段 `allocate_slots` 失败时会进一个抢占循环，当时只说「会抢占」没展开；`update_from_output()` 把它当反馈环的另一半，只说「追加 token、判 stop、释放」没钻进去。本章把这两个被刹住的分支补完。下一章 **第 15 章** 接着讲调度器背后的分页 KV 缓存——块池怎么分配、前缀缓存怎么命中。*
+> *图注：全书地图高亮当前阶段「EngineCore 循环」。[第 13 章](../../ch13-scheduler/narrative/chapter.md) 把 `schedule()` 的主线讲透了——「不分相」的连续批处理、token 预算怎么跨 RUNNING/WAITING 两阶段递减。但那一章在两个地方踩了刹车：RUNNING 阶段 `allocate_slots` 失败时会进一个抢占循环，当时只说「会抢占」没展开；`update_from_output()` 把它当反馈环的另一半，只说「追加 token、判 stop、释放」没钻进去。本章把这两个被刹住的分支补完。下一章 **第 15 章** 接着讲调度器背后的分页 KV 缓存——块池怎么分配、前缀缓存怎么命中。*
 
-[第 13 章](../ch13-scheduler/narrative/chapter.md) 立下的事是：调度器每一拍干两件事。先扫 `running` 队列，让每个在跑的请求继续往前算几个 token；再扫 `waiting` 队列，把新请求拉进来。两阶段共用一个 `token_budget`，谁先用谁先得。
+[第 13 章](../../ch13-scheduler/narrative/chapter.md) 立下的事是：调度器每一拍干两件事。先扫 `running` 队列，让每个在跑的请求继续往前算几个 token；再扫 `waiting` 队列，把新请求拉进来。两阶段共用一个 `token_budget`，谁先用谁先得。
 
 但有一句话当时被我们快速带过了。RUNNING 阶段给一个请求算 token，得先问 KV 缓存管理器要显存块——`allocate_slots()`。**如果显存满了，要不到块呢？** 第 13 章只说「会触发抢占」，然后就跳走了。
 
@@ -570,7 +570,7 @@ def check_stop(request: Request, max_model_len: int) -> bool:
 - **token 级**，在调度器侧的 `check_stop`：判 EOS、判 `stop_token_ids`（整数 id）、判长度、判重复。它工作在 **token 空间**——只看 token id，不看文本。
 - **字符串级**，在前端 detokenizer 的 `check_stop_strings`：判用户给的 stop **字符串**（比如 `"\n\n"` 或 `"</answer>"`）是不是出现在生成的文本里。它工作在**文本空间**——得先把 token 解码成字符串才能做子串匹配。
 
-为什么分两层？因为一个 stop 字符串可能跨好几个 token，甚至和某个 token 的解码结果只部分重叠——这种子串匹配在 token 空间根本做不了，必须解码到文本再匹配。这套文本空间的 stop string 逻辑，[第 9 章：增量去 token 化与 stop string](../ch09-detokenization/narrative/chapter.md) 已经讲透了。
+为什么分两层？因为一个 stop 字符串可能跨好几个 token，甚至和某个 token 的解码结果只部分重叠——这种子串匹配在 token 空间根本做不了，必须解码到文本再匹配。这套文本空间的 stop string 逻辑，[第 9 章：增量去 token 化与 stop string](../../ch09-detokenization/narrative/chapter.md) 已经讲透了。
 
 所以：**调度器侧的 `check_stop` 只管 token 级停止，stop string 子串匹配不在这里。** 别把字符串匹配画进调度器——那是 vLLM 没有的逻辑。两层甚至可能给出不同的截断点：token 级在 EOS 处停，字符串级在某个子串处停，谁先触发看具体情况。
 
@@ -699,7 +699,7 @@ def _update_request_with_output(
 - **检测到抢占就收缩。** `if not preempted_reqs` 一行守卫（`scheduler.py:L567`），本拍发生过抢占就完全跳过 WAITING，不在内存紧张时火上浇油。
 - **双队列破队头阻塞。** 阻塞态请求隔离到 `skipped_waiting`（`scheduler.py:L1554`、`L1567`），可调度请求在 `waiting` 里畅通；被跳过的请求公平重排回去等下拍重试。
 - **`update_from_output` 是反馈环的另一半（`scheduler.py:L1331`）。** 投机解码回退（回扣 `num_computed_tokens`）、逐 token 追加 + `check_stop`、先抓 `finish_reason` 再处理停止、按抢占前状态分流摘除、真完成才 `_free_request`。
-- **`check_stop`（`vllm/v1/core/sched/utils.py:L94`）只管 token 级停止**——EOS / `stop_token_ids` / 长度 / 重复，有固定优先级。stop **string** 子串匹配在 [前端 detokenizer](../ch09-detokenization/narrative/chapter.md)，不在这里。
+- **`check_stop`（`vllm/v1/core/sched/utils.py:L94`）只管 token 级停止**——EOS / `stop_token_ids` / 长度 / 重复，有固定优先级。stop **string** 子串匹配在 [前端 detokenizer](../../ch09-detokenization/narrative/chapter.md)，不在这里。
 - **`RequestStatus` 用 `IntEnum` 顺序排布**（`vllm/v1/request.py:L316`），把「是否完成」压成一次 `status > PREEMPTED` 的整型比较。
 
 调度器这一侧，到此讲完了它「派活」和「收活」的完整逻辑。但有一个黑盒还没开：`allocate_slots` 究竟怎么把 token 落到分页显存上、前缀缓存又凭什么能命中、被抢请求复活时怎么把成本降下来——**第 15 章：分页 KV 缓存** 钻进块池和前缀缓存，把本章一直在调用的那个 `kv_cache_manager` 拆开。

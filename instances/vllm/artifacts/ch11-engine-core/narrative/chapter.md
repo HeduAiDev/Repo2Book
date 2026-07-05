@@ -4,17 +4,17 @@
 
 ![你在这里：EngineCore 循环](../diagrams/roadmap.png)
 
-> *图注：全书地图高亮当前阶段。[第 7 章](../ch07-engine-core/narrative/chapter.md) 把前端与 EngineCore 之间那条虚线拆成了一套 ZMQ 协议，但它在结尾留了一笔账：「边界那一头——EngineCore 进程内的调度、执行、采样循环——细节是后续章节的主场。」本章就是那一头。我们钻进 EngineCore 进程，看清 `run_busy_loop` 如何一圈圈转、`step()` 一次迭代到底干了什么；再往后 [第 12 章](../ch12-batch-queue/narrative/chapter.md) 会把本章点到的 batch queue 展开成完整的流水线并行机制。*
+> *图注：全书地图高亮当前阶段。[第 7 章](../../ch07-engine-core/narrative/chapter.md) 把前端与 EngineCore 之间那条虚线拆成了一套 ZMQ 协议，但它在结尾留了一笔账：「边界那一头——EngineCore 进程内的调度、执行、采样循环——细节是后续章节的主场。」本章就是那一头。我们钻进 EngineCore 进程，看清 `run_busy_loop` 如何一圈圈转、`step()` 一次迭代到底干了什么；再往后 [第 12 章](../../ch12-engine-core/narrative/chapter.md) 会把本章点到的 batch queue 展开成完整的流水线并行机制。*
 
-[第 4 章](../ch04-async-llm/narrative/chapter.md) 把引擎拆成三段，反复强调中间那段 `EngineCore` 在另一个进程里独立转动。它对外只暴露三个方法——`add_request_async` / `get_output_async` / `abort_requests_async`——然后说：这台引擎自己怎么一步步推理，留到后面。
+[第 4 章](../../ch04-async-llm/narrative/chapter.md) 把引擎拆成三段，反复强调中间那段 `EngineCore` 在另一个进程里独立转动。它对外只暴露三个方法——`add_request_async` / `get_output_async` / `abort_requests_async`——然后说：这台引擎自己怎么一步步推理，留到后面。
 
-[第 7 章](../ch07-engine-core/narrative/chapter.md) 接着把「另一个进程」这件事坐实了：ZMQ 的 socket 拓扑、msgpack 多帧编解码、两个 IO 线程怎么把请求塞进 `input_queue`、把输出从 `output_queue` 抽走。但它刻意没碰进程内部的引擎本体。
+[第 7 章](../../ch07-engine-core/narrative/chapter.md) 接着把「另一个进程」这件事坐实了：ZMQ 的 socket 拓扑、msgpack 多帧编解码、两个 IO 线程怎么把请求塞进 `input_queue`、把输出从 `output_queue` 抽走。但它刻意没碰进程内部的引擎本体。
 
 **本章结清这笔账。** 那个在独立进程里独立转动的引擎，它的「心跳」是什么样的？请求进了 `input_queue` 之后会发生什么？一次 `step()` 凭什么能让 GPU 前向、语法掩码（grammar bitmask）计算、token 采样三件事咬合得严丝合缝？引擎要睡觉、要暂停、要被关掉，又是怎么做到的？
 
 本章的代码主线集中在一个文件——`vllm/v1/engine/core.py`——里的两个类：
 
-- `EngineCore`：引擎的「内循环」。持有 [执行器](../ch03-config-and-wiring/narrative/chapter.md)（executor）和调度器（scheduler），提供 `step()` 单步编排和 `pause`/`sleep`/`wake_up` 生命周期。它不知道 ZMQ 的存在。
+- `EngineCore`：引擎的「内循环」。持有 [执行器](../../ch03-config-and-wiring/narrative/chapter.md)（executor）和调度器（scheduler），提供 `step()` 单步编排和 `pause`/`sleep`/`wake_up` 生命周期。它不知道 ZMQ 的存在。
 - `EngineCoreProc`：`EngineCore` 的子进程外壳。在内循环外面套一圈 `run_busy_loop`，把第 7 章那两个 IO 线程喂进来的请求取出来、跑一步、把结果塞回去。
 
 为了能在本地（无 GPU/CUDA）把这两条主线亲手跑一遍、打断点观察控制流，本章配了一份**只做减法**的精简版：和真实 vLLM 同名、同结构、同控制流，唯一的承载替换是——真实的 executor / scheduler 构造（属其它章节）换成测试注入的协作者对象，它们的方法调用**原样保留**。删去所有标了 `# SUBTRACTED` 的分支后，它就回到真实 `EngineCore` 的单引擎子集。它是「跑起来看数值」的交叉验证物，正文主线始终是真实源码。
@@ -77,7 +77,7 @@ def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
 剩下的是一条直线，七步：
 
 1. **`has_requests()` 守门**——调度器手上一个请求都没有，直接返回 `({}, False)`，这一拍空转都不空转。注意注释：这里的「有请求」既包括没跑完的，也包括跑完了但还没从批次里清走的。
-2. **`schedule()`**——调度器决定这一拍要推哪些请求、各推多少 token，产出一个 `scheduler_output`。它是连续批处理的大脑，细节是 [第 13 章](../ch13-continuous-batching/narrative/chapter.md) 的主场，这里我们只把它当作「这一批要算什么」的清单。
+2. **`schedule()`**——调度器决定这一拍要推哪些请求、各推多少 token，产出一个 `scheduler_output`。它是连续批处理的大脑，细节是 [第 13 章](../../ch13-scheduler/narrative/chapter.md) 的主场，这里我们只把它当作「这一批要算什么」的清单。
 3. **`execute_model(..., non_block=True)`**——发起 GPU 前向。注意 `non_block=True`：它**不等前向跑完**，立刻返回一个 `future`。
 4. **`get_grammar_bitmask()`**——算结构化输出的语法掩码（下一节细讲它为什么夹在这）。
 5. **`future.result()`**——到这里才真正等前向结束。
@@ -377,7 +377,7 @@ def test_busy_loop_runs_step_then_exits_on_shutdown():
 
 ### dispatch：一个请求进来，分到哪去
 
-`_process_input_queue` 取出的每个请求都交给 `_handle_client_request`，由它按类型分派。请求的类型用第 7 章那套[字节标签协议](../ch07-engine-core/narrative/chapter.md)（byte-tag protocol）标着——`ADD`、`ABORT`、`UTILITY` 等，各是一个单字节：
+`_process_input_queue` 取出的每个请求都交给 `_handle_client_request`，由它按类型分派。请求的类型用第 7 章那套[字节标签协议](../../ch07-engine-core/narrative/chapter.md)（byte-tag protocol）标着——`ADD`、`ABORT`、`UTILITY` 等，各是一个单字节：
 
 ```python
 # vllm/v1/engine/core.py:L1270
@@ -418,7 +418,7 @@ def _handle_client_request(
 - **`WAKEUP`**——直接 `return`，什么都不做。它是个哨兵，§11.5 揭晓它的用途。
 - **`ADD`**——拆出 `(req, request_wave)`，交给 `add_request`（校验后转给调度器）。
 - **`ABORT`**——交给 `abort_requests`（让调度器把这些请求标成 `FINISHED_ABORTED`）。
-- **`UTILITY`**——这是个**通用 RPC 通道**。客户端想调引擎上某个方法（比如查询是否在睡、重置缓存、甚至触发 sleep），不必为每个方法单设一种消息类型，统一打包成 UTILITY：`(client_idx, call_id, method_name, args)`。引擎用 `getattr(self, method_name)` 懒查到方法、调用、把返回值连同 `call_id` 塞回 `output_queue`。那个 `call_id` 是第 7 章讲的[关联标识](../ch07-engine-core/narrative/chapter.md)（correlation-id）——客户端凭它把异步回来的结果对上当初的调用。**§11.6 那些生命周期方法，大多就是经这条 UTILITY 路径被调用的。**
+- **`UTILITY`**——这是个**通用 RPC 通道**。客户端想调引擎上某个方法（比如查询是否在睡、重置缓存、甚至触发 sleep），不必为每个方法单设一种消息类型，统一打包成 UTILITY：`(client_idx, call_id, method_name, args)`。引擎用 `getattr(self, method_name)` 懒查到方法、调用、把返回值连同 `call_id` 塞回 `output_queue`。那个 `call_id` 是第 7 章讲的[关联标识](../../ch07-engine-core/narrative/chapter.md)（correlation-id）——客户端凭它把异步回来的结果对上当初的调用。**§11.6 那些生命周期方法，大多就是经这条 UTILITY 路径被调用的。**
 
 精简版把这套分派逐条验证了——ADD 走 add_request、ABORT 走 finish_requests、WAKEUP 是空操作、UTILITY 真的调到了方法并把结果带 call_id 塞回队列：
 
@@ -791,7 +791,7 @@ def test_batch_queue_fills_before_taking_result():
     assert len(core.batch_queue) == 1
 ```
 
-batch queue 的完整时间轴、PP 各 stage 怎么重叠、`deferred_scheduler_output` 那条（投机解码叠加结构化输出的）小众路径——是 [第 12 章](../ch12-batch-queue/narrative/chapter.md) 的主场。本章只需点明：**忙循环里那个 `step_fn()`，普通情况是 `step`，开了 PP 就换成 `step_with_batch_queue`，二者签名相同、对忙循环透明。**
+batch queue 的完整时间轴、PP 各 stage 怎么重叠、`deferred_scheduler_output` 那条（投机解码叠加结构化输出的）小众路径——是 [第 12 章](../../ch12-engine-core/narrative/chapter.md) 的主场。本章只需点明：**忙循环里那个 `step_fn()`，普通情况是 `step`，开了 PP 就换成 `step_with_batch_queue`，二者签名相同、对忙循环透明。**
 
 ![step 与 step_with_batch_queue 的对比](../diagrams/ch11-batch-queue-pipeline.png)
 
@@ -799,7 +799,7 @@ batch queue 的完整时间轴、PP 各 stage 怎么重叠、`deferred_scheduler
 
 ### InprocClient：没有忙循环时，谁敲节拍
 
-整章我们都在讲「忙循环一拍接一拍敲 `step()`」。但 §11.1 那个 `step()` 自己不知道忙循环的存在——它就是个方法，谁都能调。`InprocClient` 就证明了这点：它是 [第 4 章](../ch04-async-llm/narrative/chapter.md) 同步路径用的进程内客户端，**没有忙循环、没有 ZMQ**，直接持有一个 `EngineCore`，每次要输出就亲手敲一拍：
+整章我们都在讲「忙循环一拍接一拍敲 `step()`」。但 §11.1 那个 `step()` 自己不知道忙循环的存在——它就是个方法，谁都能调。`InprocClient` 就证明了这点：它是 [第 4 章](../../ch04-async-llm/narrative/chapter.md) 同步路径用的进程内客户端，**没有忙循环、没有 ZMQ**，直接持有一个 `EngineCore`，每次要输出就亲手敲一拍：
 
 ```python
 # vllm/v1/engine/core_client.py:L284
@@ -832,7 +832,7 @@ def test_inproc_client_get_output_steps_engine():
 
 ### 另一头：output_queue 怎么连回第 4 章
 
-最后把 `output_queue` 的另一端接回 [第 4 章](../ch04-async-llm/narrative/chapter.md) 的[三段式解耦](../ch04-async-llm/narrative/chapter.md)。§11.4 里，`step` 的产出被塞进 `output_queue`、由 IO 线程经 ZMQ 推回客户端。客户端这边（`AsyncMPClient`）有一个后台 task 收 ZMQ、解码、塞进一个 asyncio 队列；前端的 `get_output_async` 就从这个队列 `await` 取出：
+最后把 `output_queue` 的另一端接回 [第 4 章](../../ch04-async-llm/narrative/chapter.md) 的[三段式解耦](../../ch04-async-llm/narrative/chapter.md)。§11.4 里，`step` 的产出被塞进 `output_queue`、由 IO 线程经 ZMQ 推回客户端。客户端这边（`AsyncMPClient`）有一个后台 task 收 ZMQ、解码、塞进一个 asyncio 队列；前端的 `get_output_async` 就从这个队列 `await` 取出：
 
 ```python
 # vllm/v1/engine/core_client.py:L979（process_outputs_socket 尾段 + get_output_async）
@@ -868,4 +868,4 @@ def test_inproc_client_get_output_steps_engine():
 - **关停** 是一场绕开信号雷区的握手：`WAKEUP` 哨兵叫醒睡着的队列，三态机排空后退出。
 - **生命周期** 把「停调度」（pause 三模式）和「让出显存」（sleep 三级）拆成正交的旋钮，多进程下用 idle 回调实现「等排空再动手」的异步语义。
 
-`step()` 里那几个被我们当作黑盒的方法——`schedule()` 怎么排批、`update_from_output` 怎么收口、`execute_model` 怎么在 worker 里异步跑——是后面几章逐个揭开的。[第 12 章](../ch12-batch-queue/narrative/chapter.md) 先把本章点到的 batch queue 展开成完整的流水线并行；[第 13 章](../ch13-continuous-batching/narrative/chapter.md) 钻进 `schedule()` 看连续批处理怎么决定每拍推什么。节拍器已经在转，接下来是看清每一拍里调度器到底在想什么。
+`step()` 里那几个被我们当作黑盒的方法——`schedule()` 怎么排批、`update_from_output` 怎么收口、`execute_model` 怎么在 worker 里异步跑——是后面几章逐个揭开的。[第 12 章](../../ch12-engine-core/narrative/chapter.md) 先把本章点到的 batch queue 展开成完整的流水线并行；[第 13 章](../../ch13-scheduler/narrative/chapter.md) 钻进 `schedule()` 看连续批处理怎么决定每拍推什么。节拍器已经在转，接下来是看清每一拍里调度器到底在想什么。

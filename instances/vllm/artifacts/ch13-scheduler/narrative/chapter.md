@@ -4,9 +4,9 @@
 
 ![你在这里：EngineCore 循环里的调度器](../diagrams/roadmap.png)
 
-> *图注：全书地图高亮当前阶段「EngineCore 循环」。[第 11 章](../ch11-engine-core/narrative/chapter.md) 把 `EngineCore.step()` 一拍拆到底，那一拍的第一个动作就是 `scheduler_output = self.scheduler.schedule()`——当时我们把它当黑盒，只说它「产出这一批要算什么的清单」。[第 12 章](../ch12-engine-core/narrative/chapter.md) 又把流水线变体讲透，结尾留下一句话：`schedule()` 凭什么决定这一拍推哪些请求、各推多少 token，是下一章的主场。本章就钻进这个黑盒。下一章接着讲调度器背后的 KV 块分配器——`allocate_slots` 怎么把 token 落到分页显存上。*
+> *图注：全书地图高亮当前阶段「EngineCore 循环」。[第 11 章](../../ch11-engine-core/narrative/chapter.md) 把 `EngineCore.step()` 一拍拆到底，那一拍的第一个动作就是 `scheduler_output = self.scheduler.schedule()`——当时我们把它当黑盒，只说它「产出这一批要算什么的清单」。[第 12 章](../../ch12-engine-core/narrative/chapter.md) 又把流水线变体讲透，结尾留下一句话：`schedule()` 凭什么决定这一拍推哪些请求、各推多少 token，是下一章的主场。本章就钻进这个黑盒。下一章接着讲调度器背后的 KV 块分配器——`allocate_slots` 怎么把 token 落到分页显存上。*
 
-[第 11 章](../ch11-engine-core/narrative/chapter.md) 立下的事是：`EngineCore` 每一拍调一次 `schedule()`，拿回一个 `SchedulerOutput`，喂给模型跑前向；前向出了 token，再调 `update_from_output()` 收口。那一章把循环的骨架讲清了，唯独把 `schedule()` 和 `update_from_output()` 这两个方法当作黑盒——「这一批要算什么」由它们说了算，但「凭什么这么算」没展开。本章的代码主线集中在 `vllm/v1/core/sched/` 这一个目录：调度器主体 `vllm/v1/core/sched/scheduler.py`、异步变体 `vllm/v1/core/sched/async_scheduler.py`、产物结构 `vllm/v1/core/sched/output.py`。
+[第 11 章](../../ch11-engine-core/narrative/chapter.md) 立下的事是：`EngineCore` 每一拍调一次 `schedule()`，拿回一个 `SchedulerOutput`，喂给模型跑前向；前向出了 token，再调 `update_from_output()` 收口。那一章把循环的骨架讲清了，唯独把 `schedule()` 和 `update_from_output()` 这两个方法当作黑盒——「这一批要算什么」由它们说了算，但「凭什么这么算」没展开。本章的代码主线集中在 `vllm/v1/core/sched/` 这一个目录：调度器主体 `vllm/v1/core/sched/scheduler.py`、异步变体 `vllm/v1/core/sched/async_scheduler.py`、产物结构 `vllm/v1/core/sched/output.py`。
 
 **本章就把这两个方法拆到底。** 你会看到 vLLM v1 调度器一个反直觉的设计：它的代码里**没有「prefill 阶段」也没有「decode 阶段」**。传统推理引擎把请求分成两类——还在读 prompt 的（prefill）和已经在吐字的（decode）——然后为两类各写一条调度路径。v1 把这两条路径**合成了一条**。一个请求在调度器眼里只有两个数：已经算了多少 token（`num_computed_tokens`），还差多少 token 要算（`num_tokens_with_spec`）。每一拍，调度器尽量让前者去追后者。prefill 是「差得多」，decode 是「差 1 个」——同一套逻辑，同一个预算池，同一拍里混着跑。
 
@@ -663,7 +663,7 @@ def test_second_schedule_emits_cached_request_data():
 
 ## 13.6 update_from_output：反馈环的另一半
 
-`schedule()` 是「发出去」，`update_from_output()` 是「收回来」。模型跑完前向、采样出 token，[EngineCore](../ch11-engine-core/narrative/chapter.md) 把 `ModelRunnerOutput` 交给它，它负责把 token 追加到请求上、判断该不该停、停了就释放：
+`schedule()` 是「发出去」，`update_from_output()` 是「收回来」。模型跑完前向、采样出 token，[EngineCore](../../ch11-engine-core/narrative/chapter.md) 把 `ModelRunnerOutput` 交给它，它负责把 token 追加到请求上、判断该不该停、停了就释放：
 
 ```python
 # vllm/v1/core/sched/scheduler.py:L1248（精简：剥去 connector/encoder/structured/pooling/logprobs/stats）
@@ -751,13 +751,13 @@ def test_request_stops_at_max_tokens():
 
 第 2 个 token 触顶 `max_tokens=2`，请求结束、释放、记入 `finished_req_ids`，输出带上 `finish_reason`。这就是连续批处理里一个请求「退出批」的全过程——它腾出的 KV 块和 running 槽位，下一拍立刻能被 WAITING 队列里的新请求接手。批的成员就是这样连续流转的。
 
-到这里，「不分相 + token 预算 + 两阶段 + 全量/增量 + 反馈环」就是 `schedule()` 决定每拍推哪些请求、推多少 token 的全部答案。[第 11 章和第 12 章](../ch11-engine-core/narrative/chapter.md)当作黑盒的那个方法，现在彻底展开了。
+到这里，「不分相 + token 预算 + 两阶段 + 全量/增量 + 反馈环」就是 `schedule()` 决定每拍推哪些请求、推多少 token 的全部答案。[第 11 章和第 12 章](../../ch11-engine-core/narrative/chapter.md)当作黑盒的那个方法，现在彻底展开了。
 
 ---
 
 ## 13.7 AsyncScheduler：让调度和执行重叠
 
-最后一块拼图，是 vLLM 默认会启用的**异步调度**。[第 3 章 §3.5](../ch03-config-and-wiring/narrative/chapter.md#35-async_scheduling-三态决策默认开但会自动退化) 讲配置时埋了一笔账：`async_scheduling` 是个三态开关（True / False / None），它的最终值会影响 `EngineCore` 实例化哪个调度器——`async_scheduling=True` 时实例化 `AsyncScheduler`，否则是普通 `Scheduler`。当时只说「记住这条线」，现在到了它兑现的地方：这个 `AsyncScheduler` 实例，**到底怎么驱动连续批处理？**
+最后一块拼图，是 vLLM 默认会启用的**异步调度**。[第 3 章 §3.5](../../ch03-config-and-wiring/narrative/chapter.md#35-async_scheduling-三态决策默认开但会自动退化) 讲配置时埋了一笔账：`async_scheduling` 是个三态开关（True / False / None），它的最终值会影响 `EngineCore` 实例化哪个调度器——`async_scheduling=True` 时实例化 `AsyncScheduler`，否则是普通 `Scheduler`。当时只说「记住这条线」，现在到了它兑现的地方：这个 `AsyncScheduler` 实例，**到底怎么驱动连续批处理？**
 
 先看它解决什么问题。回到同步 `Scheduler`：第 N 拍调度时，追赶公式要读 `num_computed_tokens`。但这个值，要等第 N−1 拍的前向**跑完、采样出 token**，才能正确更新。于是同步调度被卡死成一条直线——调度，等前向，调度，等前向。前向在 GPU 上跑的时候，CPU 上的调度器在干等；调度器在算的时候，GPU 在干等。两边轮流闲着。
 
@@ -844,7 +844,7 @@ def test_async_placeholder_redeemed_on_output():
     assert a.num_output_tokens == 1
 ```
 
-第一个测试：prefill 一拍读完 4 个 prompt token，请求进入「将吐字」状态，记 1 个占位；下一拍**上一拍的 token 还没回来**，但靠这个占位，调度器照样为它排了 1 个 decode 槽，占位累加到 2。第二个测试：真 token 回流，占位减回 0，账平了。占位的加减始终配平——这是异步调度正确性的基石，也是 [第 3 章](../ch03-config-and-wiring/narrative/chapter.md) 那个 `async_scheduling` 开关最终落到实处的地方。
+第一个测试：prefill 一拍读完 4 个 prompt token，请求进入「将吐字」状态，记 1 个占位；下一拍**上一拍的 token 还没回来**，但靠这个占位，调度器照样为它排了 1 个 decode 槽，占位累加到 2。第二个测试：真 token 回流，占位减回 0，账平了。占位的加减始终配平——这是异步调度正确性的基石，也是 [第 3 章](../../ch03-config-and-wiring/narrative/chapter.md) 那个 `async_scheduling` 开关最终落到实处的地方。
 
 ---
 
@@ -856,6 +856,6 @@ def test_async_placeholder_redeemed_on_output():
 - **两阶段**：先 RUNNING（在途请求优先，分不到块就 FCFS 抢占队尾、被抢者归零重算），再 WAITING（仅当本拍没抢占过，`if not preempted_reqs` 守卫防抖动）。
 - **全量 / 增量二分**：首次发 `NewRequestData`（worker 缓存住），之后只发 `CachedRequestData` 的 diff，把跨进程通信量压到最小。
 - **乐观推进**：调度后立刻把 `num_computed_tokens` 往前推，不等前向，让 chunked prefill 下一拍立刻续上。
-- **异步重叠**：`AsyncScheduler` 用 `num_output_placeholders` 占位，让 `schedule(N)` 和 `forward(N−1)` 重叠，消掉调度间隙的 GPU 气泡——这正是 [第 3 章](../ch03-config-and-wiring/narrative/chapter.md) 那个 `async_scheduling=True` 实例驱动连续批处理的真身。
+- **异步重叠**：`AsyncScheduler` 用 `num_output_placeholders` 占位，让 `schedule(N)` 和 `forward(N−1)` 重叠，消掉调度间隙的 GPU 气泡——这正是 [第 3 章](../../ch03-config-and-wiring/narrative/chapter.md) 那个 `async_scheduling=True` 实例驱动连续批处理的真身。
 
 调度器决定了「这一拍算哪些 token」，但它有个一直没展开的依赖：`allocate_slots` 凭什么说「有块」或「没块」？那些 KV 块是怎么分页、怎么按前缀复用、怎么在抢占时释放的？这是下一章 KV cache 管理器的主场——把调度器一直当接口调用的那个分页显存分配器，彻底拆开。

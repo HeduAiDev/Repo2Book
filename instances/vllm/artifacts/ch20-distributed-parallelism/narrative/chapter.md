@@ -5,11 +5,11 @@
 ![你在这里：Part V 执行层并行收官](../diagrams/roadmap.png)
 
 > *图注：全书地图走到执行层的并行收官。*
-> *[上一章](../ch19-model-runner/narrative/chapter.md)把一拍前向切成「发起」与「采样」两半，前向里那一行 `all_reduce` 当时一笔带过。*
+> *[上一章](../../ch19-model-runner/narrative/chapter.md)把一拍前向切成「发起」与「采样」两半，前向里那一行 `all_reduce` 当时一笔带过。*
 > *本章解决「多张卡之间到底怎么通信」——把 TP/PP/DP/EP 各并行维度统一成一个抽象，讲透三大集合原语、双群组分工、和让通信能进 `torch.compile` 图的 custom-op。*
-> *[下一章](../ch21-async-data-parallel/narrative/chapter.md)接着讲异步通信与数据并行，把这套群组用到 DP 调度上。*
+> *[下一章](../../ch21-async-engine/narrative/chapter.md)接着讲异步通信与数据并行，把这套群组用到 DP 调度上。*
 
-前面十几章，我们一直默认模型跑在「一张卡」上。可真实的 vLLM 部署，动辄 8 卡张量并行、再叠几段流水线。[第 17 章](../ch17-worker-and-executor/narrative/chapter.md)讲过：一张卡一个 worker，八卡就是八个 worker 同时收到同一张工单、各算各的分片。
+前面十几章，我们一直默认模型跑在「一张卡」上。可真实的 vLLM 部署，动辄 8 卡张量并行、再叠几段流水线。[第 17 章](../../ch17-worker-and-executor/narrative/chapter.md)讲过：一张卡一个 worker，八卡就是八个 worker 同时收到同一张工单、各算各的分片。
 
 问题来了——它们**算各自的分片**，可注意力和 FFN 的输出得**合起来**才是完整结果。这就需要卡与卡之间通信。一行 `hidden_states = tensor_model_parallel_all_reduce(hidden_states)`，背后是一整套机制：谁和谁组成一个通信组？用什么后端（NCCL？gloo？vLLM 自研内核？）？这行通信怎么不把 `torch.compile` 的计算图打断？流水线相邻两段之间又怎么把中间结果传过去？
 
@@ -712,13 +712,13 @@ def tensor_model_parallel_reduce_scatter(
     return get_tp_group().reduce_scatter(input_, dim)
 ```
 
-这一层是「模型层」和本章「分布式层」的**接缝**。[第 22 章](../ch22-model-definitions/narrative/chapter.md)读 Llama 模型定义时，你会看到 RowParallel 线性层调的就是 `tensor_model_parallel_all_reduce`——它根本不知道 `GroupCoordinator` 的存在，只调一个自由函数。整套群组机制对模型代码是隐形的。
+这一层是「模型层」和本章「分布式层」的**接缝**。[第 22 章](../../ch22-model-definitions/narrative/chapter.md)读 Llama 模型定义时，你会看到 RowParallel 线性层调的就是 `tensor_model_parallel_all_reduce`——它根本不知道 `GroupCoordinator` 的存在，只调一个自由函数。整套群组机制对模型代码是隐形的。
 
 ---
 
 ## 20.7 谁把群组拉起来：MultiprocExecutor
 
-前面讲的群组，得在**每个 worker 进程里**真正建起来。这是 `MultiprocExecutor` 的活——[第 17 章](../ch17-worker-and-executor/narrative/chapter.md)讲过它是引擎大脑和 GPU 之间的控制平面，这里补上它和分布式群组的接口。
+前面讲的群组，得在**每个 worker 进程里**真正建起来。这是 `MultiprocExecutor` 的活——[第 17 章](../../ch17-worker-and-executor/narrative/chapter.md)讲过它是引擎大脑和 GPU 之间的控制平面，这里补上它和分布式群组的接口。
 
 启动期的编排骨架：
 
@@ -841,7 +841,7 @@ def tensor_model_parallel_reduce_scatter(
 
 **只从一个 rank 收结果。** `unique_reply_rank` 通常指向 **PP 末段的 TP rank0**。原因很实在：TP all_reduce 之后各 rank 结果一致，PP 只有末段产 logits——取这一个 rank 就是完整结果，省掉 `(world_size − 1)` 份冗余回传。`output_rank is not None` 时，`response_mqs` 缩成单元素，只 dequeue 那一个。
 
-`FutureWrapper` 让这事支持异步：`non_block=True` 时立刻返回 future、不阻塞调度循环，否则当场 `.result()`。它配合 `futures_queue` 做 FIFO 有序排空，是 [第 19 章](../ch19-model-runner/narrative/chapter.md)那套「发起前向后不干等」的重叠机制在执行器层的抓手。
+`FutureWrapper` 让这事支持异步：`non_block=True` 时立刻返回 future、不阻塞调度循环，否则当场 `.result()`。它配合 `futures_queue` 做 FIFO 有序排空，是 [第 19 章](../../ch19-model-runner/narrative/chapter.md)那套「发起前向后不干等」的重叠机制在执行器层的抓手。
 
 worker 那头，每个进程跑一个 busy loop，从队列取 RPC、反射调用：
 
@@ -899,4 +899,4 @@ worker 那头，每个进程跑一个 busy loop，从队列取 RPC、反射调�
 
 Part V 的执行层到此收官：从 worker 生命周期、持久批次、前向与采样解耦，到这一章的多卡通信，「一拍推理怎么在 N 张卡上跑起来」已经齐活。
 
-[下一章](../ch21-async-data-parallel/narrative/chapter.md)起，我们把这套群组用到数据并行上——看 DP 各副本之间怎么异步协调、怎么用 `cpu_group` 做轻量的跨副本同步，把并行从「一份模型切到多卡」推到「多份模型副本协同调度」。
+[下一章](../../ch21-async-engine/narrative/chapter.md)起，我们把这套群组用到数据并行上——看 DP 各副本之间怎么异步协调、怎么用 `cpu_group` 做轻量的跨副本同步，把并行从「一份模型切到多卡」推到「多份模型副本协同调度」。

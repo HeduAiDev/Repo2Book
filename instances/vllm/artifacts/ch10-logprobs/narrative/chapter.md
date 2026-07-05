@@ -4,7 +4,7 @@
 
 ![你在这里：Stage 3 输出处理里的 logprobs 装配](../diagrams/roadmap.png)
 
-> *图注：全书地图高亮当前位置。[第 8 章](../ch08-output-processor/narrative/chapter.md) 拆开了 Stage 3 那条单循环 `process_outputs()`——一整批混着 N 个请求的输出，怎么被解多路复用、扇出回 N 个客户端流。[第 9 章](../ch09-detokenization/narrative/chapter.md) 钻进那循环里的 `detokenizer.update()`，讲了把 token id 增量解成会停的文字流。本章接着讲同一循环里被一笔带过的另一笔账：`logprobs_processor.update_from_output()`——把 EngineCore 吐回来的一堆 logprobs 张量，装配成 OpenAI 兼容的 sample / prompt logprobs 容器。再往后，这些容器随 `RequestOutput` 一起返回给调用者，请求生命周期就走完了。*
+> *图注：全书地图高亮当前位置。[第 8 章](../../ch08-output-processor/narrative/chapter.md) 拆开了 Stage 3 那条单循环 `process_outputs()`——一整批混着 N 个请求的输出，怎么被解多路复用、扇出回 N 个客户端流。[第 9 章](../../ch09-detokenization/narrative/chapter.md) 钻进那循环里的 `detokenizer.update()`，讲了把 token id 增量解成会停的文字流。本章接着讲同一循环里被一笔带过的另一笔账：`logprobs_processor.update_from_output()`——把 EngineCore 吐回来的一堆 logprobs 张量，装配成 OpenAI 兼容的 sample / prompt logprobs 容器。再往后，这些容器随 `RequestOutput` 一起返回给调用者，请求生命周期就走完了。*
 
 第 8 章那条单循环里，每个请求都会走到这么一行（`vllm/v1/engine/output_processor.py:L664-L666`）：
 
@@ -807,7 +807,7 @@ def _new_completion_output(
 
 关键是 DELTA 模式下那行 `logprobs = logprobs[-len(token_ids):]`。
 
-[第 8 章](../ch08-output-processor/narrative/chapter.md) 讲过 `RequestOutputKind` 有 DELTA（流式只发增量）和非 DELTA（每次发全量）之分。流式输出每一步只该回传**本批新增 token** 的 logprobs，于是切尾：取最后 `len(token_ids)` 个位置。如果容器是 `FlatLogprobs`，切片（如 `[-1:]`）会把对应区间的 `start_indices`/`end_indices` 整体减去偏移量，新对象里位置 0 指向原对象的切片起始位置，是一个独立的 0-indexed 新 `FlatLogprobs`；如果是 `list[dict]`，就是普通切片。
+[第 8 章](../../ch08-output-processor/narrative/chapter.md) 讲过 `RequestOutputKind` 有 DELTA（流式只发增量）和非 DELTA（每次发全量）之分。流式输出每一步只该回传**本批新增 token** 的 logprobs，于是切尾：取最后 `len(token_ids)` 个位置。如果容器是 `FlatLogprobs`，切片（如 `[-1:]`）会把对应区间的 `start_indices`/`end_indices` 整体减去偏移量，新对象里位置 0 指向原对象的切片起始位置，是一个独立的 0-indexed 新 `FlatLogprobs`；如果是 `list[dict]`，就是普通切片。
 
 **`cumulative_logprob` 不切**。它始终是整段序列的累计值，跟着 `CompletionOutput` 原样带出去——切尾只切逐位置的 logprobs，累计概率是整体打分，不能被切片重置。
 

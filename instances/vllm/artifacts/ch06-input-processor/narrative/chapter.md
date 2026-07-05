@@ -4,15 +4,15 @@
 
 ![本章在全书地图中的位置](../diagrams/roadmap.png)
 
-> *图注：全书子系统路线图，本章仍点亮 `input-processor` 这一段——但视角换了。上一章我们站在「单个请求怎么进引擎」的角度看输入处理；这一章把镜头拉到请求接入的最上层，看 `AsyncLLM.add_request` 怎么把一个 `n>1` 的请求**扇出**成多个对等的普通请求，再在输出侧**归并**回来。它左边接 [第 4 章的 AsyncLLM 三段式](../ch04-async-llm/narrative/chapter.md)，右边把归并好的结果交给 [第 8 章的输出处理](../ch08-output-processing/narrative/chapter.md) 真正驱动。*
+> *图注：全书子系统路线图，本章仍点亮 `input-processor` 这一段——但视角换了。上一章我们站在「单个请求怎么进引擎」的角度看输入处理；这一章把镜头拉到请求接入的最上层，看 `AsyncLLM.add_request` 怎么把一个 `n>1` 的请求**扇出**成多个对等的普通请求，再在输出侧**归并**回来。它左边接 [第 4 章的 AsyncLLM 三段式](../../ch04-async-llm/narrative/chapter.md)，右边把归并好的结果交给 [第 8 章的输出处理](../../ch08-output-processor/narrative/chapter.md) 真正驱动。*
 
-[第 4 章](../ch04-async-llm/narrative/chapter.md) 拆三段式时，`add_request` 那段代码里有一行注释被我们一笔带过：
+[第 4 章](../../ch04-async-llm/narrative/chapter.md) 拆三段式时，`add_request` 那段代码里有一行注释被我们一笔带过：
 
 ```python
 # … 省略：n>1 的 ParentRequest 扇出子请求（并行采样）…
 ```
 
-当时的原话是「`n>1` 并行采样是同机制重复，本章不展开」。[第 5 章](../ch05-input-processing/narrative/chapter.md) 又顺手揭了半层盖子——指出裂分不在 `InputProcessor` 里、而在更上层的 `ParentRequest`，并走查了子 id 与子参数怎么派生。但两章都刻意没碰一个更要紧的问题：
+当时的原话是「`n>1` 并行采样是同机制重复，本章不展开」。[第 5 章](../../ch05-input-processing/narrative/chapter.md) 又顺手揭了半层盖子——指出裂分不在 `InputProcessor` 里、而在更上层的 `ParentRequest`，并走查了子 id 与子参数怎么派生。但两章都刻意没碰一个更要紧的问题：
 
 > 用户要 `n=3`（同一个 prompt 采 3 个不同结果），vLLM 为什么不在引擎里加一个「一次算 3 路」的批量参数，反而要在客户端进程把它**拆成 3 个对等的普通请求**、各自排队、各自调度？
 
@@ -186,7 +186,7 @@ def get_child_info(self, index: int) -> tuple[str, SamplingParams]:
 
 ### 6.4.1 子 id：`f"{index}_{request_id}"`
 
-子 id 的构造是 `f"{index}_{self.request_id}"`。要看懂它为什么能保证唯一，得先回到 [第 5 章讲过的 `assign_request_id`](../ch05-input-processing/narrative/chapter.md)。它在扇出**之前**就已经把请求的 id 内部化了：
+子 id 的构造是 `f"{index}_{self.request_id}"`。要看懂它为什么能保证唯一，得先回到 [第 5 章讲过的 `assign_request_id`](../../ch05-input-processing/narrative/chapter.md)。它在扇出**之前**就已经把请求的 id 内部化了：
 
 ```python
 # vllm/v1/engine/input_processor.py:L214-L232
@@ -269,7 +269,7 @@ def add_request(
     self.external_req_ids[req_state.external_req_id].append(request_id)
 ```
 
-每个 child 在这里拿到一份**独立的** `RequestState`。这点很要紧：n 路各有各的 detokenizer、各有各的 logprobs 累积状态，互不干扰——它们在输出处理眼里就是 n 个独立请求（输出处理的全部细节留 [第 8 章](../ch08-output-processing/narrative/chapter.md)）。注意传进去的 `request_index` 正是扇出时的 `idx`，它后面会变成 `CompletionOutput.index`，是归并时归位的依据。
+每个 child 在这里拿到一份**独立的** `RequestState`。这点很要紧：n 路各有各的 detokenizer、各有各的 logprobs 累积状态，互不干扰——它们在输出处理眼里就是 n 个独立请求（输出处理的全部细节留 [第 8 章](../../ch08-output-processor/narrative/chapter.md)）。注意传进去的 `request_index` 正是扇出时的 `idx`，它后面会变成 `CompletionOutput.index`，是归并时归位的依据。
 
 这段还顺手织了两张表，正是 n>1 归并与取消的两条命脉：
 
@@ -436,4 +436,4 @@ return request_ids_to_abort
 
 这套设计的精髓，是把「采 n 个候选」彻底翻译成引擎熟悉的「n 个普通请求」——引擎侧零特判、调度上零偏袒，所有 `n>1` 的脏活累活都被关在 `ParentRequest` 这一个类里。第 4 章那行「`n>1` 本章不展开」的注释，到这里就兑现完了。
 
-这章我们多次提到，归并的状态机虽然定义在 `ParentRequest` 里，但真正**驱动**它转起来的——把引擎吐回的 `EngineCoreOutput` 喂给每个 child 的 `RequestState`、再 `put` 进那个共享队列——是输出处理这一段的活。下一段我们就去 [Stage 3 输出处理](../ch08-output-processing/narrative/chapter.md)，看一个 token 从引擎回到客户端的最后一程。
+这章我们多次提到，归并的状态机虽然定义在 `ParentRequest` 里，但真正**驱动**它转起来的——把引擎吐回的 `EngineCoreOutput` 喂给每个 child 的 `RequestState`、再 `put` 进那个共享队列——是输出处理这一段的活。下一段我们就去 [Stage 3 输出处理](../../ch08-output-processor/narrative/chapter.md)，看一个 token 从引擎回到客户端的最后一程。

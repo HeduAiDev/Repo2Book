@@ -9,7 +9,7 @@
 > *本章拆开两件事：单个算子怎么选实现，整张图怎么被切成融合 + 图捕获的段。*
 > *下一章接着进 `self.attn` 内部，看不同 attention 后端怎么实现。*
 
-[上一章](../ch22-model-definitions/narrative/chapter.md)结尾留了个钩子。`LlamaAttention.forward` 里那行 `self.attn(q, k, v)`，把后端选择、KV cache 读写、量化统统吞了进去。而让这个算子能进 `torch.compile` 图、又不把整张图撕碎的机制，被推给了本章。本章的两条主线分别落在 `vllm/model_executor/custom_op.py` 和 `vllm/compilation/decorators.py`。
+[上一章](../../ch22-model-definitions/narrative/chapter.md)结尾留了个钩子。`LlamaAttention.forward` 里那行 `self.attn(q, k, v)`，把后端选择、KV cache 读写、量化统统吞了进去。而让这个算子能进 `torch.compile` 图、又不把整张图撕碎的机制，被推给了本章。本章的两条主线分别落在 `vllm/model_executor/custom_op.py` 和 `vllm/compilation/decorators.py`。
 
 这一章就来还债。但在还债之前，先得搞清楚一件更基础的事：vLLM 里同一个算子——比如 RMSNorm——为什么会有两份实现？一份是手写的融合 CUDA kernel，一份是一串普通的 `torch` 算子。运行时到底走哪一份？谁来决定？
 

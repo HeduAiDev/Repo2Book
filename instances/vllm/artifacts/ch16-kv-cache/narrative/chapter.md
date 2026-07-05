@@ -5,11 +5,11 @@
 ![你在这里：分页 KV 缓存的分配决策层](../diagrams/roadmap.png)
 
 > *图注：全书地图仍停在主线阶段「EngineCore 循环」，本章继续深入它背后的分页 KV 缓存。*
-> *[第 15 章](../ch15-kv-cache/narrative/chapter.md) 立了块池、LRU、块哈希、前缀命中这些零件。*
+> *[第 15 章](../../ch15-kv-cache/narrative/chapter.md) 立了块池、LRU、块哈希、前缀命中这些零件。*
 > *本章解决「拿到这些零件后怎么决策」：一次分配里哪些块该释放、哪些该挂、哪些该新建。*
 > *下一章离开 KV 缓存，转向 Executor 与 Worker 的生命周期。*
 
-[第 15 章](../ch15-kv-cache/narrative/chapter.md) 把 `allocate_slots` 的三段式过了一遍——但走的是一条**最顺**的路：单一注意力类型、全注意力、开着前缀缓存。那条路上，「释放窗外块」这一步直接被跳过了（全注意力从不释放），「混合模型怎么协调多种注意力」更是连碰都没碰。
+[第 15 章](../../ch15-kv-cache/narrative/chapter.md) 把 `allocate_slots` 的三段式过了一遍——但走的是一条**最顺**的路：单一注意力类型、全注意力、开着前缀缓存。那条路上，「释放窗外块」这一步直接被跳过了（全注意力从不释放），「混合模型怎么协调多种注意力」更是连碰都没碰。
 
 那一章末尾的小结里，三段式被压成了一句话：「查容量、挂命中块、补新块、登记」。这句话在主路径上是对的，但它藏起了三个真实 vLLM 每天都要处理的深水区：
 
@@ -17,9 +17,9 @@
 - 一个请求的 KV 不全在本地——有些是**外部 connector**（比如 P/D 分离的另一端）算好的，这些「外部已算 token」怎么挂块？投机解码的**草稿 token** 又怎么预留槽位却不污染缓存？
 - 一个模型同时有 full attention 和 sliding window 两种层（现在很多模型都这样），它们对「前缀命中到哪」的判断**不一致**——到底该信谁？
 
-这一章就把这三个深水区填平。主角有两个：`allocate_slots` 的**完整**三阶段（[第 15 章](../ch15-kv-cache/narrative/chapter.md#157-三段式分配allocate_slots) 只展开了中段），和它背后那个决定「有几种注意力类型、该怎么协调」的 `KVCacheCoordinator`。
+这一章就把这三个深水区填平。主角有两个：`allocate_slots` 的**完整**三阶段（[第 15 章](../../ch15-kv-cache/narrative/chapter.md#157-三段式分配allocate_slots) 只展开了中段），和它背后那个决定「有几种注意力类型、该怎么协调」的 `KVCacheCoordinator`。
 
-照例配一份**只做减法**的精简版：和真实 `vllm/v1/core/` 下的 `kv_cache_manager.py`、`kv_cache_coordinator.py`、`single_type_kv_cache_manager.py` 同名、同结构、同控制流。它复用 [第 15 章](../ch15-kv-cache/narrative/chapter.md) 的块池与哈希基础设施，只补回那三个被跳过的分支；删掉的（Mamba 状态块、cross-attention 编码器、投机解码草稿头、上下文并行）都原样标注。它不 import vllm、不要 GPU，`pytest` 直接跑——用来在本地亲眼看不动点怎么收敛、窗外块怎么变成 null。正文的主线，始终是真实源码。
+照例配一份**只做减法**的精简版：和真实 `vllm/v1/core/` 下的 `kv_cache_manager.py`、`kv_cache_coordinator.py`、`single_type_kv_cache_manager.py` 同名、同结构、同控制流。它复用 [第 15 章](../../ch15-kv-cache/narrative/chapter.md) 的块池与哈希基础设施，只补回那三个被跳过的分支；删掉的（Mamba 状态块、cross-attention 编码器、投机解码草稿头、上下文并行）都原样标注。它不 import vllm、不要 GPU，`pytest` 直接跑——用来在本地亲眼看不动点怎么收敛、窗外块怎么变成 null。正文的主线，始终是真实源码。
 
 我们先把 `allocate_slots` 的全貌摊开，再逐阶段下钻，最后上到协调层看 Unitary 与 Hybrid 的分野。
 
@@ -27,7 +27,7 @@
 
 ## 16.1 三阶段的全貌：allocate_slots 摊开看
 
-先看入口。调度器要给一个请求安排显存时，调的就是这个函数。它的签名比 [第 15 章](../ch15-kv-cache/narrative/chapter.md) 见到的多了一串参数——那些正是本章的主角：
+先看入口。调度器要给一个请求安排显存时，调的就是这个函数。它的签名比 [第 15 章](../../ch15-kv-cache/narrative/chapter.md) 见到的多了一串参数——那些正是本章的主角：
 
 ```python
 # vllm/v1/core/kv_cache_manager.py:L225
@@ -138,7 +138,7 @@ def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
     return 0
 ```
 
-这就是为什么 [第 15 章](../ch15-kv-cache/narrative/chapter.md) 的全注意力主路径里 `remove_skipped_blocks` 像是不存在——它确实跑了，但 `get_num_skipped_tokens` 返回 0，函数开头就返回了。滑动窗口管理器把它重写成一道公式：
+这就是为什么 [第 15 章](../../ch15-kv-cache/narrative/chapter.md) 的全注意力主路径里 `remove_skipped_blocks` 像是不存在——它确实跑了，但 `get_num_skipped_tokens` 返回 0，函数开头就返回了。滑动窗口管理器把它重写成一道公式：
 
 ```python
 # vllm/v1/core/single_type_kv_cache_manager.py:L606
@@ -214,7 +214,7 @@ def remove_skipped_blocks(
 
 > *图注：sliding_window=8、block_size=4、num_computed=11。skipped=max(0,11-8+1)=4，整除块大小得 1 个 skipped 块。逆序把 B0 换成 null_block 并归还 free queue，下标不变，真实显存被释放。*
 
-为什么是「换 null」而不是「删除」？因为块表是 **append-only** 设计——块的下标就是它的逻辑位置，删掉前面一个，后面所有块的逻辑偏移全乱。换成一个共享的 `null_block` 既释放了真实显存（那个真实块进了 free queue，能被别人取用），又保住了下标稳定。这个 `null_block` 正是 [第 15 章](../ch15-kv-cache/narrative/chapter.md#152-一个块kvcacheblock) 介绍 `KVCacheBlock.is_null` 时埋下的那个特殊块——它初始化时就被单拎出来，永不参与缓存与释放，专门干这种占位的活。现在它上岗了。
+为什么是「换 null」而不是「删除」？因为块表是 **append-only** 设计——块的下标就是它的逻辑位置，删掉前面一个，后面所有块的逻辑偏移全乱。换成一个共享的 `null_block` 既释放了真实显存（那个真实块进了 free queue，能被别人取用），又保住了下标稳定。这个 `null_block` 正是 [第 15 章](../../ch15-kv-cache/narrative/chapter.md#152-一个块kvcacheblock) 介绍 `KVCacheBlock.is_null` 时埋下的那个特殊块——它初始化时就被单拎出来，永不参与缓存与释放，专门干这种占位的活。现在它上岗了。
 
 两个小心思值得点明：
 
@@ -243,7 +243,7 @@ if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
     return None
 ```
 
-返回 `None` 就是 [第 14 章](../ch14-scheduler/narrative/chapter.md) 那个**抢占触发点**——要不到块，调度器只能抢占别的请求或把这个请求退回去。
+返回 `None` 就是 [第 14 章](../../ch14-scheduler/narrative/chapter.md) 那个**抢占触发点**——要不到块，调度器只能抢占别的请求或把这个请求退回去。
 
 这个预测必须**精确**，不能近似。多估了浪费容量、调度吞吐下降；少估了真去分配时块不够，前向计算中途 OOM 直接崩。看它怎么算的：
 
@@ -470,9 +470,9 @@ def allocate_new_computed_blocks(
 逐步看：
 
 1. **先算 skipped、再切掉命中块的头。** 如果命中的前缀里有一段已经在窗外，那这段命中块根本不用挂——`new_computed_blocks[num_skipped_blocks:]` 直接切掉。命中长度和窗口共同决定真正要挂的块。
-2. **touch 命中块。** `block_pool.touch` 给命中块 `ref_cnt+1`，若在 free queue 里就移出来——这就是 [第 15 章](../ch15-kv-cache/narrative/chapter.md#154-引用计数谁在用这块) 讲过的「把驱逐候选救回」，也正是 [§16.2](#162-阶段一释放窗外块--预算检查) 预算里 `num_evictable_blocks` 要预留的那些块。
+2. **touch 命中块。** `block_pool.touch` 给命中块 `ref_cnt+1`，若在 free queue 里就移出来——这就是 [第 15 章](../../ch15-kv-cache/narrative/chapter.md#154-引用计数谁在用这块) 讲过的「把驱逐候选救回」，也正是 [§16.2](#162-阶段一释放窗外块--预算检查) 预算里 `num_evictable_blocks` 要预留的那些块。
 3. **null 填 skipped 段 + 挂命中块。** `req_blocks` 先填 `num_skipped_blocks` 个 null（占住窗外那段下标），再接上命中块。下标对齐，逻辑位置准确。
-4. **为 external 分配真实块。** 这是本章相对 [第 15 章](../ch15-kv-cache/narrative/chapter.md) 全新的分支。外部 connector 算好的 token，KV 数据在外面，但 vLLM 这边得有真实块去**接收**它们——所以走 `get_new_blocks`（真实分配），不是 `touch`（借用命中）。要分配的块数是「总已算 token 需要的块」减「已经挂上的（null + 命中）」。
+4. **为 external 分配真实块。** 这是本章相对 [第 15 章](../../ch15-kv-cache/narrative/chapter.md) 全新的分支。外部 connector 算好的 token，KV 数据在外面，但 vLLM 这边得有真实块去**接收**它们——所以走 `get_new_blocks`（真实分配），不是 `touch`（借用命中）。要分配的块数是「总已算 token 需要的块」减「已经挂上的（null + 命中）」。
 
 为什么 external 走 `get_new_blocks` 而命中走 `touch`？因为命中块是 vLLM 自己前缀缓存里已有的物理块，借用即可；external 的 KV 不在 vLLM 缓存里，得新占一块显存来装。两者本质不同。精简版 `test_external_computed_tokens_allocate_real_blocks` 验证：给定 external token 数，函数确实 `get_new_blocks` 了对应的真实块。
 
@@ -595,7 +595,7 @@ def find_longest_cache_hit(
     return hit_blocks, len(hit_blocks[0]) * self.block_size
 ```
 
-命中长度 = 命中块数 × `block_size`，没有任何协调逻辑，因为只有一种注意力。它构造时断言 `hash_block_size == block_size` 且组数 == 1。[第 15 章](../ch15-kv-cache/narrative/chapter.md#156-查表与命中从-block_hashes-到物理块) 讲的 `FullAttentionManager.find_longest_cache_hit`，走的就是 Unitary 这条委托。精简版 `test_unitary_find_longest_cache_hit_delegates` 验证它确实把调用透传给了唯一 manager。
+命中长度 = 命中块数 × `block_size`，没有任何协调逻辑，因为只有一种注意力。它构造时断言 `hash_block_size == block_size` 且组数 == 1。[第 15 章](../../ch15-kv-cache/narrative/chapter.md#156-查表与命中从-block_hashes-到物理块) 讲的 `FullAttentionManager.find_longest_cache_hit`，走的就是 Unitary 这条委托。精简版 `test_unitary_find_longest_cache_hit_delegates` 验证它确实把调用透传给了唯一 manager。
 
 真正烧脑的是 **Hybrid**——多种注意力，命中长度要让**所有类型同时成立**。下一节专门拆它。
 
@@ -803,7 +803,7 @@ simple hybrid 为什么一轮足够？full 排首给出上界，唯一的 other 
 
 ## 16.7 小结：分配决策与多注意力协调
 
-[第 15 章](../ch15-kv-cache/narrative/chapter.md) 把零件备齐，这一章把零件装成了能应对真实复杂度的分配决策。三条主线分别落在 `vllm/v1/core/kv_cache_manager.py:L225`（三阶段总控）、`vllm/v1/core/single_type_kv_cache_manager.py:L88`（需块预测）、`vllm/v1/core/kv_cache_coordinator.py:L487`（不动点迭代）。归位一下：
+[第 15 章](../../ch15-kv-cache/narrative/chapter.md) 把零件备齐，这一章把零件装成了能应对真实复杂度的分配决策。三条主线分别落在 `vllm/v1/core/kv_cache_manager.py:L225`（三阶段总控）、`vllm/v1/core/single_type_kv_cache_manager.py:L88`（需块预测）、`vllm/v1/core/kv_cache_coordinator.py:L487`（不动点迭代）。归位一下：
 
 - **`allocate_slots` 完整三阶段**：阶段一 `remove_skipped_blocks` 释放窗外块（换 null 不删除，保住 append-only 下标）+ `get_num_blocks_to_allocate` 精确预测（skipped 折抵 + 可驱逐块计入，预测 == 实际申请）；阶段二 `allocate_new_computed_blocks` 三步走（touch 命中、null 填 skipped、external 走 `get_new_blocks`）；阶段三新建 new + lookahead 槽位；收尾 `num_tokens_to_cache` 封顶到 `request.num_tokens`，挡住未定稿草稿污染缓存。
 - **各注意力类型的差异收束在 `get_num_skipped_tokens`**：全注意力恒 0（从不释放）、滑窗 `max(0, n-window+1)`、分块本地向下取整到 chunk。一个虚函数，三种回收语义。
@@ -811,6 +811,6 @@ simple hybrid 为什么一轮足够？full 排首给出上界，唯一的 other 
 - **`KVCacheCoordinator` 三态工厂**：拓扑差异构造期一次解析——NoPrefixCache（任意组数退化）/ Unitary（单组直委托，最常见）/ Hybrid（多组分桶 + 不动点）。逐组转发把「有几种注意力」对 `allocate_slots` 透明。
 - **Hybrid 不动点迭代**：每类型对候选长度「接受或缩短」，缩短即重启；单调递减 + lcm 倍数离散下界 0 保证至多 $L/\mathrm{lcm}$ 轮收敛；full 排首给紧上界 + 下闭包早停 + simple hybrid 一轮，把常见情形压回 Unitary 量级。
 
-这一章也是 KV 缓存子系统的收尾。从 [第 15 章](../ch15-kv-cache/narrative/chapter.md) 的块、队列、哈希、命中，到这一章的三阶段分配与多注意力协调，分页 KV 缓存的「显存怎么切、怎么分、怎么省」算讲透了。
+这一章也是 KV 缓存子系统的收尾。从 [第 15 章](../../ch15-kv-cache/narrative/chapter.md) 的块、队列、哈希、命中，到这一章的三阶段分配与多注意力协调，分页 KV 缓存的「显存怎么切、怎么分、怎么省」算讲透了。
 
 但有一个前提一直被我们当作给定：那个 `num_gpu_blocks`——块池到底有多少块——是哪来的？它不是拍脑袋定的，而是 Worker 在启动时**实测**显存、profiling 出来的。下一章离开 KV 缓存的核心，转向 Executor 与 Worker 的生命周期，看这些块在被分配之前，是怎么被「数」出来的。

@@ -18,7 +18,7 @@
 
 这两件事看起来八竿子打不着，却都属于同一个主题——**让一台已经在运行的引擎，在不重启的前提下改变自己的行为**。一个改的是分布式拓扑，一个改的是会话状态。本章就拆开看它们各自怎么做到"原地变身"。前者的代码集中在 `vllm/distributed/elastic_ep/elastic_state.py` 与 `vllm/v1/engine/core.py`，后者在 `vllm/entrypoints/openai/responses/serving.py` 一带。
 
-我们先啃硬骨头：弹性专家并行（Elastic EP）的扩缩状态机。它深度依赖[第 21 章的 DP wave 协议](../ch21-async-engine/narrative/chapter.md)和[第 7 章的 EngineCore busy loop](../ch07-engine-core/narrative/chapter.md)，建议手边备着那两章。然后再看相对轻巧的 Responses 多轮。
+我们先啃硬骨头：弹性专家并行（Elastic EP）的扩缩状态机。它深度依赖[第 21 章的 DP wave 协议](../../ch21-async-engine/narrative/chapter.md)和[第 7 章的 EngineCore busy loop](../../ch07-engine-core/narrative/chapter.md)，建议手边备着那两章。然后再看相对轻巧的 Responses 多轮。
 
 ---
 
@@ -357,7 +357,7 @@ def _switch_and_prepare(self):
 三件事，环环相扣：
 
 - **销毁旧组、把 `engine_core` 的 `dp_group`/`dp_rank`/`dp_store` 整体切到新组。** 切换完成后，busy loop 里那些"和组里对齐 wave"的集合通信，自动就走新组了——`engine_core` 根本不知道脚下换了组，它只认 `self.dp_group` 这个引用。
-- **跨新组 `all_reduce(MAX)` 对齐 DP wave 三元组 `[engines_running, current_wave, step_counter]`。** 这是和[第 21 章 DP wave 协议](../ch21-async-engine/narrative/chapter.md)的接缝。新组里既有老引擎（带着自己的 `current_wave`）也有新引擎（wave 还是 0），取 MAX 就让全组采纳"跑得最远的那个 wave"——避免有谁重放旧 wave 或拖慢全组。这个不变量，§33.8 还会再遇到。
+- **跨新组 `all_reduce(MAX)` 对齐 DP wave 三元组 `[engines_running, current_wave, step_counter]`。** 这是和[第 21 章 DP wave 协议](../../ch21-async-engine/narrative/chapter.md)的接缝。新组里既有老引擎（带着自己的 `current_wave`）也有新引擎（wave 还是 0），取 MAX 就让全组采纳"跑得最远的那个 wave"——避免有谁重放旧 wave 或拖慢全组。这个不变量，§33.8 还会再遇到。
 
 把"跑得最远的 wave"从口号落成一次可手算的逐分量取最大。假设切换时新组里两台老引擎与一台刚入组的新引擎各持这样三个三元组：
 
@@ -781,7 +781,7 @@ def construct_input_messages(
 
 织完这一串，喂给引擎，模型就"看见"了完整上下文。下一轮再来，这一轮的输出又会变成它的 `prev_response_output`，循环往复。
 
-这里有个量化值得点明：**有状态会话每轮都把全部历史重新喂进去，prompt 长度随轮数线性累积**。第 N 轮的输入约等于前 N-1 轮的全部消息加起来。听起来浪费，但这恰恰是[前缀缓存（prefix caching）](../ch15-kv-cache/narrative/chapter.md)价值最大的场景——历史前缀完全相同，KV 几乎全部命中缓存，真正要算的只有新增的那一句。多轮越深，缓存省得越多。
+这里有个量化值得点明：**有状态会话每轮都把全部历史重新喂进去，prompt 长度随轮数线性累积**。第 N 轮的输入约等于前 N-1 轮的全部消息加起来。听起来浪费，但这恰恰是[前缀缓存（prefix caching）](../../ch15-kv-cache/narrative/chapter.md)价值最大的场景——历史前缀完全相同，KV 几乎全部命中缓存，真正要算的只有新增的那一句。多轮越深，缓存省得越多。
 
 ---
 
@@ -941,7 +941,7 @@ assert "what is my name?" in contents          # 轮2 user
 
 本章是全书最后一段直接读源码的旅程，回头看这两条线，会发现它们共享同一种气质。
 
-弹性 EP 扩缩，是让一台**分布式引擎**原地改变拓扑：靠 `vllm/distributed/elastic_ep/elastic_state.py` 里一台每轮只走一步的状态机，把"重建进程组"这件阻塞的事拆碎了塞进 busy loop 的缝隙里，用两阶段 barrier 容忍各 rank 的时间差，用 all_reduce(MAX) 把变动后的成员收敛回同一条 DP wave。它把[第 7 章的 EngineCore 循环](../ch07-engine-core/narrative/chapter.md)和[第 21 章的 DP wave](../ch21-async-engine/narrative/chapter.md)往前推到了"成员数会动态变化"的极限场景。
+弹性 EP 扩缩，是让一台**分布式引擎**原地改变拓扑：靠 `vllm/distributed/elastic_ep/elastic_state.py` 里一台每轮只走一步的状态机，把"重建进程组"这件阻塞的事拆碎了塞进 busy loop 的缝隙里，用两阶段 barrier 容忍各 rank 的时间差，用 all_reduce(MAX) 把变动后的成员收敛回同一条 DP wave。它把[第 7 章的 EngineCore 循环](../../ch07-engine-core/narrative/chapter.md)和[第 21 章的 DP wave](../../ch21-async-engine/narrative/chapter.md)往前推到了"成员数会动态变化"的极限场景。
 
 Responses 多轮，是让一台**会话服务**原地积累状态：靠两个进程内字典，外加一个"输入 list 与生成 context 共享同一对象"的隐式接缝，让本轮输出无需显式写回就出现在下一轮历史里。它简洁、务实，也坦诚地挂着自己的 `HACK` 和 no-op `FIXME`。
 

@@ -4,9 +4,9 @@
 
 ![你在这里：EngineCore 的流水线变体](../diagrams/roadmap.png)
 
-> *图注：全书地图高亮当前阶段。[第 11 章](../ch11-engine-core/narrative/chapter.md) 把 `EngineCore` 的「心跳」`step()` 一拍拆到底，并在结尾留了一笔账：忙循环里那个 `step_fn()`，普通情况是 `step`，开了流水线并行就换成 `step_with_batch_queue`——「batch queue 的完整时间轴、各 stage 怎么重叠、那条投机解码叠结构化输出的小众路径，是第 12 章的主场」。本章就是那一场。我们把 `step_with_batch_queue` 这一个方法拆到底，看清那个 `deque` 怎么靠 `appendleft`/`pop` 把多个批同时挂在流水线的不同 stage 上，让 PP 气泡消失。往后 [第 13 章](../ch13-continuous-batching/narrative/chapter.md) 会钻进 `schedule()`，看连续批处理每一拍到底决定推什么。*
+> *图注：全书地图高亮当前阶段。[第 11 章](../../ch11-engine-core/narrative/chapter.md) 把 `EngineCore` 的「心跳」`step()` 一拍拆到底，并在结尾留了一笔账：忙循环里那个 `step_fn()`，普通情况是 `step`，开了流水线并行就换成 `step_with_batch_queue`——「batch queue 的完整时间轴、各 stage 怎么重叠、那条投机解码叠结构化输出的小众路径，是第 12 章的主场」。本章就是那一场。我们把 `step_with_batch_queue` 这一个方法拆到底，看清那个 `deque` 怎么靠 `appendleft`/`pop` 把多个批同时挂在流水线的不同 stage 上，让 PP 气泡消失。往后 [第 13 章](../../ch13-scheduler/narrative/chapter.md) 会钻进 `schedule()`，看连续批处理每一拍到底决定推什么。*
 
-[第 11 章](../ch11-engine-core/narrative/chapter.md) 立下的事是：`EngineCore` 每一拍调 `self.step_fn()`，而这个 `step_fn` 在 `vllm/v1/engine/core.py` 的 `__init__` 时就**静态绑定**好了——绑 `step` 还是绑 `step_with_batch_queue`，取决于一个开关。那一章把 `step` 讲透了：一次迭代里 `schedule → execute_model(non_block) → 算掩码 → 等前向 → 采样 → 收口`，最精巧的一手是让 CPU 算掩码和 GPU 跑前向重叠。
+[第 11 章](../../ch11-engine-core/narrative/chapter.md) 立下的事是：`EngineCore` 每一拍调 `self.step_fn()`，而这个 `step_fn` 在 `vllm/v1/engine/core.py` 的 `__init__` 时就**静态绑定**好了——绑 `step` 还是绑 `step_with_batch_queue`，取决于一个开关。那一章把 `step` 讲透了：一次迭代里 `schedule → execute_model(non_block) → 算掩码 → 等前向 → 采样 → 收口`，最精巧的一手是让 CPU 算掩码和 GPU 跑前向重叠。
 
 但 `step` 有个天花板。它一拍只推**一个批**，这个批必须完整走完「调度→执行→采样→收口」，下一拍才能开始下一个批。单卡单 stage 时这没问题。可一旦开了**流水线并行**（pipeline parallelism，PP）——把模型的层切成若干段、分给若干张卡串行接力——一个批要顺序流过 P 个 stage。`step` 一次只喂一个批进流水线，于是同一时刻**只有一个 stage 在干活**，其余 P−1 个 stage 全在干等。这就是 PP 的「气泡」（bubble）。
 
@@ -94,7 +94,7 @@ deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]]
 
 队列里每个元素是一个**三元组**：`(采样结果 future, 这个批的 SchedulerOutput, execute_model 的 future)`。三个字段各司其职：采样 future 取结果、`SchedulerOutput` 对账、`exec_future` 在采样失败时供出真因——[§12.4](#124-下半段pop-队尾取出最旧那个批) 出队时逐一拆开说。
 
-**第三，`step_fn` 二选一。** 一句话：`batch_queue is None` 就绑 `step`，否则绑 `step_with_batch_queue`。绑定**一次**，之后每拍直接调 `self.step_fn()`，不再判断分支——[第 11 章](../ch11-engine-core/narrative/chapter.md#你在这里) 的忙循环对此完全透明，它不知道也不关心自己驱动的是哪个 step。
+**第三，`step_fn` 二选一。** 一句话：`batch_queue is None` 就绑 `step`，否则绑 `step_with_batch_queue`。绑定**一次**，之后每拍直接调 `self.step_fn()`，不再判断分支——[第 11 章](../../ch11-engine-core/narrative/chapter.md#你在这里) 的忙循环对此完全透明，它不知道也不关心自己驱动的是哪个 step。
 
 精简版把这段原样搬了过来，于是可以在本地直接断言绑定结果：
 
@@ -336,7 +336,7 @@ elif not batch_queue:
     return None, False
 ```
 
-如果调度器没请求（`has_requests()` 为假）**且**队列也空了，那真没活干，返回 `(None, False)`——第二位 `False` 告诉忙循环这一拍空转了。注释也老实说了：正常不该走到这（[第 11 章](../ch11-engine-core/narrative/chapter.md) 的 `has_work()` 会拦在前面），这是一道防御。
+如果调度器没请求（`has_requests()` 为假）**且**队列也空了，那真没活干，返回 `(None, False)`——第二位 `False` 告诉忙循环这一拍空转了。注释也老实说了：正常不该走到这（[第 11 章](../../ch11-engine-core/narrative/chapter.md) 的 `has_work()` 会拦在前面），这是一道防御。
 
 注意这是 `elif`：只有 `has_requests()` 为假时才检查。如果调度器**有**请求，控制流要么在上面 `return None, True` 走了，要么就带着「这一拍新调度的批」往下落进下半段取结果。
 
@@ -440,7 +440,7 @@ assert collected == [1, 2]                       # 先调度的批先收口
 
 把这件事写成一句归纳骨架就是：**基例**——方法第一次被调用时 `len(batch_queue) == 0 < size`；**归纳步**——假设某拍进入时 `len < size`，这一拍至多 `appendleft` 一次（`+1`），且只有在 `appendleft` 前 `len < size`（即填后 `len ≤ size`）的前提下才执行，凡填到 `len == size` 就不再走 `return`、必落到下半段 `pop`（`−1`）。两个方向都被夹住，于是「进入方法时 `len < size`」这个不变量逐拍保持，`len(batch_queue)` 这个非负整数被牢牢锁在 `[0, size]` 内——上半段开头那个 `assert len(batch_queue) < self.batch_queue_size` 永不触发。
 
-最后看一眼队列对忙循环的影响。[第 11 章](../ch11-engine-core/narrative/chapter.md) 提过 `has_work()`：
+最后看一眼队列对忙循环的影响。[第 11 章](../../ch11-engine-core/narrative/chapter.md) 提过 `has_work()`：
 
 ```python
 # vllm/v1/engine/core.py:L1156
@@ -582,6 +582,6 @@ assert sched.update_draft_calls == [([[1, 2, -1]], deferred_so)]
 - **队列元素是三元组**：采样 future 取结果、`SchedulerOutput` 对账、`exec_future` 在采样撒谎说 `None` 时供出真凶。
 - **deferred sampling** 是异步发批的代价：结构化输出 + 投机解码下，算掩码要用上一步的草稿 token，缺 token 时只能把采样推迟到 `pop` 出上一步结果、拿到草稿 token 之后，补掩码 + 补采样 + 重入队，且不重跑前向。
 
-一套机制，对 PP 是消除流水线气泡，对单卡 `async_scheduling` 是重叠 CPU/GPU——这就是 [第 11 章](../ch11-engine-core/narrative/chapter.md) 结尾那个「`step_fn` 的另一种绑定」背后的全部故事。
+一套机制，对 PP 是消除流水线气泡，对单卡 `async_scheduling` 是重叠 CPU/GPU——这就是 [第 11 章](../../ch11-engine-core/narrative/chapter.md) 结尾那个「`step_fn` 的另一种绑定」背后的全部故事。
 
-那几个被我们当作黑盒的方法——`schedule()` 凭什么决定这一拍推哪些请求、各推多少 token——是下一章的主场。节拍器已经在转，流水线也填满了，接下来 [第 13 章](../ch13-continuous-batching/narrative/chapter.md) 钻进 `schedule()`，看连续批处理到底怎么排每一个批。
+那几个被我们当作黑盒的方法——`schedule()` 凭什么决定这一拍推哪些请求、各推多少 token——是下一章的主场。节拍器已经在转，流水线也填满了，接下来 [第 13 章](../../ch13-scheduler/narrative/chapter.md) 钻进 `schedule()`，看连续批处理到底怎么排每一个批。

@@ -31,7 +31,7 @@
 
 vLLM 没有把"KV 怎么搬"写死。它在 `vllm/distributed/kv_transfer/kv_connector/v1/base.py` 定义了一个抽象基类 `KVConnectorBase_V1`，让 NIXL、LMCache、Mooncake、磁盘 offloading 等十几种后端都来实现同一套契约。本章讲清楚这套契约**长什么样**、调度器（`vllm/v1/core/sched/scheduler.py`）怎么**集成**它；下一章讲 worker 侧**怎么真正搬**、各后端有何不同。
 
-这一章还要还一笔账。第 14 章讲调度循环时，我们见过 `waiting` 之外还有个 `skipped_waiting` 队列，专门隔离一种叫 `WAITING_FOR_REMOTE_KVS` 的阻塞态请求——当时只说"它在等远程 KV 传输"，把完整路径推给了后面。[第 14 章 §14.4](../ch14-scheduler/narrative/chapter.md) 埋下的这条线，本章收尾：一个请求怎么进这个阻塞态、KV 到位后怎么被提升回来重新调度。
+这一章还要还一笔账。第 14 章讲调度循环时，我们见过 `waiting` 之外还有个 `skipped_waiting` 队列，专门隔离一种叫 `WAITING_FOR_REMOTE_KVS` 的阻塞态请求——当时只说"它在等远程 KV 传输"，把完整路径推给了后面。[第 14 章 §14.4](../../ch14-scheduler/narrative/chapter.md) 埋下的这条线，本章收尾：一个请求怎么进这个阻塞态、KV 到位后怎么被提升回来重新调度。
 
 ## 29.2 role-split：一个 connector，两副面孔
 
@@ -651,7 +651,7 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
 
 逻辑很清爽：请求**不在** `finished_recving_kv_req_ids` 里 → KV 还没到 → 返回 `False`（调度器把它继续隔离回 `skipped_waiting`，下步再试）。**在**里面 → KV 到了 → 调 `_update_waiting_for_remote_kv` 做实际副作用，然后按 `num_preemptions` 决定提升回 `WAITING` 还是 `PREEMPTED`。
 
-为什么要区分这两个目标态？因为 `WAITING_FOR_REMOTE_KVS` 的请求有两种出身：全新请求第一次等远程 KV（提升回 `WAITING`），或者**曾被抢占**、重新等远程 KV 的请求（提升回 `PREEMPTED`，走 resumed 恢复路径，即[第 14 章](../ch14-scheduler/narrative/chapter.md)讲的抢占重放机制）。`num_preemptions` 非零就是被抢占过。两条路径在后续 `allocate_slots` 和调度分类上走法不同，所以必须分开。
+为什么要区分这两个目标态？因为 `WAITING_FOR_REMOTE_KVS` 的请求有两种出身：全新请求第一次等远程 KV（提升回 `WAITING`），或者**曾被抢占**、重新等远程 KV 的请求（提升回 `PREEMPTED`，走 resumed 恢复路径，即[第 14 章](../../ch14-scheduler/narrative/chapter.md)讲的抢占重放机制）。`num_preemptions` 非零就是被抢占过。两条路径在后续 `allocate_slots` 和调度分类上走法不同，所以必须分开。
 
 实际副作用在 `_update_waiting_for_remote_kv` 里。这里有个微妙但关键的处理：
 
@@ -772,4 +772,4 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
 
 第 14 章埋下的 `WAITING_FOR_REMOTE_KVS` 阻塞态，到这里有了完整的进入与提升路径。
 
-但我们一直没碰**搬运侧真正怎么搬**——`start_load_kv` 里那段把 KV inject 进 paged buffer 的代码、各后端（P2P / NIXL / Offloading）的差异、跨节点 RDMA 的握手。那是下一章 [PD 分离 II](../ch30-pd-disaggregation/narrative/chapter.md) 的主场。
+但我们一直没碰**搬运侧真正怎么搬**——`start_load_kv` 里那段把 KV inject 进 paged buffer 的代码、各后端（P2P / NIXL / Offloading）的差异、跨节点 RDMA 的握手。那是下一章 [PD 分离 II](../../ch30-pd-disaggregation/narrative/chapter.md) 的主场。

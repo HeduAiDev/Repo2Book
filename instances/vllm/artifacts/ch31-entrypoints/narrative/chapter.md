@@ -5,7 +5,7 @@
 ![你在这里：全书地图高亮"入口"阶段](../diagrams/roadmap.png)
 
 > *图注：全书地图高亮当前位置。*
-> *[第 4 章](../ch04-async-llm/narrative/chapter.md) 讲过在线侧的入口 `AsyncLLM`——异步三段式、背景协程、流式吐 token。*
+> *[第 4 章](../../ch04-async-llm/narrative/chapter.md) 讲过在线侧的入口 `AsyncLLM`——异步三段式、背景协程、流式吐 token。*
 > *本章换到离线侧：`vllm.LLM` 这个门面，怎么把一批 prompt 同步跑完、一次性收齐。*
 > *下一章接着往服务化走，把这条离线脊和在线 OpenAI server 并到一起看。*
 
@@ -523,7 +523,7 @@ class InprocClient(EngineCoreClient):
 > #   self.llm_engine.collective_rpc("finish_weight_update")
 > ```
 >
-> `start_weight_update(is_checkpoint_format=True)` 经 `collective_rpc` 向所有 worker 广播"开窗"（`is_checkpoint_format=True` 表示来料是 checkpoint 格式、需逐层处理，否则是可直拷的 kernel 格式），中间批量灌入新权重，最后 `finish_weight_update()` 广播"闭窗"收尾。这与第 4 章在线 `AsyncLLM` 的 `start_weight_update`/`finish_weight_update` 完全对称——同一套事务语义，一个走同步 `collective_rpc`、一个走异步。这里只是用户面的"开窗—闭窗"两段；窗口内每个 worker 究竟如何分阶段接收并就地替换权重，是[第 17 章：Worker 与 Executor](../ch17-worker-and-executor/narrative/chapter.md) 的话题。
+> `start_weight_update(is_checkpoint_format=True)` 经 `collective_rpc` 向所有 worker 广播"开窗"（`is_checkpoint_format=True` 表示来料是 checkpoint 格式、需逐层处理，否则是可直拷的 kernel 格式），中间批量灌入新权重，最后 `finish_weight_update()` 广播"闭窗"收尾。这与第 4 章在线 `AsyncLLM` 的 `start_weight_update`/`finish_weight_update` 完全对称——同一套事务语义，一个走同步 `collective_rpc`、一个走异步。这里只是用户面的"开窗—闭窗"两段；窗口内每个 worker 究竟如何分阶段接收并就地替换权重，是[第 17 章：Worker 与 Executor](../../ch17-worker-and-executor/narrative/chapter.md) 的话题。
 
 ---
 

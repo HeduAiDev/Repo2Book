@@ -5,10 +5,10 @@
 ![你在这里：模型架构，DeepSeek-V4 capstone](../diagrams/roadmap.png)
 
 > *图注：地图还停在 EngineCore 循环这一格——模型只是循环里 `execute` 的那一步。*
-> *[上一章](../ch24-attention/narrative/chapter.md)把注意力后端怎么收口、metadata 怎么喂 kernel 讲透了。*
+> *[上一章](../../ch24-attention/narrative/chapter.md)把注意力后端怎么收口、metadata 怎么喂 kernel 讲透了。*
 > *本章往上退一步，读一整个真实大模型 DeepSeek-V4，看它在 Llama 骨架上叠了哪些花样。*
 
-前面三章，我们把模型层一层层铺开了。[第 22 章](../ch22-model-definitions/narrative/chapter.md)立了一份契约：所有 vLLM v1 模型都长成 embedding → N 层 decoder block → 末尾 norm，并以 Llama 作**最简基线**。第 23、24 章接着把自定义算子、`torch.compile`、注意力后端拆开看。
+前面三章，我们把模型层一层层铺开了。[第 22 章](../../ch22-model-definitions/narrative/chapter.md)立了一份契约：所有 vLLM v1 模型都长成 embedding → N 层 decoder block → 末尾 norm，并以 Llama 作**最简基线**。第 23、24 章接着把自定义算子、`torch.compile`、注意力后端拆开看。
 
 那一章结尾，我留了一句话没收：Llama **刻意缺**了四样东西——没有专家混合（MoE）、没有潜变量压缩注意力（MLA）、没有量化压缩、没有混合残差。这些「缺」是留白，是为了今天填上。
 
@@ -722,6 +722,6 @@ elif "attn_sink" in name:
 
 这就是读复杂模型的方法论——**先认骨架，再认 delta**。任何一个新模型摆到你面前，先去找它的 decoder layer 的 `forward`（V4 的在 `vllm/model_executor/models/deepseek_v4.py:L1201`，Llama 的在 `vllm/model_executor/models/llama.py:L316`），并排对照第 22 章那份契约，看它在哪几个槽位上动了手脚。理解了 Llama 那份最简契约，再难的模型也只是它身上叠的一摞 delta。
 
-> **v0.21.0 更新**：这条骨架在新版里多了一处「按 rank 裁剪」。`DeepseekV4ForCausalLM` 现在实现 `SupportsPP`，构造时按 `get_pp_group().is_first_rank / is_last_rank` 把 `embed_tokens`、`norm`、`lm_head`、`_mtp_hidden_buffer` 这些首尾零件替换成占位的 `PPMissingLayer()`——非首 rank 不建 embedding、非末 rank 不建 norm/lm_head，权重装载也用 `is_pp_missing_parameter(...)` 跳过本 rank 不拥有的参数。也就是说，整条 embed → N 层 → norm → lm_head 的主线被沿流水线并行（PP）切成几段、分摊到不同 rank 上；段与段之间靠 `make_empty_intermediate_tensors` 约定的多流隐状态（形状 `(num_tokens, hc_mult, hidden_size)`，即 hc 多流也跨 rank 传递）在边界交接。骨架的**逻辑**仍是这一条，只是物理上被拆到了多卡——这条跨 rank 的数据流交接，正是[下一章](../ch26-model-architecture/narrative/chapter.md)在数据流层面要补的那个 PP 切分点。
+> **v0.21.0 更新**：这条骨架在新版里多了一处「按 rank 裁剪」。`DeepseekV4ForCausalLM` 现在实现 `SupportsPP`，构造时按 `get_pp_group().is_first_rank / is_last_rank` 把 `embed_tokens`、`norm`、`lm_head`、`_mtp_hidden_buffer` 这些首尾零件替换成占位的 `PPMissingLayer()`——非首 rank 不建 embedding、非末 rank 不建 norm/lm_head，权重装载也用 `is_pp_missing_parameter(...)` 跳过本 rank 不拥有的参数。也就是说，整条 embed → N 层 → norm → lm_head 的主线被沿流水线并行（PP）切成几段、分摊到不同 rank 上；段与段之间靠 `make_empty_intermediate_tensors` 约定的多流隐状态（形状 `(num_tokens, hc_mult, hidden_size)`，即 hc 多流也跨 rank 传递）在边界交接。骨架的**逻辑**仍是这一条，只是物理上被拆到了多卡——这条跨 rank 的数据流交接，正是[下一章](../../ch26-model-architecture/narrative/chapter.md)在数据流层面要补的那个 PP 切分点。
 
 下一章我们换个视角：从「读模型代码」到「画模型架构图」，把这套阅读方法变成一套可复用的工序。而 MTP 这个 draft 到底怎么被投机解码驱动、怎么和主模型批量验证，会在后面讲投机解码的那一章里接上——本章交付的 `get_mtp_target_hidden_states` 和那座 `_mtp_hidden_buffer` 桥，就是那一章的入口。

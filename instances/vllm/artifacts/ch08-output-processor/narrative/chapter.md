@@ -4,9 +4,9 @@
 
 ![你在这里：Stage 3 输出处理](../diagrams/roadmap.png)
 
-> *图注：全书地图高亮当前位置。前面 [第 4 章](../ch04-async-llm/narrative/chapter.md) 把引擎拆成三段、在两个进程里重叠跑，并在图里反复标出三块骨架；[第 7 章](../ch07-engine-core/narrative/chapter.md) 钻进那条进程虚线，把 IPC 协议逐帧拆开。本章是请求生命周期的最后一棒——结果从 EngineCore 回到前端之后，怎么被去 token、检测停止串、攒成 `RequestOutput`，再分发回 N 个客户端流。再往后就是流式返回给调用者，那已经是 `generate()` 吐出去的事。*
+> *图注：全书地图高亮当前位置。前面 [第 4 章](../../ch04-async-llm/narrative/chapter.md) 把引擎拆成三段、在两个进程里重叠跑，并在图里反复标出三块骨架；[第 7 章](../../ch07-engine-core/narrative/chapter.md) 钻进那条进程虚线，把 IPC 协议逐帧拆开。本章是请求生命周期的最后一棒——结果从 EngineCore 回到前端之后，怎么被去 token、检测停止串、攒成 `RequestOutput`，再分发回 N 个客户端流。再往后就是流式返回给调用者，那已经是 `generate()` 吐出去的事。*
 
-[第 4 章](../ch04-async-llm/narrative/chapter.md) 拆三段式时，在那张泳道图里圈了三块骨架，并对其中两块打了欠条：
+[第 4 章](../../ch04-async-llm/narrative/chapter.md) 拆三段式时，在那张泳道图里圈了三块骨架，并对其中两块打了欠条：
 
 - 它讲了 `output_handler` 是个后台生产者、`generate()` 是消费者，但坦白说"这层生产者-消费者关系在流式输出里的完整角色，第 8 章接着讲"。
 - 它讲了每个请求有一条专属队列 `RequestOutputCollector`，是"异步多路复用的关键"，但队列内部怎么归并、怎么用 `asyncio.Event` 唤醒，只给了个剪影。
@@ -22,7 +22,7 @@
 
 为了能在本地（无 GPU/CUDA）把这套输出处理亲手跑一遍、打断点观察数值，本章配了一份**只做减法**的精简版：和真实 vLLM 同名、同结构、同控制流，唯一的承载替换是——真实代码用 tokenizer 库做去 token、用 torch 张量装 logprobs，精简版把这两样换成最小占位（一个 `id→str` 的 `decode` 回调、几个普通 list），其余去 token 算法、停止串窗口、DELTA 归并、父聚合、`process_outputs` 单循环全部一字不差。它是用来"跑起来看数值"的交叉验证物，正文主线仍是真实源码。
 
-本章只讲**输出侧**。EngineCore 进程内部怎么调度、怎么采样出这些 token，是 [第 7 章](../ch07-engine-core/narrative/chapter.md) 及其后续的主场；本章从"一批 `EngineCoreOutput` 已经回到前端"这一刻接手。
+本章只讲**输出侧**。EngineCore 进程内部怎么调度、怎么采样出这些 token，是 [第 7 章](../../ch07-engine-core/narrative/chapter.md) 及其后续的主场；本章从"一批 `EngineCoreOutput` 已经回到前端"这一刻接手。
 
 ---
 
@@ -464,7 +464,7 @@ DELTA 与全量的三处分叉对照清楚：`text` 由 `get_next_output_text(fi
 
 ### 8.5.1 队列的真身：`RequestOutputCollector`
 
-第 4 章在 [§4.6](../ch04-async-llm/narrative/chapter.md) 给过队列一个剪影，说它的归并真身留待本章。现在揭开。它就是图里那个"单槽邮箱"：
+第 4 章在 [§4.6](../../ch04-async-llm/narrative/chapter.md) 给过队列一个剪影，说它的归并真身留待本章。现在揭开。它就是图里那个"单槽邮箱"：
 
 ```python
 # vllm/v1/engine/output_processor.py:L48
@@ -715,4 +715,4 @@ $ python3 -m pytest tests/ -q
 - **`RequestOutputCollector` 是 per-request 单槽邮箱。** `asyncio.Event` 唤醒、DELTA 归并做背压安全阀，让单生产者扇出 N 个消费者而互不干扰（§8.5.1）。这结清了第 4 章关于队列与生产者-消费者的两笔欠账。
 - **`n>1` 父聚合 + 三表注销** 收束了并行采样与请求生命周期（§8.6）。
 
-[第 4 章](../ch04-async-llm/narrative/chapter.md) 那张泳道图里圈出的三块骨架——每请求一条队列、进程边界、后台生产者-消费者——到这里全部拆开过了：进程边界归 [第 7 章](../ch07-engine-core/narrative/chapter.md)，队列与生产者-消费者归本章。从客户端一个 `await generate()` 进去，到一个个 token `yield` 回来，整条链路你现在能逐帧拆开。
+[第 4 章](../../ch04-async-llm/narrative/chapter.md) 那张泳道图里圈出的三块骨架——每请求一条队列、进程边界、后台生产者-消费者——到这里全部拆开过了：进程边界归 [第 7 章](../../ch07-engine-core/narrative/chapter.md)，队列与生产者-消费者归本章。从客户端一个 `await generate()` 进去，到一个个 token `yield` 回来，整条链路你现在能逐帧拆开。

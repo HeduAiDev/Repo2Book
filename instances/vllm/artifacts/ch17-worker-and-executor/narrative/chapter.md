@@ -5,11 +5,11 @@
 ![你在这里：Part V 执行层开篇](../diagrams/roadmap.png)
 
 > *图注：全书地图从 KV 缓存转入执行层。本章是 Part V 的第一站。*
-> *[第 16 章](../ch16-kv-cache/narrative/chapter.md) 讲完了 KV 块怎么分配、多注意力怎么协调。*
+> *[第 16 章](../../ch16-kv-cache/narrative/chapter.md) 讲完了 KV 块怎么分配、多注意力怎么协调。*
 > *本章解决「调度器算好的指令，怎么送到真正跑模型的 worker 上去」。*
 > *下一章起进入 worker 内部，看持久 batch 与前向计算本身。*
 
-到这里，引擎的「大脑」已经齐活了。调度器（[第 13–14 章](../ch13-scheduler/narrative/chapter.md)）每一拍决定跑哪些请求、KV 缓存（[第 15–16 章](../ch15-kv-cache/narrative/chapter.md)）决定它们的显存落在哪。一拍调度的产物是一个 `SchedulerOutput`——一张「这批 token 该怎么算」的工单。
+到这里，引擎的「大脑」已经齐活了。调度器（[第 13–14 章](../../ch13-scheduler/narrative/chapter.md)）每一拍决定跑哪些请求、KV 缓存（[第 15–16 章](../../ch15-kv-cache/narrative/chapter.md)）决定它们的显存落在哪。一拍调度的产物是一个 `SchedulerOutput`——一张「这批 token 该怎么算」的工单。
 
 可工单算好了，谁来执行？真正把模型前向跑在 GPU 上的，是 **worker**。一张卡一个 worker。八卡张量并行，就是八个 worker 得**同时**收到同一张工单、各算各的分片。
 
@@ -90,7 +90,7 @@ def get_class(vllm_config: VllmConfig) -> type["Executor"]:
 
 读这段，要看清两件事。
 
-**第一，分发的「键」只是个字符串**：`parallel_config.distributed_executor_backend`。它在 [第 3 章](../ch03-config-and-wiring/narrative/chapter.md) 的配置组装期就定好了——单卡默认 `"uni"`，多卡默认 `"mp"`，要用 ray 集群才是 `"ray"`。把「单卡 / 多进程 / Ray / 外部启动器」这四种截然不同的进程编排，全收敛到这**一个分发点**。引擎别处不需要知道这件事。
+**第一，分发的「键」只是个字符串**：`parallel_config.distributed_executor_backend`。它在 [第 3 章](../../ch03-config-and-wiring/narrative/chapter.md) 的配置组装期就定好了——单卡默认 `"uni"`，多卡默认 `"mp"`，要用 ray 集群才是 `"ray"`。把「单卡 / 多进程 / Ray / 外部启动器」这四种截然不同的进程编排，全收敛到这**一个分发点**。引擎别处不需要知道这件事。
 
 **第二，它留了扩展口**。注意第一个分支 `isinstance(..., type)` 和最后一个 `isinstance(..., str)`：你可以直接把一个自定义 `Executor` 子类传进来，或者传一个它的全限定名字符串（qualname，像 `"my_pkg.MyExecutor"`），工厂用 `resolve_obj_by_qualname` 把字符串解析成类。RLHF 训练框架、外部调度系统接管 vLLM 时，靠的就是这个口子。
 
@@ -746,7 +746,7 @@ class WorkerWrapperBase:
 
 最后那个 `__getattr__` 透传，看似不起眼，却是整套 RPC 能跑通的**根基**：任何 `WorkerWrapperBase` 没有的属性，都转发给内部 `self.worker`。所以 [§17.7](#177-worker-子进程出生服役死亡) 里 `getattr(self.worker, "execute_model")` 能直接命中真实 GPU worker 的 `execute_model`——包装层对调用方**完全透明**。collective_rpc 之所以能用一句 `getattr` 调到任意 worker 方法，靠的就是它。
 
-那「真实 worker」长什么样？接口由 `WorkerBase` 定义——一组硬件无关的纯虚方法（`init_device` / `load_model` / `execute_model` / `determine_available_memory` 等）。GPU 上的实现是 `vllm/v1/worker/gpu_worker.py` 里的 `Worker`：`init_device` 占卡、建分布式环境、做显存快照、构造 model_runner；`execute_model` 包一层 `model_runner` 的前向。本章只把它当生命周期的**锚点**——它怎么剖析显存定 KV 容量、前向里怎么做流水线通信，是 [第 18 章](../ch18-model-runner/narrative/chapter.md) 起的主题。这里只需记住调用链：`collective_rpc` →（getattr 透传）→ `WorkerWrapperBase` → `Worker` → `model_runner`。
+那「真实 worker」长什么样？接口由 `WorkerBase` 定义——一组硬件无关的纯虚方法（`init_device` / `load_model` / `execute_model` / `determine_available_memory` 等）。GPU 上的实现是 `vllm/v1/worker/gpu_worker.py` 里的 `Worker`：`init_device` 占卡、建分布式环境、做显存快照、构造 model_runner；`execute_model` 包一层 `model_runner` 的前向。本章只把它当生命周期的**锚点**——它怎么剖析显存定 KV 容量、前向里怎么做流水线通信，是 [第 18 章](../../ch18-model-runner/narrative/chapter.md) 起的主题。这里只需记住调用链：`collective_rpc` →（getattr 透传）→ `WorkerWrapperBase` → `Worker` → `model_runner`。
 
 ---
 
@@ -899,4 +899,4 @@ self._finalizer = weakref.finalize(self, self.shutdown)
 
 `UniProcExecutor` 始终是这一切的**退化基线**：一个 worker、同进程直调、Future 是装饰。mp 不过是把它「多进程化」——同一套语义，worker 变成真子进程，直调变成跨进程广播。理解了「单卡时控制平面是什么」，多卡就只是它的展开。
 
-这层抽象把「指令送达 worker」彻底讲清了。但工单送到之后，worker **内部**怎么把一张 `SchedulerOutput` 翻译成真正的张量、喂进模型、跑完前向、采出 token？那是肌肉里的事。[第 18 章](../ch18-model-runner/narrative/chapter.md) 推开 worker 的门，从持久 batch 与 `_prepare_inputs` 讲起。
+这层抽象把「指令送达 worker」彻底讲清了。但工单送到之后，worker **内部**怎么把一张 `SchedulerOutput` 翻译成真正的张量、喂进模型、跑完前向、采出 token？那是肌肉里的事。[第 18 章](../../ch18-model-runner/narrative/chapter.md) 推开 worker 的门，从持久 batch 与 `_prepare_inputs` 讲起。

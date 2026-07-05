@@ -18,7 +18,7 @@ vLLM 跑大模型时有两条并行轴常常同时开：**流水线并行（pipe
 2. **DP wave 共识**：多个 DP 引擎用每 32 步一次的 all-reduce，就「全体是否还有请求」达成共识，用一个单调递增的 wave 编号把「全体运行 → 全体暂停」的周期切成段。
 3. **DP 负载均衡**：一个独立的协调进程居中收集各引擎负载，前端据此把请求按负载分到最空的引擎。
 
-[第 4 章](../ch04-async-llm/narrative/chapter.md) 已经讲过 `AsyncLLM` 三段式异步外观——ZMQ 收发、output handler 那套。这章不重复那一层，只补上 PP 和 DP 这两个维度。三段式是「单引擎对外怎么异步」，这章是「多引擎/多 stage 之间怎么异步」。
+[第 4 章](../../ch04-async-llm/narrative/chapter.md) 已经讲过 `AsyncLLM` 三段式异步外观——ZMQ 收发、output handler 那套。这章不重复那一层，只补上 PP 和 DP 这两个维度。三段式是「单引擎对外怎么异步」，这章是「多引擎/多 stage 之间怎么异步」。
 
 ## 惰性 PP 同步：把 wait 推迟到最后一刻
 
@@ -429,7 +429,7 @@ def make_async_mp_client(
 
 三种形态，对应三种部署：
 
-- **单引擎**（`dp_size == 1`）：`AsyncMPClient`，没有 DP 维度，就是 [第 4 章](../ch04-async-llm/narrative/chapter.md) 那个三段式客户端。
+- **单引擎**（`dp_size == 1`）：`AsyncMPClient`，没有 DP 维度，就是 [第 4 章](../../ch04-async-llm/narrative/chapter.md) 那个三段式客户端。
 - **外部负载均衡**（`external_lb`）：`DPAsyncMPClient`，每个 client 绑定一个 DP rank，分流交给外部（比如 K8s ingress / 路由器），client 自己不做均衡。
 - **内部负载均衡**（默认）：`DPLBAsyncMPClient`，client 自己在所有引擎间均衡——这是本节主角。
 

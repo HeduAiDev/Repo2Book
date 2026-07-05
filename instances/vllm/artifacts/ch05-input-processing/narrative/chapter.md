@@ -6,7 +6,7 @@
 
 > *图注：全书子系统路线图，本章点亮 `input-processor`——三段式里最靠前的那一段。它左边接的是 `entrypoints`/`async-engine`（上一章的 `AsyncLLM`），右边把成品交给 `engine-core`。本章只管「请求进引擎之前」的最后一道工序。*
 
-上一章 [AsyncLLM 三段式异步解耦](../ch04-async-llm/narrative/chapter.md) 把整条流水线拆成了三段，并且明确说过：Stage 1 的输入处理当时**被当成黑盒**——`add_request` 拿到一个 prompt，转手就喊一声 `process_inputs`，黑盒里吐出一个 `EngineCoreRequest`，然后这个结构体被扔过进程边界送进 EngineCore。
+上一章 [AsyncLLM 三段式异步解耦](../../ch04-async-llm/narrative/chapter.md) 把整条流水线拆成了三段，并且明确说过：Stage 1 的输入处理当时**被当成黑盒**——`add_request` 拿到一个 prompt，转手就喊一声 `process_inputs`，黑盒里吐出一个 `EngineCoreRequest`，然后这个结构体被扔过进程边界送进 EngineCore。
 
 这章我们就掀开这个黑盒。问题很具体：
 
@@ -16,7 +16,7 @@
 
 > **校验 + 归一化 + 组装**——把杂乱的用户输入校验一遍、补全采样参数、把多模态数据排好序，最后塞进一个 msgspec 结构体。
 
-读完这章，你会知道：一个请求在「进引擎」之前到底被检查了多少遍、`max_tokens` 没填时引擎替你填了什么、`n=4` 的并行采样是在哪一层裂成 4 个子请求的、以及为什么每个请求的 id 后面都挂着一串随机字符。下一段 [EngineCore 跨进程 IPC](../ch07-ipc-boundary/narrative/chapter.md) 会接手本章产出的 `EngineCoreRequest`，把它真正送过进程边界。
+读完这章，你会知道：一个请求在「进引擎」之前到底被检查了多少遍、`max_tokens` 没填时引擎替你填了什么、`n=4` 的并行采样是在哪一层裂成 4 个子请求的、以及为什么每个请求的 id 后面都挂着一串随机字符。下一段 [EngineCore 跨进程 IPC](../../ch07-engine-core/narrative/chapter.md) 会接手本章产出的 `EngineCoreRequest`，把它真正送过进程边界。
 
 ---
 
@@ -484,7 +484,7 @@ class EngineCoreRequest(
         return self.pooling_params
 ```
 
-那三个 `msgspec.Struct` 的参数全是为序列化体积和速度服务的：`array_like` 让结构体序列化成数组（不带字段名）、`omit_defaults` 跳过默认值字段、`gc=False` 省掉 GC 开销。原因很简单——这个结构体马上要被 [Stage 2 序列化送过进程边界](../ch07-ipc-boundary/narrative/chapter.md) 进 EngineCore，体积越小、序列化越快越好。
+那三个 `msgspec.Struct` 的参数全是为序列化体积和速度服务的：`array_like` 让结构体序列化成数组（不带字段名）、`omit_defaults` 跳过默认值字段、`gc=False` 省掉 GC 开销。原因很简单——这个结构体马上要被 [Stage 2 序列化送过进程边界](../../ch07-engine-core/narrative/chapter.md) 进 EngineCore，体积越小、序列化越快越好。
 
 那个 `params` 属性是个贴心的统一访问器：不管请求是采样还是池化，调用方都用 `request.params` 拿参数，不必自己判断哪个非空。`external_req_id` 字段先记在这——下一节它就是主角。
 
@@ -651,7 +651,7 @@ def get_outputs(self, child_request_id, completion_output):
 
 **为什么这个请求一定会在有限步内结束？** 这里藏着一个能证明的不变式：`child_requests` 的大小单调不增、且非负。fan-out 阶段一次性塞进恰好 `n` 个子 id（`|child_requests| = n = 4`）；此后每个子请求的最终结果到达时，`get_outputs` 对该 id 做一次 `remove`，集合严格减 1；而已经完成并返回过的重复到达走 `already_finished_and_returned` 分支、不再 `remove`，所以集合大小不会掉到负数。于是它是非负整数上的单调递减序列，至多 `n` 步归零，`finished` 必然翻成 `True`。把 `FINAL_ONLY` 下四个子依次完成的过程摊开看，正是这个单调量在走：子 0、1、2 完成时 `remaining` 从 3 减到 2 再到 1、`batch_len` 一直是 0、`finished=false`（还没攒齐，先不返回）；直到子 3 完成，`remaining=0`、`batch_len=4`、`finished=true`——这一刻才把 4 个结果整批交出去。`remaining` 这一列 `3→2→1→0`，就是上面那个单调量的实测轨迹。
 
-这套聚合逻辑会在 [Stage 3 输出处理](../ch08-output-processing/narrative/chapter.md) 里被真正驱动，本章只看它的内部状态机。
+这套聚合逻辑会在 [Stage 3 输出处理](../../ch08-output-processor/narrative/chapter.md) 里被真正驱动，本章只看它的内部状态机。
 
 ---
 
@@ -683,4 +683,4 @@ def get_outputs(self, child_request_id, completion_output):
 
 还有一个重要的边界认知：**tokenize 已经不在这里了**，重活下沉到了 Renderer；**fan-out 也不在这里**，n>1 的裂分由上层的 `ParentRequest` 负责。`InputProcessor` 聚焦做好「单请求的校验与组装」这一件事。
 
-下一段，本章产出的这个 `EngineCoreRequest` 会被序列化、送过进程边界，进入 [EngineCore 跨进程 IPC](../ch07-ipc-boundary/narrative/chapter.md)——那里才是它真正「进引擎」的地方。
+下一段，本章产出的这个 `EngineCoreRequest` 会被序列化、送过进程边界，进入 [EngineCore 跨进程 IPC](../../ch07-engine-core/narrative/chapter.md)——那里才是它真正「进引擎」的地方。

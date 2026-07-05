@@ -4,13 +4,13 @@
 
 ![你在这里：IPC 边界](../diagrams/roadmap.png)
 
-> *图注：全书地图高亮当前位置。前面 [第 4 章](../ch04-async-llm/narrative/chapter.md) 把引擎拆成三段、在两个进程里重叠跑；本章钻进那条把前端和 EngineCore 分开的虚线，看清跨进程到底怎么通信；再往后 EngineCore 进程内部的调度→执行→采样循环，是后续章节的事。*
+> *图注：全书地图高亮当前位置。前面 [第 4 章](../../ch04-async-llm/narrative/chapter.md) 把引擎拆成三段、在两个进程里重叠跑；本章钻进那条把前端和 EngineCore 分开的虚线，看清跨进程到底怎么通信；再往后 EngineCore 进程内部的调度→执行→采样循环，是后续章节的事。*
 
 本章的代码主线集中在四个文件：`vllm/v1/engine/core_client.py`（前端三层 client）、`vllm/v1/engine/core.py`（engine 侧 `EngineCoreProc` 的两个 IO 线程与 busy loop）、`vllm/v1/serial_utils.py`（msgpack 多帧编解码）、`vllm/v1/engine/tensor_ipc.py`（多模态张量旁路）。
 
-[第 3 章](../ch03-config-and-wiring/narrative/chapter.md) 拼出 `VllmConfig`、用工厂选好了 IPC 客户端的类，但它说："这些客户端的内部机制——ZMQ、msgpack、跨进程怎么通信——留给本章。"
+[第 3 章](../../ch03-config-and-wiring/narrative/chapter.md) 拼出 `VllmConfig`、用工厂选好了 IPC 客户端的类，但它说："这些客户端的内部机制——ZMQ、msgpack、跨进程怎么通信——留给本章。"
 
-[第 4 章](../ch04-async-llm/narrative/chapter.md) 把引擎拆成三段，反复在图里画一条虚线，标着"进程边界（IPC）"。它甚至坦白：为了能在本地无 GPU 跑通，那一章用了一个**同进程的替身**——对外暴露同名的 `add_request_async` / `get_output_async` / `abort_requests_async`，但把真实的"独立进程 EngineCore + ZMQ"换掉了。第 4 章原话是："真实 IPC 留第 7 章。"
+[第 4 章](../../ch04-async-llm/narrative/chapter.md) 把引擎拆成三段，反复在图里画一条虚线，标着"进程边界（IPC）"。它甚至坦白：为了能在本地无 GPU 跑通，那一章用了一个**同进程的替身**——对外暴露同名的 `add_request_async` / `get_output_async` / `abort_requests_async`，但把真实的"独立进程 EngineCore + ZMQ"换掉了。第 4 章原话是："真实 IPC 留第 7 章。"
 
 **本章就是这两笔欠账的结清处。** 那个同名同签名的替身，真身是谁？前端发出一个 `await engine_core.add_request_async(request)`，这个 `await` 背后到底发生了什么——request 怎么 encode、怎么过 ZMQ socket、engine 进程怎么收、结果怎么回来？读完本章，第 4 章那条虚线对你就不再是虚线，而是一套你能逐帧拆开的协议。
 
