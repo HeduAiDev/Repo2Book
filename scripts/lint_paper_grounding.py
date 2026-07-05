@@ -64,11 +64,17 @@ def lint_paper_grounding(chapter_dir: str, expect_primer: bool = False) -> dict:
         res["warn"].append("  narrative/chapter.md 尚不存在(写作前跑属正常)")
 
     # 3) dossier paper_origin.sections 可在论文包里找到(WARNING)
+    #    双论文 primer 章可能有 paper.md + paper-dsa.md 等多份,拼接全部 *.md 再 grep
     inst_book = d.resolve().parent.parent / "book"
-    pack = inst_book / "papers" / d.resolve().name / "paper.md"
-    ptext = pack.read_text(encoding="utf-8", errors="replace") if pack.exists() else None
+    pack_dir = inst_book / "papers" / d.resolve().name
+    pack_files = sorted(pack_dir.glob("*.md")) if pack_dir.exists() else []
+    ptext = (
+        "\n".join(p.read_text(encoding="utf-8", errors="replace") for p in pack_files)
+        if pack_files
+        else None
+    )
     if ptext is None:
-        res["warn"].append(f"  论文包缺失:{pack}(发车前应先落盘)")
+        res["warn"].append(f"  论文包缺失:{pack_dir}(发车前应先落盘)")
     else:
         for mech in doc.get("mechanisms", []):
             po = mech.get("paper_origin")
