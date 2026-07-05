@@ -1,0 +1,208 @@
+{
+  "chapter": "ch21",
+  "note": "素材真相源:每张逐轮表的数字都出自 traces/ 下同名 JSON(driver=traces/run_all.py,跑 implementation/ 的论文忠实参考实现)。玩具维度 d=6,n_h=2,d_h=4,d_c=4,d_c_q=4,d_h_r=2,输入 T=3 token;KV cache 对比用 DeepSeek-V2 真实超参 n_h=128,d_h=128,l=60。",
+  "mechanisms": [
+    {
+      "mechanism_id": "kv-cache-bottleneck",
+      "intuition": "标准注意力像给每位到场嘉宾都发一张完整名片并全程留底:每来一个 token,就得为每个头各存一份 key、一份 value。嘉宾(上下文)越多,抽屉(显存)越满——长上下文下这摞名片本身成了瓶颈,而不是算力。",
+      "figure_specs": [
+        {
+          "figure_id": "fig31-1-kv-bottleneck",
+          "claim": "标准 MHA 每个 token 每层要缓存 2·n_h·d_h=32768 个 K/V 元素,随上下文长度线性累积,成为长上下文/大 batch 的显存瓶颈。",
+          "template": "tensor-flow",
+          "numbers": [
+            {"value": "32768", "provenance": "traces/cache_compare.json:mha_per_token_layer (=2*128*128)"},
+            {"value": "128", "provenance": "traces/cache_compare.json:deepseek_v2_hparams.n_h"},
+            {"value": "1966080", "provenance": "traces/cache_compare.json:full_model_mha (60 层全模型)"}
+          ],
+          "caption_draft": "每个新 token 都往 KV cache 追加 2·n_h·d_h 个元素——头数 n_h 越大、上下文越长,这摞缓存越重。MLA 要对抗的正是这条线性增长线。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "low-rank-kv-joint-compression",
+      "intuition": "与其为每个头各留一份完整 key、一份完整 value,不如先把 token 压成一小段共享的『压缩摘要』c_kv,推理期只囤这段摘要;真要用 key/value 时再从摘要临时上投影出来。就像不囤整箱零件,只囤一张能现场复原全部零件的图纸。",
+      "worked_example": {
+        "params": {"d": 6, "n_h": 2, "d_h": 4, "d_c": 4, "d_h_r": 2, "T": 3},
+        "trace_source": "run",
+        "trace_ref": "traces/compression.json",
+        "table": {
+          "columns": ["token t", "潜向量 c_kv 首元素", "c_kv 缓存维数 d_c", "若物化 key 的维数 n_h·d_h", "MLA 每 token 缓存元素", "MHA 基线每 token 缓存元素"],
+          "rows": [
+            [0, 0.5427, 4, 8, 6, 16],
+            [1, -0.0948, 4, 8, 6, 16],
+            [2, -0.1942, 4, 8, 6, 16]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "只要 d_c ≪ n_h·d_h,缓存量就与头数解耦:KV cache 只随潜向量维 d_c(=4)增长,不随物化 key 的 n_h·d_h(=8)增长。",
+        "argument": "推理期写入 cache 的只有 c_kv=W_DKV·h(d_c 维)这一个张量;k_c=W_UK·c_kv、v_c=W_UV·c_kv 都是需要时从 c_kv 现场上投影,从不落盘。故缓存足迹恒等于 d_c(本例每 token 4 个元素),与有多少个头、每头多宽无关。"
+      },
+      "quantified": "玩具维度下,MHA 每 token 每层缓存 2·n_h·d_h=16 个元素,MLA 只缓存 6 个(潜向量 d_c=4 + 解耦 key d_h_r=2),压缩比 2.6667×。DeepSeek-V2 真实维度下 d_c=512 对比 n_h·d_h=16384,仅联合压缩本体就压 32×。",
+      "figure_specs": [
+        {
+          "figure_id": "fig31-2-joint-compression",
+          "claim": "h 先经 W_DKV 压到 d_c 维潜向量 c_kv,K、V 都从这份共享 c_kv 上投影;推理期只有 c_kv 入 cache。",
+          "template": "tensor-flow",
+          "numbers": [
+            {"value": "4", "provenance": "traces/compression.json:config.d_c(潜向量维)"},
+            {"value": "8", "provenance": "traces/compression.json:rows[].k_c_dim_materialized(n_h·d_h)"},
+            {"value": "6", "provenance": "traces/compression.json:mla_per_token"},
+            {"value": "16", "provenance": "traces/compression.json:mha_per_token"}
+          ],
+          "caption_draft": "联合压缩把『每头各存 K/V』换成『共享一段潜向量 c_kv』——缓存从 16 元素/token 降到 6,且只有蓝色的 c_kv 路径落盘,k_c/v_c 都是虚线的现场上投影。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "weight-absorption-identity",
+      "intuition": "打分要算 q 和 k 的内积,而 k=W_UK·c 只是把潜向量 c 放大成 key。既然放大矩阵是死的,不如提前把它折进 query 侧:query 先乘一次 W_UK,直接落到潜向量所在的房间,再和缓存的 c 直接握手——省去了为每个历史 token 重新放大出 full key 这一步。",
+      "worked_example": {
+        "params": {"n_h": 2, "d_h": 4, "d_c": 4, "d_c_q": 4, "head": 0, "T": 3},
+        "trace_source": "run",
+        "trace_ref": "traces/absorption.json",
+        "table": {
+          "columns": ["查询 t", "键 j", "物化路径打分 (q^C·k^C)", "吸收路径打分 (q̃·c_kv)", "绝对差"],
+          "rows": [
+            [1, 0, -0.0973, -0.0973, 0.0],
+            [1, 1, -0.4644, -0.4644, 0.0],
+            [2, 0, -0.1071, -0.1071, 0.0],
+            [2, 2, -0.1114, -0.1114, 0.0]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "吸收矩阵 W̃_i=(W_UK_i)^T·W_UQ_i 是与 token/位置无关的静态量(形状 d_c×d_c_q = 4×4),加载后算一次、推理期永久复用。",
+        "argument": "打分 q_{t,i}^C·k_{j,i}^C=(W_UQ_i c_t^Q)^T(W_UK_i c_j^KV)=c_t^Q^T(W_UQ_i^T W_UK_i)c_j^KV。中间那块 W_UQ_i^T W_UK_i 只由两个静态权重相乘得到,不含任何随 t/j 变化的量;令 q̃=W̃_i c_t^Q 即得潜空间打分。表中 4 对 (t,j) 两条路径逐位相等(差恒为 0.0)正是这条恒等式的数值见证。o 侧同理:Σ_j w_j v_j^C=W_UV(Σ_j w_j c_j),先在潜空间加权再乘 W_UV 与先物化再加权完全等价。"
+      },
+      "quantified": "q 侧 4 对 (t,j) 打分的最大绝对差 0.0(物化路径与吸收路径逐位相等);o 侧潜空间加权后乘 W_UV,首元素 0.223 与直接对物化 v^C 加权的 0.223 一致,最大绝对差 0.0。故权重吸收在数值上是精确恒等,不是近似。",
+      "figure_specs": [
+        {
+          "figure_id": "fig31-3-absorption-identity",
+          "claim": "物化路径(算出 full k^C 再内积)与吸收路径(query 先乘 W_UK 落到潜空间、直接和缓存 c_kv 内积)给出逐位相等的打分。",
+          "template": "before-after",
+          "numbers": [
+            {"value": "-0.0973", "provenance": "traces/absorption.json:rows[0] 两路打分"},
+            {"value": "0.0", "provenance": "traces/absorption.json:max_q_side_abs_diff / o_side_max_abs_diff"}
+          ],
+          "caption_draft": "上:物化路径每步都得为历史 token 放大出 full key;下:吸收路径 query 一次性乘进潜空间,直接握手缓存的 c_kv。两路打分绝对差恒为 0——省算力而不改结果。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "decoupled-rope",
+      "intuition": "权重吸收成立的前提是『中间那块矩阵是死的』。可 RoPE 会往 query 和 key 之间塞一个随相对位置转动的旋转矩阵——它是活的,随每对 token 的距离变化,把原本能折叠的两块权重顶开了。解法:别让主体承载位置,单开一小撮维度专门扛 RoPE,让潜向量主体保持『位置无关』从而继续可吸收。",
+      "worked_example": {
+        "params": {"n_h": 2, "d_h": 4, "d_c": 4, "head": 0, "deltas": [0, 1, 2, 3]},
+        "trace_source": "run",
+        "trace_ref": "traces/rope.json",
+        "table": {
+          "columns": ["相对位置 δ", "R_δ 是否单位阵", "中间矩阵 M(δ)[0,0]", "‖M(δ)‖_F", "能否离线预计算成静态矩阵"],
+          "rows": [
+            [0, "是", -0.5378, 1.1402, "能(退化为静态 W̃)"],
+            [1, "否", -0.4659, 1.366, "否"],
+            [2, "否", 0.125, 1.8486, "否"],
+            [3, "否", 0.6912, 1.955, "否"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "若对 k^C 直接加 RoPE,打分中间矩阵 M(δ)=(W^Q)^T R_δ W_UK 是相对位置 δ 的函数——每个 δ 一个值,不存在与 δ 无关的静态矩阵可供离线预计算;只有 δ=0(即不加 RoPE)才退化成可吸收的 W̃。",
+        "argument": "展开 q_t^T k_j^{C,rope}=h_t^T (W^Q)^T R_t^T R_j W_UK c_j=h_t^T (W^Q)^T R_{j-t} W_UK c_j。旋转矩阵 R_{j-t} 夹在 (W^Q)^T 与 W_UK 之间,矩阵乘不满足交换律,无法把它挪到两侧与静态权重合并。表中 δ=0→3 时 M[0,0] 从 -0.5378 一路变到 0.6912、Frobenius 范数从 1.1402 涨到 1.955,正说明『中间那块』确实随位置改变。解耦策略把 RoPE 限制到独立的 d_h_r=2 维 q_pe/k_pe 上,c_kv 主体不加 RoPE 从而保持位置无关,W̃ 恒为静态——δ=0 那一档 M[0,0]=-0.5378 恰好等于解耦后主体走的静态 W̃[0,0]=-0.5378。",
+        "termination": "端到端验证:解耦 RoPE 下 decode 增量逐 token 计算与 prefill 一次性计算,3 步输出最大绝对差恒为 0.0,证明解耦既保住可吸收、又不损失正确性。"
+      },
+      "quantified": "相对位置 δ 从 0 增到 1,中间矩阵 M[0,0] 就从 -0.5378 变到 -0.4659(变化量 0.0719),δ=3 时已变成 0.6912——不是静态量,无法预折叠。反观解耦后主体依赖的 W̃[0,0]=-0.5378 全程恒定。端到端 decode-vs-prefill 3 步最大绝对差 0.0。",
+      "figure_specs": [
+        {
+          "figure_id": "fig31-4-decoupled-rope",
+          "claim": "直接对 k^C 加 RoPE 会让打分中间矩阵 M(δ) 随相对位置变(-0.5378 → 0.6912),破坏吸收;解耦 RoPE 把位置关进独立小维度,潜向量主体的 W̃ 保持静态(-0.5378 恒定)从而可吸收。",
+          "template": "before-after",
+          "numbers": [
+            {"value": "-0.5378", "provenance": "traces/rope.json:middle_matrix_rows[δ=0].M_delta_00 = w_tilde_00_static"},
+            {"value": "0.6912", "provenance": "traces/rope.json:middle_matrix_rows[δ=3].M_delta_00"},
+            {"value": "0.0", "provenance": "traces/rope.json:e2e_max_abs_diff(decode==prefill)"}
+          ],
+          "caption_draft": "左(错误路线):RoPE 加在 k^C 上,中间矩阵 M(δ) 随 δ 变动,W_UK 再也折不进 W^Q。右(解耦):位置只走独立的 q_pe/k_pe,c_kv 主体位置无关,W̃ 静态可吸收——这正是 ch22 那条『decode 走吸收、q_pe 单独过 RoPE』分支存在的根本原因。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "q-side-low-rank",
+      "intuition": "query 侧也做一次低秩压缩,但目的不同:key/value 压缩是为了省推理期 KV cache,query 压缩纯粹是为了省训练期那份『中间激活』的显存——query 每步现算现用,根本不入缓存,所以它再怎么压也动不了 KV cache 一分一毫。",
+      "worked_example": {
+        "params": {"d": 6, "n_h": 2, "d_h": 4, "d_c_q": 4, "T": 3},
+        "trace_source": "run",
+        "trace_ref": "traces/qside.json",
+        "table": {
+          "columns": ["token t", "压缩潜向量 c_q 首元素", "c_q 激活维数 d_c_q", "上投影回满维 q 的维数 n_h·d_h", "本步 KV cache 变化量"],
+          "rows": [
+            [0, -1.6634, 4, 8, 0],
+            [1, 0.8303, 4, 8, 0],
+            [2, 0.8692, 4, 8, 0]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "q 侧低秩与 KV cache 正交:c_q 只是 query 的中间激活、从不写入 cache,故每步 KV cache 变化量恒为 0,d_c_q 再小也不改变推理缓存量。",
+        "argument": "缓存里只有 KV 侧的 c_kv 与解耦 k_pe(见 low-rank-kv-joint-compression);q 侧产物 c_q=W_DQ·h、q_c=W_UQ·c_q 都在当前 token 前向内被消费掉,不跨步保留。表中 3 步 kv_cache_delta 列全为 0 即证:query 压缩省的是训练激活,不是推理缓存。"
+      },
+      "quantified": "训练期 query 中间激活从满维 n_h·d_h=8 压到 d_c_q=4(玩具维度降 50%;DeepSeek-V2 里从 16384 压到 1536),而每一步 KV cache 变化量为 0——q 侧低秩只省训练激活显存,与推理 KV cache 无关。"
+    },
+    {
+      "mechanism_id": "kv-cache-comparison",
+      "intuition": "把四种注意力排成一张账单:每个 token 每层到底要囤多少个数?MHA 为每个头各囤一整份 K 和 V(最重),GQA 让几组头共享(中等),MQA 全部头共享一份(最轻但最伤精度),MLA 只囤一段潜向量+一小撮位置维——账单和 MQA 一个量级,精度却比 MHA 还强。",
+      "worked_example": {
+        "params": {"n_h": 128, "d_h": 128, "l": 60, "d_c": 512, "d_h_r": 64, "n_g_for_gqa": 8},
+        "trace_source": "run",
+        "trace_ref": "traces/cache_compare.json",
+        "table": {
+          "columns": ["注意力机制", "每 token 每层缓存元素(DeepSeek-V2 维度)"],
+          "rows": [
+            ["MHA", 32768],
+            ["GQA-8", 2048],
+            ["MQA", 256],
+            ["MLA", 576]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "MLA 的缓存量 (d_c+d_h_r)=576 与头数 n_h(=128)完全解耦;MHA 随 n_h 线性(2·n_h·d_h),故 n_h 越大,MLA 相对 MHA 的压缩比越高。",
+        "argument": "MLA 每 token 每层缓存 (d_c+d_h_r) 个元素,表达式里根本不出现 n_h;MHA 是 2·n_h·d_h,与 n_h 成正比。DeepSeek-V2 的 n_h=128 极大,于是 32768÷576≈56.89 的压缩比主要来自『缓存不再乘 n_h』这一项。折算成 GQA,MLA 只相当于 (d_c+d_h_r)/(2·d_h)=2.25 组,却比满配 MHA 更强。"
+      },
+      "quantified": "DeepSeek-V2(n_h=128,d_h=128)每 token 每层:MHA 32768、GQA-8 2048、MQA 256、MLA 仅 576(d_c=512 + d_h_r=64)。MLA/MHA 压缩比 56.89×,等效 2.25 组 GQA;全模型 60 层缓存从 MHA 1966080 降到 MLA 34560。",
+      "figure_specs": [
+        {
+          "figure_id": "fig31-5-kv-cache-table",
+          "claim": "DeepSeek-V2 维度下,MLA 每 token 每层只缓存 576 个元素,是 MHA(32768)的 1/56.89、等效 2.25 组 GQA,却保持强于 MHA 的能力。",
+          "template": "state-table",
+          "numbers": [
+            {"value": "32768", "provenance": "traces/cache_compare.json:mha_per_token_layer"},
+            {"value": "2048", "provenance": "traces/cache_compare.json:gqa8_per_token_layer"},
+            {"value": "256", "provenance": "traces/cache_compare.json:mqa_per_token_layer"},
+            {"value": "576", "provenance": "traces/cache_compare.json:mla_per_token_layer"},
+            {"value": "56.89", "provenance": "traces/cache_compare.json:compression_ratio_mha_over_mla"},
+            {"value": "2.25", "provenance": "traces/cache_compare.json:mla_equivalent_gqa_groups"}
+          ],
+          "caption_draft": "四机制每 token 每层 KV cache 元素数(DeepSeek-V2 n_h=128,d_h=128)。MLA 一栏与 MQA 同量级,却因『潜向量携带全部头的信息』而保住 MHA 级精度——这就是 Table 1 里『KV cache 等效 2.25 组 GQA,能力却 Stronger』的含义。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "decode-vs-prefill-paths",
+      "intuition": "同一套 MLA 权重,decode 和 prefill 走两条路。decode 每步只有一个新 query 却要扫全部历史缓存——把上投影折进 query、直接在潜空间算(吸收路径)最省。prefill 一次性处理整段,重算 K/V 的开销被序列长度摊薄,索性老实物化出 full k/v 走标准注意力(物化路径)更简单。省的地方不同,所以分两条路。",
+      "figure_specs": [
+        {
+          "figure_id": "fig31-6-decode-vs-prefill",
+          "claim": "decode 走吸收路径(ql_nope=q_nope@W_UK_T,对缓存潜向量直接注意力,末尾 _v_up_proj 乘 W_UV);prefill 走物化路径(kv_b_proj 显式算出 full k_nope/value)——两路都缓存同一份 576 元素/token,输出对同一段序列逐位相等(差 0.0)。",
+          "template": "swimlane",
+          "numbers": [
+            {"value": "576", "provenance": "traces/cache_compare.json:mla_per_token_layer(两路共享同一份缓存)"},
+            {"value": "0.0", "provenance": "traces/rope.json:e2e_max_abs_diff(decode 吸收 == prefill 物化)"}
+          ],
+          "caption_draft": "上泳道 decode:q_nope 先乘 W_UK_T 落潜空间→对缓存 c_kv 直接打分→_v_up_proj 乘 W_UV 还原;下泳道 prefill:kv_b_proj 把 c 物化成 full k_nope/value 走标准注意力。落地锚点见 vllm_ascend/attention/mla_v1.py forward(L1718)的 decode/prefill 分派——回指第 22 章。"
+        }
+      ]
+    }
+  ]
+}

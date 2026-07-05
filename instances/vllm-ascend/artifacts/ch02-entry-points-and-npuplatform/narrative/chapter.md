@@ -416,7 +416,7 @@ class NPUPlatform(Platform):
 
 vLLM 的 worker 类由 `parallel_config.worker_cls` 这个**字符串字段**承载，默认值是哨兵 `"auto"`。平台在 `check_and_update_config` 里把它从 `"auto"` 改写成具体 `NPUWorker` 的 qualname——还是「写 qualname 字符串、推迟 import」那一招，只是**落点在 config 字段而非工厂方法**。这里第三次出现按设备分代分流：310P → `NPUWorker310`、openEuler Xlite 图模式 → `XliteWorker`、默认 → `NPUWorker`。跑精简版验证：`worker_cls="auto"` 在 A2 分代下被改写成 `NPUWorker`、在 310P 下变 `NPUWorker310`；而如果字段本来就不是 `"auto"`（用户显式指定了 worker），这段 `if` 整个跳过，不覆盖用户的选择。
 
-`check_and_update_config` 这个方法本身远不止改 worker_cls 这一处——它还会校验 ACL graph、刷新 block size、调并行与显存配置等等。那是 [第 5 章：check_and_update_config](../ch05-check-and-update-config/narrative/chapter.md) 的主场，本章只截下 worker_cls 这一刀，看清「同一个延迟绑定招式，第四次复用」。
+`check_and_update_config` 这个方法本身远不止改 worker_cls 这一处——它还会校验 ACL graph、刷新 block size、调并行与显存配置等等。那是 [第 5 章：check_and_update_config](../../ch05-check-and-update-config/narrative/chapter.md) 的主场，本章只截下 worker_cls 这一刀，看清「同一个延迟绑定招式，第四次复用」。
 
 至此，那个延迟绑定模式在本章已经用满四遍：平台选择（`register`）、平台工厂钩子（`get_*_cls`）、worker_cls（config 字段）、attention backend 查表。同一个「写字符串、推迟 import、运行期解析」的思路，撑起了整个昇腾接管层。
 
@@ -478,7 +478,7 @@ def register_model():
 
 还有一处细节值得记下：`register_connector / register_model_loader / register_service_profiling` 都先调一遍 `_ensure_global_patch()`。这是因为 vLLM 在子进程里加载 general plugins，而 E2E 测试的 conftest 钩子不会在子进程跑——那些影响 scheduler、engine 的进程级 monkey-patch，必须借这几个 plugin 入口在子进程里**补打**一遍。`_GLOBAL_PATCH_APPLIED` 这个模块级标志位保证它**幂等**：打过就直接 return，不会重复打。把精简版跑起来能看到，连调两次 `_ensure_global_patch()` 后标志位稳定为 `True`，第二次是空操作。
 
-这里只点出 general_plugins 会触发 `adapt_patch` 的 platform 段。`adapt_patch` 那套「platform 段 + worker 段」的两段式 monkey-patch——它具体替换了 vLLM 内部哪些函数、为什么分两段打——是 [第 3 章：两段式 monkey-patch](../ch03-two-stage-monkey-patch/narrative/chapter.md) 的主线。本章按下不表。
+这里只点出 general_plugins 会触发 `adapt_patch` 的 platform 段。`adapt_patch` 那套「platform 段 + worker 段」的两段式 monkey-patch——它具体替换了 vLLM 内部哪些函数、为什么分两段打——是 [第 3 章：两段式 monkey-patch](../../ch03-two-stage-monkey-patch/narrative/chapter.md) 的主线。本章按下不表。
 
 ## 2.10 设备分代：is_310p 这条横切线
 
@@ -552,6 +552,6 @@ def is_310p():
 - 运行期，`NPUPlatform` 作为「总台」，用身份替换类属性 + 一批返回 qualname 的工厂钩子，把 attention / 通信器 / 图包装器 / worker 逐站顶替成昇腾实现；
 - 横切其间的是 `AscendDeviceType` / `is_310p` 这条设备分代线。
 
-我们在路上埋了两颗将来要回收的种子：general_plugins 触发的 `adapt_patch` 两段式 monkey-patch，是 [第 3 章](../ch03-two-stage-monkey-patch/narrative/chapter.md) 的主题；`check_and_update_config` 那套完整的配置改写，留给 [第 5 章](../ch05-check-and-update-config/narrative/chapter.md)。
+我们在路上埋了两颗将来要回收的种子：general_plugins 触发的 `adapt_patch` 两段式 monkey-patch，是 [第 3 章](../../ch03-two-stage-monkey-patch/narrative/chapter.md) 的主题；`check_and_update_config` 那套完整的配置改写，留给 [第 5 章](../../ch05-check-and-update-config/narrative/chapter.md)。
 
 下一章我们就顺着 `adapt_patch` 往里走——看 vllm-ascend 在「选中平台」之后，如何用 monkey-patch 把 vLLM 内部那些在昇腾上跑不动、跑不快的函数，一段一段地换掉。

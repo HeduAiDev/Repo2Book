@@ -10,11 +10,11 @@
 
 ---
 
-[上一章](../ch03-two-stage-monkey-patch/narrative/chapter.md)把 vllm-ascend 接管 vLLM 的「手法」讲透了：两段式时机、靠 import 副作用触发、5 种重绑技法。但那一章举的例子是教学性的——挑短小好懂的来演示招式。真正考验工程功力的，是把这些招式用在引擎最核心、最不容出错的地方：**KV-cache**。
+[上一章](../../ch03-two-stage-monkey-patch/narrative/chapter.md)把 vllm-ascend 接管 vLLM 的「手法」讲透了：两段式时机、靠 import 副作用触发、5 种重绑技法。但那一章举的例子是教学性的——挑短小好懂的来演示招式。真正考验工程功力的，是把这些招式用在引擎最核心、最不容出错的地方：**KV-cache**。
 
 KV-cache 是大模型推理的命根子。每个 token 的注意力 key/value 都缓存在这里，按「块（block）」分页管理，跨请求复用前缀。它的形态——块多大、每块多少字节、什么数据类型、命中怎么对齐——同时被三件事卡死：**模型结构**（MLA、mamba、稀疏注意力各有各的张量布局）、**并行策略**（context parallel 把序列切给多个 rank）、**硬件算子**（昇腾 NPU 的 kernel 对块大小、连续性、dtype 有自己的硬约束）。vLLM 的原实现，处处写死了 CUDA 的假设——比如 `vllm/v1/core/kv_cache_coordinator.py` 里那两条 `assert dcp_world_size == 1`（DCP，decode context parallel，解码期上下文并行）/ `assert pcp_world_size == 1`（PCP，prefill context parallel，预填期上下文并行），干脆禁掉了 hybrid 模型开 context parallel。要让它在昇腾上既正确又跑得动，就得逐处对照、逐处重绑。
 
-本章不再重讲技法本身（要回顾招式，翻 [上一章](../ch03-two-stage-monkey-patch/narrative/chapter.md)），而是讲**怎么把招式用对地方**。我们挑 5 个真实案例，每个都走同一条三段式叙事线：
+本章不再重讲技法本身（要回顾招式，翻 [上一章](../../ch03-two-stage-monkey-patch/narrative/chapter.md)），而是讲**怎么把招式用对地方**。我们挑 5 个真实案例，每个都走同一条三段式叙事线：
 
 1. **原算法**——vLLM 基座原来怎么算；
 2. **昇腾约束**——为什么这套算法在 NPU 上不成立；
@@ -286,7 +286,7 @@ vllm.v1.kv_cache_interface.SlidingWindowMLASpec = AscendSlidingWindowMLASpec
 vllm.model_executor.layers.attention.mla_attention.MLAAttentionSpec = AscendMLAAttentionSpec
 ```
 
-前两处是技法①的标准动作——把 `kv_cache_interface` 模块里的两个 spec 类名指向昇腾子类（`SlidingWindowMLASpec` 是滑动窗口版的 MLA，同理子类化）。**第三处是关键**：`mla_attention` 模块在自己顶上 `from ... import MLAAttentionSpec`，早就把这个类名 copy 进了自己的命名空间。真正建 spec 的调用方就在 `mla_attention` 里，它认的是自己那份引用。只改 `kv_cache_interface.MLAAttentionSpec` 它根本看不见——这正是[上一章](../ch03-two-stage-monkey-patch/narrative/chapter.md)讲的 **from-import 缓存陷阱（技法⑤）**，所有再导出的别名都得补绑一遍，一个漏网就前功尽弃。
+前两处是技法①的标准动作——把 `kv_cache_interface` 模块里的两个 spec 类名指向昇腾子类（`SlidingWindowMLASpec` 是滑动窗口版的 MLA，同理子类化）。**第三处是关键**：`mla_attention` 模块在自己顶上 `from ... import MLAAttentionSpec`，早就把这个类名 copy 进了自己的命名空间。真正建 spec 的调用方就在 `mla_attention` 里，它认的是自己那份引用。只改 `kv_cache_interface.MLAAttentionSpec` 它根本看不见——这正是[上一章](../../ch03-two-stage-monkey-patch/narrative/chapter.md)讲的 **from-import 缓存陷阱（技法⑤）**，所有再导出的别名都得补绑一遍，一个漏网就前功尽弃。
 
 ---
 
@@ -603,6 +603,6 @@ dtype 对不上怎么办？`AscendBlockTables`（块表的昇腾子类）在构�
 
 **为跑通而 patch**——案例四属于这类。它带着 TODO，是务实的临时绕行，不假装自己想清楚了。
 
-而手法，自始至终就是[上一章](../ch03-two-stage-monkey-patch/narrative/chapter.md)那 5 招的排列组合：方法替换顶配置（案例一的 `vllm_ascend/patch/platform/patch_mamba_config.py`、案例四的 `vllm_ascend/patch/worker/patch_qwen3_next_mtp.py`）、整类替换换 spec 和协调器（案例二、三）、工厂替换控分发（案例三的 `vllm_ascend/patch/platform/patch_kv_cache_coordinator.py`）、from-import 补绑堵漏（案例二、三）。招式没新增一个，难的是看准「这个引擎核心的薄弱点，该用哪一招、绑哪几个名字」。
+而手法，自始至终就是[上一章](../../ch03-two-stage-monkey-patch/narrative/chapter.md)那 5 招的排列组合：方法替换顶配置（案例一的 `vllm_ascend/patch/platform/patch_mamba_config.py`、案例四的 `vllm_ascend/patch/worker/patch_qwen3_next_mtp.py`）、整类替换换 spec 和协调器（案例二、三）、工厂替换控分发（案例三的 `vllm_ascend/patch/platform/patch_kv_cache_coordinator.py`）、from-import 补绑堵漏（案例二、三）。招式没新增一个，难的是看准「这个引擎核心的薄弱点，该用哪一招、绑哪几个名字」。
 
-本章只讲了 KV-cache 形态被 patch 改写的那一面——块多大、每块多少字节、怎么对齐、什么 dtype。这些形态最终要落到真实显存：KV-cache 张量在昇腾上**怎么分配、怎么 reshape、怎么绑定**，是 [第 16 章：KV cache 在昇腾上的落地](../ch16-kv-cache-tensors-on-npu/narrative/chapter.md) 的主题——你会在那里看到本章定下的 block_size 和 page_size 如何变成一块块真实的 NPU 内存。而协调器与调度器在运行期怎么协作管理这些块，则留给 [第 22 章：KV cache 管理与调度器的 NPU 特化](../ch22-kv-manager-and-schedulers/narrative/chapter.md)。本章是它们共同的起点：先把形态定对，后面才谈得上落地与调度。
+本章只讲了 KV-cache 形态被 patch 改写的那一面——块多大、每块多少字节、怎么对齐、什么 dtype。这些形态最终要落到真实显存：KV-cache 张量在昇腾上**怎么分配、怎么 reshape、怎么绑定**，是 [第 17 章：KV cache 在昇腾上的落地](../../ch16-kv-cache-tensors-on-npu/narrative/chapter.md) 的主题——你会在那里看到本章定下的 block_size 和 page_size 如何变成一块块真实的 NPU 内存。而协调器与调度器在运行期怎么协作管理这些块，则留给 [第 25 章：KV cache 管理与调度器的 NPU 特化](../../ch25-kv-manager-and-schedulers/narrative/chapter.md)。本章是它们共同的起点：先把形态定对，后面才谈得上落地与调度。

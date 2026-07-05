@@ -92,7 +92,7 @@ def load_plugins_by_group(group: str) -> dict[str, Callable[[], Any]]:
 
 整段的关窍就一句 `entry_points(group=group)`——用标准库按组名发现第三方插件，`plugin.load()` 拿到回调函数对象。（开头那行 `allowed_plugins = envs.VLLM_PLUGINS`：`envs` 是 vLLM 的环境变量模块，`VLLM_PLUGINS` 可显式指定只加载哪些插件，默认 `None` 即全部放行。）**这一句就是整个 OOT 机制的物理基础**：vLLM 没有写死任何硬件后端的名字，而是留了一个「谁登记过就用谁」的标准发现点。昇腾把自己登记进去，就被 vLLM 反向钩了进来。
 
-这就是要素一「装上就被发现」的全部：**声明在包元数据里，发现靠 `importlib.metadata`，双方只约定组名，谁都不认识谁的源码**。这两组 entry point 从被发现到真正生效的完整旅程，是 [第 2 章](../ch02-entry-points-and-npuplatform/narrative/chapter.md) 的主线。
+这就是要素一「装上就被发现」的全部：**声明在包元数据里，发现靠 `importlib.metadata`，双方只约定组名，谁都不认识谁的源码**。这两组 entry point 从被发现到真正生效的完整旅程，是 [第 2 章](../../ch02-entry-points-and-npuplatform/narrative/chapter.md) 的主线。
 
 ## 1.3 支柱二：一个平台类接管所有分发（NPUPlatform）
 
@@ -231,7 +231,7 @@ class NPUPlatform(Platform):
         return "vllm_ascend.compilation.acl_graph.ACLGraphWrapper"  # noqa
 ```
 
-这几个方法形态相近，但**不必一刀切说成「都不做实际计算」**：它们都是 `@classmethod`、最终都只**吐回一个昇腾类的 qualname 字符串**、从不真算张量。差别在「怎么算出那个字符串」——多数工厂钩子（如 `get_device_communicator_cls` / `get_static_graph_wrapper_cls`）纯返回一个常量串；`get_attn_backend_cls` 稍复杂：它按运行时特性查一张 `backend_map` 表再分发到不同后端（那张表的 key 是 `(use_mla, use_sparse, use_compress)` 三元组，另有一张 310P 芯片专用的 `backend_map_310`，完整路由表见[第 18 章](../ch18-attention-backend-selection/narrative/chapter.md)），但查出来的同样只是个类名、不真算。vLLM 引擎要注意力后端就问 `get_attn_backend_cls`、要通信器就问 `get_device_communicator_cls`、要图捕获包装就问 `get_static_graph_wrapper_cls`——问的都是 `current_platform`，也就是 `NPUPlatform`，于是拿到的答案全是昇腾版。（这里只是随手拎三个；同一类钩子还有一个 `get_compile_backend`→`AscendCompiler`，下面图 1-2 里也一并列了，机理相同，留到[第 25 章](../ch25-ascend-compiler-aclgraph/narrative/chapter.md)展开。）
+这几个方法形态相近，但**不必一刀切说成「都不做实际计算」**：它们都是 `@classmethod`、最终都只**吐回一个昇腾类的 qualname 字符串**、从不真算张量。差别在「怎么算出那个字符串」——多数工厂钩子（如 `get_device_communicator_cls` / `get_static_graph_wrapper_cls`）纯返回一个常量串；`get_attn_backend_cls` 稍复杂：它按运行时特性查一张 `backend_map` 表再分发到不同后端（那张表的 key 是 `(use_mla, use_sparse, use_compress)` 三元组，另有一张 310P 芯片专用的 `backend_map_310`，完整路由表见[第 19 章](../../ch19-attention-backend-selection/narrative/chapter.md)），但查出来的同样只是个类名、不真算。vLLM 引擎要注意力后端就问 `get_attn_backend_cls`、要通信器就问 `get_device_communicator_cls`、要图捕获包装就问 `get_static_graph_wrapper_cls`——问的都是 `current_platform`，也就是 `NPUPlatform`，于是拿到的答案全是昇腾版。（这里只是随手拎三个；同一类钩子还有一个 `get_compile_backend`→`AscendCompiler`，下面图 1-2 里也一并列了，机理相同，留到[第 29 章](../../ch29-ascend-compiler-aclgraph/narrative/chapter.md)展开。）
 
 对照一下基座 vLLM 的默认答案，就知道昇腾在这里改了什么：
 
@@ -254,7 +254,7 @@ class NPUPlatform(Platform):
 
 *图 1-2　vLLM 各处调用点统一问 `current_platform.get_*_cls()`，NPUPlatform 覆写后返回昇腾 qualname，再 import 实例化。基类默认要么是空串、要么是通用实现——昇腾把它们逐一换成自家类名，vLLM 源码一行未改。*
 
-这也解释了本书后面 29 章大致在干什么：**逐个展开这些「返回的类名」背后的昇腾实现**。为什么全都返回字符串而不是类对象？还是那个「延迟 import」的考量——把重依赖的拉起推到真正要用的那一刻；而且这层字符串间接还顺手给了昇腾一个额外的调节点：像 `get_attn_backend_cls` 就能按 310P / MLA / 稀疏这些运行时条件返回不同的后端类（详见[第 18 章](../ch18-attention-backend-selection/narrative/chapter.md)），而不必让 vLLM 感知这些差异。
+这也解释了本书后面 29 章大致在干什么：**逐个展开这些「返回的类名」背后的昇腾实现**。为什么全都返回字符串而不是类对象？还是那个「延迟 import」的考量——把重依赖的拉起推到真正要用的那一刻；而且这层字符串间接还顺手给了昇腾一个额外的调节点：像 `get_attn_backend_cls` 就能按 310P / MLA / 稀疏这些运行时条件返回不同的后端类（详见[第 19 章](../../ch19-attention-backend-selection/narrative/chapter.md)），而不必让 vLLM 感知这些差异。
 
 ## 1.4 支柱三：改不动的地方，两段式打补丁（monkey-patch）
 
@@ -347,7 +347,7 @@ def register_connector():
 
 还有一处值得点出的**例外**：`general_plugins` 组里其实有四个回调，但只有 `register_connector` / `register_model_loader` / `register_service_profiling` 三个开头先调 `_ensure_global_patch()`。第四个 `register_model` 不打全局补丁——它只做 `from .models import register_model; register_model()`，把昇腾的模型类登记进 vLLM 的 ModelRegistry。因为模型注册是往一张注册表里塞类名，并不依赖 platform 段那批对 engine/scheduler 的符号改写，自然不必打补丁。
 
-支柱三整套招式（五种 patch 手法、from-import 的缓存陷阱、逐条补丁台账）是 [第 3 章](../ch03-two-stage-monkey-patch/narrative/chapter.md) 的主场；platform 段具体改了引擎核心的哪些地方，[第 4 章](../ch04-patch-engine-core-kvcache/narrative/chapter.md) 细看。
+支柱三整套招式（五种 patch 手法、from-import 的缓存陷阱、逐条补丁台账）是 [第 3 章](../../ch03-two-stage-monkey-patch/narrative/chapter.md) 的主场；platform 段具体改了引擎核心的哪些地方，[第 4 章](../../ch04-patch-engine-core-kvcache/narrative/chapter.md) 细看。
 
 ## 1.5 要素四与全书地图：扩展点—登记实现
 
@@ -365,13 +365,13 @@ def register_connector():
 
 顺着全书地图（图上方那条 7-Part 书脊），每一站是这样展开的：
 
-- **Part I 接入机制**——三支柱本身。[entry points 与平台选定](../ch02-entry-points-and-npuplatform/narrative/chapter.md)（第 2 章）、[两段式 monkey-patch 总纲](../ch03-two-stage-monkey-patch/narrative/chapter.md)（第 3 章）、[引擎核心的 KV-cache patch](../ch04-patch-engine-core-kvcache/narrative/chapter.md)（第 4 章）、[check_and_update_config 配置总闸](../ch05-check-and-update-config/narrative/chapter.md)（第 5 章）。
-- **Part II 设备与显存**——把 CUDA 的底座换成昇腾：[NPUCommunicator 通信器](../ch06-npu-communicator/narrative/chapter.md)（第 6 章）、[sleep-mode 与 camem 显存分配器](../ch07-sleep-mode-camem-allocator/narrative/chapter.md)（第 7 章）。
-- **Part III 并行、eplb 与 KV 解耦**——[昇腾并行组](../ch08-ascend-parallel-groups/narrative/chapter.md)（第 8 章）、[专家负载均衡 eplb](../ch09-eplb-expert-load-balancing/narrative/chapter.md)（第 9 章）、[PD 分离与 mooncake](../ch10-pd-disaggregation-mooncake/narrative/chapter.md)（第 10 章）、[KV 池化与 ascend_store](../ch11-kv-pooling-ascend-store/narrative/chapter.md)（第 11 章）、[KV 卸载到 host](../ch12-kv-offloading-host-cpu/narrative/chapter.md)（第 12 章）。
-- **Part IV 执行主线**——全书执行脊柱：[NPUWorker 重写](../ch13-npuworker-execution-control/narrative/chapter.md)（第 13 章）、[NPUModelRunner 的 CUDA→NPU 猴补](../ch14-npumodelrunner-cuda-monkeypatch/narrative/chapter.md)（第 14 章）、[单步前向与 DP 同步](../ch15-single-step-forward-context-dp-sync/narrative/chapter.md)（第 15 章）、[KV cache 在昇腾上的落地](../ch16-kv-cache-allocation-reshape-bind/narrative/chapter.md)（第 16 章）、[310P 芯片特化](../ch17-310p-inference-chip-specialization/narrative/chapter.md)（第 17 章）。
-- **Part V 注意力与 KV**——[后端选择](../ch18-attention-backend-selection/narrative/chapter.md)（第 18 章）、[标准 MHA](../ch19-ascend-attention-mha/narrative/chapter.md)（第 19 章）、[MLA 权重吸收](../ch20-mla-on-npu/narrative/chapter.md)（第 20 章）、[稀疏注意力 SFA/DSA](../ch21-sparse-attention-sfa-dsa/narrative/chapter.md)（第 21 章）、[KV 管理与调度器](../ch22-kv-manager-and-schedulers/narrative/chapter.md)（第 22 章）。
-- **Part VI 自定义算子与编译**——[CustomOp 顶替](../ch23-customop-oot-replacement/narrative/chapter.md)（第 23 章）、[torch.library 与 meta 注册](../ch24-torch-library-and-meta/narrative/chapter.md)（第 24 章）、[AscendCompiler 与 ACLGraph](../ch25-ascend-compiler-aclgraph/narrative/chapter.md)（第 25 章）、[FusedMoE 与 batch-invariant](../ch26-fusedmoe-batch-invariant/narrative/chapter.md)（第 26 章）。
-- **Part VII 量化、采样、投机与模型**——把「找扩展点→登记」的范式收束成四例：[量化框架](../ch27-ascend-quantization-framework/narrative/chapter.md)（第 27 章）、[采样的 NPU 对位](../ch28-sampling-npu-adaptation/narrative/chapter.md)（第 28 章）、[投机解码](../ch29-speculative-decode-npu/narrative/chapter.md)（第 29 章）、[模型/LoRA/netloader 注册](../ch30-model-lora-netloader-registration/narrative/chapter.md)（第 30 章）。
+- **Part I 接入机制**——三支柱本身。[entry points 与平台选定](../../ch02-entry-points-and-npuplatform/narrative/chapter.md)（第 2 章）、[两段式 monkey-patch 总纲](../../ch03-two-stage-monkey-patch/narrative/chapter.md)（第 3 章）、[引擎核心的 KV-cache patch](../../ch04-patch-engine-core-kvcache/narrative/chapter.md)（第 4 章）、[check_and_update_config 配置总闸](../../ch05-check-and-update-config/narrative/chapter.md)（第 5 章）。
+- **Part II 设备与显存**——把 CUDA 的底座换成昇腾：[NPUCommunicator 通信器](../../ch06-npu-communicator/narrative/chapter.md)（第 6 章）、[sleep-mode 与 camem 显存分配器](../../ch07-sleep-mode-camem-allocator/narrative/chapter.md)（第 7 章）。
+- **Part III 并行、eplb 与 KV 解耦**——[昇腾并行组](../../ch08-ascend-parallel-groups/narrative/chapter.md)（第 8 章）、[专家负载均衡 eplb](../../ch10-eplb-expert-load-balancing/narrative/chapter.md)（第 10 章）、[PD 分离与 mooncake](../../ch11-pd-disaggregation-mooncake/narrative/chapter.md)（第 11 章）、[KV 池化与 ascend_store](../../ch12-kv-pooling-ascend-store/narrative/chapter.md)（第 12 章）、[KV 卸载到 host](../../ch13-kv-offloading-host-cpu/narrative/chapter.md)（第 13 章）。
+- **Part IV 执行主线**——全书执行脊柱：[NPUWorker 重写](../../ch14-npuworker-execution-control/narrative/chapter.md)（第 14 章）、[NPUModelRunner 的 CUDA→NPU 猴补](../../ch15-npumodelrunner-cuda-monkeypatch/narrative/chapter.md)（第 15 章）、[单步前向与 DP 同步](../../ch16-single-step-forward-context-dp-sync/narrative/chapter.md)（第 16 章）、[KV cache 在昇腾上的落地](../../ch17-kv-cache-allocation-reshape-bind/narrative/chapter.md)（第 17 章）、[310P 芯片特化](../../ch18-310p-inference-chip-specialization/narrative/chapter.md)（第 18 章）。
+- **Part V 注意力与 KV**——[后端选择](../../ch19-attention-backend-selection/narrative/chapter.md)（第 19 章）、[标准 MHA](../../ch20-ascend-attention-mha/narrative/chapter.md)（第 20 章）、[MLA 权重吸收](../../ch22-mla-on-npu/narrative/chapter.md)（第 22 章）、[稀疏注意力 SFA/DSA](../../ch24-sparse-attention-sfa-dsa/narrative/chapter.md)（第 24 章）、[KV 管理与调度器](../../ch25-kv-manager-and-schedulers/narrative/chapter.md)（第 25 章）。
+- **Part VI 自定义算子与编译**——[CustomOp 顶替](../../ch27-customop-oot-replacement/narrative/chapter.md)（第 27 章）、[torch.library 与 meta 注册](../../ch28-torch-library-and-meta/narrative/chapter.md)（第 28 章）、[AscendCompiler 与 ACLGraph](../../ch29-ascend-compiler-aclgraph/narrative/chapter.md)（第 29 章）、[FusedMoE 与 batch-invariant](../../ch30-fusedmoe-batch-invariant/narrative/chapter.md)（第 30 章）。
+- **Part VII 量化、采样、投机与模型**——把「找扩展点→登记」的范式收束成四例：[量化框架](../../ch32-ascend-quantization-framework/narrative/chapter.md)（第 32 章）、[采样的 NPU 对位](../../ch33-sampling-npu-adaptation/narrative/chapter.md)（第 33 章）、[投机解码](../../ch35-speculative-decode-npu/narrative/chapter.md)（第 35 章）、[模型/LoRA/netloader 注册](../../ch36-model-lora-netloader-registration/narrative/chapter.md)（第 36 章）。
 
 每章开头的 Roadmap，那个高亮的「你在这里」，挂的就是这张地图上的某一站。
 
@@ -398,4 +398,4 @@ def register_connector():
 - **改不动的地方两段式打补丁**：`adapt_patch` 靠 import 副作用，在 platform 段与 worker 段两个时机改写 vLLM 里没留钩子的符号（支柱三）。
 - **往每个扩展点登记昇腾实现**：这是把前三者串成全书主线的范式，后面 29 章逐站展开（要素四）。
 
-握住这张地图，我们就可以走进第一站了。[第 2 章](../ch02-entry-points-and-npuplatform/narrative/chapter.md) 会把「装上就被发现、并顶替默认实现」这条链——从 entry point 到 `resolve_current_platform_cls_qualname` 再到懒加载——一步不落地走一遍。
+握住这张地图，我们就可以走进第一站了。[第 2 章](../../ch02-entry-points-and-npuplatform/narrative/chapter.md) 会把「装上就被发现、并顶替默认实现」这条链——从 entry point 到 `resolve_current_platform_cls_qualname` 再到懒加载——一步不落地走一遍。

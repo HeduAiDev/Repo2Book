@@ -9,7 +9,7 @@
 
 ---
 
-[上一章](../ch02-entry-points-and-npuplatform/narrative/chapter.md)结尾，vllm-ascend 已经赢得了平台的「选举」：`import vllm` 之后，整套引擎认的是 `NPUPlatform`。但「认得这个平台类」只是第一步。vLLM 的源码里还有成百上千个函数、类、库调用，它们在 GPU 上写死了 CUDA 的假设——有的在昇腾 NPU 上根本跑不起来，有的能跑但慢，有的依赖 torch_npu 里压根没有的符号。
+[上一章](../../ch02-entry-points-and-npuplatform/narrative/chapter.md)结尾，vllm-ascend 已经赢得了平台的「选举」：`import vllm` 之后，整套引擎认的是 `NPUPlatform`。但「认得这个平台类」只是第一步。vLLM 的源码里还有成百上千个函数、类、库调用，它们在 GPU 上写死了 CUDA 的假设——有的在昇腾 NPU 上根本跑不起来，有的能跑但慢，有的依赖 torch_npu 里压根没有的符号。
 
 vllm-ascend 是 **out-of-tree（OOT，源码树外）插件**：它装在 vLLM 之外，是独立的 pip 包，**不允许改 vLLM 一行源码**。那它凭什么把 vLLM 内部那些函数换成昇腾版？
 
@@ -82,7 +82,7 @@ patch 不是越早打越好，也不能越晚越好——它必须卡在「被�
 
 ### platform 段触发点②：子进程里的兜底（回收 ch02 的伏笔）
 
-[上一章](../ch02-entry-points-and-npuplatform/narrative/chapter.md)结尾埋了一颗种子：四个 `register_*`（`general_plugins` 入口）每个都先调一遍 `_ensure_global_patch()`，但当时只点到「会触发 platform 段」，没展开。现在把它讲全：
+[上一章](../../ch02-entry-points-and-npuplatform/narrative/chapter.md)结尾埋了一颗种子：四个 `register_*`（`general_plugins` 入口）每个都先调一遍 `_ensure_global_patch()`，但当时只点到「会触发 platform 段」，没展开。现在把它讲全：
 
 ```python
 # vllm_ascend/__init__.py:L20-L51
@@ -130,7 +130,7 @@ docstring 把动机说透了：vLLM 由 `vllm/plugins/__init__.py` 在 **engine-
 
 三次调用后，`adapt_patch(is_global_patch=True)` 只被真正执行了一次。守卫的正确性靠一个**单调标志**：`_GLOBAL_PATCH_APPLIED` 只可能从 `False` 翻到 `True`、永不回头；一旦翻过，后续任意多次调用都走 `return` 分支，执行 patch 的那段代码再也到不了。这就是「至多一次」的保证。
 
-至此，[上一章](../ch02-entry-points-and-npuplatform/narrative/chapter.md)埋下的那颗种子——`general_plugins` 怎样触发两段式 monkey-patch——算是正式接上了：它触发的就是 platform 段，而本章正在把这套两段式完整摊开。
+至此，[上一章](../../ch02-entry-points-and-npuplatform/narrative/chapter.md)埋下的那颗种子——`general_plugins` 怎样触发两段式 monkey-patch——算是正式接上了：它触发的就是 platform 段，而本章正在把这套两段式完整摊开。
 
 ### worker 段触发点：每个 worker 进程构造时
 
@@ -523,4 +523,4 @@ wrapped() == "destroyed"                                     → True   # ④ wr
 - **触发**：没有 `apply()`，patch 全靠 import 包时的模块级副作用；`is_310p` / `HAS_TRITON` / `vllm_version_is` / 环境变量四个维度的条件加载，精确裁剪每个环境该打哪些 patch。本书钉死的 v0.21.0 基座上，`patch_v2` 整组被版本门控挡在门外。
 - **技法**：整类替换换类名（`patch_multiproc_executor.py`）；工厂替换连派发表一起改（`patch_mamba_manager.py`）；方法替换只换一个绑定方法（`patch_scheduler.py`）；库函数 wrapper 闭包包裹原 fn（`patch_triton.py`）；from-import 缓存陷阱要把同一对象的所有别名都重绑（`patch_distributed.py`）。
 
-[下一章](../ch04-patch-engine-core-kvcache/narrative/chapter.md)我们就拿着这套招式总纲，钻进引擎核心——看 KV-cache 协调器与内存形态层这几处最要紧的 platform 段 patch，具体替换了 vLLM 的哪些行为、又为什么非换不可。
+[下一章](../../ch04-patch-engine-core-kvcache/narrative/chapter.md)我们就拿着这套招式总纲，钻进引擎核心——看 KV-cache 协调器与内存形态层这几处最要紧的 platform 段 patch，具体替换了 vLLM 的哪些行为、又为什么非换不可。

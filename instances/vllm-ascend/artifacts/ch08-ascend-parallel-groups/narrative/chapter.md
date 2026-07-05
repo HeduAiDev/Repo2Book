@@ -4,7 +4,7 @@
 
 > 上一章：显存底座 camem 把 NPU 的虚拟地址管起来了。
 > 本章：在基座已建好的并行组之上，再叠一批昇腾专属组。
-> 下一章：[这些组里的 `_DYNAMIC_EPLB` 将驱动专家热迁移](../ch09-eplb-expert-load-balancing/narrative/chapter.md)。
+> 下一章：[这些组里的 `_DYNAMIC_EPLB` 将驱动专家热迁移](../../ch10-eplb-expert-load-balancing/narrative/chapter.md)。
 
 本章主角是 `vllm_ascend/distributed/parallel_state.py` 里的 `init_ascend_model_parallel`——一个只做加法、不碰基座的并行组工厂。
 
@@ -18,7 +18,7 @@
 
 而「额外算出排布」这件事，本质是一道**排布代数题**：把 world 里的所有 rank 编号 reshape 成一张多维网格，沿不同维度 transpose / reshape / slice，切出每个组该包含哪些 rank。MC2、细粒度 TP、flashcomm2 各沿不同维度切，消费方也各不相同。
 
-本章还是**上下文并行（context parallel）的归口**。PCP / DCP 这两个 CP 组虽然由基座创建，但它们的排布用的是同一套 reshape 代数。我们在这里把它讲清；后面的[注意力章](../ch19-ascend-attention-mha/narrative/chapter.md)只在运行期用 `enable_cp()` 决定是否走 CP 分支，不再重复讲排布。
+本章还是**上下文并行（context parallel）的归口**。PCP / DCP 这两个 CP 组虽然由基座创建，但它们的排布用的是同一套 reshape 代数。我们在这里把它讲清；后面的[注意力章](../../ch20-ascend-attention-mha/narrative/chapter.md)只在运行期用 `enable_cp()` 决定是否走 CP 分支，不再重复讲排布。
 
 把这道排布代数题吃透，你就能手推任意并行度组合下、任意一个组该有哪些 rank。
 
@@ -237,7 +237,7 @@ MC2 group_ranks = [[0, 1, 2, 3, 4, 5, 6, 7]]
 
 样例 A 的 `pp=1` 让 `transpose(1,2)` 退化成恒等，看不出它在忙什么。但 `pp>1` 时它不可或缺：若不做 transpose 而直接 `reshape(-1, dp·pcp·tp)`，相邻的 `dp·pcp·tp` 块会跨过 pp 维边界，把**不同 pp stage** 的 rank 混进同一个专家域——而专家通信只该发生在单一 stage 内。`transpose(1,2)` 把 pp 提到最前，正是为了保证切出来的每个组只落在一个 pp stage 里。
 
-注意紧跟其后的两个 `if`。`_DYNAMIC_EPLB` 和 `_FC3_QUANT_X` **复用同一份 `group_ranks`**——因为动态专家负载均衡、flashcomm3 量化 all-gather，都在同一个专家域里通信，拓扑和 MC2 一模一样。复用排布、只是各 new 一个独立的 `GroupCoordinator`，省掉重算。其中 `_DYNAMIC_EPLB` 就是[第 9 章专家热迁移](../ch09-eplb-expert-load-balancing/narrative/chapter.md)要用的组——这里先把它建好，机制留到那章展开。
+注意紧跟其后的两个 `if`。`_DYNAMIC_EPLB` 和 `_FC3_QUANT_X` **复用同一份 `group_ranks`**——因为动态专家负载均衡、flashcomm3 量化 all-gather，都在同一个专家域里通信，拓扑和 MC2 一模一样。复用排布、只是各 new 一个独立的 `GroupCoordinator`，省掉重算。其中 `_DYNAMIC_EPLB` 就是[第 10 章专家热迁移](../../ch10-eplb-expert-load-balancing/narrative/chapter.md)要用的组——这里先把它建好，机制留到那章展开。
 
 还有一点要点破：`_MC2` 同时是 `model_parallel_initialized()` 的哨兵。这个函数的实现就一行——`return _MC2 is not None`（[后面 §取用、哨兵与销毁](#取用哨兵与销毁)会看到完整定义），所以 `_MC2` 是「已初始化」状态的**唯一**哨兵。这意味着 MC2 必须**无条件、最先**建——它一建好，整个 `init_ascend_model_parallel` 就被视为「已初始化」；若不最先建，重复调用时哨兵会失真。
 
@@ -473,7 +473,7 @@ CP 的核心约束是：**它不增加 world_size**。为什么不能增？因�
 
 > *图注：样例 C 下，DCP 沿行（复用 TP 的 GPU 再细分），PCP 沿列（跨 tp 跳取）。CP 不增 world，组的排布到此讲清；注意力章只在运行期用 `enable_cp()` 决定是否走这些组。*
 
-这就是 CP 排布的全部。到了[注意力章](../ch19-ascend-attention-mha/narrative/chapter.md)，源码里只会出现 `enable_cp()` 这样的运行期判断——是否经 `get_pcp_group()` / `get_dcp_group()` 做 CP 的 all_gather。组的形状不必再推一遍，因为就在上面这张表里。
+这就是 CP 排布的全部。到了[注意力章](../../ch20-ascend-attention-mha/narrative/chapter.md)，源码里只会出现 `enable_cp()` 这样的运行期判断——是否经 `get_pcp_group()` / `get_dcp_group()` 做 CP 的 all_gather。组的形状不必再推一遍，因为就在上面这张表里。
 
 ## 取用、哨兵与销毁
 

@@ -9,7 +9,7 @@
 
 ---
 
-[上一章](../ch05-check-and-update-config/narrative/chapter.md)结尾，`worker_cls` 终于从哨兵字符串落成了具体的 `NPUWorker`。可一个 worker 不会孤零零地跑——张量并行、专家并行、流水线并行，多张卡之间要不停地交换张量。而 vLLM 里负责这件事的那层，叫**通信器（communicator）**，在 GPU 上是 `CudaCommunicator`，底层走 NCCL。昇腾 NPU 上没有 NCCL，有的是华为自家的 HCCL。NCCL 是 NVIDIA 的集合通信库、HCCL 是昇腾的对应实现，都负责多卡间 all_reduce / all_gather 等集合通信。
+[上一章](../../ch05-check-and-update-config/narrative/chapter.md)结尾，`worker_cls` 终于从哨兵字符串落成了具体的 `NPUWorker`。可一个 worker 不会孤零零地跑——张量并行、专家并行、流水线并行，多张卡之间要不停地交换张量。而 vLLM 里负责这件事的那层，叫**通信器（communicator）**，在 GPU 上是 `CudaCommunicator`，底层走 NCCL。昇腾 NPU 上没有 NCCL，有的是华为自家的 HCCL。NCCL 是 NVIDIA 的集合通信库、HCCL 是昇腾的对应实现，都负责多卡间 all_reduce / all_gather 等集合通信。
 
 那 vllm-ascend 凭什么把整套通信器换成昇腾版？答案出乎意料地干净。**通信器是 OOT（out-of-tree，源码树外）插件换底座最干净的样本**——干净到整个 `NPUCommunicator` 只有 68 行。本章想说服你相信这件事，并讲清它为什么成立。
 
@@ -52,7 +52,7 @@
         return "vllm_ascend.distributed.device_communicators.npu_communicator.NPUCommunicator"
 ```
 
-`NPUPlatform` 是 `Platform` 的 OOT 子类（怎么被 vLLM 认出来、顶替成默认平台，是 [第 2 章](../ch02-entry-points-and-npuplatform/narrative/chapter.md)的事），这里只覆写这一个 classmethod：把字符串从基类换成 `NPUCommunicator` 的 qualname。**换底座的全部动作，就是改一个字符串的返回值。**
+`NPUPlatform` 是 `Platform` 的 OOT 子类（怎么被 vLLM 认出来、顶替成默认平台，是 [第 2 章](../../ch02-entry-points-and-npuplatform/narrative/chapter.md)的事），这里只覆写这一个 classmethod：把字符串从基类换成 `NPUCommunicator` 的 qualname。**换底座的全部动作，就是改一个字符串的返回值。**
 
 字符串怎么变成真正的类实例？在进程组初始化时。每个 `GroupCoordinator`（一组协同通信的 rank 的协调器）在 `__init__` 里做这件事：
 
@@ -517,7 +517,7 @@ class PyHcclCommunicator:
 
 ## 6.4 仅 310P：用 all_gather 补硬件能力缺口
 
-最后一条线，回到熟悉的地盘。前面三条都是「换底座」，这一条是「补缺口」——而且补的手法，正是 [第 3 章](../ch03-two-stage-monkey-patch/narrative/chapter.md)讲过的两段式 monkey-patch。机制不重讲，这里只讲两件事：**补什么、为什么 `all_gather` 能等价模拟**。
+最后一条线，回到熟悉的地盘。前面三条都是「换底座」，这一条是「补缺口」——而且补的手法，正是 [第 3 章](../../ch03-two-stage-monkey-patch/narrative/chapter.md)讲过的两段式 monkey-patch。机制不重讲，这里只讲两件事：**补什么、为什么 `all_gather` 能等价模拟**。
 
 背景是 Atlas 300I（310P）这块推理卡——Atlas 300I 是华为的推理卡，其较老的 310P 变体（相对 A2/A3/A5 新代）缺部分集合通信能力：硬件**不支持原生的 `broadcast`，也不支持 int64 的 `all_reduce`**。但它支持 `all_gather`。于是 vllm-ascend 用猴补把这两个缺失的原语，在 host 侧用 `all_gather` 拼出等价语义：
 
@@ -602,7 +602,7 @@ if get_ascend_device_type() == AscendDeviceType._310P:
     communication_adaptation_310p()
 ```
 
-只有当 `get_ascend_device_type()` 判定是 `_310P` 时，才在 import 期执行替换。A2/A3/A5 这些有完整原生能力的卡，根本不会触发——它们的 `broadcast`/`all_reduce` 保持原样，不被这套 host 侧模拟拖慢。这也是 [第 3 章](../ch03-two-stage-monkey-patch/narrative/chapter.md)那套「按硬件分代守卫猴补」的又一处落地。
+只有当 `get_ascend_device_type()` 判定是 `_310P` 时，才在 import 期执行替换。A2/A3/A5 这些有完整原生能力的卡，根本不会触发——它们的 `broadcast`/`all_reduce` 保持原样，不被这套 host 侧模拟拖慢。这也是 [第 3 章](../../ch03-two-stage-monkey-patch/narrative/chapter.md)那套「按硬件分代守卫猴补」的又一处落地。
 
 ## 6.5 小结：窄接口 + 已抽象好的基类 = 最干净的换底座
 

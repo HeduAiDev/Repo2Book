@@ -10,7 +10,7 @@ Usage:
   python3 roadmap.py --highlight attach        --out roadmap.svg   # Part 键: 高亮一个 Part 泳道
   python3 roadmap.py --highlight P4            --out roadmap.svg   # 等价 Part 别名 P1..P7
   python3 roadmap.py --highlight worker        --out roadmap.svg   # 子系统键: 高亮所属 Part + "本章深入"框
-  python3 roadmap.py --highlight ch20          --out roadmap.svg   # 章号键: 同上(直接按 chapter_id 定位)
+  python3 roadmap.py --highlight ch22          --out roadmap.svg   # 章号键: 同上(直接按 chapter_id 定位)
   python3 roadmap.py                            --out roadmap.svg   # 空: 全书总览(meta 章)
 
 Part 键见 STAGES（每个键=一个 Part，配 P1..P7 别名）；子系统/章号键见 ALIASES
@@ -42,7 +42,7 @@ STAGES = [
 #   (b) outline 里每章的 subsystem 值（注意 'distributed' 跨 P2/P3、'worker' 在 P4、
 #       'attention'/'core' 在 P5——故 subsystem 单独不足以定位，子系统别名取「最常见归属」，
 #       精确定位请用章号键）；
-#   (c) 每个 chapter_id（ch01..ch30）直接定位到其 Part，工作流按章发车最稳。
+#   (c) 每个 chapter_id（ch01..ch36）直接定位到其 Part，工作流按章发车最稳。
 # 值形如 (Part键, 中文"本章深入"标签)；标签=None 表示纯 Part 高亮、不画 callout。
 ALIASES = {
     # (a) P1..P7 简记别名 —— 纯 Part 高亮
@@ -60,35 +60,35 @@ ALIASES = {
     "ch06": ("device-mem", "NPUCommunicator / pyhccl"),
     "ch07": ("device-mem", "camem sleep-mode 分配器"),
     "ch08": ("parallel-kv", "昇腾并行组 / CP"),
-    "ch09": ("parallel-kv", "eplb 专家负载均衡"),
-    "ch10": ("parallel-kv", "PD 分离 / mooncake P2P"),
-    "ch11": ("parallel-kv", "KV 池化 / ascend_store"),
-    "ch12": ("parallel-kv", "KV host/CPU 卸载"),
-    "ch13": ("exec", "NPUWorker 重写"),
-    "ch14": ("exec", "NPUModelRunner 继承+猴补"),
-    "ch15": ("exec", "execute_model / forward context"),
-    "ch16": ("exec", "KV cache 在昇腾落地"),
-    "ch17": ("exec", "310P 全栈特化"),
-    "ch18": ("attention", "注意力后端选择/注册"),
-    "ch19": ("attention", "AscendAttention MHA"),
-    "ch20": ("attention", "MLA 在 NPU 上"),
-    "ch21": ("attention", "稀疏注意力 SFA/DSA"),
-    "ch22": ("attention", "KV 管理与调度器"),
-    "ch23": ("ops-compile", "CustomOp OOT 顶替"),
-    "ch24": ("ops-compile", "torch.library / meta 注册"),
-    "ch25": ("ops-compile", "AscendCompiler / ACLGraph"),
-    "ch26": ("ops-compile", "FusedMoE / batch-invariant"),
-    "ch27": ("models", "昇腾量化框架"),
-    "ch28": ("models", "采样的 NPU 对位"),
-    "ch29": ("models", "投机解码 proposer"),
-    "ch30": ("models", "模型 / LoRA / netloader"),
+    "ch10": ("parallel-kv", "eplb 专家负载均衡"),
+    "ch11": ("parallel-kv", "PD 分离 / mooncake P2P"),
+    "ch12": ("parallel-kv", "KV 池化 / ascend_store"),
+    "ch13": ("parallel-kv", "KV host/CPU 卸载"),
+    "ch14": ("exec", "NPUWorker 重写"),
+    "ch15": ("exec", "NPUModelRunner 继承+猴补"),
+    "ch16": ("exec", "execute_model / forward context"),
+    "ch17": ("exec", "KV cache 在昇腾落地"),
+    "ch18": ("exec", "310P 全栈特化"),
+    "ch19": ("attention", "注意力后端选择/注册"),
+    "ch20": ("attention", "AscendAttention MHA"),
+    "ch22": ("attention", "MLA 在 NPU 上"),
+    "ch24": ("attention", "稀疏注意力 SFA/DSA"),
+    "ch25": ("attention", "KV 管理与调度器"),
+    "ch27": ("ops-compile", "CustomOp OOT 顶替"),
+    "ch28": ("ops-compile", "torch.library / meta 注册"),
+    "ch29": ("ops-compile", "AscendCompiler / ACLGraph"),
+    "ch30": ("ops-compile", "FusedMoE / batch-invariant"),
+    "ch32": ("models", "昇腾量化框架"),
+    "ch33": ("models", "采样的 NPU 对位"),
+    "ch35": ("models", "投机解码 proposer"),
+    "ch36": ("models", "模型 / LoRA / netloader"),
     # Part VIII 原理篇（primer）——挂到所属子系统 Part，callout 标「原理篇」
-    "ch31": ("attention",   "原理篇：MLA 低秩压缩与解耦 RoPE"),
-    "ch32": ("attention",   "原理篇：NSA→DSA 稀疏注意力"),
-    "ch33": ("models",      "原理篇：投机采样与拒绝采样定理"),
-    "ch34": ("parallel-kv", "原理篇：EPLB 均衡算法"),
-    "ch35": ("models",      "原理篇：量化数学"),
-    "ch36": ("attention",   "原理篇：V4 CSA/HCA 压缩注意力"),
+    "ch21": ("attention",   "原理篇：MLA 低秩压缩与解耦 RoPE"),
+    "ch23": ("attention",   "原理篇：NSA→DSA 稀疏注意力"),
+    "ch34": ("models",      "原理篇：投机采样与拒绝采样定理"),
+    "ch09": ("parallel-kv", "原理篇：EPLB 均衡算法"),
+    "ch31": ("models",      "原理篇：量化数学"),
+    "ch26": ("attention",   "原理篇：V4 CSA/HCA 压缩注意力"),
 }
 
 

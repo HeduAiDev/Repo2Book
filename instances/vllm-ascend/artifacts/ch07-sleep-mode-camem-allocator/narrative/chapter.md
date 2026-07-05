@@ -514,7 +514,7 @@ KV cache 的初始化走的是同一招，换个 tag：
 
 最后一块拼图：这套 allocator 怎么让 vLLM「认得」？vLLM 在构图前会校验「当前平台支不支持 sleep mode」，校验不过就直接 `raise`。vllm-ascend 得让这道闸放行。
 
-这里用到的还是[第 3 章讲过的猴补技法](../ch03-two-stage-monkey-patch/narrative/chapter.md#35-from-import-缓存陷阱)——技法④，换掉某个模块里的一个函数名指向。技法本身不再重复，只看这个 patch 的两处特别之处：
+这里用到的还是[第 3 章讲过的猴补技法](../../ch03-two-stage-monkey-patch/narrative/chapter.md#35-from-import-缓存陷阱)——技法④，换掉某个模块里的一个函数名指向。技法本身不再重复，只看这个 patch 的两处特别之处：
 
 ```python
 # vllm_ascend/patch/platform/patch_camem_allocator.py:L17-L28
@@ -552,7 +552,7 @@ if hasattr(model_config_module, "is_cumem_allocator_available"):
         return True
 ```
 
-所以**当前真正让 sleep mode 过闸的，是 `NPUPlatform.is_sleep_mode_available()` 这一句**（它怎么注入进 vLLM，见[第 2 章的平台接管](../ch02-entry-points-and-npuplatform/narrative/chapter.md)）。`patch_camem_allocator.py` 是为上游接口演进预埋的备胎，眼下并不在生效路径上。把这点讲清楚，是因为读者很容易被文件名误导，以为它是当前的关键开关——它不是。
+所以**当前真正让 sleep mode 过闸的，是 `NPUPlatform.is_sleep_mode_available()` 这一句**（它怎么注入进 vLLM，见[第 2 章的平台接管](../../ch02-entry-points-and-npuplatform/narrative/chapter.md)）。`patch_camem_allocator.py` 是为上游接口演进预埋的备胎，眼下并不在生效路径上。把这点讲清楚，是因为读者很容易被文件名误导，以为它是当前的关键开关——它不是。
 
 ## 小结
 
@@ -564,6 +564,6 @@ if hasattr(model_config_module, "is_cumem_allocator_available"):
 - **移植 = 同构换符号**：`camem.py` 与 vLLM `cumem.py` 类、方法、控制流逐行对位，只换 `cudart → acl.rt`、`cumem_allocator → vllm_ascend_C`、`torch.cuda.* → torch.npu.*`。唯一「换而非改名」的是 `acl.rt.memcpy` 多了 `destMax` 上界和显式方向枚举。
 - **接入**：`patch_camem_allocator.py` 用 `hasattr` 守护为上游未来版本预埋 fallback，但在当前 base 上是 no-op；真正放行靠 `NPUPlatform.is_sleep_mode_available()`。
 
-[上一章 pyhccl 那条线](../ch06-npu-communicator/narrative/chapter.md#63-手写-pyhccl把-pynccl-的-ctypes-范式逐符号移植)埋下的伏笔，这一章也顺手收了一半。两者的**共性**是同一个套路：把厂商的底层库薄薄封装一层、接进 Python。但**手法其实相反**——pyhccl 走的是「纯 ctypes、不编译一行 C++」直接绑 `.so`；camem 反过来，核心虚拟内存原语 `create_and_map`、`unmap_and_release` 走的是**编译出来的 C 扩展** `from vllm_ascend.vllm_ascend_C import ...`（外加用 `.so` 的 `dlopen` 给 `NPUPluggableAllocator` 拿符号、`acl.rt` 的 pybind 绑定）。所以被 camem 用上的，是「薄封装厂商原语、接进 Python」这层范式，而不是 pyhccl 那套「纯 ctypes」手法——这两支恰好站在对立面。无论如何，「薄封装」这层意思落了地，伏笔回收一半。而 custom all-reduce 与图捕获那一支（它顺带挂着的 `ca_comm = None`）还悬着，要等图捕获线推进时再揭。
+[上一章 pyhccl 那条线](../../ch06-npu-communicator/narrative/chapter.md#63-手写-pyhccl把-pynccl-的-ctypes-范式逐符号移植)埋下的伏笔，这一章也顺手收了一半。两者的**共性**是同一个套路：把厂商的底层库薄薄封装一层、接进 Python。但**手法其实相反**——pyhccl 走的是「纯 ctypes、不编译一行 C++」直接绑 `.so`；camem 反过来，核心虚拟内存原语 `create_and_map`、`unmap_and_release` 走的是**编译出来的 C 扩展** `from vllm_ascend.vllm_ascend_C import ...`（外加用 `.so` 的 `dlopen` 给 `NPUPluggableAllocator` 拿符号、`acl.rt` 的 pybind 绑定）。所以被 camem 用上的，是「薄封装厂商原语、接进 Python」这层范式，而不是 pyhccl 那套「纯 ctypes」手法——这两支恰好站在对立面。无论如何，「薄封装」这层意思落了地，伏笔回收一半。而 custom all-reduce 与图捕获那一支（它顺带挂着的 `ca_comm = None`）还悬着，要等图捕获线推进时再揭。
 
 下一章离开显存底座，转向昇腾的并行与 KV 解耦。

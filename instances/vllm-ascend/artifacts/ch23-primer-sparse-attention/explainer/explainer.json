@@ -1,0 +1,250 @@
+{
+  "chapter": "ch23-primer-sparse-attention",
+  "note": "primer 原理章素材真相源。worked example 全部来自 explainer/traces/run_all.py 跑 implementation/ 论文忠实参考实现的真实输出(trace_source=run);表格每个数字都能在对应 traces/*.json 里找到。落地数值锚(index_topk=512、H^I=64、d^I=128、per_kv_dim=73728、L=131072、k=2048)出自 dsa_v1.py 真实注释与 paper-dsa.md 原文。",
+  "mechanisms": [
+    {
+      "mechanism_id": "attn-quadratic-tax",
+      "intuition": "开会握手:每进来一个新人都要和在场所有人各握一次手——第 t 个人握 t 次,人越多,握手总数按人数的平方涨。标准因果注意力里,第 t 个 query 要对 t 个前驱各算一次 q·k,整条序列的点积总数就是 1+2+…+L = L(L+1)/2,这就是长序列越来越贵的『O(L²) 注意力税』。",
+      "worked_example": {
+        "params": {"seq_lens": [4, 8, 16, 32], "count_formula": "L(L+1)/2", "d_k": 4},
+        "trace_source": "run",
+        "trace_ref": "traces/quadratic_tax.json",
+        "table": {
+          "columns": ["序列长 L", "q·k 点积总数 = L(L+1)/2", "相对 L=4 的倍数"],
+          "rows": [
+            [4, 10, "1.0x"],
+            [8, 36, "3.6x"],
+            [16, 136, "13.6x"],
+            [32, 528, "52.8x"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "点积总数 T(L)=L(L+1)/2 关于 L 严格单调递增,且边际代价(第 t 个 query 的 t 次点积)随 t 线性上升 → 总代价是 Θ(L²),不可能靠常数因子降成线性。",
+        "argument": "基例 T(1)=1;归纳步 T(L)=T(L-1)+L,每加一个 token 就新增 L 次点积。新增量本身随 L 线性增长,故累加是二次:T(L)/L = (L+1)/2 → ∞,人均代价无上界,证明它是超线性(二次)而非线性。表中序列每翻一倍,点积数约变 4 倍(36/10=3.6、136/36≈3.78、528/136≈3.88 → 趋于 4)正是二次的指纹。"
+      },
+      "quantified": "落地长上下文 L=131072(V3.1-Terminus 续训到的 128K),稠密因果注意力单层要算 L(L+1)/2 = 8,590,000,128 ≈ 8.59×10⁹ 次 q·k 点积(traces/quadratic_tax.json deploy.dot_products)。论文估 64K 解码时注意力已占端到端 70–80% 延迟——这是『必须稀疏化』的定量动机。",
+      "figure_specs": [
+        {
+          "figure_id": "fig32-quadratic-tax",
+          "claim": "序列长度每翻一倍,注意力的 q·k 点积数增至约 4 倍(二次增长),而非 2 倍(线性)——这就是 O(L²) 注意力税。",
+          "template": "state-table",
+          "numbers": [
+            {"value": "L=4 → 10", "provenance": "traces/quadratic_tax.json table_rows[0]"},
+            {"value": "L=8 → 36", "provenance": "traces/quadratic_tax.json table_rows[1]"},
+            {"value": "L=16 → 136", "provenance": "traces/quadratic_tax.json table_rows[2]"},
+            {"value": "L=32 → 528", "provenance": "traces/quadratic_tax.json table_rows[3]"},
+            {"value": "翻倍增长 ≈3.6/3.78/3.88x", "provenance": "traces/quadratic_tax.json growth_per_doubling"},
+            {"value": "L=131072 → 8.59×10⁹", "provenance": "traces/quadratic_tax.json deploy.dot_products"}
+          ],
+          "caption_draft": "标准因果注意力的 q·k 点积数随 L 二次增长:每翻一倍代价约变 4 倍,落地 128K 上下文单层已达 8.59×10⁹ 次点积,占长上下文推理的主导延迟。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "nsa-three-branch",
+      "intuition": "读长文档不逐字读:先扫目录抓大意(压缩支路 cmp)、翻到最相关的几章细读(选择支路 slc)、再顺手看手边这几段(滑窗支路 win),三路各取所需再按重要性合并。只要三路留下的 token 总数 N_t 远小于全文长度 t,就省下了大部分注意力。",
+      "worked_example": {
+        "params": {"branches": ["cmp", "slc", "win"], "gates": {"cmp": 0.2, "slc": 0.5, "win": 0.3}, "d_k": 4},
+        "trace_source": "run",
+        "trace_ref": "traces/three_branch.json",
+        "table": {
+          "columns": ["上下文长 t", "cmp 保留", "slc 保留", "win 保留", "N_t = 三路之和", "稀疏比 N_t/t"],
+          "rows": [
+            [64, 4, 8, 4, 16, 0.25],
+            [1024, 8, 16, 8, 32, 0.0312]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "各支路的保留预算与上下文长 t 解耦(近似常数 B),故 N_t 有上界而 t 无限增长时稀疏比 N_t/t → 0:上下文越长,稀疏收益越大。",
+        "argument": "门控加权求和 o_t*=Σ_c g_t^c·Attn(q_t,K̃^c,Ṽ^c) 里每条支路的 K̃^c 大小由固定策略(压缩块数/选块数 n/滑窗宽)决定,不随 t 线性扩张。表中 t 从 64 涨到 1024(16 倍),N_t 只从 16 涨到 32(2 倍),稀疏比从 0.25 掉到 0.0312 ≈ 8 倍下降——分母涨得比分子快,单调趋 0。这就是 Eq.6『保持 N_t << t』的定量含义。"
+      },
+      "quantified": "把每支路预算折成 DSA 落地的等效 k≈512,代入 t=131072:稀疏比 ≈ 512/131072 ≈ 0.39%,即每个 query 只碰约 0.4% 的前驱。DSA 是这套三支路框架的简化后裔——砍掉 cmp/win,只保留一条由 lightning indexer 打分驱动的选择支路。",
+      "figure_specs": [
+        {
+          "figure_id": "fig32-nsa-three-branch",
+          "claim": "NSA 用压缩+选择+滑窗三条支路各自产出紧凑 KV,门控加权求和;只要三路总留存 N_t 远小于 t,注意力就大幅变便宜。",
+          "template": "flow",
+          "numbers": [
+            {"value": "t=64 → N_t=16, 稀疏比 0.25", "provenance": "traces/three_branch.json table_rows[0]"},
+            {"value": "t=1024 → N_t=32, 稀疏比 0.0312", "provenance": "traces/three_branch.json table_rows[1]"},
+            {"value": "门控和 = 1.0 (0.2+0.5+0.3)", "provenance": "traces/three_branch.json gate_sum"}
+          ],
+          "caption_draft": "NSA 三支路框架:query 分别对压缩/选择/滑窗三份紧凑 KV 做注意力,再按门控 g^c 加权求和。上下文从 64 增到 1024 时稀疏比从 0.25 降到 0.03,印证『N_t << t』——DSA 把它简化为单条 indexer 选择支路。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "nsa-importance-score",
+      "intuition": "图书管理员不重新翻每本书来评估价值——直接看已经统计好的借阅热度榜给书架排名,零额外工作。NSA 同理:块重要性不额外算,直接复用『压缩注意力』那一路已经算出的 softmax 分数,组内跨头一求和,就得到每个块的重要性,取前 n 块细读。",
+      "worked_example": {
+        "params": {"n_blocks": 6, "n_heads": 2, "top_n": 3, "note": "l'=l=d 时 p_slc=p_cmp 直接复用"},
+        "trace_source": "run",
+        "trace_ref": "traces/importance_score.json",
+        "table": {
+          "columns": ["压缩块 idx", "头0 分数", "头1 分数", "组内求和 p'", "重要性排名", "入 top-3?"],
+          "rows": [
+            [0, 0.0333, 0.106, 0.1393, 6, 0],
+            [1, 0.1213, 0.0338, 0.1551, 5, 0],
+            [2, 0.1333, 0.4861, 0.6194, 1, 1],
+            [3, 0.2558, 0.1012, 0.357, 3, 1],
+            [4, 0.2059, 0.1316, 0.3375, 4, 0],
+            [5, 0.2504, 0.1413, 0.3917, 2, 1]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "块重要性打分复用已算好的压缩注意力分数 → 选择支路的打分开销为零;top-n 恰好保留 min(n, 块数) 个块,且被选块严格是组内求和分数最高的那些。",
+        "argument": "p'[b]=Σ_head p_cmp^head[b] 只是对已有中间量求和,无新增 q·k。表中组内求和列降序排名唯一确定 top-3={块2(0.6194),块5(0.3917),块3(0.357)},它们正是分数前三名——被选块占组内总质量 1.3681/2.0 ≈ 68%,而只保留了 3/6 = 50% 的块。这就是『打分函数代理相关性』在 NSA 里的首次出现,也是 DSA lightning indexer 的思想前身:排序打分 → 截断 → 只算选中项。"
+      },
+      "quantified": "本例用 50% 的块(3/6)兜住了 68% 的注意力质量(kept_group_mass 1.3681 / total 2.0,traces/importance_score.json)——即『少数块占多数注意力』。DSA 把块级选择细化成 token 级 top-k,但同一逻辑:一个廉价打分器排序后截断。"
+    },
+    {
+      "mechanism_id": "dsa-lightning-indexer",
+      "intuition": "相亲快速海选:每个红娘(indexer 头)只给『合得来』的候选打正分、合不来直接记 0(绝不倒扣成大负分),再按各红娘的权威 w 加权汇总成总分。ReLU 就是这个『合不来记 0、不倒扣』——论文选它是为了吞吐:头少、可 FP8,算得飞快。",
+      "worked_example": {
+        "params": {"H_I": 2, "d_I": 3, "t": 4, "w_t": [1.0, 2.0], "activation": "ReLU"},
+        "trace_source": "run",
+        "trace_ref": "traces/lightning_indexer.json",
+        "table": {
+          "columns": ["前驱 s", "头0 q·k", "头1 q·k", "ReLU 头0", "ReLU 头1", "I_{t,s} = 1·r0 + 2·r1"],
+          "rows": [
+            [0, 1.0, 0.5, 1.0, 0.5, 2.0],
+            [1, 0.0, 1.0, 0.0, 1.0, 2.0],
+            [2, 0.0, 1.5, 0.0, 1.5, 3.0],
+            [3, -2.0, -0.5, 0.0, 0.0, 0.0]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "权重非负时 index score I_{t,s} = Σ_j w_j·ReLU(q_j·k_s) ≥ 0 恒成立;任何负相关(负点积)贡献恰好为 0,绝不会变成大负值去污染排序;增加 indexer 头只可能抬高或维持某条目得分,不会因单头负相关把它压到榜底。",
+        "argument": "ReLU(x)=max(x,0) 逐头把负点积截为 0,故每头贡献 w_j·ReLU(·) ≥ 0(w_j≥0),求和非负。表中 s=3 两头点积均为负(-2.0、-0.5),经 ReLU 双双清零 → I=0.0,而不是留下 1·(-2)+2·(-0.5)=-3 这种会扭曲 top-k 排序的大负值。对比 s=2 只有头1 强正(1.5)也能靠权重 2 拿到最高分 3.0 → 被 top-k 选中。这正是 ReLU 而非 softmax 的设计意图:各头独立正向投票、不互相归一化压制。"
+      },
+      "quantified": "每对 (t,s) 打分成本 = H^I·d^I 次乘加。本例 2·3=6;落地 H^I=64、d^I=128 → 8192 次(traces/lightning_indexer.json mac_per_pair_deploy),仍远小于主注意力单条 KV 的 per_kv_dim=73728 MAC(约 1/9),故 indexer 虽也对全部前驱打分,常数却小得多。",
+      "figure_specs": [
+        {
+          "figure_id": "fig32-lightning-indexer",
+          "claim": "index score = 每头 q^I·k^I 点积经 ReLU(负相关清零、不倒扣)后按标量权重 w^I 加权求和;负点积被清零而非留成大负值污染排序。",
+          "template": "tensor-flow",
+          "numbers": [
+            {"value": "H^I=2 头, d^I=3, w=[1,2]", "provenance": "traces/lightning_indexer.json params"},
+            {"value": "s=2: 头1 点积 1.5 → I=3.0 (最高)", "provenance": "traces/lightning_indexer.json table_rows[2]"},
+            {"value": "s=3: 点积 -2.0/-0.5 → ReLU 清零 → I=0.0", "provenance": "traces/lightning_indexer.json table_rows[3]"},
+            {"value": "落地每对打分 8192 MAC vs 主注意力 73728", "provenance": "traces/lightning_indexer.json mac_per_pair_deploy"}
+          ],
+          "caption_draft": "Lightning indexer 打分 I_{t,s}=Σ_j w_j·ReLU(q_j^I·k_s^I):H^I 个头各做一次点积、ReLU 把负相关清零(s=3 两头皆负 → I=0),再按 w^I 加权求和。ReLU 而非 softmax 是为吞吐,单对成本仅 8192 MAC。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "dsa-topk-selection",
+      "intuition": "考前只复习最可能考的 k 个知识点,而不是通读整本书。DSA 拿 indexer 打分给所有前驱 token 排名,只取 top-k 个 KV 进主注意力——把每个 query 要算的 q·k 从 L 个砍到 k 个。当 k 取到整条序列时,它精确退化回稠密注意力(什么都没漏)。",
+      "worked_example": {
+        "params": {"L": 8, "d_k": 4, "k_values": [8, 3]},
+        "trace_source": "run",
+        "trace_ref": "traces/topk_selection.json",
+        "table": {
+          "columns": ["top-k 的 k", "实际选中", "序列长 L", "关键校验值", "注意力路径"],
+          "rows": [
+            [8, 8, 8, 0.0, "稠密(退化)"],
+            [3, 3, 8, 2.67, "稀疏"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "top-k 选择恰好保留 min(k, L) 个 KV;当 k ≥ L 时选中集 = 全部前驱,稀疏注意力输出与稠密注意力逐元素相等(退化基例);k < L 时主注意力 q·k 数从 L 降到 k。",
+        "argument": "top-k 是对 L 个索引取分数最高的 min(k,L) 个。k=8=L 时选中全部 8 个,稀疏路径与稠密路径喂入相同 KV 集,故输出最大绝对差 = 0.0(traces/topk_selection.json full_vs_dense_max_abs_diff),数值验证退化正确性;k=3 时只留 3 个 KV,每 query 点积数 8→3(降 8/3≈2.67x)。因为 softmax 只在选中集内归一化,这不是近似整段注意力、而是定义了『只看 top-k』的新注意力——由训练协同适配(见 dsa-training-coadapt)保证不掉点。"
+      },
+      "quantified": "落地 L=131072、k=512:每个 query 的主注意力 q·k 从 131072 降到 512,降幅 131072/512 = 256×(traces/topk_selection.json deploy.dot_reduction)。若取论文训练值 k=2048,降幅 64×。这就是 Eq.2 把 O(L²) 主注意力砍成 O(L·k) 的那一刀。",
+      "figure_specs": [
+        {
+          "figure_id": "fig32-topk-selection",
+          "claim": "主注意力只在 indexer top-k 选中的 KV 上算:每 query 的 q·k 从 L 降到 k;k=L 时精确退化为稠密注意力。",
+          "template": "before-after",
+          "numbers": [
+            {"value": "before: k=8=L → 与稠密差 0.0", "provenance": "traces/topk_selection.json table_rows[0]"},
+            {"value": "after: k=3 → 点积降 2.67x", "provenance": "traces/topk_selection.json table_rows[1]"},
+            {"value": "top-3 选中索引 {2,4,6}", "provenance": "traces/topk_selection.json topk3_indices"},
+            {"value": "落地 L=131072, k=512 → 256x", "provenance": "traces/topk_selection.json deploy.dot_reduction"}
+          ],
+          "caption_draft": "细粒度 top-k 选择:左稠密(k=L=8,数值等同全注意力,校验差 0.0),右稀疏(k=3,只算选中的 {2,4,6},点积降 2.67x)。落地 k=512 时每 query 主注意力算量降 256×。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "dsa-training-coadapt",
+      "intuition": "先让实习助理(indexer)照着老专家(真注意力)的判断学一遍,学到位后再让它独立筛选——不是硬砍掉 80% 的 token(那会掉点),而是先教会打分器『什么才是真重要』、再放手让它 top-k。KL 损失就是这个『照着专家学』,dense warm-up 教对齐、sparse stage 全参适配稀疏输入。",
+      "worked_example": {
+        "params": {"L": 64, "k": 8, "n_trials": 400, "alpha": "对齐旋钮 0→1", "note": "alpha=0 完全对齐真分布, alpha=1 完全随机"},
+        "trace_source": "run",
+        "trace_ref": "traces/training_coadapt.json",
+        "table": {
+          "columns": ["对齐旋钮 α(0=对齐,1=随机)", "平均 dense-warmup KL", "平均 top-k 质量召回"],
+          "rows": [
+            [0.0, 0.002, 0.386],
+            [0.25, 0.044, 0.368],
+            [0.5, 0.198, 0.284],
+            [0.75, 0.478, 0.181],
+            [1.0, 0.864, 0.126]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "KL 对齐损失越低,top-k 召回的真注意力质量越高:两者反向单调。完美对齐(Softmax(I)=p)时 KL=0 且 top-k(I) 与 top-k(p) 同集,召回达到理论上界。",
+        "argument": "基例:indexer 打分 = log p 时 Softmax(I)=p → KL(p‖p)=0(traces/training_coadapt.json kl_perfect_alignment),此时 top-k 按 I 排序 = 按 p 排序,选中集正是真注意力质量最大的 k 个 → 召回最大。旋钮 α 从 0(对齐)扫到 1(随机)时,平均 KL 单调上升 0.002→0.044→0.198→0.478→0.864,平均召回同步单调下降 0.386→0.368→0.284→0.181→0.126——400 次平均抹掉噪声后趋势干净。这定量说明:top-k 不掉点不是打分器天生准,而是训练(压 KL)换来的;post-hoc 硬剪之所以掉点,正因未经此对齐(NSA §2.2:top 20% 注意力只覆盖 70% 质量)。"
+      },
+      "quantified": "对齐端(α=0)召回 0.386,随机端(α=1)仅 0.126,差约 3× ——同样取 top-k=8,『训练过的 indexer』兜住的真注意力质量是『乱打分』的三倍。论文据此两阶段续训:dense warm-up(lr=1e-3、1000 步、2.1B token)先对齐,sparse stage(lr=7.3e-6、每 query 选 2048 KV、15000 步、943.7B token)全参适配,最终短/长上下文均无显著退化。",
+      "figure_specs": [
+        {
+          "figure_id": "fig32-training-coadapt",
+          "claim": "indexer 越对齐真注意力(KL 越低),top-k 召回的真注意力质量越高——这是 top-k 稀疏不掉点的定量根因。",
+          "template": "state-table",
+          "numbers": [
+            {"value": "α=0(对齐): KL 0.002, 召回 0.386", "provenance": "traces/training_coadapt.json table_rows[0]"},
+            {"value": "α=0.5: KL 0.198, 召回 0.284", "provenance": "traces/training_coadapt.json table_rows[2]"},
+            {"value": "α=1(随机): KL 0.864, 召回 0.126", "provenance": "traces/training_coadapt.json table_rows[4]"},
+            {"value": "完美对齐 KL(p‖p)=0", "provenance": "traces/training_coadapt.json kl_perfect_alignment"}
+          ],
+          "caption_draft": "对齐旋钮 α 从 0(indexer 对齐真注意力)扫到 1(随机):平均 KL 单调升(0.002→0.864),平均 top-k 质量召回单调降(0.386→0.126)。低 KL ⟺ 高召回——训练协同适配正是『top-k 不掉点』的机制,不是打分器天生准。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "dsa-cost-model",
+      "intuition": "打车省了主程的钱(主注意力 256× 加速),但每次还得付起步价(lightning indexer 仍要扫全部前驱、复杂度仍是 O(L²),只是常数极小)。别只看主程降了 256 倍就以为总账降 256 倍——把起步价并进去,端到端才约 8.7×,这才是诚实的加速账。",
+      "worked_example": {
+        "params": {"L": 131072, "per_kv_dim": 73728, "indexer_heads": 64, "indexer_dim": 128, "k_values": [512, 2048]},
+        "trace_source": "run",
+        "trace_ref": "traces/cost_model.json",
+        "table": {
+          "columns": ["top-k 的 k", "主注意力(稠密) MAC", "主注意力(稀疏) MAC", "indexer MAC", "主注意力加速 L/k", "端到端加速(含 indexer)"],
+          "rows": [
+            [512, 9663676416, 37748736, 1073741824, "256x", "8.69x"],
+            [2048, 9663676416, 150994944, 1073741824, "64x", "7.89x"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "只看主注意力的加速精确等于 L/k;算上 indexer 后端到端加速被 indexer 常数项拉低,且恒小于 L/k——因此『主注意力降 256×』绝不能读成『总延迟降 256×』。",
+        "argument": "单 decode 步:稠密主注意力 = L·per_kv_dim,稀疏主注意力 = k·per_kv_dim,比值精确 = L/k(k=512 → 256×,k=2048 → 64×,traces/cost_model.json main_only_speedup)。indexer 开销 = L·H^I·d^I = 131072·64·128 = 1,073,741,824,与 k 无关。端到端 = 稠密主 /(稀疏主 + indexer):k=512 时 = 9,663,676,416 /(37,748,736 + 1,073,741,824) = 8.69×;k=2048 时 7.89×。因 indexer 项固定,分母被它托底 → 端到端 << L/k。k 越小主注意力越省,但 indexer 占比越大,边际收益递减:这解释了为何落地敢用比论文训练值(2048)更激进的 k=512。",
+        "note_scale": "整条 prefill 累加:主注意力稀疏版 O(L·k)=4,947,802,324,992,indexer 仍 O(L²)=70,369,281,048,576(traces/cost_model.json prefill_scale)——indexer 的 O(L²) 没消失,只是常数比稠密主注意力 O(L²)=633,323,529,437,184 小一个数量级。"
+      },
+      "quantified": "k=512:主注意力单步从 9.66×10⁹ MAC 降到 3.77×10⁷(256×),但 indexer 固定花 1.07×10⁹,端到端仅 8.69×。整条 prefill:稀疏主注意力 4.95×10¹²(O(L·k),线性于 L),而 indexer 70.4×10¹²(仍 O(L²))——所以论文说『indexer 仍 O(L²) 但常数远小于 MLA』,端到端加速来自主注意力那一刀 + indexer 的小常数,而非把总复杂度降成线性。",
+      "figure_specs": [
+        {
+          "figure_id": "fig32-cost-model",
+          "claim": "主注意力 L/k 倍加速(256×/64×)是真的,但 indexer 仍 O(L²) 固定开销把端到端拉到约 8.7×——别把主注意力加速当成总加速。",
+          "template": "before-after",
+          "numbers": [
+            {"value": "稠密主注意力 9.66×10⁹ MAC", "provenance": "traces/cost_model.json table_rows[0][1]"},
+            {"value": "k=512 稀疏主 3.77×10⁷ → 主注意力 256x", "provenance": "traces/cost_model.json detail.512"},
+            {"value": "indexer 固定 1.07×10⁹ MAC", "provenance": "traces/cost_model.json table_rows[0][3]"},
+            {"value": "端到端 k=512: 8.69x, k=2048: 7.89x", "provenance": "traces/cost_model.json detail"}
+          ],
+          "caption_draft": "DSA 加速账两笔:主注意力从 9.66×10⁹ 降到 3.77×10⁷ MAC(L/k=256×),但 lightning indexer 固定花 1.07×10⁹ MAC 且仍 O(L²);端到端 = 稠密主/(稀疏主+indexer) ≈ 8.7×。主注意力加速 ≠ 总加速。"
+        }
+      ]
+    }
+  ]
+}

@@ -8,7 +8,7 @@
 
 ---
 
-[上一章](../ch04-patch-engine-core-kvcache/narrative/chapter.md)讲的是「改别人命名空间里的名字」——monkey-patch 是把手术刀，伸进 vLLM 引擎核心动结构。但 vLLM 给 OOT（out-of-tree，树外）插件留的接管手段不止 patch 这一种。还有一种干净得多、连刀都不用掏的：**vLLM 主动把一份完整的配置对象递到你手上，说「拿去改，改完我接着用」**。
+[上一章](../../ch04-patch-engine-core-kvcache/narrative/chapter.md)讲的是「改别人命名空间里的名字」——monkey-patch 是把手术刀，伸进 vLLM 引擎核心动结构。但 vLLM 给 OOT（out-of-tree，树外）插件留的接管手段不止 patch 这一种。还有一种干净得多、连刀都不用掏的：**vLLM 主动把一份完整的配置对象递到你手上，说「拿去改，改完我接着用」**。
 
 这就是本章的主角——`check_and_update_config`。它是 vLLM 平台抽象里的一个**钩子方法**：在构图之前的最后一刻，框架把装满了所有配置的 `VllmConfig` 对象**按引用**交给当前平台，让平台就地改它。改 worker 用哪个类、改编译走不走 cudagraph、改注意力后端、改并行通信后端——全在这一个方法里完成。改完，vLLM 拿着被改过的 config 继续往下建引擎、建 Worker。整个过程，昇腾插件**一行 vLLM 源码都没动**。
 
@@ -70,7 +70,7 @@
 
 两个窗口一前一后，让「**先给默认、再按完整上下文修正**」成为可能。本章主场是窗口②。
 
-这里有个容易被忽略的点：`current_platform` 在普通 vLLM 里是 `CudaPlatform`，但在装了 vllm-ascend 插件的进程里，它**已经被替换成了 `NPUPlatform`**。这个替换发生在更早——是 [第 2 章：entry points 与 NPUPlatform](../ch02-entry-points-and-npuplatform/narrative/chapter.md) 讲的 entry-points 注册机制干的活。所以 L1197 这一句 `current_platform.check_and_update_config(self)`，在昇腾进程里实际调到的就是下面要细看的 `NPUPlatform.check_and_update_config`。
+这里有个容易被忽略的点：`current_platform` 在普通 vLLM 里是 `CudaPlatform`，但在装了 vllm-ascend 插件的进程里，它**已经被替换成了 `NPUPlatform`**。这个替换发生在更早——是 [第 2 章：entry points 与 NPUPlatform](../../ch02-entry-points-and-npuplatform/narrative/chapter.md) 讲的 entry-points 注册机制干的活。所以 L1197 这一句 `current_platform.check_and_update_config(self)`，在昇腾进程里实际调到的就是下面要细看的 `NPUPlatform.check_and_update_config`。
 
 下面这张图把整条改写时序串起来——从 `__post_init__` 的两个窗口，到 `NPUPlatform.check_and_update_config` 内部的七步编排，再到被改写后的 config 流向后续构图。
 
@@ -683,7 +683,7 @@ mode 被改成 `NONE`、splitting_ops 被置空——平台对编译配置的改
         refresh_block_size(vllm_config)
 ```
 
-[第 2 章](../ch02-entry-points-and-npuplatform/narrative/chapter.md)曾在这里只截了一刀——讲「同一个延迟绑定招式的第四次复用」时，点到 worker_cls 是个经 config 字段改写、而非工厂钩子的例外，并约定「完整的 `check_and_update_config` 流程是第 5 章的主场」。现在我们站在这个主场里，可以把这一处看全了。
+[第 2 章](../../ch02-entry-points-and-npuplatform/narrative/chapter.md)曾在这里只截了一刀——讲「同一个延迟绑定招式的第四次复用」时，点到 worker_cls 是个经 config 字段改写、而非工厂钩子的例外，并约定「完整的 `check_and_update_config` 流程是第 5 章的主场」。现在我们站在这个主场里，可以把这一处看全了。
 
 `parallel_config.worker_cls` 是个**字符串字段**，默认值是哨兵 `"auto"`。vLLM 后续会用 `resolve_obj_by_qualname` 按这个字符串去 import 并实例化 Worker。平台在这里做的，就是把抽象的 `"auto"` 翻译成一个具体的 qualname（全限定类名）字符串：
 
@@ -707,7 +707,7 @@ NPUPlatform.check_and_update_config(cfg)
 assert cfg.parallel_config.worker_cls == "vllm_ascend.worker.worker.NPUWorker"
 ```
 
-`"auto"` 被落定成了 `vllm_ascend.worker.worker.NPUWorker`——第 2 章埋下的那个「完整流程」之约，在这一行收回。至于 `NPUWorker` 这个类本身怎么接管设备初始化与模型前向，是 [第 13 章：NPUWorker 重写执行主控](../ch13-npuworker-rewrite/narrative/chapter.md) 的主题，那时你会看到这根字符串最终被 resolve 成一个真正跑模型的对象。
+`"auto"` 被落定成了 `vllm_ascend.worker.worker.NPUWorker`——第 2 章埋下的那个「完整流程」之约，在这一行收回。至于 `NPUWorker` 这个类本身怎么接管设备初始化与模型前向，是 [第 14 章：NPUWorker 重写执行主控](../../ch13-npuworker-rewrite/narrative/chapter.md) 的主题，那时你会看到这根字符串最终被 resolve 成一个真正跑模型的对象。
 
 ---
 
@@ -736,7 +736,7 @@ assert cfg.parallel_config.worker_cls == "vllm_ascend.worker.worker.NPUWorker"
 
 它给 NPU 显存分配器设 `expandable_segments:True`（可扩展显存段，减少碎片）。三个细节：
 
-- **非 sleep-mode 才设**——sleep mode 是一种把显存「睡眠」、按需释放与唤醒的机制，有自己的一套显存管理（[第 7 章：sleep-mode 与 camem 分配器](../ch07-sleep-mode-camem-allocator/narrative/chapter.md) 的主题），和这里的可扩展显存段机制冲突，所以用 `not model_config.enable_sleep_mode` 把它让开。
+- **非 sleep-mode 才设**——sleep mode 是一种把显存「睡眠」、按需释放与唤醒的机制，有自己的一套显存管理（[第 7 章：sleep-mode 与 camem 分配器](../../ch07-sleep-mode-camem-allocator/narrative/chapter.md) 的主题），和这里的可扩展显存段机制冲突，所以用 `not model_config.enable_sleep_mode` 把它让开。
 - **追加而非覆盖**——先读现有的 `PYTORCH_NPU_ALLOC_CONF`，往上 `+=` 追加，保住用户可能已经设的别的键（注释里举了 `page_size:1g` 的例子）。
 - **互斥保护**——`expandable_segments`、`max_split_size_mb`、`garbage_collection_threshold` 这三个键都是 NPU 显存分配器的配置项、只能启用一种，所以那个 `if` 三个条件里有两个是「现有配置里没有那俩互斥键」才追加。
 
@@ -762,12 +762,12 @@ assert os.environ["PYTORCH_NPU_ALLOC_CONF"] == "max_split_size_mb:128"
 
 回头看，`check_and_update_config` 这一个方法里，藏着 vLLM 给 OOT 插件的两份馈赠，也是本章两条主线。
 
-**第一份：平台 = 配置改写器。** vLLM 把「按硬件调配置」收敛成一个 well-known 钩子，在构图前的最后一刻，把完整的 `VllmConfig` 按引用递给平台。昇腾在这一个方法里就地改写了一切——把 GPU/ROCm 专属参数系统性 cascade reset（[5.3](#53-_fix_incompatible_config系统性的-cascade-reset)）、重定向编译与 cudagraph（[5.6](#56-回到总闸改写编译与-cudagraph)）、把 `worker_cls` 从哨兵落成具体 Worker（[5.7](#57-worker_cls把-auto-落成具体-worker)）、甚至改进程环境变量（[5.8](#58-收尾把改写落到进程环境变量)）。全程没动 vLLM 一行源码。这是比 [第 4 章](../ch04-patch-engine-core-kvcache/narrative/chapter.md)的 monkey-patch（不改源码、直接重绑定别人命名空间里的名字那套接管手法）干净得多的接管——vLLM 主动把口子留好了，插件填进去就行。
+**第一份：平台 = 配置改写器。** vLLM 把「按硬件调配置」收敛成一个 well-known 钩子，在构图前的最后一刻，把完整的 `VllmConfig` 按引用递给平台。昇腾在这一个方法里就地改写了一切——把 GPU/ROCm 专属参数系统性 cascade reset（[5.3](#53-_fix_incompatible_config系统性的-cascade-reset)）、重定向编译与 cudagraph（[5.6](#56-回到总闸改写编译与-cudagraph)）、把 `worker_cls` 从哨兵落成具体 Worker（[5.7](#57-worker_cls把-auto-落成具体-worker)）、甚至改进程环境变量（[5.8](#58-收尾把改写落到进程环境变量)）。全程没动 vLLM 一行源码。这是比 [第 4 章](../../ch04-patch-engine-core-kvcache/narrative/chapter.md)的 monkey-patch（不改源码、直接重绑定别人命名空间里的名字那套接管手法）干净得多的接管——vLLM 主动把口子留好了，插件填进去就行。
 
 **第二份：无 schema 配置后门。** `additional_config` 是个开放 dict，灵活到插件爱塞什么键都行；代价是 vLLM 这侧无法校验。昇腾用 `AscendConfig` 把这个开放 dict 解析成强类型子配置，把校验责任接了过来——命名形参当事实 schema、`**kwargs` 做向前兼容、子配置就地 `assert` 自校验、三级取值给老环境变量留迁移期（[5.5](#55-ascendconfig把开放-dict-解析成强类型)）。但 `**kwargs` 那个后门的另一面始终在：**键名拼错，静默失效，没人告诉你**。灵活和失校验，是同一枚硬币的两面。
 
 而贯穿两条主线的，是一条反复出现的设计判据——**无害就 reset，会致错就 raise；自动改写让位于用户显式意图**。`vllm_ascend/platform.py` 里的 `_fix_incompatible_config` 对 GPU 专属参数 warn+reset（无害），`_validate_*` 和 `vllm_ascend/ascend_config.py` 里子配置的 `assert` 对语义冲突直接 raise（致错）；`numa_bind` 的 `setdefault`、`worker_cls` 的 `== "auto"` 守卫，都在「只在用户没明说时才自动改」。这套判据，让一个三百行的改写方法既容错又不失底线。
 
-Part I 到此收官。我们从 [entry points 与 NPUPlatform](../ch02-entry-points-and-npuplatform/narrative/chapter.md) 起步，看昇腾怎么被 vLLM 认出来；经 [两段式 monkey-patch](../ch03-two-stage-monkey-patch/narrative/chapter.md) 和 [引擎核心 patch](../ch04-patch-engine-core-kvcache/narrative/chapter.md)，看它怎么改别人的代码；到本章，看它怎么连代码都不改、只填一个配置钩子就接管。三种接管手段——认出来、改进去、填配置——合起来就是「接入机制」的全貌。
+Part I 到此收官。我们从 [entry points 与 NPUPlatform](../../ch02-entry-points-and-npuplatform/narrative/chapter.md) 起步，看昇腾怎么被 vLLM 认出来；经 [两段式 monkey-patch](../../ch03-two-stage-monkey-patch/narrative/chapter.md) 和 [引擎核心 patch](../../ch04-patch-engine-core-kvcache/narrative/chapter.md)，看它怎么改别人的代码；到本章，看它怎么连代码都不改、只填一个配置钩子就接管。三种接管手段——认出来、改进去、填配置——合起来就是「接入机制」的全貌。
 
-下一章起进 Part II「设备与显存」。第一站是[换底座的通信器](../ch06-npu-communicator/narrative/chapter.md)：本章 `worker_cls` 落定的 `NPUWorker` 要在多卡间通信，而 CUDA 的通信器在昇腾上用不了。昇腾怎么把 `CudaCommunicator` 换成 `NPUCommunicator`、怎么手写一个对位 pynccl 的 pyhccl——那是把「换底座」从配置层做到通信层的故事。
+下一章起进 Part II「设备与显存」。第一站是[换底座的通信器](../../ch06-npu-communicator/narrative/chapter.md)：本章 `worker_cls` 落定的 `NPUWorker` 要在多卡间通信，而 CUDA 的通信器在昇腾上用不了。昇腾怎么把 `CudaCommunicator` 换成 `NPUCommunicator`、怎么手写一个对位 pynccl 的 pyhccl——那是把「换底座」从配置层做到通信层的故事。
