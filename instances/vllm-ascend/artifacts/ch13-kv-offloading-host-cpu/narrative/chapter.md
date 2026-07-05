@@ -12,7 +12,7 @@
 
 整套卸载代码住在两个目录下：标准路径以 `vllm_ascend/kv_offload/npu.py` 为入口，极简路径以 `vllm_ascend/simple_kv_offload/worker.py` 为入口。两条路径有意思的地方在于——它们几乎不重写卸载的「大脑」，只换掉真正碰硬件的那一小段搬运原语。这是 vllm-ascend「最小覆写」插件哲学在卸载子系统的又一次现身。
 
-## 12.1 三件事的边界：搬去哪、省什么、跨不跨节点
+## 13.1 三件事的边界：搬去哪、省什么、跨不跨节点
 
 先把三章摆在一起。它们都在做同一件粗事——**把 KV 从 HBM 里挪走**——但目的、拓扑、省的资源各不相同。
 
@@ -28,9 +28,9 @@
 
 > **卸载 = device↔host 分层搬运，省的是显存，不是重算、也不是跨节点搬运。**
 
-记住这句，下面所有代码都是在把它做实。顺带点一个旁路：权重预取 `NPUPrefetchOffloader`（`vllm_ascend/model_executor/offloader/prefetch.py`）也是一次 device↔host 搬运——只不过搬的是模型权重而非 KV。它和本章同源，但不在本章展开，[§12.10](#1210-两条路径收口同一个昇腾算子) 收尾时再点一句。
+记住这句，下面所有代码都是在把它做实。顺带点一个旁路：权重预取 `NPUPrefetchOffloader`（`vllm_ascend/model_executor/offloader/prefetch.py`）也是一次 device↔host 搬运——只不过搬的是模型权重而非 KV。它和本章同源，但不在本章展开，[§13.10](#1310-两条路径收口同一个昇腾算子) 收尾时再点一句。
 
-## 12.2 标准路径的接入点：只新写 Handler，Manager 直接复用
+## 13.2 标准路径的接入点：只新写 Handler，Manager 直接复用
 
 先看标准路径。它要接进 vLLM 既有的卸载框架 `vllm.v1.kv_offload`。这个框架把卸载拆成两半：
 
@@ -99,7 +99,7 @@ class NPUOffloadingSpec(OffloadingSpec):
 
 三个细节要点透：
 
-**`get_manager` 返回的是基座类，不是昇腾类。** `CPUOffloadingManager` 来自 `vllm.v1.kv_offload.cpu.manager`，原样复用。它要的参数里 `block_size = gpu_block_size * self.block_size_factor`——也就是说，**CPU 侧的 block 比 GPU 侧大**（大 `block_size_factor` 倍）。这个比例是后面所有粒度换算的源头，[§12.4](#124-粒度换算expand_block_ids-与-block_size_factor) 专门讲。`enable_events` 只是把 KV-cache-event 上报的开关透传给基座 Manager，与搬运机制无关。
+**`get_manager` 返回的是基座类，不是昇腾类。** `CPUOffloadingManager` 来自 `vllm.v1.kv_offload.cpu.manager`，原样复用。它要的参数里 `block_size = gpu_block_size * self.block_size_factor`——也就是说，**CPU 侧的 block 比 GPU 侧大**（大 `block_size_factor` 倍）。这个比例是后面所有粒度换算的源头，[§13.4](#134-粒度换算expand_block_ids-与-block_size_factor) 专门讲。`enable_events` 只是把 KV-cache-event 上报的开关透传给基座 Manager，与搬运机制无关。
 
 **`get_handlers` 把同一个 handler 注册了两次。** 末尾两行 `yield` 是关键：
 
@@ -125,7 +125,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 
 **`num_cpu_blocks` 必须显式给定。** `__init__` 一开头就检查：拿不到 `num_cpu_blocks` 直接抛异常。它决定 CPU 侧能容纳多少 block，是卸载的容量上限，必须经 `kv_connector_extra_config` 配进来。
 
-## 12.3 搬运执行体的家底：两条流、两个 deque、一池 Event
+## 13.3 搬运执行体的家底：两条流、两个 deque、一池 Event
 
 `CpuNpuOffloadingHandler` 是标准路径的主角。它实现基座 `OffloadingHandler` 的三个原语：`transfer_async`（提交一次搬运）、`get_finished`（轮询哪些完成了）、`wait`（阻塞等某些 job）。先看它的 `__init__` 摆开的家底：
 
@@ -222,7 +222,7 @@ class CpuNpuOffloadingHandler(OffloadingHandler):
 
 这里把每层的 `(key, value)` **拍平**成一串独立子张量 `[layer0_key, layer0_value, layer1_key, layer1_value, …]`，对每个子张量记下三件事：NPU 侧基址、CPU 侧基址、每个 block 的字节数（`stride(0) * element_size()`）。这三个 numpy 数组是后面拼批量搬运指针的原料。为什么要拍平成「子张量列表」？因为最终的搬运算子吃的是一串平铺的 `(src, dst, size)` 三元组，一次把所有层、所有 K/V 全搬掉——拍平就是为了这次批量。
 
-## 12.4 粒度换算：expand_block_ids 与 block_size_factor
+## 13.4 粒度换算：expand_block_ids 与 block_size_factor
 
 上一节埋了个伏笔：CPU block 比 GPU block 大 `block_size_factor` 倍。搬运时给的 block id 是**粗粒度**的 CPU block 编号，但实际要搬的是**细粒度**的 GPU sub-block。`expand_block_ids` 就是这个粗→细的展开器：
 
@@ -276,7 +276,7 @@ def expand_block_ids(
 
 `skip_count` 处理一个边界情况：当被搬的 sub-block 数**不是 `factor` 整数倍**时，目标 CPU block 的第一个 slot 可能已被占（这是个「部分块」），新数据得从该 block 的第 `skip_count` 个 slot 起填。怎么算 skip 数，下一节在 `transfer_async` 里看。
 
-## 12.5 分层搬运的节拍：transfer_async
+## 13.5 分层搬运的节拍：transfer_async
 
 到了标准路径的心脏。`transfer_async` 把一次搬运请求翻译成「判方向 → 展开 block id → 拼指针 → 流序编排+发算子」四步。逐段拆。
 
@@ -423,7 +423,7 @@ $$
 
 **为什么这套节拍省墙钟（wall-clock）。** 搬运挂在 `d2h_stream` 上，不占默认 compute stream。所以「把这批 KV 卸到 host」和「下一步 forward」可以在两条流上**重叠**跑——HBM 的释放和后续计算并行，而不是串行等搬运结束。这是「异步分层搬运」相比「同步搬运」省时间的根本来源。代价只是一次额外搬运的延迟，而它被重叠摊薄了。
 
-## 12.6 发了不等：get_finished 的 FIFO 轮询与 wait
+## 13.6 发了不等：get_finished 的 FIFO 轮询与 wait
 
 `transfer_async` 提交即返回，那谁来收尾？`get_finished` 每拍被主循环调一次，**非阻塞**地探测哪些搬运完成了：
 
@@ -479,7 +479,7 @@ $$
 
 到这里标准路径就齐了：Spec 接入 → Handler 持家 → expand 换粒度 → transfer_async 打节拍 → get_finished 收尾。下面换一条更轻的路径。
 
-## 12.7 极简路径：最小覆写的 SimpleCPUOffloadNPUWorker
+## 13.7 极简路径：最小覆写的 SimpleCPUOffloadNPUWorker
 
 vLLM 还有一套更简单的卸载框架 `vllm.v1.simple_kv_offload`——没有粗细粒度换算（CPU/NPU block 1:1 同粒度），就是「把 block 原样搬上搬下」。昇腾对它的接入更是「最小覆写」的极致：整个 worker 只覆写**两个**方法，其余全继承。
 
@@ -507,7 +507,7 @@ class SimpleCPUOffloadNPUWorker(SimpleCPUOffloadWorker):
 
 ![极简路径数据通路：注册期重建视图，运行期 launch_copy → 队列 → 后台线程 → swap_blocks_batch → Event 轮询](../diagrams/simple-pathway.png)
 
-> *图注：上半注册期 register_kv_caches 的链条——拍平 (K,V)、按 storage 去重、重建 [num_blocks, block_bytes] 视图、分配 pinned 镜像、init 后端。下半运行期——launch_copy 投进 FIFO 队列，后台线程取出在专用流上 copy_blocks，record Event 进 events_list，主线程无阻塞轮询。黄框只点题——完整的字节账与专图见 §12.8。*
+> *图注：上半注册期 register_kv_caches 的链条——拍平 (K,V)、按 storage 去重、重建 [num_blocks, block_bytes] 视图、分配 pinned 镜像、init 后端。下半运行期——launch_copy 投进 FIFO 队列，后台线程取出在专用流上 copy_blocks，record Event 进 events_list，主线程无阻塞轮询。黄框只点题——完整的字节账与专图见 §13.8。*
 
 `register_kv_caches` 要绕开 NPU 的两个「现实」，逐段看：
 
@@ -620,7 +620,7 @@ def _flatten_kv_value(
 
 其二，stream 优先级。基座用 `Stream.priority_range()` 拿最低优先级，让 KV I/O 给 compute 让路。`torch.npu` 不暴露这个 API（调了会 `RuntimeError`），所以昇腾只能用普通 stream。丢的只是「始终让路」这个**软调度提示**——搬运仍挂在独立流上、仍和 forward 重叠，不影响正确性。
 
-## 12.8 为什么卸载要重建 block view
+## 13.8 为什么卸载要重建 block view
 
 `register_kv_caches` 里那句 `self._build_block_views(...)` 是极简路径最该讲透的细节。**现实二**就在这里：NPU 上 KV 张量的物理布局，不能直接拿来当 block 网格用。
 
@@ -720,7 +720,7 @@ def _flatten_kv_value(
 
 > *图注：单段 (4,4) 与多段 (2,6,4) K｜V 堆叠布局不同，但重建都把它们规约成 [num_blocks=4, block_bytes=8] 的 int8 视图（多段拆成 seg0/seg1 两个，seg1 从第 48 字节起、total_bytes=80B）；批量搬运算子只认这一种统一二维视图——重建就是这道归一。*
 
-## 12.9 DMA 拷贝调度：一个队列、一条线程、一串 Event
+## 13.9 DMA 拷贝调度：一个队列、一条线程、一串 Event
 
 `register_kv_caches` 最后 `self._backend.init(...)` 把搬运后端启起来。`NPUDmaCopyBackend` 是极简路径的搬运执行体，结构是经典的「生产者-消费者」：一个 FIFO 队列、一条后台守护线程。
 
@@ -850,7 +850,7 @@ def copy_blocks(
 
 和标准路径 `transfer_async` 第三步的指针算术**一模一样**：`base + block_id * bytes_per_block`，numpy 广播成 `(num_sub_tensors, n)` 再拍平。唯一的区别——这里 `src_block_ids` 和 `dst_block_ids` 是直接传入的，**没有 expand**，因为极简路径 CPU/NPU block 是 1:1 同粒度，不需要粗细换算。方向码来自预建的 `params.direction`（`DIRECTION_H2D = 0` / `DIRECTION_D2H = 1`），与 C++ 绑定算子约定一致。
 
-## 12.10 两条路径收口同一个昇腾算子
+## 13.10 两条路径收口同一个昇腾算子
 
 走到底，你会发现两条路径殊途同归。无论是标准路径的 `transfer_async`（`vllm_ascend/kv_offload/cpu_npu.py:L217`），还是极简路径的 `copy_blocks`（`vllm_ascend/simple_kv_offload/npu_mem_ops.py:L99`），最终那行都是：
 
@@ -861,9 +861,9 @@ torch.ops._C_ascend.swap_blocks_batch(batch_src, batch_dst, batch_sizes, directi
 
 这是昇腾自带的批量搬运算子（底层 `aclrtMemcpyBatchAsync`），吃四个参数：源地址数组、目标地址数组、每段字节数组、方向码。指针布局约定也一致——都是 `(num_sub_tensors, n)` 拍平、每元素 `= base_ptr + block_id * bytes_per_block`。这就是「只换碰硬件的那一小段」的字面意思：上面所有的记账、粒度换算、流序编排、视图重建，都是 Python；真正搬字节的，是这**一个** C++ 算子。两条路径、两套框架，收口到同一个点。
 
-回到 [§12.1](#121-三件事的边界搬去哪省什么跨不跨节点) 点名的那个旁路：权重预取 `NPUPrefetchOffloader`。它和本章卸载**同源**——也是一次 device↔host 搬运，也用独立的 `torch.npu.Stream` 把搬运和计算重叠。区别只在搬的是模型权重而非 KV、方向以预取（host→device）为主。机制同根，目的不同，这里点到为止。
+回到 [§13.1](#131-三件事的边界搬去哪省什么跨不跨节点) 点名的那个旁路：权重预取 `NPUPrefetchOffloader`。它和本章卸载**同源**——也是一次 device↔host 搬运，也用独立的 `torch.npu.Stream` 把搬运和计算重叠。区别只在搬的是模型权重而非 KV、方向以预取（host→device）为主。机制同根，目的不同，这里点到为止。
 
-## 12.11 量化与小结
+## 13.11 量化与小结
 
 把这一章的几个数字落实，别停在定性：
 
@@ -871,7 +871,7 @@ torch.ops._C_ascend.swap_blocks_batch(batch_src, batch_dst, batch_sizes, directi
 
 **pinned 内存换带宽。** CPU 镜像用 `pin_memory=True` 分配，让 DMA 走零拷贝路径——host↔device 实测带宽显著高于非 pinned（后者要先经一次 host 内的暂存拷贝）。这是卸载吞吐的底盘。
 
-**卸载省 HBM 的代价被异步摊薄。** 卸载省的是显存：把暂时用不到的 block 下沉 host，HBM 就能装下更长上下文 / 更大 batch。代价是 host 带宽 + 一次额外搬运延迟。但那次延迟挂在独立流上、和下一步 forward 重叠，墙钟上几乎被吃掉——这正是 §12.5 的节拍设计要换来的东西。
+**卸载省 HBM 的代价被异步摊薄。** 卸载省的是显存：把暂时用不到的 block 下沉 host，HBM 就能装下更长上下文 / 更大 batch。代价是 host 带宽 + 一次额外搬运延迟。但那次延迟挂在独立流上、和下一步 forward 重叠，墙钟上几乎被吃掉——这正是 §13.5 的节拍设计要换来的东西。
 
 这一章把昇腾 KV 卸载的两条路径整个拆开了：
 

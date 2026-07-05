@@ -15,7 +15,7 @@
 
 这两件事是本章的重点。我们先把主干七步顺一遍，再回头把这两个接缝逐个掰开。
 
-## 15.1 一拍前向的主干七步
+## 16.1 一拍前向的主干七步
 
 `execute_model` 这个方法本体有四百多行，但**去掉横切分支后，主干非常清爽**——就是把七个步骤串成一条线。先看全景：
 
@@ -61,7 +61,7 @@ num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
 往后，主干还有四步：建注意力元数据、预处理、`set_ascend_forward_context` 包住的前向、采样。我们按顺序拆。先看输入整形。
 
-## 15.2 _prepare_inputs：把零散请求拍成连续张量
+## 16.2 _prepare_inputs：把零散请求拍成连续张量
 
 调度器递来的 `scheduler_output` 是「逻辑」的——它说「请求 A 这拍要算第 100–115 这 16 个位置，请求 B 要算第 50 这 1 个位置」。但 NPU 上的算子吃的是**一根连续的张量**。`_prepare_inputs` 干的就是这个翻译活：把各请求要算的 token，按调度顺序铺平成 `input_ids` / `positions`，再算出从哪里取 logits。
 
@@ -88,7 +88,7 @@ if not use_spec_decode:
 
 整形完，`input_ids` / `positions` / `logits_indices` 三件套就备齐了。下一站，是进图前那场必须先办的「就位仪式」。
 
-## 15.3 DP 跨卡同步：进同一张图前的就位仪式
+## 16.3 DP 跨卡同步：进同一张图前的就位仪式
 
 先说清**为什么非同步不可**，否则后面那个打包技巧会看得莫名其妙。
 
@@ -225,7 +225,7 @@ if not is_context_moe_model:
 
 还有那个 `dp_allreduce_on_npu` 开关，值得记一句。注释写明：某些设备上 **CPU 侧的 all_reduce 可能返回脏数据**。开启这个开关后，DP 元数据同步改走 NPU device group，规避数据损坏——代价是结果要多一次 `.cpu()` 拷回 host。这是昇腾踩过坑后留下的一道保险。
 
-## 15.4 同步回来之后：用一致的结论重新 dispatch
+## 16.4 同步回来之后：用一致的结论重新 dispatch
 
 同步只是拿到了「全 DP 一致的 token 数和模式」。这两个量还得**回灌**到本卡的执行决策里去——这是在 `_determine_batch_execution_and_padding` 里收尾的：
 
@@ -261,7 +261,7 @@ if self.vllm_config.parallel_config.data_parallel_size > 1:
 
 到这里，「这一拍怎么跑」彻底定了：token 补到几、进不进图、进哪种图。中间还有一步 `_build_attention_metadata` 建注意力元数据——它产出 `attn_metadata` 交给前向，但「该用哪个后端」的选择机制是 [第 19 章](../../ch19-attention-backend-selection/narrative/chapter.md) 的主角，而 MHA / MLA 的真实算子分别留到后面的第 19、20 章，本章只用到「建好了、能交给前向」这个接口语义。接下来就是全章的题眼——前向那层 `with` 包裹。
 
-## 15.5 昇腾 forward context：包住基座，再注入
+## 16.5 昇腾 forward context：包住基座，再注入
 
 前向真正发生在一个 `with` 块里。先看这个块长什么样：
 
@@ -402,7 +402,7 @@ def set_ascend_forward_context(
             pass
 ```
 
-（其中 `select_moe_comm_method` 按本拍 token 数、并行规模、芯片代次选定 MoE 通信方式，是一整棵决策树——详见 [§15.6 的决策树](#156-select_moe_comm_method每拍前向前先把通信方式定下来)，这里先按「它会返回一种通信类型」往下读。）
+（其中 `select_moe_comm_method` 按本拍 token 数、并行规模、芯片代次选定 MoE 通信方式，是一整棵决策树——详见 [§16.6 的决策树](#166-select_moe_comm_method每拍前向前先把通信方式定下来)，这里先按「它会返回一种通信类型」往下读。）
 
 整个函数的骨架，就两句话能概括——**先包，再注入**：
 
@@ -443,7 +443,7 @@ if (
     )
 ```
 
-留意那个 `if num_tokens_across_dp is None`——**基座原本会在这里自己做一次 DP 协调**（`coordinate_batch_across_dp` 里也藏着 all_reduce）。但回看本节开头 `set_ascend_forward_context` 那层 `with`：昇腾把 `num_tokens_across_dp` 当参数**传了进来**，而它早在 [§15.3](#153-dp-跨卡同步进同一张图前的就位仪式) 的 `_sync_metadata_across_dp` 里就算好了。所以这个 `if` 分支**根本不会进**——基座不再重复协调，只是拿昇腾算好的结果 `DPMetadata.make` 成元数据。两章在这里接上了头：昇腾把 DP 同步提到前面自己做（因为还要捎带 cudagraph_mode），基座这步就被它「短路」了。
+留意那个 `if num_tokens_across_dp is None`——**基座原本会在这里自己做一次 DP 协调**（`coordinate_batch_across_dp` 里也藏着 all_reduce）。但回看本节开头 `set_ascend_forward_context` 那层 `with`：昇腾把 `num_tokens_across_dp` 当参数**传了进来**，而它早在 [§16.3](#163-dp-跨卡同步进同一张图前的就位仪式) 的 `_sync_metadata_across_dp` 里就算好了。所以这个 `if` 分支**根本不会进**——基座不再重复协调，只是拿昇腾算好的结果 `DPMetadata.make` 成元数据。两章在这里接上了头：昇腾把 DP 同步提到前面自己做（因为还要捎带 cudagraph_mode），基座这步就被它「短路」了。
 
 第二段，是平台插件的挂钩口：
 
@@ -477,7 +477,7 @@ additional_kwargs = current_platform.set_additional_forward_context(
 
 挂进去的字段不少，挑本章主线相关的几个说透：
 
-- **moe_comm_type / moe_comm_method**：本拍 MoE 用哪种通信原语。`select_moe_comm_method` 选出类型，`get_moe_comm_method` 据此取出对应的方法实例。[下一节](#156-select_moe_comm_method每拍前向前先把通信方式定下来)专讲。
+- **moe_comm_type / moe_comm_method**：本拍 MoE 用哪种通信原语。`select_moe_comm_method` 选出类型，`get_moe_comm_method` 据此取出对应的方法实例。[下一节](#166-select_moe_comm_method每拍前向前先把通信方式定下来)专讲。
 - **flash_comm_v1_enabled / flashcomm_v2_enabled**：是否启用序列并行（SP）。flashcomm 是昇腾为序列并行设计的通信原语，把 token 沿序列维切分到多卡，v1/v2 是两个不同版本。注意 v1 对非 MoE 模型带一个 `num_tokens > 1000` 的经验阈值——并发高时切换 SP 收益最大，并发低时切换反而劣化，所以低于阈值就不开。MoE 模型不设阈值、draft 模型直接关。
 - **mmrs_fusion**：mm_reduce_scatter 融合，仅当 `tp_world_size`（TP = Tensor Parallel 张量并行，把大张量切分到多卡，`tp_world_size` 即参与张量并行的卡数）`<= 8` 且非 MoE 时开（注释挂着 TODO：等算子支持 tp≥16 再放开）。
 - **padded_num_tokens / mc2_mask**：MC2 通信要把 token 数补齐到规整形状，并用一张掩码标出哪些是真 token、哪些是 padding。
@@ -494,7 +494,7 @@ $$
 
 注入选好的 `moe_comm_type`，得先有人去选。那个「选」的决策，就在下一节。
 
-## 15.6 select_moe_comm_method：每拍前向前，先把通信方式定下来
+## 16.6 select_moe_comm_method：每拍前向前，先把通信方式定下来
 
 注意 `moe_comm_type` 是在**进 `with` 体后、跑前向前**算的——也就是说，**每一拍前向，都会先重选一次通信方式**。为什么不在 MoE 层内部现算？因为通信方式取决于本拍的 token 数、EP/DP 规模、芯片代次——**这些在整个 batch 内是一致的**。前置算一次写进上下文，所有 MoE 层共用，既省掉逐层重复决策，又保证全 batch 用同一种通信，不会东一榔头西一棒子。
 
@@ -550,7 +550,7 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
     return moe_comm_type
 ```
 
-先认一下这四种通信方式（这里只点机制，落地实现与性能权衡留 [第 30 章](../../ch26-moe-communication-primitives/narrative/chapter.md)）：
+先认一下这四种通信方式（这里只点机制，落地实现与性能权衡留 [第 30 章](../../ch30-fusedmoe-batch-invariant/narrative/chapter.md)）：
 
 - **ALLGATHER**：每张卡把本地 token 用 all-gather 发给所有卡，各卡拿到全量再各算各的专家。
 - **ALLTOALL**：卡间点到点重排，把每个 token 按路由结果送到它的目标专家所在的卡。
@@ -572,9 +572,9 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
 
 三个因素一目了然：**是否 MoE+是否 EP**（要不要通信）、**芯片代次**（A2/A3/310P/A5 各有所长）、**token 数对比 `mc2_tokens_capacity`**（小 batch 偏 MC2、大 batch 偏 all_to_all）。`mc2_tokens_capacity` 这个分水岭很关键——MC2 在 token 少时延迟低，但 token 一多就不划算，所以超过容量就切到 all_to_all。
 
-选出来的 `MoECommType`（`ALLGATHER` / `MC2` / `ALLTOALL` / `FUSED_MC2` 之一）写进 `forward_context.moe_comm_type`，`get_moe_comm_method` 再据此取出对应的通信方法实例挂上去。**至于这些原语各自怎么实现——MC2 的 dispatch/combine、all_to_all 的 token 重排——那是 [第 30 章](../../ch26-moe-communication-primitives/narrative/chapter.md) 的内容。本章只讲到「这一拍选定了哪种、写进了上下文」为止。**
+选出来的 `MoECommType`（`ALLGATHER` / `MC2` / `ALLTOALL` / `FUSED_MC2` 之一）写进 `forward_context.moe_comm_type`，`get_moe_comm_method` 再据此取出对应的通信方法实例挂上去。**至于这些原语各自怎么实现——MC2 的 dispatch/combine、all_to_all 的 token 重排——那是 [第 30 章](../../ch30-fusedmoe-batch-invariant/narrative/chapter.md) 的内容。本章只讲到「这一拍选定了哪种、写进了上下文」为止。**
 
-## 15.7 跑前向、采 token：主干的最后两步
+## 16.7 跑前向、采 token：主干的最后两步
 
 上下文备好，`_model_forward` 就在这个加料过的上下文里真正跑模型：
 
@@ -621,7 +621,7 @@ def _model_forward(
 
 主体就是 `run_model()` 跑一遍 `self.model`。中间那个 `enable_enpu` 分支只是个执行顺序的小适配——ENPU 是昇腾的软切分（soft segmentation）模式，开启时注释要求「先 `event.record` 再 `event.wait`」，所以把事件记录提到了跑模型之前，否则维持「先跑、后记录」。真正的看点是最后那个 `if`——它**回应了上一节注入的 `flash_comm_v1_enabled`**。如果这拍开了 flashcomm v1（序列并行），前向时 token 被沿序列维切到各卡了，出来的 `hidden_states` 是分片的；这里就用 `_all_gather_hidden_states_and_aux` 把分片 all_gather 拼回完整张量——SP 切分的逆操作。**注入的字段，在这里被消费了**：上下文不是写完就摆着看的，它实打实地改变了前向的行为。
 
-拿到 `hidden_states`，主干就剩采样。前向后会用 `logits_indices`（§15.2 那张取址表）抽出要采样的位置、算出 logits，最后派给 `_sample`：
+拿到 `hidden_states`，主干就剩采样。前向后会用 `logits_indices`（§16.2 那张取址表）抽出要采样的位置、算出 logits，最后派给 `_sample`：
 
 ```python
 # vllm_ascend/worker/model_runner_v1.py:L2553-L2579
@@ -654,11 +654,11 @@ def _sample(self, logits, spec_decode_metadata):
 
 至此，一拍前向走完：调度器的输出 → 整形成张量 → DP 对齐 → 建注意力元数据 → 包上昇腾上下文跑前向 → 采出下一个 token。
 
-## 15.8 精简版交叉验证：把决策跑起来看数值
+## 16.8 精简版交叉验证：把决策跑起来看数值
 
 昇腾的真实前向算子、真实 `all_reduce`、MC2 通信，在没有 NPU/CANN 的机器上跑不起来。但本章三个**决策**部分是纯 Python——`select_moe_comm_method` 选通信方式、`set_ascend_forward_context` 注入字段、`_sync_metadata_across_dp` 打包同步，逻辑都不碰算子。所以可以把它们单独拎出来跑，验证控制流没讲错。
 
-把 §15.3 那两拍的同步喂进去，看 `_sync_metadata_across_dp` 的解包是否真如表所示：rank 0 填 `(40, FULL)`、rank 1 填 `(24, NONE)`，模拟 sum-allreduce 后——`num_tokens_across_dp` 应得 `[40, 24]`，`max` 取 40；`cudagraph_mode` 经 `_post_process_cudagraph_mode` 取 min，应得 `NONE`。两卡就此对齐到「padding 到 40、一起 eager」，和我们在 §15.3 推的完全一致。`select_moe_comm_method` 也一样：把 token 数从「小于容量」调到「大于容量」，看 A3 芯片下返回值从 `MC2` 翻成 `ALLTOALL`——分水岭就在 `mc2_tokens_capacity` 那一刀。
+把 §16.3 那两拍的同步喂进去，看 `_sync_metadata_across_dp` 的解包是否真如表所示：rank 0 填 `(40, FULL)`、rank 1 填 `(24, NONE)`，模拟 sum-allreduce 后——`num_tokens_across_dp` 应得 `[40, 24]`，`max` 取 40；`cudagraph_mode` 经 `_post_process_cudagraph_mode` 取 min，应得 `NONE`。两卡就此对齐到「padding 到 40、一起 eager」，和我们在 §16.3 推的完全一致。`select_moe_comm_method` 也一样：把 token 数从「小于容量」调到「大于容量」，看 A3 芯片下返回值从 `MC2` 翻成 `ALLTOALL`——分水岭就在 `mc2_tokens_capacity` 那一刀。
 
 数值对得上，说明这条主干的**决策骨架**是忠实的。至于算子真跑出来的隐藏态、真 all_reduce 的字节流，那要上 NPU 才看得到——精简版的职责到「控制流跑通、数值对得上」为止，它从来不是主角，真实源码才是。
 
@@ -666,9 +666,9 @@ def _sample(self, logits, spec_decode_metadata):
 
 回到开篇。台子搭好不算数，转一圈才知道数据怎么流。这一章把一次 `execute_model` 拆成了七步主干，重点掰开了昇腾插进去的两个接缝：
 
-- **DP 跨卡同步**（§15.3，`vllm_ascend/worker/model_runner_v1.py:L627`）：进同一张图前，DP 各卡必须就 token 数和图模式达成一致。昇腾比基座多同步一个 cudagraph_mode，用 `[2, dp_size]` 零张量 + 各填己列 + 一次 sum-allreduce 把两个量一起汇齐——多同步一个量，不多花一次集合通信。token 取 max 做 padding，模式取 min 保守对齐（任一 NONE 则全 NONE）。还能改走 NPU group 规避 CPU 脏数据。
-- **昇腾 forward context 注入**（§15.5–15.6，`vllm_ascend/ascend_forward_context.py:L56`）：不改 vLLM（`vllm/forward_context.py`）一行，用 `with set_forward_context(...)` 包住基座，再往同一个上下文对象上挂昇腾专属字段。每拍前向前用 `select_moe_comm_method` 按芯片代次、EP/DP 规模、token 数选好 MoE 通信方式，连同 flashcomm 开关、mc2_mask、padding 量一起注入——模型各层 forward 时就地取用，`_model_forward` 里的 flashcomm 回收就是对注入字段的消费。
+- **DP 跨卡同步**（§16.3，`vllm_ascend/worker/model_runner_v1.py:L627`）：进同一张图前，DP 各卡必须就 token 数和图模式达成一致。昇腾比基座多同步一个 cudagraph_mode，用 `[2, dp_size]` 零张量 + 各填己列 + 一次 sum-allreduce 把两个量一起汇齐——多同步一个量，不多花一次集合通信。token 取 max 做 padding，模式取 min 保守对齐（任一 NONE 则全 NONE）。还能改走 NPU group 规避 CPU 脏数据。
+- **昇腾 forward context 注入**（§16.5–15.6，`vllm_ascend/ascend_forward_context.py:L56`）：不改 vLLM（`vllm/forward_context.py`）一行，用 `with set_forward_context(...)` 包住基座，再往同一个上下文对象上挂昇腾专属字段。每拍前向前用 `select_moe_comm_method` 按芯片代次、EP/DP 规模、token 数选好 MoE 通信方式，连同 flashcomm 开关、mc2_mask、padding 量一起注入——模型各层 forward 时就地取用，`_model_forward` 里的 flashcomm 回收就是对注入字段的消费。
 
 两个接缝都体现了同一种插件哲学：**不动上游，包一层、注一手，让昇腾的并行决策随前向一路流下去。**
 
-这一拍里，我们三次「点到为止」，给后面三章留了引子。注意力元数据建好了，但「该选哪个注意力后端」的机制是 [第 19 章](../../ch19-attention-backend-selection/narrative/chapter.md) 的事，MHA / MLA 的真实算子则留到第五部分注意力后端各章（第 19、20 章）；MoE 通信方式选定了，但 MC2 / all_to_all 这些原语怎么落地，是 [第 30 章](../../ch26-moe-communication-primitives/narrative/chapter.md) 的主场；logits 派给了采样器，采样器内部留给后续的采样章。台子转起来了，下一章我们就钻进注意力，看 `attn_metadata` 背后那些真正碰 NPU 的算子。
+这一拍里，我们三次「点到为止」，给后面三章留了引子。注意力元数据建好了，但「该选哪个注意力后端」的机制是 [第 19 章](../../ch19-attention-backend-selection/narrative/chapter.md) 的事，MHA / MLA 的真实算子则留到第五部分注意力后端各章（第 19、20 章）；MoE 通信方式选定了，但 MC2 / all_to_all 这些原语怎么落地，是 [第 30 章](../../ch30-fusedmoe-batch-invariant/narrative/chapter.md) 的主场；logits 派给了采样器，采样器内部留给后续的采样章。台子转起来了，下一章我们就钻进注意力，看 `attn_metadata` 背后那些真正碰 NPU 的算子。

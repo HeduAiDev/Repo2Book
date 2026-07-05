@@ -3,9 +3,9 @@
 ![全书地图与本章位置](../diagrams/roadmap.png)
 
 > 你在这里：全书第七部分「量化 / 采样 / 投机 / 模型」的原理深潜。
-> 上一站 [第 35 章](../../ch35-speculative-decode-npu/narrative/chapter.md) 讲了昇腾怎么把投机解码接进 proposer 工厂。
+> 上一站 [第 33 章](../../ch33-sampling-npu-adaptation/narrative/chapter.md) 讲了昇腾采样器，含投机的验证侧拒绝采样。
 > 这一章补齐它背后的数学：拒绝采样为什么不改分布、加速比从哪来。
-> 下一站回到工程，继续昇腾采样与模型接管的落地。
+> 下一站 [第 35 章](../../ch35-speculative-decode-npu/narrative/chapter.md) 回到工程，看提议侧 proposer 怎么落地。
 
 投机解码有一句听起来像魔法的承诺：**用小模型抢跑、大模型并行验证，能几倍加速，而输出分布分毫不差。**「更快」好理解，「分毫不差」才是它凭什么敢在生产里默认开启的底气——它不是近似，是**数学上可证的无偏加速**。
 
@@ -485,4 +485,4 @@ $$
 
 ---
 
-**这一章我们做了什么**：从自回归的串行瓶颈出发，完整证明了投机采样的保分布定理（接受 $\min(p,q)$ + 残差 $p-\min(p,q)=p$，与 $q$ 无关），用玩具分布把每一步的数字口算兼蒙特卡洛验了一遍，代入实测 $\alpha$ 算出加速比并复现了论文 Table 1，最后把这些公式一条条对到昇腾栈的 MTP 模块（Eq.21-23）与拒绝采样器（接受判定 + 残差重采样）的真实源码上。理论到此闭环，工程接管交回 [第 33 章](../../ch33-sampling-npu-adaptation/narrative/chapter.md) 与 [第 35 章](../../ch35-speculative-decode-npu/narrative/chapter.md)。
+**这一章我们做了什么**：从自回归的串行瓶颈出发，完整证明了投机采样的保分布定理（接受 $\min(p,q)$ + 残差 $p-\min(p,q)=p$，与 $q$ 无关），用玩具分布把每一步的数字口算兼蒙特卡洛验了一遍，代入实测 $\alpha$ 算出加速比并复现了论文 Table 1，最后把这些公式一条条对到昇腾栈的 MTP 模块（Eq.21-23）与拒绝采样器（接受判定 + 残差重采样）的真实源码上。理论到此闭环。工程侧的落地——验证侧的采样器怎么实现（[第 33 章](../../ch33-sampling-npu-adaptation/narrative/chapter.md)已讲）、提议侧怎么产出那串草稿 token——交给下一章 [第 35 章](../../ch35-speculative-decode-npu/narrative/chapter.md)。

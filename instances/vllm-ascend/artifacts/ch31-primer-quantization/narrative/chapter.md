@@ -1,15 +1,15 @@
-# 【原理篇 P8·论文精读】量化数学：从 scale/zero-point 到 GPTQ、AWQ、SmoothQuant
+# 【原理篇·论文精读】量化数学：从 scale/zero-point 到 GPTQ、AWQ、SmoothQuant
 
 ![全书路线图：你在这里](../diagrams/roadmap.png)
 
-> 你在这里：第 VII 部分「量化/采样/投机/模型」的原理夹层。
-> 上一站：[第 32 章](../../ch32-ascend-quantization-framework/narrative/chapter.md)搭好了昇腾的量化框架骨架。
-> 这一章：补上那套框架消费的三篇论文的数学。
-> 下一站：回到落地代码，看量化权重怎么被加载执行。
+> 你在这里：第 VII 部分「量化 / 采样 / 投机 / 模型」的开篇，先打原理地基。
+> 上一站：[第 30 章](../../ch30-fusedmoe-batch-invariant/narrative/chapter.md)拆完 FusedMoE，收官算子与编译篇。
+> 这一章：补上量化框架将要消费的三篇论文的数学。
+> 下一站：[第 32 章](../../ch32-ascend-quantization-framework/narrative/chapter.md)看这套数学怎么接进 vLLM 框架、加载执行。
 
-第 32 章带你读完了 `vllm_ascend/quantization` 这套框架的**工程骨架**：`QuantType`（量化类型枚举）怎么分族、`AscendLinearScheme`（所有 linear 量化方案的抽象基类）怎么按粒度注册参数、W8A8 和 W4A16 各自的 `apply` 怎么走。但那一章有一处刻意留白——框架**消费**的那些量化权重和 scale，到底是怎么算出来的？为什么权重能压到 4 bit 还不塌？为什么激活量化比权重量化难得多？这些数学，第 32 章当成了黑盒。
+下一章会带你读 `vllm_ascend/quantization` 这套框架的**工程骨架**：`QuantType`（量化类型枚举）怎么分族、`AscendLinearScheme`（所有 linear 量化方案的抽象基类）怎么按粒度注册参数、W8A8 和 W4A16 各自的 `apply` 怎么走。但那套框架**消费**的量化权重和 scale，到底是怎么算出来的？为什么权重能压到 4 bit 还不塌？为什么激活量化比权重量化难得多？这些数学，得先在本章打好——不然那套框架里的每一个参数张量都是天书。
 
-这一章就把这个黑盒撬开。这里的 W8A8（权重 8 bit、激活 8 bit）、W4A16（权重 4 bit、激活 16 bit）不是昇腾发明的记号——它们背后站着三篇奠基论文：**SmoothQuant**（arXiv:2211.10438）、**GPTQ**（arXiv:2210.17323）、**AWQ**（arXiv:2306.00978）。昇腾的量化框架是 vLLM 基座量化栈的**昇腾特化顶替**（out-of-tree 后端把 GEMM 换成昇腾 INT8 算子），但它加载的权重格式、scale 语义，全都源自这三篇论文的离线校准产物。读懂这三篇，第 32 章那些参数张量的形状才不再是天书。
+这一章就把这些数学一块块推清楚。这里的 W8A8（权重 8 bit、激活 8 bit）、W4A16（权重 4 bit、激活 16 bit）不是昇腾发明的记号——它们背后站着三篇奠基论文：**SmoothQuant**（arXiv:2211.10438）、**GPTQ**（arXiv:2210.17323）、**AWQ**（arXiv:2306.00978）。昇腾的量化框架是 vLLM 基座量化栈的**昇腾特化顶替**（out-of-tree 后端把 GEMM 换成昇腾 INT8 算子），但它加载的权重格式、scale 语义，全都源自这三篇论文的离线校准产物。读懂这三篇，第 32 章那些参数张量的形状才不再是天书。
 
 我们按四步走。先讲**动机**：W8A8 为何能省一半显存、又为何是量化里最险的一步。再推**数学**：均匀量化的 scale / zero-point / 粒度打底，然后 GPTQ 的二阶补偿、AWQ 的激活感知缩放、SmoothQuant 的迁移难度因子各推一遍，每个关键公式都给论文的 § 和 Eq 锚点。接着上**数值推演**：在小矩阵上手算量化-反量化误差，跑参考实现把四种方法摆到一起对比。最后回**落地**：这些论文产物怎么落到 `vllm_ascend/quantization` 的真实参数形状上，接回第 32 章的框架。
 
@@ -566,4 +566,4 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
 
 - **`QuantType` 枚举是论文与落地的对照锚**。W8A8 是 SmoothQuant 领地、W4A16 是 GPTQ / AWQ 领地、W4A8 是混合。
 
-一句话收尾：论文的算法（Hessian 补偿、激活感知缩放、迁移变换）全在**离线校准**跑；`vllm_ascend` 只消费它们产出的权重和 scale。所以你在框架里看到的 `input_scale`、`weight_scale`、`group_size`、`deq_scale`，每一个背后都站着本章推过的一支数学。这些参数怎么被工厂注册、怎么在前向里被 `apply` 消费，[第 32 章](../../ch32-ascend-quantization-framework/narrative/chapter.md)已经讲透——现在你手里有了它们的数学出处，那套框架就不再是黑盒了。
+一句话收尾：论文的算法（Hessian 补偿、激活感知缩放、迁移变换）全在**离线校准**跑；`vllm_ascend` 只消费它们产出的权重和 scale。所以你在框架里看到的 `input_scale`、`weight_scale`、`group_size`、`deq_scale`，每一个背后都站着本章推过的一支数学。这些参数怎么被工厂注册、怎么在前向里被 `apply` 消费，正是[下一章](../../ch32-ascend-quantization-framework/narrative/chapter.md)的主线——现在你手里先有了它们的数学出处，读那套框架时就不会再把它当黑盒。

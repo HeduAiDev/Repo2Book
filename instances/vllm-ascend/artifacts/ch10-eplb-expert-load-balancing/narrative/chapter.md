@@ -2,13 +2,13 @@
 
 ![你在这里：第三部分「并行、eplb 与 KV 解耦」，本章深入 eplb 专家负载均衡](../diagrams/roadmap.png)
 
-> 上一章：昇腾在并行组里建好了 `_DYNAMIC_EPLB` 这个专家通信域。
-> 本章：让这个组动起来，把热门专家的权重在 NPU 之间在线热迁移。
+> 上一章：[第 9 章](../../ch09-primer-eplb/narrative/chapter.md)推导了 EPLB 均衡算法——谁复制、落哪张卡。
+> 本章：让昇腾把这套算法落地——子进程规划 + D2D 权重在 NPU 间热迁移。
 > 下一章：[把 KV 在 prefill / decode 节点间直传的 PD 分离](../../ch11-pd-disaggregation-mooncake/narrative/chapter.md)。
 
-MoE 模型有个天生的麻烦：路由是数据决定的，没人保证它均匀。
+上一章把 EPLB 的均衡算法本体推到了底：给定各专家的热度，`rebalance_experts` 该复制谁、把专家重新摆到哪张卡，都算得清清楚楚。但那张算出来的新放置表还只是一纸方案——真要在推理跑着的时候把专家权重搬到位，是另一码事。这一章就看昇腾怎么把这套算法**落成工程**。
 
-某些 expert 是热门款——大量 token 往它身上挤；另一些门可罗雀。专家是按卡切分的，于是热门 expert 所在的那几张 NPU（昇腾神经处理器，可类比 NVIDIA GPU；下文「卡」即指 NPU 设备）被打爆，算得满头大汗，而隔壁持有冷门 expert 的卡却在空转。整批请求的延迟，被最慢那张卡拖着走。
+先一句话回一下病灶：MoE 的专家按卡切分，某些 expert 是热门款、大量 token 往它身上挤，热门 expert 所在的那几张 NPU（昇腾神经处理器，可类比 NVIDIA GPU；下文「卡」即指 NPU 设备）被打爆，而持有冷门 expert 的卡却在空转——整批请求的延迟，被最慢那张卡拖着走。
 
 这一章的主角，是昇腾给出的在线解法：**eplb（expert load balancing）**。它不重启、不换模型，而是在推理跑着的同时，悄悄把热门 expert 的权重从拥挤的卡搬到空闲的卡上，让负载重新铺平。搬运用的是 NPU 间的 device-to-device（D2D，设备到设备）直拷，所以我们叫它「权重热迁移」。代码集中在 `vllm_ascend/eplb/` 目录——`eplb_updator.py`、`eplb_worker.py`、`eplb_device_transfer_loader.py` 各管一块。
 
@@ -56,7 +56,7 @@ def get_dynamic_eplb_group() -> GroupCoordinator:
 3. **`D2DExpertWeightLoader` 异步 P2P 搬运器**（主线③，`vllm_ascend/eplb/core/eplb_device_transfer_loader.py`）：用三态机把「攒 / 发 / 收」三段隔开、保证落地有序，把一整轮迁移逐层摊到多个 step（每 step 一层）。
 4. **`PolicyFactory` 策略多态**（主线④，`vllm_ascend/eplb/core/policy/policy_factory.py`）：规划算法可插拔，`DefaultEplb` 是默认实现，flashlb / swift 是备选。
 
-这里先把「规划算法」当黑盒——本章的重点是①②③这套子进程/队列/D2D 工程外壳怎么把它安全地嵌进推理主循环；`DefaultEplb` 内部怎么判定该不该搬、搬多少，后面 §「为什么均衡有效」会给一个缩小例，更完整的算法本体与均衡判据见[第 9 章：EPLB 算法本体](../../ch09-primer-eplb/narrative/chapter.md)。
+这里先把「规划算法」当黑盒——本章的重点是①②③这套子进程/队列/D2D 工程外壳怎么把它安全地嵌进推理主循环；`DefaultEplb` 内部怎么判定该不该搬、搬多少，后面 §「为什么均衡有效」会给一个缩小例——更完整的算法本体与均衡判据，[上一章](../../ch09-primer-eplb/narrative/chapter.md)刚推导过。
 
 在拆这四块之前，先回答一个统领全章的问题。
 

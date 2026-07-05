@@ -12,7 +12,7 @@
 
 答案比「注册一下」要多一层。先看一个最容易踩的坑。
 
-## 24.1 一个算子，为什么要登记两份实现
+## 28.1 一个算子，为什么要登记两份实现
 
 假设你把 AscendC kernel 注册进了 torch，推理能跑、数值也对。然后你打开 `torch.compile` 或 ACLGraph 想加速——结果图捕获在你的算子那里断了，报「无法推断输出形状」。
 
@@ -32,7 +32,7 @@
 
 vLLM-Ascend 把这两份实现，分三条线注册进 torch。下面逐条拆。
 
-## 24.2 第一条线：C++ 把真实 kernel 注册成 torch.ops
+## 28.2 第一条线：C++ 把真实 kernel 注册成 torch.ops
 
 真算那份实现在 `csrc/torch_binding.cpp`。注册的入口是一个宏块：
 
@@ -71,7 +71,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
 这套 `def + impl` 在这个主块里**对 63 个算子各做了一遍**（标准芯片分支；另有一段 `#ifdef ASCEND_PLATFORM_310P` 给 [310P 推理卡](../../ch18-310p-inference-chip-specialization/narrative/chapter.md)单独注册 2 个，与主块互斥编译，本章只看主分支）。其中绝大多数（59 个）都把实现绑在 `PrivateUse1`，是模型真正算数的重活——RmsNorm、各种 attention、MoE gating、量化 matmul……
 
-剩下 4 个工具算子用别的派发键：`swap_blocks_batch` 走 `torch::kCPU`，`device_print` / `device_print_tensor` / `get_npu_storage_shape` 走 `CompositeExplicitAutograd`（63 = 59 + 4）。它们本就不在 NPU 真算的热路径上，所以不挂 `PrivateUse1`——这也预告了 [§24.5](#245-缺口-6-个无-meta-不能进图的实证) 那几个『无 meta 不进图』里的工具算子。
+剩下 4 个工具算子用别的派发键：`swap_blocks_batch` 走 `torch::kCPU`，`device_print` / `device_print_tensor` / `get_npu_storage_shape` 走 `CompositeExplicitAutograd`（63 = 59 + 4）。它们本就不在 NPU 真算的热路径上，所以不挂 `PrivateUse1`——这也预告了 [§28.5](#285-缺口-6-个无-meta-不能进图的实证) 那几个『无 meta 不进图』里的工具算子。
 
 ### 算子全名从哪来：`_C_ascend` 这个命名空间
 
@@ -147,7 +147,7 @@ std::tuple<at::Tensor, at::Tensor> get_masked_input_and_mask(
 
 记住第 2 半——`data_ptr` + NPU 流 + 提交 kernel。等会儿看 meta 实现时，**第 1 半几乎一模一样，第 2 半整个消失**，这个对比就是「真算 vs 推形状」的全部。（这段 C++ 在 host（运行框架的那台通用 CPU 计算机，区别于挂在旁边、真正算 kernel 的 NPU 设备）上编译不了——昇腾 kernel 要 CANN 工具链和真 NPU——本章对它只做源码解读，不真跑。）
 
-## 24.3 为什么缺 meta，图就在这里断
+## 28.3 为什么缺 meta，图就在这里断
 
 回到那个坑。假跑用 Meta 张量走计算图，每遇一个算子，torch 的派发器（dispatcher）会拿这个算子在 **`Meta` 键上的实现**，去求输出的形状和 dtype，再把这个「输出 Meta 张量」喂给下一个算子。一站接一站，形状沿着整张图传播下去：
 
@@ -155,7 +155,7 @@ std::tuple<at::Tensor, at::Tensor> get_masked_input_and_mask(
 
 > *图注（示意）：Meta 张量（只有形状）流过算子链，每个算子调自己的 meta 求出输出形状、传给下一个。某个算子在 `Meta` 键上没有注册实现时，派发器找不到它的 meta——这一站推不出输出形状——后续的形状推断链断在这里，子图无法整体捕获，只能回退 eager 或直接报错。*
 
-把这条「接力」说成一个归纳会更严谨。**基例**：trace 入口那批 Meta 张量，形状 / dtype 本就已知。**归纳步**：若链上第 k 个算子的输出 Meta 张量形状已知、且第 k+1 个算子在 `Meta` 键上有实现，则第 k+1 个算子的输出形状也能推出。于是「整条链可推」当且仅当「链上每个算子都有 meta」；只要某个算子缺 meta，归纳步就在它这一站失效——这正是下面 [§24.5](#245-缺口-6-个无-meta-不能进图的实证) 那 6 个缺口算子要给的实证。
+把这条「接力」说成一个归纳会更严谨。**基例**：trace 入口那批 Meta 张量，形状 / dtype 本就已知。**归纳步**：若链上第 k 个算子的输出 Meta 张量形状已知、且第 k+1 个算子在 `Meta` 键上有实现，则第 k+1 个算子的输出形状也能推出。于是「整条链可推」当且仅当「链上每个算子都有 meta」；只要某个算子缺 meta，归纳步就在它这一站失效——这正是下面 [§28.5](#285-缺口-6-个无-meta-不能进图的实证) 那 6 个缺口算子要给的实证。
 
 把这条因果链摆直：
 
@@ -167,7 +167,7 @@ $$
 
 torch 自己能不能猜出输出形状？对简单算子（逐元素加法之类）有通用规则，但对昇腾这些自定义 kernel——输出形状要按 layout、按稀疏度参数算——torch 毫无办法，**只能靠 meta 函数显式告诉它**。`vllm_ascend/meta_registration.py` 顶部的注释把这点说死了：meta 「is essential for supporting `torch.compile` and aclgraph」。下一节的 `npu_lightning_indexer` 就是活例子。
 
-## 24.4 第二条线：C++ meta，只推形状不真算
+## 28.4 第二条线：C++ meta，只推形状不真算
 
 meta 实现集中在 `csrc/torch_binding_meta.cpp`。文件顶部的注释把规矩讲得很白：
 
@@ -251,7 +251,7 @@ std::tuple<at::Tensor, at::Tensor> npu_lightning_indexer_meta(
 
 同一个算子，layout 一换、输出连维数都退了一档（四维 `{4,1024,16,2048}` ↔ 三维 `{4096,16,2048}`）——这种东西派发器绝无可能凭空猜出，只能靠 meta 一行行算给它。
 
-这正是 [§24.3](#243-为什么缺-meta图就在这里断) 那句「torch 自己猜不出」的具体化：这套 `if BSND … else …` 的形状逻辑，派发器不可能凭空知道，**必须由 meta 函数一行行写清楚**。meta 不是可有可无的样板，它承载着真实的形状推断知识。
+这正是 [§28.3](#283-为什么缺-meta图就在这里断) 那句「torch 自己猜不出」的具体化：这套 `if BSND … else …` 的形状逻辑，派发器不可能凭空知道，**必须由 meta 函数一行行写清楚**。meta 不是可有可无的样板，它承载着真实的形状推断知识。
 
 ### meta 怎么绑到 Meta 键
 
@@ -273,9 +273,9 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
 
 跟 `torch_binding.cpp` 那边对照看，区别就一处：那边 `ops.impl(name, torch::kPrivateUse1, &真实现)`，这边 `ops.impl(name, &meta::*_meta)`——派发键换成了宏参数里的 `Meta`（写在 `_IMPL_EXPAND(..., Meta, ...)` 里），不再逐行写键。顶上那行注释直接点题：注册 meta 是「for symbolic tracing, this will also the custom kernel been captured into aclgraph」——**meta 在场，AscendC kernel 才进得了 ACLGraph。**
 
-这套 C++ meta 不是 meta 的全部来源——有一批被编译开关裹着的算子，会在 `vllm_ascend/meta_registration.py` 里由 Python 兜底补注，下面 [§24.6](#246-python-兜底补上缺位的-meta) 细讲。
+这套 C++ meta 不是 meta 的全部来源——有一批被编译开关裹着的算子，会在 `vllm_ascend/meta_registration.py` 里由 Python 兜底补注，下面 [§28.6](#286-python-兜底补上缺位的-meta) 细讲。
 
-## 24.5 缺口 6 个：「无 meta 不能进图」的实证
+## 28.5 缺口 6 个：「无 meta 不能进图」的实证
 
 既然每个想进图的真实现都得配一份 meta，我们有理由预期这两个数字应当相近——理想情况下相等。数一下实际数字：`torch_binding.cpp` 主块 `ops.def` 了 **63** 个算子，`torch_binding_meta.cpp` 主块 `ops.impl` 了 **57** 个 meta。差 **6** 个。
 
@@ -285,11 +285,11 @@ $$
 
 这 6 个不是随便差的，点名是：`bgmv_shrink`、`sgmv_shrink`、`swap_blocks`、`swap_blocks_batch`、`get_npu_storage_shape`、`npu_apply_top_k_top_p`。它们在 `torch_binding.cpp` 都有 `def` + 真实现，但在 `torch_binding_meta.cpp` 主块**没有对应的 meta**。（`bgmv_shrink` / `sgmv_shrink` 是 LoRA 相关算子——批量 / 分段的矩阵-向量收缩，源码里它们的 `weight` 形状就是 `[num_loras, …]`。）
 
-按 [§24.3](#243-为什么缺-meta图就在这里断) 的因果链，结论是确定的：**这 6 个算子不进 `torch.compile` / ACLGraph 的捕获图**（或者得靠别的兜底机制单独处理）。这不是 bug，而是设计取舍——比如 `swap_blocks` 是 KV 块搬运、`get_npu_storage_shape` 返回的是 `int[]` 而非张量，它们本就不在那条需要被捕获的计算热路径（执行频繁、最该被图优化的关键路径）上，没 meta 也无妨。但它正好把本章的论点**焊死成可验证的事实**：一个算子进不进得了图，看的就是它在 `Meta` 键上有没有实现。
+按 [§28.3](#283-为什么缺-meta图就在这里断) 的因果链，结论是确定的：**这 6 个算子不进 `torch.compile` / ACLGraph 的捕获图**（或者得靠别的兜底机制单独处理）。这不是 bug，而是设计取舍——比如 `swap_blocks` 是 KV 块搬运、`get_npu_storage_shape` 返回的是 `int[]` 而非张量，它们本就不在那条需要被捕获的计算热路径（执行频繁、最该被图优化的关键路径）上，没 meta 也无妨。但它正好把本章的论点**焊死成可验证的事实**：一个算子进不进得了图，看的就是它在 `Meta` 键上有没有实现。
 
 > 一个反直觉的对照：`device_print` / `store_kv_block` 这些看着「不像要进图」的算子，反而**都有**独立 meta（分别注册在别处）。所以缺口不是按「重不重要」分的，纯粹按「有没有写 meta」分。要判断一个算子能否进图，别猜用途，去 `Meta` 键的注册表里查它在不在——`vllm_ascend/meta_registration.py` 里那个 `_dispatch_get_registrations_for_dispatch_key("Meta")` 查的就是这张表。
 
-## 24.6 Python 兜底：补上缺位的 meta
+## 28.6 Python 兜底：补上缺位的 meta
 
 C++ meta 还有个变数：其中一批（包括 `get_masked_input_and_mask`、`bgmv_expand`、`sgmv_expand`）被 `#ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS` 这个编译开关裹着——这个开关只在某些编译配置下打开，门控这批走 ATB / direct-kernel 实现的算子要不要编进 `.so`（ATB 是昇腾的一套高性能融合 kernel 库，direct-kernel 则是直接走 AscendC kernel 的路径）。开关没开时，编译出来的 `.so` 里**根本没有这些 C++ meta**。
 
@@ -325,7 +325,7 @@ def register_meta_if_necessary(ns: str, op_name: str, fn, overload: str = ""):
 | 第 1 次（C++ 未编进该 meta） | 否 | 走到 `lib.impl(...)` | 注册 Python meta | +1 |
 | 第 2 次（含测试反复调） | 是（上一次刚加的） | `if … in …: return` | 跳过 | 不变 |
 
-第二次撞上查重直接 `return`，注册数稳住不动——**这正是精简版在 host 上能验证的点之一**（[§24.9](#249-跑起来看精简版交叉验证)）。
+第二次撞上查重直接 `return`，注册数稳住不动——**这正是精简版在 host 上能验证的点之一**（[§28.9](#289-跑起来看精简版交叉验证)）。
 
 补注的 meta 函数本身，跟 C++ meta 同构：
 
@@ -353,9 +353,9 @@ if not is_310p():
     register_meta_if_necessary("_C_ascend", "sgmv_expand", sgmv_expand_meta)
 ```
 
-跟 C++ 版逐字对得上：`torch.empty_like(input)` + `.to(torch.bool)`，只推形状。末尾的 `if not is_310p()` 守卫，跟 C++ 那边的 `#ifdef ASCEND_PLATFORM_310P` 一一呼应——同一套芯片分叉逻辑，在两种语言里各表一次。补的就是 [§24.4](#244-第二条线c-meta只推形状不真算) 末尾点到的、被编译开关控住的那几个 direct-kernel 算子——它们跟 [§24.5](#245-缺口-6-个无-meta-不能进图的实证) 那 6 个永久缺口是两组不同的算子：这 3 个是「C++ 没编进就 Python 补」，那 6 个是「C++ / Python 都没有」。
+跟 C++ 版逐字对得上：`torch.empty_like(input)` + `.to(torch.bool)`，只推形状。末尾的 `if not is_310p()` 守卫，跟 C++ 那边的 `#ifdef ASCEND_PLATFORM_310P` 一一呼应——同一套芯片分叉逻辑，在两种语言里各表一次。补的就是 [§28.4](#284-第二条线c-meta只推形状不真算) 末尾点到的、被编译开关控住的那几个 direct-kernel 算子——它们跟 [§28.5](#285-缺口-6-个无-meta-不能进图的实证) 那 6 个永久缺口是两组不同的算子：这 3 个是「C++ 没编进就 Python 补」，那 6 个是「C++ / Python 都没有」。
 
-## 24.7 第三条线：纯 Python 算子，一站式注册
+## 28.7 第三条线：纯 Python 算子，一站式注册
 
 前两条线管的是 C++ 写的 AscendC kernel。但 vLLM-Ascend 还有一批算子是**纯 Python** 写的——通信胶水、权重预取、量化、rope、triton kernel——它们也要能进图。这条线在 `vllm_ascend/ops/register_custom_ops.py`，用的是 vLLM 基座提供的 `direct_register_custom_op`。
 
@@ -460,7 +460,7 @@ def _muls_add_impl_fake(x: torch.Tensor, y: torch.Tensor, scale: float) -> torch
 
 fake 的形态可以五花八门，但职责只有一个：**给假跑一个能算出输出形状的捷径。**
 
-## 24.8 三条线，一张表，一个加载次序
+## 28.8 三条线，一张表，一个加载次序
 
 把三条线收到一起：
 
@@ -488,7 +488,7 @@ fake 的形态可以五花八门，但职责只有一个：**给假跑一个能�
 
 第三条线（`register_custom_ops.py` 的 10 个 `torch.ops.vllm.*`）走另一条 import 路径（经 `ops/__init__.py`），但道理一样：import 到哪个文件，哪批注册就执行。所有这些，都发生在模型真正前向之前——等推理开始时，`torch.ops._C_ascend.*` 和 `torch.ops.vllm.*` 早已躺在派发表里，真实现和 meta 各就各位。
 
-## 24.9 跑起来看：精简版交叉验证
+## 28.9 跑起来看：精简版交叉验证
 
 C++ 那两条线在 host 上跑不了（要 CANN 和真 NPU）。但 Python 的两条线——`meta_registration.py` 的兜底、`register_custom_ops.py` 的 10 个 op——是纯 Python，能在普通机器上跑通，正好用来**亲眼验证本章的论点**。
 
@@ -498,11 +498,11 @@ C++ 那两条线在 host 上跑不了（要 CANN 和真 NPU）。但 Python 的�
 
 **2. 假跑真的走 fake、不碰真实现吗？** ——在 `FakeTensorMode`（这正是图捕获「假跑只追形状」的那套机制）下 dispatch，结果由 fake 推出：`maybe_chunk_residual` 给 `empty_like`、`npu_rotary_embedding` 形状不变、`muls_add` 给 `empty_like`、`maybe_all_reduce_tensor_model_parallel` 给 `lambda x: x`——真实现（要 NPU 的那些）**一次都没被调到**。这就把「真算 vs 推形状是两份独立实现、假跑只碰 meta/fake」这件事实测出来了。`quantize` 的 fake 还把 dtype 推成了 `int8`，形状不变——印证 fake 能推 dtype 变化。
 
-**3. Python meta 兜底 + 幂等查重对不对？** ——`meta_registration` 给 `_C_ascend::{get_masked_input_and_mask, bgmv_expand, sgmv_expand}` 补上了 `Meta` 实现；在 meta 设备张量上调 `get_masked_input_and_mask`，输出 `masked_input` 同形同 dtype、`mask` 同形 `kBool`、`device=meta`，全程不真算。对已有 meta 的 op 再调一次 `register_meta_if_necessary`，命中 [§24.6](#246-python-兜底补上缺位的-meta) 那张表的第 2 行——`if … in …: return`，不重复注册、不报错。
+**3. Python meta 兜底 + 幂等查重对不对？** ——`meta_registration` 给 `_C_ascend::{get_masked_input_and_mask, bgmv_expand, sgmv_expand}` 补上了 `Meta` 实现；在 meta 设备张量上调 `get_masked_input_and_mask`，输出 `masked_input` 同形同 dtype、`mask` 同形 `kBool`、`device=meta`，全程不真算。对已有 meta 的 op 再调一次 `register_meta_if_necessary`，命中 [§28.6](#286-python-兜底补上缺位的-meta) 那张表的第 2 行——`if … in …: return`，不重复注册、不报错。
 
 三组验证，对应本章三个论点：注册三件套成立、假跑只走 meta/fake、缺位才兜底且幂等。host 上 8 个用例全过，没碰一次 NPU。
 
-## 24.10 小结：地基已经打好
+## 28.10 小结：地基已经打好
 
 退一步看这一章干了什么。第 27 章把模型里的算子换成了昇腾实现；这一章回答「换进来的那个真实 kernel，凭什么能被 `torch.compile` 和 ACLGraph 接住」。
 

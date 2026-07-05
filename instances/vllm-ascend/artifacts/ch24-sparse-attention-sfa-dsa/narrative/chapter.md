@@ -2,8 +2,8 @@
 
 ![你在这里](../diagrams/roadmap.png)
 
-> 上一章讲透了 MLA：用低秩压缩把 KV cache 砍到约 1/57，再用权重吸收省掉解码期的解压。
-> 本章在 MLA 之上再叠一层「稀疏」：先用轻量索引器挑出少数最相关的 KV，只算这部分。
+> 上一章推导了稀疏原理谱系：NSA→DSA 的索引器 + top-k 打分。
+> 本章看昇腾把它落成 SFA/DSA 两个后端：索引器挑出少数最相关的 KV，只算这部分。
 > 关键看点：这两个后端在 vLLM 主干里**根本不存在**——是插件「加法式扩展」出来的。
 
 到目前为止，我们看到的昇腾后端都在做同一件事：**顶替**。`AscendAttentionBackend` 顶替 vLLM 的标准注意力、`AscendMLABackend` 顶替 MLA——同一个抽象位置，换一套昇腾算子。但 OOT（out-of-tree，树外）插件的能耐不止于此。本章的两个后端，`AscendSFABackend` 与 `AscendDSABackend`，在 vLLM 主干里**找不到对位**：主干只有标准注意力和 MLA，没有稀疏注意力这条线。它们是昇腾在 MLA 基础上**新增**出来的算法。这正是[第 8 章《Ascend 并行组》](../../ch08-ascend-parallel-groups/narrative/chapter.md)里见过的「加法式扩展」母题在注意力子系统的再现——不替换、只新增。
@@ -12,7 +12,7 @@
 
 两份源码体量极大——`vllm_ascend/attention/sfa_v1.py` 约 1376 行、`vllm_ascend/attention/dsa_v1.py` 约 2897 行，底下还垫着一堆昇腾私有算子。我们不逐行啃，只抓机制：**怎么在 MLA 之上叠稀疏选择、怎么用一个轻量索引器把长上下文的注意力开销从 O(L) 压到 O(top-k)**。
 
-## 21.1 长上下文的「注意力税」
+## 24.1 长上下文的「注意力税」
 
 先说清楚痛点。标准注意力里，每生成一个 token，它的 query 要和**全部** L 个历史 KV 做点积、过 softmax、再加权求和。上下文越长，这笔账越重——单个 query 的开销正比于 L，即 O(L)；而整条序列有 L 个 query，每个都摊一遍 O(L)，故总成本 = L × O(L) = $O(L^2)$。当 L 涨到 32K、128K，这笔「注意力税」就压过了其它所有开销。
 
@@ -20,13 +20,13 @@
 
 稀疏注意力攻的正是这后半句。它的赌注很直接：**对某个 query 来说，绝大多数历史 KV 其实没什么贡献**。softmax 之后，注意力权重高度集中在少数几个位置上，剩下的几乎是噪声。既然如此，何必对全部 L 个都算全精度注意力？先想办法**便宜地**挑出最相关的少数几个，只算这几个就行。
 
-难点在「便宜地挑」。要判断哪些 KV 相关，本身就得算一遍打分——如果这个打分跟全精度注意力一样贵，那就白搭了。稀疏注意力的解法是**两段式**：用一个维度极低的「索引器」算一个粗糙的相关性代理分数，挑出 top-k；再只对这 top-k 个 KV 算真正的全精度注意力。本章两份后端 `vllm_ascend/attention/sfa_v1.py` 与 `vllm_ascend/attention/dsa_v1.py`，就是这套两段式的两种实现。这套「索引器 + top-k」谱系从 NSA 一路演化到 DSA 的 Lightning Indexer，其数学动机与取舍见[第 23 章：稀疏注意力谱系](../../ch23-primer-sparse-attention/narrative/chapter.md)（再往前一步的 V4 演进见[第 26 章](../../ch26-primer-v4-csa-hca/narrative/chapter.md)）；本章只钉死昇腾怎么把它实现成算子。
+难点在「便宜地挑」。要判断哪些 KV 相关，本身就得算一遍打分——如果这个打分跟全精度注意力一样贵，那就白搭了。稀疏注意力的解法是**两段式**：用一个维度极低的「索引器」算一个粗糙的相关性代理分数，挑出 top-k；再只对这 top-k 个 KV 算真正的全精度注意力。本章两份后端 `vllm_ascend/attention/sfa_v1.py` 与 `vllm_ascend/attention/dsa_v1.py`，就是这套两段式的两种实现。这套「索引器 + top-k」谱系从 NSA 一路演化到 DSA 的 Lightning Indexer，其数学动机与取舍，上一章[第 23 章：稀疏注意力谱系](../../ch23-primer-sparse-attention/narrative/chapter.md)刚推导过（再往前一步的 V4 演进见[第 26 章](../../ch26-primer-v4-csa-hca/narrative/chapter.md)）；本章只钉死昇腾怎么把它实现成算子。
 
 ![两段式稀疏注意力总览](../diagrams/two_stage.png)
 
 这就是本章两个后端共同的骨架。SFA 和 DSA 的差别在「怎么挑、挑多少、建在谁身上」，但两段式这个大框架是一样的。
 
-## 21.2 从 ch19 接棒：三元 key 选出「主干没有的后端」
+## 24.2 从 ch19 接棒：三元 key 选出「主干没有的后端」
 
 [第 19 章](../../ch19-attention-backend-selection/narrative/chapter.md)讲过昇腾如何按模型与配置路由到具体的注意力后端。路由的落点是 `vllm_ascend/platform.py` 的 `get_attn_backend_cls`，本章的两个主角就从这里被选出来：
 
@@ -72,7 +72,7 @@ def get_name() -> str:
 
 这是「加法式扩展」碰到主干刚性约束时的典型摩擦：vLLM 的 model runner v2（负责加载模型、初始化 KV cache 的那个组件）在 `initialize_kv_cache` 时会对注意力后端名做**硬断言**，只认 `FLASH_ATTN` 这类预定义名字，根本不认识 `ASCEND_SFA`，于是初始化阶段就会断言失败。昇腾的对策不是改 vLLM，而是在 v2 model runner 下让 `get_name()` 报一个它认得的名字 `FLASH_ATTN` 蒙混过关——这正是 [ch19](../../ch19-attention-backend-selection/narrative/chapter.md) 那条后端选择/命名约束之线在本章的延伸。一句 `HACK` 注释把这份无奈写得明明白白。
 
-## 21.3 稀疏到底省了多少：把 O(L) 钉成 O(k)
+## 24.3 稀疏到底省了多少：把 O(L) 钉成 O(k)
 
 回到机制本身。两段式稀疏的核心收益，是把「要算全精度注意力的 KV 数」从 L **钉死**成一个常数 k。索引打分那一遍仍是 O(L)，但它用的维度极小（`index_head_dim = 128`），单位成本远低于全精度注意力。
 
@@ -88,7 +88,7 @@ $$
 
 其中 $d$ 是全精度注意力每个 KV 位置的成本、$d_{idx}$ 是索引打分每个位置的成本，前者远大于后者。$k$ 是 top-k 预算（DSA 的 `index_topk`，见 `vllm_ascend/attention/dsa_v1.py`）。第一项是索引打分：扫全部 L 个位置，但每位置只花极小的索引维度。第二项是全精度注意力：只在 k 个位置上算。上下文远长于 k 时，原本随 L 线性增长的昂贵全精度注意力被钉死成常数；剩下随 L 增长的，只有便宜得多的索引打分。
 
-$d_{idx}$ 为什么能比 $d$ 便宜这么多？不是靠「索引器头数少一点」——单论头数也就差几倍。真正的来源有两处：其一，索引器对每个 KV 位置只算一个**标量代理分数**（一次点积代理），**省掉了 softmax、也省掉对 value 的加权求和**——而这两笔恰是全精度注意力每位置开销里最重的部分；其二，DSA 还更进一步，先用 `compressor` 把待打分的位置按 `cmp_ratio=4` 压到约 L/4 再打分，把第一项又砍掉一截。两相叠加，索引那一遍的单位成本就被压到远低于全精度注意力的量级（与 [§21.1](#211-长上下文的注意力税) 总览图里复杂度脚注 $O(L \cdot d_{idx} + k \cdot d)$ 的两项一一对应）。
+$d_{idx}$ 为什么能比 $d$ 便宜这么多？不是靠「索引器头数少一点」——单论头数也就差几倍。真正的来源有两处：其一，索引器对每个 KV 位置只算一个**标量代理分数**（一次点积代理），**省掉了 softmax、也省掉对 value 的加权求和**——而这两笔恰是全精度注意力每位置开销里最重的部分；其二，DSA 还更进一步，先用 `compressor` 把待打分的位置按 `cmp_ratio=4` 压到约 L/4 再打分，把第一项又砍掉一截。两相叠加，索引那一遍的单位成本就被压到远低于全精度注意力的量级（与 [§24.1](#241-长上下文的注意力税) 总览图里复杂度脚注 $O(L \cdot d_{idx} + k \cdot d)$ 的两项一一对应）。
 
 最直观的是看「有多少个 KV 进了全精度注意力」。DSA 取 k=512，随上下文长度 L 变化：
 
@@ -103,7 +103,7 @@ $d_{idx}$ 为什么能比 $d$ 便宜这么多？不是靠「索引器头数少�
 
 代价当然有：top-k 是有损近似，万一某个本该有贡献的 KV 落在 top-k 之外，就被漏掉了。k 取 512 还是 2048，是精度和速度的权衡点。这个值不是随手定的——用 DSA/SFA 这套结构的模型（DeepSeek-V3.2 / V4 一系）在训练阶段就已经按这个稀疏度适配过，让模型「学会」把注意力集中到 top-k 以内。
 
-## 21.4 SFA：直接长在 MLA 身上
+## 24.4 SFA：直接长在 MLA 身上
 
 先看 SFA（Sparse Flash Attention）。它的设计哲学是**最省事**——MLA 那套低秩压缩、权重吸收、prefill/decode 拆分，整套照搬，只在 forward 里多插两段式稀疏选择。这份「照搬」是用 Python 继承字面写出来的：
 
@@ -142,7 +142,7 @@ SFA 这条线和 DSA 那条线的继承差异，画在一起最清楚：
 
 ![SFA 与 DSA 的继承对照](../diagrams/inherit.png)
 
-## 21.5 SFA forward：两段式落地
+## 24.5 SFA forward：两段式落地
 
 把 SFA 的 forward 主脊摊开，两段式就藏在 MLA 式 prolog 之后：
 
@@ -199,7 +199,7 @@ def indexer_select_post_process(self, x, q_c, kv_cache, attn_metadata, cos, sin,
         self.use_sparse_c8_indexer, self.use_torch_npu_lightning_indexer)
 ```
 
-注意最后一步：它不直接调内核，而是甩给 `DeviceOperator`——这就是 [ch20](../../ch20-ascend-attention-mha/narrative/chapter.md)/ch22 都露过脸的设备算子门面（[§21.8](#218-deviceoperator注意力各章共用的设备底座) 详谈）。门面里的 default 分支才是 Lightning Indexer 的真身：
+注意最后一步：它不直接调内核，而是甩给 `DeviceOperator`——这就是 [ch20](../../ch20-ascend-attention-mha/narrative/chapter.md)/ch22 都露过脸的设备算子门面（[§24.8](#248-deviceoperator注意力各章共用的设备底座) 详谈）。门面里的 default 分支才是 Lightning Indexer 的真身：
 
 ```python
 # vllm_ascend/device/device_op.py:L371（节选 default 分支）
@@ -264,11 +264,11 @@ def execute_sparse_flash_attention_process(sfa_impl, ql_nope, q_pe, kv_cache, to
 
 记号：T = 本次 forward 的 token 数；H = 隐藏维；N = 注意力头数（`num_heads`）；d_v = 每头的 value 维（`v_head_dim`）；top-k = 稀疏选中的 KV 位置数（SFA 取 2048、DSA 取 512）。注意 `attn_output` 最后一维 `N·d_v` 由 `sfa_v1.py:L843` 的 `attn_output.view(-1, self.tp_size, self.num_heads * self.v_head_dim)` 钉死——它只跟头数与每头维度有关，**和历史长度 L 毫无关系**。这正是「稀疏把开销钉成常数」在张量形状上的印证。
 
-第三行是关键：不管历史有多长 L，`topk_indices` 的第二维永远钉死在 2048。后面的稀疏 flash 只在这 2048 个位置上工作——这就是 [§21.3](#213-稀疏到底省了多少把-ol-钉成-ok) 那张表「全精度 KV 数 = 常数」在代码里的样子。
+第三行是关键：不管历史有多长 L，`topk_indices` 的第二维永远钉死在 2048。后面的稀疏 flash 只在这 2048 个位置上工作——这就是 [§24.3](#243-稀疏到底省了多少把-ol-钉成-ok) 那张表「全精度 KV 数 = 常数」在代码里的样子。
 
 > 这里顺带说一句 SFA 删掉的旁支。真实 `forward` 里还有一条 `use_sparse_c8_indexer` 的路：先对 `q_li`/`k_li` 做哈达玛变换、再 INT8 动态量化，走 `npu_lightning_indexer_quant` 这个量化版索引算子。它是索引器的加速变体，和「选 top-k」的语义无关——量化只是让打分更快，挑出来的还是那批位置。我们保留非量化的 default 主路把机制讲清，量化路点到为止。
 
-## 21.6 DSA：自起一套，但还是建在 MLA 上
+## 24.6 DSA：自起一套，但还是建在 MLA 上
 
 DSA（DeepSeek Sparse Attention）走的是另一条路。它的索引器结构更复杂——除了打分投影，还带一个 `compressor`（压缩器）：按 `compress_ratio=4` 把 KV 做 4:1 压缩（每 4 个相邻位置归并成 1 个代表），再让量化索引器只对这份压缩版打分、选 top-k；而最终的稀疏注意力仍读**原始** KV——压缩只发生在「打分」这一步，是让索引更便宜的二次优化。它的 KV cache 是多张量布局，和 MLA 那套差异很大。所以 DSA **不**直接继承 vLLM 的 `MLAAttentionImpl`，而是自起一套抽象：
 
@@ -293,9 +293,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
     # … DSA 自带一套元数据装配，继承 vLLM 通用 builder，不走 MLACommonMetadataBuilder …
 ```
 
-注意这里继承的是 vLLM 的**通用** `AttentionMetadataBuilder`，不是 SFA 那个 MLA 专用 builder。这就是 [§21.4](#214-sfa直接长在-mla-身上) 那张继承对照图里「自起一套」的字面依据。
+注意这里继承的是 vLLM 的**通用** `AttentionMetadataBuilder`，不是 SFA 那个 MLA 专用 builder。这就是 [§24.4](#244-sfa直接长在-mla-身上) 那张继承对照图里「自起一套」的字面依据。
 
-但「自起一套」不等于「抛弃 MLA」。打开 `AscendDSAImpl` 的 forward 路径，里头仍然**内联重写**了一段 MLA 式的低秩 prolog——注意是「重写」不是「复用」：它没继承基类那份，而是在 DSA impl 里自己用 `wq_a`/`wq_b`/`wkv`/`q_norm`/`kv_norm` 把同一套逻辑又码了一遍（[§21.7](#217-dsa-forward低秩-prolog--选-top-512--稀疏注意力) 会看到）。所以本章标题说两者「都建在 MLA 之上」：SFA 靠继承复用，DSA 靠内联重写，殊途同归。
+但「自起一套」不等于「抛弃 MLA」。打开 `AscendDSAImpl` 的 forward 路径，里头仍然**内联重写**了一段 MLA 式的低秩 prolog——注意是「重写」不是「复用」：它没继承基类那份，而是在 DSA impl 里自己用 `wq_a`/`wq_b`/`wkv`/`q_norm`/`kv_norm` 把同一套逻辑又码了一遍（[§24.7](#247-dsa-forward低秩-prolog--选-top-512--稀疏注意力) 会看到）。所以本章标题说两者「都建在 MLA 之上」：SFA 靠继承复用，DSA 靠内联重写，殊途同归。
 
 DSA 的元数据装配是它和 SFA 最不一样的地方，也是「Lightning Indexer」这个名字真正落地的地方。`build` 入口先按 decode/prefill 拆开，各装配一份：
 
@@ -343,7 +343,7 @@ def build_prefill_metadata(self, common_prefix_len, common_attn_metadata):
 
 ![DSA forward 流水线](../diagrams/dsa_pipeline.png)
 
-## 21.7 DSA forward：低秩 prolog → 选 top-512 → 稀疏注意力
+## 24.7 DSA forward：低秩 prolog → 选 top-512 → 稀疏注意力
 
 DSA 的 forward 主脊，先把 `hidden_states` 按 decode/prefill 切成两段，各走各的稀疏路，再合并过输出投影：
 
@@ -426,13 +426,13 @@ def _indexer_qli(self, q, weights, q_scale, indexer_k_cache, indexer_scale_cache
     return topk_idxs
 ```
 
-`npu_quant_lightning_indexer` 吃前向期算好的 `query`、indexer KV cache，外加 [§21.6](#216-dsa自起一套但还是建在-mla-上) 在元数据期预建的 `metadata=qli_metadata`——元数据期和前向期在这里**接上头**了。`sparse_count=self.index_topk` 仍是 512，和元数据期的值严丝合缝。算子返回 `top-512` 个 KV 的索引 `topk_idxs`，回传给阶段二的 `cmp_sparse_indices`。
+`npu_quant_lightning_indexer` 吃前向期算好的 `query`、indexer KV cache，外加 [§24.6](#246-dsa自起一套但还是建在-mla-上) 在元数据期预建的 `metadata=qli_metadata`——元数据期和前向期在这里**接上头**了。`sparse_count=self.index_topk` 仍是 512，和元数据期的值严丝合缝。算子返回 `top-512` 个 KV 的索引 `topk_idxs`，回传给阶段二的 `cmp_sparse_indices`。
 
 这里有个 SFA 没有的精细之处：DSA 的索引器在打分前，还先用 `compressor` 把 KV **压**成更短的代表（`cmp_ratio=4`，即每 4 个位置压成 1 个）再打分。这是「让索引器更便宜」的二次优化——本来索引打分是 O(L)，压一道之后变成 O(L/4)，索引开销又降一截。压缩 KV 写进独立的 `compress_kv_cache`，量化后的 indexer KV 写进 `indexer_k_cache`，各管各的。
 
 > SFA 取 2048、DSA 取 512，为什么不一样？两者用的是**不同代际的索引内核**，top-k 预算各按各的模型配置定。别把这两个数当成同一个——SFA 的 2048 是 `npu_lightning_indexer` 的内核常量，DSA 的 512 是模型 `hf_config.index_topk`。统一的只有 `sparse_mode=3`（都按分页 block_table 选择）。
 
-## 21.8 DeviceOperator：注意力各章共用的设备底座
+## 24.8 DeviceOperator：注意力各章共用的设备底座
 
 前面 SFA、DSA 反复出现一个 `DeviceOperator.xxx(...)` 的调用——选稀疏内核、解包 KV cache、做 q 的 RMSNorm，都甩给它。这是本章立意的第四块：`vllm_ascend/device/device_op.py` 的 `DeviceOperator`，是注意力各章（ch20/ch22/ch24）**共用的设备算子门面**。
 
@@ -476,11 +476,11 @@ DeviceOperator: type["BaseDeviceAdaptor"] = get_device_adaptor()
 
 `DeviceOperator` 是个**模块级单例**——`import` 这个模块时 `get_device_adaptor()` 就跑一次，按当前设备代际把类选好。之后 sfa/dsa/mla 全写 `DeviceOperator.reshape_and_cache(...)`，调到哪个实现由这次选择决定。impl 里一行设备分支都不用写，控制流是设备无关的；代际差异全封在门面背后。
 
-这就是为什么 [§21.5](#215-sfa-forward两段式落地)、[§21.7](#217-dsa-forward低秩-prolog--选-top-512--稀疏注意力) 里的稀疏内核都经门面拿：`DeviceOperator.execute_sparse_flash_attention_process`（SFA）、`DeviceOperator.get_dsa_sparse_attn_op`（DSA）。换了代际，impl 不动，门面背后换算子即可。
+这就是为什么 [§24.5](#245-sfa-forward两段式落地)、[§24.7](#247-dsa-forward低秩-prolog--选-top-512--稀疏注意力) 里的稀疏内核都经门面拿：`DeviceOperator.execute_sparse_flash_attention_process`（SFA）、`DeviceOperator.get_dsa_sparse_attn_op`（DSA）。换了代际，impl 不动，门面背后换算子即可。
 
 这套门面在开发机上可以验得很干净——它本质是纯 Python 的多态派发，不碰加速器。把设备类型设成 A2，`DeviceOperator` 就是 `BaseDeviceAdaptor`，`reshape_and_cache` 派到 `_npu_reshape_and_cache`；设成 A5，就是 `A5DeviceAdaptor`，派到 `npu_scatter_pa_kv_cache`。两条派发路径各跑一遍，分发逻辑就钉死了——至于底下的昇腾内核真不真算，那要上 NPU 才知道，但「门面按代际选对了方法」这件事，形状级就能确认。
 
-## 21.9 小结：插件如何「无中生有」一条算法线
+## 24.9 小结：插件如何「无中生有」一条算法线
 
 回头看，本章和前面所有「顶替」章节的根本区别，就凝在一个词上：**加法式扩展**。
 

@@ -12,7 +12,7 @@
 
 这一章讲的就是怎么把这笔账记得更久。思路只有一句话：**别把 KV 用完就扔，写进一个独立的、跨请求跨实例共享的池子里**。后来任何一条请求，只要前缀撞上了，就从池里把 KV 捞回来，连重算都省了。这套机制在昇腾的代码里叫 **ascend_store**，整套代码住在 `vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/` 下面，入口是 `ascend_store_connector.py`。
 
-## 11.1 直传与池化：两种「省重算」
+## 12.1 直传与池化：两种「省重算」
 
 先把上一章和这一章的关系摆清楚，否则很容易混。两者都在省「已知前缀的重算」，但省法不一样。
 
@@ -35,7 +35,7 @@
 
 > 本章会反复用一个**精简版**来交叉验证逻辑：它是把真实源码剥掉 NPU / RDMA 等无关分支后、留下纯 Python 控制流的可运行子集。`test_get_num_new_matched_tokens_hit_arithmetic` 这类带 `test_` 前缀的用例，跑的就是这些精简版，验的是命中算术、状态翻转、队列节拍这些纯逻辑——host 上没有昇腾硬件也能跑通。真实的显存搬运（put / get 的 RDMA）验不了，那部分只读控制流。下文每提一次「精简版 …」，都是这个意思：一段能跑出数值、和正文论证对得上的参照物，不是正文的主角。
 
-## 11.2 入口：一个连接器，两端分派
+## 12.2 入口：一个连接器，两端分派
 
 vLLM 把「外部 KV」接进引擎，靠的是一套标准契约 `KVConnectorBase_V1`（KV 传输连接器基类）。引擎主循环在固定的几个时机回调连接器的钩子——分配前问一句「这条请求有多少 KV 在外面」、分配后通知一声、前向算完让你存、每步轮询哪些异步搬运完成了。昇腾要把池化接进来，就写一个子类把这些钩子实现掉。这个子类是本章的入口：
 
@@ -187,7 +187,7 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
 
 这就是整章的骨架。下面把两端分别拆开：先看调度端怎么「决定搬什么」，再看 worker 端怎么「异步搬」。
 
-## 11.3 调度端：跨进程问一句「池里有多少」
+## 12.3 调度端：跨进程问一句「池里有多少」
 
 引擎在给一条请求分配 block 之前，会先回调 `get_num_new_matched_tokens`，意思是「这条请求，除了本地 prefix cache 已经算好的，外面还有多少前缀能直接拿」。调度端的实现是这样：
 
@@ -365,7 +365,7 @@ class LookupKeyServer:
 
 到这里，「搬什么、搬多少」已经定了，写在 `LoadSpec` 里。下一步是把它打包下发。
 
-## 11.4 节拍：每一步调度都打一个包
+## 12.4 节拍：每一步调度都打一个包
 
 `build_connector_meta`（`pool_scheduler.py:L350`）是调度端的**节拍器**。引擎每走一个调度步，它就把这一步里要 load（带 `load_spec`）和要 save（`can_save`）的请求各打成一个 `ReqMeta`，聚成一个 `AscendConnectorMetadata`，随 `SchedulerOutput` 一起下发给 worker。
 
@@ -381,7 +381,7 @@ class LookupKeyServer:
 
 调度端只往里填，worker 端只往外读。
 
-## 11.5 Worker 端：把搬运甩进后台线程
+## 12.5 Worker 端：把搬运甩进后台线程
 
 清单下发到 worker，真正的搬运开始。但这里有个绕不过的物理事实：**put / get 是慢 IO**——KV 要跨网络写进 / 读出外部池，一来一回是毫秒级的延迟。如果让模型前向的主循环卡在这上面等，那 NPU 算力就白白晾着了。
 
@@ -517,7 +517,7 @@ class LookupKeyServer:
 
 这就是「节拍 / 背压解耦」的总开关。异步路径让慢 IO 和模型前向重叠；同步路径简单直接但会让主循环等。`get` 的返回值是每个块的状态码，非 0 表示这个块没取到，记进 `_invalid_block_ids`——引擎后续会知道这些块的 KV 不可信，得本地重算。
 
-## 11.6 存：背压屏障，一道必要的串行点
+## 12.6 存：背压屏障，一道必要的串行点
 
 存的入口是 `wait_for_save`。这个方法名里的 `wait` 不是随便起的——它真的会**等**。这是本章最微妙的一处设计，值得逐行看：
 
@@ -567,7 +567,7 @@ class LookupKeyServer:
 - 每次 `task_done` 让 `unfinished` 减 1；
 - `join()` 阻塞，当且仅当 `unfinished > 0`，归零即放行。
 
-关键是搞清发线程消费循环（11.5 那个 `run`）里 `task_done` 到底在哪调。[下一节 §11.7](#117-数据通路key-与-value-地址分两路再汇合) 内嵌的 `_handle_request` 会看到它有**两个正常出口**，各调一次 `task_done`：一是 `req_id` 不在 `stored_requests` 时的早退（`task_done` 在 try 内、随即 `return`），二是处理到末尾的正常完成（那句 `task_done` 位于 `try/finally` **之后**）。要留意：`try/finally` 只保证 `mark_completed_events`（释放 block），**并不**保证 `task_done`——下一节代码就在眼前时这点能直接对上。
+关键是搞清发线程消费循环（11.5 那个 `run`）里 `task_done` 到底在哪调。[下一节 §12.7](#127-数据通路key-与-value-地址分两路再汇合) 内嵌的 `_handle_request` 会看到它有**两个正常出口**，各调一次 `task_done`：一是 `req_id` 不在 `stored_requests` 时的早退（`task_done` 在 try 内、随即 `return`），二是处理到末尾的正常完成（那句 `task_done` 位于 `try/finally` **之后**）。要留意：`try/finally` 只保证 `mark_completed_events`（释放 block），**并不**保证 `task_done`——下一节代码就在眼前时这点能直接对上。
 
 那异常路径呢？循环体里会出错的 IO 主要是 `m_store.put`——它被后端 `MooncakeBackend.put` 的 `try/except` **整个吞掉**（记日志、不外抛，见 11.8）；但 `lookup`（`exists`）、`prepare_value` 等调用并不在 try 内，原则上仍可能抛。而一旦真有异常逃逸到 `run` 外层的 `except`，那一项的 `task_done` 就被**跳过**（对照上一段：`try/finally` 只护 `mark_completed_events`），于是 `unfinished` 永不归零、`join()` 反而永久挂死——这恰恰是本节要避免的那个故障。所以下面的终止性严格以「正常拍内无异常逃逸到 `run`」为前提：在此前提下，每个入队请求都顺着两个正常出口之一恰好到达一次 `task_done`。
 
@@ -575,7 +575,7 @@ class LookupKeyServer:
 
 精简版的 `test_transfer_thread_decoupling_and_join_barrier` 正是把这条走了一遍：`add_request` 两个 chunk 后调 `request_queue.join()`，返回时 `backend.puts` 里确实有了 1 次 put、含 2 个 chunk——屏障返回 ⟺ put 已落地，和论证对上。
 
-## 11.7 数据通路：key 与 value 地址，分两路再汇合
+## 12.7 数据通路：key 与 value 地址，分两路再汇合
 
 到这里，「谁来搬、什么时候搬」都清楚了。还剩最后一个问题：搬运线程拿到一个请求，怎么算出**要把哪段显存、按什么名字、写进池子**？
 
@@ -706,7 +706,7 @@ key 列表和 (addr, size) 列表，最后一起喂给后端契约 `put(keys, ad
 2. `exists_states = self.lookup(keys)`——**先问池里有没有**，只留 `missing_indices`（池里没有的那些 chunk）；
 3. 仅对 missing 块 `_prepare_value` 算 `(addr, size)`，最后 `m_store.put`。
 
-中间还有句 `current_event.synchronize()`——等之前 `wait_for_save` 记的那个 NPU 事件完成，确保显存里的 KV 真的写完了，再往池里搬。末尾的 `self.request_queue.task_done()` 正是 [§11.6](#116-存背压屏障一道必要的串行点) 那道 `join()` 屏障等的信号。对着代码就能印证前面那段终止性论证：早退在 `try` 内调一次随即 `return`，正常到底那次落在 `try/finally` **之外**，而 `finally` 本身只护 `mark_completed_events`——两个出口恰好各到达一次。
+中间还有句 `current_event.synchronize()`——等之前 `wait_for_save` 记的那个 NPU 事件完成，确保显存里的 KV 真的写完了，再往池里搬。末尾的 `self.request_queue.task_done()` 正是 [§12.6](#126-存背压屏障一道必要的串行点) 那道 `join()` 屏障等的信号。对着代码就能印证前面那段终止性论证：早退在 `try` 内调一次随即 `return`，正常到底那次落在 `try/finally` **之外**，而 `finally` 本身只护 `mark_completed_events`——两个出口恰好各到达一次。
 
 第 2 步的去重是跨请求复用的精华。来看两条共享前缀的请求，连续两拍存进同一个池子，去重怎么收敛：
 
@@ -726,7 +726,7 @@ $$
 
 共享越广，省下的池带宽和容量越多。
 
-## 11.8 可插拔后端：六个方法，一招通吃
+## 12.8 可插拔后端：六个方法，一招通吃
 
 前面所有搬运代码，调的都是 `m_store.put / get / exists`。这个 `m_store` 到底是什么后端？答案是——**搬运代码根本不在乎**。它只依赖一个抽象契约 `Backend`：
 
@@ -828,7 +828,7 @@ class Backend(ABC):
 
 至于 `set_device`（绑 NPU）、`register_buffer`（经 Mooncake 的 transfer engine 注册显存）、`setup`（连 metadata server / master server）这些，都是和 NPU、RDMA 硬件强耦合的部分。host 上没有 NPU 和 CANN，跑不了真实的池存取——所以精简版用一个纯内存 dict 的替身后端来验**契约的调用顺序**（exists → 去重 → put、get 的状态码归一），实际的 RDMA 搬运不真跑。这条边界和本章一开始定的运行约束一致：能验的是控制流，验不了的是真实显存搬运。
 
-## 11.9 收个尾：异步完成的回收
+## 12.9 收个尾：异步完成的回收
 
 最后还有一环。异步搬运甩进后台线程后，引擎怎么知道哪些搬完了、可以放行 block 了？靠每步轮询 `get_finished`：
 
@@ -854,7 +854,7 @@ class Backend(ABC):
 
 至此，「调度器决定搬什么、worker 异步搬」整条链路闭环了：问命中 → 建 LoadSpec → 下发 metadata → 入队 → 后台搬 → 回收。[第 11 章](../../ch11-pd-disaggregation-mooncake/narrative/chapter.md)留下的「store / pool 存取与池调度节拍」这台大机器，到这里全部拆完。
 
-## 11.10 量化：这套池化到底省了什么
+## 12.10 量化：这套池化到底省了什么
 
 把几处收益落成可比较的量级，别停在「往往更省」这种话上。
 
@@ -888,11 +888,11 @@ $$
 
 也就是说，它正比于缺口、**而不是** prompt 全长 $P$。前缀命中越深，缺口相对 $P$ 越小，搬运越便宜。
 
-**写放大随复用广度下降。** [§11.7](#117-数据通路key-与-value-地址分两路再汇合) 算过：同一前缀被 $R$ 条请求共享，去重让它在池里只存一份，写放大从 $R$ 降到 1。这是 `kv_transfer.py` 里 put 前那道 `exists` 去重的直接量化收益。
+**写放大随复用广度下降。** [§12.7](#127-数据通路key-与-value-地址分两路再汇合) 算过：同一前缀被 $R$ 条请求共享，去重让它在池里只存一份，写放大从 $R$ 降到 1。这是 `kv_transfer.py` 里 put 前那道 `exists` 去重的直接量化收益。
 
 **解耦的代价是一道串行点。** 异步把 put / get 的 RDMA 延迟挪进后台线程，理想下与模型前向完全重叠，主循环的 `add_request` 只是 O(1) 入队。但 `wait_for_save` 的 `join()` 是一道无法消除的串行点——它把这一拍 put 的尾延迟串进请求的关键路径。这是拿一点尾延迟，换「下一个相同 prompt 不漏命中」的正确性，是个明算过的取舍，不是疏忽。
 
-## 11.11 小结
+## 12.11 小结
 
 这一章把外存储层和池调度整个拆开了。回到开篇那张对比图，现在每一格都有了代码支撑：
 

@@ -12,7 +12,7 @@
 
 这一章只问一个核心问题：**为什么昇腾的 Worker 选择「重写」而不是「继承」GPU 的那一份？** 答案藏在一行文件头注释和四个被整段换掉的设备调用里。把这件事讲透，就读懂了 vllm-ascend 在执行层最重的一笔手术。
 
-## 13.1 一个进程，从开机到稳态：四步生命周期总览
+## 14.1 一个进程，从开机到稳态：四步生命周期总览
 
 先把 `NPUWorker` 一生要干的活摆出来。抛开几十个转发型小方法，主线就是**四步**，对应 `vllm_ascend/worker/worker.py` 里四个方法：
 
@@ -29,7 +29,7 @@
 
 这四步不是昇腾发明的——它们是 vLLM 给所有硬件后端定的**统一契约**。契约写在抽象基类 `WorkerBase` 里。昇腾要做的，是把这四个抽象方法**用昇腾的设备 API 填实**。问题在于：填实的方式，是「继承 GPU 已经填好的那份、改几处」，还是「另起一份从头填」？这正是本章的题眼，下一节就看证据。
 
-## 13.2 为什么不继承 GPU 的 Worker：WorkerBase 抽象与 cuda 的死结
+## 14.2 为什么不继承 GPU 的 Worker：WorkerBase 抽象与 cuda 的死结
 
 vLLM 的 Worker 抽象在 `vllm/v1/worker/worker_base.py`。它是个**纯抽象**：四步生命周期方法只有签名和文档，方法体一律 `raise NotImplementedError`。
 
@@ -93,7 +93,7 @@ class NPUWorker(WorkerBase):
 
 基类是 `WorkerBase`，不是 `Worker`。这一行，就是本章题眼的支点。
 
-## 13.3 搬结构、换设备层：文件头的物证与 \_\_init\_\_
+## 14.3 搬结构、换设备层：文件头的物证与 \_\_init\_\_
 
 「重写」听起来像「重造」，但 `NPUWorker` 不是从零写的。它**搬结构、换设备层**——控制流几乎逐行抄自 GPU 那份，只把每一处碰硬件的调用换掉。物证就写在 `vllm_ascend/worker/worker.py` 的文件头：
 
@@ -160,11 +160,11 @@ def __init__(
 
 1. **`super().__init__` 之前**，先做昇腾特有的开场白：`adapt_patch()` 打补丁（这套两段式猴补在 [第 3 章](../../ch03-two-stage-monkey-patch/narrative/chapter.md) 讲过）、注册 ATB 扩展与 customop、`init_ascend_config` 初始化昇腾配置和 SoC 版本。这些是 GPU 那份没有的、昇腾必须先铺好的地基。
 2. **`super().__init__`** 这一步，复用的正是 `WorkerBase` 的公共逻辑——把 `vllm_config` 摊开成 `model_config` / `cache_config` / `parallel_config` 等字段，记下 `local_rank` / `rank`，把 `device` 和 `model_runner` 先置空。这段和 GPU 的 `Worker` 走的是**同一段代码**——这就是「平级兄弟共用一个抽象基类」的实惠：公共的 config 摊开逻辑不必重写。
-3. **`super().__init__` 之后**，定 `cache_dtype`，并把 `profiler` 设成 `None` 懒初始化。注意它的类型是 `TorchNPUProfilerWrapper`——这是个横切点，[§13.8](#138-横切两点与一条平行路径profiler-与-xlite) 再点一句。
+3. **`super().__init__` 之后**，定 `cache_dtype`，并把 `profiler` 设成 `None` 懒初始化。注意它的类型是 `TorchNPUProfilerWrapper`——这是个横切点，[§14.8](#148-横切两点与一条平行路径profiler-与-xlite) 再点一句。
 
 地基铺好，下面四步逐个看。每一步我们都问同一个问题：**这里换了什么设备调用？**
 
-## 13.4 第 1 步 init\_device：设备层全换（含快照顺序的关键差异）
+## 14.4 第 1 步 init\_device：设备层全换（含快照顺序的关键差异）
 
 `init_device` 是对外契约（`WorkerBase` 的接口）。昇腾把它拆成**两层**：薄薄的 `init_device` 包住干重活的 `_init_device`。先看里层 `_init_device`，它是设备层重写最密集的地方：
 
@@ -207,7 +207,7 @@ def _init_device(self):
     return device
 ```
 
-把它和 [§13.2](#132-为什么不继承-gpu-的-workerworkerbase-抽象与-cuda-的死结) 里 GPU 的 `init_device` 并排看，「设备层全换」一目了然：
+把它和 [§14.2](#142-为什么不继承-gpu-的-workerworkerbase-抽象与-cuda-的死结) 里 GPU 的 `init_device` 并排看，「设备层全换」一目了然：
 
 | 干什么 | 基座（cuda） | 昇腾（npu） |
 |---|---|---|
@@ -246,9 +246,9 @@ def init_device(self):
 
 三件事：把 `_init_device` 返回的 device **存成成员**（注释强调 ray 场景会检查它）、`init_workspace_manager` 申请 workspace（昇腾给算子运算预留的工作缓冲区池，`num_ubatches` 是它要容纳的并行微批槽位数——昇腾每个 worker 固定开 1 个，基座开 dbo（动态批优化）时为 2）、构造 `NPUModelRunner`——这就是第 4 步 `execute_model` 要派活的对象。
 
-为什么要拆成两层？因为这给了**复用的接缝**：有一条轻量执行路径 `XliteWorker`，它只想换掉 ModelRunner、设备初始化照旧。拆层后，它只需 `override` 外层 `init_device`、复用里层 `_init_device` 即可，不必重抄设备初始化。这条平行路径 [§13.8](#138-横切两点与一条平行路径profiler-与-xlite) 点名。
+为什么要拆成两层？因为这给了**复用的接缝**：有一条轻量执行路径 `XliteWorker`，它只想换掉 ModelRunner、设备初始化照旧。拆层后，它只需 `override` 外层 `init_device`、复用里层 `_init_device` 即可，不必重抄设备初始化。这条平行路径 [§14.8](#148-横切两点与一条平行路径profiler-与-xlite) 点名。
 
-## 13.5 第 2 步 determine\_available\_memory：KV 能吃多少显存
+## 14.5 第 2 步 determine\_available\_memory：KV 能吃多少显存
 
 设备起来了，下一个大问题：**KV cache 能用多少显存？** 多了 OOM，少了浪费上下文长度。`determine_available_memory` 的办法是——拿假数据真跑一遍前向，量出峰值占用，剩下的才敢分给 KV。算法骨架和基座 `gpu_worker.py` 几乎逐行同构，只把 `torch.cuda.*` 换成 `torch.npu.*`、CUDA graph 换成 ACL/NPU graph。
 
@@ -373,7 +373,7 @@ $$
 
 封顶 `1.0` 是防呆——util 本来就接近满时，再加 δ 也不会越过 1.0。这段全是纯 Python 算术、不碰任何设备，所以在没有 NPU 的机器上注入几个桩就能跑出上面那两行 65/68 GiB 和 0.93 的数，正确性一目了然。
 
-## 13.6 第 3 步 compile\_or\_warm\_up\_model 与 \_warm\_up\_atb：预热那一发 ATB
+## 14.6 第 3 步 compile\_or\_warm\_up\_model 与 \_warm\_up\_atb：预热那一发 ATB
 
 KV 预算定了、KV cache 也分配好了，开服前还差最后一道——**预热**。冷启动的第一次前向往往奇慢：要现编译、要现初始化算子库。`compile_or_warm_up_model` 把这些开销在开服前一次性付掉。
 
@@ -456,7 +456,7 @@ def _warm_up_atb(self):
 
 最后 `return CompilationTimes(...)`——和 `WorkerBase` 约定的返回类型对齐。`encoder` 字段用 `getattr` 兜底：它是新版本 vLLM 才加的字段，老版本没有就退回 `0.0`，免得构造时崩。这种「向后兼容上游字段」的小防御，在 OOT（out-of-tree，树外插件）项目里随处可见。
 
-## 13.7 第 4 步 execute\_model：把活儿派发给 NPUModelRunner
+## 14.7 第 4 步 execute\_model：把活儿派发给 NPUModelRunner
 
 前三步都是**启动期一次性**的：`init_device`、`determine_available_memory`、`compile_or_warm_up_model` 各只在开机时跑一次，量级随模型规模 O(模型规模)，跑完就不再回头。第四步 `execute_model` 不一样——它是整个 Worker 里**唯一进稳态热路径**的方法：调度器每出一批 `scheduler_output`，就调它一次，一个请求的生命周期里要被调成百上千次。前三步的成本是一次性摊销的，`execute_model` 的成本却乘在每一拍上。但别被它的地位吓到，它本身很**薄**：
 
@@ -489,13 +489,13 @@ def execute_model(
 
 `NPUWorker` 在这一步的角色就是个**派发器**——真正的前向、采样、KV 写入，全在 `NPUModelRunner` 里。这也呼应了开头说的「本章只是脑壳」：`execute_model` 把控制权交棒出去，[第 15 章 NPUModelRunner](../../ch15-npumodelrunner-cuda-monkeypatch/narrative/chapter.md) 才是接住这一棒、跑通一次真实前向的地方。和基座 `execute_model` 对比，结构同构，差别只在昇腾多了 `profile_memory` / `dp.step` 这类设备侧观测点。
 
-## 13.8 横切两点与一条平行路径：profiler 与 xlite
+## 14.8 横切两点与一条平行路径：profiler 与 xlite
 
 主线讲完，补两个**点名不展开**的横切点，免得读者在源码里撞见时困惑。
 
-- **`profiler`（`vllm_ascend/profiler/torch_npu_profiler.py`）**：[§13.3](#133-搬结构换设备层文件头的物证与-__init__) 里 `__init__` 把 `self.profiler` 设成 `None` 懒初始化，类型是 `TorchNPUProfilerWrapper`。它是 vLLM `WorkerProfiler` 的子类，把 `torch_npu.profiler` 接进来，第一次 `profile(is_start=True)` 才真正建起来。`execute_model` 里那句 `self.profiler.step()` 就是推进它。性能剖析是观测旁支，不在四步主线里。
+- **`profiler`（`vllm_ascend/profiler/torch_npu_profiler.py`）**：[§14.3](#143-搬结构换设备层文件头的物证与-__init__) 里 `__init__` 把 `self.profiler` 设成 `None` 懒初始化，类型是 `TorchNPUProfilerWrapper`。它是 vLLM `WorkerProfiler` 的子类，把 `torch_npu.profiler` 接进来，第一次 `profile(is_start=True)` 才真正建起来。`execute_model` 里那句 `self.profiler.step()` 就是推进它。性能剖析是观测旁支，不在四步主线里。
 
-- **`xlite/`（`vllm_ascend/xlite/xlite_worker.py`）**：一条**平行于 `NPUWorker`/`NPUModelRunner` 主线的轻量执行路径**。`XliteWorker` 继承 `NPUWorker`、只 `override` `init_device` 改用 `XliteModelRunner`——这正是 [§13.4](#134-第-1-步-init_device设备层全换含快照顺序的关键差异) 里「`init_device` / `_init_device` 拆两层」留下的接缝在发挥作用：它复用里层 `_init_device` 的全套设备初始化，只换外层造的 ModelRunner。本章只点名，不展开。
+- **`xlite/`（`vllm_ascend/xlite/xlite_worker.py`）**：一条**平行于 `NPUWorker`/`NPUModelRunner` 主线的轻量执行路径**。`XliteWorker` 继承 `NPUWorker`、只 `override` `init_device` 改用 `XliteModelRunner`——这正是 [§14.4](#144-第-1-步-init_device设备层全换含快照顺序的关键差异) 里「`init_device` / `_init_device` 拆两层」留下的接缝在发挥作用：它复用里层 `_init_device` 的全套设备初始化，只换外层造的 ModelRunner。本章只点名，不展开。
 
 ## 小结：重写的边界画在哪
 

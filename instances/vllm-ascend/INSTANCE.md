@@ -116,3 +116,9 @@ ch33（sampling NPU adaptation，`vllm_ascend/sample/`）：
 - penalties/top-k-top-p/拒绝采样每个热点统一骨架 `if not HAS_TRITON:` 回退基类/`_pytorch`；`apply_all_penalties`（`penalties.py:L25`）与基座同签名，仅换内核为 `apply_penalties_triton`；`apply_top_k_top_p` 在模块加载期按芯片型号定派发（A2/A3→AscendC `npu_apply_top_k_top_p`，否则 `_apply_top_k_top_p_pytorch`）。
 - `AscendTopKTopPSampler.forward_native`（`sampler.py:L145`）三分支优先级：`VLLM_BATCH_INVARIANT`→回退基类（与 ch30 确定性同源）；`enable_async_exponential`→复用预算 `self.q` 直接 `div_`/`argmax`；默认→`random_sample`；default off 的 `reduce_sample`/`async-exponential` 是次要优化，精简版按 subtraction_plan 删除。
 - 投机解码拒绝采样判据：random 走 `target_token_probs/draft_token_probs >= uniform`（`rejection_sampler.py:L1036`）；被拒从残差 `max(0,target-draft)/q` argmax 重采（`sample_recovered_tokens_pytorch L1238`），残差重采同样用 `q~Exp(1)` 的 Gumbel-max；贪心走逐位比对 `draft==target_argmax`，全接受补 bonus。
+
+
+## 章序交错(2026-07-06 生效)
+- 36 章新序:六章原理章已归位(ch09 EPLB 原理/ch21 MLA/ch23 稀疏谱系/ch26 V4 收束/ch31 量化数学/ch34 投机采样),P8 解散并入 P3/P5/P7。映射存档 book/cartography/renumber-2026-07-05.json;补章走 RUNBOOK「补章发车 SOP」。
+- 跨章链接一律 ../../ 两层+文字号=目录号(lint_anchors 三规);全书节号=目录号。
+- 终验:gap-audit 2026-07-06 cliffs=0(唯一 cliff 已补指路),bumps 68 条 advisory 待日后 triage。

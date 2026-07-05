@@ -14,7 +14,7 @@
 
 同一个仓库、同一群作者、相邻的两个文件，为什么一个选「重写」、一个选「继承」？这一章就把这个反差讲透。答案不在子类怎么写，而在**父类怎么表达设备差异**——以及当父类没把路堵死、却也没给你留好接口时，昇腾用了一手**临时猴补（runtime monkey-patch，运行期临时替换符号）**，让父类的巨方法在它毫不知情的情况下跑在了昇腾上。
 
-## 14.1 同一个仓库，两种相反的策略
+## 15.1 同一个仓库，两种相反的策略
 
 先把两行类声明并排放一起，反差一目了然：
 
@@ -42,7 +42,7 @@ class NPUModelRunner(GPUModelRunner): # ch15：直接派生 GPU 实现类 ——
 
 下面三节，就按这三类接缝逐个拆。
 
-## 14.2 第一类接缝：父类亲手留的 override 钩子
+## 15.2 第一类接缝：父类亲手留的 override 钩子
 
 最干净的一类接缝，是父类**主动**留的。GPU 的 `GPUModelRunner` 里有两个方法，注释直接写明「留给 model runner 子类覆盖」：
 
@@ -74,7 +74,7 @@ def _sync_device(self) -> None:
 
 这一类接缝最省心：父类给了明确接口，子类填实即可，和普通继承没两样。**真正的好戏在另外两类——父类并没有留接口，符号是「散」在方法体里的。**
 
-## 14.3 第二类接缝：散落在方法体里的 torch.cuda.*
+## 15.3 第二类接缝：散落在方法体里的 torch.cuda.*
 
 来看父类一个典型的设备耦合大户——`profile_cudagraph_memory`（图捕获前预估显存）。它的核心片段是这样的：
 
@@ -106,7 +106,7 @@ with self._freeze_gc(), graph_capture(device=self.device):
 
 昇腾的破解办法，是把这些**全局符号**在父方法运行的那一瞬间「偷梁换柱」。这就引出本章的主角——两个成对进出的上下文管理器。先看构造期就用上的第一个。
 
-## 14.4 构造期的第一处猴补：包住父类的巨构造器
+## 15.4 构造期的第一处猴补：包住父类的巨构造器
 
 `NPUModelRunner.__init__` 的关键只有一句——它把父类那个庞大的构造器，整个塞进了一个 `with` 块里：
 
@@ -137,9 +137,9 @@ self.attn_state: AscendAttentionState | None = None
 self.use_aclgraph = self._use_aclgraph()
 ```
 
-父类 `__init__` 已经把 `self.sampler` 设成了 GPU 版 `Sampler`、注意力状态用的是 vLLM 自己的枚举。这里在 `super().__init__()` **之后**，把这两个字段覆盖成昇腾版——`AscendSampler` 与 `AscendAttentionState`。再算出 `use_aclgraph`，决定后续要不要走昇腾的图捕获。这三处后面 [§14.9](#149-为什么这种猴补是安全的) 再收尾，先把第一个 wrapper 的内部拆开看。
+父类 `__init__` 已经把 `self.sampler` 设成了 GPU 版 `Sampler`、注意力状态用的是 vLLM 自己的枚举。这里在 `super().__init__()` **之后**，把这两个字段覆盖成昇腾版——`AscendSampler` 与 `AscendAttentionState`。再算出 `use_aclgraph`，决定后续要不要走昇腾的图捕获。这三处后面 [§15.9](#159-为什么这种猴补是安全的) 再收尾，先把第一个 wrapper 的内部拆开看。
 
-## 14.5 \_torch\_cuda\_wrapper：进程级换符号，try/finally 成对装卸
+## 15.5 \_torch\_cuda\_wrapper：进程级换符号，try/finally 成对装卸
 
 这是全章最该逐字读的一段。它是个上下文管理器，进入时把 `torch.cuda.*` 一批符号指向 `torch.npu.*`，退出时收尾：
 
@@ -197,7 +197,7 @@ def _torch_cuda_wrapper():
 
 这是两处猴补里的第一处，只解决了「散落的 `torch.cuda.*`」这一类接缝。还剩下第三类——模块级的 `graph_capture` / `CUDAGraphWrapper`，它有个更微妙的坑。
 
-## 14.6 第三类接缝的坑：到底该把符号换进哪个模块
+## 15.6 第三类接缝的坑：到底该把符号换进哪个模块
 
 `graph_capture` 和 `CUDAGraphWrapper` 也是全局名字，按理照搬上一节的办法 `setattr` 换掉就行。但这里有个**致命的细节**：换进哪个模块的命名空间？
 
@@ -265,7 +265,7 @@ def _replace_gpu_model_runner_function_wrapper(target_module_name):
 
 > *图注：左表是 _torch_cuda_wrapper 换的 torch 设备符号（图里列了代表性的 4 个，源码共 8 个——7 个 torch.cuda.* 加 1 个 torch.Event 顶层符号），右表是 _replace_... 换的两个模块级符号。下方两个色块分别是失败兜底（placeholder）与可逆性（finally 还原）——后者保证置换的生存期被 with 作用域严格包住。*
 
-## 14.7 为什么换进去不报错：同形才能热替换
+## 15.7 为什么换进去不报错：同形才能热替换
 
 把 `CUDAGraphWrapper` 替换成 `ACLGraphWrapper`，父方法构造它时写的是 `CUDAGraphWrapper(self.model, vllm_config, runtime_mode, ...)`。要让这个构造**一字不改**就能成功，`ACLGraphWrapper` 必须和 `CUDAGraphWrapper`「长得一样」——这叫**鸭子兼容（duck-compatible，长得像就当得了）**。
 
@@ -319,7 +319,7 @@ def __init__(
 
 `ACLGraphWrapper` 内部真正的 ACL 图捕获与重放怎么实现，是另一条线的故事，留到讲昇腾编译与 ACLGraph 的那一章再展开。本章只需确认一件事：**它和 CUDAGraphWrapper 同形，所以能被热替换。**
 
-## 14.8 合起来：capture_model 的双 wrapper 与一次符号追踪
+## 15.8 合起来：capture_model 的双 wrapper 与一次符号追踪
 
 三类接缝、两个 wrapper 都备齐了，现在看它们怎么合体。`capture_model` 和 `profile_cudagraph_memory` 两个 override，结构一模一样——**双 wrapper 嵌套包住父类的同名方法**：
 
@@ -366,16 +366,16 @@ def capture_model(self) -> int:
 | t4　`_replace_...` 退出 finally | npu | cuda 版（**还原**）| `CUDAGraphWrapper`（**还原**）| 模块符号已复原 |
 | t5　`_torch_cuda_wrapper` 退出 finally | npu（稳态缺省）| —— | —— | torch.cuda 落稳态 |
 
-> † t0 的 `mem_get_info` 标 npu 而非 cuda 原生：构造期 `__init__` 里那次 `_torch_cuda_wrapper` 退出时，`finally` 已把它留在 npu 版作稳态缺省（见 [§14.5](#145-_torch_cuda_wrapper进程级换符号tryfinally-成对装卸) ④）。`capture_model` 在构造之后才被调，所以进它之前 `torch.cuda.mem_get_info` 早已是 npu。而同一行 `graph_capture` / `CUDAGraphWrapper` 两列仍是 cuda 版——构造期不碰模块级符号，它们要等 `_replace_...` 进入（t2）才换。
+> † t0 的 `mem_get_info` 标 npu 而非 cuda 原生：构造期 `__init__` 里那次 `_torch_cuda_wrapper` 退出时，`finally` 已把它留在 npu 版作稳态缺省（见 [§15.5](#155-_torch_cuda_wrapper进程级换符号tryfinally-成对装卸) ④）。`capture_model` 在构造之后才被调，所以进它之前 `torch.cuda.mem_get_info` 早已是 npu。而同一行 `graph_capture` / `CUDAGraphWrapper` 两列仍是 cuda 版——构造期不碰模块级符号，它们要等 `_replace_...` 进入（t2）才换。
 >
 > 表中 t5 行那两个「——」表示：该列归属的 `_replace_...` wrapper 已于 t4 退出、模块符号已还原，t5 不再由它管辖，故不再列值。
 
 读这张表的两个要点：
 
 - **t2 那一行是「全替换态」**——只有在这一拍，父方法看到的三个符号才全是昇腾版。父类的 `profile_cudagraph_memory` 正是在这一拍里被调用、跑完。
-- **t4、t5 反序卸载**——后进的 `_replace_...` 先退（还原模块符号），先进的 `_torch_cuda_wrapper` 后退（torch.cuda 落稳态）。这正是嵌套 `with` 的后进先出（LIFO）语义。注意 t4 把模块符号**精确还原**回了 cuda 版（因为 `original_attrs` 存了旧值），而 t5 的 torch.cuda 落到稳态缺省——两个 wrapper 的「还原」策略不同，前面 [§14.5](#145-_torch_cuda_wrapper进程级换符号tryfinally-成对装卸) / [§14.6](#146-第三类接缝的坑到底该把符号换进哪个模块) 已分别交代过。
+- **t4、t5 反序卸载**——后进的 `_replace_...` 先退（还原模块符号），先进的 `_torch_cuda_wrapper` 后退（torch.cuda 落稳态）。这正是嵌套 `with` 的后进先出（LIFO）语义。注意 t4 把模块符号**精确还原**回了 cuda 版（因为 `original_attrs` 存了旧值），而 t5 的 torch.cuda 落到稳态缺省——两个 wrapper 的「还原」策略不同，前面 [§15.5](#155-_torch_cuda_wrapper进程级换符号tryfinally-成对装卸) / [§15.6](#156-第三类接缝的坑到底该把符号换进哪个模块) 已分别交代过。
 
-## 14.9 为什么这种猴补是安全的
+## 15.9 为什么这种猴补是安全的
 
 进程级改全局符号，听着就危险——会不会漏还原、把别处带崩？这一节用一句话归纳它的安全性骨架。
 
@@ -397,7 +397,7 @@ def capture_model(self) -> int:
 
 **用约 80 行接缝代码、临时换 10 个符号，换来 7000 多行父类逻辑一行不改地跑在昇腾上**——这就是「继承 + 猴补」相对「整段重写」的账。对比 [第 14 章](../../ch14-npuworker-execution-control/narrative/chapter.md) 的 Worker：那边父类把设备钉死在 else-raise，没有任何接缝可换，只能把整个文件重写一遍。两章的分水岭，从头到尾都画在**父类那一侧**。
 
-最后收回 [§14.4](#144-构造期的第一处猴补包住父类的巨构造器) 留的尾巴——构造器跑完后那三处实体替换里，还有一个 `use_aclgraph`：
+最后收回 [§15.4](#154-构造期的第一处猴补包住父类的巨构造器) 留的尾巴——构造器跑完后那三处实体替换里，还有一个 `use_aclgraph`：
 
 ```python
 # vllm_ascend/worker/model_runner_v1.py:L620-L625

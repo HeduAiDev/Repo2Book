@@ -24,3 +24,5 @@
 | exp-0705-16 | 2026-07-05 | difficulty=core 机制缺内嵌源码/三段式子标题,评审与结构 linter 核验粒度是全章级,个别机制漏内嵌拦不住 | scripts/lint_chapter_structure.py(新增 core_mechanism_missing_source:逐 core 机制核 source_anchors 与正文代码块区间相交;ch31/ch32 逗号列表式 marker 漏认→按防回归硬规则降级 warn,解析补全后再升 blocking;三段式子标题检查为第二迭代未做) | core 机制"缺内嵌源码/三段式不完整"blocking 条数 | active |
 | exp-0705-17 | 2026-07-05 | lint_formulas 密度启发式把单符号/简单变量 inline 也计入密度计数,数学密集章节噪音偏高 | scripts/lint_formulas.py(_is_simple_inline_formula,Check 6) | 数学密集章节 too_many_inline_formulas 告警数 | active |
 | exp-0705-18 | 2026-07-05 | book-retro/book-gap-audit 的 args 若被注入为 JSON 字符串,args.instance 判断为假,静默回退到脚本内 CFG 默认值 | .claude/workflows/book-retro.js,.claude/workflows/book-gap-audit.js(内联 JSON.parse 护栏+log 告警);.claude/workflows/lib/resolve-cfg.js(纯函数单测参照,node --test) | CFG 静默回退导致报告文不对题的事故次数 | active |
+| exp-0705-19 | 2026-07-06 | 全书 228 跨章链接相对路径差一层(../ 应 ../../),写手契约示例即错源且无 lint | scripts/lint_anchors.py 三规+writer 契约+引擎迁移一并修正 | anchors 三规 BLOCKING 数 | active |
+| exp-0705-20 | 2026-07-06 | agent 做机械批量重映射易套错映射表(节号修复者 23 章错位)——机械迁移应确定性脚本+机器裁判,不交推理 | RUNBOOK 补章 SOP(引擎+validate 为准) | 迁移后节号错位数 | active |

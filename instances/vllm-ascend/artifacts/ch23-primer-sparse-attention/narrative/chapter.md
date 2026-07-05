@@ -2,7 +2,7 @@
 
 ![本章在全书地图中的位置](../diagrams/roadmap.png)
 
-*图 32-0　你在这里：注意力与 KV 那一 Part 的原理深潜，昇腾在此顶替 vLLM 对应一站。*
+*你在这里：注意力与 KV 那一 Part 的原理深潜，昇腾在此顶替 vLLM 对应一站。*
 
 先给三句话的方位感：
 
@@ -476,4 +476,4 @@ $$
 - **数值推演** —— $L=131072$、$k=512$ 时主注意力降 256 倍，但 indexer 的固定开销把端到端拉回约 8.7 倍。主注意力加速不等于总加速。
 - **落地** —— `sfa_v1.py` 与 `dsa_v1.py` 里，`indexer_select_pre_process` 造 $\mathbf{k}^I$、`npu_quant_lightning_indexer` 一算子完成打分 + top-k、`index_topk` 就是那个 $k$,top-k 索引最后喂进稀疏注意力算子。
 
-这一章讲的是**为什么**这么设计、**数学**长什么样。至于这套机制在昇腾上怎么排 metadata、怎么摆 KV cache 布局、怎么用多流 overlap 把 indexer 和主注意力藏在一起跑快 —— 那是工程实现的活，交给 [稀疏注意力实现章](../../ch24-sparse-attention-sfa-dsa/narrative/chapter.md)。而 DSA 赖以站立的 MLA latent KV 与 nope/rope 记号，则来自 [上一章的 MLA 原理](../../ch21-primer-mla/narrative/chapter.md)。
+这一章讲的是**为什么**这么设计、**数学**长什么样。至于这套机制在昇腾上怎么排 metadata、怎么摆 KV cache 布局、怎么用多流 overlap 把 indexer 和主注意力藏在一起跑快 —— 那是工程实现的活，交给 [稀疏注意力实现章](../../ch24-sparse-attention-sfa-dsa/narrative/chapter.md)。而 DSA 赖以站立的 MLA latent KV 与 nope/rope 记号，则来自 [第 21 章的 MLA 原理](../../ch21-primer-mla/narrative/chapter.md)。

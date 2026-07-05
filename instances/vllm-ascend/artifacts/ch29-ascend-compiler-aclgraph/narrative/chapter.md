@@ -14,7 +14,7 @@
 
 答案出奇地干净：在 `platform.py` 上动了三处钩子，但归根结底是**「编译」和「图捕获」两根支柱**——pass manager 是为编译后端服务的，算是「编译」这根支柱里的一颗螺丝。三处钩子、两根支柱，这一章就围着这层关系展开。
 
-## 25.1 三个字符串，换掉 vLLM 整套编译栈 {#251-三个字符串换掉-vllm-整套编译栈}
+## 29.1 三个字符串，换掉 vLLM 整套编译栈 {#251-三个字符串换掉-vllm-整套编译栈}
 
 vLLM 早把「编译后端」「图捕获包装器」「pass manager」都抽象成了 `current_platform` 上的钩子——每个钩子返回一个**类路径字符串**，vLLM 再按字符串 import 出真正的类。换句话说，这几样东西在 vLLM 框架里本就是「可替换插槽」。
 
@@ -48,7 +48,7 @@ def get_static_graph_wrapper_cls(cls) -> str:
     return "vllm_ascend.compilation.acl_graph.ACLGraphWrapper"  # noqa
 ```
 
-三个字符串，对应三处顶替。但别被「三」带偏了——这三处不是三件平起平坐的事：`get_compile_backend` 和 `get_static_graph_wrapper_cls` 各立一根支柱（**编译** / **图捕获**），而 `get_pass_manager_cls` 返回的 pass manager 是给编译后端供货的，本质上是「编译」这根支柱里的一颗螺丝。所以全章看下来是**三个钩子、两根支柱**——这也是 §25.5 收尾时要回到的那两根。配一张图把全景立住：
+三个字符串，对应三处顶替。但别被「三」带偏了——这三处不是三件平起平坐的事：`get_compile_backend` 和 `get_static_graph_wrapper_cls` 各立一根支柱（**编译** / **图捕获**），而 `get_pass_manager_cls` 返回的 pass manager 是给编译后端供货的，本质上是「编译」这根支柱里的一颗螺丝。所以全章看下来是**三个钩子、两根支柱**——这也是 §29.5 收尾时要回到的那两根。配一张图把全景立住：
 
 ![三处平台钩子换掉 vLLM 编译三件套](../diagrams/fig25-1-two-hooks-override.png)
 
@@ -84,9 +84,9 @@ class AscendCompiler(CompilerInterface):
 
 至此，顶替的「外壳」清楚了：昇腾不碰 vLLM 的编译流程，只在三个插槽里换上自己的实现类。**vLLM 看到的还是 `CompilerInterface` / `CUDAGraphWrapper` / `PostGradPassManager` 这套接口，背后的肉已经全换成 NPU 的了。**
 
-剩下三章节，就是逐一打开这三个 NPU 版实现：编译后端 `AscendCompiler`（§25.2）、融合 pass 栈 `GraphFusionPassManager`（§25.3）、图捕获包装器 `ACLGraphWrapper`（§25.4）。先从编译后端开始。
+剩下三章节，就是逐一打开这三个 NPU 版实现：编译后端 `AscendCompiler`（§29.2）、融合 pass 栈 `GraphFusionPassManager`（§29.3）、图捕获包装器 `ACLGraphWrapper`（§29.4）。先从编译后端开始。
 
-## 25.2 AscendCompiler.compile()：一次编译，两条路 {#252-ascendcompilercompile一次编译两条路}
+## 29.2 AscendCompiler.compile()：一次编译，两条路 {#252-ascendcompilercompile一次编译两条路}
 
 `CompilerInterface` 的核心方法是 `compile(graph, example_inputs, ...)`——Dynamo 把 Python 前向 trace 成 `fx.GraphModule`（PyTorch FX 的符号计算图，相当于一份类 IR 的中间表示）后，就把图交给它，期待返回一个编译好的可调用对象 `compiled_fn`。`AscendCompiler.compile` 占的就是这个位：
 
@@ -252,7 +252,7 @@ def fusion_pass_compile(
     return compiled_fn, None
 ```
 
-关键在 `compile_inner`：它从 `compiler_config[COMPILATION_PASS_KEY]` 取出一个对象，对图调用它、返回改过的图。这个 `COMPILATION_PASS_KEY`（值是 `"graph_fusion_manager"`）取出来的，**正是 §25.1 那个 `get_pass_manager_cls` 顶替进来的 `GraphFusionPassManager` 实例**——它经 Inductor 的自定义 pass 机制注入到了 `compiler_config` 里。三个钩子在这里第一次「合流」。
+关键在 `compile_inner`：它从 `compiler_config[COMPILATION_PASS_KEY]` 取出一个对象，对图调用它、返回改过的图。这个 `COMPILATION_PASS_KEY`（值是 `"graph_fusion_manager"`）取出来的，**正是 §29.1 那个 `get_pass_manager_cls` 顶替进来的 `GraphFusionPassManager` 实例**——它经 Inductor 的自定义 pass 机制注入到了 `compiler_config` 里。三个钩子在这里第一次「合流」。
 
 再看 `compile_fx` 这层包装：
 
@@ -270,7 +270,7 @@ def compile_fx(graph: GraphModule, example_inputs: list, inner_compile: Callable
 
 那 `GraphFusionPassManager` 到底跑了哪些融合？这就是下一节。
 
-## 25.3 融合 pass 栈：GraphFusionPassManager {#253-融合-pass-栈graphfusionpassmanager}
+## 29.3 融合 pass 栈：GraphFusionPassManager {#253-融合-pass-栈graphfusionpassmanager}
 
 `GraphFusionPassManager` 对位的是 vLLM 的 `PostGradPassManager`。为什么不直接复用 vLLM 那个？类自己的 docstring 给了理由：
 
@@ -339,7 +339,7 @@ def configure(self, config: VllmConfig):
 
 注意 `is_310p()` 这个门控：310P 推理卡上 `fuse_norm_quant` / `fuse_muls_add` 直接跳过——平台内部还有平台差异，[第 18 章](../../ch18-310p-inference-chip-specialization/narrative/chapter.md)讲过 310P 的特殊待遇，这里又见一例。
 
-§25.3 是全章最密的一段，先用一张全景图把这套融合 pass 栈的零件摆齐，后面几小节再逐个拧：
+§29.3 是全章最密的一段，先用一张全景图把这套融合 pass 栈的零件摆齐，后面几小节再逐个拧：
 
 ![融合 pass 栈全景：6 个 Pass + 占位锚点 + 双注册 + 融合实例](../diagrams/fusion_pass_stack.png)
 
@@ -489,7 +489,7 @@ class AddRMSNormQuantFusionPass(VllmInductorPass):
 
 至此分支 B 的全链路通了：`fusion_pass_compile` → `GraphFusionPassManager.__call__` → 各 `Pass.__call__` → `PatternMatcherPass.apply` → 把 `add_rms_norm_bias + quantize` 替成 `npu_add_rms_norm_quant`。编译这条线收尾。
 
-## 25.4 ACLGraphWrapper：把一次前向录成一张图 {#254-aclgraphwrapper把一次前向录成一张图}
+## 29.4 ACLGraphWrapper：把一次前向录成一张图 {#254-aclgraphwrapper把一次前向录成一张图}
 
 编译解决「图怎么算得快」；图捕获解决另一个问题——**host 端下发 kernel 的开销**。每跑一次前向，CPU 要逐个把 kernel 提交给 device，几百上千次提交累起来，小 batch 下 host 反而成了瓶颈。ACL 图 / CUDA 图的思路是：**第一次跑时把这串 device 端 kernel「录」成一张图，之后同样形状的前向直接 replay 这张图**，host 只下发一条 replay 指令。
 
@@ -663,7 +663,7 @@ GPU 上的 custom all-reduce 是一种「把 all-reduce 也录进 CUDA 图」的
 
 所以这条线的结论是：**框架在此，接入待来**。图捕获的地基（NPUGraph 捕获 / 分桶 / 207008 兜底）已经夯实，custom all-reduce 接到这块地基上，是这套机制之上顺理成章的下一步，只是 `ca_comm` 现在还空着。把它如实标在这里，比硬塞一段源码里不存在的调用要诚实。
 
-## 25.5 小结：两个字符串撑起的两根支柱 {#255-小结两个字符串撑起的两根支柱}
+## 29.5 小结：两个字符串撑起的两根支柱 {#255-小结两个字符串撑起的两根支柱}
 
 回头看，这一章其实只讲了两个字符串能撬动多大的事。
 

@@ -18,7 +18,7 @@
 
 前两问还顺手把两条老伏笔兑现了：第 16 章选定的 MoE 通信方式，在这里才真正落地成算子；第 6 章那个只讲了形状代数的 `NPUCommunicator.all_to_all`，在这里第一次有了「按专家路由」的用武之地。
 
-## 26.1 全书最大的「换头不换身」
+## 30.1 全书最大的「换头不换身」
 
 先看主角的骨架。`AscendFusedMoE` 直接继承 vLLM 的 `FusedMoE`：
 
@@ -86,7 +86,7 @@ def maybe_make_prepare_finalize(self, routing_tables=None):
 
 返回 `None`，明确告诉基类：「这条 modular-kernel 流水线我不用，别替我建。」昇腾要走自己的通信路径，不接管 vLLM 那套 prepare/finalize 模块化 kernel。
 
-## 26.2 forward 的两段委托：runner → forward_impl
+## 30.2 forward 的两段委托：runner → forward_impl
 
 算子建好了，前向怎么跑？`forward` 本身极薄：
 
@@ -183,7 +183,7 @@ def forward_impl(  # type: ignore[override]
 
 `forward_impl` 里反复出现的 `_EXTRA_CTX`，是**单步前向的执行上下文**（第 16 章建立的那个 per-step context）；其中的 `_EXTRA_CTX.moe_comm_method` 就是这一拍前向**当前选中的那一种通信方式**。它从哪来？这就接到第二个问题了。
 
-## 26.3 选专家：apply 是路由器到 fused_experts 的桥
+## 30.3 选专家：apply 是路由器到 fused_experts 的桥
 
 第②步的 `quant_method.apply`，主线非常短——选专家，然后打包交给通信层：
 
@@ -236,7 +236,7 @@ def apply(
 
 （`profile run` 那个 `enable_force_load_balance` 分支值得一提：profile 阶段为了估准显存，用随机路由把 token 均匀打散到所有专家，避免「恰好都堆到一张卡」造成的显存估计偏差。这不影响真实推理路径。）
 
-## 26.4 MoE 通信三选一注册表（回收 ch16）
+## 30.4 MoE 通信三选一注册表（回收 ch16）
 
 `_EXTRA_CTX.moe_comm_method` 这个「当前通信方式」是怎么定下来的？这要把第 16 章的伏笔接回来。
 
@@ -288,7 +288,7 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
 
 一条直觉贯穿这些阈值，也正是下一节量级轴要量化的东西：decode 阶段 token 少（落在 MC2 容量内），用 MC2 这种通信—计算流水线化的融合算子最优；prefill 阶段 token 多（超出容量），用 all_to_all 只搬真正需要的 token 更省。
 
-但 `select_moe_comm_method` 返回的只是一个**枚举值**。从枚举到「真正建好的通信对象」，是 `setup_moe_comm_method` 干的——它在 §26.1 那个 `__init__` 里被调用，把每个枚举映射到一个 `*CommImpl` 实例，存进一张注册表：
+但 `select_moe_comm_method` 返回的只是一个**枚举值**。从枚举到「真正建好的通信对象」，是 `setup_moe_comm_method` 干的——它在 §30.1 那个 `__init__` 里被调用，把每个枚举映射到一个 `*CommImpl` 实例，存进一张注册表：
 
 ```python
 # vllm_ascend/ops/fused_moe/moe_comm_method.py:L48
@@ -411,7 +411,7 @@ class AlltoAllCommImpl(MoECommMethod):
 
 复杂度全在被它们 `new` 出来的 `TokenDispatcher*` 里。这正是该看 token 重分发的时候了。
 
-## 26.5 token 按专家重分发（回收 ch06）
+## 30.5 token 按专家重分发（回收 ch06）
 
 先把 MoE 路由的通信代数说清楚，再看代码就有了坐标。这套代数只用四个记号，先列出来：
 
@@ -622,7 +622,7 @@ $$
 
 差距倍数恰好是 $ep\_size / top\_k$：根子在 $ep\_size$——AllGather 随卡数线性涨、All2AllV 不随卡数涨，卡越多、top_k 越小，All2AllV 省得越多。`select_moe_comm_method` 就是在这条轴上按 soc/EP/token 取点。
 
-## 26.6 FusedMC2：把三步融成一个算子
+## 30.6 FusedMC2：把三步融成一个算子
 
 `FusedMC2CommImpl` 是个特例。它的 `_get_token_dispatcher / _get_prepare_finalize` 和 MC2 一样，但它**覆写了基类的 `fused_experts`**，把「dispatch → mlp → combine」三步整个融成一个 C++ 融合算子：
 
@@ -660,7 +660,7 @@ def fused_experts(self, fused_experts_input: MoEFusedExpertsInput):
 
 这也呼应第 22 章见过的那个加载期钩子 [`process_weights_after_loading`](../../ch22-mla-on-npu/narrative/chapter.md)——那一章用它把 MLA 权重 `npu_format_cast` 成昇腾分形排布。FusedMoE 这里是同一个钩子的另一处分支：`enable_fused_mc2` 时它要把专家权重 `npu_format_cast` 成 NZ 格式——因为 `dispatch_ffn_combine` 这个融合算子**只吃 NZ 排布的权重**。这里的 NZ 不是「非零」，而是昇腾硬件友好的**分形（FRACTAL）NZ 内存排布**：它把张量切成小块、按匹配 cube 矩阵计算单元吞吐形状的次序摆放，融合算子要求权重按此排布才能充分利用 cube 单元的算力。算子的格式偏好，倒逼了加载期的权重转换。换头机制的接缝，一路传导到了权重布局。
 
-## 26.7 batch-invariant：可复现推理的额外保证
+## 30.7 batch-invariant：可复现推理的额外保证
 
 最后这一节和 MoE 正交，但同属 Part VI 的算子层，且是昇腾的一个特色保证：**batch-invariance**（批不变性）——同一个输入，不管它和谁拼成一个 batch、batch 怎么切分，输出**逐位相同**。
 
@@ -791,7 +791,7 @@ def matmul_persistent(x, y, bias=None):
 
 （对照基座：vLLM 主干的 batch_invariant 是同一套设计思路，昇腾把它落到了 NPU 的 triton / AscendC kernel 上，并补了 HCCL/LCCL 这层昇腾特有的集合通信确定性开关。）
 
-## 26.8 小结：换头机制的上界，与一致性的下界
+## 30.8 小结：换头机制的上界，与一致性的下界
 
 这一章用全书最大的单体算子，把第 27 章的「换头不换身」推到了压力极限。`AscendFusedMoE`（`vllm_ascend/ops/fused_moe/fused_moe.py`）近 900 行、横跨 12 个文件、内分 4 条通信路径，却仍然只通过三个接缝接入基类：
 

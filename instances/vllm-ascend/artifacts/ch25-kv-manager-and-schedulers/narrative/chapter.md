@@ -18,7 +18,7 @@ KV cache 管理（`vllm/v1/core/single_type_kv_cache_manager.py`、`vllm/v1/core
 
 承接[第 14 章 NPUWorker](../../ch14-npuworker-execution-control/narrative/chapter.md) / [第 15 章 NPUModelRunner](../../ch15-npumodelrunner-cuda-monkeypatch/narrative/chapter.md) / [第 16 章单步前向](../../ch16-single-step-forward-context-dp-sync/narrative/chapter.md)——那三章讲「拿到一批已调度好的请求后怎么跑」，本章讲的是它们**上游**：这批请求是怎么被调度出来的、KV block 是怎么分配的。
 
-## 22.1 入口：三个开关，默认一个都不拨
+## 25.1 入口：三个开关，默认一个都不拨
 
 先看特化是从哪里注入的。调度器的选择落在启动期的 `check_and_update_config`（[第 5 章](../../ch05-check-and-update-config/narrative/chapter.md)讲过这个统一改配置的钩子）里：
 
@@ -66,7 +66,7 @@ KV cache 管理（`vllm/v1/core/single_type_kv_cache_manager.py`、`vllm/v1/core
 
 `recompute` 那一支还多一道前置校验：`if kv_transfer_config is None or kv_role == "kv_both"` 就 `raise`——它只在 PD 分离模式（`kv_role` 是 `kv_producer` 或 `kv_consumer`）下才允许开，PD 混部（`kv_both`）或根本没配 KV 传输时一律拒绝。动机在「重算」对谁才有意义：PD 混部下，同一个节点既做 prefill 又做 decode，block 不够时本地重新 prefill 完全可行，用不着这套特化；只有纯 decode 节点（`kv_consumer`，KV 是从远端 prefill 节点拉来的）丢弃请求后无法在本地重算，才需要把它回吐 proxy 改投他处。这条约束本身就在说——recompute 是一个**强场景绑定**的特化，不是通用增强。
 
-## 22.2 KV manager：复用查表，只重映射一个 spec
+## 25.2 KV manager：复用查表，只重映射一个 spec
 
 先交代一个贯穿本章的基本单位：**KV block 是 KV cache 的分配单位**，一个 block 容纳 `block_size` 个 token 的完整 KV 向量；调度器和 KV manager 都按 block 粒度分配、回收，从不按单个 token 记账。后面所有「要几个 block」「命中几个 block」的算账，都是在这个粒度上做的。
 
@@ -132,9 +132,9 @@ def get_manager_for_kv_cache_spec(
 
 因为昇腾这个工厂**整个覆盖**了 vLLM 的同名工厂。vLLM 原本在它自己的工厂里给这两种「带回收的 spec」设了一个 admission 上限（vLLM PR #40946 引入），可昇腾的工厂顶替上来后，vLLM 那段设 cap 的代码就成了**永不到达的死代码**。不在这里补一遍，SWA / ChunkedLocal 组就没有 cap——`allocate_slots` 的 `full_sequence_must_fit` 分支会按整个 `max_model_len` 预留 block，并发一上去（cc≥2）直接耗尽 block 池（vLLM issue #40863 记录的死锁）。
 
-这是「覆盖父类方法」的一个隐性代价：你接管了一个函数，就同时接管了它**所有**的职责，包括那些跟你的特化无关、但原版顺手做了的事。这条经验后面 §22.4 / §22.5 会反复撞见——昇腾几个 `schedule()` 子类之所以体量巨大，根子都在这。
+这是「覆盖父类方法」的一个隐性代价：你接管了一个函数，就同时接管了它**所有**的职责，包括那些跟你的特化无关、但原版顺手做了的事。这条经验后面 §25.4 / §25.5 会反复撞见——昇腾几个 `schedule()` 子类之所以体量巨大，根子都在这。
 
-## 22.3 CompressAttentionManager：只改换算比例
+## 25.3 CompressAttentionManager：只改换算比例
 
 现在看右列唯一的「新增」manager。它继承 `FullAttentionManager`，构造函数只多存了两个字段：
 
@@ -219,7 +219,7 @@ $$
 
 关键是 `logical_block_size = block_size * kv_cache_spec.compress_ratio`。动机就在压缩本身：压缩 MLA 把多个逻辑 token 压进同一个物理 slot，于是前缀复用时两个请求的对齐边界必须按**逻辑块**单位算、而不是物理块，否则共享缓存的边界会错位——这正是引入 `logical_block_size = block_size × compress_ratio` 的理由。父类 `FullAttentionManager` 直接按物理 `block_size` 找命中；这里乘上 `compress_ratio`，命中的边界就抬到逻辑块——一个物理 block 对应 `compress_ratio` 倍的逻辑 token，错位半个 block 命中就废了。`max_num_blocks = max_length // logical_block_size` 也跟着用逻辑块大小来截断。
 
-至于 §22.2 给压缩 MLA 设的那个 `max_admission_blocks_per_request`，背后是一道简单的上界：
+至于 §25.2 给压缩 MLA 设的那个 `max_admission_blocks_per_request`，背后是一道简单的上界：
 
 $$
 \mathrm{peak\_blocks} = \left\lceil \frac{\mathrm{max\_model\_len} \mathbin{//} \mathrm{compress\_ratio}}{\mathrm{block\_size}} \right\rceil + 1
@@ -229,7 +229,7 @@ $$
 
 到此 KV manager 这一侧讲完了，回头数一下账：`BlockPool`、`SingleTypeKVCacheManager`、`FullAttentionManager`、`spec_manager_map`——四样原样复用；`get_manager_for_kv_cache_spec` 重映射、`CompressAttentionManager` 新增——两处特化，且后者的全部覆写就是「`//= compress_ratio` 后调 super()」。这就是「核心循环尽量少碰」的标准姿势。
 
-## 22.4 SchedulerDynamicBatch：动态预算 + decode 优先
+## 25.4 SchedulerDynamicBatch：动态预算 + decode 优先
 
 接下来三节是三个调度器子类。它们有一个共同的、反直觉的特点：**改动极小，文件却极大**。先用最简单的 `SchedulerDynamicBatch` 把这个矛盾讲透。
 
@@ -323,7 +323,7 @@ $$
 
 理解了这一点，本章「改动小、文件大」的悖论就解开了：**文件体量 ≠ 特化程度**。`scheduler_dynamic_batch.py` 几百行里，真正属于昇腾的不到十行，其余都是为了「能在方法中段插一脚」而付的复制税。读这种文件别被行数吓住——盯住 `ASCEND CHANGE` 注释，跳过逐字复刻段就行。
 
-## 22.5 RecomputeScheduler：把「抢占」改成「丢弃重算」
+## 25.5 RecomputeScheduler：把「抢占」改成「丢弃重算」
 
 `RecomputeScheduler` 是 PD 分离侧的调度器，承接[第 11 章 PD 分离](../../ch11-pd-disaggregation-mooncake/narrative/chapter.md)和[第 12 章 KV 池化](../../ch12-kv-pooling-ascend-store/narrative/chapter.md)。它的核心特化只有一个想法：**当 block 不够时，decode 节点不做本地抢占，而是把请求丢回 PD proxy 让别处重算**。这里的「重算」要先消歧：它**不是**在本节点重新计算，而是 `running.pop()` 摘掉请求、`kv_cache_manager.free()` 释放它的 KV，再回吐一个 `stop_reason='recomputed'` 的 `EngineCoreOutput`，由 PD proxy 把请求改投到有余量的节点、从头走一遍 prefill+decode（PD 分离与 remote KV 的来龙去脉见[第 11 章](../../ch11-pd-disaggregation-mooncake/narrative/chapter.md)、[第 12 章](../../ch12-kv-pooling-ascend-store/narrative/chapter.md)）。
 
@@ -452,9 +452,9 @@ def register_ascend_mla_spec_in_manager():
         _stm.spec_manager_map[AscendMLAAttentionSpec] = FullAttentionManager
 ```
 
-`spec_manager_map`（§22.2 那张查表）的键是**类对象**，在模块 import 时绑定。PD 场景下，`EngineCoreProc` 子进程 unpickle 一个 `AscendMLAAttentionSpec` 实例时，那张表可能还没把这个 spec 类登记进去，于是后面拿 `type(实例)` 去查表就 `KeyError`。补丁很轻：每次调度器构造时，若发现表里缺这个键，就补登记一份指向 `FullAttentionManager`。这类「为绕过 vLLM 内部时序而打的小补丁」，是 OOT 插件的家常便饭——[第 3 章两段式 monkey-patch](../../ch03-two-stage-monkey-patch/narrative/chapter.md)讲的就是这套打补丁的纪律。
+`spec_manager_map`（§25.2 那张查表）的键是**类对象**，在模块 import 时绑定。PD 场景下，`EngineCoreProc` 子进程 unpickle 一个 `AscendMLAAttentionSpec` 实例时，那张表可能还没把这个 spec 类登记进去，于是后面拿 `type(实例)` 去查表就 `KeyError`。补丁很轻：每次调度器构造时，若发现表里缺这个键，就补登记一份指向 `FullAttentionManager`。这类「为绕过 vLLM 内部时序而打的小补丁」，是 OOT 插件的家常便饭——[第 3 章两段式 monkey-patch](../../ch03-two-stage-monkey-patch/narrative/chapter.md)讲的就是这套打补丁的纪律。
 
-## 22.6 ProfilingChunkScheduler：用二次模型在线选 chunk size
+## 25.6 ProfilingChunkScheduler：用二次模型在线选 chunk size
 
 第三个子类 `ProfilingChunkScheduler` 解决的是另一个问题：**chunked prefill 每次切多大一块最合适？** 切太大，单步前向延迟飙高、拖累同批的 decode；切太小，调度开销摊不平。它的答案是——启动期实测、运行期反解。
 
@@ -545,7 +545,7 @@ $$
 
 值得点破一处「未完全启用」的实情：源码里 `time_budget` 被硬编码成 `0.01`、`target_latency` 那条路径用注释关掉了。原因写在注释里——FIA 算子在多请求组同批时性能异常，按目标延迟动态记账的那条路暂时禁用，`time_budget = 0.01` 只是个「非零守卫」让循环条件 `time_budget > 0` 恒成立。还有一套 history-aware 的拟合变体，默认 `with_history_ready=False`、调度路径走不到。换句话说，`ProfilingChunkScheduler` 是三个子类里成熟度最低的一个——二次模型的骨架完整可读，但「按实测延迟实时调」那半步还在等算子修复。把它如实标出来，比假装它已全功能上线诚实。
 
-## 22.7 没细讲的：KV offload 这类重度减法支线
+## 25.7 没细讲的：KV offload 这类重度减法支线
 
 最后点一笔本章**没有**展开的东西。昇腾在 KV 这块还有一条更重的支线：KV offload（把 KV 卸到 host CPU，见[第 13 章](../../ch13-kv-offloading-host-cpu/narrative/chapter.md)），底下甚至有 CPU offload 的多套 manager 实现。它们体量比本章任何一个文件都大。
 

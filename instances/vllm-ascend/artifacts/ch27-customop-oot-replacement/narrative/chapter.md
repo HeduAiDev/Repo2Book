@@ -18,7 +18,7 @@
 
 > *图注：左边模型代码不知昇腾存在；中间 `register_ascend_customop` 在启动期建一张表、遍历写进基座的 `op_registry_oot`；右边构造算子时，基座的 `__new__` 顺势换身、`dispatch_forward` 顺势换头。模型代码 0 改动。*
 
-## 23.1 一处调用：register_ascend_customop
+## 27.1 一处调用：register_ascend_customop
 
 顶替的入口只有一处，在 worker 初始化时被调一次：
 
@@ -63,7 +63,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
 
 `REGISTERED_ASCEND_OPS` 是这套机制的数据核心：一张普通的 `dict`。**键是 vLLM 算子的类名字符串**（如 `"RMSNorm"`、`"SiluAndMul"`），**值是对应的昇腾子类**（如 `AscendRMSNorm`、`AscendSiluAndMul`）。整张表说的就是一件事：「凡是 vLLM 里叫 `RMSNorm` 的算子，请改用 `AscendRMSNorm`。」
 
-注意键是**类名**而非 lowercase 注册名。vLLM 主干给 RMSNorm 的注册名是 `"rms_norm"`（小写带下划线），昇腾这里用的是类名 `"RMSNorm"`——这个差别后面 §23.5 会派上用场。
+注意键是**类名**而非 lowercase 注册名。vLLM 主干给 RMSNorm 的注册名是 `"rms_norm"`（小写带下划线），昇腾这里用的是类名 `"RMSNorm"`——这个差别后面 §27.5 会派上用场。
 
 建好表，接下来是真正的顶替动作：
 
@@ -84,11 +84,11 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
 
 核心是那个 `for` 循环：遍历整张表，对每一项调一次基座的 `CustomOp.register_oot`，把昇腾子类登记进去。`is_310p()` 那个分支是同构旁路——[第 18 章](../../ch18-310p-inference-chip-specialization/narrative/chapter.md)讲过的 310P 推理卡，算子实现不同，但顶替机制完全复用，只是把表里几个键 `update` 成 `*310` 类，主流程一点不分叉。
 
-末尾把 `_ASCEND_CUSTOMOP_IS_REIGISTERED` 置 `True`——配合开头的幂等闸，保证这一整套**全程只跑一次**。多 worker、测试反复调，第二次进来撞上闸门直接 `return`。这件事的细节留到 §23.6。
+末尾把 `_ASCEND_CUSTOMOP_IS_REIGISTERED` 置 `True`——配合开头的幂等闸，保证这一整套**全程只跑一次**。多 worker、测试反复调，第二次进来撞上闸门直接 `return`。这件事的细节留到 §27.6。
 
 我们先把「`register_oot` 到底干了什么」看清。
 
-## 23.2 register_oot：把昇腾子类写进全局注册表
+## 27.2 register_oot：把昇腾子类写进全局注册表
 
 `register_oot` 在 vLLM 主干里：
 
@@ -128,7 +128,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
 
 到这里，「准备工作」全部就绪：`op_registry_oot` 里躺着一张「vLLM 类名 → 昇腾子类」的全局映射。但模型还没构造呢。真正的魔法发生在算子被实例化的那一刻。
 
-## 23.3 换身：__new__ 在实例化前掉包
+## 27.3 换身：__new__ 在实例化前掉包
 
 这是整章最巧的一步。先问一个 Python 问题：当你写 `RMSNorm(hidden_size, eps)`，到底是谁决定「造出来的对象属于哪个类」？
 
@@ -175,7 +175,7 @@ assert isinstance(obj, RMSNorm)  # 身（继承/接口）不变
 
 最后一行 `isinstance(obj, RMSNorm)` 仍然成立——因为 `AscendRMSNorm` 继承自 `RMSNorm`。这点很关键：换身没有破坏类型契约，昇腾子类**就是**一个 RMSNorm，只是更具体。注册之前若构造 `RMSNorm(8)`，`op_registry_oot` 里没有这个键，拿到的就还是原版 `RMSNorm`——所以顶替严格依赖「先 `register_ascend_customop`、后构造模型」这个时序。
 
-## 23.4 换头：dispatch_forward 选 forward_oot
+## 27.4 换头：dispatch_forward 选 forward_oot
 
 换身只解决了「实例化哪个类」。但昇腾子类的 NPU 实现写在哪个方法里、前向时怎么被选中——这是「换头」，由 `__init__` 接着触发：
 
@@ -258,7 +258,7 @@ obj = mods.layernorm.RMSNorm(8)
 assert obj._forward_method == obj.forward_native
 ```
 
-## 23.5 标本一：AscendSiluAndMul，最简的「只覆 forward_oot」
+## 27.5 标本一：AscendSiluAndMul，最简的「只覆 forward_oot」
 
 理论讲完，看两个真实标本。先看激活算子，它把「只换头」演示到了极致：
 
@@ -304,7 +304,7 @@ class AscendSiluAndMul(SiluAndMul):
 
 > *图注：身（虚线框，接口 / 权重 / 注册键 / forward_native）继承自基座，一行不改；头（实线框，forward 实现）从 CUDA 的 `silu_and_mul` 换成 NPU 的 `npu_swiglu`。两边的「身」完全相同。*
 
-这里回收 §23.1 埋的那个伏笔——**注册键为什么用类名 `"SiluAndMul"` 而非 lowercase**。`dispatch_forward` 里那句 `compilation_config.enabled_custom_ops.update([self.__class__.name])` 用的是 `self.__class__.name`，而 `enabled()` 判断启停也查 `cls.name`。`register_oot` 把昇腾子类的 `.name` 设成了类名键 `"SiluAndMul"`（覆盖了基座 `register("silu_and_mul")` 设的小写名）。于是昇腾算子的启停以**类名**为键——这点精简版专门钉了一个测试：
+这里回收 §27.1 埋的那个伏笔——**注册键为什么用类名 `"SiluAndMul"` 而非 lowercase**。`dispatch_forward` 里那句 `compilation_config.enabled_custom_ops.update([self.__class__.name])` 用的是 `self.__class__.name`，而 `enabled()` 判断启停也查 `cls.name`。`register_oot` 把昇腾子类的 `.name` 设成了类名键 `"SiluAndMul"`（覆盖了基座 `register("silu_and_mul")` 设的小写名）。于是昇腾算子的启停以**类名**为键——这点精简版专门钉了一个测试：
 
 ```python
 mods.utils.register_ascend_customop()
@@ -312,7 +312,7 @@ assert AscendRMSNorm.name == "RMSNorm"            # OOT 注册键 = 类名
 assert mods.layernorm.RMSNorm.name == "rms_norm"  # 基座 in-tree 注册键不变
 ```
 
-## 23.6 标本二：AscendRMSNorm 与第二层二分
+## 27.6 标本二：AscendRMSNorm 与第二层二分
 
 第二个标本更有料。`AscendRMSNorm` 的 `forward_oot` 里藏着一个**新的二分**——这是本章承诺的「第二层」：
 
@@ -389,7 +389,7 @@ class AscendRMSNorm(RMSNorm):
 
 `super().__init__(...)` 把基座 RMSNorm 的 `weight`、`variance_epsilon` 等全盘复用——身不变。`self.bias` 是子类新增的字段，默认 `None`，给上面 `forward_oot` 的二分引用。
 
-## 23.7 enable_custom_op：第二层开关的真身
+## 27.7 enable_custom_op：第二层开关的真身
 
 `enable_custom_op()` 决定第二层走哪边。它的真身在 `utils.py`：
 
@@ -459,9 +459,9 @@ assert "_C_ascend.npu_add_rms_norm_bias" in names       # 融合 kernel 分支
 
 真实的 `npu_add_rms_norm_bias` / `npu_swiglu` 算子在 host 上不真跑，由测试的记录替身承接——我们验的是**控制流走对了哪条分支**，不是算子的数值。数值正确性由 NPU 上的端到端测试保证；这里要钉死的是「库在不在 → 融合还是回退」这条判定。
 
-## 23.8 幂等闸：为什么只生效一次
+## 27.8 幂等闸：为什么只生效一次
 
-最后收回 §23.1 的另一个伏笔——总开关的幂等性。`register_ascend_customop`（`vllm_ascend/utils.py:L645`）开头 `if _ASCEND_CUSTOMOP_IS_REIGISTERED: return`、结尾置 `True`，把整个建表 + 注册过程包成「最多跑一次」。
+最后收回 §27.1 的另一个伏笔——总开关的幂等性。`register_ascend_customop`（`vllm_ascend/utils.py:L645`）开头 `if _ASCEND_CUSTOMOP_IS_REIGISTERED: return`、结尾置 `True`，把整个建表 + 注册过程包成「最多跑一次」。
 
 这道闸不是可有可无的。`register_oot`（`vllm/model_executor/custom_op.py:L335`）里那句 `assert reg_name not in op_registry_oot` 对重复注册是**零容忍**的——一旦第二次遍历同一张表，第一个键就会撞 `assert` 炸掉。多 worker 进程、测试反复初始化都可能触发二次调用，幂等闸把它们挡在门外：
 
@@ -483,7 +483,7 @@ assert len(co.op_registry_oot) == n_first  # 幂等：表不变
 
 「全局且一次性」是这套机制的隐含前提：`op_registry_oot` 是进程级全局表，顶替对整个进程生效，所以注册动作天然只该发生一次。幂等闸 + `assert` 双保险，把这个前提变成了硬约束。
 
-## 23.9 小结
+## 27.9 小结
 
 这一章拆开了昇腾插件「换头不换身」的总开关，归结成两层正交的二分：
 

@@ -2,13 +2,13 @@
 
 ![你在这里](../diagrams/roadmap.png)
 
-> 上一章在注意力子系统里讲透了昇腾 MHA：TND 变长布局、`npu_fused_infer_attention_score`。
-> 本章接手同子系统的另一支——MLA：用低秩压缩把 KV cache 砍到约 1/57，再用「权重吸收」把解码期的解压省掉。
-> 注意力子系统还剩稀疏这一支——下一章看 SFA/DSA 怎么在 MLA 之上叠一层稀疏选择。
+> 上一章推导了 MLA 的三块数学地基：低秩 KV 压缩、解耦 RoPE、权重吸收。
+> 本章看昇腾把这套数学落成算子：把 KV cache 砍到约 1/57，解码期省掉解压。
+> 注意力子系统还剩稀疏这一支——下一章先讲 NSA→DSA 稀疏选择的原理谱系。
 
 这是本子系统 `torch_npu` 融合算子最密集的一章。`vllm_ascend/attention/mla_v1.py` 全文约 1804 行，把通用 MLA 的每一步都换成了昇腾专属的一把算子：`npu_format_cast`（权重排布）、`npu_kv_rmsnorm_rope_cache`（一把做 RMSNorm + RoPE + 写 KV cache）、`npu_fused_infer_attention_score(_v2)`（注意力）、`npu_attention_update`（在线 softmax 合并）。我们逐个拆开看。
 
-## 20.1 先说清楚：MLA 到底省了什么
+## 22.1 先说清楚：MLA 到底省了什么
 
 MLA（Multi-head Latent Attention，多头潜在注意力；[首现见第 19 章](../../ch19-attention-backend-selection/narrative/chapter.md)）是 DeepSeek-V2/V3 带火的注意力变体。它解决的是一个很具体的痛点：**KV cache 太占显存**。
 
@@ -18,7 +18,7 @@ $$
 \mathrm{MHA\_cache} = N \times (P + V) = 128 \times (128 + 128) = 32768 \;\mathrm{（标量/token/层）}
 $$
 
-MLA 换了个存法：不存满维 K/V，只缓存一个**低秩隐向量** `kv_c`（`kv_lora_rank = 512`），外加一个**解耦位置编码** `k_pe`（`qk_rope_head_dim = 64`）——本章默认你已了解低秩压缩与解耦 RoPE 背后的数学动机，完整推导见[第 21 章：MLA 原理](../../ch21-primer-mla/narrative/chapter.md)，这里只看昇腾把它落成了怎样的算子：
+MLA 换了个存法：不存满维 K/V，只缓存一个**低秩隐向量** `kv_c`（`kv_lora_rank = 512`），外加一个**解耦位置编码** `k_pe`（`qk_rope_head_dim = 64`）——本章默认你已了解低秩压缩与解耦 RoPE 背后的数学动机，完整推导[上一章：MLA 原理](../../ch21-primer-mla/narrative/chapter.md)刚给过，这里只看昇腾把它落成了怎样的算子：
 
 $$
 \mathrm{MLA\_cache} = L_{kv} + R = 512 + 64 = 576 \;\mathrm{（标量/token/层）}
@@ -34,7 +34,7 @@ $$
 
 MLA 的妙招叫**权重吸收（weight absorption）**：把「解压」这一步从 K 侧搬到 query 侧，并和 query 的上投影预先合并。于是 decode 期完全不碰满维 K/V，只对 512 维的隐向量做一次 MQA（多 query 头共享同一份 KV 的注意力）。这一招是本章的灵魂——它在 `vllm_ascend/attention/mla_v1.py` 的 `AscendMLAImpl` 里用昇腾算子兑现，我们先把它讲透。
 
-## 20.2 从 ch19 接棒：AscendMLAImpl 是谁选出来的
+## 22.2 从 ch19 接棒：AscendMLAImpl 是谁选出来的
 
 [第 19 章：注意力后端选择](../../ch19-attention-backend-selection/narrative/chapter.md)讲过昇腾如何按模型与配置路由到具体的注意力后端。当模型是 MLA 架构时，路由的落点就是 `AscendMLABackend`。它是一层薄壳，把「用哪个实现类、用哪个元数据 builder」这两个钩子接出去：
 
@@ -57,7 +57,7 @@ MLA 的妙招叫**权重吸收（weight absorption）**：把「解压」这一�
 
 对照基座 vLLM 的通用实现在 `vllm/model_executor/layers/attention/mla_attention.py`（`MLACommonImpl` / `MLACommonMetadataBuilder`）。下文凡提到「基类怎么做」，指的都是这个文件。
 
-## 20.3 权重吸收（一）：加载期把 kv_b_proj 拆成 W_UK 与 W_UV
+## 22.3 权重吸收（一）：加载期把 kv_b_proj 拆成 W_UK 与 W_UV
 
 吸收分两步：**加载期**把权重拆好、转好排布；**运行期**用一次 `torch.bmm` 把 query 投进 latent 空间。先看加载期的 `process_weights_after_loading`：
 
@@ -111,7 +111,7 @@ MLA 的妙招叫**权重吸收（weight absorption）**：把「解压」这一�
 
 `maybe_trans_nz` 把 `W_UK_T` 转成 `ACL_FORMAT_FRACTAL_NZ`（`utils.py:L55`，值为 `29`，FRACTAL_NZ 是昇腾 cube 的高效内排布）。**所以别把两个 format 搞混**：`kv_b_proj` 的权重 cast 用的是 ND（2，为了张量操作），只有最终喂 cube 的 `W_UK_T` 才转 NZ（29）。
 
-## 20.4 权重吸收（二）：运行期一次 bmm 投进 latent
+## 22.4 权重吸收（二）：运行期一次 bmm 投进 latent
 
 加载期备好了 `W_UK_T`，运行期 decode 每一步调 `_q_proj_and_k_up_proj`，把 query 的 `q_nope` 一把投进 latent 空间：
 
@@ -236,7 +236,7 @@ b = ql_nope @ kv_c                    # → 19.0
 
 两条路殊途同归，结果**逐位相等**（`a == b == 19.0`，精简版 test 里就是 `assert torch.allclose(a, b)`）：朴素路在 `(P,)` 空间里点乘，吸收路在 `(L,)` 空间里点乘，但因为矩阵乘有结合律，最终标量分毫不差。这正是吸收能成立的全部底气——换了计算顺序，没换计算结果。
 
-## 20.5 三段 metadata：build 如何切 decode 与 prefill
+## 22.5 三段 metadata：build 如何切 decode 与 prefill
 
 讲完吸收，回到调度层。每一步前向都要先建一份注意力元数据，告诉算子「这批 token 里哪些是 decode、哪些是 prefill、各自的序列边界在哪」。这活儿由 `AscendMLAMetadataBuilder.build` 干，它继承自 vLLM 的 `MLACommonMetadataBuilder`，产出三段式的 `AscendMLAMetadata`：
 
@@ -311,7 +311,7 @@ batch 在进来之前已经按「decode 段在前、prefill 段在后」重排�
 
 我们用一个混合 batch 在开发机上验证这套切分：`query_lens = [1, 1, 5, 7]`、阈值 1。`build` 出来 `num_decodes == 2`、`num_prefills == 2`、`num_decode_tokens == 2`、`num_actual_tokens == 14`，`prefill` 段和 `decode` 段都非空。prefill 段的 `actual_seq_lengths_q == [5, 12]`（`cumsum([5, 7])`），decode 段的 `actual_seq_lengths_q == [1, 2]`——和上面的切分逻辑分毫不差。纯 decode（`[1,1,1]`）时 `prefill is None`，纯 prefill（`[5,7]`）时 `decode is None`，三态都对。
 
-## 20.6 chunked-context：把长历史切块，每块 workspace 有界
+## 22.6 chunked-context：把长历史切块，每块 workspace 有界
 
 prefill 段里还藏着一个 `build_chunked_metadata`。它处理的是**带历史的 prefill**——也就是 chunked prefill 场景下，一个请求的前缀已经在 KV cache 里、当前这步只前向一段新 token，但算注意力时要带上全部历史 context。
 
@@ -372,7 +372,7 @@ $$
 
 表中的 `clamp` 指把每块算出的 context 长度截到合法区间：下截到 0（某条序列历史不足、算出来为负时取 0），上截到该块实际能容纳的长度。切成 2 块，第一块装下两条序列的前 16 个历史 token（第一条只有 8），第二块只剩第二条序列的最后 1 个 token。每块的 workspace 占用都被 `max_context_chunk` 框住——这是「分块」二字保证的不变量。关掉 chunked prefill 时这个方法直接返回 `None`，prefill 退回「无历史」的简单情形。
 
-## 20.7 forward 的真实分流：decode 走吸收，prefill 走解压
+## 22.7 forward 的真实分流：decode 走吸收，prefill 走解压
 
 元数据备好，进入计算。这里有一个**必须纠正的认知偏差**：vLLM 基类的 docstring 把 MLA 的两种数学等价写法叫 `forward_mqa`（数据搬运友好）和 `forward_mha`（计算友好），很容易让人以为昇腾版也是 `forward` 里调这两个方法。**实际上不是。** 本版的 `forward_mqa` / `forward_mha` 只是两个占位存根：
 
@@ -499,7 +499,7 @@ $$
         )
 ```
 
-decode 调的是 `_q_proj_and_k_up_proj`——就是 §20.4 那个吸收方法，query 直接投进 latent。prefill 路则截然不同：
+decode 调的是 `_q_proj_and_k_up_proj`——就是 §22.4 那个吸收方法，query 直接投进 latent。prefill 路则截然不同：
 
 ```python
 # vllm_ascend/attention/mla_v1.py:L1598
@@ -535,7 +535,7 @@ prefill 用 `q_proj` 出**满维** `q_nope` / `q_pe`，**不吸收**；而且它
 
 在开发机上把两条路各跑一遍可以看清这个差异：decode 路调了 `q_b_proj`（上投影）和 `npu_kv_rmsnorm_rope_cache`，**没碰** `kv_b_proj`；prefill 路则明确调了 `kv_b_proj` 显式解压，且返回结果里 `value is not None`。两路的算子调用序，和源码逐一吻合。
 
-## 20.8 exec_kv：一个算子做完 RMSNorm + RoPE + 写 cache
+## 22.8 exec_kv：一个算子做完 RMSNorm + RoPE + 写 cache
 
 上面两条路都调了 `exec_kv_*` 来处理 KV，落点是昇腾最有代表性的融合算子 `npu_kv_rmsnorm_rope_cache`。它把三件本来分开的事——`kv_a_layernorm` 的 RMSNorm、`k_pe` 的 RoPE、写分页 KV cache——揉进一个 kernel：
 
@@ -619,11 +619,11 @@ decode 路 query 的位置编码由 `rope_single` 单独加，它包的是 `npu_
         return x.view(B, N, D)
 ```
 
-## 20.9 decode 注意力：对 latent 的 MQA
+## 22.9 decode 注意力：对 latent 的 MQA
 
 decode 预处理出 `ql_nope`（已吸收的 query）、`q_pe`、缓存隐向量 `k_nope`、`k_pe`，交给 `_forward_decode`。它的主线很短——把张量摆成分页布局，调 `npu_fused_infer_attention_score_v2`，再 `_v_up_proj` 投回 V。
 
-注意一个命名的小坑：传进 `_forward_decode` 后，这个**已吸收的 latent query** 的形参名就叫 `q_nope`。它是 [§20.4](#204-权重吸收二运行期一次-bmm-投进-latent) 里已经投进 latent 的 `ql_nope`，**不是** prefill 路那个满维、未吸收的 `q_nope`。同名不同物，读代码时别被绊住：
+注意一个命名的小坑：传进 `_forward_decode` 后，这个**已吸收的 latent query** 的形参名就叫 `q_nope`。它是 [§22.4](#224-权重吸收二运行期一次-bmm-投进-latent) 里已经投进 latent 的 `ql_nope`，**不是** prefill 路那个满维、未吸收的 `q_nope`。同名不同物，读代码时别被绊住：
 
 ```python
 # vllm_ascend/attention/mla_v1.py:L1479
@@ -667,7 +667,7 @@ torch_npu.npu_fused_infer_attention_score_v2(q_nope, k_nope, k_nope, ...)
 
 完整的 `_forward_decode` 在真仓里很长，因为它要应付多种设备型号、量化模式、以及 ACL 图捕获——图捕获路径会先用 `get_max_workspace` 预取算子所需的 workspace 再录制。主线（非捕获、bf16、标准分页）就是上面这几行：摆布局、一次 `_v2` 算子、投回 V。
 
-## 20.10 prefill 注意力：新 token + chunked 历史的 LSE 合并
+## 22.10 prefill 注意力：新 token + chunked 历史的 LSE 合并
 
 最后是 prefill 的注意力 `_forward_prefill`。它分两步：先算当前这段**新 token** 的注意力，再用 `_compute_prefill_context` 把**历史 context** 的注意力补上、合并。
 
@@ -709,7 +709,7 @@ torch_npu.npu_fused_infer_attention_score_v2(q_nope, k_nope, k_nope, ...)
 
 第一步对新 token 用 `npu_fused_infer_attention_score`（TND 变长布局，回指 [第 20 章](../../ch20-ascend-attention-mha/narrative/chapter.md)）。关键是 `softmax_lse_flag=True`——让算子在吐注意力输出的同时，额外吐一份 **LSE**（log-sum-exp，对这段 key 的各注意力分数取指数、求和、再取对数）。它记录的是这段注意力的归一化因子（softmax 分母的对数）；后面把「新 token 注意力」和「历史 context 注意力」做在线合并时，正是据各段的 LSE 加权——所以它是合并的接缝料。
 
-第二步 `_compute_prefill_context` 是本章最后一段硬骨头。它把长 context 按 §20.6 切好的块，逐块从分页 cache 读 `kv_c`、解压、算注意力，最后用 `npu_attention_update` 把所有片段合并。读这段时会看到每轮调一次 `DeviceOperator.kv_cache_load`——它按 `block_table` 索引从分页 KV cache 里把该块的 `kv_c`（写进 `kv_c_normed`）与 `k_pe` 读出来，是一次设备侧的 gather（按页表跳着取，不是连续的普通拷贝）：
+第二步 `_compute_prefill_context` 是本章最后一段硬骨头。它把长 context 按 §22.6 切好的块，逐块从分页 cache 读 `kv_c`、解压、算注意力，最后用 `npu_attention_update` 把所有片段合并。读这段时会看到每轮调一次 `DeviceOperator.kv_cache_load`——它按 `block_table` 索引从分页 KV cache 里把该块的 `kv_c`（写进 `kv_c_normed`）与 `k_pe` 读出来，是一次设备侧的 gather（按页表跳着取，不是连续的普通拷贝）：
 
 ```python
 # vllm_ascend/attention/mla_v1.py:L1136
@@ -787,7 +787,7 @@ for chunk_idx in range(cdiv(C, MCC)):
 
 `cache_kv_c_chunk @ W_UK` 就是昇腾的 `kv_b_proj(kv_c_normed)` 显式解压，`merge_attn_states` 就是昇腾的 `npu_attention_update`。差别只在：基座每算完一块就 `merge` 一次（流式），昇腾攒齐 `prefix + 全部 chunk` 的列表再 `npu_attention_update` 一把合——数学结果相同。
 
-把昇腾这条循环的状态摆成逐轮表（接 §20.6 那个 `num_chunks = 2` 的例子）：
+把昇腾这条循环的状态摆成逐轮表（接 §22.6 那个 `num_chunks = 2` 的例子）：
 
 | 轮次 `i` | 动作 | 该块 `seq_tot` | 算子产出 | `out_list` 长度 | `lse_list` 长度 |
 |---|---|---|---|---|---|
@@ -810,7 +810,7 @@ $$
 
 这套合并逻辑是纯循环 + 形状代数，在开发机上可以完整复现。喂一个 `num_chunks = 2` 的 metadata 进去，`_compute_prefill_context` 恰好调了 2 次 `npu_fused_infer_attention_score`（每块一次），合并时 `lse_list` / `out_list` 长度都是 3（`1 + 2`），且合并后返回的 LSE 是 `None`（合完不再往上传 LSE）。当 `chunked_context is None` 时直接返回 prefix、一次注意力都不算——边界也对。
 
-## 20.11 小结：MLA 在昇腾上的全貌
+## 22.11 小结：MLA 在昇腾上的全貌
 
 回头看，`vllm_ascend/attention/mla_v1.py` 里的 MLA，是「一个数学招式 + 一串融合算子」的合奏：
 
@@ -818,4 +818,4 @@ $$
 - **prefill 和 decode 各走各的**：decode 数据搬运受限 → 吸收成 MQA；prefill 计算受限 → 显式 `kv_b_proj` 解压走 MHA。两路在 `forward` 内按 `has_decode` / `has_prefill` 分流，写进同一块 `o_proj_input` 的不同段。
 - **每一步都换成昇腾融合算子**：`npu_format_cast`（权重排布 ND/NZ）、`npu_kv_rmsnorm_rope_cache`（RMSNorm + RoPE + 写 cache 三合一）、`npu_fused_infer_attention_score(_v2)`（注意力）、`npu_attention_update`（chunked 历史的在线 softmax 合并）。这是本子系统算子最密集的一处。
 
-MHA、MLA 两支在昇腾上都讲透了，但注意力子系统还剩稀疏这一支。当上下文长到几十万 token、连 MLA 的 1/57 也省不动时，就得换个思路：不再对每个历史 token 都算注意力，而是只挑出少数关键 token。这正是[下一章 SFA/DSA](../../ch24-sparse-attention-sfa-dsa/narrative/chapter.md)要在 MLA 之上叠的那层稀疏选择。
+MHA、MLA 两支在昇腾上都讲透了，但注意力子系统还剩稀疏这一支。当上下文长到几十万 token、连 MLA 的 1/57 也省不动时，就得换个思路：不再对每个历史 token 都算注意力，而是只挑出少数关键 token。这正是[下一章的稀疏注意力谱系](../../ch23-primer-sparse-attention/narrative/chapter.md)要讲的——先把 NSA→DSA 稀疏选择的原理与打分函数讲清楚，再落到 SFA/DSA 的昇腾实现。

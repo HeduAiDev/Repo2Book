@@ -18,7 +18,7 @@
 
 ---
 
-## 19.1 从后端到实现：`get_impl_cls` 的两条岔路
+## 20.1 从后端到实现：`get_impl_cls` 的两条岔路
 
 先把上一章的接力棒接稳。被注册进 vLLM 的后端类长这样：
 
@@ -88,7 +88,7 @@ $$
 
 ---
 
-## 19.2 五态机：一根分流轴
+## 20.2 五态机：一根分流轴
 
 整个后端的灵魂，是一个只有六行的枚举：
 
@@ -120,7 +120,7 @@ class AscendAttentionState(Enum):
 
 ---
 
-## 19.3 元数据装配：`build` 把一批拆成两段
+## 20.3 元数据装配：`build` 把一批拆成两段
 
 `AscendAttentionMetadataBuilder` 继承自 vLLM 的 `AttentionMetadataBuilder[AscendMetadata]`。它每一步前向被调一次（逐层共享一份），把上游的通用元数据加工成本后端要吃的 `AscendMetadata`：
 
@@ -349,7 +349,7 @@ def build_for_graph_capture(
 
 ---
 
-## 19.4 写 KV：`reshape_and_cache` 落到 `_npu_reshape_and_cache`
+## 20.4 写 KV：`reshape_and_cache` 落到 `_npu_reshape_and_cache`
 
 前向第一件事，是把本步新算的 K/V 写回分页 cache。这步在基座 vLLM 里叫 `reshape_and_cache_flash`，是一个 CUDA 内核；昇腾换成自己的算子：
 
@@ -398,7 +398,7 @@ class BaseDeviceAdaptor:
 
 ---
 
-## 19.5 状态分流的前向：`forward` → `forward_impl`
+## 20.5 状态分流的前向：`forward` → `forward_impl`
 
 KV 写好了，该算注意力了。前向入口 `forward` 做的事不多——确认输出缓冲、懒初始化 cache 句柄、写 KV，然后把活交给 `forward_impl`：
 
@@ -520,7 +520,7 @@ def using_paged_attention(runtime_shape: int, vllm_config: VllmConfig) -> bool:
 
 ---
 
-## 19.6 两条算子路径
+## 20.6 两条算子路径
 
 分流之后，是两个具体的算子调用。
 
@@ -690,7 +690,7 @@ def get_attention_mask(self, causal: bool, model_config: ModelConfig):
 
 ---
 
-## 19.7 内核替换全景与 workspace 预取
+## 20.7 内核替换全景与 workspace 预取
 
 把前几节的算子对上号，本章的总立意就清晰了。昇腾做的事，是把基座 vLLM FlashAttention 的 CUDA 内核，**逐一顶替**成 `torch_npu` 算子：
 
@@ -769,7 +769,7 @@ def full_graph_pa(
 
 ---
 
-## 19.8 减法候选：INT8 KV 量化子类（选讲）
+## 20.8 减法候选：INT8 KV 量化子类（选讲）
 
 主路径讲完了。`attention_v1.py` 里还住着一个血缘很近的子类，值得点一句名：`AscendC8AttentionBackendImpl`。
 

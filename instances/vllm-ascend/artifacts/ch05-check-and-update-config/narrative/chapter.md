@@ -707,7 +707,7 @@ NPUPlatform.check_and_update_config(cfg)
 assert cfg.parallel_config.worker_cls == "vllm_ascend.worker.worker.NPUWorker"
 ```
 
-`"auto"` 被落定成了 `vllm_ascend.worker.worker.NPUWorker`——第 2 章埋下的那个「完整流程」之约，在这一行收回。至于 `NPUWorker` 这个类本身怎么接管设备初始化与模型前向，是 [第 14 章：NPUWorker 重写执行主控](../../ch13-npuworker-rewrite/narrative/chapter.md) 的主题，那时你会看到这根字符串最终被 resolve 成一个真正跑模型的对象。
+`"auto"` 被落定成了 `vllm_ascend.worker.worker.NPUWorker`——第 2 章埋下的那个「完整流程」之约，在这一行收回。至于 `NPUWorker` 这个类本身怎么接管设备初始化与模型前向，是 [第 14 章：NPUWorker 重写执行主控](../../ch14-npuworker-execution-control/narrative/chapter.md) 的主题，那时你会看到这根字符串最终被 resolve 成一个真正跑模型的对象。
 
 ---
 

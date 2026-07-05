@@ -6,7 +6,7 @@
 > 本章是最后一步：把 logits 变成 token，且不卡流水线。
 > 这也兑现了第 16 章留下的那个悬念——采样器内部到底做了什么。
 
-第 [15 章](../../ch16-single-step-forward-context-dp-sync/narrative/chapter.md)讲单步前向时，留过一个没打开的盒子。`NPUModelRunner._sample` 走到最后，只做了一次二选一的派发：没有投机解码就交给 `self.sampler`，有投机解码就交给 `self.rejection_sampler`。当时我们说，采样器内部那些「规避 CPU-NPU 同步、Triton 回退」的 NPU 对位，留到采样章再讲。
+第 [16 章](../../ch16-single-step-forward-context-dp-sync/narrative/chapter.md)讲单步前向时，留过一个没打开的盒子。`NPUModelRunner._sample` 走到最后，只做了一次二选一的派发：没有投机解码就交给 `self.sampler`，有投机解码就交给 `self.rejection_sampler`。当时我们说，采样器内部那些「规避 CPU-NPU 同步、Triton 回退」的 NPU 对位，留到采样章再讲。
 
 这一章就是来开这个盒子的。盒子里装着两个采样器：`vllm_ascend/sample/sampler.py` 里的 `AscendSampler`，和 `vllm_ascend/sample/rejection_sampler.py` 里的 `AscendRejectionSampler`。它们都继承自 vLLM 基类，但**只覆写少数几个方法**，其余原样继承。这是全书见过最薄的一层「壳」——比第 30 章的 FusedMoE 还薄。
 
@@ -18,7 +18,7 @@
 
 三件事，全靠「覆写几处、其余继承」做到。我们一件一件看。
 
-## 28.1 薄壳：基类把活干完了，昇腾只补三处
+## 33.1 薄壳：基类把活干完了，昇腾只补三处
 
 先看基类是怎么派发采样的。vLLM 的 `Sampler.sample` 把贪心和随机两条路并起来：
 
@@ -92,7 +92,7 @@ def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
 
 这就是「薄壳」的精髓：覆写的目的往往不是推翻基类，而是在基类正确实现的基础上，补一条硬件相关的旁路。看懂了这点，下面每个覆写方法你都能用同一把尺子量。
 
-## 28.2 算法宝石：Gumbel-max 如何避开 multinomial 的同步
+## 33.2 算法宝石：Gumbel-max 如何避开 multinomial 的同步
 
 现在进到这一章的核心——随机采样到底怎么做。
 
@@ -225,7 +225,7 @@ $$
 
 有种子的请求（`generators` 非空）走的是同一套数学，只是把对应行的 `q[i]` 用带种子的 `exponential_(generator=...)` 重新填一遍，保证可复现：同样的种子两次调用，抽出的 token 逐位相同。
 
-## 28.3 异步指数随机：把 RNG 藏进模型前向
+## 33.3 异步指数随机：把 RNG 藏进模型前向
 
 回到昇腾真正新增的那两行。`random_sample` 里，指数随机被包在一个 stream 切换里：
 
@@ -281,7 +281,7 @@ def forward_native(self, logits, generators, k, p):
 
 三条分支，默认那条最朴素，另两条是「确定性优先」和「极致重叠」的可选偏向。覆写 `forward_native` 的意义，就是在基类的采样契约里，把这三种取向接进来。
 
-## 28.4 top-k/top-p：按芯片派发，纯 torch 兜底
+## 33.4 top-k/top-p：按芯片派发，纯 torch 兜底
 
 `forward_native` 里那句 `self.apply_top_k_top_p(logits, k, p)` 也值得一看。`apply_top_k_top_p` 不是一个普通函数，而是**模块加载时按芯片型号定下来的派发入口**：
 
@@ -339,7 +339,7 @@ def _apply_top_k_top_p_pytorch(logits, k, p, top_k=None):
 
 这套 host 可跑的纯 torch 实现，正是「无 NPU 也能验证语义」的关键：可以在 CPU 上喂一个 `logits=[1,2,3,4]`、`k=2`，验证它确实只留下最大的两个（值 4、3）、其余两个变 `-inf`。芯片专用算子只是把同样的语义做得更快。
 
-## 28.5 penalties：同接口、换内核、HAS_TRITON 优雅回退
+## 33.5 penalties：同接口、换内核、HAS_TRITON 优雅回退
 
 接着是这一章的第二个母题：Triton 是加速、不是依赖。`AscendSampler.apply_penalties` 是最干净的样板：
 
@@ -403,7 +403,7 @@ def apply_all_penalties(
 > *图注：penalties、top-k/top-p、拒绝采样，每个热点都是这一个判定。有 Triton 走昇腾内核，没有就回退基类或纯 torch。*
 > *两条路结果同分布——Triton 只换更快的内核，不改采样语义。*
 
-## 28.6 投机解码：拒绝采样也是一层薄壳
+## 33.6 投机解码：拒绝采样也是一层薄壳
 
 最后是盒子里的第二个采样器：`AscendRejectionSampler`，投机解码（speculative decoding）专用。投机解码用一个小的 draft 模型先猜出若干 token，再用大的 target 模型一次性验证；拒绝采样（rejection sampling）就是那个「验证并决定接受到哪一位」的算法。
 
@@ -534,7 +534,7 @@ $$
 \min(p_d, p_t) + \max(0,\, p_t - p_d) = p_{\mathrm{target}}(x)
 $$
 
-无论 $p_t$ 大于还是小于 $p_d$ 都成立。这就是拒绝采样保边缘分布的经典结论——和 [§28.2](#为什么-argmaxpq-和按-p-多项式采样同分布) 的 Gumbel 等价一样，是一句话能推完的数学。draft 只是加速猜测，是否采纳由 target 说了算，且被拒时从残差补回，一个分布都不偏。
+无论 $p_t$ 大于还是小于 $p_d$ 都成立。这就是拒绝采样保边缘分布的经典结论——和 [§33.2](#为什么-argmaxpq-和按-p-多项式采样同分布) 的 Gumbel 等价一样，是一句话能推完的数学。draft 只是加速猜测，是否采纳由 target 说了算，且被拒时从残差补回，一个分布都不偏。
 
 把端到端串起来：`AscendRejectionSampler.forward` 先用持有的 `self.sampler`（也就是 `AscendSampler`）采出 bonus token，再 `apply_sampling_constraints` 套上温度/top-k/top-p，最后调 `rejection_sample` 做接受检验。无 Triton 时全程走上面那些 `*_pytorch` 回退，host 上就能验证四种场景的输出，逐一对上前面讲过的规则：
 
@@ -547,7 +547,7 @@ $$
 
 这四种输出和真仓 Triton 路径的可观察行为一致——精简版只是把同一套语义在 host 上跑给你看。
 
-## 28.7 小结：薄到几乎看不见的一层壳
+## 33.7 小结：薄到几乎看不见的一层壳
 
 这一章打开了第 16 章留下的采样盒子，里面是两个采样器（`vllm_ascend/sample/sampler.py` 与 `vllm_ascend/sample/rejection_sampler.py`，惩罚内核在 `vllm_ascend/sample/penalties.py`），加起来覆写的方法不超过十个。回头看，它们贯彻了三条对位策略：
 

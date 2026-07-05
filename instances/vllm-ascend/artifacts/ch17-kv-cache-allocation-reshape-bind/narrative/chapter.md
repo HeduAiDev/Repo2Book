@@ -16,9 +16,9 @@
 - **重整**：用 `torch.as_strided` 按 page 跨步重排出 NPU 物理布局。基座是一次 `view` + `permute`。
 - **绑定**：普通模型直接复用基座；但 DeepSeek-V4、longcat 这些层序/层数不规整的，得各走各的特化路。
 
-## 16.1 三步骨架：从字节到挂回各层
+## 17.1 三步骨架：从字节到挂回各层
 
-先看总入口。`initialize_kv_cache` 在物化 KV 之前，先 `deepcopy` 一份配置、补好 encoder/kv-sharing 层、初始化注意力后端，再调 `may_reinitialize_input_batch`（本章 [§16.8](#168-两条辅线spec-解析与输入批重建) 的辅线），最后把活儿交给 `initialize_kv_cache_tensors`：
+先看总入口。`initialize_kv_cache` 在物化 KV 之前，先 `deepcopy` 一份配置、补好 encoder/kv-sharing 层、初始化注意力后端，再调 `may_reinitialize_input_batch`（本章 [§17.8](#178-两条辅线spec-解析与输入批重建) 的辅线），最后把活儿交给 `initialize_kv_cache_tensors`：
 
 ```python
 # vllm_ascend/worker/model_runner_v1.py:L3700
@@ -78,7 +78,7 @@ def initialize_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[st
     return kv_caches
 ```
 
-读这一段，先抓骨架别陷进分支：`_allocate_kv_cache_tensors` 拿回一份「字节张量」字典，`_reshape_kv_cache_tensors` 把它整形成「可用 KV」字典，剩下整段 `if/else` 都是**绑定**——把可用 KV 挂回 `self.kv_caches` 和 `static_forward_context`。绑定为什么要分三路、`extract_dsv4_layer_index` 在排什么，留到 [§16.7](#167-bind按模型走三条路)。
+读这一段，先抓骨架别陷进分支：`_allocate_kv_cache_tensors` 拿回一份「字节张量」字典，`_reshape_kv_cache_tensors` 把它整形成「可用 KV」字典，剩下整段 `if/else` 都是**绑定**——把可用 KV 挂回 `self.kv_caches` 和 `static_forward_context`。绑定为什么要分三路、`extract_dsv4_layer_index` 在排什么，留到 [§17.7](#177-bind按模型走三条路)。
 
 整条流水线的产物在变，可以摆成一张图：
 
@@ -88,11 +88,11 @@ def initialize_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[st
 
 下面三节顺着这张图，把分配这一步的三件事——对齐、拆 K/V、sparse 双视图——逐个落到源码。
 
-## 16.2 对齐原语：为什么是 2MB，怎么对齐到 2MB
+## 17.2 对齐原语：为什么是 2MB，怎么对齐到 2MB
 
 分配的第一个常量，是 `_allocate_kv_cache_tensors` 开头那行 `alignment = 2 * 1024 * 1024`——2MB。为什么是 2MB？这要从 [PD 分离（见第 11 章）](../../ch11-pd-disaggregation-mooncake/narrative/chapter.md)说起：prefill 节点算完的 KV 要跨节点搬给 decode 节点，Mooncake/ADXL 就是承担这趟搬运的分布式 KV 传输系统。它走 RDMA、把 KV 张量注册成可被远端直读的内存区间，而这套注册要求**起始地址按 2MB 大页边界对齐**。对不齐，注册就失败。
 
-要先说清楚一件事：**这段对齐只在开了 KV 传输（即配置了 `kv_transfer_config`）时才真正生效**，没开传输时分配走的是另一条不对齐的快路——下一节 [§16.3](#163-int8-裸分配--把-kv-拆成两块) 见分晓。
+要先说清楚一件事：**这段对齐只在开了 KV 传输（即配置了 `kv_transfer_config`）时才真正生效**，没开传输时分配走的是另一条不对齐的快路——下一节 [§17.3](#173-int8-裸分配--把-kv-拆成两块) 见分晓。
 
 对齐落到两个纯算术原语。它们在源码里不相邻，但讲清「对齐到多少、怎么对齐」得放一起看：
 
@@ -127,7 +127,7 @@ $$
 
 `_align_memory` 把这套用到**真实地址**上：拿到张量的 `data_ptr()`，用同一个天花板公式算出第一个 ≥ 它、且是 `alignment` 倍数的地址 `aligned_addr`，再把超出的字节数换算成元素个数 `offset`，最后 `tensor[offset:]` 切掉头部、让新起点正好落在 2MB 边界。代价是最坏浪费 `< 2MB` 的头部——这是后面 `_allocate_int8_cache_tensor` 要「多分配 `alignment` 字节」的原因：得留出这段可能被切掉的余量。
 
-## 16.3 int8 裸分配 + 把 K/V 拆成两块
+## 17.3 int8 裸分配 + 把 K/V 拆成两块
 
 有了对齐原语，看统一的分配出口 `_allocate_int8_cache_tensor`。它是「KV 一律先按 int8 裸字节分配」这条铁律的物化点：
 
@@ -197,7 +197,7 @@ def _allocate_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str
                 assert isinstance(current_kv_cache_spec, AttentionSpec)
 
                 if self.use_sparse:
-                    # … 省略：sparse-c8 的 ratio 解包（见 §16.4）…
+                    # … 省略：sparse-c8 的 ratio 解包（见 §17.4）…
                     pass
                 else:
                     k_dim, v_dim = self._get_attention_kv_cache_dims(layer_name, current_kv_cache_spec)
@@ -219,7 +219,7 @@ def _allocate_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str
                 k_tensor = self._allocate_int8_cache_tensor(k_tensor_size, alignment)
                 if v_tensor_size is not None:
                     v_tensor = self._allocate_int8_cache_tensor(v_tensor_size, alignment)
-                # … 省略：sparse 时分配 dsa_k(/scale)（见 §16.4）…
+                # … 省略：sparse 时分配 dsa_k(/scale)（见 §17.4）…
 
                 for layer_name_inner in kv_cache_tensor.shared_by:
                     if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
@@ -229,7 +229,7 @@ def _allocate_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str
     return kv_cache_raw_tensors
 ```
 
-注意那行注释的双关：`k cache tensor (nope cache tensor in mla)`——拆 K/V 不只是为了 PD 分离把两块各自连续，对 DeepSeek MLA 还顺手把压缩 KV 的 nope 段、rope 段分到了 K、V 两块（[§16.5](#165-reshape把裸字节还原成-kv) 详谈）。注释说得直白：PD 传输只支持 `kv_cache` 的第 0 维是 `num_blocks`。原因在传输协议这一层——它按第 0 维以 block 为粒度连续切片搬运，要求每块张量的 0 维就是 `num_blocks`、块内连续；若 K、V 同住一张量、第 0 维顶着一个 size-2 的 K/V 维，协议就没法把 K、V 各自当成独立的连续区间分别注册、分别传，所以必须拆成两块。
+注意那行注释的双关：`k cache tensor (nope cache tensor in mla)`——拆 K/V 不只是为了 PD 分离把两块各自连续，对 DeepSeek MLA 还顺手把压缩 KV 的 nope 段、rope 段分到了 K、V 两块（[§17.5](#175-reshape把裸字节还原成-kv) 详谈）。注释说得直白：PD 传输只支持 `kv_cache` 的第 0 维是 `num_blocks`。原因在传输协议这一层——它按第 0 维以 block 为粒度连续切片搬运，要求每块张量的 0 维就是 `num_blocks`、块内连续；若 K、V 同住一张量、第 0 维顶着一个 size-2 的 K/V 维，协议就没法把 K、V 各自当成独立的连续区间分别注册、分别传，所以必须拆成两块。
 
 拆多大？靠 `calc_split_factor` 从 head 维度推：
 
@@ -240,7 +240,7 @@ def calc_split_factor(num_list: list[int]):
     return [total / num for num in num_list]
 ```
 
-给一组 head 维度 `[k_dim, v_dim]`，返回 `[(k+v)/k, (k+v)/v]`，再用整块字节数 `size // factor` 切。注意 `calc_split_factor` 返回的是浮点比例，但分配处写的是 `int(kv_cache_tensor.size // factor)`——显式向下取整成整字节，并不假设这个浮点除法恰好整除。万一切出来对不齐，[§16.5](#165-reshape把裸字节还原成-kv) 反推 `num_blocks` 时那句 `sum_page_size_bytes % page_size_bytes == 0` 的断言会当场拦下，不会把舍入误差悄悄带进后续形状。这样切出来的 K、V 字节数，正好按各自 head 维度占比分。
+给一组 head 维度 `[k_dim, v_dim]`，返回 `[(k+v)/k, (k+v)/v]`，再用整块字节数 `size // factor` 切。注意 `calc_split_factor` 返回的是浮点比例，但分配处写的是 `int(kv_cache_tensor.size // factor)`——显式向下取整成整字节，并不假设这个浮点除法恰好整除。万一切出来对不齐，[§17.5](#175-reshape把裸字节还原成-kv) 反推 `num_blocks` 时那句 `sum_page_size_bytes % page_size_bytes == 0` 的断言会当场拦下，不会把舍入误差悄悄带进后续形状。这样切出来的 K、V 字节数，正好按各自 head 维度占比分。
 
 下面拿两类注意力对比。**GQA**（Grouped Query Attention，分组查询注意力）的 K、V 头数对称；**MLA**（Multi-head Latent Attention，多头潜在注意力，DeepSeek 系用的压缩 KV）则把 KV 压成 nope（`kv_lora_rank` 低秩压缩段）与 rope（`qk_rope_head_dim` 旋转位置段）两段、维度悬殊：
 
@@ -251,7 +251,7 @@ def calc_split_factor(num_list: list[int]):
 
 GQA 的 K、V head 数对称，所以对半；MLA 的 nope（`kv_lora_rank=512`）比 rope（`qk_rope_head_dim=64`）大得多，K 块就吃掉 8/9 的字节。**这是「为什么拆、拆多少」的完整算术答案**——拆出来的两块字节数忠实反映各自负载，绝不是机械对半。
 
-## 16.4 sparse-c8 的双视图：两段 KV 共享一块对齐内存
+## 17.4 sparse-c8 的双视图：两段 KV 共享一块对齐内存
 
 DeepSeek-V3.2 的稀疏注意力（sparse-c8）在 K、V 之外还要一对 indexer 张量：`dsa_k`（int8 的 indexer key）和 `dsa_k_scale`（它的量化 scale）。朴素做法是各分一块，但那样 RDMA 注册条目就多一份。昇腾的做法是把这两段塞进**同一块对齐 int8 裸内存的两个视图**：
 
@@ -300,9 +300,9 @@ def _allocate_sparse_c8_indexer_tensors(
 | `dsa_k.data_ptr()` | `base` | 视图起点，实占 101 字节 |
 | `dsa_k_scale.data_ptr()` | `base + 102` | 同一裸张量、偏移 102（不是 101） |
 
-关键就在那 1 字节：`dsa_k` 只用 101 字节，但 `dsa_k_scale` 不从紧邻的 `base + 101` 起，而是被 `_align_up` 推到 `base + 102`——这个被跳过的字节就是对齐补齐留下的填充，保证 scale 视图起点落在 2 字节边界上。两个张量 `data_ptr` 差 102、共享底层 storage——`register_buffer` 能把它们合并成**一个**注册区间，HCCL/Mooncake 少注册一条。回看 [§16.3](#163-int8-裸分配--把-kv-拆成两块) 的省略处：sparse 路就是在 `(k_tensor, v_tensor)` 之外，再装上这对 `(dsa_k_tensor, dsa_k_scale_tensor)`，凑成四元组存进 `kv_cache_raw_tensors`。
+关键就在那 1 字节：`dsa_k` 只用 101 字节，但 `dsa_k_scale` 不从紧邻的 `base + 101` 起，而是被 `_align_up` 推到 `base + 102`——这个被跳过的字节就是对齐补齐留下的填充，保证 scale 视图起点落在 2 字节边界上。两个张量 `data_ptr` 差 102、共享底层 storage——`register_buffer` 能把它们合并成**一个**注册区间，HCCL/Mooncake 少注册一条。回看 [§17.3](#173-int8-裸分配--把-kv-拆成两块) 的省略处：sparse 路就是在 `(k_tensor, v_tensor)` 之外，再装上这对 `(dsa_k_tensor, dsa_k_scale_tensor)`，凑成四元组存进 `kv_cache_raw_tensors`。
 
-## 16.5 reshape：把裸字节还原成 KV
+## 17.5 reshape：把裸字节还原成 KV
 
 分配阶段交出来的全是 int8 裸字节。reshape 阶段做两件事：**反推 block 数**，再**把字节 `.view(dtype).view(shape)` 还原成带 dtype、带形状的 KV**。先看反推——它不重新读 block 数，而是由字节量除以页大小算回来：
 
@@ -371,9 +371,9 @@ def _get_attention_kv_cache_dims(self, layer_name, kv_cache_spec) -> tuple[int, 
     return kv_cache_spec.head_size, head_size_v
 ```
 
-于是 `k_cache` 摆 nope 段、`v_cache` 摆 rope 段——源码注释写得明明白白：`k_cache: nope_cache    v_cache: rope_cache`。哪段进 K、哪段进 V 不是可以随手对调的：这是注意力算子侧定死的约定，算子按这个固定次序分别去 `k_cache`、`v_cache` 取 nope 段和 rope 段，源码注释就是这份契约本身，调换两段会让算子读错。一个「拆 K/V」的机制，在标准注意力里是为 PD 分离，在 MLA 里顺手承担了 nope/rope 的物理分离。这就是 [§16.3](#163-int8-裸分配--把-kv-拆成两块) 那行双关注释的落点。
+于是 `k_cache` 摆 nope 段、`v_cache` 摆 rope 段——源码注释写得明明白白：`k_cache: nope_cache    v_cache: rope_cache`。哪段进 K、哪段进 V 不是可以随手对调的：这是注意力算子侧定死的约定，算子按这个固定次序分别去 `k_cache`、`v_cache` 取 nope 段和 rope 段，源码注释就是这份契约本身，调换两段会让算子读错。一个「拆 K/V」的机制，在标准注意力里是为 PD 分离，在 MLA 里顺手承担了 nope/rope 的物理分离。这就是 [§17.3](#173-int8-裸分配--把-kv-拆成两块) 那行双关注释的落点。
 
-## 16.6 NPU 物理布局：as_strided 把 block 维钉成一页
+## 17.6 NPU 物理布局：as_strided 把 block 维钉成一页
 
 到这里 K、V 的 shape 和 dtype 都对了，但对 sparse/compress MLA，还差一步**物理布局重排**。基座的做法是问后端要一个 stride 序、整块 view 再 permute：
 
@@ -494,7 +494,7 @@ def _adjust_kv_layout(
 
 换个角度把这笔「浪费」的账算清楚：情形二里每个 block 物理占用 `num_element_per_page = 24` 个元素，其中真实数据只有 16 个，另外 8 个（约三分之一）是页对齐 padding；n 个 block 的物理总跨度是 `24·n` 元素，而自然 contiguous 只要 `16·n`，膨胀因子 `24 / 16 = 1.5×`。这多出来的半倍空间不是白扔的——它正是换来多段视图能按页 overlap 的代价。回到情形一，page 恰等于自然块时膨胀因子退回 `16 / 16 = 1`，`as_strided` 沦为恒等，这笔账一分不花，机制也就无从显形。这也解释了为什么图注要强调基座「平时是自然 contiguous」：只有真出现页对齐 padding（`page > 自然块`）时，多花这 0.5× 才有意义。
 
-## 16.7 bind：按模型走三条路
+## 17.7 bind：按模型走三条路
 
 reshape 交出 `kv_caches` 字典后，最后一步是 **bind**——把每块 KV 挂回它该在的层。普通模型一行搞定，但层序/层数不规整的得特化。三条路画成一张分叉图：
 
@@ -502,7 +502,7 @@ reshape 交出 `kv_caches` 字典后，最后一步是 **bind**——把每块 K
 
 > *图注：`deepseek_v4` 自定层序手填；`longcat_flash` 走 `num_attn_module=2`；其它走普通 `bind_kv_cache(num_attn_module=1)`。三路汇合后，若开了 hamming 稀疏再追加一次 hashk cache 初始化。*
 
-回看 [§16.1](#161-三步骨架从字节到挂回各层) 的 `initialize_kv_cache_tensors`，那段 `if/else` 就是这张图：
+回看 [§17.1](#171-三步骨架从字节到挂回各层) 的 `initialize_kv_cache_tensors`，那段 `if/else` 就是这张图：
 
 - **普通模型**（`else` 分支）：`bind_kv_cache(..., num_attn_module=1)`。基座的 `bind_kv_cache` 按 `layer_index` 排序，把 KV 填进 `runner_kv_caches` 并挂到各层 forward context。昇腾直接复用。
 - **longcat_flash**：同样调 `bind_kv_cache`，但 `num_attn_module=2`——这个模型每个解码层含 2 个 attention module，得告诉绑定逻辑一层对两组。
@@ -537,7 +537,7 @@ def extract_dsv4_layer_index(config: Any, layer_name: str) -> int:
 
 三路走完，还有一个共同的尾巴：若 `enable_hamming_sparse`，再调一次 `init_and_bind_hashk_cache` 给 hamming 稀疏额外挂一份 hashk cache。这是叠在三路之上的可选项，不影响主分派。
 
-## 16.8 两条辅线：spec 解析与输入批重建
+## 17.8 两条辅线：spec 解析与输入批重建
 
 主线之外有两条辅线，本章顺带交代清楚它们和 KV 几何的接口。
 
@@ -617,7 +617,7 @@ def may_reinitialize_input_batch(self, kv_cache_config: KVCacheConfig) -> None:
         )
 ```
 
-两个看点。一是 `kernel_block_sizes`：注意力后端支持**虚拟 block 切分**——KV cache manager 按一个逻辑 block_size 去申请、复用、调度 block（比如 128 token 一块），但注意力 kernel 内部可能按另一个物理粒度去算（比如 16 token 一块，正是 [§16.6](#166-npu-物理布局as_strided-把-block-维钉成一页) 那种 as_strided 页几何让一块逻辑 block 在 kernel 眼里切成若干物理小块）。两个粒度都得记下来，输入批的 slot mapping 才能同时按 manager 块和 kernel 块寻址，所以 `select_common_block_size` 给每个 group 算一个 kernel 侧 block_size；mamba 这类非注意力 cache 用 `[0]` 关掉 slot mapping。二是重建判定那个三选一的 `or`：只要 block_size 与配置不符、或 kernel_block_size 与配置不符、或 group 多于一个，就重建。基座是把 `kernel_block_sizes` 当显式参数传进来；昇腾把它存成 `self.kernel_block_sizes` 实例属性，好让后续分配阶段一路取用。
+两个看点。一是 `kernel_block_sizes`：注意力后端支持**虚拟 block 切分**——KV cache manager 按一个逻辑 block_size 去申请、复用、调度 block（比如 128 token 一块），但注意力 kernel 内部可能按另一个物理粒度去算（比如 16 token 一块，正是 [§17.6](#176-npu-物理布局as_strided-把-block-维钉成一页) 那种 as_strided 页几何让一块逻辑 block 在 kernel 眼里切成若干物理小块）。两个粒度都得记下来，输入批的 slot mapping 才能同时按 manager 块和 kernel 块寻址，所以 `select_common_block_size` 给每个 group 算一个 kernel 侧 block_size；mamba 这类非注意力 cache 用 `[0]` 关掉 slot mapping。二是重建判定那个三选一的 `or`：只要 block_size 与配置不符、或 kernel_block_size 与配置不符、或 group 多于一个，就重建。基座是把 `kernel_block_sizes` 当显式参数传进来；昇腾把它存成 `self.kernel_block_sizes` 实例属性，好让后续分配阶段一路取用。
 
 | 场景 | `block_sizes` | `kernel_block_sizes` | 重建？ |
 |---|---|---|---|

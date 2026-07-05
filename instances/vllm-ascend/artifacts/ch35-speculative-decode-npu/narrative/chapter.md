@@ -2,15 +2,15 @@
 
 ![你在这里](../diagrams/roadmap.png)
 
-> 上一章把 logits 采成 token，那是投机解码的验证侧。
-> 本章转到提议侧：谁来提出那串 draft token。
+> 上一章证明了投机采样的保分布定理：为什么无偏、加速比从哪来。
+> 本章转到工程的提议侧：谁来提出那串 draft token。
 > 一处工厂分发 + 一批薄壳继承，收束投机这条线。
 
-第 [28 章](../../ch33-sampling-npu-adaptation/narrative/chapter.md)拆采样器时，反复出现一个名字：`AscendRejectionSampler`。它做的是「接受还是拒绝 draft token」（draft token＝proposer 在验证前投机提出的候选 token）——可那串 draft token 是谁提出来的？投机解码是一组「提议-验证」的搭档：一方先猜出 $k$ 个候选 token，另一方一趟前向并行验证。验证时除了核对这 $k$ 个候选，还会顺手多采 1 个 token（即第 k+1 位）——就是上一章那个白送的 bonus token，所以 n 个 draft token 最多能被接受 n+1 个，后面 `rejection_count = n+1-len` 里那个加一就是它。拒绝采样为什么能在丢掉一部分候选的同时严格保持目标分布不变、接受率又该怎么定义，见[第 34 章：投机采样原理](../../ch34-primer-speculative-sampling/narrative/chapter.md)——本章默认这套定理已经成立，只看提议侧怎么产出候选。上一章讲了验证侧，这一章补上提议侧。
+[第 33 章](../../ch33-sampling-npu-adaptation/narrative/chapter.md)拆采样器时，反复出现一个名字：`AscendRejectionSampler`。它做的是「接受还是拒绝 draft token」（draft token＝proposer 在验证前投机提出的候选 token）——可那串 draft token 是谁提出来的？投机解码是一组「提议-验证」的搭档：一方先猜出 $k$ 个候选 token，另一方一趟前向并行验证。验证时除了核对这 $k$ 个候选，还会顺手多采 1 个 token（即第 k+1 位）——就是上一章那个白送的 bonus token，所以 n 个 draft token 最多能被接受 n+1 个，后面 `rejection_count = n+1-len` 里那个加一就是它。拒绝采样为什么能在丢掉一部分候选的同时严格保持目标分布不变、接受率又该怎么定义，上一章[第 34 章：投机采样原理](../../ch34-primer-speculative-sampling/narrative/chapter.md)已经完整证过——本章默认这套定理已经成立，只看提议侧怎么产出候选。定理与验证侧上一章讲透了，这一章补上提议侧。
 
 提议侧的代码全在 `vllm_ascend/spec_decode/` 这个目录里，入口是 `vllm_ascend/spec_decode/__init__.py`。打开它你会发现一件有意思的事：投机解码有 8 种策略（ngram、eagle、medusa、dflash……），但昇腾几乎没有从零写过哪一种。它的做法是一个非常典型的工程范式——**一处工厂分发，一批薄壳继承，只有少数几处重量级重写**。能直接复用 vLLM 的就套一层薄壳，必须为 NPU 特化的才动刀。这一章就来看清这三层。
 
-## 29.1 一处工厂：if-elif 把 method 分发到 8 个 proposer
+## 35.1 一处工厂：if-elif 把 method 分发到 8 个 proposer
 
 入口在包的 `__init__.py`。整个提议侧只有一个对外函数 `get_spec_decode_method`，它把配置里的 `method` 字符串映射到具体的 proposer 类：
 
@@ -64,7 +64,7 @@ def get_spec_decode_method(method, vllm_config, device, runner):
 
 图里右侧的颜色已经剧透了本章的主线：这 8 个 proposer 不是一个量级的。绿色是**纯薄壳**，提议成本近乎为零；橙色是**中等薄壳**或 no-op 占位；红色是**走重量级 base** 的、每步要真跑一次 draft 模型前向的。下面就按这三类，从最薄的看起。
 
-## 29.2 最薄的薄壳：一行转发给父类
+## 35.2 最薄的薄壳：一行转发给父类
 
 先看绿色那端最极端的标本——薄到几乎只剩一层壳的 `AscendSuffixDecodingProposer`。它的全部代码就这么多：
 
@@ -91,7 +91,7 @@ class AscendSuffixDecodingProposer(SuffixDecodingProposer):
 
 `dummy_run` 那串长签名值得说一句：它不是后缀解码需要的，而是为了对齐昇腾 runner 在图捕获时统一的调用约定——runner 会拿同一套参数去 `dummy_run` 每一个 proposer，所以即便用不上，签名也得摆齐。这个长签名你会在本章几乎每个薄壳里看到，它是「插进昇腾 runner 这套接口」的入场券。
 
-## 29.3 真干活的薄壳 vs 占位的薄壳：ngram 的两副面孔
+## 35.3 真干活的薄壳 vs 占位的薄壳：ngram 的两副面孔
 
 n-gram 提议有意思在于：它有**两个** proposer，对应两个 method，一个真干活、一个纯占位。先看真干活的 `AscendNgramProposer`（method `"ngram"`）：
 
@@ -177,7 +177,7 @@ class AscendNgramProposerNPU(NgramProposerGPU):
 
 一个把 device 无关的父类算法照搬，一个把 device 相关的父类算法整段 stub 掉。**能复用就薄壳、不能复用就占位**——同一个范式的一体两面。
 
-## 29.4 中等薄壳：只在数据布局的接缝处插一层
+## 35.4 中等薄壳：只在数据布局的接缝处插一层
 
 再往上一档是「中等薄壳」：核心算法仍照搬父类，但昇腾要在 device 或数据布局的接缝处插一小段自己的逻辑。`AscendMedusaProposer` 是典型：
 
@@ -225,7 +225,7 @@ medusa 用最后一个隐藏状态去预测后续 token——只取最近那个�
 
 同一档里还有 `AscendExtractHiddenStatesProposer`（method `"extract_hidden_states"`，定义在 `vllm_ascend/spec_decode/extract_hidden_states_proposer.py`）：它覆写 `dummy_run` 换上 ACL graph 签名、覆写 `prepare_next_token_ids_padded` 适配昇腾的 indices/count 模式，但本身只抽取并缓存隐藏状态、不真做投机。也是「只在接缝处插一层，核心照搬」。
 
-## 29.5 走重量级 base 的薄入口：多继承拼出策略与实现
+## 35.5 走重量级 base 的薄入口：多继承拼出策略与实现
 
 前面这几类薄壳，父类要么是 vLLM 的 device 无关基类（ngram/suffix/medusa），要么干脆把搬不动的 GPU 基类 stub 掉（ngram_gpu）——总之提议逻辑都不必真跑一个 draft 模型。但 eagle、draft_model、mtp、dflash 这几种不一样——它们要真跑一个 draft 模型前向，必须落到昇腾自己重写的重量级基类 `AscendSpecDecodeBaseProposer` 上。可它们的入口文件却薄得出奇。`AscendEagleProposer` 整个 19 行：
 
@@ -274,7 +274,7 @@ class AscendDraftModelProposer(DraftModelProposer, AscendSpecDecodeBaseProposer)
 
 左半边五个薄壳，每个都是「继承 vLLM 单父类 + 覆写几处」；右半边一个重量级 `AscendSpecDecodeBaseProposer`，重写一大批方法，eagle / draft / dflash 都从它构造。下面进这个重量级核心看一眼骨架。
 
-## 29.6 重量级核心：AscendSpecDecodeBaseProposer 的骨架
+## 35.6 重量级核心：AscendSpecDecodeBaseProposer 的骨架
 
 `vllm_ascend/spec_decode/llm_base_proposer.py` 有 2043 行——是前面所有薄壳加起来的几十倍。它继承 vLLM 的 `SpecDecodeBaseProposer`，是**重写而非从零写**，但重写的面非常大。这一节我们只挑三个骨架节点看，不逐行——它把 ACLGraph（第 [25 章](../../ch29-ascend-compiler-aclgraph/narrative/chapter.md)）、昇腾 Triton kernel（第 [13](../../ch14-npuworker-execution-control/narrative/chapter.md)、[26](../../ch30-fusedmoe-batch-invariant/narrative/chapter.md) 章）、MLA（第 [20 章](../../ch22-mla-on-npu/narrative/chapter.md)）、昇腾并行组（第 [8 章](../../ch08-ascend-parallel-groups/narrative/chapter.md)）全缝在了一起，这些细节都各属前面专章，本章不展开，只看它们如何在 proposer 里会合。
 
@@ -295,7 +295,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # … 省略：query_start_loc / arange 等缓冲、attn_mask_builder …
 ```
 
-`decode_threshold = 1 + self.num_speculative_tokens` 是个值得记住的上界：每个 decode 请求一步最多产出 1 个 bonus token 加 $k$ 个候选位，所以它单步的 query 最长就是这么多。这个上界后面落在 draft 前向那条路上——`_propose` 里给 `cad.max_query_len` 定值、给图捕获时的 block_table 缓冲切片定步长，让静态图按最坏长度预留空间。（它和稍后 [§29.7](#297-prepare_inputs按拒绝数把输入收缩回来) 的 `prepare_inputs` 是两回事：那里收缩 query 靠的是逐请求实测的拒绝数 `num_rejected_tokens`，而不是这个全局上界。）
+`decode_threshold = 1 + self.num_speculative_tokens` 是个值得记住的上界：每个 decode 请求一步最多产出 1 个 bonus token 加 $k$ 个候选位，所以它单步的 query 最长就是这么多。这个上界后面落在 draft 前向那条路上——`_propose` 里给 `cad.max_query_len` 定值、给图捕获时的 block_table 缓冲切片定步长，让静态图按最坏长度预留空间。（它和稍后 [§35.7](#357-prepare_inputs按拒绝数把输入收缩回来) 的 `prepare_inputs` 是两回事：那里收缩 query 靠的是逐请求实测的拒绝数 `num_rejected_tokens`，而不是这个全局上界。）
 
 往下两处是昇腾接缝。第一处，draft 模型的并行组：
 
@@ -373,7 +373,7 @@ def _propose(
 
 骨架很清楚：eagle3/dflash 先把多层隐藏状态 `combine_hidden_states` 拼一下，统一走 `set_inputs_first_pass` 准备首遍输入，再经 `cudagraph_dispatcher` 派发、调 `self._runnable` 跑 draft 前向产出 draft token。后面那段多步循环和采样要在 NPU 上真跑 Triton kernel 和 MLA（第 [20 章](../../ch22-mla-on-npu/narrative/chapter.md)），这里只看到它的入口骨架就够了——本章要讲清的是「工厂 + 薄壳 + 一处重量级」这个范式，而不是 draft 前向的每一行。
 
-## 29.7 prepare_inputs：按拒绝数把输入收缩回来
+## 35.7 prepare_inputs：按拒绝数把输入收缩回来
 
 重量级 base 里有一个方法值得逐步走一遍，因为它是纯 host 端的索引运算、不碰 NPU，又恰好把「提议-验证」闭环的衔接讲透了——`prepare_inputs`。
 
@@ -433,7 +433,7 @@ def prepare_inputs(
 
 收缩之后的这套 metadata 喂回 draft 模型，下一步提议就只在未被拒的 token 上做。把刚算出的收缩结果当作下一步 `_propose` 的输入具体走一遍：`new_query_start_loc = [0, 2, 4, 7]` 把这一拍划成三段，draft 模型只在保留下来的 **7** 个 token（而不是上一拍的原 9 个）上前向；请求 1 那两个被拒的第 `4、5` 位已从 `token_indices` 里剔除，既不再喂进 draft、也不再占 query 预算，就此退出下一轮。`new_seq_lens = [10, 18, 15]` 同时告诉注意力：这三个请求 KV 缓存里的有效长度也按各自拒绝数缩了回去。提议、验证、按拒绝收缩、再提议——闭环就这样从「画出来」变成一串「算得出」的数转起来。
 
-## 29.8 提议-验证闭环：本章管提议，第 33 章管验证
+## 35.8 提议-验证闭环：本章管提议，第 33 章管验证
 
 把两章合起来看，一步投机解码是这么转的：
 
@@ -452,7 +452,7 @@ proposer 一步提出 $k$ 个 draft token（本章的提议侧）；target 模�
 
 这张表正好解释了为什么只有重量级 base 才值得花 2043 行：薄壳路径提议几乎不花钱，套层壳就够；重量级路径每步都要真跑一次 draft 前向，是热路径中的热路径，才配得上 ACLGraph 静态图捕获和昇腾 Triton kernel 这套重武器。**能复用就薄壳、必须特化才重写**——这句话不是审美，而是成本算出来的。
 
-## 29.9 小结：一处工厂、一批薄壳、一处重量级
+## 35.9 小结：一处工厂、一批薄壳、一处重量级
 
 回头看 `vllm_ascend/spec_decode/` 这个目录，投机解码的提议侧贯彻了一个非常克制的范式：
 

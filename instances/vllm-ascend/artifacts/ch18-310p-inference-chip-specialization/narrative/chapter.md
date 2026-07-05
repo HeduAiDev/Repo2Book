@@ -14,7 +14,7 @@
 
 差异始终集中在三件事——**没有 Triton、没有 MLA、受限的 dtype 与内存格式**。本章的代码主线都收在 `vllm_ascend/_310p/` 下，例如 runner 特化的 `vllm_ascend/_310p/model_runner_310p.py`。我们就把这三件事在执行栈各处激起的涟漪，一处处对着基座掰开看。这也是第四部分的收官：我们将看到 [第 15 章](../../ch15-npumodelrunner-cuda-monkeypatch/narrative/chapter.md) 那条「昇腾继承 vLLM」的线，怎样被 310P 再向下延伸一层。
 
-## 17.1 总开关：一个 SOC 字符串点亮整条 310 栈
+## 18.1 总开关：一个 SOC 字符串点亮整条 310 栈
 
 所有 310P 特化的源头，是一个布尔函数 `is_310p()`。它判定当前这块卡是不是 310P，整条栈据此分流。先看它判什么。
 
@@ -86,7 +86,7 @@ if get_ascend_device_type() != AscendDeviceType._310P:
 
 这一段是**整条 310 栈的入口**。`worker_cls` 一旦被指向 `NPUWorker310`，后面 vllm 拉起 worker、worker 拉起 model runner、runner 装配 input batch 与 block table——整条链都会换成 310 版。注意紧接着那个 `if`：910B 会开 `custom_ops = ["all"]`，310P 这一行被跳过，因为它根本没有 custom op。一个布尔，省去一长串 if-else 的散落判断。
 
-## 17.2 三种继承深度：310P 不一刀切
+## 18.2 三种继承深度：310P 不一刀切
 
 入口选定后，整条栈被链式拉起。但「拉起」的方式不是齐刷刷一层子类化。下面这张图把 310P 真实的继承结构画了出来——三组组件，三种不同的继承深度。
 
@@ -102,7 +102,7 @@ if get_ascend_device_type() != AscendDeviceType._310P:
 
 为什么要这么挑？因为 310P 跟 910B 共享**绝大多数**控制流，真正的差异只集中在「无 Triton、无 MLA、受限 dtype 与格式」。子类化的价值就是把差异**局部化**：哪一层有差异就在哪一层覆写一个方法，其余全继承。一刀切地整套再派生，反而要写一堆只是 `super()` 透传的空壳。接下来四节，就按四条主线，逐一读源码看「310 这层到底改了什么」——注意「组」是继承深度的分类，「条主线」是这四节的叙述线索，两者是不同维度。
 
-## 17.3 输入批与块表：用 CPU NumPy 顶替 Triton
+## 18.3 输入批与块表：用 CPU NumPy 顶替 Triton
 
 第一条主线最干净的样本，落在第一组（主执行体三层）里——`NPUInputBatch310`。它继承 `NPUInputBatch`，整个类只有一个实质改动：
 
@@ -296,7 +296,7 @@ def _update_states(self, scheduler_output: SchedulerOutput):
 
 只有当 `finished_req_ids` 非空——也就是有请求结束、触发 `condense()` 用 `move_row` 改写 `block_table.np` 的那种步骤——才插一句 `synchronize()`。这是「减法引出补偿」的一个绝佳教学点：你删掉一个看似纯计算的 kernel，却要为它顺带提供的副作用单独还债。而且还得精准——只在布局变更步还，不是每步都拦一道全局同步。
 
-## 17.4 受限硬件的 KV cache：把约束写进分配流程
+## 18.4 受限硬件的 KV cache：把约束写进分配流程
 
 本章第二条主线，是 runner 对 KV cache 的特化（runner 仍属第一组那条主执行体三层继承线）。310P 是纯推理芯片，能力边界写得毫不含糊——直接 `raise`：
 
@@ -320,7 +320,7 @@ def initialize_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[st
     return kv_caches
 ```
 
-KV 传输、Deepseek 稀疏注意力、MLA——三样 310P 不支持的特性，全部写成早失败而非静默出错。这跟我们在 [第 19 章](../../ch19-attention-backend-selection/narrative/chapter.md) 会展开的注意力后端选择**首尾呼应**：平台层选后端时，310P 的映射表里 MLA / SFA 条目本就是注释掉的（17.7 节会读到），这里再补一道运行期硬失败，两头把死路堵严。
+KV 传输、Deepseek 稀疏注意力、MLA——三样 310P 不支持的特性，全部写成早失败而非静默出错。这跟我们在 [第 19 章](../../ch19-attention-backend-selection/narrative/chapter.md) 会展开的注意力后端选择**首尾呼应**：平台层选后端时，310P 的映射表里 MLA / SFA 条目本就是注释掉的（18.7 节会读到），这里再补一道运行期硬失败，两头把死路堵严。
 
 真正分配 KV 张量时，受限硬件的两个约束落到实处。下面这张图先给全景。
 
@@ -388,7 +388,7 @@ logger.info_once("Weight layout uses FRACTAL_NZ.")
 
 还有个细节值得记一笔：基座那里一层的 KV 往往是**一整块** tensor，310P 这里 `k_cache` 和 `v_cache` 是**分开**用 `empty_with_format` 各分配一块的。这个「K、V 二元组」的形状，会直接决定下一节 KV 清零怎么写。
 
-## 17.5 KV block 清零：去 Triton 的退化实现
+## 18.5 KV block 清零：去 Triton 的退化实现
 
 第三条主线，是 KV block 清零——`AscendKVBlockZeroer310`。它属于「跳过昇腾中间层」那一类：直接两层继承 vLLM 的 `KVBlockZeroer`。这件事的背景是：MTP（多 token 预测）≥ 2 的 hybrid 模型，新分配的注意力 KV 块必须先清零再用。基座靠一个 Triton kernel 配一张绝对字节地址表来干这事——又是 Triton。310P 没有，整段退化成纯张量切片写。先看它怎么收集元信息：
 
@@ -444,7 +444,7 @@ class AscendKVBlockZeroer310(KVBlockZeroer):
 
 基座的 `init_meta` 要建一张 `seg_addrs` 绝对字节地址表喂给 Triton kernel；310 版把这整套丢掉，只做一件事：**把所有 (k, v) 张量收集成一个列表**。注意 `assert len(kv_tuple) == 2`——正好对上上一节「K、V 分开分配」的二元组结构。`seen_ptrs` 用 `data_ptr()` 去重，避免跨层共享的同一块 KV 被收两遍。
 
-`_logical_page_ratio` 记的是 `spec.block_size // kernel_bs`。这个 ratio 正是 [§17.4](#174-受限硬件的-kv-cache把约束写进分配流程) 里把逻辑块拆成物理 kernel 块的那个 `block_size_chunk`——同一个 `block_size // kernel_bs`。分配时它决定 KV 张量按物理块铺多少行，清零时它就把逻辑 block id 换算成物理页区间。调度器发下来的是**逻辑** block id，而真正的物理页是按 kernel 块算的，一个逻辑块对应 `ratio` 个物理页。清零时就靠这个比例换算区间：
+`_logical_page_ratio` 记的是 `spec.block_size // kernel_bs`。这个 ratio 正是 [§18.4](#184-受限硬件的-kv-cache把约束写进分配流程) 里把逻辑块拆成物理 kernel 块的那个 `block_size_chunk`——同一个 `block_size // kernel_bs`。分配时它决定 KV 张量按物理块铺多少行，清零时它就把逻辑 block id 换算成物理页区间。调度器发下来的是**逻辑** block id，而真正的物理页是按 kernel 块算的，一个逻辑块对应 `ratio` 个物理页。清零时就靠这个比例换算区间：
 
 ```python
 # vllm_ascend/_310p/kv_block_zeroer.py:L72
@@ -491,7 +491,7 @@ def zero_block_ids(self, block_ids: list[int]) -> None:
 
 基座用绝对字节地址 + Triton kernel 一把清；310 版用张量下标切片，纯 PyTorch 操作，host 也能跑。两者清的是同一批页，只是一个走 kernel、一个走切片。功能等价，去掉了 Triton 依赖。
 
-## 17.6 权重加载适配：单 part 外加一份量化描述
+## 18.6 权重加载适配：单 part 外加一份量化描述
 
 第四条主线是权重加载——`ShardedStateLoader310`，同样直接两层继承 vLLM 的 `ShardedStateLoader`。这件事和硬件算力无关，纯粹是 310P / CANN 那套加载格式的契约要求。先看保存：
 
@@ -601,9 +601,9 @@ class NPUWorker310(NPUWorker):
         logger.info_once("Using NPUWorker310 and NPUModelRunner310.")
 ```
 
-`NPUWorker310` 是个薄子类，`init_device` 的核心动作就一句：把 `self.model_runner` 换成 `NPUModelRunner310`。这正是 17.1 节那个 `worker_cls` 入口点燃整条链的下一棒——平台层选中 `NPUWorker310`，worker 在这里把 runner 换成 310 版，runner 再在构造时把 input batch 换成 310 版……一层层链下去。
+`NPUWorker310` 是个薄子类，`init_device` 的核心动作就一句：把 `self.model_runner` 换成 `NPUModelRunner310`。这正是 18.1 节那个 `worker_cls` 入口点燃整条链的下一棒——平台层选中 `NPUWorker310`，worker 在这里把 runner 换成 310 版，runner 再在构造时把 input batch 换成 310 版……一层层链下去。
 
-## 17.7 横切回收：一个布尔，四处补丁
+## 18.7 横切回收：一个布尔，四处补丁
 
 到这里，能收进 `_310p/` 目录的主线特化都读完了。但 310P 的改动不可能全塞进一个目录——分布式通信、注意力后端选择、算子注册这些**横切**的点，散落在 vllm-ascend 各处文件里。设计原则是：把 310P 改动尽量收进 `_310p/`，**外部文件只留一个布尔分流**。下面这张图收口这四处横切。
 
@@ -611,7 +611,7 @@ class NPUWorker310(NPUWorker):
 
 > *图注：中心一个 `is_310p()`，向外辐射到 platform、attention、distributed、ops 四个域。外部文件各自只用一行布尔判断接住差异。*
 
-平台与算子两域前面已带过——`platform.py` 用布尔选 `worker_cls` 并关掉 custom op，算子域靠 `REGISTERED_ASCEND_OPS` 把 rotary embedding、sampler 等换成 310 同形版。这里重点收两处。
+平台与算子两域前面已带过——`platform.py` 用布尔选 `worker_cls` 并关掉 custom op，算子域靠 `REGISTERED_ASCEND_OPS` 把 rotary embedding、sampler 等换成 310 同形版。`REGISTERED_ASCEND_OPS` 是一张「vLLM 算子类名 → 昇腾子类」的全局注册表，完整的登记与顶替机制见[第 27 章：CustomOp 树外顶替](../../ch27-customop-oot-replacement/narrative/chapter.md)，本章只关心 310P 把表里几个键换成 310* 变体。这里重点收两处。
 
 **注意力域。** 平台层选注意力后端时，310P 走一张专属映射表：
 
@@ -633,7 +633,7 @@ if is_310p():
 return backend_map[(attn_selector_config.use_mla, attn_selector_config.use_sparse, use_compress)]
 ```
 
-`backend_map_310` 只有一个有效条目 `(False, False)`——非 MLA、非稀疏的普通注意力。MLA 和 SFA 那两行被**注释掉**了，附一句「将来若支持再实现」。这就跟 17.4 节 `initialize_kv_cache_tensors` 里那三个 `raise` 闭上了环：一头在选后端时根本不给 MLA 的选项，一头在分配 KV 时硬失败。310P 不支持 MLA，从两个方向被钉死。
+`backend_map_310` 只有一个有效条目 `(False, False)`——非 MLA、非稀疏的普通注意力。MLA 和 SFA 那两行被**注释掉**了，附一句「将来若支持再实现」。这就跟 18.4 节 `initialize_kv_cache_tensors` 里那三个 `raise` 闭上了环：一头在选后端时根本不给 MLA 的选项，一头在分配 KV 时硬失败。310P 不支持 MLA，从两个方向被钉死。
 
 **分布式域。** 这一处，是我们在 [第 6 章](../../ch06-npu-communicator/narrative/chapter.md) 讲昇腾通信器时留下的一个尾巴——当时提过「310P 在 broadcast / all_reduce 上有专门的模拟补丁」，这里收口。310P 的 HCCL 对 device 上的 broadcast 和 int64 的 all_reduce 支持受限，于是用它**支持**的 all_gather 拼出等价语义：
 
@@ -695,7 +695,7 @@ if get_ascend_device_type() == AscendDeviceType._310P:
 
 模块尾部一个 `if`，只有是 310P 才安装。又是那个总开关。这段补丁全是纯 Python，host 上给个假 group 就能跑——下一节就来跑它。
 
-## 17.8 跑精简版，看数值对得上
+## 18.8 跑精简版，看数值对得上
 
 310P 真正的算子、显存、Triton 都在 host 跑不起来。但本章四条主线里**真正承载立意**的那些控制流——CPU NumPy 算 slot mapping、`_to_numpy` 的 CPU 守卫、KV 切片 `.zero_()`、`parameters_type_map.json` 生成、all_gather 模拟 all_reduce、`is_310p()` 分流——全是纯 Python / NumPy / CPU 张量。把它们从真实源码里**只做减法**剥出来，host 上就能验。
 
@@ -703,7 +703,7 @@ if get_ascend_device_type() == AscendDeviceType._310P:
 
 这就是精简版在本书里的定位：它不是主角，只是给「无 Triton 就退 CPU NumPy」「broadcast 用 all_gather 拼」这些论断一个**能跑出数值**的交叉验证锚点——比如 `vllm_ascend/_310p/block_table.py` 里那段 NumPy slot mapping，剥出来就能在 host 上算出 1154、1155 这种确定数值。主角始终是上面那些真实源码片段。
 
-## 17.9 小结：Part IV 收官
+## 18.9 小结：Part IV 收官
 
 第四部分至此走完。我们从 [第 14 章](../../ch14-npuworker-execution-control/narrative/chapter.md) 的 worker 执行控制起步，看 [第 15 章](../../ch15-npumodelrunner-cuda-monkeypatch/narrative/chapter.md) 的 `NPUModelRunner` 怎样「继承 vLLM 基类 + 临时猴补」把 GPU 执行路径搬上 NPU，看 [第 16 章](../../ch16-single-step-forward-context-dp-sync/narrative/chapter.md) 跑通一拍前向，看 [第 17 章](../../ch17-kv-cache-allocation-reshape-bind/narrative/chapter.md) 把 KV 张量在显存里物化。本章是这条线的自然延伸——昇腾自己搭起来的那套栈，**被再向下继承了一层**，去适配一块缺斤少两的推理芯片。
 

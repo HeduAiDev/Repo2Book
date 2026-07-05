@@ -2,13 +2,13 @@
 
 ![你在这里](../diagrams/roadmap.png)
 
-> 上一章拆完全书最大的单体算子 FusedMoE，收官 Part VI。
-> 本章翻开 Part VII，先看全栈最大的一块——量化（约 6k 行）。
-> 下面采样、投机、模型加载（ch33–30）都沿这条注册式接入往下走。
+> 上一章推导了量化数学：scale/zero-point，以及 GPTQ、AWQ、SmoothQuant。
+> 本章看昇腾把这套数学接进 vLLM——全栈最大的一块框架（约 6k 行）。
+> 下面的采样、投机、模型加载，也都沿这条注册式接入往下走。
 
 第 27 章立过一条总规矩：**模型代码一行不改，靠注册表在算子实例化的瞬间把 CUDA 算子换成昇腾子类**——换头不换身。第 30 章把这条规矩压在了全书最大的单体算子 `FusedMoE` 上，还顺手提过一句：量化版的 MoE 走的是另一个入口 `AscendFusedMoEMethod`。那个入口，就在这一章。
 
-量化（quantization，把高精度权重/激活压成低位宽整数或窄浮点）是 vLLM-Ascend 里**单块最大的代码**——`vllm_ascend/quantization/` 近 6000 行，从 `modelslim_config.py` 的注册入口到 `methods/registry.py` 的 scheme 表（scheme = 昇腾的量化方案实现类，一个 scheme 对应一种 (quant_type, layer_type) 组合、定义该组合的权重形状与前向），十七八个 scheme 文件，覆盖 W8A8 / W4A8 / MXFP 一整谱量化方案（scale/zero-point 怎么定、每种 scheme 在权衡什么，见[第 31 章：量化数学](../../ch31-primer-quantization/narrative/chapter.md)；本章只讲这些方案怎么接进 vLLM）。可它的**接入方式**却出奇地干净：不靠散落各处的 `if quant == "xxx"`，而是**一张注册表 + 三个适配器**，把整套昇腾量化方案当成一个插件，整体插进 vLLM——**vLLM 量化框架一行不改**。
+量化（quantization，把高精度权重/激活压成低位宽整数或窄浮点）是 vLLM-Ascend 里**单块最大的代码**——`vllm_ascend/quantization/` 近 6000 行，从 `modelslim_config.py` 的注册入口到 `methods/registry.py` 的 scheme 表（scheme = 昇腾的量化方案实现类，一个 scheme 对应一种 (quant_type, layer_type) 组合、定义该组合的权重形状与前向），十七八个 scheme 文件，覆盖 W8A8 / W4A8 / MXFP 一整谱量化方案（scale/zero-point 怎么定、每种 scheme 在权衡什么，上一章[第 31 章：量化数学](../../ch31-primer-quantization/narrative/chapter.md)刚推过；本章只讲这些方案怎么接进 vLLM）。可它的**接入方式**却出奇地干净：不靠散落各处的 `if quant == "xxx"`，而是**一张注册表 + 三个适配器**，把整套昇腾量化方案当成一个插件，整体插进 vLLM——**vLLM 量化框架一行不改**。
 
 这一章就读这套接入机制。它是全书「OOT（out-of-tree，树外）注册表 + 适配器」范式最干净的一次实证。我们要回答四个问题：
 
@@ -23,7 +23,7 @@
 
 > *图 27-1：左——三个 Config 经 `@register_quantization_config` 注进 vLLM 量化注册表。中——`get_quant_method` 按层类型分发，再查 `_SCHEME_REGISTRY` 选 scheme。右——三个 wrapper 各持一个 scheme，满足 vLLM 三个方法基类接口。一张表 + 三个 wrapper，换一种量化只是给表加一行装饰器。*
 
-## 27.1 三入口注册：把昇腾 Config 注进 vLLM 量化注册表
+## 32.1 三入口注册：把昇腾 Config 注进 vLLM 量化注册表
 
 vLLM 启动时认 `--quantization <名字>`。这个名字怎么和一段实现对上？靠 vLLM 暴露的一个注册装饰器 `register_quantization_config`——谁想新增一种量化方法，就继承基类 `QuantizationConfig`、用这个装饰器把自己登记进去。这是典型的 OOT 注册点：vLLM 开一个口，树外的昇腾把实现塞进来。
 
@@ -106,7 +106,7 @@ register_quantization_config("deepseek_v4_fp8")(AscendFp8Config)
 
 三个入口，两种手法（直接注册 / 先删后替换），但内核完全一致：**继承 vLLM 基类，用装饰器登记，启动时被名字选中**。vLLM 的量化框架对此毫不知情——它只是发现注册表里多了几个名字。
 
-## 27.2 一张 scheme 注册表：(quant_type, layer_type) 二维寻址
+## 32.2 一张 scheme 注册表：(quant_type, layer_type) 二维寻址
 
 进了门，下一个问题是：W8A8、W4A8、MXFP……十几种量化方案，每种又要分 linear / attention / moe 不同层，组合起来几十个具体实现，怎么管理？
 
@@ -175,14 +175,14 @@ def is_mx_quant_type(instance: Any) -> bool:
 
 每 import 一个 scheme 模块，模块里那些 `@register_scheme(...)` 装饰器就**执行一次**，把自己写进 `_SCHEME_REGISTRY`。所以「import 即注册」——`methods` 包一被加载，整张表就填满了。这是 Python 装饰器 + 模块导入副作用最经典的用法：注册的动作发生在导入瞬间，不需要任何人显式调用「初始化注册表」。
 
-末尾那个 `is_mx_quant_type` 先记一笔：它圈出哪些 scheme 属于 MXFP「微缩放」家族，是 NPU 的硬特化量化，[§27.6](#276-量化粒度谱与-mxfp-微缩放) 会回到它。
+末尾那个 `is_mx_quant_type` 先记一笔：它圈出哪些 scheme 属于 MXFP「微缩放」家族，是 NPU 的硬特化量化，[§32.6](#326-量化粒度谱与-mxfp-微缩放) 会回到它。
 
 **为什么用表，不用 if/elif？** 两条理由，一条工程一条复杂度：
 
 - 工程上，新增一种 quant_type 只需写一个 scheme 文件、贴一个装饰器——**分发代码零改动**。如果是 `if/elif` 长链，每加一种都要去那条链上插一刀，几十个 scheme 会把分发函数撑成几百行，且容易漏。
 - 复杂度上，scheme 选择从 `if/elif` 的逐个比较（scheme 数为 N 时是 $O(N)$）降为字典查的 $O(1)$。十几种 quant_type × 多种 layer_type 的组合，被一张表统一寻址。
 
-## 27.3 按层分发：get_quant_method 四类分发 + 逐层解析
+## 32.3 按层分发：get_quant_method 四类分发 + 逐层解析
 
 表填好了，下一个问题：模型有几百层，每层该选哪个 scheme？这事发生在**建层期**——vLLM 给每一层都调一次 `config.get_quant_method(layer, prefix)`，问昇腾「这一层用什么量化方法」。`prefix` 是这层的全限定名（如 `model.layers.0.mlp.down_proj`）。
 
@@ -301,7 +301,7 @@ def create_scheme_for_layer(
 
 一句话：**从 json 解析出 `quant_type`，用 `(quant_type, layer_type)` 查注册表，查到就实例化，查不到抛 `NotImplementedError`**。逐层解析（json）与注册表（dict）在这里合流——`get_linear_quant_type` 负责「这层是什么类型」，`get_scheme_class` 负责「这个类型对应哪个类」。混合精度（每层量化方案可以不同，比如对精度敏感的 `down_proj` 回退到更高位宽）就是靠这套「json 逐层记 + 运行时按层查」实现的。
 
-## 27.4 三个适配器 wrapper：满足 vLLM 三个方法基类
+## 32.4 三个适配器 wrapper：满足 vLLM 三个方法基类
 
 现在有了 scheme，但 scheme 是昇腾自己定义的一套类——vLLM 各层并不认识它们。vLLM 的层只认三个**方法基类**：linear 层认 `LinearMethodBase`，attention 认 `BaseKVCacheMethod`，MoE 认 `FusedMoEMethodBase`。怎么让昇腾的一套 scheme 体系整体插进这三个口子？
 
@@ -473,7 +473,7 @@ class AscendLinearScheme(ABC):
         ...
 ```
 
-契约固定：每个 linear scheme **必须**实现 `get_weight` 和 `apply`；至于 per-tensor / per-channel / per-group 三档 scale 参数（这是量化粒度，[§27.6](#276-量化粒度谱与-mxfp-微缩放) 细讲，这里只需知 scheme 会按需返回不同粒度的 scale），基类给了「默认返回空字典」的实现，子类**按需覆写**——用 per-channel 就只覆写 `get_perchannel_param`，不用的那两个保持空。正因为接口被钉死，wrapper 才能闭着眼调 `get_weight` / `get_*_param` / `apply` 而不管底下是哪种量化。
+契约固定：每个 linear scheme **必须**实现 `get_weight` 和 `apply`；至于 per-tensor / per-channel / per-group 三档 scale 参数（这是量化粒度，[§32.6](#326-量化粒度谱与-mxfp-微缩放) 细讲，这里只需知 scheme 会按需返回不同粒度的 scale），基类给了「默认返回空字典」的实现，子类**按需覆写**——用 per-channel 就只覆写 `get_perchannel_param`，不用的那两个保持空。正因为接口被钉死，wrapper 才能闭着眼调 `get_weight` / `get_*_param` / `apply` 而不管底下是哪种量化。
 
 这就是适配器分层的价值。从 vLLM 的层往下数，一共四层，每多一层换来一处解耦：
 
@@ -483,11 +483,11 @@ $$
 
 wrapper 隔离 vLLM 接口（vLLM 改基类，只动 wrapper）；scheme 隔离量化算法（加一种量化，只加 scheme）；kernel 隔离硬件后端（换 NPU 代际，只动算子）。三处各管各的，互不牵连。
 
-## 27.5 走通一条全链：W8A8_DYNAMIC
+## 32.5 走通一条全链：W8A8_DYNAMIC
 
 前面拆的是结构。现在挑一个具体 scheme，把「造权重 → 加载 → 前向」一条线跑通，看结构怎么落到数值。选 `W8A8_DYNAMIC`——权重 8 位、激活 8 位、激活动态量化，最常用也最好讲：它链路最完整（per-channel 权重 scale + per-token 动态激活 scale），`create_weights → apply` 全要素都齐，拿它走一遍能把前面所有结构都串起来。
 
-它就是 [§27.2](#272-一张-scheme-注册表quant_type-layer_type-二维寻址) 那张表里 `("W8A8_DYNAMIC", "linear")` 这一格背后的类。注册、造权重、scale 全在这里：
+它就是 [§32.2](#322-一张-scheme-注册表quant_type-layer_type-二维寻址) 那张表里 `("W8A8_DYNAMIC", "linear")` 这一格背后的类。注册、造权重、scale 全在这里：
 
 ```python
 # vllm_ascend/quantization/methods/w8a8_dynamic.py:L48
@@ -517,7 +517,7 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
         return params_dict
 ```
 
-`get_weight` 返回一个 `int8` 权重张量 `[output, input]`——这就是 [§27.4](#274-三个适配器-wrapper满足-vllm-三个方法基类) 里 wrapper 拿去 `register_parameter` 的那个 `weight`。`get_perchannel_param` 返回 `weight_scale` 和 `weight_offset`，形状都是 `[output, 1]`——**每个输出通道一个 scale**，这就是「per-channel 量化」。回头看 wrapper 的 `create_weights`：它正是把这两个字典里的张量逐个挂上去。scheme 给字典、wrapper 做登记，分工严丝合缝。
+`get_weight` 返回一个 `int8` 权重张量 `[output, input]`——这就是 [§32.4](#324-三个适配器-wrapper满足-vllm-三个方法基类) 里 wrapper 拿去 `register_parameter` 的那个 `weight`。`get_perchannel_param` 返回 `weight_scale` 和 `weight_offset`，形状都是 `[output, 1]`——**每个输出通道一个 scale**，这就是「per-channel 量化」。回头看 wrapper 的 `create_weights`：它正是把这两个字典里的张量逐个挂上去。scheme 给字典、wrapper 做登记，分工严丝合缝。
 
 权重加载进来后，前向之前还有一道 `process_weights_after_loading`，把权重转成昇腾算子友好的内存排布：
 
@@ -587,7 +587,7 @@ $$
 
 式中 `x_q`、`W_q` 是 `int8` 量化值；$s_w$ 是 `weight_scale`，每个输出通道一个（per-channel，落盘固定）；$s_x$ 是 `pertoken_scale`，每个 token 一个（动态，前向现算）。整数乘加在 `int8` 域里跑（NPU 的强项），最后两个 scale 一乘把结果拉回浮点。人话：**用整数算 GEMM 省算力省带宽，再用两个缩放因子把数值还原回原来的量级。**
 
-这条式子按**对称量化**写，所以没出现 `weight_offset`——对称量化下 `weight_offset≈0`，offset 项可略（[§27.4](#274-三个适配器-wrapper满足-vllm-三个方法基类) 里 `get_perchannel_param` 仍把 `weight_offset` 和 `weight_scale` 一起注册，只是这一格里它取零）。若是非对称量化，每个量化值要先减去对应的 offset、再乘 scale 才能还原。
+这条式子按**对称量化**写，所以没出现 `weight_offset`——对称量化下 `weight_offset≈0`，offset 项可略（[§32.4](#324-三个适配器-wrapper满足-vllm-三个方法基类) 里 `get_perchannel_param` 仍把 `weight_offset` 和 `weight_scale` 一起注册，只是这一格里它取零）。若是非对称量化，每个量化值要先减去对应的 offset、再乘 scale 才能还原。
 
 「动态」的好处也在这条式子里。`pertoken_scale` 按每个 token 自己的幅度算，所以一个幅值忽大忽小的序列里，大 token 和小 token 各用各的 scale，不会被一个全局 scale 一刀切——省了离线校准、对分布偏移更稳。
 
@@ -620,7 +620,7 @@ npu_quant_matmul 收到 layer.weight / layer.weight_scale，output_dtype == x.dt
 
 「host 跑不了真值、用替身验通控制流」和前面说的「精简版作交叉验证」是同一回事：**验控制流、不验数值**。这正是它的本分——不替你算真实量化值（那是 NPU 的事），但替你证明**这套注册—分发—适配—转交的骨架接对了**。
 
-## 27.6 量化粒度谱与 MXFP 微缩放
+## 32.6 量化粒度谱与 MXFP 微缩放
 
 W8A8 用的是 per-channel——每个输出通道一个 scale。但这只是量化粒度谱上的一档。粒度越细，scale 越多、显存略增，但量化误差越小。把同一个权重矩阵摆出来，三档一目了然：
 
@@ -650,9 +650,9 @@ class QuantTypeMapping:
 
 每个 MXFP 量化类型对应一组 dtype 配置：激活用什么浮点格式、权重用什么、scale 用什么。关键就是 `scale_dtype=FLOAT8_E8M0FNU_DTYPE`——每个微缩放组共享一个 e8m0 指数。为什么用纯指数？因为 microscaling 的 scale 只需表达「这一组整体放大/缩小多少个 2 的幂」，一个指数就够，省下尾数的位。这是 NPU 硬件直接支持的量化格式，host 上既没有这个 dtype 也没有对应 kernel。
 
-`quant_parser.py` 这张表只管 MXFP 的 dtype 映射（外加 `down_proj` 回退解析等），它**不决定每层走哪个 scheme**——别把「逐层 scheme 决策」记到它头上，那是 [§27.3](#273-按层分发get_quant_method-四类分发--逐层解析) 里 `get_linear_quant_type` / `get_scheme_class` 的活。`quant_parser` 只在某层确实是 MXFP 时，告诉它该用哪几种 dtype。
+`quant_parser.py` 这张表只管 MXFP 的 dtype 映射（外加 `down_proj` 回退解析等），它**不决定每层走哪个 scheme**——别把「逐层 scheme 决策」记到它头上，那是 [§32.3](#323-按层分发get_quant_method-四类分发--逐层解析) 里 `get_linear_quant_type` / `get_scheme_class` 的活。`quant_parser` 只在某层确实是 MXFP 时，告诉它该用哪几种 dtype。
 
-哪些 scheme 属于 MXFP 家族，由 [§27.2](#272-一张-scheme-注册表quant_type-layer_type-二维寻址) 见过的 `is_mx_quant_type` 圈定——它列出六个 MX scheme 类，`isinstance` 判一下就知道一个量化方法是不是微缩放型。前向时据此对 scale 张量做特殊处理（比如把 scale 的 `input_dim` 设为 1：MXFP 的 scale 是 per-group 张量、按输入维对齐，把 `input_dim` 标成 1 是让 weight_loader 沿输入维去切它）。这条线把「MXFP 是 per-group 极端」从概念落到了代码上的一处 `isinstance` 分支。
+哪些 scheme 属于 MXFP 家族，由 [§32.2](#322-一张-scheme-注册表quant_type-layer_type-二维寻址) 见过的 `is_mx_quant_type` 圈定——它列出六个 MX scheme 类，`isinstance` 判一下就知道一个量化方法是不是微缩放型。前向时据此对 scale 张量做特殊处理（比如把 scale 的 `input_dim` 设为 1：MXFP 的 scale 是 per-group 张量、按输入维对齐，把 `input_dim` 标成 1 是让 weight_loader 沿输入维去切它）。这条线把「MXFP 是 per-group 极端」从概念落到了代码上的一处 `isinstance` 分支。
 
 至于 MoE 侧的量化类型，还另有一个轻量枚举 `QuantType`，单独放在一个 35 行、无副作用的小文件里：
 
@@ -683,4 +683,4 @@ class QuantType(Enum):
 
 整套机制最值钱的一句话：**换一种量化方案，只是给注册表加一行装饰器，分发与适配代码零改动；vLLM 量化框架一行不改。** 这正是第 27 章「换头不换身」在数据结构层面的回响——那里是算子实例化时换子类，这里是量化方法注册时填一张表，本质都是「vLLM 开注册点，昇腾树外塞实现」。第 30 章那个量化版 MoE 的入口 `AscendFusedMoEMethod`，也在这一章归了位。
 
-这是 Part VII 的开篇。同一套注册式接入，接下来还会在采样、投机解码、模型加载里反复出现——每一处都是 vLLM 开一个口、昇腾在树外把 NPU 特化塞进去。机制看懂了一遍，后面就是同一个范式在不同子系统上的变奏。
+这是 Part VII 里第一块、也是最大的一块落地骨架。同一套注册式接入，接下来还会在采样、投机解码、模型加载里反复出现——每一处都是 vLLM 开一个口、昇腾在树外把 NPU 特化塞进去。机制看懂了一遍，后面就是同一个范式在不同子系统上的变奏。

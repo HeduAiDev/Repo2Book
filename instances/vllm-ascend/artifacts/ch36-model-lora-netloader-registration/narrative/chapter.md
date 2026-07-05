@@ -8,7 +8,7 @@
 
 走到这一章，你已经看过昇腾接管 vLLM 的十几种姿势。但如果把它们抽干水分，留下的骨架其实只有一句话：**vLLM 在每个该让外人插手的地方都留了一个扩展点，昇腾的工作就是往每个扩展点登记一个昇腾实现**。
 
-第 [2 章](../../ch02-entry-points-and-npuplatform/narrative/chapter.md)登记的是平台（`NPUPlatform`）；第 [23 章](../../ch27-customop-oot-replacement/narrative/chapter.md)登记的是算子（`CustomOp` 子类）；第 [27 章](../../ch32-ascend-quantization-framework/narrative/chapter.md)登记的是量化方法；第 [29 章](../../ch35-speculative-decode-npu/narrative/chapter.md)工厂分发接入的是投机 proposer。每一处的范式都一样：vLLM 留一个口，昇腾递一个名字进去。
+[第 2 章](../../ch02-entry-points-and-npuplatform/narrative/chapter.md)登记的是平台（`NPUPlatform`）；[第 27 章](../../ch27-customop-oot-replacement/narrative/chapter.md)登记的是算子（`CustomOp` 子类）；[第 32 章](../../ch32-ascend-quantization-framework/narrative/chapter.md)登记的是量化方法；[第 35 章](../../ch35-speculative-decode-npu/narrative/chapter.md)工厂分发接入的是投机 proposer。每一处的范式都一样：vLLM 留一个口，昇腾递一个名字进去。
 
 这一章把**最后三个扩展点**一并收口——它们恰好覆盖了「注册」这件事的三种典型形态：
 
@@ -18,7 +18,7 @@
 
 三种形态，从「最规矩」到「最野」，正好把昇腾接入 vLLM 的手法谱系补全。看完这三处，你对「OOT 插件到底在干什么」会有一个完整的答案。树外（OOT）插件指不改 vLLM 源码、纯靠外部包注册进去的扩展方式——这正是 vllm-ascend 的全部立身之本。
 
-## 30.1 模型注册：一行 register_model，把整个 DeepSeek-V4 递进去
+## 36.1 模型注册：一行 register_model，把整个 DeepSeek-V4 递进去
 
 先看最规矩的一种。昇腾要让 vLLM 认识一个 NPU 特化的模型，全部代码就在 `vllm_ascend/models/__init__.py`，整个文件只有七行：
 
@@ -139,7 +139,7 @@ class AscendDeepseekV4SWACache(VllmDeepseekV4SWACache):
 
 骨架（`DeepseekV4MoE` / `Attention` / `Model` / `ForCausalLM`）与 vLLM 的 `vllm/model_executor/models/deepseek_v2.py` 完全同构——昇腾只是把每一层里的 layer 和 op 换成 NPU 版，外壳一字未动。这正解释了为什么模型注册可以这么轻：注册表只认架构名和懒加载地址，至于 NPU 改了多少层，是 `deepseek_v4.py` 自己的事，注册这一步只递一个名字。
 
-## 30.2 LoRA 第一招：改写 vLLM 的全局元组，把昇腾类塞进候选池
+## 36.2 LoRA 第一招：改写 vLLM 的全局元组，把昇腾类塞进候选池
 
 模型注册有现成 API。LoRA 这一处没有——vLLM 没给「注册一个自定义 LoRA 层」的公开口子。昇腾的解法是直接伸手改 vLLM 的模块级全局变量。这就是本章的第二种注册形态，一个干净利落的「全局类替换」trick。
 
@@ -259,7 +259,7 @@ def refresh_all_lora_classes():
 
 那么 `refresh_all_lora_classes()` 在什么时候被调？这把我们带到 LoRA 的第二招。
 
-## 30.3 LoRA 第二招：按 device/rank 二选一，绑定 bgmv/sgmv 算子
+## 36.3 LoRA 第二招：按 device/rank 二选一，绑定 bgmv/sgmv 算子
 
 这一节代码块偏密，先给一条路标，读的时候带着它走：**platform 返回 wrapper 名 → wrapper 的 `__init__` 一手绑算子、一手刷全局类 → 岔进一段「大 rank 为何退回通用实现」的算账 → 回到 `add_lora_linear` 看 shrink/expand 怎么落地 → bgmv 与 sgmv 按 decode/prefill 分工 → 最底层 `lora_ops` 只是转调 NPU kernel 的薄壳**。六步连起来，就是「一个 LoRA 算子从被选中到真正在 NPU 上算」的完整链路。
 
@@ -443,7 +443,7 @@ def bgmv_expand(
 
 有一处签名细节值得圈出来：`bgmv_expand` 的形参里有 `add_inputs`，函数体里却**没用它**，反而固定传了 `0` 和 `output_tensor.size(1)`。这不是笔误——Python 薄壳的形参是为了对齐上层 wrapper 的调用约定，而转调时填的是 C++ kernel 真正要的 `(slice_offset=0, slice_size=整个输出宽度)`。薄壳的职责就是在两套签名之间做翻译，多出来的形参被默默吃掉很正常。其余四个算子（`bgmv_expand_slice` / 三个 `sgmv_*`）同构，无非参数顺序和切片偏移不同。
 
-## 30.4 第三处注册：netloader 把自定义加载器挂进 loader 注册表
+## 36.4 第三处注册：netloader 把自定义加载器挂进 loader 注册表
 
 第三个扩展点，是模型权重的加载方式。vLLM 这次给的是一个装饰器形态的注册口，定义在 `vllm/model_executor/model_loader/__init__.py`：
 
@@ -595,7 +595,7 @@ netloader 解决的是冷启动慢的问题。这里的**冷启动**，指推理
 
 它复制一份 `load_config`、把 `load_format` 强行改回 `"auto"`，然后**委托 vLLM 内置的 `DefaultModelLoader`** 走常规加载。这是 OOT 插件稳健性的范本：弹性网络加载是冷启动优化，是锦上添花的快路径，不是必经之路。一旦 source 没配好、本 rank 不该拉、或网络拉取失败，任何一条岔路都优雅退回 vLLM 默认实现——扩展点接管的是「更快的方式」，但绝不独占「能不能加载」这个底线职责。这种「我只负责优化，兜底交给上游」的克制，让昇腾的 loader 即使在最糟的网络环境里也不会让服务起不来。
 
-## 30.5 全书收口：vLLM 处处留扣，昇腾处处递名
+## 36.5 全书收口：vLLM 处处留扣，昇腾处处递名
 
 三处注册看完，把它们和前面几章并排放，全书最长的那条主线就完整浮现了。
 

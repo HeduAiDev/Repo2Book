@@ -2,11 +2,11 @@
 
 ![本章在全书地图中的位置](../diagrams/roadmap.png)
 
-*图 36-0　你在这里：注意力与 KV 那一 Part 的原理收束。*
+*你在这里：注意力与 KV 那一 Part 的原理收束。*
 
-*上一站精读了 DSA 的稀疏选块，本章把压缩与稀疏两条线合流。*
+*上一站：第 25 章讲透了 KV cache 的管理与调度器。*
 
-*落地对照 `vllm_ascend/models/deepseek_v4.py` 的真实代码。*
+*本章合流 MLA / DSA 两线成 V4，下一站转入算子与编译篇。*
 
 先给三句话的方位感：
 
@@ -591,4 +591,4 @@ class KVCompMetaData:
 - **HCA** = 更狠地压序列长（每 $m'=128$ 个 token 不重叠压 1 条）+ 稠密 MQA——用极低成本兜住全局。
 - 两者靠一张 `compress_ratios` 开关表**层间交错**，短板互补。再叠上混合精度存储，三笔账相乘，凑出 1M 上下文下「27% FLOPs / 10% KV」的量级。
 
-落地看，这套数学在 `vllm_ascend/models/deepseek_v4.py` 里就是 `Compressor`（靠 `coff` 分叉 CSA/HCA）、`Indexer`（仅 CSA 挂）、`DeepseekV4Attention`（一层装配器）、`DeepseekV2DecoderLayer`（mHC 包裹）四个模块，加上 `vllm_ascend/worker/kvcomp_utils.py` 里 hash + 汉明的运行期选块近似。原理篇的注意力演进线到此收束——下一步就是把这些真实模块在昇腾上跑起来看数值，那是实现篇的事。
+落地看，这套数学在 `vllm_ascend/models/deepseek_v4.py` 里就是 `Compressor`（靠 `coff` 分叉 CSA/HCA）、`Indexer`（仅 CSA 挂）、`DeepseekV4Attention`（一层装配器）、`DeepseekV2DecoderLayer`（mHC 包裹）四个模块，加上 `vllm_ascend/worker/kvcomp_utils.py` 里 hash + 汉明的运行期选块近似。原理篇的注意力演进线到此收束。从下一章起，全书转入算子与编译篇，去看这些注意力与 MoE 模块背后的昇腾算子怎么被顶替、编译、跑起来。
