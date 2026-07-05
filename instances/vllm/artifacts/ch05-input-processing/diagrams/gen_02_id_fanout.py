@@ -64,28 +64,29 @@ def build():
 
     box(L, 410, 255, 260, 70, "父 EngineCoreRequest", "sampling_params.n = 4", "is_pooling or n==1 → 单请求直发", fill=C_PARENT, bd=C_PARENT_BD, fs=13)
 
-    # 四个子请求
+    # 四个子请求：每框仅两行（子 id / n·seed），copy-or-reuse 作为箭头旁注，避免框内三行相撞
     cw, gap = 220, 20
     total = 4 * cw + 3 * gap
     start = (w - total) // 2
+    child_y, child_h, annot_y = 420, 66, 380
+    seeds = [42, 43, 44, 45]
     for i in range(4):
         x = start + i * (cw + gap)
         last = (i == 3)
-        box(L, x, 430, cw, 92,
-            f'child {i}',
-            f'request_id = "{i}_req-abc-3f9a..."',
-            "复用父对象" if last else "copy(request)",
-            fill=C_CHILD, bd=C_CHILD_BD, fs=13)
-        L.append(f'<text x="{x+cw//2}" y="{430+62}" text-anchor="middle" font-family="monospace" font-size="9.5" fill="{C_MUT}">{esc("sampling n=1; seed→seed+idx")}</text>')
-        arrow(L, 540, 325, x + cw // 2, 430, color=C_CHILD_BD)
-
-    cinfo = esc('get_child_info(idx)：child id = "{idx}_{request_id}"，子参数 n=1')
-    L.append(f'<text x="{w//2}" y="395" text-anchor="middle" font-family="sans-serif" font-size="12" fill="{C_MUT}">{cinfo}</text>')
+        cx = x + cw // 2
+        arrow(L, 540, 325, cx, child_y, color=C_CHILD_BD)
+        # 旁注放在箭头中段（annot_y）而非贴框顶：贴框顶时内侧两支箭头会穿过文字。
+        annot = "复用父对象" if last else "copy(request)"
+        L.append(f'<text x="{cx}" y="{annot_y}" text-anchor="middle" font-family="monospace" font-size="10" fill="{C_MUT}">{esc(annot)}</text>')
+        box(L, x, child_y, cw, child_h,
+            f'{i}_req-abc-3f9a2b1c',
+            f'n=1 · seed={seeds[i]}',
+            fill=C_CHILD, bd=C_CHILD_BD, fs=12, mono_title=True)
 
     # seed 说明
     L.append(f'<rect x="60" y="560" width="960" height="120" rx="6" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1"/>')
     L.append(f'<text x="78" y="586" font-family="sans-serif" font-size="13" font-weight="bold" fill="{C_TXT}">{esc("子采样参数派生（_get_child_sampling_params）")}</text>')
-    L.append(f'<text x="78" y="612" font-family="sans-serif" font-size="12" fill="{C_TXT}">{esc("• seed is None：所有子请求共享同一份 n=1 克隆（缓存复用，省内存；各自采样天然独立）")}</text>')
+    L.append(f'<text x="78" y="612" font-family="sans-serif" font-size="12" fill="{C_TXT}">{esc("• seed is None：n=1 克隆仅 build 1 次，其余 3 个子请求命中缓存（build 1 次 + 命中 3 次，省内存）")}</text>')
     L.append(f'<text x="78" y="636" font-family="sans-serif" font-size="12" fill="{C_TXT}">{esc("• seed 已设：每个子请求 seed = seed + index（结果各异且可复现）")}</text>')
     L.append(f'<text x="78" y="660" font-family="sans-serif" font-size="12" fill="{C_TXT}">{esc("• 输出聚合：流式逐个转发；FINAL_ONLY 按 index 攒齐 n 个再整批返回")}</text>')
 

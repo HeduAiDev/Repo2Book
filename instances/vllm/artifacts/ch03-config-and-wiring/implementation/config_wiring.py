@@ -267,10 +267,14 @@ class SchedulerConfig:
             return self.scheduler_cls
         return _resolve_obj_by_qualname(self.scheduler_cls)
 
-    # SOURCE: vllm/config/scheduler.py SchedulerConfig.compute_hash
+    # SOURCE: vllm/config/scheduler.py SchedulerConfig.compute_hash (L190-216)
     def compute_hash(self) -> str:
-        return _hash10(str((self.max_num_batched_tokens, self.max_num_seqs,
-                            self.policy, self.async_scheduling)))
+        # Only max_num_batched_tokens enters the graph hash (real source L202-215):
+        # it drives LoRA static-buffer sizes and inductor's 32/64-bit indexing.
+        # SUBTRACTED: max_num_seqs / policy / async_scheduling 不入图哈希 —
+        #   they don't affect the input-ids→hidden-states computation graph, so
+        #   real vLLM's factors list intentionally excludes them.
+        return _hash10(str((self.max_num_batched_tokens,)))
 
 
 # SOURCE: vllm/config/compilation.py PassConfig (fusion-flag subset)

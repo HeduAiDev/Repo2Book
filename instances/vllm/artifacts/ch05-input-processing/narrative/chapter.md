@@ -523,7 +523,7 @@ def assign_request_id(request: EngineCoreRequest):
 
 ![请求 id 唯一化与 fan-out](../diagrams/02-request-id-and-fanout.png)
 
-> *图注：上半，`"req-abc"` 先拷进 `external_req_id`，再被改写成 `"req-abc-3f9a2b1c"`。下半是 n>1 的 fan-out，下一节展开。*
+> *图注：上半，`"req-abc"` 先拷进 `external_req_id`，再被改写成 `"req-abc-3f9a2b1c"`。下半是 n>1 的 fan-out（下一节展开）：父请求 `n=4` 裂成 4 个 `n=1` 子请求，子 id 加 `idx` 前缀；设了 seed 时子 i 取 `seed+i`（42/43/44/45），前三个走 `copy(request)`、最后一个复用父对象；底部说明子参数派生（seed=None 共享缓存 / seed 已设连号 / FINAL_ONLY 攒齐聚合）。*
 
 **为什么 8 个字符够？** `random_uuid()` 取 uuid4 的 hex（128 bit 随机），`:.8` 截前 8 个十六进制字符，即 32 bit 随机。注意目标不是「全局密码学唯一」——只是「在单实例内消歧外部重复的 id」。即便两个请求恰好都叫 `"req-abc"`，它们再撞上同一个 8 字符后缀的概率，按生日界约为 $n^2 / 2^{33}$，小到可以忽略。这是个务实的工程取舍：不追求绝对唯一，只追求「实际上不会撞」。
 
@@ -534,6 +534,8 @@ def assign_request_id(request: EngineCoreRequest):
 ## 5.10 fan-out：n>1 的并行采样在哪一层裂开
 
 最后一块拼图。用户要 `n=4`（同一个 prompt 采 4 个不同结果），这 4 个请求是在哪儿裂开的？
+
+先建立直觉。用户点一份 `n=4`，就像下单要 4 杯同款咖啡：柜台不会让一个杯子接 4 次，而是撕出 4 张一模一样的小票，每张只做 1 杯（子请求 `n=1`），杯身编号 0/1/2/3 好对号取餐（子 id 前缀）；要「4 杯可复现」就给每张小票一个连号配方（`seed+idx`），否则 4 张共用同一张配方模板省纸（缓存复用）。全部做齐了才一起端出（`FINAL_ONLY` 聚合）。下面看这套「撕小票—做咖啡—端出」在真实源码里怎么落地。
 
 答案是：**不在 `InputProcessor` 里。** `process_inputs` 永远只产出**一个**父 `EngineCoreRequest`。裂分发生在更上层的 `add_request`，由 `ParentRequest` 协调：
 
@@ -600,6 +602,21 @@ def get_child_info(self, index):
 
 注意这里 `n` 被改成 1——每个子请求只采 1 个结果，4 个子请求合起来才是用户要的 `n=4`。
 
+把 `n=4`、`seed=42` 这条路径的 fan-out 循环逐子跑一遍，派生结果如下（数字全部出自真实运行轨迹）：
+
+<!-- trace: parallel-sampling-fanout -->
+
+| idx | child_req_id | child.n | child.seed | 请求对象 | 子参数来源 |
+|:---:|:---|:---:|:---:|:---|:---|
+| 0 | `0_req-abc-3f9a2b1c` | 1 | 42 | `copy(request)` | build（新建克隆） |
+| 1 | `1_req-abc-3f9a2b1c` | 1 | 43 | `copy(request)` | build（seed 分支不缓存） |
+| 2 | `2_req-abc-3f9a2b1c` | 1 | 44 | `copy(request)` | build |
+| 3 | `3_req-abc-3f9a2b1c` | 1 | 45 | reuse-parent（复用父对象） | build |
+
+读这张表能一眼看清三件事。其一，子 id 是父 id 加 `idx` 前缀，四行天然唯一、又都能反查回父。其二，`child.n` 全是 1，正是「4 个子各采 1 个、合起来才是 `n=4`」。其三，设了 seed，四子的 seed 就是连号的 42/43/44/45——每子都得独立 `build` 一份（seed 分支不走缓存），额外 `SamplingParams` 克隆共 `n=4` 份。
+
+换成 `seed=None` 呢？四子的 `child.seed` 全变成 `null`、`child.n` 仍全是 1，但只有 idx=0 真的 `build`，idx=1..3 直接命中 `cached_child_sampling_params`——克隆数从 `n` 降到 1，省内存。这正是上一段那个「有没有设 seed」分叉的可观察后果。另外，只有 `idx == n-1`（即 idx=3）那一行是 `reuse-parent`（复用父对象），前三行都是 `copy(request)`，对应循环里 `idx == parent_params.n - 1 else copy(request)` 的最后一轮省拷贝优化。
+
 ### 5.10.2 输出怎么聚合回去
 
 裂开了，最终还得合回来。`get_outputs` 管聚合，有两种模式：
@@ -630,7 +647,11 @@ def get_outputs(self, child_request_id, completion_output):
 - **流式**（非 `FINAL_ONLY`）：哪个子请求有新输出就立刻转发哪个，不等齐。已经完成并返回过的不重复发。
 - **非流式**（`FINAL_ONLY`，即 `RequestOutputKind.FINAL_ONLY`——`vllm/sampling_params.py` 的枚举值，语义是「不下发中间输出，只在全部完成时返回最终结果」）：把每个子请求的最终结果按 `index` 写进 `output_aggregator`，**等所有子请求都完成**（`child_requests` 清空）才整批返回这 n 个结果。
 
-判定整个并行采样请求是否结束，就一句 `finished = not self.child_requests`——子请求集合空了就完事。这套聚合逻辑会在 [Stage 3 输出处理](../ch08-output-processing/narrative/chapter.md) 里被真正驱动，本章只看它的内部状态机。
+判定整个并行采样请求是否结束，就一句 `finished = not self.child_requests`——子请求集合空了就完事。
+
+**为什么这个请求一定会在有限步内结束？** 这里藏着一个能证明的不变式：`child_requests` 的大小单调不增、且非负。fan-out 阶段一次性塞进恰好 `n` 个子 id（`|child_requests| = n = 4`）；此后每个子请求的最终结果到达时，`get_outputs` 对该 id 做一次 `remove`，集合严格减 1；而已经完成并返回过的重复到达走 `already_finished_and_returned` 分支、不再 `remove`，所以集合大小不会掉到负数。于是它是非负整数上的单调递减序列，至多 `n` 步归零，`finished` 必然翻成 `True`。把 `FINAL_ONLY` 下四个子依次完成的过程摊开看，正是这个单调量在走：子 0、1、2 完成时 `remaining` 从 3 减到 2 再到 1、`batch_len` 一直是 0、`finished=false`（还没攒齐，先不返回）；直到子 3 完成，`remaining=0`、`batch_len=4`、`finished=true`——这一刻才把 4 个结果整批交出去。`remaining` 这一列 `3→2→1→0`，就是上面那个单调量的实测轨迹。
+
+这套聚合逻辑会在 [Stage 3 输出处理](../ch08-output-processing/narrative/chapter.md) 里被真正驱动，本章只看它的内部状态机。
 
 ---
 

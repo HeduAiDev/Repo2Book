@@ -810,6 +810,35 @@ OPTIMIZATION_LEVEL_TO_CONFIG = {
 
 那么哪些配置改动会触发昂贵的重编译？看 `factors` 里收了什么就知道：换模型、改 TP/PP、改优化级（`compilation_config` 变了）——这些都会让指纹变、触发重编译。而改 `max_num_seqs`、换日志后端这类，不影响图结构，缓存照命中。理解 `compute_hash` 的作用域，你就能预测「我这个改动会不会让 vLLM 重新编译几分钟」。
 
+### 数到指纹：改一个字段，指纹翻不翻新
+
+「收 model/parallel/compilation、不收 tokenize」这句话，落到数值上才真正立住。不妨把 `compute_hash` 想成给一份**菜谱拍指纹**：只有会改变成品结构的关键配料（模型、并行度、编译级）记进指纹，「一次上多少份菜」这种不改烹饪流程的旋钮（`max_num_seqs`）不进——配料一变指纹就翻新，厨房（`torch.compile`）据此重新备菜（重编译）；配料没变，直接端出上次做好的（命中缓存）。
+
+拿一个 baseline 配置（`facebook/opt-125m`，TP=1，`max_num_seqs=256`，O2）当锚，每次**只改一个字段**，把六个子配置因子各自的 `compute_hash()` 和最终 10 位指纹都打印出来，规律就一目了然：
+
+<!-- trace: ch03-compute-hash -->
+
+| 场景（改 1 个字段） | parallel 因子 | scheduler 因子 | compilation 因子 | 10 位指纹 | 是否触发重编译 |
+|---|---|---|---|---|---|
+| baseline（TP=1, max_num_seqs=256, O2） | `028ab3525e` | `ac26a305e1` | `27caeac125` | `5f197a5c93` | —（基准） |
+| 改 TP 1→2 | `54dfeba4d6` | `ac26a305e1` | `27caeac125` | `7f9de5602c` | 是：parallel 因子变→指纹翻新 |
+| 改 max_num_seqs（256 翻倍） | `028ab3525e` | `ac26a305e1` | `27caeac125` | `5f197a5c93` | 否：无因子变→指纹不变，命中缓存 |
+| 改优化级 O2→O0 | `028ab3525e` | `ac26a305e1` | `89294b0e76` | `17488b3f00` | 是：compilation 因子变→指纹翻新 |
+
+三行对照就把「收什么、不收什么」坐实了：
+
+- **改 TP 1→2**：`parallel_config` 的因子从 `028ab3525e` 翻成 `54dfeba4d6`，指纹随之从 `5f197a5c93` 翻成 `7f9de5602c`——触发一次重编译。TP 改的是计算图怎么切分，理应重编译。
+- **改 max_num_seqs 256→512**：六个因子**逐个不变**（`scheduler` 因子恒为 `ac26a305e1`——`max_num_seqs` 根本不进 `scheduler_config.compute_hash()` 收集的字段），指纹原封不动还是 `5f197a5c93`，直接命中上次的编译产物。批大小是调度行为、不改图结构。
+- **改优化级 O2→O0**：`compilation_config` 的因子从 `27caeac125` 翻成 `89294b0e76`，指纹翻成 `17488b3f00`——又一次重编译。编译级本身就是图的一部分。
+
+留意 `scheduler` 因子 `ac26a305e1` 在四行里从头到尾没动过——这正是 `max_num_seqs` 那一行指纹不变的直接原因：它压根没进入任何一个入图因子。
+
+为什么敢说这是**规律而非巧合**？指纹 = `SHA-256(str(factors))[:10]`，两条支撑撑着它。其一，SHA-256 对**相同字节串必产相同摘要**——「不入图字段（`max_num_seqs`）变 → `factors` 字节串逐字相同 → 指纹必然相同」是恒等式，不是概率；其二，SHA-256 对不同输入产近均匀摘要，取前 10 位十六进制（`16^10` ≈ 1.1e12 的空间），碰撞概率约 `2^-40` 可忽略——「入图因子（TP、优化级）变 → `factors` 串变 → 指纹翻新」以压倒概率成立。所以指纹的确定性（缓存能安全复用）和敏感性（该重编译时不会漏）都不是散文断言，而是「确定性哈希 + 碰撞概率可忽略」两条撑起来的。
+
+![compute_hash 指纹：改哪个因子才翻新、触发重编译](../diagrams/ch03-compute-hash-fingerprint.png)
+
+> *图注：改到进入 `factors` 的配置（TP、优化级）才会翻新 10 位指纹、触发 `torch.compile` 重编译；不进 `factors` 的 `max_num_seqs` 改了指纹照旧，直接命中编译缓存。三例里 `scheduler` 因子恒为 `ac26a305e1`，是 `max_num_seqs` 那支不变的根由。*
+
 ---
 
 ## 3.11 汇合点：EngineCore.__init__，三个工厂的产物落地
@@ -931,6 +960,26 @@ optimization_level=O0 但用户显式 cudagraph_mode=PIECEWISE
 ```
 
 最后两条是关键：第三条证明 `enforce_eager` 覆盖优化级，第四条证明用户显式设置覆盖优化级预设。优先级链 **用户显式 > enforce_eager/env > 优化级预设** 在数值上被坐实了——而它背后没有一句专门排优先级的代码，全靠 [3.9 节](#39-o0o3-优化级一个声明式的旋钮) 那个「按顺序执行 + 只填 None」的机制涌现出来。
+
+### 数值 4：compute_hash 指纹与重编译
+
+最后跑一遍 [3.10 节](#310-compute_hash计算图的-10-位指纹) 的指纹计算——从同一个 baseline 出发各改一个字段，打印 `factors` 里变没变的因子和最终 `hexdigest()[:10]`：
+
+```text
+baseline（TP=1, max_num_seqs=256, O2）
+  → 指纹 5f197a5c93
+
+改 TP 1→2（parallel 因子 028ab3525e → 54dfeba4d6）
+  → 指纹 5f197a5c93 → 7f9de5602c   ⇒ 重编译
+
+改 max_num_seqs 256→512（无因子变，scheduler 因子仍 ac26a305e1）
+  → 指纹 5f197a5c93（原封不动）      ⇒ 命中缓存
+
+改优化级 O2→O0（compilation 因子 27caeac125 → 89294b0e76）
+  → 指纹 5f197a5c93 → 17488b3f00   ⇒ 重编译
+```
+
+这坐实了 [3.10 节](#310-compute_hash计算图的-10-位指纹) 的结论：只有改到进入 `factors` 的因子（TP、优化级）才翻新指纹、触发那几十秒到几分钟的重编译；不入 `factors` 的 `max_num_seqs` 改了指纹照旧，直接复用上次编译产物。你敲下一个 `vllm serve ...` 的改动前，看它动没动 `factors` 收的东西，就能预判这次会不会重编译。
 
 这些数值不是主角，源码才是。但跑一遍能让你确信：上面逐段解读的控制流，确实就是引擎启动时真实发生的事。
 
