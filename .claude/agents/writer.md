@@ -40,7 +40,7 @@ color: green
    自包含、开场引用 roadmap.png(illustrator 已生成)+ 图注 2-3 个 ≤25 字短句、
    bible 埋伏笔/回收(`python3 scripts/bible.py payoff --resolve`)、公式规则、
    **零脚手架泄漏**(规范路径/自然标题/不提 dossier/explainer/manifest 等内部文件)、
-   伏笔跨章用 markdown 链接、章内用 `#` 锚点。
+   **跨章**引用一律 markdown 链接、且从 narrative/ 出发用两层相对路径（`[第 7 章：IPC 边界](../../ch07-xxx/narrative/chapter.md)`）；链接文字里的章号必须与目标目录号一致（lint_anchors 三规核验）；**禁止裸文字章号**（「详见第 21 章」无链接——插章重编号时它是最大的迁移债）；导语/图注衔接按内容措辞（「上一章的 MHA 后端」），章号只活在链接里。
 5. **术语/缩写首现即释义**：正文（含内嵌源码片段中出现的标识符）里每个专业缩写、硬件型号、
    框架/内部 API、自定义类型、config 字段、自造记号，在全章首次出现处必须紧跟一句不超过一行的
    中文释义（是什么＋为何在此重要，与 bible glossary 对齐，如「qualname（全限定类名）」），或

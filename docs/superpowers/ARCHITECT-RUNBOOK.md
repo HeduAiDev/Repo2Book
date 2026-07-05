@@ -10,6 +10,7 @@
 4. `instances/<active>/book/cartography/ARCHITECTURE.md` + `outline-final.json`——架构地图 + 大纲。
 5. `python3 scripts/archivist.py state` + `instances/<active>/book/bible/`——当前状态 + 连贯性。
 6. `docs/superpowers/specs/2026-06-21-vllm-source-reading-book-system.md`——设计与为什么（以 vLLM 为首例，方法论通用）。
+7. outline 定稿时把 papers-map 规划的 primer 章直接占号排进物理序(参见补章发车 SOP)。
 
 ### 0.5 新建一本书（换实例）
 `python3 scripts/new_instance.py <name> --repo <git-url> --title "…" --prefix <规范路径前缀> --activate`
@@ -91,6 +92,16 @@ primer 章 = 论文精读章(动机→推导→数值→落地),豁免 subtract-
 - 评审维度 0 自动换 paper-fidelity;lint_fidelity 不跑。
 - **gap 审计**(每 Part 收尾/全书体检):`Workflow({name:"book-gap-audit", args:{instance:"vllm-ascend", date:"YYYY-MM-DD"}})` → 报告在 book/audits/;cliff 级逐条决定 retrofit/立 primer 章/接受。
 - 新书开局(§0)同步产出 papers-map.json——论文算法在 cartography 期就规划,不等成书后盘点。
+
+## 补章发车(SOP,任何补充章的标准流程)
+
+1. **定位先于内容**：outline-final.json 把新章条目插到目标位置(deps/part 定好);primer 章同步 papers-map。
+2. **生产**：新书/尾部追加→直接按最终章号发 chapter-pipeline,零迁移;存量书中段插入→先以临时尾号生产,APPROVED 后走第 3 步。
+3. **插入迁移**：`python3 scripts/renumber_chapters.py --instance <x> --insert <slug>@before:<目标dir>` 生成级联 plan → 存盘 book/cartography/ → `--plan <file> --dry-run` 审阅日志 → 执行(自动跑悬空校验)。执行窗口内不发该实例任何章 workflow。
+4. **接缝导语**：writer 定点重写插入点前后章的开场/收尾(按内容措辞衔接);受影响章 roadmap.png 重渲(roadmap.py 循环);bible 章号已由引擎重写,抽查 due。
+5. **复验**：lint_anchors --all(三规)/lint_punct --all/逐章 structure/gap-audit 增量。
+
+**首创期预留**(新书 §0 即执行)：cartography 定稿时可预见的原理/扩展章直接占号进 outline——插章成本趋零;跨章引用三规(见 writer 契约)让日后任何重编号只剩"跑引擎+接缝导语"。
 
 ## 4. 监控
 - `/workflows` 看实时阶段进度。
