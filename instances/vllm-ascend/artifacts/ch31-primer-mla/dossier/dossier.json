@@ -1,0 +1,169 @@
+{
+  "kind": "primer",
+  "chapter": "ch31",
+  "title": "MLA 原理精读:低秩 KV 压缩、解耦 RoPE 与权重吸收(DeepSeek-V2, arXiv:2405.04434)",
+  "paper_pack": "instances/vllm-ascend/book/papers/ch31-primer-mla/paper.md",
+  "landing_code": "vllm_ascend/attention/mla_v1.py",
+  "backref": "回指 [第 20 章 MLA on NPU](../ch20-mla-on-npu/narrative/chapter.md)——本章补足 ch20 读者最大的认知悬崖:为什么解耦 RoPE 必须存在、权重吸收恒等式为何成立。",
+
+  "code_spine": [
+    "vllm_ascend/attention/mla_v1.py:L924-L957  process_weights_after_loading:把 kv_b_proj 拆成 W_UK / W_UV,并转置/重排为吸收所需布局(W_UK_T 供 q 侧吸收,W_UV 供 o 侧吸收)",
+    "vllm_ascend/attention/mla_v1.py:L910-L922  _q_proj_and_k_up_proj:decode 路径的 q 侧权重吸收——ql_nope = q_nope @ W_UK_T,把 k 上投影吸进 query,使其直接落到潜向量空间",
+    "vllm_ascend/attention/mla_v1.py:L1620-L1638 mla_preprocess_decode:decode 端预处理——吸收后的 q、解耦 q_pe 过 RoPE、读缓存的潜向量 c_kv 与解耦 k_pe",
+    "vllm_ascend/attention/mla_v1.py:L1389-L1593 _forward_decode:对缓存的潜向量直接做注意力 npu_fused_infer_attention_score_v2(q_nope, k_nope, k_nope),末尾 _v_up_proj 做 o 侧 W_UV 吸收",
+    "vllm_ascend/attention/mla_v1.py:L900-L907  _v_up_proj:o 侧权重吸收——把注意力输出(仍在潜空间)乘 W_UV 还原为 value 空间,再交给 o_proj",
+    "vllm_ascend/attention/mla_v1.py:L1598-L1618 mla_preprocess_prefill:prefill 端预处理——对照组,经 kv_b_proj 显式物化出 k_nope 与 value(不走吸收)",
+    "vllm_ascend/attention/mla_v1.py:L1718-L1804 forward:统一入口——decode 走吸收路径、prefill 走物化路径,输出汇入 o_proj"
+  ],
+
+  "theory": [
+    "动机(§2.1.1, Eq.1-8):标准 MHA 每 token 需缓存 K、V 共 2·n_h·d_h·l 个元素;长上下文/大 batch 下 KV cache 是显存与吞吐的主瓶颈。DeepSeek-V2:n_h=128, d_h=128, l=60 → 每 token 每层 2·128·128=32768 元素。",
+    "低秩 KV 联合压缩(§2.1.2, Eq.9-11):c_kv = W_DKV·h(压到 d_c 维),k^C = W_UK·c_kv,v^C = W_UV·c_kv。推理只缓存 c_kv(d_c 维),KV cache 降到 d_c·l 元素。d_c ≪ d_h·n_h(DeepSeek-V2:d_c=512,对比 d_h·n_h=16384,压 32×)。",
+    "权重吸收恒等式(§2.1.2 文字 + 落地代码):注意力打分 q_{t,i}^T k_{j,i}^C = (W^Q h_t)^T (W_UK c_j) = h_t^T W^Q^T W_UK c_j。令 W̃ = W_UK^T W^Q(把 k 上投影吸进 q),则打分 = (W̃ h_t)·c_j 直接在潜空间进行——推理期无需物化任何 prefix 的 full key。同理输出侧 o = Σ softmax·v^C,而 v^C=W_UV c,最终经 W^O,故 W_UV 可吸进 W^O(代码里体现为先在潜空间注意力、再 _v_up_proj 乘 W_UV)。",
+    "解耦 RoPE 的存在理由(§2.1.3, Eq.14-19)——本章核心推导:RoPE 对 q、k 都按位置施加旋转矩阵 R_m。若对压缩后的 key 施加 RoPE,则 k_m^C = R_m W_UK c,打分 q_n^T k_m^C = (R_n W^Q h_n)^T (R_m W_UK c) = h_n^T W^Q^T R_n^T R_m W_UK c = h_n^T W^Q^T R_{m-n} W_UK c。中间夹了一个依赖当前 token 相对位置 (m-n) 的旋转矩阵 R_{m-n},它随生成位置变化,无法被折进静态权重 W^Q^T W_UK(矩阵乘不满足交换律,不能把 R_{m-n} 挪到两侧合并)。→ 一旦对 c_kv 加 RoPE,权重吸收失效,必须为每个 prefix token 重算 full key,吞吐崩塌。解法:解耦——额外一小撮维度 q^R(d_h^R 维,每头)、共享 k^R(d_h^R 维)专门承载 RoPE,拼接到 nope 部分后一起算注意力;c_kv 主体不加 RoPE 从而保持可吸收。DeepSeek-V2:d_h^R=64。",
+    "q 侧低秩(§2.1.2, Eq.12-13):c_q = W_DQ·h,q^C = W_UQ·c_q。目的是降训练期激活显存(不减 KV cache),q_lora_rank=1536。落地代码里 q_a_layernorm 后经 q_proj(=q_b_proj)上投影。",
+    "KV cache 对比(§2.1.4, Table 1):MHA=2·n_h·d_h·l;GQA=2·n_g·d_h·l;MQA=2·d_h·l;MLA=(d_c+d_h^R)·l ≈ 4.5·d_h·l(d_c=4d_h, d_h^R=d_h/2 → 512+64=576=4.5·128)。MLA 等效 GQA 仅 2.25 组,却比 MHA 更强。整体较 DeepSeek 67B 减 KV cache 93.3%。"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "paper §2.1.1 Eq.7-8, §2.1.2 Eq.9-11",
+      "lines": "arXiv:2405.04434 §2.1",
+      "code": "// 标准 MHA 打分与 KV cache(Eq.7-8):\no_{t,i} = Σ_j Softmax_j( q_{t,i}^T k_{j,i} / sqrt(d_h) ) v_{j,i}\nu_t     = W^O [o_{t,1}; ...; o_{t,n_h}]\n// 推理需缓存所有 K、V → 每 token 2 n_h d_h l 元素\n\n// MLA 低秩 KV 联合压缩(Eq.9-11):\nc_t^{KV} = W^{DKV} h_t          // 压到 d_c 维潜向量(仅此被缓存)\nk_t^C    = W^{UK} c_t^{KV}      // 上投影出 key\nv_t^C    = W^{UV} c_t^{KV}      // 上投影出 value\n// 推理只缓存 c_t^{KV} → 每 token d_c l 元素;且 W^{UK} 可吸进 W^Q、W^{UV} 可吸进 W^O",
+      "elide": ["Eq.1-6(逐头切分定义)、Eq.12-13(q 侧低秩)在正文另引"]
+    },
+    {
+      "path": "paper §2.1.3 Eq.14-19(解耦 RoPE)",
+      "lines": "arXiv:2405.04434 §2.1.3",
+      "code": "// RoPE 与低秩压缩不兼容:若对 k_t^C 施加 RoPE,W^{UK} 会与位置敏感的旋转矩阵耦合,\n// 且该旋转矩阵依赖当前生成 token 的位置,夹在 W^Q 与 W^{UK} 之间,矩阵乘不满足交换律\n// → W^{UK} 无法再吸进 W^Q,必须为所有 prefix token 重算 key,严重拖慢推理。\n// 解法:解耦 RoPE——用额外多头 query q_{t,i}^R 与共享 key k_t^R 专门承载 RoPE:\n[q_{t,1}^R; ...; q_{t,n_h}^R] = q_t^R = RoPE( W^{QR} c_t^Q )   // (14)\nk_t^R  = RoPE( W^{KR} h_t )                                    // (15)\nq_{t,i} = [q_{t,i}^C ; q_{t,i}^R]                              // (16) 拼接 nope+rope\nk_{t,i} = [k_{t,i}^C ; k_t^R]                                  // (17) 共享 k^R 广播到各头\no_{t,i} = Σ_j Softmax_j( q_{t,i}^T k_{j,i} / sqrt(d_h + d_h^R) ) v_{j,i}^C  // (18)\n// 推理需缓存 c_t^{KV} 与 k_t^R,共 (d_c + d_h^R) l 元素",
+      "elide": ["Eq.19 输出投影 u_t=W^O[...] 与 Eq.7-8 相同"]
+    },
+    {
+      "path": "vllm_ascend/attention/mla_v1.py",
+      "lines": "L924-L957",
+      "code": "    def process_weights_after_loading(self, act_dtype: torch.dtype):\n        # NOTE: We currently do not support quant kv_b_proj.\n        assert isinstance(self.kv_b_proj.quant_method, UnquantizedLinearMethod)\n        # NOTE: Weight will be reshaped next, we need to revert and transpose it.\n        kv_b_proj_weight = torch_npu.npu_format_cast(self.kv_b_proj.weight.data, ACL_FORMAT_FRACTAL_ND).T\n        assert kv_b_proj_weight.shape == (\n            self.kv_lora_rank,\n            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),\n        )\n        kv_b_proj_weight = kv_b_proj_weight.view(\n            self.kv_lora_rank,\n            self.num_heads,\n            self.qk_nope_head_dim + self.v_head_dim,\n        )\n        W_UK, W_UV = kv_b_proj_weight.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)\n        if not hasattr(self, \"W_UV\"):\n            # Convert from (L, N, V) to (N, L, V)\n            self.W_UV = W_UV.transpose(0, 1).contiguous()\n            # Convert from (L, N, P) to (N, P, L)\n            self.W_UK_T = W_UK.permute(1, 2, 0).contiguous()\n        else:\n            self.W_UV.copy_(W_UV.transpose(0, 1).contiguous())\n            self.W_UK_T.copy_(W_UK.permute(1, 2, 0).contiguous())",
+      "elide": ["mlapo/量化分支(L962 起)、graph+RL 场景 copy_ 就地写回的注释——正文只需:kv_b_proj 是论文 W_UK/W_UV 的融合权重,加载后拆开并转置成吸收所需布局(W_UK_T 供 q 侧、W_UV 供 o 侧)"]
+    },
+    {
+      "path": "vllm_ascend/attention/mla_v1.py",
+      "lines": "L910-L922",
+      "code": "    # Return `ql_nope`, `q_pe`\n    def _q_proj_and_k_up_proj(self, x):\n        q_nope, q_pe = (\n            self.q_proj(x)[0]\n            .view(-1, self.num_heads, self.qk_head_dim)\n            .split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)\n        )\n        # Convert from (B, N, P) to (N, B, P)\n        q_nope = q_nope.transpose(0, 1)\n        # Multiply (N, B, P) x (N, P, L) -> (N, B, L)\n        ql_nope = torch.bmm(q_nope, self.W_UK_T)\n        # Convert from (N, B, L) to (B, N, L)\n        return ql_nope.transpose(0, 1), q_pe",
+      "elide": ["无——这是 q 侧权重吸收的核心:q_nope(P=qk_nope_head_dim 维)右乘 W_UK_T,把 query 投到潜向量维 L=kv_lora_rank,之后即可与缓存的 c_kv 直接内积。q_pe 走解耦 RoPE 分支,不吸收。"]
+    },
+    {
+      "path": "vllm_ascend/attention/mla_v1.py",
+      "lines": "L900-L907, L1589-L1593",
+      "code": "    def _v_up_proj(self, x):\n        # Convert from (N, B, L)/(N, B, 1, L) to (N, B, L)\n        x = x.view(self.num_heads, -1, self.kv_lora_rank)\n        # Multiply (N, B, L) x (N, L, V) -> (B, N, V)\n        x = torch_npu.npu_transpose_batchmatmul(x, self.W_UV, perm_y=(1, 0, 2))\n        # Convert from (B, N, V) to (B, N * V)\n        x = x.reshape(-1, self.num_heads * self.v_head_dim)\n        return x\n\n    # ...在 _forward_decode 末尾:\n        attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(q_nope, k_nope, k_nope, **common_kwargs)\n        if self.head_padding > 0:\n            attn_output = attn_output[: self.num_heads]\n        return self._v_up_proj(attn_output)",
+      "elide": ["graph capture 分支(L1534-L1587)、head padding/量化分支——正文只需:decode 注意力直接对缓存潜向量算(q_nope=吸收后 query,k_nope=缓存的 c_kv,value 也传 k_nope 即潜向量),注意力输出仍在潜空间,再由 _v_up_proj 乘 W_UV 还原到 value 空间——这正是 W_UV 吸进 o 侧的落地形态。"]
+    },
+    {
+      "path": "vllm_ascend/attention/mla_v1.py",
+      "lines": "L1598-L1618",
+      "code": "    def mla_preprocess_prefill(self, q_c, kv_no_split, kv_cache, attn_metadata):\n        # ...\n        prefill_q = self.q_proj(prefill_q_c)[0].view(-1, self.num_heads, self.qk_head_dim)\n        prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]\n        prefill_q_nope = prefill_q[..., : self.qk_nope_head_dim]\n        prefill_q_pe = self.rope_single(prefill_q_pe, cos, sin)\n        prefill_k_pe, prefill_k_c_normed = self.exec_kv_prefill(prefill_kv_no_split, cos, sin, kv_cache, prefill_slots)\n        prefill_k_nope, prefill_value = (\n            self.kv_b_proj(prefill_k_c_normed)[0]\n            .view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)\n            .split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)\n        )",
+      "elide": ["cos/sin 取用、k_pe expand 广播细节——正文对比点:prefill 走的是不吸收的对照路径,q_nope 不乘 W_UK_T,而是经 kv_b_proj 把潜向量 c 显式物化成 full k_nope 与 value 再算标准注意力。为什么 prefill 不吸收:prefill 一次性处理整段,重算 K/V 的算力被序列长度摊薄,而 decode 每步只 1 token、要对全部 prefix 缓存做内积,吸收才划算。"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "AscendMLAImpl", "file": "vllm_ascend/attention/mla_v1.py:L700", "responsibility": "MLA 注意力在 NPU 上的实现。__init__ 记录 q_lora_rank/kv_lora_rank/qk_nope_head_dim/qk_rope_head_dim/v_head_dim 等 MLA 维度与各投影层(q_proj/kv_b_proj/o_proj/fused_qkv_a_proj);持有 forward 主循环与 decode/prefill 两条路径。"},
+    {"name": "AscendMLAImpl.process_weights_after_loading", "file": "vllm_ascend/attention/mla_v1.py:L924", "responsibility": "加载后把融合的 kv_b_proj 权重拆成论文的 W_UK、W_UV,并转置/重排成吸收布局:W_UK_T(N,P,L)供 q 侧、W_UV(N,L,V)供 o 侧。"},
+    {"name": "AscendMLAImpl._q_proj_and_k_up_proj", "file": "vllm_ascend/attention/mla_v1.py:L910", "responsibility": "decode 路径 q 侧权重吸收:q_nope 右乘 W_UK_T 投到潜空间(ql_nope),q_pe 分出走解耦 RoPE。"},
+    {"name": "AscendMLAImpl._v_up_proj", "file": "vllm_ascend/attention/mla_v1.py:L900", "responsibility": "o 侧权重吸收:把潜空间注意力输出乘 W_UV 还原为 value 空间,交给 o_proj。"},
+    {"name": "AscendMLAImpl._forward_decode", "file": "vllm_ascend/attention/mla_v1.py:L1389", "responsibility": "decode 注意力:对缓存的潜向量 c_kv 与解耦 k_pe 直接算 npu_fused_infer_attention_score_v2,末尾 _v_up_proj。"},
+    {"name": "AscendMLAImpl.mla_preprocess_prefill", "file": "vllm_ascend/attention/mla_v1.py:L1598", "responsibility": "prefill 对照路径:经 kv_b_proj 显式物化 full k_nope 与 value,不走吸收。"},
+    {"name": "DecodeMLAPreprocessResult / PrefillMLAPreprocessResult", "file": "vllm_ascend/attention/mla_v1.py:L683,L692", "responsibility": "两条路径的中间产物容器:decode 携带 ql_nope(已吸收)/q_pe/k_nope(潜向量)/k_pe;prefill 携带 q_nope/q_pe/k_nope(物化)/k_pe/value。"}
+  ],
+
+  "data_flow": [
+    "1. forward(L1718):区分 decode 与 prefill token(num_decodes/num_prefills),分派两条路径",
+    "2. _mla_preprocess(L1640):fused_qkv_a_proj → 拆出 q_c(q_lora,过 q_a_layernorm)与 kv_no_split(含 c_kv 与解耦 k_pe 的原料)",
+    "3a. decode:mla_preprocess_decode(L1620)→ _q_proj_and_k_up_proj 做 q 侧 W_UK 吸收得 ql_nope;q_pe 过 RoPE;exec_kv_decode 读/写缓存潜向量 c_kv 与 k_pe",
+    "3b. decode:_forward_decode(L1389)对潜向量直接注意力 → _v_up_proj 做 o 侧 W_UV 吸收",
+    "4a. prefill:mla_preprocess_prefill(L1598)→ q_proj 出 q_nope/q_pe;kv_b_proj 物化 full k_nope/value(不吸收)",
+    "4b. prefill:_forward_prefill(L1243)标准注意力",
+    "5. forward:两路输出汇入 o_proj_input → o_proj(L1799)得最终输出"
+  ],
+
+  "design_decisions": [
+    {"decision": "decode 走权重吸收、prefill 走物化,两条独立路径", "why": "decode 每步仅 1 query 却要对全部 prefix 缓存内积——吸收后直接在潜空间算,免去物化 full K/V 的算力与显存;prefill 一次算整段,重算 K/V 被序列长度摊薄,物化更简单且不影响吞吐。", "evidence": "vllm_ascend/attention/mla_v1.py:L1762-L1790(decode 调 _forward_decode 用 ql_nope,prefill 调 _forward_prefill 用物化 k_nope/value)"},
+    {"decision": "把 kv_b_proj 在加载后就拆分并转置成 W_UK_T / W_UV", "why": "吸收所需的是转置/重排后的布局(q 侧要 (N,P,L) 做 bmm,o 侧要 (N,L,V));一次性在权重加载后处理,推理热路径直接 bmm,不重复转置。", "evidence": "vllm_ascend/attention/mla_v1.py:L945-L957"},
+    {"decision": "解耦 RoPE:nope 主体(可吸收)与 rope 分量(承载位置)分离,拼接后算注意力", "why": "位置旋转矩阵 R_{m-n} 依赖相对位置、夹在 W^Q 与 W_UK 之间,破坏权重吸收;把 RoPE 限制在独立的小维度 q_pe/k_pe 上,潜向量 c_kv 主体保持位置无关从而可吸收。", "evidence": "vllm_ascend/attention/mla_v1.py:L910-L922(q_nope 吸收、q_pe 分出) + L1609/L1626(仅对 q_pe/k_pe 施加 rope_single)"}
+  ],
+
+  "mechanisms": [
+    {
+      "id": "kv-cache-bottleneck",
+      "name": "长上下文的 KV cache 瓶颈(MLA 的动机)",
+      "kind": "dataflow",
+      "source_anchors": ["vllm_ascend/attention/mla_v1.py:L96-L103"],
+      "paper_origin": {"paper": "arXiv:2405.04434", "sections": ["§2.1.1", "Eq.7", "Eq.8", "Table 1"]},
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "low-rank-kv-joint-compression",
+      "name": "低秩 KV 联合压缩(c_kv = W_DKV·h,只缓存潜向量)",
+      "kind": "algorithm",
+      "source_anchors": ["vllm_ascend/attention/mla_v1.py:L1620-L1638", "vllm_ascend/attention/mla_v1.py:L1312-L1342"],
+      "paper_origin": {"paper": "arXiv:2405.04434", "sections": ["§2.1.2", "Eq.9", "Eq.10", "Eq.11"]},
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "decoupled-rope",
+      "name": "解耦 RoPE:为什么位置旋转不可吸收进 W_UK(ch20 读者最大认知悬崖)",
+      "kind": "algorithm",
+      "source_anchors": ["vllm_ascend/attention/mla_v1.py:L910-L922", "vllm_ascend/attention/mla_v1.py:L1377-L1387"],
+      "paper_origin": {"paper": "arXiv:2405.04434", "sections": ["§2.1.3", "Eq.14", "Eq.15", "Eq.16", "Eq.17", "Eq.18"]},
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "weight-absorption-identity",
+      "name": "权重吸收恒等式(W_UK 吸进 q 侧、W_UV 吸进 o 侧)",
+      "kind": "algorithm",
+      "source_anchors": ["vllm_ascend/attention/mla_v1.py:L900-L922", "vllm_ascend/attention/mla_v1.py:L924-L957", "vllm_ascend/attention/mla_v1.py:L1589-L1593"],
+      "paper_origin": {"paper": "arXiv:2405.04434", "sections": ["§2.1.2"]},
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "q-side-low-rank",
+      "name": "q 侧低秩压缩(c_q = W_DQ·h,降训练激活显存)",
+      "kind": "algorithm",
+      "source_anchors": ["vllm_ascend/attention/mla_v1.py:L1640-L1667", "vllm_ascend/attention/mla_v1.py:L728-L736"],
+      "paper_origin": {"paper": "arXiv:2405.04434", "sections": ["§2.1.2", "Eq.12", "Eq.13"]},
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "kv-cache-comparison",
+      "name": "MLA vs MHA/GQA/MQA 的 KV cache 压缩率(小维度数值推演)",
+      "kind": "config",
+      "source_anchors": ["vllm_ascend/attention/mla_v1.py:L728-L733"],
+      "paper_origin": {"paper": "arXiv:2405.04434", "sections": ["§2.1.4", "Table 1"]},
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "decode-vs-prefill-paths",
+      "name": "落地:decode 吸收路径 vs prefill 物化路径(何时吸收才划算)",
+      "kind": "dataflow",
+      "source_anchors": ["vllm_ascend/attention/mla_v1.py:L1718-L1804", "vllm_ascend/attention/mla_v1.py:L1598-L1618", "vllm_ascend/attention/mla_v1.py:L1620-L1638"],
+      "paper_origin": {"paper": "arXiv:2405.04434", "sections": ["§2.1.2", "§2.1.3"]},
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    }
+  ],
+
+  "subtraction_plan": {},
+
+  "foreshadow_due": {"bury": [], "recover": [], "note": "bible.py due ch31 返回空(应埋/应回收均无)。本章为原理 primer,面向回指 ch20。"}
+}

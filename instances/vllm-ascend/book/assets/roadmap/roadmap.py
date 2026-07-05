@@ -163,6 +163,7 @@ def build(highlight: str) -> str:
                            for c in sub_label)
         cw = max(bw + 16, int(lbl_w) + 32)
         cx = hl_x + bw // 2 - cw // 2   # 以 Part 框中心对齐，向两侧对称展开
+        cx = max(8, min(cx, w - cw - 8))  # 夹到画布内：首/末 Part 配长标签时避免右/左裁切
         L.append(f'<line x1="{hl_x + bw // 2}" y1="{y0 + bh}" '
                  f'x2="{hl_x + bw // 2}" y2="{cy}" stroke="#7c3aed" '
                  f'stroke-width="2" stroke-dasharray="4 3" marker-end="url(#a)"/>')

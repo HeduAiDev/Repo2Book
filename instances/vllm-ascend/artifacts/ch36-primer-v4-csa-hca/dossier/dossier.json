@@ -1,0 +1,351 @@
+{
+  "kind": "primer",
+  "chapter": "ch36",
+  "title": "DeepSeek-V4 的 CSA/HCA 两级压缩混合注意力(论文精读)",
+  "premise": "这是 ch31 MLA → ch32 DSA(稀疏注意力)演进线的收束章。DeepSeek-V4(arXiv:2606.19348)把两条线合流为一套『混合注意力』:CSA(Compressed Sparse Attention)先把每 m=4 个 token 的 KV 压成 1 条,再做 DSA 式 top-k 稀疏;HCA(Heavily Compressed Attention)把每 m'=128 个 token 重压成 1 条后做稠密注意力抓全局。两者层间交错互补,把 1M 上下文下的单 token 推理 FLOPs 压到 V3.2 的 27%、KV cache 压到 10%。本章按『动机→推导→数值→落地』四段式讲清,落地对照 vllm_ascend 的 Compressor/Indexer(deepseek_v4.py)与 KVComp 配置/元数据(kvcomp_utils.py)。真相源=论文包 + 落地代码双源;不做减法(primer)。",
+  "paper": "arXiv:2606.19348",
+  "paper_pack": "instances/vllm-ascend/book/papers/ch36-primer-v4-csa-hca/paper.md",
+
+  "code_spine": [
+    "vllm_ascend/utils.py:L105-L110  get_dsv4_compress_ratio —— 逐层 compress_ratios 数组 → 4(CSA)/128(HCA)/0(dense),混合交错的『开关表』",
+    "vllm_ascend/models/deepseek_v4.py:L790-L834  DeepseekV4Attention.__init__ —— 依 compress_ratio 挂载 Compressor(必挂)与 Indexer(仅 c4=CSA 才挂)",
+    "vllm_ascend/models/deepseek_v4.py:L598-L674  Compressor —— coff=1+overlap、ape 位置偏置、wkv/wgate(=论文 W^KV/W^Z)、overlap_transform(=Eq.11-12 重叠 2m 压缩)",
+    "vllm_ascend/models/deepseek_v4.py:L531-L592  Indexer —— wq_b/weights_proj(=W^{IUQ}/W^w)、index_topk(=top-k 的 k)、自带 compressor 压 indexer key(=Eq.13-17 lightning indexer)",
+    "vllm_ascend/models/deepseek_v4.py:L711-L910  DeepseekV4Attention —— wq_a/q_norm/wq_b 低秩 query、wkv/kv_norm、wo_a/wo_b 分组输出投影(n_groups=g, o_lora_rank=d_g)、attn_sink(=Eq.27)、window_size(=滑窗 n_win)",
+    "vllm_ascend/models/deepseek_v4.py:L984-L1003  DeepseekV2DecoderLayer.forward —— mHC(npu_hc_pre/hc_post, hc_sinkhorn_iters)包裹 attn/mlp(=§2.2 Eq.1-8)",
+    "vllm_ascend/models/deepseek_v4.py:L1044-L1048  DeepseekV4Model —— make_layers 按 compress_ratios 交错构建 CSA/HCA 层;topk_indices_buffer 供 IndexCache 复用",
+    "vllm_ascend/worker/kvcomp_utils.py:L144-L365  KVCompConfig —— chunk_size/chunk_repre_method/top_k_ratio_per_layer/must_select_blocks/rollback|skip_layers(稀疏选择的落地配置)",
+    "vllm_ascend/worker/kvcomp_utils.py:L368-L488  HashEncoder —— QR 正交化随机 hash 权重 + npu_sign_bits_pack 打包成 uint8 hash 码(LSH 式,给 Hamming top-k 选块用)",
+    "vllm_ascend/worker/kvcomp_utils.py:L491-L580  KVCompMetaData + initialize_kvcomp_metadata —— 运行期 Hamming top-k 选块的张量集;sink=1, recent=4",
+    "vllm_ascend/models/layer/attention/layer.py:L31-L49  DSV4_BLOCK_SIZES —— [mla, swa, c4 state, c128 state] 四类 KV 缓存的 block_size 表",
+    "vllm_ascend/models/layer/attention/layer.py:L174-L192  DSAAttention.get_kv_cache_spec —— compress_ratio<=1 走独立 SWA 缓存,否则 MLAAttentionSpec 带 compress_ratio"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "book/papers/ch36-primer-v4-csa-hca/paper.md",
+      "lines": "§1 Introduction / §2.3.4",
+      "kind": "paper",
+      "code": "In the one-million-token context setting, DeepSeek-V4-Pro requires only 27% of single-token inference FLOPs and 10% of KV cache compared with DeepSeek-V3.2. ... even DeepSeek-V4-Pro, which has a larger number of activated parameters, attains only 27% of the single-token FLOPs (measured in equivalent FP8 FLOPs) and 10% of the KV cache size relative to DeepSeek-V3.2. Furthermore, DeepSeek-V4-Flash ... achieves only 10% of the single-token FLOPs and 7% of the KV cache size compared with DeepSeek-V3.2.",
+      "elide": ["Pro/Flash 参数规模、FP4 硬件前瞻等细节留待正文引"]
+    },
+    {
+      "path": "book/papers/ch36-primer-v4-csa-hca/paper.md",
+      "lines": "§2.3 opening",
+      "kind": "paper",
+      "code": "CSA integrates both compression and sparse attention strategies: it first compresses the Key-Value (KV) cache of every m tokens into one entry, and then applies DeepSeek Sparse Attention (DSA) where each query token attends to only k compressed KV entries. HCA aims for extreme compression by consolidating the KV cache of every m' (>> m) tokens into a single entry.",
+      "elide": []
+    },
+    {
+      "path": "book/papers/ch36-primer-v4-csa-hca/paper.md",
+      "lines": "§2.3.1 Eq.(11)-(12)",
+      "kind": "paper",
+      "code": "[S^a_{mi:m(i+1)-1}; S^b_{m(i-1):mi-1}] = Softmax_row([Z^a_{mi:m(i+1)-1} + B^a; Z^b_{m(i-1):mi-1} + B^b])   (11)\nC^Comp_i = sum_{j=mi}^{m(i+1)-1} S^a_j ⊙ C^a_j  +  sum_{j=m(i-1)}^{mi-1} S^b_j ⊙ C^b_j             (12)\n\n... Softmax_row performs normalization across the total of 2m elements from both Z^a and Z^b. When i=0, Z^b is padded with negative infinity and C^b is padded with zeros. ... each C^Comp_i is derived from 2m KV entries, but the indexes of C^b used for C^Comp_i and the indexes of C^a used for C^Comp_{i-1} are overlapped. Therefore, CSA in fact compresses the sequence length to 1/m times.",
+      "elide": ["C^a,C^b = H·W^{aKV},H·W^{bKV};Z^a,Z^b = H·W^{aZ},H·W^{bZ}(Eq.9-10)已在正文前置"]
+    },
+    {
+      "path": "book/papers/ch36-primer-v4-csa-hca/paper.md",
+      "lines": "§2.3.1 Eq.(16)-(17)",
+      "kind": "paper",
+      "code": "I_{t,s} = sum_{h=1}^{n^I_h} w^I_{t,h} · ReLU( q^I_{t,h} · K^IComp_s )              (16)\nC^SprsComp_t = { C^Comp_s | I_{t,s} ∈ Top-k(I_{t,:}) }                             (17)\n\n... the index score I_{t,s} between the query token t and a preceding compressed block s (s < Floor(t/m)) ... we employ a top-k selector to selectively retain a subset of compressed KV entries for subsequent core attention.",
+      "elide": ["indexer query 低秩生成 c^Q_t=h_t·W^{DQ}, q^I_t=c^Q_t·W^{IUQ}(Eq.13-14);w^I_t=h_t·W^w(Eq.15)"]
+    },
+    {
+      "path": "book/papers/ch36-primer-v4-csa-hca/paper.md",
+      "lines": "§2.3.2 Eq.(22)-(23)",
+      "kind": "paper",
+      "code": "S_{m'i:m'(i+1)-1} = Softmax_row( Z_{m'i:m'(i+1)-1} + B )                          (22)\nC^Comp_i = sum_{j=m'i}^{m'(i+1)-1} S_j ⊙ C_j                                       (23)\n\n... HCA ... employs a larger compression rate m' (>> m) and does not perform overlapped compression. ... Through this compression operation, HCA compresses the sequence length to 1/m' times. ... HCA also employs the shared KV MQA and grouped output projection strategies as CSA does. HCA ... does not employ sparse attention.",
+      "elide": ["C=H·W^{KV}, Z=H·W^Z(Eq.20-21);query 低秩 Eq.24-25、MQA Eq.26 与 CSA 同构"]
+    },
+    {
+      "path": "book/papers/ch36-primer-v4-csa-hca/paper.md",
+      "lines": "§2.3.3 Eq.(27)",
+      "kind": "paper",
+      "code": "s_{h,i,j} = Exp(z_{h,i,j}) / ( sum_k Exp(z_{h,i,k}) + Exp(z'_h) )                  (27)\n\nAttention Sink: we set a series of learnable sink logits {z'_1,...,z'_{n_h}}. For the h-th attention head, Exp(z'_h) will be added to the denominator of the attention score. This technique allows each query head to adjust its total attention scores to be not equal to 1, and even to be near 0.\n\nSliding Window: for each query token, we additionally produce n_win uncompressed KV entries corresponding to the recent n_win tokens ... used along with the compressed KV entries.\n\nPartial RoPE: we apply RoPE to its last 64 dimensions ... we also apply RoPE with position -i on the last 64 dimensions of each o_{t,i}, so the output carries relative position embeddings.",
+      "elide": ["Query/KV RMSNorm(核注意力前对每头 query 与压缩 KV 做 RMSNorm)"]
+    },
+    {
+      "path": "vllm_ascend/utils.py",
+      "lines": "L105-L110",
+      "kind": "code",
+      "code": "def get_dsv4_compress_ratio(config: Any, layer_idx: int) -> int:\n    \"\"\"Return DSV4 compress ratio, treating unspecified MTP layers as dense.\"\"\"\n    compress_ratios = getattr(config, \"compress_ratios\", None)\n    if compress_ratios is None or layer_idx >= len(compress_ratios):\n        return 0\n    return compress_ratios[layer_idx]",
+      "elide": []
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v4.py",
+      "lines": "L610-L666",
+      "kind": "code",
+      "code": "        self.dim = config.hidden_size\n        self.head_dim = head_dim\n        self.rope_head_dim = config.qk_rope_head_dim\n        self.nope_head_dim = head_dim - config.qk_rope_head_dim\n        self.compress_ratio = compress_ratio\n        self.overlap = compress_ratio == 4\n        self.rotate = rotate\n        self.norm_eps = config.rms_norm_eps\n        self.coff = 1 + self.overlap\n\n        self.ape = nn.Parameter(torch.empty(compress_ratio, self.coff * self.head_dim, dtype=torch.float32))\n        self.wkv = ReplicatedLinear(self.dim, self.coff * self.head_dim, bias=False, ...)\n        self.wgate = ReplicatedLinear(self.dim, self.coff * self.head_dim, bias=False, ...)\n        self.norm = RMSNorm(self.head_dim, config.rms_norm_eps, dtype=norm_dtype)\n        # ...\n        if compress_ratio == 4:\n            self.state_cache = AscendCompressorStateCache(state_dim=2 * self.coff * self.head_dim, ...)  # kv_state + score_state\n        elif compress_ratio == 128:\n            self.state_cache = AscendCompressorStateCache(state_dim=2 * self.head_dim, ...)\n        else:\n            raise ValueError(f\"Only support compress_ratio in [4, 128]. Got unsupported compress_ratio: {compress_ratio}\")",
+      "elide": ["quant_config/A5 device 分支与 return_bias、magic-number block_size 检索省略,只保留结构骨架"]
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v4.py",
+      "lines": "L668-L674",
+      "kind": "code",
+      "code": "    def overlap_transform(self, tensor: torch.Tensor, value=0):\n        b, s, _, _ = tensor.size()\n        ratio, d = self.compress_ratio, self.head_dim\n        new_tensor = tensor.new_full((b, s, 2 * ratio, d), value)\n        new_tensor[:, :, ratio:] = tensor[:, :, :, d:]\n        new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]\n        return new_tensor",
+      "elide": []
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v4.py",
+      "lines": "L544-L592",
+      "kind": "code",
+      "code": "        self.n_heads = config.index_n_heads\n        self.head_dim = config.index_head_dim\n        self.rope_head_dim = config.qk_rope_head_dim\n        self.index_topk = config.index_topk\n        self.softmax_scale = self.head_dim**-0.5\n        self.compress_ratio = compress_ratio\n\n        self.wq_b = ReplicatedLinear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False, ...)\n        self.weights_proj = ReplicatedLinear(config.hidden_size, self.n_heads, bias=False, ...)\n        # ...\n        if self.compress_ratio == 4:\n            self.k_cache = AscendDeepseekV4IndexerCache(head_dim=self.head_dim, dtype=k_dtype, ..., compress_ratio=self.compress_ratio)\n        self.compressor = None\n        if self.compress_ratio > 1:\n            self.compressor = Compressor(vllm_config, config, self.compress_ratio, head_dim=self.head_dim, rotate=True, ...)  # Compressor(4, 128)",
+      "elide": ["ReplicatedLinear 的 quant_config/prefix/return_bias 参数省略"]
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v4.py",
+      "lines": "L790-L834",
+      "kind": "code",
+      "code": "        self.compress_ratio = get_dsv4_compress_ratio(config, config_layer_idx)\n\n        if self.compress_ratio > 1:\n            config.rope_parameters[\"rope_theta\"] = config.compress_rope_theta\n            rope_groups = [\"default\", f\"c{self.compress_ratio}\"]\n        else:\n            config.rope_parameters[\"rope_theta\"] = config.rope_theta\n            rope_groups = [\"default\"]\n        # ... ComplexExpRotaryEmbedding(...) ...\n\n        self.compressor: Compressor | None = None\n        self.indexer: Indexer | None = None\n\n        if self.compress_ratio > 1:\n            self.compressor = Compressor(vllm_config, config, self.compress_ratio, head_dim=self.head_dim, ...)  # Compressor(4, 128)\n\n            if self.compress_ratio == 4:\n                self.indexer = Indexer(vllm_config, config, self.compress_ratio, ...)",
+      "elide": ["ComplexExpRotaryEmbedding 构造参数、Indexer/Compressor 的 quant/cache/prefix 参数省略;IndexCache skip_topk 逻辑见 L842-L853"]
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v4.py",
+      "lines": "L984-L1003",
+      "kind": "code",
+      "code": "    def forward(self, positions, hidden_states, residual, llama_4_scaling=None):\n        residual = hidden_states.clone()\n        hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)\n        hidden_states = self.input_layernorm(hidden_states)\n        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states, llama_4_scaling=llama_4_scaling)\n        hidden_states = self.hc_post(hidden_states, residual, post, comb)\n        residual = hidden_states.clone()\n        hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)\n        hidden_states = self.post_attention_layernorm(hidden_states)\n        hidden_states = self.mlp(hidden_states)\n        hidden_states = self.hc_post(hidden_states, residual, post, comb)\n        return hidden_states, residual",
+      "elide": ["hc_pre/hc_post 内部为 npu_hc_pre/npu_hc_post 融合算子(带 hc_sinkhorn_iters=Eq.8 Sinkhorn 迭代),细节封装在 kernel"]
+    },
+    {
+      "path": "vllm_ascend/worker/kvcomp_utils.py",
+      "lines": "L150-L194",
+      "kind": "code",
+      "code": "    model_name: str = \"DummyModel\"\n    is_mla: bool = False\n    hash_weight_type: str | None = \"random\"      # either \"random\" or \"fixed\"\n    num_hidden_layers: int = 36\n    seq_len_threshhold: int = 2048               # the minimal seq_len to trigger KVComp\n    chunk_size: int = 128                        # any value divisible by 128\n    chunk_repre_method: str = \"max\"              # either \"max\", \"min\" or \"sum\"\n    head_dim: int = 128\n    hash_bits: int = 128\n    top_k_ratio_per_layer: list[float] = field(default_factory=lambda: [0.3] * 36)\n    top_k_index_reuse: list[int] = field(default_factory=lambda: [-1] * 36)\n    # nonnegative means slicing from the start, negative means slicing from the end\n    must_select_blocks: list[int] = field(default_factory=lambda: [0, -2, -1])\n    # ... MLA-conditional fields: kv_lora_rank / qk_rope_head_dim / hash_bits_kv_lora / hash_bits_qk_rope ...\n    vllm_hash_attention_topk: int = 4096\n    vllm_hash_attention_rollback_layers: list[int] = field(default_factory=lambda: [])\n    vllm_hash_attention_skip_layers: list[int] = field(default_factory=lambda: [])",
+      "elide": ["generate_config_data/generate_mla_config_data/set_hash_weight/to_json/from_json 方法体省略,仅保留字段清单"]
+    },
+    {
+      "path": "vllm_ascend/worker/kvcomp_utils.py",
+      "lines": "L423-L458",
+      "kind": "code",
+      "code": "    def compute_hash(self, x: torch.Tensor) -> torch.Tensor:\n        # x: (..., input_dim) -> (..., hash_numbers=hash_bits//8) uint8 hash codes\n        orig_shape = x.shape[:-1]\n        x_flat = x.reshape(-1, self.input_dim)\n        if x_flat.dtype != self.dtype:\n            x_flat = x_flat.to(self.dtype)\n        xW = torch.matmul(x_flat, self.hash_weights)          # [N, hash_bits]\n        xW_flat = xW.view(-1)\n        packed_codes_flat = torch.ops._C_ascend.npu_sign_bits_pack(xW_flat, size=1)\n        out_shape = orig_shape + (self.hash_numbers,)\n        packed_codes = packed_codes_flat.view(out_shape)\n        return packed_codes",
+      "elide": ["_init_hash_weights 用 torch.linalg.qr 对随机高斯权重做 QR 正交化(Q*sign(diag(R)));_unpack_hash 把 uint8 解回 ±1"]
+    },
+    {
+      "path": "vllm_ascend/worker/kvcomp_utils.py",
+      "lines": "L491-L513",
+      "kind": "code",
+      "code": "@dataclass\nclass KVCompMetaData:\n    # for both GQA and MLA\n    kvcomp_config: KVCompConfig\n    chunk_sizes_for_hamming_full: torch.Tensor\n    topk_for_hamming_full: torch.Tensor\n    topk_for_hamming_full_cpu: torch.Tensor\n    seq_lens_for_hamming: torch.Tensor\n    hamming_output: torch.Tensor\n    seq_lens_from_hamming: torch.Tensor\n    seq_lens_for_reshape: torch.Tensor\n    valid_query_mask: torch.Tensor\n    sink: int\n    recent: int\n    hash_encoder: HashEncoder\n    hashk_caches: list[torch.Tensor]\n    num_actual_tokens: int = 0\n    max_seq_len_for_hamming: int = 0\n    # ... slot_mapping / seq_lens_gpu / actual_query_lens / block_tables_for_hamming ...",
+      "elide": ["initialize_kvcomp_metadata 在 L564-L578 构造该对象,固定 sink=1, recent=4"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "get_dsv4_compress_ratio", "file": "vllm_ascend/utils.py", "responsibility": "从 config.compress_ratios 逐层取压缩率:4=CSA 层、128=HCA 层、0=稠密/未指定。这是 CSA/HCA 混合交错的『开关表』的读取入口。"},
+    {"name": "Compressor", "file": "vllm_ascend/models/deepseek_v4.py", "responsibility": "论文 §2.3.1/§2.3.2 的 KV 压缩模块。coff=1+overlap(c4 重叠→coff=2,c128 无重叠→coff=1);wkv=W^KV 生成 KV 条目、wgate=W^Z 生成压缩权重、ape=位置偏置 B;overlap_transform 拼出重叠的 2m 窗口(Eq.11-12);state_cache 存跨块滚动的 kv_state+score_state。"},
+    {"name": "Indexer", "file": "vllm_ascend/models/deepseek_v4.py", "responsibility": "论文 §2.3.1 lightning indexer,仅 CSA(c4)层挂载。wq_b=W^{IUQ} 低秩升出 indexer query、weights_proj=W^w 出每头权重、index_topk=top-k 的 k;自带一个 Compressor 压出 indexer key K^IComp;k_cache 缓存压缩后的 indexer key。"},
+    {"name": "DeepseekV4Attention", "file": "vllm_ascend/models/deepseek_v4.py", "responsibility": "一层注意力的装配器。wq_a→q_norm→wq_b 低秩 query(c^Q_t 共享给 indexer 与核注意力);wkv/kv_norm;wo_a/wo_b=分组输出投影(n_groups=g、o_lora_rank=d_g,Grouped Output Projection);attn_sink=Eq.27 可学习 sink logit;window_size=滑窗 n_win;按 compress_ratio 挂 Compressor(必)与 Indexer(仅 c4)。"},
+    {"name": "DeepseekV2DecoderLayer", "file": "vllm_ascend/models/deepseek_v4.py", "responsibility": "解码层,用 mHC(§2.2)包裹 attn 与 mlp:hc_pre/hc_post 融合算子内含 Sinkhorn(hc_sinkhorn_iters)把残差映射约束到双随机矩阵流形。"},
+    {"name": "DeepseekV4Model", "file": "vllm_ascend/models/deepseek_v4.py", "responsibility": "整模型。make_layers 按 config.compress_ratios 交错构建 CSA/HCA 层;topk_indices_buffer 在模型级共享给 IndexCache/MTP 复用 top-k 结果。"},
+    {"name": "KVCompConfig", "file": "vllm_ascend/worker/kvcomp_utils.py", "responsibility": "KVComp(hash-Hamming 稀疏选块)的配置 dataclass:chunk_size(÷128)、chunk_repre_method(块代表 max/min/sum)、top_k_ratio_per_layer、must_select_blocks([0,-2,-1]=强制保留首块与最近两块,呼应 sink+recent)、rollback/skip_layers、seq_len_threshhold(触发阈值);支持 GQA 与 MLA 两套生成方法与 JSON 存取。"},
+    {"name": "HashEncoder", "file": "vllm_ascend/worker/kvcomp_utils.py", "responsibility": "LSH 式哈希:QR 正交化的随机投影权重把浮点向量投到 hash_bits 维,取符号位经 npu_sign_bits_pack 压成 uint8 hash 码;为 Hamming 距离 top-k 选块提供紧凑编码(把 §2.3.1 的 indexer 打分近似成汉明距离检索)。"},
+    {"name": "KVCompMetaData", "file": "vllm_ascend/worker/kvcomp_utils.py", "responsibility": "运行期 Hamming top-k 选块的张量集合与 hashk 缓存;固定 sink=1, recent=4(=注意力 sink 与滑窗最近块的运行期落地)。"},
+    {"name": "DSV4_BLOCK_SIZES / DSAAttention.get_kv_cache_spec", "file": "vllm_ascend/models/layer/attention/layer.py", "responsibility": "四类 KV 缓存(mla、swa、c4 state、c128 state)的分页 block_size 表;compress_ratio<=1 的层走独立 SWA 缓存,否则用带 compress_ratio 的 MLAAttentionSpec。"}
+  ],
+
+  "data_flow": [
+    "1. 建模期:DeepseekV4Model.__init__ 用 make_layers 逐层调 get_dsv4_compress_ratio(config, idx) 读 compress_ratios → 4/128/0,决定该层是 CSA / HCA / 稠密,交错成混合栈。",
+    "2. CSA 层压缩(Compressor, overlap=True/coff=2):wkv 出 KV 条目 C、wgate 出压缩权重 Z,overlap_transform 把相邻块拼成重叠的 2m 窗口,加 ape 位置偏置后 Softmax_row 归一(Eq.11)、加权求和得每块单条 C^Comp(Eq.12)→ 序列长压到 1/m(m=4)。",
+    "3. CSA 稀疏选块(Indexer):自带 compressor 压出 indexer key K^IComp;wq_b 低秩升出 indexer query、weights_proj 出每头权重 w^I;ReLU 内积按头加权得 index score I_{t,s}(Eq.16),Top-k 选出 k 个压缩块 C^SprsComp(Eq.17)。",
+    "4. CSA 核注意力:共享的低秩 c^Q_t 升出注意力 query,对选中的压缩块做 MQA(Eq.18-19);叠加滑窗最近 n_win 未压缩 KV 与 attn_sink(Eq.27);分组输出投影 wo_a→wo_b 回到 d 维。",
+    "5. HCA 层压缩(Compressor, overlap=False/coff=1):同构但压缩率 m'=128、无重叠,序列长压到 1/m'(Eq.22-23);不做稀疏,直接对全部压缩块做稠密 MQA(Eq.26)+滑窗+sink;分组输出投影回 d 维。",
+    "6. mHC 残差(DeepseekV2DecoderLayer.forward):hc_pre/hc_post 用 Sinkhorn(hc_sinkhorn_iters)把残差映射约束到双随机矩阵流形,分别包裹 attn 与 mlp 两个子层(§2.2)。",
+    "7. 落地稀疏选块(KVComp 运行期):HashEncoder.compute_hash 把 query/KV 投影取符号位打包成 uint8;按 KVCompConfig.chunk_size/chunk_repre_method 出块代表,Hamming 距离 top-k(top_k_ratio_per_layer)选块,must_select_blocks 强制保留首块+最近块(sink=1/recent=4);hashk_caches 缓存各层 hash 码。"
+  ],
+
+  "design_decisions": [
+    {"decision": "CSA 与 HCA 层间交错而非二选一", "why": "CSA(轻压 m=4 + top-k 稀疏)保留细粒度局部/被选中远程依赖,HCA(重压 m'=128 稠密)以极低成本覆盖全局所有块——两者互补:稀疏怕漏掉未选中的全局信息,重压怕丢细节,交错让每种缺陷被另一种补上。", "evidence": "book/papers/ch36-primer-v4-csa-hca/paper.md:§2.3;vllm_ascend/utils.py:L105-L110(逐层 compress_ratios 开关)"},
+    {"decision": "CSA 用重叠 2m 压缩(overlap/coff=2),HCA 不重叠(coff=1)", "why": "重叠让相邻压缩块共享边界 token(C^b 与前一块 C^a 索引交叠),缓解硬切块导致的边界信息割裂;HCA 压缩率大 128,重叠收益小且代价高,故省略。", "evidence": "vllm_ascend/models/deepseek_v4.py:L618-L621, L668-L674;paper §2.3.1 Eq.11-12 / §2.3.2"},
+    {"decision": "只有 CSA(c4)层挂 Indexer,HCA(c128)不挂", "why": "HCA 已把序列压到 1/128,块数极少、稠密注意力已足够便宜,再做 top-k 选块收益不足;CSA 压得轻(1/4)块仍多,才需要 lightning indexer 做 top-k 稀疏。", "evidence": "vllm_ascend/models/deepseek_v4.py:L826-L834(if compress_ratio==4: self.indexer=Indexer(...))"},
+    {"decision": "分组输出投影(Grouped Output Projection)", "why": "DeepSeek-V4 配置里 c·n_h 很大,直接投回 d 维成本高;先把 n_h 头分 g 组、每组降到 d_g 维再拼接投影,显著降算力。", "evidence": "vllm_ascend/models/deepseek_v4.py:L774-L789(wo_a/wo_b, n_groups, o_lora_rank);paper §2.3.1 Grouped Output Projection"},
+    {"decision": "注意力 sink + 滑窗支线", "why": "sink(Eq.27 在分母加 Exp(z'_h))让每头可把总注意力压到近 0、吸收无信息 token;滑窗补最近 n_win 未压缩 token 的细粒度局部依赖(压缩块内 query 看不到本块 token,近端 token 又最相关)。", "evidence": "vllm_ascend/models/deepseek_v4.py:L743-L744(attn_sink), L737(window_size);paper §2.3.3"},
+    {"decision": "KVComp 用 LSH hash + Hamming top-k 近似 indexer 打分", "why": "把 §2.3.1 的 ReLU 内积打分近似成汉明距离检索:hash 码压成 uint8 后选块只需位运算,极省内存/算力;must_select_blocks=[0,-2,-1] 保证首块(sink)与最近两块(recent)永远入选。", "evidence": "vllm_ascend/worker/kvcomp_utils.py:L423-L458(compute_hash), L174(must_select_blocks)"},
+    {"decision": "KV 混合精度存储 + hashk 缓存 uint8 布局", "why": "RoPE 维用 BF16、其余维用 FP8,KV cache 近乎减半;hash 码按 head_size//8 打包成 uint8,选块检索几乎不占显存——共同支撑 1M 上下文的 10% KV 目标。", "evidence": "book/papers/ch36-primer-v4-csa-hca/paper.md:§2.3.4;vllm_ascend/worker/kvcomp_utils.py:L617-L636(hashk_cache head_size//8 uint8)"}
+  ],
+
+  "theory": [
+    "KV 与 FLOPs 的账(动机):vanilla 注意力单 token 需与全部 L 个历史 token 算内积,KV cache 随 L 线性增长、单 token 注意力 FLOPs 随 L 线性增长(全序列 O(L²))。1M 上下文下这是主导瓶颈,故须在『存多少 KV』与『算多少内积』两处同时下手。",
+    "CSA 复杂度:压缩把候选块数从 L 降到 L/m(m=4),top-k 再把每 query 实际参与核注意力的块数固定为 k(与 L 无关)→ 单 query 核注意力 FLOPs 由 O(L) 降到 O(k),KV 存储由 O(L) 降到 O(L/m)。",
+    "HCA 复杂度:重压到 L/m'(m'=128)后稠密注意力,单 query FLOPs=O(L/m')、KV 存储=O(L/m');无 indexer 开销但覆盖全局。",
+    "『27% FLOPs / 10% KV』推演(数值推演段的目标):需把 CSA 层(1/m 存 + O(k) 算)、HCA 层(1/m' 存 + O(L/m') 算)、滑窗/sink 常数项、混合层比例、以及 §2.3.4 的低精度(BF16-RoPE/FP8 其余 → KV 再减半、indexer FP4)逐项相乘/相加,与 V3.2 的 DSA 基线对比得出 Pro=27%/10%、Flash=10%/7%。注:m=4、m'=128 来自落地 compress_ratio;逐层 k、CSA:HCA 层比与精度系数需 explainer 依 config/trace 补全后由 illustrator 出账本图。",
+    "重叠 2m 的作用:CSA 每个压缩块由 2m 个 KV 条目参与(C^a 的 m 个 + 上一块 C^b 的 m 个),但相邻块的 C^a/C^b 索引交叠,故净压缩率仍是 1/m 而非 1/(2m)——重叠只增边界连续性,不增存储。"
+  ],
+
+  "mechanisms": [
+    {
+      "id": "genealogy-mla-dsa-csa-hca",
+      "name": "谱系回顾:MLA(压 KV 维)→ DSA(稀疏选块)→ CSA/HCA(压序列长 + 稀疏/重压合流)",
+      "kind": "dataflow",
+      "source_anchors": ["vllm_ascend/utils.py:L105-L110", "vllm_ascend/models/deepseek_v4.py:L790-L834"],
+      "paper_origin": {"paper": "arXiv:2606.19348", "sections": ["§1", "§2.3"]},
+      "prereq": "ch31",
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "motivation-kv-flops-account",
+      "name": "动机:1M 上下文下 KV 与 FLOPs 的账(O(L²) 注意力税)",
+      "kind": "algorithm",
+      "source_anchors": ["vllm_ascend/models/deepseek_v4.py:L711-L744"],
+      "paper_origin": {"paper": "arXiv:2606.19348", "sections": ["§1", "§2.3.4"]},
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "csa-overlap-compress",
+      "name": "CSA 压缩:每 m=4 token 重叠 softmax 加权压成单条(Eq.11-12)",
+      "kind": "algorithm",
+      "source_anchors": ["vllm_ascend/models/deepseek_v4.py:L598-L674"],
+      "paper_origin": {"paper": "arXiv:2606.19348", "sections": ["§2.3.1", "Eq.(9)-(12)"]},
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "csa-lightning-indexer-topk",
+      "name": "CSA 稀疏:lightning indexer 打分 + Top-k 选压缩块(Eq.13-17)",
+      "kind": "algorithm",
+      "source_anchors": ["vllm_ascend/models/deepseek_v4.py:L531-L592"],
+      "paper_origin": {"paper": "arXiv:2606.19348", "sections": ["§2.3.1", "Eq.(13)-(17)"]},
+      "prereq": "ch32",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "hca-heavy-compress-dense",
+      "name": "HCA:每 m'=128 token 重压成单条 + 稠密 MQA(Eq.20-26)",
+      "kind": "algorithm",
+      "source_anchors": ["vllm_ascend/models/deepseek_v4.py:L598-L666", "vllm_ascend/models/deepseek_v4.py:L815-L824"],
+      "paper_origin": {"paper": "arXiv:2606.19348", "sections": ["§2.3.2", "Eq.(20)-(26)"]},
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "hybrid-interleave-complementary",
+      "name": "CSA/HCA 层间交错为何互补(混合开关表 compress_ratios)",
+      "kind": "config",
+      "source_anchors": ["vllm_ascend/utils.py:L105-L110", "vllm_ascend/models/deepseek_v4.py:L1044-L1048"],
+      "paper_origin": {"paper": "arXiv:2606.19348", "sections": ["§2.3"]},
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "efficiency-account-27-10",
+      "name": "数值推演:把『FLOPs 27% / KV 10%』逐项算出来",
+      "kind": "algorithm",
+      "source_anchors": ["vllm_ascend/models/deepseek_v4.py:L790-L834", "vllm_ascend/models/layer/attention/layer.py:L174-L192"],
+      "paper_origin": {"paper": "arXiv:2606.19348", "sections": ["§1", "§2.3.4"]},
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "shared-mqa-grouped-output",
+      "name": "共享 KV 的 MQA + 分组输出投影(Eq.18-19, wo_a/wo_b 分组)",
+      "kind": "dataflow",
+      "source_anchors": ["vllm_ascend/models/deepseek_v4.py:L774-L789"],
+      "paper_origin": {"paper": "arXiv:2606.19348", "sections": ["§2.3.1", "Eq.(18)-(19)"]},
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "sliding-window-attn-sink",
+      "name": "滑窗支线 + 注意力 sink(Eq.27)",
+      "kind": "algorithm",
+      "source_anchors": ["vllm_ascend/models/deepseek_v4.py:L737-L744", "vllm_ascend/models/deepseek_v4.py:L855-L863"],
+      "paper_origin": {"paper": "arXiv:2606.19348", "sections": ["§2.3.3", "Eq.(27)"]},
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "partial-rope",
+      "name": "部分 RoPE(query/KV 最后 64 维 + 输出用 -i 位置回旋出相对位置)",
+      "kind": "layout",
+      "source_anchors": ["vllm_ascend/models/deepseek_v4.py:L685-L708", "vllm_ascend/models/deepseek_v4.py:L792-L810"],
+      "paper_origin": {"paper": "arXiv:2606.19348", "sections": ["§2.3.3"]},
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "kvcomp-config-landing",
+      "name": "落地配置 KVCompConfig(chunk_size/chunk_repre/top_k_ratio/must_select_blocks/rollback|skip)",
+      "kind": "config",
+      "source_anchors": ["vllm_ascend/worker/kvcomp_utils.py:L145-L365"],
+      "paper_origin": {"paper": "arXiv:2606.19348", "sections": ["§2.3.1", "§2.3.4"]},
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "kvcomp-hash-hamming-selection",
+      "name": "KVComp 落地:LSH hash + Hamming top-k 近似 indexer 选块",
+      "kind": "algorithm",
+      "source_anchors": ["vllm_ascend/worker/kvcomp_utils.py:L368-L488", "vllm_ascend/worker/kvcomp_utils.py:L492-L580"],
+      "paper_origin": {"paper": "arXiv:2606.19348", "sections": ["§2.3.1", "Eq.(16)-(17)"]},
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "kvcache-mixed-precision-layout",
+      "name": "KV 混合精度存储(BF16-RoPE/FP8 其余)+ hashk 缓存 uint8 布局 + 四类块表",
+      "kind": "layout",
+      "source_anchors": ["vllm_ascend/worker/kvcomp_utils.py:L583-L655", "vllm_ascend/models/layer/attention/layer.py:L31-L49"],
+      "paper_origin": {"paper": "arXiv:2606.19348", "sections": ["§2.3.4"]},
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "mhc-manifold-hyperconnections",
+      "name": "mHC 流形约束超连接(Sinkhorn 投影到双随机矩阵, Eq.1-8)",
+      "kind": "algorithm",
+      "source_anchors": ["vllm_ascend/models/deepseek_v4.py:L960-L1003"],
+      "paper_origin": {"paper": "arXiv:2606.19348", "sections": ["§2.2", "Eq.(1)-(8)"]},
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting"
+    }
+  ],
+
+  "subtraction_plan": {},
+
+  "must_keep": [
+    {"symbol": "get_dsv4_compress_ratio", "why": "CSA/HCA 混合交错的开关读取入口,读者须理解逐层 compress_ratios→4/128/0"},
+    {"symbol": "Compressor", "why": "CSA/HCA 共用的 KV 压缩模块,核心机制载体"},
+    {"symbol": "overlap_transform", "why": "CSA 重叠 2m 压缩(Eq.11-12)的落地,writer 须逐段讲"},
+    {"symbol": "coff", "why": "1+overlap,区分 CSA(=2 重叠)与 HCA(=1 无重叠)的关键量"},
+    {"symbol": "Indexer", "why": "lightning indexer/DSA top-k(Eq.13-17)载体,仅 CSA 层挂"},
+    {"symbol": "index_topk", "why": "top-k 的 k,稀疏度关键参数"},
+    {"symbol": "DeepseekV4Attention", "why": "一层注意力装配器,统摄 query 低秩/分组输出/sink/滑窗/compressor/indexer"},
+    {"symbol": "attn_sink", "why": "注意力 sink(Eq.27)可学习 logit"},
+    {"symbol": "wo_a", "why": "分组输出投影第一段(Grouped Output Projection)"},
+    {"symbol": "wo_b", "why": "分组输出投影第二段,投回 d 维"},
+    {"symbol": "KVCompConfig", "why": "KVComp 落地配置真相源,chunk_size/top_k_ratio/must_select_blocks"},
+    {"symbol": "chunk_repre_method", "why": "块代表方法 max/min/sum,选块前的降维"},
+    {"symbol": "must_select_blocks", "why": "[0,-2,-1] 强制保留首块+最近块,呼应 sink+recent"},
+    {"symbol": "HashEncoder", "why": "LSH hash 编码器,Hamming top-k 选块的编码基础"},
+    {"symbol": "compute_hash", "why": "取符号位打包 uint8 hash 码的落地方法"},
+    {"symbol": "KVCompMetaData", "why": "运行期选块张量集,含 sink/recent 落地"},
+    {"symbol": "compress_ratio", "why": "贯穿全章的核心量:4=CSA、128=HCA、<=1=稠密/SWA"}
+  ],
+
+  "prereq_notes": [
+    "ch31-primer-mla:MLA 把 KV 压到低秩 latent(压的是每 token 的 KV 维度),本章 CSA/HCA 压的是序列长度维(每 m 个 token 合一)——开场谱系回顾须点明两者正交、可叠加。链接 ../ch31-primer-mla/narrative/chapter.md。",
+    "ch32-primer-sparse-attention:DSA(DeepSeek Sparse Attention)的 lightning indexer + top-k 选块是 CSA 稀疏部分的直接前身;本章 Indexer 即 DSA 在压缩块上的复用。链接 ../ch32-primer-sparse-attention/narrative/chapter.md。",
+    "回指 ch21/ch22/ch30:落地代码里的 KV 缓存布局(MLAAttentionSpec/SlidingWindowMLASpec)、注意力后端选择与模型注册须回指对应实现章。"
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recycle": [],
+    "note": "bible.py due ch36 返回空(无待埋/待回收)。本章为原理篇收束章,主要回收 ch31/ch32 的 MLA→DSA 线索,以 prereq_notes 显式链接处理。"
+  }
+}

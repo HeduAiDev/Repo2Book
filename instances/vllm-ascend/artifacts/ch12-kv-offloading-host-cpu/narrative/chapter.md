@@ -507,7 +507,7 @@ class SimpleCPUOffloadNPUWorker(SimpleCPUOffloadWorker):
 
 ![极简路径数据通路：注册期重建视图，运行期 launch_copy → 队列 → 后台线程 → swap_blocks_batch → Event 轮询](../diagrams/simple-pathway.png)
 
-> *图注：上半注册期 register_kv_caches 的链条——拍平 (K,V)、按 storage 去重、重建 [num_blocks, block_bytes] 视图、分配 pinned 镜像、init 后端。下半运行期——launch_copy 投进 FIFO 队列，后台线程取出在专用流上 copy_blocks，record Event 进 events_list，主线程无阻塞轮询。黄框点明：为何不能用 storage.nbytes() 量视图。*
+> *图注：上半注册期 register_kv_caches 的链条——拍平 (K,V)、按 storage 去重、重建 [num_blocks, block_bytes] 视图、分配 pinned 镜像、init 后端。下半运行期——launch_copy 投进 FIFO 队列，后台线程取出在专用流上 copy_blocks，record Event 进 events_list，主线程无阻塞轮询。黄框只点题——完整的字节账与专图见 §12.8。*
 
 `register_kv_caches` 要绕开 NPU 的两个「现实」，逐段看：
 
@@ -660,6 +660,14 @@ def _flatten_kv_value(
 
 正确做法是从张量自己的元数据精确定位：`storage_offset()` 给前导偏移，`stride(0) * element_size()` 给每个 block 的真实字节数，`set_()` 按这个尺寸裁出 `num_blocks * page_size_bytes` 的数据区，再 `view` 成二维。单段、blocks 在最外维的布局，到这里就完了。
 
+把这段字节账用一个最小例子算实。取 `element_size = 2`（bfloat16）、一个 blocks 在最外维的 `(4, 4)` 张量，`num_blocks = 4`。开启 offload 后 runner 的 +2 MiB 超额对齐把它的底层 storage 撑成三段：前导偏移 6 字节、真正的数据区 32 字节、尾部 padding 10 字节，合计 `storage.nbytes()` 撑到 48。
+
+若图省事拿 `nbytes() ÷ page_size_bytes`，`48 ÷ 8` 会数出 6 个 block——多出的 2 个正是前导 6 字节加尾部 10 字节（合 16 字节，恰好 2 个 page）的对齐残渣，是不存在的 phantom block。正确做法只认 `shape·stride`：`page_size_bytes = stride(0) × element_size = 4 × 2 = 8`，数据区 `= num_blocks × page_size_bytes = 4 × 8 = 32` 字节；从 `storage_offset()`（6 字节）起 `set_` 只裁这 32 字节、`view` 成 `[4, 8]` int8，正好框住 4 个真实 block，把首尾那 16 字节对齐残渣干净跳过。
+
+![单段 block 视图的字节布局：storage.nbytes() 覆盖全条会数出 phantom block，只有从 storage_offset 起按 stride 裁的 32B 数据区才是真正的 4 个 block](../diagrams/byte-layout-single-segment.png)
+
+> *图注：runner 超额对齐把 storage 撑成「前导偏移 6B ｜ 数据区 32B ｜ 尾部 padding 10B」三段。storage.nbytes()（48B）覆盖全条，÷8 会数出 6 块（含 2 个 phantom）；只有从 storage_offset 按 stride 精确裁出的 32B 数据区才是真正的 4 个 block——这就是尺寸必须取自 shape/stride 而非 nbytes() 的字节级根由。*
+
 但还有第二种布局——某些层把 K、V **堆在一个分配里**，形如 `(N, num_blocks, …)`：
 
 ```python
@@ -686,7 +694,31 @@ def _flatten_kv_value(
         return segs
 ```
 
-多段布局里 blocks 维在第 1 维（`shape[1]`），每段用 `stride(1)` 量 page、`stride(0)` 量段间跨度，按段切成 `n_segments` 个独立视图，各自 keyed。两条分支合起来，把「单段 blocks-最外」和「多段 K|V 堆叠」都规约成同一种 `[num_blocks, block_bytes]` 视图。这就是「为什么卸载要重建 block view」的完整答案：**物理布局多样，但搬运算子只认一种统一二维视图**——重建就是这道规约。定位不到 blocks 维就 `raise`，宁可炸也不静默搬错。
+多段布局里 blocks 维在第 1 维（`shape[1]`），每段用 `stride(1)` 量 page、`stride(0)` 量段间跨度，按段切成 `n_segments` 个独立视图，各自 keyed。两条分支合起来，把「单段 blocks-最外」和「多段 K｜V 堆叠」都规约成同一种 `[num_blocks, block_bytes]` 视图。这就是「为什么卸载要重建 block view」的完整答案：**物理布局多样，但搬运算子只认一种统一二维视图**——重建就是这道规约。定位不到 blocks 维就 `raise`，宁可炸也不静默搬错。
+
+把单段和多段两种布局的字节账并排算一遍，重建的精确性就一目了然：
+
+<!-- trace: build-block-views -->
+
+| 物理布局 | 张量 shape | connector num_blocks | storage.nbytes() 视角（错位） | 每页字节 | shape·stride 精确数据区 | 重建视图 | 被跳过的对齐字节 |
+|---|---|---|---|---|---|---|---|
+| 单段 blocks-outermost | (4,4) | 4 | 48 → 6 块（2 phantom） | 8 | 4×8=32 | [4,8] int8 | 48−32=16 |
+| 多段 (N,num_blocks,…) K｜V 堆叠 | (2,6,4) | 4 | 96（每段多 2 未用块） | 8 | 48+4×8=80 | 2 段各 [4,8] int8 | 96−2×32=32 |
+
+单段那行就是上面 `(4,4)` 例子的账：`nbytes()` 会虚增 16 字节、把 4 块数成 6 块。多段那行把 K、V 堆在一个 `(2,6,4)` 分配里，物理上每段 6 块、connector 只认前 4 块；`set_` 用 `total_bytes = (2−1)×48 + 4×8 = 80` 拉出跨两段的原始区间，再按 `seg_stride = 48` 字节切成 `seg0[0:32]`、`seg1[48:80]` 两个 `[4, 8]` 视图，精确跳过每段尾部各 2 个未用物理块（合 `96 − 2×32 = 32` 字节）。两种布局各异，出口却是同一种视图——这也是批量搬运算子能对所有子张量等步长搬运的前提。
+
+**为什么这样裁出的视图一定合法——不越界、不重叠。** 和上一节队头轮询一样，这也是个短论证，两种布局各给一条骨架：
+
+- 单段：`data_bytes` 的定义**就是** `num_blocks × page_size_bytes`，所以 `view(num_blocks, page_size_bytes)` 要的总字节数与 `data_bytes` 恒等（定义式，不是碰巧对齐），reshape 必然整除、必然合法；而 `set_` 从 `storage_offset`（已跳过前导偏移）起只裁 `data_bytes` 字节，本例 `32 < storage.nbytes() − offset = 48 − 6 = 42`，所以视图绝不会伸进尾部 padding。
+- 多段：段起点 `start = idx × seg_stride_bytes` 随 `idx` **严格单调递增**（`seg_stride ≥ seg_data`），故各段 `[start, start + seg_data_bytes)` 两两不重叠；循环 `range(n_segments)` 里 `n_segments = tensor.shape[0]` 是有限常量，单调递增的有限个段起点 ⟹ 覆盖有限、必然终止，每段 `view(num_blocks, seg_page_size_bytes)` 同样按定义式整除。
+
+所以视图合法不是「算出来碰巧对」，而是「定义式整除 + 单调有限段」这套骨架逼出来的必然。
+
+这套重建还有一个量级上的性质：它是**零字节拷贝的纯元数据运算**——单段是 1 次 `set_` 加 1 次 `view`，多段是 1 次 `set_` 加 `n_segments` 次切片（本例 2 次），复杂度 `O(n_segments)`，与 block 数、张量实际字节数都无关，不真搬任何数据。正因为不搬数据，尺寸算错就不会当场报错、而是把错误藏进元数据：一旦误用 `storage.nbytes()` 把 4 块数成 6 块，后续 `swap_blocks_batch` 的 `base + block_id × bpb` 指针算术会整体偏移，把 KV 搬到错误的物理地址。这就是为什么这里宁可在定位不到 blocks 维时 `raise`，也绝不让一个算错的尺寸静默溜下去。
+
+![两种物理布局归一：单段 (4,4) 与多段 (2,6,4) K｜V 堆叠都被规约成同一个 [num_blocks, block_bytes] int8 视图](../diagrams/layout-reduction-single-vs-multi.png)
+
+> *图注：单段 (4,4) 与多段 (2,6,4) K｜V 堆叠布局不同，但重建都把它们规约成 [num_blocks=4, block_bytes=8] 的 int8 视图（多段拆成 seg0/seg1 两个，seg1 从第 48 字节起、total_bytes=80B）；批量搬运算子只认这一种统一二维视图——重建就是这道归一。*
 
 ## 12.9 DMA 拷贝调度：一个队列、一条线程、一串 Event
 

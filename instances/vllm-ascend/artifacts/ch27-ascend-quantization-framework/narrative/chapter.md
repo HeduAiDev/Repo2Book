@@ -8,7 +8,7 @@
 
 第 23 章立过一条总规矩：**模型代码一行不改，靠注册表在算子实例化的瞬间把 CUDA 算子换成昇腾子类**——换头不换身。第 26 章把这条规矩压在了全书最大的单体算子 `FusedMoE` 上，还顺手提过一句：量化版的 MoE 走的是另一个入口 `AscendFusedMoEMethod`。那个入口，就在这一章。
 
-量化（quantization，把高精度权重/激活压成低位宽整数或窄浮点）是 vLLM-Ascend 里**单块最大的代码**——`vllm_ascend/quantization/` 近 6000 行，从 `modelslim_config.py` 的注册入口到 `methods/registry.py` 的 scheme 表（scheme = 昇腾的量化方案实现类，一个 scheme 对应一种 (quant_type, layer_type) 组合、定义该组合的权重形状与前向），十七八个 scheme 文件，覆盖 W8A8 / W4A8 / MXFP 一整谱量化方案。可它的**接入方式**却出奇地干净：不靠散落各处的 `if quant == "xxx"`，而是**一张注册表 + 三个适配器**，把整套昇腾量化方案当成一个插件，整体插进 vLLM——**vLLM 量化框架一行不改**。
+量化（quantization，把高精度权重/激活压成低位宽整数或窄浮点）是 vLLM-Ascend 里**单块最大的代码**——`vllm_ascend/quantization/` 近 6000 行，从 `modelslim_config.py` 的注册入口到 `methods/registry.py` 的 scheme 表（scheme = 昇腾的量化方案实现类，一个 scheme 对应一种 (quant_type, layer_type) 组合、定义该组合的权重形状与前向），十七八个 scheme 文件，覆盖 W8A8 / W4A8 / MXFP 一整谱量化方案（scale/zero-point 怎么定、每种 scheme 在权衡什么，见[第 35 章：量化数学](../ch35-primer-quantization/narrative/chapter.md)；本章只讲这些方案怎么接进 vLLM）。可它的**接入方式**却出奇地干净：不靠散落各处的 `if quant == "xxx"`，而是**一张注册表 + 三个适配器**，把整套昇腾量化方案当成一个插件，整体插进 vLLM——**vLLM 量化框架一行不改**。
 
 这一章就读这套接入机制。它是全书「OOT（out-of-tree，树外）注册表 + 适配器」范式最干净的一次实证。我们要回答四个问题：
 
@@ -626,7 +626,7 @@ W8A8 用的是 per-channel——每个输出通道一个 scale。但这只是量
 
 ![量化粒度谱](../diagrams/fig27-3-granularity.png)
 
-> *图 27-3：同一权重矩阵 [out, in] 上三种 scale 覆盖。per-tensor 全矩阵一个 scale（最省最糙）；per-channel 每行一个（W8A8 用）；per-group 每行的每组输入通道各一个（W4A8 / MXFP 用，对齐 `[out, in//group_size]`）。MXFP 是 per-group 的极端——每组配一个 e8m0 共享指数。*
+> *图 27-3：同一权重矩阵 [out, in] 上三种 scale 覆盖。per-tensor 全矩阵一个 scale（最省最糙）；per-channel 每行一个（W8A8 用，`weight_scale [out,1]`）；per-group 每行的每组输入通道各一个（W4A8 / MXFP 用，`weight_scale_second [out, in//group_size]`，图中 out=6 行 × in//g=2 组 = 12 格）——它在 per-channel 之上再沿输入维细分，而非取代 per-channel。MXFP 是 per-group 的极端——每组配一个 e8m0 共享指数。*
 
 - **per-tensor**：整张矩阵共享一个标量 scale。最省，但太糙，权重上几乎不用。
 - **per-channel**：每个输出通道（每行）一个 scale。W8A8_DYNAMIC 的 `weight_scale` 形状 `[out, 1]` 就是这档。

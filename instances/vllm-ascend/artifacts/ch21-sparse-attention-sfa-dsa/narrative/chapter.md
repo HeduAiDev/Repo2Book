@@ -20,7 +20,7 @@
 
 稀疏注意力攻的正是这后半句。它的赌注很直接：**对某个 query 来说，绝大多数历史 KV 其实没什么贡献**。softmax 之后，注意力权重高度集中在少数几个位置上，剩下的几乎是噪声。既然如此，何必对全部 L 个都算全精度注意力？先想办法**便宜地**挑出最相关的少数几个，只算这几个就行。
 
-难点在「便宜地挑」。要判断哪些 KV 相关，本身就得算一遍打分——如果这个打分跟全精度注意力一样贵，那就白搭了。稀疏注意力的解法是**两段式**：用一个维度极低的「索引器」算一个粗糙的相关性代理分数，挑出 top-k；再只对这 top-k 个 KV 算真正的全精度注意力。本章两份后端 `vllm_ascend/attention/sfa_v1.py` 与 `vllm_ascend/attention/dsa_v1.py`，就是这套两段式的两种实现。
+难点在「便宜地挑」。要判断哪些 KV 相关，本身就得算一遍打分——如果这个打分跟全精度注意力一样贵，那就白搭了。稀疏注意力的解法是**两段式**：用一个维度极低的「索引器」算一个粗糙的相关性代理分数，挑出 top-k；再只对这 top-k 个 KV 算真正的全精度注意力。本章两份后端 `vllm_ascend/attention/sfa_v1.py` 与 `vllm_ascend/attention/dsa_v1.py`，就是这套两段式的两种实现。这套「索引器 + top-k」谱系从 NSA 一路演化到 DSA 的 Lightning Indexer，其数学动机与取舍见[第 32 章：稀疏注意力谱系](../ch32-primer-sparse-attention/narrative/chapter.md)（再往前一步的 V4 演进见[第 36 章](../ch36-primer-v4-csa-hca/narrative/chapter.md)）；本章只钉死昇腾怎么把它实现成算子。
 
 ![两段式稀疏注意力总览](../diagrams/two_stage.png)
 

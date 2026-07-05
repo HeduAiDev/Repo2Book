@@ -1,0 +1,300 @@
+{
+  "kind": "primer",
+  "chapter": "ch34",
+  "title": "【原理篇 P8·论文精读】EPLB：专家负载均衡的算法本体",
+  "sources": {
+    "primary_paper": {
+      "id": "arXiv:2412.19437",
+      "title": "DeepSeek-V3 Technical Report §2.1.2 Auxiliary-Loss-Free Load Balancing + §3.4 Inference and Deployment (redundant experts)",
+      "pack": "book/papers/ch34-primer-eplb/paper.md"
+    },
+    "appendix_reference": {
+      "id": "deepseek-ai/EPLB",
+      "title": "Expert Parallelism Load Balancer README (eplb.rebalance_experts：分层/全局两种打包策略)——附于论文包末，非 arXiv 正文",
+      "pack": "book/papers/ch34-primer-eplb/paper.md:L63-L131"
+    },
+    "landing_code": "vllm_ascend/eplb/core/policy/policy_default_eplb.py",
+    "context_code": "vllm_ascend/eplb/core/eplb_worker.py (规划主流程 do_update / 不均衡度量 _compute_imbalance)",
+    "note": "本章为 primer 原理章：真相源=论文包（DeepSeek-V3 §2.1.2/§3.4 + deepseek-ai/EPLB README）+ 落地代码双源。落地代码是昇腾自带的 DefaultEplb 规划器（policy_type=1，PolicyFactory 默认），它实现的是论文/README 里『全局负载均衡』风格的贪心：冗余复制热门专家 + 贪心装箱到卡 + 就地映射约束。诚实说明：vllm_ascend 的 DefaultEplb 并未实现 README 里 group-limited 的『分层』打包（不按 expert group 绑节点），而是全局贪心——本章把两种论文策略讲清，再把落地代码定位为『全局』一支。回指第 9 章：那章讲了 eplb 的迁移机器（updator 节拍/子进程队列/D2D 搬运/PolicyFactory 分发），把 DefaultEplb.rebalance_experts 当黑盒；本章打开这个黑盒，讲规划器算法本体。理论机制的 source_anchors 一律指向昇腾栈中真实落地代码，paper_origin 记录论文/README 出处。"
+  },
+  "code_spine": [
+    "vllm_ascend/eplb/core/eplb_worker.py:L204-L212 — calculate_rebalance_experts：worker 把 (old_placement, load_info) 交给 policy.rebalance_experts（第 9 章讲的黑盒入口，本章从这里往里走）",
+    "vllm_ascend/eplb/core/policy/policy_default_eplb.py:L283-L296 — rebalance_experts 入口：从 placement_table 反推冗余专家数，add_redundant 把物理热度折回逻辑专家，calculate_max_heat_per_layer 记录均衡前的每层最热卡负载",
+    "vllm_ascend/eplb/core/policy/policy_default_eplb.py:L322-L335 — 逐层调用 original_compute_balanced_pack_redundancy，得到该层 (num_npus) 张卡的专家放置",
+    "vllm_ascend/eplb/core/policy/policy_default_eplb.py:L43-L57 — 冗余复制：反复挑当前最热逻辑专家、给它加一个副本、把它的『每副本平均热度』摊薄，直到用完 num_redundancy_expert 个冗余名额",
+    "vllm_ascend/eplb/core/policy/policy_default_eplb.py:L59-L121 — 贪心装箱：把『原始专家 + 冗余副本』按热度降序，逐个塞进当前总热度最小、且未装该专家、且未超容量的卡",
+    "vllm_ascend/eplb/core/policy/policy_default_eplb.py:L337 — constraint_expert_local_exchange：把新放置就地映射回旧位置，最小化卡内搬动",
+    "vllm_ascend/eplb/core/policy/policy_default_eplb.py:L339-L350 — 计算每层优先级（前后最热比）+ 变更闸门（均衡后总最热 < 0.95×均衡前才置 change=1）",
+    "vllm_ascend/eplb/core/eplb_worker.py:L290-L322 — _calculate_hotness / _compute_imbalance：把放置方案量化成不均衡度 par = 最热卡负载 / 平均卡负载，供 metrics 观测均衡前后差异"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "book/papers/ch34-primer-eplb/paper.md",
+      "lines": "L24-L29",
+      "code": "$$g_{i,t}^{\\prime} = \\begin{cases} s_{i,t}, & s_{i,t} + b_{i} \\in \\mathrm{Topk}(\\{s_{j,t} + b_{j} \\mid 1 \\leqslant j \\leqslant N_{r}\\}, K_{r}), \\\\ 0, & \\text{otherwise}. \\end{cases} \\quad (16)$$\n\n（训练期）监控整批每个专家的负载：某专家过载则把它的偏置 b_i 减 γ，欠载则加 γ（γ=bias update speed）。偏置只用于路由 top-K 选择，门控值 g 仍用原始亲和度 s——由此在不引入辅助损失、不损伤模型性能的前提下把训练期专家负载压平。",
+      "elide": ["Eq.12-15（DeepSeekMoE 基础前向/门控/sigmoid 亲和度）已在别处；Eq.17-20 的互补序列级辅助损失是补充项，本章只取 Eq.16 偏置项作为『均衡目标』的训练期背景，不做推导。"]
+    },
+    {
+      "path": "book/papers/ch34-primer-eplb/paper.md",
+      "lines": "L53",
+      "code": "To achieve load balancing among different experts in the MoE part, we need to ensure that each GPU processes approximately the same number of tokens. To this end, we introduce a deployment strategy of redundant experts, which duplicates high-load experts and deploys them redundantly. The high-load experts are detected based on statistics collected during the online deployment and are adjusted periodically (e.g., every 10 minutes). After determining the set of redundant experts, we carefully rearrange experts among GPUs within a node based on the observed loads, striving to balance the load across GPUs as much as possible without increasing the cross-node all-to-all communication overhead.",
+      "elide": ["同段后文 prefilling 具体 EP32/32 冗余专家的部署数字属 DeepSeek 自身集群参数，本章只取『冗余专家复制热门 + 就地重排不增跨节点流量』这一策略骨架。"]
+    },
+    {
+      "path": "book/papers/ch34-primer-eplb/paper.md",
+      "lines": "L83-L95",
+      "code": "### Hierarchical Load Balancing\nWhen the number of server nodes divides the number of expert groups, we use the hierarchical load balancing policy to harness the group-limited expert routing. We first pack the expert groups to nodes evenly ... Then, we replicate the experts within each node. Finally, we pack the replicated experts to individual GPUs ... can be used in prefilling stage with a smaller expert-parallel size.\n\n### Global Load Balancing\nIn other cases, we use the global load balancing policy that replicates the experts globally regardless of expert groups, and pack the replicated experts to individual GPUs. This policy can be adopted in decoding stage with a larger expert-parallel size.",
+      "elide": ["deepseek-ai/EPLB README 附录（非 arXiv 正文）。落地的 vllm_ascend DefaultEplb 走的是『全局』一支——全局复制 + 全局贪心装箱，不做 group→node 的分层绑定。"]
+    },
+    {
+      "path": "vllm_ascend/eplb/core/policy/policy_default_eplb.py",
+      "lines": "L43-L57",
+      "code": "    @staticmethod\n    # Split hot (high-load) experts into redundant experts\n    def original_compute_balanced_pack_redundancy(origin_weights, card_num, num_redundancy_expert):\n        # Step 1: Sort the items by weight in descending order (we are sorting by weight now)\n        # Sort based on the second element (the second value of each tuple)\n        route_expert_num = len(origin_weights)\n        route_expert_redundancy: list[list[int]] = [[] for _ in range(route_expert_num)]\n        for i in range(num_redundancy_expert):\n            sorted_indices = np.argsort([t[1] for t in origin_weights], kind=\"stable\")[::-1]\n            weights = [origin_weights[idx] for idx in sorted_indices]\n            tmp_raw_weight = weights[0][1] * (len(route_expert_redundancy[weights[0][0]]) + 1)\n            route_expert_redundancy[weights[0][0]].append(route_expert_num + i)\n            avg_weight = tmp_raw_weight / (len(route_expert_redundancy[weights[0][0]]) + 1)\n            weights[0] = (weights[0][0], avg_weight)\n            origin_weights = weights",
+      "elide": []
+    },
+    {
+      "path": "vllm_ascend/eplb/core/policy/policy_default_eplb.py",
+      "lines": "L59-L121",
+      "code": "        # Step 2: Calculate the number of items per box\n        expert_num = route_expert_num + num_redundancy_expert\n        items_per_box = expert_num // card_num  # Number of items per box\n        remaining_items = expert_num % card_num  # Number of items per box\n\n        # Step 3: Initialize card_num boxes with empty lists to store item IDs\n        boxes: list[list[int]] = [[] for _ in range(card_num)]\n        boxes_weights: list[list[float]] = [[] for _ in range(card_num)]\n        box_weights = [0] * card_num  # To store the total weight of each box\n        box_counts = [0] * card_num  # To store the number of items in each box\n        index = 0\n        for i in range(route_expert_num):\n            redundancy_num = len(route_expert_redundancy[i])\n            for _ in range(redundancy_num):\n                cur_weight = 0\n                for item, weight in origin_weights:\n                    if item == i:\n                        cur_weight = weight\n\n                boxes[index].append(i)\n                boxes_weights[index].append(cur_weight)\n                box_weights[index] += cur_weight\n                box_counts[index] += 1\n                index += 1\n\n        sorted_indices = np.argsort([t[1] for t in origin_weights], kind=\"stable\")[::-1]\n        origin_weights = [origin_weights[idx] for idx in sorted_indices]\n        # Step 4: Distribute items into boxes based on weight\n        for item_id, weight in origin_weights:\n            # Find the box with the least items but not full\n            min_box_index = -1\n            for i in range(card_num):\n                if item_id in boxes[i]:\n                    continue\n                # Only choose boxes that still have space (box_counts[i] < items_per_box)\n                if box_counts[i] < items_per_box or (box_counts[i] == items_per_box and remaining_items > 0):\n                    if min_box_index == -1 or box_weights[i] < box_weights[min_box_index]:\n                        min_box_index = i\n\n            # Place the item (id) into the selected box\n            boxes[min_box_index].append(item_id)\n            boxes_weights[min_box_index].append(weight)\n            box_weights[min_box_index] += weight\n            box_counts[min_box_index] += 1\n\n            # If there's an imbalance in the remaining items, reduce the \"remaining_items\" counter\n            if box_counts[min_box_index] == (items_per_box + 1) and remaining_items > 0:\n                remaining_items -= 1",
+      "elide": ["Step 5（L108-L121）把每张卡的 items/total_weight 打包成 result 字典返回，仅供上层记录『均衡后最热卡负载』，逻辑无关，正文可略。"]
+    },
+    {
+      "path": "vllm_ascend/eplb/core/policy/policy_default_eplb.py",
+      "lines": "L29-L41",
+      "code": "    @staticmethod\n    def add_redundant(current_expert_table, expert_workload, num_original_expert):\n        layer_num, npu_num, experts_per_npu = expert_workload.shape\n        workload_new = np.zeros((layer_num, num_original_expert))\n        for layer_idx in range(layer_num):\n            workload_dict: dict[int, int] = defaultdict(int)\n            placement_layer = current_expert_table[layer_idx].copy()\n            workload_layer = expert_workload[layer_idx].copy()\n            for npu_idx in range(npu_num):\n                for expert_idx in range(experts_per_npu):\n                    workload_dict[placement_layer[npu_idx][expert_idx]] += workload_layer[npu_idx][expert_idx]\n            for expert_idx in range(num_original_expert):\n                workload_new[layer_idx][expert_idx] = workload_dict[expert_idx]\n        return workload_new",
+      "elide": []
+    },
+    {
+      "path": "vllm_ascend/eplb/core/policy/policy_default_eplb.py",
+      "lines": "L250-L281",
+      "code": "    @staticmethod\n    def constraint_expert_local_exchange(current_expert_table, global_deployment):\n        for layer_id in range(len(global_deployment)):\n            for card_id in range(len(global_deployment[layer_id])):\n                current_list = [int(x) for x in current_expert_table[layer_id][card_id]]\n                new_list = [int(x) for x in global_deployment[layer_id][card_id]]\n                num = len(new_list)\n\n                new_index = [-1] * num\n                new_result = [-1] * num\n                remaining_elements = []\n\n                for i in range(num):\n                    flag = True\n                    for j in range(num):\n                        if new_list[i] == current_list[j] and new_index[j] == -1:\n                            new_index[j] = 0\n                            new_result[j] = current_list[j]\n                            flag = False\n                            break\n                    if flag:\n                        remaining_elements.append(new_list[i])\n\n                index = 0\n                for k in range(num):\n                    if new_result[k] == -1:\n                        new_result[k] = remaining_elements[index]\n                        index += 1\n\n                global_deployment[layer_id][card_id] = new_result\n\n        return global_deployment",
+      "elide": []
+    },
+    {
+      "path": "vllm_ascend/eplb/core/policy/policy_default_eplb.py",
+      "lines": "L283-L350",
+      "code": "    def rebalance_experts(self, current_expert_table, expert_workload):\n        info = DynamicTable()\n        info.workload_table = np.array(expert_workload)\n        info.placement_table = np.array(current_expert_table)\n        assert info.workload_table is not None\n        layer_num, num_npus, experts_per_npu = info.workload_table.shape\n        assert info.placement_table is not None\n        row = cast(np.ndarray, info.placement_table[0])\n        expert_ids, counts = np.unique(row, return_counts=True)\n        num_redundancy_expert = self.get_redundant_num(num_npus, counts)\n        num_original_expert = len(expert_ids)\n        layer_workloads = self.add_redundant(info.placement_table, info.workload_table, num_original_expert)\n        max_heat_per_layer_before = self.calculate_max_heat_per_layer(info.workload_table, layer_num)\n        npu_heat_all_origin = sum(max_heat_per_layer_before)\n\n        # ... 入参校验：num_original_expert==expert_num、num_npus>0、num_npus>=num_redundancy_expert（省略）\n        global_deployment: list[list[list[int]]] = [[[] for _ in range(num_npus)] for _ in range(layer_num)]\n        max_heat_per_layer_after = np.zeros([layer_num])\n        for layer in range(layer_num):\n            weights = np.zeros((expert_num,), dtype=\"object\")\n            for expert_id, workload_weight in enumerate(layer_workloads[layer]):\n                weights[expert_id] = (expert_id, workload_weight)\n\n            result, layer_deployment = self.original_compute_balanced_pack_redundancy(\n                weights, num_npus, num_redundancy_expert\n            )\n\n            global_deployment[layer] = layer_deployment\n            max_heat_per_layer_after[layer] = max(result, key=lambda x: x[\"total_weight\"])[\"total_weight\"]\n\n        new_global_deployment = self.constraint_expert_local_exchange(current_expert_table, global_deployment)\n        # Obtain the priority of each layer\n        layer_changed_ratio = []\n        for layer_idx in range(layer_num):\n            layer_changed_ratio.append(max_heat_per_layer_after[layer_idx] / max_heat_per_layer_before[layer_idx])\n\n        per_layer_priority = np.argsort(layer_changed_ratio)\n        npu_heat_all_after = sum(max_heat_per_layer_after)\n\n        change = 0\n        if npu_heat_all_after < 0.95 * npu_heat_all_origin:\n            change = 1\n\n        return change, per_layer_priority, np.array(new_global_deployment).tolist()",
+      "elide": ["L300-L317 的三条入参校验（专家数一致 / NPU>0 / NPU≥冗余数）为防御式检查，正文用一句话概括即可，此处以注释代替原样贴出。"]
+    },
+    {
+      "path": "vllm_ascend/eplb/core/eplb_worker.py",
+      "lines": "L290-L309",
+      "code": "    @staticmethod\n    def _compute_imbalance(deployment_all_layer, hotness_all_layer: np.ndarray, return_list: bool = False):\n        imbalance_list = []\n        deployment_all_layer = np.array(deployment_all_layer)\n        for deployment, hotness in zip(deployment_all_layer, hotness_all_layer):\n            counts = np.bincount(deployment.reshape(-1), minlength=hotness.shape[0])\n\n            unit_hotness = np.divide(hotness, counts, out=np.zeros_like(hotness, dtype=float), where=counts != 0)\n\n            stage_load = unit_hotness[deployment].sum(-1)\n            stage_par = stage_load.max() / stage_load.mean()\n            imbalance_list.append(stage_par)\n\n        max_val = max(imbalance_list)\n        mean_val = sum(imbalance_list) / len(imbalance_list)\n        # ms-service-metric begin: optionally expose per-layer imbalance without recomputing it.\n        if return_list:\n            return mean_val, max_val, imbalance_list\n        # ms-service-metric end.\n        return mean_val, max_val",
+      "elide": ["_calculate_hotness（L311-L322）把逐 rank 负载按放置聚回逻辑专家的热度向量，是 _compute_imbalance 的输入准备，正文可一句带过。"]
+    }
+  ],
+  "key_classes": [
+    {
+      "name": "EplbPolicy",
+      "file": "vllm_ascend/eplb/core/policy/policy_abstract.py",
+      "responsibility": "规划器抽象基类：唯一抽象方法 rebalance_experts(current_expert_table, expert_workload) → (change, per_layer_priority, new_expert_table)。契约在 docstring 里写死了输入/输出的三维表结构（[layerId, rankId, expert_num_i]）。"
+    },
+    {
+      "name": "DefaultEplb",
+      "file": "vllm_ascend/eplb/core/policy/policy_default_eplb.py",
+      "responsibility": "本章主角：PolicyFactory 里 policy_type=1 的默认规划器。实现 DeepSeek『全局负载均衡』风格贪心——add_redundant 折热度、original_compute_balanced_pack_redundancy（冗余复制 + 贪心装箱）、constraint_expert_local_exchange 就地映射、rebalance_experts 编排 + 0.95 变更闸门。"
+    },
+    {
+      "name": "DynamicTable",
+      "file": "vllm_ascend/eplb/core/policy/policy_default_eplb.py",
+      "responsibility": "承载两张三维表的容器：workload_table [layer, gpu, expert_per_gpu]=热度，placement_table 同形状=物理专家 ID；缺失位置填 -1。rebalance_experts 从它反推冗余数与逻辑专家集。"
+    },
+    {
+      "name": "PolicyFactory",
+      "file": "vllm_ascend/eplb/core/policy/policy_factory.py",
+      "responsibility": "int→策略类分发（0 random / 1 DefaultEplb / 2 swift / 3 flashlb），第 9 章已讲；本章只需它确认 DefaultEplb 是默认落地策略。"
+    },
+    {
+      "name": "EplbWorker",
+      "file": "vllm_ascend/eplb/core/eplb_worker.py",
+      "responsibility": "子进程规划宿主（第 9 章主角）：calculate_rebalance_experts 是调进 policy.rebalance_experts 的黑盒入口；_calculate_hotness/_compute_imbalance 把放置方案量化成不均衡度 par 供观测。本章借它做『均衡目标的量化度量』。"
+    }
+  ],
+  "data_flow": [
+    "1. EplbWorker.calculate_rebalance_experts(load_info, old_placement)（eplb_worker.py:L204-L212）把负载表与当前放置交给 policy.rebalance_experts——这是第 9 章黑盒、本章入口。",
+    "2. rebalance_experts 从 placement_table[0] 用 np.unique 统计每个逻辑专家的物理副本数 counts，get_redundant_num=Σ(counts-1) 反推出总冗余名额 num_redundancy_expert（policy_default_eplb.py:L288-L292）。",
+    "3. add_redundant 把 [layer,gpu,expert_per_gpu] 的物理热度按放置聚回 [layer, num_original_expert] 的逐逻辑专家热度 layer_workloads（L294, L29-L41）。",
+    "4. calculate_max_heat_per_layer 记录均衡前每层最热卡负载，求和得 npu_heat_all_origin（L295-L296）。",
+    "5. 逐层 original_compute_balanced_pack_redundancy(weights, num_npus, num_redundancy_expert)（L322-L332）：Step1 反复挑最热逻辑专家加一个副本、把其热度按副本数摊薄（L50-L57）；Step2-4 把原始专家+副本按热度降序贪心塞进当前总热度最小且合规的卡（L70-L106）。",
+    "6. 记录均衡后每层最热卡负载 max_heat_per_layer_after（L335）。",
+    "7. constraint_expert_local_exchange 把每卡新专家集合就地映射回旧位置：能对上的原地不动，剩下的填空位，最小化卡内搬动（L337, L250-L281）。",
+    "8. 逐层算 layer_changed_ratio = 均衡后最热/均衡前最热，argsort 得 per_layer_priority（迁移优先级，越省越先迁）（L339-L343）。",
+    "9. 变更闸门：仅当 npu_heat_all_after < 0.95 × npu_heat_all_origin（总最热降幅 >5%）才置 change=1，否则不值得迁（L346-L349）。",
+    "10.（观测侧，rank 0）_calculate_hotness + _compute_imbalance 把旧/新放置各量化成不均衡度 par=最热卡负载/平均卡负载，日志暴露 current/update 的 mean/max（eplb_worker.py:L66-L93, L290-L322）。"
+  ],
+  "design_decisions": [
+    {
+      "decision": "用『冗余复制热门专家』而非纯搬迁来均衡：给最热专家造多个物理副本，token 分摊到多张卡。",
+      "why": "MoE 路由是数据决定的，单个热门专家的负载可能超过一张卡的公平份额；只搬不复制无法把单专家热度降到平均线以下。复制后每副本承担原热度/副本数，才可能装进平衡的箱子。这正是 DeepSeek-V3 §3.4 的 redundant experts 策略。",
+      "evidence": "vllm_ascend/eplb/core/policy/policy_default_eplb.py:L43-L57"
+    },
+    {
+      "decision": "复制时按『每副本平均热度』贪心：每加一个副本，就把该专家热度重估为 raw×(k+1)/(k+2) 再参与下一轮最热选择。",
+      "why": "保证冗余名额优先给『即便已复制过、平均热度仍最高』的专家，等价于对最大单副本负载做贪心下降；避免把名额浪费在复制一次就不再是瓶颈的专家上。",
+      "evidence": "vllm_ascend/eplb/core/policy/policy_default_eplb.py:L53-L57"
+    },
+    {
+      "decision": "装箱用『最小总热度且未装该专家且未超容量』的贪心，容量按 expert_num//card_num 均分、余数用 remaining_items 分摊。",
+      "why": "经典 LPT（最长处理时间优先）近似装箱：降序放最重项、每次塞进当前最空的箱，能把最大箱负载压到接近下界。『未装该专家』约束保证同一逻辑专家的多副本不落在同一张卡（否则复制白做）。",
+      "evidence": "vllm_ascend/eplb/core/policy/policy_default_eplb.py:L86-L106"
+    },
+    {
+      "decision": "constraint_expert_local_exchange 就地映射：新放置尽量落回旧位置，只有对不上的才占空槽。",
+      "why": "对应论文『rearrange without increasing cross-node traffic / expert movement inside NPU』。卡内槽位保持不变意味着已在本卡的专家权重无需搬动，只有跨卡新增的副本才触发 D2D 拷贝——直接减少第 9 章热迁移的搬运量。eplb_worker.check_expert_placement 还会硬性拒绝『同卡内专家移动』的非法方案。",
+      "evidence": "vllm_ascend/eplb/core/policy/policy_default_eplb.py:L250-L281"
+    },
+    {
+      "decision": "变更闸门 0.95：只有均衡后每层最热卡负载之和降到均衡前的 95% 以下才 change=1。",
+      "why": "热迁移本身有代价（D2D 拷贝 + 一致性风险）。小幅改善不值得迁，用 5% 的死区抑制抖动，避免负载轻微波动就来回搬专家。",
+      "evidence": "vllm_ascend/eplb/core/policy/policy_default_eplb.py:L346-L349"
+    },
+    {
+      "decision": "per_layer_priority 按『改善比 argsort』排序：均衡后/前比值越小（改善越大）的层排越前。",
+      "why": "一整轮迁移被第 9 章的 D2D 搬运器逐层摊到多个 step，需要一个层的先后次序；优先迁改善最大的层，让每一步搬运的边际收益最大。",
+      "evidence": "vllm_ascend/eplb/core/policy/policy_default_eplb.py:L339-L343"
+    },
+    {
+      "decision": "不均衡度量选 par=最热卡负载/平均卡负载（max/mean），而非方差。",
+      "why": "推理批的墙钟延迟由最慢（最热）那张卡决定，最热/平均直接刻画『被最热卡拖慢的倍数』，比方差更贴目标。规划器内部也是最小化 max_heat（最热卡负载），与该度量同向。",
+      "evidence": "vllm_ascend/eplb/core/eplb_worker.py:L299-L300"
+    }
+  ],
+  "theory": [
+    "均衡目标（推导）：设 N_r 个逻辑专家、num_npus 张卡，专家 e 的热度 w_e，卡 g 的负载 L_g=Σ_{e∈g} w_e/replica(e)。目标是最小化 max_g L_g（最热卡负载），因为整批延迟 ∝ max_g L_g。理想下界为 (Σ_e w_e)/num_npus（完全均分）。不均衡度 par = max_g L_g / mean_g L_g ≥ 1，par=1 即完美均衡。",
+    "为什么复制是必需的：若某专家 w_e > (Σw)/num_npus（单专家热度已超公平份额），则任何『不复制』的放置都有 max_g L_g ≥ w_e > 下界，纯搬迁无解。复制成 k 个副本后其单副本负载降为 w_e/k，才可能 ≤ 下界。这是冗余专家策略的数学动机（对应 DeepSeek-V3 §3.4）。",
+    "复制的贪心最优性直觉：每次把冗余名额给『当前最大单副本负载』的专家，等价于对 max 单副本负载做最陡下降——类似把『最长木板锯短』的贪心，是最小化最大值问题的标准启发式。",
+    "装箱的 LPT 近似：降序 + 每次塞最空箱，是多机调度 makespan 最小化的 LPT 算法，近似比 4/3−1/(3m)。代码的 original_compute_balanced_pack_redundancy 正是 LPT 加了『同专家副本不同卡』与『容量均分』两条约束。",
+    "训练期均衡目标的背景（DeepSeek-V3 §2.1.2, Eq.16）：auxiliary-loss-free 用逐专家偏置 b_i 参与 top-K 路由（过载减 γ、欠载加 γ），在训练时就把专家热度分布压平。但推理部署时路由由已训好的模型 + 实时输入决定，热度仍会不均——于是需要本章的『推理期冗余专家 + 重排』这条独立的均衡通路。两者互补：一个压训练分布，一个补推理放置。",
+    "复杂度：设 E=原始专家数、R=冗余数、G=卡数、Layer=MoE 层数。复制阶段每个冗余名额做一次 argsort，O(R·E log E)；装箱 O((E+R)·G)；逐层重复 O(Layer)。整体 O(Layer·(R·E log E + (E+R)·G))，是纯 CPU、离线规划，故放在第 9 章的独立子进程里跑、不占推理主循环。",
+    "数值推演（2 rank × 8 expert）的构造要点，供 explainer 实跑：冗余名额并非外部传入，而是 get_redundant_num=Σ(counts-1) 从『当前放置表已有的重复物理槽』反推——所以初始 placement_table 必须已含被复制的逻辑专家，否则 num_redundancy_expert=0、规划器无事可做。构造建议：layer=1、num_npus=2、每卡 5 个物理槽（共 10 槽）承载 8 个逻辑专家（id 0..7），让 2 个热门专家各占 2 槽（counts 出现两个 2 → R=2）；workload_table 同形状给一组不均热度（把大热度堆在少数专家上）。逐步：add_redundant 聚回 8 维逻辑热度 → calculate_max_heat_per_layer 记 before 最热卡 → Step1 把 2 个冗余名额贪心分给最热专家并按副本数摊薄 → Step3/4 LPT 装箱到 2 卡 → 取 after 最热卡 → 对比 before/after 的 max 与方差 → 判 npu_heat_all_after < 0.95×npu_heat_all_origin 是否触发 change。shape 约定：workload_table[layer, npu, slot]。explainer 必须进容器实跑 DefaultEplb().rebalance_experts 取真值，禁止手算杜撰输出。"
+  ],
+  "subtraction_plan": {},
+  "mechanisms": [
+    {
+      "id": "moe-load-imbalance-straggler",
+      "name": "动机：MoE 专家热度不均 → 最热卡拖慢整批（不均衡度 par=最热/平均）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm_ascend/eplb/core/eplb_worker.py:L290-L309"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2412.19437",
+        "sections": ["§2.1.2 (routing collapse)", "§3.4 (load balancing among experts)"]
+      },
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "balance-objective-metric",
+      "name": "均衡目标的量化：最小化最热卡负载 max_g L_g，度量 par=max/mean（对应墙钟被拖慢倍数）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm_ascend/eplb/core/eplb_worker.py:L290-L322",
+        "vllm_ascend/eplb/core/policy/policy_default_eplb.py:L242-L248"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2412.19437",
+        "sections": ["§3.4", "§2.1.2 Eq.16 (训练期偏置均衡背景)"]
+      },
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "redundant-experts-replication",
+      "name": "冗余专家复制：反复挑最热逻辑专家造副本、按副本数摊薄其平均热度（贪心降 max 单专家负载）",
+      "kind": "algorithm",
+      "source_anchors": [
+        "vllm_ascend/eplb/core/policy/policy_default_eplb.py:L43-L57"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2412.19437",
+        "sections": ["§3.4 (redundant experts)", "deepseek-ai/EPLB README §Global Load Balancing"]
+      },
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "greedy-balanced-packing",
+      "name": "贪心装箱（LPT 风格）：原始专家+副本按热度降序，逐个塞进当前总热度最小、未装该专家、未超容量的卡",
+      "kind": "algorithm",
+      "source_anchors": [
+        "vllm_ascend/eplb/core/policy/policy_default_eplb.py:L59-L121"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2412.19437",
+        "sections": ["deepseek-ai/EPLB README §Hierarchical/§Global Load Balancing"]
+      },
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "add-redundant-heat-fold",
+      "name": "add_redundant：把 [layer,gpu,slot] 物理热度按放置聚回 [layer, 逻辑专家] 热度向量（规划输入准备）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm_ascend/eplb/core/policy/policy_default_eplb.py:L29-L41"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2412.19437",
+        "sections": ["§3.4 (statistics collected during online deployment)"]
+      },
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "constraint-local-exchange",
+      "name": "constraint_expert_local_exchange：新放置就地映射回旧槽位，最小化卡内搬动 → 直接减少 D2D 搬运量",
+      "kind": "algorithm",
+      "source_anchors": [
+        "vllm_ascend/eplb/core/policy/policy_default_eplb.py:L250-L281"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2412.19437",
+        "sections": ["§3.4 (rearrange without increasing cross-node traffic)"]
+      },
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "rebalance-orchestration-change-gate",
+      "name": "rebalance_experts 编排：反推冗余数 → 逐层规划 → 就地映射 → 层优先级(改善比 argsort) + 0.95 变更闸门",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm_ascend/eplb/core/policy/policy_default_eplb.py:L283-L350"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2412.19437",
+        "sections": ["§3.4 (adjusted periodically based on observed loads)"]
+      },
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "hierarchical-vs-global-policy",
+      "name": "两种论文策略：分层(group→node 绑定，prefill 小 EP)vs 全局(无视 group 全局复制装箱，decode 大 EP)；落地 DefaultEplb 走全局一支",
+      "kind": "config",
+      "source_anchors": [
+        "vllm_ascend/eplb/core/policy/policy_factory.py:L12-L41"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2412.19437",
+        "sections": ["deepseek-ai/EPLB README §Hierarchical Load Balancing", "§Global Load Balancing"]
+      },
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    }
+  ],
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recycle": [],
+    "note": "scripts/bible.py due ch34 返回空（无应埋/应回收登记）。本章自身有一条强回指关系：回指第 9 章 eplb-expert-load-balancing——第 9 章讲迁移机器（updator 节拍/子进程队列/D2D 搬运/PolicyFactory 分发）并把 DefaultEplb.rebalance_experts 当黑盒；本章打开黑盒讲规划器算法本体。writer 应在开篇与收尾明确这条 back-pointer。"
+  }
+}

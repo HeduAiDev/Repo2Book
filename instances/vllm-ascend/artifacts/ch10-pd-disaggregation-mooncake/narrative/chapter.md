@@ -290,7 +290,11 @@ def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", 
 
 ### Worker 半边：每算完一层就推一层
 
-worker 侧只有两个钩子嵌在模型 forward 循环里，但它们正是这个连接器名字的由来。先看招牌动作——`save_kv_layer`：
+worker 侧只有两个钩子嵌在模型 forward 循环里，但它们正是这个连接器名字的由来。
+
+先建个直觉。把 prefiller 算 KV 想成一条工厂流水线：某个工位每加工完一件成品，立刻放上传送带送往下游，自己转身接着做下一件——不必等整批做完再统一发货。逐层推送就是这个意思：每算完一层 KV 就立刻推走，跨节点传输藏在「后面几层还在算」的那段时间里，几乎不额外占用墙钟。
+
+先看招牌动作——`save_kv_layer`：
 
 ```python
 # vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_layerwise_connector.py:L1621
@@ -323,7 +327,33 @@ def save_kv_layer(self, layer_name, kv_layer, attn_metadata, connector_metadata,
 
 开头那个 `if self.current_layer >= self.total_layers` 守卫看着反直觉——layer 计数怎么会超过总层数？这是个边界保护：某些前向流程可能在真实模型层之外多触发几次回调，一旦计数超出模型实际层数，就只递增计数、跳过推送。而那个 `SendTask` 是「这一层的发送任务」的完整描述：等哪个事件（`wait_event`，即缓存重排完成）、发送哪层的 K/V 张量（`k_cache`/`v_cache`）、是第几层（`layer_idx`/`layer_name`）、对应哪些本地块、是否要重排块（`group_rearrange_block_ids`）——后台发送线程拿着它就能独立把这层 KV 发走。
 
-这就是「layerwise」——逐层流水线。它的价值是**重叠**：第 `i` 层的 KV 正在跨节点传输的同时，模型在算第 `i+1` 层。传输延迟被后续层的计算盖住了。一个 `L` 层的模型，理想情况下能把 `(L−1)/L` 的传输时间藏进计算里——`L=80` 时，约 99% 的传输延迟被隐藏（这是忽略层间同步与首层冷启动的理想上界，实际略低）。这也是为什么这个门面类（`MooncakeLayerwiseConnector`，把 scheduler 和 worker 两半包起来的那个类）的 `wait_for_save` 是个空 `pass`：保存是逐层 fire-and-forget 的，没有「等全部存完」这一步可等。
+这就是「layerwise」——逐层流水线。它的价值是**重叠**：第 `i` 层的 KV 正在跨节点传输的同时，模型在算第 `i+1` 层，传输延迟被后续层的计算盖住了。
+
+把这个重叠摆到时间轴上看最清楚。取一个 4 层的小模型，每层计算 `t_c = 10`、每层传输 `t_x = 6`（单位任意，只为心算）；发送线程是**单条串行**的（真实精简版里 `KVCacheSendingLayerThread` 就是一个 `queue.Queue`，按入队序 FIFO 排空）：
+
+![逐层流水线把跨节点 KV 传输藏进后续层计算：第 i 层一算完就推走，其传输与第 i+1 层计算重叠](../diagrams/layerwise-pipeline-overlap.png)
+
+> *图注：4 层小例，每层算 10、传 6。第 0 层一算完（[0,10]），它的传输 [10,16] 就和第 1 层计算 [10,20] 并行；前 3 层的传输都这样被后继层计算盖住（hidden），只剩末层传输 [40,46] 无后继计算可藏（exposed）。顺序传输要 64，逐层流水线只要 46。*
+
+逐层逐窗对一遍，`transfer(i)` 从第 `i` 层计算结束时启动，落在下一层的计算窗里：
+
+<!-- trace: layerwise-push -->
+
+| 层 i | compute 时间窗 | transfer 时间窗（串行发送线程） | 并行的下一层 compute | 判定 |
+|---|---|---|---|---|
+| 0 | [0,10] | [10,16] | 1 | hidden |
+| 1 | [10,20] | [20,26] | 2 | hidden |
+| 2 | [20,30] | [30,36] | 3 | hidden |
+| 3 | [30,40] | [40,46] | 无（末层） | exposed |
+| 顺序传输总时长（无重叠） | 64 | 4 层 transfer 全暴露 | — | baseline |
+| 逐层流水线总时长 | 46 | 3 层 hidden | 1 层尾巴 exposed | 省下 18 |
+| 隐藏的传输比例 | 3/4 = 0.75 | L=80 → 79/80 = 0.9875 | — | 理想上界 |
+
+看两行关键对照：整段算完再一次性传，得先花 `4×10` 算完、再串行传 4 层，总时长 64；逐层流水线里，前 3 层的传输各自钻进下一层的计算窗，只剩末层那段传输尾巴露在外面，总时长 46——省下的 18 正好是 `(L−1)×t_x = 3×6`，被盖住的传输占 `3/4 = 0.75`。
+
+为什么隐藏比恰好是 `(L−1)/L`？两个不变量撑住这个结论。**其一，终止性**：`current_layer` 每次 `save_kv_layer` 回调严格 `+1`，是个单调递增的非负整数，涨到 `total_layers` 就被开头那道 `current_layer >= self.total_layers` 守卫短路——`L` 层必在 `L` 次回调后停，正好入队 `L` 个 `SendTask`（真实精简版里实测 4 层→4 个 `SendTask`、按 `[0,1,2,3]` FIFO 处理）。**其二，重叠性**：当每层传输 `t_x ≤` 每层计算 `t_c` 时，第 `i` 层的传输必在第 `i` 层计算结束时启动、并在下一层的计算窗内结束——于是前 `L−1` 层的传输逐个被后继层的计算完全盖住，只有末层传输后面再没有计算可藏，暴露 1 个。隐藏 `L−1`、暴露 1，比例就是 `(L−1)/L`。放大到 `L=80`（Llama-70B 级层数，示教值、非源码常量），隐藏比 `79/80 = 0.9875`，约 99% 的跨节点 KV 传输延迟被后续层计算盖住——这正是 layerwise 连接器相对「整段 prompt 算完再一次性传」的核心收益（忽略首层冷启动与层间同步的理想上界，实际略低）。
+
+这也解释了为什么这个门面类（`MooncakeLayerwiseConnector`，把 scheduler 和 worker 两半包起来的那个类）的 `wait_for_save` 是个空 `pass`：保存是逐层 fire-and-forget 的，一层推走就不再回头等，根本没有「等全部存完」这一步可等。
 
 闭环靠 `get_finished` 收尾——它把后台收线程已经完成的请求集排空，回报给调度器，让对应的块可以释放：
 

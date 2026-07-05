@@ -18,7 +18,7 @@ $$
 \mathrm{MHA\_cache} = N \times (P + V) = 128 \times (128 + 128) = 32768 \;\mathrm{（标量/token/层）}
 $$
 
-MLA 换了个存法：不存满维 K/V，只缓存一个**低秩隐向量** `kv_c`（`kv_lora_rank = 512`），外加一个**解耦位置编码** `k_pe`（`qk_rope_head_dim = 64`）：
+MLA 换了个存法：不存满维 K/V，只缓存一个**低秩隐向量** `kv_c`（`kv_lora_rank = 512`），外加一个**解耦位置编码** `k_pe`（`qk_rope_head_dim = 64`）——本章默认你已了解低秩压缩与解耦 RoPE 背后的数学动机，完整推导见[第 31 章：MLA 原理](../ch31-primer-mla/narrative/chapter.md)，这里只看昇腾把它落成了怎样的算子：
 
 $$
 \mathrm{MLA\_cache} = L_{kv} + R = 512 + 64 = 576 \;\mathrm{（标量/token/层）}
@@ -224,6 +224,15 @@ a = q_nope @ k_nope                   # → 19.0
 ql_nope = q_nope @ W_UK_T            # → [7., 5., 4., 4.]  (L,)
 b = ql_nope @ kv_c                    # → 19.0
 ```
+
+把两条路径的中间量和最终标量并排列出，一眼看到「走的空间不同、落点相同」：
+
+<!-- trace: weight-absorption -->
+
+| 路径 | 计算空间 | 中间量（单头 P=3,L=4） | 与另一侧内积 | 结果标量 |
+|---|---|---|---|---|
+| 朴素 MHA：先解压 K | P=3 维 | `k_nope = W_UK_T·kv_c = [5, 1, 4]` | `a = q_nope · k_nope` | 19 |
+| 权重吸收：先投 query | L=4 维 | `ql_nope = q_nope · W_UK_T = [7, 5, 4, 4]` | `b = ql_nope · kv_c` | 19 |
 
 两条路殊途同归，结果**逐位相等**（`a == b == 19.0`，精简版 test 里就是 `assert torch.allclose(a, b)`）：朴素路在 `(P,)` 空间里点乘，吸收路在 `(L,)` 空间里点乘，但因为矩阵乘有结合律，最终标量分毫不差。这正是吸收能成立的全部底气——换了计算顺序，没换计算结果。
 
@@ -588,6 +597,10 @@ prefill 用的是同一个算子，但有两处关键差别：
 差别一：传 `is_output_kv=True`，让算子额外吐出未量化的 KV。差别二：取的是**后两个**返回值。decode 要的是「写进 cache 的隐向量」（前两个），prefill 要的是「供 `kv_b_proj` 显式解压用的输出 KV」（后两个）。同一个算子，靠返回值位置区分用途。
 
 这个差异很微妙，正好用记录调用的替身在开发机上钉死：`exec_kv_decode` 取到的返回值对应替身的第 1/2 个输出、`cache_mode == "PA"`、调用里**没有** `is_output_kv` 标志；`exec_kv_prefill` 取到第 3/4 个输出、调用里 `is_output_kv is True`。和源码里两处的取值位置、入参一一对上。
+
+把这个「一把算子 = 三步融合 + 返回值分野」画成一张图：
+
+![npu_kv_rmsnorm_rope_cache：一个算子内做完 RMSNorm、RoPE、写分页 cache 三步；decode 取前两个返回值（隐向量直接当 K=V 做 MQA），prefill 传 is_output_kv=True 取后两个（交给 kv_b_proj 显式解压）](../diagrams/npu-kv-rmsnorm-rope-cache.png)
 
 decode 路 query 的位置编码由 `rope_single` 单独加，它包的是 `npu_interleave_rope`：
 

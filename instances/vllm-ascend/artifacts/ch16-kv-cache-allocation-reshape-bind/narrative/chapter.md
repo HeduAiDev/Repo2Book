@@ -435,11 +435,24 @@ def _adjust_kv_layout(
 
 核心就一行：`target_stride = (num_element_per_page, *stride[1:])`。它把 block（第 0）维的 stride 从自然值，**强制改成「一整页的元素数」** `num_element_per_page = page_size_bytes // dtype_size`，其余维保持 `torch.empty(shape).stride()` 的自然 stride。
 
+打个比方：这就像停车场按「一个车位 = 一整格」画线——格宽由页大小定死，不由车身定。一辆只占半格的小轿车停进去，下一辆也得从下一条格线起停，于是每辆车后面都稳定空出一段固定宽度的空档。`as_strided` 把 block 维步长钉成「一整页的元素数」，就是把格线拉宽到一页；每个 block 的真实数据只占自然块那么大，其后必然露出「页宽 − 块宽」的页对齐空隙——多段视图（sparse-c8 的 k / scale / full）正是塞进这些缝里按页交错叠放。
+
 这一行的几何后果，是逻辑上相邻的 block 在物理上恰好跨一个 page：
 
 ![as_strided 把 block 维 stride 钉成一页](../diagrams/adjust-kv-layout.png)
 
 > *图注：上下两带对比同一份 block 数据在两种页大小下的物理落点。情形一（`page==block`）页大小恰等于自然块、block 间无缝隙，as_strided 退化成恒等；情形二（`page=24 > block=16`）block 维 stride 被钉到 24，block 0/1/2 落在 offset 0/24/48，每块 16 元素数据后露出 8 元素的页对齐空隙，多段视图据此按页 overlap。基座只在 `page_size_padded` 时才用 as_strided，平时是自然 contiguous。*
+
+图上两种情形的关键落点，先并成一张可对照的数值表——它也正是下面两组手推要抵达的答案：
+
+<!-- trace: adjust-kv-layout -->
+
+| 情形 | `page_size_bytes` | `num_element_per_page` | `target_stride` 首维 | block 0/1/2 落点（元素） | 每块真实数据（元素） | 页对齐 gap（元素） |
+|---|---|---|---|---|---|---|
+| 情形一 page==自然块（退化） | `32` | `16` | `16` | `0 / 16 / 32` | `16` | `0` |
+| 情形二 page 带 padding | `48` | `24` | `24` | `0 / 24 / 48` | `16` | `8` |
+
+两行一对照，机制的「显形条件」就跳出来了：唯一变的是 `page_size_bytes`（32→48），它一变，`num_element_per_page` 跟着从 16 抬到 24，于是 block 维步长从「恰好贴合自然块」被撑成「比自然块宽 8 个元素」。下面把这两行各自的来龙去脉手推一遍。
 
 先跑一组数，但**特意挑一个会让效果隐身的退化输入**（`shape=(4,2,1,8)`、`dtype=float16`、`page_size_bytes=16×2=32`）:
 
@@ -478,6 +491,8 @@ def _adjust_kv_layout(
 这正是上面配图的「情形二」：block 0/1/2 落在 offset `0 / 24 / 48`，每块 16 元素数据后**露出 `24−16 = 8` 个元素的页对齐空隙**。
 
 为什么这空隙稳定存在、不会忽大忽小？一句归纳骨架：每跨一个 block，`storage_offset` 单调 `+num_element_per_page`（这里 +24），而每块真实数据恒占自然 stride[0]（这里 16）个元素，差额 `gap = num_element_per_page − 自然 stride[0]` 是个**与 block 序号无关的非负常量**（情形一 `gap=16−16=0`，情形二 `gap=24−16=8`）——于是相邻 block 之间稳定空出 `gap` 个元素的缝隙。多段视图（sparse-c8 的 k / scale / full）正是塞进这些缝隙、在同一裸张量上按页码 overlap。`overlap_full_kv_cache` 那个 `idx == 2` 分支就是干这个：让第 3 段（full 视图）从基址重新起算，与前两段（k、scale）叠在同一片内存。
+
+换个角度把这笔「浪费」的账算清楚：情形二里每个 block 物理占用 `num_element_per_page = 24` 个元素，其中真实数据只有 16 个，另外 8 个（约三分之一）是页对齐 padding；n 个 block 的物理总跨度是 `24·n` 元素，而自然 contiguous 只要 `16·n`，膨胀因子 `24 / 16 = 1.5×`。这多出来的半倍空间不是白扔的——它正是换来多段视图能按页 overlap 的代价。回到情形一，page 恰等于自然块时膨胀因子退回 `16 / 16 = 1`，`as_strided` 沦为恒等，这笔账一分不花，机制也就无从显形。这也解释了为什么图注要强调基座「平时是自然 contiguous」：只有真出现页对齐 padding（`page > 自然块`）时，多花这 0.5× 才有意义。
 
 ## 16.7 bind：按模型走三条路
 

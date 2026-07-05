@@ -241,12 +241,21 @@ def refresh_all_lora_classes():
 
 把这个 trick 摊开成「替换前 / 替换后」两个状态，最能看清它干了什么。设 vLLM 原元组有 16 个内置类，源层是一个 `AscendQKVParallelLinear`（非合并，`len(packed_modules_list) == 1`）：
 
+<!-- trace: lora-class-replacement -->
 | 时刻 | `_all_lora_classes` 长度 | `from_layer` 遍历前 16 项 | 遍历第 17 项（`AscendQKVParallelLinearWithLoRA`） | 结果 |
 |---|---|---|---|---|
 | `refresh` 之前 | 16 | 逐个 `can_replace_layer` 全 `False`（无人认 `AscendQKVParallelLinear`） | —（元组里没有这一项） | 返回原层，**LoRA 失效** |
 | `refresh` 之后 | 20 | 同上，前 16 项仍全 `False` | `type is AscendQKVParallelLinear and len==1` → **`True`** | 包成 `AscendQKVParallelLinearWithLoRA`，LoRA 生效 |
 
 一行赋值的全部效果，就是把元组从 16 项变成 20 项，让 `from_layer` 的遍历多走 4 步、在第 17 步命中。原有 16 项的匹配结果**逐字不变**——这就是为什么昇腾敢用「改全局变量」这种看着野的手法：严格类型相等 + 追加到尾部，两个约束合起来保证了零侵入。
+
+![全局类替换：候选池从 16 项扩成 20 项，第 17 项命中昇腾 QKV 层](../diagrams/ch30-lora-class-replacement.png)
+
+> *图注：一行元组 splat 把候选池从 16 项扩到 20 项，4 个昇腾类追加在尾部。*
+> *`from_layer` 顺序遍历，前 16 项判定逐字不变、全 `False`。*
+> *只在第 17 项用严格类型相等命中昇腾 QKV 层——改全局变量却零侵入的原因就在这里。*
+
+这里可以顺手把「零侵入」这句话讲透一点，它其实是一个小小的归纳论证。**前缀不变**：`refresh_all_lora_classes` 只在尾部 splat 追加，前 16 项的对象与它们的 `can_replace_layer` 一字未改；`from_layer` 遇到第一个 `True` 就返回，所以对任何源层，前 16 项的判定序列都和 `refresh` 前完全相同——只有当这 16 项**全 `False`** 时，控制流才会走到第 17 项。**新增项安全**：4 个昇腾类的 `can_replace_layer` 一律以 `type(source_layer) is AscendQKVParallelLinear` 严格类型相等开头，源层是昇腾 QKV 时才可能返回 `True`，对任何非昇腾层恒 `False`。两条合起来，「候选池只增不减、既有秩序不变」这个单调量，就保证了新增项对旧层永不改判、对昇腾层恰好补上缺失的那一票。
 
 那么 `refresh_all_lora_classes()` 在什么时候被调？这把我们带到 LoRA 的第二招。
 
@@ -309,7 +318,13 @@ wrapper 怎么被选中，又是一条注册主线。vLLM 通过平台层问「�
 - 当芯片是 310P（推理卡，见第 [17 章](../ch17-310p-inference-chip-specialization/narrative/chapter.md)），**或** `max_lora_rank >= 128` 时，退回 vLLM 的 `torch_ops`——纯 PyTorch 实现，慢一点但通用，对老芯片和大 rank 都稳。
 - 否则（主流训练卡 + 常规 rank），绑昇腾自己的 `lora_ops`——薄壳转调 NPU C++ kernel，快。
 
-六个算子绑成实例属性后，后续所有 LoRA 计算都通过 `self.bgmv_shrink` 这类属性间接调用，调用方完全不知道底下是 PyTorch 还是 NPU kernel。这是「绑定一次、处处复用」的经典分发。
+六个算子绑成实例属性后，后续所有 LoRA 计算都通过 `self.bgmv_shrink` 这类属性间接调用，调用方完全不知道底下是 PyTorch 还是 NPU kernel。这是「绑定一次、处处复用」的经典分发——分支决策只在构造期发生一次，运行期一路间接调用、不再判分支，零额外开销。
+
+![LoRA 算子分发全链路：构造期二选一绑引擎，运行期 shrink→expand](../diagrams/ch30-lora-ops-dispatch.png)
+
+> *图注：构造期按 `device==310P` 或 `max_lora_rank>=128` 二选一绑引擎。*
+> *任一成立退回 PyTorch 通用 `torch_ops`，否则绑昇腾 NPU kernel。*
+> *运行期 `add_lora_linear` 走 shrink→expand 两步，落到所绑的六个算子。*
 
 ### 为什么大 rank 要退回通用实现：算一笔账
 
@@ -340,6 +355,17 @@ $$
 $$
 
 两个数据点并排一看就清楚了：r = 16 省 128 倍，r = 128 只省 16 倍——r 涨 8 倍，省下的算力也跟着缩到八分之一。低秩的红利在大 rank 上所剩无几，自定义 NPU kernel 为小 r 做的特化（比如把 r 维塞进片上缓存）也跟着失去意义。这时退回 PyTorch 原生实现，既不丢多少性能，又换来正确性和兼容性的保障。`max_lora_rank >= 128` 这个阈值，就是「自定义 kernel 还值不值」的分界线。
+
+把设备门、rank 门这两道关，连同刚算出的 FLOPs，摆成一张表，三个典型场景一眼看全（都取 d = o = 4096、T = 1）：
+
+<!-- trace: lora-ops-dispatch -->
+| 场景 | 设备 / `max_lora_rank` | 命中分支 | 绑定算子 | rank r | shrink+expand 两步 FLOPs | 满秩直算 FLOPs | 省倍数 |
+|---|---|---|---|---|---|---|---|
+| 910B 常规 rank | 非 310P，rank=16 | `else` 分支 | `vllm_ascend.lora.lora_ops`（NPU kernel 薄壳） | 16 | 262144 | 33554432 | 128 |
+| 910B 大 rank | 非 310P，rank=128 | `max_lora_rank>=128` 为真 | `vllm.lora.ops.torch_ops`（PyTorch 通用） | 128 | 2097152 | 33554432 | 16 |
+| 310P 推理卡 | `device==310P`，rank=16 | `device==310P` 为真 | `vllm.lora.ops.torch_ops`（PyTorch 通用） | 16 | 262144 | 33554432 | 128 |
+
+值得玩味的是后两行：910B 大 rank 和 310P 推理卡都退回了 `torch_ops`，触发的却是**两道不同的门**——前者因 rank 到 128、低秩红利变薄，后者因芯片型号（310P 老推理卡自定义 kernel 支持不全）。尤其 310P 那行，rank 明明只有 16、本可省 128 倍，仍因设备型号被拦回通用实现。这正说明构造函数那个 `or` 里，设备门和 rank 门是**各自独立**把关的：任一成立即短路退回，谁也不必等谁。
 
 ### shrink→expand 怎么走到 NPU kernel
 
