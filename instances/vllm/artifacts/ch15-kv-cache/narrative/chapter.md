@@ -29,7 +29,7 @@
 
 如果给每个请求预留一整段连续显存，就得按**最大可能长度**预留。一个 max_model_len=8192 的模型，哪怕请求只生成了 10 个 token，也得占着 8192 个 token 的位置。这是巨大的内部浪费。退一步，按需扩张连续段呢？那又会把显存切成无数大小不一的碎片，新请求来了凑不出一段连续的——外部碎片。
 
-vLLM 的解法是借操作系统的分页思想：把物理 KV 显存切成 `num_gpu_blocks` 个**等长**的块，每块固定装 `block_size` 个 token 的 KV。这套机制的代码都在 `vllm/v1/core/` 下——`block_pool.py` 管物理块、`kv_cache_utils.py` 管块的元数据与哈希、`kv_cache_manager.py` 是对调度器的门面。请求的逻辑 token 序列也按 `block_size` 切块，每个逻辑块通过一张 **block table** 映射到任意一个物理块。逻辑上连续、物理上可以散落。
+vLLM 的解法是借操作系统的分页思想：把物理 KV 显存切成 `num_gpu_blocks` 个**等长**的块，每块固定装 `block_size` 个 token 的 KV。这套机制的代码都在 `vllm/v1/core/` 下——`block_pool.py` 管物理块、`kv_cache_utils.py` 管块的元数据与哈希、`kv_cache_manager.py` 是对调度器的门面。请求的逻辑 token 序列也按 `block_size` 切块，每个逻辑块通过一张 **block table** 映射到任意一个物理块。逻辑上连续、物理上可以散落。这套「分页 + 块表间接寻址」的注意力机制，正是 vLLM 原始论文提出的 **PagedAttention**（arXiv:2309.06180）。
 
 ![分页总览](../diagrams/paging-overview.png)
 

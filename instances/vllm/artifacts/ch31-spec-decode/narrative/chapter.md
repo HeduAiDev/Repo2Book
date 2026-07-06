@@ -5,9 +5,9 @@
 ![你在这里：投机解码](../diagrams/roadmap.png)
 
 > *图注：全书地图高亮当前位置。*
-> *上一章把采样层拆成 9 步，把一张 logits 变成下一个 token。*
-> *本章在这之上做一件更激进的事：让一次目标前向，吐出好几个 token。*
-> *下一章回到引擎，把这些一次多产的 token 接回各自请求的输出流。*
+> *上一章推导了 EAGLE 草稿器：在特征层自回归、剧透超前一步 token，又快又准地猜草稿。*
+> *本章看 vLLM 的投机执行面——怎么把草稿摊平、验证，让一次目标前向吐出好几个 token。*
+> *下一章把视野放大到 engine 之间：prefill/decode 拆分与跨进程 KV 搬运。*
 
 自回归解码有个改不掉的毛病：一次前向只产一个 token。要写 100 个 token，就得把整个大模型跑 100 遍。而每跑一遍，GPU 的算力其实大半闲着——decode 阶段是**访存瓶颈**，矩阵又瘦又长，算术单元喂不饱。
 
@@ -169,7 +169,7 @@ return draft_token_ids
 
 这是一条链式生成的循环：跑 k−1 次，每次把上一步采的草稿喂回去、增量推进一格、再 greedy 采下一个草稿，最后 `stack` 成 `[batch_size, num_speculative_tokens]`。EAGLE 的"草稿链"就是这么一步步接出来的。
 
-至于内部的 EAGLE 头怎么算、DFlash 的 mask token 怎么布、MTP 的多 token 预测头长什么样——那是模型结构的事，[第 27 章](../../ch27-model-architecture/narrative/chapter.md) 讲过了。本章只认它们对外的契约：
+至于内部的 EAGLE 头怎么算——特征级自回归、超前一步 token、那层 FC + 单层 decoder——[上一章](../../ch30-primer-eagle/narrative/chapter.md)已经从原理推到源码；DFlash 的 mask token 怎么布、MTP 的多 token 预测头长什么样则是模型结构的事，[第 27 章](../../ch27-model-architecture/narrative/chapter.md) 讲过了。本章只认它们对外的契约：
 
 > **proposer 契约**：吃当前上下文（n-gram 吃 token 历史，模型类吃目标 hidden states），吐每请求 0 到 k 个草稿 token。模型类 proposer 还可以附带 `draft_probs`（草稿的概率分布）；n-gram 没有概率，`draft_probs` 是 `None`。
 
@@ -468,7 +468,7 @@ def rejection_greedy_sample_kernel(
         )
 ```
 
-每个 Triton program 处理一个请求。第一件事就是用 `cu_num_draft_tokens` 反推本请求的草稿区间 `[start, end)`——这正是 28.2 那个累积和的用途。以 28.2 的例子说：`cu = [3, 3, 5, 5, 6]`，req2 的区间是 `[cu[1], cu[2]) = [3, 5)`，即摊平张量的第 3、4 位是它的两个草稿。
+每个 Triton program 处理一个请求。第一件事就是用 `cu_num_draft_tokens` 反推本请求的草稿区间 `[start, end)`——这正是 §31.2 那个累积和的用途。以 §31.2 的例子说：`cu = [3, 3, 5, 5, 6]`，req2 的区间是 `[cu[1], cu[2]) = [3, 5)`，即摊平张量的第 3、4 位是它的两个草稿。
 
 准则很简单：greedy 采样就是取概率最高的 token，所以目标模型在这个位置的"标准答案"是 `target_argmax`。草稿等于 argmax 就接受、否则拒绝。注意一个细节：**拒绝位仍然写入 `target_argmax_id`**——因为 greedy 语义下，纠正后的 token 就是目标的 argmax。而且一旦 `rejected = True`，`if not rejected` 这一守卫让后续位置不再写，自然保留预填的 −1。
 
@@ -684,7 +684,7 @@ float32 下均匀采样有非可忽略的概率精确得到 0.0，会让接受�
 
 ## 31.6 收尾：把紧凑输出还原成变长
 
-三个内核跑完，输出是一块紧凑的 `[batch_size, max_spec_len + 1]` 张量，里面混着接受的草稿、recovered token、bonus token，以及一堆 −1。最后一步把它还原成每请求变长的 `list[list[int]]`，交回引擎。这是 `parse_output`（`vllm/v1/sample/rejection_sampler.py`），也是 28.2 那个"摊平"的对偶操作：
+三个内核跑完，输出是一块紧凑的 `[batch_size, max_spec_len + 1]` 张量，里面混着接受的草稿、recovered token、bonus token，以及一堆 −1。最后一步把它还原成每请求变长的 `list[list[int]]`，交回引擎。这是 `parse_output`（`vllm/v1/sample/rejection_sampler.py`），也是 §31.2 那个"摊平"的对偶操作：
 
 ```python
 # vllm/v1/sample/rejection_sampler.py:L247
@@ -729,4 +729,4 @@ req0 这一轮净产 2 个 token，req1 净产 3 个。回到本章开头那个�
 
 这套机制把"加速"和"正确"两件看似矛盾的事缝在了一起：不管草稿命中率高低，输出分布都和老老实实一个一个采**严格相等**——投机只改速度，不改结果。
 
-下一章回到引擎核心，看这些一次多产、数量不等的 token 怎么接回各自请求的输出流，让调度器和 KV cache 正确地记账。
+投机解码是压榨单个 engine 内部闲算力的加速轴。下一章把视野放大到 engine 之间——为什么要把 prefill 和 decode 拆到不同 engine 上、KV cache 又怎么跨进程从一台搬到另一台。

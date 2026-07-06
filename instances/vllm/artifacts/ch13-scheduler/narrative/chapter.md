@@ -127,6 +127,16 @@ def schedule(self) -> SchedulerOutput:
 
 这张图回答了「连续批处理为什么快」：GPU 跑一次前向，固定开销很大（启动 kernel、读权重）。如果一拍只算 1 个 decode token，这次前向的算力基本浪费了。所以 v1 把多个请求的 token **塞进同一拍**——3 个 decode（3 token）+ 2 个 prefill chunk（61 token），凑成 64 token 一起算，把 GPU 喂饱。批的成员、prefill 和 decode 的配比，每一拍都不一样（请求随时进出），所以叫「连续」。
 
+### 溯源：两个论文根
+
+v1 这套「token 为中心、不分相」的调度，把两条来自论文的思想缝进了同一条数轴，值得点名。
+
+**连续批处理源自 Orca**（OSDI'22）。传统静态批处理要等一整批请求全部生成完才换人，长短不一的请求互相拖累。Orca 提出**迭代级调度**（iteration-level scheduling）：以「一次前向」而非「一整条请求」为调度粒度，每跑完一拍就重新决定谁进批、谁出批。这正是 §13.1 那句「批的成员随时进出」的思想出处——vLLM v1 把它推到极致，连 prefill 和 decode 都不再分两条队列。
+
+**chunked prefill 源自 Sarathi**（arXiv:2308.16369）。一段长 prompt 的 prefill 是算力密集的大块，一旦独占一拍，正在 decode 的请求就被顶得卡顿。Sarathi 的办法是把长 prefill **切成固定大小的 chunk** 分几拍算，每拍的预算余量再**捎带**（piggyback）若干 decode token，让算力密集的 prefill 和访存密集的 decode 混在一拍里互补。§13.4 那个「50 token prompt、预算 16、分几拍算完」的截断，就是这套思想的直接落地。
+
+两篇论文各解一半：Orca 让批连续流转，Sarathi 让长 prefill 不再阻塞 decode。v1 的 `num_computed_tokens` 追赶公式，正是把两者统一成了一条数轴上的追赶。
+
 下面这张图是 `schedule()` 全程的控制流，后面几节会顺着它走：
 
 ![schedule 的两阶段流程](../diagrams/13-schedule-two-phase.png)

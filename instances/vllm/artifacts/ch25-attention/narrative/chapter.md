@@ -7,7 +7,7 @@
 > *图注：全书地图高亮当前位置。*
 > *[模型定义那章](../../ch22-model-definitions/narrative/chapter.md) 里，每个注意力层都建了一个 `Attention` 对象，但它具体走哪个 kernel、KV cache 长什么样，都被一句"运行时再说"带过了。*
 > *本章把那句"再说"说清：后端怎么选、metadata 怎么从一份共享结构翻译成各 kernel 的专属结构、新算出的 KV 怎么照 `slot_mapping` 写进显存、历史 KV 怎么照 `block_table` 读回来。*
-> *再往后是各家 kernel 的内部实现细节，本章只到"调用边界"为止。*
+> *上一章已经把 FlashAttention 这台 kernel 从里到外掀开过；本章反过来，只站在"调用边界"这头，看后端怎么选它、又怎么把 metadata 喂给它。*
 
 前面铺了很长的路。[KV cache 那章](../../ch15-kv-cache/narrative/chapter.md) 把显存切成定长块、用 `block_table` 和 `slot_mapping` 两张表管页；[模型运行器那章](../../ch18-model-runner/narrative/chapter.md) 在每步前把这两张表算好，塞进一份叫 `CommonAttentionMetadata` 的结构。但那两章都停在"算好了、放那儿了"。
 
@@ -673,7 +673,7 @@ metadata 翻译好了，`block_table` 和 `slot_mapping` 都到了后端手里�
 
 ## 25.9 PagedAttention：照表读写 KV 显存
 
-[KV cache 那章](../../ch15-kv-cache/narrative/chapter.md) 立下了两张表的语义，但只到"表算好了"为止。现在两张表落进了后端的手里，我们终于能看清它们怎么真正读写显存。先把寻址恒等式钉死。
+[KV cache 那章](../../ch15-kv-cache/narrative/chapter.md) 立下了两张表的语义，但只到"表算好了"为止。现在两张表落进了后端的手里，我们终于能看清它们怎么真正读写显存。这套「逻辑块→物理块」的分页间接寻址，正是 vLLM 原始论文提出的 **PagedAttention**（arXiv:2309.06180）的核心。先把寻址恒等式钉死。
 
 **PagedAttention 寻址恒等式。** 对第 $i$ 个 token：
 
@@ -1039,4 +1039,4 @@ assert out.shape == (seq_len, num_heads * head_size)
 - **两层 metadata**：`CommonAttentionMetadata` 跨层共享、运行器那头只算一次；`builder.build()` 把它翻译成后端专属 metadata——共享字段直接搬、特有字段新增。`block_table_tensor` 和 `slot_mapping` 在这里作为接口字段被接住。
 - **读写 + 分发**：`slot_mapping`（token→物理槽）照恒等式 `block_idx = slot // block_size` 把新 KV **写**进 paged cache（`vllm/_custom_ops.py` 的 `reshape_and_cache_flash`）；`block_table`（请求→逻辑块号列表）照表把历史 KV **读**回来算注意力（`vllm/v1/attention/backends/flash_attn.py` 的 `flash_attn_varlen_func`）。运行时按 `layer_name` 当键，从 `forward_context` 取本层的 KV cache 与 metadata（`vllm/model_executor/layers/attention/attention.py`），写算子和算算子用 `dummy_dep` 串住"先写后读"。
 
-一份共享的 metadata，配上一套"选谁 / 怎么翻译 / 怎么读写 / 怎么分发"的抽象，就喂饱了 FlashAttention、FlashInfer、Triton 各家 kernel。各 kernel 内部怎么把注意力算快——那是它们自己的事，从本章这条调用边界往里，是另一片天地了。
+一份共享的 metadata，配上一套"选谁 / 怎么翻译 / 怎么读写 / 怎么分发"的抽象，就喂饱了 FlashAttention、FlashInfer、Triton 各家 kernel。各 kernel 内部怎么把注意力算快——FlashAttention 那台[上一章](../../ch24-primer-flash-attention/narrative/chapter.md)已经从 online-softmax 到 tiling 掀开过，其余各家是它们自己的事，从本章这条调用边界往里，是另一片天地了。

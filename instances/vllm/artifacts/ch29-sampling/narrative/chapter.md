@@ -170,7 +170,7 @@ def apply_logits_processors(
 
 四道工序，顺序固定：
 
-1. **第 3 步：allowed token 白名单**。如果某请求限制了"只能从这些 token 里选"（比如结构化输出），`allowed_token_ids_mask` 就是一张 `[batch, vocab]` 的布尔表，把所有不在白名单里的位置 `masked_fill_` 成 `-inf`。一句话搞定，因为它本就是张量。
+1. **第 3 步：allowed token 白名单**。如果某请求限制了"只能从这些 token 里选"（比如结构化输出），`allowed_token_ids_mask` 就是一张 `[batch, vocab]` 的布尔表，把所有不在白名单里的位置 `masked_fill_` 成 `-inf`。一句话搞定，因为它本就是张量。这张白名单在结构化输出（如 JSON schema、正则约束）场景下由语法引擎逐步生成——vLLM 默认用 **XGrammar**（arXiv:2411.15100）把上下文无关文法压成快速状态机，每步吐出一张合法 token 掩码；本章只消费这张掩码，不展开文法编译本身。
 2. **第 4 步：bad words 屏蔽**（下一节细讲）。
 3. **第 5 步：non-argmax-invariant 处理器**——`min_tokens` 和 `logit_bias`。它们能改 argmax，所以排在这里。
 4. **第 6 步：三种惩罚**——repetition / frequency / presence。

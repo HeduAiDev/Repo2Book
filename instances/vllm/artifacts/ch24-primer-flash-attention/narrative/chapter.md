@@ -4,9 +4,9 @@
 
 ![全书地图：本章深入注意力后端的内部算法](../diagrams/roadmap.png)
 
-*图 34-0　全书请求生命周期地图。本章不在主干流程上，而是纵向切进"注意力后端"那一格，把它一直当黑盒的 kernel 掀开。*
+*图 34-0　全书请求生命周期地图。上一章停在 attention 算子被切出来、保持 eager;本章纵向切进这一格，掀开它内部一直当黑盒的 FlashAttention kernel。*
 
-翻到这里，我们已经把一条请求从入口、跨进程、到 EngineCore 循环走了个遍。[注意力后端抽象(第 25 章)](../../ch25-attention/narrative/chapter.md)那一站，我们看到后端把一份 metadata 喂给一行函数调用 `flash_attn_varlen_func`,注意力就算完了——但那一行里面到底发生了什么，全书至今没打开过。
+上一章拆到 `self.attn(q, k, v)` 那行调用的底下——attention 算子被 `torch.compile` 当切点切出来、夹在两侧规整段之间保持 eager。但那个算子**内部**真正干活的 FlashAttention kernel,始终是当黑盒 `import` 进来的：调用一行 `flash_attn_varlen_func`,注意力就算完了，可里面到底发生了什么，全书至今没打开过。
 
 这一章就打开它。它是一节**原理课**:主角是两篇论文——FlashAttention(arXiv:2205.14135)和它前置的 online-softmax(arXiv:1805.02867),外加一节带过的 FlashAttention-2(arXiv:2307.08691)。我们会从"注意力到底慢在哪"讲起，一路推到 vLLM 真实源码里的那几行调用，让你以后再看到 `flash_attn_varlen_func`、`merge_attn_states` 这些名字时，脑子里有的是算法而不是黑盒。
 
@@ -489,4 +489,4 @@ merge_attn_states(output, prefix_output, prefix_lse, suffix_output, suffix_lse)
 - **FA-2**:循环序对调 + 推迟归一化 + 只存 $L=m+\log\ell$,同一份数学快约 2×(arXiv:2307.08691 §3)。
 - **落地**:vLLM 按平台 import kernel,用 varlen 打平 + 分页 KV 喂它；`return_softmax_lse` 吐出的 $L$,让 `merge_attn_states` 能把 cascade 拆开的两段注意力精确拼回——⊕ 算子的第三副面孔。
 
-那个 ⊕ 算子——online-softmax 递推、FlashAttention 分块、LSE 合并——是贯穿始终的主角。以后再遇到 split-KV、chunked prefill、共享前缀去重这些名字，你都能一眼看穿：底下还是它。回到[注意力后端(第 25 章)](../../ch25-attention/narrative/chapter.md)那份 metadata,现在你知道它喂进去之后，kernel 里到底发生了什么了。
+那个 ⊕ 算子——online-softmax 递推、FlashAttention 分块、LSE 合并——是贯穿始终的主角。以后再遇到 split-KV、chunked prefill、共享前缀去重这些名字，你都能一眼看穿：底下还是它。下一章走进[注意力后端抽象(第 25 章)](../../ch25-attention/narrative/chapter.md),看 vLLM 怎么按 `head_size`、平台在 FlashAttention/FlashInfer/Triton 里挑一个后端、又怎么把一份 metadata 翻译好喂给这行 kernel——你已经知道 kernel 内部在干什么，接下来就看它怎么被选择和调用。

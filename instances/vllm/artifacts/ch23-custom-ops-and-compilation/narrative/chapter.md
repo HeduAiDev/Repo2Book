@@ -766,4 +766,4 @@ assert should_split(attn_node, ["vllm::unified_attention_with_output"])
 
 而那个反复出现的 `unified_attention_with_output`，是两级的交汇点：它是第 1 级里被夹在不透明算子内部、需要 `maybe_compile` 单独编译的那类典型，也是第 2 级里 Dynamo 不 graph break、`split_graph` 据以切图的切点。上一章 `self.attn(q, k, v)` 吞下的算子，怎么进 `torch.compile` 图——答案就是把它注册成带 fake_impl 的不透明 torch 算子。
 
-下一章走进 `self.attn` 内部，看那个被切出来、保持 eager 的 attention 段里，不同的 attention 后端（FlashAttention、Triton……）究竟怎么实现。
+下一章走进 `self.attn` 内部那个被切出来、保持 eager 的 attention 段——但在看 vLLM 怎么在不同后端间选择之前，得先把它调用的 FlashAttention kernel 这个黑盒掀开：那是一节从 online-softmax 推到 IO-aware 注意力的原理课。

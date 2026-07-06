@@ -5,10 +5,10 @@
 ![你在这里：模型架构，DeepSeek-V4 capstone](../diagrams/roadmap.png)
 
 > *图注：地图还停在 EngineCore 循环这一格——模型只是循环里 `execute` 的那一步。*
-> *[上一章](../../ch25-attention/narrative/chapter.md)把注意力后端怎么收口、metadata 怎么喂 kernel 讲透了。*
-> *本章往上退一步，读一整个真实大模型 DeepSeek-V4，看它在 Llama 骨架上叠了哪些花样。*
+> *[上一章](../../ch26-primer-quantization/narrative/chapter.md)把量化数学推清了：scale、zero-point、e8m0 块 scale 编码。*
+> *本章读一整个真实大模型 DeepSeek-V4,看它在 Llama 骨架上叠了哪些花样——包括把上一章的 FP8 语义真正铺进显存。*
 
-前面三章，我们把模型层一层层铺开了。[第 22 章](../../ch22-model-definitions/narrative/chapter.md)立了一份契约：所有 vLLM v1 模型都长成 embedding → N 层 decoder block → 末尾 norm，并以 Llama 作**最简基线**。第 23、24 章接着把自定义算子、`torch.compile`、注意力后端拆开看。
+前面几章，我们把模型层一层层铺开了。[第 22 章](../../ch22-model-definitions/narrative/chapter.md)立了一份契约：所有 vLLM v1 模型都长成 embedding → N 层 decoder block → 末尾 norm，并以 Llama 作**最简基线**；之后几章接着把自定义算子、`torch.compile`、注意力后端拆开，[上一章](../../ch26-primer-quantization/narrative/chapter.md)又把量化数学（scale、zero-point、e8m0 块 scale）推到了底。今天这些全要用上。
 
 那一章结尾，我留了一句话没收：Llama **刻意缺**了四样东西——没有专家混合（MoE）、没有潜变量压缩注意力（MLA）、没有量化压缩、没有混合残差。这些「缺」是留白，是为了今天填上。
 
@@ -119,7 +119,7 @@ $$
 
 那个 2 是 K 和 V 各一份。头数多、维度大，KV cache 就吃显存——长上下文场景下，它常常比模型权重还大。
 
-MLA（Multi-head Latent Attention，多头潜变量注意力）的思路是：别缓存满血的 K/V，缓存一个**低秩潜变量**。`kv_lora_rank` 是该潜变量的维数（DeepSeek-V4 取 512），远小于 `n_heads × d_head` 的几千维。把 K/V 压到这个 `kv_lora_rank` 维，缓存这个压缩版；真正算注意力时再升回去。压缩比（缓存满血 K/V 的字节 ÷ 缓存潜变量的字节）大致是
+MLA（Multi-head Latent Attention，多头潜变量注意力，由 DeepSeek-V2 提出，arXiv:2405.04434）的思路是：别缓存满血的 K/V，缓存一个**低秩潜变量**。`kv_lora_rank` 是该潜变量的维数（DeepSeek-V4 取 512），远小于 `n_heads × d_head` 的几千维。把 K/V 压到这个 `kv_lora_rank` 维，缓存这个压缩版；真正算注意力时再升回去。压缩比（缓存满血 K/V 的字节 ÷ 缓存潜变量的字节）大致是
 
 $$
 \frac{2 \times n_{\mathrm{heads}} \times d_{\mathrm{head}}}{kv\_lora\_rank + qk\_rope\_head\_dim}
@@ -328,7 +328,7 @@ $$
 
 举个 DeepSeek 量级：256 个专家、每 token 选 8 个。那么每 token 只碰到 8/256 ≈ 3% 的路由专家参数。**参数量可以堆到几百 B，但每 token 的算力近似不变**——这就是 MoE 的核心权衡：用稀疏激活把模型容量做大，而不把单 token 的 FLOPs 做大。
 
-注意这和 MLA 省的不是一回事：MLA 省 **KV cache 显存**，MoE 省**每 token 算力**。两个 delta 各打各的痛点。
+注意这和 MLA 省的不是一回事：MLA 省 **KV cache 显存**，MoE 省**每 token 算力**。两个 delta 各打各的痛点。V4 用的这套「细粒度路由专家 + 一条共享专家」，正是 DeepSeek-V2/V3 定型的 DeepSeekMoE 设计（arXiv:2405.04434 / 2412.19437）。
 
 ### 27.3.2　gate + shared_experts：路由之外那条「dense 残留」
 
@@ -578,7 +578,7 @@ def hc_head(
 
 ### 27.5.1　_mtp_hidden_buffer：目标模型留给 draft 的隐状态
 
-Llama 末尾就一个 `lm_head`，`compute_logits` 出一个 token 的分布。V4 在这之外旁挂了一个 **MTP（Multi-Token Prediction，多 token 预测）** draft：训练时它多头预测后面 N 个 token，推理时它当**投机解码的 draft 模型**，一口气猜好几个 token，再由主模型批量验证（投机解码的协议是后面讲投机解码那章的主题，本章只交付 MTP 这个 draft 的接口）。
+Llama 末尾就一个 `lm_head`，`compute_logits` 出一个 token 的分布。V4 在这之外旁挂了一个 **MTP（Multi-Token Prediction，多 token 预测，作为训练目标由 DeepSeek-V3 提出，arXiv:2412.19437）** draft：训练时它多头预测后面 N 个 token，推理时它当**投机解码的 draft 模型**，一口气猜好几个 token，再由主模型批量验证（投机解码的协议是后面讲投机解码那章的主题，本章只交付 MTP 这个 draft 的接口）。
 
 draft 要工作，得拿到主模型的隐状态。但拿哪个版本？回看 §27.4.1：主模型在 **`hc_head` 之前**（即多流还没压回单流时）就 `copy_` 了一份到 `_mtp_hidden_buffer`：
 
@@ -694,7 +694,7 @@ elif "attn_sink" in name:
 
 三个装载特例，每个都对应一个 delta：
 
-1. **e8m0fnu 必须 `view(uint8)` 装入**（最微妙）：MXFP4 的量化 scale 存成 `float8_e8m0fnu`，但模型里那个参数是 `uint8`。如果直接 `copy_`，PyTorch 会做**数值转换**——把 `e8m0fnu` 当浮点数解释、再转成 uint8，比如 `2^-7` 会被算成 0，指数字节全毁。正确做法是 `view(torch.uint8)`：不动底层字节，只换个类型解释。注释里 `2^-7 → 0` 就是真实会发生的灾难。这是「量化作为 delta」最具体的一处工程坑——量化权重的字节得当原始字节搬，不能当数字搬。
+1. **e8m0fnu 必须 `view(uint8)` 装入**（最微妙）：MXFP4 的量化 scale 存成 `float8_e8m0fnu`（e8m0：8 位纯指数、0 尾数的块 scale 编码，[上一章](../../ch26-primer-quantization/narrative/chapter.md)推过它怎么被 `exp2∘ceil∘log2` 取整成 2 的幂），但模型里那个参数是 `uint8`。如果直接 `copy_`，PyTorch 会做**数值转换**——把 `e8m0fnu` 当浮点数解释、再转成 uint8，比如 `2^-7` 会被算成 0，指数字节全毁。正确做法是 `view(torch.uint8)`：不动底层字节，只换个类型解释。注释里 `2^-7 → 0` 就是真实会发生的灾难。这是「量化作为 delta」最具体的一处工程坑——量化权重的字节得当原始字节搬，不能当数字搬。
 
 2. **专家走 `expert_mapping` 多副本装载**：一个 checkpoint 里的专家权重名要映射到模型里切好的多个专家参数上，靠 `weight_loader` 带着 `expert_id`/`shard_id` 装。
 
