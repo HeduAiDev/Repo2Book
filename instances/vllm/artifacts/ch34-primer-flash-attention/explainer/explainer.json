@@ -1,0 +1,257 @@
+{
+  "chapter": "ch34-primer-flash-attention",
+  "note": "primer 原理章素材真相源。worked_example 的每个表格数字来自 explainer/traces/ 下驱动脚本 run_all.py 的真实运行输出(trace_source=run);figure-only 机制只提供 intuition + figure_specs。",
+  "mechanisms": [
+    {
+      "mechanism_id": "standard-attn-materialization",
+      "intuition": "算注意力像在一个巨大的体育馆(HBM,又大又慢)和一张小书桌(SRAM,又小又快)之间搬箱子。朴素做法把一张 N×N 的大表(每对 token 的打分)整张写回体育馆、再整张搬回书桌做 softmax、又写回去——真正的乘加运算很快就做完了,时间全耗在来回搬这张大表上。注意力慢在搬运,不在计算。",
+      "figure_specs": [
+        {
+          "figure_id": "fig34-1-memory-wall",
+          "template": "layout",
+          "claim": "标准注意力把两张 N×N 中间矩阵(S=QK^T、P=softmax(S))物化到慢速 HBM 再读回,访存量 Θ(N²) 主导 wall-clock——瓶颈在带宽不在算力。",
+          "numbers": [
+            {"value": "SRAM 19 TB/s / 192 KB per SM", "provenance": "arXiv:2205.14135 §2.1 (dossier.theory 内存带宽墙)"},
+            {"value": "HBM 1.5-2.0 TB/s / 40-80 GB", "provenance": "arXiv:2205.14135 §2.1 (dossier.theory 内存带宽墙)"},
+            {"value": "标准注意力 HBM 访问 Θ(Nd + N²)", "provenance": "arXiv:2205.14135 §3.2 Theorem 2"},
+            {"value": "三步各读写一次 N×N(S 写回、P 读+写、O)", "provenance": "flash_attention.py:L140-L147 hbm_accesses_standard"}
+          ],
+          "caption_draft": "GPU 内存层级:片上 SRAM 快 10× 但仅 192KB,片外 HBM 大 40-80GB 但慢 10×。标准注意力(Algorithm 0)把 N×N 的 S、P 物化到 HBM 往返三趟,访存量随 N² 增长——这是注意力的内存带宽墙,也是 FlashAttention 要拆掉的墙。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "online-softmax-recurrence",
+      "intuition": "老师批一摞卷子求相对分数,不必先翻遍全摞找最高分再回头算——可以边看边记两个数:当前见过的最高分 m,和一个按最高分归一的『累计分母』d。每来一张更高分的卷子,就把之前的累计按新旧最高分之差缩一下,再加上新卷子。看完最后一张,m 和 d 正好等于先扫三遍才能得到的结果。",
+      "worked_example": {
+        "params": {"x": "[1, 3, 2, 5]", "note": "4 元素单遍,含一次真实 rescale(j=4 时 max 从 3 跳到 5,旧 d 被 exp(3-5)=0.1353 缩小)"},
+        "trace_source": "run",
+        "trace_ref": "traces/online_softmax_recurrence.json",
+        "table": {
+          "columns": ["轮 j", "x_j", "m: 旧→新", "rescale = exp(m_old-m_new)", "d_before", "d_new"],
+          "rows": [
+            ["1", "1", "-inf → 1", "n/a (首元素)", "0", "1.0"],
+            ["2", "3", "1 → 3", "0.1353", "1.0", "1.1353"],
+            ["3", "2", "3 → 3 (max 不变)", "1.0", "1.1353", "1.5032"],
+            ["4", "5", "3 → 5 (max 跳升)", "0.1353", "1.5032", "1.2034"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "单遍递推的末值恒等于三遍 safe-softmax:m_V = max_k x_k 且 d_V = Σ_k exp(x_k - m_V)。running max m_j 是单调不减量。",
+        "argument": "对元素个数归纳。基例 j=1:m_1=x_1=max{x_1},d_1=exp(x_1-m_1)=1=Σ_{k≤1}exp(x_k-m_1)。归纳步:设处理完前 j-1 个后 m_{j-1}=max{x_1..x_{j-1}}、d_{j-1}=Σ_{k<j}exp(x_k-m_{j-1})。来 x_j:m_j=max(m_{j-1},x_j)=max{x_1..x_j};d_j = d_{j-1}·exp(m_{j-1}-m_j) + exp(x_j-m_j) = Σ_{k<j}exp(x_k-m_j) + exp(x_j-m_j) = Σ_{k≤j}exp(x_k-m_j)——rescale 项恰好把旧累计的基准从 m_{j-1} 平移到新 m_j。故不变式在每轮保持,末轮即得等价。m_j=max(m_{j-1},x_j)≥m_{j-1} 单调,有限元素必终止。trace 佐证:末值 d=1.2034 与 reference_three_pass 的 d_V=1.2034 一致,online 与 safe softmax 逐元素差 0.0。"
+      },
+      "quantified": "三遍 safe-softmax 对长度 N 的向量需 3N 次读(求 max、求和、算 y);online-softmax 把前两遍融成一遍,读次数从 3N 降到 2N(单遍求 (m,d) + 一遍算 y),额外内存 O(1)——只多存 m、d 两个标量。本例 N=4:三遍读 12 次 vs 两遍读 8 次。",
+      "figure_specs": [
+        {
+          "figure_id": "fig34-2-online-softmax-recurrence",
+          "template": "state-table",
+          "claim": "单遍扫描 [1,3,2,5],running (m,d) 每步演进,末值 (m=5, d=1.2034) 与三遍 safe-softmax 逐位相等。",
+          "numbers": [
+            {"value": "x = [1, 3, 2, 5]", "provenance": "traces/online_softmax_recurrence.json params.x"},
+            {"value": "j=2 rescale exp(1-3)=0.1353, d: 1.0→1.1353", "provenance": "traces/online_softmax_recurrence.json steps[1]"},
+            {"value": "j=4 rescale exp(3-5)=0.1353, d: 1.5032→1.2034", "provenance": "traces/online_softmax_recurrence.json steps[3]"},
+            {"value": "final m=5, d=1.2034 == three-pass d_V=1.2034", "provenance": "traces/online_softmax_recurrence.json final / reference_three_pass"}
+          ],
+          "caption_draft": "online-softmax 单遍递推:每列是处理一个新元素后的 (m,d)。关键在第 4 步——max 从 3 跳到 5,旧累计 d=1.5032 先被 exp(3-5)=0.1353 缩小再加新项,得 1.2034,与先扫三遍才能算出的归一化分母分毫不差。这就是分块 softmax 能成立的数学地基。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "online-softmax-merge-operator",
+      "intuition": "两个组分头统计各自的『最高分 + 归一累计』,谁也不用看对方的卷子。汇总时只需把两组的 (max, 累计) 用一个固定公式 ⊕ 合并一次,结果和一个人从头扫完整摞完全一样。因为这个合并满足结合律、交换律,先合谁后合谁、并行分几路都不影响答案——这正是 FlashAttention 能把注意力切块、cascade 能把两段拼起来的许可证。",
+      "worked_example": {
+        "params": {"x": "[1, 3, 2, 5]", "block_size": "2", "note": "切成 A=[1,3]、B=[2,5] 两块,各算局部 (m,d) 再 ⊕ 合并;并验证 A⊕B == B⊕A == 单遍 == 三遍"},
+        "trace_source": "run",
+        "trace_ref": "traces/online_softmax_merge_operator.json",
+        "table": {
+          "columns": ["子块 / 操作", "m", "d"],
+          "rows": [
+            ["块 A=[1,3] 局部", "3", "1.1353"],
+            ["块 B=[2,5] 局部", "5", "1.0498"],
+            ["A ⊕ B", "5", "1.2034"],
+            ["B ⊕ A (交换)", "5", "1.2034"],
+            ["单遍遍历整段", "5", "1.2034"],
+            ["三遍 safe 参照", "5", "1.2034"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "⊕ 满足结合律与交换律,故任意分块 / 任意合并顺序 / 并行归并所得 (m,d) 唯一,且等于单遍遍历全序列的结果。",
+        "argument": "⊕ 的 max 分量:max 本身结合且交换。d 分量:合并到公共 max M=max(m_i,m_j) 后,d_i·exp(m_i-M)+d_j·exp(m_j-M) 是把两个『相对各自 max 的累计』先换算到同一基准 M 再相加——加法结合且交换,基准换算 exp(·) 与配对无关,故整体结合+交换。三块 (a⊕b)⊕c=a⊕(b⊕c) 同理可验。trace 佐证:A⊕B、B⊕A、单遍、三遍参照四者的 d 全为 1.2034,combine_blocks_via_merge 亦得 1.2034——合并顺序不改变结果。",
+        "argument_short": "结合律+交换律 ⇒ 分块合并与遍历顺序无关。"
+      },
+      "quantified": "P 个分块并行:各块独立算局部 (m,d) 耗时 O(N/P),再 O(log P) 步 tree-reduce 用 ⊕ 归并——总深度 O(N/P + log P)。本例 P=2:两块各扫 2 元素,1 次 ⊕ 合并;合并把两个基准(max=3 与 max=5)统一到 5,旧块 A 的 d=1.1353 被 exp(3-5)=0.1353 缩小后并入,得 1.2034。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "flashattention-tiling",
+      "intuition": "把注意力的大矩阵切成小方块,只把当前这一小块搬上书桌(SRAM)算。手里始终攥着三个 running 量:见过的最高分 m、归一累计 l、和当前的加权输出 O。每处理完一个 KV 块,就用 online-softmax 那套『按新旧 max 之差缩放』的手法把 O 更新到新基准——那张 N×N 的完整打分表从头到尾没在慢速 HBM 里落过地。",
+      "worked_example": {
+        "params": {"seq_len": "4", "d": "2", "block_r": "2", "block_c": "2", "tracked_query_row": "0", "note": "2×2 分块,追踪 query 行 0 的 (m_i,l_i,O_i) 随两个 KV 列块演进,末值对照标准 softmax(QK^T)V"},
+        "trace_source": "run",
+        "trace_ref": "traces/flashattention_tiling.json",
+        "table": {
+          "columns": ["KV 块 j", "局部 m~ / l~", "m_i 新", "l_i 新", "O_i 新", "对照标准 softmax"],
+          "rows": [
+            ["1", "m~=0.7071, l~=1.4931", "0.7071", "1.4931", "[0.6698, 0.3302]", "(未完)"],
+            ["2", "m~=0.7071, l~=2.0", "0.7071", "3.4931", "[0.8588, 0.7137]", "[0.8588, 0.7137]"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "Theorem 1:分块递推的输出精确等于 softmax(QK^T)V;且过程中局部块 S_ij 至多 Br×Bc,从不物化 N×N。",
+        "argument": "每个 KV 块 j 对 running (m_i,l_i,O_i) 的更新与 online-softmax ⊕ 同构:m_i^new=max(m_i,m~_ij);未归一化输出 = l_i·exp(m_i-m_i^new)·O_i + exp(m~_ij-m_i^new)·(P~_ij V_j),再除 l_i^new 归一。由 merge-operator 机制的结合律,逐块累加等于对整行一次性 softmax。基例:首块 m_i=-inf,退化为局部 softmax。归纳步:第 j 块把基准从旧全局 max 平移到 max(旧,本块),O_i 随之 rescale——与 recurrence 机制的 d 递推同一套代数。trace 佐证:O_row_after_tiling=[0.8588,0.7137] == O_row_standard_softmax == O_row_flash_full_impl,且 max_local_block_shape=[2,2] < full_NxN_would_be=[4,4]。m_i 单调不减 ⇒ Tc 块有限步终止。",
+        "argument_short": "每块 rescale-accumulate 与 ⊕ 同构,结合律保证逐块 == 一次性 softmax;局部块 ≤ Br×Bc。"
+      },
+      "quantified": "N×N 打分表元素数 = 4×4 = 16;分块后单个 (i,j) 块最大 Br×Bc = 2×2 = 4 个元素(trace max_local_block_shape=[2,2])——片上一次只需 hold 1/4 张表。推广到 N=1024、块 128×128:完整表 1,048,576 元素,单块 16,384 元素,仅 1/64,可完全放进 SRAM。额外 HBM 内存只需 O(N) 存 running (m,l,O),而非 O(N²) 存 S/P。",
+      "figure_specs": [
+        {
+          "figure_id": "fig34-3-tiling-recurrence",
+          "template": "tiling",
+          "claim": "4×4 注意力切成 2×2 块;query 行 0 沿两个 KV 块用 rescale-accumulate 更新 (m,l,O),末值 [0.8588,0.7137] 与标准 softmax 逐位相等,期间最大局部块仅 2×2。",
+          "numbers": [
+            {"value": "seq_len=4, d=2, 分块 2×2", "provenance": "traces/flashattention_tiling.json params"},
+            {"value": "KV 块1 后 O_row=[0.6698,0.3302], l=1.4931", "provenance": "traces/flashattention_tiling.json steps[0]"},
+            {"value": "KV 块2 后 O_row=[0.8588,0.7137], l=3.4931", "provenance": "traces/flashattention_tiling.json steps[1]"},
+            {"value": "对照标准 softmax O_row=[0.8588,0.7137]", "provenance": "traces/flashattention_tiling.json O_row_standard_softmax"},
+            {"value": "最大局部块 [2,2] < 完整 [4,4]", "provenance": "traces/flashattention_tiling.json max_local_block_shape / full_NxN_would_be"}
+          ],
+          "caption_draft": "FlashAttention 分块递推:外层遍历 KV 列块,query 行 0 的 running (m,l,O) 每步被 rescale-accumulate 更新。处理完第 2 个 KV 块后 O=[0.8588,0.7137],与一次性 softmax(QK^T)V 分毫不差——而全过程手里最大只有一个 2×2 的局部块,4×4 的完整打分表从未落到 HBM。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "io-complexity-accounting",
+      "intuition": "衡量注意力的成本别数它做了多少次乘加,要数它往慢速仓库(HBM)搬了多少箱货。标准做法要把那张 N×N 大表搬进搬出好几趟——箱数随 N² 疯长;FlashAttention 把 K、V 切成能塞进书桌的块,每块只把整个 Q 过一遍,搬运量正比于 N²d²/M。d 一般只有 64-128,而书桌 M 有十万个格子,d² 远小于 M,于是搬运量少了好几倍。",
+      "worked_example": {
+        "params": {"d": "64", "sram_M_elems": "25600", "block_c": "100", "note": "~100KB SRAM(fp32≈25600 元素),按参考实现的元素级访存计数,对比 N=1024/2048/4096"},
+        "trace_source": "run",
+        "trace_ref": "traces/io_complexity_accounting.json",
+        "table": {
+          "columns": ["N (序列长)", "标准 HBM 访问(元素)", "FlashAttn HBM 访问(元素)", "比值 标准/Flash"],
+          "rows": [
+            ["1024", "4456448", "2338816", "1.91"],
+            ["2048", "17301504", "8691712", "1.99"],
+            ["4096", "68157440", "33439744", "2.04"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "标准注意力含 Θ(N²) 的物化项,FlashAttention 无该项;两者比值随 N 增大而单调上升(N² 主导项被消去的收益随序列变长而放大)。",
+        "argument": "标准:Algorithm 0 三步各读写一次 N×N,访存 = Θ(Nd + N²),N 大时 N² 主导。Flash:外层每个 KV 块只搬一次 K,V(合计 Θ(Nd)),内层对每个 KV 块把整个 Q,O,l,m 重扫一遍,共 Tc=⌈N/Bc⌉ 遍,每遍 Θ(Nd) ⇒ Θ(N·d·N/Bc)=Θ(N²d/Bc)=Θ(N²d²/M)(因 Bc∝M/d)。当 d²≪M(d=64⇒d²=4096,M=25600)时 Flash 项系数更小。trace 佐证:比值 1.91→1.99→2.04 随 N=1024→2048→4096 单调增——标准的 N² 项增速快于 Flash。",
+        "argument_short": "标准 Θ(N²) 物化项被 Flash 消去;比值随 N 单调上升(1.91→2.04)。"
+      },
+      "quantified": "本参考模型按元素级访存精确计数:N=1024、d=64 时标准 4,456,448 vs Flash 2,338,816,省 47.5%(≈1.91×);N=4096 升到 2.04×。论文图 2 报告的 wall-clock 加速可达 9×——差距来自本模型只数元素搬运数,而真实收益还叠加了 softmax/mask/dropout 这些 memory-bound 算子被融进单 kernel、以及 kernel 启动与中间张量分配的消除。趋势一致:消去 N² 物化项,序列越长越赚。",
+      "figure_specs": [
+        {
+          "figure_id": "fig34-4-io-accounting",
+          "template": "state-table",
+          "claim": "d=64、SRAM≈100KB 下,标准注意力的 HBM 访存随 N² 增长而 FlashAttention 消去了 N² 物化项,比值从 N=1024 的 1.91× 升到 N=4096 的 2.04×。",
+          "numbers": [
+            {"value": "d=64, SRAM M≈25600 元素, block_c=100", "provenance": "traces/io_complexity_accounting.json params"},
+            {"value": "N=1024: 标准 4456448 vs Flash 2338816 (1.91×)", "provenance": "traces/io_complexity_accounting.json rows[0]"},
+            {"value": "N=2048: 标准 17301504 vs Flash 8691712 (1.99×)", "provenance": "traces/io_complexity_accounting.json rows[1]"},
+            {"value": "N=4096: 标准 68157440 vs Flash 33439744 (2.04×)", "provenance": "traces/io_complexity_accounting.json rows[2]"},
+            {"value": "标准 Θ(Nd+N²) vs Flash Θ(N²d²/M)", "provenance": "arXiv:2205.14135 §3.2 Theorem 2"}
+          ],
+          "caption_draft": "IO 复杂度账(元素级访存计数):标准注意力(含 N×N 物化)访存随 N² 暴涨,FlashAttention 把 K,V 切块只让 Q 过 ⌈N/Bc⌉ 遍,消去了 N² 项。比值随 N 增大——1.91×→1.99×→2.04×,序列越长越赚。真实 wall-clock 收益(论文图 2 达 9×)更大,因还叠加了算子融合与中间张量消除。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "fa2-loop-order-warp",
+      "intuition": "FA-2 是 FlashAttention 的工程调优版,三处小改把同一份数学榨得更快:(1) 把外层循环从『遍历 KV』换成『遍历 Q 行块』,于是不同 Q 行块能分给不同的线程块并行,长序列时 GPU 更不闲;(2) 中间输出先不急着除归一因子,攒到最后除一次,省下昂贵的非矩阵乘运算;(3) 只存一个 logsumexp 标量 L=m+log(l),而不是 (m,l) 两个数。合起来比初版快约 2 倍。",
+      "figure_specs": [
+        {
+          "figure_id": "fig34-5-fa1-vs-fa2",
+          "template": "before-after",
+          "claim": "FA-2 相对 FA 的三处改进:外层循环 KV→Q 行块(序列并行)、中间 O 不每步归一(减非矩阵乘 FLOP)、只存 L=m+log(l),warp 分工 split-K→split-Q。",
+          "numbers": [
+            {"value": "FA 外层遍历 K,V 块 / FA-2 外层遍历 Q 行块", "provenance": "arXiv:2307.08691 §3.1 Algorithm 1 (paper-fa2.md:L164-L200)"},
+            {"value": "FA-2 只在收尾除一次 l(非每步)", "provenance": "arXiv:2307.08691 §3.1.1 (paper-fa2.md:L146-L147)"},
+            {"value": "只存 logsumexp L=m+log(l) 一个标量", "provenance": "arXiv:2307.08691 §3.1.1 (paper-fa2.md:L192-L193)"},
+            {"value": "non-matmul FLOP 在 A100 上比 matmul 贵约 16×", "provenance": "arXiv:2307.08691 §3.1 (dossier.theory fa2)"},
+            {"value": "warp 分工 split-K → split-Q,免 shared-memory 通信", "provenance": "arXiv:2307.08691 §3.3 (dossier.theory fa2)"},
+            {"value": "综合约 2× 于 FA", "provenance": "arXiv:2307.08691 §4 (dossier.theory fa2)"}
+          ],
+          "caption_draft": "FlashAttention → FlashAttention-2 的三处改进对照:循环序对调让 Q 行块跨线程块沿序列长度并行(长序列 occupancy 更高);中间 O 保持未归一化、收尾只除一次 l,削减昂贵的 non-matmul FLOP;只存 L=m+log(l) 一个标量;warp 分工从 split-K 改为 split-Q 免去 warp 间共享内存通信。vLLM 依赖的正是这个 FA-2/FA-3 变体。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "lse-merge",
+      "intuition": "两段注意力各自算完,分别交出『部分输出 O 和一张归一化收据 lse(=log 归一因子)』。合并时看谁的收据金额大(max lse),以它为基准把两张收据换算成占比权重,按权重把两段输出加权平均——得到的结果和把两段的 KV 拼起来一次性算注意力分毫不差。收据(lse)本身也能按同样规则合并,于是可以一段段接力拼下去。",
+      "worked_example": {
+        "params": {"num_query_tokens": "2", "d": "2", "prefix_kv_len": "2", "suffix_kv_len": "2", "note": "共享前缀段(causal=False)+ 私有后缀段(causal=True)各算 (O,lse),merge_lse_states 合并,对照拼接 KV 一次性注意力"},
+        "trace_source": "run",
+        "trace_ref": "traces/lse_merge.json",
+        "table": {
+          "columns": ["token", "前缀 (O, lse)", "后缀 (O, lse)", "合并 O", "对照一次性 O"],
+          "rows": [
+            ["0", "([0.5, 0.5], 1.4003)", "([2.0, 0.0], 0.3536)", "[0.8898, 0.3701]", "[0.8898, 0.3701]"],
+            ["1", "([0.8044, 0.1956], 0.9247)", "([0.825, 1.175], 1.239)", "[0.8163, 0.7616]", "[0.8163, 0.7616]"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "对两段部分注意力做 LSE 合并,输出逐位等于对拼接后 KV 一次性做的精确注意力;合并后的 lse 也等于整体的 logsumexp。",
+        "argument": "设段 a、b 各自 softmax 归一因子为 Za=exp(lse_a)、Zb=exp(lse_b),部分输出 O_a=(Σ_a p·v)/Za。整体输出 = (Σ_a p·v + Σ_b p·v)/(Za+Zb) = (Za·O_a+Zb·O_b)/(Za+Zb) = w_a·O_a+w_b·O_b,其中 w_a=Za/(Za+Zb)=e^{lse_a-M}/(e^{lse_a-M}+e^{lse_b-M})(M=max(lse_a,lse_b) 稳定化,两个 exp 都 ≤1 不溢出)。这正是 ⊕ 算子作用在 (lse,output) 上(lse=log d,加权对应 log 域的 max+相加)。合并 lse=log(e^{lse_a-M}+e^{lse_b-M})+M=log(Za+Zb)。基例:一段为空(lse=-inf,权重 0)则退化为另一段。trace 佐证:两 token 的合并 O 与 O_reference_oneshot 完全一致,max_abs_diff_merged_vs_reference=0.0。",
+        "argument_short": "整体归一因子 Za+Zb 可拆成两段加权,权重=各段 lse 的 softmax;⊕ 结合律 ⇒ 逐位精确,trace 差 0.0。"
+      },
+      "quantified": "token 0:前缀 lse=1.4003、后缀 lse=0.3536,M=1.4003;权重 w_pre=e^0/(e^0+e^{0.3536-1.4003})=e^0/(1+e^{-1.0467})≈0.7405,w_suf≈0.2595;合并 O=0.7405·[0.5,0.5]+0.2595·[2.0,0.0]=[0.8898,0.3701],与一次性参照的 [0.8898,0.3701] 逐位相等,合并 lse=1.7012。两段合并只需 O(d) 计算 + 每 token 2 个标量 lse,远小于重算前缀注意力。",
+      "figure_specs": [
+        {
+          "figure_id": "fig34-6-lse-merge",
+          "template": "flow",
+          "claim": "两段部分注意力 (O_pre,lse_pre) 与 (O_suf,lse_suf) 经 max-稳定化的 LSE 加权合并,输出与对拼接 KV 一次性注意力逐位相等(误差 0.0)。",
+          "numbers": [
+            {"value": "token0 前缀 (O=[0.5,0.5], lse=1.4003)", "provenance": "traces/lse_merge.json rows[0]"},
+            {"value": "token0 后缀 (O=[2.0,0.0], lse=0.3536)", "provenance": "traces/lse_merge.json rows[0]"},
+            {"value": "token0 合并 O=[0.8898,0.3701], lse=1.7012", "provenance": "traces/lse_merge.json rows[0]"},
+            {"value": "token0 一次性参照 O=[0.8898,0.3701]", "provenance": "traces/lse_merge.json rows[0]"},
+            {"value": "合并 vs 参照 最大逐位误差 0.0", "provenance": "traces/lse_merge.json max_abs_diff_merged_vs_reference"}
+          ],
+          "caption_draft": "LSE 合并(merge_attn_states 的数学原型):两段各交出部分输出 O 与 logsumexp lse。以 max_lse 稳定化后按 e^{lse-max} 求两段权重,加权合并 O,并输出合并 lse=log(Σe^{lse-max})+max。token 0 的合并结果 [0.8898,0.3701] 与对拼接 KV 一次性做注意力完全相等——这就是 cascade attention 拆前缀/后缀两段却不损精度的正确性保证。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "fa-varlen-call-surface",
+      "intuition": "vLLM 不自己写 FlashAttention 的 CUDA kernel,而是把它当黑盒 import,喂给它一份『打平的变长批次 + 分页 KV 缓存的块表』。一次调用就吃下整批 prefill+decode:所有序列首尾相接拍平成一个长张量,用一个前缀和数组 cu_seqlens 标出每条序列的边界;seqused_k 和 block_table 指向分页的 KV 缓存。想拿 logsumexp 回来做合并,就把 return_softmax_lse 打开。",
+      "figure_specs": [
+        {
+          "figure_id": "fig34-7-varlen-call-surface",
+          "template": "state-table",
+          "claim": "flash_attn_varlen_func 的调用面:q/k/v 变长打平 (total,nheads,headdim) + cu_seqlens 前缀和切序列 + block_table 指分页 KV + causal/scale/window/softcap/return_softmax_lse 语义。",
+          "numbers": [
+            {"value": "q/k/v 形状 (total_tokens, nheads, headdim)", "provenance": "flash_attn_interface.py:L176-L209 (dossier.embed_excerpts)"},
+            {"value": "cu_seqlens_q 长度 = batch+1(前缀和)", "provenance": "flash_attn_interface.py:L232-L241 (dossier.design_decisions varlen)"},
+            {"value": "softmax_scale 默认 1/sqrt(headdim)", "provenance": "flash_attn_interface.py:L176-L209 (dossier.embed_excerpts)"},
+            {"value": "softmax_lse 形状 (nheads, total_q) = 每行 QK^T·scale 的 logsumexp", "provenance": "flash_attn_interface.py:L256-L261 (dossier.embed_excerpts)"},
+            {"value": "主路径 L809-L832 一次调用吃整批 prefill+decode", "provenance": "vllm/v1/attention/backends/flash_attn.py:L809-L832 (dossier.embed_excerpts)"}
+          ],
+          "caption_draft": "flash_attn_varlen_func 的调用面(全书此前把 FA 当黑盒的那一行掀开):q/k/v 把不等长序列首尾相接打平成 (total,nheads,headdim),cu_seqlens_q 前缀和切分每条序列,seqused_k+block_table 指向分页 KV 缓存;causal/softmax_scale/window_size/softcap 控制掩码与缩放,return_softmax_lse 吐出 FA-2 存的 L 供 cascade/split-KV 合并。回指注意力章(ch24)。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "cascade-shared-prefix",
+      "intuition": "一批请求共享同一段长系统提示(前缀)时,与其为每条请求把这段前缀的注意力重算一遍,不如只算一遍前缀段(所有 query 都能看,causal=False),再各自算私有后缀段(causal=True),最后用 LSE 合并把两段拼成精确结果。前缀算一次、复用给全批——这是把 LSE 合并原理放进 vLLM 真实调用现场的落地。",
+      "figure_specs": [
+        {
+          "figure_id": "fig34-8-cascade",
+          "template": "swimlane",
+          "claim": "cascade attention 把共享前缀请求拆成前缀段(causal=False,算一遍复用)+ 后缀段(causal=True,私有),两段各 return_softmax_lse=True,再 merge_attn_states 合并成精确输出。",
+          "numbers": [
+            {"value": "前缀段 causal=False, block_table[:1], return_softmax_lse=True", "provenance": "vllm/v1/attention/backends/flash_attn.py:L1185-L1236 (dossier.embed_excerpts)"},
+            {"value": "后缀段 causal=True, block_table[:, num_common_kv_blocks:], return_softmax_lse=True", "provenance": "vllm/v1/attention/backends/flash_attn.py:L1185-L1236 (dossier.embed_excerpts)"},
+            {"value": "merge_attn_states(output, prefix_output, prefix_lse, suffix_output, suffix_lse)", "provenance": "vllm/v1/attention/backends/flash_attn.py:L1234-L1236 (dossier.embed_excerpts)"},
+            {"value": "合并结果与不拆分的精确注意力逐位相等(见 lse-merge trace 误差 0.0)", "provenance": "traces/lse_merge.json max_abs_diff_merged_vs_reference"}
+          ],
+          "caption_draft": "cascade attention 的两段泳道:上道前缀段(causal=False)对全批共享前缀只算一遍;下道后缀段(causal=True)各请求算私有 KV。两段各带 softmax_lse,汇入 merge_attn_states 合并——正是 LSE 合并(⊕ 算子)在推理期的直接应用,结果与逐请求整体注意力逐位相等。"
+        }
+      ]
+    }
+  ]
+}
