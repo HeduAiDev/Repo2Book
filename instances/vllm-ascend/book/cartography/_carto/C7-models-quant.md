@@ -41,7 +41,7 @@ vllm-ascend = vLLM 的 OOT 平台插件（昇腾 NPU 顶替 CUDA）。
 ## 教学价值排序
 
 - **高**：quantization 三层接入范式（registry+adapter+ABC scheme）、sample 的 multinomial 规避 + Triton 回退、LoRA 的全局类替换 trick——都是 OOT 插件"如何无侵入顶替 CUDA"的范式样本。
-- **中**：spec_decode 工厂分发 + 薄壳继承模式（巨无霸 llm_base_proposer 只挑骨架讲，全讲会失焦）；deepseek_v4 作为昇腾特化模型唯一样本，可与 vLLM ch25 对位讲"同一个 DeepSeek-V4 在 NPU 上改了哪些 layer/op"。
+- **中**：spec_decode 工厂分发 + 薄壳继承模式（巨无霸 llm_base_proposer 只挑骨架讲，全讲会失焦）；deepseek_v4 作为昇腾特化模型唯一样本，可与 vLLM ch27 对位讲"同一个 DeepSeek-V4 在 NPU 上改了哪些 layer/op"。
 - **低（建议略或一笔带过）**：model_loader 的 netloader/rfork（弹性加载/fork 冷启动，是部署优化，偏离推理主线，且 2.2k 行很专门）、profiler（106 行封装）、model_executor offloader。
 
 ## 建议章节（2–4 章；按主题不按目录）
@@ -63,7 +63,7 @@ vllm-ascend = vLLM 的 OOT 平台插件（昇腾 NPU 顶替 CUDA）。
 - deps：vLLM 采样/rejection sampling 机制（ch27/ch28）、NPU stream/Triton 背景
 
 ### Ch-C（可选，建议并入或轻量）《模型与 LoRA 的昇腾接入：注册、类替换、自定义算子》
-- focus：`ModelRegistry.register_model` 注 DeepseekV4/MTP（昇腾唯一特化模型，挑改动 layer 与 vLLM ch25 对位）；LoRA 的 `PunicaWrapperNPU` device 分支选 ops + `refresh_all_lora_classes` 追加进 `_all_lora_classes` 全局元组的类替换 trick + `torch.ops._C_ascend` 自定义算子薄壳。可顺带一笔 model_loader 的 `@register_model_loader` 扩展点（netloader/rfork 不深讲）。
+- focus：`ModelRegistry.register_model` 注 DeepseekV4/MTP（昇腾唯一特化模型，挑改动 layer 与 vLLM ch27 对位）；LoRA 的 `PunicaWrapperNPU` device 分支选 ops + `refresh_all_lora_classes` 追加进 `_all_lora_classes` 全局元组的类替换 trick + `torch.ops._C_ascend` 自定义算子薄壳。可顺带一笔 model_loader 的 `@register_model_loader` 扩展点（netloader/rfork 不深讲）。
 - key_source_paths：`vllm_ascend/models/{__init__.py,deepseek_v4.py(挑差异)}`、`vllm_ascend/lora/{punica_npu.py,lora_ops.py,utils.py}`、`vllm_ascend/model_loader/netloader/netloader.py:38`（仅扩展点）
 - pairs_with：`vllm/model_executor/models/deepseek_v2`、`vllm/lora/punica_wrapper/`、`vllm/model_executor/model_loader/` → vLLM 书 ch22《Model Definitions and Weight Loading》+ ch25《DeepSeek-V4》
 - teach_value：中。LoRA 全局类替换 trick 是亮点；model_loader 建议略。

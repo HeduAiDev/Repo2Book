@@ -1,0 +1,225 @@
+{
+  "kind": "primer",
+  "chapter": "ch24-primer-flash-attention",
+  "title": "【原理篇·论文精读】FlashAttention:从 online-softmax 到 IO-aware 注意力",
+  "one_line": "为什么朴素注意力慢在 N×N 中间矩阵的 HBM 读写而不在算力——online-softmax 让 softmax 可分块递推,FlashAttention 用 tiling 免物化把注意力融成一个 kernel,IO 从 O(N²) 降到 O(N²d²/M);落到 vLLM 就是 flash_attn_varlen_func 与 merge_attn_states(LSE 合并)。",
+  "papers": {
+    "fa": {"id": "arXiv:2205.14135", "title": "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness", "file": "book/papers/ch24-primer-flash-attention/paper.md"},
+    "online_softmax": {"id": "arXiv:1805.02867", "title": "Online normalizer calculation for softmax", "file": "book/papers/ch24-primer-flash-attention/paper-online-softmax.md"},
+    "fa2": {"id": "arXiv:2307.08691", "title": "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning", "file": "book/papers/ch24-primer-flash-attention/paper-fa2.md"}
+  },
+
+  "code_spine": [
+    "vllm/v1/attention/backends/fa_utils.py:L18-L53  (平台分派:CUDA 取 vllm.vllm_flash_attn.flash_attn_varlen_func / XPU 取 xpu_ops / ROCm 取 upstream flash_attn——vLLM 把 FA kernel 当黑盒 import)",
+    "vllm/vllm_flash_attn/flash_attn_interface.py:L176-L261  (flash_attn_varlen_func 的形参与返回语义:varlen 打包 + paged block_table + return_softmax_lse)",
+    "vllm/v1/attention/backends/flash_attn.py:L809-L832  (非 cascade 主路径:一次 flash_attn_varlen_func 调用吃下整批 prefill+decode)",
+    "vllm/v1/attention/backends/flash_attn.py:L1145-L1236  (cascade_attention:共享前缀跑一遍、各 query 后缀跑一遍,两段各带 LSE)",
+    "vllm/v1/attention/ops/merge_attn_states.py:L9-L103  (merge_attn_states 分派:CUDA 自定义 kernel / 否则 Triton)",
+    "vllm/v1/attention/ops/triton_merge_attn_states.py:L57-L175  (LSE 合并的 Triton kernel——online-softmax ⊕ 算子的落地实现)"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "arXiv:1805.02867 §3 Algorithm 3 (online-softmax; paper-online-softmax.md:L91-L109)",
+      "lines": "Alg.3 L4-L5",
+      "code": "m_j  <- max(m_{j-1}, x_j)\nd_j  <- d_{j-1} * exp(m_{j-1} - m_j) + exp(x_j - m_j)\n... (after full pass)\ny_i  <- exp(x_i - m_V) / d_V",
+      "elide": ["原文用下标 m_0=-inf, d_0=0 初始化;第二个 for 循环算 y_i 的部分与递推无关,只展示 running max/sum 递推本身"],
+      "note": "单次遍历同时维护 running max m 与 rescaled running sum d;每来一个新元素,先把旧的 d 按新旧 max 之差 exp(m_{j-1}-m_j) 缩放,再加上新项——这就是 FlashAttention 分块 softmax 的数学地基。"
+    },
+    {
+      "path": "arXiv:1805.02867 §3.1 Eq.4 (⊕ 算子; paper-online-softmax.md:L159-L170)",
+      "lines": "Eq.4",
+      "code": "[m_i; d_i] ⊕ [m_j; d_j] = [ max(m_i, m_j);\n                            d_i*exp(m_i - max(m_i,m_j)) + d_j*exp(m_j - max(m_i,m_j)) ]",
+      "elide": [],
+      "note": "把 running (max, sum) 抽象成一个二元算子 ⊕;论文证明它满足结合律+交换律,故可并行/乱序归并——两段注意力的 LSE 合并(merge_attn_states)就是这个 ⊕ 作用在 (LSE, output) 上。"
+    },
+    {
+      "path": "arXiv:2205.14135 §3.1 Algorithm 1 (FlashAttention forward; paper.md:L128-L162)",
+      "lines": "Alg.1 L10-L13",
+      "code": "S_ij  = Q_i K_j^T                       # on chip, [Br x Bc]\nm~_ij = rowmax(S_ij);  P~_ij = exp(S_ij - m~_ij);  l~_ij = rowsum(P~_ij)\nm_i^new = max(m_i, m~_ij)\nl_i^new = exp(m_i - m_i^new)*l_i + exp(m~_ij - m_i^new)*l~_ij\nO_i <- diag(l_i^new)^{-1} * ( diag(l_i)*exp(m_i - m_i^new)*O_i\n                             + exp(m~_ij - m_i^new)*P~_ij*V_j )",
+      "elide": ["Alg.1 L1-L8 的分块尺寸 Bc=ceil(M/4d)、Br=min(ceil(M/4d),d)、HBM 初始化 O/l/m 与 K,V/Q 的分块 load,是访存脚手架;此处只保留 running (m,l,O) 递推核心"],
+      "note": "原始 FA 的循环序:外层 j 遍历 K,V 块,内层 i 遍历 Q 块。每个 (i,j) 块局部算 softmax,再用与 online-softmax 完全一致的 exp(旧max-新max) 缩放把 O_i、l_i 更新到新的全局 max——从不物化整张 N×N 的 S/P。"
+    },
+    {
+      "path": "arXiv:2205.14135 §3.2 Theorem 2 (IO complexity; paper.md:L174-L180)",
+      "lines": "Thm.2",
+      "code": "Standard attention:      Θ(N d + N^2)      HBM accesses\nFlashAttention:          Θ(N^2 d^2 M^{-1}) HBM accesses",
+      "elide": [],
+      "note": "证明骨架:SRAM 大小 M 每次装下 Θ(M) 的 K,V 块,共 Θ(Nd/M) 个块;每块要把整个 Q(Θ(Nd) 元素)过一遍 => Θ(N²d²/M) 次 HBM 访问。典型 d=64-128、M≈100KB 时 d² << M,故比标准实现的 Θ(N²) 少很多倍(论文图 2 达 9×)。"
+    },
+    {
+      "path": "arXiv:2307.08691 §3.1 Algorithm 1 (FlashAttention-2 forward; paper-fa2.md:L164-L200)",
+      "lines": "Alg.1 L3-L13",
+      "code": "for 1<=i<=Tr:                       # 外层改成遍历 Q 的行块(与 FA 相反)\n  init O_i=0, l_i=0, m_i=-inf\n  for 1<=j<=Tc:                     # 内层遍历 K,V 列块\n    S_i^j = Q_i K_j^T\n    m_i^j = max(m_i^{j-1}, rowmax(S_i^j))\n    P~_i^j = exp(S_i^j - m_i^j)\n    l_i^j  = exp(m_i^{j-1}-m_i^j)*l_i^{j-1} + rowsum(P~_i^j)\n    O_i^j  = diag(exp(m_i^{j-1}-m_i^j))^{-1} * O_i^{j-1} + P~_i^j V_j   # 不每步除 l\n  O_i = diag(l_i^{Tc})^{-1} * O_i^{Tc}       # 只在最后除一次\n  L_i = m_i^{Tc} + log(l_i^{Tc})             # 只存 logsumexp",
+      "elide": ["backward(Alg.2)、warp 分工示意图(Fig.3)不在正文推导范围,一节带过"],
+      "note": "FA-2 三处改进:(1) 循环序对调——外层 Q 行块可跨 thread block 并行(嵌入维度序列长度并行),(2) 中间 O 保持未归一化,只在收尾除一次 l => 减少 non-matmul FLOP,(3) 只存 L=m+log(l) 一个量而非 (m,l) 两个;warp 分工从 split-K 改为 split-Q 免 shared-memory 通信。"
+    },
+    {
+      "path": "vllm/vllm_flash_attn/flash_attn_interface.py",
+      "lines": "L176-L209, L256-L261",
+      "code": "def flash_attn_varlen_func(\n    q, k, v,\n    max_seqlen_q, cu_seqlens_q, max_seqlen_k,\n    cu_seqlens_k=None,        # only used for non-paged prefill\n    seqused_k=None,\n    softmax_scale=None,       # default 1/sqrt(headdim)\n    causal=False,\n    window_size=None,         # (left,right) sliding window\n    softcap=0.0,\n    block_table=None,         # paged KV cache 的块表\n    return_softmax_lse=False,\n    out=None,\n    fa_version=DEFAULT_FA_VERSION,\n    ...):\n    # Return:\n    #   out: (total, nheads, headdim)\n    #   softmax_lse [if return_softmax_lse]: (nheads, total_q_seqlen)\n    #       = logsumexp of each row of QK^T*scale (log of softmax 归一化因子)",
+      "elide": ["dropout_p/alibi_slopes/deterministic/q_descale,k_descale,v_descale(FP8)/scheduler_metadata(FA3)/cp_* 等参数,推理主路径基本不用或走默认"],
+      "note": "varlen = variable length:q 形状 (total_q, nheads, headdim) 把整批不等长序列首尾相接打平,用 cu_seqlens_q(前缀和,batch+1 长)切分;seqused_k + block_table 指向 paged KV cache。return_softmax_lse 是把 FA-2 存的 L 吐出来给 cascade/split-KV 合并用的关键开关。"
+    },
+    {
+      "path": "vllm/v1/attention/backends/flash_attn.py",
+      "lines": "L809-L832",
+      "code": "flash_attn_varlen_func(\n    q=query[:num_actual_tokens],\n    k=key_cache,\n    v=value_cache,\n    out=output[:num_actual_tokens],\n    cu_seqlens_q=cu_seqlens_q,\n    max_seqlen_q=max_seqlen_q,\n    seqused_k=seqused_k,\n    max_seqlen_k=max_seqlen_k,\n    softmax_scale=self.scale,\n    causal=attn_metadata.causal,\n    window_size=sliding_window_size,\n    block_table=block_table,\n    softcap=self.logits_soft_cap,\n    fa_version=self.vllm_flash_attn_version,\n    ...\n)\nreturn output",
+      "elide": ["q_descale/k_descale/v_descale(FP8 KV)、scheduler_metadata、num_splits、s_aux(attention sinks)等旁路参数;上文 dcp_world_size>1 走 _forward_with_dcp 的分支省略"],
+      "note": "非 cascade 的主路径:整批 prefill+decode 一次 flash_attn_varlen_func 吃下,cu_seqlens_q 来自 query_start_loc、seqused_k 来自 seq_lens、KV 从 paged key_cache/value_cache 经 block_table 取。这就是全书此前把 FA 当黑盒调用的那一行。"
+    },
+    {
+      "path": "vllm/v1/attention/backends/flash_attn.py",
+      "lines": "L1185-L1236",
+      "code": "# Process shared prefix.\nprefix_output, prefix_lse = flash_attn_varlen_func(\n    q=query, k=key_cache, v=value_cache,\n    cu_seqlens_q=cu_prefix_query_lens, seqused_k=prefix_kv_lens,\n    max_seqlen_k=common_prefix_len,\n    causal=False, return_softmax_lse=True,\n    block_table=block_table[:1], ...)\n# Process suffix per query.\nsuffix_output, suffix_lse = flash_attn_varlen_func(\n    q=query, k=key_cache, v=value_cache,\n    cu_seqlens_q=cu_query_lens, seqused_k=suffix_kv_lens,\n    max_seqlen_k=max_kv_len - common_prefix_len,\n    causal=True, return_softmax_lse=True,\n    block_table=block_table[:, num_common_kv_blocks:], ...)\n# Merge prefix and suffix outputs, and store the result in output.\nmerge_attn_states(output, prefix_output, prefix_lse, suffix_output, suffix_lse)",
+      "elide": ["descale_shape 计算、q/k/v_descale 的 expand、num_splits 的 batch-invariant 分支、断言 alibi/sliding-window 不支持——都是外围校验"],
+      "note": "cascade 把一批共享同一长前缀的请求拆成两段注意力:前缀段(causal=False,所有 query 都能看整段共享前缀)+后缀段(causal=True,各自私有 KV)。两段各自 return_softmax_lse=True,最后 merge_attn_states 用 LSE 把两段的部分输出合成精确结果——这是 online-softmax ⊕ 算子在推理期的直接应用。"
+    },
+    {
+      "path": "vllm/v1/attention/ops/triton_merge_attn_states.py",
+      "lines": "L118-L161",
+      "code": "p_lse = tl.load(prefix_lse + head_idx * num_tokens + token_idx)\ns_lse = tl.load(suffix_lse + head_idx * num_tokens + token_idx)\n# ... (inf -> -inf 归一,兼容 FA2/FA3 空序列)\nmax_lse = tl.maximum(p_lse, s_lse)\np_lse = p_lse - max_lse\ns_lse = s_lse - max_lse\np_se = tl.exp(p_lse)          # exp(p_lse - max_lse)\ns_se = tl.exp(s_lse)          # exp(s_lse - max_lse)\nout_se = p_se + s_se\nif OUTPUT_LSE:\n    out_lse = tl.log(out_se) + max_lse\n# ... load p_out, s_out ...\np_scale = p_se / out_se\ns_scale = s_se / out_se\nout = p_out * p_scale + s_out * s_scale",
+      "elide": ["FP8 量化分支(USE_FP8)、无 context token 直接 copy suffix 的 early-return 分支、指针步长 head_stride 的地址算术——都是访存脚手架"],
+      "note": "逐 token 逐 head 的 LSE 合并:两段各有 LSE=log(sum exp) 和部分输出 O。以 max_lse 稳定化,合并后归一化因子 out_se = e^{p_lse-max}+e^{s_lse-max},权重 p_scale/s_scale 恰是两段 softmax 归一化质量的占比,out = 加权和。合并后的 LSE = log(out_se)+max_lse——与 online-softmax Eq.4 的 ⊕ 完全同构(这里的 lse=log d,故 max/加权对应到 log 域)。"
+    }
+  ],
+
+  "key_classes": [
+    {"name": "flash_attn_varlen_func", "file": "vllm/vllm_flash_attn/flash_attn_interface.py", "responsibility": "vLLM 对 FlashAttention(FA2/FA3)前向 kernel 的 Python 入口:varlen 打平 + paged KV(block_table)+ 可选返回 softmax_lse。vLLM 把它当黑盒 import,本章掀开这个黑盒的算法内幕。"},
+    {"name": "FlashAttentionImpl.forward", "file": "vllm/v1/attention/backends/flash_attn.py", "responsibility": "v1 FA 后端的前向:非 cascade 主路径一次调用 flash_attn_varlen_func(L809);use_cascade 时走 cascade_attention(L835)。"},
+    {"name": "cascade_attention", "file": "vllm/v1/attention/backends/flash_attn.py", "responsibility": "共享前缀优化:前缀段 + 后缀段各跑一次带 LSE 的注意力,再 merge_attn_states 合并——LSE 合并的调用现场。"},
+    {"name": "merge_attn_states / merge_attn_states_kernel", "file": "vllm/v1/attention/ops/triton_merge_attn_states.py", "responsibility": "online-softmax ⊕ 算子的落地:把两段部分注意力输出按各自 LSE 权重稳定地合并成精确输出,并可选输出合并后 LSE。cascade / split-KV 的地基。"}
+  ],
+
+  "data_flow": [
+    "1. fa_utils.py: 按 current_platform 选择 flash_attn_varlen_func 实现(CUDA=vllm_flash_attn / XPU=xpu_ops / ROCm=upstream)——vLLM 侧只是 import,不含算法。",
+    "2. FlashAttentionImpl.forward: 取 attn_metadata(cu_seqlens_q=query_start_loc、seqused_k=seq_lens、block_table、causal、scale);若非 cascade => 单次 flash_attn_varlen_func(L809)写 output 返回。",
+    "3. FA kernel 内部(本章推导对象,非 vLLM 源码):对每个 (Q 行块, KV 列块) 用 online-softmax 递推维护 running (m,l,O),永不物化 N×N 的 S/P;收尾除一次 l 得 O,存 LSE=m+log(l)。",
+    "4. cascade 路径: flash_attn_varlen_func(前缀,causal=False,return_softmax_lse=True) 与 (后缀,causal=True,return_softmax_lse=True) 各得 (output, lse)。",
+    "5. merge_attn_states_kernel: 逐 (token,head) 以 max_lse 稳定化,按 e^{lse-max} 求两段权重,加权合并 output;可选写出合并 LSE——即 ⊕ 算子。"
+  ],
+
+  "design_decisions": [
+    {"decision": "vLLM 不自研 FA 前向 kernel,而是 import 编译好的 flash_attn_varlen_func", "why": "FA 是 IO-aware 的手写 CUDA/融合 kernel,收益全在访存与 warp 调度层面,Python 侧无法表达;vLLM 只需按平台选实现并喂 varlen+paged 元数据。", "evidence": "vllm/v1/attention/backends/fa_utils.py:L18-L53"},
+    {"decision": "varlen 打平 + cu_seqlens 前缀和,而非 padding 到等长", "why": "推理批内序列长度差异极大(prefill 上千 vs decode 1),padding 会浪费大量算力与 HBM;打平 + cu_seqlens 让 kernel 精确切分每条序列。", "evidence": "vllm/vllm_flash_attn/flash_attn_interface.py:L232-L241"},
+    {"decision": "cascade 拆前缀/后缀两段注意力 + LSE 合并,而非对每条请求重算共享前缀", "why": "多请求共享同一长系统提示时,前缀段只算一遍即可被所有 query 复用;LSE 合并保证结果与不拆分的精确注意力逐位相等。", "evidence": "vllm/v1/attention/backends/flash_attn.py:L1185-L1236"},
+    {"decision": "merge kernel 先算 scale 再乘 output,且以 max_lse 稳定化", "why": "直接乘 exp(p_lse)/exp(s_lse) 会溢出;减去 max_lse 后两个 exp 都 <=1,数值稳定——与 safe-softmax 减 max 同理。", "evidence": "vllm/v1/attention/ops/triton_merge_attn_states.py:L129-L161"},
+    {"decision": "FA-2 只存 logsumexp L=m+log(l) 而非 (m,l) 两个统计量", "why": "backward 只需 L 即可重算 P;合并时 lse 也足够——减少存储与 non-matmul FLOP。vLLM 的 return_softmax_lse 返回的正是这个 L。", "evidence": "arXiv:2307.08691 §3.1.1 (paper-fa2.md:L146-L147, L192-L193)"}
+  ],
+
+  "theory": [
+    {"topic": "内存带宽墙(为什么慢在读写不在算)", "content": "A100 SRAM ~19TB/s 但仅 192KB/SM;HBM 1.5-2.0TB/s 但 40-80GB。softmax/mask/dropout 等是 memory-bound(算术强度低)。标准注意力把 S=QK^T、P=softmax(S) 两张 N×N 矩阵物化到 HBM 再读回(Alg.0 三步各一次读+写),访存 Θ(N²) 主导 wall-clock。核心洞见:注意力慢在 HBM 往返,不在 FLOP。", "papers": ["arXiv:2205.14135 §2.1-2.2"]},
+    {"topic": "safe-softmax 三遍 -> online-softmax 一遍", "content": "safe-softmax 需三遍扫描(求 max m_V、求归一 d_V、算 y_i)。online-softmax(Alg.3)把前两遍融成单遍:维护 running m_j 与 rescaled running d_j,新元素来时 d_{j-1} 先乘 exp(m_{j-1}-m_j) 再加新项。归纳可证末值 m_V=max、d_V=Σexp(x-m_V) 与三遍等价。这是分块 softmax 的数学地基。", "papers": ["arXiv:1805.02867 §2-3, Thm.1"]},
+    {"topic": "online-softmax ⊕ 算子的结合律(合并的合法性)", "content": "把 (m,d) 视为状态,定义 ⊕(Eq.4):新 max=max、新 d=各自 d 按到新 max 的差 rescale 后相加。⊕ 满足结合律与交换律,故 softmax 归一化可任意分块/并行/乱序归并——这正是 FlashAttention 分块 tiling 与 merge_attn_states 两段合并的合法性来源。", "papers": ["arXiv:1805.02867 §3.1 Eq.3-4"]},
+    {"topic": "FlashAttention tiling 与免物化", "content": "把 Q,K,V 切块载入 SRAM,对每个 (i,j) 块局部算 S_ij、局部 softmax(m~,l~,P~),再用 online-softmax 递推把 running (m_i,l_i,O_i) 更新到新全局 max(Alg.1 L11-L13):O_i 每步按 exp(旧max-新max) 缩放旧值再加新块的 P~V。全程只在 SRAM 内,N×N 的 S/P 从不落 HBM;融成单个 CUDA kernel。Thm.1:输出精确等于 softmax(QK^T)V,O(N²d) FLOP、O(N) 额外内存。", "papers": ["arXiv:2205.14135 §3.1 Alg.1, Thm.1"]},
+    {"topic": "IO 复杂度账 O(N²d²/M) vs Θ(N²)", "content": "标准注意力 Θ(Nd+N²) HBM 访问(物化 S,P)。FA:SRAM 装 Θ(M) 的 K,V 块共 Θ(Nd/M) 块,每块过整个 Q(Θ(Nd))=> Θ(N²d²/M) 访问。d=64-128、M≈100KB 时 d²<<M,故快数倍(图 2 达 9×)。Prop.3 给下界:范围内 M 无算法能渐进更优。块越大访存越少,但受 SRAM 容量与算术瓶颈限制。", "papers": ["arXiv:2205.14135 §3.2 Thm.2, Prop.3"]},
+    {"topic": "FlashAttention-2 的循环序与 warp 分工(带过)", "content": "FA-2 三改:(1) 外层循环改为遍历 Q 行块(原 FA 外层是 K,V),使行块可跨 thread block 沿序列长度并行,提升长序列 occupancy;(2) 中间 O 保持未归一化,只收尾除一次 l,减少昂贵的 non-matmul FLOP(A100 上 non-matmul 比 matmul 贵约 16×);(3) 只存 L=m+log(l);warp 分工从 split-K 改为 split-Q,免 warp 间 shared-memory 通信。综合约 2× 于 FA。现代 kernel(vLLM 依赖)即此变体。", "papers": ["arXiv:2307.08691 §3.1-3.3, Alg.1"]},
+    {"topic": "LSE 合并(cascade/split-KV 的地基)", "content": "两段注意力各返回部分输出 O^(a),O^(b) 与 lse^(a)=log Σexp、lse^(b)。合并:max=max(lse^a,lse^b),权重 w_a=e^{lse^a-max}/(e^{lse^a-max}+e^{lse^b-max}),O=w_a O^a+w_b O^b,合并 lse=log(e^{lse^a-max}+e^{lse^b-max})+max。这就是 ⊕ 算子在 (lse, output) 上的作用,数值上与一次性对合并 KV 做 softmax 逐位相等。vLLM 的 merge_attn_states 即此实现,支撑 cascade attention 与 split-KV。", "papers": ["arXiv:1805.02867 §3.1 Eq.4", "arXiv:2307.08691 §2.3 (two-block online softmax)"]}
+  ],
+
+  "mechanisms": [
+    {
+      "id": "standard-attn-materialization",
+      "name": "标准注意力物化 N×N 与内存带宽墙",
+      "kind": "dataflow",
+      "source_anchors": ["vllm/v1/attention/backends/flash_attn.py:L809-L832"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "paper_origin": {"paper": "arXiv:2205.14135", "sections": ["§2.1 Hardware Performance", "§2.2 Standard Attention", "Algorithm 0"]},
+      "note": "读者的最大认知悬崖起点:注意力慢在 HBM 往返(物化 S=QK^T、P=softmax(S) 两张 N×N),不在 FLOP。图:GPU 内存层级(SRAM 192KB@19TB/s vs HBM 80GB@2TB/s)+ 标准三步各读写 N×N。"
+    },
+    {
+      "id": "online-softmax-recurrence",
+      "name": "online-softmax 单遍递推(running m/l)",
+      "kind": "algorithm",
+      "source_anchors": ["vllm/v1/attention/ops/triton_merge_attn_states.py:L129-L139"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {"paper": "arXiv:1805.02867", "sections": ["§3 Algorithm 3", "Theorem 1"]},
+      "note": "数值推演的主战场:小分块手算 m_j/d_j 递推,验证末值与三遍 safe-softmax 恒等。writer 必三层递进:安全 softmax 减 max -> 单遍融合 -> rescale 项的直觉。"
+    },
+    {
+      "id": "online-softmax-merge-operator",
+      "name": "online-softmax ⊕ 合并算子(结合律)",
+      "kind": "algorithm",
+      "source_anchors": ["vllm/v1/attention/ops/triton_merge_attn_states.py:L118-L161"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {"paper": "arXiv:1805.02867", "sections": ["§3.1 Eq.3-4"]},
+      "note": "把 (max,sum) 状态抽象成二元算子 ⊕,证结合律=>可任意分块合并。tiling 与 LSE 合并的合法性根据。worked example:两块乱序合并 = 顺序遍历 = 一次性 softmax。"
+    },
+    {
+      "id": "flashattention-tiling",
+      "name": "FlashAttention 分块 tiling 与免物化",
+      "kind": "algorithm",
+      "source_anchors": ["vllm/vllm_flash_attn/flash_attn_interface.py:L176-L209"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {"paper": "arXiv:2205.14135", "sections": ["§3.1 Algorithm 1", "Theorem 1"]},
+      "note": "核心算法:Q/K/V 切块,running (m_i,l_i,O_i) 用 online-softmax 递推更新,N×N 的 S/P 从不落 HBM,融成单 kernel。图:tiling 外/内循环 + O_i 的 rescale-accumulate;worked example:2×2 分块跑完 O_i 递推对照朴素 softmax(QK^T)V。"
+    },
+    {
+      "id": "io-complexity-accounting",
+      "name": "IO 复杂度账 O(N²d²/M) vs Θ(N²)",
+      "kind": "dataflow",
+      "source_anchors": ["vllm/vllm_flash_attn/flash_attn_interface.py:L232-L261"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {"paper": "arXiv:2205.14135", "sections": ["§3.2 Theorem 2", "Proposition 3"]},
+      "note": "量化为什么快:代入 N=1024,d=64,M≈100KB 算出两者 HBM 访问次数之比(worked example)。图:随 block size 增大 HBM 访问下降的账。"
+    },
+    {
+      "id": "fa2-loop-order-warp",
+      "name": "FlashAttention-2 循环序对调与 warp 分工(带过)",
+      "kind": "dataflow",
+      "source_anchors": ["vllm/v1/attention/backends/fa_utils.py:L56-L110"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "paper_origin": {"paper": "arXiv:2307.08691", "sections": ["§3.1 Algorithm 1", "§3.2 Parallelism", "§3.3 Work Partitioning"]},
+      "note": "一节带过:外层改遍历 Q 行块=>序列长度并行;未归一化 O 收尾除一次=>减 non-matmul FLOP;只存 L=m+log l;split-K->split-Q 免 shared-memory 通信。图:FA vs FA-2 循环序/warp 分工对照。"
+    },
+    {
+      "id": "lse-merge",
+      "name": "LSE 合并(merge_attn_states——两段注意力合并)",
+      "kind": "algorithm",
+      "source_anchors": ["vllm/v1/attention/ops/triton_merge_attn_states.py:L118-L161", "vllm/v1/attention/backends/flash_attn.py:L1185-L1236"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {"paper": "arXiv:1805.02867", "sections": ["§3.1 Eq.4 (⊕ 算子)"]},
+      "note": "附「LSE 合并」小节:merge_attn_states_kernel 逐 (token,head) 以 max_lse 稳定化,按 e^{lse-max} 权重合并两段 output,合并 lse=log(Σe^{lse-max})+max——即 ⊕ 在 (lse,output) 上。代码另引 arXiv:2501.01005 §2.2(不在论文包内,数学同 online-softmax Eq.4)。cascade attention 的地基。worked example:两段部分 softmax 合并 = 对合并 KV 一次性 softmax。"
+    },
+    {
+      "id": "fa-varlen-call-surface",
+      "name": "flash_attn_varlen_func 调用面与形参语义(落地)",
+      "kind": "config",
+      "source_anchors": ["vllm/vllm_flash_attn/flash_attn_interface.py:L176-L261", "vllm/v1/attention/backends/flash_attn.py:L809-L832"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "paper_origin_note": "vLLM 侧代码落地面,无直接论文出处;kernel 内部算法由 FA/FA-2 两论文覆盖(见 flashattention-tiling / fa2-loop-order-warp 机制)。",
+      "note": "落地主线:q/k/v (total,nheads,headdim) varlen 打平 + cu_seqlens_q 前缀和切序列 + seqused_k/block_table 指 paged KV;causal/softmax_scale/window_size/softcap/fa_version;return_softmax_lse 吐 L 给合并用。图:一次调用的形参语义表 + 回指 ch25-attention。"
+    },
+    {
+      "id": "cascade-shared-prefix",
+      "name": "cascade attention:共享前缀拆两段 + 合并",
+      "kind": "dataflow",
+      "source_anchors": ["vllm/v1/attention/backends/flash_attn.py:L1145-L1236"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "paper_origin_note": "vLLM 推理期优化的落地(共享前缀去重),算法基础是 LSE 合并(见 lse-merge 机制);无独立论文出处。",
+      "note": "把 LSE 合并放进真实调用现场:前缀段(causal=False,共享)+ 后缀段(causal=True,私有)各 return_softmax_lse,merge_attn_states 合并。展示原理如何在 vLLM 落地。"
+    }
+  ],
+
+  "subtraction_plan": {},
+
+  "foreshadow_due": {"embed": [], "recover": []}
+}

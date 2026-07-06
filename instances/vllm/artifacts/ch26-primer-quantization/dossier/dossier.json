@@ -1,0 +1,259 @@
+{
+  "kind": "primer",
+  "chapter": "ch26-primer-quantization",
+  "title": "量化数学：从 scale/zero-point 到 GPTQ / AWQ / SmoothQuant（论文精读 + vllm 落地面）",
+  "one_line": "以三篇奠基论文（GPTQ arXiv:2210.17323、AWQ arXiv:2306.00978、SmoothQuant arXiv:2211.10438）为真相源推导均匀量化与三种误差控制法，再回到 vllm 量化子系统的落地面（quant_config / quant_method.apply / FP8 e8m0 装载）自包含闭环。",
+
+  "code_spine": [
+    "vllm/model_executor/layers/quantization/utils/quant_utils.py:L556-L648  参考均匀量化：per-group/per-channel 的 scale w_s、非对称 zero-point maybe_w_zp、round→clamp→反量化 w_ref（数值推演的算子级真相源）",
+    "vllm/model_executor/layers/quantization/utils/quant_utils.py:L655-L686  gptq_quantize_weights：GPTQ 检查点复用同一均匀网格 + act_order 行置换",
+    "vllm/model_executor/layers/quantization/utils/quant_utils.py:L286-L353  scaled_quantize / scaled_dequantize：浮点（FP8）分组量化-反量化的对称 amax 路径",
+    "vllm/model_executor/layers/quantization/base_config.py:L19-L163  QuantizeMethodBase.apply / QuantizationConfig.get_quant_method —— 全量化方案共享的调用面契约",
+    "vllm/model_executor/layers/quantization/gptq.py:L376-L399  GPTQLinearMethod.apply → ops.gptq_gemm（权重仍是打包 INT，推理期反量化）",
+    "vllm/model_executor/layers/quantization/awq.py:L262-L286  AWQLinearMethod.apply → ops.awq_dequantize / ops.awq_gemm（激活感知缩放已离线折进 scales）",
+    "vllm/model_executor/layers/quantization/fp8.py:L343-L370  Fp8LinearMethod.create_weights：块量化 scale 以 float8_e8m0fnu 装载（is_scale_e8m0）",
+    "vllm/model_executor/layers/quantization/input_quant_fp8.py:L240-L248  激活分组量化：use_ue8m0 时把 scale 向上取整到最近 2 的幂（e8m0 只存指数）",
+    "vllm/model_executor/layers/quantization/fp8.py:L434-L477  Fp8LinearMethod.apply → fp8_linear.apply_weights（W8A8/FP8 GEMM 调用面）"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "book/papers/ch26-primer-quantization/paper-awq.md",
+      "lines": "AWQ §3.2 Eq.(1)",
+      "code": "Q(w) = Δ · Round(w/Δ),   Δ = max(|w|) / 2^(N-1)",
+      "note": "AWQ 论文 Eq.1：最基本的对称均匀量化——N 位、以组内绝对最大值 max(|w|) 定 scale Δ；Round 把 w/Δ 映到整数格点后再乘回 Δ。这是三法共同的『底座』公式。",
+      "elide": []
+    },
+    {
+      "path": "book/papers/ch26-primer-quantization/paper-awq.md",
+      "lines": "AWQ §3.2 Eq.(2) 与 RoundErr 分析",
+      "code": "Q(w·s)·(x/s) = Δ' · Round(ws/Δ') · x · (1/s)\n误差比 = (Δ'/Δ)·(1/s);  RoundErr(·) ~ 0.25;  s>1 且 Δ'≈Δ ⇒ 显著权重相对误差变小",
+      "note": "AWQ Eq.2：对显著权重通道乘 s>1、对激活反向除以 s（数学等价），Round 的平均误差恒为约 0.25，故相对量化误差按 (Δ'/Δ)/s 缩小；s 过大会抬高非显著通道的 Δ'，故最优 s（OPT-6.7B）约在 2。数值推演对照法之一。",
+      "elide": []
+    },
+    {
+      "path": "book/papers/ch26-primer-quantization/paper-awq.md",
+      "lines": "AWQ §3.2 Eq.(5)",
+      "code": "s = s_X^α,   α* = argmin_α L(s_X^α),   L(s) = || Q(W·diag(s))(diag(s)^{-1}·X) − WX ||",
+      "note": "AWQ 搜索空间：s_X 为逐输入通道的平均激活幅度，单一超参 α∈[0,1] 在网格（grid=20）上搜；α=0 不缩放，α=1 最激进。激活感知即体现在用激活幅度 s_X 定缩放。",
+      "elide": []
+    },
+    {
+      "path": "book/papers/ch26-primer-quantization/paper-smoothquant.md",
+      "lines": "SmoothQuant §4 Eq.(3)-(4)",
+      "code": "Y = (X · diag(s)^{-1}) · (diag(s) · W) = X̂ · Ŵ   （数学等价）\ns_j = max(|X_j|)^α / max(|W_j|)^{1-α},   j=1..C_i",
+      "note": "SmoothQuant Eq.4：逐输入通道的平滑因子 s_j，把激活的量化难度按迁移强度 α 搬到权重；α=0.5 是 OPT/BLOOM 甜点，GLM-130B 取 0.75。s 可离线折进前一层（LayerNorm/Linear），运行期激活已『被抹平』。W8A8 的落地对照法。",
+      "elide": ["Fig.3 per-tensor/per-token/per-channel 定义仅作粒度示意，正文用文字复述即可"]
+    },
+    {
+      "path": "book/papers/ch26-primer-quantization/paper.md",
+      "lines": "GPTQ §3 Eq.(2)（OBQ 逐权重补偿）",
+      "code": "w_q = argmin_{w_q} ( quant(w_q) − w_q )^2 / [H_F^{-1}]_{qq}\nδ_F = − (w_q − quant(w_q)) / [H_F^{-1}]_{qq} · (H_F^{-1})_{:,q},   H_F = 2 X_F X_F^T",
+      "note": "GPTQ 二阶补偿的核心：Hessian H_F=2 X_F X_F^T 只依赖层输入 X（与权重无关），量化第 q 个权重后按 δ_F 更新其余未量化权重以补偿误差。GPTQ 三步优化=任意固定列序 + lazy batch(B=128) + Cholesky 稳定化，把 OBQ 的 O(d_row·d_col^3) 降到 O(max{d_row·d_col^2, d_col^3})。",
+      "elide": ["Eq.3/Eq.5 的 H^{-1} 增量更新与 Alg.1 伪代码作为推导支撑，正文可摘录 Alg.1 主循环"]
+    },
+    {
+      "path": "book/papers/ch26-primer-quantization/paper.md",
+      "lines": "GPTQ §4 Algorithm 1（主循环）",
+      "code": "for i=0,B,2B,...:\n  for j=i..i+B-1:\n    Q[:,j] = quant(W[:,j])\n    E[:,j-i] = (W[:,j] − Q[:,j]) / [H^{-1}]_{jj}\n    W[:, j:i+B] -= E[:,j-i] · H^{-1}[j, j:i+B]   // 块内补偿\n  W[:, i+B:] -= E · H^{-1}[i:i+B, i+B:]           // 块末全局补偿",
+      "note": "GPTQ 逐字伪代码：块内逐列量化并即时补偿，块末一次性把累计误差 E 传播给块外剩余权重（lazy batch-update，提升 GPU 利用率）。",
+      "elide": []
+    },
+    {
+      "path": "vllm/model_executor/layers/quantization/utils/quant_utils.py",
+      "lines": "L586-L621",
+      "code": "    # Compute scale for each group\n    max_val = torch.max(w, 0, keepdim=True).values\n    min_val = torch.min(w, 0, keepdim=True).values\n\n    max_q_val = quant_type.max()\n    min_q_val = quant_type.min()\n\n    w_s = torch.Tensor([1.0]).to(w.device)  # unscaled case\n    maybe_w_zp = None\n    if group_size is not None:\n        if zero_points:\n            assert not quant_type.is_signed() and quant_type.max() > 0\n            w_s = (max_val - min_val).clamp(min=1e-5) / quant_type.max()\n            maybe_w_zp = (\n                torch.round(torch.abs(min_val / w_s)).clamp(min_q_val, max_q_val).int()\n            )\n        else:\n            # If the bias is such that there are no possible negative/positive\n            #  values, set the max value to inf to avoid divide by 0\n            w_s = torch.max(\n                abs(max_val / (max_q_val if max_q_val != 0 else torch.inf)),\n                abs(min_val / (min_q_val if min_q_val != 0 else torch.inf)),\n            )\n\n    # Quantize\n    w_q = torch.round(w / w_s).int() + (maybe_w_zp if zero_points else 0)\n    w_q = torch.clamp(w_q, min_q_val, max_q_val)",
+      "note": "vllm 参考均匀量化的算子级真相源：非对称（zero_points=True）时 scale=(max−min)/qmax、zero-point=round(|min|/scale)；对称时 scale=max(|max|/qmax,|min|/qmin)。round→加 zp→clamp 到 [qmin,qmax]。正好对应 AWQ Eq.1 的 Δ 与非对称推广，是数值推演的落地锚点。",
+      "elide": ["group_size 分组的 reshape/permute（L581-584）作维度铺陈，正文可文字描述"]
+    },
+    {
+      "path": "vllm/model_executor/layers/quantization/utils/quant_utils.py",
+      "lines": "L614-L621",
+      "code": "    # Compute ref (dequantized)\n    if ref_zero_points_after_scales and maybe_w_zp is not None:\n        w_ref = w_q.to(orig_type) * w_s - maybe_w_zp.to(orig_type) * w_s\n    else:\n        w_ref = (w_q - (maybe_w_zp if zero_points else 0)).to(orig_type) * w_s",
+      "note": "反量化 w_ref = (w_q − zp)·scale —— 量化-反量化往返；正文数值推演可用它与原 w 相减得到 |w − w_ref| 的量化误差，横向对比 RTN / AWQ / SmoothQuant 三法。",
+      "elide": []
+    },
+    {
+      "path": "vllm/model_executor/layers/quantization/utils/quant_utils.py",
+      "lines": "L322-L338",
+      "code": "    # Compute scales\n    min_val, max_val = x_blkd_permd.aminmax(dim=-1)\n    amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)\n    _, fp8_max = get_fp8_min_max()\n    scale = fp8_max / amax\n\n    # Apply scale and convert from:\n    # (BLK_M, BLK_N, BLOCK_SIZE_M * BLOCK_SIZE_N) to (M, N)\n    x_scl_sat = (\n        (x_blkd_permd * scale.unsqueeze(-1))\n        .clamp(min=finfo.min, max=finfo.max)\n        .reshape(blk_m, blk_n, group_shape[0], group_shape[1])\n        .permute(0, 2, 1, 3)\n        .reshape(x.shape)\n    )\n\n    return x_scl_sat.to(quant_dtype).contiguous(), scale.float().reciprocal()",
+      "note": "浮点（FP8）分组量化：对称 amax → scale=fp8_max/amax → 乘 scale 再 clamp 到 finfo 范围 → 转 quant_dtype；返回倒数 scale 供反量化。与整数版共享『amax 定 scale』思想，但值域是 FP8 而非整型格点。",
+      "elide": ["分块 reshape/permute（L311-320）是维度整形"]
+    },
+    {
+      "path": "vllm/model_executor/layers/quantization/base_config.py",
+      "lines": "L36-L41",
+      "code": "    @abstractmethod\n    def apply(self, layer: torch.nn.Module, *args, **kwargs) -> torch.Tensor:\n        \"\"\"Apply the weights in layer to the input tensor.\n\n        Expects create_weights to have been called before on the layer.\"\"\"\n        raise NotImplementedError",
+      "note": "QuantizeMethodBase.apply —— 一切量化方案（GPTQ/AWQ/FP8/int8…）向模型定义层暴露的统一调用面：模型只调 quant_method.apply(layer, x, bias)，不关心底层格式。回指 [模型定义章] 的 Linear 装配。",
+      "elide": []
+    },
+    {
+      "path": "vllm/model_executor/layers/quantization/base_config.py",
+      "lines": "L150-L163",
+      "code": "    @abstractmethod\n    def get_quant_method(\n        self, layer: torch.nn.Module, prefix: str\n    ) -> QuantizeMethodBase | None:\n        \"\"\"Get the quantize method to use for the quantized layer.\n\n        Args:\n            layer: The layer for the quant method.\n            prefix: The full name of the layer in the state dict\n        Returns:\n            The quantize method. None if the given layer doesn't support quant\n            method.\n        \"\"\"\n        raise NotImplementedError",
+      "note": "QuantizationConfig.get_quant_method：config（来自检查点 quantization_config）按 layer/prefix 分发出对应 QuantizeMethodBase。这是 quant_config → quant_method 的装配枢纽。",
+      "elide": []
+    },
+    {
+      "path": "vllm/model_executor/layers/quantization/gptq.py",
+      "lines": "L376-L399",
+      "code": "    def apply(\n        self,\n        layer: torch.nn.Module,\n        x: torch.Tensor,\n        bias: torch.Tensor | None = None,\n    ) -> torch.Tensor:\n        out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)\n        reshaped_x = x.reshape(-1, x.shape[-1])\n\n        # GPTQ v1 and v2 format checkpoints deals with zero points differently,\n        # and require different gemm kernels.\n        output = ops.gptq_gemm(\n            reshaped_x,\n            layer.qweight,\n            layer.qzeros,\n            layer.scales,\n            layer.g_idx,\n            layer.exllama_state == ExllamaState.READY,\n            self.use_v2_format,\n            self.quant_config.weight_bits,\n        )\n        if bias is not None:\n            output.add_(bias)\n        return output.reshape(out_shape)",
+      "note": "GPTQ 落地面：权重以打包 INT（qweight）+ per-group scales + qzeros + g_idx（act_order 分组索引）装载，推理期由 ops.gptq_gemm 融合反量化并矩乘。二阶补偿是离线（autogptq）产物，vllm 只消费其网格。",
+      "elide": []
+    },
+    {
+      "path": "vllm/model_executor/layers/quantization/awq.py",
+      "lines": "L262-L286",
+      "code": "    def apply(\n        self,\n        layer: torch.nn.Module,\n        x: torch.Tensor,\n        bias: torch.Tensor | None = None,\n    ) -> torch.Tensor:\n        qweight = layer.qweight\n        scales = layer.scales\n        qzeros = layer.qzeros\n        pack_factor = self.quant_config.pack_factor\n        out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)\n        reshaped_x = x.reshape(-1, x.shape[-1])\n\n        # num_tokens >= threshold\n        FP16_MATMUL_HEURISTIC_CONDITION = x.shape[:-1].numel() >= 256\n        # Batch invariant mode requires torch.matmul path\n        # for Triton override\n        if FP16_MATMUL_HEURISTIC_CONDITION or envs.VLLM_BATCH_INVARIANT:\n            out = ops.awq_dequantize(qweight, scales, qzeros, 0, 0, 0)\n            out = torch.matmul(reshaped_x, out)\n        else:\n            out = ops.awq_gemm(reshaped_x, qweight, scales, qzeros, pack_factor)\n        if bias is not None:\n            out.add_(bias)\n        return out.reshape(out_shape)",
+      "note": "AWQ 落地面：激活感知缩放 s 已在离线量化时折进 scales/权重，vllm 侧只见打包 qweight + scales + qzeros。大 batch 走 awq_dequantize→matmul，小 batch 走融合 awq_gemm。与 GPTQ 同为 weight-only INT4，区别在 scale 的来历（激活感知 vs 二阶补偿）。",
+      "elide": []
+    },
+    {
+      "path": "vllm/model_executor/layers/quantization/fp8.py",
+      "lines": "L358-L370",
+      "code": "        else:\n            assert not self.act_q_static\n            assert self.weight_block_size is not None\n            scale = create_fp8_scale_parameter(\n                BlockQuantScaleParameter,\n                output_partition_sizes,\n                input_size_per_partition,\n                self.weight_block_size,\n                weight_loader,\n                scale_dtype=(torch.float8_e8m0fnu if self.is_scale_e8m0 else None),\n            )\n            # The weight_scale_inv name is intentional for deepseekv3\n            layer.register_parameter(\"weight_scale_inv\", scale)",
+      "note": "FP8 e8m0 装载面：块量化（如 DeepSeek 系 128×128 块）的权重 scale 可用 float8_e8m0fnu 承载——8 位纯指数、无尾数，即『scale 只能是 2 的幂』。weight_scale_inv 命名沿用 DeepSeek 检查点。回指 [DeepSeek-V4 章] 的 W8A8/FP8 块量化装配。",
+      "elide": []
+    },
+    {
+      "path": "vllm/model_executor/layers/quantization/input_quant_fp8.py",
+      "lines": "L240-L248",
+      "code": "        x_grouped = x.view(-1, num_groups, self.group_size)\n        absmax = x_grouped.abs().max(dim=-1, keepdim=True)[0].float()\n        scales_raw = absmax / _FP8_MAX\n        if self.use_ue8m0:\n            scales_raw = torch.exp2(torch.ceil(torch.log2(scales_raw)))\n        scales = (scales_raw).clamp(min=_FP8_MIN_SCALING_FACTOR)\n\n        x_scaled = x_grouped / scales\n        x_quant = x_scaled.clamp(_FP8_MIN, _FP8_MAX).to(_FP8_DTYPE)",
+      "note": "e8m0（ue8m0）的数学本质就一行：scales_raw = exp2(ceil(log2(absmax/FP8_MAX))) —— 把 amax 定出的连续 scale 向上取整到最近的 2 的幂，正好落进 e8m0 的纯指数格。这是 MX(microscaling) FP8 的 scale 编码约束在 vllm 中的落地。",
+      "elide": ["padding / column_major_scales / reshape（L231-259 其余）是形状与布局细节"]
+    },
+    {
+      "path": "vllm/model_executor/layers/quantization/fp8.py",
+      "lines": "L434-L477",
+      "code": "    def apply(\n        self,\n        layer: torch.nn.Module,\n        x: torch.Tensor,\n        bias: torch.Tensor | None = None,\n    ) -> torch.Tensor:\n        # if batch invariant mode is enabled, prefer DeepGEMM FP8 path\n        ...\n        if self.use_marlin:\n            return self.fp8_linear.apply_weights(layer, x, bias)\n\n        return self.fp8_linear.apply_weights(layer, x, bias)",
+      "note": "FP8 apply 的主干：绝大多数路径直接委派 fp8_linear.apply_weights（内部按 weight/activation 的 quant_key 做 W8A8/FP8 GEMM）。中间 VLLM_BATCH_INVARIANT 分支是可省略的确定性特判（省略号处 L442-472）。",
+      "elide": ["L442-L472 VLLM_BATCH_INVARIANT 的 BF16 反量化特判是数值确定性旁路，正文点到即可"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "QuantizeMethodBase", "file": "vllm/model_executor/layers/quantization/base_config.py", "responsibility": "所有量化方法的抽象基类：create_weights（建权重占位）+ apply（前向）+ process_weights_after_loading（装载后重排）。统一调用面。"},
+    {"name": "QuantizationConfig", "file": "vllm/model_executor/layers/quantization/base_config.py", "responsibility": "量化配置抽象基类：from_config 解析检查点 quantization_config、get_quant_method 按 layer/prefix 分发方法、get_min_capability 声明硬件门槛。"},
+    {"name": "GPTQLinearMethod", "file": "vllm/model_executor/layers/quantization/gptq.py", "responsibility": "GPTQ 权重（打包 INT + per-group scales + qzeros + g_idx）的建权重与 apply→ops.gptq_gemm。"},
+    {"name": "AWQLinearMethod", "file": "vllm/model_executor/layers/quantization/awq.py", "responsibility": "AWQ 权重（打包 INT + scales + qzeros，激活感知缩放已离线折入）的 apply→awq_dequantize/awq_gemm。"},
+    {"name": "Fp8LinearMethod", "file": "vllm/model_executor/layers/quantization/fp8.py", "responsibility": "FP8（e4m3 权重）线性方法：支持 per-tensor / per-channel / 块量化，块量化 scale 可用 e8m0fnu 装载；apply 委派 fp8_linear.apply_weights。"},
+    {"name": "QuantFP8 (_quantize_group_native)", "file": "vllm/model_executor/layers/quantization/input_quant_fp8.py", "responsibility": "激活的在线 FP8 分组量化，use_ue8m0 时把 scale 向上取整到 2 的幂（e8m0 约束）。"}
+  ],
+
+  "data_flow": [
+    "解析：QuantizationConfig.from_config 读检查点 quantization_config（quant_method 名 + 位宽 + group_size + block_size + activation_scheme + is_scale_e8m0 等）",
+    "分发：模型定义层建 Linear 时调 config.get_quant_method(layer, prefix) → 得到对应 QuantizeMethodBase（GPTQ/AWQ/Fp8…）",
+    "建权重：method.create_weights 注册 qweight/scales/qzeros/g_idx（INT 路线）或 weight(e4m3)+weight_scale(_inv, 可 e8m0fnu)（FP8 路线）",
+    "装载后：process_weights_after_loading 做重排/预处理（marlin 重打包、块 scale 布局转换等）",
+    "前向：模型 forward 调 quant_method.apply(layer, x, bias) → GPTQ 走 ops.gptq_gemm；AWQ 走 awq_dequantize/awq_gemm；FP8 走 fp8_linear.apply_weights（激活侧可在线 e8m0 量化）",
+    "反量化对照（数值推演）：quantize_weights / scaled_quantize+scaled_dequantize 提供参考实现，正文用它跑量化-反量化往返、量三法误差"
+  ],
+
+  "design_decisions": [
+    {"decision": "把二阶补偿（GPTQ）、激活感知缩放（AWQ）、难度迁移（SmoothQuant）都落成『离线产 scale，运行期只消费网格』", "why": "vllm 是推理框架，量化算法的昂贵校准（Hessian/网格搜索/迁移因子）在离线（autogptq/autoawq/llm-compressor）完成；apply 只见打包权重 + scale，保证推理面统一、轻量。", "evidence": "vllm/model_executor/layers/quantization/gptq.py:L387; vllm/model_executor/layers/quantization/awq.py:L280"},
+    {"decision": "统一 QuantizeMethodBase.apply / get_quant_method 调用面，方法各自私有 GEMM", "why": "模型定义只依赖抽象 apply，新增量化格式不改模型代码；每种格式用其最优 kernel（gptq_gemm/awq_gemm/scaled_mm）。", "evidence": "vllm/model_executor/layers/quantization/base_config.py:L36-L41,L150-L163"},
+    {"decision": "块量化 scale 用 float8_e8m0fnu（纯指数、2 的幂）", "why": "对齐 OCP Microscaling(MX) FP8 硬件格式与 DeepGEMM/DeepSeek 检查点；scale 只存 8 位指数省带宽，代价是 scale 必须是 2 的幂（exp2∘ceil∘log2 取整）。", "evidence": "vllm/model_executor/layers/quantization/fp8.py:L367; vllm/model_executor/layers/quantization/input_quant_fp8.py:L243-L244"},
+    {"decision": "对称量化用 amax 定 scale，非对称量化才引入 zero-point", "why": "对称（权重常见）省一个 zp 张量与一次加法；非对称（激活/无零对称分布）用 (max−min)/qmax + zp 覆盖偏置分布。", "evidence": "vllm/model_executor/layers/quantization/utils/quant_utils.py:L595-L608"}
+  ],
+
+  "theory": [
+    "均匀量化底座：q = clamp(round(x/scale) + zp, qmin, qmax)，反量化 x̂ = (q − zp)·scale。对称：scale=max(|x|)/qmax、zp=0；非对称：scale=(max−min)/qmax、zp=round(|min|/scale)。量化误差 |x − x̂| 上界约 scale/2（round 平均误差约 0.25·scale）。",
+    "粒度与误差：per-tensor（整张一个 scale，最省但受离群值支配）< per-token/per-channel（外维逐行/逐列 scale，GEMM 友好）< per-group（组内独立 scale，最细）。SmoothQuant §2/Table 1：激活离群值使 per-tensor 崩溃，per-channel 激活量化精度好却不兼容 INT8 GEMM（内维缩放无法融进 Tensor Core）。",
+    "GPTQ 复杂度：OBQ 逐权重 O(d_row·d_col^3)；GPTQ 全行同序 + lazy batch(B=128) + Cholesky，降到 O(max{d_row·d_col^2, d_col^3})，约提速 min{d_row,d_col} 倍——175B 模型约 4 GPU·小时。误差补偿 δ_F 只依赖层输入 Hessian H=2XX^T，与权重无关。",
+    "AWQ 误差比：对显著通道乘 s、激活除以 s 数学等价；因 RoundErr≈0.25 恒定、Δ'≈Δ（单元素缩放不改组内 max），相对误差按 (Δ'/Δ)/s < 1 缩小。s 过大抬高非显著通道 Δ'，OPT-6.7B 最优 s≈2。搜索 s=s_X^α，α∈[0,1] 网格搜。",
+    "SmoothQuant 迁移：s_j = max(|X_j|)^α / max(|W_j|)^(1−α) 让权重与激活在同通道共享相近 max、均分量化难度。α=0.5（OPT/BLOOM），α=0.75（GLM-130B 激活离群更重）。s 离线折进前一层，运行期激活已平滑、可直接 per-tensor/per-token 量化。",
+    "FP8 vs INT8 的取舍：FP8(e4m3) 有指数位、动态范围大、对离群值更鲁棒，适合 W8A8/激活量化；INT4/INT3(GPTQ/AWQ) 压缩率更高但需精细 scale + 补偿/缩放才能保精度。e8m0 scale 把每块的公共缩放约束成 2 的幂，是 MX 格式的硬件约定。"
+  ],
+
+  "subtraction_plan": {},
+
+  "mechanisms": [
+    {
+      "id": "m1-uniform-affine-quant",
+      "name": "均匀（仿射）量化：scale / zero-point / 对称 vs 非对称",
+      "kind": "algorithm",
+      "source_anchors": ["vllm/model_executor/layers/quantization/utils/quant_utils.py:L586-L621"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {"paper": "arXiv:2306.00978", "sections": ["§3.2", "Eq.1"]}
+    },
+    {
+      "id": "m2-quant-granularity",
+      "name": "量化粒度：per-tensor / per-token / per-channel / per-group",
+      "kind": "layout",
+      "source_anchors": ["vllm/model_executor/layers/quantization/utils/quant_utils.py:L577-L584", "vllm/model_executor/layers/quantization/utils/quant_utils.py:L39-L44"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "paper_origin": {"paper": "arXiv:2211.10438", "sections": ["§2", "Figure 3", "Table 1"]}
+    },
+    {
+      "id": "m3-gptq-second-order",
+      "name": "GPTQ：二阶（Hessian）误差补偿 + lazy batch + Cholesky",
+      "kind": "algorithm",
+      "source_anchors": ["vllm/model_executor/layers/quantization/utils/quant_utils.py:L655-L686", "vllm/model_executor/layers/quantization/gptq.py:L376-L399"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {"paper": "arXiv:2210.17323", "sections": ["§3", "§4", "Eq.2", "Eq.3", "Eq.4", "Eq.5", "Algorithm 1"]}
+    },
+    {
+      "id": "m4-awq-activation-aware-scaling",
+      "name": "AWQ：激活感知的逐通道缩放（保护显著权重）",
+      "kind": "algorithm",
+      "source_anchors": ["vllm/model_executor/layers/quantization/awq.py:L262-L286"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {"paper": "arXiv:2306.00978", "sections": ["§3.1", "§3.2", "Eq.1", "Eq.2", "Eq.5"]}
+    },
+    {
+      "id": "m5-smoothquant-migration",
+      "name": "SmoothQuant：把量化难度从激活迁移到权重（s 因子）",
+      "kind": "algorithm",
+      "source_anchors": ["vllm/model_executor/layers/quantization/utils/quant_utils.py:L286-L338"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {"paper": "arXiv:2211.10438", "sections": ["§4", "Eq.3", "Eq.4"]}
+    },
+    {
+      "id": "m6-dequant-error-worked-example",
+      "name": "量化-反量化误差数值推演：RTN vs AWQ vs SmoothQuant 三法对比",
+      "kind": "algorithm",
+      "source_anchors": ["vllm/model_executor/layers/quantization/utils/quant_utils.py:L614-L621", "vllm/model_executor/layers/quantization/utils/quant_utils.py:L342-L353"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {"paper": "arXiv:2306.00978", "sections": ["§3.2", "Eq.1", "Eq.2"], "note": "Eq.2 之后的 RoundErr≈0.25 散文分析"}
+    },
+    {
+      "id": "m7-quant-method-calling-surface",
+      "name": "落地调用面：quant_config → get_quant_method → quant_method.apply",
+      "kind": "protocol",
+      "source_anchors": ["vllm/model_executor/layers/quantization/base_config.py:L36-L41", "vllm/model_executor/layers/quantization/base_config.py:L150-L163"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "paper_origin_note": "纯 vllm 落地面（框架调用契约），无论文出处；回指 [模型定义章] 的 Linear 装配与量化方法分发。"
+    },
+    {
+      "id": "m8-fp8-e8m0-scale",
+      "name": "FP8(e4m3) 权重 + e8m0fnu 块 scale（scale 为 2 的幂）装载面",
+      "kind": "layout",
+      "source_anchors": ["vllm/model_executor/layers/quantization/fp8.py:L358-L370", "vllm/model_executor/layers/quantization/input_quant_fp8.py:L240-L248"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "paper_origin_note": "e8m0/MX(Microscaling) 为 OCP 硬件格式约定（非本论文包三篇之一），落地面锚点；回指 [DeepSeek-V4 章] 的 W8A8/FP8 块量化。"
+    }
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_harvest": [],
+    "bible_raw": "== ch26 应埋伏笔 ==\n  [f15] 拒绝采样保分布定理与接受率定义——ch26 只讲投机解码提议侧的工厂分发与薄壳继承，默认定理成立，证明指路到 ch24 原理篇 → 回收于 ch24\n== ch26 应回收 ==",
+    "analyst_note": "bible.py due ch26 返回的 f15 条目属投机解码（拒绝采样）主题，与本『量化数学』primer 章无关——疑为跨书(vllm-ascend)或旧大纲的 ch26 槽位残留映射。本章不应埋该伏笔；已如实记录原始输出供 Lead 核对 bible 章号映射。本量化章自身无待埋/待回收伏笔。"
+  }
+}

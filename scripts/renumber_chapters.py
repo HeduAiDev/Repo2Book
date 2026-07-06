@@ -71,7 +71,8 @@ def _rewrite_targets(inst: Path):
     out = []
     for p in pats:
         out += sorted(inst.glob(p))
-    return out
+    # 豁免重编号 plan 存档自身(否则引擎会改写自己的映射记录,毁掉考古依据)
+    return [f for f in out if not f.name.startswith('renumber-')]
 
 
 def _rewrite_text(text: str, moves, report, fname):

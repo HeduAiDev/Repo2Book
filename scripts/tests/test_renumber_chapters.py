@@ -92,3 +92,11 @@ def test_insert_generates_cascade_plan(tmp_path):
     m = {x["old_dir"]: x["new_id"] for x in plan["moves"]}
     assert m == {"ch02-beta": "ch03", "ch03-gamma": "ch04"}
     assert plan["new_chapter_dir"] == "ch02-delta"
+
+
+def test_plan_archive_file_not_rewritten(tmp_path):
+    inst = _mk(tmp_path)
+    plan_file = inst / "book" / "cartography" / "renumber-x.json"
+    plan_file.write_text(json.dumps({"moves": SWAP}), encoding="utf-8")
+    rc.apply(inst, rc.parse_moves(SWAP), dry_run=False)
+    assert json.loads(plan_file.read_text(encoding="utf-8")) == {"moves": SWAP}

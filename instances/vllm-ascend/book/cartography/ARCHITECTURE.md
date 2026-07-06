@@ -80,10 +80,10 @@ vLLM v0.21.0 是引擎本体——一套设备无关的骨架 + 一套 CUDA 实�
 在 vLLM GroupCoordinator 之上叠昇腾专属组，叠 eplb 热迁移，并把 KV 解耦的三条路讲透：PD 分离（跨节点 P2P）、KV 池化（外存储/store）、KV 卸载（host/CPU 分层）——三者互不重复。
 
 - **ch08 在 vLLM 并行组之上：MC2 / 细粒度 TP / flashcomm 与上下文并行** / 配 vLLM ch20 / `distributed/parallel_state.py`,`distributed/utils.py`（↔ `vllm/distributed/parallel_state.py`）
-- **ch09 Expert 负载均衡（eplb）：子进程规划 + D2D 权重热迁移** / 松配 vLLM ch33 / `eplb/eplb_updator.py`,`core/eplb_worker.py`,`core/eplb_device_transfer_loader.py`,`adaptor/vllm_adaptor.py`,`core/policy/*`
-- **ch10【L】PD 分离：连接器分发、mooncake P2P 传输与 KV 亲和调度** / 配 vLLM ch29–ch30 / `distributed/kv_transfer/ascend_multi_connector.py`,`kv_p2p/{mooncake_connector,mooncake_hybrid_connector,mooncake_layerwise_connector}.py`,`utils/mooncake_transfer_engine.py`,`examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py`(+layerwise),`kv_pool/ascend_store/pool_scheduler.py`(`KVPoolScheduler.get_num_new_matched_tokens`)（↔ `multi_connector.py`,`kv_connector/v1/base.py`）。三层=连接器分发 + P2P 传输 + proxy 负载均衡；**重点小节 = KV 亲和（cache-hit-aware）调度：经 `client.lookup` 查外部 KV 命中、按命中决定请求落到哪个实例，是 PD 分离省传输的关键**。与 ch11 边界：本章讲「亲和路由怎么用命中信息选节点」，ch11 讲「store/pool 本身的存取与池调度节拍」。
-- **ch11 KV 池化与 ascend_store：外存储层与池调度** / 配 vLLM ch30 / `distributed/kv_transfer/kv_pool/ascend_store/{ascend_store_connector,pool_scheduler,pool_worker,kv_transfer}.py`,`backend/mooncake_backend.py`（↔ `kv_connector/v1/base.py`,`offloading_connector.py`）
-- **ch12 KV 卸载：host/CPU 分层与 OffloadingHandler 对位** / 配 vLLM ch30 / `kv_offload/cpu_npu.py`,`kv_offload/npu.py`,`simple_kv_offload/{worker,copy_backend,npu_mem_ops}.py`（↔ `kv_connector/v1/offloading_connector.py`,`simple_cpu_offload_connector.py`,`vllm/v1/kv_offload/cpu/manager.py`）
+- **ch09 Expert 负载均衡（eplb）：子进程规划 + D2D 权重热迁移** / 松配 vLLM ch36 / `eplb/eplb_updator.py`,`core/eplb_worker.py`,`core/eplb_device_transfer_loader.py`,`adaptor/vllm_adaptor.py`,`core/policy/*`
+- **ch10【L】PD 分离：连接器分发、mooncake P2P 传输与 KV 亲和调度** / 配 vLLM ch32–ch30 / `distributed/kv_transfer/ascend_multi_connector.py`,`kv_p2p/{mooncake_connector,mooncake_hybrid_connector,mooncake_layerwise_connector}.py`,`utils/mooncake_transfer_engine.py`,`examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py`(+layerwise),`kv_pool/ascend_store/pool_scheduler.py`(`KVPoolScheduler.get_num_new_matched_tokens`)（↔ `multi_connector.py`,`kv_connector/v1/base.py`）。三层=连接器分发 + P2P 传输 + proxy 负载均衡；**重点小节 = KV 亲和（cache-hit-aware）调度：经 `client.lookup` 查外部 KV 命中、按命中决定请求落到哪个实例，是 PD 分离省传输的关键**。与 ch11 边界：本章讲「亲和路由怎么用命中信息选节点」，ch11 讲「store/pool 本身的存取与池调度节拍」。
+- **ch11 KV 池化与 ascend_store：外存储层与池调度** / 配 vLLM ch33 / `distributed/kv_transfer/kv_pool/ascend_store/{ascend_store_connector,pool_scheduler,pool_worker,kv_transfer}.py`,`backend/mooncake_backend.py`（↔ `kv_connector/v1/base.py`,`offloading_connector.py`）
+- **ch12 KV 卸载：host/CPU 分层与 OffloadingHandler 对位** / 配 vLLM ch33 / `kv_offload/cpu_npu.py`,`kv_offload/npu.py`,`simple_kv_offload/{worker,copy_backend,npu_mem_ops}.py`（↔ `kv_connector/v1/offloading_connector.py`,`simple_cpu_offload_connector.py`,`vllm/v1/kv_offload/cpu/manager.py`）
 
 ### Part IV — 执行主线：NPUWorker 与 NPUModelRunner
 全书执行脊柱。两种顶替策略：Worker 重写、ModelRunner 继承+猴补；末章把 310P 推理芯片的全栈再子类化集中讲。
@@ -97,10 +97,10 @@ vLLM v0.21.0 是引擎本体——一套设备无关的骨架 + 一套 CUDA 实�
 ### Part V — 注意力与 KV：NPU 后端特化
 vLLM 注意力后端契约的昇腾对位篇。
 
-- **ch18 昇腾如何接进 vLLM 的注意力后端选择** / 配 vLLM ch24 / `platform.py`,`attention/attention_v1.py`,`attention/abstract.py`（↔ `vllm/v1/attention/backends/registry.py`,`flash_attn.py`）
-- **ch19 AscendAttentionBackendImpl：标准 MHA 的 NPU 内核与状态机** / 配 vLLM ch24 / `attention/attention_v1.py`,`attention_mask.py`,`utils.py`（↔ `flash_attn.py`）
-- **ch20【旗舰】MLA 在 NPU 上：prefill/decode 拆分与权重吸收** / 配 vLLM ch24 / `attention/mla_v1.py`（↔ `vllm/v1/attention/backends/mla/common.py`）
-- **ch21 稀疏注意力：SFA 与 DSA（Lightning Indexer）** / 松配 vLLM ch24 / `attention/sfa_v1.py`,`dsa_v1.py`,`device/device_op.py`（vLLM 主干无对位）
+- **ch18 昇腾如何接进 vLLM 的注意力后端选择** / 配 vLLM ch25 / `platform.py`,`attention/attention_v1.py`,`attention/abstract.py`（↔ `vllm/v1/attention/backends/registry.py`,`flash_attn.py`）
+- **ch19 AscendAttentionBackendImpl：标准 MHA 的 NPU 内核与状态机** / 配 vLLM ch25 / `attention/attention_v1.py`,`attention_mask.py`,`utils.py`（↔ `flash_attn.py`）
+- **ch20【旗舰】MLA 在 NPU 上：prefill/decode 拆分与权重吸收** / 配 vLLM ch25 / `attention/mla_v1.py`（↔ `vllm/v1/attention/backends/mla/common.py`）
+- **ch21 稀疏注意力：SFA 与 DSA（Lightning Indexer）** / 松配 vLLM ch25 / `attention/sfa_v1.py`,`dsa_v1.py`,`device/device_op.py`（vLLM 主干无对位）
 - **ch22 KV cache 管理与调度器的 NPU 特化** / 配 vLLM ch15,ch13,ch14 / `core/single_type_kv_cache_manager.py`,`core/scheduler_dynamic_batch.py`,`recompute_scheduler.py`,`scheduler_profiling_chunk.py`
 
 ### Part VI — 自定义算子与编译：换头不换身
@@ -115,8 +115,8 @@ vLLM 注意力后端契约的昇腾对位篇。
 收束「找到 vLLM 扩展点 → 注册/子类化/换实现」四种范式（注册表+工厂 / 子类化覆写 / 工厂分发 / 运行时类替换）。
 
 - **ch27 昇腾量化框架：把 NPU 量化方案接进 vLLM** / 配 vLLM ch22,ch23 / `quantization/{modelslim_config,method_adapters,quant_parser}.py`,`methods/{registry,base,w8a8_dynamic}.py`（↔ `vllm/model_executor/layers/quantization/`）
-- **ch28 采样的 NPU 对位：规避 CPU-NPU 同步与 Triton 回退** / 配 vLLM ch27 / `sample/{sampler,rejection_sampler,penalties}.py`（↔ `vllm/v1/sample/{sampler,rejection_sampler}.py`）
-- **ch29 投机解码的 NPU 对位：proposer 工厂与薄壳继承** / 配 vLLM ch28 / `spec_decode/{__init__,llm_base_proposer,ngram_proposer_npu}.py`（↔ `vllm/v1/spec_decode/`）
+- **ch28 采样的 NPU 对位：规避 CPU-NPU 同步与 Triton 回退** / 配 vLLM ch29 / `sample/{sampler,rejection_sampler,penalties}.py`（↔ `vllm/v1/sample/{sampler,rejection_sampler}.py`）
+- **ch29 投机解码的 NPU 对位：proposer 工厂与薄壳继承** / 配 vLLM ch31 / `spec_decode/{__init__,llm_base_proposer,ngram_proposer_npu}.py`（↔ `vllm/v1/spec_decode/`）
 - **ch30 模型、LoRA 与网络加载的昇腾接入：注册、全局类替换与 netloader** / 配 vLLM ch22,ch25 / `models/{__init__,deepseek_v4}.py`,`lora/{punica_npu,lora_ops,utils}.py`,`model_loader/netloader/{load,netloader}.py`（↔ `vllm/model_executor/models/deepseek_v2.py`,`vllm/lora/punica_wrapper/`,`vllm/model_executor/model_loader`）
 
 ---

@@ -1,0 +1,270 @@
+{
+  "chapter": "ch26-primer-quantization",
+  "note": "素材真相源：每个 worked_example 表的数字都来自 explainer/traces/<id>.json，由 explainer/traces/run_<id>.py 跑 implementation/ 的论文忠实参考实现产出（PYTHONPATH=implementation python3 explainer/traces/run_<id>.py）。三篇论文的算法（GPTQ Hessian 补偿 / AWQ 缩放搜索 / SmoothQuant 迁移）都是离线校准，vllm 只消费其输出——参考实现让读者能亲手复算论文公式。",
+
+  "mechanisms": [
+    {
+      "mechanism_id": "m1-uniform-affine-quant",
+      "intuition": "把一段连续的实数刻度塞进有限的整数格子里，就像用一把只有 16 个刻度的尺子量身高：先决定『一格代表多少』(scale)，再决定『零点画在第几格』(zero-point)。对称量化把零点钉死在正中；非对称量化允许零点平移，好让尺子的全部刻度都压在数据真正出现的区间上、一格都不浪费。",
+      "worked_example": {
+        "params": {"n_bits": 4, "grid_unsigned": "[0,15]", "w": [-1.0, -0.32, 0.24, 0.68, 1.36, 2.0], "scale_asym": 0.2, "zero_point": 5},
+        "trace_source": "run",
+        "trace_ref": "traces/m1.json",
+        "driver": "traces/run_m1.py",
+        "landing_code": "vllm/model_executor/layers/quantization/utils/quant_utils.py:L586-L621 (quantize_weights)",
+        "table": {
+          "columns": ["权重 w", "w / scale", "round()", "code = round+zp, clamp[0,15]", "反量化 ŵ = (code−zp)·scale", "|w − ŵ|"],
+          "rows": [
+            [-1.0, -5.0, -5, 0, -1.0, 0.0],
+            [-0.32, -1.6, -2, 3, -0.4, 0.08],
+            [0.24, 1.2, 1, 6, 0.2, 0.04],
+            [0.68, 3.4, 3, 8, 0.6, 0.08],
+            [1.36, 6.8, 7, 12, 1.4, 0.04],
+            [2.0, 10.0, 10, 15, 2.0, 0.0]
+          ]
+        },
+        "note": "非对称 4-bit：scale=(max−min)/15=(2.0−(−1.0))/15=0.2，zp=round(|min|/scale)=round(1.0/0.2)=5。两个端点 −1.0/2.0 恰好落到格子 0 与 15，全部 16 格都用上；最大误差 0.08 ≤ scale/2=0.1。对照同一向量的对称量化 scale=0.2857、最大误差 0.1429——对称把一半刻度浪费在数据没出现的负区间上。"
+      },
+      "invariant": {
+        "claim": "对任何未被 clamp 饱和的元素，量化-反量化的绝对误差恒有 |w − ŵ| ≤ scale/2。",
+        "argument": "由『四舍五入到最近整数』的定义，|w/scale − round(w/scale)| ≤ 0.5；两边同乘 scale 得 |w − round(w/scale)·scale| ≤ scale/2。zero-point 是精确整数偏移，在 code 里加、在反量化 (code−zp)·scale 里减，完全抵消、不引入额外误差。trace 实测 max|w−ŵ|=0.08 ≤ half_scale=0.1，符合上界。"
+      },
+      "quantified": "4-bit=16 个格点。非对称把 [−1.0, 2.0] 的宽度 3.0 铺满 16 格，scale=0.2、最大误差 0.08（仅为半格 0.1 的 80%）；对称对同一向量 scale=0.2857、最大误差 0.1429，比非对称大 79%——差距全来自对称浪费掉的负半轴刻度。",
+      "figure_specs": [
+        {
+          "figure_id": "fig35-1-affine-grid",
+          "claim": "非对称仿射量化用 scale+zero-point 把权重区间铺满整个整数格，最大误差被钉在半格以内。",
+          "template": "state-table",
+          "numbers": [
+            {"value": "0.2", "provenance": "traces/m1.json asymmetric.scale"},
+            {"value": "5", "provenance": "traces/m1.json asymmetric.zero_point"},
+            {"value": "codes 0,3,6,8,12,15", "provenance": "traces/m1.json asymmetric.codes"},
+            {"value": "max|err|=0.08", "provenance": "traces/m1.json asymmetric.max_abs_err"},
+            {"value": "half_scale=0.1", "provenance": "traces/m1.json asymmetric.half_scale"},
+            {"value": "symmetric scale=0.2857, max|err|=0.1429", "provenance": "traces/m1.json symmetric"}
+          ],
+          "caption_draft": "非对称 4-bit 量化把权重 [−1.0, 2.0] 映到 [0,15] 全格：两端点占满 code 0 与 15，最大误差 0.08 落在半格 0.1 内；对称量化对同一向量误差 0.1429，因半数刻度落在空的负区间而更差。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m2-quant-granularity",
+      "figure_specs": [
+        {
+          "figure_id": "fig35-2-granularity-collapse",
+          "claim": "单一 per-tensor scale 下，离群通道独占几乎全部量化档位，其余通道被压到只剩个位数有效档位——所以激活量化需要更细的 per-token/per-channel 粒度。",
+          "template": "state-table",
+          "numbers": [
+            {"value": "full levels = 256 (8-bit)", "provenance": "traces/m2.json params.full_levels"},
+            {"value": "outlier channel keeps 256.0", "provenance": "traces/m2.json outlier_levels"},
+            {"value": "non-outlier collapses to 1.78", "provenance": "traces/m2.json min_nonoutlier_levels"},
+            {"value": "channel absmax m_i: 1.136 / 163.4783 / 1.643 / 1.7321", "provenance": "traces/m2.json rows"},
+            {"value": "tensor absmax m=163.4783", "provenance": "traces/m2.json params.tensor_absmax_m"}
+          ],
+          "caption_draft": "8-bit per-tensor 量化下，有效档位 = 256·m_i/m。100x 离群通道保住全部 256 档，而普通通道跌到 1.78 档——per-tensor 激活量化因此崩溃；per-token（逐行）/per-channel（逐列）给每条尺子独立 scale 才能救回精度，但 per-channel 激活量化无法融进 INT8 GEMM 内维，这正是 SmoothQuant/AWQ 要解决的两难。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m3-gptq-second-order",
+      "intuition": "普通量化像挨个把家具推到最近的格线上，推歪了就算了；GPTQ 像一个会『找补』的搬运工：每把一件家具推到格线（不可避免地推歪一点），立刻用二阶信息（层输入的 Hessian）算出这点歪会怎样连累输出，然后微调所有还没摆放的家具去抵消它。等轮到那些家具时，它们已经预先偏移好了。",
+      "worked_example": {
+        "params": {"n_bits": 3, "W_row": [0.1, 0.95, -0.4, 0.55], "note": "1×4 权重行，3-bit 网格，逐列量化+补偿"},
+        "trace_source": "run",
+        "trace_ref": "traces/m3.json",
+        "driver": "traces/run_m3.py",
+        "landing_code": "vllm/model_executor/layers/quantization/gptq.py:L376-L399 (推理期 ops.gptq_gemm 消费离线产物)",
+        "table": {
+          "columns": ["列 j", "w_j (进入时值)", "量化 q_j", "误差 e_j=(w−q)/[Ĥ⁻¹]_jj", "块内剩余列：补偿前 → 补偿后"],
+          "rows": [
+            [0, 0.1, 0.1929, -0.0267, "[0.95, -0.4, 0.55] → [0.9172, -0.3525, 0.4069]"],
+            [1, 0.9172, 0.9643, -0.0553, "[-0.3525, 0.4069] → [-0.3619, 0.3703]"],
+            [2, -0.3619, -0.3857, 0.025, "[0.3703] → [0.3945]"],
+            [3, 0.3945, 0.3857, 0.0094, "(块末，无剩余列)"]
+          ]
+        },
+        "note": "逐列从左到右量化：量化第 0 列产生误差后，第 1/2/3 列的值被就地更新（0.95→0.9172…）去抵消它；轮到第 1 列时它已带着补偿量进入。整行做完，GPTQ 的重构误差 0.0057 vs 朴素 RTN 0.0253，降低 77.33%；blocksize=1/2/4 得到完全相同的 0.0057，印证 Eq.4-5 只是效率重排、不是另一套算法。"
+      },
+      "invariant": {
+        "claim": "每列恰好被量化一次、d_col 步内终止，且产出的 Q 与 lazy-batch 的 blocksize 无关。",
+        "argument": "外层按列从左到右推进，每步『未量化列数』严格减 1，非负整数单调递减 → 至多 d_col 步必停。块内逐列补偿 W[:,j:] −= e·Ĥ⁻¹[j,j:] 与块末一次性补偿 W[:,end:] −= E·Ĥ⁻¹ 合起来，等价于对每一后续列施加与逐列 OBQ 相同的更新（Eq.4-5 是 Eq.2-3 的代数重排），故与分块大小无关：trace 中 blocksize 1/2/4 均得 0.0057。补偿把误差投影到未量化子空间去抵消输出扰动，因此重构误差 ≤ 无补偿的 RTN（0.0057 ≤ 0.0253）。"
+      },
+      "quantified": "RTN 重构误差 0.0253 → GPTQ 0.0057，降 77.33%。复杂度：OBQ 逐权重贪心 O(d_row·d_col³)；GPTQ 全行同序 + lazy batch(B=128) + Cholesky 稳定化降到 O(max{d_row·d_col², d_col³})，约提速 min{d_row,d_col} 倍——175B 模型约 4 GPU·小时。Hessian H=2XXᵀ 只依赖层输入、与权重无关。",
+      "figure_specs": [
+        {
+          "figure_id": "fig35-3-gptq-compensation",
+          "claim": "二阶补偿把每列的量化误差预先摊到未量化列上，重构误差比朴素 RTN 降 77%，且与 lazy-batch 分块大小无关。",
+          "template": "before-after",
+          "numbers": [
+            {"value": "RTN error = 0.0253", "provenance": "traces/m3.json rtn_error"},
+            {"value": "GPTQ error = 0.0057", "provenance": "traces/m3.json gptq_error"},
+            {"value": "reduction 77.33%", "provenance": "traces/m3.json improvement_pct"},
+            {"value": "blocksize 1/2/4 all = 0.0057", "provenance": "traces/m3.json blocksize_invariance"},
+            {"value": "col0 err −0.0267 shifts [0.95,-0.4,0.55]→[0.9172,-0.3525,0.4069]", "provenance": "traces/m3.json per_column_rows[0]"}
+          ],
+          "caption_draft": "GPTQ 逐列量化并即时补偿：量化第 0 列的误差 −0.0267 让后续列从 [0.95,−0.4,0.55] 偏移到 [0.9172,−0.3525,0.4069] 预抵消。整行重构误差 0.0253→0.0057（−77%），blocksize 1/2/4 结果完全相同——lazy batch 是效率重排而非新算法。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m4-awq-activation-aware-scaling",
+      "intuition": "不是所有权重同等重要：乘上大激活的那些权重（『显著』权重）一旦量化歪了，对输出的伤害被激活放大。AWQ 的做法像给重要选手穿放大镜——量化前把显著权重乘一个 s>1（激活对应除以 s，数学上完全抵消），于是它在量化格子里占的相对位置更精细、round 误差被摊薄；但 s 太大又会撑大整组的格距 Δ 连累其他人，所以有个甜点。",
+      "worked_example": {
+        "params": {"T": 8, "Ci": 4, "Co": 3, "n_bits": 4, "salient_channel": 0, "activation_mult": 12.0, "grid": "alpha in {0,.25,.5,.75,1}, s=s_X^alpha"},
+        "trace_source": "run",
+        "trace_ref": "traces/m4.json",
+        "driver": "traces/run_m4.py",
+        "landing_code": "vllm/model_executor/layers/quantization/awq.py:L262-L286 (推理期消费已折进 scales 的缩放)",
+        "table": {
+          "columns": ["α（迁移强度，s=s_X^α）", "层输出重构损失 L(s_X^α) = ‖Q(W·diag(s))·(diag(s)⁻¹X) − WX‖"],
+          "rows": [
+            [0.0, 0.2118],
+            [0.25, 0.1464],
+            [0.5, 0.1517],
+            [0.75, 0.1651],
+            [1.0, 0.2791]
+          ]
+        },
+        "note": "s_X 为逐输入通道平均激活幅度，channel 0 被放大 12x（显著）。α=0（不缩放）损失 0.2118；α=1（最激进，s=s_X）损失 0.2791 反而最差——过度缩放撑大非显著通道的 Δ'；甜点在 α=0.25，损失 0.1464，比不缩放降 30.87%。RoundErr 均值 trace 实测 0.2501≈0.25，印证 AWQ『误差期望恒为 0.25 格』的前提。"
+      },
+      "invariant": {
+        "claim": "损失 L(s_X^α) 在 α∈[0,1] 上取到内部极小，两端点都比内部差。",
+        "argument": "α=0 时 s=1 不缩放，显著权重无保护 → L(0)=0.2118；α=1 时 s=s_X 全量缩放，把非显著通道的格距 Δ' 撑大 → L(1)=0.2791；L 是 α 的连续函数，两端点值均严格大于内部网格点 L(0.25)=0.1464，故极小点严格落在 (0,1) 内。这不是断言——是 trace 网格上端点 > 内部的实测不等式。",
+        "note": "对显著单元乘 s、激活除以 s 是数学等价：Eq.2 的 x/s 与 w·s 在输出值里相消，只有 w 的量化误差被 (Δ'/Δ)/s 缩小。"
+      },
+      "quantified": "4 输入通道、显著通道激活放大 12x。最优 α=0.25 把层损失从 0.2118（不缩放）降到 0.1464，减 30.87%；过度缩放 α=1 损失 0.2791 反超基线。RoundErr 实测均值 0.2501≈0.25。搜索空间单一超参 α∈[0,1] 网格搜（论文 grid=20）。",
+      "figure_specs": [
+        {
+          "figure_id": "fig35-4-awq-alpha-sweep",
+          "claim": "AWQ 用激活幅度定缩放 s=s_X^α；损失随 α 呈 U 形，甜点在内部（此例 α=0.25 降损 31%），α=1 过度缩放反而最差。",
+          "template": "state-table",
+          "numbers": [
+            {"value": "L(0.0)=0.2118", "provenance": "traces/m4.json alpha_grid"},
+            {"value": "L(0.25)=0.1464 (best)", "provenance": "traces/m4.json alpha_grid + best_alpha"},
+            {"value": "L(0.5)=0.1517", "provenance": "traces/m4.json alpha_grid"},
+            {"value": "L(0.75)=0.1651", "provenance": "traces/m4.json alpha_grid"},
+            {"value": "L(1.0)=0.2791", "provenance": "traces/m4.json alpha_grid"},
+            {"value": "reduction 30.87%", "provenance": "traces/m4.json improvement_pct"},
+            {"value": "RoundErr mean 0.2501", "provenance": "traces/m4.json round_err_mean"}
+          ],
+          "caption_draft": "激活感知缩放的损失-α 曲线：α=0 不保护显著权重（0.2118），α=1 过度缩放撑大非显著通道格距（0.2791），甜点 α=0.25 降损至 0.1464（−31%）。缩放全在离线完成，vllm 只见已折进 scales 的打包 INT4 权重。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m5-smoothquant-migration",
+      "intuition": "激活里常有几个『大嗓门』通道（离群值），一把 per-tensor 尺子被它们撑爆、其他通道没了精度。SmoothQuant 不删嗓门，而是把难度搬家：给这些通道的激活除以 s、对应权重乘以 s（矩阵乘法里两者相消，输出分毫不变），于是激活被抹平、权重稍微变陡——权重本来分布规整、扛得住。难度守恒，但被均分到激活和权重两边。",
+      "worked_example": {
+        "params": {"T": 6, "Ci": 4, "Co": 3, "n_bits": 8, "outlier_channel": 2, "outlier_mult": 60.0, "alpha": 0.5},
+        "trace_source": "run",
+        "trace_ref": "traces/m5.json",
+        "driver": "traces/run_m5.py",
+        "landing_code": "vllm/model_executor/layers/quantization/utils/quant_utils.py:L322-L338 (scaled_quantize 消费已迁移的激活)",
+        "table": {
+          "columns": ["输入通道 j", "s_j = max|X_j|^α/max|W_j|^{1−α}", "max|X_j| 迁移前", "迁移后", "max|W_j| 迁移前", "迁移后"],
+          "rows": [
+            [0, 1.4524, 2.0409, 1.4052, 0.9675, 1.4052],
+            [1, 2.575, 3.323, 1.2905, 0.5012, 1.2905],
+            [2, 16.5362, 121.1992, 7.3293, 0.4432, 7.3293],
+            [3, 1.3018, 0.5678, 0.4362, 0.3351, 0.4362]
+          ]
+        },
+        "note": "α=0.5、通道 2 是 60x 激活离群通道：迁移把它的激活 absmax 从 121.1992 压到 7.3293（÷16.54），权重 absmax 从 0.4432 抬到 7.3293（×16.54）——迁移后两者恰好相等（α=0.5 的均分含义）。迁移是精确恒等：trace 实测 X̂Ŵ 与 XW 的最大差 0.0，逐元素不变。整层 per-tensor W8A8 误差从 1.1515 降到最优 0.5273（α=0.75，此重离群层需更多迁移到权重侧），减 54.21%。"
+      },
+      "invariant": {
+        "claim": "对任意正 s，迁移是精确恒等 X̂Ŵ = XW——只改可量化性，绝不改浮点结果。",
+        "argument": "X̂Ŵ = (X·diag(s)⁻¹)(diag(s)·W) = X·(diag(s)⁻¹diag(s))·W = X·I·W = XW，因为对任意正 s 有 diag(s)⁻¹diag(s)=I。trace 实测 max|X̂Ŵ − XW|=0.0 印证。选定 s 后是一次难度再分配：通道 j 的激活 max 除以 s_j、权重 max 乘 s_j，α 控制搬多少——α=0.5 使两侧 max 相等（见通道 2：7.3293=7.3293）。"
+      },
+      "quantified": "通道 2（60x 离群）：激活 absmax 121.1992→7.3293（降 16.5x），权重 absmax 0.4432→7.3293（升 16.5x）。整层 per-tensor W8A8 量化误差 1.1515→0.5273（最优 α=0.75），减 54.21%。α=0.5 是 OPT/BLOOM 甜点，本例重离群层最优 α=0.75，与论文 GLM-130B 取 0.75 一致。",
+      "figure_specs": [
+        {
+          "figure_id": "fig35-5-smoothquant-migration",
+          "claim": "SmoothQuant 把离群通道的量化难度从激活搬到权重：激活 absmax 骤降、权重 absmax 上升，二者在 α=0.5 处相等，整层量化误差减半。",
+          "template": "before-after",
+          "numbers": [
+            {"value": "outlier ch2 |X| 121.1992 → 7.3293", "provenance": "traces/m5.json migration_rows[2]"},
+            {"value": "outlier ch2 |W| 0.4432 → 7.3293", "provenance": "traces/m5.json migration_rows[2]"},
+            {"value": "s_2 = 16.5362", "provenance": "traces/m5.json s_factor"},
+            {"value": "identity check max diff = 0.0", "provenance": "traces/m5.json equiv_max_diff"},
+            {"value": "per-tensor W8A8 error 1.1515 → 0.5273", "provenance": "traces/m5.json err_raw_pertensor + best_err"},
+            {"value": "reduction 54.21%", "provenance": "traces/m5.json improvement_pct"}
+          ],
+          "caption_draft": "60x 激活离群通道经 SmoothQuant 迁移（s=16.54）：激活 absmax 121.2→7.33、权重 absmax 0.44→7.33，两侧对齐。变换是精确恒等（最大差 0.0），却把 per-tensor W8A8 误差从 1.1515 降到 0.5273（−54%）。s 离线折进前一层，运行期激活已被抹平。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m6-dequant-error-worked-example",
+      "intuition": "同一个『难量化』的离群层，三种误差控制哲学各显神通：RTN 直接四舍五入（认命）、AWQ 保护显著权重（挑重点选手放大镜）、SmoothQuant 把激活难度迁到权重（难度搬家）。把它们放到同一台秤上称『量化-反量化往返后输出偏了多少』，每种缓解都赢过它对应制式下的 RTN 裸跑。",
+      "worked_example": {
+        "params": {"T": 6, "Ci": 4, "Co": 3, "outlier_channel": 2, "outlier_mult": 50.0, "best_alpha_awq": 0.25, "metric": "||Ŷ − Y|| 层输出重构误差"},
+        "trace_source": "run",
+        "trace_ref": "traces/m6.json",
+        "driver": "traces/run_m6.py",
+        "landing_code": "vllm/model_executor/layers/quantization/utils/quant_utils.py:L614-L621 (int 反量化往返) / L322-L338 (fp8 amax)",
+        "table": {
+          "columns": ["方法", "量化制式", "输出误差 ‖Ŷ−Y‖", "相对误差 %", "机制"],
+          "rows": [
+            ["RTN", "W8A8", 0.8424, 1.32, "无缓解"],
+            ["SmoothQuant", "W8A8", 0.2604, 0.41, "离线迁移难度到权重"],
+            ["RTN", "W4-weight-only", 3.5991, 5.63, "无缓解"],
+            ["AWQ", "W4-weight-only", 2.2373, 3.5, "激活感知缩放"]
+          ]
+        },
+        "note": "同一 50x 激活离群层、各方法与自己制式下的 RTN 基线对照，公平可比。W8A8 制式（激活+权重 8-bit per-tensor）：SmoothQuant 0.2604 < RTN 0.8424，降 69.09%。W4 weight-only 制式（权重 4-bit、激活全精度）：AWQ 2.2373 < RTN 3.5991，降 37.84%。两条制式误差量级不同（W4 压缩率更高、误差也更大），故分制式内比较，不跨制式并列。"
+      },
+      "invariant": {
+        "claim": "在离群层上，每种缓解都严格低于其同制式的 RTN 基线（同制式内的成对不等式）。",
+        "argument": "不是断言，是 trace 实测的两组成对不等式：W8A8 制式 SmoothQuant 0.2604 < RTN 0.8424；W4 制式 AWQ 2.2373 < RTN 3.5991。两种缓解都在量化前重塑了 absmax 分布（SmoothQuant 抹平激活离群、AWQ 保护显著权重），使共享 scale 少浪费档位在离群值上，故往返误差单调下降。"
+      },
+      "quantified": "W8A8：SmoothQuant 把输出误差从 RTN 的 0.8424（相对 1.32%）降到 0.2604（0.41%），减 69.09%。W4 weight-only：AWQ 从 RTN 的 3.5991（5.63%）降到 2.2373（3.50%），减 37.84%。W4 制式误差量级约为 W8A8 的 4-8 倍，体现『压缩率越高越依赖误差控制』。",
+      "figure_specs": [
+        {
+          "figure_id": "fig35-6-three-methods",
+          "claim": "同一离群层上，SmoothQuant（W8A8）与 AWQ（W4）各自把量化-反量化往返误差压到同制式 RTN 基线之下。",
+          "template": "state-table",
+          "numbers": [
+            {"value": "RTN W8A8 = 0.8424 (1.32%)", "provenance": "traces/m6.json rows[0]"},
+            {"value": "SmoothQuant W8A8 = 0.2604 (0.41%)", "provenance": "traces/m6.json rows[1]"},
+            {"value": "RTN W4 = 3.5991 (5.63%)", "provenance": "traces/m6.json rows[2]"},
+            {"value": "AWQ W4 = 2.2373 (3.50%)", "provenance": "traces/m6.json rows[3]"},
+            {"value": "W8A8 reduction 69.09%", "provenance": "traces/m6.json w8a8_reduction_pct"},
+            {"value": "W4 reduction 37.84%", "provenance": "traces/m6.json w4_reduction_pct"}
+          ],
+          "caption_draft": "三法在同一 50x 离群层的输出误差（与同制式 RTN 对照）：W8A8 下 SmoothQuant 0.2604 vs RTN 0.8424（−69%）；W4 weight-only 下 AWQ 2.2373 vs RTN 3.5991（−38%）。误差按量化制式分组比较——每种缓解都赢过自己制式的裸量化。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m7-quant-method-calling-surface",
+      "intuition": "模型定义层不关心权重是 GPTQ 的打包 INT、AWQ 的缩放 INT4、还是 FP8——它只对着一个统一插座 quant_method.apply(layer, x, bias) 说话。检查点里的 quantization_config 决定插进来的是哪种方法（get_quant_method 按 layer/prefix 分发），每种方法内部再走自己最优的 kernel。加新量化格式不用改一行模型代码。",
+      "note": "纯 vllm 落地面（框架调用契约），无论文出处、无参考实现——直接由真实源码 base_config.py:L36-L41(apply) / L150-L163(get_quant_method) 讲解。回指 [模型定义章](../../ch22-model-definitions/narrative/chapter.md) 的 Linear 装配与量化方法分发。needs_figure=false、needs_worked_example=false，本条仅供 writer 叙事衔接。"
+    },
+
+    {
+      "mechanism_id": "m8-fp8-e8m0-scale",
+      "figure_specs": [
+        {
+          "figure_id": "fig35-7-e8m0-rounding",
+          "claim": "e8m0 块 scale 只存 8 位指数、无尾数，所以连续 amax scale 必须向上取整到最近的 2 的幂——scales_raw = exp2(ceil(log2(absmax/448)))。",
+          "template": "state-table",
+          "numbers": [
+            {"value": "FP8_MAX=448.0 (e4m3fn)", "provenance": "file:vllm/model_executor/layers/quantization/input_quant_fp8.py:L24 + traces/m8.json params.FP8_MAX"},
+            {"value": "absmax 7.0 → raw 0.015625 → 2^-6 = 0.015625 (已是 2 的幂，overshoot 0%)", "provenance": "traces/m8.json rows[0]"},
+            {"value": "absmax 100.0 → raw 0.223214 → 2^-2 = 0.25 (overshoot 12%)", "provenance": "traces/m8.json rows[1]"},
+            {"value": "absmax 300.0 → raw 0.669643 → 2^0 = 1.0 (overshoot 49.33%)", "provenance": "traces/m8.json rows[2]"},
+            {"value": "absmax 1000.0 → raw 2.232143 → 2^2 = 4.0 (overshoot 79.2%)", "provenance": "traces/m8.json rows[3]"},
+            {"value": "e8m0: 8 exponent bits, 0 mantissa bits", "provenance": "traces/m8.json params + file:input_quant_fp8.py:L243-L244"}
+          ],
+          "caption_draft": "e8m0(ue8m0) 块 scale 的一行数学：连续 scale=absmax/448 被 exp2∘ceil∘log2 向上取整到最近 2 的幂。取整量随 absmax 落点从 0%（恰为 2 的幂）到 79% 不等；ceil（向上）保证 FP8 格永不裁掉块内最大值。这是 OCP Microscaling(MX) FP8 的硬件约定在 vllm 的落地，DeepSeek 系 128×128 块量化即用之。回指 [DeepSeek-V4 章](../../ch27-model-architecture/narrative/chapter.md)。"
+        }
+      ]
+    }
+  ]
+}

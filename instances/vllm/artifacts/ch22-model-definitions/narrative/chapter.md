@@ -13,7 +13,7 @@
 
 打开之后会发现：vLLM 的模型代码，和你在 HuggingFace `transformers` 里见过的 Llama 长得**很像**，又**很不一样**。像，是因为它就是标准的 decoder-only transformer——embedding、N 层 block、末尾 norm。不一样，是因为每一处都为「多卡推理」和「高效装载」改造过：三个投影 fuse 成一个、线性层自带张量并行切分、注意力收口成一个对后端无感的封装、权重从磁盘流式切进各卡。
 
-为什么挑 Llama？因为它是**最简基线**。没有专家混合（MoE），没有潜在瓶颈（MLA），没有量化压缩，没有混合残差。后面 [第 25 章读 DeepSeek-V4](../../ch25-model-architecture/narrative/chapter.md) 时，会把每一个新增结构都当作「对 Llama 的 delta」引入。所以这一章不只是讲 Llama——是在**确立一份契约**，让所有 vLLM v1 模型都照着它长。
+为什么挑 Llama？因为它是**最简基线**。没有专家混合（MoE），没有潜在瓶颈（MLA），没有量化压缩，没有混合残差。后面 [第 27 章读 DeepSeek-V4](../../ch27-model-architecture/narrative/chapter.md) 时，会把每一个新增结构都当作「对 Llama 的 delta」引入。所以这一章不只是讲 Llama——是在**确立一份契约**，让所有 vLLM v1 模型都照着它长。
 
 四条主线：
 
@@ -170,7 +170,7 @@ with pytest.raises(ValueError, match="Duplicate layer name"):
     Attention(2, 2, 1.0, num_kv_heads=2, prefix="model.layers.0.self_attn.attn")
 ```
 
-那行 `self.kv_cache = torch.tensor([])` 也值得留意——构造时 KV cache 是个**空占位**，等 model runner 后续 `bind_kv_cache` 才把真正的分页缓存塞进来。模型定义阶段根本不碰 KV cache 的内存。[第 24 章](../../ch24-attention/narrative/chapter.md)讲注意力后端时会接上这条线。
+那行 `self.kv_cache = torch.tensor([])` 也值得留意——构造时 KV cache 是个**空占位**，等 model runner 后续 `bind_kv_cache` 才把真正的分页缓存塞进来。模型定义阶段根本不碰 KV cache 的内存。[第 25 章](../../ch25-attention/narrative/chapter.md)讲注意力后端时会接上这条线。
 
 ---
 
@@ -631,7 +631,7 @@ class Attention(nn.Module, AttentionLayerBase):
 
 存 KV、算注意力、返回输出。`LlamaAttention` 构造它时只给了什么？回看 22.4 节那段构造代码下面的 `self.attn = attn_cls(...)`——只传 `num_heads`、`head_dim`、`scaling`、`num_kv_heads`、`prefix`。后端选择（`get_attn_backend`）、KV cache 管理、量化 scale，统统是 `Attention` 内部的事，模型定义碰都不碰。
 
-这就是 vLLM 支持「多模型 × 多后端」的解耦点。换一个注意力后端，不用改任何一行模型代码——`Attention` 内部换 `self.impl` 就行。它的 `forward` 经两个自定义算子（`unified_kv_cache_update` + `unified_attention_with_output`），从 `forward_context` 按 `layer_name`（还记得吗，就是 `prefix`）取回本层的 `kv_cache` 和 `attn_metadata`。这两个算子怎么进 `torch.compile` 图、后端怎么选，是[第 23 章](../../ch23-custom-ops-and-compilation/narrative/chapter.md)和[第 24 章](../../ch24-attention/narrative/chapter.md)的主题。
+这就是 vLLM 支持「多模型 × 多后端」的解耦点。换一个注意力后端，不用改任何一行模型代码——`Attention` 内部换 `self.impl` 就行。它的 `forward` 经两个自定义算子（`unified_kv_cache_update` + `unified_attention_with_output`），从 `forward_context` 按 `layer_name`（还记得吗，就是 `prefix`）取回本层的 `kv_cache` 和 `attn_metadata`。这两个算子怎么进 `torch.compile` 图、后端怎么选，是[第 23 章](../../ch23-custom-ops-and-compilation/narrative/chapter.md)和[第 25 章](../../ch25-attention/narrative/chapter.md)的主题。
 
 精简版在 host 上没有 CUDA、没有分页 KV cache，所以用一个 eager 的全因果 SDPA（含 GQA 的 KV 头复制）替身复现 decoder-only 注意力的可观察输出。它能跑通 GQA（8 query 头 / 2 KV 头）的形状：
 
@@ -699,6 +699,6 @@ assert out2.shape == (seq, cfg.hidden_size)
 - **三段式装载**：建空壳 → 流式切填（`stacked_params_mapping` 重命名 + `shard_id` offset + rank narrow，一步完成 fuse + TP 切分）→ 后处理。
 - **`Attention` 封装**：吸收后端选择和 KV cache，模型定义对后端无感——多模型 × 多后端的解耦点。
 
-最重要的是记住 Llama **缺**了什么：没有 MoE、没有 MLA、没有量化压缩、没有混合残差。这些「缺」是刻意的留白。[第 25 章读 DeepSeek-V4](../../ch25-model-architecture/narrative/chapter.md) 时，每一个新增结构都会作为「对 Llama 的 delta」引入——你会看到，理解了这份最简契约，再难的模型也只是在它上面叠加。
+最重要的是记住 Llama **缺**了什么：没有 MoE、没有 MLA、没有量化压缩、没有混合残差。这些「缺」是刻意的留白。[第 27 章读 DeepSeek-V4](../../ch27-model-architecture/narrative/chapter.md) 时，每一个新增结构都会作为「对 Llama 的 delta」引入——你会看到，理解了这份最简契约，再难的模型也只是在它上面叠加。
 
 而那行被一笔吞掉的 `self.attn(q, k, v)`，以及让它进 `torch.compile` 图的自定义算子，是[下一章](../../ch23-custom-ops-and-compilation/narrative/chapter.md)的事。
