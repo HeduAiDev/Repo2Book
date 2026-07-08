@@ -8,6 +8,10 @@
 
 这是本子系统 `torch_npu` 融合算子最密集的一章。`vllm_ascend/attention/mla_v1.py` 全文约 1804 行，把通用 MLA 的每一步都换成了昇腾专属的一把算子：`npu_format_cast`（权重排布）、`npu_kv_rmsnorm_rope_cache`（一把做 RMSNorm + RoPE + 写 KV cache）、`npu_fused_infer_attention_score(_v2)`（注意力）、`npu_attention_update`（在线 softmax 合并）。我们逐个拆开看。
 
+![本章地图：AscendMLAImpl 源码剖面——权重吸收与 decode/prefill 双路](../diagrams/chapter-map.png)
+
+只想抓住 decode 路「权重吸收→MQA」这条主线，可直接按 §22.4→§22.8→§22.9 跳读；想对照 prefill 路的显式解压做法，看 §22.7 与 §22.10；两处准备阶段（metadata 切分、加载期权重拆分）分别在 §22.5、§22.3，随时可回看，不影响顺序往下读。
+
 ## 22.1 先说清楚：MLA 到底省了什么
 
 MLA（Multi-head Latent Attention，多头潜在注意力；[首现见第 19 章](../../ch19-attention-backend-selection/narrative/chapter.md)）是 DeepSeek-V2/V3 带火的注意力变体。它解决的是一个很具体的痛点：**KV cache 太占显存**。

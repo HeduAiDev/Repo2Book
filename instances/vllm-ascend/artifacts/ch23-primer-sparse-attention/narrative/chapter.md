@@ -14,6 +14,10 @@
 
 承接上一章的记号：DSA 是「instantiate under MLA」——它跑在 MLA 的 MQA 模式上，每个 latent KV 条目被一个 query token 的所有头共享(paper-dsa §2.1)。(MQA，多查询注意力，是所有 query 头共享同一份 KV 缓存的注意力配置；它是 GQA 分组查询注意力「只有一组」的极端情形，后面第二节还会再碰到。)所以下文的「选哪些 KV」天然是跨头一致的，这一点后面会反复用到。
 
+![本章地图：NSA/DSA 论文推导→Lightning Indexer NPU 源码剖面图](../diagrams/chapter-map.png)
+
+只想弄清这套打分机制怎么落进昇腾代码，可以跳过「二、NSA 框架」「四、细粒度 top-k 选择」「五、训练协同适配」「六、成本模型」这几节，直接从「三、Lightning Indexer 打分函数」跳读到「七、落地」下造 indexer key 起的四个小节；想把两篇论文的推导跟完，就按一到七顺序通读。
+
 ---
 
 ## 一、动机：O(L²) 注意力税

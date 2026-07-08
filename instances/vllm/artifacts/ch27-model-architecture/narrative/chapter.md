@@ -26,6 +26,10 @@
 
 先看骨架，再依次拆四个 delta。
 
+![本章地图：DeepSeek-V4 前向剖面——Llama 骨架上叠的四摞 delta](../diagrams/chapter-map.png)
+
+只想看 MLA 怎么把 KV cache 压扁，直接跳 §27.2；只关心 MoE 路由怎么选专家，跳 §27.3；MTP 草稿和 FP8 权重装载连在一起，跳 §27.5、§27.6。想跟完整源码走线，就从 §27.1 骨架按序读下去。
+
 ---
 
 ## 27.1　骨架：把 Llama 的 forward 和 V4 的并排放

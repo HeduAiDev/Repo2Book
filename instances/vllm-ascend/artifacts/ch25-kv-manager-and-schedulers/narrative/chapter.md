@@ -18,6 +18,10 @@ KV cache 管理（`vllm/v1/core/single_type_kv_cache_manager.py`、`vllm/v1/core
 
 承接[第 14 章 NPUWorker](../../ch14-npuworker-execution-control/narrative/chapter.md) / [第 15 章 NPUModelRunner](../../ch15-npumodelrunner-cuda-monkeypatch/narrative/chapter.md) / [第 16 章单步前向](../../ch16-single-step-forward-context-dp-sync/narrative/chapter.md)——那三章讲「拿到一批已调度好的请求后怎么跑」，本章讲的是它们**上游**：这批请求是怎么被调度出来的、KV block 是怎么分配的。
 
+![本章地图：KV manager 与调度器的克制特化，两条互不依赖的注入轴](../diagrams/chapter-map.png)
+
+只想看某条调度器特化，从 §25.1 的入口跳到对应的 §25.4、§25.5 或 §25.6 即可；只想看 KV manager 那条独立注入轴，直接跳 §25.2→§25.3；两条轴互不依赖，按章节顺序通读也一样连贯，§25.7 是顺带带过的 KV offload 支线。
+
 ## 25.1 入口：三个开关，默认一个都不拨
 
 先看特化是从哪里注入的。调度器的选择落在启动期的 `check_and_update_config`（[第 5 章](../../ch05-check-and-update-config/narrative/chapter.md)讲过这个统一改配置的钩子）里：

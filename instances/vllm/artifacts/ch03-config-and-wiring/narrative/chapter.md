@@ -22,6 +22,10 @@
 
 本章的终点是 `EngineCore.__init__`——三个工厂的产物在那里汇合、实例化。它实例化出来的执行器和调度器**怎么跑**，分别留给 [第 13 章：连续批处理](../../ch13-scheduler/narrative/chapter.md) 和 [第 17 章：执行器与 Worker 生命周期](../../ch17-worker-and-executor/narrative/chapter.md)；本章只负责把它们**装配到位**。下一章 [第 4 章：AsyncLLM 三段式](../../ch04-async-llm/narrative/chapter.md) 用的，正是本章拼出来的这个 `VllmConfig`。
 
+![本章地图：EngineArgs→VllmConfig 两级映射剖面](../diagrams/chapter-map.png)
+
+只想弄清两级映射怎么走完整程，按 §3.1→§3.4→§3.7→§3.11 跳读；只想看执行器工厂怎么选类，跳到 §3.6 前后；想跟全程，就按 3.1 到 3.11 顺序通读。
+
 ---
 
 ## 3.1 一句话钩子：扁平进去，结构化出来

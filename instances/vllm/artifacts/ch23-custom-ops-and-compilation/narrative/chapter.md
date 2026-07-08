@@ -25,6 +25,10 @@
 > *图注：左栏是单算子的构造期 dispatch，右栏是整图的首次前向 dispatch。*
 > *底部一句话：选 `forward_native` 不是退化，是为了给第 2 级的 Inductor 留融合的余地。*
 
+![本章地图：CustomOp 两级 dispatch 从构造期到首次前向的源码剖面](../diagrams/chapter-map.png)
+
+只想看整图怎么切，跳 §23.4 到 §23.7 顺着读；只想看单个算子怎么定型，跳 §23.1 到 §23.3。惦记着开头那笔 attention 怎么进编译图的债，直接跳 §23.6 到 §23.8；想跟全程，就按小节顺序往下读。
+
 ## 23.1 CustomOp：构造期把 forward 定死
 
 先看第 1 级的载体——`CustomOp` 基类。它是 vLLM 里所有「一个算子、多份实现」的算子的共同祖先。RMSNorm、激活函数、各种 norm，都继承它。

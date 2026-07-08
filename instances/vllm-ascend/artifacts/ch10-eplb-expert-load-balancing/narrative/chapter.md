@@ -12,6 +12,10 @@
 
 这一章的主角，是昇腾给出的在线解法：**eplb（expert load balancing）**。它不重启、不换模型，而是在推理跑着的同时，悄悄把热门 expert 的权重从拥挤的卡搬到空闲的卡上，让负载重新铺平。搬运用的是 NPU 间的 device-to-device（D2D，设备到设备）直拷，所以我们叫它「权重热迁移」。代码集中在 `vllm_ascend/eplb/` 目录——`eplb_updator.py`、`eplb_worker.py`、`eplb_device_transfer_loader.py` 各管一块。
 
+![本章地图：EPLB 在线热迁移剖面——节拍状态机、子进程规划与异步 P2P 搬运](../diagrams/chapter-map.png)
+
+只想弄清子进程怎么把规划落成搬运指令，跟着「容器与两条队列 → do_update → DefaultEplb → compose」这条跳读路线走；想跟完整的一拍到位，就按图从「构建期」顺序读到「逐拍归零」，各节展开顺序与图一致。
+
 ## 一个临时的重型特性
 
 开始读源码前，先交代一件容易让人困惑的事：**这套机制在 vLLM 基座里并不存在**。

@@ -15,6 +15,10 @@ vllm-ascend 是 vLLM 的 **out-of-tree（OOT，源码树外）平台插件**。�
 
 我们就顺着这根字符串走一遍。
 
+![本章地图：一根 qualname 字符串从安装期到运行期分发的全程](../diagrams/chapter-map.png)
+
+> 想跟全程，按 §2.1→§2.2→§2.3→§2.5→§2.7→§2.8 这条主链顺序读；只想看「延迟绑定」这一招在哪几处被复用，直接跳 §2.4、§2.6、§2.10 三处卫星节点；子进程里并行发生的另一路注册在 §2.9，不打断主链阅读。
+
 ## 2.1 安装期：两个 entry-point 组
 
 故事从 `setup.py` 开始。vllm-ascend 在打包时声明了两组 setuptools entry points：

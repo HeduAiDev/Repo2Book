@@ -47,3 +47,8 @@ ch04（async-engine，`vllm/v1/engine/`）：
 - 36 章新序:三章原理篇归位(ch24 FlashAttention 原理/ch26 量化数学/ch30 EAGLE),映射存档 book/cartography/renumber-2026-07-06.json;补章走 RUNBOOK「补章发车 SOP」。
 - 跨章链接三规生效(../../ 两层+文字号=目录号);全书节号=目录号;concepts.json 140 条建账。
 - 诊断→治理闭环:2026-07-06 全书审计 cliffs=1(FA 黑盒)+71 bumps → FA 原理章+交错+接缝+inline 引用批次(Orca/Sarathi/PagedAttention/DeepSeek/XGrammar)→ 2026-07-08 定向终验受影响 9 章 cliffs=0。bump 级 advisory 留审计报告待日后 triage。
+
+
+## 本章地图(2026-07-09 全量生效)
+- 36 章每章开篇均有「本章地图」源码剖面图(diagrams/chapter-map.{py,svg,png}):入口→真实符号走线→出口、§/标题词讲解站牌、底部阅读路线;正文在开篇导航与 hook 段后插图引+选读指引。
+- 门禁:lint_chapter_map --require(徽标↔标题/符号防杜撰/画布预算 宽≤1500 比例≤2.6:1/开篇位置+指引)已进质量闸门;新章由 chapter-pipeline Map 站保证;重编号后重跑受影响章 gen 脚本再渲染(引擎已重写 §号,见补章 SOP §4)。

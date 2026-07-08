@@ -122,3 +122,8 @@ ch33（sampling NPU adaptation，`vllm_ascend/sample/`）：
 - 36 章新序:六章原理章已归位(ch09 EPLB 原理/ch21 MLA/ch23 稀疏谱系/ch26 V4 收束/ch31 量化数学/ch34 投机采样),P8 解散并入 P3/P5/P7。映射存档 book/cartography/renumber-2026-07-05.json;补章走 RUNBOOK「补章发车 SOP」。
 - 跨章链接一律 ../../ 两层+文字号=目录号(lint_anchors 三规);全书节号=目录号。
 - 终验:gap-audit 2026-07-06 cliffs=0(唯一 cliff 已补指路),bumps 68 条 advisory 待日后 triage。
+
+
+## 本章地图(2026-07-09 全量生效)
+- 36 章每章开篇均有「本章地图」源码剖面图(diagrams/chapter-map.{py,svg,png}):入口→真实符号走线→出口、§/标题词讲解站牌、底部阅读路线;正文在开篇导航与 hook 段后插图引+选读指引。
+- 门禁:lint_chapter_map --require(徽标↔标题/符号防杜撰/画布预算 宽≤1500 比例≤2.6:1/开篇位置+指引)已进质量闸门;新章由 chapter-pipeline Map 站保证;重编号后重跑受影响章 gen 脚本再渲染(引擎已重写 §号,见补章 SOP §4)。

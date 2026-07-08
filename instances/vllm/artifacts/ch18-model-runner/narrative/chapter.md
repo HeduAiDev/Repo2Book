@@ -21,6 +21,10 @@
 
 本章的代码主线落在三处：`vllm/v1/worker/gpu_model_runner.py`（每拍编排）、`vllm/v1/worker/gpu_input_batch.py`（持久批次）、`vllm/v1/worker/block_table.py`（块表与 slot 映射）。
 
+![本章地图：GPUModelRunner 每拍剖面——从状态调和到 slot 映射的源码调用链](../diagrams/chapter-map.png)
+
+只想看 slot 怎么打洞、复用、压实，直接跳 §18.5；想跟完整每拍流程，就按 §18.1 到 §18.7 顺序通读。
+
 ---
 
 ## 18.1 每拍的入口：先调和状态，再准备输入

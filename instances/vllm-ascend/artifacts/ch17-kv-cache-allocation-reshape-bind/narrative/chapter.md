@@ -16,6 +16,10 @@
 - **重整**：用 `torch.as_strided` 按 page 跨步重排出 NPU 物理布局。基座是一次 `view` + `permute`。
 - **绑定**：普通模型直接复用基座；但 DeepSeek-V4、longcat 这些层序/层数不规整的，得各走各的特化路。
 
+![本章地图：KV 张量物化剖面——分配→重整→绑定三步骨架](../diagrams/chapter-map.png)
+
+跟着主线一路读：§17.1→§17.3→§17.5→§17.7 就是分配→重整→绑定的完整链路；只想弄清 2MB 怎么对齐或 `as_strided` 怎么把 block 维钉成一页，跳 §17.2 或 §17.6 单独看即可。
+
 ## 17.1 三步骨架：从字节到挂回各层
 
 先看总入口。`initialize_kv_cache` 在物化 KV 之前，先 `deepcopy` 一份配置、补好 encoder/kv-sharing 层、初始化注意力后端，再调 `may_reinitialize_input_batch`（本章 [§17.8](#178-两条辅线spec-解析与输入批重建) 的辅线），最后把活儿交给 `initialize_kv_cache_tensors`：

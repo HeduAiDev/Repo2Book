@@ -6,6 +6,10 @@
 > 本章让模型真的跑起来：发起前向、采样、把新 token 写回批次。
 > 下一章起深入 attention 后端，接住这里产出的 `slot_mapping`。
 
+![本章地图：execute_model()/sample_tokens() 两阶段剖面](../diagrams/chapter-map.png)
+
+只想看 CUDA graph 怎么分级取舍，直接跳 §19.6；只想看新 token 怎么写回、怎么整理返回给上层，跳 §19.5 接 §19.4；想跟着两阶段主线从头走到尾，按顺序往下读就好。
+
 ## 19.1 一个反直觉的方法：发起前向，却不等结果
 
 先看一段会让人愣一下的代码。这是 GPU 模型运行器跑一拍推理的入口，`execute_model()`：它做完前向，最后一行却是 `return None`。

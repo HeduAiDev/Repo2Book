@@ -8,6 +8,10 @@
 
 本章主角是 `vllm_ascend/distributed/parallel_state.py` 里的 `init_ascend_model_parallel`——一个只做加法、不碰基座的并行组工厂。
 
+![本章地图：init_ascend_model_parallel 源码剖面——5D 网格排布代数、三种切法与 CP 归口](../diagrams/chapter-map.png)
+
+只想弄清某一种切法（MC2、细粒度 TP 或 flashcomm2）怎么切，可以直接跳到对应一节；想跟通读排布代数这套通法，从「5D 网格」按顺序读到「复用的接缝」即可。
+
 ## 这章要做什么
 
 前面几章看的都是同一种招式：昇腾用 monkey-patch 把 vLLM 的某个名字**重绑**到自己的实现上——换通信器、换分配器、换引擎核心。重绑的本质是「替换」：原来指向 A，现在指向 B。

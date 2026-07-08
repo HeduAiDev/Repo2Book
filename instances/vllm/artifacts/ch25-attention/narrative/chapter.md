@@ -22,6 +22,10 @@
 
 为了能在本地（无 GPU）把这套抉择与读写亲手跑一遍、打断点看数值，本章配了一份**只做减法**的精简版：和真实 vLLM 同名、同结构、同控制流，只删掉与主线正交的分支（MLA〔Multi-head Latent Attention，多头潜变量注意力，把 KV cache 压成低秩潜变量的注意力变体，详见[DeepSeek-V4 那章](../../ch27-model-architecture/narrative/chapter.md)〕变体、DCP、cascade、FP8 量化、CUDA graph 调度）。两个真正跑在 CUDA 上的算子（写 KV 的 `reshape_and_cache_flash`、读 KV 的 `flash_attn_varlen_func`）在 host 上以 CPU 等价实现复刻其可观察语义，让数值能对上。它是"跑起来看数值"的交叉验证物，正文主线仍是真实源码。
 
+![本章地图：注意力后端剖面——选后端→翻译 metadata→读写 KV](../diagrams/chapter-map.png)
+
+只想抓运行期主线——metadata 怎么翻译、KV 怎么读写、按 layer_name 怎么分发——跳读 §25.8、§25.9、§25.10 即可；想看建图期怎么选后端的完整脉络，再对照 §25.10、§25.6、§25.7、§25.5 回读；要跟全程，按序通读即可。
+
 ---
 
 ## 25.1 一张总图：抽象、注册、选择

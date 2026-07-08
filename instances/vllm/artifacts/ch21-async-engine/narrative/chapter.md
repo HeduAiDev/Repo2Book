@@ -8,6 +8,10 @@
 
 本章的源码主线落在四个文件上：`vllm/v1/worker/gpu_worker.py`（惰性 PP 收发）、`vllm/v1/engine/core.py`（DP wave 忙循环）、`vllm/v1/engine/coordinator.py`（协调进程）、`vllm/v1/engine/core_client.py`（负载均衡客户端）。
 
+![本章地图：三条互相独立主线的源码剖面（惰性 PP 收发／DP wave 共识／DP 负载均衡协调）](../diagrams/chapter-map.png)
+
+三条主线彼此独立，挑一条单读也不影响理解：只关心路由怎么选、暂停后又怎么被唤醒，可以跳读「评分选最空的引擎」到「暂停时怎么唤醒」这两小节；想跟完整实现，就按惰性 PP 同步、DP wave 共识、DP 协调进程与负载均衡三节的顺序通读。
+
 ## 这章要做什么
 
 vLLM 跑大模型时有两条并行轴常常同时开：**流水线并行（pipeline parallel, PP）** 把模型切成几段，每段一个 stage，隐藏状态在 stage 之间传递；**数据并行（data parallel, DP）** 复制整个引擎，多份各自吃一批请求。两条轴都要跨进程通信，而通信是延迟杀手。

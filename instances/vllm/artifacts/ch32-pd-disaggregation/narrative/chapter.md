@@ -8,6 +8,10 @@
 
 本章的两条源码主线：契约定义在 `vllm/distributed/kv_transfer/kv_connector/v1/base.py`，调度集成在 `vllm/v1/core/sched/scheduler.py`。工厂在 `vllm/distributed/kv_transfer/kv_connector/factory.py`，参考实现在 `vllm/distributed/kv_transfer/kv_connector/v1/example_connector.py`。
 
+![本章地图：KV Connector 契约怎样按角色切分、调度器怎样用它决策与回收](../diagrams/chapter-map.png)
+
+只想看阻塞请求怎么被提升回调度，直接跳 §32.5；想跟一次调度步的决策全流程，从契约本身讲起，按 §32.2→§32.5 顺序读。
+
 ## 32.1 为什么要把 prefill 和 decode 拆开
 
 先看一个让人头疼的现象。

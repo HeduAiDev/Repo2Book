@@ -23,6 +23,10 @@
 
 > *图 27-1：左——三个 Config 经 `@register_quantization_config` 注进 vLLM 量化注册表。中——`get_quant_method` 按层类型分发，再查 `_SCHEME_REGISTRY` 选 scheme。右——三个 wrapper 各持一个 scheme，满足 vLLM 三个方法基类接口。一张表 + 三个 wrapper，换一种量化只是给表加一行装饰器。*
 
+![本章地图：注册表 + 三 wrapper 适配 + W8A8 全链剖面](../diagrams/chapter-map.png)
+
+只想弄清两张注册表怎么对上号，直接跳读 §32.2→§32.3；只想单独看量化粒度谱，跳读 §32.4→§32.6。想跟完整实现走一遍，就按 §32.1→§32.5 顺序读。
+
 ## 32.1 三入口注册：把昇腾 Config 注进 vLLM 量化注册表
 
 vLLM 启动时认 `--quantization <名字>`。这个名字怎么和一段实现对上？靠 vLLM 暴露的一个注册装饰器 `register_quantization_config`——谁想新增一种量化方法，就继承基类 `QuantizationConfig`、用这个装饰器把自己登记进去。这是典型的 OOT 注册点：vLLM 开一个口，树外的昇腾把实现塞进来。
