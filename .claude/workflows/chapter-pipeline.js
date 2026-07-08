@@ -9,6 +9,7 @@ export const meta = {
     { title: 'Illustrate', detail: 'illustrator 绘图：视觉自查回环+盲审门禁' },
     { title: 'Write', detail: 'writer 以真实源码为主线写章节（内嵌源码+Roadmap）' },
     { title: 'Review', detail: '多维并行协作评审，有界回环' },
+    { title: 'Map', detail: '评审收敛后，illustrator 产出「本章地图」源码剖面图（自检+盲审回环 ≤2 轮）+ writer 微任务插图引与选读指引' },
     { title: 'Archive', detail: 'archivist 归档 + 回写 Book Bible' },
   ],
 }
@@ -292,7 +293,59 @@ if (reviewV && reviewV.verdict !== 'APPROVED') {
   return { chapter: A.chapter_id, test: testV, escalated: 'review-exhausted', stage: 'Review', issues: reviewV.issues }
 }
 
-// ---------- Phase F: Archive ----------
+// ---------- Phase F: Map（评审收敛后产出「本章地图」，站内自检+盲审回环 ≤2 轮） ----------
+const MAP_BLIND_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['pass', 'problem', 'suggested_fix'],
+  properties: { pass: { type: 'boolean' }, problem: { type: 'string' }, suggested_fix: { type: 'string' } },
+}
+let mapBlindV = null
+let mapLedger = []
+let mapHistory = []
+for (let m = 1; m <= 2; m++) {
+  phase('Map')
+  const mapV = await agent(
+    head('illustrator') +
+    '任务：为本章画「本章地图」（源码剖面图）。先读你的契约 ' + REPO + '/.claude/agents/illustrator.md 的「本章地图」节（每章一次，Map 站移交给你）——严格照其输入/模板/节点预算/自然标题章规则/自查项执行，不要自己发明格式。模板：' + REPO + '/.claude/skills/svg-diagram/references/example-chapter-map.py。\n' +
+    '输入：**定稿** ' + CH + '/narrative/chapter.md（真实节结构，站牌与徽标须对得上）+ ' + CH + '/dossier/dossier.json（mechanisms 锚点，代码符号须对得上）' + (PRIMER ? '+ ' + PAPERS + '/（论文包，primer 章节点=论文概念）' : '') + '。\n' +
+    (mapLedger.length ? '上一轮盲审 FAIL，必须修复：\n' + mapLedger.join('\n') + '\n' : '') +
+    '产出 ' + CH + '/diagrams/chapter-map.py（生成脚本，坐标全由循环/常量算，零手写魔数）+ chapter-map.svg + chapter-map.png（`rsvg-convert -z 2`，勿用 ImageMagick convert）。渲染后**用 Read 打开 PNG 亲眼看**，六项自查全真才登记进 ' + CH + '/diagrams/figure-manifest.json（`blind_review` 初写 PENDING）。\n' +
+    '完成后自跑 `python3 ' + REPO + '/scripts/lint_chapter_map.py ' + CH + '`（无 --require，试点期）与 `python3 ' + REPO + '/scripts/lint_diagram_geometry.py ' + CH + '/diagrams/chapter-map.svg`，均确保无问题（不过就自己改图重渲，别指望盲审替你挑）。返回 status/note。' + ESC,
+    { schema: STATUS_SCHEMA, label: 'map r' + m, phase: 'Map', agentType: 'general-purpose', model: MODELS.illustrate }
+  )
+  if (!mapV) return { chapter: A.chapter_id, escalated: 'map-failed', stage: 'Map', round: m, note: 'illustrator agent 失败（限流/崩溃），无法产出本章地图' }
+  if (mapV.status === 'BLOCKED') return { escalated: 'map', stage: 'Map', round: m, reason: mapV.blocker_reason }
+  mapBlindV = await agent(
+    '你是「本章地图」的盲审员，形状同插图盲审：**只准看** ' + CH + '/diagrams/chapter-map.png（用 Read 打开）与 ' + CH + '/narrative/chapter.md 的标题结构（只扫标题定位，不需通读全文）。**禁止**看 gen 生成代码、禁止看 dossier.json。\n' +
+    '四步核对：① 只看图，用自己的话复述这张「源码剖面图」讲的是哪条路线（入口→…→出口）；② 图上每个 §N.M 徽标（或自然标题站牌）逐一核对能在正文找到对应标题——对不上 = FAIL；③ 图上代码符号是否像本章会讲的真实符号（不是看着编出来的）——明显杜撰 = FAIL；④ 明显不可读（文字重叠/箭头悬空/不知从哪看起）= FAIL。\n' +
+    '把 verdict（PASS/FAIL）与一句话回填 ' + CH + '/diagrams/figure-manifest.json 中 chapter-map 条目的 blind_review 字段（用 Edit）。\n' +
+    '返回 pass（是否放行）；FAIL 时 problem+suggested_fix 必须具体；PASS 时两者留空字符串。',
+    { schema: MAP_BLIND_SCHEMA, label: 'map-blind r' + m, phase: 'Map', agentType: 'general-purpose', model: MODELS.blind }
+  )
+  mapHistory.push({ round: m, pass: !!(mapBlindV && mapBlindV.pass), problem: (mapBlindV && mapBlindV.problem) || '', suggested_fix: (mapBlindV && mapBlindV.suggested_fix) || '' })
+  if (mapBlindV && mapBlindV.pass) break
+  mapLedger = [(mapBlindV ? (mapBlindV.problem + ' → ' + mapBlindV.suggested_fix) : 'map-blind agent error（限流/崩溃）')]
+  log('本章地图第 ' + m + ' 轮盲审 FAIL，回 illustrator')
+}
+if (!mapBlindV || !mapBlindV.pass) return { chapter: A.chapter_id, escalated: 'map-exhausted', stage: 'Map', history: mapHistory }
+log('本章地图通过自检 + 盲审')
+
+// Map 站第二步：writer 微任务——插图引 + 选读指引（不改其余正文）
+phase('Map')
+let mapInsertV = null
+for (let wi = 1; wi <= 2 && !mapInsertV; wi++) {
+  if (wi > 1) log('map-insert 上轮中断(API崩)，第 ' + wi + ' 轮重试：图引已插入就跳过，只补未完成的')
+  mapInsertV = await agent(
+    head('writer') +
+    '任务：本章地图已产出并过盲审（' + CH + '/diagrams/chapter-map.png）。读你的契约 ' + REPO + '/.claude/agents/writer.md 「必达物」第 7 条「开篇『本章地图』」（插图引用位置与选读指引写法，先读它、严格照做，不要自己发明格式）。\n' +
+    '在 ' + CH + '/narrative/chapter.md 用 **Edit 定点修改**（不许 Write 整文件覆盖）：hook 段之后、第一个 `## ` 标题之前插入图引 + 1–2 句自然措辞的选读指引。只做这一处插入，不改其余正文。\n' +
+    '完成后自跑' + (PRIMER ? '五个 linter（chapter_structure/formulas/source_grounding/trace_consistency/paper_grounding --expect-primer，primer 章不跑 fidelity）' : (A.skip_impl ? '四个 linter（chapter_structure/formulas/source_grounding/trace_consistency，本章无精简版故不跑 fidelity）' : '五个 linter（chapter_structure/formulas/source_grounding/fidelity/trace_consistency）')) + '，加上 `python3 ' + REPO + '/scripts/lint_chapter_map.py ' + CH + ' --require`，均无 BLOCKING。返回 status/note。' + ESC,
+    { schema: STATUS_SCHEMA, label: 'map-insert r' + wi, phase: 'Map', agentType: 'general-purpose', model: 'sonnet' /* 插图微任务降档 */ }
+  )
+}
+if (!mapInsertV) return { chapter: A.chapter_id, escalated: 'map-insert-failed', stage: 'Map', note: 'writer 微任务多轮失败(限流/崩溃)，图引未插入' }
+if (mapInsertV.status === 'BLOCKED') return { escalated: 'map-insert', stage: 'Map', reason: mapInsertV.blocker_reason }
+
+// ---------- Phase G: Archive ----------
 phase('Archive')
 // 完整 review 对象注入提示词 → review-report.json 忠实落盘(含 verdict 与全部 issues)，
 // 不让 archivist 凭记忆重建出有损版本。
@@ -303,6 +356,7 @@ const runLedger = JSON.stringify({
   impl_test_rounds: implTestRounds, impl_test_ledger: ledger,
   write_review_rounds: reviewRounds,
   blind_rounds: blindHistory.length, blind_failures: blindHistory,
+  map_rounds: mapHistory.length, map_history: mapHistory,
   escalated: null,
 })
 const archiveTask = head('archivist') +
