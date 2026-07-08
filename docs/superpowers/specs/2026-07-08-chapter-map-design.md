@@ -20,7 +20,7 @@
 
 - svg-diagram skill 新增参考实现 `references/example-chapter-map.py`,定视觉语言:横向泳道(代码层)/圆角节点(真实符号)/§徽标(角标胶囊)/底部路线条/入口出口箭头进出画布边缘。illustrator 按各章形态自由变体(线性章可退化为单泳道;分叉章画分流)。
 - **输入**:成稿 `narrative/chapter.md`(节结构+叙事逻辑)+ `dossier.json`(mechanisms 真实锚点)+(primer 章)论文包。产出 `diagrams/chapter-map.{py,svg,png}`,登记进 `figure-manifest.json`(六项自查+盲审,流程照旧;盲审员核"入口→出口走线与 §挂牌能否复述本章逻辑")。
-- **节点预算**:≤12 个代码节点;超长章聚合(如「§N.4–N.6 双算子路径」一站)。图宽 ≤1200,几何 lint 照旧。
+- **节点预算**:≤12 个代码节点;超长章聚合(如「§N.4–N.6 双算子路径」一站)。画布宽 ≤1500 且宽高比 ≤2.6:1(lint_chapter_map 确定性查;试点实测 6.9:1 横幅排版后不可读),几何 lint 照旧。
 
 ## 3. 门禁(写作自由、门禁从严,成对落地)
 

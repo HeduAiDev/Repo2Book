@@ -176,3 +176,26 @@ def test_require_position_after_first_content_heading_still_fails(tmp_path):
     (ch / "dossier.json").write_text(json.dumps({"mechanisms": []}), encoding="utf-8")
     r = _run(ch, "--require")
     assert r.returncode == 1
+
+
+def test_oversize_canvas_fail(tmp_path):
+    """画布宽 >1500 或宽高比 >2.6:1 → exit 1(排版可读性预算)。"""
+    ch = _mk(tmp_path, ["§20.1"])
+    svg = ch / "diagrams" / "chapter-map.svg"
+    s = svg.read_text(encoding="utf-8").replace(
+        '<svg xmlns="http://www.w3.org/2000/svg">',
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2897.2 420.0">')
+    svg.write_text(s, encoding="utf-8")
+    r = _run(ch)
+    assert r.returncode == 1 and "2897" in r.stdout
+
+
+def test_normal_canvas_ok(tmp_path):
+    """宽 ≤1500 且比例正常 → 通过。"""
+    ch = _mk(tmp_path, ["§20.1"])
+    svg = ch / "diagrams" / "chapter-map.svg"
+    s = svg.read_text(encoding="utf-8").replace(
+        '<svg xmlns="http://www.w3.org/2000/svg">',
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 900">')
+    svg.write_text(s, encoding="utf-8")
+    assert _run(ch).returncode == 0

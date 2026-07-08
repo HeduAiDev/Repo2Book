@@ -106,6 +106,7 @@ def lint_chapter_map(chapter_dir: str, require: bool = False) -> dict:
         "fabricated_symbol": [],
         "missing_opening_ref": [],
         "missing_skip_guidance": [],
+        "oversize_canvas": [],
     }
 
     svg_path = cd / "diagrams" / "chapter-map.svg"
@@ -120,6 +121,17 @@ def lint_chapter_map(chapter_dir: str, require: bool = False) -> dict:
         return res  # 豁免期：无图不核标题/符号/位置
 
     segments = _svg_text_segments(svg_path)
+
+    # ── ⓪ 画布预算：宽 ≤1500 且宽高比 ≤2.6:1（排版到页宽后文字仍可读）────
+    vb = re.search(r'viewBox="0 0 ([\d.]+) ([\d.]+)"', svg_path.read_text(encoding="utf-8")[:400])
+    if vb:
+        w, h = float(vb.group(1)), float(vb.group(2))
+        if w > 1500:
+            res["oversize_canvas"].append(
+                f"  画布宽 {w:.0f} > 1500——排版到页宽后文字过小；折行泳道/聚合节点压宽")
+        if h > 0 and w / h > 2.6:
+            res["oversize_canvas"].append(
+                f"  宽高比 {w / h:.1f}:1 > 2.6:1——过扁的横幅在页面上不可读；把走线折成多行")
 
     # ── ① §徽标 ⊆ 正文标题集，且 N = 目录号 ──────────────────────────────
     dir_num = _dir_number(cd)
