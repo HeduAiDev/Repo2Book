@@ -50,6 +50,7 @@ python3 scripts/lint_dossier.py {chapter_dir}             # v3:mechanisms 机制
 python3 scripts/lint_explainer.py {chapter_dir}           # v3:素材真相源(表格数字可溯源到 trace)
 python3 scripts/lint_trace_consistency.py {chapter_dir}   # v3:正文数值表不漂移+机制覆盖
 python3 scripts/lint_paper_grounding.py {chapter_dir}    # primer 原理章:# PAPER 全覆盖/正文有出处(码章空跑)
+python3 scripts/lint_chapter_map.py {chapter_dir} --require   # 本章地图:§徽标↔标题/符号防杜撰/画布预算/开篇位置+选读指引
 python3 scripts/lint_anchors.py --all   # 章内锚点+跨章三规(目标存在/文字号一致/../../ 深度)    python3 scripts/lint_punct.py --all   # 半角标点
 python3 scripts/lint_diagram_geometry.py --all   # 图：文字越界/相撞/压框/箭头悬空（--all 走活动实例）
 ```
