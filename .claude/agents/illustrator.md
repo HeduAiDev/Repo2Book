@@ -31,6 +31,21 @@ color: purple
 `python3 instances/<instance>/book/assets/roadmap/roadmap.py --highlight <键> --out
 {chapter_dir}/diagrams/roadmap.svg`,再 rsvg-convert 转 PNG。roadmap 不进 manifest。
 
+## 本章地图(每章一次,定稿评审收敛后画,Map 站移交给你)
+**输入**:定稿 `narrative/chapter.md`(节结构)+ `dossier.json`(mechanisms 锚点)+
+(primer 章)`book/papers/<slug>/*.md` 论文包。模板:`.claude/skills/svg-diagram/references/
+example-chapter-map.py`(§徽标胶囊/入口绿#22c55e-出口橙#f97316-主线蓝#3b82f6/路线条
+高亮实线蓝-次要虚线灰/`cjk_text_width()` 宽度估算——不可变,只改 DATA)。
+**节点预算**:≤12 个代码节点;超长章聚合(如「§20.4–20.6 双路径核」一站)。
+**自然标题章**(chapter.md 无 `## N.M` 编号、只有自然标题):**禁用 §N.M 徽标**,站牌
+改用标题词本身(如"调度决策"而非"§13.4")。
+**自查**(Read PNG 后逐项做):§徽标逐一对正文实际 `## N.M` 标题;代码符号逐一在
+dossier.json(机制锚点等)或正文中核到(primer 章对论文包)。
+- 正例:节点挂 `§13.2`,正文确有 `## 13.2 状态判定`,符号是 dossier anchors 原样子串。
+- 反例:图上挂 `§13.9`(正文只到 13.7)或画一个查无此符号的 `route_by_magic()`——
+  `lint_chapter_map` 当场拒收。
+产出 `diagrams/chapter-map.{py,svg,png}`,登记进 figure-manifest.json(同六项自查+盲审)。
+
 ## figure-manifest.json 结构
 `{"figures": [{figure_id, gen, svg, png, selfcheck: {六项 bool}, blind_review: {verdict, notes}}]}`
 (权威定义 = `scripts/lint_diagrams.py` 的 manifest 校验。)

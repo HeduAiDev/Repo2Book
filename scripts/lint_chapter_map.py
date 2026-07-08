@@ -16,8 +16,11 @@
 
 `--require`(试点期默认不开，铺开后 pipeline 里启用)额外核:
     3. 存在性：diagrams/chapter-map.svg 必须存在。
-    4. 位置：chapter.md 第一个 `## ` 标题之前必须有一处 `chapter-map.png` 的引用
-       (开篇 hook 段之后、进入分节之前贴图)。
+    4. 位置：chapter.md 第一个**内容分节**标题(`## ` 标题中排除标题文本匹配
+       `roadmap|路线图|你在这里`——不区分大小写，口径同 lint_chapter_structure.py 的
+       Roadmap 检测正则——的开篇导航标题，如 `## 你在这里`/`## N.1 你在这里`)之前必须
+       有一处 `chapter-map.png` 的引用(开篇 hook 段之后、进入分节之前贴图；开篇导航
+       标题本身可以在图之前或之后，不参与该判定)。
     5. 选读指引：该图引用之后 5 个非空行内必须出现 `§` 或 `节`(读者要知道能跳去哪)。
 
 无 `--require` 且 diagrams/chapter-map.svg 不存在 → exit 0(试点期豁免，图还没画)。
@@ -38,6 +41,11 @@ _DOT_TRIGGER_RE = re.compile(r'\.[A-Za-z_]')
 _CHNUM_RE = re.compile(r'^ch(\d{1,3})')
 _IMG_REF_RE = re.compile(r'chapter-map\.png')
 _GUIDANCE_RE = re.compile(r'[§节]')
+# 开篇导航标题(如 `## 你在这里`/`## 24.1 你在这里`，常带 roadmap 图)——不算「内容分节」，
+# 位置检查要跳过它才不会与全书 86% 章的开篇导航标题互斥。口径与
+# lint_chapter_structure.py 的 Roadmap 检测正则一致(不区分大小写)。
+_ALL_H2_RE = re.compile(r'^##[ \t]+(.*)$', re.M)
+_NAV_HEADING_TEXT_RE = re.compile(r'(roadmap|路线图|你在这里)', re.I)
 
 
 def _svg_text_segments(svg_path: Path):
@@ -168,14 +176,19 @@ def lint_chapter_map(chapter_dir: str, require: bool = False) -> dict:
 
     # ── --require 专属:存在性已在上面处理;此处核位置 + 选读指引 ──────────
     if require:
-        first_heading_m = re.search(r'^##\s+', md_text, re.M)
-        first_heading_pos = first_heading_m.start() if first_heading_m else len(md_text)
+        first_content_heading_pos = len(md_text)
+        for hm in _ALL_H2_RE.finditer(md_text):
+            if _NAV_HEADING_TEXT_RE.search(hm.group(1)):
+                continue  # 开篇导航标题(你在这里/Roadmap)不算内容分节，跳过继续找
+            first_content_heading_pos = hm.start()
+            break
         opening_ref = next(
-            (m for m in _IMG_REF_RE.finditer(md_text) if m.start() < first_heading_pos), None
+            (m for m in _IMG_REF_RE.finditer(md_text) if m.start() < first_content_heading_pos), None
         )
         if opening_ref is None:
             res["missing_opening_ref"].append(
-                "  第一个 `## ` 标题之前找不到 chapter-map.png 引用——本章地图应贴在开篇 hook 段之后、分节之前"
+                "  第一个内容分节标题(排除开篇导航标题「你在这里/Roadmap」)之前找不到 "
+                "chapter-map.png 引用——本章地图应贴在开篇 hook 段之后、进入分节之前"
             )
         else:
             after = md_text[opening_ref.end():]

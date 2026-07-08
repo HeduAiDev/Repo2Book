@@ -127,3 +127,52 @@ def test_natural_language_trailing_punct_not_fabrication(tmp_path):
     此处不再重复，只补验证收窄后不误伤自然语言的这一半。)"""
     r = _run(_mk(tmp_path, ["§20.1", "fast path, e.g. decode."]))
     assert r.returncode == 0
+
+
+# ── CROSS-FIX(Task 5 评审 Critical):位置规则应跳过开篇导航标题 ─────────────
+
+def test_require_position_skips_opening_nav_heading(tmp_path):
+    """仿 ch24 真实结构:`# H1` → `## 你在这里`(带 roadmap 图)→ hook 段 →
+    chapter-map.png 引用+选读指引 → `## 24.1 动机`。开篇导航标题(你在这里)
+    不算「内容分节」，位置检查应认第一个内容标题是 `## 24.1 动机`，图在其前——
+    --require 应 exit 0(旧实现按"第一个 `## ` 标题"必然会把 `## 你在这里`
+    自身当成分界，误判图在标题之后而报错,回归此前误杀)。"""
+    ch = tmp_path / "ch24-primer-flash-attention"
+    (ch / "diagrams").mkdir(parents=True)
+    (ch / "narrative").mkdir()
+    (ch / "diagrams" / "chapter-map.svg").write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg"><text x="0" y="0">§24.1</text></svg>',
+        encoding="utf-8")
+    (ch / "narrative" / "chapter.md").write_text(
+        "# 第 24 章 FlashAttention\n\n"
+        "## 你在这里\n\n"
+        "![路线图](../diagrams/roadmap.png)\n\n"
+        "hook 段:本章要解决的问题是……\n\n"
+        "![本章地图](../diagrams/chapter-map.png)\n\n"
+        "只想看结论,跳 §24.1。\n\n"
+        "## 24.1 动机\n\n正文……\n",
+        encoding="utf-8")
+    (ch / "dossier.json").write_text(json.dumps({"mechanisms": []}), encoding="utf-8")
+    r = _run(ch, "--require")
+    assert r.returncode == 0, r.stdout
+
+def test_require_position_after_first_content_heading_still_fails(tmp_path):
+    """图放在第一个内容标题(`## 24.1 动机`)之后——即便前面有开篇导航标题——
+    仍应判定位置违规，exit 1(确认跳过导航标题不会把位置检查整体空转)。"""
+    ch = tmp_path / "ch24-primer-flash-attention"
+    (ch / "diagrams").mkdir(parents=True)
+    (ch / "narrative").mkdir()
+    (ch / "diagrams" / "chapter-map.svg").write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg"><text x="0" y="0">§24.1</text></svg>',
+        encoding="utf-8")
+    (ch / "narrative" / "chapter.md").write_text(
+        "# 第 24 章 FlashAttention\n\n"
+        "## 你在这里\n\n"
+        "![路线图](../diagrams/roadmap.png)\n\n"
+        "hook 段:本章要解决的问题是……\n\n"
+        "## 24.1 动机\n\n正文……\n\n"
+        "![本章地图](../diagrams/chapter-map.png)\n\n只想看结论,跳 §24.1。\n",
+        encoding="utf-8")
+    (ch / "dossier.json").write_text(json.dumps({"mechanisms": []}), encoding="utf-8")
+    r = _run(ch, "--require")
+    assert r.returncode == 1
