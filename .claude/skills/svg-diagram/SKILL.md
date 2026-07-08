@@ -53,6 +53,7 @@ description: >
 | tensor-flow | 张量形状流(shape 沿箭头标注) | 用 flow 骨架,每条边标 shape |
 | tiling | 分块/many-to-many 连接 | references/example-fa-tiling.py |
 | flow | 简单线性流程(<5 节点可用 Mermaid 替代) | SKILL 模板 C |
+| chapter-map | 每章开篇「本章地图」:真实源码走线(横向泳道=代码分层)+ §N.M 讲解站牌 + 底部多条阅读路线(如快通道/全通道);**不可变**=§徽标胶囊样式(圆角矩形/fill #eef2ff/stroke #6366f1)、入口绿 #22c55e/出口橙 #f97316/主线蓝 #3b82f6、路线条(高亮=实线蓝/其余=虚线灰);**可变**=泳道数/节点排布/路线 | references/example-chapter-map.py |
 
 ## 生成规则(Python 脚本,CRITICAL)
 
