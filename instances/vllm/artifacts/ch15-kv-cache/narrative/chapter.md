@@ -7,7 +7,7 @@
 > *图注：全书地图高亮主线阶段「EngineCore 循环」，本章深入它背后的 KV 缓存子系统。*
 > *[第 14 章](../../ch14-scheduler/narrative/chapter.md) 讲了抢占——要不到块就丢弃重算。*
 > *本章解决「块」本身：物理显存怎么切、怎么分配、怎么靠前缀缓存复用。*
-> *下一章接 attention backend，讲算出来的 KV 怎么写进这些块。*
+> *下一章拆开 `self.coordinator` 本身——它怎么在多种注意力类型间协调分配决策。*
 
 [第 14 章](../../ch14-scheduler/narrative/chapter.md) 反复提到一个动词：`allocate_slots`。调度器给请求算 token 之前，先向它要显存块；要不到，就抢占。但那一章把 `kv_cache_manager` 当黑盒——「要块」「还块」「命中」三个动作只说了名字，没说里面发生了什么。
 
@@ -608,7 +608,9 @@ def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
     return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
 ```
 
-第一行就是 [第 3 章](../../ch03-config-and-wiring/narrative/chapter.md) 那个 `enable_prefix_caching` 的总闸：关了直接返回空命中、0 个 token，整套查表机制被旁路。这就是那个配置字段「真正发挥作用」的地方之一。
+第一行就是 [第 3 章](../../ch03-config-and-wiring/narrative/chapter.md) 那个 `enable_prefix_caching` 的总闸：关了直接返回空命中、0 个 token，整套查表机制被旁路。`request.skip_reading_prefix_cache` 是与它并列的第二道闸，但作用域是单个请求——某些场景（比如已知这个请求的前缀不该被复用、或调用方显式要求跳过读缓存）需要单独绕开查表，又不想动全局的 `enable_caching` 开关，这个请求级字段就是留给它们的口子。两道闸只要有一道合上，就直接空手而归、不进查表。
+
+这一行也是 `self.coordinator` 在全章的第一次登场——它是 `KVCacheCoordinator`，在混合模型（多种注意力类型并存）下按 KV cache group 把调用分派给各自的单类型管理器。本章锁定单组全注意力的主路径，`self.coordinator` 上的每一次调用（这里的 `find_longest_cache_hit`，以及 §15.7 里的另外四个）都几乎原样转发给下面要看到的 `FullAttentionManager` 实例——后文看到的同名方法，就是它的落地。协调层本身怎么在多类型之间做取舍，下一章拆开。
 
 `max_cache_hit_length = request.num_tokens - 1` 这个 `-1` 值得停一下。哪怕一个请求的所有 token 都命中了缓存，也**必须重算最后一个 token**——因为要拿它的 logits 来采样下一个 token，而缓存里只有 KV、没有 logits。所以最多命中到「倒数第二个 token 所在的块」。又因为分配要求 `num_computed_tokens` 按块对齐，这个 `-1` 实际可能让最后一整块退回重算。
 
@@ -681,6 +683,8 @@ def allocate_slots(
     return self.create_kv_cache_blocks(new_blocks)
 ```
 
+`num_tokens_main_model` 这个命名里的「main model」是相对投机解码里的草稿模型而言——它是特意不做 `max_model_len` 截断、留给按「主模型」口径核对 token 数用的量；紧邻的 `num_tokens_need_slot` 才是截断后真正拿去申请块的数字。本章单主模型路径下两者数值相同，之后统一按 `num_tokens_need_slot` 讲，不再展开这层区分。
+
 三段对照下图来看：
 
 ![三段式分配与前缀命中](../diagrams/prefix-hit-alloc.png)
@@ -707,7 +711,7 @@ def get_num_blocks_to_allocate(
     return num_new_blocks + num_evictable_blocks
 ```
 
-`req_to_blocks` 是 `FullAttentionManager` 持有的一个 `defaultdict(list)`，键是 `request_id`，值是该请求当前已分配的块列表——全新请求为空 `()`，`get` 配默认值即可安全读空。`num_new_blocks` 是「装下所有 token 需要的块数，减去已有的和命中的」，再加上 `num_evictable_blocks`（命中块里 `ref_cnt == 0` 的那些）。注释把理由写得清清楚楚。
+`req_to_blocks` 是 `FullAttentionManager` 持有的一个 `defaultdict(list)`，键是 `request_id`，值是该请求当前已分配的块列表——全新请求为空 `()`，`get` 配默认值即可安全读空。这就是 §15.1 图里那张 block table 在代码里的样子：键是请求、值是它逻辑块对应的物理块列表，「逻辑块 → 物理块」的映射就落在这份列表的下标上。`num_new_blocks` 是「装下所有 token 需要的块数，减去已有的和命中的」，再加上 `num_evictable_blocks`（命中块里 `ref_cnt == 0` 的那些）。注释把理由写得清清楚楚。
 
 **段二：挂前缀命中块。** 如果有命中块，`allocate_new_computed_blocks` 把它们 `touch` 一下（`ref_cnt += 1`、必要时从 free queue 救回），挂进请求的块账本 `req_to_blocks`：
 
@@ -811,4 +815,4 @@ def free(self, request_id: str) -> None:
 
 我们也结清了两笔账。[第 3 章](../../ch03-config-and-wiring/narrative/chapter.md) 的 `CacheConfig.block_size` 在这一章无处不在——切块、哈希、分配、命中的最小粒度都是它；`enable_prefix_caching` 则是 `get_computed_blocks` 查不查命中、`get_new_blocks` 惰不惰性驱逐的总闸。[第 14 章](../../ch14-scheduler/narrative/chapter.md) 的抢占重算，靠 `free_blocks` 保留哈希 + `find_longest_cache_hit` 命中复用，把代价从「整段重 prefill」压到「只算未命中部分」。
 
-下一章接着往下：这些块分好了，attention backend 怎么把算出来的 Key/Value 真正写进它们对应的物理显存。块是地址，KV 是内容——我们刚铺好了地址簿。
+下一章拆开 `self.coordinator` 本身——这个本章一直在转发调用的 `KVCacheCoordinator`，下一章讲它怎么在多种注意力类型（全注意力 + 滑动窗口等混合模型）之间协调分配决策。块是地址、决策由协调层拍板——我们刚铺好了地址簿。

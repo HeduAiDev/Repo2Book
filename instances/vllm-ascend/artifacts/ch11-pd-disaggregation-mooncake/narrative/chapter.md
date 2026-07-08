@@ -375,7 +375,7 @@ def get_finished(self) -> tuple[set[str], set[str]]:
     return set(), done_recving
 ```
 
-它返回的是一对集合：已完成发送的请求集、已完成接收的请求集。第一个恒为空——逐层推送是 fire-and-forget，发出去就不再跟踪「发完没」；只有接收侧（decoder 拉 KV）才有真实的完成集合 `done_recving` 要上报，好让调度器释放对应的块。
+它返回的是一对集合：已完成发送的请求集、已完成接收的请求集。第一个恒为空——逐层推送是 fire-and-forget，发出去就不再跟踪「发完没」；只有接收侧（decoder 拉 KV）才有真实的完成集合 `done_recving` 要上报，好让调度器释放对应的块。`self.virtual_request` 并入的是另一类完成：无需真实跨节点传输就能判定完成的请求（比如亲和路由命中后不用再收的边角情形），它们直接记进这个集合，随下一次 `get_finished` 并入 `done_recving` 一并上报，报完随即清空。
 
 至此第一层闭合：scheduler 用 flag 分出收/发、攒待办、发握手、下元数据；worker 逐层推、逐层收、回报完成。**连接器只是个调度循环的接口**——真正搬 KV 的活，在它委托的第二层。
 
@@ -509,7 +509,7 @@ def _priority(self, role: ServerRole, entry: BackendServer, key: str) -> float:
     return entry.active_tokens
 ```
 
-两个角色的优先级公式不一样，背后是负载性质的差异：
+先看那道守卫：若该服务器已被标记 `tainted`（如健康检查失败、正在下线），优先级直接钳成 `TAINT_PRIORITY`——一个远大于任何正常负载值的哨兵值，让它稳居堆尾、几乎不会被最少负载堆选中。过了这道守卫，两个角色的优先级公式不一样，背后是负载性质的差异：
 
 - **prefill** = `active_tokens + 0.3 × active_kv_cache`。prefiller 不只在算，它算完还得**攥着 KV** 等 decoder 来拉。所以除了当前算的 token 量，还要把 KV 压力按 0.3 权重计进去——一台攥着很多待传 KV 的 prefiller，哪怕暂时没在算，也该少派点新活。
 - **decode** = `active_tokens`。decoder 的负担就是当前在跑的 token 流，直接用它。

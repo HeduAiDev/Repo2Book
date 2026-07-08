@@ -10,7 +10,7 @@
 
 这一章就来兑现。`torch.compile` 与 CUDA 图，是 vLLM 拿性能的两大支柱：前者把 Python 前向编译成优化过的计算图，后者把一次前向的 device 端 kernel 序列「录」成一张图、之后固定输入地址 replay，省掉逐 kernel 的 host 端下发开销。
 
-问题来了：这两根支柱在 vLLM 里都是为 CUDA / Inductor 写的。昇腾 NPU 既不走 Inductor，也没有 `torch.cuda.CUDAGraph`。**它要怎么把这两套栈换成 NPU 版，又不去改 vLLM 编译框架的一行代码？**
+问题来了：这两根支柱在 vLLM 里都是为 CUDA / Inductor 写的（Inductor 是 `torch.compile` 默认的图编译后端，负责把 fx 图降级成优化 kernel，并内置 pattern matcher 做算子融合）。昇腾 NPU 既不走 Inductor，也没有 `torch.cuda.CUDAGraph`。**它要怎么把这两套栈换成 NPU 版，又不去改 vLLM 编译框架的一行代码？**
 
 答案出奇地干净：在 `platform.py` 上动了三处钩子，但归根结底是**「编译」和「图捕获」两根支柱**——pass manager 是为编译后端服务的，算是「编译」这根支柱里的一颗螺丝。三处钩子、两根支柱，这一章就围着这层关系展开。
 
@@ -129,6 +129,8 @@ def compile(
     else:
         return fusion_pass_compile(graph, example_inputs, compiler_config, compile_range, key)
 ```
+
+签名里的 `compile_range: Range` 就是[第 14 章](../../ch14-npuworker-execution-control/narrative/chapter.md)预热逻辑里那个按 batch size 划的编译区间——这里不重新定义它，只是把它一路透传给下面的 `npugraph_ex_compile` / `fusion_pass_compile`，再往下传进各融合 pass 做「这个 pass 对当前区间是否适用」的判断。
 
 进二分之前，先两手防御：
 
@@ -564,6 +566,8 @@ def __call__(self, *args, **kwargs):
 
 **第二档：首见某形状，捕获。** 这是核心。先 `validate_cudagraph_capturing_enabled()` 确认此刻允许捕获，记下输入张量的 `data_ptr()`（地址，replay 时要校验），建一张 `torch.npu.NPUGraph()`，然后在 `with torch.npu.graph(aclgraph, pool=self.graph_pool):` 上下文里跑一遍 `runnable`——`graph_pool` 是各 NPUGraph 共享的捕获内存池，这一跑，device 端的 kernel 序列就被录进 `aclgraph` 了。录完把 `aclgraph` 和 `output` 存进 `entry`。
 
+代码里那句 `get_offloader().sync_prev_onload()` / `get_offloader().join_after_forward()` 管的是权重预取与图捕获的时序：`sync_prev_onload` 等上一轮权重预取的异步搬运彻底落地，`join_after_forward` 把本轮 forward 触发的预取纳入等待队列——避免图捕获期间与后台权重搬运在引用计数、显存生命周期上打架（权重预取本身留到别处细讲，这里只管两者不冲突）。
+
 注意末尾那句注释和它的反直觉操作：**捕获分支返回的是真 `output`，不是弱引用**。原因是捕获期 PyTorch 要靠真引用正确管理 aclgraph 内存池；而存进 `entry.output` 的则转成弱引用省显存。一存一返，两个版本，刻意为之。
 
 **第三档：再见同形状，重放。** 落到 `__call__` 后半段：
@@ -594,7 +598,7 @@ def __call__(self, *args, **kwargs):
 `entry.aclgraph.replay()` 一句话重放整张图，返回缓存的 `entry.output`。两个守护值得点名：
 
 - **DEBUG 下断言输入地址一致**。aclgraph 录的是「在这些固定地址上执行」的序列，replay 时输入张量必须落在**捕获时的同一地址**，否则图读的是错的内存。这条断言把这个不变量焊死成可验证的事实。
-- **FULL 模式下 replay 前 `synchronize`**。异步调度 / 多线程下，可能出现「第 i 轮的 CPU 记录事件，早于第 i-1 轮图重放完成」的乱序。同步一下，保证 `update_attn_params` 排在上一轮 replay 之后。注意这道同步只在 `runtime_mode == FULL` 且**非** draft-eagle 时才加（`is_draft_eagle` 指投机解码的草稿模型走 EAGLE 模式那一路，留待采样/投机章细说）。这是 NPU 版相对 vLLM 新增的一道屏障（对照基座 `vllm/compilation/cuda_graph.py` 的 replay 段没有这一步）。
+- **FULL 模式下 replay 前 `synchronize`**。异步调度 / 多线程下，可能出现「第 i 轮的 CPU 记录事件，早于第 i-1 轮图重放完成」的乱序。同步一下，保证 `update_attn_params` 排在上一轮 replay 之后。注意这道同步只在 `runtime_mode == FULL` 且**非** draft-eagle 且 `self.enable_enpu` 为假时才加：`enable_enpu` 是[第 16 章](../../ch16-single-step-forward-context-dp-sync/narrative/chapter.md)已建立的 ENPU（昇腾软切分模式）开关，开启后模型跑前会先调整事件记录顺序（先 `event.record` 再 `event.wait`），时序已经由那套顺序保证，这里的显式 `synchronize` 就可以省掉；`is_draft_eagle` 指投机解码的草稿模型走 EAGLE 模式那一路，留待采样/投机章细说。这是 NPU 版相对 vLLM 新增的一道屏障（对照基座 `vllm/compilation/cuda_graph.py` 的 replay 段没有这一步）。
 
 ### 两轮过后：分桶字典怎么长出来 {#两轮过后分桶字典怎么长出来}
 

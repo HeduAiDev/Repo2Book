@@ -410,7 +410,7 @@ $$
 
 两道同步点，各管一件事：
 
-- **`stream.wait_stream(current_stream())`，只在 d2h（卸载）时插。** 这里 `torch.npu.current_stream()` 返回当前 task 的默认计算流（compute stream）——forward 就在这条流上执行、把 KV 写进 HBM。卸载要**读** NPU 上刚算出的 KV——必须等这条 compute stream 上的 forward 把 KV 写完，否则读到半成品。这就是分层搬运节拍的第一拍：搬运流先让一步，等算完。加载（h2d）不需要这道——它写的是 BlockPool 占住的空闲 block，没人在算它。
+- **`stream.wait_stream(current_stream())`，只在 d2h（卸载）时插。** 这里 `torch.npu.current_stream()` 返回当前 task 的默认计算流（compute stream）——forward 就在这条流上执行、把 KV 写进 HBM。卸载要**读** NPU 上刚算出的 KV——必须等这条 compute stream 上的 forward 把 KV 写完，否则读到半成品。这就是分层搬运节拍的第一拍：搬运流先让一步，等算完。加载（h2d）不需要这道——它写的是 `BlockPool`（调度器持有的物理 block 归属账本，负责分配与前缀缓存，完整机制见[第 25 章](../../ch25-kv-manager-and-schedulers/narrative/chapter.md)）占住的空闲 block，没人在算它。
 - **`stream.wait_event(last_transfer.end_event)`，两方向都插。** 既然每方向只有一条流，同方向的多次搬运就得串行：新 transfer 在流上等上一个 transfer 的 `end_event`，保证按提交顺序执行。`transfers[-1]` 是 deque 尾部（最近一个），新的 wait 它，再 append 进去——deque 顺序即执行顺序。
 
 编排完才进 `torch.npu.stream(stream)` 上下文：record 起始 Event → 发 `swap_blocks_batch`（方向码 d2h=1 / h2d=0）→ record 结束 Event。注意**整段是异步的**：`record` 和算子提交都只是往流上排活，函数不等它跑完就 `return True`。最后把这次搬运打包成一个 `Transfer`（带 job_id 和起止 Event）塞进 deque。

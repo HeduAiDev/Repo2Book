@@ -169,7 +169,7 @@ return draft_token_ids
 
 这是一条链式生成的循环：跑 k−1 次，每次把上一步采的草稿喂回去、增量推进一格、再 greedy 采下一个草稿，最后 `stack` 成 `[batch_size, num_speculative_tokens]`。EAGLE 的"草稿链"就是这么一步步接出来的。
 
-至于内部的 EAGLE 头怎么算——特征级自回归、超前一步 token、那层 FC + 单层 decoder——[上一章](../../ch30-primer-eagle/narrative/chapter.md)已经从原理推到源码；DFlash 的 mask token 怎么布、MTP 的多 token 预测头长什么样则是模型结构的事，[第 27 章](../../ch27-model-architecture/narrative/chapter.md) 讲过了。本章只认它们对外的契约：
+至于内部的 EAGLE 头怎么算——特征级自回归、超前一步 token、那层 FC + 单层 decoder——[上一章](../../ch30-primer-eagle/narrative/chapter.md)已经从原理推到源码；MTP 的多 token 预测头长什么样是模型结构的事，[第 27 章](../../ch27-model-architecture/narrative/chapter.md) 讲过了。DFlash 的 mask token 怎么布，本书暂未展开——大致思路是把待猜的多个位置统一用占位符（mask token）铺进同一批输入，模型一次前向并行出全部候选，而不是像 EAGLE 那样逐步链式生成。本章只认它们对外的契约：
 
 > **proposer 契约**：吃当前上下文（n-gram 吃 token 历史，模型类吃目标 hidden states），吐每请求 0 到 k 个草稿 token。模型类 proposer 还可以附带 `draft_probs`（草稿的概率分布）；n-gram 没有概率，`draft_probs` 是 `None`。
 
@@ -420,6 +420,8 @@ rejection_random_sample_kernel[(batch_size,)](
 )
 return output_token_ids
 ```
+
+（`synthetic_mode` 是一条离线合成基准/压测路径——即便请求全 greedy，也强制走 `generate_uniform_probs` 生成 `uniform_probs`，用于确定性复现或性能压测，和本章的接受准则正确性无关；精简版已经把这整条分支删掉。）
 
 先看这块输出 buffer：形状 `[batch_size, max_spec_len + 1]`，预填 `PLACEHOLDER_TOKEN_ID`（即 −1）。第二维那个 **+1 就是 bonus 槽**——`max_spec_len` 来自 `SpecDecodeMetadata.__post_init__` 里的 `max(num_draft_tokens)`。每个请求最多产出"k 个接受/纠正的草稿 + 1 个 bonus"，正好 `max_spec_len + 1` 个位置。预填 −1 是个哨兵：被拒后截断的位置、压根没填的位置，都留着 −1，最后统一过滤。
 

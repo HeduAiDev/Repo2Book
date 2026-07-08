@@ -392,7 +392,7 @@ class NPUPlatform(Platform):
         return backend_map[(attn_selector_config.use_mla, attn_selector_config.use_sparse, use_compress)]
 ```
 
-它按 `(use_mla, use_sparse[, use_compress])` 这把 key 在 `backend_map` 里查不同的昇腾 attention backend——MLA、稠密、SFA、DSA（MLA / SFA / DSA 是昇腾针对不同注意力模式的几种 backend 实现；MLA 即多头潜在注意力，SFA 由 `use_sparse` 稀疏路径选中，DSA（DeepSeek Sparse Attention）由 `use_compress` 量化路径选中）。`FLASH_ATTN` 是「训推一致」场景下的特例，先经 `_validate_fa3_backend` 校验通过才走（该校验依赖外部包 `flash_attn_npu_v3`，本章不展开）。
+它按 `(use_mla, use_sparse[, use_compress])` 这把 key 在 `backend_map` 里查不同的昇腾 attention backend——MLA、稠密、SFA、DSA（MLA / SFA / DSA 是昇腾针对不同注意力模式的几种 backend 实现；MLA 即多头潜在注意力，SFA 由 `use_sparse` 稀疏路径选中，DSA（DeepSeek Sparse Attention）由 `use_compress` 量化路径选中）。`FLASH_ATTN` 是「训推一致」（训练阶段与推理阶段共用同一套注意力 kernel、数值路径保持一致以避免精度漂移）场景下的特例，先经 `_validate_fa3_backend` 校验通过才走（该校验依赖外部包 `flash_attn_npu_v3`，本章不展开）。
 
 这里埋着一条**横切线索**：`if is_310p()` 这一支会整个改走 `backend_map_310`。而且注意两张表的 key 维度不同——非-310P 用 3 元组 key（含 `use_compress`），310P 用 2 元组 key。310P 是昇腾的纯推理卡，能力受限，连 attention backend 都另起一套（`vllm_ascend._310p.…`）。这个 `is_310p()` 究竟从哪来，我们 [§2.10](#210-设备分代is_310p-这条横切线) 揭晓。把精简版跑起来喂不同的 key，`(True,False,False)` 会拿到 `AscendMLABackend`、`(True,True,False)` 拿到 `AscendSFABackend`，而一旦把设备分代设成 310P，同样的 `(False,False)` 就改落到 `AscendAttentionBackend310`——查表分发与分代分流都能在 host 上纯 Python 复现。
 
@@ -414,7 +414,7 @@ class NPUPlatform(Platform):
                 parallel_config.worker_cls = "vllm_ascend.worker.worker.NPUWorker"
 ```
 
-vLLM 的 worker 类由 `parallel_config.worker_cls` 这个**字符串字段**承载，默认值是哨兵 `"auto"`。平台在 `check_and_update_config` 里把它从 `"auto"` 改写成具体 `NPUWorker` 的 qualname——还是「写 qualname 字符串、推迟 import」那一招，只是**落点在 config 字段而非工厂方法**。这里第三次出现按设备分代分流：310P → `NPUWorker310`、openEuler Xlite 图模式 → `XliteWorker`、默认 → `NPUWorker`。跑精简版验证：`worker_cls="auto"` 在 A2 分代下被改写成 `NPUWorker`、在 310P 下变 `NPUWorker310`；而如果字段本来就不是 `"auto"`（用户显式指定了 worker），这段 `if` 整个跳过，不覆盖用户的选择。
+vLLM 的 worker 类由 `parallel_config.worker_cls` 这个**字符串字段**承载，默认值是哨兵 `"auto"`。平台在 `check_and_update_config` 里把它从 `"auto"` 改写成具体 `NPUWorker` 的 qualname——还是「写 qualname 字符串、推迟 import」那一招，只是**落点在 config 字段而非工厂方法**。这里第三次出现按设备分代分流：310P → `NPUWorker310`、openEuler（华为的国产 Linux 发行版）Xlite 图模式（其专属的轻量执行路径，与主线 NPUWorker 平行、本书不展开）→ `XliteWorker`、默认 → `NPUWorker`。跑精简版验证：`worker_cls="auto"` 在 A2 分代下被改写成 `NPUWorker`、在 310P 下变 `NPUWorker310`；而如果字段本来就不是 `"auto"`（用户显式指定了 worker），这段 `if` 整个跳过，不覆盖用户的选择。
 
 `check_and_update_config` 这个方法本身远不止改 worker_cls 这一处——它还会校验 ACL graph、刷新 block size、调并行与显存配置等等。那是 [第 5 章：check_and_update_config](../../ch05-check-and-update-config/narrative/chapter.md) 的主场，本章只截下 worker_cls 这一刀，看清「同一个延迟绑定招式，第四次复用」。
 

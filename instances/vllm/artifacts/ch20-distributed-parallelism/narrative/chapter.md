@@ -156,7 +156,7 @@ class GroupCoordinator:
 
 两个细节这张表才看得清，光记形状记不住：all_gather **按 rank 序拼接**（不是任意序），rank0 的段在前；reduce_scatter 是**先全和再切**，每个 rank 留的是「全和的自己那一段」而非「自己原值的一段」。reduce_scatter 接一个 all_gather，正好把 `[4]`/`[6]` 拼回 `[4, 6]`——这就是下面要说的「all_reduce = reduce_scatter + all_gather」在数值上的样子。
 
-通信量上，按 ring 算法，设字节宽为 $b$，每张卡收发的字节数是：
+通信量上，按 ring 算法（把张量切成 $p$ 等份、沿一个首尾相接的环形拓扑传 $p-1$ 轮，每轮每张卡只收发 $1/p$ 的数据量）计，设字节宽为 $b$，每张卡收发的字节数是：
 
 $$
 \mathrm{all\_reduce} = \frac{2(p-1)}{p}\,Nb,
@@ -171,7 +171,7 @@ $$
 = \frac{p-1}{p}Nb + \frac{p-1}{p}Nb = \frac{2(p-1)}{p}Nb
 $$
 
-一个 all_reduce 的纯通信量，等于一个 reduce_scatter 接一个 all_gather（实测延迟上还差两次 kernel 的启动开销，纯字节数上则相等）。这个等式是序列并行的本钱——把一次 all_reduce 拆成「先 reduce_scatter、各算各的、再 all_gather」，能在不同位置摊销通信、还顺手把激活切小。本章不展开序列并行，但记住这笔账：拆开不亏通信量。
+一个 all_reduce 的纯通信量，等于一个 reduce_scatter 接一个 all_gather（实测延迟上还差两次 kernel 的启动开销，纯字节数上则相等）。这个等式是序列并行（sequence parallel，把激活张量沿序列/token 维度切开、各卡只算自己那一段）的本钱——把一次 all_reduce 拆成「先 reduce_scatter、各算各的、再 all_gather」，能在不同位置摊销通信、还顺手把激活切小。本章不展开序列并行的完整机制，但记住这笔账：拆开不亏通信量。
 
 现在看 `all_reduce` 的代码。它的 docstring 道破了一个看似多此一举的迂回：
 
@@ -304,7 +304,7 @@ CUDA 平台上，`CudaCommunicator` 会覆写这几个方法，语义一致，�
         out = pynccl_comm.all_reduce(input_)
 ```
 
-这是一条**优先级回退链**：NCCL symmetric-mem → quick reduce（ROCm）→ flashinfer → `CustomAllreduce`（vLLM 自研的低延迟小张量 all-reduce）→ symm-mem → pynccl → 兜底 `torch.distributed`。（注意链首的 `symmetric-mem` 和靠后的 `symm-mem` 是两个不同分支：前者是 NCCL 自带的对称内存 all-reduce，后者是 vLLM 的 `symm_mem` 路径，别看混。）挑哪个，取决于张量大小、平台、各后端是否可用，而且**对调用方完全透明**。
+这是一条**优先级回退链**：NCCL symmetric-mem → quick reduce（ROCm）→ flashinfer → `CustomAllreduce`（vLLM 自研的低延迟小张量 all-reduce）→ symm-mem → pynccl → 兜底 `torch.distributed`。对称内存（symmetric memory）：让参与通信的多张卡把各自显存映射进同一段虚拟地址空间，规约时可以直接互相读写，省掉一次「先拷进通信缓冲区」的开销，因此延迟更低。（注意链首的 `symmetric-mem` 和靠后的 `symm-mem` 是两个不同分支：前者是 NCCL 自带的对称内存 all-reduce，后者是 vLLM 自己实现的 `symm_mem` 路径，语义相近但走不同代码路径，别看混。）挑哪个，取决于张量大小、平台、各后端是否可用，而且**对调用方完全透明**。
 
 对本章读者，结论很干脆：`GroupCoordinator` 之下，`device_communicator` 才是真正挑选具体内核的地方。这个分层的好处是——新平台只要提供一个自己的 `DeviceCommunicatorBase` 子类，`GroupCoordinator` 和模型代码**零改动**。
 
@@ -636,7 +636,7 @@ def init_distributed_environment(...):
 
 整段的套路就一句注释里写的：**把目标维度 transpose 到最后一维 → reshape 成 2D → unbind 出每个组**。对任何一个并行维度都成立，不用手写索引。
 
-用一个具体配置看清楚：TP=2、PP=2、DP=2，共 8 张卡。源码里 `all_ranks` 始终是完整的 5 维张量 `(ExternalDP=1, DP=2, PP=2, PCP=1, TP=2)`——轴号 `transpose(2,4)`、`transpose(1,4)` 都是对这 5 维写的（DP=轴1、PP=轴2、PCP=轴3、TP=轴4）。可视化时把两个 size-1 维（ExternalDP、PCP）压掉，画成 `(DP=2, PP=2, TP=2)` 的三维网格，rank 数值完全不变，只是心里要记得轴号沿用 5 维写法。
+用一个具体配置看清楚：TP=2、PP=2、DP=2，共 8 张卡。源码里 `all_ranks` 始终是完整的 5 维张量 `(ExternalDP=1, DP=2, PP=2, PCP=1, TP=2)`——`PCP`（prefill context parallel，前缀上下文并行，按 prefill 阶段的上下文/序列维度切分，本章不展开）、`ExternalDP`（跨节点场景下数据并行的外层维度，本例未启用故取 1）——轴号 `transpose(2,4)`、`transpose(1,4)` 都是对这 5 维写的（DP=轴1、PP=轴2、PCP=轴3、TP=轴4）。可视化时把两个 size-1 维（ExternalDP、PCP）压掉，画成 `(DP=2, PP=2, TP=2)` 的三维网格，rank 数值完全不变，只是心里要记得轴号沿用 5 维写法。
 
 ![5 维 rank 张量切群组](../diagrams/03-rank-layout-and-groups.png)
 
@@ -687,7 +687,7 @@ def get_ep_group() -> GroupCoordinator:
     # … 省略：_DP / _DCP / _PCP / _WORLD 等访问器同构 …
 ```
 
-单例的好处是模型 forward 在**任意深度**都能零参数拿到当前维度的通信组，不用把 group 对象沿调用链一层层透传。这就是 [§20.2](#202-三大集合原语与后端选择的下沉) 里 `all_reduce` 能被随手调用的底气。`get_ep_group` 的 assert 还顺带点了一个设计决策：EP 群组**只对 MoE 模型创建**，dense 模型不浪费进程组。
+单例的好处是模型 forward 在**任意深度**都能零参数拿到当前维度的通信组，不用把 group 对象沿调用链一层层透传。这就是 [§20.2](#202-三大集合原语与后端选择的下沉) 里 `all_reduce` 能被随手调用的底气。`get_ep_group` 的 assert 还顺带点了一个设计决策：专家并行 EP（Expert Parallel，把 MoE 层里不同的专家分摊到不同卡上，通信只发生在路由/聚合那一刻，故比 TP 稀疏得多）群组**只对 MoE 模型创建**，dense 模型不浪费进程组。
 
 模型代码实际碰到的，是 `communication_op.py` 里薄薄一层封装——薄到只是 `get_tp_group().<op>`：
 

@@ -78,7 +78,7 @@ def initialize_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[st
     return kv_caches
 ```
 
-读这一段，先抓骨架别陷进分支：`_allocate_kv_cache_tensors` 拿回一份「字节张量」字典，`_reshape_kv_cache_tensors` 把它整形成「可用 KV」字典，剩下整段 `if/else` 都是**绑定**——把可用 KV 挂回 `self.kv_caches` 和 `static_forward_context`。绑定为什么要分三路、`extract_dsv4_layer_index` 在排什么，留到 [§17.7](#177-bind按模型走三条路)。
+读这一段，先抓骨架别陷进分支：`_allocate_kv_cache_tensors` 拿回一份「字节张量」字典，`_reshape_kv_cache_tensors` 把它整形成「可用 KV」字典，剩下整段 `if/else` 都是**绑定**——把可用 KV 挂回 `self.kv_caches` 和 `static_forward_context`（vLLM 编译期建好的「层名→attention 模块」登记表，供图捕获/`torch.compile` 期间算子按层名取 `kv_cache`；是编译期钉死的静态表，不同于[第 16 章](../../ch16-single-step-forward-context-dp-sync/narrative/chapter.md)里按拍现算的 `forward_context`）。绑定为什么要分三路、`extract_dsv4_layer_index` 在排什么，留到 [§17.7](#177-bind按模型走三条路)。
 
 整条流水线的产物在变，可以摆成一张图：
 
@@ -90,7 +90,7 @@ def initialize_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[st
 
 ## 17.2 对齐原语：为什么是 2MB，怎么对齐到 2MB
 
-分配的第一个常量，是 `_allocate_kv_cache_tensors` 开头那行 `alignment = 2 * 1024 * 1024`——2MB。为什么是 2MB？这要从 [PD 分离（见第 11 章）](../../ch11-pd-disaggregation-mooncake/narrative/chapter.md)说起：prefill 节点算完的 KV 要跨节点搬给 decode 节点，Mooncake/ADXL 就是承担这趟搬运的分布式 KV 传输系统。它走 RDMA、把 KV 张量注册成可被远端直读的内存区间，而这套注册要求**起始地址按 2MB 大页边界对齐**。对不齐，注册就失败。
+分配的第一个常量，是 `_allocate_kv_cache_tensors` 开头那行 `alignment = 2 * 1024 * 1024`——2MB。为什么是 2MB？这要从 [PD 分离（见第 11 章）](../../ch11-pd-disaggregation-mooncake/narrative/chapter.md)说起：prefill 节点算完的 KV 要跨节点搬给 decode 节点，Mooncake/ADXL 就是承担这趟搬运的分布式 KV 传输系统（ADXL 是昇腾另一套与 Mooncake 并列的 P2P 传输后端，二者都走同一套 2MB 对齐要求，本章不展开两者差异）。它走 RDMA、把 KV 张量注册成可被远端直读的内存区间，而这套注册要求**起始地址按 2MB 大页边界对齐**。对不齐，注册就失败。
 
 要先说清楚一件事：**这段对齐只在开了 KV 传输（即配置了 `kv_transfer_config`）时才真正生效**，没开传输时分配走的是另一条不对齐的快路——下一节 [§17.3](#173-int8-裸分配--把-kv-拆成两块) 见分晓。
 
@@ -505,7 +505,7 @@ reshape 交出 `kv_caches` 字典后，最后一步是 **bind**——把每块 K
 回看 [§17.1](#171-三步骨架从字节到挂回各层) 的 `initialize_kv_cache_tensors`，那段 `if/else` 就是这张图：
 
 - **普通模型**（`else` 分支）：`bind_kv_cache(..., num_attn_module=1)`。基座的 `bind_kv_cache` 按 `layer_index` 排序，把 KV 填进 `runner_kv_caches` 并挂到各层 forward context。昇腾直接复用。
-- **longcat_flash**：同样调 `bind_kv_cache`，但 `num_attn_module=2`——这个模型每个解码层含 2 个 attention module，得告诉绑定逻辑一层对两组。
+- **longcat_flash**（美团 LongCat-Flash 模型）：同样调 `bind_kv_cache`，但 `num_attn_module=2`——这个模型每个解码层含 2 个 attention module，得告诉绑定逻辑一层对两组。
 - **deepseek_v4**：完全不走 `bind_kv_cache`，自己排序后手填。为什么？因为它的 MTP（多 token 预测）层在 config 的 per-layer 数组里排在主模型层**之后**，`bind_kv_cache` 默认的 `layer_index` 排序会把它们排错。排序键是 `extract_dsv4_layer_index`：
 
 ```python
@@ -535,7 +535,7 @@ def extract_dsv4_layer_index(config: Any, layer_name: str) -> int:
 
 `sorted(kv_caches, key=...)` 用这个键排，得到 `[layer0, layer1, mtp.0]`——主模型层在前、MTP 殿后，正好是前向期望的顺序。排完手动 `append` 进 `self.kv_caches`，并把每层的 `static_forward_context[layer].kv_cache` 填成 `[kv]`。
 
-三路走完，还有一个共同的尾巴：若 `enable_hamming_sparse`，再调一次 `init_and_bind_hashk_cache` 给 hamming 稀疏额外挂一份 hashk cache。这是叠在三路之上的可选项，不影响主分派。
+三路走完，还有一个共同的尾巴：若 `enable_hamming_sparse`，再调一次 `init_and_bind_hashk_cache` 给 hamming 稀疏额外挂一份 hashk cache（hamming 稀疏即 KVComp：用哈希汉明距离代理浮点内积做 top-k 选块的运行期近似检索机制，[第 26 章](../../ch26-primer-v4-csa-hca/narrative/chapter.md) §4.3 有完整机制展开，这里只需知道它是可选旁路）。这是叠在三路之上的可选项，不影响主分派。
 
 ## 17.8 两条辅线：spec 解析与输入批重建
 

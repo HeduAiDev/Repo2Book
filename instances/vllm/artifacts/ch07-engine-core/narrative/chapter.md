@@ -137,7 +137,7 @@ class InprocClient(EngineCoreClient):
 
 看清楚每个方法体：
 
-- `add_request`：直接调 `self.engine_core.add_request(...)`。一次普通的方法调用。
+- `add_request`：直接调 `self.engine_core.add_request(...)`。一次普通的方法调用。（`preprocess_add_request` 顺带拆出的 `request_wave` 是数据并行场景下给请求打的批次编号，本章只需知道它跟着请求一起被原样透传，收敛机制见[第 21 章](../../ch21-async-engine/narrative/chapter.md)。）
 - `get_output`：直接调 `self.engine_core.step_fn()` 步进一次引擎，把结果返回。
 
 **没有序列化，没有 socket，没有后台 busy loop。** 调用方调 `add_request` 时，引擎并不会自己跑——得等调用方主动 `get_output` 来步进它。这是老式 `LLMEngine` 的"塞一个请求、手动步一下"工作法。

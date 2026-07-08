@@ -194,11 +194,11 @@ class MLAAttentionSpec(FullAttentionSpec):
         )
 ```
 
-这套算法背后是个「3 元组 KV」的世界观：这套算法面对的是 DSA 系 MLA——它的一块 KV 由三段张量组成（普通 MLA 只有 `kv_lora`、`k_rope` 两段，DSA 多出稀疏索引器（indexer）的 key），而且**三段全是 bf16**。页字节就是「块大小 × 头数 × head_size × dtype 字节」这么直白一乘。
+这套算法背后是个「3 元组 KV」的世界观：这套算法面对的是 DSA（DeepSeek Sparse Attention，DeepSeek 稀疏注意力）系 MLA——它的一块 KV 由三段张量组成（普通 MLA 只有 `kv_lora`、`k_rope` 两段，DSA 多出稀疏索引器（indexer）的 key），而且**三段全是 bf16**。页字节就是「块大小 × 头数 × head_size × dtype 字节」这么直白一乘。
 
 ### 昇腾约束：DSA / Sparse-C8 把 KV 撑成 4 元组
 
-昇腾要支持一类新结构：DSA（DeepSeek Sparse Attention）配上 **Sparse-C8** 量化。这玩意儿动了 KV 的根本布局：
+昇腾要支持一类新结构：DSA 配上 **Sparse-C8** 量化。这玩意儿动了 KV 的根本布局：
 
 ![Sparse-C8 把 MLA 的 KV 从 3 元组扩成 4 元组](../diagrams/sparse_c8.png)
 
@@ -361,7 +361,7 @@ vLLM 的 `HybridKVCacheCoordinator`（hybrid 模型的 KV-cache 协调器）在�
         return block_size
 ```
 
-这就是「有效块大小」：拿 spec 自己的 `block_size`，先乘 CP 因子（`dcp × pcp`），再乘压缩比（DeepseekV4 的 C128 量化会用到）。**为什么要乘 CP 因子？** CP 下每个 rank 只本地存 `max_model_len / (dcp × pcp)` 个 token，但块在**逻辑上**仍按完整序列对齐——所以折算命中长度时，块的「有效」跨度要乘回 CP 因子。
+这就是「有效块大小」：拿 spec 自己的 `block_size`，先乘 CP 因子（`dcp × pcp`），再乘压缩比（DeepseekV4 的 C128 量化会用到——每 128 个 token 压缩一次的量化方案，机制详见[第 26 章](../../ch26-primer-v4-csa-hca/narrative/chapter.md)）。**为什么要乘 CP 因子？** CP 下每个 rank 只本地存 `max_model_len / (dcp × pcp)` 个 token，但块在**逻辑上**仍按完整序列对齐——所以折算命中长度时，块的「有效」跨度要乘回 CP 因子。
 
 这个有效块大小有什么用？它决定了前缀缓存命中长度的**对齐单位**。`verify_and_split_kv_cache_groups` 用它算出所有注意力类型块大小的最小公倍数：
 
@@ -373,7 +373,7 @@ vLLM 的 `HybridKVCacheCoordinator`（hybrid 模型的 KV-cache 协调器）在�
             attention_groups,
             key=lambda x: not isinstance(x[0], FullAttentionSpec),
         )
-        # … 省略：eagle/MTP 组索引收集 …
+        # … 省略：投机解码（eagle/MTP，多 token 预测，详见第 34、35 章）组索引收集 …
         # The LCM of the block sizes of all attention types.
         # The cache hit length must be a multiple of the LCM of the block sizes …
         block_sizes = [self._get_effective_block_size(spec) for spec, _, _ in self.attention_groups]

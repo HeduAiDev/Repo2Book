@@ -235,7 +235,7 @@ class SyncMPClient(MPClient):
 
         def process_outputs_socket():
             # 后台线程：从 ZMQ output_socket 收一帧、反序列化成 EngineCoreOutputs、塞进队列
-            # … 省略：poller / recv_multipart / decoder.decode 细节（第 5、6 章已讲字节协议）…
+            # … 省略：poller / recv_multipart / decoder.decode 细节（第 7 章已讲字节协议）…
             while True:
                 outputs: EngineCoreOutputs = decoder.decode(frames)
                 outputs_queue.put_nowait(outputs)
@@ -247,7 +247,7 @@ class SyncMPClient(MPClient):
         self.output_queue_thread.start()
 ```
 
-`super().__init__` 那一行（这里省了细节）做的是重活：启动**独立的 EngineCore 子进程**、建好 ZMQ 的输入/输出 socket、装好 msgpack 编解码器。这套字节标签协议是第 5、6 章的主题，本章不重讲——你只需知道，调用结束后，有一个 EngineCore 正在另一个进程里待命，主进程和它之间架着两条 ZMQ 管道。
+`super().__init__` 那一行（这里省了细节）做的是重活：启动**独立的 EngineCore 子进程**、建好 ZMQ 的输入/输出 socket、装好 msgpack 编解码器。这套字节标签协议是[第 7 章：IPC 边界](../../ch07-engine-core/narrative/chapter.md)的主题，本章不重讲——你只需知道，调用结束后，有一个 EngineCore 正在另一个进程里待命，主进程和它之间架着两条 ZMQ 管道。
 
 然后是本章关心的部分：一个后台 daemon 线程 `EngineCoreOutputQueueThread`，死循环地从 ZMQ output_socket 收数据、反序列化成 `EngineCoreOutputs`、`put_nowait` 进 `outputs_queue`。这条线程是"生产者"。
 

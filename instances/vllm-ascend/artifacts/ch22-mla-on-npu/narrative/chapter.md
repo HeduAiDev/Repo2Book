@@ -98,7 +98,7 @@ MLA 的妙招叫**权重吸收（weight absorption）**：把「解压」这一�
 
 这个 `W_UK_T` 是吸收的关键中间物——它把 `L_kv` 维放到最后，正好让运行期可以拿 query 的 `q_nope`（也是 `P` 维）去右乘它，一步投进 `L_kv` 空间。
 
-**这里有个容易踩的坑，必须钉死。** 上面 `npu_format_cast` 的目标格式是 `ACL_FORMAT_FRACTAL_ND`，它在 `vllm_ascend/utils.py:L54` 定义为 `2`（ND 排布）——之所以转成 ND，是因为接下来要做 `.T` / `view` / `split` 这些 PyTorch 张量操作，ND 排布才好使。真正喂给昇腾 cube 计算单元的是 `W_UK_T`，它在后面才被转成另一种格式：
+**这里有个容易踩的坑，必须钉死。** 上面 `npu_format_cast` 的目标格式是 `ACL_FORMAT_FRACTAL_ND`，它在 `vllm_ascend/utils.py:L54` 定义为 `2`（ND 排布）——之所以转成 ND，是因为接下来要做 `.T` / `view` / `split` 这些 PyTorch 张量操作，ND 排布才好使。真正喂给昇腾 cube 计算单元（[第 18 章](../../ch18-310p-inference-chip-specialization/narrative/chapter.md)介绍过的芯片内专做矩阵运算的硬件引擎）的是 `W_UK_T`，它在后面才被转成另一种格式：
 
 ```python
 # vllm_ascend/attention/mla_v1.py:L979
@@ -277,7 +277,7 @@ b = ql_nope @ kv_c                    # → 19.0
 
 骨架很清爽：`split_decodes_and_prefills` 一刀切出四个计数（decode 请求数 / prefill 请求数 / decode token 数 / prefill token 数），然后**按需**装配——有 prefill 就建 `prefill` 段，有 decode 就建 `decode` 段，两段都挂进顶层的 `AscendMLAMetadata`。
 
-切分的判据是 `decode_threshold`：`query_len ≤ decode_threshold` 的请求算 decode。普通解码每步只生成 1 个 token，所以阈值默认是 1；但开了投机解码（speculative decoding，一步先生成多个候选 token、再一起验证）时，一个 decode 步要验证多个草稿 token，于是 decode 段每请求的 query token 可能不止 1 个，阈值据此放宽到 `1 + num_speculative_tokens`（受 TND 布局上限约束，`≤ 16`）。
+切分的判据是 `decode_threshold`：`query_len ≤ decode_threshold` 的请求算 decode。普通解码每步只生成 1 个 token，所以阈值默认是 1；但开了投机解码（speculative decoding，一步先生成多个候选 token、再一起验证）时，一个 decode 步要验证多个草稿 token，于是 decode 段每请求的 query token 可能不止 1 个，阈值据此放宽到 `1 + num_speculative_tokens`（受 TND——[第 20 章](../../ch20-ascend-attention-mha/narrative/chapter.md)讲过的变长打平布局——上限约束，`≤ 16`）。
 
 batch 在进来之前已经按「decode 段在前、prefill 段在后」重排好，所以 `build_prefill_metadata` 切 prefill 段时，起点就是 `num_decodes` / `num_decode_tokens`：
 

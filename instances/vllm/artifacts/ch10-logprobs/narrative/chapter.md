@@ -206,7 +206,7 @@ def _update_sample_logprobs(self, logprobs_lists: LogprobsLists) -> None:
 
 逐段拆。
 
-**输入解包**。`LogprobsLists` 是个有四个字段的具名元组，这里解包出三个：`token_ids_lst`、`logprobs_lst`、`ranks_lst`（第四个 `cu_num_generated_tokens` 用 `_` 丢掉）。注意这三个已经是 numpy 形态了——EngineCore 那边已经搬到 CPU。
+**输入解包**。`LogprobsLists` 是个有四个字段的具名元组，这里解包出三个：`token_ids_lst`、`logprobs_lst`、`ranks_lst`（第四个 `cu_num_generated_tokens` 用 `_` 丢掉）。注意这三个已经是 numpy 形态了——EngineCore 那边已经搬到 CPU。这两个字段（`LogprobsLists` 和下一节的 `LogprobsTensors`）本身怎么从 logits 算出来——Sampler 那一侧的事——留到 [第 29 章](../../ch29-sampling/narrative/chapter.md) 讲；本章只管接住这份已经搬到 CPU 的成品，往 OpenAI 容器里装配。
 
 **外层 for 循环为什么存在**。docstring 说得很直白：外层列表长度只有在前一步 EngineCore 一次产出多个 token 时才大于 1，比如投机解码。普通逐 token 解码，每次只有一个位置。所以你可以先按"每步一个位置"理解整个循环体，最后补一句"投机解码时会有多个位置连着来"即可。
 
@@ -239,7 +239,7 @@ $$
 \mathrm{cumulative\_logprob} = \sum_{t} \log P(x_t \mid x_{<t})
 $$
 
-人话翻译：把每一步"模型确实吐出的那个词"的对数概率加起来，得到整句话的打分。越接近 0，模型对这句话越有把握；越负，越是勉强生成的。这个值后面随 `CompletionOutput` 一起返回，可用于 beam search 或序列重排。prompt 路不碰它——prompt 不是模型生成的，累计它没意义。
+人话翻译：把每一步"模型确实吐出的那个词"的对数概率加起来，得到整句话的打分。越接近 0，模型对这句话越有把握；越负，越是勉强生成的。这个值后面随 `CompletionOutput` 一起返回，可用于 beam search（用同一份累计对数概率给多条候选序列打分排序，完整 API 见 [第 34 章](../../ch34-entrypoints/narrative/chapter.md)）或序列重排。prompt 路不碰它——prompt 不是模型生成的，累计它没意义。
 
 **写入**。最后 `append_logprobs_for_next_position` 把这一位置的所有候选写进容器，§10.6 拆它。
 

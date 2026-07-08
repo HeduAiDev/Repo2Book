@@ -92,7 +92,7 @@ def get_class(vllm_config: VllmConfig) -> type["Executor"]:
 
 **第一，分发的「键」只是个字符串**：`parallel_config.distributed_executor_backend`。它在 [第 3 章](../../ch03-config-and-wiring/narrative/chapter.md) 的配置组装期就定好了——单卡默认 `"uni"`，多卡默认 `"mp"`，要用 ray 集群才是 `"ray"`。把「单卡 / 多进程 / Ray / 外部启动器」这四种截然不同的进程编排，全收敛到这**一个分发点**。引擎别处不需要知道这件事。
 
-**第二，它留了扩展口**。注意第一个分支 `isinstance(..., type)` 和最后一个 `isinstance(..., str)`：你可以直接把一个自定义 `Executor` 子类传进来，或者传一个它的全限定名字符串（qualname，像 `"my_pkg.MyExecutor"`），工厂用 `resolve_obj_by_qualname` 把字符串解析成类。RLHF 训练框架、外部调度系统接管 vLLM 时，靠的就是这个口子。
+**第二，它留了扩展口**。注意第一个分支 `isinstance(..., type)` 和最后一个 `isinstance(..., str)`：你可以直接把一个自定义 `Executor` 子类传进来，或者传一个它的全限定名字符串（qualname，像 `"my_pkg.MyExecutor"`），工厂用 `resolve_obj_by_qualname` 把字符串解析成类。RLHF（人类反馈强化学习训练循环，训练侧要把新权重同步进推理 worker）训练框架、外部调度系统接管 vLLM 时，靠的就是这个口子。
 
 > 注意：`get_class` 只**返回类**，不实例化。实例化是下一步引擎自己做的事。把「挑哪个类」和「造它」分开，让工厂保持无副作用——一个纯函数，给配置还类。
 
@@ -160,7 +160,7 @@ def execute_model(
 
 就三行。把方法名 `"execute_model"` 和工单 `scheduler_output` 交给 `collective_rpc`，收回一个结果 list，取 `output[0]`。
 
-> 为什么取 `[0]`？因为这里只关心**一个** worker 的输出。张量并行下各 rank 的最终 token 是冗余的，流水线并行下只有最后一段产出真 token——所以执行器只需要其中一个 rank 的回复。这个「只收一个 rank」的优化，[§17.6](#execute_model-为什么只收一个-rank) 会落实到 mp 版的 `output_rank` 上。
+> 为什么取 `[0]`？因为这里只关心**一个** worker 的输出。张量并行把矩阵按列/行切开，但层末靠 all-reduce 把各分片汇总回同一份完整结果，所以同一 TP 组内各 rank 的最终 token 是冗余的；流水线并行下只有最后一段产出真 token——所以执行器只需要其中一个 rank 的回复。这个「只收一个 rank」的优化，[§17.6](#execute_model-为什么只收一个-rank) 会落实到 mp 版的 `output_rank` 上。
 
 `sample_tokens`、`determine_available_memory`、`add_lora`、`sleep`、`wake_up`、`check_health`……翻一遍 `abstract.py`，十几个方法全是同一个模子：包一层 `collective_rpc`，换个方法名。这意味着**子类只要实现 `collective_rpc` 这一处，整套指令的语义就齐了**。`UniProcExecutor` 和 `MultiprocExecutor` 的全部差异，浓缩在这一个方法的两种实现里。
 
@@ -300,9 +300,9 @@ finally:
 
 几个要点。
 
-**`world_size` 个 worker，每个一张卡。** `world_size = tensor_parallel × pipeline_parallel × prefill_context_parallel`，构造一开始就 `assert` 过这个等式。单节点起 `local_world_size` 个子进程，循环里一个 `local_rank` 一个，各调 `make_worker_process` 拉起来。
+**`world_size` 个 worker，每个一张卡。** `world_size = tensor_parallel × pipeline_parallel × prefill_context_parallel`（prefill context parallel，简称 pcp：按 prefill 阶段的上下文/序列维度切分，算法本身留待专门章节，这里只需知道它是 world_size 的第三个乘法因子，默认 `pcp_size=1`），构造一开始就 `assert` 过这个等式。单节点起 `local_world_size` 个子进程，循环里一个 `local_rank` 一个，各调 `make_worker_process` 拉起来。
 
-**先全部拉起，再等就绪。** 注意那条注释——「Workers must be created before wait_for_ready to avoid deadlock」。为什么不能起一个等一个？因为 worker 的 `init_device()` 里有**设备同步**（NCCL 建组要所有 rank 同时到场）。要是父进程起完 rank 0 就阻塞等它 READY，rank 0 卡在设备同步上等 rank 1……而 rank 1 还没被起，死锁。所以必须**先把 N 个全 spawn 出去**，让它们彼此能在 init_device 里会合，父进程再统一 `wait_for_ready`。
+**先全部拉起，再等就绪。** 注意那条注释——「Workers must be created before wait_for_ready to avoid deadlock」。为什么不能起一个等一个？因为 worker 的 `init_device()` 里有**设备同步**（NCCL——GPU 间做集合通信如 all-reduce 的库——建组握手要求所有参与 rank 同时到场）。要是父进程起完 rank 0 就阻塞等它 READY，rank 0 卡在设备同步上等 rank 1……而 rank 1 还没被起，死锁。所以必须**先把 N 个全 spawn 出去**，让它们彼此能在 init_device 里会合，父进程再统一 `wait_for_ready`。
 
 **广播队列只建一份。** `rpc_broadcast_mq` 是**一条**共享内存 `MessageQueue`，`export_handle()` 导出它的句柄，作为参数发给每个子进程——这样所有 worker 都连到**同一条**广播队列。这是「一次 enqueue、N 个 reader 都看到」的物理基础。
 
@@ -383,7 +383,7 @@ def collective_rpc(
 
 注意 `send_method` 的两种形态。`method` 是字符串就原样发；是 callable 就 `cloudpickle.dumps` **把整个函数序列化**发出去。后者是个强能力：你可以在引擎侧写一个临时函数，让它在每个 worker 上跑——worker 侧反序列化后调用它（[§17.7](#177-worker-子进程出生服役死亡) 会看到 worker 怎么 `cloudpickle.loads` 接住）。collective_rpc 因此不只能调 worker 的**已有**方法，还能下发**任意**逻辑。RLHF 里在 worker 上同步权重、自定义诊断，靠的就是这条。
 
-> **v0.21.0 更新**：权重热更新正是这条「在 worker 上同步权重」路径上最具代表性的一例，且它的接口在 v0.21.0 里被显式拆开了。基线中 `vllm/v1/worker/gpu_worker.py` 的 `Worker` 用单方法 `update_weights()` 一把梭——内部自己串起 `initialize_layerwise_reload → receive_weights → finalize_layerwise_reload`。v0.21.0 把它拆成显式三段式：`start_weight_update(is_checkpoint_format)` 先开局（checkpoint 格式时建逐层重载状态、置守卫位 `_weight_update_active=True`）、`update_weights()` 此后可被 collective_rpc 调**一次或多次**接收权重分块（checkpoint 格式走 `receive_weights`，kernel 格式走就地 `param.copy_`）、`finish_weight_update()` 收尾跑 `finalize_layerwise_reload` 并复位守卫。它对应控制平面新增的 `/start_weight_update`、`/finish_weight_update` 端点，让训练侧能**分块流式**推权重，而非整批阻塞。形态变了，载体没变——还是这一句 `collective_rpc` 广播下去、N 个 worker 各执行一遍。
+> **v0.21.0 更新**：权重热更新正是这条「在 worker 上同步权重」路径上最具代表性的一例，且它的接口在 v0.21.0 里被显式拆开了。基线中 `vllm/v1/worker/gpu_worker.py` 的 `Worker` 用单方法 `update_weights()` 一把梭——内部自己串起 `initialize_layerwise_reload → receive_weights → finalize_layerwise_reload`。v0.21.0 把它拆成显式三段式：`start_weight_update(is_checkpoint_format)` 先开局（checkpoint 格式时建逐层重载状态、置守卫位 `_weight_update_active=True`）、`update_weights()` 此后可被 collective_rpc 调**一次或多次**接收权重分块（checkpoint 格式——原始权重分片需逐层处理——走 `receive_weights`，kernel 格式——已按算子打包、可直接覆盖显存——走就地 `param.copy_`）、`finish_weight_update()` 收尾跑 `finalize_layerwise_reload` 并复位守卫。它对应控制平面新增的 `/start_weight_update`、`/finish_weight_update` 端点，让训练侧能**分块流式**推权重，而非整批阻塞。形态变了，载体没变——还是这一句 `collective_rpc` 广播下去、N 个 worker 各执行一遍。
 
 **收，按 `output_rank` 决定收几个。** 关键在这两行：
 

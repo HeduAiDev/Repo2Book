@@ -129,7 +129,7 @@ $$
 \mathrm{KV}_\mathrm{total} \approx \mathrm{KV}_\mathrm{prompt} + n \times \mathrm{KV}_\mathrm{output}
 $$
 
-人话：prompt 那段 KV 只存一份（n 路共享），只有各自生成出来的 output token 才各占一份。对「长 prompt、短输出、大 n」的场景（典型如 best-of-n 重排），这笔账非常划算。
+人话：prompt 那段 KV 只存一份（n 路共享），只有各自生成出来的 output token 才各占一份。对「长 prompt、短输出、大 n」的场景（典型如 best-of-n 重排——对同一 prompt 采 n 个候选，事后按打分挑/排出最优结果），这笔账非常划算。
 
 ---
 

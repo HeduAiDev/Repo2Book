@@ -275,9 +275,9 @@ def forward_native(self, logits, generators, k, p):
 
 读这段要抓三条分支的优先级：
 
-- **`VLLM_BATCH_INVARIANT` 回退基类**——确定性模式开启时，直接 `super().forward_native(...)` 走 vLLM 原生实现。这一条和第 [26 章的批不变（batch-invariant）一致性](../../ch30-fusedmoe-batch-invariant/narrative/chapter.md)同源：昇腾的 torch_npu / Triton 路径会破坏「同一输入、不管和谁拼 batch 都逐位一致」的保证，所以确定性模式下必须退回基类那套固定分块的原生算子。两章用的是同一个开关、同一个理由。
+- **`VLLM_BATCH_INVARIANT` 回退基类**——确定性模式开启时，直接 `super().forward_native(...)` 走 vLLM 原生实现。这一条和第 [30 章的批不变（batch-invariant）一致性](../../ch30-fusedmoe-batch-invariant/narrative/chapter.md)同源：昇腾的 torch_npu / Triton 路径会破坏「同一输入、不管和谁拼 batch 都逐位一致」的保证，所以确定性模式下必须退回基类那套固定分块的原生算子。两章用的是同一个开关、同一个理由。
 - **`enable_async_exponential` 旁路**——这是前面那两行异步包裹的完整版：模型前向期间就在 side stream 上把 `q` 预算好、用 Event 记录完成点；走到这里只需 `self.async_event.synchronize()` 等一下，再直接 `probs.div_(self.q).argmax(...)`，把指数随机的延迟彻底藏进前向。这里的 `self.q`（side stream 上预算好的指数随机缓冲）和 `self.async_event`（记录其完成点的跨 stream 同步 Event）并不在 `__init__` 里——它们由 `set_q_event` 在模型前向期间的 `do_async_exponential` 写入；`__init__` 只创建了那个 Event 本体（`self.async_exponential_event = torch.npu.Event()`）。默认关闭。
-- **默认分支**——落到最后一行 `random_sample(probs, generators)`，也就是 28.2 那个带 stream 包裹的 Gumbel-max。绝大多数请求走这条。
+- **默认分支**——落到最后一行 `random_sample(probs, generators)`，也就是 33.2 那个带 stream 包裹的 Gumbel-max。绝大多数请求走这条。
 
 三条分支，默认那条最朴素，另两条是「确定性优先」和「极致重叠」的可选偏向。覆写 `forward_native` 的意义，就是在基类的采样契约里，把这三种取向接进来。
 
@@ -499,7 +499,7 @@ $$
 p_{\mathrm{recover}}(x) = \frac{\max\!\bigl(0,\; p_{\mathrm{target}}(x) - p_{\mathrm{draft}}(x)\bigr)}{Z}, \qquad Z = \sum_x \max\!\bigl(0,\; p_{\mathrm{target}}(x) - p_{\mathrm{draft}}(x)\bigr)
 $$
 
-而这个重采，用的又是 28.2 那套 Gumbel-max——`sample_recovered_tokens_pytorch` 里照样是 `q.exponential_()` 填指数随机、残差除以 `q` 再 argmax：
+而这个重采，用的又是 33.2 那套 Gumbel-max——`sample_recovered_tokens_pytorch` 里照样是 `q.exponential_()` 填指数随机、残差除以 `q` 再 argmax：
 
 ```python
 # vllm_ascend/sample/rejection_sampler.py:L1238

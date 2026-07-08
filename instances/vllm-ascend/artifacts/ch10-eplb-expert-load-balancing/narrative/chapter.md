@@ -782,7 +782,7 @@ ACT 那条把三步走全了：expert0 的 100 太扎眼，②给它劈出一个
 
 ### 为什么均衡有效：一点量化
 
-衡量负载偏斜，用的是最朴素的指标——最热卡负载除以平均卡负载：
+衡量负载偏斜，用的还是[上一章](../../ch09-primer-eplb/narrative/chapter.md)定义的 par（不均衡度）——最热卡负载除以平均卡负载，源码里变量名是 `imbalance`（对应 `_compute_imbalance` 算出的 `stage_par`），公式不变：
 
 $$
 \mathrm{imbalance} = \frac{\max_i \mathrm{load}_i}{\mathrm{mean}_i \mathrm{load}_i}

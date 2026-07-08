@@ -677,7 +677,7 @@ def _progress_removing_engine(self) -> bool:
         return True
 ```
 
-它和余留引擎的差别在动词：余留引擎调 `_switch_and_prepare`（切到新组**准备继续干活**），被裁引擎调 `_switch_and_remove`（切完就**准备退场**），并在 `COMPLETE` 前发出 `SHUTDOWN_COMPLETE` 通知——让 `EngineCoreClient` 知道这台可以释放它的 ray placement group 了。然后呢？回到 §36.4 那段 busy loop 钩子：`is_complete()` 为真 + `worker_type == "removing"` → `raise SystemExit`，进程干净下线。
+它和余留引擎的差别在动词：余留引擎调 `_switch_and_prepare`（切到新组**准备继续干活**），被裁引擎调 `_switch_and_remove`（切完就**准备退场**），并在 `COMPLETE` 前发出 `SHUTDOWN_COMPLETE` 通知——让 `EngineCoreClient` 知道这台可以释放它的 ray placement group（Ray 预留给这批 worker 的那组节点资源）了。然后呢？回到 §36.4 那段 busy loop 钩子：`is_complete()` 为真 + `worker_type == "removing"` → `raise SystemExit`，进程干净下线。
 
 至此，弹性 EP 的四种角色全部走完。一句话总结：**把"重建分布式组"这件本质阻塞的事，拆成一台每轮只走一步的状态机，让它和正常推理交织进行；用 TCPStore 计数 + 两阶段 barrier 容忍各 rank 的时间偏序；用 all_reduce(MAX) 把变动后的成员收敛回同一条 DP wave。** 不停机，靠的就是这三招。
 

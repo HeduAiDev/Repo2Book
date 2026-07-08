@@ -158,7 +158,7 @@ def __init__(
 
 分三段看：
 
-1. **`super().__init__` 之前**，先做昇腾特有的开场白：`adapt_patch()` 打补丁（这套两段式猴补在 [第 3 章](../../ch03-two-stage-monkey-patch/narrative/chapter.md) 讲过）、注册 ATB 扩展与 customop、`init_ascend_config` 初始化昇腾配置和 SoC 版本。这些是 GPU 那份没有的、昇腾必须先铺好的地基。
+1. **`super().__init__` 之前**，先做昇腾特有的开场白：`adapt_patch()` 打补丁（这套两段式猴补在 [第 3 章](../../ch03-two-stage-monkey-patch/narrative/chapter.md) 讲过）、注册 ATB 扩展与 customop（顶替算子的注册钩子，机制见 [第 27 章](../../ch27-customop-oot-replacement/narrative/chapter.md)）、`init_ascend_config` 初始化昇腾配置和 SoC 版本。这些是 GPU 那份没有的、昇腾必须先铺好的地基。
 2. **`super().__init__`** 这一步，复用的正是 `WorkerBase` 的公共逻辑——把 `vllm_config` 摊开成 `model_config` / `cache_config` / `parallel_config` 等字段，记下 `local_rank` / `rank`，把 `device` 和 `model_runner` 先置空。这段和 GPU 的 `Worker` 走的是**同一段代码**——这就是「平级兄弟共用一个抽象基类」的实惠：公共的 config 摊开逻辑不必重写。
 3. **`super().__init__` 之后**，定 `cache_dtype`，并把 `profiler` 设成 `None` 懒初始化。注意它的类型是 `TorchNPUProfilerWrapper`——这是个横切点，[§14.8](#148-横切两点与一条平行路径profiler-与-xlite) 再点一句。
 

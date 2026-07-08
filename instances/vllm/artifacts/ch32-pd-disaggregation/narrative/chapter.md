@@ -281,6 +281,8 @@ KVConnectorFactory.register_connector(
         return connector_cls(config, role, kv_cache_config)
 ```
 
+省略的那段 HMA 校验，全称 Hybrid Memory Allocator（混合内存分配器）——用来判断当前选中的 connector 是否兼容[第 16 章](../../ch16-kv-cache/narrative/chapter.md)讲过的多 `kv_cache_group` 场景（比如全注意力叠加滑窗混合模型），不兼容就在启动时直接报错；本章的主线走的是它已经校验通过的单组路径，不再展开。
+
 `role` 参数在这里分流。`NOTE(Kuntai)` 那段注释把意图说白了：调度器侧 connector 和 worker 侧 connector "build separately to enforce strict separation"——分别构造，强制严格隔离。调度器进程调一次 `create_connector(role=SCHEDULER)`，每个 worker 进程各调一次 `create_connector(role=WORKER)`。同一个类，两份实例，各活在各的进程里。
 
 > **版本沿革**：早期版本里这段曾有一条 `compat_sig` 兼容分支与 `kv_cache_config: "KVCacheConfig | None" = None` 的可选签名，用来兜住 pre-v0.12.0 的两参构造器 `__init__(self, vllm_config, role)`。v0.21.0 把它彻底删除：`kv_cache_config` 升为**第三个必填参数**，工厂不再做签名探测兜底，`create_connector` 一律 `return connector_cls(config, role, kv_cache_config)`；类查找也收敛为公开的 `get_connector_class`。`KVConnectorBase_V1.__init__` 同步把 `kv_cache_config` 改为必填、删掉"未传则告警弃用"那段。这反而强化了本节主旨——"按 role 各造一份"现在三个参数（`config, role, kv_cache_config`）齐备，进程隔离的契约更硬。

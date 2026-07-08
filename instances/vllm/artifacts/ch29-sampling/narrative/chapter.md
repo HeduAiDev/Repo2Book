@@ -519,7 +519,7 @@ def __init__(self, logprobs_mode: LogprobsMode = "raw_logprobs") -> None:
 这段分发还藏着两条值得注意的设计：
 
 - **多级回退保证启动不崩**。flashinfer 默认开但硬件跑不动时，**静默回退** native（而不是崩溃）；只有用户**显式**设了 `VLLM_USE_FLASHINFER_SAMPLER` 还跑不动，才抛错——因为这是用户明确的意图，不该悄悄改。CPU 上 RISCV/POWERPC 这种小众架构也单独回退 native。
-- **logprobs_mode 是一道硬约束**。开头那个判断把 `processed_logits`/`processed_logprobs` 模式直接挡在 flashinfer 之外——flashinfer 用拒绝采样，根本不产出截断后的中间 logits，没法满足"返回处理后的 logprobs"这个要求，只能走 native。
+- **logprobs_mode 是一道硬约束**。开头那个判断把 `processed_logits`/`processed_logprobs` 模式直接挡在 flashinfer 之外——flashinfer 用拒绝采样（反复从一个易采样的提议分布中抽样、按接受准则筛选，直到抽中落在目标截断分布内的样本，因此不必显式排序或归一化整个词表；完整的接受准则推导见[第 31 章](../../ch31-spec-decode/narrative/chapter.md)验证草稿 token 时的展开），根本不产出截断后的中间 logits，没法满足"返回处理后的 logprobs"这个要求，只能走 native。
 
 > **v0.21.0 更新**：派发链在 CUDA/CPU/ROCm 之外新增了一条 Intel GPU 分支——`elif current_platform.is_xpu():`（`vllm/v1/sample/ops/topk_topp_sampler.py`）。它受环境开关 `VLLM_XPU_USE_SAMPLER_KERNEL` 控制：开启时把 `self.forward` 绑成新的 `forward_xpu`，否则照旧回退 `forward_native`。`forward_xpu` 经 `torch.ops.vllm.xpu_topk_topp_sampler` 调用 XPU 原生 top-k/top-p kernel，并从 `torch.xpu.default_generators` 取 `(seed, offset)` 传入以复现随机性；与 `forward_cuda` 同理，它也不支持逐请求 generator（有则告警回退 native），且因 batch 侧 `top_k` 存为 int32 而 kernel 要 int64，调用前会先 `k.to(torch.int64)`。这条分支沿用了 native 这把"启动不崩"的兜底——XPU kernel 默认不开，且任何不满足的前置条件都退回 native。
 
@@ -653,7 +653,7 @@ def random_sample(probs, generators):
     return probs.div_(q).argmax(dim=-1).view(-1)
 ```
 
-这里没用 `torch.multinomial`，而是用了 Gumbel-max（指数变体）技巧。原理：给每个 token 配一个独立的 `q ~ Exp(1)`，算 `probs / q` 取 argmax，结果在分布上等价于"按 probs 采样"——这是 Gumbel-max 的一个等价形式。为什么不直接 `multinomial`？因为 `multinomial` 会触发 CPU-GPU 同步，打断流水线；而 `q.exponential_()` + `div_` + `argmax` 全在 GPU 上跑，零同步开销。
+这里没用 `torch.multinomial`，而是用了 Gumbel-max（指数变体）技巧。原理：给每个 token 配一个独立的 `q ~ Exp(1)`，算 `probs / q` 取 argmax，结果在分布上等价于"按 probs 采样"——这是 Gumbel-max 的一个等价形式。直觉上，指数分布"谁先衰减到触发阈值"的胜出概率正比于其权重，等价于按权重做了一次带权抽签；完整的 CDF 推导见[第 31 章](../../ch31-spec-decode/narrative/chapter.md)投机解码验证草稿 token 时的展开。为什么不直接 `multinomial`？因为 `multinomial` 会触发 CPU-GPU 同步，打断流水线；而 `q.exponential_()` + `div_` + `argmax` 全在 GPU 上跑，零同步开销。
 
 那个 `if len(generators) != probs.shape[0]` 的小手法也精巧：常见情况是大多数请求没设种子，于是先 `q.exponential_()` 把整批一次性填满随机数（最快的批量路径），再用 `for` 循环只覆写那几个设了种子的请求的行。无种子走批量、有种子单独覆写，两不耽误。
 

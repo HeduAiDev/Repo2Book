@@ -26,3 +26,4 @@
 | exp-0705-18 | 2026-07-05 | book-retro/book-gap-audit 的 args 若被注入为 JSON 字符串,args.instance 判断为假,静默回退到脚本内 CFG 默认值 | .claude/workflows/book-retro.js,.claude/workflows/book-gap-audit.js(内联 JSON.parse 护栏+log 告警);.claude/workflows/lib/resolve-cfg.js(纯函数单测参照,node --test) | CFG 静默回退导致报告文不对题的事故次数 | active |
 | exp-0705-19 | 2026-07-06 | 全书 228 跨章链接相对路径差一层(../ 应 ../../),写手契约示例即错源且无 lint | scripts/lint_anchors.py 三规+writer 契约+引擎迁移一并修正 | anchors 三规 BLOCKING 数 | active |
 | exp-0705-20 | 2026-07-06 | agent 做机械批量重映射易套错映射表(节号修复者 23 章错位)——机械迁移应确定性脚本+机器裁判,不交推理 | RUNBOOK 补章 SOP(引擎+validate 为准) | 迁移后节号错位数 | active |
+| exp-0708-1 | 2026-07-08 | agent 转写长 JSON 落盘必碎转义(三份审计报告全损,journal 救回) | book-gap-audit/book-retro 去 write-report agent,RUNBOOK 处方 Lead python 落盘 | 报告 JSON 可解析率 | active |

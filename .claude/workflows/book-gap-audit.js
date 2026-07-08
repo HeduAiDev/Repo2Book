@@ -62,10 +62,7 @@ const flat = all.flatMap(function (c) { return c.issues.map(function (i) { retur
 const cliffs = flat.filter(function (i) { return i.severity === 'cliff' })
 const report = { date: A.date, instance: INST, chapters_audited: slugs.length,
   totals: { cliffs: cliffs.length, bumps: flat.length - cliffs.length }, issues: flat }
-await agent(
-  '把下面 JSON **原样** Write 到 ' + OUT + '（目录不存在则先建）。不要改写内容。写完返回 "written"。\n' + JSON.stringify(report),
-  { label: 'write-report', phase: 'Merge', model: 'haiku', agentType: 'general-purpose' }
-)
+log('报告不经 agent 转写落盘（曾系统性打碎 JSON 转义）——以 workflow 返回值与 journal 为准，Lead 用 python 落盘到 ' + OUT + '。')
 log('gap 审计完成：cliff ' + cliffs.length + ' / bump ' + (flat.length - cliffs.length) + ' → ' + OUT)
 return { report: OUT, totals: report.totals,
   top_cliffs: cliffs.slice(0, 12).map(function (i) { return i.chapter + ': ' + i.concept }) }

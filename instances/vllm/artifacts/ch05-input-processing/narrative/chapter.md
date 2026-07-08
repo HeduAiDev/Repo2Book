@@ -125,6 +125,8 @@ def _validate_params(self, params, supported_tasks):
 
 ### 5.2.2 `_validate_lora`：没开 LoRA 就别传 LoRA
 
+（LoRA，Low-Rank Adaptation：给基座模型外挂的一小撮低秩权重增量，训练时只调这一小撮参数，同一份基座就能插拔出多个微调变体，推理时按请求指定加载哪个变体——下文的 `lora_request` 就是「这次请求要用哪个 LoRA 变体」的句柄。）
+
 ```python
 # vllm/v1/engine/input_processor.py:L138-L155
 def _validate_lora(self, lora_request):
@@ -150,7 +152,7 @@ def _validate_lora(self, lora_request):
 
 [§5.1](#51-一句话钩子tokenize-已经不在这里了) 已经把这个分流讲透了——主路径透传 `EngineInput`，兜底路径走 `InputPreprocessor.preprocess()`。这里补一句兜底路径里发生了什么。
 
-`InputPreprocessor.preprocess()` 是老路径的预处理总入口：它先按是否 encoder-decoder 架构分流，decoder-only 的文本会走到 `_process_text()`，在那里调 `_tokenize_prompt()` 真正切词，再包成统一的 `TokensInput`。多模态、纯嵌入也各有委托。它的产物和主路径透传的 `EngineInput` 是**同一种 TypedDict 家族**（`vllm/inputs/engine.py` 里以 `type` 字面量判别的三种变体：`TokensInput`、`EmbedsInput`、`MultiModalInput`，统一别名为 `DecoderOnlyEngineInput`）——这正是设计的巧妙处：不管走哪条路，出来的 `processed_inputs` 形状一致，后面的代码只靠 `type` 字段区分内容，不用区分来源。
+`InputPreprocessor.preprocess()` 是老路径的预处理总入口：它先按是否 encoder-decoder 架构分流，decoder-only 的文本会走到 `_process_text()`，在那里调 `_tokenize_prompt()` 真正切词，再包成统一的 `TokensInput`。多模态、纯嵌入也各有委托。它的产物和主路径透传的 `EngineInput` 是**同一种 TypedDict 家族**（TypedDict：一种带静态字段约束的字典——用法和普通 dict 一样，但类型检查器知道每个 key 该是什么类型；`vllm/inputs/engine.py` 里以 `type` 字面量判别的三种变体：`TokensInput`、`EmbedsInput`、`MultiModalInput`，统一别名为 `DecoderOnlyEngineInput`）——这正是设计的巧妙处：不管走哪条路，出来的 `processed_inputs` 形状一致，后面的代码只靠 `type` 字段区分内容，不用区分来源。
 
 两条路汇合后，立刻是一道平台级校验和一次结构拆分：
 
@@ -525,7 +527,7 @@ def assign_request_id(request: EngineCoreRequest):
 
 > *图注：上半，`"req-abc"` 先拷进 `external_req_id`，再被改写成 `"req-abc-3f9a2b1c"`。下半是 n>1 的 fan-out（下一节展开）：父请求 `n=4` 裂成 4 个 `n=1` 子请求，子 id 加 `idx` 前缀；设了 seed 时子 i 取 `seed+i`（42/43/44/45），前三个走 `copy(request)`、最后一个复用父对象；底部说明子参数派生（seed=None 共享缓存 / seed 已设连号 / FINAL_ONLY 攒齐聚合）。*
 
-**为什么 8 个字符够？** `random_uuid()` 取 uuid4 的 hex（128 bit 随机），`:.8` 截前 8 个十六进制字符，即 32 bit 随机。注意目标不是「全局密码学唯一」——只是「在单实例内消歧外部重复的 id」。即便两个请求恰好都叫 `"req-abc"`，它们再撞上同一个 8 字符后缀的概率，按生日界约为 $n^2 / 2^{33}$，小到可以忽略。这是个务实的工程取舍：不追求绝对唯一，只追求「实际上不会撞」。
+**为什么 8 个字符够？** `random_uuid()` 取 uuid4 的 hex（128 bit 随机），`:.8` 截前 8 个十六进制字符，即 32 bit 随机。注意目标不是「全局密码学唯一」——只是「在单实例内消歧外部重复的 id」。即便两个请求恰好都叫 `"req-abc"`，它们再撞上同一个 8 字符后缀的概率，按生日界（生日悖论的近似结论：n 个物件随机落入 s 个桶，任两个碰撞的概率约为 n²/2s，这里桶数 s 是 32 bit 空间 2³²）约为 $n^2 / 2^{33}$，小到可以忽略。这是个务实的工程取舍：不追求绝对唯一，只追求「实际上不会撞」。
 
 开头那个 `if request.external_req_id is not None: raise` 是道防呆——`external_req_id` 是内部字段，调用方本不该设它；设了说明用法错了，早报早好。
 

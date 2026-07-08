@@ -610,7 +610,7 @@ def forward(
     return output
 ```
 
-五行：列并行出 fused qkv → split 成 q/k/v → 旋转位置编码 → `self.attn(q, k, v)` → 行并行 + all_reduce。整个注意力的**复杂度**——选哪个后端（FlashAttention？Triton？）、KV cache 怎么读写、要不要量化——全被那一行 `self.attn(q, k, v)` 吞掉了。
+五行：列并行出 fused qkv → split 成 q/k/v → 旋转位置编码（RoPE：按 token 的绝对位置对 q/k 做一次确定性旋转，使两者点积只依赖相对位置差；细节见[第 27 章「解耦 RoPE」](../../ch27-model-architecture/narrative/chapter.md)）→ `self.attn(q, k, v)` → 行并行 + all_reduce。整个注意力的**复杂度**——选哪个后端（FlashAttention？Triton？）、KV cache 怎么读写、要不要量化——全被那一行 `self.attn(q, k, v)` 吞掉了。
 
 `self.attn` 是 `Attention` 实例。看它的类 docstring（`vllm/model_executor/layers/attention/attention.py:L177`），职责写得明明白白：
 
@@ -685,7 +685,7 @@ out2, residual2 = layer(positions, out, residual)   # 显式传递
 assert out2.shape == (seq, cfg.hidden_size)
 ```
 
-整个 `LlamaModel.forward` 就是把这套重复 N 遍（`vllm/model_executor/models/llama.py:L395`）：embedding → 逐层 decoder（`positions, hidden, residual` 三件套穿针）→ 末尾 RMSNorm。MLP 那边 `gate_up_proj`（列并行）→ `SiluAndMul` 门控 → `down_proj`（行并行 + all_reduce），结构和 attention 子块同构，又是一对列并行接行并行。
+整个 `LlamaModel.forward` 就是把这套重复 N 遍（`vllm/model_executor/models/llama.py:L395`）：embedding → 逐层 decoder（`positions, hidden, residual` 三件套穿针）→ 末尾 RMSNorm。MLP 那边 `gate_up_proj`（列并行）→ `SiluAndMul` 门控（SiLU 激活门控：gate 分支过 SiLU 后与 up 分支逐元素相乘，即 SwiGLU 的实现）→ `down_proj`（行并行 + all_reduce），结构和 attention 子块同构，又是一对列并行接行并行。
 
 ---
 

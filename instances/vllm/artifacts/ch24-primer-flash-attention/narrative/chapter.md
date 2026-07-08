@@ -375,7 +375,7 @@ out = p_out * p_scale + s_out * s_scale    # 加权合并
 
 逐行对照：`max_lse` 就是稳定化基准 $M$;两个 `tl.exp(lse - max_lse)` 保证底数 $\le 1$、绝不上溢(和 safe-softmax 减 max 同一个道理);`out_lse = tl.log(out_se) + max_lse` 就是那张合并后的新收据；`p_scale`、`s_scale` 就是权重 $w_a$、$w_b$;最后一行加权合并 $O$。源码里那句注释"先算 scale 再乘 output,别直接乘 `tl.exp(p_lse)`"说的正是数值稳定——直接乘会溢出。
 
-**这就是 §二 的 ⊕ 算子第三次现身**:第一次是 online-softmax 的单遍递推，第二次是 FlashAttention 分块更新 $(m,\ell,O)$,这一次是 `merge_attn_states` 合并两段注意力。三副面孔，同一套代数——只不过这里状态记成 $\mathrm{lse}=\log d$,max 和加权都搬到了对数域。它是 cascade attention 与 split-KV 的共同地基。
+**这就是 §二 的 ⊕ 算子第三次现身**:第一次是 online-softmax 的单遍递推，第二次是 FlashAttention 分块更新 $(m,\ell,O)$,这一次是 `merge_attn_states` 合并两段注意力。三副面孔，同一套代数——只不过这里状态记成 $\mathrm{lse}=\log d$,max 和加权都搬到了对数域。它是 cascade attention 与 split-KV 的共同地基——split-KV 是 decode 阶段的另一种切法：不按语义分段（cascade 那样分前缀/后缀），而是单纯按 KV 长度把长序列切给多个 thread block 并行算（应付 decode 阶段 batch×heads 太小、SM 吃不满的场景），各 block 各出一份 $(O,\mathrm{lse})$，同样用这里的 `merge_attn_states` 合并——⊕ 算子的第四张面孔，本章不展开其调度细节。
 
 ---
 

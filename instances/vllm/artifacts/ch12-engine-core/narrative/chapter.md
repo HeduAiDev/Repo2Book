@@ -552,7 +552,7 @@ return engine_core_outputs, model_executed
 
 有一处极易看漏：**deferred 重入队用的 `exec_future` 是上半段那个变量**——deferred 批的 `execute_model` 在上半段早跑过了（前向不依赖掩码，掩码只在采样那步才用），当时只是缺 token 没法采样。所以这里**不重跑 `execute_model`**，只补一次 `sample_tokens`，复用同一个 `exec_future`。前向只算一遍，掩码与采样补一遍——账算得很干净。
 
-那句 `NOTE(nick)` 也值得读：deferred 任务可以「当场处理」（现在这样），也可以「存进字段、下次进方法时再做」。当前选当场，源码说这「略偏向 TTFT 而非 TPOT/吞吐」——结构化输出 + 异步调度叠加时的一个微观调度取舍，知道有这权衡即可。
+那句 `NOTE(nick)` 也值得读：deferred 任务可以「当场处理」（现在这样），也可以「存进字段、下次进方法时再做」。当前选当场，源码说这「略偏向 TTFT 而非 TPOT/吞吐」（TTFT：首 token 延迟，Time-To-First-Token；TPOT：每 token 生成间隔，Time-Per-Output-Token）——结构化输出 + 异步调度叠加时的一个微观调度取舍，知道有这权衡即可。
 
 精简版把这条支线完整跑通了。`test_deferred_sampling_postpones_then_recovers` 验证「上半段暂存不入队、下半段 `update_from_output` 后补采样重入队」；`test_deferred_with_spec_decode_takes_draft_tokens` 验证投机解码下 `take_draft_token_ids` + `update_draft_token_ids_in_output` 在补掩码之前被正确调用：
 

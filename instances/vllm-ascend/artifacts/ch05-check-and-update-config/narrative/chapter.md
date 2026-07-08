@@ -423,6 +423,8 @@ class AscendConfig:
         self.eplb_config = EplbConfig(eplb_config)
 ```
 
+这里点名的 `eplb_config` 对应专家负载均衡（EPLB，把 MoE 各专家的负载摊匀到各卡的机制）的配置项，机制细节留到[第 9 章](../../ch09-primer-eplb/narrative/chapter.md)展开——本节只关心它作为示例，怎么被同一套「开放 dict → 强类型对象」范式收编。
+
 范式一目了然，每个子配置都是同一个套路：
 
 1. `additional_config.get("某键", {})`——从开放 dict 里取出对应的子 dict，**取不到就给空 dict**（所以用户完全不写这些键也安全）。
@@ -695,7 +697,7 @@ mode 被改成 `NONE`、splitting_ops 被置空——平台对编译配置的改
 
 这就是「平台 = 配置改写器」最锋利的兑现：**改一个 config 字符串字段，就顶替了 vLLM 的执行主控**。Worker 是真正在每个设备进程里跑模型前向的那个对象，而昇腾没动 vLLM 一行 Worker 调度代码，只是把 `worker_cls` 从 `"auto"` 改写成自己的类名。用 qualname 字符串而非类对象还有个好处——Worker 进程是 spawn 出来的，跨进程只要传个字符串，到那边再 resolve，省了序列化类对象的麻烦。
 
-开头那行 `pass_config.enable_sp` 里的 sp 指 sequence parallel——序列并行，和 tensor parallel、pipeline parallel 并列的又一种切分维度；这里顺手在它没开时把 all2all 通信后端切到昇腾的实现，是借这条 `if` 捎带的一笔。
+开头那行 `pass_config.enable_sp` 里的 sp 指 sequence parallel——序列并行，和 tensor parallel、pipeline parallel 并列的又一种切分维度；这里顺手在它没开时把 all2all（多卡间互相交换分片数据的集合通信原语，各卡发的行数可以不等，故也叫「不等长全交换」——MoE 里各专家收到的 token 数天然不均，靠它做 dispatch/combine）通信后端切到昇腾的实现，是借这条 `if` 捎带的一笔。
 
 还有个守卫值得点：整个改写包在 `if parallel_config.worker_cls == "auto"` 里。也就是说——只有字段还是哨兵 `"auto"` 时平台才改它；如果用户**显式**指定了某个 worker，这段 `if` 整个跳过，**不覆盖用户的选择**。又是一次「自动改写让位于用户显式意图」，和 [5.3](#53-_fix_incompatible_config系统性的-cascade-reset) 里 `numa_bind` 那个 `setdefault` 同一个分寸。
 

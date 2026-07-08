@@ -185,7 +185,7 @@ P1 照搬：数 `self.X =`。这里三条——`self.model`、`self.lm_head`、`
         self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
 ```
 
-这里出现了 P1 的一个**关键技巧**。`embed_tokens` 和 `norm` 是普通框，照常画。但中间这条不是 `self.layers = SomeModule(...)`，而是 `make_layers(num_hidden_layers, lambda: DeepseekV4DecoderLayer(...))`。
+这里出现了 P1 的一个**关键技巧**。`embed_tokens` 和 `norm` 是普通框，照常画（`VocabParallelEmbedding` 和后面要看到的 `ColumnParallelLinear` 同属并行类名判据——它按 vocab 维切分嵌入表到各 TP rank，通信模式见[第 20 章](../../ch20-distributed-parallelism/narrative/chapter.md)）。但中间这条不是 `self.layers = SomeModule(...)`，而是 `make_layers(num_hidden_layers, lambda: DeepseekV4DecoderLayer(...))`。
 
 `make_layers`（定义在 `vllm/model_executor/models/utils.py`）是 vLLM 里「堆叠 N 个同构层」的标准信号。看到 `make_layers` 或 `nn.ModuleList`，就知道这里不是一个框，而是 **N 个同构框的堆叠**。
 

@@ -201,7 +201,7 @@ def _torch_cuda_wrapper():
 
 `graph_capture` 和 `CUDAGraphWrapper` 也是全局名字，按理照搬上一节的办法 `setattr` 换掉就行。但这里有个**致命的细节**：换进哪个模块的命名空间？
 
-直觉会说「换我自己模块的呗」。错。来看父方法是怎么解析这两个名字的。父方法 `profile_cudagraph_memory` 定义在 `vllm/v1/worker/gpu_model_runner.py` 里，它体内写的 `graph_capture(device=...)` 是个**自由变量**——Python 按 LEGB 规则解析自由变量时，全局层（G）查的是「**这个函数定义所在模块的 `__globals__`**」，也就是 `vllm.v1.worker.gpu_model_runner` 这个模块的字典。
+直觉会说「换我自己模块的呗」。错。来看父方法是怎么解析这两个名字的。父方法 `profile_cudagraph_memory` 定义在 `vllm/v1/worker/gpu_model_runner.py` 里，它体内写的 `graph_capture(device=...)` 是个**自由变量**——Python 按 LEGB 规则（Local→Enclosing→Global→Built-in，变量名解析的四层查找顺序）解析自由变量时，全局层（G）查的是「**这个函数定义所在模块的 `__globals__`**」，也就是 `vllm.v1.worker.gpu_model_runner` 这个模块的字典。
 
 换句话说：**父方法眼里的 `graph_capture`，永远到父类那个模块里去找，不会到昇腾的模块里找。** 昇腾若把替换 `setattr` 到自己的 `model_runner_v1.py`，父方法**根本看不见**。要让父方法用上 NPU 版，必须把符号打到**父类所在的那个模块**。
 
@@ -411,7 +411,7 @@ def _use_aclgraph(self) -> bool:
 
 三个条件**全满足**才启用 ACLGraph：图模式不是 `NONE`、编译模式是 `VLLM_COMPILE`、没有强制 eager。它算出的 `self.use_aclgraph` 是下游一系列图相关行为的总开关——`CUDAGraph → ACLGraph` 这套对位，到这里就和前面的符号替换接上了头。
 
-至于另两处替换——`self.sampler = AscendSampler()` 把采样器换成昇腾版，`self.attn_state` 换成 `AscendAttentionState`——本章只点名「这里换了实体」这一事实。`AscendSampler` 内部的采样逻辑留给采样器那一章；`AscendAttentionState` 背后的注意力后端实体（`AscendAttentionBackend` / MLA），是第五部分的主角，那里会从头讲昇腾的注意力怎么落地。
+至于另两处替换——`self.sampler = AscendSampler()` 把采样器换成昇腾版，`self.attn_state` 换成 `AscendAttentionState`——本章只点名「这里换了实体」这一事实。`AscendSampler` 内部的采样逻辑留给[第 33 章](../../ch33-sampling-npu-adaptation/narrative/chapter.md)；`AscendAttentionState` 背后的注意力后端实体（`AscendAttentionBackend` / MLA），是第五部分的主角，那里会从头讲昇腾的注意力怎么落地。
 
 ## 小结：接缝在哪，路就怎么走
 

@@ -128,7 +128,7 @@ use_compress = getattr(attn_selector_config, "use_compress", False)
 
 至于被省略的两条旁支，本章只点名、不展开：
 
-- **FA3 旁支**：当 vLLM 显式选中 `FLASH_ATTN` 且满足训推一致场景（`_validate_fa3_backend` 通过）时，走 `AscendFABackend`。这是个特定场景的优化后端。
+- **FA3 旁支**：当 vLLM 显式选中 `FLASH_ATTN` 且满足训推一致场景（训练阶段与推理阶段共用同一套注意力 kernel、数值路径保持一致以避免精度漂移，`_validate_fa3_backend` 通过）时，走 `AscendFABackend`。这是个特定场景的优化后端。
 - **310P 旁支**：[第 18 章](../../ch18-310p-inference-chip-specialization/narrative/chapter.md) 那块推理卡有自己的 `backend_map_310`，`is_310p()` 为真时改查那张表。
 
 两条都是主路由之外的特例，跟「四后端 + 契约」的主线正交。
@@ -209,7 +209,7 @@ def register_backend(
         return "CUSTOM" if not envs_vllm.VLLM_USE_V2_MODEL_RUNNER else "FLASH_ATTN"
 ```
 
-读一遍这个返回值：在 V2 model-runner 下，`AscendAttentionBackend.get_name()` 返回的不是 `"ASCEND"`、也不是 `"CUSTOM"`，而是 **`"FLASH_ATTN"`**——一个 CUDA FlashAttention 后端的名字。一个跑在昇腾 NPU 上、压根不是 FlashAttention 的后端，对外**自报家门说自己是 FlashAttention**。
+读一遍这个返回值：在 **V2 model-runner**（vLLM 里负责加载模型、初始化 KV cache 的那条执行路径的新版本；这套 V1/V2 runner 的区别到 [第 24 章](../../ch24-sparse-attention-sfa-dsa/narrative/chapter.md) 还会再遇到，此处只需知道它是个二值开关）下，`AscendAttentionBackend.get_name()` 返回的不是 `"ASCEND"`、也不是 `"CUSTOM"`，而是 **`"FLASH_ATTN"`**——一个 CUDA FlashAttention 后端的名字。一个跑在昇腾 NPU 上、压根不是 FlashAttention 的后端，对外**自报家门说自己是 FlashAttention**。
 
 它冒充的对象，是 vLLM 自带的这位：
 

@@ -301,7 +301,7 @@ $$
         self.running = d_lst + p_lst
 ```
 
-把 `self.running` 重排成「decode 全在前、prefill 全在后，各自保序」。下游的 RUNNING 循环按这个顺序逐个分预算，于是 decode 永远先吃饱、prefill 捡剩下的——严格的 decode-first chunked prefill。为什么值得这样偏袒 decode？因为 decode 阶段对延迟最敏感——每步只产 1 个 token、是用户逐字看到的输出，慢一拍就直接体感卡顿；所以优先保住 decode 的算力，让对单步延迟不敏感的 prefill 捡剩下的。
+把 `self.running` 重排成「decode 全在前、prefill 全在后，各自保序」。下游的 RUNNING 循环按这个顺序逐个分预算，于是 decode 永远先吃饱、prefill 捡剩下的——严格的 decode-first chunked prefill（chunked prefill：把一次长 prompt 的预填充拆成多步、跟同批 decode 交替推进，[第 22 章](../../ch22-mla-on-npu/narrative/chapter.md)讲过它在注意力内核里的落地）。为什么值得这样偏袒 decode？因为 decode 阶段对延迟最敏感——每步只产 1 个 token、是用户逐字看到的输出，慢一拍就直接体感卡顿；所以优先保住 decode 的算力，让对单步延迟不敏感的 prefill 捡剩下的。
 
 ### 为什么改两处，却要重抄四百行
 

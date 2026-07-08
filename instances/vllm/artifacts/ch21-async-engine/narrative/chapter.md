@@ -499,7 +499,7 @@ $$
 
 循环从 `eng_start_index` 起轮询（而非永远从 0 开始）也是为打散——`eng_start_index` 在客户端初始化时按 `(num_engines * client_index) // client_count` 计算，将 client 们均匀地错开在引擎列表里，此后不再变动；多个前端实例的起点各不相同，空集群也能均匀铺开。源码里那句注释标了 `TODO use P2C alg`——更大 DP 规模下，会换成 power-of-two-choices（随机选两个比一下）的均衡算法，这是留给未来的优化。
 
-显式指定 `data_parallel_rank` 的请求会跳过整个评分（第一个 walrus 分支直接定 `eng_index`），路由固定。`get_late_interaction_engine_index` 是第二个短路：它专为 ColBERT 式 late-interaction 重排（pooling_params 里带着 query/passage 标记）选定固定引擎，不涉及负载，返回 `None` 就退回到评分循环。`reqs_in_flight` 记下每个请求去了哪个引擎，是为了将来 abort 时能定向找到对的引擎。
+显式指定 `data_parallel_rank` 的请求会跳过整个评分（第一个 walrus 分支直接定 `eng_index`），路由固定。`get_late_interaction_engine_index` 是第二个短路：它专为 ColBERT 式 late-interaction 重排（一种检索重排范式——query 和 passage 的 token 级向量各自独立编码，之后再逐 token 比对相似度，因此同一个 query 的所有请求必须落在同一个引擎上才能拿到一致的比对语境；pooling_params 里带着 query/passage 标记）选定固定引擎，不涉及负载，返回 `None` 就退回到评分循环。`reqs_in_flight` 记下每个请求去了哪个引擎，是为了将来 abort 时能定向找到对的引擎。
 
 ### 协调进程的 wave 状态机
 

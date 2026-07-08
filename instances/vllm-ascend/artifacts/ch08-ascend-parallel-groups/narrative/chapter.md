@@ -92,6 +92,8 @@ _DYNAMIC_EPLB: GroupCoordinator | None = None
 
 第 3 行就是关键：`GroupCoordinator`、`init_model_parallel_group`、`get_tp_group`、`get_world_group` 全都从基座 `vllm.distributed.parallel_state` 直接 import 进来。昇腾不重写一套进程组管理，它借基座的。
 
+第 5 行同时导入的 `enable_dsa_cp_with_layer_shard` 和 `flashcomm2_enable`，本章只用到后者——前者服务的是稀疏注意力（DSA）的上下文并行分片，属于[第 24 章](../../ch24-sparse-attention-sfa-dsa/narrative/chapter.md)的机制，这里只是同一个 `utils` 模块顺带导入，不影响本章排布代数。
+
 下面那一长串 `_MC2 / _MLP_TP / _OTP / _LMTP / _EMBED_TP / ...` 全是模块级全局，初值都是 `None`。每一个**将来都会指向一个 `GroupCoordinator` 实例**——和基座的 `_TP` / `_PCP` 同一个类型。换句话说，昇腾的每个并行组，都只是基座 `GroupCoordinator` 多 new 出来的一个实例。
 
 这就是整章的底色：昇腾负责「算出每个组该有哪些 rank」，建组和通信全交给基座。它做的是加法，不是替换。
@@ -139,7 +141,7 @@ $$
 \mathrm{ExternalDP} \times \mathrm{dp} \times \mathrm{pp} \times \mathrm{pcp} \times \mathrm{tp}
 $$
 
-这五个维度从外到内分别是：外层数据并行（verl 集成里每个 dp rank 可独立 generate，最外一维用 `-1` 自动算）、数据并行、流水线并行、prefill 上下文并行、张量并行。
+这五个维度从外到内分别是：外层数据并行（verl——一个把 vLLM 当推理后端的强化学习训练框架——集成里每个 dp rank 可独立 generate，最外一维用 `-1` 自动算）、数据并行、流水线并行、prefill 上下文并行、张量并行。
 
 两个细节值得记住。第一，**这张网格显式保留了 `pcp` 维**——即便开了上下文并行，昇腾的组也能在正确的坐标系里切分。第二，也是最关键的：这张 5D 网格的维度顺序，与基座 `vllm/distributed/parallel_state.py` 里 `initialize_model_parallel` 用的那张**逐维一致**。坐标系对齐，是「叠加」能成立的数学前提——昇腾组只是在同一张网格上沿不同维度切子集，rank 编号自然自洽。
 
@@ -237,7 +239,7 @@ MC2 group_ranks = [[0, 1, 2, 3, 4, 5, 6, 7]]
 
 样例 A 的 `pp=1` 让 `transpose(1,2)` 退化成恒等，看不出它在忙什么。但 `pp>1` 时它不可或缺：若不做 transpose 而直接 `reshape(-1, dp·pcp·tp)`，相邻的 `dp·pcp·tp` 块会跨过 pp 维边界，把**不同 pp stage** 的 rank 混进同一个专家域——而专家通信只该发生在单一 stage 内。`transpose(1,2)` 把 pp 提到最前，正是为了保证切出来的每个组只落在一个 pp stage 里。
 
-注意紧跟其后的两个 `if`。`_DYNAMIC_EPLB` 和 `_FC3_QUANT_X` **复用同一份 `group_ranks`**——因为动态专家负载均衡、flashcomm3 量化 all-gather，都在同一个专家域里通信，拓扑和 MC2 一模一样。复用排布、只是各 new 一个独立的 `GroupCoordinator`，省掉重算。其中 `_DYNAMIC_EPLB` 就是[第 10 章专家热迁移](../../ch10-eplb-expert-load-balancing/narrative/chapter.md)要用的组——这里先把它建好，机制留到那章展开。
+注意紧跟其后的两个 `if`。`_DYNAMIC_EPLB` 和 `_FC3_QUANT_X` **复用同一份 `group_ranks`**——因为动态专家负载均衡、flashcomm3（flashcomm 系列里更进一步的量化 all-gather 变体，本书不展开其内部机制）量化 all-gather，都在同一个专家域里通信，拓扑和 MC2 一模一样。复用排布、只是各 new 一个独立的 `GroupCoordinator`，省掉重算。其中 `_DYNAMIC_EPLB` 就是[第 10 章专家热迁移](../../ch10-eplb-expert-load-balancing/narrative/chapter.md)要用的组——这里先把它建好，机制留到那章展开。
 
 还有一点要点破：`_MC2` 同时是 `model_parallel_initialized()` 的哨兵。这个函数的实现就一行——`return _MC2 is not None`（[后面 §取用、哨兵与销毁](#取用哨兵与销毁)会看到完整定义），所以 `_MC2` 是「已初始化」状态的**唯一**哨兵。这意味着 MC2 必须**无条件、最先**建——它一建好，整个 `init_ascend_model_parallel` 就被视为「已初始化」；若不最先建，重复调用时哨兵会失真。
 

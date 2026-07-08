@@ -57,7 +57,7 @@ def get_attn_backend_cls(cls, selected_backend, attn_selector_config, num_heads:
 
 前两行是「顶替」：同一个抽象位置，vLLM 有、昇腾换一套实现。后两行不一样——`use_sparse` 或 `use_compress` 拨到 `True` 时选出的 SFA / DSA，**在 vLLM 主干里没有任何对位的后端**。它们不是替换谁，是凭空多出来的两条算法路线。
 
-所以本章不做「基座算子级对照」——没有基座可对。这正是 OOT 插件「加法式扩展」最干净的一个样本：vLLM 通过 entry-point 暴露后端注册点，插件就能往里塞一个主干设计时压根没设想过的注意力算法。
+所以本章不做「基座算子级对照」——没有基座可对。这正是 OOT 插件「加法式扩展」最干净的一个样本：vLLM 通过 entry-point（[第 2 章](../../ch02-entry-points-and-npuplatform/narrative/chapter.md)讲过的安装期注册机制）暴露后端注册点，插件就能往里塞一个主干设计时压根没设想过的注意力算法。
 
 > 顺带交代一个 ch19 埋下的细节。SFA 和 DSA 的后端 `get_name()` 都故意撒了个谎：
 

@@ -420,7 +420,7 @@ def enable_custom_op():
     return _CUSTOM_OP_ENABLED
 ```
 
-它的判定标准很硬核：**能不能 `import vllm_ascend.vllm_ascend_C`。** 这个 `vllm_ascend_C` 是昇腾 AscendC 算子源码**编译出来的 C 扩展**（`.so`）——融合 kernel 都在里面。import 成功，说明编译产物在位，置 `_CUSTOM_OP_ENABLED = True`，第二层走融合分支；import 失败（没编译、环境没配好），或撞上 batch-invariant、A5 芯片这些特例，置 `False`，走 torch_npu 原子算子回退。
+它的判定标准很硬核：**能不能 `import vllm_ascend.vllm_ascend_C`。** 这个 `vllm_ascend_C` 是昇腾 AscendC 算子源码**编译出来的 C 扩展**（`.so`）——融合 kernel 都在里面。import 成功，说明编译产物在位，置 `_CUSTOM_OP_ENABLED = True`，第二层走融合分支；import 失败（没编译、环境没配好），或撞上 batch-invariant（批不变——要求同一行输入不论 batch 怎么拼/切，输出都须逐位一致，这类融合 kernel 对分块方式有额外约束，第 30 章展开）、A5 芯片这些特例，置 `False`，走 torch_npu 原子算子回退。
 
 这里有两个设计点值得记住。
 
@@ -497,6 +497,6 @@ assert len(co.op_registry_oot) == n_first  # 幂等：表不变
 
 - 那颗融合 kernel 怎么从 AscendC 源码进到 `torch.ops._C_ascend` 命名空间、`meta` 实现又是做什么的——第 28 章「torch.library 算子注册」拆。
 - `enable_custom_op()` 背后的编译产物和 ACLGraph 图捕获怎么咬合——第 29 章讲。
-- `FusedMoE` 这个表里最重的一项，`forward_oot` 复杂到要单开一章——第 30 章专门拆。
+- `FusedMoE` 这个表里最重的一项，`forward_oot` 复杂到要单开一章，连带刚才点了名却没展开的 batch-invariant——第 30 章专门拆。
 
 这一章把骨架立好，后面都是往骨架上长肉。

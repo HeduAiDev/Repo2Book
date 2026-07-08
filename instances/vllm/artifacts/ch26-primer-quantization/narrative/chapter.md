@@ -203,7 +203,7 @@ w_q = \arg\min_{w_q}\frac{\big(\mathrm{quant}(w_q)-w_q\big)^2}{[H_F^{-1}]_{qq}},
 \delta_F = -\,\frac{w_q-\mathrm{quant}(w_q)}{[H_F^{-1}]_{qq}}\,\big(H_F^{-1}\big)_{:,q}
 $$
 
-$\delta_F$ 是对**所有未量化权重**的一次更新，把刚产生的量化误差投影到未量化子空间去抵消输出扰动。OBQ 逐权重贪心太慢，175B 模型跑不动。GPTQ 的三步优化——固定全行同序 + lazy batch（惰性批更新，$B=128$）+ Cholesky 稳定化——把复杂度大幅压下来（GPTQ §4）：
+$\delta_F$ 是对**所有未量化权重**的一次更新，把刚产生的量化误差投影到未量化子空间去抵消输出扰动。OBQ 逐权重贪心太慢，175B 模型跑不动。GPTQ 的三步优化——固定全行同序 + lazy batch（惰性批更新，$B=128$）+ Cholesky 稳定化（对 $H_F^{-1}$ 做 Cholesky 分解再取上三角部分参与递推，避免直接求逆在迭代多轮后累积数值误差、乃至矩阵不再正定）——把复杂度大幅压下来（GPTQ §4）：
 
 $$
 O\big(d_{\mathrm{row}}\cdot d_{\mathrm{col}}^3\big)\ \longrightarrow\ O\big(\max\{d_{\mathrm{row}}\cdot d_{\mathrm{col}}^2,\ d_{\mathrm{col}}^3\}\big)
@@ -273,7 +273,7 @@ for i = 0, B, 2B, ...:                       # 按块推进
         return output.reshape(out_shape)
 ```
 
-权重以 `qweight`（打包 INT）+ per-group `scales` + `qzeros`（零点）+ `g_idx`（act_order 分组索引，记录列的重排顺序）装载，推理期由 `ops.gptq_gemm` 融合反量化并矩乘。二阶补偿早已折进这些张量的数值里——vllm 一行 Hessian 都不用算。同一份均匀网格在 `quant_utils.py:L655-L686` 的 `gptq_quantize_weights` 里被复用，只是多了 act_order 的行置换。
+权重以 `qweight`（打包 INT）+ per-group `scales` + `qzeros`（零点）+ `g_idx`（act_order 分组索引，记录列的重排顺序）装载，推理期由 `ops.gptq_gemm` 融合反量化并矩乘；`exllama_state == ExllamaState.READY` 这一位是否就绪的门控——就绪就走 ExLlama 提供的融合反量化+矩乘 kernel，否则退回通用路径。二阶补偿早已折进这些张量的数值里——vllm 一行 Hessian 都不用算。同一份均匀网格在 `quant_utils.py:L655-L686` 的 `gptq_quantize_weights` 里被复用，只是多了 act_order 的行置换。
 
 ---
 
@@ -541,7 +541,7 @@ s_{\mathrm{raw}} = \frac{\mathrm{absmax}}{\mathrm{FP8_{max}}},\qquad
 s = 2^{\lceil \log_2 s_{\mathrm{raw}} \rceil}
 $$
 
-`FP8_MAX` 对 e4m3 是 $448.0$。取整量随 absmax 落点变化：absmax $=7.0$ 恰好落在 $2^{-6}$，overshoot 0%；absmax $=1000.0$ 则被抬到 $2^2=4.0$，overshoot 高达 79.2%。为什么一定向上取整（`ceil`）而不是就近？因为 scale 一旦偏小，FP8 格就会裁掉块内最大值——`ceil` 保证格永远罩得住 amax。这套约定即 OCP Microscaling（MX）FP8 规范 §5 的块 scale 编码，DeepSeek 系 128×128 块量化用的正是它。
+`FP8_MAX` 对 e4m3 是 $448.0$。取整量随 absmax 落点变化：absmax $=7.0$ 恰好落在 $2^{-6}$，overshoot 0%；absmax $=1000.0$ 则被抬到 $2^2=4.0$，overshoot 高达 79.2%。为什么一定向上取整（`ceil`）而不是就近？因为 scale 一旦偏小，FP8 格就会裁掉块内最大值——`ceil` 保证格永远罩得住 amax。这套约定即 OCP（Open Compute Project，硬件厂商联合制定开放计算规范的组织）Microscaling（MX，块级共享缩放因子的低精度格式标准）FP8 规范 §5 的块 scale 编码——上面这段 `exp2∘ceil∘log2` 代码是 vllm 对该规范的具体实现，DeepSeek 系 128×128 块量化用的正是它。
 
 ![e8m0 块 scale 向上取整到 2 的幂](../diagrams/fig35-7-e8m0-rounding.png)
 

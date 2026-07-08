@@ -9,7 +9,7 @@
 
 ---
 
-[上一章](../../ch05-check-and-update-config/narrative/chapter.md)结尾，`worker_cls` 终于从哨兵字符串落成了具体的 `NPUWorker`。可一个 worker 不会孤零零地跑——张量并行、专家并行、流水线并行，多张卡之间要不停地交换张量。而 vLLM 里负责这件事的那层，叫**通信器（communicator）**，在 GPU 上是 `CudaCommunicator`，底层走 NCCL。昇腾 NPU 上没有 NCCL，有的是华为自家的 HCCL。NCCL 是 NVIDIA 的集合通信库、HCCL 是昇腾的对应实现，都负责多卡间 all_reduce / all_gather 等集合通信。
+[上一章](../../ch05-check-and-update-config/narrative/chapter.md)结尾，`worker_cls` 终于从哨兵字符串落成了具体的 `NPUWorker`。可一个 worker 不会孤零零地跑——张量并行、专家并行（MoE，即混合专家：把不同专家分摊到不同卡，token 需按专家路由跨卡重排，机制见[第 8 章](../../ch08-ascend-parallel-groups/narrative/chapter.md)）、流水线并行，多张卡之间要不停地交换张量。而 vLLM 里负责这件事的那层，叫**通信器（communicator）**，在 GPU 上是 `CudaCommunicator`，底层走 NCCL。昇腾 NPU 上没有 NCCL，有的是华为自家的 HCCL。NCCL 是 NVIDIA 的集合通信库、HCCL 是昇腾的对应实现，都负责多卡间 all_reduce / all_gather 等集合通信。
 
 那 vllm-ascend 凭什么把整套通信器换成昇腾版？答案出乎意料地干净。**通信器是 OOT（out-of-tree，源码树外）插件换底座最干净的样本**——干净到整个 `NPUCommunicator` 只有 68 行。本章想说服你相信这件事，并讲清它为什么成立。
 
@@ -154,7 +154,7 @@ class NPUCommunicator(DeviceCommunicatorBase):
 
 **第一笔，`self.device = torch.npu.current_device()`。** 把设备坐实到当前 NPU。
 
-**第二笔，`self.ca_comm = None`。** 注释写得很直白——`For compatibility (mainly for reusing graph capturing code in vllm)`。vLLM 复用图捕获（graph capturing）代码时会去访问 `communicator.ca_comm`，那是 custom all-reduce（自定义 all-reduce）的接口；`CudaCommunicator` 在这里挂的是一个真实现，昇腾暂时还没有，于是先置 `None` 占位——让接口的「形状」对齐，访问时不至于抛 `AttributeError`。这个 `None` 不是终点：上面那行 `TODO(hz)` 已经写明要参照 `CudaCommunicator` 把 `PyHcclCommunicator` 接进来。这颗占位的种子，等显存与图捕获那条线推进时会被重新拾起。
+**第二笔，`self.ca_comm = None`。** 注释写得很直白——`For compatibility (mainly for reusing graph capturing code in vllm)`。vLLM 复用图捕获（graph capturing）代码时会去访问 `communicator.ca_comm`，那是 custom all-reduce（自定义 all-reduce）的接口；`CudaCommunicator` 在这里挂的是一个真实现，昇腾暂时还没有，于是先置 `None` 占位——让接口的「形状」对齐，访问时不至于抛 `AttributeError`。这个 `None` 不是终点：上面那行 `TODO(hz)` 已经写明要参照 `CudaCommunicator` 把 `PyHcclCommunicator` 接进来。这颗占位的种子，等讲 AscendCompiler 与 ACLGraph 编译的[第 29 章](../../ch29-ascend-compiler-aclgraph/narrative/chapter.md)会被重新拾起。
 
 再看唯一新增的方法 `all_to_all`：
 
@@ -616,4 +616,4 @@ if get_ascend_device_type() == AscendDeviceType._310P:
 
 另外两条线是对主干的补充与诚实交代：手写 `pyhccl` 示范了 ctypes 范式怎么从 GPU 逐符号照搬到 NPU——控制流逐字一致、只换符号，但尺寸/枚举值/句柄这些「值本身」也得按 HCCL 头文件换（[6.3](#63-手写-pyhccl把-pynccl-的-ctypes-范式逐符号移植)）；而且它当前**还没接入** `NPUCommunicator`，是为未来 custom all-reduce 预留的范式样本，不是 NPU 现在做集合通信的路。310P 那条线则用 `all_gather` 在 host 侧补回硬件缺失的 `broadcast` 和 int64 `all_reduce`，用带宽换原语，且仅在 310P 才触发（[6.4](#64-仅-310p用-all_gather-补硬件能力缺口)）。
 
-贯穿全章的判据其实只有一句：**基座把抽象做到位、把接口收窄，OOT 插件换底座就只剩填差异点的活**。通信器是这句话最干净的注脚。下一章进入显存的 camem sleep-mode 分配器——而 `NPUCommunicator` 里那个 `ca_comm = None` 占位、那条还没接进来的 `pyhccl`，都和图捕获、自定义 all-reduce 有关，等显存与图捕获那条线推进时，它们会被重新拾起。
+贯穿全章的判据其实只有一句：**基座把抽象做到位、把接口收窄，OOT 插件换底座就只剩填差异点的活**。通信器是这句话最干净的注脚。下一章进入显存的 camem sleep-mode 分配器——而 `NPUCommunicator` 里那个 `ca_comm = None` 占位、那条还没接进来的 `pyhccl`，都和图捕获、自定义 all-reduce 有关，等[第 29 章](../../ch29-ascend-compiler-aclgraph/narrative/chapter.md)讲 ACLGraph 编译时，它们会被重新拾起。

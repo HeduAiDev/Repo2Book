@@ -66,6 +66,8 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
 ```
 
+十个字段里两个字面上不好猜的：`ec_connector_output`（`ECConnectorOutput`）是多模态编码器缓存连接器这一拍的产出记账，本章不展开；`self.kv_connector_output`（前面第一段代码里单独挂在 `self` 上、没塞进这个 `NamedTuple`）则是 P/D 分离场景下 KV 传输连接器的产出，细节见 [第33章](../../ch33-pd-disaggregation/narrative/chapter.md)。两者本章都只管原样透传。
+
 注释里 `Ephemeral`（短命）这个词点出了它的本质：它只在 `execute_model()` 和 `sample_tokens()` 之间活一瞬，采样一做完就被丢弃。它住在一个**单槽**字段里：
 
 ```python
@@ -89,6 +91,8 @@ vLLM 不赌调用方守规矩，它在入口就把这条规矩钉死：
                 "after execute_model() returns None."
             )
 ```
+
+（其中 `intermediate_tensors` 是流水线并行非末位 rank 间传递的张量包——单卡或末位 rank 时恒为 `None`，收发细节见 [第20章](../../ch20-distributed-parallelism/narrative/chapter.md)。）
 
 `execute_model()` 进门第一件事：**断言槽必须是空的**。槽非空，说明上一拍的 state 还没被 `sample_tokens()` 消费——这是调用序列错了，直接抛 `RuntimeError`，把一个会静默损坏数据的 bug 变成一声响亮的崩溃。
 
@@ -232,7 +236,7 @@ $$
             )
 ```
 
-它产出两样东西：`cudagraph_mode`（FULL / PIECEWISE / NONE 之一）和 `batch_desc`（描述这个批次形状的 key）。怎么选的，留到 [§19.6](#196-cuda-graph-分派fullpiecewisenone-的分级取舍)。
+它产出两样东西：`cudagraph_mode`（FULL / PIECEWISE / NONE 之一）和 `batch_desc`（描述这个批次形状的 key）。怎么选的，留到 [§19.6](#196-cuda-graph-分派fullpiecewisenone-的分级取舍)。（另外还搭出 `should_ubatch`、`num_tokens_across_dp` 两个值，服务于数据并行场景下的微批切分与跨 DP rank 的 token 数对齐，本章不展开。）
 
 第四步，发起前向。这是整章最关键的一行的所在地：
 

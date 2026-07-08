@@ -226,7 +226,7 @@ $$
 
 ### 不变量与复杂度
 
-**每步都选「当前总热度最小、且未装该专家、且未满」的卡，装完后每卡恰好 5 项，且最大卡负载被压到接近下界。** 容量闸保证没有卡超载，「未装该专家」约束保证副本分散，降序 + 填最空箱就是 LPT。LPT 对 makespan（最大箱负载）最小化的近似比是 $4/3 - 1/(3m)$；本例更幸运——直接命中最优下界。装箱阶段的复杂度是（本例 $(8+2)\times 2 = 20$ 次候选卡比较量级）：
+**每步都选「当前总热度最小、且未装该专家、且未满」的卡，装完后每卡恰好 5 项，且最大卡负载被压到接近下界。** 容量闸保证没有卡超载，「未装该专家」约束保证副本分散，降序 + 填最空箱就是 LPT。LPT 对 makespan（最大箱负载）最小化的近似比是 $4/3 - 1/(3m)$（m 即卡数 G，调度理论里的标准记号）；本例更幸运——直接命中最优下界。装箱阶段的复杂度是（本例 $(8+2)\times 2 = 20$ 次候选卡比较量级）：
 
 $$
 O((E+R)\cdot G)
@@ -458,7 +458,7 @@ $$
 >
 > **Global Load Balancing** — In other cases, we use the global load balancing policy that replicates the experts globally regardless of expert groups, and pack the replicated experts to individual GPUs.
 
-区别在**要不要按 expert group 绑节点**。**分层策略**先把专家组均匀摊到节点、组内复制、再摊到卡——利用 group-limited routing 减少跨节点流量，适合 prefill（预填充）阶段的小 EP。**全局策略**无视分组，全局复制 + 全局贪心装箱，适合 decode（解码）阶段的大 EP。
+区别在**要不要按 expert group 绑节点**（这里的「专家组」指路由时预先把 $N_r$ 个专家分成若干组、token 先选组再在组内选 top-K 的分组路由，即 group-limited routing；「按组绑节点」就是让同组专家落在同一节点，减少跨节点通信）。**分层策略**先把专家组均匀摊到节点、组内复制、再摊到卡——利用 group-limited routing 减少跨节点流量，适合 prefill（预填充）阶段的小 EP。**全局策略**无视分组，全局复制 + 全局贪心装箱，适合 decode（解码）阶段的大 EP。
 
 本章从头到尾讲的复制 + 装箱，走的正是**全局**这一支。昇腾的 `DefaultEplb` 并没有实现分层的 group→node 绑定——它就是全局复制 + 全局贪心。这不是遗漏，而是设计选择：`DefaultEplb` 定位为通用的全局规划器。这一点在 `PolicyFactory` 的分发表里看得清楚：
 
@@ -472,7 +472,7 @@ policy: dict[int, type[EplbPolicy]] = {
 }
 ```
 
-`policy_type=1` 的注释写得明白：`overall expert replacement based on current moe load`——「overall」（全局）正对应论文的 global 一支。这个 `DefaultEplb` 是昇腾在 vLLM 之外自带（out-of-tree）的规划器实现：它把 DeepSeek-V3 / deepseek-ai/EPLB 的全局均衡思路移植成一份独立的 NumPy 代码，作为 `PolicyFactory` 的默认策略落地（工厂里还有 random / swift / flashlb 三种备选，第 10 章已介绍分发机制）。
+`policy_type=1` 的注释写得明白：`overall expert replacement based on current moe load`——「overall」（全局）正对应论文的 global 一支。这个 `DefaultEplb` 是昇腾在 vLLM 之外自带（out-of-tree）的规划器实现：它把 DeepSeek-V3 / deepseek-ai/EPLB 的全局均衡思路移植成一份独立的 NumPy 代码，作为 `PolicyFactory` 的默认策略落地（工厂里还有 random / swift / flashlb 三种备选，分发机制留到下一章展开）。
 
 ---
 

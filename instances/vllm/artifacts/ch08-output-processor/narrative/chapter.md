@@ -202,7 +202,7 @@ def process_outputs(
 
 **第 ④ 步，logprobs。** `update_from_output` 增量累积 sample/prompt logprobs。这是去 token 之外的第二个被调用子系统，§8.4 末尾讲它的接口。
 
-**第 ⑤ 步，造输出并分发。** `make_request_output(...)` 把本步增量变成（或不变成）一个 `RequestOutput`——它内部有三道节流/分流闸门，是 §8.5 的主题。这里只看分发：用了海象赋值 `if request_output := ...`，**返回 `None` 时整个 if 跳过**（被节流了，本步不发）。返回了对象，就看 `req_state.queue` 是不是 `None`：
+**第 ⑤ 步，造输出并分发。** `make_request_output(...)` 把本步增量变成（或不变成）一个 `RequestOutput`——它内部有三道节流/分流闸门，是 §8.5 的主题。顺带原样透传的还有 `kv_transfer_params`（第 139 行取自 `engine_core_output`）——这是 P/D 分离场景下 KV 连接器要回传给客户端的元数据，本章只管照原样搬运，细节见 [第 32 章](../../ch32-pd-disaggregation/narrative/chapter.md)。这里只看分发：用了海象赋值 `if request_output := ...`，**返回 `None` 时整个 if 跳过**（被节流了，本步不发）。返回了对象，就看 `req_state.queue` 是不是 `None`：
 
 ```python
 if req_state.queue is not None:
@@ -578,7 +578,7 @@ def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
 
 ### 父聚合：一个外部请求，n 条子流
 
-`n>1` 并行采样：客户端发一个请求要 `n` 个候选回答。在引擎内部，它被拆成 `n` 个独立的子请求（拆分在输入侧，本章不管），各自在 EngineCore 里生成。但对客户端，它仍是**一个**请求，要返回 `n` 个 `CompletionOutput`。把 n 条子流重新聚合成"一个请求的 n 个输出"，就是 `ParentRequest.get_outputs` 的活（`vllm/v1/engine/parallel_sampling.py`）：
+`n>1` 并行采样：客户端发一个请求要 `n` 个候选回答。在引擎内部，它被拆成 `n` 个独立的子请求（拆分在输入侧，见 [第 6 章](../../ch06-input-processor/narrative/chapter.md)），各自在 EngineCore 里生成。但对客户端，它仍是**一个**请求，要返回 `n` 个 `CompletionOutput`。把 n 条子流重新聚合成"一个请求的 n 个输出"，就是 `ParentRequest.get_outputs` 的活（`vllm/v1/engine/parallel_sampling.py`）：
 
 ```python
 # vllm/v1/engine/parallel_sampling.py:L100

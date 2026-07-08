@@ -141,7 +141,7 @@ class AscendDeepseekV4SWACache(VllmDeepseekV4SWACache):
 
 ## 36.2 LoRA 第一招：改写 vLLM 的全局元组，把昇腾类塞进候选池
 
-模型注册有现成 API。LoRA 这一处没有——vLLM 没给「注册一个自定义 LoRA 层」的公开口子。昇腾的解法是直接伸手改 vLLM 的模块级全局变量。这就是本章的第二种注册形态，一个干净利落的「全局类替换」trick。
+模型注册有现成 API。LoRA（Low-Rank Adaptation，低秩微调：给线性层的权重增量做低秩分解，用两个小矩阵而非一整块满秩矩阵去微调模型，算力账见 36.3 节）这一处没有——vLLM 没给「注册一个自定义 LoRA 层」的公开口子。昇腾的解法是直接伸手改 vLLM 的模块级全局变量。这就是本章的第二种注册形态，一个干净利落的「全局类替换」trick。
 
 要理解这个 trick，先得看 vLLM 怎么给一个普通线性层套上 LoRA。逻辑在 `vllm/lora/utils.py`：
 

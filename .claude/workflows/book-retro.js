@@ -85,7 +85,6 @@ const clustered = await agent(
 const cands = (clustered && clustered.candidates) || []
 const report = { date: A.date, instance: INST, chapters_mined: slugs.length,
   stats_note: (clustered && clustered.stats_note) || '', candidates: cands }
-await agent('把下面 JSON **原样** Write 到 ' + OUT + '（目录不存在先建），写完返回 "written"。\n' + JSON.stringify(report),
-  { label: 'write-report', phase: 'Cluster', model: 'haiku', agentType: 'general-purpose' })
+log('报告不经 agent 转写落盘（曾系统性打碎 JSON 转义）——以 workflow 返回值与 journal 为准，Lead 用 python 落盘到 ' + OUT + '。')
 log('复盘完成：' + cands.length + ' 个经验候选 → ' + OUT)
 return { report: OUT, candidates: cands.map(function (c) { return { id: c.id, pattern: c.pattern, target: c.target, recurrence: c.recurrence } }) }

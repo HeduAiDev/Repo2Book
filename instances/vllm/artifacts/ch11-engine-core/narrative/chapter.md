@@ -300,7 +300,7 @@ def has_work(self) -> bool:
     )
 ```
 
-单引擎读者可以把 `engines_running` 当作恒 `False`（它只在数据并行场景由全局协调置位）。于是 `has_work()` 约等于「调度器手上有请求，或者 batch queue 里还有在飞的批」。
+单引擎读者可以把 `engines_running` 当作恒 `False`（它只在数据并行场景由全局协调置位——多个引擎怎么就"全体是否还有活"达成共识，见 [第 21 章](../../ch21-async-engine/narrative/chapter.md)）。于是 `has_work()` 约等于「调度器手上有请求，或者 batch queue 里还有在飞的批」。
 
 把这两段连起来读，`_process_input_queue` 的逻辑就清楚了：
 
@@ -343,7 +343,7 @@ def _process_engine_step(self) -> bool:
 
 **输出塞进 `output_queue`**。`outputs.items()` 是 `{client_index: EngineCoreOutputs}`，逐个 `put_nowait` 进去。然后第 7 章那个 `process_output_sockets` IO 线程会把它们抽走、编码、经 ZMQ 推回客户端。忙循环只管往内存队列里塞，不碰网络——网络 IO 交给独立线程，互不阻塞。这是 `input_queue` / `output_queue` 这对内存队列存在的全部理由：**用一对线程安全队列，把「跑模型的循环」和「读写 socket 的 IO」彻底解耦**。忙循环只跟内存打交道，逻辑简单且不会被网络卡住；IO 线程的序列化和 socket 操作释放 GIL，能和 GPU 前向真正并行。
 
-**那 1 毫秒的 `time.sleep`**。看注释：有些请求会卡在 `WAITING_FOR_REMOTE_KVS`——等另一台机器把 KV cache 通过 NIXL 握手传过来。这种请求没法 step（数据还没到），但又确实「没完成」。如果忙循环为它疯狂空转，会把 CPU 时间片全占了，做握手的后台线程反而饿死、永远握不上手。短睡 1 ms 把轮询频率压到约 1000 Hz，给后台线程让出时间片。这是一个「紧轮询会饿死协作线程」的经典折中。
+**那 1 毫秒的 `time.sleep`**。看注释：有些请求会卡在 `WAITING_FOR_REMOTE_KVS`——等另一台机器把 KV cache 通过 NIXL（一种基于 RDMA 单边读的跨机器 KV 传输后端，[第 33 章 §33.8](../../ch33-pd-disaggregation/narrative/chapter.md) 细讲）握手传过来。这种请求没法 step（数据还没到），但又确实「没完成」。如果忙循环为它疯狂空转，会把 CPU 时间片全占了，做握手的后台线程反而饿死、永远握不上手。短睡 1 ms 把轮询频率压到约 1000 Hz，给后台线程让出时间片。这是一个「紧轮询会饿死协作线程」的经典折中。
 
 精简版把这一圈也跑通了：输出确实进了 `output_queue`，请求消费完加关停信号后循环干净退出。
 
@@ -416,7 +416,7 @@ def _handle_client_request(
 四条主要分支：
 
 - **`WAKEUP`**——直接 `return`，什么都不做。它是个哨兵，§11.5 揭晓它的用途。
-- **`ADD`**——拆出 `(req, request_wave)`，交给 `add_request`（校验后转给调度器）。
+- **`ADD`**——拆出 `(req, request_wave)`，交给 `add_request`（校验后转给调度器）。`request_wave` 是这批请求所属的调度波次编号，单引擎下可以先不管它；数据并行场景下多个引擎靠它对齐"全体运行/全体暂停"的节拍，[第 21 章](../../ch21-async-engine/narrative/chapter.md) 会展开这套 wave 共识机制。
 - **`ABORT`**——交给 `abort_requests`（让调度器把这些请求标成 `FINISHED_ABORTED`）。
 - **`UTILITY`**——这是个**通用 RPC 通道**。客户端想调引擎上某个方法（比如查询是否在睡、重置缓存、甚至触发 sleep），不必为每个方法单设一种消息类型，统一打包成 UTILITY：`(client_idx, call_id, method_name, args)`。引擎用 `getattr(self, method_name)` 懒查到方法、调用、把返回值连同 `call_id` 塞回 `output_queue`。那个 `call_id` 是第 7 章讲的[关联标识](../../ch07-engine-core/narrative/chapter.md)（correlation-id）——客户端凭它把异步回来的结果对上当初的调用。**§11.6 那些生命周期方法，大多就是经这条 UTILITY 路径被调用的。**
 

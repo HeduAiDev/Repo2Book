@@ -16,7 +16,7 @@
 
 假设你把 AscendC kernel 注册进了 torch，推理能跑、数值也对。然后你打开 `torch.compile` 或 ACLGraph 想加速——结果图捕获在你的算子那里断了，报「无法推断输出形状」。
 
-问题出在**图捕获的工作方式**。`torch.compile` 的 Dynamo / AOTAutograd、以及 ACLGraph 的录制，都不是真的把数据算一遍再记下来，而是**假跑一遍**。这里先单独立住一个核心概念：PyTorch 用 **Meta 张量**（`torch.device('meta')` 上的张量）做假跑，它只记录 shape / dtype / stride 这些元信息、**不分配任何真实存储**。所谓假跑，就是让 Meta 张量走一遍计算图，把「依次调用了哪些算子、每处张量是什么形状」追踪下来，再编译或录制成可重放的图。
+问题出在**图捕获的工作方式**。`torch.compile` 的 Dynamo（负责把 Python 前向逐步 trace 成计算图）/ AOTAutograd（在这张图上铺开自动微分与 functionalization），以及 ACLGraph 的录制，都不是真的把数据算一遍再记下来，而是**假跑一遍**。这里先单独立住一个核心概念：PyTorch 用 **Meta 张量**（`torch.device('meta')` 上的张量）做假跑，它只记录 shape / dtype / stride 这些元信息、**不分配任何真实存储**。所谓假跑，就是让 Meta 张量走一遍计算图，把「依次调用了哪些算子、每处张量是什么形状」追踪下来，再编译或录制成可重放的图。
 
 假跑遇到你的算子时，它需要知道：**喂进这个形状的输入，会吐出什么形状的输出？** 真实 kernel 答不了这个问题——它要真有数据、真有设备内存才能算。（你可能会问：那让真实 kernel 真跑一遍、再读出输出形状不行吗？不行——假跑时根本没有真实设备内存、没有数据、没有 NPU 计算资源；而推形状只需要形状逻辑，在任何设备上都能做。）所以每个想进图的算子，除了「真算」那份实现，还得额外提供一份**只推形状、不真算**的实现，专供假跑时查询。
 
@@ -71,7 +71,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
 这套 `def + impl` 在这个主块里**对 63 个算子各做了一遍**（标准芯片分支；另有一段 `#ifdef ASCEND_PLATFORM_310P` 给 [310P 推理卡](../../ch18-310p-inference-chip-specialization/narrative/chapter.md)单独注册 2 个，与主块互斥编译，本章只看主分支）。其中绝大多数（59 个）都把实现绑在 `PrivateUse1`，是模型真正算数的重活——RmsNorm、各种 attention、MoE gating、量化 matmul……
 
-剩下 4 个工具算子用别的派发键：`swap_blocks_batch` 走 `torch::kCPU`，`device_print` / `device_print_tensor` / `get_npu_storage_shape` 走 `CompositeExplicitAutograd`（63 = 59 + 4）。它们本就不在 NPU 真算的热路径上，所以不挂 `PrivateUse1`——这也预告了 [§28.5](#285-缺口-6-个无-meta-不能进图的实证) 那几个『无 meta 不进图』里的工具算子。
+剩下 4 个工具算子用别的派发键：`swap_blocks_batch` 走 `torch::kCPU`，`device_print` / `device_print_tensor` / `get_npu_storage_shape` 走 `CompositeExplicitAutograd`（不挂具体设备、走通用组合实现的派发键；63 = 59 + 4）。它们本就不在 NPU 真算的热路径上，所以不挂 `PrivateUse1`——这也预告了 [§28.5](#285-缺口-6-个无-meta-不能进图的实证) 那几个『无 meta 不进图』里的工具算子。
 
 ### 算子全名从哪来：`_C_ascend` 这个命名空间
 

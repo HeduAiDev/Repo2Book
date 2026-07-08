@@ -87,6 +87,8 @@ self.token_ids_cpu_tensor = torch.zeros(
 self.token_ids_cpu = self.token_ids_cpu_tensor.numpy()
 ```
 
+（`pin_memory=True` 让这块 CPU 缓冲驻留在页锁定内存里，CUDA 才能对它发起真正的异步 DMA——后面 `commit_block_table` 能把块表拷贝和 CPU 计算重叠，前提就在这里。）
+
 核心就是这块 `token_ids_cpu`：一个 `max_num_reqs × max_model_len` 的二维 int32 缓冲，**一行存一个请求的全长 token 序列**。除它之外，`InputBatch` 还并排维护一组同样按行索引的 CPU 镜像——`num_computed_tokens_cpu`（每请求已算多少 token）、`num_prompt_tokens`、`num_tokens_no_spec`、块表、整套采样参数列、以及 `req_id_to_index`（请求 ID → 行号映射）。
 
 「一行一请求」这个布局是一切的地基。它让「请求 r 的第 p 个 token」永远落在固定的 `(r, p)` 位置，于是增删请求、收集 token 都退化成**纯索引算术**，不需要任何动态分配。代价是内存——源码自己也标了 TODO，说 `max_model_len` 很大时这块缓冲会过大。但换来的是机制上的极致简单。
@@ -495,7 +497,7 @@ self._prepare_input_ids(
 )
 ```
 
-`query_start_loc` 就是 `[0]` 接上 `cu_num_tokens`——`[0, 2, 7, 10]`，标出每个请求的 token 在扁平 `input_ids` 里从哪到哪。末尾那行 `fill(cu_num_tokens[-1])` 把没用到的尾部 padding 成最后一个累积值，保证整个数组**非递减**——FlashAttention 这类 kernel 要求边界数组单调不减，否则越界。
+`query_start_loc` 就是 `[0]` 接上 `cu_num_tokens`——`[0, 2, 7, 10]`，标出每个请求的 token 在扁平 `input_ids` 里从哪到哪。末尾那行 `fill(cu_num_tokens[-1])` 把没用到的尾部 padding 成最后一个累积值，保证整个数组**非递减**——FlashAttention 这类 kernel（内部怎么工作，留给[第 25 章](../../ch25-attention/narrative/chapter.md)细看）要求边界数组单调不减，否则越界。
 
 `positions` 和上一节 CPU 端同公式，只是这回在 GPU 上算。`seq_lens` = 已算 + 本拍要算，是每请求的当前总长，attention 用它界定每个请求能看多远。
 
@@ -562,7 +564,7 @@ def commit_block_table(self, num_reqs: int) -> None:
 
 `append_row` / `add_row` / `move_row` 全改 CPU 镜像 `block_table.np`——`append_row` 追加块号，`add_row` 重置后写（新请求）,`move_row` 是 `condense` 搬行时同步搬块表。它们都廉价，因为只动 numpy。
 
-> **v0.21.0 更新**：这张表的列数由每组 `max_num_blocks` 定。v0.21.0 起，构造 `MultiGroupBlockTable` 时会把每个 KV cache group 的 `max_num_blocks` 向上对齐到 `128 / block_size` 的整数倍（`block_size ≤ 128` 时 `cdiv(n, 128//bs) * (128//bs)`，否则原样，#39324）——因为 TRTLLM MLA 等部分 attention 后端对 block table 的列数有 128 元素对齐的边角要求。对常规 `block_size` 这只会略微抬高列数，双镜像的语义与上面这套增量写法都不受影响。
+> **v0.21.0 更新**：这张表的列数由每组 `max_num_blocks` 定。v0.21.0 起，构造 `MultiGroupBlockTable` 时会把每个 KV cache group 的 `max_num_blocks` 向上对齐到 `128 / block_size` 的整数倍（`block_size ≤ 128` 时 `cdiv(n, 128//bs) * (128//bs)`，否则原样，#39324）——因为 TRTLLM MLA（一种对 block table 列数有特殊对齐要求的 attention 后端，[第 25 章](../../ch25-attention/narrative/chapter.md)还会遇到）等部分 attention 后端对 block table 的列数有 128 元素对齐的边角要求。对常规 `block_size` 这只会略微抬高列数，双镜像的语义与上面这套增量写法都不受影响。
 
 但前向要的是 GPU 上的块表。于是 `commit_block_table` 把整个 CPU 镜像**批量**拷到 GPU。这就是上一节 `_prepare_inputs` 开头那个 `commit_block_table`——所有块号在 `_update_states` 里以最廉价的 CPU 增量写好，到 `_prepare_inputs` 一次性刷到 GPU，还故意放在最前面与后续 CPU 工作重叠。**CPU 改、批量 commit、GPU 用**，职责清清楚楚。
 

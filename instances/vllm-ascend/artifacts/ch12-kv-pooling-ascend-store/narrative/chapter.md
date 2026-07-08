@@ -114,7 +114,7 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         return done_sending, done_recving
 ```
 
-四个钩子，两类去向：`get_num_new_matched_tokens` / `build_connector_meta` 转给调度端，`start_load_kv` / `wait_for_save` / `get_finished` 转给 worker 端。`wait_for_save` 里那个 `kv_role == "kv_consumer"` 的早退是个小优化——纯消费方默认不往池里写，没必要存。
+四个钩子，两类去向：`get_num_new_matched_tokens` / `build_connector_meta` 转给调度端，`start_load_kv` / `wait_for_save` / `get_finished` 转给 worker 端。`wait_for_save` 里那个 `kv_role == "kv_consumer"` 的早退是个小优化——纯消费方默认不往池里写，没必要存。这里判断用到的 `consumer_is_to_put`（后面 `get_num_new_matched_tokens`/`get_finished` 里还会遇到它和它的读侧搭档 `consumer_is_to_load`）是配置里给 `kv_consumer` 角色开的例外开关：默认关闭，纯消费方老老实实只读；某些部署里 consumer 也要顺手写一份或主动发起 load，打开对应开关后，这个实例在对应动作上就改走 `kv_producer`/`kv_both` 的路径，不再享受这条早退。
 
 ### 这套钩子从哪来：vLLM 的 KVConnectorBase_V1
 
@@ -235,7 +235,7 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         return need_to_allocate, self.load_async and not self.use_layerwise
 ```
 
-核心就一行：`self.client.lookup(...)` 去问池子「命中多少前缀」。传给它的两个参数先点明：`request.block_hashes` 是这条 prompt 逐块的**内容哈希**列表——vLLM 的 KV cache 按固定大小的 block 组织，每个 block 一个由其 token 内容算出的哈希，是 tokenize 阶段顺带产出的；池子正是拿这串哈希按内容去比中前缀。`kv_cache_group_ids` 则是**KV cache 分组**——同一个 worker 内部可能把 KV 切成几个逻辑分组（比如同一 worker 用 16 和 32 两种 block 大小布局 KV，就产生两个 cache group，不同 block 大小的 chunk 走不同的显存寻址），一条请求可能横跨多组，故逐组去查（注意它不是并行 rank，是单 worker 内的逻辑切分）。
+开头那道 `if self.kv_role == "kv_consumer" and not self.consumer_is_to_load: return 0, False`，就是上面提到的例外开关落在调度端的样子：`consumer_is_to_load` 关着时，纯消费方直接早退、连问都不问；打开它，才会往下走完整的 lookup 流程。核心就一行：`self.client.lookup(...)` 去问池子「命中多少前缀」。传给它的两个参数先点明：`request.block_hashes` 是这条 prompt 逐块的**内容哈希**列表——vLLM 的 KV cache 按固定大小的 block 组织，每个 block 一个由其 token 内容算出的哈希，是 tokenize 阶段顺带产出的；池子正是拿这串哈希按内容去比中前缀。`kv_cache_group_ids` 则是**KV cache 分组**——同一个 worker 内部可能把 KV 切成几个逻辑分组（比如同一 worker 用 16 和 32 两种 block 大小布局 KV，就产生两个 cache group，不同 block 大小的 chunk 走不同的显存寻址），一条请求可能横跨多组，故逐组去查（注意它不是并行 rank，是单 worker 内的逻辑切分）。
 
 还有开头那道下界守卫 `if token_len < self.cache_transfer_granularity: return 0, False` 值得点一句：`cache_transfer_granularity` 是池化的最小转移粒度（比如 16 token）。比这还短的前缀，即便池里有，命中也不划算搬——直接让本地重算更快，所以一块都不分配就早退。
 

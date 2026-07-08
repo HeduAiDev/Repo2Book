@@ -255,6 +255,8 @@ if self.vllm_config.parallel_config.data_parallel_size > 1:
         assert batch_descriptor.num_tokens == num_tokens_padded
 ```
 
+（这里一并重置的 `should_ubatch`／代码里断言为 `None` 的 `ubatch_slices` 服务的是另一条微批（ubatch）执行路径——[第 14 章](../../ch14-npuworker-execution-control/narrative/chapter.md) `init_workspace_manager` 建的并行微批槽位；本章这条 DP 同步流程不涉及微批，故恒置 `False`/`None`，只是与 `num_tokens_across_dp` 共享同一处初始化代码。）
+
 注意这里的因果顺序。同步**之前**，本卡其实已经按自己的 token 数 dispatch（派发/选定图模式）过一次 cudagraph 了。同步**之后**，token 数和模式都可能被别的卡拉变（上一节第 t 拍，rank 0 的 FULL 被 rank 1 拉成了 NONE）。所以必须拿同步回来的结论**重新 dispatch 一次**——`valid_modes={synced_cudagraph_mode}` 把候选模式收敛到全 DP 商定的那一个，`num_tokens_padded` 也换成本卡在对齐后该补到的数。
 
 最后那行 `assert` 是道保险：重新 dispatch 出来的 batch 描述符，其 token 数必须正好等于商定值，否则 `num_tokens_across_dp` 就对不上了，后面 forward context 里的一切 padding 都会跟着错。
@@ -496,7 +498,7 @@ $$
 
 ## 16.6 select_moe_comm_method：每拍前向前，先把通信方式定下来
 
-注意 `moe_comm_type` 是在**进 `with` 体后、跑前向前**算的——也就是说，**每一拍前向，都会先重选一次通信方式**。为什么不在 MoE 层内部现算？因为通信方式取决于本拍的 token 数、EP/DP 规模、芯片代次——**这些在整个 batch 内是一致的**。前置算一次写进上下文，所有 MoE 层共用，既省掉逐层重复决策，又保证全 batch 用同一种通信，不会东一榔头西一棒子。
+注意 `moe_comm_type` 是在**进 `with` 体后、跑前向前**算的——也就是说，**每一拍前向，都会先重选一次通信方式**。为什么不在 MoE 层内部现算？因为通信方式取决于本拍的 token 数、EP（Expert Parallel，专家并行：把不同专家分摊到不同卡，token 按路由结果跨卡发给对应专家，详见 [第 9 章](../../ch09-primer-eplb/narrative/chapter.md)）/DP 规模、芯片代次——**这些在整个 batch 内是一致的**。前置算一次写进上下文，所有 MoE 层共用，既省掉逐层重复决策，又保证全 batch 用同一种通信，不会东一榔头西一棒子。
 
 决策本身是一棵纯函数决策树：
 
@@ -619,7 +621,7 @@ def _model_forward(
     return hidden_states
 ```
 
-主体就是 `run_model()` 跑一遍 `self.model`。中间那个 `enable_enpu` 分支只是个执行顺序的小适配——ENPU 是昇腾的软切分（soft segmentation）模式，开启时注释要求「先 `event.record` 再 `event.wait`」，所以把事件记录提到了跑模型之前，否则维持「先跑、后记录」。真正的看点是最后那个 `if`——它**回应了上一节注入的 `flash_comm_v1_enabled`**。如果这拍开了 flashcomm v1（序列并行），前向时 token 被沿序列维切到各卡了，出来的 `hidden_states` 是分片的；这里就用 `_all_gather_hidden_states_and_aux` 把分片 all_gather 拼回完整张量——SP 切分的逆操作。**注入的字段，在这里被消费了**：上下文不是写完就摆着看的，它实打实地改变了前向的行为。
+主体就是 `run_model()` 跑一遍 `self.model`。中间那个 `enable_enpu` 分支只是个执行顺序的小适配——ENPU 是昇腾的软切分（soft segmentation）模式，开启时注释要求「先 `event.record` 再 `event.wait`」，所以把事件记录提到了跑模型之前，否则维持「先跑、后记录」。真正的看点是最后那个 `if`——它**回应了上一节注入的 `flash_comm_v1_enabled`**，同时用 `isinstance` 挡开一种特殊情况：若这一层是流水线并行下的非末级 stage，`hidden_states` 拿到的不是最终隐藏态，而是要传给下一级 stage 的中间结果包 `IntermediateTensors`——这种情况本就不需要（也不能）在此 all_gather。排除这种情况后，如果这拍开了 flashcomm v1（序列并行），前向时 token 被沿序列维切到各卡了，出来的 `hidden_states` 是分片的；这里就用 `_all_gather_hidden_states_and_aux` 把分片 all_gather 拼回完整张量——SP 切分的逆操作。**注入的字段，在这里被消费了**：上下文不是写完就摆着看的，它实打实地改变了前向的行为。
 
 拿到 `hidden_states`，主干就剩采样。前向后会用 `logits_indices`（§16.2 那张取址表）抽出要采样的位置、算出 logits，最后派给 `_sample`：
 

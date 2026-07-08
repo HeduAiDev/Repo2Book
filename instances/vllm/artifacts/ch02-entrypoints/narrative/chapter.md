@@ -31,7 +31,7 @@
 2. **引擎段（独立 OS 进程）**：一个叫 `run_busy_loop` 的同步循环不停地「取请求 → 算一拍 → 吐结果」，跑模型前向、采样。它和 API 进程经 ZMQ 通信。
 3. **输出段（回到 API 进程）**：一个后台协程把引擎吐出来的 token 拉回来，去 token 化、判停止、组装成面向用户的 `RequestOutput`，再交还给等在那里的请求。
 
-为什么要拆成三段、还要把引擎单拎到另一个进程？一句话：**别让模型执行堵死 API 服务器**。模型前向是个被 GIL 绑死的重活，如果它和 HTTP 处理挤在同一个 Python 进程，一跑前向，整个事件循环就卡住，别的请求全得排队。把引擎拎进独立进程，API 进程就只剩下轻活——分词、组装、收结果、回 SSE——一个事件循环能轻松扛住大量并发连接。这条设计主线，[第 4 章](../../ch04-async-llm/narrative/chapter.md) 会从 `AsyncLLM` 的搭建过程整章展开。
+为什么要拆成三段、还要把引擎单拎到另一个进程？一句话：**别让模型执行堵死 API 服务器**。模型前向是个被 GIL（全局解释器锁——同一进程内同一时刻只有一个线程能执行 Python 字节码）绑死的重活，如果它和 HTTP 处理挤在同一个 Python 进程，一跑前向，整个事件循环就卡住，别的请求全得排队。把引擎拎进独立进程，API 进程就只剩下轻活——分词、组装、收结果、回 SSE（Server-Sent Events，一种基于 HTTP 长连接的服务器单向推送协议，客户端只需 `GET` 一次就能持续收到增量片段）——一个事件循环能轻松扛住大量并发连接。这条设计主线，[第 4 章](../../ch04-async-llm/narrative/chapter.md) 会从 `AsyncLLM` 的搭建过程整章展开。
 
 下面我们就顺着这张图，从入口走到出口。
 
@@ -58,7 +58,7 @@ generator = self.engine_client.generate(
 )
 ```
 
-注意 `engine_input` 这个名字——它是**已经渲染好**的引擎输入。从一堆聊天消息（`messages`）到这个 `engine_input`，中间隔着一层 chat template 套用 + 分词的「渲染」工序。这层渲染本身是一个专题，本章不展开；你只要知道：HTTP 请求走到这一行时，消息已经变成了引擎认得的输入，接下来 `engine_client.generate(...)` 拿到的是一个异步生成器，后面 `async for` 它、把每一片吐成 SSE 回客户端。
+注意 `engine_input` 这个名字——它是**已经渲染好**的引擎输入。从一堆聊天消息（`messages`）到这个 `engine_input`，中间隔着一层 chat template 套用 + 分词的「渲染」工序。这层渲染本身是一个专题，本章不展开，细节见 [第 35 章](../../ch35-entrypoints/narrative/chapter.md)；你只要知道：HTTP 请求走到这一行时，消息已经变成了引擎认得的输入，接下来 `engine_client.generate(...)` 拿到的是一个异步生成器，后面 `async for` 它、把每一片吐成 SSE 回客户端。
 
 这里的 `engine_client` 在生产部署里就是 `AsyncLLM`。**所以无论你走 HTTP 还是别的在线协议，最终都汇到 `AsyncLLM.generate()` 这一个函数**——它就是本章主线的「出口」，我们 [§2.9](#29-出口generate-只消费队列) 会回到它。
 
@@ -146,6 +146,8 @@ if is_pooling or params.n == 1:
     return queue
 # … 省略：n>1 时用 ParentRequest 扇出 n 条子请求、都挂到同一个 queue …
 ```
+
+这里的 `is_pooling`（该请求是否为嵌入/打分等池化模型请求——与生成式 completion 请求共用同一套骨架，但产出的是向量/分数而非逐 token 文本）为真时，同样直接走单请求路径，不做 `n>1` 扇出。
 
 鸟瞰主线只需记住：**单请求一条直走，`n>1` 扇出多条子请求、共用一个 collector**。并行采样扇出的扇出与合并细节，[第 6 章](../../ch06-input-processor/narrative/chapter.md) 会放大。
 

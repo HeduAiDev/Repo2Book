@@ -377,7 +377,7 @@ $$
 
 （arXiv:2606.19348 §2.2 Eq.(8)，$\mathcal{T}_r,\mathcal{T}_c$ 是行/列归一，取 $t_{\max}=20$）
 
-接着上面「配平预算表」那个直觉往下核对：配平后的双随机矩阵谱范数 $\le 1$（非扩张），残差不会被逐层放大。代入一个 $2\times2$ 例子，看收敛：
+接着上面「配平预算表」那个直觉往下核对：配平后的双随机矩阵谱范数（矩阵对任意向量最多能放大多少倍）$\le 1$（非扩张），残差不会被逐层放大。代入一个 $2\times2$ 例子，看收敛：
 
 <!-- trace: mhc-manifold-hyperconnections -->
 
@@ -534,7 +534,7 @@ $$
         return packed_codes
 ```
 
-这是标准的 LSH（Locality-Sensitive Hashing，局部敏感哈希）：`hash_weights`（构造时用 QR 正交化的随机高斯投影）把浮点向量投到 `hash_bits` 维，取符号位，经昇腾算子 `npu_sign_bits_pack` 打包成 uint8——每 8 位一个字节。选块时不再算浮点内积，改比两串指纹的 **Hamming 距离**（汉明距离，两串 0/1 位里不同的位数），只需 XOR + popcount 位运算。这就是把 Eq.16-17 的 ReLU 加权打分近似成汉明检索。
+这是标准的 LSH（Locality-Sensitive Hashing，局部敏感哈希）：`hash_weights`（构造时用 QR 正交化——让各投影方向两两正交、避免哈希位之间冗余相关——的随机高斯投影）把浮点向量投到 `hash_bits` 维，取符号位，经昇腾算子 `npu_sign_bits_pack` 打包成 uint8——每 8 位一个字节。选块时不再算浮点内积，改比两串指纹的 **Hamming 距离**（汉明距离，两串 0/1 位里不同的位数），只需 XOR + popcount 位运算。这就是把 Eq.16-17 的 ReLU 加权打分近似成汉明检索。
 
 运行期的选块张量集在 `KVCompMetaData`（`vllm_ascend/worker/kvcomp_utils.py:L491-513`）：
 

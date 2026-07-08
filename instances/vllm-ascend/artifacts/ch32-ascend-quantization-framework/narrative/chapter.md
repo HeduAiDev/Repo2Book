@@ -234,7 +234,7 @@ def get_quant_method(self, layer: torch.nn.Module, prefix: str, tid2eid=None) ->
 
 表里归并成四类，但源码里的 `isinstance` 其实不止四处——attention 那一类的判定里还嵌了 `is_fa_quant_layer` / `is_indexer_quant_layer`：这是 attention 内部两条不同的注意力量化路径（按层 id 是否落在各自的待量化集合里命中），量化的对象与方式各不相同；此外还有一处已省略的 C8 KV cache 量化分支。按**目标层类型**归并，这些就收进上表的四类分发。
 
-每一类的套路都一样：先问 `is_layer_skipped_ascend`——这层是不是**未量化层**（逐层描述里标了 `FLOAT` 的敏感层，如某些 MTP 头；`FLOAT` 表示这层不量化、保持原始浮点精度，不是某种 float 量化格式），是就回退到对应的 `Unquantized*` 方法、不套量化 scheme；否则 `create_scheme_for_layer(...)` 造出 scheme，再包进对应 wrapper 返回。注意 MoE 那一岔——`AscendFusedMoEMethod(scheme, layer.moe_config, tid2eid)`，这就是第 30 章 `FusedMoE` 在量化路径下的落点：量化版 MoE 从这里接进来。
+每一类的套路都一样：先问 `is_layer_skipped_ascend`——这层是不是**未量化层**（逐层描述里标了 `FLOAT` 的敏感层，如某些 MTP（Multi-Token Prediction，投机解码用的多 token 预测头，后文讲投机采样时细展开）；`FLOAT` 表示这层不量化、保持原始浮点精度，不是某种 float 量化格式），是就回退到对应的 `Unquantized*` 方法、不套量化 scheme；否则 `create_scheme_for_layer(...)` 造出 scheme，再包进对应 wrapper 返回。注意 MoE 那一岔——`AscendFusedMoEMethod(scheme, layer.moe_config, tid2eid)`，这就是第 30 章 `FusedMoE` 在量化路径下的落点：量化版 MoE 从这里接进来。
 
 **那「这层用 W8A8 还是 W4A8」到底谁说了算？** 不是代码硬编码，是模型自己带的一份逐层描述。ModelSlim 工具压完权重，会生成一个 `quant_model_description.json`，逐层记下每层的量化类型。加载期它被解析成 `self.quant_description` 这个 dict。`create_scheme_for_layer` 的第一步就是按 `prefix` 去查它：
 
@@ -356,6 +356,8 @@ class AscendLinearMethod(LinearMethodBase):
             layer.register_parameter(perchannel_name, param)
             set_weight_attrs(param, extra_weight_attrs)
 ```
+
+`__init__` 里除了记下 scheme，还存了一个 `_enable_dsa_cp_with_layer_shard`——DSA-CP（DSA 注意力开上下文并行时对大权重做的切分特化）的开关标志，只在下面 `process_weights_after_loading` 的一处大权重 workaround 里用到，属旁支细节，此处按下不表。
 
 这段是整章「适配器只搬运、scheme 才决定」最直接的证据。注意 `create_weights` **自己一个权重形状都没写死**——它问 `self.quant_method.get_weight(...)` 要一个「参数名 → 空张量」的字典，然后**逐个 `register_parameter`** 挂到 layer 上。per-channel 的 scale 也一样，问 `get_perchannel_param(...)` 要、再逐个注册。wrapper 只干两件杂活：给参数打方向属性（`input_dim` / `output_dim`，告诉 weight_loader 这个权重该按哪个维度切给各 rank 做并行分片），以及把 packing 信息搬过去。**到底造几个张量、什么形状、什么 dtype，全是 scheme 说了算。**
 

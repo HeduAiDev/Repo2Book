@@ -20,7 +20,7 @@
 
 这条链横跨几个文件：抽象与共享 metadata 在 `vllm/v1/attention/backend.py`，注册表在 `vllm/v1/attention/backends/registry.py`，选后端入口在 `vllm/v1/attention/selector.py`，FlashAttention 四件套在 `vllm/v1/attention/backends/flash_attn.py`，统一注意力层在 `vllm/model_executor/layers/attention/attention.py`。
 
-为了能在本地（无 GPU）把这套抉择与读写亲手跑一遍、打断点看数值，本章配了一份**只做减法**的精简版：和真实 vLLM 同名、同结构、同控制流，只删掉与主线正交的分支（MLA 变体、DCP、cascade、FP8 量化、CUDA graph 调度）。两个真正跑在 CUDA 上的算子（写 KV 的 `reshape_and_cache_flash`、读 KV 的 `flash_attn_varlen_func`）在 host 上以 CPU 等价实现复刻其可观察语义，让数值能对上。它是"跑起来看数值"的交叉验证物，正文主线仍是真实源码。
+为了能在本地（无 GPU）把这套抉择与读写亲手跑一遍、打断点看数值，本章配了一份**只做减法**的精简版：和真实 vLLM 同名、同结构、同控制流，只删掉与主线正交的分支（MLA〔Multi-head Latent Attention，多头潜变量注意力，把 KV cache 压成低秩潜变量的注意力变体，详见[DeepSeek-V4 那章](../../ch27-model-architecture/narrative/chapter.md)〕变体、DCP、cascade、FP8 量化、CUDA graph 调度）。两个真正跑在 CUDA 上的算子（写 KV 的 `reshape_and_cache_flash`、读 KV 的 `flash_attn_varlen_func`）在 host 上以 CPU 等价实现复刻其可观察语义，让数值能对上。它是"跑起来看数值"的交叉验证物，正文主线仍是真实源码。
 
 ---
 
@@ -219,7 +219,7 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
 
 为什么不直接把类放进枚举？因为 FlashInfer、FlashMLA、Triton 各自带着重依赖。要是 `import registry` 就连带 import 全部后端，那么任何一个没装的依赖都会把整张表拖崩——你只想用 FlashAttention，却因为没装 FlashInfer 而 import 失败。
 
-> **v0.21.0 更新**：`AttentionBackendEnum`（`vllm/v1/attention/backends/registry.py`）的成员清单有增删——MLA 家族新增 `TOKENSPEED_MLA`（指向 `mla.tokenspeed_mla.TokenspeedMLABackend`，面向 DSR1/Kimi 在 Blackwell 上 prefill+decode 合一），同时 tree attention 后端 `TREE_ATTN` 被整体移除；Mamba 系列也作为正式成员被一并列入枚举。配套地，Mamba 后端的选择从旧的字符串查表彻底改成枚举驱动：原先经 `MAMBA_TYPE_TO_BACKEND_MAP` 拿 `"mamba1"`/`"mamba2"` 这类字面量去查，现已删掉该映射表，改由 `get_mamba_attn_backend(mamba_type: MambaAttentionBackendEnum)` 直接调 `mamba_type.get_class()` 惰性导入（`vllm/v1/attention/selector.py`）。换句话说，§25.4 这套"枚举值即类路径 + `get_class()` 懒加载"的机制，现在把 Mamba 也纳了进来——合法后端类型从运行期字符串校验前移成了枚举类型级约束。
+> **v0.21.0 更新**：`AttentionBackendEnum`（`vllm/v1/attention/backends/registry.py`）的成员清单有增删——MLA 家族新增 `TOKENSPEED_MLA`（指向 `mla.tokenspeed_mla.TokenspeedMLABackend`，面向 DeepSeek-R1（DSR1）/Kimi 这类模型在 Blackwell 上 prefill+decode 合一），同时 tree attention 后端 `TREE_ATTN` 被整体移除；Mamba 系列也作为正式成员被一并列入枚举。配套地，Mamba 后端的选择从旧的字符串查表彻底改成枚举驱动：原先经 `MAMBA_TYPE_TO_BACKEND_MAP` 拿 `"mamba1"`/`"mamba2"` 这类字面量去查，现已删掉该映射表，改由 `get_mamba_attn_backend(mamba_type: MambaAttentionBackendEnum)` 直接调 `mamba_type.get_class()` 惰性导入（`vllm/v1/attention/selector.py`）。换句话说，§25.4 这套"枚举值即类路径 + `get_class()` 懒加载"的机制，现在把 Mamba 也纳了进来——合法后端类型从运行期字符串校验前移成了枚举类型级约束。
 
 把值改成"字符串"就解了这个套：用到哪个后端，才真正 import 哪个。这一步落在 `get_class()`（`vllm/v1/attention/backends/registry.py:L92`）：
 
@@ -504,7 +504,7 @@ def _cached_get_attn_backend(
             ]
 ```
 
-这就是"平台最优"的体现：Blackwell（`major == 10`，sm100）把 FlashInfer 提到第一；Hopper 及以下（普通非 MLA decoder）默认 FlashAttention 优先、其次 FlashInfer、再 Triton。原因在于 FlashInfer 较早为 sm100 的 wgmma 指令做了专项适配，而 FlashAttention 对 Blackwell 的支持引入更晚；Hopper（sm90）上二者性能接近，但 FlashAttention 在 vLLM 里集成更早、测试覆盖更广，故仍排在前。
+这就是"平台最优"的体现：Blackwell（`major == 10`，sm100）把 FlashInfer 提到第一；Hopper 及以下（普通非 MLA decoder）默认 FlashAttention 优先、其次 FlashInfer、再 Triton。原因在于 FlashInfer 较早为 sm100 的 wgmma（warpgroup 级矩阵乘累加指令，Hopper/Blackwell 上新增的底层矩阵乘指令）做了专项适配，而 FlashAttention 对 Blackwell 的支持引入更晚；Hopper（sm90）上二者性能接近，但 FlashAttention 在 vLLM 里集成更早、测试覆盖更广，故仍排在前。
 
 **选后端贵不贵？** 一点都不贵。`validate_configuration` 对优先级列表里 $O(B)$ 个候选（$B$ = 后端数），各做常数次探针检查，全是 Python 端常数级别；而且整条链被 `@cache` 摊销到每模型只算一次。它根本不在前向热路径上。精简版正好复现了 Hopper 默认选 FlashAttention、以及显式指定不合法后端直接报错这两条路：
 
@@ -590,7 +590,7 @@ class CommonAttentionMetadata:
         causal = common_attn_metadata.causal
 ```
 
-中段省略的是 FA 特有的活：AOT scheduler 算 `scheduler_metadata`、cascade（共享前缀加速）、DCP（解码上下文并行）三条分支。标准 decoder 不走这些，它们都被精简掉了，主路径数值不变。重点在结尾的装配落点（`vllm/v1/attention/backends/flash_attn.py:L560`）：
+中段省略的是 FA 特有的活：AOT（Ahead-Of-Time，提前）scheduler 预先算好 `scheduler_metadata`、cascade（共享前缀加速）、DCP（解码上下文并行）三条分支。标准 decoder 不走这些，它们都被精简掉了，主路径数值不变。重点在结尾的装配落点（`vllm/v1/attention/backends/flash_attn.py:L560`）：
 
 ```python
 # vllm/v1/attention/backends/flash_attn.py:L560
@@ -831,7 +831,7 @@ assert torch.count_nonzero(key_cache[0, 1]) == 0  # slot -1 的 token 没写，�
 
 又是 `kv_cache.unbind(0)` 拆出 `key_cache` / `value_cache`，然后 `flash_attn_varlen_func` 上场。关键参数是 `block_table=block_table`——它就是从 metadata 里取出的、每请求的逻辑块号表。kernel 顺着这张表，把该请求散落在各物理块里的历史 KV 读出来，再按 `seq_lens` 决定每请求读多少个 token，与 `query` 算 causal 注意力，结果写进 `output`。这是 PagedAttention 的"读"半边。
 
-> **v0.21.0 更新**：FlashAttention 后端（`vllm/v1/attention/backends/flash_attn.py`）在这一层有两处实现修正。其一是**版本决策收口**：`head_size > 256` 时在 SM90+ 由 FA3 升到 FA4 的判断，原先散落在 `FlashAttentionImpl` 构造里，现已统一迁入 `get_flash_attn_version()`——FA3↔FA4 的版本选择只剩这一个真相源，构造路径不再各自拍板。其二是 **KV 缓存退化 stride 规整**：`forward` 在 `kv_cache.unbind(0)` 取出 `key_cache`/`value_cache` 后，对二者调一次 `canonicalize_singleton_dim_strides(...)`。原因是当 `num_kv_heads = 1` 配合 TP 时，size-1 的头维会产生退化 stride，而 H100+ 上 FA3/FA4 走 TMA 要求 ≥16 字节的 stride 对齐，否则触发 `cudaErrorIllegalInstruction`；写缓存（scatter）那条路不走 TMA，故无需规整。
+> **v0.21.0 更新**：FlashAttention 后端（`vllm/v1/attention/backends/flash_attn.py`）在这一层有两处实现修正。其一是**版本决策收口**：`head_size > 256` 时在 SM90+ 由 FA3 升到 FA4 的判断，原先散落在 `FlashAttentionImpl` 构造里，现已统一迁入 `get_flash_attn_version()`——FA3↔FA4 的版本选择只剩这一个真相源，构造路径不再各自拍板。其二是 **KV 缓存退化 stride 规整**：`forward` 在 `kv_cache.unbind(0)` 取出 `key_cache`/`value_cache` 后，对二者调一次 `canonicalize_singleton_dim_strides(...)`。原因是当 `num_kv_heads = 1` 配合 TP 时，size-1 的头维会产生退化 stride，而 H100+ 上 FA3/FA4 走 TMA（Tensor Memory Accelerator，Hopper 引入的硬件异步显存搬运单元）要求 ≥16 字节的 stride 对齐，否则触发 `cudaErrorIllegalInstruction`；写缓存（scatter）那条路不走 TMA，故无需规整。
 
 **读一个请求要走多少块？** 与该请求的历史长度 `seq_lens` 成线性。kernel 顺 `block_table` 走过的物理块数是
 
@@ -963,7 +963,7 @@ assert torch.allclose(out, ref, atol=1e-5)
     return attn_metadata, attn_layer, kv_cache, layer_slot_mapping
 ```
 
-这就是"取数"那头：`get_attention_context(layer_name)` 用 `layer_name` 当键，从全局 `forward_context` 里取出三样东西——本层的 `attn_metadata`（builder 在 [§25.8](#258-两层-metadata一份共享各自翻译) 翻译出来的那份）、`kv_cache`（绑定到本层的真实显存）、`slot_mapping`。`ForwardContext` 是一个全局线程局部对象（`vllm/forward_context.py`），由 [模型运行器那章](../../ch18-model-runner/narrative/chapter.md) 在每步 `execute_model` 开头构造、注入当步的 metadata 与 slot_mapping，然后以 `with set_forward_context(ctx)` 的形式挂到进程上下文里——进入 `forward` 后任何代码都能 `get_forward_context()` 拿到它。模型运行器那头按 `layer_name` 把这些装进 `forward_context`，后端这头按 `layer_name` 消费。一存一取，键对上了。
+这就是"取数"那头：`get_attention_context(layer_name)` 用 `layer_name` 当键，从全局 `forward_context` 里取出四样东西——本层的 `attn_metadata`（builder 在 [§25.8](#258-两层-metadata一份共享各自翻译) 翻译出来的那份）、`attn_layer`（[§25.10](#2510-按-layer_name-分发先写后算) 开头那个层对象本身，也就是 `forward_context.no_compile_layers[layer_name]`——它其实就是刚才 `compilation_config.static_forward_context[prefix] = self` 登记进去的那同一份注册表，运行时被 `forward_context` 接了过来，两个名字指的是同一张表）、`kv_cache`（绑定到本层的真实显存）、`slot_mapping`。`ForwardContext` 是一个全局线程局部对象（`vllm/forward_context.py`），由 [模型运行器那章](../../ch18-model-runner/narrative/chapter.md) 在每步 `execute_model` 开头构造、注入当步的 metadata 与 slot_mapping，然后以 `with set_forward_context(ctx)` 的形式挂到进程上下文里——进入 `forward` 后任何代码都能 `get_forward_context()` 拿到它。模型运行器那头按 `layer_name` 把这些装进 `forward_context`，后端这头按 `layer_name` 消费。一存一取，键对上了。
 
 两个算子各自经 `get_attention_context` 拿到本层料后，分头干活（`vllm/model_executor/layers/attention/attention.py:L663`）：
 

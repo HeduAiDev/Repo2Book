@@ -501,7 +501,7 @@ _patch_destroy_distributed_environment()
 三招对号入座：
 
 - **技法①（整类替换）**：`GroupCoordinatorPatch` 继承 `GroupCoordinator`，末行 `vllm.distributed.parallel_state.GroupCoordinator = GroupCoordinatorPatch` 把类名换掉。替换的核心动机，是子类新增了一个 `all_to_all` 方法——vLLM 原版 `GroupCoordinator` **根本没有这个方法**，而昇腾的 MoE 需要它。
-- **技法④（wrapper）**：`_wrap_destroy_distributed_environment` 用 `@wraps` 把原 `destroy_fn` 包一层，在原函数跑完后的 `finally` 里清 HCCL 进程组注册表。这里有个比 [§3.5](#35-from-import-缓存陷阱) 更讲究的细节——**幂等标记**：包好的函数被打上 `wrapped._hccl_registry_clearing_wrapped = True`；下次再调 `_wrap_destroy_distributed_environment`，开头那句 `if getattr(..., "_hccl_registry_clearing_wrapped", False): return destroy_fn` 会发现「这个已经包过了」，直接原样返回，**绝不二次包裹**。这正回应了 [§3.2](#platform-段触发点②子进程里的兜底回收-ch02-的伏笔) 的担忧：带状态的 wrapper 重复打就是 bug，所以它自己也得防重入。
+- **技法④（wrapper）**：`_wrap_destroy_distributed_environment` 用 `@wraps` 把原 `destroy_fn` 包一层，在原函数跑完后的 `finally` 里清 HCCL（昇腾集合通信库，NCCL 在昇腾上的对应实现，详见[第 6 章](../../ch06-npu-communicator/narrative/chapter.md)）进程组注册表。这里有个比 [§3.5](#35-from-import-缓存陷阱) 更讲究的细节——**幂等标记**：包好的函数被打上 `wrapped._hccl_registry_clearing_wrapped = True`；下次再调 `_wrap_destroy_distributed_environment`，开头那句 `if getattr(..., "_hccl_registry_clearing_wrapped", False): return destroy_fn` 会发现「这个已经包过了」，直接原样返回，**绝不二次包裹**。这正回应了 [§3.2](#platform-段触发点②子进程里的兜底回收-ch02-的伏笔) 的担忧：带状态的 wrapper 重复打就是 bug，所以它自己也得防重入。
 - **技法⑤（双绑）**：`_patch_destroy_distributed_environment` 把同一个 `destroy_fn` 同时绑到 `parallel_state.destroy_distributed_environment` 和再导出别名 `vllm.distributed.destroy_distributed_environment` 两个名字上——又是一次堵 from-import 缓存陷阱的双绑。
 
 精简版把三招连同那个幂等标记一起验证了，其中最值得看的是「再包一次会被挡回」这条：

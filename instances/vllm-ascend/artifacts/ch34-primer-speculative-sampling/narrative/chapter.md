@@ -425,7 +425,7 @@ $$
 
 这里有条支撑串行因果链的不变量：取模路由是良定义的——`spec_step_idx % num_mtp_layers` 对任意 `spec_step_idx` 都恰好落到 `0 … num_mtp_layers-1` 里唯一一个深度层，$\gamma$ 步依次路由、不重不漏，保证 Eq.22-23 的因果链一层都不断档。第一节说的自回归串行瓶颈——第 $t$ 步必须等前 $t-1$ 步落地——在这里有了具体的代码影子：`spec_step_idx` 每次只能加一，逐步路由到下一个深度，草稿本身也是一条串行链，只是链条搭在小模型上、代价远低于大模型的串行前向。
 
-`embed_tokens` 与 `shared_head` 都复用主模型权重（`load_weights` 做名字重写，把 checkpoint 里 `mtp.0.*` 映射到 `model.layers.0.mtp_block.*`）——这正是 Eq.21/23 说的共享 Emb 与 OutHead。顶层 `DeepSeekV4MTP` 吃主模型上一步的 `hidden_states`，串行跑 $\gamma$ 个深度产出 $\gamma$ 个 draft token，然后交给验证侧。它是 [第 35 章](../../ch35-speculative-decode-npu/narrative/chapter.md) 那个 proposer 工厂分发出来的 eagle / mtp 类落地对象之一——那个工厂负责在推理时按模型类型选出 proposer（EAGLE 还是 MTP）并调度验证，是纯工程装配；本章不重复它，只补上选中 MTP 之后「为什么这么长」的数学依据。工厂怎么装配、怎么调度，看第 35 章。
+`embed_tokens` 与 `shared_head` 都复用主模型权重（`load_weights` 做名字重写，把 checkpoint 里 `mtp.0.*` 映射到 `model.layers.0.mtp_block.*`）——这正是 Eq.21/23 说的共享 Emb 与 OutHead。顶层 `DeepSeekV4MTP` 吃主模型上一步的 `hidden_states`，串行跑 $\gamma$ 个深度产出 $\gamma$ 个 draft token，然后交给验证侧。它是 [第 35 章](../../ch35-speculative-decode-npu/narrative/chapter.md) 那个 proposer 工厂分发出来的 eagle / mtp 类落地对象之一——那个工厂负责在推理时按模型类型选出 proposer——EAGLE（另一种草稿 proposer，用小模型对目标模型隐藏状态特征的外推做草稿，而非 MTP 这种训练期就有的多头预测，实现方式不同，但同样扮演 $M_q$ 的角色）还是 MTP——并调度验证，是纯工程装配；本章不重复它，只补上选中 MTP 之后「为什么这么长」的数学依据。工厂怎么装配、怎么调度，看第 35 章。
 
 ### 验证侧：接受判定与残差重采样的向量化实现
 

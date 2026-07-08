@@ -773,7 +773,7 @@ def full_graph_pa(
 
 主路径讲完了。`attention_v1.py` 里还住着一个血缘很近的子类，值得点一句名：`AscendC8AttentionBackendImpl`。
 
-它是 `AscendAttentionBackendImpl` 的 INT8 KV 量化（C8 / QuaRot）子类。把 K/V 量化成 INT8 写进 NZ 排布的 5 维分页 cache（`npu_scatter_pa_kv_cache`），decode 走 FIA V1 的 BNSD 布局加 per-channel 反量化，prefill 则 gather 后再 dequant。一句话：用精度换显存与带宽，KV cache 直接砍到四分之一。
+它是 `AscendAttentionBackendImpl` 的 INT8 KV 量化（C8 / QuaRot）子类。把 K/V 量化成 INT8 写进 NZ 排布的 5 维分页 cache（`npu_scatter_pa_kv_cache`），decode 走 FIA V1 的 BNSD 布局加 per-channel 反量化，prefill 则 gather 后再 dequant。一句话：用精度换显存与带宽，KV cache 直接砍到四分之一。per-channel 反量化背后 scale/zero-point 那套量化数学，见[第 31 章](../../ch31-primer-quantization/narrative/chapter.md)。
 
 但它**不在标准 MHA 主路径上**——要经 `kv_c8.py` 的类替换（class surgery）手术才激活。本章把它当减法候选：知道它存在、知道它在哪、知道它解决什么问题就够了，不展开。真要读，它是上面这套五态机 + 双算子路径的「量化变奏」，骨架完全一致。
 

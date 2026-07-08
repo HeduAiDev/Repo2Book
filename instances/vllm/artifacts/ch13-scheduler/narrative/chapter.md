@@ -14,7 +14,7 @@
 
 - **§13.1** 「不分相」到底是什么意思：`num_computed_tokens` 追赶 `num_tokens_with_spec` 这一条公式如何吃下 prefill、decode、chunked prefill、prefix caching；
 - **§13.2** token 预算：为什么连续批处理的「批大小」是 token 数而不是请求数，`token_budget` 怎么跨两阶段递减；
-- **§13.3** 阶段一调度 RUNNING：追赶公式、`allocate_slots` 失败时的 FCFS 抢占；
+- **§13.3** 阶段一调度 RUNNING：追赶公式、`allocate_slots` 失败时的 FCFS（先来先服务，First-Come-First-Served）抢占；
 - **§13.4** 阶段二调度 WAITING：`if not preempted_reqs` 守卫、chunked prefill 的截断；
 - **§13.5** `SchedulerOutput` 的二分：首次发 `NewRequestData`（全量）、后续发 `CachedRequestData`（增量）；
 - **§13.6** `update_from_output()`：反馈环的另一半，追加 token、判 stop、释放；
@@ -74,7 +74,7 @@ def schedule(self) -> SchedulerOutput:
 「There's no decoding phase nor prefill phase in the scheduler.」——调度器里没有解码相，也没有预填相。每个请求身上只挂两个标量：
 
 - `num_computed_tokens`：**已经算过**的 token 数（KV cache 里已经有它们的 key/value）；
-- `num_tokens_with_spec`：**总共要算**的 token 数，等于 `len(prompt) + len(output) + len(spec)`——prompt 长度 + 已经生成的输出长度 + 这一拍的草稿 token 数。
+- `num_tokens_with_spec`：**总共要算**的 token 数，等于 `len(prompt) + len(output) + len(spec)`——prompt 长度 + 已经生成的输出长度 + 这一拍的草稿 token 数（投机解码：一个更小的草稿模型先提议若干候选 token，目标模型一次前向验证、只接受其中一部分，完整的接受准则与分布等价性推导见 [第 31 章 §31.5](../../ch31-spec-decode/narrative/chapter.md)；本章只需知道它会往这个总数里叠加若干「草稿 token」）。
 
 每一拍，调度器干的事就一句话：**尽量让 `num_computed_tokens` 追上 `num_tokens_with_spec`。**
 
@@ -323,6 +323,8 @@ RUNNING 都伺候完、预算还有剩，才轮到 WAITING 队列里的新请求
 `if not preempted_reqs`——**只要这一拍发生过抢占，就完全不调度 WAITING。** 这个守卫看似保守，其实是对的：抢占刚刚释放了一些 KV 块，如果立刻让新请求把这些块占走，那被抢占的请求就更难恢复了，会陷入「抢占→新请求占内存→被抢者还是回不来→再抢占」的抖动。所以一旦抖动的苗头出现（发生抢占），这一拍就别再火上浇油了，只管把在途请求推进，等下一拍内存宽裕些再说。
 
 守卫里还有两个边界：`UNPAUSED`（暂停状态不接新请求）和 `len(self.running) == self.max_num_running_reqs`（在途请求数到顶，不再接——这是并发请求数的硬上限，区别于 token 预算）。
+
+`self.skipped_waiting` 是 `self.waiting` 之外的一条旁路队列：本拍暂时分不到 token/块的请求会被挪出主队列、放进这里，避免它卡在队首反复挡住后面本可调度的请求；`_select_waiting_queue_for_scheduling` 就是在 `self.waiting` 和 `self.skipped_waiting` 之间轮询、挑出这一次该看哪个队列的队首。
 
 进入循环后，`peek_request` 先看一眼队首请求（还不弹出）。然后算它要调度多少 token。和 RUNNING 阶段不同，新请求得先查**前缀缓存命中**——如果它的 prompt 前缀已经在别处算过、KV 还在缓存里，那部分直接白嫖，计进 `num_computed_tokens`，不用重算。命中查询的细节属于下一章的 KV cache 管理器，这里只需知道：查完之后 `num_computed_tokens` 可能已经 > 0。然后算追赶公式的 WAITING 变体：
 

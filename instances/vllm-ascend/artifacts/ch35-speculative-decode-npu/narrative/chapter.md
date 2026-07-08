@@ -295,7 +295,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # … 省略：query_start_loc / arange 等缓冲、attn_mask_builder …
 ```
 
-`decode_threshold = 1 + self.num_speculative_tokens` 是个值得记住的上界：每个 decode 请求一步最多产出 1 个 bonus token 加 $k$ 个候选位，所以它单步的 query 最长就是这么多。这个上界后面落在 draft 前向那条路上——`_propose` 里给 `cad.max_query_len` 定值、给图捕获时的 block_table 缓冲切片定步长，让静态图按最坏长度预留空间。（它和稍后 [§35.7](#357-prepare_inputs按拒绝数把输入收缩回来) 的 `prepare_inputs` 是两回事：那里收缩 query 靠的是逐请求实测的拒绝数 `num_rejected_tokens`，而不是这个全局上界。）
+`decode_threshold = 1 + self.num_speculative_tokens` 是个值得记住的上界：每个 decode 请求一步最多产出 1 个 bonus token 加 $k$ 个候选位，所以它单步的 query 最长就是这么多。这个上界后面落在 draft 前向那条路上——`_propose` 里给 `cad.max_query_len` 定值、给图捕获时的 block_table 缓冲切片定步长，让静态图按最坏长度预留空间（`cad` 是下文 `_propose` 会接到的 `common_attn_metadata` 参数的简写，这里先剧透它的下游用法）。（它和稍后 [§35.7](#357-prepare_inputs按拒绝数把输入收缩回来) 的 `prepare_inputs` 是两回事：那里收缩 query 靠的是逐请求实测的拒绝数 `num_rejected_tokens`，而不是这个全局上界。）
 
 往下两处是昇腾接缝。第一处，draft 模型的并行组：
 
@@ -336,7 +336,7 @@ if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and 
     )
 ```
 
-默认情况下 `self._runnable` 就是普通函数 `self._run_merged_draft`（在 `__init__` 里赋的）。只有当编译配置开了 FULL graph，这里才把它替换成 `ACLGraphWrapper` 包裹版。draft 模型多步前向是投机解码的热路径，用 ACLGraph 捕获成静态图，能把每步的派发开销压掉。`_runnable` 这个分派点是骨架的关键——前向到底走普通函数还是图捕获版，全看这一处替没替。
+默认情况下 `self._runnable` 就是普通函数 `self._run_merged_draft`（在 `__init__` 里赋的）。只有当编译配置开了 FULL graph，这里才把它替换成 `ACLGraphWrapper` 包裹版，随手把 `enable_enpu`（ENPU：昇腾的软切分模式，[第 16 章](../../ch16-single-step-forward-context-dp-sync/narrative/chapter.md)已建立）原样透传进去，图捕获版 draft 前向也要遵守同一条软切分约束。draft 模型多步前向是投机解码的热路径，用 ACLGraph 捕获成静态图，能把每步的派发开销压掉。`_runnable` 这个分派点是骨架的关键——前向到底走普通函数还是图捕获版，全看这一处替没替。
 
 最后是真正提议一步的 `_propose`，我们只看它的开头骨架：
 

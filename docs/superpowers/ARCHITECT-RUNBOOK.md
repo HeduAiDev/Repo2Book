@@ -160,7 +160,7 @@ jq -r '.overall_verdict' $D/reviews/review-report.json
 ## 复盘发车(book-retro,经验回流)
 
 批次/Part 收尾时:`Workflow({name:"book-retro", args:{instance, chapters:[slug]|null, date:"YYYY-MM-DD"}})`
-→ 报告在 `instances/<x>/book/retro/`。Lead 逐条批(改落点/措辞/驳回)→ 派 curator(.claude/agents/curator.md)
+→ 报告在 `instances/<x>/book/retro/`。**报告落盘由 Lead 用 python 从 workflow 返回值/journal 写入**（勿再让 agent 转写长 JSON——曾系统性打碎转义）。Lead 逐条批(改落点/措辞/驳回)→ 派 curator(.claude/agents/curator.md)
 按批准清单落笔 → 台账 `docs/superpowers/experience-ledger.md` 自动追加。
 linter 类候选:curator 产 SDD 简报,Lead 另走 TDD 小任务。
 复发判定:retro 对照台账,active 条目 pattern 再现 = 沉淀无效 → 升级落点(契约→linter)。

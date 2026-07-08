@@ -381,7 +381,7 @@ else:
 
 - **`gate`**：一个小线性层，把 `hidden` 投到 `n_routed_experts` 维，输出每个专家的打分（router logits）。它决定每个 token 该去哪几个专家。
 - **`shared_experts`**：注意它的类型是 `DeepseekV4MLP`——就是一条普通的 SwiGLU MLP，**结构和 `LlamaMLP` 同构**。它不参与路由，每个 token 都走。
-- **路由的两种打分模式**：`tid2eid`（hash-MoE，用 `input_ids` 直接查表定专家，所以 §27.1 那个 `input_ids` 参数派上了用场）或 `e_score_correction_bias`（noaux_tc 打分的修正偏置）。hash-MoE 是 V4 特有的一类层，这里点名不深挖。
+- **路由的两种打分模式**：`tid2eid`（hash-MoE，用 `input_ids` 直接查表定专家，所以 §27.1 那个 `input_ids` 参数派上了用场）或 `e_score_correction_bias`（noaux_tc 打分的修正偏置——noaux_tc 即 DeepSeek-V3（arXiv:2412.19437）提出的免辅助损失负载均衡方案：不再靠额外的负载均衡 loss 项，而是给每个专家维护一个可学习/可更新的偏置去修正打分，让路由自然趋于均衡）。hash-MoE 是 V4 特有的一类层，这里点名不深挖。
 
 `shared_experts` 是理解「MoE 对 dense 的 delta」的钥匙。MoE 不是把 dense MLP 一刀切掉换成稀疏路由——它**保留了一条每 token 必走的 dense 路径**。路由专家负责「专才」，共享专家负责「通才」，托住所有 token 的基础能力。所以 V4 的 FFN 准确说是：**稀疏路由专家 + 一条共享 dense**，而不是纯稀疏。这正好回收了第 22 章那条 `LlamaMLP`——它没消失，它变成了 MoE 里的共享专家。
 
@@ -442,7 +442,7 @@ V4 的专家计算有两条后端，由 `use_mega_moe` 分叉：
 > *MegaMoE 把全部专家塞进一个 DeepGEMM 算子（EP / FP4 / SM100）；FusedMoE 走张量并行。*
 > *`shared_experts` 那条 dense 始终并行走；两路聚合它的位置不同——mega 在外相加，TP 在 FusedMoE 内部。*
 
-**MegaMoE 路径**（开了 expert parallel + DeepGEMM 后端）把所有路由专家的计算塞进**一个**自定义算子（DeepGEMM 是 DeepSeek 开源的低比特矩阵乘内核库，专为 FP4/FP8 精度和 Hopper/Blackwell SM100 架构优化，能在单次 kernel launch 内处理全部专家的 GEMM），`vllm/model_executor/models/deepseek_v4.py`：
+**MegaMoE 路径**（开了 expert parallel + DeepGEMM 后端）把所有路由专家的计算塞进**一个**自定义算子（DeepGEMM 是 DeepSeek 开源的低比特矩阵乘内核库，专为 FP4/FP8 精度和 Hopper/Blackwell SM100 架构优化，能在单次 kernel launch 内处理全部专家的 GEMM）。EP（expert parallel，专家并行）是按专家切——不同 rank 各常驻一部分专家，请求路由到哪个专家就把 token 发到哪个 rank，区别于第 20 章按 head/列切的 TP、按请求切的 DP。`vllm/model_executor/models/deepseek_v4.py`：
 
 ```python
 # vllm/model_executor/models/deepseek_v4.py:L602
@@ -470,7 +470,7 @@ def forward(
 
 这就是算子边界。注意这里**没有 for 循环逐个跑专家**——一个 `torch.ops.vllm.deepseek_v4_mega_moe_experts` 调用，DeepGEMM 在 kernel 内部把全部专家一次算完（需要对称缓冲、FP4/FP8 权重、SM100 硬件）。它的内部 scale 布局、staging kernel 是 DeepGEMM/FusedMoE 专章的事，本章只读到这条算子边界，知道「单 kernel 全专家」这个事实即可。
 
-**FusedMoE 路径**（`_forward_fused_moe`，没开 EP 时）走张量并行的 `FusedMoE`，它内部就把 `shared_experts` 一起聚合了。所以两条后端有个微妙差异：mega 路径在 forward 里**外部**手动 `+= shared_output`（上面那行），TP 路径则在 `FusedMoE` **内部**聚合。聚合的位置不同，但语义一致——路由 + 共享。FusedMoE 后端的细节，留给后面讲 FusedMoE/专家并行的章。
+**FusedMoE 路径**（`_forward_fused_moe`，没开 EP 时）走张量并行的 `FusedMoE`，它内部就把 `shared_experts` 一起聚合了。所以两条后端有个微妙差异：mega 路径在 forward 里**外部**手动 `+= shared_output`（上面那行），TP 路径则在 `FusedMoE` **内部**聚合。聚合的位置不同，但语义一致——路由 + 共享。FusedMoE 后端的细节本章不深挖；专家并行的扩缩容协调见[第 36 章的弹性专家并行](../../ch36-engine-core/narrative/chapter.md)。
 
 FFN delta 讲完。第三摞 delta 在残差里，是 V4 最不像 Llama 的地方。
 
@@ -515,7 +515,7 @@ return hidden_states
 
 关键就第二行：`hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)`。embedding 出来本是 `[T, hidden]`，这里 unsqueeze 加一维、repeat 成 `[T, hc_mult, hidden]`——**一条流复制成 `hc_mult` 条平行残差流**，一起穿过所有层。
 
-回头看 §27.1 那个 `DeepseekV4DecoderLayer.forward`：每层用 `hc_pre`（前处理）和 `hc_post`（后处理）包住 attn 和 ffn。`hc_pre` 返回三元组 `(x, post, comb)`——`x` 是本段（attn 或 ffn）的输入张量，`post` 和 `comb` 是 `hc_pre` 内部学习的门控信息（混合系数与残差组合参数），被原封不动传给 `hc_post`，让 `hc_post` 知道该如何把本段的输出写回多条残差流。Llama 的 layernorm 是固定的「加回上一段输出」，而 hc 在 `hc_mult` 条流之间做**学习式的门控混合**——`hc_attn_fn`/`hc_attn_scale`/`hc_attn_base` 这些都是可学习参数。这套混合的内核（`torch.ops.vllm.mhc_pre`/`mhc_post`，含 Sinkhorn 归一）是 GPU-only 的，本章只读它在残差骨架里的位置——它**取代了 Llama 的 `input_layernorm`/`post_attention_layernorm`**。
+回头看 §27.1 那个 `DeepseekV4DecoderLayer.forward`：每层用 `hc_pre`（前处理）和 `hc_post`（后处理）包住 attn 和 ffn。`hc_pre` 返回三元组 `(x, post, comb)`——`x` 是本段（attn 或 ffn）的输入张量，`post` 和 `comb` 是 `hc_pre` 内部学习的门控信息（混合系数与残差组合参数），被原封不动传给 `hc_post`，让 `hc_post` 知道该如何把本段的输出写回多条残差流。Llama 的 layernorm 是固定的「加回上一段输出」，而 hc 在 `hc_mult` 条流之间做**学习式的门控混合**——`hc_attn_fn`/`hc_attn_scale`/`hc_attn_base` 这些都是可学习参数。这套混合的内核（`torch.ops.vllm.mhc_pre`/`mhc_post`，含 Sinkhorn 归一——一种反复对矩阵的行、列交替做归一化、使其收敛为「每行每列都和为 1」的双随机矩阵的迭代算法，这里用来让 `hc_mult` 条流之间的门控权重更均衡，和下面 §27.4.2 `hc_head` 用的 sigmoid 门控是两种不同的混合算法）是 GPU-only 的，本章只读它在残差骨架里的位置——它**取代了 Llama 的 `input_layernorm`/`post_attention_layernorm`**。
 
 直觉上，Llama 的 add-norm 是「一条信息高速路，每层上下匝道」；hc 是「`hc_mult` 条平行车道，每层之间可以学习着变道、并道」。表达力更强，代价是 hidden 翻了 `hc_mult` 倍的显存和算力——典型的「容量换资源」。
 
@@ -698,7 +698,7 @@ elif "attn_sink" in name:
 
 2. **专家走 `expert_mapping` 多副本装载**：一个 checkpoint 里的专家权重名要映射到模型里切好的多个专家参数上，靠 `weight_loader` 带着 `expert_id`/`shard_id` 装。
 
-3. **`attn_sink` 按 TP head 区间切**：V4 注意力的 sink 参数（padded 到 head 数、初始化 -inf）要按当前 rank 负责的 head 区间 `[head_rank_start:head_rank_end]` narrow 后装入。
+3. **`attn_sink` 按 TP head 区间切**：sink 是每个注意力 head 挂的一个可学习标量，相当于给 softmax 分母里多塞一项「不指向任何 token」的项，用来稳定长序列下的注意力分布；初始化成 -inf 是因为它要过 softmax 的指数变换，-inf 对应初始贡献为 0，训练中再学出实际大小。V4 注意力的 sink 参数（padded 到 head 数、初始化 -inf）要按当前 rank 负责的 head 区间 `[head_rank_start:head_rank_end]` narrow 后装入。
 
 这三个特例就是 Llama 装载逻辑里没有的东西。`DeepseekV4FP8Config` 还会按 `expert_dtype` 惰性解析专家用 MXFP4 还是块 FP8，决定 scale 是 e8m0 还是 float32——配置层的分发样板这里不展开，记住「V4 强制量化、专家可 4-bit、scale 字节得原样搬」即可。
 

@@ -298,7 +298,7 @@ class EngineArgs:
 - `instance_id = f"{time.time_ns()}"` —— 给这次运行一个唯一名字（profiler 用）。
 - `try_verify_and_update_config()` —— 按模型架构做特定改写（有些模型需要调整配置，HF 驱动）。
 - `model_config.verify_with_parallel_config(...)` —— **交叉校验**：比如 TP size 必须能整除注意力头数，不满足就报错。
-- `parallel_config.is_moe_model = self.model_config.is_moe` —— **子配置间补全**：`ParallelConfig` 自己不知道模型是不是 MoE，从 `model_config` 抄过来。
+- `parallel_config.is_moe_model = self.model_config.is_moe` —— **子配置间补全**：`ParallelConfig` 自己不知道模型是不是 MoE（Mixture-of-Experts，混合专家模型），从 `model_config` 抄过来。
 - 最后推导量化配置（缺省时从模型元数据读）。
 
 这些是「热身」。`__post_init__` 还是一切「跨子配置硬约束」的兜底落地点——单看某一个子配置都合法、凑在一起才知道不行的组合，校验就集中写在这里。v0.21.0 又往这里补了两道这样的闸门，正好是这个模式的典型例证：
@@ -450,7 +450,7 @@ class EngineArgs:
             self.distributed_executor_backend = "uni"
 ```
 
-这段就是「单卡为什么默认 `uni`、多卡为什么默认 `mp`」的来历。`world_size = TP × PP`（单 DP 路径下），逻辑是：
+这段就是「单卡为什么默认 `uni`、多卡为什么默认 `mp`」的来历。`world_size = TP × PP`（`PP` 即流水线并行度，pipeline-parallel-size；这里限定的是「单 DP 路径」——`DP` 即数据并行，[3.8 节](#38-第二级映射之三ipc-客户端工厂-make_client) 详细展开），逻辑是：
 
 - `world_size == 1`（单卡单进程）→ `"uni"`（uniproc，就在本进程跑，不起子进程）；
 - `world_size > 1` 且能放进本节点 → `"mp"`（multiproc，每个 rank 一个子进程）；
@@ -592,10 +592,12 @@ class OptimizationLevel(IntEnum):
     """O3: Currently the same as -O2s."""
 ```
 
+在往下看对照表之前，先把反复出现的 CUDA Graph 这个词钉住：它是把一段 GPU kernel 调用序列录制下来、之后整体重放，省掉逐条 launch 的 CPU 开销；full 模式抓整个前向图，piecewise 模式只抓可静态化的子图（用来兼容动态 shape 分支）。
+
 它是个「启动时间 vs 运行性能」的单调旋钮：
 
 - **O0**：什么都不开，立刻启动。适合快速迭代、调试——你不想每改一行代码就等 `torch.compile` 编译几分钟。
-- **O1**：开 Dynamo+Inductor 编译 + Piecewise cudagraph。快速优化。
+- **O1**：开 Dynamo+Inductor（Dynamo 负责图捕获，Inductor 负责代码生成，两者合起来就是 `torch.compile`）编译 + Piecewise cudagraph。快速优化。
 - **O2**（**默认**）：O1 的基础上再开 Full & Piecewise cudagraph。生产环境用这个。
 - **O3**：当前等同 O2（给未来预留）。
 

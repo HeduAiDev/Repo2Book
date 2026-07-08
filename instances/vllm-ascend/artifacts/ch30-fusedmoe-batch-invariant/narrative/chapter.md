@@ -676,7 +676,7 @@ float32 是同一回事，只是位数更多。举个极端例子：取 $a = 2^{
 
 - 矩阵乘的 $K$ 维累加，会按硬件把 $K$ 切成若干块分别累加——分块方式若随 $M$（batch 那一维）变化，累加顺序就变了；
 - 集合通信（all-reduce）的归约顺序，默认实现不保证确定；
-- TF32 之类的低精度累加引入额外抖动。
+- TF32（一种降尾数精度换算力的矩阵乘累加格式，能省算力但引入舍入抖动）之类的低精度累加引入额外抖动。
 
 要让「$x_i$ 在 batch A 中的输出」严格等于「$x_i$ 在 batch B 中的输出」，需要让每个输出元素的归约顺序**只与该元素自身的 $K$/$N$ 维有关，与 batch 维 $M$ 怎么切分无关**。昇腾用两步合力做到（这两步都由启动期的总开关 `init_batch_invariance` 调用，本节末会看到）：
 
@@ -725,7 +725,7 @@ def enable_batch_invariant_mode():
 
 **第一步 `override_envs_for_invariance`——关掉漂移源**：`weight_nz_mode=0` 关 NZ 权重重排（不同排布会改变累加分块）；`enable_matmul_allreduce=False` 关 matmul-allreduce 融合；`HCCL_DETERMINISTIC="strict"` 和 `LCCL_DETERMINISTIC="1"` 强制集合通信走确定性 reduce 顺序（HCCL = 华为集合通信库 Huawei Collective Communication Library，LCCL 是其轻量版；非确定模式下各卡的归约执行顺序会浮动、从而改变 all-reduce 的累加结果，strict 模式把这个顺序钉死）。
 
-**第二步 `enable_batch_invariant_mode`——替换算子**：用 `torch.library.Library("aten", "IMPL")` 在 NPU 后端把 `aten::mm / matmul / addmm / bmm / softmax / sum` 整体替换成「固定分块、reduce 顺序固定」的 batch-invariant 实现（有 AscendC kernel 就优先用、否则回退 triton）。注意最后三行——`torch.sum`、`torch_npu.npu_add_rms_norm` 这类**不走 aten dispatch** 的函数，没法用 Library 拦，就直接猴补（monkey-patch）函数指针。
+**第二步 `enable_batch_invariant_mode`——替换算子**：`torch.library.Library("aten", "IMPL")` 正是[第 28 章](../../ch28-torch-library-and-meta/narrative/chapter.md)讲过的那套算子注册总线——这里同一套 API 不是拿来注册新算子，而是拿来**覆盖**既有 aten 实现。它在 NPU 后端把 `aten::mm / matmul / addmm / bmm / softmax / sum` 整体替换成「固定分块、reduce 顺序固定」的 batch-invariant 实现（有 AscendC kernel 就优先用、否则回退 triton）。注意最后三行——`torch.sum`、`torch_npu.npu_add_rms_norm` 这类**不走 aten dispatch** 的函数，没法用 Library 拦，就直接猴补（monkey-patch）函数指针。
 
 ![batch-invariant：两步消除批内非确定性](../diagrams/fig26-4-batchinvariant.png)
 
@@ -807,4 +807,4 @@ batch-invariant 则是昇腾对「可复现推理」的额外承诺：关掉非�
 
 和前几章一样，本章这套控制流有一半能在 host 上钉死、不必上卡。`setup_moe_comm_method` 那张 `_MoECommMethods` 三选一注册表、`select_moe_comm_method` 按 token 数/soc/EP 选枚举的分流、token 重分发里 `input_splits / output_splits` 的形状代数（那张 `6/3/4/3` 落卡表的算法）、以及 batch-invariant 两步里 env/config 覆盖与 `torch.library` 算子替换分支——都是纯 Python，精简版在 host 上跑一遍就能验证选路与簿记是否正确。真正只能上 NPU 的，是 MC2 / all_to_all 的跨卡通信、`dispatch_ffn_combine` 融合算子、以及那些 triton / AscendC kernel 内部的逐位累加——它们的数值需要真实硬件才看得到。
 
-Part VI 到此收官。从第 27 章的注册表总开关，到第 28 章的 torch.library 算子注册、第 29 章的 ACLGraph 编译，再到本章最复杂算子的顶替——算子与编译层这条线，立在同一套「换头不换身」的骨架上。接下来进入 Part VII，看量化、采样、投机与模型适配怎么在这套地基上长出来。
+Part VI 到此收官。从第 27 章的注册表总开关，到[第 28 章](../../ch28-torch-library-and-meta/narrative/chapter.md)的 torch.library 算子注册、第 29 章的 ACLGraph 编译，再到本章最复杂算子的顶替——算子与编译层这条线，立在同一套「换头不换身」的骨架上。接下来进入 Part VII，看量化、采样、投机与模型适配怎么在这套地基上长出来。

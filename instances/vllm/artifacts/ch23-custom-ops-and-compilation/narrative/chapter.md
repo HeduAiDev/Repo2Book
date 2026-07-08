@@ -669,7 +669,7 @@ for name, mod in split_gm.named_children():
 
 「非切分子图才建 backend、才包 CUDA graph；attention 子图保持 eager」——和真实控制流一处不差。
 
-> **v0.21.0 更新**：[§23.3](#233-rmsnorm一个-customop-长什么样) 提到的 `ir.ops.fused_add_rms_norm.maybe_inplace`，它的「下半场」就落在这条编译管线上。`vllm.ir` 把带就地（in-place）语义的算子先以**函数式**形态喂给 Inductor（避免 in-place 写法干扰图追踪），再由一道 **pre-grad pass** 在编译期把它还原成就地写。这道 pass 就是 v0.21.0 新增的 `VllmIRInplaceFunctionalizationPass`：`VllmBackend.configure_post_pass`（`vllm/compilation/backends.py`）在配置 post-grad pass manager 的同时，把它注册为 Inductor 的 `pre_grad_custom_pass`，并刻意把这个 key 加入缓存忽略前缀——它不该参与编译缓存键的计算。同一区间里，codegen 侧的 `generate_execution_code(...)` 返回值也从二元组扩成**三元组**（新增 `consts`），缓存路径同步带上 `consts=consts`。这些都不改本章 `split_graph → 逐段编译 → 包 CUDA graph` 的主骨架，只是在「送进 Inductor 之前」多了一道 IR 就地函数化的工序。
+> **v0.21.0 更新**：[§23.3](#233-rmsnorm一个-customop-长什么样) 提到的 `ir.ops.fused_add_rms_norm.maybe_inplace`，它的「下半场」就落在这条编译管线上。`vllm.ir` 把带就地（in-place）语义的算子先以**函数式**形态喂给 Inductor（避免 in-place 写法干扰图追踪），再由一道 **pre-grad pass** 在编译期把它还原成就地写（Inductor 把编译流程切成两段 pass：pre-grad pass 跑在图交给 autograd 之前，post-grad pass 跑在图降层之后——两者都挂在同一个 pass manager 上，只是介入的时机不同）。这道 pass 就是 v0.21.0 新增的 `VllmIRInplaceFunctionalizationPass`：`VllmBackend.configure_post_pass`（`vllm/compilation/backends.py`）在配置 post-grad pass manager 的同时，把它注册为 Inductor 的 `pre_grad_custom_pass`，并刻意把这个 key 加入缓存忽略前缀——它不该参与编译缓存键的计算。同一区间里，codegen 侧的 `generate_execution_code(...)` 返回值也从二元组扩成**三元组**（新增 `consts`），缓存路径同步带上 `consts=consts`。这些都不改本章 `split_graph → 逐段编译 → 包 CUDA graph` 的主骨架，只是在「送进 Inductor 之前」多了一道 IR 就地函数化的工序。
 
 ## 23.8 还债：attention 算子怎么进 torch.compile 图
 

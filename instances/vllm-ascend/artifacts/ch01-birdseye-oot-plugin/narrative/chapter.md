@@ -200,7 +200,7 @@ class NPUPlatform(Platform):
 
 两点值得停一下。
 
-第一，`_enum = PlatformEnum.OOT` 是昇腾的「树外」身份证——正是它让上面那段 `resolve_*` 把 NPUPlatform 归进 `activated_oot_plugins` 并优先选中。紧接着一批类属性（`device_name` / `dispatch_key` / `device_control_env_var`…）是一次**身份替换**：把 vLLM 眼里的「设备」整套换成昇腾口径（比如可见设备的环境变量从 `CUDA_VISIBLE_DEVICES` 换成 `ASCEND_RT_VISIBLE_DEVICES`）。
+第一，`_enum = PlatformEnum.OOT` 是昇腾的「树外」身份证——正是它让上面那段 `resolve_*` 把 NPUPlatform 归进 `activated_oot_plugins` 并优先选中。紧接着一批类属性（`device_name` / `dispatch_key` / `device_control_env_var`…）是一次**身份替换**：把 vLLM 眼里的「设备」整套换成昇腾口径（比如可见设备的环境变量从 `CUDA_VISIBLE_DEVICES` 换成 `ASCEND_RT_VISIBLE_DEVICES`）。其中 `dispatch_key`（派发键）取值 `"PrivateUse1"`，是 PyTorch 给第三方/树外设备后端预留的通用 dispatch key——昇腾复用它把算子调用路由到自己的 kernel，这个字符串本身与设备型号无关，只是一把公用的「路由钥匙」。
 
 第二，`pre_register_and_update` 是平台被选定后 vLLM 回调的**第一个钩子**——昇腾在这里第一次打补丁（`adapt_patch(is_global_patch=True)`）。支柱二和支柱三就在这一行接上头，[§1.4](#14-支柱三改不动的地方两段式打补丁monkey-patch) 接着说。
 
@@ -211,7 +211,7 @@ class NPUPlatform(Platform):
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, attn_selector_config, num_heads: int | None = None):
         use_compress = getattr(attn_selector_config, "use_compress", False)
-        # … 省略：先算出 key，再做 FA3 特判（命中则返回 fa3_v1.AscendFABackend）…
+        # … 省略：先算出 key，再做 FA3（FlashAttention 第 3 代实现）特判（命中则返回 fa3_v1.AscendFABackend）…
         backend_map = {
             (True, False, False): "vllm_ascend.attention.mla_v1.AscendMLABackend",
             (False, False, False): "vllm_ascend.attention.attention_v1.AscendAttentionBackend",
@@ -258,7 +258,7 @@ class NPUPlatform(Platform):
 
 ## 1.4 支柱三：改不动的地方，两段式打补丁（monkey-patch）
 
-工厂钩子很优雅，但有个前提：vLLM 得**预留了钩子**。可现实里，vLLM 并非处处都留了平台钩子——像 distributed 的 all_reduce、multiproc_executor 的 daemon 标志、某些 triton 算子、kv_cache 工具函数，都是写死的、没有「问平台要」这一步。对这些**改不动**的地方，昇腾的办法是 monkey-patch：靠 import 副作用，把 vLLM 里的某个符号在运行时替换成昇腾实现。
+工厂钩子很优雅，但有个前提：vLLM 得**预留了钩子**。可现实里，vLLM 并非处处都留了平台钩子——像 distributed 的 all_reduce、multiproc_executor 的 daemon 标志、某些 triton 算子（Triton：用 Python 写 GPU/NPU 优化算子内核的框架）、kv_cache 工具函数，都是写死的、没有「问平台要」这一步。对这些**改不动**的地方，昇腾的办法是 monkey-patch：靠 import 副作用，把 vLLM 里的某个符号在运行时替换成昇腾实现。
 
 机制本体小到只有一个 `if`：
 
