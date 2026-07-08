@@ -15,6 +15,10 @@ vllm-ascend 是 **out-of-tree（OOT，源码树外）插件**：它装在 vLLM �
 
 答案是 **monkey-patch**：在运行期，把 vLLM 某个命名空间里的名字，重新指向 vllm-ascend 自己的实现。这件事的全部精巧之处，被收敛进 `vllm_ascend/utils.py` 里一个只有五行的入口函数 `adapt_patch`。本章就从这五行出发，讲清三件事：**何时打**（两段式时机）、**怎么触发**（import 副作用）、**怎么换**（五种重绑技法）。
 
+![本章地图：两段式 monkey-patch 从触发到五种重绑技法的全景](../diagrams/chapter-map.png)
+
+只想摸清 platform 段这条主线，跟图底部实线路径跳读 §3.3、§3.4；只想看 worker 段每次构造时怎么打，跟虚线路径跳读 §3.3、§3.6。想跟全程，按 §3.1 到 §3.6 顺序通读即可。
+
 ## 3.1 五行入口：adapt_patch
 
 先看这个全章唯一的入口。它在 `vllm_ascend/utils.py` 里，短到可以一口气读完：

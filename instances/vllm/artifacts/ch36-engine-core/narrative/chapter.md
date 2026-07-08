@@ -20,6 +20,10 @@
 
 我们先啃硬骨头：弹性专家并行（Elastic EP）的扩缩状态机。它深度依赖[第 21 章的 DP wave 协议](../../ch21-async-engine/narrative/chapter.md)和[第 7 章的 EngineCore busy loop](../../ch07-engine-core/narrative/chapter.md)，建议手边备着那两章。然后再看相对轻巧的 Responses 多轮。
 
+![本章地图：弹性 EP 扩缩状态机与 Responses 多轮会话的源码剖面](../diagrams/chapter-map.png)
+
+只想弄清引擎怎么不停机扩缩容，跳读 §36.4 到 §36.9（新引擎扩入看 §36.8，缩容看 §36.9）；只想看跨轮对话怎么接上文，直接跳 §36.10 到 §36.12；想跟完整两条主线，就按 36.1 到 36.14 顺序通读。
+
 ---
 
 ## 36.2 难题：busy loop 里塞不下一个阻塞的"重建"

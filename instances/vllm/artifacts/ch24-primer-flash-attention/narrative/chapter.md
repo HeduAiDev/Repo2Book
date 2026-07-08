@@ -19,6 +19,10 @@
 
 读完这一章，后面凡是提到 FlashAttention、LSE 合并、cascade、split-KV 的地方，你都能接得住。
 
+![本章地图：论文推导→vLLM 源码落地剖面图](../diagrams/chapter-map.png)
+
+只想看这套算法怎么落进代码——`merge_attn_states` 怎么合、cascade attention 怎么省算——可以跳过中间推导，直接读「六、⊕ 算子再现」到「八、落地：cascade attention」这几节；想跟一遍完整推导，就从「二、推导之一」按序读到「五、FlashAttention-2」，再顺势读进代码落地。
+
 ---
 
 ## 一、动机：被物化的 N×N 与内存带宽墙

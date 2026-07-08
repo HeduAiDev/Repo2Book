@@ -16,6 +16,10 @@
 
 > **一句话说明**：昇腾主机一般没有 CUDA，本章的数值追踪跑在纯 Python 的控制流上（五态分流、拆批、`slot_mapping` 装配、`forward_impl` 选路都是 Python）。真正的 `_npu_paged_attention` / `npu_fused_infer_attention_score` 是 NPU 内核，host 上不真算——但它们的入参怎么被整理、何时被调用，全都可读可验。
 
+![本章地图：五态机与双算子路径的源码剖面](../diagrams/chapter-map.png)
+
+只想弄清五态怎么分流、两条算子路径怎么选，直接跳读 §20.2→§20.5→§20.6；想跟完整实现走一遍，就按 §20.1→§20.7 顺序读。
+
 ---
 
 ## 20.1 从后端到实现：`get_impl_cls` 的两条岔路
