@@ -66,6 +66,7 @@ def _mv(src: Path, dst: Path):
 def _rewrite_targets(inst: Path):
     pats = ["artifacts/*/narrative/*.md", "artifacts/*/dossier/*.json", "artifacts/*/explainer/*.json",
             "artifacts/*/reviews/*.json", "artifacts/*/retrofit/*.json", "artifacts/*/diagrams/*.json",
+            "artifacts/*/diagrams/*.py",
             "book/cartography/*.json", "book/bible/*.json", "book/assets/roadmap/roadmap.py",
             "trace/state.json", "INSTANCE.md"]
     out = []
@@ -73,6 +74,26 @@ def _rewrite_targets(inst: Path):
         out += sorted(inst.glob(p))
     # 豁免重编号 plan 存档自身(否则引擎会改写自己的映射记录,毁掉考古依据)
     return [f for f in out if not f.name.startswith('renumber-')]
+
+
+def _own_diagram_move(fname: str, moves):
+    """若 fname 是某条 move 自身章节下的 artifacts/<chapter_dir>/diagrams/*.py 脚本,返回对应 Move,否则 None。
+
+    §N.M 徽标只应指"本章自身",不该被论文引用(如 "arXiv:2210.17323 §3.1")或正文自引用锚点
+    (如 "[§2.9](#anchor)")误伤——因此严格限定:仅 diagrams/*.py 文件、且章节目录段命中某条
+    move 的 old_dir(dry-run,目录尚未迁移)或 new_dir(apply,阶段一已把目录迁到新名)。
+    """
+    parts = fname.replace('\\', '/').split('/')
+    if not parts or not parts[-1].endswith('.py') or 'diagrams' not in parts:
+        return None
+    idx = parts.index('diagrams')
+    if idx == 0:
+        return None
+    chapter_dir = parts[idx - 1]
+    for m in moves:
+        if chapter_dir in (m.old_dir, m.new_dir):
+            return m
+    return None
 
 
 def _rewrite_text(text: str, moves, report, fname):
@@ -96,6 +117,19 @@ def _rewrite_text(text: str, moves, report, fname):
         return '第 ' + nummap.get(n, n) + ' 章' if n in nummap else mo.group(0)
 
     text = re.sub(r'第\s*(\d{1,3})\s*章', _num, text)
+    # 4) 「§N.M」章内小节锚点/徽标——仅限"本章自身"的 diagrams/*.py 脚本(见 _own_diagram_move),
+    #    且仅当捕获的 N(int() 归一,兼容零填充如 "§09.2")恰等于该脚本所属章节的旧号时才重写,
+    #    M(节内序号)不变。论文 §引用(如 "arXiv:2210.17323 §3.1")与正文自引用锚点
+    #    (如 "[§2.9](#anchor)")均不落在 diagrams/*.py 内,天然豁免。
+    own_move = _own_diagram_move(fname, moves)
+    if own_move is not None:
+        local_nummap = {str(int(own_move.old_id[2:])): str(int(own_move.new_id[2:]))}
+
+        def _sec(mo):
+            n = str(int(mo.group(1)))
+            return '§' + local_nummap[n] + '.' + mo.group(2) if n in local_nummap else mo.group(0)
+
+        text = re.sub(r'§(\d{1,3})\.(\d{1,3})', _sec, text)
     if text != orig:
         report.files_changed += 1
         report.log.append(f"rewrote {fname}")
@@ -111,7 +145,7 @@ def apply(inst: Path, moves, dry_run: bool) -> Report:
         for f in _rewrite_targets(inst):
             t = f.read_text(encoding="utf-8", errors="replace")
             r = Report()
-            _rewrite_text(t, todo, r, f.name)
+            _rewrite_text(t, todo, r, str(f.relative_to(inst)))
             rep.files_changed += r.files_changed
             rep.log += r.log
         rep.log.insert(0, f"[dry-run] moves={rep.planned_moves} skipped={rep.skipped_moves}")

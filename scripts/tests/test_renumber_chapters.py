@@ -100,3 +100,67 @@ def test_plan_archive_file_not_rewritten(tmp_path):
     plan_file.write_text(json.dumps({"moves": SWAP}), encoding="utf-8")
     rc.apply(inst, rc.parse_moves(SWAP), dry_run=False)
     assert json.loads(plan_file.read_text(encoding="utf-8")) == {"moves": SWAP}
+
+
+def test_diagrams_gen_script_rewritten(tmp_path):
+    """diagrams/gen_x.py 是章图的真相源(SVG 由它生成):§N.M 徽标与 chNN-slug 目录名须同批重写。"""
+    inst = tmp_path / "instances" / "mini2"
+    diagrams = inst / "artifacts" / "ch19-foo" / "diagrams"
+    diagrams.mkdir(parents=True)
+    (diagrams / "gen_x.py").write_text(
+        'BADGE = "§19.2"\n# see ch19-foo/diagrams for source\n', encoding="utf-8")
+    move = [{"old_dir": "ch19-foo", "new_id": "ch20"}]
+    rc.apply(inst, rc.parse_moves(move), dry_run=False)
+    moved = inst / "artifacts" / "ch20-foo" / "diagrams" / "gen_x.py"
+    assert moved.is_file()
+    content = moved.read_text(encoding="utf-8")
+    assert '"§20.2"' in content
+    assert "ch20-foo" in content
+    assert "ch19-foo" not in content
+    assert "§19.2" not in content
+
+
+def test_papers_map_arxiv_ref_untouched(tmp_path):
+    """papers-map.json 里的论文引用"arXiv:2210.17323 §3.1"不是章内小节徽标,§N.M 规则现仅限
+    diagrams/*.py 自身章节徽标——即便 ch03 恰好在本次 moves 里被搬走,也不该被误伤。"""
+    inst = tmp_path / "instances" / "mini-papersmap"
+    (inst / "artifacts" / "ch03-quant" / "narrative").mkdir(parents=True)
+    (inst / "artifacts" / "ch03-quant" / "narrative" / "chapter.md").write_text("# 量化\n", encoding="utf-8")
+    (inst / "book" / "cartography").mkdir(parents=True)
+    papers_map = inst / "book" / "cartography" / "papers-map.json"
+    payload = {"quant": {"paper_note": "GPTQ 逐列 Hessian OBQ(arXiv:2210.17323 §3.1)"}}
+    papers_map.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    move = [{"old_dir": "ch03-quant", "new_id": "ch05"}]
+    rc.apply(inst, rc.parse_moves(move), dry_run=False)
+    assert json.loads(papers_map.read_text(encoding="utf-8")) == payload
+
+
+def test_chapter_self_reference_anchor_untouched(tmp_path):
+    """正文自引用锚点"[§2.9](#anchor)"是章内小节链接,不是 diagrams 徽标;即便 ch02 在本次
+    moves 里(SWAP: ch02→ch03),也不该被 §N.M 规则改写——否则会与未重写的 `## 2.9` 标题错位。"""
+    inst = _mk(tmp_path)
+    f = inst / "artifacts" / "ch02-beta" / "narrative" / "chapter.md"
+    f.write_text(f.read_text(encoding="utf-8") + "\n参见[§2.9](#anchor)。\n", encoding="utf-8")
+    rc.apply(inst, rc.parse_moves(SWAP), dry_run=False)
+    moved = inst / "artifacts" / "ch03-beta" / "narrative" / "chapter.md"
+    assert "[§2.9](#anchor)" in moved.read_text(encoding="utf-8")
+
+
+def test_diagram_own_badge_scoped_and_zero_pad_normalized(tmp_path):
+    """某章旧号 19 的 diagrams/gen_x.py 内同时含论文引用"§3.1"(N=3≠19,原样不变)与本章自身
+    徽标"§19.2"(重写为"§20.2");附带验证零填充"§019.2"也能经 int() 归一命中同一条本章旧号。"""
+    inst = tmp_path / "instances" / "mini-paperref"
+    diagrams = inst / "artifacts" / "ch19-foo" / "diagrams"
+    diagrams.mkdir(parents=True)
+    (diagrams / "gen_x.py").write_text(
+        'PAPER_NOTE = "cf. §3.1"\n'
+        'BADGE = "§19.2"\n'
+        'BADGE_PADDED = "§019.2"\n',
+        encoding="utf-8")
+    move = [{"old_dir": "ch19-foo", "new_id": "ch20"}]
+    rc.apply(inst, rc.parse_moves(move), dry_run=False)
+    content = (inst / "artifacts" / "ch20-foo" / "diagrams" / "gen_x.py").read_text(encoding="utf-8")
+    assert '"cf. §3.1"' in content          # 论文引用(N=3≠19)原样不变
+    assert content.count('"§20.2"') == 2    # BADGE 与零填充 BADGE_PADDED 均命中本章旧号 19
+    assert "019" not in content
+    assert "§19.2" not in content
