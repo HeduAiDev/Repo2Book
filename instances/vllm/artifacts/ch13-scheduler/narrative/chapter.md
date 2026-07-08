@@ -804,7 +804,7 @@ class AsyncScheduler(Scheduler):
 
 它覆写 §13.5 那个乐观推进的 `_update_after_schedule`：先调父类把 `num_computed_tokens` 推进，然后对每个**不在 prefill 中途**（`is_prefill_chunk` 为假，即将吐字）的请求，把 `num_output_placeholders += 1 + cur_num_spec_tokens`。
 
-这一句是异步调度的全部魔法。意思是：「我知道这一拍的前向**将会**给这个请求产出 1 个真 token（再加 `num_spec_tokens` 个草稿 token），虽然现在还没算出来，但我**先记上**。」于是下一拍调度时，追赶公式里的 `+ request.num_output_placeholders`（§13.3 我们当时跳过的那一项）就生效了——它告诉调度器「这个请求其实还差 1 个 token 要算」，于是 §13.3 那个 async 提前剪枝和追赶公式能为它预留下一拍的 decode 槽位，**不必等前向真的回来**。这就是 §3.5 那个 `AsyncScheduler` 实例驱动连续批处理的方式：靠占位，让 `schedule(N)` 和 `forward(N−1)` 在同一段墙钟时间里重叠，GPU 不再有调度间隙的气泡。
+这一句是异步调度的全部魔法。意思是：「我知道这一拍的前向**将会**给这个请求产出 1 个真 token（再加 `num_spec_tokens` 个草稿 token），虽然现在还没算出来，但我**先记上**。」于是下一拍调度时，追赶公式里的 `+ request.num_output_placeholders`（§13.3 我们当时跳过的那一项）就生效了——它告诉调度器「这个请求其实还差 1 个 token 要算」，于是 §13.3 那个 async 提前剪枝和追赶公式能为它预留下一拍的 decode 槽位，**不必等前向真的回来**。这就是 §13.5 那个 `AsyncScheduler` 实例驱动连续批处理的方式：靠占位，让 `schedule(N)` 和 `forward(N−1)` 在同一段墙钟时间里重叠，GPU 不再有调度间隙的气泡。
 
 这张图把同步和异步的时间线并排：
 

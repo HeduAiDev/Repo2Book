@@ -414,7 +414,7 @@ KVConnectorFactory.register_connector(
                     continue
 ```
 
-`_select_waiting_queue_for_scheduling` 在两个队列里选一个。这就是第 14 章 §14.4 的双队列选取：
+`_select_waiting_queue_for_scheduling` 在两个队列里选一个。这就是[第 14 章 §14.4](../../ch14-scheduler/narrative/chapter.md) 的双队列选取：
 
 ```python
 # vllm/v1/core/sched/scheduler.py:L1529-L1539
@@ -693,7 +693,7 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
 
 最后从 `finished_recving_kv_req_ids` 移除该请求——标记已消费。
 
-至此，提升完成。请求回到 `WAITING`（或 `PREEMPTED`），下一步正常调度、`allocate_slots`、进 `running`，正式开始 decode。第 14 章 §14.4 埋下的那条线——"等远程 KV 的请求隔离到 skipped_waiting，完整路径后面给"——到这里全部走通：
+至此，提升完成。请求回到 `WAITING`（或 `PREEMPTED`），下一步正常调度、`allocate_slots`、进 `running`，正式开始 decode。[第 14 章 §14.4](../../ch14-scheduler/narrative/chapter.md) 埋下的那条线——"等远程 KV 的请求隔离到 skipped_waiting，完整路径后面给"——到这里全部走通：
 
 > **WAITING** ──（查到远程命中 & `load_kv_async`）──> **WAITING_FOR_REMOTE_KVS**（隔离进 `skipped_waiting`）──（worker 报 `finished_recving`）──> 进 `finished_recving_kv_req_ids` ──（下步遍历到、提升）──> **WAITING / PREEMPTED** ──> **RUNNING**。
 

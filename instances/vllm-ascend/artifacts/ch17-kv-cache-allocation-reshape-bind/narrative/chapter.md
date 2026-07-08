@@ -535,7 +535,7 @@ def extract_dsv4_layer_index(config: Any, layer_name: str) -> int:
 
 `sorted(kv_caches, key=...)` 用这个键排，得到 `[layer0, layer1, mtp.0]`——主模型层在前、MTP 殿后，正好是前向期望的顺序。排完手动 `append` 进 `self.kv_caches`，并把每层的 `static_forward_context[layer].kv_cache` 填成 `[kv]`。
 
-三路走完，还有一个共同的尾巴：若 `enable_hamming_sparse`，再调一次 `init_and_bind_hashk_cache` 给 hamming 稀疏额外挂一份 hashk cache（hamming 稀疏即 KVComp：用哈希汉明距离代理浮点内积做 top-k 选块的运行期近似检索机制，[第 26 章](../../ch26-primer-v4-csa-hca/narrative/chapter.md) §4.3 有完整机制展开，这里只需知道它是可选旁路）。这是叠在三路之上的可选项，不影响主分派。
+三路走完，还有一个共同的尾巴：若 `enable_hamming_sparse`，再调一次 `init_and_bind_hashk_cache` 给 hamming 稀疏额外挂一份 hashk cache（hamming 稀疏即 KVComp：用哈希汉明距离代理浮点内积做 top-k 选块的运行期近似检索机制，[第 26 章](../../ch26-primer-v4-csa-hca/narrative/chapter.md) §26.4.3 有完整机制展开，这里只需知道它是可选旁路）。这是叠在三路之上的可选项，不影响主分派。
 
 ## 17.8 两条辅线：spec 解析与输入批重建
 
