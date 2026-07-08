@@ -41,3 +41,9 @@ ch04（async-engine，`vllm/v1/engine/`）：
 - IPC 接缝（`core_client.py:L990-999,L1058-1061`）恰好两个 `AsyncMPClient` 方法：`add_request_async`（编码+经 ZMQ input_socket `_send_input`）与 `get_output_async`（await `self.outputs_queue`，由后台 `process_outputs_socket` 任务喂）；`AsyncLLM` 只看得到这两个 await，ZMQ/msgpack/进程管理全部藏在后面。
 - 跨进程消息是 `msgspec.Struct`（`vllm/v1/engine/__init__.py:L80-131,L161-191`）：`EngineCoreRequest`（进：tokenized prompt_token_ids + sampling_params）、`EngineCoreOutput`（出：request_id + new_token_ids + finish_reason；`.finished` 属性 L189 驱动 `generate` 停止）；`array_like`/`omit_defaults`/`gc=False` 压缩序列化。
 - `STREAM_FINISHED`（`vllm/outputs.py:L192`）是仅用于**流式输入**场景的哨兵 `RequestOutput(finished=True)`，解除 `generate` 循环阻塞；`generate` L585 跳过 yield 它。
+
+
+## 原理篇交错与 gap 治理(2026-07-08 收官)
+- 36 章新序:三章原理篇归位(ch24 FlashAttention 原理/ch26 量化数学/ch30 EAGLE),映射存档 book/cartography/renumber-2026-07-06.json;补章走 RUNBOOK「补章发车 SOP」。
+- 跨章链接三规生效(../../ 两层+文字号=目录号);全书节号=目录号;concepts.json 140 条建账。
+- 诊断→治理闭环:2026-07-06 全书审计 cliffs=1(FA 黑盒)+71 bumps → FA 原理章+交错+接缝+inline 引用批次(Orca/Sarathi/PagedAttention/DeepSeek/XGrammar)→ 2026-07-08 定向终验受影响 9 章 cliffs=0。bump 级 advisory 留审计报告待日后 triage。
