@@ -143,6 +143,34 @@ def lint_formulas(filepath: str) -> dict:
                 )
     results["complex_inline_formulas"] = issues
 
+    # ── Check 8: CJK inside math (strict KaTeX: unicodeTextInMathMode) ──
+    issues = []
+    cjk = re.compile(r'[一-鿿　-〿（），：；]')
+    for m in re.finditer(r'^\$\$\n(.*?)\n\$\$', text, re.S | re.M):
+        body = m.group(1)
+        if cjk.search(body):
+            ln = text[:m.start()].count("\n") + 2
+            frag = next(s for s in body.split("\n") if cjk.search(s))
+            issues.append(
+                f"  Line {ln}: CJK inside $$ block → \"{frag.strip()[:50]}\" — "
+                f"strict KaTeX rejects; move CJK annotation out of math or use symbols"
+            )
+    in_fence = False
+    for i, line in enumerate(lines, 1):
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        cleaned = re.sub(r'\$\$[^$]*\$\$', '', line)
+        for m in re.finditer(r'(?<!\$)\$(?!\$)([^$\n]+)\$(?!\$)', cleaned):
+            if cjk.search(m.group(1)):
+                issues.append(
+                    f"  Line {i}: CJK inside inline $...$ → \"{m.group(1)[:50]}\" — "
+                    f"strict KaTeX rejects; move CJK out of math"
+                )
+    results["cjk_in_math"] = issues
+
     return results
 
 

@@ -68,7 +68,7 @@ python3 scripts/lint_diagram_geometry.py --all   # 图：文字越界/相撞/压
 - **架构师自身连贯性**:本 CLAUDE.md + RUNBOOK + 实例 INSTANCE.md + trace 决策记录。
 
 ## 公式规则（NON-NEGOTIABLE，auto-REJECT）
-`\text{}`→`\mathrm{}`；`\boxed{}`→markdown 粗体标题；`\tag*{}`→`$$` 外；inline `\frac`→提升为 `$$` 块；`$$` 与内容分行。inline 仅限单符号/简单式。
+`\text{}`→`\mathrm{}`；`\boxed{}`→markdown 粗体标题；`\tag*{}`→`$$` 外；inline `\frac`→提升为 `$$` 块；`$$` 与内容分行。inline 仅限单符号/简单式。**公式内禁中文/CJK**（strict KaTeX 报 unicodeTextInMathMode）——中文标注移出公式或改符号（lint_formulas 查）。
 
 ## 当前实例 → 看 INSTANCE.md
 - 活动实例、源码版本/行号基线、当前进度、实例专属坑：**`instances/<active>/INSTANCE.md`**（`<active>` = `repo2book.json` 的 `active_instance`，当前为 `vllm`）。

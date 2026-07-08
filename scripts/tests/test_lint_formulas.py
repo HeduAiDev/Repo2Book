@@ -66,3 +66,27 @@ def test_too_many_inline_formulas_remains_non_blocking(tmp_path):
         print_report(res, str(p))
     out = buf.getvalue()
     assert "No blocking issues" in out or "🟢" in out
+
+
+def test_cjk_in_display_math_flagged(tmp_path):
+    ch = tmp_path / "chapter.md"
+    ch.write_text("x\n\n$$\n\\mathrm{利用率} = 1\n$$\n", encoding="utf-8")
+    from lint_formulas import lint_formulas
+    res = lint_formulas(str(ch))
+    assert len(res["cjk_in_math"]) == 1
+
+
+def test_cjk_in_inline_math_flagged(tmp_path):
+    ch = tmp_path / "chapter.md"
+    ch.write_text("总量 $N_{总} = 3$ 个。\n", encoding="utf-8")
+    from lint_formulas import lint_formulas
+    res = lint_formulas(str(ch))
+    assert len(res["cjk_in_math"]) == 1
+
+
+def test_cjk_outside_math_ok(tmp_path):
+    ch = tmp_path / "chapter.md"
+    ch.write_text("利用率是 $u = 1$。\n\n$$\nu = \\frac{a}{b}\n$$\n", encoding="utf-8")
+    from lint_formulas import lint_formulas
+    res = lint_formulas(str(ch))
+    assert res["cjk_in_math"] == []
