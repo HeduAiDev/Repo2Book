@@ -441,11 +441,11 @@ def enable_cp():
 
 回到开篇那个问题——一个 OOT 后端接进 vLLM 的注意力框架，需要哪些契约点？这一章把答案摊开了：
 
-- **路由**（18.2，`vllm_ascend/platform.py:L738-L765`）：在平台的 `get_attn_backend_cls` 里，用 `(use_mla, use_sparse, use_compress)` 三元 key 查一张 `backend_map`，把请求映射到四个昇腾后端之一。返回字符串而非类，让 vLLM 按需加载。
-- **注册**（18.3，`vllm/v1/attention/backends/registry.py:L203-L255`）：用 `@register_backend(CUSTOM, "ASCEND")` 占住 vLLM 预留的 `CUSTOM` 槽——这是声明 / 占位，真正解析走的是路由那条线。
-- **伪装**（18.4，`vllm_ascend/attention/attention_v1.py:L77-L82`）：`get_name` 在 V2 runner 下故意返回 `"FLASH_ATTN"`，绕过 vLLM 按名字判定后端的断言。源码自承是临时 HACK。
-- **契约**（18.5，`vllm/v1/attention/backend.py:L55-L96`）：四个 `@abstractmethod`（`get_name` / `get_impl_cls` / `get_builder_cls` / `get_kv_cache_shape`）必须实现，少一个就实例化不了；`get_supported_kernel_block_sizes` 是可覆写的默认方法；`swap_blocks` / `copy_blocks` 是昇腾自带的 v0 遗留，**不在** v1 契约里。
-- **分流**（18.6，`vllm_ascend/attention/attention_v1.py:L84-L98`）：`get_impl_cls` / `get_builder_cls` 按 `enable_cp()` 运行期二选一，CP 实现延迟到命中才 import。
+- **路由**（19.2，`vllm_ascend/platform.py:L738-L765`）：在平台的 `get_attn_backend_cls` 里，用 `(use_mla, use_sparse, use_compress)` 三元 key 查一张 `backend_map`，把请求映射到四个昇腾后端之一。返回字符串而非类，让 vLLM 按需加载。
+- **注册**（19.3，`vllm/v1/attention/backends/registry.py:L203-L255`）：用 `@register_backend(CUSTOM, "ASCEND")` 占住 vLLM 预留的 `CUSTOM` 槽——这是声明 / 占位，真正解析走的是路由那条线。
+- **伪装**（19.4，`vllm_ascend/attention/attention_v1.py:L77-L82`）：`get_name` 在 V2 runner 下故意返回 `"FLASH_ATTN"`，绕过 vLLM 按名字判定后端的断言。源码自承是临时 HACK。
+- **契约**（19.5，`vllm/v1/attention/backend.py:L55-L96`）：四个 `@abstractmethod`（`get_name` / `get_impl_cls` / `get_builder_cls` / `get_kv_cache_shape`）必须实现，少一个就实例化不了；`get_supported_kernel_block_sizes` 是可覆写的默认方法；`swap_blocks` / `copy_blocks` 是昇腾自带的 v0 遗留，**不在** v1 契约里。
+- **分流**（19.6，`vllm_ascend/attention/attention_v1.py:L84-L98`）：`get_impl_cls` / `get_builder_cls` 按 `enable_cp()` 运行期二选一，CP 实现延迟到命中才 import。
 
 这五件事拼起来，就是 [第 16 章](../../ch16-single-step-forward-context-dp-sync/narrative/chapter.md) 那个「不透明对象」背后的**选择机制**——`attn_metadata` 被交给哪个后端、那个后端怎么被选中接进来，到这里全交代清楚了。
 

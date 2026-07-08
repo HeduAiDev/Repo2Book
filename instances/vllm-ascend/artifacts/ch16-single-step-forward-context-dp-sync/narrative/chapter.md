@@ -669,7 +669,7 @@ def _sample(self, logits, spec_decode_metadata):
 回到开篇。台子搭好不算数，转一圈才知道数据怎么流。这一章把一次 `execute_model` 拆成了七步主干，重点掰开了昇腾插进去的两个接缝：
 
 - **DP 跨卡同步**（§16.3，`vllm_ascend/worker/model_runner_v1.py:L627`）：进同一张图前，DP 各卡必须就 token 数和图模式达成一致。昇腾比基座多同步一个 cudagraph_mode，用 `[2, dp_size]` 零张量 + 各填己列 + 一次 sum-allreduce 把两个量一起汇齐——多同步一个量，不多花一次集合通信。token 取 max 做 padding，模式取 min 保守对齐（任一 NONE 则全 NONE）。还能改走 NPU group 规避 CPU 脏数据。
-- **昇腾 forward context 注入**（§16.5–15.6，`vllm_ascend/ascend_forward_context.py:L56`）：不改 vLLM（`vllm/forward_context.py`）一行，用 `with set_forward_context(...)` 包住基座，再往同一个上下文对象上挂昇腾专属字段。每拍前向前用 `select_moe_comm_method` 按芯片代次、EP/DP 规模、token 数选好 MoE 通信方式，连同 flashcomm 开关、mc2_mask、padding 量一起注入——模型各层 forward 时就地取用，`_model_forward` 里的 flashcomm 回收就是对注入字段的消费。
+- **昇腾 forward context 注入**（§16.5–16.6，`vllm_ascend/ascend_forward_context.py:L56`）：不改 vLLM（`vllm/forward_context.py`）一行，用 `with set_forward_context(...)` 包住基座，再往同一个上下文对象上挂昇腾专属字段。每拍前向前用 `select_moe_comm_method` 按芯片代次、EP/DP 规模、token 数选好 MoE 通信方式，连同 flashcomm 开关、mc2_mask、padding 量一起注入——模型各层 forward 时就地取用，`_model_forward` 里的 flashcomm 回收就是对注入字段的消费。
 
 两个接缝都体现了同一种插件哲学：**不动上游，包一层、注一手，让昇腾的并行决策随前向一路流下去。**
 

@@ -159,7 +159,7 @@ class KVConnectorBase_V1(ABC):
         pass
 ```
 
-对照着看，昇腾那个连接器就是把这张抽象表逐项填上了实现。基类的文档里写得很明白：`get_num_new_matched_tokens` 要返回「外部 KV 能多 load 多少 token」，第二位是「是否异步 load」——这正是 11.3 里那个返回值的语义来源。`start_load_kv` 在「前向前」被调以便在模型执行期间异步加载，`wait_for_save` 在「前向上下文退出时」被调以确保异步存完成——这两句话直接对应了 worker 端那条「入队即返回」和那道 `join()` 屏障。换句话说，**节拍不是昇腾自定的，是 vLLM 契约规定好的时机**，昇腾只是在每个时机里填进了池化的动作。
+对照着看，昇腾那个连接器就是把这张抽象表逐项填上了实现。基类的文档里写得很明白：`get_num_new_matched_tokens` 要返回「外部 KV 能多 load 多少 token」，第二位是「是否异步 load」——这正是 12.3 里那个返回值的语义来源。`start_load_kv` 在「前向前」被调以便在模型执行期间异步加载，`wait_for_save` 在「前向上下文退出时」被调以确保异步存完成——这两句话直接对应了 worker 端那条「入队即返回」和那道 `join()` 屏障。换句话说，**节拍不是昇腾自定的，是 vLLM 契约规定好的时机**，昇腾只是在每个时机里填进了池化的动作。
 
 这套「按 role 分派给 scheduler / worker 两端」的写法也不是昇腾独有的——vLLM 自己的 `OffloadingConnector`（把 KV 卸载到 host 的连接器，下一章会拆它内部的 Spec / Handler 卸载框架）用的是一模一样的骨架：
 
@@ -371,7 +371,7 @@ class LookupKeyServer:
 
 这就是「调度器决定搬什么、worker 异步搬」里**节拍的发起端**：调度器不亲自搬，它只在每一拍写一张「这一拍搬运清单」，塞进给 worker 的常规指令流里捎过去。worker 收到清单，照单异步执行。两端就这样靠一张随每步流动的元数据对齐，而不需要额外的同步握手。
 
-`LoadSpec`、`ReqMeta`、`AscendConnectorMetadata` 这三个数据结构是两端之间的**传递契约**，后面 11.5–11.7 反复引用，这里先把它们摆成一张表分立记清：
+`LoadSpec`、`ReqMeta`、`AscendConnectorMetadata` 这三个数据结构是两端之间的**传递契约**，后面 12.5–12.7 反复引用，这里先把它们摆成一张表分立记清：
 
 | 结构 | 记什么 | 关键字段 |
 |---|---|---|
@@ -385,7 +385,7 @@ class LookupKeyServer:
 
 清单下发到 worker，真正的搬运开始。但这里有个绕不过的物理事实：**put / get 是慢 IO**——KV 要跨网络写进 / 读出外部池，一来一回是毫秒级的延迟。如果让模型前向的主循环卡在这上面等，那 NPU 算力就白白晾着了。
 
-昇腾的解法是经典的**生产者—消费者解耦**：主循环只管把搬运任务**入队**，立刻返回接着算；真正的搬运由独立的**后台线程**从队列里取出来慢慢做。下面这张图是整个两端协作的全景，把 11.3 到本节的节拍串起来看：
+昇腾的解法是经典的**生产者—消费者解耦**：主循环只管把搬运任务**入队**，立刻返回接着算；真正的搬运由独立的**后台线程**从队列里取出来慢慢做。下面这张图是整个两端协作的全景，把 12.3 到本节的节拍串起来看：
 
 ![两端解耦：调度进程决定搬什么，worker 进程后台线程异步搬](../diagrams/two-end-decoupling.png)
 
@@ -482,7 +482,7 @@ class LookupKeyServer:
 
 ### 取：同步当场拿，还是异步甩进队列
 
-引擎要 worker 加载 KV 时，调 `start_load_kv`。还记得 11.3 那个 `load_async` 开关吗？它在这里分出两条岔路：
+引擎要 worker 加载 KV 时，调 `start_load_kv`。还记得 12.3 那个 `load_async` 开关吗？它在这里分出两条岔路：
 
 ```python
 # vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py:L461
@@ -508,7 +508,7 @@ class LookupKeyServer:
                         self._invalid_block_ids.update(missing_block_ids)
 ```
 
-先看那句早退：`if not load_spec.can_load: continue`——`can_load` 还是 `False`（11.3 登记时的初值，或分配后没放行）的请求直接跳过，不搬。这是 `LoadSpec` 那个状态位的用武之地。
+先看那句早退：`if not load_spec.can_load: continue`——`can_load` 还是 `False`（12.3 登记时的初值，或分配后没放行）的请求直接跳过，不搬。这是 `LoadSpec` 那个状态位的用武之地。
 
 然后两条岔路：
 
@@ -567,9 +567,9 @@ class LookupKeyServer:
 - 每次 `task_done` 让 `unfinished` 减 1；
 - `join()` 阻塞，当且仅当 `unfinished > 0`，归零即放行。
 
-关键是搞清发线程消费循环（11.5 那个 `run`）里 `task_done` 到底在哪调。[下一节 §12.7](#127-数据通路key-与-value-地址分两路再汇合) 内嵌的 `_handle_request` 会看到它有**两个正常出口**，各调一次 `task_done`：一是 `req_id` 不在 `stored_requests` 时的早退（`task_done` 在 try 内、随即 `return`），二是处理到末尾的正常完成（那句 `task_done` 位于 `try/finally` **之后**）。要留意：`try/finally` 只保证 `mark_completed_events`（释放 block），**并不**保证 `task_done`——下一节代码就在眼前时这点能直接对上。
+关键是搞清发线程消费循环（12.5 那个 `run`）里 `task_done` 到底在哪调。[下一节 §12.7](#127-数据通路key-与-value-地址分两路再汇合) 内嵌的 `_handle_request` 会看到它有**两个正常出口**，各调一次 `task_done`：一是 `req_id` 不在 `stored_requests` 时的早退（`task_done` 在 try 内、随即 `return`），二是处理到末尾的正常完成（那句 `task_done` 位于 `try/finally` **之后**）。要留意：`try/finally` 只保证 `mark_completed_events`（释放 block），**并不**保证 `task_done`——下一节代码就在眼前时这点能直接对上。
 
-那异常路径呢？循环体里会出错的 IO 主要是 `m_store.put`——它被后端 `MooncakeBackend.put` 的 `try/except` **整个吞掉**（记日志、不外抛，见 11.8）；但 `lookup`（`exists`）、`prepare_value` 等调用并不在 try 内，原则上仍可能抛。而一旦真有异常逃逸到 `run` 外层的 `except`，那一项的 `task_done` 就被**跳过**（对照上一段：`try/finally` 只护 `mark_completed_events`），于是 `unfinished` 永不归零、`join()` 反而永久挂死——这恰恰是本节要避免的那个故障。所以下面的终止性严格以「正常拍内无异常逃逸到 `run`」为前提：在此前提下，每个入队请求都顺着两个正常出口之一恰好到达一次 `task_done`。
+那异常路径呢？循环体里会出错的 IO 主要是 `m_store.put`——它被后端 `MooncakeBackend.put` 的 `try/except` **整个吞掉**（记日志、不外抛，见 12.8）；但 `lookup`（`exists`）、`prepare_value` 等调用并不在 try 内，原则上仍可能抛。而一旦真有异常逃逸到 `run` 外层的 `except`，那一项的 `task_done` 就被**跳过**（对照上一段：`try/finally` 只护 `mark_completed_events`），于是 `unfinished` 永不归零、`join()` 反而永久挂死——这恰恰是本节要避免的那个故障。所以下面的终止性严格以「正常拍内无异常逃逸到 `run`」为前提：在此前提下，每个入队请求都顺着两个正常出口之一恰好到达一次 `task_done`。
 
 于是有：`wait_for_save` 入队了有限的 $N$ 个请求，`unfinished` 至多到 $N$；消费线程持续运行，每处理一个就把 `unfinished` 减 1，且每个请求只被处理一次。`unfinished` 是个**单调不增**（在没有新 put 时）的非负整数，每次 `task_done` 严格减 1——有限步内必然归零，`join()` 必然返回。换句话说：只要发线程活着、`put` 的失败被后端吞掉，这道屏障就会解除。代价只是把这一拍 put 的尾延迟串进了请求的关键路径——用一点延迟换一个不会漏命中的正确性，划算。
 
@@ -824,7 +824,7 @@ class Backend(ABC):
 - `put` → `batch_put_from_multi_buffers`：把多段 buffer（就是 `prepare_value` 算的那些 `(addr, size)`）批量 RDMA 写进池。那个 `config = ReplicateConfig()` 是告诉 store 这批数据**怎么跨节点复制**——空构造即取默认副本策略（含同节点优先分配的 `preferred_segment` 优化），下面省略的几行只是按本机配置覆盖几个字段。
 - `get` → `batch_get_into_multi_buffers`：从池批量 RDMA 读回到那些显存区段。
 
-注意 `get` 末尾那个返回值归一化：Mooncake 返回的正数是「读到的字节数」（成功），代码把所有正数统一改成 0。配上 `put` 用负数表失败的约定，整套契约对上层就只有一个简单语义——**0 = 成功，非 0 = 这个块失败**。上层的 `_invalid_block_ids` 收集逻辑（11.5）就靠这个统一约定工作，不必关心底下是 Mooncake 还是别的什么。
+注意 `get` 末尾那个返回值归一化：Mooncake 返回的正数是「读到的字节数」（成功），代码把所有正数统一改成 0。配上 `put` 用负数表失败的约定，整套契约对上层就只有一个简单语义——**0 = 成功，非 0 = 这个块失败**。上层的 `_invalid_block_ids` 收集逻辑（12.5）就靠这个统一约定工作，不必关心底下是 Mooncake 还是别的什么。
 
 至于 `set_device`（绑 NPU）、`register_buffer`（经 Mooncake 的 transfer engine 注册显存）、`setup`（连 metadata server / master server）这些，都是和 NPU、RDMA 硬件强耦合的部分。host 上没有 NPU 和 CANN，跑不了真实的池存取——所以精简版用一个纯内存 dict 的替身后端来验**契约的调用顺序**（exists → 去重 → put、get 的状态码归一），实际的 RDMA 搬运不真跑。这条边界和本章一开始定的运行约束一致：能验的是控制流，验不了的是真实显存搬运。
 

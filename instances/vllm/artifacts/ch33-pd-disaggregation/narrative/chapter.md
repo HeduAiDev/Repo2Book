@@ -805,7 +805,7 @@ bind_connector_metadata → start_load_kv → [forward 内：层级 hook] → wa
 
 `start_load_kv` 的下标严格小于 forward 标记，`wait_for_save` 的下标严格大于——forward 被夹在中间这件事，从调用序列上就坐实了。
 
-第二个该验的是三类后端的完成信号差异（§33.7–30.9）：
+第二个该验的是三类后端的完成信号差异（§33.7–33.9）：
 
 | 后端 | start_load_kv 干什么 | wait_for_save 干什么 | finished_sending | finished_recving |
 |---|---|---|---|---|

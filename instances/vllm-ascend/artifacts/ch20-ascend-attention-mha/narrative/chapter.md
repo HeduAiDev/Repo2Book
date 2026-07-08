@@ -116,7 +116,7 @@ class AscendAttentionState(Enum):
 
 > *图注：五态各对应一种 batch 形态，决定 `block_table` 来源、KV 来源、`forward_impl` 落在哪条算子路径。注意 DecodeOnly 是唯一可能走 `forward_paged_attention`（分页专用算子）的态——而且还要再过几道门槛，否则也回落到 fused-infer。*
 
-记住一个反直觉的结论：**五态里有四态都走同一条 fused-infer 路径**，只有 DecodeOnly 有机会走专用的分页路径。为什么这么设计、那几道门槛是什么，19.5 揭晓。
+记住一个反直觉的结论：**五态里有四态都走同一条 fused-infer 路径**，只有 DecodeOnly 有机会走专用的分页路径。为什么这么设计、那几道门槛是什么，20.5 揭晓。
 
 ---
 
@@ -392,7 +392,7 @@ class BaseDeviceAdaptor:
         )
 ```
 
-落地了。`_npu_reshape_and_cache` 拿 `slot_indices`（就是 `slot_mapping`），把形状 `[num_tokens, num_kv_heads, head_size]` 的新 K/V，按每个 token 的物理槽号散写进 `(2, num_blocks, block_size, num_kv_heads, head_size)` 的 cache。接 19.3 那个例子：第 0 个 token 的 K/V 写到块 2 第 3 槽，第 1 个写到块 0 第 2 槽，依此类推。一次 scatter，KV 就归位了。
+落地了。`_npu_reshape_and_cache` 拿 `slot_indices`（就是 `slot_mapping`），把形状 `[num_tokens, num_kv_heads, head_size]` 的新 K/V，按每个 token 的物理槽号散写进 `(2, num_blocks, block_size, num_kv_heads, head_size)` 的 cache。接 20.3 那个例子：第 0 个 token 的 K/V 写到块 2 第 3 槽，第 1 个写到块 0 第 2 槽，依此类推。一次 scatter，KV 就归位了。
 
 这里能在 host 上验证的是控制流：哪些 token 被切出来、`slot_indices` 等于 `slot_mapping[:num_actual_tokens]`、算子被调用一次且参数正确。真正的散写在 NPU 上发生，host 不真算——但「调用契约」清清楚楚。
 
@@ -455,7 +455,7 @@ def forward(
     return output
 ```
 
-注意签名里的 shape 注释——输入是 `[num_tokens, num_heads, head_size]` 的三维打平张量，输出 `[num_tokens, num_heads * head_size]`。整个 batch 的所有 token 沿轴 0 摞在一起，没有 padding 到等长。这个「打平」是后面 TND 布局的前提，19.6 再细说。
+注意签名里的 shape 注释——输入是 `[num_tokens, num_heads, head_size]` 的三维打平张量，输出 `[num_tokens, num_heads * head_size]`。整个 batch 的所有 token 沿轴 0 摞在一起，没有 padding 到等长。这个「打平」是后面 TND 布局的前提，20.6 再细说。
 
 真正的分流在 `forward_impl`，全章最关键的一段判定：
 
@@ -483,7 +483,7 @@ def forward_impl(
     return output
 ```
 
-整章的控制流，浓缩成这个 `if`。三个条件**全部**满足，才走分页专用算子 `forward_paged_attention`；任意一个不满足，回落到 fused-infer。这就解释了 19.2 那个反直觉结论——
+整章的控制流，浓缩成这个 `if`。三个条件**全部**满足，才走分页专用算子 `forward_paged_attention`；任意一个不满足，回落到 fused-infer。这就解释了 20.2 那个反直觉结论——
 
 ![forward 的数据流](../diagrams/ch19-forward-flow.png)
 
@@ -600,7 +600,7 @@ def _get_fia_params(self, key, value, attn_metadata, kv_cache=None):
 - **PrefillNoCache**：KV 就是传进来的 `key` / `value`（本步刚算的），`block_table = None`，`block_size` 写死 128。无历史可读，无 cache 可指。
 - **其余三态**（PrefillCacheHit / DecodeOnly / ChunkedPrefill）：KV 在分页 cache 里，把 `key_cache` / `value_cache` `view` 成 `(num_block, block_size, -1)` 喂算子，`block_table` 指向各序列的物理块，`actual_seq_lengths_kv` 给出各序列的 KV 长度。
 
-19.4 写 KV、这里读 KV，两头都靠 `slot_mapping` / `block_table` 这套地址簿对齐——写进去的槽，正是后续读回来的块。
+20.4 写 KV、这里读 KV，两头都靠 `slot_mapping` / `block_table` 这套地址簿对齐——写进去的槽，正是后续读回来的块。
 
 ### Fused 算子：TND 变长布局 + `sparse_mode`
 
@@ -665,7 +665,7 @@ def forward_fused_infer_attention(self, query, key, value, attn_metadata, output
 
 为什么「无需 padding」是大事？传统 GPU kernel 要让一批里各序列并行，前提是它们**等长**，于是不得不把每条序列都 padding 到批内最长——短序列上全是白算的填充 token。TND 直接吃变长序列，从根上免去这层 padding。
 
-这省了多少？拿 19.3 第一批算账：`query_lens = [1, 1, 5, 7]`，若 padding 到等长，要 $4 \times 7 = 28$ 个 token 的计算量；TND 只算真实的 $1+1+5+7 = 14$ 个。整整省掉一半。序列长度越参差，padding 浪费越大，TND 省得越多——这就是变长布局对吞吐的直接贡献。
+这省了多少？拿 20.3 第一批算账：`query_lens = [1, 1, 5, 7]`，若 padding 到等长，要 $4 \times 7 = 28$ 个 token 的计算量；TND 只算真实的 $1+1+5+7 = 14$ 个。整整省掉一半。序列长度越参差，padding 浪费越大，TND 省得越多——这就是变长布局对吞吐的直接贡献。
 
 mask 本身由一个单例工厂供给，造一次、全程复用：
 
@@ -765,7 +765,7 @@ def full_graph_pa(
         return output
 ```
 
-`_npu_paged_attention_get_workspace` 用和真算子一模一样的入参，**只量大小、不算结果**，量出的 workspace 按 `num_tokens` 缓存进 `graph_params.workspaces`。fused-infer 那条也有对应的 `*_get_max_workspace`。这一步在 eager 主前向上不出现（19.6 的两条算子直接调用），只在图捕获/重放时登场——但它是理解「NPU 算子为什么比 CUDA 内核多一道工序」的关键。记住这个节拍：**先 `*_get_workspace` 量显存，再录真算子**。
+`_npu_paged_attention_get_workspace` 用和真算子一模一样的入参，**只量大小、不算结果**，量出的 workspace 按 `num_tokens` 缓存进 `graph_params.workspaces`。fused-infer 那条也有对应的 `*_get_max_workspace`。这一步在 eager 主前向上不出现（20.6 的两条算子直接调用），只在图捕获/重放时登场——但它是理解「NPU 算子为什么比 CUDA 内核多一道工序」的关键。记住这个节拍：**先 `*_get_workspace` 量显存，再录真算子**。
 
 ---
 
@@ -783,10 +783,10 @@ def full_graph_pa(
 
 回到开篇那个问题——标准 MHA 在昇腾 NPU 上到底怎么算？这一章把答案拆成了三句话：
 
-- **一台五态机做单一分流轴**（19.2，`vllm_ascend/attention/attention_v1.py:L143-L148`）。`AscendAttentionState` 的五个态各对应一种 batch 形态，`forward_impl`（`L1258-L1277`）和 `_get_fia_params` 据此分流。四态走 fused-infer 主干，唯有 DecodeOnly 在严苛门槛下解锁分页快车道。
-- **两条算子路径承接所有态**（19.5–19.6，`vllm_ascend/attention/attention_v1.py:L1166-L1185, L1045-L1164`）。`forward_paged_attention` 调 `_npu_paged_attention`（纯 decode）；`forward_fused_infer_attention` 调 `npu_fused_infer_attention_score`（其余四态，TND 变长 + `sparse_mode` 选 mask）。中间靠 `split_decodes_and_prefills` 拆批、`slot_mapping` / `block_table` 对齐 KV 读写。
-- **一套「换内核、不改引擎」**（19.7）。基座 `vllm/v1/attention/backends/flash_attn.py:L809` 的 `flash_attn_varlen_func` → fused-infer + paged，`reshape_and_cache_flash`（`L887`）→ `vllm_ascend/device/device_op.py:L42-L47` 的 `_npu_reshape_and_cache`，`cu_seqlens` → `actual_seq_lengths` + TND。后端契约一行不改。workspace 预取是 NPU 算子相对 CUDA flash 的特有节拍。
+- **一台五态机做单一分流轴**（20.2，`vllm_ascend/attention/attention_v1.py:L143-L148`）。`AscendAttentionState` 的五个态各对应一种 batch 形态，`forward_impl`（`L1258-L1277`）和 `_get_fia_params` 据此分流。四态走 fused-infer 主干，唯有 DecodeOnly 在严苛门槛下解锁分页快车道。
+- **两条算子路径承接所有态**（20.5–20.6，`vllm_ascend/attention/attention_v1.py:L1166-L1185, L1045-L1164`）。`forward_paged_attention` 调 `_npu_paged_attention`（纯 decode）；`forward_fused_infer_attention` 调 `npu_fused_infer_attention_score`（其余四态，TND 变长 + `sparse_mode` 选 mask）。中间靠 `split_decodes_and_prefills` 拆批、`slot_mapping` / `block_table` 对齐 KV 读写。
+- **一套「换内核、不改引擎」**（20.7）。基座 `vllm/v1/attention/backends/flash_attn.py:L809` 的 `flash_attn_varlen_func` → fused-infer + paged，`reshape_and_cache_flash`（`L887`）→ `vllm_ascend/device/device_op.py:L42-L47` 的 `_npu_reshape_and_cache`，`cu_seqlens` → `actual_seq_lengths` + TND。后端契约一行不改。workspace 预取是 NPU 算子相对 CUDA flash 的特有节拍。
 
-还有一条线在这里收口：运行期的 CP 分流（19.1）。`get_impl_cls` / `get_builder_cls` 一旦 `enable_cp()` 为真，就切到 `context_parallel/` 子模块的 CP 版实现——[第 8 章](../../ch08-ascend-parallel-groups/narrative/chapter.md) 排好的那套 CP 组，到这一拍才真正被运行期选中。组排布回指第 8 章，CP 注意力算子是另一条专门的线，不在本章主干。
+还有一条线在这里收口：运行期的 CP 分流（20.1）。`get_impl_cls` / `get_builder_cls` 一旦 `enable_cp()` 为真，就切到 `context_parallel/` 子模块的 CP 版实现——[第 8 章](../../ch08-ascend-parallel-groups/narrative/chapter.md) 排好的那套 CP 组，到这一拍才真正被运行期选中。组排布回指第 8 章，CP 注意力算子是另一条专门的线，不在本章主干。
 
 本章的主角是标准 MHA——KV 是完整的多头张量。但还有一类模型，把 KV 压成一个低秩的潜在向量（latent），KV cache 的几何完全不同。那套后端，就是下一章 MLA 在 NPU 上的故事。同样的五态机骨架、同样的换内核范式，换一种 KV 布局，看昇腾怎么接。
