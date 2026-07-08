@@ -183,10 +183,10 @@ def original_compute_balanced_pack_redundancy(origin_weights, card_num, num_redu
 
 逐行拆：`origin_weights` 是 `(专家id, 平均热度)` 的列表。循环跑 `num_redundancy_expert` 次，一次发一个名额。`np.argsort(...)[::-1]` 按平均热度**降序**排，`weights[0]` 就是当前最热的那个。`route_expert_redundancy[...]` 记这个专家的副本 id 列表，`.append(route_expert_num + i)` 给它加一个新副本（物理 id 从 `route_expert_num` 往后编，本例就是 8、9）。
 
-关键是那两行摊薄。设这个专家加副本前已有 $k$ 个副本（`len(...)` = k），则 `tmp_raw_weight = 当前平均 × (k+1)` 先还原出原始总热度，再除以 `(k+2)` 得到新平均，也就是（对应 §3.4，arXiv:2412.19437 的冗余复制）：
+关键是那两行摊薄。设这个专家加副本前已有 $k$ 个副本（`len(...)` = k），摊薄前的平均热度记为 $\bar{w}_{old}$、摊薄后记为 $\bar{w}_{new}$，则 `tmp_raw_weight = 当前平均 × (k+1)` 先还原出原始总热度，再除以 `(k+2)` 得到新平均，也就是（对应 §3.4，arXiv:2412.19437 的冗余复制）：
 
 $$
-\mathrm{新平均} = \mathrm{旧平均}\times\frac{k+1}{k+2}
+\bar{w}_{new} = \bar{w}_{old}\times\frac{k+1}{k+2}
 $$
 
 本例专家 3 第一次被选时 $k=0$，$60 \times 1 / 2 = 30$，和推演表一字不差。摊薄后写回 `weights[0]`，下一轮它就未必是最热的了——名额自然流向下一个瓶颈。

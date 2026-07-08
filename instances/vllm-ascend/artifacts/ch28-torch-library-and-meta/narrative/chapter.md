@@ -159,9 +159,7 @@ std::tuple<at::Tensor, at::Tensor> get_masked_input_and_mask(
 
 把这条因果链摆直：
 
-$$
-\mathrm{算子无\ Meta\ 实现} \Rightarrow \mathrm{派发器查不到\ meta} \Rightarrow \mathrm{推不出输出\ shape/dtype} \Rightarrow \mathrm{形状推断链中断} \Rightarrow \mathrm{子图无法捕获}
-$$
+**算子无 Meta 实现 ⇒ 派发器查不到 meta ⇒ 推不出输出 shape/dtype ⇒ 形状推断链中断 ⇒ 子图无法捕获**
 
 一句人话：**假跑是靠每个算子的 meta「自报输出形状」接力的；少一个人报，接力就断。** 这就是为什么 63 个真算子，绝大多数都得再配一份 meta。
 
@@ -280,7 +278,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
 既然每个想进图的真实现都得配一份 meta，我们有理由预期这两个数字应当相近——理想情况下相等。数一下实际数字：`torch_binding.cpp` 主块 `ops.def` 了 **63** 个算子，`torch_binding_meta.cpp` 主块 `ops.impl` 了 **57** 个 meta。差 **6** 个。
 
 $$
-63\ \mathrm{(真实现)} - 57\ \mathrm{(C{+}{+}\ meta)} = 6\ \mathrm{(有真实现、却没\ C{+}{+}\ meta\ 的算子)}
+63 - 57 = 6
 $$
 
 这 6 个不是随便差的，点名是：`bgmv_shrink`、`sgmv_shrink`、`swap_blocks`、`swap_blocks_batch`、`get_npu_storage_shape`、`npu_apply_top_k_top_p`。它们在 `torch_binding.cpp` 都有 `def` + 真实现，但在 `torch_binding_meta.cpp` 主块**没有对应的 meta**。（`bgmv_shrink` / `sgmv_shrink` 是 LoRA 相关算子——批量 / 分段的矩阵-向量收缩，源码里它们的 `weight` 形状就是 `[num_loras, …]`。）

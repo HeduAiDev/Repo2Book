@@ -49,9 +49,9 @@ $$
 $N$ 是位宽。对称与非对称的区别，全在 $s$ 和 $z$ 怎么定：
 
 $$
-\underbrace{s = \frac{\max(|w|)}{q_{\max}},\ z=0}_{\mathrm{对称}}
+\underbrace{s = \frac{\max(|w|)}{q_{\max}},\ z=0}_{\mathrm{sym}}
 \qquad\qquad
-\underbrace{s = \frac{\max(w)-\min(w)}{q_{\max}},\ z=\mathrm{round}\!\left(\frac{|\min(w)|}{s}\right)}_{\mathrm{非对称}}
+\underbrace{s = \frac{\max(w)-\min(w)}{q_{\max}},\ z=\mathrm{round}\!\left(\frac{|\min(w)|}{s}\right)}_{\mathrm{asym}}
 $$
 
 对称省一个 zero-point 张量和一次加法，适合分布本就对称的权重；非对称让零点平移，把尺子全部刻度压到 $[\min, \max]$ 这段数据真正出现的区间，适合有偏置的分布（如激活）。

@@ -12,16 +12,16 @@
 
 MLA（Multi-head Latent Attention，多头潜在注意力；[首现见第 19 章](../../ch19-attention-backend-selection/narrative/chapter.md)）是 DeepSeek-V2/V3 带火的注意力变体。它解决的是一个很具体的痛点：**KV cache 太占显存**。
 
-标准 MHA 每个 token、每一层，要为每个头各缓存一份 K 和一份 V。以 DeepSeek-V3 为例，128 个头、每头 K/V 各 128 维：
+标准 MHA 每个 token、每一层，要为每个头各缓存一份 K 和一份 V。以 DeepSeek-V3 为例，128 个头、每头 K/V 各 128 维（下面两个公式的结果单位均为：标量数/token/层）：
 
 $$
-\mathrm{MHA\_cache} = N \times (P + V) = 128 \times (128 + 128) = 32768 \;\mathrm{（标量/token/层）}
+\mathrm{MHA\_cache} = N \times (P + V) = 128 \times (128 + 128) = 32768
 $$
 
 MLA 换了个存法：不存满维 K/V，只缓存一个**低秩隐向量** `kv_c`（`kv_lora_rank = 512`），外加一个**解耦位置编码** `k_pe`（`qk_rope_head_dim = 64`）——本章默认你已了解低秩压缩与解耦 RoPE 背后的数学动机，完整推导[上一章：MLA 原理](../../ch21-primer-mla/narrative/chapter.md)刚给过，这里只看昇腾把它落成了怎样的算子：
 
 $$
-\mathrm{MLA\_cache} = L_{kv} + R = 512 + 64 = 576 \;\mathrm{（标量/token/层）}
+\mathrm{MLA\_cache} = L_{kv} + R = 512 + 64 = 576
 $$
 
 $$

@@ -28,10 +28,10 @@
 
 第二层才是**申请物理页**（physical handle）并把它 **map 到那段 VA 上**。这一步才真正消耗显存。张量指针指向的，永远是第一层的 VA。
 
-关键就在这里：这两层可以**分别操作**。
+关键就在这里：这两层可以**分别操作**——张量指针（tensor pointer，下文记 `ptr`）指向的是 VA，VA 全程保留不动；VA 背后绑定的物理页（physical page，下文记 `page`），却可以随时解绑、重新绑定：
 
 $$
-\mathrm{张量指针} \;\longrightarrow\; \mathrm{VA（虚拟地址，保留就不动）} \;\longrightarrow\; \mathrm{物理页（可解绑、可重绑）}
+\mathrm{ptr} \;\longrightarrow\; \mathrm{VA} \;\longrightarrow\; \mathrm{page}
 $$
 
 sleep 时，我们做的是 **unmap + release 物理页**：把 VA 和物理页之间的映射拆掉、物理显存交还系统。但那段 VA 仍然被「保留」着——没还、没让出去，地图上那块地还圈着，只是上面的房子拆了。

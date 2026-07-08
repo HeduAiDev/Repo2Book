@@ -149,10 +149,10 @@ def resolve_current_platform_cls_qualname() -> str:
 
 > *图注：builtin 探测函数「问硬件」，host 无对应硬件全返 None；OOT 的 register() 「装了就用」无条件返字符串。`elif` 链把 OOT 分支放在最前——只要有一个 OOT 激活，就走 OOT，根本不看 builtin。*
 
-注意 `elif` 链的次序：`OOT≥2`（报错）→ `OOT==1`（取 OOT）→ `builtin≥2`（报错）→ `builtin==1`（取 builtin）→ 否则 `UnspecifiedPlatform`。把这串判定形式化一下。记 builtin 的激活集为 B、OOT 的激活集为 O，最终选中的平台 P 按如下优先级决定：
+注意 `elif` 链的次序：`OOT≥2`（报错）→ `OOT==1`（取 OOT）→ `builtin≥2`（报错）→ `builtin==1`（取 builtin）→ 否则 `UnspecifiedPlatform`。把这串判定形式化一下。记 builtin 的激活集为 B、OOT 的激活集为 O，并约定 $\mathrm{sole}(S)$ 表示单元素集合 $S$ 中的那个（唯一）元素，最终选中的平台 P 按如下优先级决定：
 
 $$
-P = \begin{cases} \mathrm{RuntimeError} & |O| \ge 2 \\ O\ \mathrm{的唯一元素} & |O| = 1 \\ \mathrm{RuntimeError} & |O|=0,\ |B| \ge 2 \\ B\ \mathrm{的唯一元素} & |O|=0,\ |B| = 1 \\ \mathrm{UnspecifiedPlatform} & |O|=|B|=0 \end{cases}
+P = \begin{cases} \mathrm{RuntimeError} & |O| \ge 2 \\ \mathrm{sole}(O) & |O| = 1 \\ \mathrm{RuntimeError} & |O|=0,\ |B| \ge 2 \\ \mathrm{sole}(B) & |O|=0,\ |B| = 1 \\ \mathrm{UnspecifiedPlatform} & |O|=|B|=0 \end{cases}
 $$
 
 人话翻译：**「只要装了一个 OOT 平台插件，就用它，并且不许同时装两个。」** OOT 那一支被放在 `builtin` 之前判定，所以哪怕你这台机器同时有 GPU（`cuda` 也激活了），只要 `ascend` 在场，最终选中的仍是昇腾。这正是「不改 vLLM 源码就能顶替默认行为」的机制落点——用户安装 vllm-ascend 的意图本就是「我要用昇腾」，代码无需再让用户显式去关掉 builtin 探测。同时，`|O| >= 2` 直接 `RuntimeError`，保证「平台唯一」这条硬约束。
