@@ -23,6 +23,17 @@
 
 只想看这套算法怎么落进代码——`merge_attn_states` 怎么合、cascade attention 怎么省算——可以跳过中间推导，直接读「六、⊕ 算子再现」到「八、落地：cascade attention」这几节；想跟一遍完整推导，就从「二、推导之一」按序读到「五、FlashAttention-2」，再顺势读进代码落地。
 
+### 符号速查表
+
+后面几节会陆续借用几个记号，先列一张表备查；每个符号首次出现处正文也会紧跟一句解释，不必现在就死记。
+
+| 符号 | 含义 | 首次出现 |
+|---|---|---|
+| $M$（⊕ 算子的稳定化基准） | 合并两组统计量时取的较大者（如 $\max(m_i,m_j)$ 或 $\max(l_a,l_b)$），把两个指数的底数都压到 ≤1 防上溢——本章为叙述简洁补的记号，原论文里是内联写的 $\max(\cdot,\cdot)$，未单独命名 | 二、推导之一 |
+| $B_r$ | FlashAttention 分块时 Q 的行块大小（row block size） | 三、推导之二 |
+| $B_c$ | FlashAttention 分块时 K、V 的列块大小（column block size），与 $B_r$ 搭配限定局部打分块 $S_{ij}$ 的形状为 $B_r\times B_c$ | 三、推导之二 |
+| $M$（SRAM 容量） | GPU 片上 SRAM 的大小（以元素个数计），IO 复杂度账 $\Theta(N^2d^2/M)$ 分母里的那个 $M$——和上一行 ⊕ 算子的稳定化基准是两个不同的量，别混淆 | 四、推导之三 |
+
 ---
 
 ## 一、动机：被物化的 N×N 与内存带宽墙
@@ -171,7 +182,7 @@ $$
 
 有了 ⊕ 算子，FlashAttention(arXiv:2205.14135 §3.1 Algorithm 1)就水到渠成：把 $Q$ 、 $K$ 、 $V$ 切成能塞进 SRAM 的小块，**一次只把当前这一小块搬上"书桌"算**。手里始终攥着三个 running 量：见过的最高分 $m_i$ 、归一累计 $\ell_i$ 、当前的加权输出 $O_i$(注意力章里的记号沿用， $\ell$ 就是这里的 $d$)。每处理完一个 KV 块，就用 online-softmax 那套 rescale 手法把三个量更新到新基准——**那张 $N\times N$ 的完整打分表，从头到尾没在 HBM 里落过地**。
 
-外层循环遍历 $K,V$ 的列块 $j$,内层遍历 $Q$ 的行块 $i$;每个 $(i,j)$ 块局部算 $S_{ij}=Q_iK_j^{\top}$(至多 $B_r\times B_c$,绝不是 $N\times N$),局部 softmax 出 $\tilde m_{ij}$ 、 $\tilde\ell_{ij}$ 、 $\tilde P_{ij}$,再把 running 量推到新的全局 max(arXiv:2205.14135 §3.1 Algorithm 1 L11-L13):
+外层循环遍历 $K,V$ 的列块 $j$,内层遍历 $Q$ 的行块 $i$;每个 $(i,j)$ 块局部算 $S_{ij}=Q_iK_j^{\top}$(至多 $B_r\times B_c$——$B_r$ 是 Q 的行块大小、$B_c$ 是 K,V 的列块大小，绝不是 $N\times N$),局部 softmax 出 $\tilde m_{ij}$ 、 $\tilde\ell_{ij}$ 、 $\tilde P_{ij}$,再把 running 量推到新的全局 max(arXiv:2205.14135 §3.1 Algorithm 1 L11-L13):
 
 $$
 m_i^{\mathrm{new}}=\max(m_i,\tilde m_{ij}),\qquad
@@ -217,13 +228,13 @@ $$
 \Theta(Nd+N^2)\quad\longrightarrow\quad \Theta\!\left(\frac{N^{2}d^{2}}{M}\right)
 $$
 
-左边是标准注意力(含 $N^2$ 物化项),右边是 FlashAttention($M$ 是 SRAM 大小)。证明骨架分三步：其一， $K,V$ 总共 $\Theta(Nd)$ 个元素，SRAM 每次只装得下 $\Theta(M)$ 一块，故要分 $\Theta(Nd/M)$ 个块轮流驻留；其二，每个 $K,V$ 块驻留期间，由于每个 query 行都要和它里面的每个 key 做点积，必须把整个 $Q$($\Theta(Nd)$ 个元素)从 HBM 过一遍与之相乘；其三，块数乘以每块过一遍 $Q$ 的开销，即得总 HBM 访问量：
+左边是标准注意力(含 $N^2$ 物化项),右边是 FlashAttention($M$ 是 SRAM 大小——这个 $M$ 与 §二 ⊕ 算子里的稳定化基准 $M$ 是两个不同的量，请勿混淆，详见开篇符号速查表)。证明骨架分三步：其一， $K,V$ 总共 $\Theta(Nd)$ 个元素，SRAM 每次只装得下 $\Theta(M)$ 一块，故要分 $\Theta(Nd/M)$ 个块轮流驻留；其二，每个 $K,V$ 块驻留期间，由于每个 query 行都要和它里面的每个 key 做点积，必须把整个 $Q$($\Theta(Nd)$ 个元素)从 HBM 过一遍与之相乘；其三，块数乘以每块过一遍 $Q$ 的开销，即得总 HBM 访问量：
 
 $$
 \Theta\!\left(\frac{Nd}{M}\right)\times\Theta(Nd)=\Theta\!\left(\frac{N^{2}d^{2}}{M}\right)
 $$
 
-关键在 $d$ 一般只有 64-128,而 $M\approx100\mathrm{KB}$,于是 $d^2\ll M$,右边比左边少好几倍。Proposition 3 还证了这是**下界**:在这段 $M$ 范围内，没有精确注意力算法能渐进更省。
+关键在 $d$ 一般只有 64-128,而 $M\approx100\mathrm{KB}$(fp32 下约 25600 个元素),于是 $d^2\ll M$,右边比左边少好几倍。Proposition 3 还证了这是**下界**:在这段 $M$ 范围内，没有精确注意力算法能渐进更省。
 
 ### 机制：代入真数字
 
@@ -243,7 +254,19 @@ $N=1024$ 时标准搬 4456448 个元素、Flash 只搬 2338816,省了约一半(1
 
 *图 34-4　标准注意力访存随 N² 暴涨，FlashAttention 消去 N² 项。比值 1.91×→1.99×→2.04× 随 N 上升，序列越长越赚。*
 
-这里报的是**元素级搬运数**,在 $d=64$ 、SRAM≈100KB 时只看到 1.91×→2.04×;论文用 GPT-2 medium 的参数($N=1024$ 、 $d=64$ 、16 heads、batch 64)算出的 HBM 访问量减少可达 9×(arXiv:2205.14135 引言，Fig.2)——**和本章表格算的是同一个指标(HBM 访问量之比),只是取的参数点不同**。而真正的 wall-clock(墙钟)加速是另一个数字：论文 Figure 1 给出的是 7.6×(arXiv:2205.14135 Fig.1)。wall-clock 之所以比纯访存元素计数还快，差距才来自本模型没计入的那部分收益——softmax/mask/dropout 这些 memory-bound 算子被融进单 kernel、kernel 启动与中间张量分配被彻底省掉。方向一致：**注意力慢在 HBM 往返，而 FlashAttention 把往返砍掉了**。
+这里报的是**元素级搬运数**,在 $d=64$ 、SRAM≈100KB 时只看到 1.91×→2.04×;论文用 GPT-2 medium 的参数($N=1024$ 、 $d=64$ 、16 heads、batch 64)算出的 HBM 访问量减少可达 9×(arXiv:2205.14135 引言，Fig.2)——**和本章表格算的是同一个指标(HBM 访问量之比),只是取的参数点不同**。
+
+![重绘自 arXiv:2205.14135 Fig.2：GPT-2 medium 实测：HBM 访存量(不是 FLOP 数)决定 runtime——FlashAttention FLOP 更多却更快](../diagrams/paper-fig-2.png)
+
+*论文 Figure 2 的实测：GPT-2 medium(N=1024、d=64、16 heads、batch 64)上，FlashAttention 的 GFLOPs(75.2)反比标准实现(66.6)更高，但 HBM 读写从 40.3GB 降到 4.4GB(降了约 9.2×，与上面提到的 9× 是同一个数量级)、runtime 从 41.7ms 降到 7.3ms——FLOP 更多却更快，直接坐实"HBM 访存量而非 FLOP 数决定 runtime"这条反直觉论断；中图显示分块 Bc 越大、HBM 访问和前向耗时都越低，右图是 block-sparse 变体的加速比随稀疏度上升。*
+
+而真正的 wall-clock(墙钟)加速是另一个数字：论文 Figure 1 给出的是 7.6×(arXiv:2205.14135 Fig.1)。
+
+![重绘自 arXiv:2205.14135 Fig.1：FlashAttention 用分块(tiling)避免把 N×N 注意力矩阵物化到 HBM,换来 GPT-2 上 7.6× 实测加速](../diagrams/paper-fig-1.png)
+
+*左边是论文 Figure 1 的 tiling 示意：外层循环(红)沿 $K,V$ 的列块搬运，内层循环(蓝)沿 $Q$ 的行块搬运，每一小块都先进 SRAM"上书桌"算完再写回，虚框标出那些从未落回 HBM 的中间量；右边是 GPT-2 上的实测柱状图，标准 PyTorch 实现把 matmul/dropout/softmax/mask 逐段耗时叠加到约 17ms，FlashAttention 融成一个 kernel 后压到约 2.2ms——这正是 7.6× wall-clock 加速的来源。*
+
+wall-clock 之所以比纯访存元素计数还快，差距才来自本模型没计入的那部分收益——softmax/mask/dropout 这些 memory-bound 算子被融进单 kernel、kernel 启动与中间张量分配被彻底省掉。方向一致：**注意力慢在 HBM 往返，而 FlashAttention 把往返砍掉了**。
 
 vLLM 侧对这套访存优化的落地面，就体现在它怎么给 kernel 喂数据。看 `flash_attn_varlen_func` 的接口约定：
 
@@ -299,7 +322,15 @@ Hopper(SM90,streaming multiprocessor 9.0,NVIDIA 上一代数据中心架构)优�
 
 3. **只存一个标量**(arXiv:2307.08691 §3.1.1):初版存 $(m,\ell)$ 两个量，FA-2 只存 logsumexp $L=m+\log(\ell)$ 一个。backward 和合并都只需要它。warp(GPU 里 32 个线程一组的调度单位)分工也从 split-K 改为 **split-Q**(arXiv:2307.08691 §3.3 Work Partitioning):split-K 让每个 warp 各算 $K$ 维的一段、再跨 warp 把各自的部分结果加起来，逼着 warp 之间反复读写 shared memory 做同步；split-Q 改成每个 warp 认领一段 $Q$ 行、各自独立算完自己那几行的完整输出，warp 间不必再通信——省掉的正是这笔 shared-memory 往返。
 
+![重绘自 arXiv:2307.08691 Fig.3：warp 间工作划分：split-K(FlashAttention) vs split-Q(FlashAttention-2)](../diagrams/paper-fig-3.png)
+
+*左边 (a) 是 FlashAttention 的 split-K：$K$ 维被切给 4 个 warp 各算一段 $QK^\top$，再跨 warp 把部分结果写进 shared memory、同步相加；右边 (b) 是 FlashAttention-2 的 split-Q：切分对象换成 $Q$，每个 warp 独立认领一段 $Q$ 行、算完自己那几行的完整输出，warp 之间不再需要通信——省掉的正是 (a) 里那笔 shared-memory 读写。*
+
 第 3 点尤其重要：vLLM 那个 `return_softmax_lse=True` 返回的，正是这个 $L$ 。有了它，才能把分开算的两段注意力精确拼回去——这就是下一节的主题。
+
+![重绘自 arXiv:2307.08691 Fig.4：A100、head_dim=64、含因果掩码配置：FlashAttention-2 前向+反向速度(TFLOPs/s)](../diagrams/paper-fig-4.png)
+
+*A100、head_dim=64、含因果掩码配置下的前向+反向吞吐(TFLOPs/s)：序列长度从 512 到 16k，FlashAttention-2 相对 FlashAttention 约 1.5-1.8×，相对标准 PyTorch 实现在 8k 长度上已达约 9.2×——论文正文称全部配置下最高达 10×,坐实了本节开头"综合比初版快约 2×"背后的实测证据(这里对比的是 FA-2/FA；标准实现的差距更大)。*
 
 ---
 
@@ -319,7 +350,7 @@ $$
 l_{\mathrm{merge}}=\log\!\big(e^{\,l_a-M}+e^{\,l_b-M}\big)+M
 $$
 
-合并后的 $l_{\mathrm{merge}}$ 也是一张新收据，于是可以一段段接力拼下去(arXiv:1805.02867 §3.1 Eq.4;两段版另见 arXiv:2307.08691 §2.3)。为什么这样合是精确的？设两段各自的归一因子 $Z_a=e^{l_a}$ 、 $Z_b=e^{l_b}$ ，则整体输出
+合并后的 $l_{\mathrm{merge}}$ 也是一张新收据，于是可以一段段接力拼下去(arXiv:1805.02867 §3.1 Eq.4;两段版另见 arXiv:2307.08691 §2.3)。为什么这样合是精确的？设两段各自的归一因子 $Z_a=e^{l_a}$ 、 $Z_b=e^{l_b}$ ，且段 a 的未归一化加权和记为 $\sum_a p\cdot v$，按定义 $O_a=\sum_a p\cdot v\,/\,Z_a$，故 $Z_aO_a$ 正是段 a 的未归一化加权和(段 b 同理);两段的未归一化加权和相加、除以总归一化因子 $Z_a+Z_b$，即为整体输出：
 
 $$
 O=\frac{Z_aO_a+Z_bO_b}{Z_a+Z_b}=w_aO_a+w_bO_b
@@ -341,11 +372,11 @@ $$
 看 token 0(套用上面那两条合并公式，即 arXiv:1805.02867 §3.1 Eq.4 的 $\oplus$ 在对数域的写法)：前缀 $\mathrm{lse}=1.4003$ 、后缀 $\mathrm{lse}=0.3536$ ，基准 $M=1.4003$ 。前缀权重记 $w_a$ 、后缀权重记 $w_b$ ：
 
 $$
-w_a=\frac{e^{0}}{e^{0}+e^{0.3536-1.4003}}\approx0.7405,\qquad w_b\approx0.2595
+w_a=\frac{e^{0}}{e^{0}+e^{0.3536-1.4003}}\approx0.7401,\qquad w_b\approx0.2599
 $$
 
 $$
-O=0.7405\times[0.5,0.5]+0.2595\times[2.0,0.0]=[0.8898,0.3701]
+O=0.7401\times[0.5,0.5]+0.2599\times[2.0,0.0]=[0.8898,0.3701]
 $$
 
 **与一次性参照代数恒等，浮点舍入内成立**(参考实现里两 token 的最大逐位差约 $2.2\times10^{-16}$,正是 float64 机器精度量级，四位小数显示位归零)。两 token 都对上。
