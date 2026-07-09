@@ -27,3 +27,6 @@
 | exp-0705-19 | 2026-07-06 | 全书 228 跨章链接相对路径差一层(../ 应 ../../),写手契约示例即错源且无 lint | scripts/lint_anchors.py 三规+writer 契约+引擎迁移一并修正 | anchors 三规 BLOCKING 数 | active |
 | exp-0705-20 | 2026-07-06 | agent 做机械批量重映射易套错映射表(节号修复者 23 章错位)——机械迁移应确定性脚本+机器裁判,不交推理 | RUNBOOK 补章 SOP(引擎+validate 为准) | 迁移后节号错位数 | active |
 | exp-0708-1 | 2026-07-08 | agent 转写长 JSON 落盘必碎转义(三份审计报告全损,journal 救回) | book-gap-audit/book-retro 去 write-report agent,RUNBOOK 处方 Lead python 落盘 | 报告 JSON 可解析率 | active |
+| exp-0709-1 | 2026-07-09 | GitHub cmark-gfm 行内公式紧邻 CJK/全角即整段不渲染(858 处/29 章) | lint_formulas check9+公式规则入册+盘古之白批修 | check9 违例数=0 | active |
+| exp-0709-2 | 2026-07-09 | 图类横幅超宽(6.9:1)排版后不可读——节点预算挡不住画布失控 | lint_chapter_map 画布预算(宽≤1500 比例≤2.6:1)+illustrator 契约 | oversize_canvas=0 | active |
+| exp-0709-3 | 2026-07-09 | lint_diagram_geometry 容差设计漏报图例贴边重叠(单例:chapter-map 模板) | 暂不动阈值,复发≥2 再收紧;illustrator"Read PNG 亲眼看"仍是第一道 | 复发计数 1 | watching |
