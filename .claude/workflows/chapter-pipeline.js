@@ -256,12 +256,18 @@ for (let r = 1; r <= 3; r++) {
       )
     }
   })
-  // Haiku 读者视角理解检查（book-only，顾问性不门控）：用小模型当"没读过源码的读者"扫局部读不懂处
+  // Haiku 读者视角理解检查：非 primer 为 book-only 顾问性（不门控）；
+  // primer 原理章换「第一次读论文的工程师」人格 + 逐公式台阶四问，可 blocking=true 硬门禁。
+  const readerPrompt = PRIMER
+    ? ('你是第一次读这篇论文的工程师（高级工程师，懂 Transformer 基础，但**没读过这篇论文**）。只读 ' + CH + '/narrative/chapter.md（含它引用的图），把前面章节当已读背景，**不准看论文原文、不准看源码、不准上网**。\n' +
+       '逐个关键公式做台阶四问：①符号都认识吗——前文/符号表解释过？②公式前有没有直觉铺垫？③从上一步到这一步是否跳步（缺推导环节）？④是否需要先读别的论文才能看懂？\n' +
+       '四问中只要有一问答案是"没有/是/需要"（真卡住了）→ blocking=true（卡回 writer，公式必须让没读过论文的工程师看懂），并给 problem + suggested_fix + rationale；其余风格性建议 negotiable=true、blocking=false。全部台阶都过 → pass=true、issues=[]。')
+    : ('你是这本书的目标读者（高级工程师，但**没读过这个仓库的源码**）。只读 ' + CH + '/narrative/chapter.md（含它引用的图），把前面章节当已读背景，**不准看源码、不准上网**。\n' +
+       '站读者视角挑"读不懂/卡住"处：① 术语/缩写首现未解释；② 逻辑跳跃、缺中间步骤；③ 引入了本章没建立的概念（如某测试设施/外部机制）；④ 只有结论无直觉/例子。\n' +
+       '每条给 problem + suggested_fix（补一句话/一个例子让读者跟上）+ rationale；全部 negotiable=true、blocking=false（可读性不卡章）。读得顺则 pass=true、issues=[]。')
   const readerThunk = function () {
     return agent(
-      '你是这本书的目标读者（高级工程师，但**没读过这个仓库的源码**）。只读 ' + CH + '/narrative/chapter.md（含它引用的图），把前面章节当已读背景，**不准看源码、不准上网**。\n' +
-      '站读者视角挑"读不懂/卡住"处：① 术语/缩写首现未解释；② 逻辑跳跃、缺中间步骤；③ 引入了本章没建立的概念（如某测试设施/外部机制）；④ 只有结论无直觉/例子。\n' +
-      '每条给 problem + suggested_fix（补一句话/一个例子让读者跟上）+ rationale；全部 negotiable=true、blocking=false（可读性不卡章）。读得顺则 pass=true、issues=[]。',
+      readerPrompt,
       { model: 'haiku', schema: DIM_SCHEMA, label: 'review:reader r' + r, phase: 'Review', agentType: 'general-purpose' }
     )
   }
@@ -270,7 +276,9 @@ for (let r = 1; r <= 3; r++) {
   const reader = all[DIMS.length]               // 读者检查失败(限流)不门控
   const ok = dims.filter(Boolean)
   if (ok.length < DIMS.length) return { chapter: A.chapter_id, escalated: 'review-agents-failed', stage: 'Review', round: r, note: '部分评审 agent 失败(限流/崩溃)，评审未完成，不假通过' }
-  const readerIssues = ((reader && reader.issues) || []).map(function (i) { return Object.assign({}, i, { dimension: 'reader-comprehension', blocking: false, negotiable: true }) })
+  // 非 primer：强制 blocking:false/negotiable:true（顾问性，行为与此前一致）。
+  // primer：保留 reader 自报的 blocking/negotiable（台阶四问的硬卡点纳入下面的 blocking 聚合)。
+  const readerIssues = ((reader && reader.issues) || []).map(function (i) { return Object.assign({}, i, { dimension: 'reader-comprehension' }, PRIMER ? {} : { blocking: false, negotiable: true }) })
   const issues = ok.flatMap(function (d) { return d.issues || [] }).concat(readerIssues)
   const blocking = issues.filter(function (i) { return i.blocking })
   if (!ok.some(function (d) { return !d.pass }) && blocking.length === 0) {
