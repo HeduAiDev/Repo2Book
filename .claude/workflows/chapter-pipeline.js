@@ -271,15 +271,31 @@ for (let r = 1; r <= 3; r++) {
       { model: 'haiku', schema: DIM_SCHEMA, label: 'review:reader r' + r, phase: 'Review', agentType: 'general-purpose' }
     )
   }
-  const all = await parallel(dimThunks.concat([readerThunk]))
+  // PRIMER 专属：推导审计维（仿 reader 维之形状——独立 thunk、非 PRIMER 完全不跑；
+  // 现有 DIMS/dimThunks/readerPrompt 逐字不动，保 resume 缓存）。
+  const derivationThunk = function () {
+    return agent(
+      head('reviewer') +
+      '任务：**只**从「推导审计」维度评审 ' + CH + '/narrative/chapter.md（对照 ' + CH + '/dossier/dossier.json 与论文包 ' + PAPERS + '/paper.md）。\n' +
+      '你是推导审计员。对每条 $$ 推导链**亲手重推**：从假设/定义独立推到结论，再对照正文；矩阵乘法逐步核形状；数值例逐个数字重算；凡能写成 numpy/sympy 可执行断言的写脚本实跑（scratchpad 下）。\n' +
+      '发现推导错误/形状不合法/数字对不上/符号用法与定义冲突 → blocking=true；风格性建议 negotiable=true、blocking=false。该维度无 blocking issue → pass=true。',
+      { schema: DIM_SCHEMA, label: 'review:derivation r' + r, phase: 'Review', agentType: 'general-purpose', model: MODELS.review }
+    )
+  }
+  const all = await parallel(dimThunks.concat([readerThunk]).concat(PRIMER ? [derivationThunk] : []))
   const dims = all.slice(0, DIMS.length)        // 门控只看 4 个真维度
   const reader = all[DIMS.length]               // 读者检查失败(限流)不门控
+  const derivation = PRIMER ? all[DIMS.length + 1] : null   // 仅 PRIMER 时跑；非 PRIMER 恒为 null
   const ok = dims.filter(Boolean)
   if (ok.length < DIMS.length) return { chapter: A.chapter_id, escalated: 'review-agents-failed', stage: 'Review', round: r, note: '部分评审 agent 失败(限流/崩溃)，评审未完成，不假通过' }
+  // 推导审计是 primer 硬门禁：审计 agent 崩了不许静默放行，与其他维同等对待
+  if (PRIMER && !derivation) return { chapter: A.chapter_id, escalated: 'review-agents-failed', stage: 'Review', round: r, note: '推导审计 agent 失败(限流/崩溃)，primer 章不得免审通过' }
   // 非 primer：强制 blocking:false/negotiable:true（顾问性，行为与此前一致）。
   // primer：保留 reader 自报的 blocking/negotiable（台阶四问的硬卡点纳入下面的 blocking 聚合)。
   const readerIssues = ((reader && reader.issues) || []).map(function (i) { return Object.assign({}, i, { dimension: 'reader-comprehension' }, PRIMER ? {} : { blocking: false, negotiable: true }) })
-  const issues = ok.flatMap(function (d) { return d.issues || [] }).concat(readerIssues)
+  // derivation 维只在 PRIMER 存在；blocking/negotiable 原样保留 agent 自报（不盖 blocking:false）。
+  const derivationIssues = ((derivation && derivation.issues) || []).map(function (i) { return Object.assign({}, i, { dimension: 'derivation-audit' }) })
+  const issues = ok.flatMap(function (d) { return d.issues || [] }).concat(readerIssues).concat(derivationIssues)
   const blocking = issues.filter(function (i) { return i.blocking })
   if (!ok.some(function (d) { return !d.pass }) && blocking.length === 0) {
     reviewV = { verdict: 'APPROVED', issues: issues }

@@ -7,6 +7,7 @@ export const meta = {
     { title: 'Materials', detail: 'explainer 补 symbol_table；论文包 meta.json 写批准 key_figures；heavy 先修子论文核心片段扩容进包（# PAPER 锚）' },
     { title: 'Illustrate', detail: '逐批准 key_figure 取原图亲眼看→忠实重绘→登记 manifest→自跑 paper_grounding+geometry' },
     { title: 'Write', detail: 'writer 定点 Edit：符号速查表/首现解释/直觉垫(cliff_points)/light 先修框/图嵌入 target_section' },
+    { title: 'DerivationCheck', detail: 'opus 推导审计员对全章 $$ 推导链亲手重推（假设→结论/矩阵形状/数值重算）；fail 则 writer 微修再判，回环 ≤2 轮，竭尽标 BLOCKED' },
     { title: 'ReaderGate', detail: 'haiku 读者台阶四问硬门禁；fail 则 writer 微修 issues 再判，回环 ≤2 轮，竭尽标 BLOCKED' },
   ],
 }
@@ -34,7 +35,7 @@ if (A.phase === 'apply') {
 const REPO = A.repo_root || CFG.repo_root
 const ARTS = REPO + '/instances/' + A.instance + '/artifacts'
 const PAPERS_ROOT = REPO + '/instances/' + A.instance + '/book/papers'
-const MODELS = Object.assign({ diagnose: 'sonnet', materials: 'sonnet', illustrate: 'sonnet', write: 'sonnet', reader: 'haiku', fix: 'sonnet' }, A.models || {})
+const MODELS = Object.assign({ diagnose: 'sonnet', materials: 'sonnet', illustrate: 'sonnet', write: 'sonnet', derivation: 'opus' /* 推导审计升档 */, reader: 'haiku', fix: 'sonnet' }, A.models || {})
 
 const ESC = '\n\n**逃生舱（重要）**：如果你发现给定的批准/素材/路线是错的——真实情况与批准清单不符、施工会破坏正文正确性、缺关键前置信息——**不要硬着头皮做**。立即返回 status="BLOCKED"，blocker_reason 写清「哪里错 + 建议怎么改」。workflow 会中止该章后续阶段（不影响其他章节），把问题交给 Team Lead。'
 
@@ -163,6 +164,15 @@ const READER_SCHEMA = {
       properties: { problem: { type: 'string' }, suggested_fix: { type: 'string' } } } },
   },
 }
+const DERIVATION_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['pass', 'issues'],
+  properties: {
+    pass: { type: 'boolean' },
+    issues: { type: 'array', items: { type: 'object', additionalProperties: false,
+      required: ['location', 'problem', 'suggested_fix'],
+      properties: { location: { type: 'string' }, problem: { type: 'string' }, suggested_fix: { type: 'string' } } } },
+  },
+}
 
 function materialsPrompt(slug) {
   const dir = ARTS + '/' + slug
@@ -204,6 +214,21 @@ function writePrompt(slug) {
     '返回 status/note/counts（counts.symbols_addressed=你实际处理的 symbols_uncovered 条数；counts.cliff_points_addressed=你实际处理的 cliff_points 条数；counts.key_figures_embedded=你实际嵌入的 key_figures 张数）。' + ESC
 }
 
+function derivationCheckPrompt(slug) {
+  const dir = ARTS + '/' + slug
+  const papers = PAPERS_ROOT + '/' + slug
+  return '你是推导审计员。对每条 $$ 推导链**亲手重推**：从假设/定义独立推到结论，再对照正文；矩阵乘法逐步核形状；数值例逐个数字重算；凡能写成 numpy/sympy 可执行断言的写脚本实跑（scratchpad 下）。发现推导错误/形状不合法/数字对不上/符号用法与定义冲突 → 记入 issues；纯风格性建议不必记录（本门禁只关注推导正确性）。\n' +
+    '只审本次改动触及的推导链与数值例可从 `cd ' + dir + ' && git diff -- narrative/chapter.md` 看（本次 uplift 新插入的符号速查表/直觉垫/先修框/图嵌入），但为防连带错误，**全章 $$ 链都过一遍**，不能只挑改动处。\n' +
+    '读 ' + dir + '/narrative/chapter.md（定稿正文）+ 论文包 ' + papers + '/paper.md（推导对照的真相源）。\n' +
+    '逐条推导过：①假设/定义是否足以独立推出结论（无缺失步骤）？②矩阵/张量运算各步形状是否合法（写下形状标注核对）？③数值例每个数字能否用脚本复算对上？④符号用法是否与全文定义/符号速查表一致（无冲突/无静默改名）？\n' +
+    '返回 pass（全部推导链核验通过则 true）与 issues（每条 {location(哪个小节/哪条公式), problem(具体错在哪，需可复现), suggested_fix(具体怎么改)}）；pass=true 时 issues 为空数组。'
+}
+function derivationFixPrompt(slug, issues) {
+  const dir = ARTS + '/' + slug
+  return '你的角色契约在 ' + REPO + '/.claude/agents/writer.md。任务：推导审计门禁 FAIL，**只修**下列具体 issue（定点 Edit，不许整章重写、不改其余正文）：\n' + JSON.stringify(issues) + '\n' +
+    '完成后自跑 `python3 ' + REPO + '/scripts/lint_paper_grounding.py ' + dir + ' --expect-primer` + `python3 ' + REPO + '/scripts/lint_formulas.py ' + dir + '/narrative/chapter.md` + `python3 ' + REPO + '/scripts/lint_chapter_structure.py ' + dir + '/narrative/chapter.md` 确保均无 BLOCKING。返回 status/note。' + ESC
+}
+
 function readerPrompt(slug) {
   const dir = ARTS + '/' + slug
   return '你是第一次读这篇论文的工程师（高级工程师，懂 Transformer 基础，但没读过这篇论文、没看过源码）。只用 Read 打开 ' + dir + '/narrative/chapter.md（含它引用的图，图也用 Read 打开看）。**不准看论文包/dossier/explainer，不准上网。**\n' +
@@ -216,9 +241,55 @@ function readerFixPrompt(slug, issues) {
     '完成后自跑 `python3 ' + REPO + '/scripts/lint_paper_grounding.py ' + dir + ' --expect-primer` + `python3 ' + REPO + '/scripts/lint_formulas.py ' + dir + '/narrative/chapter.md` + `python3 ' + REPO + '/scripts/lint_chapter_structure.py ' + dir + '/narrative/chapter.md` 确保均无 BLOCKING。返回 status/note。' + ESC
 }
 
+// Write 之后、ReaderGate 之前的推导审计门禁。回环形状**直接复用 readerGateStage 的 ≤2 轮预算**
+// （而非另设独立 ≤1 轮修+复审变体）——两道门禁体量相当，复用同一形状实现最简单、行为也最好预测。
+async function derivationCheckStage(wr, slug) {
+  if (!wr || !wr.write || wr.write.status !== 'OK') {
+    return Object.assign({ slug: slug, skipped: 'derivation-check' }, wr || { status: 'BLOCKED', note: 'write agent 失败(限流/崩溃)' })
+  }
+  let verdict = null
+  let rounds = 0
+  let issuesLedger = []
+  for (let g = 1; g <= 2; g++) {
+    phase('DerivationCheck')
+    rounds = g
+    verdict = await agent(derivationCheckPrompt(slug), {
+      schema: DERIVATION_SCHEMA, label: 'derivation:' + slug.slice(0, 12) + ' r' + g, phase: 'DerivationCheck',
+      model: MODELS.derivation, agentType: 'general-purpose',
+    })
+    if (!verdict) { issuesLedger = ['derivation agent 失败(限流/崩溃)']; break }
+    if (verdict.pass) { issuesLedger = []; break }
+    issuesLedger = verdict.issues
+    if (g === 2) break // 竭尽：不再修，直接判 BLOCKED
+    const fix = await agent(derivationFixPrompt(slug, issuesLedger), {
+      schema: STATUS_SCHEMA, label: 'derivation-fix:' + slug.slice(0, 12) + ' r' + g, phase: 'DerivationCheck',
+      model: MODELS.fix, agentType: 'general-purpose',
+    })
+    if (fix && fix.status === 'BLOCKED') {
+      return Object.assign({}, wr, { derivation: { status: 'BLOCKED', verdict: 'FIX-BLOCKED', rounds: g, note: fix.blocker_reason, issues: issuesLedger } })
+    }
+    if (!fix) { log('derivation-fix agent 失败(限流/崩溃)，第 ' + g + ' 轮，仍按原 issues 再判') }
+  }
+  const passed = !!(verdict && verdict.pass)
+  log((passed ? '推导审计 PASS' : '推导审计 FAIL（' + rounds + ' 轮竭尽）') + '：' + slug)
+  return Object.assign({}, wr, {
+    derivation: {
+      status: passed ? 'OK' : 'BLOCKED',
+      verdict: passed ? 'PASS' : 'FAIL',
+      rounds: rounds,
+      issues: issuesLedger,
+    },
+  })
+}
+
 async function readerGateStage(wr, slug) {
   if (!wr || !wr.write || wr.write.status !== 'OK') {
     return Object.assign({ slug: slug, skipped: 'reader-gate' }, wr || { status: 'BLOCKED', note: 'write agent 失败(限流/崩溃)' })
+  }
+  // ⚠️ 短路不变式（同上）：DerivationCheck genuinely FAIL（非上游 skip 传导）时到这里 wr.derivation.status
+  // 是 'BLOCKED' 且 wr 本身无 skipped 标签——补一道 reader-gate 自己的 skip，标签属于"被跳过的这一站"。
+  if (!wr.derivation || wr.derivation.status !== 'OK') {
+    return Object.assign({ slug: slug, skipped: 'reader-gate' }, wr)
   }
   let verdict = null
   let rounds = 0
@@ -286,7 +357,10 @@ if (A.phase === 'apply') {
       }).then(function (r) { return Object.assign({}, ill, { write: r || { status: 'BLOCKED', note: 'write agent 失败(限流/崩溃)', counts: null } }) })
     },
     function (wr, slug) {
-      return readerGateStage(wr, slug)
+      return derivationCheckStage(wr, slug)
+    },
+    function (dc, slug) {
+      return readerGateStage(dc, slug)
     }
   )
 
@@ -296,13 +370,14 @@ if (A.phase === 'apply') {
   function blockedNote(r) {
     if (r.skipped === 'illustrate') return r.note || ''
     if (r.skipped === 'write') return (r.illustrate && r.illustrate.note) || ''
-    if (r.skipped === 'reader-gate') return (r.write && r.write.note) || ''
+    if (r.skipped === 'derivation-check') return (r.write && r.write.note) || ''
+    if (r.skipped === 'reader-gate') return (r.derivation && (r.derivation.note || JSON.stringify(r.derivation.issues || []))) || ''
     return (r.gate && r.gate.note) || (r.gate && r.gate.issues && JSON.stringify(r.gate.issues)) || ''
   }
   log('primer 施工:' + ok.length + '/' + all.length + ' 章全绿' + (blocked.length ? '；BLOCKED:' + blocked.map(function (r) { return r.slug }).join(',') : ''))
   return {
     phase: 'apply',
-    ok: ok.map(function (r) { return { slug: r.slug, counts: r.gate.counts, reader_verdict: r.gate.reader_verdict, rounds: r.gate.rounds } }),
+    ok: ok.map(function (r) { return { slug: r.slug, counts: r.gate.counts, reader_verdict: r.gate.reader_verdict, rounds: r.gate.rounds, derivation_rounds: r.derivation && r.derivation.rounds } }),
     blocked: blocked.map(function (r) { return { slug: r.slug, stage: r.skipped || 'reader-gate', note: blockedNote(r) } }),
   }
 }
