@@ -28,7 +28,7 @@ CHAPTER_DIR_NUM = re.compile(r'^ch(\d{2})')
 
 # 行文节号「N.M」精度优先版(仅两种模式触发，见 check_stale_section_prefix docstring)：
 # ① 「§N.M」：§ 前缀恒为节引用。
-STALE_SECTION_MARK = re.compile(r'§(\d{1,2})\.(\d{1,2})(?![\d.])')
+STALE_SECTION_MARK = re.compile(r'§(\d{1,3})\.(\d{1,2})(?![\d.])')
 # ② 裸「N.M」候选(排除版本号 v0.21.0 / 小数连写 3.5.1 / 紧邻 §)——是否 warn 还要看上下文(见下)。
 STALE_SECTION_BARE = re.compile(r'(?<![\dvV.§])(\d{1,2})\.(\d{1,2})(?![\d.])')
 # 裸「N.M」的后缀语境：紧邻 0-1 个空格 + 「节」/「小节」。

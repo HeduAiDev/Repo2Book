@@ -98,7 +98,7 @@ primer 章 = 论文精读章(动机→推导→数值→落地),豁免 subtract-
 1. **定位先于内容**：outline-final.json 把新章条目插到目标位置(deps/part 定好);primer 章同步 papers-map。
 2. **生产**：新书/尾部追加→直接按最终章号发 chapter-pipeline,零迁移;存量书中段插入→先以临时尾号生产,APPROVED 后走第 3 步。
 3. **插入迁移**：`python3 scripts/renumber_chapters.py --instance <x> --insert <slug>@before:<目标dir>` 生成级联 plan → 存盘 book/cartography/ → `--plan <file> --dry-run` 审阅日志 → 执行(自动跑悬空校验)。执行窗口内不发该实例任何章 workflow。
-4. **接缝导语**：writer 定点重写插入点前后章的开场/收尾(按内容措辞衔接);受影响章 roadmap.png 重渲(roadmap.py 循环);**受影响章 `diagrams/*.py`(含 chapter-map 的 gen 脚本)重跑再生 SVG/PNG**——renumber 引擎只重写 gen 脚本内的 `§N.M`/`第 N 章`/`chNN-slug` 文本,SVG/PNG 是渲染产物、引擎不碰,不重跑就是"代码新号、图仍留旧号"的静默漂移;bible 章号已由引擎重写,抽查 due。
+4. **接缝导语**：writer 定点重写插入点前后章的开场/收尾(按内容措辞衔接);受影响章 roadmap.png 重渲(roadmap.py 循环);**受影响章 `diagrams/*.py`(含 chapter-map 的 gen 脚本)重跑再生 SVG/PNG**——renumber 引擎只重写 gen 脚本内的 `§N.M`/`第 N 章`/`chNN-slug` 文本,SVG/PNG 是渲染产物、引擎不碰,不重跑就是"代码新号、图仍留旧号"的静默漂移;**移动章正文的 `## N.M` 分节标题也须同批改号(引擎不改标题——漏改会让图徽标与标题错位,lint_chapter_map --require 直接 FAIL)**;bible 章号已由引擎重写,抽查 due。
 5. **复验**：lint_anchors --all(三规)/lint_punct --all/逐章 structure/gap-audit 增量。
 
 **首创期预留**(新书 §0 即执行)：cartography 定稿时可预见的原理/扩展章直接占号进 outline——插章成本趋零;跨章引用三规(见 writer 契约)让日后任何重编号只剩"跑引擎+接缝导语"。

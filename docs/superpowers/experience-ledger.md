@@ -30,3 +30,4 @@
 | exp-0709-1 | 2026-07-09 | GitHub cmark-gfm 行内公式紧邻 CJK/全角即整段不渲染(858 处/29 章) | lint_formulas check9+公式规则入册+盘古之白批修 | check9 违例数=0 | active |
 | exp-0709-2 | 2026-07-09 | 图类横幅超宽(6.9:1)排版后不可读——节点预算挡不住画布失控 | lint_chapter_map 画布预算(宽≤1500 比例≤2.6:1)+illustrator 契约 | oversize_canvas=0 | active |
 | exp-0709-3 | 2026-07-09 | lint_diagram_geometry 容差设计漏报图例贴边重叠(单例:chapter-map 模板) | 暂不动阈值,复发≥2 再收紧;illustrator"Read PNG 亲眼看"仍是第一道 | 复发计数 1 | watching |
+| exp-0709-4 | 2026-07-09 | 引擎不改 ## N.M 标题——中段插章后图徽标必与标题错位撞门禁(终审 Medium) | SOP §4 补同批改号句;理想解=引擎顺带改移动章标题(下次 --insert 前评估) | 下次 --insert 零门禁意外 | active |

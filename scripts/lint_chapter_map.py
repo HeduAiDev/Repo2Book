@@ -34,8 +34,8 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-_BADGE_RE = re.compile(r'§(\d{1,2})\.(\d{1,2})')
-_HEADING_RE = re.compile(r'^##\s+(\d{1,2})\.(\d{1,2})', re.M)
+_BADGE_RE = re.compile(r'§(\d{1,3})\.(\d{1,2})')
+_HEADING_RE = re.compile(r'^##\s+(\d{1,3})\.(\d{1,2})', re.M)
 _TOKEN_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_.]{2,}\(?\)?')
 _DOT_TRIGGER_RE = re.compile(r'\.[A-Za-z_]')
 _CHNUM_RE = re.compile(r'^ch(\d{1,3})')

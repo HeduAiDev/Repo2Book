@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- 图节点=真实符号名(dossier.mechanisms 锚点可核),≤12 节点,宽 ≤1200;primer 章节点=论文概念(# PAPER 可核)。
+- 图节点=真实符号名(dossier.mechanisms 锚点可核),≤12 节点,宽 ≤1500 且宽高比 ≤2.6:1;primer 章节点=论文概念(# PAPER 可核)。
 - 图位置:开篇 hook 段后、第一个 `##` 前;图后 1–2 句选读指引;禁脚手架措辞。
 - HARD RULE:主编排者不写 chapter.md——正文插引由 writer/rollout agent 做;linter/模板/契约/工作流可直接改。
 - workflow 语法检查用 async-wrapper 法(`const CFG` 处切分),不用裸 node --check。
