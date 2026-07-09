@@ -332,13 +332,13 @@ wrapper 怎么被选中，又是一条注册主线。vLLM 通过平台层问「�
 
 ### 为什么大 rank 要退回通用实现：算一笔账
 
-`max_lora_rank >= 128` 退回 `torch_ops`，背后是 LoRA 的低秩账。LoRA 把权重增量分解成两个低秩矩阵 $\Delta W = BA$，前向时不直接算满秩乘法，而是分两步走。记 token 数为 T、输入维为 d、输出维为 o、LoRA rank 为 r、缩放为 s：
+`max_lora_rank >= 128` 退回 `torch_ops`，背后是 LoRA 的低秩账。LoRA 把权重增量分解成两个低秩矩阵 $\Delta W = BA$ ，前向时不直接算满秩乘法，而是分两步走。记 token 数为 T、输入维为 d、输出维为 o、LoRA rank 为 r、缩放为 s：
 
 $$
 \mathrm{shrink}: \; u = x A, \qquad \mathrm{expand}: \; y \mathrel{+}= (u B) \cdot s
 $$
 
-shrink 先把输入从 d 维降到 r 维的 buffer，expand 再把它升回 o 维。两步的 FLOPs 约为 $2 T r (d + o)$。对比满秩增量直算的 $2 T d o$，省下的倍数是：
+shrink 先把输入从 d 维降到 r 维的 buffer，expand 再把它升回 o 维。两步的 FLOPs 约为 $2 T r (d + o)$ 。对比满秩增量直算的 $2 T d o$ ，省下的倍数是：
 
 $$
 \frac{2 T d o}{2 T r (d + o)} = \frac{d o}{r (d + o)}

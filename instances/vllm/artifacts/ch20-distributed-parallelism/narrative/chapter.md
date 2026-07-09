@@ -160,7 +160,7 @@ class GroupCoordinator:
 
 两个细节这张表才看得清，光记形状记不住：all_gather **按 rank 序拼接**（不是任意序），rank0 的段在前；reduce_scatter 是**先全和再切**，每个 rank 留的是「全和的自己那一段」而非「自己原值的一段」。reduce_scatter 接一个 all_gather，正好把 `[4]`/`[6]` 拼回 `[4, 6]`——这就是下面要说的「all_reduce = reduce_scatter + all_gather」在数值上的样子。
 
-通信量上，按 ring 算法（把张量切成 $p$ 等份、沿一个首尾相接的环形拓扑传 $p-1$ 轮，每轮每张卡只收发 $1/p$ 的数据量）计，设字节宽为 $b$，每张卡收发的字节数是：
+通信量上，按 ring 算法（把张量切成 $p$ 等份、沿一个首尾相接的环形拓扑传 $p-1$ 轮，每轮每张卡只收发 $1/p$ 的数据量）计，设字节宽为 $b$ ，每张卡收发的字节数是：
 
 $$
 \mathrm{all\_reduce} = \frac{2(p-1)}{p}\,Nb,

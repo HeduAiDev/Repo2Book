@@ -184,7 +184,7 @@ def is_mx_quant_type(instance: Any) -> bool:
 **为什么用表，不用 if/elif？** 两条理由，一条工程一条复杂度：
 
 - 工程上，新增一种 quant_type 只需写一个 scheme 文件、贴一个装饰器——**分发代码零改动**。如果是 `if/elif` 长链，每加一种都要去那条链上插一刀，几十个 scheme 会把分发函数撑成几百行，且容易漏。
-- 复杂度上，scheme 选择从 `if/elif` 的逐个比较（scheme 数为 N 时是 $O(N)$）降为字典查的 $O(1)$。十几种 quant_type × 多种 layer_type 的组合，被一张表统一寻址。
+- 复杂度上，scheme 选择从 `if/elif` 的逐个比较（scheme 数为 N 时是 $O(N)$ ）降为字典查的 $O(1)$ 。十几种 quant_type × 多种 layer_type 的组合，被一张表统一寻址。
 
 ## 32.3 按层分发：get_quant_method 四类分发 + 逐层解析
 
@@ -591,7 +591,7 @@ $$
 \mathrm{out}[t, j] = \left( \sum_i x_q[t, i] \cdot W_q[j, i] \right) \cdot s_w[j] \cdot s_x[t]
 $$
 
-式中 `x_q`、`W_q` 是 `int8` 量化值；$s_w$ 是 `weight_scale`，每个输出通道一个（per-channel，落盘固定）；$s_x$ 是 `pertoken_scale`，每个 token 一个（动态，前向现算）。整数乘加在 `int8` 域里跑（NPU 的强项），最后两个 scale 一乘把结果拉回浮点。人话：**用整数算 GEMM 省算力省带宽，再用两个缩放因子把数值还原回原来的量级。**
+式中 `x_q`、`W_q` 是 `int8` 量化值； $s_w$ 是 `weight_scale`，每个输出通道一个（per-channel，落盘固定）； $s_x$ 是 `pertoken_scale`，每个 token 一个（动态，前向现算）。整数乘加在 `int8` 域里跑（NPU 的强项），最后两个 scale 一乘把结果拉回浮点。人话：**用整数算 GEMM 省算力省带宽，再用两个缩放因子把数值还原回原来的量级。**
 
 这条式子按**对称量化**写，所以没出现 `weight_offset`——对称量化下 `weight_offset≈0`，offset 项可略（[§32.4](#324-三个适配器-wrapper满足-vllm-三个方法基类) 里 `get_perchannel_param` 仍把 `weight_offset` 和 `weight_scale` 一起注册，只是这一格里它取零）。若是非对称量化，每个量化值要先减去对应的 offset、再乘 scale 才能还原。
 

@@ -171,6 +171,37 @@ def lint_formulas(filepath: str) -> dict:
                 )
     results["cjk_in_math"] = issues
 
+    # ── Check 9: inline math adjacent to CJK/fullwidth/alnum (GitHub won't render) ──
+    # cmark-gfm 数学扩展要求 $...$ 两侧紧邻空白/ASCII 标点；紧贴 CJK 字符、
+    # 全角标点或字母数字时整段不渲染。修法：$ 定界符与相邻字符间补 ASCII 空格。
+    issues = []
+    inline_re = re.compile(r'(?<![\$`])\$(?!\$)([^$\n]+?)\$(?!\$)')
+    in_fence = False
+    in_disp = False
+    for i, line in enumerate(lines, 1):
+        st = line.strip()
+        if st.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if st == "$$":
+            in_disp = not in_disp
+            continue
+        if in_fence or in_disp:
+            continue
+        parts = line.split("`")
+        for k in range(0, len(parts), 2):  # 偶数段 = 非代码 span
+            seg = parts[k]
+            for m in inline_re.finditer(seg):
+                prev = seg[m.start() - 1] if m.start() > 0 else " "
+                nxt = seg[m.end()] if m.end() < len(seg) else " "
+                if (prev != " " and (ord(prev) > 127 or prev.isalnum())) or \
+                   (nxt != " " and (ord(nxt) > 127 or nxt.isalnum())):
+                    issues.append(
+                        f"  Line {i}: inline math \"{m.group(0)[:40]}\" 紧邻 CJK/全角/字母数字"
+                        f"——GitHub 不渲染；在 $ 与相邻字符间补空格"
+                    )
+    results["inline_math_adjacency_github"] = issues
+
     return results
 
 

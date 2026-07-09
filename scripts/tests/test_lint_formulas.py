@@ -90,3 +90,27 @@ def test_cjk_outside_math_ok(tmp_path):
     from lint_formulas import lint_formulas
     res = lint_formulas(str(ch))
     assert res["cjk_in_math"] == []
+
+
+def test_inline_math_cjk_adjacency_flagged(tmp_path):
+    ch = tmp_path / "chapter.md"
+    ch.write_text("约定：$t$ 是索引（$i=1,\\ldots,n$）。\n", encoding="utf-8")
+    from lint_formulas import lint_formulas
+    res = lint_formulas(str(ch))
+    assert len(res["inline_math_adjacency_github"]) >= 2  # ：$t$ 与（$i$）
+
+
+def test_inline_math_padded_ok(tmp_path):
+    ch = tmp_path / "chapter.md"
+    ch.write_text("约定： $t$ 是索引（ $i=1,\\ldots,n$ ）。\n", encoding="utf-8")
+    from lint_formulas import lint_formulas
+    res = lint_formulas(str(ch))
+    assert res["inline_math_adjacency_github"] == []
+
+
+def test_inline_adjacency_skips_code_and_display(tmp_path):
+    ch = tmp_path / "chapter.md"
+    ch.write_text("代码 `x=$a$，b` 不查。\n\n$$\na_{t}=1\n$$\n", encoding="utf-8")
+    from lint_formulas import lint_formulas
+    res = lint_formulas(str(ch))
+    assert res["inline_math_adjacency_github"] == []

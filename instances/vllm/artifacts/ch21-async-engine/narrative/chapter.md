@@ -187,7 +187,7 @@ def execute_model(
 
 ### 它到底省了多少
 
-把这套机制的收益写成可比较的量级。设接收方在 `irecv` 之后、读 `.tensors` 之前那段准备工作耗时 $t_{\mathrm{prep}}$，NCCL 接收耗时 $t_{\mathrm{recv}}$。
+把这套机制的收益写成可比较的量级。设接收方在 `irecv` 之后、读 `.tensors` 之前那段准备工作耗时 $t_{\mathrm{prep}}$ ，NCCL 接收耗时 $t_{\mathrm{recv}}$ 。
 
 朴素阻塞写法的关键路径是「先等收完，再准备」，两段串起来。惰性写法让两者并行，关键路径降到两段中较长的那段：
 
@@ -197,7 +197,7 @@ t_{\mathrm{naive}} = t_{\mathrm{recv}} + t_{\mathrm{prep}}
 t_{\mathrm{overlapped}} = \max(t_{\mathrm{recv}},\, t_{\mathrm{prep}})
 $$
 
-省下的就是两段里较短的那段。举个数：若接收 0.3ms、准备 0.2ms，朴素写法每格花 0.5ms，惰性写法只花 $\max(0.3, 0.2)=0.3$ms，省掉 0.2ms——这 0.2ms 乘以 PP 的 stage 数、再乘以每秒成千上万拍，省下来的就很可观。
+省下的就是两段里较短的那段。举个数：若接收 0.3ms、准备 0.2ms，朴素写法每格花 0.5ms，惰性写法只花 $\max(0.3, 0.2)=0.3$ ms，省掉 0.2ms——这 0.2ms 乘以 PP 的 stage 数、再乘以每秒成千上万拍，省下来的就很可观。
 
 一句人话：**只要准备工作和接收能并行，bubble 就缩短一段准备时间**。但它不改变 PP 固有的首尾填充开销——第一拍总得有人先把流水线灌满，这部分惰性帮不上忙。
 
@@ -214,7 +214,7 @@ GPU、NCCL 都在容器里，但这套控制流是纯 Python，可以在普通�
 
 ## DP wave 共识：让多个引擎齐步走
 
-切换到第二个机制。数据并行下，整个引擎被复制成 $N$ 份（DP rank 0 到 $N-1$），每份独立吃请求。问题来了：**为什么这些独立的引擎还需要互相同步？**
+切换到第二个机制。数据并行下，整个引擎被复制成 $N$ 份（DP rank 0 到 $N-1$ ），每份独立吃请求。问题来了：**为什么这些独立的引擎还需要互相同步？**
 
 答案藏在 MoE（mixture of experts）里。MoE 层每个 token 只激活一小批专家，路由函数决定送给哪个；而专家切到多个 DP rank 上时，token 不可本地路由（token 在 rank 0、目标专家在 rank 2），只能**跨 rank 收发激活值**——这正是 all-to-all：每个 rank 把自己要发给别人的 token 切片打包，同时收取别的 rank 发来的。all-to-all 是集合操作，**要求全员到场**——如果 rank 0 还在跑第 100 步、rank 1 因为没请求提前退出了，rank 0 的 all-to-all 就会永远等不到 rank 1，整个集群 **hang 死**。
 
@@ -347,7 +347,7 @@ def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
 
 `step_counter` 不到 32 的整数倍时，**直接返回 `True`**——「假定还有活，继续跑」，根本不做 all-reduce。只有每 32 步那一次，才真去同步。
 
-这个权衡可以量化。设单步耗时 $t_{\mathrm{step}}$、一次 all-reduce 耗时 $t_{\mathrm{ar}}$，则均摊到每步的同步开销是：
+这个权衡可以量化。设单步耗时 $t_{\mathrm{step}}$ 、一次 all-reduce 耗时 $t_{\mathrm{ar}}$ ，则均摊到每步的同步开销是：
 
 $$
 \overline{t_{\mathrm{sync}}} = \frac{t_{\mathrm{ar}}}{32}
@@ -395,7 +395,7 @@ $$
 
 ## DP 协调进程与负载均衡
 
-最后一个机制。DP 部署是 **N 个前端 API server × M 个引擎** 的拓扑。前端要把请求分给最空的引擎，引擎要把 wave 状态同步给前端。如果让每个前端各自去和每个引擎 all-reduce、各自广播，$N \times M$ 条通路会乱成一团。
+最后一个机制。DP 部署是 **N 个前端 API server × M 个引擎** 的拓扑。前端要把请求分给最空的引擎，引擎要把 wave 状态同步给前端。如果让每个前端各自去和每个引擎 all-reduce、各自广播， $N \times M$ 条通路会乱成一团。
 
 vLLM 的做法是塞一个**独立的协调进程** `DPCoordinator` 居中：所有引擎把负载和 wave 信号汇报给它，它聚合后单点广播给所有前端。前端之间、引擎之间不直接对话，全走协调进程这个枢纽。
 

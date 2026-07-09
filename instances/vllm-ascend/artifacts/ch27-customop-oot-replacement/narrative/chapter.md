@@ -128,7 +128,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
 | … | … | … | … | … |
 | 27 | `"BailingMoELinearAttention"` → `Ascend…` | … | `+ …` | 27 |
 
-每轮严格 `+1`，没有删除、没有覆盖（`assert` 守着），表大小是单调递增的非负整数，跑满 27 项即停。建表与注册各是 $O(N)$ 量级（$N \approx 27$），纯属启动期一次性成本。
+每轮严格 `+1`，没有删除、没有覆盖（`assert` 守着），表大小是单调递增的非负整数，跑满 27 项即停。建表与注册各是 $O(N)$ 量级（ $N \approx 27$ ），纯属启动期一次性成本。
 
 到这里，「准备工作」全部就绪：`op_registry_oot` 里躺着一张「vLLM 类名 → 昇腾子类」的全局映射。但模型还没构造呢。真正的魔法发生在算子被实例化的那一刻。
 

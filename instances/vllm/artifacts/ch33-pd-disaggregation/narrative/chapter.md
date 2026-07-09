@@ -211,7 +211,7 @@ def maybe_transfer_kv_layer(func: Callable) -> Callable:
 
 ### 量化一下这个收益
 
-先定两个记号：模型层数 $N$、每层计算耗时 $t_c$。再记整请求 KV 从对端搬到本地 paged buffer 的总耗时为 $T_{xfer}$。
+先定两个记号：模型层数 $N$ 、每层计算耗时 $t_c$ 。再记整请求 KV 从对端搬到本地 paged buffer 的总耗时为 $T_{xfer}$ 。
 
 **同步方案**（先把 KV 全搬完再 forward）的总时间是把两段串起来：
 
@@ -227,7 +227,7 @@ $$
 
 严格说还要加上首层加载与末层尾巴的少量串行残差——第 0 层的 KV 总得先到才能算第 0 层，最后一层的 KV 也总得到齐才能收尾，这两段没法和计算重叠。所以 max 是流水线打满时的理想下界，不是可达的硬下界。但只要 $T_{xfer}$ 量级与 $N t_c$ 相当、残差远小于二者，这个近似就足够说明问题。
 
-举个数：一个 32 层的模型，每层算 1 ms（合计 32 ms），整请求 KV 传输要 20 ms。同步方案要 20 + 32 = 52 ms；重叠方案只要 max(20, 32) = 32 ms。**只要传输能藏进计算，也就是 $T_{xfer} \lesssim N t_c$，那 20 ms 的传输延迟就近乎被完全隐藏**，总时间退化成纯计算时间。这就是把 `start_load_kv` 拆成"早发起 + 逐层等"而非"一把等齐"的全部理由。
+举个数：一个 32 层的模型，每层算 1 ms（合计 32 ms），整请求 KV 传输要 20 ms。同步方案要 20 + 32 = 52 ms；重叠方案只要 max(20, 32) = 32 ms。**只要传输能藏进计算，也就是 $T_{xfer} \lesssim N t_c$ ，那 20 ms 的传输延迟就近乎被完全隐藏**，总时间退化成纯计算时间。这就是把 `start_load_kv` 拆成"早发起 + 逐层等"而非"一把等齐"的全部理由。
 
 把上面这组数（32 层、每层 1 ms、传输 20 ms）按层逐拍追一遍，就能看见"阻塞点在前几层、之后立刻返回"这个转折。假设后台传输匀速、20 ms 内搬完全部 32 层，则每 0.625 ms 搬完一层（20 ms ÷ 32 = 0.625 ms/层）；而计算每层 1 ms。表中"已耗时"列是到达第 k 层时的累计时间（第 0 层为 0 ms，第 1 层为第 0 层的等待 0.625 ms 加计算 1 ms，合计 ≈ 1.6 ms，依此累加）。`wait_for_layer_load(layer_k)` 在算到第 k 层时只需等"第 k 层是否已搬完"：
 
@@ -827,7 +827,7 @@ bind_connector_metadata → start_load_kv → [forward 内：层级 hook] → wa
 
 这一章把 PD 分离的 worker 侧讲透了。回头看三条主线：
 
-**一个 context manager 夹住整条搬运线。** `vllm/v1/worker/kv_connector_model_runner_mixin.py` 里的 `_get_kv_connector_output` 用 `enter`/`finally` 把 model forward 夹在中间：enter 段 `bind` + `start_load_kv` 异步发起，finally 段 `wait_for_save` 收齐 + `get_finished` 收割。`start_load_kv` 早发起、`wait_for_layer_load` 逐层等，把 KV 传输延迟藏进逐层计算里——理想下总时间从 $T_{xfer} + N t_c$ 压到 $\max(T_{xfer}, N t_c)$。`wait_for_save` 则是一道不能省的正确性围栏：保证异步 save 读完，paged 块才允许被下一步复用。
+**一个 context manager 夹住整条搬运线。** `vllm/v1/worker/kv_connector_model_runner_mixin.py` 里的 `_get_kv_connector_output` 用 `enter`/`finally` 把 model forward 夹在中间：enter 段 `bind` + `start_load_kv` 异步发起，finally 段 `wait_for_save` 收齐 + `get_finished` 收割。`start_load_kv` 早发起、`wait_for_layer_load` 逐层等，把 KV 传输延迟藏进逐层计算里——理想下总时间从 $T_{xfer} + N t_c$ 压到 $\max(T_{xfer}, N t_c)$ 。`wait_for_save` 则是一道不能省的正确性围栏：保证异步 save 读完，paged 块才允许被下一步复用。
 
 **同一套 worker 契约，三种填法。** `KVConnectorBase_V1` 定下 `start_load_kv` / `wait_for_layer_load` / `save_kv_layer` / `wait_for_save` / `get_finished` 五个方法。P2P NCCL 用点对点 send/recv 直发，单类自包含、靠 `is_producer` 分角色、`wait_for_save → wait_for_sent` 等队空；NIXL 用 RDMA 单边 READ，facade 拆 worker 子对象、两个层 hook 是 no-op、完成信号因"谁发起谁知道"而不对称；Offloading 做 CPU/磁盘卸载，`wait_for_save` 只入队不等待、store 推迟到下一步避开采样关键路径、`finished_sending` 恒空改走围栏。
 

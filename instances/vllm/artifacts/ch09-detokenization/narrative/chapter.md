@@ -197,33 +197,33 @@ else:
 self._last_output_text_offset: int = 0
 ```
 
-核心就一行：`stop_buffer_length = max(len(s) for s in self.stop) - 1`。设最长 stop 串长 $L$，就扣住尾部 $L-1$ 个字符。
+核心就一行：`stop_buffer_length = max(len(s) for s in self.stop) - 1`。设最长 stop 串长 $L$ ，就扣住尾部 $L-1$ 个字符。
 
-**为什么是 $L-1$ 而不是 $L$？** 这是个能证明的最优值。
+**为什么是 $L-1$ 而不是 $L$ ？** 这是个能证明的最优值。
 
 **直觉先行：** 任何 stop 串在"完整出现"之前，已经露面的部分最多只有 $L-1$ 个字符（差最后一个字符才凑齐）。只要把尾部 $L-1$ 个字符全扣住不吐，那么任何尚未完整出现的 stop 前缀，就一定还压在缓冲里、随时能回收。而 stop 串**完整出现的那一刻**，`check_stop_strings` 会在同一次 update 里命中并截断——被截掉的字符还没流出去，所以根本不用扣到第 $L$ 个。
 
-**严格点说。** 设当前文长 $n$，扣住的尾部区间是 $[n-(L-1),\ n)$。假设某 stop 串 $s$ 将在未来某步完整出现、结束于位置 $e$，它的起点就是 $e-|s|$。
+**严格点说。** 设当前文长 $n$ ，扣住的尾部区间是 $[n-(L-1),\ n)$ 。假设某 stop 串 $s$ 将在未来某步完整出现、结束于位置 $e$ ，它的起点就是 $e-|s|$ 。
 
-在它完整出现之前的任意时刻，文末还没到终点，也就是 $n < e$——$s$ 至少还差一个字符。这一刻 $s$ 已露面的前缀落在区间 $[e-|s|,\ n)$，它的长度是：
+在它完整出现之前的任意时刻，文末还没到终点，也就是 $n < e$ —— $s$ 至少还差一个字符。这一刻 $s$ 已露面的前缀落在区间 $[e-|s|,\ n)$ ，它的长度是：
 
 $$
 n-(e-|s|) = |s|-(e-n) \le |s|-1 \le L-1
 $$
 
-（第一个 $\le$：因为 $n < e$，故 $e-n \ge 1$；第二个 $\le$：$|s| \le L$ 即任意 stop 串不超过最长串。）
+（第一个 $\le$ ：因为 $n < e$ ，故 $e-n \ge 1$ ；第二个 $\le$ ： $|s| \le L$ 即任意 stop 串不超过最长串。）
 
-这段长度不超过 $L-1$ 的前缀，右端正好是 $n$，所以整个落在扣留区 $[n-(L-1),\ n)$ 里——**未完成的 stop 前缀从不外流**。
+这段长度不超过 $L-1$ 的前缀，右端正好是 $n$ ，所以整个落在扣留区 $[n-(L-1),\ n)$ 里——**未完成的 stop 前缀从不外流**。
 
-而当文末抵达终点（$n=e$、stop 串完整出现）时，update 直接截断，根本不依赖 holdback。
+而当文末抵达终点（ $n=e$ 、stop 串完整出现）时，update 直接截断，根本不依赖 holdback。
 
-所以 $L-1$ 充分；又因为露面的前缀最长能到 $L-1$，再少扣一个就可能漏，故 $L-1$ 也是最省的。
+所以 $L-1$ 充分；又因为露面的前缀最长能到 $L-1$ ，再少扣一个就可能漏，故 $L-1$ 也是最省的。
 
 这个时间线画出来是这样：
 
 ![stop-string holdback 时间线](../diagrams/02-stop-holdback.png)
 
-> *图注：stop=`"END"`，$L=3$，扣留 $L-1=2$ 个尾字符。前两步流式只吐安全区（绿）、扣住可能是前缀的尾部（橙）；第三步 `"END"` 拼齐，`check_stop_strings` 命中、`output_text` 截到 `"END"` 之前。底部两条注：序列结束（`finished=True`）时 holdback 归零、扣留区一次性全吐；min_tokens 期间 `stop_check_offset` 持续推到文末，这段时间的 stop 一律不算。*
+> *图注：stop=`"END"`， $L=3$ ，扣留 $L-1=2$ 个尾字符。前两步流式只吐安全区（绿）、扣住可能是前缀的尾部（橙）；第三步 `"END"` 拼齐，`check_stop_strings` 命中、`output_text` 截到 `"END"` 之前。底部两条注：序列结束（`finished=True`）时 holdback 归零、扣留区一次性全吐；min_tokens 期间 `stop_check_offset` 持续推到文末，这段时间的 stop 一律不算。*
 
 holdback 在取文本时兑现。`get_next_output_text` 是流式取文本的出口（`vllm/v1/engine/detokenizer.py`）：
 
@@ -313,11 +313,11 @@ def check_stop_strings(
 **为什么不从头搜起？** 因为之前的字符早搜过了。一个 stop 串要在本步才命中，必然横跨"本次新增的字符"——否则上一步就该命中了。所以只需回看两段：
 
 - 本次新增的 `new_char_count` 个字符；
-- 加上它们左边、可能与之拼成 stop 串的 $L-1$ 个旧字符（$L=$ `stop_string_len`）。
+- 加上它们左边、可能与之拼成 stop 串的 $L-1$ 个旧字符（ $L=$ `stop_string_len`）。
 
 合起来回看 `new_char_count + stop_string_len - 1` 个字符，对应负索引起点 `-(new_char_count + stop_string_len - 1) = 1 - new_char_count - stop_string_len`。一字不差。
 
-**量化一下省了多少。** 朴素做法每步 `find` 扫整段，是 $O(n)$，$n$ 步累计 $O(n^2)$。这个窗口把每步搜索压到只跟"本步新增几个字符加 stop 串长"有关：
+**量化一下省了多少。** 朴素做法每步 `find` 扫整段，是 $O(n)$ ， $n$ 步累计 $O(n^2)$ 。这个窗口把每步搜索压到只跟"本步新增几个字符加 stop 串长"有关：
 
 $$
 O(\mathrm{new\_char\_count} + L)
@@ -397,7 +397,7 @@ def convert_prompt_ids_to_tokens(
 
 注意它**不解码整个 prompt**，只取末尾 `INITIAL_OFFSET+2 = 7` 个 token。因为增量解码只需要"紧邻新 token 的那一小段上下文"就够判断空格了，整段 prompt 解码纯属浪费。`read_offset` 指向已读到的位置，`prefix_offset` 往前退 5 个 token 作为上下文锚。
 
-**量化一下这个窗口省了多少。** 朴素做法每步都把"到目前为止的全序列"重新 detokenize 一遍——第 $k$ 步要解 $k$ 个 token，$n$ 步累计 $O(n^2)$。双 offset 窗口把每步的解码范围钉死在 `[prefix_offset:]` 这一小段尾部 token 上，长度恒为 `INITIAL_OFFSET=5` 量级、与已生成多少 token 无关，于是每步降到 $O(\mathrm{INITIAL\_OFFSET})$、整体趋近 $O(n)$。和 §9.4 的 stop 搜索窗口是同一招、同一收益：把"每步重扫全文"压成"每步只看尾部常数段"，二次降到近线性。窗口存在的唯一理由是给空格 cleanup 喂足相邻上下文，而非正确性需要全量重解。
+**量化一下这个窗口省了多少。** 朴素做法每步都把"到目前为止的全序列"重新 detokenize 一遍——第 $k$ 步要解 $k$ 个 token， $n$ 步累计 $O(n^2)$ 。双 offset 窗口把每步的解码范围钉死在 `[prefix_offset:]` 这一小段尾部 token 上，长度恒为 `INITIAL_OFFSET=5` 量级、与已生成多少 token 无关，于是每步降到 $O(\mathrm{INITIAL\_OFFSET})$ 、整体趋近 $O(n)$ 。和 §9.4 的 stop 搜索窗口是同一招、同一收益：把"每步重扫全文"压成"每步只看尾部常数段"，二次降到近线性。窗口存在的唯一理由是给空格 cleanup 喂足相邻上下文，而非正确性需要全量重解。
 
 真正干活的是 `detokenize_incrementally`（函数定义在 `vllm/tokenizers/detokenizer_utils.py:L110`，下面截取的是它 L143 起的函数体主干）：
 

@@ -31,7 +31,7 @@ $$
 \mathbf o_{t,i} = \sum_{j=1}^{t} \mathrm{Softmax}_j\!\left(\frac{\mathbf q_{t,i}^{\top}\mathbf k_{j,i}}{\sqrt{d_h}}\right)\mathbf v_{j,i}
 $$
 
-约定下标：$t$ 是 token 索引（当前 query 所在位置），$i$ 是注意力头索引（$i=1,\ldots,n_h$）；$j$ 遍历 $t$ 之前的所有历史 token。全章后续所有公式都沿用这套约定，尤其后面出现的 $\delta=j-t$ 是两个 token 的**相对位置偏移**（不是头偏移）。
+约定下标： $t$ 是 token 索引（当前 query 所在位置）， $i$ 是注意力头索引（ $i=1,\ldots,n_h$ ）； $j$ 遍历 $t$ 之前的所有历史 token。全章后续所有公式都沿用这套约定，尤其后面出现的 $\delta=j-t$ 是两个 token 的**相对位置偏移**（不是头偏移）。
 
 推理要加速，就得把所有历史 token 的 key、value 全缓存下来。于是每个 token 每层要囤的元素数是（Eq.8 尾句）：
 
@@ -39,7 +39,7 @@ $$
 2\,n_h\,d_h
 $$
 
-再乘上层数 $l$，就是每 token 的全模型缓存足迹 $2\,n_h\,d_h\,l$。这里有两个「线性」：随头数 $n_h$ 线性、随上下文长度线性。DeepSeek-V2 的注意力配置是 $n_h{=}128$、$d_h{=}128$（§3.1.2），代进去：
+再乘上层数 $l$ ，就是每 token 的全模型缓存足迹 $2\,n_h\,d_h\,l$ 。这里有两个「线性」：随头数 $n_h$ 线性、随上下文长度线性。DeepSeek-V2 的注意力配置是 $n_h{=}128$ 、 $d_h{=}128$ （§3.1.2），代进去：
 
 $$
 2\times 128\times 128 = 32768
@@ -78,7 +78,7 @@ MHA 的缓存里是「每头一份 K、一份 V」，而这里 MLA 每个 token 
 
 #### 直觉：不囤零件，只囤一张能现场复原的图纸
 
-与其为每个头各留一份完整 key、一份完整 value，不如先把 token 压成一小段**共享的压缩摘要** $\mathbf c^{KV}$，推理期只囤这段摘要。真要用 key/value 时，再从摘要现场上投影出来。就像不囤整箱零件，只囤一张能现场复原全部零件的图纸——图纸小、零件在需要时才展开。
+与其为每个头各留一份完整 key、一份完整 value，不如先把 token 压成一小段**共享的压缩摘要** $\mathbf c^{KV}$ ，推理期只囤这段摘要。真要用 key/value 时，再从摘要现场上投影出来。就像不囤整箱零件，只囤一张能现场复原全部零件的图纸——图纸小、零件在需要时才展开。
 
 #### 机制：K、V 从同一段潜向量上投影
 
@@ -90,9 +90,9 @@ $$
 \mathbf v_t^{C} = W^{UV}\mathbf c_t^{KV}
 $$
 
-先约定两个方向词：**下投影**（如 $W^{DKV}$）把隐向量压到低秩、降维；**上投影**（如 $W^{UK}$、$W^{UV}$）把压缩向量恢复回满维、升维。第一行就是用下投影 $W^{DKV}$ 把 $\mathbf h_t$ 压到 $d_c$ 维的潜向量 $\mathbf c_t^{KV}$（$d_c \ll d_h n_h$）；后两行说 key、value 都是从这**同一段** $\mathbf c_t^{KV}$ 上投影出来的。推理期只有 $\mathbf c_t^{KV}$ 入缓存，key、value 都是需要时现场算、从不落盘。缓存足迹从 $2\,n_h\,d_h\,l$ 降到 $d_c\,l$。
+先约定两个方向词：**下投影**（如 $W^{DKV}$ ）把隐向量压到低秩、降维；**上投影**（如 $W^{UK}$ 、 $W^{UV}$ ）把压缩向量恢复回满维、升维。第一行就是用下投影 $W^{DKV}$ 把 $\mathbf h_t$ 压到 $d_c$ 维的潜向量 $\mathbf c_t^{KV}$ （ $d_c \ll d_h n_h$ ）；后两行说 key、value 都是从这**同一段** $\mathbf c_t^{KV}$ 上投影出来的。推理期只有 $\mathbf c_t^{KV}$ 入缓存，key、value 都是需要时现场算、从不落盘。缓存足迹从 $2\,n_h\,d_h\,l$ 降到 $d_c\,l$ 。
 
-下面用一组玩具维度亲手验一遍。取 $d{=}6$、$n_h{=}2$、$d_h{=}4$、$d_c{=}4$，喂 3 个 token 进去，看每个 token 的潜向量首元素、以及两种机制各要缓存多少。表里的「物化」指把压缩的潜向量显式上投影成完整维度的 K/V——这个词后面还会反复出现，它对应的正是「现场展开成 full key/value」：
+下面用一组玩具维度亲手验一遍。取 $d{=}6$ 、 $n_h{=}2$ 、 $d_h{=}4$ 、 $d_c{=}4$ ，喂 3 个 token 进去，看每个 token 的潜向量首元素、以及两种机制各要缓存多少。表里的「物化」指把压缩的潜向量显式上投影成完整维度的 K/V——这个词后面还会反复出现，它对应的正是「现场展开成 full key/value」：
 
 <!-- trace: low-rank-kv-joint-compression -->
 
@@ -102,15 +102,15 @@ $$
 | 1 | -0.0948 | 4 | 8 | 6 | 16 |
 | 2 | -0.1942 | 4 | 8 | 6 | 16 |
 
-读这张表要抓的是不变量：**只要 $d_c \ll n_h\!\cdot\!d_h$，缓存量就与头数彻底解耦。** 写进缓存的只有 $\mathbf c^{KV}$ 这一个 4 维张量；key（由 $W^{UK}$ 上投影、物化后 8 维）是现场算的，从不落盘。所以 MLA 每 token 只囤 6 个元素（潜向量 4 + 后面会讲的解耦 key 2），而 MHA 基线要囤 16——玩具维度下已经压了 $16/6 \approx 2.67$ 倍。换成 DeepSeek-V2 真实维度，仅联合压缩本体就是 $d_c{=}512$ 对 $n_h\!\cdot\!d_h{=}16384$，压 32 倍。
+读这张表要抓的是不变量：**只要 $d_c \ll n_h\!\cdot\!d_h$ ，缓存量就与头数彻底解耦。** 写进缓存的只有 $\mathbf c^{KV}$ 这一个 4 维张量；key（由 $W^{UK}$ 上投影、物化后 8 维）是现场算的，从不落盘。所以 MLA 每 token 只囤 6 个元素（潜向量 4 + 后面会讲的解耦 key 2），而 MHA 基线要囤 16——玩具维度下已经压了 $16/6 \approx 2.67$ 倍。换成 DeepSeek-V2 真实维度，仅联合压缩本体就是 $d_c{=}512$ 对 $n_h\!\cdot\!d_h{=}16384$ ，压 32 倍。
 
 ![联合压缩：K、V 共享一段潜向量 c_kv，只有它落盘](../diagrams/fig31-2-joint-compression.png)
 
-图里蓝色实线是唯一落盘的 $\mathbf c^{KV}$，两条灰色虚线（$W^{UK}$、$W^{UV}$）都是「按需现场上投影」——这就是 §2.1.2 那句「we even do not need to compute keys and values out」的图形版。
+图里蓝色实线是唯一落盘的 $\mathbf c^{KV}$ ，两条灰色虚线（ $W^{UK}$ 、 $W^{UV}$ ）都是「按需现场上投影」——这就是 §2.1.2 那句「we even do not need to compute keys and values out」的图形版。
 
 #### 源码：昇腾把这段压缩融进了写缓存那一步
 
-真实代码里，$\mathbf c^{KV}$ 的产出与写缓存被融合进 decode 预处理的 `exec_kv_decode`——它只把潜向量与解耦 key 写进 `kv_cache`：
+真实代码里， $\mathbf c^{KV}$ 的产出与写缓存被融合进 decode 预处理的 `exec_kv_decode`——它只把潜向量与解耦 key 写进 `kv_cache`：
 
 ```python
 # vllm_ascend/attention/mla_v1.py:L1635
@@ -123,11 +123,11 @@ decode_k_pe, decode_k_nope = self.exec_kv_decode(decode_kv_no_split, cos, sin, k
 
 #### 直觉：既然放大矩阵是死的，就提前折进 query
 
-打分要算 query 和 key 的内积，而 key 不过是上投影 $W^{UK}$ 把潜向量 $\mathbf c^{KV}$ 放大出来的。既然这个「放大矩阵」$W^{UK}$ 是死的、与位置无关，那不如**提前把它折进 query**：让 query 先乘一次 $W^{UK}$，直接落到潜向量所在的那个房间，再和缓存的 $\mathbf c^{KV}$ 直接握手。省掉的，正是「为每个历史 token 重新放大出 full key」这一步。
+打分要算 query 和 key 的内积，而 key 不过是上投影 $W^{UK}$ 把潜向量 $\mathbf c^{KV}$ 放大出来的。既然这个「放大矩阵」 $W^{UK}$ 是死的、与位置无关，那不如**提前把它折进 query**：让 query 先乘一次 $W^{UK}$ ，直接落到潜向量所在的那个房间，再和缓存的 $\mathbf c^{KV}$ 直接握手。省掉的，正是「为每个历史 token 重新放大出 full key」这一步。
 
 #### 机制：中间那块权重是静态常量
 
-这里先约定两个贯穿全章、也贯穿源码的简写：**nope**（no positional encoding）指**不含**位置旋转、可以吸收的主体分量；**rope**（rotary positional encoding）指专门承载 RoPE 位置旋转的那一小撮分量。query、key 都被切成这两半，各走各的路——这正是下一节「解耦」的由来。一句话记住分工：**nope 部分（主体信息）走吸收路径、由静态权重承载；rope 部分（位置信息）走独立旁路、由 RoPE 动态承载。** 把 query 侧也做低秩（$\mathbf q^{C}$ 由 $W^{UQ}$ 从 $\mathbf c^{Q}$ 上投影，见 [2.4 节](#24-q-侧低秩只降训练激活)），逐头展开 nope 部分的打分（之所以逐头，是因为每个头 $i$ 各有一份独立的上投影 $W^{UK}_i$、进而各有一份独立的吸收矩阵 $\widetilde W_i$；论文 §2.1.2 Eq.11 之后那句话的代数化）：
+这里先约定两个贯穿全章、也贯穿源码的简写：**nope**（no positional encoding）指**不含**位置旋转、可以吸收的主体分量；**rope**（rotary positional encoding）指专门承载 RoPE 位置旋转的那一小撮分量。query、key 都被切成这两半，各走各的路——这正是下一节「解耦」的由来。一句话记住分工：**nope 部分（主体信息）走吸收路径、由静态权重承载；rope 部分（位置信息）走独立旁路、由 RoPE 动态承载。** 把 query 侧也做低秩（ $\mathbf q^{C}$ 由 $W^{UQ}$ 从 $\mathbf c^{Q}$ 上投影，见 [2.4 节](#24-q-侧低秩只降训练激活)），逐头展开 nope 部分的打分（之所以逐头，是因为每个头 $i$ 各有一份独立的上投影 $W^{UK}_i$ 、进而各有一份独立的吸收矩阵 $\widetilde W_i$ ；论文 §2.1.2 Eq.11 之后那句话的代数化）：
 
 $$
 \mathbf q_{t,i}^{C\top}\mathbf k_{j,i}^{C}
@@ -135,14 +135,14 @@ $$
 = \mathbf c_t^{Q\top}\,\big((W^{UQ}_i)^{\top} W^{UK}_i\big)\,\mathbf c_j^{KV}
 $$
 
-中间那块 $(W^{UQ}_i)^{\top} W^{UK}_i$ 只由两个静态权重相乘得到，不含任何随 $t$、$j$ 变化的量。令吸收矩阵
+中间那块 $(W^{UQ}_i)^{\top} W^{UK}_i$ 只由两个静态权重相乘得到，不含任何随 $t$ 、 $j$ 变化的量。令吸收矩阵
 
 $$
 \widetilde W_i = (W^{UK}_i)^{\top} W^{UQ}_i,\qquad
 \tilde{\mathbf q}_{t,i} = \widetilde W_i\,\mathbf c_t^{Q}
 $$
 
-打分就变成潜空间里的一次内积（$\tilde{\mathbf q}$ 与 $\mathbf c^{KV}$ 的内积）——$W^{UK}$ 被吸进了 query 侧。$\widetilde W_i$ 形状 $d_c\times d_c'$（本例 $4\times 4$），**加载后算一次、推理期永久复用**——省下的正是「为每个历史 token 重新放大出 full key 再内积」这一步，推理期只需对缓存里每个 token 的潜向量 $\mathbf c^{KV}$ 做一次内积。
+打分就变成潜空间里的一次内积（ $\tilde{\mathbf q}$ 与 $\mathbf c^{KV}$ 的内积）—— $W^{UK}$ 被吸进了 query 侧。 $\widetilde W_i$ 形状 $d_c\times d_c'$ （本例 $4\times 4$ ），**加载后算一次、推理期永久复用**——省下的正是「为每个历史 token 重新放大出 full key 再内积」这一步，推理期只需对缓存里每个 token 的潜向量 $\mathbf c^{KV}$ 做一次内积。
 
 拿玩具维度验一验这条恒等式到底有多「等」。同一组权重，取头 0，对几对 $(t,j)$ 分别走「物化路径」（老实算出 full $\mathbf k^C$ 再内积）和「吸收路径」（query 先落潜空间、直接和 $\mathbf c^{KV}$ 内积）：
 
@@ -161,15 +161,15 @@ $$
 \sum_j w_j\,\mathbf v_{j}^{C} = \sum_j w_j\,\big(W^{UV}\mathbf c_j\big) = W^{UV}\Big(\sum_j w_j\,\mathbf c_j\Big)
 $$
 
-「先物化每个 value 再加权」与「先在潜空间加权、最后统一乘 $W^{UV}$」完全等价——所以 $W^{UV}$ 可以吸进输出投影 $W^O$。o 侧同样落得下数字：同一组玩具权重下，先在潜空间加权再乘 $W^{UV}$ 得到的首元素，与直接对物化 $\mathbf v^C$ 加权得到的首元素完全一致（均为 $0.223$，绝对差 $0.0$）——和 q 侧一样，是数值上的精确恒等，不是近似。
+「先物化每个 value 再加权」与「先在潜空间加权、最后统一乘 $W^{UV}$ 」完全等价——所以 $W^{UV}$ 可以吸进输出投影 $W^O$ 。o 侧同样落得下数字：同一组玩具权重下，先在潜空间加权再乘 $W^{UV}$ 得到的首元素，与直接对物化 $\mathbf v^C$ 加权得到的首元素完全一致（均为 $0.223$ ，绝对差 $0.0$ ）——和 q 侧一样，是数值上的精确恒等，不是近似。
 
 ![两条路径打分逐位相等：物化 vs 吸收，绝对差恒为 0](../diagrams/fig31-3-absorption-identity.png)
 
-上路每步都得为历史 token 放大出 full key，下路 query 一次性乘进潜空间、直接握手缓存的 $\mathbf c^{KV}$。省算力，而结果一丝不差。
+上路每步都得为历史 token 放大出 full key，下路 query 一次性乘进潜空间、直接握手缓存的 $\mathbf c^{KV}$ 。省算力，而结果一丝不差。
 
 #### 源码：加载后拆权重，热路径直接 bmm
 
-昇腾把「加载后算一次」落成了 `process_weights_after_loading`——它把融合的 `kv_b_proj` 权重拆成论文的 $W^{UK}$、$W^{UV}$，并转置重排成吸收所需的布局：
+昇腾把「加载后算一次」落成了 `process_weights_after_loading`——它把融合的 `kv_b_proj` 权重拆成论文的 $W^{UK}$ 、 $W^{UV}$ ，并转置重排成吸收所需的布局：
 
 ```python
 # vllm_ascend/attention/mla_v1.py:L924-L957（省略量化断言与图复用场景下的权重就地写回分支）
@@ -190,7 +190,7 @@ def process_weights_after_loading(self, act_dtype: torch.dtype):
     # … 省略：图复用场景下 copy_ 就地写回权重缓冲的分支 …
 ```
 
-`kv_b_proj` 就是论文 $W^{UK}$、$W^{UV}$ 的融合权重；拆开后 `W_UK_T` 排成 `(N, P, L)` 供 q 侧、`W_UV` 排成 `(N, L, V)` 供 o 侧。到了 decode 热路径，q 侧吸收只是一次 `bmm`：
+`kv_b_proj` 就是论文 $W^{UK}$ 、 $W^{UV}$ 的融合权重；拆开后 `W_UK_T` 排成 `(N, P, L)` 供 q 侧、`W_UV` 排成 `(N, L, V)` 供 o 侧。到了 decode 热路径，q 侧吸收只是一次 `bmm`：
 
 ```python
 # vllm_ascend/attention/mla_v1.py:L910-L922
@@ -209,7 +209,7 @@ def _q_proj_and_k_up_proj(self, x):
     return ql_nope.transpose(0, 1), q_pe
 ```
 
-对上符号：`q_proj(x)` 已经把 $W^{UQ}$ 乘完、吐出 `q_nope`（即公式里的 $\mathbf q^C$，`qk_nope_head_dim` 维），而 `W_UK_T` 恰是 $(W^{UK})^{\top}$ 重排成 `(N, P, L)`。于是这一行 `q_nope @ W_UK_T` 补上剩下的 $(W^{UK})^{\top}$ 半边、落到潜向量维 `kv_lora_rank`——两步合起来才凑成上面那步「query 乘吸收矩阵 $\widetilde W$（定义见 [2.2](#22-权重吸收恒等式把上投影折进-query-与输出)）、落进潜空间」。换句话说 `W_UK_T` 本身只是 $\widetilde W$ 的一半，另一半藏在 `q_proj` 里。注意 `q_pe` 被单独 `split` 出来、**不参与吸收**：它要去走解耦 RoPE，这正是下一节的悬崖。输出侧的 $W^{UV}$ 吸收则体现为 `_v_up_proj`：
+对上符号：`q_proj(x)` 已经把 $W^{UQ}$ 乘完、吐出 `q_nope`（即公式里的 $\mathbf q^C$ ，`qk_nope_head_dim` 维），而 `W_UK_T` 恰是 $(W^{UK})^{\top}$ 重排成 `(N, P, L)`。于是这一行 `q_nope @ W_UK_T` 补上剩下的 $(W^{UK})^{\top}$ 半边、落到潜向量维 `kv_lora_rank`——两步合起来才凑成上面那步「query 乘吸收矩阵 $\widetilde W$ （定义见 [2.2](#22-权重吸收恒等式把上投影折进-query-与输出)）、落进潜空间」。换句话说 `W_UK_T` 本身只是 $\widetilde W$ 的一半，另一半藏在 `q_proj` 里。注意 `q_pe` 被单独 `split` 出来、**不参与吸收**：它要去走解耦 RoPE，这正是下一节的悬崖。输出侧的 $W^{UV}$ 吸收则体现为 `_v_up_proj`：
 
 ```python
 # vllm_ascend/attention/mla_v1.py:L900-L907
@@ -231,9 +231,9 @@ def _v_up_proj(self, x):
 
 #### 直觉：位置旋转把两块能折叠的权重顶开了
 
-RoPE 按 token 的位置给 query 和 key 各施加一个旋转矩阵 $R_m$。这个旋转随每对 token 的相对距离转动——它是活的。一旦让它夹进 $W^Q$ 和 $W^{UK}$ 中间，就像在两张本能贴合的纸中间塞了一枚随距离变厚的垫片，两块权重再也压不到一起。解法只能是：**别让潜向量主体承载位置**，单开一小撮维度专门扛 RoPE，让 $\mathbf c^{KV}$ 主体保持「位置无关」，从而继续可吸收。
+RoPE 按 token 的位置给 query 和 key 各施加一个旋转矩阵 $R_m$ 。这个旋转随每对 token 的相对距离转动——它是活的。一旦让它夹进 $W^Q$ 和 $W^{UK}$ 中间，就像在两张本能贴合的纸中间塞了一枚随距离变厚的垫片，两块权重再也压不到一起。解法只能是：**别让潜向量主体承载位置**，单开一小撮维度专门扛 RoPE，让 $\mathbf c^{KV}$ 主体保持「位置无关」，从而继续可吸收。
 
-$R_m$ 具体怎么构造：把每个头的 $d_h$ 维两两分组成 $d_h/2$ 对，第 $k$ 对维度按位置 $m$ 转过角度 $m\theta_k$（$\theta_k$ 是随维度衰减的预设频率表，与数据无关），$R_m$ 就是这些二维旋转块拼成的分块对角矩阵。旋转天然满足「转 $a$ 再转 $b$ = 净转 $a+b$」，于是对同一对维度先转 $t$ 再转 $j$（即 $R_t^{\top}R_j$，转置对旋转矩阵等于转回去）等价于净转过 $j-t$，这正是下面 $R_t^{\top}R_j=R_{j-t}$ 成立的来源（严格推导见原始出处 RoFormer, arXiv:2104.09864）。
+$R_m$ 具体怎么构造：把每个头的 $d_h$ 维两两分组成 $d_h/2$ 对，第 $k$ 对维度按位置 $m$ 转过角度 $m\theta_k$ （ $\theta_k$ 是随维度衰减的预设频率表，与数据无关）， $R_m$ 就是这些二维旋转块拼成的分块对角矩阵。旋转天然满足「转 $a$ 再转 $b$ = 净转 $a+b$ 」，于是对同一对维度先转 $t$ 再转 $j$ （即 $R_t^{\top}R_j$ ，转置对旋转矩阵等于转回去）等价于净转过 $j-t$ ，这正是下面 $R_t^{\top}R_j=R_{j-t}$ 成立的来源（严格推导见原始出处 RoFormer, arXiv:2104.09864）。
 
 #### 机制：中间矩阵是相对位置的函数
 
@@ -245,41 +245,41 @@ $$
 = \mathbf h_t^{\top}(W^{Q})^{\top} R_{j-t}\, W^{UK}\mathbf c_j
 $$
 
-这里用了 RoPE 的标准性质 $R_t^{\top}R_j = R_{j-t}$（两次旋转叠加=角度相加）。问题就出在夹在正中间的那块矩阵：
+这里用了 RoPE 的标准性质 $R_t^{\top}R_j = R_{j-t}$ （两次旋转叠加=角度相加）。问题就出在夹在正中间的那块矩阵：
 
 $$
 M(\delta) = (W^{Q})^{\top} R_{\delta}\, W^{UK},\qquad \delta = j-t
 $$
 
-$M(\delta)$ **本身就是相对位置 $\delta$ 的函数**。问题的关键不是「矩阵乘一般不交换」这条泛泛的事实，而是在这个特定配置里：$(W^Q)^{\top}$、$R_\delta$、$W^{UK}$ 三者的乘积顺序被 $R_\delta$ 卡在正中间锁死了——一旦挪动 $R_\delta$ 与任何一侧权重的相对次序，就会改变 $R_\delta$ 的作用效果，于是它没法被吸进两侧、和静态权重合并成一个与位置无关的常量。换句话说：**每个相对位置对应一个不同的中间矩阵，根本没有「离线算好、线上复用」的空间。** 一旦这么做，推理期就得为所有 prefix token 重算 key，吞吐崩塌。
+$M(\delta)$ **本身就是相对位置 $\delta$ 的函数**。问题的关键不是「矩阵乘一般不交换」这条泛泛的事实，而是在这个特定配置里： $(W^Q)^{\top}$ 、 $R_\delta$ 、 $W^{UK}$ 三者的乘积顺序被 $R_\delta$ 卡在正中间锁死了——一旦挪动 $R_\delta$ 与任何一侧权重的相对次序，就会改变 $R_\delta$ 的作用效果，于是它没法被吸进两侧、和静态权重合并成一个与位置无关的常量。换句话说：**每个相对位置对应一个不同的中间矩阵，根本没有「离线算好、线上复用」的空间。** 一旦这么做，推理期就得为所有 prefix token 重算 key，吞吐崩塌。
 
-拿玩具维度把「$M(\delta)$ 随 $\delta$ 变」这件事量化出来。取头 0，让相对位置 $\delta$ 扫一段区间 $\delta{=}0,1,2,3$，看中间矩阵的 $[0,0]$ 元素与 Frobenius 范数。（因果解码里历史 key 有 $j\le t$、$\delta$ 取非正值；这里扫的是相对位置区间，目的只是证伪「存在一个与位置无关的静态矩阵」——只要 $M(\delta)$ 不是常量，扫正侧还是负侧结论都一样——负侧的中间矩阵 $M(-\delta)$ 把负角旋转 $R_\delta^{\top}$ 同样夹在两块权重之间，一样随 $\delta$ 变、一样不是常量。）
+拿玩具维度把「 $M(\delta)$ 随 $\delta$ 变」这件事量化出来。取头 0，让相对位置 $\delta$ 扫一段区间 $\delta{=}0,1,2,3$ ，看中间矩阵的 $[0,0]$ 元素与 Frobenius 范数。（因果解码里历史 key 有 $j\le t$ 、 $\delta$ 取非正值；这里扫的是相对位置区间，目的只是证伪「存在一个与位置无关的静态矩阵」——只要 $M(\delta)$ 不是常量，扫正侧还是负侧结论都一样——负侧的中间矩阵 $M(-\delta)$ 把负角旋转 $R_\delta^{\top}$ 同样夹在两块权重之间，一样随 $\delta$ 变、一样不是常量。）
 
 <!-- trace: decoupled-rope -->
 
 | 相对位置 $\delta$ | $R_\delta$ 是否单位阵 | 中间矩阵 $M(\delta)[0,0]$ | $\lVert M(\delta)\rVert_F$ | 能否离线预计算 |
 |---|---|---|---|---|
-| 0 | 是 | -0.5378 | 1.1402 | 能（退化为静态 $\tilde W$） |
+| 0 | 是 | -0.5378 | 1.1402 | 能（退化为静态 $\tilde W$ ） |
 | 1 | 否 | -0.4659 | 1.366 | 否 |
 | 2 | 否 | 0.125 | 1.8486 | 否 |
 | 3 | 否 | 0.6912 | 1.955 | 否 |
 
-$\delta$ 从 0 走到 3，$M[0,0]$ 从 $-0.5378$ 一路变到 $0.6912$，范数从 $1.1402$ 涨到 $1.955$——**中间那块确实随位置改变，不是常量。** 只有 $\delta{=}0$（即不加 RoPE）时 $R_0$ 退化成单位阵、$M$ 才收敛回可吸收的静态 $\widetilde W$。这一档 $M[0,0]{=}-0.5378$，恰好等于解耦方案里主体走的静态 $\widetilde W[0,0]{=}-0.5378$——两条路在「不加位置」处严丝合缝对上。
+$\delta$ 从 0 走到 3， $M[0,0]$ 从 $-0.5378$ 一路变到 $0.6912$ ，范数从 $1.1402$ 涨到 $1.955$ ——**中间那块确实随位置改变，不是常量。** 只有 $\delta{=}0$ （即不加 RoPE）时 $R_0$ 退化成单位阵、 $M$ 才收敛回可吸收的静态 $\widetilde W$ 。这一档 $M[0,0]{=}-0.5378$ ，恰好等于解耦方案里主体走的静态 $\widetilde W[0,0]{=}-0.5378$ ——两条路在「不加位置」处严丝合缝对上。
 
-解法就是论文的解耦 RoPE（Eq.14-18）：额外拉出一小撮维度 $\mathbf q^R$（每头 $d_h^R$ 维）与**共享** key $\mathbf k^R$ 专门承载 RoPE，拼接到 nope 部分后一起算注意力：
+解法就是论文的解耦 RoPE（Eq.14-18）：额外拉出一小撮维度 $\mathbf q^R$ （每头 $d_h^R$ 维）与**共享** key $\mathbf k^R$ 专门承载 RoPE，拼接到 nope 部分后一起算注意力：
 
 $$
 \mathbf q_{t,i} = [\mathbf q_{t,i}^{C};\ \mathbf q_{t,i}^{R}],\qquad
 \mathbf k_{t,i} = [\mathbf k_{t,i}^{C};\ \mathbf k_t^{R}]
 $$
 
-留意下标的差别：$\mathbf q^R_{t,i}$ 带头索引 $i$（每头各有一份），而解耦 key $\mathbf k^R_{t}$ **不带 $i$**——它由一个单独的投影从 $\mathbf h_t$ 直接生成（并非从 $\mathbf c^{KV}$ 上投影而来），再施加 RoPE，因此在各头间**共享**，每个 token 只需缓存一份 rope 向量。位置信息就这样被抽成一个「每 token 一份、全头共用」的独立分量，$\mathbf k^C$ 主体则逐头保留、且保持位置无关，这才让吸收矩阵 $\widetilde W$ 得以静态不变。
+留意下标的差别： $\mathbf q^R_{t,i}$ 带头索引 $i$ （每头各有一份），而解耦 key $\mathbf k^R_{t}$ **不带 $i$**——它由一个单独的投影从 $\mathbf h_t$ 直接生成（并非从 $\mathbf c^{KV}$ 上投影而来），再施加 RoPE，因此在各头间**共享**，每个 token 只需缓存一份 rope 向量。位置信息就这样被抽成一个「每 token 一份、全头共用」的独立分量， $\mathbf k^C$ 主体则逐头保留、且保持位置无关，这才让吸收矩阵 $\widetilde W$ 得以静态不变。
 
 $$
 \mathbf o_{t,i} = \sum_{j=1}^{t}\mathrm{Softmax}_j\!\left(\frac{\mathbf q_{t,i}^{\top}\mathbf k_{j,i}}{\sqrt{d_h+d_h^R}}\right)\mathbf v_{j,i}^{C}
 $$
 
-$\mathbf c^{KV}$ 主体不加 RoPE、保持位置无关，$\widetilde W$ 恒为静态、继续可吸收；位置信息全被关进独立的 $d_h^R$ 维小分量里（DeepSeek-V2 经实验调优取 $d_h^R{=}64$，在保住精度的同时把解耦位置维的缓存开销压到最小）。推理期要缓存的因此是 $\mathbf c^{KV}$ 加上解耦 $\mathbf k^R$，共 $(d_c+d_h^R)\,l$ 个元素。
+$\mathbf c^{KV}$ 主体不加 RoPE、保持位置无关， $\widetilde W$ 恒为静态、继续可吸收；位置信息全被关进独立的 $d_h^R$ 维小分量里（DeepSeek-V2 经实验调优取 $d_h^R{=}64$ ，在保住精度的同时把解耦位置维的缓存开销压到最小）。推理期要缓存的因此是 $\mathbf c^{KV}$ 加上解耦 $\mathbf k^R$ ，共 $(d_c+d_h^R)\,l$ 个元素。
 
 ![左：对 k^C 加 RoPE 破坏吸收；右：解耦让主体保持静态可吸收](../diagrams/fig31-4-decoupled-rope.png)
 
@@ -307,7 +307,7 @@ def mla_preprocess_decode(self, q_c, kv_no_split, kv_cache, attn_metadata):
     )
 ```
 
-看这三行的分工：`_q_proj_and_k_up_proj` 出 `decode_ql_nope`（已吸收、走潜空间，**不碰位置**）和 `decode_q_pe`；紧接着**只有** `decode_q_pe` 过 `rope_single` 拿到位置；`exec_kv_decode` 读写缓存里的潜向量 `k_nope` 与解耦 `k_pe`。nope 主体和 rope 分量泾渭分明——代码把「$M(\delta)$ 不可吸收」这条数学，翻译成了「位置只允许走 `q_pe`/`k_pe`」这条工程纪律。
+看这三行的分工：`_q_proj_and_k_up_proj` 出 `decode_ql_nope`（已吸收、走潜空间，**不碰位置**）和 `decode_q_pe`；紧接着**只有** `decode_q_pe` 过 `rope_single` 拿到位置；`exec_kv_decode` 读写缓存里的潜向量 `k_nope` 与解耦 `k_pe`。nope 主体和 rope 分量泾渭分明——代码把「 $M(\delta)$ 不可吸收」这条数学，翻译成了「位置只允许走 `q_pe`/`k_pe`」这条工程纪律。
 
 ### 2.4 q 侧低秩：只降训练激活
 
@@ -323,7 +323,7 @@ $$
 \mathbf c_t^{Q} = W^{DQ}\mathbf h_t,\qquad \mathbf q_t^{C} = W^{UQ}\mathbf c_t^{Q}
 $$
 
-关键不变量是**正交性**（这里说的正交，是指训练侧激活显存与推理侧 KV cache 开销这两个优化目标各自独立、互不牵连，而非线性代数意义上向量的正交）：$\mathbf c^Q$ 只是 query 的中间激活，在当前 token 的前向里就被消费掉、不跨步保留，故每步 KV cache 变化量恒为 0。玩具维度验一下（$d_{cq}{=}4$）：
+关键不变量是**正交性**（这里说的正交，是指训练侧激活显存与推理侧 KV cache 开销这两个优化目标各自独立、互不牵连，而非线性代数意义上向量的正交）： $\mathbf c^Q$ 只是 query 的中间激活，在当前 token 的前向里就被消费掉、不跨步保留，故每步 KV cache 变化量恒为 0。玩具维度验一下（ $d_{cq}{=}4$ ）：
 
 <!-- trace: q-side-low-rank -->
 
@@ -333,7 +333,7 @@ $$
 | 1 | 0.8303 | 4 | 8 | 0 |
 | 2 | 0.8692 | 4 | 8 | 0 |
 
-三步的「KV cache 变化」列全为 0。训练期 query 中间激活从满维 8 压到 $d_{cq}{=}4$（DeepSeek-V2 里是从 16384 压到 $d_c'{=}1536$），而推理缓存纹丝不动——**q 侧低秩省的是训练激活，不是 KV cache。** 落地代码里，这一步藏在 `_mla_preprocess`（`vllm_ascend/attention/mla_v1.py:L1640-L1667`）的 `fused_qkv_a_proj` 拆分：它同时吐出 q 侧的 `q_c`（过 `q_a_layernorm` 后再上投影）与 KV 侧的 `kv_no_split`，两侧各走各的路（`q_lora_rank`、`kv_lora_rank` 等维度字段在构造时绑定，见 `vllm_ascend/attention/mla_v1.py:L728-L742`）。
+三步的「KV cache 变化」列全为 0。训练期 query 中间激活从满维 8 压到 $d_{cq}{=}4$ （DeepSeek-V2 里是从 16384 压到 $d_c'{=}1536$ ），而推理缓存纹丝不动——**q 侧低秩省的是训练激活，不是 KV cache。** 落地代码里，这一步藏在 `_mla_preprocess`（`vllm_ascend/attention/mla_v1.py:L1640-L1667`）的 `fused_qkv_a_proj` 拆分：它同时吐出 q 侧的 `q_c`（过 `q_a_layernorm` 后再上投影）与 KV 侧的 `kv_no_split`，两侧各走各的路（`q_lora_rank`、`kv_lora_rank` 等维度字段在构造时绑定，见 `vllm_ascend/attention/mla_v1.py:L728-L742`）。
 
 ---
 
@@ -345,7 +345,7 @@ $$
 
 ### 机制：MLA 的缓存不含头数
 
-论文 Table 1（§2.1.4）给了四行公式。代进 DeepSeek-V2 维度（$n_h{=}128$、$d_h{=}128$、$d_c{=}512$、$d_h^R{=}64$，GQA 按通常配置取 8 组共享）：
+论文 Table 1（§2.1.4）给了四行公式。代进 DeepSeek-V2 维度（ $n_h{=}128$ 、 $d_h{=}128$ 、 $d_c{=}512$ 、 $d_h^R{=}64$ ，GQA 按通常配置取 8 组共享）：
 
 <!-- trace: kv-cache-comparison -->
 
@@ -356,7 +356,7 @@ $$
 | MQA | 256 |
 | MLA | 576 |
 
-抓住这条不变量：**MLA 的缓存量 $(d_c+d_h^R)$ 表达式里根本不出现 $n_h$**，而 MHA 是 $2\,n_h\,d_h$、与头数成正比。DeepSeek-V2 的 $n_h{=}128$ 极大，于是压缩比 $32768 \div 576 \approx 56.89$ 倍，主要就来自「缓存不再乘头数」这一项。折算成 GQA：GQA 每组共享头每 token 每层缓存 $2 d_h$ 个元素（一份 K、一份 V），而 MLA 的 $d_c+d_h^R{=}576$ 相当于 $576/(2\times 128)=2.25$ 组 GQA 的缓存——占用却比满配 MHA 更强。全模型 60 层，每 token 缓存从 MHA 的 $1{,}966{,}080$ 个元素降到 MLA 的 $34{,}560$ 个。
+抓住这条不变量：**MLA 的缓存量 $(d_c+d_h^R)$ 表达式里根本不出现 $n_h$**，而 MHA 是 $2\,n_h\,d_h$ 、与头数成正比。DeepSeek-V2 的 $n_h{=}128$ 极大，于是压缩比 $32768 \div 576 \approx 56.89$ 倍，主要就来自「缓存不再乘头数」这一项。折算成 GQA：GQA 每组共享头每 token 每层缓存 $2 d_h$ 个元素（一份 K、一份 V），而 MLA 的 $d_c+d_h^R{=}576$ 相当于 $576/(2\times 128)=2.25$ 组 GQA 的缓存——占用却比满配 MHA 更强。全模型 60 层，每 token 缓存从 MHA 的 $1{,}966{,}080$ 个元素降到 MLA 的 $34{,}560$ 个。
 
 需要提醒的是：论文摘要与结论里那句「reduces the KV cache by 93.3%」并不是这张表的口径。那 93.3% 是 DeepSeek-V2 相较**另一个模型** DeepSeek 67B 的实测部署对比，且部署时还额外叠加了 KV cache 量化（论文 §「Inference Efficiency」把每个缓存元素再压到平均 6 bit）。而本节 Table 1 算的是「同维度 MHA vs MLA」的理论架构比——56.89 倍、约 98.2% 的缩减，不含任何量化因素、比较对象也不同。两个数字量级都对不上，别把它们当成同一笔账。
 
@@ -366,7 +366,7 @@ MLA 一栏与 MQA 同量级，却因「潜向量携带了全部头的信息」�
 
 ### 源码：表里那三个数字，在真实代码里叫什么
 
-表里 MLA 一行用到的 $d_c{=}512$、$d_h^R{=}64$、$n_h{=}128$，在昇腾实现里都是构造时就绑定的字段：
+表里 MLA 一行用到的 $d_c{=}512$ 、 $d_h^R{=}64$ 、 $n_h{=}128$ ，在昇腾实现里都是构造时就绑定的字段：
 
 ```python
 # vllm_ascend/attention/mla_v1.py:L721,L729,L731
@@ -376,7 +376,7 @@ self.kv_lora_rank = kwargs["kv_lora_rank"]        # d_c：潜向量维（DeepSee
 self.qk_rope_head_dim = kwargs["qk_rope_head_dim"]  # d_h^R：解耦 RoPE 分量维（= 64）
 ```
 
-MLA 每 token 每层缓存的 $(d_c+d_h^R)$，落到代码就是 `kv_lora_rank + qk_rope_head_dim`（$512{+}64{=}576$）——表达式里**根本没有** `num_heads`。而 MHA 那一行的 $2\,n_h\,d_h$ 必须把 `self.num_heads` 乘进去。四行公式里每个符号，到此都能在 `__init__` 里点到名。
+MLA 每 token 每层缓存的 $(d_c+d_h^R)$ ，落到代码就是 `kv_lora_rank + qk_rope_head_dim`（ $512{+}64{=}576$ ）——表达式里**根本没有** `num_heads`。而 MHA 那一行的 $2\,n_h\,d_h$ 必须把 `self.num_heads` 乘进去。四行公式里每个符号，到此都能在 `__init__` 里点到名。
 
 ---
 

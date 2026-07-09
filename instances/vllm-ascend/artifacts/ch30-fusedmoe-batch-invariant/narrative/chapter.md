@@ -419,12 +419,12 @@ class AlltoAllCommImpl(MoECommMethod):
 
 先把 MoE 路由的通信代数说清楚，再看代码就有了坐标。这套代数只用四个记号，先列出来：
 
-- $N$：一拍前向的 token 数；
-- $top\_k$：每个 token 选中的专家数；
-- $E$：专家总数；
-- $ep\_size$：专家并行的卡数（$E$ 个专家均分到这些卡，每卡 $E / ep\_size$ 个本地专家）。
+- $N$ ：一拍前向的 token 数；
+- $top\_k$ ：每个 token 选中的专家数；
+- $E$ ：专家总数；
+- $ep\_size$ ：专家并行的卡数（ $E$ 个专家均分到这些卡，每卡 $E / ep\_size$ 个本地专家）。
 
-下文会用一组具体值把这套代数走一遍：$N=8$ 个 token、$top\_k=2$、$E=8$ 个专家均分到 $ep\_size=4$ 张卡（每卡 2 个本地专家）。先把抽象规则说清。
+下文会用一组具体值把这套代数走一遍： $N=8$ 个 token、 $top\_k=2$ 、 $E=8$ 个专家均分到 $ep\_size=4$ 张卡（每卡 2 个本地专家）。先把抽象规则说清。
 
 dispatch 阶段要把 $N \times top\_k$ 个 `(token, expert)` 对，按专家归属的卡**重新分发**。关键事实是：**每张卡收到的 token 数，等于落到本卡专家的 `(token, expert)` 对数**。
 
@@ -526,7 +526,7 @@ def async_all_to_all(input_, output_split_sizes, input_split_sizes, group, event
 
 ### 一拍 dispatch / combine 的数值追踪
 
-抽象的代数落到具体数字才好懂。设 $N=8$ 个 token，$top\_k=2$，$E=8$ 个专家均分在 $ep\_size=4$ 张卡上（每卡 2 个本地专家：卡 $i$ 管专家 $E_{2i}, E_{2i+1}$，即卡0 管 $E_0,E_1$、卡1 管 $E_2,E_3$、卡2 管 $E_4,E_5$、卡3 管 $E_6,E_7$）。8 个 token 各选 2 个专家，全系统共 $N \times top\_k = 16$ 个 `(token,expert)` 对。
+抽象的代数落到具体数字才好懂。设 $N=8$ 个 token， $top\_k=2$ ， $E=8$ 个专家均分在 $ep\_size=4$ 张卡上（每卡 2 个本地专家：卡 $i$ 管专家 $E_{2i}, E_{2i+1}$ ，即卡0 管 $E_0,E_1$ 、卡1 管 $E_2,E_3$ 、卡2 管 $E_4,E_5$ 、卡3 管 $E_6,E_7$ ）。8 个 token 各选 2 个专家，全系统共 $N \times top\_k = 16$ 个 `(token,expert)` 对。
 
 先给一组具体的路由分配（路由器算出来的 `topk_ids`），后面那张 `6/3/4/3` 的落卡表就能一格格数出来、而不是凭空给定：
 
@@ -541,7 +541,7 @@ def async_all_to_all(input_, output_split_sizes, input_split_sizes, group, event
 | t6 | $E_5, E_7$ | 卡2, 卡3 |
 | t7 | $E_2, E_6$ | 卡1, 卡3 |
 
-按「卡 $i$ 管 $E_{2i}, E_{2i+1}$」把上表每一格归卡、数一数：卡0 收到落在 $E_0/E_1$ 上的对——t0 贡献 2 条、t1/t2/t3/t4 各 1 条，共 **6**；卡1（$E_2/E_3$）收 t3、t4、t7 共 **3**；卡2（$E_4/E_5$）收 t1、t2、t5、t6 共 **4**；卡3（$E_6/E_7$）收 t5、t6、t7 共 **3**。$6+3+4+3=16$，正好是那 16 个 `(token,expert)` 对。这组 `6/3/4/3` 就是下表 dispatch 行的来历：
+按「卡 $i$ 管 $E_{2i}, E_{2i+1}$ 」把上表每一格归卡、数一数：卡0 收到落在 $E_0/E_1$ 上的对——t0 贡献 2 条、t1/t2/t3/t4 各 1 条，共 **6**；卡1（ $E_2/E_3$ ）收 t3、t4、t7 共 **3**；卡2（ $E_4/E_5$ ）收 t1、t2、t5、t6 共 **4**；卡3（ $E_6/E_7$ ）收 t5、t6、t7 共 **3**。 $6+3+4+3=16$ ，正好是那 16 个 `(token,expert)` 对。这组 `6/3/4/3` 就是下表 dispatch 行的来历：
 
 | 阶段 | 卡0 收 | 卡1 收 | 卡2 收 | 卡3 收 | 本卡 `group_list`（每专家几条）|
 |---|---|---|---|---|---|
@@ -608,7 +608,7 @@ def token_dispatch(self, token_dispatch_input: MoETokenDispatchInput):
 
 combine 阶段它用 `npu_moe_token_unpermute` 按 `topk_weights` 加权还原。这里有个值得记的工程细节：源码注释明示**不**用看似对口的 `npu_moe_finalize_routing`，因为那个算子的浮点累加会引入精度问题（可能产生逐位差异，和本章末尾要讲的 batch-invariant 一致性目标相冲突），改用数值更稳的 `unpermute` 作 workaround。
 
-三种通信方式的权衡，可以摆成一条量级轴（设 $N$ 个 token、hidden 维 $h$、$ep\_size$ 张卡、每 token 选 $top\_k$ 专家；下面的量级都按**全系统跨卡搬运的 token 总量**计，不是单卡量）：
+三种通信方式的权衡，可以摆成一条量级轴（设 $N$ 个 token、hidden 维 $h$ 、 $ep\_size$ 张卡、每 token 选 $top\_k$ 专家；下面的量级都按**全系统跨卡搬运的 token 总量**计，不是单卡量）：
 
 | 通信方式 | 搬运量级 | 适用 |
 |---|---|---|
@@ -622,9 +622,9 @@ $$
 \mathrm{AllGather} \propto N \cdot ep\_size \cdot h = 512 \times 16 \times 4096, \qquad \mathrm{All2AllV} \propto N \cdot top\_k \cdot h = 512 \times 2 \times 4096
 $$
 
-上式代入了一组具体值：$N=512$、$h=4096$、$ep\_size=16$、$top\_k=2$（Mixtral / DeepSeek 这类 MoE 的路由 top_k 通常就在 2~8）。AllGather 把全部 token 复制到 16 张卡，All2AllV 只搬被选中的 `(token,expert)` 对——同样的 token 数与 hidden 维，AllGather 多搬 **8 倍**。
+上式代入了一组具体值： $N=512$ 、 $h=4096$ 、 $ep\_size=16$ 、 $top\_k=2$ （Mixtral / DeepSeek 这类 MoE 的路由 top_k 通常就在 2~8）。AllGather 把全部 token 复制到 16 张卡，All2AllV 只搬被选中的 `(token,expert)` 对——同样的 token 数与 hidden 维，AllGather 多搬 **8 倍**。
 
-差距倍数恰好是 $ep\_size / top\_k$：根子在 $ep\_size$——AllGather 随卡数线性涨、All2AllV 不随卡数涨，卡越多、top_k 越小，All2AllV 省得越多。`select_moe_comm_method` 就是在这条轴上按 soc/EP/token 取点。
+差距倍数恰好是 $ep\_size / top\_k$ ：根子在 $ep\_size$ ——AllGather 随卡数线性涨、All2AllV 不随卡数涨，卡越多、top_k 越小，All2AllV 省得越多。`select_moe_comm_method` 就是在这条轴上按 soc/EP/token 取点。
 
 ## 30.6 FusedMC2：把三步融成一个算子
 
@@ -670,19 +670,19 @@ def fused_experts(self, fused_experts_input: MoEFusedExpertsInput):
 
 先说为什么会在乎这件事。推理服务要可复现：同一个 prompt 今天和明天、单独发和混在大 batch 里发，都该得到一模一样的输出。可浮点加法有个反直觉的毛病——**换个相加的顺序，结果就可能变**。要复现，就必须把累加顺序钉死。
 
-根因是一条容易被忽略的数学事实：**浮点加法不满足结合律**，$(a + b) + c$ 和 $a + (b + c)$ 在浮点下可能差最后几个 bit。
+根因是一条容易被忽略的数学事实：**浮点加法不满足结合律**， $(a + b) + c$ 和 $a + (b + c)$ 在浮点下可能差最后几个 bit。
 
-先给个十进制直觉。想象一个只保留 3 位有效数字的计算器，算 $1000 + 4 - 1000$：先算 $1000 + 4 = 1004$、四舍五入回 3 位有效数字成 $1.00 \times 10^3$，再减 $1000$，得 **0**；可若先算 $4 - 1000 = -996$（这步没超 3 位、精确），再加 $1000$，得 **4**。同样三个数，加法分组一换，结果从 0 跳到 4——小数被大数「吃掉」与否，取决于它何时入账。
+先给个十进制直觉。想象一个只保留 3 位有效数字的计算器，算 $1000 + 4 - 1000$ ：先算 $1000 + 4 = 1004$ 、四舍五入回 3 位有效数字成 $1.00 \times 10^3$ ，再减 $1000$ ，得 **0**；可若先算 $4 - 1000 = -996$ （这步没超 3 位、精确），再加 $1000$ ，得 **4**。同样三个数，加法分组一换，结果从 0 跳到 4——小数被大数「吃掉」与否，取决于它何时入账。
 
-float32 是同一回事，只是位数更多。举个极端例子：取 $a = 2^{24} = 16777216$，此时 $\mathrm{ulp}(a) = 2$（相邻可表示浮点的间隔是 2）。`(a + 1.0) - a` 算出来是 `0.0`——`1.0` 只有半个 ulp，加进 `a` 时被舍掉了；但 `a + (1.0 - a)` 是 `1.0`——因为 `1.0 - a = -16777215` 在 float32 下可精确表示，`1.0` 没丢。这两式在 numpy `float32` 下可一行复现。
+float32 是同一回事，只是位数更多。举个极端例子：取 $a = 2^{24} = 16777216$ ，此时 $\mathrm{ulp}(a) = 2$ （相邻可表示浮点的间隔是 2）。`(a + 1.0) - a` 算出来是 `0.0`——`1.0` 只有半个 ulp，加进 `a` 时被舍掉了；但 `a + (1.0 - a)` 是 `1.0`——因为 `1.0 - a = -16777215` 在 float32 下可精确表示，`1.0` 没丢。这两式在 numpy `float32` 下可一行复现。
 
 于是任何「求和归约」（reduce，即把一个轴上的多个值聚合成单值，比如 all-reduce 把各卡的张量逐元素加起来）的结果都依赖**累加顺序**。而 batch 一变，很多算子的 reduce 顺序就跟着变了——根子是 batch 的拼法变了，分块/通信的累加分组就跟着变，reduce 顺序随之改变：
 
-- 矩阵乘的 $K$ 维累加，会按硬件把 $K$ 切成若干块分别累加——分块方式若随 $M$（batch 那一维）变化，累加顺序就变了；
+- 矩阵乘的 $K$ 维累加，会按硬件把 $K$ 切成若干块分别累加——分块方式若随 $M$ （batch 那一维）变化，累加顺序就变了；
 - 集合通信（all-reduce）的归约顺序，默认实现不保证确定；
 - TF32（一种降尾数精度换算力的矩阵乘累加格式，能省算力但引入舍入抖动）之类的低精度累加引入额外抖动。
 
-要让「$x_i$ 在 batch A 中的输出」严格等于「$x_i$ 在 batch B 中的输出」，需要让每个输出元素的归约顺序**只与该元素自身的 $K$/$N$ 维有关，与 batch 维 $M$ 怎么切分无关**。昇腾用两步合力做到（这两步都由启动期的总开关 `init_batch_invariance` 调用，本节末会看到）：
+要让「 $x_i$ 在 batch A 中的输出」严格等于「 $x_i$ 在 batch B 中的输出」，需要让每个输出元素的归约顺序**只与该元素自身的 $K$/$N$ 维有关，与 batch 维 $M$ 怎么切分无关**。昇腾用两步合力做到（这两步都由启动期的总开关 `init_batch_invariance` 调用，本节末会看到）：
 
 ```python
 # vllm_ascend/batch_invariant.py:L76
@@ -780,18 +780,18 @@ def matmul_persistent(x, y, bias=None):
 
 `BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64` 是写死的常量——`BLOCK_M / BLOCK_N / BLOCK_K` 分别是把 $M / N / K$ 三个维度切块的块大小，取值来自这份 kernel 配置。它们之所以**固定**而非随输入自适应调优，正是批不变的关键：只有块大小恒定，累加的分组方式才会和 batch 无关。kernel 内部（host 上不真跑，但逻辑清楚）的 $K$ 维累加是 `acc = tl.zeros(..., dtype=tl.float32)`（float32 累加，不掉精度）+ `for k in range(0, tl.cdiv(K, BLOCK_K))`（按固定 `BLOCK_K=64` 分块）+ `tl.dot(..., allow_tf32=False)`（关 TF32）。
 
-**为什么这就批不变？** 一句话归纳：`BLOCK_K` 是常量，所以 $K$ 维的累加分块数 $\lceil K / 64 \rceil$ 和分块顺序**只取决于 $K$**，和 $M$（batch 怎么拼）毫无关系。同一行 token 无论单独成 batch、还是和另外几行拼成 batch，它在 $K$ 维上都走**完全相同**的累加顺序，于是 float32 累加出**逐位相同**的结果。
+**为什么这就批不变？** 一句话归纳：`BLOCK_K` 是常量，所以 $K$ 维的累加分块数 $\lceil K / 64 \rceil$ 和分块顺序**只取决于 $K$**，和 $M$ （batch 怎么拼）毫无关系。同一行 token 无论单独成 batch、还是和另外几行拼成 batch，它在 $K$ 维上都走**完全相同**的累加顺序，于是 float32 累加出**逐位相同**的结果。
 
 ### 批不变的两行数值追踪
 
-把它落到一个 mini 例子。设某行 token 的一次 matmul，$K=128$，`BLOCK_K=64`，于是 $K$ 维固定切成 $\lceil 128/64 \rceil = 2$ 块。追踪「同一行 A」在两种 batch 下的累加：
+把它落到一个 mini 例子。设某行 token 的一次 matmul， $K=128$ ，`BLOCK_K=64`，于是 $K$ 维固定切成 $\lceil 128/64 \rceil = 2$ 块。追踪「同一行 A」在两种 batch 下的累加：
 
 | 场景 | batch 形状 $M$ | 行 A 的 $K$ 维分块 | 累加顺序 | 行 A 输出 |
 |---|---|---|---|---|
 | 单独成 batch | $M=1$ | 块0:[k0..63] → 块1:[k64..127] | `acc=0; acc+=dot(块0); acc+=dot(块1)` | `bits(行A)` |
 | 和 B、C 拼 batch | $M=3$ | 块0:[k0..63] → 块1:[k64..127] | `acc=0; acc+=dot(块0); acc+=dot(块1)` | `bits(行A)` |
 
-最后一列写成符号 `bits(行A)` 而非某个具体十六进制位串——这是**示意**：host 上不真跑这个 NPU kernel，要点也不在那串 bit 等于多少，而在两场景的累加过程完全一致。看前面三列：两行的「$K$ 维分块」「累加顺序」**逐项相同**，因为分块只由 $K$ 和 `BLOCK_K` 决定，$M$ 从 1 变到 3 一点没影响它们。两列输入相同的 float32 数、按完全相同的顺序累加，结果**必然逐位相同**——所以两行的 `bits(行A)` 是同一个值。这正是 batch-invariance 想要的：你的请求和别人的请求拼不拼在一起，结果不变，推理可复现。
+最后一列写成符号 `bits(行A)` 而非某个具体十六进制位串——这是**示意**：host 上不真跑这个 NPU kernel，要点也不在那串 bit 等于多少，而在两场景的累加过程完全一致。看前面三列：两行的「 $K$ 维分块」「累加顺序」**逐项相同**，因为分块只由 $K$ 和 `BLOCK_K` 决定， $M$ 从 1 变到 3 一点没影响它们。两列输入相同的 float32 数、按完全相同的顺序累加，结果**必然逐位相同**——所以两行的 `bits(行A)` 是同一个值。这正是 batch-invariance 想要的：你的请求和别人的请求拼不拼在一起，结果不变，推理可复现。
 
 （对照基座：vLLM 主干的 batch_invariant 是同一套设计思路，昇腾把它落到了 NPU 的 triton / AscendC kernel 上，并补了 HCCL/LCCL 这层昇腾特有的集合通信确定性开关。）
 

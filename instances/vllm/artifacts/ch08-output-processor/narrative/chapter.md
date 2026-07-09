@@ -311,7 +311,7 @@ def check_stop_strings(
 
 > *图注：stop_str=`"ab"`（长 2）。Step 1 新增 1 个字符，搜索窗口（蓝色虚线框）覆盖末尾 2 个字符 `"zc"`，未命中。Step 2 新增 2 个字符 `'a'+'b'`，搜索窗口覆盖末尾 3 个字符 `"cab"`，命中 `"ab"`（红色高亮）。灰色 = 已被上一步扫过的旧字符，绿色 = 本步新增字符。窗口大小 = new\_char\_count + stop\_len − 1，始终精确覆盖跨步边界，不多扫也不漏扫。*
 
-**这把复杂度从平方级摊薄到线性级。** 朴素做法每步都重扫全文：第 $k$ 步扫 $k$ 个字符，$L$ 步累计起来是
+**这把复杂度从平方级摊薄到线性级。** 朴素做法每步都重扫全文：第 $k$ 步扫 $k$ 个字符， $L$ 步累计起来是
 
 $$
 \sum_{k=1}^{L} k = \frac{L(L+1)}{2} = O(L^2)
@@ -423,7 +423,7 @@ def make_request_output(
 
 **闸门一：`FINAL_ONLY`。** 如果调用方要的是非流式结果（只要最后一份完整输出），那中途每一步都直接 `return None`，只有 `finished` 时才往下走。这是离线批处理和"非流式 API 调用"的常态。
 
-**闸门二：`stream_interval` 节流。** 即便是流式（要逐步发），`stream_interval > 1` 时也不是每个 token 都发。发送只在三种情况：完成、首 token（`sent_tokens_offset == 0`）、或者攒够了 `stream_interval` 个新 token。直觉：把发送频率降到约 $1/k$，用稍高一点的中段延迟，换更低的 per-token 序列化/事件循环开销。高并发流式场景下，"每个 token 都造一个对象、过一遍队列、`yield` 一次"的固定开销不可忽视。
+**闸门二：`stream_interval` 节流。** 即便是流式（要逐步发），`stream_interval > 1` 时也不是每个 token 都发。发送只在三种情况：完成、首 token（`sent_tokens_offset == 0`）、或者攒够了 `stream_interval` 个新 token。直觉：把发送频率降到约 $1/k$ ，用稍高一点的中段延迟，换更低的 per-token 序列化/事件循环开销。高并发流式场景下，"每个 token 都造一个对象、过一遍队列、`yield` 一次"的固定开销不可忽视。
 
 这里的正确性关键是 `sent_tokens_offset`。DELTA 模式下，攒批之后**只发"从上次已发偏移到现在"的那段 token**，然后把偏移推进到当前位置。看这张决策表把它走一遍：
 

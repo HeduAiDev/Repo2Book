@@ -510,7 +510,7 @@ def _cached_get_attn_backend(
 
 这就是"平台最优"的体现：Blackwell（`major == 10`，sm100）把 FlashInfer 提到第一；Hopper 及以下（普通非 MLA decoder）默认 FlashAttention 优先、其次 FlashInfer、再 Triton。原因在于 FlashInfer 较早为 sm100 的 wgmma（warpgroup 级矩阵乘累加指令，Hopper/Blackwell 上新增的底层矩阵乘指令）做了专项适配，而 FlashAttention 对 Blackwell 的支持引入更晚；Hopper（sm90）上二者性能接近，但 FlashAttention 在 vLLM 里集成更早、测试覆盖更广，故仍排在前。
 
-**选后端贵不贵？** 一点都不贵。`validate_configuration` 对优先级列表里 $O(B)$ 个候选（$B$ = 后端数），各做常数次探针检查，全是 Python 端常数级别；而且整条链被 `@cache` 摊销到每模型只算一次。它根本不在前向热路径上。精简版正好复现了 Hopper 默认选 FlashAttention、以及显式指定不合法后端直接报错这两条路：
+**选后端贵不贵？** 一点都不贵。`validate_configuration` 对优先级列表里 $O(B)$ 个候选（ $B$ = 后端数），各做常数次探针检查，全是 Python 端常数级别；而且整条链被 `@cache` 摊销到每模型只算一次。它根本不在前向热路径上。精简版正好复现了 Hopper 默认选 FlashAttention、以及显式指定不合法后端直接报错这两条路：
 
 ```python
 CudaPlatform._device_capability = DeviceCapability(9, 0)  # Hopper
@@ -760,7 +760,7 @@ def reshape_and_cache_flash(
     )
 ```
 
-内核语义就是上面那条寻址恒等式：对每个 token $i$，取 `slot = slot_mapping[i]`，算出 `block_idx` 和 `block_offset`，把 `key[i]` / `value[i]`（形状 `[num_kv_heads, head_size]`）写进 `key_cache[block_idx, block_offset]` / `value_cache[block_idx, block_offset]`。`slot_mapping[i] == -1` 表示这个 token 跳过（是 padding）。这就是 PagedAttention 的"写"半边。
+内核语义就是上面那条寻址恒等式：对每个 token $i$ ，取 `slot = slot_mapping[i]`，算出 `block_idx` 和 `block_offset`，把 `key[i]` / `value[i]`（形状 `[num_kv_heads, head_size]`）写进 `key_cache[block_idx, block_offset]` / `value_cache[block_idx, block_offset]`。`slot_mapping[i] == -1` 表示这个 token 跳过（是 padding）。这就是 PagedAttention 的"写"半边。
 
 host 无 CUDA，精简版用 CPU 等价实现复刻了这个寻址语义，于是能在本地把"散写"看个真切：
 
