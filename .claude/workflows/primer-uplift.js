@@ -184,7 +184,7 @@ function illustratePrompt(slug) {
   const appr = approvalsFor(slug)
   return '你的角色契约在 ' + REPO + '/.claude/agents/illustrator.md——先读其「论文精髓图重绘」节，严格照做；**不许碰** ' + dir + '/narrative/chapter.md（正文插图引用归 writer 阶段做）。\n' +
     '任务：逐张重绘下列已批准 key_figures（论文原图，非本章已有的自产机制图）：\n' + JSON.stringify(appr.key_figures) + '\n' +
-    '每张流程：① 先取原图——从 arXiv HTML/ar5iv 抓图 URL 后 curl 下载，用 Read **亲眼看**原图长什么样（抓不到则降级：按论文包 ' + papers + '/paper.md 的文字描述重绘，图注相应改用降级句式）。② 忠实重绘 SVG（信息结构对齐原图，配色/字体套本书视觉语言，文字译中）到 ' + dir + '/diagrams/paper-fig-<N>.{py,svg,png}，图注固定句式「重绘自 arXiv:xxxx Fig.N:<一句话>」（降级时改「按 arXiv:xxxx §y 描述重绘」）。③ 渲染后 Read PNG 六项自查全真才登记进 ' + dir + '/diagrams/figure-manifest.json（blind_review 初写 PENDING）。\n' +
+    '每张流程：① 先取原图——从 arXiv HTML/ar5iv 抓图 URL 后 curl 下载，用 Read **亲眼看**原图长什么样（抓不到则降级：按论文包 ' + papers + '/paper.md 的文字描述重绘，图注相应改用降级句式）。② 忠实重绘 SVG（信息结构对齐原图，配色/字体套本书视觉语言，文字译中）到 ' + dir + '/diagrams/paper-fig-<N>.{py,svg,png}，图注固定句式「重绘自 arXiv:xxxx Fig.N:<一句话>」（降级时改「按 arXiv:xxxx Fig.N（§y）描述重绘」）。③ 渲染后 Read PNG 六项自查全真才登记进 ' + dir + '/diagrams/figure-manifest.json（blind_review 初写 PENDING）。\n' +
     '完成后自跑 `python3 ' + REPO + '/scripts/lint_paper_grounding.py ' + dir + ' --expect-primer` 与 `python3 ' + REPO + '/scripts/lint_diagram_geometry.py ' + dir + '/diagrams/*.svg`。**注意**：此时正文尚未插入图引用，lint_paper_grounding 报的 key_figure_missing（正文缺对应图注）在本阶段是预期的——writer 下一阶段插入引用后会消，不必现在解决；若报的是其他问题（fig 号错、孤儿图注、symbol_context 等）才需要你自己修。返回 status/note（note 里如实记录 key_figure_missing 是否只是预期的"待 writer 插入"）。' + ESC
 }
 

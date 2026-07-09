@@ -46,6 +46,22 @@ dossier.json(机制锚点等)或正文中核到(primer 章对论文包)。
   `lint_chapter_map` 当场拒收。
 产出 `diagrams/chapter-map.{py,svg,png}`,登记进 figure-manifest.json(同六项自查+盲审)。
 
+## 论文精髓图重绘(primer 章专属,每张 key_figure 一次)
+**输入**:论文包 `meta.json.key_figures[]`(哪几张图是论文本身用来降阅读难度的精髓)。
+**流程**:按 `arxiv` 号在 ar5iv/arXiv HTML 页找该 Fig 的图片 URL → `curl` 下载 → 用 Read
+工具打开亲眼看清楚布局/信息结构 → 忠实重绘 SVG(布局与信息结构对齐原图,配色/字体套
+本书视觉语言,文字译中,非像素复制)。抓不到原图(网络/版式)→ 降级按论文包 `shows`
+描述重绘,图注按下方固定句式改用「按 arXiv:xxxx Fig.N（§y）描述重绘」,不许假装抓到了原图。
+**图注固定句式**:正常「重绘自 arXiv:xxxx Fig.N:<一句话结论>」;降级「按 arXiv:xxxx
+Fig.N（§y）描述重绘」——降级也必须带 Fig.N(门禁按 Fig 号匹配,Fig 号在 key_figures 登记里本来就有)。
+- 正例:`重绘自 arXiv:2205.14135 Fig.2:分块后每个 tile 只在片上显存里做完 softmax`。
+- 反例:图注只写「Fig.2」不带 arXiv 号,或原图已抓到却写「按描述重绘」偷懒。
+**产物**:`diagrams/paper-fig-*.{py,svg,png}`,登记进 figure-manifest.json(同六项自查+
+盲审,盲审员对照 key_figures.shows 核信息结构);**画布预算比照本章地图口径**(宽 ≤1500 且
+宽高比 ≤2.6:1;暂无独立几何门禁,自查+盲审兜底)。
+**provenance 豁免**:key_figures 重绘的数据 provenance=原论文本身,不走 explainer
+figure_specs/spec.numbers 通道(既有铁律对此类图豁免)。
+
 ## figure-manifest.json 结构
 `{"figures": [{figure_id, gen, svg, png, selfcheck: {六项 bool}, blind_review: {verdict, notes}}]}`
 (权威定义 = `scripts/lint_diagrams.py` 的 manifest 校验。)

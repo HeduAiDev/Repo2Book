@@ -133,3 +133,155 @@ def test_section_missing_from_all_paper_packs_still_warns(tmp_path):
     (pd / "paper-mtp.md").write_text("##### Something else entirely.\n", encoding="utf-8")
     r = lint_paper_grounding(ch)
     assert r["paper_ref"], "所有论文包都找不到的小节仍应报警,不能因多包拼接而漏判"
+
+
+# ── symbol_context(WARN) + key_figure_missing(BLOCKING) ──
+# 独立的最小 primer/code 章 fixture:只关心 narrative body 与 meta.json key_figures,
+# 不复用上面 _mk() 的 IMPL/dossier.mechanisms 细节。
+
+def _mk_primer(tmp_path, body, meta_key_figures=None, chapter_name="ch40-primer-symbol-fixture",
+               create_paper_pack=True):
+    ch = tmp_path / "inst" / "artifacts" / chapter_name
+    (ch / "dossier").mkdir(parents=True)
+    (ch / "narrative").mkdir(parents=True)
+    (ch / "dossier" / "dossier.json").write_text(
+        json.dumps({"kind": "primer", "mechanisms": []}), encoding="utf-8"
+    )
+    (ch / "narrative" / "chapter.md").write_text(body, encoding="utf-8")
+    if create_paper_pack:
+        pd = tmp_path / "inst" / "book" / "papers" / chapter_name
+        pd.mkdir(parents=True)
+        (pd / "paper.md").write_text(PAPER_MD, encoding="utf-8")
+        meta = {}
+        if meta_key_figures is not None:
+            meta["key_figures"] = meta_key_figures
+        (pd / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    return str(ch)
+
+
+def _mk_code_chapter(tmp_path, body, chapter_name="ch41-normal-chapter"):
+    ch = tmp_path / "inst" / "artifacts" / chapter_name
+    (ch / "dossier").mkdir(parents=True)
+    (ch / "narrative").mkdir(parents=True)
+    (ch / "dossier" / "dossier.json").write_text(json.dumps({"mechanisms": []}), encoding="utf-8")
+    (ch / "narrative" / "chapter.md").write_text(body, encoding="utf-8")
+    return str(ch)
+
+
+def run_lint(chapter_dir):
+    return lint_paper_grounding(chapter_dir)
+
+
+def test_symbol_without_context_warns(tmp_path):
+    # $$ 块引入 \delta,前后 3 行 prose 无 δ/delta 提及、无表格行 → warn 1 条
+    ch = _mk_primer(tmp_path, body="推导如下。\n\n$$\n\\delta = j - t\n$$\n\n继续。\n")
+    res = run_lint(ch)
+    assert any("delta" in w or "δ" in w for w in res["symbol_context"])
+
+
+def test_symbol_with_nearby_prose_ok(tmp_path):
+    # 全式扫描下 RHS 的 j/t 也算候选,须在正文里一并交代清楚(不再只顾 LHS 的 δ)
+    ch = _mk_primer(
+        tmp_path,
+        body=(
+            "其中 $\\delta$ 是相对位置偏移,$j$ 遍历 $t$ 之前的历史 token。\n\n"
+            "$$\n\\delta = j - t\n$$\n"
+        ),
+    )
+    assert run_lint(ch)["symbol_context"] == []
+
+
+def test_symbol_in_table_ok(tmp_path):
+    # 表格同样须覆盖 RHS 的 j/t,而不只是 LHS 的 δ
+    ch = _mk_primer(
+        tmp_path,
+        body=(
+            "| 符号 | 含义 |\n|---|---|\n"
+            "| $\\delta$ | 相对偏移 |\n"
+            "| $j$ | 键位置 |\n"
+            "| $t$ | 查询位置 |\n\n"
+            "$$\n\\delta = j - t\n$$\n"
+        ),
+    )
+    assert run_lint(ch)["symbol_context"] == []
+
+
+def test_rhs_symbol_without_context_warns(tmp_path):
+    # 本次修复的行为定义:等号右侧首现的符号(M)同样要查——LHS-only 会对此视而不见
+    ch = _mk_primer(
+        tmp_path,
+        body="总时延如下。\n\n$$\nL = N^2 d / M\n$$\n\n继续讨论。\n",
+    )
+    res = run_lint(ch)
+    assert any(" M " in w for w in res["symbol_context"])
+
+
+def test_key_figure_registered_and_redrawn_ok(tmp_path):
+    ch = _mk_primer(
+        tmp_path,
+        meta_key_figures=[{
+            "fig": "Fig.2", "arxiv": "arXiv:2405.04434", "shows": "x",
+            "why_essential": "y", "target_section": "z",
+        }],
+        body="![重绘自 arXiv:2405.04434 Fig.2:MLA 压缩路径](../diagrams/paper-fig-2.png)\n",
+    )
+    assert run_lint(ch)["key_figure_missing"] == []
+
+
+def test_key_figure_not_redrawn_fail(tmp_path):
+    ch = _mk_primer(
+        tmp_path,
+        meta_key_figures=[{
+            "fig": "Fig.2", "arxiv": "a", "shows": "x", "why_essential": "y", "target_section": "z",
+        }],
+        body="没图。\n",
+    )
+    assert len(run_lint(ch)["key_figure_missing"]) == 1
+
+
+def test_orphan_redraw_caption_fail(tmp_path):
+    ch = _mk_primer(
+        tmp_path, meta_key_figures=[], body="![重绘自 arXiv:x Fig.9:孤儿](../diagrams/paper-fig-9.png)\n"
+    )
+    assert len(run_lint(ch)["key_figure_missing"]) == 1
+
+
+def test_degraded_redraw_caption_by_section_ok(tmp_path):
+    # 「按 arXiv:xxxx §y 描述重绘」降级句式(无法精确对应具体 Fig 号时的措辞)同样应算已重绘
+    ch = _mk_primer(
+        tmp_path,
+        meta_key_figures=[{
+            "fig": "Fig.2", "arxiv": "arXiv:2405.04434", "shows": "x",
+            "why_essential": "y", "target_section": "z",
+        }],
+        body="![按 arXiv:2405.04434 §4.2 描述重绘 Fig.2:MLA 压缩路径](../diagrams/paper-fig-2.png)\n",
+    )
+    assert run_lint(ch)["key_figure_missing"] == []
+
+
+def test_redraw_caption_multi_fig_numbers_all_counted(tmp_path):
+    # 图注「重绘自…Fig.2 与 Fig.3 合并」须 findall 全收两个 Fig 号,而非只取首个
+    ch = _mk_primer(
+        tmp_path,
+        meta_key_figures=[
+            {"fig": "Fig.2", "arxiv": "a", "shows": "x", "why_essential": "y", "target_section": "z"},
+            {"fig": "Fig.3", "arxiv": "a", "shows": "x", "why_essential": "y", "target_section": "z"},
+        ],
+        body="![重绘自 arXiv:x Fig.2 与 Fig.3 合并](../diagrams/paper-fig-2-3.png)\n",
+    )
+    assert run_lint(ch)["key_figure_missing"] == []
+
+
+def test_paper_pack_missing_no_duplicate_meta_warn(tmp_path):
+    # 论文包目录整体缺失时只应记一条"论文包缺失"warn,不应叠加同根因的
+    # "meta 缺 key_figures 字段"重复 warn
+    ch = _mk_primer(tmp_path, body="没有公式。\n", create_paper_pack=False)
+    res = run_lint(ch)
+    assert sum("论文包缺失" in w for w in res["warn"]) == 1
+    assert not any("缺 key_figures 字段" in w for w in res["warn"])
+
+
+def test_code_chapter_skipped(tmp_path):
+    ch = _mk_code_chapter(tmp_path, body="$$\n\\delta=1\n$$\n")
+    res = run_lint(ch)
+    assert res["symbol_context"] == [] and res["key_figure_missing"] == []

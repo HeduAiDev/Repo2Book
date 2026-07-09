@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - primer 判定=dossier 顶层 `kind:"primer"`(lint_paper_grounding 已用);码章一律不受本计划影响。
-- 重绘图图注固定句式:「重绘自 arXiv:xxxx Fig.N:<一句话>」或降级「按 arXiv:xxxx §y 描述重绘」;产物 `diagrams/paper-fig-*.{py,svg,png}`+figure-manifest 登记。
+- 重绘图图注固定句式:「重绘自 arXiv:xxxx Fig.N:<一句话>」或降级「按 arXiv:xxxx Fig.N（§y）描述重绘」;产物 `diagrams/paper-fig-*.{py,svg,png}`+figure-manifest 登记。
 - 画布预算沿用 lint_chapter_map 同款(宽 ≤1500、比例 ≤2.6:1——重绘图不受 chapter-map lint 管,但 illustrator 契约同预算);几何 lint 必过。
 - writer 施工**禁整章重写**,只许定点 Edit;HARD RULE:主编排者不写 chapter.md。
 - workflow 语法检查 async-wrapper 法;提交带 Co-Authored-By 尾注;不 push。

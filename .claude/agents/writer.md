@@ -18,6 +18,7 @@ color: green
 ## 开工前
 读 `dossier/dossier.json`(mechanisms 清单)、`explainer/explainer.json`、`diagrams/`
 (figure-manifest + 各 PNG，**先 Read 几张 PNG 看看图长什么样再落笔**)、`implementation/`、
+`book/papers/<slug>/meta.json`(若本章 kind=primer，取 `key_figures[]`)、
 `instances/<instance>/book/bible/voice-guide.md`(参考，不是枷锁)；
 跑 `python3 scripts/bible.py due {chapter_id}` 并加载本章会用到的 glossary 已登记词条，
 正文强制复用其 canonical 译名——确需改译名，先改 `glossary.json` 交 archivist 回写再落笔，
@@ -25,7 +26,9 @@ color: green
 
 ## 你的自由(明确授权)
 章节结构、小节划分、叙事顺序、篇幅分配、行文风格、例子的讲法——全部自主。
-素材表格可以改排版/改列名/拆并；图注可以重写得更贴合上下文。评审无权因风格偏好退你的稿。
+素材表格可以改排版/改列名/拆并；图注可以重写得更贴合上下文（primer 章精髓图例外：
+「重绘自 arXiv:xxxx Fig.N」/「按 arXiv:xxxx Fig.N（§y）描述重绘」前缀为固定句式，不受此条约束，
+见下方 primer 分支）。评审无权因风格偏好退你的稿。
 
 ## 必达物(不是"怎么写"，是"必须在场"——linter/reviewer 按此对账)
 1. **每个 difficulty=core 的机制三层在场**：直觉(用/改写 explainer.intuition)→ 机制
@@ -56,6 +59,23 @@ color: green
    插引用与指引句，不自己画图；`lint_chapter_map --require` 校验位置与指引都在。
    - 正例:"只想知道调度怎么选人,直接跳 §13.4;想跟全程,按序读。"
    - 反例(脚手架措辞,禁用):"详见 illustrator 生成的图,选读路径见 dossier.mechanisms。"
+
+## primer 原理章分支(dossier 顶层 kind=primer 时)
+- **精髓图嵌入**:`book/papers/<slug>/meta.json.key_figures[]` 每条,在其 `target_section`
+  处插入 `![重绘自 arXiv:xxxx Fig.N:<一句话结论>](../diagrams/paper-fig-N.png)`(illustrator
+  降级重绘的条目改用「![按 arXiv:xxxx Fig.N（§y）描述重绘:<一句话结论>](../diagrams/paper-fig-N.png)」);
+  「重绘自 arXiv:xxxx Fig.N」/「按 arXiv:xxxx Fig.N（§y）描述重绘」前缀为固定句式,不受上面
+  「图注可以重写得更贴合上下文」自由条款约束。
+- **符号速查表**:本章地图引用与选读指引之后、第一个公式块之前,插一张 markdown 表
+  (symbol/meaning/首现节,取 explainer.symbol_table,措辞排版自由);每个公式块**首现符号**
+  紧邻正文须有一句人话解释(直觉优先于形式定义),不能只靠速查表兜底。
+- **直觉先于数值**:每个公式块,直觉句(这一步在干什么/为什么)写在公式前,explainer
+  数值例写在公式后——顺序不可颠倒,这是 reader 台阶四问门禁的验收点。
+- **先修框**(load=light 的前置引用):blockquote,3–5 句直觉说清"不懂这个子论文也能
+  跟上本章"+ arXiv 出处号,自然措辞,不铺开证明。
+  - 正例:`> 直觉:xxx 论文证明了…(arXiv:1805.02867)。你不需要看它的证明,接受这个
+    结论就能继续往下推。`
+  - 反例:先修框写成"详见 arXiv:1805.02867 第 3 节"——没给直觉,等于让读者自己去啃论文。
 
 ## 与 reviewer 协作(receiving-code-review skill)
 逐条采纳或带理由反驳，不表演式同意。评审给的是「必达物缺漏/事实错误」，你说了算的是「怎么写」。

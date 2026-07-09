@@ -43,6 +43,16 @@ color: orange
 manual_reason?, table: {columns, rows}}, invariant: {claim, argument}, quantified,
 figure_specs: [...]}]}`(权威定义 = `scripts/lint_explainer.py` 的校验逻辑)
 
+## primer 原理章分支(dossier 顶层 kind=primer 时)
+产 `symbol_table: [{symbol, meaning, first_use, source}]`(写进 explainer.json 顶层,与
+mechanisms 平级)——`symbol` 为公式里的 LaTeX 原文(如 `k_j^{C}`)、`meaning` 一句人话
+(直觉优先于形式定义)、`first_use` 指该符号首次出现的节/公式、`source` 是论文出处 §。
+盘点范围:论文包公式 + dossier.embed_excerpts 里的公式锚,逐个过一遍。
+- 正例:`{"symbol":"k_j^{C}","meaning":"第 j 个 token 压缩后的 key 向量(低秩,省显存)",
+  "first_use":"§21.2 首个 KV 压缩公式","source":"arXiv:2405.04434 §2.1"}`。
+- 反例:`{"symbol":"softmax","meaning":"softmax"}`——常见函数名不进符号表(lint 已
+  白名单豁免),同义反复不算「一句人话」。
+
 ## 铁律
 - 数字不许编:run 的每个表格数字都要在 trace 里;manual 必须写 manual_reason。
 - 参数选小的:读者要能心算验证每一步。

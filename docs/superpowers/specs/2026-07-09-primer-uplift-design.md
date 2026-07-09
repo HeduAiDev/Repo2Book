@@ -14,7 +14,7 @@
 ## 2. 论文精髓图忠实重绘
 
 - **盘点**:论文包 `meta.json` 增 `key_figures: [{fig: "Fig.2", arxiv, shows, why_essential, target_section}]`——「哪几张图是这篇论文降低阅读难度的精髓」。retrofit 期由诊断 agent 提候选;新论文包由 analyst 建包时登记(RUNBOOK primer 发车节补此要求)。
-- **重绘**:illustrator **先取原图亲眼看**——从 arXiv HTML/ar5iv 抓原图文件下载后 Read;然后忠实重绘 SVG(布局与信息结构对齐原图,配色/字体套本书视觉语言,文字译中),图注固定句式「重绘自 arXiv:xxxx Fig.N:<一句话>」。抓不到原图(网络/版式)时按论文包文字描述重绘,图注改「按 arXiv:xxxx §y 描述重绘」如实标注。产物 `diagrams/paper-fig-*.{py,svg,png}`,登记 figure-manifest+盲审照旧(盲审员对照论文包描述核信息结构)。
+- **重绘**:illustrator **先取原图亲眼看**——从 arXiv HTML/ar5iv 抓原图文件下载后 Read;然后忠实重绘 SVG(布局与信息结构对齐原图,配色/字体套本书视觉语言,文字译中),图注固定句式「重绘自 arXiv:xxxx Fig.N:<一句话>」。抓不到原图(网络/版式)时按论文包文字描述重绘,图注改「按 arXiv:xxxx Fig.N（§y）描述重绘」如实标注。产物 `diagrams/paper-fig-*.{py,svg,png}`,登记 figure-manifest+盲审照旧(盲审员对照论文包描述核信息结构)。
 - **版权口径**:重绘(非复制)+明确出处标注,出版惯例合规。
 - **门禁**(lint_paper_grounding 增,确定性,blocking):meta.key_figures 每条须有章内图注含「重绘自 …Fig.N」(或「按 … 描述重绘」)的对应图;反向:章内「重绘自」图注的 Fig 号须在 key_figures 登记(防孤儿)。meta 无 key_figures 字段 → warn(包策展缺口)。
 

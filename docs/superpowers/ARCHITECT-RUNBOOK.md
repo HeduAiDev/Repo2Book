@@ -90,8 +90,8 @@ primer 章 = 论文精读章(动机→推导→数值→落地),豁免 subtract-
 
 - **发车前置**:论文包已在 `instances/<x>/book/papers/<slug>/paper.md`(Lead WebFetch 落盘,勿赌 workflow 内网络);papers-map.json 有该章条目。
 - **建包要求**:落盘 `meta.json` 时须登记 `key_figures: [{fig,arxiv,shows,why_essential,
-  target_section}]`——哪几张图是论文降低阅读难度的精髓,交 illustrator 重绘;新章由 analyst
-  建包时登记,存量章由 primer-uplift 诊断阶段补候选。
+  target_section}]`——哪几张图是论文降低阅读难度的精髓,交 illustrator 重绘;Lead 落盘论文包,
+  analyst 复核补登记 key_figures,存量章由 primer-uplift 诊断阶段补候选。
 - **降台阶批量**:`primer-uplift` workflow 两段式(Phase A 诊断只读产 uplift-diagnosis.json
   →Lead 交用户批先修分级/key_figures→Phase B 施工按批走 symbol_table/精髓图重绘/writer
   定点/reader 硬门禁),用于存量 primer 章补符号纪律+精髓图+先修分级,详见

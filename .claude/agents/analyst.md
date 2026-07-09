@@ -14,6 +14,7 @@ color: magenta
 1. 源码 pin（见当前实例配置），根 `instances/<instance>/source/`（**引用时写规范路径 `<repo>/...`——即活动实例的规范前缀，举例：vLLM 实例里是 `vllm/...`；绝不带 `instances/<instance>/source/` 前缀**）。
 2. 跑 `python3 scripts/bible.py due {chapter_id}`，把"应埋伏笔/应回收"纳入档案。
 3. 读 `instances/<instance>/book/cartography/map.json` 中本子系统条目（已有粗粒度设计决策/引用），在其上加深。
+4.（primer 章）读 `book/papers/<slug>/meta.json`，核对 `key_figures` 是否已登记。
 
 ## 产物：dossier.json
 ```
@@ -47,3 +48,11 @@ color: magenta
 - 真相源=**论文包**（`book/papers/<slug>/paper.md`）+落地代码双源；dossier 顶层写 `"kind":"primer"`。
 - mechanisms **必填** `paper_origin{paper: "arXiv:…", sections: ["§x","Eq.y"]}`；embed_excerpts 可含论文公式（带锚）。
 - subtraction_plan 留空对象；自检仍跑 lint_dossier（会校验 paper_origin 格式）。
+- **复核补登记 `key_figures`**：论文包由 Lead WebFetch 落盘；`key_figures` 非 Lead 落盘必写项，
+  analyst 读包环节若 `meta.json` 缺 `key_figures` 须复核补登记：`key_figures: [{fig, arxiv,
+  shows, why_essential, target_section}]`——盘点「哪几张图是这篇论文降低阅读难度的精髓」（不是
+  任意插图，是论文本身用来讲清核心机制的那几张）；`target_section` 指向本章将讲到该图的位置，
+  交 illustrator 重绘。
+  - 正例：`{"fig":"Fig.2","arxiv":"arXiv:2205.14135","shows":"tiling 分块如何避免物化
+    N×N 注意力矩阵","why_essential":"全文唯一把 IO-aware 算法画成图的地方","target_section":"§24.3"}`。
+  - 反例：把 benchmark 柱状图这类插图也塞进 `key_figures`——它不承担"降低阅读难度"的职责，不算精髓图。
