@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """fig31-6-decode-vs-prefill: 同一份 KV cache,decode 走吸收路径、prefill 走物化
 路径;swimlane 骨架,decode/prefill 两泳道各自与"KV Cache"泳道交互,末尾汇合验证
-输出恒等。落地锚点 vllm_ascend/attention/mla_v1.py forward() L1718。"""
+输出在浮点精度内一致(实测最大绝对差显示 0.0)。落地锚点 vllm_ascend/attention/mla_v1.py
+forward() L1718。"""
 import xml.sax.saxutils as xs
 from pathlib import Path
 
@@ -63,7 +64,7 @@ L.append(f'<rect x="{PAD}" y="{foot_top}" width="{foot_w}" height="96" rx="10" '
          'fill="#fef3c7" stroke="#d97706" stroke-width="2"/>')
 L.append(f'<text x="{PAD+foot_w/2}" y="{foot_top+32}" text-anchor="middle" '
          f'font-family="sans-serif" font-size="14" font-weight="bold" fill="#92400e">'
-         f'{esc("两路径共享同一份 576 元素/token 缓存,输出逐位相等——最大绝对差 0.0")}</text>')
+         f'{esc("两路径共享同一份 576 元素/token 缓存,输出在浮点精度内一致(实测最大绝对差显示 0.0)")}</text>')
 L.append(f'<text x="{PAD+foot_w/2}" y="{foot_top+62}" text-anchor="middle" '
          f'font-family="sans-serif" font-size="12.5" fill="#92400e">'
          f'{esc("落地锚点:vllm_ascend/attention/mla_v1.py forward()(L1718)按 decode/prefill 分派——回指第 20 章")}</text>')

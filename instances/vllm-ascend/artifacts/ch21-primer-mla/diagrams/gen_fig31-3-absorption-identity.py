@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """fig31-3-absorption-identity: before-after 对比——物化路径(算出 full k^C 再内积)
-vs 吸收路径(query 先乘 W_UK 落到潜空间、直接和缓存 c_kv 内积),给出逐位相等的打分。
-数字全部来自 traces/absorption.json。"""
+vs 吸收路径(query 先乘 W_UK 落到潜空间、直接和缓存 c_kv 内积),两条路径打分在浮点
+精度内一致。数字全部来自 traces/absorption.json。"""
 import xml.sax.saxutils as xs
 from pathlib import Path
 
@@ -22,7 +22,7 @@ L = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}">',
      'markerHeight="4" orient="auto"><path d="M0,0 L10,3 L0,6 Z" fill="#64748b"/></marker></defs>',
      f'<rect width="{w}" height="{h}" fill="white"/>',
      f'<text x="{PAD}" y="30" font-family="sans-serif" font-size="17" font-weight="bold" '
-     f'fill="#0f172a">{esc("权重吸收恒等式:两条路径给出逐位相等的打分")}</text>']
+     f'fill="#0f172a">{esc("权重吸收恒等式:两条路径打分在浮点精度内一致")}</text>']
 
 for p, (title, steps, hot) in enumerate(PANELS):
     px = PAD + p * (PANEL_W + 90)
@@ -57,7 +57,7 @@ L.append(f'<rect x="{PAD}" y="{call_top}" width="{call_w}" height="86" rx="10" '
          'fill="#fef3c7" stroke="#d97706" stroke-width="2"/>')
 L.append(f'<text x="{PAD+call_w/2}" y="{call_top+30}" text-anchor="middle" font-family="sans-serif" '
          f'font-size="14" font-weight="bold" fill="#92400e">'
-         f'{esc("4 对 (查询 t, 键 j) 的两路打分逐位相等,最大绝对差 = 0.0")}</text>')
+         f'{esc("4 对 (查询 t, 键 j) 两路打分一致,绝对差舍入到 4 位后为 0.0(float64 实测 ~1e-16)")}</text>')
 L.append(f'<text x="{PAD+call_w/2}" y="{call_top+58}" text-anchor="middle" font-family="sans-serif" '
          f'font-size="13" fill="#92400e">'
          f'{esc("如 (t=1, j=0):物化 -0.0973 == 吸收 -0.0973 —— 精确恒等,不是近似")}</text>')
