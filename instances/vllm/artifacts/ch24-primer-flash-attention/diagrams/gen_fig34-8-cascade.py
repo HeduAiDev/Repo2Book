@@ -85,7 +85,7 @@ for line in MERGE_LINES:
 concl_y = merge_y + merge_h + 26
 L.append(f'<rect x="{PAD}" y="{concl_y}" width="{w-2*PAD}" height="34" rx="6" '
           'fill="#eff6ff" stroke="#1d4ed8" stroke-width="1.5"/>')
-CONCL = "合并结果与不拆分的精确注意力逐位相等(见 lse-merge trace,最大逐位误差 0.0)"
+CONCL = "合并结果与不拆分的精确注意力差在浮点舍入内(见 lse-merge trace,约 2e-16)"
 L.append(f'<text x="{w/2}" y="{concl_y+22}" text-anchor="middle" font-family="sans-serif" '
           f'font-size="12.5" font-weight="bold" fill="#1e3a8a">{esc(CONCL)}</text>')
 

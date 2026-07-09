@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""flow 模板:两段部分注意力 (O,lse) 经 max-稳定化加权合并,输出与一次性注意力逐位相等。
+"""flow 模板:两段部分注意力 (O,lse) 经 max-稳定化加权合并,输出与一次性注意力在浮点舍入内恒等。
 以 token 0 为例给出具体数值。box 高度按内容行数计算,零魔数、零溢出。"""
 import xml.sax.saxutils as xs
 from pathlib import Path
@@ -7,7 +7,7 @@ from pathlib import Path
 def esc(s): return xs.escape(s)
 
 TITLE = "LSE 合并(merge_attn_states 数学原型)— token 0"
-SUBTITLE = "两段各交出 (部分输出 O, logsumexp lse);以 max(lse) 稳定化后加权合并,结果与拼接 KV 一次性注意力逐位相等"
+SUBTITLE = "两段各交出 (部分输出 O, logsumexp lse);以 max(lse) 稳定化后加权合并,结果与拼接 KV 一次性注意力在浮点舍入内恒等"
 
 PAD, TOP = 40, 96
 BOX_W = 280
@@ -21,7 +21,7 @@ PREFIX_LINES = ["O_pre=[0.5, 0.5], lse_pre=1.4003"]
 SUFFIX_LINES = ["O_suf=[2.0, 0.0], lse_suf=0.3536"]
 MERGE_LINES = ["M=max(lse_pre,lse_suf)=1.4003", "w_pre≈0.7405, w_suf≈0.2595",
                "合并 O=[0.8898, 0.3701]", "合并 lse=1.7012"]
-REF_LINES = ["拼接 KV 一次性注意力", "O=[0.8898, 0.3701]", "最大逐位误差 = 0.0"]
+REF_LINES = ["拼接 KV 一次性注意力", "O=[0.8898, 0.3701]", "误差≈2e-16(舍入)"]
 
 PREFIX_H = box_height(True, len(PREFIX_LINES))
 SUFFIX_H = box_height(True, len(SUFFIX_LINES))
@@ -86,10 +86,10 @@ L.append(f'<line x1="{suffix_x+BOX_W}" y1="{suffix_y+SUFFIX_H/2}" '
 L.append(f'<line x1="{merge_x+BOX_W}" y1="{merge_y+MERGE_H/2}" '
           f'x2="{ref_x}" y2="{ref_y+REF_H/2}" stroke="#047857" stroke-width="2.2" marker-end="url(#g)"/>')
 L.append(f'<text x="{(merge_x+BOX_W+ref_x)/2}" y="{(merge_y+MERGE_H/2+ref_y+REF_H/2)/2-10}" text-anchor="middle" '
-          f'font-family="sans-serif" font-size="11" fill="#047857">{esc("逐位相等")}</text>')
+          f'font-family="sans-serif" font-size="11" fill="#047857">{esc("舍入内恒等")}</text>')
 
 foot_y = h - 20
-FOOT = "以 max_lse 稳定化后按 e^(lse-max) 求两段权重,加权合并 O——结果与不拆分的精确注意力完全一致,这是 cascade attention 拆前缀/后缀而不损精度的正确性保证。"
+FOOT = "以 max_lse 稳定化后按 e^(lse-max) 求两段权重,加权合并 O——结果与不拆分的精确注意力只差 float64 舍入(~2e-16),这是 cascade attention 拆前缀/后缀而不损精度的正确性保证。"
 L.append(f'<text x="{PAD}" y="{foot_y}" font-family="sans-serif" font-size="11.5" '
           f'fill="#64748b">{esc(FOOT)}</text>')
 L.append('</svg>')

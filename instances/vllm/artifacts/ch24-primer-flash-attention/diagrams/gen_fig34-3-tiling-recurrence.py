@@ -110,7 +110,7 @@ for i, txt in enumerate(RUNNING):
 
 # 下方:状态演化表(KV 块1 / KV 块2 / 标准 softmax 参照)
 L.append(f'<text x="{PAD}" y="{TABLE_TOP-14}" font-family="sans-serif" font-size="14" '
-          f'font-weight="bold" fill="#1e40af">{esc("query 行 0 的 (m,l,O) 递推 —— 处理完第 2 个 KV 块即与标准 softmax 分毫不差")}</text>')
+          f'font-weight="bold" fill="#1e40af">{esc("query 行 0 的 (m,l,O) 递推 —— 处理完第 2 个 KV 块即与标准 softmax 差在浮点舍入内")}</text>')
 for j, name in enumerate(COLS2):
     x = tcol_x[j]
     fill = "#059669" if j == HL_COL else "#3b82f6"
@@ -137,7 +137,7 @@ for i, row in enumerate(ROWS2):
                   f'font-family="sans-serif" font-size="11.5" fill="{text_fill}" '
                   f'{weight}>{esc(CELLS2[row][j])}</text>')
 
-FOOT = "KV 块2 后 O_i=[0.8588,0.7137] 与标准 softmax(QKᵀ)V 逐位相等 —— 全程最大局部块仅 2×2,4×4 完整打分表从未落地 HBM。"
+FOOT = "KV 块2 后 O_i=[0.8588,0.7137] 与标准 softmax(QKᵀ)V 差约 1e-16(float64 舍入内恒等) —— 全程最大局部块仅 2×2,4×4 完整打分表从未落地 HBM。"
 L.append(f'<text x="{PAD}" y="{foot_y}" font-family="sans-serif" font-size="12" '
           f'fill="#64748b">{esc(FOOT)}</text>')
 L.append('</svg>')
