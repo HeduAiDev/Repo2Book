@@ -92,7 +92,7 @@ primer 章 = 论文精读章(动机→推导→数值→落地),豁免 subtract-
 - **建包要求**:落盘 `meta.json` 时须登记 `key_figures: [{fig,arxiv,shows,why_essential,
   target_section}]`——哪几张图是论文降低阅读难度的精髓,交 illustrator 重绘;Lead 落盘论文包,
   analyst 复核补登记 key_figures,存量章由 primer-uplift 诊断阶段补候选。
-- **降台阶批量**:`primer-uplift` workflow 两段式(Phase A 诊断只读产 uplift-diagnosis.json
+- **降台阶批量**:`primer-uplift` workflow 两段式(Phase A 诊断只读产 uplift-diagnosis.json。**后置微修纪律**:reader 门禁 PASS 之后若再做触碰语义内容的微修(符号表/公式/图注/先修框),必须对改动点重过一次 reader 抽查——只跑机械 linter 会漏语义错误(实例:ch21 符号表为清 warn 把 d 与 d_h 错并一行,linter 全绿但事实错误,用户抓出)
   →Lead 交用户批先修分级/key_figures→Phase B 施工按批走 symbol_table/精髓图重绘/writer
   定点/reader 硬门禁),用于存量 primer 章补符号纪律+精髓图+先修分级,详见
   `docs/superpowers/specs/2026-07-09-primer-uplift-design.md`。

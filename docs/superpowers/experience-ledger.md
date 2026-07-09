@@ -31,3 +31,4 @@
 | exp-0709-2 | 2026-07-09 | 图类横幅超宽(6.9:1)排版后不可读——节点预算挡不住画布失控 | lint_chapter_map 画布预算(宽≤1500 比例≤2.6:1)+illustrator 契约 | oversize_canvas=0 | active |
 | exp-0709-3 | 2026-07-09 | lint_diagram_geometry 容差设计漏报图例贴边重叠(单例:chapter-map 模板) | 暂不动阈值,复发≥2 再收紧;illustrator"Read PNG 亲眼看"仍是第一道 | 复发计数 1 | watching |
 | exp-0709-4 | 2026-07-09 | 引擎不改 ## N.M 标题——中段插章后图徽标必与标题错位撞门禁(终审 Medium) | SOP §4 补同批改号句;理想解=引擎顺带改移动章标题(下次 --insert 前评估) | 下次 --insert 零门禁意外 | active |
+| exp-0709-5 | 2026-07-09 | lint-appeasement 反模式:为清 symbol warn 把裸 d 与 d_h 配对入表,制造事实错误(d=模型维≠头维);门禁时序洞:reader PASS 后的微修只过机械 lint | RUNBOOK 后置微修纪律(语义改动重过 reader 抽查);linter 下标基名合并歧义待评估 | 同类符号并行错误 0 复发 | active |
