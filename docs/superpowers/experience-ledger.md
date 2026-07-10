@@ -34,3 +34,4 @@
 | exp-0709-5 | 2026-07-09 | lint-appeasement 反模式:为清 symbol warn 把裸 d 与 d_h 配对入表,制造事实错误(d=模型维≠头维);门禁时序洞:reader PASS 后的微修只过机械 lint | RUNBOOK 后置微修纪律(语义改动重过 reader 抽查);linter 下标基名合并歧义待评估 | 同类符号并行错误 0 复发 | active |
 | exp-0709-6 | 2026-07-09 | 行文推导路径与数值见证路径不一致(W^Q vs W^{UQ})——reader/盲审/paper-fidelity 均未抓到,唯亲手重推抓出 | derivation 硬维度(pipeline PRIMER 维+uplift DerivationCheck)+writer 落笔纪律 | 推导审计 Medium+ 0 漏 | active |
 | exp-0709-7 | 2026-07-09 | 杜撰证据引用:正文引用不存在的测试断言/把容差校验说成逐位保证(ch22/ch27,判修 sweep 抓出) | 落笔纪律已含"等式须可执行见证";derivation 维 prompt 补"引用的测试/断言须真实存在"(下轮铺开验证) | 引用核真 0 杜撰 | active |
+| exp-0710-1 | 2026-07-10 | named-workflow args 字符串化撞上 CFG 残留调试配置→静默错车重写已出版章(烧 692k;评审逃生舱救回未归档) | chapter-pipeline args 护栏:字符串解析+无 chapter_id 拒绝 CFG 回退直接终止;CFG 仅限手工无参调试 | 错车零复发 | active |

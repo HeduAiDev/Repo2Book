@@ -28,7 +28,16 @@ const CFG = {
   skip_impl: true,
   paths: ['setup.py', 'vllm_ascend/__init__.py', 'vllm_ascend/platform.py', 'vllm_ascend/patch/__init__.py'],
 }
-const A = (typeof args !== 'undefined' && args && args.chapter_id) ? args : CFG
+let A = (typeof args !== 'undefined' && args) ? args : null
+if (typeof A === 'string') { try { A = JSON.parse(A) } catch (e) { A = null } }   // named 调用 args 可能字符串化(N1)
+if (A && !A.chapter_id) A = null
+if (!A) {
+  if (typeof args !== 'undefined' && args) {
+    // args 传了但解析不出 chapter_id——拒绝 CFG 回退(曾静默错车生产别章烧 692k tokens),直接终止
+    return { escalated: 'bad-args', note: 'args 存在但无法解析出 chapter_id(字符串化/字段缺失)——拒绝 CFG 回退,请检查发车参数' }
+  }
+  A = CFG   // 仅在完全未传 args 的手工调试场景才允许 CFG
+}
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
 const INST = A.instance || 'vllm'
 const SRC = A.source_root || (REPO + '/instances/' + INST + '/source')
