@@ -635,7 +635,7 @@ def apply_top_k_top_p_triton(logits, k, p, mask_value=float("-inf")):
     # … 省略：fp32/2D 断言、按 SM 数定 NUM_PROGRAMS、缓存查找表、启动内核 …
 ```
 
-这个内核基于 Park 等人的 "Qrita" pivot-truncation 算法。思路是：**不排序整个词表**，而是用高斯分布近似 logits、做三分搜索逼近那个截断 pivot，多趟扫描把复杂度从 `O(V log V)` 压到约 `O(V)`。它先按 logit 值做 top-k、再对剩下的按概率做 top-p，in-place 写回——外部契约跟 pytorch sort 版完全等价，只是快得多。它内部那 900 多行的三分搜索/离群点处理是 GPU 工程的深水区，本章不逐行讲；记住一句就够：**`batch >= 8` 之所以另起内核，是为了避开整词表排序的 `O(V log V)`。**
+这个内核基于 Park 等人提出的 Qrita pivot-truncation 算法（*Qrita: High-performance Top-k and Top-p using Pivot-based Truncation and Selection*，arXiv:2602.01518——源码文件头注释直接点名了这篇论文）。思路是：**不排序整个词表**，而是用高斯分布近似 logits、做三分搜索逼近那个截断 pivot，多趟扫描把复杂度从 `O(V log V)` 压到约 `O(V)`。它先按 logit 值做 top-k、再对剩下的按概率做 top-p，in-place 写回——外部契约跟 pytorch sort 版完全等价，只是快得多。它内部那 900 多行的三分搜索/离群点处理是 GPU 工程的深水区，本章不逐行讲；记住一句就够：**`batch >= 8` 之所以另起内核，是为了避开整词表排序的 `O(V log V)`。**
 
 ## 30.9 第 7e 步：random_sample 与 flashinfer，两种避开同步的抽样
 

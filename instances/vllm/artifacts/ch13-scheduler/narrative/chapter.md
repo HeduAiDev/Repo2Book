@@ -141,6 +141,8 @@ v1 这套「token 为中心、不分相」的调度，把两条来自论文的�
 
 两篇论文各解一半：Orca 让批连续流转，Sarathi 让长 prefill 不再阻塞 decode。v1 的 `num_computed_tokens` 追赶公式，正是把两者统一成了一条数轴上的追赶。
 
+顺带交代一句：把长 prefill 拆成几拍算，之所以**不损一分精度**，靠的是注意力层一条更底层的性质——因果注意力逐行独立。这条性质与它换来的"拆块零代价、连合并都不需要"，见[第 24 章：FlashAttention 原理](../../ch24-primer-flash-attention/narrative/chapter.md)。
+
 下面这张图是 `schedule()` 全程的控制流，后面几节会顺着它走：
 
 ![schedule 的两阶段流程](../diagrams/13-schedule-two-phase.png)

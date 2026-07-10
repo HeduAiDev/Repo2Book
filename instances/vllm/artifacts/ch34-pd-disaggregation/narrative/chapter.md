@@ -9,7 +9,7 @@
 > *本章下沉到 worker 进程：KV 到底怎么在 GPU 之间搬，又怎么不拖慢计算。*
 > *下一章离开 PD 分离，回到引擎的其它横切面。*
 
-[上一章](../../ch34-pd-disaggregation/narrative/chapter.md)我们站在 scheduler 进程里，看一个 connector 如何长出"两副面孔"：决策侧查命中、做隔离，把一个请求挂进 `WAITING_FOR_REMOTE_KVS`，等 KV 到位再提升回 `WAITING` 重新调度。但那一章始终没回答一个最实在的问题——**KV 到底是怎么搬过来的？**
+[上一章](../../ch33-pd-disaggregation/narrative/chapter.md)我们站在 scheduler 进程里，看一个 connector 如何长出"两副面孔"：决策侧查命中、做隔离，把一个请求挂进 `WAITING_FOR_REMOTE_KVS`，等 KV 到位再提升回 `WAITING` 重新调度。但那一章始终没回答一个最实在的问题——**KV 到底是怎么搬过来的？**
 
 那条 `start_load_kv → 等待 → finished_recving` 的搬运线，全部发生在 worker 进程里，被上一章刻意推给了本章。现在补上。
 

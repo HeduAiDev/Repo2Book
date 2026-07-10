@@ -21,7 +21,7 @@
 
 ![本章地图：论文推导→vLLM 源码落地剖面图](../diagrams/chapter-map.png)
 
-只想看这套算法怎么落进代码——`merge_attn_states` 怎么合、cascade attention 怎么省算——可以跳过中间推导，直接读「六、⊕ 算子再现」到「八、落地：cascade attention」这几节；想跟一遍完整推导，就从「二、推导之一」按序读到「五、FlashAttention-2」，再顺势读进代码落地。
+只想看这套算法怎么落进代码——`merge_attn_states` 怎么合、cascade attention 怎么省算、chunked prefill 为什么连合并都省了——可以跳过中间推导，直接读「六、⊕ 算子再现」到「九、落地：chunked prefill」这几节；想跟一遍完整推导，就从「二、推导之一」按序读到「五、FlashAttention-2」，再顺势读进代码落地。
 
 ### 符号速查表
 
@@ -514,6 +514,78 @@ merge_attn_states(output, prefix_output, prefix_lse, suffix_output, suffix_lse)
 
 ---
 
+## 九、落地：chunked prefill——连合并都不需要的拆分
+
+到这里我们见过两种拆分，拆的都是 **KV 轴**:cascade 把历史切成"共享前缀 / 私有后缀",§六 末尾带过的 split-KV 把长 KV 切给多个 thread block——每一截只见部分 KV,各交一份 $(O,\mathrm{lse})$,最后非用 ⊕ 算子(`merge_attn_states`)按权重合回不可。本节的 **chunked prefill**(分块预填充：把一条长 prompt 的 prefill 拆成几拍分批算，调度动机见[第 13 章：调度器](../../ch13-scheduler/narrative/chapter.md))是第三种拆分——它拆的是 **query 轴**,而且**连合并都不需要**。为什么这么便宜？三步就能说透。
+
+<!-- PAPER: arXiv:2308.16369 (Sarathi) / arXiv:2403.02310 (Sarathi-Serve) / arXiv:2401.08671 (DeepSpeed-FastGen, Dynamic SplitFuse) — 论文包 paper-chunked.md -->
+
+### 第一步：因果注意力逐行独立
+
+直觉先行：因果掩码下，第 $i$ 个 query 只能回看位置 $\le i$ 的 KV;未来的位置被掩成 $-\infty$,softmax 权重为 0。所以第 $i$ 行的输出，是**且只是**这些历史的函数——
+
+$$
+O_i=\mathrm{softmax}\!\left(\frac{Q_iK_{\le i}^{\top}}{\sqrt{d}}\right)V_{\le i}
+$$
+
+这里 $K_{\le i}$ 、 $V_{\le i}$ 记位置 0 到 $i$ 的全部 key/value(第 $i$ 行能看到的全部历史), $d$ 是头维度(缩放 $1/\sqrt{d}$ 沿用 §一的约定)。关键在这行输出里**没有任何一项依赖 $j\ne i$ 的其它 query 行**,也不在乎这些 KV 是一次性写进缓存、还是分几批写进去。它是绝对位置的纯函数。
+
+数值见证最直接。取一条 50-token 的随机序列(每 token 一个 $d=8$ 的向量),走两条路：路 (a) 一次性对整段做因果注意力；路 (b) 把 query 轴按 **16/16/18** 切成三块，每块只喂本块的 query、KV 喂"累积到本块末尾的全量历史"、causal 掩码照**绝对位置**——逐块输出拼起来。两路逐元素比：
+
+<!-- trace: chunked-prefill-row-independence -->
+
+| 块 | query 绝对位置区间 | 累积 KV 可见列数 | causal | 该块 max\|O_块 − O_一次性\| |
+|---|---|---|---|---|
+| 1 | [0, 15] | 16 | True | 0.0 |
+| 2 | [16, 31] | 32 | True | 0.0 |
+| 3 | [32, 49] | 50 | True | 0.0 |
+| 整段拼接 vs 一次性 | [0, 49] | 50 | — | 0.0 (allclose atol=1e-12 ✓) |
+
+偏差不是"浮点舍入内近似",而是**精确 0**——逐字节相同。道理就写在上面那条公式里：一次性路对第 $i$ 行做 softmax 的非零列集合是 $\{j:j\le i\}$;分块路里第 $i$ 行落在某一块，该块的累积 KV 长度 $\ge i+1$、掩码把 $j>i$ 的列同样置 $-\infty$,于是参与 softmax 的列集合**恰好还是** $\{j:j\le i\}$。同一批标量 $Q_i\!\cdot\! K_j$ 、同一个顺序做 max/exp/求和/加权，结果自然逐字节一致——这条论证不止对我们的参考实现成立，真实 FlashAttention kernel 同理逐字节一致：它的 KV 分块尺寸是固定编译期常量、不随序列长度变化，因果掩码下第 $i$ 行选中的 KV 块集合与块内累加顺序，在"分块喂入 vs 一次性喂入"两条路上完全相同——prefill 路径走的是单调递增的因果扫描，不会触发 split-KV 那种把多个部分结果按权重重排再合并的归约。切点落在 query 轴的哪、切成几块，都不改变任何一行参与运算的列集合。
+
+![本章地图：chunked prefill 在因果矩阵上沿 query 轴横切](../diagrams/fig34-9-chunked-prefill.png)
+
+*图 34-9　50×50 因果注意力矩阵，下三角(含对角线)可见、上三角掩码。query 轴按 16/16/18 染成三段，两条红色水平虚线是 chunk 边界——切割线是**水平**的，沿 query 轴走，每一行的历史列(第 0 列到对角线)完整落在它所属段的可见窗内，没有一行被切断。对照 cascade 沿 KV 轴竖切、拆完要用 ⊕ 合并；query 轴横切后行本独立，逐块输出直接拼接，实测偏差精确为 0。*
+
+### 第二步：KV 写入逐 token 幂等
+
+一行的输出只依赖它能看到的历史 KV——那这些 KV 分几批写进缓存，会不会串位、写乱？不会，因为落盘那一步是**逐 token 幂等**的。本拍算出的 key/value 写进分页 KV 缓存，走的是 `reshape_and_cache_flash`(把 key/value 按每 token 的物理槽号散写进分页缓存的算子):
+
+```python
+# vllm/v1/attention/backends/flash_attn.py:L882-L896
+# NOTE(woosuk): Here, key and value are padded while slot_mapping is
+# not padded. However, we don't need to do key[:num_actual_tokens]
+# and value[:num_actual_tokens] because the reshape_and_cache_flash
+# op uses the slot_mapping's shape to determine the number of
+# actual tokens.
+reshape_and_cache_flash(
+    key,
+    value,
+    key_cache,
+    value_cache,
+    slot_mapping,
+    self.kv_cache_dtype,
+    layer._k_scale,
+    layer._v_scale,
+)
+```
+
+`slot_mapping`(每个 token 该写进哪个物理 KV 槽的映射，由[第 18 章：模型运行器](../../ch18-model-runner/narrative/chapter.md)的持久批次算好)一 token 一槽，且槽号由 token 的绝对位置决定——所以无论这 50 个 token 的 KV 是一拍写完、还是分 16/16/18 三拍写，第 $t$ 个 token 永远落在同一个槽。于是第 $c$ 块算完时缓存里"累积到该块末尾的 KV",与一次性写完后取同样长度的前缀**逐字节相同**。分页 KV 缓存具体怎么按 `slot_mapping` 散写、又怎么按 `block_table` 回读历史，是[第 25 章：注意力后端](../../ch25-attention/narrative/chapter.md)的 PagedAttention 一节的主题。
+
+### 第三步：拆 query 轴零代价，连 LSE 合并都不需要
+
+把前两步合起来：每一行的输出只认自己能看到的历史(第一步),而这些历史无论分几批写、都逐字节稳定(第二步)。于是拆 query 轴就成了纯粹的"分头算、直接拼":第 $c$ 块就是一次 `flash_attn_varlen_func(causal=True)` 调用，吃"累积到本块末尾的全量 KV",一次算出本块 query 行的**最终**输出——**不带 lse、不做加权**。逐块输出落在各自不相交的 query 行，拼接就是拼接。对比 cascade / split-KV 非得 `merge_attn_states` 把碎片按 $(O,\mathrm{lse})$ 合回来，chunked prefill 的合并成本是 0。
+
+工程上，这条定理长什么样？**长成"没有代码"。** 翻遍 `flash_attn.py` 的前向路径，你找不到任何一处针对 chunked prefill 的特判分支——一段被切成三拍的 prefill,和一次算完的整段 prefill,走的是**同一条 varlen 代码路径**(就是 §一、§七 那次 `flash_attn_varlen_func`)。区别只在传进来的 query 有多长、`cu_seqlens_q` 怎么切，kernel 全然不知道、也不需要知道自己吃的是"一整段"还是"一段里的第二块"。零特判，正是"因果逐行独立"这条定理最干净的工程形态：定理成立，代码里就腾出一整类本该有的分支。
+
+### 为什么要主动去拆：调度动机
+
+既然拆了零代价，那**为什么**要拆？动机不在注意力这一层，在调度那一层。一段几千 token 的长 prompt,它的 prefill 是算力密集的大块；一旦独占一拍，正在 decode(逐 token 生成)的请求就被顶得卡顿。**Sarathi**(arXiv:2308.16369)提出把长 prefill 切成固定大小的 chunk 分几拍算，每拍的算力余量再**捎带**(piggyback,搭便车)若干 decode token——算力密集的 prefill 与访存密集的 decode 混在一拍里互补。它的后续 **Sarathi-Serve**(arXiv:2403.02310)把这套做成 **stall-free**(无停顿)调度：先给每一拍定一个 **token 预算**(token budget,一拍最多算多少 token,由延迟 SLO 反推),预算先塞满在途 decode、再塞一块 prefill;新请求的长 prefill 于是被自动切成"刚好填进预算余量"的 chunk,永不打断在途 decode。这正是[第 13 章：调度器](../../ch13-scheduler/narrative/chapter.md)那条"token 为中心、不分相"数轴的论文根之一。
+
+几乎同一时间，**DeepSpeed-FastGen** 用 **Dynamic SplitFuse**(动态拆分-融合，arXiv:2401.08671)独立发明了同一个主意：把长 prompt 拆成小块、与 decode 融进同一批算，论文报告相对当时的 vLLM 最高 2.3× 吞吐。两条线殊途同归，底层踩的是同一块地基——因果注意力逐行独立，拆 query 轴不损一分精度。这也是本章那个 ⊕ 算子的**反面注脚**:凡是拆 KV 轴的(cascade、split-KV)都得请 ⊕ 出场合并，唯独拆 query 轴的 chunked prefill 用不上它——因为要合并的东西根本没被拆开。
+
+---
+
 ## 小结
 
 这一章把全书一直当黑盒的 `flash_attn_varlen_func` 从里到外拆了一遍。串起来是一条线：
@@ -523,5 +595,6 @@ merge_attn_states(output, prefix_output, prefix_lse, suffix_output, suffix_lse)
 - **FlashAttention**:用 tiling 把 $Q,K,V$ 切块在 SRAM 里算，running $(m,\ell,O)$ 逐块 rescale-accumulate,$N\times N$ 从不落 HBM;IO 从 $\Theta(N^2)$ 降到 $\Theta(N^2d^2/M)$(arXiv:2205.14135 §3)。
 - **FA-2**:循环序对调 + 推迟归一化 + 只存 $L=m+\log\ell$,同一份数学快约 2×(arXiv:2307.08691 §3)。
 - **落地**:vLLM 按平台 import kernel,用 varlen 打平 + 分页 KV 喂它；`return_softmax_lse` 吐出的 $L$,让 `merge_attn_states` 能把 cascade 拆开的两段注意力精确拼回——⊕ 算子的第三副面孔。
+- **chunked prefill**:第三种拆分，拆 query 轴而非 KV 轴。因果注意力逐行独立 + KV 写入逐 token 幂等 ⇒ 拆块零代价、连 ⊕ 合并都不需要，`flash_attn.py` 对它零特判(arXiv:2308.16369 / 2403.02310 / 2401.08671)。
 
-那个 ⊕ 算子——online-softmax 递推、FlashAttention 分块、LSE 合并——是贯穿始终的主角。以后再遇到 split-KV、chunked prefill、共享前缀去重这些名字，你都能一眼看穿：底下还是它。下一章走进[注意力后端抽象(第 25 章)](../../ch25-attention/narrative/chapter.md),看 vLLM 怎么按 `head_size`、平台在 FlashAttention/FlashInfer/Triton 里挑一个后端、又怎么把一份 metadata 翻译好喂给这行 kernel——你已经知道 kernel 内部在干什么，接下来就看它怎么被选择和调用。
+那个 ⊕ 算子——online-softmax 递推、FlashAttention 分块、LSE 合并——是贯穿始终的主角：凡是拆 KV 轴的(split-KV、共享前缀去重)底下都是它。唯独 chunked prefill 拆的是 query 轴，反倒用不上它——记住这条界线，你就分得清哪种拆分要合并、哪种不用。下一章走进[注意力后端抽象(第 25 章)](../../ch25-attention/narrative/chapter.md),看 vLLM 怎么按 `head_size`、平台在 FlashAttention/FlashInfer/Triton 里挑一个后端、又怎么把一份 metadata 翻译好喂给这行 kernel——你已经知道 kernel 内部在干什么，接下来就看它怎么被选择和调用。

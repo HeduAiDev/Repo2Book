@@ -505,6 +505,8 @@ self._prepare_input_ids(
 
 `positions` 和上一节 CPU 端同公式，只是这回在 GPU 上算。`seq_lens` = 已算 + 本拍要算，是每请求的当前总长，attention 用它界定每个请求能看多远。
 
+这个"位置由绝对下标定、每 token 一个确定落点"的写法还有个下游好处：一条长 prompt 的 KV 即便分几拍写进缓存，每 token 的落点也不变——chunked prefill 因此能沿 query 轴拆而不乱、拆了还与一次性整段逐字节相同，其中的道理见[第 24 章：FlashAttention 原理](../../ch24-primer-flash-attention/narrative/chapter.md)。
+
 重头是 `compute_slot_mapping`——它把每个 token 的绝对位置映射成 KV cache 里的物理槽号。这是 PagedAttention 的落点，单独一节讲。
 
 最后 `_build_attention_metadata` 把这些张量收束成 attention 后端的统一接口：

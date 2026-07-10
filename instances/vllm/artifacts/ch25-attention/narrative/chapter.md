@@ -872,6 +872,8 @@ assert torch.allclose(out, ref, atol=1e-5)
 
 这个对照之所以能当证明，关键在**两端是独立路径**：`ref` 直接吃连续的 `k`/`v`、一步 `softmax((q kᵀ) scale + causal_mask) v` 算完，从头到尾不查 `block_table`、不碰 paged cache；而 `out` 是顺着 `block_table=[0,1,2,3]` 跨物理块把散落的 KV 读回来再算。两条路毫无共享逻辑，却给出同一个数——`atol=1e-5` 收敛——这才排除了"自己证自己"的循环论证，从数值上钉死 paged 寻址的正确性。两张表的语义，到此完整闭环。
 
+这条"按 `slot_mapping` 一 token 一槽写、按 `block_table` 顺块读"的等价，还撑起了一个更省算的场景：把一条长 prefill 拆成几拍算的 chunked prefill。每 token 落点幂等（本节的写）叠加因果注意力逐行独立，拆块后逐块输出直接拼接就与一次性整段逐字节相同，连 LSE 合并都省了——完整论证见[第 24 章：FlashAttention 原理](../../ch24-primer-flash-attention/narrative/chapter.md)。
+
 ## 25.10 按 layer_name 分发：先写后算
 
 最后一块拼图：一次前向里有几十个注意力层，每层有各自的 KV cache 张量、各自的 metadata。运行时怎么让"写算子"和"算算子"精确取到**本层**的料，而不是把这些当参数层层透传？

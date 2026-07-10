@@ -30,7 +30,7 @@
 
 为了能在本地把这条流水线亲手跑一遍、打断点看数值，本章配了一份**只做减法**的精简版：和真实 vLLM 同名、同结构、同控制流，只删掉与主线正交的分支（tree attention、M-RoPE 位置编码、多模态、cudagraph padding、合成基准模式、logprobs 装配）。纯 CPU 跑 numpy 的索引算术与 ngram，GPU 跑三个 Triton 内核。它是"跑起来看数值"的交叉验证物；正文主线仍是真实源码。
 
-> **v0.21.0 更新**：本章把 tree attention 当作与主线正交、可整条删掉的草稿路径——v0.21.0 把这件事变成了官方动向。该版本在主线**彻底移除**了树形草稿路径：`SpecDecodeBaseProposer.propose_tree` 及其 `tree_choices` / `cu_drafts_per_level` 预计算、以及 `propose` 里对 `TreeAttentionMetadata` 的分发分支全部删除（`vllm/v1/spec_decode/llm_base_proposer.py`）。于是 `propose` 退化为**纯链式（chain）草稿**——正是下文要讲的那条自回归循环。本书"减去 tree attention"从此与上游一致，不再是"真实存在但被我们删掉"的取舍。同版本还把多模态从"硬报错"放宽为"告警后降级"：原先草稿路径遇到多模态输入会直接抛 `NotImplementedError`，v0.21.0 改为打印告警并**降级为纯文本投机解码**继续运行（`_raise_if_multimodal` 改名为 `_warn_if_multimodal`），不再硬失败。
+> **v0.21.0 更新**：树形草稿这条路子本身，思路可以追溯到 SpecInfer（arXiv:2305.09781）——把草稿组织成一棵 token 树、用一次并行的树形注意力同时验证多条候选序列。本章把 tree attention 当作与主线正交、可整条删掉的草稿路径——v0.21.0 把这件事变成了官方动向。该版本在主线**彻底移除**了树形草稿路径：`SpecDecodeBaseProposer.propose_tree` 及其 `tree_choices` / `cu_drafts_per_level` 预计算、以及 `propose` 里对 `TreeAttentionMetadata` 的分发分支全部删除（`vllm/v1/spec_decode/llm_base_proposer.py`）。于是 `propose` 退化为**纯链式（chain）草稿**——正是下文要讲的那条自回归循环。本书"减去 tree attention"从此与上游一致，不再是"真实存在但被我们删掉"的取舍。同版本还把多模态从"硬报错"放宽为"告警后降级"：原先草稿路径遇到多模态输入会直接抛 `NotImplementedError`，v0.21.0 改为打印告警并**降级为纯文本投机解码**继续运行（`_raise_if_multimodal` 改名为 `_warn_if_multimodal`），不再硬失败。
 
 ![本章地图：投机解码剖面——proposer→摊平 index→rejection sampling](../diagrams/chapter-map.png)
 

@@ -25,7 +25,7 @@
 
 人话翻译：prefill 像一次性搬一卡车货（要大马力），decode 像每隔几秒递一个快递（要稳、要快、不能卡顿）。把卡车和快递员塞进同一条单行道，结果就是——卡车一过，所有快递的递送时延（inter-token latency，ITL）全被顶上去。一个长 prompt 的 prefill 突发，能让正在 decode 的几十个请求集体卡一下。
 
-**PD 分离**（Prefill-Decode disaggregation）的思路很直接：把这两类活儿拆到**不同的 engine**上去。
+**PD 分离**（Prefill-Decode disaggregation）的思路很直接：把这两类活儿拆到**不同的 engine**上去。这不是 vLLM 一家的发明——把 prefill 和 decode 拆到不同集群、按各自瓶颈独立配比资源，正是 DistServe（arXiv:2401.09670）系统性提出并论证的服务架构；本章要讲的 KV Connector，就是 vLLM 把这套思路落进真实调度器的产物。
 
 - **Prefill engine** 专心算 prompt，按算力配比、独立扩缩容；
 - **Decode engine** 专心吐 token，按显存带宽配比、独立扩缩容；
@@ -258,7 +258,7 @@ KVConnectorFactory.register_connector(
 # … 省略：NIXL / LMCache / Mooncake / P2pNccl / Offloading 等十余种注册 …
 ```
 
-注册表只存 `(name → 模块路径 + 类名)`，**不 import**。为什么不直接 import？因为 vLLM 支持十几种 connector，每个都拖一堆重依赖（NIXL 要 RDMA 库、LMCache 要它自己的 runtime……），且这张表还在持续增长——v0.21.0 又添了一项 `MooncakeStoreConnector`（把 KV cache 卸载到 Mooncake 分布式存储，类在 `vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.connector`），后端越多，"启动即全量 import"的代价越不可接受。如果启动就把它们全 import 一遍，无关重依赖会拖慢甚至拖崩进程。懒加载注册表把实际 `import_module` 推迟到 `create_connector` 真要用那一个时，只加载当前选中的后端：
+注册表只存 `(name → 模块路径 + 类名)`，**不 import**。为什么不直接 import？因为 vLLM 支持十几种 connector，每个都拖一堆重依赖（NIXL 要 RDMA 库、LMCache 要它自己的 runtime……），且这张表还在持续增长——v0.21.0 又添了一项 `MooncakeStoreConnector`（把 KV cache 卸载到 Mooncake 分布式存储，类在 `vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.connector`——Mooncake 是月之暗面 Kimi 线上服务的 KVCache-centric 分离式架构，arXiv:2407.00079，这里接入的正是它的存储层），后端越多，"启动即全量 import"的代价越不可接受。如果启动就把它们全 import 一遍，无关重依赖会拖慢甚至拖崩进程。懒加载注册表把实际 `import_module` 推迟到 `create_connector` 真要用那一个时，只加载当前选中的后端：
 
 ```python
 # vllm/distributed/kv_transfer/kv_connector/factory.py:L42-L75（HMA 校验/日志已略）

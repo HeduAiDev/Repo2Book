@@ -278,6 +278,44 @@
           "caption_draft": "cascade attention 的两段泳道:上道前缀段(causal=False)对全批共享前缀只算一遍;下道后缀段(causal=True)各请求算私有 KV。两段各带 softmax_lse,汇入 merge_attn_states 合并——正是 LSE 合并(⊕ 算子)在推理期的直接应用,结果与逐请求整体注意力逐位相等。"
         }
       ]
+    },
+    {
+      "mechanism_id": "chunked-prefill-row-independence",
+      "intuition": "因果注意力的第 i 行只往回看:它的输出只由位置 ≤ i 的 KV 决定,是绝对位置的纯函数——跟这些 KV 是一次性写进去、还是分几批写进去、query 轴被切成几块算,统统无关。所以把一段长 prefill 的 query 轴任意切几块(比如 50 个 token 切成 16/16/18),每块只算本块的 query、KV 喂『累积到本块末尾的全量历史』、causal 掩码照绝对位置——逐块输出拼起来,和一次性对整段做因果注意力一模一样。cascade / split-KV 要拆的是 KV 轴,拆完得用 ⊕ 算子(LSE 合并)把碎片拼回来;chunked prefill 拆的是 query 轴,行与行本就独立,拼接就是拼接,连合并都不需要。",
+      "worked_example": {
+        "params": {"N": "50", "d": "8", "chunk_sizes": "[16, 16, 18]", "scale": "0.3536", "seed": "0", "note": "50-token 随机序列(seed=0)。路(a)一次性 causal 注意力得 O_full;路(b)按 16/16/18 三块,每块 query 仅本块、KV=K[0:end]/V[0:end] 累积全量、causal 按绝对位置(query 绝对行 i 只见 key 列 ≤ i),逐块输出拼接得 O_chunked。非退化:三块 query 绝对位置区间各不同([0,15]/[16,31]/[32,49]),累积 KV 逐块增长(16→32→50),每块都真实触发一次跨块历史可见性。"},
+        "trace_source": "run",
+        "trace_ref": "traces/chunked_prefill_row_independence.json",
+        "table": {
+          "columns": ["块", "query 绝对位置区间", "累积 KV 可见列数", "causal", "该块 max|O_块−O_一次性|"],
+          "rows": [
+            ["1", "[0, 15]", "16", "True", "0.0"],
+            ["2", "[16, 31]", "32", "True", "0.0"],
+            ["3", "[32, 49]", "50", "True", "0.0"],
+            ["整段拼接 vs 一次性", "[0, 49]", "50", "—", "0.0 (allclose atol=1e-12 ✓)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "对 causal 注意力,按 query 轴任意分块(每块 KV=累积全量、掩码按绝对位置)逐块计算再拼接,输出与一次性整段计算逐位相等;偏差不是『浮点舍入内近似』而是精确 0——两路对每一行做的是逐字节相同的浮点运算。",
+        "argument": "设 query 绝对行 i,一次性路对它算 softmax over {S[i,j] : j ≤ i}(未来列被 mask 成 -inf,softmax 权重为 0)。分块路里行 i 落在某块,该块 KV=K[0:end]/V[0:end] 且 end > i,掩码把 j > i 的列同样置 -inf——于是分块路对行 i 参与 softmax 的非零列集合恰为 {j : j ≤ i},与一次性路完全相同。参与运算的 S[i,j]=Q[i]·K[j]·scale 是同一批标量、以同一顺序求 max/exp/求和/加权——故逐字节相同,O_full[i] 与 O_chunked[i] 精确相等。分块的切点、块数、每块何时算,都不改变任何一行参与运算的列集合,故对整段成立。trace 佐证:三块各自 max|O_块−O_一次性|=0.0,拼接后 max_abs_dev=0.0 且 allclose(atol=1e-12)=True;抽绝对行 20(落第 2 块)两路输出前 3 维 [0.2279,-0.3581,-0.0713] 逐位相等。",
+        "argument_short": "因果第 i 行的 softmax 列集合恒为 {j≤i},与分块方式无关 ⇒ 逐字节相同 ⇒ 精确 0 偏差。"
+      },
+      "quantified": "cascade / split-KV 拆的是 KV 轴,每块只见部分历史,各出一份 (O,lse),必须用 ⊕ 算子(merge_attn_states)按 O(d) 加权合并才能拼回。chunked prefill 拆的是 query 轴:N=50 切成 16/16/18 三块,每块是一次 flash_attn_varlen_func(causal=True) 调用吃『累积全量 KV』,输出行不相交、直接落在各自 slot,合并成本为 0(无 lse、无加权)。工程后果:vLLM flash_attn.py 前向对 chunked prefill 零特判——全库 grep『chunk』在该文件命中 0 次,一段被切成多拍的 prefill 与一次算完走的是同一条 varlen 代码路径。",
+      "figure_specs": [
+        {
+          "figure_id": "fig34-9-chunked-prefill",
+          "template": "tiling",
+          "claim": "50×50 因果注意力矩阵(下三角可见),query 轴按 16/16/18 分三段染色;每段的可见窗恰好覆盖从第 0 列到该段对角线为止的全部历史列——切点落在 query 轴,不切断任何一行的历史,故拆块零代价、无需 LSE 合并(与 cascade 沿 KV 轴拆、需 ⊕ 合并成对照)。",
+          "numbers": [
+            {"value": "矩阵 50×50,下三角可见(causal)", "provenance": "traces/chunked_prefill_row_independence.json params N=50"},
+            {"value": "query 轴三段:行[0,15] / [16,31] / [32,49]", "provenance": "traces/chunked_prefill_row_independence.json rows[0..2] query_abs_range"},
+            {"value": "各段累积可见 KV 列数:16 → 32 → 50", "provenance": "traces/chunked_prefill_row_independence.json rows[*].kv_cumulative_len"},
+            {"value": "拼接 vs 一次性 max_abs_dev = 0.0 (bit-identical)", "provenance": "traces/chunked_prefill_row_independence.json max_abs_dev_chunked_vs_oneshot"}
+          ],
+          "caption_draft": "chunked prefill 在因果矩阵上的切法:50×50 下三角是全部可见的 (query,key) 对,query 轴被切成 16/16/18 三段(三色)。切割线是水平的——沿 query 轴切,每一行的历史列(从第 0 列到对角线)完整落在它所属段的可见窗里,没有任何一行被切断。对照 cascade 沿 KV 轴(竖切)拆前缀/后缀、拆完要用 ⊕ 合并;query 轴横切后行与行本就独立,逐块输出直接拼接即得整段结果,实测偏差精确为 0。"
+        }
+      ]
     }
   ]
 }
