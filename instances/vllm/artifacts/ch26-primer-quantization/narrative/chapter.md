@@ -596,7 +596,7 @@ $$
 
 *图 7：连续 scale=absmax/448 被 exp2∘ceil∘log2 取整到 2 的幂。overshoot 从 0% 到 79% 不等，ceil 保证 FP8 格永不裁掉块内最大值。*
 
-这块 FP8 装载面正是[DeepSeek 架构章的 W8A8/FP8 块量化装配](../../ch27-model-architecture/narrative/chapter.md)所依赖的底座——那一章会看到整个模型怎么按块把权重和 scale 铺进显存。
+这块 FP8 装载面正是[DeepSeek 架构章的 W8A8/FP8 块量化装配](../../ch28-model-architecture/narrative/chapter.md)所依赖的底座——那一章会看到整个模型怎么按块把权重和 scale 铺进显存。
 
 ---
 
@@ -604,4 +604,4 @@ $$
 
 绕了一大圈，其实全章只有 §二那两行底座公式（量化 + 反量化），和一个铁律 $|w-\hat{w}|\le s/2$ 。scale 越小越准，可量程逼着它不能太小——离群值一来，共享 scale 的普通元素就遭殃。三篇论文就是三种「让 scale 少浪费在离群值上」的办法：GPTQ 用二阶补偿把误差往未量化权重上摊，AWQ 给显著权重戴放大镜，SmoothQuant 把激活的难度搬去权重。三者都在离线算好，vllm 推理期只对着 `quant_method.apply` 这个统一插座消费定点权重和 scale。
 
-带上这套底座，下一章我们去看 DeepSeek 系模型怎么把 FP8 块量化真正铺进一个几百亿参数的架构里。
+带上这套底座，下一章我们去看一个更刁钻的应用场景：DeepSeek 稀疏注意力里那个「便宜到敢扫全历史」的 lightning indexer，怎么把 scale/zero-point 这套数学用到自己专属的索引缓存上——权重和激活之外，量化的第三个战场是「决定看哪里」这件事本身，index 分数也能压到 FP4。

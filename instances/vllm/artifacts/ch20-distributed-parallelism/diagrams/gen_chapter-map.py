@@ -7,7 +7,7 @@
 不同(启动期 2 列,运行期 5 列),若摊成单行 7 列会让画布宽度远超 1500 预算——
 改用 ch24 引入的"折成上下两段"手法:上段=启动期,下段=运行期,段间留一条空白
 桥接带,只画一条跨段箭头(init_groups → group_coord,这本来就是一次真实的构造
-调用,颜色仍是主线蓝,不是 ch36 那种"非调用"的灰虚线)。
+调用,颜色仍是主线蓝,不是 ch37 那种"非调用"的灰虚线)。
 
 ■ 不可变(全书统一视觉语言,抄自模板,未改动):
   1. §徽标胶囊 badge();2. 入口=绿#22c55e/出口=橙#f97316 接口桩;
@@ -20,13 +20,13 @@
     (对照 §20.2/§20.5 都委托 `device_communicator`)。所以 `broadcast_dict` 节点
     直接连到出口,不经过 `backend_fallback`(那个节点专属 all_reduce 的
     `CudaCommunicator` 回退链,§20.2)——如果硬把三条通信原语都汇进同一个"后端"
-    节点,会把 §20.4 的内容错挂成 §20.2(ch36 踩过这个坑:合并节点只能标一个
+    节点,会把 §20.4 的内容错挂成 §20.2(ch37 踩过这个坑:合并节点只能标一个
     真实站得住脚的 §)。同理 `pp_send_recv` 节点本身就是 "GroupCoordinator.send
     委托 device_communicator.send"(§20.5 原文原话),不需要再单独过一次
     `backend_fallback`。
   - `broadcast_dict`/`pp_send_recv` 到出口的边跳过了 `custom_op`/`backend_fallback`
     所在的两列(它们只在 row0 存在)。若直接画直线,会在两列的 x 范围内斜穿这两个
-    节点的框(和 ch36 那条 transition 边同一个几何陷阱)。改走三段折线:先在
+    节点的框(和 ch37 那条 transition 边同一个几何陷阱)。改走三段折线:先在
     自己的行(row1/row2,与 row0 的两个节点完全不共享 y)水平走到出口列前,再一段
     垂直,最后水平扎进出口节点——全程只经过两列间的空白间隔,不经过任何节点框。
   - 入口挂在 `MultiprocExecutor._init_executor`(§20.7 上半:把群组拉起来),
@@ -253,7 +253,7 @@ for i, name in enumerate(LANES):
               f'stroke="{C_LANE_BORDER}" stroke-width="1"/>')
 
 # 入口/出口接口桩:入口挂 spawn_worker(段 0),出口挂 collect_output(段 1)——
-# 两者本就在不同的段,stub 各自贴在自己节点的 y 高度上,和 ch36 的做法一致。
+# 两者本就在不同的段,stub 各自贴在自己节点的 y 高度上,和 ch37 的做法一致。
 ex, ey = NODE_XY["spawn_worker"]; ey += NODE_H / 2
 xx, xy = NODE_XY["collect_output"]; xy += NODE_H / 2
 L.append(f'<rect x="{EDGE_MARGIN}" y="{ey - STUB_H / 2:.1f}" width="{STUB_W}" height="{STUB_H}" '

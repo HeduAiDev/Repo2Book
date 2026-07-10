@@ -20,7 +20,7 @@
 
 这条链横跨几个文件：抽象与共享 metadata 在 `vllm/v1/attention/backend.py`，注册表在 `vllm/v1/attention/backends/registry.py`，选后端入口在 `vllm/v1/attention/selector.py`，FlashAttention 四件套在 `vllm/v1/attention/backends/flash_attn.py`，统一注意力层在 `vllm/model_executor/layers/attention/attention.py`。
 
-为了能在本地（无 GPU）把这套抉择与读写亲手跑一遍、打断点看数值，本章配了一份**只做减法**的精简版：和真实 vLLM 同名、同结构、同控制流，只删掉与主线正交的分支（MLA〔Multi-head Latent Attention，多头潜变量注意力，把 KV cache 压成低秩潜变量的注意力变体，详见[DeepSeek-V4 那章](../../ch27-model-architecture/narrative/chapter.md)〕变体、DCP、cascade、FP8 量化、CUDA graph 调度）。两个真正跑在 CUDA 上的算子（写 KV 的 `reshape_and_cache_flash`、读 KV 的 `flash_attn_varlen_func`）在 host 上以 CPU 等价实现复刻其可观察语义，让数值能对上。它是"跑起来看数值"的交叉验证物，正文主线仍是真实源码。
+为了能在本地（无 GPU）把这套抉择与读写亲手跑一遍、打断点看数值，本章配了一份**只做减法**的精简版：和真实 vLLM 同名、同结构、同控制流，只删掉与主线正交的分支（MLA〔Multi-head Latent Attention，多头潜变量注意力，把 KV cache 压成低秩潜变量的注意力变体，详见[DeepSeek-V4 那章](../../ch29-model-architecture/narrative/chapter.md)〕变体、DCP、cascade、FP8 量化、CUDA graph 调度）。两个真正跑在 CUDA 上的算子（写 KV 的 `reshape_and_cache_flash`、读 KV 的 `flash_attn_varlen_func`）在 host 上以 CPU 等价实现复刻其可观察语义，让数值能对上。它是"跑起来看数值"的交叉验证物，正文主线仍是真实源码。
 
 ![本章地图：注意力后端剖面——选后端→翻译 metadata→读写 KV](../diagrams/chapter-map.png)
 

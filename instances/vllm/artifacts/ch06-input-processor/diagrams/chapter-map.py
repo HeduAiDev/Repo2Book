@@ -2,7 +2,7 @@
 """第 6 章「本章地图」——ParentRequest 扇出与归并剖面。
 
 改写自 .claude/skills/svg-diagram/references/example-chapter-map.py（几何/配色
-不可变部分照抄），并参考已验收的 instances/vllm/artifacts/ch36-engine-core/
+不可变部分照抄），并参考已验收的 instances/vllm/artifacts/ch37-engine-core/
 diagrams/chapter-map.py 的两处做法：
   - split_symbol()：真实符号名在节点宽度下装不下时,在离中点最近的下划线处
     拆两行(不加省略号,两段仍是原符号的连续子串,lint 子串核对仍能命中)。
@@ -10,7 +10,7 @@ diagrams/chapter-map.py 的两处做法：
     9 个节点压进 5 列以内,不让画布横向爆宽。
 
 本章真实控制流(§6.2-§6.7)只有一条主干(扇出→登记→出引擎→归并),没有
-ch36 那种"两条几乎不相交的主线",所以边全部是"main"(蓝实线真实调用),
+ch37 那种"两条几乎不相交的主线",所以边全部是"main"(蓝实线真实调用),
 不需要 transition 型边。
 
 ■ 不可变(全书统一视觉语言,未改动):

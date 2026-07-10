@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""全书地图（无高亮）：8 Part / 36 章。每 Part 一栏组，列出本 Part 各章短中文标题。
+"""全书地图（无高亮）：8 Part / 37 章。每 Part 一栏组，列出本 Part 各章短中文标题。
 原理篇（primer 模式，交错插入 Part VI 的论文精读章）用浅色底+虚线框标出，图例见底部。
 章序/Part 归属/标题唯一真相源：instances/vllm/book/cartography/outline-final.json
 （短标题据各章 narrative/chapter.md 的 H1 提炼，比 outline.title 更贴近定稿）。
@@ -50,20 +50,21 @@ PARTS = [
         ("ch24", "FlashAttention 原理：online-softmax→IO-aware", True),
         ("ch25", "注意力后端抽象与元数据", False),
         ("ch26", "量化数学：scale/GPTQ/AWQ/SmoothQuant", True),
-        ("ch27", "读整模型：DeepSeek-V4", False),
-        ("ch28", "从模型代码到架构图", False),
-        ("ch29", "Sampler 九步采样流水线", False),
-        ("ch30", "EAGLE：特征自回归与树验证", True),
-        ("ch31", "投机解码：提议与拒绝采样", False),
+        ("ch27", "Lightning Indexer 原理：敢扫全历史的打分器", True),
+        ("ch28", "读整模型：DeepSeek-V4", False),
+        ("ch29", "从模型代码到架构图", False),
+        ("ch30", "Sampler 九步采样流水线", False),
+        ("ch31", "EAGLE：特征自回归与树验证", True),
+        ("ch32", "投机解码：提议与拒绝采样", False),
     ]),
     ("Part VII", "Prefill/Decode 分离", [
-        ("ch32", "PD 分离 I：KV Connector 契约", False),
-        ("ch33", "PD 分离 II：Worker 执行与后端", False),
+        ("ch33", "PD 分离 I：KV Connector 契约", False),
+        ("ch34", "PD 分离 II：Worker 执行与后端", False),
     ]),
     ("Part VIII", "服务接口", [
-        ("ch34", "离线 LLM API", False),
-        ("ch35", "OpenAI 兼容服务器", False),
-        ("ch36", "高级引擎运维：弹性扩缩与多轮", False),
+        ("ch35", "离线 LLM API", False),
+        ("ch36", "OpenAI 兼容服务器", False),
+        ("ch37", "高级引擎运维：弹性扩缩与多轮", False),
     ]),
 ]
 
@@ -82,7 +83,7 @@ def part_h(p):
     return PART_HEAD_H + len(p[2]) * CH_H + 14
 
 
-# 8 Part 分两列：左 I-IV（3+7+2+4=16 章），右 V-VIII（5+10+2+3=20 章）——按 Part 顺序切列，
+# 8 Part 分两列：左 I-IV（3+7+2+4=16 章），右 V-VIII（5+11+2+3=21 章）——按 Part 顺序切列，
 # 阅读顺序仍是先左列从上到下再右列从上到下。
 col_assign = [0, 0, 0, 0, 1, 1, 1, 1]
 cols = {0: [], 1: []}
@@ -106,7 +107,7 @@ PRIMER_TXT = "#b45309"
 L = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" font-family="sans-serif">']
 L.append(f'<rect width="{W}" height="{H}" fill="white"/>')
 L.append(f'<text x="{W/2}" y="34" text-anchor="middle" font-size="22" font-weight="bold" '
-         f'fill="#0f172a">vLLM v1 源码解读 · 全书地图（8 Part / 36 章）</text>')
+         f'fill="#0f172a">vLLM v1 源码解读 · 全书地图（8 Part / 37 章）</text>')
 
 part_index = {id(p): i for i, p in enumerate(PARTS)}
 for c in (0, 1):
@@ -162,7 +163,7 @@ L.append(f'<rect x="{PAD}" y="{leg_y}" width="30" height="16" rx="4" fill="{PRIM
          f'stroke="{PRIMER_BD}" stroke-width="1.3" stroke-dasharray="3,2"/>')
 L.append(f'<text x="{PAD+38}" y="{leg_y+13}" font-size="12.5" fill="#475569">'
          f'= 原理篇（primer；论文精读，交错插入 Part VI，回指落地章）——'
-         f'共 3 章：ch24 / ch26 / ch30</text>')
+         f'共 4 章：ch24 / ch26 / ch27 / ch31</text>')
 
 L.append('</svg>')
 import sys

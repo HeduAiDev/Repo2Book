@@ -1,19 +1,14 @@
-"""精简版 envs —— 仅本章 entrypoints 主线读到的环境开关。
+"""本章用到的环境标志（站位真实 vllm/envs.py）。
 
-与真实 vllm/envs.py 同名同语义；真实文件是惰性 __getattr__ 工厂，这里直接给值。
-# SUBTRACTED: vllm/envs.py 的惰性 __getattr__ 工厂与数百个其他开关，只留本章用到的 4 个。
+【关键澄清的源码锚点】VLLM_ENABLE_V1_MULTIPROCESSING 默认 True —— 正是它让 LLMEngine.from_engine_args
+把 enable_multiprocessing 强翻为 True，于是离线默认走 SyncMPClient（后台进程 + ZMQ），
+而非 InprocClient（进程内）。把环境变量设 '0' 才回退 InprocClient（测试/调试/V0 风格）。
 """
-
 import os
 
-# SOURCE: vllm/envs.py:VLLM_KEEP_ALIVE_ON_ENGINE_DEATH —— watchdog 是否在引擎死后仍保活
-VLLM_KEEP_ALIVE_ON_ENGINE_DEATH = bool(int(os.getenv("VLLM_KEEP_ALIVE_ON_ENGINE_DEATH", "0")))
-
-# SOURCE: vllm/envs.py:VLLM_LOG_STATS_INTERVAL —— lifespan 后台 do_log_stats 周期(秒)
-VLLM_LOG_STATS_INTERVAL = float(os.getenv("VLLM_LOG_STATS_INTERVAL", "10.0"))
-
-# SOURCE: vllm/envs.py:VLLM_HTTP_TIMEOUT_KEEP_ALIVE
-VLLM_HTTP_TIMEOUT_KEEP_ALIVE = int(os.getenv("VLLM_HTTP_TIMEOUT_KEEP_ALIVE", "5"))
-
-# SOURCE: vllm/envs.py:VLLM_API_KEY
-VLLM_API_KEY = os.getenv("VLLM_API_KEY")
+# SOURCE: vllm/envs.py:L129,L1109-L1110 (VLLM_ENABLE_V1_MULTIPROCESSING)
+# SUBTRACTED: 真实在 environment_variables 字典里以 lambda 惰性读 os.environ 并 bool 化（默认 "1"）。
+#   本章用模块级常量等价呈现：默认 True，可经环境变量覆盖。原 vllm/envs.py:L1112-L1113。
+VLLM_ENABLE_V1_MULTIPROCESSING: bool = (
+    os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING", "1") == "1"
+)

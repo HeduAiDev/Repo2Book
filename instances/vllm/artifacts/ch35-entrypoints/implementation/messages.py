@@ -1,253 +1,105 @@
-"""协议与数据模型 —— EngineClient 协议 + OpenAI 响应模型（精简版，只做减法）。
+"""本章用到的最小消息/参数/输出数据结构（站位真实 vLLM 类型）。
 
-汇集本章主线触及的几类对象，与真实 vLLM 同名、同字段语义：
-  * EngineClient        ← vllm/engine/protocol.py：handler 依赖的引擎协议（generate/errored/shutdown...）。
-  * 响应模型            ← vllm/entrypoints/openai/chat_completion/protocol.py 等：
-                          ChatCompletionResponse / ChatCompletionStreamResponse /
-                          DeltaMessage / ChatMessage / UsageInfo / ErrorResponse。
-  * RequestOutput       ← vllm/outputs.py：engine_client.generate 异步生成器逐个产出的对象。
-  * SamplingParams      ← vllm/sampling_params.py。
-
-真实模型是 pydantic BaseModel；精简版用 dataclass + model_dump/model_dump_json，
-保留 vLLM 序列化 SSE/JSON 时实际调用的 model_dump(_json) 接口语义。
-# SUBTRACTED: pydantic.BaseModel 校验/序列化引擎，用 dataclasses + json 复刻其 model_dump(_json)。
-#   原 vllm/entrypoints/openai/chat_completion/protocol.py 各 class(... BaseModel)。
+这些类型在 ch05/ch06（EngineCoreRequest 装配）、ch08-ch10（RequestOutput 装配/去 token 化）
+已细讲，本章不重讲——这里只放够 LLM facade 同步主干跑起来的字段子集，让读者能数值追踪
+'渲染→双注册→while step()→排序还原'整条流水。
 """
+# SUBTRACTED: 真实 EngineCoreRequest/RequestOutput/PoolingRequestOutput 的完整字段
+#   （mm_inputs/lora/sampling 全量参数/logprobs/metrics 等）——ch05/ch06/ch08-ch10 已细讲。
+#   本章只保留 request_id + 终止/finished 语义，够体现同步驱动主干即可。
+#   原 vllm/v1/engine/__init__.py(EngineCoreRequest) / vllm/outputs.py(RequestOutput)。
 
 from __future__ import annotations
 
-import json
-import time
-from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator, Mapping
-from dataclasses import asdict, dataclass, field
-from http import HTTPStatus
-from typing import Any
+import enum
+from dataclasses import dataclass, field
 
 
-# --- 异常（vllm/v1/engine/exceptions.py & vllm/engine/protocol.py） ---
-
-class EngineGenerateError(Exception):
-    # SOURCE: vllm/v1/engine/exceptions.py:EngineGenerateError
-    pass
-
-
-class EngineDeadError(Exception):
-    # SOURCE: vllm/v1/engine/exceptions.py:EngineDeadError
-    pass
-
-
-class GenerationError(Exception):
-    # SOURCE: vllm/v1/engine/exceptions.py:GenerationError —— finish_reason=='error' 时抛出
-    pass
-
-
-# --- 引擎产出对象（vllm/outputs.py） ---
-
-@dataclass
-class CompletionOutput:
-    # SOURCE: vllm/outputs.py:CompletionOutput —— 单个候选输出（增量语义下逐步累积）
-    index: int = 0
-    text: str = ""
-    token_ids: list[int] = field(default_factory=list)
-    finish_reason: str | None = None
-    stop_reason: str | None = None
-
-
-@dataclass
-class RequestOutput:
-    # SOURCE: vllm/outputs.py:RequestOutput —— generate 异步生成器逐个 yield 的对象
-    request_id: str = ""
-    prompt_token_ids: list[int] | None = None
-    outputs: list[CompletionOutput] = field(default_factory=list)
-    num_cached_tokens: int = 0
-    finished: bool = False
-    # SUBTRACTED: prompt_logprobs / kv_transfer_params 等字段 —— logprobs 装配在 ch10，
-    #   PD 在 ch29/30；本章不解读其计算。原 vllm/outputs.py:RequestOutput。
-
-
-# --- 采样参数（vllm/sampling_params.py） ---
-
-class RequestOutputKind:
-    # SOURCE: vllm/sampling_params.py:RequestOutputKind
-    CUMULATIVE = 0   # 流式：每步推增量
-    FINAL_ONLY = 2   # 非流式：只在末尾给最终结果
+# SOURCE: vllm/sampling_params.py (RequestOutputKind)
+class RequestOutputKind(enum.Enum):
+    # SUBTRACTED: CUMULATIVE / DELTA 两个流式取值的语义说明——ch04/ch08 流式侧已讲。
+    #   本章只需 FINAL_ONLY 这一离线取值（_add_request 强设它）。原 vllm/sampling_params.py。
+    CUMULATIVE = 0
+    DELTA = 1
+    FINAL_ONLY = 2
 
 
 @dataclass
 class SamplingParams:
-    # SOURCE: vllm/sampling_params.py:SamplingParams
-    max_tokens: int | None = 16
-    output_kind: int = RequestOutputKind.CUMULATIVE
+    # SOURCE: vllm/sampling_params.py (SamplingParams)
+    # SUBTRACTED: temperature/top_p/max_tokens/stop/logprobs 等数十个采样字段——ch06 已细讲。
+    #   本章只需 n（并行采样扇出）与 output_kind（被 _add_request 强设 FINAL_ONLY）两个字段。
+    #   原 vllm/sampling_params.py。
     n: int = 1
-
-
-# --- OpenAI 响应模型（vllm/entrypoints/openai/chat_completion/protocol.py 等） ---
-
-class _Model:
-    """pydantic BaseModel 的极小替身：提供 model_dump / model_dump_json。"""
-
-    # SOURCE: pydantic.BaseModel（dataclass 替身）—— stub
-    def model_dump(self, exclude_unset: bool = False, exclude_none: bool = False) -> dict:
-        # SOURCE: pydantic.BaseModel.model_dump —— stub
-        def keep(v):
-            return not (exclude_none and v is None)
-        return {k: v for k, v in asdict(self).items() if keep(v)}
-
-    def model_dump_json(self, exclude_unset: bool = False,
-                        exclude_none: bool = False) -> str:
-        # SOURCE: pydantic.BaseModel.model_dump_json —— stub
-        return json.dumps(self.model_dump(exclude_unset, exclude_none))
+    output_kind: RequestOutputKind = RequestOutputKind.CUMULATIVE
+    max_tokens: int = 3
 
 
 @dataclass
-class UsageInfo(_Model):
-    # SOURCE: vllm/entrypoints/openai/protocol.py:UsageInfo
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    total_tokens: int = 0
+class PoolingParams:
+    # SOURCE: vllm/pooling_params.py (PoolingParams)
+    # SUBTRACTED: dimensions/normalize/activation 等 pooling 字段——pooling 家族细节非本章主线。
+    #   原 vllm/pooling_params.py。
+    task: str | None = None
 
 
 @dataclass
-class DeltaMessage(_Model):
-    # SOURCE: vllm/entrypoints/openai/chat_completion/protocol.py:DeltaMessage
-    #   —— 流式增量载体：首块带 role，后续块带 content/tool_calls 增量
-    role: str | None = None
-    content: str | None = None
-    tool_calls: list[Any] = field(default_factory=list)
+class EngineCoreRequest:
+    # SOURCE: vllm/v1/engine/__init__.py (EngineCoreRequest)
+    request_id: str
+    params: SamplingParams | PoolingParams
+    # SUBTRACTED: prompt_token_ids/mm_inputs/lora_request/arrival_time/priority 等——ch05/ch06。
+    #   原 vllm/v1/engine/__init__.py:EngineCoreRequest。
 
 
 @dataclass
-class ChatMessage(_Model):
-    # SOURCE: vllm/entrypoints/openai/chat_completion/protocol.py:ChatMessage
-    #   —— 非流式整条消息
-    role: str = "assistant"
-    content: str | None = None
-    tool_calls: list[Any] = field(default_factory=list)
+class EngineCoreOutput:
+    # SOURCE: vllm/v1/engine/__init__.py (EngineCoreOutput)
+    request_id: str
+    new_token_ids: list[int] = field(default_factory=list)
+    finished: bool = False
 
 
 @dataclass
-class ChatCompletionResponseStreamChoice(_Model):
-    # SOURCE: vllm/entrypoints/openai/chat_completion/protocol.py:ChatCompletionResponseStreamChoice
-    index: int = 0
-    delta: DeltaMessage | None = None
-    finish_reason: str | None = None
-    logprobs: Any = None
+class EngineCoreOutputs:
+    # SOURCE: vllm/v1/engine/__init__.py (EngineCoreOutputs)
+    # SUBTRACTED: scheduler_stats/timestamp/utility_output/wave_complete 等——ch07/可观测性旁路。
+    #   本章 step 第 2/4 步只用到 outputs 列表。原 vllm/v1/engine/__init__.py:EngineCoreOutputs。
+    outputs: list[EngineCoreOutput] = field(default_factory=list)
 
 
 @dataclass
-class ChatCompletionResponseChoice(_Model):
-    # SOURCE: vllm/entrypoints/openai/chat_completion/protocol.py:ChatCompletionResponseChoice
-    index: int = 0
-    message: ChatMessage | None = None
-    finish_reason: str | None = None
-    stop_reason: str | None = None
-    logprobs: Any = None
+class RequestOutput:
+    # SOURCE: vllm/outputs.py (RequestOutput)
+    # SUBTRACTED: prompt/prompt_token_ids/CompletionOutput 列表/logprobs/metrics——ch08-ch10 已讲。
+    #   本章只需 request_id + finished（_run_engine 收集 finished 并按 request_id 排序）。
+    #   原 vllm/outputs.py:RequestOutput。
+    request_id: str
+    finished: bool = False
+    text: str = ""
 
 
 @dataclass
-class ChatCompletionStreamResponse(_Model):
-    # SOURCE: vllm/entrypoints/openai/chat_completion/protocol.py:ChatCompletionStreamResponse
-    #   —— 流式 chunk（object='chat.completion.chunk'）
-    id: str = ""
-    object: str = "chat.completion.chunk"
-    created: int = field(default_factory=lambda: int(time.time()))
-    model: str = ""
-    choices: list[ChatCompletionResponseStreamChoice] = field(default_factory=list)
-    usage: UsageInfo | None = None
-    system_fingerprint: str | None = None
+class PoolingRequestOutput:
+    # SOURCE: vllm/outputs.py (PoolingRequestOutput)
+    # SUBTRACTED: data（pooled hidden states 张量）字段——pooling 装配非本章主线。
+    #   原 vllm/outputs.py:PoolingRequestOutput。
+    request_id: str
+    finished: bool = False
+    data: object = None
 
 
 @dataclass
-class ChatCompletionResponse(_Model):
-    # SOURCE: vllm/entrypoints/openai/chat_completion/protocol.py:ChatCompletionResponse
-    #   —— 非流式一次性 JSON 响应（object='chat.completion'）
-    id: str = ""
-    object: str = "chat.completion"
-    created: int = field(default_factory=lambda: int(time.time()))
-    model: str = ""
-    choices: list[ChatCompletionResponseChoice] = field(default_factory=list)
-    usage: UsageInfo | None = None
-    system_fingerprint: str | None = None
+class EmbeddingRequestOutput:
+    # SOURCE: vllm/outputs.py (EmbeddingRequestOutput)
+    request_id: str
+    finished: bool = False
+    embedding: object = None
 
-
-@dataclass
-class _ErrorBody:
-    # SOURCE: vllm/entrypoints/openai/engine/protocol.py:ErrorInfo
-    message: str = ""
-    type: str = "BadRequestError"
-    param: str | None = None
-    code: int = HTTPStatus.BAD_REQUEST.value
-
-
-@dataclass
-class ErrorResponse(_Model):
-    # SOURCE: vllm/entrypoints/openai/engine/protocol.py:ErrorResponse
-    error: _ErrorBody = field(default_factory=_ErrorBody)
-
-    def model_dump(self, exclude_unset: bool = False, exclude_none: bool = False) -> dict:
-        # SOURCE: ErrorResponse.model_dump —— 嵌套 error 体
-        return {"error": asdict(self.error)}
-
-
-# --- 引擎协议（vllm/engine/protocol.py） ---
-
-class EngineClient(ABC):
-    """handler 依赖的引擎协议。AsyncLLM（ch04）是其 v1 实现。
-
-    本章只用到：generate(异步生成器) / errored / dead_error / is_running /
-    renderer / model_config / vllm_config / shutdown / get_supported_tasks / do_log_stats。
-    """
-
-    # SOURCE: vllm/engine/protocol.py:EngineClient
-    model_config: Any
-    renderer: Any
-    vllm_config: Any
-
-    @property
-    @abstractmethod
-    def errored(self) -> bool:
-        # SOURCE: vllm/engine/protocol.py:EngineClient.errored
-        ...
-
-    @property
-    @abstractmethod
-    def dead_error(self) -> BaseException:
-        # SOURCE: vllm/engine/protocol.py:EngineClient.dead_error
-        ...
-
-    @property
-    def is_running(self) -> bool:
-        # SOURCE: vllm/engine/protocol.py:EngineClient.is_running
-        return not self.errored
-
-    @abstractmethod
-    def generate(
-        self,
-        prompt: Any,
-        sampling_params: SamplingParams,
-        request_id: str,
-        *,
-        lora_request: Any = None,
-        trace_headers: Mapping[str, str] | None = None,
-        priority: int = 0,
-        data_parallel_rank: int | None = None,
-        reasoning_ended: bool | None = None,
-        reasoning_parser_kwargs: dict[str, Any] | None = None,
-    ) -> AsyncGenerator[RequestOutput, None]:
-        # SOURCE: vllm/engine/protocol.py:EngineClient.generate
-        """Generate outputs for a request."""
-        ...
-
-    @abstractmethod
-    def shutdown(self, timeout: float | None = None) -> None:
-        # SOURCE: vllm/engine/protocol.py / vllm/v1/engine/async_llm.py:shutdown
-        ...
-
-    async def get_supported_tasks(self):
-        # SOURCE: vllm/engine/protocol.py:EngineClient.get_supported_tasks
-        return ("generate",)
-
-    async def do_log_stats(self) -> None:
-        # SOURCE: vllm/engine/protocol.py:EngineClient.do_log_stats
-        ...
+    @classmethod
+    def from_base(cls, output: PoolingRequestOutput) -> "EmbeddingRequestOutput":
+        # SOURCE: vllm/outputs.py (EmbeddingRequestOutput.from_base)
+        # SUBTRACTED: 真实从 PoolingRequestOutput.data 抽 embedding 向量并做 dtype/shape 校验。
+        #   原 vllm/outputs.py:EmbeddingRequestOutput.from_base。本章只体现 embed=encode 的薄封装。
+        return cls(request_id=output.request_id, finished=output.finished,
+                   embedding=output.data)

@@ -16,10 +16,10 @@
 - 架构地图 + 大纲在 `instances/vllm/book/cartography/`（`ARCHITECTURE.md` 全量、`outline-final.json` 8 Part/33 章、`map.json` 结构化）。章节用 `ch`-前缀 slug，置于 `instances/vllm/artifacts/`。
 
 ## 当前状态（2026-06-28）：📕 全书 33 章完成 + 已全量重基到 v0.21.0
-- **ch01–ch36 全部完成**（31 源码解读章 + ch01/ch02/ch28 三个 meta 概览章，meta 走 `skip_impl` 轻流程无精简版）。全 APPROVED、已推 `vllm-book-v2-rebuild` 远程。规模 ≈24.5k 行正文 + 142 图。
-- **v0.21.0 升级（2026-06-28）**：① 16 章自然织入「v0.21.0 更新」内容（ch03/08/09/17/18/19/23/24/25/26/27/28/29/31/32 + ch29 XPU 分发图）；② `source/` 工作树 checkout 到 v0.21.0，~3000 处行号引用确定性重映射（1458 identity + 1531 shift + 41 content-resync）；③ bible glossary+interfaces 登记 v0.21.0 增量。整理稿见 `instances/vllm/book/_v021-update/`。
+- **ch01–ch37 全部完成**（31 源码解读章 + ch01/ch02/ch29 三个 meta 概览章，meta 走 `skip_impl` 轻流程无精简版）。全 APPROVED、已推 `vllm-book-v2-rebuild` 远程。规模 ≈24.5k 行正文 + 142 图。
+- **v0.21.0 升级（2026-06-28）**：① 16 章自然织入「v0.21.0 更新」内容（ch03/08/09/17/18/19/23/24/25/26/27/28/29/31/32 + ch30 XPU 分发图）；② `source/` 工作树 checkout 到 v0.21.0，~3000 处行号引用确定性重映射（1458 identity + 1531 shift + 41 content-resync）；③ bible glossary+interfaces 登记 v0.21.0 增量。整理稿见 `instances/vllm/book/_v021-update/`。
 - **连贯性干净**：26/26 伏笔全回收；glossary/interfaces 登记 30 章；全书 0 断裂章内锚点 / 0 半角标点 / 0 图几何问题。
-- 体系经实战加固：archive 注入完整 reviewV+崩溃重试、防假通过 escape hatch、dossier-verify 对抗自核（实战拦下 ch34 SyncMPClient / ch01 CompilationMode 等事实错误）、off-spine 分层 roadmap、git push 须前台。
+- 体系经实战加固：archive 注入完整 reviewV+崩溃重试、防假通过 escape hatch、dossier-verify 对抗自核（实战拦下 ch35 SyncMPClient / ch01 CompilationMode 等事实错误）、off-spine 分层 roadmap、git push 须前台。
 - **润色已大体完成**：断锚/半角/图标签重叠/术语对齐 glossary、算法维度增补 24 章均已做并推远程。剩余仅最低价值声线微调 + lint_formulas 内联密度软噪声。
 
 ## 实例专属坑
@@ -44,7 +44,7 @@ ch04（async-engine，`vllm/v1/engine/`）：
 
 
 ## 原理篇交错与 gap 治理(2026-07-08 收官)
-- 36 章新序:三章原理篇归位(ch24 FlashAttention 原理/ch26 量化数学/ch30 EAGLE),映射存档 book/cartography/renumber-2026-07-06.json;补章走 RUNBOOK「补章发车 SOP」。
+- 36 章新序:三章原理篇归位(ch24 FlashAttention 原理/ch26 量化数学/ch31 EAGLE),映射存档 book/cartography/renumber-2026-07-06.json;补章走 RUNBOOK「补章发车 SOP」。
 - 跨章链接三规生效(../../ 两层+文字号=目录号);全书节号=目录号;concepts.json 140 条建账。
 - 诊断→治理闭环:2026-07-06 全书审计 cliffs=1(FA 黑盒)+71 bumps → FA 原理章+交错+接缝+inline 引用批次(Orca/Sarathi/PagedAttention/DeepSeek/XGrammar)→ 2026-07-08 定向终验受影响 9 章 cliffs=0。bump 级 advisory 留审计报告待日后 triage。
 

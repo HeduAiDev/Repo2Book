@@ -1,81 +1,145 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Subtract-only companion for ch29《PD 分离的抽象与调度器集成》.
+# 只做减法：与 vLLM 同名/同结构/同控制流，只删不增。
+#
+# 本文件是 vllm/distributed/kv_transfer/kv_connector/v1/base.py 的子集：
+# 保留 role-split 契约的骨架 —— KVConnectorRole 二分、KVConnectorMetadata
+# 单向信使、以及把方法显式切成『决策侧(Scheduler-side)/搬运侧(Worker-side)』
+# 的 KVConnectorBase_V1。
 """
-Worker-side abstract contract every connector fills.
+KVConnectorBase_V1 Class for Distributed KV Cache & Hidden State
+communication in vLLM v1
 
-SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py
-本章三类后端（P2P NCCL / NIXL RDMA / Offloading）都实现这同一套 worker 契约：
-start_load_kv → wait_for_layer_load → save_kv_layer → wait_for_save → get_finished。
+The class provides the following primitives:
+    Scheduler-side: runs in the scheduler, binds metadata, which
+    is used by the worker-side to load/save KV cache.
+        get_num_new_matched_tokens() - get number of new tokens
+            that exist in the remote KV cache.
+        update_state_after_alloc() - update KVConnector state after
+            temporary buffer alloc by the CacheManager.
+        update_connector_output() - update KVConnector state after
+            output is received from worker-side connectors.
+        request_finished() - called once when a request is finished,
+            returns whether KV cache should be freed now or if the
+            connector now assumes responsibility for freeing the
+            blocks asynchronously.
+
+    Worker-side: runs in each worker, loads/saves KV cache to/from
+    the Connector based on the metadata.
+        start_load_kv() - starts loading all KVs (maybe async)
+        wait_for_layer_load() - blocks until layer i load is done
+        save_kv_layer() - starts saving KV for layer i (maybe async)
+        wait_for_save() - blocks until all saves are done
+        get_finished() - returns ids of requests that have completed
+            async sending/recving.
 """
-
+import enum
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, Any
+
+import torch
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+    from vllm.forward_context import ForwardContext
+    from vllm.v1.attention.backend import AttentionMetadata
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.outputs import KVConnectorOutput
+    from vllm.v1.request import Request
+
+# SUBTRACTED: SupportsHMA / supports_hma（HMA 多 kv_cache_group 路径）与 PD 分离
+# 正交，精简版只走单 group 的 request_finished（原 base.py:L84-120）。
+
+# SUBTRACTED: CopyBlocksOp 类型别名仅供 NIXL host-buffer 路径用（原 L69-79）。
 
 
-# SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:KVConnectorRole
-class KVConnectorRole:
-    # SUBTRACTED: 真实是 enum.Enum，精简版用类常量保留 SCHEDULER/WORKER 两值。
-    SCHEDULER = "scheduler"
-    WORKER = "worker"
+# SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L123
+class KVConnectorRole(enum.Enum):
+    # Connector running in the scheduler process
+    SCHEDULER = 0
+
+    # Connector running in the worker process
+    WORKER = 1
 
 
-# SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:KVConnectorMetadata
-class KVConnectorMetadata:
-    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:KVConnectorMetadata
-    # ch29 决策侧 build_connector_meta 打包、随 SchedulerOutput 下发、worker 侧
-    # bind_connector_metadata 吃进来的不透明载体。各后端有自己的子类。
+# SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L140
+class KVConnectorMetadata(ABC):  # noqa: B024
+    """
+    Abstract Metadata used to communicate
+    Scheduler KVConnector -> Worker KVConnector.
+    """
+
     pass
 
+# SUBTRACTED: KVConnectorHandshakeMetadata（P/D worker 间带外握手）与
+# KVConnectorWorkerMetadata（worker→scheduler 回传聚合）是特定 connector 的进阶
+# 信使，本章 role-split 骨架不需要（原 L131-167）。
 
+
+# SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L170
 class KVConnectorBase_V1(ABC):
-    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:KVConnectorBase_V1
-    def __init__(self, vllm_config, role, kv_cache_config=None):
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:KVConnectorBase_V1.__init__
-        # SUBTRACTED: _vllm_config/_kv_transfer_config 等字段的完整赋值（vllm base.py
-        #             __init__）按各后端需要在子类里补，精简版基类只保留 metadata 槽位。
-        self._connector_metadata = None
+    """
+    Base class for KV connectors.
+    """
+
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L183
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: "KVCacheConfig | None" = None,
+    ):
+        self._connector_metadata: KVConnectorMetadata | None = None
         self._vllm_config = vllm_config
+        if vllm_config.kv_transfer_config is not None:
+            self._kv_transfer_config = vllm_config.kv_transfer_config
+        else:
+            raise ValueError("kv_transfer_config must be set for KVConnectorBase_V1")
+        self._kv_cache_config = kv_cache_config
         self._role = role
+        # SUBTRACTED: 实验性 API 警告 logger、kv_cache_config 缺失的弃用警告
+        # 仅是提示，不影响契约（原 L189-206）。
 
     @property
-    def role(self):
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:KVConnectorBase_V1.role
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L202
+    def role(self) -> KVConnectorRole:
         return self._role
 
     # ==============================
-    # Worker-side metadata binding
+    # Worker-side methods
     # ==============================
 
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L210
     def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L210-L220
         """Set the connector metadata from the scheduler.
 
-        Called by the model runner every time before model execution. The
-        metadata will be used for runtime KV cache loading and saving.
+        This function should be called by the model runner every time
+        before the model execution. The metadata will be used for runtime
+        KV cache loading and saving.
         """
         self._connector_metadata = connector_metadata
 
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L222
     def clear_connector_metadata(self) -> None:
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L222-L228
-        """Clear the connector metadata. Called after model execution."""
+        """Clear the connector metadata after model execution."""
         self._connector_metadata = None
 
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L230
     def _get_connector_metadata(self) -> KVConnectorMetadata:
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L230-L240
+        """Get the connector metadata. Should only be called inside the connector."""
         # Should only be called while set to valid metadata.
         assert self._connector_metadata is not None
         return self._connector_metadata
 
-    def has_connector_metadata(self) -> bool:
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L242-L248
-        return self._connector_metadata is not None
-
-    # ==============================
-    # Worker-side lifecycle contract
-    # ==============================
+    # SUBTRACTED: register_kv_caches / register_cross_layers_kv_cache /
+    # set_host_xfer_buffer_ops / handle_preemptions 是 NIXL/offloading/cudagraph
+    # 的可选钩子，基类均为 no-op 默认，本章 role-split 骨架不展开（原 L257-296）。
 
     @abstractmethod
-    def start_load_kv(self, forward_context, **kwargs) -> None:
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L291-L307
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L291
+    def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """
         Start loading the KV cache from the connector to vLLM's paged
         KV buffer. This is called from the forward context before the
@@ -84,8 +148,8 @@ class KVConnectorBase_V1(ABC):
         pass
 
     @abstractmethod
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L309
     def wait_for_layer_load(self, layer_name: str) -> None:
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L309-L321
         """
         Block until the KV for a specific layer is loaded into vLLM's
         paged buffer. This is called from within attention layer to ensure
@@ -94,8 +158,14 @@ class KVConnectorBase_V1(ABC):
         pass
 
     @abstractmethod
-    def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs) -> None:
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L323-L343
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L323
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+        **kwargs: Any,
+    ) -> None:
         """
         Start saving a layer of KV cache from vLLM's paged buffer
         to the connector. This is called from within attention layer to
@@ -104,45 +174,125 @@ class KVConnectorBase_V1(ABC):
         pass
 
     @abstractmethod
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L345
     def wait_for_save(self):
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L345-L354
         """
         Block until all the save operations is done. This is called
         as the forward context exits to ensure that the async saving
         from save_kv_layer is complete before finishing the forward.
+
         This prevents overwrites of paged KV buffer before saving done.
         """
         pass
 
-    def get_finished(self, finished_req_ids):
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L356-L372
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L356
+    def get_finished(
+        self, finished_req_ids: set[str]
+    ) -> tuple[set[str] | None, set[str] | None]:
         """
         Notifies worker-side connector ids of requests that have
-        finished generating tokens on the worker. The scheduler process
-        (via the Executors) uses this to track which workers are done.
+        finished generating tokens on the worker.
 
-        Returns tuple of (sending/saving ids, recving/loading ids).
+        Returns:
+            ids of requests that have finished asynchronous transfer
+            (requests that previously returned True from request_finished()),
+            tuple of (sending/saving ids, recving/loading ids).
         """
         return None, None
 
-    def get_block_ids_with_load_errors(self) -> set:
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L374-L392
-        return set()
+    # SUBTRACTED: get_block_ids_with_load_errors / shutdown / get_kv_connector_stats
+    # / get_kv_connector_kv_cache_events / get_handshake_metadata /
+    # build_connector_worker_meta 都是特定 connector 的可选扩展点，基类 no-op，
+    # 与本章 role-split 骨架无关（原 L381-443）。
 
     # ==============================
-    # Optional worker-side hooks (基类默认 no-op / None)
+    # Scheduler-side methods
     # ==============================
 
-    def get_kv_connector_stats(self):
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:get_kv_connector_stats
-        # SUBTRACTED: 各后端 stats/metrics/prom 扩展点（dossier delete 项）整组删去，
-        #             基类默认 None，不影响 load/save/finished 传输闭环。
-        return None
+    @abstractmethod
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L442
+    def get_num_new_matched_tokens(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+    ) -> tuple[int | None, bool]:
+        """
+        Get number of new tokens that can be loaded from the
+        external KV cache beyond the num_computed_tokens.
 
-    def get_kv_connector_kv_cache_events(self):
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:get_kv_connector_kv_cache_events
-        return None
+        Returns:
+            A tuple with the following elements:
+                - An optional number of tokens that can be loaded from the
+                  external KV cache beyond what is already computed.
+                  If None, it means that the connector needs more time to
+                  determine the number of matched tokens, and the scheduler
+                  should query for this request again later.
+                - `True` if external KV cache tokens will be loaded
+                  asynchronously (between scheduler steps). Must be
+                  'False' if the first element is 0.
+        """
+        # SUBTRACTED: 完整 Args 文档与 Notes 段（largest prefix / eviction 注意事项）
+        # 正文用散文转述（原 L459-481）。
+        pass
 
-    def build_connector_worker_meta(self):
-        # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:build_connector_worker_meta
-        return None
+    @abstractmethod
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L477
+    def update_state_after_alloc(
+        self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
+    ):
+        """
+        Update KVConnector state after block allocation.
+
+        If get_num_new_matched_tokens previously returned True for a
+        request, this function may be called twice for that same request -
+        first when blocks are allocated for the connector tokens to be
+        asynchronously loaded into, and second when any additional blocks
+        are allocated, after the load/transfer is complete.
+        """
+        pass
+
+    @abstractmethod
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L498
+    def build_connector_meta(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> KVConnectorMetadata:
+        """
+        Build the connector metadata for this step.
+
+        This function should NOT modify fields in the scheduler_output.
+        Also, calling this function will reset the state of the connector.
+        """
+        pass
+
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L513
+    def update_connector_output(self, connector_output: "KVConnectorOutput"):
+        """
+        Update KVConnector state from worker-side connectors output.
+        """
+        return
+
+    # SOURCE: vllm/distributed/kv_transfer/kv_connector/v1/base.py:L523
+    def request_finished(
+        self,
+        request: "Request",
+        block_ids: list[int],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """
+        Called exactly once when a request has finished, before its blocks are
+        freed.
+
+        The connector may assumes responsibility for freeing the blocks
+        asynchronously by returning True.
+
+        Returns:
+            True if the request is being saved/sent asynchronously and blocks
+            should not be freed until the request_id is returned from
+            get_finished().
+            Optional KVTransferParams to be included in the request outputs.
+        """
+        return False, None
+
+    # SUBTRACTED: take_events / get_required_kvcache_layout /
+    # requires_piecewise_for_cudagraph / get_finished_count / build_kv_connector_stats
+    # / set_xfer_handshake_metadata / build_prom_metrics / reset_cache 均为 metrics /
+    # cudagraph / handshake 的可选扩展点，基类默认 no-op（原 L551-662）。

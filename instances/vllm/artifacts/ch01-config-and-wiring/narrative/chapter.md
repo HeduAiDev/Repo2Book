@@ -248,7 +248,7 @@ class CUDAGraphMode(enum.Enum):
 
 那 `PIECEWISE` 在哪？在下面**另一个**枚举 `CUDAGraphMode` 里（值为 1），讲的是 CUDA graph 怎么分段捕获，是完全不同的一回事。一个管 torch.compile 的编译策略，一个管 CUDA graph 的捕获模式——名字撞脸，但别混。本书讲"v1 的 piecewise 编译"时，指的永远是 `VLLM_COMPILE`。
 
-编译这条线——自定义算子怎么插进图、piecewise 后端怎么按形状区间分派 CUDA graph——是 [Part VI（第 22–31 章）](../../ch23-custom-ops-and-compilation/narrative/chapter.md) 的核心。
+编译这条线——自定义算子怎么插进图、piecewise 后端怎么按形状区间分派 CUDA graph——是 [Part VI（第 22–32 章）](../../ch23-custom-ops-and-compilation/narrative/chapter.md) 的核心。
 
 ### 转变四：分页 KV cache
 
@@ -313,7 +313,7 @@ def run_busy_loop(self):
 | 输出回送 | step 返回值直接拿 | 背景 `output_handler` 多路复用回各队列 |
 | 适合场景 | 离线批量、吞吐 | 在线服务、低延迟高并发 |
 
-同一个 `EngineCore.step`，离线由你的线程一拍拍敲，服务由子进程自己一拍拍转。心跳一样，握把不同。离线面的全部细节在 [第 34 章](../../ch34-entrypoints/narrative/chapter.md)，服务面在 [第 35 章](../../ch35-entrypoints/narrative/chapter.md)。
+同一个 `EngineCore.step`，离线由你的线程一拍拍敲，服务由子进程自己一拍拍转。心跳一样，握把不同。离线面的全部细节在 [第 35 章](../../ch35-entrypoints/narrative/chapter.md)，服务面在 [第 36 章](../../ch36-entrypoints/narrative/chapter.md)。
 
 ## 1.4 配置是怎么搭起来的
 
@@ -376,11 +376,11 @@ class VllmConfig:
 
 还有一条贯穿全书的纪律，顺带说明：书里所有源码路径都写成规范的 `vllm/...` 形式（比如本章引的 `vllm/v1/engine/core.py`、`vllm/config/vllm.py`），行号以本书锚定的源码版本为准。你照着路径就能在真实仓库里定位到对应代码。
 
-## 1.6 全书地图：8 个 Part、36 章
+## 1.6 全书地图：8 个 Part、37 章
 
 最后给你整张地图。全书按 vLLM v1 的真实模块组织，分 8 个 Part：
 
-![全书地图：8 Part / 36 章](../diagrams/book-map.png)
+![全书地图：8 Part / 37 章](../diagrams/book-map.png)
 
 逐 Part 一句话导览：
 
@@ -389,9 +389,9 @@ class VllmConfig:
 - **Part III（第 11–12 章）　EngineCore 内部：忙循环**：`step` 的编排、`run_busy_loop`、流水线并行用的 batch queue。
 - **Part IV（第 13–16 章）　调度与 KV cache**：连续批处理与 token 预算、抢占与等待队列、分页 KV cache 的块池与前缀缓存。转变二和转变四都在这。
 - **Part V（第 17–21 章）　执行：Worker、Runner、算子**：Executor 与 worker 生命周期、跨拍持久批次与 `_prepare_inputs`、前向与采样解耦、分布式并行。
-- **Part VI（第 22–31 章）　模型、算子、注意力与采样**：从 Llama 基线一路到自定义算子、torch.compile 与注意力后端；再完整读一个 DeepSeek-V4，落到采样流水线与投机解码。转变三在这。其中三章带【原理篇】标记——FlashAttention、量化数学、EAGLE——是论文精读的地基章，各自紧邻自己的源码落地章（依次挨着注意力后端、DeepSeek-V4、投机解码），读完地基章立刻能在下一章看到它如何被真实代码实现。
-- **Part VII（第 32–33 章）　Prefill/Decode 分离**：KV connector 契约、调度集成、worker 执行与可插拔传输后端。
-- **Part VIII（第 34–36 章）　服务接口**：离线 `LLM` API、OpenAI 兼容服务器、弹性伸缩与多轮。
+- **Part VI（第 22–32 章）　模型、算子、注意力与采样**：从 Llama 基线一路到自定义算子、torch.compile 与注意力后端；再完整读一个 DeepSeek-V4，落到采样流水线与投机解码。转变三在这。其中四章带【原理篇】标记——FlashAttention、量化数学、Lightning Indexer、EAGLE——是论文精读的地基章，各自紧邻自己的源码落地章：FlashAttention 紧邻注意力后端，EAGLE 紧邻投机解码；量化数学与 Lightning Indexer 这两章前后相接，一起铺在 DeepSeek-V4 整读之前——先立量化底座，再看这套底座怎么撑起索引器自己的低精度打分与缓存，索引器原理章读完立刻接上 DeepSeek-V4 整读那一章。
+- **Part VII（第 33–34 章）　Prefill/Decode 分离**：KV connector 契约、调度集成、worker 执行与可插拔传输后端。
+- **Part VIII（第 35–37 章）　服务接口**：离线 `LLM` API、OpenAI 兼容服务器、弹性伸缩与多轮。
 
 这是一条推荐的线性路径，但**不必从头读到尾**。每章开篇的 Roadmap 和依赖标注会告诉你它依赖哪些前置章。想直接看分页 KV cache？翻到第 15 章，Roadmap 会帮你补齐上下文。
 

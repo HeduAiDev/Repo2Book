@@ -1,395 +1,533 @@
-# 第 28 章　从模型代码到架构图：一个可复用的 code→diagram 程序
+# 第 28 章　读一个完整大模型：DeepSeek-V4 是 Llama 身上叠的一摞 delta
 
-![本章地图：code→diagram 四步法在 DeepSeek-V4 上的五站应用](../diagrams/chapter-map.png)
+## 你在这里
 
-只想看 P3 判据和双后端配置，直接跳 §28.5-28.6；已经熟悉四步法、只想看它在 V4 上怎么落地，按 §28.3→§28.4→§28.5-28.6 读。只要方法和结论，读完 §28.1-28.2 直接跳 §28.7-28.8；想完整跟一遍全过程，按序读到底。
+![你在这里：模型架构，DeepSeek-V4 capstone](../diagrams/roadmap.png)
 
-## 这章要做什么
+> *图注：地图还停在 EngineCore 循环这一格——模型只是循环里 `execute` 的那一步。*
+> *[上一章](../../ch27-primer-lightning-indexer/narrative/chapter.md)把 lightning indexer 和它专属的 IndexCache 从打分公式拆到源码；再往前，[量化数学](../../ch26-primer-quantization/narrative/chapter.md)（scale、zero-point、e8m0 块 scale）也已经推到了底。*
+> *本章读一整个真实大模型 DeepSeek-V4,看它在 Llama 骨架上叠了哪些花样——包括把刚拆开的索引器接回 MLA、把 FP8 语义真正铺进显存。*
 
-上一章我们逐行读完了 DeepSeek-V4 的真实源码——MLA 投影、MoE 双后端、MTP 旁路、还有那条 hc 多流残差。读完之后，脑子里其实已经攒下了一张图：哪个模块拥有哪个模块，张量从哪儿流到哪儿。
+前面几章，我们把模型层一层层铺开了。[第 22 章](../../ch22-model-definitions/narrative/chapter.md)立了一份契约：所有 vLLM v1 模型都长成 embedding → N 层 decoder block → 末尾 norm，并以 Llama 作**最简基线**；之后几章接着把自定义算子、`torch.compile`、注意力后端、[量化数学](../../ch26-primer-quantization/narrative/chapter.md)一路拆开，[上一章](../../ch27-primer-lightning-indexer/narrative/chapter.md)又把 lightning indexer 与 IndexCache 从公式钉到源码。今天这些全要用上。
 
-这一章不再讲「V4 是什么」。我们要把上一章那个「读着读着图就浮现出来」的过程**拆成一套明确的步骤**，让它不再靠灵感、靠经验，而是像查字典一样——翻到 `__init__` 查框，翻到 `forward` 查边。然后把这套步骤原样跑在 DeepSeek-V4 上，产出它的架构图，并逐一交代：**每个框、每条边、每种着色，是从源码哪一行读出来的。**
+那一章结尾，我留了一句话没收：Llama **刻意缺**了四样东西——没有专家混合（MoE）、没有潜变量压缩注意力（MLA）、没有量化压缩、没有混合残差。这些「缺」是留白，是为了今天填上。
 
-核心命题只有一句：**架构图不是凭直觉画的，是从 vLLM 模型类的两类源码结构机械地「读」出来的。** `__init__` 读出模块树（嵌套框），`forward` 读出数据流（有向箭头）。学会这套读法，你拿到任何一个 vLLM 模型文件，都能画出它的架构图——这是一项可迁移的技能，不绑定 DeepSeek-V4。本章的 worked example 是 `vllm/model_executor/models/deepseek_v4.py`，对照基线是 `vllm/model_executor/models/llama.py`。
+今天我们读 **DeepSeek-V4**。它是 vLLM 里最复杂的模型之一：MLA 注意力、MoE 前馈、多 token 预测（MTP）、强制 FP8 量化、还有一套叫 Hybrid-Computation 的多流残差。听起来像一座新大陆。但只要你记得第 22 章那份契约，就会发现 V4 不是从头长出来的——
 
-![本章在全书中的位置](../diagrams/roadmap.png)
+**它就是 Llama，身上叠了四摞 delta。**
 
-> *上一章逐行读完了 DeepSeek-V4 的真实源码。*
-> *本章把「读代码画架构图」抽成可照搬的程序。*
-> *下一章进入采样，看 logits 怎么变成 token。*
+![DeepSeek-V4 = Llama 基线 + 一叠 delta](../diagrams/ch25-delta-stack.png)
 
-## 28.1 为什么需要一套「读法」，而不是凭感觉画
+> *图注：左边是第 22 章的 Llama 基线，右边每一行是 V4 对它做的一处替换。*
+> *注意力 MHA 换成 MLA、FFN dense 换成 MoE、add-norm 残差换成 hc 多流、单 lm_head 旁挂一个 MTP draft。*
+> *骨架（embed → N 层 → norm）一字没动。读懂这四个箭头，就读懂了这一章。*
 
-先说个常见的坑。很多人画模型架构图，是边回忆边画——「这里大概有个 attention，那里好像还有个 MLP」。画出来的图常常对不上代码：要么多了个源码里根本没有的框，要么把两个独立模块画成了一个，要么箭头方向反了。等到拿图去 debug 权重装载、对照 checkpoint 张量名时，全是错的。
+这一章的读法，就是顺着这四个箭头，每讲一个 delta 都把它放回 Llama 的对照里。代码主要落在 `vllm/model_executor/models/deepseek_v4.py` 这一个文件里，MLA 的执行层在 `vllm/model_executor/layers/deepseek_v4_attention.py`，MTP draft 在 `vllm/model_executor/models/deepseek_v4_mtp.py`。我们不会把 V4 简化成「教科书里的 DeepSeek-V2」——真实的 V4 比那复杂得多，多流残差、双后端 MoE、FP8 字节装载都会如实呈现。但注意力 kernel、DeepGEMM 内核这些更深的东西，已经在别的章里讲过或会讲，本章只读**模型侧**：投影怎么搭、数据怎么流、算子边界画在哪。
 
-问题出在哪？出在**没有把「框」和「边」钉到确定的源码位置**。只要钉住了，画图就从一门玄学变成一道可机械复现、可审计的工序。
+先看骨架，再依次拆四个 delta。
 
-vLLM 的每个模型都是一个标准的 PyTorch `nn.Module`。`nn.Module` 有两个我们要盯死的契约：
+![本章地图：DeepSeek-V4 前向剖面——Llama 骨架上叠的四摞 delta](../diagrams/chapter-map.png)
 
-- `__init__` 里建子模块——`self.<name> = SomeModule(...)` 这种赋值，表达的是**静态的拥有关系**（谁包含谁）。
-- `forward` 里定调用序——`x = self.<child>(x)` 这种语句，表达的是**动态的调用顺序**（数据先经过谁、再经过谁）。
+只想看 MLA 怎么把 KV cache 压扁，直接跳 §28.2；只关心 MoE 路由怎么选专家，跳 §28.3；MTP 草稿和 FP8 权重装载连在一起，跳 §28.5、§28.6。想跟完整源码走线，就从 §28.1 骨架按序读下去。
 
-这两套结构，恰好对应架构图里的两类元素：
+---
 
-- 拥有关系 → 图里的**嵌套框**（父框套子框）。
-- 调用顺序 → 图里的**有向边**（箭头从上一步指向下一步）。
+## 28.1　骨架：把 Llama 的 forward 和 V4 的并排放
 
-把这层对应关系做实，就有了一套四步程序。先看全貌，再逐步落到 DeepSeek-V4 源码上。
-
-![四步 code→diagram 程序总览](../diagrams/procedure-overview.png)
-
-> *图注：四步程序——P1 读 `__init__` 出模块树，P2 读 `forward` 出数据流，P3 标子系统边界，P4 用 svg-diagram 渲染。每步下方挂着它的「源码判据」：你不是在主观分类，而是在源码里查一个确定的信号。底部那条红色回边是验证步——每个图元都要能溯源回源码，溯源不到的就是杜撰，删掉。*
-
-四步分别是：
-
-- **P1 读 `__init__` 出模块树**：每条 `self.<name> = Module(...)` 画一个子框、连一条父→子嵌套边。
-- **P2 读 `forward` 出数据流**：每个 `x = self.<child>(x)` 画一条有向边；改形状的算子在边上标形状。
-- **P3 标子系统边界**：用源码判据（`torch.ops.vllm.*` / `@torch.compile` / 并行类名）给框着色，让图同时是子系统地图。
-- **P4 用 svg-diagram 渲染**：把模块树写成嵌套矩形、数据流写成有向箭头，脚本生成 SVG → 校验 → 转 PNG。
-
-这套程序定义在 `vllm/model_executor/models/` 下每个模型文件遵循的 `nn.Module` 契约之上——`vllm/model_executor/models/deepseek_v4.py` 和 `vllm/model_executor/models/llama.py` 都不例外。下面先在最简单的 Llama 上跑一遍，建立信心；再上 DeepSeek-V4，证明同一程序只是框更多、判据不变。
-
-## 28.2 先在最简模型上跑一遍：LlamaDecoderLayer
-
-要证明一套程序「与模型无关」，最好的办法是先在最简单的模型上跑通。`vllm/model_executor/models/llama.py` 里的 `LlamaDecoderLayer` 就是理想的起点：一个标准 Transformer 解码层，没有任何花哨结构。
-
-先看 `__init__`（P1 的读取对象）和紧接着的 `forward`（P2 的读取对象），它们在 `vllm/model_executor/models/llama.py:L288-L333`：
+读任何模型，第一件事是找它的 decoder layer 的 `forward`，看一层里数据怎么走。先看第 22 章那份基线，`vllm/model_executor/models/llama.py`：
 
 ```python
-# vllm/model_executor/models/llama.py:L288
-        self.self_attn = attn_layer_type(
-            config=config,
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            # … 省略：num_kv_heads / bias / cache_config 等构造参数 …
-            prefix=f"{prefix}.self_attn",
-            attn_type=attn_type,
-        )
-        self.mlp = LlamaMLP(
-            hidden_size=self.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
-            quant_config=quant_config,
-            bias=getattr(config, "mlp_bias", False),
-            prefix=f"{prefix}.mlp",
-        )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+# vllm/model_executor/models/llama.py:L316
+def forward(
+    self,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Self Attention
+    if residual is None:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+    else:
+        hidden_states, residual = self.input_layernorm(hidden_states, residual)
+    hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
 
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
-
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+    # Fully Connected
+    hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+    hidden_states = self.mlp(hidden_states)
+    return hidden_states, residual
 ```
 
-**P1：读 `__init__` 出模块树。** 用手指顺着 `__init__` 往下点，找每一条 `self.<name> = ...(...)`。这里正好四条：
+这是最经典的 pre-norm transformer 块，两段一模一样的节奏：
 
-| 源码这一行 | 图上这个框 |
-| --- | --- |
-| `self.self_attn = attn_layer_type(...)` | `self_attn`（注意力） |
-| `self.mlp = LlamaMLP(...)` | `mlp`（前馈） |
-| `self.input_layernorm = RMSNorm(...)` | `input_layernorm` |
-| `self.post_attention_layernorm = RMSNorm(...)` | `post_attention_layernorm` |
+1. **attn 段**：`input_layernorm` 归一 → `self_attn` → 隐式加回 `residual`（融合在下一个 layernorm 里）。
+2. **mlp 段**：`post_attention_layernorm` 归一 → `mlp` → 加回 `residual`。
 
-四条赋值 → 四个框，一一对应，没有第五个，也不少一个。这就是 P1 的全部：**`__init__` 里数 `self.X =` 的条数，就是这一层的子框数。**
+注意 `residual` 是怎么传的——它和 `hidden_states` 一起进、一起出，是**一条**贯穿全模型的残差流。layernorm 是个融合算子，顺手把上一段的输出加回残差再归一。整个模型从头到尾，残差就这一条线。记住「一条流」这个词，待会儿 V4 会把它变成好几条。
 
-注意每个框上还挂着 `prefix=f"{prefix}.self_attn"` 这种参数。这条 `prefix` 链不是装饰——它就是这个框在权重 checkpoint 里的命名前缀。模块树的层级路径（`model.layers.0.self_attn...`）和加载权重时看到的张量名一字不差。这一点我们到 DeepSeek-V4 会反复用上：**图的层级标签 == 权重名前缀**，所以架构图可以直接当 debug 索引。
-
-那省略的那些构造参数（`num_kv_heads`、`bias`、`cache_config`）为什么不画？因为它们既不是 `self.X` 子模块赋值（不进模块树），也不出现在 `forward` 的数据流里。**画图只看两样东西：`self.X =`（进树）和 `forward` 里的赋值（进边）。其余配置读取一律忽略。**
-
-**P2：读 `forward` 出数据流。** 同样用手指顺着 `forward` 往下点，找每一条 `hidden_states = self.<child>(...)`，按出现顺序连成箭头：
-
-`input_layernorm` → `self_attn` → `post_attention_layernorm` → `mlp`
-
-这就是这一层的主干数据流。那个 `residual = hidden_states`（以及 `post_attention_layernorm` 同时返回 `residual`）告诉我们有一条残差回边：输入先存进 `residual`，绕过 `self_attn`，在后面 add 回来。这条回边在图上画成一根从入口绕到 attention 之后的旁路。
-
-把 P1 的框、P2 的边拼起来，就是 LlamaDecoderLayer 的完整架构图：
-
-![同一四步先跑最简 LlamaDecoderLayer](../diagrams/llama-baseline.png)
-
-> *图注：左边是 `__init__` 的四条 `self.X` 赋值，虚线连到中间的四个模块树框（模块树表达「拥有」，是静态的）。右边是 `forward` 读出的数据流链，外加那条 add-norm 残差回边（数据流表达「调用」，是动态的）。同一个框，在模块树里讲「谁拥有它」，在数据流里讲「什么时候调它」——`forward` 决定调用次序。底下那句话是本章的赌注：同样四步，DeepSeek-V4 只是框更多、判据不变。*
-
-到这里，四步程序里的 P1、P2 已经在一个真实模型上跑通了。它没用到任何 DeepSeek-V4 特有的东西——`self.X =` 数框、`forward` 连边，对所有 `nn.Module` 都成立。接下来上 DeepSeek-V4，你会看到完全相同的两步，只是要数的框更多、要连的边更绕。
-
-## 28.3 P1 实战：从 `__init__` 读出 DeepSeek-V4 的模块树
-
-画一个完整模型的图，从哪个类开始读？答案永远一样：**从 `*ForCausalLM` 的 `__init__` 开读。** 它是整个模型对外的入口类，图最外层那几个框就在它的 `__init__` 里。
-
-看 `vllm/model_executor/models/deepseek_v4.py:L1627-L1659` 的 `DeepseekV4ForCausalLM`：
-
-```python
-# vllm/model_executor/models/deepseek_v4.py:L1627
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        super().__init__()
-        config = vllm_config.model_config.hf_config
-        # … 省略：expert_dtype 分支只改 weights_mapper，不建子模块 …
-        self.model = self.model_cls(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
-        )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            prefix=maybe_prefix(prefix, "lm_head"),
-        )
-        self.logits_processor = LogitsProcessor(config.vocab_size)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
-        hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
-        )
-        return hidden_states
-```
-
-P1 照搬：数 `self.X =`。这里三条——`self.model`、`self.lm_head`、`self.logits_processor`。所以图最外层就是三个框，主干是中间那个 `model`（`ParallelLMHead` 是输出头、`LogitsProcessor` 算 logits）。`forward` 里 `hidden_states = self.model(...)` 一句就把顶层数据流交代清楚了：数据进 `model`，出来就是 `hidden_states`。其余方法（`compute_logits`、`load_weights` 等）不在这条前向主干上，画数据流图时不画。
-
-接着**下钻一层**：`model` 是 `DeepseekV4Model`，读它的 `__init__`（`vllm/model_executor/models/deepseek_v4.py:L1299-L1320`）：
-
-```python
-# vllm/model_executor/models/deepseek_v4.py:L1299
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=f"{prefix}.embed_tokens",
-        )
-
-        self.start_layer, self.end_layer, self.layers = make_layers(
-            config.num_hidden_layers,
-            lambda prefix: DeepseekV4DecoderLayer(
-                vllm_config,
-                prefix=prefix,
-                topk_indices_buffer=self.topk_indices_buffer,
-                aux_stream_list=aux_stream_list,
-            ),
-            prefix=f"{prefix}.layers",
-        )
-
-        self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
-```
-
-这里出现了 P1 的一个**关键技巧**。`embed_tokens` 和 `norm` 是普通框，照常画（`VocabParallelEmbedding` 和后面要看到的 `ColumnParallelLinear` 同属并行类名判据——它按 vocab 维切分嵌入表到各 TP rank，通信模式见[第 20 章](../../ch20-distributed-parallelism/narrative/chapter.md)）。但中间这条不是 `self.layers = SomeModule(...)`，而是 `make_layers(num_hidden_layers, lambda: DeepseekV4DecoderLayer(...))`。
-
-`make_layers`（定义在 `vllm/model_executor/models/utils.py`）是 vLLM 里「堆叠 N 个同构层」的标准信号。看到 `make_layers` 或 `nn.ModuleList`，就知道这里不是一个框，而是 **N 个同构框的堆叠**。
-
-那图上画 N 个框吗？不画。源码里它就是一个 lambda 工厂加一个计数 `num_hidden_layers`，每层结构完全一样。展开成 N 个框既冗余、又掩盖了「每层同构」这个事实。**正确画法：画一个框，标上 `× num_hidden_layers`。** 这是 P1 的一条硬规则。
-
-还有一个容易踩的坑。`DeepseekV4Model.__init__` 里其实还定义了 `topk_indices_buffer`、`_mtp_hidden_buffer`、`hc_head_*` 这些。它们是 `nn.Parameter` 或 buffer，**不是 `nn.Module` 子模块**。所以它们**不进模块树框**——把它们画成框会让图失真。它们要等到 P2 画数据流时，作为参数或数据端点出现在边上的标注里。**画图时必须分清：子模块（进树）vs 参数/buffer（进数据流标注）。**
-
-继续下钻到单层 `DeepseekV4DecoderLayer.__init__`（`vllm/model_executor/models/deepseek_v4.py:L1105-L1122`）：
-
-```python
-# vllm/model_executor/models/deepseek_v4.py:L1105
-        # Lazy import to avoid top-level tilelang dependency.
-        # Registers both torch.ops.vllm.mhc_pre and mhc_post
-        import vllm.model_executor.layers.mhc  # noqa: F401
-        # … 省略：config / hidden_size / rms_norm_eps 读取 …
-        self.attn = DeepseekV4Attention(
-            vllm_config,
-            prefix=f"{prefix}.attn",
-            topk_indices_buffer=topk_indices_buffer,
-            aux_stream_list=aux_stream_list,
-        )
-        self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
-
-        self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
-        self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
-```
-
-老规矩，数 `self.X =`：`attn`（`DeepseekV4Attention`）、`ffn`（`DeepseekV4MoE`）、`attn_norm`、`ffn_norm`。四个子框。结构和 Llama 那层是同构的——attention、前馈、两个 norm，只是名字和内部实现换了。**这正是「程序与模型无关」的现场证据：换了模型，P1 的动作一字不改。**
-
-但顶上那行 `import vllm.model_executor.layers.mhc` 不是普通 import——注释写得很清楚，它的**副作用**是注册 `torch.ops.vllm.mhc_pre` 和 `mhc_post` 两个自定义算子。这是 P3 识别「自定义算子子系统」的源码线索：算子不是 `self.X` 子模块，它靠 import 注册、靠 `torch.ops` 调用。这条线索我们 §28.5 再展开。
-
-最后下钻到叶子层 `DeepseekV4Attention.__init__`（`vllm/model_executor/models/deepseek_v4.py:L973-L1009`），看 MLA 的投影子树怎么读出来：
-
-```python
-# vllm/model_executor/models/deepseek_v4.py:L973
-        self.fused_wqa_wkv = MergedColumnParallelLinear(
-            self.hidden_size,
-            [self.q_lora_rank, self.head_dim],
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.fused_wqa_wkv",
-            disable_tp=True,  # fused ReplicatedLinear
-        )
-        self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
-        self.wq_b = ColumnParallelLinear(
-            self.q_lora_rank,
-            self.n_heads * self.head_dim,
-            # … 省略：bias / quant_config / return_bias …
-            prefix=f"{prefix}.wq_b",
-        )
-        self.kv_norm = RMSNorm(self.head_dim, self.eps)
-        self.wo_a = ColumnParallelLinear(
-            self.n_heads * self.head_dim // self.n_groups,
-            self.n_groups * self.o_lora_rank,
-            # … 省略 …
-            prefix=f"{prefix}.wo_a",
-        )
-        self.wo_a.is_bmm = True
-        self.wo_a.bmm_batch_size = self.n_local_groups
-        self.wo_b = RowParallelLinear(
-            self.n_groups * self.o_lora_rank,
-            self.hidden_size,
-            # … 省略 …
-            prefix=f"{prefix}.wo_b",
-        )
-```
-
-到了叶子层，P1 变成一种很机械的体验：**一行一框**。`fused_wqa_wkv`、`q_norm`、`wq_b`、`kv_norm`、`wo_a`、`wo_b`——一条 `self.X =` 一个框，连 `prefix=f"{prefix}.<name>"` 都对齐了图里的层级标签。这就是 MLA 的投影子树，不多不少。
-
-这里 P1 还顺手把 P3 的一半活干了：**框的着色判据，就写在类名里。** `MergedColumnParallelLinear`、`ColumnParallelLinear`、`RowParallelLinear`——这些类名本身就标了张量并行的方式。列并行（Column）按输出维切、行并行（Row）按输入维切，是两种不同的跨设备通信模式。所以画图时按类名着色：列并行一种颜色、行并行另一种、合并复制的（`fused_wqa_wkv` 带 `disable_tp=True` 的 ReplicatedLinear）再一种。**你不用主观判断「这块是不是并行」——读类名就行。**
-
-把四层下钻的结果叠起来，就是 DeepSeek-V4 的完整模块树：
-
-![P1：读 __init__ 出 DeepSeek-V4 嵌套模块树](../diagrams/init-to-tree.png)
-
-> *图注：从 `DeepseekV4ForCausalLM` 一路下钻——`model` ⊃ {`embed_tokens`，`layers × num_hidden_layers` ⊃ `DeepseekV4DecoderLayer` ⊃ {`attn` ⊃ MLA 投影叶子，`ffn` ⊃ MoE 子树}，`norm`}，`lm_head`。每个框都能指回一条 `self.X = Module` 赋值。叶子框按 `Column`/`Row`/`Merged ParallelLinear` 着色，所以这张模块树同时已经是半张并行子系统地图。`layers` 那个带叠影的框就是 `make_layers` 的 `× N` 复数框——一个框，不是 N 个。*
-
-## 28.4 P2 实战：从 `forward` 读出数据流与形状变化
-
-模块树画完了，但它只讲了「谁拥有谁」，没讲「数据怎么流」。P2 接手——读 `forward`，把静态的框连成动态的有向边。
-
-先读主干 `DeepseekV4Model.forward`（`vllm/model_executor/models/deepseek_v4.py:L1394-L1418）`：
-
-```python
-# vllm/model_executor/models/deepseek_v4.py:L1394
-        hidden_states = self.embed_input_ids(input_ids)
-        hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
-        # … 省略：use_mega_moe 时 input_ids 转 int64，与画图无关 …
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states = layer(
-                hidden_states,
-                positions,
-                input_ids,
-            )
-
-        # Stash pre-hc_head residual for the MTP draft (captured copy_).
-        num_tokens = hidden_states.shape[0]
-        self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
-
-        hidden_states = hc_head(
-            hidden_states,
-            self.hc_head_fn,
-            self.hc_head_scale,
-            self.hc_head_base,
-            self.rms_norm_eps,
-            self.hc_eps,
-        )
-        hidden_states = self.norm(hidden_states)
-        return hidden_states
-```
-
-P2 照 tensor 赋值顺序自上而下读，每一句 `hidden_states = ...(...)` 画一条有向边。这段里有四个值得专门标注的动作：
-
-**一、形状变化要标在边上。** 第二行 `hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)`——这不是一个子模块（所以不进模块树），但它把张量从 `[T, H]` 变成了 `[T, hc_mult, H]`（以 DeepSeek-V4 为例：H=7168，hc\_mult=4，即从 `[T, 7168]` 展开到 `[T, 4, 7168]`）。`unsqueeze`、`repeat`、`view`、`flatten` 这类纯形状算子，**画图时不画框，但必须在那条边上标形状**：`[T,H]→[T,hc_mult,H]`。不标的话，读者后面会一脸懵——中途怎么凭空多出来一个 `hc_mult` 维？这个维就是 hc 多流，标在边上它才有来处。
-
-**二、`for` 循环就是穿过堆叠层的那一条边。** `for layer in islice(self.layers, ...)` 对应 P1 里那个 `× N` 复数框——数据流箭头穿过这个复数框一次，代表它依次流过所有层。
-
-**三、`copy_` 是一条分叉旁路。** `self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))` 把主干上的隐状态拷一份进 `_mtp_hidden_buffer`（这就是[上一章](../../ch27-model-architecture/narrative/chapter.md)介绍的 MTP 草稿共享缓冲区）。这就是 §28.3 说的那个 buffer——它不在模块树里，现在以**数据流端点**的身份出现：主干上分一条旁路出去，喂给 MTP 草稿。旁路边画成一条岔出去的箭头，指向那个 buffer 框。
-
-**四、`hc_head` 把形状压回来。** `hc_head(...)` 接收 `[T, hc_mult, H]`，内部做完混合后输出 `[T, H]`——又一条要标形状的边，`[T,hc_mult,H]→[T,H]`，和开头那次展开正好对称。最后 `self.norm(...)` 收尾。
-
-那段 `intermediate_tensors`/`inputs_embeds` 的 PP 分支为什么省略？因为在单卡（PP=1）这条配置下它不触发——只画真正会走的路径。P2 有条原则：`if` 恒不触发的分支不进图，只画真正会走的路径。
-
-> **v0.21.0 更新**：上面这条 PP 分支在新版里不再是一条「永不触发」的死分支——DeepSeek-V4 现在实现了 `SupportsPP`，支持流水线并行（[上一章](../../ch27-model-architecture/narrative/chapter.md)§27.7 讲了它在层构造侧怎么把首尾零件换成 `PPMissingLayer()`）。在数据流层面，这给图加了一个**条件切分点**：当 PP > 1 时，非首 rank 的 `forward` 不再从 `embed_input_ids` 起步，而是直接取上一 rank 传来的 `intermediate_tensors["hidden_states"]`；非末 rank 则在末尾提前 `return IntermediateTensors(...)`，把 `hc_head`、`_mtp_hidden_buffer` 暂存与 `lm_head` 全部下放到末 rank。画图时这处可作脚注：在主干首/末画一条 `IntermediateTensors` 跨 rank 传递的虚线边，标上多流形状 `(num_tokens, hc_mult, H)`——它和单卡主干是同一条逻辑数据流，只是被 PP 边界切成了几段。是否画这条边，取决于你要画的是单卡视图还是 PP 视图：判据仍然客观（`get_pp_group().is_first_rank / is_last_rank` 那两个分支），只是这次「会不会走」由部署拓扑而非模型配置决定。
-
-下钻到单层 `DeepseekV4DecoderLayer.forward`（`vllm/model_executor/models/deepseek_v4.py:L1201-L1253`），看层内数据流：
+现在看 V4 的 `vllm/model_executor/models/deepseek_v4.py`：
 
 ```python
 # vllm/model_executor/models/deepseek_v4.py:L1201
-    def forward(
-        self,
-        x: torch.Tensor,
-        positions: torch.Tensor,
-        input_ids: torch.Tensor | None,
-    ) -> torch.Tensor:
-        residual = x
-        x, post, comb = self.hc_pre(
-            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
-        )
-        x = self.attn_norm(x)
-        x = self.attn(positions, x, None)
-        x = self.hc_post(x, residual, post, comb)
+def forward(
+    self,
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    input_ids: torch.Tensor | None,
+) -> torch.Tensor:
+    residual = x
+    x, post, comb = self.hc_pre(
+        x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+    )
+    x = self.attn_norm(x)
+    x = self.attn(positions, x, None)
+    x = self.hc_post(x, residual, post, comb)
 
-        residual = x
-        x, post, comb = self.hc_pre(
-            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
-        )
-        x = self.ffn_norm(x)
-        x = self.ffn(x, input_ids)
-        x = self.hc_post(x, residual, post, comb)
-        return x
+    residual = x
+    x, post, comb = self.hc_pre(
+        x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+    )
+    x = self.ffn_norm(x)
+    x = self.ffn(x, input_ids)
+    x = self.hc_post(x, residual, post, comb)
+    return x
 ```
 
-这段是对称的两半，结构完全一致：
+把两段并排，骨架一眼可辨——**还是那两段相同节奏**：
 
-第一半（attention）：`residual = x` 存残差 → `hc_pre` → `attn_norm` → `attn` → `hc_post`。第二半（前馈）：又一次 `residual = x` → `hc_pre` → `ffn_norm` → `ffn` → `hc_post`。
+| | Llama | DeepSeek-V4 |
+|---|---|---|
+| attn 段归一 | `input_layernorm` | `attn_norm` |
+| attn 主体 | `self_attn`（MHA） | `attn`（MLA） |
+| mlp 段归一 | `post_attention_layernorm` | `ffn_norm` |
+| mlp 主体 | `mlp`（dense） | `ffn`（MoE） |
+| 残差处理 | layernorm 融合 add-norm | `hc_pre` / `hc_post` |
 
-那两条 `residual = x`，加上 `hc_post(x, residual, ...)` 把 `residual` 当形参收进去——就是**两条残差回边**：分别绕过 attention 和 ffn，在 `hc_post` 处汇回。这和 Llama 那条 add-norm 残差是同一类回边，只是这里的「加回来」被包进了 `hc_post`（也就是后面要讲的 `torch.ops.vllm.mhc_post` 算子）里。
+对照之下，三个 delta 已经露头了：`attn` 从 MHA 变 MLA、`ffn` 从 dense 变 MoE、残差从「融合 add-norm」变成「`hc_pre` 包前、`hc_post` 包后」。注意 V4 这里 `attn_norm` 和 `attn` 是分开两行调的，不再融合——因为残差的活儿被 `hc_pre`/`hc_post` 接管了。
 
-把主干和层内拼起来，DeepSeek-V4 的数据流图就成形了——但还差最后一步：给那些算子框、编译区上色。
+还有一个细节值得停一下：V4 的 `forward` 多收一个 `input_ids` 参数，一路传给 `ffn`。Llama 的 MLP 不需要知道是哪个 token——它对每个位置一视同仁。V4 的 MoE 却可能要拿 `input_ids` 去查路由表（后面 §28.3 会讲那个 hash-MoE 分支）。这是「dense 对每 token 同构、MoE 对每 token 异构」的第一个伏笔。
 
-## 28.5 P3 实战：用源码判据标出子系统边界
+骨架读完，开始拆四个 delta。从注意力开始。
 
-到这里图已经能用了，但它还只是一张「数据怎么流」的图。P3 要让它**同时是一张子系统地图**：哪块是自定义算子、哪块是 torch.compile 编译区、哪块跨设备通信。
+---
 
-关键在于：这些边界**不靠作者主观分类**，全部从源码读出三类客观判据。
+## 28.2　Delta 一：MHA → MLA，把 KV cache 压成低秩潜变量
 
-**判据一：调 `torch.ops.vllm.*` 的，是自定义算子框。** 怎么判断一个框是「普通子模块前向」还是「自定义算子」？看它调的是 `self.<submodule>(...)` 还是 `torch.ops.vllm.*`。看 `hc_pre`/`hc_post` 的方法体（`vllm/model_executor/models/deepseek_v4.py:L1172-L1199`）：
+### 28.2.1　为什么要压：先算一笔显存账
+
+标准多头注意力（MHA）的痛点在解码阶段：每生成一个 token，都要把它的 K、V 存进 KV cache，供后面所有 token 注意。每个 token 缓存的大小，正比于
+
+$$
+2 \times n_{\mathrm{kv\_heads}} \times d_{\mathrm{head}}
+$$
+
+那个 2 是 K 和 V 各一份。头数多、维度大，KV cache 就吃显存——长上下文场景下，它常常比模型权重还大。
+
+MLA（Multi-head Latent Attention，多头潜变量注意力，由 DeepSeek-V2 提出，arXiv:2405.04434）的思路是：别缓存满血的 K/V，缓存一个**低秩潜变量**。`kv_lora_rank` 是该潜变量的维数（DeepSeek-V4 取 512），远小于 `n_heads × d_head` 的几千维。把 K/V 压到这个 `kv_lora_rank` 维，缓存这个压缩版；真正算注意力时再升回去。压缩比（缓存满血 K/V 的字节 ÷ 缓存潜变量的字节）大致是
+
+$$
+\frac{2 \times n_{\mathrm{heads}} \times d_{\mathrm{head}}}{kv\_lora\_rank + qk\_rope\_head\_dim}
+$$
+
+举个 DeepSeek 量级的数：`n_heads × d_head` 在几千维，而 `kv_lora_rank` 只有 512 左右。分子上万、分母几百——**KV cache 缩到原来的十分之一甚至更小**。这就是 MLA 值这么多工程复杂度的原因：显存省下来，batch 能开更大，吞吐就上去了。
+
+### 28.2.2　最干净的 MLA：标准版的 forward
+
+V4 的 MLA 实现裹了一层又一层工程优化，直接读容易迷路。先看 vLLM 里**标准 MLA**（DeepSeek-V2/V3 用的那版）的 forward，它最清楚地展示 MLA 的本质，`vllm/model_executor/layers/mla.py`：
 
 ```python
-# vllm/model_executor/models/deepseek_v4.py:L1172
-    def hc_pre(
-        self,
-        x: torch.Tensor,
-        hc_fn: torch.Tensor,
-        hc_scale: torch.Tensor,
-        hc_base: torch.Tensor,
-    ):
-        post_mix, res_mix, layer_input = torch.ops.vllm.mhc_pre(
-            residual=x,
-            fn=hc_fn,
-            hc_scale=hc_scale,
-            hc_base=hc_base,
-            # … 省略：rms_eps / hc_pre_eps / sinkhorn 等算子参数 …
-        )
-        return layer_input, post_mix, res_mix
+# vllm/model_executor/layers/mla.py:L139
+qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+q_c, kv_lora = qkv_lora.split(
+    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+    dim=-1,
+)
+q_c = self.q_a_layernorm(q_c)
+q = self.q_b_proj(q_c)[0]
+# … 省略：q_lora_rank 为 None 时的非低秩分支 …
+kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+kv_c_normed = self.kv_a_layernorm(kv_c)
 
-    def hc_post(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor,
-        post: torch.Tensor,
-        comb: torch.Tensor,
-    ):
-        return torch.ops.vllm.mhc_post(x, residual, post, comb)
+q = q.view(-1, self.num_heads, self.qk_head_dim)
+# Add head dim of 1 to k_pe
+k_pe = k_pe.unsqueeze(1)
+
+if self.rotary_emb is not None:
+    q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
+        positions, q[..., self.qk_nope_head_dim :], k_pe
+    )
 ```
 
-证据确凿：`hc_pre` 直接 dispatch 到 `torch.ops.vllm.mhc_pre`，`hc_post` 到 `torch.ops.vllm.mhc_post`。它们不是普通子模块前向，是自定义算子。所以图里这两个框用特殊填充、旁注算子名，和普通 `nn.Module` 框区分开。判据就一条：**`torch.ops.vllm.` 前缀。** 这种自定义算子的注册机制本身——为什么要绕开 `nn.Module`、怎么注册进 `torch.ops`——是另一套独立的话题，不在画图这条线上展开。
+四步，记住它的形状：
 
-**判据二：顶着 `@torch.compile` 装饰器的，是编译区框。** 看 `hc_head`（`vllm/model_executor/models/deepseek_v4.py:L1552-L1580`）：
+1. **`fused_qkv_a_proj` 压低秩**：一把把 `hidden` 投到 `[q_lora_rank, kv_lora_rank + qk_rope_head_dim]`。注意这远小于全量 QKV——这就是「压缩」。
+2. **归一**：q 段过 `q_a_layernorm`，kv 段过 `kv_a_layernorm`。低秩潜变量也要归一稳住数值。
+3. **`q_b_proj` 升维**：把压扁的 q 潜变量升回满血的多头 Q。K/V 不在这里升——它们以 `kv_c_normed` 的低秩形态进 KV cache，升维推迟到 kernel 内部（这是 MLA 把缓存压小的关键，详见第 25 章）。
+4. **解耦 RoPE**：看那行 `q[..., self.qk_nope_head_dim:]`——RoPE **只**作用在每个 head 的后半段。
+
+第 4 步是 MLA 最反直觉的设计，单独说。
+
+### 28.2.3　解耦 RoPE：为什么 head 要劈成 nope + rope 两半
+
+RoPE（旋转位置编码）和低秩压缩有个根本矛盾。低秩压缩想把 K「吸收」进潜变量、推迟升维；但 RoPE 是个跟绝对位置有关的旋转，一旦施加，K 就和位置纠缠在一起，没法干净地被低秩矩阵吸收了。
+
+DeepSeek 的解法是**解耦**：把每个 head 的维度劈成两段。
+
+$$
+d_{\mathrm{head}} = qk\_nope\_head\_dim + qk\_rope\_head\_dim
+$$
+
+- **nope 段**（no position embedding）：不旋转，可以被低秩 `kv_b` 矩阵吸收进潜变量，享受压缩。
+- **rope 段**：单独保留、施加旋转，显式存进缓存（就是那个 `k_pe`，pe = position embedding）。
+
+所以缓存里存的是「低秩潜变量 + 一小段带位置的 rope」，而不是满血 K。代码里 `q[..., self.qk_nope_head_dim:]` 这个切片，就是「只把 head 的 rope 段送进 `rotary_emb`」。一行切片，背后是一整套「让压缩和位置编码共存」的设计。
+
+### 28.2.4　V4 的加码：连输出投影都低秩
+
+标准 MLA 已经够巧了，V4 在它之上又叠了几层。看 V4 的注意力权重定义，`vllm/model_executor/models/deepseek_v4.py`：
+
+```python
+# vllm/model_executor/models/deepseek_v4.py:L973
+self.fused_wqa_wkv = MergedColumnParallelLinear(
+    self.hidden_size,
+    [self.q_lora_rank, self.head_dim],
+    bias=False,
+    quant_config=quant_config,
+    prefix=f"{prefix}.fused_wqa_wkv",
+    disable_tp=True,  # fused ReplicatedLinear
+)
+self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
+self.wq_b = ColumnParallelLinear(
+    self.q_lora_rank,
+    self.n_heads * self.head_dim,
+    bias=False,
+    quant_config=quant_config,
+    return_bias=False,
+    prefix=f"{prefix}.wq_b",
+)
+
+self.kv_norm = RMSNorm(self.head_dim, self.eps)
+self.wo_a = ColumnParallelLinear(
+    self.n_heads * self.head_dim // self.n_groups,
+    self.n_groups * self.o_lora_rank,
+    bias=False,
+    quant_config=quant_config,
+    return_bias=False,
+    prefix=f"{prefix}.wo_a",
+)
+self.wo_a.is_bmm = True
+self.wo_a.bmm_batch_size = self.n_local_groups
+self.wo_b = RowParallelLinear(
+    self.n_groups * self.o_lora_rank,
+    self.hidden_size,
+    bias=False,
+    quant_config=quant_config,
+    return_bias=False,
+    prefix=f"{prefix}.wo_b",
+)
+```
+
+把它和标准 MLA、再和 Llama 的 `qkv_proj`/`o_proj` 三方对照：
+
+- **输入端**：`fused_wqa_wkv` ↔ 标准 MLA 的 `fused_qkv_a_proj`，都是「压成 `[q_lora_rank, head_dim]` 低秩潜变量」；`q_norm`/`kv_norm` ↔ `q_a_layernorm`/`kv_a_layernorm`；`wq_b` ↔ `q_b_proj`，把 q 潜变量升回 `n_heads * head_dim`。这部分 V4 和标准 MLA 同构，只是名字短了。
+- **输出端**：这才是 V4 的加码。标准 MLA 算完注意力直接一个 `o_proj` 回 `hidden`。V4 偏不——它让**输出投影也低秩**：`wo_a` 先把输出压到 `o_lora_rank`（`n_groups` 是头的分组数，用于把 `n_heads` 分批——每组 `n_heads/n_groups` 个头的输出分别压缩，`is_bmm=True` 告知线性层走批量矩阵乘以处理这个分组布局），`wo_b` 再升回 `hidden_size`。
+
+对照 Llama，delta 就很清楚了：
+
+| | Llama | DeepSeek-V4 MLA |
+|---|---|---|
+| 输入投影 | `qkv_proj` 全量 Q/K/V 一把出 | `fused_wqa_wkv` 压低秩 + `wq_b` 升 q |
+| 输出投影 | `o_proj` 一把回 hidden | `wo_a` 压低秩 + `wo_b` 升回 hidden |
+| 位置编码 | RoPE 作用整个 head | 解耦 RoPE，只旋 rope 段 |
+| KV cache | 满血 K/V | 低秩潜变量 + rope 段 |
+
+「连输出投影都低秩」是 V4 区别于标准 MLA 的指纹。下面这张图把整条投影数据流串起来：
+
+![MLA 投影数据流](../diagrams/ch25-mla-projection-flow.png)
+
+> *图注：hidden 经 `fused_wqa_wkv` 压成低秩，split 后 q 走 norm→`wq_b` 升维、kv 走 norm。*
+> *head 拆 nope/rope，RoPE 只旋 rope 段；注意力 kernel（第 25 章）算完，输出再经 `wo_a`/`wo_b` 两段低秩回 hidden。*
+> *左下角对照 Llama：输入输出都是一把过的全量投影，没有低秩、没有 nope/rope 拆分。*
+
+### 28.2.5　多流 GEMM：V4 模型侧值得看的工程亮点
+
+MLA 比 MHA 多了好几个独立的输入投影：主投影 `fused_wqa_wkv`（最重），加上可选的 compressor、indexer（稀疏注意力用的，本章不深挖，见第 25 章）的几个轻量 GEMM。这些 GEMM 互相独立、谁也不等谁——典型的可并行场景。
+
+V4 就把它们摊到不同的 CUDA stream 上重叠跑，`vllm/model_executor/layers/deepseek_v4_attention.py`：
+
+```python
+# vllm/model_executor/layers/deepseek_v4_attention.py:L356
+def attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:
+    assert self.aux_stream_list is not None
+    assert len(self.aux_stream_list) >= 3
+
+    # fused_wqa_wkv (heaviest) on default; the three lighter input GEMMs
+    # on aux streams 0..2 when their owning module exists. ln_events[0]
+    # is the fan-out start event; ln_events[1..3] are per-aux done events.
+    aux_fns: list[Callable[[], Any] | None] = [None, None, None]
+
+    if self.compressor is not None:
+        compressor = self.compressor
+        def compressor_kv_score() -> torch.Tensor:
+            return torch.mm(
+                hidden_states, compressor.fused_wkv_wgate.weight.T,
+                out_dtype=torch.float32,
+            )
+        aux_fns[0] = compressor_kv_score
+    # … 省略：indexer 存在时把 indexer 的两个轻 GEMM 挂到 aux_fns[1]/[2] …
+
+    def fused_wqa_wkv() -> torch.Tensor:
+        qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+        return qr_kv
+
+    qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(
+        fused_wqa_wkv,
+        aux_fns,
+        self.ln_events[0],
+        self.ln_events[1:4],
+        self.aux_stream_list[:3],
+    )
+
+    return qr_kv, kv_score, indexer_kv_score, indexer_weights
+```
+
+读法是「主 + 辅」：最重的 `fused_wqa_wkv` 走默认流，几个轻量 GEMM 分到 aux stream 0~2，靠 `execute_in_parallel` 加 CUDA event 重叠。一个 `ln_events[0]` 是 fan-out 起跑信号，`ln_events[1:4]` 是各 aux 流的完成信号——典型的「一发多收」事件同步。
+
+对照第 22 章的 Llama：它的 `qkv_proj` 就一个 GEMM，一把算完，没有可重叠的东西，也就没这套 stream 编排。**MLA 把投影拆多了，反而开出了并行的空间**——这是「拆分换并行」的一个漂亮例子。这些 stream/event 是 GPU-only 的真实编排，本章只读它在模型侧的位置；kernel 内部交给第 25 章。
+
+输入 GEMM 算完，前处理收尾很简单——split 开，分别归一：
+
+```python
+# vllm/model_executor/layers/deepseek_v4_attention.py:L425
+qr_kv, kv_score, indexer_kv_score, indexer_weights = (
+    self.attn_gemm_parallel_execute(hidden_states)
+)
+
+qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
+qr, kv = fused_q_kv_rmsnorm(
+    qr, kv,
+    self.q_norm.weight.data,
+    self.kv_norm.weight.data,
+    self.eps,
+)
+```
+
+`split([q_lora_rank, head_dim])` 把低秩潜变量劈成 q 段和 kv 段，`fused_q_kv_rmsnorm` 一个算子把两段的 RMSNorm 都做了——对应标准 MLA 里那两个分开的 `q_a_layernorm`/`kv_a_layernorm`，V4 融成一个 kernel。到这里，MLA 的「低秩压缩 + 归一」骨架就齐了，剩下升维、RoPE、kernel 是第 25 章的活儿。
+
+注意力 delta 讲完。下一摞：前馈。
+
+---
+
+## 28.3　Delta 二：dense MLP → MoE，稀疏路由 + 一条共享 dense
+
+### 28.3.1　MoE 省的是算力，不是显存
+
+第 22 章的 `LlamaMLP` 是一条 dense 的 SwiGLU：`gate_up_proj` 升维、激活、`down_proj` 降维，**每个 token 都把全部 MLP 参数算一遍**。
+
+MoE（Mixture of Experts，专家混合）换个玩法：准备 `n_routed_experts` 个专家（每个就是一条小 MLP），每个 token 只激活其中 top-k 个。每 token 的 MLP 算力，正比于「激活专家占全部专家的比例」乘「全部专家参数」：
+
+$$
+\frac{num\_experts\_per\_tok + n_{\mathrm{shared}}}{n_{\mathrm{routed\_experts}}} \times W_{\mathrm{experts}}
+$$
+
+举个 DeepSeek 量级：256 个专家、每 token 选 8 个。那么每 token 只碰到 8/256 ≈ 3% 的路由专家参数。**参数量可以堆到几百 B，但每 token 的算力近似不变**——这就是 MoE 的核心权衡：用稀疏激活把模型容量做大，而不把单 token 的 FLOPs 做大。
+
+注意这和 MLA 省的不是一回事：MLA 省 **KV cache 显存**，MoE 省**每 token 算力**。两个 delta 各打各的痛点。V4 用的这套「细粒度路由专家 + 一条共享专家」，正是 DeepSeek-V2/V3 定型的 DeepSeekMoE 设计（arXiv:2405.04434 / 2412.19437）。
+
+### 28.3.2　gate + shared_experts：路由之外那条「dense 残留」
+
+看 V4 MoE 的构造，`vllm/model_executor/models/deepseek_v4.py`：
+
+```python
+# vllm/model_executor/models/deepseek_v4.py:L752
+self.gate = GateLinear(
+    config.hidden_size,
+    config.n_routed_experts,
+    out_dtype=torch.float32,
+    bias=False,
+    prefix=f"{prefix}.gate",
+)
+self.gate.e_score_correction_bias = None
+self.gate.tid2eid = None
+is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers
+self.hash_indices_dtype = torch.int64 if self.use_mega_moe else torch.int32
+
+if is_hash_moe:
+    # hash MoE doesn't use e_score_correction_bias …
+    self.gate.tid2eid = nn.Parameter(
+        torch.randint(0, config.n_routed_experts,
+            (config.vocab_size, config.num_experts_per_tok),
+            dtype=self.hash_indices_dtype),
+        requires_grad=False,
+    )
+elif getattr(config, "topk_method", None) == "noaux_tc":
+    self.gate.e_score_correction_bias = nn.Parameter(
+        torch.empty(config.n_routed_experts, dtype=torch.float32),
+        requires_grad=False,
+    )
+
+if config.n_shared_experts is None:
+    self.shared_experts = None
+else:
+    intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+    self.shared_experts = DeepseekV4MLP(
+        hidden_size=config.hidden_size,
+        intermediate_size=intermediate_size,
+        hidden_act=config.hidden_act,
+        swiglu_limit=self.swiglu_limit,
+        quant_config=quant_config,
+        reduce_results=self.use_mega_moe,
+        prefix=f"{prefix}.shared_experts",
+    )
+```
+
+三个零件：
+
+- **`gate`**：一个小线性层，把 `hidden` 投到 `n_routed_experts` 维，输出每个专家的打分（router logits）。它决定每个 token 该去哪几个专家。
+- **`shared_experts`**：注意它的类型是 `DeepseekV4MLP`——就是一条普通的 SwiGLU MLP，**结构和 `LlamaMLP` 同构**。它不参与路由，每个 token 都走。
+- **路由的两种打分模式**：`tid2eid`（hash-MoE，用 `input_ids` 直接查表定专家，所以 §28.1 那个 `input_ids` 参数派上了用场）或 `e_score_correction_bias`（noaux_tc 打分的修正偏置——noaux_tc 即 DeepSeek-V3（arXiv:2412.19437）提出的免辅助损失负载均衡方案：不再靠额外的负载均衡 loss 项，而是给每个专家维护一个可学习/可更新的偏置去修正打分，让路由自然趋于均衡）。hash-MoE 是 V4 特有的一类层，这里点名不深挖。
+
+`shared_experts` 是理解「MoE 对 dense 的 delta」的钥匙。MoE 不是把 dense MLP 一刀切掉换成稀疏路由——它**保留了一条每 token 必走的 dense 路径**。路由专家负责「专才」，共享专家负责「通才」，托住所有 token 的基础能力。所以 V4 的 FFN 准确说是：**稀疏路由专家 + 一条共享 dense**，而不是纯稀疏。这正好回收了第 22 章那条 `LlamaMLP`——它没消失，它变成了 MoE 里的共享专家。
+
+### 28.3.3　forward：gate → top-k → 专家 → 加上共享
+
+看数据流，`vllm/model_executor/models/deepseek_v4.py`：
+
+```python
+# vllm/model_executor/models/deepseek_v4.py:L866
+if not self.use_mega_moe:
+    return self._forward_fused_moe(hidden_states, input_ids)
+
+org_shape = hidden_states.shape
+router_logits, _ = self.gate(hidden_states)
+topk_weights, topk_ids = fused_topk_bias(
+    hidden_states=hidden_states,
+    gating_output=router_logits,
+    scoring_func=self.scoring_func,
+    e_score_correction_bias=self.gate.e_score_correction_bias.data
+    if self.gate.e_score_correction_bias is not None
+    else None,
+    topk=self.n_activated_experts,
+    renormalize=self.renormalize,
+    indices_type=self.hash_indices_dtype,
+    input_tokens=input_ids,
+    hash_indices_table=self.gate.tid2eid,
+    routed_scaling_factor=self.routed_scaling_factor,
+)
+# … 省略：activation_clamp 由 swiglu_limit 决定 …
+final_hidden_states = self.experts(
+    hidden_states, topk_weights, topk_ids,
+    activation_clamp=activation_clamp,
+)
+
+if self.shared_experts is not None:
+    shared_output = self.shared_experts(hidden_states)
+    final_hidden_states += shared_output
+
+return final_hidden_states.view(org_shape)
+```
+
+数据流四步，正好对上图：
+
+1. **`gate`** 出 router logits。
+2. **`fused_topk_bias`** 打分选专家：内部走 sqrtsoftplus（`softplus` 再开方）打分，加上 `e_score_correction_bias` 修正，取 top-k，renormalize（让选中权重和归一），再乘 `routed_scaling_factor`。出 `topk_weights`（每个选中专家的权重）和 `topk_ids`（选了哪几个）。
+3. **`self.experts`** 按选择算路由专家的输出。
+4. **`final_hidden_states += shared_output`**：路由结果加上共享专家——这一行就是「稀疏 + dense」的合流。
+
+第一行那个 `if not self.use_mega_moe` 引出了双后端，单独说。
+
+### 28.3.4　双后端：单 kernel 全专家 vs 张量并行
+
+V4 的专家计算有两条后端，由 `use_mega_moe` 分叉：
+
+![MoE 双后端数据流](../diagrams/ch25-moe-dual-backend.png)
+
+> *图注：gate → `fused_topk_bias` 选完 top-k，按 `use_mega_moe` 分叉两条后端。*
+> *MegaMoE 把全部专家塞进一个 DeepGEMM 算子（EP / FP4 / SM100）；FusedMoE 走张量并行。*
+> *`shared_experts` 那条 dense 始终并行走；两路聚合它的位置不同——mega 在外相加，TP 在 FusedMoE 内部。*
+
+**MegaMoE 路径**（开了 expert parallel + DeepGEMM 后端）把所有路由专家的计算塞进**一个**自定义算子（DeepGEMM 是 DeepSeek 开源的低比特矩阵乘内核库，专为 FP4/FP8 精度和 Hopper/Blackwell SM100 架构优化，能在单次 kernel launch 内处理全部专家的 GEMM）。EP（expert parallel，专家并行）是按专家切——不同 rank 各常驻一部分专家，请求路由到哪个专家就把 token 发到哪个 rank，区别于第 20 章按 head/列切的 TP、按请求切的 DP。`vllm/model_executor/models/deepseek_v4.py`：
+
+```python
+# vllm/model_executor/models/deepseek_v4.py:L602
+def forward(
+    self,
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    activation_clamp: float | None,
+    fast_math: bool = True,
+) -> torch.Tensor:
+    if hidden_states.shape[0] > self.max_num_tokens:
+        raise ValueError(
+            f"DeepSeek V4 MegaMoE got {hidden_states.shape[0]} tokens, "
+            f"but the symmetric buffer was sized for {self.max_num_tokens}."
+        )
+    y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
+    torch.ops.vllm.deepseek_v4_mega_moe_experts(
+        hidden_states, topk_weights, topk_ids, y,
+        self.prefix, activation_clamp, fast_math,
+    )
+    return y
+```
+
+这就是算子边界。注意这里**没有 for 循环逐个跑专家**——一个 `torch.ops.vllm.deepseek_v4_mega_moe_experts` 调用，DeepGEMM 在 kernel 内部把全部专家一次算完（需要对称缓冲、FP4/FP8 权重、SM100 硬件）。它的内部 scale 布局、staging kernel 是 DeepGEMM/FusedMoE 专章的事，本章只读到这条算子边界，知道「单 kernel 全专家」这个事实即可。
+
+**FusedMoE 路径**（`_forward_fused_moe`，没开 EP 时）走张量并行的 `FusedMoE`，它内部就把 `shared_experts` 一起聚合了。所以两条后端有个微妙差异：mega 路径在 forward 里**外部**手动 `+= shared_output`（上面那行），TP 路径则在 `FusedMoE` **内部**聚合。聚合的位置不同，但语义一致——路由 + 共享。FusedMoE 后端的细节本章不深挖；专家并行的扩缩容协调见[第 37 章的弹性专家并行](../../ch37-engine-core/narrative/chapter.md)。
+
+FFN delta 讲完。第三摞 delta 在残差里，是 V4 最不像 Llama 的地方。
+
+---
+
+## 28.4　Delta 三：add-norm → hc 多流残差
+
+### 28.4.1　从一条残差流变成 hc_mult 条
+
+回到 §28.1：Llama 全模型就**一条**残差流，layernorm 顺手加回。V4 把它彻底换掉了，换成 Hybrid-Computation（简称 hc）——一套**多流**残差。
+
+源头在主模型 forward，`vllm/model_executor/models/deepseek_v4.py`：
+
+```python
+# vllm/model_executor/models/deepseek_v4.py:L1394
+hidden_states = self.embed_input_ids(input_ids)
+hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+if self.use_mega_moe:
+    input_ids = input_ids.to(torch.int64)
+for layer in islice(self.layers, self.start_layer, self.end_layer):
+    hidden_states = layer(
+        hidden_states,
+        positions,
+        input_ids,
+    )
+
+# Stash pre-hc_head residual for the MTP draft (captured copy_).
+num_tokens = hidden_states.shape[0]
+self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+
+hidden_states = hc_head(
+    hidden_states,
+    self.hc_head_fn,
+    self.hc_head_scale,
+    self.hc_head_base,
+    self.rms_norm_eps,
+    self.hc_eps,
+)
+hidden_states = self.norm(hidden_states)
+return hidden_states
+```
+
+关键就第二行：`hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)`。embedding 出来本是 `[T, hidden]`，这里 unsqueeze 加一维、repeat 成 `[T, hc_mult, hidden]`——**一条流复制成 `hc_mult` 条平行残差流**，一起穿过所有层。
+
+回头看 §28.1 那个 `DeepseekV4DecoderLayer.forward`：每层用 `hc_pre`（前处理）和 `hc_post`（后处理）包住 attn 和 ffn。`hc_pre` 返回三元组 `(x, post, comb)`——`x` 是本段（attn 或 ffn）的输入张量，`post` 和 `comb` 是 `hc_pre` 内部学习的门控信息（混合系数与残差组合参数），被原封不动传给 `hc_post`，让 `hc_post` 知道该如何把本段的输出写回多条残差流。Llama 的 layernorm 是固定的「加回上一段输出」，而 hc 在 `hc_mult` 条流之间做**学习式的门控混合**——`hc_attn_fn`/`hc_attn_scale`/`hc_attn_base` 这些都是可学习参数。这套混合的内核（`torch.ops.vllm.mhc_pre`/`mhc_post`，含 Sinkhorn 归一——一种反复对矩阵的行、列交替做归一化、使其收敛为「每行每列都和为 1」的双随机矩阵的迭代算法，这里用来让 `hc_mult` 条流之间的门控权重更均衡，和下面 §28.4.2 `hc_head` 用的 sigmoid 门控是两种不同的混合算法）是 GPU-only 的，本章只读它在残差骨架里的位置——它**取代了 Llama 的 `input_layernorm`/`post_attention_layernorm`**。
+
+直觉上，Llama 的 add-norm 是「一条信息高速路，每层上下匝道」；hc 是「`hc_mult` 条平行车道，每层之间可以学习着变道、并道」。表达力更强，代价是 hidden 翻了 `hc_mult` 倍的显存和算力——典型的「容量换资源」。
+
+> **v0.21.0 更新**：上面这版 `forward` 把每层写成「`hc_pre` → attn → `hc_post`」「`hc_pre` → ffn → `hc_post`」四段独立调用，读起来最清楚。新版做了算子融合：把**上一层的 `hc_post` 与本层的 `hc_pre` 合并成一个自定义算子** `torch.ops.vllm.mhc_fused_post_pre`，于是 `DeepseekV4DecoderLayer.forward` 不再每层自闭收口，而是在层间流水一个 `(residual, post_mix, res_mix)` 三元组——只有第一层单独跑 `hc_pre`，最后一层的 `hc_post` 被提到 `DeepseekV4Model.forward` 末尾统一收口；前面纯 PyTorch 的 `hc_head` 也整体落进 `torch.ops.vllm.hc_head_fused_kernel`。语义不变（仍是同一套 RMSNorm + sigmoid 门控的多流合并），只是读者看到的不再是逐行可读的张量算子，而是一次 kernel 调用——把它理解成「融合算子 = 原四步的等价合并」即可，上面的数学推导依然成立。
+
+### 28.4.2　hc_head：把多流压回单流
+
+`hc_mult` 条流穿过所有层后，总得压回一条，才能喂给最终的 `norm` 和 `lm_head`。干这活的是 `hc_head`，`vllm/model_executor/models/deepseek_v4.py`：
 
 ```python
 # vllm/model_executor/models/deepseek_v4.py:L1552
@@ -405,134 +543,189 @@ def hc_head(
     x = hidden_states
     shape, dtype = x.size(), x.dtype
     x = x.flatten(1).float()
-    # … 省略：rsqrt / sigmoid 门控的数学细节 …
+    rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + rms_norm_eps)
+    mixes = F.linear(x, hc_fn) * rsqrt
+    pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps
     y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
     return y.to(dtype)
 ```
 
-这页一次给了三个画图判据。其一，顶上的 `@torch.compile(backend=...)` 装饰器就是编译边界——画图时用虚线容器把它圈出来，标「编译区」。装饰器位置即编译边界，这是客观的。和它对照的是类级装饰器 `@support_torch_compile`，它顶在 `DeepseekV4Model` 上（`vllm/model_executor/models/deepseek_v4.py:L1255`），把整个主干圈成一个大编译区。一个是函数级编译、一个是类级编译，判据是同一条：**看装饰器圈编译区。**
+这个函数是纯 PyTorch，可以逐行读懂——它是整套 hc 机制里唯一不靠 GPU 自定义算子的部分，正好让我们看清「门控混合」长什么样：
 
-其二，`hc_head` 是个**函数，不是 `nn.Module`**——可它照样是图里一个框。这破除一个误解：图里的框不一定都是子模块，前向路径上一个被调用的编译函数也算一个框。
+1. `x.flatten(1).float()`：把 `[T, hc_mult, hidden]` 摊平成 `[T, hc_mult*hidden]`，升 fp32 算精度。
+2. `rsqrt = rsqrt(mean(x²) + eps)`：算 RMSNorm 的缩放因子（均方根的倒数）。
+3. `mixes = F.linear(x, hc_fn) * rsqrt`：过一个学习的线性层 `hc_fn`，再乘归一因子——得到每条流的混合打分。
+4. `pre = sigmoid(mixes * hc_scale + hc_base) + eps`：sigmoid 门控，`hc_scale`/`hc_base` 是学习的缩放和偏置。`pre` 就是每条流的权重。
+5. `y = sum(pre * x, dim=1)`：按权重对 `hc_mult` 条流加权求和，压回 `[T, hidden]`。
 
-其三，内部 `x.flatten(1)` → `x.view(shape)` → `torch.sum(..., dim=1)` 这串，就是把 `[T, hc_mult, H]` 坍缩回 `[T, H]` 的形状变化——标在「压回单流」那条边上，和 §28.4 开头那次 `repeat` 展开首尾呼应。
+一句话归纳它的正确性骨架：第 2 步的 `rsqrt` 永远作用在「`mean(x²)+eps`」上，`eps > 0` 保证开方非零、不会除零；第 4 步 sigmoid 的输出落在 `(0,1)`，加 `hc_eps` 后严格为正——所以每条流的权重 `pre` 恒正，第 5 步是一个**带正权重的线性组合**（每条流系数恒正，但**不归一**，权重和不保证为 1，故并非严格的凸组合），数值稳定、不会把某条流的信息算成负贡献抹掉。要拿到严格凸组合还需再对 `pre` 除以 `sum(pre)` 归一，源码此处没做——尺度交给后续 `norm` 吸收。这就是「门控混合」既灵活又不失稳的根。
 
-**判据三：并行类名 + `FusedMoE` + aux CUDA stream，是并行/通信子系统。** §28.3 已经用类名给 MLA 投影上了色（`Column`/`Row`/`Merged ParallelLinear`）。同一条判据在 MoE 里还要再用一次，下一节展开。`DeepseekV4Model.__init__` 里那行 `aux_stream_list = [torch.cuda.Stream() for _ in range(3)]` 则标出了辅助 CUDA 流这个并行子系统——aux stream 本身代表独立的 GPU 执行队列，看到它被创建并传给子模块，就说明这里有算子要在主流之外异步并发执行（三条 aux 流让注意力里的几个输入 GEMM 并行跑）。
+光读符号还是抽象，跟着一个玩具张量把形状和数值追到底最踏实。取 `T=2`、`hidden=4`、`hc_mult=2`，输入是 `[2, 2, 4]`（2 个 token、各 2 条流、每流 4 维），逐步走一遍这五行：
 
-三条判据合起来，每一种着色都能指回源码的一个装饰器、一个类名、或一个 `torch.ops` 前缀。把它们叠到 §28.4 的数据流图上：
+| 行 | 动作 | 形状演变 | 数值（取 token 0） |
+|---|---|---|---|
+| 1 | `x.flatten(1).float()` | `[2,2,4]` → `[2,8]` | 两条流摊平成一行 8 维 |
+| 2 | `rsqrt(mean(x²)+eps)` | `[2,8]` → `[2,1]` | 设 `mean(x²)=4`、`eps≈0` → `rsqrt≈1/2=0.5`（标量） |
+| 3 | `F.linear(x, hc_fn)*rsqrt` | `[2,8]` → `[2,2]` | 线性层出 2 个混合打分，再乘 0.5 |
+| 4 | `sigmoid(·*scale+base)+eps` | `[2,2]` → `[2,2]` | 比如得两条流权重 `pre=[0.6, 0.5]`——注意 `0.6+0.5=1.1≠1`，正印证「不归一、非凸组合」 |
+| 5 | `sum(pre·x.view(shape), dim=1)` | `pre` 升维 `[2,2,1]` 广播乘 `[2,2,4]` → 沿流维求和 → `[2,4]` | 两条流按 0.6/0.5 加权求和，压回 `[2,4]`=`[T,hidden]` |
 
-![P2+P3：读 forward 出主干数据流 + 子系统着色](../diagrams/forward-dataflow.png)
+最后输出形状 `[2,4]` 正好回到 `[T, hidden]`——`hc_mult` 这一维被加权求和吃掉了。这一遍也把上面那句「权重不归一」坐实了：`0.6+0.5=1.1`，输出尺度可以 >1× 单流，全靠后续 `norm` 把尺度拉回来。
 
-> *图注：主干自上而下——`embed` → `repeat` 展开成 `[T,hc_mult,H]` → 逐层（`hc_pre`→`attn_norm`→`attn`→`hc_post`，再 `hc_pre`→`ffn_norm`→`ffn`→`hc_post`，两条 residual 回边在左侧）→ `hc_head` 压回 `[T,H]` → `norm` → `lm_head`。橙色框是 `torch.ops.vllm.mhc_pre/mhc_post` 自定义算子（判据：`torch.ops.vllm.` 前缀）；紫色虚线容器是 `@torch.compile` 编译区（判据：装饰器）；右侧紫色旁路是 `copy_` 去 `_mtp_hidden_buffer`（判据：它是 buffer 不是子模块，进数据流不进树）。这张图就是 P2+P3 的最终产物——每个图元都钉在一行源码上。*
+读到这里，「混合残差」这个第 22 章埋下的 delta 算是收齐了——但它不是教科书里那种简单的两路残差相加。V4 把它升级成了 `hc_mult` 条流的学习式门控混合，`hc_pre`/`hc_post` 管层内、`hc_head` 管收尾。
 
-## 28.6 配置开关怎么读：可选框与双后端分叉
+那 §28.4.1 里 `hc_head` 之前那行 `_mtp_hidden_buffer.copy_(...)` 是干嘛的？那是通往第四摞 delta 的桥。
 
-DeepSeek-V4 的 MoE 比 Llama 的 MLP 多了一层复杂度：它的结构不是固定的，而是**被配置开关决定**的。P1 和 P2 都要处理这种「条件存在」的框。先看 `DeepseekV4MoE.__init__`（`vllm/model_executor/models/deepseek_v4.py:L752-L801`）：
+---
 
-```python
-# vllm/model_executor/models/deepseek_v4.py:L752
-        self.gate = GateLinear(
-            config.hidden_size,
-            config.n_routed_experts,
-            out_dtype=torch.float32,
-            bias=False,
-            prefix=f"{prefix}.gate",
-        )
-        # … 省略：gate 的 e_score_correction_bias / tid2eid 路由细节 …
-        if config.n_shared_experts is None:
-            self.shared_experts = None
-        else:
-            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = DeepseekV4MLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=intermediate_size,
-                # … 省略：hidden_act / swiglu_limit / quant_config …
-                reduce_results=self.use_mega_moe,
-                prefix=f"{prefix}.shared_experts",
-            )
+## 28.5　Delta 四：单 lm_head → 旁挂一个 MTP draft
 
-        if self.use_mega_moe:
-            self._init_mega_moe_experts(vllm_config, config, prefix)
-        else:
-            self._init_fused_moe_experts(config, quant_config, prefix)
-```
+### 28.5.1　_mtp_hidden_buffer：目标模型留给 draft 的隐状态
 
-`self.gate` 是无条件框，照常画。但接下来两个 `if` 是 P1 要专门处理的**配置开关**：
+Llama 末尾就一个 `lm_head`，`compute_logits` 出一个 token 的分布。V4 在这之外旁挂了一个 **MTP（Multi-Token Prediction，多 token 预测，作为训练目标由 DeepSeek-V3 提出，arXiv:2412.19437）** draft：训练时它多头预测后面 N 个 token，推理时它当**投机解码的 draft 模型**，一口气猜好几个 token，再由主模型批量验证（投机解码的协议是后面讲投机解码那章的主题，本章只交付 MTP 这个 draft 的接口）。
 
-- `if config.n_shared_experts is None:` —— `shared_experts` 是**可选框**。配置里没共享专家就是 `None`（不画），否则是一个 `DeepseekV4MLP`（画）。这种框在图上要标成「条件存在」，用区别于常驻框的样式。
-- `if self.use_mega_moe:` —— 走 `_init_mega_moe_experts` 还是 `_init_fused_moe_experts`，二选一。它们各自 new 出 `DeepseekV4MegaMoEExperts` 或 `FusedMoE`，是**互斥的双后端**。图上画成一个菱形分叉：两条路只走一条。
-
-**规则：`__init__` 里的 `if` 决定图里的可选框 / 互斥框。** 不是所有框都常驻——有的框存不存在、走哪个，取决于配置。
-
-这种分叉在 `forward` 里也有对应。看 `DeepseekV4MoE.forward`（`vllm/model_executor/models/deepseek_v4.py:L860-L899`）：
+draft 要工作，得拿到主模型的隐状态。但拿哪个版本？回看 §28.4.1：主模型在 **`hc_head` 之前**（即多流还没压回单流时）就 `copy_` 了一份到 `_mtp_hidden_buffer`：
 
 ```python
-# vllm/model_executor/models/deepseek_v4.py:L860
-        if not self.use_mega_moe:
-            return self._forward_fused_moe(hidden_states, input_ids)
-
-        org_shape = hidden_states.shape
-        router_logits, _ = self.gate(hidden_states)
-        topk_weights, topk_ids = fused_topk_bias(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            # … 省略：scoring_func / e_score_correction_bias / hash 路由参数 …
-            topk=self.n_activated_experts,
-        )
-        # … 省略：activation_clamp 取值 …
-        final_hidden_states = self.experts(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            activation_clamp=activation_clamp,
-        )
-
-        if self.shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
-            final_hidden_states += shared_output
-
-        return final_hidden_states.view(org_shape)
+# Stash pre-hc_head residual for the MTP draft (captured copy_).
+num_tokens = hidden_states.shape[0]
+self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 ```
 
-P2 在这里读出两件事：
+留的是 **pre-hc_head 残差**——`hc_mult` 条流压回单流之前的完整多流状态，摊平成 `[T, hc_mult*hidden]`。为什么留压回之前的？因为 draft 自己也是个完整的 V4 解码层，它需要多流形态的输入，不是压扁后的单流。`_mtp_hidden_buffer` 就是目标模型和 draft 之间传递这份隐状态的桥。`DeepseekV4ForCausalLM` 通过 `get_mtp_target_hidden_states` 把这个 buffer 暴露出去，供 draft 取用。
 
-**一、`if not self.use_mega_moe: return ...` 是一个早退分叉。** 数据流到这里劈成两路：非 mega 走 `_forward_fused_moe` 直接返回，mega 走下面的主体。这就是 §28.6 那个互斥菱形在数据流图上的体现——`if`/`return` 早退 → 图里的分支。
+### 28.5.2　draft 怎么融合两路信号
 
-**二、`+= shared_output` 是一条旁路汇入边。** mega 路径里，主路是 `gate` → `fused_topk_bias` → `experts`，算出 `final_hidden_states`。然后 `if self.shared_experts is not None:`（呼应 `__init__` 里那个可选框）算一份 `shared_output`，用 `final_hidden_states += shared_output` 加回主路。这个 `+=` 就是一条从共享专家旁路汇入主干的边。
+MTP draft 单层的 forward，`vllm/model_executor/models/deepseek_v4_mtp.py`：
 
-读这两个 `forward` 分支时有个细节值得记下来：mega 路径里 `shared_experts` 的输出是在这里显式 `+=` 汇入的，但 TP 路径 `_forward_fused_moe` 里，`FusedMoE` 内部已经把 `shared_experts` 聚合掉了——两条路的「共享专家汇入点」位置不同。画图时这点要标注，不能想当然画成一处。**这正是「读 `forward` 出边」必须老老实实顺着每个分支读、不能凭印象的原因。**
+```python
+# vllm/model_executor/models/deepseek_v4_mtp.py:L122
+def forward(
+    self,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    previous_hidden_states: torch.Tensor,
+    inputs_embeds: torch.Tensor | None = None,
+    spec_step_index: int = 0,
+) -> torch.Tensor:
+    assert inputs_embeds is not None
+    # masking inputs at position 0, as not needed by MTP
+    inputs_embeds = torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)
+    inputs_embeds = self.enorm(inputs_embeds)
 
-## 28.7 P4 与验证：把图钉死在源码上
+    # Target stashes pre-hc_head residual as flat (T, hc_mult * D);
+    # reshape to (T, hc_mult, D) — the training-time layout.
+    previous_hidden_states = previous_hidden_states.view(
+        -1, self.hc_mult, self.config.hidden_size
+    )
+    previous_hidden_states = self.hnorm(previous_hidden_states)
+    hidden_states = self.h_proj(previous_hidden_states) + self.e_proj(
+        inputs_embeds
+    ).unsqueeze(-2)
+    hidden_states = self.mtp_block(
+        positions=positions, x=hidden_states, input_ids=None
+    )
+    # Return the flat pre-hc_head residual so it can be re-fed as the
+    # next spec step's `previous_hidden_states` …
+    return hidden_states.flatten(1)
+```
 
-前三步已经把图的内容定下来了：P1 出框、P2 出边、P3 出着色。P4 只是渲染——但渲染工具的选择本身也是有讲究的。
+draft 融合**两路信号**：
 
-模块树加数据流，是一张 dense 的多元素图：嵌套容器要精确对齐、多对多的连边要不打架、形状标注要贴在正确的边上。这种图，Mermaid 的自动布局会把节点缠成一团，Excalidraw 的手工坐标又总会错位。所以本章这几张图都用 svg-diagram 工具渲染：Python 脚本用循环算出每个坐标（零手填坐标）→ 生成 SVG → `xmllint` 校验是合法 XML → `rsvg-convert` 转成 PNG（它会自动为中文字形做字体回退，排版才不乱）。
+- **路 a，下一个 token 的 embedding**：`inputs_embeds` 经 `enorm` 归一、`e_proj` 投影。这是 draft 要预测的位置的输入。
+- **路 b，目标模型的隐状态**：`previous_hidden_states`（就是 `_mtp_hidden_buffer` 取回的那份 pre-hc_head 残差）reshape 回 `[T, hc_mult, hidden]` 多流形态，经 `hnorm` 归一、`h_proj` 投影。
 
-但 P4 不是终点。真正让这套程序「可审计」的，是最后那条**验证回边**——画完之后，拿图逐元素对回源码核一遍。判据三条，对应本章一路下来的三步：
+两路投影相加（`h_proj(...) + e_proj(...).unsqueeze(-2)`），喂进 `mtp_block`——注意这个 `mtp_block` 就是一个**复用的 `DeepseekV4DecoderLayer`**，和主模型的层一模一样的 hc_pre/attn/hc_post/ffn 结构。跑完输出又是一份 pre-hc_head 残差（`flatten(1)` 摊平返回），可以再喂回去当下一步的 `previous_hidden_states`——这样 `num_speculative_tokens > 1` 时能多步串联，一次猜好几个 token。
 
-- 每个**框**，能指到一条 `self.X = Module` 赋值（P1），或一个 `@decorator` / `torch.ops` 调用（P3 里那些非子模块的框）。
-- 每条**边**，能指到一句 `forward` 里的赋值（P2）。
-- 每种**着色**，能指到一个装饰器、一个类名、或一个 `torch.ops` 前缀（P3）。
+注意它**没**在这里调 `hc_head`——压回单流被推迟了。draft 的 `compute_logits` 才补上 `hc_head`，再过 shared_head 出 draft logits。这和主模型的收尾对称：都是「pre-hc_head 残差 → hc_head 压回 → 出 logits」，draft 只是把 `hc_head` 挪到了出 logits 那一刻。`hc_head` 被主模型和 draft 共用，又一次印证它是 hc 机制的收尾真身。
 
-一张图**忠实**，当且仅当：(a) 每个框都能这样溯源；(b) 每条边都能这样溯源；(c) 没有源码里不存在的框或边。这三条把「这张图画对了吗」从一句主观感叹，变成了一道可机械核对的命题——逐个图元过一遍，**指不回源码的图元就是杜撰，删掉。**
+> **v0.21.0 更新**：上面 `mtp_block(...)` 在新版里要接住主干层吐出的那个 `(hidden_states, residual, post_mix, res_mix)` 四元组——因为 `DeepseekV4DecoderLayer.forward` 经融合后不再层内自闭 `hc_post`（见 §28.4.1 的更新框）。`DeepSeekV4MultiTokenPredictorLayer.forward` 于是改成 `hidden_states, residual, post_mix, res_mix = self.mtp_block(...)`，再显式 `self.mtp_block.hc_post(hidden_states, residual, post_mix, res_mix)` 自己收口。语义与上面一致（draft 仍复用主干 decoder 层、`hc_head` 延后到 `compute_logits`），只是为对齐融合算子的新接口做了连带改写。
 
-这里还藏着一个让架构图额外好用的事实。那条 `prefix=f"{prefix}.<name>"` 链，让模块树的层级路径恰好等于 checkpoint 里的权重名前缀：`model.layers.0.attn.fused_wqa_wkv...`。所以这张图不光是讲解用的——加载权重报错、对照张量名调试时，看到的名字和图上的层级标签一字不差，**架构图可以直接当 debug 索引用。**
+下面这张图把 hc 多流和 MTP 桥的全貌串起来：
 
-## 28.8 这套程序为什么对任何 vLLM 模型都成立
+![hc 多流残差与 MTP 桥](../diagrams/ch25-hc-residual-and-mtp.png)
 
-回头看走过的路：在 Llama 上跑了 P1+P2，在 DeepSeek-V4 上跑了完整的 P1→P2→P3→P4。两次用的是**完全相同的动作**：
+> *图注：上半是目标模型——embed `repeat(hc_mult)` 成多流，逐层穿过，末尾分两路：`copy_` 进 `_mtp_hidden_buffer`、`hc_head` 压回单流出 logits。*
+> *下半是 MTP draft——取 buffer 的目标残差 + 下一 token embedding，两路归一投影后融合，复用一个 DecoderLayer，出新残差，`compute_logits` 补 `hc_head`。*
+> *红色那条虚线就是 `_mtp_hidden_buffer` 这座桥。*
 
-| 步骤 | 动作 | 源码判据 | Llama | DeepSeek-V4 |
-| --- | --- | --- | --- | --- |
-| P1 | 数 `self.X =` 出框 | `self.<name> = Module(...)` | 4 个框 | 几十个框，多层嵌套 |
-| P1 | 堆叠层画 `× N` | `make_layers` / `ModuleList` | 上层有 | `make_layers(DecoderLayer)` |
-| P2 | 顺序连有向边 | `x = self.<child>(x)` | 直链 | 含分叉/旁路/残差 |
-| P2 | 形状标在边上 | `unsqueeze/repeat/view/flatten` | 无 | `[T,H]↔[T,hc_mult,H]` |
-| P3 | 着色子系统 | `torch.ops.vllm.*` / `@torch.compile` / 并行类名 | 并行类名 | 三类判据全用上 |
+四摞 delta 到这里全部讲完。剩下一件第 22 章欠的账：量化。
 
-差别全在「框多少、边多绕」，**动作和判据一个没变。**
+---
 
-为什么必然如此？因为 vLLM 的每个模型都是 `nn.Module`，而 `nn.Module` 的契约是死的：`__init__` 建子模块、`forward` 定调用序。只要这个契约成立——它对 `vllm/model_executor/models/llama.py`、`vllm/model_executor/models/deepseek_v4.py` 乃至该目录下所有模型都成立——「`__init__` → 模块树、`forward` → 数据流」这个映射就成立。不同模型只是子模块多寡、调用图繁简的差异，程序的步骤一步不改。
+## 28.6　收尾 delta：FP8 量化与 e8m0fnu 字节装载
 
-这就是把一个 worked example 升格成「方法」的依据。你下次拿到 `vllm/model_executor/models/` 里任意一个陌生模型文件，不必从头读懂它的算法——先翻 `*ForCausalLM` 的 `__init__` 数框、翻 `forward` 连边、按三条判据着色，一张可溯源、可当 debug 索引的架构图就出来了。读代码画图，是一项可迁移的手艺，不绑定 DeepSeek-V4。
+第 22 章把 Llama 当基线时，特意点了它「没有量化压缩」。V4 不一样——它的 checkpoint **永远是 FP8 块量化**的，连专家权重还可能是 MXFP4（4-bit）。这件事在权重装载时会咬人。
 
-下一章我们离开模型本体，去看 `hidden_states` 出了 `lm_head` 之后的事——logits 怎么变成一个真正被采样出来的 token。
+看 `DeepseekV4Model.load_weights` 里专家权重那段，`vllm/model_executor/models/deepseek_v4.py`：
+
+```python
+# vllm/model_executor/models/deepseek_v4.py:L1475
+if ".experts." in name:
+    # E8M0 scales are stored as float8_e8m0fnu in
+    # checkpoints but the MoE param is uint8. copy_()
+    # would do a numeric conversion (e.g. 2^-7 → 0),
+    # destroying the raw exponent bytes.
+    if (
+        "weight_scale" in name
+        and loaded_weight.dtype == torch.float8_e8m0fnu
+    ):
+        loaded_weight = loaded_weight.view(torch.uint8)
+    for mapping in expert_mapping:
+        param_name, weight_name, expert_id, shard_id = mapping
+        if weight_name not in name:
+            continue
+        name_mapped = name.replace(weight_name, param_name)
+        param = params_dict[name_mapped]
+        weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
+        success = weight_loader(
+            param, loaded_weight, name_mapped,
+            shard_id=shard_id, expert_id=expert_id,
+            return_success=True,
+        )
+        if success:
+            name = name_mapped
+            break
+    loaded_params.add(name_mapped)
+    continue
+elif "attn_sink" in name:
+    narrow_weight = loaded_weight[head_rank_start:head_rank_end]
+    n = narrow_weight.shape[0]
+    params_dict[name][:n].copy_(narrow_weight)
+    loaded_params.add(name)
+    continue
+```
+
+三个装载特例，每个都对应一个 delta：
+
+1. **e8m0fnu 必须 `view(uint8)` 装入**（最微妙）：MXFP4 的量化 scale 存成 `float8_e8m0fnu`（e8m0：8 位纯指数、0 尾数的块 scale 编码，[量化数学那一章](../../ch26-primer-quantization/narrative/chapter.md)推过它怎么被 `exp2∘ceil∘log2` 取整成 2 的幂），但模型里那个参数是 `uint8`。如果直接 `copy_`，PyTorch 会做**数值转换**——把 `e8m0fnu` 当浮点数解释、再转成 uint8，比如 `2^-7` 会被算成 0，指数字节全毁。正确做法是 `view(torch.uint8)`：不动底层字节，只换个类型解释。注释里 `2^-7 → 0` 就是真实会发生的灾难。这是「量化作为 delta」最具体的一处工程坑——量化权重的字节得当原始字节搬，不能当数字搬。
+
+2. **专家走 `expert_mapping` 多副本装载**：一个 checkpoint 里的专家权重名要映射到模型里切好的多个专家参数上，靠 `weight_loader` 带着 `expert_id`/`shard_id` 装。
+
+3. **`attn_sink` 按 TP head 区间切**：sink 是每个注意力 head 挂的一个可学习标量，相当于给 softmax 分母里多塞一项「不指向任何 token」的项，用来稳定长序列下的注意力分布；初始化成 -inf 是因为它要过 softmax 的指数变换，-inf 对应初始贡献为 0，训练中再学出实际大小。V4 注意力的 sink 参数（padded 到 head 数、初始化 -inf）要按当前 rank 负责的 head 区间 `[head_rank_start:head_rank_end]` narrow 后装入。
+
+这三个特例就是 Llama 装载逻辑里没有的东西。`DeepseekV4FP8Config` 还会按 `expert_dtype` 惰性解析专家用 MXFP4 还是块 FP8，决定 scale 是 e8m0 还是 float32——配置层的分发样板这里不展开，记住「V4 强制量化、专家可 4-bit、scale 字节得原样搬」即可。
+
+到此，第 22 章埋下的四样「刻意缺失」——MoE、MLA、量化压缩、混合残差——全部作为对 Llama 的 delta 回收完毕。
+
+---
+
+## 28.7　把四摞 delta 合起来看
+
+读完一整个 DeepSeek-V4，回头看那张 delta-stack 图，应该有底气说出每个箭头背后是什么了：
+
+| delta | Llama 基线 | V4 的替换 | 它省/换的是 |
+|---|---|---|---|
+| 注意力 | `qkv_proj` + `o_proj` 全量 MHA | MLA：`fused_wqa_wkv`/`wq_b` 低秩、`wo_a`/`wo_b` 输出也低秩、解耦 RoPE | KV cache 显存 |
+| FFN | `LlamaMLP` 单 dense | MoE：`gate` 路由 top-k routed + `shared_experts` 共享 dense + 双后端 | 每 token 算力（容量换 FLOPs 不变） |
+| 残差 | layernorm 融合 add-norm，一条流 | hc：`repeat(hc_mult)` 多流、`hc_pre`/`hc_post` 层内混合、`hc_head` 压回 | 表达力（换显存/算力） |
+| 解码头 | 单 `lm_head` | + MTP draft：经 `_mtp_hidden_buffer` 融合目标残差与下一 token embedding | 解码吞吐（投机解码） |
+| 数值 | bf16 | 强制 FP8 块量化、专家 MXFP4、e8m0fnu 字节装载 | 权重/激活显存 |
+
+但更要紧的是那个没变的东西：**骨架**。embedding → N 层 decoder block（每层 attn 段 + ffn 段）→ 末尾 norm → lm_head。这条主线，从第 22 章的 Llama 到本章的 DeepSeek-V4，一字没动。V4 再复杂，也是在这条主线的每个槽位上换零件：attn 槽换成 MLA、ffn 槽换成 MoE、残差换成 hc、出口旁挂 MTP。
+
+这就是读复杂模型的方法论——**先认骨架，再认 delta**。任何一个新模型摆到你面前，先去找它的 decoder layer 的 `forward`（V4 的在 `vllm/model_executor/models/deepseek_v4.py:L1201`，Llama 的在 `vllm/model_executor/models/llama.py:L316`），并排对照第 22 章那份契约，看它在哪几个槽位上动了手脚。理解了 Llama 那份最简契约，再难的模型也只是它身上叠的一摞 delta。
+
+> **v0.21.0 更新**：这条骨架在新版里多了一处「按 rank 裁剪」。`DeepseekV4ForCausalLM` 现在实现 `SupportsPP`，构造时按 `get_pp_group().is_first_rank / is_last_rank` 把 `embed_tokens`、`norm`、`lm_head`、`_mtp_hidden_buffer` 这些首尾零件替换成占位的 `PPMissingLayer()`——非首 rank 不建 embedding、非末 rank 不建 norm/lm_head，权重装载也用 `is_pp_missing_parameter(...)` 跳过本 rank 不拥有的参数。也就是说，整条 embed → N 层 → norm → lm_head 的主线被沿流水线并行（PP）切成几段、分摊到不同 rank 上；段与段之间靠 `make_empty_intermediate_tensors` 约定的多流隐状态（形状 `(num_tokens, hc_mult, hidden_size)`，即 hc 多流也跨 rank 传递）在边界交接。骨架的**逻辑**仍是这一条，只是物理上被拆到了多卡——这条跨 rank 的数据流交接，正是[下一章](../../ch29-model-architecture/narrative/chapter.md)在数据流层面要补的那个 PP 切分点。
+
+下一章我们换个视角：从「读模型代码」到「画模型架构图」，把这套阅读方法变成一套可复用的工序。而 MTP 这个 draft 到底怎么被投机解码驱动、怎么和主模型批量验证，会在后面讲投机解码的那一章里接上——本章交付的 `get_mtp_target_hidden_states` 和那座 `_mtp_hidden_buffer` 桥，就是那一章的入口。

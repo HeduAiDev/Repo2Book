@@ -13,7 +13,7 @@
 
 打开之后会发现：vLLM 的模型代码，和你在 HuggingFace `transformers` 里见过的 Llama 长得**很像**，又**很不一样**。像，是因为它就是标准的 decoder-only transformer——embedding、N 层 block、末尾 norm。不一样，是因为每一处都为「多卡推理」和「高效装载」改造过：三个投影 fuse 成一个、线性层自带张量并行切分、注意力收口成一个对后端无感的封装、权重从磁盘流式切进各卡。
 
-为什么挑 Llama？因为它是**最简基线**。没有专家混合（MoE），没有潜在瓶颈（MLA），没有量化压缩，没有混合残差。后面 [第 27 章读 DeepSeek-V4](../../ch27-model-architecture/narrative/chapter.md) 时，会把每一个新增结构都当作「对 Llama 的 delta」引入。所以这一章不只是讲 Llama——是在**确立一份契约**，让所有 vLLM v1 模型都照着它长。
+为什么挑 Llama？因为它是**最简基线**。没有专家混合（MoE），没有潜在瓶颈（MLA），没有量化压缩，没有混合残差。后面 [第 29 章读 DeepSeek-V4](../../ch29-model-architecture/narrative/chapter.md) 时，会把每一个新增结构都当作「对 Llama 的 delta」引入。所以这一章不只是讲 Llama——是在**确立一份契约**，让所有 vLLM v1 模型都照着它长。
 
 四条主线：
 
@@ -614,7 +614,7 @@ def forward(
     return output
 ```
 
-五行：列并行出 fused qkv → split 成 q/k/v → 旋转位置编码（RoPE：按 token 的绝对位置对 q/k 做一次确定性旋转，使两者点积只依赖相对位置差；细节见[第 27 章「解耦 RoPE」](../../ch27-model-architecture/narrative/chapter.md)）→ `self.attn(q, k, v)` → 行并行 + all_reduce。整个注意力的**复杂度**——选哪个后端（FlashAttention？Triton？）、KV cache 怎么读写、要不要量化——全被那一行 `self.attn(q, k, v)` 吞掉了。
+五行：列并行出 fused qkv → split 成 q/k/v → 旋转位置编码（RoPE：按 token 的绝对位置对 q/k 做一次确定性旋转，使两者点积只依赖相对位置差；细节见[第 29 章「解耦 RoPE」](../../ch29-model-architecture/narrative/chapter.md)）→ `self.attn(q, k, v)` → 行并行 + all_reduce。整个注意力的**复杂度**——选哪个后端（FlashAttention？Triton？）、KV cache 怎么读写、要不要量化——全被那一行 `self.attn(q, k, v)` 吞掉了。
 
 `self.attn` 是 `Attention` 实例。看它的类 docstring（`vllm/model_executor/layers/attention/attention.py:L177`），职责写得明明白白：
 
@@ -703,6 +703,6 @@ assert out2.shape == (seq, cfg.hidden_size)
 - **三段式装载**：建空壳 → 流式切填（`stacked_params_mapping` 重命名 + `shard_id` offset + rank narrow，一步完成 fuse + TP 切分）→ 后处理。
 - **`Attention` 封装**：吸收后端选择和 KV cache，模型定义对后端无感——多模型 × 多后端的解耦点。
 
-最重要的是记住 Llama **缺**了什么：没有 MoE、没有 MLA、没有量化压缩、没有混合残差。这些「缺」是刻意的留白。[第 27 章读 DeepSeek-V4](../../ch27-model-architecture/narrative/chapter.md) 时，每一个新增结构都会作为「对 Llama 的 delta」引入——你会看到，理解了这份最简契约，再难的模型也只是在它上面叠加。
+最重要的是记住 Llama **缺**了什么：没有 MoE、没有 MLA、没有量化压缩、没有混合残差。这些「缺」是刻意的留白。[第 29 章读 DeepSeek-V4](../../ch29-model-architecture/narrative/chapter.md) 时，每一个新增结构都会作为「对 Llama 的 delta」引入——你会看到，理解了这份最简契约，再难的模型也只是在它上面叠加。
 
 而那行被一笔吞掉的 `self.attn(q, k, v)`，以及让它进 `torch.compile` 图的自定义算子，是[下一章](../../ch23-custom-ops-and-compilation/narrative/chapter.md)的事。

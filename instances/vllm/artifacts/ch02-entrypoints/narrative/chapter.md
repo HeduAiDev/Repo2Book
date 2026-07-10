@@ -62,7 +62,7 @@ generator = self.engine_client.generate(
 )
 ```
 
-注意 `engine_input` 这个名字——它是**已经渲染好**的引擎输入。从一堆聊天消息（`messages`）到这个 `engine_input`，中间隔着一层 chat template 套用 + 分词的「渲染」工序。这层渲染本身是一个专题，本章不展开，细节见 [第 35 章](../../ch35-entrypoints/narrative/chapter.md)；你只要知道：HTTP 请求走到这一行时，消息已经变成了引擎认得的输入，接下来 `engine_client.generate(...)` 拿到的是一个异步生成器，后面 `async for` 它、把每一片吐成 SSE 回客户端。
+注意 `engine_input` 这个名字——它是**已经渲染好**的引擎输入。从一堆聊天消息（`messages`）到这个 `engine_input`，中间隔着一层 chat template 套用 + 分词的「渲染」工序。这层渲染本身是一个专题，本章不展开，细节见 [第 36 章](../../ch36-entrypoints/narrative/chapter.md)；你只要知道：HTTP 请求走到这一行时，消息已经变成了引擎认得的输入，接下来 `engine_client.generate(...)` 拿到的是一个异步生成器，后面 `async for` 它、把每一片吐成 SSE 回客户端。
 
 这里的 `engine_client` 在生产部署里就是 `AsyncLLM`。**所以无论你走 HTTP 还是别的在线协议，最终都汇到 `AsyncLLM.generate()` 这一个函数**——它就是本章主线的「出口」，我们 [§2.9](#29-出口generate-只消费队列) 会回到它。
 
@@ -243,7 +243,7 @@ def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
 
 1. **`schedule()`**——决定这一拍跑哪些请求、各自跑多少 token。它要在显存预算内塞进尽可能多的请求，是「连续批处理」的大脑。[第 13 章](../../ch13-scheduler/narrative/chapter.md)、[第 14 章](../../ch14-scheduler/narrative/chapter.md) 讲调度与 KV 预算。
 2. **`execute_model()`**——把这一批喂进模型跑前向。注意 `non_block=True`：执行和采样在 v1 里被解耦成两步，执行可以异步。模型执行、持久批次（persistent batch）、输入组装见 [第 17](../../ch17-worker-and-executor/narrative/chapter.md)–[19 章](../../ch19-model-runner/narrative/chapter.md)。
-3. **`sample_tokens()`**——从 logits 采出这一拍每个请求的下一个 token。采样管线见 [第 29 章](../../ch29-sampling/narrative/chapter.md)。
+3. **`sample_tokens()`**——从 logits 采出这一拍每个请求的下一个 token。采样管线见 [第 30 章](../../ch30-sampling/narrative/chapter.md)。
 4. **`update_from_output()`**——把采出的 token 写回各请求状态、判断谁结束了，组装成 `EngineCoreOutputs` 返回。它的内部簿记 [第 14 章](../../ch14-scheduler/narrative/chapter.md) 一并讲。
 
 这里要建立一个关键直觉：**一拍处理的是「一批」请求，不是一个**。同一拍里，可能有刚进来、正在 prefill（吃 prompt）的请求，也有跑了很久、正在 decode（逐 token 吐）的请求，它们被混在一个连续批里一起算——这就是连续批处理（continuous batching）。所以一个用户请求的「一生」会**横跨很多拍**，每拍只往前挪几个 token。[第 11 章](../../ch11-engine-core/narrative/chapter.md) 会从引擎核心和这个 busy loop 整章讲起。
@@ -503,7 +503,7 @@ return sorted(outputs, key=lambda x: int(x.request_id))
 
 但**核心是同一套**：同一个 `EngineCore.step()`（同样的 schedule → execute → sample → update 四步），同一个 `OutputProcessor.process_outputs()`（同样的去 token 化 + 组装），只是被两种不同的方式驱动。离线场景不要并发、不要流式，就用最朴素的同步循环；在线场景要扛并发、要流式，就套上跨进程 + 后台协程那层壳。理解了这一点，你就抓住了 vLLM v1 引擎的骨架——**剩下的每一章，都是在放大这副骨架上的某一块**。
 
-离线 `LLM` 这扇门的完整 API（批量、chat、beam search 等）见 [第 34 章](../../ch34-entrypoints/narrative/chapter.md)；在线 OpenAI 兼容服务器的完整形态见 [第 35 章](../../ch35-entrypoints/narrative/chapter.md)。
+离线 `LLM` 这扇门的完整 API（批量、chat、beam search 等）见 [第 36 章](../../ch36-entrypoints/narrative/chapter.md)；在线 OpenAI 兼容服务器的完整形态见 [第 36 章](../../ch36-entrypoints/narrative/chapter.md)。
 
 ---
 

@@ -334,7 +334,7 @@ assert "R1" in out.scheduled_new_reqs       # 可调度请求照常被拉起
 assert sched.skipped_waiting.peek_request() is blocked  # 阻塞请求被跳过、留在 skipped
 ```
 
-至于这些阻塞态究竟在等什么、`_try_promote_blocked_waiting_request` 在真实 vLLM 里凭什么条件提升——`WAITING_FOR_REMOTE_KVS` 的来龙去脉属于 P/D 分离的范畴，**第 32 章** 会把远程 KV 加载、提升回 `WAITING` 的完整路径接上。本章只需记住：**双队列是为了避免队头阻塞，被跳过的请求会被公平地重排回去等下拍。**
+至于这些阻塞态究竟在等什么、`_try_promote_blocked_waiting_request` 在真实 vLLM 里凭什么条件提升——`WAITING_FOR_REMOTE_KVS` 的来龙去脉属于 P/D 分离的范畴，**第 33 章** 会把远程 KV 加载、提升回 `WAITING` 的完整路径接上。本章只需记住：**双队列是为了避免队头阻塞，被跳过的请求会被公平地重排回去等下拍。**
 
 ---
 

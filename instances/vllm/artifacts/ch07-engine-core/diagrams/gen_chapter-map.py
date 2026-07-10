@@ -2,7 +2,7 @@
 """第 7 章「本章地图」——IPC 边界剖面(client 三层 -> ZMQ socket -> EngineCoreProc)。
 
 改写自 .claude/skills/svg-diagram/references/example-chapter-map.py(直接沿用其
-badge()/cjk_text_width()/入口出口接口桩/主线蓝边)，并参考同书 ch36 的两处扩展手法:
+badge()/cjk_text_width()/入口出口接口桩/主线蓝边)，并参考同书 ch37 的两处扩展手法:
 多个 § 徽标并排挂在同一节点(secs 为列表)、长标识符用 split_symbol() 拆两行。
 
 ■ 不可变(全书统一视觉语言，未改动): §徽标胶囊 badge()；入口=绿#22c55e/出口=橙#f97316
