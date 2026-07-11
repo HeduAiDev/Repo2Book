@@ -15,7 +15,7 @@
 
 这就是 **out-of-tree（OOT，源码树外）插件**的魔法：vllm-ascend 不 fork vLLM、不改 vLLM 一行源码，而是作为一个独立的 pip 包挂在旁边，却能让 vLLM 每一站都改用昇腾实现。
 
-它是怎么做到的？说穿了，整套接入的「声明」其实只落在 `setup.py`、`vllm_ascend/__init__.py`、`vllm_ascend/platform.py` 这几处、几十行代码里。本章不逐行抠源码——那是后面 35 章的事。本章只做一件事：**把这套机制的骨架立起来**，让你带着一张地图去读后面每一章。我们会挑三个最小的真实源码锚点，把「魔法」拆成四个可以说清的动作。
+它是怎么做到的？说穿了，整套接入的「声明」其实只落在 `setup.py`、`vllm_ascend/__init__.py`、`vllm_ascend/platform.py` 这几处、几十行代码里。本章不逐行抠源码——那是后面 37 章的事。本章只做一件事：**把这套机制的骨架立起来**，让你带着一张地图去读后面每一章。我们会挑三个最小的真实源码锚点，把「魔法」拆成四个可以说清的动作。
 
 ![本章地图：OOT 插件三支柱剖面——从安装声明到选定平台，再到 NPUPlatform 分发与两段式打补丁](../diagrams/chapter-map.png)
 
@@ -258,7 +258,7 @@ class NPUPlatform(Platform):
 
 *图 1-2　vLLM 各处调用点统一问 `current_platform.get_*_cls()`，NPUPlatform 覆写后返回昇腾 qualname，再 import 实例化。基类默认要么是空串、要么是通用实现——昇腾把它们逐一换成自家类名，vLLM 源码一行未改。*
 
-这也解释了本书后面 35 章大致在干什么：**逐个展开这些「返回的类名」背后的昇腾实现**。为什么全都返回字符串而不是类对象？还是那个「延迟 import」的考量——把重依赖的拉起推到真正要用的那一刻；而且这层字符串间接还顺手给了昇腾一个额外的调节点：像 `get_attn_backend_cls` 就能按 310P / MLA / 稀疏这些运行时条件返回不同的后端类（详见[第 19 章](../../ch19-attention-backend-selection/narrative/chapter.md)），而不必让 vLLM 感知这些差异。
+这也解释了本书后面 37 章大致在干什么：**逐个展开这些「返回的类名」背后的昇腾实现**。为什么全都返回字符串而不是类对象？还是那个「延迟 import」的考量——把重依赖的拉起推到真正要用的那一刻；而且这层字符串间接还顺手给了昇腾一个额外的调节点：像 `get_attn_backend_cls` 就能按 310P / MLA / 稀疏这些运行时条件返回不同的后端类（详见[第 19 章](../../ch19-attention-backend-selection/narrative/chapter.md)），而不必让 vLLM 感知这些差异。
 
 ## 1.4 支柱三：改不动的地方，两段式打补丁（monkey-patch）
 
@@ -363,13 +363,13 @@ def register_connector():
 - `vllm/platforms/interface.py` 里 `Platform` 基类的每个 `get_*_cls` 是扩展点，`vllm_ascend/platform.py` 里 `NPUPlatform` 的覆写是登记；
 - 连没有正式钩子的地方，monkey-patch 也是在「硬造一个扩展点」再登记。
 
-这就是要素四。它不是第四根独立支柱，而是把前三根**串成全书主线**的那条逻辑：本书后面 35 章，本质上都在回答同一个问题——「在某一站，vLLM 的扩展点长什么样，昇腾登记了什么实现」。
+这就是要素四。它不是第四根独立支柱，而是把前三根**串成全书主线**的那条逻辑：本书后面 37 章，本质上都在回答同一个问题——「在某一站，vLLM 的扩展点长什么样，昇腾登记了什么实现」。
 
 登记的手法有几档，读的时候可以对号入座：**纯注册**（返回类名字符串，如各 `get_*_cls`）、**薄壳继承**（子类化 vLLM 基类、只覆写少数方法）、**换头不换身**（继承基类的接口与注册位置，只替换 forward 实现）、以及**必要时的深度特化**（整类重写，如 NPUWorker）。
 
-![vLLM-Ascend 源码解读全书地图：7 Part、36 章](../diagrams/book-map.png)
+![vLLM-Ascend 源码解读全书地图：7 Part、38 章](../diagrams/book-map.png)
 
-*7 个 Part、36 章的全景地图；橙色虚线标出的六章（09/21/23/26/31/34）是论文原理地基，各自紧邻其落地实现的那一章。*
+*7 个 Part、38 章的全景地图；橙色虚线标出的八章（09/21/23/26/31/34/35/37）是论文原理地基，各自紧邻其落地实现的那一章。*
 
 顺着全书地图（图上方那条 7-Part 书脊），每一站是这样展开的：
 
@@ -379,7 +379,7 @@ def register_connector():
 - **Part IV 执行主线**——全书执行脊柱：[NPUWorker 重写](../../ch14-npuworker-execution-control/narrative/chapter.md)（第 14 章）、[NPUModelRunner 的 CUDA→NPU 猴补](../../ch15-npumodelrunner-cuda-monkeypatch/narrative/chapter.md)（第 15 章）、[单步前向与 DP 同步](../../ch16-single-step-forward-context-dp-sync/narrative/chapter.md)（第 16 章）、[KV cache 在昇腾上的落地](../../ch17-kv-cache-allocation-reshape-bind/narrative/chapter.md)（第 17 章）、[310P 芯片特化](../../ch18-310p-inference-chip-specialization/narrative/chapter.md)（第 18 章）。
 - **Part V 注意力与 KV**——[后端选择](../../ch19-attention-backend-selection/narrative/chapter.md)（第 19 章）、[标准 MHA](../../ch20-ascend-attention-mha/narrative/chapter.md)（第 20 章）、[MLA 权重吸收](../../ch22-mla-on-npu/narrative/chapter.md)（第 22 章）、[稀疏注意力 SFA/DSA](../../ch24-sparse-attention-sfa-dsa/narrative/chapter.md)（第 24 章）、[KV 管理与调度器](../../ch25-kv-manager-and-schedulers/narrative/chapter.md)（第 25 章）。
 - **Part VI 自定义算子与编译**——[CustomOp 顶替](../../ch27-customop-oot-replacement/narrative/chapter.md)（第 27 章）、[torch.library 与 meta 注册](../../ch28-torch-library-and-meta/narrative/chapter.md)（第 28 章）、[AscendCompiler 与 ACLGraph](../../ch29-ascend-compiler-aclgraph/narrative/chapter.md)（第 29 章）、[FusedMoE 与 batch-invariant](../../ch30-fusedmoe-batch-invariant/narrative/chapter.md)（第 30 章）。
-- **Part VII 量化、采样、投机与模型**——把「找扩展点→登记」的范式收束成四例：[量化框架](../../ch32-ascend-quantization-framework/narrative/chapter.md)（第 32 章）、[采样的 NPU 对位](../../ch33-sampling-npu-adaptation/narrative/chapter.md)（第 33 章）、[投机解码](../../ch35-speculative-decode-npu/narrative/chapter.md)（第 35 章）、[模型/LoRA/netloader 注册](../../ch36-model-lora-netloader-registration/narrative/chapter.md)（第 36 章）。
+- **Part VII 量化、采样、投机与模型**——把「找扩展点→登记」的范式收束成四例，其间穿插两站原理地基：[量化框架](../../ch32-ascend-quantization-framework/narrative/chapter.md)（第 32 章）、[采样的 NPU 对位](../../ch33-sampling-npu-adaptation/narrative/chapter.md)（第 33 章）、[DFlash 块扩散原理](../../ch35-primer-dflash/narrative/chapter.md)（第 35 章）、[投机解码](../../ch36-speculative-decode-npu/narrative/chapter.md)（第 36 章）、[DSpark 半自回归前瞻](../../ch37-primer-dspark/narrative/chapter.md)（第 37 章，前瞻方向，尚未合入主线）、[模型/LoRA/netloader 注册](../../ch38-model-lora-netloader-registration/narrative/chapter.md)（第 38 章）。
 
 每章开头的 Roadmap，那个高亮的「你在这里」，挂的就是这张地图上的某一站。
 
@@ -404,6 +404,6 @@ def register_connector():
 - **装上就被发现**：`setup.py` 的两组 entry point 写进包元数据，vLLM 用 `importlib.metadata` 按组名反查（支柱一）。
 - **一个平台类接管分发**：`register()` 只返回类名字符串，懒加载出唯一的 `NPUPlatform`；它覆写一整组 `get_*_cls`，vLLM 每次「问平台要组件」拿到的都是昇腾版（支柱二）。
 - **改不动的地方两段式打补丁**：`adapt_patch` 靠 import 副作用，在 platform 段与 worker 段两个时机改写 vLLM 里没留钩子的符号（支柱三）。
-- **往每个扩展点登记昇腾实现**：这是把前三者串成全书主线的范式，后面 35 章逐站展开（要素四）。
+- **往每个扩展点登记昇腾实现**：这是把前三者串成全书主线的范式，后面 37 章逐站展开（要素四）。
 
 握住这张地图，我们就可以走进第一站了。[第 2 章](../../ch02-entry-points-and-npuplatform/narrative/chapter.md) 会把「装上就被发现、并顶替默认实现」这条链——从 entry point 到 `resolve_current_platform_cls_qualname` 再到懒加载——一步不落地走一遍。

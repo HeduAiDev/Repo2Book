@@ -34,23 +34,23 @@ vllm-ascend 是 vLLM 的 **out-of-tree 平台插件**：不改 vLLM 源码，而
 - **规划**：`book/cartography/outline-final.json` 新增 Part VIII「算法原理篇：论文里的 DeepSeek」，6 章 `ch21`–`ch26`，全部 `mode: "primer"`：
   - `ch21-primer-mla`（MLA：低秩 KV 压缩/解耦 RoPE/权重吸收，deps `ch22`）
   - `ch23-primer-sparse-attention`（NSA→DSA/Lightning Indexer 谱系，deps `ch24`+`ch21`）
-  - `ch34-primer-speculative-sampling`（拒绝采样定理+MTP+DSpark 前瞻，deps `ch35`）
+  - `ch34-primer-speculative-sampling`（拒绝采样定理+MTP+DSpark 前瞻，deps `ch36`）
   - `ch09-primer-eplb`（EPLB 均衡算法本体，deps `ch10`）
   - `ch31-primer-quantization`（量化数学：GPTQ/AWQ/SmoothQuant，deps `ch32`）
   - `ch26-primer-v4-csa-hca`（DeepSeek-V4 CSA/HCA 两级压缩混合注意力，deps `ch21`+`ch23`）
   - 发车顺序（见 RUNBOOK 发车阶段）：串行线 `ch21→ch23→ch26`（记号/概念递进），并行线 `ch34`/`ch09`/`ch31` 互不依赖。
-- **硬规则 2 豁免范围**：CLAUDE.md HARD RULE 2「只做减法不做加法」的豁免**仅限 `kind=primer`** 的章——这 6 章的落地代码段仍是忠实参考实现（非杜撰），但正文主线是论文推导而非源码逐段精简，成对启用 `lint_paper_grounding` 门禁（`# PAPER` 全覆盖 + 正文出处可溯源）；其余 30 章（`ch01`–`ch36`，`mode: "code"`）不受影响，`lint_fidelity` 照常跑。
+- **硬规则 2 豁免范围**：CLAUDE.md HARD RULE 2「只做减法不做加法」的豁免**仅限 `kind=primer`** 的章——这 6 章的落地代码段仍是忠实参考实现（非杜撰），但正文主线是论文推导而非源码逐段精简，成对启用 `lint_paper_grounding` 门禁（`# PAPER` 全覆盖 + 正文出处可溯源）；其余 30 章（`ch01`–`ch38`，`mode: "code"`）不受影响，`lint_fidelity` 照常跑。
 - **论文包位置**：`instances/vllm-ascend/book/papers/<slug>/`（`paper.md` 为主，部分章有辅助论文如 `ch23` 的 `paper-dsa.md`、`ch34` 的 `paper-mtp.md`、`ch31` 的 `paper-awq.md`/`paper-smoothquant.md`），`meta.json` 记来源；总索引 `book/cartography/papers-map.json`。
 - **2026-07-04 gap 盘点**（`book-gap-audit` workflow 首跑）：全书 30 章码章体检出 6 处「悬崖」——正文引用了论文级机制但未展开推导，对应 6 章 primer 消解：
   | 悬崖 | 首现处 | 消解章 |
   |---|---|---|
   | 解耦 RoPE（为何不能吸收进 W_UK） | ch22 MLA on NPU | ch21 |
   | DSA/Lightning Indexer 谱系（NSA→V3.2 演进） | ch24 attention backend | ch23 |
-  | 拒绝采样定理 + MTP 草稿机制 | ch35 | ch34 |
+  | 拒绝采样定理 + MTP 草稿机制 | ch36 | ch34 |
   | EPLB 重排算法本体（只讲工程接入未讲均衡算法） | ch10 | ch09 |
   | 量化数学（GPTQ/AWQ/SmoothQuant 推导） | ch32 昇腾量化框架 | ch31 |
-  | DeepSeek-V4 CSA/HCA 两级压缩注意力 | ch24/ch25/ch36 一带而过 | ch26 |
-  - 指路框补丁（6 章全部 APPROVED 后）：在 ch22/ch24/ch35/ch10/ch32 各定点插入一句「本章默认你已了解 X；其数学推导见第 NN 章」回指对应 primer 章（ch26 的 V4 CSA/HCA 暂无需单独补丁，随 ch24/ch25/ch36 的既有指路一并覆盖）；随后重跑 `book-gap-audit` 验证 6 处悬崖降级为「已建立/有指路」，报告存 `book/audits/`。
+  | DeepSeek-V4 CSA/HCA 两级压缩注意力 | ch24/ch25/ch38 一带而过 | ch26 |
+  - 指路框补丁（6 章全部 APPROVED 后）：在 ch22/ch24/ch36/ch10/ch32 各定点插入一句「本章默认你已了解 X；其数学推导见第 NN 章」回指对应 primer 章（ch26 的 V4 CSA/HCA 暂无需单独补丁，随 ch24/ch25/ch38 的既有指路一并覆盖）；随后重跑 `book-gap-audit` 验证 6 处悬崖降级为「已建立/有指路」，报告存 `book/audits/`。
 
 ## 实例专属坑
 1. 别写脱离代码的抽象——正文以真实 vllm_ascend 源码为主线、自包含内嵌，对照基座写 `vllm/...`。

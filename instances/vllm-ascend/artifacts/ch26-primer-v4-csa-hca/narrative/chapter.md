@@ -51,7 +51,7 @@
 
 轴正交意味着可以叠加：CSA 层 = 先压序列长（新轴）+ 再套 DSA 稀疏（第 23 章那条轴）。这就是为什么读懂本章要先备好前两章的记号——CSA 里的「lightning indexer + top-k」几乎原样复用 DSA。lightning indexer（闪电索引器）是第 23 章 DSA 的轻量打分器：用低秩代理代替全精度内积给每个候选打分，CSA 里原样沿用，只是打分对象从「原始 token」换成了「压缩块」。
 
-> **衍生仓定位**：本章讲的这套注意力，在昇腾接管链里对应基座 vLLM 的注意力后端那一站——`vllm_ascend/models/deepseek_v4.py` 是 vLLM-Ascend 为 DeepSeek-V4 新写的模型定义，`Compressor`/`Indexer` 顶替了基座里普通的 MLA 注意力模块。落地细节回指本书的稀疏注意力实现章（[第 24 章](../../ch24-sparse-attention-sfa-dsa/narrative/chapter.md)）、KV 缓存布局章（[第 25 章](../../ch25-kv-manager-and-schedulers/narrative/chapter.md)）与模型注册章（[第 36 章](../../ch36-model-lora-netloader-registration/narrative/chapter.md)）。
+> **衍生仓定位**：本章讲的这套注意力，在昇腾接管链里对应基座 vLLM 的注意力后端那一站——`vllm_ascend/models/deepseek_v4.py` 是 vLLM-Ascend 为 DeepSeek-V4 新写的模型定义，`Compressor`/`Indexer` 顶替了基座里普通的 MLA 注意力模块。落地细节回指本书的稀疏注意力实现章（[第 24 章](../../ch24-sparse-attention-sfa-dsa/narrative/chapter.md)）、KV 缓存布局章（[第 25 章](../../ch25-kv-manager-and-schedulers/narrative/chapter.md)）与模型注册章（[第 38 章](../../ch38-model-lora-netloader-registration/narrative/chapter.md)）。
 
 在分头拆 CSA、HCA 内部怎么算之前，先看这三条轴的最新一环——CSA/HCA——落到模型里，一层 Transformer 实际长什么样：
 
@@ -649,7 +649,7 @@ class KVCompMetaData:
 
 ### 4.4　四类 KV 缓存的分页布局
 
-最后，CSA/HCA/滑窗/MLA 各自的 KV 缓存 block_size 不同，`layer.py` 用一张表分流（`vllm_ascend/models/layer/attention/layer.py:L174-192` 的 `DSAAttention.get_kv_cache_spec`）：`compress_ratio <= 1` 的层走独立的 SWA（sliding window attention，滑窗注意力）缓存，否则用带 `compress_ratio` 的 `MLAAttentionSpec`。四类缓存（mla、swa、c4 state、c128 state）的 block_size 表 `DSV4_BLOCK_SIZES`（`vllm_ascend/models/layer/attention/layer.py:L31-49`）就是 2.1 节 `Compressor` 里 `AscendCompressorStateCache(block_size=...)` 那个 magic number 的来源——四个值分别是 MLA 主 KV、滑窗未压缩 KV、CSA（ $m=4$ ）状态、HCA（ $m'=128$ ）状态各自一页存多少条目的字节宽度，四类缓存并存互不挤占。选块用的指纹缓存 `hashk_caches` 则另走一路：它按 `head_dim//8` 打包成 uint8（每 8 个符号位塞进 1 字节），正是 4.3 节 `HashEncoder.compute_hash` 里 `npu_sign_bits_pack` 输出的那种紧凑 uint8 编码——指纹只需比位、不需还原浮点，故用最省显存的字节宽度存。这套分页 KV 布局，回指本书的 KV 缓存管理章（[第 25 章](../../ch25-kv-manager-and-schedulers/narrative/chapter.md)）；而整个 DeepSeek-V4 模型（含 CSA/HCA 层与 MTP 头）如何注册进 vLLM-Ascend，则回指模型注册章（[第 36 章](../../ch36-model-lora-netloader-registration/narrative/chapter.md)）。
+最后，CSA/HCA/滑窗/MLA 各自的 KV 缓存 block_size 不同，`layer.py` 用一张表分流（`vllm_ascend/models/layer/attention/layer.py:L174-192` 的 `DSAAttention.get_kv_cache_spec`）：`compress_ratio <= 1` 的层走独立的 SWA（sliding window attention，滑窗注意力）缓存，否则用带 `compress_ratio` 的 `MLAAttentionSpec`。四类缓存（mla、swa、c4 state、c128 state）的 block_size 表 `DSV4_BLOCK_SIZES`（`vllm_ascend/models/layer/attention/layer.py:L31-49`）就是 2.1 节 `Compressor` 里 `AscendCompressorStateCache(block_size=...)` 那个 magic number 的来源——四个值分别是 MLA 主 KV、滑窗未压缩 KV、CSA（ $m=4$ ）状态、HCA（ $m'=128$ ）状态各自一页存多少条目的字节宽度，四类缓存并存互不挤占。选块用的指纹缓存 `hashk_caches` 则另走一路：它按 `head_dim//8` 打包成 uint8（每 8 个符号位塞进 1 字节），正是 4.3 节 `HashEncoder.compute_hash` 里 `npu_sign_bits_pack` 输出的那种紧凑 uint8 编码——指纹只需比位、不需还原浮点，故用最省显存的字节宽度存。这套分页 KV 布局，回指本书的 KV 缓存管理章（[第 25 章](../../ch25-kv-manager-and-schedulers/narrative/chapter.md)）；而整个 DeepSeek-V4 模型（含 CSA/HCA 层与 MTP 头）如何注册进 vLLM-Ascend，则回指模型注册章（[第 38 章](../../ch38-model-lora-netloader-registration/narrative/chapter.md)）。
 
 ---
 

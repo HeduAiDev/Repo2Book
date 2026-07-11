@@ -42,7 +42,7 @@ STAGES = [
 #   (b) outline 里每章的 subsystem 值（注意 'distributed' 跨 P2/P3、'worker' 在 P4、
 #       'attention'/'core' 在 P5——故 subsystem 单独不足以定位，子系统别名取「最常见归属」，
 #       精确定位请用章号键）；
-#   (c) 每个 chapter_id（ch01..ch36）直接定位到其 Part，工作流按章发车最稳。
+#   (c) 每个 chapter_id（ch01..ch38）直接定位到其 Part，工作流按章发车最稳。
 # 值形如 (Part键, 中文"本章深入"标签)；标签=None 表示纯 Part 高亮、不画 callout。
 ALIASES = {
     # (a) P1..P7 简记别名 —— 纯 Part 高亮
@@ -80,8 +80,8 @@ ALIASES = {
     "ch30": ("ops-compile", "FusedMoE / batch-invariant"),
     "ch32": ("models", "昇腾量化框架"),
     "ch33": ("models", "采样的 NPU 对位"),
-    "ch35": ("models", "投机解码 proposer"),
-    "ch36": ("models", "模型 / LoRA / netloader"),
+    "ch36": ("models", "投机解码 proposer"),
+    "ch38": ("models", "模型 / LoRA / netloader"),
     # Part VIII 原理篇（primer）——挂到所属子系统 Part，callout 标「原理篇」
     "ch21": ("attention",   "原理篇：MLA 低秩压缩与解耦 RoPE"),
     "ch23": ("attention",   "原理篇：NSA→DSA 稀疏注意力"),
@@ -89,8 +89,8 @@ ALIASES = {
     "ch09": ("parallel-kv", "原理篇：EPLB 均衡算法"),
     "ch31": ("models",      "原理篇：量化数学"),
     "ch26": ("attention",   "原理篇：V4 CSA/HCA 压缩注意力"),
-    "ch38": ("models",      "前瞻原理篇：DSpark 半自回归投机解码"),
-    "ch37": ("models",      "原理篇：DFlash 块扩散并行起草"),
+    "ch37": ("models",      "前瞻原理篇：DSpark 半自回归投机解码"),
+    "ch35": ("models",      "原理篇：DFlash 块扩散并行起草"),
 }
 
 

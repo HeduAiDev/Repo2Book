@@ -1,0 +1,323 @@
+{
+  "chapter": "ch35-primer-dflash",
+  "kind": "primer",
+  "note": "primer 原理章：论文推导层 + vllm-ascend 昇腾落地代码层双源。worked_example 全部由 implementation/ 的论文忠实参考实现驱动脚本跑出（traces/run_*.py → traces/*.json），trace_source=run，表格每个数字都能在对应 trace 里找到。",
+
+  "symbol_table": [
+    {"symbol": "L", "meaning": "平均每 token 延迟——投机解码跑一轮的总耗时摊到接受的每个 token 上，越小越快", "first_use": "§一 速度模型 Eq.(1)", "source": "arXiv:2602.06036 §3.1 Eq.(1)"},
+    {"symbol": "T_{\\text{draft}}", "meaning": "起草耗时——draft 模型造出一整块草稿 token 的时间（DFlash 要压小它）", "first_use": "§一 Eq.(1)/Eq.(2)/Eq.(3)", "source": "arXiv:2602.06036 §3.1-3.2"},
+    {"symbol": "T_{\\text{verify}}", "meaning": "验证耗时——target 模型并行核对整块草稿的一次前向时间", "first_use": "§一 Eq.(1)", "source": "arXiv:2602.06036 §3.1 Eq.(1)"},
+    {"symbol": "\\tau", "meaning": "每轮期望接受 token 数（含 target 白送的 bonus token），取值 [1, γ+1]，越大越省（DFlash 靠 KV 注入抬它）", "first_use": "§一 Eq.(1)", "source": "arXiv:2602.06036 §3.1 Eq.(1)"},
+    {"symbol": "\\eta", "meaning": "加速比 = 目标模型自回归延迟 / 投机解码延迟，就是最终对外报的『几倍』", "first_use": "§一 Eq.(1) 后", "source": "arXiv:2602.06036 §3.1"},
+    {"symbol": "\\gamma", "meaning": "投机预算 / 块大小——一轮想草拟多少个未来 token", "first_use": "§一 Eq.(2)", "source": "arXiv:2602.06036 §3.2 Eq.(2)"},
+    {"symbol": "t_{\\text{step}}", "meaning": "draft 模型跑一次前向的延迟（自回归起草每个 token 要花一次）", "first_use": "§一 Eq.(2)", "source": "arXiv:2602.06036 §3.2 Eq.(2)"},
+    {"symbol": "t_{\\text{parallel}}", "meaning": "块扩散一次前向出整块的延迟——与块大小 γ 无关，是 DFlash 压 T_draft 的关键常数", "first_use": "§一 Eq.(3)", "source": "arXiv:2602.06036 §3.2 Eq.(3)"},
+    {"symbol": "L_{\\text{target}}", "meaning": "目标模型自己逐 token 自回归解码的每 token 延迟（加速比的分母基准）", "first_use": "§一 Eq.(1) 后", "source": "arXiv:2602.06036 §3.1"},
+    {"symbol": "\\mathbf{H}_{t}", "meaning": "target 上下文特征——把 target 若干层隐藏态拼接投影+归一化后的共享条件向量，逐层注入 draft 的 K/V", "first_use": "§二 KV 注入 Appendix A.3", "source": "arXiv:2602.06036 Appendix A.3"},
+    {"symbol": "\\mathbf{H}_{d}", "meaning": "draft token 自己的隐藏态——只用来产生 Q（query）", "first_use": "§二 Appendix A.3", "source": "arXiv:2602.06036 Appendix A.3"},
+    {"symbol": "W_{c}", "meaning": "共享投影矩阵（D×5D），DFlash 唯一新增的带参组件，把 5 层 target 特征融成一个 H_t", "first_use": "§二 Appendix A.3", "source": "arXiv:2602.06036 Appendix A.3"},
+    {"symbol": "\\mathbf{H}^{(l_i)}", "meaning": "target 模型第 l_i 层的隐藏态（从浅到深均匀采 5 层）", "first_use": "§二 Appendix A.3", "source": "arXiv:2602.06036 §4.1 / A.3"},
+    {"symbol": "\\mathbf{K}_{i}", "meaning": "draft 第 i 层的 Key——由 [H_t; H_d] 沿序列轴拼接投影而来（注入点）", "first_use": "§三 交叉注意力 Appendix A.3", "source": "arXiv:2602.06036 Appendix A.3"},
+    {"symbol": "\\mathbf{V}_{i}", "meaning": "draft 第 i 层的 Value——同样由 [H_t; H_d] 拼接投影，target 特征只作额外 KV 条目", "first_use": "§三 Appendix A.3", "source": "arXiv:2602.06036 Appendix A.3"},
+    {"symbol": "\\mathbf{Q}_{i}", "meaning": "draft 第 i 层的 Query——只由 draft token H_d 产生，target 特征完全不进 Q", "first_use": "§三 Appendix A.3", "source": "arXiv:2602.06036 Appendix A.3"},
+    {"symbol": "w_{k}", "meaning": "块内第 k 位的训练损失权重 = exp(-(k-1)/γ)，早位置权重大（早错会作废整块后续）", "first_use": "§四 训练 Eq.(4)", "source": "arXiv:2602.06036 §4.2 Eq.(4)"},
+    {"symbol": "q_i(y_i\\mid c,b)", "meaning": "块扩散一次前向给出的第 i 位边际分布——只依赖上下文 c 与 bonus token b，不依赖块内其他位置（这正是能一次并行出整块的代数原因）", "first_use": "§五 DDTree 延伸 Eq.(2)", "source": "arXiv:2604.12989 §3 Eq.(2)"},
+    {"symbol": "B", "meaning": "DDTree 的树节点预算——最多验证多少个候选前缀", "first_use": "§五 DDTree Algorithm 1", "source": "arXiv:2604.12989 §4.3"},
+    {"symbol": "\\rho", "meaning": "rank-tuple——按每层概率排名（而非词表 id）索引一个前缀，best-first 堆算法在 rank 空间搜索", "first_use": "§五 DDTree Algorithm 1", "source": "arXiv:2604.12989 §4.3"},
+    {"symbol": "\\sigma(\\rho)", "meaning": "前缀 ρ 的对数概率得分 = 各层选中 rank 的 log q 之和，堆按它排序", "first_use": "§五 DDTree Algorithm 1", "source": "arXiv:2604.12989 §4.3"},
+    {"symbol": "\\alpha_{T}(Y)", "meaning": "给定草稿树 T 与目标采样 Y 时的接受长度；其在分解分布下的期望 = 树里各前缀概率之和（可加，故贪心取前 B 大即最优）", "first_use": "§五 DDTree Eq.(8)", "source": "arXiv:2604.12989 §4.2 Eq.(8)"}
+  ],
+
+  "mechanisms": [
+    {
+      "mechanism_id": "block-diffusion-parallel-drafting",
+      "intuition": "自回归起草像用一台单车道打印机逐个字打草稿，要 16 个字就得走 16 趟；块扩散起草像一次曝光的照相制版——不管这一版是 4 个字还是 16 个字，都只『咔嚓』一次。趟数从随字数线性增长，变成恒等于 1。",
+      "worked_example": {
+        "params": {"t_step": 0.2, "t_parallel": 0.5, "num_draft_layers": 3, "block_size_ran": 4, "vocab": 32, "gammas": [4, 8, 16]},
+        "trace_source": "run",
+        "trace_ref": "traces/block_diffusion.json",
+        "driver": "traces/run_block_diffusion.py",
+        "table": {
+          "columns": ["块大小 γ", "自回归起草前向次数", "扩散起草前向次数", "自回归 T_draft = γ·t_step", "扩散 T_draft = t_parallel"],
+          "rows": [
+            ["4", "4", "1", "0.8", "0.5"],
+            ["8", "8", "1", "1.6", "0.5"],
+            ["16", "16", "1", "3.2", "0.5"]
+          ]
+        },
+        "run_note": "同一次实跑还调用 TinyDflashDraftModel.forward（block=4）验证：单次模型调用（diff_model_calls=1）直接返回整块 logits，形状 4×32——一次前向出整块，不是断言而是跑出来的。"
+      },
+      "invariant": {
+        "claim": "扩散起草的前向调用次数恒为 1，与块大小 γ 无关；自回归起草恒为 γ。",
+        "argument": "count_forward_calls_diffusion 对任意 block_size 都 return 1（block_size 参数被显式 del 丢弃）；count_forward_calls_autoregressive 恒 return block_size。故当 γ 从 4→8→16，自回归调用 4→8→16 单调随 γ 增，扩散调用不变——差距随 γ 线性张开。"
+      },
+      "quantified": "把本例数代入：γ=16 时自回归 T_draft = 16×0.2 = 3.2（是 γ=4 的 4 倍），扩散 T_draft 恒 = 0.5。正因 γ 移出了延迟表达式，DFlash 才敢把草稿器做深到 5 层——层数进的是常数项 t_parallel，不再乘以 γ。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-block-diffusion-vs-ar",
+          "claim": "自回归起草的耗时随块大小线性上涨，块扩散起草一次前向出整块、耗时不随块变大。",
+          "template": "before-after",
+          "numbers": [
+            {"label": "AR 前向次数 (γ=4/8/16)", "value": "4 / 8 / 16", "provenance": "traces/block_diffusion.json rows[].ar_forward_calls"},
+            {"label": "扩散前向次数 (任意 γ)", "value": "1", "provenance": "traces/block_diffusion.json rows[].diff_forward_calls"},
+            {"label": "AR T_draft (γ=16)", "value": "3.2", "provenance": "traces/block_diffusion.json rows[2].ar_T_draft"},
+            {"label": "扩散 T_draft (任意 γ)", "value": "0.5", "provenance": "traces/block_diffusion.json rows[].diff_T_draft"}
+          ],
+          "caption_draft": "左『自回归』：γ 趟前向堆叠，耗时 0.8→1.6→3.2 随 γ 线性涨；右『块扩散』：恒 1 趟前向、T_draft 恒 0.5。这就是 DFlash 敢做深草稿器而不拖慢起草的结构性理由。对照论文 Figure 3（1/3/5 层 DFlash 曲线近乎水平 vs EAGLE-3 线性上升）。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "speedup-latency-model",
+      "intuition": "加速比是一道分数题：L =（起草成本 + 验证成本）/ 每轮白赚的 token 数。想让它变小只有两招——把上面的起草成本压下去（块扩散并行起草），或把下面的接受长度顶上来（KV 注入让草稿更准）。DFlash 两招各打一处。",
+      "worked_example": {
+        "params": {"l_target": 1.0, "t_verify": 1.0, "t_step": 0.2, "t_parallel": 0.5, "gamma": 8},
+        "trace_source": "run",
+        "trace_ref": "traces/latency.json",
+        "driver": "traces/run_latency.py",
+        "table": {
+          "columns": ["场景", "起草模式", "T_draft", "T_verify", "τ", "L = (T_draft+T_verify)/τ", "η = L_target/L"],
+          "rows": [
+            ["自回归起草(EAGLE 式 τ)", "autoregressive", "1.6", "1.0", "3.0", "0.8667", "1.1538"],
+            ["扩散起草(仅换起草方式,τ 不变)", "diffusion", "0.5", "1.0", "3.0", "0.5", "2.0"],
+            ["扩散起草 + KV 注入(τ 抬高)", "diffusion", "0.5", "1.0", "4.2", "0.3571", "2.8"]
+          ]
+        },
+        "run_note": "三行共用同一组 l_target=1.0 / t_verify=1.0 / γ=8，只改起草模式与 τ，把两个杠杆拆开单独看：第 1→2 行只换起草方式（压 T_draft），η 1.1538→2.0；第 2→3 行只抬 τ（KV 注入的效果），η 2.0→2.8。"
+      },
+      "invariant": {
+        "claim": "per_token_latency 要求 τ>0，且 η 严格随 T_draft 减小、随 τ 增大而增大。",
+        "argument": "L=(T_draft+T_verify)/τ 对 T_draft 单调增、对 τ 单调减（τ>0 时分母恒正，函数 per_token_latency 在 τ≤0 抛错）；η=L_target/L 是 L 的单调减函数。故压小 T_draft 或抬大 τ 都令 η 增大——两个杠杆方向一致、可叠加，正是本例三行的走势。"
+      },
+      "quantified": "本例中：单换起草方式（T_draft 1.6→0.5，τ 同为 3.0）η 从 1.1538 涨到 2.0；再叠加 KV 注入（τ 3.0→4.2）η 继续涨到 2.8。两招叠加是乘性收益。论文自报的 Qwen3-4B GSM8K τ≈6.53、η≈5.15× 就是这条分数在真实模型上的落点（厂商自报，未独立复现）。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "kv-injection",
+      "intuition": "EAGLE 把 target 的『提示』只在门口（输入层）塞给草稿器，走到深层就被稀释得差不多了；DFlash 把这份提示做成一张『随身携带的旁听席位』——投影成 K/V 直接坐进草稿器每一层的注意力现场，层层都能回头看，信号不衰减。而且这份 K/V 是前向开跑前一次性算好、写进 cache 复用的。",
+      "worked_example": {
+        "params": {"L_draft_layers": 2, "num_ctx": 3, "num_kv_heads": 2, "head_dim": 4, "kv_size": 8, "num_selected_layers": 5},
+        "trace_source": "run",
+        "trace_ref": "traces/kv_injection.json",
+        "driver": "traces/run_kv_injection.py",
+        "table": {
+          "columns": ["步骤", "操作", "关键标量", "判定"],
+          "rows": [
+            ["1", "一次融合 GEMM 出全 L 层 K/V（权重堆成 [32, 8]）", "max|K_融合 − K_逐层| = 0.0", "与逐层投影数值等价 ✓"],
+            ["2", "扰动选定层 l1 的隐藏态", "‖ΔH_t‖ = 1.9151", "浅层进 H_t ✓"],
+            ["3", "扰动选定层 l5 的隐藏态", "‖ΔH_t‖ = 2.8071", "深层也进 H_t，5 层名副其实 ✓"],
+            ["4", "换掉 target 特征后重算 K/V", "‖Δ draft 层输出‖ = 0.2289", "KV 注入确有条件化效应 ✓"]
+          ]
+        },
+        "run_note": "融合版 precompute_layer_kv_fused 与逐层朴素版 precompute_layer_kv_looped 数值 allclose（max abs diff K/V 均为 0.0），证明『一次 GEMM 算全层』只是省 kernel 启动、不改数值；扰动 5 个选定层任一层 H_t 都变（防『5 层』名不副实）；换 target 特征则 draft 输出变（注入真的在起条件作用）。"
+      },
+      "invariant": {
+        "claim": "融合 GEMM 版与逐层版对每一层的 K/V 逐元素相等；context K/V 一旦 precompute 写入即被所有层的 attention 复用，不随层数重算。",
+        "argument": "build_fused_kv_weight 只是把各层 W^K/W^V 沿输出维 cat 成一个大矩阵，F.linear 后 view+permute 切回逐层——线性投影对行分块可分配，故融合结果与逐层 F.linear 逐元素相同（trace: max|Δ|=0.0）。precompute 在模型 forward 之外跑一次、写进 KV cache，forward 每层只读不重算——这是『KV 注入在前向之外完成』的结构保证。"
+      },
+      "quantified": "本例 L=2 层、num_ctx=3、kv_size=8：融合权重形状 [32, 8]（=L·2·kv_size × hidden），layer-major 张量 [2, 2, 3, 2, 4]（=[2, L, num_ctx, num_kv_heads, head_dim]）使 all_k[i]/all_v[i] 逐层切片天然 contiguous，可直接喂 do_kv_cache_update。真实模型里 L≈5、context 覆盖整段 prompt，一次融合 GEMM 省下的是 5 倍 kernel 启动。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-kv-injection-pipeline",
+          "claim": "target 隐藏态一次融合投影出全层 K/V，逐层写进 draft 的 KV cache，供每层注意力复用（不是只在输入层融合）。",
+          "template": "flow",
+          "numbers": [
+            {"label": "选定 target 层数", "value": "5", "provenance": "traces/kv_injection.json params.num_selected_layers"},
+            {"label": "融合 KV 权重形状", "value": "[32, 8]", "provenance": "traces/kv_injection.json fused_vs_looped.fused_kv_weight_shape"},
+            {"label": "融合/逐层数值差", "value": "0.0", "provenance": "traces/kv_injection.json fused_vs_looped.max_abs_diff_K"},
+            {"label": "换 target 特征后输出变化", "value": "0.2289", "provenance": "traces/kv_injection.json conditioning_output_delta_norm"}
+          ],
+          "caption_draft": "H^(l1..l5) → 拼接 → W_c 投影+RMSNorm → H_t → 一次融合 GEMM 出全层 K/V（[32,8] 权重）→ layer-major → 逐层写 KV cache。每层 attention 都能读到同一份注入的 target 条件；换掉 target 特征 draft 输出即变（0.2289），证明条件真在起作用。对照论文 Figure 2。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "cross-attention-qkv-split",
+      "intuition": "把一次 draft 层注意力想成一场问答：提问的人（Q）只能是草稿 token 自己（H_d）；而可被查阅的资料架（K/V）上，既摆着注入的 target 特征、也摆着草稿 token 自己的 K/V——两摞并排。target 特征只当『资料』被查，从不亲自提问，也不参与更新和 FFN。",
+      "worked_example": {
+        "params": {"num_ctx": 3, "block_size": 4, "num_speculative_tokens": 3, "num_heads": 2, "num_kv_heads": 2, "head_dim": 4},
+        "trace_source": "run",
+        "trace_ref": "traces/cross_attention.json",
+        "driver": "traces/run_cross_attention.py",
+        "table": {
+          "columns": ["操作", "关键标量", "判定"],
+          "rows": [
+            ["Q 只由 draft token（bonus + 3 mask）投影", "Q 行数 = 4", "H_d 独占 Q（函数无 target_hidden 参与 Q）✓"],
+            ["K/V = [context(3); query(4)] 沿序列轴拼接", "K/V 序列长 = 7", "target 特征只作额外 KV 条目 ✓"],
+            ["扰动最后一个 mask 位（idx 3）", "bonus 位（idx 0）输出变化 ‖Δ‖ = 0.2788", "非因果：后位能影响前位 ✓"],
+            ["移除注入的 context K/V", "输出变化 ‖Δ‖ = 1.0215", "注入的 K/V 确实参与了注意力 ✓"]
+          ]
+        },
+        "run_note": "dflash_layer_attention 的 Q 只从 h_d 投影（签名里 target 特征只以 already-projected 的 context_k/context_v 出现）；K/V = concat([context_k, k_d]) 沿 token 轴，故序列长 = 3+4 = 7；causal=False 下扰动块内最后一位会改变 bonus 位输出（0.2788≠0，双向可见）；把 context 行清零后输出大变（1.0215），证明注入 K/V 真参与打分。"
+      },
+      "invariant": {
+        "claim": "target 特征只经 K/V 投影进入注意力，绝不进入 Q；块内注意力非因果（每个 query 位看得到块内所有 query 位 + 全部 context）。",
+        "argument": "dflash_layer_attention 里 q = F.linear(h_d, w_q) 只吃 h_d；context_k/context_v 只 cat 进 K/V，从不参与 Q，也不回写 h_d、不过 FFN——对应 A.3『target features bypass Q projection, output projection, self-attention update, and FFN』。scores 用完整 [num_ctx+num_query] 做 softmax、无因果掩码，故对最后一位的扰动能传到第 0 位（trace: 0.2788>0）——非因果覆盖整个 query 段。"
+      },
+      "quantified": "本例 num_ctx=3、block_size=4：注意力打分矩阵是 4×7（query 4 行、被查 K/V 7 列 = 3 context + 4 query）。移除 3 列 context 后输出整体位移 1.0215，量级远大于块内扰动 0.2788——说明注入的 target 特征在打分里占了实打实的权重，而非可有可无的旁支。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-cross-attention-qkv",
+          "claim": "Q 来自 draft token，K/V 由 [H_t; H_d] 拼接，注意力在 context+query 拼接序列上非因果地进行。",
+          "template": "tensor-flow",
+          "numbers": [
+            {"label": "query 位数(bonus+mask)", "value": "4", "provenance": "traces/cross_attention.json params.block_size"},
+            {"label": "context 位数", "value": "3", "provenance": "traces/cross_attention.json params.num_ctx"},
+            {"label": "K/V 拼接后序列长", "value": "7", "provenance": "traces/cross_attention.json kv_sequence_length"},
+            {"label": "移除 context 后输出位移", "value": "1.0215", "provenance": "traces/cross_attention.json remove_injected_context_delta"}
+          ],
+          "caption_draft": "H_d →(W^Q)→ Q（4 行）；K/V = [W^K H_t(3) ; W^K H_d(4)] 拼成长 7 的键值序列；非因果 softmax 让每个 query 位同时看 target 上下文与块内邻居。移除 context 列输出即位移 1.0215，坐实『target 特征只作 KV、但确实参与打分』。对照 A.3 的 Q_i/K_i/V_i 式。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "input-expansion-kernel",
+      "intuition": "起一轮草稿前，要先给草稿器摆好『考卷』：每个请求先铺上下文（context），再补一排空格——第一个空格填 target 上轮确定的 bonus token（当锚点），其余空格填统一的 mask 占位符，等草稿器并行填空。融合 kernel 一趟就把每个请求的 context 位置、query 位置、slot、填什么 token 全算好。",
+      "worked_example": {
+        "params": {"num_speculative_tokens": 3, "num_query_per_req": 4, "page_block_size": 4, "parallel_drafting_token_id": 151669, "bonus_token": 42, "last_context_pos": 2},
+        "trace_source": "run",
+        "trace_ref": "traces/input_expansion.json",
+        "driver": "traces/run_input_expansion.py",
+        "table": {
+          "columns": ["q_idx", "query 位置", "out 索引 query_out_idx", "写入 input_id", "掩码位?", "登记 sample_out_idx"],
+          "rows": [
+            ["0", "3", "0", "42（bonus token）", "否", "—"],
+            ["1", "4", "1", "151669（mask）", "是", "0"],
+            ["2", "5", "2", "151669（mask）", "是", "1"],
+            ["3", "6", "3", "151669（mask）", "是", "2"]
+          ]
+        },
+        "run_note": "纯 Python 复刻 copy_and_expand_dflash_inputs_kernel_single_grid 的索引算术（host 无 triton）：context last_pos=2，故 query 位置 = last_pos+1+q_idx = 3,4,5,6；q_idx==0 写 bonus token 42、其余写 parallel_drafting_token_id 151669 并把 query_out_idx 登记进 token_indices（sample_out_idx=0,1,2）供采样。slot = block_id·4 + pos%4（block_table {0:5,1:9}）。"
+      },
+      "invariant": {
+        "claim": "每个请求恰好展开 num_query_per_req = 1 + num_speculative_tokens 个 query；仅 q_idx==0 是 bonus token（非掩码、不登记采样），其余 num_speculative_tokens 个是掩码位且各登记一次采样索引。",
+        "argument": "kernel 内 for q_idx in range(num_query_per_req)，query_out_idx = req_idx·num_query_per_req + q_idx 单调递增无重叠；分支 q_idx==0 写 next_token（bonus），else 写 parallel_drafting_token_id 并 store 到 out_token_indices[req_idx·num_speculative_tokens + (q_idx-1)]——故掩码位数 = num_query_per_req-1 = num_speculative_tokens，登记数与之一一对应（本例 3 个：sample_out_idx 0,1,2）。"
+      },
+      "quantified": "本例 num_speculative_tokens=3 → num_query_per_req=4：单请求展开 4 个 query（1 bonus + 3 mask），登记 3 个采样位。多请求时 query_out_idx 以 req_idx·4 为步长错开（req1 从 4 起），sample_out_idx 以 req_idx·3 错开——这就是融合 kernel 一趟给整个 batch 摆好考卷的记账方式。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "training-anchor-mask-weighted-loss",
+      "intuition": "块扩散虽然一口气并行出整块，但块内位置并不平权：接受是『最长前缀匹配』，第 1 位错了后面全作废，第 16 位错了只赔 1 个。所以训练时给早位置更大的损失权重（exp 衰减）——早位置是命门，要优先练准。这也点破一个误解：块扩散不是多轮迭代去噪，而是单次前向内的掩码填空 + 位置加权。",
+      "worked_example": {
+        "params": {"block_size": 4, "gamma": 4, "vocab": 5},
+        "trace_source": "run",
+        "trace_ref": "traces/position_loss.json",
+        "driver": "traces/run_position_loss.py",
+        "table": {
+          "columns": ["项目", "数值", "判定"],
+          "rows": [
+            ["块内位置 k=1 权重 w_1", "1.0", "基准（权重最大）"],
+            ["k=2 权重 w_2", "0.7788", "指数衰减"],
+            ["k=3 权重 w_3", "0.6065", "指数衰减"],
+            ["k=4 权重 w_4", "0.4724", "最小"],
+            ["位置 1 犯错的加权损失", "3.4995", "早错更贵"],
+            ["位置 4 犯错的加权损失", "1.6531", "晚错更便宜"]
+          ]
+        },
+        "run_note": "position_weights(4, 4) = [1.0, 0.7788, 0.6065, 0.4724]（= exp(-(k-1)/γ)）。同一『一个位置押错、其余全对』的场景下，把错位放在 k=1 vs k=4，position_weighted_cross_entropy 得 3.4995 vs 1.6531——早位置犯错代价约 2.1169 倍（trace early_over_late_ratio）。"
+      },
+      "invariant": {
+        "claim": "w_k = exp(-(k-1)/γ) 关于 k 严格单调递减，w_1 恒 = 1；同幅误差下早位置的加权损失严格大于晚位置。",
+        "argument": "指数函数 exp(-(k-1)/γ) 的指数 -(k-1)/γ 随 k 严格递减（γ>0），故 w_k 严格递减，k=1 时指数为 0、w_1=1。加权交叉熵 = Σ w_k·CE_k / Σ w_k；把等幅误差从晚位置移到早位置，即把它乘上更大的 w_k，加权和严格增大（本例 3.4995 > 1.6531）。"
+      },
+      "quantified": "本例 γ=4：权重从 w_1=1.0 衰减到 w_4=0.4724（末位仅约首位的 47%）。早位置错的加权损失 3.4995 是晚位置 1.6531 的约 2.1169 倍——训练目标本身就编码了『早位置更值钱』，与『并行=每位置同等重要』的望文生义恰好相反。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-position-weight-decay",
+          "claim": "块内位置权重按 exp(-(k-1)/γ) 指数衰减，早位置犯错的加权损失明显更高。",
+          "template": "state-table",
+          "numbers": [
+            {"label": "w_1", "value": "1.0", "provenance": "traces/position_loss.json weights_k1_to_k4[0]"},
+            {"label": "w_4", "value": "0.4724", "provenance": "traces/position_loss.json weights_k1_to_k4[3]"},
+            {"label": "位置1犯错加权损失", "value": "3.4995", "provenance": "traces/position_loss.json early_error_weighted_loss_pos1"},
+            {"label": "位置4犯错加权损失", "value": "1.6531", "provenance": "traces/position_loss.json late_error_weighted_loss_pos4"}
+          ],
+          "caption_draft": "块内位置权重 1.0 / 0.7788 / 0.6065 / 0.4724 逐位衰减；同幅误差放早位置损失 3.4995、放晚位置仅 1.6531（约 2.1 倍差）。配合随机锚点掩码训练（锚点=bonus token 的替身，mask 其后 block_size-1 位并行预测），对照论文 Figure 4 的块对角注意力掩码。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "ddtree-tree-verification",
+      "intuition": "vanilla DFlash 一次块扩散前向已经给出每个位置的完整候选分布，却只挑一条最可能的路去验证——像手握一张分叉地图只走一条道。DDTree 用同一次前向的分布，在固定节点预算下把『最值得验证的前几条前缀』组成一棵树一次性验证；因为目标（期望接受长度）可加，贪心的 best-first 堆算法就能拿到可证明最优的树。",
+      "worked_example": {
+        "params": {"depths": 3, "top_k": 2, "budget": 4, "marginals": [[0.6, 0.4], [0.7, 0.3], [0.8, 0.2]]},
+        "trace_source": "run",
+        "trace_ref": "traces/ddtree.json",
+        "driver": "traces/run_ddtree.py",
+        "table": {
+          "columns": ["pop 次序", "弹出的 rank-tuple", "该前缀概率", "累计 surrogate"],
+          "rows": [
+            ["1", "[1]", "0.6", "0.6"],
+            ["2", "[1, 1]", "0.42", "1.02"],
+            ["3", "[2]", "0.4", "1.42"],
+            ["4", "[1, 1, 1]", "0.336", "1.756"]
+          ]
+        },
+        "run_note": "best_first_tree(depths=3, top_k=2, budget=4) 依次弹出 [1]、[1,1]、[2]、[1,1,1]，累计 surrogate 达 1.756；与暴力枚举 top-4 前缀集合完全一致（best_first_matches_bruteforce=true，验证 Prop 2/3）。对照 vanilla 单轨迹（只走 [1],[1,1],[1,1,1]）surrogate 仅 1.356——同一堆边际分布下，树验证的期望接受长度代理更高。"
+      },
+      "invariant": {
+        "claim": "分解分布下前缀概率随延伸单调不增，故『取概率前 B 大的前缀』自动前缀闭合、构成合法树；best-first 堆按 σ(ρ) 非增序弹出，恰好恢复这 B 个前缀。",
+        "argument": "q(u_{1:d+1}) = q(u_{1:d})·q_{d+1}(·) ≤ q(u_{1:d})（因子 ≤1），故任一前缀概率 ≥ 其任何延伸——取前 B 大时每个节点的祖先前缀概率更大、必已入选，前缀闭合无需额外判断（Prop 2）。best-first 每次弹最高分 ρ 并只推入『同层下一 rank 的兄弟』和『下探一层 rank1 的孩子』，二者得分都 ≤ ρ，故弹出序即全局非增序，pop 到第 B 个即最优树（Prop 3，本例集合与暴力枚举相等）。"
+      },
+      "quantified": "本例 budget=4、depths=3、top_k=2：树 surrogate（Eq.8，各前缀概率之和）= 0.6+0.42+0.4+0.336 = 1.756，比单轨迹链的 1.356 高约 30%——多花的只是把预算 B 从 1 条路铺成 4 个节点，验证仍是 target 一次前向（祖先-only 掩码）。这是 ④『接受率/加速比』从 DFlash 到 DDTree 的进阶落点。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ddtree-best-first",
+          "claim": "best-first 堆按前缀概率非增序弹出，在预算 B 内构出可证明最优的草稿树，其期望接受长度代理高于单轨迹。",
+          "template": "flow",
+          "numbers": [
+            {"label": "节点预算 B", "value": "4", "provenance": "traces/ddtree.json params.budget"},
+            {"label": "弹出序 rank-tuple", "value": "[1] → [1,1] → [2] → [1,1,1]", "provenance": "traces/ddtree.json pop_rows[].rank_tuple"},
+            {"label": "树 surrogate (Eq.8)", "value": "1.756", "provenance": "traces/ddtree.json tree_surrogate"},
+            {"label": "单轨迹 surrogate", "value": "1.356", "provenance": "traces/ddtree.json single_trajectory_chain_surrogate"}
+          ],
+          "caption_draft": "从根 [1] 起，堆每次弹最高分前缀并推兄弟/孩子候选，4 步得树 {[1],[1,1],[2],[1,1,1]}，累计 surrogate 0.6→1.02→1.42→1.756；对比单轨迹链 1.356。同一次块扩散前向的边际分布，树验证把期望接受长度代理抬高约 30%。对照 DDTree Figure 2 与 Algorithm 1。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "fused-kv-projection-layer-major",
+      "figure_specs": [
+        {
+          "figure_id": "fig-fused-kv-layer-major",
+          "claim": "把全 L 层的 K/V 投影权重堆成一个大矩阵，一次 GEMM 出全层 K/V，再 permute 成 layer-major 布局让逐层切片天然 contiguous。",
+          "template": "layout",
+          "numbers": [
+            {"label": "堆叠融合 KV 权重形状", "value": "[32, 8]", "provenance": "traces/kv_injection.json fused_vs_looped.fused_kv_weight_shape (= L·2·kv_size × hidden)"},
+            {"label": "layer-major 张量形状", "value": "[2, 2, 3, 2, 4]", "provenance": "traces/kv_injection.json fused_vs_looped.layer_major_shape_2_L_ctx_nkv_hd (= [2, L, num_ctx, num_kv_heads, head_dim])"},
+            {"label": "融合 vs 逐层数值差", "value": "0.0", "provenance": "traces/kv_injection.json fused_vs_looped.max_abs_diff_K"},
+            {"label": "draft 层数 L", "value": "2", "provenance": "traces/kv_injection.json params.L_draft_layers"}
+          ],
+          "caption_draft": "上：L 层各自的 W^K/W^V 沿输出维 cat 成 [32,8] 大权重；中：F.linear 一次 GEMM 出 [num_ctx, L, 2, nkv, hd]；下：permute(2,1,0,3,4) 成 layer-major [2, L, num_ctx, nkv, hd]，all_k[i]/all_v[i] 逐层切片即 contiguous，直接喂 do_kv_cache_update。融合与逐层数值差 0.0——纯省 kernel 启动、不改语义（博客点名的 layer-batched linear projection）。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "acceptance-speedup-numbers",
+      "figure_specs": [
+        {
+          "figure_id": "fig-acceptance-speedup-table",
+          "claim": "DFlash 报出的接受长度 τ 与加速比 η 显著高于 EAGLE-3，KV 注入与块扩散两个变量各自有效且可叠加（均论文/厂商自报，未独立复现）。",
+          "template": "state-table",
+          "numbers": [
+            {"label": "Qwen3-4B DFlash(16) GSM8K η/τ", "value": "5.15 / 6.53", "provenance": "paper.md §5.1 Table 1（厂商自报，未独立复现）"},
+            {"label": "Qwen3-4B EAGLE-3(16) GSM8K η/τ", "value": "1.99 / 3.30", "provenance": "paper.md §5.1 Table 1（厂商自报，未独立复现）"},
+            {"label": "消融 DFlash+KV(块扩散,block8) GSM8K τ/η", "value": "4.2 / 3.3", "provenance": "paper.md §5.5.5 Table 9（厂商自报，与 LMSYS 博客互印证）"},
+            {"label": "消融 DFlash+Input(块扩散) GSM8K τ/η", "value": "3.5 / 2.9", "provenance": "paper.md §5.5.5 Table 9（Input 融合，作对照）"},
+            {"label": "裸块扩散无条件起草天花板", "value": "3", "provenance": "paper.md §1/§4.1（'approximately 3×'，约数，未精确复现）"}
+          ],
+          "caption_draft": "Table 1：Qwen3-4B 上 DFlash(16) GSM8K 5.15×/τ6.53 vs EAGLE-3(16) 1.99×/τ3.30。Table 9 消融（5 层草稿器 block8）：Input→KV 注入把 τ 3.5→4.2、η 2.9×→3.3×；裸块扩散无 target 条件卡在约 3× 天花板。所有数字均论文/厂商自报，未独立复现——需在正文显式标注。"
+        }
+      ]
+    }
+  ]
+}

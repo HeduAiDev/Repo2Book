@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""全书地图（无高亮）：7 Part / 36 章。每 Part 一栏组，列出本 Part 各章短中文标题。
+"""全书地图（无高亮）：7 Part / 38 章。每 Part 一栏组，列出本 Part 各章短中文标题。
 原理篇（primer 模式，前置数学/算法根基章）用浅色底+虚线框标出，图例见底部。
 """
 import xml.sax.saxutils as xs
@@ -59,8 +59,10 @@ PARTS = [
         ("ch32", "昇腾量化框架", False),
         ("ch33", "采样的 NPU 对位", False),
         ("ch34", "投机采样：拒绝采样定理", True),
-        ("ch35", "投机解码 proposer 工厂", False),
-        ("ch36", "模型/LoRA/netloader 注册", False),
+        ("ch35", "DFlash：块扩散并行起草", True),
+        ("ch36", "投机解码 proposer 工厂", False),
+        ("ch37", "DSpark：半自回归前瞻", True),
+        ("ch38", "模型/LoRA/netloader 注册", False),
     ]),
 ]
 
@@ -79,7 +81,7 @@ def part_h(p):
     return PART_HEAD_H + len(p[2]) * CH_H + 14
 
 
-# 7 Part 分两列：左 I-IV（5+2+6+5=18 章），右 V-VII（8+4+6=18 章）——两列章数均衡。
+# 7 Part 分两列：左 I-IV（5+2+6+5=18 章），右 V-VII（8+4+8=20 章）——两列章数大致均衡。
 col_assign = [0, 0, 0, 0, 1, 1, 1]
 cols = {0: [], 1: []}
 for i, p in enumerate(PARTS):
@@ -102,7 +104,7 @@ PRIMER_TXT = "#b45309"
 L = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" font-family="sans-serif">']
 L.append(f'<rect width="{W}" height="{H}" fill="white"/>')
 L.append(f'<text x="{W/2}" y="34" text-anchor="middle" font-size="22" font-weight="bold" '
-         f'fill="#0f172a">vLLM-Ascend 源码解读 · 全书地图（7 Part / 36 章）</text>')
+         f'fill="#0f172a">vLLM-Ascend 源码解读 · 全书地图（7 Part / 38 章）</text>')
 
 part_index = {id(p): i for i, p in enumerate(PARTS)}
 for c in (0, 1):
@@ -149,7 +151,7 @@ L.append(f'<rect x="{PAD}" y="{leg_y}" width="30" height="16" rx="4" fill="{PRIM
          f'stroke="{PRIMER_BD}" stroke-width="1.3" stroke-dasharray="3,2"/>')
 L.append(f'<text x="{PAD+38}" y="{leg_y+13}" font-size="12.5" fill="#475569">'
          f'= 原理篇（primer；前置数学/算法根基，回指后续落地章）——'
-         f'共 6 章：ch09 / ch21 / ch23 / ch26 / ch31 / ch34</text>')
+         f'共 8 章：ch09 / ch21 / ch23 / ch26 / ch31 / ch34 / ch35 / ch37</text>')
 
 L.append('</svg>')
 with open("book-map.svg", "w", encoding="utf-8") as f:

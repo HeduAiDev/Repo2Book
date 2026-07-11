@@ -1,11 +1,11 @@
-# 投机采样：拒绝采样保分布定理、MTP 与 DSpark 前瞻
+# 投机采样：拒绝采样保分布定理与 MTP 落地
 
 ![全书地图与本章位置](../diagrams/roadmap.png)
 
 > 你在这里：全书第七部分「量化 / 采样 / 投机 / 模型」的原理深潜。
 > 上一站 [第 33 章](../../ch33-sampling-npu-adaptation/narrative/chapter.md) 讲了昇腾采样器，含投机的验证侧拒绝采样。
 > 这一章补齐它背后的数学：拒绝采样为什么不改分布、加速比从哪来。
-> 下一站 [第 35 章](../../ch35-speculative-decode-npu/narrative/chapter.md) 回到工程，看提议侧 proposer 怎么落地。
+> 下一站 [第 35 章](../../ch35-primer-dflash/narrative/chapter.md) 顺着「draft 怎么猜」往前走，看 DFlash 怎么把草稿从逐 token 换成一次前向的整块。
 
 投机解码有一句听起来像魔法的承诺：**用小模型抢跑、大模型并行验证，能几倍加速，而输出分布分毫不差。**「更快」好理解，「分毫不差」才是它凭什么敢在生产里默认开启的底气——它不是近似，是**数学上可证的无偏加速**。
 
@@ -477,7 +477,7 @@ $$
 
 这里有条支撑串行因果链的不变量：取模路由是良定义的——`spec_step_idx % num_mtp_layers` 对任意 `spec_step_idx` 都恰好落到 `0 … num_mtp_layers-1` 里唯一一个深度层， $\gamma$ 步依次路由、不重不漏，保证 Eq.22-23 的因果链一层都不断档。第一节说的自回归串行瓶颈——第 $t$ 步必须等前 $t-1$ 步落地——在这里有了具体的代码影子：`spec_step_idx` 每次只能加一，逐步路由到下一个深度，草稿本身也是一条串行链，只是链条搭在小模型上、代价远低于大模型的串行前向。
 
-`embed_tokens` 与 `shared_head` 都复用主模型权重（`load_weights` 做名字重写，把 checkpoint 里 `mtp.0.*` 映射到 `model.layers.0.mtp_block.*`）——这正是 Eq.21/23 说的共享 Emb 与 OutHead。顶层 `DeepSeekV4MTP` 吃主模型上一步的 `hidden_states`，串行跑 $\gamma$ 个深度产出 $\gamma$ 个 draft token，然后交给验证侧。它是 [第 35 章](../../ch35-speculative-decode-npu/narrative/chapter.md) 那个 proposer 工厂分发出来的 eagle / mtp 类落地对象之一——那个工厂负责在推理时按模型类型选出 proposer——EAGLE（另一种草稿 proposer，用小模型对目标模型隐藏状态特征的外推做草稿，而非 MTP 这种训练期就有的多头预测，实现方式不同，但同样扮演 $M_q$ 的角色；其特征级自回归 + 树验证的完整原理本章不展开，见姊妹篇《vLLM 源码解读》的 EAGLE 原理章，arXiv:2401.15077）还是 MTP——并调度验证，是纯工程装配；本章不重复它，只补上选中 MTP 之后「为什么这么长」的数学依据。工厂怎么装配、怎么调度，看第 35 章。
+`embed_tokens` 与 `shared_head` 都复用主模型权重（`load_weights` 做名字重写，把 checkpoint 里 `mtp.0.*` 映射到 `model.layers.0.mtp_block.*`）——这正是 Eq.21/23 说的共享 Emb 与 OutHead。顶层 `DeepSeekV4MTP` 吃主模型上一步的 `hidden_states`，串行跑 $\gamma$ 个深度产出 $\gamma$ 个 draft token，然后交给验证侧。它是 [第 36 章](../../ch36-speculative-decode-npu/narrative/chapter.md) 那个 proposer 工厂分发出来的 eagle / mtp 类落地对象之一——那个工厂负责在推理时按模型类型选出 proposer——EAGLE（另一种草稿 proposer，用小模型对目标模型隐藏状态特征的外推做草稿，而非 MTP 这种训练期就有的多头预测，实现方式不同，但同样扮演 $M_q$ 的角色；其特征级自回归 + 树验证的完整原理本章不展开，见姊妹篇《vLLM 源码解读》的 EAGLE 原理章，arXiv:2401.15077）还是 MTP——并调度验证，是纯工程装配；本章不重复它，只补上选中 MTP 之后「为什么这么长」的数学依据。工厂怎么装配、怎么调度，看第 36 章。
 
 ### 验证侧：接受判定与残差重采样的向量化实现
 
@@ -533,12 +533,12 @@ $$
 
 ---
 
-## 五、前瞻：DSpark
+## 五、前瞻：从逐 token 到一次一整块
 
-投机采样这套「猜—并行验证—残差纠偏」的框架有很强的延展性。社区正在 RFC 阶段推进一个面向昇腾的前瞻 / 多头投机方案 **DSpark**，目标是在 MTP proposer 之上进一步压低延迟。
+投机采样这套「猜—并行验证—残差纠偏」的框架有很强的延展性，MTP 只是「怎么造草稿」的其中一种答案——逐深度串行、一次挤出一个 token。下一章 [第 35 章](../../ch35-primer-dflash/narrative/chapter.md) 要讲的 DFlash 换了一条路：把起草也改成一次前向并行吐出一整块草稿，起草延迟不再随块长变长。它的验证侧不用改一个字——本章证明的接受判定 $\min(1,p/q)$ 与残差重采样，原封不动就是 DFlash 那趟并行验证要用的地基。
 
-本章 pin 的源码版本里**还没有 DSpark 的实现代码**，所以这里只作一个前向指路，不做正文级的公式或伪代码推导（避免讲一份仓库里不存在的源码）。想跟进它的设计与进展，见 vllm-ascend 社区 **RFC #11126**。等它落地进主线，会是投机解码这条线的下一块拼图——而它能不能保分布、加速比怎么算，用的还是本章这套接受判定 $\min(1,p/q)$ 加残差重采样、加 Theorem 3.8 墙钟加速比的老账本。
+（再往前看一步，还有一个面向半自回归、多头前视的前瞻方案 DSpark，是 DFlash 并行骨干之上的再升级，见 [第 37 章](../../ch37-primer-dspark/narrative/chapter.md)。）
 
 ---
 
-**这一章我们做了什么**：从自回归的串行瓶颈出发，完整证明了投机采样的保分布定理（接受 $\min(p,q)$ + 残差 $p-\min(p,q)=p$ ，与 $q$ 无关），用玩具分布把每一步的数字口算兼蒙特卡洛验了一遍，代入实测 $\alpha$ 算出加速比并复现了论文 Table 1，最后把这些公式一条条对到昇腾栈的 MTP 模块（Eq.21-23）与拒绝采样器（接受判定 + 残差重采样）的真实源码上。理论到此闭环。工程侧的落地——验证侧的采样器怎么实现（[第 33 章](../../ch33-sampling-npu-adaptation/narrative/chapter.md)已讲）、提议侧怎么产出那串草稿 token——交给下一章 [第 35 章](../../ch35-speculative-decode-npu/narrative/chapter.md)。
+**这一章我们做了什么**：从自回归的串行瓶颈出发，完整证明了投机采样的保分布定理（接受 $\min(p,q)$ + 残差 $p-\min(p,q)=p$ ，与 $q$ 无关），用玩具分布把每一步的数字口算兼蒙特卡洛验了一遍，代入实测 $\alpha$ 算出加速比并复现了论文 Table 1，最后把这些公式一条条对到昇腾栈的 MTP 模块（Eq.21-23）与拒绝采样器（接受判定 + 残差重采样）的真实源码上。理论到此闭环。工程侧的落地——验证侧的采样器怎么实现（[第 33 章](../../ch33-sampling-npu-adaptation/narrative/chapter.md)已讲）、提议侧怎么把起草这一半换成一次前向的并行方案——交给下一章 [第 35 章](../../ch35-primer-dflash/narrative/chapter.md) 的 DFlash 原理，再看它怎么落地到昇腾（[第 36 章](../../ch36-speculative-decode-npu/narrative/chapter.md)）。
