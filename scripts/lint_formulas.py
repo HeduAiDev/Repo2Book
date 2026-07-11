@@ -202,6 +202,31 @@ def lint_formulas(filepath: str) -> dict:
                     )
     results["inline_math_adjacency_github"] = issues
 
+    # ── Check 10: LaTeX 数学命令混在行内 code span(反引号)里 —— 不渲染,显示裸源码 ──
+    # 数学记号应用 $...$;写成 `\mathbb{R}`/`\mid`/`\le` 这类反引号代码,读者看到的是
+    # 字面反斜杠命令(2026-07-12 用户发现 ch37-dspark 35 处)。正则只匹配数学命令(不含
+    # 正则转义 \d\n\t / Windows 路径 \ 等),避免误伤正常代码。
+    _latex_cmd = re.compile(
+        r'\\(?:in|le|ge|mid|top|times|cdot|frac|sum|prod|sqrt|mathbb|mathrm|mathcal|'
+        r'alpha|beta|gamma|delta|theta|sigma|lambda|mu|nu|approx|otimes|leq|geq|neq|'
+        r'forall|exists|langle|rangle|partial|nabla|infty|leftarrow|rightarrow|longrightarrow|'
+        r'min|max|log|exp|lceil|rceil|lfloor|rfloor|le|ge)\b')
+    _code_span = re.compile(r'`([^`]+)`')
+    issues = []
+    in_fence = False
+    for i, line in enumerate(lines, 1):
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        for sp in _code_span.finditer(line):
+            if _latex_cmd.search(sp.group(1)):
+                issues.append(
+                    f"  Line {i}: LaTeX 命令写在反引号 code span 里 → `{sp.group(1)[:45]}` "
+                    f"—— 不渲染,显示裸源码;数学记号请用 $...$")
+    results["latex_in_code_span"] = issues
+
     return results
 
 
@@ -237,6 +262,7 @@ def print_report(results: dict, filepath: str):
         # 否则章节带着不渲染的公式发布(2026-07-12 用户发现,20 处 adjacency 曾漏发)。
         + len(results.get("inline_math_adjacency_github", []))
         + len(results.get("cjk_in_math", []))
+        + len(results.get("latex_in_code_span", []))
     )
     if blocking > 0:
         print(f"🔴 {blocking} BLOCKING issue(s) — auto-REJECT")

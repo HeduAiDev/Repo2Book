@@ -127,3 +127,16 @@ def test_inline_adjacency_and_cjk_are_blocking(tmp_path):
     assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 1
     ch.write_text("能力 $M$ 的强度。\n", encoding="utf-8")  # 两侧留空格→过
     assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 0
+
+
+def test_latex_in_code_span_blocking(tmp_path):
+    """LaTeX 命令写反引号 code span 里不渲染,须阻断(2026-07-12)。"""
+    import subprocess, sys
+    LINT = str(pathlib.Path(__file__).resolve().parents[1] / "lint_formulas.py")
+    ch = tmp_path / "chapter.md"
+    ch.write_text("低秩矩阵 `W_1 \\in \\mathbb{R}^{V \\times r}` 存不下。\n", encoding="utf-8")
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 1
+    ch.write_text("变量 `num_speculative_steps` 是常量,`\\d+` 是正则。\n", encoding="utf-8")
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 0
+    ch.write_text("秩上界 $W \\in \\mathbb{R}^{V \\times r}$ 存得下。\n", encoding="utf-8")
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 0
