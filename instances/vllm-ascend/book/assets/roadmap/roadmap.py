@@ -89,6 +89,8 @@ ALIASES = {
     "ch09": ("parallel-kv", "原理篇：EPLB 均衡算法"),
     "ch31": ("models",      "原理篇：量化数学"),
     "ch26": ("attention",   "原理篇：V4 CSA/HCA 压缩注意力"),
+    "ch38": ("models",      "前瞻原理篇：DSpark 半自回归投机解码"),
+    "ch37": ("models",      "原理篇：DFlash 块扩散并行起草"),
 }
 
 
