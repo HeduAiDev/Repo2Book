@@ -29,10 +29,10 @@
 
 | 符号 | 含义 | 首次出现 |
 |---|---|---|
-| $M$（⊕ 算子的稳定化基准） | 合并两组统计量时取的较大者（如 $\max(m_i,m_j)$ 或 $\max(l_a,l_b)$），把两个指数的底数都压到 ≤1 防上溢——本章为叙述简洁补的记号，原论文里是内联写的 $\max(\cdot,\cdot)$，未单独命名 | 二、推导之一 |
+| $M$ （⊕ 算子的稳定化基准） | 合并两组统计量时取的较大者（如 $\max(m_i,m_j)$ 或 $\max(l_a,l_b)$ ），把两个指数的底数都压到 ≤1 防上溢——本章为叙述简洁补的记号，原论文里是内联写的 $\max(\cdot,\cdot)$ ，未单独命名 | 二、推导之一 |
 | $B_r$ | FlashAttention 分块时 Q 的行块大小（row block size） | 三、推导之二 |
 | $B_c$ | FlashAttention 分块时 K、V 的列块大小（column block size），与 $B_r$ 搭配限定局部打分块 $S_{ij}$ 的形状为 $B_r\times B_c$ | 三、推导之二 |
-| $M$（SRAM 容量） | GPU 片上 SRAM 的大小（以元素个数计），IO 复杂度账 $\Theta(N^2d^2/M)$ 分母里的那个 $M$——和上一行 ⊕ 算子的稳定化基准是两个不同的量，别混淆 | 四、推导之三 |
+| $M$ （SRAM 容量） | GPU 片上 SRAM 的大小（以元素个数计），IO 复杂度账 $\Theta(N^2d^2/M)$ 分母里的那个 $M$ ——和上一行 ⊕ 算子的稳定化基准是两个不同的量，别混淆 | 四、推导之三 |
 
 ---
 
@@ -182,7 +182,7 @@ $$
 
 有了 ⊕ 算子，FlashAttention(arXiv:2205.14135 §3.1 Algorithm 1)就水到渠成：把 $Q$ 、 $K$ 、 $V$ 切成能塞进 SRAM 的小块，**一次只把当前这一小块搬上"书桌"算**。手里始终攥着三个 running 量：见过的最高分 $m_i$ 、归一累计 $\ell_i$ 、当前的加权输出 $O_i$(注意力章里的记号沿用， $\ell$ 就是这里的 $d$)。每处理完一个 KV 块，就用 online-softmax 那套 rescale 手法把三个量更新到新基准——**那张 $N\times N$ 的完整打分表，从头到尾没在 HBM 里落过地**。
 
-外层循环遍历 $K,V$ 的列块 $j$,内层遍历 $Q$ 的行块 $i$;每个 $(i,j)$ 块局部算 $S_{ij}=Q_iK_j^{\top}$(至多 $B_r\times B_c$——$B_r$ 是 Q 的行块大小、$B_c$ 是 K,V 的列块大小，绝不是 $N\times N$),局部 softmax 出 $\tilde m_{ij}$ 、 $\tilde\ell_{ij}$ 、 $\tilde P_{ij}$,再把 running 量推到新的全局 max(arXiv:2205.14135 §3.1 Algorithm 1 L11-L13):
+外层循环遍历 $K,V$ 的列块 $j$,内层遍历 $Q$ 的行块 $i$;每个 $(i,j)$ 块局部算 $S_{ij}=Q_iK_j^{\top}$(至多 $B_r\times B_c$ —— $B_r$ 是 Q 的行块大小、 $B_c$ 是 K,V 的列块大小，绝不是 $N\times N$),局部 softmax 出 $\tilde m_{ij}$ 、 $\tilde\ell_{ij}$ 、 $\tilde P_{ij}$,再把 running 量推到新的全局 max(arXiv:2205.14135 §3.1 Algorithm 1 L11-L13):
 
 $$
 m_i^{\mathrm{new}}=\max(m_i,\tilde m_{ij}),\qquad
@@ -324,7 +324,7 @@ Hopper(SM90,streaming multiprocessor 9.0,NVIDIA 上一代数据中心架构)优�
 
 ![重绘自 arXiv:2307.08691 Fig.3：warp 间工作划分：split-K(FlashAttention) vs split-Q(FlashAttention-2)](../diagrams/paper-fig-3.png)
 
-*左边 (a) 是 FlashAttention 的 split-K：$K$ 维被切给 4 个 warp 各算一段 $QK^\top$，再跨 warp 把部分结果写进 shared memory、同步相加；右边 (b) 是 FlashAttention-2 的 split-Q：切分对象换成 $Q$，每个 warp 独立认领一段 $Q$ 行、算完自己那几行的完整输出，warp 之间不再需要通信——省掉的正是 (a) 里那笔 shared-memory 读写。*
+*左边 (a) 是 FlashAttention 的 split-K： $K$ 维被切给 4 个 warp 各算一段 $QK^\top$ ，再跨 warp 把部分结果写进 shared memory、同步相加；右边 (b) 是 FlashAttention-2 的 split-Q：切分对象换成 $Q$ ，每个 warp 独立认领一段 $Q$ 行、算完自己那几行的完整输出，warp 之间不再需要通信——省掉的正是 (a) 里那笔 shared-memory 读写。*
 
 第 3 点尤其重要：vLLM 那个 `return_softmax_lse=True` 返回的，正是这个 $L$ 。有了它，才能把分开算的两段注意力精确拼回去——这就是下一节的主题。
 
@@ -350,7 +350,7 @@ $$
 l_{\mathrm{merge}}=\log\!\big(e^{\,l_a-M}+e^{\,l_b-M}\big)+M
 $$
 
-合并后的 $l_{\mathrm{merge}}$ 也是一张新收据，于是可以一段段接力拼下去(arXiv:1805.02867 §3.1 Eq.4;两段版另见 arXiv:2307.08691 §2.3)。为什么这样合是精确的？设两段各自的归一因子 $Z_a=e^{l_a}$ 、 $Z_b=e^{l_b}$ ，且段 a 的未归一化加权和记为 $\sum_a p\cdot v$，按定义 $O_a=\sum_a p\cdot v\,/\,Z_a$，故 $Z_aO_a$ 正是段 a 的未归一化加权和(段 b 同理);两段的未归一化加权和相加、除以总归一化因子 $Z_a+Z_b$，即为整体输出：
+合并后的 $l_{\mathrm{merge}}$ 也是一张新收据，于是可以一段段接力拼下去(arXiv:1805.02867 §3.1 Eq.4;两段版另见 arXiv:2307.08691 §2.3)。为什么这样合是精确的？设两段各自的归一因子 $Z_a=e^{l_a}$ 、 $Z_b=e^{l_b}$ ，且段 a 的未归一化加权和记为 $\sum_a p\cdot v$ ，按定义 $O_a=\sum_a p\cdot v\,/\,Z_a$ ，故 $Z_aO_a$ 正是段 a 的未归一化加权和(段 b 同理);两段的未归一化加权和相加、除以总归一化因子 $Z_a+Z_b$ ，即为整体输出：
 
 $$
 O=\frac{Z_aO_a+Z_bO_b}{Z_a+Z_b}=w_aO_a+w_bO_b
@@ -541,7 +541,7 @@ $$
 | 3 | [32, 49] | 50 | True | 0.0 |
 | 整段拼接 vs 一次性 | [0, 49] | 50 | — | 0.0 (allclose atol=1e-12 ✓) |
 
-偏差不是"浮点舍入内近似",而是**精确 0**——逐字节相同。道理就写在上面那条公式里：一次性路对第 $i$ 行做 softmax 的非零列集合是 $\{j:j\le i\}$;分块路里第 $i$ 行落在某一块，该块的累积 KV 长度 $\ge i+1$、掩码把 $j>i$ 的列同样置 $-\infty$,于是参与 softmax 的列集合**恰好还是** $\{j:j\le i\}$。同一批标量 $Q_i\!\cdot\! K_j$ 、同一个顺序做 max/exp/求和/加权，结果自然逐字节一致——这条论证不止对我们的参考实现成立，真实 FlashAttention kernel 同理逐字节一致：它的 KV 分块尺寸是固定编译期常量、不随序列长度变化，因果掩码下第 $i$ 行选中的 KV 块集合与块内累加顺序，在"分块喂入 vs 一次性喂入"两条路上完全相同——prefill 路径走的是单调递增的因果扫描，不会触发 split-KV 那种把多个部分结果按权重重排再合并的归约。切点落在 query 轴的哪、切成几块，都不改变任何一行参与运算的列集合。
+偏差不是"浮点舍入内近似",而是**精确 0**——逐字节相同。道理就写在上面那条公式里：一次性路对第 $i$ 行做 softmax 的非零列集合是 $\{j:j\le i\}$;分块路里第 $i$ 行落在某一块，该块的累积 KV 长度 $\ge i+1$ 、掩码把 $j>i$ 的列同样置 $-\infty$,于是参与 softmax 的列集合**恰好还是** $\{j:j\le i\}$ 。同一批标量 $Q_i\!\cdot\! K_j$ 、同一个顺序做 max/exp/求和/加权，结果自然逐字节一致——这条论证不止对我们的参考实现成立，真实 FlashAttention kernel 同理逐字节一致：它的 KV 分块尺寸是固定编译期常量、不随序列长度变化，因果掩码下第 $i$ 行选中的 KV 块集合与块内累加顺序，在"分块喂入 vs 一次性喂入"两条路上完全相同——prefill 路径走的是单调递增的因果扫描，不会触发 split-KV 那种把多个部分结果按权重重排再合并的归约。切点落在 query 轴的哪、切成几块，都不改变任何一行参与运算的列集合。
 
 ![本章地图：chunked prefill 在因果矩阵上沿 query 轴横切](../diagrams/fig34-9-chunked-prefill.png)
 

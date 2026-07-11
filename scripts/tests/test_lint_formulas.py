@@ -56,7 +56,7 @@ def test_too_many_inline_formulas_remains_non_blocking(tmp_path):
 
     p = tmp_path / "chapter.md"
     p.write_text(
-        "有 $x+y=z$，也有 $\\sum_i p_i q_i$，还有 $\\alpha+\\beta=\\gamma$ 这几种表达式混在一段话里。\n",
+        "有 $x+y=z$ ，也有 $\\sum_i p_i q_i$ ，还有 $\\alpha+\\beta=\\gamma$ 这几种表达式混在一段话里。\n",
         encoding="utf-8")
     res = lint_formulas(str(p))
     assert res["too_many_inline_formulas"]
@@ -114,3 +114,16 @@ def test_inline_adjacency_skips_code_and_display(tmp_path):
     from lint_formulas import lint_formulas
     res = lint_formulas(str(ch))
     assert res["inline_math_adjacency_github"] == []
+
+
+def test_inline_adjacency_and_cjk_are_blocking(tmp_path):
+    """行内 $ 紧贴 CJK 与公式内 CJK 是真渲染失败,须阻断→exit 1(2026-07-12)。"""
+    import subprocess, sys
+    LINT = str(pathlib.Path(__file__).resolve().parents[1] / "lint_formulas.py")
+    ch = tmp_path / "chapter.md"
+    ch.write_text("能力$M$的强度。\n", encoding="utf-8")  # $ 紧贴 CJK
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 1
+    ch.write_text("总量 $N_{总}=3$ 个。\n", encoding="utf-8")  # 公式内 CJK
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 1
+    ch.write_text("能力 $M$ 的强度。\n", encoding="utf-8")  # 两侧留空格→过
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 0

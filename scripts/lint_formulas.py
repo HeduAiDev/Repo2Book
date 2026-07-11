@@ -213,7 +213,7 @@ def print_report(results: dict, filepath: str):
 
     if total_issues == 0:
         print("✓ All formula checks passed!")
-        return
+        return 0
 
     for check_name, issues in results.items():
         if issues:
@@ -233,11 +233,16 @@ def print_report(results: dict, filepath: str):
         + len(results.get("tag_requires_amsmath", []))
         + len(results.get("frac_in_inline_math", []))
         + len(results.get("block_math_on_separate_lines", []))
+        # 真·渲染失败类(GitHub 静默不渲染整段/strict KaTeX 报错)——提升为阻断,
+        # 否则章节带着不渲染的公式发布(2026-07-12 用户发现,20 处 adjacency 曾漏发)。
+        + len(results.get("inline_math_adjacency_github", []))
+        + len(results.get("cjk_in_math", []))
     )
     if blocking > 0:
         print(f"🔴 {blocking} BLOCKING issue(s) — auto-REJECT")
     else:
         print("🟢 No blocking issues")
+    return blocking
 
 
 if __name__ == "__main__":
@@ -247,4 +252,5 @@ if __name__ == "__main__":
 
     filepath = sys.argv[1]
     results = lint_formulas(filepath)
-    print_report(results, filepath)
+    blocking = print_report(results, filepath)
+    sys.exit(1 if blocking else 0)
