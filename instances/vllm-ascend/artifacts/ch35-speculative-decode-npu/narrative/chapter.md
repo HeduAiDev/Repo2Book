@@ -265,7 +265,7 @@ class AscendDraftModelProposer(DraftModelProposer, AscendSpecDecodeBaseProposer)
 
 看这个**多继承**：`(EagleProposer, AscendSpecDecodeBaseProposer)`，第一个父类是 vLLM 的策略类、第二个是昇腾的重量级 base。但 `__init__` 里**只显式调了 `AscendSpecDecodeBaseProposer.__init__`**。这是一记漂亮的正交拆分：
 
-- **策略语义**来自 vLLM 的 `EagleProposer`——eagle 怎么用隐藏状态、draft_model 怎么挂 draft 模型，这些上游写好的方法照用；
+- **策略语义**来自 vLLM 的 `EagleProposer`——eagle 怎么用隐藏状态、draft_model 怎么挂 draft 模型，这些上游写好的方法照用（EAGLE 那套「特征级自回归 + 树验证」的原理本章不展开，见姊妹篇《vLLM 源码解读》的 EAGLE 原理章，arXiv:2401.15077）；
 - **构造与前向**来自昇腾的 `AscendSpecDecodeBaseProposer`——持久缓冲、ACLGraph、MLA、昇腾并行组，全在这个重量级 base 里。
 
 两个父类各管一摊：一个出策略、一个出实现，边界清清楚楚，`__init__` 只显式调后者就够了。

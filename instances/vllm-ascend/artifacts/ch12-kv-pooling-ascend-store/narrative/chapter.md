@@ -617,6 +617,8 @@ key 由 `ChunkedTokenDatabase.process_tokens` 生成。这个 `token_database` �
 
 并行坐标进 key 不是冗余——它是分布式下正确复用的约束。同一个 chunk 在不同 TP 分片上是不同的数据，所以必须 TP 坐标一致才算同一个 key。复用要求并行布局对齐，这是池化在分布式下的一道边界。
 
+这条「按前缀复用 KV」的谱系里，另一个常被提到的坐标是 SGLang 的 RadixAttention——它用 radix tree 而非内容哈希表来管理和匹配跨请求共享的前缀 KV（arXiv:2312.07104）；两者要解决的问题相通，索引结构不同。
+
 精简版 `test_same_prefix_same_key_reuse` 验得很直接：同一段 32-token 前缀过两次 `process_tokens`，两次生成的 key 列表逐字相等（`keys_a == keys_b`）；而同一请求里相邻两个 chunk 的 key 不同（`keys_a[0] != keys_a[1]`）。前缀相同则 key 相同、内容不同则 key 不同——内容寻址的两面都对上了。
 
 ### 下路：物理显存地址
@@ -791,7 +793,7 @@ class Backend(ABC):
 
 ### 一个代表：MooncakeBackend 怎么落地
 
-抽象契约最终要落到真实的分布式 store。看 `MooncakeBackend` 怎么实现那三个核心方法：
+抽象契约最终要落到真实的分布式 store。Mooncake 本身是月之暗面（Moonshot AI）开源的以 KV cache 为中心的分离式大模型服务架构（Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving, arXiv:2407.00079），本章 `ascend_store` 这套按内容寻址的池化设计，思路上对应的正是它的 KVCache pool。看 `MooncakeBackend` 怎么实现那三个核心方法：
 
 ```python
 # vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py:L170

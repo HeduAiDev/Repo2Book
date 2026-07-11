@@ -8,6 +8,8 @@
 
 [第 14 章](../../ch14-npuworker-execution-control/narrative/chapter.md) 里 `NPUWorker` 跑完 profiling、算出了「这张卡能放多少个 KV block」的预算；[第 16 章](../../ch16-single-step-forward-context-dp-sync/narrative/chapter.md) 里 `execute_model` 跑了一拍前向，前向里每一层注意力都伸手向 `self.kv_caches` 要它那块 K、V 张量。
 
+先补一句这套 block 从何而来：vLLM 不给每条序列预留一整段连续显存，而是学操作系统的虚拟内存，把 KV cache 切成固定大小的物理 block、用一张 block table 做「逻辑页→物理页」的间接映射——这就是 **PagedAttention**（arXiv:2309.06180）。非连续分页换来两个好处：消掉「按最大长度预留整段连续显存」造成的碎片，以及让 prompt 前缀相同的请求直接共享同一批物理 block。本章不展开其原理，见姊妹篇《vLLM 源码解读》的 PagedAttention 那一章；这里只关心昇腾侧怎么把这些 block 物化成 NPU 上的真实张量。
+
 可这中间有一道没讲的缝：**预算只是一串字节数，前向要的是带 dtype、带形状、还得挂在正确层上的真实张量。** 谁把字节数变成张量？这就是本章的主角——`initialize_kv_cache_tensors`。
 
 它本身只有三步：分配（allocate）→ 重整（reshape）→ 绑定（bind）。要是放在基座 GPU 上，这三步平平无奇。但搬到昇腾，每一步都被改写过——而且都是**非改不可**的改写。本章就把这三步在昇腾上多做的事，一件件对着基座 `gpu_model_runner.py` 掰开：

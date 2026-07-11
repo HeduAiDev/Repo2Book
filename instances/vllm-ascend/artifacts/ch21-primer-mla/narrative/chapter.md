@@ -365,7 +365,7 @@ $$
 | 1 | 0.8303 | 4 | 8 | 0 |
 | 2 | 0.8692 | 4 | 8 | 0 |
 
-三步的「KV cache 变化」列全为 0。训练期 query 中间激活从满维 8 压到 $d_c'{=}4$ （DeepSeek-V2 里是从 16384 压到 $d_c'{=}1536$ ），而推理缓存纹丝不动——**q 侧低秩省的是训练激活，不是 KV cache。** 落地代码里，这一步藏在 `_mla_preprocess`（`vllm_ascend/attention/mla_v1.py:L1640-L1667`）的 `fused_qkv_a_proj` 拆分：它同时吐出 q 侧的 `q_c`（过 `q_a_layernorm` 后再上投影）与 KV 侧的 `kv_no_split`，两侧各走各的路（`q_lora_rank`、`kv_lora_rank` 等维度字段在构造时绑定，见 `vllm_ascend/attention/mla_v1.py:L728-L742`）。
+三步的「KV cache 变化」列全为 0。训练期 query 中间激活从满维 8 压到 $d_c'{=}4$ （DeepSeek-V2 里是从 16384 压到 $d_c'{=}1536$ ），而推理缓存纹丝不动——**q 侧低秩省的是训练激活，不是 KV cache。** 落地代码里，这一步藏在 `_mla_preprocess`（`vllm_ascend/attention/mla_v1.py:L1640-L1667`）的 `fused_qkv_a_proj` 拆分：它同时吐出 q 侧的 `q_c`（过 `q_a_layernorm` 后再上投影——`layernorm` 这里实际是 RMSNorm，Root Mean Square Layer Normalization，arXiv:1910.07467，只按均方根缩放、不做去均值的轻量归一化）与 KV 侧的 `kv_no_split`，两侧各走各的路（`q_lora_rank`、`kv_lora_rank` 等维度字段在构造时绑定，见 `vllm_ascend/attention/mla_v1.py:L728-L742`）。
 
 ---
 

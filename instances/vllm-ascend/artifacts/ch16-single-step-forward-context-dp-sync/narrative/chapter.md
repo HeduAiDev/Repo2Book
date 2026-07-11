@@ -484,7 +484,7 @@ additional_kwargs = current_platform.set_additional_forward_context(
 挂进去的字段不少，挑本章主线相关的几个说透：
 
 - **moe_comm_type / moe_comm_method**：本拍 MoE 用哪种通信原语。`select_moe_comm_method` 选出类型，`get_moe_comm_method` 据此取出对应的方法实例。[下一节](#166-select_moe_comm_method每拍前向前先把通信方式定下来)专讲。
-- **flash_comm_v1_enabled / flashcomm_v2_enabled**：是否启用序列并行（SP）。flashcomm 是昇腾为序列并行设计的通信原语，把 token 沿序列维切分到多卡，v1/v2 是两个不同版本。注意 v1 对非 MoE 模型带一个 `num_tokens > 1000` 的经验阈值——并发高时切换 SP 收益最大，并发低时切换反而劣化，所以低于阈值就不开。MoE 模型不设阈值、draft 模型直接关。
+- **flash_comm_v1_enabled / flashcomm_v2_enabled**：是否启用序列并行（SP）。flashcomm 是昇腾为序列并行设计的通信原语，把 token 沿序列维切分到多卡、在需要完整隐藏态时再 all-gather 拼回——这条「沿序列维切分 + TP 组内聚合」的设计路子，与 Megatron-LM 提出的序列并行（Reducing Activation Recomputation in Large Transformer Models, arXiv:2205.05198）一脉相承，v1/v2 是昇腾这套原语的两个不同版本。注意 v1 对非 MoE 模型带一个 `num_tokens > 1000` 的经验阈值——并发高时切换 SP 收益最大，并发低时切换反而劣化，所以低于阈值就不开。MoE 模型不设阈值、draft 模型直接关。
 - **mmrs_fusion**：mm_reduce_scatter 融合，仅当 `tp_world_size`（TP = Tensor Parallel 张量并行，把大张量切分到多卡，`tp_world_size` 即参与张量并行的卡数）`<= 8` 且非 MoE 时开（注释挂着 TODO：等算子支持 tp≥16 再放开）。
 - **padded_num_tokens / mc2_mask**：MC2 通信要把 token 数补齐到规整形状，并用一张掩码标出哪些是真 token、哪些是 padding。
 

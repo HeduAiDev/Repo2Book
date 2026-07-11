@@ -541,7 +541,7 @@ prefill 用 `q_proj` 出**满维** `q_nope` / `q_pe`，**不吸收**；而且它
 
 ## 22.8 exec_kv：一个算子做完 RMSNorm + RoPE + 写 cache
 
-上面两条路都调了 `exec_kv_*` 来处理 KV，落点是昇腾最有代表性的融合算子 `npu_kv_rmsnorm_rope_cache`。它把三件本来分开的事——`kv_a_layernorm` 的 RMSNorm、`k_pe` 的 RoPE、写分页 KV cache——揉进一个 kernel：
+上面两条路都调了 `exec_kv_*` 来处理 KV，落点是昇腾最有代表性的融合算子 `npu_kv_rmsnorm_rope_cache`。它把三件本来分开的事——`kv_a_layernorm` 的 RMSNorm（这个归一化的出处见 [第 21 章](../../ch21-primer-mla/narrative/chapter.md) `q_a_layernorm` 一处的注解）、`k_pe` 的 RoPE、写分页 KV cache——揉进一个 kernel：
 
 ```python
 # vllm_ascend/attention/mla_v1.py:L1312

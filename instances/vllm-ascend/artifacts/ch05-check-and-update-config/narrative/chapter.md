@@ -175,11 +175,11 @@
                 vllm_config.cache_config.cpu_kvcache_space_bytes = None
 ```
 
-先认一下这两个被归零的特性：`disable_cascade_attn` 关的是 cascade attention（GPU 上一种共享前缀的注意力加速路径），`cpu_kvcache_space_bytes` 是把 KV cache 卸载到 CPU 内存的开关——都是别家硬件的路数，昇腾用不上。
+先认一下这两个字段：`disable_cascade_attn` 管的是 cascade attention（一种在共享前缀场景下加速注意力的路径），`cpu_kvcache_space_bytes` 是把 KV cache 卸载到 CPU 内存的开关。这两段的处理方向其实相反：后者是别家硬件的路数、昇腾用不上，直接归零成 `None`；而前者恰恰相反——昇腾把它设回 `False`，是为了**启用** cascade attention，下面单独说清。
 
 `getattr(model_config, "disable_cascade_attn", False)` 这一句有个巧思：第三个参数 `False` 是**探测用的默认值**。如果 config 上根本没这个属性，`getattr` 返回 `False`，`if` 不进，什么都不发生——**不会因为某个 GPU 专属字段在昇腾配置里不存在而崩**。只有当字段存在且为真（用户确实开了它），才 warn + reset。这个「拿默认值当探针」的写法，让这套代码对「config 上有没有这个字段」天然鲁棒。
 
-> 顺带一提 `disable_cascade_attn` 这个名字的反直觉处：它字面是「禁用 cascade attention」，而昇腾这里把它强行设回 `False`。也就是说——昇腾**始终不走** cascade attention 那条 GPU 专属路径，所以这个「是否禁用」的开关对它没有意义，统一压成 `False`。
+> `disable_cascade_attn` 这个名字得反着读：它字面是「禁用 cascade attention」，base vLLM 里默认就是 `True`（也就是默认不开 cascade attention），实际是否启用由 `cascade_attn_enabled = not disable_cascade_attn` 决定。昇腾这段把它强行写回 `False`——`not False` 为真，等于**强制让 cascade attention 启用**（而不是禁用），因为昇腾后端自己实现了这条共享前缀的加速路径、支持它。所以段 1 和本方法里其它段方向恰好相反：别处是 warn 完把 GPU 特性关掉，这里是 warn 完反而把特性打开。（这段日志文案写得糙——嘴上说 GPU 参数「不支持」，手上的动作却是启用；以代码实际赋值为准。）cascade attention 具体按共享前缀触发的前向逻辑，见[第 16 章：单步前向的上下文与 DP 同步](../../ch16-single-step-forward-context-dp-sync/narrative/chapter.md)。
 
 ### 同一招式，换个子配置
 
@@ -254,7 +254,7 @@ NVTX 是 NVIDIA 的 tracing 工具，partial prefill（分块预填——把预�
 
 ### 特例：把参数「改写」而非「丢弃」
 
-到这里，9 段里 8 段都是「丢弃 / 归零」——把不适用的参数压回安全值。但段 9 里藏着一个**质上不同**的处理，也是本章把两条主线串起来的关键扣子。
+到这里，九段里除段 1 外基本都是「丢弃 / 归零」——把不适用的参数压回安全值（段 1 也只是改一个布尔位，只是方向相反、把 cascade attention 打开）。但段 9 里藏着一个**质上不同**的处理：它不是简单赋一个值，而是把参数结构性地改写掉，也是本章把两条主线串起来的关键扣子。
 
 `--numa-bind` 是 vLLM 的一个通用旗标，让 worker 进程按 NUMA 拓扑绑核。昇腾不能直接用它（GPU-to-NUMA 的拓扑探测在 NPU 上不可用），但昇腾**有自己的等价能力**——原生的 CPU 绑核。于是这里没有简单丢弃，而是**无损改写**：
 
@@ -298,7 +298,7 @@ NVTX 是 NVIDIA 的 tracing 工具，partial prefill（分块预填——把预�
 
 | 子配置 | 参数 | 来源平台 | 处理 | 类型 |
 | --- | --- | --- | --- | --- |
-| Model | `disable_cascade_attn` | GPU | → `False` | 归零 |
+| Model | `disable_cascade_attn` | GPU | → `False` | **反向：启用** |
 | Cache | `cpu_kvcache_space_bytes` | 不兼容后端 | → `None` | 丢弃 |
 | Observability | `enable_layerwise_nvtx_tracing` | NVIDIA | → `False` | 归零 |
 | Scheduler | `max_num_partial_prefills` | ROCm | → `1` | 复位默认 |
@@ -306,7 +306,7 @@ NVTX 是 NVIDIA 的 tracing 工具，partial prefill（分块预填——把预�
 | Attention | `backend`（非 FLASH_ATTN） | 通用 | → `None`（FLASH_ATTN 保留） | 有例外的归零 |
 | Parallel | `numa_bind` | 通用 | → `False` **且** `additional_config['enable_cpu_binding']=True` | **无损改写** |
 
-最后一行和前面所有行的区别一目了然：别的都是「拿掉」，只有 `numa_bind` 是「翻译」。
+最后一行和前面各行的区别一目了然：别的多是「拿掉」（只有 `disable_cascade_attn` 反手把 cascade 打开），而 `numa_bind` 是「翻译」——把用户意图换一种昇腾原生的方式实现。
 
 我们可以在精简版里把这套行为跑出来交叉验证。比如「批量归零」和「无损改写」两条：
 

@@ -14,6 +14,8 @@
 
 本章源码主线是一个文件：`vllm_ascend/attention/attention_v1.py`。姊妹篇对照基座的 `vllm/v1/attention/backends/flash_attn.py`——昇腾把它的 flash kernel 换成了 NPU 算子，我们会逐一对上号。
 
+先给还没接触过 FlashAttention 的读者一句最小直觉：FlashAttention（arXiv:2205.14135）不改注意力的数学，只改**怎么算**——把 Q/K/V 分块，用**在线 softmax**（边扫 K/V 块、边用增量公式滚动更新归一化因子）分块递推地累加输出，**全程不物化那张 $N \times N$ 的注意力矩阵**，把显存读写从 $O(N^2)$ 压到近似线性，成了长序列注意力的实际标配（Hopper GPU 上的异步/FP8 版是 FlashAttention-3，arXiv:2407.08608）。不懂它的分块推导也能读本章，只需接受「昇腾要顶替的就是这类 flash 内核」；完整的在线 softmax 递推推导，见姊妹篇《vLLM 源码解读》的 FlashAttention 原理章。
+
 > **一句话说明**：昇腾主机一般没有 CUDA，本章的数值追踪跑在纯 Python 的控制流上（五态分流、拆批、`slot_mapping` 装配、`forward_impl` 选路都是 Python）。真正的 `_npu_paged_attention` / `npu_fused_infer_attention_score` 是 NPU 内核，host 上不真算——但它们的入参怎么被整理、何时被调用，全都可读可验。
 
 ![本章地图：五态机与双算子路径的源码剖面](../diagrams/chapter-map.png)
@@ -608,7 +610,7 @@ def _get_fia_params(self, key, value, attn_metadata, kv_cache=None):
 
 ### Fused 算子：TND 变长布局 + `sparse_mode`
 
-整理完入参，调真正的算子。先说清「fused（融合）」是什么意思：它把「从 cache 取历史 KV + 算注意力分数 + 按 `scale` 缩放」这多步并进**一次** NPU kernel 调用，而不是拆成几个算子分开算——这正是 `fused_infer_attention`（fused-infer）名字的由来。标准 MHA 走非 attention-sink 分支，按 `sparse_mode` 三选一；`sparse_mode` 是 NPU 算子的 **mask 类型参数**（`0` 无 mask / `3` 因果下三角 / `4` 滑窗），不是魔法数：
+整理完入参，调真正的算子。先说清「fused（融合）」是什么意思：它把「从 cache 取历史 KV + 算注意力分数 + 按 `scale` 缩放」这多步并进**一次** NPU kernel 调用，而不是拆成几个算子分开算——这正是 `fused_infer_attention`（fused-infer）名字的由来。标准 MHA 走非 attention-sink 分支，按 `sparse_mode` 三选一；`sparse_mode` 是 NPU 算子的 **mask 类型参数**（`0` 无 mask / `3` 因果下三角 / `4` 滑窗），不是魔法数（attention sink 这个概念出自 StreamingLLM，Efficient Streaming Language Models with Attention Sinks，arXiv:2309.17453，原论文里 sink 是固定的前几个 token，下面这条分支里的 `learnable_sink` 则是把 sink 变成可学习参数的变体）：
 
 ```python
 # vllm_ascend/attention/attention_v1.py:L1045-L1164
@@ -777,7 +779,7 @@ def full_graph_pa(
 
 主路径讲完了。`attention_v1.py` 里还住着一个血缘很近的子类，值得点一句名：`AscendC8AttentionBackendImpl`。
 
-它是 `AscendAttentionBackendImpl` 的 INT8 KV 量化（C8 / QuaRot）子类。把 K/V 量化成 INT8 写进 NZ 排布的 5 维分页 cache（`npu_scatter_pa_kv_cache`），decode 走 FIA V1 的 BNSD 布局加 per-channel 反量化，prefill 则 gather 后再 dequant。一句话：用精度换显存与带宽，KV cache 直接砍到四分之一。per-channel 反量化背后 scale/zero-point 那套量化数学，见[第 31 章](../../ch31-primer-quantization/narrative/chapter.md)。
+它是 `AscendAttentionBackendImpl` 的 INT8 KV 量化（C8 / QuaRot，即 QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs 提出的旋转量化思路：用 Hadamard 旋转把激活里的离群值搅平，让 4/8-bit 量化更容易，arXiv:2404.00456）子类。把 K/V 量化成 INT8 写进 NZ 排布的 5 维分页 cache（`npu_scatter_pa_kv_cache`），decode 走 FIA V1 的 BNSD 布局加 per-channel 反量化，prefill 则 gather 后再 dequant。一句话：用精度换显存与带宽，KV cache 直接砍到四分之一。per-channel 反量化背后 scale/zero-point 那套量化数学，见[第 31 章](../../ch31-primer-quantization/narrative/chapter.md)。
 
 但它**不在标准 MHA 主路径上**——要经 `kv_c8.py` 的类替换（class surgery）手术才激活。本章把它当减法候选：知道它存在、知道它在哪、知道它解决什么问题就够了，不展开。真要读，它是上面这套五态机 + 双算子路径的「量化变奏」，骨架完全一致。
 

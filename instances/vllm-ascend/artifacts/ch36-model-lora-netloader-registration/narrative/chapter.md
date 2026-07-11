@@ -145,7 +145,7 @@ class AscendDeepseekV4SWACache(VllmDeepseekV4SWACache):
 
 ## 36.2 LoRA 第一招：改写 vLLM 的全局元组，把昇腾类塞进候选池
 
-模型注册有现成 API。LoRA（Low-Rank Adaptation，低秩微调：给线性层的权重增量做低秩分解，用两个小矩阵而非一整块满秩矩阵去微调模型，算力账见 36.3 节）这一处没有——vLLM 没给「注册一个自定义 LoRA 层」的公开口子。昇腾的解法是直接伸手改 vLLM 的模块级全局变量。这就是本章的第二种注册形态，一个干净利落的「全局类替换」trick。
+模型注册有现成 API。LoRA（Low-Rank Adaptation，低秩微调：给线性层的权重增量做低秩分解，用两个小矩阵而非一整块满秩矩阵去微调模型，算力账见 36.3 节；奠基论文见 Hu et al., LoRA: Low-Rank Adaptation of Large Language Models, arXiv:2106.09685）这一处没有——vLLM 没给「注册一个自定义 LoRA 层」的公开口子。昇腾的解法是直接伸手改 vLLM 的模块级全局变量。这就是本章的第二种注册形态，一个干净利落的「全局类替换」trick。
 
 要理解这个 trick，先得看 vLLM 怎么给一个普通线性层套上 LoRA。逻辑在 `vllm/lora/utils.py`：
 
@@ -277,7 +277,7 @@ wrapper 怎么被选中，又是一条注册主线。vLLM 通过平台层问「�
         return "vllm_ascend.lora.punica_npu.PunicaWrapperNPU"
 ```
 
-又是返回一个限定名字符串（CUDA 平台这里返回的是 `PunicaWrapperGPU`），由 vLLM 的选择器实例化。punica 这个名字来自 LoRA 的 batched-GEMM 论文，你只需把它理解成「管 LoRA 算子元数据、分发 LoRA GEMM 的那个对象」。
+又是返回一个限定名字符串（CUDA 平台这里返回的是 `PunicaWrapperGPU`），由 vLLM 的选择器实例化。punica 这个名字来自 LoRA 的 batched-GEMM 论文 Punica: Multi-Tenant LoRA Serving（arXiv:2310.18547），你只需把它理解成「管 LoRA 算子元数据、分发 LoRA GEMM 的那个对象」。
 
 被选中的 `PunicaWrapperNPU` 定义在 `vllm_ascend/lora/punica_npu.py`，它继承 vLLM 的 `PunicaWrapperBase`——又是薄壳继承的范式。LoRA 接入的两招都挤在它的 `__init__` 里：
 
@@ -405,6 +405,8 @@ $$
 
 - **bgmv**（batched gather matvec）：decode 阶段，每个请求每拍只生一个 token，多个请求各带不同 LoRA，按 token 选各自的 LoRA 权重做矩阵-向量乘。
 - **sgmv**（segmented gather matvec）：prefill 阶段，prompt 变长，按 segment 边界分段做矩阵乘。
+
+这套「一批请求各带各的 LoRA、仍要凑成一次算子调用」的批量多 LoRA 服务思路，在系统侧的代表性工作是 S-LoRA（S-LoRA: Serving Thousands of Concurrent LoRA Adapters, arXiv:2311.03285）。
 
 走到最底层，昇腾的算子不过是一层薄壳。看 `vllm_ascend/lora/lora_ops.py` 里的两个代表：
 

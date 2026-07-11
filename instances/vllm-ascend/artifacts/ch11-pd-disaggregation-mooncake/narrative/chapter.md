@@ -12,6 +12,10 @@
 
 **PD 分离**（prefill/decode disaggregation）的思路很直接：把这两件事拆到**不同的节点组**上各自跑、各自批、各自扩缩。prefill 实例算得快，decode 实例吐得稳。代价只有一个——prompt 那段 KV 是 prefill 算出来的，得**搬到 decode 节点**去，decode 才能接着往下吐。
 
+为什么「拆开」值得？把两阶段的开销摊开算一笔账。设 prompt 长 $L$ 、隐藏维 $d$ ：prefill 要为 $L$ 个 token 两两算注意力，计算量随 $O(L^2 d)$ 增长（此处取随 $L$ 二次增长的注意力项，投影 / FFN 的 $O(Ld^2)$ 项在长上下文下不主导分水岭），属**算力密集**型；decode 每步只为一个新 token 读一遍已缓存的 $L$ 段 KV，单步搬运量随 $O(L d)$ 增长、真正参与计算的却只有一个 token，属**访存密集**型。两者挤一张卡时，矛盾是**量级**上的：一个 prefill 大批量顶上来，就占满算力单元几十上百毫秒，夹在中间的 decode 步只能干等——decode 的 TPOT（time-per-output-token，每输出一个 token 的延迟）被 prefill 的批量直接拉长；反过来为压低 decode 延迟而把批量调小，又让 prefill 喂不饱算力、吞吐塌下来。同一批硬件被两个性格相反的负载反复争抢，谁都跑不到自己的最优点。
+
+拆到独立节点组后，prefill 集群按「算力打满」配比与并行，decode 集群按「延迟稳、显存带宽足」配比，各自独立扩缩——这正是 DistServe（arXiv:2401.09670）与 Splitwise（arXiv:2311.18677）用生产 trace 量化过的结论：相位分离能在满足 TTFT（首 token 延迟）/TPOT 约束下把有效吞吐（goodput）显著抬高。代价则集中在一处：prompt 的那段 KV 得整块跨节点搬到 decode 侧，这一搬既吃网络带宽、又在关键路径上加一段延迟。于是「拆分是否划算」归结为一道权衡——只要 KV 传输的开销显著小于「两负载互相干扰所浪费的算力与延迟」，分离就赚。让这道账普遍成立的关键，是把调度从「以计算为中心」转成**以 KVCache 为中心**：尽量让 decode 请求落到「它要的前缀 KV 已在本地或最近节点」的实例上，把跨节点搬运量压到最小。本章昇腾用的传输库就叫 **mooncake**，取自同名论文 Mooncake（arXiv:2407.00079，Kimi 背后的 KVCache-centric 分离式服务架构）；后文的「KV 亲和调度」正是这套 KVCache-centric 思想在昇腾侧的落地。
+
 这一章就是讲昇腾怎么把这件事做出来。代码的入口在 `vllm_ascend/distributed/kv_transfer/__init__.py`，但它不是一个文件，而是**三层**叠在一起的一套机制；最后还有一个让「搬一次」尽量便宜的高潮——**KV 亲和调度**。
 
 ![本章地图：proxy 分发→连接器分发→mooncake P2P→KV 亲和的三层源码剖面](../diagrams/chapter-map.png)

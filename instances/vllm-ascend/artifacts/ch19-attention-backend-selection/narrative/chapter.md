@@ -215,6 +215,8 @@ def register_backend(
 
 读一遍这个返回值：在 **V2 model-runner**（vLLM 里负责加载模型、初始化 KV cache 的那条执行路径的新版本；这套 V1/V2 runner 的区别到 [第 24 章](../../ch24-sparse-attention-sfa-dsa/narrative/chapter.md) 还会再遇到，此处只需知道它是个二值开关）下，`AscendAttentionBackend.get_name()` 返回的不是 `"ASCEND"`、也不是 `"CUSTOM"`，而是 **`"FLASH_ATTN"`**——一个 CUDA FlashAttention 后端的名字。一个跑在昇腾 NPU 上、压根不是 FlashAttention 的后端，对外**自报家门说自己是 FlashAttention**。
 
+顺带交代这个被冒充的名字到底指什么：FlashAttention（arXiv:2205.14135）是一套 **IO 感知**的注意力算法——用**在线 softmax** 把 Q/K/V 分块递推地累加输出，全程不物化那张 $N \times N$ 注意力矩阵，把显存读写降到近似线性，是 GPU 上长序列注意力的实际标配（Hopper 上的异步/FP8 版为 FlashAttention-3，arXiv:2407.08608）。昇腾冒用这个名字，图的是搭上 vLLM 里所有「见到 `FLASH_ATTN` 就走某条既定快路」的现成逻辑；它自家的 flash 内核究竟怎么算、在线 softmax 怎么递推，分别见 [第 20 章](../../ch20-ascend-attention-mha/narrative/chapter.md)和姊妹篇《vLLM 源码解读》的 FlashAttention 原理章。
+
 它冒充的对象，是 vLLM 自带的这位：
 
 ```python

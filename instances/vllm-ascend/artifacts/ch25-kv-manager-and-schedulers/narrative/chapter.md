@@ -237,6 +237,8 @@ $$
 
 接下来三节是三个调度器子类。它们有一个共同的、反直觉的特点：**改动极小，文件却极大**。先用最简单的 `SchedulerDynamicBatch` 把这个矛盾讲透。
 
+这里得先交代 `SchedulerDynamicBatch` 站在什么之上：它继承的 vLLM `Scheduler` 本身就是一台**连续批处理**（continuous batching，按 iteration 而非整条请求为粒度调度）的调度器——维护 `WAITING` / `RUNNING` 两条队列，每一步前向在一个 token 预算内决定「放哪些等待请求进来、让哪些运行请求再吐一个 token」，某条请求一出结束符就立刻退场、空出的槽当拍补给新请求。这套「迭代级调度 + token 预算」的基底最早由 Orca（OSDI 2022）提出，是 vLLM 高吞吐的地基；本书不展开，姊妹篇《vLLM 源码解读》的连续批处理调度章讲透了它。昇腾在这个基底上只做外科级改动。
+
 它对 vLLM `Scheduler` 只有两处实质改动。第一处是动态 token 预算，靠一个 `BudgetRefiner`。`BudgetRefiner` 启动时读一张 `profile_table.csv`（含 `ctx_len` / `d_num` / `cost` / `chunk_size` 几列），`groupby` 整理成一张查找表，运行时按当前 decode 负载查表。这张表由**离线** profiling 预先生成、随包放在 `core/` 目录下；本类只用 `pd.read_csv` 读它的结果、**不负责生成**——文件缺失时只记一条 error 日志、把 `enabled` 置回 `False` 退到静态预算（源码注释直接写「Please download the corresponding table file」）：
 
 ```python
