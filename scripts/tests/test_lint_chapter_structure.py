@@ -44,3 +44,12 @@ def test_scaffold_leak_blocking(tmp_path):
             "```python\n# vllm/v1/engine/async_llm.py:L637\ny=2\n```\n")
     res = lint_structure(_w(tmp_path, text))
     assert res["scaffold_leak"]
+
+
+def test_external_source_anchor_normalized():
+    """前瞻 primer:dossier 带 ../book/external-source/<slug>/ 前缀的锚点应能匹配正文规范路径块。"""
+    from lint_chapter_structure import _norm_anchor_path
+    assert _norm_anchor_path("../book/external-source/dspark-pr46995/vllm/model_executor/models/qwen3_dspark.py") \
+        == _norm_anchor_path("vllm/model_executor/models/qwen3_dspark.py")
+    assert _norm_anchor_path("vllm/foo.py") == "vllm/foo.py"
+    assert _norm_anchor_path("../../vllm/foo.py") == "vllm/foo.py"

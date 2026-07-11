@@ -80,6 +80,20 @@ def _embedded_block_ranges(text: str):
     return ranges
 
 
+_EXTSRC_PREFIX_RE = re.compile(r'^(?:\.\./)*book/external-source/[^/]+/')
+
+
+def _norm_anchor_path(p: str) -> str:
+    """归一化源码锚点路径,便于 dossier 锚点与正文规范路径比较。
+    前瞻 primer 章的 dossier source_anchors 带 `../book/external-source/<slug>/` 前缀,
+    正文按硬规则 3 只标规范路径(如 vllm/…)——剥掉该前缀与前导 ../ 再比,
+    否则外部快照章的 core 机制会被系统性误报缺源码层。"""
+    p = _EXTSRC_PREFIX_RE.sub('', p)
+    while p.startswith('../'):
+        p = p[3:]
+    return p
+
+
 def _core_mechanism_source_check(chapter_dir: Path, text: str):
     """返回 (missing, ) —— 每个 difficulty=core 机制若其全部 source_anchors 都与正文
     任何内嵌源码块区间不相交，报告该 mechanism_id。非 core 机制、无 dossier、
@@ -111,7 +125,8 @@ def _core_mechanism_source_check(chapter_dir: Path, text: str):
         if not parsed_anchors:
             continue  # source_anchors 格式不可解析（如非 path:La-Lb），跳过避免误报
         hit = any(
-            apath == bpath and max(ala, bla) <= min(alb, bld)
+            _norm_anchor_path(apath) == _norm_anchor_path(bpath)
+            and max(ala, bla) <= min(alb, bld)
             for apath, ala, alb in parsed_anchors
             for bpath, bla, bld in block_ranges
         )
