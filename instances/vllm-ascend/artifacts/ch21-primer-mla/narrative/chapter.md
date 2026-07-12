@@ -70,7 +70,53 @@ $$
 
 ### 源码：真实代码里的缓存已经不是这个形状
 
-有意思的是，在昇腾的 MLA 实现里，KV cache 的形状**根本没有那个 $2\,n_h\,d_h$**：
+有意思的是，在 vLLM 的 MLA 实现里，KV cache 的形状**根本没有那个 $2\,n_h\,d_h$**——但要看清这一点，得先看清特化发生在哪一步，而不是被下面这个「转发函数」的签名唬住。真正决定缓存形状参数的，是基座仓里 `MLAAttention`（MLA 专属的注意力层类，管住 query/key/value 投影与写缓存）的构造函数：
+
+```python
+# vllm/model_executor/layers/attention/mla_attention.py:L335-L365（类 MLAAttention 构造函数，节选）
+def __init__(
+    self,
+    num_heads: int,
+    scale: float,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    v_head_dim: int,
+    q_lora_rank: int | None,
+    kv_lora_rank: int,
+    kv_b_proj: ColumnParallelLinear,
+    # … 省略 cache_config/quant_config/prefix/use_sparse/indexer 等无关形参 …
+):
+    super().__init__()
+    # … 省略 num_heads/scale/qk_nope_head_dim/v_head_dim/q_lora_rank/kv_b_proj 等无关赋值 …
+    self.kv_lora_rank = kv_lora_rank
+    self.head_size = kv_lora_rank + qk_rope_head_dim
+    # … 省略 layer_name/indexer …
+
+    self.num_kv_heads = 1
+```
+
+`kv_lora_rank`（代码里对 KV 潜向量维度的叫法，数值上就是我们记号里的 $d_c$ ）、`qk_rope_head_dim`（解耦 RoPE 分量维度，就是 $d_h^R$ ）——这两个字段名换了个说法，数值上跟前面符号表是同一个数：DeepSeek-V2 取 $d_c{=}512$ 、 $d_h^R{=}64$ （§3.1.2，符号表已引过），所以这里 `self.head_size = 512 + 64 = 576`；而 `self.num_kv_heads` 被**直接硬编码成常量 1**——不管模型的 $n_h$ 是多少，MLA 每层缓存都只认一个「kv 头」。对比之下，vLLM 通用的 `Attention` 层（标准 MHA/GQA 走这个类，`vllm/model_executor/layers/attention/attention.py:L194`）构造时 `num_kv_heads` 是调用方按模型真实头数传进来的参数，不是常量。**这才是「缓存形状里再也找不到 $n_h$ 的乘法」真正发生的地方：不是某个函数施了魔法，是这两个字段在构造时就已经跟 $n_h$ 断了关系。**
+
+这两个特化值紧接着被塞进这一层自己的缓存规格对象：
+
+```python
+# vllm/model_executor/layers/attention/mla_attention.py:L951-L961
+def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+    kv_cache_dtype = kv_cache_dtype_str_to_dtype(
+        self.kv_cache_dtype, vllm_config.model_config
+    )
+    return MLAAttentionSpec(
+        block_size=vllm_config.cache_config.block_size,
+        num_kv_heads=1,
+        head_size=self.head_size,
+        dtype=kv_cache_dtype,
+        cache_dtype_str=vllm_config.cache_config.cache_dtype,
+    )
+```
+
+`MLAAttentionSpec`（MLA 专属的缓存规格对象，告诉显存分块器每层缓存该按多大的块囤）在这里被显式钉死 `num_kv_heads=1`、`head_size` 直接抄上面算出来的 576。分块器分配缓存块时读的就是这份 spec，压根不会再去问 $n_h$ 是多少。
+
+到了昇腾这一侧，`get_kv_cache_shape` 拿到的正是这份已经特化好的 `num_kv_heads`（=1）、`head_size`（=576）——它自己不做任何特化，只是把 spec 里已经钉死的值原样搬进形状元组；MHA 后端调同一个签名的函数时传的是真实头数，函数体一字不差，这正是它作为**通用透传函数**要服务所有注意力后端的代价——签名必须留着 `num_kv_heads`/`head_size` 两个形参，但填进去的值早在上一步就已经跟 $n_h$ 脱钩：
 
 ```python
 # vllm_ascend/attention/mla_v1.py:L95-L103
@@ -85,7 +131,7 @@ def get_kv_cache_shape(
     return num_blocks, block_size, num_kv_heads, head_size
 ```
 
-MHA 的缓存里是「每头一份 K、一份 V」，而这里 MLA 每个 token 每层只留一个「kv 头」宽度的向量——那就是我们下面要推的潜向量。缓存形状里再也找不到 $n_h$ 的乘法。**动机到此说完：怎么把 $2\,n_h\,d_h$ 压成一个与头数无关的小向量，正是 §2.1.2 的任务。**
+MHA 的缓存里是「每头一份 K、一份 V」，而这里 MLA 每个 token 每层只留一个「kv 头」宽度（576 维）的向量——那就是我们下面要推的潜向量（外加解耦 RoPE 分量）。**动机到此说完：怎么把 $2\,n_h\,d_h$ 压成一个与头数无关的小向量，正是 §2.1.2 的任务。**
 
 ---
 

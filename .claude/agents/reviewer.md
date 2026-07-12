@@ -26,6 +26,10 @@ color: red
    勾选表：{mechanism_id, 直觉在场?, 数值推演表在场且标记?, invariant 论证在场?, 量化落数字?,
    core 三层齐?}。先跑 `python3 scripts/lint_trace_consistency.py {chapter_dir}` 作客观依据。
    **输出是逐机制勾选表，不是整体印象分。**
+   **另核论断-证据对齐**(exp-0712-2，primer 尤其易漏)：每个「根本没有/再也找不到/完全不 X」
+   的绝对论断，紧邻的代码/数值是否*就地展示了让它成立的那个特化值或缺席*——而不是露出一个
+   同概念的通用参数(如论断「没有 n_h」却配一段签名里带 `num_kv_heads` 的通用透传函数，读者看到
+   参数就地在场、与论断打架)。论断真但证据选错片段=confusing，须打回换证据。
 2. **figure-integration(auto-REJECT)**：先跑 `python3 scripts/lint_diagrams.py {chapter_dir}`；
    然后**逐张 Read PNG 亲眼看**(不许只读 markdown)：图在其机制讲解附近？图注给结论
    (不是描述画面)？正文引用的数字与图上一致？图对读懂该机制有实际帮助？

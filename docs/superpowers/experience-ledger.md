@@ -36,3 +36,4 @@
 | exp-0709-7 | 2026-07-09 | 杜撰证据引用:正文引用不存在的测试断言/把容差校验说成逐位保证(ch22/ch27,判修 sweep 抓出) | 落笔纪律已含"等式须可执行见证";derivation 维 prompt 补"引用的测试/断言须真实存在"(下轮铺开验证) | 引用核真 0 杜撰 | active |
 | exp-0710-1 | 2026-07-10 | named-workflow args 字符串化撞上 CFG 残留调试配置→静默错车重写已出版章(烧 692k;评审逃生舱救回未归档) | chapter-pipeline args 护栏:字符串解析+无 chapter_id 拒绝 CFG 回退直接终止;CFG 仅限手工无参调试 | 错车零复发 | active |
 | exp-0711-2 | 2026-07-11 | 前瞻 primer(external-source)首用即触发 lint_chapter_structure 系统性假阳性(dossier 锚点带 ../book/external-source/ 前缀 vs 正文规范路径,4/4 core 机制误报缺源码层) | lint_chapter_structure 加 _norm_anchor_path 剥前缀再比+测试;前瞻 spec 已预言"复发即固化",首用即固化(掩盖真信号故不等 ≥2) | 外部快照章零误报 | active |
+| exp-0712-2 | 2026-07-12 | 论断-证据失配:强论断(「根本没有 n_h」)配了不支撑它的证据(通用透传函数签名里露着 num_kv_heads)——论断真但视觉打架致读者困惑(ch21 用户抓;审计 148 论断+36 类比仅此 1 例,孤例) | reviewer algorithm-pedagogy 维加「论断-证据对齐」问法;保真度门禁只验"真源码/不杜撰"、管不到"证据是否展示论断依赖的特化值" | 复发计数(现 1,<2 不立硬 linter) | watch |
