@@ -8,7 +8,7 @@ export const meta = {
     { title: 'Illustrate', detail: '逐批准 key_figure 取原图亲眼看→忠实重绘→登记 manifest→自跑 paper_grounding+geometry' },
     { title: 'Write', detail: 'writer 定点 Edit：符号速查表/首现解释/直觉垫(cliff_points)/light 先修框/图嵌入 target_section' },
     { title: 'DerivationCheck', detail: 'opus 推导审计员对全章 $$ 推导链亲手重推（假设→结论/矩阵形状/数值重算）；fail 则 writer 微修再判，回环 ≤2 轮，竭尽标 BLOCKED' },
-    { title: 'ReaderGate', detail: 'haiku 读者台阶四问硬门禁；fail 则 writer 微修 issues 再判，回环 ≤2 轮，竭尽标 BLOCKED' },
+    { title: 'ReaderGate', detail: 'opus 读者台阶五问(含一致性)硬门禁；fail 则 writer 微修 issues 再判，回环 ≤2 轮，竭尽标 BLOCKED' },
   ],
 }
 
@@ -35,7 +35,7 @@ if (A.phase === 'apply') {
 const REPO = A.repo_root || CFG.repo_root
 const ARTS = REPO + '/instances/' + A.instance + '/artifacts'
 const PAPERS_ROOT = REPO + '/instances/' + A.instance + '/book/papers'
-const MODELS = Object.assign({ diagnose: 'sonnet', materials: 'sonnet', illustrate: 'sonnet', write: 'sonnet', derivation: 'opus' /* 推导审计升档 */, reader: 'haiku', fix: 'sonnet' }, A.models || {})
+const MODELS = Object.assign({ diagnose: 'sonnet', materials: 'sonnet', illustrate: 'sonnet', write: 'sonnet', derivation: 'opus' /* 推导审计升档 */, reader: 'opus' /* exp-0712-3:一致性检测需能力,haiku 对割裂给假通过 */, fix: 'sonnet' }, A.models || {})
 
 const ESC = '\n\n**逃生舱（重要）**：如果你发现给定的批准/素材/路线是错的——真实情况与批准清单不符、施工会破坏正文正确性、缺关键前置信息——**不要硬着头皮做**。立即返回 status="BLOCKED"，blocker_reason 写清「哪里错 + 建议怎么改」。workflow 会中止该章后续阶段（不影响其他章节），把问题交给 Team Lead。'
 
@@ -233,7 +233,8 @@ function readerPrompt(slug) {
   const dir = ARTS + '/' + slug
   return '你是第一次读这篇论文的工程师（高级工程师，懂 Transformer 基础，但没读过这篇论文、没看过源码）。只用 Read 打开 ' + dir + '/narrative/chapter.md（含它引用的图，图也用 Read 打开看）。**不准看论文包/dossier/explainer，不准上网。**\n' +
     '逐个公式/推导步骤过台阶四问：①符号都认识吗（前文解释过，或有符号表）？②公式前有直觉铺垫吗？③从上一步到这一步是否跳步（缺中间推导）？④是否需要先读别的论文才能懂？\n' +
-    '任一问命中"读不懂/卡住" → 记一条 issue：{problem(卡在哪、命中第几问，引用附近原文一句), suggested_fix(具体该补一句什么样的直觉/哪一步中间推导)}。通读一遍后 issues 为空 → pass=true；否则 pass=false。'
+    '再做第五问·全章一致性（跨段落、非单公式）：⑤同一个量/概念是否自始至终同名？若在数学符号（如 $c^{KV}$）、代码标识符（如 decode_k_nope）、中文术语（如「解耦 key」）之间换了称呼，换名处有没有就地点明「这就是前面的 X」？源码块里的标识符是否在出现处就绑回它的数学符号（而非几节后才解释）？有没有某段源码/论断依赖了要到后文才解释的概念（顺序颠倒）？\n' +
+    '①–⑤ 任一命中"读不懂/卡住/换名没打通/顺序颠倒" → 记一条 issue：{problem(卡在哪、命中第几问，引用附近原文一句), suggested_fix(具体该补一句什么样的直觉/中间推导/称呼打通)}。通读一遍后 issues 为空 → pass=true；否则 pass=false。'
 }
 function readerFixPrompt(slug, issues) {
   const dir = ARTS + '/' + slug

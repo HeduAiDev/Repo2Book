@@ -265,19 +265,22 @@ for (let r = 1; r <= 3; r++) {
       )
     }
   })
-  // Haiku 读者视角理解检查：非 primer 为 book-only 顾问性（不门控）；
-  // primer 原理章换「第一次读论文的工程师」人格 + 逐公式台阶四问，可 blocking=true 硬门禁。
+  // 读者视角理解检查：非 primer 为 book-only 顾问性（不门控）；
+  // primer 原理章换「第一次读论文的工程师」人格 + 逐公式台阶四问 + 全章一致性第五问，可 blocking=true 硬门禁。
+  // 模型：primer=opus / 非 primer=sonnet（exp-0712-3：一致性检测需先「察觉多名共指」，haiku 会对割裂给假通过——
+  // 不是「真读者认了」，是「弱模型没察觉有东西可认」，故不再用 haiku）。
   const readerPrompt = PRIMER
     ? ('你是第一次读这篇论文的工程师（高级工程师，懂 Transformer 基础，但**没读过这篇论文**）。只读 ' + CH + '/narrative/chapter.md（含它引用的图），把前面章节当已读背景，**不准看论文原文、不准看源码、不准上网**。\n' +
        '逐个关键公式做台阶四问：①符号都认识吗——前文/符号表解释过？②公式前有没有直觉铺垫？③从上一步到这一步是否跳步（缺推导环节）？④是否需要先读别的论文才能看懂？\n' +
-       '四问中只要有一问答案是"没有/是/需要"（真卡住了）→ blocking=true（卡回 writer，公式必须让没读过论文的工程师看懂），并给 problem + suggested_fix + rationale；其余风格性建议 negotiable=true、blocking=false。全部台阶都过 → pass=true、issues=[]。')
+       '再做第五问·全章一致性（跨段落、非单公式）：⑤同一个量/概念是否自始至终同名？若在数学符号（如 $c^{KV}$）、代码标识符（如 decode_k_nope）、中文术语（如「解耦 key」）之间换了称呼，换名处有没有就地点明「这就是前面的 X」？源码块里的标识符，是否在出现处就绑回它对应的数学符号（而非几节后才解释）？有没有某段源码/论断依赖了要到后文才解释的概念（顺序颠倒）？\n' +
+       '①–⑤ 任一真卡住（答案是"没有/是/需要/换了名却没打通/顺序颠倒"）→ blocking=true（卡回 writer），并给 problem + suggested_fix + rationale；其余风格性建议 negotiable=true、blocking=false。全部台阶都过 → pass=true、issues=[]。')
     : ('你是这本书的目标读者（高级工程师，但**没读过这个仓库的源码**）。只读 ' + CH + '/narrative/chapter.md（含它引用的图），把前面章节当已读背景，**不准看源码、不准上网**。\n' +
-       '站读者视角挑"读不懂/卡住"处：① 术语/缩写首现未解释；② 逻辑跳跃、缺中间步骤；③ 引入了本章没建立的概念（如某测试设施/外部机制）；④ 只有结论无直觉/例子。\n' +
+       '站读者视角挑"读不懂/卡住"处：① 术语/缩写首现未解释；② 逻辑跳跃、缺中间步骤；③ 引入了本章没建立的概念（如某测试设施/外部机制）；④ 只有结论无直觉/例子；⑤ 全章一致性：同一概念多个叫法未打通、代码标识符没就地绑回其含义/数学符号、某段依赖后文才讲的概念（顺序颠倒）。\n' +
        '每条给 problem + suggested_fix（补一句话/一个例子让读者跟上）+ rationale；全部 negotiable=true、blocking=false（可读性不卡章）。读得顺则 pass=true、issues=[]。')
   const readerThunk = function () {
     return agent(
       readerPrompt,
-      { model: 'haiku', schema: DIM_SCHEMA, label: 'review:reader r' + r, phase: 'Review', agentType: 'general-purpose' }
+      { model: PRIMER ? 'opus' : 'sonnet', schema: DIM_SCHEMA, label: 'review:reader r' + r, phase: 'Review', agentType: 'general-purpose' }
     )
   }
   // PRIMER 专属：推导审计维（仿 reader 维之形状——独立 thunk、非 PRIMER 完全不跑；
