@@ -14,7 +14,7 @@ H_BIG = 200  # 朴素矩阵方块边长
 BAR_H = 200  # 低秩两条矩阵的高度
 BAR_W = 46
 
-H = TOP + H_BIG + 170
+H = TOP + H_BIG + 200
 L = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
      '<defs><marker id="a" viewBox="0 0 10 6" refX="9" refY="3" markerWidth="7" '
      'markerHeight="5" orient="auto"><path d="M0,0 L10,3 L0,6 Z" fill="#64748b"/></marker>'
@@ -101,12 +101,15 @@ L.append(f'<text x="{(ax1+ax2)/2}" y="{mid_y-12}" text-anchor="middle" font-fami
 
 # ---- 底部：softmax 仍合法分布 ----
 foot_y = by2 + BAR_H + 130
-L.append(f'<rect x="{PAD}" y="{foot_y-26}" width="{W-2*PAD}" height="56" rx="8" '
+L.append(f'<rect x="{PAD}" y="{foot_y-30}" width="{W-2*PAD}" height="80" rx="8" '
          f'fill="#eff6ff" stroke="#1d4ed8" stroke-width="1.4"/>')
-L.append(f'<text x="{W/2}" y="{foot_y}" text-anchor="middle" font-family="sans-serif" '
+L.append(f'<text x="{W/2}" y="{foot_y-8}" text-anchor="middle" font-family="sans-serif" '
          f'font-size="13" font-weight="bold" fill="#1d4ed8">'
-         f'p_k = softmax(U_k + B_k) 仍是合法分布 → min(1, p_k/q_k) 逐点良定义，验证器零改动</text>')
-L.append(f'<text x="{W/2}" y="{foot_y+20}" text-anchor="middle" font-family="sans-serif" '
+         f'p_k = softmax(U_k + B_k) 仍是合法分布</text>')
+L.append(f'<text x="{W/2}" y="{foot_y+14}" text-anchor="middle" font-family="sans-serif" '
+         f'font-size="12.5" font-weight="bold" fill="#1d4ed8">'
+         f'→ 验证器以 min(1, q_k/p_k) 保留草稿：目标 q_k 在分子、草稿 p_k 在分母，零改动</text>')
+L.append(f'<text x="{W/2}" y="{foot_y+36}" text-anchor="middle" font-family="sans-serif" '
          f'font-size="11.5" fill="#1d4ed8">低秩只是省了存 B 的方式，不是对 softmax 本身做近似</text>')
 
 L.append('</svg>')

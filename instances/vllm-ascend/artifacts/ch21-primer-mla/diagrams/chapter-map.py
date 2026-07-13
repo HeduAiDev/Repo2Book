@@ -33,50 +33,50 @@ def cjk_text_width(s, size):
 
 
 # ---------------- DATA(本章数据) ----------------
-LANES = ["数学地基：低秩压缩与权重吸收", "解耦 RoPE 与落地"]  # 泳道→折成上下两段,上→下
+# 重设计(2026-07-12):原理章 = 设计过的数学表达,不做源码剖面。站牌 = 本章各洞见的
+# 「一眼可见」概念,节点主符号 = 该洞见最简记号(源码落地全部归第 22 章,图上不出现
+# 任何源码函数名——lint_chapter_map 对 kind=primer 章按论文包+正文核符号)。
+LANES = ["数学地基:低秩压缩 → 权重吸收", "核心悬崖:解耦 RoPE → 账单"]  # 折成上下两段,上→下
 
-# (节点id, 段下标(0=上段/1=下段), 段内列, 段内行号, 真实符号名, 一行短语, 站牌文字)
+# (节点id, 段下标(0=上段/1=下段), 段内列, 段内行号, 洞见主符号, 一行短语, 站牌文字)
 NODES = [
-    ("motivation", 0, 0, 0, "get_kv_cache_shape",
-     "MLA 缓存无 2·n_h·d_h", "动机"),
-    ("compress",   0, 1, 0, "exec_kv_decode",
-     "只落盘潜向量 c_kv", "低秩 KV 压缩"),
-    ("absorb",     0, 2, 0, "_q_proj_and_k_up_proj",
-     "W_UK 折进 query 潜空间", "权重吸收恒等式"),
-    ("rope",       1, 0, 0, "rope_single",
-     "q_pe/k_pe 单开一路", "解耦 RoPE·核心"),
-    ("qside",      1, 1, 0, "fused_qkv_a_proj",
-     "只降训练激活,不动缓存", "q 侧低秩"),
-    ("ledger",     1, 2, 0, "kv_lora_rank",
-     "576=d_c+d_h^R,不含头数", "账单"),
-    ("landing",    1, 3, 0, "o_proj",
-     "decode 吸收 / prefill 物化", "落地"),
+    ("motivation", 0, 0, 0, "2·n_h·d_h",
+     "缓存随头数线性膨胀", "动机"),
+    ("compress",   0, 1, 0, "c^KV = W^DKV·h",
+     "只落盘一段潜向量", "低秩 KV 压缩"),
+    ("absorb",     0, 2, 0, "W̃ = (W^UK)⊤W^UQ",
+     "上投影折进 query 侧", "权重吸收"),
+    ("rope",       1, 0, 0, "M(δ) 随 δ 变",
+     "位置旋转不可吸收", "解耦 RoPE·核心"),
+    ("qside",      1, 1, 0, "c^Q = W^DQ·h",
+     "只降训练激活", "q 侧低秩"),
+    ("ledger",     1, 2, 0, "d_c + d_h^R = 576",
+     "缓存不含头数 n_h", "账单"),
 ]
-EDGES = [  # (src_id, dst_id) —— 调用边;同段=段内左→右主线蓝,跨段=桥接带竖向蓝
+EDGES = [  # (src_id, dst_id) —— 递进边;同段=段内左→右主线蓝,跨段=桥接带竖向蓝
     ("motivation", "compress"),
     ("compress", "absorb"),
     ("absorb", "rope"),          # 跨段(上→下):权重吸收讲完,直奔"位置旋转能不能也吸收"
     ("rope", "qside"),
     ("qside", "ledger"),
-    ("ledger", "landing"),
 ]
-# 阅读顺序上的 7 个站牌(与正文 一/2.1/2.2/2.3/2.4/三/四 一一对应),用于底部
+# 阅读顺序上的 6 个站牌(与正文 一/2.1/2.2/2.3/2.4/三 一一对应),用于底部
 # 阅读路线的独立时间轴——不复用图上节点的段内列号(折行后同一列号被两段各用
 # 一次,若路线条也用列号,不同段的站牌会在同一 x 位置叠在一起)。
-READING_ORDER = ["动机", "低秩 KV 压缩", "权重吸收恒等式", "解耦 RoPE·核心",
-                 "q 侧低秩", "账单", "落地"]
+READING_ORDER = ["动机", "低秩 KV 压缩", "权重吸收", "解耦 RoPE·核心",
+                 "q 侧低秩", "账单"]
 # (路线名, [站牌文字,...] 按阅读顺序取 READING_ORDER 的子序列, 是否高亮:True=实线蓝/False=虚线灰)
 ROUTES = [
-    ("全程精读(动机→压缩→吸收→RoPE→落地)", READING_ORDER, True),
+    ("全程精读(动机→压缩→吸收→RoPE→账单)", READING_ORDER, True),
     ("只看核心悬崖(RoPE 为什么不可吸收)",
-     ["动机", "权重吸收恒等式", "解耦 RoPE·核心", "落地"], False),
+     ["动机", "权重吸收", "解耦 RoPE·核心"], False),
 ]
 LEGEND = [
-    ("#22c55e", "入口：从 KV cache 瓶颈问题切入"),
-    ("#3b82f6", "章内主线：数学推导→源码落地"),
-    ("#f97316", "出口：两条路径汇入 o_proj"),
+    ("#22c55e", "入口:长上下文的 KV cache 瓶颈"),
+    ("#3b82f6", "主线:三块数学地基逐步递进"),
+    ("#f97316", "出口:通向第 22 章 NPU 落地"),
 ]
-TITLE = "第 21 章 · MLA 数学推导→NPU 源码剖面图（DeepSeek-V2, arXiv:2405.04434）"
+TITLE = "第 21 章 · MLA 的三块数学地基:低秩压缩 · 权重吸收 · 解耦 RoPE（arXiv:2405.04434）"
 
 # ---------------- 不可变:配色 ----------------
 C_ENTRY, C_EXIT, C_MAIN = "#22c55e", "#f97316", "#3b82f6"
@@ -190,20 +190,21 @@ for i, name in enumerate(LANES):
     L.append(f'<line x1="0" y1="{band_top[i] + band_h[i]:.1f}" x2="{w:.1f}" y2="{band_top[i] + band_h[i]:.1f}" '
               f'stroke="{C_LANE_BORDER}" stroke-width="1"/>')
 
-# 入口/出口接口桩(给入口/出口箭头一个可附着的框,兼表达"调用方在画布外")
+# 入口/出口接口桩(给入口/出口箭头一个可附着的框):入口=长上下文的瓶颈(画布外),
+# 出口=通向第 22 章的 NPU 落地(源码归隔壁实现章)。
 ex, ey = NODE_XY["motivation"]; ey += NODE_H / 2
-xx, xy = NODE_XY["landing"]; xy += NODE_H / 2
+xx, xy = NODE_XY["ledger"]; xy += NODE_H / 2
 L.append(f'<rect x="{EDGE_MARGIN}" y="{ey - STUB_H / 2:.1f}" width="{STUB_W}" height="{STUB_H}" '
          f'rx="{STUB_H / 2}" fill="#dcfce7" stroke="{C_ENTRY}" stroke-width="1.3"/>')
 L.append(f'<text x="{EDGE_MARGIN + STUB_W / 2}" y="{ey + 4:.1f}" text-anchor="middle" '
-         f'font-family="sans-serif" font-size="11" font-weight="bold" fill="#166534">{esc("调用方")}</text>')
+         f'font-family="sans-serif" font-size="11" font-weight="bold" fill="#166534">{esc("长上下文")}</text>')
 L.append(f'<line x1="{EDGE_MARGIN + STUB_W}" y1="{ey:.1f}" x2="{ex:.1f}" y2="{ey:.1f}" '
          f'stroke="{C_ENTRY}" stroke-width="2" marker-end="url(#mEntry)"/>')
 sx = w - EDGE_MARGIN - STUB_W
 L.append(f'<rect x="{sx:.1f}" y="{xy - STUB_H / 2:.1f}" width="{STUB_W}" height="{STUB_H}" '
          f'rx="{STUB_H / 2}" fill="#ffedd5" stroke="{C_EXIT}" stroke-width="1.3"/>')
 L.append(f'<text x="{sx + STUB_W / 2:.1f}" y="{xy + 4:.1f}" text-anchor="middle" '
-         f'font-family="sans-serif" font-size="11" font-weight="bold" fill="#9a3412">{esc("返回上层")}</text>')
+         f'font-family="sans-serif" font-size="11" font-weight="bold" fill="#9a3412">{esc("第 22 章")}</text>')
 L.append(f'<line x1="{xx + NODE_W:.1f}" y1="{xy:.1f}" x2="{sx:.1f}" y2="{xy:.1f}" '
          f'stroke="{C_EXIT}" stroke-width="2" marker-end="url(#mExit)"/>')
 

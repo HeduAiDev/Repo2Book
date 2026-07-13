@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
-"""第 34 章(投机采样:拒绝采样保分布定理、MTP 与 DSpark 前瞻)——本章地图:
-论文推导/数值 → 昇腾源码落地 剖面图。
+"""第 34 章(投机采样:拒绝采样保分布定理与加速账本)——本章地图:重绘版
+(writer 重构章节骨架后同步:旧版引用的「验证侧·接受/验证侧·残差」两站及
+DeepSeekV4MTP/acceptance_condition/sample_recovered_tokens 等符号,在新稿里
+已收进「见第 33/36 章」的转述句,不再是本章正文的自有站点——继续挂在图上会
+被 lint_chapter_map.py 判杜撰符号(kind=primer 章只核 book/papers/*.md 论文包
++ 正文 chapter.md,不核 dossier.json)。本轮按新稿实际的一~五节 + 两条子线索
+重新设计。)
 
 本章是 primer(原理篇)章,正文用自然标题(一、二、三、四、五),无 `## N.M` 编号——
-按契约禁用 §N.M 徽标,站牌改用标题词本身;符号真实性核对改对 book/papers/
-ch34-primer-speculative-sampling/*.md 论文包 + 正文 narrative/chapter.md
-(lint_chapter_map.py 对 kind=primer 章的口径,不查 dossier.json)。
+按契约禁用 §N.M 徽标,站牌改用标题词本身。
 
-两条泳道,各 4 节点,单行左→右(不需要像 ch24 那样折成两段——本章叙事本来就是
-单向的"动机→推导→数值→落地",没有"打开黑盒再合上"的往返,只有一次性的
-"推导完毕,落地到真实代码"跨段桥接):
-  上段(理论推导,arXiv:2211.17192 拒绝采样定理)——动机 / 接受-拒绝 / 保分布证明
-    (含接受率 α) / 数值推演(E[L] 与加速比,末尾桥接到真实形参 max_spec_len);
-  下段(昇腾源码落地)——MTP 提议侧模块 / 验证侧接受判定 / 验证侧残差重采样 /
-    DSpark 前瞻(RFC,无实现代码,画作出口)。
+两条泳道,各 4 节点,单行左→右,对应正文开篇点破的「两本账」结构:
+  上道(正确性无条件,对应「二、保分布定理」及其铺垫「一、动机」)——
+    动机 / 接受-拒绝 / 保分布证明 / 成绩单 α;
+  下道(速度单独定价 → 工程落地,对应「三、加速账本」「四、MTP」「五、前瞻」)——
+    期望长度 E[L] / 加速比·最优 γ / MTP 草稿链 / 前瞻。
+两道之间只有一条跨道边(成绩单 α → 期望长度 E[L]):正确性这本账已经关账,
+剩下的全是速度账本——这正是本章开篇那句「两本账」在图上的落点。
 
-节点预算:8(远低于 12 上限);原计划按正文 H2+H3 逐节各设一个节点会有 11~14 个、
-且部分符号名很长(如 DeepSeekMultiTokenPredictorLayer.forward),会把 NODE_W 推
-到远超画布预算——故把「接受准则+残差重采样」「保分布证明+接受率α」「MTP层forward
-+串行选深度路由」各聚合成一个节点,符号栏只挑该站最具代表性的一个真实标识符,
-其余在一行短语里带过。
+节点预算:8(远低于 12 上限)。符号栏逐一核对为 narrative/chapter.md 正文原样
+子串(min(1,p/q) / norm(max(0,p-q)) / min(p,q) / e_proj / h_proj /
+deepseek_v4_mtp.py 均逐一 grep 验证存在;纯希腊字母/数字/CJK 短语不触发
+lint 的符号防杜撰规则,因其正则只核形似代码标识符的 token)。
 
 用法: python3 gen_chapter-map.py → 同目录 chapter-map.svg
 """
@@ -38,52 +40,53 @@ def cjk_text_width(s, size):
 
 
 # ---------------- DATA(本章数据) ----------------
-LANES = ["理论推导(拒绝采样保分布定理, arXiv:2211.17192)", "昇腾源码落地(真实符号)"]  # 泳道→折成上下两段,上→下
+LANES = ["正确性无条件(动机 → 保分布定理:一、二两节)",
+         "速度单独定价 → 工程落地(加速账本 → MTP → 前瞻:三~五节)"]
 
-# (节点id, 段下标(0=上段论文/1=下段源码), 段内列, 段内行号, 真实符号名, 一行短语, 站牌文字)
+# (节点id, 泳道下标(0=正确性/1=速度+落地), 泳道内列, 泳道内行号, 真实符号/公式, 一行短语, 站牌文字)
 NODES = [
-    ("entry", 0, 0, 0, "自回归解码",
-     "K 次串行前向,内存带宽瓶颈", "动机"),
+    ("entry", 0, 0, 0, "K 次串行前向",
+     "内存带宽瓶颈,算力大量闲置", "动机"),
     ("accept_reject", 0, 1, 0, "min(1,p/q)",
-     "接受准则;残差 norm(max(0,p-q)) 补拒绝", "接受-拒绝"),
-    ("proof_alpha", 0, 2, 0, "P(x=x')=p(x')",
-     "min(p,q)+残差=p(x'),证毕;α=E(min(p,q))", "保分布证明"),
-    ("numeric", 0, 3, 0, "max_spec_len",
-     "E[L] 与加速比的公式;γ 的真实落地形参", "数值推演"),
-    ("mtp", 1, 0, 0, "DeepSeekV4MTP",
-     "mtp_block 落地 Eq.21;spec_step_idx 串行选深度", "MTP模块"),
-    ("verify_accept", 1, 1, 0, "acceptance_condition",
-     "target/draft >= uniform_token_probs 向量化判定", "验证侧·接受"),
-    ("verify_residual", 1, 2, 0, "sample_recovered_tokens",
-     "torch.maximum 起手,除 prob_over_q 再 argmax", "验证侧·残差"),
-    ("exit", 1, 3, 0, "DSpark",
-     "RFC #11126 前瞻,pin 源码无实现", "DSpark前瞻"),
+     "残差 norm(max(0,p-q)) 找补", "接受-拒绝"),
+    ("proof", 0, 2, 0, "min(p,q)+残差=p",
+     "两段相加,q 在恒等式里相消", "保分布证明"),
+    ("alpha", 0, 3, 0, "α = E(β)",
+     "1 减两分布距离,草稿的成绩单", "成绩单 α"),
+    ("expected_length", 1, 0, 0, "γ=5 → E[L]=3.689",
+     "收益递减,封顶于 1/(1-α)", "期望长度 E[L]"),
+    ("speedup", 1, 1, 0, "c=0.05,γ*=8 → 3.092×",
+     "拔河:γ↑验证更多,但草稿开销 c 也涨", "加速比·最优 γ"),
+    ("mtp", 1, 2, 0, "e_proj + h_proj",
+     "深度 k 因果链,源码 deepseek_v4_mtp.py", "MTP 草稿链"),
+    ("exit", 1, 3, 0, "DFlash / DSpark",
+     "验证侧一个字不用改,起草侧再升级", "前瞻"),
 ]
-EDGES = [  # (src_id, dst_id) —— 调用边;同段=段内左→右主线蓝,跨段=桥接带竖向蓝
+EDGES = [  # (src_id, dst_id) —— 调用边;同道=道内左→右主线蓝,跨道=桥接带竖向蓝
     ("entry", "accept_reject"),
-    ("accept_reject", "proof_alpha"),
-    ("proof_alpha", "numeric"),
-    ("numeric", "mtp"),          # 跨段(上→下):推导完毕,落地到真实代码
-    ("mtp", "verify_accept"),
-    ("verify_accept", "verify_residual"),
-    ("verify_residual", "exit"),
+    ("accept_reject", "proof"),
+    ("proof", "alpha"),
+    ("alpha", "expected_length"),   # 跨道(上→下):正确性已关账,转去算速度
+    ("expected_length", "speedup"),
+    ("speedup", "mtp"),
+    ("mtp", "exit"),
 ]
 # 阅读顺序上的 8 个站牌(与正文一~五节内容一一对应),用于底部阅读路线的独立时间轴——
-# 不复用图上节点的段内列号(两段各自独立编号,同一列号被两段各用一次)。
-READING_ORDER = ["动机", "接受-拒绝", "保分布证明", "数值推演",
-                  "MTP模块", "验证侧·接受", "验证侧·残差", "DSpark前瞻"]
+# 不复用图上节点的道内列号(两道各自独立编号,同一列号被两道各用一次)。
+READING_ORDER = ["动机", "接受-拒绝", "保分布证明", "成绩单 α",
+                  "期望长度 E[L]", "加速比·最优 γ", "MTP 草稿链", "前瞻"]
 # (路线名, [站牌文字,...] 按阅读顺序取 READING_ORDER 的子序列, 是否高亮:True=实线蓝/False=虚线灰)
 ROUTES = [
-    ("全程精读(推导→数值→落地)", READING_ORDER, True),
-    ("速览路线(跳过证明细节,只看落地)",
-     ["动机", "数值推演", "MTP模块", "验证侧·接受", "验证侧·残差"], False),
+    ("全程精读(证明→数值→落地)", READING_ORDER, True),
+    ("速览路线(跳过证明,只看能快多少)",
+     ["动机", "期望长度 E[L]", "加速比·最优 γ", "MTP 草稿链", "前瞻"], False),
 ]
 LEGEND = [
-    ("#22c55e", "入口:承接第 33 章的验证侧代码,回头问一句「它凭什么对」"),
-    ("#3b82f6", "章内主线:论文推导→数值推演→昇腾源码落地"),
-    ("#f97316", "出口:前瞻 DSpark,交给第 36 章的提议侧工程"),
+    ("#22c55e", "入口:接续第 33 章「验证侧凭什么对」的追问"),
+    ("#3b82f6", "章内主线:动机→保分布定理→加速账本→MTP"),
+    ("#f97316", "出口:前瞻 DFlash (第 35 章)与 DSpark (第 37 章)"),
 ]
-TITLE = "第 34 章 · 投机采样:拒绝采样保分布定理 → 昇腾 MTP/验证侧落地剖面图"
+TITLE = "第 34 章 · 投机采样:拒绝采样保分布定理与加速账本剖面图"
 
 # ---------------- 不可变:配色 ----------------
 C_ENTRY, C_EXIT, C_MAIN = "#22c55e", "#f97316", "#3b82f6"
@@ -110,7 +113,7 @@ EDGE_MARGIN, STUB_W, STUB_H = 16, 72, 26
 LANE_LABEL_H, BAND_PAD = 24, 14
 TOP_PAD, TITLE_H, LEGEND_H, BOTTOM_PAD = 14, 34, 66, 16
 ROUTE_HEAD_H, ROUTE_ROW_H = 22, 46
-# 桥接带:两段之间的空白间隔,专放跨段箭头 + 简短说明文字。
+# 桥接带:两道之间的空白间隔,专放跨道箭头 + 简短说明文字。
 INTER_LANE_GAP = 90
 
 # 节点宽度:同一批节点统一宽度(保列对齐),按本章最长的符号名/短语算
@@ -123,7 +126,7 @@ NODE_W = max(
 )
 PAD_L = PAD_R = EDGE_MARGIN + STUB_W + 16  # 左右各留:接口桩 + 一段箭头
 
-n_cols = max(n[2] for n in NODES) + 1  # 段内最多列数(两段各自独立复用这批列号)
+n_cols = max(n[2] for n in NODES) + 1  # 道内最多列数(两道各自独立复用这批列号)
 COLX = [PAD_L + c * (NODE_W + COL_GAP) for c in range(n_cols)]
 
 rows_per_band = [0] * len(LANES)
@@ -134,7 +137,7 @@ band_h = [LANE_LABEL_H + BAND_PAD * 2 + r * NODE_H + max(0, r - 1) * ROW_GAP for
 band_top, _cum = [], TOP_PAD + TITLE_H + LEGEND_H
 for i, bh in enumerate(band_h):
     if i > 0:
-        _cum += INTER_LANE_GAP  # 段与段之间插入桥接带(不给背景色,留白给跨段箭头)
+        _cum += INTER_LANE_GAP  # 道与道之间插入桥接带(不给背景色,留白给跨道箭头)
     band_top.append(_cum)
     _cum += bh
 lanes_bottom = _cum
@@ -152,8 +155,9 @@ h = routes_top + ROUTE_HEAD_H + len(ROUTES) * ROUTE_ROW_H + BOTTOM_PAD
 
 
 def badge(cx, cy, text):
-    """§/站牌徽标胶囊,居中挂在 (cx,cy)——宽度按文字自适应(见 badge_width),
-    颜色/圆角/描边视觉语言与模板一致,不变的是"胶囊+靛蓝描边+深靛蓝粗体文字"。"""
+    """站牌徽标胶囊,居中挂在 (cx,cy)——宽度按文字自适应(见 badge_width),
+    颜色/圆角/描边视觉语言与模板一致,不变的是"胶囊+靛蓝描边+深靛蓝粗体文字"。
+    本章自然标题,站牌文字用标题词本身,不用 §N.M。"""
     bw = badge_width(text)
     bx, by = cx - bw / 2, cy - BADGE_H / 2
     return [
@@ -185,7 +189,7 @@ for color, label in LEGEND:
              f'fill="{C_NODE_TITLE}">{esc(label)}</text>')
     _ly += _legend_line_h
 
-# 泳道背景 + 标签(桥接带本身不上色,留白给跨段箭头,视觉上与两段区分开)
+# 泳道背景 + 标签(桥接带本身不上色,留白给跨道箭头,视觉上与两道区分开)
 for i, name in enumerate(LANES):
     L.append(f'<rect x="0" y="{band_top[i]:.1f}" width="{w:.1f}" height="{band_h[i]:.1f}" '
              f'fill="{C_LANE_FILL[i % len(C_LANE_FILL)]}"/>')
@@ -213,7 +217,7 @@ L.append(f'<text x="{sx + STUB_W / 2:.1f}" y="{xy + 4:.1f}" text-anchor="middle"
 L.append(f'<line x1="{xx + NODE_W:.1f}" y1="{xy:.1f}" x2="{sx:.1f}" y2="{xy:.1f}" '
          f'stroke="{C_EXIT}" stroke-width="2" marker-end="url(#mExit)"/>')
 
-# 调用边:同段(band 相同)= 段内左→右,右中→左中;跨段(band 不同)= 桥接带上下沿,
+# 调用边:同道(band 相同)= 道内左→右,右中→左中;跨道(band 不同)= 桥接带上下沿,
 # 上中/下中 attach(不经过任何节点框内部,因为桥接带本身是留白区)。
 bridge_captions = []  # (x, y, text) —— 桥接带箭头旁的简短说明,渲后统一追加避免被箭头压住
 for src, dst in EDGES:
@@ -224,24 +228,24 @@ for src, dst in EDGES:
     if src_band == dst_band:
         p1 = (x1 + NODE_W, y1 + NODE_H / 2)
         p2 = (x2, y2 + NODE_H / 2)
-    elif dst_band > src_band:  # 上段→下段:推导完毕,落地到真实代码
+    elif dst_band > src_band:  # 上道→下道:正确性已关账,转去算速度
         p1 = (x1 + NODE_W / 2, y1 + NODE_H)
         p2 = (x2 + NODE_W / 2, y2)
-    else:  # 下段→上段(本章未用到,保留对称写法以防后续改数据加回程)
+    else:  # 下道→上道(本章未用到,保留对称写法以防后续改数据加回程)
         p1 = (x1 + NODE_W / 2, y1)
         p2 = (x2 + NODE_W / 2, y2 + NODE_H)
     L.append(f'<line x1="{p1[0]:.1f}" y1="{p1[1]:.1f}" x2="{p2[0]:.1f}" y2="{p2[1]:.1f}" '
               f'stroke="{C_MAIN}" stroke-width="2" marker-end="url(#mMain)"/>')
     if src_band != dst_band:
         mx, my = (p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2
-        cap = "打开黑盒,潜入论文推导" if dst_band < src_band else "推导完毕,落地到真实代码"
+        cap = "回头看正确性证明" if dst_band < src_band else "正确性已关账,转去算速度"
         bridge_captions.append((mx + 24, my, cap))
 
 for cx, cy, cap in bridge_captions:
     L.append(f'<text x="{cx:.1f}" y="{cy:.1f}" font-family="sans-serif" font-size="12.5" '
               f'font-style="italic" fill="{C_BRIDGE_CAPTION}">{esc(cap)}</text>')
 
-# 节点(圆角框 + 真实符号名 + 一行短语 + 右上角站牌)
+# 节点(圆角框 + 真实符号/公式 + 一行短语 + 右上角站牌)
 for nid, band, col, row, symbol, phrase, sec in NODES:
     x, y = NODE_XY[nid]
     L.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{NODE_W:.1f}" height="{NODE_H}" rx="12" '
@@ -255,7 +259,7 @@ for nid, band, col, row, symbol, phrase, sec in NODES:
     L += badge(x + NODE_W - bw / 2 + 8, y, sec)
 
 # 底部阅读路线:8 个站牌按 READING_ORDER 均匀分布在整个画布宽度上(独立于图上节点的
-# 段内列号——两段各自独立编号,若仍借列号会让不同段的站牌叠在同一 x 位置)。
+# 道内列号——两道各自独立编号,若仍借列号会让不同道的站牌叠在同一 x 位置)。
 _route_label_w = max(cjk_text_width(name, 12) for name, *_ in ROUTES)
 _route_left = 16 + _route_label_w + 24
 _n_stops = len(READING_ORDER)

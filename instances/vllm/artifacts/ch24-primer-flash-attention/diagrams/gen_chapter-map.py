@@ -5,12 +5,19 @@
 禁用 §N.M 徽标,站牌改用标题词本身;符号真实性核对改对 book/papers/ch24-primer-
 flash-attention/*.md 论文包 + 正文(lint_chapter_map.py 对 kind=primer 章的口径)。
 
+[2026-07-13 重绘] writer 重构骨架后正文改为八节(一~八),原「七、落地:调用面」整节
+已删除(该内容降级为一句指路,详见[第 25 章]),新增「八、chunked prefill」大节(⊕
+的反面注脚:拆 query 轴、连合并都不需要)——本图同步:下段(vLLM 源码落地)第 3 列从
+旧的「调用面」换成「cascade attention」(原第 4 列出口内容整体前移一列),新增第 4
+列「chunked prefill」作为新的画布出口(exit)。上段(论文推导)四节点不变。
+
 两条泳道,折成上下两行、各自成段(画布预算:宽 ≤1500 且宽高比 ≤2.6:1,横向 8 列单
 行版本 6.9:1 超预算,故改此布局):
   上段(论文推导,FlashAttention 论文族)——本行 4 节点:online-softmax / FlashAttention
     tiling / IO 复杂度账 / FA-2,行内从左到右按推导顺序排列;
   下段(vLLM 源码落地)——本行 4 节点:入口(黑盒调用)、merge_attn_states 合并 kernel、
-    flash_attn_varlen_func 调用面、cascade attention 出口,行内从左到右按调用顺序排列。
+    cascade attention(共享前缀合并)、chunked prefill(拆 query 轴、⊕ 的反面注脚)
+    出口,行内从左到右按正文一~八节的落地顺序排列。
 两段之间留一条"桥接带"(空白间隔,画两条跨段箭头 + 简短说明文字):入口在下段最左
 潜入上段最左(online-softmax)开始推导,推导完(上段最右 FA-2)浮回下段(merge_kernel)
 继续走完落地链——呼应正文"打开黑盒→推导→落地"的形状,只是不再靠横向无限延展,
@@ -38,6 +45,8 @@ LANES = ["论文推导(FlashAttention 论文族)", "vLLM 源码落地"]  # 泳�
 # (节点id, 段下标(0=上段论文/1=下段源码), 段内列, 段内行号, 真实符号名, 一行短语, 站牌文字)
 # 两段各自独立编号列 0..3(不再共享跨段列号)——这就是"折行"的关键:原先 8 个节点
 # 依次占列 0..7(单行超宽),现在段内各自从列 0 起数,画布宽度只由"段内最多 4 列"决定。
+# [2026-07-13] 下段第 3/4 列随正文改版更新:旧「调用面」(§七,已删除)→
+# 「cascade attention」(现在的 §七);新增第 4 列「chunked prefill」(§八,新画布出口)。
 NODES = [
     ("entry",        1, 0, 0, "flash_attn_varlen_func",
      "全书黑盒调用点：内部算法未知", "动机"),
@@ -51,10 +60,10 @@ NODES = [
      "循环序对调、只存 L(一节带过)", "FA-2"),
     ("merge_kernel", 1, 1, 0, "merge_attn_states",
      "Triton kernel：按 LSE 权重精确合并两段输出", "LSE 合并"),
-    ("call_surface", 1, 2, 0, "flash_attn_varlen_func 形参",
-     "varlen 打平 + block_table 分页 KV", "调用面"),
-    ("exit",         1, 3, 0, "cascade attention",
-     "两段各带 lse、合并成精确输出", "cascade"),
+    ("cascade",      1, 2, 0, "cascade attention",
+     "共享前缀只算一遍,两段各带 lse 合并", "cascade attention"),
+    ("exit",         1, 3, 0, "flash_attn.py 零特判",
+     "拆 query 轴、逐行独立，连 ⊕ 都不需要", "chunked prefill"),
 ]
 EDGES = [  # (src_id, dst_id) —— 调用边;同段=段内左→右主线蓝,跨段=桥接带竖向/斜向蓝
     ("entry", "online_sm"),        # 跨段(下→上):潜入推导
@@ -62,19 +71,21 @@ EDGES = [  # (src_id, dst_id) —— 调用边;同段=段内左→右主线蓝,�
     ("tiling", "io_acct"),
     ("io_acct", "fa2"),
     ("fa2", "merge_kernel"),       # 跨段(上→下):浮回落地
-    ("merge_kernel", "call_surface"),
-    ("call_surface", "exit"),
+    ("merge_kernel", "cascade"),
+    ("cascade", "exit"),
 ]
 # 阅读顺序上的 8 个站牌(与正文一~八节一一对应),用于底部阅读路线的独立时间轴——
 # 不再复用图上节点的段内列号(折行后同一列号会被两段各用一次,若路线条也用列号,
 # 不同段的站牌会在同一 x 位置叠在一起)。
 READING_ORDER = ["动机", "online-softmax", "tiling", "IO 复杂度账", "FA-2",
-                 "LSE 合并", "调用面", "cascade"]
+                 "LSE 合并", "cascade attention", "chunked prefill"]
 # (路线名, [站牌文字,...] 按阅读顺序取 READING_ORDER 的子序列, 是否高亮:True=实线蓝/False=虚线灰)
+# 速览路线取自正文开篇导语原句:"直接读『六、LSE 合并』到『八、chunked prefill』这三节"
+# (外加开篇"动机"给上下文),与旧版"调用面"已随该节删除一并替换。
 ROUTES = [
     ("全程精读(论文推导→代码落地)", READING_ORDER, True),
     ("速览路线(只看落地、跳过推导细节)",
-     ["动机", "LSE 合并", "调用面", "cascade"], False),
+     ["动机", "LSE 合并", "cascade attention", "chunked prefill"], False),
 ]
 LEGEND = [
     ("#22c55e", "入口：黑盒调用被打开"),

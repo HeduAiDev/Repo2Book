@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """ch09-primer-eplb 本章地图:EPLB 负载均衡算法本体的源码/论文剖面图。
 
-本章是自然标题章(无 `## N.M` 编号,只有"一、二、三…"中文数字标题),按契约禁用
-§N.M 徽标,站牌改用标题词本身(如"一、动机")。kind=primer,主线既有纯理论站
-(动机/目标,无对应可调用函数——用真实公式/真实观测函数 `_compute_imbalance`
-挂实)也有真实落地代码站(复制/装箱/折叠热度/就地映射/编排/策略工厂)。
+[2026-07-14 重绘] writer 把全章从 8 个子站(动机/目标/复制/装箱/折叠/映射/
+编排/策略)重构收敛成 6 个自然标题分节(一~六),第五节把旧版的"折叠/映射/
+编排"三站合并成一节"输出一张放置表",第六节把旧版的"策略"从"七"降编号为
+"六"。本轮按新分节 1:1 重画,不再保留旧版三站同挂"五"的做法。
+
+本章仍是自然标题章(无 `## N.M` 编号,只有"一、二、三…"中文数字标题),按契约
+禁用 §N.M 徽标,站牌改用标题词本身。kind=primer,主线既有纯理论站(动机/下界,
+用真实公式 `max_g L_g` 与真实观测组件 `EplbWorker` 挂实——`_compute_imbalance`
+这个函数名旧版正文提过、新版正文已不点名,故本轮换成新版正文里仍点名的
+`EplbWorker`,避免 lint_chapter_map 的杜撰符号检查落空)也有真实落地代码站
+(`route_expert_redundancy` 摊薄递推、`rebalance_experts` 编排、`DefaultEplb`/
+`PolicyFactory` 策略工厂)。
 
 两行泳道(折成两行避免画布超宽):
-  第一行"论证与算法核心"= 一动机→二目标→三复制→四装箱
-  第二行"落地编排"      = 五折叠→五映射→六编排→七策略
-两行之间用一条"续行"折线连接(pack → fold),不用直线穿过整个画布(那样会
-穿过中间的 objective/replicate 等无关节点),而是先垂直下沉到两行之间的
-"沟"里再水平走到下一行起点、再垂直探入节点——纯几何转弯,不代表任何额外调用。
+  第一行"论证与算法核心"= 一动机→二下界→三削峰→四铺平
+  第二行"落地编排"      = 五放置表→六策略
+两行之间用一条"续行"折线连接(pack → output),不用直线穿过整个画布。
 
 ■ 不可变(同全书其余 chapter-map,不要动):
   1. §徽标胶囊配色(此章徽标文字非 §N.M,而是中文标题词,颜色/形状不变)。
@@ -20,11 +26,9 @@
   4. 路线条:高亮=实线蓝(粗) / 次要=虚线灰(细)。
   5. >2 种语义色画图例。
   6. cjk_text_width() 逐字符宽度估算,不用半角系数硬乘 len(s)。
-■ 可变:本章把 BADGE_W 从模板默认 46 放宽到 60——本章徽标是 4 个中文字
-  (如"一、动机"),比 "§20.1" 这种 5 位数字徽标更宽,46px 会被文字撑破;
-  NODE_W/NODE_H 也放宽到 200x70,以容纳较长的真实符号别名(如
-  expert_local_exchange,是 constraint_expert_local_exchange 的真实后缀
-  子串,和 pack_redundancy 一样,为可读性做的诚实缩短,而非杜撰)。
+■ 可变:本章把 BADGE_W 从模板默认 46 放宽到 60(中文站牌比 §N.M 数字宽);
+  NODE_W/NODE_H 放宽到 200x70;真实符号名过长(如 route_expert_redundancy,
+  23 字符)时符号行降字号到 10.5,避免撑破节点框(见 SYMBOL_FONT_SIZE)。
 
 六项自查(渲染→Read PNG 亲眼看后记录,见文末字符串)。
 """
@@ -40,40 +44,41 @@ def cjk_text_width(s, size):
     return sum(size * (1.0 if ord(ch) > 0x2E80 else 0.58) for ch in s)
 
 
-# ---------------- DATA(本章数据) ----------------
-LANES = ["论证与算法核心(一、动机 → 二、目标 → 三、复制 → 四、装箱)",
-         "落地编排(五、折叠/映射 → 六、编排 → 七、策略)"]
+# ---------------- DATA(本章数据,按 writer 定稿后的六节自然标题 1:1 重画) ----------------
+LANES = ["论证与算法核心(一、动机 → 二、下界 → 三、削峰 → 四、铺平)",
+         "落地编排(五、放置表 → 六、策略)"]
 
 # (节点id, 泳道下标, 列, 泳道内行号, 真实符号名, 一行短语, 站牌)
 NODES = [
-    ("motivate", 0, 0, 0, "_compute_imbalance",
-     "par=最热/平均,量化拖慢倍数", "一、动机"),
-    ("objective", 0, 1, 0, "max_g L_g",
-     "下界=ΣW/G,超份额单专家无解", "二、目标"),
-    ("replicate", 0, 2, 0, "pack_redundancy",
-     "Step1:锯最长木板,逐轮摊薄", "三、复制"),
-    ("pack", 0, 3, 0, "pack_redundancy",
-     "Step2-4:LPT贪心,填最空箱", "四、装箱"),
-    ("fold", 1, 0, 0, "add_redundant",
-     "折叠热度:物理槽聚回逻辑专家", "五、折叠"),
-    ("remap", 1, 1, 0, "expert_local_exchange",
-     "就地映射:能不动就不动", "五、映射"),
-    ("orchestrate", 1, 2, 0, "rebalance_experts",
-     "五步编排+0.95变更闸门", "六、编排"),
-    ("policy", 1, 3, 0, "PolicyFactory",
-     "两种策略:分层/全局,落地选全局", "七、策略"),
+    ("motivate", 0, 0, 0, "EplbWorker",
+     "par=最热卡负载/平均，量化拖慢倍数", "一、动机"),
+    ("bound", 0, 1, 0, "max_g L_g",
+     "下界=ΣW/G；热度守恒，专家整块不可拆", "二、下界"),
+    ("replicate", 0, 2, 0, "route_expert_redundancy",
+     "摊薄递推(k+1)/(k+2)：锯最长木板", "三、削峰"),
+    ("pack", 0, 3, 0, "LPT",
+     "降序装箱填最轻卡，副本不共卡", "四、铺平"),
+    ("output", 1, 0, 0, "rebalance_experts",
+     "折叠热度→就地映射→0.95变更闸门", "五、放置表"),
+    ("policy", 1, 1, 0, "DefaultEplb",
+     "默认全局贪心，对照分层策略", "六、策略"),
 ]
-# 行内直连边(同一泳道内,统一主线蓝)——跨行的 pack→fold 走单独的折线,不放在这里
+# 行内直连边(同一泳道内,统一主线蓝)——跨行的 pack→output 走单独的折线,不放在这里
 EDGES = [
-    ("motivate", "objective"), ("objective", "replicate"), ("replicate", "pack"),
-    ("fold", "remap"), ("remap", "orchestrate"), ("orchestrate", "policy"),
+    ("motivate", "bound"), ("bound", "replicate"), ("replicate", "pack"),
+    ("output", "policy"),
 ]
-WRAP_EDGE = ("pack", "fold")  # 续行折线:第一行末→第二行首
+WRAP_EDGE = ("pack", "output")  # 续行折线:第一行末→第二行首
+
+# 符号文本超长时降字号,避免撑破节点框(route_expert_redundancy 23 字符)
+SYMBOL_FONT_SIZE = {"replicate": 10.5}
+DEFAULT_SYMBOL_FONT_SIZE = 13
 
 # (路线名, [(列, 站牌), ...] 按阅读顺序, 是否高亮:True=实线蓝/False=虚线灰)
+# 与正文开篇选读指引原句对齐:"只想抓…读一到四节就够;五节是…收尾,六节是…对照,可按需跳读"
 ROUTES = [
-    ("推荐通读:论证→算法核心", [(0, "一、动机"), (1, "二、目标"), (2, "三、复制"), (3, "四、装箱")], True),
-    ("落地编排选读:折叠→策略", [(0, "五、折叠"), (1, "五、映射"), (2, "六、编排"), (3, "七、策略")], False),
+    ("通读一~四：论证到核心", [(0, "一、动机"), (1, "二、下界"), (2, "三、削峰"), (3, "四、铺平")], True),
+    ("五~六按需跳读:收尾/策略", [(0, "五、放置表"), (1, "六、策略")], False),
 ]
 LEGEND = [("#22c55e", "入口:上一章→本章"), ("#3b82f6", "论证/落地主线"), ("#f97316", "出口:本章→下一章")]
 TITLE = "EPLB 负载均衡算法本体：论证骨架→算法核心→落地编排"
@@ -160,7 +165,7 @@ for i, name in enumerate(LANES):
 L.append(f'<line x1="0" y1="{lanes_bottom:.1f}" x2="{w}" y2="{lanes_bottom:.1f}" '
          f'stroke="{C_LANE_BORDER}" stroke-width="1"/>')
 
-# 入口/出口接口桩:入口挂在 motivate(全图最左的第一站),出口挂在 policy(全图最右的末站)
+# 入口/出口接口桩:入口挂在 motivate(全图最左的第一站),出口挂在 policy(全图最末站)
 ex, ey = NODE_XY["motivate"]; ey += NODE_H / 2
 xx, xy = NODE_XY["policy"]; xy += NODE_H / 2
 L.append(f'<rect x="{EDGE_MARGIN}" y="{ey - STUB_H / 2:.1f}" width="{STUB_W}" height="{STUB_H}" '
@@ -185,7 +190,7 @@ for src, dst in EDGES:
     L.append(f'<line x1="{p1[0]:.1f}" y1="{p1[1]:.1f}" x2="{p2[0]:.1f}" y2="{p2[1]:.1f}" '
               f'stroke="{C_MAIN}" stroke-width="2" marker-end="url(#mMain)"/>')
 
-# 续行折线(pack 第一行末 → fold 第二行首):纯几何转弯,不穿过中间节点
+# 续行折线(pack 第一行末 → output 第二行首):纯几何转弯,不穿过中间节点
 wsrc, wdst = WRAP_EDGE
 wx1, wy1 = NODE_XY[wsrc]; wx2, wy2 = NODE_XY[wdst]
 w_bottom = wy1 + NODE_H
@@ -204,8 +209,9 @@ for nid, lane, col, row, symbol, phrase, sec in NODES:
     x, y = NODE_XY[nid]
     L.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{NODE_W}" height="{NODE_H}" rx="12" '
               f'fill="{C_NODE_FILL}" stroke="{C_NODE_STROKE}" stroke-width="1.5"/>')
+    fsize = SYMBOL_FONT_SIZE.get(nid, DEFAULT_SYMBOL_FONT_SIZE)
     L.append(f'<text x="{x + NODE_W / 2:.1f}" y="{y + NODE_H * 0.40:.1f}" text-anchor="middle" '
-              f'font-family="sans-serif" font-size="13" font-weight="bold" '
+              f'font-family="sans-serif" font-size="{fsize}" font-weight="bold" '
               f'fill="{C_NODE_TITLE}">{esc(symbol)}</text>')
     L.append(f'<text x="{x + NODE_W / 2:.1f}" y="{y + NODE_H * 0.70:.1f}" text-anchor="middle" '
               f'font-family="sans-serif" font-size="10.5" fill="{C_NODE_SUB}">{esc(phrase)}</text>')

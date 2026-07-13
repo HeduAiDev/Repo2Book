@@ -6,41 +6,45 @@
 
 *上一章把采样从 logits 讲到下一个 token，一次前向只出一个。本章往下钻一层，读投机解码里那个草稿器 EAGLE——它怎么又快又准地一口气猜出未来好几个 token。*
 
-投机解码（speculative decoding，用一个便宜的草稿器猜出未来若干 token、再由大模型一次前向批量验证的加速技术）的骨架是这样：草稿器（proposer，负责一次性猜出未来若干个 token 的模块）先提出 γ 个草稿 token，目标模型（target LLM，我们真正想加速的那个大模型）用一次前向验证它们，再由 rejection sampling（拒绝采样）挑出能接受的前缀，最后补一个 bonus token（验证通过时白送的一个额外 token）。[下一章](../../ch32-spec-decode/narrative/chapter.md)会把这套执行面在 vLLM 源码里走全；本章先钻进那个草稿器本身。整套机器有一个命门：**目标模型一次前向能吐几个 token，取决于草稿猜得准不准**。
+投机解码（speculative decoding，用一个便宜的草稿器猜出未来若干 token、再由大模型一次前向批量验证的加速技术）的骨架是这样：草稿器（proposer，负责一次性猜出未来若干个 token 的模块）先提出 γ 个草稿 token（γ 即投机步长），目标模型（target LLM，我们真正想加速的那个大模型）用一次前向验证它们，再由 rejection sampling（拒绝采样）挑出能接受的前缀，最后补一个 bonus token（验证通过时白送的一个额外 token）。这套机器有一条红线和一本账，本章全部内容都挂在它们上面。
 
-猜得准不准，可以精确量化。这里的关键量是接受率 α（acceptance rate，草稿 token 被目标模型接受的比例）。α 越高，一次前向接住的前缀越长，加速比越大。所以投机解码的全部功夫，都花在一件事上——**让草稿分布 q 尽量贴近目标分布 p，同时草稿本身要够便宜**。
+**红线是保分布定理**：rejection sampling 保证最终输出分布严格等于目标模型逐 token 采样——无论草稿多糙。完整证明在[下一章](../../ch32-spec-decode/narrative/chapter.md) §32.5，本章只用结论。红线把「对不对」锁死之后，草稿分布 $`\hat p`$ 就成了一个纯粹的性能自由度：它只决定快不快，碰不到对不对。
 
-下一章会把 EAGLE 当成一个黑盒 proposer 接进统一契约。这一章先把黑盒打开，回答三个为什么：
+**账只有一行**。记第 $`i`$ 个草稿 token 被目标模型接受的概率为 $`\alpha_i`$（接受率，acceptance rate），链式草稿在第 $`i`$ 位仍存活当且仅当前 $`i`$ 位全部通过，于是一次目标前向期望接受的草稿数（论文记 $`\tau`$ ）等于接受率的前缀积之和 $`\mathbb{E}[\tau]=\sum_{i=1}^{\gamma}\prod_{j\le i}\alpha_j`$ 。连乘意味着链越深存活越难——想让一次前向多吐几个 token，办法只有两个：把每一项 $`\alpha`$ 抬高，或在同一份预算里多铺几条路径、让求和的范围变大。
 
-- 为什么 EAGLE 不在 token 上接龙，而在**特征**（feature，目标模型 LM Head 之前那一层的隐状态，论文称第二顶层特征）上接龙？
-- 为什么光有特征还不够，非得把「超前一步的 token」也喂进草稿模型？
-- vLLM 落地的 EAGLE 到底长什么样，和论文里那棵漂亮的动态草稿树差在哪？
-
-前两问是 EAGLE 论文（arXiv:2401.15077）的两大观察，第三问牵出 EAGLE-2（arXiv:2406.16858）的动态树，以及 vLLM v1 里那条朴素的链式实现。四段走：先讲动机，再推公式，然后用一棵极小的玩具模型把数字手算一遍，最后落回 `vllm/v1/spec_decode` 的真实代码。
-
-保分布定理（rejection sampling 保证输出分布严格等于目标模型）的完整证明在[下一章](../../ch32-spec-decode/narrative/chapter.md) §31.5,本章只用它的结论，不重复推导。
+EAGLE 论文（arXiv:2401.15077）与 EAGLE-2（arXiv:2406.16858）在这本账上做了三次抬升，本章依次推明白：在 **特征**（feature，目标模型 LM Head 之前那一层的隐状态，论文称第二顶层特征）上自回归、而非在 token 上接龙（§31.2）；把「超前一步的 token」剧透给草稿头，将采样的随机分岔钉成确定函数（§31.3）；从链长成树，一次前向核一棵连通子树（§31.7）。训练目标（§31.5）与验收准则（§31.6）会在账上合流——分类损失最小化的 KL 散度，正是接受率的下界杠杆。最后回到现实：vLLM v1 落地的是这一切的最简退化，一条链（§31.8）。
 
 ![本章地图：EAGLE 两个观察→验收准则→vLLM 链式落地剖面图](../diagrams/chapter-map.png)
 
-只想看 vLLM 真实代码怎么跑，直接跳读 §31.2、§31.3、§31.4、§31.8；想把两大观察怎样一步步推到验收准则、再落地成链式实现跟全，就从头按序通读。
+只关心 EAGLE-2 的动态树怎么长，直接跳 §31.7；只想知道 vLLM 真的跑的是哪种形态，§31.8 一节说清；想看这本账怎么一级级立起来，按序通读。
 
-在正式进入推导前，先把全章后面才会用到的两个专门下标记号放在这里备查——遇到时回来看一眼即可，不必现在死记：
+全章记号一张速查表（正文首现处仍有一句人话解释，忘了回来查即可）：
 
 | 记号 | 含义 | 首次出现 |
 |---|---|---|
-| $T_{2:i+1}$ | 喂给草稿头的「超前一位」token 序列，从第 2 位到第 i+1 位——是 §31.2 记号 $T_{1:j}$ 整体下标后移一位，对应「左移一位」后塞进草稿头的那份超前 token 序列 | §31.5 |
-| $F_{1:i}$ | 从第 1 步到第 i 步的历史特征序列，草稿头据此外推第 i+1 个特征 $f_{i+1}$ ——是单个特征记号 $f_j$ 的序列形式 | §31.5 |
+| $`\gamma`$ | 每轮草稿 token 数（投机步长） | 开篇 |
+| $`\alpha_i`$ | 第 $`i`$ 个草稿 token 被目标模型接受的概率 | 开篇 |
+| $`f_j`$ | 目标模型第 $`j`$ 个位置的特征——LM Head 之前那层隐状态 | §31.2 |
+| $`p`$ / $`\hat p`$ | 目标模型 / 草稿头给出的下一 token 分布 | §31.2 |
+| $`c_j`$ | 草稿头对第 $`j`$ 步草稿 token 的置信度 | §31.2 |
+| $`V_i`$ | EAGLE-2 的节点价值：根到该节点路径上置信度之积 | §31.7 |
+| $`T_{2:i+1}`$ | 喂给草稿头的「超前一位」token 序列，从第 2 位到第 i+1 位——是 §31.2 记号 $`T_{1:j}`$ 整体下标后移一位，对应「左移一位」后塞进草稿头的那份超前 token 序列 | §31.5 |
+| $`F_{1:i}`$ | 从第 1 步到第 i 步的历史特征序列，草稿头据此外推第 i+1 个特征 $`f_{i+1}`$ ——是单个特征记号 $`f_j`$ 的序列形式 | §31.5 |
 
 ---
 
 ## 31.1 动机：草稿的两个成本，和 token 层的天花板
 
-投机解码要快，草稿模型就得同时满足两个互相拉扯的要求：
+开篇那本账拆开就是草稿模型的两个互相拉扯的成本：
 
-1. **贴合**——草稿分布 q 要像目标分布 p，接受率 α 才高；
-2. **便宜**——草稿模型每步前向要远比目标模型快，不然省下的验证时间又被草稿吃回去。
+$$
+\mathbb{E}[\tau] = \sum_{i=1}^{\gamma} \prod_{j\le i} \alpha_j
+$$
 
-历史上有两条路。第一条：拿同系列的小模型当草稿，比如用 LLaMA2-7B 给 70B 当草稿（arXiv:2401.15077 §1）。贴合度不错，但 7B 本身不便宜，端到端加速有限。第二条：Medusa 那样，直接在目标模型的特征上挂几个 MLP（多层感知机）并行预测多个 token（arXiv:2401.15077 §1）。便宜得很，但准确率只有约 0.6——草稿分布和目标差得远，接受率低。
+1. **贴合**——草稿分布 $`\hat p`$ 要像目标分布 $`p`$ ，每一项 $`\alpha`$ 才高（§31.6 会证明 $`\alpha`$ 恰好等于 1 减去两分布的总变差距离）；
+2. **便宜**——草稿每步前向要远比目标前向快，不然抬 $`\alpha`$ 省下的验证时间又被草稿自身吃回去。
+
+历史上有两条路，各占一头。第一条：拿同系列的小模型当草稿，比如用 LLaMA2-7B 给 70B 当草稿（arXiv:2401.15077 §1）。贴合度不错，但 7B 本身不便宜，端到端加速有限。第二条：Medusa 那样，直接在目标模型的特征上挂几个 MLP（多层感知机）并行预测多个 token（arXiv:2401.15077 §1）。便宜得很，但准确率只有约 0.6——草稿分布和目标差得远，$`\alpha`$ 掉得厉害。
 
 这几种方法结构上到底差在哪，摆在一起看最直接：
 
@@ -48,27 +52,27 @@
 
 *四种方法起草第 4、5 个 token，结构差在哪：标准投机采样与 Lookahead 只吃 token 接龙；Medusa 独立用某一层特征并行猜；EAGLE 把 token 与特征一起逐步回喂，链式外推。*
 
-EAGLE 走的是第三条：**既借目标模型的特征（便宜），又保持自回归（贴合）**，把草稿准确率拉到约 0.8。它的出发点是一个反直觉的观察——
+EAGLE 走的是第三条：**既借目标模型的特征（便宜），又保持自回归（贴合）**，把草稿准确率拉到约 0.8——注意这个 0.8 是 §31.2、§31.3 两个观察**叠加后**完整 EAGLE 的端点读数，不是第一个观察独享的。支点是一个反直觉的观察——
 
 **在特征层接龙，比在 token 层接龙更容易。**
 
-道理是这样：token 序列是自然语言的一层简单变换，离散、跳变、噪声大；而特征是连续向量，序列更规整、更好预测。所以「自回归地预测下一个特征、再用目标模型的 LM Head（语言模型头，把特征映射成词表分布的那层线性变换）把特征翻成 token」，比「直接自回归地预测下一个 token」要准（arXiv:2401.15077 §1，Fig.4）。
+token 是特征经采样塌缩后的有损投影：离散、跳变，把「模型本来在想什么」的大部分信息扔掉了；特征是连续向量，序列规整得多。所以「自回归地预测下一个特征、再用目标模型的 LM Head（语言模型头，把特征映射成词表分布的那层线性变换）把特征翻成 token」，比「直接自回归地预测下一个 token」要准（arXiv:2401.15077 §1，Fig.4）。便宜这一头则是白送的：目标模型每验证一轮，前向本身就把各位置的特征算了出来——草稿头的原料零成本，它只需在特征空间续一步。
 
 ![token 层与特征层草稿对比，右侧特征层准确率与加速更高](../diagrams/fig36-1-token-vs-feature.png)
 
-*左：token 直接接龙，准确率约 0.6。右：特征层自回归再过共享 LM Head。特征更规整，是 EAGLE 第一大观察。*
+*左：token 直接接龙，准确率约 0.32、加速 1.5x。右：特征层自回归再过共享 LM Head，约 0.63、1.9x（论文 Fig.4 训练收敛后的读数）。特征更规整，是 EAGLE 第一大观察；上一段那个约 0.8 还要叠上 §31.3 的超前 token 才到手。*
 
-这就是 EAGLE 名字里 Extrapolation（外推）的由来：它在特征空间里外推下一个特征。下一节把这个观察落成记号和真实代码。
+![草稿的原料是白送的：目标前向已算出特征，EAGLE 只接两层继续画](../diagrams/fig-eagle-epiphany.png)
+
+*全章一图：以为草稿要一个完整小 LLM 从 token 从零重算（给 70B 当草稿就得再养一个 7B）；其实目标模型每次验证前向已经把每个位置的「下一步念头」——特征——白送了出来，EAGLE 捡起这个半成品只接两层可训练结构（0.99B，约 7 倍更小），草稿准确率反而从 Medusa 量级的约 0.6 抬到完整 EAGLE 的约 0.8——省，且更准。*
+
+这就是 EAGLE 名字里 Extrapolation（外推）的由来：它在特征空间里外推下一个特征。下一节把这个观察落成记号。
 
 ---
 
 ## 31.2 特征级自回归：在半成品语义上接着画
 
-### 直觉
-
-打个比方。token 是「成品文字」，一笔一画写死了；特征是「半成品语义草图」，连续、有弹性。让你接着一幅铅笔草图往下画，比让你接着一段已经誊清的钢笔字往下写，要顺手得多——草图之间的过渡是平滑的，定稿之间的跳变是突兀的。EAGLE 让草稿头在特征这幅草图上往下画，画完再借目标模型的 LM Head 誊成 token。
-
-### 机制
+洞见一行：**草稿头不猜字，猜的是目标模型的「念头」——在特征上外推一步，再借目标模型自己的 LM Head 把念头翻译成字。** 打个比方：接着一幅铅笔草图往下画，比接着一段誊清的钢笔字往下写顺手得多。
 
 先立记号（arXiv:2401.15077 §2）。目标模型的一次标准自回归是：
 
@@ -76,79 +80,55 @@ $$
 T_{1:j} \rightarrow E_{1:j} \rightarrow f_j \rightarrow p_{j+1} \rightarrow t_{j+1}
 $$
 
-token 序列 $T_{1:j}$ 过 Embedding（词嵌入层，把离散 token 查成向量）得到 $E_{1:j}$ ，再过整个网络得到特征 $f_j$ ，LM Head 把 $f_j$ 映射成分布 $p_{j+1}$ ，采样得到下一个 token $t_{j+1}$ 。这里 $f_j$ 就是「第二顶层特征」——LM Head 前的那个隐状态。
+token 序列 $`T_{1:j}`$ 过 Embedding（词嵌入层，把离散 token 查成向量）得到 $`E_{1:j}`$ ，再过整个网络得到特征 $`f_j`$ ，LM Head 把 $`f_j`$ 映射成分布 $`p_{j+1}`$ ，采样得到下一个 token $`t_{j+1}`$ 。这里 $`f_j`$ 就是「第二顶层特征」——LM Head 前的那个隐状态。
 
-EAGLE 的草稿头不重跑整个网络，而是直接在 $f$ 这一层外推：给定已知的特征序列，预测下一个特征 $\hat f$ ，再用**共享的** LM Head 采出草稿 token。共享是关键——LM Head 直接用目标模型的参数，不训练，所以草稿 token 和目标 token 说的是同一套「词表语言」。
+EAGLE 的草稿头不重跑整个网络，而是直接在 $`f`$ 这一层外推。它每步吃两样东西——一个 token 的词向量、一段特征——拼起来过一次降维、一层解码：
 
-真实运行长什么样？用一个 6 词表、4 维特征的玩具目标模型跑一条 γ=4 的草稿链，逐步观察草稿头产出的特征范数 ‖f‖ 和采出的 token：
+$$
+\hat f_{j+1} = \mathrm{Decoder}\big(W_{\mathrm{fc}}\,[\,e_{j+1};\ f_j\,]\big),\qquad
+\hat p_{j+2} = \mathrm{Softmax}\big(W_{\mathrm{LM}}\,\hat f_{j+1}\big)
+$$
+
+逐个认符号：$`e_{j+1}`$ 是 token $`t_{j+1}`$ 查 Embedding 得到的词向量；$`[\,\cdot\,;\,\cdot\,]`$ 是沿最后一维拼接，宽度变成 $`2h`$ （ $`h`$ 为隐层宽度）；$`W_{\mathrm{fc}}\in\mathbb R^{h\times 2h}`$ 把拼接压回 $`h`$ 宽；$`\mathrm{Decoder}`$ 是一层标准 Transformer 解码层；$`W_{\mathrm{LM}}`$ 是 **目标模型自己的** LM Head——直接借用、不训练，所以草稿分布 $`\hat p`$ 与目标分布 $`p`$ 定义在同一套词表语言上。还要留意下标是故意错着位的：配 $`f_j`$ 的是 $`e_{j+1}`$ ——token 为什么必须比特征超前一位，是 §31.3 的主角，这里先照抄。
+
+真实运行长什么样？用一个 6 词表、4 维特征的玩具目标模型跑一条 γ=4 的草稿链：
 
 <!-- trace: feature-level-autoregression -->
 
-| step 草稿步 | input token 输入 token | pred feature ‖f‖ | draft token 采出 token | confidence c_j |
-|---|---|---|---|---|
-| 1 | 4 | 1.195 | 3 | 0.354 |
-| 2 | 3 | 1.256 | 1 | 0.304 |
-| 3 | 1 | 2.346 | 3 | 0.592 |
-| 4 | 3 | 1.21 | 0 | 0.259 |
+| step 草稿步 | input token 输入 token | draft token 采出 token | confidence $`c_j`$ |
+|---|---|---|---|
+| 1 | 4 | 3 | 0.354 |
+| 2 | 3 | 1 | 0.304 |
+| 3 | 1 | 3 | 0.592 |
+| 4 | 3 | 0 | 0.259 |
 
-读表：每一步草稿头吃「上一步 token 的 embedding ⊕ 上一步的特征」，产出下一个特征（‖f‖ 一列 1.195→1.256→2.346→1.21，一直在演化，没有塌缩到某个定点），再过共享 LM Head argmax（取概率最大的那个 token）出一个 token（3→1→3→0，各不相同，不是退化地重复同一个）。最后一列 confidence（置信度 c_j，草稿头对该 token 的自信程度）先记下——31.7 节 EAGLE-2 算 value 时要复用它。
+读表看两件事。其一，链式回喂肉眼可见：第 1 步 argmax（取概率最大的那个 token）采出 token 3，它正是第 2 步的输入；第 2 步采出 1，又成了第 3 步的输入——input 列恰是 draft 列整体下移一格。其二，产出 3→1→3→0 各不相同，没有退化成重复同一个 token。最后一列 confidence（置信度 $`c_j`$ ，草稿头给自己所出 token 的概率）先记下——§31.7 EAGLE-2 算路径价值时要复用它。
 
-这条链有个干净的不变量：**它恰好产出 γ 个草稿 token 就停**。第一遍前向采出第 1 个，随后循环体跑 γ−1 次、每次产 1 个，计数器严格递减到零，有限步必停，总数 1+(γ−1)=γ。而且每步只依赖上一步的 (token, feature)，不回看更早状态——所以它是严格的**链式**（chain），不是树。这一点在 31.7 节会变成 vLLM 落地与论文原理的分水岭。
+这条链有个干净的不变量：**恰好产出 γ 个草稿 token 就停**。第一遍前向采出第 1 个，随后再跑 γ−1 步、每步产 1 个，有限步必停，总数 1+(γ−1)=γ。而且每步只依赖上一步的 (token, feature)，不回看更早状态——严格的 **链式**（chain），不是树。这一点在 §31.7 会变成论文原理与 vLLM 落地的分水岭。
 
-量化一下收益：本例 γ=4，只花 4 次轻量草稿头前向 + 1 次目标模型验证前向，就提出了 4 个草稿 token；而 vanilla 解码要 4 次目标前向才出 4 个 token。论文 Fig.4（Vicuna 7B，MT-bench，温度 0）量化了特征层相对 token 层的收益：草稿准确率从 token 层约 0.6 提到特征层约 0.8，加速比从 1.5x 提到 1.9x（arXiv:2401.15077 §1）。
+收益记回账上：本例 γ=4，只花 4 次轻量草稿头前向 + 1 次目标模型验证前向，就提出 4 个草稿 token；vanilla 解码要 4 次目标前向才出 4 个。论文 Fig.4（Vicuna 7B，MT-bench，温度 0）给出第一次抬升的读数：草稿准确率从 token 层约 0.32 提到特征层约 0.63，加速比从 1.5x 提到 1.9x（arXiv:2401.15077 §1，Fig.4）。§31.1 那个「约 0.6 → 约 0.8」是论文引言里 Medusa 与完整 EAGLE 的另一套整体读数，别拿它对 Fig.4 的三条消融曲线——约 0.8 要等 §31.3 把超前 token 叠上去（2.8x 那一档）才兑现。工程上，上面那条公式就是草稿模型前向的全部——拼接、降维、单层解码与式中三个算子逐项对应，落地代码见[下一章](../../ch32-spec-decode/narrative/chapter.md)。
 
-### 源码
-
-特征级自回归的算法本体，就是草稿模型 `forward` 的这几行（`vllm/model_executor/models/llama_eagle.py:L100`）：
-
-```python
-# vllm/model_executor/models/llama_eagle.py:L100
-def forward(
-    self,
-    input_ids: torch.Tensor,
-    positions: torch.Tensor,
-    hidden_states: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    input_embeds = self.embed_tokens(input_ids)
-    hidden_states = self.fc(torch.cat((input_embeds, hidden_states), dim=-1))
-    residual = None
-    for layer in self.layers:
-        hidden_states, residual = layer(
-            positions,
-            hidden_states,
-            residual,
-        )
-    hidden_states = hidden_states + residual
-    return hidden_states, hidden_states
-```
-
-四步一目了然：`embed_tokens` 把输入 token 查成 embedding；`torch.cat` 把 embedding 和传进来的目标特征 `hidden_states` 沿最后一维拼成 2h 宽；`self.fc` 降回 h 宽；过 `self.layers`（EAGLE-1 通常只 1 层 `LlamaDecoderLayer`，标准的 Transformer 解码层）预测下一个特征。返回一个二元组 `(hidden_states, hidden_states)`——两份同样的特征，一份喂共享 LM Head 采 token，一份作为下一步自回归的输入特征。
-
-注意函数签名多了个 `hidden_states` 参数——普通语言模型的 `forward` 只吃 `input_ids`。这个多出来的入参就是「目标模型的特征」，也是 EAGLE 区别于一切 token 层方法的物理入口。它是怎么被接进来的？下节先解决一个更棘手的问题：光有特征，其实还不够。
+不过光有特征还不够。公式里那个错位的 $`e_{j+1}`$ ，藏着 EAGLE 的第二个观察。
 
 ---
 
 ## 31.3 特征不确定性：为什么非要「剧透」超前一步的 token
 
-### 直觉
+洞见一行：**采样的随机性让同一个特征后面长出两条分支；把目标实际抽到的 token 剧透给草稿头，分岔就被钉成确定函数。** 这是论文标题里 feature uncertainty（特征不确定性）的确切含义。
 
-只看「我」这个字的特征 $f_I$ ，你猜不出下一个词——可能是「我**总是**（always）」，也可能是「我**马上**（am）」。走哪条，取决于目标模型这一步实际抽到了谁。这是**采样的随机性**注入的不确定性：同一个 $f_I$ ，后面能长出两个完全不同的特征分支。
+只看「我」这个字的特征 $`f_I`$ ，你猜不出下一个词——可能是「我**总是**（always）」，也可能是「我**马上**（am）」。走哪条，取决于目标模型这一步实际抽到了谁。草稿头要是只吃 $`f_I`$ ，面对两条分支却只有一份输入，无从区分，只能预测一个两边都不像的「平均」特征。EAGLE 的破解办法简单得近乎作弊：知道抽到的是「总是」还是「马上」，下一个特征就唯一确定了。
 
-草稿头要是只吃 $f_I$ ，它面对两条分支却只有一份输入，无从区分，只能预测一个「平均」的模糊特征，两边都不像。EAGLE 的破解办法简单得近乎作弊：**把目标模型实际抽到的那个 token 提前剧透给草稿头**。知道抽到的是「总是」还是「马上」，下一个特征就唯一确定了。
-
-### 机制
-
-形式化地说（arXiv:2401.15077 §1，Fig.3）：给定 $f_I$ ，下一特征 $f_{\mathrm{next}}$ 是随机的，因为它依赖尚未抽出的 token。但一旦把「超前一步的 token」 $t_x$ 也作为输入：
+形式化地说（arXiv:2401.15077 §1，Fig.3）：给定 $`f_I`$ ，下一特征 $`f_{\mathrm{next}}`$ 是随机的，因为它依赖尚未抽出的 token。但一旦把「超前一步的 token」 $`t_x`$ 也作为输入：
 
 $$
 f_{\mathrm{always}} \leftarrow (f_I,\ t_{\mathrm{always}}), \qquad f_{\mathrm{am}} \leftarrow (f_I,\ t_{\mathrm{am}})
 $$
 
-这里的 $\leftarrow$ 读作「由……决定/预测得出」——和上面 31.2 节 T→E→f→p→t 那条从左往右「变换成」的箭头方向相反，别混着读：那里是「输入变换成输出」，这里是「输出由哪些输入决定」。
+这里的 $`\leftarrow`$ 读作「由……决定/预测得出」——和上面 31.2 节 T→E→f→p→t 那条从左往右「变换成」的箭头方向相反，别混着读：那里是「输入变换成输出」，这里是「输出由哪些输入决定」。
 
-每条分支就各自成了**确定的函数值**。不确定性没有消失，而是被 $t_x$ 这个「随机分支的选择结果」显式吸收掉了。
+每条分支就各自成了**确定的函数值**。不确定性没有消失，而是被 $`t_x`$ 这个「随机分支的选择结果」显式吸收掉了。这也正是 §31.2 公式里配 $`f_j`$ 的是 $`e_{j+1}`$ 的原因：喂给草稿头的 token 序列相对特征序列整体超前一位——token 剧透未来，特征提供语义底座，两者按位对齐。工程上这只是一手「把目标 token 序列整体左移一位、末位塞上一轮刚接受的 token」的输入构造，不改任何张量形状，代码见[下一章](../../ch32-spec-decode/narrative/chapter.md)。
 
-用玩具模型复现这个分岔：固定同一个 $f_I$ （其 ‖f_I‖=0.659），只改喂进去的超前 token（0 与 2），看草稿头产出的下一特征：
+用玩具模型复现这个分岔：固定同一个 $`f_I`$ （其 ‖f_I‖=0.659），只改喂进去的超前 token（0 与 2），看草稿头产出的下一特征：
 
 <!-- trace: feature-uncertainty-shifted-token -->
 
@@ -157,11 +137,11 @@ $$
 | branch_A | 1 | 0 | 1.137 | 0.587 | 1 | 0.222 |
 | branch_B | 1 | 2 | 0.85 | -0.38 | 4 | 0.213 |
 
-两条分支共用同一个 $f_I$ ，只有超前 token 不同（0 vs 2）。草稿头产出的下一特征立刻分岔：范数 1.137 vs 0.85，第一维 f[0] 0.587 vs −0.38，符号都反了；LM Head 采出的 token 也随之不同（1 vs 4）。如果草稿头只吃 $f_I$ （feature-only 方案），两条分支的输入一模一样，输出必然相同——那就永远只能猜中一条。超前 token 正是把这份随机性钉死成确定映射的钉子。
+两条分支共用同一个 $`f_I`$ ，只有超前 token 不同（0 vs 2）。草稿头产出的下一特征立刻分岔：范数 1.137 vs 0.85，第一维 f[0] 0.587 vs −0.38，符号都反了；LM Head 采出的 token 也随之不同（1 vs 4）。如果草稿头只吃 $`f_I`$ （feature-only 方案），两条分支的输入一模一样，输出必然相同——那就永远只能猜中一条。超前 token 正是把这份随机性钉死成确定映射的钉子。
 
-不变量：草稿头 `forward` 是纯函数（fc + decoder，没有随机性），固定 $(t_x$ 的 embedding $,\ f_I)$ 则输出唯一。分岔完全来自 $t_x$ 的取值；提供 $t_x$ ，不确定性即消除。
+不变量：草稿头的前向是纯函数（ $`W_{\mathrm{fc}}`$ 加一层 decoder，前向里没有任何随机源），固定 $`(t_x`$ 的 embedding $`,\ f_I)`$ 则输出唯一。分岔完全来自 $`t_x`$ 的取值；提供 $`t_x`$ ，不确定性即消除。
 
-论文 Fig.4 量化了这一步的威力：在 feature-only 的 1.9x 基础上，加入超前一步 token 把加速比推到 2.8x（arXiv:2401.15077 §1）。§4.3.2 的输入消融进一步排出座次：feature&shifted-token（EAGLE）> feature&unshifted-token > feature/token,差距主要落在「输入含一个错误特征时的接受率 1-α」上。
+论文 Fig.4 量化了这一步的威力：在 feature-only（仅特征，准确率约 0.63、1.9x）的基础上，加入超前一步 token 把草稿准确率抬到约 0.78、加速比推到 2.8x——§31.1 说的「约 0.8」到这一档才真正兑现（arXiv:2401.15077 §1，Fig.4）。§4.3.2 的输入消融进一步排出座次：feature&shifted-token（EAGLE）> feature&unshifted-token > feature/token,差距主要落在「输入含一个错误特征时的接受率 1-α」上。
 
 ![特征不确定性的消解，同一 f_I 靠超前 token 分出两条确定分支](../diagrams/fig36-2-uncertainty-branch.png)
 
@@ -171,109 +151,29 @@ $$
 
 ![重绘自 arXiv:2401.15077 Fig.4：feature&shifted-token 全程领先，随训练收敛到准确率≈0.78、加速比≈2.77x](../diagrams/paper-fig-eagle-fig4.png)
 
-*三种草稿输入（token 层、特征层、特征层+超前 token）在 Vicuna 7B / MT-bench（温度=0）上的准确率与加速比对比。本节讲的两级跳——1.5x→1.9x→2.8x——到此收束成一张图。*
-
-### 源码
-
-「超前一步 token」在 vLLM 里怎么造出来？答案在 `set_inputs_first_pass`——EAGLE 默认路径下就一手「左移 + 塞末位」（`vllm/v1/spec_decode/llm_base_proposer.py:L656`）：
-
-```python
-# vllm/v1/spec_decode/llm_base_proposer.py:L656
-if not self.needs_extra_input_slots:
-    # Default EAGLE pathway: no reshaping of input tensors needed.
-    # Simply rotate the input ids and leave the positions unchanged,
-    # Inserting the next token ids at the last slot in each request.
-    if token_indices_to_sample is None:
-        token_indices_to_sample = cad.query_start_loc[1:] - 1
-
-    num_tokens = target_token_ids.shape[0]
-    # Shift the input ids by one token.
-    # E.g., [a1, b1, b2, c1, c2, c3] -> [b1, b2, c1, c2, c3, c3]
-    self.input_ids[: num_tokens - 1] = target_token_ids[1:]
-    # Replace the last token with the next token.
-    # E.g., [b1, b2, c1, c2, c3, c3] -> [a2, b2, b3, c2, c3, c4]
-    self.input_ids[token_indices_to_sample] = next_token_ids
-
-    # copy inputs to buffer for cudagraph
-    if self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim == 0:
-        target_positions = target_positions[0]
-    self._set_positions(num_tokens, target_positions)
-
-    self.hidden_states[:num_tokens] = target_hidden_states
-
-    return num_tokens, token_indices_to_sample, cad
-    # … 省略：else 分支（draft_model / 并行草稿走 triton kernel 重排输入）…
-```
-
-三步对上论文的「超前」：先把目标 token 序列整体左移一位（`input_ids[:-1] = target_token_ids[1:]`）；再把每条请求的末位塞成刚采出的 `next_token_ids`（上一轮验证接受的最后一个 token，也就是这一轮的真起点）；最后把目标特征 `target_hidden_states` 原样写进 `self.hidden_states` 缓冲，position（位置编码索引）保持不动。于是喂给草稿头的 token 序列，相对它要配对的特征，整体**超前了一个时间步**——token 超前，但 token 和 feature 的位置仍一一对齐。
-
-代码注释里那句 `Default EAGLE pathway` 值得记住：这一手轻量的左移，正是 EAGLE 之所以「不改张量形状、直接复用现有 batch」的工程红利，也是它和需要重排输入的 draft_model 路径的分野。`next_token_ids` 从哪来、`target_hidden_states` 又怎么选出来，留到 31.8 节讲运行器调用面。
+*三种草稿输入（token 层、特征层、特征层+超前 token）在 Vicuna 7B / MT-bench（温度=0）上的准确率与加速比对比。本节讲的两级跳——准确率 0.32→0.63→0.78、加速比 1.5x→1.9x→2.8x——到此收束成一张图。*
 
 ---
 
 ## 31.4 Autoregression Head：一层 FC 加一层 decoder，其余全借
 
-前两节的草稿头，结构上到底是个什么东西？EAGLE 给的答案朴素得惊人：**几乎全是借来的，只有两层需要训练**。
+前两节的草稿头，结构上到底是个什么东西？EAGLE 给的答案朴素得惊人：**三个模块里只有两层需要训练，其余全部冻结借自目标模型**。
 
-### 机制
+草稿模型三个模块（arXiv:2401.15077 §3.1，Fig.6）：Embedding、LM Head、Autoregression Head（自回归头）。前两个直接用目标模型的参数、**不训练**——Embedding 保证草稿和目标查的是同一套词向量，LM Head 保证 $`\hat p`$ 与 $`p`$ 说同一套词表语言；没有这两处「借」，让 $`\hat p`$ 贴近 $`p`$ 的一切努力都得先跨一道词表错位的坎。唯一要训练的 Autoregression Head 恰是 §31.2 公式里的那两个算子：FC 层（fully-connected，全连接线性层）$`W_{\mathrm{fc}}\in\mathbb R^{h\times 2h}`$ 把拼接后的 2h 宽向量降回 h 宽，一个 decoder 层预测下一特征。
 
-草稿模型三个模块（arXiv:2401.15077 §3.1，Fig.6）：Embedding、LM Head、Autoregression Head（自回归头）。前两个直接用目标模型的参数、**不训练**——Embedding 保证草稿和目标查的是同一套词向量，LM Head 保证它们说同一套词表语言。唯一要训练的是 Autoregression Head，而它只有两层：一个 FC 层（fully-connected，全连接线性层）把拼接后的 2h 宽向量降回 h 宽，一个 decoder 层预测下一特征。
-
-输入输出的形状流转是这样：token 序列 (bs, seq) 过共享 Embedding 成 (bs, seq, h)，与目标特征 (bs, seq, h) 拼成 (bs, seq, 2h)；FC 降回 (bs, seq, h)；decoder 层产出下一特征。「2」这个拼接倍数是整个结构的枢纽。
+输入输出的形状流转是这样：token 序列 (bs, seq) 过共享 Embedding 成 (bs, seq, h)，与目标特征 (bs, seq, h) 拼成 (bs, seq, 2h)；FC 降回 (bs, seq, h)；decoder 层产出下一特征。「2」这个拼接倍数是整个结构的枢纽——它就是「token 剧透 ⊕ 特征底座」两路输入的字面宽度。
 
 ![Autoregression Head 结构，复用冻结的 Embedding/LM Head 加轻量 FC 与 decoder](../diagrams/fig36-3-head-layout.png)
 
 *雪花标记的 Embedding/LM Head 用目标参数、不训练。只有 FC 和单层 decoder 需训练。*
 
-草稿头轻到什么程度？可训练参数随目标模型规模走：7B 目标对应 0.24B、13B 对应 0.37B、33B 对应 0.56B、70B 也只有 0.99B（arXiv:2401.15077 §4，Training）。给 70B 的大象配一只不到 1B 的草稿头，这是 EAGLE 训练成本极低的根本原因。
-
-### 源码
-
-这份「全借 + 两层」在 vLLM 里分两处落地。第一处是 FC 层的定义，宽度正好 `hidden_size * 2`（`vllm/model_executor/models/llama_eagle.py:L87`）：
-
-```python
-# vllm/model_executor/models/llama_eagle.py:L87
-self.fc = ReplicatedLinear(
-    input_size=self.config.hidden_size * 2,
-    output_size=self.config.hidden_size,
-    bias=False,
-    params_dtype=vllm_config.model_config.dtype,
-    quant_config=self.quant_config,
-    prefix=maybe_prefix(prefix, "fc"),
-    return_bias=False,
-)
-```
-
-`ReplicatedLinear`（在每个张量并行 rank 上各存一份完整权重的线性层）的 `input_size=hidden_size * 2`,就是论文「拼接维度 2h」的字面落地；`output_size=hidden_size` 就是「降回 h」。
-
-第二处更妙——EAGLE 的全部特有逻辑，浓缩成 `EagleProposer` 里的一个布尔标志（`vllm/v1/spec_decode/eagle.py:L10`）：
-
-```python
-# vllm/v1/spec_decode/eagle.py:L10
-class EagleProposer(SpecDecodeBaseProposer):
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        device: torch.device,
-        runner=None,
-    ):
-        super().__init__(
-            vllm_config,
-            device,
-            pass_hidden_states_to_model=True,
-            runner=runner,
-        )
-```
-
-整个类只干一件事：给基类 `SpecDecodeBaseProposer`（eagle / eagle3 / mtp / draft_model 共用的 proposer 基类）传 `pass_hidden_states_to_model=True`。这个 True 就是 31.2 节那个多出来的 `hidden_states` 入参的开关——它告诉基类：这个草稿模型除了 token,还要吃目标模型的特征。其余的链式循环、缓冲管理、CUDA graph（把前向固化成可重放计算图的加速手段）全在基类里，和别的 proposer 共享。EAGLE 的独特性，就这一行。
+草稿头轻到什么程度？可训练参数随目标模型规模走：7B 目标对应 0.24B、13B 对应 0.37B、33B 对应 0.56B、70B 也只有 0.99B（arXiv:2401.15077 §4，Training）。给 70B 的大象配一只不到 1B 的草稿头——账本的「便宜」一半就这样拿到了：抬 $`\alpha`$ 的机构本身几乎不占前向预算。这三个模块在 vLLM 里怎么装配、目标特征怎么接进草稿前向，拆解见[下一章](../../ch32-spec-decode/narrative/chapter.md)。
 
 ---
 
 ## 31.5 草稿头怎么训出来：两把尺子，与 0.1 的权重
 
-这一节是纯原理背景。训练不在 vLLM 的推理路径里——推理仓只加载已经训好的草稿头。但不讲训练目标，就说不清草稿头为什么「校准得好」（31.7 节动态树的地基）。所以把两把尺子的数字算实。
-
-### 机制
+这一节是纯原理背景。训练不在推理路径里——推理框架只加载已经训好的草稿头。但不讲训练目标，就说不清草稿头为什么「校准得好」（§31.7 动态树的地基），也说不清训练到底在账本上压的是哪个量（§31.6 揭晓）。所以把两把尺子的数字算实。
 
 草稿头有两个目标，用两个损失盯着（arXiv:2401.15077 §3.2）。第一把尺子量「特征画得像不像」，用 Smooth-L1（平滑 L1 损失，小误差处平方、大误差处线性的回归损失）做特征回归：
 
@@ -281,7 +181,7 @@ $$
 L_{\mathrm{reg}} = \mathrm{SmoothL1}\big(f_{i+1},\ \mathrm{DraftModel}(T_{2:i+1},\ F_{1:i})\big)
 $$
 
-这里 $T_{2:i+1}$ 就是 31.3 节那份左移一位的超前 token 序列， $F_{1:i}$ 是过去 i 步的历史特征序列——记号和 31.2 节的 $T_{1:j}$ 、 $f_j$ 是同一套，只是下标整体往后挪了一位（见前面的速查表）。
+这里 $`T_{2:i+1}`$ 就是 31.3 节那份左移一位的超前 token 序列， $`F_{1:i}`$ 是过去 i 步的历史特征序列——记号和 31.2 节的 $`T_{1:j}`$ 、 $`f_j`$ 是同一套，只是下标整体往后挪了一位（见前面的速查表）。
 
 第二把尺子量「最终吐字对不对」。预测特征只是中间目标，终点是吐对 token,所以再加一个分类损失——把目标特征和预测特征各自过 LM Head、softmax 成分布，取交叉熵（arXiv:2401.15077 §3.2）：
 
@@ -304,7 +204,7 @@ $$
 | accurate 特征准 | 0.001 | 1.496 | 0.1 | 0.15 | 0.151 |
 | inaccurate 特征偏 | 0.417 | 1.518 | 0.1 | 0.152 | 0.569 |
 
-读表：特征预测越准，回归项 L_reg 越小（0.001 vs 0.417）。分类项 L_cls 始终在 1.5 附近——因为交叉熵的下界是目标分布的熵 $H(p)>0$ （信息熵，衡量目标分布 p 自身不确定性的量，只要 p 不是退化的 one-hot 分布就恒为正），不是 0，跟特征准不准关系不大。两情形对比正好印证 §3.2 那句「分类损失比回归损失大一个数量级」：准情形 1.496/0.001 差了约 1500 倍，偏情形 1.518/0.417 也差约 3.6 倍。分类项乘上 0.1 后约 0.15，和偏情形的 L_reg=0.417 同量级——这就是权重取 0.1 的定量动机。
+读表：特征预测越准，回归项 L_reg 越小（0.001 vs 0.417）。分类项 L_cls 始终在 1.5 附近——因为交叉熵的下界是目标分布的熵 $`H(p)>0`$ （信息熵，衡量目标分布 p 自身不确定性的量，只要 p 不是退化的 one-hot 分布就恒为正），不是 0，跟特征准不准关系不大。两情形对比正好印证 §3.2 那句「分类损失比回归损失大一个数量级」：准情形 1.496/0.001 差了约 1500 倍，偏情形 1.518/0.417 也差约 3.6 倍。分类项乘上 0.1 后约 0.15，和偏情形的 L_reg=0.417 同量级——这就是权重取 0.1 的定量动机。
 
 不变量：组合损失恒非负，且分类项有正的熵下界。这一步「交叉熵 = 熵 + KL 散度」不是凭空甩出来的等式，而是信息论里的标准分解，任何信息论教材都能查到——这里把它展开一遍，看清「凭什么」成立：
 
@@ -324,7 +224,7 @@ $$
 L_{\mathrm{cls}} = \mathrm{CrossEntropy}(p, \hat p) = H(p) + \mathrm{KL}(p\,\|\,\hat p) \ge H(p) > 0
 $$
 
-其中 KL（Kullback-Leibler 散度，衡量两分布差距的非负量）当且仅当 $\hat p = p$ 时取零（arXiv:2401.15077 §3.2）。下降只能靠 L_reg→0（特征拟合）和 KL→0（分布对齐），所以最小化确实同时逼近「特征像」与「吐字对」。论文另外加了一手数据增强：训练时给目标特征加 $\mathcal U(-0.1, 0.1)$ 的均匀噪声，抑制自回归推理时的误差累积。
+其中 KL（Kullback-Leibler 散度，衡量两分布差距的非负量）当且仅当 $`\hat p = p`$ 时取零（arXiv:2401.15077 §3.2）。下降只能靠 L_reg→0（特征拟合）和 KL→0（分布对齐），所以最小化确实同时逼近「特征像」与「吐字对」。论文另外加了一手数据增强：训练时给目标特征加 $`\mathcal U(-0.1, 0.1)`$ 的均匀噪声，抑制自回归推理时的误差累积。
 
 这些机制不进推理路径，但它训出的草稿头有一个宝贵性质——**置信度校准得好**,31.7 节会靠它做零成本的动态树排序。
 
@@ -332,15 +232,11 @@ $$
 
 ## 31.6 验收准则：接受、拒绝与残差分布
 
-草稿提出来了，怎么验收？这一节把接受准则的数字算实。保分布定理的完整证明留给下一章 §31.5，这里只借结论。
-
-### 直觉
+草稿提出来了，怎么验收？这一节把接受准则的数字算实，并兑现开篇的承诺：**接受率 $`\alpha`$ 恰好等于 1 减去 $`p`$ 与 $`\hat p`$ 的总变差距离**——账本与训练目标在这里合流。保分布定理的完整证明留给下一章 §32.5，这里只借结论。
 
 验收员按「目标想要的概率 / 草稿给出的概率」掷骰子决定收不收：比值 ≥1 必收，<1 就以该比值为概率收。一旦退货，后面的草稿 token 全作废，并从「目标想要、但草稿没给够」的余量分布里补抽一个。
 
-### 机制
-
-投机采样对草稿 token $\hat t$ 的接受概率（arXiv:2401.15077 §2）：
+投机采样对草稿 token $`\hat t`$ 的接受概率（arXiv:2401.15077 §2）：
 
 $$
 \min\!\left(1,\ \frac{p_{j+i}(\hat t_{j+i})}{\hat p_{j+i}(\hat t_{j+i})}\right)
@@ -364,7 +260,7 @@ $$
 
 读表：位 1、2 的随机数 u（0.3、0.5）小于接受比（0.857、0.909），收；位 3 的 u=0.9 超过接受比 0.667,退货，后续全弃。残差分布归一后是 [0.4, 0.4, 0.2, 0.0]:被拒的 token 3 残差质量被清零（max(0, 0.5−0.75)=0），从余量里补抽 token 0。
 
-这个 [0.4, 0.4, 0.2, 0.0] 怎么来的？位 3 处目标分布 $p$ 和草稿分布 $\hat p$ 在整个 4 词词表上的取值都摆出来，逐元素算一遍就能亲手验证：
+这个 [0.4, 0.4, 0.2, 0.0] 怎么来的？位 3 处目标分布 $`p`$ 和草稿分布 $`\hat p`$ 在整个 4 词词表上的取值都摆出来，逐元素算一遍就能亲手验证：
 
 | token | p（目标分布） | p̂（草稿分布） | max(0, p−p̂) | 归一化残差 |
 |---|---|---|---|---|
@@ -375,11 +271,23 @@ $$
 
 `max(0, p−p̂)` 那一列加总是 0.10+0.10+0.05+0.00=0.25；每个元素除以 0.25 归一化，正好得到 [0.4, 0.4, 0.2, 0.0]。
 
-不变量：接受比落在 $[0,1]$;残差逐元素非负、归一后是合法分布；被拒 token 处 $p-\hat p<0$ 被截为 0,所以永远不会重抽到刚被拒的那个 token。链式验证遇首个拒绝即停。**输出分布严格等于目标模型采样**——这条保分布定理的完整证明（残差分布 + Gumbel-max 免归一化采样）在 [第 32 章：投机解码](../../ch32-spec-decode/narrative/chapter.md) §31.5,本章不重复。
+这张残差表还藏着本章账本的钥匙。草稿 token 是从 $`\hat p`$ 里抽出来的，所以一个位置整体的接受概率是对所有可能 token 的加权平均：
+
+$$
+\alpha \;=\; \sum_{t} \hat p(t)\,\min\!\left(1,\ \frac{p(t)}{\hat p(t)}\right)
+\;=\; \sum_{t} \min\big(p(t),\ \hat p(t)\big)
+\;=\; 1-\sum_{t}\max\big(0,\ p(t)-\hat p(t)\big)
+$$
+
+第二个等号是逐项化简（ $`\hat p\cdot\min(1,p/\hat p)=\min(\hat p,p)`$ ）；第三个等号用恒等式 $`\min(a,b)=a-\max(0,a-b)`$ ，再用 $`\sum_t p(t)=1`$ 收拢。末项 $`\sum_t\max(0,p-\hat p)`$ 就是总变差距离（total variation distance，两分布逐点差的正部之和，度量它们最多在多少概率质量上不重合）——也正是上表 `max(0, p−p̂)` 一列的总和 0.25。代入：$`\alpha = 1-0.25 = 0.75`$ 。**残差分布归一化时除掉的那个常数，与这个位置的接受率，是同一个数的两面**：两分布逐点重叠多少就能接受多少，溢出多少就得拒绝多少。
+
+> **严谨（训练损失如何压住接受率）**：$`\alpha = 1-\mathrm{TV}(p,\hat p)`$ ，而 Pinsker 不等式（信息论标准结论，此处不重证）给出 $`\mathrm{TV}(p,\hat p)\le\sqrt{\mathrm{KL}(p\,\|\,\hat p)/2}`$ ，于是 $`\alpha \ge 1-\sqrt{\mathrm{KL}(p\,\|\,\hat p)/2}`$ 。§31.5 分类损失里那个 KL 项在此显出工程真义：**训练最小化 KL，就是在直接抬高每个位置接受率的下界**——两把尺子里的分类尺，量的就是未来的 $`\alpha`$ 。代上表分布验证：$`\mathrm{KL}(p\,\|\,\hat p)\approx 0.144`$ ，下界 $`1-\sqrt{0.144/2}\approx 0.732`$ ，实际 $`\alpha=0.75`$ ，界成立且相当紧。
+
+不变量：接受比落在 $`[0,1]`$;残差逐元素非负、归一后是合法分布；被拒 token 处 $`p-\hat p<0`$ 被截为 0,所以永远不会重抽到刚被拒的那个 token。链式验证遇首个拒绝即停。**输出分布严格等于目标模型采样**——这条保分布定理的完整证明（残差分布 + Gumbel-max 免归一化采样）在 [第 32 章：投机解码](../../ch32-spec-decode/narrative/chapter.md) §32.5,本章不重复。
 
 为什么期望能这样按前缀积求和？链在位置 i 被接受，当且仅当前 i 位全部通过，其概率正是前 i 个接受比的连乘（前缀积）；对每个位置「是否被接受」这个 0/1 变量取期望、再对所有位置求和（期望的线性性——多个随机变量之和的期望，等于各自期望之和，不要求它们相互独立），就得到 E=Σ前缀积。
 
-量化加速来源：本例逐位接受比 α=[0.857, 0.909, 0.667],前缀积 [0.857, 0.779, 0.519],期望被接受草稿数 E=Σ前缀积=2.156,加 1 个 bonus token,平均每次目标前向产出 3.156 个 token。这落在论文实测平均接受长度 τ（average acceptance length,每次目标前向平均接受的 token 数）约 3.2–4.5 的量级内（arXiv:2401.15077 Table 1/2）——一次前向多吐三四个 token,加速就是这么来的。
+开篇那本账在本例的读数：逐位接受比 α=[0.857, 0.909, 0.667],前缀积 [0.857, 0.779, 0.519],期望被接受草稿数 $`\mathbb{E}[\tau]`$ =Σ前缀积=2.156,加 1 个 bonus token,平均每次目标前向产出 3.156 个 token。这落在论文实测平均接受长度 τ（average acceptance length,每次目标前向平均接受的 token 数）约 3.2–4.5 的量级内（arXiv:2401.15077 Table 1/2）——一次前向多吐三四个 token,加速就是这么来的。
 
 链式验证还有优化空间：同一位置只有一个候选，第一个被拒就散场。下节的树验证给同一位置多备几个兄弟候选，拒了还能再试。
 
@@ -397,13 +305,9 @@ $$
 
 *左：论文 Fig.9 里 EAGLE 真实使用的草稿树（树注意力）。右：去掉树注意力后对应的链式结构。同一份算力预算，树式一次前向验证 27 个候选，链式只验证 6 个。*
 
-#### 直觉
-
 链式：同一位置一个候选，拒了就停。树式：同一位置有 k 个兄弟候选，第一个被拒，把它的「概率余量」传给第二个候选再试一次——多一次机会，多接受一截。这就是多轮投机采样（multi-round speculative sampling,SpecInfer 同款),保证树草稿下输出分布仍等于目标模型。
 
 > 直觉：SpecInfer（Miao et al., 2023）用一组小模型并行生成树状草稿，并较早把「拒绝后转而尝试兄弟候选」的树验证形式化证明为保分布——这里点名只为溯源，具体引用号本章尚未核实，故不点名。本章已经借 EAGLE 论文自己的 Appendix A.2 Algorithm 1 把多轮采样算法和终止性论证讲全，不依赖那篇论文，下面的推导可以照样往下走。
-
-#### 机制
 
 树的每个节点上，k 个兄弟候选依次判接受(arXiv:2401.15077 Appendix A.2, Algorithm 1)。和链式的区别就一处：某候选被拒时，**不**立刻从残差分布采，而是把目标分布调成残差分布，再拿下一个兄弟候选来试。全被拒才从最终残差分布采一个 fresh token。
 
@@ -426,28 +330,11 @@ $$
 
 论文 Table 5 量化整体收益：树草稿/树验证相比链式，平均接受长度 τ 提升约 +0.6–0.8、加速比提升约 +0.3–0.5,且不增加前向次数、只增加每次前向处理的 token 数(arXiv:2401.15077 §4.3.1)。
 
-#### 源码：树验证在 vLLM v1 里还没落地
-
-多轮投机采样是论文原理，但 vLLM v1 的草稿路径还没接进来。证据留在 `dummy_run`(预热时空跑一遍前向、给 CUDA graph 定形状的函数)的一行 FIXME 里(`vllm/v1/spec_decode/llm_base_proposer.py:L1402`):
-
-```python
-# vllm/v1/spec_decode/llm_base_proposer.py:L1402
-# FIXME: when using tree-based specdec, adjust number of forward-passes
-# according to the depth of the tree.
-only_one_forward_pass = is_graph_capturing or self.parallel_drafting
-for fwd_idx in range(
-    1 if only_one_forward_pass else self.num_speculative_tokens
-):
-    # … 省略：逐次前向的 batch/padding 逻辑 …
-```
-
-前向次数直接按 `num_speculative_tokens` 线性来——一条链一步一次，没有「按树深调整前向次数」的分支。那句 FIXME 就是路标：树式投机解码是规划，当前落地是它的链式退化。这也是为什么本节的树验证与下面的动态树都归在「原理」，vLLM 真实代码要等到 31.8 节才登场。
+顺带一句现实：多轮投机采样是论文原理，vLLM v1 的草稿路径还没接进来——预热代码里至今留着一行 `# FIXME: when using tree-based specdec, adjust number of forward-passes`，前向次数仍按链长线性数。树是规划，链是现实，这条落差在 §31.8 收束。
 
 ### EAGLE-2:用置信度之积决定长哪棵树
 
-树能一次核多分支，但分支不能瞎长——算力有限，得把力气花在「最可能被整条接受」的路径上。怎么在**不惊动目标模型**的前提下判断哪条路径最可能被接受？这是 EAGLE-2 的核心贡献。
-
-#### 直觉
+树能一次核多分支，但分支不能瞎长——算力有限。往哪长？洞见一行：**往账本增量最大的枝上长——每个节点对 $`\mathbb{E}[\tau]`$ 的贡献就是它的路径前缀积，而校准良好的草稿头能零成本估出这个积**。怎么在**不惊动目标模型**的前提下做到，是 EAGLE-2 的核心贡献。
 
 先看第一手动机：为什么静态树不够用？
 
@@ -461,13 +348,13 @@ for fwd_idx in range(
 
 *同一个「够不够确定」，树该不该跟着变形：query="10+2"难猜时两种树都对，长 2 个候选；query="10+2="好猜时下一个 token 几乎唯一确定，EAGLE 的静态树仍固定长 2 个（浪费一个名额），EAGLE-2 的动态树只长 1 个（刚好够）。*
 
-有了这条动机，再看 EAGLE-2 的解法。一条草稿路径能整条被接受，当且仅当路上每一步都被接受。所以它的「全局接受率」= 路径上各步接受率的连乘。麻烦是，真实接受率要目标模型前向才知道。EAGLE-2 的观察是：草稿头**校准得好**——它自己的置信度 c_j 约等于真实接受率 p_j（这里的 $p_j$ 是「该节点被接受」这一个标量概率，和 31.6 节 $p_{j+i}(\hat t)$ 那种「目标分布在某个具体 token 上的取值」含义不同——两者只是字母撞了，不是同一个记号）。于是直接拿置信度连乘当路径价值 $V_i$,零成本给节点排序(arXiv:2406.16858 §4.1):
+有了这条动机，再看 EAGLE-2 的解法。一条草稿路径能整条被接受，当且仅当路上每一步都被接受。所以它的「全局接受率」= 路径上各步接受率的连乘。麻烦是，真实接受率要目标模型前向才知道。EAGLE-2 的观察是：草稿头**校准得好**——它自己的置信度 c_j 约等于真实接受率 p_j（这里的 $`p_j`$ 是「该节点被接受」这一个标量概率，和 31.6 节 $`p_{j+i}(\hat t)`$ 那种「目标分布在某个具体 token 上的取值」含义不同——两者只是字母撞了，不是同一个记号）。于是直接拿置信度连乘当路径价值 $`V_i`$,零成本给节点排序(arXiv:2406.16858 §4.1):
 
 $$
 V_i = \prod_{t_j \in \mathrm{Path}(\mathrm{root},\, t_i)} p_j \;\approx\; \prod_{t_j \in \mathrm{Path}(\mathrm{root},\, t_i)} c_j
 $$
 
-#### 机制
+这个 $`V_i`$ 的身份值得点破：它正是开篇账本里那个前缀积 $`\prod_{j\le i}\alpha_j`$ 的零成本估计——树上每个进入草稿的节点，被整条接受时恰好为 $`\mathbb{E}[\tau]`$ 贡献 1，贡献的概率就约等于 $`V_i`$ 。所以按 $`V`$ 取全树最高的 m 个节点，最大化的正是这本账的估计值。
 
 动态树分两阶段(arXiv:2406.16858 §4.1、§4.2):**扩展阶段**每层只展开 value 最高的 top-k 节点向下长；**重排阶段**对全树的 value 取 top-m,摊平成一维草稿，并按树结构改注意力掩码(每个 token 只能看到它的祖先，即树注意力)。
 
@@ -485,7 +372,7 @@ $$
 | d2_t1b | 2 | 1 | 0.354 | 0.075 | no |
 | d2_t0b | 2 | 0 | 0.342 | 0.073 | no |
 
-读表：根节点(已接受的起点)置信度固定 1.0、V=1.0。每个节点 $V=$ 从根到它路径上的置信度之积：d1 层 V=c(0.354、0.212),d2 层 V=父 V×c(如 d2_t1a=0.354×0.304=0.108)。重排取全树 top-m=4,选中 V 最高的 {根， d1_t3, d1_t5, d2_t1a}。
+读表：根节点(已接受的起点)置信度固定 1.0、V=1.0。每个节点 $`V=`$ 从根到它路径上的置信度之积：d1 层 V=c(0.354、0.212),d2 层 V=父 V×c(如 d2_t1a=0.354×0.304=0.108)。重排取全树 top-m=4,选中 V 最高的 {根， d1_t3, d1_t5, d2_t1a}。
 
 有个精妙的对照：**d2_t1b 的局部置信度 c=0.354 比 d2_t1a 的 0.304 更高，却落选**——因为它挂在价值更低的父节点 d1_t5 下，路径价值 V=0.075 反而更低。排序看的是全局 V,不是局部 c。
 
@@ -495,7 +382,7 @@ $$
 V_{\mathrm{child}} = V_{\mathrm{parent}} \cdot c_{\mathrm{child}} \le V_{\mathrm{parent}}
 $$
 
-因为置信度 c∈[0,1]，所以父节点价值恒不小于子节点价值——这是单调性本身。当两个节点 value 相等时，排序规则「同值优先浅层」优先保留更浅的那个；这条打破平局的规则保证了：对任意被选中的节点，其父节点的排序键 $(-V, \mathrm{depth})$ 一定不劣于它自己（父节点 V 更大，或者深度更浅，两者任一都让排序键更优）。父节点排序键不劣，就必然也落在 top-m 之内——也就是说，只要某个节点被选中，它的父节点也一定被选中，选中集合对「取父节点」这个操作封闭。子树里任何被选中的节点都能沿父指针一路走回根、且全程留在选中集合内，这正是「连通」的含义(arXiv:2406.16858 §4.2)。这正是「用 ∏ 置信度近似 ∏ 接受率」能成立的结构前提。
+因为置信度 c∈[0,1]，所以父节点价值恒不小于子节点价值——这是单调性本身。当两个节点 value 相等时，排序规则「同值优先浅层」优先保留更浅的那个；这条打破平局的规则保证了：对任意被选中的节点，其父节点的排序键 $`(-V, \mathrm{depth})`$ 一定不劣于它自己（父节点 V 更大，或者深度更浅，两者任一都让排序键更优）。父节点排序键不劣，就必然也落在 top-m 之内——也就是说，只要某个节点被选中，它的父节点也一定被选中，选中集合对「取父节点」这个操作封闭。子树里任何被选中的节点都能沿父指针一路走回根、且全程留在选中集合内，这正是「连通」的含义(arXiv:2406.16858 §4.2)。这正是「用 ∏ 置信度近似 ∏ 接受率」能成立的结构前提。
 
 ![EAGLE-2 动态树的 value 与重排，局部置信度高不等于被选中](../diagrams/fig36-5-value-rerank.png)
 
@@ -507,148 +394,34 @@ $$
 
 *4000 个样本按置信度分 5 桶。每桶均值几乎相等：0.101↔0.113、0.499↔0.518、0.897↔0.888。草稿头良好校准。*
 
-把 4000 个 (置信度， 是否接受) 样本按置信度分 5 桶，每桶里「平均置信度」和「实测接受率」几乎相等(0.101↔0.113、0.305↔0.312、0.499↔0.518、0.702↔0.713、0.897↔0.888)——草稿头的自信度确实约等于真实接受率(arXiv:2406.16858 §3.2,Fig.6)。这就是 $V_i=\prod c_j$ 能代替真实接受率之积来排序、无需目标前向的合法性依据。而草稿头之所以校准得好，回头看正是 31.5 节那个交叉熵分类损失盯着「吐字对不对」训出来的。
+把 4000 个 (置信度， 是否接受) 样本按置信度分 5 桶，每桶里「平均置信度」和「实测接受率」几乎相等(0.101↔0.113、0.305↔0.312、0.499↔0.518、0.702↔0.713、0.897↔0.888)——草稿头的自信度确实约等于真实接受率(arXiv:2406.16858 §3.2,Fig.6)。这就是 $`V_i=\prod c_j`$ 能代替真实接受率之积来排序、无需目标前向的合法性依据。而草稿头之所以校准得好，回头看正是 31.5 节那个交叉熵分类损失盯着「吐字对不对」训出来的。
 
 ---
 
 ## 31.8 落地：vLLM v1 的 EAGLE 是一条链
 
-讲完论文那棵漂亮的动态树，该收回到 vLLM 的真实代码了。这里有个必须说清的落差：**vLLM v1 默认的 EAGLE 路径，是链式，不是树**。上面 31.7 节的树验证、动态树、树注意力，都是论文原理；vLLM 当前落地是它们的 k=1 退化特例。
-
-### 链式草稿循环
-
-`propose()` 的骨架分两段。第一段：草稿模型对整段 prefix 前向一次，取每条请求最后一个位置的特征采出第 1 个草稿 token(`vllm/v1/spec_decode/llm_base_proposer.py:L461`):
-
-```python
-# vllm/v1/spec_decode/llm_base_proposer.py:L461
-    ret_hidden_states = self.model(**model_kwargs)
-    if not self.model_returns_tuple():
-        last_hidden_states = ret_hidden_states
-        hidden_states = last_hidden_states
-    else:
-        last_hidden_states, hidden_states = ret_hidden_states
-
-sample_hidden_states = last_hidden_states[token_indices_to_sample]
-
-# Early exit if there is only one draft token to be generated.
-if self.num_speculative_tokens == 1 or self.parallel_drafting:
-    draft_token_ids = self._greedy_sample(sample_hidden_states)
-    return draft_token_ids.view(-1, self.num_speculative_tokens)
-```
-
-`token_indices_to_sample` 挑出每条请求最后一个位置的特征，`_greedy_sample` 采出草稿 token。只要 1 个草稿 token 就在这里早退。要更多，就进第二段链式循环(`vllm/v1/spec_decode/llm_base_proposer.py:L525`):
-
-```python
-# vllm/v1/spec_decode/llm_base_proposer.py:L525
-for token_index in range(self.num_speculative_tokens - 1):
-    # Update the inputs.
-    # cast to int32 is crucial when eagle model is compiled.
-    # tensor.argmax() returns int64 by default.
-    input_ids = draft_token_ids_list[-1].int()
-    # … 省略：position / slot_mapping / attn_metadata 的逐步更新 …
-
-    # copy inputs to buffer for cudagraph
-    self.input_ids[:batch_size] = input_ids
-    self.hidden_states[:batch_size] = hidden_states
-    # … 省略：inputs_embeds 分支 …
-    model_kwargs = {
-        "input_ids": input_ids,
-        "positions": self._get_positions(input_batch_size),
-        "inputs_embeds": inputs_embeds,
-    }
-    if self.pass_hidden_states_to_model:
-        model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
-
-    with set_forward_context(...):
-        ret_hidden_states = self.model(**model_kwargs)
-        if not self.model_returns_tuple():
-            last_hidden_states = ret_hidden_states
-            hidden_states = ret_hidden_states
-        else:
-            last_hidden_states, hidden_states = ret_hidden_states
-
-    hidden_states = hidden_states[:batch_size]
-    draft_token_ids = self._greedy_sample(last_hidden_states[:batch_size])
-    draft_token_ids_list.append(draft_token_ids)
-
-# [batch_size, num_speculative_tokens]
-draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
-return draft_token_ids
-```
-
-看清链式的本质：循环 γ−1 次，每次把上一步采出的草稿 token(`draft_token_ids_list[-1]`)和上一步产出的特征(`hidden_states`)一起回喂(那句 `model_kwargs["hidden_states"] = ...` 就是 31.4 节 `pass_hidden_states_to_model=True` 打开的通道)。每步只保留 1 个 argmax token——**没有分支、没有兄弟候选、没有树注意力**。采 token 用的 `_greedy_sample` 干脆利落(`vllm/v1/spec_decode/llm_base_proposer.py:L386`):
-
-```python
-# vllm/v1/spec_decode/llm_base_proposer.py:L386
-def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    """Greedy-sample draft tokens from hidden states."""
-    if self.use_local_argmax_reduction:
-        return self.model.get_top_tokens(hidden_states)
-    return self.model.compute_logits(hidden_states).argmax(dim=-1)
-```
-
-草稿 token 一律 greedy argmax。为什么草稿阶段可以不管温度、top-p 这些采样参数？因为**草稿分布只影响接受率、不影响最终输出分布**——rejection sampling 的保分布定理(下一章 §31.5)保证了这一点。草稿猜得糙，顶多接受率低一点、慢一点，最终吐出来的文字分布分毫不差。
-
-树式投机解码在这条路径上还没落地。`dummy_run` 里至今留着一行 `# FIXME: when using tree-based specdec, adjust number of forward-passes`(`vllm/v1/spec_decode/llm_base_proposer.py:L1402`)——树是规划，链是现实。
+讲完论文那棵漂亮的动态树，落差必须说破：**vLLM v1 默认的 EAGLE 路径是链式，是 §31.7 全部树机制的 k=1 退化特例**。草稿循环（下一章的 `propose()` ）第一遍前向采出第 1 个草稿 token，随后跑 γ−1 步，每步把上一步采出的 token 和上一步产出的特征回喂、只保留 1 个 argmax token——没有兄弟候选、没有树注意力、没有多轮投机采样，正是 §31.2 那条链的字面执行。§31.7 提到的那行 FIXME 就是这条落差的路标：树是规划，链是现实。
 
 ![vLLM v1 EAGLE 的链式草稿泳道图，逐步回喂产出 token](../diagrams/fig36-7-vllm-chain.png)
 
 *首遍输入 [3,2,4](左移+塞 next_token=4)。随后四步回喂，产出 3→1→3→0。每步仅 1 个 argmax,无树。*
 
-这张泳道图正好复现了 31.2 节那条 γ=4 的链：首遍对左移后的序列前向、采出草稿 token 3(c=0.354),随后逐步回喂产 1(0.304)→3(0.592)→0(0.259)——和那张逐步表一模一样，只是换成了「谁调用谁」的视角。
+这张泳道图正好复现了 §31.2 那条 γ=4 的链：首遍对左移后的序列前向、采出草稿 token 3(c=0.354),随后逐步回喂产 1(0.304)→3(0.592)→0(0.259)——和那张逐步表一模一样，只是换成了「谁调用谁」的视角。
 
-### 运行器调用面
+为什么草稿敢一律 greedy argmax，连温度、top-p 这些采样参数都不管？红线兜底：**草稿分布只影响接受率、不影响最终输出分布**。草稿猜得糙，顶多 $`\alpha`$ 低一点、慢一点，最终吐出来的文字分布分毫不差。落到账本上，链式形态就是 $`\mathbb{E}[\tau]=\sum\prod\alpha`$ 的求和只剩一条路径；EAGLE-2 的树是把求和范围扩到整棵连通子树——差距就是 §31.7 那 +0.6~0.8 的 τ。
 
-最后一块拼图：草稿器的入参从哪来？运行器(model runner,驱动每步前向的宿主)在 `propose()` 之前先备好料(`vllm/v1/worker/gpu_model_runner.py:L4825`):
-
-```python
-# vllm/v1/worker/gpu_model_runner.py:L4825
-draft_token_ids = self.drafter.propose(
-    target_token_ids=target_token_ids,
-    target_positions=target_positions,
-    target_hidden_states=target_hidden_states,
-    next_token_ids=next_token_ids,
-    token_indices_to_sample=token_indices_to_sample,
-    sampling_metadata=sampling_metadata,
-    common_attn_metadata=common_attn_metadata,
-    mm_embed_inputs=mm_embed_inputs,
-    num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-    slot_mappings=slot_mappings,
-)
-```
-
-两个入参值得点名。`target_hidden_states`——31.2 节那份「目标特征」——来源二选一(`vllm/v1/worker/gpu_model_runner.py:L4809`):
-
-```python
-# vllm/v1/worker/gpu_model_runner.py:L4809
-if self.use_aux_hidden_state_outputs:
-    assert aux_hidden_states is not None
-    target_hidden_states = torch.cat(
-        [h[:total_num_tokens] for h in aux_hidden_states], dim=-1
-    )
-else:
-    target_hidden_states = hidden_states[:total_num_tokens]
-```
-
-`use_aux_hidden_state_outputs` 为真时，把目标模型多个层的辅助特征沿最后一维拼起来——这是 EAGLE-3 路径(用多层特征而非单层);否则直接取目标模型最后一层的 hidden,这是我们全章讲的 EAGLE-1 路径。
-
-> 直觉：EAGLE-3 是 EAGLE 之后的后续工作——让草稿头不止吃目标模型最后一层的特征，还把中间若干层的特征拼接起来一并喂进去，抓取更丰富的语义层次。具体的训练方式与结构留给它自己的论文，本章不展开；这里引用号尚未核实，暂不点名具体 arXiv 编号。
-
-`next_token_ids` 则由 `prepare_next_token_ids_padded` 从上一轮已接受的 `sampled_token_ids` 里取每条请求最后一个 token,正是 31.3 节塞进末位的那个真起点。
-
-草稿器产出 `[batch, num_speculative_tokens]` 的草稿后，就交给下一章那个 rejection sampler 做接受/拒绝 + 残差采样。一个完整的投机步，到此闭环。
+执行面的其余一切——变长草稿怎么摊平进一批、目标特征与起点 token 怎么备料、验证时怎么逐位接受、被拒后怎么从残差重采——是[下一章](../../ch32-spec-decode/narrative/chapter.md)的主线，那里会把草稿器从入参到返回走通。在那套执行面里，EAGLE 只是一个实现了统一契约的草稿器：本章的全部数学，浓缩成它每步回喂的那一对 (token, 特征)。
 
 ---
 
 ## 31.9 这章解决了什么
 
-EAGLE 用两个观察改写了投机解码的草稿阶段：
+一条红线，一本账。红线是保分布定理：输出分布被锁死，草稿分布 $`\hat p`$ 只剩性能自由度。账是 $`\mathbb{E}[\tau]=\sum_i\prod_{j\le i}\alpha_j`$ ：一次目标前向能白拿几个 token，全由接受率的前缀积决定。EAGLE 的全部设计是账上的三次抬升：
 
-- **特征级自回归**——在连续、规整的第二顶层特征上外推，再借共享 LM Head 翻成 token,比在离散跳变的 token 上直接接龙更准(约 0.8 vs 0.6,1.5x→1.9x)。落到 `llama_eagle.py` 的 `forward`,就是「拼接特征 + FC 降维 + 单层 decoder」。
-- **超前一步 token**——采样随机性给特征注入的不确定性，靠把目标实际抽到的 token 剧透给草稿头来消解(1.9x→2.8x)。落到 `set_inputs_first_pass` 的「左移 + 塞末位」。
+- **特征级自回归**（§31.2）——草稿头在连续、规整的特征上外推一步，共享 LM Head 翻译回词表，草稿准确率约 0.32→0.63，加速 1.5x→1.9x；原料（目标特征）是验证前向白送的，抬 $`\alpha`$ 几乎不花钱。
+- **超前一步 token**（§31.3）——采样注入的随机分岔被剧透的 token 显式吸收，草稿头成为确定函数，准确率约 0.63→0.78、加速 1.9x→2.8x。
+- **从链到树**（§31.7）——同一次目标前向核一棵连通子树，把账本的求和范围从一条路径扩到 top-m 个节点；EAGLE-2 用校准良好的置信度之积 $`V_i=\prod c_j`$ 零成本估计每个节点的前缀积，让树往账本增量最大的枝上长（τ +0.6~0.8）。
 
-草稿头轻到 70B 目标只配 0.99B、且 Embedding/LM Head 全借目标参数，训练成本极低；它的置信度校准得好，让 EAGLE-2 能用 $V_i=\prod c_j$ 零成本地长动态草稿树、一次目标前向核多条分支。
+训练目标与验收准则在账上合流：分类损失的 KL 项经 $`\alpha\ge 1-\sqrt{\mathrm{KL}/2}`$ 直接压住每个位置接受率的下界（§31.6）；残差分布的归一化常数与 $`1-\alpha`$ 是同一个数——重叠即接受，溢出即拒绝。轻，则来自「只训两层」：$`W_{\mathrm{fc}}`$ 加一层 decoder，70B 目标只配 0.99B（§31.4）。
 
-但读代码要认清落差：**vLLM v1 默认的 EAGLE 是一条链，不是树**。论文那棵动态树、树注意力、多轮投机采样，都是原理；vLLM 当前落地是它们的 k=1 退化，`dummy_run` 里那行 FIXME 就是路标。整套草稿器又薄又通用——`EagleProposer` 全部的特有逻辑，不过是给基类传一个 `pass_hidden_states_to_model=True`。
-
-而无论草稿多准多糙，最终输出分布分毫不差——这份底气来自[下一章](../../ch32-spec-decode/narrative/chapter.md) §31.5 的保分布定理。EAGLE 只负责让草稿更贴合、让加速更多，从不动那条分布保证的红线。下一章就接着看 vLLM 的投机执行面：怎么把这些变长草稿摊平进一批、喂目标模型一次前向、再逐位接受或拒绝。
+vLLM v1 的落地是这一切的最简退化：一条 argmax 链，k=1、无树注意力，FIXME 是从链到树尚未跨过去的路标（§31.8）。这条链怎么摊平进一批、怎么喂目标模型、逐位接受怎么执行——交给[下一章](../../ch32-spec-decode/narrative/chapter.md)的执行面：那里 EAGLE 只是统一契约下的一个草稿器，而无论它猜得多准多糙，红线保证输出分布分毫不差。

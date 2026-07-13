@@ -35,7 +35,7 @@ L = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
      f'<text x="{PAD}" y="34" font-family="sans-serif" font-size="17" font-weight="bold" '
      f'fill="#0f172a">{esc("联合压缩:K、V 共享同一段潜向量 c_kv,只有它写入缓存")}</text>',
      f'<text x="{PAD}" y="54" font-family="sans-serif" font-size="12" '
-     f'fill="#64748b">{esc("不囤整箱零件,只囤一张能现场复原全部零件的图纸")}</text>']
+     f'fill="#64748b">{esc("推理期只缓存 c_kv;key/value 用时现场上投影,从不落盘")}</text>']
 
 L.append(box(*h_box, "#e2e8f0", "#64748b"))
 L.append(ctext(h_box[0]+h_box[2]/2, h_box[1]+h_box[3]/2-6, "token h", 13, "#0f172a", "bold"))

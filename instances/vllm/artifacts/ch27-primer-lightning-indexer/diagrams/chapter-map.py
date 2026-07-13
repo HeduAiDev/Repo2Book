@@ -1,27 +1,32 @@
 #!/usr/bin/env python3
-"""第 27 章「本章地图」——Lightning Indexer 推理调用链 + 支撑机制(源码剖面图)。
+"""第 27 章「本章地图」——Lightning Indexer 论文主线五段论(概念剖面图)。
 
-本章是自然标题章(节标题为「二、三、四、五」中文数字,无 `## N.M` 编号)——
-按契约禁用 §N.M 徽标,站牌一律用正文里实际出现的标题词本身。
+writer 把本章重构成纯「原理篇·论文精读」:正文不再内嵌/引用任何 vLLM 源码符号
+(self.indexer/wq_b/fp8_fp4_mqa_logits/...全部删除),只讲论文的数学与证明。上一版
+chapter-map 画的是"推理调用链"(源码剖面图),现在与正文脱节——本版改画论文主线
+的五段论证链,站牌全部换成正文实际标题词/小节标题/严谨callout短语。
 
-结构:上泳道是真实的推理调用链(自左向右——MLA 前向调用 indexer → 独立小头出
-q/k/w → mqa_logits 打分 Eq.(1) → top-k 选择 Eq.(2)/(17) → 稀疏 MLA 只读被选中
-的 latent KV);下泳道是撑住这条链的三块支撑机制(可信训练依据 / IndexCache 独
-立缓存及其量化写入与 MXFP4 变体 / 复杂度诚实账),各自垂直挂在它所支撑的上泳道
-节点正下方。
+本章是自然标题章(节标题为中文数字「一、二、三、四」,无 `## N.M` 编号)——按契约
+禁用 §N.M 徽标,站牌一律用正文里实际出现的标题词/callout 短语本身。
 
-■ 不可变(全书统一视觉语言,来自 skill 模板,换章节时不要动):badge()胶囊样式/
-  入口绿#22c55e-出口橙#f97316-主线蓝#3b82f6/图例规则/cjk_text_width()。
-■ 本章新增(相对模板的必要扩展,非任意发挥):EDGES 里源列==目标列的一对,判定为
-  跨泳道"支撑"边,画法从"右中→左中"横向连接改为"下中→上中"纵向连接——原模板
-  只处理同泳道内的左右调用边,本章多了"上泳道节点在下方挂一块支撑证据"的结构,
-  照搬横向连边会让箭头从右边一路斜插回左边、观感别扭,故加一个按列是否相同分流
-  的小分支,颜色/箭头样式仍是同一套主线蓝,不引入新语义色。
+结构:上泳道是主线论证链(自左向右——打分函数 Eq.(1) → top-k 闸门 Eq.(2) → 复杂度
+诚实账 O(L²)→O(Lk) → KL 对齐 Eq.(3)(4) → 独立缓存与量化);下泳道是撑住每一站的
+严谨性证明/不变量(各自垂直挂在它所支撑的上泳道节点正下方,对应正文里的"不变量"
+小标题或"严谨(...)"callout)。
 
-■ 六项自查记录(渲染→Read PNG 亲眼看后如实记录):
+■ 不可变(全书统一视觉语言,来自 skill 模板,换章节时不要动):入口绿#22c55e-出口
+  橙#f97316-主线蓝#3b82f6/图例规则/cjk_text_width()/节点圆角框样式。
+■ 本章新增(相对模板的必要扩展,非任意发挥):
+  1) 同列=纵向支撑边、异列=横向主线边的分流(继承自上一版,模板原生只处理同泳道
+     左右调用边)。
+  2) badge() 胶囊宽度从模板固定的 46px(为 §13.2 这类短数字设计)改成按文字实测
+     宽度(cjk_text_width + 左右各 8px 内边距)动态撑开,下限仍是 46px——本章站牌
+     是"独立缓存与量化""不变量:选择正确性"这类 6~9 字的自然语言短语,固定 46px
+     会被文字撑破胶囊边框(压框),这是自然标题章必然遇到的问题,不是任意发挥。
+
+■ 六项自查记录(渲染→Read PNG 亲眼看后如实记录,详见 figure-manifest.json):
     claim_readable_10s=True  numbers_match_spec=True  no_overlap=True
     arrows_attached=True     cjk_rendered=True         reading_order_clear=True
-  (细节见 figure-manifest.json 该条 selfcheck 与 blind_review)
 
 用法:python3 chapter-map.py → 同目录 chapter-map.svg
 """
@@ -40,35 +45,34 @@ def cjk_text_width(s, size):
 
 
 # ---------------- DATA(可变:本章数据) ----------------
-LANES = ["推理调用链(entry → 独立小头 → 打分 → top-k → exit)", "支撑机制(可信依据 / IndexCache 与量化 / 复杂度账)"]
+LANES = ["主线论证(打分 → 选块 → 复杂度账 → 可信 → 续命)", "严谨支撑(不变量 / 证明 callout)"]
 
-# (节点id, 泳道下标, 列, 泳道内行号, 真实符号名, 一行短语, 站牌——自然标题词,禁用 §N.M)
+# (节点id, 泳道下标, 列, 泳道内行号, 数学记号, 两行短语(用|分行), 站牌——自然标题词/callout短语,禁用 §N.M)
 NODES = [
-    ("entry",       0, 0, 0, "self.indexer(...)",        "MLA 前向触发打分(纯副作用调用)", "接线"),
-    ("indep_head",  0, 1, 0, "wq_b · wk_weights_proj",   "index_* 专属头维,与主注意力解耦", "独立小头"),
-    ("score",       0, 2, 0, "fp8_fp4_mqa_logits",       "ReLU 截负+头权重加权求和",        "打分函数"),
-    ("topk",        0, 3, 0, "top_k_per_row_prefill",    "选 k 个索引,写入共享 buffer",      "top-k 选择"),
-    ("exit",        0, 4, 0, "topk_indices_buffer",      "稀疏 MLA 只算被选中的 latent KV", "接线"),
+    ("score",  0, 0, 0, "Eq.(1)",            "三刀砍出打分算子|ReLU 截负,砍 value/输出",  "打分函数"),
+    ("topk",   0, 1, 0, "Eq.(2)",            "分数不出闸,只出名单|空槽填 -1",             "top-k 闸门"),
+    ("cplx",   0, 2, 0, "O(L^2) -> O(Lk)",   "indexer 打分仍 O(L^2)|主注意力降到 O(Lk)",  "复杂度诚实账"),
+    ("kl",     0, 3, 0, "Eq.(3)(4)",         "拿主注意力分布|当 indexer 的标准答案",      "KL 对齐"),
+    ("cache",  0, 4, 0, "IndexCache/MXFP4",  "K^IComp 与 C^Comp|并行产出,各写各缓存",     "独立缓存与量化"),
 
-    ("kl",          1, 1, 0, "detach + KL 对齐",          "单独训练,逼近主注意力真实分布",  "两阶段 KL 对齐"),
-    ("cache",       1, 2, 0, "DeepseekV32IndexerCache",  "132B/条,与主 KV cache 分开分配", "IndexCache"),
-    ("quant",       1, 2, 1, "quant_block_size",         "k 量化与缓存插入融合为一步",      "量化写入"),
-    ("mxfp4",       1, 2, 2, "MXFP4_BLOCK_SIZE",         "2 值/字节打包,top-k 2× 提速",     "量化变体"),
-    ("complexity",  1, 3, 0, "O(L²) → O(Lk)",  "indexer 打分仍 O(L²),常数远小", "复杂度诚实账"),
+    ("relu_b", 1, 0, 0, "max(x,0) >= 0",     "总分有下界 0|负相关只截零,不倒扣",          "严谨:单调性"),
+    ("sel_c",  1, 1, 0, "argsort",           "分数全序|并列时索引小者优先",               "严谨:选择正确性"),
+    ("gain_c", 1, 2, 0, "L/(2k)",            "稀疏<=稠密恒成立|收益随 L 线性放大",         "不变量:收益守恒"),
+    ("kl_leg", 1, 3, 0, "KL 散度",           "两侧非负和为 1|先稠密热身,后稀疏收窄",       "严谨:KL 为何用得起来"),
+    ("indep",  1, 4, 0, "K^IComp/C^Comp",    "两块缓存各自分配|互不引用",                 "独立性:物理不是逻辑"),
 ]
-EDGES = [  # (src_id, dst_id) —— 同列 = 纵向支撑边,异列 = 横向调用边(见文件头说明)
-    ("entry", "indep_head"), ("indep_head", "score"), ("score", "topk"), ("topk", "exit"),
-    ("indep_head", "kl"),
-    ("score", "cache"), ("cache", "quant"), ("quant", "mxfp4"),
-    ("topk", "complexity"),
+EDGES = [  # (src_id, dst_id) —— 同列 = 纵向支撑边,异列 = 横向主线边(见文件头说明)
+    ("score", "topk"), ("topk", "cplx"), ("cplx", "kl"), ("kl", "cache"),
+    ("score", "relu_b"), ("topk", "sel_c"), ("cplx", "gain_c"), ("kl", "kl_leg"), ("cache", "indep"),
 ]
 # (路线名, [(列, 站牌), ...] 按阅读顺序, 是否高亮:True=实线蓝/False=虚线灰)
 ROUTES = [
-    ("数学优先(只读二·三两节)", [(1, "独立小头"), (2, "打分函数"), (3, "复杂度诚实账")], True),
-    ("直接跳落地(五节)",       [(0, "接线"), (2, "IndexCache"), (4, "接线")], False),
+    ("打分+复杂度账(一/二节)", [(0, "打分函数"), (1, "top-k 闸门"), (2, "复杂度诚实账")], True),
+    ("只关心可信(三节)",       [(3, "KL 对齐")], False),
+    ("只关心续命(四节)",       [(4, "独立缓存与量化")], False),
 ]
-LEGEND = [("#22c55e", "入口:MLA 前向调用进入"), ("#3b82f6", "调用边 / 支撑关系"), ("#f97316", "出口:交回稀疏 MLA 数值计算")]
-TITLE = "第 27 章 · Lightning Indexer 推理调用链 + 支撑机制(源码剖面图)"
+LEGEND = [("#22c55e", "入口:论文主线命题"), ("#3b82f6", "主线论证 / 严谨支撑"), ("#f97316", "出口:落地到模型架构章")]
+TITLE = "第 27 章 · Lightning Indexer 论文主线:打分 → 选块 → 复杂度账 → 可信 → 续命"
 
 # ---------------- 不可变:配色 ----------------
 C_ENTRY, C_EXIT, C_MAIN = "#22c55e", "#f97316", "#3b82f6"
@@ -79,14 +83,15 @@ C_LANE_BORDER, C_LANE_LABEL = "#e2e8f0", "#334155"
 C_ROUTE_DIM = "#94a3b8"
 
 # ---------------- 几何常量(全计算,零魔数) ----------------
-NODE_W, NODE_H = 190, 58
-COL_GAP, ROW_GAP = 42, 20
-EDGE_MARGIN, STUB_W, STUB_H = 16, 72, 26
+NODE_W, NODE_H = 178, 84
+COL_GAP, ROW_GAP = 22, 20
+EDGE_MARGIN, STUB_W, STUB_H = 14, 68, 26
 PAD_L = PAD_R = EDGE_MARGIN + STUB_W + 32  # 左右各留:接口桩 + 一段箭头
 LANE_LABEL_H, BAND_PAD = 24, 12
 TOP_PAD, TITLE_H, LEGEND_H, BOTTOM_PAD = 14, 34, 26, 16
 ROUTE_HEAD_H, ROUTE_ROW_H = 22, 44
-BADGE_W, BADGE_H = 46, 20
+BADGE_H = 20
+BADGE_FONT_SIZE = 10
 
 n_cols = max(n[2] for n in NODES) + 1
 COLX = [PAD_L + c * (NODE_W + COL_GAP) for c in range(n_cols)]
@@ -115,14 +120,27 @@ w = PAD_L + n_cols * NODE_W + (n_cols - 1) * COL_GAP + PAD_R
 h = routes_top + ROUTE_HEAD_H + len(ROUTES) * ROUTE_ROW_H + BOTTOM_PAD
 
 
+def badge_width(text):
+    """站牌胶囊按文字实测宽度撑开(下限 46px,与模板短数字 badge 视觉一致)——见
+    badge() 文档。"""
+    return max(46.0, cjk_text_width(text, BADGE_FONT_SIZE) + 16)
+
+
 def badge(cx, cy, text):
-    """§ 徽标胶囊(本章为自然标题,文字是标题词而非 §N.M),居中挂在 (cx,cy)。"""
-    bx, by = cx - BADGE_W / 2, cy - BADGE_H / 2
+    """站牌胶囊(本章为自然标题,文字是标题词/callout 短语而非 §N.M),居中挂在 (cx,cy)。
+
+    宽度按文字实测宽度动态撑开(下限 46px,与模板短数字 badge 视觉一致)——模板
+    固定 46px 是为 "§13.2" 这类 5 字符数字设计,本章站牌是"独立缓存与量化"这类
+    6~9 字自然语言短语,固定宽度会压框,故加此扩展(其余样式——胶囊圆角/配色/
+    字号——原样继承模板,不变)。
+    """
+    bw = badge_width(text)
+    bx, by = cx - bw / 2, cy - BADGE_H / 2
     return [
-        f'<rect x="{bx:.1f}" y="{by:.1f}" width="{BADGE_W}" height="{BADGE_H}" rx="{BADGE_H / 2}" '
+        f'<rect x="{bx:.1f}" y="{by:.1f}" width="{bw:.1f}" height="{BADGE_H}" rx="{BADGE_H / 2}" '
         f'fill="{C_BADGE_FILL}" stroke="{C_BADGE_STROKE}" stroke-width="1.2"/>',
         f'<text x="{cx:.1f}" y="{cy + 4:.1f}" text-anchor="middle" font-family="sans-serif" '
-        f'font-size="10" font-weight="bold" fill="{C_BADGE_TEXT}">{esc(text)}</text>',
+        f'font-size="{BADGE_FONT_SIZE}" font-weight="bold" fill="{C_BADGE_TEXT}">{esc(text)}</text>',
     ]
 
 
@@ -158,25 +176,26 @@ for i, name in enumerate(LANES):
 L.append(f'<line x1="0" y1="{lanes_bottom:.1f}" x2="{w}" y2="{lanes_bottom:.1f}" '
          f'stroke="{C_LANE_BORDER}" stroke-width="1"/>')
 
-# 入口/出口接口桩(给入口/出口箭头一个可附着的框,兼表达"调用方在画布外")
-ex, ey = NODE_XY["entry"]; ey += NODE_H / 2
-xx, xy = NODE_XY["exit"]; xy += NODE_H / 2
+# 入口/出口接口桩(给入口/出口箭头一个可附着的框,兼表达"论证从论文命题出发/
+# 最终落地到落地章")
+ex, ey = NODE_XY["score"]; ey += NODE_H / 2
+xx, xy = NODE_XY["cache"]; xy += NODE_H / 2
 L.append(f'<rect x="{EDGE_MARGIN}" y="{ey - STUB_H / 2:.1f}" width="{STUB_W}" height="{STUB_H}" '
          f'rx="{STUB_H / 2}" fill="#dcfce7" stroke="{C_ENTRY}" stroke-width="1.3"/>')
 L.append(f'<text x="{EDGE_MARGIN + STUB_W / 2}" y="{ey + 4:.1f}" text-anchor="middle" '
-         f'font-family="sans-serif" font-size="11" font-weight="bold" fill="#166534">{esc("调用方")}</text>')
+         f'font-family="sans-serif" font-size="11" font-weight="bold" fill="#166534">{esc("主线命题")}</text>')
 L.append(f'<line x1="{EDGE_MARGIN + STUB_W}" y1="{ey:.1f}" x2="{ex:.1f}" y2="{ey:.1f}" '
          f'stroke="{C_ENTRY}" stroke-width="2" marker-end="url(#mEntry)"/>')
 sx = w - EDGE_MARGIN - STUB_W
 L.append(f'<rect x="{sx:.1f}" y="{xy - STUB_H / 2:.1f}" width="{STUB_W}" height="{STUB_H}" '
          f'rx="{STUB_H / 2}" fill="#ffedd5" stroke="{C_EXIT}" stroke-width="1.3"/>')
 L.append(f'<text x="{sx + STUB_W / 2:.1f}" y="{xy + 4:.1f}" text-anchor="middle" '
-         f'font-family="sans-serif" font-size="11" font-weight="bold" fill="#9a3412">{esc("返回上层")}</text>')
+         f'font-family="sans-serif" font-size="11" font-weight="bold" fill="#9a3412">{esc("模型架构章")}</text>')
 L.append(f'<line x1="{xx + NODE_W:.1f}" y1="{xy:.1f}" x2="{sx:.1f}" y2="{xy:.1f}" '
          f'stroke="{C_EXIT}" stroke-width="2" marker-end="url(#mExit)"/>')
 
-# 调用边/支撑边(统一主线蓝):列相同 → 本章新增的纵向支撑边(上泳道节点正下方
-# 挂一块支撑证据);列不同 → 模板原有的横向调用边(右中→左中)。
+# 主线边/支撑边(统一主线蓝):列相同 → 纵向支撑边(上泳道节点正下方挂一块严谨
+# 支撑);列不同 → 横向主线边(右中→左中)。
 for src, dst in EDGES:
     x1, y1 = NODE_XY[src]; x2, y2 = NODE_XY[dst]
     if NODE_COL[src] == NODE_COL[dst]:
@@ -188,17 +207,22 @@ for src, dst in EDGES:
     L.append(f'<line x1="{p1[0]:.1f}" y1="{p1[1]:.1f}" x2="{p2[0]:.1f}" y2="{p2[1]:.1f}" '
               f'stroke="{C_MAIN}" stroke-width="2" marker-end="url(#mMain)"/>')
 
-# 节点(圆角框 + 真实符号名 + 一行短语 + 右上角站牌)
+# 节点(圆角框 + 数学记号 + 两行短语 + 右上角站牌)。短语用 "|" 分两行,避免长中文
+# 解释在单行里撑破节点宽度、压到相邻节点(自然标题章的站牌/短语天然比 §N.M 数字长)。
 for nid, lane, col, row, symbol, phrase, sec in NODES:
     x, y = NODE_XY[nid]
     L.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{NODE_W}" height="{NODE_H}" rx="12" '
               f'fill="{C_NODE_FILL}" stroke="{C_NODE_STROKE}" stroke-width="1.5"/>')
-    L.append(f'<text x="{x + NODE_W / 2:.1f}" y="{y + NODE_H * 0.4:.1f}" text-anchor="middle" '
+    L.append(f'<text x="{x + NODE_W / 2:.1f}" y="{y + NODE_H * 0.28:.1f}" text-anchor="middle" '
               f'font-family="monospace" font-size="12" font-weight="bold" '
               f'fill="{C_NODE_TITLE}">{esc(symbol)}</text>')
-    L.append(f'<text x="{x + NODE_W / 2:.1f}" y="{y + NODE_H * 0.72:.1f}" text-anchor="middle" '
-              f'font-family="sans-serif" font-size="10" fill="{C_NODE_SUB}">{esc(phrase)}</text>')
-    L += badge(x + NODE_W - BADGE_W / 2 + 8, y, sec)
+    phrase_lines = phrase.split("|")
+    for pi, pl in enumerate(phrase_lines):
+        py = y + NODE_H * (0.55 + pi * 0.23)
+        L.append(f'<text x="{x + NODE_W / 2:.1f}" y="{py:.1f}" text-anchor="middle" '
+                  f'font-family="sans-serif" font-size="10" fill="{C_NODE_SUB}">{esc(pl)}</text>')
+    bw = badge_width(sec)
+    L += badge(x + NODE_W + 8 - bw / 2, y, sec)  # 右边缘固定在 x+NODE_W+8,向左铺开 bw
 
 # 底部阅读路线:复用列坐标 COLX,站牌与图上节点对齐成竖向落点
 L.append(f'<text x="16" y="{routes_top + 15:.1f}" font-family="sans-serif" font-size="12.5" '

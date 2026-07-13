@@ -63,8 +63,8 @@ LANES = ["装配期(构造一次,已落地)", "运行期已落地(骨干前向 +
 
 # (节点id, 泳道下标, 列, 泳道内行号, 真实符号名, 一行短语, 站牌(自然标题词/正文原话短语,禁用 §N.M), landed:True=已落地实线/False=仅论文侧虚线)
 NODES = [
-    ("entry",          0, 0, 0, "load_dspark_model",
-     "加载草稿模型,别名共享 embed/lm_head", "落地对位", True),
+    ("entry",          0, 0, 0, "embed_tokens/lm_head",
+     "草稿加载时别名共享,省显存保证词表一致", "落地对位", True),
     ("cfg",            0, 0, 1, 'method="dspark"',
      "parallel_drafting=True,强制并行骨干", "落地对位", True),
     ("backbone",       0, 1, 0, "Qwen3DSparkModel",
@@ -312,3 +312,18 @@ print(f"wrote {out}: {w:.0f}x{h:.0f}")
 #     _sample_sequential/confidence_head/Algorithm 1/self.draft_tokens)
 #     逐一核对均为 chapter.md 正文原样子串,lint_chapter_map.py 的杜撰符号
 #     检查同步确认无报告。
+#
+#   第 3 轮(writer 重构骨架后复绘,2026-07-14):writer 定稿把第六节"装配"段
+#     改写为泛化叙述,不再逐字点名 load_dspark_model 这个函数名(dossier.json
+#     里仍有,但本章 kind=primer——lint_chapter_map 的杜撰符号核对口径是
+#     book/papers/ch37-primer-dspark/*.md + chapter.md,不含 dossier);
+#     lint_chapter_map.py --require 报 fabricated_symbol:load_dspark_model。
+#     entry 节点符号改为"embed_tokens/lm_head"(对应正文§六"共享 embed/lm_head
+#     （别名，省显存…）"及 skip_substrs 代码块里的 embed_tokens/lm_head 两个
+#     字面子串,均在 chapter.md 正文原样出现),phrase 同步改"草稿加载时别名
+#     共享,省显存保证词表一致"。重渲后 Read PNG 复核:六项全 True——entry
+#     节点新文字"embed_tokens/lm_head"未与右上角"落地对位"站牌重叠、与
+#     backbone/spec_init 的两条交叉边仍清晰贴住目标框(裁剪核对无穿框);
+#     其余 10 个节点/站牌未受影响,布局与第 2 轮一致。lint_chapter_map.py
+#     --require 与 lint_diagram_geometry.py 均 exit 0。blind_review 因内容
+#     变更已重置为 PENDING,待下一轮盲审回填。

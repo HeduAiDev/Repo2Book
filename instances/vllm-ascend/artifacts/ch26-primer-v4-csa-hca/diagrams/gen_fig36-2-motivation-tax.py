@@ -8,7 +8,7 @@ from pathlib import Path
 def esc(s): return xs.escape(s)
 
 TITLE = "1M 上下文的账本:dense 随 L 线性膨胀,CSA 核注意力被 top-k 钉成常数"
-SUBTITLE = "head_dim=1, m=4, k=2, n_win=1(缩小参数便于心算,真实值见第 §落地);dense 单 token FLOPs 代理 = L"
+SUBTITLE = "head_dim=1, m=4, k=2, n_win=1(缩小参数便于心算,真实量级见数值推演节);dense 单 token FLOPs 代理 = L"
 
 COLS = ["L=16", "L=64", "L=256", "L=1024"]
 ROW_LABELS = ["dense KV 存量", "dense 单 token FLOPs", "CSA KV 存量 (L/4)", "CSA 核注意力 FLOPs", "CSA 总 FLOPs"]

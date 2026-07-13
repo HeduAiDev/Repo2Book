@@ -7,141 +7,97 @@
 > 这一章：先把均衡算法本体推清楚——谁该复制、落到哪张卡。
 > 下一站：[第 10 章](../../ch10-eplb-expert-load-balancing/narrative/chapter.md)看昇腾把它落成子进程规划与 D2D 热迁移。
 
-上一章在昇腾的并行组里建好了 `_DYNAMIC_EPLB`（EPLB 专属的专家通信域）——一条给 EPLB（expert parallelism load balancer，专家并行负载均衡器）预留的卡间高速路。可这条路只管「把专家权重从 A 卡挪到 B 卡」，用的是 NPU 间的 D2D（device-to-device，设备间拷贝）直拷；它不管「该往哪挪」。真正拍板的，是一个纯算法函数 `rebalance_experts`：给它一张当前放置表和一张负载表，它吐回一张新放置表——**哪个专家该复制、该落到哪张卡，全由它决定**。这个函数，正是下一章那套搬运机制里被当成黑盒的核心。
+上一章在昇腾的并行组里建好了 `_DYNAMIC_EPLB`（EPLB（expert parallelism load balancer，专家并行负载均衡器）专属的专家通信域）——一条给专家权重搬家预留的卡间高速路，走 NPU 间的 D2D（device-to-device，设备间拷贝）直拷。可这条路只管「搬」，不管「该往哪搬」。拍板的是一个纯算法函数 `rebalance_experts`：给它一张当前放置表和一张负载表，它吐回一张新放置表——哪个专家该复制、该落到哪张卡，全由它决定。[第 10 章](../../ch10-eplb-expert-load-balancing/narrative/chapter.md)的整套迁移机器把这个函数当黑盒；本章把它撬开。
 
-这一章就把这个黑盒撬开。我们要回答的是一个纯算法问题：**给定每个专家有多热、手上有几张卡，怎样重新摆放专家，才能让最忙的那张卡尽可能不那么忙？** 这个问题的数学骨架来自 DeepSeek-V3 技术报告（arXiv:2412.19437）§3.4 的「冗余专家」部署策略，以及配套开源的 deepseek-ai/EPLB 参考实现。落地代码是昇腾自带的 `DefaultEplb` 规划器——`PolicyFactory` 里 `policy_type=1` 的默认策略，它把论文里的思路实打实写成了 NumPy。
-
-我们按四步走：先看**动机**（专家热度为什么会不均、不均了会怎样），再推**均衡目标**（要最小化什么、为什么必须复制），然后用一个 2 卡 8 专家的小例子把**冗余复制 + 贪心装箱**逐步跑一遍，最后回到 `vllm_ascend/eplb/core/policy/policy_default_eplb.py` 的真实代码，逐段对上号。
+撬开之后没有魔法，只有一条定理和两段贪心。定理是一块地板：所有卡的负载总和恒等于全部专家的总热度，于是「最热卡的负载」无论怎么摆都低不过均值—— **均值是任何放置都踩不穿的地板**（本章玩具例里是 87.5）。麻烦在于热度长在专家身上、专家整块不可拆：只靠搬，本例的极限是 90，离地板永远差一道缝。EPLB 的答案反直觉—— **搬不平的，复制能摊平**：把热度 60 的专家复制一份，它就变成两块 30，「不可拆」被买断，地板才够得着。于是全章就两段贪心：**削峰**（冗余复制，每轮锯当前最长的木板）与 **铺平**（贪心装箱，把碎块铺到均值），外加一道 0.95 闸门判定「压下来的幅度值不值得真搬一次」。这套数学出自 DeepSeek-V3 技术报告（arXiv:2412.19437）§3.4 的「冗余专家」部署策略与配套开源的 deepseek-ai/EPLB 参考实现；昇腾把它落成 `DefaultEplb` 规划器——一份在 vLLM 基座之外自带（out-of-tree）的纯 NumPy 实现，基座没有对应的站点，EPLB 整条链是插件仓的增量能力。本章只讲算法与数学本体；它怎么被宿主进程调用、权重怎么真搬，落地见[第 10 章](../../ch10-eplb-expert-load-balancing/narrative/chapter.md)。
 
 ![本章地图：EPLB 负载均衡算法本体——论证骨架→算法核心→落地编排](../diagrams/chapter-map.png)
 
-只想看算法本体怎么推出来，从「一、动机」跟读到「四、贪心装箱」就够；想看它怎么落地省搬运、怎么判断该不该迁，直接跳「五、折叠热度与就地映射」到「七、两种论文策略」这几节。
+只想抓「为什么必须复制、复制完怎么摆」这条主线，读一到四节就够；五节是从方案到放置表的收尾（就地映射与 0.95 闸门），六节是论文两种策略的对照，可按需跳读。
 
-这一章自造的专用记号不多，但有一个容易让人卡壳——先摆一张速查表混个脸熟，碰到时不用回头翻定义：
+全章记号不多，先列一张速查表，正文首现处仍会给一句人话解释：
 
 | 符号 | 含义 | 首次出现 |
 | --- | --- | --- |
-| $K_r$ | 每个 token 实际被路由选中（激活）的专家个数——就是本章反复说的「top-K 路由」里的那个 K；下标 r（routed）是为了跟共享专家区分，只统计从路由专家里选出的这 $K_r$ 个 | 二、均衡目标 节，训练期前传 Eq.16 |
+| $`w_e`$ | 逻辑专家 $`e`$ 的热度——统计窗口内路由到它的 token 量 | 一、动机与度量 |
+| $`G`$ | 卡（rank，一张卡 = 一个进程）的总数，本章玩具例取 2 | 一、动机与度量 |
+| $`L_g`$ | 卡 $`g`$ 的负载——落在它上面所有槽位的单副本热度之和 | 一、动机与度量 |
+| $`\mathrm{par}`$ | 不均衡度 = 最热卡负载 / 平均（mean）卡负载，par 恒 ≥ 1 | 一、动机与度量 |
+| $`r_e`$ | 专家 $`e`$ 的物理副本数（基副本 + 冗余副本） | 二、下界定理 |
+| $`k`$ | 摊薄递推的计数器——某个专家已攒下的冗余副本数 | 三、削峰 |
+| $`E`$ 、 $`R`$ | 逻辑专家总数、冗余名额总数（本例 8、2） | 三、削峰 |
 
 ---
 
-## 一、动机：最热的那张卡，决定整批的快慢
+## 一、动机与度量：par 是被最热卡拖慢的倍数
 
-### 直觉：一队人抬桌子，最慢那个定速度
+MoE（mixture-of-experts，混合专家）模型每一层有一大堆 FFN（前馈网络）专家，但每个 token 只激活其中 top-K 个——router（路由网络）给每个专家打分，取分数最高的 K 个。EP（expert parallelism，专家并行）把这些专家摊到不同的卡上，每张卡管一撮；一层前向要等**所有**卡都算完、再做一次 all-to-all（全对全通信）汇合，所以这一层的墙钟时间由**最慢**的那张卡决定——一队人抬桌子，最慢那个定速度。而专家有多热是数据说了算的：热门专家凑巧挤在同一张卡上，这张卡就拖着整队。
 
-MoE（mixture-of-experts，混合专家）模型每一层有一大堆 FFN 专家，但每个 token 只激活其中 top-K 个。用 EP（expert parallelism，专家并行）部署时，这些专家被摊到不同的卡（rank，一张卡 = 一个进程）上，每张卡管一撮专家。一层的前向要等**所有**卡都把自己那撮专家算完、再做一次 all-to-all 汇合——所以这一层的墙钟时间，由**最慢**的那张卡决定。
-
-问题在于：专家有多热，是数据说了算的。有的专家天生招人爱，路由过来的 token 特别多；有的门可罗雀。要是几个热门专家凑巧挤在同一张卡上，这张卡就成了那个最慢的人——它一个人抬着整队的进度。
-
-### 机制：用 par = 最热 / 平均，量化「被拖慢几倍」
-
-怎么把「拖慢」这件事变成一个数？EPLB 用的度量叫 **par**（partition ratio 的意思，这里就理解成「不均衡度」）：
+把「拖慢」变成一个数。设卡 $`g`$ 的负载为 $`L_g`$ （L 取 load 之意，指它管的那撮专家的热度之和，正式定义见下一节），par（不均衡度）取最热与平均（mean）之比：
 
 $$
 \mathrm{par} = \frac{\max_g L_g}{\mathrm{mean}_g\, L_g}
 $$
 
-分子是最热那张卡的负载 $\max_g L_g$ ，分母是所有卡的平均负载。par 恒 ≥ 1，par = 1 就是完美均衡（每张卡一样忙）。它的物理含义很直白：**par 就是整批被最热卡拖慢的倍数**。par = 1.5，意味着这批本可以快 1.5 倍，只因为有张卡特别忙。这正是 DeepSeek-V3 §3.4 要「ensure that each GPU processes approximately the same number of tokens」的量化版本。
+par 恒 ≥ 1，par = 1 是完美均衡；它的工程含义就一句—— **par 是整批被最热卡拖慢的倍数**：par = 1.5 意味着这批本可以快 1.5 倍。之所以取 max/mean 而不取方差：墙钟只由最慢卡决定，「最热/平均」直接就是拖慢倍数，与优化目标同向——这正是 DeepSeek-V3 §3.4「ensure that each GPU processes approximately the same number of tokens」的量化版（arXiv:2412.19437）。
 
-### 数值：一个把两个热门专家挤在一起的坏放置
-
-拿本章的小例子说话。1 个 MoE 层、2 张卡、每卡 5 个物理槽、8 个逻辑专家（id 0..7）。一个朴素的起始放置偏偏把两个真正的热门专家——专家 3（热度 60）和专家 4（热度 55）——塞进了同一张 card0，还把两个冗余副本浪费在了本就很冷的专家 1、5 身上：
+本章从头用到尾的玩具例：1 个 MoE 层、2 张卡、每卡 5 个物理槽、8 个逻辑专家（id 0..7）。一个朴素的起始放置偏偏把两个真正的热门专家——专家 3（热度 60）和专家 4（热度 55）——塞进了同一张 card0，还把两个冗余副本浪费在了本就很冷的专家 1、5 身上：
 
 ![朴素放置：两个热专家挤在 card0，par=1.543](../diagrams/fig34-1-straggler.png)
 
-card0 扛了 60+55+10+10 = 135，card1 只有 10×4 = 40，平均是 (135+40)/2 = 87.5。代进 par：
+card0 扛了 60+55+10+10 = 135，card1 只有 40，平均 (135+40)/2 = 87.5，par = 135/87.5 ≈ 1.543——另一张卡有近一半时间在干等。
 
-$$
-\mathrm{par} = \frac{135}{87.5} \approx 1.543
-$$
-
-也就是说，这批被 card0 一张卡拖慢了约 1.54 倍——另一张卡有近一半时间在干等。EPLB 要做的，就是把这个 1.543 压回接近 1。
-
-### 源码：观测侧怎么算这个 par
-
-这个度量在昇腾代码里是真实存在的。第 10 章的规划宿主 `EplbWorker` 有一个 `_compute_imbalance`，把任意一张放置方案量化成 par，供 metrics 观测均衡前后的差异：
-
-```python
-# vllm_ascend/eplb/core/eplb_worker.py:L290-L309
-@staticmethod
-def _compute_imbalance(deployment_all_layer, hotness_all_layer: np.ndarray, return_list: bool = False):
-    imbalance_list = []
-    deployment_all_layer = np.array(deployment_all_layer)
-    for deployment, hotness in zip(deployment_all_layer, hotness_all_layer):
-        counts = np.bincount(deployment.reshape(-1), minlength=hotness.shape[0])
-
-        unit_hotness = np.divide(hotness, counts, out=np.zeros_like(hotness, dtype=float), where=counts != 0)
-
-        stage_load = unit_hotness[deployment].sum(-1)
-        stage_par = stage_load.max() / stage_load.mean()
-        imbalance_list.append(stage_par)
-    # … 省略：把逐层 par 归并成 mean/max 供日志上报 …
-    return mean_val, max_val
-```
-
-逐层看：`counts` 数每个逻辑专家现在有几个物理副本；`unit_hotness` 把逻辑专家的总热度除以副本数，得到**每副本的平均热度**（复制越多、单副本越轻）；`stage_load` 把每张卡上各槽位的单副本热度加起来，就是那张卡的负载 $L_g$ ；最后 `stage_par = stage_load.max() / stage_load.mean()` 一行，正是上面那个 $\max/\mathrm{mean}$ 。这里 `hotness_all_layer` 是逐层聚回逻辑专家的热度向量，由旁边的 `_calculate_hotness` 按放置把每卡负载摊回专家（此处一句带过）。
-
-至于为什么用 max/mean 而不用方差——因为墙钟延迟只由最慢那张卡决定，「最热/平均」直接就是被拖慢的倍数，比方差更贴目标。规划器内部也是奔着最小化 `max_heat`（最热卡负载）去的，两者同向。
+顺手点破一个贯穿全章的不变量：**par 的分母全程是常量**。mean 只由总热度 175 与卡数决定，而后面要做的复制只是把热度摊给几份副本、装箱只是把热度换张卡放——谁都改不了总热度。所以「把 par 压回 1」与「把最热卡压到均值 87.5」是同一句话；那条 87.5 的线，就是全章唯一要盯的地板。观测侧确实按这个式子把任一放置方案量化成 par 供指标上报（EplbWorker 的记账，落地见[第 10 章](../../ch10-eplb-expert-load-balancing/narrative/chapter.md)）；规划器内部直接最小化最热卡负载，两者同向。
 
 ---
 
-## 二、均衡目标：把「最热卡负载」压到下界
+## 二、下界定理：均值是地板，纯搬运够不着
 
-### 训练期的前传：auxiliary-loss-free 偏置
-
-在讲推理期怎么重排之前，值得先交代一句：DeepSeek-V3 其实在**训练时**就努力压过一轮专家热度了。它的做法叫 auxiliary-loss-free load balancing（无辅助损失的负载均衡），来自 §2.1.2（arXiv:2412.19437）。要看懂这一句，得先补几句 MoE 路由的基础背景：每一层的 router（路由网络）会给每个 token、对每个逻辑专家都算一个分数——记作 $s_{i,t}$ ，即路由网络为 token $t$ 对专家 $i$ 算出的路由分数（亲和度，affinity），分数越高说明这个专家跟这个 token 越对路；按分数取 top-K，被选中（激活）的专家才会真正跑这个 token 的 FFN；每个激活专家的输出最终还要乘一个门控值 $g$ 再加总，这个门控值同样来自 $s_{i,t}$ 。DeepSeek-V3 的巧思正在这里：给每个专家一个偏置 $b_i$ ，只掺进「选不选」这一步的排序（ $s_{i,t}+b_i$ 参与 top-K），并不改动 $s_{i,t}$ 本身——真正乘进 FFN 输出的门控值 $g$ ，用的还是没加偏置的原始 $s_{i,t}$ ，所以调偏置只挪选择门槛，不改写模型已经学到的打分分布。这里先点一下下面公式里冒出的两个记号： $N_r$ 是路由专家总数， $K_r$ 是每个 token 实际被选中（激活）的专家数，也就是前面反复说的 top-K 路由里的那个 K（加下标 r 是为了跟共享专家区分）；两者更正式的记号会在下一节「目标函数与理想下界」里再展开。式中还会出现 $\mathrm{Topk}(S, K)$ 这个记号，含义很直白：把集合 $S$ 里的元素按大小降序排序，取排在最前面的 $K$ 个组成的新集合——放到这里就是「把 $N_r$ 个专家按 $s+b$ 排个序，选出最靠前的 $K_r$ 个」：
-
-$$
-g_{i,t}^{\prime} = \begin{cases} s_{i,t}, & s_{i,t} + b_{i} \in \mathrm{Topk}(\{s_{j,t} + b_{j} \mid 1 \leqslant j \leqslant N_{r}\}, K_{r}), \\ 0, & \mathrm{otherwise}. \end{cases}
-$$
-
-这是论文 Eq.16——case 分支写的正是这套规则：若 $s_{i,t}+b_i$ 挤进了 $\mathrm{Topk}$ ，门控走上面那支、取值仍是纯 $s_{i,t}$ （ $b_i$ 不出现在这一支里）；没挤进则门控置零。训练时每个 step 结束监控专家负载，过载的专家把 $b_i$ 减 $\gamma$ （bias update speed，偏置更新速率），欠载的加 $\gamma$ ，动态把训练期的专家热度分布压平。
-
-### 推理期为什么还得再来一遍
-
-既然训练时已经压过，推理时为什么还需要本章这套重排？因为训练压的是**分布**——让长期平均下来各专家差不多热。但推理部署时，路由由训练好的模型 + 眼下这批真实输入共同决定，某个 10 分钟窗口里的实际热度照样会不均。于是需要一条**独立于训练**的推理期通路：按线上实时统计出来的热度，动态地复制热门专家、重排放置。两者互补：一个压训练分布，一个补推理放置。论文 §3.4 把这条推理期通路说得很清楚：
+先交代一句训练期的前传。DeepSeek-V3 在训练时就压过一轮专家热度：auxiliary-loss-free load balancing（无辅助损失的负载均衡，arXiv:2412.19437 §2.1.2）给每个专家挂一个偏置，偏置只掺进 top-K「选不选」的排序、不进乘到专家输出上的门控值；每个训练步之后，过载专家的偏置下调、欠载的上调，把长期的热度分布压平。但它压的是**分布**——推理部署时，路由由训好的模型和眼下这批真实输入共同决定，某个统计窗口（论文举例每 10 分钟）里的实际热度照样会偏。于是需要一条独立于训练的推理期通路，论文 §3.4 一段话给出全部纲领：
 
 > To achieve load balancing among different experts in the MoE part, we need to ensure that each GPU processes approximately the same number of tokens. To this end, we introduce a deployment strategy of redundant experts, which duplicates high-load experts and deploys them redundantly. The high-load experts are detected based on statistics collected during the online deployment and are adjusted periodically (e.g., every 10 minutes). After determining the set of redundant experts, we carefully rearrange experts among GPUs ... striving to balance the load across GPUs as much as possible.
 
-两个关键词：**redundant experts**（冗余专家，复制热门专家）+ **rearrange**（重排放置）。这一句就是本章算法的全部纲领。
+两个关键词就是本章的两段贪心：**duplicates**（复制热门专家——削峰）与 **rearrange**（重排放置——铺平）。
 
-### 目标函数与理想下界
-
-把它写成优化问题。设 $N_r$ 个逻辑专家、 $G$ 张卡，专家 $e$ 的热度 $w_e$ ，若它有 $r_e$ 个物理副本，则每副本承担 $w_e / r_e$ 。卡 $g$ 的负载是落在它上面的所有槽位的单副本热度之和：
+把它写成优化问题。专家 $`e`$ 热度 $`w_e`$ （w 取 weight），有 $`r_e`$ 个物理副本（r 取 replica）时每副本承担 $`w_e/r_e`$ ——复制不增减热度，只摊薄。卡 $`g`$ 的负载是落在它上面所有槽位的单副本热度之和（对应 §3.4 的部署模型）：
 
 $$
 L_g = \sum_{e \in g} \frac{w_e}{r_e}
 $$
 
-目标是最小化最热卡负载 $\max_g L_g$ ，因为整批延迟正比于它。这个量有个雷打不动的**理想下界**，论证很直白：把一个专家复制成多份副本，只是把它的热度摊给这几份，摊薄不会让热度凭空增减——所有副本的热度加总起来，仍然等于复制前的总热度 $\sum_e w_e$ ；这些副本终归要落在 $G$ 张卡上， $G$ 张卡的负载总和因此也固定是 $\sum_e w_e$ ，于是不管怎么摆，平均每卡负载都是 $\sum_e w_e / G$ ；而鸽笼原理告诉我们，一组数里最大的那个不可能比它们的平均值还小——所以最热卡的负载 $\max_g L_g$ 必然不小于这个平均值：
+目标是最小化 $`\max_g L_g`$ ，因为整批延迟正比于它。这个量有个雷打不动的地板，三步推直：复制只把 $`w_e`$ 摊给几份副本，所有副本热度加总仍是 $`\sum_e w_e`$ ；这些副本终归落在 $`G`$ 张卡上，卡负载总和固定为 $`\sum_e w_e`$ ，平均每卡 $`\sum_e w_e/G`$ ；一组数的最大值不小于均值，于是
 
 $$
 \max_g L_g \;\ge\; \frac{\sum_e w_e}{G}
 $$
 
-本例总热度 $175$ 、 $G=2$ ，下界就是 $175/2 = 87.5$ 。这条线是任何放置都逾越不过去的地板。
+这就是 §3.4 那句「approximately the same number of tokens」的数学底座。本例总热度 175、 $`G=2`$ ，地板 87.5——与 par 的分母是同一个数，这不是巧合：它们是同一条热度守恒律的两个读数。
 
-### 为什么「只搬不复制」注定失败
+**为什么必须复制**，理由有两层。第一层是一个充分条件：若某个专家单体热度超过公平份额（ $`w_e > \sum_e w_e / G`$ ），任何不复制的放置都有 $`\max_g L_g \ge w_e >`$ 地板——它整块压在某张卡上，纯搬迁无解。第二层更普遍，也是本例真正命中的：即便没人超份额（60、55 都小于 87.5），**热度长在专家身上、整块不可拆**，而地板是按「热度可以无限细分」算出来的。本例 8 块热度在两卡间不复制地分，最优也只能分成 90 对 85（枚举见严谨框），90 仍高于 87.5——缝就卡在「60 和 55 拆不开」上。复制买的正是**可分性**：专家 3 复制一份，60 变成两块 30，分割的粒度变细，地板才从「理论下界」变成「可达的目标」。
 
-这里有个关键的数学观察，也是**冗余专家策略存在的理由**：如果某个专家单体热度 $w_e$ 已经超过公平份额 $(\sum w)/G$ ，那么任何**不复制**的放置都逃不过 $\max_g L_g \ge w_e > $ 下界——因为这个专家整块压在某一张卡上，那张卡至少有 $w_e$ 这么重。纯搬迁在这种情况下**无解**。
+![顿悟：搬不平、抄得平——纯搬运的极限 90 永远够不着地板 87.5，复制两份之后恰好贴地](../diagrams/fig-eplb-epiphany.png)
 
-本例的专家 3 热度 60，公平份额是 87.5，看似没超——严格说，本例并没有真正触发上面那条「单体超份额则纯搬迁必败」的数学充分条件，那条定理保证的是更极端的情形。这里复制真正带来的收益，来自一个更朴素的原因：8 个原始专家的热度都是不可再拆的整体，只靠在两卡间挪动整卡分配（完全不复制），能拿到的最优组合是「专家 3(60) + 三个热度 10 的专家」= 90 对「专家 4(55) + 三个热度 10 的专家」= 85（其余分法只会更差），90 仍然高于下界 87.5。也就是说，槽位有限、专家不可再拆分，才是这个具体例子里复制真正省下差距的原因，而不是专家 3、4 单体越过了公平份额。而只要把专家 3 复制成 2 个副本，它的单副本负载就降到 $60/2 = 30$ ，才有可能塞进一个更平衡的箱子。这就是「先复制、再装箱」两段式的由来——复制负责把过高的单体削平，装箱负责把削平后的碎块均匀铺开。
+均衡前后的全景就是这样一步跨过去的：
 
 ![均衡前后：par 从 1.543 压到 1.0，正好落在下界 87.5](../diagrams/fig34-2-par-before-after.png)
 
-图里左边是均衡前 card0=135 的高柱，右边是均衡后两卡各 87.5、齐刷刷贴在下界线上。par 从 1.543 一路压到 1.0——本例恰好命中理想下界，达到了完美均衡。下面两节，就把「怎么复制」和「怎么装箱」逐步跑给你看。
+左边是均衡前 card0=135 的高柱，右边是均衡后两卡各 87.5、齐刷刷贴在地板上——本例恰好命中下界，par 从 1.543 压到 1.0。接下来两节把「怎么复制」「怎么装箱」的贪心各自推清。
+
+> **严谨（想要深度再展开）**：其一，纯搬运最优 90 的枚举。不复制时 8 个专家各占一槽、两卡 5 槽装 8 块（容量无碍），唯一的自由是分组。60 与 55 同卡则该卡至少 115；分居两卡时，剩下 6 块热度 10 的专家给 60 那边 $`x`$ 块，两卡负载为 $`60+10x`$ 与 $`55+10(6-x)`$ ， $`x=3`$ 时最大值取最小 = 90，其余取法只会更大——纯搬运的 makespan（最大卡负载）极限是 90。其二，单体超份额条件的证明一行：不复制时该专家整块落在某张卡 $`g_0`$ 上， $`L_{g_0} \ge w_e > \sum_e w_e/G`$ 。其三，复制之后地板也**不总**可达——后面两节的贪心只保证近似（装箱启发式的最坏情况界见四节严谨框），本例命中 87.5 是「碎块恰好拼整」的幸运；但地板本身对任何放置永远成立：它是下界，不是承诺。
 
 ---
 
-## 三、冗余复制：把最长的木板锯短
+## 三、削峰：冗余复制的摊薄递推
 
-### 直觉：每一轮，锯当前最长的那根
+复制阶段手里只有 $`R`$ 个冗余名额（本例 2），要用它把「最大单副本平均热度」压到最低。规则一行：**每轮把名额发给当前单副本平均热度最高的专家**。设这个专家此前已攒下 $`k`$ 个冗余副本（此刻共 $`k+1`$ 个物理副本），再发一个名额后（对应 §3.4 的冗余复制，arXiv:2412.19437）：
 
-复制阶段的目标，是用有限的几个冗余名额，把「最大单副本负载」尽量压下去。想象你有几根长短不一的木板，整体高度由最长那根决定。你能做的不是搬走它，而是把它锯成几段——每段扛一部分，最长的板才不再拍板。策略很自然：**每一轮，都锯当前最长的那根**。谁现在的单副本平均热度最高，下一个副本名额就发给谁。
+$$
+\bar{w}_{new} = \bar{w}_{old}\times\frac{k+1}{k+2}
+$$
 
-### 数值推演：两个名额，都发给了真正的热门
+$`\bar{w}`$ 是该专家的单副本平均热度； $`k`$ 数的是**这个专家**已有的冗余副本数，不是全局轮次。这一步合法还是因为热度守恒：加副本前的总热度 $`\bar{w}_{old}\times(k+1)`$ 原封不动地摊到 $`k+2`$ 份上，除一下就是新平均。因子 $`(k+1)/(k+2)`$ 恒小于 1 且随 $`k`$ 递增（ $`1/2 \to 2/3 \to 3/4`$ ）——副本越多，再加一份摊薄得越少，贪心于是自动把名额引向「即便已复制、平均仍最高」的瓶颈。一句话的画面：整体高度由最长的木板决定，每轮锯当前最长的那根，而不是去锯已经不长的板。
 
-本例有 2 个冗余名额、8 个专家，折叠后的热度是 `[10,10,10,60,55,10,10,10]`。贪心两轮：
+本例折叠后的热度是 `[10,10,10,60,55,10,10,10]`（从物理观测折出这个向量的一步见五节）。贪心两轮：
 
 <!-- trace: redundant-experts-replication -->
 
@@ -150,76 +106,32 @@ $$
 | 1 | expert 3 | 60.0 | 0→1 | 30.0 | 2→1 |
 | 2 | expert 4 | 55.0 | 0→1 | 27.5 | 1→0 |
 
-第 1 轮全场最热是专家 3（60），给它加 1 个副本，负载被两个副本平摊成 $60/2 = 30.0$ ；此时全场最热变成专家 4（55），第 2 轮给它加副本，摊成 $55/2 = 27.5$ 。两个名额用完，最终 `replicas_of = {3:[8], 4:[9]}`——热门专家 3、4 各多一个物理副本（新副本的物理 id 是 8、9），其余专家原封不动。
+第 1 轮全场最热是专家 3（60）， $`k=0`$ ，摊成 $`60\times 1/2 = 30.0`$ ；此时全场最热变成专家 4（55），第 2 轮摊成 $`27.5`$ 。两个名额用完，最终 `replicas_of = {3:[8], 4:[9]}` ——热门专家 3、4 各多一个物理副本（新副本的物理 id 从 8 往后编），冷专家一个名额都没占到。
 
 ![两个冗余名额贪心地发给专家 3、4，各自热度减半](../diagrams/fig34-3-replication.png)
 
-注意贪心的精妙：名额没有浪费在冷专家上，而是**优先给「即便已复制、平均热度仍最高」的那个**。这正是「锯最长的板」——而不是去锯已经不长的板。
-
-### 不变量与复杂度
-
-**每发一个名额，被选中专家的单副本平均热度严格下降，且全局最大单副本负载单调不增。** 论证：设某专家在这一轮加副本前已经有 $k$ 个冗余副本（不含基副本本身，即此刻它总共有 $k+1$ 个物理副本），那么这一轮再加一个冗余副本后，新平均 = 旧平均 $\times (k+1)/(k+2)$ ，因子恒小于 1，故该专家平均严格下降；每轮只对「当前最大单副本负载」者动手（argsort 取顶），故全局 max 单副本负载不会升。冗余名额是固定的 2 个，每轮减一，有限步必停。
-
-复杂度上，每个名额做一次对 $E$ 个专家的 argsort，共 $R$ 个名额：
-
-$$
-O(R\cdot E \log E)
-$$
-
-本例 $R=2$ 、 $E=8$ ，约 48 次比较量级——纯 CPU、离线，跑在第 10 章那个独立子进程里，不占推理主循环。
-
-### 源码：`(k+1)/(k+2)` 的摊薄就在这里
-
-对上真实代码。这段叫 `original_compute_balanced_pack_redundancy`，Step 1 就是复制：
+这条递推落到昇腾的 `DefaultEplb` 里就是三行——「平均 × 副本数」还原总热度、记下新副本、再除以新副本数：
 
 ```python
-# vllm_ascend/eplb/core/policy/policy_default_eplb.py:L43-L57
-@staticmethod
-# Split hot (high-load) experts into redundant experts
-def original_compute_balanced_pack_redundancy(origin_weights, card_num, num_redundancy_expert):
-    # Step 1: Sort the items by weight in descending order (we are sorting by weight now)
-    # Sort based on the second element (the second value of each tuple)
-    route_expert_num = len(origin_weights)
-    route_expert_redundancy: list[list[int]] = [[] for _ in range(route_expert_num)]
-    for i in range(num_redundancy_expert):
-        sorted_indices = np.argsort([t[1] for t in origin_weights], kind="stable")[::-1]
-        weights = [origin_weights[idx] for idx in sorted_indices]
-        tmp_raw_weight = weights[0][1] * (len(route_expert_redundancy[weights[0][0]]) + 1)
-        route_expert_redundancy[weights[0][0]].append(route_expert_num + i)
-        avg_weight = tmp_raw_weight / (len(route_expert_redundancy[weights[0][0]]) + 1)
-        weights[0] = (weights[0][0], avg_weight)
-        origin_weights = weights
+# vllm_ascend/eplb/core/policy/policy_default_eplb.py:L53-L55
+tmp_raw_weight = weights[0][1] * (len(route_expert_redundancy[weights[0][0]]) + 1)
+route_expert_redundancy[weights[0][0]].append(route_expert_num + i)
+avg_weight = tmp_raw_weight / (len(route_expert_redundancy[weights[0][0]]) + 1)
 ```
 
-逐行拆：`origin_weights` 是 `(专家id, 平均热度)` 的列表。循环跑 `num_redundancy_expert` 次，一次发一个名额。`np.argsort(...)[::-1]` 按平均热度**降序**排，`weights[0]` 就是当前最热的那个。`route_expert_redundancy[...]` 记这个专家的副本 id 列表，`.append(route_expert_num + i)` 给它加一个新副本（物理 id 从 `route_expert_num` 往后编，本例就是 8、9）。
+`weights[0]` 是按平均热度降序排后的当前最热专家：第一行是 $`\bar{w}_{old}\times(k+1)`$ ，第三行除以 $`k+2`$ ——递推逐字对上。围着这三行的降序排序与名额循环，无非把它跑 $`R`$ 遍，上面的推演表已经把两轮跑全。
 
-关键是那两行摊薄。设这个专家在这一轮加副本前已有 $k$ 个**冗余**副本（不含基副本，对应代码里 append 之前的 `len(route_expert_redundancy[...])` = k）——也就是说此刻它总共有 k+1 个物理副本（1 个基副本 + k 个冗余副本），摊薄前的平均热度记为 $\bar{w}_{old}$ ，正是摊在这 k+1 个副本上的平均值；加了新副本之后的平均热度记为 $\bar{w}_{new}$ 。`tmp_raw_weight = 当前平均 × (k+1)` 用「平均 × 副本数」先还原出这个专家的原始总热度（因为此刻共有 k+1 个副本），再除以加了新副本之后的 `(k+2)` 个副本，得到新平均，也就是（对应 §3.4，arXiv:2412.19437 的冗余复制）：
-
-$$
-\bar{w}_{new} = \bar{w}_{old}\times\frac{k+1}{k+2}
-$$
-
-本例专家 3 第一次被选时 $k=0$ ， $60 \times 1 / 2 = 30$ ，和推演表一字不差。这条公式是个递推关系： $k$ 数的是「这个专家」已经攒了几个冗余副本，不是全局第几轮——同一个专家如果后面又中一次（比如再拿到第 3 个物理副本）， $k$ 就从 0 变成 1，摊薄因子随之从 $1/2$ 变成
-
-$$
-\frac{k+1}{k+2}=\frac{2}{3}
-$$
-
-副本越多、每次新增带来的摊薄幅度越小。本例里专家 3、4 在这两轮里各自只中了一次，没有机会走到 $k=1$ 这一步，但公式本身对任意专家、任意轮次都按同一套递推成立。摊薄后写回 `weights[0]`，下一轮它就未必是最热的了——名额自然流向下一个瓶颈。
+> **严谨（不变量、终止与代价）**：每发一个名额，被选中专家的单副本平均热度严格下降（因子恒 < 1）；每轮只对「当前最大单副本平均热度」者动手（降序取顶），故全局最大单副本平均热度单调不增；名额固定 $`R`$ 个、每轮减一，有限步必停。代价：每个名额做一次对 $`E`$ 个专家的排序， $`O(R\cdot E\log E)`$ ——本例 $`2\times 8\times\log_2 8 = 48`$ 次比较量级，纯 CPU、离线，跑在独立的规划子进程里（宿主见[第 10 章](../../ch10-eplb-expert-load-balancing/narrative/chapter.md)），不占推理主循环。再记一笔主线账：摊薄保总热度不变，par 的分母、地板 87.5 都纹丝不动——削峰只是让地板「够得着」，真正去够的是下一节的装箱。
 
 ---
 
-## 四、贪心装箱：重的先放、轻的填缝
+## 四、铺平：LPT 装箱，副本不共卡
 
-### 直觉：分行李上两台手推车
+复制把过高的单体削成了碎块，现在共 $`E+R = 10`$ 个物理副本要铺到 2 张卡、每卡 5 槽。规则一行：**按摊薄后热度降序，每件放进「当前总热度最轻、未含同专家、未满」的卡**。重的先安置、轻的填缝，这套启发式叫 LPT（longest processing time first，最长处理时间优先），是 makespan（最大卡负载）最小化的经典贪心——分行李上两台手推车，重箱先上、每件放进当前较轻的那台。
 
-复制把过高的单体削成了碎块，接下来要把这些碎块均匀铺到卡上。这是个经典的装箱问题。想象你要把一堆行李分上两台手推车，怎么让两台车最接近一样重？**先放最重的箱子，每一件都塞进当前最轻的那台车。** 重的先安置好，轻的用来填缝——最后两台车总重最接近。这套启发式有名字，叫 LPT（longest processing time first，最长处理时间优先）。
+三个条件里真正带数学分量的是中间那个：**同专家副本不共卡，是摊薄的兑现条件**。上一节把 60 摊成两块 30，靠的是两份副本各接一半流量；若两块 30 落回同一张卡，那张卡照旧扛整份 60，复制等于白做。 $`L_g = \sum_{e\in g} w_e/r_e`$ 里「每副本独立成块」这个假设，正是靠这条装箱约束兑现的。
 
-这里多一条约束：**同一个专家的多个副本，不能上同一台车**（否则复制就白做了——两个副本挤一张卡，那张卡还是扛全量）。
-
-### 数值推演：10 个副本，装成 87.5 / 87.5
-
-本例复制后共 $8+2 = 10$ 个物理副本，装到 2 张卡、每卡 5 槽。逐步跑：
+逐步跑完 10 个副本：
 
 <!-- trace: greedy-balanced-packing -->
 
@@ -236,116 +148,21 @@ $$
 | 7 | (1,10.0) | 77.5 | 77.5 | card0 | 87.5 |
 | 8 | (0,10.0) | 87.5 | 77.5 | card1 | 87.5 |
 
-先 seed：每个新副本各占一张卡（专家 3 的副本占 card0=30.0，专家 4 的副本占 card1=27.5）。再按热度降序放基副本：专家 3（30）不能进已含 3 的 card0，落 card1（→57.5）；专家 4 落 card0（→57.5）；随后 6 个热度 10 的专家轮流填当前最空的卡，每次都避开「已含该专家的卡」。到第 8 步 card0 已满 5 项，专家 0 只能进 card1。最终两卡各 **87.5**——恰好等于理想下界。
+先 seed（播种）：每个冗余副本各占一张卡（专家 3 的副本占 card0=30.0，专家 4 的占 card1=27.5）。再按热度降序放基副本：专家 3（30）不能进已含它的 card0，落 card1（→57.5）；专家 4 落 card0（→57.5）；随后 6 个热度 10 的专家轮流填当前最轻的卡，每次避开已含该专家的卡；到第 8 步 card0 已满 5 项，专家 0 只能进 card1。最终两卡各 **87.5** ——最大卡负载贴上地板，par 回到 1.0。
 
 ![LPT 装箱把 10 个副本铺成两卡各 87.5，命中下界](../diagrams/fig34-4-packing.png)
 
-### 不变量与复杂度
-
-**每步都选「当前总热度最小、且未装该专家、且未满」的卡，装完后每卡恰好 5 项，且最大卡负载被压到接近下界。** 容量闸保证没有卡超载，「未装该专家」约束保证副本分散，降序 + 填最空箱就是 LPT。LPT 对 makespan（最大箱负载）最小化的近似比是 $4/3 - 1/(3m)$ （m 即卡数 G，调度理论里的标准记号）；本例更幸运——直接命中最优下界。
-
-> 直觉： $4/3-1/(3m)$ 是调度理论里一个经典的最坏情况界（list scheduling / LPT，R. L. Graham, 1969）——不管输入多刁钻，LPT 装箱得到的最大箱负载都不会比这个界差。它不影响本章的推导，你不需要看它的证明；提它只是想让你放心：本例甚至比这个界更好，直接命中了下界本身。
-
-装箱阶段的复杂度是（本例 $(8+2)\times 2 = 20$ 次候选卡比较量级）：
-
-$$
-O((E+R)\cdot G)
-$$
-
-### 源码：seed、容量闸、填最空箱
-
-对上代码，Step 2 到 Step 4 就是装箱主体：
-
-```python
-# vllm_ascend/eplb/core/policy/policy_default_eplb.py:L59-L106
-    # Step 2: Calculate the number of items per box
-    expert_num = route_expert_num + num_redundancy_expert
-    items_per_box = expert_num // card_num  # Number of items per box
-    remaining_items = expert_num % card_num  # Number of items per box
-
-    # Step 3: Initialize card_num boxes with empty lists to store item IDs
-    boxes: list[list[int]] = [[] for _ in range(card_num)]
-    boxes_weights: list[list[float]] = [[] for _ in range(card_num)]
-    box_weights = [0] * card_num  # To store the total weight of each box
-    box_counts = [0] * card_num  # To store the number of items in each box
-    index = 0
-    for i in range(route_expert_num):
-        redundancy_num = len(route_expert_redundancy[i])
-        for _ in range(redundancy_num):
-            cur_weight = 0
-            for item, weight in origin_weights:
-                if item == i:
-                    cur_weight = weight
-
-            boxes[index].append(i)
-            boxes_weights[index].append(cur_weight)
-            box_weights[index] += cur_weight
-            box_counts[index] += 1
-            index += 1
-
-    sorted_indices = np.argsort([t[1] for t in origin_weights], kind="stable")[::-1]
-    origin_weights = [origin_weights[idx] for idx in sorted_indices]
-    # Step 4: Distribute items into boxes based on weight
-    for item_id, weight in origin_weights:
-        # Find the box with the least items but not full
-        min_box_index = -1
-        for i in range(card_num):
-            if item_id in boxes[i]:
-                continue
-            # Only choose boxes that still have space (box_counts[i] < items_per_box)
-            if box_counts[i] < items_per_box or (box_counts[i] == items_per_box and remaining_items > 0):
-                if min_box_index == -1 or box_weights[i] < box_weights[min_box_index]:
-                    min_box_index = i
-
-        # Place the item (id) into the selected box
-        boxes[min_box_index].append(item_id)
-        boxes_weights[min_box_index].append(weight)
-        box_weights[min_box_index] += weight
-        box_counts[min_box_index] += 1
-
-        # If there's an imbalance in the remaining items, reduce the "remaining_items" counter
-        if box_counts[min_box_index] == (items_per_box + 1) and remaining_items > 0:
-            remaining_items -= 1
-    # … 省略：Step 5 把每卡 items / total_weight 打包成 result 字典返回 …
-```
-
-`items_per_box = expert_num // card_num` 是每卡基本容量（本例 10//2=5），余数 `remaining_items` 用来给个别卡多分一项。第一段双重循环是 **seed**：遍历每个专家，凡有冗余副本的（`redundancy_num > 0`），先把这些副本一个一个 `index++` 摊到不同的箱里占坑——对应推演表的两行 seed。
-
-Step 4 是主循环，对应表里的 8 步。降序取每个基副本，在所有箱里找 `min_box_index`：跳过已含该专家的箱（`if item_id in boxes[i]: continue`），只在还有空间的箱里选**当前总重最小**的那个（`box_weights[i] < box_weights[min_box_index]`）。容量闸 `box_counts[i] < items_per_box` 保证不超载，余数用 `remaining_items` 分摊。放入后更新四个记账数组。跑完，`box_weights = [87.5, 87.5]`，和推演一致。
+> **严谨（近似比与代价）**：LPT 对 makespan 最小化的最坏情况近似比是 $`4/3 - 1/(3m)`$ （ $`m`$ 为卡数，调度理论的标准记号；R. L. Graham, 1969 的经典界）。你不需要看它的证明——记住结论就够：再刁钻的输入，LPT 得到的最大卡负载也不会比最优差过这个比；本例更幸运，碎块恰好拼整，直接命中地板 87.5 本身。容量闸（每卡基本容量 = 副本总数整除卡数，本例 10//2 = 5，余数逐一分摊给个别卡）保证没有卡超载；「未含同专家」保证副本分散。代价 $`O((E+R)\cdot G)`$ ，本例 $`10\times 2 = 20`$ 次候选卡比较量级。
 
 ---
 
-## 五、折叠热度与就地映射：输入准备和省搬运
+## 五、输出一张放置表：折叠、就地映射与 0.95 闸门
 
-前面两节是算法核心。但要让它跑起来，前后各有一个配套步骤：进来时得先把物理观测折成逻辑热度，出去时得把新放置尽量落回旧槽位以省搬运。这两步都不改变均衡结果，但一个决定「算得对不对」，一个决定「搬得多不多」。
+复制与装箱是数学核心；黑盒的进出两端还各有一步收尾，最后还有一道「迁不迁」的判定。它们不改变均衡的数学，却分别决定「算得对不对」「搬得多不多」「动不动手」。
 
-### 折叠热度：从物理槽位聚回逻辑专家
+**进门：折叠热度。** 规划器拿到的观测按物理槽位记账（每个槽一个热度），而复制与装箱按逻辑专家算——同一逻辑专家的多个副本散在各卡，先把它们的热度按专家 id 聚回一处。本例朴素放置里专家 1 有两个物理副本（热度 10 + 0），聚回来还是 10；折完得到 `[10,10,10,60,55,10,10,10]` ，正是三节复制阶段的输入。这一步对应 §3.4「statistics collected during the online deployment」；热度怎么在线采集、怎么送进规划器，落地见[第 10 章](../../ch10-eplb-expert-load-balancing/narrative/chapter.md)。顺带一提，冗余名额数也是从旧放置表反推的：数每个逻辑专家现有几份副本、超出 1 的部分求和——本例专家 1、5 各有 2 份，名额 = 2。
 
-规划器的输入是两张三维表：`workload_table[layer, gpu, slot]` 是每个物理槽位的热度，`placement_table` 同形状、存的是每个槽位放的物理专家 id。但复制/装箱要按**逻辑专家**算——一个逻辑专家可能有多个物理副本散在各处，得先把它们的热度加回一处。这就是 `add_redundant`：
-
-```python
-# vllm_ascend/eplb/core/policy/policy_default_eplb.py:L29-L41
-@staticmethod
-def add_redundant(current_expert_table, expert_workload, num_original_expert):
-    layer_num, npu_num, experts_per_npu = expert_workload.shape
-    workload_new = np.zeros((layer_num, num_original_expert))
-    for layer_idx in range(layer_num):
-        workload_dict: dict[int, int] = defaultdict(int)
-        placement_layer = current_expert_table[layer_idx].copy()
-        workload_layer = expert_workload[layer_idx].copy()
-        for npu_idx in range(npu_num):
-            for expert_idx in range(experts_per_npu):
-                workload_dict[placement_layer[npu_idx][expert_idx]] += workload_layer[npu_idx][expert_idx]
-        for expert_idx in range(num_original_expert):
-            workload_new[layer_idx][expert_idx] = workload_dict[expert_idx]
-    return workload_new
-```
-
-双重循环扫遍每个物理槽位，按它放的专家 id 把热度累进 `workload_dict`。本例朴素放置里专家 1 有两个物理副本（热度 10 + 0），聚回来还是 10；专家 3、4 各一份，60、55。折完得到 `[10,10,10,60,55,10,10,10]`——正是复制阶段的输入。这一步对应论文 §3.4 里「statistics collected during the online deployment」，把线上采到的逐副本负载还原成逐专家热度。
-
-### 就地映射：能不动的专家就别动
-
-装箱只决定「某专家落哪张卡」，没决定「落哪个槽位」。这里有优化空间：如果一个专家新方案里还在原来那张卡，就让它**留在原槽位**，权重根本不用搬。只有跨卡新来的副本才触发 D2D 拷贝。`constraint_expert_local_exchange` 干的就是这个：
+**出门：就地映射。** 装箱只决定「专家落哪张卡」，没决定「落哪个槽」——槽位是白送的自由度，就地映射把它全部花在「少搬」上：新方案里没换卡的专家留在原槽位，权重一个字节都不动；只有跨卡新到的副本才触发 D2D 拷贝。
 
 <!-- trace: constraint-local-exchange -->
 
@@ -354,162 +171,43 @@ def add_redundant(current_expert_table, expert_workload, num_original_expert):
 | card0 | [3,4,1,2,1] | [3,4,7,5,1] | {3,4,1} | [7,5] | [3,4,1,7,5] | 2 |
 | card1 | [0,5,6,7,5] | [4,3,6,2,0] | {6,0} | [4,3,2] | [0,4,6,3,2] | 3 |
 
-card0 的新集合 `{3,4,7,5,1}` 里，3、4、1 本来就在 card0 → 保留在原槽位；只有 7、5 是新到，填进 2、1 让出的空槽 → 只触发 2 次 D2D 拷贝。card1 同理保留 6、0，新到 4、3、2，3 次拷贝。相比「整卡重灌 5 个」，就地映射把本层搬运量从 10 降到 5——直接对应第 10 章 D2D 搬运器要拷的权重块数。
+card0 的新集合 `{3,4,7,5,1}` 里，3、4、1 本来就在 card0 → 原槽不动；只有 7、5 是新到，填进 2、1 让出的空槽，2 次拷贝。card1 同理保留 6、0，新到 3 次。相比「整卡重灌 10 份」，本层搬运量降到 5——这直接就是[第 10 章](../../ch10-eplb-expert-load-balancing/narrative/chapter.md)的 D2D 搬运器要拷的权重块数。不变量一句：新旧集合等大，保留数 + 新到数 = 槽数，填充恰好用尽——输出必是装箱集合的一个排列，一个专家都不多不少（下一章的放置合法性校验与这条不变量互为保障）。
 
-```python
-# vllm_ascend/eplb/core/policy/policy_default_eplb.py:L250-L281
-@staticmethod
-def constraint_expert_local_exchange(current_expert_table, global_deployment):
-    for layer_id in range(len(global_deployment)):
-        for card_id in range(len(global_deployment[layer_id])):
-            current_list = [int(x) for x in current_expert_table[layer_id][card_id]]
-            new_list = [int(x) for x in global_deployment[layer_id][card_id]]
-            num = len(new_list)
+到这里，黑盒的输出成形——一张「卡 × 槽 → 逻辑专家 id」的放置表：
 
-            new_index = [-1] * num
-            new_result = [-1] * num
-            remaining_elements = []
+![rebalance_experts 的最终输出是一张放置表：2 卡 × 5 槽，格内为逻辑专家 id，原位保留与跨卡新到一目了然，专家 3、4 的两份副本各自分居两卡](../diagrams/fig-eplb-placement-grid.png)
 
-            for i in range(num):
-                flag = True
-                for j in range(num):
-                    if new_list[i] == current_list[j] and new_index[j] == -1:
-                        new_index[j] = 0
-                        new_result[j] = current_list[j]
-                        flag = False
-                        break
-                if flag:
-                    remaining_elements.append(new_list[i])
-
-            index = 0
-            for k in range(num):
-                if new_result[k] == -1:
-                    new_result[k] = remaining_elements[index]
-                    index += 1
-
-            global_deployment[layer_id][card_id] = new_result
-
-    return global_deployment
-```
-
-第一个双重循环给每个新专家在旧列表 `current_list` 里找一个「未被占用的同 id 槽位」占住——对上就 `new_result[j] = current_list[j]`（原位保留），对不上的进 `remaining_elements`（新到）。第二个循环把新到的依次填进仍为 `-1` 的空槽。因为新集合与旧集合等大，保留数 + 新到数 = 槽数、空槽数 = 新到数，填充恰好用尽、无溢出——输出必是新集合的一个排列。第 10 章的 `check_expert_placement` 还会硬性拒绝「同卡内专家挪位」的非法方案，与这步互为保障。
-
----
-
-## 六、编排与变更闸门：什么时候才值得迁
-
-前面五步拆开讲完了。`rebalance_experts` 是把它们串起来的编排函数，也是第 10 章那个黑盒的真身。它还多做一件事——**决定这次到底迁不迁**。
-
-```python
-# vllm_ascend/eplb/core/policy/policy_default_eplb.py:L283-L350
-def rebalance_experts(self, current_expert_table, expert_workload):
-    info = DynamicTable()
-    info.workload_table = np.array(expert_workload)
-    info.placement_table = np.array(current_expert_table)
-    layer_num, num_npus, experts_per_npu = info.workload_table.shape
-    row = cast(np.ndarray, info.placement_table[0])
-    expert_ids, counts = np.unique(row, return_counts=True)
-    num_redundancy_expert = self.get_redundant_num(num_npus, counts)
-    num_original_expert = len(expert_ids)
-    layer_workloads = self.add_redundant(info.placement_table, info.workload_table, num_original_expert)
-    max_heat_per_layer_before = self.calculate_max_heat_per_layer(info.workload_table, layer_num)
-    npu_heat_all_origin = sum(max_heat_per_layer_before)
-    # … 省略：入参校验（专家数一致 / NPU>0 / NPU≥冗余数）…
-    global_deployment: list[list[list[int]]] = [[[] for _ in range(num_npus)] for _ in range(layer_num)]
-    max_heat_per_layer_after = np.zeros([layer_num])
-    for layer in range(layer_num):
-        weights = np.zeros((expert_num,), dtype="object")
-        for expert_id, workload_weight in enumerate(layer_workloads[layer]):
-            weights[expert_id] = (expert_id, workload_weight)
-
-        result, layer_deployment = self.original_compute_balanced_pack_redundancy(
-            weights, num_npus, num_redundancy_expert
-        )
-
-        global_deployment[layer] = layer_deployment
-        max_heat_per_layer_after[layer] = max(result, key=lambda x: x["total_weight"])["total_weight"]
-
-    new_global_deployment = self.constraint_expert_local_exchange(current_expert_table, global_deployment)
-    # Obtain the priority of each layer
-    layer_changed_ratio = []
-    for layer_idx in range(layer_num):
-        layer_changed_ratio.append(max_heat_per_layer_after[layer_idx] / max_heat_per_layer_before[layer_idx])
-
-    per_layer_priority = np.argsort(layer_changed_ratio)
-    npu_heat_all_after = sum(max_heat_per_layer_after)
-
-    change = 0
-    if npu_heat_all_after < 0.95 * npu_heat_all_origin:
-        change = 1
-
-    return change, per_layer_priority, np.array(new_global_deployment).tolist()
-```
-
-从头顺一遍，正好是前五节的串联：
-
-1. **反推冗余数**：`np.unique(row, return_counts=True)` 数第 0 层每个逻辑专家的物理副本数 `counts`，`get_redundant_num` 返回 $\sum(\mathrm{counts}-1)$ ——本例专家 1、5 各有 2 个副本，冗余数 = 2。
-2. **折叠热度**：`add_redundant`（第五节），得逐逻辑专家热度。
-3. **记录均衡前最热**：`calculate_max_heat_per_layer` 求每层最热卡负载，求和得 `npu_heat_all_origin`（本例 135）。
-4. **逐层规划**：对每层调 `original_compute_balanced_pack_redundancy`（第三、四节的复制 + 装箱），记均衡后每层最热 `max_heat_per_layer_after`（本例 87.5）。
-5. **就地映射**：`constraint_expert_local_exchange`（第五节）。
-6. **层优先级**：`layer_changed_ratio = 均衡后最热 / 均衡前最热`，`argsort` 得 `per_layer_priority`——改善越大（比值越小）的层排越前。因为一整轮迁移会被第 10 章的 D2D 搬运器逐层摊到多个 step，需要一个次序；优先迁改善最大的层，让每步搬运的边际收益最大。
-
-### 0.95 变更闸门
-
-最后是那个 `change`。热迁移本身有代价——D2D 拷贝、一致性风险。小打小闹的改善不值得折腾。所以有个死区：**只有均衡后总最热卡负载降到均衡前的 95% 以下，才置 `change=1`**。
-
-$$
-\mathrm{change} = 1 \iff \mathrm{npu\_heat\_all\_after} < 0.95 \times \mathrm{npu\_heat\_all\_origin}
-$$
-
-（对应 §3.4「adjusted periodically based on observed loads」——周期性评估、但不是每次都动。）本例阈值 $0.95 \times 135 = 128.25$ ，而均衡后是 87.5，改善比 $87.5/135 = 0.648$ ，远低于 0.95，闸门放行，`change=1`。这 5% 的死区抑制了抖动：负载轻微波动时不会来回搬专家。
+**最后一道闸：0.95。** 全流程串起来是五步：
 
 ![rebalance_experts 五步编排 + 0.95 变更闸门判定](../diagrams/fig34-5-orchestration.png)
 
-图里把五步串成流水线，末端那个判定框正是这道闸——本例降幅 35%，闸门开，迁。
+热迁移本身有代价——D2D 拷贝、切换窗口的一致性风险——小打小闹的改善不值得折腾。于是设一个死区：记均衡前、后「逐层最热卡负载之和」为 $`H_{before}`$ 与 $`H_{after}`$ ，仅当 $`H_{after}`$ 压到 $`0.95\,H_{before}`$ 以下才置 `change = 1` 、真正触发迁移（对应 §3.4「adjusted periodically」——周期性评估，但不是每次都动）。本例阈值 $`0.95 \times 135 = 128.25`$ ，均衡后 87.5，改善比 $`87.5/135 = 0.648`$ ，闸门放行。这 5% 的死区是一层迟滞：「新方案更好」与「好到值得搬一次」是两个判据，负载轻微波动时不会来回搬专家。编排还顺手给出逐层迁移次序 `per_layer_priority` ：按「均衡后最热 / 均衡前最热」的改善比排序，改善越大的层排越前——一整轮迁移会被[第 10 章](../../ch10-eplb-expert-load-balancing/narrative/chapter.md)的搬运器摊到多个 step 逐层执行，先迁改善最大的层，每一步的边际收益最大。
 
 ---
 
-## 七、两种论文策略，与落地的「全局」这一支
+## 六、两种论文策略：分层与全局
 
-到这里，`rebalance_experts` 的算法本体讲透了。但有一处必须对读者诚实交代：论文附带的 deepseek-ai/EPLB 参考实现里其实给了**两种**打包策略，而昇腾的 `DefaultEplb` 只落地了其中一支。
+最后一处必须对读者诚实交代：论文附带的 deepseek-ai/EPLB 参考实现里其实给了**两种**打包策略，而昇腾的 `DefaultEplb` 只落地了其中一支。
 
 > **Hierarchical Load Balancing** — When the number of server nodes divides the number of expert groups, we use the hierarchical load balancing policy ... We first pack the expert groups to nodes evenly ... Then, we replicate the experts within each node. Finally, we pack the replicated experts to individual GPUs ...
 >
 > **Global Load Balancing** — In other cases, we use the global load balancing policy that replicates the experts globally regardless of expert groups, and pack the replicated experts to individual GPUs.
 
-区别在**要不要按 expert group 绑节点**（这里的「专家组」指路由时预先把 $N_r$ 个专家分成若干组、token 先选组再在组内选 top-K 的分组路由，即 group-limited routing——这一路由方式源自 DeepSeek-V2（arXiv:2405.04434）提出的 device-limited routing，本章不展开其构造，只借用这个「先选组、再组内选」的直觉；「按组绑节点」就是让同组专家落在同一节点，减少跨节点通信）。**分层策略**先把专家组均匀摊到节点、组内复制、再摊到卡——利用 group-limited routing 减少跨节点流量，适合 prefill（预填充）阶段的小 EP。**全局策略**无视分组，全局复制 + 全局贪心装箱，适合 decode（解码）阶段的大 EP。
-
-分层策略落地后，放置表具体长什么样？deepseek-ai/EPLB 参考实现的 README 给出过一个具体例子——2 层 MoE、每层 12 个逻辑专家、4 个冗余名额（共 16 个物理副本），按分层策略摊到 2 个节点 × 4 GPU 的放置网格：
+区别在**要不要按 expert group 绑节点**。「专家组」指路由时预先把专家分成若干组、token 先选组再在组内选 top-K 的分组路由（group-limited routing，源自 DeepSeek-V2（arXiv:2405.04434）提出的 device-limited routing——本章不展开其构造，借用「先选组、再组内选」的直觉即可）；「按组绑节点」让同组专家落在同一节点，省跨节点通信。**分层策略**先把专家组均匀摊到节点、组内复制、再摊到卡，适合 prefill（预填充）阶段的小规模 EP；**全局策略**无视分组、全局复制 + 全局装箱，适合 decode（解码）阶段的大规模 EP。README 给过一个分层输出的实物——2 层 MoE、每层 12 个逻辑专家、4 个冗余名额（共 16 个物理副本）摊到 2 个节点 × 4 GPU：
 
 ![按 deepseek-ai/EPLB README Fig.1（arXiv:2412.19437 附属参考实现）描述重绘：分层策略示例——16 个物理副本摊到 2 节点 × 4 GPU 的放置网格](../diagrams/paper-fig-1.png)
 
-图里每个格子的数字，就是 `phy2log` 张量在那个（节点、GPU、槽位）位置写下的逻辑专家 id——比如节点 0 的 GPU 0 与 GPU 1 各有一格填了「5」（GPU 0 那格旁边是专家 6），这是专家 5 的两份冗余副本——被分摊到同一节点内的两个不同 GPU 上，正是复制要把负载摊开、副本不共卡的体现。这张图具体化的是**分层**策略的输出，正好用来对比：本章 `DefaultEplb` 走的**全局**策略不做这层节点分组，是把全部专家副本直接摊到所有 GPU 上，不会出现图中这种「按节点成块」的规整网格。
-
-本章从头到尾讲的复制 + 装箱，走的正是**全局**这一支。昇腾的 `DefaultEplb` 并没有实现分层的 group→node 绑定——它就是全局复制 + 全局贪心。这不是遗漏，而是设计选择：`DefaultEplb` 定位为通用的全局规划器。这一点在 `PolicyFactory` 的分发表里看得清楚：
-
-```python
-# vllm_ascend/eplb/core/policy/policy_factory.py:L14-L27
-policy: dict[int, type[EplbPolicy]] = {
-    0: RandomLoadBalance,  # RandomLoadBalance: shuffle last physical expert on NPU 1 and 3
-    1: DefaultEplb,  # Dynamic EPLB policy: overall expert replacement based on current moe load
-    2: SwiftBalanceEplb,
-    3: FlashLB,
-}
-```
-
-`policy_type=1` 的注释写得明白：`overall expert replacement based on current moe load`——「overall」（全局）正对应论文的 global 一支。这个 `DefaultEplb` 是昇腾在 vLLM 之外自带（out-of-tree）的规划器实现：它把 DeepSeek-V3 / deepseek-ai/EPLB 的全局均衡思路移植成一份独立的 NumPy 代码，作为 `PolicyFactory` 的默认策略落地（工厂里还有 random / swift / flashlb 三种备选，分发机制留到下一章展开）。
+图里每格的数字就是 `phy2log` 张量（物理槽位 → 逻辑专家 id 的映射）在那个（节点、GPU、槽位）位置写下的逻辑专家 id——节点 0 的 GPU 0 与 GPU 1 各有一格「5」，是专家 5 的两份冗余副本被摊到同节点内的两张不同 GPU 上：复制摊负载、副本不共卡，与本章的推导一脉相承。差别在「按节点成块」的规整分区：本章 `DefaultEplb` 走的是**全局**一支，不做 group→node 绑定，把全部副本直接摊到所有卡上——它在策略工厂 `PolicyFactory` 的分发表里是 `policy_type = 1` 的默认策略，代码注释自述「overall expert replacement based on current moe load」，「overall」正对应论文的 global。这是设计选择而非遗漏：`DefaultEplb` 定位为不依赖分组路由的通用全局规划器；工厂里其余几种备选策略与分发机制，落地见[第 10 章](../../ch10-eplb-expert-load-balancing/narrative/chapter.md)。
 
 ---
 
-## 小结：黑盒里装的，是一套「削峰 + 铺平」的贪心
+## 小结：一条地板定理，两段贪心
 
-回到开头那个黑盒。本章把 `rebalance_experts` 这个「给放置表、还放置表」的函数拆开，看到里面是一条清清爽爽的贪心流水线：
+回到开头那个黑盒。 `rebalance_experts` 拆开之后，全部内容都挂在同一条定理上—— **均值是地板**： $`\max_g L_g \ge \sum_e w_e / G`$ ，且分母全程守恒（复制只摊薄、装箱只挪位，总热度 175 不增不减），所以 par = 最热/平均就是「距地板几倍」的读数，本例从 1.543 出发。
 
-- **动机**：MoE 专家热度天生不均，最热的卡拖慢整批，用 par = 最热/平均量化（本例 1.543）。
-- **目标**：最小化最热卡负载 $\max_g L_g$ ，理想下界是总热度均分（本例 87.5）；单体超份额的专家「只搬不复制」无解——这是冗余专家策略的数学理由。
-- **复制**：每轮把名额发给当前最热专家、按副本数 $(k+1)/(k+2)$ 摊薄，等价于「锯最长的木板」（专家 3、4 各减半）。
-- **装箱**：LPT 贪心，重的先放、轻的填最空箱，同专家副本不共卡（本例装成 87.5/87.5，命中下界，par→1.0）。
-- **省搬运 + 闸门**：就地映射把没必要搬的权重留在原地，0.95 死区决定小改善不迁。
+- **纯搬运够不着地板**：热度整块不可拆，本例只搬的极限是 90 > 87.5；单体超份额时更是必败。复制买的是**可分性**（60 → 30 + 30）——这是「冗余专家」策略存在的数学理由。
+- **削峰**：每轮把名额发给当前最热的专家，平均热度按 $`(k+1)/(k+2)`$ 摊薄，最大单副本平均热度单调不增。
+- **铺平**：LPT 降序填最轻卡，「副本不共卡」兑现摊薄；本例装成 87.5/87.5，贴地，par → 1.0。
+- **收尾**：槽位自由度全部换成搬运量（10 → 5）；0.95 死区当迟滞，本例改善比 0.648 远低于阈值，`change = 1` 放行。
 
-规划器算出的这张新放置表和 `change` 标志，交给[下一章那台迁移机器](../../ch10-eplb-expert-load-balancing/narrative/chapter.md)——由它的 updator 节拍、子进程队列、D2D 搬运器，把专家权重真正在卡间搬到位。规划与搬运，一静一动，合起来才是完整的 EPLB。
+规划器算出的这张放置表和 `change` 标志，交给[下一章那台迁移机器](../../ch10-eplb-expert-load-balancing/narrative/chapter.md)——由它的 updator 节拍、子进程队列、D2D 搬运器，把专家权重真正在卡间搬到位。规划与搬运，一静一动，合起来才是完整的 EPLB。

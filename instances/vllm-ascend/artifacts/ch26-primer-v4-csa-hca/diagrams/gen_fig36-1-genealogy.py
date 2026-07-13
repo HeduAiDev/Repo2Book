@@ -11,8 +11,8 @@ TITLE = "MLA -> DSA -> CSA/HCA:三代压缩沿正交轴推进,V4 把前两条线
 SUBTITLE = "每一代压缩的是不同的一维;轴彼此正交,故可以逐代叠加而不冲突"
 
 STAGES = [
-    ("MLA", "压 KV 维度到低秩 latent", "轴:每 token 的 KV 维度", "#2563eb", "第31章"),
-    ("DSA", "lightning indexer +\ntop-k 稀疏选块", "轴:看哪些 token", "#7c3aed", "第32章"),
+    ("MLA", "压 KV 维度到低秩 latent", "轴:每 token 的 KV 维度", "#2563eb", "第21章"),
+    ("DSA", "lightning indexer +\ntop-k 稀疏选块", "轴:看哪些 token", "#7c3aed", "第23章"),
     ("CSA", "每 m=4 token 压 1 条\n+ DSA top-k 稀疏", "轴:序列长度 + 复用选块", "#059669", "本章"),
     ("HCA", "每 m'=128 token 压 1 条\n+ 稠密 MQA", "轴:序列长度(更狠)", "#d97706", "本章"),
 ]

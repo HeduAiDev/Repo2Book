@@ -5,14 +5,22 @@
 禁用 §N.M 徽标,站牌改用标题词本身;符号真实性核对改对 book/papers/ch26-primer-
 quantization/*.md 论文包 + 正文(lint_chapter_map.py 对 kind=primer 章的口径)。
 
+2026-07-14 改版说明:writer 重构后 §八「落地：vllm 量化子系统的调用面」被收窄成
+「FP8 与 e8m0：连 scale 本身也要量化」单一主题——原「统一插座 quant_config→
+apply」子节(含 base_config.py 代码块)被删成正文末尾一句带过的指路句,不再是一段
+独立可画的机制;GPTQ/AWQ 两节里指代具体 kernel 符号的 `ops.gptq_gemm`/
+`ops.awq_gemm` 也随之被替换成更朴素的一句"由 gptq.py/awq.py 消费"。于是原先的
+"comparison→surface(统一调用面)→fp8e8m0"三级落地被压成"comparison→fp8e8m0"
+两级——不再有独立的"统一调用面"站,少一个节点。
+
 形状:一个真实的"共享底座→三分支→再汇合→落地"剖面,不是单纯按阅读顺序摆成一条
 直线——§二/§三共用同一段 quant_utils 参考实现(group_size 就是粒度旋钮),GPTQ/AWQ/
 SmoothQuant 三法(§四/五/六)各自的数学都是在这同一份均匀量化网格上做误差控制,
-§七的同台称重把三法的参考实现重跑一遍摆在一起比,§八先讲三法共享的 quant_config→
-apply 统一插座,FP8 的 e8m0 装载(仍在§八)是这个插座具体落到 FP8 时的一个特例分支。
-三层泳道(底座/三法/落地)堆叠,天然产生斜线连边(上层→下层),不需要额外的桥接带
-——这就是模板本身(entry/dispatch→fast_attn/full_attn→fast_kernel/full_kernel→exit)
-已经支持的形状,只是把两分支扩到三分支。
+§七的同台称重把三法的参考实现重跑一遍摆在一起比,§八收口到 FP8 的 e8m0 装载
+(scale 自身也要被量化到 2 的幂网格)。三层泳道(底座/三法/落地)堆叠,天然产生
+斜线连边(上层→下层),不需要额外的桥接带——这就是模板本身(entry/dispatch→
+fast_attn/full_attn→fast_kernel/full_kernel→exit)已经支持的形状,只是把两分支
+扩到三分支、末端收成一站而非两站。
 
 阅读路线底部时间轴改用独立均匀分布(不复用图上节点列号)——GPTQ/AWQ/SmoothQuant
 三个节点共享同一列(col=1,只是行不同),若路线条也用列号,三个站牌会叠在同一 x 位置。
@@ -34,38 +42,39 @@ def cjk_text_width(s, size):
 
 
 # ---------------- DATA(本章数据) ----------------
-LANES = ["均匀量化底座", "三种误差控制法(论文数学 + vLLM 参考实现)", "vLLM 统一落地面"]
+LANES = ["均匀量化底座", "三种误差控制法(论文数学 + vLLM 参考实现)", "同台称重与 FP8 收口"]
 
 # (节点id, 泳道下标, 列, 泳道内行号, 真实符号名, 一行短语, 站牌文字)
 NODES = [
-    ("base",        0, 0, 0, "w_s / group_size",     "scale/zp 底座 + 粒度旋钮",   "均匀底座与粒度"),
-    ("gptq",        1, 1, 0, "ops.gptq_gemm",         "Hessian 二阶补偿",           "GPTQ"),
-    ("awq",         1, 1, 1, "ops.awq_gemm",          "激活感知缩放",               "AWQ"),
-    ("smoothquant", 1, 1, 2, "fp8_max",               "难度迁移到权重",             "SmoothQuant"),
-    ("comparison",  2, 2, 0, "w_ref",                 "同制式内比 RTN",             "三法同台称重"),
-    ("surface",     2, 3, 0, "quant_method.apply",    "统一插座,按层分发",          "统一调用面"),
-    ("fp8e8m0",     2, 4, 0, "float8_e8m0fnu",        "scale 取整 2 的幂",          "FP8 e8m0 装载"),
+    ("base",        0, 0, 0, "w_s / group_size",  "scale/zp 底座 + 粒度旋钮",   "均匀底座与粒度"),
+    ("gptq",        1, 1, 0, "gptq.py",            "Hessian 二阶补偿",           "GPTQ"),
+    ("awq",         1, 1, 1, "awq.py",             "激活感知缩放",               "AWQ"),
+    ("smoothquant", 1, 1, 2, "fp8_max",            "难度迁移到权重",             "SmoothQuant"),
+    ("comparison",  2, 2, 0, "w_ref",              "同制式内比 RTN",             "三法同台称重"),
+    ("fp8e8m0",     2, 3, 0, "use_ue8m0",          "scale 取整 2 的幂",          "FP8 e8m0"),
 ]
 EDGES = [  # (src_id, dst_id) —— 调用边,统一主线蓝
     ("base", "gptq"), ("base", "awq"), ("base", "smoothquant"),         # 三法共享同一份均匀量化网格
     ("gptq", "comparison"), ("awq", "comparison"), ("smoothquant", "comparison"),  # 同台称重重跑三法参考实现
-    ("comparison", "surface"),   # 从"离线算什么"过渡到"运行期怎么消费"(统一插座)
-    ("surface", "fp8e8m0"),      # FP8 是同一 apply 插座落到块量化时的具体装载分支
+    ("comparison", "fp8e8m0"),   # 称重收尾后收口到 FP8 块量化:scale 自身也要被量化
 ]
-# 阅读顺序上的 7 个站牌(与正文一~八节一一对应,granularity 并入 base 一站)
-READING_ORDER = ["均匀底座与粒度", "GPTQ", "AWQ", "SmoothQuant", "三法同台称重", "统一调用面", "FP8 e8m0 装载"]
+# 阅读顺序上的 6 个站牌(与正文二~八节对应,§一动机不设站、granularity 并入 base 一站,
+# §八已收窄为单一 FP8/e8m0 主题、不再单列"统一调用面"站——见文件头 2026-07-14 改版说明)
+READING_ORDER = ["均匀底座与粒度", "GPTQ", "AWQ", "SmoothQuant", "三法同台称重", "FP8 e8m0"]
 # (路线名, [站牌文字,...] 按阅读顺序取 READING_ORDER 的子序列, 是否高亮:True=实线蓝/False=虚线灰)
+# 三条路线逐字对应正文开篇的选读指引句:"读完二的底座后,四/五/六可以只挑感兴趣的
+# 读;只关心 FP8 块量化,读完底座直接跳八;想跟全程,就按序读到底。"
 ROUTES = [
     ("全程精读", READING_ORDER, True),
-    ("只读 AWQ 落地", ["均匀底座与粒度", "AWQ", "统一调用面"], False),
-    ("只看落地面", ["均匀底座与粒度", "三法同台称重", "统一调用面", "FP8 e8m0 装载"], False),
+    ("只挑一种误差控制法(如 AWQ)", ["均匀底座与粒度", "AWQ"], False),
+    ("只关心 FP8 块量化", ["均匀底座与粒度", "FP8 e8m0"], False),
 ]
 LEGEND = [
     ("#22c55e", "入口:从上一章的量化动机进入"),
-    ("#3b82f6", "章内主线:共享底座→三法→落地面"),
+    ("#3b82f6", "章内主线:共享底座→三法→同台称重→FP8 收口"),
     ("#f97316", "出口:回到 vLLM 统一调用面之外"),
 ]
-TITLE = "第 26 章 · 量化数学:均匀底座 → GPTQ/AWQ/SmoothQuant → vLLM 落地面剖面图"
+TITLE = "第 26 章 · 量化数学:均匀底座 → GPTQ/AWQ/SmoothQuant → FP8/e8m0 收口"
 
 # ---------------- 不可变:配色 ----------------
 C_ENTRY, C_EXIT, C_MAIN = "#22c55e", "#f97316", "#3b82f6"

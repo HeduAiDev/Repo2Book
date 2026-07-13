@@ -16,10 +16,13 @@
     两站单独一段,呼应正文「推导」与「数值推演」两个阶段;
     (节点符号用不带 § 的"2.3 Inference Costs"——本章自然标题,禁用 §N.M 徽标,
     §N.M 的正则连出现在节点主符号里也会被 lint 当成违规徽标拦下。)
-  段2"落地代码链"——造 indexer key(indexer_select_pre_process)→ 打分+top-k
-    一体算子(npu_quant_lightning_indexer)→ top-k 索引→稀疏注意力(cmp_sparse_indices)
-    → 层间复用 top-k(skip_topk),对应正文第七节四个 `### ` 子标题,一路都是真实
-    源码符号。
+  段2"落地代码链"——正文第七节("落地地图:三个算子落点")用"第一步/第二步/
+    第三步"三段散文(无 `### ` 子标题)串联:造打分对(indexer_select_pre_process)
+    → 打分+截断一体算子(npu_quant_lightning_indexer)→ 只算选中项
+    (cmp_sparse_indices 喂 attn_op),第三步内文顺带提到的省钱小机关"层间复用
+    top-k"(skip_topk/IndexCache)单独拆一个节点承接,四个节点站牌都改用散文里
+    的实际措辞("第一步·XX"/"第二步·XX"/"第三步·XX"/不冒充第四步的"层间复用"),
+    不再挂已被写手删掉的旧 `### ` 小标题原文,一路都是真实源码符号。
 两条跨段边:细粒度top-k选择→训练协同适配(对应正文原话"它凭什么不掉点？答案
 不在这一节——在下一节的训练协同适配");成本模型→造indexer key(对应正文"推导
 讲完，现在看这套数学在昇腾代码里怎么成真")。
@@ -58,13 +61,13 @@ NODES = [
     ("cost_model", 1, 1, 0, "2.3 Inference Costs",
      "k=512:主注意力降 256x,端到端 8.69x", "成本模型"),
     ("indexer_key", 2, 0, 0, "indexer_select_pre_process",
-     "投影→k_norm→RoPE,造 k^I", "造 indexer key"),
+     "投影→k_norm→RoPE,造 k^I", "第一步·造打分对"),
     ("fused_score_topk", 2, 1, 0, "npu_quant_lightning_indexer",
-     "点积→ReLU→加权求和→top-k,一算子全包", "打分 + top-k 一体算子"),
+     "点积→ReLU→加权求和→top-k,一算子全包", "第二步·打分 + 截断"),
     ("sparse_attn", 2, 2, 0, "cmp_sparse_indices",
-     "top-k 索引喂入 attn_op,只算选中 KV", "top-k 索引 → 稀疏注意力"),
+     "top-k 索引喂入 attn_op,只算选中 KV", "第三步·只算选中项"),
     ("layer_reuse", 2, 3, 0, "skip_topk",
-     "IndexCache 层间复用,省一次打分", "层间复用 top-k"),
+     "IndexCache 层间复用,省一次打分", "层间复用(顺带省一次打分)"),
 ]
 EDGES = [  # (src_id, dst_id) —— 调用边;同段=段内左→右主线蓝,跨段=桥接带竖向蓝
     ("motivation", "nsa_framework"),
@@ -79,7 +82,7 @@ EDGES = [  # (src_id, dst_id) —— 调用边;同段=段内左→右主线蓝,�
 ]
 BRIDGE_CAPTIONS = {
     ("topk_cut", "coadapt"): "它凭什么不掉点？答案在训练协同适配",
-    ("cost_model", "indexer_key"): "推导讲完，看这套数学在昇腾代码里怎么成真",
+    ("cost_model", "indexer_key"): "推导到此收线，这套数学落进三步主链",
 }
 # 阅读顺序上的 10 个站牌(与正文 一/二/三/四/五/六/七的四个子标题 一一对应),
 # 用于底部阅读路线的独立时间轴——不复用图上节点的段内列号(折段后同一列号被

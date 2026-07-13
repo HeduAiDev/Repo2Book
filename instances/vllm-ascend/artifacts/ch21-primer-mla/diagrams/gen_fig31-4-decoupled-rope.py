@@ -11,12 +11,13 @@ PAD, TOP, PANEL_W = 40, 96, 360
 BOX_W, BOX_H, VGAP = 320, 50, 26
 w = PAD * 2 + PANEL_W * 2 + 90
 
-L = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} 640">',
+H = 486  # 删掉底部「端到端 0.0 验证」黄框后(重设计:禁 float64/0.0 仪式),画布随之收口
+L = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {H}">',
      '<defs><marker id="a" viewBox="0 0 10 6" refX="9" refY="3" markerWidth="6" '
      'markerHeight="4" orient="auto"><path d="M0,0 L10,3 L0,6 Z" fill="#64748b"/></marker></defs>',
-     f'<rect width="{w}" height="640" fill="white"/>',
+     f'<rect width="{w}" height="{H}" fill="white"/>',
      f'<text x="{PAD}" y="30" font-family="sans-serif" font-size="17" font-weight="bold" '
-     f'fill="#0f172a">{esc("为何需要解耦 RoPE:旋转矩阵夹在中间,权重吸收就此失效")}</text>']
+     f'fill="#0f172a">{esc("为何需要解耦 RoPE:中间块变成 M(δ)——常量性被破坏,吸收失效")}</text>']
 
 def panel_title(px, cx, title, color):
     L.append(f'<rect x="{px}" y="{TOP-46}" width="{PANEL_W}" height="30" rx="6" fill="{color}"/>')
@@ -45,8 +46,8 @@ px1 = PAD
 cx1 = px1 + PANEL_W/2
 panel_title(px1, cx1, "直接对 k^C 加 RoPE(破坏吸收)", "#b91c1c")
 left_steps = [
-    "q_t^T k_j^rope = h_t^T(W^Q)^T R_(j-t) W_UK c_j",
-    "旋转矩阵 R_(j-t) 夹在 (W^Q)^T 与 W_UK 之间",
+    "q_t^T k_j^rope = c_t^Q^T (W^UQ)^T R_(j-t) W_UK c_j",
+    "旋转矩阵 R_(j-t) 夹在 (W^UQ)^T 与 W_UK 之间",
     "M(δ)随δ变:M(0)[0,0]=-0.5378\nM(3)[0,0]=0.6912",
 ]
 y = TOP
@@ -102,14 +103,6 @@ for d, v in deltas:
     L.append(f'<text x="{bx+bar_w/2}" y="{bar_top+bar_h_scale+20}" text-anchor="middle" '
              f'font-family="sans-serif" font-size="12" fill="#64748b">{esc(f"δ={d}")}</text>')
     bx += bar_w + 30
-
-call_top = bar_top + bar_h_scale + 46
-call_w = w - 2*PAD
-L.append(f'<rect x="{PAD}" y="{call_top}" width="{call_w}" height="56" rx="10" '
-         'fill="#fef3c7" stroke="#d97706" stroke-width="2"/>')
-L.append(f'<text x="{PAD+call_w/2}" y="{call_top+34}" text-anchor="middle" font-family="sans-serif" '
-         f'font-size="13" font-weight="bold" fill="#92400e">'
-         f'{esc("端到端验证:解耦 RoPE 下 decode 增量计算 vs prefill 一次性计算,3 步最大绝对差 = 0.0")}</text>')
 
 L.append('</svg>')
 out = Path(__file__).with_name("fig31-4-decoupled-rope.svg")

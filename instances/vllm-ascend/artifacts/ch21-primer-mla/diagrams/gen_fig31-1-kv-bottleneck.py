@@ -21,7 +21,7 @@ L = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
      f'<text x="{PAD}" y="34" font-family="sans-serif" font-size="17" font-weight="bold" '
      f'fill="#0f172a">{esc("标准 MHA:每个 token 都要为每个头各留一份完整 K、V")}</text>',
      f'<text x="{PAD}" y="54" font-family="sans-serif" font-size="12" '
-     f'fill="#64748b">{esc("像给每位到场嘉宾发一张完整名片并全程留底——嘉宾越多,抽屉越满")}</text>']
+     f'fill="#64748b">{esc("每头各存一份完整 K、V——随头数与上下文长度双重线性")}</text>']
 
 # --- Row 1: flow  h_t -> n_h heads -> k_i,v_i(全部写入缓存) ---
 FLOW_TOP = 84
