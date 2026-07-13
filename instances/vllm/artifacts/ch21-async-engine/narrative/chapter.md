@@ -187,7 +187,7 @@ def execute_model(
 
 ### 它到底省了多少
 
-把这套机制的收益写成可比较的量级。设接收方在 `irecv` 之后、读 `.tensors` 之前那段准备工作耗时 $t_{\mathrm{prep}}$ ，NCCL 接收耗时 $t_{\mathrm{recv}}$ 。
+把这套机制的收益写成可比较的量级。设接收方在 `irecv` 之后、读 `.tensors` 之前那段准备工作耗时 $`t_{\mathrm{prep}}`$ ，NCCL 接收耗时 $`t_{\mathrm{recv}}`$ 。
 
 朴素阻塞写法的关键路径是「先等收完，再准备」，两段串起来。惰性写法让两者并行，关键路径降到两段中较长的那段：
 
@@ -197,7 +197,7 @@ t_{\mathrm{naive}} = t_{\mathrm{recv}} + t_{\mathrm{prep}}
 t_{\mathrm{overlapped}} = \max(t_{\mathrm{recv}},\, t_{\mathrm{prep}})
 $$
 
-省下的就是两段里较短的那段。举个数：若接收 0.3ms、准备 0.2ms，朴素写法每格花 0.5ms，惰性写法只花 $\max(0.3, 0.2)=0.3$ ms，省掉 0.2ms——这 0.2ms 乘以 PP 的 stage 数、再乘以每秒成千上万拍，省下来的就很可观。
+省下的就是两段里较短的那段。举个数：若接收 0.3ms、准备 0.2ms，朴素写法每格花 0.5ms，惰性写法只花 $`\max(0.3, 0.2)=0.3`$ ms，省掉 0.2ms——这 0.2ms 乘以 PP 的 stage 数、再乘以每秒成千上万拍，省下来的就很可观。
 
 一句人话：**只要准备工作和接收能并行，bubble 就缩短一段准备时间**。但它不改变 PP 固有的首尾填充开销——第一拍总得有人先把流水线灌满，这部分惰性帮不上忙。
 
@@ -214,7 +214,7 @@ GPU、NCCL 都在容器里，但这套控制流是纯 Python，可以在普通�
 
 ## DP wave 共识：让多个引擎齐步走
 
-切换到第二个机制。数据并行下，整个引擎被复制成 $N$ 份（DP rank 0 到 $N-1$ ），每份独立吃请求。问题来了：**为什么这些独立的引擎还需要互相同步？**
+切换到第二个机制。数据并行下，整个引擎被复制成 $`N`$ 份（DP rank 0 到 $`N-1`$ ），每份独立吃请求。问题来了：**为什么这些独立的引擎还需要互相同步？**
 
 答案藏在 MoE（mixture of experts）里。MoE 层每个 token 只激活一小批专家，路由函数决定送给哪个；而专家切到多个 DP rank 上时，token 不可本地路由（token 在 rank 0、目标专家在 rank 2），只能**跨 rank 收发激活值**——这正是 all-to-all：每个 rank 把自己要发给别人的 token 切片打包，同时收取别的 rank 发来的。all-to-all 是集合操作，**要求全员到场**——如果 rank 0 还在跑第 100 步、rank 1 因为没请求提前退出了，rank 0 的 all-to-all 就会永远等不到 rank 1，整个集群 **hang 死**。
 
@@ -280,7 +280,7 @@ def run_busy_loop(self):
 1. **跑一步**：`_process_engine_step` 真去调度+执行一个 batch，返回有没有真跑（`executed`）。`_maybe_publish_request_counts` 把本引擎当前的 `[waiting, running]` 负载发给协调进程（仅在数字变化时发，省带宽）。
 2. **空转补齐**：如果本拍没真跑（`not executed`）但全局还在 running 状态，就跑一个 **dummy batch**。这是齐步走的关键——本引擎手头没 ready 请求，但别的引擎可能在跑 MoE all-to-all，需要本引擎到场凑数。dummy batch 是一个假的空 forward，专门用来维持各 rank 步调一致。要是连本引擎也没活、全局也不 running，那就 `continue` 真空转。
 3. **共识**：`_has_global_unfinished_reqs` 做 all-reduce，问全体「还有没有未完成请求」，结果写回 `engines_running`。
-4. **报暂停**：一旦共识判定全体没活了（`not engines_running`），由 **rank 0** 经 `output_queue` 报一条 `wave_complete=current_wave` 给协调进程，然后 `current_wave += 1`、`step_counter` 归零，开启下一个 wave。只有 rank 0 报，避免 $N$ 个 rank 重复上报。
+4. **报暂停**：一旦共识判定全体没活了（`not engines_running`），由 **rank 0** 经 `output_queue` 报一条 `wave_complete=current_wave` 给协调进程，然后 `current_wave += 1`、`step_counter` 归零，开启下一个 wave。只有 rank 0 报，避免 $`N`$ 个 rank 重复上报。
 
 ### 一次 all-reduce 解决两个共识
 
@@ -347,13 +347,13 @@ def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
 
 `step_counter` 不到 32 的整数倍时，**直接返回 `True`**——「假定还有活，继续跑」，根本不做 all-reduce。只有每 32 步那一次，才真去同步。
 
-这个权衡可以量化。设单步耗时 $t_{\mathrm{step}}$ 、一次 all-reduce 耗时 $t_{\mathrm{ar}}$ ，则均摊到每步的同步开销是：
+这个权衡可以量化。设单步耗时 $`t_{\mathrm{step}}`$ 、一次 all-reduce 耗时 $`t_{\mathrm{ar}}`$ ，则均摊到每步的同步开销是：
 
 $$
 \overline{t_{\mathrm{sync}}} = \frac{t_{\mathrm{ar}}}{32}
 $$
 
-通信开销直接降一个数量级。代价是**延迟发现**：某个 rank 真空闲下来后，最坏要再多跑 31 步 dummy batch，才轮到下一次 all-reduce 把它发现。用「最多 31 步无谓空转」换「同步开销降 32 倍」——对吞吐导向的引擎，这笔账划算。32 本身是经验常数：足够小使暂停延迟可接受，足够大使 all-reduce 开销摊薄到可忽略，没有 ablation，可由 `ParallelConfig` 修改。
+通信开销直接降一个数量级。代价是**延迟发现**：某个 rank 真空闲下来后，最坏要再多跑 31 步 dummy batch，才轮到下一次 all-reduce 把它发现。用「最多 31 步无谓空转」换「同步开销降 32 倍」——对吞吐导向的引擎，这笔账划算。32 本身是经验常数：足够小使暂停延迟可接受，足够大使 all-reduce 开销摊薄到可忽略，没有 ablation。它是 `core.py` 里的硬编码字面量（`self.step_counter % 32`），当前版本没有暴露成 `ParallelConfig` 字段，要调整只能改源码。
 
 ### 两阶段暂停：别被迟到的唤醒拉起
 
@@ -395,7 +395,7 @@ $$
 
 ## DP 协调进程与负载均衡
 
-最后一个机制。DP 部署是 **N 个前端 API server × M 个引擎** 的拓扑。前端要把请求分给最空的引擎，引擎要把 wave 状态同步给前端。如果让每个前端各自去和每个引擎 all-reduce、各自广播， $N \times M$ 条通路会乱成一团。
+最后一个机制。DP 部署是 **N 个前端 API server × M 个引擎** 的拓扑。前端要把请求分给最空的引擎，引擎要把 wave 状态同步给前端。如果让每个前端各自去和每个引擎 all-reduce、各自广播， $`N \times M`$ 条通路会乱成一团。
 
 vLLM 的做法是塞一个**独立的协调进程** `DPCoordinator` 居中：所有引擎把负载和 wave 信号汇报给它，它聚合后单点广播给所有前端。前端之间、引擎之间不直接对话，全走协调进程这个枢纽。
 
@@ -480,7 +480,7 @@ $$
 \mathrm{score} = 4 \cdot \mathit{waiting} + \mathit{running}
 $$
 
-`waiting`（排队等上车的请求）权重是 `running`（已在批次里跑的）的 **4 倍**。直觉是：一个 `waiting` 的请求要等当前整个 batch 跑完才有机会上车，它对尾延迟的贡献远大于一个已经在跑的请求。所以排队的请求被赋更高权重，引擎一旦积压排队就显得「更满」，新请求自然绕开它。
+`waiting`（排队等上车的请求）权重是 `running`（已在批次里跑的）的 **4 倍**。直觉是：即使有连续批处理（continuous batching），一个 `waiting` 的请求也要等到下一次调度决策、且 token 预算/KV 块有空位才能挤进 running，比一个已经在批次里跑的请求多一层不确定的排队延迟；`waiting` 队列积压得越深，这层不确定性越大。所以排队的请求被赋更高权重，引擎一旦积压排队就显得「更满」，新请求自然绕开它。
 
 举个数：三个引擎负载是 `[[2,1], [1,5], [0,0]]`，算分得 `[4·2+1, 4·1+5, 4·0+0] = [9, 9, 0]`。引擎 2 最空（0 分），新请求落到引擎 2。注意引擎 0 和引擎 1 同样是 9 分——引擎 0 有 2 个排队、引擎 1 有 5 个在跑，权重把它们拉平了，这正是 4:1 想表达的「排队 2 个 ≈ 在跑 8 个」的体感。
 

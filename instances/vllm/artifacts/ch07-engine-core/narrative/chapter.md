@@ -622,7 +622,7 @@ def call_utility(self, method: str, *args) -> Any:
 
 四步走：
 
-1. `call_id = uuid.uuid1().int >> 64`——生成一个唯一 id。`uuid.uuid1()` 产出 128 位 UUID，其高 64 位是时间戳 + 时钟序列，右移 64 位取的正是这部分，得到一个 64 位整数，可直接被 msgpack 原生编码、无需额外类型包装。RPC 频率远低于 UUID1 时间戳粒度，碰撞概率可忽略不计。
+1. `call_id = uuid.uuid1().int >> 64`——生成一个唯一 id。`uuid.uuid1()` 产出 128 位 UUID，按 RFC 4122 布局，高 64 位是 `time_low`+`time_mid`+`time_hi_and_version` 三段拼成的纯时间戳（不含时钟序列/MAC），右移 64 位取的正是这一段，得到一个 64 位整数，可直接被 msgpack 原生编码、无需额外类型包装；被丢弃的低 64 位才是 `clock_seq`（用来消解同一时间戳内碰撞）和 `node`（MAC 地址）。碰撞概率可忽略不计，理由不是时钟序列兜底，而是 RPC 调用频率远低于该时间戳的最小可分辨间隔（100ns 级）。
 2. 建一个空 `Future`，存进 `utility_results[call_id]`——这是"在此等待这个 id 的返回"的登记。
 3. `_send_input(UTILITY, (0, call_id, method, args))`——把 `(client_index, call_id, method, args)`（即客户端号、调用号、方法名、参数）当负载发出去。
 4. `future.result()`——**阻塞**等结果（同步版会卡住调用线程，直到 Future 被置值）。

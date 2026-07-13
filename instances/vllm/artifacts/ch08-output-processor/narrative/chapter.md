@@ -311,13 +311,13 @@ def check_stop_strings(
 
 > *图注：stop_str=`"ab"`（长 2）。Step 1 新增 1 个字符，搜索窗口（蓝色虚线框）覆盖末尾 2 个字符 `"zc"`，未命中。Step 2 新增 2 个字符 `'a'+'b'`，搜索窗口覆盖末尾 3 个字符 `"cab"`，命中 `"ab"`（红色高亮）。灰色 = 已被上一步扫过的旧字符，绿色 = 本步新增字符。窗口大小 = new\_char\_count + stop\_len − 1，始终精确覆盖跨步边界，不多扫也不漏扫。*
 
-**这把复杂度从平方级摊薄到线性级。** 朴素做法每步都重扫全文：第 $k$ 步扫 $k$ 个字符， $L$ 步累计起来是
+**这把复杂度从平方级摊薄到线性级。** 朴素做法每步都重扫全文：第 $`k`$ 步扫 $`k`$ 个字符， $`L`$ 步累计起来是
 
 $$
 \sum_{k=1}^{L} k = \frac{L(L+1)}{2} = O(L^2)
 $$
 
-只扫新增字符则每步成本约等于本步新增字符数，全序列累计起来就是各步新增之和，等于 $L$ 个字符的线性量级。一句话翻译：对一条 2000 token 的回答，朴素法约要做两百万次字符比较的量级，摊还法只做两千次量级。
+只扫新增字符则每步成本约等于本步新增字符数，全序列累计起来就是各步新增之和，等于 $`L`$ 个字符的线性量级。一句话翻译：对一条 2000 token 的回答，朴素法约要做两百万次字符比较的量级，摊还法只做两千次量级。
 
 返回的 `truncate_to` 是截断点：`include_in_output=False` 时停止串本身要被裁掉，把 `output_text` 截到停止串之前；`include_in_output=True` 且停止串已完整落在文本里则返回 `-1`（不裁）。
 
@@ -423,7 +423,7 @@ def make_request_output(
 
 **闸门一：`FINAL_ONLY`。** 如果调用方要的是非流式结果（只要最后一份完整输出），那中途每一步都直接 `return None`，只有 `finished` 时才往下走。这是离线批处理和"非流式 API 调用"的常态。
 
-**闸门二：`stream_interval` 节流。** 即便是流式（要逐步发），`stream_interval > 1` 时也不是每个 token 都发。发送只在三种情况：完成、首 token（`sent_tokens_offset == 0`）、或者攒够了 `stream_interval` 个新 token。直觉：把发送频率降到约 $1/k$ ，用稍高一点的中段延迟，换更低的 per-token 序列化/事件循环开销。高并发流式场景下，"每个 token 都造一个对象、过一遍队列、`yield` 一次"的固定开销不可忽视。
+**闸门二：`stream_interval` 节流。** 即便是流式（要逐步发），`stream_interval > 1` 时也不是每个 token 都发。发送只在三种情况：完成、首 token（`sent_tokens_offset == 0`）、或者攒够了 `stream_interval` 个新 token。直觉：把发送频率降到约 $`1/k`$ ，用稍高一点的中段延迟，换更低的 per-token 序列化/事件循环开销。高并发流式场景下，"每个 token 都造一个对象、过一遍队列、`yield` 一次"的固定开销不可忽视。
 
 这里的正确性关键是 `sent_tokens_offset`。DELTA 模式下，攒批之后**只发"从上次已发偏移到现在"的那段 token**，然后把偏移推进到当前位置。看这张决策表把它走一遍：
 
@@ -714,7 +714,7 @@ $ python3 -m pytest tests/ -q
 
 - **`process_outputs` 是唯一遍历整批的单循环**（`vllm/v1/engine/output_processor.py:L597`）。 V1 把对整批的 Python 循环压到最少——取 state、stats、prefill 翻转、去 token+停止串、logprobs、造输出/分发、完成清理，全在一个 for 里跑完（§8.3）。
 - **一套逻辑服务两条路径。** `queue is None` 一个判断，分出 AsyncLLM（入队）和 LLMEngine（返回列表），不写两套（§8.3）。
-- **增量去 token 是必须的，停止串检测是摊还 $O(L)$ 的。** 跨 token 文本边界相互依赖，所以维护解码状态；停止串只扫新增字符，避免重扫退化（§8.4）。
+- **增量去 token 是必须的，停止串检测是摊还 $`O(L)`$ 的。** 跨 token 文本边界相互依赖，所以维护解码状态；停止串只扫新增字符，避免重扫退化（§8.4）。
 - **三道闸门控制发不发。** FINAL_ONLY / stream_interval 节流 / `n>1` 父聚合，每道都能让本步不发；DELTA 靠 `sent_tokens_offset` 保证增量首尾相接（§8.5）。
 - **`RequestOutputCollector` 是 per-request 单槽邮箱。** `asyncio.Event` 唤醒、DELTA 归并做背压安全阀，让单生产者扇出 N 个消费者而互不干扰（§8.5.1）。这结清了第 4 章关于队列与生产者-消费者的两笔欠账。
 - **`n>1` 父聚合 + 三表注销** 收束了并行采样与请求生命周期（§8.6）。

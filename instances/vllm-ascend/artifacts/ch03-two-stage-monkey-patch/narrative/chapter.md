@@ -155,7 +155,7 @@ worker 段的触发点最朴素，就在 `NPUWorker.__init__` 里：
 为什么 worker 段要推迟到每个 worker 构造时，不能跟 platform 段一起在进程早期打完？两个原因：
 
 1. **它替换的符号构图阶段还用不到。** worker 段换的多是前向算子、模型层、通信器——这些在「搭引擎图」阶段还没被调用，推迟到 worker 里打来得及。
-2. **worker 子进程不继承父进程的 patch。** vLLM 用 spawn 起 worker 子进程，spawn 出来的是**全新的 Python 解释器**，父进程在内存里改过的名字绑定一概不带过去。所以哪怕 platform 段在主进程打过了，worker 段也必须在每个 worker 进程内**重新**触发一遍。
+2. **worker 段这批 patch，platform 段从来没打过，触发点天生就长在 worker 构造里。** 这跟 vLLM 起 worker 子进程用 fork 还是 spawn 无关——vLLM 默认走 `fork`（`VLLM_WORKER_MULTIPROC_METHOD` 默认值是 `"fork"`；只有命中 Ray actor、`--numa-bind`、CUDA/XPU 已初始化、WSL 这几种情况，`_maybe_force_spawn()` 才会把它强制切到 `spawn`——vllm-ascend 全仓没加任何 NPU 等价判据去强制 spawn，典型部署走的就是 fork）。fork 子进程是父进程内存的原样拷贝，**会**带走父进程此前已经打过的 patch（本章 §3.4 引用的 `patch_multiproc_executor.py` 里那行 `inherited_fds: list[int] | None = [] if context.get_start_method() == "fork" else None` 就是在处理 fork 这条真实分支）。但「带走」的前提是「父进程打过」——trigon / weight_utils / distributed 这批 worker 段 patch，platform 段的 `__init__.py`（[§3.3](#33-靠-import-副作用执行-patch)）里压根不 import 它们，只有 `NPUWorker.__init__` 里 `adapt_patch()` 那一行会去触发。所以不管走 fork 还是 spawn，主进程从来没打过这批 patch，子进程自然没有可以继承的东西——worker 段必须在每个 worker 进程内部第一次触发，根本原因是「触发点只挂在这里」，跟子进程是不是全新解释器无关。
 
 ## 3.3 靠 import 副作用执行 patch
 
@@ -523,7 +523,7 @@ wrapped() == "destroyed"                                     → True   # ④ wr
 
 这一章把 vllm-ascend「不改 vLLM 一行源码就整体接管」的招式总纲拆完了。三条主线收束成一句话：**一个五行入口 `adapt_patch`，靠一个布尔参数二分两段时机，靠 import 副作用执行 patch，靠五种重绑技法换掉具体符号。**
 
-- **时机**：platform 段卡在构图前（触发点①平台回调 + 触发点②子进程兜底，带 `_GLOBAL_PATCH_APPLIED` 幂等守卫）；worker 段卡在每个 worker 构造时——因为 spawn 子进程不继承父进程的 patch。
+- **时机**：platform 段卡在构图前（触发点①平台回调 + 触发点②子进程兜底，带 `_GLOBAL_PATCH_APPLIED` 幂等守卫）；worker 段卡在每个 worker 构造时——因为这批 patch 的触发点从一开始就只挂在 `NPUWorker.__init__` 里，platform 段从未打过它们，跟 vLLM 起子进程用 fork 还是 spawn 无关（vLLM 默认 fork，仅 Ray actor / `--numa-bind` / CUDA-XPU 已初始化 / WSL 时才强制 spawn）。
 - **触发**：没有 `apply()`，patch 全靠 import 包时的模块级副作用；`is_310p` / `HAS_TRITON` / `vllm_version_is` / 环境变量四个维度的条件加载，精确裁剪每个环境该打哪些 patch。本书钉死的 v0.21.0 基座上，`patch_v2` 整组被版本门控挡在门外。
 - **技法**：整类替换换类名（`patch_multiproc_executor.py`）；工厂替换连派发表一起改（`patch_mamba_manager.py`）；方法替换只换一个绑定方法（`patch_scheduler.py`）；库函数 wrapper 闭包包裹原 fn（`patch_triton.py`）；from-import 缓存陷阱要把同一对象的所有别名都重绑（`patch_distributed.py`）。
 

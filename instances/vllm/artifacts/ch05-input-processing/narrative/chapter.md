@@ -402,7 +402,7 @@ if decoder_inputs["type"] == "multimodal":
 
 > *图注：两张图（offset=5、offset=80）和一段音频（offset=40）交错出现。`argsort_mm_positions` 按 offset 升序，排成 image[0] → audio[0] → image[1]，展平成一条按序列位置有序的 `MultiModalFeatureSpec` 列表。*
 
-排序后逐个造 `MultiModalFeatureSpec`，每个 spec 打包了一个 item 的全部信息：数据本身、模态、缓存标识符、位置、哈希。展平的复杂度是 $O(M \log M)$ （ $M$ 是 item 总数），换来的是下游能单遍按序处理。
+排序后逐个造 `MultiModalFeatureSpec`，每个 spec 打包了一个 item 的全部信息：数据本身、模态、缓存标识符、位置、哈希。展平的复杂度是 $`O(M \log M)`$ （ $`M`$ 是 item 总数），换来的是下游能单遍按序处理。
 
 ### 5.7.2 缓存标识符里的 LoRA 前缀
 
@@ -531,7 +531,18 @@ def assign_request_id(request: EngineCoreRequest):
 
 > *图注：上半，`"req-abc"` 先拷进 `external_req_id`，再被改写成 `"req-abc-3f9a2b1c"`。下半是 n>1 的 fan-out（下一节展开）：父请求 `n=4` 裂成 4 个 `n=1` 子请求，子 id 加 `idx` 前缀；设了 seed 时子 i 取 `seed+i`（42/43/44/45），前三个走 `copy(request)`、最后一个复用父对象；底部说明子参数派生（seed=None 共享缓存 / seed 已设连号 / FINAL_ONLY 攒齐聚合）。*
 
-**为什么 8 个字符够？** `random_uuid()` 取 uuid4 的 hex（128 bit 随机），`:.8` 截前 8 个十六进制字符，即 32 bit 随机。注意目标不是「全局密码学唯一」——只是「在单实例内消歧外部重复的 id」。即便两个请求恰好都叫 `"req-abc"`，它们再撞上同一个 8 字符后缀的概率，按生日界（生日悖论的近似结论：n 个物件随机落入 s 个桶，任两个碰撞的概率约为 n²/2s，这里桶数 s 是 32 bit 空间 2³²）约为 $n^2 / 2^{33}$ ，小到可以忽略。这是个务实的工程取舍：不追求绝对唯一，只追求「实际上不会撞」。
+**为什么 8 个字符够？** `random_uuid()` 的实现并不是直接拿 uuid4 的完整 hex：
+
+```python
+# vllm/utils/__init__.py:L8-L12
+MASK_64_BITS = (1 << 64) - 1
+
+
+def random_uuid() -> str:
+    return f"{uuid.uuid4().int & MASK_64_BITS:016x}"  # 16 hex chars
+```
+
+先把 uuid4 生成的 128 bit 整数掩码到低 64 bit，再格式化成 16 个十六进制字符——也就是说这串字符串本身只携带 64 bit 随机性，不是「uuid4 的完整 128 bit hex」。`:.8` 截取的是这 64 bit 空间里最高的 32 bit。注意目标不是「全局密码学唯一」——只是「在单实例内消歧外部重复的 id」。即便两个请求恰好都叫 `"req-abc"`，它们再撞上同一个 8 字符后缀的概率，按生日界（生日悖论的近似结论：n 个物件随机落入 s 个桶，任两个碰撞的概率约为 n²/2s，这里桶数 s 是 32 bit 空间 2³²）约为 $`n^2 / 2^{33}`$ ，小到可以忽略。这是个务实的工程取舍：不追求绝对唯一，只追求「实际上不会撞」。
 
 开头那个 `if request.external_req_id is not None: raise` 是道防呆——`external_req_id` 是内部字段，调用方本不该设它；设了说明用法错了，早报早好。
 

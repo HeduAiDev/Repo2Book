@@ -139,6 +139,8 @@ MLA 的妙招叫**权重吸收（weight absorption）**：把「解压」这一�
 
 方法名就是「q 投影 + k 上投影」——它把这两件事合成了一个 `bmm`。注意：**吸收用的是 `torch.bmm`，不是某个 `torch_npu` 算子**。这是一次纯矩阵乘的批量版本，按头（`N`）批量做。
 
+这里的 `self.q_proj` 值得钉一句：构造函数里它是按 `q_lora_rank` 是否为 `None` 二选一绑定的——`self.q_proj = kwargs["q_proj"] if self.q_lora_rank is None else kwargs["q_b_proj"]`（`vllm_ascend/attention/mla_v1.py:736`）。DeepSeek 系列默认开启 `q_lora_rank`（query 也做低秩分解），所以本章看到的 `self.q_proj` 实际绑定的就是外部传入的 `q_b_proj` 模块（query 的上投影）。下文如果直呼 `q_b_proj`，指的都是同一个对象，不是另一个方法。
+
 形状代数走一遍（`B` = batch token 数，`N` = 头数，`P` = `qk_nope_head_dim`，`L` = `kv_lora_rank`）：
 
 | 量 | 形状 | 来自 |
@@ -537,7 +539,7 @@ prefill 用 `q_proj` 出**满维** `q_nope` / `q_pe`，**不吸收**；而且它
 - **decode**：每序列只有 1 个 query，但 KV 全在分页 cache、可能很长——瓶颈在**数据搬运**。吸收成 MQA 后，每个缓存 token 不用解压，搬运量最小。
 - **prefill**：有一整段变长新 token、需要 causal mask——瓶颈在**计算**。显式解压成满维 K/V 后走标准 MHA，计算单元利用率更高。
 
-在开发机上把两条路各跑一遍可以看清这个差异：decode 路调了 `q_b_proj`（上投影）和 `npu_kv_rmsnorm_rope_cache`，**没碰** `kv_b_proj`；prefill 路则明确调了 `kv_b_proj` 显式解压，且返回结果里 `value is not None`。两路的算子调用序，和源码逐一吻合。
+在开发机上把两条路各跑一遍可以看清这个差异：decode 路调了 `q_proj`（即 §22.4 钉过的 `q_b_proj` 别名，上投影）和 `npu_kv_rmsnorm_rope_cache`，**没碰** `kv_b_proj`；prefill 路则明确调了 `kv_b_proj` 显式解压，且返回结果里 `value is not None`。两路的算子调用序，和源码逐一吻合。
 
 ## 22.8 exec_kv：一个算子做完 RMSNorm + RoPE + 写 cache
 

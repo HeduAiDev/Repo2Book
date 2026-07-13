@@ -332,13 +332,13 @@ wrapper 怎么被选中，又是一条注册主线。vLLM 通过平台层问「�
 
 ### 为什么大 rank 要退回通用实现：算一笔账
 
-`max_lora_rank >= 128` 退回 `torch_ops`，背后是 LoRA 的低秩账。LoRA 把权重增量分解成两个低秩矩阵 $\Delta W = BA$ ，前向时不直接算满秩乘法，而是分两步走。记 token 数为 T、输入维为 d、输出维为 o、LoRA rank 为 r、缩放为 s：
+`max_lora_rank >= 128` 退回 `torch_ops`，背后是 LoRA 的低秩账。LoRA 把权重增量分解成两个低秩矩阵 $`\Delta W = BA`$ ，前向时不直接算满秩乘法，而是分两步走。记 token 数为 T、输入维为 d、输出维为 o、LoRA rank 为 r、缩放为 s：
 
 $$
 \mathrm{shrink}: \; u = x A, \qquad \mathrm{expand}: \; y \mathrel{+}= (u B) \cdot s
 $$
 
-shrink 先把输入从 d 维降到 r 维的 buffer，expand 再把它升回 o 维。两步的 FLOPs 约为 $2 T r (d + o)$ 。对比满秩增量直算的 $2 T d o$ ，省下的倍数是：
+shrink 先把输入从 d 维降到 r 维的 buffer，expand 再把它升回 o 维。两步的 FLOPs 约为 $`2 T r (d + o)`$ 。对比满秩增量直算的 $`2 T d o`$ ，省下的倍数是：
 
 $$
 \frac{2 T d o}{2 T r (d + o)} = \frac{d o}{r (d + o)}
@@ -399,7 +399,7 @@ $$
         self.add_expand(y, buffer, lora_b_stacked, output_slices, add_inputs=True, **kwargs)
 ```
 
-一目了然就是上面那条公式的代码化：先开一个 `r` 维的 `buffer`，`add_shrink` 把 $x A$ 算进 buffer，`add_expand` 把 $\mathrm{buffer} \cdot B$ 加进 `y`。`add_shrink` / `add_expand` 内部再按当前是 prefill 还是 decode，二选一调 `sgmv_*` 或 `bgmv_*`——这正是 `__init__` 绑定的那六个算子。
+一目了然就是上面那条公式的代码化：先开一个 `r` 维的 `buffer`，`add_shrink` 把 $`x A`$ 算进 buffer，`add_expand` 把 $`\mathrm{buffer} \cdot B`$ 加进 `y`。`add_shrink` / `add_expand` 内部再按当前是 prefill 还是 decode，二选一调 `sgmv_*` 或 `bgmv_*`——这正是 `__init__` 绑定的那六个算子。
 
 这里 bgmv 和 sgmv 的分工，对应推理的两个阶段：
 
@@ -520,7 +520,7 @@ def register_model_loader():
 
 netloader 解决的是冷启动慢的问题。这里的**冷启动**，指推理进程刚起、显存里还没有任何权重，要把几十上百 GB 的权重从磁盘或 HuggingFace 现读进 NPU 显存的那段慢启动期。传统加载串行读 N 个权重分片，IO 是瓶颈；netloader 则从**已经加载好的对等实例**经网络并行拉权重，把磁盘 IO 换成网络带宽，多副本部署时显著降冷启动延迟。
 
-这也解释了类名 `ModelNetLoaderElastic` 里的 **elastic（弹性）**从何而来：一来它从多个对等副本 P2P 拉取权重、来源可伸缩；二来——正如下面 `load_model` 会看到的——从 source 配置到网络传输，任何一环出问题都能优雅回退到默认加载。快路径可有可无、失败即回退，这份「拉不到就退、绝不锁死」的伸缩性，正是 elastic 的本意。
+这也解释了类名 `ModelNetLoaderElastic` 里的 **elastic（弹性）** 从何而来：一来它从多个对等副本 P2P 拉取权重、来源可伸缩；二来——正如下面 `load_model` 会看到的——从 source 配置到网络传输，任何一环出问题都能优雅回退到默认加载。快路径可有可无、失败即回退，这份「拉不到就退、绝不锁死」的伸缩性，正是 elastic 的本意。
 
 核心逻辑在 `load_model`。把样板和边角分支剥掉，主干是一个清晰的「能拉就拉、拉不动就退」：
 

@@ -96,7 +96,7 @@ def load_plugins_by_group(group: str) -> dict[str, Callable[[], Any]]:
 
 整段的关窍就一句 `entry_points(group=group)`——用标准库按组名发现第三方插件，`plugin.load()` 拿到回调函数对象。（开头那行 `allowed_plugins = envs.VLLM_PLUGINS`：`envs` 是 vLLM 的环境变量模块，`VLLM_PLUGINS` 可显式指定只加载哪些插件，默认 `None` 即全部放行。）**这一句就是整个 OOT 机制的物理基础**：vLLM 没有写死任何硬件后端的名字，而是留了一个「谁登记过就用谁」的标准发现点。昇腾把自己登记进去，就被 vLLM 反向钩了进来。
 
-这就是要素一「装上就被发现」的全部：**声明在包元数据里，发现靠 `importlib.metadata`，双方只约定组名，谁都不认识谁的源码**。这两组 entry point 从被发现到真正生效的完整旅程，是 [第 2 章](../../ch02-entry-points-and-npuplatform/narrative/chapter.md) 的主线。
+这就是要素一「装上就被发现」的全部：**声明在包元数据里，发现靠 `importlib.metadata`，双方只约定组名**——但这仅限于「谁登记了这个组名」这一步：entry point 声明阶段，vLLM 和昇腾之间不共享代码，双方各自导入的模块互不相干。往下走就不是这样了：§1.3 你会看到 `register()` 只敢返回一个类名字符串而不敢直接 `import`，正是因为 NPUPlatform 要 `from vllm.platforms import Platform` 继承 vLLM 的基类、逐一覆写与基类同名同签名的方法——真正接管分发的那一步，双方在接口上深度耦合。「entry point 层面零耦合」和「整体机制依赖共享基类接口」是两件事，前者只管发现，后者才是分发。这两组 entry point 从被发现到真正生效的完整旅程，是 [第 2 章](../../ch02-entry-points-and-npuplatform/narrative/chapter.md) 的主线。
 
 ## 1.3 支柱二：一个平台类接管所有分发（NPUPlatform）
 

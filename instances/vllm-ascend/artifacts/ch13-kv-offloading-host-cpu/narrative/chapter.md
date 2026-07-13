@@ -873,7 +873,7 @@ torch.ops._C_ascend.swap_blocks_batch(batch_src, batch_dst, batch_sizes, directi
 
 **搬运是批量的，一次调用带走全部描述符。** 一次 transfer 拼出的描述符数是 `N_desc = T × num_pairs`，`T` 是所有层的 K/V 子张量数、`num_pairs` 是这批 sub-block 对数。host 端拼指针是 O(T × num_pairs) 的 numpy 向量化运算，**零 Python 循环**；device 端是**一次** `swap_blocks_batch` 内核启动。相比「每个 block 一次 memcpy」，批量把 N_desc 次启动压成 1 次。
 
-**pinned 内存换带宽。** CPU 镜像用 `pin_memory=True` 分配，让 DMA 走零拷贝路径——host↔device 实测带宽显著高于非 pinned（后者要先经一次 host 内的暂存拷贝）。这是卸载吞吐的底盘。
+**pinned 内存换带宽。** CPU 镜像用 `pin_memory=True` 分配，让 DMA 走零拷贝路径——原理上 host↔device 带宽应高于非 pinned（后者要先经一次 host 内的暂存拷贝，多一次内存带宽和一次额外延迟）。本章没有该仓库的实测吞吐数字可引，这里只立住机制上的因果：省掉的是「暂存拷贝」这一段，不是"带宽翻倍"式的具体量级。这是卸载吞吐的底盘。
 
 **卸载省 HBM 的代价被异步摊薄。** 卸载省的是显存：把暂时用不到的 block 下沉 host，HBM 就能装下更长上下文 / 更大 batch。代价是 host 带宽 + 一次额外搬运延迟。但那次延迟挂在独立流上、和下一步 forward 重叠，墙钟上几乎被吃掉——这正是 §13.5 的节拍设计要换来的东西。
 

@@ -448,7 +448,7 @@ def test_utility_method_invoked_and_enqueued():
 
 现在回收 §11.4 留的悬念。忙循环没活时阻塞睡在 `input_queue.get(block=True)` 上。要关掉这个进程，信号处理器（收到 SIGTERM/SIGINT）能做的很有限——它在中断主线程的任意时刻触发，**不能安全操作非可重入的队列锁**（Python 的 `queue.Queue` 内部用 `threading.Lock` 保护，该锁不支持同一线程嵌套获取；若信号恰好在主线程持锁期间打断并再次调用 `put_nowait`，就会死锁）。它没法直接「叫停」那个阻塞的 `get`。
 
-vLLM 的解法分两半。信号处理器只做两件最小的事：把状态标记为「请求关停」，再往队列里投一个 `WAKEUP` 哨兵：
+vLLM 的解法分两半，关键是**没让信号处理器自己去碰队列**。信号处理器只做两件最小的事：把状态标记为「请求关停」，再调 `signal_callback.trigger()` 登记一个「待办」——真正往队列里投 `WAKEUP` 哨兵的 `put_nowait`，被抽成独立的 `wakeup_engine`，交给 `SignalCallback` 在信号上下文之外执行：
 
 ```python
 # vllm/v1/engine/core.py:L1118（run_engine_core 内）
@@ -463,6 +463,19 @@ signal_callback = SignalCallback(wakeup_engine)
 def signal_handler(signum, frame):
     engine_core.shutdown_state = EngineShutdownState.REQUESTED
     signal_callback.trigger()
+```
+
+注意 `wakeup_engine` 的注释白纸黑字警告：`put_nowait` **在信号处理器里不安全**——信号可能恰好在主线程持有非可重入的 `input_queue.mutex` 时打断它，这时再 `put` 就会死锁。所以信号处理器绝不亲自投哨兵，只调 `trigger()`。`SignalCallback` 就是这层「把危险动作挪出信号上下文」的间接：它在构造时起了一条专用后台线程，那条线程一直阻塞在 `self._event.wait()` 上；`trigger()` 只做一件极小的事——`self._event.set()`，把线程放行。真正的 `put_nowait` 由那条被唤醒的专用线程执行，此刻已在信号上下文之外，不受「信号打断主线程持锁」的雷区约束：
+
+```python
+# vllm/v1/engine/utils.py:L247（SignalCallback 内）
+def _run(self):                  # 专用后台线程
+    self._event.wait()           # 一直睡在这里
+    if not self._stopped:
+        self._callback()         # 放行后才真正 put_nowait
+
+def trigger(self):               # 信号处理器只调这个
+    self._event.set()            # 唯一动作：放行线程
 ```
 
 这下 §11.4 那个 `WAKEUP` → `return` 的空分支就有意义了：它**不为了做事，只为了把阻塞的 `input_queue.get` 唤醒**。哨兵一进队列，睡着的 `get` 立刻返回，`_handle_client_request` 拿到 `WAKEUP` 啥也不干就 `return`，控制权交回忙循环。忙循环转下一圈，去检查 `_handle_shutdown()`——这次它会看到 `shutdown_state` 已经是 `REQUESTED` 了。
@@ -508,18 +521,18 @@ def _handle_shutdown(self) -> bool:
 
 `_handle_shutdown` 返回 `False`，`run_busy_loop` 的 while 退出，`raise SystemExit`，进程干净结束。
 
-非零超时（排空模式）下，`SHUTTING_DOWN` 这态不是一锤子退出，而是要在忙循环里转好几圈、把在途请求一拍一拍跑完才退。这个「排空」必然终止吗？逐拍追一遍就清楚了——设关停被请求那一刻调度器手上还有 3 个未完成请求，每圈一拍 `step` 至少跑完一个（最坏一拍只完成一个）：
+非零超时（排空模式）下，`SHUTTING_DOWN` 这态不是一锤子退出，而是要在忙循环里转好几圈、把在途请求跑完才退。下面这张表是一个**简化到底的示意**：设关停被请求那一刻调度器手上还有 3 个未完成请求，并**假设**每圈一拍 `step` 恰好完成 1 个——真实解码远没这么整齐（一拍通常只是让每个未完成请求各往前生成一个 token，一个请求要攒够长度上限或撞上 EOS 才算完成，很可能出现「这一拍一个请求都没结束」），这张表只是帮着建立直觉，不是逐拍必然发生的节奏：
 
-| 圈次 | 进 `_handle_shutdown` 时的状态 | 该圈动作 | `get_num_unfinished_requests()` | `has_work()` | 返回 |
+| 圈次 | 进 `_handle_shutdown` 时的状态 | 该圈动作（假设） | `get_num_unfinished_requests()` | `has_work()` | 返回 |
 |---|---|---|---|---|---|
 | 1 | `REQUESTED` | 转 `SHUTTING_DOWN`，有活 | 3 | True | True（再转一圈） |
-| 2 | `SHUTTING_DOWN` | 跑一拍，完成 1 个 | 3→2 | True | True |
-| 3 | `SHUTTING_DOWN` | 跑一拍，完成 1 个 | 2→1 | True | True |
-| 4 | `SHUTTING_DOWN` | 跑一拍，完成 1 个 | 1→0 | False | **False（退出）** |
+| 2 | `SHUTTING_DOWN` | 跑一拍，假设完成 1 个 | 3→2 | True | True |
+| 3 | `SHUTTING_DOWN` | 跑一拍，假设完成 1 个 | 2→1 | True | True |
+| 4 | `SHUTTING_DOWN` | 跑一拍，假设完成 1 个 | 1→0 | False | **False（退出）** |
 
-终止性的一句话骨架：进入 `SHUTTING_DOWN` 后不再接收新请求（`_reject_add_in_shutdown` 挡掉 ADD），于是「未完成请求数」是一个**只减不增的非负整数**——每跑一拍至少递减 1，单调递减的非负整数序列必在有限步内触底为 0，`has_work()` 转 `False`，循环退出。这就把「排空一定会结束」从断言变成了可数的有限步。
+真正撑起「排空一定会结束」这句话的，不是「每拍至少完成一个」这么强的假设，而是两条更弱、也确实由代码/设计保证的性质叠加：①进入 `SHUTTING_DOWN` 后不再接收新请求（`_reject_add_in_shutdown` 挡掉 ADD），未完成请求的集合只减不增，不会有新成员补进来；②每个未完成请求的剩余生成本身有限——要么撞上长度上限，要么提前遇到 EOS（`stop_terminated`，见 §9），两者都会让调度器把它标记为完成、移出未完成集合。①保证了这堆请求不会被源源不断的新请求续命，②保证了这堆请求里的每一个终归会退场；两条一起，就把「未完成请求数」摁死成一个**总有一天会耗尽**的有限量，而不需要假设某个具体的每拍进度。上面那张表，就是这个论证在「凑巧一拍完成一个」这个特例下的样子——真实场景里可能要转很多拍才排空这 3 个请求，但排空这件事本身不会不结束。
 
-把整条链连起来看，关停其实是一次精心编排的握手：信号处理器不敢碰队列锁 → 投 `WAKEUP` 哨兵 → 叫醒阻塞的 `get` → 忙循环转一圈撞上 `_handle_shutdown` → 三态机排空 → 退出。每一环都绕开了「在信号上下文里做危险操作」这个雷区。
+把整条链连起来看，关停其实是一次精心编排的握手：信号处理器不敢碰队列锁 → 只调 `trigger()` 放行专用线程 → 该线程在信号上下文之外投 `WAKEUP` 哨兵 → 叫醒阻塞的 `get` → 忙循环转一圈撞上 `_handle_shutdown` → 三态机排空 → 退出。每一环都绕开了「在信号上下文里做危险操作」这个雷区。
 
 精简版把三态迁移和有活退出验证了：
 
@@ -757,7 +770,7 @@ self.step_fn = (
 
 逻辑很简单：executor 的 `max_concurrent_batches > 1` 时（也就是开了流水线并行 PP），启用 `batch_queue` 并把 `step_fn` 绑到 `step_with_batch_queue`；否则零开销走普通 `step`。绑定一次，之后每拍不再判断分支。
 
-`step_with_batch_queue` 是 PP 的核心——它允许同时有多个批在流水线的不同 stage 上飞，靠「先填满流水线优先于取结果」消除 PP 气泡。把收益量化一下：流水线并行（Pipeline Parallelism，PP）把模型的 Transformer 层**按层切割**分配到多个 GPU（或 GPU 组）上，每个 GPU 负责若干层，称为一个 stage——batch 先经 stage 0 的前几层、再传 stage 1、……、最终从末级 stage 出来。整体切成 $P$ 个 stage，一个批串行穿过这些 stage。若同一时刻只有一个批在飞，那么任一时刻只有一个 stage 在干活、其余的全空着——硬件利用率只有
+`step_with_batch_queue` 是 PP 的核心——它允许同时有多个批在流水线的不同 stage 上飞，靠「先填满流水线优先于取结果」消除 PP 气泡。把收益量化一下：流水线并行（Pipeline Parallelism，PP）把模型的 Transformer 层**按层切割**分配到多个 GPU（或 GPU 组）上，每个 GPU 负责若干层，称为一个 stage——batch 先经 stage 0 的前几层、再传 stage 1、……、最终从末级 stage 出来。整体切成 $`P`$ 个 stage，一个批串行穿过这些 stage。若同一时刻只有一个批在飞，那么任一时刻只有一个 stage 在干活、其余的全空着——硬件利用率只有
 
 $$
 \mathrm{util} \;=\; \frac{1}{P}

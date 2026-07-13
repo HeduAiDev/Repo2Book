@@ -332,7 +332,7 @@ $$
 \mathrm{cdiv}(\mathrm{sliding\_window} - 1 + \mathrm{newly\_scheduled\_tokens},\ \mathrm{block\_size}) + 1
 $$
 
-直觉先行：大小为 W 的窗口覆盖最近 W 个 token，但当前批次新调度的 `newly_scheduled_tokens` 个 token 可能把窗口右边界再往右推。峰值同时持有的 token 区间长度是 `(W - 1) + newly_scheduled_tokens`——W 个窗口 token 里减掉 1 是因为右边界那个 token 本身已被新调度段计入，不能重复算。把这段区间分块，向上取整加 1（窗口左边界未必落在块边界，可能多压半块）得到公式。代入数值看量级差：max_model_len=32768、sliding_window=4096、block_size=16，全长口径要 `cdiv(32768,16)=2048` 块，而峰值持块只有 `cdiv(4096-1,16)+1≈257` 块——相差近 **8 倍**。按全长留量等于把一个请求的占用虚报了 8 倍，准入会无谓地拒掉本能放下的请求。
+直觉先行：大小为 W 的窗口覆盖最近 W 个 token，但当前批次新调度的 `newly_scheduled_tokens` 个 token 可能把窗口右边界再往右推。峰值同时持有的 token 区间长度是 `(W - 1) + newly_scheduled_tokens`——W 个窗口 token 里减掉 1 是因为右边界那个 token 本身已被新调度段计入，不能重复算。把这段区间分块，向上取整加 1（窗口左边界未必落在块边界，可能多压半块）得到公式。`newly_scheduled_tokens` 在源码里就是调度器配置 `max_num_batched_tokens`——`SlidingWindowSpec.max_admission_blocks_per_request(max_num_batched_tokens, max_model_len)` 里 `num_tokens = min(sliding_window - 1 + max_num_batched_tokens, max_model_len)` 这一项，不能悄悄取 0。代入真实默认值看量级差：`max_model_len=32768`、`sliding_window=4096`、`block_size=16`、`max_num_batched_tokens` 取默认值 `DEFAULT_MAX_NUM_BATCHED_TOKENS=2048`，全长口径要 `cdiv(32768,16)=2048` 块，而峰值持块是 `cdiv(4096-1+2048,16)+1=385` 块——相差约 **5.3 倍**。按全长留量等于把一个请求的占用虚报了 5 倍多，准入会无谓地拒掉本能放下的请求。
 
 如果准入时按 `cdiv(全长)` 留量，会发生什么？要么过度保守、明明放得下却拒了（吞吐塌方），要么——更糟——启动时的池大小估算器（pool sizer）按「回收后的峰值」算了池容量，运行时准入却按「全长」检查，两套口径打架。（这个启动时估算器具体怎么数出池容量，下一章才揭晓；这里只需知道：它和运行时准入用的是同一个 spec 方法，因此两处口径天然一致。）源码注释把后果点名了：
 
@@ -813,7 +813,7 @@ simple hybrid 为什么一轮足够？full 排首给出上界，唯一的 other 
 - **各注意力类型的差异收束在 `get_num_skipped_tokens`**：全注意力恒 0（从不释放）、滑窗 `max(0, n-window+1)`、分块本地向下取整到 chunk。一个虚函数，三种回收语义。
 - **recycling-aware 准入上限**：SWA / chunked-local 用 spec 侧单一真相源方法定 `max_admission_blocks_per_request`，启动池估算与运行时准入同口径，`sum(reservation) ≤ pool ⟺ sum(peak) ≤ pool`，杜绝死锁与 prefill 中途 OOM。
 - **`KVCacheCoordinator` 三态工厂**：拓扑差异构造期一次解析——NoPrefixCache（任意组数退化）/ Unitary（单组直委托，最常见）/ Hybrid（多组分桶 + 不动点）。逐组转发把「有几种注意力」对 `allocate_slots` 透明。
-- **Hybrid 不动点迭代**：每类型对候选长度「接受或缩短」，缩短即重启；单调递减 + lcm 倍数离散下界 0 保证至多 $L/\mathrm{lcm}$ 轮收敛；full 排首给紧上界 + 下闭包早停 + simple hybrid 一轮，把常见情形压回 Unitary 量级。
+- **Hybrid 不动点迭代**：每类型对候选长度「接受或缩短」，缩短即重启；单调递减 + lcm 倍数离散下界 0 保证至多 $`L/\mathrm{lcm}`$ 轮收敛；full 排首给紧上界 + 下闭包早停 + simple hybrid 一轮，把常见情形压回 Unitary 量级。
 
 这一章也是 KV 缓存子系统的收尾。从 [第 15 章](../../ch15-kv-cache/narrative/chapter.md) 的块、队列、哈希、命中，到这一章的三阶段分配与多注意力协调，分页 KV 缓存的「显存怎么切、怎么分、怎么省」算讲透了。
 

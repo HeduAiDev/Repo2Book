@@ -184,7 +184,7 @@ def is_mx_quant_type(instance: Any) -> bool:
 **为什么用表，不用 if/elif？** 两条理由，一条工程一条复杂度：
 
 - 工程上，新增一种 quant_type 只需写一个 scheme 文件、贴一个装饰器——**分发代码零改动**。如果是 `if/elif` 长链，每加一种都要去那条链上插一刀，几十个 scheme 会把分发函数撑成几百行，且容易漏。
-- 复杂度上，scheme 选择从 `if/elif` 的逐个比较（scheme 数为 N 时是 $O(N)$ ）降为字典查的 $O(1)$ 。十几种 quant_type × 多种 layer_type 的组合，被一张表统一寻址。
+- 复杂度上，scheme 选择从 `if/elif` 的逐个比较（scheme 数为 N 时是 $`O(N)`$ ）降为字典查的 $`O(1)`$ 。十几种 quant_type × 多种 layer_type 的组合，被一张表统一寻址。
 
 ## 32.3 按层分发：get_quant_method 四类分发 + 逐层解析
 
@@ -591,9 +591,9 @@ $$
 \mathrm{out}[t, j] = \left( \sum_i x_q[t, i] \cdot W_q[j, i] \right) \cdot s_w[j] \cdot s_x[t]
 $$
 
-式中 `x_q`、`W_q` 是 `int8` 量化值； $s_w$ 是 `weight_scale`，每个输出通道一个（per-channel，落盘固定）； $s_x$ 是 `pertoken_scale`，每个 token 一个（动态，前向现算）。整数乘加在 `int8` 域里跑（NPU 的强项），最后两个 scale 一乘把结果拉回浮点。人话：**用整数算 GEMM 省算力省带宽，再用两个缩放因子把数值还原回原来的量级。**
+式中 `x_q`、`W_q` 是 `int8` 量化值； $`s_w`$ 是 `weight_scale`，每个输出通道一个（per-channel，落盘固定）； $`s_x`$ 是 `pertoken_scale`，每个 token 一个（动态，前向现算）。整数乘加在 `int8` 域里跑（NPU 的强项），最后两个 scale 一乘把结果拉回浮点。人话：**用整数算 GEMM 省算力省带宽，再用两个缩放因子把数值还原回原来的量级。**
 
-这条式子按**对称量化**写，所以没出现 `weight_offset`——对称量化下 `weight_offset≈0`，offset 项可略（[§32.4](#324-三个适配器-wrapper满足-vllm-三个方法基类) 里 `get_perchannel_param` 仍把 `weight_offset` 和 `weight_scale` 一起注册，只是这一格里它取零）。若是非对称量化，每个量化值要先减去对应的 offset、再乘 scale 才能还原。
+这条式子按**对称量化**写，所以没出现 `weight_offset`——对称量化约定 offset 恒为 0，公式据此把这一项省略。注意 `get_perchannel_param`（[§32.4](#324-三个适配器-wrapper满足-vllm-三个方法基类)）里 `weight_offset` 和 `weight_scale` 是用同一种手法分配的：`torch.empty(output_size, 1, dtype=params_dtype)`——这只是占位张量，真实取值来自 checkpoint 加载（量化工具产出对称量化权重时把它写成 0），代码本身并不能证明其运行值；这里公式省略该项，只是顺着「对称量化」的前提假设它是 0。若是非对称量化，每个量化值要先减去对应的 offset、再乘 scale 才能还原。
 
 「动态」的好处也在这条式子里。`pertoken_scale` 按每个 token 自己的幅度算，所以一个幅值忽大忽小的序列里，大 token 和小 token 各用各的 scale，不会被一个全局 scale 一刀切——省了离线校准、对分布偏移更稳。
 
@@ -638,7 +638,7 @@ W8A8 用的是 per-channel——每个输出通道一个 scale。但这只是量
 - **per-channel**：每个输出通道（每行）一个 scale。W8A8_DYNAMIC 的 `weight_scale` 形状 `[out, 1]` 就是这档。
 - **per-group**：把输入维切成若干组，**每个输出通道的每一组输入通道各配一个 scale**（即每行 × 每组一个）。W4A8 除了 per-channel 的 `weight_scale`，还多一个 per-group 的 `weight_scale_second`，形状正是 `[out, in//group_size]`（`out` 行 × `in//group_size` 组）——更细、更护精度，代价是多存一份分组 scale。4 位权重量化误差天然大，得靠更细的粒度补回来。
 
-**MXFP（microscaling，微缩放）是 per-group 的极端，也是 NPU 的硬特化。** 它把组切得很细，每组配一个共享指数 scale，且这个 scale 用一种特殊 dtype——`FLOAT8_E8M0FNU`，8 位纯指数（e8m0：8 位指数、0 位尾数，只能表示 2 的幂）。这套配置集中记在一张映射表里：
+**MXFP（microscaling，微缩放）是 per-group 的极端，也是 NPU 的硬特化。** 这族格式出自 OCP（Open Compute Project）的 Microscaling 规范，学术阐述见 Rouhani et al.《Microscaling Data Formats for Deep Learning》（arXiv:2310.10537）。它把组切得很细，每组配一个共享指数 scale——直觉是组内动态范围窄，共享一个 2 的幂 scale 就能把这一小组的值整体拉回尾数可表达的区间，精度损失被小组粒度兜住。且这个 scale 用一种特殊 dtype——`FLOAT8_E8M0FNU`，8 位纯指数（e8m0：8 位指数、0 位尾数，只能表示 2 的幂）。这套配置集中记在一张映射表里：
 
 ```python
 # vllm_ascend/quantization/quant_parser.py:L11

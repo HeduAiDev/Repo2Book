@@ -683,9 +683,9 @@ class FlatLogprobs(MutableSequence[LogprobsOnePosition | None]):
 
 ![FlatLogprobs vs nested 内存布局对比](../diagrams/03-flat-vs-nested.png)
 
-> *图注：左边 nested——3 个位置造 3 个 dict + 6 个 Logprob 对象，对象数随 L×K 增长。右边 flat——4 条值列表（token_ids / logprobs / ranks / decoded）+ 2 条索引列表（start / end），元素全是原生 int/float/str，对象数恒定。位置 i 的候选用 `token_ids[start_indices[i] : end_indices[i]]` 这个区间取回。*
+> *图注：左边 nested——3 个位置造 3 个 dict + 6 个 Logprob 对象，被循环 GC 追踪的容器对象数随 L×K 增长。右边 flat——4 条值列表（token_ids / logprobs / ranks / decoded）+ 2 条索引列表（start / end），元素是 int/float/str（这些不被循环 GC 追踪），被追踪的容器只剩这 6 条 list，数量恒定。位置 i 的候选用 `token_ids[start_indices[i] : end_indices[i]]` 这个区间取回。*
 
-核心就一句话：**把"每位置一个 dict、每候选一个对象"摊平成 6 条原生列表，再用每位置的 `[start_indices[i], end_indices[i])` 区间索引切回去**。元素是原生 int/float/str，不是 Python 对象，于是无论序列多长、`top_logprobs` 多大，常驻的 Python 对象数恒为 6（那 6 个 list），GC 扫描成本不再随规模增长。
+核心就一句话：**把"每位置一个 dict、每候选一个对象"摊平成 6 条原生列表，再用每位置的 `[start_indices[i], end_indices[i])` 区间索引切回去**。降 GC 的关键在于 CPython 的循环垃圾回收只追踪可能构成引用环的容器对象——nested 布局里那 L 个 dict 和 L×K 个 `Logprob` 实例都会被它扫描，数量随 L×K 增长；摊平后被追踪的容器只剩 `FlatLogprobs` 本身加那 6 条 list，无论序列多长、`top_logprobs` 多大都恒定。列表里装的 int/float/str 仍是 Python 对象，但它们不含引用、不参与循环 GC，故不被扫描——于是 GC 扫描成本不再随规模增长。
 
 两个写入方法的差别：`append` 吃一个现成的 dict（`{token_id: Logprob}`），拆开摊进列表；`append_fast` 直接吃几条平行数据，连那个中间 dict 都不造——这是热路径，省一次建 dict 的开销。还有个细节：`append(None)`（prompt 首位那个占位）会写出一个 `start == end` 的零长度区间，对应 §10.5.2 里"flat 路径跳过空位置"那个判断。
 
@@ -835,6 +835,7 @@ for tid in (1065, 1066, 1067):
 state2 = RequestState(p2, RequestOutputKind.DELTA, FakeDetokenizer(text="BC"))
 out2 = state2._new_completion_output(token_ids=[1066, 1067])
 assert isinstance(out2.logprobs, FlatLogprobs) and len(out2.logprobs) == 2
+assert next(iter(out2.logprobs[0])) == 1066            # 0-indexed 平移后位置 0 仍是原来的被选中 token
 ```
 
 prompt 路在 DELTA 下有自己的发送语义。`pop_prompt_logprobs` 一次性返回再清空（`vllm/v1/engine/logprobs.py:L189-L206`）：

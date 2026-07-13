@@ -142,15 +142,15 @@ class GroupCoordinator:
 
 `GroupCoordinator` 对外的核心，是三个集合原语。先建立直觉，再看代码。
 
-设一个 TP 组有 $p$ 张卡，每张卡上有一个 $N$ 元素的张量：
+设一个 TP 组有 $`p`$ 张卡，每张卡上有一个 $`N`$ 元素的张量：
 
 - **all_reduce**：每张卡把自己的张量求和，结果**每张卡都拿到完整的全和**。形状不变。RowParallel 线性层算完各自分片后，就靠它把分片求和成完整输出。
-- **all_gather**：把每张卡的切片**拼接**起来，每张卡都拿到拼好的全量。沿 `dim` 维**放大 $p$ 倍**。序列并行里把切片重组回整条序列用它。
-- **reduce_scatter**：先求和，再让每张卡**只留其中 $1/p$ 的切片**。沿 `dim` 维**缩小 $p$ 倍**。它和 all_gather 是一对对偶操作。
+- **all_gather**：把每张卡的切片**拼接**起来，每张卡都拿到拼好的全量。沿 `dim` 维**放大 $`p`$ 倍**。序列并行里把切片重组回整条序列用它。
+- **reduce_scatter**：先求和，再让每张卡**只留其中 $`1/p`$ 的切片**。沿 `dim` 维**缩小 $`p`$ 倍**。它和 all_gather 是一对对偶操作。
 
 记住这三句形状口诀就够用了：**all_reduce 形状不变、all_gather 沿 dim ×p、reduce_scatter 沿 dim ÷p**。
 
-形状口诀只说了「大小怎么变」，没说「数值怎么动」。拿一个 $p=2$ 的最小例子走一遍，三个原语就从形状记忆变成数值可验证：设 rank0 持 `[1, 2]`、rank1 持 `[3, 4]`（沿 `dim=0`）：
+形状口诀只说了「大小怎么变」，没说「数值怎么动」。拿一个 $`p=2`$ 的最小例子走一遍，三个原语就从形状记忆变成数值可验证：设 rank0 持 `[1, 2]`、rank1 持 `[3, 4]`（沿 `dim=0`）：
 
 | 原语 | rank0 结果 | rank1 结果 | 形状 | 怎么得来 |
 | --- | --- | --- | --- | --- |
@@ -160,7 +160,7 @@ class GroupCoordinator:
 
 两个细节这张表才看得清，光记形状记不住：all_gather **按 rank 序拼接**（不是任意序），rank0 的段在前；reduce_scatter 是**先全和再切**，每个 rank 留的是「全和的自己那一段」而非「自己原值的一段」。reduce_scatter 接一个 all_gather，正好把 `[4]`/`[6]` 拼回 `[4, 6]`——这就是下面要说的「all_reduce = reduce_scatter + all_gather」在数值上的样子。
 
-通信量上，按 ring 算法（把张量切成 $p$ 等份、沿一个首尾相接的环形拓扑传 $p-1$ 轮，每轮每张卡只收发 $1/p$ 的数据量）计，设字节宽为 $b$ ，每张卡收发的字节数是：
+通信量上，按 ring 算法（把张量切成 $`p`$ 等份、沿一个首尾相接的环形拓扑传 $`p-1`$ 轮，每轮每张卡只收发 $`1/p`$ 的数据量）计，设字节宽为 $`b`$ ，每张卡收发的字节数是：
 
 $$
 \mathrm{all\_reduce} = \frac{2(p-1)}{p}\,Nb,
@@ -273,7 +273,7 @@ $$
     # … 省略：reduce_scatter（movedim 到 0、按 world_size 切块、reduce_scatter_tensor），结构对偶 …
 ```
 
-两个细节值得圈出来。其一，`all_reduce` 是**原地**的（`dist.all_reduce(input_)` 直接改 `input_` 再返回）——这条直接路径不受「custom op 不许原地」的约束，约束只对 custom-op 路径生效，下一节会看到。其二，`all_gather` 那段 reshape/movedim 的体操，是为了把 `all_gather_into_tensor` 的结果按指定 `dim` 拼好，注释明说用 concat-style 而非 stack-style 是为了兼容 `torch.compile`——又一处为编译让路的痕迹。
+两个细节值得圈出来。其一，`all_reduce` 是**原地**的（`dist.all_reduce(input_)` 直接改 `input_` 再返回）——这不是疏漏：`use_custom_op_call` 只在 `current_platform.use_custom_op_collectives()` 为真的平台（CUDA、ROCm 等）才置位，那些平台各自有自己的 `device_communicator`（下面就会看到 CUDA 的版本，它压根不走这份默认实现）；`base_device_communicator` 这份原地实现，只会在 `use_custom_op_call=False` 的平台上经直接路径被调用，custom op「不许原地」的约束因此没落到它头上——下一节细讲这个约束具体管的是谁。其二，`all_gather` 那段 reshape/movedim 的体操，是为了把 `all_gather_into_tensor` 的结果按指定 `dim` 拼好，注释明说用 concat-style 而非 stack-style 是为了兼容 `torch.compile`——又一处为编译让路的痕迹。
 
 CUDA 平台上，`CudaCommunicator` 会覆写这几个方法，语义一致，但底下不是单一的 NCCL：
 
@@ -395,7 +395,7 @@ direct_register_custom_op(
 
 注册之后，这三个算子以 `torch.ops.vllm.all_reduce` 等形式存在。Dynamo 把它们当作**有确定形状语义的不透明节点**——编译期靠 fake 推断输出 shape、不真通信；运行期才执行真函数、查回 group、做真通信。图不被打断。
 
-还差最后一块拼图：custom op 不许原地改、也不许在同一个 op 里返回新张量。所以 [§20.2](#202-三大集合原语与后端选择的下沉) 里所有路径都做成 **out-of-place**（`_all_reduce_out_place` 这个名字就是为此）——这正是 docstring 里第二段说的约束。
+还差最后一块拼图：custom op 不许原地改、也不许在同一个 op 里返回新张量——这正是 docstring 里第二段说的约束。但这条约束不是靠「把 [§20.2](#202-三大集合原语与后端选择的下沉) 里所有路径都改成 out-of-place」满足的：`base_device_communicator` 那份默认实现依然是原地的，它只在 `use_custom_op_call=False` 的平台上跑，压根不会被装进 custom op 里。真正对这条约束负责的，是 `use_custom_op_call=True` 的平台各自的 `device_communicator`——CUDA 路径在 `pynccl_comm` 缺位时显式 `out = input_.clone()` 再对 `out` 做 all-reduce；`custom_all_reduce`/`pynccl_comm.all_reduce` 则各自在内部 `torch.empty_like` 出新的输出缓冲区，都不碰输入张量。`_all_reduce_out_place` 这个名字标的是调用它的那几条 `GroupCoordinator` 分支，不是承诺「底下的每份实现都是 out-of-place」。
 
 把这两条派发路径并排看一眼：
 

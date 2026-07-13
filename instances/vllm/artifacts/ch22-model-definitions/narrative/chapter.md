@@ -19,7 +19,7 @@
 
 - **`(vllm_config, prefix)` 构造契约**：所有 v1 模型类的 `__init__` 只收这两个关键字参数。`vllm_config` 是全局配置的单一入口，`prefix` 是模块在 state-dict 里的全路径——它一根串起「权重名」和「KV cache 寻址键」。
 - **TP 线性层**：`QKVParallelLinear` / `MergedColumnParallelLinear` / `RowParallelLinear`。列并行沿 output 切、行并行沿 input 切，成对出现，整个子块只在末尾一次 `all_reduce`。
-- **`Attention` 统一封装**：模型定义只给 `num_heads`/`head_size`/`scale`，后端选择、KV cache、量化 scale 全被它吸收。换后端不改模型代码。
+- **`Attention` 统一封装**：模型定义把形状参数（`num_heads`/`head_dim`/`scale`）和配置对象（`cache_config`/`quant_config`）原样递进去，但后端怎么选、KV cache 怎么读写、量化 scale 怎么算——这些**逻辑**全被它吸收。换后端不改模型代码。
 - **三段式权重装载**：`initialize_model`（建空壳）→ `load_weights`（流式切填）→ `process_weights_after_loading`（kernel 重排）。中间靠 `stacked_params_mapping` 把 checkpoint 里分开的 q/k/v 重组进 fused 参数。
 
 照例配一份**只做减法**的精简版：和真实 `vllm/model_executor/models/llama.py`、`vllm/model_executor/layers/linear.py` 同名、同结构、同控制流，只删掉量化/PP/Eagle/LoRA 注入这些与基线无关的分支。它在 host 上不要 CUDA、不 import vllm，就能跑通 TP 切分的数值、qkv fuse 的装载、三段式的前向。正文主线始终是真实源码；精简版只用来「亲眼看一眼数值对不对」。
@@ -633,7 +633,30 @@ class Attention(nn.Module, AttentionLayerBase):
     """
 ```
 
-存 KV、算注意力、返回输出。`LlamaAttention` 构造它时只给了什么？回看 22.4 节那段构造代码下面的 `self.attn = attn_cls(...)`——只传 `num_heads`、`head_dim`、`scaling`、`num_kv_heads`、`prefix`。后端选择（`get_attn_backend`）、KV cache 管理、量化 scale，统统是 `Attention` 内部的事，模型定义碰都不碰。
+存 KV、算注意力、返回输出。`LlamaAttention` 构造它时只给了什么？看 `__init__` 里紧接 QKV/`o_proj` 之后的那几行（`vllm/model_executor/models/llama.py:L205`）：
+
+```python
+# vllm/model_executor/models/llama.py:L205
+attn_cls = (
+    EncoderOnlyAttention
+    if attn_type == AttentionType.ENCODER_ONLY
+    else Attention
+)
+
+self.attn = attn_cls(
+    self.num_heads,
+    self.head_dim,
+    self.scaling,
+    num_kv_heads=self.num_kv_heads,
+    cache_config=cache_config,
+    quant_config=quant_config,
+    per_layer_sliding_window=sliding_window,
+    attn_type=attn_type,
+    prefix=f"{prefix}.attn",
+)
+```
+
+传的参数比想象中多：形状/数值参数（`num_heads`、`head_dim`、`scaling`、`num_kv_heads`）之外，还原样透传了 `cache_config`、`quant_config`、`per_layer_sliding_window`、`attn_type`、`prefix` 这些配置对象。但注意——模型这里只是**转手**，没有拆开这些对象做任何判断。选哪个后端（`get_attn_backend`）、KV cache 怎么分配和读写、量化 scale 怎么算，`LlamaAttention` 自己一行都没写；把 `cache_config`/`quant_config` 递给 `Attention.__init__` 之后，剩下的逻辑全在 `Attention` 内部完成，模型定义碰都不碰。
 
 这就是 vLLM 支持「多模型 × 多后端」的解耦点。换一个注意力后端，不用改任何一行模型代码——`Attention` 内部换 `self.impl` 就行。它的 `forward` 经两个自定义算子（`unified_kv_cache_update` + `unified_attention_with_output`），从 `forward_context` 按 `layer_name`（还记得吗，就是 `prefix`）取回本层的 `kv_cache` 和 `attn_metadata`。这两个算子怎么进 `torch.compile` 图、后端怎么选，是[第 23 章](../../ch23-custom-ops-and-compilation/narrative/chapter.md)和[第 25 章](../../ch25-attention/narrative/chapter.md)的主题。
 

@@ -198,7 +198,7 @@ class MLAAttentionSpec(FullAttentionSpec):
         )
 ```
 
-这套算法背后是个「3 元组 KV」的世界观：这套算法面对的是 DSA（DeepSeek Sparse Attention，DeepSeek 稀疏注意力）系 MLA——它的一块 KV 由三段张量组成（普通 MLA 只有 `kv_lora`、`k_rope` 两段，DSA 多出稀疏索引器（indexer）的 key），而且**三段全是 bf16**。页字节就是「块大小 × 头数 × head_size × dtype 字节」这么直白一乘。
+这套算法背后是个「3 元组 KV」的世界观：这套算法面对的是 DSA（DeepSeek Sparse Attention，DeepSeek 稀疏注意力）系 MLA——它的一块 KV 由三段张量组成（普通 MLA 只有 `kv_lora`、`k_rope` 两段，DSA 多出稀疏索引器（indexer）的 key）。这里说的是 `cache_dtype_str` 落在 `else` 分支、即**非** `fp8_ds_mla` 的默认（未量化）路径——`fp8_ds_mla` 是 DeepSeekV4 专属的量化分支，走的是 `584`/`656` 这两个写死的字节数，不套「块大小 × 头数 × head_size × dtype 字节」这条公式，与本节讨论的未量化 DSA-MLA 基线是两码事，按下不表。在这条默认路径上，**三段全是 bf16**，页字节就是「块大小 × 头数 × head_size × dtype 字节」这么直白一乘。
 
 ### 昇腾约束：DSA / Sparse-C8 把 KV 撑成 4 元组
 

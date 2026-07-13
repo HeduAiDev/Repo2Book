@@ -14,7 +14,7 @@
 
 本章源码主线是一个文件：`vllm_ascend/attention/attention_v1.py`。姊妹篇对照基座的 `vllm/v1/attention/backends/flash_attn.py`——昇腾把它的 flash kernel 换成了 NPU 算子，我们会逐一对上号。
 
-先给还没接触过 FlashAttention 的读者一句最小直觉：FlashAttention（arXiv:2205.14135）不改注意力的数学，只改**怎么算**——把 Q/K/V 分块，用**在线 softmax**（边扫 K/V 块、边用增量公式滚动更新归一化因子）分块递推地累加输出，**全程不物化那张 $N \times N$ 的注意力矩阵**，把显存读写从 $O(N^2)$ 压到近似线性，成了长序列注意力的实际标配（Hopper GPU 上的异步/FP8 版是 FlashAttention-3，arXiv:2407.08608）。不懂它的分块推导也能读本章，只需接受「昇腾要顶替的就是这类 flash 内核」；完整的在线 softmax 递推推导，见姊妹篇《vLLM 源码解读》的 FlashAttention 原理章。
+先给还没接触过 FlashAttention 的读者一句最小直觉：FlashAttention（arXiv:2205.14135）不改注意力的数学，只改**怎么算**——把 Q/K/V 分块，用**在线 softmax**（边扫 K/V 块、边用增量公式滚动更新归一化因子）分块递推地累加输出，**全程不物化那张 $`N \times N`$ 的注意力矩阵**，把显存读写从 $`O(N^2)`$ 压到近似线性，成了长序列注意力的实际标配（Hopper GPU 上的异步/FP8 版是 FlashAttention-3，arXiv:2407.08608）。不懂它的分块推导也能读本章，只需接受「昇腾要顶替的就是这类 flash 内核」；完整的在线 softmax 递推推导，见姊妹篇《vLLM 源码解读》的 FlashAttention 原理章。
 
 > **一句话说明**：昇腾主机一般没有 CUDA，本章的数值追踪跑在纯 Python 的控制流上（五态分流、拆批、`slot_mapping` 装配、`forward_impl` 选路都是 Python）。真正的 `_npu_paged_attention` / `npu_fused_infer_attention_score` 是 NPU 内核，host 上不真算——但它们的入参怎么被整理、何时被调用，全都可读可验。
 
@@ -558,7 +558,7 @@ def forward_paged_attention(
     return output
 ```
 
-算子自己拿 `block_table` 去 cache 里 gather 每序列的历史 K/V，按 `context_lens`（即 `seq_lens`）算出每序列的有效长度，一把出结果。这就是「分页注意力」最朴素的形态——没有显式的 mask、没有变长拼接，因为每序列就 1 个 query token。正因如此，paged 算子不必像 fused-infer 那样构造 TND 的变长边界（`actual_seq_lengths`）与 `attn_mask`，省下了那条路径在 mask 与变长拼接上的固定开销——这也是它能成为纯 decode「快车道」的本钱。
+算子自己拿 `block_table` 去 cache 里 gather 每序列的历史 K/V，按 `context_lens`（即 `seq_lens`）算出每序列的有效长度，一把出结果。这就是「分页注意力」最朴素的形态——没有 `atten_mask`、没有 `sparse_mode` 判定、也没有 `input_layout="TND"` 与 `actual_seq_lengths`，因为每序列就 1 个 query token，天然因果，无需分支挑选遮罩类型，也无需 `_get_fia_params` 那一层按态整理 KV。参数更少、路径更直，这才是它能成为纯 decode「快车道」的本钱——至于 mask 本身的构造成本，后面会看到它由单例工厂缓存一次、后续直接返回，早就可以忽略不计，省的不是这个。
 
 ### Fused 路径：先 `_get_fia_params` 按态整理 KV
 
@@ -671,7 +671,7 @@ def forward_fused_infer_attention(self, query, key, value, attn_metadata, output
 
 为什么「无需 padding」是大事？传统 GPU kernel 要让一批里各序列并行，前提是它们**等长**，于是不得不把每条序列都 padding 到批内最长——短序列上全是白算的填充 token。TND 直接吃变长序列，从根上免去这层 padding。
 
-这省了多少？拿 20.3 第一批算账：`query_lens = [1, 1, 5, 7]`，若 padding 到等长，要 $4 \times 7 = 28$ 个 token 的计算量；TND 只算真实的 $1+1+5+7 = 14$ 个。整整省掉一半。序列长度越参差，padding 浪费越大，TND 省得越多——这就是变长布局对吞吐的直接贡献。
+这省了多少？拿 20.3 第一批算账：`query_lens = [1, 1, 5, 7]`，若 padding 到等长，要 $`4 \times 7 = 28`$ 个 token 的计算量；TND 只算真实的 $`1+1+5+7 = 14`$ 个。整整省掉一半。序列长度越参差，padding 浪费越大，TND 省得越多——这就是变长布局对吞吐的直接贡献。
 
 mask 本身由一个单例工厂供给，造一次、全程复用：
 

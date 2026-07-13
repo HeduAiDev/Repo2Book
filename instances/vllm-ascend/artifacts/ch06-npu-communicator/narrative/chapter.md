@@ -195,7 +195,7 @@ class NPUCommunicator(DeviceCommunicatorBase):
         return output_tensor
 ```
 
-这里要澄清一个常见误读。`all_to_all` 严格说是**新增**，不是「重写基类同名方法」——基座的 `DeviceCommunicatorBase` 和 `CudaCommunicator` 里**都没有** `all_to_all`（可以全仓搜一遍确认）。`CudaCommunicator` 在 GPU 上不需要它，昇腾在 MoE 路径上需要，于是子类自己补上。
+这里要澄清一个常见误读。`all_to_all` 严格说是**新增**，不是「重写基类同名方法」——基座的 `DeviceCommunicatorBase` 和 `CudaCommunicator` 里**都没有**一个字面叫 `all_to_all` 的方法（可以全仓搜一遍确认）。但这不等于「GPU 上不需要跨卡重排」：`CudaCommunicator.__init__` 会按 `all2all_backend` 配置实例化一整套可插拔的 `all2all_manager` 子系统（定义在同目录 `all2all.py` 里，如 `AgRsAll2AllManager`、`DeepEPHTAll2AllManager`、`DeepEPLLAll2AllManager`、`MoriAll2AllManager`、`NixlEPAll2AllManager`、`FlashInferNVLinkTwoSidedManager` 等后端），`CudaCommunicator` 的 `dispatch`/`combine` 方法直接委托给它，专门服务 MoE 里 token 按专家路由的跨卡分发与合并——这正是 `all_to_all` 语义的等价物，只是没有挂在通信器基类的一个同名方法上，而是做成了独立的可插拔子系统。昇腾选的是更朴素的路径：不引入这套 manager 抽象，直接在通信器上补一个 `all_to_all` 方法。二者是「同一需求、不同实现层级」，不是「一个需要、一个不需要」。
 
 但这恰恰让「子类化 = 只改差异点」的论点更硬：昇腾对通信器的全部改动，就是 **`__init__` 两笔微调 + 新增一个 `all_to_all`**，其余集合通信全部原样继承。差异点窄到这个程度，正是「通信器是最干净样本」的实证。
 

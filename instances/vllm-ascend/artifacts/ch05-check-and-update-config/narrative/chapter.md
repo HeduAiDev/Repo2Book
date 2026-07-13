@@ -177,7 +177,7 @@
 
 先认一下这两个字段：`disable_cascade_attn` 管的是 cascade attention（一种在共享前缀场景下加速注意力的路径），`cpu_kvcache_space_bytes` 是把 KV cache 卸载到 CPU 内存的开关。这两段的处理方向其实相反：后者是别家硬件的路数、昇腾用不上，直接归零成 `None`；而前者恰恰相反——昇腾把它设回 `False`，是为了**启用** cascade attention，下面单独说清。
 
-`getattr(model_config, "disable_cascade_attn", False)` 这一句有个巧思：第三个参数 `False` 是**探测用的默认值**。如果 config 上根本没这个属性，`getattr` 返回 `False`，`if` 不进，什么都不发生——**不会因为某个 GPU 专属字段在昇腾配置里不存在而崩**。只有当字段存在且为真（用户确实开了它），才 warn + reset。这个「拿默认值当探针」的写法，让这套代码对「config 上有没有这个字段」天然鲁棒。
+`getattr(model_config, "disable_cascade_attn", False)` 这一句里，第三个参数 `False` 是**探测用的默认值**：如果 config 上根本没这个属性，`getattr` 返回 `False`，`if` 不进，什么都不发生——**不会因为某个 GPU 专属字段在昇腾配置里不存在而崩**。但 `disable_cascade_attn` 恰恰不属于这种情况：base vLLM 的 `ModelConfig.disable_cascade_attn` 类级默认值就是 `True`（`vllm/config/model.py:239`，docstring 明写 "This defaults to True, so users must opt in to cascade attention by setting this to False"），且 vLLM 自身对它的改写只会把它设为 `True`，从未设为 `False`。也就是说，只要用户没有主动把它关掉（即绝大多数默认路径），字段本身就已经是 `True`——这个 `if` 在昇腾上几乎是**每次默认启动都会触发**，并不需要用户动过什么参数。这和本节其它 8 段「probe 默认值等于字段真实默认值、因此只在用户改动后才触发」的情形正好相反，读的时候要单独区分开。
 
 > `disable_cascade_attn` 这个名字得反着读：它字面是「禁用 cascade attention」，base vLLM 里默认就是 `True`（也就是默认不开 cascade attention），实际是否启用由 `cascade_attn_enabled = not disable_cascade_attn` 决定。昇腾这段把它强行写回 `False`——`not False` 为真，等于**强制让 cascade attention 启用**（而不是禁用），因为昇腾后端自己实现了这条共享前缀的加速路径、支持它。所以段 1 和本方法里其它段方向恰好相反：别处是 warn 完把 GPU 特性关掉，这里是 warn 完反而把特性打开。（这段日志文案写得糙——嘴上说 GPU 参数「不支持」，手上的动作却是启用；以代码实际赋值为准。）cascade attention 具体按共享前缀触发的前向逻辑，见[第 16 章：单步前向的上下文与 DP 同步](../../ch16-single-step-forward-context-dp-sync/narrative/chapter.md)。
 

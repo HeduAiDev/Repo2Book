@@ -271,19 +271,25 @@ P1 照搬：数 `self.X =`。这里三条——`self.model`、`self.lm_head`、`
 
 模块树画完了，但它只讲了「谁拥有谁」，没讲「数据怎么流」。P2 接手——读 `forward`，把静态的框连成动态的有向边。
 
-先读主干 `DeepseekV4Model.forward`（`vllm/model_executor/models/deepseek_v4.py:L1394-L1418）`：
+先读主干 `DeepseekV4Model.forward`（`vllm/model_executor/models/deepseek_v4.py:L1383-L1432`）：
 
 ```python
-# vllm/model_executor/models/deepseek_v4.py:L1394
+# vllm/model_executor/models/deepseek_v4.py:L1383
         hidden_states = self.embed_input_ids(input_ids)
         hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         # … 省略：use_mega_moe 时 input_ids 转 int64，与画图无关 …
+        residual, post_mix, res_mix = None, None, None
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states = layer(
+            hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
                 input_ids,
+                post_mix,
+                res_mix,
+                residual,
             )
+        else:
+            hidden_states = layer.hc_post(hidden_states, residual, post_mix, res_mix)
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         num_tokens = hidden_states.shape[0]
@@ -305,7 +311,7 @@ P2 照 tensor 赋值顺序自上而下读，每一句 `hidden_states = ...(...)`
 
 **一、形状变化要标在边上。** 第二行 `hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)`——这不是一个子模块（所以不进模块树），但它把张量从 `[T, H]` 变成了 `[T, hc_mult, H]`（以 DeepSeek-V4 为例：H=7168，hc\_mult=4，即从 `[T, 7168]` 展开到 `[T, 4, 7168]`）。`unsqueeze`、`repeat`、`view`、`flatten` 这类纯形状算子，**画图时不画框，但必须在那条边上标形状**：`[T,H]→[T,hc_mult,H]`。不标的话，读者后面会一脸懵——中途怎么凭空多出来一个 `hc_mult` 维？这个维就是 hc 多流，标在边上它才有来处。
 
-**二、`for` 循环就是穿过堆叠层的那一条边。** `for layer in islice(self.layers, ...)` 对应 P1 里那个 `× N` 复数框——数据流箭头穿过这个复数框一次，代表它依次流过所有层。
+**二、`for` 循环就是穿过堆叠层的那一条边——但这条边上现在跑着四个状态量，不止 `hidden_states` 一个。** `for layer in islice(self.layers, ...)` 对应 P1 里那个 `× N` 复数框——数据流箭头穿过这个复数框一次，代表依次流过所有层；但每次 `layer(...)` 调用是四进四出：`hidden_states, residual, post_mix, res_mix = layer(hidden_states, positions, input_ids, post_mix, res_mix, residual)`。后三个是 hc 残差状态量，随每次迭代原样传给下一层，不在 `× N` 框内部消失。循环结束后紧跟的 `else: hidden_states = layer.hc_post(...)`——这是 Python `for...else` 语法，循环正常穷尽（没有 `break`）就执行——是收尾最后一段残差状态的独立一条边，画在 `× N` 复数框**外面**。下钻到 `DecoderLayer.forward` 时会看到这三个状态量在层内具体怎么流转、`hc_post` 为什么要挪到这里单独收尾。
 
 **三、`copy_` 是一条分叉旁路。** `self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))` 把主干上的隐状态拷一份进 `_mtp_hidden_buffer`（这就是[上一章](../../ch29-model-architecture/narrative/chapter.md)介绍的 MTP 草稿共享缓冲区）。这就是 §29.3 说的那个 buffer——它不在模块树里，现在以**数据流端点**的身份出现：主干上分一条旁路出去，喂给 MTP 草稿。旁路边画成一条岔出去的箭头，指向那个 buffer 框。
 
@@ -315,7 +321,7 @@ P2 照 tensor 赋值顺序自上而下读，每一句 `hidden_states = ...(...)`
 
 > **v0.21.0 更新**：上面这条 PP 分支在新版里不再是一条「永不触发」的死分支——DeepSeek-V4 现在实现了 `SupportsPP`，支持流水线并行（[上一章](../../ch28-model-architecture/narrative/chapter.md) §28.7 讲了它在层构造侧怎么把首尾零件换成 `PPMissingLayer()`）。在数据流层面，这给图加了一个**条件切分点**：当 PP > 1 时，非首 rank 的 `forward` 不再从 `embed_input_ids` 起步，而是直接取上一 rank 传来的 `intermediate_tensors["hidden_states"]`；非末 rank 则在末尾提前 `return IntermediateTensors(...)`，把 `hc_head`、`_mtp_hidden_buffer` 暂存与 `lm_head` 全部下放到末 rank。画图时这处可作脚注：在主干首/末画一条 `IntermediateTensors` 跨 rank 传递的虚线边，标上多流形状 `(num_tokens, hc_mult, H)`——它和单卡主干是同一条逻辑数据流，只是被 PP 边界切成了几段。是否画这条边，取决于你要画的是单卡视图还是 PP 视图：判据仍然客观（`get_pp_group().is_first_rank / is_last_rank` 那两个分支），只是这次「会不会走」由部署拓扑而非模型配置决定。
 
-下钻到单层 `DeepseekV4DecoderLayer.forward`（`vllm/model_executor/models/deepseek_v4.py:L1201-L1253`），看层内数据流：
+下钻到单层 `DeepseekV4DecoderLayer.forward`（`vllm/model_executor/models/deepseek_v4.py:L1201-L1252`），看层内数据流：
 
 ```python
 # vllm/model_executor/models/deepseek_v4.py:L1201
@@ -324,30 +330,40 @@ P2 照 tensor 赋值顺序自上而下读，每一句 `hidden_states = ...(...)`
         x: torch.Tensor,
         positions: torch.Tensor,
         input_ids: torch.Tensor | None,
-    ) -> torch.Tensor:
-        residual = x
-        x, post, comb = self.hc_pre(
-            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
-        )
+        post_mix: torch.Tensor | None = None,
+        res_mix: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if residual is None:
+            # Run standalone hc_pre on first layer
+            residual = x
+            x, post_mix, res_mix = self.hc_pre(
+                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+            )
+        else:
+            residual, post_mix, res_mix, x = torch.ops.vllm.mhc_fused_post_pre(
+                x, residual, post_mix, res_mix,
+                self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
+                # … 省略：rms_eps / hc_pre_eps / sinkhorn 等算子参数，与 hc_pre 同源 …
+            )
+
         x = self.attn_norm(x)
         x = self.attn(positions, x, None)
-        x = self.hc_post(x, residual, post, comb)
 
-        residual = x
-        x, post, comb = self.hc_pre(
-            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+        residual, post_mix, res_mix, x = torch.ops.vllm.mhc_fused_post_pre(
+            x, residual, post_mix, res_mix,
+            self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
+            # … 省略：同上，算子参数 …
         )
+
         x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
-        x = self.hc_post(x, residual, post, comb)
-        return x
+        return x, residual, post_mix, res_mix
 ```
 
-这段是对称的两半，结构完全一致：
+这段仍是两段对称的骨架——attention 一段、ffn 一段，每段都是「进 hc_pre、norm、算子、出 hc_post」——但 v0.21.0 把相邻的「上一段的 `hc_post`」和「下一段的 `hc_pre`」**融合成了一个算子** `torch.ops.vllm.mhc_fused_post_pre`：一次 dispatch 同时干两件事，用传入的 `residual`/`post_mix`/`res_mix` 收掉上一段留下的残差状态（相当于旧版单独的 `hc_post`），再为接下来这一段生成新的残差状态（相当于旧版单独的 `hc_pre`）。所以 `forward` 的签名多了三个可选入参、返回值也从单个 `x` 变成四元组——这三个状态量不再局限于层内，而是**跨层线程传递**：本层 ffn 段留下的状态，会作为参数原样传给下一层 attn 段的 `forward` 调用（就是上面 §29.4 读到的那句 `hidden_states, residual, post_mix, res_mix = layer(...)`）。
 
-第一半（attention）：`residual = x` 存残差 → `hc_pre` → `attn_norm` → `attn` → `hc_post`。第二半（前馈）：又一次 `residual = x` → `hc_pre` → `ffn_norm` → `ffn` → `hc_post`。
-
-那两条 `residual = x`，加上 `hc_post(x, residual, ...)` 把 `residual` 当形参收进去——就是**两条残差回边**：分别绕过 attention 和 ffn，在 `hc_post` 处汇回。这和 Llama 那条 add-norm 残差是同一类回边，只是这里的「加回来」被包进了 `hc_post`（也就是后面要讲的 `torch.ops.vllm.mhc_post` 算子）里。
+只有两处例外不走融合路径：**整个模型的第一次 attn 段**（`residual is None`，即第 0 层），没有「上一段」可收，只能单独调 `self.hc_pre`；**整个模型的最后一次 ffn 段**留下的状态，没有「下一段」可开，因此不在某一层的 `forward` 里被收掉——这次单独的收尾 `hc_post` 调用，就是 §29.4 已经读过的、`DeepseekV4Model.forward` 循环结束处 `for...else` 分支里的 `layer.hc_post(hidden_states, residual, post_mix, res_mix)`。逻辑上，这仍然是**两条残差回边**——一条绕过 attention、一条绕过 ffn——只是除了模型的第一段和最后一段，中间的每一次回边收尾+下一次回边起始，都被两两打包进了同一次 `mhc_fused_post_pre` 调用里，不再是每层各自独立、肉眼可数的一次 `hc_pre` 加一次 `hc_post`。
 
 把主干和层内拼起来，DeepSeek-V4 的数据流图就成形了——但还差最后一步：给那些算子框、编译区上色。
 
@@ -422,7 +438,9 @@ def hc_head(
 
 ![P2+P3：读 forward 出主干数据流 + 子系统着色](../diagrams/forward-dataflow.png)
 
-> *图注：主干自上而下——`embed` → `repeat` 展开成 `[T,hc_mult,H]` → 逐层（`hc_pre`→`attn_norm`→`attn`→`hc_post`，再 `hc_pre`→`ffn_norm`→`ffn`→`hc_post`，两条 residual 回边在左侧）→ `hc_head` 压回 `[T,H]` → `norm` → `lm_head`。橙色框是 `torch.ops.vllm.mhc_pre/mhc_post` 自定义算子（判据：`torch.ops.vllm.` 前缀）；紫色虚线容器是 `@torch.compile` 编译区（判据：装饰器）；右侧紫色旁路是 `copy_` 去 `_mtp_hidden_buffer`（判据：它是 buffer 不是子模块，进数据流不进树）。这张图就是 P2+P3 的最终产物——每个图元都钉在一行源码上。*
+> *图注：主干自上而下——`embed` → `repeat` 展开成 `[T,hc_mult,H]` → 逐层（`hc_pre`→`attn_norm`→`attn`→`hc_post`，再 `hc_pre`→`ffn_norm`→`ffn`→`hc_post`，两条 residual 回边在左侧）→ `hc_head` 压回 `[T,H]` → `norm` → `lm_head`。橙色框是 `torch.ops.vllm.mhc_pre/mhc_post` 自定义算子（判据：`torch.ops.vllm.` 前缀）；紫色虚线容器是 `@torch.compile` 编译区（判据：装饰器）；右侧紫色旁路是 `copy_` 去 `_mtp_hidden_buffer`（判据：它是 buffer 不是子模块，进数据流不进树）。这张图画的是 hc_pre/hc_post 的**逻辑**粒度——每个图元仍能钉回一行源码，但要经过下一条注解换算。*
+
+> **v0.21.0 更新**：图上画成两个分开橙色框的 `hc_post`→`hc_pre`，在当前源码里除了模型的第一段（第 0 层的 attn 段，无上一段可收）和最后一段（挪到 §29.4 循环结束处、`DeepseekV4Model.forward` 里单独收尾的那次 `hc_post`）之外，全部被融合进同一个算子 `torch.ops.vllm.mhc_fused_post_pre` 一次调用完成（§29.4 下钻 `DecoderLayer.forward` 时已经读过这处融合）。钉源码时，把图上相邻的 `hc_post`/`hc_pre` 一对框，对应到源码里的同一次 `mhc_fused_post_pre` dispatch，而不是两次分开的 `torch.ops.vllm.mhc_pre`/`mhc_post` 调用——逻辑结构（两条残差回边）不变，只是这一步「图元→源码」的映射从「一对一」变成了「一对二」。
 
 ## 29.6 配置开关怎么读：可选框与双后端分叉
 

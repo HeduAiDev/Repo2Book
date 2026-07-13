@@ -200,18 +200,20 @@ def maybe_transfer_kv_layer(func: Callable) -> Callable:
     return wrapper
 ```
 
-三个分支挡在前面：没传输组、没 attn_metadata、没绑 metadata，都直接 no-op 调原函数。真要传输时，逻辑就两句话夹住计算：
+三个分支挡在前面：没传输组、没 attn_metadata、没绑 metadata，都直接 no-op 调原函数。真要传输时，装饰器留出两句话夹住计算：
 
-- **进层前**：`wait_for_layer_load(layer_name)`——阻塞到**这一层**的 KV load 完成。
-- **出层后**：`save_kv_layer(layer_name, ...)`——**异步发起**这一层的 KV save。
+- **进层前**：`wait_for_layer_load(layer_name)`——按契约的 docstring，应阻塞到**这一层**的 KV load 完成。
+- **出层后**：`save_kv_layer(layer_name, ...)`——按契约的 docstring，应**异步发起**这一层的 KV save。
 
-把这个和 §34.2 的 `start_load_kv` 拼起来，重叠的完整机制就清楚了：
+这两句话说的是 `KVConnectorBase_V1` 契约层面的**理想化钩子**，画的是"支持真·逐层流水线"的后端应该长成的样子。但**本章覆盖的三个后端没有一个是这样落地的**：NIXL 和 Offloading 的 `wait_for_layer_load`／`save_kv_layer` 都硬编码成空实现（§34.8、§34.9 会看到源码）——它们一次性处理整个请求的 KV，压根没有"逐层"这回事；P2P 的 `wait_for_layer_load` 同样是一句 `return`（§34.7 会看到），它真正的逐层收发发生在 `start_load_kv` 内部一个同步的 for 循环里，在 forward 开始之前就已经跑完，而不是分散到 forward 期间被 `wait_for_layer_load` 一层层放行。
 
-`start_load_kv` 在第 0 层之前就把**所有层**的 load 一把发起——具体而言，P2P 把每一层的 recv 任务依次入队给后台传输线程，NIXL 则向网卡提交一次覆盖所有块的非阻塞 READ，两种方式都由后端引擎自己管并发，mixin 只负责"发起"和"按层等待"这两端。模型照常往前跑，层 0、层 1……每跑一层，`wait_for_layer_load` 只等**当前这一层**的 KV 到位。理想情况下，第 0 层算的时候，后面层的 KV 正在后台搬；等模型算到第 k 层，第 k 层的 KV 早就搬完了，`wait_for_layer_load` 立刻返回，不阻塞。**传输延迟被藏进了前面层的计算里。**
+下面先按这套理想化契约把"重叠"的设计意图讲清楚——这有助于理解为什么契约要拆成"发起"和"逐层等待"两端；但请记住，从 §34.7 开始看到的三个具体后端，没有一个真的按这张图纸运行，读到 §34.8 时不必意外。
 
-### 量化一下这个收益
+契约图纸上的样子是这样：`start_load_kv` 在第 0 层之前就把**所有层**的 load 一把发起，交给后端引擎自己管并发；模型照常往前跑，层 0、层 1……每跑一层，`wait_for_layer_load` 只等**当前这一层**的 KV 到位。理想情况下，第 0 层算的时候，后面层的 KV 正在后台搬；等模型算到第 k 层，第 k 层的 KV 早就搬完了，`wait_for_layer_load` 立刻返回，不阻塞。**传输延迟被藏进了前面层的计算里**——这是契约的设计意图，下面的量化模型算的也是这张图纸，不是本章任何一个后端的实测时序。
 
-先定两个记号：模型层数 $N$ 、每层计算耗时 $t_c$ 。再记整请求 KV 从对端搬到本地 paged buffer 的总耗时为 $T_{xfer}$ 。
+### 量化一下这个收益（契约的理想情形，非本章三个后端的实测时序）
+
+先定两个记号：模型层数 $`N`$ 、每层计算耗时 $`t_c`$ 。再记整请求 KV 从对端搬到本地 paged buffer 的总耗时为 $`T_{xfer}`$ 。这里算的是上一节那张"逐层等待"契约图纸——量化它能看清楚"发起 + 逐层等"这套设计到底想省下什么；但 NIXL/Offloading 没有逐层等待、P2P 的等待发生在 forward 开始之前，三个后端都不严格走这条时间线，下面的具体数字只是示例，不代表任何一个后端的实测数据。
 
 **同步方案**（先把 KV 全搬完再 forward）的总时间是把两段串起来：
 
@@ -225,9 +227,9 @@ $$
 T_{overlap} \approx \max(T_{xfer},\; N \cdot t_c)
 $$
 
-严格说还要加上首层加载与末层尾巴的少量串行残差——第 0 层的 KV 总得先到才能算第 0 层，最后一层的 KV 也总得到齐才能收尾，这两段没法和计算重叠。所以 max 是流水线打满时的理想下界，不是可达的硬下界。但只要 $T_{xfer}$ 量级与 $N t_c$ 相当、残差远小于二者，这个近似就足够说明问题。
+严格说还要加上首层加载与末层尾巴的少量串行残差——第 0 层的 KV 总得先到才能算第 0 层，最后一层的 KV 也总得到齐才能收尾，这两段没法和计算重叠。所以 max 是流水线打满时的理想下界，不是可达的硬下界。但只要 $`T_{xfer}`$ 量级与 $`N t_c`$ 相当、残差远小于二者，这个近似就足够说明问题。
 
-举个数：一个 32 层的模型，每层算 1 ms（合计 32 ms），整请求 KV 传输要 20 ms。同步方案要 20 + 32 = 52 ms；重叠方案只要 max(20, 32) = 32 ms。**只要传输能藏进计算，也就是 $T_{xfer} \lesssim N t_c$ ，那 20 ms 的传输延迟就近乎被完全隐藏**，总时间退化成纯计算时间。这就是把 `start_load_kv` 拆成"早发起 + 逐层等"而非"一把等齐"的全部理由。
+举个数：一个 32 层的模型，每层算 1 ms（合计 32 ms），整请求 KV 传输要 20 ms。同步方案要 20 + 32 = 52 ms；重叠方案只要 max(20, 32) = 32 ms。**只要传输能藏进计算，也就是 $`T_{xfer} \lesssim N t_c`$ ，那 20 ms 的传输延迟就近乎被完全隐藏**，总时间退化成纯计算时间。这就是把 `start_load_kv` 拆成"早发起 + 逐层等"而非"一把等齐"的全部理由。
 
 把上面这组数（32 层、每层 1 ms、传输 20 ms）按层逐拍追一遍，就能看见"阻塞点在前几层、之后立刻返回"这个转折。假设后台传输匀速、20 ms 内搬完全部 32 层，则每 0.625 ms 搬完一层（20 ms ÷ 32 = 0.625 ms/层）；而计算每层 1 ms。表中"已耗时"列是到达第 k 层时的累计时间（第 0 层为 0 ms，第 1 层为第 0 层的等待 0.625 ms 加计算 1 ms，合计 ≈ 1.6 ms，依此累加）。`wait_for_layer_load(layer_k)` 在算到第 k 层时只需等"第 k 层是否已搬完"：
 
@@ -238,9 +240,9 @@ $$
 | 第 8 层（≈8.6 ms） | ≈13.8 层 | 第 8 层早搬完 | 立即返回 |
 | 第 31 层（≈31.6 ms） | 32 层（≈20 ms 时已全搬完） | 第 31 层早搬完 | 立即返回 |
 
-读这张表的方式是看后两列：只有最前面那一两层可能真的等（传输刚起步、计算进度暂时领先搬运进度），一旦"已搬完层数"反超"算到第几层"——这里发生在第 1 层附近——之后每一层的 `wait_for_layer_load` 都立即返回。计算进度（每拍 +1 层，即每 1 ms 推进 1 层）始终慢于传输进度（每 1 ms 搬完 1÷0.625 ≈ 1.6 层），二者的差单调拉开，阻塞窗口只在开头出现一次。这就是"传输藏进计算"在逐层粒度上的真实形状：不是从头到尾零等待，而是开头交一点过路费、之后全程畅通。
+读这张表的方式是看后两列：只有最前面那一两层可能真的等（传输刚起步、计算进度暂时领先搬运进度），一旦"已搬完层数"反超"算到第几层"——这里发生在第 1 层附近——之后每一层的 `wait_for_layer_load` 都立即返回。计算进度（每拍 +1 层，即每 1 ms 推进 1 层）始终慢于传输进度（每 1 ms 搬完 1÷0.625 ≈ 1.6 层），二者的差单调拉开，阻塞窗口只在开头出现一次。这就是"传输藏进计算"在逐层粒度上的**理想形状**：不是从头到尾零等待，而是开头交一点过路费、之后全程畅通——**但这是契约留给"真·逐层流水线"后端的设计目标，不是 P2P/NIXL/Offloading 任何一个的实际时序**：NIXL/Offloading 的这一整栏"等多久"恒为 0（`wait_for_layer_load` 直接 `return`），P2P 的等待则已经在 `start_load_kv` 里、forward 开始之前一次性做完，不会按层展开成这张表的样子。
 
-而出层后的 `save_kv_layer` 是对称的另一半：边算后面的层，边把前面层的 KV 异步搬出去，把 save 也摊进计算。
+出层后的 `save_kv_layer` 同理：契约设想的是边算后面的层、边把前面层的 KV 异步搬出去。这一步对 P2P 是真的——producer 在 `save_kv_layer` 里真的逐层调用 `send_tensor` 异步发送（§34.7）；但 NIXL、Offloading 的 `save_kv_layer` 同样是空实现，它们的"保存"另有机制，§34.8、§34.9 会看到具体怎么回事。
 
 ---
 
@@ -585,7 +587,7 @@ def wait_for_save(self):
         self.connector_worker.save_kv_to_host(self._connector_metadata)
 ```
 
-注意 `wait_for_layer_load` 和 `save_kv_layer` 都是 **no-op**。这不是偷懒，是 NIXL 的传输模型决定的——这是第二个、也是更深的不同。
+这就印证了 §34.3 提前打的预防针：`wait_for_layer_load` 和 `save_kv_layer` 都是 **no-op**。这不是偷懒，是 NIXL 的传输模型决定的——这是第二个、也是更深的不同。
 
 **第二个不同：RDMA 单边 READ。** P2P 是 producer 主动"推"（send）KV。NIXL 反过来——**decode worker 主动从 prefill worker 的显存里"读"（READ）KV**，而 prefill 端的 CPU/GPU 完全不参与这次传输。这是 RDMA 单边操作的本质：发起方给网卡一组地址，网卡直接搬对端内存，对端 CPU 无感。
 
@@ -827,7 +829,7 @@ bind_connector_metadata → start_load_kv → [forward 内：层级 hook] → wa
 
 这一章把 PD 分离的 worker 侧讲透了。回头看三条主线：
 
-**一个 context manager 夹住整条搬运线。** `vllm/v1/worker/kv_connector_model_runner_mixin.py` 里的 `_get_kv_connector_output` 用 `enter`/`finally` 把 model forward 夹在中间：enter 段 `bind` + `start_load_kv` 异步发起，finally 段 `wait_for_save` 收齐 + `get_finished` 收割。`start_load_kv` 早发起、`wait_for_layer_load` 逐层等，把 KV 传输延迟藏进逐层计算里——理想下总时间从 $T_{xfer} + N t_c$ 压到 $\max(T_{xfer}, N t_c)$ 。`wait_for_save` 则是一道不能省的正确性围栏：保证异步 save 读完，paged 块才允许被下一步复用。
+**一个 context manager 夹住整条搬运线。** `vllm/v1/worker/kv_connector_model_runner_mixin.py` 里的 `_get_kv_connector_output` 用 `enter`/`finally` 把 model forward 夹在中间：enter 段 `bind` + `start_load_kv` 异步发起，finally 段 `wait_for_save` 收齐 + `get_finished` 收割。`start_load_kv` 早发起、`wait_for_layer_load` 逐层等，把 KV 传输延迟藏进逐层计算里——理想下总时间从 $`T_{xfer} + N t_c`$ 压到 $`\max(T_{xfer}, N t_c)`$ 。`wait_for_save` 则是一道不能省的正确性围栏：保证异步 save 读完，paged 块才允许被下一步复用。
 
 **同一套 worker 契约，三种填法。** `KVConnectorBase_V1` 定下 `start_load_kv` / `wait_for_layer_load` / `save_kv_layer` / `wait_for_save` / `get_finished` 五个方法。P2P NCCL 用点对点 send/recv 直发，单类自包含、靠 `is_producer` 分角色、`wait_for_save → wait_for_sent` 等队空；NIXL 用 RDMA 单边 READ，facade 拆 worker 子对象、两个层 hook 是 no-op、完成信号因"谁发起谁知道"而不对称；Offloading 做 CPU/磁盘卸载，`wait_for_save` 只入队不等待、store 推迟到下一步避开采样关键路径、`finished_sending` 恒空改走围栏。
 

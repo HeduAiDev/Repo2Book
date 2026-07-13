@@ -255,7 +255,7 @@ def calc_split_factor(num_list: list[int]):
 | GQA（K/V 对称） | `[64, 64]` | `[2.0, 2.0]` | `size // 2` | `size // 2` | 恰好对半 |
 | DeepSeek MLA | `[512, 64]` | `[576/512, 576/64]` | `size·512/576` | `size·64/576` | nope 占 8/9 |
 
-GQA 的 K、V head 数对称，所以对半；MLA 的 nope（`kv_lora_rank=512`）比 rope（`qk_rope_head_dim=64`）大得多，K 块就吃掉 8/9 的字节。**这是「为什么拆、拆多少」的完整算术答案**——拆出来的两块字节数忠实反映各自负载，绝不是机械对半。
+机制上，`calc_split_factor` 从不写死 `size // 2`，而是按 head 维度比例算：GQA 因为两侧 head 数对称（`[64, 64]`），比例算出来才巧合等于对半；MLA 因为 nope（`kv_lora_rank=512`）比 rope（`qk_rope_head_dim=64`）悬殊得多，同一套比例公式算出的结果就明显偏斜——K 块吃掉 8/9 的字节。**这是「为什么拆、拆多少」的完整算术答案**——拆出来的两块字节数忠实反映各自负载，机制不是硬编码对半，只是 GQA 这个具体案例的结果恰好如此。
 
 ## 17.4 sparse-c8 的双视图：两段 KV 共享一块对齐内存
 

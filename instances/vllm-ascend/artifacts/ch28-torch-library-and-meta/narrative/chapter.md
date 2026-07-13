@@ -204,7 +204,7 @@ std::tuple<at::Tensor, at::Tensor> get_masked_input_and_mask_meta(
 }
 ```
 
-签名**逐字对齐**真实现，但函数体只剩「建输出张量」那半：`masked_input` 同形、`mask` 同形且 dtype 强制 `kBool`（精确复刻真实现里那句 `.to(at::kBool)`），然后直接 `return`。**没有 `data_ptr`、没有 NPU 流、没有 `OpCommand`。** 假跑调它，就能在不碰任何设备内存的前提下，把「输出俩张量、一个跟输入同形、一个同形 bool」这个结论推下去。
+签名**逐字对齐**真实现，但函数体只剩「建输出张量」那半：`masked_input` 同形、`mask` 同形且 dtype 强制 `kBool`（效果等价于真实现那句 `.to(at::kBool)`，只是写法换成了 `input.options().dtype(at::kBool)`），然后直接 `return`。**没有 `data_ptr`、没有 NPU 流、没有 `OpCommand`。** 假跑调它，就能在不碰任何设备内存的前提下，把「输出俩张量、一个跟输入同形、一个同形 bool」这个结论推下去。
 
 > 别被「两边都 `at::empty_like` 」绊住——以为它俩没区别。区别全在后半段：真实现 `empty_like` 之后**真往设备上算并填了数据**；meta `empty_like` 之后**直接返回空壳**，那块内存里是什么它根本不关心。形状对了就够了。
 
@@ -355,7 +355,7 @@ if not is_310p():
     register_meta_if_necessary("_C_ascend", "sgmv_expand", sgmv_expand_meta)
 ```
 
-跟 C++ 版逐字对得上：`torch.empty_like(input)` + `.to(torch.bool)`，只推形状。末尾的 `if not is_310p()` 守卫，跟 C++ 那边的 `#ifdef ASCEND_PLATFORM_310P` 一一呼应——同一套芯片分叉逻辑，在两种语言里各表一次。补的就是 [§28.4](#284-第二条线c-meta只推形状不真算) 末尾点到的、被编译开关控住的那几个 direct-kernel 算子——它们跟 [§28.5](#285-缺口-6-个无-meta-不能进图的实证) 那 6 个永久缺口是两组不同的算子：这 3 个是「C++ 没编进就 Python 补」，那 6 个是「C++ / Python 都没有」。
+跟 C++ 真实现里 mask 那句写法一致（`.to(torch.bool)`）；跟 C++ meta 版（[§28.4](#284-第二条线c-meta只推形状不真算) 的 `get_masked_input_and_mask_meta`）效果一致但写法不同——那边用的是 `options().dtype()`。末尾的 `if not is_310p()` 守卫，跟 C++ 那边的 `#ifdef ASCEND_PLATFORM_310P` 一一呼应——同一套芯片分叉逻辑，在两种语言里各表一次。补的就是 [§28.4](#284-第二条线c-meta只推形状不真算) 末尾点到的、被编译开关控住的那几个 direct-kernel 算子——它们跟 [§28.5](#285-缺口-6-个无-meta-不能进图的实证) 那 6 个永久缺口是两组不同的算子：这 3 个是「C++ 没编进就 Python 补」，那 6 个是「C++ / Python 都没有」。
 
 ## 28.7 第三条线：纯 Python 算子，一站式注册
 

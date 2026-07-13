@@ -61,7 +61,7 @@ num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 )
 ```
 
-`_prepare_inputs` 产出三件套——`logits_indices`、`spec_decode_metadata`、token 总数。`_determine_batch_execution_and_padding` 则吐出一组**「本拍怎么跑」的决策**：用哪种 cudagraph 模式、batch 描述符、以及那个贯穿全章的 `num_tokens_across_dp`（DP 各卡对齐后的 token 数）。**DP 同步就藏在这第二个方法里**——这是本章第一个要深挖的接缝。
+`_prepare_inputs` 产出三件套——`logits_indices`、`spec_decode_metadata`、token 总数。`_determine_batch_execution_and_padding` 则吐出一组 **「本拍怎么跑」的决策**：用哪种 cudagraph 模式、batch 描述符、以及那个贯穿全章的 `num_tokens_across_dp`（DP 各卡对齐后的 token 数）。**DP 同步就藏在这第二个方法里**——这是本章第一个要深挖的接缝。
 
 往后，主干还有四步：建注意力元数据、预处理、`set_ascend_forward_context` 包住的前向、采样。我们按顺序拆。先看输入整形。
 
@@ -208,24 +208,35 @@ def _post_process_cudagraph_mode(tensor: torch.Tensor) -> int:
 | t | (40, FULL=2) | (24, NONE=0) | tokens=[40,24]，mode=[2,0] | 40 | 0 (NONE) | rank 0 跑 40、rank 1 跑 24（eager 各卡保留自己的 token 数），都 eager |
 | t+1 | (32, FULL=2) | (48, FULL=2) | tokens=[32,48]，mode=[2,2] | 48 | 2 (FULL) | 都 padding 到 48、都进 FULL 图 |
 
-这里有个容易踩空的细节：**只有进图模式才把各卡统一补到 max；纯 eager 各跑各的。** 决定补不补的，是每张卡用「同步前自己的本地模式」算出的 `allow_dp_padding`（`model_runner_v1.py:L2910`）——`cudagraph_mode != NONE` 或开了 SP 才为真。回看 `_sync_metadata_across_dp` 的解包（L668-673）：`allow_dp_padding` 为真时返回 `[max]*dp_size`（全卡补到 max），为假时返回 `num_tokens_across_dp` 原样（各卡保留自己的数）。
+这里有个容易踩空的细节：**只有 `cudagraph_mode != NONE`（进图）或开了 SP 才会把各卡统一补到 max；两者都不满足，才各跑各的。** 决定补不补的，是每张卡用「同步前自己的本地模式」算出的 `allow_dp_padding`（`model_runner_v1.py:L2910`）——这是一个 OR：`cudagraph_mode != NONE` 或开了 SP，任一为真即补齐。回看 `_sync_metadata_across_dp` 的解包（L668-673）：`allow_dp_padding` 为真时返回 `[max]*dp_size`（全卡补到 max），为假时返回 `num_tokens_across_dp` 原样（各卡保留自己的数）。
 
-对着两拍看就清楚了。第 t 拍，rank 1 本地已是 NONE、未开 SP，`allow_dp_padding=False`，走 else 分支——rank 0 跑自己的 40、rank 1 跑自己的 24，谁也不补；min 一拉，两卡模式都退回 eager。这恰好呼应本节立的论点：**padding 到 max 是为了一起进同一张图、形状才一致；eager 不进图，本就不需要统一 padding。** 第 t+1 拍，两卡都进图（FULL≠NONE），`allow_dp_padding=True`，token 才真正都补到 max=48，一起进同一张 FULL 图。**进图这一拍，两张卡迈进前向的脚步被强行对齐**——这正是 MoE 集合通信不错位的前提。
+对着两拍看就清楚了。第 t 拍，rank 1 本地已是 NONE、未开 SP，`allow_dp_padding=False`，走 else 分支——rank 0 跑自己的 40、rank 1 跑自己的 24，谁也不补；min 一拉，两卡模式都退回 eager。这恰好呼应本节立的论点：**padding 到 max 是为了一起进同一张图、形状才一致；eager 不进图、又没开 SP，本就不需要统一 padding（本例两拍都未开 SP，图/eager 的二分恰好与补/不补的二分重合，但一旦开了 SP，即便是 eager 也会补齐到 max，这不是通用规律）。** 第 t+1 拍，两卡都进图（FULL≠NONE），`allow_dp_padding=True`，token 才真正都补到 max=48，一起进同一张 FULL 图。**进图这一拍，两张卡迈进前向的脚步被强行对齐**——这正是 MoE 集合通信不错位的前提。
 
 ### 两条捷径：能跳过同步的情形
 
 同步虽便宜，能省还是省。开头那个 `should_skip_allreduce_across_dp_group` 就是这道闸：
 
 ```python
-# vllm_ascend/utils.py:L1101-L1106
+# vllm_ascend/utils.py:L1100-L1109
 # For dense models, since we don't actually need dp communication, we simply skip it.
 # This usually happens when main model is moe while eagle draft model is dense.
 is_context_moe_model = is_drafter_moe_model(vllm_config) if is_draft_model else is_moe_model(vllm_config)
 if not is_context_moe_model:
     return True
+
+# Only applicable to MoE models on KV consumer ranks.
+is_kv_consumer = vllm_config.kv_transfer_config is not None and vllm_config.kv_transfer_config.is_kv_consumer
+if not is_kv_consumer:
+    return False
+    # … 省略：中间一段按 cudagraph 容量/调度器配置估算 decode 侧最大 token 数、
+    # 再分别对 decode / prefill 判定是否落在 MC2 通信方式上的计算 …
+# vllm_ascend/utils.py:L1150-L1152
+# Skip all-reduce if decode requires MC2 and either prefill also
+# requires MC2 or recompute-based scheduler is enabled.
+return decode_must_use_mc2 and (prefill_must_use_mc2 or get_ascend_config().recompute_scheduler_enable)
 ```
 
-逻辑很直接：**dense（非 MoE）模型根本没有那个会错位的跨卡集合通信，直接跳。** 只有 MoE 模型才需要同步；而 MoE 里也有一类例外——PD 分离（见 [第 11 章](../../ch11-pd-disaggregation-mooncake/narrative/chapter.md)）的解码侧、且 prefill/decode 都走 MC2 时，这类 MoE 各卡 token 数本就允许不同，也能跳。跳过意味着各卡 token 数互不干涉，省下这次 all_reduce。
+逻辑很直接：**dense（非 MoE）模型根本没有那个会错位的跨卡集合通信，直接跳。** 只有 MoE 模型才需要同步；而 MoE 里也有一类例外——`is_kv_consumer` 为真，即 PD 分离（见 [第 11 章](../../ch11-pd-disaggregation-mooncake/narrative/chapter.md)）的解码侧作为 KV consumer 时，才继续往下判：decode 侧要求走 MC2，且（prefill 侧也走 MC2，**或者** 开了 `recompute_scheduler_enable`）——满足即可跳过。这类 MoE 各卡 token 数本就允许不同，也能跳。跳过意味着各卡 token 数互不干涉，省下这次 all_reduce。
 
 还有那个 `dp_allreduce_on_npu` 开关，值得记一句。注释写明：某些设备上 **CPU 侧的 all_reduce 可能返回脏数据**。开启这个开关后，DP 元数据同步改走 NPU device group，规避数据损坏——代价是结果要多一次 `.cpu()` 拷回 host。这是昇腾踩过坑后留下的一道保险。
 

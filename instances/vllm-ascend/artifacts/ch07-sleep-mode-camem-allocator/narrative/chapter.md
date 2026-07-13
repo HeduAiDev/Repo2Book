@@ -412,7 +412,7 @@ libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)
 memcpy(cpu_ptr, dest_max, ptr, size_in_bytes, ACL_MEMCPY_DEVICE_TO_HOST)
 ```
 
-CANN 的 `aclrtMemcpy` 多了两个参数。其一是 **`destMax`**——目的缓冲区的容量上界，CANN 要求显式传它、运行时拿它防越界写。代码里给的是 `size_in_bytes * 2`：这个 `*2` 不是精确值，而是一个宽松的安全边界——给个比实际拷贝量大的上界即可，不必算准（实际只会写 `size_in_bytes`）。其二是**显式方向枚举 `kind`**：`ACL_MEMCPY_DEVICE_TO_HOST = 2`（sleep 拷回 CPU）、`ACL_MEMCPY_HOST_TO_DEVICE = 1`（wake 拷回设备）。CUDA 的 `cudaMemcpy` 能从指针所在地址空间自动推断方向，CANN 则要求你把方向写明。除此之外，控制流和 vLLM 一模一样。
+CANN 的 `aclrtMemcpy` 多了两个参数。其一是 **`destMax`**——目的缓冲区的容量上界，CANN 要求显式传它、运行时拿它防越界写。代码里给的是 `dest_max = cpu_ptr + size_in_bytes * 2`（§7.5.3 表里 ①的具体值就是 `cpu_ptr + 1024*2`）：这不是一个精确值，而是一个宽松的安全边界——真正让上界远超实际拷贝量的是加上的指针地址值 `cpu_ptr` 本身（一个 64 位地址，数量级上早就远大于 `size_in_bytes`），末尾的 `*2` 只是在此基础上再加一点余量，不是这条「宽松边界」成立的主因；给个比实际拷贝量大的上界即可，不必算准（实际只会写 `size_in_bytes`）。其二是**显式方向枚举 `kind`**：`ACL_MEMCPY_DEVICE_TO_HOST = 2`（sleep 拷回 CPU）、`ACL_MEMCPY_HOST_TO_DEVICE = 1`（wake 拷回设备）。CUDA 的 `cudaMemcpy` 能从指针所在地址空间自动推断方向，CANN 则要求你把方向写明。除此之外，控制流和 vLLM 一模一样。
 
 ## 7.6 打标签：两档 sleep 怎么分流 weights 与 KV
 

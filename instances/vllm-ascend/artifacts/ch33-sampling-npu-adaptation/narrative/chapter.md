@@ -100,7 +100,7 @@ def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
 
 现在进到这一章的核心——随机采样到底怎么做。
 
-直觉上，「按概率分布 $p$ 抽一个 token」最直接的写法是 `torch.multinomial(probs, 1)`。但 vLLM v1 的**主采样路径**（PyTorch 原生 / CUDA）不用它（ROCm 的 aiter 旁路是例外，仍调 multinomial，但那不是主线）。原因藏在一句注释里。先看昇腾版的 `random_sample`：
+直觉上，「按概率分布 $`p`$ 抽一个 token」最直接的写法是 `torch.multinomial(probs, 1)`。但 vLLM v1 的**主采样路径**（PyTorch 原生 / CUDA）不用它（ROCm 的 aiter 旁路是例外，仍调 multinomial，但那不是主线）。原因藏在一句注释里。先看昇腾版的 `random_sample`：
 
 ```python
 # vllm_ascend/sample/sampler.py:L19
@@ -138,7 +138,7 @@ def random_sample(
 return probs.div_(q).argmax(dim=-1).view(-1)
 ```
 
-其中 `q` 是一张和 `probs` 同形、每个元素独立服从 $\mathrm{Exp}(1)$ （速率为 1 的指数分布）的随机张量，由 `q.exponential_()` 原地填充。然后 `probs.div_(q)` 逐元素算 $p_i/q_i$ ，最后 `argmax` 取最大的那个下标。
+其中 `q` 是一张和 `probs` 同形、每个元素独立服从 $`\mathrm{Exp}(1)`$ （速率为 1 的指数分布）的随机张量，由 `q.exponential_()` 原地填充。然后 `probs.div_(q)` 逐元素算 $`p_i/q_i`$ ，最后 `argmax` 取最大的那个下标。
 
 **关键的归属问题先说清楚**：这套 Gumbel 数学**不是昇腾发明的**。它是 vLLM 上游为规避 multinomial 同步早就采用的手法。把基座的 `random_sample` 拉过来对照，几乎逐字一致：
 
@@ -174,7 +174,7 @@ def random_sample(
 
 这是全章最值得推一遍的等式。直觉上很难相信「除一个指数随机再取最大」会等价于「按概率抽样」，但它精确成立。
 
-**命题**：设类别概率为 $p_1, \dots, p_V$ （归一）。对每个类别独立抽一个标准指数随机数，算比值后取最大下标，其分布等于按概率的多项式采样：
+**命题**：设类别概率为 $`p_1, \dots, p_V`$ （归一）。对每个类别独立抽一个标准指数随机数，算比值后取最大下标，其分布等于按概率的多项式采样：
 
 $$
 q_i \sim \mathrm{Exp}(1)\ \mathrm{i.i.d.} \quad\Longrightarrow\quad \arg\max_i \frac{p_i}{q_i}\ \sim\ \mathrm{Categorical}(p)
@@ -194,25 +194,25 @@ $$
 q_i \sim \mathrm{Exp}(1) \;\Longrightarrow\; \frac{q_i}{p_i} \sim \mathrm{Exp}(p_i)
 $$
 
-速率从 1 变成了 $p_i$ 。
+速率从 1 变成了 $`p_i`$ 。
 
-第三步，用独立指数变量取最小的经典结论：最小值落在第 $i$ 个的概率，等于它的速率占总速率的比例：
+第三步，用独立指数变量取最小的经典结论：最小值落在第 $`i`$ 个的概率，等于它的速率占总速率的比例：
 
 $$
 P\!\left(\arg\min_i X_i = i\right) = \frac{\lambda_i}{\sum_j \lambda_j}, \qquad X_i \sim \mathrm{Exp}(\lambda_i)
 $$
 
-把速率 $\lambda_i = p_i$ 代入，各速率之和等于 1，于是这个概率正好是 $p_i$ 。证毕。
+把速率 $`\lambda_i = p_i`$ 代入，各速率之和等于 1，于是这个概率正好是 $`p_i`$ 。证毕。
 
-一句话翻译：除以指数随机，相当于给每个类别一个「按概率拉伸过的赛跑时间」，概率越大的类别期望跑得越快、越容易成为最小值——而最小值取中谁的概率，精确等于它的概率 $p_i$ 。所以 `div_(q).argmax` 抽出来的 token，分布和 multinomial 完全一样，但它只用了一次逐元素除法加一次 argmax，没有 CDF、没有 host 同步。
+一句话翻译：除以指数随机，相当于给每个类别一个「按概率拉伸过的赛跑时间」，概率越大的类别期望跑得越快、越容易成为最小值——而最小值取中谁的概率，精确等于它的概率 $`p_i`$ 。所以 `div_(q).argmax` 抽出来的 token，分布和 multinomial 完全一样，但它只用了一次逐元素除法加一次 argmax，没有 CDF、没有 host 同步。
 
-> 等价地从 Gumbel 视角看：给每个 $\log p_i$ 加一个独立的标准 Gumbel 噪声、再取 argmax，结果同样服从 $\mathrm{Categorical}(p)$ ——这就是教科书里的 Gumbel-max trick，指数变体只是它的另一种写法。
+> 等价地从 Gumbel 视角看：给每个 $`\log p_i`$ 加一个独立的标准 Gumbel 噪声、再取 argmax，结果同样服从 $`\mathrm{Categorical}(p)`$ ——这就是教科书里的 Gumbel-max trick，指数变体只是它的另一种写法。
 
-### 数值验证：经验频率逼近 $p$
+### 数值验证：经验频率逼近 $`p`$
 
-数学证明之外，跑一遍看数值。取 $p = [0.1, 0.2, 0.3, 0.4]$ ，复制成 $B = 40000$ 行的 batch，调一次 `random_sample`（无种子，`generators` 为空，整张 `q` 走一次 `exponential_()`），再统计每个 token 被抽中的经验频率。下面是 host CPU torch 上 `manual_seed(0)` 真跑一次的结果：
+数学证明之外，跑一遍看数值。取 $`p = [0.1, 0.2, 0.3, 0.4]`$ ，复制成 $`B = 40000`$ 行的 batch，调一次 `random_sample`（无种子，`generators` 为空，整张 `q` 走一次 `exponential_()`），再统计每个 token 被抽中的经验频率。下面是 host CPU torch 上 `manual_seed(0)` 真跑一次的结果：
 
-| token | 真实概率 $p_i$ | 经验频率（B=40000，实测） | 偏差 |
+| token | 真实概率 $`p_i`$ | 经验频率（B=40000，实测） | 偏差 |
 |---|---|---|---|
 | 0 | 0.10 | 0.1004 | 0.0004 |
 | 1 | 0.20 | 0.1974 | 0.0026 |
@@ -339,7 +339,7 @@ def _apply_top_k_top_p_pytorch(logits, k, p, top_k=None):
     return logits
 ```
 
-函数内部先用 `probs = logits.softmax(dim=-1)` 把 logits 归一成概率，再按概率排序做截断：top-k 把概率第 $k$ 大以下的全置 `-inf`；top-p 沿升序累积概率，把累积质量落在尾部 $1-p$ 区间里的（即不在核 top-p 集合里的）置 `-inf`。被置 `-inf` 的 token 经 softmax 后概率归零，自然不会被采到。注意 `top_p_mask[:, -1] = False` 这行：因为 `probs_sort` 是升序排的，最后一列 `[:, -1]` 正是概率最大的那个候选，把它的 mask 强制设回 `False` 就保证每行至少留一个候选（最高概率那个永远不被 top-p 截掉），避免整行被截空。
+函数内部先用 `probs = logits.softmax(dim=-1)` 把 logits 归一成概率，再按概率排序做截断：top-k 把概率第 $`k`$ 大以下的全置 `-inf`；top-p 沿升序累积概率，把累积质量落在尾部 $`1-p`$ 区间里的（即不在核 top-p 集合里的）置 `-inf`。被置 `-inf` 的 token 经 softmax 后概率归零，自然不会被采到。注意 `top_p_mask[:, -1] = False` 这行：因为 `probs_sort` 是升序排的，最后一列 `[:, -1]` 正是概率最大的那个候选，把它的 mask 强制设回 `False` 就保证每行至少留一个候选（最高概率那个永远不被 top-p 截掉），避免整行被截空。
 
 这套 host 可跑的纯 torch 实现，正是「无 NPU 也能验证语义」的关键：可以在 CPU 上喂一个 `logits=[1,2,3,4]`、`k=2`，验证它确实只留下最大的两个（值 4、3）、其余两个变 `-inf`。芯片专用算子只是把同样的语义做得更快。
 
@@ -480,7 +480,7 @@ if not sampling_metadata.all_random:
 
 ### 随机投机的接受判据与残差重采
 
-如果不是贪心而是带温度的随机采样，接受规则换成概率比。对一个 draft token，设它在 target 分布下的概率 `p_target`、在 draft 分布下的概率 `p_draft`、再抽一个均匀随机数 $u$ ，**接受当且仅当**比值不小于这个均匀样本：
+如果不是贪心而是带温度的随机采样，接受规则换成概率比。对一个 draft token，设它在 target 分布下的概率 `p_target`、在 draft 分布下的概率 `p_draft`、再抽一个均匀随机数 $`u`$ ，**接受当且仅当**比值不小于这个均匀样本：
 
 $$
 \frac{p_{\mathrm{target}}}{p_{\mathrm{draft}}} \ge u
@@ -497,7 +497,7 @@ acceptance_condition = (draft_token_probs > zero_threshold) & (
 
 直觉：target 比 draft 越「看好」这个 token（比值越大），越容易接受；比值 ≥ 1 时必接受。举个数：draft 笃定选 token1，概率 1.0；target 对 token1 的概率 0.6，比值就是 0.6。均匀数若抽到 0.3，则 0.6 ≥ 0.3，接受；若抽到 0.9，则 0.6 < 0.9，拒绝。前半个判据 `draft_token_probs > zero_threshold` 是道护栏：`zero_threshold` 是函数内现造的 0.0 常量张量（`torch.tensor([0.0], pin_memory=True).to(device, non_blocking=True)`），要求 draft 概率严格大于 0，避免下一步用它做分母时除以零。
 
-一旦某位被拒，不能简单丢弃——那会让最终分布偏离 target。标准投机解码的做法是从**残差分布**重新采一个「恢复 token」。残差是 target 减 draft 的正部，`∝` 之后还要除以归一化常数 $Z$ 才是一个合法概率分布：
+一旦某位被拒，不能简单丢弃——那会让最终分布偏离 target。标准投机解码的做法是从**残差分布**重新采一个「恢复 token」。残差是 target 减 draft 的正部，`∝` 之后还要除以归一化常数 $`Z`$ 才是一个合法概率分布：
 
 $$
 p_{\mathrm{recover}}(x) = \frac{\max\!\bigl(0,\; p_{\mathrm{target}}(x) - p_{\mathrm{draft}}(x)\bigr)}{Z}, \qquad Z = \sum_x \max\!\bigl(0,\; p_{\mathrm{target}}(x) - p_{\mathrm{draft}}(x)\bigr)
@@ -520,25 +520,25 @@ recovered_ids = torch.argmax(prob_over_q, dim=1)
 
 代码里那个 `torch.tensor(0.0, pin_memory=True).to(device, non_blocking=True)` 顺带演示了一个昇腾上常见的小手法：用锁页内存（`pin_memory`）+ 非阻塞拷贝（`non_blocking=True`）发起 H2D 传输，让这点常量的搬运和设备上的计算重叠、不卡一次同步。
 
-接受时取 draft 的 token、拒绝时取残差重采的 token、全接受时追加 bonus——这套「接受/拒绝/补偿」的组合，保证了最终采出的 token 边缘分布精确等于 target 分布。为什么？把单个位置输出某个 token $x$ 的概率拆成「draft 提议 $x$ 且被接受」与「先拒绝、再从残差采到 $x$ 」两项相加：
+接受时取 draft 的 token、拒绝时取残差重采的 token、全接受时追加 bonus——这套「接受/拒绝/补偿」的组合，保证了最终采出的 token 边缘分布精确等于 target 分布。为什么？把单个位置输出某个 token $`x`$ 的概率拆成「draft 提议 $`x`$ 且被接受」与「先拒绝、再从残差采到 $`x`$ 」两项相加：
 
 $$
 P(\mathrm{out}=x) = \underbrace{p_{\mathrm{draft}}(x)\cdot\min\!\Bigl(1,\tfrac{p_{\mathrm{target}}(x)}{p_{\mathrm{draft}}(x)}\Bigr)}_{\mathrm{accept}} \;+\; \underbrace{Z\cdot p_{\mathrm{recover}}(x)}_{\mathrm{residual}}
 $$
 
-下面记 $p_d=p_{\mathrm{draft}}(x)$ 、 $p_t=p_{\mathrm{target}}(x)$ 。第一项化简就是 $\min(p_d, p_t)$ 。第二项里，总拒绝概率恰好等于残差归一化常数 $Z$ ——因为两侧正部之和相等：
+下面记 $`p_d=p_{\mathrm{draft}}(x)`$ 、 $`p_t=p_{\mathrm{target}}(x)`$ 。第一项化简就是 $`\min(p_d, p_t)`$ 。第二项里，总拒绝概率恰好等于残差归一化常数 $`Z`$ ——因为两侧正部之和相等：
 
 $$
 \sum_y \max\!\bigl(0,\, p_{\mathrm{draft}}(y)-p_{\mathrm{target}}(y)\bigr) = \sum_y \max\!\bigl(0,\, p_{\mathrm{target}}(y)-p_{\mathrm{draft}}(y)\bigr) = Z
 $$
 
-于是 $Z\cdot p_{\mathrm{recover}}(x)$ 正好等于 $\max(0,\, p_t - p_d)$ 。两项相加得：
+于是 $`Z\cdot p_{\mathrm{recover}}(x)`$ 正好等于 $`\max(0,\, p_t - p_d)`$ 。两项相加得：
 
 $$
 \min(p_d, p_t) + \max(0,\, p_t - p_d) = p_{\mathrm{target}}(x)
 $$
 
-无论 $p_t$ 大于还是小于 $p_d$ 都成立。这就是拒绝采样保边缘分布的经典结论——和 [§33.2](#为什么-argmaxpq-和按-p-多项式采样同分布) 的 Gumbel 等价一样，是一句话能推完的数学。draft 只是加速猜测，是否采纳由 target 说了算，且被拒时从残差补回，一个分布都不偏。
+无论 $`p_t`$ 大于还是小于 $`p_d`$ 都成立。这就是拒绝采样保边缘分布的经典结论——和 [§33.2](#为什么-argmaxpq-和按-p-多项式采样同分布) 的 Gumbel 等价一样，是一句话能推完的数学。draft 只是加速猜测，是否采纳由 target 说了算，且被拒时从残差补回，一个分布都不偏。
 
 把端到端串起来：`AscendRejectionSampler.forward` 先用持有的 `self.sampler`（也就是 `AscendSampler`）采出 bonus token，再 `apply_sampling_constraints` 套上温度/top-k/top-p，最后调 `rejection_sample` 做接受检验。无 Triton 时全程走上面那些 `*_pytorch` 回退，host 上就能验证四种场景的输出，逐一对上前面讲过的规则：
 

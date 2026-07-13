@@ -12,7 +12,7 @@
 
 问题来了：这两根支柱在 vLLM 里都是为 CUDA / Inductor 写的（Inductor 是 `torch.compile` 默认的图编译后端，负责把 fx 图降级成优化 kernel，并内置 pattern matcher 做算子融合）。昇腾 NPU 既不走 Inductor，也没有 `torch.cuda.CUDAGraph`。**它要怎么把这两套栈换成 NPU 版，又不去改 vLLM 编译框架的一行代码？**
 
-答案出奇地干净：在 `platform.py` 上动了三处钩子，但归根结底是**「编译」和「图捕获」两根支柱**——pass manager 是为编译后端服务的，算是「编译」这根支柱里的一颗螺丝。三处钩子、两根支柱，这一章就围着这层关系展开。
+答案出奇地干净：在 `platform.py` 上动了三处钩子，但归根结底是 **「编译」和「图捕获」两根支柱**——pass manager 是为编译后端服务的，算是「编译」这根支柱里的一颗螺丝。三处钩子、两根支柱，这一章就围着这层关系展开。
 
 ![本章地图：三钩子两支柱——编译栈与图捕获剖面](../diagrams/chapter-map.png)
 
@@ -76,7 +76,7 @@ def make_compiler(compilation_config: CompilationConfig) -> CompilerInterface:
         return compiler
 ```
 
-`resolve_obj_by_qualname(...)` 拿到的就是钩子返回的那个字符串，把它当**全限定类名（qualname）**解析成类、实例化。紧跟一句 `assert isinstance(compiler, CompilerInterface)`——这就是契约：昇腾返回的 `AscendCompiler` **必须**是 vLLM `CompilerInterface` 的子类。打开源码，正是如此：
+`resolve_obj_by_qualname(...)` 拿到的就是钩子返回的那个字符串，把它当**全限定类名（qualname）** 解析成类、实例化。紧跟一句 `assert isinstance(compiler, CompilerInterface)`——这就是契约：昇腾返回的 `AscendCompiler` **必须**是 vLLM `CompilerInterface` 的子类。打开源码，正是如此：
 
 ```python
 # vllm_ascend/compilation/compiler_interface.py:L30
@@ -341,7 +341,7 @@ def configure(self, config: VllmConfig):
         self.passes.append(SequenceParallelismMoePass(config))
 ```
 
-每个 pass 都挂在一个开关后面。默认开的四个（`fuse_norm_quant` / `fuse_qknorm_rope` / `fuse_allreduce_rms` / `fuse_muls_add`）外加序列并行的两个（由 `enable_sp` 控制），`configure` 显式 `append` 进来的就是**这六个 Pass 类**。`passes/` 目录下还有 `noop_elimination` 与 `allgather_chunk_noop` 两个清理 pass，但它们不在这里 append——而是在序列并行 pass 内部被串起来调用；`base_pattern` 则是所有 pattern 的基类，不是独立 pass。别被目录文件数误导。
+每个 pass 都挂在一个开关后面。默认开的四个（`fuse_norm_quant` / `fuse_qknorm_rope` / `fuse_allreduce_rms` / `fuse_muls_add`）外加序列并行的两个（由 `enable_sp` 控制），`configure` 显式 `append` 进来的就是**这六个 Pass 类**。`passes/` 目录下还有两个名字挂着「noop」的文件，但情况不一样，值得分清楚：`noop_elimination.py` 里的 `NoOpEliminationPass` 确实在跑——`sequence_parallelism.py` 的 `SequenceParallelismPass.__call__` 里有一句 `self.noop_cleanup(graph)`，正是序列并行 pass 内部把它串起来调用的（`vllm_ascend/compilation/passes/sequence_parallelism.py:L198,L211`）。而 `allgather_chunk_noop_pass.py` 里定义的 `AllGatherChunkNoOpCleanupPass`，全仓库搜不到任何 import/实例化点（一份 CI 文件清单除外）——它是没人调用的死代码。真正把「`all_gather` + `chunk` 折叠成恒等」这件事做掉的，是另一个同名相近、但定义在别处的 `AllGatherChunkNoOpPattern`：直接写在 `sequence_parallelism_moe.py` 里，由 `SequenceParallelismMoePass.__init__` 注册进 `self.patterns`（`vllm_ascend/compilation/passes/sequence_parallelism_moe.py:L145,L183`），跟 `allgather_chunk_noop_pass.py` 这个文件没有关系。`base_pattern` 则是所有 pattern 的基类，不是独立 pass。别被目录文件数误导，也别把这两个「noop」搞混。
 
 注意 `is_310p()` 这个门控：310P 推理卡上 `fuse_norm_quant` / `fuse_muls_add` 直接跳过——平台内部还有平台差异，[第 18 章](../../ch18-310p-inference-chip-specialization/narrative/chapter.md)讲过 310P 的特殊待遇，这里又见一例。
 
@@ -349,7 +349,7 @@ def configure(self, config: VllmConfig):
 
 ![融合 pass 栈全景：6 个 Pass + 占位锚点 + 双注册 + 融合实例](../diagrams/fusion_pass_stack.png)
 
-> *图注：中列是 `configure` 按开关 append 的六个 Pass（按源码顺序①→⑥，最后两个由 `enable_sp` 一并控制）；左侧 `register_dummy_fusion_op` 先挂一组 `torch.ops._C_ascend.*` 空壳占位算子，给 pattern 注册提供锚点；右上 `BasePattern.register` 把每条 pattern 同时注册进 torch Inductor（`pm.register_replacement`，供分支 B）和 npugraph_ex（`nge.register_replacement`，供分支 A），即「一份 pattern、双注册」；右侧旁注点明 `noop_elimination` / `allgather_chunk_noop` 在 SP pass 内部被串调、`base_pattern` 只是基类——它们都不在 `self.passes` 里。底部给一例融合：`add_rms_norm_bias → quantize`（2 kernel + 1 中间张量）经融合收成 `npu_add_rms_norm_quant`（1 kernel + 0）。*
+> *图注：中列是 `configure` 按开关 append 的六个 Pass（按源码顺序①→⑥，最后两个由 `enable_sp` 一并控制）；左侧 `register_dummy_fusion_op` 先挂一组 `torch.ops._C_ascend.*` 空壳占位算子，给 pattern 注册提供锚点；右上 `BasePattern.register` 把每条 pattern 同时注册进 torch Inductor（`pm.register_replacement`，供分支 B）和 npugraph_ex（`nge.register_replacement`，供分支 A），即「一份 pattern、双注册」；右侧旁注点明 `noop_elimination` 里的 `NoOpEliminationPass` 在 `SequenceParallelismPass` 内部被串调、`base_pattern` 只是基类——它们都不在 `self.passes` 里（图上「allgather_chunk_noop」一栏对应的其实是 `sequence_parallelism_moe.py` 里的 `AllGatherChunkNoOpPattern`，正文已订正）。底部给一例融合：`add_rms_norm_bias → quantize`（2 kernel + 1 中间张量）经融合收成 `npu_add_rms_norm_quant`（1 kernel + 0）。*
 
 ### 占位算子：让 pattern 有锚点可抓 {#占位算子让-pattern-有锚点可抓}
 
@@ -456,7 +456,7 @@ def get_replacement(self):
 - **pattern（要匹配的子图）**：先 `npu_add_rms_norm_bias` 做带 bias 的 AddRMSNorm（它返回一个 tuple，`output[0]` 是归一化结果、`output[2]` 是残差输出），再单独一个 `quantize` 把 `out0` 量化——**两个算子，中间还落一次中间张量 `out0`**。
 - **replacement（替换成什么）**：一个 `npu_add_rms_norm_quant`——**AddRMSNorm 与量化合成一个融合算子**，中间张量不落地。
 
-收益可以数出来：pattern 这边是 **2 个算子**（`npu_add_rms_norm_bias` + `quantize`）外加 **1 个落地的中间张量 `out0`**；replacement 这边是 **1 个融合算子**、**0 个中间张量落地**。一句话——**「2 kernel + 1 中间张量」收成「1 kernel + 0」**：省一次 kernel 启动、省一趟中间张量的显存往返。而这类 norm/quant 子图**每个 transformer 层都有一份**，所以这点收益会随层数 $L$ **线性放大**——L 层模型就省下约 L 次 kernel 启动和 L 趟中间张量往返。其余七个变体（带 bias 的 / 序列并行 SP 的 / 动态量化 DynamicQuant 的，以及它们的组合）结构同构，只是算子签名、是否带 bias、是否插 `all_gather` 不同，机制一样，不赘述。
+收益可以数出来：pattern 这边是 **2 个算子**（`npu_add_rms_norm_bias` + `quantize`）外加 **1 个落地的中间张量 `out0`**；replacement 这边是 **1 个融合算子**、**0 个中间张量落地**。一句话——**「2 kernel + 1 中间张量」收成「1 kernel + 0」**：省一次 kernel 启动、省一趟中间张量的显存往返。而这类 norm/quant 子图**每个 transformer 层都有一份**，所以这点收益会随层数 $`L`$ **线性放大**——L 层模型就省下约 L 次 kernel 启动和 L 趟中间张量往返。其余七个变体（带 bias 的 / 序列并行 SP 的 / 动态量化 DynamicQuant 的，以及它们的组合）结构同构，只是算子签名、是否带 bias、是否插 `all_gather` 不同，机制一样，不赘述。
 
 这些 pattern 怎么被串进一个 pass？看 `AddRMSNormQuantFusionPass`：
 

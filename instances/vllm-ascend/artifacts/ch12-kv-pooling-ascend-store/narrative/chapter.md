@@ -245,17 +245,17 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
 
 但注意——**这个调度进程身上没有池子**。`self.client` 是一个 zmq 客户端，这一问要跨进程发到 worker 那边。先把命中算术讲清，再看这一跨进程是怎么走的。
 
-把命中算术写清楚，先约定符号。设 prompt 总长为 $P$ ，本地 prefix cache 已经算好 $C$ 个 token（`num_computed_tokens`）。
+把命中算术写清楚，先约定符号。设 prompt 总长为 $`P`$ ，本地 prefix cache 已经算好 $`C`$ 个 token（`num_computed_tokens`）。
 
-池子返回的命中前缀记为 $H$ （`num_external_hit_tokens`）。要新分配 block 的，正是「池里有、但本地还没有」的那段，长度由下式给出：
+池子返回的命中前缀记为 $`H`$ （`num_external_hit_tokens`）。要新分配 block 的，正是「池里有、但本地还没有」的那段，长度由下式给出：
 
 $$
 \mathrm{need\_to\_allocate} = \max(0,\; H - C)
 $$
 
-它就是区间 $[C, H)$ 的长度。取 `max(0, …)` 是兜底：万一池子命中还不如本地算得多，就一块都不分配，不会出负数。
+它就是区间 $`[C, H)`$ 的长度。取 `max(0, …)` 是兜底：万一池子命中还不如本地算得多，就一块都不分配，不会出负数。
 
-这段 $[C, H)$ 的 KV 从池里 load， $[H, P)$ 那段池里也没有、得本地算。中间还有个小动作：`if num_external_hit_tokens == request.num_tokens: num_external_hit_tokens -= 1`——如果池里把整条 prompt 都命中了，硬减 1，留一个 token 给前向。因为 vLLM 要求每条请求至少真跑一次 forward 吐 1 个 token，不能整条都靠 load。
+这段 $`[C, H)`$ 的 KV 从池里 load， $`[H, P)`$ 那段池里也没有、得本地算。中间还有个小动作：`if num_external_hit_tokens == request.num_tokens: num_external_hit_tokens -= 1`——如果池里把整条 prompt 都命中了，硬减 1，留一个 token 给前向。因为 vLLM 要求每条请求至少真跑一次 forward 吐 1 个 token，不能整条都靠 load。
 
 把测试里的两组数值代进去，看这条算术怎么收敛：
 
@@ -333,7 +333,7 @@ class LookupKeyServer:
 
 一个后台线程死循环 `recv_multipart` → 解包 → 调 `pool_worker.lookup_scheduler` → 把命中数 `send` 回去。而 `lookup_scheduler` 是 `KVPoolWorker` 的方法，它持有后端 `m_store`，真正去调 `m_store.exists(keys)` 查池。
 
-为什么绕这么一圈？因为**「决定搬什么」和「持有数据 / 后端连接」天生在两个进程里**：调度进程做编排却够不着池子，worker 进程握着池子却不做编排。zmq 的 REQ→REP 就是这两端之间唯一的桥。这是池化在分布式下绕不开的一道结构。
+为什么绕这么一圈？因为 **「决定搬什么」和「持有数据 / 后端连接」天生在两个进程里**：调度进程做编排却够不着池子，worker 进程握着池子却不做编排。zmq 的 REQ→REP 就是这两端之间唯一的桥。这是池化在分布式下绕不开的一道结构。
 
 ### 分配后回填：can_load 翻 True
 
@@ -365,7 +365,7 @@ class LookupKeyServer:
         self.load_specs[request.request_id].can_load = True
 ```
 
-那句 `assert` 是一道一致性闸门：引擎实际分配的 `num_external_tokens`，必须正好等于 `kvpool_cached − vllm_cached`（也就是 $H - C$ ，上一步算的缺口）。对得上，`can_load` 才翻成 `True`。这条不变量是为什么精简版里 `test_update_state_after_alloc_mismatch_raises` 一旦传错数就抛异常——分配的块数和打算 load 的 token 数必须严丝合缝，否则后面搬运会错位。
+那句 `assert` 是一道一致性闸门：引擎实际分配的 `num_external_tokens`，必须正好等于 `kvpool_cached − vllm_cached`（也就是 $`H - C`$ ，上一步算的缺口）。对得上，`can_load` 才翻成 `True`。这条不变量是为什么精简版里 `test_update_state_after_alloc_mismatch_raises` 一旦传错数就抛异常——分配的块数和打算 load 的 token 数必须严丝合缝，否则后面搬运会错位。
 
 到这里，「搬什么、搬多少」已经定了，写在 `LoadSpec` 里。下一步是把它打包下发。
 
@@ -573,9 +573,9 @@ class LookupKeyServer:
 
 关键是搞清发线程消费循环（12.5 那个 `run`）里 `task_done` 到底在哪调。[下一节 §12.7](#127-数据通路key-与-value-地址分两路再汇合) 内嵌的 `_handle_request` 会看到它有**两个正常出口**，各调一次 `task_done`：一是 `req_id` 不在 `stored_requests` 时的早退（`task_done` 在 try 内、随即 `return`），二是处理到末尾的正常完成（那句 `task_done` 位于 `try/finally` **之后**）。要留意：`try/finally` 只保证 `mark_completed_events`（释放 block），**并不**保证 `task_done`——下一节代码就在眼前时这点能直接对上。
 
-那异常路径呢？循环体里会出错的 IO 主要是 `m_store.put`——它被后端 `MooncakeBackend.put` 的 `try/except` **整个吞掉**（记日志、不外抛，见 12.8）；但 `lookup`（`exists`）、`prepare_value` 等调用并不在 try 内，原则上仍可能抛。而一旦真有异常逃逸到 `run` 外层的 `except`，那一项的 `task_done` 就被**跳过**（对照上一段：`try/finally` 只护 `mark_completed_events`），于是 `unfinished` 永不归零、`join()` 反而永久挂死——这恰恰是本节要避免的那个故障。所以下面的终止性严格以「正常拍内无异常逃逸到 `run`」为前提：在此前提下，每个入队请求都顺着两个正常出口之一恰好到达一次 `task_done`。
+那异常路径呢？循环体里会出错的 IO 主要是 `m_store.put`——它被后端 `MooncakeBackend.put` 的 `try/except` **整个吞掉**（记日志、不外抛，见 12.8）；`lookup`（`exists`）、`prepare_value` 等调用虽然也在这个 `try` 块里，但这个 `try` 只挂了 `finally`、没有 `except`——不像 `MooncakeBackend.put` 自己的 `try/except` 会把异常吞掉，这里的异常不会被拦截，原则上仍可能一路逃逸。而一旦真有异常逃逸到 `run` 外层的 `except`，那一项的 `task_done` 就被**跳过**（对照上一段：`try/finally` 只护 `mark_completed_events`），于是 `unfinished` 永不归零、`join()` 反而永久挂死——这恰恰是本节要避免的那个故障。所以下面的终止性严格以「正常拍内无异常逃逸到 `run`」为前提：在此前提下，每个入队请求都顺着两个正常出口之一恰好到达一次 `task_done`。
 
-于是有：`wait_for_save` 入队了有限的 $N$ 个请求，`unfinished` 至多到 $N$ ；消费线程持续运行，每处理一个就把 `unfinished` 减 1，且每个请求只被处理一次。`unfinished` 是个**单调不增**（在没有新 put 时）的非负整数，每次 `task_done` 严格减 1——有限步内必然归零，`join()` 必然返回。换句话说：只要发线程活着、`put` 的失败被后端吞掉，这道屏障就会解除。代价只是把这一拍 put 的尾延迟串进了请求的关键路径——用一点延迟换一个不会漏命中的正确性，划算。
+于是有：`wait_for_save` 入队了有限的 $`N`$ 个请求，`unfinished` 至多到 $`N`$ ；消费线程持续运行，每处理一个就把 `unfinished` 减 1，且每个请求只被处理一次。`unfinished` 是个**单调不增**（在没有新 put 时）的非负整数，每次 `task_done` 严格减 1——有限步内必然归零，`join()` 必然返回。换句话说：只要发线程活着、`put` 的失败被后端吞掉，这道屏障就会解除。代价只是把这一拍 put 的尾延迟串进了请求的关键路径——用一点延迟换一个不会漏命中的正确性，划算。
 
 精简版的 `test_transfer_thread_decoupling_and_join_barrier` 正是把这条走了一遍：`add_request` 两个 chunk 后调 `request_queue.join()`，返回时 `backend.puts` 里确实有了 1 次 put、含 2 个 chunk——屏障返回 ⟺ put 已落地，和论证对上。
 
@@ -724,7 +724,7 @@ key 列表和 (addr, size) 列表，最后一起喂给后端契约 `put(keys, ad
 
 第 1 轮 Req A 进冷池，两个 chunk 都不在，全 put。第 2 轮 Req B 前缀完全相同，两个 key 全命中，一个都不 put——同一段前缀在池里**只存一份**。第 2′ 行是半重叠的情形（精简版 `test_sending_thread_dedup_only_puts_missing` 验的就是这个）：池里已有 k0，于是 `missing == {k1}`，只 put 缺的那块。`test_sending_thread_all_present_no_put` 验第 2 行：两块全在则 `puts == []`。
 
-去重的意义量化一下：同一段前缀被 $R$ 条请求共享时，不去重要写 $R$ 次，去重后只写一次。写放大因此降为
+去重的意义量化一下：同一段前缀被 $`R`$ 条请求共享时，不去重要写 $`R`$ 次，去重后只写一次。写放大因此降为
 
 $$
 \mathrm{write\_amp} = \frac{1}{R}
@@ -872,29 +872,29 @@ $$
 
 其中：
 
-- $L$ 是层数；
+- $`L`$ 是层数；
 
-- $H_{kv}$ 是 KV 头数；
+- $`H_{kv}`$ 是 KV 头数；
 
-- $d_{head}$ 是头维度；
+- $`d_{head}`$ 是头维度；
 
-- $s_{dtype}$ 是每元素字节数；
+- $`s_{dtype}`$ 是每元素字节数；
 
-- $t_{chunk}$ 是 chunk 的 token 数；
+- $`t_{chunk}`$ 是 chunk 的 token 数；
 
 - 前面的 2 是 K 和 V 各一份。
 
-命中一段长 $H$ token 的前缀，省下的就是重算这 $H$ 个 token 的 prefill 算力，以及——如果没有池化——重新产生这段 KV 的全部开销。命中前缀越长、复用次数越多，省得越多。
+命中一段长 $`H`$ token 的前缀，省下的就是重算这 $`H`$ 个 token 的 prefill 算力，以及——如果没有池化——重新产生这段 KV 的全部开销。命中前缀越长、复用次数越多，省得越多。
 
-**跨网字节随命中而非 prompt 增长。** 一条请求命中前缀 $H$ 、本地已算 $C$ ，只需为二者之间的缺口从池里搬运。跨网传输量正比于这段缺口的长度：
+**跨网字节随命中而非 prompt 增长。** 一条请求命中前缀 $`H`$ 、本地已算 $`C`$ ，只需为二者之间的缺口从池里搬运。跨网传输量正比于这段缺口的长度：
 
 $$
 \mathrm{bytes_{net}} \propto (H - C)
 $$
 
-也就是说，它正比于缺口、**而不是** prompt 全长 $P$ 。前缀命中越深，缺口相对 $P$ 越小，搬运越便宜。
+也就是说，它正比于缺口、**而不是** prompt 全长 $`P`$ 。前缀命中越深，缺口相对 $`P`$ 越小，搬运越便宜。
 
-**写放大随复用广度下降。** [§12.7](#127-数据通路key-与-value-地址分两路再汇合) 算过：同一前缀被 $R$ 条请求共享，去重让它在池里只存一份，写放大从 $R$ 降到 1。这是 `kv_transfer.py` 里 put 前那道 `exists` 去重的直接量化收益。
+**写放大随复用广度下降。** [§12.7](#127-数据通路key-与-value-地址分两路再汇合) 算过：同一前缀被 $`R`$ 条请求共享，去重让它在池里只存一份，写放大从 $`R`$ 降到 1。这是 `kv_transfer.py` 里 put 前那道 `exists` 去重的直接量化收益。
 
 **解耦的代价是一道串行点。** 异步把 put / get 的 RDMA 延迟挪进后台线程，理想下与模型前向完全重叠，主循环的 `add_request` 只是 O(1) 入队。但 `wait_for_save` 的 `join()` 是一道无法消除的串行点——它把这一拍 put 的尾延迟串进请求的关键路径。这是拿一点尾延迟，换「下一个相同 prompt 不漏命中」的正确性，是个明算过的取舍，不是疏忽。
 

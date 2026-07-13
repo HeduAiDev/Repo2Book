@@ -116,6 +116,8 @@ self.engine_core = EngineCoreClient.make_async_mp_client(
 
 同步版用 `make_client`，服务版用 `make_async_mp_client`。后者的注释直说：`starts the engine in background process`——**引擎内核被搬进了一个独立的子进程**。
 
+先按住一个容易生的误会：别把"子进程 + IPC"当成服务面的专属特征。真正决定"内核进不进独立子进程"的是 `multiprocess_mode`（默认 `True`），默认配置下同步离线面的 `make_client` 同样把 `EngineCore` 放进子进程、同样靠 ZMQ 通信；`async` 与 `sync` 的真正区别只是**用不用 asyncio 事件循环来驱动**，而非"有没有子进程"。这里之所以在服务面才点出它，是因为下一步的背景任务只有在事件循环里才需要——离线面同样藏着这层 IPC，§1.3 会拿源码把它挖出来对照。
+
 这就是解耦的物理基础。GPU 重活的 `EngineCore` 在另一个进程跑，API 这边的事件循环不会被它的前向计算阻塞。两个进程之间靠进程间通信（IPC）传消息，那套 ZMQ + msgpack 的机制本身就是一章的分量，[第 7 章会专门拆开它](../../ch07-engine-core/narrative/chapter.md)。
 
 可一旦内核进了另一个进程，新问题来了：它在那边一拍拍吐 token，谁负责把这些输出送回每个等待中的请求？答案是一个**背景任务**：
@@ -286,7 +288,9 @@ while self.llm_engine.has_unfinished_requests():
     step_outputs = self.llm_engine.step()
 ```
 
-简单直接，一个 while 循环就是引擎的心跳。没有 IPC、没有背景任务——这是 pull 模型，调用方主动拉。
+简单直接，一个 while 循环就是引擎的心跳——这是 pull 模型，调用方线程主动拉，而不是内核主动推。
+
+但这不等于"`EngineCore` 就跑在调用方那个进程里"。回看 §1.2 那句 `EngineCoreClient.make_client(multiprocess_mode=..., asyncio_mode=False, ...)`——真正的分岔点是 `multiprocess_mode`，而不是"离线 vs 服务"。`LLMEngine.from_engine_args` 把它设成 `envs.VLLM_ENABLE_V1_MULTIPROCESSING`（`vllm/v1/engine/llm_engine.py:L165`），这个环境变量默认就是 `True`（`vllm/envs.py`）。`make_client` 的分派逻辑（`vllm/v1/engine/core_client.py`）写得很直白：`multiprocess_mode=True, asyncio_mode=False` 落到 `SyncMPClient`，它的类文档字符串自己写着 `ZMQ + background proc EngineCore (for LLM)`——只有显式关掉这个环境变量（或走 V0 兼容路径）才会退到"本进程内"的 `InprocClient`。也就是说，**默认配置下离线 `LLM` 的 `EngineCore` 同样跑在独立子进程里、同样靠 ZMQ 通信**——上一段"调用方主动拉"说的是驱动方式（谁发起 step），不是"没有 IPC"；`step()` 底下那次 ZMQ 往返正是离线面隐藏起来的 IPC。
 
 服务面则完全不同。`EngineCore` 在它那个独立子进程里，自己有个永不停的总循环：
 
@@ -308,9 +312,9 @@ def run_busy_loop(self):
 | | 离线 `LLM` | 服务 OpenAI server / `AsyncLLM` |
 |---|---|---|
 | 门面 | `LLMEngine`（同步） | `AsyncLLM`（异步） |
-| `EngineCore` 在哪 | 本进程内（`make_client`） | 独立子进程（`make_async_mp_client`） |
-| 谁驱动步进 | 调用方线程 `while has_unfinished: step()` | 子进程内 `run_busy_loop` 自转 |
-| 输出回送 | step 返回值直接拿 | 背景 `output_handler` 多路复用回各队列 |
+| `EngineCore` 在哪（默认配置） | 独立子进程，`SyncMPClient`（`make_client`，走 ZMQ） | 独立子进程，`AsyncMPClient`（`make_async_mp_client`，走 ZMQ + asyncio） |
+| 谁发起 step | 调用方线程 `while has_unfinished: step()`，每次 `step()` 底下是一次同步 ZMQ 往返 | 子进程内 `run_busy_loop` 自转，主进程不主动喊 step |
+| 输出回送 | `step()` 的 ZMQ 响应直接拿 | 背景 `output_handler` 多路复用回各队列 |
 | 适合场景 | 离线批量、吞吐 | 在线服务、低延迟高并发 |
 
 同一个 `EngineCore.step`，离线由你的线程一拍拍敲，服务由子进程自己一拍拍转。心跳一样，握把不同。离线面的全部细节在 [第 35 章](../../ch35-entrypoints/narrative/chapter.md)，服务面在 [第 36 章](../../ch36-entrypoints/narrative/chapter.md)。

@@ -163,7 +163,7 @@ assert runner.execute_model_state is None        # 桥已清空，下一拍可�
 
 > *图注：第 n 拍的 SAMPLE 与第 n+1 拍的 EXEC 在橙色重叠区里同时推进。单槽 `execute_model_state` 在两阶段间传递重型张量，入口断言保证它们严格配对。*
 
-**重叠到底省了多少？** 设单拍前向耗时 $T_\mathrm{fwd}$ 、采样加簿记耗时 $T_\mathrm{samp}$ 、调度构建下批耗时 $T_\mathrm{sched}$ 。把前向和采样揉在一个方法里串行做，一拍周期约是这两段之和：
+**重叠到底省了多少？** 设单拍前向耗时 $`T_\mathrm{fwd}`$ 、采样加簿记耗时 $`T_\mathrm{samp}`$ 、调度构建下批耗时 $`T_\mathrm{sched}`$ 。把前向和采样揉在一个方法里串行做，一拍周期约是这两段之和：
 
 $$
 T_\mathrm{serial} \;\approx\; T_\mathrm{fwd} + T_\mathrm{samp}
@@ -183,7 +183,7 @@ $$
 T_\mathrm{fwd} \approx 8\,\mathrm{ms}, \qquad T_\mathrm{samp} + T_\mathrm{sched} \approx 5\,\mathrm{ms}
 $$
 
-串行拍周期约 $8+5=13$ 毫秒；两阶段下稳态拍周期约 $\max(8,5)=8$ 毫秒，省下约 38%。前向越重、采样排活越能藏进它的影子里，这个比例就越可观。
+串行拍周期约 $`8+5=13`$ 毫秒；两阶段下稳态拍周期约 $`\max(8,5)=8`$ 毫秒，省下约 38%。前向越重、采样排活越能藏进它的影子里，这个比例就越可观。
 
 ## 19.3 阶段一全景：从工单到一份缓存的 state
 

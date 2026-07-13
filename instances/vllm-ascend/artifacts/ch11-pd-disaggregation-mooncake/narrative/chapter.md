@@ -12,7 +12,7 @@
 
 **PD 分离**（prefill/decode disaggregation）的思路很直接：把这两件事拆到**不同的节点组**上各自跑、各自批、各自扩缩。prefill 实例算得快，decode 实例吐得稳。代价只有一个——prompt 那段 KV 是 prefill 算出来的，得**搬到 decode 节点**去，decode 才能接着往下吐。
 
-为什么「拆开」值得？把两阶段的开销摊开算一笔账。设 prompt 长 $L$ 、隐藏维 $d$ ：prefill 要为 $L$ 个 token 两两算注意力，计算量随 $O(L^2 d)$ 增长（此处取随 $L$ 二次增长的注意力项，投影 / FFN 的 $O(Ld^2)$ 项在长上下文下不主导分水岭），属**算力密集**型；decode 每步只为一个新 token 读一遍已缓存的 $L$ 段 KV，单步搬运量随 $O(L d)$ 增长、真正参与计算的却只有一个 token，属**访存密集**型。两者挤一张卡时，矛盾是**量级**上的：一个 prefill 大批量顶上来，就占满算力单元几十上百毫秒，夹在中间的 decode 步只能干等——decode 的 TPOT（time-per-output-token，每输出一个 token 的延迟）被 prefill 的批量直接拉长；反过来为压低 decode 延迟而把批量调小，又让 prefill 喂不饱算力、吞吐塌下来。同一批硬件被两个性格相反的负载反复争抢，谁都跑不到自己的最优点。
+为什么「拆开」值得？把两阶段的开销摊开算一笔账。设 prompt 长 $`L`$ 、隐藏维 $`d`$ ：prefill 要为 $`L`$ 个 token 两两算注意力，计算量随 $`O(L^2 d)`$ 增长（此处取随 $`L`$ 二次增长的注意力项，投影 / FFN 的 $`O(Ld^2)`$ 项在长上下文下不主导分水岭），属**算力密集**型；decode 每步只为一个新 token 读一遍已缓存的 $`L`$ 段 KV，单步搬运量随 $`O(L d)`$ 增长、真正参与计算的却只有一个 token，属**访存密集**型。两者挤一张卡时，矛盾是**量级**上的：一个 prefill 大批量顶上来，就占满算力单元几十上百毫秒，夹在中间的 decode 步只能干等——decode 的 TPOT（time-per-output-token，每输出一个 token 的延迟）被 prefill 的批量直接拉长；反过来为压低 decode 延迟而把批量调小，又让 prefill 喂不饱算力、吞吐塌下来。同一批硬件被两个性格相反的负载反复争抢，谁都跑不到自己的最优点。
 
 拆到独立节点组后，prefill 集群按「算力打满」配比与并行，decode 集群按「延迟稳、显存带宽足」配比，各自独立扩缩——这正是 DistServe（arXiv:2401.09670）与 Splitwise（arXiv:2311.18677）用生产 trace 量化过的结论：相位分离能在满足 TTFT（首 token 延迟）/TPOT 约束下把有效吞吐（goodput）显著抬高。代价则集中在一处：prompt 的那段 KV 得整块跨节点搬到 decode 侧，这一搬既吃网络带宽、又在关键路径上加一段延迟。于是「拆分是否划算」归结为一道权衡——只要 KV 传输的开销显著小于「两负载互相干扰所浪费的算力与延迟」，分离就赚。让这道账普遍成立的关键，是把调度从「以计算为中心」转成**以 KVCache 为中心**：尽量让 decode 请求落到「它要的前缀 KV 已在本地或最近节点」的实例上，把跨节点搬运量压到最小。本章昇腾用的传输库就叫 **mooncake**，取自同名论文 Mooncake（arXiv:2407.00079，Kimi 背后的 KVCache-centric 分离式服务架构）；后文的「KV 亲和调度」正是这套 KVCache-centric 思想在昇腾侧的落地。
 
@@ -626,9 +626,11 @@ async def assign_instances(api, req_data, request_length, *, is_initial_request)
     )
 ```
 
-四步连成一气（`pick_prefill` 的二选一：初始请求用 `begin_request` 给 prefiller 分配新 KV 槽，重试或续约用 `reserve_prefill_kv` 复用已预留的块、省一次重分配）：① 挑 prefiller → ② `send_request_to_service` 内部调 `build_prefill_request` 盖章后 POST，prefiller 跑 prefill、连接器把 KV 逐层推走、`request_finished` 回一份握手 `kv_transfer_params`（含 `remote_block_ids/engine_id/host/port`）→ ③ proxy 读回这份握手、塞进请求 → ④ 挑 decoder，请求（现在带着 `do_remote_prefill` + 远端握手）转给它。decoder 的连接器读到 `do_remote_prefill`，触发第一层那条「拉整段 prompt」的路。
+四步连成一气（`pick_prefill` 的二选一：初始请求用 `begin_request` 给 prefiller 分配新 KV 槽，重试或续约用 `reserve_prefill_kv` 复用已预留的块、省一次重分配）：① 挑 prefiller → ② `send_request_to_service` 内部调 `build_prefill_request` 盖章后 POST，prefiller 跑 prefill → ③ proxy 从 response 里读回 `kv_transfer_params`（非空才覆盖 `req_data`）→ ④ 挑 decoder，请求转给它。
 
-这里要把前面 scheduler 半边那个 metaserver POST 接上：它和这条 proxy 回传的握手，是**同一套地址交换的两半**。proxy 这条（②③）负责把 prefiller 算出的远端块号 / engine_id 经响应体回传给 decoder；而 [scheduler 半边](#scheduler-半边方向由-kv_transfer_params-的两个-flag-决定) 那个 metaserver POST，是 decoder 反过来把自己**本地落点的块号**登记出去，好让 prefiller 的发送线程定位「KV 到底往哪个地址写」。一来一回，两份握手拼成完整的双向地址交换。
+这里要澄清一处连接器边界，别顺着 `assign_instances` 这段脚本以为它讲的就是本章的连接器：② 的 response 里若带着 `kv_transfer_params`（`remote_block_ids/engine_id/host/port`），那是**拉式连接器**（`MooncakeConnector`/`MooncakeHybridConnector`）的 `request_finished` 算出待传物理块号后拼进的一份 dict（`kv_p2p/mooncake_connector.py:1538`、`kv_p2p/mooncake_hybrid_connector.py:1342`）。本章从头到尾讲的 `MooncakeLayerwiseConnector`，它的 `request_finished`/`request_finished_all_groups` 恒定 `return False, None`（注释写着「layer_wise push, not need delay_free_blocks」，`kv_p2p/mooncake_layerwise_connector.py:1033-1055`）——KV 早在算的过程中逐层推完了，收尾时没有握手可报。也就是说对本章的连接器而言，③ 这步 `kv_transfer_params` 是空的，`req_data` 不会被覆盖；decoder 触发「拉整段 prompt」那条路，靠的不是这里，而是它自己的 `do_remote_prefill` 判断（第一层已讲）。
+
+这里要把前面 scheduler 半边那个 metaserver POST 接上：对 layerwise 连接器来说，它才是真正、也是唯一的一次地址交换——decoder 侧 [异步 POST 一份握手](#scheduler-半边方向由-kv_transfer_params-的两个-flag-决定) 到 metaserver，把自己**本地落点的块号**（`remote_block_ids`/`engine_id`/host/port）登记出去，好让 prefiller 的发送线程定位「KV 到底往哪个地址写」。（换成拉式连接器 `MooncakeConnector`，地址交换走的是另一条路——靠 proxy 把 `request_finished` 产出的握手经 response 回传给 decoder，没有 metaserver 这一环。两种连接器各自闭环，不要混着凑成「一来一回」。）
 
 三层在这里闭环：proxy 盖 flag，连接器读 flag 决定收发方向，mooncake 按握手里的地址搬 KV。
 

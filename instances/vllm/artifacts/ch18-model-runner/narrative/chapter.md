@@ -225,9 +225,9 @@ for i, req_id in enumerate(req_data.req_ids):
 **第二步，就地更新持久批次。** 这里有个分叉：`req_index = req_id_to_index.get(req_id)` 拿到这个请求在持久批次里的行号。
 
 - 若 `req_index is None`——请求不在批次里（典型是从抢占恢复的）——推进 `reqs_to_add`，走和新请求一样的「待并入」路径。
-- 若 `req_index` 有值——请求就在批次里——那就**只改它那一行**:`num_computed_tokens_cpu[req_index]` 赋新值，`block_table.append_row` 把新块号追加到它的块表行。
+- 若 `req_index` 有值——请求就在批次里——那就**只改它那一行**:`num_computed_tokens_cpu[req_index]` 赋新值，`block_table.append_row` 把新块号追加到它的块表行，再加 `update_req_spec_token_ids` 往 `token_ids_cpu[req_index]` 那一行写入本拍新采的投机 token。
 
-看清楚这个「只改一行」：这就是持久批次省钱的地方。一个正在 decode 的请求，本拍的全部更新就是改一个标量 + 往块表行尾追加 0~1 个块号。没有重建，没有拷贝整行 token。
+看清楚这个「只改一行」：这就是持久批次省钱的地方。一个正在 decode 的请求，本拍的更新就是改一个标量 + 往块表行尾追加 0~1 个块号 + （启用投机解码时）往 `token_ids_cpu` 那一行追加同样廉价的几个 spec token——`update_req_spec_token_ids` 只写 `[start_index, start_index+num_spec_tokens)` 这一小段，不是整行覆盖。没有重建，没有拷贝整行 token。
 
 处理完所有在途请求，`reqs_to_add` 里攒齐了「新请求 + 恢复请求」。最后统一收尾：
 
@@ -379,7 +379,7 @@ def condense(self) -> None:
 
 ![持久批次跨拍演化](../diagrams/ch18-persistent-batch-update.png)
 
-> *图注：拍 1 四请求满载。拍 2 中 B、D 完成被打洞（slot 1、3），E、F 到来——`pop_removed()` 让它们直接复用 slot 1、3，无洞无搬移；同到的 G 已无洞可填，追加到末尾的 slot 5。拍 3 中 C 完成留洞且无新请求填补，`condense` 把尾部活请求 G 从 slot 5 搬进 slot 2，使 `[0, num_reqs)` 重新连续。*
+> *图注：拍 1 四请求满载。拍 2 中 B、D 完成被打洞（slot 1、3），E、F 到来——`pop_removed()` 让它们直接复用 slot 1、3，无洞无搬移；同到的 G 已无洞可填，`num_reqs`（此刻是 `len(req_id_to_index)`，即 A、C、E、F 四个在册请求）追加到 slot 4——五个请求正好摊满 `[0, 5)`，无洞。拍 3 中 C 完成留洞（slot 2）且无新请求填补，`condense` 把尾部活请求 G 从 slot 4 搬进 slot 2，使 `[0, num_reqs)` 重新连续。*
 
 **为什么 `condense` 一定会终止？** 看那个不变量：`last_req_index` 每轮要么因内层 `while` 自减、要么因外层尾部 `-= 1` 自减，**严格单调递减的非负整数**。`empty_index` 则单调递增（`removed` 降序弹出，每次弹最小）。两个指针一升一降相向而行，要么 `removed` 弹空、要么 `empty_index >= last_req_index` 触发 `break`——有限步必停。
 

@@ -460,7 +460,18 @@ def compose_expert_update_info_greedy(self, updated_expert_maps, current_expert_
 
 > *图注：把 rank0 的 e1 和 rank1 的 e3 对调。绿格（current=-1, updated≠-1）是要收的卡，红格（current≠-1, updated=-1）是要发的卡。逐 expert 配对源卡，得到 rank1→rank0 搬 e3、rank0→rank1 搬 e1 的对称交换。*
 
-`yield` 逐层产出——用生成器是为了让 `pack_update_info` 流式打包，不必先把所有层的计划在内存里堆齐。最前面那条 `Guard Clause` 也值得留意：如果某层 `updated` 和 `current` 完全相等（这层不用动），直接 `yield` 一份空的 send/recv，表示这层无任何搬运。留意这条 Guard 后源码没有 `continue`，相等层会再走一遍（空集的）两个 `torch.where`、多 `yield` 一份空计划——无害的小冗余，搬运量都是零。
+`yield` 逐层产出——用生成器是为了让 `pack_update_info` 流式打包，不必先把所有层的计划在内存里堆齐。最前面那条 `Guard Clause` 也值得留意：如果某层 `updated` 和 `current` 完全相等（这层不用动），直接 `yield` 一份空的 send/recv，表示这层无任何搬运。但留意这条 Guard 后源码**没有** `continue`——相等层会紧接着再走一遍两个 `torch.where`、多 `yield` 一份（同样为空的）计划，也就是说**每有一层本轮恰好未变，`pack_update_info` 打包出的列表就会多出一条**，长度超过 `num_moe_layers`。而 `forward_before` 在搬权重窗口内固定 `pop(0)` 恰好 `num_moe_layers` 次（上一节「逐拍归零」的强不变量）——列表变长、弹出次数不变，多出来的尾部条目在这一轮内永远不会被弹到。用一个 3 层、其中 1 层本轮未变的小例子把 `compose`→`pack_update_info`→模拟的定长 `pop` 实际跑一遍：
+
+```python
+# 3 层、2 卡、4 全局 expert；layer1 本轮未变，layer0/layer2 各有一次跨卡交换
+packed = pack_update_info(compose_expert_update_info_greedy(updated, current))
+# packed 长度 4，layer_ids = [0, 1, 1, 2]（layer1 重复）
+update_info_all = list(packed)
+popped = [update_info_all.pop(0) for _ in range(3)]           # forward_before 固定弹 num_moe_layers=3 次
+# popped 的 layer_ids = [0, 1, 1]；update_info_all 剩下 layer2 那一条，且它的 send/recv 非空
+```
+
+跑出来的结果是：`layer2` 那份**真实**（非空）的 send/recv 计划留在了 `update_info_all` 尾部，本轮窗口内没有任何一次 `pop` 轮到它；下一轮 `get_update_info_flag()` 触发时，`self.update_info_all = self.eplb_process.block_update_q.get()` 会把整个列表**整体替换**成新一轮的计划，这条被挤到尾部、没来得及弹出的搬运指令就此丢弃，既不在本轮生效也不会延续到下一轮重试。更麻烦的是 `do_update` 里 `compose` 一算完就无条件执行了 `self.old_expert_maps = new_expert_maps`——子进程已经认为这一层到位，下一轮算增量时不会再补一次同样的搬运。也就是说，**这个冗余在"未变层"自己身上确实无害（它本来就没数据要搬），但会把队列错位一格，连带挤丢当轮末尾某个"真变层"的搬运指令**——发生与否、丢的是哪一层，取决于本轮有多少层恰好未变、以及它们在迭代顺序里排在第几位。
 
 主线②讲完了：子进程是个被信号唤醒、读共享态、算增量、回传结果的纯计算单元，靠两条容量精心设计的队列与推理彻底解耦。
 

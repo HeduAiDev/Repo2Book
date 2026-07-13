@@ -97,7 +97,7 @@ else:
 self.input_processor.assign_request_id(request)
 ```
 
-`process_inputs()` 是 **Stage 1 的唯一出口**。它干的活包括：校验参数、把文本分词成 `prompt_token_ids`、处理多模态特征、做任务路由，最终产出一个 `EngineCoreRequest`。这个对象很关键——它就是**那个要穿过进程边界、被 ZMQ 序列化送进引擎进程的载荷**。它带着 `prompt_token_ids`、`sampling_params`、多模态特征等等，是「进引擎的到底是什么」这个问题的答案。Stage 1 的内部——分词、多模态、任务路由——[第 5 章](../../ch05-input-processing/narrative/chapter.md) 会整章拆开。
+`process_inputs()` 是 **Stage 1 主路径的出口**。它干的活包括：校验参数、把文本分词成 `prompt_token_ids`、处理多模态特征、做任务路由，最终产出一个 `EngineCoreRequest`。这个对象很关键——它就是**那个要穿过进程边界、被 ZMQ 序列化送进引擎进程的载荷**。它带着 `prompt_token_ids`、`sampling_params`、多模态特征等等，是「进引擎的到底是什么」这个问题的答案。（上面代码里省略的那条兼容分支是：调用方如果直接传一个现成的 `EngineCoreRequest`，就跳过 `process_inputs()`——这是个已标记 deprecated 的旧接口，本章不展开，只讲主路径。）Stage 1 的内部——分词、多模态、任务路由——[第 5 章](../../ch05-input-processing/narrative/chapter.md) 会整章拆开。
 
 紧接着的 `assign_request_id` 是一笔不起眼但很重要的账。它给请求 ID 加一截随机后缀（`vllm/v1/engine/input_processor.py:L215`）：
 
@@ -463,11 +463,11 @@ while not finished:
 # … 省略：客户端断开 / 引擎死亡等异常分支 …
 ```
 
-看清这个出口的本质：**`generate()` 从头到尾只跟信箱打交道，根本不碰引擎**。它就是一个消费者协程——`q.get_nowait() or await q.get()` 先试着不阻塞地拿（队列里有就直接拿，避免任务切换），拿不到才 `await`；拿到一片 `RequestOutput` 就 `yield` 给调用者，直到 `finished`。
+看清这个出口的本质：**`generate()` 的主循环从头到尾只跟信箱打交道，不主动调用引擎**。它就是一个消费者协程——`q.get_nowait() or await q.get()` 先试着不阻塞地拿（队列里有就直接拿，避免任务切换），拿不到才 `await`；拿到一片 `RequestOutput` 就 `yield` 给调用者，直到 `finished`。（唯一的例外是客户端断开时的 abort，那属于异常路径，见下段。）
 
-这就是三段式解耦最漂亮的地方：**一个 `generate()` 协程 = 一个消费者，唯一的 `output_handler` = 一个生产者，二者经各请求的信箱对接**。成百上千个 `generate()` 协程并发跑在同一个事件循环上，每个只管拉自己信箱里的东西；引擎在另一个进程里一拍拍地喂。单个事件循环扛得住这个量级，恰恰因为每个 `generate()` 只做去 token 化、`yield` 这种轻活——真正吃 GIL 的模型前向早被 [§2.5](#25-分叉点同一个请求同时挂到本进程和引擎进程) 搬去了独立的引擎进程。互不阻塞，这才扛得住高并发。
+这就是三段式解耦最漂亮的地方：**一个 `generate()` 协程 = 一个消费者，唯一的 `output_handler` = 一个生产者，二者经各请求的信箱对接**。成百上千个 `generate()` 协程并发跑在同一个事件循环上，每个只管拉自己信箱里的东西；引擎在另一个进程里一拍拍地喂。单个事件循环扛得住这个量级，恰恰因为去 token 化早已由唯一的 `output_handler`（Stage 3）一次性做完了——每个 `generate()` 只做取信箱、`yield` 这种轻活——真正吃 GIL 的模型前向早被 [§2.5](#25-分叉点同一个请求同时挂到本进程和引擎进程) 搬去了独立的引擎进程。生产者扛重活，消费者只管轻量转发，互不阻塞，这才扛得住高并发。
 
-至于客户端中途断开怎么办——`generate()` 会被 `CancelledError` 唤醒，顺手 abort 掉这个请求，告诉引擎别白算了。错误传播与断开处理的细节，[第 4 章](../../ch04-async-llm/narrative/chapter.md) 一并展开。
+至于客户端中途断开怎么办——`generate()` 会被 `CancelledError` 唤醒，顺手 abort 掉这个请求，告诉引擎别白算了。这是上面「不主动调用引擎」的唯一例外：正常路径下 `generate()` 只读信箱，只有断开这条异常路径才会经 ZMQ 通知引擎。错误传播与断开处理的细节，[第 4 章](../../ch04-async-llm/narrative/chapter.md) 一并展开。
 
 到这里，一个在线请求的一生就走完了：**prompt → 渲染 → Stage 1 `EngineCoreRequest` → ZMQ → 引擎一拍拍算 → ZMQ → Stage 3 组装 → 信箱 → `generate()` yield → 用户**。
 
@@ -523,6 +523,8 @@ return sorted(outputs, key=lambda x: int(x.request_id))
 |---|---|---|---|---|---|
 | 第 t 拍 | prefill（吃完 `[A, B]`，出首 token） | `[C]` | `"你"` | put `RequestOutput(text="你")` → 被 get 走 | yield 一个 DELTA：`"你"` |
 | 第 t+1 拍 | decode（逐 token 吐） | `[D]` | `"好"` | put `RequestOutput(text="好")` → 被 get 走 | yield 一个 DELTA：`"好"` |
+
+（一处刻意的简化：这张表让「一个 token 干净对应一个汉字」，纯粹是为了把主线跑通看清楚。真实里中文常常一个字跨好几个 token，`detokenizer.update` 单解某一拍的一个 token 往往只能得到半截字节、拼不出完整字——这正是 §2.8 说的、[第 9 章](../../ch09-detokenization/narrative/chapter.md) 增量去 token 化要专门处理的情况。这里读成「每来一拍就攒出可读的一片增量」即可，别把它当成 token 与汉字的真实对应。）
 
 每一拍，引擎只为这个请求往前算出一两个 token；`output_handler` 把它拉回来、交 Stage 3 去 token 化成增量文字、`put` 进信箱；等在 `get` 上的 `generate()` 被唤醒，`yield` 出这一片。同一拍里，引擎其实还在为别的几百个请求做同样的事——这张表只是把镜头对准了其中一个。一个请求的一生，就是这样横跨很多拍、每拍只前进几个 token 地走完的。
 

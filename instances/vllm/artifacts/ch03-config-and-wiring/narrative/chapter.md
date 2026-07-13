@@ -256,7 +256,7 @@ class EngineArgs:
 
 ## 3.4 VllmConfig.__post_init__：跨子配置的校验与推导中枢
 
-`VllmConfig` 构造出来的那一刻，dataclass 会自动调用它的 `__post_init__`。这是本章第二主角。它干的事，是那些**「单个子配置自己说了不算、得几个子配置凑在一起才能定」**的校验和推导。
+`VllmConfig` 构造出来的那一刻，dataclass 会自动调用它的 `__post_init__`。这是本章第二主角。它干的事，是那些 **「单个子配置自己说了不算、得几个子配置凑在一起才能定」** 的校验和推导。
 
 为什么这些逻辑要集中在 `VllmConfig.__post_init__`，而不是散落到各个子配置里？因为很多约束天生是跨配置的：
 
@@ -454,7 +454,7 @@ class EngineArgs:
             self.distributed_executor_backend = "uni"
 ```
 
-这段就是「单卡为什么默认 `uni`、多卡为什么默认 `mp`」的来历。`world_size = TP × PP`（`PP` 即流水线并行度，pipeline-parallel-size；这里限定的是「单 DP 路径」——`DP` 即数据并行，[3.8 节](#38-第二级映射之三ipc-客户端工厂-make_client) 详细展开），逻辑是：
+这段就是「单卡为什么默认 `uni`、多卡为什么默认 `mp`」的来历。真实公式是 `world_size = TP × PP × PCP`（`vllm/config/parallel.py` 的 `ParallelConfig.__post_init__` 里写的是 `self.world_size = self.pipeline_parallel_size * self.tensor_parallel_size * self.prefill_context_parallel_size`；`PP` 即流水线并行度 pipeline-parallel-size，`PCP` 即预填充上下文并行度 prefill-context-parallel-size——就是 [3.4 节](#34-vllmconfig__post_init__跨子配置的校验与推导中枢) `v0.21.0` 更新条目里跟 PP、DCP 并列校验的那个维度；这里限定的是「单 DP 路径」，没有再乘一层 DP——`DP` 即数据并行，[3.8 节](#38-第二级映射之三ipc-客户端工厂-make_client) 详细展开）。本节例子里 PCP 默认为 1，`world_size` 退化成 `TP × PP`；PCP > 1 时公式还要乘上它。逻辑是：
 
 - `world_size == 1`（单卡单进程）→ `"uni"`（uniproc，就在本进程跑，不起子进程）；
 - `world_size > 1` 且能放进本节点 → `"mp"`（multiproc，每个 rank 一个子进程）；
@@ -603,7 +603,7 @@ class OptimizationLevel(IntEnum):
 - **O0**：什么都不开，立刻启动。适合快速迭代、调试——你不想每改一行代码就等 `torch.compile` 编译几分钟。
 - **O1**：开 Dynamo+Inductor（Dynamo 负责图捕获，Inductor 负责代码生成，两者合起来就是 `torch.compile`）编译 + Piecewise cudagraph。快速优化。
 - **O2**（**默认**）：O1 的基础上再开 Full & Piecewise cudagraph。生产环境用这个。
-- **O3**：当前等同 O2（给未来预留）。
+- **O3**：compilation / cudagraph 层面与 O2 完全相同（源码 docstring 也自述「O3: Currently the same as -O2s」，给未来预留）——唯一差异在 `kernel_config`：`enable_flashinfer_autotune` 是 O0–O3 里唯一为 `True` 的一级（详见下面预设字典 line 649-650 与 §3.12 数值 3）。
 
 `VllmConfig` 的 `optimization_level` 字段默认就是 `O2`。
 
@@ -641,9 +641,13 @@ OPTIMIZATION_LEVEL_02 = {
         "use_inductor_graph_partition": False,
     },
     "kernel_config": {
-        "enable_flashinfer_autotune": True,
+        # Disabled for now due to correctness issues:
+        # https://github.com/flashinfer-ai/flashinfer/issues/3197
+        "enable_flashinfer_autotune": False,
     },
 }
+# … 省略：O3（compilation_config 与 O2 相同；kernel_config 里
+# enable_flashinfer_autotune 是 O0–O3 中唯一为 True 的一级）…
 
 OPTIMIZATION_LEVEL_TO_CONFIG = {
     OptimizationLevel.O0: OPTIMIZATION_LEVEL_00,
@@ -953,7 +957,7 @@ optimization_level=O0
   → compilation_config.mode = NONE，cudagraph_mode = NONE，flashinfer_autotune = False
 
 optimization_level=O2（默认）
-  → mode = VLLM_COMPILE，cudagraph_mode = FULL_AND_PIECEWISE，flashinfer_autotune = True
+  → mode = VLLM_COMPILE，cudagraph_mode = FULL_AND_PIECEWISE，flashinfer_autotune = False（O2 因 flashinfer#3197 的正确性问题暂时关闭；O0–O3 中只有 O3 是 True）
 
 optimization_level=O2 但 enforce_eager=True
   → enforce_eager 先把 mode/cudagraph_mode 砸成 NONE

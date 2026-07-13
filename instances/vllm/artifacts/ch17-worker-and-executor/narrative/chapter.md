@@ -164,9 +164,9 @@ def execute_model(
 
 就三行。把方法名 `"execute_model"` 和工单 `scheduler_output` 交给 `collective_rpc`，收回一个结果 list，取 `output[0]`。
 
-> 为什么取 `[0]`？因为这里只关心**一个** worker 的输出。张量并行把矩阵按列/行切开，但层末靠 all-reduce 把各分片汇总回同一份完整结果，所以同一 TP 组内各 rank 的最终 token 是冗余的；流水线并行下只有最后一段产出真 token——所以执行器只需要其中一个 rank 的回复。这个「只收一个 rank」的优化，[§17.6](#execute_model-为什么只收一个-rank) 会落实到 mp 版的 `output_rank` 上。
+> 为什么取 `[0]`？因为这里只关心**一个** worker 的输出。张量并行把矩阵按列/行切开，但层末靠 all-reduce 把各分片汇总回同一份完整结果，所以同一 TP 组内各 rank 的最终 token 是冗余的；流水线并行下只有最后一段产出真 token——所以执行器只需要其中一个 rank 的回复。不过这版 `execute_model` 是**基类的默认实现**：`UniProcExecutor` 和 `MultiprocExecutor` 都会用各自的 `execute_model` 完整覆写它（[§17.4](#174-最简对照uniprocexecutor)、[§17.6](#execute_model-为什么只收一个-rank)），覆写版把「只收一个」这件事做进了 `collective_rpc` 调用本身（uni 版传 `single_value=True`，mp 版传 `unique_reply_rank=self.output_rank`），函数体里不再需要第二次 `output[0]`——这里的 `[0]` 只是先讲清楚「为什么要收窄成一个」的道理，「实际怎么收窄」要看子类各自的实现。
 
-`sample_tokens`、`determine_available_memory`、`add_lora`、`sleep`、`wake_up`、`check_health`……翻一遍 `abstract.py`，十几个方法全是同一个模子：包一层 `collective_rpc`，换个方法名。这意味着**子类只要实现 `collective_rpc` 这一处，整套指令的语义就齐了**。`UniProcExecutor` 和 `MultiprocExecutor` 的全部差异，浓缩在这一个方法的两种实现里。
+`determine_available_memory`、`add_lora`、`sleep`、`wake_up`……翻一遍 `abstract.py`，十几个方法全是同一个模子：包一层 `collective_rpc`，换个方法名，两个子类都懒得覆写、直接吃基类这份默认实现。这意味着**子类只要实现 `collective_rpc` 这一处，这批指令的语义就齐了**——不用逐个方法重写。但热路径上的 `execute_model`、`sample_tokens`、`check_health` 是例外：`UniProcExecutor` 和 `MultiprocExecutor` 各自覆写了它们，往 `collective_rpc` 调用里塞了 `single_value` / `unique_reply_rank` / 自定义 `timeout` 这类私货（下一节就看）。`UniProcExecutor` 和 `MultiprocExecutor` 的全部差异，浓缩在 `collective_rpc` 本身、以及这几个热路径方法的两种实现里。
 
 下面就把这两种实现摆在一起看。
 
@@ -468,7 +468,24 @@ class FutureWrapper(Future):
 
 ### execute_model 为什么只收一个 rank
 
-回头补上 [§17.3](#173-一切引擎指令都是-collective_rpc) 埋下的那个 `output[0]`。mp 版决定「收哪个 rank」的是这个函数：
+回头兑现 [§17.3](#173-一切引擎指令都是-collective_rpc) 埋下的那个「收窄成一个」。mp 版的 `execute_model` 覆写了基类默认实现，不再有 `output[0]`，而是直接把 `unique_reply_rank=self.output_rank` 传给 `collective_rpc`，让收窄发生在 RPC 内部：
+
+```python
+# vllm/v1/executor/multiproc_executor.py:L306
+def execute_model(  # type: ignore[override]
+    self, scheduler_output: SchedulerOutput, non_block: bool = False
+) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+    return self.collective_rpc(
+        "execute_model",
+        args=(scheduler_output,),
+        unique_reply_rank=self.output_rank,
+        non_block=non_block,
+        timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+        kv_output_aggregator=self.kv_output_aggregator,
+    )
+```
+
+`self.output_rank` 决定「收哪个 rank」，靠的是这个函数：
 
 ```python
 # vllm/v1/executor/multiproc_executor.py:L480
@@ -896,7 +913,7 @@ self._finalizer = weakref.finalize(self, self.shutdown)
 这件事被层层抽象托起：
 
 - **工厂** `get_class` 用一个字符串，把「单卡 / 多进程 / Ray」的进程编排差异，收敛到一个分发点。
-- **collective_rpc** 是唯一入口——所有引擎指令都是它的薄封装，子类只实现这一处，整套语义就齐了。
+- **collective_rpc** 是唯一入口——大多数引擎指令（`determine_available_memory`、`add_lora`、`sleep`、`wake_up` 等）都只是它的薄封装，子类不用碰；但 `execute_model`、`sample_tokens`、`check_health` 这几个热路径方法，`UniProcExecutor` 和 `MultiprocExecutor` 各自覆写，把 `single_value` / `unique_reply_rank` 等收窄逻辑做进了调用本身。
 - **mp 实现**用共享内存广播做「下行一对多」（一次 enqueue），用 `output_rank` + N 条应答队列做「上行多对一」（按需收一个或全收），用 `FutureWrapper` + 一条 deque 的 FIFO 配对，把异步流水线的「回复对上请求」问题，化成两个 FIFO 同序的小巧思。
 - **生命周期**用 ready / death 两条管道做就绪握手与死亡感知，用 **两条独立失败路径**（方法错经 MQ 回报、进程死经 sentinel 监控）保证引擎永不静默挂死，用 **三级关停 + weakref 兜底** 杜绝泄漏。
 - **WorkerWrapperBase** 的延迟出生，给「设置环境」和「实例化 worker」之间留出必需的窗口，`__getattr__` 透传让 RPC 能一句 `getattr` 命中任意 worker 方法。

@@ -546,7 +546,7 @@ def _base_request_id(
 
 handler 只认这个协议——它不知道、也不需要知道背后是 `AsyncLLM`、是几个子进程、output_handler 怎么多路分发。它要的就是一个会持续吐 `RequestOutput` 的异步生成器。`RequestOutput` 的核心字段有：`prompt_token_ids`（输入 token 列表）、`outputs`（一组 `CompletionOutput`，每个含 `text` 增量或全文、`token_ids`、`finish_reason`、`index`）、`num_cached_tokens`（KV 缓存命中数）——下面两个分支直接从这些字段取值。`errored` / `dead_error` 这两个属性也在协议里，下一节就要用到。
 
-主线里那句 `assert len(generators) == 1` 值得解释。当 `n > 1`（要多个候选回答）或一次塞多段 prompt 时，代码会派生出多个 `sub_request_id = f"{request_id}_{i}"` 并起多个生成器；但最常见的单回答单 prompt 场景就是一个。本章盯着这条主线走。
+主线里那句 `assert len(generators) == 1` 值得解释。触发多个生成器的只有一件事：一次塞多段 prompt（`len(engine_inputs) > 1`）——这时才会派生出多个 `sub_request_id = f"{request_id}_{i}"`。`n > 1`（要多个候选回答）走的是完全独立的另一条通道：`request.to_sampling_params(...)` 把 `n=self.n` 原样塞进*同一个* `SamplingParams`（`vllm/entrypoints/openai/chat_completion/protocol.py:586`），引擎照样只起一个生成器，只是在同一个 `RequestOutput.outputs` 里一次给出多个 `CompletionOutput`（各有自己的 `index`）——[§36.5.1](#3651-流式逐-token-推成-sse) 那句 `num_choices = 1 if request.n is None else request.n` 和 `for output in res.outputs: i = output.index` 就是在消费这些并列的候选，而不是多个 sub_request_id。最常见的单回答单 prompt 场景，两条通道都退化成一，`generators` 自然长度为一。本章盯着这条主线走。
 
 最后，`if request.stream:` 决定返回哪个生成器：流式返回 `chat_completion_stream_generator`，非流式 `await chat_completion_full_generator`。两个分支吃的是**同一个 `result_generator`**——这是下一节的关键。
 

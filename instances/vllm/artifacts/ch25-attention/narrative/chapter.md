@@ -34,13 +34,13 @@
 
 ![后端抽象、注册表懒加载、按配置选后端三段](../diagrams/01-backend-abstraction-and-selection.png)
 
-> *图注：左段是抽象层——`AttentionBackend` 用六个抽象 staticmethod 定义"一个后端该长什么样"。中段是注册表——`AttentionBackendEnum` 把每个后端记成一段类路径字符串，用到才 import。右段是选择——`get_attn_backend` 把零散参数打成可哈希的键，交给平台层按 compute capability 过滤、挑优先级最高者。*
+> *图注：左段是抽象层——`AttentionBackend` 用四个抽象 staticmethod 定义"一个后端该长什么样"。中段是注册表——`AttentionBackendEnum` 把每个后端记成一段类路径字符串，用到才 import。右段是选择——`get_attn_backend` 把零散参数打成可哈希的键，交给平台层按 compute capability 过滤、挑优先级最高者。*
 
 注意三个动词：**抽象**（`vllm/v1/attention/backend.py`）让框架不必认识任何具体后端，只认接口；**注册**（`vllm/v1/attention/backends/registry.py`）让重依赖的后端（FlashInfer、FlashMLA）不会因为没装而拖崩整个 import；**选择**（`vllm/v1/attention/selector.py`）让同一份模型在 Hopper 上默认走 FlashAttention、在 Blackwell 上默认走 FlashInfer，全自动。
 
 我们从最左边的抽象基类开始。
 
-## 25.2 后端的身份证：六个抽象 staticmethod
+## 25.2 后端的身份证：四个抽象 staticmethod
 
 `AttentionBackend` 是所有注意力后端的抽象基类。它开头就声明了两件全局约束——支持哪些 `dtype`、KV cache 能存成哪些精度（`vllm/v1/attention/backend.py:L55`）：
 
@@ -101,7 +101,7 @@ class AttentionBackend(ABC):
 
 `forward_includes_kv_cache_update` 这个布尔标志也先记一笔：它决定"写 KV"这步是混在 `forward` 里、还是拆成独立一步。FlashAttention 把它设成 `False`，于是写和读被拆成两个算子——这是 [§25.10](#2510-按-layer_name-分发先写后算) 的伏笔。
 
-抽象基类下面还挂着两个抽象角色，凑齐一个后端的"四件套"：
+`AttentionBackend` 本身的抽象 staticmethod 就是这四个。但一个后端要跑起来，还得配上另外两个抽象角色——它们不挂在 `AttentionBackend` 上，而是分属 `AttentionMetadataBuilder` 和 `AttentionImpl` 这两个协作类，且都是**实例方法**（`self.build(...)`、`self.forward(...)`），不是 staticmethod：
 
 ```python
 # vllm/v1/attention/backend.py:L582
@@ -510,7 +510,7 @@ def _cached_get_attn_backend(
 
 这就是"平台最优"的体现：Blackwell（`major == 10`，sm100）把 FlashInfer 提到第一；Hopper 及以下（普通非 MLA decoder）默认 FlashAttention 优先、其次 FlashInfer、再 Triton。原因在于 FlashInfer 较早为 sm100 的 wgmma（warpgroup 级矩阵乘累加指令，Hopper/Blackwell 上新增的底层矩阵乘指令）做了专项适配，而 FlashAttention 对 Blackwell 的支持引入更晚；Hopper（sm90）上二者性能接近，但 FlashAttention 在 vLLM 里集成更早、测试覆盖更广，故仍排在前。
 
-**选后端贵不贵？** 一点都不贵。`validate_configuration` 对优先级列表里 $O(B)$ 个候选（ $B$ = 后端数），各做常数次探针检查，全是 Python 端常数级别；而且整条链被 `@cache` 摊销到每模型只算一次。它根本不在前向热路径上。精简版正好复现了 Hopper 默认选 FlashAttention、以及显式指定不合法后端直接报错这两条路：
+**选后端贵不贵？** 一点都不贵。`validate_configuration` 对优先级列表里 $`O(B)`$ 个候选（ $`B`$ = 后端数），各做常数次探针检查，全是 Python 端常数级别；而且整条链被 `@cache` 摊销到每模型只算一次。它根本不在前向热路径上。精简版正好复现了 Hopper 默认选 FlashAttention、以及显式指定不合法后端直接报错这两条路：
 
 ```python
 CudaPlatform._device_capability = DeviceCapability(9, 0)  # Hopper
@@ -679,7 +679,7 @@ metadata 翻译好了，`block_table` 和 `slot_mapping` 都到了后端手里�
 
 [KV cache 那章](../../ch15-kv-cache/narrative/chapter.md) 立下了两张表的语义，但只到"表算好了"为止。现在两张表落进了后端的手里，我们终于能看清它们怎么真正读写显存。这套「逻辑块→物理块」的分页间接寻址，正是 vLLM 原始论文提出的 **PagedAttention**（arXiv:2309.06180）的核心。先把寻址恒等式钉死。
 
-**PagedAttention 寻址恒等式。** 对第 $i$ 个 token：
+**PagedAttention 寻址恒等式。** 对第 $`i`$ 个 token：
 
 $$
 \mathrm{slot} = \mathrm{slot\_mapping}[i], \quad
@@ -687,7 +687,7 @@ $$
 \mathrm{block\_offset} = \mathrm{slot} \;\mathrm{mod}\; \mathrm{block\_size}
 $$
 
-人话翻译：`slot_mapping[i]` 给出第 $i$ 个 token 的**扁平槽号**；整除块大小得到它落在第几个物理块，取余得到块内偏移。举个数：`block_size = 16` 时，`slot = 17` → `block_idx = 1`、`block_offset = 1`，也就是第 1 块的第 1 个位置。
+人话翻译：`slot_mapping[i]` 给出第 $`i`$ 个 token 的**扁平槽号**；整除块大小得到它落在第几个物理块，取余得到块内偏移。举个数：`block_size = 16` 时，`slot = 17` → `block_idx = 1`、`block_offset = 1`，也就是第 1 块的第 1 个位置。
 
 两张表分工明确：
 
@@ -760,7 +760,7 @@ def reshape_and_cache_flash(
     )
 ```
 
-内核语义就是上面那条寻址恒等式：对每个 token $i$ ，取 `slot = slot_mapping[i]`，算出 `block_idx` 和 `block_offset`，把 `key[i]` / `value[i]`（形状 `[num_kv_heads, head_size]`）写进 `key_cache[block_idx, block_offset]` / `value_cache[block_idx, block_offset]`。`slot_mapping[i] == -1` 表示这个 token 跳过（是 padding）。这就是 PagedAttention 的"写"半边。
+内核语义就是上面那条寻址恒等式：对每个 token $`i`$ ，取 `slot = slot_mapping[i]`，算出 `block_idx` 和 `block_offset`，把 `key[i]` / `value[i]`（形状 `[num_kv_heads, head_size]`）写进 `key_cache[block_idx, block_offset]` / `value_cache[block_idx, block_offset]`。`slot_mapping[i] == -1` 表示这个 token 跳过（是 padding）。这就是 PagedAttention 的"写"半边。
 
 host 无 CUDA，精简版用 CPU 等价实现复刻了这个寻址语义，于是能在本地把"散写"看个真切：
 
@@ -843,7 +843,7 @@ $$
 n_{\mathrm{blocks}} = \left\lceil \frac{\mathrm{seq\_len}}{\mathrm{block\_size}} \right\rceil
 $$
 
-每块读至多 `block_size` 个 token 的 KV。这和"写"那侧 $O(1)$ 的散写直觉对称——写是按 `slot_mapping[i]` 一个 token 落一格、单 token 常数时间，读则要把整段历史顺块表扫一遍、与历史长度成正比。`block_table` 可以比实际历史长（它给的是请求"最多能用到的页"），但 `seq_lens` 会把读截到前 `seq_len` 个 token，多余的块这一步根本不碰。
+每块读至多 `block_size` 个 token 的 KV。这和"写"那侧 $`O(1)`$ 的散写直觉对称——写是按 `slot_mapping[i]` 一个 token 落一格、单 token 常数时间，读则要把整段历史顺块表扫一遍、与历史长度成正比。`block_table` 可以比实际历史长（它给的是请求"最多能用到的页"），但 `seq_lens` 会把读截到前 `seq_len` 个 token，多余的块这一步根本不碰。
 
 host 没有 FlashAttention kernel，精简版用 CPU 等价实现（照 `block_table` 读 paged KV + causal softmax）复刻了语义。最有说服力的验证是：**把它的输出和一个朴素稠密 causal 自注意力对照**——如果 paged 寻址没错，二者应当数值一致。
 
@@ -897,7 +897,7 @@ assert torch.allclose(out, ref, atol=1e-5)
             self.attn_backend = attn_backend
 ```
 
-模型里每个注意力层在 `__init__` 时调 `get_attn_backend` 选出后端类，随后 `impl_cls = self.attn_backend.get_impl_cls()` 实例化具体 impl（`vllm/model_executor/layers/attention/attention.py:L345`）。`get_impl_cls` 在这里是"抽象→具体"的桥——[§25.2](#252-后端的身份证六个抽象-staticmethod) 那张身份证，到这一刻兑现成一个能算注意力的对象。
+模型里每个注意力层在 `__init__` 时调 `get_attn_backend` 选出后端类，随后 `impl_cls = self.attn_backend.get_impl_cls()` 实例化具体 impl（`vllm/model_executor/layers/attention/attention.py:L345`）。`get_impl_cls` 在这里是"抽象→具体"的桥——[§25.2](#252-后端的身份证四个抽象-staticmethod) 那张身份证，到这一刻兑现成一个能算注意力的对象。
 
 紧接着，这个层把自己以 `prefix`（即 `layer_name`）为键注册进全局上下文（`vllm/model_executor/layers/attention/attention.py:L368`）：
 
@@ -1040,7 +1040,7 @@ assert out.shape == (seq_len, num_heads * head_size)
 
 这一章把注意力后端这条链从头接到尾，回头看四个动作：
 
-- **抽象**：`AttentionBackend` 用六个抽象 staticmethod 定义后端身份。staticmethod 是为了在"还没实例化"阶段就能查能力。一个后端 = Backend + Builder + Impl + Metadata 四件套。
+- **抽象**：`AttentionBackend` 用四个抽象 staticmethod（`get_name`/`get_impl_cls`/`get_builder_cls`/`get_kv_cache_shape`）定义后端身份，staticmethod 是为了在"还没实例化"阶段就能查能力；`AttentionMetadataBuilder.build()` 和 `AttentionImpl.forward()`/`do_kv_cache_update()` 是另外两个抽象角色，是实例方法，分属 Builder/Impl 两个协作类。一个后端 = Backend + Builder + Impl + Metadata 四件套。
 - **注册 + 选择**：枚举值是类路径字符串，`get_class()` 用到才 import（懒加载），躲开重依赖；`validate_configuration` 把"不行的理由"列成清单，平台层据此过滤、按 compute capability 挑优先级最高者；`@cache` 摊销到每模型只算一次。
 - **两层 metadata**：`CommonAttentionMetadata` 跨层共享、运行器那头只算一次；`builder.build()` 把它翻译成后端专属 metadata——共享字段直接搬、特有字段新增。`block_table_tensor` 和 `slot_mapping` 在这里作为接口字段被接住。
 - **读写 + 分发**：`slot_mapping`（token→物理槽）照恒等式 `block_idx = slot // block_size` 把新 KV **写**进 paged cache（`vllm/_custom_ops.py` 的 `reshape_and_cache_flash`）；`block_table`（请求→逻辑块号列表）照表把历史 KV **读**回来算注意力（`vllm/v1/attention/backends/flash_attn.py` 的 `flash_attn_varlen_func`）。运行时按 `layer_name` 当键，从 `forward_context` 取本层的 KV cache 与 metadata（`vllm/model_executor/layers/attention/attention.py`），写算子和算算子用 `dummy_dep` 串住"先写后读"。

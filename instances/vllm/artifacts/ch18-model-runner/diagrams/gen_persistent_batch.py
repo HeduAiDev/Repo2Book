@@ -59,11 +59,11 @@ draw_col(x2, [
     ("E  (复用 slot1)", C_REUSE, "#166534"),
     ("C", C_ACTIVE, "#1e3a8a"),
     ("F  (复用 slot3)", C_REUSE, "#166534"),
+    ("G  (追加 slot4)", C_ACTIVE, "#1e3a8a"),
     ("—", C_EMPTY, "#94a3b8"),
-    ("G  (追加 slot5)", C_ACTIVE, "#1e3a8a"),
 ])
 # annotate removed->reused
-L.append(f'<text x="{x2+slot_w//2}" y="{top - 12}" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="#b45309">remove 打洞(1,3) → pop_removed 复用，G 无洞可填则追加</text>')
+L.append(f'<text x="{x2+slot_w//2}" y="{top - 12}" text-anchor="middle" font-family="sans-serif" font-size="12.5" fill="#b45309">remove 打洞(1,3) → pop_removed 复用，G 无洞可填则追加到 num_reqs=4</text>')
 
 # 拍3
 x3 = x2 + col_gap + 70
@@ -73,16 +73,16 @@ title(x3-90, 70, "拍 3：C 完成留洞 + 无新请求")
 draw_col(x3, [
     ("A", C_ACTIVE, "#1e3a8a"),
     ("E", C_ACTIVE, "#1e3a8a"),
-    ("G  ←slot5", C_MOVE, "#854d0e"),
+    ("G  ←slot4", C_MOVE, "#854d0e"),
     ("F", C_ACTIVE, "#1e3a8a"),
-    ("—", C_EMPTY, "#94a3b8"),
     ("—  (G 搬走)", C_EMPTY, "#94a3b8"),
+    ("—", C_EMPTY, "#94a3b8"),
 ])
-# arrow showing move from slot5 to slot2
-y5 = top + 5*slot_h + (slot_h-6)//2
+# arrow showing move from slot4 to slot2
+y4 = top + 4*slot_h + (slot_h-6)//2
 y2c = top + 2*slot_h + (slot_h-6)//2
-L.append(f'<path d="M {x3+slot_w} {y5} C {x3+slot_w+70} {y5}, {x3+slot_w+70} {y2c}, {x3+slot_w} {y2c}" fill="none" stroke="#b45309" stroke-width="2" marker-end="url(#arr)"/>')
-L.append(f'<text x="{x3+slot_w+78} " y="{(y5+y2c)//2+4}" font-family="sans-serif" font-size="12" fill="#b45309">condense</text>')
+L.append(f'<path d="M {x3+slot_w} {y4} C {x3+slot_w+70} {y4}, {x3+slot_w+70} {y2c}, {x3+slot_w} {y2c}" fill="none" stroke="#b45309" stroke-width="2" marker-end="url(#arr)"/>')
+L.append(f'<text x="{x3+slot_w+78} " y="{(y4+y2c)//2+4}" font-family="sans-serif" font-size="12" fill="#b45309">condense</text>')
 
 # legend
 ly = top + NSLOT*slot_h + 40

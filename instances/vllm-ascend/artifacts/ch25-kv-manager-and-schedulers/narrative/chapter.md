@@ -171,7 +171,7 @@ class CompressAttentionManager(FullAttentionManager):
 
 看 `get_num_blocks_to_allocate`：两行 `num_tokens //= self.compress_ratio`，然后**原封不动调 `super()`**。这就是整个 manager 的设计母题——压缩 MLA 把每 `compress_ratio` 个逻辑 token 压成 1 个物理 KV slot，所以「要多少物理 block」这道题里的 `num_tokens` 先除以 `compress_ratio`，剩下的 block 计数逻辑跟全注意力**一模一样**，不必重写。
 
-`allocate_new_blocks`、`cache_blocks` 也是同一个套路：入口处把 token 数除以 `compress_ratio`，主体调父类。把账算清楚就一目了然：
+`allocate_new_blocks` 同样在入口 `num_tokens //= self.compress_ratio`，但主体**不调** `super()`——它自己用 `cdiv(num_tokens, self.block_size)` 算出 `num_required_blocks` 再直接调 `self.block_pool.get_new_blocks(...)`，是独立重写，只是换算思路和父类一致。`cache_blocks` 换了种写法：把 `compress_ratio` 直接乘进分母算 `num_full_blocks = num_tokens // (self.block_size * self.compress_ratio)`，然后直接调 `self.block_pool.cache_full_blocks(...)`，同样不经过父类同名方法。三个方法里只有 `get_num_blocks_to_allocate` 真的「除一下调 `super()`」；另外两个是入口算法一致、但主体独立改写。把账算清楚就一目了然：
 
 ![压缩 KV 的 block 换算](../diagrams/compress_scaling.png)
 
@@ -231,7 +231,7 @@ $$
 
 压缩 MLA 的 KV 不像 SWA 那样随窗口滑动回收，但它也**永不超过**这个峰值。把 admission 上限钉在这里，就和启动期 block 池的尺寸算法对齐了——长输入请求不会被 `allocate_slots` 静默拒掉、卡死在 waiting 队列里。
 
-到此 KV manager 这一侧讲完了，回头数一下账：`BlockPool`、`SingleTypeKVCacheManager`、`FullAttentionManager`、`spec_manager_map`——四样原样复用；`get_manager_for_kv_cache_spec` 重映射、`CompressAttentionManager` 新增——两处特化，且后者的全部覆写就是「`//= compress_ratio` 后调 super()」。这就是「核心循环尽量少碰」的标准姿势。
+到此 KV manager 这一侧讲完了，回头数一下账：`BlockPool`、`SingleTypeKVCacheManager`、`FullAttentionManager`、`spec_manager_map`——四样原样复用；`get_manager_for_kv_cache_spec` 重映射、`CompressAttentionManager` 新增——两处特化。但后者内部不是清一色「除一下调 `super()`」：四个覆写方法里只有 `get_num_blocks_to_allocate` 真调了 `super()`；`allocate_new_blocks`、`cache_blocks` 换算完直接调 `block_pool`，`find_longest_cache_hit`（前面说的「改动最实的一处」）更是整段独立重写，都不经过父类同名方法。这就是「核心循环尽量少碰」的标准姿势——碰的地方各显特化，不是统一套路。
 
 ## 25.4 SchedulerDynamicBatch：动态预算 + decode 优先
 
@@ -561,7 +561,7 @@ $$
 
 把本章五处特化连起来看，会发现它们有个共同的形状：每一处都**贴着**一个 vLLM 基类/基方法，只改最小的那个落点。
 
-- `CompressAttentionManager`（`vllm_ascend/core/single_type_kv_cache_manager.py`）：贴着 `vllm/v1/core/single_type_kv_cache_manager.py` 的 `FullAttentionManager`，只在入口 `//= compress_ratio`；
+- `CompressAttentionManager`（`vllm_ascend/core/single_type_kv_cache_manager.py`）：贴着 `vllm/v1/core/single_type_kv_cache_manager.py` 的 `FullAttentionManager`——`get_num_blocks_to_allocate` 只在入口 `//= compress_ratio` 后调 `super()`，`allocate_new_blocks`/`cache_blocks`/`find_longest_cache_hit` 换算思路一致但独立重写，不经过父类同名方法；
 - `get_manager_for_kv_cache_spec`：贴着 `spec_manager_map`，只对压缩 MLA 一个 spec 改选；
 - 三个 `Scheduler` 子类：贴着 `vllm/v1/core/sched/scheduler.py` 的 `Scheduler.schedule`，各自只插一两处改动点——动态预算、丢弃重算、chunk 收窄。
 

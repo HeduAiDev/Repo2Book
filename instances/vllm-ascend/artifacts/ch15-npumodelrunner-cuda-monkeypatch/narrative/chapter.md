@@ -193,7 +193,11 @@ def _torch_cuda_wrapper():
 
 **② 进程级 = 必须成对装卸。** 既然改的是全局状态，就绝不能改完不还原——否则会污染进程里**别处**真正想用 cuda 的代码。所以它用 `try / except / finally` 三件套：`try` 里装、`yield` 交出控制权给 `with` 体、`finally` 里卸。Python 保证 `finally` 在**正常退出、抛异常、return 三条路径上都执行**，这就是「装了必卸」的硬保证。
 
-**③ 失败兜底用 placeholder。** 万一 `with` 体里抛了异常（比如初始化失败），`except` 分支先把符号换成两个 placeholder 类——`_EventPlaceholder` 的 `record` / `wait` / `synchronize` 全是 no-op、`query` 恒返回 `True`，`_StreamPlaceholder` 是个空壳。注意 `synchronize` / `mem_get_info` 这种本是「函数」的符号，这里也被赋成 placeholder **类**：调用 `torch.cuda.synchronize()` 时，只是 new 一个空对象出来、什么都不做，对调用方就是个安全的 no-op。这样即便走异常路径，进程里残留的 `torch.cuda.Event()` 也只是造个不干活的空对象，**不会因为留着坏掉的 NPU 绑定而把别处搞崩**。安顿好这些残留符号后，`except` 分支最后再 re-raise，把原始错误包成 `RuntimeError` 原样抛出去。（`except` 与紧随其后的 `finally` 都落兜底值，看似重复——其实 `except` 是抛错前先把符号钉到安全态，`finally` 再落到下一段 ④ 说的稳态缺省，两道叠加，确保任何中途状态都不留坏绑定。）
+**③ 失败兜底用 placeholder。** 万一 `with` 体里抛了异常（比如初始化失败），`except` 分支先把符号换成两个 placeholder 类——`_EventPlaceholder` 的 `record` / `wait` / `synchronize` 全是 no-op、`query` 恒返回 `True`，`_StreamPlaceholder` 是个空壳。注意 `synchronize` / `mem_get_info` 这种本是「函数」的符号，这里也被赋成 placeholder **类**：调用 `torch.cuda.synchronize()` 时，只是 new 一个空对象出来、什么都不做，对调用方就是个安全的 no-op。这样即便走异常路径，进程里残留的 `torch.cuda.Event()` 也只是造个不干活的空对象，**不会因为留着坏掉的 NPU 绑定而把别处搞崩**。安顿好这些残留符号后，`except` 分支最后再 re-raise，把原始错误包成 `RuntimeError` 原样抛出去。
+
+`except` 与紧随其后的 `finally` 落的兜底值并不是对全部符号都一致——七个符号分两种命运。`Event`：两处都落 `_EventPlaceholder`，`finally` 维持 `except` 钉好的安全态。`Stream`：`finally` 写的是 `torch.cuda.Stream = torch.cuda.Stream`——自引用，读的是当前值再写回去，所以它也只是维持 `except` 刚落下的 `_StreamPlaceholder`，没有二次改判。但 `default_stream` / `current_stream` / `stream` / `synchronize` / `mem_get_info` 这 5 个符号，`finally` 写的是 `torch.cuda.default_stream = torch.npu.default_stream` 这类**无条件赋值**——不管 `except` 是否已经把它们钉成 `_StreamPlaceholder`，`finally` 都会把它们**改判回真实的 npu 函数**。也就是说异常路径退出后，进程里 `torch.cuda.synchronize` 实际绑定的是真的 `torch.npu.synchronize`，不是占位符。
+
+这么改判依然安全，原因在于这 5 个符号本身的性质：它们是无副作用、随时可调的**纯函数**（查询流状态、做同步、问显存），不像 `Event()` / `Stream()` 那样会在异常路径里可能持有一个初始化到一半、绑着坏底层句柄的对象实例。放真 npu 函数在这，调用方拿到的要么是正常结果、要么因为设备本就没问题而正常返回——不会因为「上一次 with 块失败了」就变得不安全。真正需要挡一手的，只有 `Event`/`Stream` 这两个「会产出可能带脏状态实例」的类，这也是为什么只有它们在 `finally` 里维持了 `except` 落的 placeholder。
 
 **④ 退出后不是「原样还原」，而是「落到稳态缺省」。** 注意 `finally` 里的赋值——`torch.cuda.Event` 落到 placeholder、`synchronize` / `mem_get_info` 留在 npu 版。它没有把 `torch.cuda` 恢复成进程启动时的原始 cuda 实现。原因很实在：**昇腾进程本来就没有真 cuda**，「还原成 cuda」毫无意义；落到一组「NPU 直通 + 安全空实现」的稳态，才是这台机器上正确的缺省。
 

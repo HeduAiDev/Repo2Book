@@ -245,7 +245,7 @@ MC2 group_ranks = [[0, 1, 2, 3, 4, 5, 6, 7]]
 
 注意紧跟其后的两个 `if`。`_DYNAMIC_EPLB` 和 `_FC3_QUANT_X` **复用同一份 `group_ranks`**——因为动态专家负载均衡、flashcomm3（flashcomm 系列里更进一步的量化 all-gather 变体，本书不展开其内部机制）量化 all-gather，都在同一个专家域里通信，拓扑和 MC2 一模一样。复用排布、只是各 new 一个独立的 `GroupCoordinator`，省掉重算。其中 `_DYNAMIC_EPLB` 就是[第 10 章专家热迁移](../../ch10-eplb-expert-load-balancing/narrative/chapter.md)要用的组——这里先把它建好，机制留到那章展开。
 
-还有一点要点破：`_MC2` 同时是 `model_parallel_initialized()` 的哨兵。这个函数的实现就一行——`return _MC2 is not None`（[后面 §取用、哨兵与销毁](#取用哨兵与销毁)会看到完整定义），所以 `_MC2` 是「已初始化」状态的**唯一**哨兵。这意味着 MC2 必须**无条件、最先**建——它一建好，整个 `init_ascend_model_parallel` 就被视为「已初始化」；若不最先建，重复调用时哨兵会失真。
+还有一点要点破：`_MC2` 同时是 `model_parallel_initialized()` 的哨兵。这个函数的实现就一行——`return _MC2 is not None`（[后面 §取用、哨兵与销毁](#取用哨兵与销毁)会看到完整定义），所以 `_MC2` 是「已初始化」状态的**唯一**哨兵。这意味着 MC2 必须**无条件**建——赋值语句不能被任何 `if` 包住，否则某些配置下函数正常返回时 `_MC2` 仍是 `None`，哨兵就失真了。注意这与「建组顺序」无关：本节代码框顶部省略掉的 `_P_TP` 分支其实排在 MC2 之前执行（只是 `_P_TP` 本身建不建、建成什么样要看 `pd_head_ratio` 和 `is_kv_producer`），MC2 并不是函数里第一个被处理、甚至第一个被建的组；哨兵真正要求的只是「函数正常返回前 `_MC2` 一定被赋值」，不要求它在代码顺序上打头。
 
 ## 细粒度 TP：沿 DP 借 rank，与全局 TP 正交
 
@@ -462,7 +462,7 @@ flashcomm2 也在 o_proj 处「再切一刀」TP，但目的是通信-计算重�
 
 先看那张 `all_ranks`——和昇腾那张**逐维一致**，这是两边能在同一坐标系叠加的前提，前面强调过。
 
-CP 的核心约束是：**它不增加 world_size**。为什么不能增？因为 CP 的语义是把**序列（上下文）**切给已有的那批卡——它是「在同一批 GPU 上换个维度切」，而不是「多铺一批 GPU」。源码注释也点明了这一点：DCP「不改变 world size，只是复用 TP 组的那些 GPU」。一旦真去加卡，就引入了新的 rank、变成另一根独立的并行维度，而非 CP 想要的「同一批卡上的切法变化」。所以：
+CP 的核心约束是：**它不增加 world_size**。为什么不能增？因为 CP 的语义是把**序列（上下文）** 切给已有的那批卡——它是「在同一批 GPU 上换个维度切」，而不是「多铺一批 GPU」。源码注释也点明了这一点：DCP「不改变 world size，只是复用 TP 组的那些 GPU」。一旦真去加卡，就引入了新的 rank、变成另一根独立的并行维度，而非 CP 想要的「同一批卡上的切法变化」。所以：
 
 - **DCP**：`all_ranks.reshape(-1, dcp)`。注释说得明白——dcp 复用 TP 组的 GPU，把一个 TP 组再切成 `tp_size // dcp_size` 个 DCP 子组，因此 `dcp_size ≤ tp_size`。
 - **PCP**：`all_ranks.transpose(3, 4).reshape(-1, pcp)`。把 pcp 维（维度 3）和 tp 维（维度 4）对调，pcp 换到末尾再切——所以 PCP 组沿 tp 维以步长 tp 跳取。
@@ -515,7 +515,7 @@ def get_flashcomm2_odp_group() -> GroupCoordinator:
 
 三点收尾：
 
-- `model_parallel_initialized()` 以 `_MC2` 为**唯一哨兵**——这反过来印证了前面的话：MC2 必须无条件、最先建，否则哨兵就失真了。
+- `model_parallel_initialized()` 以 `_MC2` 为**唯一哨兵**——这反过来印证了前面的话：MC2 必须无条件建（赋值不能被 `if` 包住），否则哨兵就失真了；但它不必是代码里第一个被处理的组（`_P_TP` 分支就排在它前面）。
 - 多数 getter 带 `assert ... is not None`，没建就用会当场报错。
 - `get_flashcomm2_otp_group()` 故意**不带断言**——因为 `otp_size==1` 时它合法地就是 `None`，断言反而错。
 

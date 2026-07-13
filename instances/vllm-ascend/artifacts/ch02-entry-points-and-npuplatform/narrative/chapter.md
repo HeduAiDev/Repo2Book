@@ -153,7 +153,7 @@ def resolve_current_platform_cls_qualname() -> str:
 
 > *图注：builtin 探测函数「问硬件」，host 无对应硬件全返 None；OOT 的 register() 「装了就用」无条件返字符串。`elif` 链把 OOT 分支放在最前——只要有一个 OOT 激活，就走 OOT，根本不看 builtin。*
 
-注意 `elif` 链的次序：`OOT≥2`（报错）→ `OOT==1`（取 OOT）→ `builtin≥2`（报错）→ `builtin==1`（取 builtin）→ 否则 `UnspecifiedPlatform`。把这串判定形式化一下。记 builtin 的激活集为 B、OOT 的激活集为 O，并约定 $\mathrm{sole}(S)$ 表示单元素集合 $S$ 中的那个（唯一）元素，最终选中的平台 P 按如下优先级决定：
+注意 `elif` 链的次序：`OOT≥2`（报错）→ `OOT==1`（取 OOT）→ `builtin≥2`（报错）→ `builtin==1`（取 builtin）→ 否则 `UnspecifiedPlatform`。把这串判定形式化一下。记 builtin 的激活集为 B、OOT 的激活集为 O，并约定 $`\mathrm{sole}(S)`$ 表示单元素集合 $`S`$ 中的那个（唯一）元素，最终选中的平台 P 按如下优先级决定：
 
 $$
 P = \begin{cases} \mathrm{RuntimeError} & |O| \ge 2 \\ \mathrm{sole}(O) & |O| = 1 \\ \mathrm{RuntimeError} & |O|=0,\ |B| \ge 2 \\ \mathrm{sole}(B) & |O|=0,\ |B| = 1 \\ \mathrm{UnspecifiedPlatform} & |O|=|B|=0 \end{cases}
@@ -199,7 +199,7 @@ def register():
     return "vllm_ascend.platform.NPUPlatform"
 ```
 
-就这四行。它**无条件**返回字符串 `"vllm_ascend.platform.NPUPlatform"`，从不返回 `None`——所以它永远「激活」。对 OOT 而言，「激活」退化成了「这个插件包装没装」：你既然 `pip install` 了 vllm-ascend，`register` 就一定能被发现、一定返回 qualname。「是否在场」从「硬件探测」降级成了「包是否安装」，决定权前移到了用户的安装动作上。
+就这四行。它**无条件**返回字符串 `"vllm_ascend.platform.NPUPlatform"`，从不返回 `None`——函数体本身没有任何「查不到就返回 `None`」的分支，只要被调用就「激活」。「是否在场」从「硬件探测」降级成了「函数体里写死返回值」，不再依赖任何运行时环境判定。当然，`register` 能不能被调用到，还要看 §2.2 的白名单前置：`allowed_plugins`（即 `envs.VLLM_PLUGINS`）为 `None`（默认，不设白名单）时，`ascend` 这个插件条目会被正常发现并 `load()`，`register()` 随即被调用、返回 qualname；但如果用户显式设置了 `VLLM_PLUGINS` 且其中不含 `"ascend"`，第 69 行的筛选就会把它挡在 `load()` 之外，`register` 根本不会被调用——决定权最终前移到了用户的安装 **与** 白名单配置这两个动作上。
 
 两种语义不同，却被 `resolve_current_platform_cls_qualname` 统一成了同一句话——「`func()` 返回非 `None` 即激活」。这是接口设计的漂亮之处：链上所有成员只需满足同一个契约（`() -> str | None`），各自的「在场判定」逻辑则完全自治。
 
@@ -213,7 +213,7 @@ def register():
 
 打个比方：import `torch_npu` 像是「点火启动整套昇腾运行时 CANN（昇腾的算子与运行时软件栈）」。点火要去抢占设备、建立上下文，本身就是个重操作。更要命的是它「一锤定音」——按点火那一刻读到的环境与配置定型，之后你再改环境变量，它也不回头重读。所以你绝不想在「还没想清楚到底用不用昇腾」时就把它点着。
 
-而 `register` 被调用的时刻——平台选择期——是 vLLM 刚启动、**还在探测「我到底在什么硬件上」**的极早期。此刻：
+而 `register` 被调用的时刻——平台选择期——是 vLLM 刚启动、**还在探测「我到底在什么硬件上」** 的极早期。此刻：
 
 - 还没确定该不该用昇腾（万一这台机器装了 vllm-ascend 但用户其实想跑别的？选择逻辑还没跑完）；
 - 选卡用的环境变量 `ASCEND_RT_VISIBLE_DEVICES` 可能还没生效；

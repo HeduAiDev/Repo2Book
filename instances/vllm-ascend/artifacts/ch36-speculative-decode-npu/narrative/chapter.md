@@ -6,7 +6,7 @@
 > 本章转到工程：`AscendDflashProposer` 怎么把它落地到昇腾——以及另外 7 种提议策略共享的工厂分发与薄壳继承。
 > 一处工厂分发 + 一批薄壳继承，收束投机这条线。
 
-[第 33 章](../../ch33-sampling-npu-adaptation/narrative/chapter.md)拆采样器时，反复出现一个名字：`AscendRejectionSampler`。它做的是「接受还是拒绝 draft token」（draft token＝proposer 在验证前投机提出的候选 token）——可那串 draft token 是谁提出来的？投机解码是一组「提议-验证」的搭档：一方先猜出 $k$ 个候选 token，另一方一趟前向并行验证。验证时除了核对这 $k$ 个候选，还会顺手多采 1 个 token（即第 k+1 位）——就是[投机采样原理](../../ch34-primer-speculative-sampling/narrative/chapter.md)那一章讲的白送 bonus token，所以 n 个 draft token 最多能被接受 n+1 个，后面 `rejection_count = n+1-len` 里那个加一就是它。拒绝采样为什么能在丢掉一部分候选的同时严格保持目标分布不变、接受率又该怎么定义，[那一章](../../ch34-primer-speculative-sampling/narrative/chapter.md)已经完整证过——本章默认这套定理已经成立。刚过去的上一章讲的是 [DFlash 原理](../../ch35-primer-dflash/narrative/chapter.md)：把「怎么猜」这一半从逐 token 自回归换成一次前向并行吐出整块草稿、再把 target 隐藏特征逐层注入 draft 的 KV cache——定理和验证侧的地基原封不动，这一章要看的正是它（以及另外 7 种提议策略）怎么落地到昇腾：`AscendDflashProposer` 就是 DFlash 原理落地昇腾的那个类。
+[第 33 章](../../ch33-sampling-npu-adaptation/narrative/chapter.md)拆采样器时，反复出现一个名字：`AscendRejectionSampler`。它做的是「接受还是拒绝 draft token」（draft token＝proposer 在验证前投机提出的候选 token）——可那串 draft token 是谁提出来的？投机解码是一组「提议-验证」的搭档：一方先猜出 $`k`$ 个候选 token，另一方一趟前向并行验证。验证时除了核对这 $`k`$ 个候选，还会顺手多采 1 个 token（即第 k+1 位）——就是[投机采样原理](../../ch34-primer-speculative-sampling/narrative/chapter.md)那一章讲的白送 bonus token，所以 n 个 draft token 最多能被接受 n+1 个，后面 `rejection_count = n+1-len` 里那个加一就是它。拒绝采样为什么能在丢掉一部分候选的同时严格保持目标分布不变、接受率又该怎么定义，[那一章](../../ch34-primer-speculative-sampling/narrative/chapter.md)已经完整证过——本章默认这套定理已经成立。刚过去的上一章讲的是 [DFlash 原理](../../ch35-primer-dflash/narrative/chapter.md)：把「怎么猜」这一半从逐 token 自回归换成一次前向并行吐出整块草稿、再把 target 隐藏特征逐层注入 draft 的 KV cache——定理和验证侧的地基原封不动，这一章要看的正是它（以及另外 7 种提议策略）怎么落地到昇腾：`AscendDflashProposer` 就是 DFlash 原理落地昇腾的那个类。
 
 提议侧的代码全在 `vllm_ascend/spec_decode/` 这个目录里，入口是 `vllm_ascend/spec_decode/__init__.py`。打开它你会发现一件有意思的事：投机解码有 8 种策略（ngram、eagle、medusa、dflash……），但昇腾几乎没有从零写过哪一种。它的做法是一个非常典型的工程范式——**一处工厂分发，一批薄壳继承，只有少数几处重量级重写**。能直接复用 vLLM 的就套一层薄壳，必须为 NPU 特化的才动刀。这一章就来看清这三层。
 
@@ -299,7 +299,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # … 省略：query_start_loc / arange 等缓冲、attn_mask_builder …
 ```
 
-`decode_threshold = 1 + self.num_speculative_tokens` 是个值得记住的上界：每个 decode 请求一步最多产出 1 个 bonus token 加 $k$ 个候选位，所以它单步的 query 最长就是这么多。这个上界后面落在 draft 前向那条路上——`_propose` 里给 `cad.max_query_len` 定值、给图捕获时的 block_table 缓冲切片定步长，让静态图按最坏长度预留空间（`cad` 是下文 `_propose` 会接到的 `common_attn_metadata` 参数的简写，这里先剧透它的下游用法）。（它和稍后 [§36.7](#367-prepare_inputs按拒绝数把输入收缩回来) 的 `prepare_inputs` 是两回事：那里收缩 query 靠的是逐请求实测的拒绝数 `num_rejected_tokens`，而不是这个全局上界。）
+`decode_threshold = 1 + self.num_speculative_tokens` 是个值得记住的上界：每个 decode 请求一步最多产出 1 个 bonus token 加 $`k`$ 个候选位，所以它单步的 query 最长就是这么多。这个上界后面落在 draft 前向那条路上——`_propose` 里给 `cad.max_query_len` 定值、给图捕获时的 block_table 缓冲切片定步长，让静态图按最坏长度预留空间（`cad` 是下文 `_propose` 会接到的 `common_attn_metadata` 参数的简写，这里先剧透它的下游用法）。（它和稍后 [§36.7](#367-prepare_inputs按拒绝数把输入收缩回来) 的 `prepare_inputs` 是两回事：那里收缩 query 靠的是逐请求实测的拒绝数 `num_rejected_tokens`，而不是这个全局上界。）
 
 往下两处是昇腾接缝。第一处，draft 模型的并行组：
 
@@ -443,9 +443,9 @@ def prepare_inputs(
 
 ![提议-验证闭环](../diagrams/fig29-3-loop.png)
 
-proposer 一步提出 $k$ 个 draft token（本章的提议侧）；target 模型一趟前向并行验证这 `k+1` 个候选位；`AscendRejectionSampler` 接受最长合法前缀加 1 个 bonus token（第 [28 章](../../ch33-sampling-npu-adaptation/narrative/chapter.md)的验证侧，定义在 `vllm_ascend/sample/rejection_sampler.py`）；`prepare_inputs` 按拒绝数收缩输入，回到 proposer 提下一步。提议侧和验证侧各管一段，拼成一个完整的「猜测-检验」循环。
+proposer 一步提出 $`k`$ 个 draft token（本章的提议侧）；target 模型一趟前向并行验证这 `k+1` 个候选位；`AscendRejectionSampler` 接受最长合法前缀加 1 个 bonus token（第 [28 章](../../ch33-sampling-npu-adaptation/narrative/chapter.md)的验证侧，定义在 `vllm_ascend/sample/rejection_sampler.py`）；`prepare_inputs` 按拒绝数收缩输入，回到 proposer 提下一步。提议侧和验证侧各管一段，拼成一个完整的「猜测-检验」循环。
 
-这条线上有个值得量化的工程账。先说工厂这一头：if-elif 串有 8 支，最坏情况一次调用要比 8 次字符串、命中则 $O(1)$ 返回——而且这只在配置阶段调一次，运行期零开销。新增一种投机策略的边际成本，就是「加一支 elif + 写一个薄文件」，不动其余任何一支。策略数从 8 涨到 16，工厂也只是多 8 行。
+这条线上有个值得量化的工程账。先说工厂这一头：if-elif 串有 8 支，最坏情况一次调用要比 8 次字符串、命中则 $`O(1)`$ 返回——而且这只在配置阶段调一次，运行期零开销。新增一种投机策略的边际成本，就是「加一支 elif + 写一个薄文件」，不动其余任何一支。策略数从 8 涨到 16，工厂也只是多 8 行。
 
 再说提议成本这一头，两类 proposer 差着数量级：
 

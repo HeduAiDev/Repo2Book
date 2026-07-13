@@ -85,9 +85,9 @@ def schedule(self) -> SchedulerOutput:
 我们用这把尺子量一下两种经典场景：
 
 - **一个刚进来的请求**，prompt 100 个 token，还没算过任何东西。`num_computed_tokens = 0`，`num_tokens_with_spec = 100`。差 100。这就是 prefill——「差得多」。
-- **一个已经吐了 50 个字的请求**，prompt 100 + 输出 50 = 150 都算过了，现在要生成第 51 个字。`num_computed_tokens = 150`，`num_tokens_with_spec = 151`（输出 +1）。差 1。这就是 decode——「差 1 个」。
+- **一个已经吐了 50 个字的请求**，prompt 100 + 输出 50，套进上面那条公式：`num_tokens_with_spec = 100 + 50 + 0 = 150`。但最后那第 50 个输出 token 是这一拍刚采样出来的，它的 KV 还没算进 cache，所以 `num_computed_tokens = 149`。差 1——差的正是这个刚采样、尚未算 KV 的末尾 token。这就是 decode——「差 1 个」。
 
-同一条减法 `num_tokens_with_spec − num_computed_tokens`，prefill 时它等于剩余 prompt 长度，decode 时它等于 1。**调度器根本不需要知道哪个是 prefill、哪个是 decode**——它只看这个差值，给请求分配「这一拍补多少」。注释最后那行点破了威力来源：这套逻辑「general enough」——足够通用，天然覆盖 chunked prefill（差值被预算截断，分几拍补）、prefix caching（命中的前缀直接计进 `num_computed_tokens`，差值变小）、投机解码（差值里含草稿 token），甚至将来的 jump decoding。一条公式，吃下所有特性。这是 v1 相对 v0 最核心的简化——v0 要为 prefill 和 decode 维护两套队列、两条调度路径，v1 把它们抹平成了一条数轴上的追赶。
+同一条减法 `num_tokens_with_spec − num_computed_tokens`，prefill 时它等于剩余 prompt 长度，decode 时它等于 1。**这条追赶公式本身不区分 prefill 还是 decode**——它只看这个差值，给请求分配「这一拍补多少」（§13.5 你会看到调度器另外维护了一个 `is_prefill_chunk` 标志位，那是给异步调度记账用的派生量，不是这条调度公式本身分了相——公式照样是同一条减法）。注释最后那行点破了威力来源：这套逻辑「general enough」——足够通用，天然覆盖 chunked prefill（差值被预算截断，分几拍补）、prefix caching（命中的前缀直接计进 `num_computed_tokens`，差值变小）、投机解码（差值里含草稿 token），甚至将来的 jump decoding。一条公式，吃下所有特性。这是 v1 相对 v0 最核心的简化——v0 要为 prefill 和 decode 维护两套队列、两条调度路径，v1 把它们抹平成了一条数轴上的追赶。
 
 > 后面 §13.3 你会看到这条减法在 RUNNING 阶段的真身（还多了个 `num_output_placeholders` 项，那是 §13.7 异步调度的伏笔）；§13.4 看它在 WAITING 阶段的变体。
 
@@ -452,7 +452,7 @@ def test_continuous_batch_mixes_prefill_and_decode():
     assert set(out.scheduled_cached_reqs.req_ids) == {"a"}          # a 走增量
 ```
 
-同一拍里，`a` 算 1 个 decode token、`b` 算 20 个 prefill token，加起来 21，共享一个预算池。调度器代码里没有任何地方写「if prefill / if decode」——它只是对每个请求算了那条减法。这就是「不分相」。
+同一拍里，`a` 算 1 个 decode token、`b` 算 20 个 prefill token，加起来 21，共享一个预算池。决定「这一拍补多少」的 `num_new_tokens` 那条减法里没有写「if prefill / if decode」——它只是对每个请求算了同一条减法。这就是「不分相」：分相与否是就调度决策公式而言，不是说整个调度器实现里彻底没有 `if` 分支（§13.5 引入的 `is_prefill_chunk` 就是一个例外，那是异步调度记账用的派生标志位，§13.7 会展开）。
 
 ---
 
@@ -675,7 +675,7 @@ def test_second_schedule_emits_cached_request_data():
 
 每拍 `num_computed_tokens` 严格增加（增量 = 上一拍乐观推进的 `num_new_tokens` > 0），它是个**有上界 `num_tokens` 的单调递增整数**——必在有限拍内追上，公式收敛、`is_prefill_chunk` 翻假，请求转入 decode。第 4 拍只剩 2 token，预算没花满（末值 14），同一拍里这 14 的余量正好留给别的 decode 请求共享——「不分相」在 chunked prefill 收尾时自然让出预算。
 
-`is_prefill_chunk` 也在这里更新：如果 `num_computed_tokens` 还没追上总数，说明 prompt 还没读完，这个请求还在 prefill 中途。这个标志位 §13.7 异步调度会用到。
+`is_prefill_chunk` 也在这里更新：如果 `num_computed_tokens` 还没追上总数，说明 prompt 还没读完，这个请求还在 prefill 中途。**这个标志位是异步调度记账用的派生量**——它标的是「prompt 读完没有」这个布尔状态，不是说调度决策本身分了相：§13.1／§13.3 那条 `num_new_tokens` 追赶公式对 `is_prefill_chunk` 为真为假的请求一视同仁，都走同一条减法。§13.7 异步调度会用到它，来判断该不该给某个请求记「输出占位」。
 
 ---
 
@@ -808,7 +808,7 @@ class AsyncScheduler(Scheduler):
             request.spec_token_ids = self._spec_token_placeholders
 ```
 
-它覆写 §13.5 那个乐观推进的 `_update_after_schedule`：先调父类把 `num_computed_tokens` 推进，然后对每个**不在 prefill 中途**（`is_prefill_chunk` 为假，即将吐字）的请求，把 `num_output_placeholders += 1 + cur_num_spec_tokens`。
+它覆写 §13.5 那个乐观推进的 `_update_after_schedule`：先调父类把 `num_computed_tokens` 推进，然后对每个**不在 prefill 中途**（`is_prefill_chunk` 为假，即将吐字）的请求，把 `num_output_placeholders += 1 + cur_num_spec_tokens`。这里的 `if request.is_prefill_chunk: continue` 确实是字面意义上的「if prefill」分支——但它出现在异步调度**记账**要不要给这个请求记「下一拍将产出的输出占位」这一步，而不是出现在决定「这一拍给它分多少 token」的调度公式里；后者（§13.1／§13.3 的 `num_new_tokens` 减法）从头到尾没有按 prefill/decode 分支。
 
 这一句是异步调度的全部魔法。意思是：「我知道这一拍的前向**将会**给这个请求产出 1 个真 token（再加 `num_spec_tokens` 个草稿 token），虽然现在还没算出来，但我**先记上**。」于是下一拍调度时，追赶公式里的 `+ request.num_output_placeholders`（§13.3 我们当时跳过的那一项）就生效了——它告诉调度器「这个请求其实还差 1 个 token 要算」，于是 §13.3 那个 async 提前剪枝和追赶公式能为它预留下一拍的 decode 槽位，**不必等前向真的回来**。这就是 §13.5 那个 `AsyncScheduler` 实例驱动连续批处理的方式：靠占位，让 `schedule(N)` 和 `forward(N−1)` 在同一段墙钟时间里重叠，GPU 不再有调度间隙的气泡。
 

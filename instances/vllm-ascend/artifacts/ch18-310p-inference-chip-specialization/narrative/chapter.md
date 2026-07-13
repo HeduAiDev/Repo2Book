@@ -88,7 +88,7 @@ if get_ascend_device_type() != AscendDeviceType._310P:
     compilation_config.custom_ops = ["all"]
 ```
 
-这一段是**整条 310 栈的入口**。`worker_cls` 一旦被指向 `NPUWorker310`，后面 vllm 拉起 worker、worker 拉起 model runner、runner 装配 input batch 与 block table——整条链都会换成 310 版。注意紧接着那个 `if`：910B 会开 `custom_ops = ["all"]`，310P 这一行被跳过，因为它根本没有 custom op。一个布尔，省去一长串 if-else 的散落判断。
+这一段是**整条 310 栈的入口**。`worker_cls` 一旦被指向 `NPUWorker310`，后面 vllm 拉起 worker、worker 拉起 model runner、runner 装配 input batch 与 block table——整条链都会换成 310 版。注意紧接着那个 `if`：910B 会开 `compilation_config.custom_ops = ["all"]`，310P 这一行被跳过——这一步跳过的只是**编译期强制启用**：`custom_ops` 是 vLLM 里控制算子 `forward()` 要不要派发到 `forward_oot`（out-of-tree 实现）的一个全局编译开关，与 310P 自己有没有算子顶替类是两回事。310P 依然通过 `REGISTERED_ASCEND_OPS` 注册了自己的一批顶替类（见 §18.7、机制详解见[第 27 章](../../ch27-customop-oot-replacement/narrative/chapter.md)），只是不必强制全局启用这条路径。一个布尔，省去一长串 if-else 的散落判断。
 
 ## 18.2 三种继承深度：310P 不一刀切
 
@@ -615,7 +615,7 @@ class NPUWorker310(NPUWorker):
 
 > *图注：中心一个 `is_310p()`，向外辐射到 platform、attention、distributed、ops 四个域。外部文件各自只用一行布尔判断接住差异。*
 
-平台与算子两域前面已带过——`platform.py` 用布尔选 `worker_cls` 并关掉 custom op，算子域靠 `REGISTERED_ASCEND_OPS` 把 rotary embedding、sampler 等换成 310 同形版。`REGISTERED_ASCEND_OPS` 是一张「vLLM 算子类名 → 昇腾子类」的全局注册表，完整的登记与顶替机制见[第 27 章：CustomOp 树外顶替](../../ch27-customop-oot-replacement/narrative/chapter.md)，本章只关心 310P 把表里几个键换成 310* 变体。这里重点收两处。
+平台与算子两域前面已带过——`platform.py` 用布尔选 `worker_cls`，并跳过 `custom_ops = ["all"]` 这个编译期全局启用开关（不是"没有算子顶替"，见 §18.1 的辨析）；算子域则靠 `REGISTERED_ASCEND_OPS` 把 rotary embedding、sampler 等换成 310 同形版——这才是真正决定"310P 有没有顶替算子"的机制。`REGISTERED_ASCEND_OPS` 是一张「vLLM 算子类名 → 昇腾子类」的全局注册表，完整的登记与顶替机制见[第 27 章：CustomOp 树外顶替](../../ch27-customop-oot-replacement/narrative/chapter.md)，本章只关心 310P 把表里几个键换成 310* 变体。这里重点收两处。
 
 **注意力域。** 平台层选注意力后端时，310P 走一张专属映射表：
 
@@ -687,7 +687,7 @@ def all_reduce_wrapper_310p(fn):
     return all_reduce
 ```
 
-非 int64 直接走原生 `fn`；只有 int64 才模拟——all_gather 拿全所有 rank，本地 `sum` 或 `max` 把它 reduce 掉。这里有个值得想一秒的代价问题。口径要先讲清：下面比的是**单卡视角**（每张卡的收发量），不是全局总量。单张卡上，原生（ring，即环形 all_reduce：把张量切成 P 份沿卡环状依次传递归约，每张卡累计收发量仍只是一份整张量）all_reduce 的收发量是 $O(N)$ （N 是张量元素数），而 all_gather 要让每张卡都收齐所有 P 份完整副本，单卡收发量是 $O(P \cdot N)$ （P 是卡数）——单卡视角贵了约 P 倍。为什么能接受？因为它**只**用在 int64 的小张量上——计数、同步标量这类一两个元素的东西。N 本就极小，乘个 P 也无所谓。要是拿它去模拟大张量的 all_reduce，那就是灾难。设计把模拟严格限定在 int64，正是踩准了这条边界。
+非 int64 直接走原生 `fn`；只有 int64 才模拟——all_gather 拿全所有 rank，本地 `sum` 或 `max` 把它 reduce 掉。这里有个值得想一秒的代价问题。口径要先讲清：下面比的是**单卡视角**（每张卡的收发量），不是全局总量。单张卡上，原生（ring，即环形 all_reduce：把张量切成 P 份沿卡环状依次传递归约，每张卡累计收发量仍只是一份整张量）all_reduce 的收发量是 $`O(N)`$ （N 是张量元素数），而 all_gather 要让每张卡都收齐所有 P 份完整副本，单卡收发量是 $`O(P \cdot N)`$ （P 是卡数）——单卡视角贵了约 P 倍。为什么能接受？因为它**只**用在 int64 的小张量上——计数、同步标量这类一两个元素的东西。N 本就极小，乘个 P 也无所谓。要是拿它去模拟大张量的 all_reduce，那就是灾难。设计把模拟严格限定在 int64，正是踩准了这条边界。
 
 整个补丁的安装是纯运行期的：
 
