@@ -140,3 +140,55 @@ def test_latex_in_code_span_blocking(tmp_path):
     assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 0
     ch.write_text("秩上界 $W \\in \\mathbb{R}^{V \\times r}$ 存得下。\n", encoding="utf-8")
     assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 0
+
+
+def test_inner_space_in_inline_math_blocking(tmp_path):
+    """行内数学内侧带空格 `$ x $` GitHub 不渲染,须阻断(2026-07-13)。"""
+    import subprocess, sys
+    LINT = str(pathlib.Path(__file__).resolve().parents[1] / "lint_formulas.py")
+    ch = tmp_path / "chapter.md"
+    ch.write_text("小写 $ h $ 是向量。\n", encoding="utf-8")          # 内侧两头空格
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 1
+    ch.write_text("上界 $I(t_0) = $ 之类。\n", encoding="utf-8")      # 仅闭定界符前空格
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 1
+    ch.write_text("小写 $h$ 是向量。\n", encoding="utf-8")            # 正确:空格在外侧
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 0
+
+
+def test_emphasis_flanking_cjk_blocking(tmp_path):
+    """CJK 正文里 ** 的 flanking 被全角标点卡死 → GitHub 吐字面 **,须阻断(2026-07-13)。"""
+    import subprocess, sys
+    LINT = str(pathlib.Path(__file__).resolve().parents[1] / "lint_formulas.py")
+    ch = tmp_path / "chapter.md"
+    # 开定界符:前接汉字 + 后接全角括号 → 开不了
+    ch.write_text("归根结底是**「编译」和「图捕获」两根支柱**——pass manager。\n", encoding="utf-8")
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 1
+    # 闭定界符:前接全角冒号 + 后接汉字 → 关不上
+    ch.write_text("**上标怎么读：**第一个字母 D。\n", encoding="utf-8")
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 1
+    # 修好:空格在定界符外侧
+    ch.write_text("归根结底是 **「编译」和「图捕获」两根支柱**——pass manager。\n", encoding="utf-8")
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 0
+    ch.write_text("**上标怎么读：** 第一个字母 D。\n", encoding="utf-8")
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 0
+    # 常规粗体(两侧皆汉字)不得误报
+    ch.write_text("这是**重点内容**不要漏。\n", encoding="utf-8")
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 0
+    # 紧邻反引号的 ** 不得误报(掩码不能参与 flanking 判定)
+    ch.write_text("默认是 `SCHEDULED`、**`num_computed_tokens`** 字段。\n", encoding="utf-8")
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 0
+
+
+def test_markdown_hostile_inline_math_blocking(tmp_path):
+    """`}_{` 的下划线会被 markdown 吃成 <em>,整段数学不渲染 → 须阻断,改用 $`…`$(2026-07-13)。"""
+    import subprocess, sys
+    LINT = str(pathlib.Path(__file__).resolve().parents[1] / "lint_formulas.py")
+    ch = tmp_path / "chapter.md"
+    ch.write_text("向量 $\\mathbf{q}_{t,j}$ 与权重 $w_{t,j}$ 同段。\n", encoding="utf-8")
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 1
+    # GitHub 官方转义式:放行(且不得被 latex_in_code_span 误伤)
+    ch.write_text("向量 $`\\mathbf{q}_{t,j}`$ 与权重 $`w_{t,j}`$ 同段。\n", encoding="utf-8")
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 0
+    # 字母后的下划线开不了强调,朴素写法安全
+    ch.write_text("标量 $a_i$ 与 $b_j$ 同段。\n", encoding="utf-8")
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 0

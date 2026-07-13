@@ -139,19 +139,38 @@ def _core_mechanism_source_check(chapter_dir: Path, text: str):
     return issues
 
 
+def _is_primer(chapter_dir: Path) -> bool:
+    """primer(原理章)探测：dossier 顶层 "kind":"primer"。口径与
+    lint_source_grounding.py / lint_paper_grounding.py 一致。"""
+    dossier_path = chapter_dir / "dossier" / "dossier.json"
+    if not dossier_path.exists():
+        return False
+    try:
+        return _json.loads(dossier_path.read_text(encoding="utf-8")).get("kind") == "primer"
+    except ValueError:
+        return False
+
+
 def lint_structure(md_path: str) -> dict:
     md_path = Path(md_path)
     text = md_path.read_text(encoding="utf-8")
     res = {"no_roadmap": [], "no_embedded_source": [], "scaffold_leak": [], "halfwidth_punct": [],
            "core_mechanism_missing_source": []}
 
+    chapter_dir = md_path.resolve().parent.parent
+    is_primer = _is_primer(chapter_dir)
+
     head = "\n".join(text.splitlines()[:60])
     if not re.search(r"(roadmap|路线图|你在这里)", head, re.I):
         res["no_roadmap"].append("  开头 60 行内无 Roadmap/路线图/你在这里 段")
 
+    # 内嵌真源码块 >= 2：码章的自包含硬规则。primer(原理章)按 2026-07-12 重设计哲学
+    # 「设计过的数学表达 + 源码仅指路」——正文至多一句「落地见第 N 章」，不做函数走读，
+    # 故不要求内嵌源码块（其根基由 lint_paper_grounding 的 arXiv/# PAPER 锚接管，
+    # 与 lint_source_grounding 对 primer 放行 narrative_vllm_refs 同源）。
     blocks = _CODE_FENCE_RE.findall(text)
     embedded = [b for b in blocks if _SRC_PATH_RE.search(b)]
-    if len(embedded) < MIN_SOURCE_BLOCKS:
+    if len(embedded) < MIN_SOURCE_BLOCKS and not is_primer:
         res["no_embedded_source"].append(
             f"  内嵌真源码块仅 {len(embedded)}（需 >= {MIN_SOURCE_BLOCKS}，块内含规范源码路径标注，如 "
             f"{'/'.join(sorted(set(_PREFIXES)))}/…）")
@@ -174,11 +193,11 @@ def lint_structure(md_path: str) -> dict:
         ctx = no_code[max(0, mm.start() - 6):mm.start() + 2].replace('\n', ' ')
         res["halfwidth_punct"].append(f"  中文后误用半角逗号（应 '，'）：…{ctx}…")
 
-    # core 机制源码层机检（lint-exp-008）：向后兼容旧调用点——入参仍是单个
-    # chapter.md 文件路径（如 `{chapter}/narrative/chapter.md`），chapter_dir 从其
-    # 父目录的父目录推导，无 dossier/ 时静默跳过（不影响旧调用行为）。
-    chapter_dir = md_path.resolve().parent.parent
-    res["core_mechanism_missing_source"] += _core_mechanism_source_check(chapter_dir, text)
+    # core 机制源码层机检（lint-exp-008）：逐个 difficulty=core 机制的 source_anchors
+    # 是否与正文内嵌源码块相交。primer 章按重设计哲学不内嵌源码，此检查不适用——跳过
+    # （否则每个 core 机制都会被报缺源码层，纯噪声）。无 dossier/ 时 helper 内静默跳过。
+    if not is_primer:
+        res["core_mechanism_missing_source"] += _core_mechanism_source_check(chapter_dir, text)
     return res
 
 

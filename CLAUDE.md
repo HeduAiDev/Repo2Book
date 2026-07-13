@@ -69,7 +69,18 @@ python3 scripts/lint_diagram_geometry.py --all   # 图：文字越界/相撞/压
 - **架构师自身连贯性**:本 CLAUDE.md + RUNBOOK + 实例 INSTANCE.md + trace 决策记录。
 
 ## 公式规则（NON-NEGOTIABLE，auto-REJECT）
-`\text{}`→`\mathrm{}`；`\boxed{}`→markdown 粗体标题；`\tag*{}`→`$$` 外；inline `\frac`→提升为 `$$` 块；`$$` 与内容分行。inline 仅限单符号/简单式。**公式内禁中文/CJK**（strict KaTeX 报 unicodeTextInMathMode）——中文标注移出公式或改符号（lint_formulas 查）。**inline `$…$` 两侧须留空格**（紧贴 CJK/全角标点时 GitHub 整段不渲染，lint_formulas 查）。
+
+**① 行内数学一律写 GitHub 转义式 `` $`…`$ ``**（`` 压到 $`d_c`$ 维 ``），**不要写朴素 `$…$`**。
+朴素 `$…$` 在 GitHub(cmark-gfm) 上有**六**种静默失效方式，踩中任一整段吐裸源码——`压到$d_c$维`(紧贴 CJK)、`$ d_c $`(内侧带空格)、`一半;$N$ 涨`(前接半角标点)、`$\mathbf{q}_{t,j}$`(`}_{` 的 `_` 被 markdown 吃成 `<em>`)、`*图 1 同一 $L$*`(被单星号斜体包住)、以及被 `**` flanking 失败连累。**`` $`…`$ `` 对以上全部免疫**（正文/表格/粗体/斜体/列表/标题/紧贴 CJK 实测均渲染），LaTeX 源码逐字不变。一条规则替掉六条易错规则。
+存量转换：`python3 scripts/fix_inline_math_escape.py <file.md>`（幂等）。
+
+**② 块级 `$$…$$` 照旧**（叶子块，不受上述影响），但须与内容分行、且**前后留空行**。
+
+**③ `**粗体**` 定界符外侧留半角空格**（内侧紧邻全角标点时必须）：❌ `是**「编译」…**` / ❌ `**…怎么读：**第一个` → ✅ `是 **「编译」…**` / ✅ `**…怎么读：** 第一个`。汉字既非空白也非标点，CommonMark flanking 不成立时 ** 原样显示、**并连累其中的数学**。修法同口诀：**空格永远在定界符外侧**。存量：`python3 scripts/fix_emphasis_flanking.py <file.md>`。
+
+**④ 其余**：`\text{}`→`\mathrm{}`；`\boxed{}`→markdown 粗体标题；`\tag*{}`→`$$` 外；inline `\frac`→提升为 `$$` 块。inline 仅限单符号/简单式。**公式内禁中文/CJK**（strict KaTeX 报 unicodeTextInMathMode）。**禁把 LaTeX 命令塞进普通反引号**（`` `\mathbb{R}` `` 显示裸源码——注意 `` $`\mathbb{R}`$ `` 是数学、不是 code span）。
+
+以上全部由 `lint_formulas.py` 阻断式校验。**真值口径**：GitHub 自家 markdown API——`python3 scripts/check_github_render.py <file.md>`（需网络+gh 鉴权，回归时跑；linter 是它的离线近似，已对齐到零漏报）。
 
 ## 当前实例 → 看 INSTANCE.md
 - 活动实例、源码版本/行号基线、当前进度、实例专属坑：**`instances/<active>/INSTANCE.md`**（`<active>` = `repo2book.json` 的 `active_instance`，当前为 `vllm`）。
