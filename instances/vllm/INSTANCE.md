@@ -21,6 +21,9 @@
 - **连贯性干净**：26/26 伏笔全回收；glossary/interfaces 登记 30 章；全书 0 断裂章内锚点 / 0 半角标点 / 0 图几何问题。
 - 体系经实战加固：archive 注入完整 reviewV+崩溃重试、防假通过 escape hatch、dossier-verify 对抗自核（实战拦下 ch35 SyncMPClient / ch01 CompilationMode 等事实错误）、off-spine 分层 roadmap、git push 须前台。
 - **润色已大体完成**：断锚/半角/图标签重叠/术语对齐 glossary、算法维度增补 24 章均已做并推远程。剩余仅最低价值声线微调 + lint_formulas 内联密度软噪声。
+- **2026-07-14 primer 重构**：4 章原理篇（ch24/ch26/ch27/ch31）按「设计过的数学表达」新哲学
+  重构收口（全章主线定理+顿悟图头图+密度纪律+源码降指路，`primer-redesign-rollout` 全链）；
+  同批全书行内公式转 GitHub 转义式 `` $`…`$ ``（渲染真值零未渲染）。
 
 ## 实例专属坑
 1. 别写脱离代码的抽象——正文以真实 vllm 源码为主线、自包含内嵌。

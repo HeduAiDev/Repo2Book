@@ -27,7 +27,9 @@ vllm-ascend 是 vLLM 的 **out-of-tree 平台插件**：不改 vLLM 源码，而
 ## 当前状态（本 fork 完成）
 - ✅ 锁定 v0.21.0rc1（80610e44）、blobless clone 进 source/。
 - ✅ 摸清「配对依赖 vLLM v0.21.0 + OOT 插件 + 两段 patch」的接入骨架，写入本文件 + `cartography/ARCHITECTURE.md` 种子。
-- ⏭ 下一步：补完整大纲（按子系统 + 接入机制分 Part），把顶层 `repo2book.json` 的 `active_instance` 切到 `vllm-ascend`，再逐章发车。
+- ✅ 全书 38 章完成；**2026-07-14 全部 8 章 primer 按「设计过的数学表达」新哲学重构收口**
+  （ch09/ch21(样板)/ch23/ch26/ch31/ch34/ch35/ch37：全章主线定理+顿悟图头图+密度纪律+
+  源码降指路；`primer-redesign-rollout` workflow 全链，推导审计/读者门/GitHub 渲染真值全过）。
 
 ## Part VIII — 算法原理篇（primer，v4 新增）
 
