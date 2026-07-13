@@ -48,6 +48,8 @@ const MODELS = Object.assign(
   { analyst: 'opus', verify: 'opus', implement: 'sonnet', test: 'sonnet', explain: 'opus', illustrate: 'sonnet', blind: 'sonnet', write: 'opus', review: 'sonnet', archive: 'sonnet' },
   A.models || {})
 const PRIMER = A.kind === 'primer'
+// 2026-07-13 用户定:原理章 writer 能用 fable5 就用 fable5(ch21 对比验证:主线定理/悬崖诊断/事实修正均更优)。args.models.write 可覆盖。
+if (PRIMER && !(A.models && A.models.write)) MODELS.write = 'fable'
 const PAPERS = REPO + '/instances/' + INST + '/book/papers/' + A.slug
 const PATHS = (A.paths || []).join(', ')
 
@@ -69,6 +71,11 @@ function head(role) {
 const STATUS_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['status', 'note'],
   properties: { status: { type: 'string', enum: ['OK', 'BLOCKED'] }, note: { type: 'string' }, blocker_reason: { type: 'string' } },
+}
+// 2026-07-13 定图权归 writer:Write 站专用 schema,figure_requests=writer 写进 diagrams/figure-requests.json 的变更条数(0=图集无变动)
+const WRITE_STATUS_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['status', 'note', 'figure_requests'],
+  properties: { status: { type: 'string', enum: ['OK', 'BLOCKED'] }, note: { type: 'string' }, blocker_reason: { type: 'string' }, figure_requests: { type: 'number' } },
 }
 const VERIFY_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['sound', 'problems'],
@@ -225,7 +232,7 @@ writeV = await agent(
   head('writer') +
   '任务：以**真实目标源码为主线**写 ' + CH + '/narrative/chapter.md（你唯一有权写它）。\n' +
   '读 dossier、implementation、' + REPO + '/instances/' + INST + '/book/bible/voice-guide.md，并跑 `python3 ' + REPO + '/scripts/bible.py due ' + A.chapter_id + '`。\n' +
-  '素材已备好：读 ' + CH + '/explainer/explainer.json（数值轨迹/直觉/不变量）与 ' + CH + '/diagrams/（已过盲审的图 + roadmap.png——先 Read 几张 PNG 看图长什么样再落笔）。**怎么讲由你**：结构/顺序/风格/篇幅自由。**必达物要在场**：difficulty=core 机制三层递进（直觉→机制→源码）；explainer 的数值推演表进正文，表格前一行放 `<!-- trace: <mechanism_id> -->` 标记，数字一个不许改（排版随意）；每张图被引用且在其机制讲解附近；开场引用 roadmap.png。图不合适 → 用逃生舱提需求，不许自己画。\n' +
+  '素材已备好：读 ' + CH + '/explainer/explainer.json（数值轨迹/直觉/不变量）与 ' + CH + '/diagrams/（已过盲审的图 + roadmap.png——先 Read 几张 PNG 看图长什么样再落笔）。**怎么讲由你**：结构/顺序/风格/篇幅自由。**必达物要在场**：difficulty=core 机制三层递进（直觉→机制→源码）；explainer 的数值推演表进正文，表格前一行放 `<!-- trace: <mechanism_id> -->` 标记，数字一个不许改（排版随意）；每张仍贴合的已验收图被引用且在其机制讲解附近；开场引用 roadmap.png。**图集由你定**(契约必达物3)：已备图不贴合可 drop、新叙事需要新图就写 ' + CH + '/diagrams/figure-requests.json(add/replace/drop,数字带溯源)，并在返回值 figure_requests 填条数(无变更填 0)——workflow 会派 illustrator 处理后再让你插/删引用；**不许自己画**。\n' +
   (PRIMER ? '本章四段式必达物：动机 → 数学推导（**每个关键公式给论文锚 §/Eq + arXiv id**）→ 小参数数值推演（explainer 素材）→ 落地（vllm_ascend 真实代码锚点 + 链接对应码章）。\n' : '') +
   '正文内嵌**真实源码片段**(裁剪无关分支用 `# … 省略 …`)，逐段解读设计决策。' +
   (A.skip_impl
@@ -234,11 +241,46 @@ writeV = await agent(
   '埋伏笔、`python3 ' + REPO + '/scripts/bible.py payoff --resolve` 回收应回收项。\n' +
   '**零脚手架泄漏**：规范 vllm/ 路径、自然标题(无 Cell N)、不提内部文件。\n' +
   '完成后自跑' + (PRIMER ? '五个 linter（chapter_structure/formulas/source_grounding/trace_consistency/paper_grounding --expect-primer，primer 章不跑 fidelity）' : (A.skip_impl ? '四个 linter（chapter_structure/formulas/source_grounding/trace_consistency，本章无精简版故不跑 fidelity）' : '五个 linter（chapter_structure/formulas/source_grounding/fidelity/trace_consistency）')) + '均无 BLOCKING（图的 linter 归 illustrator，不用你跑）。返回 status/note。' + ESC,
-  { schema: STATUS_SCHEMA, label: 'write r' + w, phase: 'Write', agentType: 'general-purpose', model: MODELS.write }
+  { schema: WRITE_STATUS_SCHEMA, label: 'write r' + w, phase: 'Write', agentType: 'general-purpose', model: MODELS.write }
 )
 }
 if (!writeV) return { chapter: A.chapter_id, escalated: 'write-failed', stage: 'Write', note: 'writer 多轮失败(限流/崩溃)，无 chapter.md，不进评审' }
 if (writeV && writeV.status === 'BLOCKED') return { escalated: 'write', stage: 'Write', reason: writeV.blocker_reason }
+
+// ---------- Phase D2: 按需补图（2026-07-13 定图权归 writer：writer 提 requests → illustrator 画/删 → 盲审 → writer 插引用） ----------
+if (writeV.figure_requests > 0) {
+  log('writer 提出 ' + writeV.figure_requests + ' 条图集变更，进入按需补图')
+  let figBlind = null
+  let figLedger = []
+  for (let f = 1; f <= 3; f++) {
+    phase('Write')
+    const figIll = await agent(
+      head('illustrator') +
+      '任务：处理 ' + CH + '/diagrams/figure-requests.json（writer 定的图集变更——你契约「开工前」输入优先级 1）。add/replace 逐张走强制流程：渲染 → Read 打开 PNG 亲眼看 → 六项自查全真 → 登记 figure-manifest.json（blind_review 初写 PENDING）；drop 删图文件并移除 manifest 条目。**数字溯源缺失 → status=BLOCKED 打回，不许脑补。**处理完把条目挪进 done、requests 清空。\n' +
+      (figLedger.length ? '上一轮盲审 FAIL，先修复：\n' + figLedger.join('\n') + '\n' : '') +
+      '完成后自跑 `python3 ' + REPO + '/scripts/lint_diagram_geometry.py ' + CH + '/diagrams/*.svg` 无问题。返回 status/note。' + ESC,
+      { schema: STATUS_SCHEMA, label: 'fig-request r' + f, phase: 'Write', agentType: 'general-purpose', model: MODELS.illustrate }
+    )
+    if (!figIll) return { chapter: A.chapter_id, escalated: 'fig-request-failed', stage: 'Write', round: f, note: 'illustrator agent 失败（限流/崩溃）' }
+    if (figIll.status === 'BLOCKED') return { escalated: 'fig-request', stage: 'Write', round: f, reason: figIll.blocker_reason }
+    figBlind = await agent(
+      '你是插图盲审员。**只准看**：' + CH + '/diagrams/figure-requests.json 的 done 条目（本轮新增/替换的图）+ figure-manifest.json 对应条目 + 每张对应 PNG（用 Read 打开）。**禁止**看 gen_*.py、禁止看正文。\n' +
+      '逐张四步：① 只看图复述论点；② 与 done 条目的 claim 对照——对不上 = FAIL；③ 图上每个数字与 done 条目的 numbers 逐个核对——对不上 = FAIL；④ 明显不可读 = FAIL。verdict 回填 manifest 的 blind_review。返回 all_pass 与 failures。',
+      { schema: BLIND_SCHEMA, label: 'fig-blind r' + f, phase: 'Write', agentType: 'general-purpose', model: MODELS.blind }
+    )
+    if (figBlind && figBlind.all_pass) break
+    figLedger = ((figBlind && figBlind.failures) || []).map(function (x) { return '[' + x.figure_id + '] ' + x.problem + ' → ' + x.suggested_fix })
+    log('按需补图盲审第 ' + f + ' 轮 FAIL：' + figLedger.length + ' 张打回')
+  }
+  if (!figBlind || !figBlind.all_pass) return { chapter: A.chapter_id, escalated: 'fig-request-blind-exhausted', stage: 'Write', failures: (figBlind && figBlind.failures) || [] }
+  const figInsert = await agent(
+    head('writer') +
+    '微任务：你此前对 ' + CH + '/narrative/chapter.md 提的图集变更已由 illustrator 完成并过盲审（见 ' + CH + '/diagrams/figure-requests.json 的 done 条目）。用 Edit 定点收尾：新增/替换的图在其 target_section 附近插引用（`![图注给结论](../diagrams/<id>.png)`，先 Read PNG 看图再写图注）；drop 的图删除其正文引用。**禁其他改动。**自跑 lint_chapter_structure + lint_formulas 无 BLOCKING。返回 status/note。' + ESC,
+    { schema: STATUS_SCHEMA, label: 'fig-insert', phase: 'Write', agentType: 'general-purpose', model: MODELS.write }
+  )
+  if (!figInsert || figInsert.status === 'BLOCKED') return { chapter: A.chapter_id, escalated: 'fig-insert', stage: 'Write', reason: (figInsert && figInsert.blocker_reason) || 'fig-insert agent 失败' }
+  log('按需补图完成：画/删 + 盲审 + 引用收尾')
+}
 
 // ---------- Phase E: Review (多维并行 → 协作回环) ----------
 let reviewV = null

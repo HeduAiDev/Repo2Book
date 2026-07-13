@@ -35,7 +35,7 @@ if (A.phase === 'apply') {
 const REPO = A.repo_root || CFG.repo_root
 const ARTS = REPO + '/instances/' + A.instance + '/artifacts'
 const PAPERS_ROOT = REPO + '/instances/' + A.instance + '/book/papers'
-const MODELS = Object.assign({ diagnose: 'sonnet', materials: 'sonnet', illustrate: 'sonnet', write: 'sonnet', derivation: 'opus' /* 推导审计升档 */, reader: 'opus' /* exp-0712-3:一致性检测需能力,haiku 对割裂给假通过 */, fix: 'sonnet' }, A.models || {})
+const MODELS = Object.assign({ diagnose: 'sonnet', materials: 'sonnet', illustrate: 'sonnet', write: 'fable' /* 2026-07-13 用户定:原理章写作用 fable5 */, derivation: 'opus' /* 推导审计升档 */, reader: 'opus' /* exp-0712-3:一致性检测需能力,haiku 对割裂给假通过 */, fix: 'sonnet' }, A.models || {})
 
 const ESC = '\n\n**逃生舱（重要）**：如果你发现给定的批准/素材/路线是错的——真实情况与批准清单不符、施工会破坏正文正确性、缺关键前置信息——**不要硬着头皮做**。立即返回 status="BLOCKED"，blocker_reason 写清「哪里错 + 建议怎么改」。workflow 会中止该章后续阶段（不影响其他章节），把问题交给 Team Lead。'
 
@@ -149,9 +149,10 @@ const WRITE_SCHEMA = {
   properties: {
     status: { type: 'string', enum: ['OK', 'BLOCKED'] }, note: { type: 'string' }, blocker_reason: { type: 'string' },
     counts: { type: 'object', additionalProperties: false,
-      required: ['symbols_addressed', 'cliff_points_addressed', 'key_figures_embedded'],
+      required: ['symbols_addressed', 'cliff_points_addressed', 'key_figures_embedded', 'figure_requests'],
       properties: {
         symbols_addressed: { type: 'number' }, cliff_points_addressed: { type: 'number' }, key_figures_embedded: { type: 'number' },
+        figure_requests: { type: 'number' },
       } },
   },
 }
@@ -210,6 +211,7 @@ function writePrompt(slug) {
     '③ **直觉垫**：diagnosis.cliff_points 逐条——按 suggested_fix 在其 section 补一句直觉铺垫或一步中间推导。\n' +
     '④ **light 先修框**：以下已批准 load=light 的先修项——3–5 句直觉+出处 arXiv 号，blockquote 样式，自然措辞，插在 where_used 附近：\n' + JSON.stringify(light) + '\n' +
     '⑤ **图嵌入**：已重绘的 key_figures 逐张嵌入其 target_section（`![重绘自 arXiv:xxxx Fig.N:一句话](../diagrams/paper-fig-N.png)`，图注句式须与 illustrator 图上一致）。\n' +
+    '⑥ **图集由你定**(契约必达物3，2026-07-13)：本次修改若让某段落值得配新图、或某旧图不再贴合叙事，写 ' + dir + '/diagrams/figure-requests.json（add/replace/drop，claim+numbers 带溯源），counts.figure_requests 填条数（无变更填 0）——workflow 会派 illustrator 处理后再让你插/删引用；**不许自己画**，也不为加而加。\n' +
     '完成后自跑 `python3 ' + REPO + '/scripts/lint_paper_grounding.py ' + dir + ' --expect-primer` + `python3 ' + REPO + '/scripts/lint_formulas.py ' + dir + '/narrative/chapter.md` + `python3 ' + REPO + '/scripts/lint_chapter_structure.py ' + dir + '/narrative/chapter.md` 确保均无 BLOCKING。\n' +
     '返回 status/note/counts（counts.symbols_addressed=你实际处理的 symbols_uncovered 条数；counts.cliff_points_addressed=你实际处理的 cliff_points 条数；counts.key_figures_embedded=你实际嵌入的 key_figures 张数）。' + ESC
 }
@@ -244,6 +246,34 @@ function readerFixPrompt(slug, issues) {
 
 // Write 之后、ReaderGate 之前的推导审计门禁。回环形状**直接复用 readerGateStage 的 ≤2 轮预算**
 // （而非另设独立 ≤1 轮修+复审变体）——两道门禁体量相当，复用同一形状实现最简单、行为也最好预测。
+// 2026-07-13 定图权归 writer:write 站返回 counts.figure_requests>0 时,派 illustrator 处理
+// figure-requests.json(画/删+盲审口径由其契约兜底),再让 writer 插/删引用。失败不掐死整章:
+// 记 figure_note 放行到后续门禁(requests 文件留痕,Review/Lead 兜底),避免图之败株连推导审计。
+async function figureRequestStage(wr, slug) {
+  if (!wr || !wr.write || wr.write.status !== 'OK') return wr
+  const n = wr.write.counts && wr.write.counts.figure_requests
+  if (!n) return wr
+  const dir = ARTS + '/' + slug
+  phase('Illustrate')
+  const ill = await agent(
+    '你的角色契约在 ' + REPO + '/.claude/agents/illustrator.md——先读它。任务：处理 ' + dir + '/diagrams/figure-requests.json（writer 定的图集变更，你契约「开工前」输入优先级 1）：add/replace 逐张强制流程（渲染→Read PNG 亲眼看→六项自查→登记 manifest）；drop 删文件+移除 manifest 条目；数字溯源缺失→BLOCKED。处理完条目挪 done。自跑 lint_diagram_geometry 无问题。返回 status/note。' + ESC,
+    { schema: STATUS_SCHEMA, label: 'fig-request:' + slug.slice(0, 14), phase: 'Illustrate', model: MODELS.illustrate, agentType: 'general-purpose' }
+  )
+  if (!ill || ill.status !== 'OK') {
+    log('figure-requests 处理失败（' + slug + '）：' + ((ill && (ill.blocker_reason || ill.note)) || 'agent 失败') + '——requests 留痕，继续后续门禁')
+    return Object.assign({}, wr, { figure_note: 'figure-requests 未完成:' + ((ill && (ill.blocker_reason || ill.note)) || 'agent 失败') })
+  }
+  const ins = await agent(
+    '你的角色契约在 ' + REPO + '/.claude/agents/writer.md——先读它。微任务：你此前提的图集变更已由 illustrator 完成（' + dir + '/diagrams/figure-requests.json 的 done 条目）。用 Edit 定点收尾 ' + dir + '/narrative/chapter.md：新增/替换图在其 target_section 附近插引用（先 Read PNG 看图再写图注，图注给结论）；drop 图删除其引用。**禁其他改动。**自跑 lint_chapter_structure + lint_formulas 无 BLOCKING。返回 status/note。' + ESC,
+    { schema: STATUS_SCHEMA, label: 'fig-insert:' + slug.slice(0, 14), phase: 'Illustrate', model: MODELS.fix, agentType: 'general-purpose' }
+  )
+  if (!ins || ins.status !== 'OK') {
+    return Object.assign({}, wr, { figure_note: 'fig-insert 未完成:' + ((ins && (ins.blocker_reason || ins.note)) || 'agent 失败') })
+  }
+  log('按需补图完成（' + slug + '）：' + n + ' 条变更落地')
+  return Object.assign({}, wr, { figure_note: 'ok:' + n })
+}
+
 async function derivationCheckStage(wr, slug) {
   if (!wr || !wr.write || wr.write.status !== 'OK') {
     return Object.assign({ slug: slug, skipped: 'derivation-check' }, wr || { status: 'BLOCKED', note: 'write agent 失败(限流/崩溃)' })
@@ -358,7 +388,10 @@ if (A.phase === 'apply') {
       }).then(function (r) { return Object.assign({}, ill, { write: r || { status: 'BLOCKED', note: 'write agent 失败(限流/崩溃)', counts: null } }) })
     },
     function (wr, slug) {
-      return derivationCheckStage(wr, slug)
+      return figureRequestStage(wr, slug)
+    },
+    function (fr, slug) {
+      return derivationCheckStage(fr, slug)
     },
     function (dc, slug) {
       return readerGateStage(dc, slug)

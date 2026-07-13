@@ -124,6 +124,22 @@ primer 章 = 论文精读章(动机→推导→数值→落地),豁免 subtract-
   hook 段之后、第一个内容分节标题之前)+选读指引都在;试点期不开
   `--require`(图未画不算错),全量铺开定稿后转 blocking,并入 CLAUDE.md 质量闸门清单。
 
+## 图集变更 SOP(2026-07-13 用户定:定图权归 writer)
+
+**原则**:什么图该加/该删是内容强相关的,由 **writer** 决定;illustrator 只管画+验收
+(渲染→Read PNG→自查→盲审不变);explainer/trace 仍是图中数字的真相源。
+**标准接口** = `{chapter}/diagrams/figure-requests.json`
+(`{"requests":[{action: add|replace|drop, figure_id, claim, numbers:[{value,provenance}], target_section, template_hint?, reason}]}`,
+处理完的条目挪进 `done` 留痕):
+- **三条 workflow 已内建**:chapter-pipeline(Write 站返 figure_requests>0 → 按需
+  illustrate+盲审+writer 插引用)、primer-uplift(write→figureRequestStage)、
+  chapter-retrofit(PatchWrite 站同款)。
+- **Lead 临时派单修订**(最常踩的路):给 writer 的任务书写明「图集由你定,需要就写
+  figure-requests.json」;writer 返回 requests>0 时,Lead 依次派 ①illustrator
+  (处理 requests,契约输入优先级 1) ②盲审(只看 PNG+done 条目核 claim/numbers)
+  ③writer 微任务插/删引用;最后跑 lint_diagrams + lint_diagram_geometry + lint_chapter_structure。
+- **禁**:writer 自己画图;illustrator 对缺溯源的数字脑补;跳过盲审直接插引用。
+
 ## 4. 监控
 - `/workflows` 看实时阶段进度。
 - `TaskOutput`/读 `/tmp/.../tasks/<id>.output` 看结果。

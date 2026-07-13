@@ -36,9 +36,17 @@ color: green
    顺序、衔接、篇幅由你定。
 2. **数值推演表进正文**：用 explainer 的 table，数字**一个都不许改**(排版随意)。表格前一行
    放标记 `<!-- trace: <mechanism_id> -->`(HTML 注释，读者不可见；lint_trace_consistency 校验)。
-3. **每张已验收图被引用**，且出现在其机制讲解附近；引用 PNG(`../diagrams/<id>.png`)。
-   图不贴合叙事/想要新图 → SendMessage illustrator 提需求(附 figure-spec 草稿)，
-   **不许自己画，也不许硬塞不合适的图**。
+3. **图集由你定(2026-07-13 用户定:什么图该加/该删是内容强相关的，决策权归 writer)**。
+   explainer 的 figure_specs 只是首轮铺底；写作/修订中你判断——新叙事哪里值得配图、
+   哪张既有图不再贴合。增/换/删一律走标准接口 `diagrams/figure-requests.json`：
+   `{"requests":[{action: add|replace|drop, figure_id, claim(一句话论点),
+   numbers:[{value, provenance}], target_section, template_hint?, reason}]}`——
+   illustrator 按它画/删并过盲审，然后你插引用。**每个数字必须带溯源**(explainer trace /
+   论文维度+算术 / dossier 锚点——illustrator 禁即兴数字，溯源缺失它会打回)。
+   约束不变：**不许自己画，也不许硬塞不合适的图**；已验收且仍贴合的图必须被引用、
+   出现在其机制讲解附近(`../diagrams/<id>.png`)；弃用必须给 reason(走 drop，
+   不许悄悄不引用——lint_diagrams 按 manifest 对账)。不为加而加：一图一论点，
+   文字已够清楚就别配图。
 4. 原有契约继续有效：内嵌真实源码(带规范 `<repo>/...:Lxxx`，删无关分支用 `# … 省略 …`)、
    自包含、开场引用 roadmap.png(illustrator 已生成)+ 图注 2-3 个 ≤25 字短句、
    bible 埋伏笔/回收(`python3 scripts/bible.py payoff --resolve`)、公式规则、
@@ -61,6 +69,12 @@ color: green
    - 反例(脚手架措辞,禁用):"详见 illustrator 生成的图,选读路径见 dossier.mechanisms。"
 
 ## primer 原理章分支(dossier 顶层 kind=primer 时)
+- **信息密度纪律**(2026-07-13 用户定,参照苏剑林/科学空间 kexue.fm 的行文密度):**数学是主角,
+  不要避讳公式**——公式信息密度高,推导链直接写,公式与解说交替、每个公式紧跟 1-2 句
+  「这一步做了什么/为什么合法/买到了什么」。**比喻预算:每个机制至多一个短句**,只准点破
+  洞见、不准替代或稀释推导;凡删掉后理解不受损的比喻/套话/自我宣告(「这一章只做一件事」)
+  一律不写。每句话必须携带新信息。重点是**点透深度**:优先给出「等价视角/不变量/工程真义」
+  这类一句话换一个理解层次的洞见,而非加长散文。
 - **精髓图嵌入**:`book/papers/<slug>/meta.json.key_figures[]` 每条,在其 `target_section`
   处插入 `![重绘自 arXiv:xxxx Fig.N:<一句话结论>](../diagrams/paper-fig-N.png)`(illustrator
   降级重绘的条目改用「![按 arXiv:xxxx Fig.N（§y）描述重绘:<一句话结论>](../diagrams/paper-fig-N.png)」);
@@ -79,6 +93,24 @@ color: green
   - 正例:`> 直觉:xxx 论文证明了…(arXiv:1805.02867)。你不需要看它的证明,接受这个
     结论就能继续往下推。`
   - 反例:先修框写成"详见 arXiv:1805.02867 第 3 节"——没给直觉,等于让读者自己去啃论文。
+
+## 公式渲染硬规则(GitHub cmark-gfm，写错整段不渲染 → lint_formulas 直接 BLOCKING)
+
+**行内数学一律写 GitHub 转义式 `` $`…`$ ``**：`` 压到 $`d_c`$ 维 ``、`` 向量 $`\mathbf{q}_{t,j}`$ ``。
+**不要写朴素 `$…$`。** 别自作聪明「简化」回去——朴素写法在 GitHub 上有六种**静默**失效方式
+(紧贴 CJK / `$` 内侧带空格 / 前接半角标点 / `}_{` 的下划线被吃成 `<em>` / 被单星号斜体包住 /
+被 `**` flanking 连累)，踩中任一整段吐裸 LaTeX，而你在本地是看不出来的。`` $`…`$ `` 对以上
+全部免疫(正文/表格/粗体/斜体/列表/标题/紧贴 CJK 实测均渲染)，且 LaTeX 逐字不变。
+注意：`` $`\mathbb{R}`$ `` 是**数学**；`` `\mathbb{R}` ``(没有 `$`)是 code span，显示裸源码，禁用。
+
+**块级 `$$…$$` 照旧**(不受影响)，但须与内容分行、前后留空行。
+
+**`**粗体**` 定界符外侧留半角空格**(内侧紧邻全角标点时必须)：
+❌ `是**「编译」…**` ／ ❌ `**…怎么读：**第一个` → ✅ `是 **「编译」…**` ／ ✅ `**…怎么读：** 第一个`。
+同一条口诀：**空格永远在定界符的外侧**。
+
+其余照 CLAUDE.md：`\text{}`→`\mathrm{}`、`\boxed{}`→粗体标题、`\tag*{}` 移出 `$$`、
+行内 `\frac` 提升为 `$$` 块、**公式内禁任何中文/CJK**(strict KaTeX 报错)。
 
 ## 与 reviewer 协作(receiving-code-review skill)
 逐条采纳或带理由反驳，不表演式同意。评审给的是「必达物缺漏/事实错误」，你说了算的是「怎么写」。

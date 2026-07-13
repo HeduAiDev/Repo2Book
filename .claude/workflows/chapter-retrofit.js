@@ -44,6 +44,11 @@ const STATUS_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['status', 'note'],
   properties: { status: { type: 'string', enum: ['OK', 'BLOCKED'] }, note: { type: 'string' }, blocker_reason: { type: 'string' } },
 }
+// 2026-07-13 定图权归 writer:PatchWrite 站专用,figure_requests=写进 figure-requests.json 的变更条数
+const PATCH_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['status', 'note', 'figure_requests'],
+  properties: { status: { type: 'string', enum: ['OK', 'BLOCKED'] }, note: { type: 'string' }, blocker_reason: { type: 'string' }, figure_requests: { type: 'number' } },
+}
 const DIAG_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['flagged_count', 'summary'],
   properties: { flagged_count: { type: 'number' }, summary: { type: 'string' } },
@@ -139,10 +144,27 @@ for (let r = 1; r <= 2; r++) {
     '⛔ 禁止：整章重写 / 用 Write 覆盖 / 移动章节结构 / 改非算法叙事 / 删既有标题锚点。\n' +
     '要做：按 ' + CH + '/explainer/explainer.json 素材加深讲解（直觉→机制→源码三层，怎么衔接由你）；数值推演表进正文（表格前一行 `<!-- trace: <mechanism_id> -->`，数字不许改）；更新图引用（新图 ../diagrams/<id>.png，被替换旧图的引用与图注一并更新）。\n' +
     (issuesForWriter.length ? '上轮评审 issue（逐条采纳或带理由反驳）：\n' + JSON.stringify(issuesForWriter) + '\n' : '') +
-    '完成后自跑 lint_trace_consistency / lint_anchors / lint_chapter_structure / lint_formulas / lint_punct 无 BLOCKING。返回 status/note。' + ESC,
-    { schema: STATUS_SCHEMA, label: 'patch-write r' + r, phase: 'PatchWrite', agentType: 'general-purpose', model: MODELS.patch }
+    '**图集由你定**(契约必达物3)：定点改写若让某段值得新图/某图不再贴合，写 ' + CH + '/diagrams/figure-requests.json（add/replace/drop，数字带溯源），figure_requests 填条数（无变更填 0）——workflow 会派 illustrator 处理后让你插/删引用，**不许自己画**。\n' +
+    '完成后自跑 lint_trace_consistency / lint_anchors / lint_chapter_structure / lint_formulas / lint_punct 无 BLOCKING。返回 status/note/figure_requests。' + ESC,
+    { schema: PATCH_SCHEMA, label: 'patch-write r' + r, phase: 'PatchWrite', agentType: 'general-purpose', model: MODELS.patch }
   )
   if (pw && pw.status === 'BLOCKED') return { escalated: 'patch-write', stage: 'PatchWrite', round: r, reason: pw.blocker_reason }
+  // 按需补图（2026-07-13 定图权归 writer）：illustrator 处理 requests → writer 插引用 → 本轮 Review 的 figure-integration 维随后验收
+  if (pw && pw.figure_requests > 0) {
+    const figIll = await agent(
+      head('illustrator') +
+      '任务：处理 ' + CH + '/diagrams/figure-requests.json（writer 定的图集变更，你契约「开工前」输入优先级 1）：add/replace 逐张强制流程（渲染→Read PNG 亲眼看→六项自查→登记 manifest）；drop 删文件+移除 manifest 条目；数字溯源缺失→BLOCKED。处理完条目挪 done。自跑 lint_diagram_geometry 无问题。返回 status/note。' + ESC,
+      { schema: STATUS_SCHEMA, label: 'fig-request r' + r, phase: 'PatchWrite', agentType: 'general-purpose', model: MODELS.illustrate }
+    )
+    if (!figIll || figIll.status === 'BLOCKED') return { escalated: 'fig-request', stage: 'PatchWrite', round: r, reason: (figIll && figIll.blocker_reason) || 'illustrator agent 失败' }
+    const figIns = await agent(
+      head('writer') +
+      '微任务：你此前提的图集变更已由 illustrator 完成（' + CH + '/diagrams/figure-requests.json 的 done 条目）。用 Edit 定点收尾 ' + CH + '/narrative/chapter.md：新增/替换图在其 target_section 附近插引用（先 Read PNG 看图再写图注，图注给结论）；drop 图删除其引用。**禁其他改动。**自跑 lint_chapter_structure + lint_formulas 无 BLOCKING。返回 status/note。' + ESC,
+      { schema: STATUS_SCHEMA, label: 'fig-insert r' + r, phase: 'PatchWrite', agentType: 'general-purpose', model: MODELS.patch }
+    )
+    if (!figIns || figIns.status === 'BLOCKED') return { escalated: 'fig-insert', stage: 'PatchWrite', round: r, reason: (figIns && figIns.blocker_reason) || 'fig-insert agent 失败' }
+    log('retrofit 按需补图完成：' + pw.figure_requests + ' 条变更落地，交本轮 Review 验收')
+  }
   phase('Review')
   const dims = await parallel(DIMS.map(function (dim) {
     return function () {

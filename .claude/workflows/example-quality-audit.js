@@ -70,7 +70,7 @@ function fixPrompt(inst, slug, findings) {
     '• 数学↔代码未搭桥→在源码块出现处就地补一句绑定(如「decode_k_nope 就是潜向量 $c^{KV}$、decode_k_pe 就是解耦 RoPE 分量 $d_h^R$」);\n' +
     '• 顺序颠倒→补一句前指(「这个命名的道理见下一节权重吸收」)或把解释前移一句;\n' +
     '• 论断-证据失配→换成就地展示关键特化值的真源码/数值(必要时读 ' + REPO + '/instances/' + inst + '/source);论断本身错→按源码事实改论断;类比误导→修映射或加免责;玩具/真实混淆→补显式免责。\n' +
-    '不改真源码本身、不杜撰。公式禁中文、$ 两侧留空格。\n' +
+    '不改真源码本身、不杜撰。公式禁中文/CJK;行内数学的空格在 $ 的**外侧**(`压到 $d_c$ 维`),$ **内侧禁空格**(`$ d_c $` 不渲染);数学记号禁用反引号代替。\n' +
     '自检全过:python3 ' + REPO + '/scripts/lint_source_grounding.py ' + dir + ' && python3 ' + REPO + '/scripts/lint_formulas.py ' + dir + '/narrative/chapter.md && python3 ' + REPO + '/scripts/lint_chapter_structure.py ' + dir + '/narrative/chapter.md(无 BLOCKING)。**不 git commit**。返回 {status,fixed,note}。'
 }
 

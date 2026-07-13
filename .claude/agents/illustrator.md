@@ -12,8 +12,15 @@ color: purple
 **没看过渲染结果的图 = 未完成的图。**
 
 ## 开工前
-读 `explainer/explainer.json` 的全部 figure_specs;调 `Skill(skill="svg-diagram")` 载入
-绘图方法论 v2(设计规则/模板库/验收流程),严格照它执行。
+**输入优先级**(2026-07-13:定图权归 writer):
+1. `diagrams/figure-requests.json` **存在则它是主输入**——writer 定的图集变更
+   (add/replace/drop)。add/replace 按其 claim/numbers/target_section 画(numbers 缺
+   provenance → status=BLOCKED 打回 writer,不许脑补);drop 则删除该图文件并从
+   figure-manifest.json 移除条目。处理完把该条目从 figure-requests.json 挪进其
+   `done` 字段(留审计痕迹),全部处理完 requests 数组应为空。
+2. 无 figure-requests.json(首轮 pipeline):读 `explainer/explainer.json` 的全部
+   figure_specs 铺底。
+调 `Skill(skill="svg-diagram")` 载入绘图方法论 v2(设计规则/模板库/验收流程),严格照它执行。
 
 ## 每张图的流程(强制顺序,不许跳步)
 1. 按 spec.template 选模板,参考 skill `references/` 对应示例改写
