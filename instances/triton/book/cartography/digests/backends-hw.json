@@ -1,0 +1,88 @@
+{
+  "subsystem": "backends-hw",
+  "scope": "硬件后端接入层：python/triton/backends 的发现机制 + 抽象契约（BaseBackend/DriverBase/AttrsDescriptor），third_party/nvidia 的落地端（compiler.py stages 注入 / ptxas 调用 / driver.c cubin 装载 / 占用率），以及 third_party/amd 的对照落地（同一抽象两种实现）。这一层是姊妹篇 triton-ascend（本仓 fork + ascend 后端）的配对脊柱：所有『后端接入接缝』都在这里。",
+  "source_version_note": "Triton v3.2.0，源码在 instances/triton/source（只读）。行号基线以本次测绘时的文件为准。",
+  "mainline": "读者带着一个问题走进来：Triton 只有一套前端（@triton.jit 写的核）和一套中端（TTIR/TTGIR MLIR 方言），为什么换一块 GPU（NVIDIA→AMD→昇腾）就能跑，而且我 fork 一个仓、塞一个目录进去就能加一块新卡？答案是『约定即插件』——python/triton/backends 在 import 时扫目录，任何含 compiler.py + driver.py、且各恰好定义一个 BaseBackend/DriverBase 具体子类的目录，自动成为一个后端。走进这条主线，读者会依次看清四个接缝：(1) 发现与选择——目录扫描 + supports_target/is_active 单活选举；(2) 契约——后端必须实现的 6 个抽象方法（parse_options / add_stages / load_dialects / get_module_map / get_attrs_descriptor / 以及 driver 侧 get_current_target / is_active / get_benchmarker），这 6 个方法就是新卡要填的全部空格；(3) NVIDIA 的完整落地——CUDAOptions 怎么解析、add_stages 怎么把 make_ttir→make_ttgir→make_llir→make_ptx→make_cubin 五段注入编译管线、ptxas 子进程怎么把 PTX 编成 cubin、driver.c 怎么 cuModuleLoadData 装载并读回寄存器/溢出/占用率；(4) AMD 的对照落地——同样 6 个方法，但 HIPOptions 多了 waves_per_eu/matrix_instr_nonkdim、stages 走 amdgcn/hsaco、装载走 hsaco+ld.lld。走出去时读者懂了：加一块新卡 = 在 backends/ 下新增一个目录、实现这 6 个方法、把自己的 MLIR dialect 通过 load_dialects 挂进 context、把 add_stages 的最后一段产出设备二进制——昇腾后端正是照这个模板 fork 出来的。",
+  "units": [
+    {
+      "title": "约定即插件：后端发现机制与两张契约",
+      "focus": "讲透 python/triton/backends 如何在 import 时扫目录自动发现后端、_find_concrete_subclasses 的『恰好一个具体子类』约束，以及 BaseBackend/DriverBase 这两张抽象契约——它们就是 triton-ascend 加 ascend 后端时要填的全部空格；顺带讲清 make_backend(supports_target) 与 _create_driver(is_active) 的『单活选举』如何在多后端共存时选出唯一后端/驱动。【后端接入接缝 #1：backends 发现机制 + 抽象契约】",
+      "key_source_paths": [
+        "python/triton/backends/__init__.py",
+        "python/triton/backends/compiler.py",
+        "python/triton/backends/driver.py",
+        "python/triton/runtime/driver.py",
+        "python/triton/compiler/compiler.py"
+      ],
+      "est_size": "M",
+      "mode_hint": "deep",
+      "note": "纯 Python 且无需 GPU 即可跑：_discover_backends 扫 backends/ 目录、_load_module 动态加载 compiler.py/driver.py、_find_concrete_subclasses 用 issubclass + not isabstract 抓出唯一具体子类（0 个或 >1 个都 raise）。精简版可造一个 mini 目录树（含一个玩具 Backend）真实跑通发现→选举链路，交叉验证。契约面：BaseBackend 的 6 个 @abstractmethod（supports_target/hash/parse_options/add_stages/load_dialects/get_module_map）+ get_attrs_descriptor/compute_spec_key 默认实现；DriverBase 的 is_active/get_current_target/get_benchmarker + GPUDriver 基类（torch.cuda 绑定）。选举：make_backend 用 supports_target 挑编译后端、runtime/driver.py 的 _create_driver 用 is_active 挑驱动，各要求『恰好一个 active』否则 RuntimeError。GPUTarget(backend, arch, warp_size) 是贯穿全书的目标三元组。这一章务必显式点名：昇腾后端 = 在此新增 backends/... 目录 + 一对 compiler/driver 子类，is_active/supports_target 决定它何时被选中。"
+    },
+    {
+      "title": "编译期参数特化：AttrsDescriptor 与后端专属属性",
+      "focus": "讲透 AttrsDescriptor 如何把运行时实参的编译期性质（16 对齐 tt.divisibility / 常量 1 tt.equal_to）萃取成属性、并入缓存 key 驱动特化代码生成；以及后端如何通过 _add_backend_properties / register_descriptor 扩展自己的属性（AMD 的 HIPAttrsDescriptor 加 tt.pointer_range=32 以启用 buffer load/store）——这是又一处后端可插拔接缝，昇腾同样可挂自己的特化属性。",
+      "key_source_paths": [
+        "python/triton/backends/compiler.py"
+      ],
+      "est_size": "M",
+      "mode_hint": "deep",
+      "note": "纯 Python 可跑。AttrsDescriptor：__slots__ + arg_properties/property_values/constant_properties 三字典；is_divisible_by_16（data_ptr()%16 或 int%16）、is_equal_to_1（int 且非 bool 且 ==1）；get_property_key 返回 'D'/'1'/'N' 特化键；hash/to_dict/from_dict/from_hints 序列化往返；filter_out_constants 剥常量。register_descriptor + _descriptor_table 让 from_dict 能按类名重建正确子类——这就是后端子类扩展点。HIPAttrsDescriptor（在 amd/backend/compiler.py）覆写 _add_backend_properties 加 pointer_range（is_within2gb），并把 get_property_key 拼成 'DS'/'S' 等复合键。精简版可对玩具参数列表跑一遍萃取+序列化往返，验证特化键。教学价值：解释为什么『同一个核、不同实参对齐』会触发不同 cubin（缓存 key 含 attrs）。"
+    },
+    {
+      "title": "CUDABackend 把五段 stages 注入编译管线",
+      "focus": "讲透 NVIDIA 后端的核心接缝 add_stages——它按插入顺序把 make_ttir→make_ttgir→make_llir→make_ptx→make_cubin 五段登记进 stages dict，compiler.compile 顺序执行、以 metadata 串联；重点解读 make_ttgir/make_llir 里按 capability 分档注入的 MLIR pass 序列（coalesce/accelerate_matmul/warp-spec/pipeline/tma_lowering），以及 CUDAOptions 怎么把用户选项+capability 启发式解析成冻结配置。【后端接入接缝 #3：stages 注入 + load_dialects 挂 NVIDIA dialect】",
+      "key_source_paths": [
+        "third_party/nvidia/backend/compiler.py",
+        "third_party/nvidia/triton_nvidia.cc",
+        "python/triton/compiler/compiler.py"
+      ],
+      "est_size": "L",
+      "mode_hint": "skip_impl",
+      "note": "skip_impl：make_ttir/ttgir/llir 里每一步都是 passes.*/nvidia.passes.* 调进 libtriton（编译好的 C++ MLIR pass），无 GPU/无编译产物跑不动、也无法只做减法造精简版。正文按『真源码逐段解读』：CUDAOptions（num_warps/num_stages/cluster_dims/ptx_version/supported_fp8_dtypes...）+ __post_init__（注入 libdevice extern_lib、校验 num_warps 是 2 的幂）+ hash；parse_options 的 capability 启发式（sm89 加 fp8e4nv、sm90 弃 fp8e4b15、maxnreg 默认）。add_stages 是主角：五段 lambda 按序登记，compiler.compile 的 for ext,compile_ir in stages[first_stage:] 逐段跑并把每级 IR 落缓存。make_ttgir 的 pass 流水线按 capability//10 分 8/9 档注入（f32_dot_tc、accelerate_matmul、ws_*warp specialization 四连、add_pipeline(num_stages)、fence_insertion、tma_lowering）——这里能自然引出软件流水线/warp specialization 的原理（见先修）。load_dialects→nvidia.load_dialects(ctx) 与 triton_nvidia.cc 的 init_triton_nvidia 注册（load_dialects 挂 NVGPU/TritonNvidiaGPU dialect、ClusterInfo pybind、add_plan_cta/add_tma_lowering 等 pass wrapper）成对讲——这是 C++/Python 双语接缝。昇腾后端就是提供自己的 add_stages（最后一段产出昇腾二进制）+ load_dialects（挂 ascend dialect）。",
+      "primer_candidate": "make_ttgir 里 add_pipeline(num_stages) 与 ws_* 四连引用了『软件流水线调度』与『warp specialization / producer-consumer』的编译原理——如综合者要独立 primer，可在此拆出一章讲多级缓冲流水线与 warp 组分工的调度模型（论文级），本章只解读 Python 落地端的注入顺序与 capability 分档。"
+    },
+    {
+      "title": "从 PTX 到 cubin：ptxas 子进程与二进制装载",
+      "focus": "讲透编译管线最后两段的落地：make_ptx 用 llvm.translate_to_asm 出 PTX 并做版本/调试标志后处理，make_cubin 起 ptxas 子进程（-v 拿寄存器占用、--gpu-name=sm_XX、SIGSEGV/返回码错误分类）把 PTX 编成 cubin；再到 driver.c 的 loadBinary 用 cuModuleLoadData 装载、cuFuncGetAttribute 读回 n_regs/n_spills、按 >48KB 阈值 cuFuncSetAttribute 开 opt-in 动态共享内存。这是『toolchain 外部依赖』最密的一段。",
+      "key_source_paths": [
+        "third_party/nvidia/backend/compiler.py",
+        "third_party/nvidia/backend/driver.c",
+        "python/triton/compiler/compiler.py"
+      ],
+      "est_size": "M",
+      "mode_hint": "skip_impl",
+      "note": "skip_impl：make_cubin 依赖真实 ptxas 二进制、loadBinary 依赖 libcuda + 真 GPU，无法造只做减法的可运行精简版。真源码解读要点：_path_to_binary（TRITON_PTXAS_PATH env 或 backend/bin/ptxas，正则抓 release 版本，lru_cache）；ptx_get_version/get_features（CUDA 版本→PTX 版本→llvm +ptxNN feature，llvm 上限 83）；make_ptx 的 translate_to_asm + 正则抓唯一 .visible .entry 核名写 metadata['name'] + .version 重写 + 去 debug 标志；make_cubin 的 ptxas_cmd 组装（-lineinfo/--fmad/-v/--opt-level/sm_90a 后缀）、subprocess.run(check=True) + CalledProcessError 按 returncode 分类报错（255=内部 codegen 错、128+SIGSEGV、其它）+ 附 repro 命令。driver.c loadBinary：cuModuleLoadData→cuModuleGetFunction→cuFuncGetAttribute(NUM_REGS/LOCAL_SIZE_BYTES) n_spills/=4→shared>49152 且 optin>49152 时 cuFuncSetCacheConfig PREFER_SHARED + 设 MAX_DYNAMIC_SHARED_SIZE，返回 (module, function, n_regs, n_spills)。消费端：CompiledKernel._init_handles 调 driver.active.utils.load_binary 装载并存 n_regs/n_spills，get_device_properties['max_shared_mem'] 做 OutOfResources 前置检查。教学坑：无 GPU/无 CUDA toolchain 全程不可运行，须用真实抓取的日志/数值轨迹佐证。"
+    },
+    {
+      "title": "占用率、launcher 代码生成与 kernel 装配运行",
+      "focus": "讲透 cubin 装好之后怎么真正被调用：CudaLauncher 用 make_launcher 按核签名动态生成一段 C 扩展（PyArg 解析实参、getPointer 从 torch 张量取 data_ptr、cuLaunchKernel 或 cluster 场景 dlsym 出 cuLaunchKernelEx），compile_module_from_src 编译并缓存成 .so；以及 driver.c 的 occupancyMaxActiveClusters 如何用 cuOccupancyMaxActiveClusters 算 cluster 占用率。落点：CudaDriver 作为 GPUDriver 落地（get_current_target 组 GPUTarget、is_active 判 torch.cuda 且非 hip）。【后端接入接缝：driver 抽象的 NVIDIA 落地 + launcher 契约】",
+      "key_source_paths": [
+        "third_party/nvidia/backend/driver.py",
+        "third_party/nvidia/backend/driver.c",
+        "python/triton/backends/driver.py"
+      ],
+      "est_size": "L",
+      "mode_hint": "skip_impl",
+      "note": "skip_impl：launcher 生成的 C 扩展要真编译 + libcuda + GPU 才能跑，occupancy 走 cuOccupancyMaxActiveClusters。真源码解读：make_launcher 是『代码生成代码』——ty_to_cpp 类型映射（*→CUdeviceptr、nvTmaDesc→CUtensorMap）、format_of 拼 PyArg_ParseTuple 格式串、_launch 里 num_ctas==1 走 cuLaunchKernel、否则组 CUlaunchConfig+cluster attr 并 dlsym cuLaunchKernelEx（运行时从 libcuda.so.1 取符号，避开链接期依赖）、getPointer 从 PyObject 取 data_ptr 并 cuPointerGetAttribute 校验是设备指针、getTmaDesc 取 TMA 描述符、ensureCudaContext 保证有 primary context。CudaLauncher.__init__ 从 src 拆 constants/signature 喂 make_launcher，compile_module_from_src（sha256 源码做 cache key，triton.runtime.build._build 编 .so，cache 命中直接 importlib 加载）。CudaUtils 单例把 driver.c 编出的 load_binary/get_device_properties/cuOccupancyMaxActiveClusters/fill_*_tma_descriptor 绑上来。occupancyMaxActiveClusters：先 cuFuncSetAttribute 设动态共享内存 + NON_PORTABLE_CLUSTER_SIZE_ALLOWED，再按 1 block/SM 造 config 调 cuOccupancyMaxActiveClusters 返回可并发 cluster 数。DriverBase/GPUDriver（backends/driver.py）是被落地的契约：Benchmarker Protocol、is_active/get_current_target/get_benchmarker 抽象、GPUDriver 绑 torch.cuda 的 stream/device 句柄。昇腾后端就是提供自己的 Driver（is_active 判昇腾可用、get_current_target 返回昇腾 arch、自己的 launcher_cls）。",
+      "primer_candidate": "占用率（occupancy = 每 SM 活跃 warp 数 / 硬件上限，受寄存器/共享内存压制）是理解 n_regs/n_spills/max_dynamic_shared 三个量为何重要的概念地基。如综合者要 primer，可拆一节讲 GPU 资源模型与占用率理论（active blocks/warps vs SM 的寄存器堆/共享内存/warp 槽上限、寄存器溢出的代价），本章正文只解读 cuOccupancyMaxActiveClusters 的 Python/C 落地与 launcher 装配。"
+    },
+    {
+      "title": "对照落地：AMD HIP 后端——同一抽象的第二种实现",
+      "focus": "把 AMD 后端与 NVIDIA 逐面对照，坐实『6 个方法两种落地』这一姊妹篇脊柱：HIPOptions 的差异字段（waves_per_eu/matrix_instr_nonkdim/kpack/warp_size 按 gfx 档定 32/64）、add_stages 走 make_amdgcn/make_hsaco（amgcn→amd.assemble_amdgcn→ld.lld 链接出 hsaco，而非 ptxas/cubin）、HIPAttrsDescriptor 的 pointer_range 特化、load_dialects 挂 amd dialect、CDNA matrix core 的 stream pipeline。读者由此看清哪些是抽象强制的骨架、哪些是硬件自由发挥的血肉——正是昇腾后端要照抄骨架、替换血肉的分界线。",
+      "key_source_paths": [
+        "third_party/amd/backend/compiler.py",
+        "third_party/amd/backend/driver.py"
+      ],
+      "est_size": "M",
+      "mode_hint": "skip_impl",
+      "note": "skip_impl：同样依赖 amd libtriton passes + ROCm 工具链（ld.lld/hsaco）+ AMD GPU。作对照章，结构上与 NVIDIA 章一一并排：supports_target=='hip'/binary_ext='hsaco'；HIPOptions.__post_init__ 按 arch 定 warp_size（gfx10/11/12→32 否则 64）、注入 ocml/ockl bitcode；make_ttgir 用 amd.passes.ttgpuir.add_accelerate_matmul(arch, matrix_instr_nonkdim, kpack)、has_matrix_core_feature 时 add_stream_pipelinev2(num_stages)（注意其 num_stages==0 的 assert 提示——AMD pipeliner 语义变更史）、可选 buffer ops（AMDGCN_USE_BUFFER_OPS）；make_llir 设一堆 AMDGPU control constants（__oclc_*、wavefrontsize64、amdgpu-flat-work-group-size/waves-per-eu、denormal-fp-math）+ set_all_fn_arg_inreg；make_amdgcn 正则抓 amdgpu_kernel 名 + translate_to_asm；make_hsaco 走 amd.assemble_amdgcn + ld.lld -shared。HIPAttrsDescriptor 复用上文 AttrsDescriptor 扩展点。对照收口：明确列出 6 方法骨架不变、Options/pass 序列/二进制格式/装载器血肉各异——这张对照表就是昇腾后端的施工图。"
+    }
+  ],
+  "hazards": [
+    "无 GPU 不可运行处密集：Unit 3/4/5/6（CUDABackend stages、ptxas→cubin、launcher/occupancy、AMD 落地）几乎全程需真实 GPU + CUDA/ROCm 工具链 + 编译好的 libtriton，无法造『只做减法的可运行精简版』——这些章走 skip_impl，用真实抓取的编译日志/PTX 片段/寄存器占用数值轨迹佐证，切勿伪造运行结果。仅 Unit 1（发现机制）、Unit 2（AttrsDescriptor）是纯 Python、无 GPU 可跑，适合 deep 带精简版。",
+    "双语栈断点：add_stages 里每个 make_* 调的 passes.*/nvidia.passes.* 都是 Python→libtriton(C++ MLIR pass) 的跳转（triton_nvidia.cc 的 pybind 注册是另一半）；driver.py 的 utils 方法体在 driver.c（Python→C 扩展→libcuda driver API）。讲解须成对呈现 Python 调用点 + C/C++ 落地，否则读者在接缝处断线。占位知识：MLIR pass 内部实现属『编译中端』子系统，本层只讲注入顺序与接缝，不深入 pass 算法。",
+    "强耦合外溢：本子系统与 (a) compiler/compiler.py 的 compile() 主循环（stages 消费、make_backend 选举、CompiledKernel._init_handles 调 load_binary）、(b) runtime/build.py 的 _build（launcher .so 编译）、(c) runtime/cache.py（compile_module_from_src 缓存）、(d) MLIR pass 子系统（passes.ttgpuir.*）强耦合。测绘边界：本层负责『把这些拼装并注入』，不负责 pass 算法本身与 cache 实现——引用即可，避免与其它子系统的章节重复。",
+    "版本/工具链隐性依赖：ptx_get_version 把 CUDA 版本硬编码映射到 PTX 版本、get_features 的 llvm PTX 上限 83、sm_90a 后缀、ptxas 返回码 255/SIGSEGV 分类——这些是 v3.2.0 当下的经验常数，讲解须标注『随工具链版本会变』，勿当永恒真理。",
+    "姊妹篇配对脊柱（务必在正文显式点名）：后端接入的四道接缝——① backends/ 目录发现机制（Unit 1）② add_stages 注入 + load_dialects 挂第三方 dialect（Unit 3/6）③ DriverBase 抽象的落地：is_active/get_current_target/launcher_cls（Unit 1/5）④ AttrsDescriptor 后端专属特化（Unit 2）——正是 triton-ascend fork 加 ascend 后端时动刀的全部位置。每章 focus 已用【后端接入接缝】标注，写作时不可淡化，它们是与姊妹篇对齐的锚点。"
+  ]
+}

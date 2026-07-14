@@ -1,0 +1,913 @@
+{
+  "book": {
+    "title": "Triton 源码解读:一门 DSL 如何一路编译成 PTX",
+    "instance": "triton",
+    "kind": "source-reading",
+    "spine": "一门 GPU DSL 从 @triton.jit 的一行 Python，一路降级成 GPU 能跑的 PTX/cubin：每一层（追踪→TTIR→TTGIR+布局→优化 pass→LLVM→PTX）都是一次带理由的降级，本书沿这条降级阶梯逐层解读真实源码，并处处点名『一块新卡从哪里挂进来』。",
+    "sister_book": {
+      "instance": "triton-ascend",
+      "relation": "triton-ascend = 本仓 fork + 昇腾 NPU 后端；它是本书的衍生姊妹篇，会沿本书标注的『后端接缝』章逐章对位（发现机制/契约/stages 注入/第三方 dialect/布局编码/AttrsDescriptor 特化/tracer/launcher）。本书是基座，pairs_with 均留空；对位方向由姊妹篇的 outline 反向引用本书章号。"
+    },
+    "reader_profile": {
+      "assumed_knowledge": [
+        "熟练 Python（装饰器、AST、上下文管理器）",
+        "基础 GPU/CUDA 概念（线程/内存层级；不足由 ch02 primer 兜底）",
+        "基础编译器概念（IR/pass；SSA 由 ch15 primer 兜底）",
+        "线性代数与矩阵乘基础"
+      ],
+      "target_level": "advanced",
+      "language": "zh"
+    }
+  },
+  "parts": [
+    {
+      "id": "part-1",
+      "title": "第一部分 · 起步：一门 DSL 与它的目标机器",
+      "intent": "建立全书心智模型（追踪成 IR、五级降级阶梯、双语栈接缝、subtract-only 精简版约定），补齐 GPU 执行模型这一自包含地基，并用一个最小 kernel 走完 @jit→PTX→launch 的鸟瞰主线，作为后续每一章放大的地图。"
+    },
+    {
+      "id": "part-2",
+      "title": "第二部分 · 领域语言 tl.*：在追踪期把 Python 翻成 IR",
+      "intent": "读者写下的 tl.load/tl.dot 不是在跑、而是在被追踪成 Triton IR。逐层讲透 tl.* 的两层结构与 @builtin 契约、constexpr 编译期/运行期分野、类型系统与 tensor、类型提升与广播、造块/形状/访存/原子/dot/归约，以及用 DSL 自举的标准库——这是全书后续所有 kernel 书写的表面，也是双语栈接缝的第一现场。"
+    },
+    {
+      "id": "part-3",
+      "title": "第三部分 · 宿主运行时：从 fn[grid](...) 到发射",
+      "intent": "顺着一次 launch 的 host 侧全链：JITFunction 元数据、特化键/依赖哈希缓存、run() 的缓存→编译→发射胶水、可插拔 driver 抽象与后端发现、autotune/磁盘缓存两条支线，以及 TRITON_INTERPRET 无 GPU 替身执行——这里出现后端接入的第一道配对脊柱。"
+    },
+    {
+      "id": "part-4",
+      "title": "第四部分 · 编译前端：把 AST 翻译成 TTIR",
+      "intent": "compile() 的驱动主循环如何编排逐级降级；CodeGenerator 作为 AST 访问者把 Python 翻成 MLIR，核心难点是 constexpr↔tensor 两个世界与控制流下降到结构化 scf（皇冠明珠）；收束于 BaseBackend 契约与编译产物 CompiledKernel——后端从哪几个钩子挂进来。"
+    },
+    {
+      "id": "part-5",
+      "title": "第五部分 · IR 与布局：编译器到底在摆弄什么",
+      "intent": "三层方言（tt→ttg→ttng）的递进，与贯穿始终的核心抽象——布局(layout)=把张量索引映到线程集合的函数。从 tt.* 硬件无关词汇，到 distributed/shared 布局编码，再到 LinearLayout 用一族 GF(2) 线性函数统一所有布局——理解了布局，convert_layout 与整条降级就不再神秘。这里密集出现『新后端如何在 IR 层挂进来』的配对脊柱。"
+    },
+    {
+      "id": "part-6",
+      "title": "第六部分 · 优化 pass：朴素 IR 如何变成高性能 IR",
+      "intent": "一段朴素的 tt.dot+tt.load 怎样被一串按精确顺序排列的 MLIR pass 打磨成能喂饱 Tensor Core、合并访存、重叠搬运与计算的高性能 IR。主线：静态分析(AxisInfo/Allocation/Membar)量化地驱动一串改写(Coalesce/AccelerateMatmul/RemoveLayout/软件流水线/Prefetch/Warp Specialization)。AccelerateMatmul 与流水线是后端接缝重灾区。"
+    },
+    {
+      "id": "part-7",
+      "title": "第七部分 · 降级：从带布局的张量 IR 到 PTX",
+      "intent": "五级台阶的后半程：TTIR→TTGIR 给每个张量贴布局，TTGIR→LLVM 把张量塌缩成 per-thread 寄存器与访存指令（convert_layout 三条搬运路径、共享内存 swizzle、访存向量化、dot→mma/wgmma 指令选择、内联 PTX），最后 LLVM→PTX→cubin 出口。TargetInfo 与 third_party/ 是后端可插拔的确切接缝。"
+    },
+    {
+      "id": "part-8",
+      "title": "第八部分 · 硬件后端：一块新卡怎么接进来",
+      "intent": "把前面散落的所有后端接缝收成一张施工图：约定即插件的发现机制之上，CUDABackend 如何注入五段 stages 与挂 dialect、PTX→cubin→装载→launcher→占用率的落地，以及 AMD HIP 作为『同一抽象的第二种实现』的逐面对照——这正是姊妹篇 triton-ascend 昇腾后端要照抄骨架、替换血肉的分界线。"
+    },
+    {
+      "id": "part-9",
+      "title": "第九部分 · 工具生态：量它、读它、部署它、学它",
+      "intent": "与编译/发射正交但同样贴身的一层：proton 零侵入钩进每次 launch 并用 roofline 翻译成利用率、do_bench 是全书 benchmark 的秒表；AOT compile/link 把核烙成脱离 Python 的自包含 C；disasm/triton-opt/triton-tensor-layout 让你读懂编译产物与布局；tutorials 阶梯是读者 on-ramp。"
+    }
+  ],
+  "chapters": [
+    {
+      "chapter_id": "ch01",
+      "slug": "ch01-what-is-triton",
+      "title": "Triton 是什么，以及本书怎么读",
+      "focus": "建立全书心智模型：@triton.jit 里的 Python 不是在跑而是在追踪成 Triton IR；一条 ttir→ttgir→llir→ptx→cubin 的五级降级阶梯贯穿全书；处处存在『Python 校验/合法化 + C++/MLIR 执行』的双语栈接缝；源码解读章的结构（真源码内嵌 + subtract-only 精简版做数值交叉验证 + 原理 primer）；以及本书作为基座、triton-ascend 昇腾姊妹篇沿『后端接缝』逐章对位的约定。 源码树与构建总览一张图:CMake 如何把 core 与 third_party 后端聚合进 libtriton(TRITON_BACKENDS_TUPLE 注入),后续各章的地基。",
+      "part": "part-1",
+      "subsystem": "orientation",
+      "key_source_paths": [
+        "python/triton/__init__.py",
+        "python/tutorials/01-vector-add.py",
+        "CMakeLists.txt",
+        "python/src/main.cc"
+      ],
+      "deps": [],
+      "est_size": "M",
+      "mode": "meta",
+      "kind": "skip_impl"
+    },
+    {
+      "chapter_id": "ch02",
+      "slug": "ch02-gpu-execution-model",
+      "title": "GPU 执行模型：SIMT、grid/warp/lane、内存层级与占用率",
+      "focus": "自包含地基 primer：把 GPU 编程模型讲成读者脑中的图——SPMD/SIMT 的 grid→block(CTA)→warp→lane 层次、寄存器/共享内存/L2/全局显存的内存层级与延迟、访存合并(coalescing)为何依赖『相邻线程访问相邻地址』、以及占用率(occupancy=活跃 warp/上限，受寄存器与共享内存压制)与寄存器溢出的代价。为后续布局、访存合并、共享内存分配、后端占用率各章铺台阶；不解读源码，用 vector-add 做锚点。",
+      "part": "part-1",
+      "subsystem": "orientation",
+      "key_source_paths": [
+        "python/tutorials/01-vector-add.py",
+        "python/triton/language/core.py"
+      ],
+      "deps": [
+        "ch01"
+      ],
+      "est_size": "M",
+      "mode": "meta",
+      "kind": "primer"
+    },
+    {
+      "chapter_id": "ch03",
+      "slug": "ch03-kernel-life-birdseye",
+      "title": "一个 kernel 的一生（鸟瞰）",
+      "focus": "用最小的 vector-add 核低分辨率走通整条主线：@triton.jit 装饰 → fn[grid](...) 触发 JITFunction.run → 追踪 AST 成 TTIR → 贴布局成 TTGIR → 优化 pass → 降到 LLVM/NVVM → NVPTX 出 PTX → ptxas 出 cubin → driver 发射。建立后续每一章放大进去的那张地图，并第一次点名沿途所有『双语栈断点』与『无 GPU 断裂处』。",
+      "part": "part-1",
+      "subsystem": "orientation",
+      "key_source_paths": [
+        "python/tutorials/01-vector-add.py",
+        "python/triton/runtime/jit.py",
+        "python/triton/compiler/compiler.py"
+      ],
+      "deps": [
+        "ch01",
+        "ch02"
+      ],
+      "est_size": "M",
+      "mode": "meta",
+      "kind": "skip_impl",
+      "flagship": true
+    },
+    {
+      "chapter_id": "ch04",
+      "slug": "ch04-tl-surface-and-constexpr",
+      "title": "tl.* 的两层结构、@builtin 契约与 constexpr",
+      "focus": "取景框章：__init__.py 如何把 core/standard/math/random 铺成 tl.* 表面；@builtin 装饰器如何在追踪期由 JIT 注入 _builder 桥到 C++ IR builder（脱离 @triton.jit 直接调用即报错），_tensor_member_fn/is_builtin 标记服务 AST 识别；以及 constexpr 作为编译期/运行期分野的化身——包装 Python 值、重载全部 dunder、__index__ 当形状用，static_range/range 作为编译期迭代器（range 携带 num_stages/loop_unroll_factor 提示到后端流水线 pass），_constexpr_to_value/_unwrap_if_constexpr 的到处兜底。",
+      "part": "part-2",
+      "subsystem": "dsl-language",
+      "key_source_paths": [
+        "python/triton/language/__init__.py",
+        "python/triton/__init__.py",
+        "python/triton/language/core.py"
+      ],
+      "deps": [
+        "ch03"
+      ],
+      "est_size": "M",
+      "mode": "code",
+      "kind": "deep"
+    },
+    {
+      "chapter_id": "ch05",
+      "slug": "ch05-type-system-and-tensor",
+      "title": "类型系统与 tensor：三层类型、cast 与运算符重载",
+      "focus": "dtype/pointer_type/block_type 三层类型体系（fp8 家族的 mantissa/bitwidth/exponent_bias、to_ir 按 name dispatch 下降到 builder.get_*_ty 并经 builder.options 检查 fp8 支持——后端能力接缝、_utils.validate_block_shape 强制 2 的幂+numel≤2^20）；tensor 如何以 (IR handle, type) 承载一个值、shape 为何是 constexpr 列表、薄魔术方法转发到 core/semantic；cast/bitcast 的大 dispatch（按源/目标 dtype 组合选 create_fp_to_fp/create_si_to_fp、fp_downcast_rounding、bitcast 等宽约束）——Python 决策 + C++ 执行的典型。",
+      "part": "part-2",
+      "subsystem": "dsl-language",
+      "key_source_paths": [
+        "python/triton/language/core.py",
+        "python/triton/language/semantic.py",
+        "python/triton/language/_utils.py"
+      ],
+      "deps": [
+        "ch04"
+      ],
+      "est_size": "L",
+      "mode": "code",
+      "kind": "deep"
+    },
+    {
+      "chapter_id": "ch06",
+      "slug": "ch06-type-promotion-broadcast",
+      "title": "类型提升与隐式广播：每个 x+y 背后的语义规则",
+      "focus": "本子系统最纯 Python 也最反直觉的深水区（几乎可脱机单测）：computation_type_impl 的六档分层规则（标量按 kind 的 PyTorch 式降级、fp64>fp32>fp16、bf16/不同 fp8/整数 usual arithmetic conversions 的特例）；binary_op_type_checking_impl 的总调度（to_tensor→check_ptr→算 ret 类型→broadcast_impl 对齐形状）；广播的 block-scalar(splat) 与 block-block(补维+create_broadcast，1 可扩非 1 报错)；以及 sanitize_overflow 提到 int64 复算的整数溢出检查。点明规则来源混合（C + PyTorch）以消除『规则任意』的错觉。",
+      "part": "part-2",
+      "subsystem": "dsl-language",
+      "key_source_paths": [
+        "python/triton/language/semantic.py"
+      ],
+      "deps": [
+        "ch05"
+      ],
+      "est_size": "L",
+      "mode": "code",
+      "kind": "deep"
+    },
+    {
+      "chapter_id": "ch07",
+      "slug": "ch07-blocks-shape-and-memory-access",
+      "title": "造块、形状变换、访存与原子操作",
+      "focus": "编程模型的动作面：从 grid 坐标(program_id/num_programs)到 block 张量(arange/full)，reshape/view/expand_dims/join/split/cat/trans/permute/broadcast_to 一族形状算子（Python 侧算形状、builder.create_* 落算子）；全书 kernel 最高频的访存——『指针+mask』的两条路径 legacy 逐元素指针(_load_legacy 的 mask/other/cache/evict)与 block pointer(make_block_ptr/advance/boundary_check)，外加 Hopper TMA descriptor；以及 atomic_* 家族的统一类型校验与 sem(内存序)/scope(作用域)下降。这里是双语栈断点最密集处。",
+      "part": "part-2",
+      "subsystem": "dsl-language",
+      "key_source_paths": [
+        "python/triton/language/core.py",
+        "python/triton/language/semantic.py"
+      ],
+      "deps": [
+        "ch06"
+      ],
+      "est_size": "L",
+      "mode": "code",
+      "kind": "deep"
+    },
+    {
+      "chapter_id": "ch08",
+      "slug": "ch08-dot-reduce-scan",
+      "title": "dot、归约与扫描：块级计算与 combine_fn 变 IR region",
+      "focus": "tl.dot 块级矩阵乘的形状/dtype 校验、input_precision(tf32/ieee)、acc/out_dtype，以及关键后端能力钩子——assert builder.codegen_fns['min_dot_size']（后端声明 Tensor Core 最小 tile）、options.default_dot_input_precision/max_num_imprecise_acc_default、dot_scaled 的 microscaling 路径；reduce/associative_scan/histogram 如何把用户传入的 combine_fn 经 _generator 回调 AST CodeGenerator 重新编译成 create_reduce/create_scan 的 region body（解释为何 combine_fn 必须是可追踪 Triton 代码，_reduce_with_indices 支撑 argmax/argmin）。",
+      "part": "part-2",
+      "subsystem": "dsl-language",
+      "key_source_paths": [
+        "python/triton/language/core.py",
+        "python/triton/language/semantic.py"
+      ],
+      "deps": [
+        "ch07"
+      ],
+      "est_size": "L",
+      "mode": "code",
+      "kind": "deep"
+    },
+    {
+      "chapter_id": "ch09",
+      "slug": "ch09-self-hosted-libraries",
+      "title": "在 Triton 里写 Triton：自举标准库、数学/extern 与随机数",
+      "focus": "证明 tl.* 上半部不是黑盒——standard.py 的 cdiv/softmax(减最大值数值稳定)/sort(完整 bitonic，constexpr 驱动 log2(n) 阶段)/cumsum 全用 core 原语 @jit 自举；random.py 的 Philox counter-based 无状态 RNG（umulhi+位运算，刻意关 sanitize_overflow 做环绕算术）；math.py 内置数学(桥到 builder.create_exp)与 extern_elementwise/dispatch 走外部 bitcode(libdevice)两条路，以及 extra/__init__.py 用 pkgutil 动态发现 cuda/hip 后端子模块——triton-ascend 挂载自己 extra/libdevice 的入口（配对脊柱）；顺带收编编译期诊断(static_print/assert)与优化提示(multiple_of/max_contiguous，喂给 AxisInfo)。",
+      "part": "part-2",
+      "subsystem": "dsl-language",
+      "key_source_paths": [
+        "python/triton/language/standard.py",
+        "python/triton/language/random.py",
+        "python/triton/language/math.py",
+        "python/triton/language/extra/libdevice.py",
+        "python/triton/language/extra/__init__.py"
+      ],
+      "deps": [
+        "ch08"
+      ],
+      "est_size": "L",
+      "mode": "code",
+      "kind": "deep",
+      "backend_seam": true
+    },
+    {
+      "chapter_id": "ch10",
+      "slug": "ch10-jitfunction-and-cache-key",
+      "title": "@triton.jit、JITFunction 与缓存键",
+      "focus": "装饰器如何把普通函数包成 JITFunction（inspect.signature 解析成 KernelParam、识别 constexpr/const 注解、切掉装饰器留源码、按 device 分桶 cache），fn[grid] 经 KernelInterface.__getitem__ 记住 grid 的语法糖；launch 热路径核心——create_function_from_signature 用 exec 动态生成 binder 摊薄开销、compute_spec_key 的 16 字节对齐特化(D/1/N)、mangle_type 的 dtype 编码（backend.compute_spec_key 是可覆写接缝）；以及 DependenciesFinder AST 访问者把自身+被调 JITFunction 源码哈希进 cache_key、登记『可疑』全局变量的值，run() 尾部逐个核对全局值没变（改源码/改全局量为何缓存失效）。",
+      "part": "part-3",
+      "subsystem": "jit-runtime",
+      "key_source_paths": [
+        "python/triton/runtime/jit.py"
+      ],
+      "deps": [
+        "ch03",
+        "ch04"
+      ],
+      "est_size": "L",
+      "mode": "code",
+      "kind": "deep"
+    },
+    {
+      "chapter_id": "ch11",
+      "slug": "ch11-run-launch-pipeline",
+      "title": "run()：从缓存查询到编译再到内核发射的一次完整 launch",
+      "focus": "全书脊柱胶水：JITFunction.run 逐段走通——从 driver.active 取 device/stream/target 并 make_backend（跨到 driver 子系统的边界，无 GPU 在此断裂）→ 惰性 create_binder 绑参 → 拼 cache 键 → 内存 cache 命中/未命中 → 未命中则 parse_options+get_attrs_descriptor+ASTSource+compile 回填双缓存 → grid 规范化（callable grid、补 3 维）→ kernel.launch_metadata + kernel.run 发射（后端 C++ launcher，双语断点）。收口 CompiledKernel 的惰性设备句柄如何接到这条发射路径。",
+      "part": "part-3",
+      "subsystem": "jit-runtime",
+      "key_source_paths": [
+        "python/triton/runtime/jit.py",
+        "python/triton/compiler/compiler.py"
+      ],
+      "deps": [
+        "ch10"
+      ],
+      "est_size": "L",
+      "mode": "code",
+      "kind": "deep"
+    },
+    {
+      "chapter_id": "ch12",
+      "slug": "ch12-driver-autotune-cache",
+      "title": "driver 抽象、后端发现、autotune 与磁盘缓存",
+      "focus": "后端接入的第一道配对脊柱——DriverConfig+LazyProxy 惰性选出唯一 is_active 的 driver（import triton 不强制初始化 CUDA），_discover_backends 扫 backends/<name>/{compiler,driver}.py 各取唯一 concrete 子类，DriverBase/GPUDriver 契约（ascend 新增 backends/ascend 目录即零改动纳入）；两条 launch 外层支线——Autotuner 以 key+张量 dtype 为缓存键跑一轮 _bench(取分位、reset_to_zero/restore_value 保护被改写张量)、prune_configs 裁剪，Heuristics 轻量启发式，计时器来自 driver.active.get_benchmarker(后端接缝)；FileCacheManager 的目录布局+tmp+os.replace 原子写+group 文件+可插拔 CacheManager(Redis/Remote)。",
+      "part": "part-3",
+      "subsystem": "jit-runtime",
+      "key_source_paths": [
+        "python/triton/runtime/driver.py",
+        "python/triton/backends/__init__.py",
+        "python/triton/backends/driver.py",
+        "python/triton/runtime/autotuner.py",
+        "python/triton/runtime/cache.py"
+      ],
+      "deps": [
+        "ch11"
+      ],
+      "est_size": "L",
+      "mode": "code",
+      "kind": "deep",
+      "backend_seam": true
+    },
+    {
+      "chapter_id": "ch13",
+      "slug": "ch13-interpreter-mode",
+      "title": "TRITON_INTERPRET：无 GPU 也能跑核的替身执行",
+      "focus": "让整本书的核在无 GPU 环境可跑可调的解药：jit 在 TRITON_INTERPRET==1 时返回 InterpretedFunction；FunctionRewriter 用 AST 变换把每个赋值包成 to_tensor，GridExecutor 把 device 张量拷到 host、_implicit_cvt 把指针实参换成 uint64 地址、_patch_lang 把 tl 的 builtin 重绑到 InterpreterBuilder，再用三重 for 在 CPU 上串行遍历 grid；InterpreterBuilder 的 create_* 用 numpy 逐条复刻 IR 语义（program_id 读 grid_idx、masked_load/store 委托 C++ _interpreter 做按掩码聚散、_convert_float 纯位运算模拟 IEEE-754 降/升精度支撑 fp8/bf16）。明确边界：单线程串行 ≠ GPU 并行，原子/竞争被顺序化。",
+      "part": "part-3",
+      "subsystem": "jit-runtime",
+      "key_source_paths": [
+        "python/triton/runtime/interpreter.py"
+      ],
+      "deps": [
+        "ch11"
+      ],
+      "est_size": "L",
+      "mode": "code",
+      "kind": "deep"
+    },
+    {
+      "chapter_id": "ch14",
+      "slug": "ch14-compile-driver-and-backend-contract",
+      "title": "compile() 驱动主循环、编译入口与后端契约",
+      "focus": "compiler.py 的 compile() 如何编排整条降级链——内容寻址缓存键(triton_key 把 compiler/backends/language 全部源码 sha256，改编译器源码即失效全部缓存)、make_backend 按 target 选唯一后端、backend.add_stages 填出 ir_name→pass 的有序 stages 字典、从 src.ext 起步逐级 compile_ir 并落盘；ASTSource/IRSource 两种入口与内容寻址身份（为何能拿一份 .ttgir 直接做 IR 级测试）；收束于 BaseBackend 契约的六个抽象钩子(supports_target/hash/parse_options/add_stages/load_dialects/get_module_map)+get_codegen_implementation 与 CompiledKernel 编译产物——这些就是 ascend 后端挂进来的空格（配对脊柱）。",
+      "part": "part-4",
+      "subsystem": "compiler-driver",
+      "key_source_paths": [
+        "python/triton/compiler/compiler.py",
+        "python/triton/backends/compiler.py",
+        "third_party/nvidia/backend/compiler.py"
+      ],
+      "deps": [
+        "ch11",
+        "ch07"
+      ],
+      "est_size": "L",
+      "mode": "code",
+      "kind": "deep",
+      "backend_seam": true
+    },
+    {
+      "chapter_id": "ch15",
+      "slug": "ch15-ssa-and-structured-control-flow",
+      "title": "SSA 与结构化控制流：φ 节点、块参数与 loop-carried 变量",
+      "focus": "控制流下降章的理论台阶（primer，不解读源码）：SSA 每个变量只赋值一次，分支汇合处用 φ(v_then,v_else) 选出正确来源；MLIR 不用 φ 而用块参数（后继块声明参数、各前驱跳转时传实参），语义等价；Triton 前端把 Python 的可变名字绑定翻成 SSA 时，循环体里被更新的变量必须『带进带出』成 loop-carried——对应 scf.for 的 iter_args/results、scf.while 的 before/after 块参数。带着 φ/块参数概念去读 ch17 的 visit_For 三步曲(dry-run 收集→create_for_op→块参数接回→yield)。",
+      "part": "part-4",
+      "subsystem": "compiler-driver",
+      "key_source_paths": [
+        "python/triton/compiler/code_generator.py"
+      ],
+      "deps": [
+        "ch14"
+      ],
+      "est_size": "S",
+      "mode": "meta",
+      "kind": "primer"
+    },
+    {
+      "chapter_id": "ch16",
+      "slug": "ch16-codegenerator-ast-to-ttir",
+      "title": "CodeGenerator：AST 访问者、两个世界与表达式/函数下降",
+      "focus": "code_generator 的翻译框架：CodeGenerator 作为 ast.NodeVisitor 逐节点分派，gscope/lscope/local_defs 三层作用域、name_lookup 的 local→global→builtin 三级查找与『只允许 constexpr 全局变量』守卫、贯穿全器的 constexpr(编译期 Python 值)↔tensor(运行期 SSA 句柄)二分、visit() 外壳设 MLIR location 并把异常包成带源码摘录的 CompilationError；表达式与赋值下降(_apply_binary_method 反射分派到 tensor.__add__(_builder=...)、visit_Call 的三分派 static/JITFunction/builtin、visit_Assign 的 lvalue 记账)；函数层 ast_to_ttir 入口 + visit_FunctionDef 建 tt.func(constexpr 参数不占 IR 位、AttrsDescriptor 的 tt.divisibility 经 set_arg_attr 进 IR) + call_JitFunction 的 mangle_fn 内联。",
+      "part": "part-4",
+      "subsystem": "compiler-driver",
+      "key_source_paths": [
+        "python/triton/compiler/code_generator.py",
+        "python/triton/compiler/errors.py"
+      ],
+      "deps": [
+        "ch14",
+        "ch15"
+      ],
+      "est_size": "L",
+      "mode": "code",
+      "kind": "deep"
+    },
+    {
+      "chapter_id": "ch17",
+      "slug": "ch17-control-flow-lowering-scf",
+      "title": "控制流下降到结构化 IR：if/for/while 如何变成 scf 与 φ",
+      "focus": "全书前端最烧脑的皇冠明珠：Python 控制流翻成 MLIR 结构化控制流。visit_If 在『带 return 走顶层 CFG cond_branch』与『无 return 走 scf.if』间分流（ContainsReturnChecker 静态判 return、scf_stack 禁止循环内 return）；visit_For 对 range/static_range 的处理（loop-carried 变量识别、负步长翻转边界、num_stages/loop_unroll_factor 挂成 tt. 属性、诱导变量 poison 占位再回填）；visit_While 的 before/after 双区域；enter_sub_region 如何快照/恢复作用域识别 loop-carried，并把它们显式接成块参数(φ 节点)。精简版可跑到 scf.for/scf.if 的 TTIR dump（CPU 可验）。",
+      "part": "part-4",
+      "subsystem": "compiler-driver",
+      "key_source_paths": [
+        "python/triton/compiler/code_generator.py"
+      ],
+      "deps": [
+        "ch16",
+        "ch15"
+      ],
+      "est_size": "L",
+      "mode": "code",
+      "kind": "deep",
+      "flagship": true
+    },
+    {
+      "chapter_id": "ch18",
+      "slug": "ch18-pybind-bridge-libtriton",
+      "title": "双语桥:libtriton 的 pybind11 绑定层",
+      "focus": "打开 python/src/:ir.cc 的 TritonOpBuilder(前几章反复调用的 _builder.create_* 的 C++ 真身)、main.cc 的 PYBIND11_MODULE 把 ir/passes/interpreter/llvm/backends 装配成 _C 扩展(TRITON_BACKENDS_TUPLE 由 CMake 注入)、passes.cc 暴露 add_* pass 注册、interpreter.cc 的按掩码聚散——坐实「Python create_* → C++ builder → MLIR op」这条全书最贴身的双语接缝。姊妹篇 ascend 的「Python 契约↔C++ 执行」逐章对位正走这条缝(backend_seam)。",
+      "part": "part-4",
+      "subsystem": "compiler-driver",
+      "key_source_paths": [
+        "python/src/ir.cc",
+        "python/src/main.cc",
+        "python/src/passes.cc",
+        "python/src/interpreter.cc",
+        "python/src/llvm.cc"
+      ],
+      "deps": [
+        "ch16"
+      ],
+      "est_size": "M",
+      "mode": "meta",
+      "kind": "skip_impl"
+    },
+    {
+      "chapter_id": "ch19",
+      "slug": "ch19-tt-dialect-vocabulary",
+      "title": "tt.* 词汇表与方言黏合层：硬件无关的张量 IR",
+      "focus": "读懂任何一段 TTIR/TTGIR dump 的入门词典：Triton 方言(tt.*)作为最上层 IR 的算子(load/store/dot/reduce/scan/make_range/splat/broadcast/expand_dims/reshape/trans/join/split/addptr/make_tensor_ptr/atomic_*)与类型系统(PointerType/MemDescType/TensorPtr)，这层张量只有 shape+dtype、encoding 通常为空——任何后端都认；关键 trait 的语义承诺(Pure 让 op 可 CSE/DCE、SameOperandsAndResultEncoding 让布局沿数据流传播、TensorSizeTrait 限 2^20 元素防寄存器爆炸、VerifyTensorLayoutsTrait 统一布局合法性闸门)与 dependentDialects/dialect 注册这一后端登记口。trans op 的 doc 为布局章埋钩子。",
+      "part": "part-5",
+      "subsystem": "ir-dialects",
+      "key_source_paths": [
+        "include/triton/Dialect/Triton/IR/TritonOps.td",
+        "include/triton/Dialect/Triton/IR/TritonTypes.td",
+        "include/triton/Dialect/Triton/IR/TritonAttrDefs.td",
+        "include/triton/Dialect/Triton/IR/Traits.h",
+        "lib/Dialect/Triton/IR/Ops.cpp"
+      ],
+      "deps": [
+        "ch03",
+        "ch14"
+      ],
+      "est_size": "L",
+      "mode": "meta",
+      "kind": "skip_impl",
+      "backend_seam": true
+    },
+    {
+      "chapter_id": "ch20",
+      "slug": "ch20-layout-is-a-function",
+      "title": "布局即函数：GPU 张量凭什么和普通张量不同",
+      "focus": "整个 TritonGPU 布局系统的钥匙(primer)：TritonGPU 张量类型多出的 encoding 属性其正式定义就是一个函数 L——把张量多维索引 i 映射到『允许访问该处数据的 CUDA 线程集合』(TritonGPUAttrDefs.td 白纸黑字)。两大类布局的分野(distributed 分散在寄存器 / shared 在共享内存所有线程可见)、distributed 的四级计算层次 CTA→Warp→Thread→Value、以及『同一元素可被多线程持有(broadcast)、一线程持有多元素(wrap-around)』的映射语义；模块契约 num-warps/num-ctas/threads-per-warp 决定线程总数。全程用『把张量画成格子、每格填线程号』把抽象函数 L 变成一张可核对的表。",
+      "part": "part-5",
+      "subsystem": "ir-dialects",
+      "key_source_paths": [
+        "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+        "include/triton/Dialect/TritonGPU/IR/TritonGPUDialect.td"
+      ],
+      "deps": [
+        "ch19",
+        "ch02"
+      ],
+      "est_size": "M",
+      "mode": "meta",
+      "kind": "primer"
+    },
+    {
+      "chapter_id": "ch21",
+      "slug": "ch21-distributed-layouts",
+      "title": "Distributed 布局：Blocked、Slice、MMA 与 DotOperand 编码",
+      "focus": "承 primer，把 distributed 布局的具体形态走一遍：BlockedEncodingAttr 用 sizePerThread/threadsPerWarp/warpsPerCTA/order 三元组把张量切成『每线程一块连续元素』促成访存合并、自动推导 builder 从 shape+numWarps 反解各级 tile、getElemsPerThread 等布局算术(CPU 可查、难得可验)；SliceEncodingAttr 对 parent 挤掉一维作为 expand_dims 的逆；由矩阵乘硬件指令强制的 NvidiaMmaEncodingAttr(versionMajor/Minor 区分 Volta/Ampere/Hopper)与 DotOperandEncodingAttr(opIdx/parent/kWidth)。核心配对脊柱：AMDMfma/AMDWmmaEncodingAttr 与 Nvidia 编码同继承 DistributedEncoding、并排住在同一 .td——后端新增自有矩阵乘布局族的现成样板。",
+      "part": "part-5",
+      "subsystem": "ir-dialects",
+      "key_source_paths": [
+        "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+        "lib/Dialect/TritonGPU/IR/Dialect.cpp"
+      ],
+      "deps": [
+        "ch20"
+      ],
+      "est_size": "L",
+      "mode": "meta",
+      "kind": "skip_impl",
+      "backend_seam": true
+    },
+    {
+      "chapter_id": "ch22",
+      "slug": "ch22-shared-encoding-swizzle",
+      "title": "Shared 编码与 swizzle：共享内存里如何避开 bank 冲突",
+      "focus": "与 distributed 完全不同的第二套心智模型：SharedEncodingAttr 用 vec/perPhase/maxPhase/order/hasLeadingOffset 描述共享内存元素的 xor swizzle 排布（为什么把 in[r][c] 存到 out[r][c^phase] 就能消除 bank 冲突，用 .td 里现成的五个逐步加料例子手算佐证）；那个按 dotOperand+mma 版本(MFMA/WMMA/Volta/Ampere/Hopper)自动推导 swizzle 参数的巨型 builder——讲清『swizzle 参数不是拍脑袋、是被目标 mma 指令的共享内存访问模式反推出来的』；CTALayoutAttr(CTAsPerCGA/CTASplitNum/CTAOrder)描述 Hopper CGA 里张量在多 CTA 间的切分与 multicast。",
+      "part": "part-5",
+      "subsystem": "ir-dialects",
+      "key_source_paths": [
+        "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+        "lib/Dialect/TritonGPU/IR/Dialect.cpp"
+      ],
+      "deps": [
+        "ch20"
+      ],
+      "est_size": "M",
+      "mode": "meta",
+      "kind": "skip_impl"
+    },
+    {
+      "chapter_id": "ch23",
+      "slug": "ch23-linear-layout",
+      "title": "LinearLayout：一个抽象统一所有布局",
+      "focus": "本子系统的思想高潮(primer)：把任意布局都看成 GF(2) 上『硬件位置(reg,lane,warp,block)→逻辑张量索引』的线性函数，只需给出 2 的幂次输入点的基向量(bases)、其余全靠 xor 线性律 L(a⊕b)=L(a)⊕L(b) 推出（用 LinearLayout.h 顶部的 4x4 swizzle 例子让读者亲手用线性律填表）；为何它能把 transpose/swizzle/broadcast 统一成同一族线性函数的不同基、为何选『硬件位置→张量索引』方向、surjective 但一般非 injective；LinearLayoutConversions 的 toLinearLayout 如何把 blocked/mma/shared 编码翻成 LL、chooseShemLayoutForRegToRegConversion 如何为 convert_layout 描述共享内存中转。Triton 正走向用 LL 取代所有具体布局类的终局。",
+      "part": "part-5",
+      "subsystem": "ir-dialects",
+      "key_source_paths": [
+        "include/triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h",
+        "include/triton/Tools/LinearLayout.h",
+        "lib/Dialect/TritonGPU/IR/LinearLayoutConversions.cpp"
+      ],
+      "deps": [
+        "ch21",
+        "ch22"
+      ],
+      "est_size": "L",
+      "mode": "meta",
+      "kind": "primer",
+      "flagship": true
+    },
+    {
+      "chapter_id": "ch24",
+      "slug": "ch24-ttg-ttng-operations",
+      "title": "ttg.* 与 ttng.* 算子：布局转换、异步拷贝与 Hopper 硬件方言",
+      "focus": "张量带上布局后开始与共享内存/异步/硬件打交道的操作词汇。ttg 层：convert_layout(唯一真正在线程间搬数据的 op，其它 trans/reshape 只是给元素改名，须回扣 tt.trans doc)、共享内存生命周期(local_alloc/dealloc/load/store+memdesc_subview)、async_copy_global_to_local+commit_group+async_wait 的 cp.async 三件套(用 async.token 串 SSA 依赖)、upcast_mxfp。ttng 层作为『硬件专属方言』样板：warp_group_dot(WGMMA)、async_tma_copy(TMA)、mbarrier 全家桶、cluster 同步、warp-specialization 的 create_token/producer/consumer 流水词汇。核心配对脊柱：整个 TritonNvidiaGPU 方言就是 triton-ascend NPU 硬件方言逐结构对位的样板。",
+      "part": "part-5",
+      "subsystem": "ir-dialects",
+      "key_source_paths": [
+        "include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td",
+        "include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td",
+        "lib/Dialect/TritonGPU/IR/Dialect.cpp"
+      ],
+      "deps": [
+        "ch19",
+        "ch23"
+      ],
+      "est_size": "M",
+      "mode": "meta",
+      "kind": "skip_impl",
+      "backend_seam": true
+    },
+    {
+      "chapter_id": "ch25",
+      "slug": "ch25-axisinfo-and-coalesce",
+      "title": "AxisInfo 与 Coalesce：静态分析驱动改写的最短闭环",
+      "focus": "所有访存优化的静态真相源——AxisInfo 用 MLIR 稀疏前向数据流为每个张量的每根轴推断 contiguity/divisibility/constancy 三元组（格的 join 就是逐轴 gcd、悲观初值来自函数参数的 tt.divisibility/contiguity 提示、几十个 per-op 访问器前向传播，ModuleAxisInfoAnalysis 基于 CallGraph 跨函数）；紧接着第一个消费它的 pass——Coalesce 按指针 contiguity 的 argSort 定 order、聚合同 order 访存取最大 perThread、夹在 numElems/numThreads 与 128-bit 之间，产出让 warp 内访存合并最优的 BlockedEncodingAttr 并用 convert_layout 前后夹住原 op。AxisInfo 的格+gcd-join+几个访问器是本子系统唯一适合做独立 Python 玩具模型的单元。",
+      "part": "part-6",
+      "subsystem": "analysis-transforms",
+      "key_source_paths": [
+        "include/triton/Analysis/AxisInfo.h",
+        "lib/Analysis/AxisInfo.cpp",
+        "lib/Dialect/TritonGPU/Transforms/Coalesce.cpp",
+        "lib/Dialect/TritonGPU/Transforms/Utility.cpp"
+      ],
+      "deps": [
+        "ch19",
+        "ch09"
+      ],
+      "est_size": "L",
+      "mode": "code",
+      "kind": "deep"
+    },
+    {
+      "chapter_id": "ch26",
+      "slug": "ch26-shared-memory-allocation-membar",
+      "title": "共享内存分配与屏障：Allocation、Alias 与 Membar",
+      "focus": "convert_layout 的 scratch、显式 local_alloc、函数调用 virtual buffer 如何在有限共享内存里定址——AllocationAnalysis 用 Liveness+SharedMemoryAliasAnalysis 求每个 buffer 的活跃区间(scf.for/yield 造成的别名并入活跃期)，再按区间相交建冲突图、first-fit 计算对齐 offset，得出整个 call graph 的 sharedMemorySize；Membar 靠 buffer 区间自动插 barrier——BlockInfo 维护 syncRead/syncWrite 区间集，只在写后读/读后写且区间相交处插屏障(WAW 因不重叠分配天然不可能、RAR 不需要)，MembarFilterFn 允许后端豁免(接缝)。这些分析结果被后面的降级(ch33)直接消费。",
+      "part": "part-6",
+      "subsystem": "analysis-transforms",
+      "key_source_paths": [
+        "include/triton/Analysis/Allocation.h",
+        "lib/Analysis/Allocation.cpp",
+        "include/triton/Analysis/Alias.h",
+        "lib/Analysis/Alias.cpp",
+        "include/triton/Analysis/Membar.h",
+        "lib/Analysis/Membar.cpp"
+      ],
+      "deps": [
+        "ch24",
+        "ch25"
+      ],
+      "est_size": "L",
+      "mode": "meta",
+      "kind": "skip_impl"
+    },
+    {
+      "chapter_id": "ch27",
+      "slug": "ch27-tensor-core-mma-layout",
+      "title": "Tensor Core 与 MMA 布局：mma/dot-operand 编码为什么长这样",
+      "focus": "AccelerateMatmul 的前置原理章(primer)：warp 级 MMA 指令(m16n8k16 等)对操作数在寄存器/共享内存中的分布要求——把 NVIDIA PTX ISA 的 mma tile 线程/寄存器映射图忠实重绘，和 Triton 的 NvidiaMmaEncodingAttr(warpsPerCTA/instrShape/versionMajor)、DotOperandEncodingAttr(opIdx/kWidth)字段一一对应，讲清『为什么要 warpsPerTile、为什么 kWidth 这样取、为什么 MMAv3 要把操作数放共享内存』。论文/文档来源=NVIDIA PTX ISA(mma 指令)+Triton layout 设计；走 lint_paper_grounding。姊妹篇的对应 primer 会换成 ascend cube 单元的 tile 模型。",
+      "part": "part-6",
+      "subsystem": "analysis-transforms",
+      "key_source_paths": [
+        "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp",
+        "lib/Dialect/TritonGPU/Transforms/Utility.cpp"
+      ],
+      "deps": [
+        "ch21",
+        "ch02"
+      ],
+      "est_size": "M",
+      "mode": "meta",
+      "kind": "primer"
+    },
+    {
+      "chapter_id": "ch28",
+      "slug": "ch28-accelerate-matmul-layout-opt",
+      "title": "AccelerateMatmul 与布局最优化：tt.dot→MMA、减少 convert_layout",
+      "focus": "配对脊柱重灾区。BlockedToMMA 按 NVIDIA compute capability 选 MMA 版本(sm75→v1/sm8x→v2/sm90→v3)、算 warpsPerTile、给累加器/操作数换 mma+dot-operand 编码（MMAv3 特判走 WarpGroupDot+共享内存操作数，仅 f16/bf16 允许转置），外加 ScaledBlockedToMMAv2(mxfp/fp8 scaled dot 插 UpcastMXFP)与 decomposeMixedModeDotOp 混合精度兜底——整章硬绑 NvidiaMmaEncodingAttr/getNVIDIAComputeCapability/WarpGroupDotOp，ascend 必须 fork 等价 pass；紧接着 RemoveLayoutConversions 的『锚点→传播→消解冲突→重写(支配序)』四阶段(它在 make_ttgir 里出现三次)与 OptimizeDotOperands 把 trans 融进 dot 操作数的 swizzled 共享编码。",
+      "part": "part-6",
+      "subsystem": "analysis-transforms",
+      "key_source_paths": [
+        "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp",
+        "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp",
+        "lib/Dialect/TritonGPU/Transforms/OptimizeDotOperands.cpp",
+        "lib/Analysis/Utility.cpp"
+      ],
+      "deps": [
+        "ch27",
+        "ch21",
+        "ch25"
+      ],
+      "est_size": "L",
+      "mode": "meta",
+      "kind": "skip_impl",
+      "backend_seam": true
+    },
+    {
+      "chapter_id": "ch29",
+      "slug": "ch29-software-pipelining-primer",
+      "title": "软件流水线与模调度：num_stages 到底调度了什么",
+      "focus": "Pipeliner 群的前置原理章(primer)：软件流水线的经典理论——把循环体拆成多 stage、用模调度(modulo scheduling)让不同迭代的不同 stage 在同一物理循环体里并行，从而用 async load 隐藏访存延迟；用时空图(迭代×stage)讲清重叠，建立 stage/cluster/distance/prologue/epilogue 词汇，再落到 Triton 的 CoarseSchedule 抽象。引经典软件流水线/模调度文献(Lam 等)；走 lint_paper_grounding。模调度理论后端无关，ascend 复用同一套流水线基础设施、只是异步 copy op 不同。",
+      "part": "part-6",
+      "subsystem": "analysis-transforms",
+      "key_source_paths": [
+        "lib/Dialect/TritonGPU/Transforms/Pipeliner/SoftwarePipeliner.cpp",
+        "lib/Dialect/TritonGPU/Transforms/Pipeliner/Schedule.cpp"
+      ],
+      "deps": [
+        "ch24",
+        "ch02"
+      ],
+      "est_size": "M",
+      "mode": "meta",
+      "kind": "primer"
+    },
+    {
+      "chapter_id": "ch30",
+      "slug": "ch30-pipeline-lowering",
+      "title": "软件流水线落地：MatmulLoopPipeline 建模与 PipelineExpander 展开",
+      "focus": "num_stages 流水线的两半。建模(preProcessLoopAndGetSchedule)：识别循环里喂 dot 的 load 换成 async copy(cp.async/TMA)+多 buffer 共享内存环形缓冲、给每个 op 打 stage/cluster 标签(CoarseSchedule)、处理 MMAv3 的特殊 async、scheduleDependencies/distance-1 依赖、asyncLaunchDots+dotCanBeProperlyAsync 插 WarpGroupDot 的 wait；展开(LoopPipelinerInternal)：拿到 (op,stage) 调度表后计算每个跨 stage 值的活跃期，发射 prologue(填流水线)、改写稳态循环体(iter_args 做模变量扩展让同一 SSA 值同时代表多个在飞迭代)、发射 epilogue(排空)，支持动态循环与谓词化。PipelineExpander 完全后端无关(通用 SCF 变换)，async copy op 是 NV 语义(接缝)。",
+      "part": "part-6",
+      "subsystem": "analysis-transforms",
+      "key_source_paths": [
+        "lib/Dialect/TritonGPU/Transforms/Pipeliner/MatmulLoopPipeline.cpp",
+        "lib/Dialect/TritonGPU/Transforms/Pipeliner/PipelineExpander.cpp",
+        "include/triton/Dialect/TritonGPU/Transforms/PipelineExpander.h",
+        "lib/Dialect/TritonGPU/Transforms/Pipeliner/Schedule.cpp"
+      ],
+      "deps": [
+        "ch29",
+        "ch28",
+        "ch24"
+      ],
+      "est_size": "L",
+      "mode": "meta",
+      "kind": "skip_impl",
+      "backend_seam": true
+    },
+    {
+      "chapter_id": "ch31",
+      "slug": "ch31-prefetch-warp-specialization",
+      "title": "Prefetch、Warp Specialization 与杂项清理 pass",
+      "focus": "与软件流水线互补的操作数预取——Prefetch 对循环里单个 dot(MMAv2 或 AMD MFMA)沿 K 维把共享内存操作数切成 subview、上一轮末尾 local_load 出下一轮片、重建带额外 iter_args 的新循环让 shared→register 搬运与计算重叠(initialize 同时接受 Nvidia v2 与 AMDMfma 编码——第三方 MMA 编码挂进通用 pass 的现成范例)；Hopper 专属进阶(选读) Warp Specialization——WSTaskPartition/TaskIdPropagate/WSDataPartition/WSCodePartition/WSLowering 把循环按 async task id 拆到不同 warpgroup 各司其职(producer/consumer)、受 num_consumer_groups 门控；以及 pipeline 尾部的轻量 layout 清理(ReorderInstructions/ReduceDataDuplication/OptimizeThreadLocality/F32DotTC 的 TF32x3)。",
+      "part": "part-6",
+      "subsystem": "analysis-transforms",
+      "key_source_paths": [
+        "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp",
+        "lib/Dialect/TritonGPU/Transforms/WSCodePartition.cpp",
+        "lib/Dialect/TritonGPU/Transforms/WSTaskPartition.cpp",
+        "lib/Dialect/TritonGPU/Transforms/ReorderInstructions.cpp",
+        "lib/Dialect/TritonGPU/Transforms/ReduceDataDuplication.cpp",
+        "lib/Dialect/TritonGPU/Transforms/F32DotTC.cpp"
+      ],
+      "deps": [
+        "ch30",
+        "ch28"
+      ],
+      "est_size": "L",
+      "mode": "meta",
+      "kind": "skip_impl",
+      "backend_seam": true
+    },
+    {
+      "chapter_id": "ch32",
+      "slug": "ch32-lowering-ladder-ttir-to-ttgir",
+      "title": "五级台阶与第一跳 TTIR→TTGIR：给每个张量贴上布局",
+      "focus": "降级链的定向地图 + 第一跳。CUDABackend.add_stages 注册五段(make_ttir/ttgir/llir/ptx/cubin)、每段建一个 MLIR pass_manager 或 shell 到 ptxas、以 metadata 串联，这个文件就是主要后端接缝(load_dialects 挂 NVGPU dialect、add_stages 注入 stage 回调、CUDAOptions/GPUTarget 带 num_warps/capability)；ConvertTritonToTritonGPUPass 用 dialect-conversion 框架把无布局张量默认贴成 Blocked 编码(getDefaultBlockedEncoding)，并逐算子推导返回布局——TritonExpandDimsPattern 插 SliceEncoding、TritonDotPattern 把两操作数强制成 DotOperandEncoding 并插 ConvertLayoutOp 胶水，ConversionTarget 把 tt.dot 标记为『两操作数都 DotOperand 编码后才合法』驱动重写。 补齐降级阶梯第一段:make_ttir 的 TTIR 级 pass(RewriteTensorPointer——回扣 block pointer 章教的 tt.make_tensor_ptr 在这里被降解掉、Combine 窥孔合并;ReorderBroadcast/LoopUnroll 一句带过)。",
+      "part": "part-7",
+      "subsystem": "conversion-lowering",
+      "key_source_paths": [
+        "third_party/nvidia/backend/compiler.py",
+        "lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp",
+        "lib/Conversion/TritonToTritonGPU/TritonGPUConversion.cpp",
+        "lib/Dialect/Triton/Transforms/RewriteTensorPointer.cpp",
+        "lib/Dialect/Triton/Transforms/Combine.cpp"
+      ],
+      "deps": [
+        "ch19",
+        "ch21",
+        "ch14"
+      ],
+      "est_size": "L",
+      "mode": "meta",
+      "kind": "skip_impl",
+      "backend_seam": true
+    },
+    {
+      "chapter_id": "ch33",
+      "slug": "ch33-convert-layout-lowering",
+      "title": "第二跳的地基：类型塌缩与 ConvertLayoutOp 的三条搬运路径",
+      "focus": "TTGIR→LLVM 的脊柱。TritonGPUToLLVMTypeConverter 把带布局张量塌缩成 LLVM struct-of-N-elements(shared/memdesc 塌成 {ptr,offsets,strides}、fp8→i8)，两阶段 applyPartialConversion(先 func 后 ops)把几十个 populate*Patterns 按 PatternBenefit 排序拼进去(TargetInfo 注入是后端接缝)；ConvertLayoutOp 的降级——用 LinearLayout 相除得最小转换，据 register/lane/warp/block 哪一维参与选路：纯寄存器重排(同线程零流量)、warp shuffle、或共享内存往返(transferWithinBlock，src/dstLayout.invertAndCompose(sharedLayout) 给出精确 shmem 地址、chooseStMatrixLayout 走 stmatrix 快路径、padding 防 bank 冲突)，并存的 legacy Blocked/Mma 路径(FIXME [Dot LL] 迁移中，须讲清为何两路共存)。",
+      "part": "part-7",
+      "subsystem": "conversion-lowering",
+      "key_source_paths": [
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp",
+        "lib/Conversion/TritonGPUToLLVM/TypeConverter.cpp",
+        "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp",
+        "lib/Conversion/TritonGPUToLLVM/Utility.cpp"
+      ],
+      "deps": [
+        "ch32",
+        "ch23"
+      ],
+      "est_size": "L",
+      "mode": "meta",
+      "kind": "skip_impl",
+      "backend_seam": true
+    },
+    {
+      "chapter_id": "ch34",
+      "slug": "ch34-shared-memory-and-vectorized-loads",
+      "title": "共享内存降级与全局访存向量化",
+      "focus": "AllocateSharedMemory pass 用 ModuleAllocation 把每个 buffer 的 offset 以 allocation.offset 属性钉到 op 上、总量写进 triton_gpu.shared，降级期 initSharedMemory 建单个 global_smem extern 数组供所有分配 gep 索引、ModuleMembarAnalysis+canSkipBarSync 决定屏障(把 ch25 分析结果落地)；MemoryOpToLLVM 把分布式张量写进/读出 swizzle 过的共享内存(storeDistributedToShared 按 SharedEncoding order 换相、LocalLoadOpConversion 的 ldmatrix 加载器喂 dot)；LoadStoreOpToLLVM 是访存带宽的战场——getVectorSize=min(128/bitwidth, AxisInfo.getPtrContiguity) 再被 getMaskAlignment 夹，拼出带 predicate/cache-modifier/evict-policy 的 ld/st.global 内联 PTX，redundantDataMask 阻止复制数据的线程重复写。",
+      "part": "part-7",
+      "subsystem": "conversion-lowering",
+      "key_source_paths": [
+        "lib/Conversion/TritonGPUToLLVM/AllocateSharedMemory.cpp",
+        "lib/Conversion/TritonGPUToLLVM/MemoryOpToLLVM.cpp",
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp"
+      ],
+      "deps": [
+        "ch33",
+        "ch25",
+        "ch26"
+      ],
+      "est_size": "L",
+      "mode": "meta",
+      "kind": "skip_impl"
+    },
+    {
+      "chapter_id": "ch35",
+      "slug": "ch35-dot-lowering-and-ptx-exit",
+      "title": "矩阵乘指令选择、逐元素/归约降级与 LLVM→PTX 出口",
+      "focus": "per-op 降级的尾段与出口。DotOpToLLVM 按结果的 NvidiaMma 布局版本分派——Volta→mma.884/Turing→mma.1688/Ampere→mma.16816/Hopper WarpGroupDot→wgmma，非 mma 走 FMA 兜底(MMAv2 的 ValueTableV2 与 kWidth=8 拆 mma)；ElementwiseOpConversionBase 的通用套路(拆 struct→unpackI32→per-element→repack)与 NVIDIA fp8↔fp16/bf16 数值转换；ReduceOp/ScanOp 把 combine region 落成 warp 内 shfl.bfly 树+warp 间共享内存(scan 的 Kogge-Stone)；每条硬件指令都由 PTXBuilder 拼成 llvm.inline_asm，NVGPUToLLVMPass 把 NVGPU dialect 高层 op 批量降成 inline asm(第三方 dialect 挂载接缝)；最后 LLVMIRBreakPhiStruct 拆结构体 phi、make_llir/ptx/cubin 把 MLIR-LLVM 翻成真 LLVM IR→nvptx 出 PTX→shell 到 ptxas 出 cubin，闭合五级阶梯。",
+      "part": "part-7",
+      "subsystem": "conversion-lowering",
+      "key_source_paths": [
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM.cpp",
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ElementwiseOpToLLVM.cpp",
+        "lib/Conversion/TritonGPUToLLVM/ReduceOpToLLVM.cpp",
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/PTXAsmFormat.cpp",
+        "lib/Target/LLVMIR/LLVMIRBreakPhiStruct.cpp"
+      ],
+      "deps": [
+        "ch34",
+        "ch21",
+        "ch17"
+      ],
+      "est_size": "L",
+      "mode": "meta",
+      "kind": "skip_impl",
+      "backend_seam": true
+    },
+    {
+      "chapter_id": "ch36",
+      "slug": "ch36-cuda-backend-stages",
+      "title": "CUDABackend：把五段 stages 注入编译管线",
+      "focus": "把前面散落的后端接缝收成落地端。CUDAOptions(num_warps/num_stages/cluster_dims/ptx_version/supported_fp8_dtypes)+__post_init__(注入 libdevice extern_lib、校验 num_warps 是 2 的幂)+capability 启发式(sm89 加 fp8e4nv 等)；add_stages 是主角——五段 lambda 按序登记、compiler.compile 逐段跑并落缓存，make_ttgir 的 pass 流水线按 capability//10 分档注入(f32_dot_tc/accelerate_matmul/warp-spec 四连/add_pipeline(num_stages)/fence_insertion/tma_lowering)，把 ch27-30 的 pass 串成真实序列；load_dialects→nvidia.load_dialects(ctx) 与 triton_nvidia.cc 的 init_triton_nvidia 注册成对讲(C++/Python 双语接缝)。核心配对脊柱：ascend 后端就是提供自己的 add_stages(最后一段产出昇腾二进制)+load_dialects(挂 ascend dialect)。",
+      "part": "part-8",
+      "subsystem": "backends-hw",
+      "key_source_paths": [
+        "third_party/nvidia/backend/compiler.py",
+        "third_party/nvidia/triton_nvidia.cc",
+        "python/triton/compiler/compiler.py"
+      ],
+      "deps": [
+        "ch14",
+        "ch28",
+        "ch29",
+        "ch32"
+      ],
+      "est_size": "L",
+      "mode": "meta",
+      "kind": "skip_impl",
+      "backend_seam": true,
+      "flagship": true
+    },
+    {
+      "chapter_id": "ch37",
+      "slug": "ch37-ptx-to-cubin-and-launch",
+      "title": "从 PTX 到 cubin 到发射：ptxas、二进制装载与 launcher",
+      "focus": "编译管线最后两段与发射的落地(toolchain 外部依赖最密)。make_ptx 用 llvm.translate_to_asm 出 PTX 并做版本/调试后处理，make_cubin 起 ptxas 子进程(-v 拿寄存器占用、--gpu-name=sm_XX、返回码/SIGSEGV 错误分类)；driver.c 的 loadBinary 用 cuModuleLoadData 装载、cuFuncGetAttribute 读回 n_regs/n_spills、按 >48KB 阈值 cuFuncSetAttribute 开 opt-in 动态共享内存；CudaLauncher 用 make_launcher 按核签名动态生成一段 C 扩展(PyArg 解析、getPointer 取 data_ptr、cuLaunchKernel 或 cluster 场景 dlsym cuLaunchKernelEx)、compile_module_from_src 编成缓存 .so；occupancyMaxActiveClusters 算 cluster 占用率。CudaDriver 作为 GPUDriver 落地(get_current_target 组 GPUTarget、is_active 判 torch.cuda 且非 hip)——ascend 提供自己的 Driver 与 launcher_cls。",
+      "part": "part-8",
+      "subsystem": "backends-hw",
+      "key_source_paths": [
+        "third_party/nvidia/backend/compiler.py",
+        "third_party/nvidia/backend/driver.c",
+        "third_party/nvidia/backend/driver.py"
+      ],
+      "deps": [
+        "ch36",
+        "ch11"
+      ],
+      "est_size": "M",
+      "mode": "meta",
+      "kind": "skip_impl",
+      "backend_seam": true
+    },
+    {
+      "chapter_id": "ch38",
+      "slug": "ch38-amd-hip-backend",
+      "title": "对照落地：AMD HIP 后端——同一抽象的第二种实现",
+      "focus": "把 AMD 后端与 NVIDIA 逐面对照，坐实『6 个方法两种落地』这一姊妹篇脊柱：HIPOptions 的差异字段(waves_per_eu/matrix_instr_nonkdim/kpack/warp_size 按 gfx 档定 32/64)、add_stages 走 make_amdgcn/make_hsaco(amdgcn→amd.assemble_amdgcn→ld.lld 出 hsaco 而非 ptxas/cubin)、make_ttgir 用 amd.passes.ttgpuir.add_accelerate_matmul(arch,matrix_instr_nonkdim,kpack)+has_matrix_core 时 add_stream_pipelinev2、make_llir 设 AMDGPU control constants、HIPAttrsDescriptor 覆写 _add_backend_properties 加 pointer_range=32 启用 buffer load/store(后端专属特化)、load_dialects 挂 amd dialect。收口成一张对照表：6 方法骨架不变、Options/pass 序列/二进制格式/装载器血肉各异——这正是 triton-ascend 昇腾后端的施工图。",
+      "part": "part-8",
+      "subsystem": "backends-hw",
+      "key_source_paths": [
+        "third_party/amd/backend/compiler.py",
+        "third_party/amd/backend/driver.py",
+        "python/triton/backends/compiler.py"
+      ],
+      "deps": [
+        "ch36",
+        "ch37"
+      ],
+      "est_size": "M",
+      "mode": "meta",
+      "kind": "skip_impl",
+      "backend_seam": true,
+      "flagship": true
+    },
+    {
+      "chapter_id": "ch39",
+      "slug": "ch39-proton-profiling-and-benchmark",
+      "title": "度量：proton launch 钩子、roofline viewer 与 do_bench",
+      "focus": "剖析器如何零侵入钩进每次发射——CompiledKernel.launch_enter_hook/exit_hook 这对类级钩子+launch_metadata+LazyDict 惰性求值，让 register_triton_hook() 在不改一行核代码的前提下于每次 kernel.run 前后各插一次 scope 并把用户 metadata_fn 的 flops/bytes 挂上去；proton 会话状态机(start→activate/deactivate→finalize、_select_backend 的 cuda→cupti/hip→roctracer 是姊妹篇 tracer 接缝)；viewer 把 hatchet 调用树的原始计数派生成 flop/s、byte/s 与 util=roofline 屋顶模型(可喂仓库自带 example_*.json 无 GPU 跑)；do_bench 是全书 benchmark 秒表——估时→定 warmup/repeat→每次 zero L2 防缓存污染→CUDA events→取分位，get_benchmarker 正是 autotuner 的计时来源(后端接缝)。 显式交代:csrc/ 的 C++ 采集引擎(Cupti/RocTracer/Session 状态机)属正交深水区,本章只到 Python 表面与 hook 接缝,选读框给两条采集路径的一句话地图,不深入(理由:采集协议与编译主线无关)。",
+      "part": "part-9",
+      "subsystem": "tooling-ecosystem",
+      "key_source_paths": [
+        "third_party/proton/proton/hook.py",
+        "python/triton/compiler/compiler.py",
+        "third_party/proton/proton/profile.py",
+        "third_party/proton/proton/viewer.py",
+        "python/triton/testing.py"
+      ],
+      "deps": [
+        "ch11",
+        "ch37"
+      ],
+      "est_size": "M",
+      "mode": "code",
+      "kind": "deep",
+      "backend_seam": true
+    },
+    {
+      "chapter_id": "ch40",
+      "slug": "ch40-aot-compile-link-disasm",
+      "title": "部署与读产物：AOT compile/link 与 SASS 反汇编",
+      "focus": "把核脱离 Python 部署，并读懂它编成了什么。compile.py 把一个 @triton.jit 核+cubin 烙成自包含 C——解析『带整除性提示的签名』(*fp32:16, i32:16, 1024)、把 :16/:1 喂给 AttrsDescriptor.from_hints、区分 constexpr 常量与运行期参数、走 triton.compile 拿 cubin、binascii.hexlify 内嵌进 compile.c/h 模板(把『特化』落到一条命令行)；link.py 的 HeaderParser 解析 tt-linker 头指令、生成按运行期整除性(val%16==0)/(val==1) 分派的 C 入口(compute_spec_key 的 AOT C 化身)；disasm.py 调 cuobjdump -sass、parseCtrl 解出每条指令的 64 位控制字(stall/yield/barrier/wait mask)、BRA→LBB 重标，接到 compiler 的 AsmDict['sass'] 惰性反汇编。签名解析/link 纯字符串生成无 GPU 可跑。",
+      "part": "part-9",
+      "subsystem": "tooling-ecosystem",
+      "key_source_paths": [
+        "python/triton/tools/compile.py",
+        "python/triton/tools/compile.c",
+        "python/triton/tools/link.py",
+        "python/triton/tools/disasm.py"
+      ],
+      "deps": [
+        "ch14",
+        "ch37"
+      ],
+      "est_size": "M",
+      "mode": "code",
+      "kind": "deep"
+    },
+    {
+      "chapter_id": "ch41",
+      "slug": "ch41-mlir-tools-and-tutorials",
+      "title": "调试与学习：triton-opt 家族、tensor-layout 探针与 tutorials 阶梯",
+      "focus": "编译器工程师的调试工作流与读者 on-ramp。bin/ 下 triton-opt/triton-reduce/triton-lsp/triton-llvm-opt 都是 MLIR 标准入口的几行薄壳，真正承重的是 RegisterTritonDialects.h——把 Triton/TritonGPU/TritonNvidiaGPU/AMD 全部 dialect 与所有 pass 注册进一个 registry(triton-ascend 挂第三方 dialect+pass 的配对脊柱，一个新后端要能被 triton-opt 调试就必须在此注册)；triton-tensor-layout 给一个 layout 字符串+tensor 类型，用 getLayoutStr 打印每个元素落在哪个线程/寄存器(tensor 视角 vs hardware/warp 视角)——ch19-22 布局章最好的动手教具；最后盘点 tutorials 01→09 阶梯(vector-add→fused-softmax→matmul→layer-norm→fused-attention→persistent/TMA)作为各子系统可复用的真实叙事素材与学习路径。 显式交代:test/(lit 回归基建)与 unittest/(C++ gtest)属开发基建、不入书,但给一段「怎么用 lit 复现一个 pass 测试」的选读,读者调试 pass 时用得上。",
+      "part": "part-9",
+      "subsystem": "tooling-ecosystem",
+      "key_source_paths": [
+        "bin/RegisterTritonDialects.h",
+        "bin/triton-opt.cpp",
+        "bin/triton-tensor-layout.cpp",
+        "python/tutorials/01-vector-add.py",
+        "python/tutorials/03-matrix-multiplication.py",
+        "python/tutorials/06-fused-attention.py"
+      ],
+      "deps": [
+        "ch19",
+        "ch20",
+        "ch03"
+      ],
+      "est_size": "M",
+      "mode": "meta",
+      "kind": "skip_impl",
+      "backend_seam": true
+    }
+  ]
+}

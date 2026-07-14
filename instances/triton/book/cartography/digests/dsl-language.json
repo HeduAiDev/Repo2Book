@@ -1,0 +1,147 @@
+{
+  "subsystem": "dsl-language",
+  "scope": "python/triton/language/ (core.py, semantic.py, standard.py, math.py, random.py, _utils.py, extra/) + python/triton/__init__.py export face",
+  "source_version": "Triton v3.2.0",
+  "role": "读者进入 Triton 的入口层：tl.* 编程模型、编译期/运行期分野、类型与广播规则、builtin 如何桥到 IR builder。全书后续所有 kernel 都用这套表面书写。",
+  "mainline": "读者带着一个问题走进来：『我在 @triton.jit 里写的 x = tl.load(ptr + offs, mask) 这行 Python，到底是什么？它不是在跑，而是在被追踪成 IR。』这一子系统就是这条追踪管线的『前端语言层』。故事从入口的两层结构讲起——tl.* 里的每个名字要么是 @builtin(追踪期由 JIT 注入 _builder，桥到 C++ IR builder），要么是 @jit 的纯 Triton 函数（standard/math/random，用 core 原语自举）。接着建立世界观的三块基石：constexpr（编译期已知值，驱动形状与循环展开）、dtype/pointer/block 三层类型（到 MLIR type 的下降）、tensor（handle+type 的载体，重载所有运算符）。有了基石，就能讲清 Triton 最反直觉也最核心的两条隐式语义——类型提升（混合 C 的 usual arithmetic conversions 与 PyTorch 的标量降级规则）和隐式广播（block 与 scalar、block 与 block 的形状对齐），它们藏在每个 x+y 背后。再往上是编程模型的动作面：program_id/arange 把 grid 坐标变成 block；load/store 用『指针+mask』访存（legacy 与 block-pointer 两条路径，外加 TMA descriptor）；dot 做块级矩阵乘；reduce/scan 把用户 combine_fn 变成 IR region。最后揭示这层语言是可自举的：standard.py 的 softmax/sort、random.py 的 philox，全是用前面的原语写成的普通 Triton 代码。读者走出去时应当懂得：tl.* 不是运行时库，而是一套『在 JIT 追踪期把 Python 表达式翻译成 Triton IR』的领域语言；每个 builtin 的职责是做 Python 侧的类型/形状校验与合法化，然后调用 builder.create_* 把真正的算子交给 C++/MLIR 层——这就是全书反复出现的『双语栈接缝』的第一现场。",
+  "units": [
+    {
+      "title": "编程模型入口：tl.* 的两层结构与 @builtin 的 _builder 契约",
+      "focus": "讲透 import triton.language as tl 背后的组织方式，以及 builtin 如何在 @triton.jit 追踪期拿到 _builder 桥到 IR builder（不写 @triton.jit 直接调用会报错）。",
+      "expanded": "这是全书的取景框章节。__init__.py 用 isort:skip_file 强制导入顺序，把 core/standard/math/random 的符号铺成 tl.* 表面并维护 __all__。核心机制是 core.py 的 @builtin 装饰器：wrapper 检查 kwargs 里有没有 _builder，没有就抛『Did you forget to add @triton.jit ?』——这揭示了 builtin 不能脱离 JIT tracing 独立运行，_builder 由 runtime.jit 在追踪每个调用点时注入。配套的 _tensor_member_fn 把自由函数注册成 tensor 的成员方法（x.sqrt() 等价 tl.sqrt(x)），is_builtin/TRITON_BUILTIN 标记用于 AST 识别。to_tensor 是标量入口。这里要点名：_builder 注入是与 runtime/jit（AST CodeGenerator）子系统的强接缝。",
+      "key_source_paths": ["python/triton/language/__init__.py", "python/triton/__init__.py", "python/triton/language/core.py"],
+      "est_size": "S",
+      "mode_hint": "skip_impl"
+    },
+    {
+      "title": "constexpr：编译期值、循环迭代器与编译期控制流",
+      "focus": "讲透编译期已知值如何贯穿类型/形状/循环展开，以及 static_range/range 作为编译期迭代器（range 还携带 num_stages 流水线提示到后端 pass）。",
+      "expanded": "constexpr 类是 Triton 编译期/运行期分野的化身：它包装一个 Python 值，重载全部算术/比较/位运算 dunder，并提供 __index__（可当形状用）和 __iter__（可迭代时才暴露）。_constexpr_to_value/_unwrap_if_constexpr 是全 codebase 到处出现的防御式解包——注释点出 interpreter 模式下常量不被 wrap，故必须处处兜底（教学易混点）。static_range 要求 start/end/step 都是 constexpr，引导编译器激进展开；range 携带 num_stages（软件流水线）与 loop_unroll_factor，只是把属性挂到循环上，真正的流水线在 MLIR pass 里完成——这是到编译器后端的跨子系统伏笔。两个迭代器的 __iter__ 都直接 raise，强调它们只在 @triton.jit 内由 AST visitor 特殊处理。",
+      "key_source_paths": ["python/triton/language/core.py"],
+      "est_size": "S",
+      "mode_hint": "deep"
+    },
+    {
+      "title": "类型系统：dtype / pointer_type / block_type 三层与到 MLIR type 的下降",
+      "focus": "讲透 Triton 标量/指针/块三层类型体系、fp8 家族的多种编码，以及 to_ir 如何把 Python dtype 下降为 builder 的 ir.type（fp8 支持依赖后端 options）。",
+      "expanded": "dtype 类枚举 SINT/UINT/FP/OTHER，为每种 fp8（e4nv/e4b8/e4b15/e5/e5b16）记录 mantissa/bitwidth/exponent_bias，并提供 is_*、kind()（bool<int<fp 的序）、get_int_max/min_value。to_ir 是关键下降点：按 name dispatch 到 builder.get_*_ty；对 fp8 会检查 builder.options.supported_fp8_dtypes / deprecated_fp8_dtypes——后端能力经 options 注入的明确接缝（ascend 在此声明自己支持哪些 fp8）。pointer_type 带 element_ty/address_space/const（const 指针不可 store）；nv_tma_desc_type 是特化指针；block_type 存 shape（int 列表，区别于 tensor 的 constexpr shape）并经 _utils.validate_block_shape 强制 2 的幂 + numel ≤ TRITON_MAX_TENSOR_NUMEL(1048576)、禁 0D。__init__.py 的 str_to_ty 把 'fp16'/'*i32' 这类签名串解析回 dtype，是 JIT 签名的桥。",
+      "key_source_paths": ["python/triton/language/core.py", "python/triton/language/_utils.py", "python/triton/language/__init__.py"],
+      "est_size": "M",
+      "mode_hint": "deep"
+    },
+    {
+      "title": "tensor：DSL 核心数据结构与运算符重载",
+      "focus": "讲透 tensor 如何以 (IR handle, type) 承载一个值、shape 为何是 constexpr 列表，以及 x+y/x<<2/x[None,:] 怎样落到 semantic。",
+      "expanded": "tensor 继承 _value（只有 handle 字段——IR 里真实存在的值，区别于 constexpr）。__init__ 从 type 推 shape（block 才有形状）、numel、dtype=type.scalar，并把 shape 元素包成 constexpr。全部魔术方法都很薄：算术 __add__/__mul__ 转发到 core 自由函数 add/mul（带 sanitize_overflow），比较/位运算/移位（含带符号选 ashr、无符号选 lshr，check_bit_width 警告移位越界）转发到 semantic。__getitem__ 只支持 None（插维，走 expand_dims）与全切片，其余 raise。.T 直接 assert『必须由 AST visitor 构造』。.to()/cast 是唯一自带实现（注释解释 core 不喜欢互调故复制 cast 逻辑）。类体尾部有一批 ... 型 stub，专供 _tensor_member_fn 注入的成员做类型提示。",
+      "key_source_paths": ["python/triton/language/core.py", "python/triton/language/semantic.py"],
+      "est_size": "M",
+      "mode_hint": "deep"
+    },
+    {
+      "title": "类型提升与隐式广播：每个 x+y 背后的语义规则",
+      "focus": "讲透两个不同 dtype/shape 的操作数如何统一——computation_type_impl 的分层规则（含标量 PyTorch 式降级）与 broadcast_impl_value/shape 的形状对齐，以及整数溢出 sanitize。",
+      "expanded": "这是本子系统最『纯 Python 且最反直觉』的深水区，几乎可脱离 GPU 单测。computation_type_impl 分六档：标量 vs 张量按 kind 降级（标量 kind ≤ 张量则不参与提升，但 / 或 % 遇 fp16/bf16 升 fp32）；fp64>fp32>fp16 逐级；bf16 仅两边都是 bf16 才保 bf16 否则 fp32；不同 fp8 → fp16；整数走 integer_promote_impl（C 的 usual arithmetic conversions 签名规则）。binary_op_type_checking_impl 是总调度：to_tensor 化标量→check_ptr_type_impl 拦非法指针运算→算 ret 类型并 cast/full→broadcast_impl_value 对齐形状。广播分 block-scalar（splat）与 block-block（补维 expand_dims + create_broadcast，1 可扩，非 1 不等则报错）。binary_op_sanitize_overflow_impl 在 <64bit 且 options.sanitize_overflow 时提到 int64 复算并 device_assert 越界。add 里还藏着 ptr+offset 交换律与 create_addptr 的指针算术。",
+      "key_source_paths": ["python/triton/language/semantic.py"],
+      "est_size": "L",
+      "mode_hint": "deep"
+    },
+    {
+      "title": "cast 与 bitcast：数值类型转换的下降选择",
+      "focus": "讲透显式 .to() / 隐式提升如何在 semantic.cast 里按源/目标 dtype 组合选择正确的 create_* 转换指令，以及 bitcast 的等宽约束与 fp8/rounding 特例。",
+      "expanded": "cast 是一个大 dispatch：先解包 constexpr dst_ty、block 情形保形状、同型早退；随后按 (src_sca_ty, dst_sca_ty) 的浮点/整数/指针/fp8 组合分派到 builder 的 create_fp_to_fp/create_int_to_ptr/create_si_to_fp 等，fp_downcast_rounding 经 _str_to_rounding_mode 映到 ir.ROUNDING_MODE.RTNE/RTZ。bitcast 要求等 primitive_bitwidth，否则报错；涉及指针时退回 cast。这层是『Python 决策 + C++ 执行』的典型：转换规则的智能全在 Python，真正的位操作在 builder。可与类型提升章配对，作为『提升算出目标类型 → cast 落地』的下半场。",
+      "key_source_paths": ["python/triton/language/semantic.py", "python/triton/language/core.py"],
+      "est_size": "M",
+      "mode_hint": "deep"
+    },
+    {
+      "title": "块的诞生与形状变换：program_id / arange / full / broadcast / reshape / join·split·permute",
+      "focus": "讲透从 grid 坐标（program_id/num_programs）到 block 张量（arange/full）的构造，以及 reshape/view/expand_dims/join/split/cat/trans/permute/broadcast_to 这一族形状算子。",
+      "expanded": "编程模型的『造块』动作面。program_id/num_programs 薄桥到 semantic（读取 3D launch grid 坐标）。arange 生成 [start,end) 且要求 2 的幂、≤ TRITON_MAX_TENSOR_NUMEL；full 用 splat 造常量块；zeros/zeros_like 在 standard 里用 full 自举。形状族：broadcast/broadcast_to（显式扩形）、expand_dims（插 1 维，_wrap_axis 处理负轴）、reshape/view（view 不重排、reshape 可 can_reorder）、join（沿新末维拼 2 个 → 末维=2）、split（末维=2 拆回 2 个，_generator 参与）、cat、trans/permute（维度重排，trans 默认逆序）、interleave（standard 里基于 join+reshape）。这些都是 Python 侧算形状、builder.create_* 落算子的模式，reshape 的 numel 不变约束是常见报错源。",
+      "key_source_paths": ["python/triton/language/core.py", "python/triton/language/semantic.py"],
+      "est_size": "L",
+      "mode_hint": "deep"
+    },
+    {
+      "title": "访存：load / store、mask / other、block pointer 与 TMA descriptor",
+      "focus": "讲透『指针+mask』访存编程模型的两条实现路径——legacy 逐元素指针（_load_legacy）与 block pointer（make_block_ptr/advance/boundary_check），以及实验性 TMA descriptor load/store。",
+      "expanded": "全书 kernel 最高频的一章。load 分派：若 ptr 是 block-pointer 走 _load_block_pointer（用 boundary_check/padding，无需 mask），否则走 _load_legacy（mask/other 广播、cache_modifier/eviction_policy/padding_option 经 _str_to_* 映到 ir 枚举、is_volatile）。store 对称（含 const 指针禁写检查）。make_block_ptr 用 base/shape/strides/offsets/block_shape/order 造 tensor-of-pointer，advance 平移；_convert_to_ir_values/_canonicalize_boundary_check 做参数规整。_experimental_descriptor_load/store 与 semantic 的 descriptor_load/store/tensormap_create/tensormap_fenceproxy_acquire 是 Hopper TMA 路径（nv_tma_desc_type）。这里 create_load/create_store/create_make_block_ptr 全落 C++，是双语栈断点最密集处；mask/boundary 两套边界处理机制的取舍是核心教学点。",
+      "key_source_paths": ["python/triton/language/core.py", "python/triton/language/semantic.py"],
+      "est_size": "L",
+      "mode_hint": "deep"
+    },
+    {
+      "title": "原子操作：atomic_* 家族、类型校验与内存序/作用域",
+      "focus": "讲透 atomic_cas/xchg/add/max/min/and/or/xor 的统一类型校验（atom_red_typechecking_impl）与 sem（内存序）、scope（作用域）参数如何经 _str_to_sem/_str_to_scope 下降。",
+      "expanded": "原子 RMW 家族。core.py 用 _add_atomic_docstr 批量生成文档，8 个 builtin 薄桥到 semantic。semantic 侧 atom_red_typechecking_impl 统一校验 ptr/val/mask 的类型与形状兼容（浮点 add 与整数 add 走不同 create_atomic_rmw op 枚举）、把 sem 字符串（acquire/release/acq_rel/relaxed）与 scope（gpu/cta/sys）映射为 ir 枚举。atomic_cas 独立处理 compare-and-swap。教学要点：原子操作的『按元素 mask + 内存序』语义，以及它与普通 store 在并发下的区别；实现仍是 Python 校验 + builder.create_atomic_* 落地。",
+      "key_source_paths": ["python/triton/language/core.py", "python/triton/language/semantic.py"],
+      "est_size": "M",
+      "mode_hint": "deep"
+    },
+    {
+      "title": "dot：块级矩阵乘、精度控制与后端能力钩子",
+      "focus": "讲透 tl.dot 如何校验 2D/3D 形状与 dtype（fp8/int8/fp16/bf16/fp32）、input_precision（tf32/ieee）与 acc/out_dtype，并点名 min_dot_size 与 fp8 支持是经 builder.codegen_fns/options 注入的后端能力接缝。",
+      "expanded": "matmul 入口。semantic.dot 做大量断言：两操作数须都是 block、dtype 组合合法（fp8xfp8 任意组合、否则同型且属受支持集）、rank 同为 2 或 3、K 维对齐；关键接缝——assert builder.codegen_fns['min_dot_size'] 存在并用它取目标的 M/N/K 下界（后端声明自己 Tensor Core 的最小 tile），input_precision 缺省取 builder.options.default_dot_input_precision，fp8→fp32 的 max_num_imprecise_acc 取 options.max_num_imprecise_acc_default。累加器 acc 缺省 splat 0，out_dtype 决定 ret_scalar_ty（bf16 out 被禁、建议 fp32 后 cast）。dot_scaled 是 microscaling（mxfp）路径，lhs/rhs_format 经 _str_to_fp_type 映 e4m3/e5m2 等。这是后端配对脊柱重点章：ascend 需提供自己的 min_dot_size 与精度默认。",
+      "key_source_paths": ["python/triton/language/core.py", "python/triton/language/semantic.py"],
+      "est_size": "M",
+      "mode_hint": "deep"
+    },
+    {
+      "title": "归约与扫描：reduce / associative_scan / histogram 的 region 机制",
+      "focus": "讲透用户传入的 combine_fn 如何经 _generator 回调 AST code generator 变成 IR 里的 region，以及 reduce/scan 与内置 _reduce_with_indices（argmax/argmin 用）的关系。",
+      "expanded": "本子系统与 runtime/AST 层耦合最深的一章。reduce/associative_scan 都接收 combine_fn（如 lambda a,b: a+b），core 侧 builtin 带 _generator 参数——semantic.reduction/associative_scan 用 region_builder_fn 回调把 combine_fn 的 AST 重新编译进 create_reduce/create_scan 的 region body（_insertion_guard 管理 builder 插入点）。这解释了为何 combine_fn 必须是可追踪的 Triton 代码而非任意 Python。_reduce_with_indices 支撑带索引归约（argmax/argmin），_promote_bfloat16_to_float32 处理 bf16 归约精度。histogram 是特化归约。wrap_tensor 把 region 结果包回 tensor。教学难点：『高阶函数变 IR region』这一编译期回调，跨到 CodeGenerator 子系统。",
+      "key_source_paths": ["python/triton/language/core.py", "python/triton/language/semantic.py"],
+      "est_size": "M",
+      "mode_hint": "deep"
+    },
+    {
+      "title": "编译期调试、断言与优化提示：static/device print·assert、multiple_of、max_contiguous、inline_asm",
+      "focus": "讲透编译期（static_print/static_assert）与运行期（device_print/device_assert/debug_barrier）两类诊断，以及 multiple_of/max_contiguous/max_constancy/assume 这类喂给优化器的对齐/连续性提示与 inline_asm_elementwise 逃生舱。",
+      "expanded": "两组彼此独立但都『不产生数值、只影响编译/调试』的 builtin，适合合章。诊断类：static_print/static_assert 在追踪期就求值（constexpr 驱动）；device_print（含 hex 格式、prefix）与 device_assert 在运行期由设备侧打印/断言，debug_barrier 插同步。优化提示类：multiple_of/max_contiguous/max_constancy 把『这个指针张量的值是 X 的倍数/连续 X 个/常量 X 个』作为 assumption 挂到 IR，帮助向量化与合并访存；assume 挂通用布尔假设。inline_asm_elementwise 允许内联 PTX/汇编做逐元素 op（asm/constraints/多返回 dtype），是绕过 DSL 的逃生舱。这些多为薄桥到 builder.create_*，几乎无可减内容。",
+      "key_source_paths": ["python/triton/language/core.py", "python/triton/language/semantic.py"],
+      "est_size": "M",
+      "mode_hint": "skip_impl"
+    },
+    {
+      "title": "在 Triton 里写 Triton：standard.py 标准库的自举",
+      "focus": "讲透 cdiv/softmax/ravel/max/min/argmax/sum/cumsum/cumprod/sort(bitonic)/flip/interleave/swizzle2d 如何纯用 core 原语 + @jit 组合出来，示范 DSL 的可自举性。",
+      "expanded": "这层证明 tl.* 上半部不是黑盒——全是普通 @triton.jit 函数，读者能逐行读懂并可运行观察数值。cdiv=(x+div-1)//div；softmax = x-max 再 exp/sum/fdiv（数值稳定的减最大值技巧就在这里）；reduce 家族（max/min/sum/argmax/argmin）都把 _elementwise_max 之类 combine_fn 喂给 core.reduce，argmax 用 (value,index) 元组 combine 并处理 tie-break；cumsum/cumprod 走 associative_scan；sort 是完整 bitonic sort（_compare_and_swap + _bitonic_merge，用 constexpr 驱动 log2(n) 阶段，形状必须 2 的幂）；flip/interleave/ravel/swizzle2d(grouped launch 重排) 是形状魔法。_log2/_is_power_of_two 是 constexpr 工具。此章最适合做可运行精简版并配数值轨迹（如 softmax 一行数据的逐步表）。",
+      "key_source_paths": ["python/triton/language/standard.py", "python/triton/language/core.py"],
+      "est_size": "M",
+      "mode_hint": "deep"
+    },
+    {
+      "title": "逐元素数学与 extern 库：math.py、libdevice 与后端子模块发现接缝",
+      "focus": "讲透内置数学（exp/log/sqrt… 桥到 builder.create_exp）与 extern_elementwise/dispatch 走外部 bitcode 库（libdevice）两条路径，并点名 extra/__init__.py 动态发现 cuda/hip(→ascend) 后端子模块的接缝。",
+      "expanded": "数学函数分两路。内置路（math.py）：exp/exp2/log/sqrt/sin/cos/erf/floor/ceil/fdiv/umulhi 等经 @builtin + _check_dtype（限 fp32/fp64 等）薄桥到 builder.create_exp/create_sqrt——硬件原生指令。extern 路（core.py dispatch/extern_elementwise/extern）：按 (arg dtype 元组) 在 arg_type_symbol_dict 里查 symbol，广播后调用 builder.create_extern_elementwise 链接进外部库函数。extra/libdevice.py 是一整屏 `...` 型 stub 签名（clz/popc/rint/j0/erfinv…），真正实现由各后端在构建期注入。关键接缝在 extra/__init__.py：用 pkgutil.iter_modules 在导入时动态发现并加载 extra 下的后端子包（cuda、hip），把它们注册进 sys.modules——这正是 triton-ascend 挂载自己 libdevice/后端 extra 的入口，务必作为配对脊柱显式讲。",
+      "key_source_paths": ["python/triton/language/math.py", "python/triton/language/extra/libdevice.py", "python/triton/language/extra/__init__.py", "python/triton/language/core.py"],
+      "est_size": "M",
+      "mode_hint": "deep"
+    },
+    {
+      "title": "随机数：Philox 计数器式 RNG 的纯 Triton 实现",
+      "focus": "讲透无状态 counter-based Philox 如何完全用 DSL（@jit + umulhi + 位运算）实现 randint/rand/randn，示范 standard 之外另一处自举库。",
+      "expanded": "random.py 是又一处『用 Triton 写 Triton』的样板，但领域是并行 RNG。philox_impl 跑 N_ROUNDS_DEFAULT=10 轮 Philox：按 uint32/uint64 选常量（PHILOX_KEY/ROUND magic），每轮用 math.umulhi 取 64 位乘积高位、异或、加密钥，全程 sanitize_overflow=False（RNG 需要环绕算术，是刻意关闭溢出检查的教学点）。上层 randint/randint4x 组装种子+offset 为 counter，uint_to_uniform_float 把整数位映射到 [0,1)，rand/randn（randn 经 pair_uniform_to_normal 做 Box-Muller）产浮点。无状态设计（输出只依赖 seed+offset，不需全局 RNG state）是 GPU 并行 RNG 的核心思想，可配数值轨迹展示同 seed 不同 offset 的独立性。",
+      "key_source_paths": ["python/triton/language/random.py", "python/triton/language/core.py", "python/triton/language/math.py"],
+      "est_size": "S",
+      "mode_hint": "deep"
+    }
+  ],
+  "hazards": [
+    "双语栈断点（全书第一现场）：几乎每个 builtin 最终都调用 builder.create_*，而 builder 是 _C.libtriton.ir 的 C++ 对象——create_dot/create_load/create_reduce 的真实语义在 MLIR TritonDialect，Python 层只做校验与合法化。读者在 Python 侧看到的是『把参数交出去』，实现追踪要跨到 C++/MLIR 子系统。",
+    "无 GPU / 无 builder 不可运行：绝大多数 builtin 脱离 @triton.jit 追踪上下文直接调用会抛『Did you forget to add @triton.jit ?』（因 _builder 未注入）。可脱机单测的主要是纯 Python 逻辑：类型提升 computation_type_impl、constexpr 算术、_utils 形状校验、standard/random 的算法结构（interpreter 模式部分可跑，但语义有别）。",
+    "_builder 注入魔法与 runtime/jit 耦合：@builtin wrapper 依赖 JIT 在追踪每个调用点时把 kwargs['_builder'] 塞进去；_tensor_member_fn、is_builtin/TRITON_BUILTIN 标记也服务于 AST 识别。讲 builtin 机制必然牵出 runtime.jit 的 CodeGenerator。",
+    "_generator 回调到 AST 层：reduce/associative_scan/split 的 combine_fn 通过 _generator 参数回调 code generator，把用户高阶函数重新编译成 IR region。这解释了『为何 combine_fn 必须是可追踪 Triton 代码』，是与 AST/CodeGenerator 子系统的深耦合。",
+    "constexpr 双重身份易混：正常追踪期常量包在 constexpr 里（有 .value、驱动形状/展开），但 interpreter 模式下常量不被 wrap，故 _constexpr_to_value/_unwrap_if_constexpr 到处兜底。教学时需明确区分『编译期 constexpr』与『运行期 tensor』。",
+    "类型提升规则来源混合且反直觉：computation_type_impl 混用 C 的 usual arithmetic conversions（整数签名/秩）与 PyTorch 的标量降级规则（标量 kind ≤ 张量则不参与提升），外加 fp8/bf16/除模的特例。不点明来源读者会觉得规则任意。",
+    "后端能力经 options/codegen_fns 注入（姊妹篇 triton-ascend 配对脊柱）：dtype.to_ir 依赖 builder.options.supported_fp8_dtypes/deprecated_fp8_dtypes；dot 依赖 builder.codegen_fns['min_dot_size'] 与 options.default_dot_input_precision/max_num_imprecise_acc_default；sanitize_overflow 依赖 options.sanitize_overflow；extern_elementwise 的 lib_path 指向后端 libdevice.bc。这些是后端注入自身能力的接缝。",
+    "extra 后端子模块动态发现（最强后端接缝）：extra/__init__.py 用 pkgutil.iter_modules 在导入时扫描并加载 extra/ 下的后端子包（cuda/hip），libdevice.py 只是 `...` stub 签名、真实实现由后端在构建期注入。triton-ascend 正是经此机制挂载自己的 extra/后端与 libdevice——凡讲 math/extern 章必须显式配对。"
+  ],
+  "backend_seams_for_sister_book": [
+    "extra/__init__.py: pkgutil 动态发现 cuda/hip 后端子模块 → ascend 挂载点",
+    "extra/libdevice.py: stub 签名 + 后端注入 bitcode 实现（extern_elementwise/dispatch 的目标库）",
+    "core.py dtype.to_ir → builder.options.supported_fp8_dtypes / deprecated_fp8_dtypes（后端声明 fp8 支持）",
+    "semantic.dot → builder.codegen_fns['min_dot_size']（后端声明 Tensor Core 最小 tile 下界）+ options.default_dot_input_precision / max_num_imprecise_acc_default",
+    "semantic 溢出检查 → builder.options.sanitize_overflow",
+    "range(num_stages=…) / loop_unroll_factor：DSL 只挂属性，真正软件流水线在后端 MLIR pass"
+  ]
+}

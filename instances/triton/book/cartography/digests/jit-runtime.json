@@ -1,0 +1,101 @@
+{
+  "subsystem": "jit-runtime",
+  "source_version": "Triton v3.2.0",
+  "source_root": "python/triton/runtime/ (+ backend seams in python/triton/backends/)",
+  "surveyed_files": [
+    "python/triton/runtime/jit.py (951 lines)",
+    "python/triton/runtime/autotuner.py (408)",
+    "python/triton/runtime/cache.py (295)",
+    "python/triton/runtime/driver.py (60)",
+    "python/triton/runtime/errors.py (26)",
+    "python/triton/runtime/build.py (80)",
+    "python/triton/runtime/interpreter.py (1235)",
+    "python/triton/backends/__init__.py (backend discovery)",
+    "python/triton/backends/driver.py (DriverBase / GPUDriver contract)",
+    "python/triton/backends/compiler.py (BaseBackend / AttrsDescriptor / GPUTarget seam)"
+  ],
+  "mainline": "读者带着一个具体问题走进来：我写了 `@triton.jit def kernel(...)`，然后 `kernel[grid](*args, meta=...)`——从这一行 Python 调用到 GPU 真的跑起我的核，中间到底发生了什么？顺着这条主线，读者会依次看清：(1) 装饰器把普通 Python 函数包成一个持有元数据的 JITFunction 对象，`fn[grid]` 只是记住 grid 的语法糖；(2) 每次 launch 先用一段 exec 动态生成的 binder 把实参绑定、就地算出「特化键 + 类型签名」缓存键（对齐/常量/dtype 都编进键里）；(3) 键在进程内 cache 未命中就走 compiler 子系统编译，产物同时进内存 cache 和磁盘 cache；(4) 编译/启动所需的 device、stream、target 全部经由一个可插拔的 driver 抽象取得，最终由后端 launcher 发射。围绕这条脊柱还有三条支线：autotune/heuristics 包在 launch 外层，靠实测 benchmark 或启发式函数替你挑元参数；磁盘缓存让编译产物跨进程复用；而 `TRITON_INTERPRET=1` 会把整条 GPU 路径换成一套 numpy CPU 仿真器，让你能用 pdb/print 逐行调核。走出去时，读者不但懂了这条 host 侧全链，还清楚看到一个新后端（如 ascend）是从哪个接缝——driver 抽象 + backend 发现——挂进来的。",
+  "units": [
+    {
+      "title": "@triton.jit 与 JITFunction：一个 Python 函数如何变成可发射的核",
+      "focus": "讲透装饰器如何把普通函数包成 JITFunction（解析签名成 KernelParam 列表、识别 constexpr/const 注解、抽取去装饰器的源码），以及 `fn[grid](...)` 经 KernelInterface.__getitem__ 返回记住 grid 的可调用代理这一语法糖。",
+      "key_source_paths": ["python/triton/runtime/jit.py"],
+      "est_size": "M",
+      "mode_hint": "deep",
+      "explain": "入口章。`jit()` 装饰器（jit.py:803）在 TRITON_INTERPRET 分支外返回 JITFunction。JITFunction.__init__（657）用 inspect.signature 把每个形参包成 KernelParam（230），KernelParam 的 cached_property 从注解字符串里判定 is_constexpr('constexpr' in annotation)、is_const、annotation_type（int/uint→i/u+width）。它还 textwrap.dedent + 正则切掉装饰器只留 `def ...` 源码（681），并建 `cache=defaultdict(dict)`（按 device 分桶）。KernelInterface.__getitem__（324）返回 `lambda *a,**k: self.run(grid=grid,...)`——这就是 `fn[grid](...)` 的全部魔法。本章为后续 run()/特化键/依赖哈希铺元数据地基。可配精简版：一个只保留 constexpr 识别与 __getitem__ 代理的最小 JITFunction。"
+    },
+    {
+      "title": "特化键与签名：参数如何在一次 launch 内被压成缓存键",
+      "focus": "讲透 launch 热路径的核心——create_function_from_signature 用 exec 动态生成 binder 以摊薄 launch 开销、compute_spec_key 的对齐特化（data_ptr 或值 %16==0→\"D\"、值==1→\"1\"）、mangle_type/type_canonicalisation_dict 的 dtype 编码，以及 do_not_specialize / do_not_specialize_on_alignment 如何关掉特化。显式点名 backend.compute_spec_key 接缝（后端可覆写特化策略）。",
+      "key_source_paths": ["python/triton/runtime/jit.py"],
+      "est_size": "L",
+      "mode_hint": "deep",
+      "explain": "这是全书最精妙也最烧脑的一段。create_function_from_signature（345）在 create_binder 时对每个核只跑一次，用字符串拼出 `def dynamic_func(...)` 再 exec，把 sig.bind+apply_defaults+特化 全部内联成一个原生函数（作者注释明说这占了 launch 开销的大头）。生成体里对每个非 constexpr、需特化的参数塞 `compute_spec_key(x, align=...)`；compute_spec_key（278）判 16 字节对齐（指针 data_ptr%16 或整数值%16）→\"D\"、值 1→\"1\"、否则\"N\"；类型侧 mangle_type（294）把 int 按范围编成 i32/i64/u64、tensor 经 type_canonicalisation_dict（413）规范成 *fp16/*i8 等（*k 前缀表 const 指针）。运行时 run() 里 `key = ''.join(sig_and_spec)+str((constexpr_vals,excess_kwargs))`（583）。关键接缝：func_namespace['compute_spec_key']=backend.compute_spec_key（404）——特化策略由后端注入，AttrsDescriptor.get_property_key 是默认实现，ascend/其他后端可换。教学坑：exec 生成的动态函数难读，需把生成的字符串「展开成人能读的等价体」讲。"
+    },
+    {
+      "title": "依赖哈希与全局变量守卫：源码一改，缓存为何要失效",
+      "focus": "讲透 DependenciesFinder 这个 AST 访问者如何遍历核函数、把自身与所有被传递调用的 JITFunction 源码哈希进 cache_key，并登记用到的「可疑」全局变量的值；以及 run() 尾部为何要逐个核对这些全局值没变（变了就 RuntimeError）。",
+      "key_source_paths": ["python/triton/runtime/jit.py"],
+      "est_size": "M",
+      "mode_hint": "deep",
+      "explain": "回答「我改了 kernel 源码或它引用的全局常量，Triton 怎么知道要重编」。cache_key property（717）懒构造：对 self.parse() 出的 AST 跑 DependenciesFinder（24）。visitor 用 sha256 起手于源码，visit_Name（100）挑出「非模块、非 JITFunction、非 triton builtin、非 Python 内建」的全局变量，登记 `(name,id(globals))->(val,globals)` 进 used_global_vals；_update_hash（82）遇到被调 JITFunction 就把其 cache_key（含 noinline）揉进哈希，并合并它的 used_global_vals（重叠值不一致直接报错）。最终 hash = digest+starting_line_number。run() 尾（633）在每次发射前重放这张表：`globals_dict.get(name)!=val` 就抛「Global variable 变了」。__setattr__（768）在 self.src 被 monkey-patch 时清 hash。教学价值：解释「为什么改一个 device 函数会让所有调它的核失效」「为什么运行中改全局量会突然报错」。"
+    },
+    {
+      "title": "run()：从缓存查询到编译、再到内核发射的一次完整 launch",
+      "focus": "把 JITFunction.run 作为主线胶水逐段走通：binder 绑参 → 拼 cache 键 → 内存 cache 命中/未命中 → 未命中则 parse_options+get_attrs_descriptor+ASTSource+compile 并回填双缓存 → grid 规范化（callable grid、补到 3 维）→ 经 launch_metadata 与 kernel.run 发射。显式点名 driver.active 三件套（get_current_device/stream/target）与 make_backend——这是 host 侧与 compiler/driver 子系统的总接缝。",
+      "key_source_paths": ["python/triton/runtime/jit.py"],
+      "est_size": "L",
+      "mode_hint": "deep",
+      "explain": "全书脊柱章。run()（563）：先注入 TRITON_DEBUG；从 driver.active 取 device/stream/target 并 make_backend（567）——这三个调用是跨到 driver 子系统的边界，无 GPU 即在此断裂。首帧 create_binder（547，惰性）绑好 backend 依赖的特化。binder 返回 (bound_args, sig_and_spec, constexpr_vals, non_constexpr_vals, excess_kwargs)。cache miss 时：parse_options（校验 excess_kwargs 合法性）、None→*i8 的签名修正（600，注释解释为何必须此处做否则字节指针与 None 撞键）、configs=backend.get_attrs_descriptor(...)、constants 收集（constexpr 或 attrs 判定的常量或 None）、_call_hook(before)→ASTSource→compile→写回 self.cache[device][key]（628）。发射段（638）：canonicalize grid（callable 则以 bound_args 调用）、补齐 grid_1/2、kernel.launch_metadata(...)、kernel.run(grid_0..2, stream, function, packed_metadata, ..., launch_enter/exit_hook, *non_constexpr_vals)——kernel.run 是后端 C++ launcher，双语断点。精简版可保留「binder→键→cache 查/编→发射」骨架，桩掉 compile 与 kernel.run。"
+    },
+    {
+      "title": "driver 抽象与后端发现：新后端从哪里挂进来",
+      "focus": "讲透 host 侧如何解耦具体硬件：DriverConfig+LazyProxy 惰性选出唯一 is_active 的 driver；_discover_backends 扫描 python/triton/backends/<name>/{compiler,driver}.py 并各取唯一 concrete 子类；DriverBase/GPUDriver 契约（is_active/get_current_target/get_benchmarker/get_current_device/stream）。这是与姊妹篇 triton-ascend 的配对脊柱——ascend 后端正是在 third_party/ascend 放一份 compiler.py+driver.py，经此发现机制注册、set_active 切换。",
+      "key_source_paths": ["python/triton/runtime/driver.py", "python/triton/backends/__init__.py", "python/triton/backends/driver.py"],
+      "est_size": "M",
+      "mode_hint": "deep",
+      "explain": "姊妹篇配对必讲章。driver.py 的 DriverConfig（47）持 default=LazyProxy(_create_driver) 与可切换的 active；_create_driver（5）遍历 backends 取所有 is_active() 为真的 driver，断言恰好一个。LazyProxy（12）把首次属性访问才 _init_fn() 的惰性代理——正因如此，import triton 不会强制初始化 CUDA。backends/__init__.py 的 _discover_backends（真源）os.listdir(backends 目录)，对每个子目录 _load_module 其 compiler.py 与 driver.py，用 _find_concrete_subclasses 各挑唯一非抽象子类（0 或 >1 都报错）装进 Backend(compiler, driver)。真实后端实现住在 third_party/{nvidia,amd,proton}，构建时落进 python/triton/backends/<name>/。DriverBase（backends/driver.py:11）定 is_active/get_current_target/get_benchmarker 抽象契约，GPUDriver 基类从 torch.cuda 取 device/stream。ascend 接缝：新增 backends/ascend 目录 → 发现机制零改动纳入 → is_active 命中 NPU → set_active/reset_active 切换。教学坑：真正 launcher/target 细节在 C++/第三方，本章聚焦 Python 侧的发现与抽象契约，不下钻 C++。"
+    },
+    {
+      "title": "autotune 与 heuristics：搜索配置空间、实测挑最优、裁剪与钩子",
+      "focus": "讲透 Autotuner 如何把 @autotune 叠在 @jit 之上：以 key 参数（+ 张量 dtype）为缓存键触发一轮 benchmark，用 _bench 逐个 Config 计时取最小、prune_configs（early_config_prune + perf_model/top_k）裁剪搜索空间、reset_to_zero/restore_value 的 pre/post_hook 保护被核改写的张量；并对照 Heuristics 这条轻量启发式支线。点名 driver.active.get_benchmarker 接缝（后端提供计时器）。",
+      "key_source_paths": ["python/triton/runtime/autotuner.py"],
+      "est_size": "L",
+      "mode_hint": "deep",
+      "explain": "launch 外层支线。Autotuner（14）是 KernelInterface，run（170）先 zip 出 nargs，若 configs>1 则以 `key 指定的参数值 + 各张量 dtype` 组 tuple 当 cache 键；miss 时 prune_configs（211）后对每个 config 跑 _bench（134）——_bench 组 kernel_call 里依次 config.pre_hook、self.pre_hook、self.fn.run(*args,**current)、post_hook，交给 self.do_bench 取 (0.5,0.2,0.8) 分位，OutOfResources/CompileTimeAssertionFailure 记 inf。builtins.min 选最优缓存。prune_configs：early_config_prune 先砍，再 perf_model 估时按 top_k（float≤1 视作比例）取前 k。do_bench 默认来自 driver.active.get_benchmarker()（130）——又一后端接缝。Config（244）持 num_warps/stages/ctas + warp-spec 相关字段，all_kwargs 过滤 None。reset_to_zero/restore_value 通过默认 _pre_hook/_post_hook clone/copy_ 保护会被核累加改写的张量（配 TRITON_PRINT_AUTOTUNING）。Heuristics（375）极轻：run 时对每个 value 调 heur(args dict) 注入 kwarg 再转发。教学坑：装饰器叠放顺序（autotune 在外、jit 在内），base_fn 靠 while .fn 解包；_bench 需真实 GPU。"
+    },
+    {
+      "title": "编译产物的磁盘缓存：FileCacheManager、原子写与可插拔后端",
+      "focus": "讲透跨进程复用编译产物的机制：缓存目录布局（TRITON_CACHE_DIR/HOME 下 .triton/cache/<key>）、put 用 tmp 目录 + os.replace 保证原子落盘、group 文件把一次编译的多产物组织在一起、make_so_cache_key 的键构造，以及 CacheManager 抽象如何被 Redis/Remote 后端与 TRITON_CACHE_MANAGER 环境变量替换（含 override/dump 两种特殊模式）。",
+      "key_source_paths": ["python/triton/runtime/cache.py"],
+      "est_size": "M",
+      "mode_hint": "deep",
+      "explain": "让「编译一次、永久复用」成立的一章。FileCacheManager（50）按 dump/override/普通三态选目录（default_cache_dir=HOME/.triton/cache）。put（112）先写进 `tmp.pid_<pid>_<uuid>/` 再 os.replace 到目标——POSIX 原子替换，避免并发/中断留下半截文件（作者注释点明）。get_group/put_group（87/105）用 `__grp__<name>` JSON 记 child_paths，把一个核的多份产物（IR/cubin/json 等）当一组存取。抽象层 CacheManager（28）+ get_cache_manager（264）读 TRITON_CACHE_MANAGER=\"module:Class\" 动态换实现；RemoteCacheManager（178）叠一个 backend（RedisRemoteCacheBackend 示例，206 每次都查远端以维持 LRU 记账）并用内嵌 FileCacheManager 物化到本地。make_so_cache_key（288）把 version_hash+签名(指针归一为 'ptr')+constants+ids+kwargs sha256 再 base64。教学坑：本章不依赖 GPU，可实机演示缓存目录；与 compiler 子系统耦合在「谁调 get_cache_manager 落产物」，本章讲存取机制、点到为止其被谁调用。"
+    },
+    {
+      "title": "TRITON_INTERPRET：无 GPU 也能跑核的替身执行总览",
+      "focus": "讲透 interpreter 模式的执行骨架：jit 装饰器改返 InterpretedFunction；FunctionRewriter 用 AST 变换把每个赋值包成 to_tensor；GridExecutor 把 device 张量拷到 host、_implicit_cvt 把指针实参换成 uint64 地址、_patch_lang 把 tl 的 builtin 重绑到 InterpreterBuilder，然后用三重 for 在 CPU 上串行遍历 grid 逐个 program 执行、最后把结果拷回。点明这是「无 GPU 不可运行处」的解药与 pdb 可调优势。",
+      "key_source_paths": ["python/triton/runtime/interpreter.py"],
+      "est_size": "L",
+      "mode_hint": "deep",
+      "explain": "教学价值极高的一章——它让整本书的核在无 GPU 环境可跑可调。jit()（jit.py:834）在 TRITON_INTERPRET==1 时返回 InterpretedFunction（interpreter.py:1198）。__getitem__/run 经 FunctionRewriter.rewrite_ast（1139）：inspect.getsourcelines 取源、切到 def、ASTTransformer（1109）把 `x = value` 重写成 `x = triton.language.semantic.to_tensor(value, interpreter_builder, False)`（让每个中间量都成受控 tensor），compile+exec 进核的 __globals__（缓存于 rewritten_fn）。GridExecutor.__call__（1079）：剔除 RESERVED_KWS、warmup 早退、_init_args_hst 把带 data_ptr 的实参 .cpu() 拷到 host、_patch_lang（999）遍历核 globals 里的 tl/tl.core 把所有 is_builtin 成员用 _patch_attr（681）重绑到 interpreter_builder（并 patch tensor.__bool__/__index__/T、reduce/scan）、inspect.getcallargs 绑参、_implicit_cvt（1012）把整数/指针实参转成 TensorHandle（指针即 uint64 地址）、set_grid_dim 后三重 for 遍历 (x,y,z) 每格 set_grid_idx 再 self.fn(**args) 串行执行、最后 _restore_args_dev 把 host 结果 copy_ 回 device 张量传播副作用。异常统一裹成 InterpreterError。教学坑：单线程串行 ≠ GPU 并行语义（竞争/原子在此被顺序化）；依赖 _C.libtriton.interpreter/ir（C++），是双语接触点。"
+    },
+    {
+      "title": "InterpreterBuilder：用 numpy 逐条复刻 IR 语义",
+      "focus": "讲透替身执行的语义库——InterpreterBuilder 的 create_* 方法如何把每条 Triton IR builder 操作映射成 numpy 计算：program_id/num_programs 读 grid_idx、addptr/masked_load/masked_store 把指针当 uint64 地址算术并经 C++ _interpreter 扩展真读写、BlockPointerHandle.materialize_pointers 物化 block 指针与 boundary mask、_convert_float 做 fp8/bf16 的位级降精度、ReduceOps/ScanOps 复刻规约与扫描。",
+      "key_source_paths": ["python/triton/runtime/interpreter.py"],
+      "est_size": "L",
+      "mode_hint": "deep",
+      "explain": "接上一章的语义底座。InterpreterBuilder（219）持 grid_idx/grid_dim + InterpreterOptions，暴露上百个 create_* 与 get_*_ty 方法，与真编译器的 IR builder 同名同签名，这样被 patch 后核代码里的 tl.load/tl.dot/tl.program_id 无缝落到这里。核心样例：create_get_program_id 直接返回 grid_idx[axis]；TensorHandle（18）是 (numpy data, triton dtype) 二元组，指针在 numpy 里就是 uint64 数组；create_addptr 做地址算术；create_masked_load/store（376/384）委托 C++ _interpreter.load/store 做真正的按掩码聚散读写（越界靠 other 填充）；BlockPointerHandle.materialize_pointers（57）按 strides/offsets 广播出指针网格并生成 boundary_check mask。数值硬核：_convert_float（132）纯位运算模拟 IEEE-754 降/升精度（含 subnormal、RTNE 舍入），支撑 fp8/bf16（存储为 uint8/uint16）的忠实转换；cast_impl（389）对 bf16↔fp32 走 _convert_float 否则 numpy astype。ReduceOps/ScanOps（747/843）复刻 reduce/associative_scan/histogram。教学坑：这是全书最重的双语接触面（_C.libtriton.interpreter 与 _ir 枚举映射，如 MEM_SEMANTIC/RMW_OP 表），且用 numpy 单核标量语义近似 GPU 并行——原子/竞争行为不等价，须明确边界。可配精简版：留 program_id + masked_load/store + addptr + 一个算术 op 的最小可跑仿真。"
+    }
+  ],
+  "hazards": [
+    "双语栈断点（最密）：run() 的 kernel.run / launch_metadata 是后端 C++ launcher（third_party/{nvidia,amd}），driver.active.get_current_target/stream 来自 C++/torch；interpreter 的 masked_load/store 与语义枚举来自 _C.libtriton.interpreter 与 _ir。凡涉这些下钻即出本子系统，须在接缝处收口、不追进 C++。",
+    "无 GPU 不可运行处：JITFunction.run 的编译+发射全链、autotune 的 _bench 计时都需真实 driver.active（GPU/NPU）。解药即 TRITON_INTERPRET 章——interpreter 纯 numpy CPU 可跑；cache 章的目录/原子写也可无 GPU 实机演示。素材生成需据此分流（能跑的实测、不能跑的讲清并标注）。",
+    "与 compiler/driver 子系统强耦合：run() 直接 import ..compiler 的 compile/ASTSource/make_backend，并调 backend.parse_options/get_attrs_descriptor/compute_spec_key（backends/compiler.py 的 BaseBackend/AttrsDescriptor）。特化键、attrs、options 的真正语义一半在 compiler 子系统——本子系统只讲 host 侧如何组织与调用，语义细节交叉引用 compiler 卷。",
+    "装饰器叠放顺序易误解：@autotune/@heuristics 必须叠在 @jit 之外，KernelInterface.run 链式转发；arg_names 来自最内层 jit，base_fn 靠 while .fn 逐层解包（autotuner base_fn、get_jit_fn_file_line）。讲例子时须画清这层包裹关系。",
+    "exec 动态生成代码难读：create_function_from_signature 拼字符串再 exec 出 binder，是 launch 热路径核心却最不直观；interpreter 的 FunctionRewriter 也 exec 重写后的 AST。两处都须把生成物「展开成人可读的等价函数」来讲，否则读者卡壳。",
+    "特化/守卫的隐蔽副作用：compute_spec_key 的 16 对齐特化与 v==1 特化会让「同一核不同实参」编出不同产物；used_global_vals 守卫会在运行中改了全局量时突然抛错。这些是真实用户踩坑点，须正面讲清触发条件。",
+    "姊妹篇配对脊柱（务必在 focus 显式点名）：backend 发现（backends/__init__.py 的 _discover_backends 扫 backends/<name>/{compiler,driver}.py）、driver 抽象（DriverBase/GPUDriver、set_active/reset_active）、stages 注入（BaseBackend.add_stages）、compute_spec_key/get_attrs_descriptor 后端可覆写、load_dialects/第三方 dialect 挂载——triton-ascend 全部在这些接缝上做 ascend 后端接入，第 5 章为主承载、第 2/4/6 章各点到相关接缝。"
+  ]
+}

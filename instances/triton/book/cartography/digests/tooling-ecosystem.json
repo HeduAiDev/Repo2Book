@@ -1,0 +1,118 @@
+{
+  "subsystem": "tooling-ecosystem",
+  "source_version": "Triton v3.2.0",
+  "source_root": "third_party/proton/ (profiler) + python/triton/tools/ (AOT + disasm) + bin/ (MLIR debug drivers) + python/tutorials/ + python/triton/testing.py",
+  "surveyed_files": [
+    "third_party/proton/proton/profile.py (206 lines) — session lifecycle start/activate/deactivate/finalize + profile decorator",
+    "third_party/proton/proton/scope.py (105) — scope context-manager/decorator, thread_local scope stack, enter_scope/exit_scope, enter_op/exit_op",
+    "third_party/proton/proton/hook.py (33) — TritonHook.enter/exit, register_triton_hook (THE launch seam)",
+    "third_party/proton/proton/flags.py (33) — global profiling_on / command_line state",
+    "third_party/proton/proton/proton.py (82) — `proton` CLI wrapper: run a script/pytest under profiling",
+    "third_party/proton/proton/viewer.py (321) — hatchet GraphFrame → derived metrics (flop/s, byte/s, util roofline), peak-flops/bandwidth tables",
+    "third_party/proton/csrc/Proton.cpp (82) — pybind11 boundary to libproton SessionManager (start/enter_scope/add_metrics/...)",
+    "third_party/proton/test/example_cuda.json / example_hip.json — sample profiles (viewer runs on these, no GPU)",
+    "python/triton/compiler/compiler.py:314-426 — LazyDict + CompiledKernel.launch_enter_hook/exit_hook + launch_metadata (the compiler side of the proton seam)",
+    "python/triton/tools/compile.py (156) — AOT: JITFunction → self-contained C + embedded cubin",
+    "python/triton/tools/compile.c / compile.h — C stub templates filled by compile.py",
+    "python/triton/tools/link.py (323) — AOT linker: parse tt-linker headers, generate runtime specialization dispatcher",
+    "python/triton/tools/disasm.py (145) — cuobjdump -sass wrapper, SASS control-word decode, BRA→LBB relabel",
+    "python/triton/tools/build_extern.py (365) — codegen libdevice extern-function bindings from bitcode",
+    "python/triton/tools/experimental_descriptor.py (32) — host-side TMA descriptor fill (fill_1d/2d_tma_descriptor)",
+    "bin/triton-opt.cpp / triton-reduce.cpp / triton-lsp.cpp / triton-llvm-opt.cpp — thin main() wrappers over MLIR MlirOptMain / MlirReduceMain / LSP / llvm-opt",
+    "bin/RegisterTritonDialects.h (76) — registers ALL dialects+passes incl. amd/nvidia (backend mount seam)",
+    "bin/triton-tensor-layout.cpp (231) — CLI to print a layout attribute's element↔thread mapping (getLayoutStr, HW vs tensor view)",
+    "python/triton/testing.py (512) — do_bench / do_bench_cudagraph / perf_report / Benchmark / Mark + roofline peak helpers (get_dram_gbps, get_max_tensorcore_tflops)",
+    "python/tutorials/01..09*.py (3276 total) — the tutorial ladder from vector-add to persistent/TMA matmul; cross-cutting teaching source for other subsystems"
+  ],
+  "mainline": "这个子系统回答一个和「核怎么编译/怎么发射」正交、但同样贴身的问题：核跑起来之后，我怎么『看见』它——量它多快、读它编成了什么、把它烙成能脱离 Python 部署的产物、以及照着现成的范例学会写它？读者顺着四条支线走进来：(1) 度量——proton 剖析器怎么零侵入地钩进每一次 kernel launch，把用户给的 flops/bytes 元数据攒成一棵带上下文的调用树，再用 roofline 把原始计时翻译成『你离硬件峰值还差多远』；testing.py 的 do_bench 则是全书所有 benchmark 表格背后的秒表（L2 flush + CUDA events + 分位数）。(2) 部署——tools/compile.py 把一个 @triton.jit 核连同 cubin 烙进一段自包含 C，tools/link.py 再把多份特化产物缝成一个按运行期整除性分派的入口，让核脱离 Python 进 C/C++ 工程。(3) 洞察——disasm.py 把 cubin 反汇编成带控制字的 SASS，bin/ 里的 triton-opt / triton-reduce / triton-llvm-opt 让你逐 pass 观察 MLIR 怎么被改写，triton-tensor-layout 把抽象的 layout 属性摊成一张『第几个元素落在哪个线程』的表。(4) 学习——python/tutorials 的 01→09 阶梯是全书读者的 on-ramp，也是 dsl / compiler / backend 各章可以直接复用的真实叙事素材。走出去时，读者不但会用这套工具链，还看清了两条与姊妹篇 triton-ascend 配对的脊柱：proton 的后端选择（cuda→cupti / hip→roctracer，_select_backend）和 bin/RegisterTritonDialects.h 的第三方 dialect+pass 挂载点——一个新后端（ascend/NPU）正是从这两处、以及 do_bench 背后的 driver.active.get_benchmarker，把自己接进整套工具生态。",
+  "units": [
+    {
+      "title": "Proton 全景与 launch 钩子：剖析器如何零侵入地钩进每一次发射",
+      "focus": "讲透 proton 与运行时唯一的耦合点——CompiledKernel.launch_enter_hook/exit_hook 这对类级钩子 + launch_metadata + LazyDict 惰性求值，如何让 register_triton_hook() 在不改一行核代码的前提下，于每次 kernel.run 前后各插一次 scope 进出并把用户 metadata_fn 算出的 flops/bytes 挂到该 scope。",
+      "key_source_paths": ["third_party/proton/proton/hook.py", "python/triton/compiler/compiler.py"],
+      "est_size": "M",
+      "mode_hint": "deep",
+      "explain": "子系统入口章，也是最能体现『机制之美』的一段。compiler.py 侧：CompiledKernel 上两个类变量 launch_enter_hook/launch_exit_hook（347-348，默认 None），__getitem__.runner（418）每次发射都调 launch_metadata(grid,stream,*args)（398）——若无 hook 直接返回 None（零开销）；有 hook 时构造 LazyDict（314，data|func(*args) 的惰性合并，避免不需要时白算 metadata），并 add 用户 @triton.jit(launch_metadata=metadata_fn) 挂的回调，回调收到 (grid, metadata namedtuple, arg_dict)（412）。最终 run(...) 把 launch_enter_hook/launch_exit_hook 一并传给后端 launcher（423-424），由 C++ launcher 在真正发射前后回调。proton 侧：TritonHook.enter（hook.py:12）先进一个 __proton_launch_metadata 影子 scope 触发 lazy_dict.get() 求值，再 enter_scope(metadata['name'], triton_op=True, metrics={flops*/bytes})；register_triton_hook（24）只是把这对静态方法赋给类变量——这就是全部魔法。教学价值：解释『为什么加一句 proton.start(hook=triton) 就能自动量到每个核的 flops/util，而核代码一字不改』；LazyDict 惰性是性能护栏。姊妹篇提示：hook 机制与后端无关，但 metadata namedtuple 的字段（num_warps/cluster_dims/shared）由各后端 pack_metadata 决定。可配精简版：一个最小 CompiledKernel 骨架，只保留 enter/exit hook 类变量 + LazyDict + 一次桩 run，演示钩子插入时机。"
+    },
+    {
+      "title": "会话与 scope 状态机：start/finalize 生命周期与 libproton 边界",
+      "focus": "讲透 proton 的用户面 API 与 C++ 内核的分工：Python 侧只管状态机（start→activate/deactivate→finalize 的会话、scope 作为上下文管理器/装饰器嵌套、thread_local 的 scope 栈、profiling_on/command_line 全局旗标、proton CLI 把整个脚本/pytest 跑在 profiling 下），真正的 SessionManager/树聚合全在 libproton（Proton.cpp 的 pybind 边界）。显式点名后端选择接缝 _select_backend：cuda→cupti、hip→roctracer。",
+      "key_source_paths": ["third_party/proton/proton/profile.py", "third_party/proton/proton/scope.py", "third_party/proton/csrc/Proton.cpp"],
+      "est_size": "M",
+      "mode_hint": "skip_impl",
+      "explain": "把 proton『Python 是薄壳、C++ 是引擎』讲清的一章，无 GPU 不可真跑（需构建 libproton + CUPTI/roctracer），故 skip_impl。profile.py：start（33）选后端（_select_backend 读 driver.active.get_current_target().backend 映射到 cupti/roctracer——姊妹篇后端接缝，ascend/NPU 在此需要自己的 tracer 分支）、_check_env 拦 AMD 的 HIP_VISIBLE_DEVICES 坑、set_profiling_on、可选 register_triton_hook，最后 libproton.start(name,context,data,backend)。context 有 shadow（按代码里 proton.scope 标注的区域归因）与 python（按调用点文件/函数/行归因）两种。finalize（120）区分单会话/全部，落 hatchet 格式。scope.py：scope 类既是 with 也是装饰器，__enter__ 调 libproton.record_scope→enter_scope(+add_metrics/set_properties)；模块级 enter_scope/exit_scope（78/97）维护 thread_local 的 (id,name) 栈并区分 enter_scope vs enter_op（triton_op=True 走 op 通道，供 hook 用）。flags.py 是三个全局旗标的极简状态；proton.py 的 CLI（run_profiling）start→set_command_line（让脚本内的 start 调用被忽略，避免嵌套）→execute_as_main/pytest→finalize。Proton.cpp：pybind11 把每个 libproton.* 定义成一行 SessionManager::instance() 转发——这是 Python↔C++ 的确切边界，本章讲到此为止不下钻 C++ 引擎。教学坑：双语栈断点（Python 只是转发，行为在 C++）；command_line 旗标的『忽略脚本内 start』语义反直觉。"
+    },
+    {
+      "title": "Proton viewer：从 hatchet 调用树到 roofline 利用率",
+      "focus": "讲透 profile 产物怎么被读懂：viewer 把 hatchet GraphFrame（一棵带 inclusive 指标的调用树）里的原始计数（time/flops<width>/bytes）派生成人能用的指标——flop/s、byte/s，以及 util = max(sum(flops)/峰值算力时间, bytes/峰值带宽时间) 这个 roofline 屋顶模型；内含各架构（sm80/89/90、gfx90a/942）的峰值算力表与由显存频率×位宽算的峰值带宽。",
+      "key_source_paths": ["third_party/proton/proton/viewer.py"],
+      "est_size": "M",
+      "mode_hint": "deep",
+      "explain": "把『量到的数字翻译成洞察』讲清的一章，且无 GPU 可跑——直接喂仓库自带的 test/example_cuda.json / example_hip.json。get_raw_metrics（31）pop 出 device_info（每卡 arch/num_sms/clock/mem_clock/bus_width）再 ht.GraphFrame.from_literal 建树。derive_metrics（105）是核心：对 util 走 roofline——get_min_time_flops（38）按 arch 查峰值 FLOPS 表（sm80=624e12/(width/8)、sm90 按 num_sms/114×clock 缩放）算『若打满算力需多久』，get_min_time_bytes（71）用 2×bus_width×mem_clock/8 算峰值带宽下的 min_time，util=两者取 max 再除实测 time_sec（屋顶模型的 compute-bound vs memory-bound 上包络）；其余派生（flop/s、gbyte/s、time/%）是单位换算。filter_frames（169）用 hatchet query 做 include/exclude/threshold 并滤掉 __proton_launch_metadata 影子帧。format_frames 按 full/file_function_line 等裁剪帧名。TritonHook.flops_width=[8,16,32,64] 把不同位宽的 tensor-core 吞吐分开记。教学价值：roofline 是性能分析的地基心智模型，这一章可把它从公式讲成一张能算的表。教学坑：需 pip install llnl-hatchet；峰值表是硬编码的具体卡（读者换卡要改）；util 只对 tensor-core 有意义。"
+    },
+    {
+      "title": "AOT 编译：compile.py 把一个 JITFunction 烙成自包含 C + 内嵌 cubin",
+      "focus": "讲透 ahead-of-time 部署的第一步：命令行给定 kernel-name/signature/grid，compile.py 如何解析『带整除性提示的签名』(*fp32:16, i32:16, 1024)、把 :16/:1 提示喂给 AttrsDescriptor.from_hints、区分 constexpr 常量与运行期参数、走 triton.compile 拿到 cubin，再把 cubin 十六进制内嵌进 compile.c/compile.h 模板生成一段能 load/launch 的 C 桩。显式点名与 compiler 子系统的接缝：ASTSource / AttrsDescriptor / kernel_suffix。",
+      "key_source_paths": ["python/triton/tools/compile.py", "python/triton/tools/compile.c"],
+      "est_size": "M",
+      "mode_hint": "deep",
+      "explain": "AOT 支线的起点章。compile.py（全文即 __main__）：签名按逗号切，`ty:hint` 里 hint 只允许 1 或 16（108，对应 equal_to_1 与 16 字节对齐两种特化）；constexpr(s) 把能转 int/float 的段当编译期常量收进 constants（会从生成原型里消失）；AttrsDescriptor.from_hints(hints)（110）把整除性提示物化成属性描述，get_constants() 把 ==1 的也并进常量。核心接缝：ASTSource(fn=kernel, constants, signature, attrs)（113）→ triton.compile(src, options={num_warps,num_stages})（115）——这是跨进 compiler 子系统的边界，需要真实后端/ptxas 出 cubin（无 GPU 在此断裂）。产物侧：kernel_suffix（131，来自 compiler.code_generator）+ sig_hash 拼出唯一函数名，binascii.hexlify(cubin) 内嵌成 bin_data，ty_to_cpp（来自 nvidia backend）把 triton 类型映成 C 类型，最后 .format(**params) 灌进 compile.h/compile.c 模板落两个文件。教学价值：把『特化』这个抽象概念落到一条命令行——你亲眼看到 :16 提示如何改变生成的 C 原型。姊妹篇提示：ty_to_cpp / from_nvidia.driver 是 NVIDIA 专属，ascend 的 AOT 需并行一套类型映射与模板。教学坑：signature DSL（:16/:1、constexpr 位置）反直觉；跑通需 GPU+ptxas。可配精简版：只保留签名解析→hints→constants 三段纯 Python 逻辑，桩掉 triton.compile 与模板写盘。"
+    },
+    {
+      "title": "AOT 链接：link.py 生成按运行期整除性分派的入口",
+      "focus": "讲透多份特化产物如何缝成一个统一入口：link.py 的 HeaderParser 解析 compile.py 在头文件里留的 `// tt-linker:` 指令，反推每个核的 C 签名、sig_hash、特化后缀(d=16对齐/c==1)，再生成一段 C 分派器——运行期用 (val%16==0)/(val==1) 条件挑对应的特化实现，并生成 load/unload 与 algo_id 选择表。",
+      "key_source_paths": ["python/triton/tools/link.py"],
+      "est_size": "M",
+      "mode_hint": "deep",
+      "explain": "AOT 支线的收口章，紧接 compile.py。HeaderParser.extract_linker_meta（45）用三条正则拆 tt-linker 指令→(kernel_name, c_sig, algo_info)，_match_name 拆 name_hash_suffix，_match_suffix（86）扫后缀里每个参数位后跟的 d/c，用 s2i={c:1,d:16} 还原每个参数的整除性提示 sizes，num_specs 计特化数；_add_kernel 把同名核的多份特化归组并校验签名一致。生成侧：make_kernel_hints_dispatcher（161）按 num_specs 降序（最特化的先匹配）生成 `if ((val%16==0)&&...) return kernel_hash_suffix(...)` 的分派链，末尾回落 CUDA_ERROR_INVALID_VALUE；make_func_pointers/make_kernel_meta_const_dispatcher（202）另建一张按 algo_id 索引的函数指针表（供 meta-参数如 num_warps 不同的多版本选择）；make_kernel_load_def 生成批量 load/unload。教学价值：这一章把『特化在运行期怎么被选中』从 jit-runtime 的 Python compute_spec_key 延伸到 AOT 的 C 分派——同一件事的两种化身。教学坑：与 compile.py 的耦合全靠头文件里的字符串约定（tt-linker 指令格式），改一处要动两处；纯字符串生成，无 GPU 也能跑通读懂。"
+    },
+    {
+      "title": "读编译产物：disasm.py 把 cubin 反汇编成带控制字的 SASS",
+      "focus": "讲透『核到底编成了什么机器码』这一层洞察：disasm.py 调 cuobjdump -sass 拿到 NVIDIA SASS，解析每条指令后跟的 64 位控制字（stall/yield/read-write barrier/wait mask 调度信息），把 BRA 跳转目标地址重映射成 LBB 标签，产出可读的汇编；并串起 compiler 里 AsmDict 对 'sass' 键的惰性反汇编。",
+      "key_source_paths": ["python/triton/tools/disasm.py", "python/triton/compiler/compiler.py"],
+      "est_size": "M",
+      "mode_hint": "deep",
+      "explain": "洞察支线里最『贴金属』的一章。disasm.py：extract（84）调 cuobjdump（路径来自 nvidia.compiler._path_to_binary）拿 -sass 文本，按 `Function:` 头分段；每条指令占两行——FLINE_RE 抓汇编体、SLINE_RE 抓紧随的控制字编码，parseCtrl（35）位移解出 stall(bit41-44)/yield(45)/write-barrier(46-48)/read-barrier(49-51)/wait-mask(52-57)，格式化成 `wait:read:write:yield:stall`；processSassLines 把 BRA 目标登记进 labels，第二趟按 offset 打 LBB 标签并把跳转重写成标签名。上游接缝：compiler.py 的 AsmDict.__missing__（332）在你访问 kernel.asm['sass'] 时才惰性调 get_sass(cubin)（disasm.get_sass，带 lru_cache）——即『按需反汇编』。教学价值：读者第一次看懂 GPU 调度控制字（为什么 SASS 每条带一串 barrier 数字），把编译器输出从黑盒变白盒。姊妹篇提示：整套 NVIDIA/cuobjdump 专属；AMD 走不同反汇编、ascend 又不同——这是后端专属工具的典型。教学坑：需 CUDA toolkit 的 cuobjdump + 一份真 cubin；控制字位布局是 SM 架构相关的经验解码，非官方文档。"
+    },
+    {
+      "title": "MLIR 调试驱动与 dialect 挂载接缝：triton-opt 家族",
+      "focus": "讲透编译器工程师的调试工作流：bin/ 下 triton-opt/triton-reduce/triton-lsp/triton-llvm-opt 都是 MLIR 标准入口（MlirOptMain/MlirReduceMain/LSP/llvm-opt clone）的几行薄壳，真正承重的是 RegisterTritonDialects.h——它把 Triton/TritonGPU/TritonNvidiaGPU/AMD 全部 dialect 与所有 pass 注册进一个 registry。显式点名：这就是姊妹篇 triton-ascend 挂第三方 dialect+pass 的配对脊柱。",
+      "key_source_paths": ["bin/RegisterTritonDialects.h", "bin/triton-opt.cpp"],
+      "est_size": "M",
+      "mode_hint": "skip_impl",
+      "explain": "C++/MLIR 层，无精简版故 skip_impl，但概念上是全书『怎么逐 pass 调试 IR』的枢纽。triton-opt.cpp 全文 8 行：建 DialectRegistry→registerTritonDialects→asMainReturnCode(MlirOptMain(...))——用法即 `triton-opt --convert-triton-to-tritongpu input.mlir`，把某个 pass 单独跑在一段 MLIR 上，是观察 ir-dialects/analysis-transforms 各 pass 效果的手术刀；triton-reduce 做失败用例最小化，triton-lsp 给 .mlir 提供编辑器补全，triton-llvm-opt 是 llvm opt 的裁剪版用于测 triton 自定义 LLVM pass。承重文件 RegisterTritonDialects.h（37）：registerAllPasses + registerTritonPasses + registerTritonGPUPasses + registerTritonNvidiaGPUPasses + 一整串 AMD pass（registerTritonAMDGPUAccelerateMatmul 等）+ registry.insert 所有 dialect（含 amdgpu::TritonAMDGPUDialect、ROCDL）。姊妹篇提示（本章核心）：一个新后端要能被 triton-opt 调试，就必须在此文件（或其等价物）注册自己的 dialect 与 pass——ascend 正是在这里挂 NPU dialect+pass；这是『后端接缝』在工具层的直接体现，与 backends 发现机制、stages 注入并列为配对脊柱。教学坑：纯 C++/MLIR，读者要有 mlir-opt 心智；本章讲注册与用法，不下钻 pass 内部（那在 analysis-transforms 子系统）。"
+    },
+    {
+      "title": "triton-tensor-layout：把抽象 layout 摊成一张元素↔线程表",
+      "focus": "讲透一个专为『看懂 layout』而生的调试探针：给一个 layout 属性字符串（如 #triton_gpu.nvidia_mma<...> 或 blocked/mfma）和一个 tensor 类型，triton-tensor-layout 打印每个张量元素落在哪个线程/寄存器（getLayoutStr），支持 tensor 视角与 hardware(warp) 视角两种 point-of-view——是 layout 理论章最好的动手教具。",
+      "key_source_paths": ["bin/triton-tensor-layout.cpp"],
+      "est_size": "S",
+      "mode_hint": "skip_impl",
+      "explain": "C++ 层 skip_impl，但作为 layout primer 的配套动手工具价值极高，值得单列或紧贴 layout 章。main（179）：parseType 解析 tensor<128x256xf16>，从字符串（-l）或文件（-i，可带 -alias-names 挑具名 layout）拿到 layout attribute，layoutPrint（82）对 triton_gpu dialect 调 triton::gpu::getLayoutStr(tensorType, UseHWPointOfView) 输出映射表；-use-hw-view 切到 warp 视角（每个 warp/lane 拿哪些元素）而非默认的 tensor 视角（每个元素归哪个线程）。教学价值：layout（blocked/mma/mfma/dot-operand）是 Triton 最抽象最劝退的概念，这个工具把它从公式变成一张可以逐格核对的表——读者改一个 warpsPerCTA 就能看到映射怎么变。姊妹篇提示：只对 triton_gpu dialect 有效，AMD 的 mfma / ascend 的 NPU layout 若要可视化需扩此工具的 dialect 分派（layoutPrint 里的 dialectName=='triton_gpu' 判断即挂载点）。教学坑：C++，且理解输出前得先懂 layout 定义（依赖 ir-dialects 的 layout primer 打底）。"
+    },
+    {
+      "title": "do_bench 与 perf_report：全书性能表背后的秒表",
+      "focus": "讲透 testing.py 这套度量骨架：do_bench 如何用『先估单次耗时→据此定 warmup/repeat 次数→每次前 zero L2 cache 防缓存污染→CUDA events 计时→取 (0.5,0.2,0.8) 分位』产出可复现的核耗时；do_bench_cudagraph 用 CUDA Graph 摊掉 host 开销；perf_report/Benchmark/Mark 把参数扫描跑成 matplotlib 曲线与 CSV。显式点名 driver.active 接缝：get_device_interface / get_empty_cache_for_benchmark / get_benchmarker（autotuner 的计时器就来自这里）。",
+      "key_source_paths": ["python/triton/testing.py"],
+      "est_size": "M",
+      "mode_hint": "deep",
+      "explain": "度量支线的骨架章，也是全书几乎每张 benchmark 图背后的机制。do_bench（95）：di=driver.active.get_device_interface() 取设备侧 Event/synchronize（后端接缝，非硬绑 torch.cuda）；先跑 5 次估 estimate_ms，据此 n_warmup=warmup/estimate_ms、n_repeat=rep/estimate_ms 自适应次数；关键护栏 cache=get_empty_cache_for_benchmark() + 每次 cache.zero_()——刷 L2 让每次 launch 都冷起，否则测的是缓存命中而非核本身（作者注释点明）；用一串 Event 记时间，_summarize_statistics（20）按 quantiles 取分位（默认返回中位数+20/80 分位带，正是 autotuner._bench 与 tutorials 图里那条阴影带）。do_bench_cudagraph（32）：把 n_repeat 次调用录进一张 CUDA Graph 再 replay，摊掉 launch 的 host 开销，适合极短核。perf_report（378）→Mark（279）：_run 对 x_vals×line_vals 网格逐点调用被测函数，攒进 DataFrame，画 ax.plot + fill_between（min/max 带）出 png，落 csv/html。roofline 峰值助手 get_dram_gbps（389，mem_clock×bus_width×2/8）、get_max_tensorcore_tflops（402，按 compute capability 与 dtype 查每 sub-core ops）给理论上限。姊妹篇提示：get_benchmarker 是 autotuner 挑最优 config 的计时来源（见 jit-runtime autotune 章），后端提供各自实现；ascend 需给出自己的 Event/benchmarker。教学坑：需真实 GPU 才有意义的数字；L2 flush 的必要性是常见踩坑点（不刷则跑分虚高）。可配精简版：保留『估时→定次数→分位』骨架，桩掉 GPU Event。"
+    },
+    {
+      "title": "教学阶梯：tutorials 01→09 作为读者 on-ramp 与各章素材来源",
+      "focus": "把 python/tutorials 的九级阶梯当作跨子系统的教学资产盘点：从 01-vector-add（编程模型/@jit/grid）→ 02-fused-softmax（行归约/自动 num_warps）→ 03-matmul（分块+L2 分组重排+autotune）→ 05-layer-norm（前后向）→ 06-fused-attention（FlashAttention-2 真实内核）→ 08-grouped-gemm → 09-persistent-matmul（persistent + TMA + proton 联动），指出每级喂养哪个子系统的哪一章、哪些可原样内嵌、哪些配 experimental_descriptor/build_extern 等工具。",
+      "key_source_paths": ["python/tutorials/01-vector-add.py", "python/tutorials/03-matrix-multiplication.py", "python/tutorials/06-fused-attention.py", "python/tutorials/09-persistent-matmul.py"],
+      "est_size": "M",
+      "mode_hint": "skip_impl",
+      "explain": "这是一个『素材测绘』单元而非常规解读章——它的产物首先是给综合者/各子系统 analyst 的一张映射表，其次可落成一章『读者 on-ramp / 学习路径』导引。盘点：01-vector-add（133 行）是最干净的编程模型样例（pid/BLOCK_SIZE/mask/load-store + grid=lambda meta），直接喂 dsl-language 与 jit-runtime 的入门；02-fused-softmax（244）教行内归约与按 shared/registers 自动定 num_warps，喂 dsl 归约章；03-matmul（441）是分块 GEMM + GROUP_SIZE_M 的 L2 命中重排 + @autotune 多 config，喂 compiler/autotune 与 backend 的旗舰样例（program-reorder 那段图文可直接复用）；04-dropout / 05-layer-norm（含反向）喂数值/前后向章；06-fused-attention（641）是 FlashAttention-2 的真实生产内核（引 arXiv:2205.14135 与 flash2 paper，_attn_fwd_inner 分 STAGE），是注意力/softmax-tiling primer 的最佳落地代码；07-extern-functions（97）配 build_extern.py 讲 libdevice 外部函数；08-grouped-gemm 讲变尺寸批量；09-persistent-matmul（888）综合 persistent kernel + TMA（用 triton.tools.experimental_descriptor 建 TMA 描述符）+ 与 proton 联动做剖析（metadata_fn 回调正是上面 hook 章的用户侧），是本子系统与 backend/TMA 的收口样例。工具配套：experimental_descriptor.py（host 侧 fill_1d/2d_tma_descriptor）只在 09 这类 TMA 教程用；build_extern.py 生成 libdevice 绑定，服务 07。教学坑（关键）：tutorials 全部需真实 GPU 才能跑出数字（无 GPU 只能读代码、内嵌片段、复用其叙事结构），跨子系统复用时须避免同一段核在多章重复深挖（由综合者去重）；06/09 体量大，内嵌须裁到论点相关的核心循环。"
+    }
+  ],
+  "hazards": [
+    "双语栈断点集中：proton 的 Python 面（profile/scope/hook）几乎全是对 libproton C++（Proton.cpp→SessionManager）的转发，真正的树聚合/计时归因在 C++，讲『行为』时不能只读 Python；bin/ 全是 C++/MLIR（triton-opt 家族、triton-tensor-layout），无精简版。",
+    "无 GPU 不可运行处密集：proton 需构建 libproton+CUPTI/roctracer 并有真卡；compile.py 的 triton.compile 需后端+ptxas 出 cubin；disasm.py 需 CUDA toolkit 的 cuobjdump+真 cubin；do_bench/所有 tutorials 需真实 GPU 才有数字。可无 GPU 演示的绿洲：viewer.py（喂 test/example_*.json）、link.py（纯字符串生成）、compile.py 的签名解析段、do_bench 的估时/分位逻辑。",
+    "强跨子系统耦合：本子系统是『观察/部署/学习』层，几乎每个单元都指回别处——hook 接缝在 compiler.py 的 CompiledKernel；compile/link 依赖 compiler 的 ASTSource/AttrsDescriptor/kernel_suffix 与 jit-runtime 的特化概念（compute_spec_key 的 C 化身）；do_bench 的 get_benchmarker 正是 jit-runtime autotune 章的计时器；triton-tensor-layout 依赖 ir-dialects 的 layout primer 打底。综合者需协调这些引用避免重复深挖。",
+    "姊妹篇（triton-ascend）配对脊柱有三处务必在成书时显式点名：① proton _select_backend 的 cuda→cupti/hip→roctracer 映射（NPU 需自有 tracer 分支）；② bin/RegisterTritonDialects.h 的 dialect+pass 注册（第三方后端在此挂 dialect 才能被 triton-opt 调试）；③ compile.py 的 ty_to_cpp 与 triton-tensor-layout 的 dialectName 分派均为后端专属挂载点。",
+    "NVIDIA 专属工具易被误当通用：disasm.py（cuobjdump/SASS 控制字）、experimental_descriptor（CUtensorMap/TMA）、triton-tensor-layout 的 nvidia_mma 示例、viewer 的峰值算力表（sm80/89/90 硬编码）都是 NVIDIA 具体架构经验值，讲时须标明适用边界，别当作跨后端通用。",
+    "tutorials 是素材不是章：01→09 主要服务于其他子系统（dsl/compiler/backend/attention primer）的叙事与内嵌，本子系统只负责测绘映射与（可选）一章 on-ramp 导引；06/09 体量大（641/888 行）内嵌须裁剪到论点相关核心循环，且同一段核不宜在多章重复深挖。"
+  ]
+}

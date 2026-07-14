@@ -1,0 +1,156 @@
+{
+  "subsystem": "analysis-transforms",
+  "repo": "triton",
+  "source_version": "v3.2.0 (git 9641643da, tag v3.2.0)",
+  "source_root": "instances/triton/source",
+  "scope": "lib/Analysis/ (AxisInfo/Allocation/Membar/Alias/Utility) + lib/Dialect/TritonGPU/Transforms/ (Coalesce/AccelerateMatmul/RemoveLayoutConversions/OptimizeDotOperands/Prefetch/Pipeliner/WS*/misc)",
+  "surveyed_at": "read every key .cpp/.h to function-level granularity; verified pass ordering against third_party/nvidia/backend/compiler.py make_ttgir",
+  "mainline": "读者带着一个问题走进来:一段 tt.dot + tt.load 的朴素 TritonGPU IR,张量上还挂着未经打磨的 blocked layout——它怎么变成能喂饱 Tensor Core、把全局访存合并成 128-bit 事务、把搬运和计算在时间上错开的高性能 IR?答案是一串按精确顺序排列的 MLIR pass,而这串 pass 的‘决策依据’来自一组静态分析。主线沿真实编译顺序走:先建立**分析地基**——AxisInfo 用稀疏数据流在每个张量的每根轴上推断‘连续性/整除性/常量性’(join=逐轴 gcd),这是所有访存优化的真相源;Allocation 把 convert_layout 需要的 scratch 与显式 local_alloc 打包进有限的共享内存(活跃期区间 + first-fit),Alias 追踪 scf.for/yield 造成的共享内存别名喂给活跃期,Membar 在读写区间相交处插同步屏障。地基之上是**优化 pass 群**,严格按 make_ttgir 的顺序解读:Coalesce 读 AxisInfo 的 contiguity 反推出让访存合并最优的 blocked 编码;RemoveLayoutConversions 用‘锚点→传播→消解冲突→重写’四阶段把布局转换降到最少;AccelerateMatmul 把 tt.dot 从 blocked 改写成硬件 MMA 布局(按 compute capability 选 v1/v2/v3,MMAv3 走 WarpGroupDot + 共享内存操作数);OptimizeDotOperands 把 trans 融进 dot 操作数的 swizzled 共享编码;软件流水线(num_stages)把 load 异步化、用 CoarseSchedule 建模 stage/cluster、再由 PipelineExpander 展开成 prologue/kernel/epilogue;Prefetch 用 subview+local_load 把下一轮 dot 操作数提前搬入;Hopper 上还有一整套 Warp Specialization(WS*)把 producer/consumer 拆到不同 warpgroup。走出去时,读者理解的不是‘某个 pass 干了什么’,而是‘一个静态分析(AxisInfo/Allocation)如何量化地驱动一串改写决策’,以及‘为什么这些 pass 必须以这个顺序、在这些 layout 抽象上协作’。",
+  "sister_book_seams": "triton-ascend 是本仓 fork + Ascend NPU 后端。本子系统的配对脊柱集中在:(1) **pass 注入点**——third_party/nvidia/backend/compiler.py 的 make_ttgir 用 passes.ttgpuir.add_* 逐条拼装 TTGIR pipeline(coalesce→remove_layout→accelerate_matmul→optimize_dot_operands→[ws_*|pipeline]→prefetch→remove_layout→reduce_data_duplication→reorder),ascend 后端有自己的 make_ttgir,选择/重排/替换这些 pass,是最直接的接缝;(2) **AccelerateMatmul 硬绑 NVIDIA**——getNVIDIAComputeCapability / getMMAVersionSafe / NvidiaMmaEncodingAttr / WarpGroupDotOp 全是 NV 专属,ascend 必须 fork 出面向 cube/MMA 的等价 pass 与自己的 dot-operand 编码;(3) **第三方 MMA 编码挂载点**——Prefetch 已同时接受 AMDMfmaEncodingAttr,示范了后端如何把自定义 MMA 编码插进通用 pass;(4) **Membar 的 MembarFilterFn 回调**——后端可注入 filter 抑制不必要的屏障,是 driver/backend 抽象的接缝;(5) **WS* 一族**受 num_consumer_groups/Hopper 门控,ascend 的多核/多流水专业化若存在会在此对位。凡涉及这些点,章节 focus 已显式点名。",
+  "hazards": [
+    "双语栈断点:本子系统几乎全是 MLIR/C++(lib/Analysis + lib/Dialect/.../Transforms),Python 只在 make_ttgir 里以 add_* 一行行拼 pipeline。读者的心智模型必须在‘Python 拼 pipeline’和‘C++ 里每个 pass 干什么’之间反复穿梭——每章须显式搭这座桥(Python 那一行 ↔ 对应 runOnOperation)。",
+    "无 GPU 不可运行:这些 pass 产出的是 IR-to-IR 变换,可用 triton-opt + lit FileCheck 在无 GPU 下跑(纯 MLIR 变换),但‘为什么这样变换更快’的收益(合并访存、Tensor Core 吞吐、流水线重叠)只有真机能量到。素材应走 IR diff / FileCheck 而非数值 trace;性能收益用示意图讲,别谎称跑出了加速比。",
+    "MLIR C++ 层难做‘只做减法的精简版’:多数 pass 深度依赖 MLIR 的 PatternRewriter/DataFlow/CallGraph 基础设施,砍不成独立可跑的小程序 → 绝大多数单元标 skip_impl(轻流程,靠真源码内嵌+IR 示例讲透)。仅 AxisInfo 的格与 join(逐轴 gcd)可另做一个独立 Python 玩具模型佐证。",
+    "强耦合链条:AxisInfo→Coalesce、Alias→Allocation→Membar、AccelerateMatmul→(OptimizeDotOperands/Prefetch/Pipeline) 环环相扣;RemoveLayoutConversions 在 pipeline 里出现三次、AccelerateMatmul 前后各夹一次,顺序本身即语义。任一章不能孤立讲,须用 make_ttgir 的顺序图锚定‘你在这里’。",
+    "layout 抽象前置依赖:blocked / mma(NvidiaMma v1-v3)/ dot-operand / shared(swizzled)四类编码及 CTALayout、kWidth 等概念是本子系统的通用词汇,来自 TritonGPU IR/Dialect 定义(不在本子系统),须由 concepts.json / 先修指路补齐,否则每章都要重讲 layout。",
+    "MMA 版本与硬件世代:getMMAVersionSafe 里 sm75→v1、sm80/86→v2、sm90(Hopper)→v3、sm100 assert 未支持;MMAv3 触发 WarpGroupDot + 共享内存操作数 + 允许转置仅 f16/bf16。讲 AccelerateMatmul 必须把‘版本×世代×数据类型’的分支讲清,别只讲一条路径。",
+    "Warp Specialization 是 Hopper 专属实验特性:WS* 五个 pass(~140KB)受 num_consumer_groups 门控,概念重(warpgroup producer/consumer、task id 传播、data/code partition、canonical warp id lowering),对新手是深水区。建议单独成 Part 或明确标注‘进阶/选读’,不要塞进主线让读者卡住。"
+  ],
+  "units": [
+    {
+      "title": "AxisInfo:指针连续性、整除性与常量性的稀疏数据流分析",
+      "focus": "讲透 Triton 如何在编译期为每个张量的每根轴推断三元组 contiguity/divisibility/constancy——这是所有访存优化(尤其 Coalesce/向量化)的静态真相源;格的 join 就是逐轴取 gcd,悲观初值来自函数参数的 tt.divisibility/contiguity 提示,再经 per-op 访问器(add/mul/rem/cmp/broadcast/splat/makerange…)前向传播。",
+      "key_source_paths": ["include/triton/Analysis/AxisInfo.h", "lib/Analysis/AxisInfo.cpp"],
+      "est_size": "L",
+      "mode_hint": "deep",
+      "elaboration": "AxisInfo 是一个三向量格(contiguity/divisibility/constancy + 可选 constantValue),头文件里的大段注释给了极好的‘数组→三元组’直觉例子(可直接改绘成图)。lib/Analysis/AxisInfo.cpp 用 MLIR SparseForwardDataFlowAnalysis 实现:AxisInfoVisitorList 注册几十个 per-op 访问器(AddSub/Mul/Div/Rem/Cmp/Shl/Shr/Select/Broadcast/ExpandDims/MakeRange/Constant/Load…),每个访问器给出该 op 输出轴信息的推导规则(如 mul 的 contiguity、rem 对 constancy 的影响);AxisInfo::join 是逐轴 gcd(1186 行);getPessimisticValueState 是悲观初值;ModuleAxisInfoAnalysis 基于 CallGraph 做跨函数(后序、按 caller 聚合)分析,并暴露 getPtrContiguity/getPtrAlignment/getMaskAlignment 给下游。**唯一适合做独立 Python 精简版的单元**:格 + gcd-join + 几个访问器可写成小模型,数值上验证‘tt.make_range→add→连续性怎么算’。est L 因访问器多;可挑代表性 5-6 个讲透,其余列表带过。",
+      "sister_book_note": "getPtrAlignment/getMaskAlignment 决定后端向量化宽度,是后端无关的通用地基;ascend 复用同一分析。"
+    },
+    {
+      "title": "Coalesce:用 AxisInfo 反推访存合并的 blocked 编码",
+      "focus": "讲透第一个消费 AxisInfo 的 pass——对每个 tensor-of-pointer 的 load/store,按指针 contiguity 的 argSort 定 order,聚合同 order 的相关访存取最大 perThread,夹在 numElems/numThreads 与 128-bit 存宽之间,产出让 warp 内访存合并最优的 BlockedEncodingAttr,再用 convert_layout 前后夹住原 op 完成改写。",
+      "key_source_paths": ["lib/Dialect/TritonGPU/Transforms/Coalesce.cpp", "lib/Dialect/TritonGPU/Transforms/Utility.cpp"],
+      "est_size": "M",
+      "mode_hint": "skip_impl",
+      "elaboration": "CoalescePass::setCoalescedEncoding 是核心:取 ptr 的 contiguity→argSort 得 order;用 multiRootGetSlice 收集‘同 shape 同 order’的相关访存(memAccessesSameOrder),getNumElementsPerThread(Transforms/Utility.cpp:111,内部再查 AxisInfo)算每个的 perThread 取最大;perThread 再 min 到 numElems/numThreads;非 load 的写操作额外夹到 128-bit(避免 warp 级写有‘缝’)。sizePerThread[order[0]]=perThread 其余为 1,拼出 BlockedEncodingAttr。coalesceOp 做实际重写:非 shared 的张量操作数插 convert_layout 到新编码、构造同名新 op、结果再 convert 回原布局。是‘分析驱动改写’的最短闭环,适合作为分析→变换的第一课。skip_impl:纯 MLIR rewrite;素材走 IR before/after + AxisInfo 打印。",
+      "sister_book_note": "后端无关,ascend 复用;但 threadsPerWarp/numWarps 由 TritonGPUDialect 从 module 属性取,后端设定不同会改结果。"
+    },
+    {
+      "title": "共享内存分配:Allocation 的活跃期区间与 first-fit 打包(含 Alias 分析)",
+      "focus": "讲透 convert_layout 的 scratch 缓冲、显式 local_alloc、以及函数调用的 virtual buffer 如何在有限共享内存里定址——先用 Liveness + SharedMemoryAliasAnalysis 求每个 buffer 的活跃区间(scf.for/yield 造成的别名并入活跃期),再按区间相交建冲突图、first-fit 计算对齐 offset,得出整个 call graph 的 sharedMemorySize。",
+      "key_source_paths": ["include/triton/Analysis/Allocation.h", "lib/Analysis/Allocation.cpp", "include/triton/Analysis/Alias.h", "lib/Analysis/Alias.cpp"],
+      "est_size": "L",
+      "mode_hint": "skip_impl",
+      "elaboration": "AllocationAnalysis(Allocation.cpp:169)的 run = resolveLiveness()+computeOffsets()。ScratchConfig/getScratchConfigForCvt(:113)算 convert_layout 需要的 scratch 形状(repShape/paddedRepShape 防 bank conflict/inVec/outVec)。三类 buffer:Explicit(local_alloc)/Scratch(convert_layout)/Virtual(triton.call)。resolveLiveness 用 mlir Liveness + Alias 结果扩展别名 buffer 的区间;computeOffsets 建 interference 图后 allocate() 做 first-fit + 对齐。头文件的 Interval 模板与 BufferT 结构清晰。Alias.h/.cpp 是配套的 SharedMemoryAliasAnalysis(SparseForwardDataFlow),头注释用 scf.for/yield 的 v1-v6 例子讲清‘一个值可能别名多个 alloc’——直接可绘图。ModuleAllocation 走 CallGraph 后序,把每次 call 当作分配 scratch 并把 offset 作参数传给 callee。skip_impl:依赖 MLIR Liveness/DataFlow。",
+      "sister_book_note": "后端无关地基;Membar 与 LLVM lowering 都消费 Allocation 结果。共享内存总量约束在不同后端不同,但分析逻辑通用。"
+    },
+    {
+      "title": "Membar:共享内存读写屏障的区间相交分析",
+      "focus": "讲透在无显式屏障的 IR 上,如何靠 Allocation 的 buffer 区间自动插 barrier——BlockInfo 维护 syncRead/syncWrite 区间集,RAW/WAR/WAW 中 WAW 天然不可能(不重叠分配)、RAR 不需要,故只在写后读、读后写且区间相交处插屏障;MembarFilterFn 允许后端进一步豁免。",
+      "key_source_paths": ["include/triton/Analysis/Membar.h", "lib/Analysis/Membar.cpp"],
+      "est_size": "M",
+      "mode_hint": "skip_impl",
+      "elaboration": "Membar.h 已把语义讲得很透:BlockInfo::isIntersected 对 (write,read)/(read,write)/(write,write) 三对区间集做相交判定,filter 回调可对具体 op 对豁免;sync() 在插屏障后清空区间。MembarAnalysis::resolve 基于 SCF(每 region 单基本块)做前向遍历,update 按 op 累积读写区间、visitTerminator 收集后继、区间相交则 insertBarrier。ModuleMembarAnalysis 走 CallGraph 后序,每函数维护返回后的 BlockInfo(保守地免去调用点手插屏障)。教学重点:为什么 WAW 不可能(overlapped 分配不允许)、Reduce 的临时存储为何算‘读’。skip_impl:纯分析 + 插 op。",
+      "sister_book_note": "MembarFilterFn 是明确的后端接缝——backend 传入 filter 抑制自己知道安全的屏障;ascend 可注入 NPU 语义的 filter。"
+    },
+    {
+      "title": "AccelerateMatmul:把 tt.dot 改写成硬件 MMA 布局",
+      "focus": "讲透 BlockedToMMA 如何按 NVIDIA compute capability 选 MMA 版本(sm75→v1 / sm8x→v2 / sm90→v3)、算 warpsPerTile、给累加器/操作数换 mma+dot-operand 编码;MMAv3 特判走 WarpGroupDot + 共享内存操作数(getSharedMemoryMMAOperand,仅 f16/bf16 允许转置);外加 ScaledBlockedToMMAv2(mxfp/fp8 scaled dot)与 decomposeMixedModeDotOp 混合精度兜底。",
+      "key_source_paths": ["lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp", "lib/Analysis/Utility.cpp", "lib/Dialect/TritonGPU/Transforms/Utility.cpp"],
+      "est_size": "L",
+      "mode_hint": "skip_impl",
+      "elaboration": "getMMAVersionSafe(:27)按世代给候选版本、supportMMA(Analysis/Utility.cpp:481)判数据类型可行性。BlockedToMMA::matchAndRewrite(:234)是主线:算 retShapePerCTA/numWarps/instrShape(mmaVersionToInstrShape,Transforms/Utility.cpp:26),v1 走 mmaV1Counter+isARow/isBRow 分支,v2/v3 走 warpsPerTileV2/V3;v3 用 getSharedMemoryMMAOperand 把 A/B 变成 LocalAlloc 的共享内存操作数并建 WarpGroupDotOp,v2 给 A/B 套 DotOperandEncodingAttr(kWidth 来自 computeOrigBitWidth 的位宽回溯,处理 up/down cast)。ScaledBlockedToMMAv2(:395)处理 fp8/fp4(E4M3/E5M2/E2M1)带 scale 的 dot,插 UpcastMXFPOp。decomposeMixedModeDotOp(:363)在选完 mma 后对不原生支持的类型组合插 FpToFp 提升。**强烈建议配一个 MMA/Tensor Core 布局理论 primer 作前置**(见下一单元)。skip_impl。",
+      "sister_book_note": "★配对脊柱重灾区★:整章硬绑 NvidiaMmaEncodingAttr / getNVIDIAComputeCapability / WarpGroupDotOp,是 NV 专属。ascend 必须 fork 出面向 cube/MMA 的等价 pass 与自己的 operand 编码——focus 里点名此接缝,姊妹篇应对照 ascend 的 matmul 加速 pass。"
+    },
+    {
+      "title": "[原理] Tensor Core 与 MMA 布局:mma/dot-operand 编码为什么长这样",
+      "focus": "作为 AccelerateMatmul 的前置原理章,讲清 warp 级 MMA 指令(m16n8k16 等)对操作数在寄存器/共享内存中的分布要求,以及 Triton 的 NvidiaMmaEncodingAttr(warpsPerCTA/instrShape/versionMajor)、DotOperandEncodingAttr(opIdx/kWidth)如何把这些硬件约束编码成 layout——不解读源码,而是把 PTX MMA 布局文档的图忠实重绘、和 Triton 编码字段一一对应。",
+      "key_source_paths": ["lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp", "lib/Dialect/TritonGPU/Transforms/Utility.cpp"],
+      "est_size": "M",
+      "mode_hint": "primer",
+      "elaboration": "AccelerateMatmul.cpp 源码里多处直接引 NVIDIA PTX 文档(mma-16816-a / mma-16816-c 的线程-数据映射注释,见 ScaledBlockedToMMAv2 的 502-514 行长注释)。这些映射是理解‘为什么要 warpsPerTile、为什么 kWidth 这样取、为什么 MMAv3 要把操作数放共享内存’的前提,但属硬件 ISA 知识,不适合当源码逐段讲。primer 章:忠实重绘 PTX mma tile 的线程/寄存器分布图,建立 instrShape/warpsPerTile/kWidth 与硬件的对应,给后一章 AccelerateMatmul 铺台阶。论文/文档来源=NVIDIA PTX ISA(mma 指令)+ Triton layout 设计。primer 走 lint_paper_grounding。",
+      "sister_book_note": "布局理论是通用的;但具体 tile 形状是 NV Tensor Core 专属,ascend 的 cube 单元有不同 tile,姊妹篇的对应 primer 会换硬件模型。"
+    },
+    {
+      "title": "RemoveLayoutConversions:锚点→传播→消解→重写的四阶段布局最优化",
+      "focus": "讲透 Triton 减少 convert_layout 的核心 pass——先找锚点 op(有想保留布局的,如 dot/load),把锚点布局沿 use-def 传播给后代(一个 op 可能背多个候选布局),再消解冲突为每个值定唯一布局(必要处插 convert),最后按支配序一次性重写 IR。它在 make_ttgir 里出现三次,是 layout 优化的主力。",
+      "key_source_paths": ["lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp"],
+      "est_size": "L",
+      "mode_hint": "skip_impl",
+      "elaboration": "文件头注释精确给出四阶段算法(anchor→propagate→resolve conflicts→rewrite in dominance order),LayoutPropagation 类维护每个值的 LayoutInfo(候选布局集)。传播用前/后向切片,冲突消解挑代价最小的布局并插最少 convert,重写阶段假设 IR 结构化、按 region 顺序处理。45KB 是本子系统最大的单文件 pass 之一,内容含 backward rematerialization、hoist convert 出循环等子机制。教学难点:‘一个值多布局→定唯一’的消解策略与代价模型。建议聚焦四阶段主骨架 + 一两个代表性子机制,余者列举。skip_impl:纯 MLIR 分析+重写;素材走 IR diff(convert_layout 数量前后对比)。",
+      "sister_book_note": "后端无关,ascend 复用;但它消费的 layout 种类(含后端自定义 mma 编码)会影响传播,属间接接缝。"
+    },
+    {
+      "title": "OptimizeDotOperands:把 transpose 融进 dot 操作数的 swizzled 共享编码",
+      "focus": "讲透一组针对 dot 操作数路径的窥孔优化——SwizzleShmemConvert 把 convert(trans(convert(x))) 折成带 needTrans 的 swizzled SharedEncodingAttr(避免错误的 vec/maxPhase),以及把 local_load/trans 重排到能被 MMA 直接吃的形态,减少共享内存往返与 warp shuffle。",
+      "key_source_paths": ["lib/Dialect/TritonGPU/Transforms/OptimizeDotOperands.cpp"],
+      "est_size": "M",
+      "mode_hint": "skip_impl",
+      "elaboration": "SwizzleShmemConvert(OpRewritePattern<ConvertLayoutOp>)匹配 outerCvt(trans(innerCvt(x))),把内层 convert 的编码换成基于转置前 argEncoding + needTrans=true 计算的 swizzled SharedEncodingAttr——注释详述为何不加 needTrans 会算错 vec/maxPhase(TransOp 类型推断只换 order 不修 swizzle)。文件里还有几个配套 pattern 处理 dot operand 的转置/加载重排。pass 在 make_ttgir 里紧跟 accelerate_matmul、又在 prefetch 后再跑一次。skip_impl。教学价值:展示 layout 的 swizzling(vec/perPhase/maxPhase)如何服务 bank-conflict-free 的共享内存访问。",
+      "sister_book_note": "swizzle 概念通用;具体 dot-operand 编码与 MMA 绑定,ascend 侧有等价窥孔。"
+    },
+    {
+      "title": "[原理] 软件流水线与模调度(Modulo Scheduling):num_stages 到底调度了什么",
+      "focus": "作为 Pipeliner 群的前置原理章,讲清软件流水线的经典理论——把循环体拆成多 stage、用模调度(modulo scheduling)让不同迭代的不同 stage 在同一物理循环体里并行,从而用 async load 隐藏访存延迟;建立 stage/cluster/distance/prologue/epilogue 这套词汇,再落到 Triton 的 CoarseSchedule 抽象。",
+      "key_source_paths": ["lib/Dialect/TritonGPU/Transforms/Pipeliner/SoftwarePipeliner.cpp", "lib/Dialect/TritonGPU/Transforms/Pipeliner/Schedule.cpp"],
+      "est_size": "M",
+      "mode_hint": "primer",
+      "elaboration": "SoftwarePipeliner.cpp 头注释点明经典结构=‘modulo schedule + expander(生成 prologue/epilogue)’,PipelineExpander.cpp 头注释列了它相对 upstream pipeliner 的改动(distance-1 修复、动态循环、非 index 归纳变量等)。这些前提是‘为什么 num_stages 能加速’的理论根基,但软件流水线/模调度是编译器经典课题,适合抽成 primer:用时空图(迭代×stage)讲清模调度如何重叠,引经典软件流水线文献(如 Lam 的 software pipelining、modulo scheduling),再把 Triton 的 CoarseSchedule(stage + cluster 排序,Schedule.cpp)对应上去。为随后 MatmulLoopPipeline / PipelineExpander 两章铺台阶。primer 走 lint_paper_grounding。",
+      "sister_book_note": "模调度理论通用;Triton 的 CoarseSchedule/PipelineExpander 后端无关,ascend 复用同一套流水线基础设施,只是异步 copy op 不同。"
+    },
+    {
+      "title": "MatmulLoopPipeline:把 matmul 循环异步化并建模调度",
+      "focus": "讲透 num_stages 流水线的‘预处理+建模’一半——识别循环里喂 dot 的 load,换成 async copy(cp.async 或 TMA)+ 多 buffer 共享内存环形缓冲,给每个 op 打 stage/cluster 标签(CoarseSchedule),处理 MMAv3 的特殊 async、依赖调度与 distance-1 依赖,产出交给 PipelineExpander 的调度表。",
+      "key_source_paths": ["lib/Dialect/TritonGPU/Transforms/Pipeliner/MatmulLoopPipeline.cpp", "lib/Dialect/TritonGPU/Transforms/Pipeliner/Schedule.cpp", "lib/Dialect/TritonGPU/Transforms/Pipeliner/SoftwarePipeliner.cpp"],
+      "est_size": "L",
+      "mode_hint": "skip_impl",
+      "elaboration": "SoftwarePipeliner.cpp 是入口(PipelinePass::runOnOperation:按 num_stages>1 收集循环、pipelineLoop→preProcessLoopAndGetSchedule→pipelineForLoop→asyncLaunchDots;还处理 outer loop pipeline 与 TMA store pipeline)。真正的重活在 MatmulLoopPipeline.cpp(66KB):createAsyncCopy(:54)/createTMAAsyncCopy(:156)把 load 换成 async + local_alloc 多 buffer;loadIsMMAv3(:377)判 MMAv3;createBarrierAlloc/createTMABarrierAndWait 管 mbarrier;preProcessLoopAndGetSchedule(:1067)是总装;scheduleDependencies/scheduleDistanceOneDependencies 做依赖调度;asyncLaunchDots(:1595)+dotCanBeProperlyAsync(:1392)+insertAsyncWarpGroupDotWaitInLoop 处理 WarpGroupDot 的异步与 wait 插入;updateWaits(:1247)/minNumInterleavedCommitOps 调 async wait 数。CoarseSchedule(Schedule.cpp)提供 stage/cluster 排序与 insertDepsOfOp/getOpsInOrder/createFinalSchedule。**建议拆 2 章**:异步化(async copy/TMA/多 buffer)与调度建模(CoarseSchedule/依赖/wait),留给综合者定。skip_impl:MLIR 重写,素材走 IR diff + 流水线时空图。",
+      "sister_book_note": "async copy 的具体 op(AsyncCopyGlobalToLocal/TMA)是 NV 语义;ascend 的异步搬运 op 不同,是接缝。CoarseSchedule/调度骨架通用。"
+    },
+    {
+      "title": "PipelineExpander:模调度展开为 prologue / 稳态 kernel / epilogue",
+      "focus": "讲透流水线的‘展开’一半——拿到 (op, stage) 调度表后,LoopPipelinerInternal 计算每个跨 stage 值的活跃期,发射 prologue(填流水线)、改写稳态循环体(每个 stage 取不同迭代的值,iter_args 做模变量扩展)、发射 epilogue(排空),并支持动态循环边界与谓词化。",
+      "key_source_paths": ["lib/Dialect/TritonGPU/Transforms/Pipeliner/PipelineExpander.cpp", "include/triton/Dialect/TritonGPU/Transforms/PipelineExpander.h"],
+      "est_size": "L",
+      "mode_hint": "skip_impl",
+      "elaboration": "这是从 upstream MLIR SCF pipeliner fork 来的通用 expander(头注释列了 Triton 的定制:distance-1 def 在 stage0 的 bug 修复、动态循环谓词化、非 index 归纳变量、distance-1 值跨多 stage 使用、epilogue 不 peel 时的输出重映射)。LoopPipelinerInternal 维护 LiverangeInfo(defStage/lastUseStage),emitPrologue/稳态 body 重写/emitEpilogue 三段。教学重点:‘模变量扩展’——同一 SSA 值在稳态循环里同时代表多个在飞迭代的版本,靠 iter_args 轮转。与上一章(建模)配对成‘调度→展开’完整闭环。skip_impl:纯 SCF/IR 变换;可用小循环的 before/after IR 讲清 prologue/kernel/epilogue。",
+      "sister_book_note": "完全后端无关(通用 SCF 变换),ascend 直接复用——是流水线基础设施里最稳定的通用件。"
+    },
+    {
+      "title": "Prefetch:把下一轮 dot 操作数用 subview + local_load 提前搬入",
+      "focus": "讲透与软件流水线互补的操作数预取——对循环里的单个 dot(MMAv2 或 AMD MFMA),沿 K 维把共享内存操作数切成 prefetchWidth 的 subview,在上一轮末尾 local_load 出下一轮要用的片,发射 prologue 预取 + 重建带额外 iter_args 的新循环,让 shared→register 的搬运与计算重叠。",
+      "key_source_paths": ["lib/Dialect/TritonGPU/Transforms/Prefetch.cpp"],
+      "est_size": "M",
+      "mode_hint": "skip_impl",
+      "elaboration": "文件头注释给了完整 before/after IR 示例(极好教学素材,可直接内嵌)。Prefetcher 类:initialize() 只接受结果为 NvidiaMma v2 或 AMDMfma 的单 dot(多 dot/flash-attention 因 segfault 主动退出),沿 cvt 链找共享内存源(getPrefetchSrc),按 kWidth/elementWidth 定 prefetchWidth;generatePrefetch 用 MemDescSubviewOp 切 K 维 + LocalLoadOp 出 dot-operand 编码的片;emitPrologue 发射循环前首取;createNewForOp 重建循环:把 dot 拆成 firstDot(用预取的 head)+ 沿 K 余量循环发多个 dot、末尾预取下一轮塞进 yield。教学重点:K 维切片 + iter_args 携带预取值,和 Pipeliner 的区别(这里针对 shared→reg,Pipeliner 针对 global→shared)。skip_impl。",
+      "sister_book_note": "★接缝★:initialize 显式同时接受 NvidiaMmaEncodingAttr(v2)与 AMDMfmaEncodingAttr——是‘第三方 MMA 编码挂进通用 pass’的现成范例,姊妹篇讲 ascend 自定义编码如何在此挂载可直接对照这行。"
+    },
+    {
+      "title": "Warp Specialization(WS*):Hopper warpgroup 生产者/消费者专业化流水线",
+      "focus": "讲透 Hopper 上把循环拆成不同 warpgroup 各司其职的进阶流水线——WSTaskPartition 按 num_consumer_groups 给 op 打 task id,TaskIdPropagate 沿数据流传播 task 归属,WSDataPartition 沿 task 切数据/共享内存,WSCodePartition 生成 producer/consumer 分区代码与同步,WSLowering 落到 GetCanonicalWarpIdOp;这是 num_warp_groups>1 时替代普通 pipeline 的路径。",
+      "key_source_paths": ["lib/Dialect/TritonGPU/Transforms/WSTaskPartition.cpp", "lib/Dialect/TritonGPU/Transforms/TaskIdPropagate.cpp", "lib/Dialect/TritonGPU/Transforms/WSDataPartition.cpp", "lib/Dialect/TritonGPU/Transforms/WSCodePartition.cpp", "lib/Dialect/TritonGPU/Transforms/WSLowering.cpp"],
+      "est_size": "L",
+      "mode_hint": "skip_impl",
+      "elaboration": "make_ttgir 在 num_consumer_groups 路径上按序跑 ws_task_partition→taskid_propagate→ws_data_partition→ws_code_partition→(pipeline)→ws_lowering。WSCodePartition.cpp 巨大(89KB),是把 IR 按 async task id 拆成 warp-specialized 区块并插 mbarrier/named-barrier 同步的核心;WSDataPartition(27KB)沿 task 切 tensor/shared;WSLowering 头注释:‘Hopper 每 task=一个 4-warp 的 warpgroup’,lower 到 GetCanonicalWarpIdOp;TaskIdPropagate 沿 use-def 传 task 标记;WSTaskPartition 定初始 task 划分。**这是进阶深水区,强烈建议单独成 Part 或标选读**;因体量(合计~140KB)综合者可能拆成 2-3 章(partition 系 / code-gen+lowering)。skip_impl:纯 MLIR。",
+      "sister_book_note": "★接缝★:整族受 num_consumer_groups/Hopper 门控,是 NV 特性;ascend 若有多核/多流水专业化会在此对位(不同硬件的 warpgroup 概念)。task-id 传播的思路可通用。"
+    },
+    {
+      "title": "布局清理三则:ReorderInstructions / ReduceDataDuplication / OptimizeThreadLocality",
+      "focus": "讲透 pipeline 尾部的三个轻量 layout 清理 pass——ReorderInstructions 把 convert/local_load 下沉到首个使用点、按寄存器压力搬进循环、把 dot 两操作数的 convert 排序;ReduceDataDuplication 把会走 shared 的 convert(→dot-operand)显式换成 local_alloc+local_load 省寄存器复制;OptimizeThreadLocality 改 reshape 目标布局,减少 reduction 的跨线程通信。",
+      "key_source_paths": ["lib/Dialect/TritonGPU/Transforms/ReorderInstructions.cpp", "lib/Dialect/TritonGPU/Transforms/ReduceDataDuplication.cpp", "lib/Dialect/TritonGPU/Transforms/OptimizeThreadLocality.cpp"],
+      "est_size": "M",
+      "mode_hint": "skip_impl",
+      "elaboration": "ReorderInstructions.cpp:willIncreaseRegisterPressure 标 local_load 和 →dot-operand 的 convert;runOnOperation 做四件小事(sink convert 到 dealloc 后/首用前、把增压 op 搬进循环、alloc(load) 紧跟 load、trans 紧跟定义、dot opIdx=1 的 convert 排到 opIdx=0 之后)。ReduceDataDuplication.cpp:对 src 非 shared、dst 是 dot-operand 且需要 shared 的 convert_layout,换成 local_alloc(shared, 带 needTrans 处理 3D order)+local_load,省掉寄存器里的数据重复。OptimizeThreadLocality.cpp:OptimizeReshapeLayoutPattern 改 reshape 目标布局让 reduction 在线程内完成、减少 shuffle。三者都短、都属‘收尾微调’,合成一章讲‘pipeline 末端为寄存器/通信做的小手术’。skip_impl。",
+      "sister_book_note": "均后端无关,ascend 复用;OptimizeThreadLocality 的 reduction 局部性对任何 SIMT/SIMD 后端都成立。"
+    },
+    {
+      "title": "小优化 passes 拾遗:F32DotTC(TF32x3)/ OptimizeAccumulatorInit / CombineTensorSelectAndIf",
+      "focus": "讲透三个独立的小改写 pass——F32DotTC 用 TF32x3(3xTF32)技巧在无原生 fp32 Tensor Core 时用三次 tf32 dot 逼近 f32 精度;OptimizeAccumulatorInit 优化累加器初始化(把 0 初始化下沉/融进首个 mma 避免多余 memset);CombineTensorSelectAndIf 在不破坏 SSA 前提下把 select 融进 scf.if。",
+      "key_source_paths": ["lib/Dialect/TritonGPU/Transforms/F32DotTC.cpp", "lib/Dialect/TritonGPU/Transforms/OptimizeAccumulatorInit.cpp", "lib/Dialect/TritonGPU/Transforms/CombineTensorSelectAndIf.cpp"],
+      "est_size": "M",
+      "mode_hint": "skip_impl",
+      "elaboration": "F32DotTC.cpp:TF32x3 pattern 头注释给了完整代数(aBig=f32ToTF32(a), aSmall=a-aBig,展开成 3 个 tf32 dot 求和,引 CUTLASS discussion #385)——数学清晰、适合内嵌讲。OptimizeAccumulatorInit.cpp:识别 dot 累加器的常量初始化并优化(配合 pipeline 的 useAccumulator 标志)。CombineTensorSelectAndIf.cpp:把紧跟 scf.if 结果的 arith.select 融进 if 的 yield(注释讲清何时融合不破坏 SSA)。三者互不相关但都短小自洽,合成一章‘杂项小改写’收尾整个 transforms 群。F32DotTC 数学可作亮点(甚至可做小 Python 精度验证 f32 vs tf32x3)。skip_impl(F32DotTC 的代数部分可选做玩具验证)。",
+      "sister_book_note": "F32DotTC 依赖 tf32 概念(NV 专属);OptimizeAccumulatorInit 配合 pipeline;CombineTensorSelectAndIf 通用。ascend 是否需要视其 dot 精度路径而定。"
+    }
+  ]
+}

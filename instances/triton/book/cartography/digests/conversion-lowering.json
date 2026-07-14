@@ -1,0 +1,178 @@
+{
+  "subsystem": "conversion-lowering",
+  "repo": "Triton v3.2.0",
+  "source_root": "instances/triton/source",
+  "scope": "lib/Conversion/ (TritonToTritonGPU/ + TritonGPUToLLVM/) + lib/Target/ + include/triton/Conversion + include/triton/Target, plus the per-op lowering that actually lives in the NVIDIA backend (third_party/nvidia/lib/{TritonNVIDIAGPUToLLVM,NVGPUToLLVM}) and the Python stage-driver (third_party/nvidia/backend/compiler.py). Paths below are relative to source_root.",
+  "viewpoint": "The lowering ladder: TTIR->TTGIR layout assignment, TTGIR->LLVM per-op lowering (load/store vectorization, shared-memory swizzle, mma instruction selection), LLVM->PTX exit.",
+  "mainline": "Reader arrives asking: 'I have a Triton kernel's tensor IR — how does it become PTX/cubin the GPU can run?' First they see the five-rung stage ladder in compiler.py (ttir->ttgir->llir->ptx->cubin) to get the whole map. Then hop 1, TTIR->TTGIR, stamps every tensor with a *layout* (which thread's which register holds which element); a tt.dot forces DotOperand layouts and inserts ConvertLayoutOp glue. Armed with the layout algebra (Blocked/Slice/Mma/DotOperand + the LinearLayout abstraction), they enter hop 2, TTGIR->LLVM: tensor types collapse to LLVM struct-of-N-elements; convert-layout moves data via one of three paths (register shuffle within a thread / warp shuffle / round-trip through shared memory); shared memory is first allocated and barrier-guarded. Per-op lowering then vectorizes tt.load/tt.store into ld/st.global by axis-info contiguity, selects mma vs wgmma for tt.dot by the mma layout version, unpacks structs for elementwise, and routes reduce/scan through shuffle+shared. Every hardware instruction is emitted as an inline-PTX asm string built by PTXBuilder; the NVGPU dialect lowers to inline asm too. Finally the exit translates MLIR-LLVM to LLVM IR, runs the nvptx backend to PTX, and shells out to ptxas for cubin. Walking out, the reader understands: the *layout* is the pipeline's central data structure, lowering = translating 'logical tensor + layout' into 'per-thread registers + memory accesses + instructions', and the backend is pluggable via TargetInfo and third_party/.",
+  "hazards": [
+    "Quad-lingual stack seam on one chain: MLIR C++ (passes/patterns) <-> TableGen (.td pass definitions, GEN_PASS_* macros) <-> Python orchestration (compiler.py pass-manager wiring) <-> raw inline-PTX asm strings (ld/st/mma/wgmma.fence text). A teaching break happens at every hand-off; readers must be shown all four surfaces or the chain looks magical.",
+    "No-GPU-not-runnable: outputs are PTX/cubin needing ptxas + a real NVIDIA GPU. Almost nothing in this subsystem produces a numeric trace on CPU — the honest verification is FileCheck/lit over textual IR (input .mlir -> expected LLVM IR), not value checks. This is why most units are mode_hint=skip_impl: a subtract-only runnable companion is largely infeasible for MLIR C++ lowering; explainer material must lean on IR-diff snapshots and PTX snippets, not runtime tensors.",
+    "Strong coupling to Dialect/TritonGPU: the layout attributes (Blocked/Slice/NvidiaMma/DotOperand/Shared encodings), the LinearLayout algebra, and shared-memory swizzle (perPhase/maxPhase) are DEFINED in the Dialect subsystem (lib/Dialect/TritonGPU/IR, include/.../LinearLayoutConversions.h); Conversion is only their consumer. You cannot explain convert-layout lowering without first teaching the layout algebra -> a primer unit is mandatory and it borrows heavily from a sibling subsystem.",
+    "Strong coupling to Analysis: AxisInfo (drives load/store vectorization via getPtrContiguity/getMaskAlignment), Allocation (ModuleAllocation -> shared-memory offsets), and Membar (ModuleMembarAnalysis -> barrier insertion) all live in lib/Analysis and are prerequisite INPUTS to lowering. Reference them, don't re-derive them here.",
+    "Backend seam / where-the-code-lives trap: lib/Conversion/TritonGPUToLLVM holds only the *shared/target-independent* patterns (convert-layout, local memory ops, reduce/scan, view, func, elementwise base, make-range). The heavy per-op lowering — global load/store, dot->mma/wgmma, NVIDIA elementwise/fp8, the ConvertTritonGPUToLLVM pass driver itself — lives in third_party/nvidia/lib. triton-ascend mounts its Ascend backend at exactly these seams.",
+    "TargetInfo abstraction is the cross-backend interface: TargetInfoBase (include/.../TargetInfoBase.h) declares loadDShared/storeDShared/storeMatrixShared/shuffle/getClusterCTAId etc.; NVIDIA::TargetInfo implements them. Shared patterns call through this base so the same convert-layout/reduce code serves multiple backends. This is a configured seam, not incidental.",
+    "LinearLayout new-path / legacy-path coexistence: ConvertLayoutOpToLLVM ships both a LinearLayout-based conversion (benefit+1, preferred) and legacy Blocked/Mma shared-memory conversion, gated by `useLegacyMMAConversion` and littered with `FIXME [Dot LL]`. The code is mid-migration; teaching must explain WHY two paths coexist rather than pretending the design is settled."
+  ],
+  "units": [
+    {
+      "title": "五级台阶：从 TTIR 到 cubin 的降级全景",
+      "focus": "用 compiler.py 的 add_stages 把整条降级链 ttir->ttgir->llir->ptx->cubin 串成一张地图，点名后端接入接缝（load_dialects / add_stages / make_* 各级 pass-manager 注入点）。",
+      "one_para": "This is the orientation map. third_party/nvidia/backend/compiler.py::CUDABackend.add_stages registers five callables (make_ttir/make_ttgir/make_llir/make_ptx/make_cubin); each builds an MLIR pass_manager (or shells to ptxas) and hands the module to the next rung. make_ttgir wires add_convert_to_ttgpuir + the TTGIR optimization passes; make_llir wires decompose->scf_to_cf->index_to_llvm->allocate_shared_memory->add_to_llvmir(cap,ptxVer)->nvgpu_to_llvm->arith_to_llvm, then translates MLIR-LLVM to real LLVM IR. This file IS the primary backend seam: load_dialects(ctx) mounts the NVGPU third-party dialect, add_stages injects the stage callables, and CUDAOptions/GPUTarget carry num_warps/num_ctas/capability. For the triton-ascend sister book, the entire per-backend stage list and dialect mounting is what gets swapped here. Keep it a map chapter — no runnable subset, it's Python pass-plumbing over C++ passes.",
+      "key_source_paths": [
+        "third_party/nvidia/backend/compiler.py",
+        "include/triton/Conversion/TritonToTritonGPU/Passes.td",
+        "include/triton/Conversion/TritonGPUToLLVM/Passes.td"
+      ],
+      "est_size": "M",
+      "mode_hint": "skip_impl"
+    },
+    {
+      "title": "第一跳 TTIR->TTGIR：给每个张量贴上布局",
+      "focus": "ConvertTritonToTritonGPUPass 如何用 dialect-conversion 框架把无布局张量默认贴成 Blocked 编码，并逐算子（expand_dims/split/cat/trans/broadcast/dot）推导返回布局；DotPattern 触发 DotOperand 编码与 ConvertLayoutOp 的插入。",
+      "one_para": "lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp is the first lowering hop. It runs applyPartialConversion with a TritonGPUTypeConverter whose core rule (in TritonGPUConversion.cpp) attaches getDefaultBlockedEncoding to any RankedTensorType lacking an encoding, and threads num_warps/threads_per_warp/num_ctas as module attrs. Most ops go through GenericOpPattern (convert result types, re-create op), but structural ops carry bespoke layout math: TritonExpandDimsPattern inserts a size-1 axis into sizePerThread/threadsPerWarp/warpsPerCTA/CTALayout and wraps the operand in a SliceEncoding via a new ConvertLayoutOp; TritonDotPattern picks a Blocked result layout by element count and forces both operands into DotOperandEncodingAttr, inserting ConvertLayoutOp glue; Split/Cat/Trans/Broadcast each massage the encoding. The ConversionTarget marks tt.dot dynamically-legal only once both operands are DotOperand-encoded, driving the rewrite. Target-independent C++/MLIR — no runnable subset; teach via before/after IR diffs.",
+      "key_source_paths": [
+        "lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp",
+        "lib/Conversion/TritonToTritonGPU/TritonGPUConversion.cpp",
+        "include/triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
+      ],
+      "est_size": "L",
+      "mode_hint": "skip_impl"
+    },
+    {
+      "title": "布局代数（原理章）：Blocked / Slice / Mma / DotOperand 与 Linear Layout",
+      "focus": "把'布局=从张量逻辑坐标到 (register, lane, warp, block) 的映射'讲透：Blocked 的 sizePerThread/threadsPerWarp/warpsPerCTA/order/CTALayout 四元组、Slice/Mma/DotOperand 的派生，以及统一它们的 LinearLayout 抽象。这是理解两跳降级的中枢先修，定义在 Dialect 子系统、被 Conversion 消费。",
+      "one_para": "A primer chapter — the pipeline's central abstraction. A distributed layout answers 'which thread's which register holds tensor element (i,j)?'. BlockedEncodingAttr encodes it as a nested tiling (sizePerThread x threadsPerWarp x warpsPerCTA, with order + CTALayout for multi-CTA); SliceEncoding is a projection (drops an axis), NvidiaMmaEncoding matches tensor-core output fragment layouts, DotOperandEncoding matches mma/wgmma input fragments, SharedEncoding describes swizzled shared-memory tiles. Triton v3 unifies all of these under LinearLayout: a layout is a linear (xor-of-basis) map over dims {register, lane, warp, block} -> offset, so composing/inverting layouts (invertAndCompose) mechanically derives the shared-memory round-trip for any convert. The header include/triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h (toLinearLayout, chooseShemLayoutForRegToRegConversion, chooseStMatrixLayout) is the bridge Conversion calls into. Definitions live in the Dialect subsystem — flag the coupling. Primer: teach the math + one worked 16x16 example, not source line-by-line.",
+      "key_source_paths": [
+        "include/triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h",
+        "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp",
+        "lib/Conversion/TritonGPUToLLVM/TypeConverter.cpp"
+      ],
+      "est_size": "M",
+      "mode_hint": "primer"
+    },
+    {
+      "title": "第二跳的地基：ConvertTritonGPUToLLVM 总装与类型塌缩",
+      "focus": "NVIDIA 后端的 pass 驱动如何两阶段（先 func 后 ops）把 TTGIR 降到 LLVM+NVVM：TritonGPUToLLVMTypeConverter 把带布局张量塌缩成 LLVM struct-of-N-elements（shared/memdesc 塌成 {ptr, offsets, strides}），benefit 优先级排序把几十个 populate*Patterns 拼进一个 RewritePatternSet。后端接缝：TargetInfo 注入 + pattern 集注册点。",
+      "one_para": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp is the spine of hop 2. It constructs TargetInfo(computeCapability, ptxVersion), a TritonGPUToLLVMTypeConverter (lib/Conversion/TritonGPUToLLVM/TypeConverter.cpp) that collapses a distributed RankedTensorType into an LLVM struct of getTotalElemsPerThread(type) scalars, a SharedEncoding tensor / MemDescType into {ptr(shared), 2*rank i32 offsets+strides}, pointers into LLVM structs, and fp8 types into i8. It runs in two applyPartialConversion phases: first FuncOp+ControlFlow (so callee shared-mem base is known), then the giant op phase where ~30 populate*Patterns are registered with layered PatternBenefit (convert-layout optimized > LL > default). initSharedMemory injects the extern global_smem array; ModuleAllocation + ModuleMembarAnalysis (with NVIDIA::canSkipBarSync) pre-compute offsets and barriers. This file is the definitive backend seam: the pattern list and TargetInfo are exactly what a new backend (Ascend) replaces. skip_impl.",
+      "key_source_paths": [
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp",
+        "lib/Conversion/TritonGPUToLLVM/TypeConverter.cpp",
+        "include/triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h",
+        "include/triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
+      ],
+      "est_size": "L",
+      "mode_hint": "skip_impl"
+    },
+    {
+      "title": "ConvertLayoutOp 的降级：跨布局搬运的三条路径",
+      "focus": "布局转换如何在 LLVM 层实现：LinearLayout 相除得到最小转换，据 register/lane/warp/block 哪一维参与选路——纯寄存器重排（同线程）、warp shuffle 或 shared memory 往返（transferWithinBlock，含 stmatrix 快路径与 padding 防 bank 冲突）；并存的 legacy Blocked/Mma 路径。",
+      "one_para": "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp lowers the ubiquitous glue op. The preferred ConvertLayoutOpUsingLinearLayoutsConversion computes minimalCvtLayout(src,dst) and dispatches on which LinearLayout input dim survives: 'register' only => transferWithinThread (pure reindex of the value vector, zero traffic); 'lane' => warp shuffle (currently still via shared mem TODO); 'warp'/'block' => transferWithinBlock, a store-to-shared then load-from-shared round trip where src/dstLayout.invertAndCompose(sharedLayout) give the exact shmem addresses, chooseStMatrixLayout enables an stmatrix fast path, and one-dim padding avoids bank conflicts. A legacy ConvertLayoutOpConversion (processReplica) handles Blocked/Mma with data-padding, gated by useLegacyMMAConversion=false and the FIXME [Dot LL] Ampere kWidth packing hacks. Utility.cpp supplies applyLinearLayout/getSharedMemoryBase/linearize. Heavy, target-independent; teach the three-path decision tree with a diagram. skip_impl.",
+      "key_source_paths": [
+        "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp",
+        "lib/Conversion/TritonGPUToLLVM/Utility.cpp",
+        "include/triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
+      ],
+      "est_size": "L",
+      "mode_hint": "skip_impl"
+    },
+    {
+      "title": "共享内存的分配、偏移标注与屏障插入",
+      "focus": "AllocateSharedMemory pass 如何用 ModuleAllocation 把每个 buffer 的 offset 以 allocation.offset 属性钉到 op 上、把总量写进 triton_gpu.shared；以及降级期 initSharedMemory 建 global_smem extern 数组、ModuleMembarAnalysis + canSkipBarSync 决定屏障。",
+      "one_para": "lib/Conversion/TritonGPUToLLVM/AllocateSharedMemory.cpp is a tiny but pivotal pass: it walks each function, asks ModuleAllocation (lib/Analysis/Allocation) for each op/value's bufferId, and stamps an integer allocation.offset attr, then annotates the module with total triton_gpu.shared bytes. Downstream, TritonGPUToLLVM.cpp::initSharedMemory materializes a single extern LLVM global 'global_smem' (array<i8,0>, 16B aligned, shared address space) that every allocation indexes into via getSharedMemoryBase(op)+offset. Correctness across the shared reuse comes from ModuleMembarAnalysis, whose NVIDIA::canSkipBarSync encodes which mbarrier/TMA op pairs may skip a barrier. This unit ties the Analysis subsystem (Allocation/Membar) to the concrete LLVM lowering; explain the offset->global_smem+gep addressing model. skip_impl (relies on Analysis outputs; verify via annotated IR).",
+      "key_source_paths": [
+        "lib/Conversion/TritonGPUToLLVM/AllocateSharedMemory.cpp",
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp",
+        "include/triton/Conversion/TritonGPUToLLVM/Passes.td"
+      ],
+      "est_size": "M",
+      "mode_hint": "skip_impl"
+    },
+    {
+      "title": "分布式↔共享内存：local_alloc / local_load / local_store 与 swizzle",
+      "focus": "MemoryOpToLLVM 如何把寄存器里的分布式张量写进/读出 swizzle 过的共享内存（SharedEncoding 的 perPhase/maxPhase 换相防 bank 冲突），以及给 dot 喂料的 ldmatrix 加载器（MMA16816SmemLoader）。",
+      "one_para": "lib/Conversion/TritonGPUToLLVM/MemoryOpToLLVM.cpp lowers the shared-memory op trio. LocalAllocOpConversion builds a SharedMemoryObject over global_smem and, if seeded, stores the distributed source in via storeDistributedToShared (Utility.cpp), swizzling per the SharedEncoding order. LocalStoreOpConversion does the same for an existing memdesc; LocalLoadOpConversion reads shared back to a distributed/dot layout via loadSharedToDistributed, with Ampere i8/bf16 i32-packing hacks (FIXME [Dot LL]) and an FMA-dot shortcut. The swizzle itself (perPhase/maxPhase phase-xor to spread rows across banks) is defined in SharedEncodingAttr (Dialect) and consumed here. The real ldmatrix loader for feeding mma is third_party/nvidia/.../ConvertLayoutOpToLLVM/SharedToDotOperandMMAv2.cpp (MMA16816SmemLoader, canUseLdmatrix). Teach swizzle with a bank-conflict diagram. skip_impl.",
+      "key_source_paths": [
+        "lib/Conversion/TritonGPUToLLVM/MemoryOpToLLVM.cpp",
+        "lib/Conversion/TritonGPUToLLVM/Utility.cpp",
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ConvertLayoutOpToLLVM/SharedToDotOperandMMAv2.cpp"
+      ],
+      "est_size": "L",
+      "mode_hint": "skip_impl"
+    },
+    {
+      "title": "全局访存的向量化：tt.load / tt.store -> ld/st.global",
+      "focus": "LoadStoreOpToLLVM 如何用 AxisInfo 的指针连续性（getPtrContiguity）与 mask 对齐算出向量宽度（min(128/bitwidth, contiguity)），拼出带谓词/cache-modifier/evict-policy 的 ld/st.global 内联 PTX，处理 mask/other 与去冗余写 mask。",
+      "one_para": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp is where memory bandwidth is won. getVectorSize = min(128/pointeeBitWidth, axisAnalysisPass.getPtrContiguity(ptr)), then clamped by getMaskAlignment(mask); a vec==1 with numElems>1 emits a 'vectorization fails' remark. Per vec-group it builds a PTXBuilder 'ld.global' with .v(nWords).b(width), cache modifiers (ca/cg), L1 evict_first/last, and a boolean predicate from the mask; 'other' values are folded in via predicated mov (splat-const fast path). StoreOp mirrors this and uses redundantDataMask to stop threads that replicate data (per sizePerThread/CTA multicast) from writing. This unit is the clearest payoff of the AxisInfo analysis and a backend seam (TargetInfo, PTX text). No GPU to run — verify via generated PTX snippets. skip_impl.",
+      "key_source_paths": [
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp",
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TargetInfo.cpp",
+        "include/triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
+      ],
+      "est_size": "L",
+      "mode_hint": "skip_impl"
+    },
+    {
+      "title": "矩阵乘的指令选择：tt.dot -> mma / wgmma / fma",
+      "focus": "DotOpToLLVM 分派器如何按结果的 NvidiaMma 布局版本选指令——Volta->mma.884、Turing->mma.1688、Ampere->mma.16816、Hopper 的 WarpGroupDot->wgmma，非 mma 走 FMA 兜底；MMAv2 的 register value-table 与 kWidth=8 拆 mma 的细节。",
+      "one_para": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM.cpp is a thin but decisive dispatcher: it reads the result's NvidiaMmaEncoding version and, if supportMMA holds, routes to convertMMA884 (Volta) / convertMMA1688 (Turing) / convertMMA16816 (Ampere) in DotOpToLLVM/MMAv2.cpp, while the separate WarpGroupDotOp routes Hopper to convertWGMMA (DotOpToLLVM/WGMMA.cpp); a Blocked result falls back to convertFMADot (DotOpToLLVM/FMA.cpp). MMAv2.cpp holds the ValueTableV2 machinery — loadC packing, getValuesFromDotOperandLayoutStruct, and the kWidth==8 Ampere case that splits one logical mma into 4 stride-4 mmas. Each emits the mma.sync.aligned.mNkK PTX via PTXBuilder. This is the tensor-core heart; pair it conceptually with the mma fragment layouts from the layout primer. Backend-specific, skip_impl (needs a tensor-core GPU to run).",
+      "key_source_paths": [
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM.cpp",
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv2.cpp",
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/WGMMA.cpp",
+        "lib/Conversion/TritonGPUToLLVM/DotOpToLLVM/FMA.cpp"
+      ],
+      "est_size": "L",
+      "mode_hint": "skip_impl"
+    },
+    {
+      "title": "逐元素算子与 fp8 转换的降级",
+      "focus": "ElementwiseOpConversionBase 的通用套路：把 LLVM struct 拆成 per-thread 标量、i32 打包/拆包（packI32/unpackI32）、逐元素调子类、再 repack；以及 NVIDIA 后端的 fp8<->fp16/bf16 数值转换与 clamp 优化路径。",
+      "one_para": "include/triton/Conversion/TritonGPUToLLVM/ElementwiseOpToLLVMBase.h defines the reusable pattern: unpack the operand struct into scalars, unpackI32 sub-32-bit packed lanes, call the subclass's createDestOps once per element (via MultipleOperandsRange so multi-operand ops zip lanes), then packI32 + repack into a result struct. third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ElementwiseOpToLLVM.cpp specializes it for NVIDIA: hand-tuned fp8e4/fp8e5 <-> fp16/bf16 conversions (sm80 vs sm70 code paths, PTX cvt sequences), the ClampF optimized pattern, and ExternElementwise/InlineAsm. This is the least layout-entangled unit — good place to show the struct-of-elements type model concretely. Backend-specific numerics but logic is simple; skip_impl (fp8 rounding truly needs the GPU to validate).",
+      "key_source_paths": [
+        "include/triton/Conversion/TritonGPUToLLVM/ElementwiseOpToLLVMBase.h",
+        "lib/Conversion/TritonGPUToLLVM/ElementwiseOpToLLVM.cpp",
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ElementwiseOpToLLVM.cpp"
+      ],
+      "est_size": "L",
+      "mode_hint": "skip_impl"
+    },
+    {
+      "title": "跨线程归约：reduce 与 scan 的 shuffle + shared 降级",
+      "focus": "ReduceOpToLLVM / ScanOpToLLVM 如何把带 combine region 的归约/前缀和落成硬件：warp 内 shfl.bfly 树、warp 间经共享内存汇合，scan 的 Kogge-Stone 段内前缀 + 跨段累加；ReduceScanCommon 的共用骨架与 combine region 内联。",
+      "one_para": "lib/Conversion/TritonGPUToLLVM/ReduceOpToLLVM.cpp and ScanOpToLLVM.cpp lower tt.reduce/tt.scan, which carry a user combine region (e.g. add/max) that gets inlined at each combination step. ReduceScanCommon.h holds the shared scaffolding (unpacking, applying the combine region, index math). Reduce does an intra-warp butterfly shuffle tree then an inter-warp reduction through shared memory (using targetInfo.shuffleXor / loadShared). Scan implements a Kogge-Stone within-thread + within-warp prefix then adds cross-warp/cross-segment carry, honoring the reverse flag. Both are target-independent and call through TargetInfo for shuffles. Good teaching value: shows the shuffle-vs-shared tradeoff again. skip_impl.",
+      "key_source_paths": [
+        "lib/Conversion/TritonGPUToLLVM/ReduceOpToLLVM.cpp",
+        "lib/Conversion/TritonGPUToLLVM/ScanOpToLLVM.cpp",
+        "lib/Conversion/TritonGPUToLLVM/ReduceScanCommon.h"
+      ],
+      "est_size": "L",
+      "mode_hint": "skip_impl"
+    },
+    {
+      "title": "内联 PTX 构造器与 NVGPU dialect 的降级",
+      "focus": "PTXBuilder/AsmFormat 如何把结构化的操作数+约束拼成一条 llvm.inline_asm（$0 占位、约束串、predicate）；NVGPUToLLVMPass 如何把 NVGPU dialect 的高层 op（wgmma.fence、cluster_cta_id、named barrier、setmaxnreg 等固定 PTX 片段）批量降成 inline asm。第三方 dialect 挂载接缝。",
+      "one_para": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/PTXAsmFormat.cpp + include/triton/Conversion/TritonGPUToLLVM/AsmFormat.h implement PTXBuilder: a small DSL where newOperand(constraint)/newAddrOperand/newListOperand build operands, create<>(\"ld\").global().v(n).b(w) builds an instruction with modifiers, and launch() emits an llvm.inline_asm op with the assembled '$0, [$1]' string and constraint list — this is how every hardware instruction in the subsystem is produced. NVGPUToLLVMPass.cpp then greedily rewrites the NVGPU dialect's high-level ops (WGMMAFence, ClusterCTAId, named-barrier arrive/wait, RegAlloc/Dealloc setmaxnreg, canonical warp id) each defined as a fixed PTX template string into inline asm via the same builder. The NVGPU dialect itself (third_party/nvidia/lib/Dialect/NVGPU) is a mounted third-party dialect — a sister-book seam. skip_impl.",
+      "key_source_paths": [
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/PTXAsmFormat.cpp",
+        "include/triton/Conversion/TritonGPUToLLVM/AsmFormat.h",
+        "third_party/nvidia/lib/NVGPUToLLVM/NVGPUToLLVMPass.cpp"
+      ],
+      "est_size": "M",
+      "mode_hint": "skip_impl"
+    },
+    {
+      "title": "最后一跳 LLVM->PTX 出口：MLIR-LLVM 翻译、nvptx 后端与 ptxas",
+      "focus": "lib/Target/LLVMIR 的收尾 LLVM-pass（BreakPhiStruct 拆结构体 phi、DIScope 补调试作用域），以及 compiler.py make_llir/make_ptx/make_cubin 如何把 MLIR-LLVM 转成真 LLVM IR、挂 nvptx datalayout、O3、translate_to_asm 出 PTX、再 shell 到 ptxas 出 cubin。",
+      "one_para": "The exit ramp. After ConvertTritonGPUToLLVM produces MLIR in the LLVM+NVVM dialects, lib/Target/LLVMIR runs cleanup LLVM-IR passes: LLVMIRBreakPhiStruct.cpp splits one-level struct phi nodes into per-field phis (Triton emits struct-typed values everywhere; breaking them unlocks downstream LLVM opts), and LLVMDIScope.cpp attaches debug scopes. compiler.py::make_llir then calls llvm.to_module (MLIR-LLVM -> real LLVM Module), attaches the nvptx64 triple + sm_XX datalayout + features, links libdevice, and runs OPTIMIZE_O3. make_ptx calls llvm.translate_to_asm (the LLVM NVPTX backend) to emit PTX text, patches the .version line, and make_cubin shells out to ptxas --gpu-name=sm_XX to produce the final cubin. This closes the loop back to the stage-ladder overview and is the second major backend seam (target triple / ptxas invocation are per-backend). skip_impl.",
+      "key_source_paths": [
+        "lib/Target/LLVMIR/LLVMIRBreakPhiStruct.cpp",
+        "lib/Target/LLVMIR/LLVMDIScope.cpp",
+        "include/triton/Target/LLVMIR/Passes.td",
+        "third_party/nvidia/backend/compiler.py"
+      ],
+      "est_size": "M",
+      "mode_hint": "skip_impl"
+    }
+  ]
+}
