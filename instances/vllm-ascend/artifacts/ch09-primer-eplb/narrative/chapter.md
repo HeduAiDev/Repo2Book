@@ -197,7 +197,7 @@ card0 的新集合 `{3,4,7,5,1}` 里，3、4、1 本来就在 card0 → 原槽�
 
 ![按 deepseek-ai/EPLB README Fig.1（arXiv:2412.19437 附属参考实现）描述重绘：分层策略示例——16 个物理副本摊到 2 节点 × 4 GPU 的放置网格](../diagrams/paper-fig-1.png)
 
-图里每格的数字就是 `phy2log` 张量（物理槽位 → 逻辑专家 id 的映射）在那个（节点、GPU、槽位）位置写下的逻辑专家 id——节点 0 的 GPU 0 与 GPU 1 各有一格「5」，是专家 5 的两份冗余副本被摊到同节点内的两张不同 GPU 上：复制摊负载、副本不共卡，与本章的推导一脉相承。差别在「按节点成块」的规整分区：本章 `DefaultEplb` 走的是**全局**一支，不做 group→node 绑定，把全部副本直接摊到所有卡上——它在策略工厂 `PolicyFactory` 的分发表里是 `policy_type = 1` 的默认策略，代码注释自述「overall expert replacement based on current moe load」，「overall」正对应论文的 global。这是设计选择而非遗漏：`DefaultEplb` 定位为不依赖分组路由的通用全局规划器；工厂里其余几种备选策略与分发机制，落地见[第 10 章](../../ch10-eplb-expert-load-balancing/narrative/chapter.md)。
+图里每格的数字就是 `phy2log` 张量（物理槽位 → 逻辑专家 id 的映射）在那个（节点、GPU、槽位）位置写下的逻辑专家 id——节点 0 的 GPU 0 与 GPU 1 各有一格「5」，是专家 5 的两份冗余副本被摊到同节点内的两张不同 GPU 上：复制摊负载、副本不共卡，与本章的推导一脉相承。差别在「按节点成块」的规整分区：本章 `DefaultEplb` 走的是**全局**一支，不做 group→node 绑定，把全部副本直接摊到所有卡上——它在策略工厂 `PolicyFactory` 的分发表里是 `policy_type = 1` 的默认策略，代码注释自述「overall expert replacement based on current moe load」，「overall」正对应论文的 global。这是设计选择而非遗漏，且均衡上一分不亏：本章的地板定理与两段贪心从头到尾没碰过组结构，而分层的 group→node 绑定只是把可行放置收窄成全局的一个子集——同一套贪心在更大的集合上搜，最热卡只会更低、不会更高。绑定买的从来不是均衡，是通信：让分组路由的 token 尽量留在节点内，「不增加跨节点 all-to-all 通信开销」（§3.4 原话），而这有前置——上面引文第一句的「节点数整除专家组数」。一旦前置不满足，或像 decode 大规模 EP 那样每卡只放一个专家、all-to-all 本就走跨节点点对点直连（§3.4），绑定买不到任何东西，约束更少的全局一支就是正确的剩余项——`DefaultEplb` 正是这支不依赖分组路由的通用全局规划器；工厂里其余几种备选策略与分发机制，落地见[第 10 章](../../ch10-eplb-expert-load-balancing/narrative/chapter.md)。
 
 ---
 
