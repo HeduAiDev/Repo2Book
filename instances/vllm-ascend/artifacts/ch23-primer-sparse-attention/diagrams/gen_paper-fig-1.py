@@ -92,7 +92,7 @@ for cx, key in zip(branch_cx, ["cmp", "slc", "win"]):
               f'stroke="{BRANCH_COLORS[key]}" stroke-width="1.6" marker-end="url(#a)" opacity="0.75"/>')
 
 BRANCH_LABELS = [
-    ("cmp", "压缩支路 Compression", "块内均值池化"),
+    ("cmp", "压缩支路 Compression", "块内可学习 MLP 压缩"),
     ("slc", "选择支路 Selection", "Top-n 块 + concat"),
     ("win", "滑窗支路 Sliding", "保留最近 w 个 token"),
 ]
