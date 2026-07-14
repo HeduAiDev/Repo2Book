@@ -91,4 +91,4 @@ python3 scripts/lint_diagram_geometry.py --all   # 图：文字越界/相撞/压
 2. implementer 别过度删减/误删——只删 `delete` 批准项，`must_keep` 必保留。
 3. 标记完成前跑全部 linter（含 `--all` 锚点/半角/图几何）。
 4. 别赌自己的上下文——决策/状态写进 trace、Bible、本文档 / `INSTANCE.md`。
-5. **git push 须前台**（后台 shell SSH 鉴权失败）；只在用户要求时提交/推送。
+5. **提交后自动推送**（2026-07-14 用户定）：任务节点照常提交，提交完即推送、不必等用户指示。推送**须前台**跑且走 **gh HTTPS**（`git push https://github.com/HeduAiDev/Repo2Book.git <branch>`——SSH 22 端口被墙必超时，`gh auth setup-git` 已配好凭据）。
