@@ -192,3 +192,33 @@ def test_markdown_hostile_inline_math_blocking(tmp_path):
     # 字母后的下划线开不了强调,朴素写法安全
     ch.write_text("标量 $a_i$ 与 $b_j$ 同段。\n", encoding="utf-8")
     assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 0
+
+
+def test_display_math_dollar_block_blocking(tmp_path):
+    """$$ 块级数学被 GitHub 吃反斜杠(\\, → 逗号、\\{ → \\left 报错),须阻断改 ```math(2026-07-14)。"""
+    import subprocess, sys
+    LINT = str(pathlib.Path(__file__).resolve().parents[1] / "lint_formulas.py")
+    ch = tmp_path / "chapter.md"
+    ch.write_text("公式:\n\n$$\na\\,b = \\left\\{ x \\right\\}\n$$\n", encoding="utf-8")
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 1
+    ch.write_text("> 引用块内:\n>\n> $$\n> a\;b\n> $$\n", encoding="utf-8")
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 1
+    ch.write_text("公式:\n\n```math\na\\,b = \\left\\{ x \\right\\}\n```\n", encoding="utf-8")
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 0
+    # 代码围栏里的 $$ 字符串不误伤
+    ch.write_text("```python\ncost = \"$$\"\nx = 1\n```\n", encoding="utf-8")
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 0
+
+
+def test_cjk_in_math_fence_blocking(tmp_path):
+    """```math 围栏体内 CJK 被 strict KaTeX 拒绝,须阻断(围栏被 in_fence 跳过故单独扫)。"""
+    import subprocess, sys
+    LINT = str(pathlib.Path(__file__).resolve().parents[1] / "lint_formulas.py")
+    ch = tmp_path / "chapter.md"
+    ch.write_text("```math\nx = 全部元素\n```\n", encoding="utf-8")
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 1
+    ch.write_text("```math\nx = n_h d_h\n```\n", encoding="utf-8")
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 0
+    # 普通代码围栏里的中文不误伤
+    ch.write_text("```python\n# 中文注释\nx = 1\n```\n", encoding="utf-8")
+    assert subprocess.run([sys.executable, LINT, str(ch)]).returncode == 0

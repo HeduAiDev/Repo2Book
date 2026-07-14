@@ -120,9 +120,9 @@ def _align_up(value: int, alignment: int) -> int:
 
 `_align_up` 是「整数向上取整到 `alignment` 的倍数」，就是那个经典的整数天花板公式：
 
-$$
+```math
 \mathrm{align\_up}(v, a) = \left\lceil \frac{v}{a} \right\rceil \cdot a = \left\lfloor \frac{v + a - 1}{a} \right\rfloor \cdot a
-$$
+```
 
 人话：先把 `v` 加上 `a-1`（保证只要有余数就进位），整除 `a` 再乘回去。来两行数值看它怎么动：
 

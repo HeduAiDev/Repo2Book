@@ -34,9 +34,9 @@
 
 关键就在这里：这两层可以**分别操作**——张量指针（tensor pointer，下文记 `ptr`）指向的是 VA，VA 全程保留不动；VA 背后绑定的物理页（physical page，下文记 `page`），却可以随时解绑、重新绑定：
 
-$$
+```math
 \mathrm{ptr} \;\longrightarrow\; \mathrm{VA} \;\longrightarrow\; \mathrm{page}
-$$
+```
 
 sleep 时，我们做的是 **unmap + release 物理页**：把 VA 和物理页之间的映射拆掉、物理显存交还系统。但那段 VA 仍然被「保留」着——没还、没让出去，地图上那块地还圈着，只是上面的房子拆了。
 

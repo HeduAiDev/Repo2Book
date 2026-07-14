@@ -618,9 +618,9 @@ combine 阶段它用 `npu_moe_token_unpermute` 按 `topk_weights` 加权还原�
 
 两者的搬运量级因此是：
 
-$$
+```math
 \mathrm{AllGather} \propto N \cdot ep\_size \cdot h = 512 \times 16 \times 4096, \qquad \mathrm{All2AllV} \propto N \cdot top\_k \cdot h = 512 \times 2 \times 4096
-$$
+```
 
 上式代入了一组具体值： $`N=512`$ 、 $`h=4096`$ 、 $`ep\_size=16`$ 、 $`top\_k=2`$ （Mixtral / DeepSeek 这类 MoE 的路由 top_k 通常就在 2~8）。AllGather 把全部 token 复制到 16 张卡，All2AllV 只搬被选中的 `(token,expert)` 对——同样的 token 数与 hidden 维，AllGather 多搬 **8 倍**。
 

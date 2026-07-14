@@ -75,21 +75,21 @@
 
 **不拆**（同进程同线程，受 GIL 串行）每步总时间：
 
-$$
+```math
 T_{\mathrm{single}} = T_{cpu} + T_{gpu}
-$$
+```
 
 **拆到两进程后**，前端处理第 $`i{+}1`$ 个请求的 CPU 活，可以和后端跑第 $`i`$ 批的 GPU 活**重叠**。稳态下每步时间趋近二者的较大者：
 
-$$
+```math
 T_{\mathrm{pipelined}} = \max(T_{cpu},\, T_{gpu})
-$$
+```
 
 吞吐上界因此被抬高：
 
-$$
+```math
 \frac{1}{T_{cpu}+T_{gpu}} \;\longrightarrow\; \frac{1}{\max(T_{cpu},\, T_{gpu})}
-$$
+```
 
 **翻译成人话**：假设 tokenize 一批要 8ms、GPU 跑一步也要 8ms。不拆，每步 16ms；拆了，两件事并排跑，每步约 8ms——**吞吐近乎翻倍**。当 $`T_{cpu}`$ 和 $`T_{gpu}`$ 同量级时收益最大，这也是后面[连续批处理](../../ch13-scheduler/narrative/chapter.md)能持续把 GPU 喂饱的前提：前端不停接客、预处理，后端不停跑批，谁也别等谁。
 
@@ -634,9 +634,9 @@ class RequestOutputCollector:
 
 **per-request 队列：物理隔离 N 路。** `output_handler` 处理到本请求时，一次 `put` 直接命中它专属的 `Event`，**只唤醒那一个请求的 `generate()`**，不和任何别的请求争同一条队列。每个 `asyncio.Event` 最多只有一个等待者（该请求的 `generate()` 协程），所以 `Event.set()` 的唤醒成本恒为 O(1)。也就是说，**「派发到本请求」这一步的队列成本**约等于：
 
-$$
+```math
 T_{\mathrm{dispatch}} \approx T_{\mathrm{put}} + T_{\mathrm{resume}}
-$$
+```
 
 一次 `put` + 一次协程恢复，**与并发量 N 无关**——这正是 per-request 队列相对共享队列的胜处：把「派发到本请求」的队列竞争从 $`O(N)`$ 降到 $`O(1)`$ 。
 

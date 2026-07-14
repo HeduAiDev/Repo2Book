@@ -177,13 +177,13 @@ class CompressAttentionManager(FullAttentionManager):
 
 物理 block 数的两个公式只差一个除法：
 
-$$
+```math
 \mathrm{full}:\quad \mathrm{blocks} = \left\lceil \frac{\mathrm{num\_tokens}}{\mathrm{block\_size}} \right\rceil
-$$
+```
 
-$$
+```math
 \mathrm{compress}:\quad \mathrm{blocks} = \left\lceil \frac{\mathrm{num\_tokens} \mathbin{//} \mathrm{compress\_ratio}}{\mathrm{block\_size}} \right\rceil
-$$
+```
 
 人话：压缩比 4 时，1024 个逻辑 token 只占 256 个 slot 的 KV——按 `block_size=128` 算，全注意力要 8 个 block，压缩 MLA 只要 2 个。manager 本身不懂「压缩」是什么物理含义，它只知道把 token 数缩小 4 倍再去数 block。
 
@@ -225,9 +225,9 @@ $$
 
 至于 §25.2 给压缩 MLA 设的那个 `max_admission_blocks_per_request`，背后是一道简单的上界：
 
-$$
+```math
 \mathrm{peak\_blocks} = \left\lceil \frac{\mathrm{max\_model\_len} \mathbin{//} \mathrm{compress\_ratio}}{\mathrm{block\_size}} \right\rceil + 1
-$$
+```
 
 压缩 MLA 的 KV 不像 SWA 那样随窗口滑动回收，但它也**永不超过**这个峰值。把 admission 上限钉在这里，就和启动期 block 池的尺寸算法对齐了——长输入请求不会被 `allocate_slots` 静默拒掉、卡死在 waiting 队列里。
 
@@ -485,9 +485,9 @@ def register_ascend_mla_spec_in_manager():
 
 要求 `f(L+x) − f(L) = T`，展开就是一个一元二次方程：
 
-$$
+```math
 a \cdot x^2 + (2aL + b)\cdot x - T = 0
-$$
+```
 
 取正根。`ChunkSizePredictor.predict` 把这套解出来：
 

@@ -501,9 +501,9 @@ additional_kwargs = current_platform.set_additional_forward_context(
 
 `padded_num_tokens` 的算法是一道向上取整：
 
-$$
+```math
 \mathrm{padded\_num\_tokens} = \left\lceil \frac{\mathrm{max\_tokens\_across\_dp}}{\mathrm{tp\_world\_size}} \right\rceil \times \mathrm{tp\_world\_size}
-$$
+```
 
 直觉是「补到 tp_world_size 的整数倍」，这样 TP/SP 切分时每张卡分到的 token 数相等，通信缓冲也规整。举个数：DP 对齐后 `max_tokens_across_dp = 40`，`tp_world_size = 8`，那么 padded 到 `ceil(40/8)*8 = 40`，正好整除不用补；若是 `42`，则 `ceil(42/8)*8 = 48`，补 6 个 padding。`mc2_mask` 随即把前 `num_actual_tokens` 个标 `True`、其余标 `False`——真假 token 一目了然，MC2 才不会把 padding 当真数据算进去。
 

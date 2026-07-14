@@ -34,10 +34,10 @@
 
 标准因果自注意力里，第 $`t`$ 个 query 要对它前面全部 $`t`$ 个 token 各算一次 $`q\cdot k`$ ——像会场里每个新进门的人都要跟在场所有人握一遍手。整条序列的点积总数就是 $`1+2+\cdots+L = L(L+1)/2`$ ：这就是那笔「 $`O(L^2)`$ 注意力税」。NSA 论文的背景公式先把标准注意力写清楚(arXiv:2502.11089 §3.1 Eq.(1)-(2)，下式把 Eq.(1) 的输出 $`\mathbf{o}_t`$ 与 Eq.(2) 的 softmax 展开并作一处):
 
-$$
+```math
 \mathbf{o}_t = \sum_{i=1}^{t} \frac{\alpha_{t,i}\,\mathbf{v}_i}{\sum_{j=1}^{t}\alpha_{t,j}}, \qquad
 \alpha_{t,i} = \exp\!\left(\frac{\mathbf{q}_t^{\top}\mathbf{k}_i}{\sqrt{d_k}}\right)
-$$
+```
 
 这里 $`d_k`$ 是 key 向量的特征维度——分母 $`\sqrt{d_k}`$ 是标准缩放点积注意力的老规矩，维度变大时把点积规模压回合理范围，避免 softmax 被推进梯度消失区；第三节讲 indexer 的缩放会再碰到同一个直觉，只是换了个记号。
 
@@ -98,16 +98,16 @@ $$
 
 NSA 动的不是注意力算子，而是喂给它的 KV(§3.2 Eq.(3)-(4))：把 Eq.(1) 里的全量 $`\mathbf{k}_{:t},\mathbf{v}_{:t}`$ 换成一份按当前 query 动态构造的紧凑集，注意力本身照旧算。紧凑集怎么构造？NSA 给了三种映射策略，用一组门控 $`g_t^c`$ 把三条支路的输出加权求和(§3.2 Eq.(5)):
 
-$$
+```math
 \mathbf{o}_t^{*} = \sum_{c\in\mathcal{C}} g_t^c \cdot \mathrm{Attn}\!\left(\mathbf{q}_t, \widetilde{K}_t^{c}, \widetilde{V}_t^{c}\right), \qquad
 \mathcal{C} = \{\mathrm{cmp}, \mathrm{slc}, \mathrm{win}\}
-$$
+```
 
 $`\mathcal{C}`$ 里的 cmp/slc/win 就是压缩、选择、滑窗三支路，每支路只对一份紧凑的 KV 做注意力——读一份长报告的三个动作：扫目录抓大意(压缩)、翻到最相关几章细读(选择)、顺手看一眼手边段落(滑窗)。但三支路不是拍脑袋凑的组合拳，而是一条因果链：压缩是起点，选择补压缩的失败模式，滑窗补训练动力学的失败模式，门控最后把三路合一——门 $`g_t^c`$ 怎么来、为什么带下标 $`t`$ ，等三条支路立起来再收(本节末)。省不省钱，取决于三支路留下的 token 总数 $`N_t`$(§3.2 Eq.(6)):
 
-$$
+```math
 N_t = \sum_{c\in\mathcal{C}} \mathrm{size}\!\left[\widetilde{K}_t^{c}\right], \qquad N_t \ll t
-$$
+```
 
 这个 $`N_t \ll t`$ 就是「稀疏为何省」的定量定义。
 
@@ -138,9 +138,9 @@ $`N_t \ll t`$ 不是空头支票——给三支路各配一份预算(压缩条�
 
 压缩回答最朴素的问题：上文那么长，能不能先「变短」再做注意力？NSA 的做法(§3.3.1 Eq.(7))是把 key 序列按滑动窗口切块，每块用一个函数 $`\varphi`$ 压成一条紧凑 key：
 
-$$
+```math
 \widetilde{K}_t^{\mathrm{cmp}} = f_K^{\mathrm{cmp}}\!\left(\mathbf{k}_{:t}\right) = \left\{ \varphi\!\left(\mathbf{k}_{id+1\,:\,id+l}\right) \;\middle|\; 0 \le i \le \left\lfloor \frac{t-l}{d} \right\rfloor \right\}
-$$
+```
 
 左边的映射 $`f`$ (上标 cmp、下标 K 标记「压缩支路、key 侧」)就是框架里说的「映射策略」在压缩支路的实例。三个新记号逐个落地： $`l`$ 是块长(每块 $`l`$ 个 token)； $`d`$ 是相邻块起点的滑动步长——注意这个 $`d`$ 是步长，与 §六 成本模型里的特征维 $`d`$ 同符不同义(速查表也提醒了)，下标里的 $`id`$ 也因此是乘积 $`i\cdot d`$ ——第 $`i`$ 块从位置 $`id+1`$ 起步； $`\varphi`$ 是一个带块内位置编码的**可学习 MLP**(多层感知机)，负责把一块 $`l`$ 个 key 揉成一条。value 侧同构地压出 $`\widetilde{V}_t^{\mathrm{cmp}}`$ 。三个设计决策各有讲头：
 
@@ -154,9 +154,9 @@ $$
 
 细读之前得先知道读哪，也就是给每个候选块打重要性分。最朴素的做法是单独立一个打分网络——那是一笔新开销，而且立论第二宗罪立刻找上门：分数要靠训练才打得准，可离散选择挡住了梯度，只好再立一份辅助损失专门教它打分，代价与效果都成问题。NSA 的答案(§3.3.2)漂亮得多： **压缩支路做注意力时，顺手已经把每个压缩块对当前 query 的 softmax 分数算出来了——直接拿它当块的重要性** (Eq.(8))：
 
-$$
+```math
 \mathbf{p}_t^{\mathrm{cmp}} = \mathrm{Softmax}\!\left(\mathbf{q}_t^{\top}\widetilde{K}_t^{\mathrm{cmp}}\right)
-$$
+```
 
 先记一句：Eq.(8) 写的是单头视角——组内每个 query 头各有自己的一份压缩注意力分数，这个伏笔马上要用。能复用的前提是两条支路的块对得上：当压缩块与选择块用同一套分块( $`l'=l=d`$ ， $`l'`$ 是选择块大小)，同一段 token 在两条支路里落在同一个块位置，压缩分数与选择块一一对应，直接搬用 $`\mathbf{p}_t^{\mathrm{slc}}=\mathbf{p}_t^{\mathrm{cmp}}`$ ；分块不对齐时按空间重叠折算(Eq.(9)，收进节末严谨框——DSA 后来连整套块机制一起砍了，是真旁支)。这步「复用」买到的远不止省一笔账：
 
@@ -167,18 +167,18 @@ $$
 
 **第一步，跨头求和(Eq.(10))。** GQA 下同组 query 头共享一份 KV cache，立论里 Quest 的教训言犹在耳：各头各选各的，访存按并集算，白省。NSA 把组内所有头的分数逐块相加，得到一份全组共享的重要性：
 
-$$
+```math
 \mathbf{p}_t^{\mathrm{slc}\prime} = \sum_{h=1}^{H} \mathbf{p}_t^{\mathrm{slc},(h)}
-$$
+```
 
 上标 $`(h)`$ 是头号， $`H`$ 是组内 query 头数(速查表提醒过：别与下一节的 indexer 头数 $`H^I`$ 混淆)；撇号专门标记「已跨头求和」。一组只剩一份分数，就只剩一份选择——解码时要搬的 KV 恰好就是选中的那几块，计算稀疏第一次真正兑换成访存稀疏。DSA 用的 MQA 是 GQA「只有一组」的特例，同一件事在那边天然成立，§四 会回头用它。
 
 **第二步，top-n 截断与拼接(Eq.(11)-(12))。** 按共享分数降序取前 $`n`$ 名( $`\mathrm{rank}=1`$ 是最高分)，把选中块里的**原始** key——不是压缩代表——逐块拼接，喂给选择支路的注意力：
 
-$$
+```math
 \mathcal{I}_t = \left\{ i \;\middle|\; \mathrm{rank}\!\left(\mathbf{p}_t^{\mathrm{slc}\prime}[i]\right) \le n \right\}, \qquad
 \widetilde{K}_t^{\mathrm{slc}} = \mathrm{Cat}\!\left[\,\left\{ \mathbf{k}_{il'+1\,:\,(i+1)l'} \;\middle|\; i \in \mathcal{I}_t \right\}\,\right]
-$$
+```
 
 $`\mathrm{Cat}`$ 是按序拼接算子，value 侧同构。为什么以块、而不是逐 token 选？还是硬件账：GPU 对连续内存块的吞吐远高于按随机下标散读，成块访存才喂得饱 Tensor Core(GPU 上专做矩阵乘加的硬件单元)——FlashAttention(把 KV 分块搬进片上缓存、逐块累积 softmax 的高性能注意力标准实现)早把「按块算」立成了公理。精度上也丢不了多少：注意力分数天然带空间连续性——相邻 key 的分数常常一起高一起低(§6.2 对预训练模型注意力图的可视化)，重要 token 所在的整块，往往正是该拿的块。
 
@@ -207,10 +207,10 @@ $`\mathrm{Cat}`$ 是按序拼接算子，value 侧同构。为什么以块、而
 
 破法是承认局部、给它单开一条路——滑窗支路固定持有最近 $`w`$ 个 token 的原始 KV(§3.3.3)：
 
-$$
+```math
 \widetilde{K}_t^{\mathrm{win}} = \mathbf{k}_{t-w\,:\,t}, \qquad
 \widetilde{V}_t^{\mathrm{win}} = \mathbf{v}_{t-w\,:\,t}
-$$
+```
 
 局部需求被这条支路喂饱之后，压缩/选择支路就不必再学局部，它们的梯度被逼向真正的长程依赖。论文还上了一道保险：三条支路各用**独立**的 key/value(而非共享一套)，边际开销很小，却把跨支路的梯度串扰也切断——每条支路只能学自己的活。窗宽 $`w`$ 是固定常数，不随 $`t`$ 涨，Eq.(6) 的账不受影响。
 
@@ -240,9 +240,9 @@ NSA 复用压缩注意力的分数，聪明，但仍绑在「先做压缩注意�
 
 lightning indexer 给 query token $`\mathbf{h}_t`$ 和前驱 token $`\mathbf{h}_s`$ 算一个 index score( $`\mathbf{h}`$ 是 token 的隐状态——§一 主注意力的 $`\mathbf{q}_t`$ 与下式的 $`\mathbf{q}^I`$ 都由它投影而来，indexer 只是另开了一路更小的投影)(arXiv:2512.02556 §2.1 Eq.(1)):
 
-$$
+```math
 I_{t,s} = \sum_{j=1}^{H^I} w_{t,j}^I \cdot \mathrm{ReLU}\!\left(\mathbf{q}_{t,j}^I \cdot \mathbf{k}_s^I\right)
-$$
+```
 
 $`H^I`$ 是 indexer 头数； $`\mathbf{q}_{t,j}^I`$ 和标量权重 $`w_{t,j}^I`$ 从 query token 导出， $`\mathbf{k}_s^I`$ 从前驱 token 导出。三步：每头做一次点积、ReLU 把负相关清零、按权重 $`w^I`$ 加权求和。
 
@@ -281,9 +281,9 @@ Eq.(1) 的每个符号在推理侧都有实名落点—— $`H^I`$ 即 indexer �
 
 DSA 的细粒度 token 选择就是这一刀(arXiv:2512.02556 §2.1 Eq.(2)):
 
-$$
+```math
 \mathbf{u}_t = \mathrm{Attn}\!\left(\mathbf{h}_t, \left\{\mathbf{c}_s \;\middle|\; I_{t,s} \in \mathrm{Top-}k(I_{t,:})\right\}\right)
-$$
+```
 
 式中 $`\mathbf{c}_s`$ 是前驱 token $`s`$ 对应的 KV 条目(在 MLA 下就是那个 latent KV);只有 index score 落在 Top-$`k`$ 内的 $`\{\mathbf{c}_s\}`$ 参与主注意力。承接开头的 MQA 前提：MLA 下每个 latent KV 条目被一个 query token 的所有头共享，所以 Top-$`k`$ 选出的是**一组跨头一致的 latent KV 条目**，而不是各头各自挑 token —— 选择在 token(latent 条目)粒度上做，却对全部头统一生效。这就是把 $`O(L^2)`$ 主注意力降到 $`O(L\cdot k)`$ 的那一刀。
 
@@ -324,16 +324,16 @@ DSA 从 DeepSeek-V3.1-Terminus 的 checkpoint 续训，分两阶段(arXiv:2512.0
 
 **Dense warm-up:** 冻结主模型，只训 indexer。把主注意力每个头的 softmax 注意力权重(即 §3.1 里的 $`\alpha_{t,\cdot}`$,不是原始点积 $`\mathbf{q}^{\top}\mathbf{k}`$)跨头求和、再 L1 归一化(除以总和，使其变成加总为 1 的概率分布),得到目标分布 $`p_{t,:}`$,用 KL 让 indexer 的 $`\mathrm{Softmax}(I_{t,:})`$ 去对齐它(§2.1.1 Eq.(3)):
 
-$$
+```math
 \mathcal{L}^{I} = \sum_t \mathbb{D}_{\mathrm{KL}}\!\left(p_{t,:} \,\|\, \mathrm{Softmax}(I_{t,:})\right)
-$$
+```
 
 **Sparse stage:** 引入 top-k,放开全参微调，让主模型主动适配「只看 top-k」的输入分布。KL 这时只在选中集 $`\mathcal{S}_t`$ 上算(§2.1.1 Eq.(4)):
 
-$$
+```math
 \mathcal{L}^{I} = \sum_t \mathbb{D}_{\mathrm{KL}}\!\left(p_{t,\mathcal{S}_t} \,\|\, \mathrm{Softmax}(I_{t,\mathcal{S}_t})\right), \qquad
 \mathcal{S}_t = \left\{s \;\middle|\; I_{t,s} \in \mathrm{Top-}k(I_{t,:})\right\}
-$$
+```
 
 论文有个细节值得记：**indexer 的输入是 detach 的，与主模型分开优化。**(detach 即切断反向传播的梯度回流 —— 打分器这一路的梯度不再流回主模型。)indexer 只由 $`\mathcal{L}^I`$ 训练，主模型只由语言建模损失训练，互不污染梯度 —— 这才有稳定的协同适配。
 
@@ -341,9 +341,9 @@ $$
 
 怎么定量证明「对齐 → 不掉点」？做个对照实验(呼应 §2.1.1 Eq.(3) 的 KL 对齐)：构造一个可调 indexer —— 把「与真注意力对齐的打分」($`\log p_{t,:}`$,标准化后)和「纯随机打分」按旋钮 $`\alpha`$ 线性插值：
 
-$$
+```math
 I = (1-\alpha)\cdot\widehat{\log p_{t,:}} + \alpha\cdot\mathrm{noise}
-$$
+```
 
 于是 $`\alpha=0`$ 时 $`\mathrm{Softmax}(I)\approx`$ 真分布 $`p_{t,:}`$ 、 $`\alpha=1`$ 时纯随机；每个 $`\alpha`$ 跑 400 次随机试验取平均，看 KL 和 top-k 召回怎么变。这里的**top-k 质量召回**指：indexer 选中的那 $`k`$ 个 token，占了真注意力全部权重的多大比例(召回 0.386 就是说这 $`k`$ 个 token 汇聚了约 39% 的真注意力质量)—— 召回越高，说明打分器越没漏掉真正重要的 token。
 
@@ -377,10 +377,10 @@ $$
 
 成本模型看两笔账(arXiv:2512.02556 §2.3)。对单个 query token,indexer 打分对 $`L`$ 个前驱各做 $`H^I`$ 个 $`d^I`$ 维点积，选出 $`k`$ 个后主注意力只在这 $`k`$ 条 KV 上算。两笔单-query 成本写成：
 
-$$
+```math
 \mathrm{indexer} \approx O(L\cdot d_{\mathrm{idx}}), \qquad
 \mathrm{main\ attn} \approx O(k\cdot d)
-$$
+```
 
 其中 $`d_{\mathrm{idx}}:=H^I\cdot d^I`$ 是 indexer 的特征总维(落地 $`64\times128`$),$`d`$ 是主注意力单条 KV 的特征维。整条序列，主注意力从 $`O(L^2)`$ 降到 $`O(L\cdot k)`$,而 indexer 仍是 $`O(L^2)`$ —— 只是常数小一个数量级。
 

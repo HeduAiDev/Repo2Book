@@ -86,9 +86,9 @@ CP 版的注意力算子住在 `context_parallel/` 子模块，`AscendMetadata` 
 
 最后一个静态方法值得记住：`get_kv_cache_shape` 钉死了 KV cache 的形状——
 
-$$
+```math
 (2,\ \mathrm{num\_blocks},\ \mathrm{block\_size},\ \mathrm{num\_kv\_heads},\ \mathrm{head\_size})
-$$
+```
 
 首维的 `2` 是 key 和 value 合存一张张量（`[0]` 是 K，`[1]` 是 V）。这个布局是后面 `slot_mapping` 寻址、`_npu_reshape_and_cache` 写入的物理基础，[第 17 章](../../ch17-kv-cache-allocation-reshape-bind/narrative/chapter.md) 已经把它的分配与 reshape 讲透，本章直接用。
 
@@ -316,9 +316,9 @@ class AscendMetadata:
 
 `slot_mapping[i]` 是第 `i` 个 token 要落进的**全局物理槽号**。按注释的例子，`slot_mapping = [35, 2, 17]`、`block_size = 16`：
 
-$$
+```math
 \mathrm{block\_id} = \lfloor \mathrm{slot} / \mathrm{block\_size} \rfloor, \qquad \mathrm{offset} = \mathrm{slot} \bmod \mathrm{block\_size}
-$$
+```
 
 于是 `35 → 块 2 第 3 槽`、`2 → 块 0 第 2 槽`、`17 → 块 1 第 1 槽`。`block_tables[req]` 则给出某序列占用的物理块号列表——读历史 KV 时算子据此去 gather。这套逻辑寻址 → 物理页的映射，[第 17 章](../../ch17-kv-cache-allocation-reshape-bind/narrative/chapter.md) 已经建立，这里只是把地址簿接过来用。
 

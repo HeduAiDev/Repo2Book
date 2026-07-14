@@ -43,9 +43,9 @@
 
 标准注意力是怎么算的？给定 $`Q`$ 、 $`K`$ 、 $`V`$(形状都是 $`N\times d`$,$`N`$ 是序列长、 $`d`$ 是每个头的维度),它老老实实按定义走三步(arXiv:2205.14135 §2.2 Algorithm 0):
 
-$$
+```math
 S=QK^{\top}\in\mathbb{R}^{N\times N},\qquad P=\mathrm{softmax}(S)\in\mathbb{R}^{N\times N},\qquad O=PV\in\mathbb{R}^{N\times d}
-$$
+```
 
 问题就出在那两张 $`N\times N`$ 的中间矩阵 $`S`$ 和 $`P`$ 。Algorithm 0 的三步，每一步都要跟 HBM 打一趟往返：第 1 步把 $`S`$ 写回 HBM,第 2 步读 $`S`$ 、写 $`P`$,第 3 步读 $`P`$ 和 $`V`$ 、写 $`O`$ 。 $`N=1024`$ 时， $`N\times N`$ 就是一百多万个元素，来回搬三趟——**访存量是 $`\Theta(N^2)`$ 级别的，而这正是 wall-clock 时间的主导项**。真正的矩阵乘反而很快就做完了。
 
@@ -79,17 +79,17 @@ flash_attn_varlen_func(
 
 softmax 要对一行 $`N`$ 个打分做归一化。数值稳定的标准做法(**safe-softmax**)要扫**三遍**:第一遍找最大值 $`m_V`$(减掉它防止 $`e^x`$ 上溢),第二遍求归一化分母 $`d_V`$,第三遍算每个输出(arXiv:1805.02867 §2 Algorithm 2):
 
-$$
+```math
 m_V=\max_k x_k,\qquad d_V=\sum_k e^{x_k-m_V},\qquad y_i=\frac{e^{x_i-m_V}}{d_V}
-$$
+```
 
 三遍扫描意味着三趟访存——放到 FlashAttention 的分块场景里，等于要求"先看完整行才能开始":既然要先扫遍整行拿到全局最大值 $`m_V`$ 才敢算任何一项，就没法只拿着一小块 KV 先动手，算法被钉死成串行的。而下面 online-softmax 用一个 running 最大值打破了这条依赖，让每一行都能拿到一块就先算一块、增量推进——这正是分块(tiling)能成立的前提。
 
 online-softmax(arXiv:1805.02867 §3 Algorithm 3)的洞见像老师批一摞卷子：**不必先翻遍全摞找最高分再回头算**。边看边记两个数就够了——当前见过的最高分 $`m`$,和一个"按当前最高分归一"的累计分母 $`d`$ 。每来一张新卷子 $`x_j`$,先把旧累计按新旧最高分之差缩一下，再加上新卷子这一项：
 
-$$
+```math
 m_j=\max(m_{j-1},\,x_j),\qquad d_j=d_{j-1}\,e^{m_{j-1}-m_j}+e^{x_j-m_j}
-$$
+```
 
 那个 $`e^{m_{j-1}-m_j}`$ 就是**rescale 因子**。最高分没变时它等于 1(旧累计不动);最高分跳升时它小于 1(把旧累计缩到新基准上)。safe-softmax 的头两遍(找 $`m_V`$ 、求分母 $`d_V`$)就这么融成了一遍——一趟扫描同时得到 $`(m,d)`$;剩下只需再扫一遍按 $`y_i=e^{x_i-m}/d`$ 输出每一项。总扫描数从 $`3N`$ 降到 $`2N`$,代价只是多存 $`m`$ 、 $`d`$ 两个标量。
 
@@ -132,9 +132,9 @@ def online_softmax_stats(x):
 
 单遍递推还只是"顺序看完一摞"。真正让分块成立的，是把 $`(m,d)`$ 这对状态抽象成一个**二元合并算子 ⊕**(arXiv:1805.02867 §3.1 Eq.4):
 
-$$
+```math
 [m_i;d_i]\oplus[m_j;d_j]=\Big[\ \max(m_i,m_j)\ ;\ d_i\,e^{m_i-M}+d_j\,e^{m_j-M}\ \Big],\qquad M=\max(m_i,m_j)
-$$
+```
 
 它把两组"各自相对自己最高分的累计"先换算到公共基准 $`M`$,再相加。**这就是开篇点破的那条主线定理**——⊕ 满足**结合律与交换律**，于是 softmax 的归一化统计量可以任意分块、任意顺序、并行归并，结果唯一。这是 FlashAttention 敢切块、cascade attention 敢拆两段的**许可证**。
 
@@ -173,14 +173,14 @@ $$
 
 外层循环遍历 $`K,V`$ 的列块 $`j`$,内层遍历 $`Q`$ 的行块 $`i`$;每个 $`(i,j)`$ 块局部算 $`S_{ij}=Q_iK_j^{\top}`$(至多 $`B_r\times B_c`$ —— $`B_r`$ 是 Q 的行块大小、 $`B_c`$ 是 K,V 的列块大小，绝不是 $`N\times N`$),局部 softmax 出 $`\tilde m_{ij}`$ 、 $`\tilde\ell_{ij}`$ 、 $`\tilde P_{ij}`$,再把 running 量推到新的全局 max(arXiv:2205.14135 §3.1 Algorithm 1 L11-L13):
 
-$$
+```math
 m_i^{\mathrm{new}}=\max(m_i,\tilde m_{ij}),\qquad
 \ell_i^{\mathrm{new}}=e^{m_i-m_i^{\mathrm{new}}}\ell_i+e^{\tilde m_{ij}-m_i^{\mathrm{new}}}\tilde\ell_{ij}
-$$
+```
 
-$$
+```math
 O_i\ \leftarrow\ \frac{1}{\ell_i^{\mathrm{new}}}\Big(\ \ell_i\,e^{m_i-m_i^{\mathrm{new}}}\,O_i\ +\ e^{\tilde m_{ij}-m_i^{\mathrm{new}}}\,\tilde P_{ij}V_j\ \Big)
-$$
+```
 
 看那个 $`e^{m_i-m_i^{\mathrm{new}}}`$ ——和 online-softmax 里的 rescale 因子一模一样。但先盯住另一个容易被略过的乘子： $`\ell_i`$ 。初版算法里 $`O_i`$ **每处理完一个 KV 块都保持归一化**——上一步收尾已经除过一次 $`\ell_i`$(下面机制表里第 1 块处理完的 $`O_i`$ 就已经是"只看前两个 key 的精确注意力输出")。所以更新时得先乘回 $`\ell_i`$ ，把它**反归一化**成未归一的加权和 $`\ell_i O_i`$ ——这就是公式里 $`\ell_i`$ 乘子的来历；再像 online-softmax 里累计分母 $`d`$ 那样，按 $`e^{m_i-m_i^{\mathrm{new}}}`$ 把这笔旧账缩到新的全局最高分基准上——只有旧贡献和新块的贡献同处一个基准，把它们相加、共用一个分母 $`\ell_i^{\mathrm{new}}`$ 才有意义。于是每步四拍：乘 $`\ell_i`$ 反归一化、rescale 到新基准、加上新块的 $`\tilde P_{ij}V_j`$ 贡献、除以 $`\ell_i^{\mathrm{new}}`$ 重新归一——这"每步都除一次 $`\ell`$"，正是 §五 里 FA-2 要动刀省掉的那笔开销。整个过程融成一个 CUDA kernel。Theorem 1 保证：输出**精确等于** $`\mathrm{softmax}(QK^{\top})V`$,只花 $`O(N^2d)`$ FLOP、额外内存仅 $`O(N)`$ 。
 
@@ -215,9 +215,9 @@ $$
 
 衡量注意力的成本，别数它做了多少次乘加，要数它往慢速仓库(HBM)搬了多少箱货。标准做法要把 $`N\times N`$ 大表搬进搬出好几趟，箱数随 $`N^2`$ 疯长；FlashAttention 把 $`K,V`$ 切成能塞进书桌的块，每块只把整个 $`Q`$ 过一遍。论文给出的账(arXiv:2205.14135 §3.2 Theorem 2)是：
 
-$$
+```math
 \Theta(Nd+N^2)\quad\longrightarrow\quad \Theta\!\left(\frac{N^{2}d^{2}}{M}\right)
-$$
+```
 
 左边是标准注意力(含 $`N^2`$ 物化项),右边是 FlashAttention($`M`$ 是 SRAM 大小——这个 $`M`$ 与 §二 ⊕ 算子里的稳定化基准 $`M`$ 是两个不同的量，请勿混淆，详见开篇符号速查表)。关键在 $`d`$ 一般只有 64-128,而 $`M\approx100\mathrm{KB}`$(fp32 下约 25600 个元素),于是 $`d^2\ll M`$,右边比左边少好几倍。Proposition 3 还证了这是**下界**:在这段 $`M`$ 范围内，没有精确注意力算法能渐进更省。
 
@@ -293,19 +293,19 @@ vLLM 侧对这套访存优化的落地面，体现在它怎么给 kernel 喂数�
 
 怎么合？看谁的收据金额大(取 $`M=\max`$ 稳定化),以它为基准把两张收据换算成占比权重，再按权重把两段输出加权平均。这其实还是 §二 那个 ⊕ 算子，只不过现在作用在 $`(\mathrm{lse}, O)`$ 上而非 $`(m, d)`$ 上：
 
-$$
+```math
 M=\max(l_a,l_b),\qquad w_a=\frac{e^{\,l_a-M}}{e^{\,l_a-M}+e^{\,l_b-M}},\qquad O=w_aO_a+w_bO_b
-$$
+```
 
-$$
+```math
 l_{\mathrm{merge}}=\log\!\big(e^{\,l_a-M}+e^{\,l_b-M}\big)+M
-$$
+```
 
 合并后的 $`l_{\mathrm{merge}}`$ 也是一张新收据，于是可以一段段接力拼下去(arXiv:1805.02867 §3.1 Eq.4;两段版另见 arXiv:2307.08691 §2.3)。精确性一句话点透：**收据 $`e^{l}`$ 乘回部分输出 $`O`$ ，恢复的正是"未归一化加权和"——两段相加、再除以总归一因子，就是整体输出**：
 
-$$
+```math
 O=\frac{Z_aO_a+Z_bO_b}{Z_a+Z_b}=w_aO_a+w_bO_b,\qquad Z_a=e^{l_a},\ Z_b=e^{l_b}
-$$
+```
 
 > **严谨（推导）**：段 a 的未归一化加权和记为 $`\sum_a p\cdot v`$ ，按 softmax 定义 $`O_a=\sum_a p\cdot v\,/\,Z_a`$ ，故 $`Z_aO_a`$ 恰是段 a 的未归一化加权和(段 b 同理)。把两段 KV 拼起来一次性做 softmax,其分子是两段未归一化加权和之和、分母是 $`Z_a+Z_b`$ ——与上式逐项相同，代数恒等(浮点口径见 §二)。上式第二个等号只是把 $`Z/(Z_a+Z_b)`$ 改写成权重 $`w`$ ,与前面 $`M`$ 稳定化的写法等价：分子分母同乘 $`e^{-M}`$ 不改变比值，只防上溢。
 
@@ -322,13 +322,13 @@ $$
 
 看 token 0(套用上面那两条合并公式，即 arXiv:1805.02867 §3.1 Eq.4 的 $`\oplus`$ 在对数域的写法)：前缀 $`\mathrm{lse}=1.4003`$ 、后缀 $`\mathrm{lse}=0.3536`$ ，基准 $`M=1.4003`$ 。前缀权重记 $`w_a`$ 、后缀权重记 $`w_b`$ ：
 
-$$
+```math
 w_a=\frac{e^{0}}{e^{0}+e^{0.3536-1.4003}}\approx0.7401,\qquad w_b\approx0.2599
-$$
+```
 
-$$
+```math
 O=0.7401\times[0.5,0.5]+0.2599\times[2.0,0.0]=[0.8898,0.3701]
-$$
+```
 
 两 token 都与一次性参照对上——代数恒等，§二 口径。
 
@@ -408,9 +408,9 @@ merge_attn_states(output, prefix_output, prefix_lse, suffix_output, suffix_lse)
 
 直觉先行：因果掩码下，第 $`i`$ 个 query 只能回看位置 $`\le i`$ 的 KV;未来的位置被掩成 $`-\infty`$,softmax 权重为 0。所以第 $`i`$ 行的输出，是**且只是**这些历史的函数——
 
-$$
+```math
 O_i=\mathrm{softmax}\!\left(\frac{Q_iK_{\le i}^{\top}}{\sqrt{d}}\right)V_{\le i}
-$$
+```
 
 这里 $`K_{\le i}`$ 、 $`V_{\le i}`$ 记位置 0 到 $`i`$ 的全部 key/value(第 $`i`$ 行能看到的全部历史), $`d`$ 是头维度(缩放 $`1/\sqrt{d}`$ 沿用 §一的约定)。关键在这行输出里**没有任何一项依赖 $`j\ne i`$ 的其它 query 行**,也不在乎这些 KV 是一次性写进缓存、还是分几批写进去。它是绝对位置的纯函数。
 

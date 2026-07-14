@@ -239,9 +239,9 @@ def convert_ids_list_to_tokens(
 
 **累计概率**。`sampled_token_logprob = logprobs[0]`，然后 `cumulative_logprob += sampled_token_logprob`。为什么取第 0 个？因为 sampler 约定把**被采样的那个 token** 放在每行第一个。所以 `logprobs[0]` 就是"在前文条件下、模型给被采样 token 的对数概率"，累计起来就是整段生成序列的对数概率：
 
-$$
+```math
 \mathrm{cumulative\_logprob} = \sum_{t} \log P(x_t \mid x_{<t})
-$$
+```
 
 人话翻译：把每一步"模型确实吐出的那个词"的对数概率加起来，得到整句话的打分。越接近 0，模型对这句话越有把握；越负，越是勉强生成的。这个值后面随 `CompletionOutput` 一起返回，可用于 beam search（用同一份累计对数概率给多条候选序列打分排序，完整 API 见 [第 36 章](../../ch36-entrypoints/narrative/chapter.md)）或序列重排。prompt 路不碰它——prompt 不是模型生成的，累计它没意义。
 
@@ -624,9 +624,9 @@ class Logprob:
 
 问题在于：假设序列长 L、每位置 K 个候选，nested 存法要造的对象数是 L 个 dict（每位置一个）加 L×K 个 `Logprob`（每候选一个）：
 
-$$
+```math
 \mathrm{nested\ objects} = L + L \times K
-$$
+```
 
 Python 对象越多，垃圾回收扫描越慢。`FlatLogprobs` 的思路是把这些对象**压成 6 条平行的原生列表**（`vllm/logprobs.py:L30-L72`）：
 

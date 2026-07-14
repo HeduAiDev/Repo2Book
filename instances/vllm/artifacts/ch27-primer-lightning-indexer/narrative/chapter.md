@@ -52,9 +52,9 @@
 
 索引分数 $`I_{t,s}`$ 衡量 query token $`\mathbf{h}_t`$ 与它之前某个 token $`\mathbf{h}_s`$ 的相关性（ $`\mathbf{h}`$ 是当前层的隐藏向量，打分用的 query、key、话语权全部从它投影而来），定义如下（arXiv:2512.02556 §2.1「Prototype of DSA」Eq.(1)）：
 
-$$
+```math
 I_{t,s} = \sum_{j=1}^{H^I} w_{t,j}^I \cdot \mathrm{ReLU}\left(\mathbf{q}_{t,j}^I \cdot \mathbf{k}_s^I\right)
-$$
+```
 
 逐项读它： $`H^I`$ 是 indexer 头数； $`\mathbf{q}_{t,j}^I \in \mathbb{R}^{d^I}`$ 是 query $`t`$ 在第 $`j`$ 个头上的打分向量（ $`d^I`$ 是 indexer 专属的头维）、 $`w_{t,j}^I \in \mathbb{R}`$ 是这个头的标量话语权，两者都从 $`\mathbf{h}_t`$ 投影而来； $`\mathbf{k}_s^I \in \mathbb{R}^{d^I}`$ 是历史 token $`s`$ 的 indexer key，从 $`\mathbf{h}_s`$ 导出，且**跨所有头共享同一份**（MQA（Multi-Query Attention，多查询注意力）式——全部头共用一份 key，key 侧的存储与计算都与头数无关）。ReLU 把负相关点积截为 0：负相关不算证据，但也不倒扣。论文明确写了：选 ReLU 而非 softmax 是「for throughput consideration」。
 
@@ -91,9 +91,9 @@ $$
 
 先点破 top-k 的地位：**它是打分器与主注意力之间唯一的信息闸门**——分数不出闸，出闸的只有一个索引集合。主注意力只照名单取人、不关心分是怎么打的；名单没坐满的位置填 $`-1`$ ，表示「这里没人，别取」。接口窄到只剩一张名单，正是 §四 里两边能各自独立演化（独立缓存、独立量化）的根。形式上，打完分只保留分数最高的 $`k`$ 个条目对应的 latent KV，主注意力（ $`\mathrm{Attn}`$ ，即标准缩放点积注意力）用 query 隐藏向量 $`\mathbf{h}_t`$ 在这批稀疏子集上算输出 $`\mathbf{u}_t`$ （arXiv:2512.02556 §2.1 Eq.(2)）：
 
-$$
+```math
 \mathbf{u}_t = \mathrm{Attn}\left(\mathbf{h}_t, \left\{\mathbf{c}_s \mid I_{t,s} \in \operatorname{Top-k}(I_{t,:})\right\}\right)
-$$
+```
 
 这里 $`\mathbf{c}_s`$ 是第 $`s`$ 个 latent KV 条目（MLA 压缩后、主注意力真正消费的东西）， $`\operatorname{Top-k}(I_{t,:})`$ 取分数最大的 $`k`$ 个索引。
 
@@ -161,21 +161,21 @@ $`t_0`$ 的分数 `3, 4, 2, 0` 降序索引是 `1, 0, 2, 3`（ $`s_1`$ 分最高
 
 先是 Dense Warm-up 阶段（arXiv:2512.02556 §2.1.1）：保持稠密注意力、冻结除 indexer 外的所有参数。要模仿，先得有一份「主注意力到底把注意力放在了哪里」的标准答案。对第 $`t`$ 个 query，把主注意力**每个头**分给历史位置 $`s`$ 的注意力权重（softmax 之后、非负的分配比例）跨全部 $`H`$ 个头求和得到 $`a_{t,s}`$ ，再沿序列维做 L1 归一化，得到落在 $`t`$ 个历史位置上的目标分布 $`p_{t,:} \in \mathbb{R}^t`$ ：
 
-$$
+```math
 p_{t,s} = \frac{a_{t,s}}{\sum_{s'=1}^{t} a_{t,s'}}, \qquad a_{t,s} = \sum_{h=1}^{H} A_{t,s}^{(h)}
-$$
+```
 
 式中 $`A`$ 记主注意力权重， $`A_{t,s}^{(h)}`$ 是它第 $`h`$ 个头从 query $`t`$ 分给历史 token $`s`$ 的那一项， $`H`$ 是主注意力头数；跨头求和记为 $`a`$ ，逐项即 $`a_{t,s}`$ 。indexer 的训练目标就是让它打分的 softmax 去逼近这个 $`p`$ （arXiv:2512.02556 §2.1.1 Eq.(3)）：
 
-$$
+```math
 \mathcal{L}^I = \sum_t \mathbb{D}_{KL}\left(p_{t,:} \parallel \mathrm{Softmax}(I_{t,:})\right)
-$$
+```
 
 $`\mathbb{D}_{KL}`$ 是 KL 散度，衡量「indexer 打的分 softmax 后」离「目标分布」有多远。等 indexer 热身完，进入 Sparse Training 阶段——引入 top-k 选择、放开所有参数。这一阶段主注意力真正消费的只有被选中的那 $`k`$ 个条目，indexer 只需要把这批会真正进场的 token 排对，于是对齐目标收窄到被选中的集合 $`\mathcal{S}_t = \operatorname{Top-k}(I_{t,:})`$ 上（arXiv:2512.02556 §2.1.1 Eq.(4)）——训练目标与推理时的稀疏消费方式对齐：
 
-$$
+```math
 \mathcal{L}^I = \sum_t \mathbb{D}_{KL}\left(p_{t,\mathcal{S}_t} \parallel \mathrm{Softmax}(I_{t,\mathcal{S}_t})\right)
-$$
+```
 
 论文特别点出：`we detach the indexer input from the computational graph for separate optimization`——detach（把张量从计算图上断开，梯度不再回流）之后，indexer 的训练信号只来自 $`\mathcal{L}^I`$ ，主模型只按语言建模损失优化，两条梯度互不串味。
 
@@ -201,17 +201,17 @@ $$
 
 V4（DeepSeek-V4 的 CSA，Compressed Sparse Attention，压缩稀疏注意力）把这份独立讲得最清楚（arXiv:2606.19348 §2.3.1 CSA，Eq.(13)-(17)）。indexer query 与主 query 共享同一个低秩压缩 latent $`c_t^Q`$ （query 侧先压到低秩、再各走各的上投影），打分则在**压缩后的** key 上做（Eq.(16)）：
 
-$$
+```math
 I_{t,s} = \sum_{h=1}^{n_h^I} w_{t,h}^I \cdot \mathrm{ReLU}\left(\mathbf{q}_{t,h}^I \cdot K^{IComp}_s\right)
-$$
+```
 
 和 §一 V3.2 的 Eq.(1) 比，这里只换了一个操作数：打分对象从「单个历史 token 的 key $`\mathbf{k}_s^I`$ 」换成了「一个压缩块的 key $`K^{IComp}_s`$ 」（ $`n_h^I`$ 是 V4 记号下的 indexer 头数，与 $`H^I`$ 等价）。原因在于 V4 里主注意力本身就消费压缩块——每 $`m`$ 个 token 先压成一个 $`C^{Comp}`$ 条目（ $`m`$ 是压缩比），被选中的最小单位于是也是压缩块、而非单个 token。索引器要挑的既然是压缩块，它的 key 就必须活在同样的「每块一行」粒度上，所以 $`K^{IComp}`$ 用与 $`C^{Comp}`$ **完全相同的压缩操作**产出。除此之外打分结构与 Eq.(1) 一字不差：仍是逐头 $`q \cdot k`$ 点积、ReLU 截负、按话语权加权求和，query 也仍从共享 latent $`c_t^Q`$ 上投影而来——§一那套打分数学原样迁移到压缩空间，不产生新的东西。
 
 这里 $`K^{IComp} \in \mathbb{R}^{n/m \times c^I}`$ 是索引器专属的压缩 key：每 $`m`$ 个 token 压成 1 个，和主注意力的压缩 KV $`C^{Comp}`$ 由**同一套压缩操作并行产出、各自缓存**。这套压缩操作本身本章不展开推导（见 arXiv:2606.19348 §2.3.1「Compressed Key-Value Entries」Eq.(9)-(12)），一句话勾勒即可：每 $`m`$ 个条目按一组带可学习位置偏置的联合 softmax 权重、对相邻两个窗口共 $`2m`$ 个候选条目加权求和压出一个块（首块因缺前一个窗口，按论文约定把它那侧的权重填 $`-\infty`$ 、值填 $`0`$ ）。要点只有一条—— $`K^{IComp}`$ 与 $`C^{Comp}`$ 是同一套操作的两个并排输出，各写各的缓存。 $`c^I`$ 是 indexer 压缩 key 的头维，与主注意力头维无关，这就是 IndexCache 能独立布局的根。被选中的那批压缩条目才进主注意力（Eq.(17)）：
 
-$$
+```math
 C_t^{SprsComp} = \left\{ C^{Comp}_s \mid I_{t,s} \in \operatorname{Top-k}(I_{t,:}) \right\}
-$$
+```
 
 式中 $`C_t^{SprsComp}`$ 就是 query $`t`$ 名单上的那批压缩条目。公式看不出「两份东西是并排的两块缓存」，这张图把它钉死：
 

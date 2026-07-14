@@ -405,6 +405,48 @@ def lint_formulas(filepath: str) -> dict:
                     f"markdown 会把 _ 吃成 <em>,整段数学不渲染;改用 GitHub 转义 $`…`$")
     results["markdown_hostile_inline_math"] = issues
 
+    # ── Check 14: 块级数学禁用 $$…$$,一律 ```math 围栏 ──
+    # GitHub 在数学扩展拿到内容前先做 CommonMark 反斜杠转义:$$ 块里 \, \; \! \{ \_ \\ 等
+    # 「反斜杠+标点」命令全被吃掉反斜杠 → 细间距变字面逗号、\left\{ 变非法 \left{ 报
+    # Missing delimiter、aligned 换行被砍(2026-07-14 用户报 \left 报错后 API 实测,
+    # 全书 242 块中 139 块受影响)。```math 围栏是代码围栏语义,逐字节免疫(引用块内同样成立)。
+    # 存量转换:python3 scripts/fix_display_math_fence.py <file.md>
+    issues = []
+    in_code = False
+    for i, line in enumerate(lines, 1):
+        rest = re.sub(r'^(\s*(?:>\s?)*)', '', line)
+        if rest.startswith("```"):
+            in_code = not in_code
+            continue
+        if not in_code and rest.strip() == "$$":
+            issues.append(
+                f"  Line {i}: 块级数学用了 $$ —— GitHub 会先吃掉块内 \\, \\; \\! \\{{ 等的反斜杠"
+                f"(公式错渲/报错);改用 ```math 围栏(fix_display_math_fence.py 可批转)")
+    results["display_math_dollar_block"] = issues
+
+    # ── Check 8b: ```math 围栏体内禁 CJK(围栏被 in_fence 跳过,这里单独扫) ──
+    cjk_re = re.compile(r'[一-鿿　-〿＀-￯]')
+    issues = []
+    in_math_fence = False
+    in_other_fence = False
+    for i, line in enumerate(lines, 1):
+        rest = re.sub(r'^(\s*(?:>\s?)*)', '', line)
+        if rest.startswith("```"):
+            if in_math_fence:
+                in_math_fence = False
+            elif in_other_fence:
+                in_other_fence = False
+            elif rest.strip() == "```math":
+                in_math_fence = True
+            else:
+                in_other_fence = True
+            continue
+        if in_math_fence and cjk_re.search(rest):
+            issues.append(
+                f"  Line {i}: ```math 围栏内含 CJK → \"{rest.strip()[:50]}\" — "
+                f"strict KaTeX 拒绝;中文移出公式")
+    results["cjk_in_math_fence"] = issues
+
     return results
 
 
@@ -444,6 +486,8 @@ def print_report(results: dict, filepath: str):
         + len(results.get("inner_space_in_inline_math", []))
         + len(results.get("emphasis_flanking_cjk", []))
         + len(results.get("markdown_hostile_inline_math", []))
+        + len(results.get("display_math_dollar_block", []))
+        + len(results.get("cjk_in_math_fence", []))
     )
     if blocking > 0:
         print(f"🔴 {blocking} BLOCKING issue(s) — auto-REJECT")

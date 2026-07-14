@@ -18,19 +18,19 @@ MLA（Multi-head Latent Attention，多头潜在注意力；[首现见第 19 章
 
 标准 MHA 每个 token、每一层，要为每个头各缓存一份 K 和一份 V。以 DeepSeek-V3 为例，128 个头、每头 K/V 各 128 维（下面两个公式的结果单位均为：标量数/token/层）：
 
-$$
+```math
 \mathrm{MHA\_cache} = N \times (P + V) = 128 \times (128 + 128) = 32768
-$$
+```
 
 MLA 换了个存法：不存满维 K/V，只缓存一个**低秩隐向量** `kv_c`（`kv_lora_rank = 512`），外加一个**解耦位置编码** `k_pe`（`qk_rope_head_dim = 64`）——本章默认你已了解低秩压缩与解耦 RoPE 背后的数学动机，完整推导[上一章：MLA 原理](../../ch21-primer-mla/narrative/chapter.md)刚给过，这里只看昇腾把它落成了怎样的算子：
 
-$$
+```math
 \mathrm{MLA\_cache} = L_{kv} + R = 512 + 64 = 576
-$$
+```
 
-$$
+```math
 \frac{\mathrm{MLA\_cache}}{\mathrm{MHA\_cache}} = \frac{576}{32768} \approx \frac{1}{57}
-$$
+```
 
 人话翻译：同样长的上下文，MLA 的 KV cache 大约只占 MHA 的 1/57。一张卡能塞下的并发序列、能跑的上下文长度，因此成倍放大。
 
@@ -153,9 +153,9 @@ MLA 的妙招叫**权重吸收（weight absorption）**：把「解压」这一�
 
 **为什么这样做就等价于「先解压 K 再算注意力」？** 设缓存的隐向量为 `kv_c`（`L` 维），标准做法是先解压出 `k_nope = W_UK^⊤ · kv_c`（`P` 维），再算 query 与它的内积 `q_nope · k_nope`。把它展开：
 
-$$
+```math
 q_{nope} \cdot k_{nope} = q_{nope} \cdot (W_{UK}^{\top} \cdot kv_c) = (q_{nope} \cdot W_{UK}^{\top}) \cdot kv_c = ql_{nope} \cdot kv_c
-$$
+```
 
 人话翻译：矩阵乘有结合律。原本要对**每个缓存 token** 把 `kv_c` 解压成 `k_nope`，现在改成对**每个 query**（decode 时每序列只有 1 个）先把 `q_nope` 投成 `ql_nope`，然后 query 直接和缓存的 `kv_c` 做内积。把 `W_UK` 从 K 侧「吸」进了 query 侧——这就是「吸收」二字的来历。
 
@@ -210,9 +210,9 @@ latent 输出 `(N, B, L)` 经 `W_UV (N, L, V)` 投回 `(B, N, V)`，再拍平成
 
 光看形状还不够「眼见为实」，我们喂一组固定小数值，把上面那条结合律的两端各算一遍（取 `P=3`、`L=4` 的单个头）：
 
-$$
+```math
 (q \cdot W_{UK}^{\top}) \cdot kv_c = q \cdot (W_{UK}^{\top} \cdot kv_c)
-$$
+```
 
 ```python
 # 单头小尺寸数值核对：P=qk_nope_head_dim=3, L=kv_lora_rank=4
@@ -355,13 +355,13 @@ prefill 段里还藏着一个 `build_chunked_metadata`。它处理的是**带历
 
 核心是这两行算式。先说清楚 `workspace`：它是算子计算一块历史 context 注意力时申请的临时设备显存（中间结果暂存），大小固定，所以要按「带历史的 prefill 请求数」均分、再 `round_down` 到 `block_size`，才不会让任何一块 context 撑爆这块显存：
 
-$$
+```math
 \mathrm{max\_context\_chunk} = \mathrm{round\_down}\!\left(\frac{\mathrm{workspace\_size}}{\mathrm{prefill\_with\_context}},\; \mathrm{block\_size}\right)
-$$
+```
 
-$$
+```math
 \mathrm{num\_chunks} = \mathrm{cdiv}(\mathrm{max\_context\_len},\; \mathrm{max\_context\_chunk})
-$$
+```
 
 人话翻译：把固定大小的 workspace 平摊给每个带历史的 prefill 请求，得到每块最多能装多少历史 token；`round_down` 到 `block_size` 是为了对齐分页 KV cache 的页边界；最后用「最长历史 ÷ 每块容量」向上取整，得到要切几块。
 
@@ -808,9 +808,9 @@ for chunk_idx in range(cdiv(C, MCC)):
 
 **为什么分块再合并是对的？** 注意力的 softmax 分母是所有 key 的 `exp(score)` 之和。把 key 切成几段分别算，每段得到一个局部输出 `out_i` 和一个局部 `lse_i`（这段 `exp(score)` 之和的对数）。合并时用在线 softmax 公式：
 
-$$
+```math
 \mathrm{lse_{max}} = \max_i \mathrm{lse}_i, \qquad \mathrm{out} = \frac{\sum_i \exp(\mathrm{lse}_i - \mathrm{lse_{max}}) \cdot \mathrm{out}_i}{\sum_i \exp(\mathrm{lse}_i - \mathrm{lse_{max}})}
-$$
+```
 
 人话翻译：每段先各自归一化，再按各段「占了多少 softmax 权重」（由 `lse_i` 反映）加权平均。**数值稳定性的不变量**在于先减 `lse_max` 再取指数——这保证所有指数的幂 `lse_i - lse_max ≤ 0`，于是 `exp(·) ∈ (0, 1]`，永不上溢。这套在线合并公式是一条精确的代数恒等式：无论切几块、各块多长，合并结果在实数域上都等于「一次性对全部 key 算 softmax」；落到 float32 实现，分块累加与一次性累加走的舍入路径不同，二者**在浮点舍入内一致**（差值落到显示精度即为 0.0），而非机械保证逐位相同。
 

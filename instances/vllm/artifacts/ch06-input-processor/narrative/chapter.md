@@ -129,9 +129,9 @@ child_sampling_params.n = 1
 
 代价当然也有：n 个请求各自有一份元数据、一份 `RequestState`，内存上比「共享一份」略贵。但有一处省回来了——n 路的 prompt 完全相同，prefix caching 会让它们**共享同一段 prompt 前缀的 KV**。所以实际的显存账大致是：
 
-$$
+```math
 \mathrm{KV}_\mathrm{total} \approx \mathrm{KV}_\mathrm{prompt} + n \times \mathrm{KV}_\mathrm{output}
-$$
+```
 
 人话：prompt 那段 KV 只存一份（n 路共享），只有各自生成出来的 output token 才各占一份。对「长 prompt、短输出、大 n」的场景（典型如 best-of-n 重排——对同一 prompt 采 n 个候选，事后按打分挑/排出最优结果），这笔账非常划算。
 

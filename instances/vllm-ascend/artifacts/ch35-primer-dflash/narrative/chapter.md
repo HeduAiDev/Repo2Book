@@ -51,9 +51,9 @@
 
 先记账：跑一轮投机解码，总成本是起草加验证，收益是这一轮真正落袋的 token 数。论文沿用标准记法（arXiv:2602.06036 §3.1 Eq.(1)）把「平均每 token 延迟」写成：
 
-$$
+```math
 L=\frac{T_{\mathrm{draft}}+T_{\mathrm{verify}}}{\tau}
-$$
+```
 
 分子是一轮的总成本（ $`T_{\mathrm{draft}}`$ 起草、 $`T_{\mathrm{verify}}`$ 验证），分母 $`\tau`$ 是这一轮期望接受的 token 数；加速比 $`\eta=L_{\mathrm{target}}/L`$ ，对照基准 $`L_{\mathrm{target}}`$ 是不投机时 target 逐 token 解码的每 token 延迟。 $`\tau`$ 的下界恰为 1：target 每轮验证必然自产一个确定的下一 token（bonus token），哪怕草稿全被拒也至少落袋它，故 $`\tau\in[1,\gamma+1]`$ 。
 
@@ -73,21 +73,21 @@ $$
 
 自回归草稿器的成本由控制流决定：逐 token 生成，每个 token 一次前向（arXiv:2602.06036 §3.2 Eq.(2)）：
 
-$$
+```math
 T_{\mathrm{draft}}=\gamma\cdot t_{\mathrm{step}}
-$$
+```
 
 块大小 $`\gamma`$ 直接乘在 draft 单次前向延迟 $`t_{\mathrm{step}}`$ 上——想多猜一倍，起草就慢一倍。这不是工程没优化，是「逐 token」的代数宿命，也是 EAGLE-3 只敢用一层的原因。块扩散草稿器换掉的正是这个控制流，而它「一次前向出整块」的合法性可以写成一条式子——后续树验证工作 DDTree 给出了最精确的表述（arXiv:2604.12989 §3 Eq.(2)）：整块草稿的分布是**分解分布**，
 
-$$
+```math
 Q(y_{1:\gamma}\mid c,b)=\prod_{i=1}^{\gamma}q_i(y_i\mid c,b)
-$$
+```
 
 每个因子 $`q_i(y_i\mid c,b)`$ 是块内第 $`i`$ 位的边际分布，只依赖上下文 $`c`$ 与块首锚点 $`b`$ （bonus token），**不依赖块内其他位置的采样结果**——位置间条件独立，谁都不用等谁，全部 $`\gamma`$ 个分布在同一次前向里一起读出。于是起草成本变成（arXiv:2602.06036 §3.2 Eq.(3)）：
 
-$$
+```math
 T_{\mathrm{draft}}=t_{\mathrm{parallel}}
-$$
+```
 
 $`\gamma`$ 从延迟表达式里**消失了**：块再大，也只是同一次前向里多几列并行的掩码位，而现代加速器上一次宽前向远比多趟窄前向划算， $`t_{\mathrm{parallel}}\ll\gamma\cdot t_{\mathrm{step}}`$ （arXiv:2602.06036 §3.2）。比喻只需一句：自回归起草是单车道打印机逐字打，块扩散是一次曝光的照相制版。拿 $`t_{\mathrm{step}}=0.2`$ 、 $`t_{\mathrm{parallel}}=0.5`$ 数一遍前向次数：
 
@@ -142,9 +142,9 @@ $`\gamma`$ 从延迟表达式里**消失了**：块再大，也只是同一次�
 
 先把条件本身压紧。从 target **从浅到深均匀采 5 层**（具体是第 2 层到倒数第 3 层之间均匀采样，arXiv:2602.06036 §5），把每个上下文位置的 5 段隐藏态 $`\mathbf{H}^{(l_1)},\ldots,\mathbf{H}^{(l_5)}`$ 沿特征维拼成一条 $`5D`$ 向量（ $`D`$ 为隐藏维），过共享投影 $`W_c`$ 压回 $`D`$ 维、再做 RMSNorm（Root Mean Square Normalization，Transformer 的标准归一化算子），得到**上下文特征**（arXiv:2602.06036 Appendix A.3）：
 
-$$
+```math
 \mathbf{H}_t=\mathrm{RMSNorm}\!\left(W_c[\mathbf{H}^{(l_1)};\ldots;\mathbf{H}^{(l_5)}]\right)
-$$
+```
 
 维度账：拼接后是 $`n\times 5D`$ （ $`n`$ 为上下文长度）， $`W_c\in\mathbb R^{D\times 5D}`$ 压回 $`n\times D`$ 。 $`W_c`$ 是 DFlash **唯一新增的带参组件**——草稿器的「知识」几乎全部借自本节开头论证的那份「朝未来炼出的 target 表征」，自己只学怎么读。这份 $`\mathbf{H}_t`$ 被**所有 draft 层共享**，每层再各自经该层的 K/V 投影变成注意力条目（式子见 §三），写进 draft 的 KV cache（推理期缓存的 key/value）跨起草轮复用（arXiv:2602.06036 §4.1）。小参数见证（draft 2 层、上下文 3 位、选定 5 层）：
 
@@ -170,17 +170,17 @@ $$
 
 注入的 K/V 进了 cache，draft 层怎么用它？一句话：**提问的只有草稿 token，资料架上摆着注入的 target 条件和草稿自己**。论文正文没用「cross-attention（交叉注意力）」这个词，但其算子形式（arXiv:2602.06036 Appendix A.3）就是交叉注意力与块内自注意力合并进同一次 attention：
 
-$$
+```math
 \mathbf{Q}_i=W_i^Q\mathbf{H}_d
-$$
+```
 
-$$
+```math
 \mathbf{K}_i=[W_i^K\mathbf{H}_t;\,W_i^K\mathbf{H}_d]_{\mathrm{seq}}
-$$
+```
 
-$$
+```math
 \mathbf{V}_i=[W_i^V\mathbf{H}_t;\,W_i^V\mathbf{H}_d]_{\mathrm{seq}}
-$$
+```
 
 逐式读一遍：第 $`i`$ 层的 Query $`\mathbf{Q}_i`$ **只由 draft token 的隐藏态 $`\mathbf{H}_d`$ 投影**，target 特征完全不进 Q；Key/Value 则由 $`[\mathbf{H}_t;\mathbf{H}_d]`$ **沿序列轴拼接**后投影——注入的 $`\mathbf{H}_t`$ 只作为**额外的 KV 条目**摆上资料架。论文 A.3 说得很清楚：target 特征「绕过 draft 的 Q 投影、输出投影、自注意力更新和 FFN（feed-forward network，前馈网络）」，它只被查、不提问、不更新。小参数见证（上下文 3 位、块 4 位 = bonus + 3 mask）：
 
@@ -219,15 +219,15 @@ $$
 
 分解分布让每个位置的边际独立训练，但位置的**价值**不独立：接受是最长前缀匹配——第 1 位错了，后面全作废；末位错了，只赔一个。训练目标按此加权，给早位置指数级更大的损失权重（arXiv:2602.06036 §4.2 Eq.(4)）：
 
-$$
+```math
 w_k=\exp\!\left(-\frac{k-1}{\gamma}\right)
-$$
+```
 
 块内第 $`k`$ 位（ $`k`$ 从 1 起）的交叉熵权重指数衰减： $`k=1`$ 时指数为 0、 $`w_1=1`$ 最大，越往后越小。论文只给出权重定义 Eq.(4)；把 $`w_k`$ 套进标准的加权交叉熵、按权重归一化求平均，是下面这个还原写法（非论文原文的编号公式）：
 
-$$
+```math
 \mathrm{loss}=\frac{\sum_k w_k\cdot \mathrm{CE}_k}{\sum_k w_k}
-$$
+```
 
 其中 $`\mathrm{CE}_k`$ 是第 $`k`$ 位的交叉熵。拿 $`\gamma=4`$ 、块 4 位算一遍，再比一个「一位押错、其余全对」的场景把错位放早还是放晚：
 
@@ -270,9 +270,9 @@ $$
 
 **其二，前缀概率单调不增**。每往后延伸一位，就多乘一个 $`\le 1`$ 的因子（arXiv:2604.12989 Prop.2 证明内使用）：
 
-$$
+```math
 Q(y_{1:i+1})=Q(y_{1:i})\cdot q_{i+1}\le Q(y_{1:i})
-$$
+```
 
 因此任一前缀的概率不小于它的任何延伸——「取前 $`B`$ 大」自动把每个入选节点的全部祖先一并选进，贪心的结果恰好是一棵**合法树**（前缀闭合），不需要额外校验。可加保证贪心的目标最优、单调不增保证贪心的结果合法，合起来才有「贪心取前 $`B`$ 大 = 最优树」；best-first（最高分优先）堆按前缀得分 $`\sigma(\rho)`$ 非增序弹出即可实现。拿一个 depth 3、每层 top-2、预算 $`B=4`$ 的小例子（边际分布 [[0.6,0.4],[0.7,0.3],[0.8,0.2]]）跑一遍：
 

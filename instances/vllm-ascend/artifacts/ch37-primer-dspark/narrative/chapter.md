@@ -48,9 +48,9 @@ DSpark 没有单一 arXiv 论文可锚（DeepSeek 尚未为它发独立报告）
 
 DSpark 走第三条路——**半自回归（semi-autoregressive）**：重活（一整层 Transformer 解码器栈）保持一次非因果并行前向，轻活（块内 $`N`$ 步从左到右的修正）只花向量级计算，不重跑骨干。宏观并行、微观（块内）序列。写成本章那行主线等式（对应技术摘要 §三）：
 
-$$
+```math
 p_k(v \mid x_0, x_{<k}) = \mathrm{softmax}\big(U_k(v) + B_k(x_{k-1}, v)\big)
-$$
+```
 
 $`p_k`$ 是块内位置 $`k`$ 的草稿分布； $`U_k(v)`$ 是并行骨干给候选 token $`v`$ 的**基础分数**——它与块内采样无关，第二节造它； $`B_k(x_{k-1}, v)`$ 是「前驱是 $`x_{k-1}`$ 时给 $`v`$ 的转移偏置」——块内依赖**全部**住在这一项里，第三节造它。条件记号沿一般自回归写作 $`(x_0, x_{<k})`$ ，但一阶 Markov（马尔可夫：分布只依赖上一步状态）假设下它实际只依赖前驱一个 token $`x_{k-1}`$ 。这行等式怎么读：依赖项是 **加性** 的、**低秩** 的、且在 **softmax 之前**——加性，所以骨干可以脱开采样先并行算完；低秩，所以逐位修正便宜到向量级；在 softmax 之前，所以输出仍是合法分布、验证器零改动。全章就是把这三个从句逐一坐实。
 
@@ -62,9 +62,9 @@ $`p_k`$ 是块内位置 $`k`$ 的草稿分布； $`U_k(v)`$ 是并行骨干给�
 
 **机制**：骨干零架构新增——`Qwen3DSparkModel` 直接继承 DFlash 的 Qwen3 解码器栈，整个类体只多挂一个 `markov_head`，docstring 直书「DFlash Qwen3 backbone + DSpark Markov head」，这就是「半自回归」的代码级定义；DeepSeek-V4 版本（`DSparkDeepseekV4Model`）额外复用目标模型的超连接（hyper-connection，跨层残差直连）MLA 解码层——正是[第 26 章](../../ch26-primer-v4-csa-hca/narrative/chapter.md)讲的两级压缩混合注意力。骨干输出块内每个位置的 hidden state $`h_k`$ （下标 $`k`$ 记块内位置， $`k = 0, \ldots, N-1`$ ），经最终归一化与 lm-head（词表投影层）得基础 logits $`U_k`$ （对应技术摘要 §二）：
 
-$$
+```math
 U_k = \mathrm{lm\_head}(\mathrm{norm}(h_k))
-$$
+```
 
 其中 $`\mathrm{norm}`$ 是 head 前的最终归一化，与骨干内部逐层 norm 是两回事。这条公式在源码里就是三行，注释直书：
 
@@ -95,9 +95,9 @@ def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
 
 **洞见**： $`B_k`$ 要对每个（前驱 token，候选 token）配对存一个数，朴素实现是一张 $`V \times V`$ 矩阵——词表 $`V`$ 数万到十万量级，存不起也学不动。但**两张 $`V \times r`$ 瘦表的乘积，就是一张秩 $`\le r`$ 的 $`V \times V`$ 表**：每个词先压成 $`r`$ 维的小签名（ $`W_1`$ 取行），再从签名展开成对整个词表的偏好（ $`W_2`$ 投影）。写成矩阵形式（技术摘要 §三）：
 
-$$
+```math
 B(v, x') = \big(W_2\, W_1[x']^\top\big)_v ,\qquad B = W_2\, W_1^\top
-$$
+```
 
 这里 $`x'`$ 是前驱 token， $`v`$ 是候选 token。维度账逐步核一遍： $`W_1 \in \mathbb{R}^{V \times r}`$ ，取一行得 $`W_1[x'] \in \mathbb{R}^{r}`$ ， $`^\top`$ 把它当列向量（ $`r \times 1`$ ）； $`W_2 \in \mathbb{R}^{V \times r}`$ ，于是 $`W_2\, W_1[x']^\top \in \mathbb{R}^{V}`$ ，其第 $`v`$ 个分量就是标量偏置 $`B(v, x')`$ 。存储与每步计算量都是 $`O(Vr)`$ 而非 $`O(V^2)`$ —— $`r = 256`$ （摘要值，未独立复现）、 $`V`$ 数万级时差**两个量级**。源码里这就是 `DSparkMarkovHead` 仅有的两张表与两个方法：`embed()` 按 token id 从 $`W_1`$ （词表并行嵌入表 `markov_w1`）取一行，`bias()` 拿这个 $`r`$ 维嵌入与 $`W_2`$ （`markov_w2`，当伪 lm-head 用）相乘投回词表——各自一行矩阵乘，上面的矩阵恒等式已把整个类说尽。
 
@@ -111,9 +111,9 @@ $$
 
 **洞见**： $`p_k`$ 是对「加了偏置之后的完整 logits」做一次**标准** softmax——词表上合法、逐点显式、严格为正的概率分布，不是近似、不是采样内插。于是[第 34 章](../../ch34-primer-speculative-sampling/narrative/chapter.md)的接受准则（arXiv:2211.17192 §2.3）原封不动适用：草稿采出 token $`v`$ 后，验证器以概率
 
-$$
+```math
 \min\!\left(1,\ \frac{q_k(v)}{p_k(v)}\right)
-$$
+```
 
 保留它——分子 $`q_k`$ 是**目标模型**的验证分布，分母 $`p_k`$ 是**草稿**分布。这正是[第 34 章](../../ch34-primer-speculative-sampling/narrative/chapter.md)的 $`\min(1, p/q)`$ ：那里 $`p`$ 记目标、 $`q`$ 记草稿，本章的草稿分布叫 $`p_k`$ ，两个字母恰好对调——认角色（目标在分子、草稿在分母）不认字母。分母是 softmax 的输出、逐点严格为正，比值处处良定义，验证器不需要为 DSpark 改一行。
 
@@ -180,15 +180,15 @@ def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
 
 **论文说的是什么**：技术摘要描述了一个**置信度头**（confidence head），在验证之前预测每个草稿位置的存活概率——把骨干 hidden state $`h_k`$ 与该位置的 Markov 嵌入 $`W_1[x_{k-1}]`$ 拼接后过一个线性层（权重向量 $`w`$ ，长度即拼接维度；记号简洁起见略去偏置项）加 sigmoid，输出 $`c_k`$ （对应摘要 §四）：
 
-$$
+```math
 c_k = \mathrm{sigmoid}\big(w^\top [\,h_k\,;\, W_1[x_{k-1}]\,]\big)
-$$
+```
 
 它逼近的目标是**解析接受率** $`c_k^*`$ ——用全变差距离 $`\mathrm{TV}`$ （total variation，取**归一化**定义：逐点差绝对值和的一半，值域 $`[0,1]`$ ）度量草稿分布 $`p_{\mathrm{draft}}`$ （本章的 $`p_k`$ ）与目标分布 $`p_{\mathrm{target}}`$ （本章的 $`q_k`$ ）的差异：
 
-$$
+```math
 c_k^{*} = 1 - \mathrm{TV}(p_{\mathrm{draft}}, p_{\mathrm{target}})
-$$
+```
 
 这不是一个新量：此归一化下 $`\mathrm{TV}`$ 与[第 34 章](../../ch34-primer-speculative-sampling/narrative/chapter.md)的散度 $`D_{LK}`$ 逐点相等（因 $`|p-m| = \tfrac{1}{2}|p-q|`$ ， $`m`$ 为两分布中点），故 $`c_k^* = 1 - D_{LK} = \beta`$ ——**置信度头学的就是那张成绩单（单点接受率 $`\beta`$ ）的逐位置版本**（arXiv:2211.17192 的接受率定义）。极端一验：两分布无重叠（ $`p=(1,0)`$ 、 $`q=(0,1)`$ ）时 $`\mathrm{TV}=1`$ 、 $`c_k^*=0`$ ，与真实接受率 $`\beta = \sum_v \min(p,q) = 0`$ 吻合——所以定义里**不带** $`1/2`$ （误带会算出 0.5）。摘要还提到 **Sequential Temperature Scaling（STS，序列温度校准）**：一维网格搜索校准 $`c_k`$ ，把期望校准误差（ECE，Expected Calibration Error，预测置信度与实际正确率的平均偏离）从 3–8% 压到约 1%，让「累计存活概率」（连乘 $`c_i`$ ）数值可信，才够格当第五节的调度判据。
 
@@ -214,9 +214,9 @@ DeepSeek-V4 版的权重名映射同样把 `confidence_head.*` 直接映成 `Non
 
 **论文说的是什么**：有了第四节的逐位存活概率 $`c_k`$ ，DeepSeek 报告描述了一个**贪心动态调度器**，目标是最大化吞吐量（对应摘要 §五）：
 
-$$
+```math
 \Theta = \tau \cdot \mathrm{SPS}(B)
-$$
+```
 
 $`\tau`$ 是（给定批大小 $`B`$ 下）期望被接受的 token 数， $`\mathrm{SPS}(B)`$ （steps-per-second）是针对批大小 $`B`$ 离线 profile 好、可 O(1) 查表的硬件吞吐曲线。调度过程（摘要复述的 Algorithm 1）：
 

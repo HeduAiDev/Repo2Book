@@ -249,9 +249,9 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
 
 池子返回的命中前缀记为 $`H`$ （`num_external_hit_tokens`）。要新分配 block 的，正是「池里有、但本地还没有」的那段，长度由下式给出：
 
-$$
+```math
 \mathrm{need\_to\_allocate} = \max(0,\; H - C)
-$$
+```
 
 它就是区间 $`[C, H)`$ 的长度。取 `max(0, …)` 是兜底：万一池子命中还不如本地算得多，就一块都不分配，不会出负数。
 
@@ -726,9 +726,9 @@ key 列表和 (addr, size) 列表，最后一起喂给后端契约 `put(keys, ad
 
 去重的意义量化一下：同一段前缀被 $`R`$ 条请求共享时，不去重要写 $`R`$ 次，去重后只写一次。写放大因此降为
 
-$$
+```math
 \mathrm{write\_amp} = \frac{1}{R}
-$$
+```
 
 共享越广，省下的池带宽和容量越多。
 
@@ -866,9 +866,9 @@ class Backend(ABC):
 
 **复用收益。** 一个 chunk 的 KV 字节数约为
 
-$$
+```math
 \mathrm{bytes_{chunk}} = 2 \times L \times H_{kv} \times d_{head} \times s_{dtype} \times t_{chunk}
-$$
+```
 
 其中：
 
@@ -888,9 +888,9 @@ $$
 
 **跨网字节随命中而非 prompt 增长。** 一条请求命中前缀 $`H`$ 、本地已算 $`C`$ ，只需为二者之间的缺口从池里搬运。跨网传输量正比于这段缺口的长度：
 
-$$
+```math
 \mathrm{bytes_{net}} \propto (H - C)
-$$
+```
 
 也就是说，它正比于缺口、**而不是** prompt 全长 $`P`$ 。前缀命中越深，缺口相对 $`P`$ 越小，搬运越便宜。
 

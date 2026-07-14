@@ -191,11 +191,11 @@ def execute_model(
 
 朴素阻塞写法的关键路径是「先等收完，再准备」，两段串起来。惰性写法让两者并行，关键路径降到两段中较长的那段：
 
-$$
+```math
 t_{\mathrm{naive}} = t_{\mathrm{recv}} + t_{\mathrm{prep}}
 \quad\longrightarrow\quad
 t_{\mathrm{overlapped}} = \max(t_{\mathrm{recv}},\, t_{\mathrm{prep}})
-$$
+```
 
 省下的就是两段里较短的那段。举个数：若接收 0.3ms、准备 0.2ms，朴素写法每格花 0.5ms，惰性写法只花 $`\max(0.3, 0.2)=0.3`$ ms，省掉 0.2ms——这 0.2ms 乘以 PP 的 stage 数、再乘以每秒成千上万拍，省下来的就很可观。
 
@@ -349,9 +349,9 @@ def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
 
 这个权衡可以量化。设单步耗时 $`t_{\mathrm{step}}`$ 、一次 all-reduce 耗时 $`t_{\mathrm{ar}}`$ ，则均摊到每步的同步开销是：
 
-$$
+```math
 \overline{t_{\mathrm{sync}}} = \frac{t_{\mathrm{ar}}}{32}
-$$
+```
 
 通信开销直接降一个数量级。代价是**延迟发现**：某个 rank 真空闲下来后，最坏要再多跑 31 步 dummy batch，才轮到下一次 all-reduce 把它发现。用「最多 31 步无谓空转」换「同步开销降 32 倍」——对吞吐导向的引擎，这笔账划算。32 本身是经验常数：足够小使暂停延迟可接受，足够大使 all-reduce 开销摊薄到可忽略，没有 ablation。它是 `core.py` 里的硬编码字面量（`self.step_counter % 32`），当前版本没有暴露成 `ParallelConfig` 字段，要调整只能改源码。
 
@@ -476,9 +476,9 @@ def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdent
 
 核心是那行评分公式：
 
-$$
+```math
 \mathrm{score} = 4 \cdot \mathit{waiting} + \mathit{running}
-$$
+```
 
 `waiting`（排队等上车的请求）权重是 `running`（已在批次里跑的）的 **4 倍**。直觉是：即使有连续批处理（continuous batching），一个 `waiting` 的请求也要等到下一次调度决策、且 token 预算/KV 块有空位才能挤进 running，比一个已经在批次里跑的请求多一层不确定的排队延迟；`waiting` 队列积压得越深，这层不确定性越大。所以排队的请求被赋更高权重，引擎一旦积压排队就显得「更满」，新请求自然绕开它。
 

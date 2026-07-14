@@ -483,9 +483,9 @@ class AscendLinearScheme(ABC):
 
 这就是适配器分层的价值。从 vLLM 的层往下数，一共四层，每多一层换来一处解耦：
 
-$$
+```math
 \mathrm{vLLM\ layer} \;\to\; \mathrm{wrapper} \;\to\; \mathrm{scheme} \;\to\; \mathrm{torch\_npu\ kernel}
-$$
+```
 
 wrapper 隔离 vLLM 接口（vLLM 改基类，只动 wrapper）；scheme 隔离量化算法（加一种量化，只加 scheme）；kernel 隔离硬件后端（换 NPU 代际，只动算子）。三处各管各的，互不牵连。
 
@@ -587,9 +587,9 @@ def apply(
 
 `npu_quant_matmul` 把量化、矩阵乘、反量化融成一个 kernel。拆开看，它在算这件事——对第 t 个 token、第 j 个输出通道：
 
-$$
+```math
 \mathrm{out}[t, j] = \left( \sum_i x_q[t, i] \cdot W_q[j, i] \right) \cdot s_w[j] \cdot s_x[t]
-$$
+```
 
 式中 `x_q`、`W_q` 是 `int8` 量化值； $`s_w`$ 是 `weight_scale`，每个输出通道一个（per-channel，落盘固定）； $`s_x`$ 是 `pertoken_scale`，每个 token 一个（动态，前向现算）。整数乘加在 `int8` 域里跑（NPU 的强项），最后两个 scale 一乘把结果拉回浮点。人话：**用整数算 GEMM 省算力省带宽，再用两个缩放因子把数值还原回原来的量级。**
 

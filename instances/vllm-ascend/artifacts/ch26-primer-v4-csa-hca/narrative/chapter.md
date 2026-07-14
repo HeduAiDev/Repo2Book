@@ -107,13 +107,13 @@ CSA/HCA 不是推倒 MLA 和 DSA 重来，而是在它们之上再叠一条轴�
 
 先亮这一节的全部内容——一条律：
 
-$$
+```math
 C^{\mathrm{Comp}}_i \;=\; \sum_{j\in\mathcal W_i} S_j \odot C_j,
 \qquad
 S = \mathrm{Softmax}_{\mathrm{row}}\big(Z_{\mathcal W_i} + B\big),
 \qquad
 |\mathcal W_i| = 2m
-$$
+```
 
 （arXiv:2606.19348 §2.3.1 Eq.(11)-(12) 的合并写法，与原式的逐项对应见严谨框。）符号的人话：每个 token 先各投出两条 $`c`$ 维向量——值条目 $`C_j`$ 与门控 $`Z_j`$ （由隐状态 $`\mathbf h_j`$ 各乘一个可训练矩阵得到，Eq.(9)-(10)）；窗口 $`\mathcal W_i`$ = 本块的 $`m`$ 个 token ∪ 向上一块借来的 $`m`$ 个 token；把窗口内门控加上可学习位置偏置 $`B`$ 、过一次 softmax 得权重 $`S`$ ，对值条目逐元素（ $`\odot`$ ）加权求和，得到这一块**唯一落盘**的压缩条目 $`C^{\mathrm{Comp}}_i`$ ——像把每 4 个词打包成一张摘要卡片、相邻卡片共享一条边界，比喻只此一句。这条律有三个一眼要看出的性质：
 
@@ -146,11 +146,11 @@ $$
 
 打分与选块两行（arXiv:2606.19348 §2.3.1 Eq.(16)-(17)， $`s<\lfloor t/m\rfloor`$ 保因果）：
 
-$$
+```math
 I_{t,s} = \sum_{h=1}^{n^I_h} w^I_{t,h}\cdot \mathrm{ReLU}\big(\mathbf{q}^I_{t,h}\cdot K^{\mathrm{IComp}}_s\big),
 \qquad
 \mathcal{C}^{\mathrm{SprsComp}}_t = \big\{\, C^{\mathrm{Comp}}_s \;\big|\; I_{t,s}\in \mathrm{TopK}(I_{t,:}) \,\big\}
-$$
+```
 
 人话：每个 indexer 头 $`h`$ 拿自己的 query $`\mathbf q^I_{t,h}`$ 与块摘要 $`K^{\mathrm{IComp}}_s`$ 算内积、过 ReLU 清掉负相关，再按头的标量权重 $`w^I_{t,h}`$ 加权求和——一个标量 $`I_{t,s}`$ 把「块 $`s`$ 值不值得精读」定死；top-k 之后进核注意力的块恒为 $`k`$ 条， $`N_{\mathrm{read}}`$ 被钉成常数。两个新记号的来历各一句： $`\mathbf q^I_{t,h}`$ 由低秩 $`\mathbf c^Q_t`$ 经每头独立的升维矩阵升出（Eq.(13)-(14)）； $`K^{\mathrm{IComp}}`$ 用与 2.1 节**同一套**压缩操作从 token 压出（论文原话「same compression operation」）——indexer 打分的对象与主路压缩块同粒度、一一对应。
 
@@ -228,17 +228,17 @@ def get_dsv4_compress_ratio(config: Any, layer_idx: int) -> int:
 
 **共享 KV 的 MQA + 分组输出投影**（arXiv:2606.19348 §2.3.1 Eq.(18)-(19)；分组输出投影是同小节无编号的文字描述）。核注意力是 MQA：每条压缩条目同时当 key 和 value，全部 query 头共用。query 从共享的 $`\mathbf c^Q_t`$ 升出（Eq.(18)，与 indexer query 同构、矩阵与头数各自独立），打分-加权就是标准缩放点积注意力（论文记作抽象算子 $`\mathrm{CoreAttn}(\cdot)`$ ，按 MQA 展开即）：
 
-$$
+```math
 \mathbf{o}_{t,i} = \mathrm{Softmax}\!\left(\frac{\mathbf{q}_{t,i}\,(\mathcal{C}_t^{\mathrm{SprsComp}})^{\top}}{\sqrt{c}}\right)\mathcal{C}_t^{\mathrm{SprsComp}}
-$$
+```
 
 （arXiv:2606.19348 §2.3.1 Eq.(19) 写实。） $`\mathbf q_{t,i}\in\mathbb R^{1\times c}`$ 是头 $`i`$ 的 query 行向量， $`\mathcal C^{\mathrm{SprsComp}}_t\in\mathbb R^{k\times c}`$ 是 Eq.(17) 选中的 $`k`$ 条压缩条目， $`\mathbf o_{t,i}\in\mathbb R^{c}`$ 是头 $`i`$ 的输出。两点一句话点透：key 与 value 是**同一份** $`\mathcal C^{\mathrm{SprsComp}}_t`$ ，这正是 MQA 的定义；top-k 已在选块阶段把候选裁到 $`k`$ 条，这一步内部不再裁剪。输出侧还有一处省钱：V4 的 $`c\cdot n_h`$ （ $`n_h`$ 为核注意力头数）很大，直接投回 $`d`$ 维太贵，于是先把 $`n_h`$ 个头分 $`g`$ 组、每组降到低秩 $`d_g`$ 、再拼接投回 $`d`$ ——两段瘦线性替一段胖线性，这就是分组输出投影，落地形状见[第 24 章](../../ch24-sparse-attention-sfa-dsa/narrative/chapter.md)。
 
 **滑窗 + 注意力 sink**（arXiv:2606.19348 §2.3.3 Eq.(27)）。压缩块有个天生盲区：核注意力只读各压缩块的**输出**（单条摘要）、不读块内细节，而因果约束只允许 query 看 $`s<\lfloor t/m\rfloor`$ 的块——query 自己所在的块连同块内近邻 token 一起落进盲区，而近端恰恰最相关。滑窗支线因此额外保留最近 $`n_{\mathrm{win}}`$ 个**未压缩**的 KV 补上近端细节。注意力 sink 则给每头一张「弃权票」：
 
-$$
+```math
 s_{h,i,j} = \frac{\exp(z_{h,i,j})}{\sum_k \exp(z_{h,i,k}) + \exp(z'_h)}
-$$
+```
 
 （arXiv:2606.19348 §2.3.3 Eq.(27)。） $`z_{h,i,j}`$ 就是动机节「对前面每个候选各算一次 $`q\cdot k`$ 」里的那个打分，补上头 $`h`$ 、query 位置 $`i`$ 、候选 $`j`$ （滑窗 token 或压缩块）三个下标——还没除 softmax 分母、没加 sink 票的原始 logit； $`z'_h`$ 是第 $`h`$ 头的可学习 sink logit。分母多加一项 $`\exp(z'_h)`$ ，每头的注意力总和便不必等于 1、甚至可近 0——遇到无信息的候选，头可以「什么都不投」。（这个 softmax 与 2.1 节 $`\mathrm{Softmax}_{\mathrm{row}}`$ 是同一族「沿某一维归一」操作：那里沿窗口位置逐通道归一，这里沿候选逐头归一、再加 sink 项。）代入极端值看行为：
 
@@ -259,15 +259,15 @@ $$
 
 **mHC：把残差钉在双随机流形上**（arXiv:2606.19348 §2.2 Eq.(1)-(8)）。这是 V4 的另一根支柱，与注意力正交但同样为「深栈稳定」服务。标准 Hyper-Connections 把残差流从 $`\mathbb{R}^d`$ 扩宽到 $`\mathbb{R}^{n_{\mathrm{hc}}\times d}`$ ，用一个 $`B_l`$ 矩阵混合各路残差（Eq.(1)）；但堆多层容易数值发散。mHC（Manifold-Constrained Hyper-Connections，流形约束超连接）把 $`B_l`$ 约束到**双随机矩阵**（每行每列和都为 1）流形上，用 Sinkhorn-Knopp 算法迭代实现。先给直觉：这套迭代像把一张预算表来回按行、按列配平，直到每行每列都恰好加起来是 1——先 $`\exp`$ 保正，再反复列归一、行归一（即下式 Eq.(8) 中内层先做列归一 $`\mathcal{T}_c`$ 、外层再做行归一 $`\mathcal{T}_r`$ ）：
 
-$$
+```math
 M^{(t)} = \mathcal{T}_r\big(\mathcal{T}_c(M^{(t-1)})\big)
-$$
+```
 
 （arXiv:2606.19348 §2.2 Eq.(8)， $`\mathcal{T}_r,\mathcal{T}_c`$ 是行/列归一，取 $`t_{\max}=20`$ ）。两者的具体定义是逐元素除以对应的行和/列和：
 
-$$
+```math
 \mathcal{T}_c(M)_{ij} = \frac{M_{ij}}{\sum_{i'} M_{i'j}}, \qquad \mathcal{T}_r(M)_{ij} = \frac{M_{ij}}{\sum_{j'} M_{ij'}}
-$$
+```
 
 $`\mathcal{T}_c`$ 把每一**列**的和配平到 1（列归一，固定 $`j`$ 、对 $`i`$ 求和）， $`\mathcal{T}_r`$ 把每一**行**的和配平到 1（行归一，固定 $`i`$ 、对 $`j`$ 求和）；两步交替应用直到收敛，就是 Sinkhorn-Knopp 迭代。
 

@@ -681,11 +681,11 @@ metadata 翻译好了，`block_table` 和 `slot_mapping` 都到了后端手里�
 
 **PagedAttention 寻址恒等式。** 对第 $`i`$ 个 token：
 
-$$
+```math
 \mathrm{slot} = \mathrm{slot\_mapping}[i], \quad
 \mathrm{block\_idx} = \left\lfloor \frac{\mathrm{slot}}{\mathrm{block\_size}} \right\rfloor, \quad
 \mathrm{block\_offset} = \mathrm{slot} \;\mathrm{mod}\; \mathrm{block\_size}
-$$
+```
 
 人话翻译：`slot_mapping[i]` 给出第 $`i`$ 个 token 的**扁平槽号**；整除块大小得到它落在第几个物理块，取余得到块内偏移。举个数：`block_size = 16` 时，`slot = 17` → `block_idx = 1`、`block_offset = 1`，也就是第 1 块的第 1 个位置。
 
@@ -839,9 +839,9 @@ assert torch.count_nonzero(key_cache[0, 1]) == 0  # slot -1 的 token 没写，�
 
 **读一个请求要走多少块？** 与该请求的历史长度 `seq_lens` 成线性。kernel 顺 `block_table` 走过的物理块数是
 
-$$
+```math
 n_{\mathrm{blocks}} = \left\lceil \frac{\mathrm{seq\_len}}{\mathrm{block\_size}} \right\rceil
-$$
+```
 
 每块读至多 `block_size` 个 token 的 KV。这和"写"那侧 $`O(1)`$ 的散写直觉对称——写是按 `slot_mapping[i]` 一个 token 落一格、单 token 常数时间，读则要把整段历史顺块表扫一遍、与历史长度成正比。`block_table` 可以比实际历史长（它给的是请求"最多能用到的页"），但 `seq_lens` 会把读截到前 `seq_len` 个 token，多余的块这一步根本不碰。
 

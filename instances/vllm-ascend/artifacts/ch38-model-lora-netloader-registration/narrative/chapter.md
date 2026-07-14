@@ -334,29 +334,29 @@ wrapper 怎么被选中，又是一条注册主线。vLLM 通过平台层问「�
 
 `max_lora_rank >= 128` 退回 `torch_ops`，背后是 LoRA 的低秩账。LoRA 把权重增量分解成两个低秩矩阵 $`\Delta W = BA`$ ，前向时不直接算满秩乘法，而是分两步走。记 token 数为 T、输入维为 d、输出维为 o、LoRA rank 为 r、缩放为 s：
 
-$$
+```math
 \mathrm{shrink}: \; u = x A, \qquad \mathrm{expand}: \; y \mathrel{+}= (u B) \cdot s
-$$
+```
 
 shrink 先把输入从 d 维降到 r 维的 buffer，expand 再把它升回 o 维。两步的 FLOPs 约为 $`2 T r (d + o)`$ 。对比满秩增量直算的 $`2 T d o`$ ，省下的倍数是：
 
-$$
+```math
 \frac{2 T d o}{2 T r (d + o)} = \frac{d o}{r (d + o)}
-$$
+```
 
 代入数值看一眼。取 d = o = 4096，先算常规的 r = 16：
 
-$$
+```math
 \frac{4096 \times 4096}{16 \times (4096 + 4096)} = \frac{4096}{32} = 128
-$$
+```
 
 省约 128 倍——这就是 LoRA「低秩」二字的算力含义。
 
 但这个收益随 r 增大而缩水。把 r 提到阈值 128，同一公式原样代进去：
 
-$$
+```math
 \frac{4096 \times 4096}{128 \times (4096 + 4096)} = \frac{4096}{256} = 16
-$$
+```
 
 两个数据点并排一看就清楚了：r = 16 省 128 倍，r = 128 只省 16 倍——r 涨 8 倍，省下的算力也跟着缩到八分之一。低秩的红利在大 rank 上所剩无几，自定义 NPU kernel 为小 r 做的特化（比如把 r 维塞进片上缓存）也跟着失去意义。这时退回 PyTorch 原生实现，既不丢多少性能，又换来正确性和兼容性的保障。`max_lora_rank >= 128` 这个阈值，就是「自定义 kernel 还值不值」的分界线。
 

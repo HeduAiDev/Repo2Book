@@ -321,9 +321,9 @@ else:
 
 给个数。设 `max_model_len = 4096`，prompt 是 100 个 token：
 
-$$
+```math
 \mathrm{max\_tokens} = \mathrm{max\_model\_len} - \mathrm{seq\_len} = 4096 - 100 = 3996
-$$
+```
 
 人话翻译：你没说要生成多少，那就敞开了生成，一直到把上下文窗口剩下的 3996 个位置填满为止。`seq_len` 由 `length_from_prompt_token_ids_or_embeds` 算——有 token id 就数 token，纯嵌入就数嵌入行数。
 

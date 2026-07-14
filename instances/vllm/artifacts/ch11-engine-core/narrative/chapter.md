@@ -123,9 +123,9 @@ if model_output is None:
 
 把这一手量化一下。设一次迭代里几个阶段的耗时为：
 
-$$
+```math
 T_{\mathrm{step}} \;\approx\; \max\!\big(T_{\mathrm{forward}},\; T_{\mathrm{bitmask}}\big) \;+\; T_{\mathrm{sample}} \;+\; T_{\mathrm{update}}
-$$
+```
 
 人话翻译：这一拍花的时间 ≈（前向和掩码两者里更慢的那个）+ 采样 + 收尾。因为前向和掩码并行，所以是 `max` 而不是相加。举个数：前向 20 ms、掩码 2 ms，并行后这一段就是 `max(20, 2) = 20` ms，那 2 ms 的掩码计算**白赚**——它整个藏进了前向的影子里。要是串行，就是 `20 + 2 = 22` ms。
 
@@ -772,9 +772,9 @@ self.step_fn = (
 
 `step_with_batch_queue` 是 PP 的核心——它允许同时有多个批在流水线的不同 stage 上飞，靠「先填满流水线优先于取结果」消除 PP 气泡。把收益量化一下：流水线并行（Pipeline Parallelism，PP）把模型的 Transformer 层**按层切割**分配到多个 GPU（或 GPU 组）上，每个 GPU 负责若干层，称为一个 stage——batch 先经 stage 0 的前几层、再传 stage 1、……、最终从末级 stage 出来。整体切成 $`P`$ 个 stage，一个批串行穿过这些 stage。若同一时刻只有一个批在飞，那么任一时刻只有一个 stage 在干活、其余的全空着——硬件利用率只有
 
-$$
+```math
 \mathrm{util} \;=\; \frac{1}{P}
-$$
+```
 
 `batch_queue_size>1` 让同时有至多 `batch_queue_size` 个批分布在不同 stage 上，各 stage 都有活干，理论吞吐上限趋近 P 倍（实际受队列深度与调度/采样依赖封顶）。它的关键一手是：调度到新批、且队列没满、且队尾那个批还没算完时，**直接返回 `(None, True)`**，让忙循环立刻转下一圈再去调度一个批，而不是傻等当前批：
 

@@ -155,9 +155,9 @@ def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
 
 写成公式：
 
-$$
+```math
 \mathrm{skipped} = \max(0,\ \mathrm{num\_computed} - \mathrm{sliding\_window} + 1)
-$$
+```
 
 直觉先行：算到第 `num_computed` 个 token 时，下一个要算的 token 能看到的窗口是最近 `sliding_window` 个。窗口左边界之前的 token 全部出局。那个 `+1` 是因为「下一个 token」也要占一个窗口名额，所以窗口往前滑的步子比 token 序号慢一格。
 
@@ -297,9 +297,9 @@ def get_num_blocks_to_allocate(
 
 **第一项 `num_new_blocks`：要新建几块。** 核心是这个 `max`：
 
-$$
+```math
 \mathrm{num\_new\_blocks} = \max\big(\mathrm{num\_required} - \max(\mathrm{num\_skipped},\ \mathrm{num\_local\_computed}),\ 0\big)
-$$
+```
 
 `num_required` 是这次需要的总块数（按 `num_tokens_need_slot` 算）。从里减掉「已经有的」——但「已经有的」要取 `num_skipped_blocks` 和 `num_local_computed_blocks` 的较大者。为什么取 max？两种情形：窗口里还有本地已算块时，这些块顶用，`num_local_computed_blocks` 主导；窗口滑得太远、本地块全出窗了，那 `num_skipped_blocks` 主导（出窗的块虽然换了 null 但下标占着，required 是从下标 0 数的）。取较大者才不会重复计算这段已被覆盖的前缀。
 
@@ -328,9 +328,9 @@ if apply_admission_cap and self._max_admission_blocks_per_request is not None:
 
 问题的根源：滑窗请求的 `cdiv(全长)` 是按**整条序列长度**算的，但它实际**同时持有**的真实块远没那么多——因为窗外块一直在被 `remove_skipped_blocks` 回收。每请求峰值真实持块约为
 
-$$
+```math
 \mathrm{cdiv}(\mathrm{sliding\_window} - 1 + \mathrm{newly\_scheduled\_tokens},\ \mathrm{block\_size}) + 1
-$$
+```
 
 直觉先行：大小为 W 的窗口覆盖最近 W 个 token，但当前批次新调度的 `newly_scheduled_tokens` 个 token 可能把窗口右边界再往右推。峰值同时持有的 token 区间长度是 `(W - 1) + newly_scheduled_tokens`——W 个窗口 token 里减掉 1 是因为右边界那个 token 本身已被新调度段计入，不能重复算。把这段区间分块，向上取整加 1（窗口左边界未必落在块边界，可能多压半块）得到公式。`newly_scheduled_tokens` 在源码里就是调度器配置 `max_num_batched_tokens`——`SlidingWindowSpec.max_admission_blocks_per_request(max_num_batched_tokens, max_model_len)` 里 `num_tokens = min(sliding_window - 1 + max_num_batched_tokens, max_model_len)` 这一项，不能悄悄取 0。代入真实默认值看量级差：`max_model_len=32768`、`sliding_window=4096`、`block_size=16`、`max_num_batched_tokens` 取默认值 `DEFAULT_MAX_NUM_BATCHED_TOKENS=2048`，全长口径要 `cdiv(32768,16)=2048` 块，而峰值持块是 `cdiv(4096-1+2048,16)+1=385` 块——相差约 **5.3 倍**。按全长留量等于把一个请求的占用虚报了 5 倍多，准入会无谓地拒掉本能放下的请求。
 
@@ -375,9 +375,9 @@ def get_manager_for_kv_cache_spec(
 
 `kv_cache_spec.max_admission_blocks_per_request(...)` 这个 spec 侧方法，既被启动时的池估算器调用来定池容量，又在这里被注入进 manager 当运行时准入上限。两边永远一致。于是不等式
 
-$$
+```math
 \sum_{\mathrm{requests}} \mathrm{reservation} \le \mathrm{pool} \iff \sum_{\mathrm{requests}} \mathrm{peak\_real\_held} \le \mathrm{pool}
-$$
+```
 
 恒成立——「启动估算能放下的请求，运行时一定能被准入」，不会死锁，也不会 prefill 中途 OOM。这个等价性依赖一个前提：`remove_skipped_blocks` 在每个 chunk 的预算检查**之前**运行（[§16.2](#162-阶段一释放窗外块--预算检查) 那个「先释放后检查」的顺序），保证每请求峰值持块不超上限。一环扣一环。
 
@@ -772,23 +772,23 @@ def find_longest_cache_hit(
 
 把候选命中长度记作 L（token 数）。每轮迭代中，每个注意力类型把 L 映射为不超过它的新值——接受则不变，缩短则严格变小：
 
-$$
+```math
 L' \le L,\quad \mathrm{accept} \Rightarrow L' = L,\quad \mathrm{shrink} \Rightarrow L' < L
-$$
+```
 
 所以一轮内 L 单调不增。两种结局：某轮无任何类型缩短（`curr_hit_length >= hit_length`），到达不动点退出；否则 L 严格下降。
 
 而 L 的取值落在离散有限集合里——必须是 `lcm_block_size` 的倍数，下界为 0：
 
-$$
+```math
 L \in \{0,\ \mathrm{lcm},\ 2\cdot\mathrm{lcm},\ \dots\}
-$$
+```
 
 一个严格下降、有下界、取值离散的量，必然有限步触底。轮数上界就是初值除以步长：
 
-$$
+```math
 \mathrm{rounds} \le \Big\lceil \mathrm{max\_cache\_hit\_length} / \mathrm{lcm\_block\_size} \Big\rceil
-$$
+```
 
 这是单调量 + 离散下界保证终止性的标准论证。
 

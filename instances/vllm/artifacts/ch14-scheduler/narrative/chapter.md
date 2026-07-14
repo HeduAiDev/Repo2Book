@@ -113,9 +113,9 @@ if preempted_req == request:
 
 把成本量级写明白：记被抢请求已生成长度为 $`L`$ 、前缀缓存未命中的部分为 $`L_{\mathrm{miss}}`$ 。朴素的「丢弃重算」要重新 prefill 整段，但前缀缓存命中后只需重算没命中的那部分：
 
-$$
+```math
 O(L) \;\longrightarrow\; O(L_{\mathrm{miss}})
-$$
+```
 
 命中率越高， $`L_{\mathrm{miss}}`$ 越接近 0，重算成本越低。这就是 v1 敢用「丢弃」替「换出」的底气——这套前缀缓存的机制，**第 15 章** 会拆开讲。v1 用「简单的内存模型 + 前缀缓存兜底」换掉了「复杂的 swap 管理」。
 
@@ -239,9 +239,9 @@ if not preempted_reqs:
 
 vLLM 的解法：把阻塞态请求**隔离**到第二个队列 `skipped_waiting`，让可调度的请求在 `waiting` 里畅通无阻。隔离后，每个阻塞请求只是被 $`O(1)`$ 地 `pop` + `prepend` 跳过一次，后面 $`N`$ 个可调度请求照常前进；单拍的额外代价不过是最多遍历两队总长一遍，即每拍 `peek`/`pop` 次数满足：
 
-$$
+```math
 C_{\mathrm{step}} \le |waiting| + |skipped\_waiting|
-$$
+```
 
 也就是把 $`O(N)`$ 的队头阻塞换成了对两队的线性一遍扫描。
 

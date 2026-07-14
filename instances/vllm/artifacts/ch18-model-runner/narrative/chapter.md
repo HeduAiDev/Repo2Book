@@ -452,9 +452,9 @@ torch.index_select(
 
 **拍扁成一维。** 这是技巧的核心。`token_ids_cpu` 是 `(R, L)` 的二维行优先缓冲，元素 `(r, p)` 的扁平偏移就是 `r·L + p`(`L` = `max_model_len`)。所以：
 
-$$
+```math
 \mathrm{token\_indices}[i] = \mathrm{positions}[i] + \mathrm{req\_indices}[i] \times L
-$$
+```
 
 一句话翻译：**把「第几个请求、第几个位置」这对二维坐标，换算成它在拉直后的一维大数组里的偏移。** 换算完，一次 `torch.index_select` 就把散落在不同行、不同列的 token 全捞进连续的 `input_ids`。注释专门点名用 `index_select` 而非 `np.take`——大张量上前者实测快得多。
 
@@ -621,9 +621,9 @@ for i in range(start_idx, end_idx, BLOCK_SIZE):
 
 把上下文并行的旁路折叠掉（单 rank 时 `TOTAL_CP_WORLD_SIZE = 1`，`virtual_block_size` 退化成 `block_size`，`local_block_offsets` 退化成 `pos % block_size`），映射公式就清爽了：
 
-$$
+```math
 \mathrm{slot\_id} = \mathrm{block\_table}[\mathrm{req}, \lfloor \mathrm{pos} / \mathrm{bs} \rfloor] \times \mathrm{bs} + (\mathrm{pos} \bmod \mathrm{bs})
-$$
+```
 
 一句话翻译：**token 的绝对位置 `pos`，落在它第 `pos // bs` 个逻辑块、块内第 `pos % bs` 格。查块表把逻辑块号换成物理块号，再乘块大小加块内偏移，就是它在 KV 显存里的物理槽。**
 

@@ -82,13 +82,13 @@ def get_name() -> str:
 
 把账算清楚。设单 query：
 
-$$
+```math
 \mathrm{full} = O(L \cdot d)
-$$
+```
 
-$$
+```math
 \mathrm{sparse} = O(L \cdot d_{idx} + k \cdot d)
-$$
+```
 
 其中 $`d`$ 是全精度注意力每个 KV 位置的成本、 $`d_{idx}`$ 是索引打分每个位置的成本，前者远大于后者。 $`k`$ 是 top-k 预算（DSA 的 `index_topk`，见 `vllm_ascend/attention/dsa_v1.py`）。第一项是索引打分：扫全部 L 个位置，但每位置只花极小的索引维度。第二项是全精度注意力：只在 k 个位置上算。上下文远长于 k 时，原本随 L 线性增长的昂贵全精度注意力被钉死成常数；剩下随 L 增长的，只有便宜得多的索引打分。
 

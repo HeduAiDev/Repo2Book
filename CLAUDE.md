@@ -74,7 +74,7 @@ python3 scripts/lint_diagram_geometry.py --all   # 图：文字越界/相撞/压
 朴素 `$…$` 在 GitHub(cmark-gfm) 上有**六**种静默失效方式，踩中任一整段吐裸源码——`压到$d_c$维`(紧贴 CJK)、`$ d_c $`(内侧带空格)、`一半;$N$ 涨`(前接半角标点)、`$\mathbf{q}_{t,j}$`(`}_{` 的 `_` 被 markdown 吃成 `<em>`)、`*图 1 同一 $L$*`(被单星号斜体包住)、以及被 `**` flanking 失败连累。**`` $`…`$ `` 对以上全部免疫**（正文/表格/粗体/斜体/列表/标题/紧贴 CJK 实测均渲染），LaTeX 源码逐字不变。一条规则替掉六条易错规则。
 存量转换：`python3 scripts/fix_inline_math_escape.py <file.md>`（幂等）。
 
-**② 块级 `$$…$$` 照旧**（叶子块，不受上述影响），但须与内容分行、且**前后留空行**。
+**② 块级数学一律 ` ```math ` 围栏,禁用 `$$…$$`**。`$$` 块会先过 CommonMark 反斜杠转义——`\,`→字面逗号、`\;`→分号、`\!`→`!`、`\{`→`{`（`\left\{` 变非法 `\left{`，GitHub 报 Missing delimiter）、`\\`→`\`（aligned/矩阵换行被砍）。` ```math ` 是代码围栏语义、逐字节免疫（引用块内 `> ```math` 同样成立）。存量转换：`python3 scripts/fix_display_math_fence.py <file.md>`（幂等）。与①同一条总原则：**数学内容永远放在不做 markdown 转义的容器里**（行内=code span，块级=code fence）。
 
 **③ `**粗体**` 定界符外侧留半角空格**（内侧紧邻全角标点时必须）：❌ `是**「编译」…**` / ❌ `**…怎么读：**第一个` → ✅ `是 **「编译」…**` / ✅ `**…怎么读：** 第一个`。汉字既非空白也非标点，CommonMark flanking 不成立时 ** 原样显示、**并连累其中的数学**。修法同口诀：**空格永远在定界符外侧**。存量：`python3 scripts/fix_emphasis_flanking.py <file.md>`。
 

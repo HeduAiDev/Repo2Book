@@ -308,9 +308,9 @@ def determine_available_memory(self) -> int:
 
 非 KV 显存因此分成三块，相加得 `non_kv_cache_memory`：
 
-$$
+```math
 \mathrm{non\_kv} = \mathrm{non\_torch} + \mathrm{torch\_peak} + \mathrm{weights}
-$$
+```
 
 人话：**非 KV 显存 = 框架杂项 + 激活峰值 + 模型权重**。后半段把账结清：
 
@@ -348,9 +348,9 @@ return int(self.available_kv_cache_memory_bytes)
 
 KV 预算的落点公式：
 
-$$
+```math
 \mathrm{available\_kv} = \mathrm{requested} - \mathrm{non\_kv} - \mathrm{aclgraph\_applied}
-$$
+```
 
 其中 `requested = total × gpu_memory_utilization`，而 `aclgraph_applied` 是否真扣，由环境开关 `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS` 决定。
 
@@ -371,9 +371,9 @@ $$
 
 道理很简单：被 ACLGraph 占走多少比例，就把利用率往上抬回多少。所以要把这块 KV 补回来，只需把 `--gpu-memory-utilization` 提到
 
-$$
+```math
 \mathrm{suggested\_util} = \min(\mathrm{util} + \delta,\ 1.0) = \min(0.9 + 0.03,\ 1.0) = 0.93
-$$
+```
 
 封顶 `1.0` 是防呆——util 本来就接近满时，再加 δ 也不会越过 1.0。这段全是纯 Python 算术、不碰任何设备，所以在没有 NPU 的机器上注入几个桩就能跑出上面那两行 65/68 GiB 和 0.93 的数，正确性一目了然。
 

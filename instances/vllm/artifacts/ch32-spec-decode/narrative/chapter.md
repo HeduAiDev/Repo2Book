@@ -540,15 +540,15 @@ def rejection_random_sample_kernel(
 
 核心是这一行：
 
-$$
+```math
 \mathrm{accepted} = (\,p_{\mathrm{draft}}(x) > 0\,)\ \wedge\ \bigl(\,p_{\mathrm{target}}(x)\,/\,p_{\mathrm{draft}}(x)\ \ge\ u\,\bigr)
-$$
+```
 
 其中 $`u`$ 是一个 `[0, 1)` 的均匀随机数。把 $`p`$ 记作目标概率、 $`q`$ 记作草稿概率，准则就是看比值是否过得了随机门槛：
 
-$$
+```math
 P(\mathrm{accept}\ x) = \min\Bigl(1,\ \frac{p(x)}{q(x)}\Bigr)
-$$
+```
 
 因为 $`u`$ 服从均匀分布，"$`p(x)/q(x) \ge u`$ 成立"的概率正好等于上式。把它落到具体数字上就一目了然：比值 $`p/q = 0.3`$ 时， $`u`$ 只有落在 $`[0, 0.3)`$ 才接受，而 $`u`$ 在 $`[0,1)`$ 上均匀，落进去的概率正好 0.3；比值 $`\ge 1`$ 时门槛恒过、必接受。**这就是以 $`\min(1, p/q)`$ 的概率接受草稿 token x**——比值 ≥1 时（目标比草稿更看好 x）必接受，小于 1 时按比值的概率接受。
 
@@ -569,17 +569,17 @@ $$
 
 接受准则验证了"正确"，那"快"能快多少？也可以量化。设每个位置的接受率为 $`\alpha`$ （位置间近似独立），一次投机里草稿从前往后逐位接受，直到首个拒绝。那么一次目标前向接受的草稿数是个几何截断，期望接受长度为：
 
-$$
+```math
 \mathbb{E}[L] \approx \frac{1 - \alpha^{k+1}}{1 - \alpha}
-$$
+```
 
 再加上全接受时白嫖的那个 bonus，单次前向期望净产出 token 数就是 $`\mathbb{E}[L]`$ 量级。两个极端能帮你建立直觉： $`\alpha \to 1`$ （草稿几乎全中）时 $`\mathbb{E}[L] \to k+1`$ ，k 个草稿全白嫖再加 bonus，加速比逼近 k+1 倍； $`\alpha \to 0`$ （草稿几乎全错）时 $`\mathbb{E}[L] \to 1`$ ，退化成无投机、一次前向只产一个 token。加速比正比于 $`\mathbb{E}[L]`$ ，因为投机的开销（一次目标前向）和不投机时一模一样，多产出的 token 全是净赚。
 
 代入刚才那个实测的 $`\alpha \approx 0.5`$ 、取 $`k = 3`$ ：
 
-$$
+```math
 \mathbb{E}[L] \approx \frac{1 - 0.5^{4}}{1 - 0.5} \approx 1.875
-$$
+```
 
 即便接受率只有一半，一次目标前向也平均吐出近 2 个 token——这就是投机解码存在的理由。"正确性"那边用 2 万次实测锚定了 $`\alpha`$ ，"速度"这边就用同一个 $`\alpha`$ 算出了收益，两头对称。
 
@@ -595,9 +595,9 @@ $$
 
 补救办法是：拒绝时，从**残差分布**采一个 token：
 
-$$
+```math
 p'(x) = \frac{\bigl(p(x) - q(x)\bigr)_+}{\sum_y \bigl(p(y) - q(y)\bigr)_+}
-$$
+```
 
 这里 $`(\cdot)_+ = \max(\cdot,\ 0)`$ 是取正部。直觉是这样的：
 
@@ -669,9 +669,9 @@ def sample_recovered_tokens_kernel(
 
 这用的是 **Gumbel-max 技巧**的一个等价形式。`inv_q` 是 $`1/q'`$ ，其中 $`q'`$ 取自指数分布 $`\mathrm{Exp}(1)`$ 。直觉：指数分布的 CDF 是 $`1 - e^{-\lambda t}`$ ，当用权重 $`w`$ 缩放参数时，两个 token 中权重更大的那个"等待时间更短"，赢得 argmax 的概率正比于其权重——本质是对指数随机变量取 argmax 就等价于按权重比例抽签。可以证明，对未归一化的权重 `prob`：
 
-$$
+```math
 \arg\max_x\ \bigl(\mathrm{prob}(x) \cdot \mathrm{inv\_q}(x)\bigr)\ \sim\ \frac{\mathrm{prob}(x)}{\sum_y \mathrm{prob}(y)}
-$$
+```
 
 也就是说，按 `prob × inv_q` 取 argmax，分布上等价于"按 `prob` 归一化后的分布"采样。于是省掉了对整个 vocab 维度求和归一化这一步——单个内核里分块扫一遍 vocab、滚动维护最大值，直接出 recovered token。
 

@@ -117,17 +117,17 @@ def forward(
 
 标准多头注意力（MHA）的痛点在解码阶段：每生成一个 token，都要把它的 K、V 存进 KV cache，供后面所有 token 注意。每个 token 缓存的大小，正比于
 
-$$
+```math
 2 \times n_{\mathrm{kv\_heads}} \times d_{\mathrm{head}}
-$$
+```
 
 那个 2 是 K 和 V 各一份。头数多、维度大，KV cache 就吃显存——长上下文场景下，它常常比模型权重还大。
 
 MLA（Multi-head Latent Attention，多头潜变量注意力，由 DeepSeek-V2 提出，arXiv:2405.04434）的思路是：别缓存满血的 K/V，缓存一个**低秩潜变量**。`kv_lora_rank` 是该潜变量的维数（DeepSeek-V4 取 512），远小于 `n_heads × d_head` 的几千维。把 K/V 压到这个 `kv_lora_rank` 维，缓存这个压缩版；真正算注意力时再升回去。压缩比（缓存满血 K/V 的字节 ÷ 缓存潜变量的字节）大致是
 
-$$
+```math
 \frac{2 \times n_{\mathrm{heads}} \times d_{\mathrm{head}}}{kv\_lora\_rank + qk\_rope\_head\_dim}
-$$
+```
 
 举个 DeepSeek 量级的数：`n_heads × d_head` 在几千维，而 `kv_lora_rank` 只有 512 左右。分子上万、分母几百——**KV cache 缩到原来的十分之一甚至更小**。这就是 MLA 值这么多工程复杂度的原因：显存省下来，batch 能开更大，吞吐就上去了。
 
@@ -173,9 +173,9 @@ RoPE（旋转位置编码）和低秩压缩有个根本矛盾。低秩压缩想�
 
 DeepSeek 的解法是**解耦**：把每个 head 的维度劈成两段。
 
-$$
+```math
 d_{\mathrm{head}} = qk\_nope\_head\_dim + qk\_rope\_head\_dim
-$$
+```
 
 - **nope 段**（no position embedding）：不旋转，可以被低秩 `kv_b` 矩阵吸收进潜变量，享受压缩。
 - **rope 段**：单独保留、施加旋转，显式存进缓存（就是那个 `k_pe`，pe = position embedding）。
@@ -326,9 +326,9 @@ qr, kv = fused_q_kv_rmsnorm(
 
 MoE（Mixture of Experts，专家混合）换个玩法：准备 `n_routed_experts` 个专家（每个就是一条小 MLP），每个 token 只激活其中 top-k 个。每 token 的 MLP 算力，正比于「激活专家占全部专家的比例」乘「全部专家参数」：
 
-$$
+```math
 \frac{num\_experts\_per\_tok + n_{\mathrm{shared}}}{n_{\mathrm{routed\_experts}}} \times W_{\mathrm{experts}}
-$$
+```
 
 举个 DeepSeek 量级：256 个专家、每 token 选 8 个。那么每 token 只碰到 8/256 ≈ 3% 的路由专家参数。**参数量可以堆到几百 B，但每 token 的算力近似不变**——这就是 MoE 的核心权衡：用稀疏激活把模型容量做大，而不把单 token 的 FLOPs 做大。
 
@@ -389,13 +389,13 @@ else:
 
 **偏置怎么更新、为什么能把负载摁平**：`e_score_correction_bias` 在 vLLM 里是 `requires_grad=False` 的纯推理期参数——它的取值是训练阶段一条更新规则喂出来的结果，这条规则最早由 Loss-Free Balancing 提出（arXiv:2408.15664），DeepSeek-V3 沿用并定型了记号（arXiv:2412.19437）：路由排序看打分加偏置之和，谁的和进 top-k 谁就被选中；但**门控权重**（专家输出乘多大的系数去加权求和）用的是**原始**打分，偏置从不参与加权。每一轮统计每个专家实际收到的 token 数 $`c_i`$ ，跟均匀负载 $`\bar c`$ 比：过载的专家（ $`c_i > \bar c`$ ）把偏置减一个固定步长 γ，欠载的专家（ $`c_i < \bar c`$ ）把偏置加 γ：
 
-$$
+```math
 b_i \leftarrow b_i - \gamma \quad (c_i > \bar c)
-$$
+```
 
-$$
+```math
 b_i \leftarrow b_i + \gamma \quad (c_i < \bar c)
-$$
+```
 
 注意这条更新只看过载/欠载的**方向**，不看差多少——这是它能收敛而不是乱撞的关键，下面手算一遍就看得出来。
 

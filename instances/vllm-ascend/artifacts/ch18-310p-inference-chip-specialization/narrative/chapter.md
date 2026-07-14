@@ -197,9 +197,9 @@ class BlockTable(AscendBlockTable):
 
 这段 `else` 主路径，就是 slot mapping 的数学定义本身。逻辑块号是位置整除块大小，物理块号去块表里查，块内偏移是位置对块大小取余，最后拼起来：
 
-$$
+```math
 \mathrm{slot} = \mathrm{block\_number} \times \mathrm{block\_size} + (\mathrm{position} \bmod \mathrm{block\_size})
-$$
+```
 
 基座的 Triton kernel 和这里的 NumPy 算的是**同一个公式**，只是执行域从 NPU 挪到了 host CPU。下面这张图把两条路并排放在一起。
 
@@ -374,9 +374,9 @@ elif "attn" in layer_name and layer_name not in kv_cache:
 
 **约束一·对齐。** 这个约束来自一个具体算子——310P 的页注意力算子（paged attention kernel）对 kernel 块有个硬上限，源码注释写得很直白：`block_size * head_size <= 128 * 128`。这个 128×128 对应硬件矩阵计算单元一次能吃下的分块形状：
 
-$$
+```math
 \mathrm{block\_size} \times \mathrm{head\_size} \le 128 \times 128 = 16384
-$$
+```
 
 代码里 `_ATTENTION_BLOCK_SIZE_LIMIT = 128 * 128`。它从候选的 kernel 块大小里筛出满足这个上限的，取第一个。如果逻辑块大小比筛出来的 kernel 块大，就用 `block_size_chunk = 逻辑块大小 // kernel 块大小` 把一个逻辑块**拆成多个物理 kernel 块**。举例：逻辑块 128、head_size 256，则 128×256 = 32768 超限，得退到 kernel 块 64（64×256 = 16384 刚好压线），`block_size_chunk = 128 // 64 = 2`，一个逻辑块拆成两个物理块。
 

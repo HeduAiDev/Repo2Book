@@ -584,9 +584,9 @@ def __getattr__(name: str):
 
 理清了塌缩，三级取值的优先级就能精确表述：
 
-$$
+```math
 \mathrm{value} = \begin{cases} \mathrm{additional\_config}[k], & k \in \mathrm{additional\_config} \\ \mathrm{env\_value}, & \mathrm{otherwise} \end{cases}
-$$
+```
 
 而 env_value 早在 `vllm_ascend/envs.py` 的 lambda 里求好：环境里有 KEY 就取环境值，没有就取 default。
 

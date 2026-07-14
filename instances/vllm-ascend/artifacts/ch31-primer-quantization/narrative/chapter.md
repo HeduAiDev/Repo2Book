@@ -32,9 +32,9 @@
 
 真正的坑不在档位少，在**刻度被谁用掉**。SmoothQuant §3（arXiv:2211.10438）给了精确的定量刻画：per-tensor（整矩阵共用一个 scale，即量化步长）量化下，通道 $`i`$ 的**有效量化级数** $`\ell_i`$ 是：
 
-$$
+```math
 \ell_i = 2^{N}\cdot \dfrac{m_i}{m}
-$$
+```
 
 $`m_i`$ 是通道 $`i`$ 自己的最大幅值、 $`m`$ 是整个矩阵的最大幅值、 $`N`$ 是位宽：量程被 $`m`$ 撑到头，通道 $`i`$ 实际用到的刻度只有满量程的 $`m_i/m`$ 那么多。而大模型的激活里，恰有极少数通道（往往固定就那几个）的幅值系统性地比别人大上百倍——这就是 **outlier**。一个 outlier 把 $`m`$ 撑大百倍，其余正常通道的有效级数就塌到个位数；SmoothQuant 论文原话：非 outlier 通道只剩「2-3 级」，256 个档位名存实亡。这不是玩具现象，论文用真实模型的真实层验证过：
 
@@ -68,9 +68,9 @@ class QuantType(Enum):
 
 先把「预算的定价公式」写下来。SmoothQuant §2 Eq.1（arXiv:2211.10438）的对称均匀量化：
 
-$$
+```math
 \overline{\mathbf{X}}^{\mathrm{INT8}} = \left\lceil \dfrac{\mathbf{X}^{\mathrm{FP16}}}{\Delta} \right\rfloor, \quad \Delta = \dfrac{\max(|\mathbf{X}|)}{2^{N-1}-1}
-$$
+```
 
 $`\lceil\cdot\rfloor`$ 是四舍五入取整。量化 = 除以步长再取整，反量化 = 乘回步长；步长 $`\Delta`$ 由 absmax 定——把最大幅值映到最大码位 $`2^{N-1}-1`$ （N=8 时是 127）。取整误差至多半个码位，乘回 $`\Delta`$ 就是全章反复使用的误差界： $`|\hat w - w| \le \Delta/2`$ 。两条直接推论：位宽每降 1 bit， $`\Delta`$ 近似翻倍，误差上界跟着翻倍——「低位宽更糙」的定量说法；更要紧的是 $`\Delta`$ 正比于 absmax——这正是主线的汇率，**谁改小了付账处的 absmax，谁就买到更细的刻度**，后面三篇论文的每一笔挪账都按它结算。（约定差异一句说破：AWQ §3.2 Eq.1（arXiv:2306.00978）的量化函数几乎一样，只是分母用满量程 $`2^{N-1}`$ 而非 $`2^{N-1}-1`$ ，N=8 时二者之比 $`128/127\approx1.0079`$ ，只差一个码位，文献里两种约定都常见、**不是矛盾**；本章参考实现把两个函数分开写，不硬凑成一个。）
 
@@ -89,9 +89,9 @@ absmax 那个权重（1.27）正好落在码位 127 上，零误差。其余的�
 
 对称量化把零点钉死在正中间，适合正负大致平衡的权重；激活常常一侧偏多（比如 ReLU 之后全是正数），钉死中点等于白扔一半档位。非对称量化多留一个自由度 **zero-point**（零点 $`z`$ ），把档位整体挪到数据真正的区间上：
 
-$$
+```math
 q = \mathrm{round}\!\left(\dfrac{x}{\Delta}\right) + z, \quad \Delta = \dfrac{\max(x)-\min(x)}{2^{N}-1}, \quad z = -\mathrm{round}\!\left(\dfrac{\min(x)}{\Delta}\right)
-$$
+```
 
 步长 $`\Delta`$ 按数据的实际值域算（而不是以 0 为中心的 absmax），零点 $`z`$ 跟着实际最小值走。全正激活 $`a = [0.1, 0.55, 0.9, 0.32]`$ 、3 bit（8 个档位）：对称量化负半轴那 4 个档位全程用不上，最大误差 0.1；非对称量化用 (scale=0.1143, zero_point=-1) 把 8 个档位全铺在 [0.1, 0.9] 上，最大误差降到 0.0229。代入验证这两个数字： $`\Delta=(0.9-0.1)/7=0.1143`$ 、 $`z=-\mathrm{round}(0.1/0.1143)=-\mathrm{round}(0.875)=-1`$ ，正好对上。
 
@@ -107,15 +107,15 @@ $$
 
 线性层是 $`\mathbf{Y} = \mathbf{X}\mathbf{W}`$ ，维度约定沿 SmoothQuant §2（arXiv:2211.10438，Preliminaries 的一句叙述，未编号）：
 
-$$
+```math
 \mathbf{Y} = \mathbf{X}\,\mathbf{W}, \quad \mathbf{X}\in\mathbb{R}^{T\times C_i},\ \mathbf{W}\in\mathbb{R}^{C_i\times C_o}
-$$
+```
 
 $`T`$ 是 token 数、 $`C_i`$ 是输入通道、 $`C_o`$ 是输出通道。INT8 GEMM 在 int8 域把乘加做完、攒成 int32，**最后**才乘 scale 一次性反量化回浮点。SmoothQuant §3 Eq.2 把这一步写死了——反量化只能在矩阵乘**之后**、从两个外维还原：
 
-$$
+```math
 \mathbf{Y} = \mathrm{diag}(\boldsymbol{\Delta}_{\mathbf{X}})\cdot\big(\overline{\mathbf{X}}^{\mathrm{INT8}}\,\overline{\mathbf{W}}^{\mathrm{INT8}}\big)\cdot\mathrm{diag}(\boldsymbol{\Delta}_{\mathbf{W}})
-$$
+```
 
 洞见一句话：**scale 只能活在输出里还存活的维上**。 $`T`$ （行）与 $`C_o`$ （列）在 $`\mathbf{Y}`$ 里都还在，所以左侧 $`\mathrm{diag}(\boldsymbol{\Delta}_{\mathbf{X}})`$ 可以是 per-tensor（对角线上 $`T`$ 个元素全相等，退化成标量）或 per-token（每行 token 各自一个 scale），右侧 $`\mathrm{diag}(\boldsymbol{\Delta}_{\mathbf{W}})`$ 是权重的 per-channel（每输出通道一个）。而输入通道 $`C_i`$ 是 GEMM 的**收缩维**（累加维）：每个输出元素都要沿所有 $`C_i`$ 求和，一旦求和，通道的身份就没了——你再没法回头说「这部分和来自通道 0，给它乘 $`s_0`$ 」，整个和已经坍成一个数。数学最优的「激活 per-channel（沿 $`C_i`$ ）」恰好死在这里：上一节想用来隔离 outlier 的那把逐通道尺子，GEMM 还原不了。
 
@@ -135,15 +135,15 @@ outlier 就地隔离不了，难度只能转移。三篇论文给了三个下家
 
 朴素量化 RTN（round-to-nearest，逐权重独立四舍五入）让每个权重各扫门前雪。GPTQ 的出发点是换目标——不逼近权重，逼近**层输出**（GPTQ §3 Eq.1，arXiv:2210.17323）：
 
-$$
+```math
 \underset{\widehat{\mathbf{W}}}{\arg\min}\ \big\| \mathbf{W}\mathbf{X} - \widehat{\mathbf{W}}\mathbf{X} \big\|_2^2
-$$
+```
 
 目标一换，问题就从「一堆独立取整」变成「一串互相耦合的决定」：量化一个权重留下的误差，可以让还没量化的邻居**反向吸收**。这套贪心-补偿由 GPTQ 的前身 OBQ（Optimal Brain Quantization，最优脑量化）给出闭式解（OBQ §3 Eq.2，arXiv:2210.17323；下标 $`F`$ 指当前尚未量化的全精度权重集合， $`\mathbf{H}_F^{-1}`$ 即限制在这批权重上的 Hessian 逆）：
 
-$$
+```math
 w_q = \underset{w_q}{\arg\min}\ \dfrac{\big(\mathrm{quant}(w_q)-w_q\big)^2}{[\mathbf{H}_F^{-1}]_{qq}}, \qquad \boldsymbol{\delta}_F = -\dfrac{w_q-\mathrm{quant}(w_q)}{[\mathbf{H}_F^{-1}]_{qq}}\cdot(\mathbf{H}_F^{-1})_{:,q}
-$$
+```
 
 左式挑人：在所有剩余权重里，选「量化误差平方除以 Hessian 逆对角」最小的先动手。右式摊账：把 $`w_q`$ 的取整误差按 $`\mathbf{H}_F^{-1}`$ **第 $`q`$ 列**的比例摊给所有剩余的全精度权重——这一列刻画的正是「在 $`q`$ 处注入单位误差，每个邻居该分摊多少来抵消」，补偿的方向不是拍的，是它给出的。比喻只需一句：结账时把多收的零头当场补给下一位顾客。
 
@@ -153,9 +153,9 @@ $$
 
 量化掉一个权重后，Hessian 逆不必从头重算——OBQ §3 Eq.3 用一次秩-1 高斯消元，直接得到「去掉该权重后」的 Hessian 逆：
 
-$$
+```math
 \mathbf{H}_{-q}^{-1} = \left( \mathbf{H}^{-1} - \dfrac{1}{[\mathbf{H}^{-1}]_{qq}}\,\mathbf{H}^{-1}_{:,q}\,\mathbf{H}^{-1}_{q,:} \right)_{-p}
-$$
+```
 
 括号里的减项是秩-1 更新，不是把某行某列简单删掉；外层下标 $`-p`$ 里的 $`p`$ 就是 $`q`$ ——论文原文在这一条公式里换写了记号（见速查表）。由此还得到收敛**不变量**：每轮严格量化并移除一个权重，剩余全精度集合单调减 1， $`d`$ 个权重必在 $`d`$ 轮内全部量化并终止。
 
@@ -193,17 +193,17 @@ GPTQ 在 OBQ 之上加的三处优化（GPTQ §4，arXiv:2210.17323）没有一�
 
 **其一，全行同序。** OBQ 允许每行各按各的顺序挑权重；GPTQ 让所有行同按一个列序——精度几乎不变，而 $`\mathbf H_F^{-1}`$ 的更新只依赖列输入 $`\mathbf X_F`$ 、与具体哪一行权重无关（上一节严谨框刚证明 $`\mathbf H`$ 与行号无关），于是整份 Hessian 逆全体行共享：每列只更新一次（共 $`d_{\mathrm{col}}`$ 次、每次 $`O(d_{\mathrm{col}}^2)`$ ），再把结果套用到全部 $`d_{\mathrm{row}}`$ 行上（ $`O(d_{\mathrm{row}}d_{\mathrm{col}}^2)`$ ），两部分取较大者：
 
-$$
+```math
 O(d_{\mathrm{row}}\cdot d_{\mathrm{col}}^3)\ \longrightarrow\ O\!\big(\max\{d_{\mathrm{row}}\cdot d_{\mathrm{col}}^2,\ d_{\mathrm{col}}^3\}\big)
-$$
+```
 
 快约 $`\min\{d_{\mathrm{row}}, d_{\mathrm{col}}\}`$ 倍。
 
 **其二，懒惰批。** 逐列把补偿立即写回全部剩余列是访存密集操作；GPTQ §4 Eq.4-5 把补偿攒成一批（B=128 列；大写 $`Q`$ 是这一批列的索引集合、单个 $`q`$ 的推广， $`[\mathbf{H}_F^{-1}]_{QQ}`$ 是把 Hessian 逆限制在这批索引的行列上取出的子块）：
 
-$$
+```math
 \boldsymbol{\delta}_F = -\big(\mathbf{w}_Q-\mathrm{quant}(\mathbf{w}_Q)\big)\big([\mathbf{H}_F^{-1}]_{QQ}\big)^{-1}(\mathbf{H}_F^{-1})_{:,Q}
-$$
+```
 
 它是逐列 OBQ 的**代数恒等重排**：块内逐列即时更新，块末才对块外一次性写回；逐列各除一次对角项的标量除法，收拢成一次子块求逆，子块逆顺带吸收块内各列彼此的补偿耦合——求和顺序换了、每一项没变，结果逐位相同。把访存密集的操作攒成算力密集的批操作，实测再快一个数量级。
 
@@ -257,9 +257,9 @@ AWQ 的反直觉洞见一行写完：权重 $`w`$ 的取整误差落到输出里
 
 保护的手段是**挪误差**：显著权重 $`w`$ 乘 $`s>1`$ 、对应激活 $`x`$ 除 $`s`$ ，乘积不变（下式左半即 AWQ §3.2 Eq.2；右半的误差比 $`\mathrm{Err}_{s}/\mathrm{Err}_{1}`$ 是本章为论文的文字结论取的记号，论文未单独编号）：
 
-$$
+```math
 Q(w\cdot s)\cdot\dfrac{x}{s} = \Delta'\cdot\mathrm{Round}\!\left(\dfrac{ws}{\Delta'}\right)\cdot x\cdot\dfrac{1}{s}, \qquad \dfrac{\mathrm{Err}_{s}}{\mathrm{Err}_{1}} = \dfrac{\Delta'}{\Delta}\cdot\dfrac{1}{s}
-$$
+```
 
 两个事实合起来就是 $`1/s`$ ：其一，四舍五入的取整误差只看 $`x/\Delta`$ 的小数部分，期望约 0.25 个码位、**与步长无关**——于是缩放前后的两个取整误差因子在期望下约掉，误差比只剩 $`\Delta'/\Delta\cdot 1/s`$ ；其二，只要放大后的 $`\max(|ws|)`$ 不顶破组内原有的 absmax，步长就不变（ $`\Delta'=\Delta`$ ，因为 $`\Delta`$ 由组 absmax 除以量化级数定），误差比精确化到 $`1/s<1`$ 。**边界**也在这：一旦 $`s`$ 大到让显著权重自己成了组内新的最大值， $`\Delta'`$ 随之涨大，这一涨会拖累组内**所有**非显著权重—— $`1/s`$ 的好处被 $`\Delta'/\Delta>1`$ 反噬。挪账免费的前提，是不撑破口袋。比喻一句：给重要的字用更粗的笔写，手抖的相对影响更小。
 
@@ -267,9 +267,9 @@ $$
 
 于是要搜一个「护得住显著权重、又不顶破组 absmax」的 $`s`$ 。AWQ §3.2 Eq.4-5 用一个超参 $`\alpha`$ 参数化这个搜索：
 
-$$
+```math
 \mathbf{s}^{*} = \underset{\mathbf{s}}{\arg\min}\ \big\| Q(\mathbf{W}\cdot\mathrm{diag}(\mathbf{s}))\,(\mathrm{diag}(\mathbf{s})^{-1}\mathbf{X}) - \mathbf{W}\mathbf{X} \big\|, \qquad \mathbf{s} = \mathbf{s_X}^{\alpha}
-$$
+```
 
 $`\mathbf{s_X}`$ 是逐输入通道的激活**平均**幅值（在 token 维上对 $`|\mathbf X|`$ 取平均，每个输入通道得一个标量——是平均、不是最大，AWQ §3.2 原文即 average magnitude of activation per-channel）， $`\alpha\in[0,1]`$ 网格搜： $`\alpha=0`$ 不缩放、 $`\alpha=1`$ 最激进。**不变量**：只要放大不改组 absmax（ $`\Delta'=\Delta`$ ），相对误差期望就精确等于 $`1/s`$ 。参考实现在 4 bit 上，对多次随机显著权重取误差均值（因为 $`1/s`$ 是期望意义的规律），扫 $`s`$ ：
 
@@ -299,22 +299,22 @@ AWQ 与 GPTQ 殊途同归：都只碰权重、不碰激活（W4A16），离线�
 
 激活难量化、权重好量化——那就把难度挪账过去，这是全章主线最字面的一次兑现。SmoothQuant §4 Eq.3（arXiv:2211.10438）的迁移变换：
 
-$$
+```math
 \mathbf{Y} = \big(\mathbf{X}\,\mathrm{diag}(\mathbf{s})^{-1}\big)\cdot\big(\mathrm{diag}(\mathbf{s})\,\mathbf{W}\big) = \widehat{\mathbf{X}}\,\widehat{\mathbf{W}}
-$$
+```
 
 激活逐通道除 $`s`$ 、权重逐通道乘 $`s`$ ， $`\mathrm{diag}(\mathbf{s})^{-1}\mathrm{diag}(\mathbf{s})`$ 抵消——乘积对任意正 $`s`$ **恒等**，不是近似：挪走的是量化友好度，不是数学。挪多少由难度因子定（§4 Eq.4；下标 $`j`$ 是输入通道索引，取值 $`1,\ldots,C_i`$ ——Eq.3 的整体记号 $`\mathrm{diag}(\mathbf s)`$ 到这里才按通道展开）：
 
-$$
+```math
 \mathbf{s}_j = \dfrac{\max(|\mathbf{X}_j|)^{\alpha}}{\max(|\mathbf{W}_j|)^{1-\alpha}}
-$$
+```
 
 $`\alpha`$ 是迁移强度（migration strength）——开篇说的那只旋钮。「分子分母互补指数」这个形式自带一个漂亮的对称性：把 $`\mathbf s_j`$ 代回迁移变换，两侧的新 max **底数相同、指数互补**——
 
-$$
+```math
 \max(|\widehat{\mathbf{X}}_j|) = \big(\max(|\mathbf{X}_j|)\max(|\mathbf{W}_j|)\big)^{1-\alpha},\qquad
 \max(|\widehat{\mathbf{W}}_j|) = \big(\max(|\mathbf{X}_j|)\max(|\mathbf{W}_j|)\big)^{\alpha}
-$$
+```
 
 $`\alpha=0.5`$ 时两指数相等，两侧 max 齐平于**几何平均** $`\sqrt{\max(|\mathbf{X}_j|)\max(|\mathbf{W}_j|)}`$ ——量化难度正好均分； $`\alpha`$ 偏离 0.5，两个指数此消彼长，总有一侧的 max 被重新放大、难度失衡（ $`\alpha\to1`$ 全推给权重、 $`\alpha\to0`$ 全留激活，两极端都恶化）。这就是甜点为什么常在 0.5（OPT / BLOOM 的经验值）；下面数值表的 U 形谷底是它的经验印证。**不变量**：迁移对任意正 $`s`$ 乘积无损， $`\alpha`$ 只改量化友好度，不改这个乘积。
 

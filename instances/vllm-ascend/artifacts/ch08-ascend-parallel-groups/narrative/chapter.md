@@ -141,9 +141,9 @@ def init_ascend_model_parallel(
 - `backend = ... get_backend(get_world_group().device_group)` ——直接从基座 world group 拿后端（就是 hccl）。又一处复用。
 - 最后 `all_ranks = torch.arange(world_size).reshape(...)`。它把 `0 .. world_size-1` 这一串 rank 编号，叠成一张 **5 维网格**：
 
-$$
+```math
 \mathrm{ExternalDP} \times \mathrm{dp} \times \mathrm{pp} \times \mathrm{pcp} \times \mathrm{tp}
-$$
+```
 
 这五个维度从外到内分别是：外层数据并行（verl——一个把 vLLM 当推理后端的强化学习训练框架——集成里每个 dp rank 可独立 generate，最外一维用 `-1` 自动算）、数据并行、流水线并行、prefill 上下文并行、张量并行。
 

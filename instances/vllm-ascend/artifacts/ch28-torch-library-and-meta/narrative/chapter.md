@@ -281,9 +281,9 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
 
 既然每个想进图的真实现都得配一份 meta，我们有理由预期这两个数字应当相近——理想情况下相等。数一下实际数字：`torch_binding.cpp` 主块 `ops.def` 了 **63** 个算子，`torch_binding_meta.cpp` 主块 `ops.impl` 了 **57** 个 meta。差 **6** 个。
 
-$$
+```math
 63 - 57 = 6
-$$
+```
 
 这 6 个不是随便差的，点名是：`bgmv_shrink`、`sgmv_shrink`、`swap_blocks`、`swap_blocks_batch`、`get_npu_storage_shape`、`npu_apply_top_k_top_p`。它们在 `torch_binding.cpp` 都有 `def` + 真实现，但在 `torch_binding_meta.cpp` 主块**没有对应的 meta**。（`bgmv_shrink` / `sgmv_shrink` 是 LoRA 相关算子——批量 / 分段的矩阵-向量收缩，源码里它们的 `weight` 形状就是 `[num_loras, …]`。）
 

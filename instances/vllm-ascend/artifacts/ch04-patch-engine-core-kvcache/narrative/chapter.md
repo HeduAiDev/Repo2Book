@@ -138,9 +138,9 @@ docstring 写得很明白：block size 对齐是**后面** `Platform.update_bloc
 
 注意第一行 `kernel_block_size = 128`——这是写死的常量，直接取代了 CUDA 路径里那个「从 backend 查最小 kernel 块」的逻辑。算块大小的公式形态和基座一模一样：
 
-$$
+```math
 \mathrm{attn\_block\_size} = \mathrm{kernel\_block} \times \left\lceil \frac{\mathrm{ssm\_page}}{\mathrm{kernel\_block} \times \mathrm{attn\_token}} \right\rceil
-$$
+```
 
 一句人话翻译：先看一个 mamba 状态页（`ssm_page`）能装下多少个「注意力单 token 的 key 字节」（`attn_token`），把这个数向上取整到 `kernel_block` 的倍数，就是注意力块该有多大。`cdiv` 是向上整除。（`attn_token` 即代码里的 `attn_single_token_k_page_size`，`ssm_page` 即 `ssm_block_page_size`，`kernel_block` 即写死的 `kernel_block_size = 128`。）
 
@@ -266,9 +266,9 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
 
 Sparse-C8 路径的页字节是三段相加：
 
-$$
+```math
 \mathrm{page\_size\_bytes} = \mathrm{kv\_bytes} + \mathrm{qli\_bytes} + \mathrm{qli\_scale\_bytes}
-$$
+```
 
 `kv_bytes` 是 `kv_lora`（A3 下还含 `k_rope`）那段，`qli_bytes` 是 int8 的 indexer key，`qli_scale_bytes` 是 fp16 的量化 scale。算一组 A3 设备的账（`qk_rope_head_dim ≠ 0`），取 block_size=128、num_kv_heads=1、`sparse_head_dim = (kv_lora_rank=512, qk_rope_head_dim=64, index_head_dim=128)`：
 

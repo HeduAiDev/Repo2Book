@@ -36,23 +36,23 @@ MLA（Multi-head Latent Attention，多头潜在注意力）是 DeepSeek-V2 论�
 
 标准多头注意力推理时，每来一个 token 都要为**每个头**各缓存一份完整的 key 和 value——缓存量随头数、随上下文长度双重线性增长，长上下文里卡住吞吐的不是算力，是这份缓存。论文 §2.1.1（arXiv:2405.04434, Eq.7-8）把标准 MHA 的一层写清楚：把 $`\mathbf h_t`$ 投成 query、key、value 三份，切成 $`n_h`$ 个头，逐头算注意力：
 
-$$
+```math
 \mathbf o_{t,i} = \sum_{j=1}^{t} \mathrm{Softmax}_j\!\left(\frac{\mathbf q_{t,i}^{\top}\mathbf k_{j,i}}{\sqrt{d_h}}\right)\mathbf v_{j,i}
-$$
+```
 
 约定下标： $`t`$ 是当前 query 所在的 token 位置， $`i`$ 是注意力头索引， $`j`$ 遍历 $`t`$ 之前的所有历史 token。全章沿用这套约定，尤其后面的 $`\delta=j-t`$ 是两个 token 的**相对位置偏移**。
 
 推理要加速，就得把所有历史 token 的 key、value 全缓存下来。于是每个 token 每层要囤的元素数是（Eq.8）：
 
-$$
+```math
 2\,n_h\,d_h
-$$
+```
 
 这里有两个「线性」：随头数 $`n_h`$ 线性、随上下文长度线性。代进 DeepSeek-V2 的注意力配置 $`n_h{=}128`$ 、 $`d_h{=}128`$ （§3.1.2）：
 
-$$
+```math
 2\times 128\times 128 = 32768
-$$
+```
 
 **每个 token、每一层，往缓存里追加 32768 个元素**；全模型 60 层累计 $`32768\times 60 = 1{,}966{,}080`$ 个元素每 token。下图是这条随上下文线性累积的增长线：
 
@@ -74,11 +74,11 @@ MLA 的任务就是把 $`2\,n_h\,d_h`$ 压成一个与头数无关的小向量�
 
 与其为每个头各留一份完整 key、一份完整 value，不如把 token 压成一小段各头**共享**的低秩摘要 $`\mathbf c^{KV}`$ ，推理期只缓存它，用到 key/value 时再现场恢复。论文 §2.1.2（arXiv:2405.04434, Eq.9-11）的核心就三行：
 
-$$
+```math
 \mathbf c_t^{KV} = W^{DKV}\mathbf h_t,\qquad
 \mathbf k_t^{C} = W^{UK}\mathbf c_t^{KV},\qquad
 \mathbf v_t^{C} = W^{UV}\mathbf c_t^{KV}
-$$
+```
 
 先约定两个方向词：**下投影**（ $`W^{DKV}\in\mathbb R^{d_c\times d}`$ ）降维，**上投影**（ $`W^{UK}, W^{UV}\in\mathbb R^{n_h d_h\times d_c}`$ ）升维。第一行把 $`\mathbf h_t`$ 压到 $`d_c`$ 维潜向量 $`\mathbf c_t^{KV}`$ ；后两行说 key、value 都从这**同一段** $`\mathbf c_t^{KV}`$ 上投影出来。推理期只有 $`\mathbf c_t^{KV}`$ 入缓存，key、value 现算现用、从不落盘。
 
@@ -102,18 +102,18 @@ $$
 
 打分要算 query 和 key 的内积，而 key 不过是 $`W^{UK}`$ 从潜向量放大出来的。把这层关系摊开：
 
-$$
+```math
 \mathbf q^{C\top}\mathbf k^{C}
 = (W^{UQ}\mathbf c^{Q})^{\top}(W^{UK}\mathbf c^{KV})
 = \mathbf c^{Q\top}\big((W^{UQ})^{\top} W^{UK}\big)\mathbf c^{KV}
-$$
+```
 
 （query 侧也做了低秩压缩， $`\mathbf c^Q`$ 是 query 的潜向量、 $`W^{UQ}`$ 是它的上投影，理由见 2.4 节。）第二个等号只是结合律换括号。关键在中间那块 $`(W^{UQ})^{\top} W^{UK}`$ ：它由两个静态权重相乘得到，与 token 无关、与位置无关——**是个常量**。常量才有「离线折好、线上复用」的资格。令
 
-$$
+```math
 \widetilde W = (W^{UK})^{\top} W^{UQ},\qquad
 \tilde{\mathbf q} = \widetilde W\,\mathbf c^{Q}
-$$
+```
 
 打分就化成潜空间里的一次内积 $`\tilde{\mathbf q}^{\top}\mathbf c^{KV}`$ ： $`W^{UK}`$ 被吸进 query 侧，「为每个历史 token 重新放大出 full key」这一步整个消失——论文 §2.1.2 那句「 $`W^{UK}`$ can be absorbed into $`W^{Q}`$ 」说的就是这一步。记住这条主线—— **吸收成立的全部前提，就是中间块是常量**；2.3 节的悬崖正是这个前提被打碎。用 2.1 节同一组玩具维度把两条路径各算一遍打分：
 
@@ -134,9 +134,9 @@ $$
 
 输出侧完全对称：注意力输出是对 value 的加权和（ $`w_j`$ 为对历史 token $`j`$ 的注意力权重），而 value 由 $`W^{UV}`$ 从潜向量上投影，
 
-$$
+```math
 \sum_j w_j\,\mathbf v_{j}^{C} = \sum_j w_j\,(W^{UV}\mathbf c_j) = W^{UV}\Big(\sum_j w_j\,\mathbf c_j\Big)
-$$
+```
 
 先在潜空间加权、最后统一乘一次 $`W^{UV}`$ ，与逐个物化 value 再加权逐项恒等——所以 $`W^{UV}`$ 同样能吸进输出投影 $`W^O`$ 。
 
@@ -148,17 +148,17 @@ $$
 
 做个证伪实验：假设**偏要**对上投影得到的 key $`\mathbf k^C`$ 直接加 RoPE，query 仍走 2.2 节那条低秩路径 $`\mathbf q_t^C = W^{UQ}\mathbf c_t^Q`$ 。给两者施加位置旋转 $`R_t`$ 、 $`R_j`$ 后，把内积展开（论文 §2.1.3, arXiv:2405.04434）：
 
-$$
+```math
 \mathbf q_{t}^{\top}\mathbf k_{j}^{C,\mathrm{rope}}
 = \mathbf c_t^{Q\top}(W^{UQ})^{\top} R_t^{\top} R_j\, W^{UK}\mathbf c_j
 = \mathbf c_t^{Q\top}(W^{UQ})^{\top} R_{j-t}\, W^{UK}\mathbf c_j
-$$
+```
 
 （这里用了旋转的标准性质 $`R_t^{\top}R_j = R_{j-t}`$ ，推导见下方严谨框。）问题就出在夹在正中间的那块矩阵：
 
-$$
+```math
 M(\delta) = (W^{UQ})^{\top} R_{\delta}\, W^{UK},\qquad \delta = j-t
-$$
+```
 
 这块 $`M(\delta)`$ 与 2.2 节的 $`\widetilde W`$ 同形，却**本身是相对位置 $`\delta`$ 的函数**——每个 $`\delta`$ 一张脸。注意悬崖的准确位置：**结合律没有失效**，上式怎么加括号都成立；死掉的是「中间块是常量」这个前提——「可预计算」死于常量性被破坏，而非任何代数定律被违反。数值证伪（ $`\delta`$ 扫过 $`0,1,2,3`$ ，取头 0 看 $`M(\delta)[0,0]`$ ）：
 
@@ -175,10 +175,10 @@ $`\delta`$ 从 0 走到 3， $`M[0,0]`$ 就从 $`-0.5378`$ 变到 $`0.6912`$ —
 
 **解法：位置单开一路，主体保持常量。** 论文的解耦 RoPE（Eq.14-18）额外拉出一小撮维度 $`\mathbf q^R`$ （每头 $`d_h^R`$ 维）与**共享** key $`\mathbf k^R`$ 专门承载 RoPE，拼接到主体（下文记作 nope，no positional encoding，不含位置旋转的可吸收分量）后一起算注意力：
 
-$$
+```math
 \mathbf q_{t,i} = [\mathbf q_{t,i}^{C};\ \mathbf q_{t,i}^{R}],\qquad
 \mathbf k_{t,i} = [\mathbf k_{t,i}^{C};\ \mathbf k_t^{R}]
-$$
+```
 
 留意下标的差别： $`\mathbf q^R_{t,i}`$ 带头索引 $`i`$ （每头各一份），而解耦 key $`\mathbf k^R_{t}`$ **不带 $`i`$**——它由一个单独的投影从 $`\mathbf h_t`$ 直接生成、再施加 RoPE，因此在各头间**共享**，每个 token 只需缓存一份。位置信息就这样被抽成一个「每 token 一份、全头共用」的独立分量， $`\mathbf c^{KV}`$ 主体则不加 RoPE、保持位置无关，这才让吸收矩阵 $`\widetilde W`$ 得以静态不变。推理期要缓存的因此是 $`\mathbf c^{KV}`$ 加上解耦 $`\mathbf k^R`$ ，共 $`(d_c+d_h^R)\,l`$ 个元素（DeepSeek-V2 取 $`d_h^R{=}64`$ ，把解耦位置维的开销压到最小）。
 
@@ -188,9 +188,9 @@ $$
 
 query 侧也做一次低秩压缩，但目标不同：key/value 压缩省的是**推理期 KV cache**，query 压缩省的是**训练期中间激活**的显存——query 每步现算现用、不入缓存，再怎么压也动不了 KV cache。论文 §2.1.2（arXiv:2405.04434, Eq.12-13）：
 
-$$
+```math
 \mathbf c_t^{Q} = W^{DQ}\mathbf h_t,\qquad \mathbf q_t^{C} = W^{UQ}\mathbf c_t^{Q}
-$$
+```
 
 其中 $`\mathbf c^Q`$ 只是 query 的中间激活，在当前 token 的前向里就被消费掉、不跨步保留，故每步 KV cache 变化量恒为 0。玩具维度验一下（ $`d_c'{=}4`$ ）：
 
@@ -231,11 +231,11 @@ $$
 
 「不出现 $`n_h`$ 」不是巧合，而是一个更强命题的直接推论：**吸收后的 MLA 在 decode 时本来就是一个 MQA，只是 head_dim 变成了 576**。把 2.3 节的拼接形式（arXiv:2405.04434, Eq.14-18）代回打分、再套 2.2 节的吸收——头 $`i`$ 对历史 token $`j`$ 的打分是 nope 与 rope 两段内积之和，而两段内积之和恰好等于拼接后的一次内积：
 
-$$
+```math
 \mathbf q_{t,i}^{\top}\mathbf k_{j,i}
 = \tilde{\mathbf q}_{t,i}^{\top}\mathbf c_j^{KV} + \mathbf q_{t,i}^{R\top}\mathbf k_j^{R}
 = [\tilde{\mathbf q}_{t,i};\ \mathbf q_{t,i}^{R}]^{\top}\,[\mathbf c_j^{KV};\ \mathbf k_j^{R}]
-$$
+```
 
 第二个等号是分块向量内积的恒等拆写。维度账： $`\tilde{\mathbf q}_{t,i}\in\mathbb R^{d_c}`$ 是头 $`i`$ 的吸收 query（512 维，即 2.2 节严谨框里的 $`\widetilde W_i\,\mathbf c_t^{Q}`$ ）， $`\mathbf q^R_{t,i}\in\mathbb R^{d_h^R}`$ 是它的位置分量（64 维），拼成一个 576 维的逐头「query」；而右侧 $`[\mathbf c_j^{KV};\ \mathbf k_j^{R}]\in\mathbb R^{576}`$ **不带头下标 $`i`$** ——全部 128 个头打分用的是同一份 576 维「key」。value 侧同样：吸收后每个头都对同一份 $`\mathbf c_j^{KV}`$ 加权求和，再各过自己的 $`W^{UV}_i`$ 、 $`W^{O}_i`$ 。「所有头共享同一份 key/value」正是 MQA 的定义。于是同一套 MLA 权重一鱼两吃：训练与 prefill 走物化路径，是标准 MHA 形态（每头独立 K/V，保表达能力）；decode 走吸收路径，是 head_dim 576 的 MQA 形态（key/value 只此一份，缓存天然不含 $`n_h`$ ）。对照表里 MQA 一行的 $`256 = 2\times d_h`$ ：MLA 相当于把 MQA 的单头缓存从 256 抬到 576、多付 2.25 倍，按论文口径换回强于满配 MHA 的表达能力。（这一视角出自苏剑林《缓存与效果的极限拉扯：从 MHA、MQA、GQA 到 MLA》，kexue.fm/archives/10091，延伸阅读首选。）
 

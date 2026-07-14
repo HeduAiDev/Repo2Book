@@ -444,9 +444,9 @@ def get_transfer_meta(self, send_task, req_id, req_meta, layer_group_idx):
 
 核心是三行地址算术：
 
-$$
+```math
 \mathrm{src} = \mathrm{base\_addr} + \mathrm{block\_id} \times \mathrm{block\_len}
-$$
+```
 
 算术的两个输入都来自 `layer_metadata`——它是一张按层登记的元信息表，worker 初始化时从注册内存信息填充，存着每层 KV 缓存的基址 `kv_caches_base_addr` 和每块字节数 `block_len`，正是用来把抽象的「块号」换算成绝对地址的。一块 KV 的物理地址，就是「这层 KV 的基址」加「块号乘每块字节数」。本地算出 `src`、远端算出 `dst`（远端的基址来自对面握手带过来的 `remote_layer_metadata`），长度是「这一**批**连续块的总字节」。注意 `group_local_block_id[0]`——只取这批的**第一块**算起始地址，因为这一批块在内存里是连续的，一个起始地址 + 总长就够描述。
 
@@ -709,9 +709,9 @@ def get_num_new_matched_tokens(self, request, num_computed_tokens: int) -> tuple
 
 先理清代码里几个 token 计数别混：`prompt_token_ids` 是原始 prompt，`token_len` 是对齐到缓存传输粒度后的长度（某些配置下舍入以避免破碎块），`num_tokens` 是请求总 token 数（prompt + 生成）。核心就一行算术：
 
-$$
+```math
 \mathrm{need\_to\_allocate} = \max(0,\ H - C)
-$$
+```
 
 `H` 是池命中数，`C` 是本地已算（`num_computed_tokens`）。**只为缺口 `H − C` 那段 token 分配块、从池里加载**；`[0, C]` 本地早有，`[H, P]` 池里没有得本地算。`LoadSpec` 把 `vllm_cached=C`、`kvpool_cached=H` 记下来，供后续真正加载时用。
 
@@ -739,9 +739,9 @@ $$
 
 把账算清。一条请求的 KV 字节量正比于 token 数：
 
-$$
+```math
 \mathrm{KV\ bytes} \approx 2 \times L \times H_{kv} \times d \times s \times n_{tokens}
-$$
+```
 
 `2` 是 K 和 V，`L` 层数，`H_{kv}` 是 KV 头数（K/V 张量的头数，独立于 Q 头数，GQA 下通常更少），`d` 头维度，`s` 数据类型字节，`n_{tokens}` token 数。前面那串系数对一条请求是常数，**跨节点搬运量正比于 `n_{tokens}`**。
 

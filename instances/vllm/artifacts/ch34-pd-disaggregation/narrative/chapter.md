@@ -217,15 +217,15 @@ def maybe_transfer_kv_layer(func: Callable) -> Callable:
 
 **同步方案**（先把 KV 全搬完再 forward）的总时间是把两段串起来：
 
-$$
+```math
 T_{sync} = T_{xfer} + N \cdot t_c
-$$
+```
 
 **重叠方案**下，`start_load_kv` 在第 0 层前就发起，传输和计算并行推进。总时间不再是相加，而是取两者的较大值：
 
-$$
+```math
 T_{overlap} \approx \max(T_{xfer},\; N \cdot t_c)
-$$
+```
 
 严格说还要加上首层加载与末层尾巴的少量串行残差——第 0 层的 KV 总得先到才能算第 0 层，最后一层的 KV 也总得到齐才能收尾，这两段没法和计算重叠。所以 max 是流水线打满时的理想下界，不是可达的硬下界。但只要 $`T_{xfer}`$ 量级与 $`N t_c`$ 相当、残差远小于二者，这个近似就足够说明问题。
 

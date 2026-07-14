@@ -162,18 +162,18 @@ class GroupCoordinator:
 
 通信量上，按 ring 算法（把张量切成 $`p`$ 等份、沿一个首尾相接的环形拓扑传 $`p-1`$ 轮，每轮每张卡只收发 $`1/p`$ 的数据量）计，设字节宽为 $`b`$ ，每张卡收发的字节数是：
 
-$$
+```math
 \mathrm{all\_reduce} = \frac{2(p-1)}{p}\,Nb,
 \qquad
 \mathrm{all\_gather} = \mathrm{reduce\_scatter} = \frac{p-1}{p}\,Nb
-$$
+```
 
 代进去一比，按 ring 通信量是**恰好相等**——把两条 `(p-1)/p` 相加正好凑成 all_reduce 的 `2(p-1)/p`：
 
-$$
+```math
 \mathrm{all\_reduce} = \mathrm{reduce\_scatter} + \mathrm{all\_gather}
 = \frac{p-1}{p}Nb + \frac{p-1}{p}Nb = \frac{2(p-1)}{p}Nb
-$$
+```
 
 一个 all_reduce 的纯通信量，等于一个 reduce_scatter 接一个 all_gather（实测延迟上还差两次 kernel 的启动开销，纯字节数上则相等）。这个等式是序列并行（sequence parallel，把激活张量沿序列/token 维度切开、各卡只算自己那一段）的本钱——把一次 all_reduce 拆成「先 reduce_scatter、各算各的、再 all_gather」，能在不同位置摊销通信、还顺手把激活切小。本章不展开序列并行的完整机制，但记住这笔账：拆开不亏通信量。
 

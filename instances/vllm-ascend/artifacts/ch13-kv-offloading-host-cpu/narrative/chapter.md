@@ -365,15 +365,15 @@ def expand_block_ids(
 
 指针算术是两条路径共用的一条公式：
 
-$$
+```math
 \mathrm{addr} = \mathrm{base\_ptr} + \mathrm{block\_id} \times \mathrm{bytes\_per\_block}
-$$
+```
 
 numpy 广播把它一次算完：`(T, 1)` 的基址列加上 `(1, num_pairs)` 的偏移行，得到 `(T, num_pairs)` 的地址矩阵，`ravel()` 拍平成一维。`T = num_sub_tensors`（所有层的 K 和 V），`num_pairs` 是这次搬的 sub-block 对数。所以一次 transfer 拼出的描述符总数是：
 
-$$
+```math
 N_{\mathrm{desc}} = T \times \mathrm{num\_pairs}
-$$
+```
 
 举例：48 层、每层 K/V 两份，`T = 96`；这次搬 8 个 sub-block，`num_pairs = 8`，则 `N_desc = 768` 个 `(src, dst, size)` 三元组——**一次** `swap_blocks_batch` 调用全带走，host 端零 Python 循环，全靠 numpy 广播。
 

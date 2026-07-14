@@ -762,9 +762,9 @@ def rebalance_experts(self, current_expert_table, expert_workload):
 
 第 3 步是个务实的工程判断。看这个不等式：
 
-$$
+```math
 \mathrm{heat}_{\mathrm{after}} < 0.95 \times \mathrm{heat}_{\mathrm{origin}}
-$$
+```
 
 含义是：如果权重迁移不能至少改善 5% 的负载峰值，就**不值得**为它付出昂贵的 D2D 搬运——`change=0`，这一轮什么都不搬，宁可等下一轮、让热度再积累一些。举个数：原来最热卡们的热度总和是 100，重排后若只降到 96，省下的 4% 还不够搬权重的开销，于是放弃；若降到 90，省 10%，才动手。这道门槛挡掉了「为蝇头小利反复搬运」的抖动。
 
@@ -799,17 +799,17 @@ ACT 那条把三步走全了：expert0 的 100 太扎眼，②给它劈出一个
 
 衡量负载偏斜，用的还是[上一章](../../ch09-primer-eplb/narrative/chapter.md)定义的 par（不均衡度）——最热卡负载除以平均卡负载，源码里变量名是 `imbalance`（对应 `_compute_imbalance` 算出的 `stage_par`），公式不变：
 
-$$
+```math
 \mathrm{imbalance} = \frac{\max_i \mathrm{load}_i}{\mathrm{mean}_i \mathrm{load}_i}
-$$
+```
 
 理想均衡时它等于 1，越大越偏。比如 4 张卡负载是 `[100, 20, 20, 20]`，平均 40，imbalance = 100/40 = 2.5——最热卡干了两倍半平均的活，整批延迟被它锁死。`DefaultEplb` 把热门 expert 拆成冗余副本铺开后，理想情况下 4 卡趋近 `[40, 40, 40, 40]`，imbalance 压回 1，整体吞吐随之抬升。但要说清一点：`[40, 40, 40, 40]` 是把热门 expert 无限拆分才逼近的**渐近极限**；真实算法的冗余副本数有限（上一节的例子只加 1 个），单轮实际把 `[100, 20, 20, 20]` 压到 `[60, 60, 20, 20]`（imbalance 2.5→1.5）就落地了。理想是靶心，每一轮只朝它挪一步，靠一轮轮再均衡逐步逼近。
 
 而这套贪心装箱的计算量，正是「为何不能放主循环」的量化注脚。每层要对（含冗余的）所有 expert 做排序 + 装箱，复杂度约
 
-$$
+```math
 O(\mathrm{num\_redundancy} \times \mathrm{num\_expert} \times \log(\mathrm{num\_expert}))
-$$
+```
 
 这个乘积有它的来历：装箱前要把每个冗余副本逐个分配出去，每分配一个都得对全部 expert 重排一次（一次 `np.argsort`），所以 `num_redundancy` 与 `num_expert × log(num_expert)` 相乘——log 因子来自对全部 expert 的排序，与卡数无关。再乘以 `layer_num` 层。代进上面的 ACT 缩小例：`num_redundancy=1`、单层 7 个 expert，也就一次 7 元排序，轻得看不见。但真实部署完全是另一个量级——单层 expert 可达 256、MoE 层数数十、冗余副本数十，三者一乘，每轮轻松到上万次排序，而且随专家数 / 层数 / 卡数一起水涨船高。这个量级绝不能卡在每个推理 step 的关键路径上——必须扔进子进程异步算。主线①②③④至此闭环：正因为④这么重，才需要②的子进程隔离、①的节拍调度、③的异步摊薄。
 

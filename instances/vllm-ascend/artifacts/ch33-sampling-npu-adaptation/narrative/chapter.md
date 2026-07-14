@@ -176,31 +176,31 @@ def random_sample(
 
 **命题**：设类别概率为 $`p_1, \dots, p_V`$ （归一）。对每个类别独立抽一个标准指数随机数，算比值后取最大下标，其分布等于按概率的多项式采样：
 
-$$
+```math
 q_i \sim \mathrm{Exp}(1)\ \mathrm{i.i.d.} \quad\Longrightarrow\quad \arg\max_i \frac{p_i}{q_i}\ \sim\ \mathrm{Categorical}(p)
-$$
+```
 
 也就是每个下标被取中的概率，恰好等于它自己那一项的概率。
 
 **证明**。第一步，把 argmax 翻成 argmin——比值取最大，等价于它的倒数取最小：
 
-$$
+```math
 \arg\max_i \frac{p_i}{q_i} = \arg\min_i \frac{q_i}{p_i}
-$$
+```
 
 第二步，看这个倒数的分布。指数分布有个缩放性质：标准指数除以一个常数后，变成速率等于该常数的指数。代进来就是：
 
-$$
+```math
 q_i \sim \mathrm{Exp}(1) \;\Longrightarrow\; \frac{q_i}{p_i} \sim \mathrm{Exp}(p_i)
-$$
+```
 
 速率从 1 变成了 $`p_i`$ 。
 
 第三步，用独立指数变量取最小的经典结论：最小值落在第 $`i`$ 个的概率，等于它的速率占总速率的比例：
 
-$$
+```math
 P\!\left(\arg\min_i X_i = i\right) = \frac{\lambda_i}{\sum_j \lambda_j}, \qquad X_i \sim \mathrm{Exp}(\lambda_i)
-$$
+```
 
 把速率 $`\lambda_i = p_i`$ 代入，各速率之和等于 1，于是这个概率正好是 $`p_i`$ 。证毕。
 
@@ -221,9 +221,9 @@ $$
 
 注意经验频率和真实概率 **接近但不相等**——这正是采样噪声的指纹，说明这组数是真跑出来的而非把概率抄了一遍。偏差的量级由标准误决定：
 
-$$
+```math
 \mathrm{SE}_i = \sqrt{p_i(1-p_i)/B}
-$$
+```
 
 在 B=40000 下约 0.0015～0.0024，四个类别的实测偏差全落在 1 个标准误附近，且随 batch 增大而继续收缩。这正是 Gumbel-max 与 `Categorical(p)` 同分布的实测证据——而且这段验证在 host 的 CPU torch 上就能跑（`probs.div_(q).argmax` 是纯数学，不碰 NPU）。
 
@@ -482,9 +482,9 @@ if not sampling_metadata.all_random:
 
 如果不是贪心而是带温度的随机采样，接受规则换成概率比。对一个 draft token，设它在 target 分布下的概率 `p_target`、在 draft 分布下的概率 `p_draft`、再抽一个均匀随机数 $`u`$ ，**接受当且仅当**比值不小于这个均匀样本：
 
-$$
+```math
 \frac{p_{\mathrm{target}}}{p_{\mathrm{draft}}} \ge u
-$$
+```
 
 源码里就是这一行（`rejection_random_sample_pytorch`）：
 
@@ -499,9 +499,9 @@ acceptance_condition = (draft_token_probs > zero_threshold) & (
 
 一旦某位被拒，不能简单丢弃——那会让最终分布偏离 target。标准投机解码的做法是从**残差分布**重新采一个「恢复 token」。残差是 target 减 draft 的正部，`∝` 之后还要除以归一化常数 $`Z`$ 才是一个合法概率分布：
 
-$$
+```math
 p_{\mathrm{recover}}(x) = \frac{\max\!\bigl(0,\; p_{\mathrm{target}}(x) - p_{\mathrm{draft}}(x)\bigr)}{Z}, \qquad Z = \sum_x \max\!\bigl(0,\; p_{\mathrm{target}}(x) - p_{\mathrm{draft}}(x)\bigr)
-$$
+```
 
 而这个重采，用的又是 33.2 那套 Gumbel-max——`sample_recovered_tokens_pytorch` 里照样是 `q.exponential_()` 填指数随机、残差除以 `q` 再 argmax：
 
@@ -522,21 +522,21 @@ recovered_ids = torch.argmax(prob_over_q, dim=1)
 
 接受时取 draft 的 token、拒绝时取残差重采的 token、全接受时追加 bonus——这套「接受/拒绝/补偿」的组合，保证了最终采出的 token 边缘分布精确等于 target 分布。为什么？把单个位置输出某个 token $`x`$ 的概率拆成「draft 提议 $`x`$ 且被接受」与「先拒绝、再从残差采到 $`x`$ 」两项相加：
 
-$$
+```math
 P(\mathrm{out}=x) = \underbrace{p_{\mathrm{draft}}(x)\cdot\min\!\Bigl(1,\tfrac{p_{\mathrm{target}}(x)}{p_{\mathrm{draft}}(x)}\Bigr)}_{\mathrm{accept}} \;+\; \underbrace{Z\cdot p_{\mathrm{recover}}(x)}_{\mathrm{residual}}
-$$
+```
 
 下面记 $`p_d=p_{\mathrm{draft}}(x)`$ 、 $`p_t=p_{\mathrm{target}}(x)`$ 。第一项化简就是 $`\min(p_d, p_t)`$ 。第二项里，总拒绝概率恰好等于残差归一化常数 $`Z`$ ——因为两侧正部之和相等：
 
-$$
+```math
 \sum_y \max\!\bigl(0,\, p_{\mathrm{draft}}(y)-p_{\mathrm{target}}(y)\bigr) = \sum_y \max\!\bigl(0,\, p_{\mathrm{target}}(y)-p_{\mathrm{draft}}(y)\bigr) = Z
-$$
+```
 
 于是 $`Z\cdot p_{\mathrm{recover}}(x)`$ 正好等于 $`\max(0,\, p_t - p_d)`$ 。两项相加得：
 
-$$
+```math
 \min(p_d, p_t) + \max(0,\, p_t - p_d) = p_{\mathrm{target}}(x)
-$$
+```
 
 无论 $`p_t`$ 大于还是小于 $`p_d`$ 都成立。这就是拒绝采样保边缘分布的经典结论——和 [§33.2](#为什么-argmaxpq-和按-p-多项式采样同分布) 的 Gumbel 等价一样，是一句话能推完的数学。draft 只是加速猜测，是否采纳由 target 说了算，且被拒时从残差补回，一个分布都不偏。
 
