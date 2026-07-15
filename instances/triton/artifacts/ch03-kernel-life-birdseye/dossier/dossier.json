@@ -1,0 +1,353 @@
+{
+  "chapter_id": "ch03",
+  "slug": "ch03-kernel-life-birdseye",
+  "title": "一个 kernel 的一生（鸟瞰）",
+  "kind": "skip_impl",
+  "source_pin": "triton v3.2.0 @ 9641643da6c52000c807b5eeed05edaec4402a67",
+  "chapter_contract": {
+    "hook": "本章给读者一张『该去哪一层拧旋钮』的定位地图：kernel 慢时，能一眼分清是编译期特化（cache/signature 一变就重编）、优化 pass（TTGIR 上贴布局/流水线）、还是发射开销（每次 launch 都要过 C launcher）的问题——不再对着黑盒瞎调。沿途每一层都点名它后面对应哪一章（哪个旋钮在哪一层拧、在哪一章讲）。",
+    "resolution": "低分辨率串场：只画整条主线的骨架 + 每层的入口符号 + 指向后续章，不重讲机制细节。凡 IR 必标阶段（追踪期 vs make_ttir 之后 vs 更后）。",
+    "do_not_repeat_ch01": "ch01 已讲透 visit_Call 三岔分发、tl 命名空间分裂、cdiv 追踪 worked example、三条双语接缝。本章只在鸟瞰高度点名这些接缝，不重讲其内部机制；对 visit_Call/追踪细节一律『见 ch01 / 见后续章』带过。",
+    "two_new_maps": [
+      "双语栈断点地图：第一次把 Python↔C++/MLIR 的全部接缝按管线顺序排成一张图（pass_manager 经 pybind 进 libtriton.so / MLIR pass 在 C++ 里跑 / ptxas 是独立子进程 / C launcher 现场编译）。",
+      "无 GPU 断裂处地图：标清管线哪几级能 headless 纯编译看 IR（make_ir→ttir→ttgir→llir→ptx，甚至 make_cubin 调 ptxas 也只是 CPU 子进程），哪几级必须真卡（load_binary/CudaLauncher.launch）。配 pin 精确验证配方（pip triton==3.2.0）核实每级产物真实存在。"
+    ]
+  },
+  "code_spine": [
+    "python/tutorials/01-vector-add.py:L27 — @triton.jit 装饰 add_kernel（起点：一个被装饰的 Python 函数，不是普通函数）",
+    "python/tutorials/01-vector-add.py:L68 — grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)（可调用 grid，发射时才求值）",
+    "python/tutorials/01-vector-add.py:L73 — add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)（触发点）",
+    "python/triton/runtime/jit.py:L324-L330 — KernelInterface.__getitem__：fn[grid] 记住 grid，返回 lambda → self.run",
+    "python/triton/runtime/jit.py:L563-L584 — JITFunction.run：取 backend/绑定实参/算 cache key/查缓存（编译期特化的旋钮在这一层）",
+    "python/triton/runtime/jit.py:L586-L628 — 未命中：算 signature/constants/configs → ASTSource(...) → self.compile(src, target, options)",
+    "python/triton/compiler/compiler.py:L217 — compile(src, target, options)：编译主入口",
+    "python/triton/compiler/compiler.py:L261-L262 — backend.add_stages(stages, options)：注册五级阶梯 ttir→ttgir→llir→ptx→cubin",
+    "python/triton/compiler/compiler.py:L273 — src.make_ir(...) → ast_to_ttir：【追踪期】TTIR，任何 pass 之前（visit_Call 追踪细节见 ch01）",
+    "python/triton/compiler/compiler.py:L278-L292 — stages 循环：对每一级调 compile_ir(module) → 落盘/dump → module=next（管线主体）",
+    "third_party/nvidia/backend/compiler.py:L384-L389 — CUDABackend.add_stages：把五个 make_* 静态方法绑成五级",
+    "third_party/nvidia/backend/compiler.py:L187-L201 — make_ttir：TTIR 优化，第一个 pass 就是 add_inliner（把追踪期看到的 tt.call 抹平）",
+    "third_party/nvidia/backend/compiler.py:L203-L254 — make_ttgir：TTIR→TTGIR，convert_to_ttgpuir 首次贴上布局/num_warps（贴布局层，见后续 Part）",
+    "third_party/nvidia/backend/compiler.py:L256-L315 — make_llir：TTGIR→LLVM-IR(MLIR)→LLVM-IR(LLVM)，to_module 跨过 MLIR/LLVM 边界，末尾 O3",
+    "third_party/nvidia/backend/compiler.py:L317-L337 — make_ptx：LLVM-IR→PTX，translate_to_asm 走 LLVM 的 NVPTX 后端出 .ptx 文本",
+    "third_party/nvidia/backend/compiler.py:L339-L382 — make_cubin：起独立子进程 ptxas 把 PTX 汇编成 cubin（ptxas 非 Triton，是 CUDA 工具链）",
+    "python/triton/compiler/compiler.py:L303 — return CompiledKernel(src, metadata_group, hash)：编译产物封装",
+    "python/triton/runtime/jit.py:L638-L654 — 回到 run：非 warmup 则 canonicalize grid → kernel.run(...) 发射",
+    "python/triton/compiler/compiler.py:L379-L391 — CompiledKernel._init_handles：load_binary 把 cubin 灌进 GPU（此处开始必须真卡）",
+    "third_party/nvidia/backend/driver.py:L431-L444 — CudaLauncher：现场编译一个 C launcher（make_launcher）作 Python→CUDA driver 的最后一跳（详见 ch01 已点名）"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "python/tutorials/01-vector-add.py",
+      "lines": "L60-L76",
+      "why": "读者视角的『一生起点』：主机侧 add() 里做的三件事——预分配输出、把 grid 写成 lambda（发射时才求值）、fn[grid](...) 触发。ch01 embed 的是 kernel 体（L27-L52），本章 embed 的是发射侧，两者互补不重复。注意 L74 后 kernel 已在异步跑（尚未 synchronize）——呼应全书 async 主线。",
+      "code": "def add(x: torch.Tensor, y: torch.Tensor):\n    # We need to preallocate the output.\n    output = torch.empty_like(x)\n    assert x.is_cuda and y.is_cuda and output.is_cuda\n    n_elements = output.numel()\n    # The SPMD launch grid denotes the number of kernel instances that run in parallel.\n    # It is analogous to CUDA launch grids. It can be either Tuple[int], or Callable(metaparameters) -> Tuple[int].\n    # In this case, we use a 1D grid where the size is the number of blocks:\n    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )\n    # NOTE:\n    #  - Each torch.tensor object is implicitly converted into a pointer to its first element.\n    #  - `triton.jit`'ed functions can be indexed with a launch grid to obtain a callable GPU kernel.\n    #  - Don't forget to pass meta-parameters as keywords arguments.\n    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)\n    # We return a handle to z but, since `torch.cuda.synchronize()` hasn't been called, the kernel is still\n    # running asynchronously at this point.\n    return output",
+      "elide": []
+    },
+    {
+      "path": "python/triton/runtime/jit.py",
+      "lines": "L563-L586",
+      "why": "『编译期特化』旋钮所在层：run 的开头——取 backend/绑定实参/用 sig_and_spec+constexpr_vals 拼出 cache key/查 self.cache。key 由『签名 + 特化位（对齐/是否为 1）+ constexpr 值』组成，所以换 dtype、换是否 16 对齐、换 constexpr 都会 miss → 触发重编。读者调优时『为什么每次都在编译』的答案就在 L583 这一行。",
+      "code": "    def run(self, *args, grid, warmup, **kwargs):\n        kwargs[\"debug\"] = kwargs.get(\"debug\", False) or os.environ.get(\"TRITON_DEBUG\", \"0\") == \"1\"\n\n        # parse options\n        from ..compiler import make_backend\n        device = driver.active.get_current_device()\n        stream = driver.active.get_current_stream(device)\n        target = driver.active.get_current_target()\n        backend = make_backend(target)\n\n        # Execute pre run hooks with args and kwargs\n        for hook in self.pre_run_hooks:\n            hook(*args, **kwargs)\n\n        if self.binder is None:\n            self.create_binder(backend)\n\n        bound_args, sig_and_spec, constexpr_vals, non_constexpr_vals, excess_kwargs = self.binder(*args, **kwargs)\n\n        # compute cache key\n        key = ''.join(sig_and_spec) + str((constexpr_vals, excess_kwargs))\n        kernel = self.cache[device].get(key, None)\n\n        if kernel is None:",
+      "elide": ["L564 的 TRITON_DEBUG 开关、L574-575 的 pre_run_hooks 遍历只是旁路 hook，正文可略；『绑定实参』的细节（create_binder/create_function_from_signature 预编译签名）留待专章"]
+    },
+    {
+      "path": "python/triton/runtime/jit.py",
+      "lines": "L619-L628",
+      "why": "cache miss 后的落点：构造 ASTSource（把 self/signature/constants/configs 打包成编译的『源』），调 self.compile 得到 kernel 并回填缓存。这是 Python 前端交棒给编译器的那一行（L623）。ASTSource.ext='ttir' 决定管线从哪一级起步。",
+      "code": "            if self._call_hook(key, signature, device, constants, options, configs, warmup, before=True):\n                return None\n            # compile the kernel\n            src = self.ASTSource(self, signature, constants, configs[0])\n            kernel = self.compile(\n                src,\n                target=target,\n                options=options.__dict__,\n            )\n            self.cache[device][key] = kernel\n            self._call_hook(key, signature, device, constants, options, configs, warmup, before=False)",
+      "elide": ["_call_hook（before/after）是给外部工具（如 autotune/profiler）的插桩钩子，鸟瞰层可略"]
+    },
+    {
+      "path": "python/triton/compiler/compiler.py",
+      "lines": "L260-L292",
+      "why": "★本章的地图本体：compile 的管线心脏。add_stages 注册五级（L262）→ src.make_ir 出【追踪期】TTIR（L273，pass 之前）→ 从 first_stage 起 for 循环逐级 compile_ir(module)（L278-L279），每级落盘到 cache（L284）、若开 TRITON_KERNEL_DUMP 则 dump（L285-286）、module=next 进下一级（L292）。整条『一生』就是这个 for 循环转五圈。first_stage 由 src.ext 定（ASTSource 从 'ttir' 起）。",
+      "code": "    # run compilation pipeline  and populate metadata\n    stages = dict()\n    backend.add_stages(stages, options)\n    first_stage = list(stages.keys()).index(src.ext)\n    # when the source is an IR file, don't apply the passes related to this stage. This makes it easier to write IR level tests.\n    if ir_source:\n        first_stage += 1\n    context = ir.context()\n    ir.load_dialects(context)\n    backend.load_dialects(context)\n    codegen_fns = backend.get_codegen_implementation()\n    module_map = backend.get_module_map()\n    try:\n        module = src.make_ir(options, codegen_fns, module_map, context)\n    except Exception as e:\n        filter_traceback(e)\n        raise\n    use_ir_loc = os.environ.get(\"USE_IR_LOC\", None)\n    for ext, compile_ir in list(stages.items())[first_stage:]:\n        next_module = compile_ir(module, metadata)\n        ir_filename = f\"{file_name}.{ext}\"\n        if (fn_override_manager is not None and (full_name := fn_override_manager.get_file(ir_filename)) is not None):\n            print(f\"\\nOverriding kernel with file {full_name}\")\n            next_module = parse(full_name, ext, context)\n        metadata_group[ir_filename] = fn_cache_manager.put(next_module, ir_filename)\n        if fn_dump_manager is not None:\n            fn_dump_manager.put(next_module, ir_filename)\n        # use an env variable to parse ir from file\n        if use_ir_loc == ext:\n            ir_full_name = fn_cache_manager.get_file(ir_filename)\n            next_module.create_location_snapshot(ir_full_name)\n            print(f\"Creating new locations for {ir_full_name}\")\n        module = next_module",
+      "elide": ["fn_override_manager 分支（TRITON_KERNEL_OVERRIDE，用外部文件替换某一级 IR）与 USE_IR_LOC 分支是调试旁路，鸟瞰层只需知道『每级可被 dump / 可被替换』，具体机制留后续；context/dialects 加载细节属 MLIR 基础设施，本章不展开"]
+    },
+    {
+      "path": "python/triton/compiler/compiler.py",
+      "lines": "L237-L239",
+      "why": "读者可复现锚点的开关来源：TRITON_KERNEL_DUMP=1 打开 dump manager（L237、L239），随后 stages 循环里每级都会把该级 IR 落到磁盘（配 L285-286）。这就是全书让读者『逐级看产物』的官方入口——设它就能拿到 .ttir/.ttgir/.llir/.ptx/.cubin/.json 一整套。",
+      "code": "    enable_override = os.environ.get(\"TRITON_KERNEL_OVERRIDE\", \"0\") == \"1\"\n    enable_ir_dump = os.environ.get(\"TRITON_KERNEL_DUMP\", \"0\") == \"1\"\n    fn_override_manager = get_override_manager(src.hash()) if enable_override else None\n    fn_dump_manager = get_dump_manager(src.hash()) if enable_ir_dump else None",
+      "elide": []
+    },
+    {
+      "path": "third_party/nvidia/backend/compiler.py",
+      "lines": "L384-L389",
+      "why": "五级阶梯的『注册表』：CUDABackend.add_stages 把五个 make_* 静态方法按顺序塞进 stages 字典。key 名（ttir/ttgir/llir/ptx/cubin）正是 dump 出的文件后缀。读者看这六行就知道『一生』一共几站、每站叫什么、归哪个后端管。",
+      "code": "    def add_stages(self, stages, options):\n        stages[\"ttir\"] = lambda src, metadata: self.make_ttir(src, metadata, options)\n        stages[\"ttgir\"] = lambda src, metadata: self.make_ttgir(src, metadata, options, self.capability)\n        stages[\"llir\"] = lambda src, metadata: self.make_llir(src, metadata, options, self.capability)\n        stages[\"ptx\"] = lambda src, metadata: self.make_ptx(src, metadata, options, self.capability)\n        stages[\"cubin\"] = lambda src, metadata: self.make_cubin(src, metadata, options, self.capability)",
+      "elide": []
+    },
+    {
+      "path": "third_party/nvidia/backend/compiler.py",
+      "lines": "L187-L201",
+      "why": "★ch01 教训照搬①的落地证据：make_ttir 是 stages 的第一站，而它的第一个 pass 就是 add_inliner（L191）。所以追踪期（make_ir 输出）里能看到的 tt.call / 被调 tt.func，到了 .ttir dump 里已被内联抹平——凡给 IR 事实必须标清取自哪一阶段。本章只需展示这一行、点破分界，内联机制细节留后续。",
+      "code": "    @staticmethod\n    def make_ttir(mod, metadata, opt):\n        pm = ir.pass_manager(mod.context)\n        pm.enable_debug()\n        passes.common.add_inliner(pm)\n        passes.ttir.add_rewrite_tensor_pointer(pm)\n        passes.ttir.add_combine(pm)\n        passes.common.add_canonicalizer(pm)\n        passes.ttir.add_reorder_broadcast(pm)\n        passes.common.add_cse(pm)\n        passes.common.add_licm(pm)\n        passes.common.add_symbol_dce(pm)\n        passes.ttir.add_loop_unroll(pm)\n        pm.run(mod)\n        return mod",
+      "elide": ["这些 add_* 都是 pybind 过来的 C++ pass，逐个 pass 的语义留给后续 Part；本章只用它证明『第一站第一 pass 就内联』这一个点"]
+    },
+    {
+      "path": "third_party/nvidia/backend/compiler.py",
+      "lines": "L339-L356",
+      "why": "『无 GPU 断裂处』与『双语断点』的合流点：make_cubin 不在进程内做，而是把 PTX 写到临时文件、起一个独立子进程 ptxas（L341、L352-356）汇编成 cubin。关键澄清——ptxas 是 CUDA 工具链的 CPU 程序（triton wheel 自带），headless 无 GPU 也能跑；真正需要真卡的是再往后的 load_binary/launch。这是读者最容易误判的一层。",
+      "code": "    @staticmethod\n    def make_cubin(src, metadata, opt, capability):\n        ptxas, _ = _path_to_binary(\"ptxas\")\n        with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.ptx') as fsrc, \\\n            tempfile.NamedTemporaryFile(delete=False, mode='r', suffix='.log') as flog:\n            fsrc.write(src)\n            fsrc.flush()\n            fbin = fsrc.name + '.o'\n\n            line_info = [] if os.environ.get('TRITON_DISABLE_LINE_INFO') else ['-lineinfo']\n            fmad = [] if opt.enable_fp_fusion else ['--fmad=false']\n            suffix = 'a' if capability == 90 else ''\n            opt_level = ['--opt-level', '0'] if os.environ.get(\"DISABLE_PTXAS_OPT\", \"0\") == \"1\" else []\n            ptxas_cmd = [\n                ptxas, *line_info, *fmad, '-v', *opt_level, f'--gpu-name=sm_{capability}{suffix}', fsrc.name, '-o', fbin\n            ]",
+      "elide": ["L355-382 的 subprocess.run + 错误码分诊（255=内部 codegen 错 / SIGSEGV / 其它）+ 读回 cubin 字节 + 清理临时文件，鸟瞰层只需知道『起子进程 ptxas，失败会连 Repro command 一起报』"]
+    },
+    {
+      "path": "python/triton/runtime/jit.py",
+      "lines": "L638-L654",
+      "why": "『一生』的终点与『发射开销』旋钮层：编译拿到 kernel 后，非 warmup 就 canonicalize grid（可调用 grid 在此对 bound_args 求值，L645）→ 补齐到三维 → kernel.run(...) 真正下发（L653-654）。每次调用都要走这一段（缓存只省编译、不省发射），发射侧开销的答案在这里。C launcher 细节 ch01 已点名，本章带过。",
+      "code": "        if not warmup:\n            # canonicalize grid\n            assert grid is not None\n            if callable(grid):\n                # Arguments are passed as a dict to `grid`, by contract.\n                # TODO(jlebar): In the new launch API, pass the compiler flags as a\n                # second parameter to `grid`.\n                grid = grid(bound_args)\n            grid_size = len(grid)\n            grid_0 = grid[0]\n            grid_1 = grid[1] if grid_size > 1 else 1\n            grid_2 = grid[2] if grid_size > 2 else 1\n\n            # launch kernel\n            launch_metadata = kernel.launch_metadata(grid, stream, *non_constexpr_vals)\n            kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata,\n                       self.CompiledKernel.launch_enter_hook, self.CompiledKernel.launch_exit_hook, *non_constexpr_vals)\n        return kernel",
+      "elide": ["launch_metadata 是给 profiler 的可选元数据（launch_enter/exit_hook）；non_constexpr_vals 的打包细节留专章"]
+    },
+    {
+      "path": "python/triton/compiler/compiler.py",
+      "lines": "L379-L391",
+      "why": "无 GPU 断裂线的确切位置：CompiledKernel._init_handles 第一次真正碰硬件——driver.active.launcher_cls 现场编译 C launcher（L384）、查设备 shared memory（L386）、load_binary 把 cubin 装进 GPU 拿到 function 句柄（L390-391）。到 make_cubin 为止都能 headless；跨过这一函数就必须有真卡。这条线是本章『无 GPU 断裂处地图』的锚。",
+      "code": "    def _init_handles(self):\n        if self.module is not None:\n            return\n        device = driver.active.get_current_device()\n        # create launcher\n        self.run = driver.active.launcher_cls(self.src, self.metadata)\n        # not enough shared memory to run the kernel\n        max_shared = driver.active.utils.get_device_properties(device)[\"max_shared_mem\"]\n        if self.metadata.shared > max_shared:\n            raise OutOfResources(self.metadata.shared, max_shared, \"shared memory\")\n        # TODO: n_regs, n_spills should be metadata generated when calling `ptxas`\n        self.module, self.function, self.n_regs, self.n_spills = driver.active.utils.load_binary(\n            self.name, self.kernel, self.metadata.shared, device)",
+      "elide": ["__getattribute__ 拦截 'run' 触发懒初始化（L393-396）的机制只需一句话带过"]
+    }
+  ],
+  "mechanisms": [
+    {
+      "id": "m01-end-to-end-spine",
+      "name": "端到端主线：@triton.jit → fn[grid](...) → run → compile → 五级 stages → 发射",
+      "kind": "dataflow",
+      "source_anchors": [
+        "python/tutorials/01-vector-add.py:L27",
+        "python/tutorials/01-vector-add.py:L73",
+        "python/triton/runtime/jit.py:L324-L330",
+        "python/triton/runtime/jit.py:L563-L584",
+        "python/triton/compiler/compiler.py:L260-L303",
+        "python/triton/runtime/jit.py:L638-L654"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "本章的脊柱与主图。低分辨率画完整条链：装饰→索引记 grid→run 查缓存→miss 则 ASTSource+compile→compile 里 add_stages 注册五级、make_ir 出追踪期 TTIR、for 循环逐级降级→CompiledKernel→回 run 发射。每一站在图上标『归哪一层、后面哪一章放大』。worked example = 用 vector-add 这一个核跟着走一遍，不引入任何 ch01 没有的新机制。"
+    },
+    {
+      "id": "m02-cache-key-specialization-knob",
+      "name": "编译触发与缓存短路：cache key = 签名+特化位+constexpr（『编译期特化』旋钮层）",
+      "kind": "config",
+      "source_anchors": [
+        "python/triton/runtime/jit.py:L580-L584",
+        "python/triton/runtime/jit.py:L586-L628"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "note": "定位地图的第一个旋钮：为什么 kernel 有时候『每次都在编译』。key 由 sig_and_spec（含 dtype、是否 16 对齐、是否等于 1 的特化标记）+ constexpr_vals 拼成；任一变化即 miss → 重走整条 compile。读者据此判断『慢是不是因为反复重编』。深挖特化位规则留后续章，本章只点名旋钮位置。"
+    },
+    {
+      "id": "m03-trace-vs-pass-boundary",
+      "name": "追踪期 TTIR vs make_ttir 之后：add_inliner 抹平 tt.call（ch01 教训照搬①）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "python/triton/compiler/compiler.py:L273",
+        "third_party/nvidia/backend/compiler.py:L187-L201"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "note": "全书反复要用的分界线：make_ir（ast_to_ttir）产出的是【追踪期】TTIR，pass 之前；stages 第一站 make_ttir 的第一个 pass 就是 add_inliner，把追踪期能看到的 tt.call/被调 tt.func 内联抹平。凡本章及后续给 IR 事实，必须标清取自哪一阶段——否则会承诺一个 .ttir dump 里根本找不到的 tt.call（ch01 exp-0715-1 踩过）。"
+    },
+    {
+      "id": "m04-five-stage-lowering-lowres",
+      "name": "五级降级阶梯 ttir→ttgir→llir→ptx→cubin（低分辨率 + 每级指向后续章）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "python/triton/compiler/compiler.py:L278-L292",
+        "third_party/nvidia/backend/compiler.py:L384-L389",
+        "third_party/nvidia/backend/compiler.py:L203-L254",
+        "third_party/nvidia/backend/compiler.py:L256-L315",
+        "third_party/nvidia/backend/compiler.py:L317-L337"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "note": "地图主干。add_stages 注册五站，compile 的 for 循环逐站转。低分辨率描述每站干什么 + 后面哪章放大：ttir（设备无关 Triton 方言，追踪+ttir 优化）→ ttgir（make_ttgir 的 convert_to_ttgpuir 首次贴布局/num_warps，『优化 pass/贴布局』旋钮层）→ llir（make_llir 两跳：TTGPU→LLVM-IR(MLIR)→to_module 跨到 LLVM-IR(LLVM)+O3）→ ptx（make_ptx 走 LLVM NVPTX 后端出汇编文本）→ cubin（make_cubin 交 ptxas）。与 ch01 m07 的区别：ch01 只并列点名五级；本章标清每级的入口函数、跨越的边界、及『哪个旋钮在哪级』。"
+    },
+    {
+      "id": "m05-ttgir-layout-knob",
+      "name": "TTGIR 贴布局：make_ttgir 的 convert_to_ttgpuir 引入 num_warps/blocked layout（『优化 pass』旋钮层）",
+      "kind": "layout",
+      "source_anchors": [
+        "third_party/nvidia/backend/compiler.py:L203-L218",
+        "third_party/nvidia/backend/compiler.py:L219-L252"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "note": "定位地图的第二个旋钮：调 num_warps/num_stages/布局相关的性能问题都落在 TTGIR 这一级（coalesce、remove_layout_conversions、pipeline 等一长串 pass 都在 make_ttgir 里）。本章只点名『这里是布局/流水线优化发生的地方，慢在这类问题就来 TTGIR 层看』，具体 pass 留 Part 级章节。"
+    },
+    {
+      "id": "m06-llir-mlir-llvm-seam",
+      "name": "降到 LLVM/NVVM：make_llir 跨过 MLIR→LLVM 边界（to_module）并做 O3",
+      "kind": "dataflow",
+      "source_anchors": [
+        "third_party/nvidia/backend/compiler.py:L256-L291",
+        "third_party/nvidia/backend/compiler.py:L308-L315"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "note": "低分辨率交代 llir 站的双重身份：先一串 pass 把 TTGPU 方言降到 LLVM-IR 的 MLIR 表示，再 to_module 转成真正的 LLVM-IR（LLVM 侧），挂 datalayout/triple(nvptx64-nvidia-cuda)、设 nvvm reflect，最后 optimize_module O3。这一步是『MLIR 世界』与『LLVM 世界』的接缝，属双语断点地图的一环。"
+    },
+    {
+      "id": "m07-ptx-nvptx-backend",
+      "name": "NVPTX 出 PTX：make_ptx 的 translate_to_asm 走 LLVM NVPTX 后端",
+      "kind": "dataflow",
+      "source_anchors": [
+        "third_party/nvidia/backend/compiler.py:L317-L337"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "note": "PTX 是人可读的虚拟汇编文本。make_ptx 用 LLVM 的 NVPTX target 出 .ptx，再正则抓出唯一 kernel 名写进 metadata['name']、并把 .version 改写成目标 PTX 版本。本章只需读者知道『PTX = LLVM 后端产物、仍是文本、还不是机器码』。"
+    },
+    {
+      "id": "m08-cubin-ptxas-subprocess",
+      "name": "ptxas 出 cubin：起独立子进程把 PTX 汇编成 cubin（ptxas 非 Triton）",
+      "kind": "protocol",
+      "source_anchors": [
+        "third_party/nvidia/backend/compiler.py:L339-L356",
+        "third_party/nvidia/backend/compiler.py:L361-L382"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "note": "最容易误判的一层：cubin 不是 Triton 自己生成的，而是 fork 一个 ptxas 子进程（CUDA 工具链的 CPU 程序，triton wheel 自带）做的。含义有二——(1) 它是进程边界断点（Python 之外的第三方二进制）；(2) 因为 ptxas 是 CPU 工具，headless 无 GPU 也能跑到 cubin，真正的 GPU 门槛在 load_binary。ptxas 失败会连 Repro command 一起报（可复现）。"
+    },
+    {
+      "id": "m09-launch-openhandle-real-gpu",
+      "name": "发射：CompiledKernel._init_handles 的 load_binary + CudaLauncher（『发射开销』旋钮 & 真卡起点）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "python/triton/runtime/jit.py:L638-L654",
+        "python/triton/compiler/compiler.py:L379-L391",
+        "third_party/nvidia/backend/driver.py:L431-L444"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "note": "定位地图的第三个旋钮 + 无 GPU 断裂线：run 的非 warmup 段每次调用都要 canonicalize grid + kernel.run 下发（缓存只省编译不省发射）；首次触碰 _init_handles 时 load_binary 把 cubin 灌进 GPU（此处起必须真卡），CudaLauncher 现场编译一个 C launcher 作最后一跳。C launcher 的双语接缝 ch01 已讲，本章仅在地图上标位，不重述。"
+    },
+    {
+      "id": "m10-bilingual-seam-map",
+      "name": "双语栈断点地图：按管线顺序排出全部 Python↔C++/MLIR 接缝",
+      "kind": "protocol",
+      "source_anchors": [
+        "python/triton/compiler/compiler.py:L273",
+        "third_party/nvidia/backend/compiler.py:L189-L200",
+        "third_party/nvidia/backend/compiler.py:L291",
+        "third_party/nvidia/backend/compiler.py:L341-L356",
+        "third_party/nvidia/backend/driver.py:L439-L441"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "note": "本章两张新地图之一。把接缝第一次沿管线排成一列：① make_ir/pass_manager 经 pybind 进 libtriton.so（追踪与所有 MLIR pass 都在 C++ 里跑，Python 只是编排）；② to_module 从 MLIR 世界跨到 LLVM 世界；③ make_cubin 起 ptxas 子进程（进程边界）；④ CudaLauncher 现场编译 C launcher（make_launcher→compile_module_from_src）作 Python→CUDA driver 最后一跳。ch01 m09 讲了其中三条接缝的内部机制；本章的增量是『把它们按一生的时间轴排成一张断点图 + 指明各自归后续哪一章/姊妹篇对位』，不重讲内部。"
+    },
+    {
+      "id": "m11-no-gpu-fracture-map",
+      "name": "无 GPU 断裂处地图：哪几级 headless 可看 IR，哪一级起必须真卡",
+      "kind": "config",
+      "source_anchors": [
+        "python/triton/compiler/compiler.py:L272-L292",
+        "third_party/nvidia/backend/compiler.py:L339-L356",
+        "python/triton/compiler/compiler.py:L379-L391"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "本章两张新地图之二，也是可复现性的地基。分界：make_ir→make_ttir→make_ttgir→make_llir→make_ptx 全是纯编译，headless 无 GPU 可跑（用 pin 配方 pip triton==3.2.0：ASTSource(...).make_ir 看追踪期 IR、backend.add_stages()['ttir'](...) 看 make_ttir 之后）；make_cubin 调 ptxas 也只是 CPU 子进程，仍可 headless；真正的断裂线在 CompiledKernel._init_handles 的 load_binary（灌进 GPU）与 CudaLauncher.launch（真发射）。worked example = 用 pin 配方实测每一级产物真实存在、并标清各自取自哪一阶段（不照记忆写）。"
+    },
+    {
+      "id": "m12-kernel-dump-anchors",
+      "name": "TRITON_KERNEL_DUMP 逐级 dump：读者可复现锚点（每级 dump 出什么）",
+      "kind": "config",
+      "source_anchors": [
+        "python/triton/compiler/compiler.py:L237-L239",
+        "python/triton/compiler/compiler.py:L285-L286"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "note": "把地图变成读者手上可操作的东西：设 TRITON_KERNEL_DUMP=1，compile 的 for 循环每级都会把该级产物落盘——.ttir/.ttgir/.llir/.ptx（文本）+ .cubin（二进制）+ .json（metadata）。后缀名正是 add_stages 注册的 key。全书后续章要读者『去看某级 IR』时都指向这个开关。注意：dump 出的 .ttir 是 make_ttir 之后（已内联），非追踪期——与 m03 呼应。"
+    },
+    {
+      "id": "m13-perf-locator-map",
+      "name": "定位地图（perf payoff）：症状→哪一层→哪一章的对照",
+      "kind": "config",
+      "source_anchors": [
+        "python/triton/runtime/jit.py:L580-L584",
+        "third_party/nvidia/backend/compiler.py:L203-L218",
+        "python/triton/runtime/jit.py:L638-L654"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "note": "本章 hook 的收口图：把三个旋钮层连成一张『kernel 慢时先看哪层』的决策图——(a) 每次都在编译/换 shape 就变慢 → 编译期特化层（run 的 cache key，m02）；(b) 算得慢/占用低/带宽打不满 → 优化 pass 层（TTGIR 布局/流水线，m05）；(c) 小 kernel 频繁调用、host 侧开销大 → 发射层（每次都过 launcher，m09）。每一格标后续对应章节。这是把结构主线（一路降 PTX）翻译成读者收益主线（去哪拧旋钮）的那张图。"
+    }
+  ],
+  "key_classes": [
+    {"name": "JITFunction", "file": "python/triton/runtime/jit.py:L442", "responsibility": "被 @triton.jit 装饰后的核对象；run() 是编译+发射的总调度：绑参、算 cache key、miss 则 ASTSource+compile、非 warmup 则发射。"},
+    {"name": "KernelInterface", "file": "python/triton/runtime/jit.py:L321", "responsibility": "JITFunction 的基类；__getitem__ 实现 fn[grid] 语法：记住 grid 返回 lambda→run。一生的语法入口。"},
+    {"name": "ASTSource", "file": "python/triton/compiler/compiler.py:L67", "responsibility": "把 fn/signature/constants/attrs 打包成编译的『源』；ext='ttir' 定管线起点；make_ir→ast_to_ttir 出追踪期 TTIR。"},
+    {"name": "compile", "file": "python/triton/compiler/compiler.py:L217", "responsibility": "编译主入口（函数）：查磁盘缓存、add_stages 注册五级、make_ir 出追踪期 IR、for 循环逐级降级并落盘/dump、返回 CompiledKernel。本章地图的心脏。"},
+    {"name": "CUDABackend", "file": "third_party/nvidia/backend/compiler.py:L132", "responsibility": "NVIDIA 后端；add_stages 注册五级、五个 make_* 静态方法各管一级降级（ttir/ttgir/llir/ptx/cubin）。"},
+    {"name": "CompiledKernel", "file": "python/triton/compiler/compiler.py:L343", "responsibility": "编译产物封装；持各级 IR/asm 文本+cubin；_init_handles 首次 load_binary 灌进 GPU（无 GPU 断裂线）；run=launcher。"},
+    {"name": "CudaLauncher", "file": "third_party/nvidia/backend/driver.py:L431", "responsibility": "现场编译一个 C launcher（make_launcher→compile_module_from_src）作 Python→CUDA driver 的最后一跳。ch01 已详述。"}
+  ],
+  "data_flow": [
+    "1. 定义：@triton.jit 装饰 add_kernel（python/tutorials/01-vector-add.py:L27）→ 得到 JITFunction。",
+    "2. 索引：add_kernel[grid]（L73）→ KernelInterface.__getitem__（jit.py:L324）记住 grid，返回 lambda。",
+    "3. 调用：lambda(*args) → JITFunction.run（jit.py:L563），grid=grid, warmup=False。",
+    "4. 绑参+查缓存：binder 出 sig_and_spec/constexpr_vals（jit.py:L580）→ cache key（L583）→ self.cache.get（L584）。命中即跳到步 11。",
+    "5. miss：算 signature/constants/configs（jit.py:L604-L614）→ ASTSource(self, signature, constants, configs[0])（L622）→ self.compile（L623）。",
+    "6. compile 入口（compiler.py:L217）：算磁盘缓存 hash（L231），命中磁盘则直接 CompiledKernel（L252）。",
+    "7. add_stages（compiler.py:L262 → nvidia compiler.py:L384）注册五级 ttir/ttgir/llir/ptx/cubin。",
+    "8. make_ir（compiler.py:L273 → ASTSource.make_ir → ast_to_ttir）：出【追踪期】TTIR，pass 之前。",
+    "9. for 循环（compiler.py:L278）逐级 compile_ir(module)：make_ttir（第一个 pass=add_inliner，抹平 tt.call）→ make_ttgir（convert_to_ttgpuir 贴布局）→ make_llir（TTGPU→LLVM-IR(MLIR)→to_module→LLVM-IR(LLVM)+O3）→ make_ptx（LLVM NVPTX 后端出 .ptx）→ make_cubin（ptxas 子进程出 cubin）；每级落盘/若 DUMP 则 dump（L284-286）。",
+    "10. 封装：return CompiledKernel(src, metadata_group, hash)（compiler.py:L303）→ 回填 self.cache（jit.py:L628）。",
+    "11. 发射（非 warmup，jit.py:L638）：callable grid 求值（L645）→ 补三维 → kernel.run（首次触发 _init_handles：load_binary 灌 GPU + CudaLauncher 现场编 C launcher）→ 异步下发到 stream。",
+    "12. 返回：add() 返回 output handle（尚未 synchronize，kernel 异步执行中）。"
+  ],
+  "design_decisions": [
+    {"decision": "编译触发点在 run 里、以运行时实参算 cache key（不是定义时编译）", "why": "Triton 是 JIT：同一个 @triton.jit 函数按 dtype/对齐/constexpr 的不同组合各特化一份。key 一变即重编，是『编译期特化』这个性能维度的物理入口。", "evidence": "python/triton/runtime/jit.py:L583-L586"},
+    {"decision": "整条编译管线抽象成有序 stages 字典 + 统一 for 循环逐级 compile_ir", "why": "把『五级降级』变成数据（可注册、可枚举、可逐级落盘/dump/override），后端只需实现 add_stages 就能插入自己的阶梯；也让每级 IR 天然可被 TRITON_KERNEL_DUMP 观察。", "evidence": "python/triton/compiler/compiler.py:L261-L292"},
+    {"decision": "五级降级由后端注册，而非硬编码在通用 compile 里", "why": "通用 compile 不知道目标是 NVIDIA 还是别的后端；add_stages 让 CUDABackend 决定自己的阶梯与每级实现。姊妹篇（Ascend）正是在这里换掉后半段阶梯——本书是配对脊柱的基座端。", "evidence": "third_party/nvidia/backend/compiler.py:L384-L389"},
+    {"decision": "cubin 生成外包给独立 ptxas 子进程，而非进程内库调用", "why": "ptxas 是 NVIDIA 闭源工具链的一部分；Triton 只负责产出 PTX，把 PTX→SASS/cubin 交给官方汇编器（保证与 CUDA 语义一致，也解释了为什么这一步是进程边界断点）。", "evidence": "third_party/nvidia/backend/compiler.py:L341-L356"},
+    {"decision": "GPU 句柄懒初始化（_init_handles 延迟到首次访问 .run）", "why": "编译产物（各级 IR/PTX/cubin）本身与设备无关，可在无卡环境产出与缓存；只有真要发射时才 load_binary 碰硬件。这正是『无 GPU 断裂线』落在此处而非更早的原因。", "evidence": "python/triton/compiler/compiler.py:L379-L396"}
+  ],
+  "theory": [
+    "缓存两级：进程内 self.cache[device]（jit.py:L584，key=签名+特化+constexpr）+ 磁盘 fn_cache_manager（compiler.py:L231-L252，key 含 triton_key/src.hash/backend.hash/options.hash/env）。前者命中省整条 compile 调用，后者命中省五级降级只重建 CompiledKernel。读者理解『第一次慢、之后快』与『换机器/换版本又慢』的机理。",
+    "追踪期 vs pass 后是全书反复出现的时间轴刻度：make_ir 输出 = 追踪器直译 AST 的 TTIR（含 tt.call/被调 tt.func）；make_ttir 之后 = 第一个 pass add_inliner 已内联。给任何 IR 事实必须落在这条刻度的某一点，否则不可复现（本章不做深推导，只立坐标系，供后续章挂靠）。",
+    "PTX 与 cubin 的层级差：PTX 是设备无关的虚拟 ISA 文本（LLVM NVPTX 后端产出、跨 sm 版本可移植、JIT 于驱动或 ptxas 之手），cubin 是绑定具体 sm_XX 的机器码（ptxas 汇编产物）。这解释了 make_ptx（进程内 LLVM）与 make_cubin（外部 ptxas）为何是两级、且断点性质不同。"
+  ],
+  "subtraction_plan": {
+    "delete": [],
+    "must_keep": [
+      {"symbol": "run", "why": "JITFunction.run 是一生的总调度入口（jit.py:L563）；缓存判定、编译触发、发射都在这一个方法里，地图的圆心。"},
+      {"symbol": "add_stages", "why": "五级阶梯的注册表（nvidia compiler.py:L384 / compiler.py:L262）；『一共几站、每站叫什么、归哪个后端』全看它，本章地图的骨架来源。"},
+      {"symbol": "make_ir", "why": "ASTSource.make_ir→ast_to_ttir（compiler.py:L273/L99）产出【追踪期】TTIR；是『追踪期 vs pass 后』分界线的左端，ch01 教训①的锚。"},
+      {"symbol": "make_ttir", "why": "五级第一站（nvidia compiler.py:L187）；其第一个 pass add_inliner 抹平 tt.call，是分界线右端。缺它无法讲清『.ttir dump 里找不到 tt.call』。"},
+      {"symbol": "add_inliner", "why": "make_ttir 的第一个 pass（nvidia compiler.py:L191）；ch01 教训①的物理证据，正文要点名它就是抹平内联的那一行。"},
+      {"symbol": "make_ttgir", "why": "TTIR→TTGIR 站（nvidia compiler.py:L203）；convert_to_ttgpuir 首次贴布局/num_warps，是『优化 pass』旋钮层的入口，perf 定位图的一格。"},
+      {"symbol": "make_llir", "why": "TTGIR→LLVM 站（nvidia compiler.py:L256）；to_module 跨 MLIR→LLVM 边界，双语断点地图的一环。"},
+      {"symbol": "make_ptx", "why": "LLVM→PTX 站（nvidia compiler.py:L317）；translate_to_asm 走 NVPTX 后端，读者要分清 PTX 仍是文本、非机器码。"},
+      {"symbol": "make_cubin", "why": "PTX→cubin 站（nvidia compiler.py:L339）；起 ptxas 子进程，既是进程边界断点又是『headless 仍可跑』的澄清点，最易误判的一层。"},
+      {"symbol": "ptxas", "why": "make_cubin 里 fork 的外部汇编器（nvidia compiler.py:L341/L352）；点名它非 Triton、是 CUDA 工具链，才能讲清双语/进程断点与无 GPU 边界。"},
+      {"symbol": "CompiledKernel", "why": "编译产物封装（compiler.py:L343）；持各级 IR/PTX/cubin，_init_handles 是无 GPU 断裂线所在。"},
+      {"symbol": "_init_handles", "why": "CompiledKernel._init_handles（compiler.py:L379）；load_binary 灌 GPU 的确切位置，无 GPU 断裂处地图的锚点。"},
+      {"symbol": "load_binary", "why": "把 cubin 装进 GPU 拿 function 句柄（compiler.py:L390）；跨过它就必须真卡，断裂线的判据。"},
+      {"symbol": "TRITON_KERNEL_DUMP", "why": "读者逐级看产物的官方开关（compiler.py:L237）；全书后续『去看某级 IR』都指向它，必须点名。"},
+      {"symbol": "cache", "why": "self.cache[device]（jit.py:L584）；『编译期特化』旋钮的物理载体，讲清第一次慢之后快、换 shape 又慢。"}
+    ]
+  },
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recycle": [],
+    "note": "bible.py due ch03 返回空（无应埋/应回收项）。本章自身作为鸟瞰图为后续每一章埋下『定位锚』——每级降级点名后面哪一章放大——但这些是本章 hook 的组织方式，非 bible 登记的正式伏笔。"
+  }
+}
