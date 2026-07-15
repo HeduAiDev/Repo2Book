@@ -22,12 +22,32 @@
 `pairs_with` 指回本书章；本书是配对脊柱的基座端。
 
 ## 实例专属硬规则
+
+### ★ pin 精确 IR 验证配方（2026-07-15 ch01 终审员实证，全书 43 章验 IR 都靠它）
+**`pip install triton==3.2.0` 装出的 wheel，其 Python 前端与本 pin 逐字节相同**（已 diff：
+core/standard/semantic/code_generator/compiler/jit/interpreter/backends/__init__ + nvidia
+compiler/driver，全部 IDENTICAL），且自带 `libtriton.so`。**因此可以 headless、无 GPU 做真·pin 实机编译**：
+```
+python -m venv v32 && v32/bin/pip install triton==3.2.0
+# ASTSource(fn, signature, constants).make_ir(...)        → 追踪期 IR（任何 pass 之前）
+# backend.add_stages()["ttir"](...)                        → make_ttir 之后
+```
+- **凡给 IR 事实必须标明取自哪个阶段**（追踪期 / make_ttir 之后 / 更后）——两者差异极大：
+  `add_inliner` 是 make_ttir 的**第一个 pass**，追踪期能看到的 `tt.call`/被调 `tt.func`
+  在 `.ttir` dump 里**已被内联抹平**。让读者用 `TRITON_KERNEL_DUMP` 去 `.ttir` 找 `tt.call`
+  = 承诺一个不可复现的证据（ch01 曾踩，见 exp-0715-1）。
+- **禁止拿环境里装的新版 triton（3.5/3.6）或记忆中的上游代码当准**：上游改过 `cdiv` 体、
+  加过 `BoundJITMethod` 等，拿新版"验证"会得出**错误**结论。一律以 pin 为准。
+- 无法编译的部分（真跑 kernel 需 GPU）：用 `TRITON_INTERPRET=1` 与编译期产物替代；
+  explainer 的 `trace_source` 如实标注，不许假装跑了真核。
+
+### 其他
 - 双语栈：Python DSL 层（python/triton）与 C++/MLIR 层（lib/include）。精简版（implementer）
   预计只对 Python 层可行，MLIR pass 层多数章走 `skip_impl` 轻流程——cartography 逐章标注。
-- 运行验证无 GPU 时用 `TRITON_INTERPRET=1` interpreter 模式与编译期 IR dump 替代；
-  explainer 的 trace_source 如实标注，不许假装跑了真核。
 
 ## 当前状态（2026-07-15）
 - ✅ scaffold + blobless clone + 钉版 v3.2.0；已设为 active_instance。
-- ⏳ cartography 测绘中（RUNBOOK §0.6：fan-out → synthesis → 覆盖交叉核对 → 路径核对 →
-  **用户审批闸**）。大纲未获批前不发车任何章。
+- ✅ cartography 收官：43 章 / 9 Part / 7 primer；论文清单 25 条全部核真；roadmap 生成器就绪。
+- 🔄 ch01 施工中（dossier 已过 5 轮对抗性自核——开篇章定义全书心智模型，从严）。
+- **审批闸豁免（2026-07-15 用户令）**：「查明所有引用论文和 gap 点，查明后无需经我审批，直接开工」
+  ——论文清单+gap 点核清、primer 章并入大纲后，直接逐章发车，不等大纲审批。
