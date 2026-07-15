@@ -46,6 +46,14 @@ python -m venv v32 && v32/bin/pip install triton==3.2.0
 每章 hook 点破本章解锁的性能杠杆、小结回扣。结构主线（一路降级成 PTX）定顺序，
 性能主线定 stakes。落点=outline 每章 `perf_payoff` 字段 + voice-guide 已注入。
 
+### ★ 「可运行交叉验证」= pin 精确编译，非 subtract-only 精简版（2026-07-16 Lead 定）
+Triton 是编译器代码库:core.py/semantic.py 等是庞大且互相缠绕的 DSL 库,对它做「同名同结构
+只删不增」的精简版既不自然、也跑不起来(切一片 core.py 离不开整条编译栈)。因此本书的
+**「运行起来看数值」支柱由 pin 精确编译承担**:explainer 用 `pip install triton==3.2.0`(与
+pin 逐字节同)headless 编译真 kernel,观测**真实** IR/dtype/报错(比 subtract-only 重实现更真)。
+- 多数章 **skip_impl**(无精简版);explainer 的 `trace_source` 记「pin-compile」并标 IR 阶段。
+- 仅当某机制能干净抽取并独立跑(编译器里少见)才用精简版。cartography 的 mode 以此为准。
+
 ### 其他
 - 双语栈：Python DSL 层（python/triton）与 C++/MLIR 层（lib/include）。精简版（implementer）
   预计只对 Python 层可行，MLIR pass 层多数章走 `skip_impl` 轻流程——cartography 逐章标注。
