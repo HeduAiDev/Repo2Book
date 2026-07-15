@@ -441,7 +441,7 @@ const archiveTask = head('archivist') +
   '任务一(务必先做)：把下面这个完整 review 对象**原样**写入 ' + CH + '/reviews/review-report.json（保留 verdict 与全部 issues，不要删改、不要自己重写摘要）：\n' +
   reviewJson + '\n' +
   '任务一b：把这个 run-ledger 对象**原样**写入 ' + CH + '/reviews/run-ledger.json（经验回流的信号源，不要改写）：\n' + runLedger + '\n' +
-  '任务二：回写 Book Bible —— 登记本章精简版新接口（`python3 ' + REPO + '/scripts/bible.py iface --add ' + A.chapter_id + " '<sig>'`)，确认已回收伏笔。\n" +
+  '任务二：回写 Book Bible —— (a) **登记本章新术语进 glossary.json**：本章首现并需全书统一译名的专业缩写/硬件型号/框架 API/自造记号(如 occupancy/SM/coalescing/warp/AOT/dtype 等)，逐条写 {term, 中文译名, 一句释义, 首现章}；不存在则读契约 glossary 结构建。(b) 登记本章新建立的核心概念进 concepts.json：`{"<术语>":"' + A.chapter_id + '"}`(gap 审计据此判「前章已立」)。(c) 登记本章精简版新接口(`python3 ' + REPO + '/scripts/bible.py iface --add ' + A.chapter_id + " '<sig>'`，无精简版可跳)。(d) 确认已回收伏笔、登记新埋伏笔。**glossary/concepts 不回写=术语跨章漂移的源头,勿漏。**\n" +
   '任务三：在 ' + REPO + '/instances/' + INST + '/trace/ 记 delivery 并更新 state.json。返回一句话状态。'
 let archV = null
 for (let a = 1; a <= 2 && !archV; a++) {
