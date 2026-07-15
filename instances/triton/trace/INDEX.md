@@ -5,4 +5,8 @@
 ## Recent Activity
 
 | Date | Type | Chapter | Summary | File |
+| 2026-07-15 | delivery | 05 | ch05 type-system-and-tensor delivered (skip_impl) | [2026-07-15_ch05-ch05-type-system-and-tensor-delivered-(skip_impl).md](deliveries/2026-07-15_ch05-ch05-type-system-and-tensor-delivered-(skip_impl).md) |
+| 2026-07-15 | delivery | 04 | ch04 tl surface and constexpr delivered (skip_impl) | [2026-07-15_ch04-ch04-tl-surface-and-constexpr-delivered-(skip_impl).md](deliveries/2026-07-15_ch04-ch04-tl-surface-and-constexpr-delivered-(skip_impl).md) |
+| 2026-07-15 | delivery | 02 | ch02 gpu-execution-model delivered (primer) | [2026-07-15_ch02-ch02-gpu-execution-model-delivered-(primer).md](deliveries/2026-07-15_ch02-ch02-gpu-execution-model-delivered-(primer).md) |
+| 2026-07-15 | delivery | 03 | ch03 kernel life birdseye delivered (skip_impl) | [2026-07-15_ch03-ch03-kernel-life-birdseye-delivered-(skip_impl).md](deliveries/2026-07-15_ch03-ch03-kernel-life-birdseye-delivered-(skip_impl).md) |
 | 2026-07-15 | delivery | 01 | ch01 What is Triton delivered (skip_impl) | [2026-07-15_ch01-ch01-what-is-triton-delivered-(skip_impl).md](deliveries/2026-07-15_ch01-ch01-what-is-triton-delivered-(skip_impl).md) |

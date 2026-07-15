@@ -60,12 +60,15 @@ color: green
 6. **衍生仓分支**：若当前实例是「插件/衍生仓」类型（如 vllm-ascend），每章须显式点名并简述其
    对位的基座仓章节/模块（可用 bible 里的跨实例映射），说明本章讲的是基座哪一站的顶替/扩展，
    而非孤立叙述。
-7. **开篇「本章地图」**:开篇导航(你在这里/Roadmap 标题，若有)与 hook 段之后、
-   第一个内容分节标题之前插入
-   `![本章地图:<一句话概括>](../diagrams/chapter-map.png)`，紧跟 1–2 句自然措辞的
-   选读指引（点出能跳去哪/什么情况该顺序读）。图由 illustrator 在 Map 站产出，你只管
-   插引用与指引句，不自己画图；`lint_chapter_map --require` 校验位置与指引都在。
-   - 正例:"只想知道调度怎么选人,直接跳 §13.4;想跟全程,按序读。"
+7. **开篇「本章地图」——引用留给 Map 站,主 Write 阶段禁止插入**(2026-07-16 修:
+   chapter-map 图在 **Map 站(评审收敛后)** 才产出,而主 Write 在评审**之前**;若你在主 Write
+   就插 `![本章地图](../diagrams/chapter-map.png)`,评审跑 `lint_chapter_map --require` 会
+   撞上「引用在、文件不在」→ 评审死锁 review-exhausted,永远收不了(ch05 实测)。
+   **所以:主 Write 阶段不要引用 chapter-map**。图由 illustrator 在 Map 站产出后,**Map 站的
+   writer 微任务**才把 `![本章地图:<一句话概括>](../diagrams/chapter-map.png)` + 选读指引
+   插到开篇导航/hook 之后、第一个内容分节标题之前。你在 Map 微任务里做这件事,不在主 Write。
+   (roadmap「你在这里」窄条不同:它每章都有、图已存在,主 Write 阶段照常引用。)
+   - 选读指引正例:"只想知道调度怎么选人,直接跳 §13.4;想跟全程,按序读。"
    - 反例(脚手架措辞,禁用):"详见 illustrator 生成的图,选读路径见 dossier.mechanisms。"
 
 ## primer 原理章分支(dossier 顶层 kind=primer 时)

@@ -1,0 +1,171 @@
+{
+  "chapter": "ch05-type-system-and-tensor",
+  "note": "素材真相源。本章 skip_impl（无 implementer 精简版）——按 INSTANCE.md『可运行交叉验证=pin 精确编译』，所有数值取自 pip install triton==3.2.0（前端 + libtriton.so 与本 pin 逐字节相同、headless 无 GPU）实机运行，故 trace_source 一律 run（与姊妹章 ch04 同）。dtype 三元组 / validate_block_shape / bitcast 报错为纯前端行为，直接跑真对象；cast/bitcast 的 IR op 取自 ASTSource.make_ir（追踪期，任何 pass 之前，标于每处）。驱动脚本与原始输出见 explainer/traces/。凡引用源码常量另标 file:Lxxx 双溯源。",
+
+  "mechanisms": [
+    {
+      "mechanism_id": "m01-three-layer-types",
+      "intuition": "三层类型像俄罗斯套娃：最里层 dtype 是一个标量类型（『这是个 fp32』）；套第二层 pointer_type，里面裹着一个 element_ty（『指向 fp32 的指针』）；套第三层 block_type，裹着 element_ty 再加一个 shape（『128×64 个 fp32 排成的块』）。后两层都继承 dtype、都靠 to_ir 先把内层降成 IR type 再套一层壳。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-three-layer-types",
+          "claim": "Triton 的类型体系是三层嵌套：dtype（标量）被 pointer_type 与 block_type 各包一层 element_ty，to_ir 逐层下降到 builder.get_*_ty。",
+          "template": "layout",
+          "numbers": [
+            {"label": "dtype 标量位宽示例（fp32）", "value": "32", "provenance": "python/triton/language/core.py:L345（fp32 primitive_bitwidth=32）"},
+            {"label": "block_type numel 上限", "value": "1048576", "provenance": "python/triton/language/_utils.py:L3（TRITON_MAX_TENSOR_NUMEL=2^20）"},
+            {"label": "pointer_type 默认 address_space", "value": "1", "provenance": "python/triton/language/core.py:L561（address_space: int = 1）"},
+            {"label": "block_type.scalar 返回", "value": "element_ty", "provenance": "python/triton/language/core.py:L644-L646（scalar 属性=element_ty，即 tensor.dtype 来源）"}
+          ],
+          "caption_draft": "读者写下 tl.float32 / tl.pointer_type(...) / block_type(...) 时落成的三层套娃：第一层是标量 dtype（fp32 位宽 32），第二层 pointer_type 裹一个 element_ty + address_space，第三层 block_type 裹 element_ty + shape 并在构造时用 validate_block_shape 把关（numel≤2^20）。三层都继承 dtype、都实现 to_ir——下降到 IR 时从内向外一层层套成 builder 的 get_ptr_ty / get_block_ty。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m02-fp8-family-encoding",
+      "intuition": "一个浮点数的 8（或 16、32）个 bit 要在两件事上分账：尾数（mantissa）位数决定『分得多细』（精度），指数位数 + exponent_bias 决定『量程多宽』（能表示多大多小的数）。fp8 家族就是同样 8 个 bit 的不同分法——fp8e4nv 给尾数 3 位、量程窄一点；fp8e5 只给尾数 2 位、把省下的位给指数换更宽量程。选 dtype 就是在这块固定预算上滑动这个旋钮。",
+      "worked_example": {
+        "params": {"compared": ["fp8e4nv", "fp8e5", "fp16", "bf16", "fp32"], "note": "同 8 bit 的两个 fp8 变体 + 两个 16 bit + fp32 基准，看『位宽固定时精度↔量程如何互换』"},
+        "trace_source": "run",
+        "trace_ref": "traces/fp8_encoding.txt",
+        "table": {
+          "columns": ["dtype", "bitwidth", "mantissa", "exponent_bias", "相对精度 ≈2^-(mantissa+1)", "相对 fp32 带宽"],
+          "rows": [
+            ["fp8e4nv", "8", "3", "7", "0.0625", "0.250"],
+            ["fp8e5", "8", "2", "15", "0.125", "0.250"],
+            ["fp16", "16", "10", "15", "0.000488281", "0.500"],
+            ["bf16", "16", "7", "127", "0.00390625", "0.500"],
+            ["fp32", "32", "23", "127", "5.96046e-08", "1.000"]
+          ]
+        }
+      },
+      "quantified": "位宽直接换算内存带宽：fp8 是 fp16 的一半（8/16=0.5）、fp32 的四分之一（8/32=0.25），故 KV cache / 激活值转 fp8 直接把该张量的访存量砍到 1/4（实测见 traces/fp8_encoding.txt）。同为 8 bit：fp8e4nv 尾数 3 位→相对精度 0.0625，fp8e5 尾数 2 位→相对精度 0.125（精度差一倍），换来的是 fp8e5 多一个指数位、量程更宽。同为 16 bit：bf16 只给尾数 7 位（相对精度 0.00390625，比 fp16 的 0.000488281 粗 8 倍），却把 exponent_bias 抬到 127（与 fp32 同量程）——这就是训练偏爱 bf16 的原因：宁可粗一点也不溢出。",
+      "invariant": {
+        "claim": "8 bit 的 fp8 满足『符号 1 + 指数位 + 尾数位 = 8』这条守恒——尾数与指数此消彼长，没有既高精度又宽量程的免费午餐。",
+        "argument": "基例：fp8e4nv 尾数 3 位、指数 4 位、符号 1 位，3+4+1=8=primitive_bitwidth。对照：fp8e5 尾数 2 位、指数 5 位、符号 1 位，2+5+1=8。两者位宽都是 8（trace 打印 bitwidth=8），差别只在把那 7 个非符号位在尾数/指数间怎么切。core.py 把 (fp_mantissa_width, exponent_bias) 存成两个独立字段正是为了让 cast/精度分析能直接查这个切分，而不必从一个枚举里反推。"
+      },
+      "figure_specs": [
+        {
+          "figure_id": "fig-fp8-tradeoff",
+          "claim": "同位宽下 (mantissa, exponent_bias) 三元组把精度与量程对立起来：fp8 两个变体全 8 bit、差别只在这两个数；bf16 用尾数换 fp32 量程。",
+          "template": "state-table",
+          "numbers": [
+            {"label": "fp8e4nv 尾数 / bias", "value": "3 / 7", "provenance": "traces/fp8_encoding.txt；python/triton/language/core.py:L323-L325"},
+            {"label": "fp8e5 尾数 / bias", "value": "2 / 15", "provenance": "traces/fp8_encoding.txt；python/triton/language/core.py:L332-L334"},
+            {"label": "fp8 相对 fp32 带宽", "value": "0.25", "provenance": "traces/fp8_encoding.txt（8/32）"},
+            {"label": "bf16 尾数 / bias", "value": "7 / 127", "provenance": "traces/fp8_encoding.txt；python/triton/language/core.py:L338-L340"},
+            {"label": "fp16 尾数 / bias", "value": "10 / 15", "provenance": "traces/fp8_encoding.txt；python/triton/language/core.py:L335-L337"}
+          ],
+          "caption_draft": "读 dtype 三元组就是读性能账：横轴 mantissa（精度）、纵轴 exponent_bias（量程），每个 dtype 是一个点。fp8e4nv 与 fp8e5 都在『8 bit 线』上、位置不同（精度↔量程互换）；bf16 与 fp16 都在『16 bit 线』上，bf16 靠牺牲尾数（7 vs 10）把 bias 抬到 127 拿到 fp32 量程。选 dtype = 选这条线（带宽）上的一个点（精度/量程）。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m04-validate-block-shape",
+      "intuition": "block 的 shape 有两道门卫：每一维必须是 2 的幂（这样下游按位移就能算 tiling / 向量化，不必做通用除法），且所有维乘起来的元素数不许超过 2^20=1048576（约束单个 block 占的寄存器/共享内存不失控）。你把 BLOCK_SIZE 开太大、或开成非 2 的幂，构造 block_type 的那一刻就在这里被 ValueError 拦下——不是运行期崩，是编译期就报。",
+      "worked_example": {
+        "params": {"cases": ["[16,16] 合法", "[1024,1024] 恰等 2^20 边界", "[2048,1024] 超上限", "[1000,16] 非 2 的幂"], "note": "覆盖通过 / 边界 / 超限 / 非幂四支，后两支真触发 ValueError"},
+        "trace_source": "run",
+        "trace_ref": "traces/validate_block_shape.txt",
+        "table": {
+          "columns": ["2D block shape", "每维 2 的幂?", "numel = ∏dim", "≤ 2^20 (1048576)?", "结果"],
+          "rows": [
+            ["[16, 16]", "是", "256", "是", "OK，返回 numel=256"],
+            ["[1024, 1024]", "是", "1048576", "是（恰等边界，允许）", "OK，返回 numel=1048576"],
+            ["[2048, 1024]", "是", "2097152", "否", "ValueError: numel (2097152) exceeds triton maximum tensor numel (1048576)"],
+            ["[1000, 16]", "否（1000 非 2 的幂）", "首维即失败", "—", "ValueError: Shape element 0 must be a power of 2"]
+          ]
+        }
+      },
+      "quantified": "上限是元素数不是字节数：2D block 的 BLOCK_M × BLOCK_N 必须 ≤ 2^20，故最大正方 block 是 1024×1024=1048576（恰等边界，实测放行）；再往上如 2048×1024=2097152 直接抛 ValueError（实测）。这就是读者调大 BLOCK_SIZE 撞的硬编译期天花板——与元素的 dtype 无关（fp8 也好 fp32 也好，都是这 2^20 个元素的上限），所以想省显存靠的是小 dtype 而非更大的 block。",
+      "invariant": {
+        "claim": "validate_block_shape 是全通过或抛错的守卫：遍历每一维，任一维非 2 的幂立即抛，累乘 numel 一旦越过 2^20 即抛；正常返回的 numel 必是各维（皆 2 的幂）之积、且 ≤2^20。",
+        "argument": "循环对每个维度 d 先查 is_power_of_two(d)=（d & (d-1))==0，假则 raise（基例上 d=1 也判 true，符合 2^0）；随后 numel *= d 单调累乘（各维≥1），循环后一次性判 numel > TRITON_MAX_TENSOR_NUMEL 则 raise。因每维有限、无回退，函数必在有限步内『返回 numel』或『在越界那一步抛出』二者之一——[2048,1024] 累乘到 2097152 落入后者，[16,16] 累乘到 256 落入前者。"
+      }
+    },
+
+    {
+      "mechanism_id": "m05-tensor-handle-type",
+      "intuition": "tensor 不是数据，是一张『提货单』：它只记两样真东西——handle（IR 里某个 SSA 值的编号，真正的数值在寄存器/IR 里）和 type（这个值的类型）。你在 Python 侧看到的 shape / numel / dtype 全是从 type 现算出来的便利视图，而且 shape 每个元素都裹成 constexpr（编译期已知，回指 ch04）。所以 tensor 很轻，传来传去只是在传这张提货单。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-tensor-handle-type",
+          "claim": "tensor = (handle, type) 二元组；shape/numel/dtype 全从 type 派生，shape 元素裹成 constexpr（编译期已知）。",
+          "template": "layout",
+          "numbers": [
+            {"label": "tensor 的真字段数", "value": "2", "provenance": "python/triton/language/core.py:L744-L757（仅 handle + type 为真字段，其余派生）"},
+            {"label": "block [128,64] 派生 numel", "value": "8192", "provenance": "traces/validate_block_shape.txt（128×64=8192）"},
+            {"label": "shape 元素类型", "value": "constexpr", "provenance": "python/triton/language/core.py:L757（self.shape = [constexpr(s) for s in self.shape]）"},
+            {"label": "dtype 来源", "value": "type.scalar", "provenance": "python/triton/language/core.py:L753（self.dtype = type.scalar）"}
+          ],
+          "caption_draft": "一个 tensor 的解剖：中心只有两格——handle（指向 IR 里的 SSA 值）和 type（可以是 block_type）。向外派生出三个只读视图：shape（block_type.shape 逐元素裹 constexpr）、numel（各维之积，如 128×64=8192）、dtype（type.scalar，即 block_type 那层剥到最里的标量 dtype）。数值本身不在这张图里——它在 IR/寄存器里，tensor 只是它的把手。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m07-cast-big-dispatch",
+      "intuition": "cast 不是给变量换个类型标签那么免费——semantic.cast 是一棵大分岔树，按（源 dtype, 目标 dtype）的组合选一条支，每选中一支就 builder.create_*(...) 发一个真的 IR 算术 op（截断 / 扩展 / 浮点转整数 / 整数转浮点…）。这个 op 会占寄存器、进指令流。个别组合（如 bf16↔非 fp32）硬件没有直达指令，还得借道 fp32 发两个 op。所以热循环里反复 cast 是实打实的算力开销。",
+      "worked_example": {
+        "params": {"kernel": "x:fp32 依次 .to(fp16) / .to(fp32) / .to(int32) / .to(fp32)；另 fp16.to(bf16) 看两跳", "ir_stage": "追踪期 ASTSource.make_ir（任何 pass 之前）", "target": "cuda capability 90"},
+        "trace_source": "run",
+        "trace_ref": "traces/cast_ir.txt",
+        "table": {
+          "columns": ["cast 表达式", "src → dst", "semantic.cast 命中分支", "发出的 IR op", "op 数"],
+          "rows": [
+            ["x.to(tl.float16)", "fp32 → fp16", "fp 截断 truncate（bitwidth 降）", "arith.truncf", "1"],
+            ["a.to(tl.float32)", "fp16 → fp32", "fp 扩展 extend（bitwidth 升）", "arith.extf", "1"],
+            ["x.to(tl.int32)", "fp32 → int32", "标准浮点 → 整数", "arith.fptosi", "1"],
+            ["s.to(tl.float32)", "int32 → fp32", "整数 → 标准浮点（有符号）", "arith.sitofp", "1"],
+            ["x.to(tl.bfloat16)", "fp16 → bf16", "bf16↔非 fp32：借道 fp32 两跳", "arith.extf + arith.truncf", "2"]
+          ]
+        }
+      },
+      "quantified": "实测（追踪期 IR）：4 个不同类型对的 cast 各发恰好 1 个 arith op（truncf / extf / fptosi / sitofp 各 1，见 traces/cast_ir.txt 计数 1/1/1/1）；而 fp16→bf16 因走『先扩到 fp32 再截到 bf16』发 2 个 op（extf 1 + truncf 1）。换算成开销：一段热循环里每迭代 N 次无谓 cast = N 个额外 IR op 进指令流，bf16↔非fp32 的还翻倍——这是『避免无谓 cast』这条性能建议的字面依据。",
+      "invariant": {
+        "claim": "cast 的开销与分支一一对应：语义层每命中一条 dispatch 支就发恰好一个 IR op；唯一的例外是 bf16↔非fp32，它递归成两跳、发两个 op。绝不存在『发 0 个 op 的 cast』（同类型早返回那条不算 cast）。",
+        "argument": "semantic.cast 里每一条分支体都形如 tl.tensor(builder.create_XXX(...), dst_ty)——一次 builder.create_* 调用即一个 IR op；分支互斥，故命中一支=一个 op。bf16↔非fp32 分支体是 cast(cast(input, fp32), dst)，两层嵌套各自再落到某条 create_* 支，故 2 个 op（实测 extf+truncf）。开篇 src_ty==dst_ty 直接 return input 不发 op，但那是『无需转换』，不构成一次 cast。"
+      },
+      "figure_specs": [
+        {
+          "figure_id": "fig-cast-dispatch",
+          "claim": "semantic.cast 按 (src, dst) dtype 选支，每支发一个真 IR op；bf16↔非fp32 借道 fp32 发两个。",
+          "template": "state-table",
+          "numbers": [
+            {"label": "fp32→fp16（截断）", "value": "arith.truncf ×1", "provenance": "traces/cast_ir.txt"},
+            {"label": "fp16→fp32（扩展）", "value": "arith.extf ×1", "provenance": "traces/cast_ir.txt"},
+            {"label": "fp32→int32", "value": "arith.fptosi ×1", "provenance": "traces/cast_ir.txt"},
+            {"label": "int32→fp32", "value": "arith.sitofp ×1", "provenance": "traces/cast_ir.txt"},
+            {"label": "fp16→bf16（两跳）", "value": "extf + truncf ×2", "provenance": "traces/cast_ir.txt"}
+          ],
+          "caption_draft": "每一行是一条 dispatch 支：左边源/目标 dtype，右边追踪期 IR 里真的多出来那个 op。前四行『一进一出』各 1 个 op；最后一行 fp16→bf16 因缺直达指令，被拆成 extf（→fp32）+ truncf（→bf16）两个 op——图里同一次 .to() 掉出两块砖。这张图把『cast 有开销、且不是所有 cast 一样贵』变成可数的 op。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m08-bitcast-equal-width",
+      "intuition": "bitcast 和 cast 是两回事：cast 会真算（fp32→fp16 会舍入），bitcast 只是『把同一堆 bit 换个类型标签重新解读』——一分钱不算，但硬前提是位宽必须相等（32 bit 的 fp32 只能 bitcast 到同样 32 bit 的 int32）。位数不等就无从对应，semantic 层当场 ValueError，连一个 IR op 都不发。",
+      "worked_example": {
+        "params": {"cases": ["fp32→int32 bitcast（32==32）", "fp16→bf16 bitcast（16==16）", "fp32→fp16 bitcast（32≠16）"], "ir_stage": "追踪期 ASTSource.make_ir", "target": "cuda capability 90"},
+        "trace_source": "run",
+        "trace_ref": "traces/bitcast.txt",
+        "table": {
+          "columns": ["表达式", "src → dst", "primitive_bitwidth 比较", "结果"],
+          "rows": [
+            ["x.to(tl.int32, bitcast=True)", "fp32 → int32", "32 == 32", "发 1 个 tt.bitcast（同 bit 重解释，无计算）"],
+            ["x.to(tl.bfloat16, bitcast=True)", "fp16 → bf16", "16 == 16", "发 1 个 tt.bitcast"],
+            ["x.to(tl.float16, bitcast=True)", "fp32 → fp16", "32 ≠ 16", "ValueError: Cannot bitcast data-type of size 32 to data-type of size 16"]
+          ]
+        }
+      },
+      "quantified": "bitcast 的计算开销为 0：等宽通过时只发一个 tt.bitcast（实测 fp32↔int32、fp16↔bf16 各 count=1），它不改 bit、只改类型解读，无舍入无算术——这正是它相对 cast 的价值（把 fp32 位模式当 int32 做位运算再 bitcast 回来，不丢精度）。但等宽是硬约束：fp32(32)→fp16(16) 位数不等，在 semantic.bitcast 就抛 ValueError（size 32 to size 16），连 IR 都没进。",
+      "invariant": {
+        "claim": "bitcast 保位宽：src 与 dst 的 primitive_bitwidth 必须相等，否则报错在 semantic 层、不发任何 IR op；相等时发恰好一个 tt.bitcast，输入的每个 bit 原样保留、只换类型标签。",
+        "argument": "semantic.bitcast 取 src_bits = src_sca_ty.primitive_bitwidth、dst_bits = dst_sca_ty.primitive_bitwidth，若 src_bits != dst_bits 立即 raise ValueError（『Cannot bitcast data-type of size 32 to data-type of size 16』即此，实测）；相等则 builder.create_bitcast 发一个 op。位宽相等是『同一堆 bit 能一一对应到新类型的每个 bit』的充要前提——32 个 bit 无法无损塞进 16 个 bit，故不等即拒。（涉指针的会先降级到 cast 的指针分支，不走等宽这条。）"
+      }
+    }
+  ]
+}
