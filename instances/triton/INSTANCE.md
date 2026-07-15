@@ -41,6 +41,11 @@ python -m venv v32 && v32/bin/pip install triton==3.2.0
 - 无法编译的部分（真跑 kernel 需 GPU）：用 `TRITON_INTERPRET=1` 与编译期产物替代；
   explainer 的 `trace_source` 如实标注，不许假装跑了真核。
 
+### ★ 读者收益主线（2026-07-15 用户定）
+全书围绕一条读者收益主线组织：**「这一章的内容如何帮我优化 Triton 算子的性能」**。
+每章 hook 点破本章解锁的性能杠杆、小结回扣。结构主线（一路降级成 PTX）定顺序，
+性能主线定 stakes。落点=outline 每章 `perf_payoff` 字段 + voice-guide 已注入。
+
 ### 其他
 - 双语栈：Python DSL 层（python/triton）与 C++/MLIR 层（lib/include）。精简版（implementer）
   预计只对 Python 层可行，MLIR pass 层多数章走 `skip_impl` 轻流程——cartography 逐章标注。
