@@ -48,7 +48,7 @@ color: green
    不许悄悄不引用——lint_diagrams 按 manifest 对账)。不为加而加：一图一论点，
    文字已够清楚就别配图。
 4. 原有契约继续有效：内嵌真实源码(带规范 `<repo>/...:Lxxx`，删无关分支用 `# … 省略 …`)、
-   自包含、开场引用 roadmap.png(illustrator 已生成)+ 图注 2-3 个 ≤25 字短句、
+   自包含、开场引用 book-map.png(全书地图窄长条横幅,illustrator 已生成;既有 vllm/ascend 章沿用旧名 roadmap.png)+ 图注 2-3 个 ≤25 字短句、
    bible 埋伏笔/回收(`python3 scripts/bible.py payoff --resolve`)、公式规则、
    **零脚手架泄漏**(规范路径/自然标题/不提 dossier/explainer/manifest 等内部文件)、
    **跨章**引用一律 markdown 链接、且从 narrative/ 出发用两层相对路径（`[第 7 章：IPC 边界](../../ch07-xxx/narrative/chapter.md)`）；链接文字里的章号必须与目标目录号一致（lint_anchors 三规核验）；**禁止裸文字章号**（「详见第 21 章」无链接——插章重编号时它是最大的迁移债）；导语/图注衔接按内容措辞（「上一章的 MHA 后端」），章号只活在链接里。

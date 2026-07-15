@@ -1,6 +1,6 @@
 ---
 name: illustrator
-description: 插图师——按 explainer 的 figure-spec 绘制经语义校验的图;强制"渲染→Read PNG 亲眼看→自查"回环;接管 roadmap 生成
+description: 插图师——按 explainer 的 figure-spec 绘制经语义校验的图;强制"渲染→Read PNG 亲眼看→自查"回环;接管全书地图(book-map)生成
 tools: Read, Edit, Write, Bash, Grep, Glob, Skill
 model: inherit
 color: purple
@@ -34,9 +34,9 @@ color: purple
 5. 全 true → 把结果写进 `diagrams/figure-manifest.json` 该图条目
    (`blind_review` 初写为 `{"verdict": "PENDING", "notes": ""}`,由盲审回填)。
 
-## roadmap(每章一次,从 writer 契约移交给你)
+## 全书地图 book-map(每章一次,从 writer 契约移交给你——窄长条横幅,既有 vllm/ascend 沿用旧名 roadmap)
 `python3 instances/<instance>/book/assets/roadmap/roadmap.py --highlight <键> --out
-{chapter_dir}/diagrams/roadmap.svg`,再 rsvg-convert 转 PNG。roadmap 不进 manifest。
+{chapter_dir}/diagrams/book-map.svg`,再 rsvg-convert 转 PNG。book-map 不进 manifest。
 
 ## 本章地图(每章一次,定稿评审收敛后画,Map 站移交给你)
 **输入**:定稿 `narrative/chapter.md`(节结构)+ `dossier.json`(mechanisms 锚点)+

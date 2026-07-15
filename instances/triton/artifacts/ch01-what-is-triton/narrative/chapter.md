@@ -1,6 +1,6 @@
 # Triton 是什么，以及本书怎么读
 
-![Triton 降级阶梯·全书地图](../diagrams/roadmap.png)
+![全书地图：9 个 Part 的降级阶梯，你在第 I 部分「起步」](../diagrams/book-map.png)
 
 > **你在这里** ——第 I 部分「起步」的第一站。
 > 上一章：无，这是全书的起点。
