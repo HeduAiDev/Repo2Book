@@ -1,6 +1,6 @@
 ---
 name: illustrator
-description: 插图师——按 explainer 的 figure-spec 绘制经语义校验的图;强制"渲染→Read PNG 亲眼看→自查"回环;接管全书地图(book-map)生成
+description: 插图师——按 explainer 的 figure-spec 绘制经语义校验的图;强制"渲染→Read PNG 亲眼看→自查"回环;接管全书地图(roadmap 开篇窄长条 + book-map 详细图)生成
 tools: Read, Edit, Write, Bash, Grep, Glob, Skill
 model: inherit
 color: purple
@@ -34,9 +34,18 @@ color: purple
 5. 全 true → 把结果写进 `diagrams/figure-manifest.json` 该图条目
    (`blind_review` 初写为 `{"verdict": "PENDING", "notes": ""}`,由盲审回填)。
 
-## 全书地图 book-map(每章一次,从 writer 契约移交给你——窄长条横幅,既有 vllm/ascend 沿用旧名 roadmap)
+## 开篇「你在这里」roadmap(每章一次,从 writer 契约移交给你——**窄长条横幅**:Part 单行面包屑+当前 Part 高亮,宽高比 6:1~8:1,勿方形)
 `python3 instances/<instance>/book/assets/roadmap/roadmap.py --highlight <键> --out
-{chapter_dir}/diagrams/book-map.svg`,再 rsvg-convert 转 PNG。book-map 不进 manifest。
+{chapter_dir}/diagrams/roadmap.svg`,再 rsvg-convert 转 PNG。roadmap 不进 manifest。
+
+## 详细全书地图 book-map(**只 ch01/鸟瞰章**一次,2026-07-16 用户定)
+与开篇 roadmap 窄长条**不同**:book-map 是一张**详细全书地图**——把**全部 Part × 全部章**铺开,
+每 Part 一栏/一区(配 Part 主题色)、每章一行 `chNN + 短标题`、**primer 原理章加「原理」徽标**、
+底部图例(标出共几章 primer 及章号)。读者在开篇一眼看清全书骨架 + 哪些是原理章。
+范本 `instances/vllm-ascend/artifacts/ch01-birdseye-oot-plugin/diagrams/book-map.png`。
+数据取本书 `book/cartography/outline-final.json`(章号/标题/part/kind);gen 脚本坐标循环算、
+文本 esc()。渲染→**Read PNG 亲眼看**(章号数、primer 徽标数逐一对 outline)→登记 figure-manifest 走盲审。
+画布可比开篇窄长条高(它是详细目录图,非「你在这里」条),但仍守 lint_diagram_geometry。
 
 ## 本章地图(每章一次,定稿评审收敛后画,Map 站移交给你)
 **输入**:定稿 `narrative/chapter.md`(节结构)+ `dossier.json`(mechanisms 锚点)+

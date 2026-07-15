@@ -201,7 +201,7 @@ for (let b = 1; b <= 3; b++) {
   const ill = await agent(
     head('illustrator') +
     '任务：按 ' + CH + '/explainer/explainer.json 的全部 figure_specs 绘图到 ' + CH + '/diagrams/（gen_<figure_id>.py + svg + png + figure-manifest.json）。每张图强制流程：渲染 → 用 Read 打开 PNG **亲眼看** → 六项自查全真才登记 manifest（blind_review 初写 PENDING）。\n' +
-    '并生成本章 roadmap：`python3 ' + REPO + '/instances/' + INST + '/book/assets/roadmap/roadmap.py --highlight "' + HL + '" --out ' + CH + '/diagrams/book-map.svg`（全书地图=窄长条横幅），rsvg-convert -z 2 转 PNG（**勿用 ImageMagick convert**）。\n' +
+    '并生成本章 roadmap：`python3 ' + REPO + '/instances/' + INST + '/book/assets/roadmap/roadmap.py --highlight "' + HL + '" --out ' + CH + '/diagrams/roadmap.svg`（开篇「你在这里」窄长条横幅），rsvg-convert -z 2 转 PNG（**勿用 ImageMagick convert**）。\n' +
     (blindLedger.length ? '上一轮盲审 FAIL，必须修复后重渲重看：\n' + blindLedger.join('\n') + '\n' : '') +
     '完成后自跑 `python3 ' + REPO + '/scripts/lint_diagram_geometry.py ' + CH + '/diagrams/*.svg` 确保无问题。返回 status/note。' + ESC,
     { schema: STATUS_SCHEMA, label: 'illustrate r' + b, phase: 'Illustrate', agentType: 'general-purpose', model: MODELS.illustrate }
@@ -232,7 +232,7 @@ writeV = await agent(
   head('writer') +
   '任务：以**真实目标源码为主线**写 ' + CH + '/narrative/chapter.md（你唯一有权写它）。\n' +
   '读 dossier、implementation、' + REPO + '/instances/' + INST + '/book/bible/voice-guide.md，并跑 `python3 ' + REPO + '/scripts/bible.py due ' + A.chapter_id + '`。\n' +
-  '素材已备好：读 ' + CH + '/explainer/explainer.json（数值轨迹/直觉/不变量）与 ' + CH + '/diagrams/（已过盲审的图 + book-map.png——先 Read 几张 PNG 看图长什么样再落笔）。**怎么讲由你**：结构/顺序/风格/篇幅自由。**必达物要在场**：difficulty=core 机制三层递进（直觉→机制→源码）；explainer 的数值推演表进正文，表格前一行放 `<!-- trace: <mechanism_id> -->` 标记，数字一个不许改（排版随意）；每张仍贴合的已验收图被引用且在其机制讲解附近；开场引用 book-map.png（全书地图窄长条横幅）。**图集由你定**(契约必达物3)：已备图不贴合可 drop、新叙事需要新图就写 ' + CH + '/diagrams/figure-requests.json(add/replace/drop,数字带溯源)，并在返回值 figure_requests 填条数(无变更填 0)——workflow 会派 illustrator 处理后再让你插/删引用；**不许自己画**。\n' +
+  '素材已备好：读 ' + CH + '/explainer/explainer.json（数值轨迹/直觉/不变量）与 ' + CH + '/diagrams/（已过盲审的图 + roadmap.png——先 Read 几张 PNG 看图长什么样再落笔）。**怎么讲由你**：结构/顺序/风格/篇幅自由。**必达物要在场**：difficulty=core 机制三层递进（直觉→机制→源码）；explainer 的数值推演表进正文，表格前一行放 `<!-- trace: <mechanism_id> -->` 标记，数字一个不许改（排版随意）；每张仍贴合的已验收图被引用且在其机制讲解附近；开场引用 roadmap.png（开篇「你在这里」窄长条横幅）；**ch01/鸟瞰章**另需 book-map.png（详细全书地图:各 Part×各章+primer 徽标）。**图集由你定**(契约必达物3)：已备图不贴合可 drop、新叙事需要新图就写 ' + CH + '/diagrams/figure-requests.json(add/replace/drop,数字带溯源)，并在返回值 figure_requests 填条数(无变更填 0)——workflow 会派 illustrator 处理后再让你插/删引用；**不许自己画**。\n' +
   (PRIMER ? '本章四段式必达物：动机 → 数学推导（**每个关键公式给论文锚 §/Eq + arXiv id**）→ 小参数数值推演（explainer 素材）→ 落地（vllm_ascend 真实代码锚点 + 链接对应码章）。\n' : '') +
   '正文内嵌**真实源码片段**(裁剪无关分支用 `# … 省略 …`)，逐段解读设计决策。' +
   (A.skip_impl

@@ -11,10 +11,10 @@ Reused as each chapter's 开篇「你在这里」横幅。
 版式为**窄长条**（宽 ≈1500、高 ≈240，宽高比 ≈6:1），只占很少版面。
 
 Usage:
-  python3 roadmap.py --highlight orientation   --out book-map.svg   # Part 键: 高亮一个 Part
-  python3 roadmap.py --highlight P5             --out book-map.svg   # 等价 Part 别名 P1..P9
-  python3 roadmap.py --highlight ch23           --out book-map.svg   # 章号键: 同上 + "本章深入" 小标
-  python3 roadmap.py                             --out book-map.svg   # 空: 全书总览（meta 章）
+  python3 roadmap.py --highlight orientation   --out roadmap.svg   # Part 键: 高亮一个 Part
+  python3 roadmap.py --highlight P5             --out roadmap.svg   # 等价 Part 别名 P1..P9
+  python3 roadmap.py --highlight ch23           --out roadmap.svg   # 章号键: 同上 + "本章深入" 小标
+  python3 roadmap.py                             --out roadmap.svg   # 空: 全书总览（meta 章）
 
 Part 键见 STAGES（每个键=一个 Part，配 P1..P9 别名，且与 outline 的 subsystem 字段
 一一同名——本书每个 subsystem 恰好落在唯一一个 Part，不存在 vllm-ascend 那种子系统
@@ -218,7 +218,7 @@ def build(highlight: str) -> str:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--highlight", default="")
-    ap.add_argument("--out", default="book-map.svg")
+    ap.add_argument("--out", default="roadmap.svg")
     a = ap.parse_args()
     with open(a.out, "w", encoding="utf-8") as f:
         f.write(build(a.highlight))
