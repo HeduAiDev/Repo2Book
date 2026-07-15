@@ -20,10 +20,13 @@
 这步定全书骨架，**经验沉淀在这张清单里**（vLLM 当年的一次性 cartography workflow 已散失，故写成 playbook，别再裸手重走弯路）：
 1. **子系统测绘（fan-out）**：按源码顶层目录/子系统分组，每组派一个 analyst 读真实源码（姊妹篇还要对照基座实例 `instances/<base>/source`），产 digest：可成章单元、`key_source_paths`、`pairs_with`、教学价值、该子系统"怎么接入/改写"的主线。
 2. **综合（synthesis）**：1 个 agent 汇总成 `outline-final.json`（**遵从 `schemas/book_outline.json` v2**：`book` + `parts[]` + `chapters[]`，每章 `chapter_id/slug/title/focus/part/key_source_paths/pairs_with/deps/est_size/mode`）+ `ARCHITECTURE.md`（心智模型 + 子系统地形 + 逐 Part 大纲 + 配对脊柱）。
-3. **⚠️ 强制：子系统覆盖交叉核对**（最易漏，vLLM-ascend 试点连栽四次：PD 分离 / 池化 / kv_offload / 310P 都是用户事后揪出的）：列源码**每个顶层子系统**，逐一确认"被某章 `key_source_paths` 覆盖 / 或显式点名入横切"，**未覆盖即漏章**。死盯易被低估的：PD 分离（proxy 调度 + **KV 亲和/命中路由**）、KV 池化/外存储、KV 卸载（host/CPU 分层）、芯片/硬件分代变体（如 310P，常是整套子类化）、网络加载——这些常被压成一章或漏掉。
-4. **路径核对**：每个 `key_source_paths`（及 `pairs_with` 的基座路径）在 source/ 真实存在。
-5. **配对脊柱**（姊妹篇）：每章钉一个对位基座章，正文对照基座说"顶替/扩展了哪一站"。
-6. **用户审批闸**：把 Part/章列表 + 覆盖核对结论给用户，**批准后**才逐章发车——别跳。
+   - **★ 强制:第一章必是「鸟瞰」开篇章**（2026-07-16 用户定，vLLM/vllm-ascend/Triton 皆如此）：`ch01` 为全书取景框——用最小示例低分辨率走通整条主线、建立心智模型、第一次点名沿途所有接缝，后续每章都是「放大进这张鸟瞰图的某一块」。kind=skip_impl（meta 概览、无精简版）。综合者产出大纲时**必须**把 ch01 设成鸟瞰章，缺则视为漏章。
+3. **★ 强制:出「全书地图」生成器**（2026-07-16 用户定）：综合阶段**必须**产出 `instances/<name>/book/assets/roadmap/roadmap.py`——把全书 Part 主线画成 SVG、`--highlight <键>` 高亮当前章所在 Part（每章开篇「你在这里」图复用它）。范本 = 既有实例的 `book/assets/roadmap/roadmap.py`（照搬 STAGES/ALIASES/CLI/视觉语言，只换本书 Part 内容）；派 illustrator 建，四种调用（章号/子系统键/Part 键/无参）跑通 + lint_diagram_geometry 过 + Read PNG 亲眼验。**无 roadmap.py，chapter-pipeline 的开篇 Roadmap 引用无图可指**。
+4. **⚠️ 强制：子系统覆盖交叉核对**（最易漏，vLLM-ascend 试点连栽四次：PD 分离 / 池化 / kv_offload / 310P 都是用户事后揪出的）：列源码**每个顶层子系统**，逐一确认"被某章 `key_source_paths` 覆盖 / 或显式点名入横切"，**未覆盖即漏章**。死盯易被低估的：PD 分离（proxy 调度 + **KV 亲和/命中路由**）、KV 池化/外存储、KV 卸载（host/CPU 分层）、芯片/硬件分代变体（如 310P，常是整套子类化）、网络加载——这些常被压成一章或漏掉。
+5. **★ 强制:论文/gap 侦察**（2026-07-15 用户定）：并行侦察四路——①源码内显式引用 ②tutorials/docs 引用 ③**无引用但算法有论文根基的机制（gap 点=primer 候选，最易漏）** ④姊妹篇侧。每条引用**联网核真**（web-verified / source-cited / unverified 三级，禁杜撰——台账有案底）；gap 点并入大纲成 primer 原理章 + prereq-box 先修框；产 `cartography/papers-inventory.json`。
+6. **路径核对**：每个 `key_source_paths`（及 `pairs_with` 的基座路径）在 source/ 真实存在。
+7. **配对脊柱**（姊妹篇）：每章钉一个对位基座章，正文对照基座说"顶替/扩展了哪一站"。
+8. **审批闸**：默认把 Part/章列表 + 覆盖核对 + 论文清单给用户批准后再发车；**若用户已豁免审批（如"查明后直接开工"），则论文/gap 核清、primer 并入后直接逐章发车**——豁免令记进 INSTANCE.md，别再回退到等审批。
 
 ## 1. 心智模型（一句话）
 真实源码是教材；analyst 把它读成 **dossier（唯一真相源）**；implementer 据此**只删不增**做可运行精简版；writer 以**真实源码为主线**写自包含章节；reviewer 协作式把关；archivist 持久化记忆。编排靠 **chapter-pipeline workflow**（并行+确定性+逃生舱），活体迭代靠我 + 命名 agent + SendMessage。
