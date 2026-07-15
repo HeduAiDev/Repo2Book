@@ -65,6 +65,21 @@ def canonical_prefix(name=None):
     return (config(name).get("source") or {}).get("canonical_prefix") or active_name()
 
 
+def canonical_prefixes(name=None):
+    """正文规范源码路径的**全部合法顶层根**（列表）。
+
+    单前缀仓（vLLM: 'vllm'）返回 ['vllm']；多根仓（Triton fork：源码分布在
+    python/ lib/ include/ third_party/ 等，无单一前缀）在 repo2book.json 的
+    source.canonical_prefixes 里列出真实顶层根。向后兼容：无该字段时退回
+    [canonical_prefix()]，故既有实例（vLLM）行为不变。
+    """
+    src = config(name).get("source") or {}
+    lst = src.get("canonical_prefixes")
+    if isinstance(lst, list) and lst:
+        return list(lst)
+    return [canonical_prefix(name)]
+
+
 if __name__ == "__main__":
     import sys
     key = sys.argv[1] if len(sys.argv) > 1 else "name"

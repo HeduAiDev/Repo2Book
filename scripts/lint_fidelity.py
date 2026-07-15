@@ -26,20 +26,21 @@ INVENTION_MARKERS = ("# ADDED", "# TOY", "# FAKE", "# INVENTED")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 try:
     import instance as _instance
-    _PREFIX = _instance.canonical_prefix()
-    _BASE_PREFIX = None
+    _SRC_PREFIXES = list(_instance.canonical_prefixes())
     try:
         _root = json.load(open(Path(__file__).resolve().parent.parent / "repo2book.json"))
         _dep = (_root.get("instances", {}).get(_instance.active_name(), {}) or {}).get("depends_on")
         if _dep:
-            _BASE_PREFIX = json.load(open(
+            _bsrc = json.load(open(
                 Path(__file__).resolve().parent.parent / "instances" / _dep / "repo2book.json"
-            )).get("source", {}).get("canonical_prefix") or _dep
+            )).get("source", {})
+            for _bp in (_bsrc.get("canonical_prefixes") or [_bsrc.get("canonical_prefix") or _dep]):
+                if _bp and _bp not in _SRC_PREFIXES:
+                    _SRC_PREFIXES.append(_bp)
     except Exception:
-        _BASE_PREFIX = None
+        pass
 except Exception:
-    _PREFIX, _BASE_PREFIX = "vllm", None
-_SRC_PREFIXES = [p for p in (_PREFIX, _BASE_PREFIX) if p]
+    _SRC_PREFIXES = ["vllm"]
 # 长前缀优先，避免 vllm 抢先匹配 vllm_ascend（其实前缀后强制 '/'，二者互斥，但仍按长度排序更稳）
 _SRC_REF_RE = re.compile(
     r"(?:" + "|".join(re.escape(p) for p in sorted(_SRC_PREFIXES, key=len, reverse=True)) + r")/[\w/]+\.py"

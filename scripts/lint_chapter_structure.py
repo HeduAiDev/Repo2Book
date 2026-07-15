@@ -17,16 +17,20 @@ import json as _json
 _PREFIXES = ["vllm", "csrc"]
 try:
     import instance as _instance
-    _p = _instance.canonical_prefix()
-    if _p and _p not in _PREFIXES:
-        _PREFIXES.append(_p)
+    # 多根仓（Triton fork：python/ lib/ include/ third_party/ …无单一前缀）走 canonical_prefixes；
+    # 单前缀仓（vLLM）退回 [canonical_prefix]，行为不变。
+    for _p in _instance.canonical_prefixes():
+        if _p and _p not in _PREFIXES:
+            _PREFIXES.append(_p)
     try:
         _root = _json.load(open(Path(__file__).resolve().parent.parent / "repo2book.json"))
         _dep = (_root.get("instances", {}).get(_instance.active_name(), {}) or {}).get("depends_on")
         if _dep:
-            _bp = _json.load(open(Path(__file__).resolve().parent.parent / "instances" / _dep / "repo2book.json")).get("source", {}).get("canonical_prefix") or _dep
-            if _bp and _bp not in _PREFIXES:
-                _PREFIXES.append(_bp)
+            _bsrc = _json.load(open(Path(__file__).resolve().parent.parent / "instances" / _dep / "repo2book.json")).get("source", {})
+            _bps = _bsrc.get("canonical_prefixes") or [_bsrc.get("canonical_prefix") or _dep]
+            for _bp in _bps:
+                if _bp and _bp not in _PREFIXES:
+                    _PREFIXES.append(_bp)
     except Exception:
         pass
 except Exception:

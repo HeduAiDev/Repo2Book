@@ -18,22 +18,24 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 try:
     import instance as _instance
-    _PREFIX = _instance.canonical_prefix()
-    # 姊妹篇：章节合法地同时引用本仓(vllm_ascend/)与对照基座(vllm/)源码，两者都算源码落点。
-    _BASE_PREFIX = None
+    # 多根仓走 canonical_prefixes（Triton：python/ lib/ include/ third_party/ …）；单前缀仓退回 [canonical_prefix]。
+    _SRC_PREFIXES = list(_instance.canonical_prefixes())
+    # 姊妹篇：章节合法地同时引用本仓与对照基座源码，两者都算源码落点。
     try:
         import json as _json
         _root = _json.load(open(Path(__file__).resolve().parent.parent / "repo2book.json"))
         _dep = (_root.get("instances", {}).get(_instance.active_name(), {}) or {}).get("depends_on")
         if _dep:
-            _BASE_PREFIX = _json.load(open(
+            _bsrc = _json.load(open(
                 Path(__file__).resolve().parent.parent / "instances" / _dep / "repo2book.json"
-            )).get("source", {}).get("canonical_prefix") or _dep
+            )).get("source", {})
+            for _bp in (_bsrc.get("canonical_prefixes") or [_bsrc.get("canonical_prefix") or _dep]):
+                if _bp and _bp not in _SRC_PREFIXES:
+                    _SRC_PREFIXES.append(_bp)
     except Exception:
-        _BASE_PREFIX = None
+        pass
 except Exception:
-    _PREFIX, _BASE_PREFIX = "vllm", None
-_SRC_PREFIXES = [p for p in (_PREFIX, _BASE_PREFIX) if p]
+    _SRC_PREFIXES = ["vllm"]
 
 
 def lint_source_grounding(chapter_dir: str) -> dict:
