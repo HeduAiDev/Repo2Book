@@ -1,0 +1,248 @@
+{
+  "chapter_id": "ch02",
+  "slug": "ch02-gpu-execution-model",
+  "kind": "primer",
+  "note": "primer 原理章。GPU 执行模型无学术论文——事实源是厂商编程指南(CUDA PG / Best Practices)+ MAPL 2019 tile 题名立论。全部 worked example 由 implementation/ 纯 Python 参考模型 host 直接跑(无需 CUDA),trace 存 traces/。三把性能判据尺(occupancy/coalescing/register spill)各给可心算的数值例。**校正**:dossier m07 note 写『尾块 512 元素』有误——N=98432,BLOCK=1024 时 96×1024=98304,尾块真实元素=98432-98304=128(与 m08 note『896 lane 被 mask、128 kept』一致);本文用实跑值 128。",
+
+  "symbol_table": [
+    {"symbol": "\\mathrm{occ}", "meaning": "占用率——每 SM 实际驻留的活跃 warp 数占硬件上限的比例;越高越能靠 warp 轮转藏住访存长延迟", "first_use": "占用率机制段(m05)首个 occupancy 公式", "source": "CUDA C++ Programming Guide — Hardware Implementation: Hardware Multithreading"},
+    {"symbol": "W_{a}", "meaning": "一个 SM 上同时驻留、可供调度器轮转的活跃 warp 数(occupancy 的分子)", "first_use": "占用率机制段(m05) occupancy 公式", "source": "CUDA C++ Programming Guide — Hardware Implementation: Hardware Multithreading"},
+    {"symbol": "W_{\\max}", "meaning": "一个 SM 硬件允许的最大驻留 warp 数(Ampere 级约 64)(occupancy 的分母)", "first_use": "占用率机制段(m05) occupancy 公式", "source": "CUDA C++ Programming Guide — Hardware Implementation: Hardware Multithreading"},
+    {"symbol": "R_{\\mathrm{sm}}", "meaning": "一个 SM 的寄存器堆总容量(Ampere 级约 65536 个 32-bit 寄存器),两道占用率闸门中『寄存器闸』的预算", "first_use": "占用率机制段(m05) 寄存器压制推导", "source": "CUDA C++ Programming Guide — Hardware Implementation: Hardware Multithreading"},
+    {"symbol": "r", "meaning": "编译器给 kernel 每个线程分配的寄存器数;它翻倍,可驻留线程/warp 减半——寄存器压制 occupancy 的旋钮", "first_use": "占用率机制段(m05) 寄存器压制推导", "source": "CUDA C++ Programming Guide — Hardware Implementation: Hardware Multithreading"},
+    {"symbol": "T_{\\max}", "meaning": "一个 SM 硬件允许的最大驻留线程数(Ampere 级约 2048,= 64 warp × 32 lane)", "first_use": "占用率机制段(m05) 寄存器压制推导", "source": "CUDA C++ Programming Guide — Hardware Implementation: Hardware Multithreading"},
+    {"symbol": "N", "meaning": "待处理向量的元素总数(vector-add 里 n_elements);它决定要启多少个并行 program", "first_use": "SPMD launch grid 段(m07) grid=cdiv(N,BLOCK_SIZE)", "source": "python/tutorials/01-vector-add.py:L63"},
+    {"symbol": "\\mathrm{BLOCK\\_SIZE}", "meaning": "一个 program 负责的 tile 大小(=一个 block 的逻辑线程数);vector-add 取 1024;是压 occupancy 的第一颗旋钮", "first_use": "SPMD tile 段(m02) 每 program 一个 tile", "source": "python/tutorials/01-vector-add.py:L32-L33"}
+  ],
+
+  "mechanisms": [
+    {
+      "mechanism_id": "m01-simt-hierarchy",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m01-simt-hierarchy",
+          "template": "layout",
+          "claim": "程序员在 Triton 只显式写到 program(=block/CTA/tile)这一层,再往下的 warp(32 lane 锁步)和 lane 是编译器与硬件替你切的——所以你的性能决策止于 tile,线程映射不由你手写。",
+          "numbers": [
+            {"label": "一个 warp 的 lane 数", "value": "32", "provenance": "traces/m01_simt.txt (warp_size)"},
+            {"label": "BLOCK=1024 切成的 warp 数", "value": "32", "provenance": "traces/m01_simt.txt (BLOCK=1024 -> 32 warps)"},
+            {"label": "warp0 的 lane 范围", "value": "0..31", "provenance": "traces/m01_simt.txt (warp0 lanes 0..31)"},
+            {"label": "warp1 的 lane 范围", "value": "32..63", "provenance": "traces/m01_simt.txt (warp1 lanes 32..63)"}
+          ],
+          "caption_draft": "SIMT 四层:grid → block(CTA) → warp(32 lane) → lane。Triton 的 tl.program_id 只给到 block 层(降级成 PTX %ctaid);一个 BLOCK=1024 的 block 被硬件切成 32 个 warp,同 warp 内 32 个 lane 锁步执行同一条指令。你写 tile,硬件铺线程。"
+        },
+        {
+          "figure_id": "fig-epiphany-head",
+          "template": "layout",
+          "claim": "GPU 上『快』与『慢』的落差一眼看尽:数据在执行层次里的位置(哪个 warp/lane)加上它在延迟金字塔里的层级(寄存器还是 HBM),共同决定这次访存是一次合并事务、还是几十次散落事务。",
+          "numbers": [
+            {"label": "warp lane 数", "value": "32", "provenance": "traces/m01_simt.txt (warp_size)"},
+            {"label": "寄存器延迟(cycle)", "value": "1", "provenance": "file:implementation/memory_hierarchy.py:L25 (register (1,1))"},
+            {"label": "全局显存延迟(cycle)", "value": "400-800", "provenance": "file:implementation/memory_hierarchy.py:L28 (global (400,800))"},
+            {"label": "连续访问的事务数", "value": "1", "provenance": "traces/m04_coalescing.txt (contiguous transactions)"},
+            {"label": "跨步 gather 的事务数", "value": "32", "provenance": "traces/m04_coalescing.txt (strided transactions)"}
+          ],
+          "caption_draft": "本章的顿悟头图:左侧是 grid→block→warp→lane 的执行层次,右侧是寄存器(~1 cycle)到全局显存(~400-800 cycle)的延迟金字塔,中间一支箭把两者接起来——同一 warp 的 32 个 lane 若落到连续对齐地址,金字塔最慢那层的一次访问被合并成 1 次事务;若地址散开,就是 32 次。occupancy/coalescing/spill 三把尺都从这张图长出来。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m02-spmd-tile-model",
+      "intuition": "把一条 256 元素的长向量当成一叠作业本发给 4 个完全相同的工人。每个工人拿到同一份工序单(同一段 kernel 代码),唯一的区别是手里的工号(program_id);工号一乘 BLOCK_SIZE,就知道自己该翻到第几页、连续做 64 道题。谁也不会碰别人那 64 页。",
+      "worked_example": {
+        "params": {"N": 256, "BLOCK_SIZE": 64, "grid_size": 4, "note": "01-vector-add.py L40 注释里的原例:长度 256、block 64 → 4 个 program 各拿 [0:64][64:128][128:192][192:256]"},
+        "trace_source": "run",
+        "trace_ref": "traces/m02_spmd_tile.txt",
+        "table": {
+          "columns": ["program_id", "block_start = pid×BLOCK", "负责的 offsets(半开区间)", "tile 长度", "说明"],
+          "rows": [
+            ["0", "0", "[0:64)", "64", "第 0 个 program 包下前 64 个元素"],
+            ["1", "64", "[64:128)", "64", "工号一变,起点整体平移 BLOCK"],
+            ["2", "128", "[128:192)", "64", "四份 tile 首尾相接、互不重叠"],
+            ["3", "192", "[192:256)", "64", "并集恰好铺满 [0:256)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "4 个 program 的 tile 两两不重叠,且并集恰好覆盖 [0, N)——没有元素漏算、没有元素被算两遍。",
+        "argument": "block_start(pid)=pid×BLOCK 是步长为 BLOCK 的严格递增序列,每个 tile 长恰好 BLOCK,故第 pid 个 tile [pid×BLOCK, (pid+1)×BLOCK) 的右端点 = 第 pid+1 个的左端点 → 相邻无缝、无叠;基例 pid=0 从 0 起,归纳到 pid=grid-1,并集 = [0, grid×BLOCK) ⊇ [0, N),超出 N 的部分由 mask(见 m08)削平。"
+      },
+      "quantified": "grid = cdiv(N, BLOCK) = cdiv(256, 64) = 4 个 program;每个 program 独立处理 BLOCK=64 个元素,总工作量 4×64 = 256 = N,零重复零遗漏。program 之间无通信、无同步——这就是 SPMD(单程序多数据)可无脑并行的根。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m02-spmd-tiling",
+          "template": "tiling",
+          "claim": "一条长度 256 的向量被切成 4 个连续 tile,program_id=0..3 各认领一块;这是『一个 program 处理一个 tile』的 SPMD tile 模型,不是『一个线程处理一个元素』。",
+          "numbers": [
+            {"label": "向量长度 N", "value": "256", "provenance": "traces/m02_spmd_tile.txt (N)"},
+            {"label": "BLOCK_SIZE", "value": "64", "provenance": "traces/m02_spmd_tile.txt (BLOCK)"},
+            {"label": "program 数(grid)", "value": "4", "provenance": "traces/m02_spmd_tile.txt (grid_size)"},
+            {"label": "program 2 的 tile", "value": "[128:192)", "provenance": "traces/m02_spmd_tile.txt (pid=2 offsets=[128:192])"}
+          ],
+          "caption_draft": "SPMD tile 切分:N=256、BLOCK=64 → 4 个 program。每个 program 靠 program_id×BLOCK 定位自己那 64 个连续元素,四块首尾相接铺满整条向量。程序员写的是 tile 级代码,编译器负责把 tile 铺到 warp/lane。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m03-memory-hierarchy-latency",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m03-latency-pyramid",
+          "template": "layout",
+          "claim": "内存层级是一座延迟金字塔:越靠顶端越快越小(寄存器 ~1 cycle),越往底端越慢越大(全局 HBM ~400-800 cycle),每下一层大致慢一个数量级——写快 kernel = 让数据尽量待在上层、让下层访问尽量少且合并。",
+          "numbers": [
+            {"label": "寄存器延迟", "value": "1", "provenance": "file:implementation/memory_hierarchy.py:L25 (register (1,1))"},
+            {"label": "共享内存(SMEM)延迟", "value": "20-30", "provenance": "file:implementation/memory_hierarchy.py:L26 (shared (20,30))"},
+            {"label": "L2 延迟", "value": "200", "provenance": "file:implementation/memory_hierarchy.py:L27 (l2 (200,200))"},
+            {"label": "全局显存(HBM)延迟", "value": "400-800", "provenance": "file:implementation/memory_hierarchy.py:L28 (global (400,800))"},
+            {"label": "寄存器↔全局的量级差", "value": "≥100", "provenance": "tests/test_memory_hierarchy.py (≥100x register↔global gap)"}
+          ],
+          "caption_draft": "内存延迟金字塔(Ampere 级数量级,架构相关):寄存器 ~1 → 共享内存 ~20-30 → L2 ~200 → 全局 HBM ~400-800 cycle。vector-add 里 tl.load/tl.store 摸的正是最底那层,所以既要把访问合并成尽量少的事务(见 coalescing),又要靠足够的 occupancy 把这几百 cycle 的长延迟藏在别的 warp 计算背后。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m04-coalescing",
+      "intuition": "一个 warp 的 32 个 lane 同时伸手取数,好比 32 个人同时下单送货。若他们要的货恰好在同一个货架的相邻格子(连续对齐地址),快递员一趟(一次 128 字节事务)就全带走;若 32 个人的货散在 32 个不同货架(跨步/gather),就得跑 32 趟——有效带宽掉到 1/32。vector-add 的 offsets 天生连续,永远是『一趟』。",
+      "worked_example": {
+        "params": {"warp_size": 32, "element_bytes": 4, "transaction_bytes": 128, "note": "一个 warp、fp32(4 字节),对比连续 offsets 与 stride=32 的 gather"},
+        "trace_source": "run",
+        "trace_ref": "traces/m04_coalescing.txt",
+        "table": {
+          "columns": ["访问模式", "warp 触及的字节地址", "落入的对齐段数 = 事务数", "有效带宽"],
+          "rows": [
+            ["连续(vector-add 的 offsets)", "0..124(32×4 = 128 字节,同一 128B 段)", "1", "满带宽(基准 1×)"],
+            ["跨步 gather(stride=32)", "0..3968(散落在 32 个不同段)", "32", "1/32 带宽"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "warp 一次访存的事务数 = 这 32 个地址落入的不同 128 字节对齐段的个数;连续对齐访问取到该数的下确界 1,地址越分散事务数单调越大、有效带宽成比例越小。",
+        "argument": "硬件把 addr 按 ⌊addr/128⌋ 归段,事务数 = 不同段号的基数(count_transactions 就是 len(set(⌊addr/128⌋)))。连续 32×fp32 = 128 字节恰好压进一个段 → 基数 1;stride=32 的 fp32 相邻地址差 128 字节,32 个地址落进 32 个不同段 → 基数 32。段数越多、每次事务搬的有用字节越少,有效带宽 = 1/事务数 单调递减。"
+      },
+      "quantified": "连续:32 lane × 4 字节 = 128 字节 = 恰好 1 次 128B 事务,带宽 100% 利用。跨步 gather(stride=32):同样 32 lane 却要 32 次事务,每次事务里只有 4 字节(1/32)是有用的 → 有效带宽 = 1/32 ≈ 3.125%。同一份数据,访存写法之差带来 32× 的带宽落差——这就是『相邻线程必须访问相邻地址才快』的机器成因。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m04-coalescing",
+          "template": "before-after",
+          "claim": "同一个 warp 的 32 次访存,连续对齐时被硬件合并成 1 次 128 字节事务,跨步 gather 时炸成 32 次事务——有效带宽差 32 倍,而代码差别只是 offsets 连不连续。",
+          "numbers": [
+            {"label": "warp lane 数", "value": "32", "provenance": "traces/m04_coalescing.txt (warp_size)"},
+            {"label": "连续访问事务数", "value": "1", "provenance": "traces/m04_coalescing.txt (contiguous transactions)"},
+            {"label": "连续访问字节数", "value": "128", "provenance": "traces/m04_coalescing.txt (bytes_touched 128)"},
+            {"label": "跨步 gather 事务数", "value": "32", "provenance": "traces/m04_coalescing.txt (strided transactions)"},
+            {"label": "带宽落差", "value": "1/32", "provenance": "traces/m04_coalescing.txt (bandwidth 1/32)"}
+          ],
+          "caption_draft": "合并访存对比:左(连续 offsets)32 个 lane 的地址 0..124 全落在一个 128 字节段 → 1 次事务、满带宽;右(stride=32 gather)32 个地址散落 0..3968、落进 32 个段 → 32 次事务、有效带宽仅 1/32。vector-add 的 offsets=block_start+arange 天然是左边这种。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m05-occupancy",
+      "intuition": "一个 SM 像一间只有固定几排储物柜(寄存器堆)的教室。每个学生(线程)占的储物柜越多,能同时坐进教室的学生就越少。占用率 occupancy 就是『教室坐了几成满』——坐得越满,某个学生等快递(等 HBM)时,老师(调度器)越有别的学生可教,长延迟就被别人的计算盖住了。",
+      "worked_example": {
+        "params": {"max_registers_per_sm": 65536, "max_threads_per_sm": 2048, "max_warps_per_sm": 64, "note": "Ampere 级数量级:64K 寄存器/SM、2048 线程=64 warp/SM。扫每线程 32/64/128 寄存器"},
+        "trace_source": "run",
+        "trace_ref": "traces/m05_occupancy.txt",
+        "table": {
+          "columns": ["每线程寄存器 r", "可驻留线程数 = 65536 / r", "可驻留 warp 数", "occupancy"],
+          "rows": [
+            ["32", "2048", "64", "100%(满)"],
+            ["64", "1024", "32", "50%"],
+            ["128", "512", "16", "25%"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "在寄存器闸门主导时,occupancy 关于每线程寄存器数 r 单调不增:r 翻倍,可驻留线程(进而 warp)数减半,直到触及每 block 的下界。",
+        "argument": "可驻留线程数 = min(T_max, ⌊R_sm / r⌋)。当 r 使 R_sm/r < T_max 时,该项 = R_sm/r 随 r 单调递减;occupancy = 可驻留线程 / T_max 因此随 r 单调递减。代入 R_sm=65536、T_max=2048:r=32 → 2048(封顶,100%);r=64 → 1024(50%);r=128 → 512(25%)——每翻倍即减半。"
+      },
+      "quantified": "寄存器闸:r=32→100%、r=64→50%、r=128→25% occupancy,寄存器用量翻倍则可驻留 warp 减半。但 occupancy 取『寄存器闸』与『共享内存闸』的下确界:一个 32 寄存器(寄存器闸=100%)、每 block 用 49152 字节共享内存、256 线程/block 的 kernel,共享内存只放得下 3 个 block → 768 线程 → occupancy_by_shared_memory ≈ 0.375(约 38%),两闸取 min 后被共享内存卡在 ≈38%。谁小谁说了算。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m05-occupancy-registers",
+          "template": "state-table",
+          "claim": "每线程寄存器用量翻倍,一个 SM 能同时驻留的 warp 就减半,occupancy 从 100% 跌到 50% 再到 25%——这是『寄存器压制占用率』的量化本体。",
+          "numbers": [
+            {"label": "SM 寄存器堆容量", "value": "65536", "provenance": "traces/m05_occupancy.txt (max_registers_per_sm)"},
+            {"label": "r=32 → occupancy", "value": "100", "provenance": "traces/m05_occupancy.txt (32 regs -> 100%)"},
+            {"label": "r=64 → occupancy", "value": "50", "provenance": "traces/m05_occupancy.txt (64 regs -> 50%)"},
+            {"label": "r=128 → occupancy", "value": "25", "provenance": "traces/m05_occupancy.txt (128 regs -> 25%)"},
+            {"label": "共享内存闸主导时", "value": "38", "provenance": "traces/m05_occupancy.txt (smem-bound -> 38%)"}
+          ],
+          "caption_draft": "占用率随每线程寄存器数的变化(Ampere 级 64K 寄存器、2048 线程/SM):r=32→100%、64→50%、128→25%,寄存器翻倍 occupancy 减半。右侧提醒:occupancy 取寄存器闸与共享内存闸的较小者——共享内存吃紧的 kernel(如每 block 48KiB)会被卡到 ≈38%,与寄存器无关。这是全书第一把性能判据尺。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m06-register-spill",
+      "intuition": "寄存器堆是桌面,只放得下 32 样常用工具。kernel 若同时要 40 样,多出的 8 样只能塞进楼下仓库(local memory)——名字叫『local』听着近,其实那仓库就在城外的 DRAM。每次要用这 8 样就得跑一趟城外:本来 ~1 cycle 拿到的东西,变成 ~400-800 cycle。",
+      "worked_example": {
+        "params": {"register_budget_per_thread": 32, "reg_latency_cycles": "1", "global_latency_cycles": "400-800", "note": "预算 32 寄存器/线程,扫 kernel 需求 32/40/64"},
+        "trace_source": "run",
+        "trace_ref": "traces/m06_spill.txt",
+        "table": {
+          "columns": ["kernel 需求寄存器", "预算", "溢出数 = max(0, 需求−预算)", "溢出变量的访问延迟", "相对寄存器"],
+          "rows": [
+            ["32", "32", "0", "无溢出(全部 ~1 cycle)", "1×"],
+            ["40", "32", "8", "~400–800 cycle", "~600×"],
+            ["64", "32", "32", "~400–800 cycle", "~600×"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "溢出寄存器数 = max(0, 需求 − 预算),关于需求单调非降;一旦溢出 > 0,那些变量的每次访问延迟就从寄存器层的 ~1 cycle 塌回全局层的 ~400-800 cycle。",
+        "argument": "spilled = max(0, needed − budget):needed ≤ budget 时为 0(基例),needed 每增 1、spilled 增 1(归纳步),故单调非降。物理上溢出的变量落在 local memory,而 local memory 就在 device DRAM,延迟等同全局访问——effective_access_cycles 里溢出访问取的正是 global 层区间 (400, 800),相对寄存器 (1,1) 的中点比为 600×。"
+      },
+      "quantified": "预算 32、需求 40 → 溢出 8 个寄存器;这 8 个变量每次访问从 ~1 cycle 变 ~400-800 cycle(中点计约 600×)。这就与 occupancy 形成一对张力:少用寄存器(小 r)能提 occupancy,但压到 kernel 真实需求以下就触发 spill,把省下的收益连本带利赔进全局延迟。两把尺要一起量。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m07-grid-launch-cdiv",
+      "intuition": "要把 N 个元素按每袋 BLOCK 个装箱,袋数不能向下取整——最后剩几个也得再开一袋。cdiv(向上取整除)就是『宁可多开一袋兜住零头』:grid = cdiv(N, BLOCK) 决定发射多少个并行 program,一个都不能少,否则尾巴上的元素没人算。",
+      "worked_example": {
+        "params": {"BLOCK": 1024, "note": "01-vector-add benchmark 尺寸 N=98432,及几个对照尺寸;cdiv=(N+BLOCK-1)//BLOCK"},
+        "trace_source": "run",
+        "trace_ref": "traces/m07_cdiv.txt",
+        "table": {
+          "columns": ["N", "grid = cdiv(N, 1024)", "满块数", "尾块真实元素", "整除?"],
+          "rows": [
+            ["98432", "97", "96", "128", "否(多开 1 个 program 兜零头)"],
+            ["98304", "96", "96", "0", "是(恰好整除)"],
+            ["1025", "2", "1", "1", "否(多 1 个元素也要多 1 个 program)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "grid = cdiv(N, BLOCK) 是能覆盖 [0, N) 的最小 program 数:grid×BLOCK ≥ N,且 (grid−1)×BLOCK < N(去掉任一个 program 就会漏算尾块)。",
+        "argument": "cdiv(N,BLOCK) = (N+BLOCK−1)//BLOCK = ⌈N/BLOCK⌉。由天花板函数定义,⌈N/BLOCK⌉ 是满足 g×BLOCK ≥ N 的最小整数 g,故 grid×BLOCK ≥ N(覆盖完整)、(grid−1)×BLOCK < N(不多余)。代入 N=98432、BLOCK=1024:96×1024=98304 < 98432 ≤ 97×1024=99328 → grid=97,其中 96 个满块 + 1 个只含 128 个真实元素的尾块。"
+      },
+      "quantified": "N=98432、BLOCK=1024 → grid=97 = 96 个满块(各 1024 元素)+ 1 个尾块(仅 128 个真实元素)。grid 大小是硬件要跑的 block(CTA)数上界;它们被映射到有限的 SM 上轮转,而不是 97 个 block 全同时跑——这也是为什么单看 grid 大不代表占满硬件,还要看 occupancy。"
+      ,
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m08-mask-bounds",
+      "intuition": "尾块那个 program 手里的 1024 个工号里,有一批(896 个)对应的元素其实超出了向量末尾。mask = offsets < N 就是一张出入证:证件为真的 lane 正常读写,为假的 lane 原地站住、不发任何访存——不是绕路(分支),是被『预测执行』直接摁住。这样越界地址永远不会被碰。",
+      "worked_example": {
+        "params": {"N": 98432, "BLOCK": 1024, "pid": 96, "note": "N=98432 的尾块 program(pid=96):block_start=98304,offsets 98304..99327"},
+        "trace_source": "run",
+        "trace_ref": "traces/m08_mask.txt",
+        "table": {
+          "columns": ["lane 序号", "offset = block_start + lane", "offset < N ?", "mask", "动作"],
+          "rows": [
+            ["127", "98431", "98431 < 98432 → 真", "True", "读/写(最后一个有效元素)"],
+            ["128", "98432", "98432 < 98432 → 假", "False", "跳过,不发访存(预测执行摁住)"],
+            ["合计", "98304..99327", "阈值在 lane 128", "128 kept / 896 masked", "尾块 1024 个 lane 里 896 个被守掉"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "mask 恰好保留 offset < N 的 lane、丢弃其余;因 offset 随 lane 严格递增,存在唯一阈值 lane*,lane < lane* 全保留、lane ≥ lane* 全丢弃,越界读写永不发生。",
+        "argument": "offset(lane) = block_start + lane 关于 lane 严格递增,故谓词 offset < N 是一个单调阶跃:一旦某 lane 使 offset ≥ N,其后所有 lane 亦然。阈值 lane* = N − block_start = 98432 − 98304 = 128 → lane 0..127(128 个)保留、lane 128..1023(896 个)丢弃。保留数 = N − block_start = 128,与实跑 kept=128、masked=896 一致。"
+      },
+      "quantified": "尾块 pid=96:block_start=98304,1024 个 lane 中 offset ≥ 98432 的有 896 个被 mask 掉,只有 128 个真正访存——正好等于 m07 里那个尾块的 128 个真实元素。cdiv(向上取整多开一袋)与 mask(袋里越界的摁住)是一对搭档:前者保证不漏算,后者保证不越界。这也是后续 boundary_check 的直觉起点。",
+      "figure_specs": []
+    }
+  ]
+}

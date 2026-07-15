@@ -1,0 +1,326 @@
+{
+  "kind": "primer",
+  "chapter_id": "ch02",
+  "slug": "ch02-gpu-execution-model",
+  "one_line": "自包含地基 primer——把 GPU 执行模型（SIMT 层次 + 内存延迟金字塔 + 为什么相邻地址才合并）铸成读者脑中的一张图，交出贯穿全书的三把性能判据尺：occupancy、coalescing、register spill。锚点用读者在 ch01 已见过的 01-vector-add。",
+  "paper_grounding_note": "GPU 执行模型本体【无学术论文】——事实源是厂商编程指南（PTX ISA / CUDA C++ Programming Guide / CUDA Best Practices Guide）。tile 立论引 Triton MAPL 2019（DOI:10.1145/3315508.3329973，用 doi.org URL 形式过 lint_dossier 的 PAPER_ID 正则；只引题名/立论、不引不存在的节号——遵 ch01 教训禁杜撰锚点）。CUDA/PTX 文档的 sections 用【真实存在的节标题】（Thread Hierarchy / Memory Hierarchy / SIMT Architecture / Hardware Multithreading / Coalesced Access / Local Memory），非杜撰编号。内存延迟只给【真实数量级】并注明架构相关。延迟量级的实测佐证在 §3 以先修框引 arXiv:1804.06826（Volta 微基准测量，评审第 1 轮 web-核实真实在题；正文注明『你不需要读它』，只取量级、绝对值随架构变化）——补登于此及 book/papers/ch02-gpu-execution-model/meta.json（role=latency-evidence），消除游离引用。",
+  "missing_paper_md_flag": "book/papers/ch02-gpu-execution-model/paper.md 尚未落盘（目录仅有 meta.json，两篇均 status=to-fetch）。本 primer 的事实基础是厂商编程指南 + MAPL 2019 题名立论，均在 meta.json 以真实 DOI/URL 登记，故不阻断建档；但若 Lead 希望正文内嵌 MAPL 2019 的 tile 原文段落/图，需先 WebFetch 落盘 paper.md。已在返回 note 中提示。",
+  "code_spine": [
+    "python/tutorials/01-vector-add.py:L27-L52  add_kernel —— 一个 program 处理一个 tile：program_id 取『我是谁』→ block_start=pid*BLOCK_SIZE → offsets=block_start+arange(0,BLOCK_SIZE)（连续偏移，合并访存的第一现场）→ mask 守边界 → load/store",
+    "python/tutorials/01-vector-add.py:L60-L76  add() 主机侧 —— grid=cdiv(n_elements,BLOCK_SIZE) 定 program 数（SPMD launch grid）；BLOCK_SIZE=1024 传成 constexpr",
+    "python/triton/__init__.py:L59-L60         cdiv —— 向上取整分块，决定 grid 大小（覆盖不整除尾块）",
+    "python/triton/language/core.py:L1148-L1163 program_id —— SPMD 里区分实例的唯一手段；semantic 落成 create_get_program_id(axis)（→PTX %ctaid，即硬件 block/CTA 索引）",
+    "python/triton/language/core.py:L1184-L1200 arange —— 半开区间 [start,end) 连续整数张量；本章用它生成 tile 内的连续 lane 偏移（合并访存的成因）",
+    "python/triton/language/core.py:L134-L146   constexpr —— 编译期常量；BLOCK_SIZE 走这条路才能当 shape/被特化（承 ch01 性能分水岭）",
+    "python/triton/language/core.py:L1580-L1636 load —— 带 mask 的张量取数；mask[idx]=false 则不取该地址（越界守卫 + 预测执行）",
+    "python/triton/language/core.py:L1664-L1699 store —— 带 mask 的张量写回；同样 mask 守越界"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "python/tutorials/01-vector-add.py",
+      "lines": "L27-L52",
+      "what": "整个 add_kernel。primer 用它做锚点：program_id/block_start/offsets/mask/load/store 一次点齐——每一行都对应一个 GPU 执行模型概念。",
+      "code": "@triton.jit\ndef add_kernel(x_ptr,  # *Pointer* to first input vector.\n               y_ptr,  # *Pointer* to second input vector.\n               output_ptr,  # *Pointer* to output vector.\n               n_elements,  # Size of the vector.\n               BLOCK_SIZE: tl.constexpr,  # Number of elements each program should process.\n               # NOTE: `constexpr` so it can be used as a shape value.\n               ):\n    # There are multiple 'programs' processing different data. We identify which program\n    # we are here:\n    pid = tl.program_id(axis=0)  # We use a 1D launch grid so axis is 0.\n    # This program will process inputs that are offset from the initial data.\n    # For instance, if you had a vector of length 256 and block_size of 64, the programs\n    # would each access the elements [0:64, 64:128, 128:192, 192:256].\n    # Note that offsets is a list of pointers:\n    block_start = pid * BLOCK_SIZE\n    offsets = block_start + tl.arange(0, BLOCK_SIZE)\n    # Create a mask to guard memory operations against out-of-bounds accesses.\n    mask = offsets < n_elements\n    # Load x and y from DRAM, masking out any extra elements in case the input is not a\n    # multiple of the block size.\n    x = tl.load(x_ptr + offsets, mask=mask)\n    y = tl.load(y_ptr + offsets, mask=mask)\n    output = x + y\n    # Write x + y back to DRAM.\n    tl.store(output_ptr + offsets, output, mask=mask)",
+      "elide": []
+    },
+    {
+      "path": "python/tutorials/01-vector-add.py",
+      "lines": "L60-L76",
+      "what": "主机侧 add()：SPMD launch grid 的定义处。grid=cdiv(n_elements,BLOCK_SIZE) 决定并行 program 数；BLOCK_SIZE=1024 以 constexpr 传入。",
+      "code": "def add(x: torch.Tensor, y: torch.Tensor):\n    # We need to preallocate the output.\n    output = torch.empty_like(x)\n    assert x.is_cuda and y.is_cuda and output.is_cuda\n    n_elements = output.numel()\n    # The SPMD launch grid denotes the number of kernel instances that run in parallel.\n    # It is analogous to CUDA launch grids. It can be either Tuple[int], or Callable(metaparameters) -> Tuple[int].\n    # In this case, we use a 1D grid where the size is the number of blocks:\n    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )\n    # NOTE:\n    #  - Each torch.tensor object is implicitly converted into a pointer to its first element.\n    #  - `triton.jit`'ed functions can be indexed with a launch grid to obtain a callable GPU kernel.\n    #  - Don't forget to pass meta-parameters as keywords arguments.\n    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)\n    # We return a handle to z but, since `torch.cuda.synchronize()` hasn't been called, the kernel is still\n    # running asynchronously at this point.\n    return output",
+      "elide": []
+    },
+    {
+      "path": "python/triton/__init__.py",
+      "lines": "L59-L60",
+      "what": "cdiv 的真身：整数向上取整。grid=cdiv(N,BLOCK) 保证最后一个不整除的尾块也有一个 program 兜住（配合 kernel 内 mask 守越界）。",
+      "code": "def cdiv(x: int, y: int):\n    return (x + y - 1) // y",
+      "elide": []
+    },
+    {
+      "path": "python/triton/language/core.py",
+      "lines": "L1148-L1163",
+      "what": "program_id 原语。它是 SPMD『我是第几个实例』的唯一来源；下行 semantic.program_id 落成 create_get_program_id(axis)（→ PTX %ctaid，硬件 CTA/block 索引）。省略的多轴合并注释块保留原样。",
+      "code": "def program_id(axis, _builder=None):\n    \"\"\"\n    Returns the id of the current program instance along the given :code:`axis`.\n\n    :param axis: The axis of the 3D launch grid. Must be 0, 1 or 2.\n    :type axis: int\n    \"\"\"\n    # if axis == -1:\n    #     pid0 = program_id(0, _builder)\n    #     pid1 = program_id(1, _builder)\n    #     pid2 = program_id(2, _builder)\n    #     npg0 = num_programs(0, _builder)\n    #     npg1 = num_programs(1, _builder)\n    #     return pid0 + pid1*npg0 + pid2*npg0*npg1\n    axis = _constexpr_to_value(axis)\n    return semantic.program_id(axis, _builder)",
+      "elide": [
+        "注释掉的 axis==-1 分支是历史多轴线性化，正文可略——只讲『每 axis 返回该维实例 id』即可"
+      ]
+    },
+    {
+      "path": "python/triton/language/semantic.py",
+      "lines": "L28-L31",
+      "what": "program_id 的降级落点：create_get_program_id(axis)。用来给正文一个『Python 原语 → 硬件 block 索引』的确凿证据（axis 限 0/1/2 = 3D grid）。",
+      "code": "def program_id(axis: int, builder: ir.builder) -> tl.tensor:\n    if axis not in (0, 1, 2):\n        raise ValueError(f\"program_id axis must be 0, 1, or 2 but got {axis}\")\n    return tl.tensor(builder.create_get_program_id(axis), tl.int32)",
+      "elide": []
+    },
+    {
+      "path": "python/triton/language/core.py",
+      "lines": "L1184-L1200",
+      "what": "arange 原语 + 其 docstring（半开区间 [start,end)、start/end 须为 2 的幂）。tl.arange(0,BLOCK_SIZE) 生成 tile 内连续偏移——正文用它解释『为什么相邻 lane 落到相邻地址』。",
+      "code": "def arange(start, end, _builder=None):\n    start = _constexpr_to_value(start)\n    end = _constexpr_to_value(end)\n    return semantic.arange(start, end, _builder)\n\n\narange.__doc__ = f\"\"\"\n    Returns contiguous values within the half-open interval :code:`[start,\n    end)`.  :code:`end - start` must be less than or equal to\n    :code:`TRITON_MAX_TENSOR_NUMEL = {TRITON_MAX_TENSOR_NUMEL}`\n\n    :param start: Start of the interval. Must be a power of two.\n    :type start: int32\n    :param end: End of the interval. Must be a power of two greater than\n        :code:`start`.\n    :type end: int32\n\"\"\"",
+      "elide": [
+        "省略 @builtin 装饰器行；正文只需 arange 语义"
+      ]
+    },
+    {
+      "path": "python/triton/language/core.py",
+      "lines": "L134-L146",
+      "what": "constexpr 类：编译期已知值。承 ch01——BLOCK_SIZE: tl.constexpr 才能当 shape、被特化；这是 occupancy/向量化决策的编译期入口。",
+      "code": "class constexpr:\n    \"\"\"\n    This class is used to store a value that is known at compile-time.\n    \"\"\"\n\n    def __init__(self, value):\n        if isinstance(value, constexpr):\n            self.value = value.value\n        else:\n            self.value = value\n\n    def __repr__(self) -> str:\n        return f\"constexpr[{self.value}]\"",
+      "elide": [
+        "省略后续大量算术 dunder（__add__/__mul__ 等）——正文只需『编译期常量』这一语义"
+      ]
+    },
+    {
+      "path": "python/triton/language/core.py",
+      "lines": "L1580-L1636",
+      "what": "load 原语签名 + mask 语义（mask[idx]=false 则不取该地址）。docstring 里 cache_modifier 直接指向 NVIDIA PTX cache operators 文档——primer 引它坐实『Triton 原语一路通到 PTX 内存指令』。正文只嵌签名 + mask/其余关键段，body 大段可略。",
+      "code": "def load(pointer, mask=None, other=None, boundary_check=(), padding_option=\"\", cache_modifier=\"\", eviction_policy=\"\",\n         volatile=False, _builder=None):\n    \"\"\"\n    Return a tensor of data whose values are loaded from memory at location defined by `pointer`:\n\n        (2) If `pointer` is an N-dimensional tensor of pointers, an\n            N-dimensional tensor is loaded.  In this case:\n\n            - `mask` and `other` are implicitly broadcast to `pointer.shape`,\n            ...\n\n    :param mask: if `mask[idx]` is false, do not load the data at address `pointer[idx]`\n    :param cache_modifier: changes cache option in NVIDIA PTX\n        ... cache operator <https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#cache-operators>\n    \"\"\"",
+      "elide": [
+        "嵌入时已用 ... 标注省略：case (1)/(3) 说明、other/boundary_check/padding/eviction 等次要参数文档、以及 body 的 _constexpr_to_value 处理段——正文只需 mask 语义 + PTX cache 指向"
+      ]
+    }
+  ],
+  "key_classes": [
+    {
+      "name": "constexpr",
+      "file": "python/triton/language/core.py",
+      "responsibility": "编译期已知值的载体；BLOCK_SIZE 走这条路才能当 tile 形状/被编译器特化（承 ch01，本章只需概念）"
+    },
+    {
+      "name": "program_id (builtin)",
+      "file": "python/triton/language/core.py",
+      "responsibility": "返回当前 program 实例在给定 axis 上的 id——SPMD 里区分『我是谁』的唯一手段"
+    },
+    {
+      "name": "arange (builtin)",
+      "file": "python/triton/language/core.py",
+      "responsibility": "生成半开区间连续整数张量；tile 内连续偏移的来源，合并访存的成因"
+    },
+    {
+      "name": "load / store (builtin)",
+      "file": "python/triton/language/core.py",
+      "responsibility": "带 mask 的张量级取/存；mask 守越界，cache_modifier 通向 PTX cache operators"
+    },
+    {
+      "name": "cdiv",
+      "file": "python/triton/__init__.py",
+      "responsibility": "向上取整分块；决定 SPMD launch grid 的 program 数（覆盖不整除尾块）"
+    }
+  ],
+  "data_flow": [
+    "① 主机侧 add() 算 n_elements，定 grid = cdiv(n_elements, BLOCK_SIZE)：这就是 SPMD launch grid——启多少个并行 program（对应硬件多少个 block/CTA）",
+    "② add_kernel[grid](...) 发射：每个 program 是同一段代码的一个实例（SPMD），靠 program_id 区分身份",
+    "③ kernel 内 pid = program_id(0)；block_start = pid*BLOCK_SIZE：本 program 负责 [block_start, block_start+BLOCK_SIZE) 这一 tile",
+    "④ offsets = block_start + arange(0, BLOCK_SIZE)：tile 内连续偏移。一个 block 的 BLOCK_SIZE 个『逻辑线程』被硬件切成 warp（32 lane/warp），相邻 lane 拿到相邻 offset",
+    "⑤ mask = offsets < n_elements：不整除的尾块里越界 lane 被 mask 掉，不发访存",
+    "⑥ load(x_ptr+offsets, mask)：一个 warp 的 32 个相邻 fp32 地址 = 128 字节，硬件合并成一次访存事务（coalescing）",
+    "⑦ output = x + y 在寄存器里算；store(output_ptr+offsets, output, mask) 写回全局显存，同样合并",
+    "⑧ 性能账：这条访存路径每层踩在内存延迟金字塔上——寄存器 ~1 cycle / 共享内存 ~20–30 / L2 ~200 / 全局 HBM ~400–800（数量级，架构相关）；能藏住 HBM 延迟靠 occupancy 够高（够多 warp 轮转），occupancy 又被每线程寄存器数与每 block 共享内存挤压——寄存器不够就 spill 到 local memory（其实在 DRAM），延迟塌回全局级别"
+  ],
+  "design_decisions": [
+    {
+      "decision": "一个 Triton program 处理一个 tile（BLOCK_SIZE 个元素），而非一个线程处理一个元素",
+      "why": "tile 是 Triton 编程模型与 IR 的基本单位（MAPL 2019 立论）：程序员写 tile 级代码，编译器负责把 tile 铺到 warp/lane、自动做合并访存与共享内存——程序员不手写线程索引",
+      "evidence": "python/tutorials/01-vector-add.py:L42-L43 (block_start/offsets)；MAPL 2019 题名立论"
+    },
+    {
+      "decision": "用 program_id 而非线程 id 作为身份",
+      "why": "SPMD 抽象：所有 program 跑同一段码，program_id 是唯一分叉点；降级为 PTX %ctaid（block 索引），把『线程』这一层藏进 tile 内部由编译器管理",
+      "evidence": "python/triton/language/core.py:L1148-L1163 → python/triton/language/semantic.py:L28-L31 create_get_program_id"
+    },
+    {
+      "decision": "offsets 用 block_start + arange(0,BLOCK_SIZE) 的连续形式",
+      "why": "连续偏移让相邻 lane 落到相邻地址——这正是合并访存成立的前提；若换成跨步/gather 就退化成多次事务，带宽掉数倍",
+      "evidence": "python/tutorials/01-vector-add.py:L43；CUDA Best Practices Coalesced Access"
+    },
+    {
+      "decision": "grid=cdiv(N,BLOCK) 且 kernel 内 mask=offsets<n_elements 双保险",
+      "why": "N 通常不是 BLOCK_SIZE 整数倍；cdiv 向上取整保证尾块有 program 覆盖，mask 保证越界 lane 不读/写非法地址——正确性护栏，也是后续 boundary_check 的直觉起点",
+      "evidence": "python/triton/__init__.py:L59-L60；python/tutorials/01-vector-add.py:L45-L52"
+    },
+    {
+      "decision": "BLOCK_SIZE 用 tl.constexpr",
+      "why": "承 ch01：编译期常量才能当 shape、被特化（消分支/展开/向量化）；BLOCK_SIZE 还直接决定每 block 资源占用，进而影响 occupancy——它是性能旋钮的第一颗",
+      "evidence": "python/tutorials/01-vector-add.py:L32-L33；python/triton/language/core.py:L134-L146"
+    }
+  ],
+  "theory": [
+    "【SIMT 层次】grid → block(CTA) → warp(32 lane) → lane。程序员在 Triton 只显式写到 program(=block/tile) 一层；warp/lane 由编译器与硬件管理。一个 block 的 BLOCK_SIZE 个逻辑线程按 32 一组切成 warp，warp 是硬件调度与 SIMT 执行的最小单位（同 warp 内 32 lane 锁步执行同一指令，分叉走预测执行/mask）。",
+    "【内存延迟金字塔（真实数量级，架构相关）】寄存器 ~1 cycle；共享内存(SMEM) ~20–30 cycle；L2 ~200 cycle；全局显存(HBM/DRAM) ~400–800 cycle。核心直觉落差：越靠上越快越小，越靠下越慢越大。写快 kernel = 让数据尽量待在上层、让下层访问尽量少且合并。",
+    "【合并访存 coalescing】同一 warp 的 32 个 lane 若访问一段连续对齐地址（如 32×fp32=128 字节），硬件把它并成【一次】128 字节内存事务；若地址分散（跨步/gather），退化成多次事务，有效带宽掉到 1/k。这就是『相邻线程必须访问相邻地址才快』的机器成因——vector-add 的 offsets 连续，天然合并。",
+    "【占用率 occupancy】occupancy = 每 SM 活跃 warp 数 / 每 SM 最大 warp 数。它衡量『有多少 warp 能同时驻留、供硬件轮转以藏住访存延迟』。活跃 warp 数被两道闸压制：(a) 寄存器——每 SM 寄存器总数 / (每线程寄存器数 × warp 尺寸)；(b) 共享内存——每 SM 共享内存 / 每 block 共享内存。取两闸的下确界。低 occupancy → 没有足够 warp 轮转 → HBM 长延迟暴露 → 停顿。",
+    "【occupancy 数值例（Ampere 级数量级：64K 32-bit 寄存器/SM，最大 2048 线程=64 warp/SM）】每线程 32 寄存器 → 65536/32=2048 线程=64 warp=100% occupancy；每线程 64 寄存器 → 1024 线程=32 warp=50%；每线程 128 寄存器 → 512 线程=16 warp=25%。结论：寄存器用量翻倍，可驻留 warp 减半——这是『寄存器压制 occupancy』的量化本体（具体上限随架构变，量级如此）。",
+    "【寄存器溢出 register spill】当 kernel 每线程需要的寄存器超过硬件/编译器上限，多出的变量被 spill 到 local memory——名字叫 local，物理上在 DRAM（有 L1/L2 缓存兜底）。代价：一次寄存器访问 ~1 cycle 的量级，塌回全局显存量级；且 spill 挤占的往往是热路径变量，双重伤害。所以『少用寄存器提 occupancy』与『别 spill』是一对需要平衡的力。",
+    "【tile 抽象的立论（MAPL 2019）】Triton 把静态形状的多维子数组(tile)作为程序与 IR 的基本单位：程序员写 tile 级 SPMD 代码，编译器承担线程映射、合并访存、共享内存分配等本该手写的苦活。本章三把尺（occupancy/coalescing/spill）正是编译器替你做这些决策时的评判标准——后续布局/AxisInfo+Coalesce/共享内存分配/后端 occupancy 各章都拿这套模型来量。"
+  ],
+  "mechanisms": [
+    {
+      "id": "m01-simt-hierarchy",
+      "name": "SIMT 执行层次 grid→block(CTA)→warp(32 lane)→lane",
+      "kind": "layout",
+      "source_anchors": [
+        "python/tutorials/01-vector-add.py:L37-L43",
+        "python/triton/language/semantic.py:L28-L31"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "paper_origin": {
+        "paper": "https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html",
+        "sections": [
+          "Thread Hierarchy",
+          "Hardware Implementation: SIMT Architecture"
+        ]
+      },
+      "note": "顿悟头图主成分之一。Triton 只显式写到 program(block/tile)；warp/lane 由编译器+硬件管理。program_id→PTX %ctaid 是硬件 block 索引的确证。"
+    },
+    {
+      "id": "m02-spmd-tile-model",
+      "name": "SPMD tile 模型——一个 program 处理一个 tile，program_id 分身份",
+      "kind": "dataflow",
+      "source_anchors": [
+        "python/tutorials/01-vector-add.py:L37-L43",
+        "python/triton/language/core.py:L1148-L1163"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {
+        "paper": "https://doi.org/10.1145/3315508.3329973",
+        "sections": [
+          "Title & Abstract: tiled program + tiled IR thesis (题名立论，不引编号节)"
+        ]
+      },
+      "note": "MAPL 2019 tile 立论的落地锚点。worked example：N=256,BLOCK=64 → 4 个 program 各拿 [0:64][64:128][128:192][192:256]（源码注释 L40 原文即此例）。承 ch01 SPMD/program_id。"
+    },
+    {
+      "id": "m03-memory-hierarchy-latency",
+      "name": "内存延迟金字塔 寄存器/共享内存/L2/全局显存",
+      "kind": "layout",
+      "source_anchors": [
+        "python/tutorials/01-vector-add.py:L48-L52"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "paper_origin": {
+        "paper": "https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html",
+        "sections": [
+          "Memory Hierarchy",
+          "Device Memory Accesses"
+        ]
+      },
+      "note": "顿悟头图主成分之二。真实数量级：reg~1 / SMEM~20-30 / L2~200 / HBM~400-800 cycle（架构相关，正文须注明）。load/store 摸的是最慢那层，故要合并 + 藏延迟。"
+    },
+    {
+      "id": "m04-coalescing",
+      "name": "合并访存——相邻 lane 访问相邻地址并成一次事务",
+      "kind": "layout",
+      "source_anchors": [
+        "python/tutorials/01-vector-add.py:L43-L52",
+        "python/triton/language/core.py:L1184-L1200"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {
+        "paper": "https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html",
+        "sections": [
+          "Coalesced Access to Global Memory"
+        ]
+      },
+      "note": "顿悟头图主成分之三 + 全书访存主线的机器成因。worked example：warp 32 lane × fp32 = 128B = 1 次事务（连续 offsets）vs 跨步 gather = 32 次事务、带宽掉 1/32。offsets=block_start+arange 天然连续。"
+    },
+    {
+      "id": "m05-occupancy",
+      "name": "占用率 occupancy = 活跃 warp / 上限，受寄存器与共享内存压制",
+      "kind": "config",
+      "source_anchors": [
+        "python/tutorials/01-vector-add.py:L32-L33",
+        "python/tutorials/01-vector-add.py:L73"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {
+        "paper": "https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html",
+        "sections": [
+          "Hardware Implementation: Hardware Multithreading (occupancy)"
+        ]
+      },
+      "note": "第一把性能判据尺。公式 + Ampere 级数值例（64K reg/SM,2048 线程/SM：32/64/128 reg/线程 → 100%/50%/25% occupancy）。BLOCK_SIZE=1024 是这颗旋钮在 vector-add 里的取值。"
+    },
+    {
+      "id": "m06-register-spill",
+      "name": "寄存器溢出——超上限的变量 spill 到 local memory(其实在 DRAM)",
+      "kind": "config",
+      "source_anchors": [
+        "python/tutorials/01-vector-add.py:L48-L52"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {
+        "paper": "https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html",
+        "sections": [
+          "Device Memory Accesses: Local Memory"
+        ]
+      },
+      "note": "第三把尺。local memory 名字骗人——物理在 DRAM，延迟从 ~1 cycle 塌回全局级。worked example：定性对比 spill 前后热变量访问延迟量级 + 与 occupancy 的张力（少寄存器提 occupancy vs 别 spill）。"
+    },
+    {
+      "id": "m07-grid-launch-cdiv",
+      "name": "SPMD launch grid 与 cdiv——决定并行 program 数",
+      "kind": "dataflow",
+      "source_anchors": [
+        "python/tutorials/01-vector-add.py:L68-L73",
+        "python/triton/__init__.py:L59-L60"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting",
+      "paper_origin": {
+        "paper": "https://doi.org/10.1145/3315508.3329973",
+        "sections": [
+          "Title & Abstract: SPMD blocked program 立论(题名级)"
+        ]
+      },
+      "note": "worked example：N=98432,BLOCK=1024 → cdiv=97（96 满块 + 1 半块 512 元素）。grid 大小=硬件 block 数的上界；映射到 SM 轮转。"
+    },
+    {
+      "id": "m08-mask-bounds",
+      "name": "mask 越界守卫——不整除尾块的正确性护栏",
+      "kind": "protocol",
+      "source_anchors": [
+        "python/tutorials/01-vector-add.py:L45-L52",
+        "python/triton/language/core.py:L1580-L1636"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting",
+      "paper_origin_note": "无论文出处——Triton 编程模型/predication，事实源为源码 load/store 的 mask 语义（core.py:L1607 mask[idx]=false 则不取该地址）；SIMT 预测执行背景可参 CUDA PG SIMT Architecture。属码章级机制，非 primer 论文根基。",
+      "note": "worked example：尾块 pid=96,block_start=98304,offsets=98304..99327，其中 >=98432 的 896 个 lane 被 mask 掉。承接 ch05 boundary_check 的直觉。"
+    },
+    {
+      "id": "m09-constexpr-blocksize",
+      "name": "BLOCK_SIZE 走 tl.constexpr——特化与资源占用的编译期入口",
+      "kind": "config",
+      "source_anchors": [
+        "python/tutorials/01-vector-add.py:L32-L33",
+        "python/triton/language/core.py:L134-L146"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "paper_origin_note": "无论文出处——Triton 实现细节，事实源为源码 constexpr 类（core.py:L134-L146）。承 ch01 已建立的 constexpr『性能分水岭』，本章只点它与 occupancy 的联系（BLOCK_SIZE 决定每 block 资源占用），不重讲。",
+      "note": "只做承前一句：constexpr 让 BLOCK_SIZE 能当 shape/被特化，且它是压 occupancy 的旋钮之一。ch01 已详述，本章不展开。"
+    }
+  ],
+  "subtraction_plan": {},
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recycle": [],
+    "note": "scripts/bible.py due ch02 返回空（无应埋伏笔、无应回收）。但本章 primer 前瞻性铺垫（非 bible 登记、供 writer 收尾点名）：occupancy→后续『共享内存分配/后端占用率』章、coalescing→『ch25 AxisInfo+Coalesce / ch05 访存书写』章、register spill→占用率决策章。这三把尺是 perf 主线在全书的复用锚，正文小结应显式点名『后面各章都拿这套模型来量』。"
+  }
+}
