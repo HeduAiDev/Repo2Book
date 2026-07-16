@@ -402,7 +402,15 @@ def _update_index(date: str, entry_type: str, chapter: str, title: str, filename
             index = f.read()
 
         # Insert after "## Recent Activity" header
-        new_entry = f"| {date} | {entry_type} | {chapter or 'N/A'} | {title} | [{filename}]({entry_type}s/{filename}) |\n"
+        dir_name_map = {
+            "decision": "decisions",
+            "delivery": "deliveries",
+            "user_interaction": "user_interactions",
+            "bug": "decisions",
+            "design_change": "decisions",
+        }
+        link_dir = dir_name_map.get(entry_type, f"{entry_type}s")
+        new_entry = f"| {date} | {entry_type} | {chapter or 'N/A'} | {title} | [{filename}]({link_dir}/{filename}) |\n"
         marker = "| Date | Type | Chapter | Summary | File |\n"
         if marker in index:
             index = index.replace(marker, marker + new_entry)

@@ -1,0 +1,199 @@
+{
+  "chapter_id": "ch07",
+  "slug": "blocks-shape-and-memory-access",
+  "title": "block、形状与访存",
+  "kind": "code",
+  "one_line": "kernel 第一行『我是谁、我算哪一块』(program_id/num_programs/arange/full)→ 一族形状算子只算元数据(reshape/view/permute…,builder.create_* 才落 IR)→ 访存两条路径(legacy 逐元素指针+mask 的四旋钮 vs make_block_ptr 把 stride/边界打包给编译器)→ atomic_* 家族(统一类型校验 + sem/scope 下降)。全书最高频的访存书写,coalescing 成不成的第一现场。",
+
+  "code_spine": [
+    "python/triton/language/semantic.py:L28-L37  program_id()/num_programs():校验 axis∈{0,1,2},create_get_program_id/create_get_num_programs 各生一个 tl.int32 标量——本 program 在 3D grid 里的坐标",
+    "python/triton/language/semantic.py:L602-L616  arange():Python 侧校验 start/end 均 int、范围 power-of-two、fit int32,create_make_range 生 [range] 形状的 int32 block——block 内张量的起点",
+    "python/triton/language/semantic.py:L619-L647  full()+splat():把标量填满 shape——0 值走 get_null_value,非 0 走 get_{dtype.name},最后 create_splat 成 block",
+    "python/triton/language/semantic.py:L650-L741  形状算子一族:reshape(校验 numel 不变→create_reshape)/expand_dims(insert 长度1维→create_expand_dims)/permute(校验是 0..n-1 的排列→create_trans)/broadcast_impl_shape(尺寸1可扩、非1不等报错→create_broadcast)——Python 只算/校验形状,create_* 落算子",
+    "python/triton/language/core.py:L1405-L1442  view()/reshape() 表面:view 打 deprecated 警告并强制 can_reorder=True;reshape 默认 can_reorder=False——两者语义差就在这一个 flag",
+    "python/triton/language/core.py:L1580-L1637  load() 表面:mask/other 经 to_tensor 裹成张量,cache/eviction/padding/volatile 透传 → semantic.load 分派",
+    "python/triton/language/semantic.py:L1128-L1141  load() 分派:ptr.element_ty.is_block() → _load_block_pointer,否则 → _load_legacy(两条路径的岔口)",
+    "python/triton/language/semantic.py:L1066-L1126  _load_legacy():逐元素路径——拒 padding/boundary_check,mask/other 广播到 ptr 形状,int1→int8 改写,create_load(无 mask)/create_masked_load(有 mask+other)",
+    "python/triton/language/semantic.py:L1044-L1064  _load_block_pointer():block 指针路径——拒 mask/other,_canonicalize_boundary_check 归一化边界维,create_tensor_pointer_load(带 boundary_check/padding)",
+    "python/triton/language/semantic.py:L1752-L1796  make_block_ptr()/advance():把 shape/strides/offsets/block_shape/order 转 IR 值并校验(order 须是排列、block_shape 静态 int32),create_make_block_ptr 打包成 ptr<tensor<...>>;advance 只挪 offsets、类型不变",
+    "python/triton/language/semantic.py:L1031-L1042  _canonicalize_boundary_check():把 boundary_check 维号去重、排序、范围校验——喂给编译器做边界的元信息",
+    "python/triton/language/semantic.py:L1288-L1321  atomic_cas() + atom_red_typechecking_impl():atomic 家族统一类型校验(拒 const、拒 fp16 非 add、拒 int1/int8/int16/bf16),mask/val 广播,val cast 到 ptr 元素类型,mask 缺省补全 True",
+    "python/triton/language/semantic.py:L1001-L1029  _str_to_sem()/_str_to_scope():字符串内存序('acquire'/'release'/'acq_rel'/'relaxed')和作用域('gpu'/'cta'/'sys')下降成 ir.MEM_SEMANTIC/MEM_SYNC_SCOPE 枚举",
+    "python/triton/language/semantic.py:L1402-L1409  atomic_add():typecheck→sem/scope→按 is_floating 选 FADD/ADD,create_atomic_rmw 落 RMW op"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "python/triton/language/semantic.py",
+      "lines": "L28-L37",
+      "code": "def program_id(axis: int, builder: ir.builder) -> tl.tensor:\n    if axis not in (0, 1, 2):\n        raise ValueError(f\"program_id axis must be 0, 1, or 2 but got {axis}\")\n    return tl.tensor(builder.create_get_program_id(axis), tl.int32)\n\n\ndef num_programs(axis: int, builder: ir.builder) -> tl.tensor:\n    if axis not in (0, 1, 2):\n        raise ValueError(f\"num_programs axis must be 0, 1, or 2 but got {axis}\")\n    return tl.tensor(builder.create_get_num_programs(axis), tl.int32)",
+      "elide": ["两函数骨架完全同构:校验 axis∈{0,1,2} → 造一个 tt.get_program_id/tt.get_num_programs 的 tl.int32 标量。核心是『追踪期只生一个 IR 节点,真实坐标值要到 GPU 上每个 program 各自不同』"]
+    },
+    {
+      "path": "python/triton/language/semantic.py",
+      "lines": "L602-L616",
+      "code": "def arange(start: int, end: int, builder: ir.builder) -> tl.tensor:\n    if not isinstance(start, int) or not isinstance(end, int):\n        raise ValueError(\"arange's arguments must be of type tl.constexpr\")\n    is_start_int64 = bool(start >> 32)\n    is_end_int64 = bool(end >> 32)\n    if is_start_int64 or is_end_int64:\n        raise ValueError(\"arange must fit in int32\")\n    if end <= start:\n        raise ValueError(\"arange's end argument must be greater than the start argument\")\n    range = end - start\n    if (range & (range - 1)) != 0:\n        raise ValueError(\"arange's range must be a power of 2\")\n    shape = [range]\n    ret_ty = tl.block_type(tl.int32, shape)\n    return tl.tensor(builder.create_make_range(start, end), ret_ty)",
+      "elide": ["三道 Python 侧校验(int/fit int32/power-of-2)全在追踪期跑,失败即编译报错;真正落地的只有最后一行 create_make_range——block 内 [0,1,...,range) 的坐标轴"]
+    },
+    {
+      "path": "python/triton/language/semantic.py",
+      "lines": "L619-L647",
+      "code": "def full(shape: List[int], value, dtype: tl.dtype, builder: ir.builder) -> tl.tensor:\n    if isinstance(value, tl.tensor):\n        assert value.numel.value == 1, \"only accepts size-1 tensor\"\n        value = cast(value, dtype, builder)\n    else:\n        # scalar\n        if dtype is None:\n            raise ValueError(\"dtype must be specified when value is not a tensor\")\n        if value == 0:\n            value = builder.get_null_value(dtype.to_ir(builder))\n        else:\n            get_value_fn = getattr(builder, f\"get_{dtype.name}\")\n            value = get_value_fn(value)\n        value = tl.tensor(value, dtype)\n\n    return splat(value, shape, builder)\n\n\ndef splat(value: tl.tensor, shape: List[int], builder: ir.builder) -> tl.tensor:\n    assert not value.type.is_block(), \"Cannot splat a block tensor\"\n    if len(shape) == 0:\n        return value\n    ret_ty = tl.block_type(value.dtype, shape)\n    return tl.tensor(builder.create_splat(value.handle, shape), ret_ty)",
+      "elide": ["value 是 size-1 tensor 的分支(L620-622)是护栏支线;主线是标量→按 0/非0 造常量 handle→splat 铺满 shape。splat 对 shape==[] 直接返回标量(不生 block)"]
+    },
+    {
+      "path": "python/triton/language/semantic.py",
+      "lines": "L650-L741",
+      "code": "def reshape(input: tl.tensor, dst_shape: List[int], can_reorder: bool, builder: ir.builder) -> tl.tensor:\n    numel = 1\n    for s in dst_shape:\n        numel *= s\n    if input.type.numel != numel:\n        raise ValueError(\"reshape() cannot change total number of elements in tensor\")\n    ret_ty = tl.block_type(input.type.scalar, dst_shape)\n    return tl.tensor(builder.create_reshape(input.handle, dst_shape, can_reorder), ret_ty)\n\n\ndef expand_dims(input: tl.tensor, axis: int, builder: ir.builder) -> tl.tensor:\n    dst_shape = [tl._constexpr_to_value(x) for x in input.shape]\n    dst_shape.insert(axis, 1)\n\n    if not input.type.is_block():\n        return splat(input, shape=dst_shape, builder=builder)\n\n    ret_ty = tl.block_type(input.type.scalar, dst_shape)\n    return tl.tensor(builder.create_expand_dims(input.handle, axis), ret_ty)\n\n\ndef permute(input: tl.tensor, dims: Tuple[int], builder: ir.builder) -> tl.tensor:\n    if len(input.shape) != len(dims):\n        raise ValueError(\"permute dims must have the same length as input shape\")\n    if sorted(tl._constexpr_to_value(d) for d in dims) != list(range(len(dims))):\n        raise ValueError(f\"permute dims must be a permutation of 0, 1, ..., n-1, but were {dims}\")\n\n    ret_type = tl.block_type(input.type.scalar, [input.shape[d] for d in dims])\n    return tl.tensor(builder.create_trans(input.handle, dims), ret_type)\n\n\ndef broadcast_impl_shape(input: tl.tensor, shape: List[int], builder: ir.builder) -> tl.tensor:\n    if not input.type.is_block():\n        ret_ty = tl.block_type(input.type, shape)\n        return tl.tensor(builder.create_splat(input.handle, shape), ret_ty)\n    src_shape = input.type.get_block_shapes()\n    if len(src_shape) != len(shape):\n        raise ValueError(f\"Cannot broadcast, rank mismatch: {src_shape}, {shape}\")\n    if shape == src_shape:\n        return input\n    for i, item in enumerate(src_shape):\n        if shape[i] != item and item != 1:\n            raise ValueError(f\"Cannot broadcast, the expanded size of the tensor ({shape[i]})\"\n                             f\" must match the existing size ({item}) at non-singleton dimension\"\n                             f\" {i}: {src_shape}, {shape}\")\n    ret_ty = tl.block_type(input.type.scalar, shape)\n    return tl.tensor(builder.create_broadcast(input.handle, shape), ret_ty)",
+      "elide": ["此处摘 reshape/expand_dims/permute/broadcast_impl_shape 四个代表(cat/join/split L671-714 同构,可一句带过)。共同结构:Python 侧只算/校验 shape 元数据(numel 不变 / 是排列 / 尺寸1可扩)→ create_reshape/create_expand_dims/create_trans/create_broadcast 才落真算子。permute 用 create_trans(转置=stride 视角换序),没有搬数据"]
+    },
+    {
+      "path": "python/triton/language/core.py",
+      "lines": "L1405-L1442",
+      "code": "@_tensor_member_fn\n@builtin\ndef view(input, *shape, _builder=None):\n    \"\"\"\n    Returns a tensor with the same elements as `input` but a different shape.\n    The order of the elements may not be preserved.\n    ...\n    \"\"\"\n    warn(\"view is deprecated, please use reshape with can_reorder being true.\")\n    shape = _shape_check_impl(_unwrap_iterable(shape))\n    return semantic.reshape(input, shape, can_reorder=True, builder=_builder)\n\n\n@_tensor_member_fn\n@builtin\ndef reshape(input, *shape, can_reorder=False, _builder=None):\n    \"\"\"\n    Returns a tensor with the same number of elements as input but with the\n    provided shape.\n    ...\n    \"\"\"\n    shape = _shape_check_impl(_unwrap_iterable(shape))\n    return semantic.reshape(input, shape, can_reorder, _builder)",
+      "elide": ["docstring 已缩写(用 ... 标)。核心对照:view 是 reshape 的 deprecated 别名、且硬编码 can_reorder=True(允许编译器为了效率打乱元素顺序);reshape 默认 can_reorder=False(保持行主序语义)。两者落的都是 create_reshape,差别只在这一个 flag"]
+    },
+    {
+      "path": "python/triton/language/core.py",
+      "lines": "L1580-L1637",
+      "code": "def load(pointer, mask=None, other=None, boundary_check=(), padding_option=\"\", cache_modifier=\"\", eviction_policy=\"\",\n         volatile=False, _builder=None):\n    \"\"\"\n    Return a tensor of data whose values are loaded from memory at location defined by `pointer`:\n        (1) If `pointer` is a single element pointer, a scalar is be loaded. ...\n        (2) If `pointer` is an N-dimensional tensor of pointers, an N-dimensional tensor is loaded. ...\n        (3) If `pointer` is a block pointer defined by `make_block_ptr`, a tensor is loaded. ...\n    \"\"\"\n    # `mask` and `other` can be constexpr\n    mask = _constexpr_to_value(mask)\n    other = _constexpr_to_value(other)\n    if mask is not None:\n        mask = semantic.to_tensor(mask, _builder)\n    if other is not None:\n        other = semantic.to_tensor(other, _builder)\n    padding_option = _constexpr_to_value(padding_option)\n    cache_modifier = _constexpr_to_value(cache_modifier)\n    eviction_policy = _constexpr_to_value(eviction_policy)\n    volatile = _constexpr_to_value(volatile)\n    return semantic.load(pointer, mask, other, boundary_check, padding_option, cache_modifier, eviction_policy,\n                         volatile, _builder)",
+      "elide": ["docstring 三种 pointer 形态已缩写(用 ... 标),正文可完整复述这三条:标量指针/指针张量/block 指针。表面层只做『mask/other 裹成张量 + constexpr 拆值』,真正分派在 semantic.load"]
+    },
+    {
+      "path": "python/triton/language/semantic.py",
+      "lines": "L1128-L1141",
+      "code": "def load(ptr: tl.tensor, mask: Optional[tl.tensor], other: Optional[tl.tensor], boundary_check: Tuple,\n         padding_option: str, cache_modifier: str, eviction_policy: str, is_volatile: bool,\n         builder: ir.builder) -> tl.tensor:\n    # Cache, eviction and padding options\n    cache = _str_to_load_cache_modifier(cache_modifier)\n    eviction = _str_to_eviction_policy(eviction_policy)\n    padding = _str_to_padding_option(padding_option)\n\n    if ptr.type.is_ptr() and ptr.type.element_ty.is_block():\n        # Load by a block pointer: `pointer_type<block_type<>>`\n        return _load_block_pointer(ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile, builder)\n    else:\n        # Load by a tensor of pointers or a pointer of scalar: `block_type<pointer_type<>>` or `pointer_type<>`\n        return _load_legacy(ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile, builder)",
+      "elide": ["这是两条访存路径的岔口。判据只有一句:ptr 的类型是不是 `pointer<block<...>>`(即 make_block_ptr 造出来的)→ 走 block pointer;否则(指针张量或标量指针)→ 走 legacy。cache/eviction/padding 三个字符串在这里先下降成枚举"]
+    },
+    {
+      "path": "python/triton/language/semantic.py",
+      "lines": "L1066-L1126",
+      "code": "def _load_legacy(ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile, builder):\n    # Load by a tensor of pointers or a pointer of scalar: `block_type<pointer_type<>>` or `pointer_type<>`\n    if not ptr.type.scalar.is_ptr():\n        raise ValueError(f\"Unsupported ptr type {ptr.type.__repr__()} in `tl.load`\")\n\n    # Check `mask`, `other`, `boundary_check`, and `padding` arguments\n    if mask is None and other is not None:\n        raise ValueError(\"`other` cannot be provided without `mask`\")\n    if padding or boundary_check:\n        raise ValueError(\"`padding_option` or `boundary_check` argument is not supported for loading a tensor of\"\n                         \"pointers or loading a scalar. Because the compiler does not know the boundary; please \"\n                         \"use block pointers (defined by `make_block_ptr`) instead\")\n\n    # For a pointer of scalar, check the type of `mask` and `other`\n    if not ptr.type.is_block():\n        if mask and mask.type.is_block():\n            raise ValueError(\"Mask argument cannot be block type if pointer argument is not a block\")\n        if other and other.type.is_block():\n            raise ValueError(\"Other argument cannot be block type if pointer argument is not a block\")\n\n    # Make `mask` and `other` into the same shape as `ptr`\n    if ptr.type.is_block():\n        if mask is not None:\n            mask = broadcast_impl_shape(mask, ptr.type.get_block_shapes(), builder)\n        if other is not None:\n            other = broadcast_impl_shape(other, ptr.type.get_block_shapes(), builder)\n\n    # Get `pointer_type<elt_ty>` and `elt_ty`\n    ptr_ty = ptr.type.scalar\n    elt_ty = ptr_ty.element_ty\n\n    # Treat `pointer_type<tl.int1>` as `pointer_type<tl.int8>`\n    is_bool = elt_ty == tl.int1\n    if is_bool:\n        elt_ty = tl.int8\n        ptr_ty = tl.pointer_type(elt_ty, ptr_ty.address_space)\n        ptr = cast(ptr, ptr_ty, builder)\n\n    # Cast `other` into `elt_ty` type\n    if other is not None:\n        other = cast(other, elt_ty, builder)\n\n    # Create loaded result type `dst_ty`\n    if ptr.type.is_block():\n        shape = ptr.type.get_block_shapes()\n        dst_ty = tl.block_type(elt_ty, shape)\n    else:\n        # Load by de-referencing the pointer of scalar\n        dst_ty = elt_ty\n\n    # Build IR\n    if mask is None:\n        ret = tl.tensor(builder.create_load(ptr.handle, cache, eviction, is_volatile), dst_ty)\n    else:\n        ret = tl.tensor(\n            builder.create_masked_load(ptr.handle, mask.handle, other.handle if other else None, cache, eviction,\n                                       is_volatile), dst_ty)\n    if is_bool:\n        ret = cast(ret, tl.int1, builder)\n    return ret",
+      "elide": ["int1→int8 改写(L1099-1104)与 bool 回转(L1123-1124)是位宽护栏支线,可一句带过。主线是:①ptr 本身是 block 形状的指针张量(所以 mask/other 要 broadcast 到同形状);②有 mask 走 create_masked_load(带 other 兜底值),无 mask 走 create_load;③legacy 路径明确拒收 boundary_check/padding——因为逐元素指针里编译器不知道边界在哪(这正是它和 block pointer 的分水岭)"]
+    },
+    {
+      "path": "python/triton/language/semantic.py",
+      "lines": "L1044-L1064",
+      "code": "def _load_block_pointer(ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile, builder):\n    # Load by a block pointer: `pointer_type<block_type<>>`\n    # Block pointer can not have `mask` and `other` arguments\n    if mask is not None or other is not None:\n        raise ValueError(\"`mask` and `other` arguments cannot be specified for loading block pointers\")\n\n    elt_ty = ptr.type.element_ty.element_ty\n    assert elt_ty != tl.int1, \"`tl.int1` should be rewrited in `tl.make_block_ptr`\"\n    if elt_ty.is_int() and padding == ir.PADDING_OPTION.PAD_NAN:\n        raise ValueError(\"Padding option `nan` is not supported for integer block pointers\")\n\n    # `dst_ty` is de-referenced type of the pointer type\n    dst_ty = ptr.type.element_ty\n\n    # Check `boundary_check` argument\n    boundary_check = _canonicalize_boundary_check(boundary_check, dst_ty.get_block_shapes())\n\n    # Build IR\n    return tl.tensor(\n        builder.create_tensor_pointer_load(ptr.handle, boundary_check, padding, cache, eviction, is_volatile), dst_ty)",
+      "elide": ["block pointer 路径与 legacy 恰好互补:这里拒收 mask/other(边界由 boundary_check+padding 表达),而 legacy 拒收 boundary_check/padding。dst_ty 直接就是指针解引用出来的 block 类型——形状信息已经打包在指针类型里,编译器据此做向量化/合并"]
+    },
+    {
+      "path": "python/triton/language/semantic.py",
+      "lines": "L1752-L1796",
+      "code": "def make_block_ptr(base: tl.tensor, shape, strides, offsets, block_shape, order, builder: ir.builder) -> tl.tensor:\n    # Convert dynamic arguments to IR values\n    # NOTES(Chenggang): current `shape/strides` are `int64_t`, while `offsets/block_shape` are `int32_t`\n    shape = _convert_to_ir_values(builder, shape)\n    strides = _convert_to_ir_values(builder, strides)\n    offsets = _convert_to_ir_values(builder, offsets, require_i64=False)\n\n    # Check `base` type\n    if not base.type.is_ptr() or base.type.element_ty.is_block():\n        raise ValueError(\"Expected `base` to be a pointer type (but not a block pointer type or others)\")\n\n    # Treat `pointer_type<tl.int1>` as `pointer_type<tl.int8>`\n    if base.type.element_ty == tl.int1:\n        base = cast(base, tl.pointer_type(tl.int8, base.type.address_space), builder)\n\n    # Check whether `block_shape` is static\n    if not hasattr(block_shape, \"__iter__\"):\n        block_shape = [block_shape]\n    block_shape = [elem.value if isinstance(elem, tl.constexpr) else elem for elem in block_shape]\n    assert all(isinstance(elem, int) and -2**31 <= elem < 2**31 for elem in block_shape), \\\n        \"Expected a list of constant integers (`int32_t` range) in `block_shape`\"\n\n    # Check `order`\n    if not hasattr(order, \"__iter__\"):\n        order = [order]\n    order = [elem.value if isinstance(elem, tl.constexpr) else elem for elem in order]\n    assert sorted(order) == list(range(len(order))), \"Expected a permutation of (0, 1, ..., len(order)-1) in order\"\n\n    # Must have same length\n    assert all(len(block_shape) == len(list_like) for list_like in [shape, strides, offsets, order]), \\\n        \"Expected shape/strides/offsets/block_shape to have the same length\"\n\n    # Build value, the type is:\n    #   `pointer_type<blocked<shape, element_type>>` in Python\n    #   `tt.ptr<tensor<shape, element_type>>` in MLIR\n    handle = builder.create_make_block_ptr(base.handle, shape, strides, offsets, block_shape, order)\n    return tl.tensor(handle, tl.pointer_type(tl.block_type(base.type.element_ty, block_shape)))\n\n\ndef advance(base: tl.tensor, offsets, builder: ir.builder) -> tl.tensor:\n    # Convert dynamic offsets to IR values\n    offsets = _convert_to_ir_values(builder, offsets, require_i64=False)\n\n    # Advanced block pointer type is the same as before\n    return tl.tensor(builder.create_advance(base.handle, offsets), base.type)",
+      "elide": ["int1→int8 改写(L1763-1764)是护栏。要点:make_block_ptr 把父张量的 shape/strides(int64)、当前 offsets/block_shape(int32)、order(排列)全部打包进一个 `tt.ptr<tensor<...>>`——这就是喂给编译器做向量化/合并的『带边界与 stride 信息的指针』。advance 只把 offsets 平移、指针类型原样不变(用于沿维度滑窗)"]
+    },
+    {
+      "path": "python/triton/language/semantic.py",
+      "lines": "L1031-L1042",
+      "code": "def _canonicalize_boundary_check(boundary_check, block_shape):\n    if boundary_check:\n        if not hasattr(boundary_check, \"__iter__\"):\n            boundary_check = [boundary_check]\n        boundary_check = [elem.value if isinstance(elem, tl.constexpr) else elem for elem in boundary_check]\n        for dim in boundary_check:\n            assert isinstance(dim, int) and 0 <= dim < len(block_shape)\n        assert len(boundary_check) > 0\n        assert len(boundary_check) == len(set(boundary_check)), \"Duplicate dimension in `boundary_check`\"\n        return sorted(boundary_check)\n    return ()",
+      "elide": ["boundary_check 是一串维号(哪些维要做越界检查)。这里去重、范围校验、排序,归一成有序元组喂给 create_tensor_pointer_load——由编译器在那些维上生成边界判断,越界元素按 padding 补零/NaN"]
+    },
+    {
+      "path": "python/triton/language/semantic.py",
+      "lines": "L1001-L1029",
+      "code": "def _str_to_sem(sem_option):\n    sem = ir.MEM_SEMANTIC.ACQUIRE_RELEASE\n    if sem_option:\n        if sem_option == \"acquire\":\n            sem = ir.MEM_SEMANTIC.ACQUIRE\n        elif sem_option == \"release\":\n            sem = ir.MEM_SEMANTIC.RELEASE\n        elif sem_option == \"acq_rel\":\n            sem = ir.MEM_SEMANTIC.ACQUIRE_RELEASE\n        elif sem_option == \"relaxed\":\n            sem = ir.MEM_SEMANTIC.RELAXED\n        else:\n            raise ValueError(f\"Memory semantic {sem_option} not supported\")\n    return sem\n\n\ndef _str_to_scope(scope_option):\n    scope = ir.MEM_SYNC_SCOPE.GPU\n    if scope_option:\n        if scope_option == \"gpu\":\n            scope = ir.MEM_SYNC_SCOPE.GPU\n        elif scope_option == \"cta\":\n            scope = ir.MEM_SYNC_SCOPE.CTA\n        elif scope_option == \"sys\":\n            scope = ir.MEM_SYNC_SCOPE.SYSTEM\n        else:\n            raise ValueError(f\"Memory semantic {scope_option} not supported\")\n    return scope",
+      "elide": ["两个纯查表函数。要点:sem 默认 ACQUIRE_RELEASE(最强序,最安全),scope 默认 GPU;字符串→枚举后原样交给 create_atomic_rmw/create_atomic_cas 的最后两个参数,决定这次原子操作的内存序与可见范围(CTA 内 / 整卡 / 跨设备)"]
+    },
+    {
+      "path": "python/triton/language/semantic.py",
+      "lines": "L1288-L1321",
+      "code": "def atomic_cas(ptr: tl.tensor, cmp: tl.tensor, val: tl.tensor, sem: str, scope: str, builder: ir.builder) -> tl.tensor:\n    sem = _str_to_sem(sem)\n    scope = _str_to_scope(scope)\n    element_ty = ptr.type.scalar.element_ty\n    if element_ty.primitive_bitwidth not in [16, 32, 64]:\n        raise ValueError(\"atomic_cas only supports elements with width {16, 32, 64}\")\n    return tl.tensor(builder.create_atomic_cas(ptr.handle, cmp.handle, val.handle, sem, scope), val.type)\n\n\ndef atom_red_typechecking_impl(ptr: tl.tensor, val: tl.tensor, mask: tl.tensor, op: str,\n                               builder: ir.builder) -> Tuple[tl.tensor, tl.tensor, tl.tensor]:\n    if not ptr.type.scalar.is_ptr():\n        raise ValueError(\"Pointer argument of store instruction is \" + ptr.type.__repr__())\n    if ptr.type.is_const() or ptr.type.element_ty.is_const():\n        raise ValueError(\"Cannot store to a constant pointer\")\n    element_ty = ptr.type.scalar.element_ty\n    if element_ty is tl.float16 and op != 'add':\n        raise ValueError(\"atomic_\" + op + \" does not support fp16\")\n    if element_ty in [tl.int1, tl.int8, tl.int16, tl.bfloat16]:\n        raise ValueError(\"atomic_\" + op + \" does not support \" + str(element_ty))\n    if ptr.type.is_block():\n        if mask is not None:\n            mask = broadcast_impl_shape(mask, ptr.type.get_block_shapes(), builder)\n        if val is not None:\n            val = broadcast_impl_shape(val, ptr.type.get_block_shapes(), builder)\n    val = cast(val, ptr.type.scalar.element_ty, builder)\n    if not mask:\n        mask_ir = builder.get_int1(True)\n        mask_ty = tl.int1\n        if ptr.type.is_block():\n            mask_ir = builder.create_splat(mask_ir, ptr.type.get_block_shapes())\n            mask_ty = tl.block_type(tl.int1, ptr.type.get_block_shapes())\n        mask = tl.tensor(mask_ir, mask_ty)\n    return ptr, val, mask",
+      "elide": ["atom_red_typechecking_impl 是 atomic_add/and/or/xor/xchg/max/min 六个 RMW 的公共前置:①拒 const 指针;②类型白名单(fp16 只许 add、int1/int8/int16/bf16 全拒——复用 ch05 的类型体系,只讲 atomic 特有的这层约束);③mask/val 广播到指针形状;④val cast 到指针元素类型;⑤mask 缺省补一个全 True。atomic_cas 走独立 typecheck(只查 16/32/64 位宽)"]
+    },
+    {
+      "path": "python/triton/language/semantic.py",
+      "lines": "L1402-L1409",
+      "code": "def atomic_add(ptr: tl.tensor, val: tl.tensor, mask: tl.tensor, sem: str, scope: str, builder: ir.builder) -> tl.tensor:\n    ptr, val, mask = atom_red_typechecking_impl(ptr, val, mask, 'add', builder)\n    sem = _str_to_sem(sem)\n    scope = _str_to_scope(scope)\n    sca_ty = val.type.scalar\n    op = ir.ATOMIC_OP.FADD if sca_ty.is_floating() else ir.ATOMIC_OP.ADD\n    return tl.tensor(builder.create_atomic_rmw(op, ptr.handle, val.handle, mask.handle, sem, scope), val.type)",
+      "elide": ["最干净的 RMW 代表:统一 typecheck → sem/scope 下降 → 按浮点/整数选 FADD/ADD → create_atomic_rmw(op, ptr, val, mask, sem, scope)。atomic_and/or/xor/xchg 结构完全相同,只换 ATOMIC_OP 枚举;atomic_max/min 对浮点要额外做符号位技巧(见 design_decisions)"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "ir.builder", "file": "python/triton/language/semantic.py", "responsibility": "IR 建造器——所有 create_get_program_id/create_make_range/create_splat/create_reshape/create_trans/create_broadcast/create_load/create_masked_load/create_tensor_pointer_load/create_make_block_ptr/create_advance/create_atomic_rmw/create_atomic_cas 都是它的方法;Python 侧算完形状/类型后,由它把动作落成一个 IR 节点(追踪期)"},
+    {"name": "tl.tensor", "file": "python/triton/language/core.py", "responsibility": "把一个 IR handle 与其 tl.type 打包成的『值』;本章每个动作都返回它。带 shape/dtype 元数据,不含真实数值——数值要到 GPU 上每个 program/lane 各自计算"},
+    {"name": "tl.block_type", "file": "python/triton/language/core.py", "responsibility": "block 张量类型 = 标量元素类型 + shape 列表;形状算子的产物类型都由它构造(create_* 之前先算出 ret_ty)"},
+    {"name": "tl.pointer_type", "file": "python/triton/language/core.py", "responsibility": "指针类型;区分『指针的 block』(legacy 路径,ptr.type 是 block<pointer>)与『block 的指针』(block pointer 路径,ptr.type 是 pointer<block>)——load 的分派判据就看这个嵌套方向"}
+  ],
+
+  "data_flow": [
+    "kernel 首行定位:program_id(axis)→ semantic.program_id 校验 axis∈{0,1,2}→ create_get_program_id 生 int32 标量『我是第几块』;num_programs 同构给出『一共几块』",
+    "造 block 内张量:arange(0, BLOCK)→ create_make_range 生 [BLOCK] 的 int32 轴;full(shape, v, dtype)→ splat 把标量铺满 shape;二者组合出本 program 负责的元素坐标",
+    "算地址:坐标张量 × stride + base(经 ch06 的算术/广播)→ 得到一个 block 形状的『指针张量』(每个元素是一个地址)",
+    "形状对齐(可选):reshape/expand_dims/permute/broadcast_to/join/split/cat 在 Python 侧校验形状元数据 → create_* 落算子,不搬数据(permute=create_trans 换 stride 视角)",
+    "访存分派:semantic.load 看 ptr 类型 —— pointer<block>(make_block_ptr 造)走 _load_block_pointer;否则(block<pointer> 或裸标量指针)走 _load_legacy",
+    "legacy 路径:mask/other 广播到 ptr 形状 → 有 mask 走 create_masked_load(mask 裁边界、other 兜底)/无 mask 走 create_load;明确拒 boundary_check/padding",
+    "block pointer 路径:make_block_ptr 先把 shape/strides/offsets/block_shape/order 打包成 pointer<block> → _load_block_pointer 用 _canonicalize_boundary_check 归一化边界维 → create_tensor_pointer_load(带 boundary_check/padding);advance 沿维滑窗",
+    "原子读改写:atomic_*(ptr, val, mask, sem, scope)→ atom_red_typechecking_impl 统一校验+广播+cast+补 mask → _str_to_sem/_str_to_scope 下降内存序/作用域 → create_atomic_rmw/create_atomic_cas 落 op"
+  ],
+
+  "design_decisions": [
+    {"decision": "program_id/num_programs 只在追踪期生一个 IR 节点,不携带真实坐标值", "why": "Triton 是 SPMD:同一份 kernel IR 被 grid 里每个 program 实例复用,坐标是运行期各自不同的值。追踪期只能落一个 `tt.get_program_id` 占位,真实值到 GPU 上兑现——这解释了为什么 kernel 里能用 pid 算地址却打印不出具体数", "evidence": "python/triton/language/semantic.py:L28-L37"},
+    {"decision": "形状算子一律『Python 算元数据 + builder.create_* 落算子』两段式,数据不搬动", "why": "block 张量在追踪期只是类型(shape+dtype),没有真实 buffer。reshape 校验 numel 不变、permute 校验是排列、broadcast 校验尺寸1可扩——全是对 shape 列表的纯 Python 计算;真正的重排/广播是 create_reshape/create_trans/create_broadcast 生成的 IR 算子,由后端决定是否物化。permute 用 create_trans 意味着转置本质是 stride 视角换序", "evidence": "python/triton/language/semantic.py:L650-L741"},
+    {"decision": "view = reshape 的 deprecated 别名,唯一差别是硬编码 can_reorder=True", "why": "reshape 默认 can_reorder=False 保持行主序元素顺序;view 允许编译器为效率打乱顺序(只在结果顺序无关时安全,如后接 reduce)。同一个 create_reshape,一个 flag 分出两种语义——这是读者最容易混淆的点", "evidence": "python/triton/language/core.py:L1405-L1442"},
+    {"decision": "访存两条路径互斥:legacy 拒 boundary_check/padding,block pointer 拒 mask/other", "why": "legacy 的指针是一个 block 形状的指针张量,编译器不知道父张量边界在哪,只能靠调用者用 mask 逐元素裁(灵活但编译器信息少);block pointer 把 shape/strides/offsets/order 打包进指针类型,编译器有完整边界信息,用 boundary_check+padding 表达越界(信息足、更易向量化与合并)。两套边界表达法不能混用,故各自拒收对方的参数", "evidence": "python/triton/language/semantic.py:L1075-L1080"},
+    {"decision": "coalescing 成不成取决于相邻 lane 的地址是否连续;两条路径给编译器的信息量不同", "why": "一个 warp 内相邻 lane 若访问连续地址,硬件可把 32 笔请求合并成少数几笔内存事务(见第 2 章的访存事务/带宽)。legacy 路径下编译器只看到一堆独立地址,合并与否要靠它反推 stride;block pointer 直接告诉它 stride 与 order,更容易生成向量化/合并的访存。mask 边界与 boundary_check 决定尾块是否破坏对齐——这是本章的性能落点", "evidence": "python/triton/language/semantic.py:L1128-L1141"},
+    {"decision": "atomic 家族用统一 typecheck(atom_red_typechecking_impl)复用类型体系,只加 atomic 特有约束", "why": "六个 RMW(add/and/or/xor/xchg/max/min)共享同一前置:拒 const 指针、fp16 只许 add、拒 int1/int8/int16/bf16、mask/val 广播到指针形状、val cast 到元素类型、mask 缺省补 True。类型提升/cast 复用 ch05 结论,这里只讲 atomic 硬件不支持的窄类型这层额外约束", "evidence": "python/triton/language/semantic.py:L1296-L1321"},
+    {"decision": "浮点 atomic_max/min 通过整数位重解释 + 符号分流实现", "why": "PTX 没有原生浮点 max/min 的原子指令。利用 IEEE754 位序:非负浮点按有符号整数比大小、负浮点按无符号整数反向比。故 val≥0 走 atomic_max(有符号 int 重解释)、val<0 走 atomic_umin(无符号),再 where 合并、bitcast 回浮点。这是一段值得单独讲清的算法", "evidence": "python/triton/language/semantic.py:L1324-L1361"},
+    {"decision": "sem 默认 acq_rel、scope 默认 gpu", "why": "最强内存序 + 整卡可见是最安全的默认——多数 kernel 无需关心。放宽到 relaxed/cta 是性能优化选项(减少同步开销),由调用者显式指定。字符串在 Python 侧查表下降成 ir 枚举,直接作为 create_atomic_rmw 的最后两参", "evidence": "python/triton/language/semantic.py:L1001-L1029"}
+  ],
+
+  "theory": [
+    "内存合并(coalescing):设一个 warp 有 32 个 lane,lane i 访问地址 a_i。当 {a_i} 落在同一对齐的连续区间(如 a_i = base + i·elem_size)时,硬件把 32 笔请求合并成 ⌈32·elem_size / txn_size⌉ 笔事务(txn_size 常为 32/64/128 字节);若地址散乱(strided 大步长或随机),最坏退化为 32 笔独立事务,有效带宽掉到 1/32。故『相邻 lane 地址是否连续』是访存效率的第一判据(带宽/事务量化见第 2 章)。",
+    "两条路径的信息量差异:legacy 路径编译器拿到的是一个 block 的独立地址,需从地址表达式反推 stride 才能判断可否向量化;block pointer 路径直接携带 strides/order,编译器无须反推即可生成合并/向量化访存——这是『信息足更易合并』的形式化根据。",
+    "边界与向量化的张力:尾块(tensor 尺寸非 BLOCK 整数倍)必须裁边界。legacy 用 mask 逐元素关断,越界 lane 不发访存但可能打破对齐/连续;block pointer 用 boundary_check 让编译器在指定维生成边界判断、越界按 padding 补值,更利于保持规整的向量化访存。",
+    "arange/block 形状约束:validate_block_shape 要求每维是 2 的幂、numel ≤ TRITON_MAX_TENSOR_NUMEL(1048576);arange 的 range 也必须是 2 的幂。这是为了让 block 尺寸能整除 warp/向量宽度,天然对齐到合并友好的边界。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "_load_legacy 里 int1→int8 改写与末尾 bool 回转(L1099-1104, L1123-1124)", "why_safe": "位宽护栏支线,不影响『指针张量+mask 逐元素访存』主线;精简版用非 bool 元素类型即不触发,删后控制流仍完整"},
+      {"what": "make_block_ptr 里 int1→int8 改写(L1763-1764)", "why_safe": "同上,bool 元素的边角处理;主线讲 shape/strides/offsets/order 打包即可"},
+      {"what": "atomic_max/atomic_min 的浮点符号位技巧完整实现(bitcast/pos-neg 分流,L1341-1361)——精简版保留整数直连分支与函数签名,浮点分支可缩为一句注释指向 design_decisions", "why_safe": "整数 max/min 直连 create_atomic_rmw 已能讲清 RMW 骨架;浮点位技巧是进阶细节,删其实现不破坏 atomic 家族的类型校验+sem/scope 主线。注意 atomic_add 无此分支,作为主代表保留完整"},
+      {"what": "cat/join/split(semantic L671-714)的完整实现——保留 reshape/expand_dims/permute/broadcast_impl_shape 作代表", "why_safe": "四者与保留的形状算子同构(Python 算形状 + create_*),讲清代表即讲清一族;join/split 的 rank-1 特判是边角,不承载核心机理"},
+      {"what": "store 侧完整实现(_store_legacy/_store_block_pointer,semantic L1193-1286)——保留 load 两条路径作主线,store 可点出『与 load 镜像对称』", "why_safe": "store 与 load 结构镜像(同样两条路径、同样的 mask/boundary_check 互斥约束),讲清 load 即讲清 store 的机理;精简版保留 store 签名与分派即可"}
+    ],
+    "must_keep": [
+      {"symbol": "program_id", "why": "kernel 第一行『我是谁』,读者必须理解 SPMD 坐标只在运行期兑现"},
+      {"symbol": "num_programs", "why": "与 program_id 配套给出 grid 维度,算网格步长时要用"},
+      {"symbol": "arange", "why": "造 block 内坐标轴的唯一入口,power-of-2 约束与合并对齐相关"},
+      {"symbol": "full", "why": "造常量 block;splat 铺满机制的代表"},
+      {"symbol": "create_make_range", "why": "arange 落到 IR 的算子名,writer 讲『追踪期只生节点』要点它"},
+      {"symbol": "reshape", "why": "形状算子一族的代表,numel 不变校验 + create_reshape"},
+      {"symbol": "can_reorder", "why": "view 与 reshape 的唯一语义差就在这个 flag,读者最易混淆点"},
+      {"symbol": "permute", "why": "转置=stride 视角换序(create_trans),不搬数据"},
+      {"symbol": "broadcast_impl_shape", "why": "广播的形状校验(尺寸1可扩、非1不等报错)+ create_broadcast/create_splat"},
+      {"symbol": "expand_dims", "why": "插入长度1维,__getitem__ 的 None 索引也走它"},
+      {"symbol": "load", "why": "访存两条路径的分派入口,本章 stakes 核心"},
+      {"symbol": "_load_legacy", "why": "逐元素『指针+mask』路径;mask/other 广播、create_masked_load/create_load、拒 boundary_check——coalescing 灵活但信息少的一侧"},
+      {"symbol": "create_masked_load", "why": "有 mask 时落的 IR 算子;mask 裁边界的落点"},
+      {"symbol": "_load_block_pointer", "why": "block 指针路径;拒 mask/other、走 create_tensor_pointer_load——coalescing 信息足的一侧"},
+      {"symbol": "make_block_ptr", "why": "把 shape/strides/offsets/block_shape/order 打包给编译器的核心;boundary_check 与向量化的前提"},
+      {"symbol": "advance", "why": "沿维滑窗的 block 指针平移,类型不变"},
+      {"symbol": "_canonicalize_boundary_check", "why": "boundary_check 维号归一化,喂给编译器做边界的元信息"},
+      {"symbol": "atom_red_typechecking_impl", "why": "atomic 家族统一类型校验(拒 fp16 非 add、拒窄整数/bf16、mask 缺省补 True),读者需懂 atomic 特有约束"},
+      {"symbol": "atomic_add", "why": "RMW 家族最干净的代表:typecheck→sem/scope→FADD/ADD→create_atomic_rmw"},
+      {"symbol": "atomic_cas", "why": "compare-and-swap,独立 typecheck(16/32/64 位宽),原子协议的另一支"},
+      {"symbol": "create_atomic_rmw", "why": "所有 RMW 落到 IR 的算子名,sem/scope 作为其末两参"},
+      {"symbol": "_str_to_sem", "why": "内存序字符串→枚举,default acq_rel;放宽是性能选项"},
+      {"symbol": "_str_to_scope", "why": "作用域字符串→枚举,default gpu;cta/sys 的可见范围差异"}
+    ]
+  },
+
+  "mechanisms": [
+    {"id": "m1-grid-to-block", "name": "从 grid 坐标到 block 张量(program_id/num_programs/arange/full)", "kind": "dataflow", "source_anchors": ["python/triton/language/semantic.py:L28-L37", "python/triton/language/semantic.py:L602-L616", "python/triton/language/semantic.py:L619-L647"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m2-shape-metadata", "name": "形状算子只算元数据、create_* 才落 IR(reshape/expand_dims/permute/broadcast/join/split/cat 共性)", "kind": "layout", "source_anchors": ["python/triton/language/semantic.py:L650-L741"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m3-view-vs-reshape", "name": "view 与 reshape 的语义差(can_reorder 一个 flag)", "kind": "config", "source_anchors": ["python/triton/language/core.py:L1405-L1442"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m4-permute-stride-view", "name": "permute/trans = stride 视角换序,不搬数据(create_trans)", "kind": "layout", "source_anchors": ["python/triton/language/semantic.py:L716-L724"], "needs_figure": true, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m5-load-dispatch", "name": "load 两条路径的分派判据(pointer<block> vs block<pointer>)", "kind": "dataflow", "source_anchors": ["python/triton/language/semantic.py:L1128-L1141"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m6-legacy-ptr-mask", "name": "legacy 逐元素路径:block 形状的指针张量 + mask/other 四旋钮", "kind": "dataflow", "source_anchors": ["python/triton/language/semantic.py:L1066-L1126"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m7-block-pointer", "name": "block pointer:make_block_ptr/advance/boundary_check 把 stride 与边界打包给编译器", "kind": "protocol", "source_anchors": ["python/triton/language/semantic.py:L1752-L1796", "python/triton/language/semantic.py:L1044-L1064", "python/triton/language/semantic.py:L1031-L1042"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m8-coalescing", "name": "coalescing:相邻 lane 地址连续决定访存能否合并成一笔事务;两条路径的信息量取舍", "kind": "layout", "source_anchors": ["python/triton/language/semantic.py:L1075-L1080", "python/triton/language/semantic.py:L1128-L1141"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m9-atomic-typecheck", "name": "atomic 家族统一类型校验(atom_red_typechecking_impl:窄类型/fp16 约束 + mask 补全)", "kind": "protocol", "source_anchors": ["python/triton/language/semantic.py:L1296-L1321"], "needs_figure": false, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m10-atomic-rmw-sem-scope", "name": "RMW 落 IR + sem/scope 下降(atomic_add 代表 + _str_to_sem/_str_to_scope)", "kind": "config", "source_anchors": ["python/triton/language/semantic.py:L1402-L1409", "python/triton/language/semantic.py:L1001-L1029"], "needs_figure": false, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m11-atomic-float-trick", "name": "浮点 atomic_max/min 的整数位重解释 + 符号分流", "kind": "algorithm", "source_anchors": ["python/triton/language/semantic.py:L1324-L1361"], "needs_figure": false, "needs_worked_example": true, "difficulty": "supporting"},
+    {"id": "m12-tma-descriptor", "name": "Hopper TMA descriptor 化访存(descriptor_load/store)一瞥", "kind": "protocol", "source_anchors": ["python/triton/language/semantic.py:L1144-L1158"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"}
+  ],
+
+  "foreshadow_due": {"plant": [], "payoff": [], "note": "bible.py due ch07 返回空(应埋/应回收均无登记)"}
+}
