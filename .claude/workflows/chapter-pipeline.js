@@ -428,11 +428,10 @@ if (!mapInsertV) return { chapter: A.chapter_id, escalated: 'map-insert-failed',
 if (mapInsertV.status === 'BLOCKED') return { escalated: 'map-insert', stage: 'Map', reason: mapInsertV.blocker_reason }
 
 // ---------- Phase G: Archive ----------
-phase('Archive')
 // 完整 review 对象注入提示词 → review-report.json 忠实落盘(含 verdict 与全部 issues)，
 // 不让 archivist 凭记忆重建出有损版本。
 const reviewJson = JSON.stringify(reviewV || { overall_verdict: 'UNKNOWN', issues: [] })
-const runLedger = JSON.stringify({
+const runLedgerObj = {
   chapter_id: A.chapter_id,
   kind: PRIMER ? 'primer' : (A.skip_impl ? 'meta' : 'code'),
   impl_test_rounds: implTestRounds, impl_test_ledger: ledger,
@@ -440,7 +439,16 @@ const runLedger = JSON.stringify({
   blind_rounds: blindHistory.length, blind_failures: blindHistory,
   map_rounds: mapHistory.length, map_history: mapHistory,
   escalated: null,
-})
+}
+// skip_archive(并行发车模式):Review+Map 都过了,但**跳过写共享 Book Bible/trace**——多章
+// 并行时各自的 Archive agent 会对 glossary/concepts/interfaces/arc-map/state.json 做并发
+// read-modify-write,竞争必丢条目(静默损坏)。故把 review/run-ledger 交还 Lead,由 Lead **串行**
+// 补齐归档(按章序,保伏笔/术语累积顺序)。per-chapter 隔离产物(章内 diagrams/narrative 等)已落盘。
+if (A.skip_archive) {
+  return { chapter: A.chapter_id, needs_archive: true, review_verdict: (reviewV && reviewV.verdict) || 'UNKNOWN', review_report: reviewV, run_ledger: runLedgerObj, note: '并行模式:Review+Map 已过,Bible/trace 待 Lead 串行归档' }
+}
+phase('Archive')
+const runLedger = JSON.stringify(runLedgerObj)
 const archiveTask = head('archivist') +
   '任务一(务必先做)：把下面这个完整 review 对象**原样**写入 ' + CH + '/reviews/review-report.json（保留 verdict 与全部 issues，不要删改、不要自己重写摘要）：\n' +
   reviewJson + '\n' +
