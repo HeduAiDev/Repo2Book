@@ -1,0 +1,289 @@
+{
+  "chapter_id": "ch11",
+  "slug": "ch11-run-launch-pipeline",
+  "title": "run()：从缓存查询到编译再到内核发射的一次完整 launch",
+  "kind": "code",
+  "one_line_stakes": "JITFunction.run 是全书脊柱胶水——把 ch10 建好的 binder/缓存键、ch14 的 compile、ch12 的 driver/后端串成一次真实 launch。看清这条热路径每段的开销来源，就能判断一个小算子到底是被 GPU 算力卡住、还是被 Python 侧发射固定开销卡住。",
+
+  "code_spine": [
+    "python/triton/runtime/jit.py:L324-L330  KernelInterface.__getitem__：fn[grid](args) 返回记住 grid 的 lambda，最终落到 self.run(grid=grid, warmup=False, ...)（语法糖细节见 ch10，本章从 run 入口开讲）",
+    "python/triton/runtime/jit.py:L563-L571  run() 开场：debug 旗标 → driver.active 取 device/stream/target → make_backend(target)（跨到 driver 子系统的边界，host 无 GPU 在此断裂）",
+    "python/triton/runtime/jit.py:L573-L575  pre_run_hooks 逐个执行（autotune 等外层挂钩点）",
+    "python/triton/runtime/jit.py:L577-L580  惰性 create_binder：self.binder is None 才建；调 self.binder(*args,**kwargs) 得 5 元组 (bound_args, sig_and_spec, constexpr_vals, non_constexpr_vals, excess_kwargs)",
+    "python/triton/runtime/jit.py:L582-L584  拼发射缓存键 key = ''.join(sig_and_spec)+str((constexpr_vals,excess_kwargs)) → self.cache[device].get(key)（键的三桶构成见 ch10，本章只看 run 怎么用它查内存 cache）",
+    "python/triton/runtime/jit.py:L586-L629  未命中慢路径：parse_options → excess_kwargs 合法性校验 → None→*i8 签名修正 → get_attrs_descriptor+get_constants 组 constants → callable-constexpr 守卫 → _call_hook(before) → ASTSource(self,...) → self.compile(src,...) → 回填 self.cache[device][key] → _call_hook(after)（compile 内部五段主循环是 ch14，本章只讲 run 怎么调它）",
+    "python/triton/runtime/jit.py:L631-L636  used_global_vals 逐个核对未变，否则 RuntimeError（机制本体在 ch10，本章作为 run 尾部一站回指）",
+    "python/triton/runtime/jit.py:L638-L649  非 warmup 才规范化 grid：callable grid → grid(bound_args)；补齐 grid_0/grid_1/grid_2 三维",
+    "python/triton/runtime/jit.py:L651-L654  发射：kernel.launch_metadata(grid,stream,*non_constexpr_vals) → kernel.run(grid_0,grid_1,grid_2,stream,kernel.function,kernel.packed_metadata,launch_metadata,enter_hook,exit_hook,*non_constexpr_vals)（跨语言到 C++ launcher）",
+    "python/triton/compiler/compiler.py:L393-L396  CompiledKernel.__getattribute__：读取 .run 属性即触发 _init_handles()——惰性设备句柄接入发射路径的机关",
+    "python/triton/compiler/compiler.py:L379-L391  CompiledKernel._init_handles：driver.active.launcher_cls 造 launcher + load_binary 把 cubin 装到 GPU（需真设备）",
+    "python/triton/compiler/compiler.py:L398-L413  CompiledKernel.launch_metadata：无 enter hook 直接 None；否则 LazyDict 兜底 + 可选挂用户 launch_metadata 回调"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "python/triton/runtime/jit.py",
+      "lines": "L321-L331",
+      "code": "class KernelInterface(Generic[T]):\n    run: T\n\n    def __getitem__(self, grid) -> T:\n        \"\"\"\n        A JIT function is launched with: fn[grid](*args, **kwargs).\n        Hence JITFunction.__getitem__ returns a callable proxy that\n        memorizes the grid.\n        \"\"\"\n        return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)\n        # return cast(T, functools.partial(cast(Callable, self.run), grid=grid))",
+      "elide": ["ch10 已详解 fn[grid](args) 两步语法糖；本章只需知道它把 grid 塞进 run 的关键字参数、warmup=False，随后所有工作都在 run 里发生"]
+    },
+    {
+      "path": "python/triton/runtime/jit.py",
+      "lines": "L547-L561",
+      "code": "    def create_binder(self, backend):\n        \"\"\"\n        Precompute as much as possible.\n        \"\"\"\n        from ..compiler import CompiledKernel, compile, ASTSource, make_backend\n        self.CompiledKernel = CompiledKernel\n        self.compile = compile\n        self.ASTSource = ASTSource\n        self.make_backend = make_backend\n        self.binder = create_function_from_signature(self.signature, self.params, backend)\n        self.constexpr_indices = [i for (i, p) in enumerate(self.params) if p.is_constexpr]\n        self.non_constexpr_indices = [i for (i, p) in enumerate(self.params) if not p.is_constexpr]\n        self.specialised_indices = [\n            i for (i, p) in enumerate(self.params) if (not p.do_not_specialize) and (not p.is_constexpr)\n        ]",
+      "elide": ["create_function_from_signature 如何 exec 动态生成 binder 是 ch10 的主题（binder-codegen）；本章看 create_binder 在 run 侧的另一半职责——把 compile/ASTSource/CompiledKernel/make_backend 这几个编译入口一次性缓存到 self 上，之后每次 run 直接取，且必须等拿到 backend（因而需 device）才能建，这正是它惰性的原因"]
+    },
+    {
+      "path": "python/triton/runtime/jit.py",
+      "lines": "L563-L584",
+      "code": "    def run(self, *args, grid, warmup, **kwargs):\n        kwargs[\"debug\"] = kwargs.get(\"debug\", False) or os.environ.get(\"TRITON_DEBUG\", \"0\") == \"1\"\n\n        # parse options\n        from ..compiler import make_backend\n        device = driver.active.get_current_device()\n        stream = driver.active.get_current_stream(device)\n        target = driver.active.get_current_target()\n        backend = make_backend(target)\n\n        # Execute pre run hooks with args and kwargs\n        for hook in self.pre_run_hooks:\n            hook(*args, **kwargs)\n\n        if self.binder is None:\n            self.create_binder(backend)\n\n        bound_args, sig_and_spec, constexpr_vals, non_constexpr_vals, excess_kwargs = self.binder(*args, **kwargs)\n\n        # compute cache key\n        key = ''.join(sig_and_spec) + str((constexpr_vals, excess_kwargs))\n        kernel = self.cache[device].get(key, None)",
+      "elide": ["driver.active.get_current_device/stream/target 与 make_backend 是跨到 driver 子系统的一跳——get_current_device=torch.cuda.current_device、get_current_stream 需 CUDA raw stream，host 无 GPU 在此抛错。driver 抽象/后端发现是 ch12，本章只标边界。binder 调用返回的 5 元组、以及 key 的三桶（签名+特化位+constexpr 值）构成见 ch10"]
+    },
+    {
+      "path": "python/triton/runtime/jit.py",
+      "lines": "L586-L629",
+      "code": "        if kernel is None:\n            # Kernel is not cached; we have to compile.\n            options = backend.parse_options(kwargs)\n\n            # deprecated arguments\n            assert \"device_type\" not in kwargs, \"device_type option is deprecated; current target will be used\"\n            assert \"device\" not in kwargs, \"device option is deprecated; current device will be used\"\n            assert \"stream\" not in kwargs, \"stream option is deprecated; current stream will be used\"\n            for k in excess_kwargs:\n                if k not in options.__dict__:\n                    raise KeyError(\"Keyword argument %s was specified but unrecognised\" % k)\n\n            bound_vals = tuple(bound_args.values())\n\n            # `None` is nullptr. Implicitly convert to *i8. This needs to be\n            # done here rather than when we build the signature as otherwise\n            # the kernel cache key could not distinguish between byte pointers\n            # and None arguments, resulting in a downstream mismatch:\n            sigkeys = [self.params[i].name for i in self.non_constexpr_indices]\n            sigvals = sig_and_spec[:len(sigkeys)]\n            signature = {k: ('*i8' if (v == 'none') else v) for (k, v) in zip(sigkeys, sigvals)}\n\n            configs = (backend.get_attrs_descriptor(self.params, bound_vals), )\n            constant_params = configs[0].get_constants()\n            constants = {\n                p.name: v\n                for (v, p) in zip(bound_vals, self.params)\n                if p.is_constexpr or (p.num in constant_params) or v is None\n            }\n            for i, arg in constants.items():\n                if callable(arg):\n                    raise TypeError(f\"Callable constexpr at index {i} is not supported\")\n\n            if self._call_hook(key, signature, device, constants, options, configs, warmup, before=True):\n                return None\n            # compile the kernel\n            src = self.ASTSource(self, signature, constants, configs[0])\n            kernel = self.compile(\n                src,\n                target=target,\n                options=options.__dict__,\n            )\n            self.cache[device][key] = kernel\n            self._call_hook(key, signature, device, constants, options, configs, warmup, before=False)",
+      "elide": ["backend.parse_options/get_attrs_descriptor 属后端契约（ch12），此处只作调用；get_attrs_descriptor 返回 AttrsDescriptor（16 字节对齐等特化属性的载体，ch10 已铺）。self.compile 就是 python/triton/compiler/compiler.py:compile——它内部的五段驱动主循环（make_ir→逐 stage compile_ir→写回 metadata→FileCacheManager 磁盘缓存）是 ch14 主题，本章把它当一次调用。_call_hook 是 autotune/缓存旁路的观测钩子，None 时直接返回 False（见下条）"]
+    },
+    {
+      "path": "python/triton/runtime/jit.py",
+      "lines": "L631-L654",
+      "code": "        # Check that used global values have not changed.\n        not_present = object()\n        for (name, _), (val, globals_dict) in self.used_global_vals.items():\n            if (newVal := globals_dict.get(name, not_present)) != val:\n                raise RuntimeError(\n                    f\"Global variable {name} has changed since we compiled this kernel, from {val} to {newVal}\")\n\n        if not warmup:\n            # canonicalize grid\n            assert grid is not None\n            if callable(grid):\n                # Arguments are passed as a dict to `grid`, by contract.\n                # TODO(jlebar): In the new launch API, pass the compiler flags as a\n                # second parameter to `grid`.\n                grid = grid(bound_args)\n            grid_size = len(grid)\n            grid_0 = grid[0]\n            grid_1 = grid[1] if grid_size > 1 else 1\n            grid_2 = grid[2] if grid_size > 2 else 1\n\n            # launch kernel\n            launch_metadata = kernel.launch_metadata(grid, stream, *non_constexpr_vals)\n            kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata,\n                       self.CompiledKernel.launch_enter_hook, self.CompiledKernel.launch_exit_hook, *non_constexpr_vals)\n        return kernel",
+      "elide": ["used_global_vals 核对机制本体（DependenciesFinder 登记『可疑』全局量、首编时快照）在 ch10，本章作为 run 尾部一站回指即可。warmup=True 时（如 autotune 预热）编译完就 return，不发射。kernel.run 里 kernel.function/kernel.packed_metadata 的填充见惰性设备句柄一节"]
+    },
+    {
+      "path": "python/triton/compiler/compiler.py",
+      "lines": "L379-L396",
+      "code": "    def _init_handles(self):\n        if self.module is not None:\n            return\n        device = driver.active.get_current_device()\n        # create launcher\n        self.run = driver.active.launcher_cls(self.src, self.metadata)\n        # not enough shared memory to run the kernel\n        max_shared = driver.active.utils.get_device_properties(device)[\"max_shared_mem\"]\n        if self.metadata.shared > max_shared:\n            raise OutOfResources(self.metadata.shared, max_shared, \"shared memory\")\n        # TODO: n_regs, n_spills should be metadata generated when calling `ptxas`\n        self.module, self.function, self.n_regs, self.n_spills = driver.active.utils.load_binary(\n            self.name, self.kernel, self.metadata.shared, device)\n\n    def __getattribute__(self, name):\n        if name == 'run':\n            self._init_handles()\n        return super().__getattribute__(name)",
+      "elide": ["launcher_cls / load_binary 属 driver 子系统（ch12），需真设备（把 cubin 装进 GPU、查 max_shared_mem）。本章只点破机关：run() 里 `kernel.run(...)` 一读 .run 属性，__getattribute__ 就先跑 _init_handles——把『编译期产物』首次接到『真设备』上。compile 阶段 module/function 一直是 None，因此没有 GPU 也能编译成功，只在第一次发射时才需要设备"]
+    },
+    {
+      "path": "python/triton/compiler/compiler.py",
+      "lines": "L398-L413",
+      "code": "    def launch_metadata(self, grid, stream, *args):\n        if CompiledKernel.launch_enter_hook is None:\n            return None\n        ret = LazyDict({\"name\": self.name, \"function\": self.function, \"stream\": stream})\n        if not isinstance(self.src, ASTSource) or self.src.fn.launch_metadata is None:\n            return ret\n        arg_dict = {}\n        arg_idx = 0\n        for i, arg_name in enumerate(self.src.fn.arg_names):\n            if i in self.src.fn.constexprs:\n                arg_dict[arg_name] = self.src.constants[arg_name]\n            else:\n                arg_dict[arg_name] = args[arg_idx]\n                arg_idx += 1\n        ret.add(self.src.fn.launch_metadata, (grid, self.metadata, arg_dict))\n        return ret",
+      "elide": ["常规发射 launch_enter_hook 为 None → 直接返回 None（零开销）；仅当用户注册了 enter hook / @triton.jit(launch_metadata=...) 时才组 LazyDict 兜底并挂用户回调。LazyDict 惰性求值（.get() 时才拼），避免无人观测时白算"]
+    },
+    {
+      "path": "python/triton/compiler/compiler.py",
+      "lines": "L217-L233",
+      "code": "def compile(src, target=None, options=None):\n    if target is None:\n        target = driver.active.get_current_target()\n    assert isinstance(target, GPUTarget), \"target must be of GPUTarget type\"\n    backend = make_backend(target)\n    ir_source = not isinstance(src, ASTSource)\n    # create backend\n    if ir_source:\n        assert isinstance(src, str), \"source must be either AST or a filepath\"\n        src = IRSource(src)\n    extra_options = src.parse_options()\n    options = backend.parse_options(dict(options or dict(), **extra_options))\n    # create cache manager\n    env_vars = get_cache_invalidating_env_vars()\n    key = f\"{triton_key()}-{src.hash()}-{backend.hash()}-{options.hash()}-{str(sorted(env_vars.items()))}\"\n    hash = hashlib.sha256(key.encode(\"utf-8\")).hexdigest()\n    fn_cache_manager = get_cache_manager(hash)",
+      "elide": ["只截 compile 开场以说明 run 交给它什么（ASTSource + target + options.__dict__）以及它算的是另一层 hash——磁盘缓存键（含 triton_key/后端/环境变量），与 run 侧的内存 cache 键是两层缓存。compile 内部 make_ir→逐 stage→写回的驱动主循环全部留给 ch14，本章到此为止"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "JITFunction.run", "file": "python/triton/runtime/jit.py", "responsibility": "全书脊柱胶水：一次 launch 的编排者——取 device/stream/target、惰性绑参、查内存 cache、未命中则驱动 compile 回填、规范化 grid、跨语言发射"},
+    {"name": "KernelInterface.__getitem__", "file": "python/triton/runtime/jit.py", "responsibility": "fn[grid](args) 语法糖，记住 grid 后落到 run(grid=..., warmup=False)（细节属 ch10，本章的入口）"},
+    {"name": "CompiledKernel", "file": "python/triton/compiler/compiler.py", "responsibility": "compile 的产物句柄：持有 cubin/metadata/packed_metadata；module/function/run 惰性化——首次读 .run 才把二进制装上真设备"},
+    {"name": "CompiledKernel.__getattribute__ / _init_handles", "file": "python/triton/compiler/compiler.py", "responsibility": "惰性设备句柄机关：拦截 .run 读取触发 load_binary，把编译期产物接到发射路径（唯一真正需要 GPU 的地方之一）"},
+    {"name": "CompiledKernel.launch_metadata", "file": "python/triton/compiler/compiler.py", "responsibility": "发射前组装观测元数据；无 enter hook 时零成本返回 None"},
+    {"name": "make_backend", "file": "python/triton/compiler/compiler.py", "responsibility": "按 target 选出唯一支持它的 backend.compiler 实例（后端发现细节属 ch12，本章作边界调用）"},
+    {"name": "GPUDriver", "file": "python/triton/backends/driver.py", "responsibility": "driver.active 的具体后端：get_current_device/stream 直接桥到 torch.cuda——host 无 GPU 的断裂点（子系统展开属 ch12）"}
+  ],
+
+  "data_flow": [
+    "1. 用户写 fn[grid](a,b,BLOCK=128) → KernelInterface.__getitem__ 返回 lambda，调它 = JITFunction.run(a,b,BLOCK=128, grid=grid, warmup=False)",
+    "2. run 开场：合成 debug 旗标；driver.active 取 device/stream/target；make_backend(target) 拿到本次编译/发射用的 backend（跨 driver 边界，host 无 GPU 断裂）",
+    "3. 逐个跑 pre_run_hooks（autotune 等外层挂钩）",
+    "4. 惰性绑参：self.binder 为 None 则 create_binder(backend)（同时缓存 compile/ASTSource/CompiledKernel 入口）；调 binder 得 (bound_args, sig_and_spec, constexpr_vals, non_constexpr_vals, excess_kwargs)",
+    "5. 拼内存 cache 键 key，self.cache[device].get(key)",
+    "6a. 命中（快路径）：直接拿到 CompiledKernel，跳到步骤 8",
+    "6b. 未命中（慢路径）：parse_options → 校验 excess_kwargs → None→*i8 修正签名 → get_attrs_descriptor+get_constants 组 constants → callable-constexpr 守卫 → _call_hook(before)（可提前返回）→ ASTSource(self,signature,constants,attrs) → compile(src,target,options) 编出 CompiledKernel → 回填 self.cache[device][key] → _call_hook(after)",
+    "7. used_global_vals 逐个核对未变（否则 RuntimeError；机制属 ch10）",
+    "8. 非 warmup：规范化 grid（callable 则 grid(bound_args)，补 grid_0/1/2 三维）",
+    "9. launch_metadata = kernel.launch_metadata(grid,stream,*non_constexpr_vals)（无 hook 则 None）",
+    "10. kernel.run(...) —— 读 .run 属性触发 __getattribute__→_init_handles：driver.active.launcher_cls 造 C++ launcher + load_binary 装 cubin 到 GPU（首次才做）；随后跨语言调 C++ launcher 真正发射一个 kernel",
+    "11. return kernel（CompiledKernel），供 autotune/warmup 等复用"
+  ],
+
+  "design_decisions": [
+    {"decision": "binder 惰性构建（self.binder is None 才 create_binder）", "why": "create_binder 需要 backend（compute_spec_key 来自 backend），而 backend 要先 make_backend(target)、target 要 driver.active——都得等到第一次真 run、真环境就绪时才有；构造期（ch10 __init__）拿不到设备，故延后", "evidence": "python/triton/runtime/jit.py:L577-L578"},
+    {"decision": "binder 用 exec 动态生成而非通用 sig.bind+apply_defaults", "why": "签名绑定+默认值填充+特化键计算是每次 launch 都要跑的高频路径，反射式绑定占了大半发射开销；把它编译成一条直线函数按 kernel 记忆，摊薄每次绑参成本（注释原文：constitute much of the kernel launch overhead）", "evidence": "python/triton/runtime/jit.py:L345-L351"},
+    {"decision": "两层缓存：run 侧内存 cache[device][key] + compile 侧 FileCacheManager 磁盘缓存", "why": "内存 cache 命中是最快路径（一次 dict 查找即拿到已装好的 CompiledKernel），跨进程/重启才落到磁盘缓存，磁盘也没有才真编译；两层键不同（内存键=签名+特化+constexpr；磁盘键含 triton_key/后端/环境变量）", "evidence": "python/triton/runtime/jit.py:L584 + python/triton/compiler/compiler.py:L231-L252"},
+    {"decision": "CompiledKernel 的设备句柄惰性化（module/function=None，首读 .run 才 _init_handles）", "why": "编译本身不该要求当前有可用设备（可在无 GPU 或异设备上编译/序列化）；把 load_binary（查 max_shared_mem、装 cubin）推迟到第一次真发射——注释：binaries are lazily initialized because it involves doing runtime things", "evidence": "python/triton/compiler/compiler.py:L373-L377"},
+    {"decision": "用 __getattribute__ 拦 .run 触发 _init_handles，而非在 run() 里显式初始化", "why": "让『首次发射自动装设备』对调用方透明——无论谁读 kernel.run（jit.run 或 CompiledKernel.__getitem__ 独立发射）都自动接上，不用记得先调初始化", "evidence": "python/triton/compiler/compiler.py:L393-L396"},
+    {"decision": "None→*i8 的转换放在 run 时（编签名时）而非建 binder 时", "why": "若在建签名时就抹平 None，缓存键无法区分『真的字节指针』与『None 实参』，会导致下游误命中错误 kernel（注释原文说明）", "evidence": "python/triton/runtime/jit.py:L600-L606"},
+    {"decision": "cache 按 device 分桶（self.cache[device]）", "why": "同一 JITFunction 在不同设备上编出的 CompiledKernel 不可混用（二进制/能力不同），键相同也要分设备存", "evidence": "python/triton/runtime/jit.py:L584 + L684"},
+    {"decision": "launch_metadata 在无 enter hook 时直接返回 None、LazyDict 惰性求值", "why": "绝大多数发射没有观测钩子，这条路径必须零额外开销；有钩子时也只在 .get() 时才拼字典", "evidence": "python/triton/compiler/compiler.py:L398-L400 + L314-L324"},
+    {"decision": "warmup 旗标：编译但不发射", "why": "autotune/预热只想触发编译回填缓存、不想真跑 kernel（也就不需要设备发射），故 warmup=True 时跳过 grid 规范化与 kernel.run", "evidence": "python/triton/runtime/jit.py:L638"}
+  ],
+
+  "theory": [
+    {
+      "topic": "launch 热路径开销拆解（快路径）",
+      "content": "cache 命中时 run 的固定开销 = driver.active 三次取值 + make_backend + 一次 binder 调用（直线绑参+特化键）+ 一次字符串拼接得 key + 一次 dict.get + grid 规范化（几次比较/索引）+ 跨语言调 C++ launcher。全程无编译、无磁盘 IO，是纯 Python 侧固定成本。这条成本与 kernel 计算量无关——kernel 再小也要付这一整套。"
+    },
+    {
+      "topic": "binder 摊薄的量化直觉",
+      "content": "通用 inspect.Signature.bind + apply_defaults 每次都要遍历参数、匹配 args/kwargs、填默认值、再逐参算特化键（compute_spec_key/mangle_type），全是带分支的反射。exec 生成的 dynamic_func 把这些在建 binder 时一次性展开成一条无分支直线（参数名/默认值/特化调用都硬编码进函数体），此后每次 launch 只跑这条直线，省掉反射与分支——注释明确这占了 launch overhead 的大头。"
+    },
+    {
+      "topic": "慢路径为何贵",
+      "content": "未命中触发整条 compile：make_ir（AST→TTIR）+ 逐 stage lowering（TTIR→TTGIR→LLVM IR→PTX→cubin，多轮 MLIR pass）+ 磁盘缓存读写。相对快路径的微秒级，慢路径是毫秒到数百毫秒量级，且首次 launch 还叠加 _init_handles 的 load_binary。所以第一次 launch 与稳态 launch 的开销差几个数量级——性能测量必须先预热。"
+    },
+    {
+      "topic": "小 kernel 为何被发射开销主导",
+      "content": "GPU 执行时间 ∝ 计算量/带宽；而 run 的 Python 侧固定开销近似常数。当 kernel 很小（元素少、算子简单），GPU 侧几微秒就算完，Python 侧绑参/查缓存/规范化 grid/跨语言发射的固定开销反而成了瓶颈——此时瓶颈不是 GPU 算不过来，而是发射路径喂不快。优化方向随之改变：融合多个小 kernel、增大 grid 分摊、或用 CUDA graph 绕开重复的 Python 发射，而非堆算力。这正是本章解锁的性能判据。"
+    }
+  ],
+
+  "subtraction_plan": {
+    "note": "本章 skip_impl（无 subtract-only 精简版）——run() 是编排胶水，牵动整条编译栈（compile/driver/后端），切一片跑不起来；按实例硬规则『可运行交叉验证=pin 精确编译』，由 explainer 用 pip install triton==3.2.0 headless 编译真 kernel 取证（首次 launch cache 未命中 / 二次命中；C++ launcher 真发射需 GPU 的部分用 TRITON_INTERPRET 或编译期产物替代并如实标注）。must_keep 列出读者必须理解、writer 必须讲清的符号。",
+    "delete": [],
+    "must_keep": [
+      {"symbol": "run", "why": "本章脊柱主角，一次 launch 的编排入口"},
+      {"symbol": "create_binder", "why": "惰性绑参 + 缓存编译入口，run 第一次才建"},
+      {"symbol": "binder", "why": "run 调它得 5 元组，摊薄绑参开销的载体"},
+      {"symbol": "driver", "why": "driver.active 取 device/stream/target 的边界对象（host 无 GPU 断裂点）"},
+      {"symbol": "make_backend", "why": "按 target 选后端，run 与 compile 都调它"},
+      {"symbol": "get_current_device", "why": "driver 边界一跳，host 无 GPU 在此抛错"},
+      {"symbol": "get_current_stream", "why": "取发射用 stream，桥到 torch.cuda"},
+      {"symbol": "get_current_target", "why": "取 target 供 make_backend/compile"},
+      {"symbol": "cache", "why": "内存 cache[device][key]，快路径命中点"},
+      {"symbol": "parse_options", "why": "慢路径首步，把 kwargs 解析成后端 options"},
+      {"symbol": "get_attrs_descriptor", "why": "慢路径组特化描述子，供 ASTSource"},
+      {"symbol": "get_constants", "why": "从描述子取常量参数，参与 constants 组装"},
+      {"symbol": "ASTSource", "why": "run 把 (self,signature,constants,attrs) 包成 compile 的输入"},
+      {"symbol": "compile", "why": "run 调它编出 CompiledKernel（内部留给 ch14）"},
+      {"symbol": "CompiledKernel", "why": "compile 产物句柄，持有惰性设备句柄"},
+      {"symbol": "_init_handles", "why": "惰性把 cubin 装到 GPU，接入发射路径"},
+      {"symbol": "__getattribute__", "why": "拦 .run 读取触发 _init_handles 的机关"},
+      {"symbol": "launch_metadata", "why": "发射前组观测元数据，无 hook 零成本"},
+      {"symbol": "launch_enter_hook", "why": "发射观测入口钩子，常态 None"},
+      {"symbol": "launch_exit_hook", "why": "发射观测出口钩子，常态 None"},
+      {"symbol": "packed_metadata", "why": "打包后的 metadata，作为发射实参传 C++ launcher"},
+      {"symbol": "non_constexpr_vals", "why": "发射时真正传给 kernel 的运行期实参"},
+      {"symbol": "used_global_vals", "why": "尾部核对全局量未变（机制属 ch10，此处一站回指）"},
+      {"symbol": "warmup", "why": "编译但不发射的旗标，autotune 预热用"},
+      {"symbol": "pre_run_hooks", "why": "run 开场的外层挂钩点（autotune 等）"},
+      {"symbol": "launcher_cls", "why": "driver 提供的 C++ launcher 类，_init_handles 造它"},
+      {"symbol": "load_binary", "why": "把 cubin 装进 GPU（需真设备）"}
+    ]
+  },
+
+  "mechanisms": [
+    {
+      "id": "run-orchestration-spine",
+      "name": "run() 一次 launch 的编排主脊：driver→binder→key→cache→[compile]→grid→launch",
+      "kind": "dataflow",
+      "source_anchors": ["python/triton/runtime/jit.py:L563-L655"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "driver-boundary-jump",
+      "name": "driver.active 取 device/stream/target + make_backend——跨 driver 子系统的边界（host 无 GPU 断裂点）",
+      "kind": "protocol",
+      "source_anchors": ["python/triton/runtime/jit.py:L567-L571", "python/triton/backends/driver.py:L32-L44"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "lazy-binder-invocation",
+      "name": "惰性 create_binder + 调 binder 得 5 元组（run 侧视角，绑参摊薄）",
+      "kind": "dataflow",
+      "source_anchors": ["python/triton/runtime/jit.py:L577-L580", "python/triton/runtime/jit.py:L547-L561"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "runtime-cache-lookup",
+      "name": "内存 cache[device][key] 查询——命中即快路径",
+      "kind": "dataflow",
+      "source_anchors": ["python/triton/runtime/jit.py:L582-L584"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "compile-slowpath-orchestration",
+      "name": "未命中慢路径编排：parse_options→签名/constants 组装→_call_hook→ASTSource→compile→回填缓存",
+      "kind": "protocol",
+      "source_anchors": ["python/triton/runtime/jit.py:L586-L629"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "none-to-i8-signature-fixup",
+      "name": "None→*i8 隐式转换（放在 run 时以保缓存键能区分字节指针与 None）",
+      "kind": "algorithm",
+      "source_anchors": ["python/triton/runtime/jit.py:L600-L606"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "constants-assembly",
+      "name": "constants 组装：constexpr ∪ 属性常量(num in constant_params) ∪ None 实参 → 喂 ASTSource",
+      "kind": "dataflow",
+      "source_anchors": ["python/triton/runtime/jit.py:L608-L617"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "grid-canonicalization",
+      "name": "grid 规范化：callable grid → grid(bound_args)；补齐 grid_0/1/2 三维",
+      "kind": "algorithm",
+      "source_anchors": ["python/triton/runtime/jit.py:L638-L649"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "launch-emission-crosslang",
+      "name": "kernel.launch_metadata + kernel.run——Python 侧到 C++ launcher 的跨语言发射一跳",
+      "kind": "protocol",
+      "source_anchors": ["python/triton/runtime/jit.py:L651-L654", "python/triton/compiler/compiler.py:L398-L413"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "lazy-device-handles",
+      "name": "CompiledKernel 惰性设备句柄：__getattribute__ 拦 .run → _init_handles 装 cubin 到 GPU（收口发射路径）",
+      "kind": "protocol",
+      "source_anchors": ["python/triton/compiler/compiler.py:L379-L396", "python/triton/compiler/compiler.py:L373-L377"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "warmup-vs-launch",
+      "name": "warmup 旗标：编译回填缓存但跳过 grid 规范化与发射",
+      "kind": "config",
+      "source_anchors": ["python/triton/runtime/jit.py:L638-L655", "python/triton/runtime/jit.py:L324-L330"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "launch-metadata-lazydict",
+      "name": "launch_metadata 惰性观测元数据：无 enter hook 返回 None，有则 LazyDict 兜底 + 用户回调",
+      "kind": "dataflow",
+      "source_anchors": ["python/triton/compiler/compiler.py:L398-L413", "python/triton/compiler/compiler.py:L314-L324"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "launch-overhead-anatomy",
+      "name": "launch 热路径开销拆解 + 小 kernel 发射受限判据（性能落点）",
+      "kind": "config",
+      "source_anchors": ["python/triton/runtime/jit.py:L563-L655"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    }
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_payoff": [],
+    "note": "bible.py due ch11 返回空（无登记的应埋/应回收项）。本章的跨章关系以回指为主：ch10（JITFunction 构造/KernelParam/缓存键三桶/binder 代码生成/compute_spec_key/mangle_type/used_global_vals）、ch12（driver 抽象/后端发现/launcher_cls/load_binary/autotune/磁盘缓存）、ch14（compile 内部五段驱动主循环）。"
+  }
+}

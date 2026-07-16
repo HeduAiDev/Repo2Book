@@ -1,0 +1,286 @@
+{
+  "chapter_id": "ch11",
+  "slug": "ch11-run-launch-pipeline",
+  "trace_note": "全章素材取自单个 headless pin-compile 驱动脚本 traces/run_launch.py（venv=triton==3.2.0，与 pin v3.2.0 前端逐字节同，见 INSTANCE.md）。脚本 stub 掉 driver.active（host 无 GPU），用 warmup=True 让 JITFunction.run 走完除『grid 规范化 + C++ launcher 发射』外的整条 run() 主体——这两步在 `if not warmup` 尾部、需真设备。故 run 侧的取环境/惰性绑参/查内存 cache/慢路径 compile 全部是真跑真编译；grid 规范化与 None→*i8 用源码同款纯 Python 逻辑离线复现；真正的跨语言 kernel.run 发射需 GPU，未运行，如实标注。原始输出 traces/run_launch.json。所有逐轮表数字均可在该 json 里逐个核到。",
+  "mechanisms": [
+    {
+      "mechanism_id": "run-orchestration-spine",
+      "intuition": "run() 像机场登机口的一次完整放行：先确认『今天在哪个跑道、哪条滑行道』（driver.active 取 device/stream/target），把这次航班的登机牌一次性打好（binder 绑参），去值机系统查『这架飞机之前放行过吗』（cache 查键）——查到就直接放行（快路径），查不到才现造一遍手续（慢路径 compile）。同一航班第二次来，登机口只做一次哈希查表就放行。",
+      "worked_example": {
+        "params": {"kernel": "add_kernel(x_ptr,y_ptr,out_ptr,n_elements,BLOCK:constexpr)", "N": 1024, "BLOCK": 256, "grid": "(4,)", "target": "cuda sm=80 warp=32"},
+        "trace_source": "run",
+        "trace_ref": "traces/run_launch.json",
+        "table": {
+          "columns": ["阶段（jit.py:L567–654）", "run() 动作", "本例产物 / 标量", "需真设备？"],
+          "rows": [
+            ["① 取环境", "driver.active 取 device/stream/target + make_backend(target)", "device=0，target=cuda sm=80 warp=32，backend=CUDABackend", "是（host 无 GPU 在此断裂）"],
+            ["② 惰性绑参", "binder is None → create_binder；调 binder(*args,debug=False)", "五元组：sig_and_spec=[*fp32,*fp32,*fp32,i32,D,D,D,D]，constexpr_vals=(256,)", "否"],
+            ["③ 拼键+查 cache", "key=签名+特化+constexpr；cache[0].get(key)", "key=…((256, ), {'debug': False})；首次 launch 未命中", "否"],
+            ["④ 慢路径 compile", "parse_options→…→ASTSource→compile→回填 cache", "编出 CompiledKernel，cache 条目=1", "否（编译不需设备）"],
+            ["⑤ 规范化 grid", "(4,) 补齐三维 (grid_0,grid_1,grid_2)", "(4, 1, 1)", "否"],
+            ["⑥ 跨语言发射", "kernel.launch_metadata + kernel.run → C++ launcher", "真发射一个 kernel（headless 未跑，见机制 launch-emission-crosslang）", "是"],
+            ["第二次同参 launch（快路径）", "①–③ 后 cache[0].get 命中 → 跳过④", "直接拿回同一 CompiledKernel（k2 is k1=True），无编译", "否"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "对固定的 (签名, 特化位, constexpr 值) 三元组键，run() 生命周期内至多编译一次——首个 miss 结尾必执行 self.cache[device][key]=kernel 回填，此后同键 cache.get 恒命中，编译次数单调封顶为 1。",
+        "argument": "key 是 sig_and_spec 与 constexpr_vals 的确定性函数（相同实参类型/特化/常量 → 相同 key）；慢路径入口守卫是 `kernel is None`，而慢路径结尾无条件写回 cache[key]，故第二次进 run 时 get 非 None、`kernel is None` 为假、跳过整个 compile 块。cache 只增不删（无淘汰），命中一旦成立不会失效。"
+      },
+      "quantified": "本例一条 launch 主脊由 6 段固定工序组成，其中只有第 ④ 段（compile）在 miss 时展开。冷进程首次 launch 实测 1951.11 ms（含 ptxas/LLVM 一次性预热），稳态命中仅 4.398 µs（run 侧 Python 记账，见 launch-overhead-anatomy）——同一条脊柱，miss 与 hit 相差约 44 万倍，差别全在第 ④ 段是否触发。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch11-launch-spine",
+          "claim": "一次 launch 走 6 段固定流水线，只有内存 cache 未命中才岔进 compile 支路，之后所有同参 launch 都抄近道命中。",
+          "template": "flow",
+          "panels": "主干竖排 6 段：①driver.active 取 device/stream/target + make_backend →②惰性 binder 得 5 元组 →③拼 key 查 cache[device] →◇菱形判定『命中?』→ 命中支线直达⑤；未命中支线进④compile（parse_options→ASTSource→compile→回填 cache，标注『回填后此键永久命中』回箭到 cache）→⑤规范化 grid (4,)→(4,1,1) →⑥kernel.run 跨语言发射。左侧泳道标注『需真设备』只覆盖 ① 与 ⑥（虚线闪电标断裂点）。",
+          "numbers": [
+            {"value": "grid (4,) → (4, 1, 1)", "provenance": "traces/run_launch.json: grid_1tuple_in / grid_1tuple_out"},
+            {"value": "constexpr_vals=(256,)", "provenance": "traces/run_launch.json: binder_constexpr_vals"},
+            {"value": "cache 条目 miss 后=1", "provenance": "traces/run_launch.json: cache_entries_after_miss"},
+            {"value": "k2 is k1 = True（同参命中返回同一对象）", "provenance": "traces/run_launch.json: hit_returns_same_object"}
+          ],
+          "caption_draft": "图：JITFunction.run 一次 launch 的脊柱。6 段里只有第 ④ 段 compile 在首次未命中时展开；命中支线一次 dict 查表即放行。仅 ① 取环境与 ⑥ 跨语言发射需要真设备——这也是一个 headless 无 GPU 环境唯一跑不动的两处。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "driver-boundary-jump",
+      "intuition": "run() 一开口就要问三件事：『现在是哪块卡（device）、往哪条流水线排队（stream）、这块卡长什么样（target）』——这三问全部打到 driver.active 这道边界门上，门后面就是真 GPU。host 上没插卡，这道门一推就塌（get_current_device 直接抛错）。本章只把门推到、看清门后是 driver 子系统（ch12），不进门。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch11-driver-boundary",
+          "claim": "run() 开场三次 driver.active 取值 + make_backend 是跨到 driver 子系统的唯一边界一跳，也是 host 无 GPU 时最先断裂的地方。",
+          "template": "layout",
+          "panels": "上下两层泳道。上层『Python 运行时（jit.py run）』：run 开场四行代码 get_current_device / get_current_stream / get_current_target / make_backend(target) 横排。中间一道粗虚线标『driver 边界（host 无 GPU 在此断裂 ⚡）』。下层『driver 子系统（ch12 主题，本章不展开）』：GPUDriver.active → torch.cuda.current_device / raw CUDA stream / GPUTarget，灰显并标『见第十二章』。右侧注：make_backend(target) 返回 CUDABackend（headless 可跑，不需真设备）；三次 get_current_* 需真设备。",
+          "numbers": [
+            {"value": "device=0", "provenance": "traces/run_launch.py: FakeDriver.get_current_device 返回 0（stub 替代真 torch.cuda.current_device）"},
+            {"value": "target=cuda sm=80 warp=32", "provenance": "traces/run_launch.py: REAL_TARGET=GPUTarget(\"cuda\",80,32)"},
+            {"value": "make_backend → CUDABackend（headless OK）", "provenance": "traces/run_launch.py Phase 探测：make_backend(GPUTarget(\"cuda\",80,32)) 返回 nvidia.CUDABackend"}
+          ],
+          "caption_draft": "图：driver 边界一跳。run() 前四行把『当前哪块卡/哪条流/什么架构』问给 driver.active——门后是 ch12 的 driver 子系统。make_backend 只按 target 选后端（headless 可跑），但三次 get_current_* 桥到 torch.cuda，是无 GPU 环境最先崩的一处。本书用 stub 顶替这道门，才让后面的真编译在 host 上跑起来。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "lazy-binder-invocation",
+      "intuition": "binder 像给这个 kernel 量身定做的一台『登机牌打印机』：第一次用才组装（要等 backend 到位），装好后钉在 self 上；此后每次 launch 不再翻规则手册（通用 inspect.bind），而是按那台机器一按出牌——绑参和算特化键被压成一条没有分支的直线。",
+      "worked_example": {
+        "params": {"call": "add_kernel(x,y,o, N=1024, BLOCK=256, debug=False)"},
+        "trace_source": "run",
+        "trace_ref": "traces/run_launch.json",
+        "table": {
+          "columns": ["时刻", "self.binder 状态", "这一步做了什么", "得到什么"],
+          "rows": [
+            ["构造期（前章 __init__）", "None", "不建 binder——此刻拿不到 backend（需 make_backend→target→driver）", "self.binder is None（惰性守卫成立）"],
+            ["首次 run 进门", "None → built", "create_binder(backend)：create_function_from_signature 用 exec 生成 dynamic_func，并把 compile/ASTSource/CompiledKernel/make_backend 缓存到 self", "binder 就绪，之后 run 不再重建"],
+            ["调 binder(x,y,o,N,BLOCK=256,debug=False)", "built", "一条直线：绑位置参→算 sig_and_spec 与特化键→分拣 constexpr / 非 constexpr", "5 元组：sig_and_spec=[*fp32,*fp32,*fp32,i32,D,D,D,D]，constexpr_vals=(256,)，非 constexpr 4 个，excess={'debug': False}"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "binder 至多构建一次：`self.binder is None` 守卫使 create_binder 在 JITFunction 生命周期内只跑一次；构建是 None→非 None 的单向跃迁，此后守卫恒假。",
+        "argument": "create_binder 结尾把 self.binder 赋成一个函数对象（非 None），且没有任何代码把它重置回 None；因此第一次 run 之后 `self.binder is None` 永远为假，create_binder 不再进入。惰性的必然性来自数据依赖：binder 需要 backend，backend 需 make_backend(target)，target 需 driver.active——三者都要等第一次真 run、真环境就绪，构造期（ch10）拿不到。"
+      },
+      "quantified": "本例 5 个形参里 4 个非 constexpr（3 个 *fp32 指针 + 1 个 i32 标量），1 个 constexpr（BLOCK=256）。三个指针实参地址均 16 字节对齐 → 特化键各得 'D'，标量 N=1024 也是 16 的倍数 → 'D'，共 4 个 'D'。通用 inspect.Signature.bind+apply_defaults 每次 launch 都要遍历这 5 个参数做反射匹配+逐参算特化键；exec 生成的 dynamic_func 把这套在建 binder 时一次性展开成硬编码直线，此后每次 launch 只跑这条线——源码注释原文即称这部分反射『constitute much of the kernel launch overhead』。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "runtime-cache-lookup",
+      "intuition": "内存 cache 是登机口自己桌上的一本小册子：key 一样就翻到、秒放行；不一样就得走后面『现造手续』的长队。册子按设备分本（cache[device]），因为 A100 上打印的登机牌拿到别的卡上不认。",
+      "worked_example": {
+        "params": {"calls": ["add_kernel(BLOCK=256) 两次", "add_kernel(BLOCK=128) 一次"]},
+        "trace_source": "run",
+        "trace_ref": "traces/run_launch.json",
+        "table": {
+          "columns": ["调用", "cache 键（末段）", "cache[0].get", "结果 / 耗时"],
+          "rows": [
+            ["第 1 次 add_kernel(BLOCK=256)", "…((256, ), {'debug': False})", "未命中（None）", "触发编译→回填，cache 条目=1，≈ 1951.11 ms（冷进程，含一次性预热）"],
+            ["第 2 次 同参 add_kernel(BLOCK=256)", "同上 key", "命中", "直接返回同一对象（k2 is k1），≈ 4.398 µs（无编译）"],
+            ["第 3 次 add_kernel(BLOCK=128)", "…((128, ), {'debug': False})——constexpr 变了→新 key", "未命中（None）", "另编一份，cache 条目=2，≈ 98.379 ms（热进程真编译）"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "同一 device 桶内，cache 命中集合对固定 key 只增不减：一旦某 key 被回填，其后所有该 key 的 get 都命中；不同 key（如 BLOCK 变化）落在不同槽位，互不干扰。",
+        "argument": "key 由 ''.join(sig_and_spec)+str((constexpr_vals,excess_kwargs)) 完全确定——BLOCK 是 constexpr，进 constexpr_vals，256≠128 → 键串不同（本例末段 (256, ) vs (128, )），映射到 dict 不同条目。cache 是普通 dict 无淘汰，写入即长存，故 len(cache) 随不同键出现单调递增（本例 1→2），已存在的键命中性不因新键写入而改变。"
+      },
+      "quantified": "本例 dict 命中一次约 4.398 µs（2000 次平均）；同键未命中触发真编译（BLOCK=128 那次，热进程）约 98.379 ms——命中比未命中快约 2.2 万倍（98.379 ms / 4.398 µs ≈ 22367）。冷进程首次更是 1951.11 ms（叠加 ptxas/LLVM 一次性预热）。内存 cache 命中是全链路最快的一档，也是稳态性能测量必须先预热的原因。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "compile-slowpath-orchestration",
+      "intuition": "cache 没查到，run() 就现场备齐一套编译输入再交给 compile：把 kwargs 解析成后端选项、修正 None 指针的签名、算出哪些参数是编译期常量、打包成 ASTSource，最后调 compile 拿回 CompiledKernel 并塞回 cache。run 只是这条慢路的『前台派单员』，真正的五段编译主循环在 compile 里（ch14）。",
+      "worked_example": {
+        "params": {"call": "add_kernel 首次未命中 → 进入 if kernel is None 块", "target": "cuda sm=80 warp=32"},
+        "trace_source": "run",
+        "trace_ref": "traces/run_launch.json",
+        "table": {
+          "columns": ["子步（jit.py:L586–629 顺序）", "run 调用", "本例产物"],
+          "rows": [
+            ["parse_options", "backend.parse_options(kwargs)", "CUDAOptions（本例 num_warps=4, num_stages=3）"],
+            ["签名修正", "sig token 'none' → '*i8'（见机制 none-to-i8）", "signature 字典（本例无 None，全直通）"],
+            ["特化描述子", "backend.get_attrs_descriptor + get_constants", "configs[0] / constant_params"],
+            ["组 constants", "constexpr ∪ 属性常量(num∈constant_params) ∪ None 实参；callable 守卫", "constants 字典（本例含 BLOCK=256）"],
+            ["建 IR 源", "ASTSource(self, signature, constants, configs[0])", "src（compile 的输入）"],
+            ["编译", "self.compile(src, target, options.__dict__)", "CompiledKernel：asm 五段=[ttir,ttgir,llir,ptx,cubin]，ttir 3882 字符，metadata.shared=0 字节"],
+            ["回填", "self.cache[device][key] = kernel", "同键下次直达快路径（cache 条目=1）"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "慢路径对固定键至多执行一次：只在 `kernel is None` 时进入，块尾必写 cache[key]=kernel，故第二次同键 run 时 get 非 None、绕过整块。",
+        "argument": "入口条件 `if kernel is None` 与出口动作 `cache[device][key]=kernel` 构成配对——进入必因未命中，退出必留下命中记录。二者之间无 return（除 _call_hook(before) 返回 True 的旁路，那是 autotune 观测钩子，常态 None→False）；正常路径一定走到回填。因此对同一键，慢路径是一次性的。"
+      },
+      "quantified": "本例慢路径把 add_kernel 从 Python AST 一路编到 cubin，产出 5 段 IR（ttir/ttgir/llir/ptx/cubin），其中 ttir 就有 3882 字符；metadata 记录 num_warps=4、num_stages=3、shared=0 字节。热进程下这一整条约 98.379 ms——相对内存命中的 4.398 µs 贵约 4 个数量级。compile 内部这五段如何逐 stage lowering 是 ch14 的主题，run 侧只把它当一次调用。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch11-slowpath",
+          "claim": "内存 cache 未命中时，run() 依次备齐 5 样编译输入再调 compile，产物 CompiledKernel 携 5 段 IR 回填 cache。",
+          "template": "flow",
+          "panels": "横向流水：parse_options→(CUDAOptions num_warps=4,num_stages=3) → None→*i8 签名修正 → get_attrs_descriptor+get_constants→configs → 组 constants(含 BLOCK=256) → ASTSource → self.compile ▷ 一个大圆角框标『ch14：五段驱动主循环，本章不展开』内含 ttir→ttgir→llir→ptx→cubin 五格灰显 ▷ 出来一个 CompiledKernel（asm 5 段、ttir 3882 字符、shared 0 字节）→ 回填 cache[device][key]，回箭指向上游 cache『此键从此命中』。底部时间轴标：本段热进程 ≈ 98.379 ms。",
+          "numbers": [
+            {"value": "num_warps=4", "provenance": "traces/run_launch.json: metadata_num_warps"},
+            {"value": "num_stages=3", "provenance": "traces/run_launch.json: metadata_num_stages"},
+            {"value": "asm 5 段 ttir/ttgir/llir/ptx/cubin", "provenance": "traces/run_launch.json: asm_stages"},
+            {"value": "ttir 3882 字符", "provenance": "traces/run_launch.json: ttir_len_chars"},
+            {"value": "shared=0 字节", "provenance": "traces/run_launch.json: metadata_shared_bytes"},
+            {"value": "本段 ≈ 98.379 ms（热进程）", "provenance": "traces/run_launch.json: second_miss_wall_ms"}
+          ],
+          "caption_draft": "图：未命中慢路径。run() 是前台派单——依次备齐 options / 签名 / 特化描述子 / constants / ASTSource，再把担子交给 compile。compile 内部五段 lowering（灰框）留给第十四章；本章只看 run 交出什么、拿回什么（一个携 5 段 IR 的 CompiledKernel），以及它把产物塞回 cache 让此键从此走快路。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "none-to-i8-signature-fixup",
+      "intuition": "传进来的 None 代表『空指针』，编译时要当成 *i8（字节指针）。但如果在缓存键里也把 None 写成 *i8，就分不清『我真传了个 int8 指针』和『我传了 None』——下次可能误命中错 kernel。所以规矩是：缓存键里 None 永远留着 'none' 这个记号，只在临交给编译器那一刻才翻译成 *i8。",
+      "worked_example": {
+        "params": {"kernel": "opt_kernel(a_ptr, b_ptr, n, BLOCK:constexpr)", "call": "opt_kernel(a=*fp32 指针, b=None, n=1024, BLOCK=256)"},
+        "trace_source": "run",
+        "trace_ref": "traces/run_launch.json",
+        "table": {
+          "columns": ["参数", "binder 给的 token（sig_and_spec）", "run 编 signature 时映射（L606）", "cache 键里保留的是"],
+          "rows": [
+            ["a_ptr（真 *fp32 指针）", "*fp32", "*fp32", "*fp32"],
+            ["b_ptr（传入 None）", "none", "*i8（当作 nullptr）", "none —— 不是 *i8！"],
+            ["n（int 1024）", "i32", "i32", "i32"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "None 实参与真实 *i8 字节指针实参在 cache 键中可区分：键用 'none' 记号，*i8 的映射只发生在 compile 的 signature 里、不回写键。",
+        "argument": "cache 键来自 binder 的 sig_and_spec，None 在 mangle_type(jit.py:L296-297) 返回字面 'none'；而 L606 的 `'*i8' if v=='none' else v` 只作用于临时构造的 signature 字典（喂给 ASTSource/compile），不改 sig_and_spec、不改 key。因此『传 None』得到键含 'none'，『传一个真 int8 指针』得到键含 '*i8'（其 dtype 经 type_canonicalisation_dict 映射），两者键串不同——不会互相误命中。若在建签名时就抹平，两者键相同即产生下游 kernel 错配（源码注释 L600-603 明示此隐患）。",
+        "note": "本例特意让 b_ptr 传 None（触发 fixup 的非平凡分支），trace 实测 sig_and_spec 第 2 位为 'none'、signature 字典里 b_ptr 变 '*i8'，前后不同——非退化。"
+      },
+      "quantified": "本例 opt_kernel 三个非 constexpr 参数得 sig_and_spec=[*fp32, none, i32, ...]；run 编签名后 signature={a_ptr:'*fp32', b_ptr:'*i8', n:'i32'}——只有 b_ptr 从 'none' 翻成 '*i8'，另两个原样。关键差异：cache 键末段仍带 'none'，与假设某天真传一个 int8* 得到的 '*i8' 键不同，二者各占一条缓存槽，永不误命中。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "grid-canonicalization",
+      "intuition": "grid 告诉 GPU『发多少个线程块，排成几维』。用户可以只给一维 (4,)，也可以给个函数按参数现算；run() 统一把它补成三维 (grid_0,grid_1,grid_2)，缺的维填 1——就像快递地址你只写了街道，系统自动补上『市/省默认同城、国家默认本国』，总量不变。",
+      "worked_example": {
+        "params": {"bound_args": "{n_elements:1024, BLOCK:256, ...}", "note": "callable grid 收到 bound_args 字典求值"},
+        "trace_source": "run",
+        "trace_ref": "traces/run_launch.json",
+        "table": {
+          "columns": ["传入 grid", "callable？", "len(grid)", "补齐后 (grid_0, grid_1, grid_2)"],
+          "rows": [
+            ["(4,)", "否", "1", "(4, 1, 1)"],
+            ["(4, 2)", "否", "2", "(4, 2, 1)"],
+            ["(4, 2, 3)", "否", "3", "(4, 2, 3)"],
+            ["lambda meta:(meta['n_elements']//meta['BLOCK']+1,)", "是 → grid(bound_args) 求值得 (5,)", "1", "(5, 1, 1)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "补维后 grid 恒为 3 元组，缺省维填 1，线程块总数不变：grid_1、grid_2 缺省=1，故 1 维 (g0) → (g0,1,1)，总块数 g0·1·1=g0 保持。",
+        "argument": "L646-649 取 grid_size=len(grid)，grid_1 = grid[1] if grid_size>1 else 1，grid_2 同理。缺失维一律取 1，乘 1 不改变总程序实例数；已给出的维原样保留。callable 分支先 grid=grid(bound_args) 求值成元组，再走同一补维逻辑——本例 (5,) → (5,1,1)，总块数 5 不变。仅 warmup=False 才执行这段（warmup 只编不发）。"
+      },
+      "quantified": "本例四种写法补维后总块数分别为 4、8、24、5（=各维乘积）。补维是 O(1) 几次比较+索引，纯 Python、无设备参与，属快路径固定开销的一小项；但 callable grid 每次 launch 都要调一次用户函数求值（本例 lambda 返回 5），若该函数本身昂贵会计入发射开销。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "launch-emission-crosslang",
+      "intuition": "前面全是 Python 在打点、查表、补维；到 kernel.run(...) 这一行，接力棒交给后端的 C++ launcher——它才真正把 grid/stream/参数指针塞进 CUDA，让 GPU 上冒出一个 kernel。这一跳是 Python↔C++ 的双语断点，也是全程唯一真正『发射』的动作，需要真设备。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch11-emission-crosslang",
+          "claim": "kernel.run(...) 是 Python 到后端 C++ launcher 的跨语言一跳，把 grid 三维/stream/function/packed_metadata/运行期实参一次性交给 GPU 真发射。",
+          "template": "swimlane",
+          "panels": "两条泳道。左『Python（jit.py run L651-654）』：先 launch_metadata=kernel.launch_metadata(grid,stream,*non_constexpr_vals)（常态无 hook→None，见 launch-metadata-lazydict）；再 kernel.run(grid_0,grid_1,grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata, launch_enter_hook, launch_exit_hook, *non_constexpr_vals)。中间粗箭头跨过『Python | C++』分界线（标⚡双语断点/需真设备）。右『后端 C++ launcher（driver 子系统，ch12）』：接收上述参数→cuLaunchKernel→GPU 上出现一个 kernel 实例。注：本书 headless 未执行此跳（无 GPU）。",
+          "numbers": [
+            {"value": "grid 三维 (4, 1, 1)", "provenance": "traces/run_launch.json: grid_1tuple_out"},
+            {"value": "运行期实参 non_constexpr 4 个（3 指针+1 i32）", "provenance": "traces/run_launch.json: binder_non_constexpr_count"},
+            {"value": "launch_enter_hook / launch_exit_hook 常态 None", "provenance": "python/triton/compiler/compiler.py:L398-400（无 enter hook 直接 None）"}
+          ],
+          "caption_draft": "图：跨语言发射一跳。run() 收尾把 grid 三维、stream、function、packed_metadata 与运行期实参交给后端 C++ launcher——这是全程唯一真正把 kernel 送上 GPU 的动作，也是双语断点。常态下 enter/exit hook 为 None，launch_metadata 直接 None，路径零额外开销。本书在无 GPU 的 host 上跑不到这一步，如实标注。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "lazy-device-handles",
+      "intuition": "编译产物 CompiledKernel 出厂时是『半成品』——cubin 在手，但还没装进任何一块 GPU（module/function 都是 None）。谁第一次去读它的 .run 属性，__getattribute__ 就偷偷先跑 _init_handles()，把 cubin 真正装上当前设备。于是『编译不需要 GPU、只有第一次发射才需要』这件事对调用方完全透明。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch11-lazy-handles",
+          "claim": "CompiledKernel 编译后 module/function 仍是 None（无需 GPU）；首次读 .run 触发 __getattribute__→_init_handles，把 cubin 装上设备，才接通发射路径。",
+          "template": "before-after",
+          "panels": "左『编译后（本书 headless 实测）』：CompiledKernel 持 asm 5 段 + metadata，但 module=None、function=None、run 未初始化——标『无 GPU 也能走到这里』。中间箭头触发器：任意代码读 kernel.run → __getattribute__ 拦截 name=='run' → 调 _init_handles()。右『首次发射后（需真设备）』：driver.active.launcher_cls 造 C++ launcher 挂到 self.run；load_binary 把 cubin 装进 GPU、查 max_shared_mem；module/function 被填实。底注：本书在 host 上只能停在左态（module_after_compile=None），右态需 GPU。",
+          "numbers": [
+            {"value": "module_after_compile = None", "provenance": "traces/run_launch.json: module_after_compile"},
+            {"value": "function_after_compile = None", "provenance": "traces/run_launch.json: function_after_compile"},
+            {"value": "metadata.shared = 0 字节（编译期即定，与装载无关）", "provenance": "traces/run_launch.json: metadata_shared_bytes"}
+          ],
+          "caption_draft": "图：惰性设备句柄。左边是本书能在无 GPU 环境亲眼看到的状态——编译完成，module/function 仍为 None，证明编译本身不碰设备。右边（需真 GPU）是首次读 .run 触发 _init_handles 后的样子：cubin 经 load_binary 装上卡、launcher 就位。这道 __getattribute__ 机关让『首次发射自动装设备』对 run() 透明。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "launch-overhead-anatomy",
+      "intuition": "同一个 kernel，三种『第一次』的代价天差地别：全新进程第一次编（最贵，还要热身编译器），换个参数在热进程里重编（贵但便宜一档），已经在内存 cache 里的稳态发射（最便宜，一次查表）。小算子的痛点在于：GPU 几微秒就算完了，可稳态发射那点固定 Python 开销反而成了瓶颈——不是算力不够，是发射喂不快。",
+      "worked_example": {
+        "params": {"kernel": "add_kernel(N=1024, BLOCK=256)", "measure": "warmup=True 路径，stub driver，headless"},
+        "trace_source": "run",
+        "trace_ref": "traces/run_launch.json",
+        "table": {
+          "columns": ["场景", "走哪条路", "本例耗时", "相对稳态命中"],
+          "rows": [
+            ["首次 launch（冷进程，内存+磁盘皆未命中）", "慢路径整条 compile + ptxas/LLVM 一次性预热", "≈ 1951.11 ms", "≈ 443591.2×"],
+            ["另编一份（热进程，真编译）", "慢路径 compile（无进程预热）", "≈ 98.379 ms", "≈ 22366.8×"],
+            ["稳态 launch（内存 cache 命中）", "快路径：driver 取值+绑参+查键（+规范化 grid+发射）", "≈ 4.398 µs", "1×（基准）"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "稳态（cache 命中）launch 的 Python 侧固定开销与 kernel 计算量无关，是近似常数；GPU 执行时间随问题规模增长——故存在一个临界规模，其下发射固定开销主导总耗时。",
+        "argument": "命中路径的动作集合固定：driver.active 三次取值 + make_backend + 一次 binder 直线调用 + 一次字符串拼键 + 一次 dict.get +（发射时）grid 补维 + 跨语言一跳，均不随输入元素数变化，故其耗时下界是常数（本例实测 run 侧记账 ≈ 4.398 µs）。而 GPU 计算时间 ∝ 元素数/带宽，随规模单调增。两条曲线（常数 vs 线性增）必在某规模相交：规模小于交点时常数项占优 → 发射受限；大于则算力受限。优化方向随之分野：小 kernel 靠融合/增大 grid/CUDA graph 摊薄固定开销，而非堆算力。"
+      },
+      "quantified": "三档实测：冷进程首次 1951.11 ms（≈ 443591.2× 于稳态，含一次性预热）；热进程真编译 98.379 ms（≈ 22366.8×）；内存命中 4.398 µs（2000 次平均，基准 1×）。注意 4.398 µs 是 headless 用 warmup=True 测得的 run 侧 Python 记账（取环境+绑参+查键），未含真正的 grid 补维与 C++ launcher 发射（需 GPU）——故它是真实稳态发射固定开销的下界。即便如此，这条常数开销就已比一个 1024 元素 add 的 GPU 计算时间量级更高——正是『小 kernel 被发射开销主导』的直接证据：此时优化不该盯着算力，而该盯着怎么少发射（融合/CUDA graph）或每次发射摊更多活（增大 grid）。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch11-overhead-tiers",
+          "claim": "同一 add_kernel 三档 launch 代价跨约 6 个数量级：冷编 1951.11 ms、热编 98.379 ms、稳态命中 4.398 µs——小 kernel 的瓶颈落在最右那根常数条上。",
+          "template": "state-table",
+          "panels": "对数横轴柱状对比（三根）：①首次冷编 1951.11 ms（标『含 ptxas/LLVM 预热，一次性』）②热进程真编 98.379 ms（标『慢路径 compile』）③稳态命中 4.398 µs（标『快路径，run 侧 Python 记账，发射固定开销下界』）。右侧叠一条示意：GPU 计算时间随元素数上升的斜线与③的水平常数线相交，交点左侧阴影标『发射受限区（小 kernel）』、右侧标『算力受限区』。倍率标注 ①≈ 443591.2× ②≈ 22366.8× ③=1×。",
+          "numbers": [
+            {"value": "冷进程首次 1951.11 ms", "provenance": "traces/run_launch.json: miss_wall_ms"},
+            {"value": "热进程真编译 98.379 ms", "provenance": "traces/run_launch.json: second_miss_wall_ms"},
+            {"value": "稳态命中 4.398 µs（2000 次平均）", "provenance": "traces/run_launch.json: hit_wall_us_avg"},
+            {"value": "冷/命中 ≈ 443591.2×", "provenance": "traces/run_launch.json: miss_over_hit_ratio"},
+            {"value": "热编/命中 ≈ 22366.8×", "provenance": "traces/run_launch.json: second_miss_over_hit_ratio"}
+          ],
+          "caption_draft": "图：launch 三档开销。首次编译比稳态命中贵约 44 万倍——所以性能测量必须先预热。稳态命中仅 4.398 µs 却与 kernel 大小无关：当算子小到 GPU 几微秒算完，这根常数条就成了瓶颈（发射受限区），优化要靠融合 kernel、增大 grid 或 CUDA graph，而非堆算力。注：4.398 µs 为 headless warmup 路径的 run 侧记账，未含真 C++ 发射，是真实固定开销的下界。"
+        }
+      ]
+    }
+  ]
+}
