@@ -1,0 +1,222 @@
+{
+  "chapter_id": "ch12",
+  "title": "driver 抽象、后端发现、autotune 与磁盘缓存 —— 教学素材",
+  "note": "skip_impl 章（无 subtract-only 精简版）。纯 Python 控制流机制（m3 driver 选择 / m5 缓存键 / m7 hook 保护 / m8 裁剪 / m13 缓存键哈希）用忠实复刻源码逻辑的 host 脚本实跑取真实数值，trace_source=run；只有 m6（_bench 计时）依赖真实 CUDA 设备且实机计时非确定，trace_source=manual。所有引用的源码常量/行号取自 pin v3.2.0。",
+  "mechanisms": [
+    {
+      "mechanism_id": "m1",
+      "intuition": "像餐厅的『按铃才上菜』：import triton 只把菜单（LazyProxy 里的 _create_driver）摆上桌，没人真去后厨（CUDA）。直到某段代码第一次伸手拿 driver.active.<某属性>，铃才响、后厨才开火。",
+      "figure_specs": [
+        {
+          "figure_id": "m1-lazy-state",
+          "claim": "LazyProxy 把 driver 的真正构造推迟到首次属性访问——import triton 时 _obj 仍是 None、完全不碰 CUDA。",
+          "template": "state-machine",
+          "numbers": [
+            {"value": "None", "provenance": "driver.py:L15 self._obj = None（LazyProxy.__init__ 只存 init_fn，不构造）"},
+            {"value": "L50", "provenance": "driver.py:L50 default = LazyProxy(_create_driver)——import 期只登记 init_fn"},
+            {"value": "L18-L24", "provenance": "driver.py:L18-L24 __getattr__ → _initialize_obj：首次属性访问才调 _create_driver()"}
+          ],
+          "caption_draft": "两态状态机：`未初始化(_obj=None)` --首次 __getattr__/__setattr__/__delattr__/__str__--> `已初始化(_obj=真 driver)`。触发边上标『_initialize_obj: _obj is None 才构造』。左态旁注『import triton 停在这里，headless，不触碰 torch.cuda』——这正是 ch11 标出的『真设备断裂点』被推迟发生的位置。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m2",
+      "intuition": "后端接入像『往文件夹里丢标准插件』：triton 不维护一张注册名单，而是开机时扫 backends/ 目录，每个子目录里必须恰好放一份 compiler.py 和 driver.py，各含唯一一个『能用的』类。多一个少一个都当场报错——逼你保持『一目录一后端一驱动』的干净契约。",
+      "figure_specs": [
+        {
+          "figure_id": "m2-discover-flow",
+          "claim": "新后端只需在 backends/<name>/ 放 compiler.py + driver.py（各含唯一 concrete 子类），即被 _discover_backends 零改动纳入——姊妹篇 triton-ascend 只塞一个 ascend/ 目录就接入。",
+          "template": "flow",
+          "numbers": [
+            {"value": "1", "provenance": "backends/__init__.py:L16-L26 _find_concrete_subclasses：恰取 1 个 concrete 子类返回 ret[0]"},
+            {"value": "0", "provenance": "backends/__init__.py:L22-L23 len(ret)==0 → RuntimeError（一个后端都没实现）"},
+            {"value": ">1", "provenance": "backends/__init__.py:L24-L25 len(ret)>1 → RuntimeError（目录里混了多个 concrete 类）"}
+          ],
+          "caption_draft": "流程图：os.listdir(backends/) → 逐个非 __ 开头目录 → _load_module(compiler.py)/_load_module(driver.py) → _find_concrete_subclasses 各筛唯一 concrete 子类（0 或 >1 → 抛错）→ 组成 Backend(compiler, driver) → 存入 {name: Backend} 表。收尾标注：ascend/ 目录只需照此结构放两份文件即入表，主库零改动。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m3",
+      "intuition": "开机自检『谁在场』：让每个后端自报『我这套设备现在能用吗』(is_active)，全场举手的必须恰好一个。零人举手（纯 CPU）或多人举手（同装 CUDA+HIP 的歧义机）都拒绝开工——一次运行只面向一种设备。",
+      "worked_example": {
+        "params": {"backends": "{nvidia, amd} 两个后端，各带一个 is_active() 返回布尔的 stand-in driver", "select": "_create_driver 筛 is_active 为真者，断言恰好 1 个"},
+        "trace_source": "run",
+        "trace_ref": "traces/m3_select.txt",
+        "table": {
+          "columns": ["场景", "active 数", "判定 (len != 1?)", "返回"],
+          "rows": [
+            ["gpu-box：nvidia 可用、amd 不可用", "1", "== 1，唯一", "实例化 CudaDriver 实例"],
+            ["cpu-only：两后端均不可用", "0", "!= 1 → 抛错", "RuntimeError: 0 active drivers"],
+            ["双活歧义：两后端都自报 active", "2", "!= 1 → 抛错", "RuntimeError: 2 active drivers"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "_create_driver 要么返回恰好一个 driver 实例，要么抛错——绝不静默返回歧义或空结果。",
+        "argument": "存在唯一性由单个守卫 `if len(actives) != 1: raise`（driver.py:L7）保证：actives 是对 backends.values() 按 is_active() 的过滤，len 取值 {0,1,2,...}；仅 len==1 落到 `return actives[0]()`，其余全部抛 RuntimeError。故『恰好一个 active driver』是返回的充要条件。"
+      },
+      "quantified": "遍历 N 个后端各调一次 is_active()——本例 N=2 → 2 次布尔判定；唯一 active 时一次 O(1) 实例化。选择成本随后端数线性、与 kernel 规模无关，且整个进程只在首次 LazyProxy 触发时跑一次。"
+    },
+    {
+      "mechanism_id": "m5",
+      "intuition": "调优结果的『行李牌』：最优 config 只随『问题多大 + 数据什么类型』变。所以缓存键 = 你声明的 key 参数（如 N）+ 每个张量实参的 dtype。换了尺寸或把 fp16 换成 fp32，牌号变、重新调优；同尺寸同 dtype 再来，凭旧牌直接取结果。指针地址这类每次都不同的量故意不进键，否则永远命不中。",
+      "worked_example": {
+        "params": {"arg_names": "['x','out','N']", "keys": "['N']（用户在 @triton.autotune(key=['N']) 声明）", "note": "x/out 是张量（带 .dtype），N 是标量尺寸"},
+        "trace_source": "run",
+        "trace_ref": "traces/m5_key.txt",
+        "table": {
+          "columns": ["调用", "key 元组", "判定", "cache 项数"],
+          "rows": [
+            ["N=1024 fp16（首次）", "(1024, float16, float16)", "MISS → 搜索并缓存", "1"],
+            ["N=1024 fp16（重复）", "(1024, float16, float16)", "HIT → 复用 best_config", "1"],
+            ["N=1024 fp32", "(1024, float32, float32)", "MISS → 搜索（fp32 不共享 fp16 结果）", "2"],
+            ["N=2048 fp16", "(2048, float16, float16)", "MISS → 搜索（尺寸变）", "3"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "key 是 (keys 参数值 + 各 dtype) 的确定函数：相同(问题量,dtype) → 相同 key → 至多搜索一次；cache 项数随出现的不同 key 单调不减，同一 key 绝不重复搜索。",
+        "argument": "run() 里 key 由纯读取实参构造（L176 取 self.keys 命名值、L177-179 顺序追加每个带 dtype 实参的 str(dtype)），无随机、无外部状态 → 同输入必得同 key。命中判定 `if key not in self.cache`（L181）：未命中才进搜索分支并写 `self.cache[key]=min(...)`（L189），已命中直接读。故每个 key 的昂贵搜索至多发生一次，cache 只增不改已有项。"
+      },
+      "quantified": "key 长度 = |keys| + (带 dtype 的实参数)——本例 1 + 2 = 3 元组。首次 MISS 成本 = prune 后每个候选 config 各一次 _bench（含编译）；此后同 key 调用退化为 1 次 O(1) 字典查找 + 一次 fn.run。本例 4 次调用只触发 3 次搜索（第 2 次命中），跨尺寸/dtype 的 3 个 key 各自独立摊销。",
+      "figure_specs": [
+        {
+          "figure_id": "m5-key-cache",
+          "claim": "缓存键 = key 参数值 + 每个张量实参的 dtype：同(尺寸,dtype)命中复用，换尺寸或换 dtype 即另建键重搜。",
+          "template": "state-table",
+          "numbers": [
+            {"value": "(1024, float16, float16)", "provenance": "traces/m5_key.txt 第 1 次调用 key（N=1024 fp16）"},
+            {"value": "(1024, float32, float32)", "provenance": "traces/m5_key.txt 第 3 次调用 key（同尺寸但 fp32，不共享 fp16 结果）"},
+            {"value": "(2048, float16, float16)", "provenance": "traces/m5_key.txt 第 4 次调用 key（尺寸变）"},
+            {"value": "3", "provenance": "traces/m5_key.txt 末尾 cache 3 项（4 次调用命中 1 次、搜索 3 次）"}
+          ],
+          "caption_draft": "状态表：4 行调用 × 列(key 元组 | MISS/HIT | cache 项数)。第 2 行(重复 N=1024 fp16)标 HIT 复用第 1 行结果；第 3 行(fp32)与第 4 行(N=2048)因 dtype/尺寸变各自 MISS 新建键。底注：指针地址等不入键，故不会每次调用都误判 MISS。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m6",
+      "intuition": "赛马选马：把每匹马（config）拉到同一条跑道各跑几趟，记它们的『中位圈速』，最快的胜出。跑不动的马（显存超限/编译失败）直接记成『无穷慢』，自然出局，绝不因为一匹马摔了就取消整场比赛。",
+      "worked_example": {
+        "params": {"configs": "2 个候选：configA(BLOCK=64) 可运行、configB(BLOCK=256) 显存超限", "quantiles": "(0.5, 0.2, 0.8)——中位 + p20/p80 波动带", "compare": "builtins.min 按返回列表首元素（中位数）比较"},
+        "trace_source": "manual",
+        "manual_reason": "真实 _bench 依赖 driver.active.get_benchmarker() 返回的 do_bench，须在 CUDA 设备上对真实 kernel 跑 warmup+rep 次计时；host 无 GPU（见 INSTANCE 运行约束），且实机延迟非确定。故下表延迟为『示意值』，仅分位常量 (0.5,0.2,0.8)（autotuner.py:L166）与『异常记 inf 淘汰』逻辑（autotuner.py:L167-L168 捕获 OutOfResources/CompileTimeAssertionFailure 返回 [inf,inf,inf]）取自源码。",
+        "table": {
+          "columns": ["候选 config", "do_bench 返回 (q0.5,q0.2,q0.8)", "参与比较的中位(ms)", "判定"],
+          "rows": [
+            ["configA (BLOCK=64)", "(0.85, 0.80, 0.93) [示意]", "0.85 [示意]", "可运行，进入比较"],
+            ["configB (BLOCK=256)", "(inf, inf, inf)", "inf", "OutOfResources → 记 inf 淘汰"],
+            ["min(timings)", "—", "0.85 vs inf", "选中 configA"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "只要至少一个 config 计时有限，min 必选中一个有限项——OOM/编译失败的 config 永不胜出（除非所有 config 都失败）。",
+        "argument": "_bench 对异常 config 返回 [inf,inf,inf]（L167-168），正常 config 返回有限分位列表（L166）。`builtins.min(timings, key=timings.get)`（L189）按列表首元素（中位数）比较；对任意有限 x，x < inf 恒成立。故存在 ≥1 个有限中位数时，最小者必来自有限集合；单个失败 config 不中断整轮搜索（它只是被赋 inf 而非抛出）。"
+      },
+      "quantified": "每个 config 一次 _bench：do_bench 内部按分位 (0.5,0.2,0.8) 对 rep 次样本取经验分位数，中位数是稳健位置估计（抗 GC/时钟抖动离群）。C 个候选 → C 次编译+计时；本例 C=2，1 个有限、1 个 inf，min 一次线性扫描 O(C) 定胜负。"
+    },
+    {
+      "mechanism_id": "m7",
+      "intuition": "考试用同一张卷子考每个考生才公平：autotune 把同一 kernel 对每个 config 各跑很多遍，若 kernel 会往累加器里加、或原地改写输入，第二个 config 就会拿到被上一个『考生』污染的卷子。reset_to_zero 每轮把累加器擦成 0，restore_value 先拍照存档、跑完再照原样恢复——保证每个 config 面对一模一样的输入。",
+      "worked_example": {
+        "params": {"reset_to_zero": "['acc']（累加器，kernel 每轮 +=10）", "restore_value": "['x']（输入，kernel 原地覆盖为 999）", "seq": "对 configA、configB 依次 bench，共享同一组张量；kernel_call 序 = pre_hook → fn.run → post_hook（autotuner.py:L147-L163）"},
+        "trace_source": "run",
+        "trace_ref": "traces/m7_hooks.txt",
+        "table": {
+          "columns": ["bench 轮", "阶段", "acc", "x", "restore_copies['x']"],
+          "rows": [
+            ["configA", "pre_hook", "0", "5", "5"],
+            ["configA", "kernel 后", "10", "999", "5"],
+            ["configA", "post_hook", "10", "5", "已清空"],
+            ["configB", "pre_hook", "0", "5", "5"],
+            ["configB", "kernel 后", "10", "999", "5"],
+            ["configB", "post_hook", "10", "5", "已清空"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "任意两个 config 的 kernel_call 起点处，reset_to_zero 张量恒为 0、restore_value 张量恒为其原值——bench 的输入可比性不变量。",
+        "argument": "每个 config 的 kernel_call 必先调 pre_hook（L149-150）：reset_to_zero 张量 zero_()、restore_value 张量 clone() 存副本（autotuner.py:L67-L71）；kernel_call 必后调 post_hook（L163）：restore_value 张量 copy_(副本) 还原（L81-83）。故无论 configA 把 acc/x 改成什么，进入 configB 前 pre_hook 已把 acc 清 0、post_hook 已把 x 还原到 5——trace 中两轮 pre_hook 行完全相同（acc=0,x=5）即为佐证。"
+      },
+      "quantified": "每个 config 一轮 hook 成本：|reset_to_zero| 次 zero_ + |restore_value| 次 clone（pre）+ |restore_value| 次 copy_（post）——本例各 1，即 1 zero_ + 1 clone + 1 copy_ / config。C 个 config → C 次拷贝对，与 kernel 计算量相比可忽略，换来跨 config 的输入一致性。搜索结束后还有一次 pre_hook(reset_only=True)（run L191）只清零、不再存副本。",
+      "figure_specs": [
+        {
+          "figure_id": "m7-hook-guard",
+          "claim": "pre_hook 每轮把 acc 清 0、给 x 拍照，post_hook 把被 kernel 覆盖的 x 还原——两个 config 都从 acc=0、x=5 起跑。",
+          "template": "state-table",
+          "numbers": [
+            {"value": "0", "provenance": "traces/m7_hooks.txt 每个 config 的 pre_hook 后 acc=[0]（reset_to_zero 清零）"},
+            {"value": "999", "provenance": "traces/m7_hooks.txt kernel 后 x=[999]（被原地覆盖）"},
+            {"value": "5", "provenance": "traces/m7_hooks.txt post_hook 后 x=[5]（restore_value 还原）"},
+            {"value": "10", "provenance": "traces/m7_hooks.txt kernel 后 acc=[10]（+=10 累加）"}
+          ],
+          "caption_draft": "状态表：行=(configA/configB × pre_hook / kernel后 / post_hook)，列=(acc | x | restore_copies['x'])。高亮两个 config 的 pre_hook 行完全相同(acc=0,x=5)——证明第二个 config 未被第一个的累加(acc=10)/覆盖(x=999)污染。底注：不加 hook 时 configB 会拿到 acc=10 的脏累加器，测速失真。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m8",
+      "intuition": "海选两轮筛：先按硬规则刷掉一批明显不合格的（early_config_prune，如 num_stages 与 shared memory 冲突），再用一个便宜的估时模型（perf_model）给剩下的排名，只让最靠前的 top_k 个真正下场实测。把『昂贵的编译+计时』留给最有希望的少数。",
+      "worked_example": {
+        "params": {"configs": "8 个候选（编号 0..7，编号即 perf_model 估时，越小越快）", "早筛": "early_config_prune 删编号 6、7", "top_k": "0.5（浮点，按 len(configs) 折算）与 2（整数）两种"},
+        "trace_source": "run",
+        "trace_ref": "traces/m8_prune.txt",
+        "table": {
+          "columns": ["场景", "early 后候选数", "top_k 解析", "实际 _bench 数", "成本比"],
+          "rows": [
+            ["无 prune_configs_by（默认）", "8", "不适用", "8", "8/8"],
+            ["early 删 2 + perf_model, top_k=0.5", "6", "int(8*0.5)=4", "4", "4/8"],
+            ["仅 perf_model, top_k=2（整数）", "8", "2", "2", "2/8"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "pruned_configs ⊆ configs 且 |pruned| ≤ top_k ≤ |configs|：两级裁剪只缩不增，实测次数单调不超过全集。",
+        "argument": "early_config_prune 从 self.configs 里挑子集（L214），perf_model 分支 `sorted(...)[:top_k]`（L228）再截前 top_k 个；top_k 为浮点时 `int(len(self.configs)*top_k)`（L217）≤ |configs|。两步都是取子集/截断，无插入操作，故 pruned 始终是 configs 的子集且大小受 top_k 上界约束——_bench 调用数（L186 对 pruned_configs 逐个）随之被压到 ≤ top_k。"
+      },
+      "quantified": "全测成本 ∝ |configs| 次编译+计时；两级裁剪把它压到 |pruned|。本例 8 → 4（top_k=0.5，2× 提速）与 8 → 2（top_k=2，4× 提速）。perf_model 估时是纯 Python 前向、成本远低于一次真实 _bench，故裁剪净收益 ≈ (|configs|−top_k) 次 _bench 的编译+运行时间。"
+    },
+    {
+      "mechanism_id": "m11",
+      "intuition": "改文件像『先写草稿再一把换掉正本』：put 先把内容写进一个带进程号+随机 uuid 的临时目录，写完用 os.replace 一步原子改名成正式文件。任何并发读者要么看到旧正本、要么看到完整新正本，永远读不到写了一半的残缺文件；uuid 保证不同进程各写各的草稿、互不覆盖。",
+      "figure_specs": [
+        {
+          "figure_id": "m11-atomic-put",
+          "claim": "FileCacheManager.put 走 tmp.pid_<pid>_<uuid> 目录 + os.replace 原子改名落盘——并发读者永远看不到半截文件。",
+          "template": "flow",
+          "numbers": [
+            {"value": "<TRITON_CACHE_DIR 或 ~/.triton/cache>/<key>", "provenance": "cache.py:L66-L70 常规分支 cache_dir 布局（key 为 _base64(sha256)）"},
+            {"value": "tmp.pid_<pid>_<uuid>", "provenance": "cache.py:L124 temp_dir 命名：pid 标识进程 + uuid 防碰撞"},
+            {"value": "os.replace", "provenance": "cache.py:L133 os.replace(temp_path, filepath)——POSIX rename 原子，读者不见半截写"}
+          ],
+          "caption_draft": "流程图：write 到 cache_dir/tmp.pid_<pid>_<uuid>/<filename>（L124-131）--os.replace 原子改名（L133）--> cache_dir/<filename> 正本，随后 os.removedirs 清临时目录（L134）。旁注：目录名 <key> = _base64(sha256(...))，与内存 launch 缓存的三桶 cache[device][key] 正交（见第 11 章）——一层跨进程免重编、一层同进程内免二次编译。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m13",
+      "intuition": "编译产物的『指纹门牌』：把决定编译结果的所有东西——triton 库版本、源码、后端、编译选项、影响结果的环境变量——拼成一长串，过一遍 sha256 压成定长指纹，再转成文件名安全的 base64 当目录名。只要这五样一字不差，门牌就相同、直接进屋取现成产物；改一行 kernel，门牌就变、另起一间重编。",
+      "worked_example": {
+        "params": {"key 五段": "triton_key() - src.hash() - backend.hash() - options.hash() - sorted(env_vars)", "哈希": "sha256 hexdigest → _base64（bytes.fromhex → urlsafe_b64encode → rstrip('=')）得目录名", "note": "四段用短 stand-in 值占位便于肉眼比对；sha256/base64 为真实计算"},
+        "trace_source": "run",
+        "trace_ref": "traces/m13_key.txt",
+        "table": {
+          "columns": ["轮次", "src.hash", "sha256 前缀", "目录名前缀", "判定"],
+          "rows": [
+            ["首次编译 srcA", "srcA", "1153a47c", "EVOkfAl-", "MISS → 逐产物落盘"],
+            ["重复同源 srcA", "srcA", "1153a47c", "EVOkfAl-", "HIT → 命中既有目录"],
+            ["改一行 kernel srcB", "srcB", "cb897b24", "y4l7JPpb", "MISS → 另起新目录"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "目录名是五元组 (triton_key, src, backend, options, env) 的确定函数：相同五元组必得相同目录名（命中复用），任一分量变必（除极小概率碰撞外）得不同目录名（miss 重编）。",
+        "argument": "key 串由五段确定性拼接（compiler.py:L231）→ sha256（L232，确定、抗碰撞）→ _base64（cache.py:L260，确定双射编码）。整条链无随机、无外部状态，故同输入必得同目录名（trace 第 1、2 轮 sha256 与目录名逐字节相同）；sha256 的抗碰撞性保证不同输入极难撞到同名（trace 第 3 轮改 src 即得全然不同的 cb897b24.../y4l7JPpb...）。"
+      },
+      "quantified": "key 串长度 ≈ 四段哈希 + 环境变量列表；sha256 恒压成 32 字节 = 64 hex 字符，_base64 去填充后约 43 字符目录名。缓存查找 = 一次哈希计算 + get_group 的一次目录 json 读 + 逐 child_path 的 os.path.exists——远低于一次真实编译（走完全部 lowering stage）。本例 3 次编译请求只 2 个不同目录（第 2 次命中省一次全编译）。"
+    }
+  ]
+}

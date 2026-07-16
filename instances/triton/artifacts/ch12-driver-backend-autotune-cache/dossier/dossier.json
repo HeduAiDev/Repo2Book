@@ -1,0 +1,206 @@
+{
+  "chapter_id": "ch12",
+  "title": "driver 抽象、后端发现、autotune 与磁盘缓存",
+  "kind": "deep",
+  "mode": "code",
+  "code_spine": [
+    "python/triton/backends/__init__.py:L35-L50  —— _discover_backends 在 import 期扫 backends/<name>/ 建 {name: Backend(compiler, driver)} 表",
+    "python/triton/backends/__init__.py:L16-L26  —— _find_concrete_subclasses 各目录取唯一 concrete 子类",
+    "python/triton/runtime/driver.py:L5-L9      —— _create_driver 从 backends 里筛出唯一 is_active() 的 driver 并实例化",
+    "python/triton/runtime/driver.py:L12-L44    —— LazyProxy 首次属性访问才触发 _init_fn（惰性初始化）",
+    "python/triton/runtime/driver.py:L47-L60    —— DriverConfig 持 default/active，全局单例 driver = DriverConfig()",
+    "python/triton/backends/driver.py:L11-L48   —— DriverBase 抽象契约 + GPUDriver（torch.cuda 桥）",
+    "python/triton/runtime/autotuner.py:L170-L209 —— Autotuner.run：以 key+dtype 建缓存键，miss 则 prune+_bench+取 min",
+    "python/triton/runtime/autotuner.py:L134-L168 —— _bench：装配 pre/post hook 的 kernel_call，do_bench 取分位数",
+    "python/triton/runtime/autotuner.py:L211-L229 —— prune_configs：early_config_prune + perf_model top_k 裁剪",
+    "python/triton/runtime/cache.py:L112-L136   —— FileCacheManager.put：tmp 目录 + os.replace 原子落盘",
+    "python/triton/compiler/compiler.py:L229-L252 —— compile 里编译缓存键的构造与命中判定（磁盘缓存入口）"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "python/triton/backends/__init__.py",
+      "lines": "L16-L47",
+      "code": "def _find_concrete_subclasses(module, base_class):\n    ret = []\n    for attr_name in dir(module):\n        attr = getattr(module, attr_name)\n        if isinstance(attr, type) and issubclass(attr, base_class) and not inspect.isabstract(attr):\n            ret.append(attr)\n    if len(ret) == 0:\n        raise RuntimeError(f\"Found 0 concrete subclasses of {base_class} in {module}: {ret}\")\n    if len(ret) > 1:\n        raise RuntimeError(f\"Found >1 concrete subclasses of {base_class} in {module}: {ret}\")\n    return ret[0]\n\n\n@dataclass(frozen=True)\nclass Backend:\n    compiler: BaseBackend = None\n    driver: DriverBase = None\n\n\ndef _discover_backends():\n    backends = dict()\n    root = os.path.dirname(__file__)\n    for name in os.listdir(root):\n        if not os.path.isdir(os.path.join(root, name)):\n            continue\n        if name.startswith('__'):\n            continue\n        compiler = _load_module(name, os.path.join(root, name, 'compiler.py'))\n        driver = _load_module(name, os.path.join(root, name, 'driver.py'))\n        backends[name] = Backend(_find_concrete_subclasses(compiler, BaseBackend),\n                                 _find_concrete_subclasses(driver, DriverBase))\n    return backends",
+      "elide": ["_load_module（L9-L13）用 importlib.util 从文件路径加载模块，机械细节，正文一句带过即可"]
+    },
+    {
+      "path": "python/triton/runtime/driver.py",
+      "lines": "L5-L60",
+      "code": "def _create_driver():\n    actives = [x.driver for x in backends.values() if x.driver.is_active()]\n    if len(actives) != 1:\n        raise RuntimeError(f\"{len(actives)} active drivers ({actives}). There should only be one.\")\n    return actives[0]()\n\n\nclass LazyProxy:\n\n    def __init__(self, init_fn):\n        self._init_fn = init_fn\n        self._obj = None\n\n    def _initialize_obj(self):\n        if self._obj is None:\n            self._obj = self._init_fn()\n\n    def __getattr__(self, name):\n        self._initialize_obj()\n        return getattr(self._obj, name)\n\n    def __setattr__(self, name, value):\n        if name in [\"_init_fn\", \"_obj\"]:\n            super().__setattr__(name, value)\n        else:\n            self._initialize_obj()\n            setattr(self._obj, name, value)\n\n    def __delattr__(self, name):\n        self._initialize_obj()\n        delattr(self._obj, name)\n\n    def __repr__(self):\n        if self._obj is None:\n            return f\"<{self.__class__.__name__} for {self._init_fn} not yet initialized>\"\n        return repr(self._obj)\n\n    def __str__(self):\n        self._initialize_obj()\n        return str(self._obj)\n\n\nclass DriverConfig:\n\n    def __init__(self):\n        self.default = LazyProxy(_create_driver)\n        self.active = self.default\n\n    def set_active(self, driver: DriverBase):\n        self.active = driver\n\n    def reset_active(self):\n        self.active = self.default\n\n\ndriver = DriverConfig()",
+      "elide": ["__delattr__/__repr__/__str__ 是 LazyProxy 转发协议的补全，正文点到 __getattr__ 触发即可，其余同理"]
+    },
+    {
+      "path": "python/triton/backends/driver.py",
+      "lines": "L11-L48",
+      "code": "class DriverBase(metaclass=ABCMeta):\n\n    @abstractclassmethod\n    def is_active(self):\n        pass\n\n    @abstractmethod\n    def get_current_target(self):\n        pass\n\n    @abstractmethod\n    def get_benchmarker(self) -> Benchmarker:\n        \"\"\"\n        Return the benchmarking function that this backend should use by default.\n        \"\"\"\n        raise NotImplementedError\n\n    def __init__(self) -> None:\n        pass\n\n\nclass GPUDriver(DriverBase):\n\n    def __init__(self):\n        # TODO: support other frameworks than torch\n        import torch\n        self.get_device_capability = torch.cuda.get_device_capability\n        try:\n            from torch._C import _cuda_getCurrentRawStream\n            self.get_current_stream = _cuda_getCurrentRawStream\n        except ImportError:\n            self.get_current_stream = lambda idx: torch.cuda.current_stream(idx).cuda_stream\n        self.get_current_device = torch.cuda.current_device\n        self.set_current_device = torch.cuda.set_device",
+      "elide": ["assemble_tensormap_to_arg（L47-L48）是 TMA 遗留占位，注释已标 TODO remove，正文略过"]
+    },
+    {
+      "path": "third_party/nvidia/backend/driver.py",
+      "lines": "L465-L472",
+      "code": "    @staticmethod\n    def is_active():\n        import torch\n        return torch.cuda.is_available() and (torch.version.hip is None)\n\n    def get_benchmarker(self):\n        from triton.testing import do_bench\n        return do_bench",
+      "elide": ["CudaDriver 的其余方法（utils/launcher_cls 等）在别章展开，本节只取 is_active/get_benchmarker 两个契约实现点"]
+    },
+    {
+      "path": "python/triton/runtime/autotuner.py",
+      "lines": "L170-L209",
+      "code": "    def run(self, *args, **kwargs):\n        self.nargs = dict(zip(self.arg_names, args))\n        used_cached_result = True\n        if len(self.configs) > 1:\n            all_args = {**self.nargs, **kwargs}\n            _args = {k: v for (k, v) in all_args.items() if k in self.arg_names}\n            key = [_args[key] for key in self.keys if key in _args]\n            for _, arg in _args.items():\n                if hasattr(arg, \"dtype\"):\n                    key.append(str(arg.dtype))\n            key = tuple(key)\n            if key not in self.cache:\n                # prune configs\n                used_cached_result = False\n                pruned_configs = self.prune_configs(kwargs)\n                bench_start = time.time()\n                timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}\n                bench_end = time.time()\n                self.bench_time = bench_end - bench_start\n                self.cache[key] = builtins.min(timings, key=timings.get)\n                full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}\n                self.pre_hook(full_nargs, reset_only=True)\n                self.configs_timings = timings\n            config = self.cache[key]\n        else:\n            config = self.configs[0]\n        self.best_config = config\n        if os.getenv(\"TRITON_PRINT_AUTOTUNING\", None) == \"1\" and not used_cached_result:\n            print(f\"Triton autotuning for function {self.base_fn.__name__} finished after \"\n                  f\"{self.bench_time:.2f}s; best config selected: {self.best_config};\")\n        if config.pre_hook is not None:\n            full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}\n            config.pre_hook(full_nargs)\n        ret = self.fn.run(\n            *args,\n            **kwargs,\n            **config.all_kwargs(),\n        )\n        self.nargs = None\n        return ret",
+      "elide": ["TRITON_PRINT_AUTOTUNING 打印分支只影响日志，不改选择逻辑，正文可作旁注"]
+    },
+    {
+      "path": "python/triton/runtime/autotuner.py",
+      "lines": "L134-L168",
+      "code": "    def _bench(self, *args, config, **meta):\n        from ..compiler.errors import CompileTimeAssertionFailure\n\n        # check for conflicts, i.e. meta-parameters both provided\n        # as kwargs and by the autotuner\n        conflicts = meta.keys() & config.kwargs.keys()\n        if conflicts:\n            raise ValueError(f\"Conflicting meta-parameters: {', '.join(conflicts)}.\"\n                             \" Make sure that you don't re-define auto-tuned symbols.\")\n        # augment meta-parameters with tunable ones\n        current = dict(meta, **config.all_kwargs())\n        full_nargs = {**self.nargs, **current}\n\n        def kernel_call():\n            if config.pre_hook:\n                config.pre_hook(full_nargs)\n            self.pre_hook(full_nargs)\n            try:\n                self.fn.run(\n                    *args,\n                    **current,\n                )\n            except Exception as e:\n                try:\n                    self.post_hook(full_nargs, exception=e)\n                finally:\n                    # Throw exception raised by `self.fn.run`\n                    raise\n\n            self.post_hook(full_nargs, exception=None)\n\n        try:\n            return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))\n        except (OutOfResources, CompileTimeAssertionFailure):\n            return [float(\"inf\"), float(\"inf\"), float(\"inf\")]",
+      "elide": []
+    },
+    {
+      "path": "python/triton/runtime/autotuner.py",
+      "lines": "L65-L85",
+      "code": "        elif (len(self.reset_to_zero) > 0 or len(self.restore_value) > 0):\n\n            def _pre_hook(kwargs, reset_only=False):\n                for name in self.reset_to_zero:\n                    kwargs[name].zero_()\n                if not reset_only:\n                    self.restore_copies = {name: kwargs[name].clone() for name in self.restore_value}\n\n            self.pre_hook = _pre_hook\n\n        if post_hook:\n            self.post_hook = post_hook\n            self.user_defined_post_hook = True\n        elif len(self.restore_value) > 0:\n\n            def _post_hook(kwargs, exception):\n                for name in self.restore_value:\n                    kwargs[name].copy_(self.restore_copies[name])\n                self.restore_copies = {}\n\n            self.post_hook = _post_hook",
+      "elide": ["用户自定义 pre_hook/post_hook 的分支（L62-L64、L75-L77）只是覆盖默认钩子，正文点明默认钩子做什么即可"]
+    },
+    {
+      "path": "python/triton/runtime/autotuner.py",
+      "lines": "L211-L229",
+      "code": "    def prune_configs(self, kwargs):\n        pruned_configs = self.configs\n        if self.early_config_prune:\n            pruned_configs = self.early_config_prune(self.configs, self.nargs, **kwargs)\n        if self.perf_model:\n            top_k = self.configs_top_k\n            if isinstance(top_k, float) and top_k <= 1.0:\n                top_k = int(len(self.configs) * top_k)\n            if len(pruned_configs) > top_k:\n                est_timing = {\n                    config: self.perf_model(\n                        **self.nargs,\n                        **kwargs,\n                        **config.all_kwargs(),\n                    )\n                    for config in pruned_configs\n                }\n                pruned_configs = sorted(est_timing.keys(), key=lambda x: est_timing[x])[:top_k]\n        return pruned_configs",
+      "elide": []
+    },
+    {
+      "path": "python/triton/runtime/autotuner.py",
+      "lines": "L278-L293",
+      "code": "    def all_kwargs(self):\n        return {\n            **self.kwargs, **{\n                k: v\n                for (k, v) in (\n                    (\"num_warps\", self.num_warps),\n                    (\"num_ctas\", self.num_ctas),\n                    (\"num_stages\", self.num_stages),\n                    (\"num_buffers_warp_spec\", self.num_buffers_warp_spec),\n                    (\"num_consumer_groups\", self.num_consumer_groups),\n                    (\"reg_dec_producer\", self.reg_dec_producer),\n                    (\"reg_inc_consumer\", self.reg_inc_consumer),\n                    (\"maxnreg\", self.maxnreg),\n                ) if v is not None\n            }\n        }",
+      "elide": ["Config.__init__ 的字段赋值（L265-L276）逐字段直白，正文列出关键旋钮 kwargs/num_warps/num_stages/num_ctas 即可"]
+    },
+    {
+      "path": "python/triton/runtime/cache.py",
+      "lines": "L112-L136",
+      "code": "    def put(self, data, filename, binary=True) -> str:\n        if not self.cache_dir:\n            raise RuntimeError(\"Could not create or locate cache dir\")\n        binary = isinstance(data, bytes)\n        if not binary:\n            data = str(data)\n        assert self.lock_path is not None\n        filepath = self._make_path(filename)\n        # Random ID to avoid any collisions\n        rnd_id = str(uuid.uuid4())\n        # we use the PID in case a bunch of these around so we can see what PID made it\n        pid = os.getpid()\n        # use temp dir to be robust against program interruptions\n        temp_dir = os.path.join(self.cache_dir, f\"tmp.pid_{pid}_{rnd_id}\")\n        os.makedirs(temp_dir, exist_ok=True)\n        temp_path = os.path.join(temp_dir, filename)\n\n        mode = \"wb\" if binary else \"w\"\n        with open(temp_path, mode) as f:\n            f.write(data)\n        # Replace is guaranteed to be atomic on POSIX systems if it succeeds\n        # so filepath cannot see a partial write\n        os.replace(temp_path, filepath)\n        os.removedirs(temp_dir)\n        return filepath",
+      "elide": []
+    },
+    {
+      "path": "python/triton/runtime/cache.py",
+      "lines": "L52-L74",
+      "code": "    def __init__(self, key, override=False, dump=False):\n        self.key = key\n        self.lock_path = None\n        if dump:\n            self.cache_dir = os.getenv(\"TRITON_DUMP_DIR\", \"\").strip() or default_dump_dir()\n            self.cache_dir = os.path.join(self.cache_dir, self.key)\n            self.lock_path = os.path.join(self.cache_dir, \"lock\")\n            os.makedirs(self.cache_dir, exist_ok=True)\n        elif override:\n            self.cache_dir = os.getenv(\"TRITON_OVERRIDE_DIR\", \"\").strip() or default_override_dir()\n            self.cache_dir = os.path.join(self.cache_dir, self.key)\n        else:\n            # create cache directory if it doesn't exist\n            self.cache_dir = os.getenv(\"TRITON_CACHE_DIR\", \"\").strip() or default_cache_dir()\n            if self.cache_dir:\n                self.cache_dir = os.path.join(self.cache_dir, self.key)\n                self.lock_path = os.path.join(self.cache_dir, \"lock\")\n                os.makedirs(self.cache_dir, exist_ok=True)\n            else:\n                raise RuntimeError(\"Could not create or locate cache dir\")",
+      "elide": ["dump/override 两个分支是导出/覆盖用途，与常规磁盘缓存正交，正文聚焦 else 常规分支（cache_dir = <TRITON_CACHE_DIR 或 ~/.triton/cache>/<key>）"]
+    },
+    {
+      "path": "python/triton/runtime/cache.py",
+      "lines": "L87-L110",
+      "code": "    def get_group(self, filename: str) -> Optional[Dict[str, str]]:\n        grp_filename = f\"__grp__{filename}\"\n        if not self.has_file(grp_filename):\n            return None\n        grp_filepath = self._make_path(grp_filename)\n        with open(grp_filepath) as f:\n            grp_data = json.load(f)\n        child_paths = grp_data.get(\"child_paths\", None)\n        # Invalid group data.\n        if child_paths is None:\n            return None\n        result = {}\n        for c, p in child_paths.items():\n            if os.path.exists(p):\n                result[c] = p\n        return result\n\n    # Note a group of pushed files as being part of a group\n    def put_group(self, filename: str, group: Dict[str, str]) -> str:\n        if not self.cache_dir:\n            raise RuntimeError(\"Could not create or locate cache dir\")\n        grp_contents = json.dumps({\"child_paths\": group})\n        grp_filename = f\"__grp__{filename}\"\n        return self.put(grp_contents, grp_filename, binary=False)",
+      "elide": []
+    },
+    {
+      "path": "python/triton/runtime/cache.py",
+      "lines": "L259-L277",
+      "code": "def _base64(key):\n    # Assume key is a hex string.\n    return base64.urlsafe_b64encode(bytes.fromhex(key)).decode(\"utf-8\").rstrip(\"=\")\n\n\ndef get_cache_manager(key) -> CacheManager:\n    import os\n\n    user_cache_manager = os.environ.get(\"TRITON_CACHE_MANAGER\", None)\n    global __cache_cls\n    global __cache_cls_nme\n\n    if user_cache_manager is not None and user_cache_manager != __cache_cls_nme:\n        module_path, clz_nme = user_cache_manager.split(\":\")\n        module = importlib.import_module(module_path)\n        __cache_cls = getattr(module, clz_nme)\n        __cache_cls_nme = user_cache_manager\n\n    return __cache_cls(_base64(key))",
+      "elide": []
+    },
+    {
+      "path": "python/triton/compiler/compiler.py",
+      "lines": "L229-L252",
+      "code": "    # create cache manager\n    env_vars = get_cache_invalidating_env_vars()\n    key = f\"{triton_key()}-{src.hash()}-{backend.hash()}-{options.hash()}-{str(sorted(env_vars.items()))}\"\n    hash = hashlib.sha256(key.encode(\"utf-8\")).hexdigest()\n    fn_cache_manager = get_cache_manager(hash)\n    # For dumping/overriding only hash the source as we want it to be independent of triton\n    # core changes to make it easier to track kernels by hash.\n    enable_override = os.environ.get(\"TRITON_KERNEL_OVERRIDE\", \"0\") == \"1\"\n    enable_ir_dump = os.environ.get(\"TRITON_KERNEL_DUMP\", \"0\") == \"1\"\n    fn_override_manager = get_override_manager(src.hash()) if enable_override else None\n    fn_dump_manager = get_dump_manager(src.hash()) if enable_ir_dump else None\n    # Pre-truncate the file name here to avoid hitting the 255 character limit on common platforms.\n    file_name = src.name[:150]\n    metadata_filename = f\"{file_name}.json\"\n    metadata_group = fn_cache_manager.get_group(metadata_filename) or {}\n    metadata_path = metadata_group.get(metadata_filename)\n    always_compile = os.environ.get(\"TRITON_ALWAYS_COMPILE\", \"0\") == \"1\"\n    if not always_compile and metadata_path is not None:\n        # cache hit!\n        metadata = json.loads(Path(metadata_path).read_text())\n        return CompiledKernel(src, metadata_group, hash)",
+      "elide": ["override/dump 两个 manager 只在对应环境变量置位时创建，正文点明主键 key 的四段构成 + get_group 命中即早返回 CompiledKernel"]
+    }
+  ],
+  "key_classes": [
+    {"name": "LazyProxy", "file": "python/triton/runtime/driver.py", "responsibility": "惰性代理：包住一个 init_fn，仅在首次属性访问（__getattr__/__setattr__/__delattr__/__str__）时才调用它构造真实对象，之后全部转发。让 `import triton` 不触发 driver 创建、进而不触发 CUDA 初始化。"},
+    {"name": "DriverConfig", "file": "python/triton/runtime/driver.py", "responsibility": "全局单例 `driver`。持有 default（LazyProxy(_create_driver)）与 active 两个引用；set_active/reset_active 允许运行期切换后端。全库通过 driver.active.* 拿设备/流/target/benchmarker。"},
+    {"name": "Backend", "file": "python/triton/backends/__init__.py", "responsibility": "frozen dataclass，一条后端记录 = (compiler 类, driver 类) 的配对。_discover_backends 建成 {name: Backend} 表。"},
+    {"name": "DriverBase", "file": "python/triton/backends/driver.py", "responsibility": "驱动抽象契约：抽象方法 is_active/get_current_target/get_benchmarker。后端发现靠 is_active 做选择、靠 concrete 判定入表。"},
+    {"name": "GPUDriver", "file": "python/triton/backends/driver.py", "responsibility": "GPU 驱动半成品基类：__init__ 里把 get_current_device/stream/set_current_device/get_device_capability 桥接到 torch.cuda。各后端 driver 继承它再补 is_active/get_current_target/get_benchmarker。"},
+    {"name": "Autotuner", "file": "python/triton/runtime/autotuner.py", "responsibility": "KernelInterface 包装器：run() 时按 key+张量 dtype 组缓存键，miss 则 prune_configs + 逐 config _bench + 取最快者存缓存，hit 则直接复用最优 config 转发到 fn.run。"},
+    {"name": "Config", "file": "python/triton/runtime/autotuner.py", "responsibility": "一个候选配置：kwargs（meta 参数如 BLOCK_SIZE）+ num_warps/num_stages/num_ctas 等编译旋钮 + 可选 pre_hook。all_kwargs() 把非 None 旋钮摊平成传给 fn.run 的关键字参数。"},
+    {"name": "FileCacheManager", "file": "python/triton/runtime/cache.py", "responsibility": "磁盘缓存：cache_dir = <TRITON_CACHE_DIR 或 ~/.triton/cache>/<key>；put 走 tmp 目录 + os.replace 原子落盘；get_group/put_group 用 __grp__ 前缀的 json 索引把一次编译的多个产物文件绑成一组。"},
+    {"name": "get_cache_manager", "file": "python/triton/runtime/cache.py", "responsibility": "缓存管理器工厂：默认 FileCacheManager，可经 TRITON_CACHE_MANAGER=module:Class 换成自定义/远程实现（可插拔缝）。key 先经 _base64 转成文件名安全串。"}
+  ],
+  "data_flow": [
+    "import triton → backends/__init__.py 模块级 backends = _discover_backends()：扫 python/triton/backends/ 下每个非 __ 开头目录，_load_module 各加载 compiler.py/driver.py，_find_concrete_subclasses 各取唯一 concrete 子类，建 {name: Backend(compiler, driver)} 表。",
+    "同期 driver.py 模块级 driver = DriverConfig()：default = LazyProxy(_create_driver)，此刻 _create_driver 尚未执行——不触碰 torch.cuda，import 保持 headless。",
+    "首次真正用到 driver.active.<attr>（如 ch11 run() 里 get_current_device/stream/target，或 autotune 取 benchmarker）→ LazyProxy.__getattr__ → _initialize_obj → _create_driver()：遍历 backends，筛 is_active() 为真者，断言恰好一个，实例化。CUDA 初始化在此刻发生。",
+    "@triton.autotune(configs,key,...) 装饰 → Autotuner 包住 JITFunction。调用 kernel(*args) → Autotuner.run。",
+    "run：len(configs)>1 时，从实参里取 self.keys 命名的值 + 每个带 dtype 参数的 str(dtype) 组成 key 元组；key 不在 self.cache → prune_configs 裁剪候选 → 对每个 config 调 _bench → builtins.min 取最快 → 存 self.cache[key]。",
+    "_bench：组 kernel_call 闭包（config.pre_hook → self.pre_hook 保护张量 → fn.run → self.post_hook 恢复），do_bench(kernel_call, quantiles=(0.5,0.2,0.8)) 返回 [中位, p20, p80]；OutOfResources/编译期断言失败 → 记 inf 淘汰该 config。",
+    "run 尾：拿最优 config，若有 config.pre_hook 先跑，fn.run(*args,**kwargs,**config.all_kwargs()) 把选中旋钮摊平下发——转入 ch11 的 JITFunction.run 与编译/launch 链路。",
+    "编译链路（ch10/ch11 已建）里 compile()：key = triton_key()-src.hash()-backend.hash()-options.hash()-env_vars → sha256 → get_cache_manager(hash) → get_group 命中则早返回 CompiledKernel（磁盘缓存命中）；miss 则逐 stage put 产物 + put_group 写 __grp__ 索引落盘。"
+  ],
+  "design_decisions": [
+    {"decision": "driver 用 LazyProxy 惰性初始化，而非 import 期直接 _create_driver()", "why": "import triton 只是加载 Python 模块，不应强制初始化 CUDA/触碰 GPU——否则纯 CPU 环境、文档构建、单元测试导入都会崩。惰性代理把「构造真实 driver」推迟到第一次真正访问其属性时，实现 headless import。", "evidence": "python/triton/runtime/driver.py:L50 default=LazyProxy(_create_driver)，L18-L24 __getattr__ 触发 _initialize_obj"},
+    {"decision": "后端发现靠约定目录结构 + 唯一 concrete 子类，而非注册表/入口点", "why": "配对脊柱：新后端只需在 backends/<name>/ 放 compiler.py + driver.py，各含唯一一个 concrete 子类，就零改动被 _discover_backends 纳入。>1 或 0 个 concrete 子类直接报错，逼接入方保持「一目录一后端一驱动」的清晰契约。", "evidence": "python/triton/backends/__init__.py:L35-L47 扫目录建表，L22-L25 对 0/>1 concrete 子类抛错"},
+    {"decision": "恰好一个 is_active() 的 driver，否则报错", "why": "一次运行只能面向一种设备。_create_driver 断言 active driver 数量为 1，避免多后端环境（如同装 CUDA/HIP）下歧义选择。is_active 由各后端自报（nvidia: torch.cuda.is_available() and hip is None）。", "evidence": "python/triton/runtime/driver.py:L6-L8；third_party/nvidia/backend/driver.py:L466-L468"},
+    {"decision": "autotune 缓存键 = 选定 key 参数值 + 所有带 dtype 实参的 dtype 字符串", "why": "最优 config 只随「改变问题规模/数据类型」的量变化。把 key 参数（如 x_size）之外自动附上张量 dtype，保证 fp16 与 fp32 不会误共享同一最优 config；无关的指针地址等不入键，避免每次调用都重测。", "evidence": "python/triton/runtime/autotuner.py:L176-L180"},
+    {"decision": "_bench 取分位数 (0.5,0.2,0.8) 且以中位数比较，异常记 inf", "why": "单次计时噪声大，分位数比均值更稳健、抗离群；min(timings) 按返回列表首元素（中位）比较。资源超限/编译断言失败的 config 记 inf 自然淘汰，不让一个跑不起来的 config 中断整轮搜索。", "evidence": "python/triton/runtime/autotuner.py:L166-L168, L189"},
+    {"decision": "reset_to_zero / restore_value 通过 pre_hook/post_hook 保护被 kernel 改写的张量", "why": "autotune 会把同一 kernel 跑很多遍，若 kernel 原地累加/写入某张量，多次运行会污染结果。reset_to_zero 每轮清零、restore_value 先 clone 后 copy_ 还原，保证每个 config 面对相同输入、结果不被前一轮污染。", "evidence": "python/triton/runtime/autotuner.py:L67-L73（_pre_hook zero_/clone），L80-L83（_post_hook copy_ 还原）"},
+    {"decision": "prune_configs 两级裁剪：early_config_prune 硬筛 + perf_model top_k 估时排序", "why": "搜索空间可能很大，全测代价高。允许用户提供 early_config_prune 先按规则（如 num_stages 与 shared memory 冲突）剔除非法项，再用 perf_model 估时只保留 top_k 个真正下场 _bench，把编译+运行成本压到可接受。", "evidence": "python/triton/runtime/autotuner.py:L211-L229"},
+    {"decision": "计时器来自 driver.active.get_benchmarker()，而非硬编码 do_bench", "why": "后端接缝：不同设备的准确计时方式不同（CUDA event vs 其它）。默认 do_bench 由当前后端 driver 提供，autotune 无需知道设备细节。也可用 do_bench= 参数覆盖。", "evidence": "python/triton/runtime/autotuner.py:L129-L132；third_party/nvidia/backend/driver.py:L470-L472"},
+    {"decision": "磁盘缓存 put 用 tmp 目录 + os.replace 原子落盘", "why": "多进程/中断安全：先写到带 pid+uuid 的临时目录再 os.replace（POSIX 保证原子 rename），读者永远看不到半截文件；uuid 防不同进程写同名文件互相覆盖。", "evidence": "python/triton/runtime/cache.py:L120-L135"},
+    {"decision": "编译产物用 group（__grp__ 索引文件）绑成一组，而非单文件", "why": "一次编译产出多份产物（各 IR 阶段 + metadata.json + 二进制）。put_group 写一个 __grp__<name> 的 json 列出 child_paths，get_group 一把校验全组是否齐全（逐个 os.path.exists），任一缺失即视为 miss——保证缓存命中拿到的是完整一套。", "evidence": "python/triton/runtime/cache.py:L87-L110；compiler.py:L246-L252, L294-L296"},
+    {"decision": "CacheManager 可插拔（TRITON_CACHE_MANAGER / TRITON_REMOTE_CACHE_BACKEND）", "why": "让分布式/CI 场景可把缓存后端换成 Redis 等远程实现，共享编译产物、避免每台机重编。get_cache_manager 按环境变量动态 import 替换默认 FileCacheManager。", "evidence": "python/triton/runtime/cache.py:L264-L277；RemoteCacheManager L178-L252（本章正交，仅提一句）"},
+    {"decision": "本章的磁盘缓存与 ch10/ch11 的内存 launch 缓存正交", "why": "内存 launch 缓存（cache[device][key] 三桶）解决「同进程内同参重复 launch 免二次编译」；磁盘缓存解决「跨进程/跨运行免重编」，键由 triton_key+src+backend+options+env 的 sha256 组成，落到 ~/.triton/cache/<key>/。两层是不同粒度、不同生命周期。", "evidence": "python/triton/compiler/compiler.py:L231-L233；对照 ch11 内存缓存（回指）"}
+  ],
+  "theory": [
+    "惰性初始化的本质是把「模块加载副作用」与「首次使用副作用」解耦：LazyProxy 用 Python 的属性协议（__getattr__ 等）做透明代理，调用方写 driver.active.get_current_device() 与直接持有真 driver 无差别，唯一区别是构造时机后移到首次属性访问。这是「import 不应有重副作用」原则的具体落地。",
+    "autotune 是一次离散黑盒优化：搜索空间 = configs 列表（笛卡尔式的 {meta 参数} × {num_warps,num_stages,num_ctas,...}），目标函数 = _bench 的中位延迟，评估代价高（每次要编译+跑）。缓存键把「目标函数只随问题量变化」这一先验编码进来，摊销搜索成本；prune 用便宜的估时/规则近似替代昂贵的实测，是典型的「代理模型 + top_k 精测」两阶段优化。",
+    "分位数计时：对 n 次重复的延迟样本取经验分位数 q0.5/q0.2/q0.8，中位数是稳健位置估计（对离群不敏感），p20/p80 给出波动带。以中位数排序 config 比均值更能反映稳定性能，尤其在有 GC/时钟抖动的实机上。",
+    "原子落盘的正确性依据：POSIX rename(2) 对同一文件系统内的替换是原子的——要么旧内容、要么完整新内容，不存在中间态。因此并发读者不会读到写一半的缓存文件；write-to-tmp-then-rename 是无锁发布的经典手法。lock 文件在本章路径里创建但 FileCacheManager 自身未加锁读写，一致性主要靠 rename 原子性 + 键的确定性（同键内容等价）。"
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {"what": "cache.py 的 RemoteCacheBackend / RedisRemoteCacheBackend / RemoteCacheManager 三个类（L139-L252）", "why_safe": "远程/分布式缓存是与本章主线（本地磁盘缓存 + 可插拔缝）正交的替代实现；FileCacheManager 独立自洽，删除不影响默认路径的键构造、原子落盘、group 语义。正文用一句话说明「可经环境变量换成远程实现」即可。"},
+      {"what": "autotuner.py __init__ 中 deprecated 的 warmup/rep/use_cuda_graph 分支（L104-L127）", "why_safe": "代码内注释明确标 deprecated 并 warnings.warn；默认路径走 L129-L132 的 do_bench = driver.active.get_benchmarker()。删掉旧接口分支不改变现代用法下的行为。"},
+      {"what": "FileCacheManager.__init__ 的 dump/override 两个分支（L55-L62，保留 else 常规分支）", "why_safe": "dump（IR 导出）/override（内核替换）是调试用途、由 TRITON_KERNEL_DUMP/OVERRIDE 触发，与常规编译缓存正交。保留 else 分支即完整覆盖「~/.triton/cache/<key>」主路径；相应 get_override_manager/get_dump_manager 亦可删。"},
+      {"what": "Heuristics 类与 heuristics 装饰器（L375-L408）", "why_safe": "Heuristics 是与 Autotuner 并列的轻量替代（不测速、直接按函数算 meta），本章焦点在 autotune 完整操作面；删除不影响 Autotuner 主线。正文可一句带过其存在与差异。"},
+      {"what": "LazyProxy 的 __delattr__/__repr__/__str__（L33-L44，保留 __getattr__/__setattr__/_initialize_obj）", "why_safe": "这些是转发协议的补全方法，惰性初始化的核心机制由 __getattr__ + _initialize_obj 体现。精简版保留触发点即可讲清惰性；补全方法不改变机制正确性。"}
+    ],
+    "must_keep": [
+      {"symbol": "LazyProxy", "why": "惰性代理是「import triton 不初始化 CUDA」的核心，读者必须理解 __getattr__ → _initialize_obj 的触发链。"},
+      {"symbol": "_initialize_obj", "why": "惰性初始化的判空守卫（_obj is None 才构造），是惰性语义的关键单点。"},
+      {"symbol": "DriverConfig", "why": "全局 driver 单例的类型，active/default 双引用 + set_active/reset_active 是运行期切后端入口。"},
+      {"symbol": "_create_driver", "why": "「筛唯一 is_active driver」的选择逻辑发生地，配对脊柱的选择端。"},
+      {"symbol": "_discover_backends", "why": "配对脊柱的发现端：扫目录建 {name: Backend} 表，姊妹篇 triton-ascend 回指本节。"},
+      {"symbol": "_find_concrete_subclasses", "why": "「各目录取唯一 concrete 子类」的契约执行者，0/>1 报错逻辑是接入规约。"},
+      {"symbol": "Backend", "why": "compiler+driver 配对记录，脊柱的数据结构。"},
+      {"symbol": "DriverBase", "why": "驱动抽象契约（is_active/get_current_target/get_benchmarker），后端发现与选择都建立在它之上。"},
+      {"symbol": "GPUDriver", "why": "torch.cuda 桥接基类，点透 driver.active 为何需要真设备（回收 f11 的断裂点）。"},
+      {"symbol": "is_active", "why": "后端自报「我这套设备可用吗」的判据，选择唯一 driver 的依据。"},
+      {"symbol": "get_benchmarker", "why": "计时器的后端接缝，autotune 的 do_bench 来源。"},
+      {"symbol": "Autotuner", "why": "自动调优主类，本章性能落点。"},
+      {"symbol": "run", "why": "Autotuner.run 是缓存键构造 + miss 搜索 + hit 复用的编排主干。"},
+      {"symbol": "_bench", "why": "单 config 计时核心：装配 hook 的 kernel_call + do_bench 取分位 + 异常记 inf。"},
+      {"symbol": "prune_configs", "why": "搜索空间裁剪（early_config_prune + perf_model top_k），读者据此配 prune_configs_by。"},
+      {"symbol": "Config", "why": "候选配置对象，读者写 @triton.autotune 直接构造它。"},
+      {"symbol": "all_kwargs", "why": "把 config 旋钮摊平成 fn.run 关键字参数，连接调优与编译。"},
+      {"symbol": "pre_hook", "why": "reset_to_zero/restore 的挂钩点（回收 f11 提到的 pre_run_hooks 语义关联）。"},
+      {"symbol": "post_hook", "why": "restore_value 还原被改写张量的挂钩点。"},
+      {"symbol": "reset_to_zero", "why": "保护被 kernel 累加/写入的张量每轮清零，读者调优带副作用 kernel 必用。"},
+      {"symbol": "restore_value", "why": "clone/copy_ 还原被改写张量，保证每 config 面对相同输入。"},
+      {"symbol": "FileCacheManager", "why": "磁盘缓存主体，目录布局 + 原子写 + group。"},
+      {"symbol": "put", "why": "tmp 目录 + os.replace 原子落盘的实现，theory 里原子性论证的落点。"},
+      {"symbol": "get_group", "why": "整组产物齐全性校验（逐个 exists），缓存命中完整性的关键。"},
+      {"symbol": "put_group", "why": "写 __grp__ 索引，group 语义的写端。"},
+      {"symbol": "get_cache_manager", "why": "可插拔缝：默认 FileCacheManager，按环境变量替换。"},
+      {"symbol": "_base64", "why": "把 sha256 十六进制键转成文件名安全串，缓存目录名来源。"}
+    ]
+  },
+  "mechanisms": [
+    {"id": "m1", "name": "LazyProxy 惰性 driver 初始化（import 不碰 CUDA）", "kind": "protocol", "source_anchors": ["python/triton/runtime/driver.py:L12-L44", "python/triton/runtime/driver.py:L47-L60"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m2", "name": "_discover_backends 配对脊柱：扫目录取唯一 concrete 子类", "kind": "protocol", "source_anchors": ["python/triton/backends/__init__.py:L35-L47", "python/triton/backends/__init__.py:L16-L26"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m3", "name": "_create_driver：筛唯一 is_active driver 并实例化", "kind": "algorithm", "source_anchors": ["python/triton/runtime/driver.py:L5-L9", "third_party/nvidia/backend/driver.py:L465-L468"], "needs_figure": false, "needs_worked_example": true, "difficulty": "supporting"},
+    {"id": "m4", "name": "DriverBase/GPUDriver 契约与 torch.cuda 桥（f11 断裂点回收）", "kind": "protocol", "source_anchors": ["python/triton/backends/driver.py:L11-L48"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m5", "name": "Autotuner 缓存键：key 参数 + 张量 dtype", "kind": "algorithm", "source_anchors": ["python/triton/runtime/autotuner.py:L170-L193"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m6", "name": "_bench 单 config 计时：hook 装配 + do_bench 分位数 + 异常记 inf", "kind": "algorithm", "source_anchors": ["python/triton/runtime/autotuner.py:L134-L168"], "needs_figure": false, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m7", "name": "reset_to_zero/restore_value：pre/post hook 保护被改写张量", "kind": "algorithm", "source_anchors": ["python/triton/runtime/autotuner.py:L57-L85", "python/triton/runtime/autotuner.py:L147-L163"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m8", "name": "prune_configs 两级裁剪：early_config_prune + perf_model top_k", "kind": "algorithm", "source_anchors": ["python/triton/runtime/autotuner.py:L211-L229"], "needs_figure": false, "needs_worked_example": true, "difficulty": "supporting"},
+    {"id": "m9", "name": "Config 搜索空间与 all_kwargs 摊平", "kind": "config", "source_anchors": ["python/triton/runtime/autotuner.py:L265-L293"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m10", "name": "计时器后端接缝 driver.active.get_benchmarker()", "kind": "protocol", "source_anchors": ["python/triton/runtime/autotuner.py:L129-L132", "third_party/nvidia/backend/driver.py:L470-L472"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m11", "name": "FileCacheManager 目录布局 + tmp + os.replace 原子落盘", "kind": "dataflow", "source_anchors": ["python/triton/runtime/cache.py:L52-L74", "python/triton/runtime/cache.py:L112-L136"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m12", "name": "编译产物 group（__grp__ 索引）整组齐全性校验", "kind": "dataflow", "source_anchors": ["python/triton/runtime/cache.py:L87-L110", "python/triton/compiler/compiler.py:L246-L252"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m13", "name": "编译磁盘缓存键构造（triton_key+src+backend+options+env → sha256 → _base64）", "kind": "algorithm", "source_anchors": ["python/triton/compiler/compiler.py:L229-L233", "python/triton/runtime/cache.py:L259-L277"], "needs_figure": false, "needs_worked_example": true, "difficulty": "supporting"},
+    {"id": "m14", "name": "可插拔 CacheManager（TRITON_CACHE_MANAGER / 远程后端）", "kind": "config", "source_anchors": ["python/triton/runtime/cache.py:L264-L277"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"}
+  ],
+  "foreshadow_due": {
+    "plant": [],
+    "recover": [
+      {"id": "f11", "note": "driver 子系统边界（driver.active 取 device/stream/target + make_backend——host 无 GPU 的断裂点），埋于 ch11。本章正式展开：DriverConfig+LazyProxy 惰性选出唯一 is_active 的 driver、_discover_backends 扫 backends/<name>/、GPUDriver 契约（torch.cuda 桥即断裂点所在）、autotune(pre_hook/post_hook 挂钩) 与磁盘缓存(FileCacheManager)。回收方式：m1/m2/m4 展开 driver 发现与选择，m4 的 GPUDriver.__init__ 桥到 torch.cuda 正是 ch11 标出的『真设备断裂点』。"}
+    ]
+  }
+}
