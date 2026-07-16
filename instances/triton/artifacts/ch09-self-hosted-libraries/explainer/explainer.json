@@ -1,0 +1,605 @@
+{
+  "chapter_id": "ch09",
+  "slug": "ch09-self-hosted-libraries",
+  "trace_notes": "本章 skip_impl（无 subtract-only 精简版）。两类取证：(1) 纯控制流算法用 host python 忠实复刻 v3.2.0 源码常量与控制流 -> traces/algorithms.json；(2) 内联后 IR 膨胀用 pip install triton==3.2.0（pin，instances/triton/source==v3.2.0）headless 精确编译真 kernel、数 TTIR 里展开的 op -> traces/ir_metrics.json。两类都 trace_source=run。",
+  "mechanisms": [
+    {
+      "mechanism_id": "m1-self-hosting-cdiv",
+      "intuition": "整箱装货：99 件货、每箱 10 件，要几个箱？99//10=9 只装得下 90 件，剩 9 件还得再开 1 箱 -> 向上取整 10。cdiv 就是这个『不够一箱也算一箱』，而它整个函数体只有一行普通算术 (x+div-1)//div —— 没有一句 C++，是纯 Triton 原语拼出来的，这就是『在 Triton 里写 Triton』的最小原子证据。",
+      "worked_example": {
+        "params": {
+          "cases": "(10,3) 不整除, (9,3) 整除, (1,4) 不足一块",
+          "source": "standard.py:L40"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/algorithms.json",
+        "table": {
+          "columns": [
+            "x",
+            "div",
+            "floor = x//div",
+            "cdiv = (x+div-1)//div",
+            "为什么不是 floor"
+          ],
+          "rows": [
+            [
+              "10",
+              "3",
+              "3",
+              "4",
+              "floor 少算 1 块（余数被丢），+div-1 把它补回 -> 4"
+            ],
+            [
+              "9",
+              "3",
+              "3",
+              "3",
+              "整除时 x+div-1 落在同一商内，floor=cdiv=3，不多给"
+            ],
+            [
+              "1",
+              "4",
+              "0",
+              "1",
+              "不足一块也要一块：floor=0 会丢东西，cdiv=1"
+            ]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "cdiv(x,div) = ⌈x/div⌉ 对所有正整数成立，且整除时不会多给一块。",
+        "argument": "写 x = q·div + r，0≤r<div。x+div-1 = q·div + (r+div-1)。若 r=0（整除）：r+div-1 = div-1 < div，整除后仍是 q -> 不多给。若 r>0：r+div-1 ∈ [div, 2div-2)，整除后是 q+1 -> 正好进一块。故等于 ⌈x/div⌉。"
+      },
+      "quantified": "函数体 1 行、用到的原语数 = 3（一次加、一次减、一次整除 //），@jit 层新增的 C++ 代码 = 0 行。调用点被内联展开成这 3 个标量算术 op。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m2-inlining-ir-blowup",
+      "intuition": "tl.sort/tl.softmax 不是你以为的『一次便宜的函数调用』——它更像 C 里的宏：追踪 kernel 时整个函数体被『复制粘贴』内联进你的 IR。所以块越大，铺进 IR 的算法网络越大，寄存器压力和编译时长跟着涨。优化算子时，得把这笔 IR 膨胀算进预算。",
+      "worked_example": {
+        "params": {
+          "kernel": "对 N 长块调 tl.sort",
+          "pin": "triton==3.2.0 headless 精确编译",
+          "metric": "TTIR 里 arith.select 数 = compare-and-swap 数; tt.call 数 = 真函数调用数"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/ir_metrics.json",
+        "table": {
+          "columns": [
+            "块长 n",
+            "log2(n) = bitonic 阶段数",
+            "内联后 arith.select (= CAS 数)",
+            "TTIR 行数",
+            "tt.call (真函数调用)"
+          ],
+          "rows": [
+            [
+              "16",
+              "4",
+              "10",
+              "452",
+              "0"
+            ],
+            [
+              "64",
+              "6",
+              "21",
+              "779",
+              "0"
+            ],
+            [
+              "1024",
+              "10",
+              "55",
+              "1781",
+              "0"
+            ]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "tt.call 恒为 0（完全内联），且 IR 里的 compare-and-swap 数随块长单调增长，等于 log2(n)·(log2(n)+1)/2。",
+        "argument": "sort 是 @jit 函数，追踪期在每个调用点内联展开、不生成 tt.call 节点（实测三档均为 0）。其体内 static_range 循环边界是 constexpr，追踪期铺平成定长网络：n_dims=log2(n) 个 merge、第 i 个铺 i 次 CAS，累加 1+2+…+n_dims -> 严格随 n 增。实测 n=16→10、64→21、1024→55，与 n_dims(n_dims+1)/2 逐一吻合。"
+      },
+      "quantified": "n=16 -> 452 行 TTIR / 10 个 CAS；n 翻到 1024（×64）-> 1781 行（约 ×3.9）/ 55 个 CAS（×5.5）。一次 tl.sort(1024) 在你 IR 里 = 55 个向量化 compare-and-swap 全展开，绝非一条便宜的调用。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch09-inlining-blowup",
+          "template": "state-table",
+          "claim": "块长每翻倍，tl.sort 内联进 IR 的 compare-and-swap 数按 log2(n) 三角数增长，函数调用数恒为 0。",
+          "numbers": [
+            {
+              "value": "10",
+              "provenance": "traces/ir_metrics.json sort_inlining n=16 arith_select"
+            },
+            {
+              "value": "21",
+              "provenance": "traces/ir_metrics.json sort_inlining n=64 arith_select"
+            },
+            {
+              "value": "55",
+              "provenance": "traces/ir_metrics.json sort_inlining n=1024 arith_select"
+            },
+            {
+              "value": "1781",
+              "provenance": "traces/ir_metrics.json sort_inlining n=1024 ttir_lines"
+            },
+            {
+              "value": "0",
+              "provenance": "traces/ir_metrics.json sort_inlining tt_call（三档全 0，完全内联）"
+            }
+          ],
+          "caption_draft": "@jit 库函数被内联而非调用：一次 tl.sort(1024) 在你的 TTIR 里铺开 55 个 compare-and-swap、1781 行 IR，tt.call=0。它是宏不是免费调用——IR 膨胀要算进优化预算。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m3-softmax-stability",
+      "intuition": "exp 是个『暴脾气』：exp(1000) 在 fp32 里直接爆成 inf，然后 inf/inf = nan，softmax 全废。技巧极简：先把每个数减去这一行的最大值，最大值变成 0、其余变负数，exp 的上界被压到 exp(0)=1，永不溢出；而分子分母同乘 exp(-max) 抵消，softmax 结果一字不变。",
+      "worked_example": {
+        "params": {
+          "x": "[1000, 1001, 1002]",
+          "source": "standard.py:L54  z = x - max(x,0)"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/algorithms.json",
+        "table": {
+          "columns": [
+            "x_i",
+            "朴素 exp(x_i)",
+            "减 max 后 z_i = x_i - 1002",
+            "exp(z_i)",
+            "稳定 softmax_i"
+          ],
+          "rows": [
+            [
+              "1000",
+              "inf（溢出）",
+              "-2.0",
+              "0.135",
+              "0.09"
+            ],
+            [
+              "1001",
+              "inf（溢出）",
+              "-1.0",
+              "0.368",
+              "0.245"
+            ],
+            [
+              "1002",
+              "inf（溢出）",
+              "0.0",
+              "1.0",
+              "0.665"
+            ]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "减最大值不改变 softmax 的值，但把 exp 的输入上界钉在 0（exp≤1），杜绝溢出。",
+        "argument": "softmax(x)_i = e^{x_i}/Σ_j e^{x_j}。分子分母同乘常数 e^{-m}（m=max x）：e^{x_i-m}/Σ_j e^{x_j-m}，比值不变 -> 结果恒等。又因 x_i-m≤0，故 e^{x_i-m}≤e^0=1，绝不会到 inf。实测朴素路三项 exp 全 inf -> nan；稳定路 z=[-2,-1,0]，exp=[0.135,0.368,1.0] 都有限，softmax=[0.09,0.245,0.665] 正常。"
+      },
+      "quantified": "朴素路溢出项数 = 3/3（全废）；稳定路 exp 最大值 = 1.0（发生在 z=0 处），最小 = 0.135，三项和 = 1.483，归一化后 softmax 三项和 = 1.0（0.09+0.245+0.665）。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m4-bitonic-sort",
+      "intuition": "GPU 讨厌『看数据决定走哪条分支』。bitonic sort 是一张『排序网络』：谁跟谁比、比几轮，完全由块长（编译期常量）定死，与数值无关。constexpr 引擎 _log2 在追踪期把块长换成阶段数 n_dims，static_range 循环把 n_dims 个阶段在追踪期就铺平成定长 IR —— 没有运行期循环，天生适配 SIMT。",
+      "worked_example": {
+        "params": {
+          "input": "[3, 1, 2, 0]",
+          "n_dims": "log2(4) = 2",
+          "note": "每个 compare-and-swap 调用 = 整块一个向量化 op = 内联 IR 里一个 arith.select"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/algorithms.json",
+        "table": {
+          "columns": [
+            "CAS 调用#",
+            "阶段内下标 i",
+            "调用前",
+            "调用后"
+          ],
+          "rows": [
+            [
+              "1",
+              "1",
+              "[3, 1, 2, 0]",
+              "[1, 3, 2, 0]"
+            ],
+            [
+              "2",
+              "0",
+              "[1, 3, 2, 0]",
+              "[1, 0, 2, 3]"
+            ],
+            [
+              "3",
+              "1",
+              "[1, 0, 2, 3]",
+              "[0, 1, 2, 3]"
+            ]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "sort 铺开的 compare-and-swap 调用数只依赖块长 = n_dims(n_dims+1)/2，与被排的数值无关（data-independent）。",
+        "argument": "n_dims=log2(n) 由 _log2 在追踪期（纯 Python）算出。顶层 static_range(1,n_dims+1) 铺 n_dims 个 _bitonic_merge；第 i 个 merge 内 static_range(i) 铺 i 次 _compare_and_swap。累加 Σ_{i=1..n_dims} i = n_dims(n_dims+1)/2，全部循环边界是 constexpr -> 定长。实测 n=4：3 次调用（1+2），把 [3,1,2,0] 单调收敛到 [0,1,2,3]。"
+      },
+      "quantified": "n=4 -> n_dims=2 -> 3 次 CAS 调用；n=1024 -> n_dims=10 -> 55 次（1+2+…+10）。复杂度 O(log^2 n) 全部内联进 IR（见 m2 实测 select 数）。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch09-bitonic-n4",
+          "template": "state-table",
+          "claim": "n=4 的 bitonic sort 用 3 次数据无关的 compare-and-swap 调用把 [3,1,2,0] 单调收敛为 [0,1,2,3]。",
+          "numbers": [
+            {
+              "value": "[3,1,2,0]",
+              "provenance": "traces/algorithms.json bitonic_sort.input"
+            },
+            {
+              "value": "[0,1,2,3]",
+              "provenance": "traces/algorithms.json bitonic_sort.sorted"
+            },
+            {
+              "value": "3",
+              "provenance": "traces/algorithms.json bitonic_sort.num_cas_calls"
+            },
+            {
+              "value": "2",
+              "provenance": "traces/algorithms.json bitonic_sort.n_dims = log2(4)"
+            }
+          ],
+          "caption_draft": "排序网络是定死的：3 次 compare-and-swap 的『谁跟谁比』由块长 4 编译期定死、与数值无关，逐调用把乱序块推向有序——这正是 static_range 在追踪期铺平的定长 IR。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m5-compare-and-swap",
+      "intuition": "GPU 上写 if 交换两个数会引起分支发散、很贵。bitonic 的原子操作用『异或魔术』做到无分支：注意到 a 与 b 交换等价于同时对两者异或 (a^b)，交换与否只由一个布尔 cond 决定 —— cond 真就异或 (a^b)，假就异或 0（原样）。一条 where 选 (a^b) 或 0，全程没有 if。",
+      "worked_example": {
+        "params": {
+          "flip": "0（升序）",
+          "cond": "(left>right) != flip",
+          "delta": "left ^ right",
+          "source": "standard.py:L334-L339"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/algorithms.json",
+        "table": {
+          "columns": [
+            "left",
+            "right",
+            "cond = (left>right)!=0",
+            "delta = left^right",
+            "out_left = left^(cond?delta:0)",
+            "out_right = right^(cond?delta:0)"
+          ],
+          "rows": [
+            [
+              "3",
+              "1",
+              "真 -> 交换",
+              "2",
+              "1",
+              "3"
+            ],
+            [
+              "1",
+              "3",
+              "假 -> 保持",
+              "2",
+              "1",
+              "3"
+            ],
+            [
+              "2",
+              "0",
+              "真 -> 交换",
+              "2",
+              "0",
+              "2"
+            ]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "无分支异或交换与『cond 时交换、否则保持』语义完全一致，且对任意 dtype（bitcast 到同宽整数后）都成立。",
+        "argument": "记 d=a^b。cond 真：a^d = a^a^b = b，b^d = b^a^b = a -> 两者互换。cond 假：异或 0 -> a、b 原样。一条 where(cond, d, 0) 覆盖两种情况、无 if 分支。实测 (3,1) cond 真 -> (1,3)；(1,3) cond 假 -> (1,3)；(2,0) 真 -> (0,2)，三例 delta 均 = 2。浮点先 bitcast 成同宽整数再异或，故 dtype 无关。"
+      },
+      "quantified": "分支数 = 0（用 1 个 where + 1 个 xor 取代 if）；一次 CAS 调用在 IR 里 = 1 个 arith.select + 1 个 arith.cmpf + 2 个 arith.xori（见 traces/ir_metrics.json：n=16 时 select=10、cmpf=10、xori=20，比值 1:1:2）。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch09-xor-swap",
+          "template": "before-after",
+          "claim": "条件交换用 x ^ where(cond, left^right, 0) 一步完成，cond 真则两元素互换、假则原样，全程无分支。",
+          "numbers": [
+            {
+              "value": "3",
+              "provenance": "traces/algorithms.json compare_and_swap ascending_pairs[0].left"
+            },
+            {
+              "value": "1",
+              "provenance": "traces/algorithms.json compare_and_swap ascending_pairs[0].right"
+            },
+            {
+              "value": "2",
+              "provenance": "traces/algorithms.json compare_and_swap ascending_pairs[0].xor_delta = 3^1"
+            },
+            {
+              "value": "1:1:2",
+              "provenance": "traces/ir_metrics.json n=16 select:cmpf:xori = 10:10:20"
+            }
+          ],
+          "caption_draft": "异或魔术做无分支交换：delta=3^1=2，(3,1) 各异或 delta 得 (1,3) 完成升序交换；cond 为假时异或 0 保持原样。GPU 上一条 select 取代 if，杜绝分支发散。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m7-philox-counterbased",
+      "intuition": "传统 RNG 像一条流水线：要第 100 个数得先摇前 99 个（持有可变状态）。GPU 上千万线程共享这条流水线得加锁同步，并行全毁。Philox 反过来：它是个纯函数 rand(seed, counter) —— 想要第 offset 个随机数，直接把 offset 当计数器喂进去，不摇前面的。无状态 => 每个线程各算各的、无需同步，且同样的 (seed, offset) 永远给同一个数（可复现）。",
+      "worked_example": {
+        "params": {
+          "seed": "42 (0x2A)",
+          "n_rounds": "10 (N_ROUNDS_DEFAULT, random.py:L5)",
+          "entry": "randint4x -> philox -> philox_impl，offset 即计数器"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/algorithms.json",
+        "table": {
+          "columns": [
+            "场景",
+            "seed",
+            "offset（计数器）",
+            "randint4x 输出 [c0, c1, c2, c3]"
+          ],
+          "rows": [
+            [
+              "首次 launch",
+              "42",
+              "0",
+              "[2632642643, 2012563771, 314527917, 1463989207]"
+            ],
+            [
+              "同参重跑（可复现）",
+              "42",
+              "0",
+              "[2632642643, 2012563771, 314527917, 1463989207] —— 逐位相同"
+            ],
+            [
+              "换计数器（无状态并行）",
+              "42",
+              "1",
+              "[4242219303, 1404726525, 2207210094, 1951270651] —— 全变"
+            ]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "输出只是 (seed, offset) 的确定性纯函数：无状态 => 同参 bit-exact 复现、不同 offset 相互独立可并行。",
+        "argument": "randint4x(seed, offset) = philox_impl(offset,0,0,0, seed_lo, seed_hi, 10)，无任何跨调用可变状态。第 offset 个数与前 offset-1 个数无数据依赖 -> 完美并行。实测 seed=42/offset=0 两次调用输出逐位相同（stateless_identical=True）；offset 换成 1 输出四元组全变（differ=True）。10 轮 umulhi+异或提供跨 bit 雪崩混合。"
+      },
+      "quantified": "混合轮数 = 10（random.py:L5）；每次 randint4x 产 4 个 int32 随机块；线程间同步开销 = 0（无共享状态）。seed=42、offset 0->1 使 4 个输出全部改变（无相关性）。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch09-philox-stateless",
+          "template": "flow",
+          "claim": "(seed, offset) 经 10 轮 Philox 混合直接映射到随机数：同参恒等复现，换 offset 即得独立流，无需线程间同步状态。",
+          "numbers": [
+            {
+              "value": "10",
+              "provenance": "random.py:L5 N_ROUNDS_DEFAULT"
+            },
+            {
+              "value": "42",
+              "provenance": "traces/algorithms.json philox.seed"
+            },
+            {
+              "value": "[2632642643,2012563771,314527917,1463989207]",
+              "provenance": "traces/algorithms.json philox.randint4x_offset0"
+            },
+            {
+              "value": "[4242219303,1404726525,2207210094,1951270651]",
+              "provenance": "traces/algorithms.json philox.randint4x_offset1"
+            }
+          ],
+          "caption_draft": "counter-based 无状态 RNG：seed=42 下 offset=0 与 offset=1 各得一组独立随机数；重跑 offset=0 逐位复现。计数器代替可变状态，千万线程各算各的、零同步。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m8-wraparound-sanitize-off",
+      "intuition": "RNG 的搅拌靠的正是『整数算到溢出就绕回去』这套 mod 2^32 的钟表算术 —— 走满一圈从 0 重来。所以 Philox 的乘加刻意传 sanitize_overflow=False，主动要环绕。这跟第 7 章里默认 sanitize_overflow=True『防溢出』是同一个开关的相反用法：那边把溢出当 bug 拦下，这边把溢出当特性放行。",
+      "worked_example": {
+        "params": {
+          "op": "c1 = B * _c2 mod 2^32",
+          "B": "0xCD9E8D57 = 3449720151 (PHILOX_ROUND_B)",
+          "source": "random.py:L37 tl.mul(..., sanitize_overflow=False)"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/algorithms.json",
+        "table": {
+          "columns": [
+            "_c2",
+            "完整积 B×_c2",
+            "是否 ≥ 2^32 = 4294967296",
+            "sanitize=False 环绕后 (mod 2^32)"
+          ],
+          "rows": [
+            [
+              "1",
+              "3449720151",
+              "否（不溢出）",
+              "3449720151（不变）"
+            ],
+            [
+              "3",
+              "10349160453",
+              "是（溢出）",
+              "1759225861（绕回）"
+            ]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "关掉 sanitize_overflow 使乘加落在 Z/2^32 环上做精确模运算；不溢出时值不变，溢出时按 mod 2^32 环绕，二者都是 RNG 需要的确定性行为。",
+        "argument": "u32(x) = x mod 2^32。_c2=1：积 3449720151 < 2^32 -> 模运算恒等，值不变。_c2=3：积 10349160453 ≥ 2^32 -> 10349160453 - 2·2^32 = 1759225861，绕回。若开 sanitize_overflow（ch07 默认）会把第二种情况判为溢出错误，破坏 RNG 的置换数学 -> 故此处显式 False。"
+      },
+      "quantified": "环模 = 2^32 = 4294967296。示例中 _c2=3 时完整积 10349160453 超模一圈多，环绕后 = 1759225861（= 完整积 - 2×2^32）。sanitize 开销 = 0（关掉即纯模乘）。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m10-extern-dispatch-path",
+      "intuition": "数学函数有两条路。第一条（内置，见 exp/umulhi）：语言层自己有对应的 MLIR op，@builtin 直接 _builder.create_exp 建一个 IR 节点。第二条（extern）：很多 transcendental/特殊函数没有原生 op，于是不建节点、改『链外部库』—— 按入参 dtype 元组去一张字典里查出 libdevice 里的具名符号（如 __nv_umulhi），把调用绑上去，编译期链接 NVIDIA 的 libdevice.bc bitcode 拿到高质量实现。",
+      "worked_example": {
+        "params": {
+          "call": "libdevice.mulhi(a, b)",
+          "mechanism": "extern_elementwise -> dispatch 按 arg_types 元组查 arg_type_symbol_dict",
+          "source": "core.py:L2628-L2679; third_party/nvidia/language/cuda/libdevice.py:L29-L37"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/algorithms.json",
+        "table": {
+          "columns": [
+            "入参 dtype 元组",
+            "查中的外部符号",
+            "返回 dtype",
+            "命中?"
+          ],
+          "rows": [
+            [
+              "(int32, int32)",
+              "__nv_mulhi",
+              "int32",
+              "命中"
+            ],
+            [
+              "(uint32, uint32)",
+              "__nv_umulhi",
+              "uint32",
+              "命中"
+            ],
+            [
+              "(uint64, uint64)",
+              "__nv_umul64hi",
+              "uint64",
+              "命中"
+            ],
+            [
+              "(float16, float16)",
+              "—",
+              "—",
+              "未命中 -> ValueError"
+            ]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "dispatch 以入参 dtype 元组为 key 精确选符号；key 不在字典即报错，不会静默乱选。",
+        "argument": "arg_type_symbol_dict = {(int32,int32):(__nv_mulhi,...), (uint32,uint32):(__nv_umulhi,...), ...}。dispatch 先 `if arg_types not in dict: raise ValueError`，否则取 symbol=dict[arg_types][0]、ret=dict[arg_types][1]，交给 create_extern_elementwise 绑定。实测 (int32,int32)->__nv_mulhi、(uint32,uint32)->__nv_umulhi 各走各路；(float16,float16) 不在字典 -> ValueError。有符号/无符号靠这层区分。"
+      },
+      "quantified": "libdevice.mulhi 声明覆盖 dtype 元组数 = 4（int32/uint32/int64/uint64），未覆盖的 dtype（如 float16）= 直接报错、0 静默回退。第一条路建 IR 节点数 = 1（create_umulhi）；第二条路 = 1 次 create_extern_elementwise + 链外部 bitcode。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch09-two-math-paths",
+          "template": "flow",
+          "claim": "数学函数两条路：内置直接 create_* 建原生 IR 节点；extern 按 dtype 元组查符号后 create_extern_elementwise 链外部 libdevice bitcode。",
+          "numbers": [
+            {
+              "value": "__nv_umulhi",
+              "provenance": "third_party/nvidia/language/cuda/libdevice.py:L33 (uint32,uint32) 映射"
+            },
+            {
+              "value": "__nv_mulhi",
+              "provenance": "third_party/nvidia/language/cuda/libdevice.py:L32 (int32,int32) 映射"
+            },
+            {
+              "value": "4",
+              "provenance": "traces/algorithms.json extern_dispatch：mulhi 覆盖 4 个 dtype 元组"
+            }
+          ],
+          "caption_draft": "同名 mulhi 两条命运：内置数学(exp/umulhi)走 builder.create_* 建原生 op；extern 数学按入参 dtype 查字典选 __nv_umulhi 等外部符号，链 libdevice bitcode。有原生 op 就自己建、没有就链外部库。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m11-extra-pkgutil-discovery",
+      "intuition": "extra/ 目录是个『插座面板』：谁把后端子包（cuda/hip）插进来，pkgutil 就在 import 时逐个发现并挂载，上游不必硬编码有哪些后端。这正是姊妹篇 triton-ascend 挂自己 libdevice 入口的同一个接缝 —— 配对脊柱。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch09-extra-seam",
+          "template": "flow",
+          "claim": "import triton.language.extra 时 pkgutil.iter_modules 遍历 extra/ 子包、跳过 .py 文件、逐个 import 并塞进 sys.modules，构成后端 libdevice 的动态挂载接缝。",
+          "numbers": [
+            {
+              "value": "cuda/hip",
+              "provenance": "python/triton/language/extra/__init__.py:L15 注释：import backends (like cuda and hip)"
+            },
+            {
+              "value": "is_pkg",
+              "provenance": "python/triton/language/extra/__init__.py:L11 跳过 .py（如 libdevice.py）只收子包"
+            }
+          ],
+          "caption_draft": "extra/ 是后端插座：pkgutil 只挑 is_pkg 的子包（跳过 libdevice.py）逐个 import 进 sys.modules。上游零硬编码——triton-ascend 就在这里挂自己的 extra/ 后端入口（姊妹篇回指本节）。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m12-optimization-hints",
+      "intuition": "编译器不总能自动看出『这批地址一定能被 128 整除』这类事实，可它一旦知道，就能把 128 个零散 load 合并成向量化的宽 load。tl.multiple_of(off, 128) 就是你把这个只有程序员知道的事实『贴张标签』塞进 IR —— 它自己不做任何计算，只在张量上盖一个 tt.divisibility=128 的戳，真正拿这戳去做向量化的是后端 AxisInfo 分析（第 25 章会讲）。",
+      "worked_example": {
+        "params": {
+          "kernel": "对 arange 块做 load+1",
+          "hint": "tl.multiple_of(off, 128)",
+          "pin": "triton==3.2.0 headless 编译，比对 TTIR make_range 属性",
+          "source": "core.py:L2200-L2229"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/ir_metrics.json",
+        "table": {
+          "columns": [
+            "版本",
+            "make_range 上是否有 tt.divisibility 标记",
+            "标记值"
+          ],
+          "rows": [
+            [
+              "无提示（plain）",
+              "无",
+              "—"
+            ],
+            [
+              "tl.multiple_of(off, 128)",
+              "有",
+              "128"
+            ]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "multiple_of 只在追踪期校验 constexpr[int] 并给张量打 divisibility 标记，本身不产生任何计算 op；标记进入 IR 属性供后端消费。",
+        "argument": "源码逐元素 assert isinstance(d, constexpr) 且 d.value 是 int，否则 TypeError；随后 return semantic.multiple_of(input, values) —— 只改张量的 divisibility 元信息、不建算术节点。实测：plain 版 make_range 无 tt.divisibility；加 tl.multiple_of(off,128) 后 make_range 上出现 tt.divisibility=dense<128>。它是纯『打标记』，向量化在第 25 章的 AxisInfo/Coalesce 才发生。"
+      },
+      "quantified": "hint 新增的计算 op = 0（纯标记）；注入的 IR 属性 = tt.divisibility=dense<128>（plain 版为空）。打对标记后编译器方可把 load 合并向量化；打错则是未定义行为。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch09-multiple-of-tag",
+          "template": "before-after",
+          "claim": "tl.multiple_of(off,128) 不做计算，只在 make_range 上盖一个 tt.divisibility=dense<128> 的标记，喂给后端 AxisInfo 决定向量化。",
+          "numbers": [
+            {
+              "value": "128",
+              "provenance": "traces/ir_metrics.json multiple_of_hint.hint_divisibility_value"
+            },
+            {
+              "value": "0",
+              "provenance": "traces/ir_metrics.json multiple_of_hint：plain 版无 tt.divisibility 属性（新增计算 op 为 0）"
+            }
+          ],
+          "caption_draft": "打标记而非计算：plain 版 make_range 光秃秃，加一句 tl.multiple_of(off,128) 后 IR 上多了 tt.divisibility=dense<128>。语言层只负责盖戳，向量化由第 25 章的 AxisInfo 消费这个戳。"
+        }
+      ]
+    }
+  ]
+}
