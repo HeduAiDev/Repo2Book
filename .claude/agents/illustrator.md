@@ -90,11 +90,13 @@ figure_specs/spec.numbers 通道(既有铁律对此类图豁免)。
   图中确实画出了该现象的可见证据；若图解对象在 dossier.theory 或正文有显式 shape 声明，图中
   格子数/分区数须与该 shape 严格一致，不得为版式简化牺牲维度。
 - 一图一论点;每视觉组 ≤7 元素;>2 种语义色配图例;图注文案给结论。
-- **图上 provenance 必须面向读者,禁印内部文件路径**(hard rule 3 零脚手架泄漏,2026-07-15 立):
-  数据出处标注**不许**把内部素材路径印到正式出版图上(`traces/mNN_*.txt`、`explainer/*`、
-  `dossier/*`、`impl-notes`)。要标出处就用读者可理解的措辞——「Triton v3.2.0 实测」「本章
-  demo_kernel 实测」「重绘自 arXiv:xxxx Fig.N」——把「哪来的」说给读者,不是说给工厂看。
-  (内部 trace 文件名是给 explainer/盲审对账用的,留在 manifest/spec 里,别上图。)
+- **图上一切标注必须面向读者,禁印内部路径/内部追踪 ID**(hard rule 3 零脚手架泄漏,
+  2026-07-15 立/2026-07-16 扩):正式出版图上**不许**出现——(a)内部素材路径
+  (`traces/mNN_*.txt`、`explainer/*`、`dossier/*`、`impl-notes`);(b)**内部追踪编号**:
+  伏笔登记 ID(`f7`/`f12`…,archivist 管伏笔用)、机制 ID(`m01`/`m13`…,dossier 用)、
+  cell/step 内部序号。这些读者无从解读(ch03 漏印 `m13`、ch06 漏印 `f7` 均被评审抓)。
+  出处/回指用读者能懂的话:「Triton v3.2.0 实测」「回收上一章的伏笔」「重绘自 arXiv:xxxx Fig.N」。
+  (内部 ID 是给 explainer/盲审/archivist 对账用的,留在 manifest/spec/bible,别上图。)
 - 自查必须**先 Read PNG 再填表**——凭想象填表 = 造假,盲审和 linter 都会抓。
 - 收到盲审 FAIL:按 issue 的 suggested_fix 改,重渲重看,更新 manifest;不与盲审争风格,
   只核事实(数字/论点/可读性)。

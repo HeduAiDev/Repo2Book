@@ -5,6 +5,7 @@
 ## Recent Activity
 
 | Date | Type | Chapter | Summary | File |
+| 2026-07-16 | delivery | 06 | ch06-type-promotion-broadcast-delivered-(skip_impl) | [2026-07-16_ch06-ch06-type-promotion-broadcast-delivered-(skip_impl).md](deliveries/2026-07-16_ch06-ch06-type-promotion-broadcast-delivered-(skip_impl).md) |
 | 2026-07-15 | delivery | 05 | ch05 type-system-and-tensor delivered (skip_impl) | [2026-07-15_ch05-ch05-type-system-and-tensor-delivered-(skip_impl).md](deliveries/2026-07-15_ch05-ch05-type-system-and-tensor-delivered-(skip_impl).md) |
 | 2026-07-15 | delivery | 04 | ch04 tl surface and constexpr delivered (skip_impl) | [2026-07-15_ch04-ch04-tl-surface-and-constexpr-delivered-(skip_impl).md](deliveries/2026-07-15_ch04-ch04-tl-surface-and-constexpr-delivered-(skip_impl).md) |
 | 2026-07-15 | delivery | 02 | ch02 gpu-execution-model delivered (primer) | [2026-07-15_ch02-ch02-gpu-execution-model-delivered-(primer).md](deliveries/2026-07-15_ch02-ch02-gpu-execution-model-delivered-(primer).md) |
