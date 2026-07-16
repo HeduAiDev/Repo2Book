@@ -1,0 +1,160 @@
+{
+  "chapter": "ch13",
+  "title": "TRITON_INTERPRET —— 无 GPU 环境下的替身执行器（回收伏笔 f5）",
+  "pin": "triton v3.2.0 @ 9641643da6c52000c807b5eeed05edaec4402a67",
+  "evidence_note": "本章两个 needs_worked_example 机制均有真实运行 trace：m4（串行遍历 grid）设 TRITON_INTERPRET=1 在 host CPU 实机跑通（trace 见 traces/m4_serial_grid.stdout.txt，@triton.jit 返回对象类型名实测为 InterpretedFunction、pid=0 整段先跑完再 pid=1、[0..7]*2 数值正确）；m2（AST 改写）直接切出 pin v3.2.0 interpreter.py:L1109-L1126 的 ASTTransformer 逐字源码在标准库 ast 上运行（trace 见 traces/m2_ast_rewrite.stdout.txt，无需 GPU/无需已编译 triton）。源码行号一律以 pin v3.2.0 为准，已逐条核对（jit.py:L834、interpreter.py:L358/L416/L1098/L1111 等）。",
+  "mechanisms": [
+    {
+      "mechanism_id": "m1-entry-fork",
+      "intuition": "同一份剧本（你的 @triton.jit 核代码），换个演出模式就换一位『演员』：平时是登台真跑硬件的主演（JITFunction，见第十一章正常发射路径），一旦挂上 TRITON_INTERPRET=1 这块牌子，装饰器改派替身（InterpretedFunction）上场——台词一字不改，只是这位替身在 CPU 上排练给你看。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m1-entry-fork",
+          "claim": "TRITON_INTERPRET=1 让 @triton.jit 装饰器在源头分叉：同一份用户核代码、同一句 k[grid](...) 调用语法，环境变量决定返回替身 InterpretedFunction（CPU 串行）还是正常路径的 JITFunction（GPU 发射）。",
+          "template": "flow",
+          "numbers": [
+            {"label": "分叉判据", "value": "os.getenv('TRITON_INTERPRET','0')=='1'", "provenance": "jit.py:L834"},
+            {"label": "命中→返回", "value": "InterpretedFunction", "provenance": "jit.py:L835-L838"},
+            {"label": "未命中→返回", "value": "JITFunction（正常路径，见第十一章）", "provenance": "jit.py:L840-L849"},
+            {"label": "实测对象类型名", "value": "InterpretedFunction", "provenance": "traces/m4_serial_grid.stdout.txt 首行 type(...).__name__"}
+          ],
+          "caption_draft": "一块环境变量牌子就换掉整条执行路线：装饰器层分叉，用户零改动。替身与正常路径在对象类型上彻底分开，互不污染——这就是伏笔 f5 说的『TRITON_INTERPRET=1 时返回 InterpretedFunction 而非 JITFunction』。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m2-ast-rewrite-to-tensor",
+      "intuition": "解释器不『原样跑你的 Python』，而是先给核体做一次『统一穿制服』：每条赋值的右值都被套进 to_tensor(...) 这件『张量外套』。因为 tl 的整套语义建立在『一切都是张量』上——program_id、arange 返回张量，连你随手写的 `c = 2` 这个裸整数也得先变成带 dtype 的张量，后面的 tl 运算才有统一语义可依。",
+      "worked_example": {
+        "params": {"kernel_assignments": 4, "non_assign_stmts": 1, "example": "pid=program_id(0); offs=pid*BLOCK+arange(0,BLOCK); c=2; y=load(...)*c; store(...)"},
+        "trace_source": "run",
+        "trace_ref": "traces/m2_ast_rewrite.stdout.txt",
+        "manual_reason": "",
+        "table": {
+          "columns": ["赋值序号", "改写前 (BEFORE)", "改写后 (AFTER)", "右值发生了什么"],
+          "rows": [
+            ["0", "pid = tl.program_id(0)", "pid = triton.language.semantic.to_tensor(tl.program_id(0), interpreter_builder, False)", "program_id 返回值被包一层 to_tensor"],
+            ["1", "offs = pid * BLOCK + tl.arange(0, BLOCK)", "offs = triton.language.semantic.to_tensor(pid * BLOCK + tl.arange(0, BLOCK), interpreter_builder, False)", "整个偏移表达式被包一层"],
+            ["2", "c = 2", "c = triton.language.semantic.to_tensor(2, interpreter_builder, False)", "裸标量 2 被提升成整型 tl.tensor，这一步最能说明『为何不能原样跑 Python』"],
+            ["3", "y = tl.load(x_ptr + offs) * c", "y = triton.language.semantic.to_tensor(tl.load(x_ptr + offs) * c, interpreter_builder, False)", "读入并乘常量后的结果同样被包一层"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "改写是保结构的：visit_Assign 只重写 Assign 节点的右值（node.value），语句条数、控制流、目标名一律不变；本例 4 条赋值恰好各被包一次、1 条 store 表达式语句零改动。",
+        "argument": "ASTTransformer 只覆写 visit_Assign，其它节点走默认遍历不动；方法内先禁止多目标赋值（len(names)>1 抛错）以杜绝歧义，再把 node.value 原样塞进一个 to_tensor(...) 调用后 return node——目标 targets 与语句位置都不动。于是『改写次数 = 赋值数』是一个守恒事实：trace 实测 4 次改写、store 这条 Expr 语句 0 次改写，语句总数不变。"
+      },
+      "quantified": "本例核体 4 条赋值 → 恰 4 次 to_tensor 包裹、1 条 store 语句 0 改写；改写是一次性 O(赋值数) 的 AST 变换，结果缓存进 InterpretedFunction.rewritten_fn（类级字典），同一个核只改写一次、后续调用复用。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m2-to-tensor-wrap",
+          "claim": "ASTTransformer.visit_Assign 把核体内每条赋值 `x = value` 改写成 `x = to_tensor(value, interpreter_builder, False)`，连裸标量 `c = 2` 也被提升为 tl.tensor——这就是『不是原样跑 Python』的具体动作。",
+          "template": "before-after",
+          "numbers": [
+            {"label": "被改写的赋值数", "value": "4", "provenance": "traces/m2_ast_rewrite.stdout.txt『赋值语句数 = 4』"},
+            {"label": "未触碰的 store 语句数", "value": "1", "provenance": "traces/m2_ast_rewrite.stdout.txt『非赋值表达式语句…数 = 1』"},
+            {"label": "裸标量样例", "value": "c = 2  ->  c = to_tensor(2, interpreter_builder, False)", "provenance": "traces/m2_ast_rewrite.stdout.txt 第 [2] 条"},
+            {"label": "改写实现锚点", "value": "visit_Assign@L1111", "provenance": "interpreter.py:L1111-L1126"},
+            {"label": "包裹落点函数", "value": "to_tensor", "provenance": "semantic.py:L111-L126"}
+          ],
+          "caption_draft": "左边你写的裸 Python 赋值，右边解释器实际编译执行的版本：每个右值都套上 to_tensor 这件张量外套。裸整数 2 变成 int32 张量，核体里从此『一切皆张量』——tl 语义得以在替身里闭合。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m3-function-rewriter-pipeline",
+      "intuition": "改写不是凭空发生的：FunctionRewriter 像一条小流水线，先把你函数的源码原文抠出来（inspect.getsourcelines），撕掉 @triton.jit 这类装饰器行、对齐缩进，解析成 AST，交给 ASTTransformer 逐条包 to_tensor，再把行号重新对齐回你的原文件——这样一旦报错，traceback 指的是你源码的真实行号，而不是某段临时字符串。最后 compile+exec 进原函数的 globals，产出那个改写后的可调用函数。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m3-rewriter-pipeline",
+          "claim": "FunctionRewriter.rewrite_ast 是一条 7 步流水线：取源码→定位 def 行→dedent→ast.parse→ASTTransformer.visit→重排行号对齐原文件→compile+exec 进原 globals，产出改写后可调用函数（取不到源码则原样返回）。",
+          "template": "flow",
+          "numbers": [
+            {"label": "取源码", "value": "inspect.getsourcelines(self.fn)", "provenance": "interpreter.py:L1143"},
+            {"label": "定位 def / dedent / 变换", "value": "_find_def → _prepare_source → _transform_ast", "provenance": "interpreter.py:L1152-L1155"},
+            {"label": "compile+exec 落点", "value": "_compile_and_exec 进 fn.__globals__", "provenance": "interpreter.py:L1187-L1195"},
+            {"label": "行号对齐目的", "value": "报错/断点指回用户源码真实行号", "provenance": "design_decisions: interpreter.py:L1183-L1188"},
+            {"label": "缓存", "value": "rewritten_fn 类级去重（同函数只改写一次）", "provenance": "interpreter.py:L1214-L1217"}
+          ],
+          "caption_draft": "一条从『你的源码文本』到『改写后可调用函数』的流水线。关键两点：行号重排让 traceback 指回你的原文件（调试是本模式头等目的），exec 进原函数 globals 让注入的 interpreter_builder 名字解析得到。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m4-grid-executor-serial",
+      "intuition": "GPU 上一个 grid 的成百上千个 program 是同时铺开在各个核心上并行跑的；替身没有并行硬件，于是 GridExecutor 把它们排成一队，用三重 for 一个一个喂：先把 program_id=0 这个 program 从头到尾跑完，再喂 program_id=1……就像一位演员把群戏里每个角色轮流演一遍。program_id 不是硬件算出来的，是执行器一个个塞进来的。",
+      "worked_example": {
+        "params": {"grid": "(2,)", "BLOCK": 4, "n": 8, "input_x": "[0,1,2,3,4,5,6,7]", "kernel": "y = x * 2"},
+        "trace_source": "run",
+        "trace_ref": "traces/m4_serial_grid.stdout.txt",
+        "manual_reason": "",
+        "table": {
+          "columns": ["串行轮次", "program_id（执行器喂入）", "offs 分片", "x 读入", "y = x*2 写出", "此刻另一 program 状态"],
+          "rows": [
+            ["1", "0", "[0, 1, 2, 3]", "[0, 1, 2, 3]", "[0, 2, 4, 6]", "pid=1 尚未开始"],
+            ["2", "1", "[4, 5, 6, 7]", "[4, 5, 6, 7]", "[8, 10, 12, 14]", "pid=0 已整段跑完"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "三重 for 恰好遍历 prod(补齐后 grid) 次、逐点 set_grid_idx 后调一次核体，每个 program 跑且只跑一次、串行不重入，有限步必停。",
+        "argument": "grid=(2,) 被补齐为 (2,1,1)，三层 range 上界固定 → 迭代计数 = 2×1×1 = 2，严格有限；每轮先 set_grid_idx(x,y,z) 唯一确定 program_id，再同步调用 self.fn(**args)，无并发、无 await，pid=0 整段返回后才进入 pid=1（trace 中两行按 program_id=0 → program_id=1 顺序打印为证）→ 覆盖全 grid 且一次一个 program。"
+      },
+      "quantified": "grid=(2,) 补齐 (2,1,1)，串行迭代 prod = 2 次、单线程 numpy；对照 GPU：这 2 个 program 本应并行铺开在不同 warp/SM 上，替身把它们摊成 2 次顺序调用——总工作量 = 2 × 单 program 计算，墙钟与 GPU 不可比，只复现『每个 program 算什么』。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m4-serial-vs-parallel",
+          "claim": "GridExecutor 用三重 for 把 grid 的每个 program 串行喂入 CPU：pid=0 整段先跑完（写 [0,2,4,6]）再轮到 pid=1（写 [8,10,12,14]），与 GPU 上同一 grid 并行铺开形成鲜明对照。",
+          "template": "swimlane",
+          "numbers": [
+            {"label": "grid", "value": "(2,)→补齐(2,1,1)", "provenance": "interpreter.py:L1093-L1096"},
+            {"label": "轮1 program_id", "value": "0", "provenance": "traces/m4_serial_grid.stdout.txt『program_id=0』"},
+            {"label": "轮1 写出", "value": "[0, 2, 4, 6]", "provenance": "traces/m4_serial_grid.stdout.txt pid=0 y_write"},
+            {"label": "轮2 program_id", "value": "1", "provenance": "traces/m4_serial_grid.stdout.txt『program_id=1』"},
+            {"label": "轮2 写出", "value": "[8, 10, 12, 14]", "provenance": "traces/m4_serial_grid.stdout.txt pid=1 y_write"},
+            {"label": "串行调用点", "value": "for x/y/z: set_grid_idx; self.fn(**args)", "provenance": "interpreter.py:L1098-L1102"}
+          ],
+          "caption_draft": "一条 CPU 泳道上两个 program 首尾相接地跑（上：GPU 本应并行两条泳道同时跑）。program_id 由执行器一个个喂进来——这就是『串行 ≠ 并行』的画面，也是它能单步/能 print/能无卡验证的根源。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m7-interpreter-builder-numpy",
+      "intuition": "真实编译路径里，builder.create_add 是去『画一张施工图』——建一个 tt.add 的 IR 节点交给后端；解释器的 InterpreterBuilder 同名同签名，但 create_add 干的是当场把两个 numpy 数组加起来。接口一样、行为换芯：从『建 IR』换成『直接算数值』。所以同一段 tl 代码，一个走去编译、一个走去出数。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m7-numpy-vs-ir",
+          "claim": "InterpreterBuilder 提供与真 IR builder 同名的 create_* 全套，但实现是 numpy 直算而非建 IR：program_id 从 grid_idx 取值、二元算子走 op(numpy)、load/store 按 uint64 地址读写 host 内存——解释器不建 IR。",
+          "template": "before-after",
+          "numbers": [
+            {"label": "program_id 实现", "value": "return grid_idx[axis]（直接取值，不建 IR）", "provenance": "interpreter.py:L358-L361"},
+            {"label": "二元算子公共实现", "value": "binary_op: TensorHandle(op(lhs.data, rhs.data), ...)", "provenance": "interpreter.py:L416-L417"},
+            {"label": "create_add", "value": "binary_op(..., np.add)", "provenance": "interpreter.py:L431"},
+            {"label": "create_mul", "value": "binary_op(..., np.multiply)", "provenance": "interpreter.py:L424"},
+            {"label": "访存实现", "value": "create_masked_load/store → C++ _interpreter 按地址读写", "provenance": "interpreter.py:L376-L385"}
+          ],
+          "caption_draft": "左（真 builder）：create_add 建一个 tt.add IR 节点，交后端编译成 GPU 指令。右（InterpreterBuilder）：create_add 就是 np.add(lhs.data, rhs.data)，当场出数。同名接口、换掉内核——这让整套 tl 前端零改动地复用到 CPU 数值路径上。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m8-boundary-serial-not-parallel",
+      "intuition": "替身是台『慢放的显微镜』：它能让你逐个 program 看清每一步算了什么、哪个下标越界、数值对不对；但它一次只有一个 program、访存是逐地址的 numpy 读写，根本没有『多线程同时抢内存』这回事——所以合并访存、bank 冲突、occupancy 这些并行性能量在这台机器上压根不存在。一句话：用它查对错，不用它查快慢。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m8-can-vs-cannot",
+          "claim": "替身执行器能查『对错』（逻辑/边界/数值，可单步可 print），量不出『快慢』（合并访存/occupancy/bank 冲突）——因为它一次一个 program、并行旋钮 RESERVED_KWS 被剔除、访存策略参数被忽略。",
+          "template": "state-table",
+          "numbers": [
+            {"label": "能：数值正确性", "value": "[0..7]*2 实测正确", "provenance": "traces/m4_serial_grid.stdout.txt『correct = True』"},
+            {"label": "能：单步/print", "value": "核内 print 直接在 CPU 生效", "provenance": "traces/m4_serial_grid.stdout.txt [kernel] 两行"},
+            {"label": "剔除：并行旋钮", "value": "RESERVED_KWS=num_warps/num_stages/num_ctas/...", "provenance": "interpreter.py:L1038 与 L1081"},
+            {"label": "忽略：访存策略", "value": "cache_modifier/eviction_policy/is_volatile 下划线占位", "provenance": "interpreter.py:L376-L385"},
+            {"label": "不能：并行性能量", "value": "合并访存/occupancy/bank 冲突（无并发访存）", "provenance": "dossier.theory『为何量不出合并访存/occupancy』"}
+          ],
+          "caption_draft": "一张能/不能对照表：左列（能）——数值、边界、逻辑，可单步可打印；右列（不能）——一切并行性能量，因为一次只有一个 program、并行旋钮被直接丢弃。这是本章的边界，也是伏笔 f5 要点破的『串行 ≠ 并行』。"
+        }
+      ]
+    }
+  ]
+}

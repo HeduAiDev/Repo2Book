@@ -1,0 +1,457 @@
+{
+  "chapter": "ch13",
+  "title": "TRITON_INTERPRET —— 无 GPU 环境下的替身执行器（回收伏笔 f5）",
+  "pin": "triton v3.2.0 @ 9641643da6c52000c807b5eeed05edaec4402a67",
+  "evidence_note": "本章取证最完整：TRITON_INTERPRET=1 本就在 host CPU 执行，无需 GPU。实机 headless 观测已确认：@triton.jit 装饰的函数在 TRITON_INTERPRET=1 下 type(k).__name__ == 'InterpretedFunction'；k[(2,)](...) 触发 GridExecutor 串行遍历 grid（先 pid 0 再 pid 1，逐个打印），核内 print 生效，输出数值正确（[0,1,2,3,4,5]*2 => [0,2,4,6,8,10]）。行号一律以 pin v3.2.0 源码为准。",
+  "code_spine": [
+    "python/triton/runtime/jit.py:L832-L849  —— @triton.jit 装饰器：TRITON_INTERPRET==1 时分叉，返回 InterpretedFunction（否则 JITFunction，正常路径见第十一章，本章不重讲）",
+    "python/triton/runtime/interpreter.py:L1198-L1235  —— InterpretedFunction：替身函数对象，惰性 rewrite() + 经 GridExecutor 发射",
+    "python/triton/runtime/interpreter.py:L1109-L1126  —— ASTTransformer.visit_Assign：把每个赋值 x=value 改写为 x = triton.language.semantic.to_tensor(value, interpreter_builder, False)",
+    "python/triton/runtime/interpreter.py:L1129-L1195  —— FunctionRewriter：取源码→定位 def→dedent→ast.parse→visit→重排行号→compile/exec，产出改写后的可调用函数",
+    "python/triton/language/semantic.py:L111-L126  —— to_tensor：把裸 python 标量（bool/int/float）包成 tl.tensor（张量语义），赋值改写的落点",
+    "python/triton/runtime/interpreter.py:L1079-L1106  —— GridExecutor.__call__：剔保留 kw→拷参到 host→_patch_lang→_implicit_cvt→三重 for 串行遍历 grid→回拷副作用",
+    "python/triton/runtime/interpreter.py:L1052-L1066  —— GridExecutor._init_args_hst：凡有 data_ptr 的 device 张量 .cpu() 拷到 host",
+    "python/triton/runtime/interpreter.py:L1012-L1032  —— _implicit_cvt：把指针实参换成装着 data_ptr()（uint64 地址）的 TensorHandle",
+    "python/triton/runtime/interpreter.py:L999-L1008  —— _patch_lang：把 tl / tl.core 的 builtin 重绑到 interpreter_builder（InterpreterBuilder 实例）",
+    "python/triton/runtime/interpreter.py:L358-L364  —— InterpreterBuilder.create_get_program_id / create_get_num_programs：从当前 grid_idx / grid_dim 直接取值（不建 IR）",
+    "python/triton/runtime/interpreter.py:L416-L432  —— InterpreterBuilder.binary_op 与 create_add/create_mul... ：numpy 直接算数值（与真 builder 建 tt.* IR 节点对照）",
+    "python/triton/runtime/interpreter.py:L367-L385  —— InterpreterBuilder.create_load/create_store/create_masked_load/create_masked_store：走 C++ _interpreter.load/store 按 uint64 地址读写 host 内存"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "python/triton/runtime/jit.py",
+      "lines": "L832-L849",
+      "code": "    def decorator(fn: T) -> JITFunction[T]:\n        assert callable(fn)\n        if os.getenv(\"TRITON_INTERPRET\", \"0\") == \"1\":\n            from .interpreter import InterpretedFunction\n            return InterpretedFunction(fn, version=version, do_not_specialize=do_not_specialize,\n                                       do_not_specialize_on_alignment=do_not_specialize_on_alignment, debug=debug,\n                                       noinline=noinline, repr=repr, launch_metadata=launch_metadata)\n        else:\n            return JITFunction(\n                fn,\n                version=version,\n                do_not_specialize=do_not_specialize,\n                do_not_specialize_on_alignment=do_not_specialize_on_alignment,\n                debug=debug,\n                noinline=noinline,\n                repr=repr,\n                launch_metadata=launch_metadata,\n            )",
+      "elide": [
+        "decorator 外层 jit(fn=None, ...) 的两处 overload 签名与 if fn is not None 分支（L790-L830、L851-L855）只是装饰器语法糖，与替身选择无关，可省略。else 分支的 JITFunction 正常路径见第十一章，本章只用它作对照。"
+      ]
+    },
+    {
+      "path": "python/triton/runtime/interpreter.py",
+      "lines": "L1198-L1235",
+      "code": "class InterpretedFunction:\n    # Cache all rewritten functions\n    rewritten_fn = {}\n\n    def __init__(self, fn, **kwargs) -> None:\n        self.fn = fn\n        self.rewriter = FunctionRewriter(fn, **kwargs)\n\n        def run(*args, **kwargs):\n            grid = kwargs[\"grid\"]\n            fn = self.rewrite()\n            return GridExecutor(fn, self.arg_names, grid)(*args, **kwargs)\n\n        self.run = run\n        signature = inspect.signature(fn)\n        self.arg_names = [v.name for v in signature.parameters.values()]\n\n    def rewrite(self):\n        if self.fn not in self.rewritten_fn:\n            self.rewritten_fn[self.fn] = self.rewriter.rewrite_ast()\n        return self.rewritten_fn[self.fn]\n\n    @property\n    def __name__(self):\n        return self.fn.__name__\n\n    def __getitem__(self, grid):\n        fn = self.rewrite()\n        return GridExecutor(fn, self.arg_names, grid)\n\n    def __call__(self, *args, **kwargs):\n        # This is a device function call\n        _patch_lang(self.fn)\n        fn = self.rewrite()\n        try:\n            return fn(*args, **kwargs)\n        except Exception as e:\n            raise InterpreterError(repr(e)) from e",
+      "elide": [
+        "__call__ 是「核内调用另一个 @triton.jit 设备函数」的路径（不带 grid），与顶层发射对照即可，正文可略讲。rewritten_fn 类级缓存：同一函数只改写一次。"
+      ]
+    },
+    {
+      "path": "python/triton/runtime/interpreter.py",
+      "lines": "L1109-L1126",
+      "code": "class ASTTransformer(ast.NodeTransformer):\n\n    def visit_Assign(self, node):\n        names = []\n        for target in node.targets:\n            names += [self.visit(target)]\n        if len(names) > 1:\n            raise ValueError(\"Multiple assignments are not supported\")\n        # Modify the assignment x = value to\n        # triton.language.semantic.to_tensor(value, interpreter_builder, False)\n        node.value = ast.Call(\n            func=ast.Attribute(\n                value=ast.Attribute(\n                    value=ast.Attribute(value=ast.Name(id='triton', ctx=ast.Load()), attr='language', ctx=ast.Load()),\n                    attr='semantic', ctx=ast.Load()), attr='to_tensor', ctx=ast.Load()),\n            args=[node.value, ast.Name(id='interpreter_builder', ctx=ast.Load()),\n                  ast.Constant(value=False)], keywords=[])\n        return node",
+      "elide": [
+        "ast.Attribute 嵌套只是在构造 `triton.language.semantic.to_tensor` 这一串属性访问的 AST，正文讲清「等价于把右值包一层 to_tensor」即可，无需逐层解释 Attribute 树。"
+      ]
+    },
+    {
+      "path": "python/triton/language/semantic.py",
+      "lines": "L111-L126",
+      "code": "def to_tensor(x, builder, check_type: bool = True):\n    if isinstance(x, bool):\n        return tl.tensor(builder.get_int1(x), tl.int1)\n    # Note: compile-time const integers are represented by unsigned values\n    elif isinstance(x, int):\n        if -2**31 <= x < 2**31:\n            dtype = tl.int32\n        elif 2**31 <= x < 2**32:\n            dtype = tl.uint32\n        elif -2**63 <= x < 2**63:\n            dtype = tl.int64\n        elif 2**63 <= x < 2**64:\n            dtype = tl.uint64\n        else:\n            raise ValueError(f'Nonrepresentable integer {x}.')\n        return full((), x, dtype=dtype, builder=builder)",
+      "elide": [
+        "float 分支（L127+）逻辑同理，按大小选 fp32/fp64；已是 tl.tensor 的 x 直接返回。要点：裸标量被提升成张量，从而后续 tl 运算有统一的张量语义可依。"
+      ]
+    },
+    {
+      "path": "python/triton/runtime/interpreter.py",
+      "lines": "L1139-L1157",
+      "code": "    def rewrite_ast(self):\n        # If exception is raise, it means the function does not have source code available,\n        # e.g., dynamically generated functions, we cannot rewrite it so just return the original function\n        try:\n            lines, _ = inspect.getsourcelines(self.fn)\n        except Exception:\n            return self.fn\n\n        # truncate lines before def\n        # @triton.autotune(...)\n        # ...\n        # @triton.jit\n        # ...\n        # def foo(...): <- this line is the function definition\n        self.filename, self.def_file_lineno = self._get_jit_fn_file_line()\n        self.def_lineno = self._find_def(lines)\n        src = self._prepare_source(lines)\n        transformed_ast = self._transform_ast(src)\n        return self._compile_and_exec(transformed_ast)",
+      "elide": [
+        "_find_def/_prepare_source/_transform_ast/_compile_and_exec 四个私有方法（L1163-L1195）是本流水线的分步实现：定位 def 行、dedent、ast.parse+visit+增量行号、compile+exec。正文可挑其中「重排行号让报错指回原文件」与「exec 进原函数 globals」两点讲，其余按流水线口径概述。"
+      ]
+    },
+    {
+      "path": "python/triton/runtime/interpreter.py",
+      "lines": "L1187-L1195",
+      "code": "    def _compile_and_exec(self, transformed_ast):\n        compiled_code = compile(transformed_ast, filename=self.filename, mode='exec')\n        local_namespace = {**self.kwargs}\n        fn_globals = self.fn.__globals__\n        for key, value in globals().items():\n            if key not in fn_globals:\n                fn_globals[key] = value\n        exec(compiled_code, fn_globals, local_namespace)\n        return local_namespace[self.fn.__name__]",
+      "elide": [
+        "把 interpreter.py 的模块级名字（interpreter_builder、TensorHandle 等）注入原函数 globals，改写后的 to_tensor 调用才能解析到 interpreter_builder。"
+      ]
+    },
+    {
+      "path": "python/triton/runtime/interpreter.py",
+      "lines": "L1079-L1106",
+      "code": "    def __call__(self, *args_dev, **kwargs):\n        # removes reserved keywords from kwargs\n        kwargs = {k: v for k, v in kwargs.items() if k not in RESERVED_KWS}\n        if kwargs.pop(\"warmup\", False):\n            return\n        # copy arguments to the host\n        args_hst, kwargs_hst = self._init_args_hst(args_dev, kwargs)\n        # remaps core language functions to interpreted ones\n        _patch_lang(self.fn)\n        # we need to copy arguments to the host for the interpreter\n        # implicitly convert tensor arguments to their base pointers\n        args = inspect.getcallargs(self.fn, *args_hst, **kwargs_hst)\n        args = {name: arg if name in self.constexprs else _implicit_cvt(arg) for name, arg in args.items()}\n        # iterate through grid\n        grid = self.grid(args) if callable(self.grid) else self.grid\n        assert len(grid) <= 3, \"grid must have at most 3 dimensions\"\n        grid = grid + (1, ) * (3 - len(grid))\n        interpreter_builder.set_grid_dim(*grid)\n        try:\n            for x in range(grid[0]):\n                for y in range(grid[1]):\n                    for z in range(grid[2]):\n                        interpreter_builder.set_grid_idx(x, y, z)\n                        self.fn(**args)\n        except Exception as e:\n            raise InterpreterError(repr(e)) from e\n        # copy arguments back to propagate side-effects\n        self._restore_args_dev(args_dev, args_hst, kwargs, kwargs_hst)",
+      "elide": [
+        "RESERVED_KWS（num_warps/num_stages/num_ctas/... L1038）在解释器无意义被剔除；warmup 直接返回。三重 for 是本章题眼：grid 被补齐到三维后逐点 set_grid_idx + 调 self.fn，一次只跑一个 program，串行。"
+      ]
+    },
+    {
+      "path": "python/triton/runtime/interpreter.py",
+      "lines": "L1052-L1066",
+      "code": "    def _init_args_hst(self, args_dev, kwargs):\n        args_hst = []\n        for arg in args_dev:\n            if hasattr(arg, \"data_ptr\"):\n                args_hst.append(arg.cpu())\n            else:\n                args_hst.append(arg)\n        # Process keyword arguments\n        kwargs_hst = {}\n        for key, value in kwargs.items():\n            if hasattr(value, \"data_ptr\"):\n                kwargs_hst[key] = value.cpu()\n            else:\n                kwargs_hst[key] = value\n        return args_hst, kwargs_hst",
+      "elide": [
+        "_restore_args_dev（L1068-L1077）是对称回拷：跑完把 host 张量 .to(device) 拷回原 device 张量，让 store 的副作用可见。"
+      ]
+    },
+    {
+      "path": "python/triton/runtime/interpreter.py",
+      "lines": "L1012-L1032",
+      "code": "def _implicit_cvt(arg):\n    if isinstance(arg, int):\n        ty = tl.str_to_ty(triton.runtime.jit.JITFunction._type_of(triton.runtime.jit.JITFunction._key_of(arg)))\n        dtype = np.int32\n        if -2**31 <= arg < 2**31:\n            dtype = np.int32\n        elif 2**31 <= arg < 2**32:\n            dtype = np.uint32\n        elif -2**63 <= arg < 2**63:\n            dtype = np.int64\n        elif 2**63 <= arg < 2**64:\n            dtype = np.uint64\n        else:\n            raise ValueError(f\"Unsupported integer value {arg}\")\n        handle = TensorHandle(np.array([arg], dtype=dtype), ty)\n        return tl.tensor(handle, ty)\n    if hasattr(arg, \"data_ptr\"):\n        ty = tl.str_to_ty(triton.runtime.jit.JITFunction._type_of(triton.runtime.jit.JITFunction._key_of(arg)))\n        handle = TensorHandle(np.array([arg.data_ptr()], dtype=np.uint64), ty)\n        return tl.tensor(handle, ty)\n    return arg",
+      "elide": [
+        "int 分支按大小选 numpy dtype，与 to_tensor 呼应。要点在第二个 if：有 data_ptr 的张量实参被换成「装着 data_ptr() 这个 uint64 地址」的 TensorHandle——核里对指针的算术从此都是对这个整数地址算。"
+      ]
+    },
+    {
+      "path": "python/triton/runtime/interpreter.py",
+      "lines": "L999-L1008",
+      "code": "def _patch_lang(fn):\n    langs = [value for _, value in fn.__globals__.items() if value in [tl, tl.core]]\n    assert len(langs) >= 1, \"triton.language must be visible from within jit'd function\"\n    for lang in langs:\n        _patch_builtin(lang, interpreter_builder)\n        _patch_builtin(lang.tensor, interpreter_builder)\n        if lang == tl:\n            _patch_builtin(lang.math, interpreter_builder)\n        _patch_lang_tensor(lang.tensor)\n        _patch_lang_core(lang)",
+      "elide": [
+        "_patch_builtin（L689-L692）遍历成员，凡 tl.core.is_builtin 的就用 _patch_attr 重绑到 interpreter_builder；_patch_lang_tensor/_patch_lang_core 另补 tensor 的 __bool__/__index__ 与 range/static_assert/reduce/scan 等。正文讲清「tl.* 的 builtin 被整体重接到 InterpreterBuilder」即可。"
+      ]
+    },
+    {
+      "path": "python/triton/runtime/interpreter.py",
+      "lines": "L358-L364",
+      "code": "    # programming model\n    def create_get_program_id(self, axis):\n        if self.grid_idx is None:\n            raise ValueError(\"grid_idx is None\")\n        return TensorHandle(np.array([self.grid_idx[axis]], dtype=np.int32), tl.int32)\n\n    def create_get_num_programs(self, axis):\n        return TensorHandle(np.array([self.grid_dim[axis]], dtype=np.int32), tl.int32)",
+      "elide": [
+        "与真 builder 对照：真 builder 会建一个 tt.get_program_id IR op 交给后端；这里直接返回当前串行迭代的 grid_idx[axis] 数值——program_id 不是硬件算出来的，是 GridExecutor 一个个喂进来的。"
+      ]
+    },
+    {
+      "path": "python/triton/runtime/interpreter.py",
+      "lines": "L554-L555",
+      "code": "    def create_make_range(self, start, stop):\n        return TensorHandle(np.arange(start, stop, dtype=np.int32), tl.int32)",
+      "elide": [
+        "tl.arange 的解释器实现——worked_example 里 tl.arange(0, BLOCK) 生成的偏移张量下标即由此出。与 create_get_program_id/binary_op 同一副印子：同名接口、换 numpy 内核（这里是 np.arange），解释器不建 IR。"
+      ]
+    },
+    {
+      "path": "python/triton/runtime/interpreter.py",
+      "lines": "L415-L432",
+      "code": "    # binary operators\n    def binary_op(self, lhs, rhs, op):\n        return TensorHandle(op(lhs.data, rhs.data), lhs.dtype.scalar)\n\n    create_fadd = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.add)\n    create_fmul = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.multiply)\n    create_fdiv = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.divide)\n    create_frem = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.remainder)\n    create_fsub = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.subtract)\n    create_mul = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.multiply)\n    create_precise_divf = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.divide)\n    create_sdiv = lambda self, lhs, rhs: self.create_idiv(lhs, rhs)\n    create_udiv = lambda self, lhs, rhs: self.create_idiv(lhs, rhs)\n    # LLVM has 'numpy.fmod', not 'numpy.remainder', semantics on integer remainders.\n    create_srem = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.fmod)\n    create_urem = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.fmod)\n    create_add = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.add)\n    create_sub = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.subtract)",
+      "elide": [
+        "块内 L415-L432 现为逐字连续（含 precise_divf/sdiv/udiv/srem/urem 全部整数变体）；只有 L433-L537 的其余几十个 create_*（比较/位运算/min/max/cast/超越函数）省略，均同构：op(numpy)。对照点：真 builder 的同名 create_* 建 IR 节点，这里直接落 numpy 数值——解释器不建 IR。正文举 add/mul 一两个即可。"
+      ]
+    },
+    {
+      "path": "python/triton/runtime/interpreter.py",
+      "lines": "L367-L385",
+      "code": "    # memory ops\n    def create_load(self, ptr, _0, _1, is_volatile):\n        mask = TensorHandle(np.ones_like(ptr.data, dtype=bool), tl.int1)\n        other = None\n        return self.create_masked_load(ptr, mask, other, _0, _1, is_volatile)\n\n    def create_store(self, ptr, val, _0, _1):\n        mask = TensorHandle(np.ones_like(ptr.data, dtype=bool), tl.int1)\n        return self.create_masked_store(ptr, val, mask, None, None)\n\n    def create_masked_load(self, ptrs, mask, other, cache_modifier, eviction_policy, is_volatile):\n        dtype_tt = ptrs.get_element_ty()\n        dtype_np = _get_np_dtype(dtype_tt)\n        if other is None:\n            other = TensorHandle(np.zeros_like(ptrs.data, dtype=dtype_np), dtype_tt)\n        ret = _interpreter.load(ptrs.data, mask.data, other.data, dtype_np)\n        return TensorHandle(ret, dtype_tt)\n\n    def create_masked_store(self, ptrs, value, mask, cache_modifier, eviction_policy):\n        return _interpreter.store(ptrs.data, value.data, mask.data)",
+      "elide": [
+        "cache_modifier/eviction_policy/is_volatile 这些性能相关的参数在解释器里被忽略（下划线占位）——又一个「查对错不查快慢」的印证。_interpreter.load/store 是 C++ 侧按 uint64 地址数组直接读写进程内存。"
+      ]
+    }
+  ],
+  "key_classes": [
+    {
+      "name": "InterpretedFunction",
+      "file": "python/triton/runtime/interpreter.py",
+      "responsibility": "TRITON_INTERPRET=1 下 @triton.jit 返回的替身对象（对应正常路径的 JITFunction）。持有原函数 fn 与 FunctionRewriter；run/__getitem__ 触发惰性 rewrite() 后交 GridExecutor 发射；__call__ 处理核内设备函数调用。rewritten_fn 类级缓存去重。"
+    },
+    {
+      "name": "FunctionRewriter",
+      "file": "python/triton/runtime/interpreter.py",
+      "responsibility": "AST 改写流水线：inspect.getsourcelines 取源码→_find_def 定位 def 行→_prepare_source dedent→_transform_ast(ast.parse+ASTTransformer.visit+增量行号)→_compile_and_exec(compile+exec 进原函数 globals)。产出改写后的可调用函数。取不到源码则原样返回。"
+    },
+    {
+      "name": "ASTTransformer",
+      "file": "python/triton/runtime/interpreter.py",
+      "responsibility": "ast.NodeTransformer 子类，只重写 visit_Assign：把每个赋值 `x = value` 改成 `x = triton.language.semantic.to_tensor(value, interpreter_builder, False)`，从而所有中间值都带张量语义。禁止多目标赋值。"
+    },
+    {
+      "name": "GridExecutor",
+      "file": "python/triton/runtime/interpreter.py",
+      "responsibility": "把改写后的函数在 CPU 上跑起来的执行器：剔 RESERVED_KWS→_init_args_hst 拷参到 host→_patch_lang 重绑 tl→_implicit_cvt 指针换 uint64→三重 for 串行遍历 grid（逐点 set_grid_idx 调 fn）→_restore_args_dev 回拷副作用。"
+    },
+    {
+      "name": "InterpreterBuilder",
+      "file": "python/triton/runtime/interpreter.py",
+      "responsibility": "与真 IR builder 同名接口（create_* 全套）的 numpy 兜底实现。不建 IR 节点，直接用 numpy 算数值：program_id 从 grid_idx 取、二元/一元/比较用 np.*、load/store 走 C++ _interpreter 按地址读写。全局单例 interpreter_builder。"
+    },
+    {
+      "name": "TensorHandle",
+      "file": "python/triton/runtime/interpreter.py",
+      "responsibility": "解释器里张量的载体：包一个 numpy array（data）+ triton 类型（dtype）。InterpreterBuilder 所有运算的输入输出都是 TensorHandle。指针也是 TensorHandle（data 为 uint64 地址数组）。"
+    },
+    {
+      "name": "to_tensor",
+      "file": "python/triton/language/semantic.py",
+      "responsibility": "把裸 python 标量（bool/int/float）按大小选 dtype 提升为 tl.tensor；已是 tensor 则原样返回。ASTTransformer 注入的赋值包裹落点——保证赋值右值统一为张量语义。"
+    }
+  ],
+  "data_flow": [
+    "1. 用户设 TRITON_INTERPRET=1；import 时 @triton.jit 走 jit.py:decorator，os.getenv 命中，返回 InterpretedFunction(fn,...)（而非 JITFunction）。",
+    "2. 用户写 k[(grid,)](args...)：InterpretedFunction.__getitem__(grid) 先 rewrite() 得改写函数，再返回 GridExecutor(fn, arg_names, grid)；随即对其 __call__(args...)。（k[...](...)=下标建执行器再调用；k.run 同理走 run 闭包。）",
+    "3. rewrite()：首次调用触发 FunctionRewriter.rewrite_ast——取源码、定位 def、dedent、ast.parse、ASTTransformer.visit 把每个赋值包成 to_tensor(...)、fix_missing_locations + increment_lineno 让行号指回原文件、compile、exec 进 fn.__globals__（并注入 interpreter.py 的模块名如 interpreter_builder）。结果缓存进 rewritten_fn。",
+    "4. GridExecutor.__call__：剔 RESERVED_KWS（num_warps 等）与 warmup；_init_args_hst 把带 data_ptr 的 device 张量 .cpu() 拷到 host。",
+    "5. _patch_lang(fn)：遍历 fn.__globals__ 找到 tl/tl.core，_patch_builtin 把其中 is_builtin 成员整体重绑到全局单例 interpreter_builder，并补 tensor 的 __bool__/__index__、range/static_assert/reduce/scan 等。tl.* 从此调到 InterpreterBuilder。",
+    "6. inspect.getcallargs 绑定实参到形参名；_implicit_cvt 把非 constexpr 的指针实参换成装着 data_ptr()（uint64 地址）的 TensorHandle，int 实参也提升为 TensorHandle。",
+    "7. grid 补齐到三维，set_grid_dim；三重 for x/y/z 逐点 set_grid_idx(x,y,z) 后调 self.fn(**args)——一次只跑一个 program，CPU 串行遍历整个 grid。",
+    "8. 核体内：program_id 从 grid_idx 取当前值；arange/load/store/算术全部落到 InterpreterBuilder 的 numpy 实现；load/store 经 C++ _interpreter 按 uint64 地址读写 host 内存。print/assert 直接在 CPU 上生效。",
+    "9. 全 grid 跑完后 _restore_args_dev 把 host 张量 .to(device) 回拷进原 device 张量，使 store 副作用对调用方可见。异常统一包成 InterpreterError。"
+  ],
+  "design_decisions": [
+    {
+      "decision": "入口分叉在装饰器层：TRITON_INTERPRET==1 直接返回另一种函数对象 InterpretedFunction，而非在编译期切换后端",
+      "why": "让替身与正常路径共享同一份用户核代码与调用语法（k[grid](...)），用户零改动切换；两条路径在对象类型上彻底分开，互不污染。",
+      "evidence": "python/triton/runtime/jit.py:L834-L838"
+    },
+    {
+      "decision": "用 AST 改写把每个赋值包成 to_tensor，而不是原样跑 Python",
+      "why": "tl 的语义建立在「一切是张量」之上：program_id/arange 返回的是张量、标量常量也要能参与张量运算并携带 dtype。若原样跑 Python，`x = 0` 会得到裸 int，后续 tl 运算/attr 设置无统一张量语义可依。包一层 to_tensor 把每个中间结果都提升为 tl.tensor，从而张量语义在整段核体内闭合。",
+      "evidence": "python/triton/runtime/interpreter.py:L1117-L1126 与 semantic.py:L111-L126"
+    },
+    {
+      "decision": "GridExecutor 用三重 Python for 串行遍历 grid，一次一个 program",
+      "why": "无 GPU、无并行硬件；把 program_id 一个个喂进核体即可复现每个 program 的计算。串行的代价是量不出真实并行性能，但换来可单步调试、可 print、可在无卡机器验证逻辑正确性。",
+      "evidence": "python/triton/runtime/interpreter.py:L1098-L1102"
+    },
+    {
+      "decision": "指针实参换成 uint64 地址（data_ptr()），load/store 按地址读写 host 内存",
+      "why": "核体里对指针只做整数算术（base+offset）；把张量替换成其 host 缓冲区的整数地址后，numpy 侧的指针算术与 C++ _interpreter.load/store 就能忠实复现「按地址访存」，无需真设备内存模型。",
+      "evidence": "python/triton/runtime/interpreter.py:L1028-L1031 与 L376-L385"
+    },
+    {
+      "decision": "InterpreterBuilder 提供与真 IR builder 同名的 create_* 全套，但用 numpy 兜底、不建 IR",
+      "why": "tl 的 builtin 只认 builder.create_* 接口；只要接口同名同签名，把它换成 numpy 直算的实现，就能让同一段 tl 代码走「数值路径」而非「建 IR 路径」。解释器因此复用整套 tl 前端，零改核代码。",
+      "evidence": "python/triton/runtime/interpreter.py:L219-L364（类定义与 create_get_program_id 起）"
+    },
+    {
+      "decision": "改写后的代码 compile 时 filename 用原文件、并 increment_lineno 对齐原行号",
+      "why": "调试是本模式的头等目的——报错、断点、traceback 必须指回用户源码的真实行号，而不是改写后临时字符串的行号。",
+      "evidence": "python/triton/runtime/interpreter.py:L1183-L1188"
+    },
+    {
+      "decision": "RESERVED_KWS（num_warps/num_stages/num_ctas/enable_fp_fusion/grid/maxnreg）在解释器里被剔除；cache_modifier/eviction_policy/is_volatile 被忽略",
+      "why": "这些是并行/调度/访存策略旋钮，只影响真实硬件的『快慢』，对 CPU 串行数值复现无意义。它们被丢弃这一事实本身就点破边界：解释器不承载性能语义。",
+      "evidence": "python/triton/runtime/interpreter.py:L1038、L1081、L376-L385（下划线占位参数）"
+    }
+  ],
+  "theory": [
+    {
+      "point": "串行复杂度 vs 并行事实",
+      "detail": "GridExecutor 的三重 for 使总工作量 = prod(grid) × (单 program 的核体计算)，全部落在单线程 numpy 上顺序执行。GPU 上这 prod(grid) 个 program 是并行铺开的（跨 SM/warp）。因此解释器的墙钟时间与 GPU 墙钟时间无任何可比性——它复现的是『每个 program 算什么』，不是『多少 program 同时算、访存是否合并、occupancy 多高』。"
+    },
+    {
+      "point": "为何量不出合并访存/occupancy",
+      "detail": "合并访存、bank 冲突、occupancy 都是『多线程同时访问内存/寄存器压力』的产物；解释器一次只有一个 program、load/store 是逐个地址的 numpy/C++ 读写，根本不存在并发访存，这些量级在此模型里不存在。结论：用它查对错（逻辑/边界/数值），不用它查快慢（性能）。"
+    },
+    {
+      "point": "张量语义闭合性",
+      "detail": "to_tensor 注入保证核体内每个被赋值的中间量都是 tl.tensor；配合 _patch_lang 把 tl.* 重绑到 InterpreterBuilder，整段核代码在『张量对象 + numpy 数值后端』这套替身语义里自洽运行，与真实编译路径产出相同数值（已实机验证 v*2 输出正确）。"
+    }
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {
+        "what": "_convert_float 的浮点位级手工转换（L132-L193）及依赖它的 create_fp_to_fp/cast_impl 的 bf16 分支细节",
+        "why_safe": "这是为忠实复现 fp8/bf16 舍入而写的位操作，与『替身执行如何跑通一个核』的主线无关；精简版用简单 dtype（fp32/int32）跑通即可，删掉不影响入口分叉→改写→串行发射→numpy 兜底的骨架。"
+      },
+      {
+        "what": "InterpreterBuilder 中除 create_get_program_id/create_get_num_programs/binary_op/create_add/create_mul/create_make_range/create_addptr/create_splat/create_broadcast/create_expand_dims/create_load/create_store/create_masked_load/create_masked_store 之外的大批 create_*（比较算子全家、超越函数 cos/exp/log/sqrt、create_dot、fp 转换、bitcast、fabs、umulhi、histogram、clamp/select/fma 等 L387-L678）",
+        "why_safe": "它们与保留的 binary_op 同构（都是 op(numpy)），是 tl 全表面的逐条覆盖；精简版保留代表性的 add/mul/load/store/program_id/arange 已足以讲清『create_* = numpy 直算，不建 IR』的对照要点，删其余不改变机制。"
+      },
+      {
+        "what": "ReduceScanOpIneterface/ReduceOps/ScanOps 及 _patch_reduce_scan（L713-L918）",
+        "why_safe": "reduce/scan 的 numpy 复现是独立子系统（第几章另述归约），与本章『替身入口+串行 grid+builder 兜底』主线正交；精简版不含 reduce 的核也能完整演示替身执行。"
+      },
+      {
+        "what": "原子操作 create_atomic_cas/create_atomic_rmw、BlockPointerHandle.materialize_pointers 与 create_make_block_ptr/create_advance/tensor_pointer_load/store（L47-L71、L569-L671、L611-L624）",
+        "why_safe": "块指针与原子是进阶访存形态；用普通 ptr+offset 的 load/store 已能讲透『指针换 uint64 地址、按地址读写』的核心，删这些不破坏正确性。"
+      },
+      {
+        "what": "InterpreterOptions 的 fp8 dtype 列表、_get_signed_np_dtype、ExtraFunctions、create_extern_elementwise/create_inline_asm 的 NotImplementedError 占位（L74-L97、L212-L216、L626-L630）",
+        "why_safe": "配置细节与未支持特性占位，不参与主数据流；删掉不影响替身执行跑通。"
+      }
+    ],
+    "must_keep": [
+      {
+        "symbol": "InterpretedFunction",
+        "why": "本章主角——替身函数对象，回收 f5 的核心；run/__getitem__/rewrite/__call__ 缺一不可讲清发射入口。"
+      },
+      {
+        "symbol": "FunctionRewriter",
+        "why": "AST 改写流水线的持有者；rewrite_ast 是『为何要重写而不是直接跑 Python』的答案落点。"
+      },
+      {
+        "symbol": "ASTTransformer",
+        "why": "visit_Assign 是把赋值包成 to_tensor 的具体改写，张量语义注入点，必须让读者看到。"
+      },
+      {
+        "symbol": "visit_Assign",
+        "why": "改写的唯一实现方法，正文逐段讲的对象。"
+      },
+      {
+        "symbol": "GridExecutor",
+        "why": "CPU 串行执行器，三重 for 遍历 grid 是本章题眼。"
+      },
+      {
+        "symbol": "InterpreterBuilder",
+        "why": "numpy 兜底 builder，与真 builder 对照的主体。"
+      },
+      {
+        "symbol": "interpreter_builder",
+        "why": "全局单例，_patch_lang 重绑目标 + ASTTransformer 注入的 to_tensor 第二实参，串起改写与执行。"
+      },
+      {
+        "symbol": "TensorHandle",
+        "why": "解释器张量载体，指针=装 uint64 地址的 TensorHandle，读者需理解这一表示。"
+      },
+      {
+        "symbol": "_patch_lang",
+        "why": "把 tl.* builtin 整体重绑到 InterpreterBuilder 的关键一跳，缺它 tl 仍走真 builder。"
+      },
+      {
+        "symbol": "_implicit_cvt",
+        "why": "指针实参→uint64 地址的转换，『按地址访存』得以成立的前提。"
+      },
+      {
+        "symbol": "_init_args_hst",
+        "why": "device→host 拷贝，无 GPU 也能跑的前提之一。"
+      },
+      {
+        "symbol": "to_tensor",
+        "why": "赋值改写的落点函数，张量语义提升的实现（semantic.py）。"
+      },
+      {
+        "symbol": "create_get_program_id",
+        "why": "program_id 从 grid_idx 直接取值——『不是硬件算的，是逐个喂进来的』最直观证据。"
+      },
+      {
+        "symbol": "set_grid_idx",
+        "why": "三重 for 每步设当前 program 坐标，串行遍历的驱动。"
+      },
+      {
+        "symbol": "set_grid_dim",
+        "why": "num_programs 的来源，与 grid 补齐配套。"
+      },
+      {
+        "symbol": "binary_op",
+        "why": "create_add/mul 等的公共实现，『create_* = numpy 直算』的代表。"
+      },
+      {
+        "symbol": "create_masked_load",
+        "why": "按地址读 host 内存，走 C++ _interpreter.load，访存复现的实体。"
+      },
+      {
+        "symbol": "create_masked_store",
+        "why": "按地址写 host 内存，副作用来源，与 _restore_args_dev 配套可见。"
+      },
+      {
+        "symbol": "RESERVED_KWS",
+        "why": "num_warps 等并行旋钮被剔除——点破『不承载性能语义』边界的直接证据。"
+      },
+      {
+        "symbol": "rewrite_ast",
+        "why": "改写流水线主方法，取源码→改写→compile/exec 的编排。"
+      },
+      {
+        "symbol": "create_make_range",
+        "why": "arange 的实现(L554)——worked_example [0..5]*2 依赖它,读者需理解 program 内张量从哪来"
+      },
+      {
+        "symbol": "_restore_args_dev",
+        "why": "store 副作用回拷(L1068-1077)——data_flow 第9步,读者据此理解无 GPU 也能看到写回结果"
+      }
+    ]
+  },
+  "mechanisms": [
+    {
+      "id": "m1-entry-fork",
+      "name": "替身入口分叉：TRITON_INTERPRET 选 InterpretedFunction 而非 JITFunction",
+      "kind": "config",
+      "source_anchors": [
+        "python/triton/runtime/jit.py:L834-L838"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m2-ast-rewrite-to-tensor",
+      "name": "AST 改写：把每个赋值包成 to_tensor（为何重写而非原样跑 Python）",
+      "kind": "algorithm",
+      "source_anchors": [
+        "python/triton/runtime/interpreter.py:L1111-L1126",
+        "python/triton/language/semantic.py:L111-L126"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m3-function-rewriter-pipeline",
+      "name": "FunctionRewriter 流水线：取源码→定位 def→dedent→parse→transform→重排行号→compile/exec",
+      "kind": "dataflow",
+      "source_anchors": [
+        "python/triton/runtime/interpreter.py:L1139-L1157",
+        "python/triton/runtime/interpreter.py:L1176-L1195"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m4-grid-executor-serial",
+      "name": "GridExecutor 三重 for 串行遍历 grid（一次一个 program）",
+      "kind": "algorithm",
+      "source_anchors": [
+        "python/triton/runtime/interpreter.py:L1079-L1106"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m5-host-copy-implicit-cvt",
+      "name": "拷参到 host + 指针实参换 uint64 地址（无 GPU 也能访存）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "python/triton/runtime/interpreter.py:L1052-L1066",
+        "python/triton/runtime/interpreter.py:L1012-L1032",
+        "python/triton/runtime/interpreter.py:L1068-L1077"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m6-patch-lang-rebind",
+      "name": "_patch_lang 把 tl.* builtin 整体重绑到 InterpreterBuilder",
+      "kind": "protocol",
+      "source_anchors": [
+        "python/triton/runtime/interpreter.py:L999-L1008",
+        "python/triton/runtime/interpreter.py:L681-L692"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m7-interpreter-builder-numpy",
+      "name": "InterpreterBuilder 的 create_* 用 numpy 直算数值（与真 builder 建 IR 对照）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "python/triton/runtime/interpreter.py:L358-L364",
+        "python/triton/runtime/interpreter.py:L416-L432",
+        "python/triton/runtime/interpreter.py:L367-L385"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m8-boundary-serial-not-parallel",
+      "name": "边界：串行 ≠ 并行——查对错不查快慢（RESERVED_KWS 剔除、访存策略被忽略）",
+      "kind": "config",
+      "source_anchors": [
+        "python/triton/runtime/interpreter.py:L1038",
+        "python/triton/runtime/interpreter.py:L1081",
+        "python/triton/runtime/interpreter.py:L376-L385"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    }
+  ],
+  "foreshadow_due": {
+    "reap": [
+      {
+        "id": "f5",
+        "planted_in": "ch01",
+        "text": "TRITON_INTERPRET=1 时 @triton.jit 返回 InterpretedFunction（而非 JITFunction）、经 FunctionRewriter 重写 AST 后由 GridExecutor 在 CPU 串行遍历 grid——本章旁路点名，后续专章讲准它「不是原样跑 Python」。",
+        "how_reaped": "本章即该专章：逐段内嵌真源码讲透 (1) 入口分叉 (jit.py:L834) → (2) InterpretedFunction 惰性 rewrite → (3) FunctionRewriter/ASTTransformer 把赋值包成 to_tensor（正面回答『不是原样跑 Python，而是重写 AST 注入张量语义』）→ (4) GridExecutor 三重 for 串行遍历 grid → (5) InterpreterBuilder numpy 兜底。并点破边界：串行 ≠ 并行，量不出合并访存/occupancy。"
+      }
+    ],
+    "plant": []
+  }
+}
