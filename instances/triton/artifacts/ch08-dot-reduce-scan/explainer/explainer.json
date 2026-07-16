@@ -1,0 +1,285 @@
+{
+  "chapter": "ch08-dot-reduce-scan",
+  "note": "本章 kind=code、skip_impl（无 subtract-only 精简版，改用 pin v3.2.0 精确编译取证，见 INSTANCE.md）。tl.dot 的全套校验、min_dot_size 后端钩子、combine_fn→region 的再编译都发生在追踪期 / make_ttir 之前，需完整 Triton 编译器 + NVIDIA 后端才能触发，host 无 CUDA 无法直接跑。故所有 worked_example trace_source=manual，数值全部溯源到源码常量（file:Lxxx）；唯一可 host 复算的 argmax combine 逻辑另附 traces/argmax_tree_reduce.py 做纯 Python 交叉验证（非 Triton 运行时，忠实重演 _argmax_combine 的 where 组合）。所有 min_dot_size 相关常量来自 NVIDIA 后端 third_party/nvidia/backend/compiler.py。",
+  "mechanisms": [
+    {
+      "mechanism_id": "dot-validation-gauntlet",
+      "intuition": "两个操作数进 tl.dot 像两件行李过海关安检：先验类型白名单（护照在受理列表里），再验两件同型（同一本护照），再验维度阶数（都是 2D 或都是 3D），最后验拼接口 K 维对得上。任一道闸不过，追踪期当场拦下，绝不放进 create_dot。",
+      "worked_example": {
+        "params": {"lhs": "shape (16,32), fp16", "rhs": "shape (32,16), fp16", "acc": "None"},
+        "trace_source": "manual",
+        "manual_reason": "校验发生在 semantic.dot 追踪期（make_ttir 之前），需 Triton 编译器构造 tl.tensor 与 builder 才会触发 assert 链；host 无 CUDA/Triton 运行时。每道闸的判据与行号取自 python/triton/language/semantic.py。",
+        "table": {
+          "columns": ["闸门", "判据（源码）", "本例取值", "判定"],
+          "rows": [
+            ["dtype 白名单", "lhs/rhs.dtype ∈ {int8,uint8,fp16,bf16,fp32}（semantic.py:L1466-L1469）", "fp16 / fp16", "通过"],
+            ["操作数同型", "lhs.dtype == rhs.dtype（semantic.py:L1470）", "fp16 == fp16", "通过"],
+            ["维度阶数", "lhs_rank == rhs_rank ∈ {2,3}（semantic.py:L1480 附近）", "2 == 2", "通过"],
+            ["K 维相容", "lhs.shape[-1] == rhs.shape[-2]", "32 == 32", "通过 → 进 min_dot_size 门"],
+            ["反例：rhs 换 fp32", "lhs.dtype == rhs.dtype（semantic.py:L1470）", "fp16 != fp32", "追踪期 AssertionError 拦下"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "只有全部闸门通过才会到达 create_dot；任一失败在追踪期抛 AssertionError，永不生成 tt.dot IR。",
+        "argument": "semantic.dot 是一条顺序 assert 链、无 try/except，第一个失败的 assert 即终止函数；create_dot 在函数末尾（semantic.py:L1526），排在所有 assert 之后——故『执行到 create_dot』蕴含『全部 assert 已过』。"
+      },
+      "quantified": "本例 5 道闸（dtype 白名单、同型、阶数、K 相容，加 1 条反例演示拦下）全过才建 1 个 tt.dot op；闸门数与矩阵规模无关，是 O(1) 追踪期开销，不影响运行时。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "min-dot-size-hook",
+      "intuition": "Tensor Core 像一台只吃『整托盘』货的机器，最小托盘尺寸由厂家（后端）钉死。你的矩阵块小于托盘就装不下，只能退回手工 FMA。min_dot_size 就是 NVIDIA 后端贴在机器上的『最小托盘 (M,N,K)』标签，语言层照着它设卡。",
+      "worked_example": {
+        "params": {"backend": "NVIDIA", "min_dot_size_fp16": "(16,16,16)", "min_dot_size_int8": "(16,32,16)"},
+        "trace_source": "manual",
+        "manual_reason": "min_dot_size 是 NVIDIA 后端注入 builder.codegen_fns 的钩子（compiler.py:L176），门禁 assert 在 semantic.dot 追踪期跑（semantic.py:L1488-L1490）；host 无 CUDA/Triton 后端无法实跑。返回值取自 third_party/nvidia/backend/compiler.py:L18，门禁下标次序取自 semantic.py。",
+        "table": {
+          "columns": ["场景", "min_dot_size 返回", "门槛 M/N/K", "本例 M,N,K", "判定"],
+          "rows": [
+            ["fp16 (16,16)@(16,16)", "(16,16,16)（compiler.py:L18）", "M≥16, N≥16, K≥16", "16, 16, 16", "通过 → 命中 TC 最小 tile"],
+            ["fp16 (8,16)@(16,16)", "(16,16,16)", "M≥16", "M=8", "拦下：M<16"],
+            ["int8 (16,16)@(16,16)", "(16,32,16)（compiler.py:L18）", "N≥32", "N=16", "拦下：int8 需 N≥32"],
+            ["int8 (16,32)@(32,32)", "(16,32,16)", "M≥16, N≥32, K≥16", "16, 32, 32", "通过"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "min_dot_size 的数字由后端声明、语言层不硬编：semantic.dot 只 assert 钩子存在再据其门禁；换后端换约束，语言层代码一字不动。",
+        "argument": "builder.codegen_fns['min_dot_size'] 在 NVIDIA 后端 parse 阶段注入（compiler.py:L176）；semantic.dot 先 assert 其非 None（L1486，否则报 'target doesn't provide lower shape bounds for dot.'），再 min_dot_size(lhs.type, rhs.type) 取值门禁（L1488-1490）。注意下标易错：min[0] 比 lhs.shape[-2]=M，min[2] 比 lhs.shape[-1]=K，min[1] 比 rhs.shape[-1]=N。"
+      },
+      "quantified": "NVIDIA 两档门槛：非 int8 (16,16,16)（对应最小 16×16×16 的 MMA tile），int8 (16,32,16)（compiler.py:L18）。读者若写 BLOCK_M=8 的 fp16 dot，追踪期直接 AssertionError；int8 dot 的 N 维必须 ≥32 才不被拦。为何存在最小 tile：Tensor Core 是固定尺寸的硬件 MMA 单元（硬件层见第二章，此处不重讲）。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-min-dot-size",
+          "template": "state-table",
+          "claim": "NVIDIA 后端把 Tensor Core 最小 tile 声明成 min_dot_size 钩子——非 int8 为 (16,16,16)、int8 为 (16,32,16)；block 任一维低于门槛，tl.dot 追踪期被拦，落不到 Tensor Core。",
+          "numbers": [
+            {"label": "非 int8 门槛 M", "value": "16", "provenance": "third_party/nvidia/backend/compiler.py:L18"},
+            {"label": "非 int8 门槛 N", "value": "16", "provenance": "third_party/nvidia/backend/compiler.py:L18"},
+            {"label": "非 int8 门槛 K", "value": "16", "provenance": "third_party/nvidia/backend/compiler.py:L18"},
+            {"label": "int8 门槛 N", "value": "32", "provenance": "third_party/nvidia/backend/compiler.py:L18"},
+            {"label": "拦下例 fp16 M", "value": "8", "provenance": "worked_example 反例（M=8<16）"}
+          ],
+          "caption_draft": "min_dot_size 由后端而非语言层决定：语言层只在 semantic.dot 里 assert 钩子存在（L1486）再据其门禁（L1488-1490）。你的 block 每维都要 ≥ 对应门槛（int8 的 N 需 ≥32），否则编译期报错、命不中 Tensor Core。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "input-precision-selection",
+      "intuition": "f32×f32 有两条路：tf32（砍掉尾数低位、快、走 Tensor Core）和 ieee（全精度、慢、退回 FMA 式路径）。Triton 默认帮你选快的 tf32，但留了三层开关，要精度时能手动切回 ieee——像默认上高速，但你能改走国道。",
+      "worked_example": {
+        "params": {"dtype": "f32×f32", "backend": "NVIDIA", "allowed": "(tf32, tf32x3, ieee)"},
+        "trace_source": "manual",
+        "manual_reason": "默认选取在 core.dot 追踪期读 builder.options.allowed_dot_input_precisions 与环境变量（core.py:L1541-1543），白名单校验在 semantic._str_to_dot_input_precision（semantic.py:L1450）；host 无 Triton builder 无法实跑。取值/行号取自 core.py、semantic.py 与 compiler.py:L108-L109。",
+        "table": {
+          "columns": ["输入组合", "supports_tf32", "解析出的 input_precision", "命中?"],
+          "rows": [
+            ["全默认（precision=None, allow_tf32=None, 无环境变量）", "True（'tf32' 在白名单，compiler.py:L109）", "tf32（core.py:L1542）", "命中 TC（tf32）"],
+            ["allow_tf32=False", "True", "ieee（core.py:L1542 default 分支）", "退化：ieee 非 TC 路径"],
+            ["显式 input_precision='ieee'", "—（跳过默认块）", "ieee（过白名单 semantic.py:L1450）", "退化：ieee 非 TC 路径"],
+            ["环境变量 TRITON_F32_DEFAULT='ieee'", "True", "ieee（core.py:L1543 getenv 覆盖）", "退化：ieee 非 TC 路径"],
+            ["显式 input_precision='fp64'（非法）", "—", "AssertionError（不在白名单 semantic.py:L1450）", "拦下"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "三层优先级固定：显式 input_precision 参数 > 环境变量 TRITON_F32_DEFAULT > (allow_tf32/supports 推出的) default；最终值必过 allowed_dot_input_precisions 白名单，否则追踪期报错。",
+        "argument": "代码结构决定优先级：input_precision 非 None 时整个默认块被 if 跳过（core.py:L1541）；否则先算 default（L1542）再被 os.getenv 覆盖（L1543）。无论走哪条，semantic._str_to_dot_input_precision 的 assert（semantic.py:L1450）是最后一道白名单闸门。"
+      },
+      "quantified": "NVIDIA 白名单 3 档（tf32/tf32x3/ieee，compiler.py:L109），默认 tf32（compiler.py:L108）。f32 dot 不显式指定即命中 tf32 走 Tensor Core；要 ieee 全精度须显式声明或设 TRITON_F32_DEFAULT，代价是退化到无 TC 的更慢路径。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "acc-out-dtype-selection",
+      "intuition": "dot 用什么类型攒和（累加器 acc / 返回标量 ret_scalar_ty）不是你随便定的——它由操作数 dtype 反推：整数进 → int32 出；f32/bf16 进 → f32 出；f16 进 → 看你的 out_dtype。像收银台按进来的是硬币还是纸币，决定用哪种钱箱。",
+      "worked_example": {
+        "params": {"cases": "int8/fp32/bf16/fp16 操作数 × out_dtype", "acc": "None 或显式"},
+        "trace_source": "manual",
+        "manual_reason": "ret_scalar_ty 与 _0 累加初值的分支选择在 semantic.dot 追踪期跑（semantic.py:L1491-L1524），依赖 tl.dtype 谓词与 builder；host 无 Triton 无法实跑。分支与行号取自 semantic.py，max_num_imprecise_acc 默认取自 compiler.py:L158。",
+        "table": {
+          "columns": ["操作数 scalar dtype", "out_dtype", "分支（源码）", "ret_scalar_ty", "acc 初值 _0"],
+          "rows": [
+            ["int8", "（忽略）", "is_int（semantic.py:L1491-1493）", "int32", "get_int32(0)"],
+            ["fp32", "float32", "is_fp32（semantic.py:L1499）", "float32", "get_fp32(0)"],
+            ["bf16", "float32", "is_bf16（semantic.py:L1499）", "float32", "get_fp32(0)"],
+            ["fp16", "float16", "else + out_dtype.is_fp16（semantic.py:L1503-1504）", "float16", "get_fp16(0)"],
+            ["fp16", "float32", "else + 非 fp16 out（semantic.py:L1503-1504）", "float32", "get_fp32(0)"],
+            ["任意", "bfloat16", "out_dtype.is_bf16 → raise（semantic.py:L1495-1497）", "ValueError", "拦下"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "ret_scalar_ty 唯一由 (操作数 scalar 类别, out_dtype) 决定；acc 若显式传入必须 acc.type == ret_ty（同形同 dtype），否则由 create_splat(0) 造零累加器——不存在 acc 与输出不同型还能进 create_dot 的路径。",
+        "argument": "semantic.py:L1491-1504 是互斥 if/elif/else，覆盖 int/bf16-out(禁)/fp32|bf16/else 全部 dtype 类别，每条恰定一个 ret_scalar_ty 与 _0。acc 分支 L1510-1514：None → splat _0，否则 assert acc.type == ret_ty。max_num_imprecise_acc 仅在 fp8×fp8 取 builder 默认，其余置 0（L1516-1524）。"
+      },
+      "quantified": "4 类操作数 dtype × out_dtype 组合坍缩成 3 种 ret_scalar_ty（int32 / float32 / float16）；out_dtype=bfloat16 被显式禁（L1495）。max_num_imprecise_acc 仅 fp8×fp8 且 sm_90 取 2**30，其余全 0（compiler.py:L158）——即该项只对 sm_90 上的 fp8→fp32 dot 生效。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "tensor-core-hit-criterion",
+      "intuition": "命中 Tensor Core 不是单一开关，而是三把锁同时开：形状够大（过 min_dot_size）、精度选对（f32 走 tf32 而非 ieee）、dtype 受支持且 acc 相容。任一锁没开，dot 要么追踪期报错，要么退化到没有 TC 的慢路径。这是本章交给读者的自查清单。",
+      "worked_example": {
+        "params": {"backend": "NVIDIA", "locks": "形状锁 / 精度锁 / dtype 锁"},
+        "trace_source": "manual",
+        "manual_reason": "三锁分别落在 semantic.dot 的 min_dot_size 门禁、input_precision 解析、dtype 白名单/acc 分支，全在追踪期（make_ttir 之前）；host 无 CUDA/Triton 无法实跑。各锁判据/常量取自 semantic.py:L1466-L1526 与 compiler.py:L18/L108。",
+        "table": {
+          "columns": ["写法", "形状锁（min_dot_size）", "精度锁（input_precision）", "dtype 锁", "结果"],
+          "rows": [
+            ["fp16 (128,128)@(128,128) 默认", "M,N,K=128≥16 ✓", "fp16 与 tf32/ieee 无关 ✓", "fp16 受支持 ✓", "命中 Tensor Core"],
+            ["f32 (128,128)@(128,128) 默认", "128≥16 ✓", "tf32（默认）✓", "f32 受支持 ✓", "命中 Tensor Core（tf32）"],
+            ["f32 同上但 allow_tf32=False", "✓", "ieee ✗", "✓", "退化：走 ieee 非 TC 路径"],
+            ["fp16 (8,128)@(128,128)", "M=8<16 ✗", "—", "—", "追踪期报错"],
+            ["int8 (128,128)@(128,16)", "N=16<32 ✗（int8 需 32）", "—", "int8 受支持 ✓", "追踪期报错"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "tl.dot 命中 Tensor Core ⟺ 三锁同开；任一破，形状锁/dtype 锁 → 追踪期 AssertionError（不生成 IR），精度锁选 ieee → 能编译但退化到非 TC 路径。",
+        "argument": "形状锁（min_dot_size 门禁 L1488-1490）与 dtype 锁（白名单 L1466、acc 相容 L1513）是硬 assert，失败即不到 create_dot；精度锁不拦下而是把 INPUT_PRECISION 枚举设成 IEEE（_str_to_dot_input_precision L1454），后续 lowering 据此不选 TC MMA——故 ieee 是『能编译但不命中』，与形状/dtype 的『直接报错』性质不同。"
+      },
+      "quantified": "三锁门槛：形状来自 min_dot_size（16/16/16 或 int8 的 16/32/16，compiler.py:L18）、精度默认 tf32（compiler.py:L108）、dtype 属白名单 {int8,uint8,fp16,bf16,fp32}∪fp8（semantic.py:L1466）。读者自查三条：BLOCK 各维 ≥16（int8 的 N≥32）；f32 用默认或显式 tf32；操作数 dtype 在白名单内且同型。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-tc-hit-criterion",
+          "template": "state-table",
+          "claim": "命中 Tensor Core 需形状锁 + 精度锁 + dtype 锁三者同开——逐行列出常见 dot 写法命中 / 退化 / 报错，读者对号入座自查。",
+          "numbers": [
+            {"label": "形状锁门槛（非 int8）", "value": "16", "provenance": "third_party/nvidia/backend/compiler.py:L18"},
+            {"label": "int8 的 N 门槛", "value": "32", "provenance": "third_party/nvidia/backend/compiler.py:L18"},
+            {"label": "退化例 M（fp16 8<16）", "value": "8", "provenance": "worked_example 报错行"},
+            {"label": "命中例 block 边长", "value": "128", "provenance": "worked_example 命中行（128≥16）"}
+          ],
+          "caption_draft": "三锁清单：形状（每维 ≥ min_dot_size，int8 的 N≥32）、精度（f32 走 tf32 非 ieee）、dtype（白名单且同型、acc 相容）。形状/dtype 破锁 → 编译期报错；精度选 ieee → 能编译但退化到无 Tensor Core 的慢路径。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "combine-fn-to-region",
+      "intuition": "你写 lambda a,b: a+b 交给 reduce，Triton 不在 Python 里跑它。它把这个函数的语法树抠出来，当成一小段设备程序重新编译，塞进归约算子的 region 里——像把菜谱翻译成机器指令，而不是照着菜谱自己炒菜。",
+      "worked_example": {
+        "params": {"input": "shape (4,) f32", "combine_fn": "_sum_combine (a+b)", "axis": "0"},
+        "trace_source": "manual",
+        "manual_reason": "make_combine_region 的建 block、call_JitFunction 的 fn.parse()+CodeGenerator.visit 全在追踪期把 combine_fn 编译进 region（core.py:L2049-L2063、code_generator.py:L1050-L1078），需 Triton builder/generator；host 无法实跑。步骤与行号取自 core.py、semantic.py、code_generator.py。",
+        "table": {
+          "columns": ["步骤", "动作", "关键源码", "产物"],
+          "rows": [
+            ["1", "core.reduce 建闭包 make_combine_region", "core.py:L2049", "区域构造器（尚未执行）"],
+            ["2", "semantic.reduction 建 create_reduce op", "semantic.py:L1626", "reduce_op（空 region）"],
+            ["3", "回调 make_combine_region：定 prototype = function_type([f32], [f32,f32])", "core.py:L2051", "region 双入参协议（2 入 1 出）"],
+            ["4", "开 block，取两个 block 参数 a, b（tl.tensor）", "core.py:L2054-L2056", "region 形参 a, b"],
+            ["5", "_generator.call_JitFunction(_sum_combine, [a,b])", "core.py:L2058", "进入 AST 再编译"],
+            ["6", "fn.parse() 取 AST + 新 CodeGenerator.visit", "code_generator.py:L1075", "a+b 编译成 add op（非 Python 求值）"],
+            ["7", "create_reduce_ret(结果句柄)", "core.py:L2063", "region body 写回归约结果"],
+            ["8", "reduce_op.verify()", "semantic.py:L1628", "region 合法性校验通过"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "combine_fn 的函数体从不在 Python 解释器里被调用求值，而是经 fn.parse() → CodeGenerator.visit 一次性编译进 reduce_op 的 region IR。",
+        "argument": "call_JitFunction（code_generator.py:L1050+）对 fn 走的是 inspect.getcallargs + fn.parse() + generator.visit(fn.parse())（L1075）——与普通 @jit 内联同一条 code generation 路径（见第一/三章，回指不重讲），全程没有 combine_fn(*args) 式的 Python 调用；传入的 args 是 tl.tensor（block 参数）而非 Python 数，故 a+b 里的 + 被重载成 create_add 而非 Python 加法。"
+      },
+      "quantified": "每次 reduce/scan 生成 1 个 region，region 内 op 数 = combine_fn 编译后的 IR 指令数（_sum_combine → 1 个 add；_argmax_combine → 若干比较 + where）；同一 combine_fn 经 mangle_fn 去重（code_generator.py:L1071 附近），一次编译多处复用。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-combine-fn-to-region",
+          "template": "flow",
+          "claim": "用户 combine_fn 经 make_combine_region → call_JitFunction → fn.parse()+CodeGenerator.visit 被再编译成 reduce_op 的 region body，而非在 Python 里求值。",
+          "numbers": [
+            {"label": "make_combine_region 行", "value": "L2049", "provenance": "python/triton/language/core.py:L2049"},
+            {"label": "region 协议 prototype", "value": "L2051", "provenance": "python/triton/language/core.py:L2051（function_type(in, in*2)）"},
+            {"label": "call_JitFunction 调用点", "value": "L2058", "provenance": "python/triton/language/core.py:L2058"},
+            {"label": "AST 再编译点", "value": "L1075", "provenance": "python/triton/compiler/code_generator.py:L1075（generator.visit(fn.parse())）"},
+            {"label": "create_reduce_ret 写回", "value": "L2063", "provenance": "python/triton/language/core.py:L2063"}
+          ],
+          "caption_draft": "combine_fn 是被编译进 IR region 的设备代码，不是被 Python 调用的回调：这解释了下一条——为什么它只能用 tl.* 可追踪操作。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "why-combine-fn-traceable",
+      "intuition": "既然 combine_fn 是被『再编译』而不是『被调用』，它里面就只能写编译器认得的 tl.* 操作。写个 numpy 调用或对 tensor 用原生 if，编译器追踪 AST 时遇到不认识的语法就崩——就像把只懂机器码的编译器喂中文菜谱。",
+      "worked_example": {
+        "params": {"legal": "_sum_combine / _argmax_combine", "illegal": "numpy / 原生 if 对 tensor"},
+        "trace_source": "manual",
+        "manual_reason": "『合法 vs 非法 combine_fn』的分野在 CodeGenerator 追踪期是否有对应 visit_* handler 决定（code_generator.py:L1075 走 visit），需真实编译才能触发失败；host 无 Triton。合法样例取自 standard.py:L140/L255，机理回指第一/三章 CodeGenerator。",
+        "table": {
+          "columns": ["combine_fn", "函数体", "追踪期发生什么", "结果"],
+          "rows": [
+            ["_sum_combine（standard.py:L255）", "return a + b", "a,b 是 tl.tensor，+ 重载为 create_add", "编译成 add op，合法"],
+            ["_argmax_combine（standard.py:L140）", "core.where(gt, v1, v2) 等", "where / > 皆 tl.* 可追踪", "编译成比较+where op，合法"],
+            ["假想 lambda a,b: numpy.add(a,b)", "调外部库 numpy", "CodeGenerator 追踪到 numpy 调用无法 lower 成 IR", "追踪期报错"],
+            ["假想 lambda a,b: a if a>b else b", "对 tensor 用 Python if", "tl.tensor 无 __bool__，原生 if 求值即失败", "追踪期报错（须改用 core.where）"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "combine_fn 体内每个操作必须能被 CodeGenerator 降解成 IR；非 tl.* 的 Python 运算（外部库、对 tensor 的原生 if/bool）在追踪期即失败——这是编译期语言约束，不是运行期检查。",
+        "argument": "因为 combine_fn 走 fn.parse()→visit 的编译路径（见上一机制），CodeGenerator 只认自己内建的 visit_* handler（visit_Call/visit_If 等，见第一/三章）；a,b 是 tl.tensor，其上的 Python if 需要 __bool__ 而 tensor 无定义，故分支必须用 core.where。standard.py 里所有 combine_fn 100% 由 tl.* 构成，正是这条契约的活样例。"
+      },
+      "quantified": "standard.py 内建的 combine_fn（_sum_combine / _argmax_combine / _elementwise_max / _xor_combine 等）全部 100% 由 tl.* 构成（core.where / maximum / + / ^），0 个 Python 原生分支或外部库调用；这不是巧合，而是『被再编译成 IR』强加的硬约束。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "reduce-with-indices-argmax",
+      "intuition": "argmax 要同时报『最大值』和『它在第几位』。技巧：给每个元素配一个身份证号（index），值和号绑成一对一起归约；combine 时谁的值大就连值带号一起留下。最后值那路给你 max，号那路给你 argmax。",
+      "worked_example": {
+        "params": {"input": "[3, 1, 4, 1]", "axis": "0", "combine_fn": "_argmax_combine (tie_break_left=True)", "index": "arange(0,4)=[0,1,2,3]"},
+        "trace_source": "manual",
+        "manual_reason": "真实路径把 _argmax_combine 编译进 create_reduce 的 region、在 GPU 上做并行树归约，需 Triton 编译器 + 设备；host 无 CUDA。combine 逻辑（core.where 挑值+索引）另附 traces/argmax_tree_reduce.py 纯 Python 忠实重演做交叉验证（见 traces/argmax_tree_reduce.out），行号取自 core.py:L2094-L2108 与 standard.py:L140-L150。",
+        "table": {
+          "columns": ["轮次", "combine 输入 (v1,i1) x (v2,i2)", "gt = v1>v2 or tie", "where 选出 (v_ret,i_ret)"],
+          "rows": [
+            ["1", "(3,0) x (1,1)", "3>1 = True", "(3,0)"],
+            ["2", "(4,2) x (1,3)", "4>1 = True", "(4,2)"],
+            ["3", "(3,0) x (4,2)", "3>4 = False", "(4,2) → 最终 value=4, index=2"],
+            ["平局例 [4,4]", "(4,0) x (4,1)", "tie = (4==4 and 0<1) = True → gt=True", "(4,0) → 左侧索引 0 胜"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "带索引归约必终止且给出全局 argmax：值那路做 max，索引那路跟随值的选择；平局取最左（tie_break_left）。",
+        "argument": "树归约每轮把候选对数减半（n→⌈n/2⌉→…→1），log2(n) 轮必停（单调递减到 1，终止）。不变量：每个部分结果保持『(该段最大值, 其索引)』——基例单元素平凡成立；归纳步合并两个各自正确的部分结果时，where(gt) 选出全局较大者连同其索引，tie 分支保证值相等时取较小索引，故合并后仍是 (全局最大值, 其索引)。"
+      },
+      "quantified": "n=4 → log2(4)=2 层树归约（本例展开成 3 次 pairwise combine，交叉验证见 argmax_tree_reduce.out）；index 由 arange(0,n)（core.py:L2097）造，多维输入时 expand_dims + broadcast_to 到输入形状（core.py:L2101-L2105）；全程复用同一 create_reduce，不新增 IR op 类型——argmax 是 reduce 的免费高级用法。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-argmax-tree",
+          "template": "state-table",
+          "claim": "argmax 把 (值,索引) 成对做树归约，combine 用 where(v1>v2) 同步选值与索引；[3,1,4,1] 经 2 层归约得 value=4、index=2。",
+          "numbers": [
+            {"label": "输入最大值", "value": "4", "provenance": "traces/argmax_tree_reduce.out（scenario distinct, RESULT value=4）"},
+            {"label": "argmax 索引", "value": "2", "provenance": "traces/argmax_tree_reduce.out（scenario distinct, index=2）"},
+            {"label": "输入长度 n", "value": "4", "provenance": "worked_example input=[3,1,4,1]"},
+            {"label": "树归约层数", "value": "2", "provenance": "log2(4)=2，见 quantified"},
+            {"label": "平局取最左索引", "value": "0", "provenance": "traces/argmax_tree_reduce.out（scenario tie [4,4], index=0）"}
+          ],
+          "caption_draft": "argmax = reduce 的免费高级用法：_reduce_with_indices 造 arange 索引并 broadcast，把 (值,索引) 成对喂给同一个 create_reduce；combine_fn 内 where(gt) 让索引跟随值一起被选，平局取最左。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "combine-fn-region-protocol",
+      "intuition": "region 的调用约定像『两两 PK』：每次拿两组选手（各 N 个 tensor 的一份），比出一组胜者。所以参数个数是输入 tensor 数的 2 倍、返回 1 倍。单 tensor reduce → (a,b)→c；带索引 → (v1,i1,v2,i2)→(v,i)。",
+      "worked_example": {
+        "params": {"protocol": "function_type(in_scalar_tys, in_scalar_tys*2)", "source": "core.py:L2051 (reduce) / L2152 (scan)"},
+        "trace_source": "manual",
+        "manual_reason": "prototype 与 block 参数在追踪期由 make_combine_region 构造（core.py:L2051-L2056），需 Triton builder；host 无法实跑。协议定义与行号取自 core.py，样例 combine_fn 取自 standard.py。",
+        "table": {
+          "columns": ["归约输入 tensor 数", "in_scalar_tys", "prototype 参数（×2）", "combine_fn 签名", "样例"],
+          "rows": [
+            ["1（纯 reduce sum）", "[f32]", "[f32, f32]", "(a, b) → c", "_sum_combine（standard.py:L255）"],
+            ["2（带索引 argmax）", "[f32, int32]", "[f32, int32, f32, int32]", "(v1, i1, v2, i2) → (v, i)", "_argmax_combine（standard.py:L140）"],
+            ["1（scan cumsum）", "[f32]", "[f32, f32]", "(a, b) → c", "_sum_combine（associative_scan 同协议，core.py:L2152）"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "region 参数个数 = 输入 tensor 数 × 2，返回 = 输入 tensor 数；reduce 与 associative_scan 用同一条 function_type(in, in*2) 协议。",
+        "argument": "core.py:L2051（reduce）与 L2152（scan）字面相同：prototype = function_type(in_scalar_tys, in_scalar_tys * 2)；建 block 时按 param_types 造两倍形参（L2054-L2056），create_reduce_ret / create_scan_ret 写回 1 倍——故 _argmax_combine 恰是 4 入 2 出，_sum_combine 是 2 入 1 出。"
+      },
+      "quantified": "N 个输入 tensor → combine_fn 收 2N 参数、返 N 值；本章样例 N=1（sum，2 入 1 出）与 N=2（argmax，4 入 2 出）；协议由 function_type(in, in*2)（core.py:L2051 reduce、L2152 scan）硬定，reduce 与 scan 共用。",
+      "figure_specs": []
+    }
+  ]
+}

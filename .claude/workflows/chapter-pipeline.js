@@ -39,7 +39,11 @@ if (!A) {
   A = CFG   // 仅在完全未传 args 的手工调试场景才允许 CFG
 }
 const REPO = A.repo_root || '/mnt/e/Laboratory/Repo2Book'
-const INST = A.instance || 'vllm'
+// instance 必传护栏(与 chapter_id 同级):曾因 args 漏传 instance 静默默认 'vllm',使
+// CH/PAPERS/roadmap/bible/trace 全指向错实例——ch06-08 均踩,仅靠子 agent 每次自纠 CH 才没错车
+// (脆弱且污染每个 agent 提示词)。凡 args 发车必须显式带 instance,否则拉闸;仅手工无参调试(A===CFG)用 CFG.instance。
+if (A !== CFG && !A.instance) return { escalated: 'bad-args', note: 'args 发车缺 instance 字段——拒绝静默默认 vllm(曾致错实例路径),请显式传 instance(如 "triton")' }
+const INST = A.instance || CFG.instance
 const SRC = A.source_root || (REPO + '/instances/' + INST + '/source')
 const CH = REPO + '/instances/' + INST + '/artifacts/' + A.slug
 const HL = A.highlight || A.subsystem || ''

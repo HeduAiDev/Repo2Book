@@ -1,0 +1,204 @@
+{
+  "chapter": "ch08-dot-reduce-scan",
+  "title": "dot、归约与扫描：块级计算与 combine_fn 变 IR region",
+  "kind": "code",
+  "one_line": "两大块级计算主题：① tl.dot 的形状/dtype 校验 + 后端能力钩子(min_dot_size/input_precision/acc-dtype)如何共同决定命不命中 Tensor Core；② reduce/associative_scan/histogram 如何把用户传入的 combine_fn 经 _generator 回调重新驱动 CodeGenerator，把 Python 函数体再编译成 create_reduce/create_scan 的 IR region body。",
+  "reader_payoff": "本章解锁的性能杠杆：你的 tl.dot 到底命不命中 Tensor Core——由 min_dot_size(后端声明的最小 tile) + input_precision(tf32/ieee) + acc/out_dtype 三者共同决定，读者据此判断自己的 dot 写法。",
+
+  "code_spine": [
+    "python/triton/language/core.py:L1515-L1548  (tl.dot 前端：input_precision 默认选取、allow_tf32 兼容、转发 semantic.dot)",
+    "python/triton/language/semantic.py:L1458-L1527  (semantic.dot：dtype 校验 → input_precision 解析 → 形状相容 → min_dot_size 后端钩子门禁 → acc/ret dtype 选型 → max_num_imprecise_acc → create_dot)",
+    "third_party/nvidia/backend/compiler.py:L17-L18  (NVIDIA 后端声明 min_dot_size：int8 → (16,32,16)，其余 → (16,16,16))",
+    "third_party/nvidia/backend/compiler.py:L108-L110,L158  (CUDAOptions：default_dot_input_precision='tf32'、allowed_dot_input_precisions、max_num_imprecise_acc_default=2**30 iff capability==90)",
+    "python/triton/language/core.py:L1552-L1571  (tl.dot_scaled 前端：microscaling MX 格式，转发 semantic.dot_scaled)",
+    "python/triton/language/semantic.py:L1544-L1576  (semantic.dot_scaled：格式枚举校验 + K>=64 + create_dot_scaled)",
+    "python/triton/language/core.py:L2033-L2080  (tl.reduce：make_combine_region 把 combine_fn 变 region body，转发 semantic.reduction)",
+    "python/triton/language/semantic.py:L1615-L1630  (semantic.reduction：create_reduce → region_builder_fn → verify)",
+    "python/triton/compiler/code_generator.py:L1050-L1089  (call_JitFunction：inspect.getcallargs + fn.parse() + generator.visit —— combine_fn 被当作 AST 再喂给 CodeGenerator 生成 IR，不在 Python 里求值)",
+    "python/triton/language/core.py:L2093-L2108  (_reduce_with_indices：造 index、跨非归约轴 broadcast，把 (input,index) 一起归约 —— argmax/argmin 的支撑)",
+    "python/triton/language/core.py:L2134-L2169  (tl.associative_scan：make_combine_region → semantic.associative_scan)",
+    "python/triton/language/semantic.py:L1638-L1655  (semantic.associative_scan：create_scan(带 reverse) → region → verify)",
+    "python/triton/language/core.py:L2174-L2184  (tl.histogram → semantic.histogram)",
+    "python/triton/language/semantic.py:L1663-L1666  (semantic.histogram：1D+int 校验 → create_histogram)",
+    "python/triton/language/standard.py:L140-L267  (combine_fn 真实样例：_argmax_combine/_sum_combine/_elementwise_max，以及 max/argmax/sum/argmin 如何调 reduce 与 _reduce_with_indices)"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "python/triton/language/core.py",
+      "lines": "L1515-L1548",
+      "what": "tl.dot 前端(@builtin)：input_precision 的默认选取与 allow_tf32 兼容，然后转发 semantic.dot",
+      "code": "def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_imprecise_acc=None, out_dtype=float32,\n        _builder=None):\n    ...\n    assert input_precision is None or allow_tf32 is None, \"Only one of input_precision and allow_tf32 can be specified\"\n    if input_precision is None:\n        supports_tf32 = _builder and \"tf32\" in _builder.options.allowed_dot_input_precisions\n        default_precision = \"tf32\" if (supports_tf32 and (allow_tf32 or allow_tf32 is None)) else \"ieee\"\n        input_precision = os.getenv(\"TRITON_F32_DEFAULT\", default_precision)\n\n    input_precision = _constexpr_to_value(input_precision)\n    out_dtype = _constexpr_to_value(out_dtype)\n    max_num_imprecise_acc = _constexpr_to_value(max_num_imprecise_acc)\n    return semantic.dot(input, other, acc, input_precision, max_num_imprecise_acc, out_dtype, _builder)",
+      "elide": ["中间大段是 :param docstring（形状/dtype/input_precision 各选项说明），讲解时可摘要不逐字印"]
+    },
+    {
+      "path": "python/triton/language/semantic.py",
+      "lines": "L1458-L1527",
+      "what": "semantic.dot：本章 stakes 核心。校验闸门(dtype→precision→形状→min_dot_size 后端钩子)+acc/ret dtype 选型+create_dot",
+      "code": "def dot(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optional[str], max_num_imprecise_acc: int,\n        out_dtype: tl.dtype, builder: ir.builder) -> tl.tensor:\n    assert lhs.type.is_block() and rhs.type.is_block()\n\n    if lhs.dtype.is_fp8() and rhs.dtype.is_fp8():\n        # All combinations of supported fp8 x fp8 are permitted\n        pass\n    else:\n        assert lhs.dtype in (tl.int8, tl.uint8, tl.float16, tl.bfloat16,\n                             tl.float32), f\"Unsupported lhs dtype {lhs.dtype}\"\n        assert rhs.dtype in (tl.int8, tl.uint8, tl.float16, tl.bfloat16,\n                             tl.float32), f\"Unsupported rhs dtype {rhs.dtype}\"\n        assert lhs.dtype == rhs.dtype, f\"Both operands must be same dtype. Got {lhs.dtype} and {rhs.dtype}\"\n\n    if lhs.dtype.is_fp8e4b15() or rhs.dtype.is_fp8e4b15():\n        lhs = cast(lhs, tl.float16, builder)\n        rhs = cast(rhs, tl.float16, builder)\n\n    if input_precision is None:\n        input_precision = builder.options.default_dot_input_precision\n\n    input_precision = _str_to_dot_input_precision(input_precision, builder)\n\n    lhs_rank = len(lhs.shape)\n    rhs_rank = len(rhs.shape)\n    assert lhs_rank == rhs_rank == 2 or lhs_rank == rhs_rank == 3, f\"Both inputs must be either 2D or 3D; (lhs: {lhs.shape} vs rhs: {rhs.shape})\"\n    assert lhs.shape[-1].value == rhs.shape[\n        -2].value, f\"First input shape ({lhs.shape}) and second input shape {rhs.shape} are not compatible for matmul ...\"\n    assert builder.codegen_fns.get(\"min_dot_size\") is not None, \"target doesn't provide lower shape bounds for dot.\"\n    min_dot_size = builder.codegen_fns[\"min_dot_size\"](lhs.type, rhs.type)\n    assert lhs.shape[-2].value >= min_dot_size[0] and lhs.shape[-1].value >= min_dot_size[2] \\\n        and rhs.shape[-1].value >= min_dot_size[1], \\\n            f\"Input shapes should have M >= {min_dot_size[0]}, N >= {min_dot_size[1]} and K >= {min_dot_size[2]}\"\n    if lhs.type.scalar.is_int():\n        assert lhs.type.scalar == tl.int8, \"only int8 supported!\"\n        _0 = builder.get_int32(0)\n        ret_scalar_ty = tl.int32\n    elif out_dtype.is_bf16():\n        raise ValueError(\n            \"out_dtype=bfloat16 is unsupported. Please use out_dtype=float32/float16 and cast with `.to(tl.bfloat16)`\")\n    elif lhs.type.scalar.is_fp32() or lhs.type.scalar.is_bf16():\n        _0 = builder.get_fp32(0)\n        ret_scalar_ty = tl.float32\n    else:\n        _0 = builder.get_fp16(0) if out_dtype.is_fp16() else builder.get_fp32(0)\n        ret_scalar_ty = out_dtype\n\n    M = lhs.type.shape[-2]\n    N = rhs.type.shape[-1]\n    K = lhs.type.shape[-1]\n    B = lhs.type.shape[0] if lhs_rank == 3 else None\n    ret_ty = tl.block_type(ret_scalar_ty, [B, M, N] if B else [M, N])\n    if acc is None:\n        acc_handle = builder.create_splat(_0, [B, M, N] if B else [M, N])\n    else:\n        acc_handle = acc.handle\n        assert acc.type == ret_ty\n\n    # max_num_imprecise_acc only applies to fp8 -> fp32 dot on sm_90\n    if max_num_imprecise_acc is None:\n        if lhs.dtype.is_fp8() and rhs.dtype.is_fp8():\n            max_num_imprecise_acc = builder.options.max_num_imprecise_acc_default\n        else:\n            max_num_imprecise_acc = 0\n    else:\n        if lhs.dtype.is_fp8() and rhs.dtype.is_fp8() and max_num_imprecise_acc > K:\n            raise ValueError(f\"max_num_imprecise_acc ({max_num_imprecise_acc}) must be <= K ({K})\")\n\n    return tl.tensor(builder.create_dot(lhs.handle, rhs.handle, acc_handle, input_precision, max_num_imprecise_acc),\n                     ret_ty)",
+      "elide": ["两处 assert 的 f-string 错误信息可截断（… 处），讲解只需保留判据本身"]
+    },
+    {
+      "path": "python/triton/language/semantic.py",
+      "lines": "L1449-L1455",
+      "what": "input_precision 字符串→IR 枚举的解析：这里执行 allowed_dot_input_precisions 白名单校验",
+      "code": "def _str_to_dot_input_precision(input_precision, builder):\n    assert input_precision.lower() in builder.options.allowed_dot_input_precisions, \\\n        f\"input_precision must be one of {builder.options.allowed_dot_input_precisions}. Got {input_precision}\"\n    input_precision = input_precision.upper()\n    if input_precision == \"TF32X3\":\n        input_precision = \"TF32x3\"\n    return getattr(ir.INPUT_PRECISION, input_precision)",
+      "elide": []
+    },
+    {
+      "path": "third_party/nvidia/backend/compiler.py",
+      "lines": "L17-L18",
+      "what": "关键落点：NVIDIA 后端声明的 min_dot_size —— Tensor Core 能吃的最小 (M,N,K) tile。返回 (M_min, N_min, K_min)。int8 时 N 最小 32，其余 (16,16,16)",
+      "code": "def min_dot_size(target: GPUTarget):\n    return lambda lhsType, rhsType: (16, 32, 16) if lhsType.is_int8() else (16, 16, 16)",
+      "elide": []
+    },
+    {
+      "path": "third_party/nvidia/backend/compiler.py",
+      "lines": "L108-L110,L158",
+      "what": "CUDAOptions 里 dot 相关默认：默认 tf32、允许的三档精度、以及 fp8 imprecise acc 默认（仅 sm_90 非零）",
+      "code": "    default_dot_input_precision: str = \"tf32\"\n    allowed_dot_input_precisions: Tuple[str] = (\"tf32\", \"tf32x3\", \"ieee\")\n    max_num_imprecise_acc_default: bool = None\n    ...\n    # in CUDABackend.parse_options():\n    args[\"max_num_imprecise_acc_default\"] = 2**30 if self.capability == 90 else 0",
+      "elide": ["parse_options 里其余 fp8 dtype 处理与本章无关，省略"]
+    },
+    {
+      "path": "python/triton/language/core.py",
+      "lines": "L2033-L2080",
+      "what": "本章概念核心：tl.reduce 如何把 combine_fn 变成 IR region。make_combine_region 建 block、用 _generator.call_JitFunction 重新驱动 combine_fn，再 create_reduce_ret",
+      "code": "def reduce(input, axis, combine_fn, keep_dims=False, _builder=None, _generator=None):\n    ...\n    if isinstance(input, tensor):\n        return reduce((input, ), axis, combine_fn, keep_dims=keep_dims, _builder=_builder, _generator=_generator)[0]\n\n    def make_combine_region(reduce_op):\n        in_scalar_tys = [t.type.scalar for t in input]\n        prototype = function_type(in_scalar_tys, in_scalar_tys * 2)\n\n        region = reduce_op.get_region(0)\n        with _insertion_guard(_builder):\n            param_types = [ty.to_ir(_builder) for ty in prototype.param_types]\n            block = _builder.create_block_with_parent(region, param_types)\n            args = [tensor(block.arg(i), ty) for i, ty in enumerate(prototype.param_types)]\n            results = _generator.call_JitFunction(combine_fn, args, kwargs={})\n            if isinstance(results, tensor):\n                handles = [results.handle]\n            else:\n                handles = [r.handle for r in results]\n            _builder.create_reduce_ret(*handles)\n\n    def expand_ndims(t, ndims):\n        for _ in builtins.range(ndims):\n            t = expand_dims(t, 0, _builder=_builder)\n        return t\n\n    axis = _constexpr_to_value(axis)\n    keep_dims = _constexpr_to_value(keep_dims)\n    if axis is not None:\n        axis = _wrap_axis(axis, len(input[0].shape))\n    ret = semantic.reduction(input, axis, make_combine_region, _builder)\n    if keep_dims:\n        if axis is not None:\n            ret = tuple(expand_dims(t, axis, _builder=_builder) for t in ret)\n        else:\n            ret = tuple(expand_ndims(t, len(input[0].shape)) for t in ret)\n    return ret",
+      "elide": ["docstring 省略；单-tensor→tuple 的自递归包装(第一 if)可一句话带过"]
+    },
+    {
+      "path": "python/triton/language/semantic.py",
+      "lines": "L1615-L1630",
+      "what": "semantic.reduction：造 create_reduce op、让 region_builder_fn(=make_combine_region) 填 region body、verify、按结果形状包 tensor",
+      "code": "def reduction(inputs: Sequence[tl.tensor], axis: int, region_builder_fn, builder: ir.builder) -> Tuple[tl.tensor, ...]:\n    if axis is None:\n        inputs = tuple(reshape(t, [t.numel.value], can_reorder=True, builder=builder) for t in inputs)\n        axis = 0\n    # get result shape\n    shape = inputs[0].type.shape\n    rank = len(shape)\n    assert axis < rank, f\"reduction axis must be < inputs rank ({rank})\"\n    ret_shape = [s for i, s in enumerate(shape) if i != axis]\n    assert all(t.type.shape == shape for t in inputs), \"all reduction inputs must have the same shape\"\n\n    reduce_op = builder.create_reduce([t.handle for t in inputs], axis)\n    region_builder_fn(reduce_op)\n    reduce_op.verify()\n\n    return tuple(wrap_tensor(reduce_op.get_result(i), inputs[i].type.scalar, ret_shape) for i in range(len(inputs)))",
+      "elide": []
+    },
+    {
+      "path": "python/triton/compiler/code_generator.py",
+      "lines": "L1050-L1078",
+      "what": "回指 ch01/ch03 的高级用法：call_JitFunction 用 fn.parse() 取 combine_fn 的 AST、新建 CodeGenerator 并 visit —— 证明 combine_fn 是被再编译成 IR，而非在 Python 里被调用求值。回指不重讲 visit/CodeGenerator 机理",
+      "code": "    def call_JitFunction(self, fn: JITFunction, args, kwargs):\n        args = inspect.getcallargs(fn.fn, *args, **kwargs)\n        args = [args[name] for name in fn.arg_names]\n        args = [arg if _is_triton_value(arg) else constexpr(arg) for arg in args]\n        ...\n        fn_name = mangle_fn(fn.__name__, arg_types, constants)\n        # generate function def if necessary\n        if not self.module.has_function(fn_name):\n            prototype = language.function_type([], arg_types)\n            gscope = fn.__globals__\n            file_name, begin_line = get_jit_fn_file_line(fn)\n            generator = CodeGenerator(self.context, prototype, gscope, attributes, constants, module=self.module,\n                                      jit_fn=fn, function_name=fn_name, function_types=self.function_ret_types,\n                                      noinline=fn.noinline, file_name=file_name, begin_line=begin_line,\n                                      options=self.builder.options, codegen_fns=self.builder.codegen_fns,\n                                      module_map=self.builder.module_map)\n            generator.visit(fn.parse())\n            ...",
+      "elide": ["mangle_fn 细节、异常包装、call_op 结果解包(0/1/多结果)与本章论点无关，只需保留 fn.parse()+CodeGenerator+visit 三步作为『AST 再编译』的证据"]
+    },
+    {
+      "path": "python/triton/language/core.py",
+      "lines": "L2093-L2108",
+      "what": "_reduce_with_indices：argmax/argmin 的支撑。造 arange 索引、跨非归约轴 expand+broadcast，把 (值,索引) 作为一对 tensor 一起归约 —— combine_fn 于是能同时挑值和对应索引",
+      "code": "def _reduce_with_indices(input, axis, combine_fn, keep_dims=False, _builder=None, _generator=None):\n    axis = _constexpr_to_value(axis)\n    n = input.shape[axis]\n    index = arange(0, n, _builder=_builder)\n\n    if len(input.shape) > 1:\n        # Broadcast index across the non-reduced axes\n        axes_to_expand = [constexpr(d) for d in builtins.range(len(input.shape))]\n        del axes_to_expand[axis]\n        index = expand_dims(index, axes_to_expand, _builder=_builder)\n        index = broadcast_to(index, input.shape, _builder=_builder)\n\n    rvalue, rindices = reduce((input, index), axis, combine_fn, keep_dims=keep_dims, _builder=_builder,\n                              _generator=_generator)\n    return rvalue, rindices",
+      "elide": []
+    },
+    {
+      "path": "python/triton/language/core.py",
+      "lines": "L2134-L2169",
+      "what": "tl.associative_scan：与 reduce 同构，但落到 create_scan_ret，且带 reverse 方向。make_combine_region 同样 call_JitFunction 重编译 combine_fn",
+      "code": "def associative_scan(input, axis, combine_fn, reverse=False, _builder=None, _generator=None):\n    ...\n    if isinstance(input, tensor):\n        return associative_scan((input, ), axis, combine_fn, reverse, _builder=_builder, _generator=_generator)[0]\n\n    def make_combine_region(scan_op):\n        in_scalar_tys = [t.type.scalar for t in input]\n        prototype = function_type(in_scalar_tys, in_scalar_tys * 2)\n\n        region = scan_op.get_region(0)\n        with _insertion_guard(_builder):\n            param_types = [ty.to_ir(_builder) for ty in prototype.param_types]\n            block = _builder.create_block_with_parent(region, param_types)\n            args = [tensor(block.arg(i), ty) for i, ty in enumerate(prototype.param_types)]\n            results = _generator.call_JitFunction(combine_fn, args, kwargs={})\n            if isinstance(results, tensor):\n                handles = [results.handle]\n            else:\n                handles = [r.handle for r in results]\n            _builder.create_scan_ret(*handles)\n\n    axis = _constexpr_to_value(axis)\n    if axis is not None:\n        axis = _wrap_axis(axis, len(input[0].shape))\n    return semantic.associative_scan(input, axis, make_combine_region, reverse, _builder)",
+      "elide": ["docstring 省略"]
+    },
+    {
+      "path": "python/triton/language/semantic.py",
+      "lines": "L1638-L1666",
+      "what": "semantic.associative_scan(带 reverse 传给 create_scan) 与 semantic.histogram(1D+int 校验，直出 create_histogram，无 combine region)",
+      "code": "def associative_scan(inputs: Sequence[tl.tensor], axis: int, region_builder_fn, reverse: bool,\n                     builder: ir.builder) -> Tuple[tl.tensor, ...]:\n    shape = inputs[0].type.shape\n    rank = len(shape)\n    assert -rank <= axis < rank, f\"scan axis {axis} must be < inputs rank ({rank})\"\n    if axis < 0:\n        axis += rank\n    for t in inputs:\n        assert t.type.shape == shape, \"all scan inputs must have the same shape\"\n    scan_op = builder.create_scan([t.handle for t in inputs], axis, reverse)\n    region_builder_fn(scan_op)\n    scan_op.verify()\n    return tuple(wrap_tensor(scan_op.get_result(i), inputs[i].type.scalar, shape) for i in range(len(inputs)))\n\n\ndef histogram(input: tl.tensor, num_bins: int, builder: ir.builder) -> tl.tensor:\n    assert len(input.shape) == 1, \"histogram only supports 1D input\"\n    assert input.dtype.is_int(), \"histogram only supports integer input\"\n    return tl.tensor(builder.create_histogram(input.handle, num_bins), tl.block_type(tl.int32, (num_bins, )))",
+      "elide": []
+    },
+    {
+      "path": "python/triton/language/standard.py",
+      "lines": "L140-L184,L254-L267",
+      "what": "combine_fn 真实样例——证明它是可追踪 tl.* 代码。_argmax_combine 用 core.where 挑值+索引；_sum_combine 就是 a+b；max/sum 分别调 _reduce_with_indices 与 reduce",
+      "code": "@jit\ndef _argmax_combine(value1, index1, value2, index2, tie_break_left):\n    if tie_break_left:\n        tie = value1 == value2 and index1 < index2\n    else:\n        tie = False\n    gt = value1 > value2 or tie\n    v_ret = core.where(gt, value1, value2)\n    i_ret = core.where(gt, index1, index2)\n    return v_ret, i_ret\n\n@jit\ndef _elementwise_max(a, b):\n    return core.maximum(a, b)\n\n@jit\ndef max(input, axis=None, return_indices=False, return_indices_tie_break_left=True, keep_dims=False):\n    input = core._promote_bfloat16_to_float32(input)\n    if return_indices:\n        if return_indices_tie_break_left:\n            return core._reduce_with_indices(input, axis, _argmax_combine_tie_break_left, keep_dims=keep_dims)\n        else:\n            return core._reduce_with_indices(input, axis, _argmax_combine_tie_break_fast, keep_dims=keep_dims)\n    else:\n        if core.constexpr(input.dtype.primitive_bitwidth) < core.constexpr(32):\n            if core.constexpr(input.dtype.is_floating()):\n                input = input.to(core.float32)\n            else:\n                assert input.dtype.is_int(), \"Expecting input to be integer type\"\n                input = input.to(core.int32)\n        return core.reduce(input, axis, _elementwise_max, keep_dims=keep_dims)\n\n@jit\ndef _sum_combine(a, b):\n    return a + b\n\n@jit\ndef sum(input, axis=None, keep_dims=False):\n    input = core._promote_bfloat16_to_float32(input)\n    return core.reduce(input, axis, _sum_combine, keep_dims=keep_dims)",
+      "elide": ["装饰器 @core._tensor_member_fn / @core._add_reduction_docstr、以及 _argmax_combine_tie_break_left/fast 两个薄封装、min/argmin(与 max/argmax 对称)可省略只提一句"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "tl.dot (core.py 前端 @builtin)", "file": "python/triton/language/core.py", "responsibility": "面向用户的 dot：解析 input_precision 默认(tf32 vs ieee)、处理 allow_tf32 废弃别名、constexpr 归一，转发 semantic.dot"},
+    {"name": "semantic.dot", "file": "python/triton/language/semantic.py", "responsibility": "dot 的真正校验+建 IR：dtype 白名单/同型、input_precision 白名单、2D/3D 形状相容、min_dot_size 后端钩子门禁、按操作数与 out_dtype 定 ret_scalar_ty/acc、max_num_imprecise_acc、create_dot"},
+    {"name": "min_dot_size (NVIDIA backend codegen_fns)", "file": "third_party/nvidia/backend/compiler.py", "responsibility": "后端声明 Tensor Core 能吃的最小 (M,N,K) tile：int8→(16,32,16)，其余→(16,16,16)。经 builder.codegen_fns['min_dot_size'] 注入 semantic.dot"},
+    {"name": "CUDAOptions", "file": "third_party/nvidia/backend/compiler.py", "responsibility": "承载 default_dot_input_precision/allowed_dot_input_precisions/max_num_imprecise_acc_default 等 dot 行为默认值"},
+    {"name": "tl.reduce / tl.associative_scan / tl.histogram (core.py @builtin)", "file": "python/triton/language/core.py", "responsibility": "块级归约/扫描/直方图前端；前两者用内嵌闭包 make_combine_region 把用户 combine_fn 变 region body"},
+    {"name": "_reduce_with_indices", "file": "python/triton/language/core.py", "responsibility": "带索引归约：造 arange 索引并 broadcast，把 (值,索引) 成对归约——argmax/argmin 的底座"},
+    {"name": "semantic.reduction / semantic.associative_scan / semantic.histogram", "file": "python/triton/language/semantic.py", "responsibility": "建 create_reduce/create_scan/create_histogram op、调 region_builder_fn 填 region、verify、包结果 tensor"},
+    {"name": "CodeGenerator.call_JitFunction", "file": "python/triton/compiler/code_generator.py", "responsibility": "把 combine_fn 当 JITFunction：getcallargs→fn.parse()→新 CodeGenerator.visit，重新把函数体编译成 IR（本章回指 ch01/ch03 的高级应用）"},
+    {"name": "standard.py 归约/扫描封装", "file": "python/triton/language/standard.py", "responsibility": "max/min/argmax/argmin/sum/xor_sum/cumsum/cumprod：定义具体 combine_fn（@jit）并调 reduce/_reduce_with_indices/associative_scan"}
+  ],
+
+  "data_flow": [
+    "① tl.dot 路径：core.dot 定 input_precision 默认 → semantic.dot 校验 dtype/形状 → assert builder.codegen_fns['min_dot_size'] 取后端最小 tile → 校验 M/N/K ≥ min → 定 ret_scalar_ty(int8→int32 / fp32|bf16→fp32 / 其余看 out_dtype) → acc 缺省 splat 0 → 定 max_num_imprecise_acc(fp8 才非零) → builder.create_dot 出 tt.dot IR",
+    "② dot_scaled 路径：core.dot_scaled(仅 out_dtype=float32) → semantic.dot_scaled 校验 MX 格式枚举/K≥64/rhs_scale 目前必 None → create_dot_scaled(microscaling 路径，点到即止)",
+    "③ combine_fn→region 路径：core.reduce 建 make_combine_region 闭包 → semantic.reduction 建 create_reduce op → 回调 make_combine_region：开 block、_generator.call_JitFunction(combine_fn) 把其 AST 再编译进 region、create_reduce_ret → reduce_op.verify → 包结果 tensor",
+    "④ scan 路径：core.associative_scan 同③但 create_scan(带 reverse)/create_scan_ret",
+    "⑤ argmax/argmin 路径：standard.max(return_indices=True) → core._reduce_with_indices 造 index 并 broadcast → reduce((input,index), _argmax_combine…) → combine_fn 内 core.where 同步挑值+索引",
+    "⑥ histogram 路径：core.histogram → semantic.histogram(1D+int 校验) → create_histogram，无 combine region"
+  ],
+
+  "design_decisions": [
+    {"decision": "min_dot_size 由后端(codegen_fns)声明，而非语言层硬编码", "why": "Tensor Core 能接受的最小 tile 是硬件/后端相关的（NVIDIA int8 需 N≥32、其余 16³；AMD、interpreter 各不同）。语言层只在 semantic.dot 里 assert 存在并据其门禁，把硬件事实下沉到后端——你的 block 形状不达标就直接编译期报错，落不到 Tensor Core", "evidence": "python/triton/language/semantic.py:L1486-L1490 与 third_party/nvidia/backend/compiler.py:L17-L18"},
+    {"decision": "f32×f32 默认走 tf32 而非 ieee（除非无 tf32 支持或 TRITON_F32_DEFAULT 覆盖）", "why": "tf32 命中 Tensor Core（性能），ieee 退化到更慢但更精确的路径。默认偏性能，把选择权以 input_precision/allow_tf32/环境变量三层暴露给用户", "evidence": "python/triton/language/core.py:L1540-L1543 与 semantic.py:L1476-L1479，默认值 third_party/nvidia/backend/compiler.py:L108"},
+    {"decision": "combine_fn 不在 Python 里被调用求值，而是被 fn.parse() 取 AST 后由 CodeGenerator 重新编译进 create_reduce/create_scan 的 region body", "why": "归约/扫描的逐元素组合逻辑必须落进设备 IR 才能在 GPU 上并行执行；因此 combine_fn 只能用 tl.* 可追踪操作（core.where/maximum/+ 等），普通 Python 运算无法被 trace。这是 ch01/ch03 CodeGenerator/visit_Call 机制的高级用法", "evidence": "python/triton/language/core.py:L2058(call_JitFunction 调用点) 与 python/triton/compiler/code_generator.py:L1075(generator.visit(fn.parse()))"},
+    {"decision": "argmax/argmin 复用同一 reduce 基础设施，靠『把索引作为第二个 tensor 一起归约』实现", "why": "无需为带索引归约另造 IR op；_reduce_with_indices 造 arange 索引并 broadcast 到输入形状，combine_fn 内用 core.where(gt, ...) 对 (值,索引) 同步选择即得 argmax", "evidence": "python/triton/language/core.py:L2093-L2108 与 standard.py:L140-L148"},
+    {"decision": "max_num_imprecise_acc 只对 fp8×fp8→fp32 在 sm_90 生效，默认 2**30(sm90)/0(其它)", "why": "sm_90 的 fp8 MMA 累加器有精度上限，允许每若干步刷新一次高精度累加；非 fp8 或非 sm90 无此需求故为 0", "evidence": "python/triton/language/semantic.py:L1516-L1524 与 third_party/nvidia/backend/compiler.py:L158"},
+    {"decision": "acc 累加器缺省时由 create_splat(0) 生成，且强制 acc.type == ret_ty", "why": "累加初值必须与输出块同形同 dtype，避免用户传入不相容 acc 破坏 MMA 累加语义", "evidence": "python/triton/language/semantic.py:L1510-L1514"}
+  ],
+
+  "theory": [
+    "Tensor Core 命中判据（本章性能落点）：tl.dot 命中 Tensor Core ⇔ 同时满足 (a) 形状 M,N,K 各 ≥ 后端 min_dot_size 对应分量（NVIDIA 非 int8 为 16/16/16，int8 为 16/32/16）；(b) input_precision 选 tf32/tf32x3 而非 ieee（f32 输入时；tf32 走 TC，ieee 退化 FMA 式更慢路径）；(c) 操作数 dtype 属受支持集合且 acc/out_dtype 相容。三者任一不满足即编译期报错或退化——读者据此自查 dot 写法。回指 ch02 硬件层解释 min_dot_size 为何存在（一句话），不重讲 warp/SIMT/TC 原理。",
+    "min_dot_size 返回三元组语义：(M_min, N_min, K_min)。注意 semantic.dot 的校验用 lhs.shape[-2]≥min[0](M)、rhs.shape[-1]≥min[1](N)、lhs.shape[-1]≥min[2](K)——下标次序易错，K 对应 min_dot_size 的第 3 分量。",
+    "combine_fn 结合律要求：associative_scan 名字点破——combine_fn 必须满足结合律（a⊕b）⊕c=a⊕(b⊕c)，因为并行前缀扫描按树形而非顺序求值；reduce 亦然。源码不强制检查，是使用契约。",
+    "reduce/scan 的 region 双入参协议：prototype = function_type(in_scalar_tys, in_scalar_tys*2)——combine_fn 接收『两组标量』(各 N 个 tensor 的一对)，返回一组，故参数个数是输入 tensor 数的 2 倍。这解释了 _argmax_combine 为何是 (value1,index1,value2,index2)→(v,i) 的四入二出。"
+  ],
+
+  "subtraction_plan": {
+    "note": "本实例多数章 skip_impl（无 subtract-only 精简版，改用 pin 精确编译交叉验证，见 INSTANCE.md §『可运行交叉验证』）。若 workflow 仍要精简版，按下列执行；否则本节仅约束 must_keep 供门禁参考。",
+    "delete": [
+      {"what": "semantic.dot 中 fp8e4b15 特判分支（L1472-1474 的 cast 到 float16）", "why_safe": "只影响一种边缘 fp8 子类型的预处理，删后其余 dtype 路径与 create_dot 主线不变；讲解可一句话带过"},
+      {"what": "dot_scaled 全路径（microscaling MX 格式）", "why_safe": "本章对 dot_scaled 明确『点到即止』，非 stakes 核心；删除不影响 tl.dot 主线与 combine_fn 主线的正确性"},
+      {"what": "keep_dims 的 expand_dims/expand_ndims 后处理（core.reduce L2065-2068,2075-2079）", "why_safe": "只是把被归约维以长度 1 保留的形状修饰，不改归约数值语义；讲 combine_fn→region 机理时可略"},
+      {"what": "input_precision==TF32X3 的大小写修正分支（semantic _str_to_dot_input_precision L1453-1454）", "why_safe": "仅字符串规范化，不影响 tf32/ieee 主路径判据"}
+    ],
+    "must_keep": [
+      {"symbol": "semantic.dot", "why": "本章 stakes 核心函数，全套校验与 create_dot 都在此"},
+      {"symbol": "min_dot_size", "why": "性能落点——Tensor Core 最小 tile 门禁，读者必须理解"},
+      {"symbol": "codegen_fns", "why": "后端能力钩子的载体，min_dot_size 经它注入；点破『后端声明能力』"},
+      {"symbol": "default_dot_input_precision", "why": "f32 默认 tf32 的来源，性能默认值"},
+      {"symbol": "allowed_dot_input_precisions", "why": "tf32/tf32x3/ieee 白名单校验依据"},
+      {"symbol": "input_precision", "why": "tf32 vs ieee 决定命不命中 TC 的核心开关"},
+      {"symbol": "max_num_imprecise_acc", "why": "fp8→fp32 sm90 累加精度控制，dtype 选型的一部分"},
+      {"symbol": "out_dtype", "why": "与 acc/ret_scalar_ty 选型耦合"},
+      {"symbol": "create_dot", "why": "dot 最终落成的 IR op"},
+      {"symbol": "make_combine_region", "why": "combine_fn→region 的关键闭包，概念核心"},
+      {"symbol": "call_JitFunction", "why": "把 combine_fn AST 再编译成 IR 的回调，点破『为何 combine_fn 必须可追踪』"},
+      {"symbol": "create_reduce_ret", "why": "region body 的归约返回，标志 combine 结果写回 region"},
+      {"symbol": "create_reduce", "why": "reduce 的 IR op"},
+      {"symbol": "create_scan", "why": "associative_scan 的 IR op(带 reverse)"},
+      {"symbol": "create_scan_ret", "why": "scan region 返回"},
+      {"symbol": "_reduce_with_indices", "why": "argmax/argmin 支撑，带索引归约"},
+      {"symbol": "reduction", "why": "semantic 层归约主函数：create_reduce+region+verify"},
+      {"symbol": "associative_scan", "why": "semantic 层扫描主函数"},
+      {"symbol": "histogram", "why": "第三个块级归约类原语，无 combine region 的对照"},
+      {"symbol": "_argmax_combine", "why": "combine_fn 真实样例，展示 core.where 同步挑值+索引"},
+      {"symbol": "_sum_combine", "why": "最简 combine_fn 样例(a+b)，讲『必须是 tl.* 可追踪』的起点"}
+    ]
+  },
+
+  "mechanisms": [
+    {"id": "dot-validation-gauntlet", "name": "tl.dot 的校验闸门：dtype 白名单/同型 + 2D/3D 形状相容", "kind": "protocol", "source_anchors": ["python/triton/language/semantic.py:L1460-L1485"], "needs_figure": false, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "min-dot-size-hook", "name": "min_dot_size 后端能力钩子：Tensor Core 最小 tile 门禁（性能落点）", "kind": "protocol", "source_anchors": ["python/triton/language/semantic.py:L1486-L1490", "third_party/nvidia/backend/compiler.py:L17-L18"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "input-precision-selection", "name": "input_precision 三层选取：tf32/tf32x3/ieee 与 allow_tf32/TRITON_F32_DEFAULT", "kind": "config", "source_anchors": ["python/triton/language/core.py:L1539-L1545", "python/triton/language/semantic.py:L1476-L1479", "python/triton/language/semantic.py:L1449-L1455", "third_party/nvidia/backend/compiler.py:L108-L109"], "needs_figure": false, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "acc-out-dtype-selection", "name": "acc/ret_scalar_ty/out_dtype 选型与 max_num_imprecise_acc(fp8·sm90)", "kind": "algorithm", "source_anchors": ["python/triton/language/semantic.py:L1491-L1524", "third_party/nvidia/backend/compiler.py:L158"], "needs_figure": false, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "tensor-core-hit-criterion", "name": "命中判据合流：min_dot_size + input_precision + acc/out_dtype 三者共同决定命不命中 Tensor Core", "kind": "protocol", "source_anchors": ["python/triton/language/semantic.py:L1486-L1526"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "dot-scaled-microscaling", "name": "dot_scaled 的 microscaling MX 路径（点到即止）", "kind": "dataflow", "source_anchors": ["python/triton/language/core.py:L1552-L1571", "python/triton/language/semantic.py:L1544-L1576"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "combine-fn-to-region", "name": "combine_fn 变 IR region：make_combine_region + call_JitFunction 重新驱动 CodeGenerator", "kind": "dataflow", "source_anchors": ["python/triton/language/core.py:L2049-L2063", "python/triton/compiler/code_generator.py:L1050-L1078"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "why-combine-fn-traceable", "name": "为何 combine_fn 必须是可追踪 Triton 代码（不在 Python 求值而被再编译成 IR）", "kind": "protocol", "source_anchors": ["python/triton/compiler/code_generator.py:L1075", "python/triton/language/standard.py:L254-L256"], "needs_figure": false, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "reduction-semantic", "name": "semantic.reduction：create_reduce → region → verify → 按去轴形状包结果", "kind": "dataflow", "source_anchors": ["python/triton/language/semantic.py:L1615-L1630"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "associative-scan-semantic", "name": "associative_scan：与 reduce 同构但带 reverse 方向、落 create_scan", "kind": "dataflow", "source_anchors": ["python/triton/language/core.py:L2150-L2169", "python/triton/language/semantic.py:L1638-L1655"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "reduce-with-indices-argmax", "name": "_reduce_with_indices 支撑 argmax/argmin：索引 broadcast + 成对归约", "kind": "algorithm", "source_anchors": ["python/triton/language/core.py:L2093-L2108", "python/triton/language/standard.py:L140-L184"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "combine-fn-region-protocol", "name": "region 双入参协议：function_type(in_scalar_tys, in_scalar_tys*2)——两组标量入、一组出", "kind": "protocol", "source_anchors": ["python/triton/language/core.py:L2050-L2057"], "needs_figure": false, "needs_worked_example": true, "difficulty": "supporting"},
+    {"id": "histogram-op", "name": "histogram：1D+int 校验直出 create_histogram（无 combine region 的对照）", "kind": "dataflow", "source_anchors": ["python/triton/language/semantic.py:L1663-L1666"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"}
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recover": [],
+    "note": "bible.py due ch08 返回空（无应埋伏笔/应回收登记）。本章为 Part II 语言层深入章，对外可埋：min_dot_size/codegen_fns 作为『后端能力钩子』伏笔，在后续后端章(ch09 backend_seam 等)回收；combine_fn→region 是 ch01/ch03 CodeGenerator 的回指点（回指不重讲）。"
+  }
+}
