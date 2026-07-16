@@ -1,0 +1,170 @@
+{
+  "chapter_id": "ch10",
+  "slug": "ch10-jitfunction-and-cache-keys",
+  "title": "@triton.jit、JITFunction 与缓存键",
+  "kind": "source-reading",
+  "mode": "skip_impl",
+  "scope_note": "Part III 开篇。覆盖 runtime 侧装饰器机制 + 缓存键构成，止于『JITFunction 就绪 + 缓存键怎么算』。run() 的完整 launch 流程（make_backend/parse_options/ASTSource/compile/grid 规范化/kernel.run 发射）是 ch11 的主题，本章只截取 run() 里『调 binder 拼缓存键 + 命中查表 + 尾部核对全局值』三段，编译→发射整体回指 ch11。不重讲 ch01 的 visit_Call 三分派/内联心智模型（CodeGenerator 追踪期），不重讲 ch04 的 @builtin/constexpr 两层结构（此处 constexpr 只作缓存键成分，回指其定义）。",
+  "perf_payoff": "认清『什么进了缓存键』= 知道『什么会触发重编译』。同一份 kernel 源码喂不同 divisibility/dtype/constexpr 值 → 各自算出不同缓存键 → 各编一份；constexpr 传连续变化的值 = 缓存键爆炸 = 编译风暴拖慢首次迭代。这是本章解锁的性能杠杆。",
+  "code_spine": [
+    "python/triton/runtime/jit.py:L803-L855  @triton.jit 装饰器入口：decorator(fn) → JITFunction(fn)（或 TRITON_INTERPRET=1 时 InterpretedFunction）",
+    "python/triton/runtime/jit.py:L657-L716  JITFunction.__init__：inspect.signature 解析 → KernelParam 列表；切掉装饰器只留 def 源码；cache=defaultdict(dict) 按 device 分桶；收集 constexprs",
+    "python/triton/runtime/jit.py:L230-L275  KernelParam：is_constexpr/is_const/annotation_type 从注解识别",
+    "python/triton/runtime/jit.py:L321-L331  KernelInterface.__getitem__：fn[grid](args) 记住 grid 的语法糖",
+    "python/triton/runtime/jit.py:L547-L562  JITFunction.create_binder：惰性构建 binder + 三张下标索引",
+    "python/triton/runtime/jit.py:L345-L410  create_function_from_signature：exec 动态生成 dynamic_func（binder），内联组装缓存键模板",
+    "python/triton/runtime/jit.py:L278-L288  compute_spec_key：16 字节对齐特化 → D/1/N",
+    "python/triton/runtime/jit.py:L294-L318  mangle_type：dtype/int/bool/float → 编码字符串",
+    "python/triton/runtime/jit.py:L577-L584  run()：调 binder 得 (bound_args, sig_and_spec, constexpr_vals, …) 并拼出发射缓存键 key，查 cache[device]（run 全流程见 ch11）",
+    "python/triton/runtime/jit.py:L631-L636  run() 尾部：逐个核对 used_global_vals 未变，否则 RuntimeError",
+    "python/triton/runtime/jit.py:L717-L725  cache_key 属性（源码哈希）：DependenciesFinder 遍历 AST → sha256 + starting_line_number",
+    "python/triton/runtime/jit.py:L24-L214  DependenciesFinder：把自身+被调 JITFunction 源码哈希进 cache_key，登记『可疑』全局变量的值"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "python/triton/runtime/jit.py",
+      "lines": "L803-L855",
+      "code": "def jit(\n    fn: Optional[T] = None,\n    *,\n    version=None,\n    repr: Optional[Callable] = None,\n    launch_metadata: Optional[Callable] = None,\n    do_not_specialize: Optional[Iterable[int]] = None,\n    do_not_specialize_on_alignment: Optional[Iterable[int]] = None,\n    debug: Optional[bool] = None,\n    noinline: Optional[bool] = None,\n) -> Union[JITFunction[T], Callable[[T], JITFunction[T]]]:\n    def decorator(fn: T) -> JITFunction[T]:\n        assert callable(fn)\n        if os.getenv(\"TRITON_INTERPRET\", \"0\") == \"1\":\n            from .interpreter import InterpretedFunction\n            return InterpretedFunction(fn, version=version, do_not_specialize=do_not_specialize,\n                                       do_not_specialize_on_alignment=do_not_specialize_on_alignment, debug=debug,\n                                       noinline=noinline, repr=repr, launch_metadata=launch_metadata)\n        else:\n            return JITFunction(\n                fn,\n                version=version,\n                do_not_specialize=do_not_specialize,\n                do_not_specialize_on_alignment=do_not_specialize_on_alignment,\n                debug=debug,\n                noinline=noinline,\n                repr=repr,\n                launch_metadata=launch_metadata,\n            )\n\n    if fn is not None:\n        return decorator(fn)\n\n    else:\n        return decorator",
+      "elide": ["删掉了两个 @overload 存根（L784-L800）——纯类型提示，无运行时行为；删掉 docstring（L814-L830）保留决策：TRITON_INTERPRET=1 走 InterpretedFunction（无 GPU 替身，回指专章），否则包成 JITFunction。裸用 @triton.jit（fn 非 None，L851）与带参 @triton.jit(...)（fn=None 返回 decorator，L854）两种写法都收敛到 decorator(fn)。"]
+    },
+    {
+      "path": "python/triton/runtime/jit.py",
+      "lines": "L657-L716",
+      "code": "    def __init__(self, fn, version=None, do_not_specialize=None, do_not_specialize_on_alignment=None, debug=None,\n                 noinline=None, repr=None, launch_metadata=None):\n        do_not_specialize = do_not_specialize if do_not_specialize else []\n        do_not_specialize_on_alignment = do_not_specialize_on_alignment if do_not_specialize_on_alignment else []\n\n        self.fn = fn\n        self.module = fn.__module__\n        self.version = version\n        self.signature = inspect.signature(fn)\n        self.do_not_specialize = do_not_specialize\n        self.do_not_specialize_on_alignment = do_not_specialize_on_alignment\n        self.starting_line_number = inspect.getsourcelines(fn)[1]\n        self.repr = lambda _: fn.__name__ if repr is None else repr(_)\n        self.launch_metadata = launch_metadata\n\n        self.binder = None\n\n        self.params = []\n        for i, param in enumerate(self.signature.parameters.values()):\n            dns = i in do_not_specialize or param.name in do_not_specialize\n            dns_oa = i in do_not_specialize_on_alignment or param.name in do_not_specialize_on_alignment\n            self.params.append(KernelParam(i, param, dns, dns_oa))\n\n        # function source code (without decorators)\n        self.src = textwrap.dedent(inspect.getsource(fn))\n        self.src = self.src[re.search(r\"^def\\s+\\w+\\s*\\(\", self.src, re.MULTILINE).start():]\n        # cache of just-in-time compiled kernels\n        self.cache = defaultdict(dict)\n        self.hash = None\n        ...\n        self.used_global_vals: Dict[Tuple[str, int], Tuple[Any, Dict[str, Any]]] = {}\n\n        self.kernel = None\n        self.noinline = noinline\n\n        self.arg_names = [p.name for p in self.params]\n        self.constexprs = [p.num for p in self.params if p.is_constexpr]\n\n        self.pre_run_hooks = []\n\n        self.__doc__ = fn.__doc__\n        self.__name__ = fn.__name__\n        self.__globals__ = fn.__globals__\n        self.__module__ = fn.__module__",
+      "elide": ["省略中段 used_global_vals 的长注释（L687-L695）：说明 map 键是 (var_name, id(__globals__))；机制在 DependenciesFinder 段展开。四要点须讲清：(1) inspect.signature 逐参数建 KernelParam（L675-L678）；(2) do_not_specialize 支持按下标或按名字命中；(3) self.src = 切掉装饰器行、只从第一个 `def` 起（L681-L682，为后续 CodeGenerator 重解析准备，回指 ch01/ch03）；(4) self.cache = defaultdict(dict) 是『按 device 分桶』的两层缓存，键在 run() 里拼。"]
+    },
+    {
+      "path": "python/triton/runtime/jit.py",
+      "lines": "L230-L275",
+      "code": "class KernelParam:\n    \"\"\"Represents a parameter (name plus metadata) to a @jit'ed function.\"\"\"\n\n    def __init__(self, num: int, param: inspect.Parameter, do_not_specialize: bool,\n                 do_not_specialize_on_alignment: bool):\n        self.num = num\n        self._param = param\n        self.do_not_specialize = do_not_specialize\n        self.do_not_specialize_on_alignment = do_not_specialize_on_alignment\n\n    @cached_property\n    def name(self):\n        return self._param.name\n\n    @cached_property\n    def annotation(self):\n        if not self._param.annotation or self._param.annotation == inspect.Parameter.empty:\n            return \"\"\n        return _normalize_ty(self._param.annotation)\n\n    @cached_property\n    def annotation_type(self):\n        annotation = self.annotation\n        for ty1, ty2 in [(\"uint\", 'u'), (\"int\", 'i')]:\n            width = annotation[annotation.find(ty1) + len(ty1):]\n            if width and ty1 in annotation:\n                return f\"{ty2}{width}\"\n        if annotation == \"bool\":\n            return \"u1\"\n        return \"\"\n\n    @cached_property\n    def is_constexpr(self):\n        return \"constexpr\" in self.annotation\n\n    @cached_property\n    def is_const(self):\n        return \"const\" in self.annotation and not self.is_constexpr\n\n    @property\n    def default(self):\n        return self._param.default\n\n    @property\n    def has_default(self):\n        return self._param.default != inspect.Parameter.empty",
+      "elide": ["is_constexpr 就是简单字符串包含判断：注解里含 'constexpr' 即 True（tl.constexpr 的 __name__ 经 _normalize_ty 归一成含 'constexpr' 的字符串）；is_const 含 'const' 但排除 constexpr。annotation_type 把 `tl.int32` 这类注解编成 'i32'（给缓存键当签名，避开 mangle_type 的运行时探测）。"]
+    },
+    {
+      "path": "python/triton/runtime/jit.py",
+      "lines": "L321-L331",
+      "code": "class KernelInterface(Generic[T]):\n    run: T\n\n    def __getitem__(self, grid) -> T:\n        \"\"\"\n        A JIT function is launched with: fn[grid](*args, **kwargs).\n        Hence JITFunction.__getitem__ returns a callable proxy that\n        memorizes the grid.\n        \"\"\"\n        return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)\n        # return cast(T, functools.partial(cast(Callable, self.run), grid=grid))",
+      "elide": ["JITFunction 继承 KernelInterface[T]（L442）。fn[grid](args) 是两步语法糖：fn[grid] 触发 __getitem__ 返回一个记住 grid 的 lambda，再 (args) 调用它 → self.run(grid=grid, warmup=False, *args)。"]
+    },
+    {
+      "path": "python/triton/runtime/jit.py",
+      "lines": "L547-L562",
+      "code": "    def create_binder(self, backend):\n        \"\"\"\n        Precompute as much as possible.\n        \"\"\"\n        from ..compiler import CompiledKernel, compile, ASTSource, make_backend\n        self.CompiledKernel = CompiledKernel\n        self.compile = compile\n        self.ASTSource = ASTSource\n        self.make_backend = make_backend\n        self.binder = create_function_from_signature(self.signature, self.params, backend)\n        self.constexpr_indices = [i for (i, p) in enumerate(self.params) if p.is_constexpr]\n        self.non_constexpr_indices = [i for (i, p) in enumerate(self.params) if not p.is_constexpr]\n        self.specialised_indices = [\n            i for (i, p) in enumerate(self.params) if (not p.do_not_specialize) and (not p.is_constexpr)\n        ]",
+      "elide": ["run() 首次调用时（self.binder is None，L577-L578）惰性触发一次；之后复用。重点是 self.binder = create_function_from_signature(...)——把慢路径预编译成一个原生 Python 函数；同时缓存编译器入口与三张参数下标（constexpr / 非 constexpr / 需特化）。"]
+    },
+    {
+      "path": "python/triton/runtime/jit.py",
+      "lines": "L345-L410",
+      "code": "def create_function_from_signature(sig, kparams, backend):\n    \"\"\"\n    Equivalent to sig.bind followed by apply_defaults. This generates a\n    native Python function (using exec) which can be memoized on a per-kernel\n    basis to avoid having to run these expensive functions -- which constitute\n    much of the kernel launch overhead -- every time we run the kernel.\n    \"\"\"\n\n    assert len(sig.parameters) == len(kparams)\n\n    func_args = []\n    dict_entries = []\n    constexpr_vals = []\n    non_constexpr_vals = []\n    signature_types = []\n    specialisations = []\n\n    for ((name, sp), kp) in zip(sig.parameters.items(), kparams):\n        if sp.default is inspect.Parameter.empty:\n            func_args.append(name)\n            dict_entries.append(f\"'{name}': {name}\")\n        else:\n            func_args.append(f\"{name}=default_{name}\")\n            dict_entries.append(f\"'{name}': {name}\")\n        if kp.is_constexpr:\n            constexpr_vals.append(name)\n        else:\n            non_constexpr_vals.append(name)\n            if not kp.do_not_specialize:\n                if not kp.do_not_specialize_on_alignment:\n                    specialisations.append('compute_spec_key(%s, align=True)' % name)\n                else:\n                    specialisations.append('compute_spec_key(%s, align=False)' % name)\n            if kp.annotation_type:\n                signature_types.append('\"%s\"' % kp.annotation_type)\n            else:\n                signature_types.append('mangle_type(%s, %s)' % (name, 'True' if kp.is_const else 'False'))\n\n    cache_key = ''.join([x + ', ' for x in signature_types + specialisations])\n    constexpr_vals = ''.join([x + ', ' for x in constexpr_vals])\n    non_constexpr_vals = ''.join([x + ', ' for x in non_constexpr_vals])\n\n    func_args.append('**excess_kwargs')\n\n    args_str = ', '.join(func_args)\n    dict_str = ', '.join(dict_entries)\n    func_body = \"def dynamic_func(%s):\\n    return {%s}, (%s), (%s), (%s), excess_kwargs\" % (\n        args_str, dict_str, cache_key, constexpr_vals, non_constexpr_vals)\n\n    func_namespace = {\n        f\"default_{name}\": param.default\n        for name, param in sig.parameters.items()\n        if param.default is not inspect.Parameter.empty\n    }\n\n    func_namespace['mangle_type'] = mangle_type\n    func_namespace['compute_spec_key'] = backend.compute_spec_key\n\n    exec(func_body, func_namespace)\n\n    return func_namespace['dynamic_func']",
+      "elide": ["核心 worked example：为 add_kernel(x_ptr,y_ptr,out_ptr,n_elements,BLOCK_SIZE:constexpr) 生成的 dynamic_func 返回五元组 (bound_args_dict, sig_and_spec_tuple, constexpr_vals_tuple, non_constexpr_vals_tuple, excess_kwargs)。cache_key 模板 = 每个非 constexpr 参数的『签名项』(annotation_type 或 mangle_type(v)) 拼上『特化项』(compute_spec_key(v))——这段字符串在 exec 时被展开成对每个实参调 mangle_type/compute_spec_key 的真实代码。constexpr 参数不进签名/特化，其具体值单列进 constexpr_vals。backend.compute_spec_key 是可覆写接缝（默认 AttrsDescriptor.get_property_key，见 design_decisions）。"]
+    },
+    {
+      "path": "python/triton/runtime/jit.py",
+      "lines": "L278-L288",
+      "code": "def compute_spec_key(v, align):\n\n    if align and hasattr(v, \"data_ptr\") and (v.data_ptr() % 16 == 0):\n        return \"D\"\n    elif isinstance(v, int):\n        # bool is a subclass of int, so we don't check explicitly above.\n        if align and (v % 16 == 0):\n            return \"D\"\n        elif v == 1:\n            return \"1\"\n    return \"N\"",
+      "elide": ["三值特化：D=指针地址或 int 值 16 对齐（编译器可假设 divisibility，开启向量化/合并访存）、1=值恰为 1（可把该维当标量常量折掉）、N=其他（无特化假设）。对张量看 data_ptr()%16，对 int 看 v%16。backend.compute_spec_key 默认委托到 AttrsDescriptor.get_property_key，D/1/N 逻辑逐字相同（backends/compiler.py:L206-L211）。"]
+    },
+    {
+      "path": "python/triton/runtime/jit.py",
+      "lines": "L294-L318",
+      "code": "def mangle_type(arg, is_const=False):\n\n    if arg is None:\n        return \"none\"\n    elif isinstance(arg, bool):\n        return \"i1\"\n    elif isinstance(arg, int):\n        if -(2**31) <= arg and arg <= 2**31 - 1:\n            return \"i32\"\n        elif 2**63 <= arg and arg <= 2**64 - 1:\n            return \"u64\"\n        else:\n            return \"i64\"\n    elif isinstance(arg, float):\n        return \"fp32\"\n    elif hasattr(arg, \"tma_desc_cpu_ptr\"):\n        return \"nvTmaDesc\"\n    else:\n        # dtypes are hashable so we can memoize this mapping:\n        dsk = (arg.dtype, is_const)\n        res = dtype2str.get(dsk, None)\n        if res is None:\n            res = (\"*k\" if dsk[1] else \"*\") + type_canonicalisation_dict[str(dsk[0]).split('.')[-1]]\n            dtype2str[dsk] = res\n        return res",
+      "elide": ["当参数没有编译期注解（annotation_type 为空）时，binder 落到运行时 mangle_type 探测实参：None→'none'（run() 里再改写成 *i8）、bool→'i1'、int 按范围→i32/i64/u64、float→fp32、有 .dtype 的张量→'*'+规范化 dtype（is_const 时 '*k'）。张量映射经 dtype2str 记忆化。type_canonicalisation_dict（L413-L436）把 torch/triton dtype 名归一成 fp16/bf16/i32/... 的短码。"]
+    },
+    {
+      "path": "python/triton/runtime/jit.py",
+      "lines": "L577-L584",
+      "code": "        if self.binder is None:\n            self.create_binder(backend)\n\n        bound_args, sig_and_spec, constexpr_vals, non_constexpr_vals, excess_kwargs = self.binder(*args, **kwargs)\n\n        # compute cache key\n        key = ''.join(sig_and_spec) + str((constexpr_vals, excess_kwargs))\n        kernel = self.cache[device].get(key, None)",
+      "elide": ["这是本章与 ch11 的交界点：run() 首次惰性建 binder，调 binder(*args) 得五元组，随后把发射缓存键 key 拼出来 = 『签名+特化位』字符串 + 『constexpr 具体值 + 未知 kwargs』的 repr，再 self.cache[device].get(key) 查两层缓存。缓存未命中的编译分支（L586-L629：parse_options/get_attrs_descriptor/ASTSource/compile 回填）与命中后的 grid 规范化+kernel.run 发射（L638-L654）都是 ch11 的题目，本章不展开。要点只有一个：key 由什么组成 → 什么会让它变 → 什么触发重编译。"]
+    },
+    {
+      "path": "python/triton/runtime/jit.py",
+      "lines": "L631-L636",
+      "code": "        # Check that used global values have not changed.\n        not_present = object()\n        for (name, _), (val, globals_dict) in self.used_global_vals.items():\n            if (newVal := globals_dict.get(name, not_present)) != val:\n                raise RuntimeError(\n                    f\"Global variable {name} has changed since we compiled this kernel, from {val} to {newVal}\")",
+      "elide": ["run() 每次发射前（缓存命中也走这里）逐个核对：kernel 首次编译时登记的『可疑全局变量』现值是否仍等于当时值；变了就抛 RuntimeError（而非静默用旧编译产物）。used_global_vals 由 cache_key 属性触发 DependenciesFinder 填充。"]
+    },
+    {
+      "path": "python/triton/runtime/jit.py",
+      "lines": "L717-L725",
+      "code": "    @property\n    def cache_key(self):\n        # TODO : hash should be attribute of `self`\n        if self.hash is None:\n            dependencies_finder = DependenciesFinder(name=self.__name__, globals=self.__globals__, src=self.src)\n            dependencies_finder.visit(self.parse())\n            self.hash = dependencies_finder.ret + str(self.starting_line_number)\n            self.used_global_vals = dict(sorted(dependencies_finder.used_global_vals.items()))\n        return self.hash",
+      "elide": ["注意与发射缓存键（run 里的 key）区分：cache_key 是『源码哈希』——sha256(src) 融合所有被调 JITFunction 的哈希，再拼 starting_line_number。它回答『源码/依赖/全局量变了没』，改源码即失效（__setattr__ 里 src 一变就 self.hash=None，L768-L773）。副作用：填充 self.used_global_vals 供 run() 尾部核对。DependenciesFinder._update_hash（L82-L98）在遇到被调 JITFunction 时把对方 cache_key+noinline 也 update 进哈希——嵌套 kernel 改了，外层哈希跟着变。"]
+    },
+    {
+      "path": "python/triton/runtime/jit.py",
+      "lines": "L36-L98",
+      "code": "    def __init__(self, name, globals, src) -> None:\n        super().__init__()\n        self.name = name\n        self.hasher = hashlib.sha256(src.encode(\"utf-8\"))\n        self.globals = globals\n        ...\n        self.used_global_vals: Dict[Tuple[str, int], Tuple[Any, Dict[str, Any]]] = {}\n        self.visiting_arg_default_value = False\n\n    @property\n    def ret(self):\n        return self.hasher.hexdigest()\n\n    def _update_hash(self, func):\n        if isinstance(func, JITFunction):\n            for k in self.used_global_vals.keys() & func.used_global_vals.keys():\n                var_name, _ = k\n                v1, _ = self.used_global_vals[k]\n                v2, _ = func.used_global_vals[k]\n                if v1 != v2:\n                    raise RuntimeError(...)\n            self.used_global_vals.update(func.used_global_vals)\n            func_key = func.cache_key\n            func_key += str(getattr(func, \"noinline\", False))\n            self.hasher.update(func_key.encode(\"utf-8\"))",
+      "elide": ["DependenciesFinder 是 ast.NodeVisitor：从 src 起 sha256，visit_Name/visit_Attribute（L100-L143）遇到被引用的全局符号时，若是被调 JITFunction 就把对方 cache_key 混进哈希（_update_hash），若是『可疑』的可变全局量（非模块/非函数/非 builtin，L113-L125）就登记进 used_global_vals。visit_arguments/visit_Assign 等（L145-L214）只为正确追踪局部名遮蔽与默认值特殊语义，属机制细节，正文点到即可、不逐行讲。本章讲清『源码哈希覆盖自身+依赖+可疑全局量』这一层即可，AST 遍历细节回指 ch01/ch03 的 CodeGenerator。"]
+    }
+  ],
+  "key_classes": [
+    {"name": "JITFunction", "file": "python/triton/runtime/jit.py:L442", "responsibility": "@triton.jit 的产物：持有 fn、signature、params(KernelParam)、去装饰器的 src、按 device 分桶的 cache、binder；实现 run()（发射热路径，全流程见 ch11）与 cache_key（源码哈希）。从不作为普通 Python 运行（__call__ 直接抛错，L765-L766）。"},
+    {"name": "KernelParam", "file": "python/triton/runtime/jit.py:L230", "responsibility": "包一个 inspect.Parameter + 特化开关；惰性算 is_constexpr/is_const/annotation_type，决定该参数进不进签名/特化、还是当 constexpr 具体值。"},
+    {"name": "KernelInterface", "file": "python/triton/runtime/jit.py:L321", "responsibility": "JITFunction 的父类；__getitem__ 提供 fn[grid](args) 记 grid 的语法糖。"},
+    {"name": "DependenciesFinder", "file": "python/triton/runtime/jit.py:L24", "responsibility": "ast.NodeVisitor：算 kernel 源码哈希（融合被调 JITFunction 哈希），并登记 kernel 用到的『可疑』全局变量及其编译时值，供 run() 核对。"},
+    {"name": "AttrsDescriptor", "file": "python/triton/backends/compiler.py:L26", "responsibility": "后端侧特化描述符；get_property_key(val,align) 给出 D/1/N（与 jit.py 的 compute_spec_key 逻辑一致），是 backend.compute_spec_key 的默认实现。本章只作接缝点名，属 ch11/后端章。"}
+  ],
+  "data_flow": [
+    "装饰期：@triton.jit(fn) → jit.decorator(fn) → JITFunction(fn)（TRITON_INTERPRET=1 时 InterpretedFunction，回指专章）",
+    "装饰期：JITFunction.__init__ — inspect.signature(fn) 逐参数建 KernelParam；textwrap.dedent+正则切掉装饰器只留 def 起的 src；cache=defaultdict(dict)；constexprs=[constexpr 参数的 num]",
+    "装饰期（惰性，首次 cache_key 访问）：DependenciesFinder.visit(parse()) → self.hash = sha256(src+依赖) + starting_line_number；填 used_global_vals",
+    "发射期第一步：fn[grid] → KernelInterface.__getitem__ 返回记住 grid 的 lambda；再 (args) → JITFunction.run(grid=grid, warmup=False, *args)",
+    "发射期（首次）：run 见 self.binder is None → create_binder(backend) → create_function_from_signature exec 生成 dynamic_func 当 binder",
+    "发射期：binder(*args) → (bound_args, sig_and_spec, constexpr_vals, non_constexpr_vals, excess_kwargs)；sig_and_spec 内联调 mangle_type/annotation_type（签名）+ compute_spec_key（D/1/N 特化）",
+    "发射期：key = ''.join(sig_and_spec) + str((constexpr_vals, excess_kwargs)) → self.cache[device].get(key)（命中/未命中后续编译发射见 ch11）",
+    "发射期尾：逐个核对 used_global_vals 现值未变，否则 RuntimeError"
+  ],
+  "design_decisions": [
+    {"decision": "用 exec 动态生成 binder（dynamic_func），而非每次 launch 走通用 sig.bind+apply_defaults", "why": "sig.bind/apply_defaults + 逐参数算签名与特化是 launch 开销的大头；针对某个 kernel 的固定签名，把这套逻辑一次性内联成一个原生函数、按 kernel 记忆化，摊薄每次发射成本", "evidence": "python/triton/runtime/jit.py:L346-L351 docstring + L556 self.binder=create_function_from_signature(...)"},
+    {"decision": "缓存键分两级、职责正交：源码哈希 cache_key(property) vs 发射特化键 key(run 内)", "why": "cache_key 回答『源码/依赖/可疑全局量变了没』（改源码就重编），key 回答『这次实参的 dtype/对齐/constexpr 值组合见过没』（换特化就重编）；分开才能既在改代码时失效、又在同代码不同特化间各存一份", "evidence": "python/triton/runtime/jit.py:L717-L725（源码哈希）对比 L583（发射键）"},
+    {"decision": "constexpr 参数不进签名/特化项，而是把『具体值』整体拼进发射键", "why": "constexpr 值追踪期就折进 IR，不同值编出的 kernel 结构不同 → 必须每个值各存一份缓存；但它不是 dtype 也不需 D/1/N 特化，故单列 constexpr_vals", "evidence": "python/triton/runtime/jit.py:L370-L371（binder 把 constexpr 归到 constexpr_vals）+ L583（key 拼 constexpr_vals）"},
+    {"decision": "16 字节对齐特化压成三值 D/1/N", "why": "编译器只需知道『能否假设 16 对齐（开向量化/合并访存）』『是否恰为 1（可当标量常量折掉）』『都不是』三种情况，无需记录具体地址/值——把无穷值域压到 3 个特化桶，抑制缓存键爆炸", "evidence": "python/triton/runtime/jit.py:L278-L288"},
+    {"decision": "compute_spec_key/mangle_type 经 backend.compute_spec_key 暴露为可覆写接缝", "why": "不同后端（nvidia/amd/ascend）可能有不同对齐/特化规则；binder 里绑的是 backend.compute_spec_key，默认委托 AttrsDescriptor.get_property_key", "evidence": "python/triton/runtime/jit.py:L404 func_namespace['compute_spec_key']=backend.compute_spec_key；backends/compiler.py:L206-L211/L303-L304"},
+    {"decision": "run() 每次发射前核对 used_global_vals 未变，变了抛错而非静默复用", "why": "kernel 体里读的全局量（如 flag）编译时被固化进 IR；若之后改了全局量，旧缓存产物已不反映新值——宁可显式报错让用户察觉，也不给静默的错误结果", "evidence": "python/triton/runtime/jit.py:L631-L636 + L108-L125 DependenciesFinder 登记『可疑』全局量的判据"},
+    {"decision": "src 一被赋值就把 self.hash 置 None", "why": "单元测试/用户可 monkey-patch self.src；src 变了源码哈希必须重算，否则缓存键指向旧代码", "evidence": "python/triton/runtime/jit.py:L768-L773 __setattr__"}
+  ],
+  "theory": [
+    "缓存键组合爆炸的量化直觉：发射键 = 签名(每个非 constexpr 参数的 dtype 短码) × 特化位(每个可特化参数 ∈ {D,1,N}) × constexpr 值(逐个具体值) × 未知 kwargs。特化位对 k 个可特化参数最多 3^k 个组合；constexpr 若传连续变化的值则组合无上界 → 各编一份 → 首次迭代编译风暴。这是本章性能杠杆的定量落点。",
+    "16 字节对齐为何值得单独特化：现代 GPU 访存以 16/32/128 字节事务为单位（回指 ch02 合并访存事务数公式）；编译器知道指针 16 对齐才能安全发向量化 load/store，故 divisibility 必须进特化键。",
+    "D/1/N 把无穷整数/地址值域压到 3 桶：这是『特化换缓存条目数』的权衡——特化越细编出的核越优但缓存条目越多、命中率越低；Triton 选了 3 值这个折中。"
+  ],
+  "subtraction_plan": {
+    "delete": [],
+    "must_keep": [
+      {"symbol": "JITFunction", "why": "本章主角，@triton.jit 的产物类"},
+      {"symbol": "jit", "why": "装饰器入口，读者从这里进入 runtime 侧"},
+      {"symbol": "KernelParam", "why": "参数元数据，决定进签名/特化/constexpr"},
+      {"symbol": "is_constexpr", "why": "读者需理解 constexpr 参数为何单列进缓存键"},
+      {"symbol": "is_const", "why": "const 注解影响 mangle 出 '*k'，签名成分"},
+      {"symbol": "annotation_type", "why": "有注解时走静态签名、绕过运行时 mangle 探测"},
+      {"symbol": "KernelInterface", "why": "fn[grid] 语法糖的宿主类"},
+      {"symbol": "__getitem__", "why": "fn[grid](args) 两步发射的第一步，记住 grid"},
+      {"symbol": "create_binder", "why": "惰性绑定入口，run() 首次触发"},
+      {"symbol": "create_function_from_signature", "why": "launch 热路径核心：exec 动态生成 binder 摊薄开销"},
+      {"symbol": "compute_spec_key", "why": "16 对齐特化 D/1/N，缓存键特化位来源"},
+      {"symbol": "mangle_type", "why": "dtype/标量编码，缓存键签名成分"},
+      {"symbol": "type_canonicalisation_dict", "why": "dtype 名归一到短码，mangle 依赖它"},
+      {"symbol": "cache_key", "why": "源码哈希，区别于发射特化键；改源码为何失效的答案"},
+      {"symbol": "DependenciesFinder", "why": "源码哈希+全局量登记的执行者"},
+      {"symbol": "used_global_vals", "why": "run() 尾部核对全局值、改全局量为何报错的载体"},
+      {"symbol": "cache", "why": "按 device 分桶的两层缓存字典，键在 run() 里拼"},
+      {"symbol": "binder", "why": "create_binder 产出的动态函数，run() 每次调它拿签名/特化/constexpr"},
+      {"symbol": "constexprs", "why": "constexpr 参数的 num 列表，_make_constants 与索引依赖它"},
+      {"symbol": "run", "why": "发射热路径入口；本章只讲其拼键+查表+核对全局值三段（全流程 ch11）"}
+    ]
+  },
+  "mechanisms": [
+    {"id": "jit-decorator-wraps", "name": "@triton.jit 把函数包成 JITFunction", "kind": "dataflow", "source_anchors": ["python/triton/runtime/jit.py:L803-L855"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "jitfunction-init", "name": "JITFunction.__init__：signature→KernelParam、切装饰器留 src、按 device 分桶 cache", "kind": "dataflow", "source_anchors": ["python/triton/runtime/jit.py:L657-L716"], "needs_figure": false, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "kernelparam-annotations", "name": "KernelParam 从注解识别 constexpr/const/annotation_type", "kind": "config", "source_anchors": ["python/triton/runtime/jit.py:L230-L275"], "needs_figure": false, "needs_worked_example": true, "difficulty": "supporting"},
+    {"id": "getitem-grid-sugar", "name": "fn[grid](args) 两步发射语法糖", "kind": "protocol", "source_anchors": ["python/triton/runtime/jit.py:L321-L331"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "binder-codegen", "name": "create_function_from_signature：exec 动态生成 binder 摊薄 launch 开销", "kind": "algorithm", "source_anchors": ["python/triton/runtime/jit.py:L345-L410", "python/triton/runtime/jit.py:L547-L562"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "spec-key-alignment", "name": "compute_spec_key：16 字节对齐特化 D/1/N", "kind": "algorithm", "source_anchors": ["python/triton/runtime/jit.py:L278-L288", "python/triton/backends/compiler.py:L206-L211"], "needs_figure": false, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "mangle-dtype", "name": "mangle_type + type_canonicalisation_dict：dtype/标量编码", "kind": "algorithm", "source_anchors": ["python/triton/runtime/jit.py:L294-L318", "python/triton/runtime/jit.py:L413-L439"], "needs_figure": false, "needs_worked_example": true, "difficulty": "supporting"},
+    {"id": "launch-cache-key", "name": "发射缓存键 = 签名+特化位+constexpr 值：同源码不同特化各编一份（性能落点）", "kind": "dataflow", "source_anchors": ["python/triton/runtime/jit.py:L577-L584"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "source-hash-cachekey", "name": "cache_key 属性：DependenciesFinder 算源码哈希（含被调 JITFunction），改源码即失效", "kind": "algorithm", "source_anchors": ["python/triton/runtime/jit.py:L717-L725", "python/triton/runtime/jit.py:L24-L143", "python/triton/runtime/jit.py:L768-L773"], "needs_figure": false, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "global-vals-recheck", "name": "run() 尾部核对 used_global_vals 未变，否则 RuntimeError", "kind": "protocol", "source_anchors": ["python/triton/runtime/jit.py:L631-L636", "python/triton/runtime/jit.py:L108-L125"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"}
+  ],
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recycle": [],
+    "note": "bible.py due ch10 返回空（无应埋/应回收登记项）。相关既有概念在前章已建：'JITFunction'/'constexpr 编译期常量'/'函数名 mangle 编入 constexpr'→ch01；'缓存键=签名+特化位+constexpr(每次都在编译的病根)'→ch03；'constexpr 全 dunder 转发类'→ch04。ch10 用 runtime 真源码把 ch03 点破的『缓存键病根』坐实到 create_function_from_signature/compute_spec_key/发射键三处；run() 的完整 launch 编译→发射链接续 ch11。回指一律『见第 N 章』，不印内部 ID。"
+  }
+}

@@ -1,0 +1,242 @@
+{
+  "chapter_id": "ch10",
+  "slug": "ch10-jitfunction-and-cache-keys",
+  "running_example": "add_kernel(x_ptr, y_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr) —— Triton 经典向量加。5 个参数里 4 个非 constexpr（3 指针 + n_elements）、1 个 constexpr（BLOCK_SIZE）。全章用它一贯到底：装饰期解析成 params，发射期算缓存键。",
+  "trace_note": "本章 mode=skip_impl（无 subtract-only 精简版），但所涉 runtime 函数（compute_spec_key/mangle_type/create_function_from_signature/KernelParam/sha256 源码哈希）均为纯 Python，可脱离 GPU 运行。故未降级 manual：把 pin v3.2.0 源码 python/triton/runtime/jit.py 里这些函数逐字复制进驱动脚本（每处标 # SOURCE: jit.py:Lxxx）真跑取真值；torch 仅用于造真实张量取 data_ptr()%16 的真对齐值。驱动 = traces/run_cachekey.py、traces/run_srchash.py；原始输出 = traces/cachekey.json、traces/srchash.json。所有逐轮表数字均可在对应 trace 文件溯源。",
+  "mechanisms": [
+    {
+      "mechanism_id": "jitfunction-init",
+      "intuition": "装饰期像新员工报到登记，不是上岗干活：@triton.jit 拿到你的函数，照签名点名给每个参数发一张身份卡（KernelParam），撕掉最上面的 @triton.jit 装饰器行只留函数正文，再开一个按设备分格的空档案柜（cache），就把它放走了——一行 kernel 都还没编译。真正的编译推迟到首次发射且缓存未命中时（见后续 launch 章）。",
+      "worked_example": {
+        "params": {"kernel": "add_kernel", "num_params": 5, "constexpr": ["BLOCK_SIZE"]},
+        "trace_source": "run",
+        "trace_ref": "traces/cachekey.json",
+        "manual_reason": "",
+        "table": {
+          "columns": ["下标", "参数名", "注解", "is_constexpr", "在 cache_key 里的角色"],
+          "rows": [
+            [0, "x_ptr", "(无)", "否", "签名项 + 特化位"],
+            [1, "y_ptr", "(无)", "否", "签名项 + 特化位"],
+            [2, "output_ptr", "(无)", "否", "签名项 + 特化位"],
+            [3, "n_elements", "(无)", "否", "签名项 + 特化位"],
+            [4, "BLOCK_SIZE", "tl.constexpr", "是", "constexpr 具体值（单列，不进签名/特化）"]
+          ]
+        },
+        "post_state": "__init__ 后：arg_names=['x_ptr','y_ptr','output_ptr','n_elements','BLOCK_SIZE']；constexprs=[4]（只 BLOCK_SIZE 的 num）；self.src 从 'def add_kernel(' 起（装饰器行已被正则 re.search(r'^def\\s+\\w+\\s*\\(') 切掉，jit.py:L681-L682）；cache=defaultdict(dict) 空。均见 traces/cachekey.json jitfunction_init 段。"
+      },
+      "invariant": {
+        "claim": "装饰期是纯登记、零编译——产出的 JITFunction 持有 signature/params/去装饰器 src/空 cache，但一行 IR 都未生成。",
+        "argument": "__init__ 只做 inspect.signature 解析（jit.py:L664）、逐参数建 KernelParam（L675-L678）、正则切 src（L681-L682）、defaultdict(dict) 建空桶（L684）；编译入口在 run() 缓存未命中分支（下一章），__init__ 从不触发。故 import 一个满是 @triton.jit 的模块无任何 GPU 编译开销。"
+      },
+      "quantified": "装饰成本 = O(参数数) 次 inspect + 1 次正则，本例 5 个参数；编译成本 = 0（推迟）。一个含 100 个 @triton.jit kernel 的库，import 期总装饰开销约 100 × O(少量参数)，无一次 GPU 编译。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "kernelparam-annotations",
+      "intuition": "每个参数进门先看它戴的『注解牌子』决定走哪条通道：牌子写 constexpr 的走『编进代码』通道（值单列，追踪期折进 IR）；写 int32/bool 的走『静态签名』快速通道（编译期就知道 dtype，免运行时探测）；没戴牌子的暂不定，留到发射时当场验货（mangle_type 探测实参）。",
+      "worked_example": {
+        "params": {"note": "对若干归一化后的注解字符串跑 KernelParam 的 is_constexpr/is_const/annotation_type"},
+        "trace_source": "run",
+        "trace_ref": "traces/cachekey.json",
+        "manual_reason": "",
+        "table": {
+          "columns": ["注解", "is_constexpr", "is_const", "annotation_type", "归宿"],
+          "rows": [
+            ["constexpr", "是", "否", "(空)", "constexpr 具体值，不进签名/特化"],
+            ["int32", "否", "否", "i32", "静态签名，绕过运行时 mangle"],
+            ["uint32", "否", "否", "u32", "静态签名"],
+            ["const int32", "否", "是", "i32", "静态签名；mangle 时前缀 '*k'"],
+            ["bool", "否", "否", "u1", "静态签名"],
+            ["fp16", "否", "否", "(空)", "annotation_type 空 → 发射时运行时 mangle"],
+            ["(无注解)", "否", "否", "(空)", "运行时 mangle 探测实参"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "is_constexpr/is_const/annotation_type 三者由注解字符串唯一确定，且互斥优先：含 'constexpr' → constexpr（is_const 恒否）；否则含 'const' → const；annotation_type 只从 int/uint/bool 模式解析，无匹配即空。",
+        "argument": "is_constexpr = ('constexpr' in annotation)（jit.py:L261-262）；is_const = ('const' in annotation) and not is_constexpr（L265-266）——故 'const int32' 判 const，'constexpr' 因先被 is_constexpr 吃掉而 is_const=否。annotation_type 遍历 [('uint','u'),('int','i')] 找宽度、或 bool→'u1'、否则 ''（L252-259）；'fp16' 不含 int/uint/bool → 空 → 落运行时 mangle。全部 trace 见 cachekey.json kernelparam_annotations 段。"
+      },
+      "quantified": "带注解参数省掉运行时 mangle 探测：本例若给 n_elements 标 tl.int32，则 binder 里签名项从 mangle_type(n_elements, False)（运行时判 isinstance + 范围）变成字面 \"i32\"，每次发射少一次类型分派。7 个测试注解里 4 个产出非空 annotation_type（i32/u32/i32/u1），即走静态签名。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "binder-codegen",
+      "intuition": "与其每次发射都翻规则手册逐参数查『这个要不要特化、那个 dtype 是啥、有没有默认值』，不如第一次就把这本手册针对这一个 kernel 抄成一张『填空即出结果』的便签——create_function_from_signature 用 exec 把便签（dynamic_func）生成出来，以后每次发射照便签一填就吐出缓存键原料。这张便签就是 launch 快路径，是 kernel 发射开销大头被摊薄的地方。",
+      "worked_example": {
+        "params": {"kernel": "add_kernel", "backend.compute_spec_key": "默认委托 AttrsDescriptor.get_property_key，D/1/N 逻辑与 compute_spec_key 逐字相同"},
+        "trace_source": "run",
+        "trace_ref": "traces/cachekey.json",
+        "manual_reason": "",
+        "table": {
+          "columns": ["dynamic_func 返回槽位", "内容", "add_kernel 实际展开"],
+          "rows": [
+            ["1  bound_args", "参数名 → 实参 dict", "{'x_ptr': x_ptr, ..., 'BLOCK_SIZE': BLOCK_SIZE}（5 项）"],
+            ["2  sig_and_spec", "4 个 dtype 签名项 + 4 个 D/1/N 特化项", "(mangle_type(x_ptr,False),…, compute_spec_key(x_ptr,align=True),…)"],
+            ["3  constexpr_vals", "constexpr 参数的具体值", "(BLOCK_SIZE,)"],
+            ["4  non_constexpr_vals", "非 constexpr 实参", "(x_ptr, y_ptr, output_ptr, n_elements)"],
+            ["5  excess_kwargs", "未在签名内的多余 kwargs", "{}"]
+          ]
+        },
+        "generated_source": "def dynamic_func(x_ptr, y_ptr, output_ptr, n_elements, BLOCK_SIZE, **excess_kwargs):\n    return {'x_ptr': x_ptr, 'y_ptr': y_ptr, 'output_ptr': output_ptr, 'n_elements': n_elements, 'BLOCK_SIZE': BLOCK_SIZE}, (mangle_type(x_ptr, False), mangle_type(y_ptr, False), mangle_type(output_ptr, False), mangle_type(n_elements, False), compute_spec_key(x_ptr, align=True), compute_spec_key(y_ptr, align=True), compute_spec_key(output_ptr, align=True), compute_spec_key(n_elements, align=True), ), (BLOCK_SIZE, ), (x_ptr, y_ptr, output_ptr, n_elements, ), excess_kwargs  # 见 traces/cachekey.json binder_codegen.func_body（真跑生成）"
+      },
+      "invariant": {
+        "claim": "dynamic_func 与逐次 sig.bind + apply_defaults 语义等价，但把逐参数分派固化成一条直线代码 → 每次发射 O(1) 无解释开销。",
+        "argument": "exec 一次生成的函数体是对该 kernel 固定签名的完全展开：参数名、默认值（default_<name> 注入 namespace）、每个非 constexpr 参数的 mangle_type/compute_spec_key 调用全部字面内联（jit.py:L363-L394），无循环无查表；binder 存进 self.binder，create_binder 仅在 run() 首次（self.binder is None）触发一次（L577-L578）→ N 次发射摊销到 1 次生成。docstring 明言这套逻辑 'constitute much of the kernel launch overhead'（L349-L350）。",
+        "note": "本例 constexpr（BLOCK_SIZE）被归入槽 3，不出现在 sig_and_spec，印证『constexpr 值单列』。"
+      },
+      "quantified": "通用 sig.bind + apply_defaults 每次发射约 O(P) Python 层解析（P=参数数，本例 5）；记忆化 binder 后降到一次原生函数调用。签名项数 = 特化项数 = 非 constexpr 参数数 = 4；返回元组 5 槽。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-binder-codegen",
+          "template": "flow",
+          "claim": "create_function_from_signature 把 add_kernel 的固定签名一次性 exec 成一个 dynamic_func(binder)，此后每次发射只调它一次即得缓存键原料五元组，免走通用 sig.bind 慢路径。",
+          "numbers": [
+            {"label": "参数数", "value": "5", "provenance": "traces/cachekey.json jitfunction_init.num_params"},
+            {"label": "dtype 签名项", "value": "4", "provenance": "traces/cachekey.json binder_codegen.num_signature_entries"},
+            {"label": "D/1/N 特化项", "value": "4", "provenance": "traces/cachekey.json binder_codegen.num_spec_entries"},
+            {"label": "返回元组槽位", "value": "5", "provenance": "traces/cachekey.json binder_codegen.num_tuple_slots"}
+          ],
+          "caption_draft": "装饰期只解析签名；首次发射惰性 exec 出 binder。binder 是这条 add_kernel 专属的直线代码——把 4 个 mangle_type + 4 个 compute_spec_key 调用字面内联，一步吐出 (bound_args, 签名+特化位, constexpr 值, 非 constexpr 值, excess_kwargs) 五元组。这条快路径正是 launch 开销大头被摊薄之处；第 2 槽 sig_and_spec 就是下一步拼缓存键的原料。",
+          "layout_hint": "左：add_kernel signature（5 参数，标出 BLOCK_SIZE=constexpr）→ 中：create_function_from_signature（exec，标『按 kernel 记忆化，仅首次』）→ 右：dynamic_func 返回的 5 元组盒子，高亮第 2 槽 sig_and_spec 引出到 fig-launch-cache-key。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "spec-key-alignment",
+      "intuition": "编译器对一个指针/整数只关心三件事：它是不是 16 的整倍数（是 → 可以放心发向量化、合并访存的搬运指令）、是不是恰好等于 1（是 → 可以把这一维当常量 1 抹掉）、都不是（只能保守）。所以 compute_spec_key 把千变万化的具体地址和数值压成三张标签 D/1/N 贴上——特化位只记『属于哪一桶』，不记具体值。",
+      "worked_example": {
+        "params": {"note": "align=True；张量用真实 torch.empty 取 data_ptr()%16，整数直接判"},
+        "trace_source": "run",
+        "trace_ref": "traces/cachekey.json",
+        "manual_reason": "",
+        "table": {
+          "columns": ["输入", "判据", "特化码", "编译器可假设"],
+          "rows": [
+            ["张量 base（data_ptr%16=0）", "align 且 data_ptr()%16==0", "D", "16 对齐 → 可向量化/合并访存"],
+            ["张量 base[1:]（data_ptr%16=4）", "data_ptr()%16 ≠ 0", "N", "无对齐假设"],
+            ["int 1024", "1024 % 16 == 0", "D", "可当 16 的倍数"],
+            ["int 16", "16 % 16 == 0", "D", "同上"],
+            ["int 1", "非对齐但 v == 1", "1", "可折成标量常量 1"],
+            ["int 7", "非对齐且 ≠ 1", "N", "无假设"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "compute_spec_key 是全序值域到 {D, 1, N} 三桶的确定性投影，同一实参恒得同码，且分支互斥穷尽。",
+        "argument": "分支顺序（jit.py:L280-L288）：对齐指针或对齐 int → D；否则 int 且 v==1 → '1'；其余 → 'N'。无副作用，故特化位仅由『是否 16 对齐』与『是否为 1』两个布尔量决定，把无穷值域压到 3 个桶——这是『特化粒度 ↔ 缓存条目数』的折中：桶越细编出的核越优但缓存条目越多、命中率越低，Triton 取 3 值。真值见 cachekey.json spec_key_alignment 段（base %16=0→D，base[1:] %16=4→N）。"
+      },
+      "quantified": "值域 → 3 桶。k 个可特化参数最多 3^k 个特化组合；本例 k=4 → 上限 3^4 = 81。实测 3 次不同发射（见 launch-cache-key）落 3 个键，尚远未穷尽 81 桶。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "mangle-dtype",
+      "intuition": "给每个运行时实参盖一个『类型邮戳』：指针盖 *fp32、标量按大小盖 i32/i64/fp32、bool 盖 i1。两次发射要复用同一份已编译 kernel，前提之一是所有实参的邮戳都一样——邮戳不同就寄到不同的缓存格子。",
+      "worked_example": {
+        "params": {"note": "mangle_type(arg, is_const)；张量用真实 torch.empty"},
+        "trace_source": "run",
+        "trace_ref": "traces/cachekey.json",
+        "manual_reason": "",
+        "table": {
+          "columns": ["实参", "类型判定", "mangle 码"],
+          "rows": [
+            ["None", "arg is None", "none"],
+            ["True (bool)", "isinstance bool（先于 int 判）", "i1"],
+            ["1024 (int, 32 位范围内)", "int 且落在 32 位有符号范围", "i32"],
+            ["2^40 (int)", "int 超 32 位", "i64"],
+            ["3.14 (float)", "float", "fp32"],
+            ["float32 张量", "有 .dtype", "*fp32"],
+            ["int8 张量（const）", "有 .dtype 且 is_const", "*ki8"],
+            ["bf16 张量", "有 .dtype", "*bf16"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "mangle_type 对每个运行时实参给出唯一 dtype 短码，张量映射经 dtype2str 记忆化后幂等。",
+        "argument": "类型链互斥且有序（jit.py:L296-L318）：None/bool/int/float/有 tma_desc/有 dtype；bool 判在 int 前（bool 是 int 子类）；int 按范围三分 i32/i64/u64。张量码 = ('*k' if is_const else '*') + type_canonicalisation_dict[规范化 dtype 名]，首次算完存 dtype2str[(dtype,is_const)]，第二次起 O(1) 命中。is_const 决定前缀 '*k' vs '*'（对照 int8 张量 const → '*ki8'）。真值见 cachekey.json mangle_type 段。"
+      },
+      "quantified": "dtype 码空间有限（type_canonicalisation_dict 约 20+ 条目，jit.py:L413-L436）；张量映射经 dtype2str 记忆化，同 (dtype, is_const) 第二次起 O(1)。int 三分点：2^31-1、2^63/2^64-1。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "launch-cache-key",
+      "intuition": "缓存键像 kernel 的『户口本条目号』：同一份源码，喂进的实参一旦让 dtype、指针对齐、constexpr 值任何一维变了，就落到不同的号，各自占一格缓存、各编一份；号相同才复用。想避免意外的编译风暴，就要认清『什么进了这个号』——尤其别给 constexpr 喂连续变化的值。",
+      "worked_example": {
+        "params": {"kernel": "add_kernel", "x/y/output": "float32 张量（16 对齐→D）", "device_cache": "self.cache[device] 两层字典"},
+        "trace_source": "run",
+        "trace_ref": "traces/cachekey.json",
+        "manual_reason": "",
+        "table": {
+          "columns": ["发射", "n_elements", "n 对齐位", "BLOCK_SIZE(constexpr)", "缓存键", "缓存动作"],
+          "rows": [
+            ["L1", 1024, "D (1024%16=0)", 1024, "*fp32*fp32*fp32i32DDDD((1024,), {})", "未命中 → 编译第 1 份"],
+            ["L2", 1024, "D", 512, "*fp32*fp32*fp32i32DDDD((512,), {})", "constexpr 值变 → 未命中 → 编第 2 份"],
+            ["L3", 1000, "N (1000%16=8)", 1024, "*fp32*fp32*fp32i32DDDN((1024,), {})", "对齐位 D→N → 未命中 → 编第 3 份"],
+            ["L4", 1024, "D", 1024, "*fp32*fp32*fp32i32DDDD((1024,), {})", "与 L1 同键 → 命中 → 不编"]
+          ]
+        },
+        "post_state": "4 次发射产 3 个不同缓存键（cachekey.json launch_cache_key.num_distinct_keys=3），L4 与 L1 键相等（L1_eq_L4=true）故复用。key = ''.join(sig_and_spec) + str((constexpr_vals, excess_kwargs))（jit.py:L583）。"
+      },
+      "invariant": {
+        "claim": "缓存键把发射参数的特化投影单射到缓存槽：两次发射命中同一编译产物 ⟺ 其 (签名, 特化位, constexpr 值, excess_kwargs) 逐分量相等。",
+        "argument": "key 由这些分量确定性拼接（''.join(sig_and_spec) + str((constexpr_vals, excess_kwargs))，纯函数无随机）；分量全等 → 字符串全等 → dict 命中同键（L4=L1）；任一分量不同 → 字符串不同 → 落新键各编一份（L1/L2 差在 constexpr 值 (1024,)↔(512,)，L1/L3 差在末位特化 D↔N，两两不同）。故『同源码不同特化 → 不同键 → 各编一份』得证。"
+      },
+      "quantified": "发射键组合空间 = 签名 × 特化位(每个可特化参数 ∈ {D,1,N}) × constexpr 值 × excess_kwargs。k 个可特化参数 → 特化位上限 3^k，本例 k=4 → 3^4=81；再乘 constexpr 值域：BLOCK_SIZE 若取 {128,256,512,1024} 四值 → 81×4=324 个潜在缓存条目。若 constexpr 喂连续变化的值（如逐 batch 变的 seqlen）→ 组合无上界 → 各编一份 → 首次迭代编译风暴。本例 4 发射 → 3 键 → 3 份产物 + 1 次命中复用。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-launch-cache-key",
+          "template": "state-table",
+          "claim": "同一份 add_kernel 源码，4 次发射因 constexpr 值 / 指针对齐不同算出 3 个不同缓存键 → 各编一份；唯有与首次逐参全同的第 4 次命中复用。",
+          "numbers": [
+            {"label": "发射次数", "value": "4", "provenance": "traces/cachekey.json launch_cache_key.num_launches"},
+            {"label": "不同缓存键数", "value": "3", "provenance": "traces/cachekey.json launch_cache_key.num_distinct_keys"},
+            {"label": "L1 键", "value": "*fp32*fp32*fp32i32DDDD((1024,), {})", "provenance": "traces/cachekey.json launch_cache_key.launches[0].key"},
+            {"label": "L2 键（BLOCK 512）", "value": "*fp32*fp32*fp32i32DDDD((512,), {})", "provenance": "traces/cachekey.json launch_cache_key.launches[1].key"},
+            {"label": "L3 键（n=1000 → N）", "value": "*fp32*fp32*fp32i32DDDN((1024,), {})", "provenance": "traces/cachekey.json launch_cache_key.launches[2].key"}
+          ],
+          "caption_draft": "读表看键怎么随特化变：L1→L2 只把 constexpr BLOCK_SIZE 从 1024 改到 512，键尾 (1024,)→(512,) 就另编一份；L1→L3 只把 n_elements 从 1024 改到 1000（不再 16 对齐），末位特化 D→N 也另编一份；L4 与 L1 逐参全同 → 键相同 → 命中不编。结论：凡进键的维度（dtype / 对齐 / constexpr 值）任一变化都触发重编译——constexpr 若喂连续变化的值，键无上界，首次迭代即编译风暴。",
+          "layout_hint": "四行状态表，列 = 发射 / n_elements / 对齐位 / BLOCK_SIZE / 缓存键 / 动作；用色块标 L4=L1（绿=命中）、L2/L3（红=重编），键串里高亮变化的片段（(512,) 与末位 N）。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "source-hash-cachekey",
+      "intuition": "cache_key 属性像给 kernel 源码拍的指纹照（区别于发射期那个特化缓存键）：改一行代码，指纹全变，旧的编译产物立刻作废重编；一个字没动，指纹分毫不差，直接复用。它回答的问题是『源码/依赖变了没』，而不是『这次实参啥特化』。",
+      "worked_example": {
+        "params": {"kernel": "add_kernel", "note": "无被调 JITFunction、无可疑全局量 → DependenciesFinder.ret == sha256(src).hexdigest()"},
+        "trace_source": "run",
+        "trace_ref": "traces/srchash.json",
+        "manual_reason": "",
+        "table": {
+          "columns": ["源码版本", "改动", "sha256 前 12 位", "cache_key 前 12 位", "缓存动作"],
+          "rows": [
+            ["v1: ... tl.store(..., x + y, ...)", "—（基线）", "58214bcd37f4", "58214bcd37f4", "首编 → 存档"],
+            ["v2: ... tl.store(..., x * y, ...)", "一处 x+y 改 x*y", "2b785191f0ad", "2b785191f0ad", "哈希变 → 旧缓存失效 → 重编"],
+            ["v1 再算一次", "无（幂等）", "58214bcd37f4", "58214bcd37f4", "同哈希 → 命中复用"]
+          ]
+        },
+        "post_state": "cache_key = DependenciesFinder.ret + str(starting_line_number)（jit.py:L723）；本例 starting_line_number=12（假设值），因其拼在 64 位 hex 末尾，前 12 位等于 sha256 前 12 位。__setattr__ 里 self.src 一被赋值即 self.hash=None（L768-L773），强制下次 cache_key 重算。真值见 srchash.json。"
+      },
+      "invariant": {
+        "claim": "源码字节流是缓存键的确定性指纹：src 不变则 cache_key 恒等（幂等命中），src 改任一字节则 sha256 雪崩 → cache_key 变（旧产物全失效重编）。",
+        "argument": "hasher = hashlib.sha256(src.encode)（jit.py:L38），纯函数：同 src → 同 hexdigest（v1 两次算相等，v1_recompute_stable=true）；改一处 x+y→x*y 使输入字节不同 → sha256 抗碰撞 → 摘要不同（58214… ≠ 2b785…，hashes_differ=true）。此外 DependenciesFinder 遇被调 JITFunction 会把对方 cache_key 也 update 进哈希（_update_hash，L82-L98），故嵌套 kernel 改动会连累外层哈希——依赖闭包一并覆盖。__setattr__ 的 src→hash=None 保证不用陈旧指纹。"
+      },
+      "quantified": "sha256 覆盖 src 全字节 + 融合所有被调 JITFunction 的哈希 + starting_line_number；改 1 字节 → 摘要以约 1 − 2^-256 的概率全变。本例改 'x+y'→'x*y' 使前缀 58214bcd37f4 → 2b785191f0ad，cache_key 全域失效。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "jit-decorator-wraps",
+      "supporting_note": "@triton.jit(fn) → jit.decorator(fn) → JITFunction(fn)；裸用 @triton.jit（fn 非 None）与带参 @triton.jit(...)（fn=None，返回 decorator）两种写法都收敛到 decorator(fn)（jit.py:L851/L854）。若 TRITON_INTERPRET=1 则返回 InterpretedFunction（CPU 替身，无 GPU，回指专章）。本机制为 dataflow supporting，无需 worked example/figure；写作时点出『两种装饰写法同归 JITFunction』即可。",
+      "intuition": "@triton.jit 是个『登记窗口』：不管你写 @triton.jit 还是 @triton.jit(debug=True)，最后都把裸函数换成一个 JITFunction 对象交还给你——从此这个名字不再是普通函数（直接 fn() 调用会抛错，L765-766），只能用 fn[grid](args) 发射。"
+    },
+    {
+      "mechanism_id": "getitem-grid-sugar",
+      "supporting_note": "fn[grid](args) 是两步语法糖（jit.py:L324-L330）：fn[grid] 触发 KernelInterface.__getitem__ 返回一个记住 grid 的 lambda，再 (args) 调用它 → self.run(grid=grid, warmup=False, *args)。本机制 protocol supporting，无需 worked example/figure。",
+      "intuition": "fn[grid](args) 读作两步：方括号先把『发射网格 grid』记在一张便利贴上（返回一个记住 grid 的小函数），圆括号再拿着实参真正发射。方括号本身不启动 kernel，只是记住『要开多少个 program』。"
+    },
+    {
+      "mechanism_id": "global-vals-recheck",
+      "supporting_note": "run() 每次发射前（缓存命中也走）逐个核对 used_global_vals：kernel 首次编译时登记的『可疑全局量』现值若不等于当时值，抛 RuntimeError 而非静默复用旧产物（jit.py:L631-L636）。used_global_vals 由 cache_key 属性触发 DependenciesFinder 填充（登记判据：非模块/非函数/非 builtin 的可变全局量，L108-L125）。本机制 protocol supporting，无需 worked example/figure。",
+      "intuition": "kernel 体里读的全局量（如一个 flag）在编译时被固化进 IR。若之后你改了这个全局量再发射，旧缓存产物已不反映新值——Triton 宁可当场抛 RuntimeError『Global variable X has changed since we compiled』让你察觉，也不给你一个静默用旧代码算出的错误结果。"
+    }
+  ]
+}

@@ -5,6 +5,8 @@
 ## Recent Activity
 
 | Date | Type | Chapter | Summary | File |
+| 2026-07-16 | delivery | 09 | ch09-self-hosted-libraries-delivered-(skip_impl) | [2026-07-16_ch09-ch09-self-hosted-libraries-delivered-(skip_impl).md](deliveries/2026-07-16_ch09-ch09-self-hosted-libraries-delivered-(skip_impl).md) |
+| 2026-07-17 | delivery | 10 | ch10-jitfunction-and-cache-keys-delivered-(skip_impl) | [2026-07-17_ch10-ch10-jitfunction-and-cache-keys-delivered-(skip_impl).md](deliveries/2026-07-17_ch10-ch10-jitfunction-and-cache-keys-delivered-(skip_impl).md) |
 | 2026-07-16 | delivery | 08 | ch08-dot-reduce-scan-delivered-(deep) | [2026-07-16_ch08-ch08-dot-reduce-scan-delivered-(deep).md](deliveries/2026-07-16_ch08-ch08-dot-reduce-scan-delivered-(deep).md) |
 | 2026-07-16 | decision | 07 | 候选经验:write-review 回环够不到图,figure-only blocking 项必致 review-exhausted | [2026-07-16_ch07-候选经验:write-review-回环够不到图,figure-only-blocking-项必致-review-exh.md](decisions/2026-07-16_ch07-候选经验:write-review-回环够不到图,figure-only-blocking-项必致-review-exh.md) |
 | 2026-07-16 | delivery | 07 | ch07《造块、形状变换、访存与原子操作》定稿（Archive 补做） | [2026-07-16_ch07-ch07《造块、形状变换、访存与原子操作》定稿（archive-补做）.md](deliveries/2026-07-16_ch07-ch07《造块、形状变换、访存与原子操作》定稿（archive-补做）.md) |
