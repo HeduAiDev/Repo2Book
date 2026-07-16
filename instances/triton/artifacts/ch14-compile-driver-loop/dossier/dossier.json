@@ -1,0 +1,166 @@
+{
+  "chapter": "ch14",
+  "title": "compile() 驱动主循环——一路降到 PTX 的编排本体",
+  "code_spine": [
+    "python/triton/compiler/compiler.py:L217-L221  compile() 入口：target 缺省→driver.active.get_current_target()；断言 GPUTarget；make_backend(target) 选唯一后端",
+    "python/triton/compiler/compiler.py:L222-L228  分流两种入口：非 ASTSource 即视为 IR 文件路径→包成 IRSource；src.parse_options() 抽出 IR 内嵌选项（ttgir 的 num_warps）；backend.parse_options 归一化",
+    "python/triton/compiler/compiler.py:L134-L166  triton_key()：把 frontend+compiler+backends+libtriton.so+language 全部源码 sha256——内容寻址的『编译器身份』",
+    "python/triton/compiler/compiler.py:L230-L233  磁盘缓存键 = triton_key()-src.hash()-backend.hash()-options.hash()-env_vars，再 sha256",
+    "python/triton/compiler/compiler.py:L233-L252  get_cache_manager(hash) 取缓存；命中（metadata_path 存在且非 TRITON_ALWAYS_COMPILE）直接 return CompiledKernel（快路径）",
+    "python/triton/compiler/compiler.py:L253-L263  未命中：初始化 metadata；stages=dict()→backend.add_stages(stages,options) 填出 ir_name→pass 有序字典；first_stage=stages 中 src.ext 的下标",
+    "python/triton/compiler/compiler.py:L264-L266  IR 入口时 first_stage+=1——跳过本级 pass，让一份 .ttir/.ttgir 直接从下一级起步",
+    "python/triton/compiler/compiler.py:L267-L276  建 MLIR context、载 dialects、取 codegen_fns/module_map；src.make_ir 造出起点 module",
+    "python/triton/compiler/compiler.py:L277-L292  驱动主循环：for ext, compile_ir in stages[first_stage:] → next_module=compile_ir(module,metadata) → 每级 fn_cache_manager.put 落盘 → module=next_module",
+    "python/triton/compiler/compiler.py:L293-L303  写回 metadata（put+put_group）→ context.disable_multithreading → return CompiledKernel",
+    "python/triton/compiler/compiler.py:L306-L311  make_backend(target)：在所有 backend.compiler 里筛 supports_target(target)，必须恰好一个",
+    "python/triton/backends/compiler.py:L226-L290  BaseBackend 抽象契约：supports_target/hash/parse_options/add_stages/load_dialects/get_module_map 六个钩子",
+    "python/triton/backends/compiler.py:L266-L276  add_stages 契约：填 ir_name→(src,metadata)->str|bytes；按插入序跑，metadata 串起各级；末级返 bytes",
+    "third_party/nvidia/backend/compiler.py:L384-L389  CUDABackend.add_stages：登记 ttir/ttgir/llir/ptx/cubin 五级（本章给骨架全貌，各 pass 属 Part V-VIII）",
+    "third_party/nvidia/backend/compiler.py:L391-L394  CUDABackend.hash：ptxas 版本-capability，喂进磁盘缓存键的 backend.hash() 位"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "python/triton/compiler/compiler.py",
+      "lines": "L217-L233",
+      "code": "def compile(src, target=None, options=None):\n    if target is None:\n        target = driver.active.get_current_target()\n    assert isinstance(target, GPUTarget), \"target must be of GPUTarget type\"\n    backend = make_backend(target)\n    ir_source = not isinstance(src, ASTSource)\n    # create backend\n    if ir_source:\n        assert isinstance(src, str), \"source must be either AST or a filepath\"\n        src = IRSource(src)\n    extra_options = src.parse_options()\n    options = backend.parse_options(dict(options or dict(), **extra_options))\n    # create cache manager\n    env_vars = get_cache_invalidating_env_vars()\n    key = f\"{triton_key()}-{src.hash()}-{backend.hash()}-{options.hash()}-{str(sorted(env_vars.items()))}\"\n    hash = hashlib.sha256(key.encode(\"utf-8\")).hexdigest()\n    fn_cache_manager = get_cache_manager(hash)",
+      "elide": ["compile() 的开场：先定 target（run 侧传进来的 or driver 现取），选后端，分流入口，最后拼出磁盘缓存键。缓存键的五个组成部分（triton_key/源码/后端/选项/环境变量）是本章要逐个点透的——它决定了『什么变了才重编译』。get_cache_invalidating_env_vars 是 C++ 侧列出的一组会使缓存失效的环境变量名单，属缓存子系统细节，本章只标它是键的一部分。"]
+    },
+    {
+      "path": "python/triton/compiler/compiler.py",
+      "lines": "L134-L166",
+      "code": "@functools.lru_cache()\ndef triton_key():\n    import pkgutil\n    TRITON_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))\n    contents = []\n    # frontend\n    with open(__file__, \"rb\") as f:\n        contents += [hashlib.sha256(f.read()).hexdigest()]\n    # compiler\n    path_prefixes = [\n        (os.path.join(TRITON_PATH, \"compiler\"), \"triton.compiler.\"),\n        (os.path.join(TRITON_PATH, \"backends\"), \"triton.backends.\"),\n    ]\n    for path, prefix in path_prefixes:\n        for lib in pkgutil.walk_packages([path], prefix=prefix):\n            with open(lib.module_finder.find_spec(lib.name).origin, \"rb\") as f:\n                contents += [hashlib.sha256(f.read()).hexdigest()]\n\n    # backend\n    libtriton_hash = hashlib.sha256()\n    with open(os.path.join(TRITON_PATH, \"_C/libtriton.so\"), \"rb\") as f:\n        while True:\n            chunk = f.read(1024**2)\n            if not chunk:\n                break\n            libtriton_hash.update(chunk)\n    contents.append(libtriton_hash.hexdigest())\n    # language\n    language_path = os.path.join(TRITON_PATH, 'language')\n    for lib in pkgutil.walk_packages([language_path], prefix=\"triton.language.\"):\n        with open(lib.module_finder.find_spec(lib.name).origin, \"rb\") as f:\n            contents += [hashlib.sha256(f.read()).hexdigest()]\n    return f'{__version__}' + '-'.join(contents)",
+      "elide": ["triton_key 是本章的核心洞见：它把『Triton 编译器本身』——前端 compiler.py、整个 compiler/ 与 backends/ 包的每个 .py、编译好的 libtriton.so 二进制、以及整个 language/ 包——逐文件 sha256 拼成一个身份指纹，前缀版本号。@lru_cache 保证一个进程里只算一次。点透：你改了编译器/后端/语言层的任意一行源码，triton_key 变→所有 kernel 的磁盘缓存键全部变→全部失效重编。这跟 kernel 的实参/特化毫无关系（那是 ch10 的 launch 特化缓存键，正交）。"]
+    },
+    {
+      "path": "python/triton/compiler/compiler.py",
+      "lines": "L248-L263",
+      "code": "    always_compile = os.environ.get(\"TRITON_ALWAYS_COMPILE\", \"0\") == \"1\"\n    if not always_compile and metadata_path is not None:\n        # cache hit!\n        metadata = json.loads(Path(metadata_path).read_text())\n        return CompiledKernel(src, metadata_group, hash)\n    # initialize metadata\n    metadata = {\n        \"hash\": hash,\n        \"target\": target,\n        **options.__dict__,\n        **env_vars,\n    }\n    # run compilation pipeline  and populate metadata\n    stages = dict()\n    backend.add_stages(stages, options)\n    first_stage = list(stages.keys()).index(src.ext)",
+      "elide": ["缓存命中就直接从磁盘 metadata_group 重建 CompiledKernel 返回——不跑任何 pass。未命中才进入慢路径：先给 metadata 播种（hash/target/所有编译选项/环境变量），然后关键三行——stages 是个空 dict，交给 backend.add_stages 去填；填完 stages 是一个有序字典 ir_name→pass 函数；first_stage 是 src.ext（起点 IR 的扩展名，ASTSource 是 'ttir'）在这个字典里的下标。这个 stages 字典就是后续 Part V-VIII 每个 pass 章要展开的骨架全貌。"]
+    },
+    {
+      "path": "python/triton/compiler/compiler.py",
+      "lines": "L264-L292",
+      "code": "    # when the source is an IR file, don't apply the passes related to this stage. This makes it easier to write IR level tests.\n    if ir_source:\n        first_stage += 1\n    context = ir.context()\n    ir.load_dialects(context)\n    backend.load_dialects(context)\n    codegen_fns = backend.get_codegen_implementation()\n    module_map = backend.get_module_map()\n    try:\n        module = src.make_ir(options, codegen_fns, module_map, context)\n    except Exception as e:\n        filter_traceback(e)\n        raise\n    use_ir_loc = os.environ.get(\"USE_IR_LOC\", None)\n    for ext, compile_ir in list(stages.items())[first_stage:]:\n        next_module = compile_ir(module, metadata)\n        ir_filename = f\"{file_name}.{ext}\"\n        if (fn_override_manager is not None and (full_name := fn_override_manager.get_file(ir_filename)) is not None):\n            print(f\"\\nOverriding kernel with file {full_name}\")\n            next_module = parse(full_name, ext, context)\n        metadata_group[ir_filename] = fn_cache_manager.put(next_module, ir_filename)\n        if fn_dump_manager is not None:\n            fn_dump_manager.put(next_module, ir_filename)\n        # use an env variable to parse ir from file\n        if use_ir_loc == ext:\n            ir_full_name = fn_cache_manager.get_file(ir_filename)\n            next_module.create_location_snapshot(ir_full_name)\n            print(f\"Creating new locations for {ir_full_name}\")\n        module = next_module",
+      "elide": ["这是驱动主循环的核心。前半段：IR 入口时 first_stage+=1（跳过起点这一级的 pass——因为 .ttgir 文件已经是 ttgir 了，不必再把它降一遍；这正是『拿一份 .ttgir 直接做 IR 级实验』的机制）；建 MLIR context 并载入通用+后端 dialect；取后端的 codegen 函数与 module_map；src.make_ir 造出起点 module（AST 入口=跑 ast_to_ttir 前端；IR 入口=parse 那份 .ttir/.ttgir 文件）。后半段就是 for 循环：从 first_stage 起，逐级 compile_ir(module, metadata)——每一级吃上一级的 module、吐下一级的 module，且每一级都 fn_cache_manager.put 落盘（ttir/ttgir/llir/ptx/cubin 一级一个文件）。override/dump/use_ir_loc 是三个调试旁路（TRITON_KERNEL_OVERRIDE/DUMP、USE_IR_LOC），主线不依赖它们，讲时可略。"]
+    },
+    {
+      "path": "python/triton/compiler/compiler.py",
+      "lines": "L293-L303",
+      "code": "    # write-back metadata\n    metadata_group[metadata_filename] = fn_cache_manager.put(json.dumps(metadata, default=vars), metadata_filename,\n                                                             binary=False)\n    fn_cache_manager.put_group(metadata_filename, metadata_group)\n    # Compilation completed, disabling multithreading in context.\n    # This is needed to safely finalize threads pool inside context: if current process forks before\n    # python GC deletes context object, thread pool in child process will be invalid, which could\n    # lead to child crash or hang.\n    context.disable_multithreading()\n    # return handle to compiled kernel\n    return CompiledKernel(src, metadata_group, hash)",
+      "elide": ["循环跑完后收尾：把 metadata（含各级 pass 途中往里塞的 shared/name/cluster_dims 等）序列化落盘，put_group 把整组文件登记进缓存目录；关掉 context 多线程（防 fork 后子进程线程池失效）；最后同样 return CompiledKernel——与缓存命中走的是同一个构造出口。"]
+    },
+    {
+      "path": "python/triton/compiler/compiler.py",
+      "lines": "L306-L311",
+      "code": "def make_backend(target):\n    actives = [x.compiler for x in backends.values() if x.compiler.supports_target(target)]\n    if len(actives) != 1:\n        raise RuntimeError(\n            f\"{len(actives)} compatible backends for target ({target.backend}) ({actives}). There should only be one.\")\n    return actives[0](target)",
+      "elide": ["make_backend 在全部已发现后端（backends 是 ch01 的 _discover_backends 扫出来的字典）里，用每个后端类方法 supports_target(target) 过滤，要求结果恰好一个——多了或零个都抛错。选中的类用 target 实例化。这就是『按 target 选唯一后端』：CUDABackend.supports_target 判 target.backend=='cuda'。"]
+    },
+    {
+      "path": "python/triton/compiler/compiler.py",
+      "lines": "L67-L104",
+      "code": "class ASTSource:\n\n    def __init__(self, fn, signature, constants=None, attrs=None) -> None:\n        self.fn = fn\n        self.ext = \"ttir\"\n        self.name = fn.__name__\n        self.signature = signature\n        self.constants = constants\n        self.attrs = attrs\n        ...\n        if self.attrs is None:\n            self.attrs = AttrsDescriptor()\n\n    def hash(self):\n        sorted_sig = [v for k, v in sorted(self.signature.items())]\n        sorted_constants = sorted((str(k), v) for k, v in self.constants.items())\n        key = f\"{self.fn.cache_key}-{self.attrs.hash()}-{sorted_sig}-{sorted_constants}\"\n        return hashlib.sha256(key.encode(\"utf-8\")).hexdigest()\n\n    def make_ir(self, options, codegen_fns, module_map, context):\n        return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,\n                           module_map=module_map)\n\n    def parse_options(self):\n        return dict()",
+      "elide": ["ASTSource 是从 @jit 源码进来的入口：ext 固定 'ttir'（起点是 TTIR），make_ir 调 ast_to_ttir 跑前端 AST→TTIR（前端细节是别的章）。它的 hash 用 fn.cache_key（源码指纹）+attrs（ch07 的特化事实）+签名+常量——即『按这个 kernel 的身份+这次特化』寻址。parse_options 空——AST 入口不从源里读编译选项。__init__ 中的签名/常量归一化（str 化 key、None→空）已省略，与本章主线无关。"]
+    },
+    {
+      "path": "python/triton/compiler/compiler.py",
+      "lines": "L107-L131",
+      "code": "class IRSource:\n\n    def __init__(self, path):\n        self.path = path\n        path = Path(path)\n        self.ext = path.suffix[1:]\n        self.src = path.read_text()\n        match = re.search(prototype_pattern[self.ext], self.src, re.MULTILINE)\n        self.name = match.group(1)\n        signature = match.group(2)\n        types = re.findall(arg_type_pattern[self.ext], signature)\n        self.signature = {k: convert_type_repr(ty) for k, ty in enumerate(types)}\n\n    def hash(self):\n        return hashlib.sha256(self.src.encode(\"utf-8\")).hexdigest()\n\n    def make_ir(self, options, codegen_fns, module_map, context):\n        module = ir.parse_mlir_module(self.path, context)\n        module.context = context\n        return module\n\n    def parse_options(self):\n        if self.ext == \"ttgir\":\n            return {'num_warps': _get_num_warps_from_ir_str(self.src)}\n        return dict()",
+      "elide": ["IRSource 是从一份 .ttir/.ttgir/.llir/.ptx 文件直接进来的入口：ext 取文件后缀（决定从降级链哪一级起步），name/signature 用正则从 IR 文本的函数原型里抠出来。关键点——它的 hash 就是这份 IR 文本的 sha256：内容寻址身份=文件内容本身。make_ir 不跑前端，直接 parse_mlir_module 把文本解析成 MLIR module。parse_options：ttgir 会从文本里正则抠出 num_warps（因为 num_warps 已烙进 ttgir 属性）。这套设计就是『拿一份 .ttgir 绕过前端做 IR 级调优』的落地。convert_type_repr/prototype_pattern 是 IR 文本解析工具，讲时可略。"]
+    },
+    {
+      "path": "python/triton/backends/compiler.py",
+      "lines": "L226-L290",
+      "code": "class BaseBackend(metaclass=ABCMeta):\n\n    def __init__(self, target: GPUTarget) -> None:\n        self.target = target\n        assert self.supports_target(target)\n\n    @abstractclassmethod\n    def supports_target(target: GPUTarget):\n        raise NotImplementedError\n\n    @abstractmethod\n    def hash(self) -> str:\n        \"\"\"Returns a unique identifier for this backend\"\"\"\n        raise NotImplementedError\n\n    @abstractmethod\n    def parse_options(self, options: dict) -> object:\n        ...\n\n    @abstractmethod\n    def add_stages(self, stages: dict, options: object) -> None:\n        \"\"\"\n        Populates `stages` dictionary with entries of the form:\n        ir_name [str] => Function[(src: str, metadata: dict) -> str|bytes]\n        Stages will be run sequentially (in inseriton order) and can communicate using `metadata`.\n        All stages are expected to return a `str` object, except for the last stage which returns\n        a `bytes` object for execution by the launcher.\n        \"\"\"\n        raise NotImplementedError\n\n    @abstractmethod\n    def load_dialects(self, context):\n        \"\"\"Load additional MLIR dialects into the provided `context`\"\"\"\n        raise NotImplementedError\n\n    @abstractmethod\n    def get_module_map(self) -> Dict[str, ModuleType]:\n        raise NotImplementedError",
+      "elide": ["BaseBackend 是所有后端必须实现的抽象契约（ABCMeta+abstractmethod 强制）。compile() 主循环里用到的每个 backend.xxx 调用，在这里都有对应的抽象钩子：supports_target（make_backend 选它）、hash（喂缓存键）、parse_options（归一化选项）、add_stages（填 stages 字典——契约明确写了『按插入序跑、metadata 串起各级、末级返 bytes 给 launcher』）、load_dialects/get_module_map（建 context 用）。_path_to_binary/get_attrs_descriptor/compute_spec_key 等非抽象方法（后者是 ch07/ch10 用到的）此处略——本章聚焦 compile 主循环调到的那几个抽象钩子。ch07 的 get_attrs_descriptor 就是这里的默认实现，回指不重讲。"]
+    },
+    {
+      "path": "third_party/nvidia/backend/compiler.py",
+      "lines": "L384-L394",
+      "code": "    def add_stages(self, stages, options):\n        stages[\"ttir\"] = lambda src, metadata: self.make_ttir(src, metadata, options)\n        stages[\"ttgir\"] = lambda src, metadata: self.make_ttgir(src, metadata, options, self.capability)\n        stages[\"llir\"] = lambda src, metadata: self.make_llir(src, metadata, options, self.capability)\n        stages[\"ptx\"] = lambda src, metadata: self.make_ptx(src, metadata, options, self.capability)\n        stages[\"cubin\"] = lambda src, metadata: self.make_cubin(src, metadata, options, self.capability)\n\n    @functools.lru_cache()\n    def hash(self):\n        version = get_ptxas_version()\n        return f'{version}-{self.capability}'",
+      "elide": ["CUDABackend 怎么填 add_stages 契约的一个具体样例：五行，按序登记 ttir→ttgir→llir→ptx→cubin 五级，每级绑一个 make_xxx 函数。这就是 compile 主循环遍历的那个有序字典——本章给的是这个骨架全貌；每个 make_xxx 内部具体跑了哪些 MLIR pass（如 make_ttir 里的 add_inliner/add_combine…），是 Part V-VIII 各章的主题，本章不展开，只前瞻。backend.hash()=ptxas 版本+capability——它变了（换 CUDA 工具链/换卡架构）也会使磁盘缓存键变。make_ttir…make_cubin 五个方法体（L188-L382）此处不内嵌——属各 pass 专章。"]
+    }
+  ],
+  "key_classes": [
+    {"name": "compile", "file": "python/triton/compiler/compiler.py", "responsibility": "编译驱动主循环（模块级函数，非类）：选后端→拼内容寻址磁盘缓存键→命中即返/未命中则 add_stages 填 stages→src.make_ir 造起点 module→逐级 compile_ir 并落盘→写回 metadata→返 CompiledKernel。全书『一路降到 PTX』结构主线的驱动本体。"},
+    {"name": "ASTSource", "file": "python/triton/compiler/compiler.py", "responsibility": "从 @jit 源码进来的编译入口：ext 固定 'ttir'，make_ir 跑前端 ast_to_ttir，hash 按 fn.cache_key+attrs+签名+常量寻址（这次特化的身份）。"},
+    {"name": "IRSource", "file": "python/triton/compiler/compiler.py", "responsibility": "从一份 .ttir/.ttgir/.llir/.ptx 文件直接进来的编译入口：ext=文件后缀（决定起步级），hash=文件内容 sha256（内容寻址身份），make_ir 直接 parse_mlir_module，绕过前端。让 IR 级实验/调优成为可能。"},
+    {"name": "make_backend", "file": "python/triton/compiler/compiler.py", "responsibility": "按 target 在已发现后端里筛 supports_target，要求恰好一个，实例化返回。run 与 compile 都调它。"},
+    {"name": "triton_key", "file": "python/triton/compiler/compiler.py", "responsibility": "内容寻址的『编译器身份』：把 frontend+compiler/+backends/+libtriton.so+language/ 全部源码/二进制 sha256 拼成指纹（@lru_cache 一进程一次）。改编译器源码即失效全部磁盘缓存。"},
+    {"name": "BaseBackend", "file": "python/triton/backends/compiler.py", "responsibility": "所有后端的抽象契约（ABCMeta）：supports_target/hash/parse_options/add_stages/load_dialects/get_module_map 六个钩子。compile 主循环靠这层抽象与具体后端解耦。"},
+    {"name": "CUDABackend", "file": "third_party/nvidia/backend/compiler.py", "responsibility": "BaseBackend 的 NVIDIA 实现：add_stages 登记 ttir/ttgir/llir/ptx/cubin 五级，binary_ext='cubin'，hash=ptxas 版本+capability。本章作『后端怎么填契约』的样例，五段 pass 内部前瞻 ch36。"},
+    {"name": "GPUTarget", "file": "python/triton/backends/compiler.py", "responsibility": "frozen dataclass：backend(str)/arch/warp_size 三元组，唯一标识编译目标；make_backend 用它选后端。"},
+    {"name": "CompiledKernel", "file": "python/triton/compiler/compiler.py", "responsibility": "编译产物句柄：从 metadata_group 读回各级 IR 文本与最终 cubin（asm 字典）、还原 metadata、惰性初始化设备句柄。命中/未命中两条路径的共同返回类型（本章作出口，launcher 细节属 ch11/ch13）。"}
+  ],
+  "data_flow": [
+    "1. compile(src, target, options) 被 run() 慢路径调用（ch11，回指不重讲）：src=ASTSource(fn,signature,constants,attrs)，target 与 options.__dict__",
+    "2. target 缺省则 driver.active.get_current_target()；断言 GPUTarget；make_backend(target) 选唯一后端",
+    "3. 判入口：非 ASTSource→IRSource(path) 包装；src.parse_options() 抽 IR 内嵌选项；backend.parse_options 归一化成 options 对象",
+    "4. 拼磁盘缓存键：triton_key()（编译器身份）-src.hash()（源/IR 身份）-backend.hash()-options.hash()-env_vars → sha256 → hash",
+    "5. get_cache_manager(hash)；若命中（metadata_path 存在且非 always_compile）→ return CompiledKernel(src, metadata_group, hash)（快路径，不跑 pass）",
+    "6. 未命中：初始化 metadata（hash/target/options/env）",
+    "7. stages=dict(); backend.add_stages(stages, options) → 有序字典 ir_name→compile_ir；first_stage = stages 中 src.ext 的下标（IR 入口再 +1 跳过本级）",
+    "8. 建 ir.context()，ir.load_dialects + backend.load_dialects；codegen_fns=backend.get_codegen_implementation()；module_map=backend.get_module_map()",
+    "9. module = src.make_ir(...)：AST 入口跑 ast_to_ttir 前端；IR 入口 parse_mlir_module 那份文件",
+    "10. 主循环 for ext, compile_ir in stages[first_stage:]：next_module=compile_ir(module, metadata) → fn_cache_manager.put 落盘 f'{name}.{ext}' → module=next_module（override/dump/use_ir_loc 为调试旁路）",
+    "11. 写回 metadata（put + put_group）；context.disable_multithreading()",
+    "12. return CompiledKernel(src, metadata_group, hash)：从落盘的各级文件读回 asm 字典与最终 cubin"
+  ],
+  "design_decisions": [
+    {"decision": "磁盘缓存键含 triton_key()——把整个编译器（compiler/backends/language 源码 + libtriton.so）的内容指纹并入", "why": "缓存必须在『编译器本身变了就应重编』时失效。按内容寻址而非版本号：即便版本号没动，只要你改了编译器任意一行源码，指纹变→全部 kernel 缓存失效。这与 ch10 的 launch 特化缓存键正交——那是按 kernel 实参特化寻址『同一个 kernel 不同参数编不同产物』，triton_key 是按『编译器身份』寻址『同一份产物是不是这个编译器编的』。读者杠杆①：改编译器源码后别傻等旧缓存，它已全失效必重编。", "evidence": "python/triton/compiler/compiler.py:L134-L166 + L231"},
+    {"decision": "两种入口 ASTSource / IRSource 共享同一 compile 主循环，只在 ext 起步级与 hash 口径上不同", "why": "统一驱动循环解耦了『IR 从哪来』与『IR 怎么往下降』。ASTSource.ext='ttir' 从头降；IRSource.ext=文件后缀，且 ir_source 时 first_stage+=1 跳过起点级——一份 .ttgir 直接从 llir 级起步。IRSource.hash=文件内容 sha256（内容寻址身份），让你把某一级 IR 存成文件、手改、直接喂 compile 做 IR 级实验/单层调优，绕过前端整条迭代。读者杠杆②。", "evidence": "python/triton/compiler/compiler.py:L107-L131 + L222-L226 + L263-L266"},
+    {"decision": "stages 用有序 dict（ir_name→pass 函数），由 backend.add_stages 填、compile 按插入序遍历", "why": "把『降级链有哪些级、每级叫什么、顺序如何』的决定权交给后端，compile 只做通用遍历+落盘。不同后端（cuda/hip/…）填不同 stages 即支持不同降级路径。这也是全书结构主线：ttir→ttgir→llir→ptx→cubin 五级，每级 = Part V-VIII 的一个 pass 专章，本章给骨架全貌。", "evidence": "python/triton/compiler/compiler.py:L261-L263 + L278 + third_party/nvidia/backend/compiler.py:L384-L389"},
+    {"decision": "make_backend 要求恰好一个后端 supports_target(target)，多零皆抛", "why": "target 到后端必须是确定的单射，否则编译产物归属不明。ch01 的 _discover_backends 扫出所有后端，make_backend 在其上按 target 唯一选择——这是 ch01 f1『后端接缝』的运行期使用点。", "evidence": "python/triton/compiler/compiler.py:L306-L311"},
+    {"decision": "每一级 compile_ir 产物都 fn_cache_manager.put 落盘（ttir/ttgir/llir/ptx/cubin 各一个文件）", "why": "落盘既是缓存（命中时 CompiledKernel 直接读回），也让每级 IR 可观测（TRITON_KERNEL_DUMP/USE_IR_LOC 等旁路依赖它）。metadata 由各级 pass 途中往里塞（shared/name/cluster_dims），循环末统一写回。", "evidence": "python/triton/compiler/compiler.py:L280-L296"},
+    {"decision": "缓存命中与未命中走同一个 return CompiledKernel(src, metadata_group, hash) 出口", "why": "无论产物来自磁盘还是刚编出，对调用者（run）都是同一种句柄，屏蔽了『这次编没编』。CompiledKernel 从 metadata_group 里读回各级 IR 文本与 cubin，与是否刚跑过 pass 无关。", "evidence": "python/triton/compiler/compiler.py:L252 + L303 + L350-L372"}
+  ],
+  "theory": [
+    "内容寻址缓存的失效面分析：磁盘缓存键有五个乘性组成——triton_key(编译器身份) × src.hash(kernel/IR 身份) × backend.hash(工具链+架构) × options.hash(编译选项) × env_vars(缓存敏感环境变量)。任一变，键变，缓存 miss。triton_key 覆盖面最广（整个 compiler/backends/language 包 + libtriton.so），所以改编译器一行源码=全部 kernel 全 miss；backend.hash 只含 ptxas 版本+capability，换卡/换 CUDA 才动；options.hash 含 num_warps/num_stages 等，调参就动；src.hash 只随 kernel 源或那份 IR 文件变。理解这个乘积就理解『什么改动会触发多大范围的重编』。",
+    "两层缓存的正交性（回指 ch10/ch11，本章只点破不重讲三桶）：run 侧内存 cache[device][key] 键=签名+特化位+constexpr 值（按实参特化，ch10）；compile 侧磁盘缓存键=triton_key+src+backend+options+env（含编译器身份，本章）。前者答『同一进程这次调用要不要重走编译』，后者答『跨进程/重启这份产物在不在盘上、是不是这个编译器编的』。两键维度不同、互不覆盖——同一 kernel 同一特化，内存 miss 但磁盘可能 hit（重启后）；编译器改了，磁盘全 miss 但内存键不受影响。",
+    "IR 级实验的可行性来自内容寻址身份：因为 IRSource.hash=文件内容 sha256、且 first_stage 由 ext 决定，你可以取任意一级 IR（如 dump 出的 .ttgir）、手工修改、存文件、compile(path) 直接从下一级起步降到 cubin——产物身份完全由这份文件内容决定，与原 kernel 源码/前端无关。这把『调某一层 pass 的效果』从『改 kernel→跑整条前端』缩短为『改一份 IR 文本→跑剩余几级』。"
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {"what": "compile() 中的 TRITON_KERNEL_OVERRIDE / fn_override_manager 分支（L236,L238,L281-L283）", "why_safe": "override 是把某级 IR 替换成外部文件的调试旁路，默认关（环境变量='0'）。删掉不影响正常编译主线的正确性；精简版走默认路径即可。属可省略无关分支，不是 must_keep。"},
+      {"what": "compile() 中的 TRITON_KERNEL_DUMP / fn_dump_manager 分支（L237,L239,L285-L286）", "why_safe": "dump 是把各级 IR 额外拷到 dump 目录的调试旁路，默认关。与产物正确性无关。"},
+      {"what": "compile() 中的 USE_IR_LOC / create_location_snapshot 分支（L277,L288-L291）", "why_safe": "为 IR 生成位置信息快照的调试旁路，默认 None 不触发。删除不改变降级产物。"},
+      {"what": "filter_traceback 函数体细节（L180-L213）与 make_ir 的 try/except 包裹", "why_safe": "filter_traceback 只是从异常回溯里剔除 code_generator.py/ast.py 帧以改善报错可读性，不影响编译结果；精简版可保留 make_ir 调用、去掉异常美化。属可省略。"},
+      {"what": "convert_type_repr / _get_num_warps_from_ir_str / prototype_pattern / arg_type_pattern 的正则实现细节（L19-L64,L118,L130）", "why_safe": "这些是 IRSource 解析 IR 文本原型/类型的工具，属 IR 入口的解析细节；精简版保留 IRSource 的两条入口语义（ext/hash/make_ir/parse_options）即可，正则内部可简述。注意：IRSource 类本身及其 hash=文件内容 sha256 的语义必须保留（must_keep）。"},
+      {"what": "parse() 函数（L169-L177）对 llir/ptx/cubin 各 ext 的分支", "why_safe": "parse 只在 override 旁路里被调用（把外部文件读成对应类型）；override 分支已删，parse 随之不需要。"}
+    ],
+    "must_keep": [
+      {"symbol": "compile", "why": "本章驱动主循环本体，必须保留完整五段结构（选后端→缓存键→add_stages→make_ir→逐级 compile_ir 落盘）。"},
+      {"symbol": "triton_key", "why": "内容寻址『编译器身份』核心，读者杠杆①的机制所在，必须保留其 frontend/compiler/backends/libtriton.so/language 逐文件 sha256 结构。"},
+      {"symbol": "make_backend", "why": "按 target 选唯一后端，主循环第一步；读者需理解『恰好一个』的约束。"},
+      {"symbol": "add_stages", "why": "填 ir_name→pass 有序字典的契约，全书降级链骨架的来源，writer 必须讲清。"},
+      {"symbol": "ASTSource", "why": "从 @jit 源码进的入口，ext='ttir'、make_ir 跑前端、hash 按特化身份——两入口对照的一极。"},
+      {"symbol": "IRSource", "why": "从 IR 文件直接进的入口，hash=文件内容 sha256、ext=后缀决定起步级——读者杠杆②的机制所在。"},
+      {"symbol": "first_stage", "why": "src.ext 在 stages 里的下标 + IR 入口 +1 跳过本级，是『.ttgir 绕过前端从下一级起步』的关键变量。"},
+      {"symbol": "BaseBackend", "why": "后端抽象契约基类，compile 主循环靠它与具体后端解耦；回指 ch01 f1、前瞻 ch36。"},
+      {"symbol": "GPUTarget", "why": "make_backend 选后端的依据三元组，compile 入口断言它。"},
+      {"symbol": "supports_target", "why": "make_backend 用它筛后端；后端唯一性约束的判据。"},
+      {"symbol": "parse_options", "why": "src.parse_options（IR 内嵌选项，如 ttgir 的 num_warps）+ backend.parse_options（归一化）两处都出现，读者需理解选项如何汇入。"},
+      {"symbol": "make_ir", "why": "两入口造起点 module 的多态方法：ASTSource 跑 ast_to_ttir、IRSource 跑 parse_mlir_module。"},
+      {"symbol": "CompiledKernel", "why": "命中/未命中共同返回类型；从 metadata_group 读回各级 IR 与 cubin，是编译出口。"},
+      {"symbol": "CUDABackend", "why": "add_stages 五级样例的载体，回指 ch01、前瞻 ch36。"},
+      {"symbol": "binary_ext", "why": "CUDABackend.binary_ext='cubin' 决定降级链最后一级/末级返 bytes 的类型。"}
+    ]
+  },
+  "mechanisms": [
+    {"id": "m1-compile-driver-loop", "name": "compile() 五段驱动主循环：选后端→内容寻址缓存键→add_stages 填 stages→make_ir 造起点→逐级 compile_ir 落盘→写回 metadata 返 CompiledKernel", "kind": "algorithm", "source_anchors": ["python/triton/compiler/compiler.py:L217-L303"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m2-triton-key-content-addressing", "name": "triton_key 内容寻址『编译器身份』：frontend+compiler/+backends/+libtriton.so+language/ 逐文件 sha256——改编译器源码即失效全部磁盘缓存", "kind": "algorithm", "source_anchors": ["python/triton/compiler/compiler.py:L134-L166", "python/triton/compiler/compiler.py:L230-L233"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m3-two-entrypoints", "name": "ASTSource vs IRSource 两种入口 + 内容寻址身份（fn.cache_key+attrs vs 文件内容 sha256）+ first_stage 起步级差异", "kind": "dataflow", "source_anchors": ["python/triton/compiler/compiler.py:L67-L131", "python/triton/compiler/compiler.py:L222-L228", "python/triton/compiler/compiler.py:L263-L266"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m4-ir-level-experiment", "name": "拿一份 .ttgir 绕过前端做 IR 级实验/单层调优：first_stage+=1 跳过起点级 + IRSource.parse_options 从 ttgir 文本抠 num_warps", "kind": "protocol", "source_anchors": ["python/triton/compiler/compiler.py:L263-L266", "python/triton/compiler/compiler.py:L128-L131"], "needs_figure": false, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m5-make-backend-selection", "name": "make_backend 按 target 选唯一后端（supports_target 过滤，恰好一个）", "kind": "algorithm", "source_anchors": ["python/triton/compiler/compiler.py:L306-L311"], "needs_figure": false, "needs_worked_example": true, "difficulty": "supporting"},
+    {"id": "m6-add-stages-contract", "name": "add_stages 填 ir_name→pass 有序字典契约（按插入序跑、metadata 串联、末级返 bytes）+ CUDABackend 五级样例（ttir/ttgir/llir/ptx/cubin 骨架全貌）", "kind": "protocol", "source_anchors": ["python/triton/backends/compiler.py:L266-L276", "third_party/nvidia/backend/compiler.py:L384-L389"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m7-basebackend-contract", "name": "BaseBackend 抽象钩子契约（supports_target/hash/parse_options/add_stages/load_dialects/get_module_map）——compile 主循环与具体后端解耦点", "kind": "protocol", "source_anchors": ["python/triton/backends/compiler.py:L226-L290"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m8-disk-cache-key-composition", "name": "磁盘缓存键五乘性组成（triton_key×src.hash×backend.hash×options.hash×env_vars）与内存特化键正交（回指 ch10 不重讲三桶）", "kind": "config", "source_anchors": ["python/triton/compiler/compiler.py:L230-L233"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m9-per-stage-writeback", "name": "每级 compile_ir 产物落盘 + metadata 循环末统一写回 + 命中/未命中共同 CompiledKernel 出口", "kind": "dataflow", "source_anchors": ["python/triton/compiler/compiler.py:L278-L303", "python/triton/compiler/compiler.py:L350-L372"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"}
+  ],
+  "foreshadow_due": {
+    "recover": [
+      {"id": "f12", "planted_in": "ch11", "text": "compile() 内部五段驱动主循环——ch11 只把 compile 当一次黑箱调用（run 把 ASTSource(self,signature,constants,attrs)+target+options.__dict__ 交给它），本章打开它：内容寻址缓存键 triton_key、make_backend 选后端、backend.add_stages 填 ir_name→pass 有序字典、ASTSource/IRSource 两种入口、BaseBackend 六个抽象钩子契约、逐级 compile_ir 落盘。", "how_recovered": "本章 m1-m9 全面展开 compile()；开篇明确回指 ch11『把 compile 当一次调用』，本章展开其内部主循环——回指不重讲 run() 调 compile 的三桶/慢路径。"}
+    ],
+    "plant": [],
+    "notes": "本章无新埋伏笔（结构性回指为主）。跨章接缝：回指 ch01 f1『后端接缝/BaseBackend』（_discover_backends→make_backend 的运行期使用点）；回指 ch07『attrs/get_attrs_descriptor』（ASTSource.attrs 来源，不重讲）；回指 ch10『launch 特化缓存键三桶』（与 triton_key 正交，点破不重讲）；前瞻 ch36『CUDABackend 怎么填五段 add_stages』；前瞻 Part V-VIII『每级 pass 内部展开』。archivist 归档时建议登记：add_stages 五级骨架 → 各 pass 专章的对位点。"
+  }
+}

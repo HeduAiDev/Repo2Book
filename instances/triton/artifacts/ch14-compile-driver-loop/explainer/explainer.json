@@ -1,0 +1,339 @@
+{
+  "chapter": "ch14",
+  "title": "compile() 驱动主循环——一路降到 PTX 的编排本体",
+  "note_on_traces": "本章无精简版(skip_impl)。compile() 完整跑需 libtriton.so(C++ 构建产物)与 GPU/ptxas,本机为源码-only clone、无构建、无 CUDA,故整章 trace_source 以 manual 为主;但两处纯逻辑判定(triton_key 的文件枚举+sha256 拼接、first_stage 起步级、make_backend 唯一性)可脱离 GPU 在 host 复现——已写成 traces/run_triton_key.py 与 traces/run_dispatch.py 实跑,产物 triton_key.json / dispatch.json,对应机制标 trace_source=run。凡引用源码常量的数字均标 file:Lxxx。",
+  "mechanisms": [
+    {
+      "mechanism_id": "m1-compile-driver-loop",
+      "intuition": "像一条流水线:一块毛坯(起点 IR)从第一道工位进去,每道工位把它加工成下一种半成品并拍照存档(落盘),照着后端交来的『工位清单』一道道走,最后一道吐出成品(cubin)。compile() 本身不懂任何一道工艺,它只负责『按清单顺序把料递给下一道、每道存一次档』。",
+      "worked_example": {
+        "params": {
+          "src": "ASTSource(@jit kernel)",
+          "target.backend": "cuda",
+          "stages": "CUDABackend.add_stages 填的 ttir→ttgir→llir→ptx→cubin",
+          "first_stage": 0,
+          "cache": "未命中(慢路径)"
+        },
+        "trace_source": "manual",
+        "manual_reason": "compile() 真正执行每级 compile_ir 需 libtriton.so(C++ 构建产物)与 GPU/ptxas,本机为源码-only clone、无构建、无 CUDA,无法实跑取每级 module 句柄。stage 序列与逐级落盘文件名由 CUDABackend.add_stages(third_party/nvidia/backend/compiler.py:L385-389)与主循环(python/triton/compiler/compiler.py:L278-286)静态确定;起步级=0、共 5 级已由 traces/dispatch.json 的 AST_ttir 项(first_stage_index=0、num_stages_run=5)交叉验证。表中『输入/输出 module』为示意占位(真实为 MLIR module 句柄),非编造数值。",
+        "table": {
+          "columns": [
+            "轮次(stages 下标)",
+            "ext",
+            "compile_ir 调用(L278-279)",
+            "输入 module",
+            "输出 module→落盘文件(L280)",
+            "metadata 作用"
+          ],
+          "rows": [
+            [
+              "0",
+              "ttir",
+              "make_ttir(module,metadata)",
+              "src.make_ir 造的起点 TTIR",
+              "TTIR′ → name.ttir",
+              "各级往里塞 shared/name 等,循环末统一写回(L294)"
+            ],
+            [
+              "1",
+              "ttgir",
+              "make_ttgir(module,metadata)",
+              "上一级 TTIR′",
+              "TTGIR → name.ttgir",
+              "串联上下级(L276 契约)"
+            ],
+            [
+              "2",
+              "llir",
+              "make_llir(module,metadata)",
+              "上一级 TTGIR",
+              "LLIR → name.llir",
+              "串联"
+            ],
+            [
+              "3",
+              "ptx",
+              "make_ptx(module,metadata)",
+              "上一级 LLIR",
+              "PTX → name.ptx",
+              "串联"
+            ],
+            [
+              "4",
+              "cubin",
+              "make_cubin(module,metadata)",
+              "上一级 PTX",
+              "cubin(bytes,末级)→ name.cubin",
+              "末级返 bytes 给 launcher(L273-275 契约)"
+            ]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "主循环每轮把 module 严格推进降级链一级,循环体不引入回退——起点级下标 first_stage 到末级 cubin 单调递增、有限步必停,终点是唯一 bytes 产物。",
+        "argument": "stages 是有限有序字典(CUDABackend 恰 5 项,L385-389),for ext, compile_ir in list(stages.items())[first_stage:] 遍历一个固定切片、每轮消费一项且 module=next_module 只前进不回退(L286);切片长度 = 5 − first_stage 为有限非负整数,故必在有限轮内耗尽。契约保证除末级外每级返 str(IR 文本)、末级返 bytes(L273-275),终止时 module 即最终 bytes 产物,交 CompiledKernel。"
+      },
+      "quantified": "CUDABackend 下降级链固定 5 级(dispatch.json:AST_ttir.num_stages_run=5;源 L385-389),ASTSource 起步级 first_stage=0 故 5 级全跑、落盘 5 个 IR 文件(name.ttir/.ttgir/.llir/.ptx/.cubin);循环体外仅 1 次 metadata 写回(L294)+1 次 put_group(L296)。单次未命中编译的『工位遍历』复杂度 = O(级数) = 5 次 compile_ir + 5 次 fn_cache_manager.put。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch14-driver-loop",
+          "claim": "compile() 未命中缓存时,把起点 module 沿 add_stages 填出的有序 stages 逐级降级、每级 compile_ir 后落盘,最后返回 CompiledKernel;命中则直接从磁盘重建、跳过全部 pass。",
+          "template": "flow",
+          "numbers": [
+            {
+              "value": "5",
+              "provenance": "traces/dispatch.json AST_ttir.num_stages_run=5(源 third_party/nvidia/backend/compiler.py:L385-389 五级)"
+            },
+            {
+              "value": "0",
+              "provenance": "traces/dispatch.json AST_ttir.first_stage_index=0(ASTSource.ext='ttir',compiler.py:L71 + L263)"
+            }
+          ],
+          "caption_draft": "结论:compile 是通用驱动壳——它只做『选后端→拼缓存键→(命中即返)→add_stages→make_ir 造起点→逐级 compile_ir 落盘→返 CompiledKernel』,五级 pass 的内容全由后端 add_stages 决定,是后续 Part V-VIII 各 pass 章的骨架。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m2-triton-key-content-addressing",
+      "intuition": "磁盘缓存不看『版本号几点几』,而看『编译器这个人指纹长啥样』:把前端、整个 compiler/、backends/、编译好的 libtriton.so、整个 language/ 逐文件按指纹(sha256)拼成一张身份证。你改编译器任一行源码,指纹就换了张脸——旧缓存全部不认你,必须重编。这跟 kernel 传什么实参毫无关系(那是 ch10 的另一套按实参特化的缓存键,正交)。",
+      "worked_example": {
+        "params": {
+          "version": "3.2.0",
+          "枚举": "frontend 1 + compiler 5 + backends 3 + language 9 + libtriton.so 1",
+          "改动": "只改 code_generator.py 一行"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/triton_key.json",
+        "manual_reason": "",
+        "table": {
+          "columns": [
+            "步骤",
+            "动作",
+            "被 sha256 的输入数",
+            "改动文件数",
+            "编译器身份指纹",
+            "全部 kernel 磁盘缓存"
+          ],
+          "rows": [
+            [
+              "基线",
+              "枚举 frontend 1 + compiler 5 + backends 3 + language 9 + libtriton.so 1,逐个求哈希、拼接、前缀版本号",
+              "19",
+              "0",
+              "取得基线指纹",
+              "以此为基准键"
+            ],
+            [
+              "改编译器一行",
+              "仅对 compiler 包里 code_generator.py 追加 1 行注释",
+              "19",
+              "1",
+              "指纹翻转(与基线不同)",
+              "缓存键随之全变 → 全部 miss、必重编"
+            ]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "triton_key 是编译器全体源码/二进制内容的单射指纹:任一被枚举文件内容变化 ⇒ 指纹必变;进程内 @lru_cache 保证同一进程只算一次、值稳定。",
+        "argument": "sha256 抗碰撞,单个文件字节变→该文件 hash 变;triton_key 把各文件 hash 以 '-' 拼接(L164),拼接串任一段变→整串变→其 sha256(缓存键中的 triton_key 位)变。traces/run_triton_key.py 实证:仅改 1 个文件 1 行,fingerprint_before≠fingerprint_after(triton_key.json: fingerprint_changed=true)。@functools.lru_cache(L134)使返回值在进程生命周期内恒定,不会每次编译重扫盘。"
+      },
+      "quantified": "pin v3.2.0 源码树静态基线:triton_key 枚举 frontend(1)+compiler 包(5 个 .py)+backends 包(3 个 .py)+language 包(9 个 .py)=18 个 .py,加 libtriton.so 共 19 项输入(triton_key.json: total_py_hashed_static=18、total_inputs_incl_libtriton_so=19)。改动面 = 这 19 项中任意 1 项内容变即触发全体 kernel 磁盘缓存失效——失效放大比 1:全部。(注:真实运行时 language.extra 后端扩展会另增枚举项,不改变『改一处即全失效』的结论。)",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch14-triton-key-invalidation",
+          "claim": "改编译器任一源码文件一行,triton_key 指纹翻转,所有 kernel 的磁盘缓存键随之全变、集体失效重编。",
+          "template": "before-after",
+          "numbers": [
+            {
+              "value": "19",
+              "provenance": "traces/triton_key.json total_inputs_incl_libtriton_so=19(frontend 1+compiler 5+backends 3+language 9+libtriton.so 1)"
+            },
+            {
+              "value": "1",
+              "provenance": "traces/triton_key.json files_edited=1、fingerprint_changed=true(改 code_generator.py 一行即翻转)"
+            }
+          ],
+          "caption_draft": "结论(读者杠杆①):triton_key 按『编译器身份』内容寻址,不是按版本号;你 hack 了编译器/后端/语言层任意一行,别傻等旧缓存——它已随指纹翻转全部失效,下次调用必重编。这与 ch10 按实参特化的 launch 缓存键正交、互不覆盖。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m3-two-entrypoints",
+      "intuition": "两扇门进同一条流水线:一扇是『交源码』(ASTSource,@jit 函数),进门先跑前端把源码译成起点 IR;另一扇是『交半成品』(IRSource,一份 .ttir/.ttgir 文件),进门直接把文件解析成 module、绕过前端。进门后走的是同一条降级传送带,只是上带的位置(起步级)和『身份怎么算』不同。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch14-two-entrypoints",
+          "claim": "ASTSource 从 @jit 源码起(ext=ttir、hash 按特化身份、make_ir 跑前端),IRSource 从一份 IR 文件起(ext=文件后缀、hash=文件内容 sha256、make_ir 直接 parse),二者汇入同一驱动主循环、只差起步级与身份口径。",
+          "template": "before-after",
+          "numbers": [
+            {
+              "value": "0",
+              "provenance": "traces/dispatch.json AST_ttir.first_stage_index=0(ASTSource.ext='ttir',compiler.py:L71)"
+            },
+            {
+              "value": "2",
+              "provenance": "traces/dispatch.json IR_ttgir.first_stage_index=2(IRSource .ttgir:index=1 再 +1,compiler.py:L112 + L265-266)"
+            }
+          ],
+          "caption_draft": "结论:两入口的分歧只在『ext(起步级)+ hash(身份口径)+ make_ir(跑前端 vs 直接 parse)』三点;下游驱动循环完全共用。IRSource 用文件内容 sha256 作身份,正是它能『拿一份 IR 直接做实验』的前提(见 m4)。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m4-ir-level-experiment",
+      "intuition": "想单独调某一层 pass 的效果,不必每次都从 kernel 源码重跑整条前端。把某一级 IR(比如 dump 出的 .ttgir)存成文件、手改几行,直接喂 compile(path):它认这份文件的内容当身份,从『比这级低一级』的地方接着往下降到 cubin——迭代半径从『改源码→跑五级』缩到『改一份 IR→跑剩下几级』。",
+      "worked_example": {
+        "params": {
+          "stages": "ttir(0)→ttgir(1)→llir(2)→ptx(3)→cubin(4)",
+          "对照": "ASTSource(.ttir) vs IRSource(.ttgir) vs IRSource(.llir)"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/dispatch.json",
+        "manual_reason": "",
+        "table": {
+          "columns": [
+            "入口",
+            "src.ext",
+            "ir_source",
+            "first_stage 下标",
+            "实际遍历的级",
+            "跑几级",
+            "跳过几级"
+          ],
+          "rows": [
+            [
+              "ASTSource(@jit)",
+              "ttir",
+              "否",
+              "0",
+              "ttir→ttgir→llir→ptx→cubin",
+              "5",
+              "0"
+            ],
+            [
+              "IRSource(.ttgir)",
+              "ttgir",
+              "是",
+              "2",
+              "llir→ptx→cubin",
+              "3",
+              "2"
+            ],
+            [
+              "IRSource(.llir)",
+              "llir",
+              "是",
+              "3",
+              "ptx→cubin",
+              "2",
+              "3"
+            ]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "IR 入口的起步级 = index(src.ext)+1,恰好跳过『把 IR 降成它自己这一级』的那道 pass,保证一份已经是 X 级的 IR 不会被再降一次 X。",
+        "argument": "first_stage=list(stages).index(src.ext)(L263)定位该 ext 在降级链的位置;ir_source 时 first_stage+=1(L265-266)使遍历从下一级开始。故 .ttgir(index=1)→从 llir(2)起,ttir/ttgir 两级被跳过——因为文件已是 ttgir、无需再『生成 ttir』或『把它降成 ttgir』。dispatch.json 实证:IR_ttgir.num_stages_skipped=2、num_stages_run=3,二者之和=5=总级数,无遗漏无重复。"
+      },
+      "quantified": "对 CUDABackend 五级链:从一份 .ttgir 起步只跑 3 级(dispatch.json IR_ttgir.num_stages_run=3),省去前 2 级(num_stages_skipped=2);从 .llir 起只跑 2 级(IR_llir.num_stages_run=2),省 3 级。相较 ASTSource 全跑 5 级,IR 级实验把每次迭代的 pass 执行数从 5 降到 2~3,且完全免掉前端 ast_to_ttir。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m5-make-backend-selection",
+      "intuition": "一台机器上可能同时装了好几家后端(cuda/amd/…)。compile 拿到编译目标(target)时,像点名:让每个后端自报『我支不支持这个 target』,要求场上恰好一个人举手——零个举手(没人支持)或两个举手(归属不清)都当场报错,绝不蒙着编。",
+      "worked_example": {
+        "params": {
+          "discovered": "{cuda, amd}",
+          "supports": "cuda↔target.backend=='cuda';amd↔'hip'",
+          "targets": "cuda / hip / xpu"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/dispatch.json",
+        "manual_reason": "",
+        "table": {
+          "columns": [
+            "target.backend",
+            "已发现后端数",
+            "supports_target 命中者",
+            "actives 数",
+            "结果(L308-310)"
+          ],
+          "rows": [
+            [
+              "cuda",
+              "2",
+              "cuda",
+              "1",
+              "选中 cuda(唯一,实例化返回)"
+            ],
+            [
+              "hip",
+              "2",
+              "amd",
+              "1",
+              "选中 amd(唯一,实例化返回)"
+            ],
+            [
+              "xpu",
+              "2",
+              "(无人举手)",
+              "0",
+              "RuntimeError:需恰好一个"
+            ]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "make_backend 的后置条件是 len(actives)==1:target→后端必须是良定义的函数（每个 target 恰好一个后端，可多对一）,否则立刻抛错、绝不返回歧义或空后端。",
+        "argument": "actives = [x.compiler for x in backends.values() if supports_target(target)](L307)是过滤结果;L308 `if len(actives) != 1: raise RuntimeError`(L309-310)把 0(无支持)与 ≥2(多支持、归属不清)都拦下,仅 ==1 落到 L311 return actives[0](target)。dispatch.json 实证:target=cuda/hip 各 num_actives=1(放行),target=xpu 的 num_actives=0(抛错)。"
+      },
+      "quantified": "点名代价 = O(已发现后端数)次 supports_target 调用(dispatch.json num_discovered=2 → 2 次判定);放行条件是唯一命中数严格等于 1,故合法结果集大小恒为 1,非 0 非 ≥2。target=cuda 时 num_actives=1、target=xpu 时 num_actives=0(抛错)——覆盖『恰好一个/零个』两种边界。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m6-add-stages-contract",
+      "intuition": "compile 不自己规定『降级链有哪几级、什么顺序』,而是递给后端一个空清单(stages 字典),让后端往里按顺序填工位。CUDABackend 填五行:ttir→ttgir→llir→ptx→cubin,每行绑一个加工函数。填完这张有序清单,就是全书『一路降到 PTX』要逐章展开的骨架。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch14-add-stages-skeleton",
+          "claim": "backend.add_stages 按插入序把 ttir→ttgir→llir→ptx→cubin 五级填进有序 stages 字典,compile 主循环即遍历它——这就是全书降级链的骨架,每级是 Part V-VIII 的一个 pass 专章。",
+          "template": "flow",
+          "numbers": [
+            {
+              "value": "5",
+              "provenance": "third_party/nvidia/backend/compiler.py:L385-389 CUDABackend.add_stages 登记五级;traces/dispatch.json stages_order 长度=5"
+            },
+            {
+              "value": "1",
+              "provenance": "契约 python/triton/backends/compiler.py:L273-275『末级(1 个)返 bytes,其余返 str』"
+            }
+          ],
+          "caption_draft": "结论:add_stages 是 BaseBackend 的抽象钩子(契约:插入序执行、metadata 串联、末级返 bytes);不同后端填不同 stages 即支持不同降级路径。本章只给五级骨架全貌,每个 make_xxx 内部跑哪些 MLIR pass 属 Part V-VIII 各章,前瞻 ch36 看 CUDABackend 怎么填。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m8-disk-cache-key-composition",
+      "intuition": "磁盘缓存键像一把五齿钥匙:编译器身份(triton_key)、kernel/IR 身份(src.hash)、工具链+架构(backend.hash)、编译选项(options.hash)、敏感环境变量(env_vars)——任一齿变了,钥匙就开不了旧锁、缓存 miss。它和 ch10 那把『按实参特化』的内存钥匙插的是不同的锁,互不覆盖(正交)。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch14-cache-key-composition",
+          "claim": "磁盘缓存键由 triton_key × src.hash × backend.hash × options.hash × env_vars 五个乘性组成拼成再 sha256,任一变即 miss;它与 ch10 内存特化键(按实参)维度正交、互不覆盖。",
+          "template": "state-table",
+          "numbers": [
+            {
+              "value": "5",
+              "provenance": "python/triton/compiler/compiler.py:L231 key=f\"{triton_key()}-{src.hash()}-{backend.hash()}-{options.hash()}-{env_vars}\" 五段"
+            },
+            {
+              "value": "19",
+              "provenance": "triton_key 覆盖面 = traces/triton_key.json total_inputs_incl_libtriton_so=19(五段中覆盖最广的一段)"
+            }
+          ],
+          "caption_draft": "结论:五段各自回答『什么改动触发多大范围重编』——triton_key 覆盖整个编译器(改一行源码→全部 kernel miss)、backend.hash 只含 ptxas 版本+capability(换卡/换工具链才动)、options.hash 含 num_warps 等(调参就动)、src.hash 只随 kernel 源或那份 IR 变。与 ch10 内存三桶正交,点破不重讲。"
+        }
+      ]
+    }
+  ]
+}
