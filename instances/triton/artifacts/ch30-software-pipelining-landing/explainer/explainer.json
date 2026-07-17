@@ -1,0 +1,335 @@
+{
+  "_meta": {
+    "chapter": "ch30",
+    "title": "软件流水线落地：MatmulLoopPipeline 建模与 PipelineExpander 展开",
+    "pin_evidence": "所有 run 素材取自 pin triton==3.2.0 headless 编译一段 num_stages=3 的 fp16 row-major matmul kernel、dump 到 make_ttgir 之后的 IR（TritonGPUPipeline pass 已运行）。驱动脚本 explainer/traces/run_pipeline_dump.py；产物 matmul_sm{80,90}_ns{2,3,4}.ttgir.mlir 与 pipeline_dump_summary.json；环形缓冲游标演化复算脚本 run_ringbuffer_trace.py → ringbuffer_trace.json。IR 阶段一律标注为『make_ttgir 之后』。关键前提：必须给 kernel 打真实 launch 的特化标签（指针 16B 对齐、内维 stride==1），否则 axis-info 判 load 连续度=1、宽度 16bit<32，pipeliner 直接跳过该 load（见 assignMemoryLayouts width<32 分支，MatmulLoopPipeline.cpp:L430-432）——这本身就是一条读者易踩的坑，已写进 m2。",
+    "manual_note": "m4/m5/m9 三个机制是编译期内部分析（CoarseSchedule 的 (stage,cluster) 标签、依赖调度、跨 stage 活跃期），其中间态在 pass 结束前即被消化、不出现在最终 IR；故 trace_source=manual，数值按源码公式 file:Lxxx 复算，并尽量与最终 IR 的可观测后果（numBuffers=3 的 alloc 首维、iter_args 3→7）交叉对齐。"
+  },
+  "mechanisms": [
+    {
+      "mechanism_id": "m2",
+      "intuition": "把『去仓库现取现用』改成『让搬运工提前把货搬到货架、你只管从货架拿』。同步 tt.load 是站在全局内存门口等货到手才能算；async copy（cp.async）是发一张『搬运单』就走人，算别的，货到货架（共享内存）后再回来取——搬运与计算重叠。",
+      "worked_example": {
+        "params": {"kernel": "fp16 matmul, BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, num_stages=3, sm90", "focus": "循环内喂 dot 的两个 tt.load"},
+        "trace_source": "run",
+        "trace_ref": "traces/matmul_sm90_ns3.ttgir.mlir",
+        "table": {
+          "columns": ["阶段", "A 操作数 load 的形态", "算子序列", "说明"],
+          "rows": [
+            ["make_ttir 之后（pipeliner 前）", "tt.load %a_ptrs -> tensor<128x64xf16>；紧跟 local_alloc 进共享内存", "tt.load → local_alloc → warp_group_dot", "同步：dot 必须等 load 落地"],
+            ["make_ttgir 之后（pipeliner 后）", "memdesc_subview 选环形缓冲槽 → async_copy_global_to_local（cp.async 发射，带 mask）→ async_commit_group（封组）", "subview → async_copy → async_commit …（远处）… async_wait → warp_group_dot", "异步：发搬运单即走，wait 在下游才对账"],
+            ["全循环净变化", "2 个 tt.load 归零（ttgir_tt_load=0），换成 3 缓冲深度的 async 三件套", "async_copy 出现 6 次 = 2 load ×（2 段 prologue + 1 稳态）", "tt.load 2→0，local_alloc 仍 2（两块环形缓冲）"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "每个被流水的 load 的 async_copy 必与恰好一个 async_commit_group 配对、并被下游某个 async_wait 覆盖；未满足 width≥32 的 load 不进流水、原样保留同步 tt.load。",
+        "argument": "createAsyncCopy 逐 load 依次建 AsyncCopyGlobalToLocalOp→AsyncCommitGroupOp→（下游）AsyncWaitOp 三件套（MatmulLoopPipeline.cpp:L96-L108），commit/copy 一一对应；而 assignMemoryLayouts 在 width=vec×bitWidth<32 时 continue 跳过该 load（L430-432），使其不进 loadToInfo、保持同步。两条合起来：进流水的必配对，不配对的必没进流水。"
+      },
+      "quantified": "本例 fp16、指针 16B 对齐、内维 stride==1 ⇒ 连续度 vec=8，width=8×16=128bit≥32，两 load 都合格进流水。若去掉对齐特化 ⇒ vec=1、width=16bit<32 ⇒ 两 load 都被跳过、pipeliner 对该循环整体 bail（实测：不打特化标签时 ttgir 里 tt.load 仍为 2、async_copy=0）。sm80 路径额外补 local_load 把数据从共享内存取回寄存器（ttgir_local_load=10），sm90 MMAv3 数据留在共享内存直接喂 wgmma（local_load=0）。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m2-load-to-asynccopy",
+          "claim": "一条同步 tt.load 被 pipeliner 就地拆成『选槽 subview + 异步 cp.async + 封组 commit + 下游 wait』四件套。",
+          "template": "before-after",
+          "numbers": [
+            {"value": "2", "provenance": "traces/pipeline_dump_summary.json: sm90_ns3.ttir_tt_load=2（前）"},
+            {"value": "0", "provenance": "traces/pipeline_dump_summary.json: sm90_ns3.ttgir_tt_load=0（后）"},
+            {"value": "6", "provenance": "traces/pipeline_dump_summary.json: sm90_ns3.ttgir_async_copy=6"},
+            {"value": "3", "provenance": "traces/matmul_sm90_ns3.ttgir.mlir:L61 memdesc<3x128x64xf16> 环形缓冲深度"}
+          ],
+          "caption_draft": "同步 load 变异步预取：tt.load 从 2 归 0，换成 3 深度环形缓冲上的 cp.async 三件套——搬运与计算自此可重叠。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m3",
+      "intuition": "共享内存不是一块、而是一排 N 个格子的转盘。写货的手（insertIdx）和取货的手（extractIdx）各转各的，相位差固定：写第 k 格时，取的是几拍之前写进另一格的货。转盘满一圈就回到 0（模 N 环绕）。",
+      "worked_example": {
+        "params": {"numBuffers": 3, "insert_init": 1, "extract_init": -1, "maxStage": 2, "trip": 6, "来源": "常量取自 matmul_sm90_ns3.ttgir.mlir 的 alloc 首维与 iter_args 初值"},
+        "trace_source": "run",
+        "trace_ref": "traces/ringbuffer_trace.json",
+        "table": {
+          "columns": ["iter", "extractIdx=(旧+1)%3", "读槽/取用", "insertIdx=(旧+1)%3", "写槽", "谓词 iv<trip-2", "预取"],
+          "rows": [
+            ["0", "0", "槽0 / iter0（prologue 预填）", "2", "槽2", "真", "iter2"],
+            ["1", "1", "槽1 / iter1（prologue 预填）", "0", "槽0", "真", "iter3"],
+            ["2", "2", "槽2 / iter2", "1", "槽1", "真", "iter4"],
+            ["3", "0", "槽0 / iter3", "2", "槽2", "真", "iter5"],
+            ["4", "1", "槽1 / iter4", "0", "槽0", "假", "关闭（临尾）"],
+            ["5", "2", "槽2 / iter5", "1", "槽1", "假", "关闭（临尾）"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "读游标与写游标始终保持相位差 = 流水深度（2 拍）：迭代 i 消费的正是 i 本身的数据，而它写入的是 i+2 的数据；两游标都在 [0,3) 内环绕，永不越界。",
+        "argument": "两游标同一递推 idx←(idx+1<3)?idx+1:0（MatmulLoopPipeline.cpp:L1004-L1015），值域恒 [0,3)。初值 insert=1、extract=-1（IR iter_args）令 extract 落后 insert 恰 2 拍且被 prologue 预填的槽 0、1 兜住：稳态第 i 拍读槽=(i)%3 命中 prologue/前序写入、写槽=(i+2)%3 是 2 拍后才被消费的空档，故读写不撞。归纳：每拍 pop 一格 push 一格，占用数守恒 = 深度，有限 trip 必然排空。"
+      },
+      "quantified": "深度 = num_stages−1 = 2；缓冲槽数 numBuffers = maxDistToUse(2) + 1(MMAv3) = 3（= alloc 首维，matmul_sm90_ns3.ttgir.mlir:L61）。谓词在 iter ≥ trip−2（本例 ≥4）关闭预取，恰好停发『会越过循环尾』的 cp.async。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m3-ringbuffer-rotation",
+          "claim": "3 槽环形缓冲上，读/写游标以固定 2 拍相位差旋转，写在前、读在后，互不覆盖。",
+          "template": "state-table",
+          "numbers": [
+            {"value": "3", "provenance": "traces/matmul_sm90_ns3.ttgir.mlir:L61 memdesc<3x...> 首维"},
+            {"value": "1", "provenance": "traces/matmul_sm90_ns3.ttgir.mlir:L83 insertIdx 初值 %c1_i32"},
+            {"value": "-1", "provenance": "traces/matmul_sm90_ns3.ttgir.mlir:L83 extractIdx 初值 %c-1_i32"},
+            {"value": "2", "provenance": "traces/ringbuffer_trace.json: 相位差 = maxStage = 2"}
+          ],
+          "caption_draft": "转盘式共享内存：insertIdx 写、extractIdx 读，相位差恒为流水深度 2；深度决定槽数、槽数决定 SRAM 占用。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m4",
+      "intuition": "给每个算子发两个号：stage 号（第几拍执行，决定跨迭代的时间错位）和 cluster 号（同一拍内的排队先后）。喂 dot 的 load 发『第 0 拍』、dot 本人发『最后一拍』，中间隔出的拍数就是预取提前量。",
+      "worked_example": {
+        "params": {"ops": "loadA, loadB, dot", "numStages": 3, "maxIndirectionLevel": 0, "note": "简单 matmul：两 load 直接喂 dot，无间接寻址"},
+        "trace_source": "manual",
+        "manual_reason": "CoarseSchedule 的 (stage,cluster) 标签是建模期内部账本，createFinalSchedule 展平交给 expander 后即被消化，不出现在最终 IR。数值按 scheduleLoads 公式（MatmulLoopPipeline.cpp:L558-L598）复算，并与最终 IR 可观测后果 numBuffers=3 交叉对齐。",
+        "table": {
+          "columns": ["op", "间接层 indLevel", "stage 公式", "stage", "cluster", "distToUse"],
+          "rows": [
+            ["dot（root use）", "—", "numStages−1", "2", "rootUsersCluster（front）", "—"],
+            ["loadA", "0", "(maxIndLevel−indLevel)×stagesBetweenLoads=(0−0)×1", "0", "loadsClusters[0]", "stage[dot]−stage[loadA]=2−0=2"],
+            ["loadB", "0", "(0−0)×1", "0", "loadsClusters[0]", "2−0=2"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "root use（dot）恒在最后 stage（numStages−1），每个 load 的 stage 单调随其间接层前移，故任一 load 的 distToUse = stage[use]−stage[load] ≥ 1（有真实预取提前量）。",
+        "argument": "scheduleLoads 先把非 load 的 root use 钉在 numStages−1（L568），再按 stage=(maxIndLevel−indLevel)×stagesBetweenLoads 给 load 赋 stage（L590-592），indLevel≤maxIndLevel ⇒ load 的 stage ≤ (maxIndLevel)×s ≤ ... < numStages−1（stagesBetweenLoads=ceil(numStages−2,maxIndLevel+1) 保证）；两者相减 distToUse≥1。"
+      },
+      "quantified": "stagesBetweenLoads = ceil(numStages−2, maxIndLevel+1) = ceil(1,1) = 1（MatmulLoopPipeline.cpp:L565）。distToUse=2 ⇒ numBuffers=max(2)=2，MMAv3 再 +1 = 3，与最终 IR 的 memdesc<3x...>（matmul_sm90_ns3.ttgir.mlir:L61）逐位吻合——证明这套纯内部的 stage 算术确实决定了看得见的缓冲深度。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m4-stage-cluster-labels",
+          "claim": "load 打 stage 0、dot 打 stage 2（=num_stages−1），两拍的错位就是预取提前量 distToUse=2。",
+          "template": "state-table",
+          "numbers": [
+            {"value": "0", "provenance": "MatmulLoopPipeline.cpp:L590-592 load stage=(0−0)×1"},
+            {"value": "2", "provenance": "MatmulLoopPipeline.cpp:L568 dot stage=numStages−1=2"},
+            {"value": "1", "provenance": "MatmulLoopPipeline.cpp:L565 stagesBetweenLoads=ceil(1,1)=1"},
+            {"value": "3", "provenance": "traces/matmul_sm90_ns3.ttgir.mlir:L61 numBuffers=distToUse(2)+1=3"}
+          ],
+          "caption_draft": "(stage,cluster) 二维打标：stage 定跨迭代错位、cluster 定同拍先后；load→dot 的 2 拍 stage 差直接变成 3 深度环形缓冲。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m5",
+      "intuition": "打完 stage 号还有漏网之鱼：dot 的直接依赖要跟 dot 同拍（别把它甩到别的迭代），而『下一拍才用得上』的循环携带值（distance-1，如指针自增）要提前一拍、排在那一拍的最前面，好让预取有料可取。",
+      "worked_example": {
+        "params": {"anchor": "warp_group_dot(stage 2)", "distance1_op": "tt.addptr 推进 a_ptrs/b_ptrs（喂下一拍的 async_copy）"},
+        "trace_source": "manual",
+        "manual_reason": "scheduleDependencies/scheduleDistanceOneDependencies 只重写 CoarseSchedule 里的 (stage,cluster) 归属，是建模内部步骤；最终 IR 只留其后果（addptr 落在稳态体、其结果经 yield 成为下一拍 iter_arg）。数值按 MatmulLoopPipeline.cpp:L663-L730 复算。",
+        "table": {
+          "columns": ["op", "与 anchor 的关系", "适用规则", "落点 (stage, cluster)"],
+          "rows": [
+            ["subview/wait（dot 的操作数链）", "同迭代前驱（distance 0）", "scheduleDependencies：拉到 anchor 同 stage", "(2, dot 的 cluster 之前)"],
+            ["addptr 推进指针", "循环携带、下一拍才被 async_copy 用（distance 1）", "scheduleDistanceOneDependencies：放到 next stage、当前 cluster 之前", "(stage+1, 前置 cluster)"],
+            ["其余未定 op", "无 anchor 约束", "scheduleRemainingToLastStage 兜底", "(numStages−1=2, 保序)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "调度结束后循环体里每个 op 都恰有一个 (stage,cluster)，且 use 的 cluster 绝不排在其 def 的 cluster 之前——满足 expander『每 op 有 stage 且顺序合法』的输入契约。",
+        "argument": "scheduleDependencies 把 anchor 依赖并入 anchor 的 stage（L663-L700），scheduleDistanceOneDependencies 处理跨一拍的携带依赖（L702-L730），scheduleRemainingToLastStage 给所有仍未打标的 op 兜底进最后 stage 并保序（L732-L773）。三步覆盖全部 op，故 initializeLoopInfo 的『op not assigned a pipeline stage → BAIL』（PipelineExpander.cpp:L163-165）不会触发。"
+      },
+      "quantified": "本例 distance-1 携带值 = 2 组指针自增（a_ptrs、b_ptrs），各被提前一拍安排，使其结果在稳态体末尾经 scf.yield 回灌成下一拍 iter_arg（对应最终 IR 稳态体 %88/%89 → yield，matmul_sm90_ns3.ttgir.mlir 稳态段）。expander 只接受 distance≤1 携带依赖，distance>1 直接 BAIL（PipelineExpander.cpp:L196-L209）。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m8",
+      "intuition": "开跑前先『空转几拍把流水灌满』：第 0 段只发第 0 次迭代的取数，第 1 段发第 0、1 次迭代该做的事……像上电梯前先让前几层的人依次进厢。灌到 maxStage 段，稳态循环才接手。",
+      "worked_example": {
+        "params": {"maxStage": 2, "prologue_segments": 2, "动态循环": "trip 运行期才知 ⇒ 每段用 trip 谓词兜住"},
+        "trace_source": "run",
+        "trace_ref": "traces/matmul_sm90_ns3.ttgir.mlir",
+        "table": {
+          "columns": ["prologue 段", "守卫谓词", "写入槽", "发射内容", "IR 证据"],
+          "rows": [
+            ["段 0", "trip > 0（%44 = cmpi sgt %39, 0）", "槽 0（subview %42[0]）", "async_copy A、B 进槽 0 + commit", "%45–%52"],
+            ["段 1", "trip > 1（%53 = cmpi sgt %39, 1）", "槽 1（subview %42[1]）", "先 addptr 推进指针，再 async_copy A、B 进槽 1 + commit", "%54–%63"],
+            ["稳态入口 iter_args 初值", "—", "insertIdx=1, extractIdx=-1", "prologue 已填槽 0、1，故写游标从 1 起、读游标从 -1 起", "%64:7 的 %arg16=1,%arg17=-1"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "prologue 段数 = maxStage = num_stages−1；第 i 段只克隆 stage≤i 的 op，克隆出的每个值按填充轮次存入 valueMapping[值][i−stage]，供后续段与稳态体索引正确版本。",
+        "argument": "emitPrologue 外层 i 从 0 到 maxStage−1（PipelineExpander.cpp:L305 起），内层跳过 stages[op]>i 的 op（L306-307），故第 i 段执行的是『提前跑到第 i 拍就该完成』的所有早 stage 工作；setValueMapping(…, i−stages[op]) 按版本号存值（L340-343）。动态循环时每段裹谓词 predicates[i]（L316-320），保证 trip 不足时不误发。"
+      },
+      "quantified": "本例灌 2 段：段 0 预取 iter0、段 1 预取 iter1，正好把 3 槽缓冲填 2 槽（留 1 槽给稳态第一拍写 iter2）。async_copy 总数 6 = prologue 2 段 ×2 load + 稳态 1×2 load（pipeline_dump_summary.json: sm90_ns3.ttgir_async_copy=6）。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m8-prologue-staircase",
+          "claim": "prologue 是 2 级台阶：段 0 发 iter0 的取数、段 1 发 iter1 的取数，各由 trip>0、trip>1 谓词兜住，把环形缓冲预填到 2 槽。",
+          "template": "swimlane",
+          "numbers": [
+            {"value": "2", "provenance": "traces/matmul_sm90_ns3.ttgir.mlir prologue 段数=maxStage=2"},
+            {"value": "0", "provenance": "traces/matmul_sm90_ns3.ttgir.mlir:段0 写槽 subview %42[0]"},
+            {"value": "1", "provenance": "traces/matmul_sm90_ns3.ttgir.mlir:段1 写槽 subview %42[1]"},
+            {"value": "6", "provenance": "traces/pipeline_dump_summary.json: sm90_ns3.ttgir_async_copy=6（2 段×2+稳态2）"}
+          ],
+          "caption_draft": "填流水线的台阶：maxStage=2 段 prologue 把迭代 0、1 的 cp.async 提前发出，缓冲预填 2 槽后交给稳态循环。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m9",
+      "intuition": "有些值『这一拍造、好几拍后才用』——比如发出去的搬运单（async token），commit 在早 stage、wait 在晚 stage。要把它从造到最后一次用之间的跨度量出来，才知道循环里得替它留几个副本。",
+      "worked_example": {
+        "params": {"cross_stage_values": "2 个 async_commit token（A、B 各一）", "defStage": 0, "lastUseStage": 2},
+        "trace_source": "manual",
+        "manual_reason": "analyzeCrossStageValues 产出的 (defStage,lastUseStage) 活跃期表是 expander 中间数据结构，随即被 createKernelLoop 消费、不落最终 IR。数值按 PipelineExpander.cpp:L352-L398 定义复算，与最终 IR 新增的 2 个 async.token iter_arg 交叉对齐。",
+        "table": {
+          "columns": ["跨 stage 值", "defStage（造）", "lastUseStage（末用）", "活跃跨度 = 末−造", "需保留副本数"],
+          "rows": [
+            ["A 的 async_commit token", "0（copy/commit 所在 stage）", "2（wait 所在 stage）", "2", "2"],
+            ["B 的 async_commit token", "0", "2", "2", "2"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "只有 defStage≠useStage 且 useStage≠defStage+distance 的值才登记为跨 stage 值；其活跃跨度 lastUseStage−defStage 恒 ≥1，且等于它在稳态循环里所需的额外 iter_arg 副本数。",
+        "argument": "analyzeOperand 对每个操作数取其 def 的 stage，若 defStage==useStage 或 ==useStage+distance 则 return 不登记（PipelineExpander.cpp:L363-366）；否则 assert(stage>defStage) 并记 lastUseStage=max(…,stage)（L367-370）。跨度即『同一原值要同时代表几个在飞迭代』，直接喂给 createKernelLoop 补副本。"
+      },
+      "quantified": "本例 2 个 token 各跨 2 stage，故稳态循环各留 2 个版本——体现在最终 IR：iter_args 从原 3 个（acc,a_ptrs,b_ptrs）涨到 7 个，新增 4 = insertIdx + extractIdx +（A、B 各 1 个）async.token（matmul_sm90_ns3.ttgir.mlir:L83 %64:7）。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m10",
+      "intuition": "同一句『a = load(...)』在展开后要同时代表好几个正在半空中的迭代的 a。办法是给循环多挂几个 iter_arg 当『不同拍的 a 的存档』——一个 SSA 名，背后其实排着一列在飞版本。这就是『展开』二字的字面含义。",
+      "worked_example": {
+        "params": {"orig_iter_args": 3, "new_iter_args": 7, "added": 4},
+        "trace_source": "run",
+        "trace_ref": "traces/matmul_sm90_ns3.ttgir.mlir",
+        "table": {
+          "columns": ["iter_arg", "来历", "谁添加的", "初值"],
+          "rows": [
+            ["%arg13 acc", "原循环携带（累加器）", "原 kernel", "%cst_0"],
+            ["%arg14 a_ptrs / %arg15 b_ptrs", "原循环携带（指针）", "原 kernel", "%54 / %55"],
+            ["%arg16 insertIdx / %arg17 extractIdx", "环形缓冲读写游标", "createAsyncOps（建模期）", "1 / -1"],
+            ["%arg18 / %arg19 async.token", "跨 stage 活跃的搬运单版本（模变量扩展补出）", "PipelineExpander createKernelLoop", "%52 / %63"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "每个活跃期跨 k 个 stage 的值补 k 份 iter_arg，且 loopArgMap[(值, stage差)]→iter_arg 下标一一对应，使 createKernel 能按 (useStage−defStage) 精确接回对应版本。",
+        "argument": "createKernelLoop 对每个 crossStageValue 循环 stageIdx∈[0, lastUseStage−defStage) 各 push 一份 iter_arg（PipelineExpander.cpp:L430-438），并登记 loopArgMap[(value, span−stageIdx)]=下标（L436-437）。span 份副本对应 span 个在飞迭代版本；下标映射的存在性由 createKernel 侧的 assert(remap!=end)（L563）反向保证。"
+      },
+      "quantified": "本例新增 4 个 iter_arg（3→7，matmul_sm90_ns3.ttgir.mlir:L83 %64:7）：其中 2 个游标来自建模期 createAsyncOps，2 个 async.token 副本来自 expander 的模变量扩展（对应 m9 两个跨 2-stage 的 token）。若 num_stages 更深、活跃跨度更大，副本数随之增多——iter_arg 膨胀是流水加深的第二类代价（第一类是 SRAM）。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m10-iterarg-expansion",
+          "claim": "循环签名从 3 个 iter_arg 扩到 7 个：+2 环形游标、+2 跨 stage 搬运单副本，后者正是模变量扩展的产物。",
+          "template": "before-after",
+          "numbers": [
+            {"value": "3", "provenance": "make_ttir 之后原循环 iter_args=3（acc,a_ptrs,b_ptrs）"},
+            {"value": "7", "provenance": "traces/matmul_sm90_ns3.ttgir.mlir:L83 %64:7"},
+            {"value": "2", "provenance": "PipelineExpander.cpp:L430-438 跨 2-stage token 各补 2 份中的新增部分（2 个 token）"},
+            {"value": "1", "provenance": "traces/matmul_sm90_ns3.ttgir.mlir:L83 insertIdx 初值 1"}
+          ],
+          "caption_draft": "『展开』的字面含义：一个跨 stage 的 SSA 值在循环签名里裂成多份 iter_arg，让单次迭代同时握住多个在飞版本。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m11",
+      "intuition": "稳态循环体一拍干三件事，但分属不同迭代：给 I+2 次迭代发取数（S0）、给 I 次迭代算 dot（S2）。同一段代码，操作数各接各拍的版本——早 stage 用刚算的新值，晚 stage 用几拍前存下的旧档。",
+      "worked_example": {
+        "params": {"one_iteration": "S0(I+2) 取数 / S2(I) 计算 同体并行", "kernel": "sm90 num_stages=3"},
+        "trace_source": "run",
+        "trace_ref": "traces/matmul_sm90_ns3.ttgir.mlir",
+        "table": {
+          "columns": ["稳态体内动作", "属于哪拍迭代", "操作数版本来源", "IR 证据"],
+          "rows": [
+            ["extractIdx 推进 → memdesc_subview 读槽 → warp_group_dot", "S2：本拍 I 计算", "读的是 2 拍前 prologue/前序写入的槽（extractIdx=(旧+1)%3）", "%82,%83,%86"],
+            ["insertIdx 推进 → memdesc_subview 写槽 → async_copy(mask) → commit", "S0：为 I+2 拍取数", "写的是当前指针 %88/%89（本拍推进后）", "%92,%93,%95,%96"],
+            ["scf.yield 回灌", "把本拍产物交给下一拍", "acc、指针、两游标、async.token 版本轮转", "yield %87#0,%88,%89,%92,%82,…"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "稳态体克隆每个 op 后，凡操作数来自更早 stage 就按 (useStage−defStage) 查 loopArgMap 接到对应版本 region iter-arg；诱导变量按 (maxStage−stage)×step 加偏移——于是同体一拍内 S0 用本拍新值、S2 用 depth 拍前旧值，语义等价于原顺序循环。",
+        "argument": "createKernel 遍历 opOrder 克隆（PipelineExpander.cpp:L502 起），对跨 stage 操作数 setOperand 到 newForOp.getRegionIterArgs()[loopArgMap[…]]（L560-564），对诱导变量派生按 (maxStage−stage)*step 偏移（L516-531）。版本表 loopArgMap 由 m10 建立，故每次接回的都是该迭代对应拍的正确拷贝；yield 再把各版本前移一格，维持转盘不变式。"
+      },
+      "quantified": "本例稳态体单拍同时推进：读游标覆盖 iter I、写游标覆盖 iter I+2，重叠深度 2。这把『取数延迟』藏在 2 拍计算之后——num_stages=3 时理论上可让 dot 几乎不等 load（前提 SRAM 够、occupancy 未被挤垮，回指 ch29 s* / ch26 预算）。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m11-steady-body-overlap",
+          "claim": "稳态循环单次迭代同体并行跑 S0(I+2) 取数与 S2(I) 计算，操作数各接各拍版本。",
+          "template": "swimlane",
+          "numbers": [
+            {"value": "2", "provenance": "重叠深度=maxStage=2（traces/matmul_sm90_ns3.ttgir.mlir）"},
+            {"value": "3", "provenance": "traces/matmul_sm90_ns3.ttgir.mlir:L61 numBuffers=3"},
+            {"value": "1", "provenance": "traces/matmul_sm90_ns3.ttgir.mlir:%87 warp_group_dot_wait pendings=1"},
+            {"value": "7", "provenance": "traces/matmul_sm90_ns3.ttgir.mlir:L83 %64:7 稳态 iter_args"}
+          ],
+          "caption_draft": "稳态体的时空并行：一次迭代里，写游标为 I+2 发取数、读游标为 I 喂 dot，靠版本化 iter_arg 让同一段代码承载多拍在飞迭代。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m12",
+      "intuition": "不另写一段收尾代码去排空流水，而是让稳态体自己『临尾自觉收手』：给每个早 stage 挂一个谓词『还没到最后 (maxStage−i) 拍才干』，越接近循环尾，早 stage 一个个自动闭嘴，等价于把排空折进主循环——还天然支持循环次数运行期才知。",
+      "worked_example": {
+        "params": {"peelEpilogue": false, "supportDynamicLoops": true, "predicate_stage0": "iv < ub − 2×step"},
+        "trace_source": "run",
+        "trace_ref": "traces/matmul_sm90_ns3.ttgir.mlir",
+        "table": {
+          "columns": ["位置", "构造", "作用", "IR 证据"],
+          "rows": [
+            ["稳态体开头", "%78 = ub − 2；%79 = cmpi slt, iv, %78", "stage 0 的谓词：临尾前 2 拍起不再发取数", "%78,%79"],
+            ["async_copy 处", "splat %79 作 mask 喂 async_copy_global_to_local", "谓词假 ⇒ 该拍 cp.async 被 mask 关闭（不越界取数）", "%94,%95,%98,%99"],
+            ["循环之后（无独立 epilogue）", "warp_group_dot_wait pendings=0；async_wait num=0；local_dealloc", "排空最后在飞的 dot 与 copy、释放缓冲——收尾靠这几条而非 emitEpilogue", "%65,%66"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "peelEpilogue=false 时不发独立 epilogue：稳态体给每个 stage i<maxStage 造谓词 iv < ub−(maxStage−i)×step，逼近尾部时早 stage 逐个关闭，等价排空且对动态 trip 成立。",
+        "argument": "createKernel 在 !peelEpilogue 分支为 i∈[0,maxStage) 构造 c=ub−(maxStage−i)×step、pred=(iv<c)（PipelineExpander.cpp:L482-501），越大的 i 关得越晚；predicateFn 用该谓词裹住对应 stage 的 op。pipelineForLoop 仅在 options.peelEpilogue 时才调 emitEpilogue（L828），故 Triton matmul 路径根本不生成独立 epilogue，收尾完全由这些递减边界的谓词 + 循环后一条 async_wait 0 完成。"
+      },
+      "quantified": "本例 maxStage=2 ⇒ 只 stage 0 需谓词（边界 ub−2×step）；stage 1、2 无谓词（stage 2 是最后 stage 本就每拍执行）。ttgir 里 scf.if=0（pipeline_dump_summary.json: sm90_ns3.ttgir_scf_if=0）——收尾没被展开成分支块，纯靠 mask 谓词 + 循环后的 async_wait num=0，代码体积不随收尾膨胀。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m12-predicated-drain",
+          "claim": "谓词化收尾：stage 0 的取数在 iv≥ub−2 时被 mask 关闭，早 stage 临尾逐个熄灭，排空折进主循环、无独立 epilogue 块。",
+          "template": "state-table",
+          "numbers": [
+            {"value": "2", "provenance": "traces/matmul_sm90_ns3.ttgir.mlir:%78 = ub − 2（maxStage=2）"},
+            {"value": "0", "provenance": "traces/matmul_sm90_ns3.ttgir.mlir:%66 async_wait num=0（循环后排空）"},
+            {"value": "0", "provenance": "traces/pipeline_dump_summary.json: sm90_ns3.ttgir_scf_if=0（无独立 epilogue 分支）"},
+            {"value": "6", "provenance": "traces/ringbuffer_trace.json: trip=6 时谓词在 iter≥4（=trip−2）关闭预取"}
+          ],
+          "caption_draft": "收尾不 peel、而是谓词化：早 stage 的 cp.async 在临尾 2 拍被谓词关掉，等价排空且天然支持运行期未知的循环次数。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m14",
+      "intuition": "Hopper 的 wgmma 本就是『发射即返回』的异步指令。默认保守：每个 dot 后紧跟一条 wait 0 变同步；只有当能证明安全（结果只被下一个 wgmma 当累加数吃、操作数在多 buffer 里稳住）才免掉紧跟的 wait，让两个 dot 真正流起来、深度到 2。",
+      "worked_example": {
+        "params": {"op": "warp_group_dot（MMAv3/wgmma）", "深度": 2},
+        "trace_source": "run",
+        "trace_ref": "traces/matmul_sm90_ns3.ttgir.mlir",
+        "table": {
+          "columns": ["位置", "构造", "含义", "IR 证据"],
+          "rows": [
+            ["稳态体 dot", "warp_group_dot {isAsync = true}", "asyncLaunchDots 把 wgmma 置异步", "%86 isAsync = true"],
+            ["稳态体 dot 之后", "warp_group_dot_wait {pendings = 1}", "允许 1 个 wgmma 在飞（深度 2 的等待水位），不是 pendings=0 的全同步", "%87 pendings = 1"],
+            ["循环之后", "warp_group_dot_wait {pendings = 0}", "排空最后在飞的 wgmma，取回最终 acc", "%65 pendings = 0"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "满足 dotCanBeProperlyAsync 三规则的 wgmma 才免紧跟 wait 0；否则紧插 pendings=0 的 WarpGroupDotWait。本例满足 ⇒ 循环内水位 pendings=1（放 1 个在飞）、循环后 pendings=0（排空）。",
+        "argument": "asyncLaunchDots 先对每个 WarpGroupDot setIsAsync(true)；dotCanBeProperlyAsync 返回 iterArgIdx 则登记 properlyAsyncDots、否则紧插 WarpGroupDotWait(pendings=0)（MatmulLoopPipeline.cpp:L1615-L1625）。随后 insertAsyncWarpGroupDotWaitInLoop 按流水深度在循环内插 pendings=1 的 wait（放 1 个在飞），循环后再补 pendings=0 等最终迭代（L1637-L1647）。三规则（结果仅被下个 wgmma 当 c 操作数、操作数来自多 buffer、循环内使用受限）保证省 wait 安全。",
+        "argument_note": "断言→论证：省 wait 的安全性不是空口，而是三条可判定规则的合取（回指 ch24 warp_group_dot 语义）。"
+      },
+      "quantified": "本例流水深度 2：循环内保留 1 个 wgmma 在飞（pendings=1），故 dot 的等待被推后一拍、与下一拍的取数/计算重叠。若 dotCanBeProperlyAsync 不满足，则退化为每拍 pendings=0 全同步，wgmma 异步优势归零。",
+      "figure_specs": []
+    }
+  ]
+}

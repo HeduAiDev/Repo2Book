@@ -5,6 +5,7 @@
 ## Recent Activity
 
 | Date | Type | Chapter | Summary | File |
+| 2026-07-17 | delivery | ch30 | 软件流水线落地 MatmulLoopPipeline 建模与 PipelineExpander 展开 定稿(回收 f16) | [2026-07-17_ch30-软件流水线落地-matmullooppipeline-建模与-pipelineexpander-展开-定稿.md](deliveries/2026-07-17_ch30-软件流水线落地-matmullooppipeline-建模与-pipelineexpander-展开-定稿.md) |
 | 2026-07-17 | delivery | ch32 | ch32 五级台阶与第一跳 TTIR→TTGIR 定稿(Part VII 开篇) | [2026-07-17_ch32-ch32-五级台阶与第一跳-ttir→ttgir-定稿(part-vii-开篇).md](deliveries/2026-07-17_ch32-ch32-五级台阶与第一跳-ttir→ttgir-定稿(part-vii-开篇).md) |
 | 2026-07-17 | delivery | ch29 | ch29 software-pipelining-primer delivered (primer) | [2026-07-17_ch29-ch29-software-pipelining-primer-delivered-(primer).md](deliveries/2026-07-17_ch29-ch29-software-pipelining-primer-delivered-(primer).md) |
 | 2026-07-17 | delivery | ch28 | ch28《AccelerateMatmul 与布局最优化：tt.dot→MMA、减少 convert_layout》定稿 | [2026-07-17_ch28-ch28《acceleratematmul-与布局最优化：tt.dot→mma、减少-convert_layout》定稿.md](deliveries/2026-07-17_ch28-ch28《acceleratematmul-与布局最优化：tt.dot→mma、减少-convert_layout》定稿.md) |
@@ -14,4 +15,3 @@
 | 2026-07-17 | delivery | 25 | ch25《AxisInfo 静态分析与 Coalesce 改写》定稿——Part VI 开篇 + 全书第一个 analysis→transform 最短闭环 | [2026-07-17_ch25-ch25《axisinfo-静态分析与-coalesce-改写》定稿——part-vi-开篇-+-全书第一个-analy.md](deliveries/2026-07-17_ch25-ch25《axisinfo-静态分析与-coalesce-改写》定稿——part-vi-开篇-+-全书第一个-analy.md) |
 | 2026-07-17 | delivery | 23 | ch23《LinearLayout：一个抽象统一所有布局》定稿 + 回收 f17 | [2026-07-17_ch23-ch23《linearlayout：一个抽象统一所有布局》定稿-+-回收-f17.md](deliveries/2026-07-17_ch23-ch23《linearlayout：一个抽象统一所有布局》定稿-+-回收-f17.md) |
 | 2026-07-17 | delivery | 22 | ch22《Shared 编码与 swizzle：共享内存里如何避开 bank 冲突》定稿（skip_impl，新开 f18→ch34） | [2026-07-17_ch22-ch22-shared-encoding-swizzle-delivered-(skip_impl).md](deliveries/2026-07-17_ch22-ch22-shared-encoding-swizzle-delivered-(skip_impl).md) |
-| 2026-07-17 | delivery | 21 | ch21《Distributed 布局：Blocked、Slice、MMA 与 DotOperand 编码》定稿（skip_impl，无新伏笔） | [2026-07-17_ch21-ch21-distributed-layouts-delivered-(skip_impl).md](deliveries/2026-07-17_ch21-ch21-distributed-layouts-delivered-(skip_impl).md) |
