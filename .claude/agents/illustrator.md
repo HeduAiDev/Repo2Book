@@ -97,6 +97,10 @@ figure_specs/spec.numbers 通道(既有铁律对此类图豁免)。
   cell/step 内部序号。这些读者无从解读(ch03 漏印 `m13`、ch06 漏印 `f7` 均被评审抓)。
   出处/回指用读者能懂的话:「Triton v3.2.0 实测」「回收上一章的伏笔」「重绘自 arXiv:xxxx Fig.N」。
   (内部 ID 是给 explainer/盲审/archivist 对账用的,留在 manifest/spec/bible,别上图。)
+  **确定性门禁(2026-07-17 补,exp-0717-8)**:`scripts/lint_diagram_scaffolding.py` 扫渲染出的
+  SVG `<text>` 节点,命中 `traces/`/`explainer/`/`dossier`/`impl-notes`/`…/source/` 即阻断——
+  出图前自跑 `python3 scripts/lint_diagram_scaffolding.py <chapter_dir>`(入 `--all` 常规门禁)。
+  此前此规则只写在契约里、无 linter 兜底,ch04-ch32 累计 20 张图漏印 `traces/*.json`。
 - 自查必须**先 Read PNG 再填表**——凭想象填表 = 造假,盲审和 linter 都会抓。
 - 收到盲审 FAIL:按 issue 的 suggested_fix 改,重渲重看,更新 manifest;不与盲审争风格,
   只核事实(数字/论点/可读性)。
