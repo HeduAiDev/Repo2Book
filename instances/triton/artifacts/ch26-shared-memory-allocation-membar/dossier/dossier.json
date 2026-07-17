@@ -1,0 +1,330 @@
+{
+  "kind": "skip_impl",
+  "chapter": "ch26",
+  "title": "共享内存分配与屏障：Allocation、Alias 与 Membar",
+  "one_line": "ch25 建立的 analysis→transform 母范式的又一实例（回指 ch25，不重讲范式）：两个只读分析——AllocationAnalysis 在有限共享内存里给每个 buffer 定 offset 并算出总 sharedMemorySize；MembarAnalysis 靠 buffer 区间在写后读/读后写处自动插 barrier。",
+
+  "code_spine": [
+    "lib/Analysis/Allocation.cpp:L188-L192  AllocationAnalysis::run() 三步：getValuesAndSizes → resolveLiveness → computeOffsets",
+    "lib/Analysis/Allocation.cpp:L195-L222  getExplicitValueSize：显式 local_alloc 的 buffer 字节数（BufferKind::Explicit）",
+    "lib/Analysis/Allocation.cpp:L238-L312  getScratchValueSize：convert_layout 的 scratch（Scratch）/ 函数调用的 virtual buffer（Virtual）",
+    "lib/Analysis/Allocation.cpp:L328-L357  getValuesAndSizes：walk 收集 explicit/scratch/virtual + 跑 SharedMemoryAliasAnalysis 收 alias",
+    "lib/Analysis/Alias.cpp:L24-L60        SharedMemoryAliasAnalysis::visitOperation：只有 local_alloc 造新 buffer，subview/trans 传递别名",
+    "lib/Analysis/Allocation.cpp:L428-L489  resolveLiveness：给 op 编 post-order ID，用 mlir::Liveness 求每个 buffer 的活跃区间；alias 并入活跃期",
+    "lib/Analysis/Allocation.cpp:L511-L577  computeOffsets：calculateStarts 初定址 → buildInterferenceGraph → allocate 循环到不动点",
+    "lib/Analysis/Allocation.cpp:L580-L637  calculateStarts：tripleMap 空隙表 + first-fit 给 buffer 落对齐 offset",
+    "lib/Analysis/Allocation.cpp:L641-L681  buildInterferenceGraph：活跃区间相交 ∧ 地址区间相交 → 连冲突边",
+    "lib/Analysis/Allocation.cpp:L684-L725  allocate：first-fit 图着色 + 按邻居 max(offset+size) 定址；sharedMemorySize = max(offset+size)",
+    "include/triton/Analysis/Allocation.h:L268-L275  ModuleAllocation::getSharedMemorySize：整条 call graph 取 roots 的 max",
+    "lib/Analysis/Membar.cpp:L14-L19       MembarAnalysis::run：拿到 funcOp 与 OpBuilder，调 resolve",
+    "lib/Analysis/Membar.cpp:L21-L80       resolve：block 级不动点，逐 op update，把 dangling buffer 汇到 funcBlockInfo",
+    "lib/Analysis/Membar.cpp:L101-L185     update：按 MemoryEffect 填 syncRead/syncWrite 区间，isIntersected 命中则插 barrier 再 sync",
+    "include/triton/Analysis/Membar.h:L18-L75  BlockInfo：syncRead/syncWrite 区间集 + join/sync/isIntersected（RAW/WAR/WAW）"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "lib/Analysis/Allocation.cpp",
+      "lines": "L188-L192",
+      "what": "AllocationAnalysis 主干三步——本章的算法骨架",
+      "code": "  void run() {\n    getValuesAndSizes();\n    resolveLiveness();\n    computeOffsets();\n  }"
+    },
+    {
+      "path": "include/triton/Analysis/Allocation.h",
+      "lines": "L175-L204",
+      "what": "BufferT——共享内存 buffer 的三种来源（Explicit/Scratch/Virtual）与 offset/size/alignment 字段；setOffsetAligned 是对齐定址的唯一入口",
+      "code": "  /// A class that represents a shared memory buffer\n  struct BufferT {\n    /// Explicit: triton_gpu.local_alloc\n    /// Scratch: triton_gpu.convert_layout\n    /// Virtual: triton.call\n    enum class BufferKind { Explicit, Scratch, Virtual };\n\n    /// MT: thread-safe\n    inline static std::atomic<BufferId> nextId = 0;\n\n    BufferKind kind;\n    BufferId id;\n    size_t size;\n    size_t alignment;\n    size_t offset;\n    SetVector<int> regionIds;\n    int sharingGroup; // -1 means not shared\n\n    bool operator==(const BufferT &other) const { return id == other.id; }\n    bool operator<(const BufferT &other) const { return id < other.id; }\n\n    BufferT() : BufferT(BufferKind::Explicit, 0) {}\n    BufferT(BufferKind kind, size_t size, size_t alignment = 4,\n            size_t offset = 0, int sharingGroup = -1)\n        : kind(kind), id(nextId++), size(size), alignment(alignment),\n          offset(offset), sharingGroup(sharingGroup) {}\n\n    size_t setOffsetAligned(size_t newOffset) {\n      return offset = llvm::alignTo(newOffset, alignment);\n    }\n  };",
+      "elide": []
+    },
+    {
+      "path": "lib/Analysis/Allocation.cpp",
+      "lines": "L195-L222",
+      "what": "谁要共享内存之一：显式 local_alloc。字节数 = shapePerCTA 元素数 × 位宽/8（回指 ch24 的 local_alloc/memdesc，本章讲它怎么被定址）",
+      "code": "  /// Initializes explicitly defined shared memory values for a given operation.\n  void getExplicitValueSize(Operation *op) {\n    for (Value result : op->getResults()) {\n      auto alloc = result.getDefiningOp<triton::gpu::LocalAllocOp>();\n      if (alloc && alloc.isSharedMemoryAlloc()) {\n        // Bytes could be a different value once we support padding or other\n        // allocation policies.\n        auto allocType = alloc.getType();\n        auto shapePerCTA = triton::gpu::getShapePerCTA(allocType);\n        auto bytes = product<int64_t>(shapePerCTA) *\n                     allocType.getElementTypeBitWidth() / 8;\n\n        auto alignment = alloc.getAlignmentOrDefault();\n        ...\n        allocation->addBuffer<BufferT::BufferKind::Explicit>(\n            result, bytes, alignment, 0, sharingGroup);\n      }\n    }\n  }",
+      "elide": ["L207-L217 的 LLVM_DEBUG dump 与 allocation.shareGroup 属性读取（warp-spec 才用，主线可略）"]
+    },
+    {
+      "path": "lib/Analysis/Allocation.cpp",
+      "lines": "L258-L304",
+      "what": "谁要共享内存之二三：convert_layout 的 scratch（从/到 shared 不需要）与函数调用的 virtual buffer（大小 = 被调函数的 sharedMemorySize，回指 call graph 后序遍历）",
+      "code": "    } else if (auto cvtLayout = dyn_cast<triton::gpu::ConvertLayoutOp>(op)) {\n      auto srcTy = cvtLayout.getSrc().getType();\n      auto dstTy = cvtLayout.getType();\n      auto srcEncoding = srcTy.getEncoding();\n      auto dstEncoding = dstTy.getEncoding();\n      if (mlir::isa<SharedEncodingAttr>(srcEncoding) ||\n          mlir::isa<SharedEncodingAttr>(dstEncoding)) {\n        // Conversions from/to shared memory do not need scratch memory.\n        return;\n      }\n      // ConvertLayoutOp with both input/output non-shared_layout\n      auto scratchConfig = getScratchConfigForCvt(srcTy, dstTy);\n      auto elems = getNumScratchElements(scratchConfig.paddedRepShape);\n      auto bytes =\n          isa<triton::PointerType>(srcTy.getElementType())\n              ? elems * kPtrBitWidth / 8\n              : elems * std::max<int>(8, srcTy.getElementTypeBitWidth()) / 8;\n      maybeAddScratchBuffer<BufferT::BufferKind::Scratch>(op, bytes,\n                                                          scratchAlignment);\n    }\n    ...\n    else if (auto callOp = dyn_cast<CallOpInterface>(op)) {\n      auto callable = callOp.resolveCallable();\n      auto funcOp = dyn_cast<FunctionOpInterface>(callable);\n      auto *funcAlloc = &(*funcAllocMap)[funcOp];\n      auto bytes = funcAlloc->getSharedMemorySize();\n      maybeAddScratchBuffer<BufferT::BufferKind::Virtual>(op, bytes,\n                                                          scratchAlignment);\n    }",
+      "elide": ["同函数内 reduce/scan/histogram/atomic/tensormap 各分支（都是同一模式：算 bytes → maybeAddScratchBuffer<Scratch>；正文举 convert_layout 即可，其余点名不逐一展开）"]
+    },
+    {
+      "path": "lib/Analysis/Alias.cpp",
+      "lines": "L24-L60",
+      "what": "SharedMemoryAliasAnalysis 转移函数：唯一造新 buffer 的是 local_alloc；subview/trans 只传递源的 alloc 集合；其余保守（pessimistic）",
+      "code": "LogicalResult SharedMemoryAliasAnalysis::visitOperation(\n    Operation *op, ArrayRef<const dataflow::Lattice<AliasInfo> *> operands,\n    ArrayRef<dataflow::Lattice<AliasInfo> *> results) {\n  AliasInfo aliasInfo;\n  bool pessimistic = true;\n  auto result = op->getResult(0);\n  // skip ops that return memdesc in a different memory space.\n  if (auto memdescTy = dyn_cast<triton::MemDescType>(result.getType())) {\n    if (!isa_and_nonnull<triton::gpu::SharedMemorySpaceAttr>(\n            memdescTy.getMemorySpace()))\n      return success();\n  }\n\n  // Only LocalAllocOp creates a new buffer.\n  if (isa<triton::gpu::LocalAllocOp>(op)) {\n    aliasInfo.insert(result);\n    pessimistic = false;\n  } else if (isa<triton::gpu::MemDescSubviewOp, triton::TransOp>(op)) {\n    // extract_slice %src\n    // trans %src\n    aliasInfo = AliasInfo(operands[0]->getValue());\n    pessimistic = false;\n  } else {\n    assert(!isa<triton::MemDescType>(result.getType()) &&\n           \"unknown operation creating memory descriptor\");\n  }\n\n  if (pessimistic) {\n    setAllToEntryStates(results);\n    return success();\n  }\n  // Join all lattice elements\n  for (auto *result : results)\n    propagateIfChanged(result, result->join(aliasInfo));\n\n  return success();\n}",
+      "elide": []
+    },
+    {
+      "path": "include/triton/Analysis/Alias.h",
+      "lines": "L42-L59",
+      "what": "Alias 头注释里 scf.for/yield 的别名图例——为何 v4 的活跃期是 [v1,v2] 的并、v1 的活跃期是 v3∪v4∪v6 的并。这是『scf.for/yield 造成的别名并入活跃期』的原始出处",
+      "code": "  /// For now, we only consider aliased value produced by the following\n  /// situations:\n  /// 1. values returned by scf.yield\n  /// 2. block arguments in scf.for\n  /// Example:\n  ///    alloc v1                  alloc v2\n  ///       |                         |\n  ///    |--------------|   |------------|\n  ///  scf.for v3     scf.for v4       scf.for v5\n  ///    |\n  /// scf.yield v6\n  ///\n  /// v1's alloc [v1]\n  /// v2's alloc [v2]\n  /// v3's alloc [v1]\n  /// v4's alloc [v1, v2]\n  /// v5's alloc [v2]\n  /// v6's alloc [v1]\n  ///\n  /// Therefore, v1's liveness range is the union of v3, v4, and v6",
+      "elide": []
+    },
+    {
+      "path": "lib/Analysis/Allocation.cpp",
+      "lines": "L374-L392",
+      "what": "resolveAliasBufferLiveness：把别名值的活跃区间并进被别名 buffer 的活跃期（min/max 取并），实现 Alias.h 图例里『v1 的活跃期 = 各别名活跃区间的并』",
+      "code": "  void resolveAliasBufferLiveness(\n      function_ref<Interval<size_t>(Value value, BufferT *buffer)>\n          getLiveness) {\n    for (auto aliasBufferIter : allocation->aliasBuffer) {\n      auto value = aliasBufferIter.first;\n      auto buffers = aliasBufferIter.second;\n      auto range = getLiveness(value, buffers.front());\n      for (auto *buffer : buffers) {\n        auto minId = range.start();\n        auto maxId = range.end();\n        if (bufferRange.count(buffer)) {\n          // Extend the allocated buffer's range\n          minId = std::min(minId, bufferRange[buffer].start());\n          maxId = std::max(maxId, bufferRange[buffer].end());\n        }\n        bufferRange[buffer] = Interval(minId, maxId);\n      }\n    }\n  }",
+      "elide": []
+    },
+    {
+      "path": "lib/Analysis/Allocation.cpp",
+      "lines": "L445-L484",
+      "what": "resolveLiveness 核心：post-order 给 op 编 ID（保证父 op ID 大于子 op，让跨 region 使用的 buffer 活跃期不早退）；用 mlir::Liveness 求每个 explicit buffer 的 [minId,maxId) 区间",
+      "code": "    DenseMap<Operation *, size_t> operationId;\n    operation->walk<WalkOrder::PostOrder>(\n        [&](Operation *op) { operationId[op] = operationId.size(); });\n\n    // Analyze liveness of explicit buffers\n    Liveness liveness(operation);\n    auto getValueLivenessRange = [&](Value value, BufferT *buffer) {\n      auto liveOperations = liveness.resolveLiveness(value);\n      ...\n      auto minId = std::numeric_limits<size_t>::max();\n      auto maxId = std::numeric_limits<size_t>::min();\n      std::for_each(\n          liveOperations.begin(), liveOperations.end(), [&](Operation *liveOp) {\n            ...\n            if (operationId[liveOp] < minId) {\n              minId = operationId[liveOp];\n            }\n            if ((operationId[liveOp] + 1) > maxId) {\n              maxId = operationId[liveOp] + 1;\n            }\n          });\n      return Interval(minId, maxId);\n    };\n\n    resolveExplicitBufferLiveness(getValueLivenessRange);\n    resolveAliasBufferLiveness(getValueLivenessRange);\n    resolveScratchBufferLiveness(operationId);",
+      "elide": ["warp-spec 分支（regionIds.size()>1 或 sharingGroup>=0 → 区间设为 [0,全程]）——接缝，正文可点名不展开"]
+    },
+    {
+      "path": "lib/Analysis/Allocation.cpp",
+      "lines": "L580-L637",
+      "what": "calculateStarts：first-fit 定址的核心。tripleMap 是『(offset → 该 offset 处可用空隙区间)』的空隙表；每轮取最低 offset 的空隙，找一个活跃区间恰好能塞进且不与别的空隙冲突的 buffer，setOffsetAligned 落址，再把剩余空隙拆分回表",
+      "code": "  void calculateStarts(const SmallVector<BufferT *> &buffers) {\n    ...\n    using TripleMapT = std::multimap<size_t, Interval<size_t>>;\n    TripleMapT tripleMap;\n    tripleMap.insert(std::make_pair(0, Interval<size_t>()));\n    SmallVector<BufferT *> xBuffers = buffers;\n    while (!xBuffers.empty()) {\n      auto tripleIt = tripleMap.begin();\n      auto offset = tripleIt->first;\n      auto range = tripleIt->second;\n      tripleMap.erase(tripleIt);\n      auto bufferIt =\n          std::find_if(xBuffers.begin(), xBuffers.end(), [&](auto *buffer) {\n            auto xRange = bufferRange[buffer];\n            bool res = xRange.intersects(range);\n            for (auto val : tripleMap)\n              res = res &&\n                    !val.second.intersects(xRange); // only one buffer intersect\n            return res;\n          });\n      if (bufferIt != xBuffers.end()) {\n        auto buffer = *bufferIt;\n        auto xSize = buffer->size;\n        auto xRange = bufferRange.lookup(buffer);\n        size_t alignOffset = buffer->setOffsetAligned(offset);\n        tripleMap.insert({alignOffset + xSize,\n                          Interval{std::max(range.start(), xRange.start()),\n                                   std::min(range.end(), xRange.end())}});\n        if (range.start() < xRange.start())\n          tripleMap.insert({offset, Interval{range.start(), xRange.end()}});\n        if (xRange.end() < range.end())\n          tripleMap.insert({offset, Interval{xRange.start(), range.end()}});\n        xBuffers.erase(bufferIt);\n      }\n    }\n  }",
+      "elide": ["L581-L596 的 ASCII 示意注释（可作图素材，正文可复述不逐字印）"]
+    },
+    {
+      "path": "lib/Analysis/Allocation.cpp",
+      "lines": "L641-L681",
+      "what": "buildInterferenceGraph：两个 buffer 只有『活跃区间相交 ∧ 地址区间相交』才连冲突边——这是 WAW『不重叠分配天然不可能』的分配侧根据",
+      "code": "  void buildInterferenceGraph(const SmallVector<BufferT *> &buffers,\n                              GraphT &interference) {\n    ...\n    interference.clear();\n    for (auto x : buffers) {\n      for (auto y : buffers) {\n        if (x == y)\n          continue;\n        auto xStart = x->offset;\n        auto yStart = y->offset;\n        auto xSize = x->size;\n        auto ySize = y->size;\n        Interval xSizeRange = {xStart, xStart + xSize};\n        Interval ySizeRange = {yStart, yStart + ySize};\n        auto xOpRange = bufferRange.lookup(x);\n        auto yOpRange = bufferRange.lookup(y);\n        if (xOpRange.intersects(yOpRange) &&\n            xSizeRange.intersects(ySizeRange)) {\n          interference[x].insert(y);\n        }\n        // if x and y belong to different regions (ignore producer region).\n        if (inDifferentRegion(x, y) && xSizeRange.intersects(ySizeRange))\n          interference[x].insert(y);\n      }\n    }\n  }",
+      "elide": ["inDifferentRegion lambda 与 regionIds 相关分支（warp-spec 才触发）——点名不展开"]
+    },
+    {
+      "path": "lib/Analysis/Allocation.cpp",
+      "lines": "L684-L725",
+      "what": "allocate：first-fit 图着色（找第一个未被邻居占用的颜色）+ 按邻居 max(offset+size) 抬 offset；末尾 sharedMemorySize = max over buffers of (offset+size)——超硬件上限就编不出/压 occupancy 的那个总量",
+      "code": "  void allocate(const SmallVector<BufferT *> &buffers,\n                const GraphT &interference) {\n    // Reset shared memory size\n    allocation->sharedMemorySize = 0;\n    // First-fit graph coloring\n    DenseMap<BufferT *, int> colors;\n    for (auto value : buffers) {\n      colors[value] = (value == buffers[0]) ? 0 : -1;\n    }\n    SmallVector<bool> available(buffers.size());\n    for (auto x : buffers) {\n      std::fill(available.begin(), available.end(), true);\n      for (auto y : interference.lookup(x)) {\n        int color = colors[y];\n        if (color >= 0) {\n          available[color] = false;\n        }\n      }\n      auto it = std::find(available.begin(), available.end(), true);\n      colors[x] = std::distance(available.begin(), it);\n    }\n    // Finalize allocation\n    for (auto x : buffers) {\n      size_t newOffset = 0;\n      for (auto y : interference.lookup(x)) {\n        newOffset = std::max(newOffset, y->offset + y->size);\n      }\n      if (colors.lookup(x) != 0)\n        x->setOffsetAligned(newOffset);\n      allocation->sharedMemorySize =\n          std::max(allocation->sharedMemorySize, x->offset + x->size);\n    }\n  }",
+      "elide": ["L710-L714 颜色→offset 的示例注释与 TODO(浪费内存) 说明（可复述）"]
+    },
+    {
+      "path": "lib/Analysis/Allocation.cpp",
+      "lines": "L559-L564",
+      "what": "computeOffsets 的不动点循环：bump offset 后原本不冲突的 buffer 可能变冲突，故 allocate→重建冲突图 反复到 interference 为空",
+      "code": "    GraphT interference;\n    buildInterferenceGraph(buffers, interference);\n    do {\n      allocate(buffers, interference);\n      buildInterferenceGraph(buffers, interference);\n    } while (!interference.empty());",
+      "elide": []
+    },
+    {
+      "path": "include/triton/Analysis/Allocation.h",
+      "lines": "L268-L275",
+      "what": "ModuleAllocation::getSharedMemorySize：整条 call graph 的总量 = 各 root 函数 sharedMemorySize 的 max（post-order walk 保证被调函数先算完，其量以 virtual buffer 计入调用者）",
+      "code": "  size_t getSharedMemorySize() {\n    size_t size = 0;\n    for (auto funcOp : getRoots()) {\n      auto *alloc = getFuncData(funcOp);\n      size = std::max(size, alloc->getSharedMemorySize());\n    }\n    return size;\n  }",
+      "elide": []
+    },
+    {
+      "path": "include/triton/Analysis/Membar.h",
+      "lines": "L18-L45",
+      "what": "BlockInfo：两个『区间→写/读它的 op 集』的 map；isIntersected 只查 RAW/WAR/WAW 三类交集，RAR 不查（无写不需同步）",
+      "code": "struct BlockInfo {\n  using IntervalMapT = std::map<Interval<size_t>, std::set<Operation *>>;\n\n  IntervalMapT syncReadIntervals;\n  IntervalMapT syncWriteIntervals;\n\n  BlockInfo() = default;\n\n  /// Unions two BlockInfo objects.\n  BlockInfo &join(const BlockInfo &other) {\n    ...\n  }\n\n  /// Returns true if intervals in two BlockInfo objects are intersected.\n  bool isIntersected(const BlockInfo &other, MembarFilterFn filter) const {\n    return /*RAW*/ isIntersected(syncWriteIntervals, other.syncReadIntervals,\n                                 filter) ||\n           /*WAR*/\n           isIntersected(syncReadIntervals, other.syncWriteIntervals, filter) ||\n           /*WAW*/\n           isIntersected(syncWriteIntervals, other.syncWriteIntervals, filter);\n  }",
+      "elide": ["join 体的两段 insert 循环（就是两个 map 求并，可略）"]
+    },
+    {
+      "path": "lib/Analysis/Membar.cpp",
+      "lines": "L101-L155",
+      "what": "MembarAnalysis::update 前半：barrier op → sync 清账；AsyncWait → 补 barrier；否则按 MemoryEffect 把每个访问的 buffer 区间填进 curBlockInfo 的 syncWrite/syncRead",
+      "code": "void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,\n                            FuncBlockInfoMapT *funcBlockInfoMap,\n                            OpBuilder *builder) {\n  if (isa<gpu::BarrierOp>(op)) {\n    // If the current op is a barrier, we sync previous reads and writes\n    blockInfo->sync();\n    return;\n  }\n  ...\n  BlockInfo curBlockInfo;\n  auto scratchBufferId = Allocation::InvalidBufferId;\n  if (isa<triton::CallOp>(op)) {\n    ...\n  } else {\n    // Intra-function dependencies\n    if (auto memoryEffectOpInterface = dyn_cast<MemoryEffectOpInterface>(op)) {\n      SmallVector<SideEffects::EffectInstance<MemoryEffects::Effect>>\n          effectInstances;\n      memoryEffectOpInterface.getEffects(effectInstances);\n      for (auto effectInstance : effectInstances) {\n        if (auto value = effectInstance.getValue()) {\n          for (auto bufferId : allocation->getBufferIds(value)) {\n            if (bufferId != Allocation::InvalidBufferId) {\n              if (isa<MemoryEffects::Write>(effectInstance.getEffect()))\n                curBlockInfo\n                    .syncWriteIntervals[allocation->getAllocatedInterval(\n                        bufferId)]\n                    .insert(op);\n              else if (isa<MemoryEffects::Read>(effectInstance.getEffect()))\n                curBlockInfo\n                    .syncReadIntervals[allocation->getAllocatedInterval(\n                        bufferId)]\n                    .insert(op);\n            }\n          }\n        }\n      }\n    }\n    scratchBufferId = allocation->getBufferId(op);\n  }",
+      "elide": ["L110-L118 AsyncWait 分支（后端异步拷贝接缝，点名不展开）；L122-L127 CallOp 分支（跨函数 BlockInfo 查表，回指 call graph）"]
+    },
+    {
+      "path": "lib/Analysis/Membar.cpp",
+      "lines": "L161-L184",
+      "what": "update 后半：scratch buffer 的『写→…→读』模型——先当写检查是否与前面区间相交（相交则插 barrier），sync 清账，再登记为读；非 scratch 则直接『区间相交→插 barrier→sync』",
+      "code": "  if (scratchBufferId != Allocation::InvalidBufferId) {\n    ...\n    auto interval = allocation->getAllocatedInterval(scratchBufferId);\n    curBlockInfo.syncWriteIntervals[interval].insert(op);\n    if (blockInfo->isIntersected(curBlockInfo, filter)) {\n      builder->setInsertionPoint(op);\n      insertBarrier(op, builder);\n    }\n    // Ops with a scratch buffer internally syncs read/write on shared memory\n    blockInfo->sync();\n    curBlockInfo.syncReadIntervals[interval].insert(op);\n  } else if (blockInfo->isIntersected(curBlockInfo, filter)) {\n    builder->setInsertionPoint(op);\n    insertBarrier(op, builder);\n    blockInfo->sync();\n  }\n  // Update the region info, even if barrier is inserted, we have to maintain\n  // the current op's read/write buffers.\n  blockInfo->join(curBlockInfo);",
+      "elide": ["L162-L167 的 report_fatal_error 断言（scratch buffer 不应带既有依赖）"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "Allocation", "file": "include/triton/Analysis/Allocation.h:L89-L243", "responsibility": "单函数的共享内存分配结果容器：bufferSet(BufferId→BufferT)、valueBuffer/opScratch/opVirtual/aliasBuffer 映射、sharedMemorySize；对外暴露 getOffset/getAllocatedInterval/getBufferId/getSharedMemorySize"},
+    {"name": "Allocation::BufferT", "file": "include/triton/Analysis/Allocation.h:L175-L204", "responsibility": "一个共享内存 buffer：kind(Explicit/Scratch/Virtual)、size、alignment、offset；setOffsetAligned 是对齐定址唯一入口"},
+    {"name": "triton::AllocationAnalysis", "file": "lib/Analysis/Allocation.cpp:L169-L732", "responsibility": "定址算法本体（analysis→transform 里的只读 analysis 侧）：getValuesAndSizes→resolveLiveness→computeOffsets；calculateStarts/buildInterferenceGraph/allocate 三件套跑到不动点"},
+    {"name": "ScratchConfig / getScratchConfigForCvt", "file": "include/triton/Analysis/Allocation.h:L28-L56", "responsibility": "convert_layout scratch 的形状：repShape(每轮最大访问)→paddedRepShape(避 bank conflict 的 padding)+order+in/outVec；决定 scratch 字节数"},
+    {"name": "ModuleAllocation", "file": "include/triton/Analysis/Allocation.h:L251-L291", "responsibility": "call graph 层封装：CallGraph<Allocation> 的 post-order walk 逐函数 run；getSharedMemorySize 取各 root 的 max（虚 buffer 把被调量计入调用者）"},
+    {"name": "AliasInfo", "file": "include/triton/Analysis/Alias.h:L10-L60", "responsibility": "格值=一个值别名到的 alloc 集合（DenseSet<Value>）；join=并集；只登记 scf.yield 返回值与 scf.for block 参数造成的别名"},
+    {"name": "SharedMemoryAliasAnalysis", "file": "include/triton/Analysis/Alias.h:L65-L92 / lib/Analysis/Alias.cpp:L24-L71", "responsibility": "MLIR SparseForwardDataFlowAnalysis：转移函数只让 local_alloc 造新 buffer、subview/trans 传递别名、其余保守；为 Allocation 提供 alias 集合以并入活跃期"},
+    {"name": "Interval<T>", "file": "include/triton/Analysis/Allocation.h:L63-L87", "responsibility": "半开区间 [Start,End)；intersects 判交，贯穿活跃区间(时间)与地址区间(空间)两处"},
+    {"name": "BlockInfo", "file": "include/triton/Analysis/Membar.h:L18-L75", "responsibility": "Membar 的账本：syncRead/syncWrite 两个『区间→op 集』map；join 求并、sync 清空、isIntersected 查 RAW/WAR/WAW 交集"},
+    {"name": "MembarAnalysis", "file": "include/triton/Analysis/Membar.h:L80-L134 / lib/Analysis/Membar.cpp:L14-L186", "responsibility": "插屏障（analysis 侧但会改 IR：插 barrier op）：block 级不动点，逐 op 维护 BlockInfo，交集命中处 insertBarrier；MembarFilterFn 允许后端豁免"},
+    {"name": "ModuleMembarAnalysis", "file": "include/triton/Analysis/Membar.h:L141-L166", "responsibility": "call graph 层封装：post-order 逐函数跑 MembarAnalysis，把返回时 dangling buffer 汇入 funcBlockInfo 供调用点参考"}
+  ],
+
+  "data_flow": [
+    "1. ModuleAllocation 构造：CallGraph<Allocation> post-order walk 每个函数 → Allocation::run(funcMap) → 构造 AllocationAnalysis 触发 run()",
+    "2. getValuesAndSizes（Allocation.cpp:L328）：PreOrder walk 每个 op，getExplicitValueSize 收 local_alloc(Explicit)、getScratchValueSize 收 convert_layout scratch(Scratch)/call(Virtual)；随后建 DataFlowSolver 跑 SharedMemoryAliasAnalysis，为每个 operand/result 收 alias 集（addAlias）",
+    "3. SharedMemoryAliasAnalysis::visitOperation（Alias.cpp:L24）：local_alloc→新 buffer；subview/trans→传播源别名；其余 pessimistic。scf.for block 参数 / scf.yield 返回值经框架自动 join，得每个值的 alloc 集",
+    "4. resolveLiveness（Allocation.cpp:L428）：PostOrder 给 op 编 ID；mlir::Liveness 求 explicit buffer 的 [minId,maxId)；resolveAliasBufferLiveness 把别名值区间并入被别名 buffer；resolveScratchBufferLiveness 令 scratch/virtual 活跃区间=其所在 op 的 [id,id+1)",
+    "5. computeOffsets（Allocation.cpp:L511）：（先按 sharingGroup 归并，warp-spec 才触发）calculateStarts 用 tripleMap 空隙表 first-fit 给每个 buffer 落初始对齐 offset",
+    "6. buildInterferenceGraph（L641）：活跃区间相交 ∧ 地址区间相交 → 连边；allocate（L684）first-fit 图着色 + 按邻居 max(offset+size) 抬 offset；两者 do-while 到 interference 空（不动点）",
+    "7. allocate 末尾（L722）：sharedMemorySize = max over buffers (offset+size)；ModuleAllocation::getSharedMemorySize 取各 root 的 max — 这是编译器上报给 runtime 的每 block 共享内存需求",
+    "8. Membar 阶段（消费 Allocation）：ModuleMembarAnalysis post-order 逐函数 MembarAnalysis::run→resolve（Membar.cpp:L21）：block 级不动点，逐 op update",
+    "9. update（Membar.cpp:L101）：barrier→sync；按 MemoryEffect 把每个访问 buffer 的 getAllocatedInterval 填进 curBlockInfo 的 syncWrite/syncRead；scratchBufferId 的 op 按『写→读』模型处理",
+    "10. isIntersected 命中（RAW 或 WAR 或 WAW 且区间相交，filter 未豁免）→ setInsertionPoint(op)+insertBarrier(gpu.barrier)+sync 清账；WAW 因分配不重叠实际不可能命中，RAR 根本不查"
+  ],
+
+  "design_decisions": [
+    {"decision": "共享内存 buffer 分三类：Explicit(local_alloc) / Scratch(convert_layout 等临时) / Virtual(函数调用)", "why": "三类来源、生命周期、大小算法不同；Virtual 让调用者无需展开被调函数即可为其预留 = 被调 sharedMemorySize 的空间", "evidence": "include/triton/Analysis/Allocation.h:L179-L180 (BufferKind 注释); lib/Analysis/Allocation.cpp:L298-L304 (Virtual)"},
+    {"decision": "分配问题建模为离线的『活跃区间图 + first-fit 着色』，而非运行期栈/堆", "why": "编译期所有 buffer 活跃区间已知，可一次性离线定址；见源码注释直接引 Gergov『Algorithms for Compile-Time Memory Optimization』(SODA 1999)", "evidence": "lib/Analysis/Allocation.cpp:L509-L510 (注释引论文+DOI)"},
+    {"decision": "冲突边 = 活跃区间(时间)相交 ∧ 地址区间(空间)相交 两个条件都满足", "why": "只有生命周期重叠且地址重叠才真冲突；分开判使得同一 offset 可被生命周期不相交的 buffer 复用 → 省共享内存", "evidence": "lib/Analysis/Allocation.cpp:L672-L675"},
+    {"decision": "bump offset 后重建冲突图并重着色，循环到不动点", "why": "原论文不考虑 bump 后新增的交叠；抬高 offset 可能使原不冲突的两 buffer 地址区间开始相交，故必须重算", "evidence": "lib/Analysis/Allocation.cpp:L552-L564 (NOTE 注释 + do-while)"},
+    {"decision": "别名只登记 scf.yield 返回值与 scf.for block 参数两种来源", "why": "循环里 buffer 通过迭代参数/yield 在 region 间传递，若不并入活跃期会误判其在循环体内已死 → 错误复用导致数据损坏", "evidence": "include/triton/Analysis/Alias.h:L38-L60; lib/Analysis/Alias.cpp:L41-L45"},
+    {"decision": "Membar 只在 RAW/WAR 且区间相交处插 barrier；WAW 不可能、RAR 不需要", "why": "WAW 需两个写同地址，但分配保证活跃期重叠的 buffer 不共址故不可能；RAR 无写无需同步 → 省掉多余 barrier", "evidence": "include/triton/Analysis/Membar.h:L86-L95 (类注释); Membar.h:L38-L45"},
+    {"decision": "scratch buffer 的 op 用『写→…→读』模型，内部自带同步", "why": "convert_layout 这类 op 本身就是先写共享内存再读；对外只需在其『写』边界处判是否需要与前序冲突插 barrier，读边界靠 sync 清账", "evidence": "lib/Analysis/Membar.cpp:L157-L176 (注释 + 逻辑)"},
+    {"decision": "提供 MembarFilterFn 回调让后端豁免特定 op 对间的 barrier", "why": "两个 op 访问同一共享内存不一定真需 barrier（后端可能有更细的知识，如异步 copy 的自同步）；把后端专有知识外置为接缝", "evidence": "include/triton/Analysis/Membar.h:L13-L16; lib/Analysis/Membar.cpp:L170,L177 (filter 参与 isIntersected)"},
+    {"decision": "op 用 PostOrder 编 ID 求活跃区间；父 op ID 必大于其所有子 op", "why": "父 region 里定义、子 region 里使用的 buffer（如 for 外定义、for 内用），若父 ID 小于子 ID 会让其活跃期在子 op 前结束 → 误判早死", "evidence": "lib/Analysis/Allocation.cpp:L429-L447 (注释举 scf.for 例)"}
+  ],
+
+  "theory": [
+    {
+      "topic": "prereq-box：编译期共享内存分配 = 离线动态存储分配 / 区间图着色",
+      "content": "所有 buffer 的活跃区间在编译期已知（不像运行期 malloc/free 是在线到达）。给每个 buffer 一段连续地址、使活跃期相交的 buffer 不重叠，正是 offline dynamic storage allocation（区间图着色的一个变体）。这是 NP-hard 的一般问题，Triton 用 first-fit 作实用近似。前置框只点出『归约到哪类问题 + first-fit 是近似』，不铺证明。",
+      "prereq": "ch25",
+      "paper": "Gergov, J. 'Algorithms for Compile-Time Memory Optimization', SODA 1999 (源码 Allocation.cpp:L509-L510 直接引，DOI 10.5555/314500.315082)",
+      "note": "3-5 句直觉 + 出处，不证明；Gergov 只作前置框归约点出"
+    },
+    {
+      "topic": "两级 max 得整个 call graph 的 sharedMemorySize",
+      "content": "单函数内 sharedMemorySize = max_buffer(offset+size)（allocate 末尾）；跨函数经 Virtual buffer 把被调函数需求计入调用点，ModuleAllocation 再取各 root 函数的 max。超过硬件每 block 共享内存上限 → 编不出；越大 → 每 SM 能并发的 block 越少 → occupancy 越低。这条量化链是本章 perf 命门。",
+      "quantify": "sharedMemorySize = max_{b∈buffers}(offset_b + size_b)；单 CTA 共享内存 ↑ ⇒ 每 SM 驻留 block 数 ↓ ⇒ occupancy ↓"
+    }
+  ],
+
+  "subtraction_plan": {
+    "delete": [],
+    "must_keep": [
+      {"symbol": "AllocationAnalysis", "why": "定址算法本体，本章 stakes 核心；writer 内嵌真 C++ 逐段讲"},
+      {"symbol": "getValuesAndSizes", "why": "谁要共享内存的收集入口（explicit/scratch/virtual 三类 + alias）"},
+      {"symbol": "getExplicitValueSize", "why": "显式 local_alloc 的字节数算法（回指 ch24）"},
+      {"symbol": "getScratchValueSize", "why": "convert_layout scratch 与 call virtual buffer 的大小来源"},
+      {"symbol": "BufferKind", "why": "Explicit/Scratch/Virtual 三分类是理解全章的骨架"},
+      {"symbol": "resolveLiveness", "why": "求活跃区间；PostOrder ID + mlir::Liveness"},
+      {"symbol": "resolveAliasBufferLiveness", "why": "scf.for/yield 别名并入活跃期的落地点"},
+      {"symbol": "SharedMemoryAliasAnalysis", "why": "别名分析，活跃期正确性的前提"},
+      {"symbol": "AliasInfo", "why": "别名格值=alloc 集合，join=并集"},
+      {"symbol": "calculateStarts", "why": "first-fit 初始定址，tripleMap 空隙表"},
+      {"symbol": "buildInterferenceGraph", "why": "活跃区间∧地址区间双相交建冲突图；WAW 不可能的分配侧根据"},
+      {"symbol": "allocate", "why": "first-fit 图着色 + sharedMemorySize=max(offset+size)，perf 命门总量"},
+      {"symbol": "computeOffsets", "why": "串起 calculateStarts→build→allocate 不动点循环"},
+      {"symbol": "sharedMemorySize", "why": "读者要理解的核心产物：超限即编不出/压 occupancy"},
+      {"symbol": "getSharedMemorySize", "why": "call graph 层取各 root 的 max"},
+      {"symbol": "ModuleAllocation", "why": "call graph 封装，post-order 逐函数"},
+      {"symbol": "setOffsetAligned", "why": "对齐定址唯一入口，alignTo"},
+      {"symbol": "Interval", "why": "半开区间，贯穿时间(活跃)与空间(地址)两处 intersects"},
+      {"symbol": "MembarAnalysis", "why": "插屏障的算法本体，闭环另一半"},
+      {"symbol": "BlockInfo", "why": "syncRead/syncWrite 区间集账本"},
+      {"symbol": "syncWriteIntervals", "why": "写区间集，RAW/WAR/WAW 判据的一半"},
+      {"symbol": "syncReadIntervals", "why": "读区间集，RAW/WAR 判据的一半"},
+      {"symbol": "isIntersected", "why": "RAW/WAR/WAW 交集判定，决定是否插 barrier"},
+      {"symbol": "update", "why": "逐 op 维护 BlockInfo 并在命中处 insertBarrier"},
+      {"symbol": "insertBarrier", "why": "真正插入 gpu.barrier 的动作"},
+      {"symbol": "MembarFilterFn", "why": "后端豁免接缝，多余同步的调节点"},
+      {"symbol": "getAllocatedInterval", "why": "把 bufferId 映射为地址区间，连接 Allocation 与 Membar 的接口"}
+    ]
+  },
+
+  "mechanisms": [
+    {
+      "id": "buffer-kinds",
+      "name": "共享内存 buffer 的三种来源（Explicit/Scratch/Virtual）",
+      "kind": "config",
+      "source_anchors": ["include/triton/Analysis/Allocation.h:L175-L204", "lib/Analysis/Allocation.cpp:L195-L222", "lib/Analysis/Allocation.cpp:L258-L304"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "alias-analysis",
+      "name": "SharedMemoryAliasAnalysis：谁别名到谁（scf.for/yield）",
+      "kind": "dataflow",
+      "source_anchors": ["lib/Analysis/Alias.cpp:L24-L60", "include/triton/Analysis/Alias.h:L38-L60"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "liveness-interval",
+      "name": "活跃区间求解（PostOrder ID + mlir::Liveness + 别名并入）",
+      "kind": "dataflow",
+      "source_anchors": ["lib/Analysis/Allocation.cpp:L428-L489", "lib/Analysis/Allocation.cpp:L374-L392"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "first-fit-allocation",
+      "name": "first-fit 定址：calculateStarts + 冲突图 + 图着色到不动点",
+      "kind": "algorithm",
+      "source_anchors": ["lib/Analysis/Allocation.cpp:L580-L637", "lib/Analysis/Allocation.cpp:L641-L681", "lib/Analysis/Allocation.cpp:L684-L725", "lib/Analysis/Allocation.cpp:L559-L564"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin_note": "非机器学习论文出处；源码注释直接引经典编译器论文 Gergov『Algorithms for Compile-Time Memory Optimization』SODA 1999（DOI 10.5555/314500.315082），非 arXiv，故走 note 豁免"
+    },
+    {
+      "id": "shared-memory-size",
+      "name": "sharedMemorySize 两级 max（单函数 + call graph）与 occupancy 账本",
+      "kind": "algorithm",
+      "source_anchors": ["lib/Analysis/Allocation.cpp:L722-L724", "include/triton/Analysis/Allocation.h:L268-L275"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin_note": "无论文出处：max(offset+size) 的直接量化，属实现常量算式，非算法论文机制"
+    },
+    {
+      "id": "gergov-prereq",
+      "name": "前置框：编译期共享内存分配 = 离线动态存储分配 / 区间图着色（Gergov 归约，只作直觉不证明）",
+      "kind": "config",
+      "source_anchors": ["lib/Analysis/Allocation.cpp:L508-L511"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "prereq": "ch25"
+    },
+    {
+      "id": "membar-blockinfo",
+      "name": "BlockInfo 区间账本与 RAW/WAR/WAW/RAR 分类",
+      "kind": "protocol",
+      "source_anchors": ["include/triton/Analysis/Membar.h:L18-L75", "include/triton/Analysis/Membar.h:L86-L95"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "membar-insert",
+      "name": "MembarAnalysis 插屏障：逐 op 维护区间集、交集命中处 insertBarrier",
+      "kind": "algorithm",
+      "source_anchors": ["lib/Analysis/Membar.cpp:L101-L185", "lib/Analysis/Membar.cpp:L21-L80"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin_note": "无论文出处：基于区间集的写后读/读后写屏障插入，属编译器实现算法，非机器学习论文机制"
+    },
+    {
+      "id": "membar-filter",
+      "name": "MembarFilterFn：后端豁免接缝（多余同步的调节点）",
+      "kind": "config",
+      "source_anchors": ["include/triton/Analysis/Membar.h:L13-L16", "lib/Analysis/Membar.cpp:L170-L177"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    }
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recall": [],
+    "note": "bible.py due ch26 返回空（无应埋/应回收）。本章明确无伏笔埋/回收。"
+  },
+
+  "verification_plan": {
+    "kind": "pin-compile",
+    "how": "pip install triton==3.2.0 (与 pin 逐字节同) headless 编译一段带 convert_layout(触发 scratch) + local_alloc 的 kernel；用 TRITON_KERNEL_DUMP / add_stages 取 ttgir，观测：(a) AllocationAnalysis 定出的每 buffer offset 与总 triton_gpu.shared / sharedMemorySize；(b) Membar 插的 gpu.barrier 位置。必须标 IR 阶段（make_ttgir 之后、AllocateSharedMemory/Membar pass 之后）。",
+    "caveat": "真跑 kernel 需 GPU；host 无 GPU 时用 TRITON_INTERPRET=1 与编译期 IR 产物替代，trace_source 如实标注不假装跑真核。行号一律以 pin v3.2.0 为准。"
+  },
+
+  "cross_refs": {
+    "back": ["ch24: memdesc / local_alloc 算子表面（本章讲这些 buffer 怎么被分析定址，不重讲算子表面）", "ch25: analysis→transform 母范式本身（本章是其又一实例，回指不重讲）"],
+    "forward": ["ch33: AllocateSharedMemory pass 用 ModuleAllocation 把 offset 钉成 allocation.offset 属性、总量写进 triton_gpu.shared，并落地 ModuleMembarAnalysis（本章分析结果被降级消费，前瞻不展开）", "ch34: MemoryOp/LoadStore 降级消费共享内存布局（前瞻不展开）"]
+  }
+}

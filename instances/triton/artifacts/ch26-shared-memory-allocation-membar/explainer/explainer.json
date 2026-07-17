@@ -1,0 +1,242 @@
+{
+  "chapter": "ch26",
+  "title": "共享内存分配与屏障：Allocation、Alias 与 Membar",
+  "note_on_traces": "本章 kind=skip_impl，无精简版可跑。所有 worked_example 皆 trace_source=manual：Allocation/Membar 是编译期 C++ 只读分析，其逐步内部状态（PostOrder 活跃区间 ID、first-fit 定址顺序、冲突图边、BlockInfo 区间集）不经任何 Python/triton 运行时 API 暴露——运行时只能在 dump 的 TTGIR 里看到最终 sharedMemorySize 与已插入的 gpu.barrier。且 pin 为 v3.2.0，宿主机装的是 triton 3.6.0（版本不符，不能冒充跑 pin）。故 worked_example 为『按 pin v3.2.0 源码逐字手推 + 纯 Python 复算镜像确认算术』：first-fit 定址见 traces/sim_allocation.py（镜像 Allocation.cpp:L641-725 的 buildInterferenceGraph/allocate 与 L560-565 不动点循环）；membar 见 traces/sim_membar.py（镜像 Membar.cpp:L101-184 与 Membar.h:L38-45 isIntersected）。凡源码常量数字均标 file:Lxxx。alias/liveness 例直接复用 Alias.h:L42-59 头注释里的 v1..v6 规范图例。",
+
+  "mechanisms": [
+    {
+      "mechanism_id": "buffer-kinds",
+      "intuition": "谁在跟共享内存这块公用黑板打交道，只有三类人：自己带笔上台写字的（Explicit，显式 local_alloc）、临时借块草稿纸打个转手（Scratch，convert_layout 换布局要的中转区）、以及把黑板转租给下属函数用的（Virtual，函数调用——按下属需要的大小替它占好位）。三类来源不同、生命周期不同、算大小的公式也不同，但都要在同一块有限黑板上抢地盘。",
+      "worked_example": null,
+      "figure_specs": [
+        {
+          "figure_id": "fig-buffer-kinds",
+          "claim": "共享内存 buffer 只有三种来源——Explicit(local_alloc)/Scratch(convert_layout)/Virtual(函数调用)——各自的字节数由不同公式算出，统一进入 first-fit 定址。",
+          "template": "flow",
+          "numbers": [
+            {"label": "Explicit 字节数公式", "value": "product(shapePerCTA) × bitWidth / 8", "provenance": "lib/Analysis/Allocation.cpp:L203-L205 getExplicitValueSize"},
+            {"label": "Explicit 例：16×16 f16", "value": "256 × 16 / 8 = 512 字节", "provenance": "手推自 Allocation.cpp:L203-L205（16×16=256 元素，f16=16bit）"},
+            {"label": "Explicit 默认对齐", "value": "bytes>256 ? 1024 : 8（512B>256 → 1024）", "provenance": "lib/Dialect/TritonGPU/IR/Dialect.cpp:L3126 getAlignmentOrDefault"},
+            {"label": "Scratch 字节数公式(convert_layout)", "value": "elems × max(8, bitWidth) / 8", "provenance": "lib/Analysis/Allocation.cpp:L276-L278 getScratchValueSize"},
+            {"label": "Scratch 对齐", "value": "scratchAlignment = 128 字节", "provenance": "lib/Analysis/Allocation.cpp:L239"},
+            {"label": "指针位宽(指针型 scratch)", "value": "kPtrBitWidth = 64", "provenance": "lib/Analysis/Allocation.cpp:L47"},
+            {"label": "Virtual 字节数", "value": "= 被调函数的 sharedMemorySize", "provenance": "lib/Analysis/Allocation.cpp:L298-L302（callOp 分支 funcAlloc->getSharedMemorySize）"}
+          ],
+          "caption_draft": "三类来源同进 first-fit 定址：Explicit 按张量形状×位宽，Scratch 按每轮最大访问×位宽（128B 对齐避 bank conflict），Virtual 直接借用被调函数的整块需求——调用者无需展开被调函数即为其预留空间。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "alias-analysis",
+      "intuition": "循环里的一块共享内存，每一轮迭代『同一块草稿纸换了个名字』又传回来。别名分析就是给这些不同名字（v3、v4、v6…）贴上『它们其实指向哪张原始草稿纸(alloc)』的标签。只有 local_alloc 会真的『买一张新草稿纸』；subview/trans 只是把同一张纸剪一角或转个方向，名字变了纸没变；scf.for 的迭代参数和 scf.yield 的返回值经框架自动合并标签。",
+      "worked_example": {
+        "params": {"scenario": "Alias.h 头注释规范图例：两块 alloc v1/v2，三个 scf.for 迭代参数 v3/v4/v5，一个 scf.yield 返回 v6", "source": "include/triton/Analysis/Alias.h:L42-L59"},
+        "trace_source": "manual",
+        "manual_reason": "SharedMemoryAliasAnalysis 是 MLIR SparseForwardDataFlowAnalysis 的转移函数，其 lattice 收敛过程不经运行时暴露；直接采用源码头注释 Alias.h:L42-L59 给出的规范 v1..v6 图例，逐值套用 visitOperation 转移规则(Alias.cpp:L24-L60)手推别名集。",
+        "table": {
+          "columns": ["值", "产生它的 op", "转移规则(Alias.cpp)", "别名集(alloc 集合)"],
+          "rows": [
+            ["v1", "local_alloc", "isa<LocalAllocOp> → insert(result)，pessimistic=false", "{v1}"],
+            ["v2", "local_alloc", "isa<LocalAllocOp> → insert(result)", "{v2}"],
+            ["v3", "scf.for 迭代参数(源自 v1)", "block 参数经框架 join 源的别名集", "{v1}"],
+            ["v4", "scf.for 迭代参数(源自 v1 与 v2)", "两条边 join → 取并集", "{v1, v2}"],
+            ["v5", "scf.for 迭代参数(源自 v2)", "block 参数 join", "{v2}"],
+            ["v6", "scf.yield(返回 v3)", "yield 值传递 v3 的别名集", "{v1}"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "别名分析必然在有限步内收敛到不动点。",
+        "argument": "格值是『别名到的 alloc 集合』，join=并集(Alias.h:L10-L60 AliasInfo)——集合在 join 下只增不减(单调)；而全模块 alloc 数量有限(本例 2 个:v1,v2)，每个值的别名集被这个有限全集封顶。单调递增 + 有上界 ⇒ 有限步必达不动点。这也是把它交给 MLIR 前向数据流框架自动 join 的前提。"
+      },
+      "quantified": "本例 alloc 全集 |{v1,v2}|=2，故任一值别名集基数 ≤ 2；6 个值中 v4 达到上界基数 2（同时别名 v1、v2），其余基数 1。lattice 高度 ≤ 2。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-alias-scf-for",
+          "claim": "只有 local_alloc 造新 buffer；scf.for 迭代参数/scf.yield 返回值经 join 传播别名集，v4 因两条来源边合并出 {v1,v2}。",
+          "template": "flow",
+          "numbers": [
+            {"label": "v1 别名集", "value": "{v1}", "provenance": "include/triton/Analysis/Alias.h:L54"},
+            {"label": "v2 别名集", "value": "{v2}", "provenance": "include/triton/Analysis/Alias.h:L55"},
+            {"label": "v3 别名集", "value": "{v1}", "provenance": "include/triton/Analysis/Alias.h:L56"},
+            {"label": "v4 别名集", "value": "{v1, v2}", "provenance": "include/triton/Analysis/Alias.h:L57"},
+            {"label": "v5 别名集", "value": "{v2}", "provenance": "include/triton/Analysis/Alias.h:L58"},
+            {"label": "v6 别名集", "value": "{v1}", "provenance": "include/triton/Analysis/Alias.h:L59"},
+            {"label": "造新 buffer 的 op 数", "value": "1 类（仅 LocalAllocOp）", "provenance": "lib/Analysis/Alias.cpp:L41-L45"}
+          ],
+          "caption_draft": "别名图：v1/v2 是唯二真 alloc；v3=v1、v5=v2 各随一条 scf.for 边，v4 同时挂在 v1 与 v2 下故别名集并为 {v1,v2}，v6 经 scf.yield 传回 v1。这张图的直接后果——v1 的活跃期必须涵盖 v3、v4、v6 的全部使用（见活跃区间机制）。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "liveness-interval",
+      "intuition": "给每条指令编个号（PostOrder：先给儿子编、父亲编号必比所有儿子大，这样『循环外定义、循环内使用』的 buffer 不会被误判成在循环体开始前就死了）。一个 buffer 的『活着区间』= 从第一次碰它到最后一次碰它的编号区间。别名让事情多一步：v1 这张原始草稿纸的活着区间，得把所有别名(v3、v4、v6)各自的使用区间都并进来——取最小起点、最大终点，谁都不能落在外面。",
+      "worked_example": {
+        "params": {"buffer": "v1（被 v3/v4/v6 别名，承 alias-analysis 例）", "aliased_use_intervals": {"v3": "[2,5)", "v4": "[4,7)", "v6": "[6,9)"}, "note": "区间端点为 PostOrder op ID（构造的小实例，用于演示 min/max 求并）"},
+        "trace_source": "manual",
+        "manual_reason": "mlir::Liveness 的 op-ID 编号与每值活跃区间是编译期分析中间态，无运行时 API 暴露；此处取 alias-analysis 例的 v1 及其别名 v3/v4/v6，赋构造的 PostOrder ID 区间，按 resolveAliasBufferLiveness 的 min/max 求并规则(Allocation.cpp:L378-L388)手推。端点为演示用小整数 ID，非某次真跑读出。",
+        "table": {
+          "columns": ["并入的别名值", "该值使用区间", "running minId", "running maxId", "v1 当前活跃区间"],
+          "rows": [
+            ["(v1 自身 alloc 点)", "[2,3)", "2", "3", "[2,3)"],
+            ["v3", "[2,5)", "min(2,2)=2", "max(3,5)=5", "[2,5)"],
+            ["v4", "[4,7)", "min(2,4)=2", "max(5,7)=7", "[2,7)"],
+            ["v6", "[6,9)", "min(2,6)=2", "max(7,9)=9", "[2,9)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "合并后的 buffer 活跃区间是每个别名使用区间的超集，故任何别名使用都不落在 buffer 活跃期之外。",
+        "argument": "resolveAliasBufferLiveness 对每个别名做 minId=min(minId, 现值)、maxId=max(maxId, 现值)(Allocation.cpp:L385-L387)——minId 单调不增、maxId 单调不减，合并区间只扩不缩。归纳：基例是 buffer 自身 [2,3)；每并入一个别名区间 [a,b)，新区间 [min,max) ⊇ 旧区间 ∪ [a,b)。故终态 [2,9) 涵盖 v3/v4/v6 的每一次使用 ⇒ 分配器不会在别名仍存活时把 v1 的地址复用给别人，杜绝数据损坏。"
+      },
+      "quantified": "v1 活跃区间宽度 = maxId − minId = 9 − 2 = 7 个 op；相比只看自身 alloc 点 [2,3) 的宽度 1，别名合并把活跃期扩大了 6 个 op——这 6 个 op 内 v1 的地址被锁定不可复用。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-liveness-alias-merge",
+          "claim": "v1 的活跃区间 = 自身 alloc 点与三个别名 v3/v4/v6 使用区间的并 = [2,9)，min/max 各扩一次。",
+          "template": "state-table",
+          "numbers": [
+            {"label": "v3 使用区间", "value": "[2,5)", "provenance": "构造的 PostOrder ID（traces/sim 说明），承 Alias.h:L61 语义"},
+            {"label": "v4 使用区间", "value": "[4,7)", "provenance": "构造的 PostOrder ID"},
+            {"label": "v6 使用区间", "value": "[6,9)", "provenance": "构造的 PostOrder ID"},
+            {"label": "合并后 v1 活跃区间", "value": "[2,9)", "provenance": "手推 min/max 求并，规则 lib/Analysis/Allocation.cpp:L385-L387"},
+            {"label": "区间宽度", "value": "7 op", "provenance": "9−2，手推"}
+          ],
+          "caption_draft": "别名把活跃期撑开：v1 若只看自身 alloc 点只活 [2,3)，但 v3/v4/v6 的使用逼得它的活跃期取三者之并 [2,9)——这条区间正是下一步冲突图判『时间相交』的输入。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "first-fit-allocation",
+      "intuition": "把每个 buffer 想成一段『占用某时段的行李』，共享内存是一排储物格（地址从 0 往上）。两件行李只有『同一时段 且 占了重叠格子』才真冲突。做法：先都堆到 0 号格试试，画出谁跟谁冲突的图，用贪心染色（first-fit：给每个 buffer 挑第一个不与邻居撞色的颜色），再按邻居的最高占用把该抬的抬高。抬高后可能又冒出新冲突，于是重画冲突图再抬，直到没有冲突——因为每次只增不减 offset、冲突只减不增，必然停。收益：时段不重叠的两件行李能共用同一格子。",
+      "worked_example": {
+        "params": {"A": {"size": 1024, "live": "[1,4)"}, "B": {"size": 512, "live": "[3,6)"}, "C": {"size": 1024, "live": "[5,8)"}, "note": "3 个 explicit buffer；A 与 C 时段不相交，故可共用 offset 0。size 为 128 对齐字节数，alignTo 为恒等。"},
+        "trace_source": "manual",
+        "manual_reason": "计算过程(冲突图边、贪心染色、邻居 max 定址、不动点迭代)是编译期 C++ 分析内部态，无运行时 API 暴露；且 pin=v3.2.0 而宿主机为 triton 3.6.0。以纯 Python 镜像 pin 源码 Allocation.cpp:L641-L725/L560-L565 手推并复算，脚本与原始输出见 traces/sim_allocation.py 与 traces/sim_allocation.out。",
+        "trace_ref": "traces/sim_allocation.out",
+        "table": {
+          "columns": ["轮次", "offset(A,B,C)", "冲突图(时间∧地址相交)", "染色/动作", "sharedMemorySize"],
+          "rows": [
+            ["初始(calculateStarts 松初值,全 0)", "0,0,0", "A-B, B-C（A-C 时段不交无边）", "初始定址皆 0，进入不动点循环", "—"],
+            ["allocate 第 1 轮", "0,1024,0", "空", "染色 A=0,B=1,C=0；B(色1)抬到 max(A:0+1024)=1024，C(色0)保持 0", "max(1024,1536,1024)=1536"],
+            ["重建冲突图 第 2 轮", "0,1024,0", "空 → 不动点，退出", "收敛：A[0,1024) 与 C[0,1024) 时段不交共用 offset 0，B 独占 [1024,1536)", "1536"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "不动点循环必然终止，且终态下时段相交的 buffer 地址一定不重叠。",
+        "argument": "终止性(单调量)：allocate 只会把 offset 抬高到邻居的 max(offset+size)、绝不降低(Allocation.cpp:L714-L717)，每轮抬高使一对原本地址相交的冲突分开、冲突边只减不增；冲突数是非负整数、严格递减，有限步到 0(do-while 退出，L562-L565)。正确性(染色保证)：冲突图边 = 时间相交 ∧ 地址相交(L672-L675)，first-fit 染色令相邻(冲突)节点异色、异色即被 max-offset 推到不重叠地址；故终态无边 ⇒ 任意时段相交的两 buffer 地址区间不交 ⇒ 不会有两个同时存活的 buffer 踩同一字节。"
+      },
+      "quantified": "本例三 buffer 尺寸和 = 1024+512+1024 = 2560 字节（若无复用需 2560B）；first-fit 后 sharedMemorySize = 1536 字节，A 与 C 时段不相交共用 offset 0，省下 2560−1536 = 1024 字节。复杂度：buildInterferenceGraph 每轮 O(N²) 判交(N=buffer 数)，外层不动点至多 O(N) 轮，总 O(N³) 上界；first-fit 是 NP-hard 区间图着色的实用近似。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-first-fit-layout",
+          "claim": "时段不相交的 A、C 复用 offset 0，B 独占 [1024,1536)，总量 1536B < 三者之和 2560B。",
+          "template": "layout",
+          "numbers": [
+            {"label": "A 地址区间", "value": "[0,1024)  活跃[1,4)", "provenance": "traces/sim_allocation.out（size=1024,offset=0）"},
+            {"label": "B 地址区间", "value": "[1024,1536) 活跃[3,6)", "provenance": "traces/sim_allocation.out（bump 到 1024）"},
+            {"label": "C 地址区间", "value": "[0,1024) 活跃[5,8)", "provenance": "traces/sim_allocation.out（色0 保持 offset 0）"},
+            {"label": "sharedMemorySize", "value": "1536 字节", "provenance": "traces/sim_allocation.out；公式 max(offset+size) lib/Analysis/Allocation.cpp:L722-L724"},
+            {"label": "尺寸之和(无复用)", "value": "2560 字节", "provenance": "1024+512+1024，traces/sim_allocation.out"},
+            {"label": "复用省下", "value": "1024 字节", "provenance": "2560−1536，traces/sim_allocation.out"}
+          ],
+          "caption_draft": "两轴布局（横=时间/活跃区间，纵=地址/offset）：A 和 C 在时间上错开，于是共享地址 [0,1024)；B 与两者都时段重叠，被顶到 [1024,1536)。总量取所有块 offset+size 的最大值 1536B——这就是编译器上报给 runtime 的每 block 共享内存需求。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "shared-memory-size",
+      "intuition": "一个 block 到底要占多少共享内存？两层取最大值：函数内部，是所有 buffer『地址终点 offset+size』里最高的那个（谁探到最高就是谁）；跨函数，调用者用一个 Virtual buffer 替被调函数占下它的整块需求，再在整条调用图上取各根函数的最大值。这个总数是硬指标——超过硬件每 block 上限直接编不出来；就算没超，越大，每个 SM 能同时驻留的 block 越少，occupancy 越低。",
+      "worked_example": {
+        "params": {"foo_own_buffers": "1536B（承 first-fit 例的 A/B/C）", "bar_sharedMemorySize": "2048B（被调函数 bar 自身总量）", "call": "foo 调 bar，调用点后 foo 自身 buffer 已死 → Virtual buffer 复用 offset 0", "smem_per_sm": "49152 字节(48 KiB，示例性每 SM 可配共享内存)"},
+        "trace_source": "manual",
+        "manual_reason": "sharedMemorySize 的最终数字虽可从 dump 的 TTGIR (triton_gpu.shared) 观测，但跨函数两级 max 与 Virtual buffer 定址的中间过程无运行时 API 暴露，且 pin=v3.2.0 宿主为 3.6.0；此处按 Allocation.cpp:L722-L724 与 Allocation.h:L268-L275 手推两级 max，复算见 traces/sim_allocation.out 末段。occupancy 用示例性硬件常量 48KiB/SM 代入除法。",
+        "trace_ref": "traces/sim_allocation.out",
+        "table": {
+          "columns": ["层级", "量", "取值", "规则(源码)"],
+          "rows": [
+            ["函数内 (foo 自有)", "max_buffer(offset+size)", "1536 字节", "lib/Analysis/Allocation.cpp:L722-L724"],
+            ["被调函数 bar", "bar.sharedMemorySize", "2048 字节", "bar 自身 allocate 末尾 max"],
+            ["调用点 Virtual buffer", "= bar.sharedMemorySize", "2048 字节(复用 offset 0)", "lib/Analysis/Allocation.cpp:L298-L302"],
+            ["函数 foo 总量", "max(自有 1536, Virtual 2048)", "2048 字节", "同一 allocate 的 max(offset+size)"],
+            ["模块(call graph)", "max over roots", "2048 字节", "include/triton/Analysis/Allocation.h:L268-L275 getSharedMemorySize"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "模块 sharedMemorySize ≥ 任一函数、任一 buffer 的 offset+size；它是整条调用图的上确界。",
+        "argument": "函数内 allocation->sharedMemorySize 每步取 max(旧值, offset+size)(L722-L724)，故 ≥ 每个 buffer 终点；跨函数经 Virtual buffer 把被调 sharedMemorySize 计入调用者的一个 buffer，于是调用者的 max 又 ≥ 被调总量；ModuleAllocation 再对各 root 取 max(L268-L275)。逐层 max 的复合仍是 max ⇒ 结果支配调用图中每一处需求，不会漏报。"
+      },
+      "quantified": "本例模块 sharedMemorySize = max(foo 自有 1536, bar 2048) = 2048 字节。occupancy 账本：以 48 KiB/SM = 49152 字节可配共享内存计，仅共享内存一项限制的驻留 block 数 = ⌊49152/需求⌋——2048B/block → 24 block；若 block 开大到 8192B → 6 block；开到 24576B → 2 block。共享内存需求每翻几倍，占用率成反比跌落。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "membar-blockinfo",
+      "intuition": "屏障账本 BlockInfo 只记两本流水：谁在哪段地址『写过』(syncWrite)、谁在哪段『读过』(syncRead)。要不要在两个访问之间插同步(gpu.barrier)，只查三种危险组合——写后读(RAW)、读后写(WAR)、写后写(WAW)且地址相交；读后读(RAR)根本不查，因为没有写就无所谓先后。而 WAW 在这套分配下压根不可能命中：能同时存活(活跃期相交)的两个 buffer 一定被分到不重叠地址，两个写要撞得先地址相交。",
+      "worked_example": null,
+      "figure_specs": [
+        {
+          "figure_id": "fig-raw-war-waw-rar",
+          "claim": "isIntersected 只在 RAW/WAR/WAW 且区间相交处返回真；RAR 从不查询，WAW 因分配不重叠而不可能命中——真正会插 barrier 的只有 RAW 与 WAR。",
+          "template": "state-table",
+          "numbers": [
+            {"label": "RAW = syncWrite × other.syncRead", "value": "查询：是 → 会插", "provenance": "include/triton/Analysis/Membar.h:L39-L40"},
+            {"label": "WAR = syncRead × other.syncWrite", "value": "查询：是 → 会插", "provenance": "include/triton/Analysis/Membar.h:L41-L42"},
+            {"label": "WAW = syncWrite × other.syncWrite", "value": "查询：是，但分配保证不重叠 → 实际不可能命中", "provenance": "include/triton/Analysis/Membar.h:L43-L44；分配侧 lib/Analysis/Allocation.cpp:L672-L675"},
+            {"label": "RAR", "value": "不查询（无写不需同步）", "provenance": "include/triton/Analysis/Membar.h:L38-L45（isIntersected 只含三项，无 RAR）"}
+          ],
+          "caption_draft": "四类依赖矩阵：isIntersected 显式只列 RAW/WAR/WAW 三项(Membar.h:L39-44)、RAR 缺席；再叠加分配层『活跃期相交⇒地址不重叠』的保证使 WAW 空转——落到实处，barrier 只来自写后读与读后写。这解释了『多余同步从哪来』：任何被判 RAW/WAR 的相邻共享内存访问都会吃一个 barrier。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "membar-insert",
+      "intuition": "沿着 block 里的指令一条条走，手里攥着 BlockInfo 账本。每碰到一个访问共享内存的 op，就把它这次读/写的地址区间和账本里已有的读写比一比：命中 RAW 或 WAR，就在这个 op 前面插一道 gpu.barrier，然后 sync 清账（barrier 之前的都同步过了），再把这次访问记进账本。碰到 barrier op 本身就直接 sync 清账。scratch buffer（如 convert_layout）的 op 自带『先写后读』，只在它的写边界处判一次是否要插。",
+      "worked_example": {
+        "params": {"buffer": "b，分配区间 [0,512)", "op_sequence": "op1 local_store(W) → op2 local_load(R) → op3 local_store(W) → op4 local_load(R) → op5 local_load(R)"},
+        "trace_source": "manual",
+        "manual_reason": "MembarAnalysis::update 的 BlockInfo 逐 op 演化与 barrier 插点是编译期 C++ 分析改 IR 的中间态；最终 gpu.barrier 位置虽可在 dump 的 TTGIR 看到，但逐步 syncRead/syncWrite 账本无运行时 API 暴露，且 pin=v3.2.0 宿主为 3.6.0。以纯 Python 镜像 pin 源码 Membar.cpp:L101-L184 与 Membar.h:L38-L45 手推并复算，脚本与原始输出见 traces/sim_membar.py 与 traces/sim_membar.out。",
+        "trace_ref": "traces/sim_membar.out",
+        "table": {
+          "columns": ["op", "效果", "对账(blockInfo × cur)", "命中?", "插 barrier?", "账本 after"],
+          "rows": [
+            ["op1 local_store b", "W [0,512)", "账本空", "否", "否", "write={[0,512):op1}"],
+            ["op2 local_load b", "R [0,512)", "RAW: write[op1] × read[op2]", "是(RAW)", "在 op2 前插，然后 sync", "read={[0,512):op2}"],
+            ["op3 local_store b", "W [0,512)", "WAR: read[op2] × write[op3]", "是(WAR)", "在 op3 前插，然后 sync", "write={[0,512):op3}"],
+            ["op4 local_load b", "R [0,512)", "RAW: write[op3] × read[op4]", "是(RAW)", "在 op4 前插，然后 sync", "read={[0,512):op4}"],
+            ["op5 local_load b", "R [0,512)", "RAR: 无写可对 → isIntersected 假", "否", "否", "read={[0,512):op4,op5}"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "barrier 只在写后读/读后写的真依赖处插入，且插一道即清账不重复插。",
+        "argument": "update 每次 isIntersected 命中就 insertBarrier 后立刻 blockInfo->sync() 清空两本区间集(Membar.cpp:L178-L183)——sync 后账本为空，紧接的下一个 op 除非与『本 op 之后新记的访问』再成 RAW/WAR，否则不会再命中，故不会对同一依赖重复插。命中判据 isIntersected 只含 RAW/WAR/WAW(Membar.h:L38-L45)，RAR(op5 对 op4)因两侧皆读、无写参与而恒假 ⇒ 读后读永不插 barrier。本例 5 个 op 恰插 3 道(op2/op3/op4 前)，op1 无前序、op5 是 RAR，均不插。"
+      },
+      "quantified": "5 个共享内存访问(3 读 2 写)沿途插入 barrier = 3 道（RAW+WAR+RAW），命中率 3/4（第 op1 无前序不算判定点，op5 判定为 RAR 未命中）；若把 op5 换成对 b 的写(WAR)则升至 4 道——每多一个跨越读写边界的访问就多一道同步开销，这正是 MembarFilterFn 后端豁免要削减的目标。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-membar-sequence",
+          "claim": "op1→op5 对同一 buffer b 的读写序列中，barrier 恰插在 op2(RAW)/op3(WAR)/op4(RAW) 前，op5(RAR) 不插。",
+          "template": "swimlane",
+          "numbers": [
+            {"label": "op1 local_store", "value": "W；账本空，不插", "provenance": "traces/sim_membar.out"},
+            {"label": "op2 local_load", "value": "RAW 命中 → barrier #1", "provenance": "traces/sim_membar.out"},
+            {"label": "op3 local_store", "value": "WAR 命中 → barrier #2", "provenance": "traces/sim_membar.out"},
+            {"label": "op4 local_load", "value": "RAW 命中 → barrier #3", "provenance": "traces/sim_membar.out"},
+            {"label": "op5 local_load", "value": "RAR → 不插", "provenance": "traces/sim_membar.out"},
+            {"label": "barrier 总数", "value": "3", "provenance": "traces/sim_membar.out（total barriers inserted = 3）"},
+            {"label": "buffer b 分配区间", "value": "[0,512)", "provenance": "traces/sim_membar.py INTERVAL；语义 lib/Analysis/Membar.cpp:L142-L150 getAllocatedInterval"}
+          ],
+          "caption_draft": "泳道时间线：一条针对同一地址区间 [0,512) 的读写流，每跨越一次写↔读边界(RAW 或 WAR)就落一道 gpu.barrier；连续两个读(op4→op5)之间不插——这直观演示了『多余同步』的来源与 RAR 的豁免。"
+        }
+      ]
+    }
+  ]
+}
