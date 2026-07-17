@@ -1,0 +1,480 @@
+{
+  "chapter_id": "ch24",
+  "slug": "ch24-ttg-ttng-operations",
+  "kind": "skip_impl",
+  "mode": "meta",
+  "title": "ttg.* 与 ttng.* 算子:布局转换、异步拷贝与 Hopper 硬件方言",
+  "one_liner": "张量带上布局(ch20-23)后,开始与共享内存/异步/硬件打交道的'操作词汇表':ttg 层(通用 GPU 抽象)+ ttng 层(NVIDIA Hopper 硬件专属方言,配对脊柱样板)。以 .td 逐字定义 + Dialect.cpp 语义 + 真实 TTGIR dump 为可核抓手(skip_impl,无可运行精简版)。",
+  "code_spine": [
+    "include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td:L22-L40  — TTG_Op 基类 + convert_layout(唯一跨线程搬数据 op)",
+    "include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td:L42-L134 — cp.async 三件套(async_wait/commit_group/copy_global_to_local)",
+    "include/triton/Dialect/TritonGPU/IR/TritonGPUTypes.td:L26-L35 — async.token 类型(串 SSA 依赖)",
+    "include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td:L137-L257 — 共享内存生命周期(local_alloc/dealloc/subview/load/store)",
+    "include/triton/Dialect/Triton/IR/TritonTypes.td:L96-L112 — memdesc 类型(共享内存 SSA 句柄)",
+    "include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td:L259-L277 — upcast_mxfp",
+    "lib/Dialect/TritonGPU/IR/Dialect.cpp:L2842-L2975 — convert_layout canonicalizer(消冗余/折叠链)",
+    "lib/Dialect/TritonGPU/IR/Dialect.cpp:L2977-L3107 — 共享内存 op 的 getEffects/fold/verify + memdesc_subview::verify",
+    "include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td:L41-L44 — TTNG_Op 基类(与 TTG_Op 同骨架 = 配对脊柱样板)",
+    "include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td:L129-L171 — warp_group_dot(WGMMA)+ wait",
+    "include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td:L173-L243, L46-L76 — mbarrier 全家桶",
+    "include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td:L246-L307 — async_tma_copy(TMA,回收 f10)",
+    "include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td:L321-L369 — warp-specialization token 流水 + reg_alloc",
+    "include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td:L117-L124 — cluster 同步"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td",
+      "lines": "L22-L40",
+      "code": "class TTG_Op<string mnemonic, list<Trait> traits = []> :\n    Op<TritonGPU_Dialect, mnemonic,\n       !listconcat(traits, [VerifyTensorLayoutsTrait])> {\n}\n\ndef TTG_ConvertLayoutOp : TTG_Op<\"convert_layout\",\n                                 [SameOperandsAndResultShape,\n                                  SameOperandsAndResultElementType,\n                                  Pure]> {\n  let summary = \"convert layout\";\n\n  let arguments = (ins TT_Tensor:$src);\n\n  let results = (outs TT_Tensor:$result);\n\n  let hasCanonicalizer = 1;\n\n  let assemblyFormat = \"$src attr-dict `:` type($src) `->` type($result)\";\n}",
+      "elide": [
+        "TTG_Op 基类把 VerifyTensorLayoutsTrait 追加到每个 ttg 算子——所有 ttg op 落地时都会校验张量布局合法性,是本方言的公共门禁,后文各 op 不再复述"
+      ],
+      "note": "convert_layout 的 .td 定义:Pure + SameOperandsAndResultShape + SameOperandsAndResultElementType——同形同元素类型、纯函数,只改 encoding(布局)。这是唯一真正在线程间搬数据的 op(回扣 f15:tt.trans 只改名,真正跨线程搬运在 convert_layout)。"
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td",
+      "lines": "L42-L134",
+      "code": "def TTG_AsyncWaitOp : TTG_Op<\"async_wait\"> {\n  let summary = \"async wait\";\n\n  let arguments = (ins Variadic<TTG_AsyncToken>:$asyncToken, I32Attr:$num);\n\n  let results = (outs TTG_AsyncToken:$retToken);\n\n  let assemblyFormat = \"$asyncToken attr-dict\";\n\n  let extraClassDeclaration = [{\n    static bool isSupported(int computeCapability) {\n      return computeCapability >= 80;\n    }\n  }];\n}\n\ndef TTG_AsyncCommitGroupOp : TTG_Op<\"async_commit_group\"> {\n  let summary = \"async commit group\";\n\n  let results = (outs TTG_AsyncToken:$asyncToken);\n  let arguments = (ins Variadic<TTG_AsyncToken>:$inputTokens);\n\n  let assemblyFormat = [{\n    $inputTokens attr-dict\n  }];\n\n  let extraClassDeclaration = [{\n    static bool isSupported(int computeCapability) {\n      return computeCapability >= 80;\n    }\n  }];\n}\n\ndef TTG_AsyncCopyGlobalToLocalOp : TTG_Op<\"async_copy_global_to_local\", [\n  AttrSizedOperandSegments,\n  DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,\n  TypesMatchWith<\"infer mask type from src type\",\n                 \"src\", \"mask\", \"getI1SameShape($_self)\",\n                 \"($_op.getOperands().size() <= 3) || std::equal_to<>()\">,\n  TypesMatchWith<\"infer other type from src type\",\n                 \"src\", \"other\", \"getPointeeType($_self)\",\n                 \"($_op.getOperands().size() <= 4) || std::equal_to<>()\">\n]> {\n  let summary = \"copy data from global memory to local memory asynchronously\";\n\n  let hasVerifier = 1;\n  let description = [{\n    This operation copies data from global memory to local memory asynchronously.\n    This is analogue to tt.load except the data are copied to local memory pointed\n    by by the memory descriptor instread of a distributed tensor. The rest of the\n    operands are the same as tt.load.\n  }];\n\n  let arguments = (\n    ins TT_PtrTensor:$src,\n    TT_MemDescType:$result,\n    Optional<I1Tensor>:$mask,\n    Optional<TT_Type>:$other,\n    DefaultValuedAttr<TT_CacheModifierAttr, \"triton::CacheModifier::NONE\">:$cache,\n    DefaultValuedAttr<TT_EvictionPolicyAttr, \"triton::EvictionPolicy::NORMAL\">:$evict,\n    DefaultValuedAttr<BoolAttr, \"false\">:$isVolatile\n  );\n\n  let builders = [\n      OpBuilder<(ins \"Value\":$src, \"Value\":$result,\n                     \"triton::CacheModifier\":$cache,\n                     \"triton::EvictionPolicy\":$evict, \"bool\":$isVolatile)>,\n  ];\n\n  let results = (outs TTG_AsyncToken:$token);\n\n  let extraClassDeclaration = [{\n    static DenseSet<unsigned> getEligibleLoadByteWidth(int computeCapability) {\n      DenseSet<unsigned> validLoadBytes;\n      if (computeCapability >= 80) {\n        validLoadBytes = {4, 8, 16};\n      }\n      return validLoadBytes;\n    }\n  }];\n\n  // Specify cacheModifier and evictionPolicy explicitly, instead of leaving\n  // them in attr-dict, because this way their values get printed as strings,\n  // rather than as opaque integers.\n  //\n  // Note there are no commas between other, cacheModifier, and evictionPolicy,\n  // due to limitations in MLIR's asm parser.\n  let assemblyFormat = [{\n    $src `,` $result (`mask` $mask^)? (`other` $other^)?\n    oilist(`cacheModifier` `=` $cache | `evictionPolicy` `=` $evict)\n    attr-dict `:` type($src) `->` type($result)\n  }];\n}",
+      "elide": [
+        "builders / OpBuilder 段(C++ 构造入口)对读者理解算子语义无关,可略",
+        "TypesMatchWith<...> 两条(从 src 推 mask/other 类型)是类型推断细节,点到即可",
+        "getEligibleLoadByteWidth/isSupported 的 computeCapability>=80 门槛说明 cp.async 是 Ampere(sm80)起的硬件基元"
+      ],
+      "note": "cp.async 三件套的 .td 定义:async_wait(等 num 个未完成组)、async_commit_group(把已发起的异步拷贝打成一组,返回 async.token)、async_copy_global_to_local(发起 global→shared 的异步拷贝,返回 async.token)。三者都吞吐/产出 TTG_AsyncToken,靠 SSA token 串成依赖链。"
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUTypes.td",
+      "lines": "L26-L35",
+      "code": "def TTG_AsyncToken : TTG_TypeDef<\"AsyncToken\",\n                                    \"async.token\", []> {\n  let summary = \"async token type\";\n  let description = [{\n    `ttg.async.token` is a type returned by an asynchronous operation.\n    It is used to establish an SSA-based link between async operations\n    and operations that group or synchronize the async operations.\n  }];\n}\n",
+      "elide": [],
+      "note": "async.token 类型定义:异步算子返回的 SSA 值,用来在 async op 与后续 group/synchronize 之间建立 SSA 依赖——这就是 cp.async 三件套'串起来'的粘合剂。"
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td",
+      "lines": "L137-L173",
+      "code": "// Allocate shared memory\ndef TTG_LocalAllocOp : TTG_Op<\"local_alloc\", [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {\n  let summary = \"allocate tensor\";\n  let description = [{\n    This operation allocates buffer in shared memory and return a descriptor\n    containing the address and a view of the buffer.\n\n    Explicitly deallocating a buffer is optional; see local_dealloc.\n  }];\n  let arguments = (\n    ins\n    Optional<TT_Tensor>:$src,\n    OptionalAttr<I32Attr>:$alignment\n  );\n\n  let builders = [\n    OpBuilder<(ins \"Type\":$result),\n              [{ build($_builder, $_state, result, Value(), IntegerAttr()); }]>,\n    OpBuilder<(ins \"Type\":$result, \"Value\":$src),\n              [{ build($_builder, $_state, result, src, IntegerAttr()); }]>,\n    OpBuilder<(ins \"Type\":$result, \"Value\":$src, \"int32_t\":$alignment),\n              [{ build($_builder, $_state, result, src, $_builder.getI32IntegerAttr(alignment)); }]>\n  ];\n\n  let extraClassDeclaration = [{\n    bool isSharedMemoryAlloc() {\n      return getType().getMemorySpace() &&\n             isa<SharedMemorySpaceAttr>(getType().getMemorySpace());\n    }\n    int32_t getAlignmentOrDefault();\n  }];\n  let assemblyFormat = [{$src attr-dict `:` functional-type(operands, results)}];\n\n  let results = (outs TT_MemDescType:$result);\n  let hasFolder = 1;\n  let hasVerifier = 1;\n}",
+      "elide": [
+        "三个 OpBuilder 重载是 C++ 构造糖(可选 src、可选 alignment),不影响语义理解"
+      ],
+      "note": "local_alloc:在共享内存里开一块 buffer,返回 memdesc(共享内存的 SSA 句柄);可选 src 表示'分配即用这个分布式张量初始化'。显式 dealloc 可选。"
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td",
+      "lines": "L176-L257",
+      "code": "def TTG_LocalDeallocOp : TTG_Op<\"local_dealloc\", [MemoryEffects<[MemFree<SharedMemory>]>]> {\n  let summary = \"dealloc buffer\";\n\n  let description = [{\n    This operation deallocates a buffer explicitly. Using the buffer after this\n    operation is undefined.\n\n    This operation is optional.  If you don't explicitly dealloc a buffer, the\n    compiler assumes it's deallocated at the first point that post-dominates all\n    uses of the alloc.\n\n    Because we assume a memdesc is dead at the first point that post-dominates\n    its uses, ops that wait for an async operation on a memdesc to complete\n    (such as triton_nvidia_gpu.warp_group_dot_wait) should also take the memdesc as an\n    operand.\n  }];\n\n  let arguments = (ins TT_MemDescType:$src);\n\n  // Use qualified() otherwise \"!tt.memdesc<X>\" is printed as \"<X>\".\n  let assemblyFormat = [{$src attr-dict `:` qualified(type($src))}];\n}\n\ndef TTG_MemDescSubviewOp : TTG_Op<\"memdesc_subview\", [Pure]> {\n  let summary = \"take a subview of the descriptor.\";\n\n  let description = [{\n    This operation returns a new descriptor representing a subview of the buffer.\n    It doesn't affect the underlying memory. The subview can be rank-reduced.\n\n    For example, suppose that\n     - the input shape is 2x4x16xf16,\n     - the output shape is 4x4xf16, and\n     - offsets = [1, 0, 4].\n\n    Then in Python syntax, the subview covers input[1][0:4][4:8].\n  }];\n  let arguments = (\n    ins TT_MemDescType:$src, Variadic<I32>:$offsets);\n\n  // Use qualified() otherwise \"!tt.memdesc<X>\" is printed as \"<X>\".\n  let assemblyFormat = [{$src `[` $offsets `]` attr-dict `:` qualified(type($src)) `->` qualified(type($result))}];\n\n  let results = (outs TT_MemDescType:$result);\n\n  let hasVerifier = 1;\n}\n\ndef TTG_LocalLoadOp : TTG_Op<\"local_load\", [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {\n  let summary = \"Load a buffer from local memory into a distributed tensor\";\n\n  let description = [{\n    Load a tensor from the local memory descriptor into a distributed tensor.\n  }];\n  let arguments = (ins TT_MemDescType:$src, Optional<TTG_AsyncToken> :$token);\n\n  let builders = [\n      OpBuilder<(ins \"Type\":$retType, \"Value\":$src),\n      [{\n      build($_builder, $_state, retType, src, /*token=*/static_cast<mlir::Value>(nullptr));\n      }]>];\n\n  // Use qualified() otherwise \"!tt.memdesc<X>\" is printed as \"<X>\".\n  let assemblyFormat = [{$src (`token` $token^)? attr-dict `:` qualified(type($src)) `->` type($result)}];\n\n  let results = (outs TT_Tensor:$result);\n}\n\ndef TTG_LocalStoreOp : TTG_Op<\"local_store\", [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {\n  let summary = \"Store a distributed tensor into a buffer in local memory\";\n\n  let description = [{\n    Store a distributed tensor into a buffer in local memory.\n  }];\n  let arguments = (ins TT_Tensor:$src, TT_MemDescType:$dst);\n\n  let hasVerifier = 1;\n  // Use qualified() otherwise \"!tt.memdesc<X>\" is printed as \"<X>\".\n  let assemblyFormat = [{\n    $src `,` $dst attr-dict `:` type($src) `->` qualified(type($dst))\n  }];\n}",
+      "elide": [
+        "local_load 的 OpBuilder(token 缺省为 null)是构造糖"
+      ],
+      "note": "共享内存生命周期其余四件:local_dealloc(可选显式释放,不写则编译器在支配所有 use 的首点自动回收)、memdesc_subview(对 buffer 取子视图,可降秩,不动底层内存)、local_load(从 memdesc 读回分布式张量)、local_store(把分布式张量写入 memdesc)。memdesc 是贯穿它们的共享内存 SSA 句柄类型。"
+    },
+    {
+      "path": "include/triton/Dialect/Triton/IR/TritonTypes.td",
+      "lines": "L95-L112",
+      "code": "// Memory descriptor type.\ndef TT_MemDescType : TritonTypeDef<\"MemDesc\", \"memdesc\", [ShapedTypeInterface]> {\n    let summary = \"memory descriptor type (`::mlir::triton::MemDescType`) in Triton IR type system\";\n\n    let description = [{\n        Memory descriptor contains a base pointer (scalar) and a descriptor of the memory.\n        If mutable memory is false that means the memory is constant and can only be allocated and stored once.\n        A constant memory allocation is different than a tensor as it can have multiple views and the descriptor\n        can be changed without changing the underlying memory.\n    }];\n\n  let parameters = (ins\n    ArrayRefParameter<\"int64_t\">:$shape,\n    \"Type\":$elementType,\n    \"Attribute\":$encoding,\n    \"Attribute\":$memorySpace,\n    \"bool\":$mutable_memory\n  );",
+      "elide": [
+        "extraClassDeclaration/builders(cloneWith、hasRank、TypeBuilder)是 C++ 便利方法,不影响语义"
+      ],
+      "note": "memdesc 类型 = 共享内存句柄:携带 shape/elementType/encoding(shared 布局)/memorySpace/mutable_memory。mutable=false 的常量分配可有多个 view、descriptor 可变而底层内存不变——这正是 memdesc_subview 的立足点。"
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td",
+      "lines": "L259-L277",
+      "code": "def TTG_UpcastMXFPOp : TTG_Op<\"upcast_mxfp\", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {\n  let summary = \"Convert an mxfp tensor to bf16\";\n\n  let hasVerifier = 1;\n\n  let description = [{\n    Compute the bf16 encoded in the given mxfp number as per\n    https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf\n  }];\n  let arguments = (ins\n                   TT_Tensor:$src,\n                   TT_Tensor:$scale,\n                   TT_F8F6F4TypeAttr:$fp_type);\n  let results = (outs TT_Tensor:$result);\n\n  let assemblyFormat = [{\n    $src `,` $scale  `fp_type` `=` $fp_type attr-dict `:` type($src) `,` type($scale) `->` type($result)\n  }];\n}",
+      "elide": [],
+      "note": "upcast_mxfp:把 mxfp(microscaling 低精度)张量按 OCP MX 规范上采样到 bf16——低精度矩阵乘的操作数上采样入口,本章点到即可,展开留给 ch28 的 ScaledBlockedToMMAv2。"
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/IR/Dialect.cpp",
+      "lines": "L2842-L2975",
+      "code": "struct CanonicalizeConvertFromConvert\n    : public OpRewritePattern<ConvertLayoutOp> {\n  using OpRewritePattern::OpRewritePattern;\n\n  mlir::LogicalResult\n  matchAndRewrite(ConvertLayoutOp op,\n                  PatternRewriter &rewriter) const override {\n    // Convert to the same layout is redundant.\n    if (op->getResultTypes() == op->getOperandTypes()) {\n      rewriter.replaceOp(op, op->getOperands());\n      return success();\n    }\n\n    // We don't handle conversions to DotOperandEncodingAttr.  This is a\n    // heuristic to accommodate fused attention.\n    auto srcType = op.getSrc().getType();\n    auto dstType = op.getType();\n    if (mlir::isa<DotOperandEncodingAttr>(dstType.getEncoding()) &&\n        mlir::isa<NvidiaMmaEncodingAttr>(srcType.getEncoding()))\n      return failure();\n\n    // for hopper MMAv3\n    if (mlir::isa<SharedEncodingAttr>(dstType.getEncoding()) &&\n        mlir::isa<NvidiaMmaEncodingAttr>(srcType.getEncoding()) &&\n        llvm::any_of(op.getResult().getUsers(), [](Operation *dot) {\n          return dot->hasTrait<OpTrait::DotLike>();\n        })) {\n      return failure();\n    }\n\n    Operation *arg = op.getSrc().getDefiningOp();\n    if (!arg)\n      return failure();\n\n    // cvt(reshape) -> reshape\n    if (auto reshape = dyn_cast<ReshapeOp>(arg)) {\n      if (!reshape.getAllowReorder() || reshape.getEfficientLayout() ||\n          isExpensiveView(reshape.getSrc().getType(), op.getType()))\n        return failure();\n\n      // In TritonGPUToLLVM phase, ViewOp is converted to unpacking and packing\n      // operations, which requires the element type to match between unpacking\n      // and packing. However, part of values with dot operand encoding will be\n      // packed/unpacked as i32 elements instead of the underlying element type.\n      // To avoid errors, skip this folding when either the operand or result\n      // of view has a dot operand encoding.\n      if (hasDotOperandEncoding(op->getOperand(0)) ||\n          hasDotOperandEncoding(op->getResult(0)))\n        return failure();\n\n      rewriter.replaceOpWithNewOp<ReshapeOp>(op, op->getResult(0).getType(),\n                                             reshape.getResult(),\n                                             reshape.getAllowReorder());\n      return success();\n    }\n\n    // cvt(histogram) -> histogram\n    if (auto histogram = dyn_cast<HistogramOp>(arg)) {\n      // For histogram ops the input and output layouts are independent, so we\n      // can always fold convert into the histogram op.\n      rewriter.replaceOpWithNewOp<HistogramOp>(op, op->getResult(0).getType(),\n                                               histogram.getSrc());\n      return success();\n    }\n\n    // cvt(local_load) -> local_load.\n    if (auto sharedLoad = dyn_cast<LocalLoadOp>(arg)) {\n      // Shared_load can load to any layout so we can always fold convert into\n      // it.\n      // We insert at the point of the original op as there could be ops with\n      // memory side-effects between the LocalLoad op and the ConvertLayout op\n      rewriter.setInsertionPoint(arg);\n      rewriter.replaceOpWithNewOp<LocalLoadOp>(op, op->getResult(0).getType(),\n                                               sharedLoad.getSrc());\n\n      return success();\n    }\n\n    // cvt(cat) -> cat\n    if (auto cat = dyn_cast<CatOp>(arg)) {\n      if (isExpensiveCat(cat, op.getType().getEncoding()))\n        return failure();\n\n      rewriter.replaceOpWithNewOp<CatOp>(op, op->getResult(0).getType(),\n                                         cat.getOperands());\n      return success();\n    }\n\n    // cvt(cvt(x, type1), type2) -> cvt(x, type2)\n    if (auto cvt = dyn_cast<ConvertLayoutOp>(arg)) {\n      auto srcType = op.getSrc().getType();\n      auto origAttrs = op->getAttrs();\n      auto newOp = rewriter.replaceOpWithNewOp<triton::gpu::ConvertLayoutOp>(\n          op, op->getResultTypes().front(), cvt.getSrc());\n      newOp->setAttrs(origAttrs);\n      return success();\n    }\n\n    // cvt(type1, splat(type2, x)) -> splat(type1, x)\n    if (auto splat = dyn_cast<triton::SplatOp>(arg)) {\n      rewriter.replaceOpWithNewOp<triton::SplatOp>(op, op->getResultTypes(),\n                                                   splat.getSrc());\n      return success();\n    }\n\n    // cvt(type1, make_range(type2, x)) -> make_range(type1, x)\n    if (auto range = dyn_cast<MakeRangeOp>(arg)) {\n      rewriter.replaceOpWithNewOp<MakeRangeOp>(\n          op, op->getResultTypes(), range.getStart(), range.getEnd());\n      return success();\n    }\n\n    // cvt(type, constant) -> constant\n    if (auto cst = llvm::dyn_cast<arith::ConstantOp>(arg))\n      if (auto ret = dyn_cast<SplatElementsAttr>(cst.getValue())) {\n        auto ty = cast<ShapedType>(op->getResultTypes().front());\n        auto newRet =\n            SplatElementsAttr::get(ty, ret.getSplatValue<Attribute>());\n        rewriter.replaceOpWithNewOp<arith::ConstantOp>(op, newRet);\n        return success();\n      }\n    return failure();\n  }\n};\n\nvoid ConvertLayoutOp::getCanonicalizationPatterns(RewritePatternSet &patterns,\n                                                  MLIRContext *context) {\n  patterns.add<CanonicalizeConvertFromConvert>(context);\n  patterns.add<CanonicalizeConvertFromReshape>(context);\n  patterns.add<CanonicalizeConvertFromHistogram>(context);\n  patterns.add<CanonicalizeConvertFromAlloc>(context);\n  patterns.add<CanonicalizeConvertFromLocalStore>(context);\n  patterns.add<CanonicalizeConvertFromSplit>(context);\n}",
+      "elide": [
+        "cvt(reshape)/cvt(cat)/cvt(splat)/cvt(make_range)/cvt(constant) 各分支同构:若 src 由某 op 定义且折叠安全,则把 convert 折进上游 op——逐分支列举即可,规律一致",
+        "DotOperandEncoding/Hopper MMAv3 两处 early-return 是防止破坏 fused-attention/WGMMA 的启发式豁免,点到即可"
+      ],
+      "note": "convert_layout 的规范化(canonicalizer):CanonicalizeConvertFromConvert 消冗余(cvt 到同布局直接删)、折叠链(cvt(cvt(x))→cvt(x)、cvt(local_load)→local_load、cvt(reshape)→reshape…)。这解释了为什么 dump 里剩下的 convert_layout 才是'真正省不掉、真要搬数据'的那些——数它即可估布局转换开销(perf 命门)。"
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/IR/Dialect.cpp",
+      "lines": "L2977-L3062",
+      "code": "// LocalAllocOp\nvoid LocalAllocOp::getEffects(\n    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>\n        &effects) {\n  Operation *op = getOperation();\n  // If allocation is immutable, mark it as no side effect allow things like\n  // CSE, DCE to work in early compiler passes.\n  // After the memory offset is computed, we attach the true side effect to the\n  // op.\n  if (!getType().getMutableMemory() && !op->hasAttr(\"allocation.offset\"))\n    return;\n  effects.emplace_back(MemoryEffects::Allocate::get(),\n                       mlir::triton::gpu::SharedMemory::get());\n  if (getSrc())\n    effects.emplace_back(MemoryEffects::Write::get(),\n                         getOperation()->getOpResult(0),\n                         mlir::triton::gpu::SharedMemory::get());\n}\n\nOpFoldResult LocalAllocOp::fold(FoldAdaptor adaptor) {\n  if (getType().getMutableMemory())\n    return {};\n  auto src = getSrc();\n  if (!src)\n    return {};\n  auto localLoadOp = src.getDefiningOp<LocalLoadOp>();\n  if (!localLoadOp)\n    return {};\n  auto loadSrc = localLoadOp.getSrc();\n  if (loadSrc.getType() != getType())\n    return {};\n  return loadSrc;\n}\n\nLogicalResult LocalAllocOp::verify() {\n  if (!getSrc()) {\n    if (!getType().getMutableMemory())\n      return emitError(\"uninitialized alloc must have a mutable memdesc type\");\n    return success();\n  }\n  auto srcTy = getSrc().getType();\n  auto dstTy = getType();\n\n  if (srcTy.getElementType() != dstTy.getElementType()) {\n    return emitError(\"result element type must match desc element type\");\n  }\n  return success();\n}\n\n// LocalLoadOp\nvoid LocalLoadOp::getEffects(\n    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>\n        &effects) {\n  effects.emplace_back(MemoryEffects::Read::get(), &getSrcMutable(),\n                       mlir::triton::gpu::SharedMemory::get());\n}\n\n// LocalStoreOp\nLogicalResult LocalStoreOp::verify() {\n  if (!getDst().getType().getMutableMemory())\n    return emitOpError(\"Cannot store into immutable memory\");\n  return success();\n}\n\nvoid LocalStoreOp::getEffects(\n    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>\n        &effects) {\n  effects.emplace_back(MemoryEffects::Write::get(), &getDstMutable(),\n                       mlir::triton::gpu::SharedMemory::get());\n}\n\n// AsyncCopyGlobalToLocalOp\nLogicalResult AsyncCopyGlobalToLocalOp::verify() {\n  if (!getResult().getType().getMutableMemory())\n    return emitOpError(\"Cannot store into immutable memory\");\n  return success();\n}\n\nvoid AsyncCopyGlobalToLocalOp::getEffects(\n    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>\n        &effects) {\n  effects.emplace_back(MemoryEffects::Read::get(), &getSrcMutable(),\n                       mlir::triton::GlobalMemory::get());\n  effects.emplace_back(MemoryEffects::Write::get(), &getResultMutable(),\n                       mlir::triton::gpu::SharedMemory::get());\n}",
+      "elide": [],
+      "note": "共享内存三件的语义(Dialect.cpp):local_alloc 的 getEffects(不可变且未定 offset 时无副作用,便于 CSE/DCE)、fold(alloc(local_load(x)) 若类型一致折回 x)、verify(未初始化 alloc 必须 mutable);local_load/local_store/async_copy 各自的 Read/Write 副作用登记(SharedMemory 资源)与 verify(不能写入 immutable 内存)。"
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/IR/Dialect.cpp",
+      "lines": "L3064-L3107",
+      "code": "LogicalResult MemDescSubviewOp::verify() {\n  auto srcTy = getSrc().getType();\n  auto dstTy = getType();\n\n  if (srcTy.getElementType() != dstTy.getElementType()) {\n    return emitError(\"result element type must match desc element type\");\n  }\n  if (getOffsets().size() != srcTy.getRank()) {\n    return emitError(\"offsets must have the same rank as input\");\n  }\n  if (srcTy.getRank() < dstTy.getRank()) {\n    return emitError(\"result rank must be less than or equal to input rank\");\n  }\n  auto rankDiff = srcTy.getRank() - dstTy.getRank();\n  for (int i = 0; i < dstTy.getRank(); i++) {\n    if (dstTy.getDimSize(i) > srcTy.getDimSize(i + rankDiff)) {\n      return emitError(\n                 \"result shape cannot be larger than input shape at dimension \")\n             << i;\n    }\n  }\n\n  auto srcEnc = srcTy.getEncoding();\n  auto dstEnc = dstTy.getEncoding();\n  if (!!srcEnc != !!dstEnc) {\n    return emitError(\"src and result must both have or not have an encoding\");\n  }\n\n  if (!isa<SharedEncodingAttr>(srcEnc)) {\n    return emitError(\"src encoding must be SharedEncodingAttr\");\n  }\n  if (!isa<SharedEncodingAttr>(dstEnc)) {\n    return emitError(\"result encoding must be SharedEncodingAttr\");\n  }\n\n  // TODO(jlebar): Currently we generate illegal encodings, so we can't add a\n  // verifier for them.  In particular, we use the same encoding for the src and\n  // dst of a subview op, when the subview removes a dimension.  That generates\n  // an illegal shared encoding (because the size of `order` doesn't match the\n  // rank of the tensor), but it's not checked anywhere, and we believe the\n  // resulting code ultimately works.\n\n  return success();\n}",
+      "elide": [
+        "末尾 TODO 注释解释当前降秩 subview 会生成'非法'shared encoding 但实际可跑——是已知技术债,读者了解即可"
+      ],
+      "note": "memdesc_subview::verify:元素类型须一致、offsets 秩=输入秩、输出秩<=输入秩(可降秩)、各维尺寸不超输入、src/dst 都须是 SharedEncodingAttr。配合 .td 里 2x4x16→4x4(offsets=[1,0,4]→input[1][0:4][4:8])的算例,是本章唯一自带 worked example 的 op。"
+    },
+    {
+      "path": "include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td",
+      "lines": "L41-L44",
+      "code": "class TTNG_Op<string mnemonic, list<Trait> traits = []> :\n    Op<TritonNvidiaGPU_Dialect, mnemonic,\n       !listconcat(traits, [VerifyTensorLayoutsTrait])> {\n}",
+      "elide": [],
+      "note": "TTNG_Op 基类:与 TTG_Op 同构——同样追加 VerifyTensorLayoutsTrait。TritonNvidiaGPU 方言的骨架与 TritonGPU 完全对称,只是内容换成 NVIDIA Hopper 硬件专属算子。这个'骨架对称、内容换硬件'正是配对脊柱的结构样板。"
+    },
+    {
+      "path": "include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td",
+      "lines": "L129-L171",
+      "code": "def TTNG_WarpGroupDotOp : TTNG_Op<\"warp_group_dot\", [DeclareOpInterfaceMethods<InferTypeOpInterface>,\n                                                     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,\n                                                     DotLike,\n                                                     TypesMatchWith<\"result's type matches accumulator's type\",\n                                                                     \"d\", \"c\", \"$_self\">]> {\n    let summary = \"warp group dot\";\n\n    let description = [{\n        $d = matrix_multiply($a, $b) + $c. For docs on InputPrecisionAttr, see TT_DotOp\n    }];\n\n    let arguments = (ins TT_TensorOrMemDesc:$a,\n                         TT_TensorOrMemDesc:$b,\n                         TT_FpIntTensor:$c,\n                         Optional<I1>:$useC,\n                         DefaultValuedAttr<TT_InputPrecisionAttr, \"::mlir::triton::InputPrecision::IEEE\">:$inputPrecision,\n                         DefaultValuedAttr<I32Attr, \"0\">:$maxNumImpreciseAcc,\n                         DefaultValuedAttr<BoolAttr, \"false\">:$isAsync);\n\n    let results = (outs TT_FpIntTensor:$d);\n\n    let assemblyFormat = \"$a`,` $b`,` $c (`,` $useC^)? attr-dict `:` type($a) `*` type($b) `->` type($d)\";\n\n    let extraClassDeclaration = [{\n      bool needsPartialAccumulator();\n    }];\n}\n\ndef TTNG_WarpGroupDotWaitOp : TTNG_Op<\"warp_group_dot_wait\", [DeclareOpInterfaceMethods<InferTypeOpInterface>,\n                                                              AllTypesMatch<[\"inputs\", \"outputs\"]>]> {\n  let summary = \"warp group dot wait\";\n  let arguments = (ins Variadic<TT_TensorOrMemDesc>:$inputs, I32Attr:$pendings);\n  let results = (outs Variadic<TT_TensorOrMemDesc>:$outputs);\n  let description = [{\n    Waits until there are $pendings or fewer outstanding async dot operations.\n\n    $inputs must be the tensors corresponding to the async dot ops that we're\n    waiting on.  For example, if there are N pending async dot ops and we call\n    `warp_group_dot_wait 1`, then $inputs must be the result of the first dot op.\n  }];\n\n  let assemblyFormat = \"$inputs attr-dict `:` type($inputs)\";\n}",
+      "elide": [
+        "extraClassDeclaration needsPartialAccumulator() 是降级期细节"
+      ],
+      "note": "warp_group_dot(WGMMA):Hopper warpgroup 级矩阵乘 d=a*b+c,操作数可直接吃 memdesc(共享内存),isAsync 表异步;warp_group_dot_wait 等到未完成异步 dot <= pendings。这是 ch28 MMAv3 特判的落点算子,本章作词汇表登记、微架构留给后续降级章。"
+    },
+    {
+      "path": "include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td",
+      "lines": "L173-L243",
+      "code": "def TTNG_InitBarrierOp : TTNG_Op<\"init_barrier\", [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {\n    let summary = \"Initialize a barrier in the given shared memory allocation.\";\n\n    let description = [{\n        Initializes a shared memory allocation with mbarrier information.\n        `alloc` is a descriptor to the shared memory allocation. `count` is the\n        number of arrives expected by the barrier.\n\n        This lowers to PTX mbarrier.init.shared::cta.b64.\n    }];\n\n    let hasVerifier = 1;\n    let arguments = (ins TT_MemDescType:$alloc,\n                         I32Attr:$count);\n    let assemblyFormat = \"$alloc `,` $count attr-dict `:` type($alloc)\";\n}\n\ndef TTNG_InvalBarrierOp : TTNG_Op<\"inval_barrier\", [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {\n    let summary = \"Invalidate a barrier allocation.\";\n\n    let description = [{\n      Invalidate a barrier allocation so that it can be re-used. According to PTX\n      spec this has to be done before any re-use of the memory used by mbarrier.\n\n      https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-inval\n    }];\n\n    let hasVerifier = 1;\n    let arguments = (ins TT_MemDescType:$alloc);\n    let assemblyFormat = \"$alloc attr-dict `:` type($alloc)\";\n}\n\ndef TTNG_BarrierExpectOp : TTNG_Op<\"barrier_expect\", [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {\n  let summary = \"Signal a barrier of an expected number of bytes to be copied.\";\n\n  let description = [{\n    This signal the barrier that `size` bytes are expected to be copied. The\n    associated barrier wait will block until the expected number of bytes are copied.\n  }];\n\n  let hasVerifier = 1;\n  let arguments = (\n    ins TT_MemDescType:$alloc,\n    I32Attr:$size,\n    I1:$pred\n  );\n\n  let assemblyFormat = [{\n    $alloc `,` $size attr-dict `,` $pred `:` type($alloc)\n  }];\n}\n\ndef TTNG_WaitBarrierOp : TTNG_Op<\"wait_barrier\", [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {\n    let summary = \"wait until the mbarrier phase completes.\";\n\n    let description = [{\n      Blocks the program progress until the mbarrier object in `alloc` completes\n      its current phase.\n\n      This lowers a waitloop using PTX instruction\n      mbarrier.try_wait.parity.shared.b64.\n\n      The barrier behavior is described here:\n      https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-asynchronous-copy-completion-mechanisms\n    }];\n\n    let hasVerifier = 1;\n    let arguments = (ins TT_MemDescType:$alloc,\n                         I32:$phase);\n    let assemblyFormat = \"$alloc `,` $phase attr-dict `:` type($alloc)\";\n}",
+      "elide": [
+        "各 op 的 hasVerifier 细节与 PTX 文档链接注释,读者了解其降级到哪条 PTX 指令即可"
+      ],
+      "note": "mbarrier 全家桶:init_barrier(mbarrier.init)、inval_barrier(复用前失效)、barrier_expect(声明期望搬入字节数)、wait_barrier(阻塞到相位完成,mbarrier.try_wait.parity)。加上 L46 的 mbarrier_arrive——这是 TMA/异步拷贝完成的同步机制(sm90 硬件基元)。"
+    },
+    {
+      "path": "include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td",
+      "lines": "L246-L307",
+      "code": "def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<\"async_tma_copy_global_to_local\", [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {\n  let summary = \"copy data based on descriptor from global memory to local memory asynchronously\";\n\n  let description = [{\n    This operation copies data from global memory to local memory\n    asynchronously.  This is analogue to tt.load except the data are copied to\n    local memory pointed by the memory descriptor instread of a distributed\n    tensor. The data copied depends on the global memory descriptor pointed to\n    by `desc_ptr`.\n  }];\n\n  let hasVerifier = 1;\n  let arguments = (\n    ins TT_PtrType:$desc_ptr,\n    Variadic<I32>:$coord,\n    TT_MemDescType:$barrier,\n    TT_MemDescType:$result,\n    I1:$pred,\n    DefaultValuedAttr<TT_CacheModifierAttr, \"triton::CacheModifier::NONE\">:$cache,\n    DefaultValuedAttr<TT_EvictionPolicyAttr, \"triton::EvictionPolicy::NORMAL\">:$evict,\n    DefaultValuedAttr<BoolAttr, \"false\">:$isVolatile\n  );\n\n  let assemblyFormat = [{\n    $desc_ptr `[` $coord `]` $result `,` $barrier `,` $pred\n    oilist(`cacheModifier` `=` $cache | `evictionPolicy` `=` $evict)\n    attr-dict `:` type($desc_ptr) `,` type($barrier) `->` type($result)\n  }];\n}\n\ndef TTNG_AsyncTMACopyLocalToGlobalOp : TTNG_Op<\"async_tma_copy_local_to_global\", [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {\n  let summary = \"copy data based on descriptor from local memory to global memory asynchronously\";\n\n  let description = [{\n    This operation copies data from local memory to global memory\n    asynchronously.  This is analogue to tt.store except the data are copied from\n    local memory pointed by the memory descriptor instread of a distributed\n    tensor. The data copied depends on the global memory descriptor pointed to\n    by `desc_ptr`.\n  }];\n\n  let arguments = (\n    ins TT_PtrType:$desc_ptr,\n    Variadic<I32>:$coord,\n    TT_MemDescType:$src);\n\n  let assemblyFormat = [{\n    $desc_ptr `[` $coord `]` $src\n    attr-dict `:` type($desc_ptr) `,` type($src)\n  }];\n}\n\ndef TTNG_TMAStoreWait : TTNG_Op<\"async_tma_store_wait\"> {\n  let summary = \"wait until all the inputs are read.\";\n  let arguments = (ins I32Attr:$pendings);\n  let description = [{\n    Wait until all the read operations are done from the associated store operations.\n    This is needed before the shared memory can be written to.\n  }];\n\n  let assemblyFormat = \"attr-dict\";\n}",
+      "elide": [
+        "async_tma_copy_local_to_global 与 async_tma_store_wait 是反方向(shared→global)存储路径,结构与 global→local 对称"
+      ],
+      "note": "async_tma_copy_global_to_local(TMA,回收 f10):按 global 内存 descriptor(desc_ptr)+坐标 coord 把整块数据异步搬到 memdesc 指的共享内存,配 barrier(mbarrier)做完成同步。这就是 ch07 埋的 f10——Hopper TMA descriptor 化整块搬运真正降级到硬件方言的落点。"
+    },
+    {
+      "path": "include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td",
+      "lines": "L321-L369",
+      "code": "def TTNG_CreateTokenOp : TTNG_Op<\"create_token\"> {\n  let results = (outs TensorOf<[TTNG_TokenType]>:$result);\n\n  let arguments = (ins I32Attr:$num);\n\n  let builders = [OpBuilder<(ins \"uint32_t\":$num)>];\n\n  let assemblyFormat = \"attr-dict `:` type($result)\";\n}\n\ndef TTNG_ProducerAcquireOp : TTNG_Op<\"producer_acquire\"> {\n  let arguments = (ins TensorOf<[TTNG_TokenType]>:$token, I32:$idx, I1:$phase);\n\n  let assemblyFormat = \"$token `,` $idx `,` $phase attr-dict `:` type(operands)\";\n}\n\ndef TTNG_ProducerCommitOp : TTNG_Op<\"producer_commit\"> {\n  let arguments = (ins TensorOf<[TTNG_TokenType]>:$token, I32:$idx);\n\n  let assemblyFormat = \"$token `,` $idx attr-dict `:` type(operands)\";\n}\n\ndef TTNG_ConsumerWaitOp : TTNG_Op<\"consumer_wait\"> {\n  let arguments = (ins TensorOf<[TTNG_TokenType]>:$token, I32:$idx, I1: $phase);\n\n  let assemblyFormat = \"$token `,` $idx `,` $phase attr-dict `:` type(operands)\";\n}\n\ndef TTNG_ConsumerReleaseOp : TTNG_Op<\"consumer_release\"> {\n  let arguments = (ins TensorOf<[TTNG_TokenType]>:$token, I32:$idx);\n\n  let assemblyFormat = \"$token `,` $idx attr-dict `:` type(operands)\";\n}\n\ndef TTNG_RegAllocOp : TTNG_Op<\"reg_alloc\", []> {\n  let summary = \"register allocation\";\n\n  let arguments = (ins I32Attr: $regCount);\n\n  let assemblyFormat = \"$regCount attr-dict\";\n}\n\ndef TTNG_RegDeallocOp : TTNG_Op<\"reg_dealloc\", []> {\n  let summary = \"register deallocation\";\n\n  let arguments = (ins I32Attr: $regCount);\n\n  let assemblyFormat = \"$regCount attr-dict\";\n}",
+      "elide": [
+        "reg_alloc/reg_dealloc 的 OpBuilder 略;各 op assemblyFormat 已足够看出操作数形态"
+      ],
+      "note": "warp-specialization 流水词汇:create_token(建同步 token 张量)、producer_acquire/producer_commit、consumer_wait/consumer_release(生产者/消费者按 idx+phase 握手)、reg_alloc/reg_dealloc(warpgroup 间寄存器重分配)。ch31 的 Warp Specialization pass 消费这套词汇,本章只登记词汇表。"
+    },
+    {
+      "path": "TTGIR (pin-compile 观测)",
+      "lines": "make_ttgir @ sm80 num_stages=3",
+      "code": "      %46 = tt.load %arg8 : tensor<64x32x!tt.ptr<f16>, #blocked> loc(#loc22)\n      %47 = triton_gpu.local_alloc %46 : (tensor<64x32xf16, #blocked>) -> !tt.memdesc<64x32xf16, #shared, #triton_gpu.shared_memory> loc(#loc22)\n      %48 = tt.load %arg9 : tensor<32x64x!tt.ptr<f16>, #blocked1> loc(#loc23)\n      %49 = triton_gpu.local_alloc %48 : (tensor<32x64xf16, #blocked1>) -> !tt.memdesc<32x64xf16, #shared1, #triton_gpu.shared_memory> loc(#loc23)\n      %50 = triton_gpu.local_load %47 : !tt.memdesc<64x32xf16, #shared, #triton_gpu.shared_memory> -> tensor<64x32xf16, #triton_gpu.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>> loc(#loc22)\n      %51 = triton_gpu.local_load %49 : !tt.memdesc<32x64xf16, #shared1, #triton_gpu.shared_memory> -> tensor<32x64xf16, #triton_gpu.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>> loc(#loc23)\n      %52 = tt.dot %50, %51, %arg7, inputPrecision = tf32 : tensor<64x32xf16, #triton_gpu.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>> * tensor<32x64xf16, #triton_gpu.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>> -> tensor<64x64xf32, #mma> loc(#loc24)\n      %53 = tt.addptr %arg8, %cst : tensor<64x32x!tt.ptr<f16>, #blocked>, tensor<64x32xi32, #blocked> loc(#loc25)\n      %54 = tt.addptr %arg9, %35 : tensor<32x64x!tt.ptr<f16>, #blocked1>, tensor<32x64xi32, #blocked1> loc(#loc20)\n      scf.yield %52, %53, %54 : tensor<64x64xf32, #mma>, tensor<64x32x!tt.ptr<f16>, #blocked>, tensor<32x64x!tt.ptr<f16>, #blocked1> loc(#loc26)\n    } loc(#loc21)\n    %37 = tt.splat %arg4 : i32 -> tensor<64x1xi32, #blocked1> loc(#loc27)",
+      "elide": [
+        "前后 tt.addptr/tt.broadcast 等地址算术略,只保留共享内存与布局算子形态"
+      ],
+      "note": "pip install triton==3.2.0(与 pin 逐字节同)headless 编译 fp16 matmul 的真实 TTGIR 循环体片段(make_ttgir 之后)。可核抓手:tt.load 出来的 #blocked 张量经 local_alloc 落进 !tt.memdesc<...,#shared,#triton_gpu.shared_memory>,再 local_load 成 #dot_op(喂 tt.dot 的 MMA 操作数布局);#mma/#blocked/#shared/#dot_op 布局属性均可见。convert_layout 出现在循环外(mma→blocked1 回写)。本例 num_stages=3 但循环未被多缓冲成 cp.async(pipeliner 对该 case 停在同步 local_alloc/local_load 形态),async_copy 形态以 .td 定义为准——如实标注,不假装。"
+    }
+  ],
+  "mechanisms": [
+    {
+      "id": "m1",
+      "name": "convert_layout:唯一真正跨线程搬数据的 op",
+      "kind": "dataflow",
+      "source_anchors": [
+        "include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td:L27-L40",
+        "lib/Dialect/TritonGPU/IR/Dialect.cpp:L2842-L2975"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "note": "同形同元素类型、只改 encoding;dump 里数它=估布局转换开销。回扣 ch19 tt.trans(改名,元数据重排)对比:trans/reshape 只改名,convert_layout 才真在线程间搬数据。回收 f15。"
+    },
+    {
+      "id": "m2",
+      "name": "memdesc 类型 + 共享内存生命周期(local_alloc/dealloc/load/store)",
+      "kind": "dataflow",
+      "source_anchors": [
+        "include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td:L138-L173",
+        "include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td:L176-L257",
+        "include/triton/Dialect/Triton/IR/TritonTypes.td:L96-L112",
+        "lib/Dialect/TritonGPU/IR/Dialect.cpp:L2977-L3046"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "note": "memdesc=共享内存的 SSA 句柄类型(base ptr + shape/encoding/mutable);local_alloc 开、local_dealloc 关(可省则自动回收)、local_load 读回分布式张量、local_store 写入。副作用/verify 见 Dialect.cpp。"
+    },
+    {
+      "id": "m3",
+      "name": "memdesc_subview:对共享内存 buffer 取(可降秩)子视图",
+      "kind": "layout",
+      "source_anchors": [
+        "include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td:L199-L222",
+        "lib/Dialect/TritonGPU/IR/Dialect.cpp:L3064-L3107"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting",
+      "note": ".td 自带算例:2x4x16→4x4,offsets=[1,0,4]→input[1][0:4][4:8]。verify 校验元素类型/秩/尺寸/SharedEncoding。多缓冲环形 buffer 靠它取当前 stage 的片。"
+    },
+    {
+      "id": "m4",
+      "name": "cp.async 三件套:async_copy_global_to_local + async_commit_group + async_wait",
+      "kind": "protocol",
+      "source_anchors": [
+        "include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td:L42-L134",
+        "include/triton/Dialect/TritonGPU/IR/TritonGPUTypes.td:L26-L35",
+        "lib/Dialect/TritonGPU/IR/Dialect.cpp:L3048-L3062"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "note": "隐藏访存延迟的 Ampere(sm80)硬件基元:发起异步 global→shared 拷贝→commit 打组→wait 等 num 个未完成组;三者用 async.token 串 SSA 依赖。是软件流水线(ch29/30)的底层原语。"
+    },
+    {
+      "id": "m5",
+      "name": "convert_layout 规范化:消冗余 + 折叠链",
+      "kind": "algorithm",
+      "source_anchors": [
+        "lib/Dialect/TritonGPU/IR/Dialect.cpp:L2842-L2975"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting",
+      "paper_origin_note": "MLIR canonicalizer 重写模式,无论文出处",
+      "note": "cvt 到同布局删、cvt(cvt(x))→cvt(x)、cvt(local_load)→local_load、cvt(reshape/cat/splat/...)→折进上游。解释为何 dump 里剩下的 convert_layout 才是真省不掉的开销。DotOperand/MMAv3 两处启发式豁免。"
+    },
+    {
+      "id": "m6",
+      "name": "upcast_mxfp:低精度(mxfp)上采样到 bf16",
+      "kind": "config",
+      "source_anchors": [
+        "include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td:L259-L277"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "note": "按 OCP MX 规范把 mxfp 张量升到 bf16;点到即可,scaled dot 的展开留给 ch28。"
+    },
+    {
+      "id": "m7",
+      "name": "ttng 硬件专属方言样板:与 ttg 同骨架、内容换 NVIDIA Hopper",
+      "kind": "config",
+      "source_anchors": [
+        "include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td:L41-L44",
+        "include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td:L22-L25"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "note": "TTNG_Op 与 TTG_Op 同构(都追加 VerifyTensorLayoutsTrait),方言骨架对称、内容换硬件。这是配对脊柱结构样板:整个 TritonNvidiaGPU = 姊妹篇 triton-ascend NPU 硬件方言逐结构对位的模子——'硬件专属方言'这个位置通用,换硬件换内容不换骨架。"
+    },
+    {
+      "id": "m8",
+      "name": "warp_group_dot(WGMMA):Hopper warpgroup 级异步矩阵乘",
+      "kind": "protocol",
+      "source_anchors": [
+        "include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td:L129-L171"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "note": "d=a*b+c,操作数可直接吃 memdesc(共享内存),isAsync+warp_group_dot_wait(pendings)构成异步 dot;ch28 MMAv3 特判的落点算子。作词汇表,微架构留后续降级章。"
+    },
+    {
+      "id": "m9",
+      "name": "async_tma_copy(TMA)+ mbarrier 全家桶:整块搬运降级到硬件方言",
+      "kind": "protocol",
+      "source_anchors": [
+        "include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td:L246-L307",
+        "include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td:L173-L243",
+        "include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td:L46-L76"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "note": "回收 f10:async_tma_copy_global_to_local 按 global descriptor+coord 把整块搬到 shared,配 mbarrier(init/expect/wait/arrive/inval)做完成同步——ch07 埋的 TMA descriptor 化访存真正降级到硬件方言的落点。sm90 基元,作词汇表。"
+    },
+    {
+      "id": "m10",
+      "name": "warp-specialization 流水词汇 + cluster 同步",
+      "kind": "protocol",
+      "source_anchors": [
+        "include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td:L321-L369",
+        "include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td:L117-L124"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "note": "create_token/producer_acquire/producer_commit/consumer_wait/consumer_release 的生产者-消费者握手 + reg_alloc/dealloc(warpgroup 寄存器重分配)+ cluster_arrive/wait(CGA 同步)。ch31 Warp Specialization pass 消费这套词汇,本章登记词汇表。"
+    }
+  ],
+  "key_classes": [
+    {
+      "name": "TritonGPU_Dialect (ttg)",
+      "file": "include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td",
+      "responsibility": "通用 GPU 抽象方言:布局转换(convert_layout)、共享内存生命周期、cp.async 异步拷贝——后端无关(NVIDIA/AMD 共用)"
+    },
+    {
+      "name": "TritonNvidiaGPU_Dialect (ttng)",
+      "file": "include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td",
+      "responsibility": "NVIDIA 硬件专属方言:WGMMA/TMA/mbarrier/cluster/warp-specialization——与 ttg 同骨架,配对脊柱样板"
+    },
+    {
+      "name": "MemDescType",
+      "file": "include/triton/Dialect/Triton/IR/TritonTypes.td",
+      "responsibility": "共享内存的 SSA 句柄类型:base ptr + shape/elementType/encoding(shared)/memorySpace/mutable;可多 view、descriptor 可变而底层内存不变"
+    },
+    {
+      "name": "AsyncToken / (ttng)Token",
+      "file": "include/triton/Dialect/TritonGPU/IR/TritonGPUTypes.td",
+      "responsibility": "异步算子返回的 SSA token,建立 async op 与 group/synchronize 之间的显式依赖链"
+    },
+    {
+      "name": "ConvertLayoutOp canonicalizer",
+      "file": "lib/Dialect/TritonGPU/IR/Dialect.cpp",
+      "responsibility": "6 条重写模式消除冗余/可折叠的 convert_layout,决定 dump 里真正省不掉的布局转换"
+    }
+  ],
+  "data_flow": [
+    {
+      "step": "1",
+      "where": "include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td TTG_ConvertLayoutOp",
+      "what": "tt 层张量(ch19)带上布局(ch20-23 编码)后,convert_layout 在不同 encoding 间搬数据(唯一真正跨线程搬运的 op)"
+    },
+    {
+      "step": "2",
+      "where": "include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td LocalAllocOp/LocalStoreOp",
+      "what": "要经共享内存中转时:local_alloc 开 memdesc,local_store/async_copy 把数据落进共享内存"
+    },
+    {
+      "step": "3",
+      "where": "include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td AsyncCopyGlobalToLocalOp+AsyncCommitGroupOp+AsyncWaitOp",
+      "what": "异步路径:async_copy 发起 global→shared,commit_group 打组,async_wait 等完成;async.token 串依赖(隐藏访存延迟)"
+    },
+    {
+      "step": "4",
+      "where": "include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td LocalLoadOp",
+      "what": "local_load 从 memdesc 读回分布式张量(常带 dot_op 布局喂给 dot)"
+    },
+    {
+      "step": "5",
+      "where": "lib/Dialect/TritonGPU/IR/Dialect.cpp canonicalizer",
+      "what": "convert_layout canonicalizer 折叠冗余转换,只留真正必要的布局搬运"
+    },
+    {
+      "step": "6",
+      "where": "include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td 硬件专属算子",
+      "what": "Hopper 路径:async_tma_copy(TMA,f10)整块搬入 shared + mbarrier 同步;warp_group_dot(WGMMA)吃共享内存操作数;warp-specialization token 协调 producer/consumer"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "convert_layout 是唯一真正跨线程搬数据的 op;trans/reshape 只改元数据",
+      "why": "分离'改名(纯元数据,免费)'与'搬运(线程间通信,有成本)'两种语义,让优化器能精确度量与消除布局转换开销",
+      "evidence": "include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td:L27-L40 (SameOperandsAndResultShape+Pure,只改 encoding) + lib/Dialect/TritonGPU/IR/Dialect.cpp:L2842-L2975 (canonicalizer 折叠冗余)"
+    },
+    {
+      "decision": "共享内存用 memdesc 类型作 SSA 句柄,而非把 shared 当另一种张量 encoding",
+      "why": "共享内存是可变、可多 view、有生命周期的资源(非 SSA 值语义);memdesc 携带 mutable_memory 与 memorySpace,让 alloc/dealloc/subview/load/store 能带精确副作用参与 CSE/DCE 与 barrier 分析(ch26)",
+      "evidence": "include/triton/Dialect/Triton/IR/TritonTypes.td:L96-L112 + lib/Dialect/TritonGPU/IR/Dialect.cpp:L2978-L2994 (getEffects)"
+    },
+    {
+      "decision": "异步拷贝用 async.token 显式串 SSA 依赖(而非隐式顺序)",
+      "why": "cp.async 语义是'发起后不阻塞',必须用 token 在 IR 里显式表达'哪个 wait 等哪批 copy',否则调度器无法安全重排/流水",
+      "evidence": "include/triton/Dialect/TritonGPU/IR/TritonGPUTypes.td:L26-L35 + include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td:L42-L73 (commit/wait 都吞吐 AsyncToken)"
+    },
+    {
+      "decision": "NVIDIA 硬件专属算子单独成 TritonNvidiaGPU 方言,与 TritonGPU 同骨架",
+      "why": "通用 GPU 抽象(ttg)后端无关可复用;硬件专属(WGMMA/TMA/mbarrier)隔离在 ttng,换硬件(如 Ascend NPU)只需 fork 一个同骨架方言换内容——配对脊柱的结构基础",
+      "evidence": "include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td:L41-L44 (TTNG_Op 与 include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td:L22-L25 TTG_Op 同构)"
+    },
+    {
+      "decision": "cp.async 门槛 computeCapability>=80、TMA/mbarrier/WGMMA 门槛 >=90",
+      "why": "这些是特定 GPU 世代(Ampere/Hopper)的硬件基元,方言层用 isSupported 显式记录硬件门槛,降级期据此选路",
+      "evidence": "include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td:L52-L55,L69-L72 + include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td:L86-L89 (isSupported)"
+    }
+  ],
+  "theory": [
+    "布局转换开销:convert_layout 在两个 distributed encoding 间搬数据,最坏须经共享内存往返(每线程写自己的元素→同步→按目标布局读回);dump 里 convert_layout 的条数与涉及的张量规模,是估算布局转换开销的直接代理(perf 命门)。对照 tt.trans/reshape:纯元数据改名,零搬运成本。",
+    "异步延迟隐藏:cp.async 让 global→shared 拷贝与计算重叠——发起(async_copy)后不阻塞,commit 打组、后续 wait 才同步;配合软件流水线(ch29/30)多缓冲,可把访存延迟藏在上一轮计算下。async.token 的 SSA 链是调度器安全重排的依据。",
+    "TMA vs cp.async:cp.async(sm80)按每线程指针逐元素异步搬;TMA(sm90,async_tma_copy)按 global descriptor 一次性整块搬,由专用引擎完成、mbarrier 同步——搬运粒度从'线程级'升到'张量块级',进一步省指令与地址算术(f10 的兑现)。"
+  ],
+  "subtraction_plan": {
+    "delete": [],
+    "must_keep": [
+      {
+        "symbol": "TTG_ConvertLayoutOp / convert_layout",
+        "why": "本章头号 op、唯一真正跨线程搬数据者、perf 命门、回收 f15"
+      },
+      {
+        "symbol": "TTG_AsyncCopyGlobalToLocalOp / async_copy_global_to_local",
+        "why": "cp.async 三件套核心,隐藏访存延迟的硬件基元"
+      },
+      {
+        "symbol": "TTG_AsyncCommitGroupOp / async_commit_group",
+        "why": "三件套之二,打组"
+      },
+      {
+        "symbol": "TTG_AsyncWaitOp / async_wait",
+        "why": "三件套之三,等完成"
+      },
+      {
+        "symbol": "TTG_AsyncToken / async.token",
+        "why": "串起三件套的 SSA 依赖粘合剂"
+      },
+      {
+        "symbol": "TTG_LocalAllocOp / local_alloc",
+        "why": "共享内存生命周期起点,产 memdesc"
+      },
+      {
+        "symbol": "TTG_LocalDeallocOp / local_dealloc",
+        "why": "生命周期终点(可省则自动回收)"
+      },
+      {
+        "symbol": "TTG_LocalLoadOp / local_load",
+        "why": "从 memdesc 读回分布式张量"
+      },
+      {
+        "symbol": "TTG_LocalStoreOp / local_store",
+        "why": "把分布式张量写入 memdesc"
+      },
+      {
+        "symbol": "TTG_MemDescSubviewOp / memdesc_subview",
+        "why": "取共享内存子视图(可降秩),本章唯一自带 worked example 的 op"
+      },
+      {
+        "symbol": "MemDescType / memdesc",
+        "why": "共享内存的 SSA 句柄类型,贯穿所有 local_* op"
+      },
+      {
+        "symbol": "TTG_UpcastMXFPOp / upcast_mxfp",
+        "why": "低精度上采样,点到即可"
+      },
+      {
+        "symbol": "TTNG_Op",
+        "why": "与 TTG_Op 同骨架——配对脊柱结构样板的证据"
+      },
+      {
+        "symbol": "TTNG_WarpGroupDotOp / warp_group_dot",
+        "why": "WGMMA 词汇,ch28 MMAv3 落点"
+      },
+      {
+        "symbol": "TTNG_AsyncTMACopyGlobalToLocalOp / async_tma_copy_global_to_local",
+        "why": "TMA,回收 f10"
+      },
+      {
+        "symbol": "TTNG_InitBarrierOp / init_barrier / wait_barrier / mbarrier_arrive",
+        "why": "mbarrier 全家桶,TMA 完成同步"
+      },
+      {
+        "symbol": "TTNG_CreateTokenOp / create_token / producer_acquire / consumer_wait",
+        "why": "warp-specialization 流水词汇,ch31 落点"
+      }
+    ]
+  },
+  "foreshadow_due": {
+    "plant": [],
+    "recover": [
+      {
+        "id": "f10",
+        "planted_in": "ch07",
+        "summary": "Hopper TMA descriptor 化访存(整块搬运交给专用引擎)——ch24 里 async_tma_copy 是这条路径真正降级到硬件方言的落点。",
+        "recover_at": "ttng 层 async_tma_copy_global_to_local + mbarrier 段(embed L246-L307 / m9)"
+      },
+      {
+        "id": "f15",
+        "planted_in": "ch19",
+        "summary": "tt.trans 只是给每个 GPU 线程持有的元素'改名'(纯元数据重排),真正跨线程搬运发生在前后的 convertLayout 算子,那是 ttg 层的事。",
+        "recover_at": "ttg 层 convert_layout 段(embed L27-L40 + canonicalizer / m1)——讲透 convert_layout 是唯一真正在线程间搬数据的 op,回扣 tt.trans 改名"
+      }
+    ]
+  }
+}
