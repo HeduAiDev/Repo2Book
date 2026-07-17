@@ -228,8 +228,16 @@ def lint_formulas(filepath: str) -> dict:
     results["too_many_inline_formulas"] = issues
 
     # ── Check 7: Complex inline formulas (>30 chars inside $...$) ──
+    # 跳过 ```…``` 围栏体：源码里的裸 $（如 TableGen `$var ... $var` assemblyFormat 语法）
+    # 不是数学，会被 $...$ 正则误配成复杂内联公式（复用 Check 6 的 in_fence 追踪）。
     issues = []
+    in_fence = False
     for i, line in enumerate(lines, 1):
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
         cleaned = re.sub(r'\$\$[^$]*\$\$', '', line)
         for m in re.finditer(r'\$(?!\$)([^$]+)\$(?!\$)', cleaned):
             content = _unwrap(m.group(1))

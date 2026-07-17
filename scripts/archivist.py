@@ -425,30 +425,28 @@ def _update_state_chapter(chapter_id: str, status: str):
     with open(STATE_FILE) as f:
         state = json.load(f)
 
-    # Determine which part the chapter belongs to
-    ch_num = int(chapter_id.replace("artifacts/", "").split("-")[0]) if chapter_id else 0
-    part_map = {
-        range(1, 11): "part1",
-        range(11, 14): "part2",
-        range(14, 22): "part3",
-        range(22, 26): "part4",
-        range(26, 29): "part5",
-    }
-    part = "unknown"
-    for r, p in part_map.items():
-        if ch_num in r:
-            part = p
-            break
+    # 规范扁平键 chNN(与 state["chapters"] 实际 schema 一致)。
+    # 旧版 int(chapter_id.split("-")[0]) 对 "ch24" 抛 ValueError 直接崩(state 更新中断),
+    # 且旧版写的是 chapters[part][NN] 嵌套结构、与实际扁平 chapters["chNN"] 不符 → 静默 no-op,
+    # 是 state.json 章条目静默缺失的根因(如 ch23)。改为:健壮解析 + 直接维护扁平 status。
+    raw = chapter_id.replace("artifacts/", "").split("-")[0] if chapter_id else ""
+    digits = "".join(c for c in raw if c.isdigit())
+    ch_key = f"ch{int(digits):02d}" if digits else raw
+    if not ch_key:
+        return
 
-    chapters = state.get("chapters", {})
-    if part in chapters:
-        if isinstance(chapters[part], dict):
-            chapters[part][str(ch_num).zfill(2)] = status
+    chapters = state.setdefault("chapters", {})
+    entry = chapters.get(ch_key)
+    if isinstance(entry, dict):
+        entry["status"] = status
+    else:
+        # 章条目尚不存在:建最小条目,防止 state 静默漏登记(rich 字段由 archivist 另行补全)
+        chapters[ch_key] = {"status": status}
 
     state["updated"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     state["updated_by"] = "archivist"
     with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+        json.dump(state, f, indent=2, ensure_ascii=False)
 
 
 def _find_relevant(directory: Path, chapter_id: str, limit: int) -> list:
