@@ -311,7 +311,7 @@ def session_summary(date: str = None, accomplishments: str = "",
         "context_hash": f"session-{date}",
     }
     with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+        json.dump(state, f, indent=2, ensure_ascii=False)
 
     print(f"Session summary: {filepath.relative_to(ROOT)}")
     return filepath
@@ -858,7 +858,7 @@ def _update_state_field(key: str, value):
     state["updated"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     state["updated_by"] = "archivist"
     with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+        json.dump(state, f, indent=2, ensure_ascii=False)
 
 
 # ── CLI ──────────────────────────────────────────────────────────
