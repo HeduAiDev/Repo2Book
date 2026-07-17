@@ -5,6 +5,7 @@
 ## Recent Activity
 
 | Date | Type | Chapter | Summary | File |
+| 2026-07-18 | delivery | ch40 | ch40《脱离 Python:AOT compile/link 与读懂 SASS》定稿——Part IX 工具章 | [2026-07-18_ch40-ch40《脱离-python:aot-compile-link-与读懂-sass》定稿——part-ix-工具章.md](deliveries/2026-07-18_ch40-ch40《脱离-python:aot-compile-link-与读懂-sass》定稿——part-ix-工具章.md) |
 | 2026-07-18 | delivery | ch39 | ch39《度量:proton 钩子、roofline viewer 与 do_bench》定稿——Part IX 度量章 | [2026-07-18_ch39-ch39《度量:proton-钩子、roofline-viewer-与-do_bench》定稿——part-ix-度量章.md](deliveries/2026-07-18_ch39-ch39《度量:proton-钩子、roofline-viewer-与-do_bench》定稿——part-ix-度量章.md) |
 | 2026-07-17 | delivery | ch42 | ch42《【原理篇】FlashAttention:在线 softmax 与分块遍历》定稿——Part IX 原理篇 | [2026-07-17_ch42-ch42《【原理篇】flashattention:在线-softmax-与分块遍历》定稿——part-ix-原理篇.md](deliveries/2026-07-17_ch42-ch42《【原理篇】flashattention:在线-softmax-与分块遍历》定稿——part-ix-原理篇.md) |
 | 2026-07-17 | delivery | ch41 | ch41《调试与学习:triton-opt 家族、tensor-layout 探针与 tutorials 阶梯》定稿——Part IX 工具生态收官 | [2026-07-17_ch41-ch41《调试与学习:triton-opt-家族、tensor-layout-探针与-tutorials-阶梯》定稿——.md](deliveries/2026-07-17_ch41-ch41《调试与学习:triton-opt-家族、tensor-layout-探针与-tutorials-阶梯》定稿——.md) |
