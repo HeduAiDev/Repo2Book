@@ -1,0 +1,131 @@
+{
+  "chapter": "ch31",
+  "note": "skip_impl 章。prefetch-loop-rewrite 是编译器 IR 重写,无法在 host 执行整条 pass → trace_source=manual,结构性数字全部 file:Lxxx 溯源到源码常量。f32-dot-tc-tf32x3 的『为什么三次』本质是数值误差问题,用 host 纯 numpy 忠实模拟 F32DotTC.cpp 的 f32ToTF32/三次累加链(不依赖 triton 编译器)→ trace_source=run,误差数字全部实测可核。两处均非运行『精简版』(本章无精简版),tf32x3 的 run 是独立数值模型,故与任务『trace_source=manual』的口径差异在此显式说明。",
+  "mechanisms": [
+    {
+      "mechanism_id": "prefetch-loop-rewrite",
+      "intuition": "流水线上的工人不等整箱零件到齐才开工——上一道工序快收尾时,就先把下一箱的头几件递到手边。算本片 K 时,下一片『从货架(shared)搬到工作台(register)』已经在路上;搬运的等待被藏进了相邻片的 tensor-core 计算里。",
+      "worked_example": {
+        "params": {
+          "M": 128,
+          "N": 128,
+          "BLOCK_K": 64,
+          "dtype": "fp16",
+          "mma": "Nvidia MMA v2",
+          "prefetchWidth": 16,
+          "K_slices_per_dot": 4
+        },
+        "trace_source": "manual",
+        "manual_reason": "Prefetch 是 TTGIR 层的循环重写 pass(MemDescSubviewOp/LocalLoadOp/scf.for 重建),没有可在 host python 执行的等价精简版,跑它需完整构建 triton 编译器并给定 GPU target。逐轮表是对 createNewForOp(Prefetch.cpp:L286-L413)控制流的手工推演;所有结构性数字(prefetchWidth=16、K 片数=4、iter_args 增量=+2)均由源码常量算出,逐格标 file:Lxxx。",
+        "table": {
+          "columns": ["K 片", "K 区间", "本片 local_load 时机", "dot 动作(累加输入)", "重叠对象"],
+          "rows": [
+            ["片0", "[0, 16)", "上一轮末尾已预取,存于 iter_arg %a_prefetch_arg/%b_prefetch_arg(L338-343)", "firstDot(片0, C_in)", "无需等待,进循环即算"],
+            ["片1", "[16, 32)", "本轮体内 subview+local_load(L362-369)", "dot(片1, 累到 firstDot)", "片1 的搬运 与 firstDot 的计算重叠"],
+            ["片2", "[32, 48)", "本轮体内 subview+local_load", "dot(片2, 累到片1)", "片2 搬运 与 片1 dot 重叠"],
+            ["片3", "[48, 64)", "本轮体内 subview+local_load", "dot(片3, 累到片2)", "片3 搬运 与 片2 dot 重叠"],
+            ["下轮片0", "下一轮 [0, 16)", "本轮体尾预取→塞进 yield(L398-406)", "供下一轮 firstDot 用", "下轮首片搬运 藏在本轮尾"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "循环体内的 sub-dot 恰好覆盖整个 BLOCK_K 一次、不重不漏,累加结果数值等价于原来的单个整-K dot;循环体内 dot 数有限(= BLOCK_K/prefetchWidth = 4)。",
+        "argument": "kRem 从 BLOCK_K - prefetchWidth = 48 出发,while 循环每轮 kOff += prefetchWidth、kRem -= prefetchWidth(Prefetch.cpp:L376-377),是严格递减的非负整数,到 kRem==0 停(基例),有限步必终止;每片 offset 连续拼接 [0,16),[16,32),[32,48),[48,64) 无缝覆盖 [0,64);累加链 C_in→片0→片1→片2→片3 即 Σ_k a_k·b_k = 原 dot,故等价。"
+      },
+      "quantified": "BLOCK_K=64、prefetchWidth=16 → 每个 dot 拆成 4 个 sub-dot;新循环 iter_args 比原来多 2 个(每 dot 追加 a/b 两个头预取片,Prefetch.cpp:L292-295);每轮循环体内 local_load = 3 片×2(剩余片 a/b)+ 1 片×2(尾部预取下轮首片)= 8 次,循环外 prologue 再 2 次(L269-284)。prefetchWidth 若改成 kWidth 路径则 = 8*kWidth(L238);K 小于 prefetchWidth 时整个 dot 跳过不预取(L241-242)。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-prefetch-loop-rewrite",
+          "claim": "Prefetch 把『每轮先 local_load 满整片 K 再做一个 dot』的循环,重写成『循环外预取首片 + 循环内沿 K 逐片 dot 且下一片的 local_load 与本片 dot 重叠 + 末尾预取下轮首片』,iter_args 多出 2 个。",
+          "template": "before-after",
+          "numbers": [
+            {"label": "prefetchWidth", "value": "16", "provenance": "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp:L236 (aKWidth==0 → 256/elementWidth, fp16 elementWidth=16)"},
+            {"label": "BLOCK_K", "value": "64", "provenance": "worked-example 参数(小到可心算);kSize = aType.getShape()[1],见 Prefetch.cpp:L231"},
+            {"label": "K 片数", "value": "4", "provenance": "BLOCK_K/prefetchWidth = 64/16;while-loop kRem/kOff 见 Prefetch.cpp:L346-L347,L357-L377"},
+            {"label": "iter_args 增量", "value": "+2", "provenance": "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp:L292-L295 (每 dot push a/b 头预取片)"}
+          ],
+          "caption_draft": "单-dot 循环经 Prefetch 后:shared→register 搬运(local_load)被切成 4 片、错开一拍藏进相邻片的 dot 计算里。这是软件流水线(见 ch29/ch30,重叠 global→shared)之外、专门重叠 shared→register 的第二层旋钮——两级重叠正交叠加。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "prefetch-slice-generate",
+      "intuition": "『切一片』分两步:先在货架(shared)上圈出要拿的那一格(MemDescSubview——只是个零成本的视图,不搬数据),再真把这一格搬到工作台(LocalLoad——shared→register,带上 tensor core 认得的 DotOperand 布局)。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-generate-prefetch-slice",
+          "claim": "generatePrefetch 把一个共享内存操作数沿 K 维切出 prefetchWidth 宽的 MemDescSubview,再 LocalLoad 成带 DotOperandEncoding 的寄存器片;opIdx=0(A)切列(kIdx=1)、opIdx=1(B)切行(kIdx=0)。",
+          "template": "tensor-flow",
+          "numbers": [
+            {"label": "A 片(opIdx=0,切列 kIdx=1)", "value": "[128, 16]", "provenance": "generatePrefetch: kIdx = opIdx==0?1:0, shape[kIdx]=prefetchWidth;Prefetch.cpp:L112-L150;prefetchWidth=16 见 L236"},
+            {"label": "B 片(opIdx=1,切行 kIdx=0)", "value": "[16, 128]", "provenance": "同上,opIdx=1→kIdx=0;Prefetch.cpp:L112-L150"},
+            {"label": "K 总宽", "value": "64", "provenance": "worked-example 参数 BLOCK_K;非 prologue 时切剩余片 shape[kIdx]=k-prefetchWidth,见 L124-L128"}
+          ],
+          "caption_draft": "『切一片』= MemDescSubviewOp(在 shared 上开视图,零成本)+ LocalLoadOp(真搬到寄存器,附 DotOperandEncoding)。A 沿列、B 沿行各切 16 宽,恰好喂给一次 tensor-core MMA 指令的 K 步长;isPrologue 取首片 [0,16),否则取剩余 [16,64)。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "f32-dot-tc-tf32x3",
+      "intuition": "一把只读得到毫米刻度的快尺(tf32,10bit 尾数)去量微米级长度(fp32,23bit)。技巧:先量个大概(主体×主体);再用同一把快尺单独去量『刚才量漏的零头』——零头×主体、主体×零头两笔补正;至于零头×零头,小到快尺根本读不出,干脆不量。三次快量加起来,精度逼近真值,而每次用的还是那把快尺。",
+      "worked_example": {
+        "params": {
+          "K": 4,
+          "a": [1.3, 2.7, 0.9, 3.14159],
+          "b": [0.7, 1.1, 2.2, 1.41421],
+          "dtype": "f32",
+          "inputPrecision": "tf32x3"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/tf32x3.json",
+        "table": {
+          "columns": ["交叉项", "数值", "相对结果量级", "处置(累加链位置)"],
+          "rows": [
+            ["aBig·bBig(主体×主体)", "10.298326", "主体项", "保留 · 累加链末(最后加,即单次 tf32 结果)"],
+            ["aSmall·bBig(零头×主体)", "0.002575", "补正项", "保留 · 累加链首(最先加,残差小先入)"],
+            ["aBig·bSmall(主体×零头)", "0.001967", "补正项", "保留 · 累加链中"],
+            ["aSmall·bSmall(零头×零头)", "0.00000049", "占结果 0.000000047", "丢弃(量级低于 fp32 末位,快尺读不出)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "三项之和 = fp32 真值 − aSmall·bSmall,而丢弃的 aSmall·bSmall 有明确上界且实测已小于 tf32x3 的总残差——所以『只做三次、不做第四次』无损。",
+        "argument": "精确展开 ab=(aBig+aSmall)(bBig+bSmall) 有四项;保留三项、只丢 aSmall·bSmall。残差量级 |aSmall|~2^-10·|a|、|bSmall|~2^-10·|b| ⇒ |丢弃项|~2^-20·|ab|;实测占结果 0.000000047(trace dropped_term_rel_to_result),甚至小于 tf32x3 的总相对残差 0.00000011——可见剩余误差主要来自三个保留 dot 各自的 tf32 截断,而非丢弃项,故补第四次 dot 收益为零。累加按残差从小到大(aSmall·bBig 起于 0)以减少累加舍入。"
+      },
+      "quantified": "单次 tf32 dot 相对误差 0.00044(≈2^-11),tf32x3 降到 0.00000011(≈2^-23,逼近 fp32 尾数末位),约 3901 倍改善(trace single_over_x3_relerr_ratio);代价是 3 次 tensor-core dot,吞吐约为单次 tf32 的 1/3,但仍远快于 IEEE fp32 软件仿真。守门:仅 inputPrecision==tf32x3 且 a、b 均为 f32 时触发(F32DotTC.cpp:L34-37),且需 sm80+ tensor core。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-tf32x3-decompose",
+          "claim": "一个 fp32 dot 被拆成 3 个 tf32 dot 的累加链——保留 aSmall·bBig、aBig·bSmall、aBig·bBig 三项、丢弃最小的 aSmall·bSmall;实测相对误差从单次 tf32 的 0.00044 降到 0.00000011。",
+          "template": "flow",
+          "numbers": [
+            {"label": "单次 tf32 相对误差", "value": "0.00044", "provenance": "traces/tf32x3.json single_tf32.rel_err(rounded_for_table)"},
+            {"label": "tf32x3 相对误差", "value": "0.00000011", "provenance": "traces/tf32x3.json tf32x3.rel_err(rounded_for_table)"},
+            {"label": "丢弃项占结果", "value": "0.000000047", "provenance": "traces/tf32x3.json dropped_term_rel_to_result(rounded_for_table)"},
+            {"label": "改善倍数", "value": "3901", "provenance": "traces/tf32x3.json single_over_x3_relerr_ratio(rounded_for_table)"},
+            {"label": "主项 aBig·bBig", "value": "10.298326", "provenance": "traces/tf32x3.json cross_terms.aBig_bBig(rounded_for_table);恰等于单次 tf32 结果"}
+          ],
+          "caption_draft": "为什么恰好三次:四项交叉积里,零头×零头(aSmall·bSmall)小到 fp32 都读不出(占结果 0.000000047),丢它无损;剩下三项每项至少一边是高精度,三次 tf32 dot 就把结果从单次的 0.00044 误差逼到 0.00000011、约 3901 倍改善。累加链把主项放最后加(aSmall·bBig → aBig·bSmall → aBig·bBig)以保精度。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "ws-token-landing",
+      "intuition": "把车间分成『搬运班』和『加工班』两班人(warpgroup),各占一片工位。搬运班只管把料从仓库(global/shared)源源不断搬到工位、加工班只管开机床(wgmma)算;两班用交接牌(token)对暗号——搬运班放牌『料好了』,加工班等到牌才动、用完回牌『可以搬下一批』。两班并行,搬与算就重叠起来了。这是 ch24 producer/consumer 词汇在 IR 里的最终落地形态。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ws-warpgroup-swimlane",
+          "claim": "num_consumer_groups>0 时,WS 六联把循环按 async task id 拆到两条泳道——producer warpgroup 异步搬 load、consumer warpgroup 做 wgmma;WSLowering 把 async task id 落成 warpId/4(每 task = 一个 4-warp warpgroup),token(见 ch24)做跨 warpgroup 流控。",
+          "template": "swimlane",
+          "numbers": [
+            {"label": "WARPS_PER_TASK", "value": "4", "provenance": "lib/Dialect/TritonGPU/Transforms/WSLowering.cpp:L41 (Hopper 每 warpgroup=4 warp)"},
+            {"label": "THREADS_PER_TASK", "value": "128", "provenance": "lib/Dialect/TritonGPU/Transforms/WSLowering.cpp:L42"},
+            {"label": "task id = warpId / 4", "value": "4", "provenance": "WSLowering.cpp:L48-L50 asyncTaskId = DivUI(canonicalWarpId, WARPS_PER_TASK)"},
+            {"label": "默认 num_consumer_groups", "value": "0", "provenance": "third_party/nvidia/backend/compiler.py:L97 (默认 0=关;WSTaskPartition 等入口 num_consumer_groups==0 即早退,>0 才触发六联)"}
+          ],
+          "caption_draft": "WS 是选读旋钮:默认 num_consumer_groups=0 时六联全部早退、IR 不变;>0 才把 producer/consumer 拆到不同 warpgroup。producer 泳道搬 load、consumer 泳道算 dot,token 握手保序——这正是 ch24 create_token/ProducerAcquire/ConsumerWait 词汇被 pass 落地的样子,别夸大它在默认路径的作用。"
+        }
+      ]
+    }
+  ]
+}

@@ -5,6 +5,7 @@
 ## Recent Activity
 
 | Date | Type | Chapter | Summary | File |
+| 2026-07-17 | delivery | 31 | ch31《Prefetch、Warp Specialization 与杂项清理 pass》定稿——Part VI 收官 | [2026-07-17_ch31-ch31《prefetch、warp-specialization-与杂项清理-pass》定稿——part-vi-收官.md](deliveries/2026-07-17_ch31-ch31《prefetch、warp-specialization-与杂项清理-pass》定稿——part-vi-收官.md) |
 | 2026-07-17 | delivery | ch33 | ch33 第二跳的地基:类型塌缩与 ConvertLayoutOp 的三条搬运路径 定稿(Part VII) | [2026-07-17_ch33-第二跳的地基-类型塌缩与-convertlayoutop-的三条搬运路径-定稿(part-vii).md](deliveries/2026-07-17_ch33-第二跳的地基-类型塌缩与-convertlayoutop-的三条搬运路径-定稿(part-vii).md) |
 | 2026-07-17 | delivery | ch30 | 软件流水线落地 MatmulLoopPipeline 建模与 PipelineExpander 展开 定稿(回收 f16) | [2026-07-17_ch30-软件流水线落地-matmullooppipeline-建模与-pipelineexpander-展开-定稿.md](deliveries/2026-07-17_ch30-软件流水线落地-matmullooppipeline-建模与-pipelineexpander-展开-定稿.md) |
 | 2026-07-17 | delivery | ch32 | ch32 五级台阶与第一跳 TTIR→TTGIR 定稿(Part VII 开篇) | [2026-07-17_ch32-ch32-五级台阶与第一跳-ttir→ttgir-定稿(part-vii-开篇).md](deliveries/2026-07-17_ch32-ch32-五级台阶与第一跳-ttir→ttgir-定稿(part-vii-开篇).md) |

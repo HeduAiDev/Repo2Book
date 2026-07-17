@@ -1,0 +1,279 @@
+{
+  "chapter": "ch31",
+  "title": "Prefetch、Warp Specialization 与杂项清理 pass——流水线之外的进阶重叠旋钮",
+  "kind": "skip_impl",
+  "one_line": "软件流水线(见 ch29/ch30)之外的两个进阶重叠旋钮——Prefetch 让 shared→register 搬运与 dot 计算重叠、Hopper Warp Specialization(选读)按 num_consumer_groups 把循环拆到 producer/consumer warpgroup;外加 F32DotTC 用 TF32x3 三次逼近换 fp32 精度/速度,以及 pipeline 尾部一串轻量 layout 清理 pass。",
+
+  "code_spine": [
+    "third_party/nvidia/backend/compiler.py:L204-L253 — make_ttgir 全景:本章诸 pass 在 TTGIR pipeline 里的落点。默认路径按序:add_f32_dot_tc(sm80+)→…layout 优化…→[WS 六联,仅 num_consumer_groups>0]→add_prefetch→add_optimize_dot_operands→add_reduce_data_duplication→add_reorder_instructions",
+    "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp:L417-L445 — PrefetchPass::runOnOperation:canonicalize cvt → walk 每个 scf.for → Prefetcher{initialize→emitPrologue→createNewForOp} → 替换旧循环",
+    "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp:L152-L267 — Prefetcher::initialize:筛选可 prefetch 的 dot(只收 MMAv2/AMD MFMA、单 dot)、算 prefetchWidth、沿 def-use 回溯到 local_load 源、登记 a/b 的 loopArg/headerDef/yield",
+    "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp:L112-L150 — generatePrefetch:把共享内存操作数沿 K 维切 MemDescSubview → LocalLoad 出一个 prefetchWidth 宽的片(带 DotOperandEncoding)",
+    "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp:L269-L284 — emitPrologue:循环体外先 local_load 出首片(上一轮的『下一片』),作为新循环的额外 init 参数",
+    "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp:L286-L413 — createNewForOp:重建带额外 iter_args 的新循环——用 prologue 预取片喂第一个 dot、循环内沿 K 逐片 subview+local_load+dot、末尾预取下一轮首片塞进 yield",
+    "lib/Dialect/TritonGPU/Transforms/F32DotTC.cpp:L27-L83 — TF32x3::matchAndRewrite:inputPrecision==tf32x3 的 f32 dot 拆成 3 个 tf32 dot 逼近",
+    "third_party/nvidia/backend/compiler.py:L234-L240 — WS 六联(选读):ws_task_partition→taskid_propagate→ws_data_partition→ws_code_partition→add_pipeline→ws_lowering,全部吃 num_consumer_groups",
+    "lib/Dialect/TritonGPU/Transforms/WSTaskPartition.cpp:L44-L163 — doPartition:把 load 标 producer(task 0)、dot 标 consumer(task 1..N),num_consumer_groups==0 直接早退",
+    "lib/Dialect/TritonGPU/Transforms/ReduceDataDuplication.cpp:L32-L74 — 把 blocked→dot-operand 的 cvt 换成 local_alloc+local_load(过一趟 shared)消冗余复制",
+    "lib/Dialect/TritonGPU/Transforms/ReorderInstructions.cpp:L61-L135 — 五组就地移动:下沉 cvt 到 dealloc 后/循环内、alloc(load) 贴 load、trans 贴定义、opIdx=1 的 local_load 排到 opIdx=0 之后"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp",
+      "lines": "L1-L27",
+      "what": "Pass 顶部 doc 注释——一眼看懂 Prefetch 做的 IR 变换:单个 dot 的循环 → 循环外预取首片 + 带额外 iter_arg(%a_prefetch_arg) 的新循环",
+      "code": "//===----------------------------------------------------------------------===//\n//\n// This pass tries to prefetch operands (a and b) of tt.dot.\n// Those ConvertLayoutOps will be lowered to shared memory loads.\n//\n// For example:\n// %a: tensor<128x32xf16, #enc>\n// scf.for %iv = ... iter_args(%a_arg = %a, ...) {\n//   %d = tt.dot %a_arg, %b, %c\n//   ...\n//   scf.yield %a_next, ...\n// }\n//\n// will be translated to\n//\n// %a: tensor<128x32xf16, #enc>\n// %a_tmp = tensor.subview %a[0, 0] [128, 16]\n// %a_prefetch = triton_gpu.local_load %a_tmp\n// scf.for %iv = ... iter_args(%a_buf = %a, ..., %a_prefetch_arg = %a_prefetch)\n// {\n//   %x = tt.dot %a_prefetch_arg, %b, %c\n//   %a_tmp_rem = tensor.subview %a_buf[0, 16] [128, 16]\n//   %a_prefetch_next = triton_gpu.local_load %a_tmp_rem\n//   ...\n//   scf.yield %next_a, ..., %a_prefetch_next\n// }\n//===----------------------------------------------------------------------===//",
+      "elide": []
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp",
+      "lines": "L159-L179",
+      "what": "配对脊柱点:initialize 只接受 Nvidia MMA v2 与 AMD MFMA 两种 dot 结果编码——『第三方 MMA 编码挂进通用 pass』的现成范例(姊妹篇 ascend 挂自己的 MMA 编码走的正是这条口子)。外加两条保守约束:非这两种编码直接 failure、循环里多于一个 dot 也 failure(flash-attention 双 dot 会 segfault)",
+      "code": "  SmallVector<triton::DotOp> dotsInFor;\n  for (Operation &op : *loop)\n    if (auto dotOp = dyn_cast<triton::DotOp>(op)) {\n      // Only accepts dotOps encoded as Nvidia MMA v2 or AMD MFMA\n      auto dstMmaEnc =\n          dyn_cast<NvidiaMmaEncodingAttr>(getEncoding(dotOp.getResult()));\n      auto dstMfmaEnc =\n          dyn_cast<AMDMfmaEncodingAttr>(getEncoding(dotOp.getResult()));\n      if (!dstMfmaEnc && (!dstMmaEnc || dstMmaEnc.getVersionMajor() != 2))\n        // Don't rewrite if any other type is found.\n        return failure();\n      dotsInFor.push_back(dotOp);\n    }\n\n  if (dotsInFor.empty())\n    return failure();\n\n  // TODO: segfault (original for still has uses)\n  // when used in flash attention that has 2 dots in the loop\n  if (dotsInFor.size() > 1)\n    return failure();",
+      "elide": []
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp",
+      "lines": "L112-L150",
+      "what": "generatePrefetch:把共享内存操作数沿 K 维切一片。opIdx=0(a)切列(kIdx=1)、opIdx=1(b)切行(kIdx=0);isPrologue 时取 [0,prefetchWidth) 首片、否则取剩余 [prefetchWidth,k) —— 落成 MemDescSubviewOp(切 shared)+ LocalLoadOp(搬到寄存器、带 DotOperandEncoding)",
+      "code": "Value Prefetcher::generatePrefetch(Value v, unsigned opIdx, bool isPrologue,\n                                   Attribute dotEncoding, OpBuilder &builder,\n                                   std::optional<int64_t> offsetK,\n                                   std::optional<int64_t> shapeK) {\n  // opIdx: 0 => a, 1 => b\n  auto type = cast<triton::MemDescType>(v.getType());\n  SmallVector<int64_t> shape{type.getShape().begin(), type.getShape().end()};\n  SmallVector<int64_t> offset{0, 0};\n  Type elementType = type.getElementType();\n\n  // k => (prefetchWidth, k - prefetchWidth)\n  int64_t kIdx = opIdx == 0 ? 1 : 0;\n\n  offset[kIdx] = isPrologue ? 0 : prefetchWidth;\n  shape[kIdx] = isPrologue ? prefetchWidth : (shape[kIdx] - prefetchWidth);\n\n  if (shapeK)\n    shape[kIdx] = *shapeK;\n  if (offsetK)\n    offset[kIdx] = *offsetK;\n\n  SmallVector<Value> offsetsVal;\n  for (int64_t off : offset)\n    offsetsVal.push_back(\n        builder.create<arith::ConstantIntOp>(v.getLoc(), off, 32));\n  Value newSmem = builder.create<triton::gpu::MemDescSubviewOp>(\n      v.getLoc(),\n      triton::MemDescType::get(shape, elementType, type.getEncoding(),\n                               type.getMemorySpace()),\n      v, offsetsVal);\n\n  auto dotOperandEnc = triton::gpu::DotOperandEncodingAttr::get(\n      builder.getContext(), opIdx, dotEncoding, prefetchWidth / 8);\n  Value prefetchSlice = builder.create<triton::gpu::LocalLoadOp>(\n      v.getLoc(), RankedTensorType::get(shape, elementType, dotOperandEnc),\n      newSmem);\n\n  return prefetchSlice;\n}",
+      "elide": []
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp",
+      "lines": "L233-L242",
+      "what": "prefetchWidth 的确定:kWidth==0 时按 256/elementWidth(fp16→16),否则 8*kWidth;K 维小于 prefetchWidth 就跳过不预取。这是『切多宽一片』的旋钮",
+      "code": "    // works better with nvidia tensor cores\n    unsigned elementWidth = aType.getElementTypeBitWidth();\n    if (aKWidth == 0)\n      prefetchWidth = 256 / elementWidth;\n    else\n      prefetchWidth = 8 * aKWidth;\n\n    // Skip prefetching if kSize is less than prefetchWidth\n    if (kSize < prefetchWidth)\n      continue;",
+      "elide": []
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp",
+      "lines": "L289-L299",
+      "what": "createNewForOp 的核心:新循环的 init 参数 = 旧循环全部 initArgs + 每个 dot 追加 a/b 两个『头预取片』。这就是注释里那个多出来的 %a_prefetch_arg —— 与 ch30 软件流水线扩 iter_args 是同一手法、不同目的(这里重叠 shared→register)",
+      "code": "  SmallVector<Value> loopArgs;\n  for (auto v : forOp.getInitArgs())\n    loopArgs.push_back(v);\n  for (triton::DotOp dot : dots) {\n    loopArgs.push_back(operand2headPrefetch[dot.getA()]);\n    loopArgs.push_back(operand2headPrefetch[dot.getB()]);\n  }\n\n  auto newForOp = builder.create<scf::ForOp>(\n      forOp.getLoc(), forOp.getLowerBound(), forOp.getUpperBound(),\n      forOp.getStep(), loopArgs);",
+      "elide": []
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp",
+      "lines": "L392-L411",
+      "what": "『预取下一轮首片』:循环体尾部,把 dot 的 yield 操作数(下一轮的 a/b 完整片)再切一个 prologue 首片、local_load 出来,追加进 yield —— 于是下一轮进来就有寄存器里的片可用,搬运被藏在本轮计算之后",
+      "code": "  // prefetch next iteration\n  SmallVector<Value> yieldValues;\n  for (Value v : forOp.getBody()->getTerminator()->getOperands())\n    yieldValues.push_back(mapping.lookupOrDefault(v));\n  for (triton::DotOp dot : dots) {\n    Attribute dotEncoding = dot.getType().getEncoding();\n    Value aToYield = generatePrefetch(mapping.lookup(dot2aYield[dot]), 0, true,\n                                      dotEncoding, builder);\n    cloneElementwiseOps(aToYield, dot2aVals[dot], builder);\n    yieldValues.push_back(aToYield);\n    // bToYield\n    Value bToYield = generatePrefetch(mapping.lookup(dot2bYield[dot]), 1, true,\n                                      dotEncoding, builder);\n    cloneElementwiseOps(bToYield, dot2bVals[dot], builder);\n    yieldValues.push_back(bToYield);\n  }",
+      "elide": []
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/F32DotTC.cpp",
+      "lines": "L14-L22",
+      "what": "TF32x3 注释:3xTF32 trick 的算式定义。为什么是 3 次——一个 f32 拆成 aBig(高位,TF32 精度) + aSmall(低位残差);(aBig+aSmall)(bBig+bSmall) 展开有四项,丢掉最小的 aSmall*bSmall,保留 aSmall*bBig + aBig*bSmall + aBig*bBig 三项、各用一次 tf32 dot",
+      "code": "// nb. We call the trick TF32x3 as C++ disallows varaibles starting with numbers\n// Implement 3xTF32 trick https://github.com/NVIDIA/cutlass/discussions/385\n// For a, b f32\n// dot(a, b, inputPrecision=\"tf32x3\") ->\n//  let aBig = f32ToTF32(a), aSmall = a - aBig;\n//  let bBig = f32ToTF32(b), bSmall = b - bBig;\n//  dot(aSmall, bBig, inputPrecision=\"tf32\") +\n//  dot(aBig, bSmall, inputPrecision=\"tf32\") +\n//  dot(aBig, bBig, inputPrecision=\"tf32\")",
+      "elide": []
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/F32DotTC.cpp",
+      "lines": "L34-L81",
+      "what": "TF32x3 落地:守门(仅 inputPrecision==tf32x3 且 a、b 都是 f32)、f32ToTF32 用 inline asm cvt.rna.tf32.f32 截高位、三个 tf32 dot 串成累加链(dot1 起于 0、dot2 累 dot1、dot3 累 dot2),最后 +C。累加顺序按残差从小到大(aSmall*bBig 先)保精度",
+      "code": "    if (!(dotOp.getInputPrecision() == InputPrecision::TF32x3 &&\n          isF32(dotOp.getA()) && isF32(dotOp.getB()))) {\n      return failure();\n    }\n\n    // Aux functions\n    auto f32ToTF32 = [&](Value value) -> Value {\n      return rewriter\n          .create<ElementwiseInlineAsmOp>(dotOp.getLoc(), value.getType(),\n                                          \"cvt.rna.tf32.f32 $0, $1;\", \"=r,r\",\n                                          /*isPure=*/true, /*pack=*/1,\n                                          ArrayRef<Value>{value})\n          .getResult()[0];\n    };\n    auto dot = [&](Value a, Value b, Value c) -> Value {\n      return rewriter.create<DotOp>(dotOp->getLoc(), c.getType(), a, b, c,\n                                    InputPrecision::TF32,\n                                    dotOp.getMaxNumImpreciseAcc());\n    };\n\n    auto aBig = f32ToTF32(dotOp.getA());\n    auto aSmall = sub(dotOp.getA(), aBig);\n\n    auto bBig = f32ToTF32(dotOp.getB());\n    auto bSmall = sub(dotOp.getB(), bBig);\n\n    auto zero = zeroLike(dotOp.getC());\n\n    auto dot1 = dot(aSmall, bBig, zero);\n    auto dot2 = dot(aBig, bSmall, dot1);\n    auto dot3 = dot(aBig, bBig, dot2);\n\n    auto sum = add(dot3, dotOp.getC());\n\n    rewriter.replaceOp(dotOp, sum);\n    return success();",
+      "elide": ["中间的 zeroLike/add/sub lambda 定义(L48-L59)是平凡的 arith 构造,已在上面用到处点明其作用"]
+    },
+    {
+      "path": "third_party/nvidia/backend/compiler.py",
+      "lines": "L232-L245",
+      "what": "make_ttgir 里这几个 pass 的真实落点与门控:F32DotTC/WS/Prefetch/ReduceDataDup/Reorder 都在 sm80+(capability//10>=8)分支;WS 六联在这个分支里但被 num_consumer_groups 门控(见下方 WSTaskPartition 早退);add_prefetch 恒在 add_pipeline 之后跑——印证 Prefetch 是流水线之外的『再叠一层』",
+      "code": "        if capability // 10 >= 8:\n            passes.ttgpuir.add_optimize_accumulator_init(pm)\n            passes.ttgpuir.add_combine_tensor_select_and_if(pm)\n            passes.ttgpuir.add_ws_task_partition(pm, opt.num_consumer_groups)\n            passes.ttgpuir.add_taskid_propagate(pm, opt.num_consumer_groups)\n            passes.ttgpuir.add_ws_data_partition(pm, opt.num_consumer_groups)\n            passes.ttgpuir.add_ws_code_partition(pm, opt.num_buffers_warp_spec, opt.num_consumer_groups,\n                                                 opt.reg_dec_producer, opt.reg_inc_consumer)\n            passes.ttgpuir.add_pipeline(pm, opt.num_stages)\n            passes.ttgpuir.add_ws_lowering(pm, opt.num_consumer_groups)\n        passes.ttgpuir.add_prefetch(pm)\n        passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)\n        passes.ttgpuir.add_remove_layout_conversions(pm)\n        passes.ttgpuir.add_reduce_data_duplication(pm)\n        passes.ttgpuir.add_reorder_instructions(pm)",
+      "elide": []
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/WSTaskPartition.cpp",
+      "lines": "L127-L157",
+      "what": "选读脊柱:WS 的 task-id 分派——producer 固定 task 0,consumer 按 num_consumer_groups 摊到 task 1..N;把 backward-slice 里的 load 标 producer、dot 标 consumer。Pass 入口 num_consumer_groups==0 直接 return —— 证明 WS 默认不启用(CUDAOptions.num_consumer_groups 默认 0),是 num_consumer_groups>0 才触发的选读旋钮",
+      "code": "  // Annoate the program with task ids\n  SmallVector<AsyncTaskId, 1> producerTaskIds{0};\n  SmallVector<AsyncTaskId, 2> consumerTaskIds;\n  for (unsigned i = 0; i < numConsumerGroups; ++i) {\n    consumerTaskIds.push_back(i + producerTaskIds.size());\n  }\n\n  for (auto op : producerOps) {\n    setAsyncTaskIds(op, producerTaskIds);\n  }\n\n  for (auto op : consumerOps) {\n    setAsyncTaskIds(op, consumerTaskIds);\n  }\n  ...\n  void runOnFuncOp(triton::FuncOp funcOp) {\n    if (numConsumerGroups == 0)\n      return;\n    doPartition(funcOp, numConsumerGroups);\n  }",
+      "elide": ["中间省略 LLVM_DEBUG dump 块(L141-L145);runOnFuncOp 与 doPartition 之间省略类声明样板——保留早退守卫与 doPartition 签名的对应关系"]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/WSLowering.cpp",
+      "lines": "L39-L51",
+      "what": "选读收尾:WSLowering 把抽象的 async task id 落成真实 warpgroup id —— Hopper 上每个 task = 一个 warpgroup(4 warp),task id = canonicalWarpId / 4。这就是 ch24 讲的 producer/consumer warpgroup 词汇在 IR 里最终的落地形态",
+      "code": "// Lower to use GetCanonicalWarpIdOp.\n// In Hopper, each task is a warpgroup consisting of 4 warps.\nstatic const int WARPS_PER_TASK = 4;\nstatic const int THREADS_PER_TASK = 128;\nvoid lowerGetAsyncTaskIdOp(Operation *parentOp, int numConsumerGroups) {\n  ...\n    Value _4 = builder.create<arith::ConstantIntOp>(loc, WARPS_PER_TASK, 32);\n    Value warpId = builder.create<ttng::GetCanonicalWarpIdOp>(loc);\n    Value asyncTaskId = builder.create<arith::DivUIOp>(loc, warpId, _4);\n    op.getResult().replaceAllUsesWith(asyncTaskId);",
+      "elide": ["walk lambda 的 OpBuilder 构造与 erase 尾部(L45-L47, L52-L56)省略——保留 task=warpId/4 这条落地映射"]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/ReduceDataDuplication.cpp",
+      "lines": "L34-L72",
+      "what": "代表性清理 pass 之一:把一个 blocked→dot-operand 的 ConvertLayout(会在寄存器里给每个线程冗余存一份)改道成 local_alloc(写 shared)+ local_load(读回 dot-operand 布局),用一趟 shared memory 消除寄存器里的重复数据。守门:源不是 shared、目标是 dot-operand、且该 cvt 确实需要 shared memory",
+      "code": "    mod.walk([&](triton::gpu::ConvertLayoutOp cvtOp) -> void {\n      OpBuilder builder(cvtOp);\n      auto srcType = cast<RankedTensorType>(cvtOp.getSrc().getType());\n      auto dstType = cast<RankedTensorType>(cvtOp.getType());\n      auto srcEncoding = srcType.getEncoding();\n      if (isa<triton::gpu::SharedEncodingAttr>(srcEncoding))\n        return;\n      auto dstDotOp =\n          dyn_cast<triton::gpu::DotOperandEncodingAttr>(dstType.getEncoding());\n      if (!dstDotOp)\n        return;\n      if (!cvtNeedsSharedMemory(srcType, dstType))\n        return;\n      ...\n      auto tmp = builder.create<triton::gpu::LocalAllocOp>(\n          cvtOp.getLoc(), tmpType, cvtOp.getSrc());\n      auto newConvert = builder.create<triton::gpu::LocalLoadOp>(cvtOp.getLoc(),\n                                                                 dstType, tmp);\n      cvtOp.replaceAllUsesWith(newConvert.getResult());\n      cvtOp.erase();\n    });",
+      "elide": ["中间 sharedOrder/tmpType 的构造(L47-L66)省略——rank==3 特殊排序是次要细节,主线是 cvt → local_alloc+local_load 这条改道"]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/ReorderInstructions.cpp",
+      "lines": "L30-L40",
+      "what": "代表性清理 pass 之二 ReorderInstructions 的判据核心:哪些 op 会抬高寄存器压力——local_load、以及转成 dot-operand 布局的 cvt。Pass 据此把这类 op 下沉到贴近使用点(见 runOnOperation 里 5 组就地 move),调度微调、削峰寄存器",
+      "code": "static bool willIncreaseRegisterPressure(Operation *op) {\n  if (isa<triton::gpu::LocalLoadOp>(op))\n    return true;\n  auto cvt = dyn_cast<triton::gpu::ConvertLayoutOp>(op);\n  if (!cvt)\n    return false;\n  if (mlir::isa<triton::gpu::DotOperandEncodingAttr>(\n          cvt.getType().getEncoding()))\n    return true;\n  return false;\n}",
+      "elide": []
+    }
+  ],
+
+  "key_classes": [
+    {"name": "Prefetcher", "file": "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp", "responsibility": "本章主角。对循环里单个 dot 做 shared→register prefetch 的四步机器:initialize(筛 dot/回溯源/算宽)→emitPrologue(循环外预取首片)→createNewForOp(重建带额外 iter_args 的新循环、循环内逐片搬+末尾预取下轮首片)。缓存 forOp/yieldOp、prefetchWidth、及一堆 dot→(loopArg/headerDef/yield/vals) 映射"},
+    {"name": "PrefetchPass", "file": "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp", "responsibility": "Pass 壳:先 canonicalize ConvertLayout 便于模式匹配,再 walk 每个 scf.for 跑 Prefetcher,成功则用新循环替换旧循环并 erase"},
+    {"name": "TF32x3", "file": "lib/Dialect/TritonGPU/Transforms/F32DotTC.cpp", "responsibility": "OpRewritePattern<DotOp>:把 inputPrecision=tf32x3 的 f32 dot 拆成 3 个 tf32 dot 逼近 fp32(精度/速度折中)。用 inline asm cvt.rna.tf32.f32 截高位、残差作低位、丢弃最小交叉项"},
+    {"name": "TritonGPUWSTaskPartitionPass / doPartition", "file": "lib/Dialect/TritonGPU/Transforms/WSTaskPartition.cpp", "responsibility": "(选读)WS 六联的第一棒:num_consumer_groups>0 才跑;把 load 标 producer(task 0)、dot 标 consumer(task 1..N),为后续 pass 铺 async task id"},
+    {"name": "TritonGPUReduceDataDuplicationPass", "file": "lib/Dialect/TritonGPU/Transforms/ReduceDataDuplication.cpp", "responsibility": "pipeline 尾部清理:把 blocked→dot-operand 的 cvt 改道成 local_alloc+local_load,用一趟 shared memory 消除寄存器冗余复制"},
+    {"name": "TritonGPUReorderInstructionsPass", "file": "lib/Dialect/TritonGPU/Transforms/ReorderInstructions.cpp", "responsibility": "pipeline 尾部清理:五组就地指令移动(下沉 cvt、alloc 贴 load、trans 贴定义、opIdx 排序),按 willIncreaseRegisterPressure 判据削寄存器峰值"}
+  ],
+
+  "data_flow": [
+    "1. [Prefetch 主线] PrefetchPass::runOnOperation — canonicalize ConvertLayout,walk 每个 scf.for 构造 Prefetcher(lib/Dialect/TritonGPU/Transforms/Prefetch.cpp:L429-L437)",
+    "2. Prefetcher::initialize — 循环里找 dot;结果编码必须是 Nvidia MMAv2 或 AMD MFMA 否则 failure;单 dot 约束;对每个 dot 沿 def-use 回溯到 local_load 源(getPrefetchSrc)、确认 a/b 都是 loop arg(getIncomingOp);算 prefetchWidth;登记 loopArg/headerDef/yield(:L152-L267)",
+    "3. Prefetcher::emitPrologue — 循环外 generatePrefetch(isPrologue=true)出 a/b 首片,记入 operand2headPrefetch(:L269-L284)",
+    "4. Prefetcher::createNewForOp — 新循环 init = 旧 initArgs + 每 dot 追加 a/b 头预取片;循环内:首个 dot 用预取片、沿 K 逐片 generatePrefetch(isPrologue=false, offsetK/shapeK)+ dot 累加;末尾对 yield 操作数再预取下轮首片塞进新 yield(:L286-L413)",
+    "5. Pass 用新循环结果替换旧循环全部 use 并 erase 旧循环(:L440-L442)",
+    "6. [F32DotTC 独立] F32DotTCPass 贪心跑 TF32x3 pattern:命中 tf32x3 的 f32 dot → f32ToTF32 截高位 → 3 个 tf32 dot 累加链 → +C 替换(lib/Dialect/TritonGPU/Transforms/F32DotTC.cpp:L87-L98, L27-L83)",
+    "7. [WS 选读] num_consumer_groups>0 时:WSTaskPartition 标 producer/consumer task id → TaskIdPropagate 沿 def-use 把 task id 补全到未标注 op → WSDataPartition → WSCodePartition(建 token、按 task id specialize 成每 task 一个 if 区、插 ProducerAcquire/Commit + ConsumerWait/Release 同步)→ add_pipeline → WSLowering(task id → warpId/4 warpgroup、lower token、设 num-warp-groups-per-cta=1+num_consumer_groups)",
+    "8. [尾部清理] ReduceDataDuplication(cvt→shared 消冗余)、ReorderInstructions(五组就地 move 削寄存器)在 add_prefetch 之后收尾(third_party/nvidia/backend/compiler.py:L241-L245)"
+  ],
+
+  "design_decisions": [
+    {"decision": "Prefetch 与软件流水线(见 ch29/ch30)互补、且恒排在 add_pipeline 之后", "why": "软件流水线重叠的是 global→shared(异步拷贝跨迭代),Prefetch 重叠的是 shared→register(local_load 与 dot 计算)。两层重叠正交,Prefetch 在流水线搭好骨架后再叠一层片级搬运重叠", "evidence": "third_party/nvidia/backend/compiler.py:L240-L241"},
+    {"decision": "initialize 同时接受 Nvidia MMA v2 与 AMD MFMA 两种 dot 结果编码", "why": "Prefetch 是通用 pass,不写死单一硬件的 MMA 编码;第三方后端(如 AMD、姊妹篇 ascend)把自家 MMA 编码 dyn_cast 挂进同一处判定即可复用整条 prefetch 逻辑——通用 pass 接纳第三方 MMA 编码的现成范例", "evidence": "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp:L162-L167"},
+    {"decision": "循环里多于一个 dot 直接 failure、不做 prefetch", "why": "多 dot(如 flash-attention 双 dot)会导致旧循环仍有 use、erase 时 segfault(源码 TODO 明标);保守早退优先正确性", "evidence": "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp:L176-L179"},
+    {"decision": "prefetchWidth 按 kWidth/元素位宽推导(fp16 kWidth=0 → 256/16=16),K 小于它就跳过", "why": "预取片宽要对齐 tensor core 的 MMA 指令 K 步长才划算;K 太小分片无收益反增开销", "evidence": "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp:L235-L242"},
+    {"decision": "TF32x3 保留 3 项交叉积、丢弃 aSmall*bSmall", "why": "f32=aBig+aSmall 的展开有四项,最小项 aSmall*bSmall 量级约为主项的 2^-40 级,对 fp32 有效精度无贡献;保留 3 项即可把 tf32(~10 bit 尾数)dot 逼到接近 fp32,用 3 倍 tensor-core 吞吐换 ieee fp32 的近似精度", "evidence": "lib/Dialect/TritonGPU/Transforms/F32DotTC.cpp:L14-L22"},
+    {"decision": "TF32x3 只在 sm80+ 且 inputPrecision 显式为 tf32x3 时触发;默认 dot 精度是 tf32", "why": "默认 dot input precision=tf32(单次),tf32x3 是用户/autotuner 主动选的精度档;pass 在 sm80+(有 tensor core tf32)才有意义", "evidence": "third_party/nvidia/backend/compiler.py:L221-L222"},
+    {"decision": "Warp Specialization 默认关闭(num_consumer_groups 默认 0),仅 >0 才触发全套六联", "why": "WS 把循环拆到多个 warpgroup、改变 num_warps、插一整套 token 同步,是 Hopper 特有的进阶重叠、代价大收益依 kernel 而定;设为显式 autotune 旋钮而非默认路径。每个 WS pass 入口都 num_consumer_groups==0 早退", "evidence": "third_party/nvidia/backend/compiler.py:L97"},
+    {"decision": "WSLowering 把 async task id 定义为 canonicalWarpId/4(每 task 一个 4-warp warpgroup),num-warp-groups-per-cta=1+num_consumer_groups", "why": "Hopper warpgroup=4 warp 是 wgmma 指令的天然粒度;1 个 producer group + N 个 consumer group 各占一个 warpgroup,make_llir 据此把 num_warps 乘上 warpgroup 数", "evidence": "lib/Dialect/TritonGPU/Transforms/WSLowering.cpp:L40-L50"}
+  ],
+
+  "theory": [
+    "Prefetch 的重叠层次:一次 dot 沿 K 维要多轮 local_load(shared→register)喂 tensor core。朴素写法每轮先 load 满整个 K 片再算,搬运与计算串行。Prefetch 把 K 切成 prefetchWidth 宽的多片,在算第 i 片时已经把第 i+1 片 local_load 发出去(靠额外 iter_arg 跨迭代传预取片),于是 shared→register 延迟被藏在 tensor-core 计算之后。与 ch29/ch30 软件流水线(藏 global→shared)叠加得两级重叠。",
+    "TF32x3 的误差分析:f32 尾数 23 bit,tf32 只 10 bit。设 a=aBig+aSmall,aBig=round_tf32(a) 取高 10 bit、aSmall 是残差(量级 ~2^-10·a)。乘积 ab=(aBig+aSmall)(bBig+bSmall)=aBig·bBig + aBig·bSmall + aSmall·bBig + aSmall·bSmall。前三项各用一次 tf32 dot(每个乘子至少一边是高精度 aBig/bBig,乘积残差 ~2^-20);末项 aSmall·bSmall ~2^-20·ab 且再被 tf32 截断到 ~2^-30,远低于 fp32 尾数末位,丢弃无损。累加按残差从小到大(aSmall·bBig 起于 0)减少累加舍入。三次 dot 换来接近 fp32 的精度,吞吐仍是 tf32 tensor core 的 1/3——比 ieee fp32 emulation 划算。",
+    "WS 的 producer/consumer 分工(选读):把循环体沿数据依赖切成 producer(异步搬 load 的数据进 shared)与 consumer(wgmma 算 dot),分派到不同 warpgroup 并发跑,用 token(CreateToken + ProducerAcquire/Commit / ConsumerWait/Release,ch24 的词汇)做跨 warpgroup 的生产-消费流控。相比单 warpgroup 串行,producer 可以领先 consumer 若干拍(num_buffers_warp_spec 控深度),把搬运与计算重叠到 warpgroup 粒度。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [],
+    "must_keep": [
+      {"symbol": "Prefetcher", "why": "本章主角类,writer 必须逐段讲其四步(initialize/emitPrologue/createNewForOp/generatePrefetch)"},
+      {"symbol": "generatePrefetch", "why": "prefetch 的原子操作:MemDescSubviewOp 切片 + LocalLoadOp 搬运,读者要看懂『切一片』如何落成 IR"},
+      {"symbol": "MemDescSubviewOp", "why": "沿 K 维切共享内存 subview 的具体 op,内嵌真源码里出现、读者需认得"},
+      {"symbol": "LocalLoadOp", "why": "shared→register 搬运 op,prefetch 重叠的正是它;回指 ch24 local_load"},
+      {"symbol": "prefetchWidth", "why": "『切多宽一片』的旋钮,推导规则(256/elementWidth 或 8*kWidth)是设计决策"},
+      {"symbol": "NvidiaMmaEncodingAttr", "why": "配对脊柱:initialize 接纳的 Nvidia MMA v2 编码之一"},
+      {"symbol": "AMDMfmaEncodingAttr", "why": "配对脊柱:第三方(AMD)MMA 编码挂进通用 pass 的范例,姊妹篇 ascend 类比点"},
+      {"symbol": "iter_args", "why": "新循环靠额外 iter_arg 跨迭代传预取片;回指 ch30 但本章是互补用法,须点明差别"},
+      {"symbol": "TF32x3", "why": "F32DotTC 主角 pattern,3xTF32 拆分算法,writer 需 worked example 讲三次逼近"},
+      {"symbol": "InputPrecision::TF32x3", "why": "触发 TF32x3 的精度档标记,守门条件"},
+      {"symbol": "f32ToTF32", "why": "cvt.rna.tf32.f32 截高位——拆分的关键一步,读者要懂 aBig/aSmall 怎么来的"},
+      {"symbol": "num_consumer_groups", "why": "WS 的总门控旋钮,决定 WS 是否触发、拆几个 consumer warpgroup;默认 0=关"},
+      {"symbol": "doPartition", "why": "(选读)WS 把 load/dot 分派 producer/consumer task 的入口逻辑"},
+      {"symbol": "GetAsyncTaskIdOp", "why": "(选读)async task id 的 IR 承载,WSLowering 落成 warpId/4"},
+      {"symbol": "willIncreaseRegisterPressure", "why": "ReorderInstructions 的判据核心,代表尾部清理 pass 的『削寄存器』动机"},
+      {"symbol": "ReduceDataDuplication", "why": "代表性尾部清理 pass:cvt→local_alloc+local_load 消冗余"}
+    ]
+  },
+
+  "mechanisms": [
+    {
+      "id": "prefetch-loop-rewrite",
+      "name": "Prefetch 循环重写:shared→register 搬运与 dot 计算重叠",
+      "kind": "algorithm",
+      "source_anchors": [
+        "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp:L1-L27",
+        "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp:L286-L413",
+        "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp:L269-L284"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "prefetch-slice-generate",
+      "name": "generatePrefetch:沿 K 维切 subview + local_load 出一片",
+      "kind": "dataflow",
+      "source_anchors": [
+        "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp:L112-L150",
+        "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp:L233-L242"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "prefetch-mma-encoding-gate",
+      "name": "配对脊柱:initialize 接纳 Nvidia MMAv2 与 AMD MFMA 编码(第三方 MMA 挂进通用 pass)",
+      "kind": "config",
+      "source_anchors": [
+        "lib/Dialect/TritonGPU/Transforms/Prefetch.cpp:L159-L179"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "f32-dot-tc-tf32x3",
+      "name": "F32DotTC 的 TF32x3:fp32 dot 拆 3 个 tf32 dot 逼近(为什么是 3 次)",
+      "kind": "algorithm",
+      "source_anchors": [
+        "lib/Dialect/TritonGPU/Transforms/F32DotTC.cpp:L14-L22",
+        "lib/Dialect/TritonGPU/Transforms/F32DotTC.cpp:L27-L83"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin_note": "非论文机制:出处为 NVIDIA CUTLASS 讨论帖(3xTF32 trick),已在 embed_excerpts 与 design_decisions 中带 URL 溯源"
+    },
+    {
+      "id": "ws-task-partition-gate",
+      "name": "Warp Specialization 门控与 producer/consumer 分派(选读)",
+      "kind": "config",
+      "source_anchors": [
+        "lib/Dialect/TritonGPU/Transforms/WSTaskPartition.cpp:L44-L163",
+        "third_party/nvidia/backend/compiler.py:L90-L97"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "ws-token-landing",
+      "name": "WS 六联把 ch24 的 create_token/producer/consumer 词汇落地(选读)",
+      "kind": "protocol",
+      "source_anchors": [
+        "third_party/nvidia/backend/compiler.py:L234-L240",
+        "lib/Dialect/TritonGPU/Transforms/WSCodePartition.cpp:L2010-L2045",
+        "lib/Dialect/TritonGPU/Transforms/WSLowering.cpp:L39-L51"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "reduce-data-duplication",
+      "name": "ReduceDataDuplication:cvt→local_alloc+local_load 消寄存器冗余",
+      "kind": "layout",
+      "source_anchors": [
+        "lib/Dialect/TritonGPU/Transforms/ReduceDataDuplication.cpp:L32-L74"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "reorder-instructions",
+      "name": "ReorderInstructions:按寄存器压力判据就地下沉指令(调度微调)",
+      "kind": "layout",
+      "source_anchors": [
+        "lib/Dialect/TritonGPU/Transforms/ReorderInstructions.cpp:L30-L40",
+        "lib/Dialect/TritonGPU/Transforms/ReorderInstructions.cpp:L61-L135"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    }
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_payoff": [],
+    "note": "bible.py due ch31 返回空(本章无伏笔埋/回收),与章节大纲一致"
+  }
+}
