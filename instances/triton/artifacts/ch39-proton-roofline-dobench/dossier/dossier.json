@@ -1,0 +1,210 @@
+{
+  "kind": "deep",
+  "skip_impl": true,
+  "skip_impl_reason": "度量工具链(proton 钩子 / roofline viewer / do_bench)本身无可重实现的算法——它们是挂钩、派生公式与计时协议。取证方式=实跑真源码(viewer 喂仓库自带 example json 无 GPU 出 roofline;do_bench/proton 挂 flops/bytes 需真机)。无『同名同结构只删不增』的精简版对象。",
+  "chapter": "ch39",
+  "title": "Part IX 度量——proton launch 钩子、roofline viewer 与 do_bench",
+
+  "code_spine": [
+    "python/triton/compiler/compiler.py:L343-L348  CompiledKernel 类级钩子槽位 launch_enter_hook/launch_exit_hook(默认 None)",
+    "python/triton/compiler/compiler.py:L398-L413  launch_metadata():钩子未挂→直接返回 None(零成本);挂了→构造 LazyDict 并 add(fn.launch_metadata) 惰性登记",
+    "python/triton/compiler/compiler.py:L314-L328  LazyDict:惰性求值容器,.get() 时才跑 extras 里登记的 metadata_fn 并合并进 data",
+    "python/triton/compiler/compiler.py:L415-L426  __getitem__ 的 runner:每次 kernel[grid](*args) 把 launch_metadata + 两个类级钩子透传给 self.run(=make_launcher 的发射器,见 ch37)",
+    "python/triton/runtime/jit.py:L651-L654  JITFunction 快路径同样把 launch_enter_hook/exit_hook 透传给 kernel.run——钩子挂在发射路径上",
+    "third_party/proton/proton/hook.py:L24-L27  register_triton_hook():把 TritonHook.enter/exit 写进 CompiledKernel 的两个类级槽位——不改一行核代码",
+    "third_party/proton/proton/hook.py:L11-L21  TritonHook.enter/exit:发射前后各一次;enter 里先 get() 惰性算出 flops/bytes,再 enter_scope(name, triton_op=True, metrics=fn_metrics)",
+    "third_party/proton/proton/scope.py:L78-L105  enter_scope/exit_scope:triton_op=True 走 libproton.enter_op/exit_op(triton kernel 语义),否则 enter_scope/exit_scope;thread_local 栈配对",
+    "third_party/proton/proton/profile.py:L33-L85  start():is_command_line 早退→选 backend→set_profiling_on→(hook==triton)register_triton_hook→libproton.start",
+    "third_party/proton/proton/profile.py:L13-L20  _select_backend():cuda→cupti / hip→roctracer(姊妹篇 tracer 接缝)",
+    "third_party/proton/proton/profile.py:L88-L140  会话状态机 activate/deactivate/finalize:finalize(None) 关闭 profiling + finalize_all + unregister_triton_hook",
+    "third_party/proton/proton/viewer.py:L192-L201  parse():hatchet GraphFrame→format→update_inclusive_columns→derive_metrics→filter_frames→print tree",
+    "third_party/proton/proton/viewer.py:L31-L35  get_raw_metrics():json 第 0 元=调用树喂 hatchet,第 1 元 pop 出=device_info(峰值算力/带宽的来源)",
+    "third_party/proton/proton/viewer.py:L38-L68  get_min_time_flops():按 arch 查峰值 flops(compute roof),ideal_time = flops/peak_flops",
+    "third_party/proton/proton/viewer.py:L71-L81  get_min_time_bytes():peak_bw=2*bus_width*mem_clock/8(memory roof),ideal_time = bytes/peak_bw",
+    "third_party/proton/proton/viewer.py:L114-L129  derive_metrics():util=max(min_time_flops,min_time_bytes)/time(屋顶模型判据);flop/s、byte/s 派生",
+    "python/triton/testing.py:L95-L158  do_bench():预热同步→估时→定 n_warmup/n_repeat→每次 zero L2→CUDA events 打点→_summarize_statistics 取分位",
+    "python/triton/testing.py:L120-L120  cache = get_empty_cache_for_benchmark()(256MB 缓冲,每轮 cache.zero_() 冲刷 L2)",
+    "python/triton/testing.py:L20-L29  _summarize_statistics():quantiles→torch.quantile;否则 return_mode(min/max/mean/median/all)",
+    "third_party/nvidia/backend/driver.py:L474-L481  get_empty_cache_for_benchmark():256MB int 缓冲,zero_() 即把 L2 里的上轮数据挤走"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "python/triton/compiler/compiler.py",
+      "lines": "L343-L348",
+      "code": "class CompiledKernel:\n\n    # Hooks for external tools to monitor the execution of triton kernels\n    # TODO: move out of this namespace since it's a runtime thing\n    launch_enter_hook = None\n    launch_exit_hook = None",
+      "elide": ["CompiledKernel 其余方法(__init__/_init_handles/launch_metadata/__getitem__)见下方与 ch11。此处只截取『类级(非实例级)钩子槽位』这一对——它们默认 None,是零成本;类级=一次注册对全体已编译 kernel 生效"]
+    },
+    {
+      "path": "python/triton/compiler/compiler.py",
+      "lines": "L398-L413",
+      "code": "    def launch_metadata(self, grid, stream, *args):\n        if CompiledKernel.launch_enter_hook is None:\n            return None\n        ret = LazyDict({\"name\": self.name, \"function\": self.function, \"stream\": stream})\n        if not isinstance(self.src, ASTSource) or self.src.fn.launch_metadata is None:\n            return ret\n        arg_dict = {}\n        arg_idx = 0\n        for i, arg_name in enumerate(self.src.fn.arg_names):\n            if i in self.src.fn.constexprs:\n                arg_dict[arg_name] = self.src.constants[arg_name]\n            else:\n                arg_dict[arg_name] = args[arg_idx]\n                arg_idx += 1\n        ret.add(self.src.fn.launch_metadata, (grid, self.metadata, arg_dict))\n        return ret",
+      "elide": ["第一行 `if launch_enter_hook is None: return None`——没挂钩子时整段零成本,连 LazyDict 都不建。构造 arg_dict 是把 constexpr 与运行时实参对齐成 {名:值},喂给用户注册的 self.src.fn.launch_metadata(grid, metadata, arg_dict) 这个 metadata_fn——但用 ret.add() 只是『登记』,并不当场调用(惰性)"]
+    },
+    {
+      "path": "python/triton/compiler/compiler.py",
+      "lines": "L314-L328",
+      "code": "class LazyDict:\n\n    def __init__(self, data):\n        self.data = data\n        self.extras = []\n\n    def get(self) -> None:\n        for func, args in self.extras:\n            self.data = self.data | func(*args)\n        self.extras.clear()\n        return self.data\n\n    def add(self, func, args):\n        self.extras.append((func, args))",
+      "elide": ["惰性求值容器:add() 只把 (metadata_fn, args) 压进 extras 列表;直到 .get() 被调用才逐个 func(*args) 并用 `|` 合并进 data。意义:用户的 flops/bytes 计算只在 profiling 真正开启、钩子 enter 里 get() 时才发生——关闭 profiling 时那个 metadata_fn 一次都不跑"]
+    },
+    {
+      "path": "python/triton/compiler/compiler.py",
+      "lines": "L415-L426",
+      "code": "    def __getitem__(self, grid):\n        self._init_handles()\n\n        def runner(*args, stream=None):\n            if stream is None:\n                device = driver.active.get_current_device()\n                stream = driver.active.get_current_stream(device)\n            launch_metadata = self.launch_metadata(grid, stream, *args)\n            self.run(grid[0], grid[1], grid[2], stream, self.function, self.packed_metadata, launch_metadata,\n                     CompiledKernel.launch_enter_hook, CompiledKernel.launch_exit_hook, *args)\n\n        return runner",
+      "elide": ["self.run 就是 ch37 make_launcher 生成的发射器(C 扩展 launch)。看最后两个实参:launch_enter_hook、launch_exit_hook——发射器在真正 cuLaunchKernel 前后各回调一次。钩子就挂在这条发射路径上,这是 proton『零侵入』的落点。ch37 讲发射器怎么生成,本章只讲钩子挂在它上面(回指,不重讲)"]
+    },
+    {
+      "path": "third_party/proton/proton/hook.py",
+      "lines": "L7-L33",
+      "code": "class TritonHook:\n    flops_width = [8, 16, 32, 64]\n    metrics = [f\"flops{width}\" for width in flops_width] + [\"bytes\"] + [\"flops\"]\n\n    @staticmethod\n    def enter(lazy_dict: LazyDict) -> None:\n        enter_scope(COMPUTE_METADATA_SCOPE_NAME)\n        metadata = lazy_dict.get()\n        exit_scope()\n        fn_metrics = {k: metadata[k] for k in TritonHook.metrics if k in metadata}\n        enter_scope(metadata[\"name\"], triton_op=True, metrics=fn_metrics)\n\n    @staticmethod\n    def exit(lazy_dict: LazyDict) -> None:\n        exit_scope(triton_op=True)\n\n\ndef register_triton_hook() -> None:\n    if CompiledKernel.launch_enter_hook is None:\n        CompiledKernel.launch_enter_hook = TritonHook.enter\n        CompiledKernel.launch_exit_hook = TritonHook.exit\n\n\ndef unregister_triton_hook() -> None:\n    if CompiledKernel.launch_enter_hook == TritonHook.enter:\n        CompiledKernel.launch_enter_hook = None\n        CompiledKernel.launch_exit_hook = None",
+      "elide": ["register_triton_hook 只是把 TritonHook.enter/exit 赋给 CompiledKernel 的两个类级槽位——这就是全部『注入』,不改一行 kernel 代码。enter 里:先用 COMPUTE_METADATA_SCOPE_NAME 包一个临时 scope 把 lazy_dict.get()(真正跑用户 metadata_fn 算 flops/bytes)的开销单独计到一个可被 viewer 过滤掉的桶里,exit 后再 enter_scope(kernel 名, triton_op=True, metrics={flops8..bytes..flops})——把用户给的 flops/bytes 挂到这个 kernel 作用域上。metrics 列表 flops8/16/32/64 对应不同位宽的乘加"]
+    },
+    {
+      "path": "third_party/proton/proton/scope.py",
+      "lines": "L78-L105",
+      "code": "def enter_scope(name: str, *, triton_op: bool = False, metrics: Optional[dict[str, MetricValueType]] = None,\n                properties: Optional[dict[str, PropertyValueType]] = None) -> int:\n    if not get_profiling_on():\n        return -1\n    id = libproton.record_scope()\n    if not hasattr(thread_local_scopes, \"scopes\"):\n        thread_local_scopes.scopes = []\n    thread_local_scopes.scopes.append((id, name))\n    if triton_op:\n        libproton.enter_op(id, name)\n    else:\n        libproton.enter_scope(id, name)\n    if metrics:\n        libproton.add_metrics(id, metrics)\n    if properties:\n        libproton.set_properties(id, properties)\n    return id\n\n\ndef exit_scope(triton_op: bool = False) -> int:\n    if not get_profiling_on():\n        return -1\n    id, name = thread_local_scopes.scopes.pop()\n    if triton_op:\n        libproton.exit_op(id, name)\n    else:\n        libproton.exit_scope(id, name)\n    return id",
+      "elide": ["首行 `if not get_profiling_on(): return -1`——profiling 关闭时 enter/exit 都是空转,这是零成本的第二道闸。thread_local_scopes.scopes 是每线程一个的作用域栈,append/pop 保证 enter/exit 配对。triton_op=True→libproton.enter_op(kernel 是 triton 算子语义,viewer 里作为 flops/bytes 的承载节点);普通 scope→enter_scope。add_metrics 把 flops/bytes 绑到该作用域 id 上。libproton.* 是 C++ 侧(点到即止,不深挖)"]
+    },
+    {
+      "path": "third_party/proton/proton/profile.py",
+      "lines": "L13-L20",
+      "code": "def _select_backend() -> str:\n    backend = triton.runtime.driver.active.get_current_target().backend\n    if backend == \"cuda\":\n        return \"cupti\"\n    elif backend == \"hip\":\n        return \"roctracer\"\n    else:\n        raise ValueError(\"No backend is available for the current target.\")",
+      "elide": ["姊妹篇 tracer 接缝:proton 自己不测时,它把 kernel 时间的采集交给厂商 tracer——NVIDIA 走 CUPTI、AMD 走 roctracer。CUPTI/roctracer 是第三方库,点到即止不深挖"]
+    },
+    {
+      "path": "third_party/proton/proton/profile.py",
+      "lines": "L70-L85",
+      "code": "    if is_command_line():\n        # Ignore the start() call if the script is run from the command line.\n        return\n\n    if name is None:\n        name = DEFAULT_PROFILE_NAME\n\n    if backend is None:\n        backend = _select_backend()\n\n    _check_env(backend)\n\n    set_profiling_on()\n    if hook and hook == \"triton\":\n        register_triton_hook()\n    return libproton.start(name, context, data, backend)",
+      "elide": ["start() 的收尾:is_command_line 时忽略(命令行下由 proton CLI 统管会话);否则选 backend→set_profiling_on(翻开 flags.profiling_on 全局开关,scope.py 的两道闸就是查它)→(hook=='triton')register_triton_hook 挂 flops/bytes 钩子→libproton.start 开会话。start 的前半段 docstring/参数校验省略"]
+    },
+    {
+      "path": "third_party/proton/proton/profile.py",
+      "lines": "L120-L136",
+      "code": "def finalize(session: Optional[int] = None, output_format: str = \"hatchet\") -> None:\n    if session is None:\n        set_profiling_off()\n        libproton.finalize_all(output_format)\n        unregister_triton_hook()\n    else:\n        if is_command_line() and session != 0:\n            raise ValueError(\"Only one session can be finalized when running from the command line.\")\n        libproton.finalize(session, output_format)",
+      "elide": ["状态机收口:finalize(None) 把 profiling 全局开关关掉→flush 全部会话写盘(默认 hatchet 格式,即 viewer 吃的 json)→摘掉钩子。start→activate/deactivate→finalize 是一条会话生命线;activate/deactivate 只翻某个 session 的记录开关(docstring 省略)"]
+    },
+    {
+      "path": "third_party/proton/proton/viewer.py",
+      "lines": "L38-L68",
+      "code": "def get_min_time_flops(df, device_info):\n    min_time_flops = pd.DataFrame(0.0, index=df.index, columns=[\"min_time\"])\n    for device_type in device_info:\n        for device_index in device_info[device_type]:\n            arch = device_info[device_type][device_index][\"arch\"]\n            num_sms = device_info[device_type][device_index][\"num_sms\"]\n            clock_rate = device_info[device_type][device_index][\"clock_rate\"]\n            for width in TritonHook.flops_width:\n                idx = df[\"device_id\"] == device_index\n                device_frames = df[idx]\n                if f\"flops{width}\" not in device_frames.columns:\n                    continue\n                max_flops = 0\n                if device_type == \"CUDA\":\n                    if arch == \"80\":\n                        max_flops = 624e12 / (width / 8)\n                    elif arch == \"89\":\n                        # TODO(Keren): Implement fp16 acc-> 660.6 fp8\n                        max_flops = (330.3 * 1e12) / (width / 8)\n                    elif arch == \"90\":\n                        # 114 sms and 1755mhz is the base number of sms and clock rate of H100 pcie\n                        max_flops = ((num_sms / 114 * clock_rate / (1755 * 1e3) * 1513) * 1e12) / (width / 8)\n                elif device_type == \"HIP\":\n                    if arch == \"gfx90a\":\n                        max_flops = 383e12 / (width / 8)\n                    elif arch == \"gfx941\" or arch == \"gfx942\":\n                        max_flops = 2614.9e12 / (width / 8)\n                else:\n                    raise ValueError(f\"Unsupported device type: {device_type}\")\n                min_time_flops.loc[idx, \"min_time\"] += device_frames[f\"flops{width}\"].fillna(0) / max_flops\n    return min_time_flops",
+      "elide": ["compute roof:按 device 的 arch 查出该 GPU 的峰值 flops(H100=arch90 时按 num_sms/clock 相对 H100 PCIe 基线线性缩放),再对每个位宽累加 ideal_time = 该位宽 flops 数 / 峰值算力。位宽越窄峰值越高(/(width/8)),故 flops8 的峰值是 flops64 的 8 倍。这一步产出的是『若算力打满该跑多久』"]
+    },
+    {
+      "path": "third_party/proton/proton/viewer.py",
+      "lines": "L71-L81",
+      "code": "def get_min_time_bytes(df, device_info):\n    min_time_bytes = pd.DataFrame(0.0, index=df.index, columns=[\"min_time\"])\n    for device_type in device_info:\n        for device_index in device_info[device_type]:\n            idx = df[\"device_id\"] == device_index\n            device_frames = df[idx]\n            memory_clock_rate = device_info[device_type][device_index][\"memory_clock_rate\"]  # in khz\n            bus_width = device_info[device_type][device_index][\"bus_width\"]  # in bits\n            peak_bandwidth = 2 * bus_width * memory_clock_rate * 1e3 / 8\n            min_time_bytes.loc[idx, \"min_time\"] += device_frames[\"bytes\"] / peak_bandwidth\n    return min_time_bytes",
+      "elide": ["memory roof:peak_bandwidth = 2(DDR 双沿)× bus_width(bit)× mem_clock(kHz→Hz)/ 8(bit→byte),再 ideal_time = bytes / 峰值带宽。产出『若带宽打满该跑多久』。与 flops roof 对称——两者取 max 就是屋顶模型的判据"]
+    },
+    {
+      "path": "third_party/proton/proton/viewer.py",
+      "lines": "L114-L129",
+      "code": "    for metric in metrics:\n        if metric == \"util\":  # Tensor core only\n            min_time_bytes = get_min_time_bytes(gf.dataframe, device_info)\n            min_time_flops = get_min_time_flops(gf.dataframe, device_info)\n            time_sec = get_time_seconds(gf.dataframe)\n            gf.dataframe[\"util (inc)\"] = min_time_flops[\"min_time\"].combine(min_time_bytes[\"min_time\"], max) / time_sec\n            gf.dataframe.loc[internal_frame_indices, \"util (inc)\"] = np.nan\n            derived_metrics.append(\"util (inc)\")\n        elif metric in derivable_metrics:  # flop<width>/s, <t/g>byte/s\n            derivable_metric = derivable_metrics[metric]\n            metric_name = derivable_metric.name\n            metric_factor_dict = derivable_metric.factor\n            matched_metric_name = match_available_metrics([metric_name], raw_metrics)[0]\n            gf.dataframe[f\"{metric} (inc)\"] = (gf.dataframe[matched_metric_name] / (get_time_seconds(gf.dataframe)) /\n                                               metric_factor_dict[metric])\n            derived_metrics.append(f\"{metric} (inc)\")",
+      "elide": ["屋顶判据核心一行:util = max(min_time_flops, min_time_bytes) / 实测时间。分子取两个 ideal_time 的 max——谁大谁是瓶颈:min_time_flops 大→compute-bound(该往降算力/换低精度走),min_time_bytes 大→memory-bound(该往省访存/融合走)。分母是实测时间,故 util∈(0,1] 是『离那面屋顶多近』。flop/s、byte/s 派生分支:实测计数/实测时间/单位因子。其余 time/、avg_time/、%/ 分支省略"]
+    },
+    {
+      "path": "third_party/proton/proton/viewer.py",
+      "lines": "L192-L201",
+      "code": "def parse(metrics, filename, include=None, exclude=None, threshold=None, depth=100, format=None):\n    with open(filename, \"r\") as f:\n        gf, raw_metrics, device_info = get_raw_metrics(f)\n        gf = format_frames(gf, format)\n        assert len(raw_metrics) > 0, \"No metrics found in the input file\"\n        gf.update_inclusive_columns()\n        metrics = derive_metrics(gf, metrics, raw_metrics, device_info)\n        # TODO: generalize to support multiple metrics, not just the first one\n        gf = filter_frames(gf, include, exclude, threshold, metrics[0])\n        print(gf.tree(metric_column=metrics, expand_name=True, depth=depth, render_header=False))\n        emit_warnings(gf, metrics)",
+      "elide": ["viewer 主管线:json→hatchet GraphFrame(调用树)→update_inclusive_columns(子节点计数上卷到父,故 ROOT 的 time 是叶子之和)→derive_metrics(把原始计数派生成 flop/s、byte/s、util)→filter_frames(顺带过滤掉 __proton_launch_metadata 这个 metadata 计算桶)→打印树。get_raw_metrics 把 json 拆成『调用树 + device_info』两半(见 code_spine)。hatchet 是第三方库,点到即止"]
+    },
+    {
+      "path": "python/triton/testing.py",
+      "lines": "L95-L158",
+      "code": "def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_mode=\"mean\"):\n    assert return_mode in [\"min\", \"max\", \"mean\", \"median\", \"all\"]\n    import torch\n\n    di = runtime.driver.active.get_device_interface()\n\n    fn()\n    di.synchronize()\n\n    cache = runtime.driver.active.get_empty_cache_for_benchmark()\n\n    # Estimate the runtime of the function\n    start_event = di.Event(enable_timing=True)\n    end_event = di.Event(enable_timing=True)\n    start_event.record()\n    for _ in range(5):\n        cache.zero_()\n        fn()\n    end_event.record()\n    di.synchronize()\n    estimate_ms = start_event.elapsed_time(end_event) / 5\n\n    # compute number of warmup and repeat\n    n_warmup = max(1, int(warmup / estimate_ms))\n    n_repeat = max(1, int(rep / estimate_ms))\n    start_event = [di.Event(enable_timing=True) for i in range(n_repeat)]\n    end_event = [di.Event(enable_timing=True) for i in range(n_repeat)]\n    # Warm-up\n    for _ in range(n_warmup):\n        fn()\n    # Benchmark\n    for i in range(n_repeat):\n        # we don't want `fn` to accumulate gradient values\n        # if it contains a backward pass. So we clear the\n        # provided gradients\n        if grad_to_none is not None:\n            for x in grad_to_none:\n                x.grad = None\n        # we clear the L2 cache before each run\n        cache.zero_()\n        # record time of `fn`\n        start_event[i].record()\n        fn()\n        end_event[i].record()\n    # Record clocks\n    di.synchronize()\n    times = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)\n    return _summarize_statistics(times, quantiles, return_mode)",
+      "elide": ["docstring 省略。五段骨架:①先 fn()+synchronize 触发 JIT 编译与懒初始化,不计时;②估时——跑 5 次(每次 cache.zero_() 冲 L2)用一对 CUDA event 量总时长/5 得 estimate_ms;③按预算把 warmup/rep(毫秒)换算成次数 n_warmup=max(1,warmup/estimate)、n_repeat=max(1,rep/estimate),并给每次 repeat 各配一对 event;④预热 n_warmup 次不计时(让时钟/缓存进稳态);⑤正式测——每次先 cache.zero_() 冲 L2 再用该次专属 event 对打点,最后 synchronize 一次性读回所有 event 间隔。grad_to_none 分支只在含反向时清梯度。CUDA event 是 GPU 端时间戳,避开 host-device 同步误差"]
+    },
+    {
+      "path": "python/triton/testing.py",
+      "lines": "L20-L29",
+      "code": "def _summarize_statistics(times, quantiles, return_mode):\n    import torch\n    if quantiles is not None:\n        ret = torch.quantile(times, torch.tensor(quantiles, dtype=torch.float)).tolist()\n        if len(ret) == 1:\n            ret = ret[0]\n        return ret\n    if return_mode == \"all\":\n        return times.tolist()\n    return getattr(torch, return_mode)(times).item()",
+      "elide": ["抗抖动收尾:给了 quantiles→torch.quantile 取分位(默认调用方传 [0.5,0.2,0.8] 即中位数+20/80 分位,过滤偶发尖峰);否则按 return_mode 取 min/max/mean/median 或返回全部。分位数/中位数比均值抗离群,这是全书性能数字都用它的原因"]
+    },
+    {
+      "path": "third_party/nvidia/backend/driver.py",
+      "lines": "L474-L481",
+      "code": "    def get_empty_cache_for_benchmark(self):\n        import torch\n\n        # We maintain a buffer of 256 MB that we clear\n        # before each kernel call to make sure that the L2 cache\n        # doesn't contain any input data before the run\n        cache_size = 256 * 1024 * 1024\n        return torch.empty(int(cache_size // 4), dtype=torch.int, device='cuda')",
+      "elide": ["L2 冲刷缓冲:256MB(远大于任何 GPU 的 L2)的 int 数组,每轮 cache.zero_() 把它写一遍就把上一轮 kernel 留在 L2 的输入/输出挤出去——保证每次计时都是冷 L2 的公平起点,否则第 2 次起 kernel 命中 L2 会假性变快。AMD 后端同名方法同理(L507)"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "CompiledKernel", "file": "python/triton/compiler/compiler.py", "responsibility": "编译产物句柄;持有两个类级钩子槽位 launch_enter_hook/launch_exit_hook 与 launch_metadata()——proton 零侵入的挂点。CompiledKernel 本身见 ch11(回指,不重讲)"},
+    {"name": "LazyDict", "file": "python/triton/compiler/compiler.py", "responsibility": "惰性求值容器:add() 登记 metadata_fn,直到 .get() 才真正跑并合并——让 flops/bytes 只在 profiling 开启时才计算"},
+    {"name": "TritonHook", "file": "third_party/proton/proton/hook.py", "responsibility": "proton 侧的钩子实现:enter 在发射前 get() 出 flops/bytes 并 enter_scope(triton_op) 挂上去,exit 收尾;metrics 列表 flops8/16/32/64+bytes+flops 决定采哪些量"},
+    {"name": "scope", "file": "third_party/proton/proton/scope.py", "responsibility": "作用域上下文管理器/装饰器 + 函数式 enter_scope/exit_scope;triton_op 分流到 libproton.enter_op;thread_local 栈保证配对"},
+    {"name": "FactorDict / derivable_metrics", "file": "third_party/proton/proton/viewer.py", "responsibility": "单位换算表:把 flop/s、gflop/s、byte/s 等目标指标映射到原始计数名与缩放因子,驱动 derive_metrics 的派生"},
+    {"name": "Benchmark / Mark", "file": "python/triton/testing.py", "responsibility": "perf_report 的配置对象与执行器——扫 x_vals×line_vals 网格、对每格调 do_bench、出 DataFrame/折线图/csv。本章重点是 do_bench 本身,Benchmark 作外围点到"}
+  ],
+
+  "data_flow": [
+    "① 注册:proton.start(hook='triton') → profile.start → register_triton_hook → CompiledKernel.launch_enter_hook/exit_hook = TritonHook.enter/exit(compiler.py 类级槽位被写)",
+    "② 发射前构元数据:kernel[grid](*args) → runner → CompiledKernel.launch_metadata:钩子非 None→建 LazyDict 并 add(用户 fn.launch_metadata) 惰性登记 grid/metadata/arg_dict",
+    "③ 透传:runner 把 launch_metadata 与两个类级钩子一并传给 self.run(=ch37 make_launcher 发射器)",
+    "④ 发射前回调:发射器在 cuLaunchKernel 前调 launch_enter_hook=TritonHook.enter → lazy_dict.get() 此刻才跑用户 metadata_fn 算出 flops/bytes → enter_scope(kernel名, triton_op=True, metrics=flops/bytes)",
+    "⑤ 发射后回调:发射器在 kernel 后调 launch_exit_hook=TritonHook.exit → exit_scope(triton_op=True) 关作用域",
+    "⑥ 采时:libproton 借 CUPTI(cuda)/roctracer(hip) 采到该作用域的 kernel 实测时间,与④挂上的 flops/bytes 一起进调用树",
+    "⑦ 收口:proton.finalize → libproton.finalize_all('hatchet') 把调用树+device_info 写成 json → unregister_triton_hook 摘钩子",
+    "⑧ 读数:proton-viewer -m util,flop/s file.json → get_raw_metrics 拆调用树+device_info → derive_metrics:get_min_time_flops(compute roof)/get_min_time_bytes(memory roof)/util=max(两 ideal_time)/实测时间 → 打印 hatchet 树",
+    "—— 另一条独立线(do_bench,不依赖 proton):fn()+sync 触发编译 → 估时 → 定 n_warmup/n_repeat → 每轮 cache.zero_() 冲 L2 + CUDA event 打点 → _summarize_statistics 取分位/中位数"
+  ],
+
+  "design_decisions": [
+    {"decision": "钩子是 CompiledKernel 的类级(而非实例级)属性,默认 None", "why": "类级=注册一次对全体已编译 kernel 生效(register_triton_hook 只写一处);默认 None 让 launch_metadata 首行即 `if hook is None: return None`——未开 profiling 时零成本,连 LazyDict 都不建", "evidence": "python/triton/compiler/compiler.py:L347-L348 与 L399-L400"},
+    {"decision": "用户 metadata_fn 用 LazyDict.add 惰性登记,而非当场调用", "why": "flops/bytes 的计算只该在 profiling 真正开启、钩子 enter 里 .get() 时才发生;关闭 profiling 时那段用户代码一次都不跑", "evidence": "python/triton/compiler/compiler.py:L412(ret.add) 与 third_party/proton/proton/hook.py:L14(metadata=lazy_dict.get())"},
+    {"decision": "metadata 计算单独包一个 COMPUTE_METADATA_SCOPE_NAME 作用域", "why": "把『算 flops/bytes 本身的开销』计到一个独立桶,viewer 的 filter_frames 用 `^(?!__proton_launch_metadata).*` 把它剔除,不污染 kernel 的时间/算力统计", "evidence": "third_party/proton/proton/hook.py:L13-L15 与 third_party/proton/proton/viewer.py:L183-L185"},
+    {"decision": "proton 不自测时间,委托厂商 tracer(cupti/roctracer)", "why": "厂商 tracer 直接从驱动/硬件计数器拿 kernel 时间,比 host 侧计时精确;proton 只负责作用域/元数据的组织与派生", "evidence": "third_party/proton/proton/profile.py:L13-L20 _select_backend"},
+    {"decision": "util = max(min_time_flops, min_time_bytes) / 实测时间", "why": "屋顶模型:两个 ideal_time 取 max 即取瓶颈资源——compute roof 时间大则 compute-bound、memory roof 时间大则 memory-bound;除实测时间得『离屋顶多近』∈(0,1]。这一个数直接指出优化方向", "evidence": "third_party/proton/proton/viewer.py:L119"},
+    {"decision": "do_bench 每轮 fn 前 cache.zero_() 冲 256MB L2 缓冲", "why": "防上一轮 kernel 的输入/输出留在 L2 命中,使第 2 次起假性变快;写满一个远大于 L2 的缓冲即把它挤空,保证每次冷 L2 公平计时", "evidence": "python/triton/testing.py:L150 与 third_party/nvidia/backend/driver.py:L476-L481"},
+    {"decision": "warmup/rep 以毫秒预算给,内部先估时再换算成次数", "why": "kernel 快慢差几个数量级,固定次数要么测不准要么太慢;先跑 5 次估 estimate_ms,再 n=max(1, budget_ms/estimate_ms) 让快 kernel 多跑、慢 kernel 少跑,统一到大致相同的墙钟预算", "evidence": "python/triton/testing.py:L131-L135"},
+    {"decision": "每次 repeat 各配一对 CUDA event、最后一次性 synchronize 读回", "why": "CUDA event 是 GPU 端时间戳,record 只入队不阻塞 host;循环内不 sync 避免 host-device 往返污染节奏,循环后一次 synchronize 再批量 elapsed_time 读回各段", "evidence": "python/triton/testing.py:L136-L157"},
+    {"decision": "默认返回中位数 + 20/80 分位(quantiles),而非均值", "why": "GPU 计时有偶发尖峰(调度/时钟波动),中位数与分位抗离群,均值会被拖偏;这是全书所有『实测』数字的口径", "evidence": "python/triton/testing.py:L96-L97 docstring 与 L20-L26 _summarize_statistics"}
+  ],
+
+  "theory": [
+    "屋顶模型(roofline)判据:给一个 kernel 的 flops 数 F 与 bytes 数 B,ideal_time_compute = F / peak_flops,ideal_time_mem = B / peak_bandwidth。util = max(ideal_time_compute, ideal_time_mem) / measured_time。取 max 的物理含义:即便算力与带宽都打满,kernel 也至少要 max(两者) 那么久——瓶颈资源决定下界。哪个 ideal_time 大,哪面屋顶就是你现在贴着的:compute roof 大→compute-bound(降精度/减 flop)、memory roof 大→memory-bound(融合/减访存)。",
+    "峰值带宽公式:peak_bandwidth = 2 × bus_width(bit) × mem_clock(Hz) / 8。因子 2=DDR 双数据沿,/8=bit→byte。峰值算力按 arch 硬编码基准,H100(arch90)按 (num_sms/114 × clock/1755MHz × 1513) TFLOP/s 相对 H100 PCIe 基线线性缩放;位宽越窄峰值越高(除以 width/8),故同一 kernel 用 fp8 算的屋顶比 fp32 高 4 倍。",
+    "roofline 数值取证(仓库自带 example_cuda.json,无 GPU 跑通):foo0 在 device1(arch90,num_sms=132,clock=1980MHz,bus_width=6144,mem_clock=2619MHz),flops8=1e11,bytes=1e8,time=204800ns。peak_flops8 = (132/114 × 1980/1755 × 1513)e12 ≈ 1.977e15 → ideal_time_flops = 1e11/1.977e15 ≈ 5.06e-5 s;peak_bw = 2×6144×2619e6/8 ≈ 4.02e12 → ideal_time_bytes = 1e8/4.02e12 ≈ 2.49e-5 s。max=5.06e-5(compute 侧),/204.8e-6 ≈ 0.247。viewer 实跑输出 foo0 util=0.247、foo1 util=0.148,与手算逐位吻合(见 subtraction_plan.must_keep 无关;此为取证)。两个样例 kernel 都是 compute-bound(flops 屋顶时间 > bytes 屋顶时间)。",
+    "do_bench 次数换算:n_warmup=max(1, ⌊warmup_ms/estimate_ms⌋),n_repeat=max(1, ⌊rep_ms/estimate_ms⌋)。默认 warmup=25ms、rep=100ms:若某 kernel estimate_ms=0.2,则 n_warmup=125、n_repeat=500。快 kernel 自动多测以摊平抖动,慢 kernel 少测以控总时长。",
+    "为何 CUDA event 而非 time.time():kernel 是异步下发的,host 端 time.time() 量的是『下发到看到』含 host-device 同步的墙钟;CUDA event record 在 GPU 流上打时间戳,elapsed_time 是纯 GPU 执行时间,精度到微秒且不含 host 抖动。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [],
+    "must_keep": [
+      {"symbol": "launch_enter_hook", "why": "CompiledKernel 类级钩子槽位——proton 零侵入的挂点,读者必须理解发射前回调挂在此"},
+      {"symbol": "launch_exit_hook", "why": "发射后回调槽位,与 enter 配对"},
+      {"symbol": "launch_metadata", "why": "构造惰性元数据的方法;首行 `if hook is None: return None` 是零成本闸门"},
+      {"symbol": "LazyDict", "why": "惰性求值容器,解释 flops/bytes 为何只在 profiling 开启时才算"},
+      {"symbol": "register_triton_hook", "why": "把 TritonHook.enter/exit 写进类级槽位——『不改一行核代码』的注入动作本体"},
+      {"symbol": "TritonHook", "why": "proton 钩子实现类;metrics 列表决定采 flops8/16/32/64+bytes"},
+      {"symbol": "enter_scope", "why": "作用域进入;triton_op=True 分流到 libproton.enter_op,是 flops/bytes 的挂载点"},
+      {"symbol": "exit_scope", "why": "作用域退出,与 enter 配对(thread_local 栈)"},
+      {"symbol": "COMPUTE_METADATA_SCOPE_NAME", "why": "metadata 计算的独立桶名;viewer 用它把 metadata 开销过滤掉"},
+      {"symbol": "_select_backend", "why": "cuda→cupti/hip→roctracer 的姊妹篇 tracer 接缝"},
+      {"symbol": "start", "why": "proton 会话状态机起点;set_profiling_on + 可选 register_triton_hook"},
+      {"symbol": "finalize", "why": "状态机收口;set_profiling_off + finalize_all + unregister_triton_hook"},
+      {"symbol": "get_min_time_flops", "why": "compute roof——按 arch 峰值算力算 ideal_time,roofline 的一半"},
+      {"symbol": "get_min_time_bytes", "why": "memory roof——峰值带宽算 ideal_time,roofline 的另一半"},
+      {"symbol": "derive_metrics", "why": "util=max(两 roof)/实测时间 的落点;flop/s、byte/s 派生"},
+      {"symbol": "get_empty_cache_for_benchmark", "why": "256MB L2 冲刷缓冲的来源,do_bench 冷 L2 的保证"},
+      {"symbol": "do_bench", "why": "全书 benchmark 秒表本体——估时/warmup/repeat/zero L2/CUDA event/分位"},
+      {"symbol": "_summarize_statistics", "why": "分位/中位数抗抖动收尾,全书性能数字口径"}
+    ]
+  },
+
+  "mechanisms": [
+    {"id": "m1", "name": "proton launch 钩子(零侵入)——发射前后各插一次 scope", "kind": "protocol", "source_anchors": ["third_party/proton/proton/hook.py:L7-L33", "python/triton/compiler/compiler.py:L343-L348", "python/triton/compiler/compiler.py:L415-L426"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m2", "name": "LazyDict 惰性元数据——flops/bytes 只在 profiling 开启时才算", "kind": "dataflow", "source_anchors": ["python/triton/compiler/compiler.py:L314-L328", "python/triton/compiler/compiler.py:L398-L413"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m3", "name": "proton 会话状态机 start→activate/deactivate→finalize", "kind": "protocol", "source_anchors": ["third_party/proton/proton/profile.py:L33-L85", "third_party/proton/proton/profile.py:L88-L140"], "needs_figure": true, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m4", "name": "backend 选择 cuda→cupti / hip→roctracer(tracer 接缝)", "kind": "config", "source_anchors": ["third_party/proton/proton/profile.py:L13-L20"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m5", "name": "scope 进出与 triton_op 分流(enter_op vs enter_scope)", "kind": "dataflow", "source_anchors": ["third_party/proton/proton/scope.py:L78-L105"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m6", "name": "roofline 屋顶模型 util=max(compute_roof, memory_roof)/实测时间", "kind": "algorithm", "source_anchors": ["third_party/proton/proton/viewer.py:L38-L68", "third_party/proton/proton/viewer.py:L71-L81", "third_party/proton/proton/viewer.py:L114-L121"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m7", "name": "derive_metrics 派生 flop/s、byte/s(原始计数/实测时间/单位)", "kind": "dataflow", "source_anchors": ["third_party/proton/proton/viewer.py:L105-L156"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m8", "name": "viewer 主管线:json→hatchet 调用树→inclusive→derive→filter→tree", "kind": "dataflow", "source_anchors": ["third_party/proton/proton/viewer.py:L31-L35", "third_party/proton/proton/viewer.py:L169-L201"], "needs_figure": true, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m9", "name": "do_bench 计时协议:估时→定 warmup/repeat→zero L2→CUDA event→分位", "kind": "algorithm", "source_anchors": ["python/triton/testing.py:L95-L158"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m10", "name": "L2 冲刷——256MB 缓冲每轮 zero_() 保证冷 L2 公平计时", "kind": "config", "source_anchors": ["python/triton/testing.py:L120-L120", "python/triton/testing.py:L149-L150", "third_party/nvidia/backend/driver.py:L474-L481"], "needs_figure": false, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m11", "name": "_summarize_statistics 分位/中位数抗抖动收尾", "kind": "algorithm", "source_anchors": ["python/triton/testing.py:L20-L29"], "needs_figure": false, "needs_worked_example": true, "difficulty": "supporting"}
+  ],
+
+  "foreshadow_due": {"plant": [], "harvest": [], "note": "bible.py due ch39 返回空——本章无伏笔埋/回收(与 workflow 说明一致)"}
+}
