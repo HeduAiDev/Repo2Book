@@ -1,0 +1,186 @@
+{
+  "kind": "skip_impl",
+  "chapter": "ch32",
+  "title": "【Part VII 开篇】五级台阶与第一跳 TTIR→TTGIR：给每个张量贴上布局",
+
+  "code_spine": [
+    "third_party/nvidia/backend/compiler.py:L384-L389  CUDABackend.add_stages —— 注册 ttir/ttgir/llir/ptx/cubin 五段降级回调（f2 五级阶梯全貌）",
+    "third_party/nvidia/backend/compiler.py:L184-L185  CUDABackend.load_dialects —— nvidia.load_dialects 挂 NVGPU dialect（后端接缝）",
+    "third_party/nvidia/backend/compiler.py:L188-L201  make_ttir —— 第一段：TTIR 级 pass（inliner / rewrite_tensor_pointer / combine / canonicalizer / reorder_broadcast / cse / licm / dce / loop_unroll）",
+    "third_party/nvidia/backend/compiler.py:L204-L218  make_ttgir 开头 —— 建 pass_manager，add_convert_to_ttgpuir 就是第一跳 TTIR→TTGIR",
+    "lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp:L762-L807  ConvertTritonToTritonGPU::runOnOperation —— 建 TypeConverter+ConversionTarget+patterns，applyPartialConversion 驱动整个重写",
+    "lib/Conversion/TritonToTritonGPU/TritonGPUConversion.cpp:L26-L36  TypeConverter tensor 规则 —— 无布局张量默认贴 getDefaultBlockedEncoding（Blocked 编码）",
+    "lib/Conversion/TritonToTritonGPU/TritonGPUConversion.cpp:L112-L121  ConversionTarget DotOp 合法性 —— tt.dot 仅当两操作数都 DotOperand 编码才合法（非法→合法约束）",
+    "lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp:L215-L279  TritonDotPattern —— 把 tt.dot 两操作数强制 DotOperandEncoding 并插 ConvertLayoutOp 胶水",
+    "lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp:L176-L192  TritonExpandDimsPattern —— 返回 Blocked、操作数贴 SliceEncoding",
+    "lib/Conversion/TritonToTritonGPU/TritonGPUConversion.cpp:L77-L82  addTargetMaterialization —— 类型不匹配时自动插 ConvertLayoutOp（胶水的统一来源）",
+    "lib/Dialect/Triton/Transforms/RewriteTensorPointer.cpp:L227-L250  rewriteMakeTensorPtrOp —— tt.make_tensor_ptr 在 TTIR 级被降解成 base+strides+offsets（block pointer 只活到 TTIR）",
+    "lib/Dialect/Triton/Transforms/RewriteTensorPointer.cpp:L541-L564  RewriteTensorPointerPass::runOnOperation —— 递归重建 IR、延迟 erase",
+    "lib/Dialect/Triton/Transforms/Combine.cpp:L219-L240  CombineOpsPass::runOnOperation —— 窥孔合并（dot+add、select+load、addptr、broadcast 常量）",
+    "lib/Dialect/TritonGPU/IR/Dialect.cpp:L520-L532  getDefaultBlockedEncoding —— 默认 Blocked：order 逆序、sizePerThread 全 1"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "third_party/nvidia/backend/compiler.py",
+      "lines": "L384-L389",
+      "what": "五级降级阶梯的登记处——回收 f2。每段一个 lambda，串上同一个 options/capability/metadata。",
+      "code": "    def add_stages(self, stages, options):\n        stages[\"ttir\"] = lambda src, metadata: self.make_ttir(src, metadata, options)\n        stages[\"ttgir\"] = lambda src, metadata: self.make_ttgir(src, metadata, options, self.capability)\n        stages[\"llir\"] = lambda src, metadata: self.make_llir(src, metadata, options, self.capability)\n        stages[\"ptx\"] = lambda src, metadata: self.make_ptx(src, metadata, options, self.capability)\n        stages[\"cubin\"] = lambda src, metadata: self.make_cubin(src, metadata, options, self.capability)",
+      "elide": []
+    },
+    {
+      "path": "third_party/nvidia/backend/compiler.py",
+      "lines": "L188-L201",
+      "what": "第一段 make_ttir：TTIR 级 pass 序列。本章点名三个——add_rewrite_tensor_pointer（降解 block pointer，回扣 ch07）、add_combine（窥孔合并）、add_reorder_broadcast。其余（inliner/canonicalizer/cse/licm/symbol_dce/loop_unroll）为通用清理，不展开。",
+      "code": "    @staticmethod\n    def make_ttir(mod, metadata, opt):\n        pm = ir.pass_manager(mod.context)\n        pm.enable_debug()\n        passes.common.add_inliner(pm)\n        passes.ttir.add_rewrite_tensor_pointer(pm)\n        passes.ttir.add_combine(pm)\n        passes.common.add_canonicalizer(pm)\n        passes.ttir.add_reorder_broadcast(pm)\n        passes.common.add_cse(pm)\n        passes.common.add_licm(pm)\n        passes.common.add_symbol_dce(pm)\n        passes.ttir.add_loop_unroll(pm)\n        pm.run(mod)\n        return mod",
+      "elide": ["inliner/canonicalizer/cse/licm/symbol_dce/loop_unroll 为通用 MLIR 清理 pass，本章不逐个展开"]
+    },
+    {
+      "path": "third_party/nvidia/backend/compiler.py",
+      "lines": "L204-L218",
+      "what": "第二段 make_ttgir 开头。add_convert_to_ttgpuir 这一行就是第一跳 TTIR→TTGIR，参数 cuda:capability / num_warps / 32(threadsPerWarp) / num_ctas 正是布局推导要用的并行度。其后一长串 ttgpuir.* 优化 pass（coalesce/accelerate_matmul/...）是 ch33+ 内容，本章只到这一跳。",
+      "code": "    @staticmethod\n    def make_ttgir(mod, metadata, opt, capability):\n        cluster_info = nvidia.ClusterInfo()\n        if opt.cluster_dims is not None:\n            cluster_info.clusterDimX = opt.cluster_dims[0]\n            cluster_info.clusterDimY = opt.cluster_dims[1]\n            cluster_info.clusterDimZ = opt.cluster_dims[2]\n        # Set up Diagnostic\n        if os.environ.get(\"MLIR_ENABLE_REMARK\", \"0\") == \"1\":\n            srcMgr = llvm.source_mgr()\n            diag = ir.source_mgr_diag(srcMgr, mod.context)\n            mod.context.printOpOnDiagnostic(True)\n        # TTIR -> TTGIR\n        pm = ir.pass_manager(mod.context)\n        pm.enable_debug()\n        passes.ttir.add_convert_to_ttgpuir(pm, f\"cuda:{capability}\", opt.num_warps, 32, opt.num_ctas)",
+      "elide": ["cluster_info / MLIR_ENABLE_REMARK 诊断分支与本章无关；add_convert_to_ttgpuir 之后的 coalesce/accelerate_matmul 等 TTGIR 优化 pass 属 ch33+，不展开"]
+    },
+    {
+      "path": "lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp",
+      "lines": "L762-L807",
+      "what": "第一跳的 pass body：建 TritonGPUTypeConverter（带 numWarps/threadsPerWarp/numCTAs）、TritonGPUConversionTarget，装齐 arith/math/triton/scf/cf 各 dialect 的 pattern，给 module 打上 num-warps 等属性，最后 applyPartialConversion 一把驱动整套 dialect-conversion 重写。",
+      "code": "  void runOnOperation() override {\n    MLIRContext *context = &getContext();\n    ModuleOp mod = getOperation();\n    // type converter\n    TritonGPUTypeConverter typeConverter(context, numWarps, threadsPerWarp,\n                                         numCTAs);\n    TritonGPUConversionTarget target(*context, typeConverter);\n    // rewrite patterns\n    RewritePatternSet patterns(context);\n    // add rules\n    populateArithPatternsAndLegality(typeConverter, patterns, target);\n    populateMathPatternsAndLegality(typeConverter, patterns, target);\n    populateTritonPatterns(typeConverter, patterns, numCTAs);\n    // TODO: can we use\n    //    mlir::scf::populateSCFStructurealTypeConversionsAndLegality(...) here?\n    populateSCFPatterns(typeConverter, patterns);\n    populateCFPatterns(typeConverter, patterns);\n\n    auto inti = llvm::APSInt(32, false);\n    auto i32_ty = IntegerType::get(mod->getContext(), 32);\n\n    mod->setAttr(\n        AttrNumWarpsName,\n        IntegerAttr::get(i32_ty, llvm::APInt(32, numWarps.getValue())));\n    mod->setAttr(\n        AttrNumThreadsPerWarp,\n        IntegerAttr::get(i32_ty, llvm::APInt(32, threadsPerWarp.getValue())));\n\n    mod->setAttr(AttrNumCTAsName,\n                 IntegerAttr::get(i32_ty, llvm::APInt(32, numCTAs.getValue())));\n\n    if (this->target.getValue().empty()) {\n      mod.emitError(\"expected target specification to attach to the module op\");\n      return signalPassFailure();\n    }\n    mod->setAttr(AttrTargetName,\n                 StringAttr::get(context, this->target.getValue()));\n\n    if (failed(applyPartialConversion(mod, target, std::move(patterns))))\n      return signalPassFailure();\n  }",
+      "elide": ["末尾被注释掉的 refineLayouts 分支（死代码）已省"]
+    },
+    {
+      "path": "lib/Conversion/TritonToTritonGPU/TritonGPUConversion.cpp",
+      "lines": "L26-L36",
+      "what": "布局怎么『默认贴上』的核心：TypeConverter 对每个 RankedTensorType，若已有 encoding 就原样返回，否则调 getDefaultBlockedEncoding 贴上 Blocked 编码。这是『无布局张量→Blocked』的唯一来源。",
+      "code": "  // Add encoding for tensor\n  addConversion([this](RankedTensorType tensorType) -> RankedTensorType {\n    // types with encoding are already in the right format\n    // TODO: check for layout encodings more specifically\n    if (tensorType.getEncoding())\n      return tensorType;\n    ArrayRef<int64_t> shape = tensorType.getShape();\n    triton::gpu::BlockedEncodingAttr encoding =\n        getDefaultBlockedEncoding(this->context, shape, this->numWarps,\n                                  this->threadsPerWarp, this->numCTAs);\n    return RankedTensorType::get(shape, tensorType.getElementType(), encoding);\n  });",
+      "elide": []
+    },
+    {
+      "path": "lib/Conversion/TritonToTritonGPU/TritonGPUConversion.cpp",
+      "lines": "L77-L82",
+      "what": "胶水的统一出处：当某个值的实际类型与期望类型不一致（布局不匹配），dialect-conversion 框架回调 addTargetMaterialization，它 create 一个 ConvertLayoutOp 把值搬到目标布局——TTGIR 里满屏的 convert_layout 就是这里冒出来的。",
+      "code": "  addTargetMaterialization([&](OpBuilder &builder, RankedTensorType tensorType,\n                               ValueRange inputs, Location loc) {\n    auto cast =\n        builder.create<triton::gpu::ConvertLayoutOp>(loc, tensorType, inputs);\n    return cast.getResult();\n  });",
+      "elide": ["argument/source rematerialization 两个回调都 llvm_unreachable（Triton→TritonGPU 不应触发），已省"]
+    },
+    {
+      "path": "lib/Conversion/TritonToTritonGPU/TritonGPUConversion.cpp",
+      "lines": "L112-L121",
+      "what": "驱动整个 tt.dot 重写的『非法条件』：ConversionTarget 把 DotOp 声明为 dynamically-legal，仅当 A、B 两操作数都已是 DotOperandEncodingAttr 才合法。只要不满足，框架就判它非法、去找能把它变合法的 pattern（即 TritonDotPattern）。这就是 dialect-conversion『声明目标合法性，让框架自己找路径』的精髓。",
+      "code": "  // We have requirements for the data layouts\n  addDynamicallyLegalOp<triton::DotOp>([](triton::DotOp dotOp) -> bool {\n    Attribute aEncoding =\n        cast<RankedTensorType>(dotOp.getA().getType()).getEncoding();\n    Attribute bEncoding =\n        cast<RankedTensorType>(dotOp.getB().getType()).getEncoding();\n    if (aEncoding && isa<triton::gpu::DotOperandEncodingAttr>(aEncoding) &&\n        bEncoding && isa<triton::gpu::DotOperandEncodingAttr>(bEncoding))\n      return true;\n    return false;\n  });",
+      "elide": []
+    },
+    {
+      "path": "lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp",
+      "lines": "L215-L279",
+      "what": "本章 stakes 核心。TritonDotPattern 先给结果 D 算一个 Blocked 编码（retSizePerThread 随元素/线程比例取 1/2/4），再检查 A/B：若不是 DotOperandEncoding，就 create ConvertLayoutOp 把它转成 DotOperand(opIdx=0/1, parent=dEncoding)；C（累加器）也 convert 到结果布局。这就是『tt.dot 强制两操作数变 DotOperand + 插 convert_layout 胶水』的实现。",
+      "code": "struct TritonDotPattern : public OpConversionPattern<triton::DotOp> {\n  using OpConversionPattern::OpConversionPattern;\n\n  LogicalResult\n  matchAndRewrite(triton::DotOp op, OpAdaptor adaptor,\n                  ConversionPatternRewriter &rewriter) const override {\n    RankedTensorType origType = op.getType();\n    auto origShape = origType.getShape();\n    auto typeConverter = getTypeConverter<TritonGPUTypeConverter>();\n    int numWarps = typeConverter->getNumWarps();\n    int threadsPerWarp = typeConverter->getThreadsPerWarp();\n    int numCTAs = typeConverter->getNumCTAs();\n    auto rank = origShape.size();\n    SmallVector<unsigned> retSizePerThread(rank, 1);\n    auto numElements = product<int64_t>(origShape);\n    if (numElements / (numWarps * threadsPerWarp) >= 4) {\n      retSizePerThread[rank - 1] = 2;\n      retSizePerThread[rank - 2] = 2;\n    }\n    if (numElements / (numWarps * threadsPerWarp) >= 16) {\n      retSizePerThread[rank - 1] = 4;\n      retSizePerThread[rank - 2] = 4;\n    }\n    SmallVector<unsigned> retOrder(rank);\n    for (unsigned i = 0; i < rank; ++i)\n      retOrder[i] = rank - 1 - i;\n    Attribute dEncoding = triton::gpu::BlockedEncodingAttr::get(\n        getContext(), origShape, retSizePerThread, retOrder, numWarps,\n        threadsPerWarp, numCTAs);\n    RankedTensorType retType =\n        RankedTensorType::get(origShape, origType.getElementType(), dEncoding);\n    // a & b must be of smem layout\n    auto aType = cast<RankedTensorType>(adaptor.getA().getType());\n    auto bType = cast<RankedTensorType>(adaptor.getB().getType());\n    Type aEltType = aType.getElementType();\n    Type bEltType = bType.getElementType();\n    Attribute aEncoding = aType.getEncoding();\n    Attribute bEncoding = bType.getEncoding();\n    if (!aEncoding || !bEncoding)\n      return failure();\n    Value a = adaptor.getA();\n    Value b = adaptor.getB();\n    Value c = adaptor.getC();\n    if (!mlir::isa<triton::gpu::DotOperandEncodingAttr>(aEncoding)) {\n      Attribute encoding = triton::gpu::DotOperandEncodingAttr::get(\n          getContext(), 0, dEncoding, aEltType);\n      auto dstType =\n          RankedTensorType::get(aType.getShape(), aEltType, encoding);\n      a = rewriter.create<triton::gpu::ConvertLayoutOp>(a.getLoc(), dstType, a);\n    }\n    if (!mlir::isa<triton::gpu::DotOperandEncodingAttr>(bEncoding)) {\n      Attribute encoding = triton::gpu::DotOperandEncodingAttr::get(\n          getContext(), 1, dEncoding, bEltType);\n      auto dstType =\n          RankedTensorType::get(bType.getShape(), bEltType, encoding);\n      b = rewriter.create<triton::gpu::ConvertLayoutOp>(b.getLoc(), dstType, b);\n    }\n    c = rewriter.create<triton::gpu::ConvertLayoutOp>(c.getLoc(), retType, c);\n\n    addNamedAttrs(rewriter.replaceOpWithNewOp<triton::DotOp>(\n                      op, retType, a, b, c, adaptor.getInputPrecision(),\n                      adaptor.getMaxNumImpreciseAcc()),\n                  adaptor.getAttributes());\n    return success();\n  }\n};",
+      "elide": []
+    },
+    {
+      "path": "lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp",
+      "lines": "L176-L192",
+      "what": "逐算子推导布局的一个代表：ExpandDims 先给结果算一个 Blocked（在 axis 处插 1），再把源操作数贴成对应的 SliceEncoding（沿 axis 切片），并 create 一个 ConvertLayoutOp 把源转过去。说明每个算子都自带一条『我的结果该是什么布局、我的操作数该是什么布局』的推导规则。",
+      "code": "    triton::gpu::BlockedEncodingAttr retEncoding =\n        triton::gpu::BlockedEncodingAttr::get(getContext(), retSizePerThread,\n                                              retThreadsPerWarp, retWarpsPerCTA,\n                                              retOrder, retCTALayout);\n    // convert operand to slice of return type\n    Attribute newArgEncoding = triton::gpu::SliceEncodingAttr::get(\n        getContext(), op.getAxis(), retEncoding);\n    RankedTensorType newArgType = RankedTensorType::get(\n        argType.getShape(), argType.getElementType(), newArgEncoding);\n    // construct new op\n    auto newSrc = rewriter.create<triton::gpu::ConvertLayoutOp>(\n        op.getLoc(), newArgType, adaptor.getSrc());\n    addNamedAttrs(rewriter.replaceOpWithNewOp<triton::ExpandDimsOp>(\n                      op, newSrc, adaptor.getAxis()),\n                  adaptor.getAttributes());\n    return success();",
+      "elide": ["前半段从 argEncoding 的 sizePerThread/threadsPerWarp/warpsPerCTA/CTALayout 逐个 insertOne(axis) 的机械展开已省"]
+    },
+    {
+      "path": "lib/Dialect/Triton/Transforms/RewriteTensorPointer.cpp",
+      "lines": "L227-L250",
+      "what": "补齐 make_ttir 第一段：block pointer 在 TTIR 级就被降解掉，只活到这里。rewriteMakeTensorPtrOp 把 tt.make_tensor_ptr 拆成 base + shape + strides + i64 offsets 存进 rewritedInfo 表，把原 op 压进 eraser——后续 load/store 改用显式指针张量算术，TTGIR 里再也见不到 block pointer。这回扣 ch07。",
+      "code": "  Operation *rewriteMakeTensorPtrOp(OpBuilder &builder,\n                                    triton::MakeTensorPtrOp op,\n                                    std::stack<Operation *> &eraser) {\n    // Save info for later use\n    auto ptrType = cast<triton::PointerType>(op.getType());\n    auto tensorType = cast<RankedTensorType>(ptrType.getPointeeType());\n\n    // Cast I32 offsets into I64\n    SmallVector<Value> i64Offsets;\n    for (auto offset : op.getOffsets()) {\n      auto i64Offset = builder.create<arith::ExtSIOp>(\n          op.getLoc(), builder.getI64Type(), offset);\n      i64Offsets.push_back(i64Offset);\n    }\n\n    // Save information\n    rewritedInfo[op.getResult()] =\n        RewritedInfo(op.getBase(), op.getShape(), op.getStrides(), i64Offsets,\n                     tensorType.getShape());\n\n    // Erase the original operation\n    eraser.push(op);\n    return nullptr;\n  }",
+      "elide": ["RewritedInfo 里 generatePtr/generateMask/generateOther 的具体指针算术属 ch07 细节，本章只说『被降解』这一事实"]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/IR/Dialect.cpp",
+      "lines": "L520-L532",
+      "what": "默认 Blocked 到底长什么样：order 是 [rank-1,...,0]（行主序/最后一维最 minor），sizePerThread 全 1。回指 ch21 讲的 Blocked 编码内部结构——本章只讲它怎么被默认贴上。",
+      "code": "getDefaultBlockedEncoding(MLIRContext *context, ArrayRef<int64_t> shape,\n                          int numWarps, int threadsPerWarp, int numCTAs) {\n  int rank = shape.size();\n  llvm::SmallVector<unsigned> order(rank);\n  std::iota(order.begin(), order.end(), 0);\n  std::reverse(order.begin(), order.end());\n  llvm::SmallVector<unsigned> sizePerThread(rank, 1);\n  triton::gpu::BlockedEncodingAttr encoding =\n      triton::gpu::BlockedEncodingAttr::get(context, shape, sizePerThread,\n                                            order, numWarps, threadsPerWarp,\n                                            numCTAs);\n  return encoding;\n}",
+      "elide": []
+    }
+  ],
+
+  "key_classes": [
+    {"name": "CUDABackend", "file": "third_party/nvidia/backend/compiler.py", "responsibility": "NVIDIA 后端接缝：load_dialects 挂 NVGPU dialect；add_stages 注册 ttir/ttgir/llir/ptx/cubin 五段降级；每段 make_* 建 MLIR pass_manager（前四段）或 shell 到 ptxas（cubin）；以 metadata 串联。这就是 ch01 埋的 f2 五级阶梯的全貌。"},
+    {"name": "CUDAOptions", "file": "third_party/nvidia/backend/compiler.py", "responsibility": "编译选项（frozen dataclass）：num_warps/num_ctas/num_stages/capability 相关；num_warps 与 threadsPerWarp=32 一起决定第一跳的默认布局并行度。"},
+    {"name": "ConvertTritonToTritonGPU", "file": "lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp", "responsibility": "第一跳 pass 本体：runOnOperation 建 TypeConverter+ConversionTarget+patterns，applyPartialConversion 驱动。给 module 打 num-warps/num-threads-per-warp/num-ctas/target 属性。"},
+    {"name": "TritonGPUTypeConverter", "file": "lib/Conversion/TritonToTritonGPU/TritonGPUConversion.cpp", "responsibility": "类型转换器：无 encoding 的张量 → 默认 Blocked 编码；tensor pointer 的 pointee 也补布局；addTargetMaterialization 在布局不匹配处自动插 ConvertLayoutOp（胶水统一来源）。"},
+    {"name": "TritonGPUConversionTarget", "file": "lib/Conversion/TritonToTritonGPU/TritonGPUConversion.cpp", "responsibility": "转换目标：声明 TritonGPUDialect 合法；DotOp 仅当两操作数皆 DotOperand 编码才动态合法——这个『非法条件』驱动 TritonDotPattern。"},
+    {"name": "TritonDotPattern", "file": "lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp", "responsibility": "把 tt.dot 结果贴 Blocked、两操作数强制 DotOperandEncoding(opIdx 0/1) 并 create ConvertLayoutOp 胶水、累加器 C 也 convert 到结果布局。"},
+    {"name": "TritonExpandDimsPattern", "file": "lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp", "responsibility": "ExpandDims 的布局推导：结果 Blocked（axis 处插 1）、源操作数贴 SliceEncoding 并插 convert_layout。示范『逐算子推导返回布局’。"},
+    {"name": "RewriteTensorPointerPass", "file": "lib/Dialect/Triton/Transforms/RewriteTensorPointer.cpp", "responsibility": "TTIR 级 pass：递归把 tt.make_tensor_ptr/tt.advance/带 tensor-ptr 的 load/store/for 降解成显式指针张量算术，block pointer 只活到 TTIR。"},
+    {"name": "CombineOpsPass", "file": "lib/Dialect/Triton/Transforms/Combine.cpp", "responsibility": "TTIR 级窥孔合并（peephole）：dot+add 融合、select+masked-load 融合、addptr 链合并、broadcast(常量) 折叠、broadcast·mul·reduce → dot。greedy 驱动。"}
+  ],
+
+  "data_flow": [
+    {"step": "1", "detail": "compiler.py:add_stages —— CUDABackend 向编译器注册 ttir→ttgir→llir→ptx→cubin 五个 stage 回调（f2 五级阶梯全貌）；本章走前两段。"},
+    {"step": "2", "detail": "compiler.py:make_ttir —— 第一段在 TTIR 内做 pass：add_rewrite_tensor_pointer 把 block pointer 降解、add_combine 窥孔合并、add_reorder_broadcast 及通用清理。产物仍是无布局 TTIR。"},
+    {"step": "3", "detail": "compiler.py:make_ttgir → add_convert_to_ttgpuir(cuda:cap, num_warps, 32, num_ctas) —— 触发第一跳 TTIR→TTGIR。"},
+    {"step": "4", "detail": "ConvertTritonToTritonGPU::runOnOperation —— 建 TritonGPUTypeConverter / TritonGPUConversionTarget / patterns，给 module 打 num-warps 等属性。"},
+    {"step": "5", "detail": "TypeConverter 规则 —— 每个无 encoding 的 RankedTensorType 被 getDefaultBlockedEncoding 贴上默认 Blocked（order 逆序、sizePerThread 全 1）。"},
+    {"step": "6", "detail": "ConversionTarget —— tt.dot 声明为『两操作数皆 DotOperand 才合法』，当前非法，框架去找 pattern。"},
+    {"step": "7", "detail": "TritonDotPattern —— 给 D 算 Blocked、A/B 强制 DotOperandEncoding、create ConvertLayoutOp 胶水、C convert 到结果布局，replaceOpWithNewOp<DotOp> 变合法。逐算子（ExpandDims→Slice、Broadcast 承袭源布局等）同理推导。"},
+    {"step": "8", "detail": "布局不匹配处 addTargetMaterialization 自动插 ConvertLayoutOp。applyPartialConversion 收敛 → 得到每个张量都带布局、tt.dot 两侧 DotOperand、遍布 convert_layout 的 TTGIR。（后续 coalesce/accelerate_matmul 等优化属 ch33+）"}
+  ],
+
+  "design_decisions": [
+    {"decision": "五段降级用 lambda 注册进 stages 字典、以 metadata 串联，而非硬编码调用链", "why": "后端可插拔（每个 backend 自己 add_stages）；前四段共享 MLIR pass_manager 抽象，末段 cubin 才 shell 到 ptxas。这让『五级台阶』成为一张可枚举的定向地图。", "evidence": "third_party/nvidia/backend/compiler.py:L384-L389"},
+    {"decision": "无布局张量默认贴 Blocked 编码（order 逆序、sizePerThread 全 1），而非留空或报错", "why": "Blocked 是最通用的『每线程连续持有一小块』布局，能表达任意 elementwise/load/store；先给所有张量一个可用默认，再靠后续 pass（coalesce/accelerate_matmul）按需改写。读 TTGIR 定位布局问题的起点就是认出这个默认。", "evidence": "lib/Conversion/TritonToTritonGPU/TritonGPUConversion.cpp:L29-L36 · lib/Dialect/TritonGPU/IR/Dialect.cpp:L520-L532"},
+    {"decision": "用 dialect-conversion 框架：声明 DotOp 的『合法布局条件』，让框架自己驱动重写，而非手写遍历", "why": "把『目标 IR 什么样合法』与『怎么变过去』解耦——ConversionTarget 声明合法性，Pattern 提供路径，框架负责收敛并在类型不匹配处自动 materialize(ConvertLayoutOp)。tt.dot 的『非法→合法』约束是这套机制最直观的例子。", "evidence": "lib/Conversion/TritonToTritonGPU/TritonGPUConversion.cpp:L112-L121 · TritonToTritonGPUPass.cpp:L800"},
+    {"decision": "tt.dot 两操作数强制 DotOperandEncoding、累加器与结果同布局，并显式插 ConvertLayoutOp 胶水", "why": "Tensor Core / MMA 对 A、B 的线程—数据映射有硬性要求（ch27），故第一跳就把 dot 的操作数布局钉死；跨布局搬运只能靠 convert_layout（ch24）。这批 convert_layout 是后续 remove-layout-conversions 优化要消解的对象。", "evidence": "lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp:L258-L272"},
+    {"decision": "block pointer(tt.make_tensor_ptr) 在 TTIR 级由 RewriteTensorPointer 降解，只活到 TTIR", "why": "block pointer 是给前端/边界检查用的高层抽象；降到 TTGIR 前拆成显式 base+strides+offsets 指针张量算术，后端只需处理一种寻址形式。RewriteTensorPointer 不用 ConversionPatternRewriter（因 MLIR 不支持 1→多值映射），改递归重建 IR + 延迟 erase。", "evidence": "lib/Dialect/Triton/Transforms/RewriteTensorPointer.cpp:L227-L250 · L541-L554"}
+  ],
+
+  "theory": [
+    "布局默认值 = 定位性能问题的基线：读 TTGIR 时，认出『所有张量默认 Blocked、tt.dot 两侧 DotOperand、其间遍布 convert_layout』这三件事，就能判断哪些 convert_layout 是必需的（跨 MMA 布局）、哪些是默认布局与理想布局不合留下的、可被 remove-layout-conversions 消掉的开销。",
+    "retSizePerThread 的阶梯（TritonDotPattern:L228-L237）：结果每线程持有的元素数按 numElements/(numWarps*threadsPerWarp) 的比值取 1/2/4——元素越多、每线程分块越大，减少线程间协作次数。这是一个纯启发式的初值，非最终布局。",
+    "dialect-conversion 的『不动点』语义：applyPartialConversion 反复应用 pattern 直到所有 op 都满足 ConversionTarget 声明的合法性；不合法且无 pattern 可救的 op 会导致 pass 失败。理解这一点才能读懂『为什么 tt.dot 一定会长出 convert_layout』——不是某段代码显式加的，是合法性约束逼出来的。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [],
+    "must_keep": [
+      {"symbol": "add_stages", "why": "五级降级阶梯的登记点，回收 f2 的锚。"},
+      {"symbol": "make_ttir", "why": "第一段：TTIR 级 pass 序列。"},
+      {"symbol": "make_ttgir", "why": "第二段：承载第一跳 TTIR→TTGIR。"},
+      {"symbol": "add_convert_to_ttgpuir", "why": "第一跳的触发行，读者需认出它就是布局注入的入口。"},
+      {"symbol": "add_rewrite_tensor_pointer", "why": "TTIR 级降解 block pointer 的 pass，回扣 ch07。"},
+      {"symbol": "add_combine", "why": "TTIR 级窥孔合并 pass。"},
+      {"symbol": "add_reorder_broadcast", "why": "TTIR 级 pass，本章点名。"},
+      {"symbol": "getDefaultBlockedEncoding", "why": "无布局张量默认贴 Blocked 的函数，核心机制。"},
+      {"symbol": "TritonGPUTypeConverter", "why": "类型转换器，布局默认注入所在。"},
+      {"symbol": "addTargetMaterialization", "why": "convert_layout 胶水的统一出处。"},
+      {"symbol": "ConvertLayoutOp", "why": "布局搬运算子（ch24），本章讲它从哪冒出来。"},
+      {"symbol": "TritonGPUConversionTarget", "why": "声明合法性、驱动重写的目标。"},
+      {"symbol": "DotOp", "why": "第一跳 stakes 核心算子。"},
+      {"symbol": "DotOperandEncodingAttr", "why": "tt.dot 操作数被强制成的编码（回指 ch27）。"},
+      {"symbol": "BlockedEncodingAttr", "why": "默认张量编码（回指 ch21）。"},
+      {"symbol": "SliceEncodingAttr", "why": "ExpandDims 操作数编码（回指 ch21）。"},
+      {"symbol": "TritonDotPattern", "why": "把 tt.dot 两操作数变 DotOperand + 插胶水的 pattern。"},
+      {"symbol": "TritonExpandDimsPattern", "why": "逐算子布局推导的代表（Slice 编码）。"},
+      {"symbol": "applyPartialConversion", "why": "dialect-conversion 的驱动入口，'非法→合法'收敛靠它。"},
+      {"symbol": "rewriteMakeTensorPtrOp", "why": "block pointer 在 TTIR 级被降解的实现。"},
+      {"symbol": "RewriteTensorPointerPass", "why": "降解 block pointer 的 pass 本体。"},
+      {"symbol": "CombineOpsPass", "why": "窥孔合并 pass 本体。"}
+    ]
+  },
+
+  "mechanisms": [
+    {"id": "m1-five-stage-ladder", "name": "五级降级阶梯 ttir→ttgir→llir→ptx→cubin（回收 f2）", "kind": "dataflow", "source_anchors": ["third_party/nvidia/backend/compiler.py:L384-L389", "third_party/nvidia/backend/compiler.py:L184-L185"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m2-make-ttir-passes", "name": "make_ttir 第一段 TTIR 级 pass 序列（rewrite_tensor_pointer / combine / reorder_broadcast 点名）", "kind": "dataflow", "source_anchors": ["third_party/nvidia/backend/compiler.py:L188-L201"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m3-default-blocked-encoding", "name": "无布局张量默认贴 Blocked 编码（getDefaultBlockedEncoding via TypeConverter）", "kind": "layout", "source_anchors": ["lib/Conversion/TritonToTritonGPU/TritonGPUConversion.cpp:L26-L36", "lib/Dialect/TritonGPU/IR/Dialect.cpp:L520-L532"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m4-dialect-conversion-legality", "name": "dialect-conversion：声明 DotOp 合法性条件驱动重写（非法→合法）", "kind": "protocol", "source_anchors": ["lib/Conversion/TritonToTritonGPU/TritonGPUConversion.cpp:L112-L121", "lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp:L762-L807"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m5-dot-operand-glue", "name": "tt.dot 两操作数强制 DotOperandEncoding + 插 ConvertLayoutOp 胶水（TritonDotPattern）", "kind": "layout", "source_anchors": ["lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp:L215-L279"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m6-per-op-layout-inference", "name": "逐算子推导返回布局（ExpandDims→SliceEncoding、Broadcast 承袭源布局）", "kind": "layout", "source_anchors": ["lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp:L141-L192", "lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp:L422-L442"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m7-target-materialization", "name": "布局不匹配处自动插 ConvertLayoutOp（addTargetMaterialization，胶水统一来源）", "kind": "protocol", "source_anchors": ["lib/Conversion/TritonToTritonGPU/TritonGPUConversion.cpp:L77-L82"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m8-rewrite-tensor-pointer", "name": "block pointer 在 TTIR 级被 RewriteTensorPointer 降解（只活到 TTIR，回扣 ch07）", "kind": "dataflow", "source_anchors": ["lib/Dialect/Triton/Transforms/RewriteTensorPointer.cpp:L227-L250", "lib/Dialect/Triton/Transforms/RewriteTensorPointer.cpp:L541-L564"], "needs_figure": false, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m9-ttir-combine-peephole", "name": "Combine 窥孔合并（dot+add / select+load / addptr / broadcast 常量）", "kind": "dataflow", "source_anchors": ["lib/Dialect/Triton/Transforms/Combine.cpp:L219-L240"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"}
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recover": [
+      {"id": "f2", "desc": "五级降级阶梯 ttir→ttgir→llir→ptx→cubin——本章给全貌（add_stages 五段），后续 ch33/34/35 逐级展开到 PTX 出口。埋于 ch01。", "planted_in": "ch01", "how_recovered": "add_stages(compiler.py:L384-L389) 五段回调即 f2 全貌；本章正式走第一跳 TTIR→TTGIR，前瞻回指 ch33/34/35 逐级展开。"}
+    ]
+  }
+}

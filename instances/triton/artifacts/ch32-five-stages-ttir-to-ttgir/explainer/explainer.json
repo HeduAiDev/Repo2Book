@@ -1,0 +1,135 @@
+{
+  "chapter": "ch32",
+  "trace_provenance": {
+    "driver": "traces/run_dump_ir.py",
+    "raw": "traces/dump_ir.json",
+    "how": "pin-compile:用 instances/triton/v32(pip install triton==3.2.0,与 pin v3.2.0 逐字节同,INSTANCE.md 已 diff)headless、无 GPU 编译一段带 tt.dot + block pointer 的 matmul kernel(BLOCK_M=BLOCK_N=BLOCK_K=16,num_warps=4,threads_per_warp=32,num_ctas=1,capability=80)。分三个观测点取 IR:(a) src.make_ir 追踪期(任何 pass 前)、(b) make_ttir 之后、(c) 单独跑 add_convert_to_ttgpuir 的『第一跳纯净态』(不含 ch33+ 的 coalesce/accelerate_matmul)。第一跳后再跑完整 make_ttgir 只作对照,不用于本章素材。",
+    "stage_labels": {
+      "traced_ttir": "追踪期(make_ir,pass 前)——block pointer(tt.make_tensor_ptr)在场、张量无布局",
+      "ttir_after_make_ttir": "make_ttir 之后——block pointer 已被 RewriteTensorPointer 降解成 splat/expand_dims/broadcast/addptr,张量仍无布局",
+      "ttgir_first_hop_only": "第一跳纯净态(仅 add_convert_to_ttgpuir)——本章正文素材:每张量贴 #blocked、tt.dot 两操作数变 dot_op、其间 convert_layout 胶水",
+      "ttgir_after_make_ttgir": "完整 make_ttgir(含 ch33+ 优化)——仅对照:dot_op parent 已被 accelerate_matmul 换成 #mma、走 local_alloc/local_load,不在本章范围"
+    }
+  },
+
+  "mechanisms": [
+    {
+      "mechanism_id": "m1-five-stage-ladder",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch32-five-stage-ladder",
+          "template": "flow",
+          "claim": "CUDABackend.add_stages 把一段 kernel 的降级注册成五级阶梯 ttir→ttgir→llir→ptx→cubin,前四段各建一个 MLIR pass_manager、末段 shell 到 ptxas,以同一 options/metadata 串联——这就是 ch01 埋的 f2 全貌,本章只走第一跳。",
+          "numbers": [
+            {"value": "5 段:ttir / ttgir / llir / ptx / cubin", "provenance": "third_party/nvidia/backend/compiler.py:L384-L389(add_stages 五行 stages[] 赋值)"},
+            {"value": "make_ttir / make_ttgir / make_llir / make_ptx / make_cubin", "provenance": "third_party/nvidia/backend/compiler.py:L187,L203,+ 各 make_* 静态方法"},
+            {"value": "前 4 段 = ir.pass_manager;第 5 段 cubin = shell 到 ptxas", "provenance": "compiler.py make_ptx/make_cubin(cubin 段 subprocess 调 ptxas)"},
+            {"value": "第一跳触发行 add_convert_to_ttgpuir(cuda:80, num_warps=4, 32, num_ctas=1)", "provenance": "compiler.py make_ttgir 首个 pass;参数见 traces/dump_ir.json params"}
+          ],
+          "caption_draft": "五级降级阶梯:源码只在 ttir/ttgir/llir/ptx/cubin 五个出口露面,本章聚焦第一跳 ttir→ttgir(布局注入),ch33/34/35 逐级走到 PTX 出口。认阶梯 = 知道该在哪一级 dump 才看得到某个变换。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m3-default-blocked-encoding",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch32-default-blocked",
+          "template": "layout",
+          "claim": "凡没有 encoding 的张量,TypeConverter 一律调 getDefaultBlockedEncoding 贴上默认 #blocked——sizePerThread 全 1、order 逆序[1,0];本例 16×16 张量实测得到 #blocked{sizePerThread=[1,1], threadsPerWarp=[2,16], warpsPerCTA=[4,1], order=[1,0]}。",
+          "numbers": [
+            {"value": "sizePerThread = [1,1](全 1)", "provenance": "lib/Dialect/TritonGPU/IR/Dialect.cpp:L526 sizePerThread(rank,1);实测 traces/dump_ir.json #blocked1"},
+            {"value": "order = [1,0](iota 后 reverse,行主序)", "provenance": "Dialect.cpp:L523-L525 std::iota+std::reverse;实测 #blocked1 order=[1,0]"},
+            {"value": "threadsPerWarp = [2,16]", "provenance": "traces/dump_ir.json ttgir_first_hop_only #blocked1(由 BlockedEncodingAttr::get 从 shape+threadsPerWarp=32 推)"},
+            {"value": "warpsPerCTA = [4,1]", "provenance": "traces/dump_ir.json #blocked1(num_warps=4 铺到 M 维)"},
+            {"value": "触发点:TypeConverter 见张量无 encoding 才贴,已有 encoding 原样返回", "provenance": "lib/Conversion/TritonToTritonGPU/TritonGPUConversion.cpp:L26-L36(L33 调 getDefaultBlockedEncoding)"}
+          ],
+          "caption_draft": "『无布局→Blocked』只有一个出处:TypeConverter。读 TTGIR 定位性能问题的第一步,就是认出这个满屏的默认 #blocked——它是基线,不是最优解,后续 pass 会按需改写它。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m4-dialect-conversion-legality",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch32-dot-legality",
+          "template": "before-after",
+          "claim": "tt.dot 一开始操作数是 #blocked,被 ConversionTarget 判为『非法』(声明:两操作数皆 DotOperand 编码才合法);dialect-conversion 框架据此自己去找能把它变合法的 pattern(TritonDotPattern),不是某段代码显式改写它。",
+          "numbers": [
+            {"value": "合法条件:aEncoding 与 bEncoding 都 isa<DotOperandEncodingAttr> → true,否则 false", "provenance": "lib/Conversion/TritonToTritonGPU/TritonGPUConversion.cpp:L112-L121 addDynamicallyLegalOp<DotOp>"},
+            {"value": "非法态(前):tt.dot 两操作数 = #blocked1", "provenance": "make_ttir 产物 traces/dump_ir.json ttir_after_make_ttir(%14 = tt.dot,无编码)"},
+            {"value": "合法态(后):两操作数 = dot_op(opIdx=0/1),结果 = #blocked1", "provenance": "traces/dump_ir.json ttgir_first_hop_only(%22 = tt.dot %19,%20)"},
+            {"value": "驱动入口 applyPartialConversion:反复应用 pattern 至所有 op 合法,否则 pass 失败", "provenance": "lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp:L806 applyPartialConversion"}
+          ],
+          "caption_draft": "dialect-conversion 的精髓:只声明『什么样合法』(ConversionTarget),不写『怎么改』;框架负责收敛。这解释了为什么 tt.dot 一定会长出 convert_layout——不是有人加的,是合法性约束逼出来的。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m5-dot-operand-glue",
+      "intuition": "tt.dot 像一台只认特定插头的插座:Tensor Core 对 A、B 两个操作数的线程—数据映射有硬性形状要求(DotOperand)。你手里的张量原来是什么插头(默认 Blocked)它不管,统统得先过一个转接头(convert_layout)才能插进去。第一跳就把这些转接头当场焊好。",
+      "worked_example": {
+        "params": {
+          "kernel": "matmul_bp,shape=16×16×16,dtype A/B=fp16 C=fp32",
+          "num_warps": 4,
+          "threads_per_warp": 32,
+          "num_ctas": 1,
+          "capability": 80
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/dump_ir.json",
+        "manual_reason": "",
+        "narrative": "在第一跳纯净态(ttgir_first_hop_only)里,make_ttir 产物中那条无编码的 tt.dot(%14)被 TritonDotPattern 重写:先给结果算 dEncoding=#blocked1(retSizePerThread 见 quantified),再逐个检查 A/B/C 操作数,凡不是 dot_op 就 create 一个 convert_layout 转过去。下表逐操作数追踪这次重写,SSA 编号与结果编码全部取自 traces/dump_ir.json 的 ttgir_first_hop_only。",
+        "table": {
+          "columns": ["操作数", "第一跳前类型", "合法性判定 / pattern 动作", "插入的 convert_layout(SSA)", "转成的目标编码"],
+          "rows": [
+            ["A 操作数(load 结果 %15)", "tensor<16x16xf16> #blocked1", "非 dot_op → 需转", "%19", "dot_op opIdx=0 parent=#blocked1"],
+            ["B 操作数(load 结果 %18)", "tensor<16x16xf16> #blocked1", "非 dot_op → 需转", "%20", "dot_op opIdx=1 parent=#blocked1"],
+            ["C 累加器(常量 %cst_0)", "tensor<16x16xf32> #blocked1", "转到结果布局", "%21", "#blocked1(结果布局)"],
+            ["tt.dot 结果(%22)", "make_ttir 产物 tensor<16x16xf32> 无编码", "两侧皆 dot_op → 现合法,replaceOpWithNewOp", "无(结果直接带 dEncoding)", "tensor<16x16xf32> #blocked1"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "第一跳收敛后,IR 里每个 tt.dot 的两个操作数类型必然是 DotOperandEncodingAttr;不可能残留 #blocked 操作数的 tt.dot。",
+        "argument": "基例:若某 tt.dot 操作数已是 dot_op,ConversionTarget(TritonGPUConversion.cpp:L112-L121)判其合法,不动。归纳步:否则判非法,框架调 TritonDotPattern——它对每个非 dot_op 操作数 create 一个 convert_layout 到 dot_op(TritonToTritonGPUPass.cpp:L258-L272),再 replaceOpWithNewOp<DotOp> 换上带 dot_op 操作数的新 dot,新 dot 满足合法性且不再回退。applyPartialConversion 的不动点语义要求所有 op 合法才成功,否则 signalPassFailure。故收敛(pass 成功)时,所有 tt.dot 两侧必为 dot_op。"
+      },
+      "quantified": "结果布局 dEncoding 的 retSizePerThread 阶梯(TritonToTritonGPUPass.cpp:L228-L237):初值 [1,1],当 numElements/(numWarps×threadsPerWarp) ≥ 4 升到 [2,2],≥ 16 升到 [4,4]。代入本例:16×16 → numElements=256,分母=4×32=128,比值=256/128=2。因 2<4,retSizePerThread 保持 [1,1]——与实测 #blocked1 的 sizePerThread=[1,1] 一致(traces/dump_ir.json)。作为同一公式的手算外推:32×32 → 1024/128=8≥4 → [2,2];64×64 → 4096/128=32≥16 → [4,4](后两组未编译,纯按 L228-L237 阈值代入)。这是纯启发式初值,非最终布局——ch33+ 的 accelerate_matmul 会把 parent 换成 #mma。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch32-dot-operand-glue",
+          "template": "before-after",
+          "claim": "第一跳把一条无编码的 tt.dot 重写成:结果贴 #blocked1、A/B 两操作数各插一个 convert_layout 转成 DotOperand(opIdx=0/1)、累加器 C 也 convert 到结果布局——这就是 TTGIR 里 tt.dot 周围那圈 convert_layout 胶水的来源。",
+          "numbers": [
+            {"value": "前:%14 = tt.dot,操作数 #blocked1(无 dot_op)", "provenance": "traces/dump_ir.json ttir_after_make_ttir"},
+            {"value": "后:A → %19 convert_layout 到 dot_op opIdx=0", "provenance": "traces/dump_ir.json ttgir_first_hop_only;pattern 见 TritonToTritonGPUPass.cpp:L258-L263"},
+            {"value": "后:B → %20 convert_layout 到 dot_op opIdx=1", "provenance": "traces/dump_ir.json ttgir_first_hop_only;pattern 见 TritonToTritonGPUPass.cpp:L266-L270"},
+            {"value": "后:C → %21 convert_layout 到结果布局 #blocked1", "provenance": "traces/dump_ir.json ttgir_first_hop_only;pattern 见 TritonToTritonGPUPass.cpp:L272"},
+            {"value": "后:%22 = tt.dot %19,%20,%21 结果 #blocked1(retSizePerThread=[1,1])", "provenance": "traces/dump_ir.json ttgir_first_hop_only;retSizePerThread 见 TritonToTritonGPUPass.cpp:L228-L237"}
+          ],
+          "caption_draft": "tt.dot 的『非法→合法』一步到位:三条 convert_layout(A/B/C)当场焊上,操作数被钉成 DotOperand。这批 convert_layout 正是后续 remove-layout-conversions 要消解的开销来源。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m8-rewrite-tensor-pointer",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch32-block-pointer-lowered",
+          "template": "before-after",
+          "claim": "block pointer 只活到 TTIR 级:追踪期还在的 tt.make_tensor_ptr,经 make_ttir 里的 RewriteTensorPointer 被降解成显式指针张量算术(splat/make_range/expand_dims/broadcast/addptr),TTGIR 里再也见不到它——回扣 ch07。",
+          "numbers": [
+            {"value": "追踪期:3 个 tt.make_tensor_ptr(A/B/C 各一)在场", "provenance": "traces/dump_ir.json traced_ttir(%2/%5/%11 = tt.make_tensor_ptr)"},
+            {"value": "make_ttir 之后:0 个 tt.make_tensor_ptr,换成 splat+expand_dims+broadcast+addptr", "provenance": "traces/dump_ir.json ttir_after_make_ttir(driver 断言 'make_tensor_ptr' not in ttir 为 True)"},
+            {"value": "降解实现:make_tensor_ptr 拆成 base+shape+strides+i64 offsets 存表,原 op 压入 eraser", "provenance": "lib/Dialect/Triton/Transforms/RewriteTensorPointer.cpp:L227-L250 rewriteMakeTensorPtrOp"}
+          ],
+          "caption_draft": "block pointer 是给前端/边界检查用的高层抽象,降到 TTGIR 前就被拆成显式指针算术——所以后端只需处理一种寻址形式。想在 IR 里看它,得在第一段 make_ttir 之前 dump。"
+        }
+      ]
+    }
+  ]
+}
