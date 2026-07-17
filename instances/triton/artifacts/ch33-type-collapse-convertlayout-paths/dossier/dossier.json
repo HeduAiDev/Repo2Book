@@ -1,0 +1,171 @@
+{
+  "chapter": "ch33",
+  "title": "第二跳的地基：类型塌缩与 ConvertLayoutOp 的三条搬运路径",
+  "kind": "skip_impl",
+  "note": "码章（内嵌真 C++ 逐段讲，无 subtract-only 精简版）。可运行交叉验证由 pin 精确编译承担：pip install triton==3.2.0 headless dump 一段带 convert_layout 的 kernel 的 make_llir，观测张量塌成 LLVM struct、convert_layout 走哪条路径。本章无伏笔埋/回收。",
+
+  "code_spine": [
+    "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp:L85-L200  —— ConvertTritonGPUToLLVM::runOnOperation：整个 TTGIR→LLVM 脊柱的入口。建 TargetInfo/TypeConverter → membar → 两阶段 applyPartialConversion（先 func 后 ops）→ 按 PatternBenefit 拼几十个 populate*Patterns",
+    "lib/Conversion/TritonGPUToLLVM/TypeConverter.cpp:L18-L46  —— TritonGPUToLLVMTypeConverter 构造：注册各 Triton 类型的塌缩规则（addConversion）",
+    "lib/Conversion/TritonGPUToLLVM/TypeConverter.cpp:L90-L134  —— convertTritonTensorType / convertMemDescType：分布式张量→struct-of-N-elements；shared/memdesc→{ptr, offsets, strides}",
+    "lib/Analysis/Utility.cpp:L649-L705  —— minimalCvtLayout：dst⁻¹∘src 后按 block→warp→lane→register 逐维相除取最小转换；cvtReordersRegisters / cvtNeedsWarpShuffle / cvtNeedsSharedMemory 三个判据",
+    "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp:L277-L329  —— ConvertLayoutOpUsingLinearLayoutsConversion::matchAndRewrite：本章核心——据最小转换里哪一维参与，选四条路径之一",
+    "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp:L331-L351  —— transferWithinThread：纯寄存器重排（同线程，零跨线程流量）",
+    "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp:L353-L470  —— transferWithinBlock：共享内存往返（invertAndCompose 给精确 shmem 地址、stmatrix 快路径）",
+    "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp:L472-L650  —— transferWithinBlockImpl：store→barrier→load 主循环 + padding 防 bank 冲突",
+    "lib/Analysis/Allocation.cpp:L113-L167  —— getScratchConfigForCvt：往返 scratch 的 repShape / inVec / outVec / paddedRepShape（padding 加在 outOrd[0]）",
+    "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp:L28-L233  —— 并存的 legacy Blocked/Mma 路径：ConvertLayoutOpConversion + processReplica + lowerDistributedToDistributed（LinearLayout 统一路径迁移期两路共存）"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "lib/Conversion/TritonGPUToLLVM/TypeConverter.cpp",
+      "lines": "L18-L46",
+      "code": "TritonGPUToLLVMTypeConverter::TritonGPUToLLVMTypeConverter(\n    MLIRContext *ctx, LowerToLLVMOptions &option,\n    const TargetInfoBase &targetInfo, const DataLayoutAnalysis *analysis)\n    : LLVMTypeConverter(ctx, option, analysis) {\n  addConversion([&](triton::PointerType type) -> std::optional<Type> {\n    return convertTritonPointerType(type);\n  });\n  addConversion([&](RankedTensorType type) -> std::optional<Type> {\n    return convertTritonTensorType(type, targetInfo);\n  });\n  addConversion([&](MemDescType type) -> std::optional<Type> {\n    return convertMemDescType(type, targetInfo);\n  });\n  addConversion([&](triton::gpu::AsyncTokenType type) -> std::optional<Type> {\n    return convertAsyncToken(type);\n  });\n  addConversion([&](mlir::Float8E4M3FNUZType type) -> std::optional<Type> {\n    return IntegerType::get(type.getContext(), 8);\n  });\n  addConversion([&](mlir::Float8E4M3FNType type) -> std::optional<Type> {\n    return IntegerType::get(type.getContext(), 8);\n  });\n  addConversion([&](mlir::Float8E5M2Type type) -> std::optional<Type> {\n    return IntegerType::get(type.getContext(), 8);\n  });\n  addConversion([&](mlir::Float8E5M2FNUZType type) -> std::optional<Type> {\n    return IntegerType::get(type.getContext(), 8);\n  });\n}",
+      "elide": ["其余 addConversion（AsyncToken→i32）与 fp8 四种编码逐条同构；讲清一种 fp8→i8 即可，四条只是不同 fp8 编码名"]
+    },
+    {
+      "path": "lib/Conversion/TritonGPUToLLVM/TypeConverter.cpp",
+      "lines": "L90-L134",
+      "code": "Type TritonGPUToLLVMTypeConverter::convertTritonTensorType(\n    RankedTensorType type, const TargetInfoBase &targetInfo) {\n  auto ctx = type.getContext();\n  Attribute layout = type.getEncoding();\n  SmallVector<int64_t> shape(type.getShape().begin(), type.getShape().end());\n  Type eltType = getElementTypeForStruct(cast<TensorOrMemDesc>(type));\n\n  if (auto shared_layout = mlir::dyn_cast<SharedEncodingAttr>(layout)) {\n    SmallVector<Type, 4> types;\n    // base ptr\n    auto ptrType =\n        LLVM::LLVMPointerType::get(ctx, targetInfo.getSharedAddressSpace());\n    types.push_back(ptrType);\n    // shape dims\n    auto rank = type.getRank();\n    // offsets + strides\n    for (auto i = 0; i < rank * 2; i++) {\n      types.push_back(IntegerType::get(ctx, 32));\n    }\n    return LLVM::LLVMStructType::getLiteral(ctx, types);\n  }\n\n  unsigned numElementsPerThread = getTotalElemsPerThread(type);\n  SmallVector<Type, 4> types(numElementsPerThread, eltType);\n  return LLVM::LLVMStructType::getLiteral(ctx, types);\n}\n\nType TritonGPUToLLVMTypeConverter::convertMemDescType(\n    MemDescType type, const TargetInfoBase &targetInfo) {\n  auto ctx = type.getContext();\n  Attribute layout = type.getEncoding();\n  SmallVector<int64_t> shape(type.getShape().begin(), type.getShape().end());\n  SmallVector<Type, 4> types;\n  // base ptr\n  auto ptrType =\n      LLVM::LLVMPointerType::get(ctx, targetInfo.getSharedAddressSpace());\n  types.push_back(ptrType);\n  // shape dims\n  auto rank = type.getShape().size();\n  // offsets + strides\n  for (auto i = 0; i < rank * 2; i++) {\n    types.push_back(IntegerType::get(ctx, 32));\n  }\n  return LLVM::LLVMStructType::getLiteral(ctx, types);\n}",
+      "elide": ["getElementTypeForStruct 的 DotOperand/Ampere kWidth 特判（bitwidth<=32 时打包成 i32）——只在 Ampere dot operand 才走，讲主干时可略"]
+    },
+    {
+      "path": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp",
+      "lines": "L89-L139",
+      "code": "    mlir::LowerToLLVMOptions option(context);\n    option.overrideIndexBitwidth(32);\n    TargetInfo targetInfo(computeCapability, ptxVersion);\n    TritonGPUToLLVMTypeConverter typeConverter(context, option, targetInfo);\n    TritonLLVMConversionTarget convTarget(*context);\n    int numWarps = triton::gpu::TritonGPUDialect::getNumWarps(mod);\n    int numCTAs = triton::gpu::TritonGPUDialect::getNumCTAs(mod);\n    int threadsPerWarp = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);\n\n    // ... num-warp-groups hack ...\n\n    // Allocate shared memory and set barrier\n    ModuleAllocation allocation(mod);\n    ModuleMembarAnalysis membarPass(&allocation, NVIDIA::canSkipBarSync);\n    membarPass.run();\n\n    // Lower functions\n    {\n      mlir::LowerToLLVMOptions option(context);\n      TritonGPUToLLVMTypeConverter typeConverter(context, option, targetInfo);\n      TritonLLVMFunctionConversionTarget funcTarget(*context);\n      RewritePatternSet funcPatterns(context);\n      mlir::triton::populateFuncOpConversionPattern(typeConverter, funcPatterns,\n                                                    numWarps, targetInfo,\n                                                    patternBenefitDefault);\n      mlir::cf::populateControlFlowToLLVMConversionPatterns(typeConverter,\n                                                            funcPatterns);\n      if (failed(\n              applyPartialConversion(mod, funcTarget, std::move(funcPatterns))))\n        return signalPassFailure();\n    }\n\n    // initSharedMemory is run before the conversion of call and ret ops,\n    // because the call op has to know the shared memory base address of each\n    // function\n    initSharedMemory(typeConverter);\n    ModuleAxisInfoAnalysis axisInfoAnalysis(mod);\n    OpBuilder::InsertPoint indexInsertPoint;\n\n    RewritePatternSet patterns(context);\n    int benefit = patternBenefitPrioritizeOverLLVMConversions;\n    mlir::triton::NVIDIA::populateConvertLayoutOpToLLVMOptimizedPatterns(\n        typeConverter, targetInfo, patterns,\n        patternBenefitConvertLayoutOptimizedPattern);\n    mlir::triton::NVIDIA::populateConvertLayoutOpToLLVMPatterns(\n        typeConverter, targetInfo, patterns, benefit);",
+      "elide": ["num-warp-groups-per-cta 的 WSLowering hack（L98-L104）只调整 numWarps；populate* 列表在此后还有几十行（dot/elementwise/load-store/reduce/...），结构同构，讲清『按 PatternBenefit 排序把几十个 populate*Patterns 拼进同一 RewritePatternSet』即可，无需逐条抄"]
+    },
+    {
+      "path": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp",
+      "lines": "L187-L200",
+      "code": "    mlir::triton::populateRegReallocOpToLLVMPatterns(typeConverter, patterns,\n                                                     benefit);\n    if (failed(applyPartialConversion(mod, convTarget, std::move(patterns))))\n      return signalPassFailure();\n\n    // Fold CTAId when there is only 1 CTA.\n    if (numCTAs == 1) {\n      mod.walk([](triton::nvgpu::ClusterCTAIdOp id) {\n        OpBuilder b(id);\n        Value zero = LLVM::createConstantI32(id->getLoc(), b, 0);\n        id.replaceAllUsesWith(zero);\n      });\n    }",
+      "elide": []
+    },
+    {
+      "path": "lib/Analysis/Utility.cpp",
+      "lines": "L643-L705",
+      "code": "// We get the smallest submap of srcTy^{-1} * dstTy that is not the identity\n// under kBlock, kWarp or kLane (in that order). The idea here is that if we\n// have a transformation that's the identity on kBlock, we don't need to use\n// distributed shared memory. If it's also the identity on kWarp, we can\n// transfer via warp-shuffles, and if it's the identity on kLane just have to\n// reorder the registers\nstd::optional<LinearLayout> minimalCvtLayout(RankedTensorType srcTy,\n                                             RankedTensorType dstTy) {\n  MLIRContext *ctx = srcTy.getContext();\n  std::optional<LinearLayout> srcLayout =\n      toLinearLayout(srcTy.getShape(), srcTy.getEncoding());\n  std::optional<LinearLayout> dstLayout =\n      toLinearLayout(dstTy.getShape(), dstTy.getEncoding());\n  if (!(srcLayout.has_value() && dstLayout.has_value()))\n    return std::nullopt;\n  // comp describes the layout function to create dst from src.\n  LinearLayout comp = dstLayout->invertAndCompose(*srcLayout);\n  // We try to quotient by the largest subspace first\n  auto dims = SmallVector<StringRef>{\"block\", \"warp\", \"lane\", \"register\"};\n  for (auto dim : dims) {\n    auto quotient = comp.quotient(StringAttr::get(ctx, dim));\n    if (!quotient.has_value()) {\n      break;\n    }\n    comp = *quotient;\n  }\n  return comp;\n}\n\nbool cvtReordersRegisters(RankedTensorType srcTy, RankedTensorType dstTy) {\n  auto layout = minimalCvtLayout(srcTy, dstTy);\n  MLIRContext *ctx = srcTy.getContext();\n  if (!layout.has_value()) {\n    return false;\n  }\n  auto kRegister = StringAttr::get(ctx, \"register\");\n  auto outDims = llvm::to_vector(layout->getOutDimNames());\n  return outDims.empty() || ArrayRef(outDims) == ArrayRef({kRegister});\n}",
+      "elide": ["cvtNeedsWarpShuffle（判据=最小转换 outDims 恰为 {register,lane}）与 cvtNeedsSharedMemory（=不是纯寄存器重排且不是三种 dot shortcut）紧随其后，结构对称，正文可概括"]
+    },
+    {
+      "path": "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp",
+      "lines": "L277-L329",
+      "code": "  LogicalResult\n  matchAndRewrite(ConvertLayoutOp op, OpAdaptor adaptor,\n                  ConversionPatternRewriter &rewriter) const override {\n    MLIRContext *ctx = op.getContext();\n\n    const auto &shape = op.getType().getShape();\n    auto srcTy = op.getSrc().getType();\n    auto dstTy = op.getType();\n\n    auto conversion = minimalCvtLayout(srcTy, dstTy);\n    if (!conversion.has_value()) {\n      return rewriter.notifyMatchFailure(\n          op, \"NYI. srcTy and/or dstTy don't implement LLs yet\");\n    }\n\n    assert(to_vector(conversion->getInDimNames()) ==\n           to_vector(conversion->getOutDimNames()));\n    auto dims = conversion->getInDimNames();\n    if (llvm::is_contained(dims, str_attr(\"block\"))) {\n      // Case 1: Transfer between values in different CTAs.\n      //          This requires moving values through distributed shared memory.\n      return rewriter.notifyMatchFailure(\n          op, \"NYI: Transfer between different CTAs\");\n    } else if (llvm::is_contained(dims, str_attr(\"warp\"))) {\n      // Case 2: Transfer between values in the same CTA, in which case we move\n      //         values through shared memory.\n      LinearLayout srcLayout =\n          *toLinearLayout(srcTy.getShape(), srcTy.getEncoding());\n      LinearLayout dstLayout =\n          *toLinearLayout(dstTy.getShape(), dstTy.getEncoding());\n      return transferWithinBlock(op, srcLayout, dstLayout, adaptor, rewriter);\n    } else if (llvm::is_contained(dims, str_attr(\"lane\"))) {\n      // Case 3. Transfer between values in the same warp, in which case we try\n      //         to move values using warp shuffles, though if the pattern is\n      //         complicated enough we may fall back to using shared memory\n      // TODO(Keren): implement warp shuffle instead of using the general\n      // approach that uses shared memory\n      LinearLayout srcLayout =\n          *toLinearLayout(srcTy.getShape(), srcTy.getEncoding());\n      LinearLayout dstLayout =\n          *toLinearLayout(dstTy.getShape(), dstTy.getEncoding());\n      return transferWithinBlock(op, srcLayout, dstLayout, adaptor, rewriter);\n    } else if (llvm::is_contained(dims, str_attr(\"register\"))) {\n      // Case 4. Transfer between values in the same thread, in which case we\n      //         simply reorder the elements of adaptor.getSrc().\n      return transferWithinThread(op, *conversion, adaptor, rewriter);\n    } else {\n      // The two layouts are equivalent. We should probably remove these in\n      // RemoveLayoutConversion.\n      rewriter.replaceOp(op, adaptor.getSrc());\n      return success();\n    }\n  }",
+      "elide": ["注意：源码里 block 分支是『最贵』（跨 CTA 分布式 shmem，v3.2.0 仍 NYI），warp/lane 都落到 transferWithinBlock（共享内存往返），register 落 transferWithinThread（纯寄存器重排）。lane→warp shuffle 的专用实现 TODO 未做，故 lane 也暂走 shmem"]
+    },
+    {
+      "path": "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp",
+      "lines": "L331-L351",
+      "code": "  LogicalResult\n  transferWithinThread(ConvertLayoutOp op, const LinearLayout &conversion,\n                       OpAdaptor adaptor,\n                       ConversionPatternRewriter &rewriter) const {\n    MLIRContext *ctx = op.getContext();\n    auto loc = op.getLoc();\n    StringAttr kRegister = str_attr(\"register\");\n    assert(!cvtNeedsSharedMemory(op.getSrc().getType(), op.getType()));\n\n    auto inVals = unpackLLElements(loc, adaptor.getSrc(), rewriter);\n    SmallVector<Value> outVals;\n    outVals.resize(conversion.getInDimSize(kRegister));\n    for (int i = 0; i < conversion.getInDimSize(kRegister); i++) {\n      auto srcIdx = conversion.apply({{kRegister, i}}).begin()->second;\n      outVals[i] = inVals[srcIdx];\n    }\n    Value result = packLLElements(loc, getTypeConverter(), outVals, rewriter,\n                                  op.getType());\n    rewriter.replaceOp(op, result);\n    return success();\n  }",
+      "elide": []
+    },
+    {
+      "path": "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp",
+      "lines": "L492-L523",
+      "code": "    auto scratchConfig =\n        getScratchConfigForCvt(op.getSrc().getType(), op.getType());\n    auto tensorShapePerCTA = convertType<unsigned, int64_t>(getShapePerCTA(\n        op.getSrc().getType().getEncoding(), op.getType().getShape()));\n    // Input dims: [offset, iteration, block]\n    // Output dims: dimN-1, dimN-2, ..., dim0, where N is obtained from repShape\n    LinearLayout sharedLayout = chooseShemLayoutForRegToRegConversion(\n        ctx, tensorShapePerCTA, scratchConfig.repShape, scratchConfig.order);\n\n    // Layout for the store from registers to shared memory.\n    //\n    // Note: If two threads in the same warp write to the same shmem offset, the\n    // hardware resolves that without a stall or a bank conflict.  Therefore we\n    // don't need to avoid duplicate writes.\n    // Input dims: [reg, lane, warp]\n    // Output dims: [offset, iteration]\n    std::optional<LinearLayout> shmemStoreLayout =\n        chooseStMatrixLayout(ctx, op.getSrc().getType(), scratchConfig.repShape,\n                             scratchConfig.paddedRepShape, scratchConfig.order,\n                             /*swizzleByteSize=*/0);\n    bool isStMatrix = shmemStoreLayout.has_value();\n    if (!isStMatrix) {\n      shmemStoreLayout = srcLayout.invertAndCompose(sharedLayout);\n    }\n    assert(shmemStoreLayout.has_value());\n\n    // ...\n\n    // Layout for the load from shmem to registers.\n    LinearLayout shmemLoadLayout = dstLayout.invertAndCompose(sharedLayout);",
+      "elide": ["中间的 shmemAllocatedNumElems 断言（L518-L520）确认 store layout 的 offset 维不超分配；讲主干时略。核心两句：store 端 srcLayout.invertAndCompose(sharedLayout)、load 端 dstLayout.invertAndCompose(sharedLayout)——都用 ch23 的 invertAndCompose 求出每个寄存器落到哪个 shmem 偏移"]
+    },
+    {
+      "path": "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp",
+      "lines": "L606-L644",
+      "code": "    for (int i = 0; i < iterations; i++) {\n      if (i != 0)\n        insertBarrier(rewriter, op);\n\n      auto &inRegs = inRegsForIter[i];\n      auto &outRegs = outRegsForIter[i];\n\n      // When using `stmatrix`, we can store `inVec` elements even if they are\n      // not contiguous\n      auto inVec = isStMatrix ? shmemStoreLayout->getNumConsecutiveInOut()\n                              : scratchConfig.inVec;\n      for (int j = 0; j < inVals.size() / iterations; j += inVec) {\n        auto inRegSlice = inRegs[j];\n        Value vecAddr = getVecAddr(*shmemStoreLayout, storeBase, inRegSlice);\n        SmallVector<Value> inValsVec;\n        for (int k = 0; k < inVec; k++)\n          inValsVec.push_back(inVals[inRegSlice + k]);\n        Value valsVec = packLLVector(loc, inValsVec, rewriter);\n        if (isStMatrix) {\n          targetInfo.storeMatrixShared(rewriter, loc, vecAddr, valsVec);\n        } else {\n          targetInfo.storeDShared(rewriter, loc, vecAddr, std::nullopt, valsVec,\n                                  /*pred=*/true_val());\n        }\n      }\n\n      insertBarrier(rewriter, op);\n\n      for (int j = 0; j < outSize / iterations; j += scratchConfig.outVec) {\n        auto outRegSlice = outRegs[j];\n        auto vecAddr = getVecAddr(shmemLoadLayout, loadBase, outRegSlice);\n        Value valsVec =\n            targetInfo.loadDShared(rewriter, loc, vecAddr, std::nullopt,\n                                   vec_ty(elemTy, scratchConfig.outVec),\n                                   /*pred=*/true_val());\n        for (Value v : unpackLLVector(loc, valsVec, rewriter))\n          outVals[outRegSlice++] = v;\n      }\n    }",
+      "elide": ["getVecAddr 内的 padding 位运算（xor regBase^regIdx 后按 paddedStride/paddedSize 做 shl(lshr(...)) 加偏移）实现 bank 冲突避免——是往返最贵路径里那道『store—barrier—load』的中枢：每次迭代先各线程 store 到 shmem、insertBarrier 同步、再按 dst 布局 load 回寄存器，stmatrix 命中时 store 走 st.matrix 快路径"]
+    },
+    {
+      "path": "lib/Analysis/Allocation.cpp",
+      "lines": "L159-L166",
+      "code": "  // No padding is required if the tensor is 1-D, or if all dimensions except\n  // the first accessed dimension have a size of 1.\n  if (rank <= 1 || product(repShape) == repShape[outOrd[0]])\n    return scratchConfig;\n\n  auto paddedSize = std::max(scratchConfig.inVec, scratchConfig.outVec);\n  scratchConfig.paddedRepShape[outOrd[0]] += paddedSize;\n  return scratchConfig;",
+      "elide": ["前半段（L134-L157）算 inVec/outVec 向量宽度与 MmaV1/blocked 特判；核心：往返 scratch 在最内访问维 outOrd[0] 上加 paddedSize 宽度，错开 bank 起始，防 store/load 撞同一 bank"]
+    },
+    {
+      "path": "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp",
+      "lines": "L28-L61",
+      "code": "// XXX(Keren): A temporary knob to control the use of legacy MMA conversion\n// because LinearLayout seems to have some performance issues.\nconstexpr bool useLegacyMMAConversion = false;\n\nstruct ConvertLayoutOpConversion\n    : public ConvertOpToLLVMPattern<ConvertLayoutOp> {\npublic:\n  ConvertLayoutOpConversion(LLVMTypeConverter &typeConverter,\n                            const TargetInfoBase &targetInfo,\n                            PatternBenefit benefit = 1)\n      : ConvertOpToLLVMPattern(typeConverter, benefit), targetInfo(targetInfo) {\n  }\n\n  LogicalResult\n  matchAndRewrite(ConvertLayoutOp op, OpAdaptor adaptor,\n                  ConversionPatternRewriter &rewriter) const override {\n    RankedTensorType srcTy = op.getSrc().getType();\n    RankedTensorType dstTy = op.getType();\n    Attribute srcLayout = srcTy.getEncoding();\n    Attribute dstLayout = dstTy.getEncoding();\n    if (isSupported(srcLayout, dstLayout)) {\n      return lowerDistributedToDistributed(op, adaptor, rewriter, targetInfo);\n    }\n    return failure();\n  }\n\nprivate:\n  bool isSupported(Attribute srcLayout, Attribute dstLayout) const {\n    return isa<BlockedEncodingAttr, MmaEncodingTrait, SliceEncodingAttr>(\n               srcLayout) &&\n           isa<BlockedEncodingAttr, MmaEncodingTrait, SliceEncodingAttr>(\n               dstLayout) &&\n           !isLayoutMmaV1(srcLayout) && !isLayoutMmaV1(dstLayout);\n  }",
+      "elide": ["legacy 路径的实现主体 processReplica（按 CTA-tile 复制、padding shmem 读写）+ lowerDistributedToDistributed（L148-L229）与新 LL 路径殊途同归、结构更繁琐；此处只需读者知道：benefit=2 的 LL 路径优先命中，legacy（benefit=1）仅作后备，两路共存是 [Dot LL] 迁移期状态"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "TritonGPUToLLVMTypeConverter", "file": "lib/Conversion/TritonGPUToLLVM/TypeConverter.cpp", "responsibility": "类型塌缩规则表：继承 MLIR 的 LLVMTypeConverter，addConversion 注册『带布局张量→LLVM struct-of-N-elements』『shared/memdesc→{ptr,offsets,strides} struct』『fp8→i8』『PointerType→带 shape/stride 的 struct』。TargetInfo 由构造参数注入（换后端只换 TargetInfoBase）"},
+    {"name": "ConvertTritonGPUToLLVM", "file": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp", "responsibility": "TTGIR→LLVM 整趟 pass。runOnOperation 建 TypeConverter/两个 ConversionTarget→membar→两阶段 applyPartialConversion（先 func 后 ops）→按 PatternBenefit 拼几十个 populate*Patterns"},
+    {"name": "ConvertLayoutOpUsingLinearLayoutsConversion", "file": "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp", "responsibility": "本章核心 pattern（benefit=2 优先）：用 minimalCvtLayout 求最小转换，据 block/warp/lane/register 哪维参与选四条路径；含 transferWithinThread（纯寄存器）与 transferWithinBlock/Impl（共享内存往返）"},
+    {"name": "ConvertLayoutOpConversion", "file": "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp", "responsibility": "并存的 legacy Blocked/Mma 路径（benefit=1 后备）：processReplica + lowerDistributedToDistributed，按 CTA-tile 手工做 padding shmem 读写。LinearLayout 统一路径正取代它（FIXME [Dot LL]），迁移期两路共存"},
+    {"name": "minimalCvtLayout", "file": "lib/Analysis/Utility.cpp", "responsibility": "选路依据：算 dstLayout.invertAndCompose(srcLayout) 得转换映射，按 block→warp→lane→register 顺序逐维 quotient（相除）取最小非恒等子映射。剩下参与的最大维决定代价档位"},
+    {"name": "getScratchConfigForCvt", "file": "lib/Analysis/Allocation.cpp", "responsibility": "为往返 scratch 定 repShape/inVec/outVec/order，并在最内访问维 outOrd[0] 上加 paddedSize，错开 shared memory bank 防冲突"}
+  ],
+
+  "data_flow": [
+    "1. 入口 ConvertTritonGPUToLLVM::runOnOperation：建 TargetInfo(computeCapability,ptxVersion) → TritonGPUToLLVMTypeConverter（把塌缩规则注册进去）→ 两个 ConversionTarget（func 版把 LLVM/NVVM/Index 设 legal；ops 版把 Triton/TritonGPU/GPU 三方言设 illegal，逼其全部下译）",
+    "2. ModuleAllocation + ModuleMembarAnalysis：先算好每个 convert_layout/reduce 等要用的 scratch shmem 与 barrier",
+    "3. 第一阶段 applyPartialConversion（func 先行）：populateFuncOpConversionPattern 把函数签名里的张量参数按 TypeConverter 塌成 struct，再 initSharedMemory 建 global_smem——call op 需要先知道各函数 shmem 基址",
+    "4. 第二阶段 applyPartialConversion（ops）：把几十个 populate*Patterns（convert_layout / dot / elementwise / load-store / reduce / ...）按各自 PatternBenefit 塞进一个 RewritePatternSet，一趟贪心改写。benefit 高者先试",
+    "5. 类型塌缩在改写中随每个 Value 发生：RankedTensorType(带 Blocked/Mma/Slice 布局)→ LLVMStructType，元素个数=getTotalElemsPerThread（每线程持有的元素摊平）；SharedEncoding/MemDesc→ {ptr, 2×rank 个 i32 offsets/strides}；fp8→i8",
+    "6. convert_layout 命中 ConvertLayoutOpUsingLinearLayoutsConversion（benefit 更高）：minimalCvtLayout(src,dst) 得最小转换 → 看剩下哪一维",
+    "7a. 只 register 维 → transferWithinThread：unpack 源 struct，按 conversion.apply({register:i}) 重排到 outVals，pack 回 dst struct。零跨线程流量、零 shmem、零 barrier——最便宜",
+    "7b. lane 维（当前 warp shuffle 未实现，落 shmem）/ warp 维 → transferWithinBlock：invertAndCompose(sharedLayout) 算每寄存器落到的精确 shmem 偏移 → store→barrier→load 往返，padding 防 bank 冲突，stmatrix 命中走 st.matrix 快路径——最贵",
+    "7c. block 维（跨 CTA）→ v3.2.0 仍 NYI（notifyMatchFailure）",
+    "8. 若 LL 路径 notifyMatchFailure，退到 legacy ConvertLayoutOpConversion（benefit=1）做同样的 padding shmem 往返"
+  ],
+
+  "design_decisions": [
+    {"decision": "带布局张量塌成 LLVM struct-of-N-elements（每线程持有的元素摊平成结构体字段），而非塌成一个数组/向量", "why": "TTGIR 的分布式布局本就是『哪个元素归哪个线程的哪个寄存器』的规约；塌成定长 struct 后每个字段恰好映射一个线程私有寄存器，后续 pattern 直接 unpack/pack 逐元素操作", "evidence": "lib/Conversion/TritonGPUToLLVM/TypeConverter.cpp:L112-L114"},
+    {"decision": "shared/memdesc 张量塌成 {ptr, offsets…, strides…} 而非 struct-of-N", "why": "shared 内存是全 warp/block 共享的一块，没有『每线程持有几个元素』的语义，只需基址+每维 offset/stride 即可寻址", "evidence": "lib/Conversion/TritonGPUToLLVM/TypeConverter.cpp:L97-L110"},
+    {"decision": "convert_layout 用 minimalCvtLayout 按 block→warp→lane→register 逐维相除，据剩余最大参与维选路", "why": "转换若在某维是恒等就不必付该维的搬运代价——block 恒等免分布式 shmem、warp 恒等可退到 warp shuffle、lane 恒等只需重排寄存器。相除（quotient）正是消掉恒等维、留下真正要动的维", "evidence": "lib/Analysis/Utility.cpp:L643-L668"},
+    {"decision": "三条路径代价严格递增：纯寄存器重排（同线程零流量）< warp shuffle（warp 内洗牌）< 共享内存往返（store+barrier+load，最贵）", "why": "跨线程数据搬运量决定代价：register 档不跨线程；lane 档在 warp 内用 shuffle 寄存器互换；warp/block 档必须落地 shared memory 再取回，还要 barrier 同步。这是读 dump 找优化点的判据——出现走 shmem 往返的 convert_layout 就是明确优化目标", "evidence": "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp:L295-L322"},
+    {"decision": "store 端用 srcLayout.invertAndCompose(sharedLayout)、load 端用 dstLayout.invertAndCompose(sharedLayout) 给出精确 shmem 地址", "why": "invertAndCompose（见第 23 章）把『寄存器→源布局坐标』与『shmem 布局→坐标』复合，直接得到每个寄存器该写/读的 shmem 偏移，无需手工推坐标", "evidence": "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp:L514-L523"},
+    {"decision": "往返 scratch 在最内访问维 outOrd[0] 上加 padding；命中条件时走 stmatrix 快路径", "why": "padding 错开 bank 起始，避免 store/load 撞同一 shared memory bank（见第 26 章 bank 冲突）；stmatrix（st.matrix PTX）一条指令按 warp 协作写 8×8 矩阵块，比逐元素 storeDShared 快", "evidence": "lib/Analysis/Allocation.cpp:L164-L165, lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp:L508-L512"},
+    {"decision": "LinearLayout 统一路径（benefit=2）与 legacy Blocked/Mma 路径（benefit=1）并存，useLegacyMMAConversion=false", "why": "LinearLayout 相除选路是新的统一机制，正取代旧的『按布局类型 if-else 分支』的 processReplica 路径；但迁移未完（FIXME [Dot LL]、部分 dot operand/AMD MFMA 尚未覆盖），故保留 legacy 作 benefit 更低的后备，LL 路 notifyMatchFailure 时兜底", "evidence": "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp:L28-L30, L269-L275, L685-L696"},
+    {"decision": "两阶段 applyPartialConversion：先转 func（+initSharedMemory）再转 ops", "why": "call op 下译时要知道被调函数的 shmem 基址，故必须先把函数签名塌好、global_smem 建好，再转函数体内的 op", "evidence": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp:L110-L129"},
+    {"decision": "TargetInfo 由 TypeConverter/pattern 构造参数注入（getSharedAddressSpace、storeMatrixShared、loadDShared 等经它）", "why": "后端接缝：NVIDIA/AMD 只需换 TargetInfoBase 实现，塌缩与选路的主干代码不变（姊妹篇换 target 一句点到）", "evidence": "lib/Conversion/TritonGPUToLLVM/TypeConverter.cpp:L18-L27, L100-L101"}
+  ],
+
+  "theory": [
+    "选路代数（回指第 23 章，本章只用不推）：minimalCvtLayout 先算 comp = dstLayout.invertAndCompose(srcLayout)（GF(2) 上的 RREF 求逆再复合），再对 dims=[block,warp,lane,register] 依次 quotient——quotient 成功表示该维上转换是恒等、可整除消去。第一个不能整除的维即『真正要跨的最细粒度』，决定代价档位。",
+    "代价排序量化：设 convert 涉及 T 个元素/线程。纯寄存器重排=0 次跨线程搬运、0 barrier；warp shuffle≈O(log2 参与 lane 数) 次 shfl；共享内存往返=T 次 store + 1 barrier + T 次 load（每 iteration），且受 shared memory 带宽与 bank 冲突制约。故 dump 中每个走 transferWithinBlock 的 convert_layout 都值得回看能否经 RemoveLayoutConversions（见第 28 章）消除或改成寄存器/shuffle 档。",
+    "struct-of-N 的 N：N=getTotalElemsPerThread(type)，由布局的 sizePerThread×每线程负责的 CTA-tile 数决定。塌缩后 LLVM 层不再有『张量』概念，只剩每线程 N 个标量寄存器——这是 TTGIR 布局语义在 LLVM 上的物化。",
+    "padding 防 bank 冲突（回指第 26 章）：shared memory 32 个 bank，连续 4 字节落连续 bank。若 store/load 沿最内维步长恰为 32 的倍数会全撞 bank 0。往返在 outOrd[0] 维加 paddedSize=max(inVec,outVec) 宽度错开，getVecAddr 里 shl(lshr(offset,log2 paddedStride),log2 paddedSize)+offset 把该 padding 折进地址。",
+    "pin v3.2.0 取证配方（可运行交叉验证）：pip install triton==3.2.0（与 pin 逐字节同、headless 无 GPU 可编），写一段会产生 convert_layout 的 kernel（如 blocked→mma 或经 tl.trans/reduce 引入布局变换），设 TRITON_KERNEL_DUMP=1 或直接调编译栈观测 stages：ttir→ttgir→llir（make_llir 即调 createConvertTritonGPUToLLVMPass）。在 ttgir 找 convert_layout op、看其 src/dst encoding；在 llir 里观测张量塌成 struct（!llvm.struct<(f32, f32, ...)>）、convert_layout 展开成纯寄存器重排 / warp shuffle / 还是 st.shared+barrier+ld.shared 往返，据此判档位。标 IR 阶段：ttgir=选路输入，llir=塌缩+选路结果。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [],
+    "must_keep": [
+      {"symbol": "TritonGPUToLLVMTypeConverter", "why": "类型塌缩的规则表，本章 stakes 前半；writer 必须讲它如何 addConversion"},
+      {"symbol": "convertTritonTensorType", "why": "分布式张量→struct-of-N-elements 的塌缩函数，核心机制"},
+      {"symbol": "convertMemDescType", "why": "shared/memdesc→{ptr,offsets,strides} 的塌缩，与前者对比"},
+      {"symbol": "getTotalElemsPerThread", "why": "决定 struct 字段数 N=每线程持有元素数，读者需理解 struct 宽度来源"},
+      {"symbol": "minimalCvtLayout", "why": "选路的唯一依据：相除取最小转换，本章核心判据"},
+      {"symbol": "invertAndCompose", "why": "shmem 地址与选路都靠它（回指第 23 章）；writer 需点出复用点"},
+      {"symbol": "ConvertLayoutOpUsingLinearLayoutsConversion", "why": "三条路径选路的主 pattern（benefit=2）"},
+      {"symbol": "transferWithinThread", "why": "纯寄存器重排路径——最便宜档"},
+      {"symbol": "transferWithinBlock", "why": "共享内存往返路径入口——最贵档，perf 命门"},
+      {"symbol": "transferWithinBlockImpl", "why": "往返的 store→barrier→load 主循环 + padding，读者需看到往返代价的具体来源"},
+      {"symbol": "chooseStMatrixLayout", "why": "stmatrix 快路径判定，往返路径的加速支路"},
+      {"symbol": "getScratchConfigForCvt", "why": "padding 防 bank 冲突的来源（回指第 26 章）"},
+      {"symbol": "cvtNeedsSharedMemory", "why": "『这个 convert 要不要落 shmem』的判据，perf 判据尺"},
+      {"symbol": "cvtReordersRegisters", "why": "『纯寄存器重排即可』的判据，最便宜档识别"},
+      {"symbol": "ConvertLayoutOpConversion", "why": "并存的 legacy Blocked/Mma 路径，须讲清两路为何共存"},
+      {"symbol": "useLegacyMMAConversion", "why": "控制 legacy vs LL 路径的 knob，迁移期状态的直接证据"},
+      {"symbol": "applyPartialConversion", "why": "两阶段（func→ops）转换的驱动，pass 脊柱"},
+      {"symbol": "PatternBenefit", "why": "几十个 populate*Patterns 的排序依据，benefit 高者先试"},
+      {"symbol": "storeDShared", "why": "往返 store 端 TargetInfo 接缝，后端可换点"},
+      {"symbol": "storeMatrixShared", "why": "stmatrix 快路径的 TargetInfo 落点"}
+    ]
+  },
+
+  "mechanisms": [
+    {"id": "type-collapse-tensor", "name": "带布局张量塌缩成 LLVM struct-of-N-elements", "kind": "dataflow", "source_anchors": ["lib/Conversion/TritonGPUToLLVM/TypeConverter.cpp:L90-L115", "lib/Conversion/TritonGPUToLLVM/TypeConverter.cpp:L18-L46"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "type-collapse-shared", "name": "shared/memdesc 塌成 {ptr,offsets,strides}、fp8→i8", "kind": "dataflow", "source_anchors": ["lib/Conversion/TritonGPUToLLVM/TypeConverter.cpp:L97-L110", "lib/Conversion/TritonGPUToLLVM/TypeConverter.cpp:L117-L134", "lib/Conversion/TritonGPUToLLVM/TypeConverter.cpp:L34-L45"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "pass-spine-two-phase", "name": "两阶段 applyPartialConversion + PatternBenefit 拼装（func 先于 ops，TargetInfo 注入）", "kind": "protocol", "source_anchors": ["third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp:L85-L190"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "cvt-path-selection", "name": "convert_layout 相除选路：block/warp/lane/register 哪维参与决定档位", "kind": "algorithm", "source_anchors": ["lib/Analysis/Utility.cpp:L649-L705", "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp:L277-L329"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "path-register-reorder", "name": "纯寄存器重排 transferWithinThread（同线程零流量，最便宜）", "kind": "algorithm", "source_anchors": ["lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp:L331-L351"], "needs_figure": false, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "path-shmem-roundtrip", "name": "共享内存往返 transferWithinBlock/Impl（invertAndCompose 定址、store→barrier→load、最贵）", "kind": "algorithm", "source_anchors": ["lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp:L353-L470", "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp:L492-L523", "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp:L606-L644"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "stmatrix-fastpath", "name": "chooseStMatrixLayout 走 st.matrix 快路径", "kind": "layout", "source_anchors": ["lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp:L508-L512", "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp:L613-L629"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "padding-bank-conflict", "name": "往返 scratch padding 防 bank 冲突（outOrd[0] 加宽）", "kind": "layout", "source_anchors": ["lib/Analysis/Allocation.cpp:L159-L166", "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp:L570-L590"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "cost-ordering-perf", "name": "三路代价排序落到 perf：读 dump 认出 shmem 往返=优化目标", "kind": "algorithm", "source_anchors": ["lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp:L295-L322", "lib/Analysis/Utility.cpp:L695-L705"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "legacy-ll-coexist", "name": "legacy Blocked/Mma 路径与 LinearLayout 统一路径两路共存（FIXME [Dot LL] 迁移期）", "kind": "config", "source_anchors": ["lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp:L28-L61", "lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp:L685-L696"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"}
+  ],
+
+  "foreshadow_due": {"埋": [], "回收": [], "note": "bible.py due ch33 返回空——本章无伏笔埋/回收，与章节计划一致"}
+}

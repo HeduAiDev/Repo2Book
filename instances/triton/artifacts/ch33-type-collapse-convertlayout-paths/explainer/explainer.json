@@ -1,0 +1,223 @@
+{
+  "chapter": "ch33",
+  "note": "kind=skip_impl，无精简版：所有 worked_example 走 trace_source=manual（见 explainer/traces/manual-derivations.md），引用源码常量的数字均标 file:Lxxx，自选小示例参数为构造值、内部自洽。规范路径去 instances/triton/source/ 前缀。",
+
+  "mechanisms": [
+    {
+      "mechanism_id": "type-collapse-tensor",
+      "intuition": "布局张量就像一张座位表——规定了每个元素坐在哪个线程的哪个寄存器上。塌缩就是把每个线程名下的座位摊平成一排固定格子（LLVM struct 字段）：从此 LLVM 层不再有『张量』这个整体，只剩每线程私有的 N 个标量寄存器。",
+      "worked_example": {
+        "params": {"type": "tensor<16x16xf32, #blocked>", "numWarps": 4, "threadsPerWarp": 32, "total_threads": 128, "total_elements": 256},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl 章无精简版；host 无 CUDA 且本机 triton 为 3.6.0 非 pin 3.2.0，dump 出的 IR 结构/行号会偏离本章所引源码，故手工推演。N 的公式 getTotalElemsPerThread 引自 TypeConverter.cpp:L112；小示例形状（16x16、4 warp）为构造值。",
+        "table": {
+          "columns": ["输入类型", "布局与线程数", "每线程元素 N", "LLVM 塌缩结果", "源码锚"],
+          "rows": [
+            ["tensor<16x16xf32, #blocked>", "Blocked / 4 warp × 32 = 128 线程", "256 / 128 = 2", "!llvm.struct<(f32, f32)>", "TypeConverter.cpp:L112-L114"],
+            ["同张量，改 numWarps=8", "Blocked / 8 warp × 32 = 256 线程", "256 / 256 = 1", "!llvm.struct<(f32)>", "TypeConverter.cpp:L112-L114"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "struct 字段数恒等于每线程持有的元素数 N=getTotalElemsPerThread(type)，塌缩守恒——不增不减元素，只把『张量整体视角』换成『线程私有视角』。",
+        "argument": "布局是元素到 (register, lane, warp, block) 坐标的双射，故每个张量元素恰归属唯一 (线程, 寄存器) 对；对固定线程枚举其 register 维即得字段序，字段数 = register 维大小 = getTotalElemsPerThread。总量守恒：线程数 × N ≡ 总元素数（本例 128×2 = 256 = 256×1，改 numWarps 后仍恒等）。"
+      },
+      "quantified": "16×16=256 元素 / 128 线程 = N=2 字段/线程 → !llvm.struct<(f32,f32)>；numWarps 翻倍到 8 → 256 线程 → N=1，总量 256 恒守恒。字段类型 f32 逐字段一份（TypeConverter.cpp:L113 的 SmallVector<Type>(N, eltType)）。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch33-type-collapse",
+          "template": "before-after",
+          "claim": "带 Blocked 布局的 16×16 f32 张量（256 元素 / 128 线程）塌成每线程 2 字段的 LLVM struct，字段数 N=getTotalElemsPerThread。",
+          "numbers": [
+            {"label": "总元素", "value": "256", "provenance": "16×16，构造示例形状"},
+            {"label": "线程数", "value": "128", "provenance": "numWarps=4 × threadsPerWarp=32，构造示例"},
+            {"label": "每线程字段 N", "value": "2", "provenance": "N=getTotalElemsPerThread=256/128；file:TypeConverter.cpp:L112-L114"},
+            {"label": "shared/memdesc 对照塌缩", "value": "{ptr} + rank×2 个 i32", "provenance": "file:TypeConverter.cpp:L97-L110"}
+          ],
+          "caption_draft": "左：TTGIR 里 tensor<16×16, #blocked> 是一整块带布局的张量；右：塌缩后每个线程只剩 N=2 个标量寄存器打包成 !llvm.struct<(f32,f32)>——LLVM 层不再有张量，布局语义物化成 struct 宽度。对照下方 shared 张量塌成 {ptr, offsets, strides}（无『每线程几个』语义）。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "type-collapse-shared",
+      "intuition": "shared 内存是全 warp/block 共享的一块黑板，没有『哪个元素归哪个线程』的说法，所以不塌成 struct-of-N，而塌成一张寻址便签：基址 + 每维 offset/stride。fp8 更朴素——LLVM 没有 fp8 算术类型，直接当成 i8 位袋子搬运，等真要算时再解释。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "pass-spine-two-phase",
+      "intuition": "整趟 TTGIR→LLVM 分两口气：先只把函数签名里的张量参数塌成 struct（并建好 global_smem），再转函数体里的每个 op——因为 call op 下译时必须先知道被调函数的共享内存基址。几十个 populate*Patterns 塞进同一个 RewritePatternSet，按 PatternBenefit 从高到低试，convert_layout 的优化 pattern benefit 最高（20）先命中。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch33-pass-spine",
+          "template": "swimlane",
+          "claim": "TTGIR→LLVM 两阶段 applyPartialConversion：先转 func（+initSharedMemory 建 global_smem）再转 ops，几十个 populate*Patterns 按 PatternBenefit 20>10>1 排序贪心改写。",
+          "numbers": [
+            {"label": "阶段数", "value": "2", "provenance": "先 func 后 ops；file:TritonGPUToLLVM.cpp:L110-L129"},
+            {"label": "convert_layout 优化 pattern benefit", "value": "20", "provenance": "patternBenefitConvertLayoutOptimizedPattern；file:PatternTritonGPUOpToLLVM.h:L28"},
+            {"label": "优先于 LLVM 转换的 benefit", "value": "10", "provenance": "patternBenefitPrioritizeOverLLVMConversions；file:PatternTritonGPUOpToLLVM.h:L26"},
+            {"label": "默认 benefit", "value": "1", "provenance": "patternBenefitDefault；file:PatternTritonGPUOpToLLVM.h:L25"}
+          ],
+          "caption_draft": "上泳道 func 阶段：populateFuncOpConversionPattern 把函数签名张量塌成 struct → initSharedMemory 建 global_smem（call op 需先知各函数 shmem 基址）。下泳道 ops 阶段：convert_layout(benefit 20) / dot / elementwise / load-store / reduce 等几十个 populate*Patterns 进同一 RewritePatternSet，benefit 高者先试。TargetInfo 作后端接缝由构造参数注入（换 NVIDIA/AMD 只换它）。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "cvt-path-selection",
+      "intuition": "选路像搬家前先问『这趟要跨多远』：先问跨不跨楼（block）、跨不跨层（warp）、跨不跨房间（lane），全不跨就只在自己桌上挪东西（register）。相除（quotient）就是逐层划掉『根本没动』的那些维，剩下最粗的一维决定要用多贵的搬法。",
+      "worked_example": {
+        "params": {"scenario": "同一 warp 内跨 lane 的转置：comp 在 block/warp 维恒等、lane 维非恒等", "dims_order": ["block", "warp", "lane", "register"]},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl 无精简版；LinearLayout quotient 属 GF(2) 代数（回指第 23 章，本章只用不推），且 host 无法跑 pin 3.2.0 make_llir。相除维序 [block,warp,lane,register] 与四分支落点引自 Utility.cpp:L661 与 ConvertLayoutOpToLLVM.cpp:L295-L322；具体 comp 在哪维恒等为构造场景。",
+        "table": {
+          "columns": ["轮次", "试除维 dim", "comp 在该维恒等?", "quotient 成功?", "comp 变化", "循环动作"],
+          "rows": [
+            ["1", "block", "是", "成功", "消去 block 维", "继续（免分布式 shmem）"],
+            ["2", "warp", "是", "成功", "消去 warp 维", "继续（可退到 warp shuffle 档）"],
+            ["3", "lane", "否", "失败", "不变", "break——lane 是真正要跨的最粗粒度"],
+            ["判定", "剩余 dims={lane, register}", "—", "—", "—", "matchAndRewrite 命中 is_contained(dims,\"lane\")（L308）→ transferWithinBlock（共享内存往返；warp-shuffle 专用实现 TODO 未做）"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "相除循环单调终止，且第一个 quotient 失败的维唯一决定代价档位。",
+        "argument": "dims=[block,warp,lane,register] 长度固定为 4；每轮 quotient 成功则 comp 严格消去一维（维数 -1），失败则 break——单调递减且有下界（0 维），至多 4 轮必停。基例：4 轮全成功→dims 空→两布局等价（replaceOp adaptor.getSrc，L327）。归纳步：每消一维档位下移一级（block→warp→lane→register）。故第一个非恒等维=转换真正跨的最细粒度，唯一定档。"
+      },
+      "quantified": "至多 4 次 quotient 试除；本例 3 次成功（block、warp）后在 lane 停（第 3 轮失败）→ 档位=lane→当前版本落 transferWithinBlock（共享内存往返）。四分支落点：block(L295, v3.2.0 NYI)、warp(L300)、lane(L308)、register(L319)。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch33-path-selection",
+          "template": "flow",
+          "claim": "convert_layout 按 block→warp→lane→register 逐维相除，第一个非恒等维决定四条路径与代价档位。",
+          "numbers": [
+            {"label": "相除维序", "value": "block→warp→lane→register", "provenance": "file:Utility.cpp:L661"},
+            {"label": "block 分支", "value": "跨 CTA，v3.2.0 NYI（notifyMatchFailure）", "provenance": "file:ConvertLayoutOpToLLVM.cpp:L295-L299"},
+            {"label": "warp 分支", "value": "transferWithinBlock（shmem 往返）", "provenance": "file:ConvertLayoutOpToLLVM.cpp:L300-L307"},
+            {"label": "lane 分支", "value": "transferWithinBlock（warp-shuffle TODO，暂落 shmem）", "provenance": "file:ConvertLayoutOpToLLVM.cpp:L308-L318"},
+            {"label": "register 分支", "value": "transferWithinThread（纯寄存器重排）", "provenance": "file:ConvertLayoutOpToLLVM.cpp:L319-L322"}
+          ],
+          "caption_draft": "菱形判据从上到下问 block→warp→lane→register 哪一维参与（相除消掉恒等维后剩下的最粗维）：block→跨 CTA 分布式 shmem（NYI）、warp→共享内存往返、lane→本应 warp shuffle 但专用实现未做故也落 shmem、register→纯寄存器重排。越往下越便宜。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "path-register-reorder",
+      "intuition": "最便宜的『搬运』其实根本不搬——数据全在本线程的寄存器里，只是把 struct 的字段换个顺序读，像把手里几张牌重新排列，零跨人传递、零等待。",
+      "worked_example": {
+        "params": {"N_registers_per_thread": 4, "permutation_apply": {"0": 0, "1": 2, "2": 1, "3": 3}, "note": "交换中间两张牌的置换"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl 无精简版；host 无 CUDA 跑不了 pin。逻辑 outVals[i]=inVals[srcIdx] 与前置断言 !cvtNeedsSharedMemory 引自 ConvertLayoutOpToLLVM.cpp:L339-L345；N=4 与具体置换为构造小例（读者可心算）。",
+        "table": {
+          "columns": ["i（dst 寄存器）", "conversion.apply({register:i}) = srcIdx", "outVals[i] = inVals[srcIdx]", "跨线程流量"],
+          "rows": [
+            ["0", "0", "inVals[0]", "0"],
+            ["1", "2", "inVals[2]", "0"],
+            ["2", "1", "inVals[1]", "0"],
+            ["3", "3", "inVals[3]", "0"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "本路径只在同线程寄存器空间做置换，零 shmem/barrier/shuffle——由进入前的断言 assert(!cvtNeedsSharedMemory) 保证。",
+        "argument": "进入 transferWithinThread 前断言 !cvtNeedsSharedMemory（L339）成立 ⇒ 最小转换 outDims ⊆ {register} ⇒ conversion.apply 只把本线程的 register 索引映到 register 索引，是双射置换。故每个 outVals[i] 恰来自唯一 inVals[srcIdx]，元素守恒、无跨线程数据移动、无同步。输出寄存器数 = conversion.getInDimSize(kRegister)（L342）恒等于 N。"
+      },
+      "quantified": "N=4 → 4 次寄存器读、0 shmem 字节、0 barrier、0 shfl 指令。相对代价 = 三路最低（基准 0）。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "path-shmem-roundtrip",
+      "intuition": "最贵的搬运要『落地中转』：每个线程先把自己的元素写进共享内存（store），全体鸣哨等一下（barrier）确保都写完，再按新布局各取所需读回（load）。像大家把行李堆上公共传送带、鸣哨集合、再按新座位各自取走——多了一次落地写和一次全员等待。",
+      "worked_example": {
+        "params": {"inVals_size": 8, "iterations": 2, "inVec": 2, "outVec": 2, "elem": "f32(4 字节)", "padding": "paddedSize=max(2,2)=2"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl 无精简版；host 无 CUDA。barrier 计数规则（迭代开头 i!=0 一次 + store 后一次）引自 ConvertLayoutOpToLLVM.cpp:L608,L632；store/load 步长 inVec/outVec 与循环 inVals.size()/iterations 引自 L617；padding paddedSize=max(inVec,outVec) 引自 Allocation.cpp:L164。iterations=2、inVals=8 等具体值为构造小例。",
+        "table": {
+          "columns": ["迭代 i", "迭代开头 barrier(i!=0)", "store op 数（4 元素 / inVec=2）", "store 后 barrier", "load op 数（4 元素 / outVec=2）", "累计 barrier"],
+          "rows": [
+            ["0", "无", "2", "1", "2", "1"],
+            ["1", "1", "2", "1", "2", "3"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "每次迭代严格 store→barrier→load，且 store/load 地址由 invertAndCompose 给出的双射保证读到的正是写进去的值。",
+        "argument": "store 端地址 = srcLayout.invertAndCompose(sharedLayout)（L514）、load 端 = dstLayout.invertAndCompose(sharedLayout)（L523），invertAndCompose 可逆 ⇒ 寄存器↔shmem 偏移双射，无覆盖、无丢失（同 warp 同址写硬件自解，L505-L507 注释）。store 后、load 前的 insertBarrier（L632）建立 happens-before ⇒ load 必读到已 store 的值。barrier 总数 = 2×iterations − 1（本例 3）。"
+      },
+      "quantified": "iterations=2、inVals=8：共 8 次 store 元素 + 8 次 load 元素 + 3 次 barrier；往返 shmem 每线程 T×4=32 字节/迭代。padding 在 outOrd[0] 加 paddedSize=2 错开 bank 起始（Allocation.cpp:L164-L165；共享内存 32 bank，回指第 26 章）。对照纯寄存器重排：0/0/0。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch33-shmem-roundtrip",
+          "template": "swimlane",
+          "claim": "共享内存往返每迭代走 store→barrier→load：8 元素往返需 8 store + 8 load + 3 barrier，padding 加 2 防 bank 冲突——这是三路里最贵的档。",
+          "numbers": [
+            {"label": "迭代数", "value": "2", "provenance": "构造小例；循环 file:ConvertLayoutOpToLLVM.cpp:L606"},
+            {"label": "barrier 总数", "value": "3", "provenance": "2×iterations−1；file:ConvertLayoutOpToLLVM.cpp:L608,L632"},
+            {"label": "store/load 元素", "value": "8 / 8", "provenance": "inVals.size()=8，构造小例；步长 inVec=outVec=2 file:L617"},
+            {"label": "padding 宽度", "value": "2", "provenance": "paddedSize=max(inVec,outVec)=max(2,2)；file:Allocation.cpp:L164"},
+            {"label": "shared memory bank 数", "value": "32", "provenance": "NVIDIA 硬件常量，回指第 26 章"}
+          ],
+          "caption_draft": "泳道自上而下：各线程按 srcLayout.invertAndCompose(sharedLayout) 把寄存器 store 进 shmem（padding 在最内维加 2 错开 bank）→ barrier 全员同步 → 各线程按 dstLayout.invertAndCompose(sharedLayout) load 回寄存器。迭代 1 开头再加一次 barrier，8 元素往返共 3 次 barrier。stmatrix 命中时 store 走 st.matrix 一条指令协作写 8×8 块。这条『落地+等待』就是最贵档的代价来源。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "stmatrix-fastpath",
+      "intuition": "共享内存往返里，store 端如果布局对得上，可以走 st.matrix：一条 PTX 指令让整个 warp 协作写一个 8×8 矩阵块，比逐元素 storeDShared 快得多。chooseStMatrixLayout 返回非空就命中这条快路径。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "padding-bank-conflict",
+      "intuition": "共享内存有 32 个 bank，连续 4 字节落连续 bank。如果 store/load 沿最内维步长恰是 32 的倍数，会全撞 bank 0 排队。往返 scratch 在最内访问维 outOrd[0] 上加一小段 padding，把每行起始错开一个 bank，冲突就散开了。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "cost-ordering-perf",
+      "intuition": "三条路径就是三档价签——桌上挪牌（register）免费、warp 内传纸条（shuffle）便宜、堆到公共货架再取（shmem）最贵还得全体等。读 dump 一旦看到 convert_layout 展开成 st.shared + bar.sync + ld.shared，就是账单上最贵那笔，优先想办法消掉（回指第 28 章 RemoveLayoutConversions）。",
+      "worked_example": {
+        "params": {"T_elems_per_thread": 8, "lanes_per_warp": 32, "elem": "f32(4 字节)"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl 无精简版；host 无 CUDA 跑不了 pin dump。三判据互斥完备（cvtReordersRegisters L672 / cvtNeedsWarpShuffle L683 / cvtNeedsSharedMemory L695-L705）引自 Utility.cpp；shmem 档的 8/8/3 承接 path-shmem-roundtrip 例；warp shuffle 的 log2(32)=5 为量级估算、T=8 为构造值。",
+        "table": {
+          "columns": ["路径", "参与最粗维", "跨线程搬运", "barrier", "shmem 往返", "相对代价"],
+          "rows": [
+            ["transferWithinThread（寄存器重排）", "register", "0", "0", "0 字节", "最低（基准）"],
+            ["warp shuffle", "lane", "约 log2(32)=5 次 shfl", "0", "0 字节", "中（v3.2.0 专用实现 TODO 未做，暂落 shmem）"],
+            ["transferWithinBlock（shmem 往返）", "warp / block", "8 store + 8 load", "3", "8×4=32 字节/线程/迭代", "最高"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "三路代价严格递增 register < warp shuffle < shmem 往返，因跨线程数据流量严格递增；三判据互斥且完备。",
+        "argument": "cvtReordersRegisters（outDims ⊆ {register}）、cvtNeedsWarpShuffle（outDims 恰 {register,lane}）、cvtNeedsSharedMemory（既非纯寄存器重排又非三种 dot shortcut）由最小转换 outDims 分类，互斥完备 ⇒ 每个 convert 落唯一档位（Utility.cpp:L672-L705）。流量单调：register 档 0 跨线程 < lane 档 warp 内 shfl < warp/block 档必须落地 shared memory 并 barrier。流量 monotone ⇒ 代价 monotone。"
+      },
+      "quantified": "T=8：register=0 搬运/0 barrier/0 shmem；warp shuffle≈5 shfl；shmem 往返=8 store+8 load+3 barrier+32 字节/线程/迭代。dump 判据：出现 st.shared/ld.shared + bar.sync 即命中最贵档 = 明确优化目标（回指第 28 章消它、第 24 章 convert_layout=唯一跨线程搬运）。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch33-cost-ordering",
+          "template": "state-table",
+          "claim": "三条搬运路径代价按跨线程流量严格递增；shmem 往返是 dump 里认出来就该优化的靶子。",
+          "numbers": [
+            {"label": "register 重排代价", "value": "0 跨线程 / 0 barrier / 0 shmem", "provenance": "cvtReordersRegisters；file:Utility.cpp:L672"},
+            {"label": "warp shuffle 代价", "value": "约 5 次 shfl（log2(32)）", "provenance": "cvtNeedsWarpShuffle；file:Utility.cpp:L683，量级估算 T 构造值"},
+            {"label": "shmem 往返代价", "value": "8 store + 8 load + 3 barrier", "provenance": "承接 path-shmem-roundtrip；file:ConvertLayoutOpToLLVM.cpp:L606-L644"},
+            {"label": "shmem 每线程往返字节", "value": "32", "provenance": "T=8 × f32 4 字节，构造值"}
+          ],
+          "caption_draft": "三行三档：register（纯寄存器重排，0/0/0，基准）< lane（warp shuffle，约 5 shfl；v3.2.0 落 shmem）< warp/block（共享内存往返，8 store+8 load+3 barrier+落地 32 字节，最贵）。判据 cvtReordersRegisters/cvtNeedsWarpShuffle/cvtNeedsSharedMemory 互斥定档。读 dump 认出 st.shared+bar.sync+ld.shared 就是最贵档——回看能否经 RemoveLayoutConversions（第 28 章）消掉或降档到寄存器/shuffle。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "legacy-ll-coexist",
+      "intuition": "同一个 convert_layout 现在有两套下译代码并存：新的 LinearLayout 统一路径（相除选路，benefit=20 优先命中）正在取代旧的『按 Blocked/Mma 布局类型 if-else 分支』的 legacy 路径（benefit 更低作后备）。knob useLegacyMMAConversion=false 就是新路当家的开关，但迁移未完（FIXME [Dot LL]，部分 dot operand / AMD MFMA 尚未覆盖），故 legacy 留着兜底：LL 路 notifyMatchFailure 时退回它做同样的 padding shmem 往返。",
+      "figure_specs": []
+    }
+  ]
+}
