@@ -16,10 +16,21 @@ from pathlib import Path
 
 NUM = re.compile(r'-?\d+(?:\.\d+)?')
 MARK = re.compile(r'<!--\s*trace:\s*([\w-]+)\s*-->')
+# 引用类记号不是推演数据:章节引用(§7 / 第 7 章)、源码行号引用(L308 / L308-310)。
+# 对称地从两侧剔除,避免『§1 表』的 1、『L308』的 308 被当成漂移数字。
+REF = re.compile(r'§\s*\d+|第\s*\d+\s*[章节]|\bL\d+(?:[-–]\d+)?')
+# 显式标注为『虚构/假设/hypothetical』的整行 = 教学用反例,非 run 实测值;仅在正文侧剔除
+# (explainer 素材是运行验证过的,不含虚构行),故只减少误报、绝不掩盖真实 drift。
+HYPO = re.compile(r'虚构|假设|hypothetical', re.I)
 
 
 def _nums(text: str) -> set:
-    return {float(t) for t in NUM.findall(text)}
+    return {float(t) for t in NUM.findall(REF.sub(' ', text))}
+
+
+def _nums_narrative(table: str) -> set:
+    kept = "\n".join(ln for ln in table.splitlines() if not HYPO.search(ln))
+    return _nums(kept)
 
 
 def _tables_after_marks(md: str):
@@ -57,7 +68,10 @@ def lint_trace_consistency(chapter_dir: str) -> dict:
     allowed = {}
     for m in doc.get("mechanisms", []):
         table = ((m.get("worked_example") or {}).get("table")) or {}
-        allowed[m.get("mechanism_id")] = _nums(json.dumps(table))
+        # ensure_ascii=False: 否则 CJK 被转成 \uXXXX,转义序列里的十六进制数字会被
+        # NUM 正则吃进 allowed 集合,污染放行名单 → 全中文表格的漂移检测形同虚设。
+        # (exp-0717-5:ch25 pessimistic-seed 2^62 vs explainer 2^30 的真实 drift 被此 bug 掩盖)
+        allowed[m.get("mechanism_id")] = _nums(json.dumps(table, ensure_ascii=False))
     marked = set()
     for mid, table in _tables_after_marks(nar.read_text(encoding="utf-8")):
         marked.add(mid)
@@ -67,7 +81,7 @@ def lint_trace_consistency(chapter_dir: str) -> dict:
         if not table:
             res["invalid"].append(f"  标记 trace:{mid} 后没有紧跟 markdown 表格")
             continue
-        extra = _nums(table) - allowed[mid]
+        extra = _nums_narrative(table) - allowed[mid]
         if extra:
             res["drift"].append(
                 f"  trace:{mid} 表内数字 {sorted(extra)} 不在 explainer 素材里(数字不可改,排版随意)")

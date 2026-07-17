@@ -193,12 +193,16 @@ def lint_formulas(filepath: str) -> dict:
     results["block_math_on_separate_lines"] = issues
 
     # ── Check 6: Inline formulas with ≥3 $...$ per paragraph ──
+    # 跳过 ```…``` 围栏体：源码里的裸 $（如 TableGen `:$param` 变量语法）不是数学，
+    # 若跨行累进段落会被误配成内联公式（复用 Check 8 的 in_fence 追踪）。
     issues = []
     paragraph_lines = []
     current_start = 0
+    in_fence = False
     for i, line in enumerate(lines, 1):
         stripped = line.strip()
-        if stripped == "" or stripped.startswith("#") or stripped.startswith("```"):
+        is_fence = stripped.startswith("```")
+        if stripped == "" or stripped.startswith("#") or is_fence:
             if paragraph_lines:
                 para = " ".join(paragraph_lines)
                 inline_contents = re.findall(r'(?<!\$)\$(?!\$)([^$]+)\$(?!\$)', para)
@@ -211,7 +215,11 @@ def lint_formulas(filepath: str) -> dict:
                     )
                 paragraph_lines = []
                 current_start = i + 1
+            if is_fence:
+                in_fence = not in_fence
         else:
+            if in_fence:
+                continue
             if not paragraph_lines:
                 current_start = i
             # Remove $$ blocks from count

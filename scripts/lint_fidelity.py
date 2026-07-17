@@ -43,7 +43,10 @@ except Exception:
     _SRC_PREFIXES = ["vllm"]
 # 长前缀优先，避免 vllm 抢先匹配 vllm_ascend（其实前缀后强制 '/'，二者互斥，但仍按长度排序更稳）
 _SRC_REF_RE = re.compile(
-    r"(?:" + "|".join(re.escape(p) for p in sorted(_SRC_PREFIXES, key=len, reverse=True)) + r")/[\w/]+\.py"
+    r"(?:" + "|".join(re.escape(p) for p in sorted(_SRC_PREFIXES, key=len, reverse=True))
+    # Part V 起进入 MLIR/C++ 层：正文引用的是 .td/.cpp/.cc/.h（不是 .py）——一并识别，
+    # 否则 C++/MLIR 章（ch19+）会被 .py-only 正则误判为「0 处源码引用」。
+    + r")/[\w/]+\.(?:py|pyi|td|cpp|cc|cu|cuh|h|hpp)"
 )
 
 

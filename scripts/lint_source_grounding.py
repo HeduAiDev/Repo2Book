@@ -67,7 +67,7 @@ def lint_source_grounding(chapter_dir: str) -> dict:
         sections = re.split(r'^## ', text, flags=re.MULTILINE)
 
         vllm_ref_pattern = re.compile(
-            r'(?:vllm/)?[\w/]+\.(?:py|cu|cuh|h)(?:[\s:]*L?\d+(?:-L?\d+)?)?', re.IGNORECASE
+            r'(?:vllm/)?[\w/]+\.(?:py|pyi|td|cpp|cc|cu|cuh|h|hpp)(?:[\s:]*L?\d+(?:-L?\d+)?)?', re.IGNORECASE
         )
 
         refs_per_section = {}
@@ -125,7 +125,8 @@ def lint_source_grounding(chapter_dir: str) -> dict:
     # ── Check 4: vLLM source files referenced (发布正文为准，非内部 impl-notes.md) ──
     # 实例无关：用活动实例规范前缀 + 对照基座前缀（姊妹篇引用基座 vllm/ 也算）计源码文件
     alt = "|".join(re.escape(p) for p in _SRC_PREFIXES)
-    src_ref_re = rf'(?:{alt})/[\w/]+\.py'
+    # 含 MLIR/C++ 层后缀：Part V 起正文引用 .td/.cpp/.cc/.h，不再是清一色 .py。
+    src_ref_re = rf'(?:{alt})/[\w/]+\.(?:py|pyi|td|cpp|cc|cu|cuh|h|hpp)'
     issues = []
     if narrative.exists():
         text = narrative.read_text(encoding="utf-8")
