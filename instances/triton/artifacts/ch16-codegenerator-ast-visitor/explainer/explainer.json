@@ -1,0 +1,297 @@
+{
+  "chapter": "ch16",
+  "title": "CodeGenerator 翻译框架——把 Python AST 逐节点翻成 tt.* IR 的那台机器",
+  "trace_note": "本章 skip_impl(无精简版):真·CodeGenerator 离不开 ir.builder/MLIR/language 整条栈,无法 headless 独跑出可示教轨迹;故 worked_example 的 trace_source 一律 manual。为让每个数字可复算,explainer/traces/ 下逐机制放了『忠实控制流复刻脚本』——逐字照抄源码对应行段的分支逻辑(如 visit_FunctionDef 的 idx 递增、visit_Call 的四条判据顺序),对一个小而具体的 kernel 跑出确定性 JSON。这些脚本是 host 纯 Python(部分用宿主 ast 模块),不是真编译产物,故仍标 manual;凡引用源码常量(divisibility=16 等)均标 file:Lxxx。",
+  "mechanisms": [
+    {
+      "mechanism_id": "m1-nodevisitor-dispatch",
+      "figure_specs": [
+        {
+          "figure_id": "ch16-fig-visit-shell-flow",
+          "claim": "每个 AST 节点先过重写的 visit 外壳(设 MLIR loc + try/except 包 CompilationError),再由 super().visit 按类型名分派到对应 visit_<Type>;没有对应方法的节点落到 generic_visit 抛 UnsupportedLanguageConstruct——白名单式只支持被显式实现的 AST 子集。",
+          "template": "flow",
+          "nodes": [
+            "AST 节点 node",
+            "visit 外壳:set_loc(file_name, begin_line+node.lineno, col_offset)",
+            "super().visit(node) 按 type(node).__name__ 分派",
+            "visit_FunctionDef / visit_Call / visit_Assign / visit_BinOp …(已实现)",
+            "generic_visit → raise UnsupportedLanguageConstruct(未实现节点)",
+            "出节点:恢复上一个 loc",
+            "except 非 CompilationError → raise CompilationError(jit_fn.src, node) from None"
+          ],
+          "edges": [
+            "node → visit 外壳",
+            "visit 外壳 → super().visit(node)",
+            "super().visit → visit_<Type>(已实现)",
+            "super().visit → generic_visit(未实现) → UnsupportedLanguageConstruct",
+            "visit_<Type> 抛异常 → CompilationError from None",
+            "visit_<Type> 正常 → 恢复上一个 loc"
+          ],
+          "numbers": [
+            {"label": "begin_line 偏移", "value": "-1", "provenance": "code_generator.py:L200 (self.begin_line = begin_line - 1,因 node.lineno 从 1 起)"},
+            {"label": "set_loc 行号", "value": "begin_line + node.lineno", "provenance": "code_generator.py:L1197"}
+          ],
+          "caption_draft": "为什么每条 IR op 都带 #loc、报错能精确指到你 kernel 的那一行:分派前的 visit 外壳先钉源码位置,分派中任何异常被就地重新包成携带 @jit 源码的 CompilationError。未实现的语法直接白名单式报错,而非静默产错。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m2-three-scope-name-lookup",
+      "intuition": "查一个名字像在三层抽屉里翻找:先翻手边最近的『本函数局部』抽屉(lscope),没有再翻『模块全局』抽屉(gscope)——但这层抽屉有门卫,只放行编译期常量和导入/内建;还没有才翻最底层『语言内建』抽屉(builtin_namespace,把 len/range/print 重定向到 Triton 版)。谁先命中用谁。",
+      "worked_example": {
+        "params": {"lscope": ["x", "offs", "BLOCK"], "gscope": {"tl": "module", "MAX_FUSED": "constexpr 全局", "LOOKUP_TABLE": "普通 list(非 constexpr)"}, "builtin_namespace": ["range", "len", "min"]},
+        "trace_source": "manual",
+        "manual_reason": "真 name_lookup 的守卫会 isinstance(val, JITFunction)/language.dtype 等,需 triton 运行期对象;traces/run_m2_name_lookup.py 用轻量标签值复刻 global_lookup 的 any([...]) 判据清单(同一条顺序)与三级查找循环,对 6 个名字跑出确定性解析级别。非真编译产物,故标 manual。",
+        "trace_ref": "traces/m2_name_lookup.json",
+        "table": {
+          "columns": ["名字", "解析级别", "守卫判定", "结果"],
+          "rows": [
+            ["x", "①local(lscope)", "—", "tensor(kernel 参数)"],
+            ["BLOCK", "①local(lscope)", "—", "constexpr(1024)(已赋值局部)"],
+            ["tl", "②global(gscope)", "放行(is_ModuleType)", "module"],
+            ["MAX_FUSED", "②global(gscope)", "放行(is_constexpr_global)", "constexpr 全局值"],
+            ["range", "③builtin", "—", "重定向到 Triton 版 range"],
+            ["LOOKUP_TABLE", "②global(gscope)", "拒绝(非 constexpr 全局)", "raise NameError"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "name_lookup 的三级查找必在有限步内终止:三个 lookup 函数(local_lookup/global_lookup/builtin_namespace.get)是固定长度为 3 的列表,for 循环至多迭代 3 次;任一层返回非 absent_marker 即 return,全落空则 raise NameError('not defined')——无回退、无递归,严格线性扫过三层。",
+        "argument": "循环体 `for lookup_function in local_lookup, global_lookup, self.builtin_namespace.get`(L307)遍历一个 3 元组,单调推进、不重入;每层的 absent 判据用同一个 absent_marker 单例(L305 object() 身份比较),不会被合法值(哪怕是 None)误判为缺失。基例:第 1 层命中即停;归纳步:第 k 层缺失则进第 k+1 层,k≤3;三层全缺是唯一 raise 出口。"
+      },
+      "quantified": "本例 6 个名字:2 个命中第①层(lscope,查 1 次)、3 个命中第②层(gscope,查 2 次,其中 1 个被守卫拒)、1 个命中第③层(builtin,查 3 次)。守卫拒绝率 = 1/3 的 global 命中(LOOKUP_TABLE 是普通 list、非 constexpr、无 constexpr 注解 → 触发 NameError)。三层作用域尺寸 lscope=3 / gscope=3 / builtin_namespace=3(traces/m2_name_lookup.json)。",
+      "figure_specs": [
+        {
+          "figure_id": "ch16-fig-three-scope-lookup",
+          "claim": "name_lookup 严格按 local→global→builtin 三级线性查找,global 层夹一道『只允许 constexpr 全局』守卫:普通全局变量(非 constexpr、无 constexpr 注解)在这里被拒成 NameError。",
+          "template": "state-table",
+          "columns": ["名字", "①local", "②global(守卫)", "③builtin", "解析结果"],
+          "rows": [
+            ["x", "命中 tensor", "—", "—", "kernel 参数句柄"],
+            ["BLOCK", "命中 constexpr", "—", "—", "constexpr(1024)"],
+            ["tl", "缺", "放行(module)", "—", "module"],
+            ["MAX_FUSED", "缺", "放行(constexpr 全局)", "—", "编译期常量"],
+            ["range", "缺", "缺", "命中", "Triton 版 range"],
+            ["LOOKUP_TABLE", "缺", "拒绝(非 constexpr)", "—", "raise NameError"]
+          ],
+          "numbers": [
+            {"label": "查找层数", "value": "3", "provenance": "code_generator.py:L307 (local_lookup, global_lookup, builtin_namespace.get)"},
+            {"label": "守卫拒绝数", "value": "1", "provenance": "traces/m2_name_lookup.json n_rejected"}
+          ],
+          "caption_draft": "『kernel 里为什么不能随便读全局变量』的机器答案:global 层的守卫只放行 constexpr 全局、module 导入、JITFunction、@builtin 与 tl.* 成员、dtype——普通可变全局被拒,以保证同签名→同编译产物的确定性(逃生阀 TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1,不承诺长期支持)。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m3-constexpr-tensor-dichotomy",
+      "figure_specs": [
+        {
+          "figure_id": "ch16-fig-constexpr-tensor-worlds",
+          "claim": "CodeGenerator 在两个世界间穿梭:constexpr=编译期已知的 Python 值(被 _unwrap_if_constexpr 拆成裸值参与 Python 计算、可折叠进代码、不建 op);tensor=运行期 SSA 句柄(持 handle=MLIR Value,一切建 op 的运算作用在它身上并注入 _builder)。每个 visit_<Type> 的两条分支就沿这条二分岔开。",
+          "template": "state-table",
+          "columns": ["维度", "constexpr 世界(编译期)", "tensor 世界(运行期)"],
+          "rows": [
+            ["是什么", "Python 值(int/str/dtype/tl.constexpr 包装)", "language.tensor(handle=MLIR Value + type)"],
+            ["何时已知", "编译时已知,可折叠(BLOCK=1024→arith.constant)", "运行期才有值,IR 里只是 SSA 名"],
+            ["判据函数", "_is_constexpr", "_is_triton_tensor / _is_triton_value"],
+            ["在 visit_Assign", "_unwrap 成裸值赋进 Python 变量,不建 op", "to_tensor 物化成 SSA 句柄"],
+            ["在 visit_FunctionDef", "取 Python 值、idx 不加(不占 IR 位)", "fn.args(idx) 取句柄、idx++"],
+            ["在 call_JitFunction", "抽进 constants、进 mangle 名(不进 IR 参数)", "arg.handle 成为 tt.call 的 SSA 操作数"],
+            ["在 visit_BinOp", "两边都 constexpr → 纯 Python 运算", "有 tensor → __add__(_builder=) 建 op"]
+          ],
+          "numbers": [
+            {"label": "二分在本章现身处数", "value": "4", "provenance": "dossier embed_excerpts note:visit_FunctionDef/call_JitFunction/name_lookup guard/visit_BinOp 各一处"}
+          ],
+          "caption_draft": "本章主线心智模型一图收:你标 :constexpr 的参数活在左列(编译期钉死、每个取值编出不同产物),运行期数据活在右列(SSA 句柄、建真 op)。CodeGenerator 每遇一个节点,先问『这是哪个世界的东西』,再决定折叠还是建 op——这条二分统一解释了后面所有分派。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m4-apply-binary-method",
+      "intuition": "`a + b` 怎么翻?CodeGenerator 不自己算,而是照 Python 的老规矩『反射』——把加号翻译成去问左操作数要它的 __add__ 方法,并偷偷塞一把 _builder 进去让它在 IR 里建 op。若左边不是 tensor(如 `2 + x`),就转去问右操作数要 __radd__(反向方法)。两边都是普通常量时,连 _builder 都不塞,退化成宿主 Python 直接算。",
+      "worked_example": {
+        "params": {"exprs": ["x + y", "x + 1", "2 + x", "a + b"], "note": "x,y 是 tensor;1,2,a,b 是 Python 常量"},
+        "trace_source": "manual",
+        "manual_reason": "_apply_binary_method 本体是纯宿主 Python 反射逻辑,traces/run_m4_binop.py 用宿主 ast 模块取 _method_name_for_bin_op 映射、逐字复刻 L536-L543 的 lhs/rhs tensor 判据与 __radd__ 的 re.sub 反向命名,可直跑;但真正的 tensor.__add__ 建 op 需 language/builder,故整体标 manual、只示教到『调哪个方法、塞不塞 _builder』这一层。",
+        "trace_ref": "traces/m4_binop.json",
+        "table": {
+          "columns": ["表达式", "method_name", "lhs tensor?", "rhs tensor?", "实际调用", "建 op?"],
+          "rows": [
+            ["x + y", "__add__", "是", "是", "lhs.__add__(rhs, _builder=…)", "是"],
+            ["x + 1", "__add__", "是", "否", "lhs.__add__(rhs, _builder=…)", "是"],
+            ["2 + x", "__add__", "否", "是", "rhs.__radd__(lhs, _builder=…)(反向)", "是"],
+            ["a + b", "__add__", "否", "否", "lhs.__add__(rhs)(无 _builder)", "否"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "_apply_binary_method 三条分支互斥且穷尽:恰有一条执行——lhs 是 tensor / lhs 非但 rhs 是 tensor / 两者皆非。只要至少一个操作数是 tensor,结果一定注入 _builder 并在 IR 建 op;两者皆非则一定不建 op(纯 Python)。『是否建 op』完全由『是否存在 tensor 操作数』决定,与运算符种类无关。",
+        "argument": "L537-L543 是顺序 if 链:`if _is_triton_tensor(lhs): return …(_builder=)`;`if _is_triton_tensor(rhs): return …reverse…(_builder=)`;末行 `return getattr(lhs, method_name)(rhs)` 无 _builder。第一条命中即返回,故 lhs 优先于 rhs;两条 tensor 分支都带 _builder、唯末行不带 → 建 op ⟺ (lhs 或 rhs 是 tensor)。reverse 分支用 re.sub(r'__(.*)__', r'__r\\1__') 把 __add__ 变 __radd__,保证左操作数非 tensor 时仍由 tensor 那侧主导建 op。"
+      },
+      "quantified": "本例 4 个二元表达式:3 个建 op(至少一侧是 tensor)、1 个纯 Python(a+b 都是常量)。建 op 率 = 3/4(traces/m4_binop.json n_builds_op=3)。_method_name_for_bin_op 映射覆盖 12 种二元运算符(ast.Add…ast.BitXor,code_generator.py:L554-L567),本例只演示 Add 一支,其余 11 支同构。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m5-visit-call-three-dispatch",
+      "intuition": "kernel 里一句『调用』长得都一样,语义却天差地别——tl.static_assert 是编译期检查(根本不该进 IR)、被 @jit 的子函数要展开成 tt.call、tl.load 这种 @builtin 要在 IR 里建真 op、Python 的 range 只是宿主循环。visit_Call 像个分诊台:先看这个 fn『是谁』,再把它送进四个不同科室。这就是 ch01 立的 f4 心智模型的机器实现。",
+      "worked_example": {
+        "params": {"call_sites": ["tl.static_assert(...)", "len(shape)", "_helper(x, BLOCK)", "tl.load(...)", "x.to(tl.float32)", "range(0, N)"]},
+        "trace_source": "manual",
+        "manual_reason": "真 visit_Call 要拿到 JITFunction 实例、language.core.is_builtin(fn) 等 triton 运行期判据;traces/run_m5_visit_call_dispatch.py 把每个调用点的 fn 身份事实(是否在 statically_implemented_functions / 是否 JITFunction / 是否 @builtin 或 tensor 方法)按源码语义显式给出,逐字复刻 L1099-L1126 的四条判据**顺序**,输出命中分支。非真编译,故标 manual。statically_implemented_functions={static_assert,static_print,int,len} 取自 L1252-L1257。",
+        "trace_ref": "traces/m5_visit_call_dispatch.json",
+        "table": {
+          "columns": ["调用点", "fn 身份", "命中分支", "动作", "建 IR op?"],
+          "rows": [
+            ["tl.static_assert(BLOCK % 16 == 0)", "在 statically_implemented_functions", "①static", "编译期求值,直接返回 constexpr", "否"],
+            ["n2 = len(shape)", "len ∈ statically_implemented", "①static", "编译期算出常量,不建 op", "否"],
+            ["acc = _helper(x, BLOCK)", "isinstance(fn, JITFunction)", "②JITFunction", "call_JitFunction 内联,建 tt.call", "是"],
+            ["v = tl.load(x_ptr + offs)", "is_builtin(fn)(@builtin)", "③builtin", "注入 _builder,在 IR 建 tt.load op", "是"],
+            ["y = x.to(tl.float32)", "fn.__self__ 是 tensor", "③builtin", "注入 _builder,建 arith/tt op", "是"],
+            ["for i in range(0, N)", "纯 Python 内置 callable", "④纯Python", "unwrap constexpr 后宿主直调,不建 op", "否"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "visit_Call 的四条出口按固定优先级顺序判定、互斥且穷尽:①statically_implemented_functions.get(fn) 非 None → ②isinstance JITFunction → ③(有 tensor __self__ 或 is_builtin) → ④兜底纯 Python 调用。任一 fn 恰好落一格;顺序不可交换(static 必须先于 builtin,否则 int/len 会被误当普通调用)。",
+        "argument": "L1099-L1126 是短路 if 链:第①支 `if static_implementation is not None: return`(L1100-L1101)最先拦截、命中即返回;第②支 `if isinstance(fn, JITFunction): return call_JitFunction`(L1105-L1107);第③支 `if (hasattr(fn,'__self__') and _is_triton_value(fn.__self__)) or is_builtin(fn):`(L1108)注入 _builder 调用;都不中则落到 L1124-L1126 兜底。判据基于 fn 的身份属性(在表/类型/标记),两两不相交:static 表项不是 JITFunction、@builtin 函数无 __self__ tensor 也不在 static 表——故无二义。"
+      },
+      "quantified": "本例 6 个调用点:2 个走①static(不建 op)、1 个走②JITFunction(建 tt.call)、2 个走③builtin(建 tt.* op)、1 个走④纯 Python(不建 op)。建 IR op 的 = 3/6(traces/m5_visit_call_dispatch.json n_build_ir=3);statically_implemented_functions 表恰 4 项(int/len/static_assert/static_print,L1252-L1257)。",
+      "figure_specs": [
+        {
+          "figure_id": "ch16-fig-visit-call-dispatch",
+          "claim": "visit_Call 按固定优先级四问分诊:是 static 内建吗→是 @jit 子函数吗→是 @builtin/tensor 方法吗→否则纯 Python;四条出口分别对应『编译期折叠 / 内联 tt.call / 建 tt.* op / 宿主直调』。这就是 ch01 f4 的三岔(static/JITFunction/builtin)+ 兜底。",
+          "template": "flow",
+          "nodes": [
+            "visit_Call(node):fn = visit(node.func)",
+            "问①:fn ∈ statically_implemented_functions? → ①static:编译期求值返回 constexpr(不建 op)",
+            "问②:isinstance(fn, JITFunction)? → ②JITFunction:call_JitFunction 内联,建 tt.call",
+            "问③:有 tensor __self__ 或 is_builtin(fn)? → ③builtin:注入 _builder,建 tt.* op",
+            "④兜底:纯 Python callable → unwrap constexpr 后宿主直调(不建 op)"
+          ],
+          "edges": [
+            "fn → 问① (static_assert/static_print/int/len 命中)",
+            "问①否 → 问② (_helper@jit 命中)",
+            "问②否 → 问③ (tl.load/x.to 命中)",
+            "问③否 → ④兜底 (range 命中)"
+          ],
+          "numbers": [
+            {"label": "分派出口数", "value": "4", "provenance": "code_generator.py:L1099-L1126 四条 return 路径"},
+            {"label": "static 表项数", "value": "4", "provenance": "code_generator.py:L1252-L1257 (static_assert/static_print/int/len)"},
+            {"label": "本例建 op 数", "value": "3", "provenance": "traces/m5_visit_call_dispatch.json n_build_ir"}
+          ],
+          "caption_draft": "f4 回收:同样写成 `foo(...)`,命运由 foo『是谁』决定——static_assert 在编译期就消解、@jit 子函数内联成 tt.call、@builtin 的 tl.load 建真 op、Python range 只是宿主循环。判据顺序不可乱(static 必须先于 builtin),这是 @builtin/@jit 两层结构落到调用点的机器实现。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m8-functiondef-ttfunc-constexpr-divisibility",
+      "intuition": "建 tt.func 时,CodeGenerator 拿两把号码牌走一遍参数队列:i 是『Python 参数序』(每个参数都发一张),idx 是『IR 参数位』(只发给真要进 IR 的参数)。遇到 constexpr 参数,取它的编译期值塞进函数体、但 idx 这张牌不发(continue)——所以 constexpr 参数不占 IR 位。遇到普通指针参数,先给它贴 tt.divisibility=16 的标签(set_arg_attr),再发 idx 号、领一个 SSA 句柄。",
+      "worked_example": {
+        "params": {"kernel": "add_kernel(x_ptr, y_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr)", "constants": {"4": 1024}, "divisibility_args": [0, 1, 2], "note": "三个指针 16 对齐→tt.divisibility=16;n_elements=1000 不被 16 整除→无属性;BLOCK_SIZE 是 constexpr"},
+        "trace_source": "manual",
+        "manual_reason": "真 visit_FunctionDef 要 builder.get_or_insert_function/fn.set_arg_attr/fn.args(idx) 等 MLIR 侧调用,无法 headless 独跑;traces/run_m8_functiondef_idx.py 逐字复刻 L414-L433 的 for 循环(i 走 range(len(arg_names))、`if i in constants: …; continue` 不加 idx、否则 set_arg_attr(idx,…) 后 idx++),对上面具体 kernel 跑出 idx 轨迹与 set_arg_attr 落点。divisibility 值 16 取自 backends/compiler.py:L77。非真 IR 产物,故标 manual。",
+        "trace_ref": "traces/m8_functiondef_idx.json",
+        "table": {
+          "columns": ["i(Python 参数序)", "参数名", "in constants?", "分支", "set_arg_attr", "idx: before→after", "IR 参数位"],
+          "rows": [
+            ["0", "x_ptr", "否", "tensor", "set_arg_attr(0, 'tt.divisibility', 16)", "0→1", "0"],
+            ["1", "y_ptr", "否", "tensor", "set_arg_attr(1, 'tt.divisibility', 16)", "1→2", "1"],
+            ["2", "out_ptr", "否", "tensor", "set_arg_attr(2, 'tt.divisibility', 16)", "2→3", "2"],
+            ["3", "n_elements", "否", "tensor", "—(1000 不被 16 整除)", "3→4", "3"],
+            ["4", "BLOCK_SIZE", "是", "constexpr", "—(continue,idx 不加)", "4→4", "无(不占 IR 位)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "循环结束时 idx = 真进 IR 的参数个数 = (Python 参数总数) − (constexpr 参数个数)。idx 单调不减,且只在非 constexpr 分支自增 1、constexpr 分支 continue 前不动——故 idx 精确计数非 constexpr 参数,constexpr 参数一定不占 IR 参数位。",
+        "argument": "L410-L431 的循环:constexpr 分支(`if i in self.constants`)执行 `arg_values.append(cst); continue`——continue 跳过后面的 `idx += 1`(L431),idx 保持不变;非 constexpr 分支必执行 `tensor(self.fn.args(idx), …); idx += 1`,idx 恰加 1。初值 idx=0(L409),每个非 constexpr 参数贡献 +1、每个 constexpr 贡献 0 → 终值 idx = |非 constexpr 参数|。又因 arg_types 在 ast_to_ttir 就已 `if k not in specialization.constants` 剔除 constexpr(L1291),prototype 的参数数与此 idx 终值一致,两处闸门自洽。"
+      },
+      "quantified": "本例 5 个 Python 参数 → 4 个 IR 参数(BLOCK_SIZE 被折叠,占位数 −1);4 个 IR 参数中 3 个(x_ptr/y_ptr/out_ptr,idx 0/1/2)携带 tt.divisibility=16,占比 3/4。constexpr 折叠数=1,divisibility 标注数=3(traces/m8_functiondef_idx.json:python_param_count=5,ir_param_count=4,divisibility_args=[0,1,2])。",
+      "figure_specs": [
+        {
+          "figure_id": "ch16-fig-constexpr-not-in-ir",
+          "claim": "Python def 的 5 个参数经 visit_FunctionDef 下降成只有 4 个参数的 tt.func:BLOCK_SIZE(constexpr)被折叠不占 IR 位,3 个指针参数携带 tt.divisibility=16 属性。",
+          "template": "before-after",
+          "before": {
+            "label": "Python @triton.jit 签名(5 参数)",
+            "items": ["x_ptr", "y_ptr", "out_ptr", "n_elements", "BLOCK_SIZE: tl.constexpr = 1024"]
+          },
+          "after": {
+            "label": "追踪期 tt.func 签名(4 个 IR 参数)",
+            "items": [
+              "%arg0 {tt.divisibility = 16}  ← x_ptr",
+              "%arg1 {tt.divisibility = 16}  ← y_ptr",
+              "%arg2 {tt.divisibility = 16}  ← out_ptr",
+              "%arg3  ← n_elements(1000,无 divisibility)",
+              "BLOCK_SIZE → 折叠成 arith.constant 1024(不在签名里)"
+            ]
+          },
+          "numbers": [
+            {"label": "Python 参数数", "value": "5", "provenance": "traces/m8_functiondef_idx.json python_param_count"},
+            {"label": "IR 参数数", "value": "4", "provenance": "traces/m8_functiondef_idx.json ir_param_count"},
+            {"label": "divisibility 标注数", "value": "3", "provenance": "traces/m8_functiondef_idx.json divisibility_args=[0,1,2]"},
+            {"label": "divisibility 值", "value": "16", "provenance": "backends/compiler.py:L77 (property_values['tt.divisibility']=16)"},
+            {"label": "BLOCK_SIZE 折叠值", "value": "1024", "provenance": "本例设定,constants={4:1024}"}
+          ],
+          "caption_draft": "第一性能命门一图看穿:你标 :constexpr 的 BLOCK_SIZE 不是『传进 kernel 的参数』,是『编译这份 kernel 时钉死的常量』——它被折叠进代码、不占 IR 参数位(每个取值编出不同产物);而三个指针的 tt.divisibility=16 属性正是在这一步 set_arg_attr 落进 IR 的,它是下游访存向量化的源头。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m9-call-jitfunction-inline",
+      "intuition": "内联一个 @jit 子函数时,call_JitFunction 把实参分成两堆:tensor 实参走 SSA 句柄、真正成为 tt.call 的操作数;constexpr 实参不进 IR 参数,而是被抽进 constants、编进被调函数的『名字』(mangle)——这样 `_helper(x,y,1024)` 和 `_helper(x,y,512)` 会 mangle 成两个不同 tt.func、各自内联一次。这与 visit_FunctionDef 的 idx 跳位是同一条规则的两端。",
+      "worked_example": {
+        "params": {"callee": "_helper(a, b, BLOCK: tl.constexpr)", "call": "_helper(x, y, 1024)", "note": "x,y 是 tensor,1024 是 Python 常量"},
+        "trace_source": "manual",
+        "manual_reason": "call_JitFunction 的拆分逻辑(L1052-L1061)是纯 Python 列表推导,traces/run_m9_call_jitfunction.py 逐字复刻『非 triton value 包 constexpr → 收 constexprs 下标 → constants={i:args[i]} → args 里 constexpr 位抹 None → arg_vals=[非 None 的 handle]』;但真正的 mangle_fn 命名(回指 ch10)与递归 new CodeGenerator 内联需 triton/builder,故标 manual、只示教到拆分账。",
+        "trace_ref": "traces/m9_call_jitfunction.json",
+        "table": {
+          "columns": ["位置 i", "实参", "is_triton_value?", "is_constexpr?", "进 constants?", "进 arg_vals(handle)?"],
+          "rows": [
+            ["0", "x(tensor)", "是", "否", "否", "是 → x.handle"],
+            ["1", "y(tensor)", "是", "否", "否", "是 → y.handle"],
+            ["2", "1024", "否", "是", "是 → constants={2:1024}", "否(位置抹 None)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "对每个实参位置 i,『进 constants』与『进 arg_vals(handle)』恰好二选一、互补且穷尽:constexpr 实参进 constants、不进 arg_vals;非 constexpr(tensor)实参进 arg_vals、不进 constants。故 len(constants)+len(arg_vals)=Python 实参总数,无重复无遗漏。",
+        "argument": "L1056 `constexprs=[i for i,arg in enumerate(args) if _is_constexpr(arg)]` 取全体 constexpr 下标;L1057 `constants={i:args[i] for i in constexprs}`;L1059 `args=[None if i in constexprs else arg …]` 把 constexpr 位置抹成 None;L1060 `arg_vals=[arg.handle for arg in args if arg is not None]` 只收非 None(即非 constexpr)。同一个 constexprs 集合同时决定『进 constants』(i∈constexprs)与『被抹 None』(i∈constexprs 则不进 arg_vals),两个谓词互为否定 → 每个 i 恰属一侧;并集是全体 enumerate(args) → 穷尽。"
+      },
+      "quantified": "本例 3 个 Python 实参 → 2 个 SSA 调用操作数(x.handle, y.handle)+ 1 个 constexpr(1024)进 constants 与 mangle 名;进 IR 的操作数 = 2/3(traces/m9_call_jitfunction.json n_ssa_call_operands=2,constexprs_idx=[2])。与 m8 同构:constexpr 在参数下降/函数调用两处都『不占 IR 位、抹成 None/跳 idx』。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m11-perf-payoff-divisibility-chain",
+      "figure_specs": [
+        {
+          "figure_id": "ch16-fig-divisibility-chain",
+          "claim": "divisibility 提示是一条端到端的链:launch 期特化算出哪些指针 16 对齐 → AttrsDescriptor.get_fn_attrs 打包成 {argIdx:[('tt.divisibility',16)]} → CodeGenerator.attributes → visit_FunctionDef 的 set_arg_attr(idx,'tt.divisibility',16) 落成 tt.func 属性 → 下游 AxisInfo/coalesce 据此做访存向量化。链上任一环断,后端就分析不出对齐、优化不动。",
+          "template": "flow",
+          "nodes": [
+            "launch 期:multiple_of 打标记 + 特化(回指 ch09/ch12)",
+            "AttrsDescriptor._add_common_properties:property_values['tt.divisibility']=16,arg_properties 收 16 对齐参数序号",
+            "get_fn_attrs():{argIdx: [('tt.divisibility', 16)]}",
+            "ast_to_ttir 的 fn_attrs → CodeGenerator.attributes",
+            "visit_FunctionDef:set_arg_attr(idx, 'tt.divisibility', 16)",
+            "追踪期 tt.func:%argN {tt.divisibility = 16}",
+            "下游 AxisInfo/coalesce 消费属性 → 向量化访存(前瞻 ch25)"
+          ],
+          "edges": [
+            "launch 特化 → AttrsDescriptor",
+            "AttrsDescriptor → get_fn_attrs",
+            "get_fn_attrs → CodeGenerator.attributes",
+            "CodeGenerator.attributes → set_arg_attr",
+            "set_arg_attr → tt.func 属性",
+            "tt.func 属性 → AxisInfo 向量化"
+          ],
+          "numbers": [
+            {"label": "divisibility 值", "value": "16", "provenance": "backends/compiler.py:L77 (property_values['tt.divisibility']=16)"},
+            {"label": "本例落属性的参数数", "value": "3", "provenance": "traces/m8_functiondef_idx.json divisibility_args=[0,1,2]"}
+          ],
+          "caption_draft": "性能落点收尾:『提示没进 IR,后面就优化不动』的完整证据链。指针按 16 对齐这条信息只有 launch 期看得到,必须作为 tt.divisibility 属性钉在 tt.func 参数上,后端 AxisInfo 才读得到并做 coalescing/向量化——这是 CodeGenerator 这台机器与下游访存性能之间的那根线(打标记那头回指 ch09 multiple_of)。"
+        }
+      ]
+    }
+  ]
+}

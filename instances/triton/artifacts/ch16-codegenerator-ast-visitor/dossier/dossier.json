@@ -1,0 +1,178 @@
+{
+  "chapter": "ch16",
+  "title": "CodeGenerator 翻译框架——把 Python AST 逐节点翻成 tt.* IR 的那台机器",
+  "skip_impl": true,
+  "impl_note": "本章走 skip_impl（编译器代码库无法干净抽取『同名同结构只删不增』的可运行精简版——CodeGenerator 离不开整条 ir.builder/language 栈）。『运行起来看数值』支柱由 pin v3.2.0 精确编译承担：headless `ASTSource(...).make_ir(options, codegen_fns, module_map, ctx)` 出真·追踪期 TTIR，观测 tt.func 签名 / constexpr 不占位 / tt.divisibility 属性。subtraction_plan.delete 留空，must_keep 登记读者需理解、writer 需讲清的符号。",
+  "code_spine": [
+    "python/triton/compiler/code_generator.py:L1273-L1303  ast_to_ttir（入口：由 ch14 compile 的 make_ir 阶段调）——拆 constants / 造 prototype / 建 fn_attrs / new CodeGenerator / generator.visit(fn.parse())",
+    "python/triton/compiler/code_generator.py:L192-L243  CodeGenerator.__init__——gscope/lscope/local_defs 三层作用域、builder、prototype、constants、attributes 就位",
+    "python/triton/compiler/code_generator.py:L386-L458  visit_FunctionDef——建 tt.func：constexpr 参数不占 IR 位、AttrsDescriptor 的 tt.divisibility 经 set_arg_attr 落进 IR、visit_compound_statement 走函数体",
+    "python/triton/compiler/code_generator.py:L1186-L1213  visit() 外壳——设 MLIR location + 把异常包成带源码摘录的 CompilationError",
+    "python/triton/compiler/code_generator.py:L305-L313 / L268-L302  name_lookup 三级查找（local→global→builtin）+ global_lookup 的『只允许 constexpr 全局变量』守卫",
+    "python/triton/compiler/code_generator.py:L545-L552 / L536-L543  visit_BinOp → _apply_binary_method 反射分派到 tensor.__add__(_builder=...)",
+    "python/triton/compiler/code_generator.py:L1097-L1126  visit_Call 三分派（f4 命门）：static（constexpr 求值）/ JITFunction（内联）/ builtin（建 op）",
+    "python/triton/compiler/code_generator.py:L1050-L1095  call_JitFunction——constexpr 抽出成 constants、非 constexpr 走 handle；mangle_fn 命名 + 递归 new CodeGenerator 内联被调函数",
+    "python/triton/compiler/code_generator.py:L488-L511 / L315-L322  visit_Assign lvalue 记账 → set_value 写 lscope + local_defs（接 ch15 的 SSA local_defs 记账）",
+    "python/triton/backends/compiler.py:L109-L124  AttrsDescriptor.get_fn_attrs()——把 {arg_idx: [('tt.divisibility',16)]} 交给 CodeGenerator.attributes",
+    "python/triton/compiler/errors.py:L6-L42  CompilationError._format_message——把 node.lineno/col_offset 转成带 `^` 光标的源码摘录"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "python/triton/compiler/code_generator.py",
+      "lines": "L1273-L1303",
+      "code": "def ast_to_ttir(fn, specialization, context, options, codegen_fns, module_map):\n    attrs = specialization.attrs\n    # create kernel prototype\n    cst_key = lambda i: fn.arg_names.index(i) if isinstance(i, str) else i\n    constants = {cst_key(key): value for key, value in specialization.constants.items()}\n    # visit kernel AST\n    gscope = fn.__globals__.copy()\n    function_name = fn.repr(specialization)\n    tys = list(specialization.signature.values())\n    new_constants = attrs.get_constants()\n    for k in new_constants:\n        if k in tys and tys[k] == \"i1\" and new_constants[k] == 1:\n            new_constants[k] = True\n\n    new_attrs = attrs.filter_out_constants()\n    fn_attrs = new_attrs.get_fn_attrs()\n    all_constants = constants.copy()\n    all_constants.update(new_constants)\n    arg_types = [str_to_ty(v) for k, v in specialization.signature.items() if k not in specialization.constants]\n    file_name, begin_line = get_jit_fn_file_line(fn)\n\n    prototype = language.function_type([], arg_types)\n    generator = CodeGenerator(context, prototype, gscope=gscope, constants=all_constants, function_name=function_name,\n                              jit_fn=fn, attributes=fn_attrs, is_kernel=True, file_name=file_name,\n                              begin_line=begin_line, options=options, codegen_fns=codegen_fns, module_map=module_map)\n    generator.visit(fn.parse())\n\n    ret = generator.module\n    # module takes ownership of the context\n    ret.context = context\n    return ret",
+      "elide": ["`arg_types` 那行的关键在 `if k not in specialization.constants`——signature 里被标 constexpr 的参数直接从 arg_types 里剔除，这是『constexpr 不进 IR 签名』的第一处闸门（第二处在 visit_FunctionDef）。", "`new_constants[k]=True` 的 i1==1 特判是 equal_to_1 特化的边角，与主线无关可省略讲。"]
+    },
+    {
+      "path": "python/triton/compiler/code_generator.py",
+      "lines": "L386-L438",
+      "code": "    def visit_FunctionDef(self, node):\n        arg_names, kwarg_names = self.visit(node.args)\n        if self.fn:\n            raise self._unsupported(node, \"nested function definition is not supported.\")\n        # initialize defaults\n        for i, default_value in enumerate(node.args.defaults[::-1]):\n            ...\n\n        # initialize function\n        visibility = \"public\" if self.is_kernel else \"private\"\n        self.fn = self.builder.get_or_insert_function(self.module, self.function_name,\n                                                      self.prototype.to_ir(self.builder), visibility, self.noinline)\n        self.module.push_back(self.fn)\n        entry = self.fn.add_entry_block()\n        arg_values = []\n        idx = 0\n        for i in range(len(arg_names)):\n            if i in self.constants:\n                cst = self.constants[i]\n                if not _is_constexpr(cst):\n                    cst = constexpr(self.constants[i])\n                arg_values.append(cst)\n                continue\n            else:\n                if i in self.attributes:\n                    for name, value in self.attributes[i]:\n                        self.fn.set_arg_attr(idx, name, value)\n\n                # Mark this argument as a pass-by-value TMA descriptor (nvidia)\n                if isinstance(self.prototype.param_types[idx], nv_tma_desc_type):\n                    self.fn.set_arg_attr(idx, \"tt.nv_tma_desc\", 1)\n\n                arg_values.append(tensor(self.fn.args(idx), self.prototype.param_types[idx]))\n                idx += 1\n\n        insert_pt = self.builder.get_insertion_block()\n        for arg_name, arg_value in zip(arg_names, arg_values):\n            self.set_value(arg_name, arg_value)\n        self.builder.set_insertion_point_to_start(entry)\n        # visit function body\n        self.visit_compound_statement(node.body)",
+      "elide": ["`node.args.defaults[::-1]` 的默认值初始化循环（L390-L406）：把带默认值的参数当赋值语句 visit，visiting_arg_default_value 置位以放行全局访问——正文可一句带过，不是本章命门。", "finalize function（L442-L458）：ret_type 收尾、reset_type、create_poison 补返回——收尾细节，讲 constexpr/divisibility 时可省。"],
+      "note": "本章第一命门代码：两条 index。`i` 走 Python 参数序，`idx` 只在『真进 IR 的参数』上递增。`if i in self.constants: ... continue`——constexpr 参数取 Python 值塞进 arg_values（供函数体求值），但 **idx 不加**，所以它**不占 IR 参数位**。非 constexpr 参数才 `self.fn.args(idx)` 取 SSA 句柄、idx++。`if i in self.attributes: for name,value: self.fn.set_arg_attr(idx, name, value)`——name='tt.divisibility'、value=16 就在这里落进 tt.func 的参数属性。"
+    },
+    {
+      "path": "python/triton/compiler/code_generator.py",
+      "lines": "L1097-L1126",
+      "code": "    def visit_Call(self, node):\n        fn = _unwrap_if_constexpr(self.visit(node.func))\n        static_implementation = self.statically_implemented_functions.get(fn)\n        if static_implementation is not None:\n            return static_implementation(self, node)\n\n        kws = dict(self.visit(keyword) for keyword in node.keywords)\n        args = [self.visit(arg) for arg in node.args]\n        if isinstance(fn, JITFunction):\n            _check_fn_args(node, fn, args)\n            return self.call_JitFunction(fn, args, kws)\n        if (hasattr(fn, '__self__') and _is_triton_value(fn.__self__)) or language.core.is_builtin(fn):\n            extra_kwargs = {\"_builder\": self.builder}\n            sig = inspect.signature(fn)\n            if '_generator' in sig.parameters:\n                extra_kwargs['_generator'] = self\n            try:\n                return fn(*args, **extra_kwargs, **kws)\n            except Exception as e:\n                # Normally when we raise a CompilationError, we raise it as\n                # `from None`, ...\n                raise CompilationError(self.jit_fn.src, node, None) from e\n\n        if fn in self.builtin_namespace.values():\n            args = map(_unwrap_if_constexpr, args)\n        return fn(*args, **kws)",
+      "elide": ["`from e`/`from None` 的注释原文较长（L1116-L1121），保留一行足够。"],
+      "note": "f4 回收命门。四条出口，讲透三分派：①`statically_implemented_functions.get(fn)` 命中→纯编译期求值（static_assert/static_print/int/len），直接返回 constexpr、不建任何 op；②`isinstance(fn, JITFunction)`→内联，转 call_JitFunction；③`hasattr(fn,'__self__') and _is_triton_value(fn.__self__)`（tensor 方法如 x.to）**或** `language.core.is_builtin(fn)`（@builtin 标记的 tl.* 函数如 tl.load）→注入 `_builder=self.builder`（可选 `_generator=self`）调之、在 IR 里建 op；④剩下的纯 Python callable（如内置 range/isinstance）→ unwrap constexpr 后直接 Python 调用。三岔判据：谁是编译期常量折叠、谁是内联展开、谁是建 tt.* op。"
+    },
+    {
+      "path": "python/triton/compiler/code_generator.py",
+      "lines": "L1050-L1062",
+      "code": "    def call_JitFunction(self, fn: JITFunction, args, kwargs):\n        args = inspect.getcallargs(fn.fn, *args, **kwargs)\n        args = [args[name] for name in fn.arg_names]\n        args = [arg if _is_triton_value(arg) else constexpr(arg) for arg in args]\n        # generate function def\n        attributes = {}\n        constexprs = [i for i, arg in enumerate(args) if _is_constexpr(arg)]\n        constants = {i: args[i] for i in constexprs}\n        # generate call\n        args = [None if i in constexprs else arg for i, arg in enumerate(args)]\n        arg_vals = [arg.handle for arg in args if arg is not None]\n        arg_types = [arg.type for arg in args if arg is not None]\n        fn_name = mangle_fn(fn.__name__, arg_types, constants)",
+      "elide": ["L1063-L1095：`if not self.module.has_function(fn_name)` 的递归 new CodeGenerator + generator.visit(fn.parse()) 内联体、以及按 call_op 结果数 0/1/N 组返回值——正文按需引，mangle 细节回指 ch10。"],
+      "note": "constexpr↔tensor 二分在这里第三次现身：constexpr 实参被抽进 `constants`（进 mangle 的函数名、不进 IR 参数）；tensor 实参 `arg.handle` 才成为 tt.call 的 SSA 操作数。`args = [None if i in constexprs ...]` 把 constexpr 位置抹成 None——与 visit_FunctionDef 的 idx 跳位是同一条规则的两端。mangle_fn 回指 ch10。"
+    },
+    {
+      "path": "python/triton/compiler/code_generator.py",
+      "lines": "L268-L313",
+      "code": "    def _define_name_lookup(self):\n\n        def local_lookup(name: str, absent):\n            # this needs to be re-fetched from `self` every time, because it gets switched occasionally\n            return self.lscope.get(name, absent)\n\n        def global_lookup(name: str, absent):\n            val = self.gscope.get(name, absent)\n            # The high-level rule is that only constexpr globals are allowed.\n            # But actually a bunch of other things, such as module imports, are\n            # technically Python globals. We have to allow these too!\n            if any([\n                    val is absent, name in self.builtin_namespace,  #\n                    type(val) is ModuleType,  #\n                    isinstance(val, JITFunction),  #\n                    getattr(val, \"__triton_builtin__\", False),  #\n                    getattr(val, \"__module__\", \"\").startswith(\"triton.language\"),  #\n                    isinstance(val, language.dtype),  #\n                    self._is_constexpr_global(name),  #\n                    self.visiting_arg_default_value,  #\n                    os.environ.get(\"TRITON_ALLOW_NON_CONSTEXPR_GLOBALS\", \"0\") == \"1\"\n            ]):\n                return val\n            raise NameError(...)\n\n        absent_marker = object()\n\n        def name_lookup(name: str) -> Any:\n            absent = absent_marker\n            for lookup_function in local_lookup, global_lookup, self.builtin_namespace.get:\n                value = lookup_function(name, absent)\n                if value is not absent:\n                    return value\n            raise NameError(f'{name} is not defined')\n\n        return name_lookup",
+      "elide": ["`raise NameError(textwrap.dedent(...))` 的长错误文案（L294-L301）：告诉用户只能访问 constexpr 全局或设 TRITON_ALLOW_NON_CONSTEXPR_GLOBALS——引一句即可。"],
+      "note": "三级查找：`for lookup_function in local_lookup, global_lookup, builtin_namespace.get`——lscope（本函数局部）→ gscope（模块全局，带守卫）→ builtin_namespace（len/range/min/max/print 等重定向）。守卫哲学：全局只允许 constexpr——但 module import / JITFunction / @builtin(__triton_builtin__) / tl.* 模块成员 / dtype 是技术上的全局也必须放行。`self.gscope` 在 __init__ 里对 ModuleType 值做过 module_map 重映射（L213-L223）。"
+    },
+    {
+      "path": "python/triton/compiler/code_generator.py",
+      "lines": "L536-L552",
+      "code": "    def _apply_binary_method(self, method_name, lhs, rhs):\n        # TODO: raise something meaningful if getattr fails below, esp for reverse method\n        if _is_triton_tensor(lhs):\n            return getattr(lhs, method_name)(rhs, _builder=self.builder)\n        if _is_triton_tensor(rhs):\n            reverse_method_name = re.sub(r\"__(.*)__\", r\"__r\\1__\", method_name)\n            return getattr(rhs, reverse_method_name)(lhs, _builder=self.builder)\n        return getattr(lhs, method_name)(rhs)\n\n    def visit_BinOp(self, node):\n        lhs = self.visit(node.left)\n        rhs = self.visit(node.right)\n        method_name = self._method_name_for_bin_op.get(type(node.op))\n        if method_name is None:\n            raise self._unsupported(node,\n                                    \"AST binary operator '{}' is not (currently) implemented.\".format(node.op.__name__))\n        return self._apply_binary_method(method_name, lhs, rhs)",
+      "elide": ["_method_name_for_bin_op 的整张映射表（L554-L567）：ast.Add→'__add__' 等 12 项，引三两行示意即可。"],
+      "note": "constexpr↔tensor 二分的第四处体现，也是 f4 里『tl.* 两层结构』落到运算符的那一层：`a + b` 的 AST BinOp 被翻成 `getattr(lhs, '__add__')(rhs, _builder=self.builder)`——若 lhs 是 tensor，反射调用 tensor.__add__ 并注入 _builder，进而在 semantic 层建 arith/tt op；若两边都是 Python 常量则退化成纯 Python 运算（无 _builder）。reverse method（__radd__）处理 `2 + x` 这种左操作数非 tensor 的情形。"
+    },
+    {
+      "path": "python/triton/compiler/code_generator.py",
+      "lines": "L488-L511",
+      "code": "    def visit_Assign(self, node):\n        _names = []\n        if isinstance(node, ast.AnnAssign):\n            _names += [self.visit(node.target)]\n        else:\n            for target in node.targets:\n                _names += [self.visit(target)]\n        if len(_names) > 1:\n            raise self._unsupported(node, \"simultaneous multiple assignment is not supported.\")\n        names = _names[0]\n        values = self.visit(node.value)\n        if not _is_list_like(names):\n            names = [names]\n        if not _is_list_like(values):\n            values = [values]\n        native_nontensor_types = (language.dtype, )\n        for name, value in zip(names, values):\n            # by default, constexpr are assigned into python variable\n            value = _unwrap_if_constexpr(value)\n            if value is not None and \\\n               not _is_triton_value(value) and \\\n               not isinstance(value, native_nontensor_types):\n                value = language.semantic.to_tensor(value, self.builder)\n            self.set_value(name, value)",
+      "elide": [],
+      "note": "赋值下降 + lvalue 记账。visit_Name 在 Store 上下文返回裸字符串名（不 deref），在 Load 上下文才 deref 取值——所以 `names` 是待写的名字、`values` 是已求值的右值。`_unwrap_if_constexpr` 把 constexpr 拆成裸 Python 值『赋进 python 变量』（不建 op）；否则 to_tensor 物化成 SSA 句柄。终点 set_value 把 (name→value) 同时写进 lscope 与 local_defs——local_defs 正是 ch15 讲的 SSA 记账账本（if/for 收口时据它算 block 参数/loop-carried 值）。"
+    },
+    {
+      "path": "python/triton/compiler/code_generator.py",
+      "lines": "L315-L322",
+      "code": "    def set_value(self, name: str, value: Union[tensor, constexpr]) -> None:\n        ''' This function:\n            called by visit_Assign() & visit_FunctionDef() to store left value (lvalue)\n        1. record local defined name (FIXME: should consider control flow)\n        2. store tensor in self.lvalue\n        '''\n        self.lscope[name] = value\n        self.local_defs[name] = value",
+      "elide": [],
+      "note": "两行写两账本：lscope=当前可见符号表（name_lookup 第一级查它），local_defs=本作用域『新定义了哪些名』的增量账（enter_sub_region 进块时清空、出块时并回——这是 ch15 结构化控制流做 SSA 收敛的依据）。"
+    },
+    {
+      "path": "python/triton/compiler/code_generator.py",
+      "lines": "L1186-L1213",
+      "code": "    def visit(self, node):\n        if node is None:\n            return\n        with warnings.catch_warnings():\n            warnings.simplefilter(\"ignore\", DeprecationWarning)  # python 3.9\n            warnings.simplefilter(\"ignore\", PendingDeprecationWarning)  # python 3.8\n            last_node = self.cur_node\n            last_loc = self.builder.get_loc()\n            self.cur_node = node\n            if hasattr(node, 'lineno') and hasattr(node, 'col_offset'):\n                self.builder.set_loc(self.file_name, self.begin_line + node.lineno, node.col_offset)\n                last_loc = self.builder.get_loc()\n            try:\n                ret = super().visit(node)\n            except CompilationError:\n                raise\n            except Exception as e:\n                # Wrap the error in a CompilationError which contains the source\n                # of the @jit function.\n                raise CompilationError(self.jit_fn.src, self.cur_node, repr(e)) from None\n\n            # Reset the location to the last one before the visit\n            if last_loc:\n                self.cur_node = last_node\n                self.builder.set_loc(last_loc)\n            return ret",
+      "elide": [],
+      "note": "重写的 visit 外壳（覆盖 ast.NodeVisitor.visit）包住每次分派：进节点前 `set_loc(file_name, begin_line+lineno, col_offset)`——这就是为什么每条 IR op 都带 `loc(...)`（headless dump 里的 #loc）；`super().visit(node)` 才真正按 visit_<Type> 分派；任何非 CompilationError 异常被就地包成 CompilationError(带 @jit 源码)，`from None` 掐掉指向 code_generator.py 自身的无关栈。generic_visit（L1215）对没有 visit_<Type> 方法的节点抛 UnsupportedLanguageConstruct——白名单式：只支持被显式实现的 AST 子集。"
+    },
+    {
+      "path": "python/triton/compiler/errors.py",
+      "lines": "L6-L38",
+      "code": "class CompilationError(TritonError):\n    \"\"\"Base class for all errors raised during compilation\"\"\"\n    source_line_count_max_in_message = 12\n\n    def _format_message(self) -> str:\n        node = self.node\n        if self.src is None:\n            source_excerpt = \" <source unavailable>\"\n        else:\n            if hasattr(node, 'lineno'):\n                source_excerpt = self.src.split('\\n')[:node.lineno][-self.source_line_count_max_in_message:]\n                if source_excerpt:\n                    source_excerpt.append(' ' * node.col_offset + '^')\n                    source_excerpt = '\\n'.join(source_excerpt)\n                else:\n                    source_excerpt = \" <source empty>\"\n            else:\n                source_excerpt = self.src\n\n        message = \"at {}:{}:\\n{}\".format(node.lineno, node.col_offset, source_excerpt) if hasattr(\n            node, 'lineno') else source_excerpt\n        if self.error_message:\n            message += '\\n' + self.error_message\n        return message\n\n    def __init__(self, src: Optional[str], node: ast.AST, error_message: Optional[str] = None):\n        self.src = src\n        self.node = node\n        self.error_message = error_message\n        self.message = self._format_message()",
+      "elide": ["__reduce__（L40-L42）：让 CompilationError 可 pickle（跨进程编译时传得回来）——一句带过。CompileTimeAssertionFailure / UnsupportedLanguageConstruct 是它的两个子类（L45-L51）。"],
+      "note": "为什么 Triton 报错能精确指到你 kernel 的那一行并画 `^`：_format_message 拿 node.lineno 截取源码前 N 行、按 col_offset 补空格加 `^` 光标。src 是 @jit 函数源码（jit_fn.src），node 是出错的 AST 节点——由 visit 外壳在包异常时喂进来。"
+    },
+    {
+      "path": "python/triton/backends/compiler.py",
+      "lines": "L109-L124",
+      "code": "    def get_fn_attrs(self) -> Dict:\n        \"\"\"\n        Get the function attributes as a dictionary.\n\n        The returned dictionary will look like :\n            {\n            \"arg0\" : [(prop_name00, val00), (prop_name01, val01), ...)]}\n            \"arg1\" : [(prop_name10, val10), (prop_name11, val11), ...)]}\n            }\n        \"\"\"\n        attrs = {}\n        for prop_name, arg_set in self.arg_properties.items():\n            prop_val = self.property_values[prop_name]\n            for arg in arg_set:\n                attrs[arg] = attrs.get(arg, []) + [(prop_name, prop_val)]\n        return attrs",
+      "elide": ["_add_common_properties（L75-L98）：property_values['tt.divisibility']=16、arg_properties['tt.divisibility']=[能被 16 整除且未 do_not_specialize 的参数序号]——这一头由 launch 期特化算出（回指 ch09 multiple_of / ch12 特化）。filter_out_constants（L134-L142）先把 equal_to 这类『常量属性』摘掉，剩下 divisibility 才进 get_fn_attrs。"],
+      "note": "divisibility 提示的载体。get_fn_attrs() 把 {参数序号: [('tt.divisibility', 16)]} 交给 ast_to_ttir 的 fn_attrs → CodeGenerator.attributes → visit_FunctionDef 的 `self.fn.set_arg_attr(idx, 'tt.divisibility', 16)` 落成 tt.func 参数属性。这条链是下游访存向量化的源头：提示没进来，后面 AxisInfo/coalesce 就优化不动（前瞻 ch25）。"
+    }
+  ],
+  "key_classes": [
+    {"name": "CodeGenerator", "file": "python/triton/compiler/code_generator.py", "responsibility": "ast.NodeVisitor 子类——本章主角。持有 builder(ir.builder)/gscope/lscope/local_defs/constants/attributes，逐 AST 节点分派翻成 tt.* IR。每个 visit_<Type> 方法负责一类节点；未实现的节点由 generic_visit 抛 UnsupportedLanguageConstruct（白名单式支持子集）。"},
+    {"name": "enter_sub_region", "file": "python/triton/compiler/code_generator.py", "responsibility": "上下文管理器：进块时快照 lscope/local_defs、清空 local_defs；出块时并回。if/for/while 借它做 SSA 作用域收敛（ch15 主题，本章只用不重讲）。"},
+    {"name": "ContainsReturnChecker", "file": "python/triton/compiler/code_generator.py", "responsibility": "另一个 ast.NodeVisitor：预扫描 if 体内是否含 early return，决定 visit_If 走 top-level（多基本块 + cond_branch）还是 scf.if。支撑角色。"},
+    {"name": "CompilationError", "file": "python/triton/compiler/errors.py", "responsibility": "编译期错误基类（TritonError 子类）。_format_message 把出错 AST 节点的 lineno/col_offset 转成带 `^` 光标的源码摘录。子类 CompileTimeAssertionFailure（static_assert 失败）、UnsupportedLanguageConstruct（不支持的语法）。"},
+    {"name": "AttrsDescriptor", "file": "python/triton/backends/compiler.py", "responsibility": "承载编译期参数属性（tt.divisibility / tt.equal_to）。get_fn_attrs() 产出交给 CodeGenerator.attributes、经 set_arg_attr 进 IR。本章只讲它到 IR 的这一段（deduce 那头回指 ch09/ch12）。"}
+  ],
+  "data_flow": [
+    "ch14 compile() 的 make_ir 阶段调 ast_to_ttir(fn, specialization, context, options, codegen_fns, module_map)（回指 ch14，不重讲主循环）",
+    "ast_to_ttir 拆解 specialization：constants（constexpr 参数序号→值）、arg_types（剔除 constexpr 后的签名）、fn_attrs（get_fn_attrs 的 divisibility 等）；造 prototype=function_type([], arg_types)",
+    "new CodeGenerator(...)：__init__ 建 ir.builder、装 gscope（对 ModuleType 做 module_map 重映射）、lscope={}、local_defs={}、constants、attributes 就位；dereference_name = _define_name_lookup()",
+    "generator.visit(fn.parse())：fn.parse() 得 AST；visit 外壳设 loc、分派到 visit_Module → visit_FunctionDef",
+    "visit_FunctionDef：先 visit_arguments 收 arg_names；get_or_insert_function 建 tt.func；逐参数分流——i in constants 的 constexpr 取 Python 值、idx 不加（不占 IR 位）；否则 set_arg_attr(idx, 'tt.divisibility', 16) 落属性、tensor(fn.args(idx)) 取 SSA 句柄、idx++；set_value 把参数写进 lscope/local_defs；visit_compound_statement 走函数体",
+    "函数体逐语句：visit_Assign→set_value 记账；visit_BinOp→_apply_binary_method 反射到 tensor.__add__(_builder=)；visit_Call→三分派(static/JITFunction/builtin)",
+    "visit_Call 命中 JITFunction→call_JitFunction：constexpr 实参抽进 constants（进 mangle_fn 名、不进 IR）、tensor 实参走 handle；若被调未生成则递归 new CodeGenerator 内联其体；builder.call 建 tt.call",
+    "name 解析贯穿全程：visit_Name(Load)→dereference_name→name_lookup 三级（local→global 带 constexpr 守卫→builtin）",
+    "任一步异常→visit 外壳包成 CompilationError(jit_fn.src, node)——_format_message 出带 `^` 的源码摘录",
+    "visit 返回后 ast_to_ttir 返回 generator.module——追踪期 TTIR（任何 pass 之前；make_ttir 的 add_inliner 之后 tt.call 才被抹平）"
+  ],
+  "design_decisions": [
+    {"decision": "constexpr 参数不占 IR 参数位——两处闸门：ast_to_ttir 的 arg_types 剔除 constexpr（`if k not in specialization.constants`），visit_FunctionDef 的 idx 只在非 constexpr 参数上递增", "why": "constexpr 是编译期 Python 值，编译时已知就应折叠进代码（如 BLOCK=1024 直接成 arith.constant），没必要占运行期函数签名的一个 SSA 参数。读者杠杆：你标 `:constexpr` 的参数不是『传进 kernel 的参数』，是『编译这份 kernel 时钉死的常量』——每个不同取值编出不同产物。", "evidence": "python/triton/compiler/code_generator.py:L416-L433 + L1291（arg_types 剔除）"},
+    {"decision": "divisibility 提示经 set_arg_attr 落成 tt.func 参数上的 tt.divisibility 属性", "why": "指针按 16 对齐是下游访存向量化（coalescing / vectorized load）的前提，但这信息只有 launch 期看到实参才算得出。把它作为 IR 属性钉在参数上，编译后端才能读到并据以优化。提示没进 IR，后面 AxisInfo 就分析不出对齐、优化不动（前瞻 ch25）。这一头的『打标记』回指 ch09 multiple_of / ch12 特化。", "evidence": "python/triton/compiler/code_generator.py:L424-L426 + python/triton/backends/compiler.py:L88-L91,L109-L124"},
+    {"decision": "visit_Call 用四条判据分派而非统一 IR 建 op：static 求值 / JITFunction 内联 / builtin 建 op / 纯 Python 直调", "why": "Triton kernel 里的调用语义天差地别——static_assert 是编译期检查（不该进 IR）、被 @jit 的子函数要内联展开成 tt.call+tt.func、tl.load 这类 @builtin 要在 IR 里建真 op、Python 内置 range 只是宿主语言循环。用 fn 的身份（是否 statically_implemented / isinstance JITFunction / __triton_builtin__ / 有 tensor __self__）判定它属于哪个世界。这是 f4『visit_Call 三岔 + tl @builtin/@jit 两层』的机器实现。", "evidence": "python/triton/compiler/code_generator.py:L1097-L1126"},
+    {"decision": "全局变量只允许 constexpr（+ 一批技术性豁免：module/JITFunction/@builtin/tl.* 成员/dtype）", "why": "kernel 若能自由读可变全局，其编译产物就依赖编译时的全局状态、破坏『同签名→同产物』的确定性与缓存正确性。守卫强制全局要么是 constexpr、要么是不影响语义的导入/内建。逃生阀 TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1 但不承诺长期支持。", "evidence": "python/triton/compiler/code_generator.py:L274-L302"},
+    {"decision": "每次 visit 前 set_loc、异常就地包 CompilationError(from None)", "why": "让每条 IR op 携带源码位置（#loc），让报错精确指到用户 kernel 的行/列并画 `^`，而不是吐一堆指向 code_generator.py 的无关栈。这是 Triton 报错体验好的直接原因。", "evidence": "python/triton/compiler/code_generator.py:L1197-L1207 + python/triton/compiler/errors.py:L10-L29"},
+    {"decision": "白名单式 AST 支持：generic_visit 抛 UnsupportedLanguageConstruct", "why": "不是把 Python 全语言翻进 IR，而是只支持被显式写了 visit_<Type> 的子集；遇到没实现的节点直接给出清晰报错，而非静默产错。", "evidence": "python/triton/compiler/code_generator.py:L1215-L1216"}
+  ],
+  "theory": [
+    "constexpr↔tensor 二分（本章主线心智模型）：CodeGenerator 在两个世界间穿梭——constexpr=编译期已知的 Python 值（int/字符串/dtype/tl.constexpr 包装），在多数节点里被 _unwrap_if_constexpr 拆成裸值参与 Python 计算、可折叠进代码、不建 op；tensor=运行期 SSA 句柄（language.tensor，持 handle=MLIR Value + type），一切建 op 的运算都作用在它身上并注入 _builder。判据函数：_is_constexpr / _is_triton_tensor / _is_triton_value。这条二分决定了每个 visit_<Type> 的两条分支走向（回指 ch04 @builtin/constexpr 两层定义、ch15 SSA 句柄）。",
+    "SSA 构造的 Python 侧账本（本章只讲构造、理论回指 ch15）：lscope=当前可见符号表，local_defs=本作用域新定义增量。set_value 同写两账；enter_sub_region 进块清 local_defs、出块并回。if/for/while 收口时据 then_defs/else_defs/loop_defs∩liveins 算 block 参数与 loop-carried 值——但那是 ch15 主题，本章用其概念、不重推。",
+    "内联的命名唯一性：call_JitFunction 用 mangle_fn(name, arg_types, constants) 生成被调函数的 IR 名——同一 @jit 函数按 (参数类型, constexpr 常量) 不同实例化成不同 tt.func，`if not module.has_function(fn_name)` 保证每个实例只生成一次（回指 ch10 mangle）。",
+    "追踪期 vs make_ttir 之后（pin 取证纪律）：ast_to_ttir 产出的是任何 pass 之前的追踪期 TTIR——此时 tt.call 与被调 tt.func 尚在；make_ttir 的第一个 pass add_inliner 会把它们内联抹平。给 IR 事实必须标阶段（本章观测点=make_ir 返回的追踪期）。"
+  ],
+  "subtraction_plan": {
+    "delete": [],
+    "must_keep": [
+      {"symbol": "ast_to_ttir", "why": "本章入口函数——ch14 compile 的 make_ir 阶段调它；拆 constants/arg_types/fn_attrs、造 CodeGenerator。读者据此接上 ch14。"},
+      {"symbol": "CodeGenerator", "why": "本章主角类，ast.NodeVisitor 子类。"},
+      {"symbol": "visit_FunctionDef", "why": "建 tt.func 的方法——constexpr 不占 IR 位 + set_arg_attr 落 divisibility 都在这，第一性能命门。"},
+      {"symbol": "set_arg_attr", "why": "divisibility→tt.divisibility 属性进 IR 的落点，性能主线关键调用。"},
+      {"symbol": "tt.divisibility", "why": "落进 IR 的属性名，下游访存向量化的源头（前瞻 ch25）。"},
+      {"symbol": "visit_Call", "why": "f4 回收命门——三分派（static/JITFunction/builtin）的现场。"},
+      {"symbol": "statically_implemented_functions", "why": "visit_Call 第一岔（编译期求值：static_assert/static_print/int/len）的判据表。"},
+      {"symbol": "call_JitFunction", "why": "visit_Call 第二岔——JITFunction 内联；constexpr 抽 constants、tensor 走 handle。"},
+      {"symbol": "is_builtin", "why": "visit_Call 第三岔判据（language.core.is_builtin）——识别 @builtin 的 tl.* 建 op。"},
+      {"symbol": "_apply_binary_method", "why": "反射分派到 tensor.__add__(_builder=)——运算符下降的核心。"},
+      {"symbol": "visit_Assign", "why": "赋值下降 + lvalue 记账，接 ch15 SSA。"},
+      {"symbol": "set_value", "why": "写 lscope + local_defs 两账本的唯一入口，SSA 记账根节点。"},
+      {"symbol": "name_lookup", "why": "三级查找（local→global→builtin），name 解析主线。"},
+      {"symbol": "_define_name_lookup", "why": "闭包工厂，含 global_lookup 的 constexpr 全局守卫。"},
+      {"symbol": "_is_constexpr_global", "why": "『只允许 constexpr 全局』守卫的判定函数。"},
+      {"symbol": "lscope", "why": "局部符号表——name_lookup 第一级、SSA 可见性。"},
+      {"symbol": "gscope", "why": "全局作用域——name_lookup 第二级，带 constexpr 守卫。"},
+      {"symbol": "local_defs", "why": "本作用域新定义增量账——ch15 SSA 收敛依据，本章记账终点。"},
+      {"symbol": "visit", "why": "重写的分派外壳——set_loc + 异常包 CompilationError。"},
+      {"symbol": "generic_visit", "why": "未支持节点抛 UnsupportedLanguageConstruct（白名单式）。"},
+      {"symbol": "CompilationError", "why": "带源码摘录+`^`光标的编译错误——报错体验的载体。"},
+      {"symbol": "get_fn_attrs", "why": "AttrsDescriptor 侧——把 {arg:[(tt.divisibility,16)]} 交给 CodeGenerator.attributes。"},
+      {"symbol": "mangle_fn", "why": "内联时被调函数 IR 命名（按 arg_types+constants），回指 ch10。"},
+      {"symbol": "_unwrap_if_constexpr", "why": "constexpr→裸 Python 值的拆包，constexpr↔tensor 二分的常用闸。"}
+    ]
+  },
+  "mechanisms": [
+    {"id": "m1-nodevisitor-dispatch", "name": "CodeGenerator 作为 ast.NodeVisitor 逐节点分派 + visit 外壳（set_loc + 异常包 CompilationError）+ generic_visit 白名单", "kind": "protocol", "source_anchors": ["python/triton/compiler/code_generator.py:L1186-L1216", "python/triton/compiler/code_generator.py:L339-L352"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m2-three-scope-name-lookup", "name": "gscope/lscope/local_defs 三层作用域 + name_lookup 三级查找（local→global→builtin）+ 『只允许 constexpr 全局』守卫", "kind": "algorithm", "source_anchors": ["python/triton/compiler/code_generator.py:L268-L313", "python/triton/compiler/code_generator.py:L254-L266", "python/triton/compiler/code_generator.py:L213-L249"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m3-constexpr-tensor-dichotomy", "name": "贯穿全器的二分：constexpr（编译期 Python 值）↔ tensor（运行期 SSA 句柄）——本章主线心智模型", "kind": "protocol", "source_anchors": ["python/triton/compiler/code_generator.py:L50-L67", "python/triton/compiler/code_generator.py:L503-L511"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m4-apply-binary-method", "name": "_apply_binary_method 反射分派到 tensor.__add__(_builder=...)（含 reverse method）——运算符下降", "kind": "algorithm", "source_anchors": ["python/triton/compiler/code_generator.py:L536-L567"], "needs_figure": false, "needs_worked_example": true, "difficulty": "supporting"},
+    {"id": "m5-visit-call-three-dispatch", "name": "visit_Call 三分派（f4 命门）：static（constexpr 求值）/ JITFunction（内联）/ builtin（建 op）——三岔判据逐一讲清", "kind": "algorithm", "source_anchors": ["python/triton/compiler/code_generator.py:L1097-L1126", "python/triton/compiler/code_generator.py:L1252-L1257"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m6-visit-assign-lvalue", "name": "visit_Assign 的 lvalue 记账 → set_value 写 lscope+local_defs（接 ch15 SSA local_defs 记账）", "kind": "dataflow", "source_anchors": ["python/triton/compiler/code_generator.py:L488-L524", "python/triton/compiler/code_generator.py:L315-L322"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m7-ast-to-ttir-entry", "name": "ast_to_ttir 入口：拆 constants/arg_types/fn_attrs、造 prototype、new CodeGenerator、visit(fn.parse())（回指 ch14 compile 怎么调它）", "kind": "dataflow", "source_anchors": ["python/triton/compiler/code_generator.py:L1273-L1303"], "needs_figure": false, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m8-functiondef-ttfunc-constexpr-divisibility", "name": "visit_FunctionDef 建 tt.func：constexpr 参数不占 IR 位（idx 跳位）+ AttrsDescriptor 的 tt.divisibility 经 set_arg_attr 进 IR（第一性能命门）", "kind": "algorithm", "source_anchors": ["python/triton/compiler/code_generator.py:L386-L458", "python/triton/backends/compiler.py:L109-L124"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m9-call-jitfunction-inline", "name": "call_JitFunction：constexpr 抽 constants / tensor 走 handle、mangle_fn 命名、递归 new CodeGenerator 内联（回指 ch10 mangle/ch11 binder，不重讲）", "kind": "algorithm", "source_anchors": ["python/triton/compiler/code_generator.py:L1050-L1095"], "needs_figure": false, "needs_worked_example": true, "difficulty": "supporting"},
+    {"id": "m10-compilation-error-excerpt", "name": "CompilationError._format_message：把 node.lineno/col_offset 转成带 `^` 光标的源码摘录（Triton 报错精确指行的原理）", "kind": "dataflow", "source_anchors": ["python/triton/compiler/errors.py:L6-L42"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m11-perf-payoff-divisibility-chain", "name": "性能落点收尾：constexpr 不占 IR 位 + divisibility→set_arg_attr→tt.divisibility 属性链，是下游访存向量化的源头（前瞻 ch25 AxisInfo 消费、回指 ch09 multiple_of 打标记那头）", "kind": "config", "source_anchors": ["python/triton/compiler/code_generator.py:L424-L433", "python/triton/backends/compiler.py:L75-L98"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"}
+  ],
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recycle": [
+      {"id": "f4", "note": "visit_Call 三岔分发与 tl 的 @builtin/@jit 两层结构——ch01 立心智模型，本章讲透。回收落点：m5-visit-call-three-dispatch（三分派 static/JITFunction/builtin 逐一讲清）+ m4/m9（@builtin 建 op vs @jit 内联的两层）。", "planted_in": "ch01"}
+    ]
+  }
+}
