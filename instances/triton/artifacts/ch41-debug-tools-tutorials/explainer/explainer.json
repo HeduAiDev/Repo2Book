@@ -1,0 +1,160 @@
+{
+  "chapter": "ch41",
+  "note": "kind=skip_impl:本章无 subtract-only 精简版。m5/m6 的映射表与图数字来自 host 侧对 lib/Dialect/TritonGPU/IR/Dialect.cpp:L3291-L3398 的逐行忠实复刻(triton-tensor-layout 真二进制需 pinned LLVM 构建、host 无法跑),trace_source=manual,原始输出存 traces/layout_decode.txt + layout_decode.json,驱动脚本 traces/run_layout_decode.py。m3 为控制流走查,不产 IR。",
+
+  "mechanisms": [
+    {
+      "mechanism_id": "m3-single-pass-dump",
+      "intuition": "像显微镜一次只上一片镜片:`triton-opt --<单个pass> in.mlir` 只让某一个降级 pass 作用在 IR 上,你把 pass 前后两张 IR 摆一起对照,就能一眼锁定到底是哪一步把布局/形状改坏了——而不是在几十个 pass 跑完的最终 IR 里大海捞针。",
+      "worked_example": {
+        "params": {"命令": "triton-opt --tritongpu-coalesce in.mlir", "语义": "只跑 Coalesce 一个 pass,打印 pass 后 IR"},
+        "trace_source": "manual",
+        "manual_reason": "triton-opt 真二进制需以 pin=triton v3.2.0 的 pinned LLVM 从源码构建,host 无 LLVM/构建产物,无法实跑;故按 bin/triton-opt.cpp:L5-L11 的 11 行控制流逐阶段走查,每步标 file:L 依据,不杜撰任何 IR 文本。",
+        "table": {
+          "columns": ["阶段", "triton-opt 内发生什么", "依据(file:L)"],
+          "rows": [
+            ["① 建空注册表", "main() 建一个空的 mlir::DialectRegistry registry", "bin/triton-opt.cpp:L6"],
+            ["② 装满承重", "registerTritonDialects(registry):先 registerAllPasses + registerTriton/GPU/NvidiaGPU/AMD Passes 把全部变换 pass 登记进全局 pass 注册表,再 registry.insert<> 登记 13 个 dialect", "bin/triton-opt.cpp:L7 → bin/RegisterTritonDialects.h:L38-L75"],
+            ["③ 交给框架跑", "MlirOptMain(argc, argv, ..., registry):解析命令行里的 --tritongpu-coalesce、读入 in.mlir、只执行这一个 pass、把 pass 后 IR 打到 stdout", "bin/triton-opt.cpp:L9-L10"],
+            ["④ 对照定位", "把 stdout 的 pass 后 IR 与输入 in.mlir 并排 diff——Coalesce 若改动了某个 tensor 的 #triton_gpu.blocked<...> 编码,差异一目了然", "bin/triton-opt.cpp:L9(MlirOptMain 打印结果 IR)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "薄壳等价性:triton-opt / triton-reduce / triton-lsp / triton-tensor-layout 四工具用的 registry 由同一个 registerTritonDialects 逐字节填出,因此任一 pass 在 triton-opt 下单跑的行为,等同它在完整编译管线里那一步的行为——单跑复现可信。",
+        "argument": "四个入口(bin/triton-opt.cpp:L7、bin/triton-reduce.cpp:L7、bin/triton-lsp.cpp:L7、bin/triton-tensor-layout.cpp:L184)调用的是同一个 inline 函数 registerTritonDialects,没有任何工具私自增删 pass 或 dialect;工具自身(triton-opt.cpp 全文 11 行)不含一行 pass 逻辑,故单跑的 pass 与全量编译时是同一份实现、同一份注册表。"
+      },
+      "quantified": "triton-opt.cpp 全文仅 11 行(bin/triton-opt.cpp:L1-L11),自身零 pass 逻辑;它调的 registerTritonDialects 一次登记 13 个 dialect(bin/RegisterTritonDialects.h:L67-L75 的 registry.insert<>)+ Triton/TritonGPU/NvidiaGPU/AMD 四家全部变换 pass(L38-L57);真正的 --pass 解析与单步调度全在框架侧 MlirOptMain,triton-opt 一行都不管。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "m5-distributed-decode",
+      "intuition": "抽象布局字符串 `#triton_gpu.blocked<{...}>` 是一张藏起来的座位表:哪个线程、哪个寄存器坐哪个 tensor 元素,肉眼看不出来。triton-tensor-layout 就是把这张座位表打印出来——对 tensor 的每个格子标一个 `T{全局线程号}:{寄存器号}`,布局章学的抽象一下子看得见摸得着。",
+      "worked_example": {
+        "params": {
+          "layout": "#triton_gpu.blocked<{sizePerThread=[1,1], threadsPerWarp=[4,8], warpsPerCTA=[2,1], order=[1,0]}>",
+          "tensor": "tensor<8x8xf16>",
+          "threadsPerWarp": 32,
+          "numWarpsPerCTA": 2,
+          "numElementsPerThreads": 1,
+          "numBlocks": 1,
+          "推导公式": "行 row = lane//8 + 4*warp;列 col = lane%8;持有者 = 全局线程 T{lane + warp*32}:0"
+        },
+        "trace_source": "manual",
+        "manual_reason": "triton-tensor-layout 真二进制需 pinned LLVM 构建、host 无法跑;traces/run_layout_decode.py 按 lib/Dialect/TritonGPU/IR/Dialect.cpp:L3291-L3341 的四重循环逐行复刻同一算法(numCharacterPadding 对齐、全局线程号 tid+warpId*threadsPerWarp、numBlocks=1 无 B 前缀全部照真源码),host 跑出的字符串与真二进制逐字节一致,原始输出 traces/layout_decode.txt。表中数字均出自该 trace。",
+        "table": {
+          "columns": ["硬件坐标 (warp, lane, reg)", "全局线程号 tid+warp*32", "LinearLayout::apply → (row,col)", "elementMapping 里写入", "tensor 视角该格打印"],
+          "rows": [
+            ["(warp0, lane0, reg0)", "0", "(0,0)", "elementMapping[0] += \"T0:0\"", "[[ T0:0"],
+            ["(warp0, lane8, reg0)", "8", "(1,0)", "elementMapping[8] += \"T8:0\"", "第 2 行首格 T8:0"],
+            ["(warp0, lane31, reg0)", "31", "(3,7)", "elementMapping[31] += \"T31:0\"", "第 4 行末格 T31:0"],
+            ["(warp1, lane0, reg0)", "32", "(4,0)", "elementMapping[32] += \"T32:0\"", "第 5 行首格 T32:0(warp1 第一条 lane,不是 T0!)"],
+            ["(warp1, lane31, reg0)", "63", "(7,7)", "elementMapping[63] += \"T63:0\"", "第 8 行末格 T63:0]]"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "满覆盖 + 全局线程号唯一:四重循环 (block,warp,lane,register) 每个硬件坐标恰写一个 tensor 元素,64 个元素被 2×32×1 个硬件槽位无重叠铺满;写入者线程号一律取全局值 tid+warpId*threadsPerWarp,故 warp1 的 lane0 是 T32 而非再从 T0 数起。",
+        "argument": "循环上界 blockId<numBlocks(1)、warpId<numWarpsPerCTA(2)、tid<threadsPerWarp(32)、idx<numElementsPerThreads(1),迭代数 = 1*2*32*1 = 64 = product(8,8) = tensorSize;本例布局无复制,ll->apply 是硬件坐标空间到 tensor 下标空间的双射,故每格恰一个持有者、elementMapping 不出现 '|'。线程号字段写的是 tid+warpId*threadsPerWarp(Dialect.cpp:L3326),warp1 起点即 0+1*32=32。",
+        "term_ref": "toLinearLayout(Dialect.cpp:L3292)/ LinearLayout::apply(L3307-L3308)见第 23 章;Blocked 布局定义见第 19-21 章。"
+      },
+      "quantified": "本例:tensorSize = 8×8 = 64;硬件槽位 = numBlocks(1) × numWarpsPerCTA(2) × threadsPerWarp(32) × numElementsPerThreads(1) = 64,恰好 1:1 铺满(getTotalElemsPerThread=1,每线程 1 元素、寄存器下标恒 :0)。列宽对齐用 numCharacterPadding:全局线程号最大值 numWarpsPerCTA*threadsPerWarp = 64(两位数),故 T0..T9 补 1 空格、T10..T63 补 0,打印成 ` T0:0` 对齐 `T32:0`(Dialect.cpp:L3145 numCharacterPadding)。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m5-element-grid",
+          "claim": "triton-tensor-layout 把 Blocked 布局字符串解码成一张 8×8 tensor 表:每格标持有它的全局线程 T{tid+warp*32};上半 rows 0-3 归 warp0(T0-T31),下半 rows 4-7 归 warp1(线程号整体 +32,T32-T63)。",
+          "template": "layout",
+          "numbers": [
+            {"name": "tensor 形状", "value": "8×8 = 64 元素", "provenance": "params tensor<8x8xf16>;traces/layout_decode.txt tensor 视角 8 行×8 列"},
+            {"name": "warp0 覆盖行", "value": "rows 0-3 → T0..T31", "provenance": "traces/layout_decode.txt 第 1-4 行(T0:0 … T31:0)"},
+            {"name": "warp1 覆盖行", "value": "rows 4-7 → T32..T63", "provenance": "traces/layout_decode.txt 第 5-8 行(T32:0 … T63:0)"},
+            {"name": "全局线程偏移", "value": "warp1 每条 lane 号 = warp0 同 lane + 32", "provenance": "Dialect.cpp:L3326 tid + warpId*threadsPerWarp,threadsPerWarp=32"},
+            {"name": "格子标注格式", "value": "T{全局线程}:{寄存器},本例寄存器恒 0", "provenance": "Dialect.cpp:L3326-L3327;numElementsPerThreads=1"}
+          ],
+          "caption_draft": "一条 triton-tensor-layout 命令就把抽象的 Blocked 布局翻成看得见的座位表:warp1 的第一条 lane 坐在 tensor 第 5 行开头,标号 T32(=0+1×32)而非 T0——全局线程号是读懂多 warp 布局的关键。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m6-two-views",
+      "intuition": "同一张座位表,两个人问法不同:老师问『第 (4,0) 号座位是谁?』(tensor 视角:元素→线程),学生问『我 Warp1 的 32 个人各坐哪?』(warp 视角:线程→元素)。triton-tensor-layout 不重算映射,只把同一张表转置着念——`-use-hw-view` 开关一按就切。",
+      "worked_example": {
+        "params": {
+          "layout": "#triton_gpu.blocked<{sizePerThread=[1,1], threadsPerWarp=[4,8], warpsPerCTA=[2,1], order=[1,0]}>",
+          "tensor": "tensor<8x8xf16>",
+          "开关": "useHWPointOfView(-use-hw-view)"
+        },
+        "trace_source": "manual",
+        "manual_reason": "同 m5:host 侧复刻 lib/Dialect/TritonGPU/IR/Dialect.cpp:L3343-L3397 两种视角的排版逻辑(tensor 视角走 delinearizeIndex 行主序 + 方括号缩进;HW 视角外层 Block/Warp、内层 (reg,lane) 印 threadMapping),两段共用同一份 elementMapping/threadMapping,只是遍历顺序不同。原始输出 traces/layout_decode.txt。",
+        "table": {
+          "columns": ["问法", "视角(源码分支)", "遍历顺序", "读一格的含义", "trace 里对应片段"],
+          "rows": [
+            ["元素 (4,0) 在谁手里?", "tensor 视角(!useHWPointOfView,L3343)", "按 tensor 下标行主序走 64 格,每格印 elementMapping[i]", "第 5 行首格 = T32:0 → 元素(4,0)由全局线程 32 的寄存器 0 持有", "tensor 视角第 5 行 ` T32:0, T33:0, …`"],
+            ["Warp0 的 32 条 lane 各拿哪个?", "warp 视角(useHWPointOfView,L3376)", "外层 Block/Warp、内层 (reg idx, lane tid),印 threadMapping[...]", "Warp0 一行 32 个坐标 = 该 warp 32 条 lane 各持的 (row,col)", "`Warp0:` 下 `(0,0), (0,1), …, (3,7)`"],
+            ["Warp1 覆盖 tensor 哪一半?", "warp 视角(useHWPointOfView,L3376)", "同上,warpId=1", "Warp1 的 32 个坐标从 (4,0) 到 (7,7) → 正好是 tensor 下半", "`Warp1:` 下 `(4,0), (4,1), …, (7,7)`"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "转置一致性:两种视角读的是同一份 (硬件坐标 ↔ tensor 坐标) 映射,不重新求值——tensor 视角按值域(tensor 下标)遍历、warp 视角按定义域(硬件坐标)遍历,故『元素(4,0)→T32』与『Warp1 lane0→(4,0)』必然互为逆、恒不矛盾。",
+        "argument": "elementMapping 与 threadMapping 都在同一个四重循环里(L3298-L3341)一次性建好,两个 if 分支(L3343 / L3376)只做排版、不调 ll->apply。tensor 视角打印 elementMapping[i](元素 i 的持有者),warp 视角打印 threadMapping[槽位](该槽位持有的元素坐标),二者由同一次 apply 的 (inputs→outputs) 同时写入,天然互逆。"
+      },
+      "quantified": "同一次解码产出两张视图,零重算:tensor 视角 = 64 格的 8×8 表(每格 1 个 T 标号);warp 视角 = 2 个 Warp 段、每段 numElementsPerThreads(1) 行 × threadsPerWarp(32) 列 = 32 个坐标。两视图元素总数都是 64,只是把同一映射按值域 / 定义域两个方向遍历(L3343 vs L3376)。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m6-transpose",
+          "claim": "同一 Blocked 布局的两种转置读法:tensor 视角(左,元素→线程)的 8×8 表,与 warp 视角(右,线程→元素)按 Warp 分段的坐标行,互为逆映射——warp1 那 32 个坐标恰好铺满 tensor 下半 rows 4-7。",
+          "template": "before-after",
+          "numbers": [
+            {"name": "tensor 视角", "value": "8×8 表,格 (4,0) 标 T32:0", "provenance": "traces/layout_decode.txt tensor 视角第 5 行首格"},
+            {"name": "warp 视角 Warp1 首坐标", "value": "(4,0)", "provenance": "traces/layout_decode.txt `Warp1:` 行第一个坐标 (4,0)"},
+            {"name": "互逆关系", "value": "元素(4,0)→T32 ⇔ Warp1 lane0→(4,0)", "provenance": "Dialect.cpp:L3343(elementMapping) 与 L3376(threadMapping) 同源;traces/layout_decode.txt 两段对照"},
+            {"name": "warp1 覆盖范围", "value": "rows 4-7 全 32 坐标", "provenance": "traces/layout_decode.txt `Warp1:` 行 (4,0)…(7,7)"},
+            {"name": "视角开关", "value": "-use-hw-view(UseHWPointOfView)", "provenance": "bin/triton-tensor-layout.cpp:L82-L94 layoutPrint 传 UseHWPointOfView"}
+          ],
+          "caption_draft": "按一下 -use-hw-view,同一张座位表就从『每个 tensor 元素在谁手里』翻成『每条 lane 拿哪个元素』——不重算,只换遍历方向;warp1 的 32 条 lane 正好承包 tensor 的下半部分。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m1-shared-registry",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m1-shared-registry",
+          "claim": "triton-opt / triton-reduce / triton-lsp / triton-tensor-layout 四个工具都是几行薄壳,各自建一个空 DialectRegistry 后调用同一个 registerTritonDialects 把它填满(13 个 dialect + 四家全部 pass),再各自交给不同的 MLIR 官方驱动;承重全在这份共享注册表。",
+          "template": "flow",
+          "numbers": [
+            {"name": "共享注册工具数", "value": "4 个(opt/reduce/lsp/tensor-layout)", "provenance": "bin/triton-opt.cpp:L7 / triton-reduce.cpp:L7 / triton-lsp.cpp:L7 / triton-tensor-layout.cpp:L184 都调 registerTritonDialects(registry)"},
+            {"name": "triton-opt 薄壳行数", "value": "11 行", "provenance": "bin/triton-opt.cpp:L1-L11(全文内嵌)"},
+            {"name": "注册的 dialect 数", "value": "13 个", "provenance": "bin/RegisterTritonDialects.h:L67-L75 registry.insert<...13 类...>"},
+            {"name": "各自驱动", "value": "MlirOptMain / MlirReduceMain / MlirLspServerMain", "provenance": "bin/triton-opt.cpp:L9 / triton-reduce.cpp include L3 / triton-lsp.cpp:L9"},
+            {"name": "第三方后端接缝", "value": "在 registerTritonDialects 加一行注册自家 dialect+pass", "provenance": "bin/RegisterTritonDialects.h:L37-L76;design_decisions『AMD 与 NVIDIA pass 一起无条件注册』"}
+          ],
+          "caption_draft": "四个调试工具、一份注册表:新后端(如姊妹篇 triton-ascend)要接入调试链,只需在 registerTritonDialects 里加一行登记自己的 dialect 与 pass——四个工具立刻全部认得它。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m7-tutorials-ladder",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m7-tutorials-ladder",
+          "claim": "python/tutorials 01→09 是一道认知阶梯,每一级只引入一个新概念,且恰好回指本书从鸟瞰(第 3 章)经 MMA(第 27/28 章)到 FlashAttention 实战(第 42/43 章)的主线,可当读者的 on-ramp 索引。",
+          "template": "flow",
+          "numbers": [
+            {"name": "阶梯级数", "value": "9 级(01→09)", "provenance": "dossier data_flow ③;python/tutorials/ 目录 01-vector-add … 09-persistent"},
+            {"name": "第一级回指", "value": "01-vector-add ↔ 第 3 章鸟瞰(SPMD 分块)", "provenance": "python/tutorials/01-vector-add.py:L27-L52(program_id/BLOCK_SIZE/arange/mask/load-store)"},
+            {"name": "第三级回指", "value": "03-matmul ↔ 第 27/28 章 MMA", "provenance": "dossier data_flow ③(block matmul + L2 swizzle)"},
+            {"name": "第六级回指", "value": "06-fused-attention ↔ 第 42/43 章 FlashAttention 实战", "provenance": "python/tutorials/06-fused-attention.py:L1-L14(FlashAttention v2)+ L45-L77(在线 softmax 内层)"},
+            {"name": "收束点", "value": "06 把前面 dot/reduce/block-ptr 全用上", "provenance": "python/tutorials/06-fused-attention.py:L45-L77(tl.dot/tl.max/tl.sum/tl.advance)"}
+          ],
+          "caption_draft": "别从 06-fused-attention 硬啃:先 01 立起 programming model(第 3 章),再沿阶梯每级吃一个新概念,到 06 时 dot/reduce/block-ptr 都已就位——tutorials 的顺序就是本书章节的顺序。"
+        }
+      ]
+    }
+  ]
+}
