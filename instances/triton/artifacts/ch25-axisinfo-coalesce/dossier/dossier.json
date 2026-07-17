@@ -1,0 +1,380 @@
+{
+  "chapter": "ch25",
+  "title": "Part VI 开篇：所有访存优化的静态真相源——AxisInfo 静态分析 + Coalesce 改写",
+  "one_liner": "全书第一个完整的『分析→改写』最短闭环：AxisInfo（稀疏前向数据流为每根轴推断 contiguity/divisibility/constancy）是所有访存优化的静态真相源，Coalesce 消费它的 contiguity 结果把访存 op 改写成合并友好的 Blocked 布局。回收 f3（constexpr→精确 divisibility）与 f9（multiple_of 标记→AxisInfo 悲观初值→Coalesce 才敢向量化）。",
+
+  "code_spine": [
+    "lib/Dialect/TritonGPU/Transforms/Coalesce.cpp:L156-L192  CoalescePass::runOnOperation —— 闭环总入口：先跑 ModuleAxisInfoAnalysis(分析)，再 walk 每个访存 op 算目标布局(setCoalescedEncoding)，最后 coalesceOp 逐个改写",
+    "lib/Analysis/AxisInfo.cpp:L1278-L1304  ModuleAxisInfoAnalysis::initialize —— 每函数建一个 DataFlowSolver 跑 AxisInfoAnalysis，把每个 Value 的收敛格值抄进 axisInfoMap",
+    "lib/Analysis/AxisInfo.cpp:L1124-L1184  AxisInfo::getPessimisticValueState —— 悲观初值：函数参数从 tt.divisibility/contiguity/constancy arg attr 起手(f9 消费点)，控制流 op 给最乐观初值",
+    "lib/Analysis/AxisInfo.cpp:L1102-L1122  AxisInfo::initPessimisticStateFromFunc —— 逐个读 arg attr 填三元组",
+    "lib/Analysis/AxisInfo.cpp:L1048-L1083  AxisInfoAnalysis::visitOperation —— 稀疏前向传播主循环：apply 命中的 per-op visitor 算出新格值，可被 op 上的 tt.* discardable attr 覆盖，再 join 进各 result 的格",
+    "lib/Analysis/AxisInfo.cpp:L156-L162  AxisInfoVisitorList::apply —— 按注册顺序找第一个 match 的 visitor",
+    "lib/Analysis/AxisInfo.cpp:L219-L233  MakeRangeOpAxisInfoVisitor —— tl.arange 起点：contiguity=end-start，divisibility=起点的最高 2 幂因子",
+    "lib/Analysis/AxisInfo.cpp:L273-L343  AddSubOpAxisInfoVisitor —— addptr/addi/subi：contiguity 用 contiguity×constancy 的 gcd 传播，addptr 的 divisibility 乘 elemSize(字节)",
+    "lib/Analysis/AxisInfo.cpp:L525-L547  SplatOpAxisInfoVisitor —— 标量广播成张量：contiguity=1、constancy=整维长",
+    "lib/Analysis/AxisInfo.cpp:L614-L641  BroadcastOpAxisInfoVisitor —— 沿 size==1 维广播：该维 contiguity 塌成 1、constancy 拉满",
+    "lib/Analysis/AxisInfo.cpp:L1186-L1206  AxisInfo::join —— 格的 join：逐轴 gcd(contiguity/divisibility/constancy)，常量值仅两侧相等才保留",
+    "lib/Dialect/TritonGPU/Transforms/Coalesce.cpp:L26-L105  CoalescePass::setCoalescedEncoding —— 消费 AxisInfo：argSort(contiguity) 定 order，getNumElementsPerThread 定每线程向量宽 perThread，构造 BlockedEncodingAttr",
+    "lib/Dialect/TritonGPU/Transforms/Utility.cpp:L81-L87  argSort —— 按 contiguity 降序稳定排序得 order(最连续的轴排最前)",
+    "lib/Dialect/TritonGPU/Transforms/Utility.cpp:L111-L130  getNumElementsPerThread —— divisibility→maxMultiple、contiguity→maxContig，取 min 再夹到 128/elemBits 得每线程元素数",
+    "lib/Dialect/TritonGPU/Transforms/Coalesce.cpp:L113-L154  CoalescePass::coalesceOp —— 改写：给操作数插 ConvertLayoutOp 到新布局、造同名新 op、结果再 convert 回原布局、replaceAllUsesWith"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "include/triton/Analysis/AxisInfo.h",
+      "lines": "L23-L39",
+      "code": "class AxisInfo {\npublic:\n  typedef SmallVector<int64_t> DimVectorT;\n\npublic:\n  AxisInfo() : AxisInfo({}, {}, {}) {}\n\n  AxisInfo(DimVectorT contiguity, DimVectorT divisibility, DimVectorT constancy)\n      : AxisInfo(contiguity, divisibility, constancy, std::nullopt) {}\n\n  AxisInfo(DimVectorT contiguity, DimVectorT divisibility, DimVectorT constancy,\n           std::optional<int64_t> constantValue)\n      : contiguity(contiguity), divisibility(divisibility),\n        constancy(constancy), constantValue(constantValue) {\n    assert(divisibility.size() == contiguity.size());\n    assert(constancy.size() == contiguity.size());\n  }",
+      "elide": ["三个 getter 及其上方的大段 doc 注释（含 contiguity=[1,4]/divisibility=[4,1] 的图例）可在正文用其中一两个图例讲清语义，不必全贴"]
+    },
+    {
+      "path": "include/triton/Analysis/AxisInfo.h",
+      "lines": "L41-L46, L66-L67, L91-L99",
+      "code": "// contiguity[d] is the length of the shortest sequence of contiguous integers\n// along dimension d.\n//\n// If we have an array of N elements with a contiguity value C, then the array\n// can be divided into a list of N/C sequences of C contiguous elements.\n// Since we have N = 2^k, C must be a power of two.\n// ...\n// divisibility[d] is the largest power of two that divides the first element\n// of all groups of length contiguity[d] along dimension d.\n// ...\n// constancy[d] is the length of the shortest sequence of repeating integers\n// along dimension d.",
+      "elide": ["源码此处三段注释各带一个 2D 数组图例；正文可只保留 contiguity 的 [[10,11,12,13,18,19,20,21]] → [1,4] 那个图例"]
+    },
+    {
+      "path": "lib/Analysis/AxisInfo.cpp",
+      "lines": "L1186-L1206",
+      "code": "/*static*/ AxisInfo AxisInfo::join(const AxisInfo &lhs, const AxisInfo &rhs) {\n  // If one argument is not initialized, return the other.\n  if (lhs.getRank() == 0)\n    return rhs;\n  if (rhs.getRank() == 0)\n    return lhs;\n  DimVectorT contiguity;\n  DimVectorT divisibility;\n  DimVectorT constancy;\n  for (auto d = 0; d < lhs.getRank(); ++d) {\n    contiguity.push_back(gcd(lhs.getContiguity(d), rhs.getContiguity(d)));\n    divisibility.push_back(gcd(lhs.getDivisibility(d), rhs.getDivisibility(d)));\n    constancy.push_back(gcd(lhs.getConstancy(d), rhs.getConstancy(d)));\n  }\n  std::optional<int64_t> constantValue;\n  if (lhs.getConstantValue().has_value() &&\n      rhs.getConstantValue().has_value() &&\n      lhs.getConstantValue() == rhs.getConstantValue())\n    constantValue = lhs.getConstantValue();\n  return AxisInfo(contiguity, divisibility, constancy, constantValue);\n}",
+      "elide": []
+    },
+    {
+      "path": "lib/Analysis/AxisInfo.cpp",
+      "lines": "L1124-L1157",
+      "code": "/*static*/ AxisInfo AxisInfo::getPessimisticValueState(Value value) {\n  auto rank = 1;\n  if (TensorType ty = dyn_cast<TensorType>(value.getType()))\n    rank = ty.getRank();\n  if (triton::PointerType ty = dyn_cast<triton::PointerType>(value.getType()))\n    if (TensorType elemTy = dyn_cast<TensorType>(ty.getPointeeType()))\n      rank = elemTy.getRank();\n\n  DimVectorT knownContiguity(rank, 1);\n  DimVectorT knownDivisibility(rank, 1);\n  DimVectorT knownConstancy(rank, 1);\n\n  BlockArgument blockArg = dyn_cast<BlockArgument>(value);\n\n  if (blockArg && blockArg.getOwner()->isEntryBlock()) {\n    Operation *op = blockArg.getOwner()->getParentOp();\n    if (auto fun = dyn_cast<FunctionOpInterface>(op))\n      initPessimisticStateFromFunc(blockArg.getArgNumber(), fun,\n                                   &knownContiguity, &knownDivisibility,\n                                   &knownConstancy);",
+      "elide": ["LLVM::LLVMFuncOp 分支同 FunctionOpInterface（LLVM codegen 对齐用，正文可一句带过）；RegionBranchOpInterface(scf.for/if/while) 分支给最乐观初值 highestPowOf2Divisor(0)；defining-op 分支同样支持 tt.* discardable attr 覆盖——三者可归纳为『非函数参数的 seed 走各自默认』"]
+    },
+    {
+      "path": "lib/Analysis/AxisInfo.cpp",
+      "lines": "L1102-L1122",
+      "code": "template <class T>\nvoid AxisInfo::initPessimisticStateFromFunc(int argNumber, T funcOp,\n                                            DimVectorT *contiguity,\n                                            DimVectorT *divisibility,\n                                            DimVectorT *constancy) {\n  // liast of attributes that we care about\n  SmallVector<std::pair<DimVectorT *, std::string>> retVecs;\n  retVecs.push_back({contiguity, \"tt.contiguity\"});\n  retVecs.push_back({divisibility, \"tt.divisibility\"});\n  retVecs.push_back({constancy, \"tt.constancy\"});\n  // initialize attributes one by one\n  for (auto [vec, attrName] : retVecs) {\n    Attribute attr = funcOp.getArgAttr(argNumber, attrName);\n    if (auto int_attr = dyn_cast_or_null<IntegerAttr>(attr))\n      *vec = DimVectorT(contiguity->size(), int_attr.getValue().getZExtValue());\n    if (auto dense_attr = dyn_cast_or_null<DenseElementsAttr>(attr)) {\n      auto vals = dense_attr.getValues<int>();\n      *vec = DimVectorT(vals.begin(), vals.end());\n    }\n  }\n}",
+      "elide": []
+    },
+    {
+      "path": "lib/Analysis/AxisInfo.cpp",
+      "lines": "L219-L233",
+      "code": "class MakeRangeOpAxisInfoVisitor final\n    : public AxisInfoVisitorImpl<triton::MakeRangeOp> {\npublic:\n  using AxisInfoVisitorImpl<triton::MakeRangeOp>::AxisInfoVisitorImpl;\n\n  AxisInfo\n  getAxisInfo(triton::MakeRangeOp op,\n              ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) override {\n    auto start = op.getStart();\n    auto end = op.getEnd();\n    return AxisInfo(/*contiguity=*/{end - start},\n                    /*divisibility=*/{highestPowOf2Divisor(start)},\n                    /*constancy=*/{1});\n  }\n};",
+      "elide": []
+    },
+    {
+      "path": "lib/Analysis/AxisInfo.cpp",
+      "lines": "L290-L315",
+      "code": "  int64_t getDivisibility(OpTy op, const AxisInfo &lhs, const AxisInfo &rhs,\n                          int dim) override {\n    // lhs = k * d_lhs = k * k' * gcd(d_lhs, d_rhs)\n    // rhs = p * d_rhs = p * p' * gcd(d_lhs, d_rhs)\n    // lhs + rhs = k * d_lhs + p * d_rhs = (k * k' + p * p') * gcd(d_lhs, d_rhs)\n    auto rhsDivisibility = rhs.getDivisibility(dim);\n    if constexpr (std::is_same_v<OpTy, triton::AddPtrOp>) {\n      //  %ptr = addptr %lhs, %rhs\n      // is equivalent to\n      //  %0 = mul %rhs, %elemSize\n      //  %ptr = add %lhs, %0\n      // ...\n      auto rank = lhs.getRank();\n      auto elemSize = std::max<int64_t>(\n          1, triton::getPointeeBitWidth(op.getPtr().getType()) / 8);\n      rhsDivisibility = multiplyDivisor(rhs.getDivisibility(dim), elemSize);\n    }\n    return gcd(lhs.getDivisibility(dim), rhsDivisibility);\n  }",
+      "elide": ["注释中间的 addptr [16],[0,1,2,3] -> [16,20,24,28]（元素位置 [4,5,6,7]，16 字节可整除）具体例子可在正文worked example里用；getContiguity/getConstancy/getConstantValue 三个兄弟方法一句带过"]
+    },
+    {
+      "path": "lib/Analysis/AxisInfo.cpp",
+      "lines": "L1048-L1083",
+      "code": "LogicalResult AxisInfoAnalysis::visitOperation(\n    Operation *op, ArrayRef<const dataflow::Lattice<AxisInfo> *> operands,\n    ArrayRef<dataflow::Lattice<AxisInfo> *> results) {\n  // ...\n  AxisInfo curr = visitors.apply(op, operands);\n  if (curr.getRank() == 0) {\n    setAllToEntryStates(results);\n    return success();\n  }\n  // override with hint\n  auto newContiguity = curr.getContiguity();\n  auto newDivisibility = curr.getDivisibility();\n  auto newConstancy = curr.getConstancy();\n  if (Attribute attr = op->getDiscardableAttr(\"tt.contiguity\")) {\n    auto vals = cast<DenseElementsAttr>(attr).getValues<int>();\n    newContiguity = AxisInfo::DimVectorT(vals.begin(), vals.end());\n  }\n  if (Attribute attr = op->getDiscardableAttr(\"tt.divisibility\")) {\n    auto vals = cast<DenseElementsAttr>(attr).getValues<int>();\n    newDivisibility = AxisInfo::DimVectorT(vals.begin(), vals.end());\n  }\n  if (Attribute attr = op->getDiscardableAttr(\"tt.constancy\")) {\n    auto vals = cast<DenseElementsAttr>(attr).getValues<int>();\n    newConstancy = AxisInfo::DimVectorT(vals.begin(), vals.end());\n  }\n  curr = AxisInfo(newContiguity, newDivisibility, newConstancy,\n                  curr.getConstantValue());\n  // join all lattice elements\n  for (auto *result : results)\n    propagateIfChanged(result, result->join(curr));\n  return success();\n}",
+      "elide": ["开头 for(operands) 里对 rank==0 的 operand 补 setToEntryState 的 scf.if 兜底可省略解释（源码注释自承『not the right way』）"]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Coalesce.cpp",
+      "lines": "L26-L105",
+      "code": "  void\n  setCoalescedEncoding(ModuleAxisInfoAnalysis &axisInfoAnalysis, Operation *op,\n                       int numWarps, int threadsPerWarp,\n                       llvm::MapVector<Operation *, Attribute> &layoutMap) {\n    Value ptr = getMemAccessPtr(op);\n    auto refTensorType = cast<RankedTensorType>(ptr.getType());\n\n    auto contiguity = axisInfoAnalysis.getAxisInfo(ptr)->getContiguity();\n    SmallVector<unsigned> order = argSort(contiguity);\n\n    // ...collect other mem accesses with the same order (memAccessesSameOrder)...\n\n    auto shapePerCTA = triton::gpu::getShapePerCTA(refTensorType);\n    int numElems = product<int64_t>(shapePerCTA);\n    int numThreads = numWarps * threadsPerWarp;\n\n    unsigned perThread = getNumElementsPerThread(op, order, axisInfoAnalysis);\n\n    for (Operation *opSameOrder : memAccessesSameOrder) {\n      if (opSameOrder == op)\n        continue;\n      unsigned currPerThread =\n          getNumElementsPerThread(opSameOrder, order, axisInfoAnalysis);\n      perThread = std::max(perThread, currPerThread);\n    }\n\n    perThread = std::min<int>(perThread, std::max(numElems / numThreads, 1));\n\n    if (!dyn_cast<triton::LoadOp>(op)) {\n      // For ops that can result in a global memory write, we should enforce\n      // that each thread handles at most 128 bits...\n      perThread = std::min<int>(\n          perThread, getNumElementsPerThread(op, order, axisInfoAnalysis));\n    }\n    SmallVector<unsigned> sizePerThread(refTensorType.getRank(), 1);\n    sizePerThread[order[0]] = perThread;\n\n    auto CTALayout = triton::gpu::getCTALayout(refTensorType.getEncoding());\n    layoutMap[op] = triton::gpu::BlockedEncodingAttr::get(\n        &getContext(), refTensorType.getShape(), sizePerThread, order, numWarps,\n        threadsPerWarp, CTALayout);\n  }",
+      "elide": ["所有 LDBG/LLVM_DEBUG 打印可删；memAccessesSameOrder 的 multiRootGetSlice 邻域搜集是『同 order 的相关访存取最大 divisibility』的工程细节，正文一句带过、无需逐行"]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Utility.cpp",
+      "lines": "L81-L87",
+      "code": "SmallVector<unsigned, 4> argSort(const SmallVector<int64_t> &arr) {\n  SmallVector<unsigned, 4> ret(arr.size());\n  std::iota(ret.begin(), ret.end(), 0);\n  std::stable_sort(ret.begin(), ret.end(),\n                   [&](unsigned x, unsigned y) { return arr[x] > arr[y]; });\n  return ret;\n}",
+      "elide": []
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Utility.cpp",
+      "lines": "L111-L130",
+      "code": "unsigned getNumElementsPerThread(Operation *op, SmallVector<unsigned> order,\n                                 ModuleAxisInfoAnalysis &axisInfoAnalysis) {\n  Value val = getMemAccessPtr(op);\n  auto ty = cast<RankedTensorType>(val.getType());\n  auto shapePerCTA = triton::gpu::getShapePerCTA(ty);\n  AxisInfo &valInfo = *axisInfoAnalysis.getAxisInfo(val);\n  unsigned elemNumBits = getElementBitWidth(ty);\n  unsigned elemNumBytes = std::max(elemNumBits / 8, 1u);\n  unsigned maxMultipleBytes = valInfo.getDivisibility(order[0]);\n  unsigned maxMultiple = std::max(maxMultipleBytes / elemNumBytes, 1u);\n  unsigned maxContig =\n      std::min(valInfo.getContiguity(order[0]), shapePerCTA[order[0]]);\n  unsigned alignment = std::min(maxMultiple, maxContig);\n  unsigned currPerThread = std::min(alignment, 128 / elemNumBits);\n  return currPerThread;\n}",
+      "elide": ["末尾 LDBG 打印可删"]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Coalesce.cpp",
+      "lines": "L113-L154",
+      "code": "  void coalesceOp(Attribute encoding, Operation *op) {\n    OpBuilder builder(op);\n    // Convert operands\n    SmallVector<Value, 4> newArgs;\n    for (auto operand : op->getOperands()) {\n      auto tensorType = dyn_cast<RankedTensorType>(operand.getType());\n      if (tensorType &&\n          !isa<triton::gpu::SharedEncodingAttr>(tensorType.getEncoding())) {\n        Type newType = getNewType(tensorType, encoding);\n        newArgs.push_back(builder.create<triton::gpu::ConvertLayoutOp>(\n            op->getLoc(), newType, operand));\n      } else {\n        newArgs.push_back(operand);\n      }\n    }\n\n    // Convert output types\n    SmallVector<Type, 4> newTypes;\n    for (auto t : op->getResultTypes()) {\n      bool isAsync = isa<triton::gpu::AsyncCopyGlobalToLocalOp>(op);\n      newTypes.push_back(isAsync ? t : getNewType(t, encoding));\n    }\n\n    // Construct new op with the new encoding\n    Operation *newOp =\n        builder.create(op->getLoc(), op->getName().getIdentifier(), newArgs,\n                       newTypes, op->getAttrs());\n\n    // Cast the results back to the original layout\n    for (size_t i = 0; i < op->getNumResults(); i++) {\n      Value newResult = newOp->getResult(i);\n      if (newTypes[i] != op->getResultTypes()[i]) {\n        newResult = builder.create<triton::gpu::ConvertLayoutOp>(\n            op->getLoc(), op->getResult(i).getType(), newResult);\n      }\n      op->getResult(i).replaceAllUsesWith(newResult);\n    }\n    op->erase();\n  }",
+      "elide": []
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Coalesce.cpp",
+      "lines": "L156-L192",
+      "code": "  void runOnOperation() override {\n    // Run axis info analysis\n    ModuleOp moduleOp = getOperation();\n    ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);\n\n    // For each i/o operation, we determine what layout\n    // the pointers should have for best memory coalescing\n    llvm::MapVector<Operation *, Attribute> layoutMap;\n    moduleOp.walk([&](Operation *curr) {\n      Value ptr = getMemAccessPtr(curr);\n      if (!ptr)\n        return;\n      // We only convert `tensor<tt.ptr<>>` load/store\n      bool isPtrTensor = false;\n      if (auto tensorType = dyn_cast<RankedTensorType>(ptr.getType()))\n        isPtrTensor = isa<PointerType>(tensorType.getElementType());\n      if (!isPtrTensor)\n        return;\n      auto mod = curr->getParentOfType<ModuleOp>();\n      int numWarps = triton::gpu::TritonGPUDialect::getNumWarps(mod);\n      int threadsPerWarp =\n          triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);\n      setCoalescedEncoding(axisInfoAnalysis, curr, numWarps, threadsPerWarp,\n                           layoutMap);\n    });\n\n    for (auto &kv : layoutMap) {\n      coalesceOp(kv.second, kv.first);\n    }\n  }",
+      "elide": []
+    }
+  ],
+
+  "key_classes": [
+    {
+      "name": "AxisInfo",
+      "file": "include/triton/Analysis/AxisInfo.h",
+      "responsibility": "格(lattice)值：为一个张量 Value 的每根轴持有三元组 contiguity/divisibility/constancy（+可选 constantValue）。所有访存优化读的『静态真相』就是它。含 join(逐轴 gcd)、getPessimisticValueState(悲观初值/seed)、initPessimisticStateFromFunc(从函数参数 tt.* attr 起手)。"
+    },
+    {
+      "name": "AxisInfoAnalysis",
+      "file": "lib/Analysis/AxisInfo.cpp",
+      "responsibility": "MLIR SparseForwardDataFlowAnalysis 子类。持一个 AxisInfoVisitorList；visitOperation 对每个 op 找匹配 visitor 算新格值→可被 op 上 tt.* discardable attr 覆盖→join 进 result 格；setToEntryState 用 getPessimisticValueState 起手。"
+    },
+    {
+      "name": "AxisInfoVisitor / BinaryOpVisitorImpl / 各 per-op visitor",
+      "file": "lib/Analysis/AxisInfo.cpp",
+      "responsibility": "前向传播规则库：每类 op 一个 visitor（MakeRange/AddSub(含AddPtr)/Mul/Div/Rem/Splat/Broadcast/ExpandDims/Cmp/Select/Shift/MaxMin/Load/Constant/Cast），把操作数格值映成结果格值。BinaryOpVisitorImpl 抽象出 getContiguity/getDivisibility/getConstancy/getConstantValue 四个可覆写钩子。"
+    },
+    {
+      "name": "ModuleAxisInfoAnalysis",
+      "file": "include/triton/Analysis/AxisInfo.h",
+      "responsibility": "模块级封装，基于 CallGraph 跨函数：对每个函数建 DataFlowSolver 跑一遍 AxisInfoAnalysis 收敛后抄进 AxisInfoMapT；按调用图逆后序把调用点实参的 axis info 以 gcd 合进被调函数的 arg attr。对外提供 getAxisInfo/getPtrContiguity/getPtrAlignment/getMaskAlignment——Coalesce 及后续 pass 的查询入口。"
+    },
+    {
+      "name": "CoalescePass",
+      "file": "lib/Dialect/TritonGPU/Transforms/Coalesce.cpp",
+      "responsibility": "改写 pass（闭环另一半）。runOnOperation 先跑 ModuleAxisInfoAnalysis；对每个张量指针访存 op：setCoalescedEncoding 用 contiguity 定 order、divisibility/contiguity 定每线程向量宽 perThread，产出 BlockedEncodingAttr；coalesceOp 插 ConvertLayoutOp 把 op 换成新布局。"
+    }
+  ],
+
+  "data_flow": [
+    "CoalescePass::runOnOperation 构造 ModuleAxisInfoAnalysis(moduleOp) —— 触发整模块的 AxisInfo 分析",
+    "ModuleAxisInfoAnalysis 构造器按 CallGraph 逆后序对每个 func 调 initialize：建 DataFlowSolver 跑 AxisInfoAnalysis 到不动点，把每个 Value 的收敛格值抄进 funcMap；再对每个 callOp 调 update 把实参 axis info 以 gcd 下推到 callee 的 arg attr",
+    "AxisInfoAnalysis 起手：setToEntryState 用 getPessimisticValueState 给 seed——函数入口参数从 tt.divisibility/contiguity/constancy arg attr 读悲观初值(f9 消费点)，控制流结果给最乐观初值",
+    "AxisInfoAnalysis::visitOperation 前向传播：visitors.apply 找匹配 op 的 visitor 算结果格值；若 op 带 tt.* discardable attr 则覆盖；对每个 result 做 join(逐轴 gcd) 并 propagateIfChanged，直到不动点",
+    "典型链：make_range 给 contiguity=BLOCK；splat 基址给 constancy=BLOCK；addptr(基址, range) 把 divisibility 乘 elemSize 传出——最终 ptr 张量在连续轴上拿到大 contiguity/divisibility(f3：若形状/偏移是 constexpr 具体值，divisibility 能被 highestPowOf2Divisor 精确算出)",
+    "回到 CoalescePass::runOnOperation：walk 每个 tensor-of-ptr 的 load/store，调 setCoalescedEncoding",
+    "setCoalescedEncoding：读 ptr 的 AxisInfo.contiguity → argSort 得 order(最连续轴在前) → getNumElementsPerThread 用 divisibility(maxMultiple) 与 contiguity(maxContig) 的 min、再夹到 128/elemBits 得 perThread → sizePerThread[order[0]]=perThread → BlockedEncodingAttr",
+    "coalesceOp：给操作数插 ConvertLayoutOp 到新 Blocked 布局、造同名新 op 产出新布局结果、结果再 ConvertLayoutOp 回原布局、replaceAllUsesWith、erase 旧 op——IR 里访存 op 的指针布局变成合并友好的"
+  ],
+
+  "design_decisions": [
+    {
+      "decision": "三元组(contiguity/divisibility/constancy)而非单一『是否连续』布尔，且都强制为 2 的幂",
+      "why": "向量化/合并访存需要的是『每线程能安全读多少个连续且对齐的元素』——contiguity 给连续长度、divisibility 给起始对齐(字节)、constancy 给重复长度(掩码对齐/广播判断)。三者都是 2 的幂，才能让 join=gcd 闭合、且直接对应 32/64/128-bit 向量访存宽度。",
+      "evidence": "include/triton/Analysis/AxisInfo.h:L41-L108"
+    },
+    {
+      "decision": "格的 join = 逐轴 gcd（而非 min 或集合交）",
+      "why": "两条控制流汇合处，只能保证两侧都成立的对齐/连续性。gcd 精确刻画『同时是 A 的因子和 B 的因子的最大 2 幂』——这正是保守但不丢信息的最紧上界。也解释了为什么提示一旦在某分支被 join 成 1，后面就再也合并不动(f9 的失败面)。",
+      "evidence": "lib/Analysis/AxisInfo.cpp:L1186-L1206"
+    },
+    {
+      "decision": "悲观初值从函数参数的 tt.divisibility/contiguity/constancy attr 起手；非函数值默认 (1,1,1)，控制流值给最乐观",
+      "why": "AxisInfo 无法凭空知道运行时指针的对齐——必须由前端把 tl.multiple_of/JIT 特化(constexpr)打的标记通过 arg attr 传进来当 seed(f9 的『提示进来』这一头；也是 f3：constexpr 形状让偏移在追踪期即具体数字)。默认 (1,1,1) 是最保守假设，保证没提示时不会误判连续。",
+      "evidence": "lib/Analysis/AxisInfo.cpp:L1124-L1184, L1102-L1122"
+    },
+    {
+      "decision": "addptr 的 divisibility 乘 elemSize(字节)",
+      "why": "AxisInfo 的 divisibility 语义是『字节对齐』。指针加偏移在元素上连续，但字节步长是 elemSize 倍——所以 rhs(偏移)的 divisibility 要乘元素字节数才是指针的字节对齐。这是 addptr visitor 与普通 addi 的唯一区别，也是把『元素连续』翻译成『字节对齐』的关键一步。",
+      "evidence": "lib/Analysis/AxisInfo.cpp:L296-L313"
+    },
+    {
+      "decision": "op 上的 tt.* discardable attr 可在 visitOperation 里覆盖分析结果",
+      "why": "除了函数参数的 seed，中间 op 也可被显式标注(如某些 pass 注入的提示)——覆盖机制让这些标注直接生效，不被前向规则冲掉。与 getPessimisticValueState 里 defining-op 的 attr 读取对称。",
+      "evidence": "lib/Analysis/AxisInfo.cpp:L1061-L1078"
+    },
+    {
+      "decision": "Coalesce 用 argSort(contiguity) 定 order——最连续的轴放最内层",
+      "why": "合并访存要求相邻 lane 访问相邻地址，即最连续的轴必须是布局里 stride 最小(最内)的轴。argSort 降序排 contiguity 得到的 order 恰好把最连续轴排在 order[0]，再让 sizePerThread[order[0]]=perThread 把向量宽度全压在这根轴上。",
+      "evidence": "lib/Dialect/TritonGPU/Transforms/Coalesce.cpp:L40-L41, L98-L99; lib/Dialect/TritonGPU/Transforms/Utility.cpp:L81-L87"
+    },
+    {
+      "decision": "perThread = min(divisibility/elemBytes, contiguity, shapePerCTA) 再夹到 128/elemBits；store 额外夹 128-bit",
+      "why": "每线程能向量化的元素数受三重约束：字节对齐(divisibility)、连续长度(contiguity)、以及硬件最宽向量访存 128-bit。store 因为写回没有 L1 缓存兜底『空洞』，强制不超过 128-bit；load 可放宽。这把 f9 埋的人工判据 N_txn=⌈32·s_elem/s_txn⌉ 自动化成了编译器计算。",
+      "evidence": "lib/Dialect/TritonGPU/Transforms/Utility.cpp:L117-L124; lib/Dialect/TritonGPU/Transforms/Coalesce.cpp:L85-L97"
+    },
+    {
+      "decision": "改写用 ConvertLayoutOp 夹层而非原地改类型",
+      "why": "MLIR SSA 下 op 的结果类型被下游依赖，不能原地改。做法是：操作数 convert 到新布局→造新 op→结果 convert 回原布局→replaceAllUsesWith。后续 layout 传播/ConvertLayout 消除 pass 会把冗余的 convert 化简掉——这是 analysis→transform 范式里『局部改写、全局收敛』的典型。",
+      "evidence": "lib/Dialect/TritonGPU/Transforms/Coalesce.cpp:L113-L154"
+    },
+    {
+      "decision": "ModuleAxisInfoAnalysis 基于 CallGraph、假设无递归、按逆后序传播实参信息",
+      "why": "同一函数被多处调用时，参数对齐取所有调用点的 gcd(update 里对 arg attr 做 gcd)——保守但正确。逆后序保证被调函数先于调用者拿到已下推的实参信息。注释明言未来可用 function cloning 让每个调用点独立。",
+      "evidence": "include/triton/Analysis/AxisInfo.h:L155-L188; lib/Analysis/AxisInfo.cpp:L1306-L1329"
+    }
+  ],
+
+  "theory": [
+    "格(lattice)与单调数据流：AxisInfo 的每根轴取值在『2 的幂 + gcd 偏序』上构成半格，join=gcd 是最大下界(信息越少值越小，1 是底)。前向传播反复对 result 做 join 直到不动点——因为 gcd 单调下降且有下界 1，必然收敛。",
+    "f9 回收——人工判据自动化：ch07 给出合并判据『相邻 lane 地址连续 → 一笔事务』与公式 N_txn=⌈32·s_elem/s_txn⌉。AxisInfo 的 contiguity 就是『相邻是否连续』的静态度量，divisibility 是对齐度量；getNumElementsPerThread 把 min(对齐, 连续, 128/bits) 算成每线程向量宽——即用静态分析替人算 N_txn，Coalesce 据此定布局使事务数最小。",
+    "f3 回收——constexpr→精确 divisibility：MakeRange 的 divisibility=highestPowOf2Divisor(start)，addptr/mul 的 divisibility 沿最高 2 幂因子传播。只有当形状/偏移在追踪期是 constexpr 具体数字时，highestPowOf2Divisor 才能算出大的对齐(如 1024→1024)；若是运行时未知值，只能退回 1。这就是『标了 constexpr 编译器才能特化/向量化/合并访存』在访存这条线上的落地。",
+    "addptr 元素连续 vs 字节对齐：元素级 contiguity 与字节级 divisibility 是两套单位。addptr 保持元素连续(contiguity 传承)但 divisibility 需乘 elemSize 转成字节——正文可用 [16],[0,1,2,3]→[16,20,24,28] 的例子量化(i32：4 字节步长，divisibility=16 字节)。",
+    "join 成 1 的失败面：任一分支/调用点把某轴 contiguity 或 divisibility 拉成 1，gcd 后全程为 1，getNumElementsPerThread 退回每线程 1 元素——Coalesce 合并不动。这解释了『为什么你的 tl.multiple_of 提示有时不生效』：提示没进 seed、或被某条路径的保守值 join 掉了。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "AxisInfo.cpp 里非本章主线的 per-op visitor 完整实现：DivOp/RemOp/Cmp/Select/Logical/ShL/ShR/MaxMin/ExpandDims 的方法体", "why_safe": "本章主线只需 make_range/splat/broadcast/addptr(addsub)/load/constant 这几个代表把『三元组如何前向更新』讲透；其余 visitor 是同一模式(BinaryOpVisitorImpl 覆写四钩子)的更多实例，删掉不影响读者理解范式，正文以『还有几十个访问器，模式相同』一句概括。保留其类名注册行(visitors.append) 以示规模。"},
+      {"what": "gcdImpl 的扩展欧几里得完整推导(x,y 回填)", "why_safe": "本章只用到 gcd 的返回值语义(逐轴取 gcd)，扩展欧几里得的 Bézout 系数 x,y 在 AxisInfo 里从未被使用(gcd() 包装丢弃了它们)。可简化为标准二元 gcd，不改变任何格值结果。"},
+      {"what": "所有 LDBG/LLVM_DEBUG/DBGS 调试打印块", "why_safe": "纯调试输出，不参与任何格值计算或改写决策，删除后行为逐字节不变。"},
+      {"what": "setCoalescedEncoding 里 memAccessesSameOrder 的 multiRootGetSlice 邻域搜集与 perThread 取 max 循环", "why_safe": "这是『同 order 的相关访存合并取最大 divisibility』的工程增强；单个访存 op 的核心闭环(contiguity→order→perThread→BlockedEncoding)不依赖它。正文可一句注明『还会跨相关访存取最大对齐』，删其实现不破坏单 op 的正确布局推导。"},
+      {"what": "ModuleAxisInfoAnalysis 的 getMaskAlignment 及 LLVM::LLVMFuncOp 分支", "why_safe": "getMaskAlignment 服务掩码对齐查询、非 Coalesce 主闭环；LLVMFuncOp 分支是 codegen 阶段兜底。删掉不影响 AxisInfo→Coalesce 的分析→改写闭环叙事。getPtrContiguity/getPtrAlignment 保留(是对外查询范例)。"}
+    ],
+    "must_keep": [
+      {"symbol": "AxisInfo", "why": "全章核心数据结构——三元组格值，读者必须理解 contiguity/divisibility/constancy 各是什么。"},
+      {"symbol": "getContiguity", "why": "Coalesce 定 order 直接消费；三元组语义之一。"},
+      {"symbol": "getDivisibility", "why": "字节对齐度量；perThread 计算与 addptr 传播的核心。"},
+      {"symbol": "getConstancy", "why": "重复长度度量；掩码/广播判断，三元组不可缺的一角。"},
+      {"symbol": "join", "why": "格的 join=逐轴 gcd——单调收敛与『提示被 join 成 1』失败面的关键，f9 失败面所系。"},
+      {"symbol": "getPessimisticValueState", "why": "悲观初值/seed 的起点；f9『提示进来当初值』的落点。"},
+      {"symbol": "initPessimisticStateFromFunc", "why": "从函数参数 tt.divisibility/contiguity/constancy attr 读 seed——f9/f3 提示如何被消费的直接证据。"},
+      {"symbol": "MakeRangeOpAxisInfoVisitor", "why": "前向传播起点代表：arange 如何生成初始 contiguity/divisibility(f3：divisibility=highestPowOf2Divisor(start))。"},
+      {"symbol": "AddSubOpAxisInfoVisitor", "why": "addptr 传播代表：元素连续→字节对齐(divisibility×elemSize)的关键转换。"},
+      {"symbol": "SplatOpAxisInfoVisitor", "why": "标量→张量广播的三元组规则代表(constancy 拉满)。"},
+      {"symbol": "BroadcastOpAxisInfoVisitor", "why": "沿 size==1 维广播的三元组规则代表。"},
+      {"symbol": "AxisInfoAnalysis", "why": "稀疏前向数据流分析主体，承载 visitOperation 传播循环。"},
+      {"symbol": "visitOperation", "why": "前向传播主循环 + tt.* attr 覆盖 + join 传播，读者理解『分析怎么跑』的核心。"},
+      {"symbol": "ModuleAxisInfoAnalysis", "why": "对外查询入口 + 跨函数 CallGraph 传播；Coalesce 通过它拿 AxisInfo。"},
+      {"symbol": "getAxisInfo", "why": "Coalesce 消费 AxisInfo 的实际调用点。"},
+      {"symbol": "getPtrContiguity", "why": "从 AxisInfo 推指针连续度的对外范例，展示分析结果如何被下游用。"},
+      {"symbol": "getPtrAlignment", "why": "从 divisibility/contiguity 推对齐的对外范例。"},
+      {"symbol": "CoalescePass", "why": "改写 pass 主体——闭环的另一半。"},
+      {"symbol": "setCoalescedEncoding", "why": "消费 contiguity→order、divisibility/contiguity→perThread→BlockedEncoding 的核心改写决策。"},
+      {"symbol": "getMemAccessPtr", "why": "识别访存 op 并取其指针操作数——Coalesce walk 的入口判据。"},
+      {"symbol": "argSort", "why": "按 contiguity 降序定 order——合并友好轴排最内的关键一步。"},
+      {"symbol": "getNumElementsPerThread", "why": "把 divisibility/contiguity/128-bit 三重约束算成每线程向量宽——f9 人工判据自动化的落点。"},
+      {"symbol": "coalesceOp", "why": "实际 IR 改写：ConvertLayoutOp 夹层 + 新 op + replaceAllUsesWith，读者看到『改写』长什么样。"},
+      {"symbol": "BlockedEncodingAttr", "why": "改写产出的目标布局类型——合并友好布局的具体载体。"},
+      {"symbol": "ConvertLayoutOp", "why": "布局转换夹层 op，改写的缝合手段。"}
+    ]
+  },
+
+  "mechanisms": [
+    {
+      "id": "axisinfo-triple",
+      "name": "AxisInfo 三元组格值 (contiguity/divisibility/constancy)",
+      "kind": "layout",
+      "source_anchors": ["include/triton/Analysis/AxisInfo.h:L23-L108"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "lattice-join-gcd",
+      "name": "格的 join = 逐轴 gcd（单调收敛 + 提示被 join 成 1 的失败面）",
+      "kind": "dataflow",
+      "source_anchors": ["lib/Analysis/AxisInfo.cpp:L1186-L1206"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "pessimistic-seed",
+      "name": "悲观初值 seed：从函数参数 tt.divisibility/contiguity/constancy attr 起手（f9 消费点）",
+      "kind": "dataflow",
+      "source_anchors": ["lib/Analysis/AxisInfo.cpp:L1124-L1184", "lib/Analysis/AxisInfo.cpp:L1102-L1122"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "sparse-forward-visitors",
+      "name": "稀疏前向数据流 + per-op 访问器前向传播（make_range/addptr/splat/broadcast/load 代表）",
+      "kind": "dataflow",
+      "source_anchors": ["lib/Analysis/AxisInfo.cpp:L1048-L1083", "lib/Analysis/AxisInfo.cpp:L219-L233", "lib/Analysis/AxisInfo.cpp:L273-L343", "lib/Analysis/AxisInfo.cpp:L525-L547", "lib/Analysis/AxisInfo.cpp:L614-L641"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "addptr-elem-to-byte",
+      "name": "addptr 的元素连续→字节对齐：divisibility 乘 elemSize",
+      "kind": "algorithm",
+      "source_anchors": ["lib/Analysis/AxisInfo.cpp:L290-L315"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "constexpr-precise-divisibility",
+      "name": "constexpr→精确 divisibility（f3 回收：highestPowOf2Divisor 只在具体数字上算得出大对齐）",
+      "kind": "dataflow",
+      "source_anchors": ["lib/Analysis/AxisInfo.cpp:L219-L233", "include/triton/Dialect/Triton/IR/Utility.h:L32-L42"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "tt-attr-override",
+      "name": "op 上 tt.* discardable attr 覆盖分析结果",
+      "kind": "config",
+      "source_anchors": ["lib/Analysis/AxisInfo.cpp:L1061-L1078"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "module-callgraph",
+      "name": "ModuleAxisInfoAnalysis 基于 CallGraph 跨函数传播实参信息",
+      "kind": "protocol",
+      "source_anchors": ["include/triton/Analysis/AxisInfo.h:L155-L188", "lib/Analysis/AxisInfo.cpp:L1278-L1329"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "ptr-alignment-query",
+      "name": "从 AxisInfo 推指针对齐/连续度（getPtrContiguity/getPtrAlignment 对外查询范例）",
+      "kind": "algorithm",
+      "source_anchors": ["lib/Analysis/AxisInfo.cpp:L1208-L1256"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "coalesce-order",
+      "name": "Coalesce 定 order：argSort(contiguity) 把最连续轴排最内",
+      "kind": "layout",
+      "source_anchors": ["lib/Dialect/TritonGPU/Transforms/Coalesce.cpp:L40-L41", "lib/Dialect/TritonGPU/Transforms/Utility.cpp:L81-L87", "lib/Dialect/TritonGPU/Transforms/Coalesce.cpp:L98-L104"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "perthread-vec-width",
+      "name": "getNumElementsPerThread：divisibility/contiguity/128-bit 三重约束定每线程向量宽（f9 判据自动化）",
+      "kind": "algorithm",
+      "source_anchors": ["lib/Dialect/TritonGPU/Transforms/Utility.cpp:L111-L130", "lib/Dialect/TritonGPU/Transforms/Coalesce.cpp:L73-L99"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "coalesce-rewrite",
+      "name": "coalesceOp 改写：ConvertLayoutOp 夹层 + 新 op + replaceAllUsesWith，产出 BlockedEncodingAttr",
+      "kind": "layout",
+      "source_anchors": ["lib/Dialect/TritonGPU/Transforms/Coalesce.cpp:L113-L154", "lib/Dialect/TritonGPU/Transforms/Coalesce.cpp:L101-L104"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "analysis-transform-loop",
+      "name": "analysis→transform 最短闭环范式（AxisInfo 只读推断 → Coalesce 据推断改布局；后续 pass 皆此变体）",
+      "kind": "protocol",
+      "source_anchors": ["lib/Dialect/TritonGPU/Transforms/Coalesce.cpp:L156-L192"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    }
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recover": [
+      {
+        "id": "f3",
+        "planted_in": "ch01",
+        "summary": "constexpr 特化是全书性能主线——标了 constexpr 的值追踪期即具体数字，编译器才能消分支(visit_If)、特化函数、按已知形状展开与向量化/合并访存；后续性能 pass 章逐一兑现。",
+        "recover_here": "本章在访存这条线上兑现：MakeRange 的 divisibility=highestPowOf2Divisor(start)、addptr/mul 沿最高 2 幂因子传播——只有形状/偏移是 constexpr 具体数字时才能算出大 divisibility(如 1024→1024)，AxisInfo 才推得出精确对齐、Coalesce 才敢把 load 改成向量化布局；否则退回 1，合并不动。"
+      },
+      {
+        "id": "f9",
+        "planted_in": "ch07",
+        "summary": "coalescing 判据(相邻 lane 地址是否连续决定能否合并成一笔内存事务，给出公式 N_txn=⌈32·s_elem/s_txn⌉)——ch25 是编译器把这条人工判据自动化为静态分析(AxisInfo contiguity/divisibility)+改写 pass(Coalesce 按 contiguity 定 order)的落点。",
+        "recover_here": "本章兑现自动化：tl.multiple_of/max_contiguity 打的 divisibility/contiguity 标记经 initPessimisticStateFromFunc 成为 AxisInfo 悲观初值(seed)；getNumElementsPerThread 用 min(对齐, 连续, 128/bits) 把 N_txn 判据算成每线程向量宽；Coalesce 按 argSort(contiguity) 定 order 产出合并最优布局。提示没进 seed 或被某路径 join 成 1，合并即失效——把 ch07 的人工判据完整落成编译器自动流程。"
+      }
+    ]
+  },
+
+  "notes_on_scope": {
+    "回指非重讲": "ch07 讲 coalescing 硬件原理与 N_txn 公式(第一现场)、ch09 讲 tl.multiple_of/max_contiguous 怎么打标记、ch16 讲 set_arg_attr/tt.divisibility 怎么进 IR——本章只讲这些标记『如何被 AxisInfo 消费 + Coalesce 如何据此改写』，其余以『见第 N 章』回指，不重讲、不印内部 ID。",
+    "不展开": "不深化 MLIR DataFlow framework 本身实现(用 SparseForwardDataFlowAnalysis，不讲它内部)；不展开 ch26-35 的后续具体 pass——本章只立 analysis→transform 范式。",
+    "pin_verification": "v3.2.0 @ 9641643da6c52000c807b5eeed05edaec4402a67。可 headless(pip install triton==3.2.0，无 GPU)对一段 TTGIR 跑 AxisInfo 观测每轴三元组、跑 Coalesce pass 前后对比布局；标 IR 阶段(coalesce 在 TTGIR 层)。"
+  }
+}

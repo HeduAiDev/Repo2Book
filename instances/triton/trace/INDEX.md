@@ -5,6 +5,7 @@
 ## Recent Activity
 
 | Date | Type | Chapter | Summary | File |
+| 2026-07-17 | delivery | 25 | ch25《AxisInfo 静态分析与 Coalesce 改写》定稿——Part VI 开篇 + 全书第一个 analysis→transform 最短闭环 | [2026-07-17_ch25-ch25《axisinfo-静态分析与-coalesce-改写》定稿——part-vi-开篇-+-全书第一个-analy.md](deliveries/2026-07-17_ch25-ch25《axisinfo-静态分析与-coalesce-改写》定稿——part-vi-开篇-+-全书第一个-analy.md) |
 | 2026-07-17 | delivery | 23 | ch23《LinearLayout：一个抽象统一所有布局》定稿 + 回收 f17 | [2026-07-17_ch23-ch23《linearlayout：一个抽象统一所有布局》定稿-+-回收-f17.md](deliveries/2026-07-17_ch23-ch23《linearlayout：一个抽象统一所有布局》定稿-+-回收-f17.md) |
 | 2026-07-17 | delivery | 22 | ch22《Shared 编码与 swizzle：共享内存里如何避开 bank 冲突》定稿（skip_impl，新开 f18→ch34） | [2026-07-17_ch22-ch22-shared-encoding-swizzle-delivered-(skip_impl).md](deliveries/2026-07-17_ch22-ch22-shared-encoding-swizzle-delivered-(skip_impl).md) |
 | 2026-07-17 | delivery | 21 | ch21《Distributed 布局：Blocked、Slice、MMA 与 DotOperand 编码》定稿（skip_impl，无新伏笔） | [2026-07-17_ch21-ch21-distributed-layouts-delivered-(skip_impl).md](deliveries/2026-07-17_ch21-ch21-distributed-layouts-delivered-(skip_impl).md) |
@@ -14,5 +15,3 @@
 | 2026-07-17 | delivery | 16 | ch16-codegenerator-ast-to-ttir-delivered-(deep) | [2026-07-17_ch16-ch16-codegenerator-ast-to-ttir-delivered-(deep).md](deliveries/2026-07-17_ch16-ch16-codegenerator-ast-to-ttir-delivered-(deep).md) |
 | 2026-07-17 | delivery | 19 | ch19-tt-dialect-vocabulary-delivered-(code) | [2026-07-17_ch19-ch19-tt-dialect-vocabulary-delivered-(code).md](deliveries/2026-07-17_ch19-ch19-tt-dialect-vocabulary-delivered-(code).md) |
 | 2026-07-17 | delivery | 15 | ch15-ssa-and-structured-control-flow-delivered-(primer) | [2026-07-17_ch15-ch15-ssa-and-structured-control-flow-delivered-(primer).md](deliveries/2026-07-17_ch15-ch15-ssa-and-structured-control-flow-delivered-(primer).md) |
-| 2026-07-17 | delivery | 14 | ch14-compile-driver-loop-delivered-(skip_impl) | [2026-07-17_ch14-ch14-compile-driver-loop-delivered-(skip_impl).md](deliveries/2026-07-17_ch14-ch14-compile-driver-loop-delivered-(skip_impl).md) |
-| 2026-07-17 | delivery | 13 | ch13-triton-interpret-delivered-(skip_impl) | [2026-07-17_ch13-ch13-triton-interpret-delivered-(skip_impl).md](deliveries/2026-07-17_ch13-ch13-triton-interpret-delivered-(skip_impl).md) |

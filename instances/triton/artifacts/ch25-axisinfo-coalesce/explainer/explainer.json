@@ -1,0 +1,772 @@
+{
+  "chapter": "ch25",
+  "note": "本章无精简版：解读的是编译器 C++ 内部的静态分析(AxisInfo)+改写 pass(Coalesce)，产物是格值/布局而非数值张量，无可运行交叉验证载体；宿主机 triton=3.6.0 与钉版 v3.2.0 不一致，headless dump 会与所引源码错位。故全部数字手工按已核验 transfer rule 推演，完整推导见 traces/axisinfo_coalesce_worksheet.md，常量标 file:Lxxx。主线例子贯穿全章：`x_ptr + tl.arange(0,1024)`，i32，x_ptr 带 tt.divisibility=16 arg attr，numWarps=4/threadsPerWarp=32。",
+  "mechanisms": [
+    {
+      "mechanism_id": "axisinfo-triple",
+      "intuition": "给每根轴发三张『访存体检报告』：contiguity=『这根轴上最长能一口气顺读多少个连续元素』(像书架上连号的书)、divisibility=『这段的起点按字节对齐到 2 的几次幂』(是否卡在 16/32/128 字节整边界)、constancy=『同一个值连续重复多长』(掩码/广播用)。三个数都强制是 2 的幂——因为它们最终要对上 32/64/128-bit 的硬件向量宽，且这样格的合并(join)才能用 gcd 闭合。",
+      "worked_example": {
+        "params": {
+          "ptr_expr": "x_ptr + tl.arange(0,1024)",
+          "dtype": "i32",
+          "x_ptr.tt.divisibility": 16,
+          "header_example_array": "[[10,11,12,13,18,19,20,21]]"
+        },
+        "trace_source": "manual",
+        "manual_reason": "AxisInfo 三元组是 MLIR 格值、非运行数值；无精简版可跑。数值按 AxisInfo.h 头注语义 + make_range/splat/addptr transfer rule 手推，见 traces/axisinfo_coalesce_worksheet.md。",
+        "trace_ref": "traces/axisinfo_coalesce_worksheet.md",
+        "table": {
+          "columns": [
+            "Value",
+            "op",
+            "contiguity",
+            "divisibility(字节)",
+            "constancy",
+            "读法"
+          ],
+          "rows": [
+            [
+              "x_ptr(arg)",
+              "seed",
+              "1",
+              "16",
+              "1",
+              "标量指针：只有对齐 16 字节这一条静态事实(f9 提示)"
+            ],
+            [
+              "%r=make_range 0..1024",
+              "make_range",
+              "1024",
+              "1073741824",
+              "1",
+              "arange 是一根满连续轴：顺读 1024 个"
+            ],
+            [
+              "%b=splat x_ptr",
+              "splat",
+              "1",
+              "16",
+              "1024",
+              "同一指针重复 1024 次：constancy 拉满、contiguity 塌成 1"
+            ],
+            [
+              "%p=addptr %b,%r",
+              "addptr",
+              "1024",
+              "16",
+              "1",
+              "指针张量：1024 连续、起点 16 字节对齐——这就是给 Coalesce 的『静态真相』"
+            ]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "三元组每个分量恒为 2 的幂，且沿前向传播只会变小(信息只减不增)——1 是底(最保守)。",
+        "argument": "初值 seed 的每个分量是 2 的幂(arg attr 是整数、缺省 1；highestPowOf2Divisor 输出 2 幂)；每条 transfer rule 只用 gcd/2 幂相乘/取 min——对 2 幂集合封闭。join=逐轴 gcd 只会下降到公因子，故格值在『2 幂+整除偏序』上单调不增、下有界 1，反复 join 必收敛(基例:seed 是 2 幂；归纳步:gcd/min/2 幂乘 保持 2 幂且不增)。"
+      },
+      "quantified": "主线 %p 的三元组 (contiguity=1024, divisibility=16 字节, constancy=1)：contiguity=1024 说明这根轴整段连续可向量化；divisibility=16 字节=4 个 i32，正好够拼一条 128-bit 访存；constancy=1 说明没有重复(非广播)。Coalesce 后面就靠这三个数定布局。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-axisinfo-triple",
+          "claim": "AxisInfo 把一根轴的访存友好度压成三个 2 的幂：连续跑多长、起点字节对齐、重复多长。",
+          "template": "state-table",
+          "numbers": [
+            {
+              "label": "header 例 [10,11,12,13,18,19,20,21] 的 contiguity",
+              "value": "4",
+              "provenance": "include/triton/Analysis/AxisInfo.h:L41-L99 头注图例"
+            },
+            {
+              "label": "%p contiguity",
+              "value": "1024",
+              "provenance": "worksheet 主线：max(gcd(1024,1024),gcd(1,1)); AxisInfo.cpp:L286-L287"
+            },
+            {
+              "label": "%p divisibility(字节)",
+              "value": "16",
+              "provenance": "worksheet：gcd(16, multiplyDivisor(2^30,4)); AxisInfo.cpp:L296-L313"
+            },
+            {
+              "label": "%p constancy",
+              "value": "1",
+              "provenance": "worksheet：gcd(1024,1); AxisInfo.cpp:L318-L319"
+            }
+          ],
+          "caption_draft": "三元组 = 一根轴的三张访存体检报告(全为 2 的幂)。主线 %p 拿到 (1024, 16字节, 1)：既长又对齐，是 Coalesce 敢向量化的静态凭据。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "lattice-join-gcd",
+      "intuition": "两条路(if 的两支、循环回边)在某点汇合，编译器只敢相信『两边都成立』的对齐/连续性。gcd 就是『同时整除两边的最大 2 幂』——最紧的保守上界。就像两个人各自承诺『我这批货每 16 个一箱』和『我每 4 个一箱』，合流后你只能保证『每 4 个一箱』(gcd(16,4)=4)。一旦某支承诺退到 1，合流后全程按 1 算，向量化就此崩塌。",
+      "worked_example": {
+        "params": {
+          "branchA_ptr": "contiguity=1024,div=16,constancy=1",
+          "branchB_ptr": "contiguity=1024,div=4,constancy=1",
+          "dtype": "i32"
+        },
+        "trace_source": "manual",
+        "manual_reason": "控制流汇合处的格 join 发生在 MLIR block argument 上、非运行数值；按 AxisInfo::join 逐轴 gcd 手推，见 worksheet『join 失败面』。",
+        "trace_ref": "traces/axisinfo_coalesce_worksheet.md",
+        "table": {
+          "columns": [
+            "轴量",
+            "分支A",
+            "分支B",
+            "join=gcd",
+            "后果"
+          ],
+          "rows": [
+            [
+              "contiguity",
+              "1024",
+              "1024",
+              "1024",
+              "连续性两边都在 → 保住"
+            ],
+            [
+              "divisibility(字节)",
+              "16",
+              "4",
+              "4",
+              "对齐退到两边公因子 4 字节"
+            ],
+            [
+              "constancy",
+              "1",
+              "1",
+              "1",
+              "都非重复 → 1"
+            ],
+            [
+              "→ perThread",
+              "4",
+              "1",
+              "1",
+              "A 单独可 4 元素/线程；合并后 maxMultiple=4/4=1 → 塌成 1，向量化失效"
+            ]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "join 结果每轴 ≤ 两输入对应轴的最小值，且是它们的公因子；反复 join 单调下降、下有界 1，必达不动点。",
+        "argument": "gcd(a,b) 整除 a 与 b 故 ≤ min(a,b)；一根轴的值域是有限的 2 幂链 {…,4,2,1}，每次 join 要么不变要么严格下降一级，下界 1——严格递减的有界整数序列有限步收敛。这既保证数据流分析终止，也解释了 f9 的失败面：任一路径把某轴拉到 1，gcd 后全程锁死 1。"
+      },
+      "quantified": "分支 A(div=16) 单独 → perThread=min(16/4,1024,128/32)=4，即 128-bit 向量；与 B(div=4) 汇合后 divisibility=gcd(16,4)=4 → perThread=min(4/4,1024,4)=1，退回 32-bit 标量。同理若某支 contiguity=1(gather 指针)，join contiguity=gcd(1024,1)=1 也塌成 1。这就是『你的 multiple_of 提示为什么有时不生效』的机制答案：被某条路径 join 掉了。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-join-gcd-collapse",
+          "claim": "控制流汇合处逐轴取 gcd；一支对齐退化就把合并后的向量宽拖到 1。",
+          "template": "before-after",
+          "numbers": [
+            {
+              "label": "A divisibility",
+              "value": "16",
+              "provenance": "worksheet join 失败面（设定：对齐路径）"
+            },
+            {
+              "label": "B divisibility",
+              "value": "4",
+              "provenance": "worksheet join 失败面（设定：错位路径）"
+            },
+            {
+              "label": "join divisibility",
+              "value": "4",
+              "provenance": "gcd(16,4)=4; AxisInfo.cpp:L1196"
+            },
+            {
+              "label": "A 单独 perThread",
+              "value": "4",
+              "provenance": "worksheet：min(16/4,1024,4)"
+            },
+            {
+              "label": "合并后 perThread",
+              "value": "1",
+              "provenance": "worksheet：min(4/4,1024,4); Utility.cpp:L117-L124"
+            }
+          ],
+          "caption_draft": "join=逐轴 gcd 是保守但不丢信息的最紧上界。A 单独能 4 元素/线程(128-bit)，一旦与 4 字节对齐的 B 汇合，divisibility=gcd(16,4)=4，向量宽塌回 1——提示被路径 join 掉了。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "pessimistic-seed",
+      "intuition": "AxisInfo 没法凭空知道运行时指针对齐到哪——它从『最悲观』起手：默认每根轴 (1,1,1)，谁也不信。唯一的信息来源是函数参数上前端打的 tt.divisibility/contiguity/constancy 标记(第 9 章 tl.multiple_of / 第 16 章 set_arg_attr 打进来的)。这就是 f9 提示的『进门』那一刻：标记读进来当 seed，没标记就退回全 1。",
+      "worked_example": {
+        "params": {
+          "arg": "x_ptr",
+          "with_hint": "tt.divisibility=16",
+          "without_hint": "无 tt.* attr"
+        },
+        "trace_source": "manual",
+        "manual_reason": "seed 由 initPessimisticStateFromFunc 读 MLIR arg attr 生成、非运行数值；按 L1102-L1122/L1146-L1157 手推。",
+        "trace_ref": "traces/axisinfo_coalesce_worksheet.md",
+        "table": {
+          "columns": [
+            "情形",
+            "tt.divisibility attr",
+            "seed contiguity",
+            "seed divisibility",
+            "seed constancy"
+          ],
+          "rows": [
+            [
+              "有提示 x_ptr",
+              "16",
+              "1",
+              "16",
+              "1"
+            ],
+            [
+              "无提示 x_ptr",
+              "(缺省)",
+              "1",
+              "1",
+              "1"
+            ],
+            [
+              "scf.for 结果(控制流值)",
+              "N/A",
+              "最乐观 2^62",
+              "最乐观 2^62",
+              "最乐观 2^62"
+            ]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "非控制流值的 seed 恒 ≤ 真实运行时对齐(保守不高估)；缺省 (1,1,1) 是任何整数都成立的绝对下界。",
+        "argument": "initPessimisticStateFromFunc 只把 arg attr 原值填进去、缺省 1；divisibility=1 对任何地址都成立、contiguity=1/constancy=1 对任何张量都成立——故没有提示时分析绝不会误判『连续/对齐』而放行错误向量化。控制流 op(scf.for/if)例外地给最乐观 2^62，因为其真实值由后续 join 收敛决定，起点必须是格的顶。"
+      },
+      "quantified": "有 tt.divisibility=16 → seed divisibility=16 字节，经 addptr 传到 %p 仍是 16 → perThread=4(128-bit)；无提示 → seed divisibility=1 → %p divisibility=gcd(1,…)=1 → perThread=1(标量)。同一段代码，提示进没进 seed，向量宽差 4×。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "sparse-forward-visitors",
+      "intuition": "分析像沿数据流管道『递水』：每个 op 有一张专属『配方卡』(visitor)，拿上游张量的三元组算出自己输出的三元组，再往下传，直到全图不再变化(不动点)。make_range 是源头(凭空造出一根连续轴)，splat 把标量吹成一片重复，addptr 把偏移叠到基址上——几十张配方卡，模式都一样：读上游三元组→按本 op 语义映射→join 进结果。",
+      "worked_example": {
+        "params": {
+          "pipeline": "make_range → splat → addptr",
+          "dtype": "i32",
+          "BLOCK": 1024
+        },
+        "trace_source": "manual",
+        "manual_reason": "前向传播跑在 MLIR IR 上、产物是格值；按各 visitor 的 transfer rule 逐 op 手推，见 worksheet 主线表。",
+        "trace_ref": "traces/axisinfo_coalesce_worksheet.md",
+        "table": {
+          "columns": [
+            "op",
+            "配方卡(visitor)",
+            "contiguity",
+            "divisibility",
+            "constancy",
+            "本 op 干了什么"
+          ],
+          "rows": [
+            [
+              "make_range 0..1024",
+              "MakeRangeOpAxisInfoVisitor",
+              "1024",
+              "1073741824",
+              "1",
+              "造源头：contiguity=end-start，divisibility=highestPowOf2Divisor(0)"
+            ],
+            [
+              "splat x_ptr",
+              "SplatOpAxisInfoVisitor",
+              "1",
+              "16",
+              "1024",
+              "标量吹成张量：contiguity→1，constancy→整维长 1024"
+            ],
+            [
+              "addptr %b,%r",
+              "AddSubOpAxisInfoVisitor<AddPtrOp>",
+              "1024",
+              "16",
+              "1",
+              "叠偏移：contiguity 取 gcd 组合、divisibility 乘 elemSize 再 gcd"
+            ],
+            [
+              "broadcast(size1维)",
+              "BroadcastOpAxisInfoVisitor",
+              "1",
+              "(原样)",
+              "retShape",
+              "沿长度 1 的维复制：该维 contiguity→1、constancy→目标长"
+            ]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "对无环数据流(SSA)，前向传播必在有限步内到达不动点；每个 result 的格值单调下降。",
+        "argument": "visitOperation 对每个 result 做 result.join(curr) 并 propagateIfChanged——join 只会让格值下降或不变(见 lattice-join-gcd 不变量)；值域是有限 2 幂链，任何格值最多下降有限级到底 1。SparseForwardDataFlowAnalysis 的工作表算法只在某 result 真的变化时才重新入队后继，故总更新次数有上界，必收敛。"
+      },
+      "quantified": "本例三步(make_range→splat→addptr)一趟前向即定值，无需回环——因为是直链无控制流。%p 最终 (1024,16,1)。真实 kernel 里 visitors 覆盖 make_range/add/sub/mul/div/rem/cmp/select/shift/max-min/splat/broadcast/expand_dims/load/constant/cast 十几类；本章只点 4 张代表卡讲清『读上游→映射→join』这一范式，其余同构。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-forward-propagation-chain",
+          "claim": "三元组沿 make_range→splat→addptr 前向传播，每个 op 按自己的配方卡更新，addptr 处汇成指针张量的静态真相。",
+          "template": "tensor-flow",
+          "numbers": [
+            {
+              "label": "make_range contiguity",
+              "value": "1024",
+              "provenance": "AxisInfo.cpp:L229-L232 (end-start)"
+            },
+            {
+              "label": "make_range divisibility",
+              "value": "1073741824",
+              "provenance": "highestPowOf2Divisor(0)=1<<30; Utility.h:L33-L42"
+            },
+            {
+              "label": "splat constancy",
+              "value": "1024",
+              "provenance": "AxisInfo.cpp:L539-L543 (retShape)"
+            },
+            {
+              "label": "addptr contiguity",
+              "value": "1024",
+              "provenance": "AxisInfo.cpp:L286-L287"
+            },
+            {
+              "label": "addptr divisibility(字节)",
+              "value": "16",
+              "provenance": "AxisInfo.cpp:L296-L313 (gcd, ×elemSize)"
+            }
+          ],
+          "caption_draft": "稀疏前向数据流：每个 op 一张 visitor 配方卡。源头 make_range 造出 contiguity=1024 的连续轴，splat 把基址铺成 constancy=1024 的重复面，addptr 叠加后得到 (1024,16字节,1)——所有下游访存优化读的就是这份传播结果。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "addptr-elem-to-byte",
+      "intuition": "指针加偏移在『元素』上是连续的(第 0、1、2、3 个元素)，但硬件对齐讲的是『字节』。i32 一个元素占 4 字节，所以元素步长 1 对应字节步长 4——addptr 的 divisibility 必须把偏移的对齐乘上 elemSize 才是真正的字节对齐。这是唯一把 addptr 和普通整数加法区分开的一步。",
+      "worked_example": {
+        "params": {
+          "expr": "addptr [16]:!ptr<i32>, [0,1,2,3]:i32",
+          "elemSize": 4
+        },
+        "trace_source": "manual",
+        "manual_reason": "取自 AxisInfo.cpp:L303-L311 源码注释的原例；按 addptr divisibility transfer rule 手算，非运行数值。",
+        "trace_ref": "traces/axisinfo_coalesce_worksheet.md",
+        "table": {
+          "columns": [
+            "lane",
+            "range 值(元素偏移)",
+            "字节地址 = 16 + 4×range",
+            "元素位置"
+          ],
+          "rows": [
+            [
+              "0",
+              "0",
+              "16",
+              "4"
+            ],
+            [
+              "1",
+              "1",
+              "20",
+              "5"
+            ],
+            [
+              "2",
+              "2",
+              "24",
+              "6"
+            ],
+            [
+              "3",
+              "3",
+              "28",
+              "7"
+            ]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "addptr 结果的元素级 contiguity 与操作数一致，但 divisibility 单位从『元素』翻译成『字节』——乘 elemSize 后再与基址 gcd。",
+        "argument": "内存是字节寻址：元素连续(步长 1 元素)在字节上是步长 elemSize。源码把 rhs.divisibility 乘 elemSize=pointeeBitWidth/8 得字节对齐，再 gcd(基址字节对齐, 偏移字节对齐)。基址 16 字节对齐、偏移字节对齐=2^30×4 溢出夹到 2^62 → gcd=16。故结果『元素连续但字节按 16 对齐』,即注释所谓 strided contiguous。"
+      },
+      "quantified": "elemSize = pointeeBitWidth/8 = 32/8 = 4 字节。字节地址 [16,20,24,28] 步长 4，起点 16 → divisibility=gcd(16, 2^32(夹前))=16 字节 = 4 个 i32，恰好一条 128-bit 事务的对齐边界。若是 f16(elemSize=2)，同样 range 的字节步长变 2，对齐语义随之改变——elemSize 是元素↔字节的换算枢纽。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "constexpr-precise-divisibility",
+      "intuition": "编译器只能对『它看得见的具体数字』算出精确对齐。你写 BLOCK: tl.constexpr = 1024，追踪期这就是字面 1024，highestPowOf2Divisor(1024)=1024——编译器立刻知道『这个偏移必是 1024 的倍数』。换成运行时变量,它只能耸肩退回 1。这正是第 1 章埋的主线『标 constexpr 编译器才能特化』在访存上的兑现:没有 constexpr,后面所有向量化/合并都无从谈起。",
+      "worked_example": {
+        "params": {
+          "offset": "pid * BLOCK",
+          "BLOCK_constexpr": 1024
+        },
+        "trace_source": "manual",
+        "manual_reason": "divisibility 由 ConstantOp/Mul visitor 在追踪期常量上计算、非运行数值；按 L252/L384 transfer rule 手推。",
+        "trace_ref": "traces/axisinfo_coalesce_worksheet.md",
+        "table": {
+          "columns": [
+            "BLOCK 情形",
+            "constant 1024 的 divisibility",
+            "muli(pid,BLOCK) 的 divisibility",
+            "arange(0,BLOCK) contiguity"
+          ],
+          "rows": [
+            [
+              "constexpr = 1024",
+              "1024",
+              "1024",
+              "1024"
+            ],
+            [
+              "运行时变量",
+              "1(非常量,无 ConstantOp)",
+              "1",
+              "未知(退回 1)"
+            ]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "只有当 BLOCK 是追踪期常量时，highestPowOf2Divisor 才能给出 >1 的精确 divisibility；运行时值恒退回 1。",
+        "argument": "ConstantOp visitor 只对 IntegerAttr 走 highestPowOf2Divisor(value) 分支——运行时值不是 constant，走不到该分支、divisibility=1。Mul 的 divisibility=multiplyDivisor(lhs,rhs)，pid(1)×常量(1024)=1024；pid(1)×运行时(1)=1。且 arange 需常量上下界才能给出静态 contiguity。故 constexpr 是链条起点：它精确,下游才可能精确。"
+      },
+      "quantified": "constexpr BLOCK=1024=2^10 → 偏移 divisibility=1024，且 arange 贡献 contiguity=1024。运行时 BLOCK → 偏移 divisibility=1、contiguity 未知 → getNumElementsPerThread 的 maxMultiple 和 maxContig 双双退到 1 → perThread=1，合并不动。一个 constexpr 关键字，决定 load 能否向量化。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "ptr-alignment-query",
+      "intuition": "AxisInfo 只是『真相源』，下游 pass 不直接翻三元组,而是问几个封装好的问题:『这个指针每线程能安全读几个连续元素?』(getPtrContiguity)、『它对齐到几个元素?』(getPtrAlignment)。这两个查询把 (divisibility,contiguity) 折算成下游真正关心的『元素级安全宽度』。",
+      "worked_example": {
+        "params": {
+          "ptr": "%p: contiguity=1024,div=16字节,i32",
+          "layout": "合并后 Blocked sizePerThread=4"
+        },
+        "trace_source": "manual",
+        "manual_reason": "查询在 MLIR Value 上跑、返回标量;按 getPtrAlignment/getPtrContiguity 公式手算,非运行数值。",
+        "trace_ref": "traces/axisinfo_coalesce_worksheet.md",
+        "table": {
+          "columns": [
+            "查询",
+            "公式",
+            "代入",
+            "值"
+          ],
+          "rows": [
+            [
+              "getPtrAlignment",
+              "min(max(div/elemBytes,1), contiguity)",
+              "min(max(16/4,1),1024)",
+              "4"
+            ],
+            [
+              "getPtrContiguity",
+              "min(getPtrAlignment, uniqueContigPerThread)",
+              "min(4,4)",
+              "4"
+            ]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "两个查询的返回值恒 ≤ 底层 AxisInfo 的对应分量(元素级),不会高估安全宽度。",
+        "argument": "getPtrAlignment=min(divisibility/elemBytes, contiguity) 是两个上界取小;getPtrContiguity 再 min 上 alignment 与布局的 uniqueContigPerThread——层层取 min 只会更保守。故下游按查询值向量化永远安全:实际连续/对齐至少有这么多。"
+      },
+      "quantified": "%p(div=16字节,contiguity=1024,i32):getPtrAlignment=min(16/4,1024)=4 个元素;getPtrContiguity=min(4,4)=4。即『每线程可安全连读 4 个 i32』=128-bit,与 getNumElementsPerThread 的 perThread=4 一致——这两条对外查询和 Coalesce 内部算的是同一件事的不同封装。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "coalesce-order",
+      "intuition": "合并访存的硬性要求:相邻的 lane(线程)必须访问相邻的地址。所以布局里『最连续的那根轴』必须放到最内层(stride 最小)。argSort 就干这一件事:把各轴按 contiguity 从大到小排,最连续的轴排第一(order[0]),后面把整个向量宽度全压在这根轴上。",
+      "worked_example": {
+        "params": {
+          "tensor": "32x64xi32",
+          "contiguity": "[1,64]",
+          "layout": "行主序"
+        },
+        "trace_source": "manual",
+        "manual_reason": "argSort 对 contiguity 数组排序、返回 order;按 Utility.cpp:L81-L87 手推,非运行数值。",
+        "trace_ref": "traces/axisinfo_coalesce_worksheet.md",
+        "table": {
+          "columns": [
+            "轴",
+            "contiguity",
+            "argSort 排名(order 位置)",
+            "含义"
+          ],
+          "rows": [
+            [
+              "axis1(内层)",
+              "64",
+              "order[0](第1)",
+              "最连续 → 放最内层,相邻 lane 连号"
+            ],
+            [
+              "axis0(外层)",
+              "1",
+              "order[1](第2)",
+              "不连续 → 放外层"
+            ],
+            [
+              "→ order",
+              "—",
+              "[1,0]",
+              "sizePerThread[order[0]=1]=perThread,向量宽压在 axis1"
+            ]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "order 是 contiguity 的降序稳定排列;order[0] 恒指向 contiguity 最大的轴。",
+        "argument": "argSort 用 stable_sort 以 arr[x]>arr[y] 为序——严格降序,contiguity 最大的下标必居首。稳定性保证 contiguity 相等时保持原轴序、结果确定。故『最连续轴排最内层』这一合并前提被机械保证,与输入轴的书写顺序无关。"
+      },
+      "quantified": "contiguity=[1,64] → order=[1,0]:把 64 长连续的 axis1 放最内层。若误取自然序 order=[0,1],相邻 lane 会沿 axis0 跨 64 个元素跳(stride 64),完全不合并——事务数放大 64×。1D 主线 %p 平凡:contiguity=[1024] → order=[0]。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-coalesce-order",
+          "claim": "argSort(contiguity) 把最连续的轴排到 order[0](最内层),相邻 lane 才能访问相邻地址。",
+          "template": "layout",
+          "numbers": [
+            {
+              "label": "axis0 contiguity",
+              "value": "1",
+              "provenance": "worksheet 2D 例(行主序 32x64)"
+            },
+            {
+              "label": "axis1 contiguity",
+              "value": "64",
+              "provenance": "worksheet 2D 例(内层连续)"
+            },
+            {
+              "label": "order 结果",
+              "value": "[1,0]",
+              "provenance": "argSort([1,64]) 降序; Utility.cpp:L81-L87"
+            },
+            {
+              "label": "误序放大倍数",
+              "value": "64",
+              "provenance": "worksheet：order=[0,1] 时 axis0 stride=64"
+            }
+          ],
+          "caption_draft": "合并访存要求相邻 lane 访问相邻地址。argSort 把 contiguity=64 的 axis1 排到 order[0](最内层),向量宽全压这根轴;若按自然序把不连续的 axis0 放内层,事务数放大 64×。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "perthread-vec-width",
+      "intuition": "每个线程一次能向量化读几个元素,受三道闸门卡住,取最小:①字节对齐(divisibility/elemBytes)②连续长度(contiguity,还不能超过该轴形状)③硬件单条向量访存最宽 128-bit。三者 min 就是每线程向量宽。这正是把第 7 章那条人工判据 N_txn=⌈32·s_elem/s_txn⌉ 交给编译器自动算。",
+      "worked_example": {
+        "params": {
+          "ptr": "%p: contiguity=1024, i32, shape=1024",
+          "elemBits": 32
+        },
+        "trace_source": "manual",
+        "manual_reason": "getNumElementsPerThread 在 AxisInfo 上算标量;按 Utility.cpp:L111-L128 逐行代入,非运行数值。",
+        "trace_ref": "traces/axisinfo_coalesce_worksheet.md",
+        "table": {
+          "columns": [
+            "divisibility(字节)",
+            "maxMultiple=div/4",
+            "maxContig",
+            "alignment",
+            "128/32 cap",
+            "perThread",
+            "向量宽"
+          ],
+          "rows": [
+            [
+              "16",
+              "4",
+              "1024",
+              "4",
+              "4",
+              "4",
+              "128-bit (v4)"
+            ],
+            [
+              "8",
+              "2",
+              "1024",
+              "2",
+              "4",
+              "2",
+              "64-bit (v2)"
+            ],
+            [
+              "4",
+              "1",
+              "1024",
+              "1",
+              "4",
+              "1",
+              "32-bit 标量"
+            ],
+            [
+              "1",
+              "1",
+              "1024",
+              "1",
+              "4",
+              "1",
+              "32-bit 标量"
+            ]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "perThread = min(divisibility/elemBytes, contiguity∧shape, 128/elemBits),恒 ≥1 且是 2 的幂;任一约束退化即拉低全局。",
+        "argument": "三个量都是 2 幂(divisibility/contiguity 见 axisinfo-triple 不变量,128/elemBits 是 2 幂),min 保持 2 幂;末尾 max(·,1) 保证 ≥1。三道 min 意味着最弱的一环决定结果——这是『木桶效应』:对齐、连续、硬件宽任缺一即封顶。故正确性(不越界读)与性能(尽量宽)由同一条 min 式同时保证。"
+      },
+      "quantified": "i32(elemBits=32)下 128-bit cap=4 个元素。divisibility≥16 字节即饱和 128-bit(v4);掉到 8 字节 → v2(64-bit);掉到 4 字节或无提示(1)→ 标量。主线 %p divisibility=16 → perThread=4,1024 元素/4 = 256 笔向量事务,较标量 1024 笔省 4×——正是第 7 章 N_txn 判据的编译器自动版。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-perthread-vec-width",
+          "claim": "每线程向量宽 = min(对齐, 连续, 128/bits);divisibility 是本例的绑定约束,决定 v4/v2/标量。",
+          "template": "state-table",
+          "numbers": [
+            {
+              "label": "div=16 → perThread",
+              "value": "4",
+              "provenance": "worksheet：min(16/4,1024,4); Utility.cpp:L117-L124"
+            },
+            {
+              "label": "div=8 → perThread",
+              "value": "2",
+              "provenance": "worksheet：min(8/4,1024,4)"
+            },
+            {
+              "label": "div=4 → perThread",
+              "value": "1",
+              "provenance": "worksheet：min(4/4,1024,4)"
+            },
+            {
+              "label": "128-bit cap(i32)",
+              "value": "4",
+              "provenance": "128/32=4; Utility.cpp:L124"
+            },
+            {
+              "label": "主线省事务倍数",
+              "value": "4",
+              "provenance": "1024/4=256 vs 1024 笔"
+            }
+          ],
+          "caption_draft": "三道 min 闸门定每线程向量宽。i32 下 divisibility≥16 字节饱和 128-bit(v4,perThread=4);对齐掉到 4 字节就退回标量——divisibility 是这里的绑定约束,把 N_txn 判据自动化。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "coalesce-rewrite",
+      "intuition": "分析算出了目标布局,但 SSA 下不能原地改一个 op 的结果类型(下游都依赖它)。做法像换水管接头不断水:先给操作数套一个 convert_layout 转成新布局→造一个同名新 op 产出新布局结果→再 convert 回原布局→把下游对旧结果的引用全指到新结果→删旧 op。多出来的 convert 由后续化简 pass 抹掉。",
+      "worked_example": {
+        "params": {
+          "op": "tt.load %p",
+          "L_new": "Blocked sizePerThread=[4],order=[0]"
+        },
+        "trace_source": "manual",
+        "manual_reason": "coalesceOp 是 IR 结构改写、无数值输出;按 Coalesce.cpp:L113-L154 逐步骤展开,非运行数值。",
+        "trace_ref": "traces/axisinfo_coalesce_worksheet.md",
+        "table": {
+          "columns": [
+            "步骤",
+            "IR",
+            "布局"
+          ],
+          "rows": [
+            [
+              "改写前",
+              "%v = tt.load %p",
+              "%p,%v : L_old"
+            ],
+            [
+              "插操作数 convert",
+              "%p2 = convert_layout %p",
+              "L_old → L_new"
+            ],
+            [
+              "造同名新 op",
+              "%v2 = tt.load %p2",
+              "L_new"
+            ],
+            [
+              "结果 convert 回",
+              "%v3 = convert_layout %v2",
+              "L_new → L_old"
+            ],
+            [
+              "替换&删除",
+              "replaceAllUsesWith(%v→%v3); 旧 op erase",
+              "下游仍见 L_old"
+            ]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "改写后下游看到的结果类型/布局与改写前逐字节一致(L_old);语义不变,只是内部访存布局换成合并友好的。",
+        "argument": "新 op 产出 L_new 结果后立刻 convert 回 L_old 再 replaceAllUsesWith——下游所有 use 拿到的仍是 L_old 类型的值,类型系统与语义不受扰动。这是 analysis→transform 的『局部改写、全局收敛』:每处只做保语义的局部替换,冗余的 convert_layout 留给后续传播/消除 pass 统一化简。"
+      },
+      "quantified": "1 个 tt.load → 1 load + 2 convert_layout(操作数侧 1 + 结果侧 1)。这些 convert 大多会被后续 layout 传播/RemoveLayoutConversions 吸收进相邻 op 或抵消,净代价趋近 0,换来 load 从标量升到 perThread=4 的 128-bit 向量访存。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-coalesce-rewrite",
+          "claim": "coalesceOp 用 convert_layout 夹层做保语义改写:操作数转入新布局、新 op、结果转回原布局。",
+          "template": "before-after",
+          "numbers": [
+            {
+              "label": "改写前 op 数",
+              "value": "1",
+              "provenance": "tt.load %p; Coalesce.cpp:L113-L154"
+            },
+            {
+              "label": "改写后 op 数",
+              "value": "3",
+              "provenance": "worksheet：1 load + 2 convert_layout"
+            },
+            {
+              "label": "新增 convert_layout",
+              "value": "2",
+              "provenance": "操作数侧+结果侧; Coalesce.cpp:L117-L149"
+            },
+            {
+              "label": "load 向量宽提升到",
+              "value": "4",
+              "provenance": "perThread=4,128-bit; Utility.cpp:L117-L124"
+            }
+          ],
+          "caption_draft": "SSA 下不能原地改类型:操作数 convert 到新 Blocked 布局 → 造新 load → 结果 convert 回原布局 → replaceAllUsesWith。多出的 2 个 convert 由后续化简吸收,换来 load 升到 128-bit 向量访存。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "analysis-transform-loop",
+      "figure_specs": [
+        {
+          "figure_id": "fig-analysis-transform-loop",
+          "claim": "runOnOperation 是全书第一个完整 analysis→transform 闭环:先只读分析(AxisInfo)、再据结果改写(Coalesce),后续所有优化 pass 都是这个范式的变体。",
+          "template": "flow",
+          "numbers": [
+            {
+              "label": "阶段1 分析(只读)",
+              "value": "ModuleAxisInfoAnalysis(moduleOp)",
+              "provenance": "Coalesce.cpp:L158-L159"
+            },
+            {
+              "label": "阶段2 walk 收集布局",
+              "value": "setCoalescedEncoding → layoutMap",
+              "provenance": "Coalesce.cpp:L164-L188"
+            },
+            {
+              "label": "阶段3 改写",
+              "value": "coalesceOp(kv)",
+              "provenance": "Coalesce.cpp:L190-L192"
+            },
+            {
+              "label": "分析读的量",
+              "value": "contiguity/divisibility",
+              "provenance": "AxisInfo 三元组; AxisInfo.h:L23-L108"
+            }
+          ],
+          "caption_draft": "analysis→transform 最短闭环:AxisInfo 只读推断出每根轴的静态真相 → Coalesce 据 contiguity 定 order、据 divisibility/contiguity 定向量宽 → coalesceOp 落地改写。ch26-35 的每个优化 pass 都是『先建一个分析、再据其结果改写』这一范式的变体。"
+        }
+      ]
+    }
+  ]
+}
