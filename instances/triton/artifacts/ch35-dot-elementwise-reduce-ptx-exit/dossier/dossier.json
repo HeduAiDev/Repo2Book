@@ -1,0 +1,272 @@
+{
+  "kind": "skip_impl",
+  "chapter": "ch35",
+  "title": "矩阵乘指令选择、逐元素/归约降级与 LLVM→PTX 出口",
+  "one_line": "接 ch33/ch34,把剩下的 per-op 降级(dot/elementwise/reduce/scan)+ PTX 汇编拼装 + LLVM IR 收尾讲完;五级阶梯 TTGIR→LLVM→(PTX) 到此走完。",
+
+  "code_spine": [
+    "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM.cpp:L31-L69  (DotOpConversion::matchAndRewrite —— 按结果 NvidiaMma 布局版本分派 mma.884/1688/16816,或 FMA 兜底)",
+    "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM.cpp:L71-L106 (WarpGroupDotOpConversion —— Hopper 走 convertWGMMA)",
+    "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv2.cpp:L505-L516 (convertMMA1688/convertMMA16816 —— 转发到 convertMMA,isTuring 区分)",
+    "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv2.cpp:L60-L119 (getValuesFromDotOperandLayoutStruct —— ValueTableV2 + kWidth=8 拆 4 个 mma)",
+    "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv2.cpp:L354-L378 (callMmaAmpere —— 4 个 A / 2 个 B / numMmaRets 个 C 拼一条 mma.sync)",
+    "include/triton/Conversion/TritonGPUToLLVM/ElementwiseOpToLLVMBase.h:L178-L224 (ElementwiseOpConversionBase::matchAndRewrite —— 拆 struct→unpackI32→per-element→repack 通用模板)",
+    "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ElementwiseOpToLLVM.cpp:L463-L532 (FpToFpOpConversion::createDestOps —— fp8↔fp16/bf16/fp32 数值转换分派)",
+    "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ElementwiseOpToLLVM.cpp:L258-L318 (makeConverterFromPtx —— 把 fp8 转换 ptx 串封成 inline asm converter)",
+    "lib/Conversion/TritonGPUToLLVM/ReduceOpToLLVM.cpp:L25-L76 (ReduceOpConversion::matchAndRewrite —— thread 内→warp 内 shfl→warp 间共享内存三段)",
+    "lib/Conversion/TritonGPUToLLVM/ReduceOpToLLVM.cpp:L154-L173 (warpReduce —— shfl.bfly 蝶形树 log2 步归约)",
+    "lib/Conversion/TritonGPUToLLVM/ReduceScanCommon.h:L50-L117 (applyCombineOp —— 把 combine region 克隆内联到 shfl 之后)",
+    "lib/Conversion/TritonGPUToLLVM/ScanOpToLLVM.cpp:L51-L81 (warpScan —— Kogge-Stone 前缀扫描,shuffleUp + mask + select)",
+    "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/PTXAsmFormat.cpp:L98-L114 (PTXBuilder::launch —— 每条硬件指令 → LLVM::InlineAsmOp)",
+    "third_party/nvidia/lib/NVGPUToLLVM/NVGPUToLLVMPass.cpp:L595-L625 (ConvertNVGPUToLLVM::runOnOperation —— NVGPU dialect 高层 op 批量降 inline asm 的挂载接缝)",
+    "third_party/nvidia/lib/NVGPUToLLVM/NVGPUToLLVMPass.cpp:L633-L662 (rewriteAsPtxAsm —— 统一出口:patchPtxAsm→PTXBuilder→launch)",
+    "lib/Target/LLVMIR/LLVMIRBreakPhiStruct.cpp:L12-L38 (processPhiStruct —— 把 struct phi 拆成逐标量 phi,make_llir 出口收尾)"
+  ],
+
+  "key_classes": [
+    {"name": "DotOpConversion", "file": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM.cpp", "responsibility": "tt.dot 的降级模式:读结果 tensor 的 NvidiaMmaEncodingAttr,按 versionMajor(Volta/Turing/Ampere)分派到 convertMMA884/1688/16816;非 mma(Blocked)布局走 convertFMADot 兜底;都不匹配 report_fatal_error。"},
+    {"name": "WarpGroupDotOpConversion", "file": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM.cpp", "responsibility": "tt.nvidia_gpu.warp_group_dot(Hopper 异步 warpgroup 矩阵乘)的降级:isHopper 时走 convertWGMMA,其余报错。"},
+    {"name": "WarpGroupDotWaitOpConversion", "file": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM.cpp", "responsibility": "warp_group_dot_wait 降级:把多个输入 struct 打包成单 struct 过 WGMMAWaitGroupOp 再拆回,单输入直接替换。"},
+    {"name": "ValueTableV2 / getValuesFromDotOperandLayoutStruct", "file": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv2.cpp", "responsibility": "把 A/B 操作数寄存器 struct 拆成 {b,m,k}→Value 的映射表;kWidth=8(Ampere)时按 stride 4 重排,拆成 4 个独立 mma。"},
+    {"name": "callMmaAmpere", "file": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv2.cpp", "responsibility": "为一个 (b,m,n,k) 分块凑齐 4 个 A 寄存器 / 2 个 B 寄存器 / numMmaRets 个 C(既作输入又复用为输出)寄存器,喂给 mma.sync inline asm。"},
+    {"name": "ElementwiseOpConversionBase", "file": "include/triton/Conversion/TritonGPUToLLVM/ElementwiseOpToLLVMBase.h", "responsibility": "所有逐元素 op 的 CRTP 降级基类:unpackLLElements 拆结果 struct、unpackI32 拆 32bit 打包、逐元素调 ConcreteT::createDestOps、reorderValues/maybeDeduplicate、packI32/packLLElements 重打包。"},
+    {"name": "FpToFpOpConversion", "file": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ElementwiseOpToLLVM.cpp", "responsibility": "浮点↔浮点转换(重点 fp8↔fp16/bf16/fp32):按 (srcTy,dstTy,rounding) 查 srcMap 拿 Fp8ConversionDesc,按 computeCapability 选原生 cvt 还是 bit-trick 回退。"},
+    {"name": "ReduceOpConversion", "file": "lib/Conversion/TritonGPUToLLVM/ReduceOpToLLVM.cpp", "responsibility": "tt.reduce 降级:thread 内串行 combine → warp 内 shfl.bfly 树 → 若跨 warp 则落共享内存 + barrier + 第二轮 shfl 归约。"},
+    {"name": "warpReduce", "file": "lib/Conversion/TritonGPUToLLVM/ReduceOpToLLVM.cpp", "responsibility": "warp 内蝶形归约:N 从 numLane/2 到 1 逐次减半,每步 shuffleXor(异或 lane)拿邻居值再 combine。"},
+    {"name": "applyCombineOp", "file": "lib/Conversion/TritonGPUToLLVM/ReduceScanCommon.h", "responsibility": "把用户 combine region 克隆并内联到当前插入点:无副作用走快路径直接内联,有 pred 且不可推测则包一层 cf.cond_br。"},
+    {"name": "warpScan", "file": "lib/Conversion/TritonGPUToLLVM/ScanOpToLLVM.cpp", "responsibility": "tt.scan 的 warp 内前缀扫描:Kogge-Stone,i 从 1 到 scanDim/2 倍增,shuffleUp(i) 取前 i 车道值,mask(lane>=i)决定是否累加。"},
+    {"name": "PTXBuilder", "file": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/PTXAsmFormat.cpp", "responsibility": "把一条(或一组)PTX 指令 + operand/constraint 拼成 asm 字符串与约束串,最终 launch 成 LLVM::InlineAsmOp。"},
+    {"name": "ConvertNVGPUToLLVM / rewriteAsPtxAsm", "file": "third_party/nvidia/lib/NVGPUToLLVM/NVGPUToLLVMPass.cpp", "responsibility": "把 NVGPU dialect 高层 op(wgmma/mbarrier/fence/named_barrier 等)批量降成 inline asm;NVGPUOpGenericPattern 用模板 ptx + 约束表统一处理,#pendings 等占位由 patchPtxAsm 回填。"},
+    {"name": "BreakStructPhiNodesPass / processPhiStruct", "file": "lib/Target/LLVMIR/LLVMIRBreakPhiStruct.cpp", "responsibility": "LLVM IR 后处理:把返回 struct 的 phi 拆成逐元素标量 phi + extractvalue/insertvalue,消除 LLVM 不友好的 struct phi,利于后续优化。"}
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM.cpp",
+      "lines": "L34-L68",
+      "code": "  LogicalResult\n  matchAndRewrite(triton::DotOp op, OpAdaptor adaptor,\n                  ConversionPatternRewriter &rewriter) const override {\n    Location loc = op->getLoc();\n    // D = A * B + C\n    Value A = op.getA();\n    Value D = op.getResult();\n\n    // Here we assume the DotOp's operands always comes from shared memory.\n    auto AShapePerCTA = getShapePerCTA(A.getType());\n    size_t reduceAxis = 1;\n    unsigned K = AShapePerCTA[reduceAxis];\n    bool isOuter = K == 1;\n\n    NvidiaMmaEncodingAttr mmaLayout = dyn_cast<NvidiaMmaEncodingAttr>(\n        cast<RankedTensorType>(D.getType()).getEncoding());\n    if (!isOuter && mmaLayout && supportMMA(op, mmaLayout.getVersionMajor())) {\n      if (mmaLayout.isVolta())\n        return convertMMA884(op, adaptor, getTypeConverter(), rewriter);\n      if (mmaLayout.isTuring())\n        return convertMMA1688(op, adaptor, getTypeConverter(), rewriter);\n      if (mmaLayout.isAmpere())\n        return convertMMA16816(op, adaptor, getTypeConverter(), rewriter);\n\n      llvm::report_fatal_error(\n          \"Unsupported MMA kind found when converting DotOp to LLVM.\");\n    }\n\n    if (isa<BlockedEncodingAttr>(\n            cast<RankedTensorType>(D.getType()).getEncoding()))\n      return convertFMADot(op, adaptor, getTypeConverter(), rewriter);\n\n    llvm::report_fatal_error(\n        \"Unsupported DotOp found when converting TritonGPU to LLVM.\");\n  }",
+      "elide": ["整个 DotOpConversion 只是一个『分派表』:真正的 mma 指令拼装在 convertMMA884/1688/16816 里(MMAv1.cpp/MMAv2.cpp),本章只需讲清『按结果布局版本选哪条硬件指令』这个决策点。"]
+    },
+    {
+      "path": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM.cpp",
+      "lines": "L90-L101",
+      "code": "    NvidiaMmaEncodingAttr mmaLayout = dyn_cast<NvidiaMmaEncodingAttr>(\n        cast<RankedTensorType>(D.getType()).getEncoding());\n    if (!isOuter && mmaLayout &&\n        supportMMA(op.getOperand(0), mmaLayout.getVersionMajor())) {\n      if (mmaLayout.isHopper()) {\n        return convertWGMMA(op, adaptor, getTypeConverter(), rewriter,\n                            getThreadId(rewriter, loc));\n      }\n\n      llvm::report_fatal_error(\n          \"Unsupported MMA kind found when converting WarpGroupDotOp to LLVM.\");\n    }",
+      "elide": ["WarpGroupDotOpConversion 与 DotOpConversion 同构:只是 Hopper 专属,分派到 wgmma。可省略前面取 A/K/isOuter 的重复样板(L79-L88,与 DotOp 一致)。"]
+    },
+    {
+      "path": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv2.cpp",
+      "lines": "L505-L516",
+      "code": "LogicalResult convertMMA1688(triton::DotOp op, triton::DotOp::Adaptor adaptor,\n                             const LLVMTypeConverter *typeConverter,\n                             ConversionPatternRewriter &rewriter) {\n  return convertMMA(op, adaptor, typeConverter, rewriter, true /*isTuring*/);\n}\n\n// Convert to mma.m16n8k16\nLogicalResult convertMMA16816(triton::DotOp op, triton::DotOp::Adaptor adaptor,\n                              const LLVMTypeConverter *typeConverter,\n                              ConversionPatternRewriter &rewriter) {\n  return convertMMA(op, adaptor, typeConverter, rewriter, false /*isTuring*/);\n}",
+      "elide": ["Turing(mma.1688)与 Ampere(mma.16816)共用同一个 convertMMA 主体,只靠 isTuring 布尔选择 mma 指令表(mmaInstrPtxTuring vs mmaInstrPtxAmpere)。"]
+    },
+    {
+      "path": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv2.cpp",
+      "lines": "L68-L99",
+      "code": "  // FIXME [Dot LL]\n  // [ez] Generalize the logic below for kWidth * elemBitWidth > 32\n  auto dot = cast<DotOperandEncodingAttr>(type.getEncoding());\n  auto largeK = dot.getKWidth() == 8 &&\n                cast<NvidiaMmaEncodingAttr>(dot.getParent()).isAmpere();\n  if (largeK) {\n    llvm::SmallVector<unsigned> si;\n\n    // For kWidth = 8, split the mma into 4 mmas with \"stride 4\" along K\n    if (dot.getOpIdx() == 0) {\n      // ...\n      // To derive four independent MMA operations, a stride of 4 is applied to\n      // the original register layout:\n      //\n      //   1st MMA: [0, 4, 8, 12]\n      //   2nd MMA: [1, 5, 9, 13]\n      //   3rd MMA: [2, 6, 10, 14]\n      //   4th MMA: [3, 7, 11, 15]\n      si = llvm::SmallVector<unsigned>{0, 4, 8,  12, 1, 5, 9,  13,\n                                       2, 6, 10, 14, 3, 7, 11, 15};\n    } else {\n      // ...\n      si = llvm::SmallVector<unsigned>{0, 4, 1, 5, 2, 6, 3, 7};\n    }",
+      "elide": ["原文含大段 ASCII 寄存器布局注释(L78-L110),讲 kWidth=8 每元素含两个 bf16、按 stride 4 拆 4 个 mma 的动机;正文引其结论即可,不必全印。"]
+    },
+    {
+      "path": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv2.cpp",
+      "lines": "L360-L377",
+      "code": "  auto retArgs =\n      builder.newListOperand(numMmaRets, isIntMMA || isAccF16 ? \"=r\" : \"=f\");\n  auto cArgs = builder.newListOperand();\n  for (int i = 0; i < numMmaRets; ++i) {\n    cArgs->listAppend(builder.newOperand(\n        fc[(m * colsPerThread + 4 * n) / numCPackedElem + i + batchOffset * b],\n        std::to_string(i)));\n    // reuse the output registers\n  }\n  auto aArgs = builder.newListOperand({\n      {ha[{b, m, k}], \"r\"},\n      {ha[{b, m + 1, k}], \"r\"},\n      {ha[{b, m, k + 1}], \"r\"},\n      {ha[{b, m + 1, k + 1}], \"r\"},\n  });\n  auto bArgs =\n      builder.newListOperand({{hb[{b, n, k}], \"r\"}, {hb[{b, n, k + 1}], \"r\"}});\n  mma(retArgs, aArgs, bArgs, cArgs);",
+      "elide": ["mma.sync.aligned.m16n8k16 一次吃 4 个 A 片段寄存器、2 个 B 片段寄存器、numMmaRets 个 C 累加器(既是输入约束 std::to_string(i) 又复用为输出),对应 ch27 讲的 fragment 布局。此处只讲『凑齐操作数喂 mma』,不重讲 fragment 原理。"]
+    },
+    {
+      "path": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv2.cpp",
+      "lines": "L253-L256",
+      "code": "    {TensorCoreType::FP32_FP16_FP16_FP32,\n     \"mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\"},\n    {TensorCoreType::FP32_BF16_BF16_FP32,\n     \"mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32\"},",
+      "elide": ["mmaInstrPtxAmpere 是一张 (输入/累加 dtype 组合 → mma.sync 指令串) 的查表;完整表含 int8/tf32/fp8/b1 等十余条(L243-L277),正文引 2~3 条代表即可。"]
+    },
+    {
+      "path": "include/triton/Conversion/TritonGPUToLLVM/ElementwiseOpToLLVMBase.h",
+      "lines": "L178-L224",
+      "code": "  LogicalResult\n  matchAndRewrite(SourceOp op, OpAdaptor adaptor,\n                  ConversionPatternRewriter &rewriter) const override {\n    auto resultTy = op.getType();\n    Location loc = op->getLoc();\n    // element type\n    auto resultElementTy = getElementTypeOrSelf(resultTy);\n    Type elemTy = this->getTypeConverter()->convertType(resultElementTy);\n    SmallVector<SmallVector<Value>> allOperands;\n    for (auto operand : adaptor.getOperands()) {\n      auto argTy = op->getOperand(0).getType();\n      auto subOperands = unpackLLElements(loc, operand, rewriter);\n      subOperands = unpackI32(subOperands, argTy, rewriter, loc,\n                              this->getTypeConverter());\n      allOperands.resize(subOperands.size());\n      for (auto v : llvm::enumerate(subOperands))\n        allOperands[v.index()].push_back(v.value());\n    }\n    if (allOperands.size() == 0)\n      allOperands.push_back({});\n\n    SmallVector<Value> resultVals;\n    for (auto it = allOperands.begin(), end = allOperands.end(); it != end;) {\n      auto curr = static_cast<const ConcreteT *>(this)->createDestOps(\n          op, adaptor, rewriter, elemTy, MultipleOperandsRange(it, end), loc);\n      if (curr.size() == 0)\n        return failure();\n      for (auto v : curr) {\n        if (!static_cast<bool>(v))\n          return failure();\n        resultVals.push_back(v);\n      }\n      it += curr.size();\n    }\n    if (op->getNumOperands() > 0) {\n      auto argTy = op->getOperand(0).getType();\n      resultVals = reorderValues(resultVals, argTy, resultTy);\n    }\n    resultVals = maybeDeduplicate(op, resultVals);\n    resultVals =\n        packI32(resultVals, resultTy, rewriter, loc, this->getTypeConverter());\n    Value view = packLLElements(loc, this->getTypeConverter(), resultVals,\n                                rewriter, resultTy);\n    rewriter.replaceOp(op, view);\n\n    return success();\n  }",
+      "elide": ["这是所有逐元素 op 的通用『拆-算-拼』脚手架:unpackLLElements(拆结果 struct)→unpackI32(拆 32bit 打包元素)→逐元素 createDestOps(由子类填算法)→reorderValues/maybeDeduplicate→packI32→packLLElements(重打包)。maybeDeduplicate(L69-L177)是常量折叠优化,正文可点到即止。"]
+    },
+    {
+      "path": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ElementwiseOpToLLVM.cpp",
+      "lines": "L179-L191",
+      "code": "// Fp8E4M3 (x2) -> Fp16 (x2) (packed)\nstatic const Fp8ConversionDesc Fp8E4M3Nv_to_Fp16 = {\n    \"{ \\n\"\n    \"cvt.rn.f16x2.e4m3x2 $0, $1; \\n\"\n    \"}\",\n    16, 32, 2};\n\n// Fp16 (x2) -> Fp8E4M3 (x2) (packed)\nstatic const Fp8ConversionDesc Fp16_to_Fp8E4M3Nv = {\n    \"{ \\n\"\n    \"cvt.rn.satfinite.e4m3x2.f16x2 $0, $1; \\n\"\n    \"}\",\n    32, 16, 2};",
+      "elide": ["Ampere+ (sm_89) 上 fp8↔fp16 有原生 cvt.*.e4m3x2/e5m2x2 打包指令,一条指令转两个元素;pre-sm_89 则退化为 prmt/lop3/mul 的 bit-trick 长序列(如 Fp8E5M2_to_Bf16 的 hasNativeFP=false 分支 L71-L96)。正文对比『原生一条 cvt vs bit-trick 一堆』即可,不必逐条解读 bit-trick。"]
+    },
+    {
+      "path": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ElementwiseOpToLLVM.cpp",
+      "lines": "L414-L435",
+      "code": "    static DenseMap<std::tuple<TypeID, TypeID, RoundingMode>, Fp8ConversionDesc>\n        srcMap = {\n            // F8 -> F16\n            {{F8E4M3TyID, F16TyID, undefRounding}, Fp8E4M3Nv_to_Fp16},\n            {{F8E5M2TyID, F16TyID, undefRounding},\n             Fp8E5M2_to_Fp16(computeCapability >= 90)},\n            {{F16TyID, F8E4M3TyID, RoundingMode::RTNE}, Fp16_to_Fp8E4M3Nv},\n            {{F16TyID, F8E5M2TyID, RoundingMode::RTNE},\n             Fp16_to_Fp8E5M2_RTNE(computeCapability >= 90)},\n            {{F16TyID, F8E5M2TyID, RoundingMode::RTZ}, Fp16_to_Fp8E5M2_RTZ},\n            // F8 -> BF16\n            {{F8E5M2TyID, BF16TyID, undefRounding},\n             Fp8E5M2_to_Bf16(computeCapability >= 90)},\n            {{F8E4M3TyID, BF16TyID, undefRounding}, Fp8E4M3Nv_to_Bf16},\n            // BF16 -> F8\n            {{BF16TyID, F8E5M2TyID, RoundingMode::RTNE},\n             Bf16_to_Fp8E5M2(computeCapability >= 90)},\n            {{BF16TyID, F8E4M3TyID, RoundingMode::RTNE}, Bf16_to_Fp8E4M3Nv},\n            // F32 -> F8\n            {{F32TyID, F8E4M3TyID, RoundingMode::RTNE}, Fp32_to_Fp8E4M3Nv},\n            {{F32TyID, F8E5M2TyID, RoundingMode::RTNE}, Fp32_to_Fp8E5M2},\n        };",
+      "elide": ["fp8 转换的核心是这张 (源类型, 目标类型, 舍入) → PTX 描述 的三元组查表;每个 value 的 hasNativeFP 由 computeCapability>=90 决定选原生还是回退。回指 ch05 fp8 dtype / ch06 类型提升——本章讲『查到哪条 cvt 指令』。"]
+    },
+    {
+      "path": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ElementwiseOpToLLVM.cpp",
+      "lines": "L286-L309",
+      "code": "    PTXBuilder builder;\n    SmallVector<PTXBuilder::Operand *> operands;\n    auto outConstriant = outVecWidthBits == 16 ? \"=h\" : \"=r\";\n    auto inConstraint = inVecWidthBits == 16 ? \"h\" : \"r\";\n    for (int i = 0; i < outNums; i++) {\n      operands.push_back(builder.newOperand(outConstriant));\n    }\n\n    for (Value inVal : inPacked) {\n      operands.push_back(builder.newOperand(inVal, inConstraint));\n    }\n\n    auto &ptxOp = *builder.create(ptxAsm);\n    ptxOp(operands, /*onlyAttachMLIRArgs=*/true);\n    auto outVecTy = vec_ty(outType, outVecWidth);\n    SmallVector<Value> outPacked;\n    if (outNums == 1)\n      outPacked.push_back(builder.launch(rewriter, loc, outVecTy, false));\n    else {\n      auto outStructTy = struct_ty(SmallVector<Type>(outNums, outVecTy));\n      auto outStruct = builder.launch(rewriter, loc, outStructTy, false);\n      for (int i = 0; i < outNums; i++)\n        outPacked.push_back(extract_val(outVecTy, outStruct, i));\n    }",
+      "elide": ["makeConverterFromPtx 是 fp8 转换与 PTXBuilder 的接缝:把描述里的 ptx 串 + 输入/输出约束(=h/=r 按位宽)喂给 PTXBuilder,launch 成 inline asm。前半(L273-L285)把 v 打包进 32bit int 的样板可略讲。"]
+    },
+    {
+      "path": "lib/Conversion/TritonGPUToLLVM/ReduceOpToLLVM.cpp",
+      "lines": "L33-L75",
+      "code": "    auto srcValues = unpackInputs(loc, op, adaptor, rewriter);\n    std::map<SmallVector<unsigned>, SmallVector<Value>> accs;\n    std::map<SmallVector<unsigned>, SmallVector<Value>> indices;\n    // First reduce all the values along axis within each thread.\n    reduceWithinThreads(helper, srcValues, accs, indices, rewriter);\n\n    // Then reduce across threads within a warp.\n    reduceWithinWarps(helper, accs, rewriter);\n\n    if (helper.isWarpSynchronous()) {\n      // If all the values to be reduced are within the same warp there is\n      // nothing left to do.\n      packResults(helper, accs, rewriter);\n      return success();\n    }\n\n    // Compute a shared memory base per operand.\n    auto smemShape = helper.getScratchRepShape();\n\n    SmallVector<Value> smemBases =\n        getSmemBases(op, product<unsigned>(smemShape), rewriter, targetInfo);\n\n    storeWarpReduceToSharedMemory(helper, accs, indices, smemBases, rewriter);\n\n    sync(rewriter, loc, op);\n\n    // The second round of shuffle reduction\n    //   now the problem size: sizeInterWarps, s1, s2, .. , sn\n    accumulatePartialReductions(helper, smemBases, rewriter);\n\n    sync(rewriter, loc, op);\n\n    // set output values\n    loadReductionAndPackResult(helper, smemShape, smemBases, rewriter);\n\n    return success();",
+      "elide": ["reduce 三段式主干:①thread 内串行 combine ②warp 内 shfl 蝶形树 ③若归约维跨多 warp,则每 warp 结果落共享内存 + barrier + 第二轮 shfl 归约再写回。isWarpSynchronous 时省掉③直接 packResults——这是 reduce 快的关键:纯 warp 内归约无共享内存往返。"]
+    },
+    {
+      "path": "lib/Conversion/TritonGPUToLLVM/ReduceOpToLLVM.cpp",
+      "lines": "L154-L173",
+      "code": "  void warpReduce(ConversionPatternRewriter &rewriter, Location loc,\n                  SmallVector<Value> &acc, triton::ReduceOp op,\n                  unsigned numLaneToReduce, unsigned interleave,\n                  Value pred = {}) const {\n    auto success = targetInfo.warpReduce(rewriter, loc, acc, op,\n                                         numLaneToReduce, interleave);\n    if (success)\n      return;\n\n    auto mod = op->getParentOfType<ModuleOp>();\n    unsigned iWarpSize = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);\n\n    for (unsigned N = numLaneToReduce / 2; N > 0; N >>= 1) {\n      SmallVector<Value> shfl(acc.size());\n      for (unsigned i = 0; i < acc.size(); ++i) {\n        shfl[i] = targetInfo.shuffleXor(rewriter, loc, acc[i], N * interleave);\n      }\n      accumulate(op.getLoc(), rewriter, op.getCombineOp(), acc, shfl, pred);\n    }\n  }",
+      "elide": ["蝶形(butterfly)归约的心脏:N 从 numLane/2 逐次右移减半,每步用 shuffleXor(异或 lane N)取『对折』邻居的 acc,再把 combine region 作用上去。log2(numLane) 步内完成整个 warp 归约。shuffleXor 底层降成 shfl.sync.bfly.b32 PTX(ch34 已讲 warp shuffle 机制,此处只讲归约怎么用它)。"]
+    },
+    {
+      "path": "lib/Conversion/TritonGPUToLLVM/ReduceScanCommon.h",
+      "lines": "L50-L82",
+      "code": "inline SmallVector<Value> applyCombineOp(Location loc,\n                                         ConversionPatternRewriter &rewriter,\n                                         Region &combineOp, ValueRange acc,\n                                         ValueRange cur, Value pred = {}) {\n  // Allows for passing an unitialized acc and use cur as the neutral element\n  if (acc.size() == 0) {\n    return cur;\n  }\n  assert(cur.size() == acc.size());\n\n  // Create a new copy of the combine block, and try to speculatively inline it\n  Block *currentBlock = rewriter.getBlock();\n  Region &parent = *currentBlock->getParent();\n\n  rewriter.cloneRegionBefore(combineOp, parent,\n                             std::next(currentBlock->getIterator()));\n  Block &newCombine = *currentBlock->getNextNode();\n\n  llvm::SmallVector<Value> combineArgs(2 * acc.size());\n  for (unsigned i = 0; i < acc.size(); ++i) {\n    combineArgs[i] = acc[i];\n    combineArgs[acc.size() + i] = cur[i];\n  }\n\n  auto isRegionSpeculatable =\n      std::all_of(newCombine.begin(), newCombine.end(),\n                  [](auto &op) { return isSpeculatable(&op); });\n\n  if (!pred || isRegionSpeculatable) {\n    // Fast path, region has no side effects so we can unconditionally execute\n    return inlineCombineBlock(rewriter, newCombine, currentBlock,\n                              rewriter.getInsertionPoint(), combineArgs);\n  }",
+      "elide": ["combine region(用户 tl.reduce/tl.associative_scan 传入的 lambda,如 a+b、max(a,b))在降级期被克隆并内联到 shfl 之后:无副作用走快路径直接内联(fast path);有 pred 且含副作用则包一层 cf.cond_br 慢路径(L84-L116 可略,正文讲快路径足矣)。这解释了『combine region 落成什么』——它不是运行时函数调用,而是被物化进每步 shfl 后的指令流。"]
+    },
+    {
+      "path": "lib/Conversion/TritonGPUToLLVM/ScanOpToLLVM.cpp",
+      "lines": "L60-L80",
+      "code": "  for (unsigned srcIndex = 0; srcIndex < srcValues.size(); srcIndex++) {\n    unsigned elementIdx = (srcIndex / elementStride) % scanElementsPerThreads;\n    // Only consider the last element of each contiguous chunk of elements.\n    if (elementIdx != scanElementsPerThreads - 1)\n      continue;\n    // Reduce within warps.\n    SmallVector<Value> acc = srcValues[srcIndex];\n    for (unsigned i = 1; i <= scanDim / 2; i <<= 1) {\n      SmallVector<Value> shfl(acc.size());\n      for (unsigned j = 0; j < acc.size(); ++j) {\n        shfl[j] = targetInfo.shuffleUp(rewriter, loc, acc[j], i * threadStride);\n      }\n      Value mask = icmp_sge(laneIdAxis, i32_val(i));\n      SmallVector<Value> tempAcc =\n          accumulate(helper, rewriter, shfl, acc, mask);\n      for (unsigned j = 0; j < acc.size(); ++j) {\n        acc[j] = select(mask, tempAcc[j], acc[j]);\n      }\n    }\n    srcValues[srcIndex] = std::move(acc);\n  }",
+      "elide": ["scan(前缀和/前缀 max)的 warp 内 Kogge-Stone:i 从 1 倍增到 scanDim/2,每步 shuffleUp(i) 取前 i 个车道的值;mask(lane>=i)保证前 i 车道不越界累加;select 按 mask 决定是否用累加结果。与 reduce 的 shuffleXor 蝶形不同,scan 用 shuffleUp 定向前缀。跨 warp 部分(storeWarpAccumulator 等)可点到即止。"]
+    },
+    {
+      "path": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/PTXAsmFormat.cpp",
+      "lines": "L98-L114",
+      "code": "mlir::Value PTXBuilder::launch(OpBuilder &rewriter, Location loc, Type resTy,\n                               bool hasSideEffect, bool isAlignStack,\n                               ArrayRef<Attribute> attrs) const {\n  auto *ctx = rewriter.getContext();\n  auto inlineAsm = rewriter.create<LLVM::InlineAsmOp>(\n      loc, resTy, getAllMLIRArgs(), // operands\n      dump(),                       // asm_string\n      getConstraints(),             // constraints\n      hasSideEffect,                // has_side_effects\n      isAlignStack,                 // is_align_stack\n      LLVM::AsmDialectAttr::get(ctx,\n                                LLVM::AsmDialect::AD_ATT), // asm_dialect\n      ArrayAttr::get(ctx, attrs)                           // operand_attrs\n  );\n\n  return inlineAsm.getRes();\n}",
+      "elide": ["PTXBuilder 是所有 NVIDIA 硬件指令(mma/cvt/shfl/wgmma…)的公共出口:newOperand 登记 SSA 值 + 约束(=r/=f/=h/r/h…),create(ptxAsm) 登记指令,dump() 把 $0,$1… 占位符和指令拼成 asm 字符串,launch() 生成一条 LLVM::InlineAsmOp。dump()/getConstraints() 拼串细节(L73-L79, L140-L199)可略。"]
+    },
+    {
+      "path": "third_party/nvidia/lib/NVGPUToLLVM/NVGPUToLLVMPass.cpp",
+      "lines": "L595-L625",
+      "code": "  void runOnOperation() override {\n    MLIRContext *context = &getContext();\n    ModuleOp mod = getOperation();\n    RewritePatternSet patterns(context);\n\n#define POPULATE_NVGPU_OP(SRC_OP, ASM)                                         \\\n  patterns.add<NVGPUOpGenericPattern<SRC_OP>>(context, ASM, Constraints(),     \\\n                                              Constraints());\n    POPULATE_NVGPU_OP(ttn::RegAllocOp, Reg_Alloc_Op)\n    POPULATE_NVGPU_OP(ttn::WGMMAFenceOp, Wgmma_Fence_Op)\n    POPULATE_NVGPU_OP(ttn::WGMMACommitGroupOp, Wgmma_Commit_Group_Op)\n    POPULATE_NVGPU_OP(ttn::ClusterWaitOp, Cluster_Wait_Op)\n    POPULATE_NVGPU_OP(ttn::RegDeallocOp, Reg_Dealloc_Op)\n#undef POPULATE_NVGPU_OP\n    patterns.add<NVGPUOpGenericPattern<ttn::NamedBarrierArriveOp>>(\n        context, Named_Barrier_Arrive_Op, Constraints(),\n        Constraints({\"r\", \"r\"}));\n    patterns.add<NVGPUOpGenericPattern<ttn::NamedBarrierWaitOp>>(\n        context, Named_Barrier_Wait_Op, Constraints(), Constraints({\"r\", \"r\"}));\n    patterns.add<NVGPUOpGenericPattern<ttn::ClusterCTAIdOp>>(\n        context, Cluster_Cta_Id_Op, Constraints({\"=r\"}), Constraints());\n    patterns.add<NVGPUOpGenericPattern<ttn::CanonicalWarpIdOp>>(\n        context, Canonical_Warp_Id_Op, Constraints({\"=r\"}), Constraints());\n\n    patterns.add<FenceAsyncSharedOpPattern, StoreMatrixOpPattern,\n                 MBarrierArriveOpPattern, ClusterArriveOpPattern,\n                 WGMMAOpPattern, WGMMAWaitGroupOpPattern>(context);\n\n    if (applyPatternsAndFoldGreedily(mod, std::move(patterns)).failed())\n      signalPassFailure();\n  }",
+      "elide": ["NVGPUToLLVMPass 是一个独立 pass(不同于前面的 ConvertTritonGPUToLLVM),专把 NVGPU dialect 的高层 op 批量降成 inline asm。简单 op 用 NVGPUOpGenericPattern<Op>(模板 ptx 串 + 输入/输出约束表)一行注册;复杂 op(wgmma/store_matrix/mbarrier)各写专属 Pattern。这是『第三方 dialect 挂载接缝』——姊妹后端(如 Ascend)在此挂自己的 dialect→asm 降级。"]
+    },
+    {
+      "path": "third_party/nvidia/lib/NVGPUToLLVM/NVGPUToLLVMPass.cpp",
+      "lines": "L633-L662",
+      "code": "nvgpu::rewriteAsPtxAsm(Operation *op, PatternRewriter &rewriter,\n                       std::string ptxAsm,\n                       const OperandsAndConstraints &operandsAndConstraints,\n                       const Constraints &outputConstraints) {\n  auto ctx = rewriter.getContext();\n  auto loc = op->getLoc();\n  ptxAsm = patchPtxAsm(op, std::move(ptxAsm));\n  auto hasSideEffects = !isMemoryEffectFree(op);\n\n  PTXBuilder ptxBuilder;\n  auto ptxOutputs = getPtxOutputs(outputConstraints, ptxBuilder);\n  auto ptxOperands =\n      getPtxOperands(operandsAndConstraints, ptxBuilder, loc, rewriter);\n  SmallVector<PTXBuilder::Operand *> outputsAndOperands = ptxOutputs;\n  outputsAndOperands.append(ptxOperands.begin(), ptxOperands.end());\n  auto &ptxInstr = *ptxBuilder.create<PTXInstr>(ptxAsm);\n  ptxInstr(outputsAndOperands, /*onlyAttachMLIRArgs=*/true);\n  auto retTy =\n      op->getNumResults() == 0 ? void_ty(ctx) : op->getResult(0).getType();\n  auto res = ptxBuilder.launch(rewriter, loc, retTy,\n                               /*hasSideEffects*/ hasSideEffects);\n  if (op->getNumResults() == 0) {\n    rewriter.eraseOp(op);\n  } else {\n    rewriter.replaceOp(op, res);\n  }\n\n  return success();",
+      "elide": ["所有 NVGPU pattern 的统一出口:patchPtxAsm 先把模板里的 #pendings/#aligned 等占位符按 op 属性回填(patchPtxAsm L168-L205),再走 PTXBuilder 拼 operand/约束 → launch 成 InlineAsmOp,最后替换/删除原 op。与 DotOp/Elementwise 走的是同一个 PTXBuilder 脊柱。"]
+    },
+    {
+      "path": "lib/Target/LLVMIR/LLVMIRBreakPhiStruct.cpp",
+      "lines": "L12-L38",
+      "code": "static bool processPhiStruct(PHINode *phiNode) {\n  StructType *STy = dyn_cast<StructType>(phiNode->getType());\n  if (!STy)\n    return false;\n  IRBuilder<> builder(phiNode);\n  unsigned numOperands = phiNode->getNumIncomingValues();\n  unsigned numScalarEl = STy->getNumElements();\n  Value *newStruct = UndefValue::get(STy);\n  builder.SetInsertPoint(phiNode->getParent()->getFirstNonPHI());\n  llvm::IRBuilderBase::InsertPoint insertInsertPt = builder.saveIP();\n  for (unsigned i = 0; i < numScalarEl; i++) {\n    builder.SetInsertPoint(phiNode);\n    PHINode *newPhiNode =\n        builder.CreatePHI(STy->getElementType(i), numOperands);\n    for (unsigned j = 0; j < numOperands; ++j) {\n      Value *operand = phiNode->getIncomingValue(j);\n      builder.SetInsertPoint(phiNode->getIncomingBlock(j)->getTerminator());\n      newPhiNode->addIncoming(builder.CreateExtractValue(operand, i),\n                              phiNode->getIncomingBlock(j));\n    }\n    builder.restoreIP(insertInsertPt);\n    newStruct = builder.CreateInsertValue(newStruct, newPhiNode, i);\n    insertInsertPt = builder.saveIP();\n  }\n  phiNode->replaceAllUsesWith(newStruct);\n  return true;\n}",
+      "elide": ["make_llir 出口收尾:Triton 大量用 struct(打包的寄存器组)在循环边界当 phi,但 LLVM 后续优化对 struct phi 不友好。此 pass 把一个 struct phi 拆成 numScalarEl 个标量 phi(每个 element 一条),原 struct 用 insertvalue 重组、replaceAllUsesWith 替换。runOnFunction(L40-L53)只扫每个 block 开头连续的 phi 段(遇到非 phi 即 break),因为 phi 必在块首。"]
+    }
+  ],
+
+  "data_flow": [
+    {"step": "1. tt.dot 到达 DotOpConversion::matchAndRewrite", "detail": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM.cpp: 读结果 D 的 NvidiaMmaEncodingAttr;isOuter(K==1)或非 mma 布局则不走 mma。"},
+    {"step": "2. 按 versionMajor 分派", "detail": "isVolta→convertMMA884(mma.884)/isTuring→convertMMA1688(mma.1688)/isAmpere→convertMMA16816(mma.16816);WarpGroupDot 的 isHopper→convertWGMMA(wgmma);非 mma 的 Blocked 布局→convertFMADot(FMA 兜底)。"},
+    {"step": "3. (Ampere)convertMMA→convertDot", "detail": "MMAv2.cpp: getValuesFromDotOperandLayoutStruct 把 A/B 寄存器拆成 ValueTableV2;kWidth=8 时按 stride 4 拆成 4 个独立 mma;callMmaAmpere 凑 4A/2B/nC 操作数,查 mmaInstrPtxAmpere 拿指令串。"},
+    {"step": "4. tt.fp_to_fp / arith.* 逐元素 op", "detail": "ElementwiseOpConversionBase::matchAndRewrite: unpackLLElements→unpackI32→逐元素 createDestOps→reorderValues→maybeDeduplicate→packI32→packLLElements。FpToFpOpConversion::getConversionFunc 按 (src,dst,rounding) 查 srcMap 拿 Fp8ConversionDesc。"},
+    {"step": "5. tt.reduce 降级", "detail": "ReduceOpToLLVM.cpp: reduceWithinThreads(thread 内串行 combine)→reduceWithinWarps→warpReduce(shuffleXor 蝶形树)→若跨 warp 则 storeWarpReduceToSharedMemory + barrier + accumulatePartialReductions + loadReductionAndPackResult。"},
+    {"step": "6. tt.scan 降级", "detail": "ScanOpToLLVM.cpp: warpScan 用 Kogge-Stone(shuffleUp + mask + select)做 warp 内前缀;跨 warp 用共享内存传递 warp 级前缀。"},
+    {"step": "7. 每条硬件指令 → inline asm", "detail": "PTXAsmFormat.cpp: PTXBuilder.newOperand 登记 SSA 值 + 约束、create(ptx) 登记指令、launch() 生成 LLVM::InlineAsmOp。fp8/mma/shfl 都经此。"},
+    {"step": "8. NVGPU dialect 高层 op 批量降 asm", "detail": "NVGPUToLLVMPass.cpp: 独立 pass,NVGPUOpGenericPattern / 专属 Pattern → rewriteAsPtxAsm → patchPtxAsm 回填占位 → PTXBuilder → InlineAsmOp。"},
+    {"step": "9. LLVM IR 收尾:拆 struct phi", "detail": "LLVMIRBreakPhiStruct.cpp: processPhiStruct 把 struct phi 拆成逐标量 phi(LLVM 不友好 struct phi),make_llir 出口。此后 TTGIR→LLVM(→PTX by ptxas)阶梯走完。"}
+  ],
+
+  "design_decisions": [
+    {"decision": "dot 按『结果 tensor 的 NvidiaMma 布局版本』分派硬件指令,而非按 GPU 架构直接判断", "why": "布局版本(versionMajor + isVolta/Turing/Ampere/Hopper)在更早的 pass 已依目标算力选定并烙进 encoding;降级期只需照 encoding 派单,decouple 指令选择与降级。versionMajor 不匹配则 report_fatal_error(要求上游 pass 已保证合法)。", "evidence": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM.cpp:L48-L60"},
+    {"decision": "非 mma(Blocked)布局的 dot 走 FMA 标量兜底", "why": "没有合适 Tensor Core 布局(小 shape、不支持的 dtype、K==1 外积)时,退化为逐元素 FMA 乘加,保证正确性但放弃 Tensor Core 吞吐——这是『你的 dot 有没有用上 Tensor Core』的判据源头。", "evidence": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM.cpp:L62-L64"},
+    {"decision": "kWidth=8(Ampere)把一次逻辑 mma 拆成 4 个 stride-4 的物理 mma", "why": "kWidth*elemBitWidth>32 时单条 mma.16816 装不下,按 K 方向 stride 4 重排寄存器拆 4 个独立 mma,复用 Tensor Core 而不改布局语义。", "evidence": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv2.cpp:L71-L119"},
+    {"decision": "fp8 转换按 computeCapability 选『原生 cvt 打包指令 vs bit-trick 序列』", "why": "sm_89/sm_90 有原生 cvt.rn.f16x2.e4m3x2 等一条转两元素;老架构无此指令,回退为 prmt/lop3/mul/shr 的位操作长序列模拟。同一逻辑转换在不同算力上降成截然不同的指令,是 fp8 kernel 跨代性能差异的根。", "evidence": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ElementwiseOpToLLVM.cpp:L54-L118, L179-L191"},
+    {"decision": "reduce 纯 warp 内(isWarpSynchronous)时跳过共享内存往返", "why": "归约维完全落在一个 warp 内时,shfl 蝶形树即可完成,无需 store/barrier/load 共享内存——省掉两次 barrier 是 reduce 快的关键。跨 warp 才付共享内存代价。", "evidence": "lib/Conversion/TritonGPUToLLVM/ReduceOpToLLVM.cpp:L42-L47"},
+    {"decision": "warp 内归约用 shfl.bfly(异或 lane)蝶形树,log2(N) 步", "why": "蝶形交换让每步都有全部活跃车道参与,N 步后每车道都持有完整归约值,无共享内存、无 bank conflict——warp 级归约的最优模式。", "evidence": "lib/Conversion/TritonGPUToLLVM/ReduceOpToLLVM.cpp:L166-L172"},
+    {"decision": "scan 用 Kogge-Stone(shfl.up)而非蝶形", "why": "前缀扫描需要方向性(lane i 的结果依赖 lane<i),shuffleUp 取前 i 车道 + mask(lane>=i)保证只累加合法前缀;Kogge-Stone log2 步、work-inefficient 但 step-efficient,适合 warp 内 SIMD。", "evidence": "lib/Conversion/TritonGPUToLLVM/ScanOpToLLVM.cpp:L67-L78"},
+    {"decision": "combine region 克隆内联而非当函数调用", "why": "用户 combine lambda(a+b、max)被 cloneRegionBefore 复制并 inlineCombineBlock 物化进每步 shfl 后的指令流;无副作用走无条件快路径,有副作用+pred 才包 cond_br。避免函数调用开销,让 combine 与 shfl 融成一段直线代码。", "evidence": "lib/Conversion/TritonGPUToLLVM/ReduceScanCommon.h:L64-L82"},
+    {"decision": "所有硬件指令统一经 PTXBuilder → LLVM::InlineAsmOp 出口", "why": "mma/cvt/shfl/wgmma/mbarrier 全部落成 inline asm 而非 LLVM intrinsic:PTX 表达力更全、且约束串($0/$1 + =r/r/=f/=h)精确控制寄存器分配。PTXBuilder 是全后端共享的脊柱。", "evidence": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/PTXAsmFormat.cpp:L98-L114"},
+    {"decision": "NVGPU dialect 单独一个 pass 批量降 asm(配对脊柱)", "why": "把 wgmma/mbarrier/fence/cluster 等 NVIDIA 专属高层 op 收拢进独立 NVGPUToLLVMPass,用『模板 ptx + 约束表』的 NVGPUOpGenericPattern 一行注册简单 op、专属 Pattern 处理复杂 op。这是第三方后端挂载自己 dialect→asm 降级的接缝范式。", "evidence": "third_party/nvidia/lib/NVGPUToLLVM/NVGPUToLLVMPass.cpp:L600-L621"},
+    {"decision": "LLVM IR 出口拆 struct phi", "why": "LLVM 后端优化对聚合类型 phi 支持差;Triton 用 struct 打包寄存器组在循环边界当 phi 很常见。BreakStructPhiNodesPass 把 struct phi 降成逐标量 phi,换取下游更好的优化(SROA/寄存器分配)。", "evidence": "lib/Target/LLVMIR/LLVMIRBreakPhiStruct.cpp:L1-L5, L36"}
+  ],
+
+  "theory": [
+    "warp 内蝶形归约复杂度:一个 warp(32 车道)归约 32 个值,shuffleXor 步数为 log2(32)=5,每步全部 32 车道并行,总 shfl 次数 5*acc.size();对比串行归约 31 次加法,step 数从 O(N) 降到 O(log N)。",
+    "Kogge-Stone 前缀扫描:warp 内 scanDim 个元素,i 从 1 倍增到 scanDim/2,共 log2(scanDim) 步;每步 shuffleUp + select;work=O(N log N)(非 work-efficient 的 Brent-Kung),但 step=O(log N),SIMD 下每步免费并行,故 warp 内选它。",
+    "mma.16816 单指令算力:m16n8k16 一条指令做 16x8x16 的 MAC = 2048 次乘加,一个 warp(32 线程)协同完成,相较逐线程 FMA(每线程每周期 1 次乘加)是数量级吞吐差——这是『dot 到底有没有降到 mma』决定要不要 Tensor Core 的量化根据。",
+    "kWidth=8 拆 4 mma:kWidth*elemBitWidth = 8*16 = 128 bit > 单 mma 操作数寄存器容量,按 K 方向 stride 4 拆成 4 个 m16n8k16,总 K 覆盖不变、Tensor Core 复用率不降。",
+    "fp8 原生 vs bit-trick 转换开销:sm_89+ 上 fp8↔fp16 是 1 条 cvt(转 2 元素);pre-sm_89 的 Fp8E5M2_to_Bf16 回退分支用约 20 条 prmt/lop3/shr/mul 指令模拟同一转换——同逻辑跨代指令数差约 20x,直接体现在 fp8 kernel 的转换开销上。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [],
+    "must_keep": [
+      {"symbol": "DotOpConversion", "why": "dot 降级分派表,本章 stakes 核心;读者须懂『按结果布局版本选 mma 指令』的决策点。"},
+      {"symbol": "matchAndRewrite", "why": "所有 Conversion Pattern 的入口方法,dot/elementwise/reduce 都以它为骨架。"},
+      {"symbol": "convertMMA884", "why": "Volta→mma.884 分派目标,四条版本分派之一,须保留以对齐 ch27 MMA 版本。"},
+      {"symbol": "convertMMA1688", "why": "Turing→mma.1688 分派目标。"},
+      {"symbol": "convertMMA16816", "why": "Ampere→mma.16816 分派目标,fp16/bf16 主力 Tensor Core 路径。"},
+      {"symbol": "convertWGMMA", "why": "Hopper WarpGroupDot→wgmma 分派目标,异步 warpgroup 矩阵乘。"},
+      {"symbol": "convertFMADot", "why": "非 mma 布局的 FMA 兜底路径;『dot 有没有用上 Tensor Core』的反面判据。"},
+      {"symbol": "supportMMA", "why": "分派前的守卫:判断该 dot 是否受支持的 mma 版本接受。"},
+      {"symbol": "NvidiaMmaEncodingAttr", "why": "结果布局属性,isVolta/isTuring/isAmpere/isHopper/getVersionMajor 是分派依据。"},
+      {"symbol": "ValueTableV2", "why": "MMAv2 把 A/B 寄存器 struct 组织成 {b,m,k}→Value 的表,喂 mma 操作数的核心数据结构。"},
+      {"symbol": "callMmaAmpere", "why": "凑齐 4A/2B/nC 操作数拼一条 mma.sync 的具体拼装点。"},
+      {"symbol": "ElementwiseOpConversionBase", "why": "逐元素通用降级模板;unpack→per-element→repack 套路的载体。"},
+      {"symbol": "createDestOps", "why": "逐元素算法的子类填充点,fp8 转换/fma 等都在此实现。"},
+      {"symbol": "unpackI32", "why": "拆 32bit 打包元素,逐元素模板的入口环节。"},
+      {"symbol": "packI32", "why": "重打包回 32bit,逐元素模板的出口环节。"},
+      {"symbol": "FpToFpOpConversion", "why": "fp8↔fp16/bf16/fp32 数值转换的降级类。"},
+      {"symbol": "getConversionFunc", "why": "按 (src,dst,rounding) 查 srcMap 拿 Fp8ConversionDesc 的分派函数。"},
+      {"symbol": "Fp8ConversionDesc", "why": "描述一条 fp8 转换的 ptx 串 + 位宽 + 元素数的结构。"},
+      {"symbol": "makeConverterFromPtx", "why": "把 fp8 转换 ptx 串封成 inline asm converter,fp8↔PTXBuilder 的接缝。"},
+      {"symbol": "ReduceOpConversion", "why": "reduce 降级主类,三段式(thread/warp/inter-warp)骨架。"},
+      {"symbol": "warpReduce", "why": "shfl.bfly 蝶形归约,『reduce 快的根』。"},
+      {"symbol": "shuffleXor", "why": "蝶形归约每步取邻居值的 warp shuffle 原语。"},
+      {"symbol": "reduceWithinThreads", "why": "thread 内串行 combine 阶段。"},
+      {"symbol": "reduceWithinWarps", "why": "warp 内 shfl 归约阶段的调度。"},
+      {"symbol": "applyCombineOp", "why": "把用户 combine region 克隆内联到 shfl 之后;解释『combine region 落成什么』。"},
+      {"symbol": "warpScan", "why": "scan 的 Kogge-Stone warp 内前缀扫描。"},
+      {"symbol": "shuffleUp", "why": "Kogge-Stone 每步取前 i 车道值的定向 shuffle。"},
+      {"symbol": "PTXBuilder", "why": "所有硬件指令→inline asm 的公共脊柱。"},
+      {"symbol": "launch", "why": "PTXBuilder 生成 LLVM::InlineAsmOp 的出口方法。"},
+      {"symbol": "InlineAsmOp", "why": "硬件指令最终落成的 LLVM op 形态。"},
+      {"symbol": "newOperand", "why": "登记 SSA 值 + 约束(=r/r/=f/=h)的方法,约束串决定寄存器分配。"},
+      {"symbol": "NVGPUOpGenericPattern", "why": "NVGPU 高层 op 批量降 asm 的通用模板 pattern。"},
+      {"symbol": "rewriteAsPtxAsm", "why": "NVGPU pattern 的统一出口:patchPtxAsm→PTXBuilder→launch。"},
+      {"symbol": "ConvertNVGPUToLLVM", "why": "第三方 dialect 挂载接缝的 pass 本体。"},
+      {"symbol": "WGMMAOpPattern", "why": "wgmma 专属降级 pattern,Hopper 异步矩阵乘的 asm 拼装。"},
+      {"symbol": "processPhiStruct", "why": "拆 struct phi 的核心函数,make_llir 出口收尾。"},
+      {"symbol": "BreakStructPhiNodesPass", "why": "拆 struct phi 的 pass 本体,LLVM IR 收尾阶段标记点。"}
+    ]
+  },
+
+  "mechanisms": [
+    {"id": "dot-dispatch", "name": "dot 按 NvidiaMma 布局版本分派硬件指令(Volta/Turing/Ampere/Hopper + FMA 兜底)", "kind": "protocol", "source_anchors": ["third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM.cpp:L34-L68", "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM.cpp:L90-L101"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "mma-operand-assembly", "name": "MMAv2 ValueTableV2 + kWidth=8 拆 4 mma + callMmaAmpere 凑操作数拼 mma.sync", "kind": "layout", "source_anchors": ["third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv2.cpp:L60-L119", "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAv2.cpp:L354-L378"], "needs_figure": true, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "elementwise-template", "name": "逐元素通用降级模板:拆 struct→unpackI32→per-element→repack", "kind": "dataflow", "source_anchors": ["include/triton/Conversion/TritonGPUToLLVM/ElementwiseOpToLLVMBase.h:L178-L224"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "fp8-conversion", "name": "fp8↔fp16/bf16/fp32 数值转换:查表 srcMap + 原生 cvt vs bit-trick 回退", "kind": "config", "source_anchors": ["third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ElementwiseOpToLLVM.cpp:L414-L461", "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ElementwiseOpToLLVM.cpp:L179-L191", "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ElementwiseOpToLLVM.cpp:L54-L118"], "needs_figure": false, "needs_worked_example": true, "difficulty": "core", "paper_origin_note": "码章:fp8 数值格式属硬件 ISA 约定,无单一论文出处;数值语义回指 ch05/ch06。"},
+    {"id": "reduce-shfl-tree", "name": "reduce warp 内 shfl.bfly 蝶形树 + warp 间共享内存两轮归约", "kind": "algorithm", "source_anchors": ["lib/Conversion/TritonGPUToLLVM/ReduceOpToLLVM.cpp:L33-L75", "lib/Conversion/TritonGPUToLLVM/ReduceOpToLLVM.cpp:L154-L173"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core", "paper_origin_note": "码章:warp shuffle 归约为 CUDA 通用惯用法,无单一论文出处;算法复杂度已在 theory 量化。"},
+    {"id": "scan-kogge-stone", "name": "scan warp 内 Kogge-Stone 前缀扫描(shuffleUp + mask + select)", "kind": "algorithm", "source_anchors": ["lib/Conversion/TritonGPUToLLVM/ScanOpToLLVM.cpp:L51-L81"], "needs_figure": true, "needs_worked_example": true, "difficulty": "supporting", "paper_origin_note": "码章:Kogge-Stone 为经典并行前缀算法(1973),此处讲其在 warp shuffle 上的落地,非论文解读。"},
+    {"id": "combine-region-inline", "name": "combine region 克隆内联(快路径直接内联 / 慢路径 cond_br)", "kind": "protocol", "source_anchors": ["lib/Conversion/TritonGPUToLLVM/ReduceScanCommon.h:L50-L117"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "ptxbuilder-inline-asm", "name": "PTXBuilder 把每条硬件指令拼成 llvm.inline_asm", "kind": "protocol", "source_anchors": ["third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/PTXAsmFormat.cpp:L98-L114", "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/PTXAsmFormat.cpp:L171-L199"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "nvgpu-dialect-lowering", "name": "NVGPUToLLVMPass 把 NVGPU dialect 高层 op 批量降 inline asm(第三方 dialect 挂载接缝)", "kind": "protocol", "source_anchors": ["third_party/nvidia/lib/NVGPUToLLVM/NVGPUToLLVMPass.cpp:L595-L625", "third_party/nvidia/lib/NVGPUToLLVM/NVGPUToLLVMPass.cpp:L633-L662"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "break-phi-struct", "name": "LLVMIRBreakPhiStruct 把 struct phi 拆成标量 phi(make_llir 出口收尾)", "kind": "algorithm", "source_anchors": ["lib/Target/LLVMIR/LLVMIRBreakPhiStruct.cpp:L12-L38", "lib/Target/LLVMIR/LLVMIRBreakPhiStruct.cpp:L40-L53"], "needs_figure": true, "needs_worked_example": true, "difficulty": "supporting", "paper_origin_note": "码章:struct phi 拆解为 LLVM IR 工程处理,无论文出处;拆解前后 phi 形态由 pin 取证观测。"}
+  ],
+
+  "pin_forensics_plan": {
+    "target": "对一段带 tt.dot(fp16,mma 布局)+ tt.reduce(sum)+ fp8 cast 的 kernel,dump make_llir 阶段产物",
+    "observe": [
+      "dot 降成哪条 mma inline asm(预期 mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32),核对与结果布局 versionMajor 一致",
+      "reduce 的 shfl 序列(预期 shfl.sync.bfly.b32,N=16,8,4,2,1 共 5 步 + 逐步 combine 指令)",
+      "fp8 转换指令(sm_90 预期 cvt.rn.f16x2.e4m3x2 / cvt.rn.satfinite.e4m3x2.f16x2 单条;老算力预期 prmt/lop3 长序列)",
+      "BreakPhiStruct 前后 phi 形态:前=返回 struct 的单个 phi;后=numScalarEl 个标量 phi + insertvalue 重组"
+    ],
+    "note": "运行须进容器(host 无 CUDA);行号基线以 pin v3.2.0 为准。此为 illustrator/tester 取证指引,archivist 落 trace。"
+  },
+
+  "cross_references": {
+    "回指(禁重讲)": [
+      "ch27:MMA 版本/fragment/寄存器布局原理——本章只讲『降成哪条 mma 指令』,不重讲 fragment 如何铺",
+      "ch34:ldmatrix 喂操作数 / 共享内存降级 / warp shuffle 机制——本章讲 reduce/scan 怎么用 shfl,不重讲 shfl 本身",
+      "ch08:dot/reduce/scan 的语言表面(tl.dot/tl.reduce/tl.associative_scan)——本章讲它们怎么降到 mma/shfl",
+      "ch05:fp8 dtype(e4m3/e5m2)——本章讲 fp8 怎么降到硬件 cvt 指令",
+      "ch06:类型提升/broadcast——本章讲类型转换降到哪条硬件指令",
+      "ch33:per-op 降级的前段(load/store/地址计算等)——本章接其后讲 dot/elementwise/reduce 尾段"
+    ],
+    "配对脊柱/姊妹篇": "NVGPUToLLVMPass 是第三方 dialect 挂载接缝范式,姊妹后端(如 Ascend)在对应位置挂自己的 dialect→asm 降级。"
+  },
+
+  "foreshadow_due": {
+    "应埋": [],
+    "应回收": [],
+    "note": "bible.py due ch35 返回空(本章无伏笔埋/回收);与章节任务书『本章无伏笔埋/回收』一致。"
+  }
+}

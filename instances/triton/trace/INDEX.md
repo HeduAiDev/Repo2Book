@@ -5,6 +5,7 @@
 ## Recent Activity
 
 | Date | Type | Chapter | Summary | File |
+| 2026-07-17 | delivery | ch35 | 《矩阵乘指令选择、逐元素-归约降级与 LLVM→PTX 出口》定稿——Part VII 收官 | [2026-07-17_ch35-《矩阵乘指令选择、逐元素-归约降级与-llvm→ptx-出口》定稿——part-vii-收官.md](deliveries/2026-07-17_ch35-《矩阵乘指令选择、逐元素-归约降级与-llvm→ptx-出口》定稿——part-vii-收官.md) |
 | 2026-07-17 | delivery | 34 | ch34《共享内存降级与全局访存向量化》定稿——Part VII 第三跳,回收 f18 | [2026-07-17_ch34-ch34《共享内存降级与全局访存向量化》定稿——part-vii-第三跳,回收-f18.md](deliveries/2026-07-17_ch34-ch34《共享内存降级与全局访存向量化》定稿——part-vii-第三跳,回收-f18.md) |
 | 2026-07-17 | delivery | ch36 | ch36 CUDABackend 把五段 stages 注入编译管线 定稿 | [2026-07-17_ch36-ch36-cudabackend-把五段-stages-注入编译管线-定稿.md](deliveries/2026-07-17_ch36-ch36-cudabackend-把五段-stages-注入编译管线-定稿.md) |
 | 2026-07-17 | delivery | 31 | ch31《Prefetch、Warp Specialization 与杂项清理 pass》定稿——Part VI 收官 | [2026-07-17_ch31-ch31《prefetch、warp-specialization-与杂项清理-pass》定稿——part-vi-收官.md](deliveries/2026-07-17_ch31-ch31《prefetch、warp-specialization-与杂项清理-pass》定稿——part-vi-收官.md) |
@@ -14,7 +15,3 @@
 | 2026-07-17 | delivery | ch29 | ch29 software-pipelining-primer delivered (primer) | [2026-07-17_ch29-ch29-software-pipelining-primer-delivered-(primer).md](deliveries/2026-07-17_ch29-ch29-software-pipelining-primer-delivered-(primer).md) |
 | 2026-07-17 | delivery | ch28 | ch28《AccelerateMatmul 与布局最优化：tt.dot→MMA、减少 convert_layout》定稿 | [2026-07-17_ch28-ch28《acceleratematmul-与布局最优化：tt.dot→mma、减少-convert_layout》定稿.md](deliveries/2026-07-17_ch28-ch28《acceleratematmul-与布局最优化：tt.dot→mma、减少-convert_layout》定稿.md) |
 | 2026-07-17 | delivery | ch26 | ch26《共享内存分配与屏障:Allocation、Alias 与 Membar》定稿——Part VI | [2026-07-17_ch26-ch26《共享内存分配与屏障:allocation、alias-与-membar》定稿——part-vi.md](deliveries/2026-07-17_ch26-ch26《共享内存分配与屏障:allocation、alias-与-membar》定稿——part-vi.md) |
-| 2026-07-17 | delivery | 27 | ch27《Tensor Core 与 MMA 布局》定稿——primer,fragment 硬件契约倒逼编码 | [2026-07-17_ch27-ch27《tensor-core-与-mma-布局》定稿——primer,fragment-硬件契约倒逼编码.md](deliveries/2026-07-17_ch27-ch27《tensor-core-与-mma-布局》定稿——primer,fragment-硬件契约倒逼编码.md) |
-| 2026-07-17 | delivery | ch24 | ch24《ttg.* 与 ttng.* 算子:布局转换、异步拷贝与 Hopper 硬件方言》定稿——Part V 收官（回收 f10+f15） | [2026-07-17_ch24-ttg-ttng-operations-定稿-part-v-收官.md](deliveries/2026-07-17_ch24-ttg-ttng-operations-定稿-part-v-收官.md) |
-| 2026-07-17 | delivery | 25 | ch25《AxisInfo 静态分析与 Coalesce 改写》定稿——Part VI 开篇 + 全书第一个 analysis→transform 最短闭环 | [2026-07-17_ch25-ch25《axisinfo-静态分析与-coalesce-改写》定稿——part-vi-开篇-+-全书第一个-analy.md](deliveries/2026-07-17_ch25-ch25《axisinfo-静态分析与-coalesce-改写》定稿——part-vi-开篇-+-全书第一个-analy.md) |
-| 2026-07-17 | delivery | 23 | ch23《LinearLayout：一个抽象统一所有布局》定稿 + 回收 f17 | [2026-07-17_ch23-ch23《linearlayout：一个抽象统一所有布局》定稿-+-回收-f17.md](deliveries/2026-07-17_ch23-ch23《linearlayout：一个抽象统一所有布局》定稿-+-回收-f17.md) |
