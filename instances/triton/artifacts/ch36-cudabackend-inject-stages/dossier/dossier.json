@@ -1,0 +1,237 @@
+{
+  "kind": "skip_impl",
+  "chapter": "ch36",
+  "title": "CUDABackend：把五段 stages 注入编译管线（Part VIII 开篇 · 后端落地端）",
+  "one_line": "CUDABackend 是 BaseBackend 的一个具体实现——它用 add_stages 把 make_ttir/ttgir/llir/ptx/cubin 五段登记进 stages 字典，用 parse_options 按 self.capability 动态拼出 supported_fp8_dtypes 并组装成 CUDAOptions 存进 builder.options；make_ttgir 内部按 capability//10 分档注入前面各章讲过的 pass，构成真实的编译序列。本章回收 f1（后端接缝）与 f6（fp8 能力接缝的后端一端）。",
+
+  "code_spine": [
+    "python/triton/backends/compiler.py:L226-L305  —— BaseBackend 抽象基类：parse_options/add_stages/load_dialects/get_module_map 是 @abstractmethod（后端接缝的契约面，回收 f1）",
+    "third_party/nvidia/backend/compiler.py:L91-L129  —— CUDAOptions dataclass（frozen）：五组核心字段 + __post_init__ 注入 libdevice、校验 num_warps 是 2 的幂 + hash()",
+    "third_party/nvidia/backend/compiler.py:L132-L159  —— CUDABackend.__init__ 存 self.capability=target.arch；parse_options 按 capability 启发式拼 fp8 清单并组装 CUDAOptions（回收 f6）",
+    "third_party/nvidia/backend/compiler.py:L384-L389  —— add_stages：五个 lambda 按序写进 stages 字典（本章主角）",
+    "third_party/nvidia/backend/compiler.py:L203-L254  —— make_ttgir：ttir→ttgir 的 pass 流水线，按 capability//10 分档注入（把 ch27-31 各 pass 串成真实序列）",
+    "python/triton/compiler/compiler.py:L261-L292  —— compile() 消费 stages：add_stages 填字典→按 src.ext 定位 first_stage→逐段跑 compile_ir 并落缓存",
+    "third_party/nvidia/backend/compiler.py:L184-L185  —— load_dialects：Python 侧薄封装转调 nvidia.load_dialects(ctx)",
+    "third_party/nvidia/triton_nvidia.cc:L42-L71  —— init_triton_nvidia：pybind 把 C++ 的 load_dialects / ClusterInfo / passes 子模块暴露给 Python 后端（双语接缝的 C++ 一端）",
+    "third_party/nvidia/triton_nvidia.cc:L17-L40  —— init_triton_nvidia_passes_ttgpuir / ttnvgpuir：add_to_llvmir / add_plan_cta / add_fence_insertion / add_tma_lowering 等 pass 的 C++ 注册点"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "python/triton/backends/compiler.py",
+      "lines": "L258-L283",
+      "what": "BaseBackend 的抽象契约面：parse_options / add_stages / load_dialects 三个 @abstractmethod——一块新卡就是实现这三个方法接进来（回收 f1）",
+      "code": "    @abstractmethod\n    def parse_options(self, options: dict) -> object:\n        \"\"\"\n        Converts an `options` dictionary into an arbitrary object and returns it.\n        This function may contain target-specific heuristics and check the legality of the provided options\n        \"\"\"\n        raise NotImplementedError\n\n    @abstractmethod\n    def add_stages(self, stages: dict, options: object) -> None:\n        \"\"\"\n        Populates `stages` dictionary with entries of the form:\n        ir_name [str] => Function[(src: str, metadata: dict) -> str|bytes]\n        The value of each entry may populate a `metadata` dictionary.\n        Stages will be run sequentially (in inseriton order) and can communicate using `metadata`.\n        All stages are expected to return a `str` object, except for the last stage which returns\n        a `bytes` object for execution by the launcher.\n        \"\"\"\n        raise NotImplementedError\n\n    @abstractmethod\n    def load_dialects(self, context):\n        \"\"\"\n        Load additional MLIR dialects into the provided `context`\n        \"\"\"\n        raise NotImplementedError",
+      "elide": ["同类的 hash()/get_module_map() 抽象方法与 get_attrs_descriptor/compute_spec_key 的默认实现（L249-L305）——本章只需 parse_options/add_stages/load_dialects 三个接缝方法说明契约面"]
+    },
+    {
+      "path": "third_party/nvidia/backend/compiler.py",
+      "lines": "L91-L114",
+      "what": "CUDAOptions dataclass 的字段面：num_warps/num_stages/cluster_dims/ptx_version/supported_fp8_dtypes 等——注意 supported_fp8_dtypes 默认值 (fp8e5, fp8e4b15)，parse_options 会按 capability 覆盖它（f6 的后端一端）",
+      "code": "@dataclass(frozen=True)\nclass CUDAOptions:\n    num_warps: int = 4\n    num_ctas: int = 1\n    num_stages: int = 3\n    num_buffers_warp_spec: int = 0\n    num_consumer_groups: int = 0\n    reg_dec_producer: int = 0\n    reg_inc_consumer: int = 0\n    # maxnreg corresponds to the ptx parameter .maxnreg, which controls the\n    # maximum number of 32-bit registers used by one thread.\n    maxnreg: Optional[int] = None\n    cluster_dims: tuple = (1, 1, 1)\n    ptx_version: int = None\n    enable_fp_fusion: bool = True\n    supported_fp8_dtypes: Tuple[str] = (\"fp8e5\", \"fp8e4b15\")\n    deprecated_fp8_dtypes: Tuple[str] = ()\n    default_dot_input_precision: str = \"tf32\"\n    allowed_dot_input_precisions: Tuple[str] = (\"tf32\", \"tf32x3\", \"ieee\")\n    max_num_imprecise_acc_default: bool = None\n    extern_libs: dict = None\n    debug: bool = False\n    backend_name: str = 'cuda'\n    sanitize_overflow: bool = True",
+      "elide": []
+    },
+    {
+      "path": "third_party/nvidia/backend/compiler.py",
+      "lines": "L116-L123",
+      "what": "CUDAOptions.__post_init__：往 extern_libs 注入 libdevice.10.bc（可被 TRITON_LIBDEVICE_PATH 覆盖）并冻结为 tuple；assert num_warps 是 2 的幂",
+      "code": "    def __post_init__(self):\n        default_libdir = Path(__file__).parent / 'lib'\n        extern_libs = {} if self.extern_libs is None else dict(self.extern_libs)\n        if not extern_libs.get('libdevice', None):\n            extern_libs['libdevice'] = os.getenv(\"TRITON_LIBDEVICE_PATH\", str(default_libdir / 'libdevice.10.bc'))\n        object.__setattr__(self, 'extern_libs', tuple(extern_libs.items()))\n        assert self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0, \\\n               \"num_warps must be a power of 2\"",
+      "elide": []
+    },
+    {
+      "path": "third_party/nvidia/backend/compiler.py",
+      "lines": "L144-L159",
+      "what": "parse_options（本章主角之一 · 回收 f6）：从 opts 里挑出 CUDAOptions 认识的键；未显式给 supported_fp8_dtypes 时，以默认集为底、capability≥89 补 fp8e4nv、capability≥90 把 fp8e4b15 标为 deprecated；最后 CUDAOptions(**args) 组装并（在 compile() 里）存进 builder.options",
+      "code": "    def parse_options(self, opts) -> Any:\n        args = {k: opts[k] for k in CUDAOptions.__dataclass_fields__.keys() if k in opts}\n        if \"supported_fp8_dtypes\" not in args:\n            supported_fp8_dtypes = set(CUDAOptions.supported_fp8_dtypes)\n            if self.capability >= 89:\n                supported_fp8_dtypes.add(\"fp8e4nv\")\n            args[\"supported_fp8_dtypes\"] = tuple(sorted(supported_fp8_dtypes))\n\n        if \"deprecated_fp8_dtypes\" not in args:\n            if self.capability >= 90:\n                args[\"deprecated_fp8_dtypes\"] = (\"fp8e4b15\", )\n\n        if \"enable_fp_fusion\" not in args:\n            args[\"enable_fp_fusion\"] = os.getenv(\"TRITON_DEFAULT_FP_FUSION\", \"1\") == \"1\"\n        args[\"max_num_imprecise_acc_default\"] = 2**30 if self.capability == 90 else 0\n        return CUDAOptions(**args)",
+      "elide": []
+    },
+    {
+      "path": "third_party/nvidia/backend/compiler.py",
+      "lines": "L384-L389",
+      "what": "add_stages（本章绝对主角）：把五段编译函数各包一层 lambda，按 ttir→ttgir→llir→ptx→cubin 顺序写进 stages 字典。lambda 闭包捕获 options 与 self.capability，让每段拿到本次编译的配置",
+      "code": "    def add_stages(self, stages, options):\n        stages[\"ttir\"] = lambda src, metadata: self.make_ttir(src, metadata, options)\n        stages[\"ttgir\"] = lambda src, metadata: self.make_ttgir(src, metadata, options, self.capability)\n        stages[\"llir\"] = lambda src, metadata: self.make_llir(src, metadata, options, self.capability)\n        stages[\"ptx\"] = lambda src, metadata: self.make_ptx(src, metadata, options, self.capability)\n        stages[\"cubin\"] = lambda src, metadata: self.make_cubin(src, metadata, options, self.capability)",
+      "elide": []
+    },
+    {
+      "path": "third_party/nvidia/backend/compiler.py",
+      "lines": "L203-L254",
+      "what": "make_ttgir：ttir→ttgir 阶段的完整 pass 流水线。把 ch27-31 各 pass 串成真实序列，并按 capability//10 分档门控——≥sm80 开 f32_dot_tc / optimize_accumulator_init / warp-spec 四连 + add_pipeline(num_stages)；≥sm90 补 fence_insertion + tma_lowering",
+      "code": "    @staticmethod\n    def make_ttgir(mod, metadata, opt, capability):\n        cluster_info = nvidia.ClusterInfo()\n        if opt.cluster_dims is not None:\n            cluster_info.clusterDimX = opt.cluster_dims[0]\n            cluster_info.clusterDimY = opt.cluster_dims[1]\n            cluster_info.clusterDimZ = opt.cluster_dims[2]\n        # Set up Diagnostic\n        if os.environ.get(\"MLIR_ENABLE_REMARK\", \"0\") == \"1\":\n            srcMgr = llvm.source_mgr()\n            diag = ir.source_mgr_diag(srcMgr, mod.context)\n            mod.context.printOpOnDiagnostic(True)\n        # TTIR -> TTGIR\n        pm = ir.pass_manager(mod.context)\n        pm.enable_debug()\n        passes.ttir.add_convert_to_ttgpuir(pm, f\"cuda:{capability}\", opt.num_warps, 32, opt.num_ctas)\n        # optimize TTGIR\n        passes.ttgpuir.add_coalesce(pm)\n        if capability // 10 >= 8:\n            passes.ttgpuir.add_f32_dot_tc(pm)\n        # TODO(Qingyi): Move PlanCTAPass to the front of CoalescePass\n        nvidia.passes.ttnvgpuir.add_plan_cta(pm, cluster_info)\n        passes.ttgpuir.add_remove_layout_conversions(pm)\n        passes.ttgpuir.add_optimize_thread_locality(pm)\n        passes.ttgpuir.add_accelerate_matmul(pm)\n        passes.ttgpuir.add_remove_layout_conversions(pm)\n        passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)\n        passes.common.add_cse(pm)\n        if capability // 10 >= 8:\n            passes.ttgpuir.add_optimize_accumulator_init(pm)\n            passes.ttgpuir.add_combine_tensor_select_and_if(pm)\n            passes.ttgpuir.add_ws_task_partition(pm, opt.num_consumer_groups)\n            passes.ttgpuir.add_taskid_propagate(pm, opt.num_consumer_groups)\n            passes.ttgpuir.add_ws_data_partition(pm, opt.num_consumer_groups)\n            passes.ttgpuir.add_ws_code_partition(pm, opt.num_buffers_warp_spec, opt.num_consumer_groups,\n                                                 opt.reg_dec_producer, opt.reg_inc_consumer)\n            passes.ttgpuir.add_pipeline(pm, opt.num_stages)\n            passes.ttgpuir.add_ws_lowering(pm, opt.num_consumer_groups)\n        passes.ttgpuir.add_prefetch(pm)\n        passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)\n        passes.ttgpuir.add_remove_layout_conversions(pm)\n        passes.ttgpuir.add_reduce_data_duplication(pm)\n        passes.ttgpuir.add_reorder_instructions(pm)\n        passes.common.add_cse(pm)\n        passes.common.add_symbol_dce(pm)\n        if capability // 10 >= 9:\n            nvidia.passes.ttnvgpuir.add_fence_insertion(pm)\n            nvidia.passes.ttnvgpuir.add_tma_lowering(pm)\n        passes.common.add_canonicalizer(pm)\n        pm.run(mod)\n        metadata[\"cluster_dims\"] = (cluster_info.clusterDimX, cluster_info.clusterDimY, cluster_info.clusterDimZ)\n        return mod",
+      "elide": ["MLIR_ENABLE_REMARK 诊断分支（L211-L214）只影响调试输出、不改变 IR，讲解时可略"]
+    },
+    {
+      "path": "python/triton/compiler/compiler.py",
+      "lines": "L261-L292",
+      "what": "compile() 消费 stages 的关键片段：先 add_stages 把字典填满，再按源码扩展名 src.ext 定位 first_stage（IR 起点则跳过本段），load_dialects，然后 for 循环逐段 compile_ir(module, metadata) 并把每级 IR 落进缓存——这就是 add_stages 登记的五段被真正逐段跑起来的地方",
+      "code": "    # run compilation pipeline  and populate metadata\n    stages = dict()\n    backend.add_stages(stages, options)\n    first_stage = list(stages.keys()).index(src.ext)\n    # when the source is an IR file, don't apply the passes related to this stage. This makes it easier to write IR level tests.\n    if ir_source:\n        first_stage += 1\n    context = ir.context()\n    ir.load_dialects(context)\n    backend.load_dialects(context)\n    codegen_fns = backend.get_codegen_implementation()\n    module_map = backend.get_module_map()\n    try:\n        module = src.make_ir(options, codegen_fns, module_map, context)\n    except Exception as e:\n        filter_traceback(e)\n        raise\n    use_ir_loc = os.environ.get(\"USE_IR_LOC\", None)\n    for ext, compile_ir in list(stages.items())[first_stage:]:\n        next_module = compile_ir(module, metadata)\n        ir_filename = f\"{file_name}.{ext}\"\n        if (fn_override_manager is not None and (full_name := fn_override_manager.get_file(ir_filename)) is not None):\n            print(f\"\\nOverriding kernel with file {full_name}\")\n            next_module = parse(full_name, ext, context)\n        metadata_group[ir_filename] = fn_cache_manager.put(next_module, ir_filename)\n        if fn_dump_manager is not None:\n            fn_dump_manager.put(next_module, ir_filename)\n        # use an env variable to parse ir from file\n        if use_ir_loc == ext:\n            ir_full_name = fn_cache_manager.get_file(ir_filename)\n            next_module.create_location_snapshot(ir_full_name)\n            print(f\"Creating new locations for {ir_full_name}\")\n        module = next_module",
+      "elide": ["override/dump/USE_IR_LOC 三个环境变量分支只做旁路 IO，不改变主控制流；讲解时可略，聚焦 for 循环逐段跑 + 落缓存"]
+    },
+    {
+      "path": "third_party/nvidia/backend/compiler.py",
+      "lines": "L184-L185",
+      "what": "load_dialects：Python 后端侧只是一行薄封装，转调 C++ 暴露上来的 nvidia.load_dialects(ctx)——双语接缝的 Python 一端",
+      "code": "    def load_dialects(self, ctx):\n        nvidia.load_dialects(ctx)",
+      "elide": []
+    },
+    {
+      "path": "third_party/nvidia/triton_nvidia.cc",
+      "lines": "L42-L71",
+      "what": "init_triton_nvidia：pybind 把 C++ 侧的 passes 子模块、ClusterInfo 类、load_dialects 函数注册到 Python 的 nvidia 模块——上一段 Python 的 nvidia.load_dialects / nvidia.ClusterInfo / nvidia.passes.* 都在这里被暴露（双语接缝的 C++ 一端）",
+      "code": "void init_triton_nvidia(py::module &&m) {\n  auto passes = m.def_submodule(\"passes\");\n  init_triton_nvidia_passes_ttgpuir(passes.def_submodule(\"ttgpuir\"));\n  init_triton_nvidia_passes_ttnvgpuir(passes.def_submodule(\"ttnvgpuir\"));\n\n  // cluster info\n  py::class_<mlir::triton::nvidia_gpu::ClusterInfo>(m, \"ClusterInfo\")\n      .def(py::init<>())\n      .def_readwrite(\"clusterDimX\",\n                     &mlir::triton::nvidia_gpu::ClusterInfo::clusterDimX)\n      .def_readwrite(\"clusterDimY\",\n                     &mlir::triton::nvidia_gpu::ClusterInfo::clusterDimY)\n      .def_readwrite(\"clusterDimZ\",\n                     &mlir::triton::nvidia_gpu::ClusterInfo::clusterDimZ)\n      .def(\"__repr__\", [](mlir::triton::nvidia_gpu::ClusterInfo &self) {\n        std::ostringstream oss;\n        oss << \"(\" << self.clusterDimX << \", \" << self.clusterDimY << \", \"\n            << self.clusterDimZ << \")\";\n        return oss.str();\n      });\n\n  // load dialects\n  m.def(\"load_dialects\", [](mlir::MLIRContext &context) {\n    mlir::DialectRegistry registry;\n    registry.insert<mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect,\n                    mlir::triton::nvgpu::NVGPUDialect>();\n    mlir::registerNVVMDialectTranslation(registry);\n    context.appendDialectRegistry(registry);\n    context.loadAllAvailableDialects();\n  });",
+      "elide": ["set_nvvm_reflect_ftz（L74-L87）与 cublas 子模块（L89-L162）也在 init_triton_nvidia 内注册，但与本章「五段 stages 注入 + dialect 加载」的接缝主线无关，点到即可"]
+    },
+    {
+      "path": "third_party/nvidia/triton_nvidia.cc",
+      "lines": "L31-L40",
+      "what": "init_triton_nvidia_passes_ttnvgpuir：make_ttgir 里 nvidia.passes.ttnvgpuir.add_plan_cta / add_fence_insertion / add_tma_lowering 三个 Python 名字的 C++ 注册点——用 ADD_PASS_WRAPPER 宏把 MLIR pass 构造函数包成 pybind 可调用（双语接缝：Python 后端调的每个 nvidia pass 都在这里定义）",
+      "code": "void init_triton_nvidia_passes_ttnvgpuir(py::module &&m) {\n  ADD_PASS_WRAPPER_1(\"add_plan_cta\", mlir::createTritonNvidiaGPUPlanCTAPass,\n                     mlir::triton::nvidia_gpu::ClusterInfo *);\n  ADD_PASS_WRAPPER_0(\"add_fence_insertion\",\n                     mlir::createTritonNvidiaGPUFenceInsertionPass);\n  ADD_PASS_WRAPPER_0(\"add_tma_lowering\",\n                     mlir::createTritonNvidiaGPUTMALoweringPass);\n  ADD_PASS_WRAPPER_0(\"add_nvgpu_to_llvm\",\n                     mlir::triton::createConvertNVGPUToLLVMPass);\n}",
+      "elide": []
+    }
+  ],
+
+  "key_classes": [
+    {"name": "BaseBackend", "file": "python/triton/backends/compiler.py", "responsibility": "所有后端的抽象基类（metaclass=ABCMeta）。定义 parse_options/add_stages/load_dialects/get_module_map/hash 等抽象方法——这就是「后端接缝」的契约面（回收 f1）：一块新卡通过实现这些方法接进 Triton 编译驱动。"},
+    {"name": "CUDAOptions", "file": "third_party/nvidia/backend/compiler.py", "responsibility": "frozen dataclass，NVIDIA 后端的编译配置载体。字段含 num_warps/num_stages/cluster_dims/ptx_version/supported_fp8_dtypes 等；__post_init__ 注入 libdevice extern_lib、校验 num_warps 是 2 的幂；hash() 参与缓存键。是 f6 里 builder.options.supported_fp8_dtypes 的实际持有者。"},
+    {"name": "CUDABackend", "file": "third_party/nvidia/backend/compiler.py", "responsibility": "BaseBackend 的 NVIDIA 具体实现（回收 f1 的样板）。__init__ 存 self.capability=target.arch；parse_options 按 capability 拼 CUDAOptions（回收 f6）；add_stages 把五段编译函数注册进 stages；make_ttir/ttgir/llir/ptx/cubin 是五段实现；load_dialects 转调 C++。"},
+    {"name": "compile", "file": "python/triton/compiler/compiler.py", "responsibility": "编译驱动函数（ch14 已讲，本章回指）。本章关注它如何消费后端：backend.parse_options → add_stages 填 stages 字典 → 按 src.ext 定 first_stage → for 循环逐段 compile_ir 并落缓存。"}
+  ],
+
+  "data_flow": [
+    "1. compile() 拿到 target，make_backend(target) 选出 CUDABackend（supports_target 匹配 backend=='cuda'），实例化时 self.capability=target.arch。（python/triton/compiler/compiler.py:compile / third_party/nvidia/backend/compiler.py:__init__）",
+    "2. options = backend.parse_options(opts)：按 self.capability 拼 supported_fp8_dtypes（≥89 补 fp8e4nv）、deprecated_fp8_dtypes（≥90 弃 fp8e4b15）、max_num_imprecise_acc_default，组装出 CUDAOptions；__post_init__ 注入 libdevice、校验 num_warps 是 2 的幂。（compiler.py:parse_options → CUDAOptions.__post_init__）",
+    "3. stages = dict(); backend.add_stages(stages, options)：五个 lambda 按 ttir→ttgir→llir→ptx→cubin 顺序写进字典，闭包捕获 options 与 capability。（compiler.py:add_stages）",
+    "4. first_stage = list(stages.keys()).index(src.ext)：AST 源从 ttir 起跑；IR 文件源跳过本段。（python/triton/compiler/compiler.py:compile）",
+    "5. ir.load_dialects(context); backend.load_dialects(context)：后者转调 nvidia.load_dialects(ctx)，经 pybind 注册 TritonNvidiaGPU/NVGPU dialect + NVVM translation。（compiler.py:load_dialects → triton_nvidia.cc:init_triton_nvidia）",
+    "6. for ext, compile_ir in stages[first_stage:]: next_module = compile_ir(module, metadata)：逐段跑；make_ttgir 内部按 capability//10 分档注入 pass 流水线，pass 本身是 C++（triton_nvidia.cc 等注册）。每级 IR 落进 fn_cache_manager 缓存。（compiler.py:compile → make_ttgir）",
+    "7. 末段 make_cubin 返回 bytes；metadata 写回缓存，返回 CompiledKernel。（compiler.py:compile）"
+  ],
+
+  "design_decisions": [
+    {"decision": "五段编译不是硬编码在 compile()，而是由后端 add_stages 往一个字典里注册 lambda", "why": "把「有哪些编译阶段/每段怎么跑」的决定权下放给后端——CUDA 注册 5 段到 cubin，别的后端可注册不同段数/不同末产物。compile() 只按插入顺序遍历字典，与具体后端解耦。这是 f1 后端接缝在编译阶段维度的体现。", "evidence": "third_party/nvidia/backend/compiler.py:L384-L389 与 python/triton/compiler/compiler.py:L261-L292"},
+    {"decision": "add_stages 用 lambda 闭包捕获 options 与 self.capability，而非把它们作为 stages 的调用参数", "why": "compile() 的 for 循环只用统一签名 compile_ir(module, metadata) 逐段调用；把配置藏进闭包让循环无需知道每段要几个参数。ttgir/llir/ptx/cubin 需要 capability，ttir 不需要——闭包让签名统一而参数各异。", "evidence": "third_party/nvidia/backend/compiler.py:L384-L389"},
+    {"decision": "supported_fp8_dtypes 不写死，由 parse_options 按 self.capability 动态拼后存进 CUDAOptions", "why": "fp8 硬件支持随架构演进（Ada/Hopper 才有 fp8e4nv，Hopper 弃 fp8e4b15）。把这份能力清单绑定到 capability 后放进 builder.options，前端 dtype.to_ir 一查就知道当前卡能不能用某种 fp8——这是 f6 接缝的后端一端。", "evidence": "third_party/nvidia/backend/compiler.py:L144-L159"},
+    {"decision": "make_ttgir 用 capability//10 分档门控 pass（≥8 开 warp-spec/f32dottc，≥9 开 fence/tma）", "why": "同一后端要覆盖 sm70~sm90+ 多代硬件；用整除 10 取「代号档位」(80→8, 90→9) 决定注入哪些高级 pass，避免为每代写一个 backend。Tensor Core f32、warp specialization、TMA 都是有硬件门槛的优化。", "evidence": "third_party/nvidia/backend/compiler.py:L221,L231,L248"},
+    {"decision": "load_dialects / 各 pass 是 C++ 实现，经 pybind 暴露成 Python 名字供后端调用", "why": "MLIR dialect 与 pass 是 C++ 生态；pybind（triton_nvidia.cc）把它们包成 nvidia.load_dialects / nvidia.passes.ttnvgpuir.* 等 Python 可调用符号。Python 后端负责「编排顺序」，C++ 负责「pass 实现」——双语分工。", "evidence": "third_party/nvidia/triton_nvidia.cc:L17-L71 与 third_party/nvidia/backend/compiler.py:L184-L185,L224,L249-L250"}
+  ],
+
+  "theory": [
+    "capability//10 分档：NVIDIA compute capability 以两位十进制编码（sm70=70, sm80=80, sm89=89, sm90=90）。整除 10 取「主代号」——70→7, 80/86/89→8, 90→9。make_ttgir 用 `capability // 10 >= 8` 门控 f32_dot_tc/warp-spec 四连/add_pipeline，用 `>= 9` 门控 fence_insertion/tma_lowering；而 fp8 用更细的 `>= 89`（Ada 起有 fp8e4nv）与 `>= 90`（Hopper 弃 fp8e4b15）。粗档控 pass、细阈控 dtype，是两套并行的能力门。",
+    "num_warps 必须是 2 的幂：__post_init__ 用位运算 `n & (n-1) == 0` 校验（对正数，当且仅当只有一个 bit 置位时成立）。原因是 warp 到线程块的划分、layout 推导都假设 2 的幂，非幂会破坏 tiling 与 coalescing 的整除假设。",
+    "stages 字典的插入顺序即执行顺序：Python 3.7+ dict 保序，add_stages 按 ttir→ttgir→llir→ptx→cubin 插入，compile() 用 list(stages.items())[first_stage:] 切片顺序遍历。first_stage 由 src.ext 在键序中的下标决定——从 .ttgir 文件起编译就跳过 ttir 段（IR 源再 +1 跳过该段自身）。这把「五级阶梯」（ch32）落成一个可切片的有序表。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [],
+    "must_keep": [
+      {"symbol": "BaseBackend", "why": "后端接缝契约面（回收 f1）；CUDABackend 继承它，读者须理解抽象基类这一端"},
+      {"symbol": "CUDABackend", "why": "本章主角类，BaseBackend 的具体实现样板（f1）"},
+      {"symbol": "CUDAOptions", "why": "编译配置载体，f6 里 supported_fp8_dtypes 的持有者"},
+      {"symbol": "add_stages", "why": "本章绝对主角——五段注入的入口"},
+      {"symbol": "parse_options", "why": "回收 f6 的方法：按 capability 拼 fp8 清单并组装 CUDAOptions"},
+      {"symbol": "make_ttgir", "why": "capability 分档 pass 流水线所在，串起 ch27-31 各 pass"},
+      {"symbol": "make_ttir", "why": "五段之一，须与其余四段并列呈现登记顺序"},
+      {"symbol": "make_llir", "why": "五段之一"},
+      {"symbol": "make_ptx", "why": "五段之一"},
+      {"symbol": "make_cubin", "why": "五段之一，末段返回 bytes"},
+      {"symbol": "load_dialects", "why": "双语接缝 Python 一端，转调 nvidia.load_dialects"},
+      {"symbol": "supported_fp8_dtypes", "why": "f6 接缝的具体字段，capability≥89 补 fp8e4nv"},
+      {"symbol": "deprecated_fp8_dtypes", "why": "f6：capability≥90 弃 fp8e4b15"},
+      {"symbol": "capability", "why": "分档门控的自变量（self.capability=target.arch）"},
+      {"symbol": "__post_init__", "why": "注入 libdevice、校验 num_warps 是 2 的幂"},
+      {"symbol": "supports_target", "why": "后端选择依据（backend=='cuda'），make_backend 用它筛后端"},
+      {"symbol": "load_dialects", "why": "C++ 侧 init_triton_nvidia 里 m.def(\"load_dialects\") 与 Python 端成对"},
+      {"symbol": "init_triton_nvidia", "why": "pybind 双语接缝的 C++ 入口，暴露 passes/ClusterInfo/load_dialects"}
+    ]
+  },
+
+  "mechanisms": [
+    {
+      "id": "m1-add-stages-register",
+      "name": "add_stages 把五段编译函数注册进 stages 字典",
+      "kind": "protocol",
+      "source_anchors": ["third_party/nvidia/backend/compiler.py:L384-L389", "python/triton/compiler/compiler.py:L261-L292"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "本章主角。五个 lambda 按序写进字典，compile() 按插入序逐段跑。图应画：stages 字典（有序表）↔ compile() for 循环消费 ↔ 五级 IR 产物落缓存。worked example = 对一段真 kernel 观测五段注册顺序（pin v3.2.0 取证）。回指 ch32 五级阶梯（本章讲注册，不重讲阶梯原理）。"
+    },
+    {
+      "id": "m2-parse-options-fp8",
+      "name": "parse_options 按 capability 动态拼 supported_fp8_dtypes 并组装 CUDAOptions（回收 f6）",
+      "kind": "config",
+      "source_anchors": ["third_party/nvidia/backend/compiler.py:L144-L159", "third_party/nvidia/backend/compiler.py:L106-L107"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "回收 f6 的后端一端。worked example = 分别对 sm86/sm89/sm90 跑 parse_options，观测 fp8 清单差异（sm89 加 fp8e4nv、sm90 弃 fp8e4b15）。回指 ch05 dtype.to_ir 查 builder.options.supported_fp8_dtypes（本章讲清单怎么拼，不重讲 dtype 那端）。"
+    },
+    {
+      "id": "m3-ttgir-pass-pipeline",
+      "name": "make_ttgir 按 capability//10 分档注入 pass 流水线",
+      "kind": "dataflow",
+      "source_anchors": ["third_party/nvidia/backend/compiler.py:L203-L254"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "把 ch27-31 各 pass 串成真实序列。图应画：pass 流水线纵向序列 + capability 档位门控（基线段 / ≥sm80 段 / ≥sm90 段）三色分层，标出 accelerate_matmul(ch28)/add_pipeline(ch29,ch30)/warp-spec 四连+f32_dot_tc(ch31)/fence_insertion+tma_lowering(ch30) 各落在哪。worked example = 对一段 matmul kernel 在 sm90 下 dump ttgir pass 序列。回指 ch27-31（本章讲序列与门控，不重讲各 pass 内部）。"
+    },
+    {
+      "id": "m4-capability-gate",
+      "name": "capability//10 分档门控（粗档控 pass / 细阈控 dtype）",
+      "kind": "algorithm",
+      "source_anchors": ["third_party/nvidia/backend/compiler.py:L221", "third_party/nvidia/backend/compiler.py:L248", "third_party/nvidia/backend/compiler.py:L148-L154"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting",
+      "note": "kind=algorithm 须 worked_example：给定 capability=70/80/86/89/90，推出 capability//10 档位与各门开关（f32_dot_tc/warp-spec/fence/tma/fp8e4nv/deprecate fp8e4b15）。无论文出处，是工程启发式。"
+    },
+    {
+      "id": "m5-cudaoptions-postinit",
+      "name": "CUDAOptions.__post_init__：注入 libdevice + 校验 num_warps 是 2 的幂",
+      "kind": "config",
+      "source_anchors": ["third_party/nvidia/backend/compiler.py:L116-L123"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "note": "frozen dataclass 用 object.__setattr__ 绕过冻结注入 extern_libs；位运算 n&(n-1)==0 校验 2 的幂。"
+    },
+    {
+      "id": "m6-base-backend-seam",
+      "name": "BaseBackend 抽象基类 = 后端接缝契约面（回收 f1）",
+      "kind": "protocol",
+      "source_anchors": ["python/triton/backends/compiler.py:L258-L283", "python/triton/backends/compiler.py:L226-L231"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "note": "回收 f1。parse_options/add_stages/load_dialects/get_module_map/hash 五个 @abstractmethod 就是「一块新卡怎么接进来」的契约。姊妹篇《Triton-Ascend 源码解读》往 python/triton/backends/ 塞 ascend/ 目录（经 _discover_backends 扫描）实现同一组方法接进 C++ 侧——一句点到即可，本章是配对脊柱的 CUDA 样板端。"
+    },
+    {
+      "id": "m7-pybind-bilingual-seam",
+      "name": "C++/Python 双语接缝：load_dialects 与 init_triton_nvidia 成对",
+      "kind": "protocol",
+      "source_anchors": ["third_party/nvidia/backend/compiler.py:L184-L185", "third_party/nvidia/triton_nvidia.cc:L42-L71", "third_party/nvidia/triton_nvidia.cc:L17-L40"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "note": "Python 后端 nvidia.load_dialects(ctx) 转调 C++ init_triton_nvidia 里 m.def(\"load_dialects\")；make_ttgir 调的 nvidia.passes.ttnvgpuir.add_* 在 init_triton_nvidia_passes_ttnvgpuir 用 ADD_PASS_WRAPPER 宏注册。pybind 把 C++ dialect/pass 暴露给 Python 后端——点到即可，不深挖 pybind 机制。"
+    },
+    {
+      "id": "m8-stages-consumed-in-compile",
+      "name": "compile() 消费 stages：first_stage 定位 + for 循环逐段跑并落缓存",
+      "kind": "dataflow",
+      "source_anchors": ["python/triton/compiler/compiler.py:L261-L292"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "note": "回指 ch14 编译驱动（不重讲驱动全貌）。本章只讲 add_stages 注册的字典在此被按 src.ext 切片、逐段 compile_ir(module,metadata) 跑起来、每级 IR 落 fn_cache_manager——闭合「注册→消费」环。"
+    }
+  ],
+
+  "foreshadow_due": {
+    "recycle": [
+      {"id": "f1", "planted": "ch01", "what": "后端接缝（§8 FOR_EACH_P + BaseBackend 抽象基类 + TRITON_PLUGIN_DIRS 侧门）——「一块新卡怎么接进来」与姊妹篇《Triton-Ascend 源码解读》逐章对位的锚；姊妹篇往 python/triton/backends/ 塞 ascend/ 目录、经该缝进 C++ 侧。", "how_recycled_here": "本章 CUDABackend 就是 BaseBackend 的一个具体实现，讲清后端经 parse_options/add_stages/load_dialects 三个抽象方法接进编译驱动。BaseBackend 契约面（m6）+ CUDABackend 样板（m1/m2/m3）= 配对脊柱的 CUDA 端。姊妹篇塞 ascend/ 目录经 _discover_backends 扫描（python/triton/backends/__init__.py）+ TRITON_PLUGIN_DIRS 侧门（CMakeLists.txt:161 / python/setup.py:90）进 C++ 侧——一句点到，作为逐结构对位样板收尾。"},
+      {"id": "f6", "planted": "ch05", "what": "fp8 后端能力接缝——dtype.to_ir 查 builder.options.supported_fp8_dtypes，那份清单由 CUDABackend.parse_options 按 self.capability 动态拼(≥89 补 fp8e4nv、≥90 弃 fp8e4b15)后组装成新 CUDAOptions 存进 builder.options。", "how_recycled_here": "parse_options（compiler.py:L144-L159 / m2）按 self.capability≥89 补 fp8e4nv、≥90 把 fp8e4b15 标 deprecated，拼成清单塞进 CUDAOptions.supported_fp8_dtypes（默认值 :L106），CUDAOptions 即 builder.options。f6 的另一端（ch05 dtype.to_ir 查这份清单）在此兑现——本章讲清单怎么拼，回指 ch05 讲查的那端。"}
+    ],
+    "plant": []
+  }
+}
