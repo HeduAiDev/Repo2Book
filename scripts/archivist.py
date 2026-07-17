@@ -90,7 +90,12 @@ def record(entry_type: str, title: str, what: str, why: str,
 
     # Generate filename
     safe_title = title.lower().replace(" ", "-").replace("/", "-")[:60]
-    chapter_prefix = f"ch{chapter}-" if chapter else ""
+    # 别对已带 "ch" 前缀的 chapter 再补一次 "ch"(如 "ch26" → 曾变成 "chch26-")。
+    if chapter:
+        ch_str = str(chapter)
+        chapter_prefix = f"{ch_str}-" if ch_str.startswith("ch") else f"ch{ch_str}-"
+    else:
+        chapter_prefix = ""
     filename = f"{date_str}_{chapter_prefix}{safe_title}.md"
     filepath = target_dir / filename
 
