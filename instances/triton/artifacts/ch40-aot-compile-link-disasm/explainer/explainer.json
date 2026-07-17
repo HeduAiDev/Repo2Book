@@ -1,0 +1,321 @@
+{
+  "chapter_id": "ch40",
+  "slug": "ch40-aot-compile-link-disasm",
+  "trace_methodology": "本章 kind=deep 且 skip_impl(命令行工具无算法可重实现)。取证遵循 INSTANCE 的『pin 精确编译』支柱:用 pip install triton==3.2.0 装出的 v32 venv(与钉版 9641643 逐字节相同)真跑 compile.py/link.py/disasm.py 的真函数。版本无关的纯 Python/正则段(签名三分/suffix 编解码/HeaderParser/分派器生成/parseCtrl)直接 host 跑;需 cubin 的段(m3 内嵌/m8 两行解析/m10 BRA 重标)用显式 target=sm_90(Hopper) 绕开 driver.active(本 host 无 torch)、走 triton 自带 ptxas 12.4 + cuobjdump 出真 cubin/真 SASS。sm_90 正落在 parseCtrl 的 Volta~Hopper 控制字布局适用域。compile.py __main__ 端到端(其 triton.compile 无 target、走 driver.active)需 torch/GPU,故 m3 改为显式 target 编译真 cubin + 逐字复刻 L116-L155 的分桶/hexlify/读真 compile.{c,h} 模板 .format——产物是真 compile.c/compile.h。所有 trace_source=run,原始输出见 traces/*.json,驱动脚本见 traces/run_*.py。",
+
+  "mechanisms": [
+    {
+      "mechanism_id": "m1-signature-tripartition",
+      "intuition": "报关单：一行签名字符串就是给编译器的报关单,constexpr 是海关。带 : 且冒号后能读成数的段(如 :16)贴上『整除性提示』标签进 hints 抽屉;裸的能读成数的段(如 1024)是『编译期常量』进 constants 抽屉、并从运行期清单除名;剩下读不成数的段(如 i32)才是运行期真要传的参数进 signature 抽屉。",
+      "worked_example": {
+        "params": {"signature_string": "*fp32:16, i32:16, 1024, i32", "arg_names": ["X", "N", "BLOCK", "stride"]},
+        "trace_source": "run",
+        "trace_ref": "traces/tripartition.json",
+        "table": {
+          "columns": ["签名段(位置,参数名)", "有冒号?", "冒号后/整段可转数?", "→ hints", "→ constants", "→ signature(运行期)"],
+          "rows": [
+            ["*fp32:16 (pos0, X)", "是", "16 → int ✓", "hints[0]=16", "—", "X:*fp32"],
+            ["i32:16 (pos1, N)", "是", "16 → int ✓", "hints[1]=16", "—", "N:i32"],
+            ["1024 (pos2, BLOCK)", "否", "1024 → int ✓", "—", "BLOCK=1024", "—(入常量,从签名除名)"],
+            ["i32 (pos3, stride)", "否", "i32 → 非数", "—", "—", "stride:i32"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "constants 与 signature 互斥且共同覆盖被 arg_names 认领的段;hints 是正交的位置索引集(可与 signature 重叠)。",
+        "argument": "签名字典推导的 `if kernel.arg_names[i] not in constants`(compile.py:L101) 使一个参数名要么在 constants(裸可转数)、要么在 signature、绝不同时——每段判定一次、不重不漏。本例 4 段 → constants{BLOCK}(1 个) + signature{X,N,stride}(3 个) 恰好认领全部标量语义;而 X 的 :16 只进 hints、X 仍留在 signature——hints 与 signature 正交,互不排斥。"
+      },
+      "quantified": "签名段数 n=4,一次 O(n) 线性扫描完成三分。产出 2 个 hints + 1 个 constant + 3 个运行期参数;运行期 C 原型形参数 = 段数 − constants 数(此例暂为 4−1=3,若含 :1 还会再降,见 m3)。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m1-tripartition",
+          "claim": "一条命令行签名字符串被 constexpr 判据切成三张不相交的表:hints(有冒号且可转数) / constants(裸可转数) / signature(其余运行期参数)。",
+          "template": "flow",
+          "numbers": [
+            {"value": "输入 4 段", "provenance": "traces/tripartition.json num_segments=4"},
+            {"value": "hints={0:16, 1:16}", "provenance": "traces/tripartition.json hints"},
+            {"value": "constants={BLOCK:1024}", "provenance": "traces/tripartition.json constants"},
+            {"value": "signature={X:*fp32, N:i32, stride:i32}", "provenance": "traces/tripartition.json signature"}
+          ],
+          "caption_draft": "同一段 :16 既进 hints 又留在 signature(整除性提示不改变『要不要传』);而裸的 1024 进 constants 并从 signature 除名——三桶按『有无冒号 × 整段能否转数』正交划分,这就是 AOT 把 JIT 特化钉到命令行的入口。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m2-hints-to-attrs",
+      "intuition": "AttrsDescriptor 有两条进货渠道:JIT 期从『真实参数值』推断(ch14),AOT 期没有实参、改由人在命令行报数(:16/:1),from_hints 就是这条命令行进货口。它拿着一张『什么值算什么属性』的对照表(16=可被16整除, 1=恒等于1),把你报的每个位号对号入座。",
+      "worked_example": {
+        "params": {"case_a": "hints={0:16, 1:16}", "case_b": "hints={0:16, 2:1}"},
+        "trace_source": "run",
+        "trace_ref": "traces/attrs.json",
+        "table": {
+          "columns": ["输入 hints", "property 匹配", "tt.divisibility 组", "tt.equal_to 组", "get_constants()"],
+          "rows": [
+            ["{0:16, 1:16}", "16 == tt.divisibility(=16)", "[0, 1]", "[]", "{}(空)"],
+            ["{0:16, 2:1}", "1 == tt.equal_to(=1)", "[0]", "[2]", "{2: 1}"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "每个 hint 值 ∈ {1, 16}(assert 保证),且每个值恰好匹配一个 property,故每个 hint 位被分入恰好一个 arg_properties 列、绝不双重归类。",
+        "argument": "compile.py:L108-L109 先 assert h∈{1,16} 卡住定义域;from_hints 遍历 property_values(pin 里仅 tt.divisibility=16 与 tt.equal_to=1 两项),对每项收集满足 h==prop_val 的位号。16 与 1 互异 ⇒ 无位同时进两列。case_b 里位 2 报 1 → 进 tt.equal_to、且 get_constants() 把它并成常量 {2:1},它将从运行期原型消失(接 m3)。"
+      },
+      "quantified": "from_hints 复杂度 O(property 数 × |hints|)=O(2×|hints|)。case_a 两位全报 16 → 全进 divisibility、get_constants 为空;case_b 位 2 报 1 → 并入常量,运行期形参 −1。回指 ch14:同一个 AttrsDescriptor,from_hints 只是它的命令行构造入口,不重讲其语义。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "m3-arg-partition-and-embed",
+      "intuition": "打包一个『免安装绿色版』:把编译出的 cubin(GPU 机器码)按十六进制一个字节一个字节抄进一段 C 数组,再配上『开机自加载』(cuModuleLoadData 从内存直接读)和『一键启动』(cuLaunchKernel)。生成的 .c 编进 .so 后不再需要 Python、也不需要旁边挂个 .cubin 文件——真正自包含。而参数清单分两份:对外的运行期清单(你要传的)和给链接器留档的全清单(含被折叠掉的 :1 参数)。",
+      "worked_example": {
+        "params": {"kernel": "add_kernel(X,Y,Out,stride)", "hints": "{0:16,1:16,2:16, 3:1}", "note": "stride 报 :1(equal_to_1)以演示形参折叠;另编译一个无 :1 的真 cubin 落 compile.c"},
+        "trace_source": "run",
+        "trace_ref": "traces/compile_embed.json",
+        "table": {
+          "columns": ["参数(位置)", "in constants?", "in equal_to_1?", "→ full_signature(arg_names, 留档)", "→ 运行期 signature(arg_names_not_1)"],
+          "rows": [
+            ["X (0)", "否", "—", "✓ X", "✓ X"],
+            ["Y (1)", "否", "—", "✓ Y", "✓ Y"],
+            ["Out (2)", "否", "—", "✓ Out", "✓ Out"],
+            ["stride (3)", "是(=1)", "是(∈ equal_to_1)", "✓ stride", "✗ 省略"],
+            ["合计", "", "", "full = 4 形参", "runtime = 3 形参"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "arg_names_not_1(运行期签名)⊆ arg_names(全签名):运行期原型恰为全原型去掉 equal_to_1 参数的子集。",
+        "argument": "compile.py:L120-L128 对每个参数三分支:非常量 → 同时进两表;是常量且 i∈attrs.equal_to_1 → 只进 arg_names(留档)不进 arg_names_not_1;纯常量(如 BLOCK)→ 都不进。故 arg_names_not_1 = arg_names 减去 equal_to_1 项。本例 stride 报 :1 → full=4 但 runtime=3,一个 :1 让 C 原型少一个形参。"
+      },
+      "quantified": "真编译的无 :1 版:cubin=5648 字节 → hexlify 得 11296 个十六进制字符 → C 里 `unsigned char CUBIN_NAME[11296]`,数组头 6 字节 0x7f 0x45 0x4c 0x46 0x02 0x01 正是 ELF 魔数(cubin 是 ELF);入口 `cuLaunchKernel(func, 1,1,1, 4*32, 1,1, 0, stream, args, NULL)`——gridXYZ=1、num_warps*32=4*32 线程、shared=0。含 :1 版形参 4→3。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m3-cubin-embed",
+          "claim": "cubin 二进制经 binascii.hexlify 逐字节内嵌成 C 数组 CUBIN_NAME[N],与 load(cuModuleLoadData)+入口(cuLaunchKernel)一起构成脱离 Python 的自包含 C。",
+          "template": "before-after",
+          "numbers": [
+            {"value": "cubin 5648 字节", "provenance": "traces/compile_embed.json cubin_bytes=5648"},
+            {"value": "→ CUBIN_NAME[11296]", "provenance": "traces/compile_embed.json bin_size_hexchars=11296"},
+            {"value": "数组头 0x7f 0x45 0x4c 0x46(ELF)", "provenance": "traces/compile_embed.json cubin_array_head_6"},
+            {"value": "cuLaunchKernel(..., 4*32, ...)", "provenance": "traces/compile_embed.json compile_c_launch_tail"}
+          ],
+          "caption_draft": "左:Python 手里的 5648 字节 cubin;右:填好的 compile.c——1 字节变 2 个 hex 字符(5648→11296),cuModuleLoadData 从这段内存数组直接加载模块,无需旁挂 .cubin 文件,这就是『自包含部署』的字面含义。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m4-suffix-codec",
+      "intuition": "把特化信息写进函数名本身当暗号:kernel_suffix 是发报机,逐参数拼上位号,再看这个参数是不是恒 1(记 c)或对齐 16(记 d);link.py 的 _match_suffix 是收报机,扫这串名字把暗号解回每个参数的整除性提示。函数名就是跨进程传递特化的隐形信道。",
+      "worked_example": {
+        "params": {"signature_len": 3, "divisibility_16": "{2}", "equal_to_1": "{}"},
+        "trace_source": "run",
+        "trace_ref": "traces/suffix_codec.json",
+        "table": {
+          "columns": ["方向", "输入", "逐参数处理", "输出"],
+          "rows": [
+            ["编码 kernel_suffix", "signature_len=3, divisibility_16_params=[2]", "逐参数拼位号,divisibility_16 追加 'd'", "suffix='012d'"],
+            ["解码 _match_suffix", "suffix='012d', c_sig 有 3 参数", "定位每参数位再读紧邻字符:d→16, c→1, 无→None", "num_specs=1, sizes=[null, null, 16]"],
+            ["往返校验", "编码 → 解码", "复原 sizes", "roundtrip_ok = true"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "kernel_suffix 与 _match_suffix 在参数数较少时互为逆运算:编码后再解码复原 sizes。",
+        "argument": "编码对每参数 i 先拼 str(i)、再按 equal_to_1/divisibility_16 追加 'c'/'d';解码 find(str(i)) 定位后读紧邻字符还原 1/16/None。本例 '012d' ⇄ sizes=[null,null,16] 往返一致(trace roundtrip_ok=true)。注:find(str(i)) 在多位数 argid 下定位有歧义(如 '1' 可能先命中 '10' 里的 '1'),参数少时不触发。"
+      },
+      "quantified": "suffix 长度 = Σ_param (1 + [该参数 equal_to_1] + [该参数 divisibility_16]) 个字符;3 参数、仅第 2 位对齐 16 → '012d'(4 字符,1 个特化标志 d)。编解码各 O(参数数)。这对编解码是 compile.py(发)与 link.py(收)跨进程唯一的特化信道。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "m5-header-parse",
+      "intuition": "compile.py 和 link.py 是两个各自独立的命令行程序,内存不共享。compile.py 把链接要用的元数据(函数名/全签名/算法信息)编成一行 `// tt-linker:` 注释留在头文件里当漂流瓶;link.py 的 HeaderParser 用三条正则把漂流瓶捞回来拆成结构化的 KernelLinkerMeta。",
+      "worked_example": {
+        "params": {"header": "// tt-linker: add_deadbeef_012d:CUdeviceptr X, CUdeviceptr Y, int32_t N:1024_warps4xstages3"},
+        "trace_source": "run",
+        "trace_ref": "traces/link.json",
+        "table": {
+          "columns": ["tt-linker 指令片段", "解析器", "结果"],
+          "rows": [
+            ["add_deadbeef_012d", "_match_name(三段正则)", "name=add, sig_hash=deadbeef, suffix=012d"],
+            ["CUdeviceptr X, CUdeviceptr Y, int32_t N", "_match_c_sig", "ctypes=[CUdeviceptr ×2, int32_t], names=[X, Y, N]"],
+            ["012d", "_match_suffix", "sizes=[null, null, 16], num_specs=1"],
+            ["归组键", "'{name}_{algo_info}'", "add_1024_warps4xstages3(组内 2 份特化)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "同一归组键下所有 KernelLinkerMeta 的 arg_ctypes 必须逐位相等,否则 _add_kernel 抛 LinkerError。",
+        "argument": "_add_kernel 把新 meta 的 arg_ctypes 与组内 last 的逐个比对,任一不等即 raise LinkerError(同名核不同签名是错误)。本例两份特化(012d 与 012)ctypes 均为 [CUdeviceptr, CUdeviceptr, int32_t] → 校验通过,归入 add_1024_warps4xstages3 组、组内 2 份。"
+      },
+      "quantified": "2 份头文件 → 1 个归组键 add_1024_warps4xstages3 → 组内 2 份特化。每份头一次正则匹配 O(1),归组用 defaultdict(list) 追加 O(1)。algo_info(1024_warps4xstages3)携带常量+meta 信息,是跨版本区分『同名不同 tile』的键。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "m6-hints-dispatcher",
+      "intuition": "同一个核编了好几份特化版(有的假设 N 能被 16 整除、跑得更快),运行期到底调哪份?link.py 生成一段 C 的 if 链当交通警察:先试约束最强(最特化)的那份,它的条件(N%16==0)成立就走它;不成立退而求其次;全不中就报 CUDA_ERROR_INVALID_VALUE。这就是 ch14 的 compute_spec_key 在 C 里的化身。",
+      "worked_example": {
+        "params": {"spec_A": "012d (N:16, num_specs=1)", "spec_B": "012 (无特化, num_specs=0)"},
+        "trace_source": "run",
+        "trace_ref": "traces/link.json",
+        "table": {
+          "columns": ["特化(suffix)", "num_specs", "生成的分派条件", "命中则调用"],
+          "rows": [
+            ["012d (N 提示 16)", "1", "if ((N % 16 == 0))", "add_deadbeef_012d(stream, X, Y, N)"],
+            ["012 (无提示)", "0", "if (1) — 恒真兜底", "add_cafef00d_012(stream, X, Y, N)"],
+            ["皆不命中", "—", "—", "return CUDA_ERROR_INVALID_VALUE"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "分派链对任意运行期实参都有确定返回:命中某特化即 return,否则 if(1) 兜底 return,再否则 return CUDA_ERROR_INVALID_VALUE——每条路径必 return。",
+        "argument": "metas 有限、按 -num_specs 降序线性排列;cond_fn 对 hint==16 出 (val%16==0)、对 hint==1 出 (val==1)。末尾 num_specs=0 的特化 any(sizes)=False → 生成 if(1) 恒真兜底(本例 012)。降序保证约束最强(通常最快)的先试。若连兜底都无则落到最后的 CUDA_ERROR_INVALID_VALUE。"
+      },
+      "quantified": "分派链长度 = 组内特化数(2)+ 1 条兜底 return。本例真跑 link.py 生成 `if ((N % 16 == 0)) return add_deadbeef_012d(...); if (1) return add_cafef00d_012(...); return CUDA_ERROR_INVALID_VALUE;`。回指 ch14——同一把特化钥匙,JIT 期算 spec_key、AOT 期编成这段 C if 链。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m6-dispatch-chain",
+          "claim": "链接器按 num_specs 降序生成整除性分派链:运行期 N 先试最特化的 N%16==0 分支,退而 if(1) 兜底,皆不中返回 CUDA_ERROR_INVALID_VALUE。",
+          "template": "flow",
+          "numbers": [
+            {"value": "2 份特化归一组", "provenance": "traces/link.json num_metas_in_group=2"},
+            {"value": "num_specs=1 分支: if ((N % 16 == 0)) → 012d", "provenance": "traces/link.json hints_dispatcher_src"},
+            {"value": "num_specs=0 分支: if (1) → 012", "provenance": "traces/link.json hints_dispatcher_src"},
+            {"value": "兜底 return CUDA_ERROR_INVALID_VALUE", "provenance": "traces/link.json hints_dispatcher_src"}
+          ],
+          "caption_draft": "运行期实参 N 顺着降序 if 链走:先问『N 能被 16 整除吗』——是就调那份向量化的 012d;否则 if(1) 恒真调通用的 012。最特化的先试,保证选到能用且尽量优的实现。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m7-algo-id-table",
+      "intuition": "整除性分派管『同一 tile 配置下的整除变体』(运行期自动选);而不同 tile 配置/meta 参数的多个版本(autotune 那种),交给一张函数指针表 add_kernels[],调用方显式传 algo_id 当下标选。两级分派正交:先按 algo_id 选大版本,再进去按整除性选小变体。",
+      "worked_example": {
+        "params": {"num_tile_configs": 1, "note": "本例单 tile 配置 → 表 1 项;多 tile 时表多项"},
+        "trace_source": "run",
+        "trace_ref": "traces/link.json",
+        "table": {
+          "columns": ["生成物", "内容(真跑 link.py)", "作用"],
+          "rows": [
+            ["函数指针表", "kernel_func_t add_kernels[] = { add_1024_warps4xstages3, }", "1 项(单 tile 配置)"],
+            ["meta-const 分派", "add(stream, X, Y, N, int algo_id){ assert(algo_id < sizeof(add_kernels)); return add_kernels[algo_id](stream, X, Y, N); }", "按 algo_id 下标索引"],
+            ["default 入口", "add_default → add(stream, X, Y, N, 0)", "固定 algo_id=0"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "algo_id 访问前 assert 越界,函数指针表索引恒在 [0, num_algos) 内。",
+        "argument": "make_kernel_meta_const_dispatcher 生成 `assert(algo_id < (int)sizeof(add_kernels))`,越界即断言失败;表长 = tile 配置数(本例 1),add_default 固定传 algo_id=0——保证不越界解引用。"
+      },
+      "quantified": "函数指针表项数 = 不同 meta/tile 配置数(本例 1);algo_id ∈ [0, 1)。两级分派总入口 = add(stream, args, algo_id)(显式选版本)与 add_default(algo_id=0)。多 tile 时(如 test_aot 的多组 tile_sizes)表里多项。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "m8-sass-two-line-parse",
+      "intuition": "cuobjdump 打印 SASS 时,每条指令占两行:第一行是人看的汇编体加上这条指令编码的前半;第二行是纯十六进制的后半(藏着调度控制字)。disasm 的解析器就像双人舞,每次读两行、并成一条指令,指针一次前进 2。",
+      "worked_example": {
+        "params": {"kernel": "loopy(带 data-dependent 循环)", "target": "sm_90", "cuobjdump": "-sass"},
+        "trace_source": "run",
+        "trace_ref": "traces/sass.json",
+        "table": {
+          "columns": ["FLINE(第一行:offset+汇编体+首半编码)", "SLINE(第二行:次半编码=控制字)", "折叠成一条 (ctrl, asm)"],
+          "rows": [
+            ["/*0000*/ LDC R1, c[0x0][0x28] ; /* 0x00000a00ff017b82 */", "/* 0x000e240000000800 */", "asm='LDC R1, c[0x0][0x28] ;', ctrl='--:-:0:-:2'"],
+            ["/*0010*/ LDC R4, c[0x0][0x218] ; /* 0x00008600ff047b82 */", "/* 0x000e620000000800 */", "asm='LDC R4, c[0x0][0x218] ;', ctrl='--:-:1:-:1'"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "SASS 体每条指令严格占两行(FLINE 后紧跟 SLINE),解析指针每条前进 2,且第 idx 条指令 offset = idx × 16。",
+        "argument": "extract 的 while FLINE_RE 循环每轮读 fline(line_idx+1)再读 sline(line_idx+1)、共 +2;cuobjdump 对 sm_90 每条指令定长 16 字节,故 offset 逐条 +0x10(本例 0x0000 → 0x0010 → 0x0020)。FLINE_RE/SLINE_RE 两条正则分别锚定两行格式,配对不会错位。"
+      },
+      "quantified": "本 kernel 72 条指令 → SASS 体约 72×2=144 行(不计 Function/headerflags 头);相邻指令 offset 差 0x10=16 字节。第一行的首半编码(如 0x00000a00ff017b82)是指令本体,第二行(如 0x000e240000000800)是 parseCtrl 的输入(见 m9)。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m8-two-line",
+          "claim": "cuobjdump -sass 每条指令占两行——FLINE 携汇编体+首半 64 位编码、SLINE 携次半 64 位控制字;disasm 每次 line_idx+=2 把两行折叠成一条 (ctrl, asm)。",
+          "template": "before-after",
+          "numbers": [
+            {"value": "offset 步长 0x10(16 字节)", "provenance": "traces/sass.json raw_pairs offsets 0000/0010/0020"},
+            {"value": "line_idx += 2 每指令", "provenance": "python/triton/tools/disasm.py:L112-L118"},
+            {"value": "首指令 ctrl=--:-:0:-:2", "provenance": "traces/sass.json raw_pairs[0].ctrl_decoded"},
+            {"value": "72 条指令", "provenance": "traces/sass.json num_instructions=72"}
+          ],
+          "caption_draft": "左:cuobjdump 吐出的两行原始文本(FLINE+SLINE);右:折叠后的一条指令——左列 ctrl 是从 SLINE 解出的调度控制字,右侧是汇编体。看懂这个两行格式,是读 SASS 的第一步。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m9-parse-ctrl",
+      "intuition": "从 Volta 起,NVIDIA 不再全靠硬件记分牌自动调度,而是把『这条指令发射后停几拍、要不要让位、结果登记到哪个屏障、发射前等哪些屏障』直接编进每条指令后附的 64 位控制字。parseCtrl 就是拿位移+掩码把这五个字段抠出来,格式化成 SASS 左列那串 `等待:读屏障:写屏障:让位:停顿`。",
+      "worked_example": {
+        "params": {"example_1": "SLINE=0x000e220000000800", "example_2": "SLINE=0x002fda000780c0ff"},
+        "trace_source": "run",
+        "trace_ref": "traces/parsectrl.json",
+        "table": {
+          "columns": ["SLINE 编码(hex)", "stall", "yield", "wr-barrier", "rd-barrier", "wait-mask", "格式化(wait:rd:wr:yld:stall)"],
+          "rows": [
+            ["000e220000000800", "1", "1 → '-'(不让位)", "0", "7 → '-'(无)", "0 → '--'", "--:-:0:-:1"],
+            ["002fda000780c0ff", "13(0xd)", "0 → 'Y'(让位)", "7 → '-'(无)", "7 → '-'(无)", "2 → '02'", "02:-:-:Y:d"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "五个调度字段占 64 位控制字中互不重叠的位段(41-44, 45, 46-48, 49-51, 52-57),各自掩码隔离、一次解码互不干扰。",
+        "argument": "parseCtrl 用 (enc>>shift)&mask 取各字段:stall 宽 4 位(&0xf)、yield 1 位(&0x1)、wr/rd-barrier 各 3 位(&0x7)、wait-mask 6 位(&0x3f)。起始位 41/45/46/49/52 加各自宽度恰好首尾相接不交叠,故任一字段的掩码不会漏进邻位。example_2 命中 wait-mask bit1(值 2)、yield 生效、stall=13(0xd)。"
+      },
+      "quantified": "64 位控制字里调度信息占 bit41-57 共 17 位:stall∈[0,15]=发射后固定停顿周期;yield 1 位(源码 0→'Y' 让位提示生效);wr/rd-barrier 各 0-6 号(7=无,可变延迟指令如 LDG/MUFU 用它登记结果);wait-mask 6 位掩码=发射前须等就绪的屏障集合。这串正是 kernel.asm['sass'] 每条指令最左侧的数字。回指 ch37:ptxas 排指令时正是在填这些控制字来隐藏访存延迟,读懂它=读懂 ptxas 的调度决策。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m9-ctrl-word",
+          "claim": "每条 SASS 指令后附的 64 位控制字里,ptxas 的调度决策编在 bit41-57:stall / yield / wr-barrier / rd-barrier / wait-mask 五个互不重叠的位段。",
+          "template": "layout",
+          "numbers": [
+            {"value": "stall = bits 41-44(4 位, &0xf)", "provenance": "python/triton/tools/disasm.py:L37"},
+            {"value": "yield = bit 45(&0x1)", "provenance": "python/triton/tools/disasm.py:L38"},
+            {"value": "wr-barrier = bits 46-48(&0x7)", "provenance": "python/triton/tools/disasm.py:L39"},
+            {"value": "rd-barrier = bits 49-51(&0x7)", "provenance": "python/triton/tools/disasm.py:L40"},
+            {"value": "wait-mask = bits 52-57(&0x3f)", "provenance": "python/triton/tools/disasm.py:L41"},
+            {"value": "实例 0x002fda000780c0ff → 02:-:-:Y:d", "provenance": "traces/parsectrl.json example_2.formatted"}
+          ],
+          "caption_draft": "一条 64 位控制字被切成五个位段,ptxas 在这里写下每条指令的发射时序。实例 0x002fda000780c0ff 解出:等待 2 号位屏障、让位(Y)、发射后停 13(0xd)拍——这就是 SASS 左列 `02:-:-:Y:d` 的来历。位定义是逆向经验值(源自 Da Yan 的工作),跨 SM 世代可能变动。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m10-bra-relabel",
+      "intuition": "cuobjdump 里的跳转 BRA 指向的是裸十六进制地址(0x330),人读起来像天书。disasm 走两趟:第一趟把每个被跳到的地址按首次出现的顺序编号(0x330→0 号),第二趟把跳转目标和落点都换成 LBB0/LBB1 这种人类可读标签——跟编译器给循环起名字一个道理。",
+      "worked_example": {
+        "params": {"kernel": "loopy(含循环回边+尾部自旋)", "num_bra": 6, "num_labels": 5},
+        "trace_source": "run",
+        "trace_ref": "traces/sass.json",
+        "table": {
+          "columns": ["BRA 位置(offset)", "原始目标(hex)", "目标 offset(dec)", "首见序 → 标签", "重写后"],
+          "rows": [
+            ["0050", "0x330", "816", "首见 #0 → LBB0", "@!P0 BRA LBB0;"],
+            ["02e0", "0x330", "816", "已登记 → 复用 LBB0", "@!P0 BRA LBB0;"],
+            ["0390", "0x390", "912", "首见 #4 → LBB4(自旋:指向自身)", "BRA LBB4;"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "BRA 目标地址 → LBB 标签是首见序的确定映射,重复目标复用同一标签,两趟后每个 BRA 恰有一个 LBB 名。",
+        "argument": "第一趟 processSassLines 遇新目标写 labels[target]=len(labels)、已见则 pass(幂等),故映射是函数且随发现顺序单调加号;第二趟 extract 按此表:落点 offset∈labels 前置 `LBB{i}:`、每条 BRA 用 BRA_RE.sub 把裸地址换成 LBBn。本例 0x330 被 0x50 与 0x2e0 两条 BRA 共享 → 同 LBB0;自旋 BRA 0x390 指向自身 offset → LBB4,前面正好打 LBB4: 标签。"
+      },
+      "quantified": "本 kernel 72 条指令、6 条 BRA、5 个唯一标签(因 0x330 被两条 BRA 共享 → 同 LBB0,6 条 BRA 只产 5 个标签)。两趟均 O(指令数)。尾部 `LBB4: BRA LBB4`(stall=0 控制字 --:-:-:Y:0)是经典的核末自旋/陷阱。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "m11-lazy-sass",
+      "intuition": "反汇编要 fork 一个 cuobjdump 子进程、写临时文件,开销不小,而大多数编译根本不看 SASS。所以 disasm 采『用时才做、做了就存』:只有当你访问 kernel.asm['sass'] 时(上游 AsmDict.__missing__ 触发)才真去反汇编,且 get_sass 带 @lru_cache——同一个 cubin 只反汇编一次。",
+      "quantified": "get_sass 与 path_to_cuobjdump 均挂 @functools.lru_cache:同一 cubin 字节的 sass 只在首次访问时 fork cuobjdump + 写临时文件,后续命中缓存 0 开销。这是『按需 + 缓存』的惰性求值,把重活推迟到真有人读 SASS 时。本章 m8/m10 的 sass.json 正是经这条惰性路径拿到的。"
+    }
+  ]
+}

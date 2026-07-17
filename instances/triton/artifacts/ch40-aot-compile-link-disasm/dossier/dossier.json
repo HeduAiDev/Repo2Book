@@ -1,0 +1,350 @@
+{
+  "chapter_id": "ch40",
+  "slug": "ch40-aot-compile-link-disasm",
+  "title": "部署与读产物：AOT compile/link 与 SASS 反汇编",
+  "kind": "deep",
+  "skip_impl": true,
+  "one_line": "把 @triton.jit 核脱离 Python 运行时烙成自包含 C 部署（compile.py 内嵌 cubin + link.py 运行期分派），并调 cuobjdump -sass + parseCtrl 读懂它最终编成了什么机器码。",
+
+  "code_spine": [
+    "python/triton/tools/compile.py:L14-L38  —— AOT 命令行契约（签名 DSL 说明 + 生成的 C 入口原型示例）",
+    "python/triton/tools/compile.py:L40-L69  —— argparse 收 kernel-name/signature/grid，importlib 执行 kernel.py 取出 JITFunction",
+    "python/triton/tools/compile.py:L71-L105 —— 签名字符串三分：hints(:16/:1 整除性提示) / constants(裸 constexpr) / signature(运行期参数)",
+    "python/triton/tools/compile.py:L107-L115 —— hints→AttrsDescriptor.from_hints，get_constants() 把 ==1 并进常量，ASTSource→triton.compile 拿 cubin（此处需真机+ptxas）",
+    "python/triton/tools/compile.py:L116-L129 —— 按 constants / equal_to_1 把参数切成 full_signature vs 运行期 signature",
+    "python/triton/tools/compile.py:L130-L155 —— kernel_suffix+sig_hash 拼函数名，binascii.hexlify(cubin) 内嵌成 bin_data，.format(**params) 灌 compile.h/compile.c 模板落两文件",
+    "python/triton/tools/compile.c:L27-L67   —— C 桩模板：CUBIN 字节数组 + load(cuModuleLoadData/GetFunction) + 入口(cuLaunchKernel)",
+    "python/triton/tools/compile.h:L11-L14   —— 头模板：声明 load/unload/入口 + 关键的 `// tt-linker:` 指令（link.py 的输入契约）",
+    "python/triton/tools/link.py:L29-L119    —— HeaderParser：三条正则拆 tt-linker 指令 → KernelLinkerMeta（含 _match_suffix 把 d/c 后缀还原成每参数 sizes 提示）",
+    "python/triton/tools/link.py:L152-L198   —— make_kernel_hints_dispatcher：按 num_specs 降序生成 `if ((val%16==0)&&(val==1)) return kernel_hash_suffix(...)` 分派链 + load/unload 批量",
+    "python/triton/tools/link.py:L200-L241   —— make_kernel_meta_const_dispatcher / make_func_pointers：按 algo_id 索引的函数指针表（meta-参数多版本选择）",
+    "python/triton/tools/link.py:L255-L322   —— __main__：读 headers→拼 .h/.c 两个链接产物",
+    "python/triton/tools/disasm.py:L29-L47   —— FLINE_RE/SLINE_RE/BRA_RE 正则 + parseCtrl：位移解出每条 SASS 指令的 64 位控制字",
+    "python/triton/tools/disasm.py:L50-L81   —— processSassLines(BRA 目标登记 labels) + get_sass(lru_cache 惰性反汇编) + path_to_cuobjdump",
+    "python/triton/tools/disasm.py:L84-L144  —— extract：调 cuobjdump -sass、按 Function 分段、两行一指令解析、第二趟 BRA→LBB 重标"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "python/triton/tools/compile.py",
+      "lines": "L71-L105",
+      "what": "AOT 的灵魂：把一条命令行签名字符串三分成 hints/constants/signature——本章最该讲透的一段",
+      "code": "    # validate and parse signature\n    signature = list(map(lambda s: s.strip(\" \"), args.signature.split(\",\")))\n\n    def hash_signature(signature: List[str]):\n        m = hashlib.sha256()\n        m.update(\" \".join(signature).encode())\n        return m.hexdigest()[:8]\n\n    meta_sig = f\"warps{args.num_warps}xstages{args.num_stages}\"\n    sig_hash = hash_signature(signature + [meta_sig])\n\n    def constexpr(s):\n        try:\n            ret = int(s)\n            return ret\n        except ValueError:\n            pass\n        try:\n            ret = float(s)\n            return ret\n        except ValueError:\n            pass\n        return None\n\n    hints = {i: constexpr(s.split(\":\")[1]) for i, s in enumerate(signature) if \":\" in s}\n    hints = {k: v for k, v in hints.items() if v is not None}\n    constants = {kernel.arg_names[i]: constexpr(s) for i, s in enumerate(signature)}\n    constants = {k: v for k, v in constants.items() if v is not None}\n    signature = {\n        kernel.arg_names[i]: s.split(\":\")[0]\n        for i, s in enumerate(signature)\n        if kernel.arg_names[i] not in constants\n    }\n    const_sig = 'x'.join([str(v) for v in constants.values()])\n    doc_string = [f\"{k}={v}\" for k, v in constants.items()]\n    doc_string += [f\"num_warps={args.num_warps}\", f\"num_stages={args.num_stages}\"]",
+      "elide": ["无——这一段是本章核心，逐字保留"]
+    },
+    {
+      "path": "python/triton/tools/compile.py",
+      "lines": "L107-L115",
+      "what": "跨进 compiler 子系统的接缝：hints 物化成 AttrsDescriptor，走 triton.compile 出 cubin（回指 ch14 的 specialization / ch37 的 ptxas）",
+      "code": "    # compile ast into cubin\n    for h in hints.values():\n        assert h in [1, 16], f\"Only 1 and 16 are valid hints, got {h}\"\n    attrs = triton.backends.compiler.AttrsDescriptor.from_hints(hints)\n    for p, v in attrs.get_constants().items():\n        constants.update({kernel.arg_names[p]: v})\n    src = triton.compiler.ASTSource(fn=kernel, constants=constants, signature=signature, attrs=attrs)\n    opts = {\"num_warps\": args.num_warps, \"num_stages\": args.num_stages}\n    ccinfo = triton.compile(src, options=opts)",
+      "elide": ["triton.compile 内部（ch37 已讲的 ttir→ttgir→ptx→ptxas→cubin 全流水）不在本章展开，本章只用它的产物 ccinfo.asm['cubin']"]
+    },
+    {
+      "path": "python/triton/tools/compile.py",
+      "lines": "L130-L155",
+      "what": "把 cubin 十六进制内嵌进 C 模板：binascii.hexlify + .format(**params) 落 compile.h/compile.c 两个文件",
+      "code": "    # dump C stub code\n    suffix = kernel_suffix(signature.values(), attrs)\n    func_name = '_'.join([out_name, sig_hash, suffix])\n    hex_ = str(binascii.hexlify(ccinfo.asm[\"cubin\"]))[2:-1]\n    params = {\n        \"kernel_name\": func_name,\n        \"triton_kernel_name\": args.kernel_name,\n        \"bin_size\": len(hex_),\n        \"bin_data\": \", \".join([f\"0x{x}{y}\" for x, y in zip(hex_[::2], hex_[1::2])]),\n        \"signature\": \", \".join([f\"{ty_to_cpp(ty)} {name}\" for name, ty in zip(arg_names_not_1, arg_types_not_1)]),\n        \"full_signature\": \", \".join([f\"{ty_to_cpp(ty)} {name}\" for name, ty in zip(arg_names, arg_types)]),\n        \"arg_pointers\": \", \".join([f\"&{arg}\" for arg in arg_names_not_1]),\n        \"num_args\": len(arg_names_not_1),\n        \"kernel_docstring\": doc_string,\n        \"shared\": ccinfo.metadata.shared,\n        \"num_warps\": args.num_warps,\n        \"algo_info\": '_'.join([const_sig, meta_sig]),\n        \"gridX\": grid[0],\n        \"gridY\": grid[1],\n        \"gridZ\": grid[2],\n        \"_placeholder\": \"\",\n    }\n    for ext in ['h', 'c']:\n        template_path = Path(__file__).parent / f\"compile.{ext}\"\n        with out_path.with_suffix(f\".{sig_hash}_{suffix}.{ext}\").open(\"w\") as fp:\n            fp.write(Path(template_path).read_text().format(**params))",
+      "elide": ["L116-L129 的 arg_names/arg_types 分组循环在 data_flow 里逐步讲，此处只呈现它们被灌进模板的终点"]
+    },
+    {
+      "path": "python/triton/tools/compile.c",
+      "lines": "L27-L67",
+      "what": "填充后的 C 桩：cubin 字节数组 + load(cuModuleLoadData/cuModuleGetFunction) + 入口(cuLaunchKernel)。注意 {{ }} 是 .format 的转义花括号",
+      "code": "// globals\n#define CUBIN_NAME {kernel_name}_cubin\nCUmodule {kernel_name}_mod = NULL;\nCUfunction {kernel_name}_func = NULL;\nunsigned char CUBIN_NAME[{bin_size}] = {{ {bin_data} }};\n\n\nvoid unload_{kernel_name}(void) {{\n    CUDA_CHECK(cuModuleUnload({kernel_name}_mod));\n}}\n\n// TODO: some code duplication with `runtime/backend/cuda.c`\nvoid load_{kernel_name}() {{\n    int dev = 0;\n    void *bin = (void *)&CUBIN_NAME;\n    int shared = {shared};\n    CUDA_CHECK(cuModuleLoadData(&{kernel_name}_mod, bin));\n    CUDA_CHECK(cuModuleGetFunction(&{kernel_name}_func, {kernel_name}_mod, \"{triton_kernel_name}\"));\n    // set dynamic shared memory if necessary\n    int shared_optin;\n    CUDA_CHECK(cuDeviceGetAttribute(&shared_optin, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, dev));\n    if (shared > 49152 && shared_optin > 49152) {{\n      CUDA_CHECK(cuFuncSetCacheConfig({kernel_name}_func, CU_FUNC_CACHE_PREFER_SHARED));\n      CUDA_CHECK(cuFuncSetAttribute({kernel_name}_func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared_optin))\n    }}\n}}\n\n/*\n{kernel_docstring}\n*/\nCUresult {kernel_name}(CUstream stream, {signature}) {{\n    if ({kernel_name}_func == NULL)\n       load_{kernel_name}();\n    unsigned int gX = {gridX};\n    unsigned int gY = {gridY};\n    unsigned int gZ = {gridZ};\n    void *args[{num_args}] = {{ {arg_pointers} }};\n    // TODO: shared memory\n    if(gX * gY * gZ > 0)\n      return cuLaunchKernel({kernel_name}_func, gX, gY, gZ, {num_warps} * 32, 1, 1, {shared}, stream, args, NULL);\n}}",
+      "elide": ["L1-L26 的 clang-format/#include/CUDA_CHECK gpuAssert 宏为样板，讲一句『错误检查宏』即可，不必逐行"]
+    },
+    {
+      "path": "python/triton/tools/compile.h",
+      "lines": "L11-L14",
+      "what": "头模板尾部——第 13 行的 `// tt-linker:` 注释是 compile.py 与 link.py 之间唯一的字符串契约",
+      "code": "void unload_{kernel_name}(void);\nvoid load_{kernel_name}(void);\n// tt-linker: {kernel_name}:{full_signature}:{algo_info}\nCUresult{_placeholder} {kernel_name}(CUstream stream, {signature});",
+      "elide": ["L1-L9 的 include guard 为样板"]
+    },
+    {
+      "path": "python/triton/tools/link.py",
+      "lines": "L29-L67",
+      "what": "HeaderParser 三条正则 + extract_linker_meta：把 tt-linker 指令逆向拆回一份 KernelLinkerMeta",
+      "code": "class HeaderParser:\n\n    def __init__(self) -> None:\n        import re\n\n        # [kernel_name, c signature]\n        self.linker_directives = re.compile(\"//[\\\\s]*tt-linker:[\\\\s]*([\\\\w]+):(.+):(.+)\")\n        # [name, hash, suffix]\n        self.kernel_name = re.compile(\"^([\\\\w]+)_([\\\\w]+)_([\\\\w]+)$\")\n        # [(type, name)]\n        self.c_sig = re.compile(\"[\\\\s]*(\\\\w+)\\\\s(\\\\w+)[,]?\")\n        # [d|c]\n        self.arg_suffix = re.compile(\"[c,d]\")\n\n        self.kernels = defaultdict(list)\n\n    def extract_linker_meta(self, header: str):\n        for ln in header.splitlines():\n            if ln.startswith(\"//\"):\n                m = self.linker_directives.match(ln)\n                if _exists(m):\n                    ker_name, c_sig, algo_info = m.group(1), m.group(2), m.group(3)\n                    name, sig_hash, suffix = self._match_name(ker_name)\n                    c_types, arg_names = self._match_c_sig(c_sig)\n                    num_specs, sizes = self._match_suffix(suffix, c_sig)\n                    self._add_kernel(\n                        \"_\".join([name, algo_info]),\n                        KernelLinkerMeta(\n                            orig_kernel_name=name,\n                            arg_names=arg_names,\n                            arg_ctypes=c_types,\n                            sizes=sizes,\n                            sig_hash=sig_hash,\n                            triton_suffix=suffix,\n                            suffix=suffix,\n                            num_specs=num_specs,\n                        ),\n                    )",
+      "elide": ["_match_name/_match_c_sig（L68-L84）是直白的正则取组，data_flow 里点到即可；此处呈现主控制流"]
+    },
+    {
+      "path": "python/triton/tools/link.py",
+      "lines": "L86-L107",
+      "what": "_match_suffix：把 kernel_suffix 编的 d/c 后缀逆向解回『每个参数位的整除性提示 sizes』（c=1, d=16）",
+      "code": "    def _match_suffix(self, suffix: str, c_sig: str):\n        args = c_sig.split(\",\")\n        s2i = {\"c\": 1, \"d\": 16}\n        num_specs = 0\n        sizes = []\n        # scan through suffix, first find the index,\n        # then see if it is followed by d or c\n        for i in range(len(args)):\n            pos = suffix.find(str(i))\n            if pos == -1:\n                raise LinkerError(f\"{suffix} is not a valid kernel suffix\")\n            pos += len(str(i))\n            if self.arg_suffix.match(suffix, pos):\n                num_specs += 1\n                sizes.extend([None] * (i - len(sizes)))\n                sizes.append(s2i[suffix[pos]])\n                pos += 1\n            if i < len(args) - 1:\n                suffix = suffix[pos:]\n            else:\n                sizes.extend([None] * (len(args) - len(sizes)))\n        return num_specs, sizes",
+      "elide": ["无——这是 link.py 里最烧脑的一段，逐字保留供 worked example 逐步走"]
+    },
+    {
+      "path": "python/triton/tools/link.py",
+      "lines": "L160-L198",
+      "what": "make_kernel_hints_dispatcher：本章第二支柱的落点——按 num_specs 降序生成运行期整除性分派链（compute_spec_key 的 C 化身，回指 ch14）",
+      "code": "# generate dispatcher function for kernels with different integer value hints\ndef make_kernel_hints_dispatcher(name: str, metas: Sequence[KernelLinkerMeta]) -> str:\n    src = f\"// launcher for: {name}\\n\"\n    for meta in sorted(metas, key=lambda m: -m.num_specs):\n        src += f\"CUresult {meta.orig_kernel_name}_{meta.sig_hash}_{meta.suffix}(CUstream stream, {gen_signature(meta)});\\n\"\n    src += \"\\n\"\n\n    src += (f\"CUresult {name}(CUstream stream, {gen_signature_with_full_args(metas[-1])}){{\")\n    src += \"\\n\"\n    for meta in sorted(metas, key=lambda m: -m.num_specs):\n        cond_fn = (  #\n            lambda val, hint: f\"({val} % {hint} == 0)\"  #\n            if hint == 16  #\n            else f\"({val} == {hint})\"  #\n            if hint == 1  #\n            else None)\n        conds = \" && \".join([  #\n            cond_fn(val, hint)  #\n            for val, hint in zip(meta.arg_names, meta.sizes)  #\n            if hint is not None\n        ])\n        src += (f\"  if ({conds})\\n\" if any(meta.sizes) else \"if (1)\\n\"\n                )  # Edge case where no specializations hence no dispatching required\n        arg_names = [arg for arg, hint in zip(meta.arg_names, meta.sizes) if hint != 1]\n        src += f\"    return {meta.orig_kernel_name}_{meta.sig_hash}_{meta.suffix}(stream, {', '.join(arg_names)});\\n\"\n    src += \"\\n\"\n    src += \"  return CUDA_ERROR_INVALID_VALUE;\\n\"\n    src += \"}\\n\"\n\n    for mode in [\"load\", \"unload\"]:\n        src += f\"\\n// {mode} for: {name}\\n\"\n        for meta in sorted(metas, key=lambda m: -m.num_specs):\n            src += f\"void {mode}_{meta.orig_kernel_name}_{meta.sig_hash}_{meta.suffix}();\\n\"\n        src += f\"void {mode}_{name}() {{\"\n        src += \"\\n\"\n        for meta in sorted(metas, key=lambda m: -m.num_specs):\n            src += (f\"  {mode}_{meta.orig_kernel_name}_{meta.sig_hash}_{meta.suffix}();\\n\")\n        src += \"}\\n\"\n    return src",
+      "elide": ["load/unload 两段（L189-L197）与分派同构，讲时可一句带过；核心是 cond_fn + 降序匹配"]
+    },
+    {
+      "path": "python/triton/tools/disasm.py",
+      "lines": "L29-L47",
+      "what": "本章第三支柱：parseCtrl 位移解出每条 SASS 指令的 64 位控制字（stall/yield/read-write barrier/wait mask）",
+      "code": "FLINE_RE = re.compile(r'\\s*/\\*\\w{4}\\*/\\s*([^;]*;)\\s*/\\* 0x(\\w{16}) \\*/\\s*')\nSLINE_RE = re.compile(r'\\s*/\\* 0x(\\w{16}) \\*/\\s*')\nFNAME_RE = re.compile(r'\\s*Function : (\\w+)\\s*')\nBRA_RE = re.compile(r'(.*BRA(?:\\.U)? )(0x\\w+);')\n\n\ndef parseCtrl(sline):\n    enc = int(SLINE_RE.match(sline).group(1), 16)\n    stall = (enc >> 41) & 0xf\n    yld = (enc >> 45) & 0x1\n    wrtdb = (enc >> 46) & 0x7\n    readb = (enc >> 49) & 0x7\n    watdb = (enc >> 52) & 0x3f\n\n    yld_str = 'Y' if yld == 0 else '-'\n    wrtdb_str = '-' if wrtdb == 7 else str(wrtdb)\n    readb_str = '-' if readb == 7 else str(readb)\n    watdb_str = '--' if watdb == 0 else f'{watdb:02d}'\n    return f'{watdb_str}:{readb_str}:{wrtdb_str}:{yld_str}:{stall:x}'",
+      "elide": ["无——这四条正则 + parseCtrl 是本章反汇编支线的心脏，逐字保留"]
+    },
+    {
+      "path": "python/triton/tools/disasm.py",
+      "lines": "L84-L144",
+      "what": "extract：调 cuobjdump -sass、按 Function 分段、两行一指令（FLINE=汇编体+SLINE=控制字编码）解析、第二趟把 BRA 目标 offset 重标成 LBB 标签",
+      "code": "def extract(file_path, fun):\n    cuobjdump, _ = path_to_cuobjdump()\n    if fun is None:\n        sass_str = subprocess.check_output([cuobjdump, \"-sass\", file_path])\n    else:\n        sass_str = subprocess.check_output([cuobjdump, \"-fun\", fun, \"-sass\", file_path])\n    sass_lines = sass_str.splitlines()\n    line_idx = 0\n    while line_idx < len(sass_lines):\n        line = sass_lines[line_idx].decode()\n        # Looking for new function header (function: <name>)\n        while FNAME_RE.match(line) is None:\n            line_idx += 1\n            if line_idx < len(sass_lines):\n                line = sass_lines[line_idx].decode()\n            else:\n                return\n\n        fname = FNAME_RE.match(line).group(1)\n        ret = ''\n        ret += f'Function:{fname}\\n'\n        line_idx += 2  # bypass .headerflags\n        line = sass_lines[line_idx].decode()\n        # Remapping address to label\n        labels = {}  # address -> label_idx\n        # store sass asm in buffer and them print them (for labels)\n        # (ctrl, asm)\n        asm_buffer = []\n        while FLINE_RE.match(line) is not None:\n            # First line (Offset ASM Encoding)\n            fline = sass_lines[line_idx].decode()\n            line_idx += 1\n            # Second line (Encoding)\n            sline = sass_lines[line_idx].decode()\n            line_idx += 1\n            asm_buffer.append(processSassLines(fline, sline, labels))\n            # peek the next line\n            line = sass_lines[line_idx].decode()\n        # Print sass\n        # label naming convention: LBB#i\n        for idx, (ctrl, asm) in enumerate(asm_buffer):\n            # Print label if this is BRA target\n            offset = idx * 16\n            if offset in labels:\n                label_name = f'LBB{labels[offset]}'\n                ret += f'{label_name}:\\n'\n            ret += ctrl + '\\t'\n            # if this is BRA, remap offset to label\n            if BRA_RE.match(asm):\n                target = int(BRA_RE.match(asm).group(2), 16)\n                target_name = f'LBB{labels[target]}'\n                asm = BRA_RE.sub(rf'\\1{target_name};', asm)\n            ret += asm + '\\n'\n        ret += '\\n'\n        return ret",
+      "elide": ["MIT license 头（L1-L21，disasm.py 源自 Da Yan 的 cuobjdump 解析器）在正文提一句出处即可；注释里的 format 示意图可用作插图素材"]
+    },
+    {
+      "path": "python/triton/tools/disasm.py",
+      "lines": "L50-L63",
+      "what": "processSassLines：把一条指令的汇编体与控制字配对，并把 BRA 跳转目标地址登记进 labels（第一趟）",
+      "code": "def processSassLines(fline, sline, labels):\n    asm = FLINE_RE.match(fline).group(1)\n    # Remove tailing space\n    if asm.endswith(\" ;\"):\n        asm = asm[:-2] + \";\"\n    ctrl = parseCtrl(sline)\n    # BRA target address\n    if BRA_RE.match(asm) is not None:\n        target = int(BRA_RE.match(asm).group(2), 16)\n        if target in labels:\n            pass\n        else:\n            labels[target] = len(labels)\n    return (f'{ctrl}', f'{asm}')",
+      "elide": []
+    },
+    {
+      "path": "python/triton/tools/disasm.py",
+      "lines": "L66-L81",
+      "what": "get_sass：把内存里的 cubin 写临时文件再 extract；lru_cache 让 kernel.asm['sass'] 只反汇编一次（惰性 + 缓存）",
+      "code": "@functools.lru_cache()\ndef get_sass(cubin_asm, fun=None):\n    fd, path = tempfile.mkstemp()\n    try:\n        with open(fd, 'wb') as cubin:\n            cubin.write(cubin_asm)\n        sass = extract(path, fun)\n    finally:\n        os.remove(path)\n    return sass\n\n\n@functools.lru_cache()\ndef path_to_cuobjdump():\n    from triton.backends.nvidia.compiler import _path_to_binary\n    return _path_to_binary(\"cuobjdump\")",
+      "elide": []
+    },
+    {
+      "path": "python/triton/backends/compiler.py",
+      "lines": "L172-L187",
+      "what": "AttrsDescriptor.from_hints：AOT 独有的构造路径——不从『参数值』推断特化，而是直接吃命令行给的 {param_index: hint}（回指 ch14 JIT 期的值推断路径）",
+      "code": "    @classmethod\n    def from_hints(cls, hints: List[Tuple[int, int]]):\n        \"\"\"\n        Create the class from a set of hints that are passed in.\n\n        Instead of deducing the properties from a list of paramaters and values,\n        the user can pass in a list of `hints=[(param_index, val)]` and if `val`\n        matches one of the values of the properties (e.g., `prop_val[prop0]`),\n        then we insert `param_index` into the correct list (e.g., in\n        `arg_properties[prop0]`)\n        \"\"\"\n        attrs_descriptor = cls()\n        for prop_name, prop_val in attrs_descriptor.property_values.items():\n            attrs_descriptor.arg_properties[prop_name] = [i for i, h in hints.items() if h == prop_val]\n        attrs_descriptor._init_slots()\n        return attrs_descriptor",
+      "elide": ["AttrsDescriptor 的完整语义在 ch14 已讲，本章只引 from_hints 与 get_constants 两个 AOT 用到的入口，其余方法（to_dict/from_dict/hash 等）回指 ch14"]
+    },
+    {
+      "path": "python/triton/compiler/code_generator.py",
+      "lines": "L1260-L1269",
+      "what": "kernel_suffix：把特化编码进函数名后缀（<argid>c=equal_to_1, d=divisible_by_16）——link.py 的 _match_suffix 正是它的逆运算",
+      "code": "def kernel_suffix(signature, specialization):\n    # suffix format:\n    # <argid><'c' if equal to 1><'d' if divisible by 16><'e' if divisible by 8>\n    suffix = ''\n    for i, _ in enumerate(signature):\n        suffix += str(i)\n        if i in specialization.equal_to_1:\n            suffix += 'c'\n        if i in specialization.divisibility_16:\n            suffix += 'd'\n    return suffix",
+      "elide": []
+    },
+    {
+      "path": "third_party/nvidia/backend/driver.py",
+      "lines": "L94-L114",
+      "what": "ty_to_cpp：把 triton 类型字符串（*fp32/i32/...）映成 C 类型（CUdeviceptr/int32_t/...）——compile.py 生成 C 原型的类型翻译（NVIDIA 专属）",
+      "code": "def ty_to_cpp(ty):\n    if ty[0] == '*':\n        return \"CUdeviceptr\"\n    return {\n        \"i1\": \"int32_t\",\n        \"i8\": \"int8_t\",\n        \"i16\": \"int16_t\",\n        \"i32\": \"int32_t\",\n        \"i64\": \"int64_t\",\n        \"u1\": \"uint32_t\",\n        \"u8\": \"uint8_t\",\n        \"u16\": \"uint16_t\",\n        \"u32\": \"uint32_t\",\n        \"u64\": \"uint64_t\",\n        \"fp16\": \"float\",\n        \"bf16\": \"float\",\n        \"fp32\": \"float\",\n        \"f32\": \"float\",\n        \"fp64\": \"double\",\n        \"nvTmaDesc\": \"CUtensorMap\",\n    }[ty]",
+      "elide": ["注意 fp16/bf16/fp32 都映成 C 的 float——指针类型统一成 CUdeviceptr，标量按位宽映；这是 NVIDIA 后端专属，ascend 需并行一套"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "compile.py (__main__)", "file": "python/triton/tools/compile.py", "responsibility": "AOT 编译命令行工具：解析带整除性提示的签名 → hints/constants/signature 三分 → AttrsDescriptor.from_hints → triton.compile 出 cubin → binascii.hexlify 内嵌进 compile.c/compile.h 模板，产出一份自包含 C（可 load/launch 单个特化核）"},
+    {"name": "HeaderParser", "file": "python/triton/tools/link.py", "responsibility": "解析 compile.py 留在头文件里的 `// tt-linker:` 指令，用三条正则拆出 (kernel_name, c_sig, algo_info)、把 name_hash_suffix 拆开、_match_suffix 把 d/c 后缀逆向还原成每参数整除性提示 sizes，按 algo_info 归组同名核的多份特化并校验签名一致"},
+    {"name": "KernelLinkerMeta", "file": "python/triton/tools/link.py", "responsibility": "一份特化产物的元数据 dataclass：orig_kernel_name / arg_names / arg_ctypes / sizes(每参数 None|1|16 提示) / sig_hash / suffix / num_specs(特化参数数，分派排序键)"},
+    {"name": "link.py 生成器函数族", "file": "python/triton/tools/link.py", "responsibility": "make_kernel_hints_dispatcher(按 num_specs 降序生成整除性分派链) / make_kernel_meta_const_dispatcher + make_func_pointers(按 algo_id 索引函数指针表) / make_kernel_load_def / make_default_algo_kernel / make_global_decl —— 拼出链接产物的 .h 与 .c"},
+    {"name": "disasm.extract / parseCtrl / processSassLines", "file": "python/triton/tools/disasm.py", "responsibility": "extract 调 cuobjdump -sass 并两行一指令解析；parseCtrl 位移解出 64 位控制字(stall/yield/wr-barrier/rd-barrier/wait-mask)；processSassLines 配对汇编体与控制字并登记 BRA 目标，第二趟 offset→LBB 重标"},
+    {"name": "get_sass", "file": "python/triton/tools/disasm.py", "responsibility": "cubin 字节 → 临时文件 → extract → SASS 文本；@lru_cache 使 kernel.asm['sass'] 惰性且只反汇编一次（上游接缝：compiler.py 的 AsmDict.__missing__ 访问 'sass' 键时才调它）"},
+    {"name": "AttrsDescriptor.from_hints / get_constants", "file": "python/triton/backends/compiler.py", "responsibility": "AOT 专用构造路径：直接吃命令行 {param_index: hint} 而非从参数值推断（ch14 讲过 JIT 期路径）；get_constants 把 equal_to(==1) 属性并进常量表（消失于生成原型）"}
+  ],
+
+  "data_flow": [
+    {"step": "1. 收命令行", "detail": "python/triton/tools/compile.py:L40-L55 argparse 收 path / --kernel-name / --signature / --grid / --num-warps / --num-stages / --out-name / --out-path；grid 必须逗号切成恰 3 段（L67-L68 assert len==3）"},
+    {"step": "2. 加载 JITFunction", "detail": "python/triton/tools/compile.py:L60-L66 sys.path.insert 父目录 + importlib 从文件执行 kernel.py，getattr 取出名为 --kernel-name 的 @triton.jit 对象（拿到它的 arg_names）"},
+    {"step": "3. 签名三分", "detail": "python/triton/tools/compile.py:L94-L102 —— hints={i: int(s.split(':')[1])} 只收带冒号且值可转数的位；constants={arg_name: int/float(s)} 收裸 constexpr 段（如 1024）；signature={arg_name: s.split(':')[0]} 收其余运行期参数（去掉 :hint 后缀）。实测 `*fp32:16, i32:16, 1024, i32`(arg_names=X,N,BLOCK,stride) → hints={0:16,1:16}, constants={BLOCK:1024}, signature={X:*fp32,N:i32,stride:i32}"},
+    {"step": "4. hints 校验+物化", "detail": "python/triton/tools/compile.py:L108-L112 —— assert 每个 hint ∈ {1,16}；AttrsDescriptor.from_hints(hints) 把 16 归入 tt.divisibility、1 归入 tt.equal_to；get_constants() 把 ==1 的参数也并进 constants（它们从运行期原型消失）"},
+    {"step": "5. 出 cubin（需真机）", "detail": "python/triton/tools/compile.py:L113-L115 —— ASTSource(fn,constants,signature,attrs) → triton.compile(src, options={num_warps,num_stages})，跨进 ch37 讲的 ttir→...→ptxas→cubin，产物 ccinfo.asm['cubin'] + ccinfo.metadata.shared"},
+    {"step": "6. 切参数三桶", "detail": "python/triton/tools/compile.py:L116-L129 —— 遍历 kernel.arg_names：非常量入 arg_names_not_1+arg_names（运行期签名）；是常量但 i∈attrs.equal_to_1 只入 arg_names（full_signature 保留、运行期原型省略）；纯常量两者都不入"},
+    {"step": "7. 拼函数名+内嵌 cubin", "detail": "python/triton/tools/compile.py:L131-L133 —— func_name = out_name_{sig_hash}_{kernel_suffix}；hex_ = hexlify(cubin) 去 b'' 包装，bin_data = 逐字节 '0xXY' 逗号拼接；bin_size = len(hex_)"},
+    {"step": "8. 灌模板落两文件", "detail": "python/triton/tools/compile.py:L134-L155 —— params 字典（含 tt-linker 需要的 full_signature/algo_info/_placeholder）→ 对 'h','c' 各读 compile.{ext} 模板 .format(**params)，写到 {out}.{sig_hash}_{suffix}.{h,c}"},
+    {"step": "9. 链接：解析头", "detail": "python/triton/tools/link.py:L274-L280 —— HeaderParser 逐个读 headers，extract_linker_meta 用 tt-linker 正则拆指令，_match_suffix 从 suffix(如 012d) 逆推 sizes(如 [None,None,16])，按 '{name}_{algo_info}' 归组"},
+    {"step": "10. 生成分派器 .c/.h", "detail": "python/triton/tools/link.py:L282-L322 —— make_algo_decls/make_global_decl 出 .h；make_kernel_hints_dispatcher(按 num_specs 降序，最特化的 if 先匹配) + make_func_pointers(algo_id 表) + make_kernel_meta_const_dispatcher + load/unload + default 出 .c。实测两特化 add(012d 有 N%16 提示 / 012 无) → `if ((N % 16 == 0)) return add_..._012d(...); if (1) return add_..._012(...); return CUDA_ERROR_INVALID_VALUE;`"},
+    {"step": "11. 反汇编：取 SASS", "detail": "python/triton/tools/disasm.py:L84-L90 —— kernel.asm['sass'] 触发 AsmDict.__missing__ → get_sass(cubin) → 写临时 cubin → extract 调 `cuobjdump -sass <file>`（cuobjdump 路径来自 nvidia.compiler._path_to_binary）"},
+    {"step": "12. 两行一指令解析", "detail": "python/triton/tools/disasm.py:L100-L127 —— 找 `Function :` 头→跳 .headerflags→循环：FLINE(offset+汇编体+首半编码) 与紧随 SLINE(次半编码) 配对，processSassLines 调 parseCtrl 解控制字并登记 BRA 目标"},
+    {"step": "13. 控制字解码", "detail": "python/triton/tools/disasm.py:L35-L47 —— parseCtrl 从 SLINE 的 64 位编码位移取 stall(41-44)/yield(45)/wr-barrier(46-48)/rd-barrier(49-51)/wait-mask(52-57)，格式化 `wait:read:write:yield:stall`。实测 SLINE 0x000e220000000800 → `--:-:0:-:1`（wr-barrier=0, stall=1）；0x002fda000780c0ff → `02:-:-:Y:d`（wait-mask 命中 bit1, yield, stall=13）"},
+    {"step": "14. BRA→LBB 重标", "detail": "python/triton/tools/disasm.py:L130-L143 —— 第二趟遍历 asm_buffer：offset(idx*16) 若是某 BRA 的目标则打 LBB{i} 标签；每条 BRA 的十六进制目标地址用 BRA_RE.sub 重写成 LBBn，产出可读汇编"}
+  ],
+
+  "design_decisions": [
+    {"decision": "AOT = 把 JIT 特化钉到命令行", "why": "@triton.jit 平时在运行期按实参值推断特化（ch14 的 AttrsDescriptor 从值推断）；AOT 无实参，改由人在签名里用 :16/:1 显式声明整除性提示，走 from_hints 这条平行构造路径把同一套特化机制搬到编译期，产物脱离 Python", "evidence": "python/triton/tools/compile.py:L110 + python/triton/backends/compiler.py:L172-L187"},
+    {"decision": "只有 1 和 16 是合法提示", "why": "对应 AttrsDescriptor 仅有的两种标量特化属性：equal_to_1（值恒为 1，可从原型消去、编译期常量折叠）与 divisibility_16（16 字节对齐，开向量化/合并访存）；其余值无特化意义，assert 拦掉", "evidence": "python/triton/tools/compile.py:L108-L109"},
+    {"decision": "cubin 十六进制内嵌进 C 数组而非旁挂文件", "why": "目标是『自包含』部署——生成的 .c 里 unsigned char CUBIN_NAME[N]={...} 直接携带二进制，编译进 .so/.o 后无需运行时再找 .cubin 文件，cuModuleLoadData 直接从内存加载", "evidence": "python/triton/tools/compile.py:L133 + python/triton/tools/compile.c:L31,L43"},
+    {"decision": "compile.py 与 link.py 靠头文件里的 `// tt-linker:` 字符串约定耦合", "why": "两个独立命令行工具间无内存共享，compile.py 把链接所需元数据（函数名/full_signature/algo_info）编成一行注释留在 .h，link.py 用正则逆向解析——好处是解耦、可分别调用；代价是改一处格式要动两处", "evidence": "python/triton/tools/compile.h:L13 + python/triton/tools/link.py:L35"},
+    {"decision": "分派链按 num_specs 降序（最特化的先匹配）", "why": "运行期实参可能同时满足多份特化的条件（如 N 既是任意值也恰好 %16==0）；先试特化最多（约束最强、通常最快）的那份，退而求其次，最后 if(1) 兜底或 CUDA_ERROR_INVALID_VALUE，保证选到能用且尽量优的实现", "evidence": "python/triton/tools/link.py:L163,L169"},
+    {"decision": "两级分派：整除性(hints) 与 meta-参数(algo_id) 正交", "why": "hints dispatcher 处理『同一 tile 配置下的整除性变体』（运行期条件选），algo_id 函数指针表处理『不同 meta-参数/tile 配置的版本』（调用方显式传 algo_id 选，供 autotune 式多版本）；两者组合成 kernel(stream, args, algo_id) 与 kernel_default", "evidence": "python/triton/tools/link.py:L202-L218 + L143-L157"},
+    {"decision": "SASS 惰性反汇编 + lru_cache", "why": "反汇编要 fork cuobjdump 子进程、写临时文件，开销不小且多数编译不看 SASS；故只在用户访问 kernel.asm['sass'] 时才触发（AsmDict.__missing__），且 get_sass 带 lru_cache 避免同一 cubin 反复反汇编", "evidence": "python/triton/tools/disasm.py:L66-L67"},
+    {"decision": "控制字位布局是逆向经验值而非官方文档", "why": "NVIDIA 未公开 SASS 每条指令后 64 位控制字的位定义；disasm.py 源自 Da Yan(HKUST) 的逆向工作（MIT 许可），parseCtrl 里 bit41-57 的 stall/yield/barrier 布局是 Volta~Hopper 世代的经验解码，跨 SM 架构可能变动", "evidence": "python/triton/tools/disasm.py:L1-L3(版权) + L37-L41(位移常量)"}
+  ],
+
+  "theory": [
+    {
+      "topic": "整除性提示如何改变生成的 C 原型",
+      "content": "特化不只是编译器内部优化，它直接改变 AOT 产出的 C 函数签名。equal_to_1 的参数（:1）从运行期原型完全消失（编译期已知恒为 1，折叠进 cubin），只留在 full_signature（tt-linker 记录）里；divisibility_16 的参数（:16）仍在原型里（值是运行期的），但 cubin 内部按 16 对齐做了向量化。gen_signature(link.py:L126) 过滤掉 hint==1 的参数正是这个道理——运行期签名 = 全参数 − equal_to_1。读者亲眼看到：签名里一个 :1 就让 C 原型少一个形参。"
+    },
+    {
+      "topic": "suffix 编解码是一对逆运算",
+      "content": "kernel_suffix(code_generator.py) 把特化编码进函数名：逐参数拼 `<argid>` 再看 equal_to_1 加 'c'、divisibility_16 加 'd'（如 3 参数、arg2 对齐 16 → `012d`）。link.py 的 _match_suffix 是它的逆：扫描 suffix，对每个参数位 i 先 find(str(i)) 定位，再看紧跟的字符是 'c'(→size 1) 还是 'd'(→size 16) 还是无(→None)，还原出 sizes 数组。这对编解码是 compile.py 与 link.py 跨进程传递特化信息的隐形通道——函数名本身就是元数据。注意 _match_suffix 用 find(str(i)) 定位有潜在歧义（多位数 argid 时 '1' 可能先匹配到 '10' 里的 '1'），但实践中参数少、够用。"
+    },
+    {
+      "topic": "64 位控制字的位布局与调度语义",
+      "content": "从 Volta 起 NVIDIA 把指令调度信息编进每条指令后附的控制字（不再靠硬件记分牌全自动）。parseCtrl 解出五个字段：stall(bit41-44, 4 位)=本条发射后固定停顿的周期数；yield(bit45, 1 位)=是否让出给同 warp-scheduler 的其他 warp（源码里 0→'Y' 表示 yield-hint 生效）；write-barrier(bit46-48)/read-barrier(bit49-51, 各 3 位, 值 7=无)=本条指令的写/读结果登记到哪个依赖屏障（0-5 号，可变延迟指令如 LDG/MUFU 用它通知后续）；wait-mask(bit52-57, 6 位)=本条发射前须等待哪些屏障就绪的位掩码。格式化成 `wait:read:write:yield:stall`，正是 kernel.asm['sass'] 每条指令左侧那串数字。ptxas 排指令时正是在填这些控制字来隐藏访存/长延迟指令的延迟——读懂它就读懂了 ptxas 的调度决策（回指 ch37 ptxas→cubin，这里再往下一层看它排布的结果）。"
+    }
+  ],
+
+  "subtraction_plan": {
+    "note": "本章 kind=deep 且 skip_impl —— 命令行工具无算法可重实现，取证=实跑 compile.py/link.py/cuobjdump。故无精简版、subtraction_plan 留空（delete 空、must_keep 记录 writer 必须讲清、读者必须理解的符号供 lint_source_grounding 与叙事核对）。",
+    "delete": [],
+    "must_keep": [
+      {"symbol": "constexpr", "why": "compile.py 内嵌小函数，签名三分的判定核心——能转 int/float 的段判为编译期常量，读者须理解 constexpr 与运行期参数的分界"},
+      {"symbol": "hints", "why": "从 `:16`/`:1` 提取的 {param_index: value} 字典，AOT 特化的输入，writer 须讲透它怎么来、去哪"},
+      {"symbol": "from_hints", "why": "AttrsDescriptor 的 AOT 专用构造路径（区别于 ch14 的值推断路径），本章与 ch14 的接缝符号"},
+      {"symbol": "get_constants", "why": "把 equal_to(==1) 属性并进常量表、使其从运行期原型消失，解释『:1 参数为何从 C 原型消失』的关键"},
+      {"symbol": "kernel_suffix", "why": "把特化编码进函数名后缀（c=equal_to_1, d=divisibility_16），与 link.py 的 _match_suffix 构成逆运算对"},
+      {"symbol": "ty_to_cpp", "why": "triton 类型→C 类型映射，compile.py 生成 C 原型的类型翻译，NVIDIA 专属挂载点"},
+      {"symbol": "binascii", "why": "hexlify 把 cubin 二进制转十六进制内嵌进 C 数组，『自包含』的实现手段"},
+      {"symbol": "cuLaunchKernel", "why": "compile.c 模板里真正发射核的 driver API，读者须看到生成的 C 最终怎么 launch（gridXYZ + num_warps*32 线程 + shared + args）"},
+      {"symbol": "cuModuleLoadData", "why": "compile.c 从内存里的 cubin 字节数组加载模块的 driver API，体现『无旁挂文件』的自包含加载"},
+      {"symbol": "HeaderParser", "why": "link.py 解析 tt-linker 头指令的类，链接支线的入口"},
+      {"symbol": "KernelLinkerMeta", "why": "一份特化产物的元数据 dataclass，link.py 全程围绕它生成 C"},
+      {"symbol": "extract_linker_meta", "why": "HeaderParser 主方法，用 tt-linker 正则把头文件逆向解析成 KernelLinkerMeta"},
+      {"symbol": "_match_suffix", "why": "把 d/c 后缀逆向解回每参数 sizes 提示（c=1,d=16），link.py 最烧脑的一段，须逐步走 worked example"},
+      {"symbol": "make_kernel_hints_dispatcher", "why": "生成按运行期整除性(val%16==0)/(val==1)分派的 C 入口——compute_spec_key 的 AOT C 化身，本章第二支柱落点"},
+      {"symbol": "num_specs", "why": "特化参数数，分派链的排序键（降序：最特化先匹配），须解释为何这样排"},
+      {"symbol": "make_func_pointers", "why": "生成按 algo_id 索引的函数指针表，讲两级分派（hints × algo_id）"},
+      {"symbol": "parseCtrl", "why": "解 64 位控制字的核心函数，反汇编支线的心脏，读者第一次看懂 SASS 调度控制字"},
+      {"symbol": "SLINE_RE", "why": "抓紧随汇编体的控制字编码行的正则，parseCtrl 的输入来源"},
+      {"symbol": "FLINE_RE", "why": "抓一条指令汇编体+offset+首半编码的正则，两行一指令解析的第一行"},
+      {"symbol": "processSassLines", "why": "配对汇编体与控制字并登记 BRA 目标，第一趟遍历核心"},
+      {"symbol": "extract", "why": "disasm 主流程：调 cuobjdump -sass、按 Function 分段、两趟解析（第二趟 BRA→LBB 重标）"},
+      {"symbol": "get_sass", "why": "cubin→SASS 的惰性缓存入口，上游接 compiler AsmDict['sass']，解释『按需反汇编』"},
+      {"symbol": "cuobjdump", "why": "NVIDIA 反汇编工具，disasm.py 的底层依赖，`-sass`/`-fun` 参数须讲"},
+      {"symbol": "BRA_RE", "why": "识别 BRA 跳转指令并抓目标地址的正则，支撑 offset→LBB 标签重映射"}
+    ]
+  },
+
+  "mechanisms": [
+    {
+      "id": "m1-signature-tripartition",
+      "name": "签名字符串三分：hints / constants / signature",
+      "kind": "algorithm",
+      "source_anchors": ["python/triton/tools/compile.py:L94-L102"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "worked_example": "输入 `*fp32:16, i32:16, 1024, i32`，kernel.arg_names=[X,N,BLOCK,stride] → hints={0:16,1:16}（第 0、1 位带 :16）、constants={BLOCK:1024}（第 2 段裸 1024 可转 int）、signature={X:*fp32, N:i32, stride:i32}（其余去 :hint 后缀，BLOCK 因入 constants 被排除）。已在 host 用纯 Python 复现本 trace。"
+    },
+    {
+      "id": "m2-hints-to-attrs",
+      "name": "hints 物化成 AttrsDescriptor（AOT 特化路径）",
+      "kind": "dataflow",
+      "source_anchors": ["python/triton/tools/compile.py:L108-L112", "python/triton/backends/compiler.py:L172-L187", "python/triton/backends/compiler.py:L126-L132"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "worked_example": "hints={0:16,1:16} → from_hints 把 property_values 里 tt.divisibility=16 匹配到 [0,1]、tt.equal_to=1 匹配到 []（无 :1）→ arg_properties['tt.divisibility']=[0,1]。若某位 :1 则进 equal_to 且 get_constants() 把它并入 constants（从运行期原型消失）。回指 ch14——同一 AttrsDescriptor，from_hints 是它的命令行入口。"
+    },
+    {
+      "id": "m3-arg-partition-and-embed",
+      "name": "参数三桶切分 + cubin 十六进制内嵌 C 模板",
+      "kind": "algorithm",
+      "source_anchors": ["python/triton/tools/compile.py:L116-L155", "python/triton/tools/compile.c:L27-L67", "python/triton/tools/compile.h:L11-L14"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "worked_example": "遍历 arg_names：非常量→arg_names_not_1+arg_names（运行期签名 signature）；常量且 i∈equal_to_1→只入 arg_names（full_signature 有、运行期原型无）；纯常量→都不入。再 func_name=out_{sig_hash}_{suffix}、bin_data=hexlify(cubin) 逐字节 '0xXY'、.format 灌 compile.c/.h。产物 compile.c 里 CUBIN_NAME[N]={0x..,..} + load(cuModuleLoadData/GetFunction) + 入口(cuLaunchKernel)。"
+    },
+    {
+      "id": "m4-suffix-codec",
+      "name": "kernel_suffix 编码 ↔ _match_suffix 解码（特化的隐形通道）",
+      "kind": "algorithm",
+      "source_anchors": ["python/triton/compiler/code_generator.py:L1260-L1269", "python/triton/tools/link.py:L86-L107"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "worked_example": "编码：3 参数、arg2 对齐 16 → kernel_suffix 拼 '0'+'1'+'2'+'d'='012d'。解码：_match_suffix('012d', c_sig 有 3 参数)→逐位 find：'0'后无 c/d→sizes[0]=None；'1'后无→None；'2'后是'd'→s2i['d']=16、num_specs=1→sizes=[None,None,16]。函数名本身携带了特化信息。"
+    },
+    {
+      "id": "m5-header-parse",
+      "name": "HeaderParser：tt-linker 指令逆向解析与归组",
+      "kind": "protocol",
+      "source_anchors": ["python/triton/tools/link.py:L29-L119"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting",
+      "worked_example": "读到 `// tt-linker: add_deadbeef_012d:CUdeviceptr X, CUdeviceptr Y, int32_t N:warps4xstages3` → linker_directives 三组=(add_deadbeef_012d, 'CUdeviceptr X, ...N', 'warps4xstages3')；_match_name→(add, deadbeef, 012d)；_match_c_sig→ctypes=[CUdeviceptr,CUdeviceptr,int32_t]/names=[X,Y,N]；_match_suffix('012d')→sizes=[None,None,16]；按 'add_warps4xstages3' 归组。_add_kernel 校验同组签名一致。"
+    },
+    {
+      "id": "m6-hints-dispatcher",
+      "name": "运行期整除性分派器生成（compute_spec_key 的 C 化身）",
+      "kind": "algorithm",
+      "source_anchors": ["python/triton/tools/link.py:L160-L198", "python/triton/tools/link.py:L122-L130"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "worked_example": "两特化 add：012d(N:16 提示,sizes=[None,None,16],num_specs=1) 与 012(无,num_specs=0)。按 num_specs 降序生成：`CUresult add_warps4xstages3(...N){ if ((N % 16 == 0)) return add_deadbeef_012d(stream, X, Y, N); if (1) return add_cafef00d_012(stream, X, Y, N); return CUDA_ERROR_INVALID_VALUE; }`。已在 host 用 pin 的 link.py 实跑生成，逐字如上（cond_fn 对 hint==16 出 %16==0、hint==1 出 ==1）。回指 ch14。"
+    },
+    {
+      "id": "m7-algo-id-table",
+      "name": "algo_id 函数指针表：meta-参数多版本选择（两级分派的第二级）",
+      "kind": "dataflow",
+      "source_anchors": ["python/triton/tools/link.py:L200-L241"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting",
+      "worked_example": "make_func_pointers 生成 `kernel_func_t add_kernels[] = { add_warps4xstages3, };`；make_kernel_meta_const_dispatcher 生成 `add(stream, X,Y,N, int algo_id){ assert(algo_id < sizeof(add_kernels)); return add_kernels[algo_id](stream, X,Y,N); }`；add_default 固定 algo_id=0。多 tile 配置（如 test_aot 的 4 组 tile_sizes）时表里多项，调用方传 algo_id 选。"
+    },
+    {
+      "id": "m8-sass-two-line-parse",
+      "name": "cuobjdump -sass 两行一指令解析 + Function 分段",
+      "kind": "protocol",
+      "source_anchors": ["python/triton/tools/disasm.py:L84-L127"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "worked_example": "cuobjdump 每条指令两行：FLINE `/*0000*/ LDC R1, c[0x0][0x37c] ...; /* 0x0000df00ff017b82 */`（offset+汇编体+首半编码）与 SLINE `/* 0x000e220000000800 */`（次半编码）。extract 找 `Function :` 头→line_idx+=2 跳 .headerflags→while FLINE_RE 匹配：读 fline、读 sline、processSassLines 配对。已在 host 用真 cubin(sm_120) 的 cuobjdump 验证此两行格式。"
+    },
+    {
+      "id": "m9-parse-ctrl",
+      "name": "parseCtrl：64 位控制字位解码（stall/yield/barrier/wait-mask）",
+      "kind": "layout",
+      "source_anchors": ["python/triton/tools/disasm.py:L35-L47"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "worked_example": "SLINE 0x000e220000000800：stall=(>>41)&0xf=1、yield=(>>45)&1=非0→'-'、wr-barrier=(>>46)&7=0、rd-barrier=(>>49)&7=7→'-'、wait-mask=(>>52)&0x3f=0→'--' ⇒ `--:-:0:-:1`。SLINE 0x002fda000780c0ff ⇒ `02:-:-:Y:d`（wait-mask 命中 bit1、yield 生效、stall=13）。两例均在 host 用 pin 的 parseCtrl 实跑验证，且与该 kernel 的 kernel.asm['sass'] 左列逐字吻合。"
+    },
+    {
+      "id": "m10-bra-relabel",
+      "name": "BRA 目标地址 → LBB 标签重映射（两趟）",
+      "kind": "algorithm",
+      "source_anchors": ["python/triton/tools/disasm.py:L50-L63", "python/triton/tools/disasm.py:L130-L143"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting",
+      "worked_example": "第一趟 processSassLines：遇 BRA（BRA_RE 匹配）把十六进制目标地址登记 labels[target]=len(labels)。第二趟 extract：逐指令 offset=idx*16，若 offset∈labels 则前置 `LBB{i}:` 行；每条 BRA 用 BRA_RE.sub 把 0x 地址重写成 LBBn。实测自旋核尾部 `BRA LBB0;` + 前置 `LBB0:` 标签（host 真机 sass 输出可见）。"
+    },
+    {
+      "id": "m11-lazy-sass",
+      "name": "SASS 惰性反汇编 + lru_cache（上游接 AsmDict['sass']）",
+      "kind": "config",
+      "source_anchors": ["python/triton/tools/disasm.py:L66-L81"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    }
+  ],
+
+  "forensics": {
+    "env": "host 有 GPU(NVIDIA RTX PRO 6000 Blackwell, sm_120) + /usr/local/cuda/bin/cuobjdump + 已装 triton 3.6.0；pin 的 3.2.0 源码树未编译(_C.libtriton 缺失)，故 compile.py 端到端出 cubin 用『需真机+pin 构建』标注，但可版本无关地取证的部分全部实跑",
+    "ran_ok": [
+      "signature 三分：host 纯 Python 复现 compile.py:L94-L102，`*fp32:16, i32:16, 1024, i32`(arg_names=X,N,BLOCK,stride)→hints={0:16,1:16}, constants={BLOCK:1024}, signature={X:*fp32,N:i32,stride:i32}",
+      "link.py 端到端：用 pin 的 link.py 对两份手写 tt-linker 头(012d 与 012)实跑，生成 add_linked.c/.h，分派链 `if ((N % 16 == 0)) return add_..._012d; if (1) return add_..._012; return CUDA_ERROR_INVALID_VALUE;` + algo_id 表 + load/unload，逐字如 data_flow/m6/m7 所载（link.py 纯 stdlib，无 GPU 依赖）",
+      "parseCtrl：用 pin 的 parseCtrl 对真 SLINE 编码实跑，0x000e220000000800→`--:-:0:-:1`、0x002fda000780c0ff→`02:-:-:Y:d`，与真机 kernel.asm['sass'] 左列逐字吻合",
+      "cuobjdump 两行格式：对真 cubin 跑 `cuobjdump -sass` 确认 FLINE(`/*0000*/ asm; /* 0x.. */`) + SLINE(`/* 0x.. */`) 两行一指令格式，与 FLINE_RE/SLINE_RE 匹配"
+    ],
+    "needs_real_machine_with_pin": [
+      "compile.py 端到端出 compile.c/compile.h：triton.compile 需 pin 的 3.2.0 已构建后端 + ptxas 出 cubin（本 host 的 3.2.0 源码树未构建；3.6.0 已装但 API 与 3.2.0 compile.py 不完全兼容）。行号/逻辑以 pin 源码为准，illustrator/tester 阶段若在 pin 构建环境可补跑生成真 compile.c 片段"
+    ]
+  },
+
+  "cross_refs": [
+    {"to": "ch14", "what": "specialization / AttrsDescriptor / equal_to_1 / divisibility_16——本章是它的 AOT 落地（from_hints 命令行入口 + C 版分派器），禁止重讲，回指『见第 N 章』"},
+    {"to": "ch37", "what": "ptxas → cubin——本章往下一层看 cubin 反汇编出的 SASS 及其控制字（ptxas 的调度决策结果），禁止重讲 ptxas 内部，回指"}
+  ],
+
+  "foreshadow_due": {"plant": [], "recycle": []}
+}
