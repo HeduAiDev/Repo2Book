@@ -1,0 +1,414 @@
+{
+  "kind": "primer",
+  "chapter_id": "ch29",
+  "slug": "ch29-software-pipelining-primer",
+  "title": "软件流水线与模调度：num_stages 到底调度了什么",
+  "one_line": "软件流水线 = 编译期把循环体的 op 拆到不同 stage、跨迭代重叠，让第 i+1 次的 async load 藏进第 i 次的 dot 计算背后；num_stages 就是流水线深度 = 预取多少次未来迭代 = 共享内存里几份 buffer 轮转。",
+  "code_spine": [
+    "lib/Dialect/TritonGPU/Transforms/Pipeliner/SoftwarePipeliner.cpp:19-27  架构头注释：software pipeliner = create a modulo schedule + expander emits prologue/epilogue（本章理论骨架 + 术语坐实源）",
+    "lib/Dialect/TritonGPU/Transforms/Pipeliner/SoftwarePipeliner.cpp:73-94  pipelineLoop：先 preProcessLoopAndGetSchedule 建模 → pipelineForLoop 展开 → asyncLaunchDots",
+    "lib/Dialect/TritonGPU/Transforms/Pipeliner/SoftwarePipeliner.cpp:100-108 getNumStagesOrDefault：读循环上的 kNumStagesAttrName 属性，否则用全局 numStages",
+    "lib/Dialect/TritonGPU/Transforms/Pipeliner/SoftwarePipeliner.cpp:110-119 runOnOperation：num_stage <= 1 直接 bail（=1 即关掉流水线）",
+    "include/triton/Dialect/TritonGPU/Transforms/Schedule.h:69-78  CoarseSchedule：numStages / clusters / opToStageAndCluster（op → (stage, cluster) 排期表）",
+    "lib/Dialect/TritonGPU/Transforms/Pipeliner/Schedule.cpp:45-70  getOpsInOrder：按 cluster 把 op 排序",
+    "lib/Dialect/TritonGPU/Transforms/Pipeliner/Schedule.cpp:72-80  createFinalSchedule：把二维表拍平成 (op, stage) 序列交给 expander",
+    "lib/Dialect/TritonGPU/Transforms/Pipeliner/MatmulLoopPipeline.cpp:87-110  createAsyncCopy：tt.load → AsyncCopyGlobalToLocalOp + AsyncCommitGroupOp + AsyncWaitOp，写进 buffer 第 insertIdx 格",
+    "lib/Dialect/TritonGPU/Transforms/Pipeliner/MatmulLoopPipeline.cpp:558-598  scheduleLoads：stagesBetweenLoads、root use（dot）放 numStages-1、load 放前面 stage、distToUse = use.stage - load.stage",
+    "lib/Dialect/TritonGPU/Transforms/Pipeliner/MatmulLoopPipeline.cpp:775-790  createAlloc：buffer 首维插一维 distance（distance 份 tile 组成环形缓冲）",
+    "lib/Dialect/TritonGPU/Transforms/Pipeliner/MatmulLoopPipeline.cpp:936-955  createAsyncOps：numBuffers = max(distToUse)（MMAv3 再 +1）",
+    "lib/Dialect/TritonGPU/Transforms/Pipeliner/MatmulLoopPipeline.cpp:1067-1134 preProcessLoopAndGetSchedule：建模总装（scheduleLoads → createAsyncOps → createFinalSchedule），设 peelEpilogue=false",
+    "lib/Dialect/TritonGPU/Transforms/Pipeliner/PipelineExpander.cpp:90-92   emitPrologue 注释：creates maxStage-1 part，含 stages [0; i]",
+    "lib/Dialect/TritonGPU/Transforms/Pipeliner/PipelineExpander.cpp:107-110 emitEpilogue 注释：creates maxStage-1 part，含 stages [i; maxStage]",
+    "lib/Dialect/TritonGPU/Transforms/Pipeliner/PipelineExpander.cpp:278-317 emitPrologue 实现：for i in [0, maxStage)，stages[op] > i 时 continue（还没轮到该 stage 出场）",
+    "lib/Dialect/TritonGPU/Transforms/Pipeliner/PipelineExpander.cpp:789-841 pipelineForLoop 五步总装：emitPrologue → analyzeCrossStageValues → createKernelLoop/createKernel → (peelEpilogue 时) emitEpilogue → erase 原循环"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Pipeliner/SoftwarePipeliner.cpp",
+      "lines": "L19-L27",
+      "role": "架构头注释——本章的理论骨架 + 全部术语坐实源",
+      "code": "//===----------------------------------------------------------------------===//\n// This file will create a schedule that will be handed over to the pipeline\n// expander.\n// Software pipeliners are usually separated into two pieces, one that create a\n// modulo schedule and an expander that rewrites the loop and emits a prologue\n// and epilogue. This pass first calls a helper that will pre-process the IR\n// to create async operations and create a modulo schedule. Then we call the\n// expander to generate the prologue and new loop.\n//===----------------------------------------------------------------------===//",
+      "elide": []
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Pipeliner/SoftwarePipeliner.cpp",
+      "lines": "L73-L94",
+      "role": "pipelineLoop：建模→展开两半的总装（精简掉失败早退分支的中间日志）",
+      "code": "static bool pipelineLoop(scf::ForOp forOp, int numStages) {\n  mlir::triton::PipeliningOption options;\n  if (!preCondition(forOp))\n    return false;\n\n  bool foundSchedule = false;\n  foundSchedule = preProcessLoopAndGetSchedule(forOp, numStages, options);\n\n  // TODO: add more pipelines strategy.\n  if (!foundSchedule)\n    return false;\n\n  IRRewriter rewriter(forOp->getContext());\n  rewriter.setInsertionPoint(forOp);\n  FailureOr<scf::ForOp> newForOp =\n      mlir::triton::pipelineForLoop(rewriter, forOp, options);\n\n  if (failed(newForOp))\n    return false;\n  mlir::triton::asyncLaunchDots(newForOp.value());\n  return true;\n}",
+      "elide": [
+        "preProcessLoopAndGetSchedule 是建模半、pipelineForLoop 是展开半、asyncLaunchDots 是 MMAv3 后处理——细节留 ch30"
+      ]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Pipeliner/SoftwarePipeliner.cpp",
+      "lines": "L100-L108",
+      "role": "getNumStagesOrDefault：num_stages 从哪来（循环属性优先，否则全局默认）",
+      "code": "  int getNumStagesOrDefault(scf::ForOp forOp) {\n    // Use the attribute attached to the loop if it exists otherwise use the\n    // global control.\n    if (!forOp->hasAttr(mlir::triton::kNumStagesAttrName))\n      return numStages;\n    return mlir::cast<IntegerAttr>(\n               forOp->getAttr(mlir::triton::kNumStagesAttrName))\n        .getInt();\n  }",
+      "elide": []
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Pipeliner/SoftwarePipeliner.cpp",
+      "lines": "L112-L116",
+      "role": "runOnOperation：num_stage <= 1 直接不收集 → 不流水（=1 即关掉流水线）",
+      "code": "    getOperation()->walk([&](scf::ForOp forOp) {\n      // Bail out for loops with num_stage <= 1.\n      if (getNumStagesOrDefault(forOp) > 1)\n        loops.push_back(forOp);\n    });",
+      "elide": []
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/Transforms/Schedule.h",
+      "lines": "L69-L78",
+      "role": "CoarseSchedule 结构体：模调度在 Triton 里的数据结构 = op → (stage, cluster) 表",
+      "code": "  CoarseSchedule(int numStages) : numStages(numStages) {}\n  int numStages;\n  ClusterList clusters;\n  using Cluster = decltype(clusters)::iterator;\n\n  DenseMap<Operation *, std::pair<int, Cluster>> opToStageAndCluster;\n\n  void insert(Operation *op, int stage, Cluster cluster) {\n    opToStageAndCluster[op] = {stage, cluster};\n  }",
+      "elide": [
+        "ClusterList 是一个有序 std::list<int>，可 newAtFront/newAtBack 往两头插——同 stage 内的执行顺序分组"
+      ]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Pipeliner/Schedule.cpp",
+      "lines": "L72-L80",
+      "role": "createFinalSchedule：把二维排期表拍平成 (op, stage) 序列——展开器唯一需要的输入",
+      "code": "std::vector<std::pair<Operation *, unsigned>>\ntt::CoarseSchedule::createFinalSchedule(scf::ForOp forOp) {\n  SmallVector<std::tuple<Operation *, int, tt::CoarseSchedule::Cluster>>\n      opsInOrder = getOpsInOrder(forOp);\n  std::vector<std::pair<Operation *, unsigned>> schedule;\n  for (auto [op, stage, cluster] : opsInOrder)\n    schedule.push_back({op, stage});\n  return schedule;\n}",
+      "elide": [
+        "getOpsInOrder 先按 cluster 把 op 排好序（Schedule.cpp:45-70）"
+      ]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Pipeliner/MatmulLoopPipeline.cpp",
+      "lines": "L87-L103",
+      "role": "createAsyncCopy：把 tt.load 换成异步三件套（cp.async 发起 + commit + wait），写进 buffer 第 insertIdx 格",
+      "code": "  tt::MemDescType allocTy = cast<tt::MemDescType>(alloc.getType());\n  SmallVector<Value> copyOffsets(allocTy.getRank(), zero);\n  copyOffsets[0] = insertIdx;\n  Attribute sharedMemorySpace =\n      triton::gpu::SharedMemorySpaceAttr::get(forOp.getContext());\n  tt::MemDescType subviewTy = tt::MemDescType::get(\n      allocTy.getShape().drop_front(), allocTy.getElementType(),\n      allocTy.getEncoding(), sharedMemorySpace, /*mutableMemory=*/true);\n  auto view =\n      builder.create<ttg::MemDescSubviewOp>(loc, subviewTy, alloc, copyOffsets);\n  Operation *copy = builder.create<ttg::AsyncCopyGlobalToLocalOp>(\n      loc, src, view, mask, other, loadOp.getCache(), loadOp.getEvict(),\n      loadOp.getIsVolatile());\n  Operation *commmit =\n      builder.create<ttg::AsyncCommitGroupOp>(loc, copy->getResult(0));\n  Operation *wait =\n      builder.create<ttg::AsyncWaitOp>(loc, commmit->getResult(0), 0);",
+      "elide": [
+        "前置的非昂贵 load 布局转换分支（L68-85）与 extract/LocalLoad 回读分支（L111-152）省略——只保留『发起-提交-等待』三件套骨架；async_copy 算子表面已在 ch24 讲，本章讲它怎么被多 stage 预取用"
+      ]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Pipeliner/MatmulLoopPipeline.cpp",
+      "lines": "L568-L597",
+      "role": "scheduleLoads：root use（dot）放最后一个 stage numStages-1、load 放前面 stage、distToUse = 二者的 stage 差",
+      "code": "  tt::CoarseSchedule::Cluster rootUsersCluster = schedule.clusters.newAtFront();\n  // Put the root uses of the loads in the last stage.\n  for (auto &[loadOp, dist, use] : loadOpToIndLevelAndUse) {\n    if (loadToInfo.count(loadOp) == 0)\n      continue;\n    // Non-LoadOp(s) are the root uses of all LoadOp(s) and should be\n    // always present in the opInfo\n    if (!isa<tt::LoadOp>(use)) {\n      schedule.insert(use, numStages - 1, rootUsersCluster);\n      rootUsers.insert(use);\n    }\n  }\n\n  SmallVector<tt::CoarseSchedule::Cluster> loadsClusters;\n  for (int i = 0; i < maxIndirectionLevel + 1; i++) {\n    loadsClusters.push_back(schedule.clusters.newAtBack());\n  }\n  // Assign stages to the loads.\n  for (auto [loadOp, indLevel, _] : loadOpToIndLevelAndUse) {\n    if (loadToInfo.count(loadOp) == 0)\n      continue;\n    int stage = (maxIndirectionLevel - indLevel) * stagesBetweenLoads;\n    schedule.insert(loadOp, stage, loadsClusters[indLevel]);\n  }\n\n  // Distance from the load to the use.\n  for (auto [loadOp, _, use] : loadOpToIndLevelAndUse) {\n    if (loadToInfo.count(loadOp) == 0)\n      continue;\n    loadToInfo[loadOp].distToUse = schedule[use].first - schedule[loadOp].first;\n  }",
+      "elide": [
+        "indirection level（间接寻址层级）分 stage 的完整算法（stagesBetweenLoads=ceil(numStages-2, maxIndirectionLevel+1)）留 ch30；本章只用简单直取的直觉：dot 在最后一级、load 在前面、二者相差 distToUse 个 stage"
+      ]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Pipeliner/MatmulLoopPipeline.cpp",
+      "lines": "L775-L790",
+      "role": "createAlloc：buffer 首维插一维 distance——一个 tile 被扩成 distance 份组成环形缓冲",
+      "code": "// Create an allocation that can hold distance number of loadOp shapes.\nstatic Value createAlloc(scf::ForOp &forOp, Operation *loadOp,\n                         ttg::SharedEncodingAttr sharedEnc, unsigned distance) {\n  OpBuilder builder(forOp);\n  Attribute sharedMemorySpace =\n      triton::gpu::SharedMemorySpaceAttr::get(forOp.getContext());\n  auto ty = cast<RankedTensorType>(loadOp->getResultTypes()[0]);\n  SmallVector<int64_t> bufferShape(ty.getShape().begin(), ty.getShape().end());\n  bufferShape.insert(bufferShape.begin(), distance);\n  Type memdescType = mlir::triton::MemDescType::get(\n      bufferShape, ty.getElementType(), sharedEnc, sharedMemorySpace,\n      /*mutableMemory*/ true);\n  Value alloc = builder.create<mlir::triton::gpu::LocalAllocOp>(\n      loadOp->getLoc(), memdescType, Value());\n  return alloc;\n}",
+      "elide": []
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Pipeliner/MatmulLoopPipeline.cpp",
+      "lines": "L940-L955",
+      "role": "createAsyncOps：buffer 份数 numBuffers = 所有 load 里 distToUse 的最大值（MMAv3 再 +1）",
+      "code": "  // Calculate the number of buffers needed for each load.\n  // TODO pawel: we could do more fine-grained allocation here and\n  // allocate only the number of buffers that specific loads need.\n  // Instead, we allocate the maximum number of buffers needed by any load.\n  int numBuffers =\n      llvm::max_element(llvm::make_second_range(loadToInfo), [](auto &lhs,\n                                                                auto &rhs) {\n        return lhs.distToUse < rhs.distToUse;\n      })->distToUse;\n  bool hasMMAV3 =\n      llvm::any_of(loadToInfo, [](auto &kv) { return kv.second.loadIsMMAV3; });\n  if (hasMMAV3) {\n    // For MMAv3, we need an extra buffer as this is assumed in the wgmma\n    // pipelining post-processing.\n    numBuffers++;\n  };",
+      "elide": []
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Pipeliner/PipelineExpander.cpp",
+      "lines": "L90-L92",
+      "role": "emitPrologue 注释：prologue 是 maxStage-1 段，含 stages [0; i]（填流水线）",
+      "code": "  /// Emits the prologue, this creates `maxStage - 1` part which will contain\n  /// operations from stages [0; i], where i is the part index.\n  LogicalResult emitPrologue(RewriterBase &rewriter);",
+      "elide": []
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Pipeliner/PipelineExpander.cpp",
+      "lines": "L107-L110",
+      "role": "emitEpilogue 注释：epilogue 同构，maxStage-1 段，含 stages [i; maxStage]（排空流水线）",
+      "code": "  /// Emits the epilogue, this creates `maxStage - 1` part which will contain\n  /// operations from stages [i; maxStage], where i is the part index.\n  LogicalResult emitEpilogue(RewriterBase &rewriter,\n                             llvm::SmallVector<Value> &returnValues);",
+      "elide": []
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Pipeliner/PipelineExpander.cpp",
+      "lines": "L305-L307",
+      "role": "emitPrologue 实现核心：for i in [0, maxStage)，只发射 stages[op] <= i 的 op（还没轮到的 stage continue 跳过）",
+      "code": "    for (Operation *op : opOrder) {\n      if (stages[op] > i)\n        continue;",
+      "elide": [
+        "外层 for i in [0,maxStage) 循环体（L287-297 造归纳变量 iv=lb+i*step）、cloneAndUpdateOperands 与谓词化分支（L308-345）省略——只保留『第 i 段只跑到 stage i』的骨架"
+      ]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Pipeliner/PipelineExpander.cpp",
+      "lines": "L789-L841",
+      "role": "pipelineForLoop 五步总装：prologue → cross-stage 值 → kernel loop（稳态）→ epilogue → erase 原循环",
+      "code": "FailureOr<ForOp>\nmlir::triton::pipelineForLoop(RewriterBase &rewriter, ForOp forOp,\n                              const triton::PipeliningOption &options,\n                              bool *modifiedIR) {\n  ...\n  LoopPipelinerInternal pipeliner;\n  if (!pipeliner.initializeLoopInfo(forOp, options))\n    return failure();\n  ...\n  // 1. Emit prologue.\n  if (failed(pipeliner.emitPrologue(rewriter)))\n    return failure();\n\n  // 2. Track values used across stages. When a value cross stages it will\n  // need to be passed as loop iteration arguments.\n  llvm::MapVector<Value, LoopPipelinerInternal::LiverangeInfo>\n      crossStageValues = pipeliner.analyzeCrossStageValues();\n  ...\n  // 3. Create the new kernel loop and return the block arguments mapping.\n  ForOp newForOp =\n      pipeliner.createKernelLoop(crossStageValues, rewriter, loopArgMap);\n  if (failed(pipeliner.createKernel(newForOp, crossStageValues, loopArgMap,\n                                    rewriter)))\n    return failure();\n\n  llvm::SmallVector<Value> returnValues =\n      newForOp.getResults().take_front(forOp->getNumResults());\n  if (options.peelEpilogue) {\n    // 4. Emit the epilogue after the new forOp.\n    rewriter.setInsertionPointAfter(newForOp);\n    if (failed(pipeliner.emitEpilogue(rewriter, returnValues)))\n      return failure();\n  }\n  // 5. Erase the original loop and replace the uses with the epilogue output.\n  if (forOp->getNumResults() > 0)\n    rewriter.replaceOp(forOp, returnValues);\n  else\n    rewriter.eraseOp(forOp);\n\n  return newForOp;\n}",
+      "elide": [
+        "modifiedIR 标志设置、loopArgMap 声明注释省略——保留五步骨架；Triton 的 matmul 建模设 peelEpilogue=false（MatmulLoopPipeline.cpp:1129），选择不剥离 epilogue、改用谓词化在稳态循环内收尾，展开器两条路都支持"
+      ]
+    },
+    {
+      "path": "book/papers/ch29-software-pipelining-primer/paper.md",
+      "lines": "§29.2.2",
+      "role": "论文包给出的『迭代 × 时间片』稳态时空图（key_figure 1 的文字底稿）——同一时间片里不同迭代的不同 stage 并行",
+      "code": "时间片  →   t0      t1      t2      t3      t4\n迭代 i+2:                  load    wait    dot\n迭代 i+1:          load    wait    dot\n迭代 i  :  load    wait    dot\n                    ↑ 同一时刻(t2)：迭代i在dot、迭代i+1在wait、迭代i+2在load",
+      "elide": [
+        "这是 illustrator 要重绘的核心时空图；II（发起间隔）/ steady state 的严格定义待核·回指 DOI:10.1145/53990.54022，此处只用重叠直觉"
+      ]
+    }
+  ],
+  "key_classes": [
+    {
+      "name": "PipelinePass (TritonGPUPipeline)",
+      "file": "lib/Dialect/TritonGPU/Transforms/Pipeliner/SoftwarePipeliner.cpp",
+      "responsibility": "pass 入口：walk 所有 scf.for，对 num_stages>1 的循环调 pipelineLoop（建模→展开）；num_stage<=1 直接跳过"
+    },
+    {
+      "name": "CoarseSchedule",
+      "file": "include/triton/Dialect/TritonGPU/Transforms/Schedule.h",
+      "responsibility": "模调度的数据结构：一张 op → (stage, cluster) 表；numStages 是深度、clusters 是同 stage 内顺序分组；createFinalSchedule 拍平成 (op, stage) 序列交展开器"
+    },
+    {
+      "name": "preProcessLoopAndGetSchedule",
+      "file": "lib/Dialect/TritonGPU/Transforms/Pipeliner/MatmulLoopPipeline.cpp",
+      "responsibility": "建模半的总装：scheduleLoads 给 op 分 stage → createAsyncOps 把 load 换成异步 + 开 numBuffers 份 buffer → createFinalSchedule；设 peelEpilogue=false"
+    },
+    {
+      "name": "LoopPipelinerInternal",
+      "file": "lib/Dialect/TritonGPU/Transforms/Pipeliner/PipelineExpander.cpp",
+      "responsibility": "展开半的实现：拿排期表把循环重写成 prologue（填流水，maxStage-1 段）+ 稳态 kernel loop + epilogue（排空，maxStage-1 段）"
+    }
+  ],
+  "data_flow": [
+    "1. tl.range(..., num_stages=N) 的 N 一路下降成 scf.for 上的 tt.num_stages 属性（ch04/ch17 已讲）→ SoftwarePipeliner.cpp:getNumStagesOrDefault 读出来",
+    "2. runOnOperation：num_stages<=1 的循环跳过（关流水线）；>1 的收集进 loops，逐个 pipelineLoop",
+    "3. 建模（preProcessLoopAndGetSchedule）：scheduleLoads 给每个 op 分 stage——dot（root use）放最后 stage numStages-1、喂它的 load 放前面 stage，二者 stage 差记为 distToUse",
+    "4. createAsyncOps：numBuffers = max(distToUse)；createAlloc 把每个 load 的 tile 首维扩成 distance=numBuffers 份 → 共享内存里 N 份 buffer 环形缓冲",
+    "5. createAsyncCopy：把 tt.load 换成 AsyncCopyGlobalToLocal（cp.async 异步发起）+ AsyncCommitGroup + AsyncWait（用时才等）；写第 insertIdx 格、dot 读第 extractIdx 格",
+    "6. createFinalSchedule：CoarseSchedule 二维表 → 拍平成 (op, stage) 序列",
+    "7. 展开（pipelineForLoop 五步）：emitPrologue 灌满流水线（maxStage-1 段）→ analyzeCrossStageValues 识别跨 stage 存活值（走 iter_args）→ createKernelLoop/createKernel 造稳态循环体（一次迭代含所有 stage 的 op）→ (peelEpilogue 时) emitEpilogue 排空 → erase 原循环",
+    "8. asyncLaunchDots：MMAv3 dot 的 wait 后处理（细节 ch30）"
+  ],
+  "design_decisions": [
+    {
+      "decision": "软件流水线器拆成两半：建模（create modulo schedule）+ 展开（expander emits prologue/epilogue）",
+      "why": "分离关注点——建模只管『每个 op 属于哪个 stage』（策略），展开只管『把排期表机械地重写成三段式循环』（机制）；换调度策略不必动展开器",
+      "evidence": "lib/Dialect/TritonGPU/Transforms/Pipeliner/SoftwarePipeliner.cpp:19-27"
+    },
+    {
+      "decision": "stage 之外再引入 cluster 维度，op → (stage, cluster)",
+      "why": "stage 决定『差几个迭代执行』（跨迭代维度），cluster 决定『同一迭代内谁先谁后』（迭代内顺序）；两个正交维度分开表达调度自由度",
+      "evidence": "include/triton/Dialect/TritonGPU/Transforms/Schedule.h:69-78"
+    },
+    {
+      "decision": "num_stages<=1 直接 bail 不流水",
+      "why": "深度 1 = 没有『提前的迭代』，无从跨迭代重叠；这就是 num_stages=1 等于关掉流水线的实现根据",
+      "evidence": "lib/Dialect/TritonGPU/Transforms/Pipeliner/SoftwarePipeliner.cpp:112-116"
+    },
+    {
+      "decision": "buffer 份数取所有 load 的 max(distToUse)，不逐 load 精细分配",
+      "why": "简化实现（源码 TODO 承认可更细粒度）；用最大距离统一开 buffer，保证任何 load 从发起到被用都有足够的在飞 buffer 不被覆盖",
+      "evidence": "lib/Dialect/TritonGPU/Transforms/Pipeliner/MatmulLoopPipeline.cpp:940-955"
+    },
+    {
+      "decision": "buffer 首维扩成 distance 维做环形缓冲（多 buffer）",
+      "why": "预取 distance 个迭代的数据同时在飞，就必须有 distance 份物理存储轮转——这是『深度→共享内存份数』代价的物理落点",
+      "evidence": "lib/Dialect/TritonGPU/Transforms/Pipeliner/MatmulLoopPipeline.cpp:775-790"
+    },
+    {
+      "decision": "把同步 tt.load 换成 AsyncCopyGlobalToLocal（cp.async）+ 延后的 AsyncWait",
+      "why": "异步发起后线程不阻塞、可继续算上一轮 dot，直到真正要用数据才 wait——这是『用计算盖住访存延迟』的硬件落点",
+      "evidence": "lib/Dialect/TritonGPU/Transforms/Pipeliner/MatmulLoopPipeline.cpp:87-110"
+    },
+    {
+      "decision": "Triton matmul 建模设 peelEpilogue=false",
+      "why": "选择不物理剥离 epilogue、改用谓词化（predicate）在稳态循环内收尾——减少代码膨胀；展开器两条路都支持（options.peelEpilogue 控制）",
+      "evidence": "lib/Dialect/TritonGPU/Transforms/Pipeliner/MatmulLoopPipeline.cpp:1129"
+    }
+  ],
+  "theory": [
+    "软件流水线（software pipelining）：编译期把循环体重排、跨迭代重叠、生成新循环，让不同迭代的不同 stage 在同一物理循环体里同时在飞。『软件』相对硬件流水线——不靠电路自动重叠，靠编译器变换。源码坐实：SoftwarePipeliner.cpp:19-27 头注释逐字点名 modulo schedule / prologue / epilogue。",
+    "模调度（modulo schedule，C 档 Lam 1988 DOI:10.1145/53990.54022 奠基）：给循环体每个 op 分配 stage，使稳态循环体一次迭代同时含所有 stage 的 op。Triton 的落地 = CoarseSchedule 的 op→(stage,cluster) 表。",
+    "prologue（序幕）/ epilogue（尾声）：稳态循环两端各 maxStage-1 段『不完整』迭代——prologue 逐段填满流水线（第 i 段只跑 stage[op]<=i 的 op），epilogue 逐段排空。源码坐实：PipelineExpander.cpp:90-92 / 107-110。",
+    "落地闭环（可逐算式核）：num_stages ↑ → load 与 dot 的 stage 差 distToUse ↑ → numBuffers=max(distToUse) ↑ → createAlloc 的 distance 维 ↑ → 共享内存里多一份 tile 大小 buffer。多一个 stage = 多一份 buffer。",
+    "代价—收益权衡（perf_payoff）：收益——深度大→在飞迭代多→更长访存延迟被更多 dot 盖住（访存受限循环提吞吐）；代价——每多一 stage 多一份共享内存 buffer + 更多跨 stage 存活值占寄存器，共享内存/寄存器超预算 → occupancy 掉（ch26 的尺）或 spill，甚至编译失败。故 num_stages 有最优值、是 autotuner 关键 config。",
+    "诚实边界：经典模调度的 initiation interval（II，发起间隔）与 steady state（稳态）两词 grep 整个 Pipeliner/ 目录未命中源码；本包无联网，不给 II 定义/下界公式/模调度伪码，一律标『待核·回指 DOI:10.1145/53990.54022（Lam 1988）/ DOI:10.1145/192724.192731（Allan 1995 综述）』，正文只用教科书级重叠直觉。"
+  ],
+  "subtraction_plan": {},
+  "mechanisms": [
+    {
+      "id": "two-piece-architecture",
+      "name": "软件流水线器 = 建模（modulo schedule）+ 展开（expander emits prologue/epilogue）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "lib/Dialect/TritonGPU/Transforms/Pipeliner/SoftwarePipeliner.cpp:L19-L27",
+        "lib/Dialect/TritonGPU/Transforms/Pipeliner/SoftwarePipeliner.cpp:L73-L94"
+      ],
+      "paper_origin": {
+        "paper": "https://doi.org/10.1145/192724.192731",
+        "sections": [
+          "§2.1",
+          "SoftwarePipeliner.cpp", ":19–27"
+        ]
+      },
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "modulo-schedule-spacetime",
+      "name": "模调度的时空直觉：把循环体切 stage，让不同迭代的不同 stage 同一时间片并行（跨迭代重叠隐藏访存延迟）",
+      "kind": "algorithm",
+      "source_anchors": [
+        "lib/Dialect/TritonGPU/Transforms/Pipeliner/SoftwarePipeliner.cpp:L19-L27"
+      ],
+      "paper_origin": {
+        "paper": "https://doi.org/10.1145/53990.54022",
+        "sections": [
+          "§2.2",
+          "Lam 1988", "DOI:10.1145/53990.54022"
+        ]
+      },
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "coarse-schedule-stage-cluster",
+      "name": "CoarseSchedule 排期表：op → (stage, cluster)；stage=差几个迭代、cluster=同迭代内顺序；createFinalSchedule 拍平成 (op,stage)",
+      "kind": "dataflow",
+      "source_anchors": [
+        "include/triton/Dialect/TritonGPU/Transforms/Schedule.h:L69-L78",
+        "lib/Dialect/TritonGPU/Transforms/Pipeliner/Schedule.cpp:L45-L70",
+        "lib/Dialect/TritonGPU/Transforms/Pipeliner/Schedule.cpp:L72-L80"
+      ],
+      "paper_origin": {
+        "paper": "https://doi.org/10.1145/53990.54022",
+        "sections": [
+          "§2.3"
+        ]
+      },
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "num-stages-source-and-bail",
+      "name": "num_stages 从哪来 + <=1 即关流水线：getNumStagesOrDefault 读 kNumStagesAttrName，runOnOperation 对 <=1 bail",
+      "kind": "config",
+      "source_anchors": [
+        "lib/Dialect/TritonGPU/Transforms/Pipeliner/SoftwarePipeliner.cpp:L100-L108",
+        "lib/Dialect/TritonGPU/Transforms/Pipeliner/SoftwarePipeliner.cpp:L112-L116"
+      ],
+      "paper_origin": {
+        "paper": "https://doi.org/10.1145/192724.192731",
+        "sections": [
+          "§3.1"
+        ]
+      },
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "async-copy-triple",
+      "name": "异步预取三件套：createAsyncCopy 把 tt.load 换成 AsyncCopyGlobalToLocal(cp.async)+AsyncCommitGroup+AsyncWait，写 buffer 第 insertIdx 格",
+      "kind": "protocol",
+      "source_anchors": [
+        "lib/Dialect/TritonGPU/Transforms/Pipeliner/MatmulLoopPipeline.cpp:L87-L110"
+      ],
+      "paper_origin": {
+        "paper": "https://doi.org/10.1145/192724.192731",
+        "sections": [
+          "§3.2"
+        ]
+      },
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "stage-assignment-distToUse",
+      "name": "stage 分配与距离：scheduleLoads 把 dot（root use）放 numStages-1、load 放前面 stage，distToUse = use.stage - load.stage",
+      "kind": "algorithm",
+      "source_anchors": [
+        "lib/Dialect/TritonGPU/Transforms/Pipeliner/MatmulLoopPipeline.cpp:L568-L597"
+      ],
+      "paper_origin": {
+        "paper": "https://doi.org/10.1145/53990.54022",
+        "sections": [
+          "§3.2"
+        ]
+      },
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "multi-buffer-ring",
+      "name": "深度→buffer 份数：createAlloc 扩 distance 维成环形缓冲，numBuffers=max(distToUse)（多一 stage 多一份 tile 共享内存）",
+      "kind": "layout",
+      "source_anchors": [
+        "lib/Dialect/TritonGPU/Transforms/Pipeliner/MatmulLoopPipeline.cpp:L775-L790",
+        "lib/Dialect/TritonGPU/Transforms/Pipeliner/MatmulLoopPipeline.cpp:L940-L955"
+      ],
+      "paper_origin": {
+        "paper": "https://doi.org/10.1145/192724.192731",
+        "sections": [
+          "§3.2",
+          "附 C：key_figures"
+        ]
+      },
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "prologue-epilogue-expansion",
+      "name": "展开成三段：pipelineForLoop 五步——emitPrologue 填流水（maxStage-1 段，stages[op]>i 跳过）+ 稳态 kernel loop + emitEpilogue 排空",
+      "kind": "algorithm",
+      "source_anchors": [
+        "lib/Dialect/TritonGPU/Transforms/Pipeliner/PipelineExpander.cpp:L90-L92",
+        "lib/Dialect/TritonGPU/Transforms/Pipeliner/PipelineExpander.cpp:L107-L110",
+        "lib/Dialect/TritonGPU/Transforms/Pipeliner/PipelineExpander.cpp:L305-L307",
+        "lib/Dialect/TritonGPU/Transforms/Pipeliner/PipelineExpander.cpp:L789-L841"
+      ],
+      "paper_origin": {
+        "paper": "https://doi.org/10.1145/192724.192731",
+        "sections": [
+          "§3.3"
+        ]
+      },
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "perf-payoff-tradeoff",
+      "name": "落地权衡：num_stages 调大藏延迟（收益）vs 调多爆共享内存/寄存器（代价）——回指 ch26 共享内存预算/occupancy",
+      "kind": "config",
+      "source_anchors": [
+        "lib/Dialect/TritonGPU/Transforms/Pipeliner/MatmulLoopPipeline.cpp:L775-L790",
+        "lib/Dialect/TritonGPU/Transforms/Pipeliner/MatmulLoopPipeline.cpp:L940-L955"
+      ],
+      "paper_origin": {
+        "paper": "https://doi.org/10.1145/192724.192731",
+        "sections": [
+          "§4"
+        ]
+      },
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    }
+  ],
+  "key_figures": [
+    {
+      "fig": "spacetime-serial-vs-pipelined",
+      "arxiv": "DOI:10.1145/53990.54022",
+      "shows": "迭代×stage 时空图：朴素串行（每迭代 load→wait→dot 顺序做完，Tensor Core 大段空转）对比软件流水线稳态（同一时间片里迭代 i 在 dot、i+1 在 wait、i+2 在 load 三色并行）",
+      "why_essential": "全章唯一把『num_stages 到底调度了什么』画成一张图的地方——跨迭代重叠的直觉不靠这张时空图讲不清；源码头注释 SoftwarePipeliner.cpp:19-27 点名的 modulo schedule 就是这张图的形式化",
+      "target_section": "§29.2.2"
+    },
+    {
+      "fig": "shared-mem-ring-buffer",
+      "arxiv": "DOI:10.1145/192724.192731",
+      "shows": "num_stages=N 时共享内存里 [distance=N, BLOCK_M, BLOCK_K] 环形缓冲：第 i 次迭代 AsyncCopy 写 insertIdx=i%N 格、dot 从 extractIdx 格读，N 份 buffer 首尾轮转；旁注『多一 stage=多一份 tile 共享内存』",
+      "why_essential": "把『深度→buffer 份数→共享内存预算』代价闭环画实——解释 num_stages 调多了为何爆共享内存/寄存器，是本章 perf_payoff 落点图；锚 createAlloc(:775-790) 扩 distance 维",
+      "target_section": "§29.3.2"
+    }
+  ],
+  "foreshadow_due": {
+    "应埋伏笔": [],
+    "应回收": [],
+    "note": "bible.py due ch29 返回空——本章无伏笔埋/回收"
+  }
+}

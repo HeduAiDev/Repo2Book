@@ -1,0 +1,260 @@
+{
+  "chapter_id": "ch29",
+  "slug": "ch29-software-pipelining-primer",
+  "kind": "primer",
+  "note": "primer 原理章,无精简版(skip_impl)。所有数值经 explainer/traces/derive_schedule.py 复算(纯 Python 逐字搬源码分配公式,非跑 Triton),原始输出 explainer/traces/derive_schedule.out.json。stage/buffer/段数全部源码坐实并标 file:Lxxx;延迟隐藏的时间单位(t_load/t_dot)是教学模型,已显式标注;II/steady-state 严格式无源码坐实,一律标待核·回指 DOI:10.1145/53990.54022(Lam 1988)。",
+  "symbol_table": [
+    {
+      "symbol": "num_stages (numStages)",
+      "meaning": "流水线深度——把循环体切成几级 stage;也就是最多预取几次未来迭代的 load。你在 tl.range(num_stages=N) 写的 N,一路降成 scf.for 的 tt.num_stages 属性",
+      "first_use": "§1 动机 / §3.1",
+      "source": "SoftwarePipeliner.cpp:100-108(getNumStagesOrDefault)"
+    },
+    {
+      "symbol": "stage",
+      "meaning": "一个 op 属于流水线第几级(0..numStages-1)——决定它比它的消费者提前几个迭代执行。load 放前面 stage(提前预取)、dot 放最后 stage",
+      "first_use": "§2.3",
+      "source": "Schedule.h:69-78(opToStageAndCluster)"
+    },
+    {
+      "symbol": "cluster",
+      "meaning": "同一 stage 内部 op 的执行先后分组(一个有序 list)。stage 管『差几个迭代』,cluster 管『同一迭代内谁先谁后』——两个正交的调度维度",
+      "first_use": "§2.3",
+      "source": "Schedule.h:69-78"
+    },
+    {
+      "symbol": "distToUse",
+      "meaning": "一个 load 从发起到被 dot 用,跨了几个 stage = dot.stage − load.stage。直取 load(无间接寻址)时它就等于 numStages−1",
+      "first_use": "§3.2",
+      "source": "MatmulLoopPipeline.cpp:596-597"
+    },
+    {
+      "symbol": "numBuffers (distance)",
+      "meaning": "共享内存里要开几份 tile buffer 轮转 = 所有 load 里 distToUse 的最大值(MMAv3 再 +1)。createAlloc 把它插进 buffer 首维,做成环形缓冲",
+      "first_use": "§3.2",
+      "source": "MatmulLoopPipeline.cpp:940-955(numBuffers)、:775-790(distance 维)"
+    },
+    {
+      "symbol": "maxStage",
+      "meaning": "排期里最大的 stage 下标 = numStages−1。prologue/epilogue 各跑 maxStage 个『部件』来填满/排空流水线",
+      "first_use": "§3.3",
+      "source": "PipelineExpander.cpp:90-92 注释 + :287 循环 for i in [0, maxStage)"
+    },
+    {
+      "symbol": "stagesBetweenLoads",
+      "meaning": "相邻两级间接寻址 load 之间隔几个 stage = ceil(numStages−2, maxIndirectionLevel+1)。直取 load(maxIndirectionLevel=0)时 = numStages−2",
+      "first_use": "§3.2",
+      "source": "MatmulLoopPipeline.cpp:565-566"
+    },
+    {
+      "symbol": "insertIdx / extractIdx",
+      "meaning": "环形 buffer 的写格 / 读格:第 i 次迭代的 AsyncCopy 写进 insertIdx 格、dot 从 extractIdx 格读,N 份 buffer 首尾轮转",
+      "first_use": "§3.2",
+      "source": "MatmulLoopPipeline.cpp:87-110(copyOffsets[0]=insertIdx)"
+    },
+    {
+      "symbol": "II (initiation interval,发起间隔)",
+      "meaning": "经典模调度里相邻两个迭代『发起』的固定时间间隔(稳态吞吐的倒数)。Triton 的 pipeliner 是 stage-based、并不显式算 II——此词 grep 整个 Pipeliner/ 目录未命中源码,严格定义与下界公式待核·回指 DOI:10.1145/53990.54022(Lam 1988)",
+      "first_use": "§2.2(仅作理论背景一句带过)",
+      "source": "待核·回指 DOI:10.1145/53990.54022;源码不出现该词"
+    },
+    {
+      "symbol": "steady state(稳态)",
+      "meaning": "填满流水线后、每个时间片都满并发(num_stages 个迭代各占一个 stage)的那段循环体。严格定义待核·回指 DOI:10.1145/192724.192731(Allan 1995 综述),源码不出现该词",
+      "first_use": "§2.2",
+      "source": "待核·回指 DOI:10.1145/192724.192731;源码不出现该词"
+    }
+  ],
+  "mechanisms": [
+    {
+      "mechanism_id": "modulo-schedule-spacetime",
+      "intuition": "像洗车流水线的三个工位(冲水→打泡→擦干):不是一辆车走完三工位、下一辆才开进来,而是三辆车各占一个工位同时动。软件流水线把循环体切成 stage,让不同迭代的不同 stage 在同一个时间片里并行——第 i 次的 dot 正在算的同时,异步引擎已经在给第 i+2 次搬数据,长长的 load 延迟就被别的迭代的 dot 盖住了。",
+      "worked_example": {
+        "params": {
+          "num_stages": 3,
+          "stages": "stage0=发起 load(异步引擎)、stage1=wait+取数、stage2=dot(Tensor Core)",
+          "num_iters": 5,
+          "rule": "迭代 k 的 stage s 落在时间片 t = k + s(错开一个 stage 一个时间片)"
+        },
+        "trace_source": "manual",
+        "manual_reason": "primer 章无精简版:真正的模调度跑在 Triton MLIR 的 TritonGPUPipeline pass 内,需完整 LLVM/MLIR 构建 + GPU 才能跑通。时空表由 stage 分配规则(load@stage0、dot@stage numStages-1,MatmulLoopPipeline.cpp:576/590)手工推演,并经 explainer/traces/derive_schedule.py 的 spacetime() 复算(输出见 derive_schedule.out.json 的 spacetime_ns3_it5,steady_slices=[2,3,4])。时间片是逻辑排期格、非硬件 cycle。",
+        "table": {
+          "columns": ["时间片 t", "stage0 load(异步引擎)", "stage1 wait+取数", "stage2 dot(Tensor Core)", "同时在飞的迭代数", "阶段"],
+          "rows": [
+            ["t0", "迭代0", "—", "—", "1", "prologue 填流水"],
+            ["t1", "迭代1", "迭代0", "—", "2", "prologue 填流水"],
+            ["t2", "迭代2", "迭代1", "迭代0", "3", "稳态(满并发)"],
+            ["t3", "迭代3", "迭代2", "迭代1", "3", "稳态(满并发)"],
+            ["t4", "迭代4", "迭代3", "迭代2", "3", "稳态(满并发)"],
+            ["t5", "—", "迭代4", "迭代3", "2", "epilogue 排空"],
+            ["t6", "—", "—", "迭代4", "1", "epilogue 排空"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "进入稳态后,每个时间片恰好有 num_stages 个不同迭代各占一个不同 stage——三种硬件资源(异步引擎/共享内存/Tensor Core)同时被三个迭代占满,每个时间片恰好完成 1 个 dot(吞吐 = 1 迭代/片)。",
+        "argument": "基例:t0 只有迭代0 在 stage0,并发=1。归纳步:每前进一个时间片,最前沿迭代进下一 stage、同时一个新迭代进 stage0,并发 +1,直到 num_stages-1 片后并发达到 num_stages(t2,见表)并保持恒定;这段就是稳态。排期规则 t=k+s 保证同一 t 上各 (k,s) 的 s 两两不同(因 k 不同),故同一时间片内每个 stage 至多一个迭代——资源无冲突。"
+      },
+      "quantified": "取 load 延迟 t_load=4、dot t_dot=1(教学单位)。朴素串行每迭代顺序做完 = t_load+t_dot = 5 个单位;num_stages=3 的稳态每迭代 = t_dot + max(0, t_load-(num_stages-1)*t_dot) = 1+max(0,4-2) = 3 个单位(derive_schedule.out.json latency_scan[num_stages=3])。同一循环体每迭代 5→3,稳态并发从 1 升到 3。",
+      "figure_specs": [
+        {
+          "figure_id": "spacetime-serial-vs-pipelined",
+          "claim": "软件流水线让不同迭代的不同 stage 在同一时间片并行——num_stages=3 稳态里 t2 时刻迭代0在 dot、迭代1在 wait、迭代2在 load 三色并行,长 load 延迟被别的迭代的 dot 盖住。",
+          "template": "swimlane",
+          "numbers": [
+            {"label": "num_stages(泳道数=stage 数)", "value": "3", "provenance": "本例选定参数;stage 语义 Schedule.h:69-78"},
+            {"label": "稳态满并发迭代数", "value": "3", "provenance": "derive_schedule.out.json spacetime_ns3_it5.slots[t2].num_concurrent=3"},
+            {"label": "稳态时间片", "value": "t2,t3,t4", "provenance": "derive_schedule.out.json spacetime_ns3_it5.steady_slices=[2,3,4]"},
+            {"label": "串行每迭代耗时", "value": "5 单位", "provenance": "derive_schedule.out.json latency_scan[num_stages=1].steady_per_iter=5(t_load=4+t_dot=1)"},
+            {"label": "流水线稳态每迭代耗时", "value": "3 单位", "provenance": "derive_schedule.out.json latency_scan[num_stages=3].steady_per_iter=3"}
+          ],
+          "caption_draft": "上半朴素串行:每迭代 load→wait→dot 顺序做完才进下一次,Tensor Core 大段空转(每迭代 5 单位);下半软件流水线稳态:同一时间片里迭代 i 在 dot、i+1 在 wait、i+2 在 load 三色并行,每迭代降到 3 单位。这张『迭代×stage』时空图就是 SoftwarePipeliner.cpp:19-27 头注释所说 modulo schedule 的形式化——num_stages 到底调度了什么,一图看懂。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "stage-assignment-distToUse",
+      "intuition": "像排班表定谁提前几班到岗:dot 是压轴的最后一班(stage numStages-1),喂它的 load 得排在前面的班次提前把料备好,两者相差的班次数就是 distToUse。班次差越大,越早开始备料、越能藏住备料的耗时。",
+      "worked_example": {
+        "params": {
+          "load_type": "直取 load(indirection level = 0,喂 dot 的 A/B tile)",
+          "maxIndirectionLevel": 0,
+          "formula": "stagesBetweenLoads=ceil(numStages-2,1)=numStages-2;dot.stage=numStages-1;load.stage=(0-0)*stagesBetweenLoads=0;distToUse=dot.stage-load.stage"
+        },
+        "trace_source": "manual",
+        "manual_reason": "primer 无精简版;stage 分配由 scheduleLoads 的源码算式(MatmulLoopPipeline.cpp:565-566 stagesBetweenLoads、:576 dot 放 numStages-1、:590 load stage、:596-597 distToUse)手工代入,经 derive_schedule.py 的 derive() 复算(输出 schedule_by_num_stages)。",
+        "table": {
+          "columns": ["num_stages", "stagesBetweenLoads (=numStages-2)", "load 的 stage", "dot 的 stage (=numStages-1)", "distToUse (=dot-load)"],
+          "rows": [
+            ["2", "0", "0", "1", "1"],
+            ["3", "1", "0", "2", "2"],
+            ["4", "2", "0", "3", "3"],
+            ["5", "3", "0", "4", "4"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "直取 load 恒落在 stage 0、dot 恒落在 stage numStages-1,故 distToUse = numStages-1 ≥ 1——load 永远严格早于 dot(否则无从预取),且每加深一个 stage,distToUse 精确 +1。",
+        "argument": "基例 numStages=2:load@0、dot@1,distToUse=1>0。归纳步:load.stage=(maxIndirectionLevel-indLevel)*stagesBetweenLoads,直取时 maxIndirectionLevel=indLevel=0 → load.stage≡0 与 numStages 无关;dot.stage=numStages-1 随 numStages 每 +1。二者相减 distToUse=numStages-1,单调递增、恒 ≥1。表中 2/3/4/5 → 1/2/3/4 逐一坐实。"
+      },
+      "quantified": "distToUse(numStages) = numStages - 1,是一条斜率 1 的直线。这就是下游 numBuffers 与共享内存份数随 num_stages 线性增长的根:distToUse 每涨 1,buffer 就多 1 份。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "multi-buffer-ring",
+      "intuition": "像旋转寿司的环形传送带:N 个盘位首尾相接轮转,厨师往空盘装菜(insertIdx=i%N)、食客从满盘取(extractIdx)。要让 N 次未来迭代的数据同时在飞,就得有 N 份物理盘位轮流用——预取多深,盘位就得多几份。",
+      "worked_example": {
+        "params": {
+          "block": "BLOCK_M=BLOCK_N=128, BLOCK_K=32, dtype=fp16(2 字节)",
+          "per_buffer": "一份 buffer = 一个 A tile(128×32×2=8KB)+ 一个 B tile(32×128×2=8KB)= 16KB",
+          "formula": "numBuffers=max(distToUse)=numStages-1(直取,非 MMAv3);MMAv3 再 +1 → numStages;共享内存=numBuffers×16KB"
+        },
+        "trace_source": "manual",
+        "manual_reason": "primer 无精简版;numBuffers 由 createAsyncOps 的 max(distToUse)(MatmulLoopPipeline.cpp:940-955)+ createAlloc 扩 distance 维(:775-790)手工代入,经 derive_schedule.py derive() 复算(schedule_by_num_stages 的 num_buffers_ampere/num_buffers_mmav3/smem_KB_ampere);tile 字节数用本例选定的 block 尺寸算,非源码常量。",
+        "table": {
+          "columns": ["num_stages", "distToUse", "numBuffers(非 MMAv3=distToUse)", "共享内存(numBuffers×16KB)", "numBuffers(MMAv3=+1)"],
+          "rows": [
+            ["2", "1", "1", "16KB", "2"],
+            ["3", "2", "2", "32KB", "3"],
+            ["4", "3", "3", "48KB", "4"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "numBuffers 随 num_stages 单调递增,每加深一个 stage 精确多一份 tile 大小的共享内存 buffer(非 MMAv3:numBuffers=numStages-1;MMAv3:numStages)——这就是『多一个 stage = 多一份 buffer』的算式落点。",
+        "argument": "numBuffers=max_load(distToUse);上一机制已证直取 load 的 distToUse=numStages-1 单调 +1/stage,取 max 后不改单调性。createAlloc 把 buffer 首维扩成 distance=numBuffers(:775-790),故物理共享内存 = numBuffers × 单份 tile 字节,随 numBuffers 线性。表中 numBuffers 2→3→4 对应共享内存 16→32→48KB,步长恒为一份 tile(16KB)。"
+      },
+      "quantified": "本例 smem(numStages) = (numStages-1) × 16KB(非 MMAv3 直取)。num_stages=2→16KB、=3→32KB、=4→48KB;每 +1 stage 固定 +16KB。这是 num_stages 调多爆共享内存的定量根据(共享内存预算尺见第 26 章)。",
+      "figure_specs": [
+        {
+          "figure_id": "shared-mem-ring-buffer",
+          "claim": "num_stages 深度直接决定共享内存里几份 tile buffer 环形轮转:非 MMAv3 直取时 numBuffers=num_stages-1,第 i 次迭代 AsyncCopy 写 insertIdx=i%numBuffers 格、dot 从 extractIdx 格读,首尾轮转;每加一个 stage 多一份 tile 共享内存。",
+          "template": "layout",
+          "numbers": [
+            {"label": "本例 num_stages", "value": "4", "provenance": "本例选定;取 4 使环有 3 格便于画环"},
+            {"label": "numBuffers(=distToUse,非 MMAv3)", "value": "3", "provenance": "derive_schedule.out.json schedule_by_num_stages[num_stages=4].num_buffers_ampere=3"},
+            {"label": "写格 insertIdx", "value": "i % 3", "provenance": "MatmulLoopPipeline.cpp:87-110 copyOffsets[0]=insertIdx"},
+            {"label": "单份 buffer 字节", "value": "16KB (A 8KB + B 8KB)", "provenance": "本例 BLOCK_M=BLOCK_N=128,BLOCK_K=32,fp16;derive_schedule.out.json per_buffer_KB=16"},
+            {"label": "总共享内存", "value": "48KB", "provenance": "derive_schedule.out.json schedule_by_num_stages[num_stages=4].smem_KB_ampere=48"},
+            {"label": "MMAv3 时 numBuffers", "value": "4", "provenance": "derive_schedule.out.json schedule_by_num_stages[num_stages=4].num_buffers_mmav3=4(+1,:948-954)"}
+          ],
+          "caption_draft": "num_stages=4(非 MMAv3 直取)时共享内存里 3 份 [BLOCK_M,BLOCK_K] tile 组成环形缓冲:第 i 次迭代 cp.async 写 insertIdx=i%3 格、dot 从 extractIdx 格读,3 份首尾轮转。每份 16KB(A+B),共 48KB;每加深一个 stage 多一份 tile——这就是 num_stages 调多爆共享内存的物理落点(createAlloc 扩 distance 维,MatmulLoopPipeline.cpp:775-790)。注:Hopper MMAv3 会再 +1 份。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "prologue-epilogue-expansion",
+      "intuition": "像工厂开工与收工:早班工人先到、逐个把设备预热灌满(prologue 填流水线),没到齐前产线不满负荷;下班时最后几件在制品还得留人做完(epilogue 排空)。中间满负荷那段就是稳态。prologue 和 epilogue 各要 num_stages-1 段『不完整』的迭代来填和排。",
+      "worked_example": {
+        "params": {
+          "num_stages": 3,
+          "maxStage": 2,
+          "rule": "emitPrologue 的 for i in [0, maxStage):第 i 段只发射 stages[op] ≤ i 的 op(stages[op] > i 就 continue 跳过)",
+          "stage_map": "load@stage0、wait@stage1、dot@stage2"
+        },
+        "trace_source": "manual",
+        "manual_reason": "primer 无精简版;prologue 逐段发射由 PipelineExpander.cpp:287(for i in [0,maxStage))+ :305-307(stages[op]>i 跳过)手工推演。maxStage=numStages-1=2,故 prologue/epilogue 各 2 段(源码注释称 'maxStage-1 part',其 maxStage 指 stage 总数=numStages,即段数=numStages-1);经 derive_schedule.py derive() 复算(schedule_by_num_stages[num_stages=3].prologue_parts=2)。",
+        "table": {
+          "columns": ["阶段", "部件 i", "发射条件 stages[op]≤i", "本段新发射的 (迭代, stage)", "累计在飞迭代"],
+          "rows": [
+            ["prologue", "i=0", "只发 stage≤0", "(迭代0, load)", "1"],
+            ["prologue", "i=1", "发 stage≤1", "(迭代1, load) + (迭代0, wait)", "2"],
+            ["稳态 kernel loop", "每趟", "发全部 stage 0..2", "第 k 趟:(k+2,load)+(k+1,wait)+(k,dot)", "3(满)"],
+            ["epilogue", "i=0", "发 stage≥1(排空)", "(末-1, wait)+(末-2, dot)…", "2"],
+            ["epilogue", "i=1", "发 stage≥2", "(末, dot)", "1"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "prologue 的第 i 段把在飞迭代数从 i 提到 i+1,跑完 maxStage(=numStages-1)段后流水线恰好填满(在飞=numStages);epilogue 对称地 numStages-1 段把在飞数从 numStages-1 降到 0。填与排的段数都恰是 numStages-1。",
+        "argument": "prologue 基例 i=0:条件 stages[op]≤0 只放行 stage0(load),在飞=1。归纳步:第 i 段放行 stages[op]≤i,比第 i-1 段多放行 stage=i 的 op(即多推进最老那个迭代一格、并新起一个迭代的 load),在飞 +1。for i in [0,maxStage) 跑 maxStage 段后在飞=maxStage+... 达到 numStages。epilogue 是时间反演的同一归纳(条件 stages[op]≥i+1),段数同为 numStages-1。num_stages=3 → 各 2 段,与表一致。"
+      },
+      "quantified": "prologue 段数 = epilogue 段数 = numStages-1 = maxStage。num_stages=3 → 各 2 段(derive_schedule.out.json prologue_parts=epilogue_parts=2);num_stages=5 → 各 4 段。深度越大,填/排的『不完整』迭代越多——这是深度的固定开销(短循环里 prologue/epilogue 占比会显著,故 num_stages 不宜盲目调大)。注:Triton matmul 建模设 peelEpilogue=false(MatmulLoopPipeline.cpp:1129),用谓词化在稳态循环内收尾而非物理剥离 epilogue,展开器两条路都支持。",
+      "figure_specs": [
+        {
+          "figure_id": "prologue-steady-epilogue",
+          "claim": "展开器把循环重写成三段:prologue 用 numStages-1 段逐格灌满流水线(在飞 1→numStages)、稳态 kernel loop 满并发运转、epilogue 用 numStages-1 段逐格排空——num_stages=3 时 prologue/epilogue 各 2 段。",
+          "template": "state-table",
+          "numbers": [
+            {"label": "num_stages", "value": "3", "provenance": "本例选定"},
+            {"label": "maxStage(=numStages-1)", "value": "2", "provenance": "derive_schedule.out.json schedule_by_num_stages[num_stages=3].max_stage=2;PipelineExpander.cpp:287"},
+            {"label": "prologue 段数", "value": "2", "provenance": "derive_schedule.out.json schedule_by_num_stages[num_stages=3].prologue_parts=2"},
+            {"label": "epilogue 段数", "value": "2", "provenance": "derive_schedule.out.json schedule_by_num_stages[num_stages=3].epilogue_parts=2"},
+            {"label": "稳态满并发迭代数", "value": "3", "provenance": "= num_stages;derive_schedule.out.json spacetime_ns3_it5.slots[t2].num_concurrent=3"}
+          ],
+          "caption_draft": "pipelineForLoop 把原循环展开成 prologue + 稳态 kernel loop + epilogue 三段(PipelineExpander.cpp:789-841)。prologue 逐段发射 stages[op]≤i 的 op(第 i 段,:305-307),num_stages-1=2 段把在飞迭代从 1 灌到 3(满);稳态每趟同时含所有 stage 的 op;epilogue 对称 2 段排空。填/排各 num_stages-1 段是深度的固定开销——短循环里这段占比不容忽视。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "perf-payoff-tradeoff",
+      "intuition": "加深流水线像加长快递预取链:预取够深,货(数据)总是提前到、厨房(Tensor Core)不缺料停工;但预取越深,仓库(共享内存)囤的货越多。预取到刚好盖住到货延迟就够了——再深不会更快,只是白占仓库。",
+      "worked_example": {
+        "params": {
+          "model": "延迟隐藏教学模型:load 延迟 t_load=4、dot t_dot=1(逻辑单位,非硬件 cycle);深度 s 预取 s-1 个迭代 → dot 前有 (s-1)*t_dot 计算窗口藏 load",
+          "smem": "共享内存 = (s-1)×16KB(本例 BLOCK 尺寸,非 MMAv3)",
+          "formula": "stall/迭代 = max(0, t_load-(s-1)*t_dot);稳态每迭代 = t_dot + stall;恰好盖住的深度 s* = ceil(t_load/t_dot)+1 = 5"
+        },
+        "trace_source": "manual",
+        "manual_reason": "primer 无精简版;stage↔buffer↔共享内存的链是源码坐实的(distToUse=s-1、numBuffers=max(distToUse)、distance 维,MatmulLoopPipeline.cpp:596-597/940-955/775-790),延迟隐藏的时间单位(t_load/t_dot)是教学模型(II/稳态严格式待核·回指 DOI:10.1145/53990.54022)。数值经 derive_schedule.py latency() 复算(latency_scan)。",
+        "table": {
+          "columns": ["num_stages s", "预取窗口 (s-1)×t_dot", "stall/迭代 max(0,4-窗口)", "稳态每迭代耗时 (1+stall)", "共享内存 (s-1)×16KB", "边际"],
+          "rows": [
+            ["1", "0", "4", "5", "0(关流水线)", "无重叠,全空转"],
+            ["2", "1", "3", "4", "16KB", "开始藏延迟"],
+            ["3", "2", "2", "3", "32KB", "继续藏"],
+            ["4", "3", "1", "2", "48KB", "快盖住了"],
+            ["5", "4", "0", "1", "64KB", "延迟全藏住(最优深度 s*)"],
+            ["6", "5", "0", "1", "80KB", "吞吐无收益,只多一份 buffer"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "稳态每迭代耗时随 num_stages 单调不增、在 s*=ceil(t_load/t_dot)+1=5 处触底(stall=0)后恒定不再降;而共享内存随 num_stages 单调恒定 +16KB/stage 无上限——收益边际递减触零、代价边际恒正,故存在最优 num_stages,过之只赔不赚。",
+        "argument": "stall=max(0, t_load-(s-1)*t_dot):括号内随 s 每 +1 减 t_dot=1,单调降;到 (s-1)*t_dot≥t_load(即 s≥5)后被 max 钳在 0,不再降(表中 s=5,6 每迭代同为 1)。共享内存=(s-1)×16KB 无钳制、恒 +16KB/stage(表中 64→80KB)。两条曲线在 s*=5 后一条水平、一条继续爬,交叉即最优:s>s* 时吞吐不涨、共享内存白涨,occupancy 反可能掉(第 26 章的尺)。"
+      },
+      "quantified": "本例最优深度 s* = ceil(t_load/t_dot)+1 = ceil(4/1)+1 = 5:此时 stall 首次归零、每迭代 1 单位(相对串行 5 单位提速 5×);s=6 每迭代仍 1 单位(无收益)却多囤 16KB 共享内存(64→80KB)。真实 s* 取决于访存延迟/tile 大小/数据位宽/目标 SM 共享内存容量——这就是 num_stages 是 autotuner 关键 config 的原因。num_stages 的落地建模细节(indirection 分 stage、MMAv3 async、谓词化收尾)见第 30 章。",
+      "figure_specs": []
+    }
+  ]
+}
