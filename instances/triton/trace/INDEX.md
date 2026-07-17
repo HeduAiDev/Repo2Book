@@ -5,6 +5,7 @@
 ## Recent Activity
 
 | Date | Type | Chapter | Summary | File |
+| 2026-07-17 | delivery | 34 | ch34《共享内存降级与全局访存向量化》定稿——Part VII 第三跳,回收 f18 | [2026-07-17_ch34-ch34《共享内存降级与全局访存向量化》定稿——part-vii-第三跳,回收-f18.md](deliveries/2026-07-17_ch34-ch34《共享内存降级与全局访存向量化》定稿——part-vii-第三跳,回收-f18.md) |
 | 2026-07-17 | delivery | ch36 | ch36 CUDABackend 把五段 stages 注入编译管线 定稿 | [2026-07-17_ch36-ch36-cudabackend-把五段-stages-注入编译管线-定稿.md](deliveries/2026-07-17_ch36-ch36-cudabackend-把五段-stages-注入编译管线-定稿.md) |
 | 2026-07-17 | delivery | 31 | ch31《Prefetch、Warp Specialization 与杂项清理 pass》定稿——Part VI 收官 | [2026-07-17_ch31-ch31《prefetch、warp-specialization-与杂项清理-pass》定稿——part-vi-收官.md](deliveries/2026-07-17_ch31-ch31《prefetch、warp-specialization-与杂项清理-pass》定稿——part-vi-收官.md) |
 | 2026-07-17 | delivery | ch33 | ch33 第二跳的地基:类型塌缩与 ConvertLayoutOp 的三条搬运路径 定稿(Part VII) | [2026-07-17_ch33-第二跳的地基-类型塌缩与-convertlayoutop-的三条搬运路径-定稿(part-vii).md](deliveries/2026-07-17_ch33-第二跳的地基-类型塌缩与-convertlayoutop-的三条搬运路径-定稿(part-vii).md) |

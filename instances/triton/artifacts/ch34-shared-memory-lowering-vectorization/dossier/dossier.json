@@ -1,0 +1,295 @@
+{
+  "chapter": "ch34",
+  "title": "共享内存降级与全局访存向量化",
+  "kind": "skip_impl",
+  "pin": "triton v3.2.0 @ 9641643da6c52000c807b5eeed05edaec4402a67",
+  "route_correction_notes": [
+    "计划书说『storeDistributedToShared 把 phase(r) 公式编译成物理偏移算术』。v3.2.0 的实况更精确：storeDistributedToShared(lib/Conversion/TritonGPUToLLVM/Utility.cpp:L403)本身不写模运算——它调 emitTransferBetweenRegistersAndShared(同文件:L266),用 regLayout->invertAndCompose(sharedLayout) 把寄存器布局与共享布局复合,再 applyLinearLayout 生成物理偏移。真正把 phase(r)=⌊r/perPhase⌋ mod maxPhase 烘进偏移的地方是 sharedToLinearLayoutNoLeadingOffset(lib/Dialect/TritonGPU/IR/LinearLayoutConversions.cpp:L369): bases2D.push_back({row,(vec*((row/perPhase)%maxPhase))%numCols}) —— 这是 f18 兑现点①。writer 必须讲成『swizzle 公式被烘进共享 LinearLayout 的基向量,storeDistributedToShared 消费它』,不要说 storeDistributedToShared 自己吐 urem/xor。",
+    "计划书说『LocalLoadOpConversion 的 ldmatrix 加载器喂 dot』。v3.2.0 实况:MemoryOpToLLVM.cpp 里的 LocalLoadOpConversion 走的是通用 LinearLayout 路径(lowerSharedToDistributed→loadSharedToDistributed→普通向量化 load),不发 ldmatrix。真正的 ldmatrix 加载器在 third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ConvertLayoutOpToLLVM/SharedToDotOperandMMAv2.cpp,那里显式写出 phase=urem(udiv(rowInMat,perPhase),maxPhase)(:L162)、contiguousIndexSwizzled=xor_(contiguousIndex,phase)(:L181),再发 ldmatrix.sync.aligned.m8n8.x4(:L355)喂 MMAv2 dot —— 这是 f18 兑现点②(最字面的『phase 公式编译成物理偏移算术』)。writer 讲 ldmatrix 时回指此文件,别说它在 LocalLoadOpConversion 内。两个兑现点都真实、都忠实回收 f18;这是位置更正,不是路线错,故 status=OK。"
+  ],
+  "code_spine": [
+    "lib/Conversion/TritonGPUToLLVM/AllocateSharedMemory.cpp:L23-L52  —— AllocateSharedMemory pass: ModuleAllocation 算 offset,walk 每个 op 钉 allocation.offset i32 属性,模块钉 triton_gpu.shared 总量",
+    "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp:L203-L220  —— initSharedMemory: 建单个 global_smem extern 数组(size-0/External/shared addrspace/16B 对齐)",
+    "include/triton/Conversion/TritonGPUToLLVM/Utility.h:L398-L411  —— getSharedMemoryBase: 读 allocation.offset 属性,gep(i8, stackPointer, offset) 索引 global_smem",
+    "lib/Conversion/TritonGPUToLLVM/MemoryOpToLLVM.cpp:L18-L89  —— LocalAllocOp lowering: 取 SharedEncoding order,建 SharedMemoryObject,lowerDistributedToShared 把初值写进 swizzle 共享内存",
+    "lib/Conversion/TritonGPUToLLVM/Utility.cpp:L403-L424  —— storeDistributedToShared: 调 emitTransferBetweenRegistersAndShared 驱动写入",
+    "lib/Conversion/TritonGPUToLLVM/Utility.cpp:L266-L377  —— emitTransferBetweenRegistersAndShared: regLayout->invertAndCompose(sharedLayout),向量宽=getNumConsecutiveInOut,逐向量 applyLinearLayout 出偏移 gep+回调",
+    "lib/Dialect/TritonGPU/IR/LinearLayoutConversions.cpp:L336-L382  —— sharedToLinearLayoutNoLeadingOffset: phase(r)=⌊r/perPhase⌋ mod maxPhase 烘进 LinearLayout 基(f18 兑现①)",
+    "lib/Conversion/TritonGPUToLLVM/MemoryOpToLLVM.cpp:L104-L227  —— LocalLoadOpConversion: 通用 LinearLayout 读回(loadSharedToDistributed)+Ampere i8/bf16 打包成 i32",
+    "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ConvertLayoutOpToLLVM/SharedToDotOperandMMAv2.cpp:L162-L193  —— ldmatrix 加载器的显式 swizzle: phase=urem(udiv(row,perPhase),maxPhase),xor_ 进列索引(f18 兑现②)",
+    "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ConvertLayoutOpToLLVM/SharedToDotOperandMMAv2.cpp:L350-L358  —— ldmatrix.sync.aligned.m8n8.x4 内联 PTX 喂 dot",
+    "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp:L132-L142  —— getVectorSize = min(128/pointeeBitWidth, getPtrContiguity)(本章 perf 核心)",
+    "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp:L188-L201  —— load 侧 mask alignment 夹: vec=min(vec,getMaskAlignment);vec==1 告警",
+    "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp:L29-L100  —— redundantDataMask: 广播布局下屏蔽复制线程,只让唯一持有者写",
+    "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp:L275-L298  —— load 侧拼 ld.global 内联 PTX: .ca/.cg cache-modifier + L1::evict_first/last + .v(nWords).b(width) + predicate",
+    "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp:L399-L504  —— StoreOpConversion: getVectorSize→mask 夹→redundantDataMask→st.global(.wb/.cg/.cs/.wt + evict + predicate=and_(redundantMask,maskElems))"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "lib/Conversion/TritonGPUToLLVM/AllocateSharedMemory.cpp",
+      "lines": "L23-L52",
+      "code": "  void runOnOperation() override {\n    ModuleOp mod = getOperation();\n    MLIRContext *ctx = &getContext();\n    ModuleAllocation allocation(mod);\n\n    mod.walk([&](FunctionOpInterface funcOp) {\n      funcOp.walk([&](Operation *op) {\n        auto *funcAllocation = allocation.getFuncData(funcOp);\n        auto oBufferId = funcAllocation->getBufferId(op);\n        int offset = -1;\n        if (oBufferId != Allocation::InvalidBufferId)\n          offset = funcAllocation->getOffset(oBufferId);\n        else if (op->getNumResults() == 1) {\n          Value value = op->getResult(0);\n          auto vBufferId = funcAllocation->getBufferId(value);\n          if (vBufferId != Allocation::InvalidBufferId)\n            offset = funcAllocation->getOffset(vBufferId);\n        }\n        if (offset == -1)\n          return;\n        if (op->hasAttr(\"allocation.offset\"))\n          return;\n        op->setAttr(\"allocation.offset\",\n                    IntegerAttr::get(IntegerType::get(ctx, 32), offset));\n      });\n    });\n    mod->setAttr(\"triton_gpu.shared\",\n                 mlir::IntegerAttr::get(mlir::IntegerType::get(ctx, 32),\n                                        allocation.getSharedMemorySize()));\n  }",
+      "elide": ["ModuleAllocation 的分配算法本体(染色/生命周期分析)在 ch26 已讲,本章只看它的结果 offset 如何被钉成属性——回指 ch26。walk 里 op-buffer 与 result-value 两种 buffer id 的区分点到即可。"]
+    },
+    {
+      "path": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp",
+      "lines": "L203-L220",
+      "code": "  void initSharedMemory(LLVMTypeConverter &typeConverter) {\n    ModuleOp mod = getOperation();\n    OpBuilder b(mod.getBodyRegion());\n    auto ctx = mod.getContext();\n    auto loc = mod.getLoc();\n    auto elemTy = typeConverter.convertType(b.getIntegerType(8));\n    // Set array size 0 and external linkage indicates that we use dynamic\n    // shared allocation to allow a larger shared memory size for each kernel.\n    //\n    // Ask for 16B alignment on global_smem because that's the largest we should\n    // ever need (4xi32).\n    auto arrayTy = LLVM::LLVMArrayType::get(elemTy, 0);\n    auto global = b.create<LLVM::GlobalOp>(\n        loc, arrayTy, /*isConstant=*/false, LLVM::Linkage::External,\n        \"global_smem\", /*value=*/Attribute(), /*alignment=*/16,\n        static_cast<unsigned>(NVVM::NVVMMemorySpace::kSharedMemorySpace));\n  }",
+      "elide": ["数组类型 i8[0] + External linkage 是『动态共享内存』约定:真实大小由 launch 时按 triton_gpu.shared 传入,不写死在 IR。"]
+    },
+    {
+      "path": "include/triton/Conversion/TritonGPUToLLVM/Utility.h",
+      "lines": "L398-L411",
+      "code": "inline Value getSharedMemoryBase(Location loc, RewriterBase &rewriter,\n                                 const TargetInfoBase &target, Operation *op) {\n  auto ptrTy = LLVM::LLVMPointerType::get(rewriter.getContext(),\n                                          target.getSharedAddressSpace());\n  FunctionOpInterface func =\n      op->template getParentOfType<FunctionOpInterface>();\n  assert(op->hasAttr(\"allocation.offset\"));\n  size_t offset = cast<IntegerAttr>(op->getAttr(\"allocation.offset\"))\n                      .getValue()\n                      .getZExtValue();\n  Value offVal = i32_val(offset);\n  Value base = gep(ptrTy, i8_ty, LLVM::getStackPointer(rewriter, func), offVal);\n  return base;\n}",
+      "elide": ["getStackPointer 对 kernel 函数返回 AddressOf(global_smem)(见同文件 L388-L395);非 kernel 走函数最后一个参数(嵌套调用传递共享基址)。这一 gep 就是 AllocateSharedMemory 钉的 offset 与 global_smem 数组的会合点。"]
+    },
+    {
+      "path": "lib/Conversion/TritonGPUToLLVM/MemoryOpToLLVM.cpp",
+      "lines": "L18-L37",
+      "code": "// blocked -> shared.\n// Swizzling in shared memory to avoid bank conflict. Normally used for\n// A/B operands of dots.\nvoid lowerDistributedToShared(Location loc, Value src, Value dst,\n                              Value adaptorSrc,\n                              const SharedMemoryObject &smemObj,\n                              const LLVMTypeConverter *typeConverter,\n                              ConversionPatternRewriter &rewriter,\n                              const TargetInfoBase &targetInfo) {\n  auto srcTy = cast<RankedTensorType>(src.getType());\n  auto dstTy = cast<MemDescType>(dst.getType());\n  auto outOrd = mlir::cast<SharedEncodingAttr>(dstTy.getEncoding()).getOrder();\n  auto elemTy = typeConverter->convertType(srcTy.getElementType());\n\n  auto smemBase = smemObj.getBase();\n  auto dstStrides = smemObj.getStrides();\n  auto inVals = unpackLLElements(loc, adaptorSrc, rewriter);\n  storeDistributedToShared(dstTy, srcTy, elemTy, inVals, smemBase, dstStrides,\n                           loc, rewriter, targetInfo);\n}",
+      "elide": ["为可读性删去中间的 3D rank assert(srcTy.getShape().size()<=2 || ...outOrd[2]==0)——只作维度合法性检查,不影响主流程。outOrd = SharedEncoding.getOrder() 就是计划书说的『按 SharedEncoding order 换相』的 order 来源。"]
+    },
+    {
+      "path": "lib/Conversion/TritonGPUToLLVM/Utility.cpp",
+      "lines": "L403-L424",
+      "code": "void storeDistributedToShared(MemDescType dstTy, RankedTensorType srcTy,\n                              Type elemLlvmTy, ArrayRef<Value> srcVals,\n                              Value smemBase, ArrayRef<Value> dstStrides,\n                              Location loc, RewriterBase &rewriter,\n                              const TargetInfoBase &target) {\n  bool success = emitTransferBetweenRegistersAndShared(\n      srcTy, dstTy, elemLlvmTy, /*maxVecElems=*/std::nullopt, smemBase,\n      dstStrides, loc, rewriter, target, [&](VectorType vecTy, Value vecAddr) {\n        ArrayRef<Value> vals = srcVals.take_front(vecTy.getNumElements());\n        srcVals = srcVals.drop_front(vecTy.getNumElements());\n\n        Value vec = undef(vecTy);\n        for (int i = 0; i < vals.size(); i++) {\n          vec = insert_element(vec, vals[i], i32_val(i));\n        }\n        store(vec, vecAddr)\n            .setAlignment(vecTy.getNumElements() *\n                          elemLlvmTy.getIntOrFloatBitWidth() / 8);\n      });\n  if (!success)\n    llvm::report_fatal_error(\"Failed to emit transfer from register to shared\");\n}",
+      "elide": ["storeDistributedToShared 只是薄封装:把每个向量地址处的寄存器值 insert 进 vecTy 再 store。真正的换相/地址算术全在 emitTransferBetweenRegistersAndShared 的回调外部完成(它把 vecAddr 已算好交进来)。"]
+    },
+    {
+      "path": "lib/Conversion/TritonGPUToLLVM/Utility.cpp",
+      "lines": "L282-L310",
+      "code": "  std::optional<LinearLayout> regLayout =\n      triton::gpu::toLinearLayout(shape, registerTy.getEncoding());\n  std::optional<LinearLayout> sharedLayout = triton::gpu::toLinearLayout(\n      shape, sharedTy.getEncoding(), elemLlvmTy.getIntOrFloatBitWidth());\n  if (!regLayout.has_value() || !sharedLayout.has_value()) {\n    return false;\n  }\n  auto sharedOrder = triton::gpu::getOrder(sharedTy.getEncoding());\n  // ...\n  // regToSharedLayout maps from (register, lane, warp, block) to (offsetX1,\n  // ..., offsetXN, block), where the offsetX's are in minor-to-major order.\n  LinearLayout regToSharedLayout = regLayout->invertAndCompose(*sharedLayout);",
+      "elide": ["中间把 sharedLayout 的 in-dims 从 (offset,block) reshape 成 (offsetX1,...,offsetXN,block) 以套 N 维 stride——技术细节,点到即可。关键是这一句 invertAndCompose:把『寄存器→逻辑元素』与『逻辑元素→swizzle 共享地址』两个 LinearLayout 复合成『寄存器→物理共享偏移』的一张表,swizzle 已烘在 sharedLayout 里。"]
+    },
+    {
+      "path": "lib/Conversion/TritonGPUToLLVM/Utility.cpp",
+      "lines": "L341-L374",
+      "code": "  const int vecElems =\n      std::min(regToSharedLayout.getNumConsecutiveInOut(),\n               maxVecElems.value_or(std::numeric_limits<int>::max()));\n\n  Value threadId = getThreadId(rewriter, loc);\n  Value threadsPerWarp = i32_val(regToSharedLayout.getInDimSize(kLane));\n  Value laneId = urem(threadId, threadsPerWarp);\n  Value warpId = udiv(threadId, threadsPerWarp);\n\n  int numElems = regToSharedLayout.getInDimSize(kRegister);\n  auto vecTy = vec_ty(elemLlvmTy, vecElems);\n  auto ptrTy = shmemBase.getType();\n  Value zero = i32_val(0);\n  for (int i = 0; i < numElems / vecElems; i++) {\n    auto multiDimShmemOffset =\n        llvm::to_vector(llvm::drop_end(llvm::make_second_range(\n            applyLinearLayout(loc, rewriter, regToSharedLayout,\n                              {{kRegister, i32_val(i * vecElems)},\n                               {kLane, laneId},\n                               {kWarp, warpId},\n                               {kBlock, zero}}))));\n    Value shmemOffset = dot(rewriter, loc, multiDimShmemOffset,\n                            applyPermutation(shmemStrides, sharedOrder));\n    auto vecAddr = gep(ptrTy, elemLlvmTy, shmemBase, shmemOffset);\n    vecAddr.setInbounds(true);\n    perVectorCallback(vecTy, vecAddr);\n  }\n  return true;",
+      "elide": ["向量宽 vecElems = 共享侧连续寄存器映射到连续 shmem 元素的段长(getNumConsecutiveInOut)。applyLinearLayout 把(register,lane,warp)代入 regToSharedLayout 生成 multi-dim 偏移,与 stride 点积成标量 shmemOffset,gep 出地址交回调 store/load。这里 swizzle 已经被 applyLinearLayout 具现为一串 LLVM 位/加算术,读者不必看到显式 urem/xor。"]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/IR/LinearLayoutConversions.cpp",
+      "lines": "L360-L372",
+      "code": "  std::vector<std::vector<int>> bases2D;\n  for (int logCol = 0; logCol < llvm::Log2_32(numCols); logCol++) {\n    bases2D.push_back({0, 1 << logCol});\n  }\n  for (int logRow = 0; logRow < llvm::Log2_32(numRows); logRow++) {\n    int row = 1 << logRow;\n    int vec = shared.getVec();\n    int perPhase = shared.getPerPhase();\n    int maxPhase = shared.getMaxPhase();\n    bases2D.push_back({row, (vec * ((row / perPhase) % maxPhase)) % numCols});\n  }\n  LinearLayout ctaLayout =\n      LinearLayout({{S(\"offset\"), bases2D}}, {rowDimName, colDimName});",
+      "elide": ["这是 f18 兑现点①:ch22 的 swizzle 相位公式 phase(row)=⌊row/perPhase⌋ mod maxPhase,在这里被逐位(每个 2 的幂 row 基)写成 LinearLayout 的列偏移基 vec*((row/perPhase)%maxPhase)——换相被烘进共享布局的基向量。colDim/rowDim 取自 shared.getOrder()[0]/[1](计划书『按 order 换相』的落点)。leading-offset 变体(sharedToLinearLayoutLeadingOffset)另有 (perPhase,maxPhase)∈{(4,2),(2,4),(1,8)} 的分支,原理同,本章点到。"]
+    },
+    {
+      "path": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ConvertLayoutOpToLLVM/SharedToDotOperandMMAv2.cpp",
+      "lines": "L162-L192",
+      "code": "  Value phase = urem(udiv(rowInMat, i32_val(perPhase)), i32_val(maxPhase));\n  // ...\n  for (int i = 0; i < numPtrs; ++i) {\n    Value contiguousIndex =\n        add(contiguousMatIndex, i32_val(i * contiguousLoadMatOffset));\n    if (warpsPerCTA[order[0]] > contiguousTileNumMats ||\n        contiguousTileNumMats % warpsPerCTA[order[0]] != 0)\n      contiguousIndex = urem(contiguousIndex, i32_val(contiguousTileNumMats));\n    contiguousIndex = add(contiguousIndex, contiguousSliceMatOffset);\n    Value contiguousIndexSwizzled = xor_(contiguousIndex, phase);\n    if (tileShape[0] != 1) {\n      Value batchOffset =\n          mul(warpB, i32_val(tileShape[order[0]] * tileShape[order[1]]));\n      offs[i] =\n          add(batchOffset,\n              add(mul(contiguousIndexSwizzled, i32_val(contiguousMatShape)),\n                  mul(rowOffset, stridedSmemOffset)));\n    } else {\n      offs[i] = add(mul(contiguousIndexSwizzled, i32_val(contiguousMatShape)),\n                    mul(rowOffset, stridedSmemOffset));\n    }\n  }",
+      "elide": ["这是 f18 兑现点②——最字面的『phase(r) 公式编译成物理偏移算术』:phase=urem(udiv(rowInMat,perPhase),maxPhase) 就是 ⌊r/perPhase⌋ mod maxPhase,再 xor_ 进列索引(bank 换相=按行异或列)。rowOffset 的越界回绕 urem 与 batchOffset 分支点到即可。"]
+    },
+    {
+      "path": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ConvertLayoutOpToLLVM/SharedToDotOperandMMAv2.cpp",
+      "lines": "L350-L358",
+      "code": "    // ldmatrix.m8n8.x4 returns 4x2xfp16(that is 4xb32) elements for a\n    // thread.\n    auto resArgs = builder.newListOperand(4, \"=r\");\n    auto addrArg = builder.newAddrOperand(readPtr, \"r\");\n\n    auto ldmatrix = builder.create(\"ldmatrix.sync.aligned.m8n8.x4\")\n                        ->o(\"trans\", needTrans /*predicate*/)\n                        .o(\"shared.b16\");\n    ldmatrix(resArgs, addrArg);",
+      "elide": ["ldmatrix.sync.aligned.m8n8.x4 一条指令让一个 warp 协作从 swizzle 共享内存搬 4 张 8x8 b16 矩阵进寄存器,直接摆成 MMAv2 dot 操作数所需布局(回指 ch27 MMA 操作数编码)。needTrans 决定是否转置搬运。"]
+    },
+    {
+      "path": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp",
+      "lines": "L132-L142",
+      "code": "  unsigned getVectorSize(Value ptr) const {\n    auto tensorTy = dyn_cast<RankedTensorType>(ptr.getType());\n    if (!tensorTy)\n      return 1;\n    auto contiguity = getContiguity(ptr);\n    auto pointeeBitWidth = triton::getPointeeBitWidth(tensorTy);\n    LDBG(\"getVectorSize contiguity = \" << contiguity << \" pointeeBitWidth = \"\n                                       << pointeeBitWidth);\n    // The maximum vector size is 128 bits on NVIDIA GPUs.\n    return std::min<unsigned>(128 / pointeeBitWidth, contiguity);\n  }",
+      "elide": ["getContiguity(ptr) 直接转发 axisAnalysisPass.getPtrContiguity(ptr)(L125-L130),即 ch25 AxisInfo 推断的指针连续度。128/pointeeBitWidth 是硬件上限(NVIDIA 单条访存最宽 128 位):fp16→8 元素、fp32→4 元素、i8→16 元素。取二者较小值。"]
+    },
+    {
+      "path": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp",
+      "lines": "L185-L201",
+      "code": "    unsigned vec = getVectorSize(ptr);\n    unsigned numElems = getTotalElemsPerThread(ptr.getType());\n    unsigned vecOrig = vec;\n    if (llMask) {\n      LLVM_DEBUG(DBGS() << \"vec = \" << vec\n                        << \" mask_alignment = \" << getMaskAlignment(mask));\n      vec = std::min<size_t>(vec, getMaskAlignment(mask));\n      LLVM_DEBUG(llvm::dbgs() << \" vec = \" << vec << '\\n');\n    }\n\n    if (vec == 1 && numElems > 1) {\n      int maskValue = !llMask ? -1 : getMaskAlignment(mask);\n      op->emitRemark() << \"Warning: vectorization fails vec = \" << vec\n                       << \" origin vec = \" << vecOrig\n                       << \" numElems = \" << numElems << \" mask is \" << maskValue\n                       << \"\\n\";\n    }",
+      "elide": ["若有 mask,向量宽再被 getMaskAlignment(mask) 夹一刀:mask 只对齐到 k,就只能 k 元素一组访存。vec 塌到 1 且本可向量化时发 remark 警告——这是读者调优时能真实看到的编译器提示。store 侧同构(L399/L414-L415)。"]
+    },
+    {
+      "path": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp",
+      "lines": "L29-L63",
+      "code": "Value redundantDataMask(Type valueTy, ConversionPatternRewriter &rewriter,\n                        Location loc, const NVIDIA::TargetInfo &targetInfo) {\n  auto tensorTy = dyn_cast<RankedTensorType>(valueTy);\n  Value mask = int_val(1, 1);\n  auto tid = tid_val();\n  auto clusterCTAId = targetInfo.getClusterCTAId(rewriter, loc);\n  if (tensorTy) {\n    auto layout = tensorTy.getEncoding();\n    auto shape = tensorTy.getShape();\n    unsigned rank = shape.size();\n    auto sizePerThread = triton::gpu::getSizePerThread(layout);\n    auto threadsPerWarp = triton::gpu::getThreadsPerWarp(layout);\n    auto warpsPerCTA = triton::gpu::getWarpsPerCTA(layout);\n    auto order = triton::gpu::getOrder(layout);\n    auto warpOrder = triton::gpu::getWarpOrder(layout);\n    auto shapePerCTATile = triton::gpu::getShapePerCTATile(layout, shape);\n    Value warpSize = i32_val(32);\n    Value laneId = urem(tid, warpSize);\n    Value warpId = udiv(tid, warpSize);\n    SmallVector<Value> multiDimWarpId =\n        delinearize(rewriter, loc, warpId, warpsPerCTA, warpOrder);\n    SmallVector<Value> multiDimThreadId =\n        delinearize(rewriter, loc, laneId, threadsPerWarp, order);\n    for (unsigned dim = 0; dim < rank; ++dim) {\n      // if there is no data replication across threads on this dimension\n      if (shape[dim] >= shapePerCTATile[dim])\n        continue;\n      // Otherwise, we need to mask threads that will replicate data on this\n      // dimension. Calculate the thread index on this dimension for the CTA\n      Value threadDim =\n          add(mul(multiDimWarpId[dim], i32_val(threadsPerWarp[dim])),\n              multiDimThreadId[dim]);\n      mask = and_(mask, icmp_slt(mul(threadDim, i32_val(sizePerThread[dim])),\n                                 i32_val(shape[dim])));\n    }",
+      "elide": ["multicast(getNumCTAs>1)分支(L65-L92)与非张量标量分支(L93-L98)本章点到即可。核心:当某维 shape<shapePerCTATile,说明这维数据被多个线程复制持有(广播布局);对复制线程加 icmp_slt(threadDim*sizePerThread, shape) 断言,只让『落在真实形状内』的那个线程写,其余线程 predicate 为假不写——防重复写。"]
+    },
+    {
+      "path": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp",
+      "lines": "L276-L298",
+      "code": "      auto &ld = ptxBuilder.create<>(\"ld\")\n                     ->o(\"volatile\", op.getIsVolatile())\n                     .global()\n                     .o(\"ca\", op.getCache() == triton::CacheModifier::CA)\n                     .o(\"cg\", op.getCache() == triton::CacheModifier::CG)\n                     .o(\"L1::evict_first\",\n                        op.getEvict() == triton::EvictionPolicy::EVICT_FIRST)\n                     .o(\"L1::evict_last\",\n                        op.getEvict() == triton::EvictionPolicy::EVICT_LAST)\n                     .o(\"L1::cache_hint\", hasL2EvictPolicy)\n                     .v(nWords)\n                     .b(width);\n\n      PTXBuilder::Operand *evictOpr{};\n\n      if (!evictOpr)\n        ld(dstsOpr, addrOpr).predicate(pred, \"b\");\n      else\n        ld(dstsOpr, addrOpr, evictOpr).predicate(pred, \"b\");",
+      "elide": ["拼出的 PTX 形如 @%pred ld.global.ca.v4.b32 {…},{[%addr]}: .global 地址空间 + cache-modifier(.ca=L1 缓存/.cg=绕 L1 只 L2)+ evict-policy(L1::evict_first/last)+ .v(nWords) 向量宽 + .b(width) 位宽,整条由 predicate(pred) 谓词化(mask 为假不发访存)。width/nWords 由前面 vec 与 valueElemNBits 推出。"]
+    },
+    {
+      "path": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp",
+      "lines": "L426-L492",
+      "code": "    Value mask = redundantDataMask(valueTy, rewriter, loc, targetInfo);\n    const size_t dtsize =\n        std::max<int>(1, valueElemTy.getIntOrFloatBitWidth() / 8);\n    const size_t valueElemNBits = dtsize * 8;\n    // ...\n      Value maskVal = llMask ? and_(mask, maskElems[vecStart]) : mask;\n\n      auto *asmAddr =\n          ptxBuilder.newAddrOperand(ptrElems[vecStart], \"l\", in_off);\n\n      auto &ptxStoreInstr =\n          ptxBuilder.create<>(\"st\")\n              ->global()\n              .o(\"wb\", op.getCache() == triton::CacheModifier::WB)\n              .o(\"cg\", op.getCache() == triton::CacheModifier::CG)\n              .o(\"cs\", op.getCache() == triton::CacheModifier::CS)\n              .o(\"wt\", op.getCache() == triton::CacheModifier::WT)\n              .o(\"L1::evict_first\",\n                 op.getEvict() == triton::EvictionPolicy::EVICT_FIRST)\n              .o(\"L1::evict_last\",\n                 op.getEvict() == triton::EvictionPolicy::EVICT_LAST)\n              .v(nWords)\n              .b(width);\n      ptxStoreInstr(asmAddr, asmArgList).predicate(maskVal, \"b\");",
+      "elide": ["store 的谓词是 and_(redundantDataMask, maskElems[vecStart]):既要用户 mask 为真、又要是该数据的唯一持有线程,两者与之后才发 st.global。中间把每个向量元素 insert 进 wordTy 再 bitcast 成 width 位整型的打包细节(L446-L468)点到即可。cache-modifier 在 store 侧是 .wb/.cg/.cs/.wt(写回/绕 L1/流式/直写)。"]
+    }
+  ],
+  "key_classes": [
+    {"name": "AllocateSharedMemory", "file": "lib/Conversion/TritonGPUToLLVM/AllocateSharedMemory.cpp", "responsibility": "ModuleOp pass:用 ModuleAllocation 的分配结果把每个 buffer 的 offset 钉成 op 的 allocation.offset i32 属性,把总量钉成模块 triton_gpu.shared 属性。纯 TritonGPU 层,尚未涉及 LLVM。"},
+    {"name": "LocalAllocOpConversion / LocalStoreOpConversion / LocalLoadOpConversion / LocalDeallocOpConversion", "file": "lib/Conversion/TritonGPUToLLVM/MemoryOpToLLVM.cpp", "responsibility": "把 triton_gpu.local_alloc/local_store/local_load/local_dealloc 降到 LLVM:建 SharedMemoryObject,读写 swizzle 过的共享内存。Alloc 带初值时顺手 store。"},
+    {"name": "emitTransferBetweenRegistersAndShared", "file": "lib/Conversion/TritonGPUToLLVM/Utility.cpp", "responsibility": "寄存器↔共享内存传输的公共引擎:regLayout->invertAndCompose(sharedLayout) 得寄存器→物理共享偏移映射,定向量宽,逐向量 applyLinearLayout 出地址 gep,回调做 store/load。storeDistributedToShared/loadSharedToDistributed 都是它的薄封装。"},
+    {"name": "sharedToLinearLayoutNoLeadingOffset / sharedToLinearLayoutLeadingOffset", "file": "lib/Dialect/TritonGPU/IR/LinearLayoutConversions.cpp", "responsibility": "SharedEncodingAttr::toLinearLayout 的实现:把 vec/perPhase/maxPhase/order/hasLeadingOffset 六字段翻成 LinearLayout 基向量——swizzle 相位公式 vec*((row/perPhase)%maxPhase) 在此烘进列偏移基(f18 兑现①)。"},
+    {"name": "SharedToDotOperandMMAv2 (ldmatrix 加载器)", "file": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ConvertLayoutOpToLLVM/SharedToDotOperandMMAv2.cpp", "responsibility": "为 MMAv2 dot 操作数从 swizzle 共享内存用 ldmatrix.sync.aligned.m8n8.x4 搬数:显式 phase=urem(udiv(row,perPhase),maxPhase) + xor_ 列换相(f18 兑现②),摆成 MMA 操作数布局。"},
+    {"name": "LoadStoreConversionBase / LoadOpConversion / StoreOpConversion", "file": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp", "responsibility": "全局访存降级(本章 perf 核心):getVectorSize=min(128/bitwidth,contiguity)、getMaskAlignment 夹向量宽、redundantDataMask 防重复写,拼出带 cache-modifier/evict-policy/predicate 的 ld/st.global 内联 PTX。"},
+    {"name": "redundantDataMask", "file": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp", "responsibility": "计算『唯一数据掩码』:广播布局下同一元素被多线程持有时,只让落在真实 shape 内的线程写,其余谓词为假,避免重复写全局内存。"},
+    {"name": "initSharedMemory / getSharedMemoryBase", "file": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp / include/triton/Conversion/TritonGPUToLLVM/Utility.h", "responsibility": "initSharedMemory 建单个 global_smem extern i8 数组;getSharedMemoryBase 读 allocation.offset 属性 gep 进 global_smem——AllocateSharedMemory 的 offset 与实际共享基址在此会合。"}
+  ],
+  "data_flow": [
+    "1. AllocateSharedMemory::runOnOperation:ModuleAllocation(mod) 跑分配(ch26 分析),walk 每个 op,getBufferId→getOffset,op->setAttr(allocation.offset, offset);模块 setAttr(triton_gpu.shared, 总量)。",
+    "2. TritonGPUToLLVM pass 起手 initSharedMemory:向模块插入单个 global_smem = i8[0] External/shared/16B 数组。",
+    "3. 降级各 op 时 getSharedMemoryBase(op):assert op 有 allocation.offset → gep(i8, AddressOf(global_smem), offset) 得该 buffer 的共享基址指针。",
+    "4a. (写)LocalAllocOp 带初值 / LocalStoreOp:取 SharedEncoding.getOrder(),建 SharedMemoryObject(base, order, strides),lowerDistributedToShared→storeDistributedToShared→emitTransferBetweenRegistersAndShared。",
+    "5a. emitTransfer:toLinearLayout(register)、toLinearLayout(shared)(swizzle 已烘入)→ regLayout->invertAndCompose(sharedLayout)=regToShared;vecElems=getNumConsecutiveInOut;逐向量 applyLinearLayout(register=i*vec,lane,warp)→multiDimOffset·stride=shmemOffset→gep→store(vec)。",
+    "4b. (读回分布式)LocalLoadOp(BlockedEncoding/MMA/Slice 或 Ampere kWidth==8 dot):lowerSharedToDistributed→loadSharedToDistributed→同一 emitTransfer,回调改为 load;Ampere i8/bf16 再打包成 i32 喂 MMA。",
+    "4c. (读回喂 MMAv2 dot,ldmatrix 路径,经 ConvertLayoutOp)SharedToDotOperandMMAv2:phase=urem(udiv(rowInMat,perPhase),maxPhase);contiguousIndexSwizzled=xor_(contiguousIndex,phase);算 offs;ldmatrix.sync.aligned.m8n8.x4 搬进寄存器摆成 dot 操作数(回指 ch27)。",
+    "6. (全局访存)LoadOp/StoreOp:vec=getVectorSize(ptr)=min(128/pointeeBitWidth, getPtrContiguity(ptr));若有 mask,vec=min(vec,getMaskAlignment(mask));vec==1 且本可向量化则 emitRemark 警告。",
+    "7. store 侧:mask=redundantDataMask(valueTy)(广播去重);maskVal=and_(mask, maskElems[vecStart]);逐 vec 拼 st.global(.wb/.cg/.cs/.wt + evict + .v(nWords).b(width)).predicate(maskVal)。",
+    "8. load 侧:逐 vec 拼 ld.global(.ca/.cg + L1::evict_* + .v.b).predicate(pred);other 值经 mov 谓词填补 masked-out 槽位;返回值 bitcast/extract 回元素。",
+    "9. 屏障落地(回指 ch26):ModuleMembarAnalysis 在共享内存读写之间按 canSkipBarSync 结果决定是否插 barrier(createBarrier→insertBarrier / cluster arrive-wait),本章是 ch26 Membar 分析的降级落地。"
+  ],
+  "design_decisions": [
+    {"decision": "共享内存分配结果不用 IR 结构承载,而是钉成 op 上的 allocation.offset 整数属性 + 模块级 triton_gpu.shared 总量", "why": "把『分配』(TritonGPU 层的 ModuleAllocation 分析,ch26)与『物化』(LLVM 层的 gep)解耦:降级期任一需要共享内存的 op 只需读自己的 offset 属性即可算出基址,无需重跑分配。", "evidence": "lib/Conversion/TritonGPUToLLVM/AllocateSharedMemory.cpp:L45-L51"},
+    {"decision": "全 kernel 共用单个 global_smem extern i8[0] 数组,所有分配 gep 进它;真实大小 launch 时按 triton_gpu.shared 动态传入", "why": "动态共享内存约定:size-0 + External linkage 让同一 kernel 可申请超过静态上限的共享内存,大小推迟到 launch。所有 buffer 是这块大数组里的字节区间。", "evidence": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp:L209-L219"},
+    {"decision": "swizzle 相位公式不在 store/load 降级里手写 urem/xor,而是烘进共享 LinearLayout 的基向量,由 applyLinearLayout 统一具现", "why": "LinearLayout 把『逻辑元素→swizzle 物理地址』表达成线性(GF(2))映射,与寄存器布局 invertAndCompose 后一次性得到寄存器→物理偏移的映射;换相、bank-conflict 规避、向量化连续段长(getNumConsecutiveInOut)全在同一框架里算出,避免每条降级路径各写一套地址算术。", "evidence": "lib/Dialect/TritonGPU/IR/LinearLayoutConversions.cpp:L369 + lib/Conversion/TritonGPUToLLVM/Utility.cpp:L310"},
+    {"decision": "MMAv2 dot 操作数的 ldmatrix 路径保留手写显式 swizzle(urem/udiv/xor_),不走通用 LinearLayout 路径", "why": "ldmatrix.sync.aligned.m8n8.x4 有固定的 8x8 矩阵搬运语义与 warp 内线程-地址约定,需按矩阵坐标精确算 phase 与列异或来对齐 bank;这是 NVIDIA 专属、比通用路径更贴硬件的加载器(通用 LocalLoad 路径只在 Ampere kWidth==8 等窄条件下接管)。", "evidence": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ConvertLayoutOpToLLVM/SharedToDotOperandMMAv2.cpp:L162,L181,L355"},
+    {"decision": "全局访存向量宽 = min(128/bitwidth, contiguity) 再被 mask alignment 夹,取不到宽向量就发 remark", "why": "128 位是 NVIDIA 单条访存物理上限;contiguity(ch25 AxisInfo)反映指针实际连续度,不连续就无法合并;mask 若只对齐到 k,超过 k 的向量会跨越 mask 边界故须夹。三者共同决定合并访存(coalescing)带宽,是本章 perf 命门——contiguity 不够或 mask 不对齐直接掉到标量访存。", "evidence": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp:L141,L191"},
+    {"decision": "store 谓词 = redundantDataMask ∧ 用户 mask;广播布局下只让唯一持有线程写全局内存", "why": "分布式布局里一个逻辑元素可能被多个线程各持一份副本(某维 shape<shapePerCTATile),若都写会重复写同一全局地址(浪费带宽甚至竞态);redundantDataMask 用 icmp_slt(threadDim*sizePerThread, shape) 选出落在真实形状内的唯一线程。", "evidence": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp:L54-L62,L474"},
+    {"decision": "cache-modifier 与 evict-policy 由 op 的 CacheModifier/EvictionPolicy 枚举直接翻成 PTX 后缀,谓词化整条访存", "why": "把 Triton 前端的 cache 语义(.ca/.cg/.cs/.wb/.wt)与 L1 淘汰提示(evict_first/last)透传到 ld/st.global,谓词 @%p 让 masked-out 线程静默不访存——无分支即可实现掩码访存。", "evidence": "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp:L279-L296,L482-L492"}
+  ],
+  "theory": [
+    "Swizzle 换相把共享内存 bank-conflict 规避表达成:物理列 = 逻辑列 XOR phase(row),phase(row)=⌊row/perPhase⌋ mod maxPhase,偏移单位为 vec。perPhase=每 perPhase 行共享一个相位(与访存粒度对齐),maxPhase=相位周期(=bank 数/vec 决定)。ch22 已推导公式与参数来源;本章只证它如何编译成物理偏移:LinearLayout 路径写成列基 vec*((row/perPhase)%maxPhase)(GF(2) 线性,故可与寄存器布局复合),ldmatrix 路径写成 xor_(col, urem(udiv(row,perPhase),maxPhase))。",
+    "向量化带宽定量:单线程访存字节 = vec × bitwidth/8,受 vec = min(128/bitwidth, contiguity, maskAlign) 三重上限。合并访存要求 warp 内 32 线程的地址落在连续段;contiguity(ch25 AxisInfo.getPtrContiguity)给出编译期可证的连续度。fp16(bitwidth=16)理想 vec=8→128 位;若 contiguity=4 则 vec=4→64 位,带宽减半;若 mask 只对齐到 1 则 vec=1→标量访存,带宽 1/8。这解释了『contiguity 不够或 mask 不对齐拿不到 128-bit 向量访存』。",
+    "redundantDataMask 正确性:某维若 shape[dim] < shapePerCTATile[dim],该维数据在 CTA tile 内被复制 ceil(shapePerCTATile/shape) 份。掩码 icmp_slt(threadDim*sizePerThread[dim], shape[dim]) 恰好选出线性索引落在 [0,shape) 内的那组线程为写者,其余为读者副本不写——保证每个全局地址恰被写一次。",
+    "【prereq-box:Gergov, SODA 1999】共享内存分配的最优 offset 布置可归约为区间图着色/存储分配问题(Gergov 的 2-近似动态存储分配)。本章不重铺证明——ModuleAllocation 的分配算法与该归约点已在 ch26 讲透;此处只需知道 AllocateSharedMemory 消费的 offset 是那套分析的产物,本章负责把 offset 物化成 gep。回指 ch26。"
+  ],
+  "subtraction_plan": {
+    "delete": [],
+    "must_keep": [
+      {"symbol": "AllocateSharedMemory", "why": "本章降级落地的起点 pass;读者须懂它把 offset 钉成属性。"},
+      {"symbol": "allocation.offset", "why": "分配结果的载体属性,连接 ch26 分析与本章 gep 物化。"},
+      {"symbol": "triton_gpu.shared", "why": "模块级共享内存总量属性,launch 时按它开动态共享内存。"},
+      {"symbol": "global_smem", "why": "单个 extern 数组,所有共享分配 gep 的锚;初始大小 0/External linkage 是动态共享内存约定。"},
+      {"symbol": "initSharedMemory", "why": "建 global_smem 的函数,writer 须讲清『单数组供所有分配索引』。"},
+      {"symbol": "getSharedMemoryBase", "why": "读 allocation.offset gep 进 global_smem——offset 与基址会合点。"},
+      {"symbol": "storeDistributedToShared", "why": "把分布式张量写进 swizzle 共享内存的入口(f18 相关);须讲清它驱动而非手写换相。"},
+      {"symbol": "loadSharedToDistributed", "why": "读回路径入口,与 store 对称。"},
+      {"symbol": "emitTransferBetweenRegistersAndShared", "why": "寄存器↔共享传输引擎;invertAndCompose 与向量宽都在此,是 f18 兑现①的消费者。"},
+      {"symbol": "invertAndCompose", "why": "把寄存器布局与 swizzle 共享布局复合成物理偏移映射的关键操作。"},
+      {"symbol": "sharedToLinearLayoutNoLeadingOffset", "why": "swizzle phase 公式烘进 LinearLayout 基的函数(f18 兑现①)。"},
+      {"symbol": "perPhase", "why": "swizzle 六字段之一,phase 公式的分母;f18 回收须点名。"},
+      {"symbol": "maxPhase", "why": "swizzle 六字段之一,phase 公式的模;f18 回收须点名。"},
+      {"symbol": "getVec", "why": "swizzle 的 vec 字段访问器,换相偏移单位。"},
+      {"symbol": "SharedEncodingAttr", "why": "承载 swizzle 六字段的编码;order 决定换相维(计划书『按 order 换相』)。"},
+      {"symbol": "LocalLoadOpConversion", "why": "共享→分布式读回的降级模式;须讲清它走通用 LinearLayout 路径(非 ldmatrix)。"},
+      {"symbol": "ldmatrix", "why": "喂 MMAv2 dot 的加载器指令(f18 兑现②的物理载体),回指 ch27。"},
+      {"symbol": "phase", "why": "ldmatrix 路径里显式的 urem(udiv(row,perPhase),maxPhase),最字面的 phase 公式编译产物。"},
+      {"symbol": "getVectorSize", "why": "本章 perf 核心公式 min(128/bitwidth,contiguity) 的所在。"},
+      {"symbol": "getPtrContiguity", "why": "getVectorSize 的连续度来源(ch25 AxisInfo 消费点)。"},
+      {"symbol": "getMaskAlignment", "why": "夹 vec 的 mask 对齐;不对齐拿不到宽向量的原因。"},
+      {"symbol": "redundantDataMask", "why": "广播去重防重复写,本章 perf 正确性要点。"},
+      {"symbol": "getPointeeBitWidth", "why": "getVectorSize 的 bitwidth 来源,决定 128 位能塞几个元素。"}
+    ]
+  },
+  "mechanisms": [
+    {
+      "id": "m1-allocate-shared-memory-pass",
+      "name": "AllocateSharedMemory:把 ch26 分配结果钉成 allocation.offset + global_smem 单数组",
+      "kind": "dataflow",
+      "source_anchors": [
+        "lib/Conversion/TritonGPUToLLVM/AllocateSharedMemory.cpp:L23-L52",
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp:L203-L220",
+        "include/triton/Conversion/TritonGPUToLLVM/Utility.h:L398-L411"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m2-swizzle-phase-to-physical-offset",
+      "name": "swizzle phase(r)=⌊r/perPhase⌋ mod maxPhase 编译成物理偏移(f18 兑现:LinearLayout 基 + ldmatrix 显式 xor 双路径)",
+      "kind": "algorithm",
+      "source_anchors": [
+        "lib/Dialect/TritonGPU/IR/LinearLayoutConversions.cpp:L360-L372",
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ConvertLayoutOpToLLVM/SharedToDotOperandMMAv2.cpp:L162-L192"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m3-store-load-distributed-shared-transfer",
+      "name": "storeDistributedToShared / emitTransferBetweenRegistersAndShared:invertAndCompose + 向量化写读 swizzle 共享内存",
+      "kind": "dataflow",
+      "source_anchors": [
+        "lib/Conversion/TritonGPUToLLVM/MemoryOpToLLVM.cpp:L18-L89",
+        "lib/Conversion/TritonGPUToLLVM/Utility.cpp:L266-L424"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m4-ldmatrix-feed-dot",
+      "name": "LocalLoad 读回喂 dot:通用 LinearLayout 路径 vs ldmatrix.x4 加载器(MMAv2 操作数)",
+      "kind": "dataflow",
+      "source_anchors": [
+        "lib/Conversion/TritonGPUToLLVM/MemoryOpToLLVM.cpp:L104-L227",
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ConvertLayoutOpToLLVM/SharedToDotOperandMMAv2.cpp:L350-L358"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m5-global-load-vectorization",
+      "name": "getVectorSize = min(128/bitwidth, getPtrContiguity) 再被 getMaskAlignment 夹(本章 perf 命门)",
+      "kind": "algorithm",
+      "source_anchors": [
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp:L132-L142",
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp:L185-L201"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m6-redundant-data-mask",
+      "name": "redundantDataMask:广播布局下只让唯一持有线程写全局内存(防重复写)",
+      "kind": "algorithm",
+      "source_anchors": [
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp:L29-L100",
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp:L426-L474"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m7-ldst-global-ptx-emission",
+      "name": "ld/st.global 内联 PTX 拼装:cache-modifier + evict-policy + .v.b 向量宽 + predicate",
+      "kind": "protocol",
+      "source_anchors": [
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp:L275-L298",
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp:L479-L492"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m8-membar-lowering-landing",
+      "name": "屏障降级落地:ModuleMembarAnalysis + canSkipBarSync 决定共享读写间是否插 barrier(回指 ch26)",
+      "kind": "protocol",
+      "source_anchors": [
+        "include/triton/Analysis/Membar.h:L80-L145",
+        "third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp:L507-L516"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    }
+  ],
+  "foreshadow_due": {
+    "plant": [],
+    "recover": [
+      {
+        "id": "f18",
+        "planted_in": "ch22",
+        "summary": "swizzle 六字段(vec/perPhase/maxPhase/order/hasLeadingOffset)如何在物理 lowering 时真正驱动地址计算——本章兑现:phase(r)=⌊r/perPhase⌋ mod maxPhase 公式被①烘进共享 LinearLayout 基向量 vec*((row/perPhase)%maxPhase)(sharedToLinearLayoutNoLeadingOffset),由 storeDistributedToShared/emitTransferBetweenRegistersAndShared 经 invertAndCompose+applyLinearLayout 具现成物理偏移;②在 ldmatrix 加载器里显式写成 phase=urem(udiv(row,perPhase),maxPhase) + xor_ 列换相(SharedToDotOperandMMAv2)喂 MMAv2 dot。order 决定换相维。",
+        "recovered_here": true
+      }
+    ]
+  }
+}

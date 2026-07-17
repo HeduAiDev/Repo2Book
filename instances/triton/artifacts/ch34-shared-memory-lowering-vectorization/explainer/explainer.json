@@ -1,0 +1,187 @@
+{
+  "chapter": "ch34",
+  "title": "共享内存降级与全局访存向量化",
+  "notes": "skip_impl 章:无精简版可跑。三个 needs_worked_example 机制(m2/m5/m6)的核心是从源码抽出的纯整数公式;为让每个数字可复核,explainer/traces/ 下放了三段 host 端算术复刻脚本(swizzle_phase.py / vector_size.py / redundant_mask.py),逐位重放源码常量,输出存 *.out。trace_source 仍标 manual(见各机制 manual_reason)——因为真正的 LLVM/PTX 偏移需在 CUDA 容器里对带 convert_layout/dot 的 kernel 跑 make_llir 才能观测,host 无 CUDA;脚本只复刻编译期整数算术,不是运行目标仓。所有引用源码常量的数字均标 file:Lxxx。",
+  "mechanisms": [
+    {
+      "mechanism_id": "m1-allocate-shared-memory-pass",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch34-m1-global-smem-offsets",
+          "claim": "AllocateSharedMemory 把每个 buffer 的 offset 钉成 op 的 allocation.offset 属性、总量钉成模块 triton_gpu.shared,降级期所有分配都 gep 进同一个 global_smem extern 数组。",
+          "template": "layout",
+          "numbers": [
+            {"label": "global_smem 数组类型", "value": "i8[0]", "provenance": "TritonGPUToLLVM.cpp:L215 arrayTy = LLVMArrayType::get(elemTy=i8, 0)"},
+            {"label": "linkage", "value": "External", "provenance": "TritonGPUToLLVM.cpp:L217 LLVM::Linkage::External(动态共享内存约定)"},
+            {"label": "对齐", "value": "16 字节", "provenance": "TritonGPUToLLVM.cpp:L218 alignment=16(4xi32 最宽需求)"},
+            {"label": "offset 属性位宽", "value": "i32", "provenance": "AllocateSharedMemory.cpp:L45-L46 IntegerType::get(ctx,32)"},
+            {"label": "总量属性", "value": "triton_gpu.shared", "provenance": "AllocateSharedMemory.cpp:L48-L51 mod.setAttr(triton_gpu.shared, getSharedMemorySize())"},
+            {"label": "会合点", "value": "gep(i8, AddressOf(global_smem), offset)", "provenance": "Utility.h:L409-L410 getSharedMemoryBase"}
+          ],
+          "caption_draft": "分配(ch26 分析算 offset)与物化(gep)解耦:offset 只是钉在 op 上的一个 i32 属性,降级期任一需要共享内存的 op 读自己的 offset 就能从唯一的 global_smem 大数组里 gep 出基址,无需重跑分配。真实大小 launch 时按 triton_gpu.shared 动态传入。",
+          "provenance_note": "示意图,buffer 个数/offset 值为教学摆放;字节区间语义忠实源码。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m2-swizzle-phase-to-physical-offset",
+      "intuition": "图书馆把同一列书稍微斜着摆:第 0 排放原位,第 2 排整体右移一格,第 4 排右移两格……这样『同一逻辑列』的书散落到不同货架(bank),多个人同时取书不用排队抢同一架。斜移量就是 phase(行),移法就是把列号和 phase 做异或。",
+      "worked_example": {
+        "params": {"vec": 8, "perPhase": 2, "maxPhase": 4, "numCols": 64, "contiguousIndex": 3, "numRows": 8, "note": "perPhase=2 让相邻两行共享相位(展示 ⌊r/perPhase⌋ 的取整),maxPhase=4 让相位在 4 内循环(展示 mod);两者都非平凡,避开 maxPhase=1 或 perPhase≥numRows 的退化相位恒 0 分支。"},
+        "trace_source": "manual",
+        "manual_reason": "本章无精简版;真正的物理偏移是 make_llir 后 LLVM IR 里 applyLinearLayout 具现的位/加算术(LinearLayout 路径)与 urem/udiv/xor_(ldmatrix 路径),需 CUDA 容器跑带 dot 的 kernel 才能 dump。此处用 host 端整数复刻 explainer/traces/swizzle_phase.py 逐位重放源码公式:LinearLayoutConversions.cpp:L369 base=(vec*((row/perPhase)%maxPhase))%numCols 与 SharedToDotOperandMMAv2.cpp:L162,L181 phase=urem(udiv(row,perPhase),maxPhase)、xor_(idx,phase)。表中每个数字见 traces/swizzle_phase.out。",
+        "table": {
+          "columns": ["行 r", "⌊r/perPhase⌋", "phase = mod maxPhase", "ldmatrix 列 = idx(3) XOR phase", "LinearLayout 列偏移 = vec*phase", "XOR 基复合 (bases {1:0,2:8,4:16})", "线性一致?"],
+          "rows": [
+            ["0", "0", "0", "3", "0", "0", "True"],
+            ["1", "0", "0", "3", "0", "0", "True"],
+            ["2", "1", "1", "2", "8", "8", "True"],
+            ["3", "1", "1", "2", "8", "8", "True"],
+            ["4", "2", "2", "1", "16", "16", "True"],
+            ["5", "2", "2", "1", "16", "16", "True"],
+            ["6", "3", "3", "0", "24", "24", "True"],
+            ["7", "3", "3", "0", "24", "24", "True"],
+            ["8", "4", "0", "3", "0", "(周期回绕→同行0)", "period=8"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "① 固定一行,列→列XORphase 是列集合上的双射(置换),故不丢元素、且把原本同 bank 的列打散;② phase 以 perPhase*maxPhase 行为周期;③ 源码存的只是 2 的幂行的基,任意行 r 的偏移 = 各置位比特基的 XOR,恰好等于算术 vec*phase(r)——GF(2) 线性成立,这正是它能塞进 LinearLayout 与寄存器布局复合的前提。",
+        "argument": "① a XOR c 对固定 c 是自逆置换(异或同一常量两次还原),故对每行是双射——trace 里 row2 把 [0..7] 映成 [1,0,3,2,5,4,7,6],sorted 后仍是 [0..7]。② phase(r)=(⌊r/perPhase⌋)mod maxPhase,r 增加 perPhase*maxPhase 时 ⌊r/perPhase⌋ 增加 maxPhase,mod 后不变→周期 8(trace row8 相位回到 row0 的 0)。③ 归纳:基仅对 row=1,2,4 定义为 {0,8,16};对 r=6=4+2,XOR 基 =16 XOR 8=24,与算术 vec*phase(6)=8*3=24 相等;对全部 r=0..7 trace 的『线性一致』列均 True,故线性映射与逐行算术相位处处吻合。",
+        "monotonicity_or_base_step": "基例 r∈{1,2,4} 基直接由源码公式给出;归纳步 r 的每个置位比特贡献其基、XOR 合成——因 phase 公式在 GF(2) 上线性,合成值 = 算术相位。"
+      },
+      "quantified": "dossier.theory:未 swizzle 时同一逻辑列的 8 行全落同一 bank → 8 路 bank conflict(一次访存串行 8 拍)。本例 maxPhase=4 给出 4 个不同相位,把 8 行的同列请求摊到最多 4 组不同 bank;配合 vec=8 的偏移粒度,warp 内 ldmatrix 的 4 张 8x8 矩阵各自换相后无 bank 冲突(trace 每行置换均为 bijection)。相位周期 perPhase*maxPhase=8 行 = 一个 swizzle 单元高度。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch34-m2-swizzle-remap",
+          "claim": "同一逻辑列(idx=3)随行号被 phase 换相后落到不同物理列 3→2→1→0(行 0/2/4/6),把本会撞同一 bank 的访问摊开——swizzle 相位公式在此变成物理偏移算术。",
+          "template": "before-after",
+          "numbers": [
+            {"label": "参数 (vec,perPhase,maxPhase)", "value": "(8,2,4)", "provenance": "traces/swizzle_phase.py 取自 SharedEncoding 六字段;公式 LinearLayoutConversions.cpp:L367-L369"},
+            {"label": "phase(行 0,2,4,6)", "value": "0,1,2,3", "provenance": "traces/swizzle_phase.out phase 列 = (r//perPhase)%maxPhase"},
+            {"label": "ldmatrix 列 = 3 XOR phase(行 0,2,4,6)", "value": "3,2,1,0", "provenance": "traces/swizzle_phase.out ldmatrix 列;SharedToDotOperandMMAv2.cpp:L181 xor_(contiguousIndex,phase)"},
+            {"label": "LinearLayout 列偏移(行 0,2,4,6)", "value": "0,8,16,24", "provenance": "traces/swizzle_phase.out vec*phase 列;LinearLayoutConversions.cpp:L369"},
+            {"label": "相位周期", "value": "8 行", "provenance": "perPhase*maxPhase=2*4;traces/swizzle_phase.out 行 8 相位回 0"}
+          ],
+          "caption_draft": "f18 兑现:ch22 埋的 phase(r)=⌊r/perPhase⌋ mod maxPhase,在物理 lowering 里两处落地——LinearLayout 把它烘成列偏移基 vec*phase(左,storeDistributedToShared 消费),ldmatrix 加载器把它显式写成 xor_(列, phase)(右,喂 MMAv2 dot)。同一逻辑列 3 在四行被摊到物理列 3/2/1/0,bank 冲突消解。"
+        },
+        {
+          "figure_id": "fig-ch34-m2-linear-basis",
+          "claim": "源码只存 2 的幂行的相位基 {行1:0, 行2:8, 行4:16},任意行的偏移由置位比特基 XOR 合成,处处等于算术 vec*phase——这就是相位公式可作为 GF(2) LinearLayout 与寄存器布局复合的原因。",
+          "template": "state-table",
+          "numbers": [
+            {"label": "行 1/2/4 的列偏移基", "value": "0 / 8 / 16", "provenance": "traces/swizzle_phase.out 'LinearLayout row-bases';LinearLayoutConversions.cpp:L369"},
+            {"label": "行 6=4+2:XOR 基", "value": "16 XOR 8 = 24", "provenance": "traces/swizzle_phase.py ll_colshift(6)=24"},
+            {"label": "行 6 算术 vec*phase", "value": "8*3 = 24", "provenance": "traces/swizzle_phase.out 行 6 vec*phase 列"},
+            {"label": "全 8 行线性一致", "value": "8/8 True", "provenance": "traces/swizzle_phase.out '线性一致' 列全 True"}
+          ],
+          "caption_draft": "为何 swizzle 能塞进 LinearLayout:相位在 GF(2) 上线性。存 log2(numRows)=3 个基就够,合成任意行靠比特 XOR,与逐行算术相位逐个吻合——invertAndCompose 才能把它与寄存器布局复合成一张寄存器→物理偏移表。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m3-store-load-distributed-shared-transfer",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch34-m3-transfer-pipeline",
+          "claim": "storeDistributedToShared 不手写换相:它调 emitTransferBetweenRegistersAndShared,后者用 regLayout->invertAndCompose(sharedLayout) 把『寄存器→逻辑元素』与『逻辑元素→swizzle 物理地址』复合成一张寄存器→物理偏移表,逐向量 applyLinearLayout 出偏移 gep 再 store。",
+          "template": "flow",
+          "numbers": [
+            {"label": "换相来源 order", "value": "SharedEncoding.getOrder()", "provenance": "MemoryOpToLLVM.cpp:L28 outOrd = cast<SharedEncodingAttr>(...).getOrder()"},
+            {"label": "复合操作", "value": "regLayout->invertAndCompose(sharedLayout)", "provenance": "Utility.cpp:L310 regToSharedLayout"},
+            {"label": "向量宽 = 连续段长", "value": "getNumConsecutiveInOut", "provenance": "Utility.cpp:L342 vecElems=min(getNumConsecutiveInOut, maxVecElems)"},
+            {"label": "偏移生成", "value": "applyLinearLayout(register=i*vec, lane, warp) · stride", "provenance": "Utility.cpp:L354-L361 multiDimShmemOffset · shmemStrides"},
+            {"label": "store 对齐", "value": "vecElems * bitwidth/8 字节", "provenance": "Utility.cpp:L421-L422 setAlignment"}
+          ],
+          "caption_draft": "写分布式张量进 swizzle 共享内存的流水:swizzle 已烘在 sharedLayout 里(见 m2),这里只做复合+逐向量 gep+store。读者看不到显式 urem/xor——它们被 applyLinearLayout 具现成一串 LLVM 位/加算术。loadSharedToDistributed 是同一引擎、回调换成 load。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m5-global-load-vectorization",
+      "intuition": "搬家时能一次抱几个箱子,取决于三件事:货车一趟最多装 128 斤(硬件上限)、这批箱子在货架上是不是挨着(contiguity)、以及提货单是不是按整组开的(mask 对齐)。三者取最小,才是你实际一次能抱走的数量;任一不满足,就退化到一次抱一个(标量访存)。",
+      "worked_example": {
+        "params": {"HW_BITS": 128, "note": "128 位是 NVIDIA 单条访存物理上限(LoadStoreOpToLLVM.cpp:L141 注释)。取 fp16/fp32/i8 三种位宽,配不同 contiguity 与 maskAlign,覆盖满宽/被连续度夹/被 mask 夹/塌到标量发 remark 四类非平凡分支。"},
+        "trace_source": "manual",
+        "manual_reason": "本章无精简版;真实的 vec 是编译期 axisAnalysisPass.getPtrContiguity/getMaskAlignment(ch25 AxisInfo)在具体 kernel 上推出的,要 make_llir dump ld/st.global 的 .v(nWords).b(width) 才能实测,host 无 CUDA。此处用 host 复刻 explainer/traces/vector_size.py 重放 LoadStoreOpToLLVM.cpp:L142 min(128/pointeeBitWidth, contiguity) 与 L191 min(vec, getMaskAlignment)——contiguity/maskAlign 作为 AxisInfo 的假设输入给定,公式与 128 位上限忠实源码。表中数字见 traces/vector_size.out。",
+        "table": {
+          "columns": ["场景", "dtype", "bitwidth", "128/bw", "contiguity", "maskAlign", "vec", "字节", "位", "remark 警告?"],
+          "rows": [
+            ["A 满宽", "fp16", "16", "8", "16", "无", "8", "16", "128", "False"],
+            ["B 连续度夹", "fp16", "16", "8", "4", "无", "4", "8", "64", "False"],
+            ["C mask 夹", "fp16", "16", "8", "16", "2", "2", "4", "32", "False"],
+            ["D 塌成标量", "fp16", "16", "8", "16", "1", "1", "2", "16", "True"],
+            ["E fp32 满宽", "fp32", "32", "4", "8", "无", "4", "16", "128", "False"],
+            ["F i8 满宽", "i8", "8", "16", "32", "无", "16", "16", "128", "False"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "vec 沿 min 链单调不增:vec ≤ 128/bitwidth(硬件天花板)且 vec ≤ contiguity 且(有 mask 时)vec ≤ maskAlignment;下界 1。等号只在三上限都放行时取满宽 128 位;任一收紧即降带宽,vec 塌到 1 且本可向量化(numElems>1)时发 emitRemark。",
+        "argument": "min(a,b) ≤ a 且 ≤ b,连取两次 min 得 vec = min(128/bw, contiguity, maskAlign) ≤ 每一项;各项均为正整数故 vec ≥ 1。单调:再夹一刀只会更小或不变(trace 场景 A→C→D 随 maskAlign 16→2→1 使 vec 8→2→1 严格下降)。满宽当且仅当 contiguity≥128/bw 且 maskAlign≥128/bw(场景 A/E/F:vec*bitwidth 恰 128 位)。",
+        "monotonicity_or_base_step": "单调量 = vec,经每个 min 非增;下界 1 为终值,故三重夹取后即定,无迭代。"
+      },
+      "quantified": "dossier.theory:单线程访存字节 = vec × bitwidth/8。fp16 理想 vec=8 → 128 位满带宽(场景 A);contiguity 掉到 4 → vec=4 → 64 位,带宽减半(场景 B,一次访存变两次);mask 只对齐到 1 → vec=1 → 16 位标量(场景 D),带宽 1/8、原本 1 条访存裂成 8 条并触发 emitRemark。这就是『contiguity 不够或 mask 不对齐拿不到 128-bit 向量访存』的定量证据。i8 因位宽小(场景 F)可一次 16 元素仍是 128 位。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch34-m5-vec-clamp",
+          "claim": "getVectorSize=min(128/bitwidth, contiguity) 再被 mask alignment 夹:fp16 从满宽 8 元素(128 位)沿 contiguity→maskAlign 逐级掉到 4/2/1,带宽 128→64→32→16 位,塌到 1 时编译器发 remark。",
+          "template": "state-table",
+          "numbers": [
+            {"label": "fp16 硬件上限 128/16", "value": "8 元素", "provenance": "traces/vector_size.out 场景A;LoadStoreOpToLLVM.cpp:L142"},
+            {"label": "场景 A/B/C/D 的 vec", "value": "8 / 4 / 2 / 1", "provenance": "traces/vector_size.out vec 列(contiguity 16→4、maskAlign 无→2→1)"},
+            {"label": "对应位宽", "value": "128 / 64 / 32 / 16 位", "provenance": "traces/vector_size.out 位列 = vec*bitwidth"},
+            {"label": "标量退化触发 remark", "value": "vec==1 且 numElems>1", "provenance": "traces/vector_size.out 场景D remark=True;LoadStoreOpToLLVM.cpp:L195-L200"},
+            {"label": "i8 满宽", "value": "16 元素=128 位", "provenance": "traces/vector_size.out 场景F;128/8=16"}
+          ],
+          "caption_draft": "访存带宽战场:128 位是天花板,contiguity(ch25 AxisInfo)与 mask 对齐各是一把夹子。三者取最小——任一不足就从 128 位合并访存掉向标量,fp16 场景 D 带宽只剩 1/8 并被编译器点名。调优就是把这三把夹子都顶到 128/bitwidth。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m6-redundant-data-mask",
+      "intuition": "一份公告被抄给了整栋楼每层各一份,但只需要往公示栏贴一次。redundantDataMask 就是那条规矩:同一份数据被多个线程各持一份副本时(广播布局),只让『排在真实名额内』的那个线程去写全局内存,其余持副本的线程闭嘴——否则同一个地址被写好几遍,白耗带宽甚至打架。",
+      "worked_example": {
+        "params": {"shape": 64, "sizePerThread": 1, "threadsPerWarp": 32, "warpsPerCTA": 4, "shapePerCTATile": 128, "note": "shapePerCTATile=sizePerThread*threadsPerWarp*warpsPerCTA=128 > shape=64 → 该维数据被复制 2 份(触发去重分支,非退化);若取 shape≥128 则 shape>=tile 直接 continue 无掩码,故意避开。"},
+        "trace_source": "manual",
+        "manual_reason": "本章无精简版;真实掩码是编译期按 tensor 布局(getSizePerThread/threadsPerWarp/warpsPerCTA/getShapePerCTATile)生成的 icmp_slt 谓词,需 make_llir dump st.global 的 predicate 才能实测,host 无 CUDA。此处用 host 复刻 explainer/traces/redundant_mask.py 重放 LoadStoreOpToLLVM.cpp:L54-L62 的判定:shape[dim]<shapePerCTATile 时 mask&=icmp_slt(threadDim*sizePerThread, shape),threadDim=warpId*threadsPerWarp+laneId。表中数字见 traces/redundant_mask.out。",
+        "table": {
+          "columns": ["warp", "lane", "threadDim = warp*32+lane", "threadDim × sizePerThread", "< shape(64)?", "动作"],
+          "rows": [
+            ["0", "0", "0", "0", "True", "WRITE"],
+            ["0", "31", "31", "31", "True", "WRITE"],
+            ["1", "0", "32", "32", "True", "WRITE"],
+            ["1", "31", "63", "63", "True", "WRITE"],
+            ["2", "0", "64", "64", "False", "masked"],
+            ["2", "31", "95", "95", "False", "masked"],
+            ["3", "0", "96", "96", "False", "masked"],
+            ["3", "31", "127", "127", "False", "masked"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "每个真实全局地址恰被写一次:写者集合 = {线程 : threadDim*sizePerThread < shape} 恰好覆盖逻辑索引 [0, shape) 一次,互不重叠也无遗漏;其余复制副本线程谓词为假不写。",
+        "argument": "线程 threadDim 负责逻辑索引区间 [threadDim*sizePerThread, threadDim*sizePerThread+sizePerThread)。谓词 threadDim*sizePerThread < shape 选出的写者其起始索引 <shape;因 sizePerThread=1 且 threadDim 遍历 0..127,写者恰为 threadDim∈[0,64) 即 warp0/warp1,覆盖索引 0..63 各一次(trace:covered=64/64,writers*sizePerThread==shape 为 True)。warp2/warp3(threadDim 64..127)起始索引≥64 谓词假,正是那 2× 复制的副本,被屏蔽。故满射且单射。",
+        "monotonicity_or_base_step": "基例:threadDim=0 写索引 0;归纳:threadDim 每 +1 覆盖下一个 sizePerThread 段,直到起始索引≥shape 截止——区间无缝拼接且不越界,故恰好一次覆盖 [0,shape)。"
+      },
+      "quantified": "本例 shapePerCTATile=128 而 shape=64 → 数据被复制 2×;redundantDataMask 把 128 个线程里 64 个(warp0/1)留作写者、屏蔽另 64 个(warp2/3),store 全局流量 ×0.50(trace:writers=64/128)。若无此掩码,同一地址被写 2 遍 → 一半带宽纯浪费甚至竞态。复制倍数 = shapePerCTATile/shape = 2,写者占比 = 1/复制倍数。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch34-m6-writer-mask",
+          "claim": "广播布局(shape 64 < CTA tile 128)下数据被复制 2×;redundantDataMask 用 icmp_slt(threadDim*sizePerThread, shape) 只放行 warp0/warp1 写全局内存,warp2/warp3 谓词为假被屏蔽,store 流量减半。",
+          "template": "layout",
+          "numbers": [
+            {"label": "shape vs CTA tile", "value": "64 vs 128", "provenance": "traces/redundant_mask.out shape=64 shapePerCTATile=128;LoadStoreOpToLLVM.cpp:L54 shape[dim]<shapePerCTATile"},
+            {"label": "复制倍数", "value": "2×", "provenance": "traces/redundant_mask.out replication=2x = shapePerCTATile/shape"},
+            {"label": "写者阈值", "value": "threadDim < 64", "provenance": "traces/redundant_mask.out '< shape' 列翻转于 threadDim 64;icmp_slt(threadDim*1, 64) L61-L62"},
+            {"label": "写者 warps", "value": "warp0,warp1(64 线程)", "provenance": "traces/redundant_mask.out warp0/1 行 action=WRITE"},
+            {"label": "屏蔽 warps", "value": "warp2,warp3(64 线程)", "provenance": "traces/redundant_mask.out warp2/3 行 action=masked"},
+            {"label": "store 流量", "value": "×0.50", "provenance": "traces/redundant_mask.out writers=64 of 128"},
+            {"label": "覆盖检查", "value": "64/64 各写一次", "provenance": "traces/redundant_mask.out covered=64 of 64 (True)"}
+          ],
+          "caption_draft": "防重复写:store 谓词 = redundantDataMask ∧ 用户 mask。这维 shape(64)小于 CTA tile(128),说明每个逻辑元素被两个线程各持一份;掩码用线性阈值只选『落在真实形状内』的 warp0/1 当唯一写者,warp2/3 静默——每个全局地址恰写一次,带宽减半不重复。"
+        }
+      ]
+    }
+  ]
+}
