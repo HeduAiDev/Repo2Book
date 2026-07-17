@@ -1,0 +1,285 @@
+{
+  "chapter_id": "ch17",
+  "slug": "ch17-control-flow-lowering-scf",
+  "note": "本章 skip_impl（无 subtract-only 精简版）；『跑起来看数值』支柱由 pin v3.2.0 精确编译承担。所有 IR 事实取自追踪期 TTIR（ASTSource(...).make_ir(...)，任何 make_ttir pass 之前），驱动脚本 traces/run_ch17_control_flow.py 与 traces/run_m2_return_checker.py，原始输出 traces/ch17_traces.json 与 traces/m2_return_checker.json。数值仿真（负步长诱导重构、static_range 展开累加）是执行 IR 所编码的整数算术、结果落在同一 json。",
+
+  "mechanisms": [
+    {
+      "mechanism_id": "m1-visit-if-dispatch",
+      "intuition": "visit_If 像岔路口的检票员：先看条件是不是运行时张量（动态 cond）——不是，编译期就选定一条分支、连岔路都不建；是，再看这段 if 里『藏没藏 return』——藏了走 CFG 大路（能中途下车），没藏走 scf.if 结构化小路。四条路互斥。",
+      "figure_specs": [
+        {
+          "figure_id": "f17-1-if-dispatch",
+          "claim": "visit_If 按『cond 是否动态 × 是否含 return』把一段 if 分派到四条互斥的下降路径。",
+          "template": "flow",
+          "numbers": [
+            {"value": "visit_If L683-L708", "provenance": "python/triton/compiler/code_generator.py:L683-L708"},
+            {"value": "静态 cond → 编译期择一分支（visit_compound_statement active_block）", "provenance": "python/triton/compiler/code_generator.py:L698-L708"},
+            {"value": "动态+含 return+循环内 → raise", "provenance": "python/triton/compiler/code_generator.py:L690-L694"},
+            {"value": "动态+含 return+顶层 → visit_if_top_level（CFG）", "provenance": "python/triton/compiler/code_generator.py:L695"},
+            {"value": "动态+无 return → visit_if_scf（scf.if）", "provenance": "python/triton/compiler/code_generator.py:L697"}
+          ],
+          "caption_draft": "一段 if 走哪条下降路径不由 if 本身决定，而由『条件是不是运行时张量』和『子树里藏没藏 return』两个正交判据共同决定——这是本章其余机制的总调度台。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m2-contains-return-checker",
+      "intuition": "ContainsReturnChecker 像出门前逐个房间查『有没有人没关灯』：递归走遍 if 子树的每条语句、以及被裸调用的 jit 函数体，任一处踩到 return 就整体判『含 return』。但它有个真实盲点——赋值语句 y = f() 被当作『不可能提前返回』直接判 False，连右边 f() 的函数体都不再下探。",
+      "worked_example": {
+        "params": {"cases": "A 体内直接 return / B 只赋值无 return / C 裸调用含 return 的 jit 函数 / D 同一调用但结果被赋值", "note": "真跑 pin v3.2.0 的 ContainsReturnChecker 类于真实 AST 子树"},
+        "trace_source": "run",
+        "trace_ref": "traces/m2_return_checker.json",
+        "table": {
+          "columns": ["用例", "if 子树形态", "ContainsReturnChecker 判定", "visit_If 分派"],
+          "rows": [
+            ["A", "if 体内直接 return", "True", "顶层 CFG (visit_if_top_level)"],
+            ["B", "只有赋值、无 return", "False", "scf.if (visit_if_scf)"],
+            ["C", "裸调用含 return 的 jit 函数", "True", "顶层 CFG（transitively 递归进被调函数体）"],
+            ["D", "同一调用但结果被赋值 y=helper(...)", "False", "scf.if（visit_Assign 短路、不下探 RHS）"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "ContainsReturnChecker.visit 必终止，且返回 True ⟺ 沿其访问到的节点存在至少一个 return（含被裸调用的全局 JITFunction 体内的 return）。",
+        "argument": "终止：递归只下降到 AST 子节点（有限树）与被裸调用的全局 JITFunction 体（fn.parse 出新的有限树；noinline 函数不展开、Store 上下文的 Name 立即返回 False），无环故有限步停。聚合单调：generic_visit 用 `ret = ret or self.visit(child)`，任一子节点为 True 即整体 True，等价于『存在某条被访问路径命中 visit_Return』。盲点显式化：visit_Assign 直接 return False（源注释『x = ... 不可能提前 return』），故赋值 RHS 里的调用不被下探——用例 C（裸调用）判 True 而 D（同调用被赋值）判 False，仅差这一处。"
+      },
+      "quantified": "4 用例中 2 判 True→走 CFG、2 判 False→走 scf.if；C 与 D 只差『裸调用 vs 赋值』一处，判定就翻转，量化了 transitively 语义的边界——它只覆盖被 generic_visit 访问到的节点，visit_Assign 把 RHS 整个剪掉。"
+    },
+
+    {
+      "mechanism_id": "m3-scf-stack-guard",
+      "intuition": "scf_stack 是一叠『我正站在几层循环里』的便签：visit_For/visit_While 进入时压一张、退出时揭一张。visit_If 一旦发现自己带 return 且便签堆非空（=身处循环内），当场 raise——因为从结构化循环区域中途 return 需要跳出多层单入单出的 scf 区域，SCF 表达不了。配合 ContainsReturnChecker 的跨函数递归，连『被循环里调用的函数内的 return』也一并拦下。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "m4-if-toplevel-cfg",
+      "intuition": "带 return 的 if 走最原始的『条件跳转 + 汇合站』：cf.cond_br 把控制流分到 then/else 两个基本块，各分支把要带出去的变量当『行李』塞进 endif 汇合站的块参数（这就是手写的 φ），再各自 cf.br 到汇合站。块参数的每条入边 = 某分支 create_branch 传的实参。",
+      "figure_specs": [
+        {
+          "figure_id": "f17-2-cfg-blocks",
+          "claim": "带 return 的 if 下降成 cf.cond_br 到 then/else 两块、endif 块用块参数汇合（手写 φ），return 分支自带一个『no predecessors』死块。",
+          "template": "flow",
+          "numbers": [
+            {"value": "cf.cond_br %0, ^bb1, ^bb2", "provenance": "traces/ch17_traces.json → ir.K3_if_return_cfg（cf.cond_br 计数=1）"},
+            {"value": "^bb3: // no predecessors", "provenance": "traces/ch17_traces.json → ir.K3_if_return_cfg（no predecessors 计数=1）"},
+            {"value": "^bb4: // 2 preds: ^bb2, ^bb3（endif 汇合）", "provenance": "traces/ch17_traces.json → op_counts.K3_if_return_cfg.cf.br=2"},
+            {"value": "endif_block.add_argument = 块参数（手写 φ）", "provenance": "python/triton/compiler/code_generator.py:L634, L646-L653"}
+          ],
+          "caption_draft": "return 让 then 分支直接 tt.return 离场，剩下的 else 与 return-后死块经 cf.br 汇入 ^bb4——整张图是非结构化 CFG，没有单一出口，这正是它无法塞进 scf.if 的原因。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m5-return-dead-block",
+      "intuition": "visit_Return 发出 builder.ret 之后，硬开一个『没有前驱』的死块（post_ret_block）——好比在终点线之后又画了一段跑道，没人能跑到。TTIR 里它显示为 `^bbN: // no predecessors`。正是这个『提前离场 + 死块』破坏了 scf.if/scf.for 要求的单一出口，成为『带 return 必走 CFG』的实证。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "m6-if-scf",
+      "intuition": "无 return 的 if 走结构化小路：scf.if 自带 then/else 两个区域，每个区域末尾用 scf.yield『交作业』把更新后的变量交回来，外面用 SSA 结果接住。一进一出、干净闭合——没有跳转、没有死块。未更新值的那一侧就 yield 进入前的 livein 原值。",
+      "figure_specs": [
+        {
+          "figure_id": "f17-3-scf-if",
+          "claim": "无 return 的 if 下降成 scf.if：then/else 各以 scf.yield 收口、结果 SSA 值接回符号表；未更新的分支 yield livein 原值。",
+          "template": "before-after",
+          "numbers": [
+            {"value": "%5 = scf.if %4 -> (tensor<8xf32>)", "provenance": "traces/ch17_traces.json → ir.K2_if_scf（scf.if 计数=1）"},
+            {"value": "then: scf.yield %9（x+1）", "provenance": "traces/ch17_traces.json → ir.K2_if_scf"},
+            {"value": "else: scf.yield %3（livein x 原值）", "provenance": "traces/ch17_traces.json → ir.K2_if_scf（scf.yield 计数=2）"}
+          ],
+          "caption_draft": "源码里只写了 then 分支（if c>0: x=x+1），下降后 else 分支被自动补出并 yield 进入前的 x（%3）——scf.if 的『单入单出』靠两侧都 yield 同一组变量来保证。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m7-then-else-defs",
+      "intuition": "两条分支各写各的草稿，汇合处要对账：凡『进 if 前就可见（livein）、且被某条分支改过』的变量都要在汇合处统一成一个新值；只有一条分支改了的，另一条就用进入前的旧值补齐——这正是 φ 的另一条入边。",
+      "worked_example": {
+        "params": {"kernel": "if c>0: x=x+1  else: x=x-1; y=y+10", "BLOCK": 8, "note": "x 两侧都改（对称）、y 只 else 改（非对称）"},
+        "trace_source": "run",
+        "trace_ref": "traces/ch17_traces.json",
+        "table": {
+          "columns": ["变量", "进入前 livein", "then 改?", "else 改?", "scf.if 结果类型", "then 侧 yield", "else 侧 yield"],
+          "rows": [
+            ["x", "是 (%3)", "改 x+1", "改 x-1", "tensor<8xf32>", "x+1", "x-1"],
+            ["y", "是 (%7)", "未改", "改 y+10", "tensor<8xf32>", "livein y 原值 (%7)", "y+10"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "汇合处 names = {进入前可见(livein) 且被 then 或 else 至少一侧重定义的变量}；每个 name 在两条入边都有一个同类型 SSA 值（未改的一侧补 livein 原值），故 scf.if 的每个结果都单值良定义。",
+        "argument": "对每个 livein name：若某侧未 def，代码显式令该侧 defs[name]=liveins[name]（源 L616-L622 的对称补齐），保证 then/else 两侧都为该 name 提供一个 SSA 值；类型一致性由 `assert defs[name].type == liveins[name].type`（源 L595-L599）把关。于是 scf.if 每个结果恰有两条 yield 入边、类型统一 —— 本例得 %9:2 两个结果。"
+      },
+      "quantified": "本例 union 出 2 个汇合变量 → scf.if 出 2 个结果（%9:2）；对称变量 x 两侧各出 1 个新值，非对称变量 y 只 else 出新值、then 用 livein %7 补齐——非对称正是 φ 存在的意义。"
+    },
+
+    {
+      "mechanism_id": "m8-for-dispatch",
+      "intuition": "visit_For 先看迭代器是谁：tl.static_range → 编译期直接摊开（IR 里没有循环）；tl.range → 携带 num_stages/loop_unroll_factor 两个流水线属性走 scf.for；Python 原生 range → 走朴素 scf.for（无属性）。三条路在函数开头就分好。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "m9-static-range-unroll",
+      "intuition": "static_range 像把『重复三遍』的谱子直接抄成三行：因为三个边界都是 constexpr，编译期就把循环体复制 N 份，每份把诱导变量钉成常量 constexpr(i)。IR 里根本没有 scf.for——利于常量传播/激进展开，代价是代码膨胀。",
+      "worked_example": {
+        "params": {"iter": "tl.static_range(0, 3)", "body": "acc = acc + k", "note": "acc 初值 0（每 lane 同）；k 编译期钉成 0/1/2"},
+        "trace_source": "run",
+        "trace_ref": "traces/ch17_traces.json",
+        "table": {
+          "columns": ["展开次序", "诱导变量 k (constexpr)", "生成的体内常量", "每-lane acc 累加后"],
+          "rows": [
+            ["0", "0", "dense<0>", "0"],
+            ["1", "1", "dense<1>", "1"],
+            ["2", "2", "dense<2>", "3"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "static_range 三界皆 constexpr → 展开次数 (end-start)/step 编译期确定且有限 → 展开必停（等价于把普通 Python for 在追踪期跑完）。",
+        "argument": "visit_For 对 static_range 直接构造 Python range(start,end,step) 并 for i in ... 逐次 visit_compound_statement（源 L902-L910），每次把 target 绑成 constexpr(i)；range 有限故循环有限、无 scf.for 生成。IR 佐证：K6 里出现 dense<0>/dense<1>/dense<2> 三组常量、零个 scf.for。"
+      },
+      "quantified": "static_range(0,3) 生成 3 份体拷贝、0 个 scf.for；K6 里 arith.addi 计数=6（每份体 1 个累加 add + 1 个溢出检查 add，共 3×2），说明展开是逐份复制而非循环。"
+    },
+
+    {
+      "mechanism_id": "m10-negative-step",
+      "intuition": "MLIR 的 scf.for 只会正着数，负步长得『翻译』：把 range(10,0,-1) 的边界对调、步长取正，让循环正着从 0 跑到 9；再在循环体开头用 iv = ub - j + lb 把计数器『翻回』用户要的递减序列 10,9,…,1。用户写的是倒着数，机器跑的是正着数，体首一步反算把两者对上。",
+      "worked_example": {
+        "params": {"user_loop": "range(10, 0, -1)", "swapped": "lb'=0, ub'=10, step'=1", "reconstruct": "iv = ub - j + lb = 10 - j"},
+        "trace_source": "run",
+        "trace_ref": "traces/ch17_traces.json",
+        "table": {
+          "columns": ["scf.for 计数器 j", "iv = ub - j + lb（反算）", "用户看到的 k"],
+          "rows": [
+            ["0", "10", "10"],
+            ["1", "9", "9"],
+            ["2", "8", "8"],
+            ["9", "1", "1"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "边界翻转 + iv=ub-j+lb 反算，双射还原用户的递减序列：range(10,0,-1) 的原序列 [10,9,…,1] 与反算序列逐项相等（仿真实测 match=True）。",
+        "argument": "翻转后 scf.for 计数器 j∈[0,(ub'-lb')/step')=[0,10) step 1；体首 iv=ub-j+lb=10-j，j 从 0 到 9 时 iv 从 10 到 1，是 {0..9}→{10..1} 的双射，恰为 range(10,0,-1) 的原序列。IR 佐证：K4 体首 `%9 = arith.subi %2(ub=10), %arg1(j)` + `%10 = arith.addi %9, %1(lb=0)`，即 iv=ub-j+lb。仿真 neg_step_reconstruction 逐项对照 python range(10,0,-1)，match=True。"
+      },
+      "quantified": "10 次迭代；体首为反算多付 2 条 arith 指令（subi + addi）——K4 op 计数 subi=1、addi=3（1 反算 subi + 1 反算 addi + 1 累加 addi + 1 溢出检查 addi）。这点开销换来『前端对用户屏蔽 scf.for 只能正数』的抽象。",
+      "figure_specs": [
+        {
+          "figure_id": "f17-4-negstep-reconstruct",
+          "claim": "range(10,0,-1) 下降为『0..9 正序 scf.for + 体首 iv=ub-j+lb 反算』，逐次还原用户的递减序列 10..1。",
+          "template": "state-table",
+          "numbers": [
+            {"value": "j=0 → iv=10", "provenance": "traces/ch17_traces.json → neg_step_reconstruction.rows[0]"},
+            {"value": "j=1 → iv=9", "provenance": "traces/ch17_traces.json → neg_step_reconstruction.rows[1]"},
+            {"value": "j=9 → iv=1", "provenance": "traces/ch17_traces.json → neg_step_reconstruction.rows[9]"},
+            {"value": "reconstructed_seq=[10,9,8,7,6,5,4,3,2,1] match=True", "provenance": "traces/ch17_traces.json → neg_step_reconstruction.match"},
+            {"value": "IR 体首 subi %2 %arg1 + addi %9 %1", "provenance": "traces/ch17_traces.json → ir.K4_for_negstep（arith.subi=1, arith.addi=3）"}
+          ],
+          "caption_draft": "左列是 MLIR 正着数的循环计数器 j，右列是体首反算出的、用户真正看到的诱导值——两列相差一次 ub-j+lb 变换，正是 scf.for『只能正步长』这条硬约束在前端留下的补偿痕迹。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m11-poison-induction-var",
+      "intuition": "建 for_op 之前还没有真正的循环计数器，但循环体已经要用它——先塞一个合法的『占位符』ub.poison 顶上，等 for_op 造好、拿到真计数器 get_induction_var，再用 replace_all_uses_with 一次性把所有占位引用换成真值。像先用铅笔占个座，正主到了再擦掉换上。",
+      "figure_specs": [
+        {
+          "figure_id": "f17-5-poison-lifecycle",
+          "claim": "诱导变量三步走：create_poison 占位 → dry-run 探 loop-carried/建 for_op → get_induction_var 回填 replace_all_uses_with；追踪期 IR 里 `%N = ub.poison : i32` 是这枚占位符的痕迹。",
+          "template": "swimlane",
+          "numbers": [
+            {"value": "create_poison 占位（set_value target）", "provenance": "python/triton/compiler/code_generator.py:L956-L958"},
+            {"value": "%4 = ub.poison : i32（主函数里的诱导变量占位）", "provenance": "traces/ch17_traces.json → ir.K1_for_range_attrs"},
+            {"value": "get_induction_var + replace_all_uses_with 回填", "provenance": "python/triton/compiler/code_generator.py:L1016-L1023"}
+          ],
+          "caption_draft": "poison 不是错误，而是 SSA『先声明后定义』做不到时的合法占位——它让 dry-run 阶段能引用『尚不存在』的诱导变量，等 for_op 建好再一次性替换掉。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m12-for-dryrun-loopcarried",
+      "intuition": "要造 scf.for 必须先知道『哪些变量跨迭代传递』（loop-carried），但这信息只能靠真访问一遍循环体拿到——于是先在一个临时块里『预演』visit 一遍、抄下 local_defs∩liveins、再 erase 丢弃这段 IR；正式建好 for_op 后再 visit 一遍真的。第一遍只为侦察，不留痕。",
+      "figure_specs": [
+        {
+          "figure_id": "f17-6-dryrun-loopcarried",
+          "claim": "for 下降靠一次 dry-run（建块→visit body→erase）先探 loop-carried=local_defs∩liveins，再正式 create_for_op + 重 visit——识别机理见第 15 章，本章是其在完整 for 下的落地。",
+          "template": "swimlane",
+          "numbers": [
+            {"value": "dry-run: create_block → visit body → block.erase()", "provenance": "python/triton/compiler/code_generator.py:L964-L971"},
+            {"value": "loop-carried = local_defs ∩ liveins → init_args/yields/names", "provenance": "python/triton/compiler/code_generator.py:L978-L986"},
+            {"value": "acc 为唯一 loop-carried → scf.for iter_args(%arg3 = %0)", "provenance": "traces/ch17_traces.json → ir.K1_for_range_attrs"},
+            {"value": "正式 visit body 用 for_op body arg(i+1) 接块参数（arg0=诱导变量）", "provenance": "python/triton/compiler/code_generator.py:L1001-L1003"}
+          ],
+          "caption_draft": "循环体被 visit 了两遍：第一遍进临时块只为数出 loop-carried（acc），随即 erase 抹掉；拿到 iter_args 才能 create_for_op，再第二遍正式生成体——dry-run 是『先探后建』的必要代价。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m13-scf-for-attrs",
+      "intuition": "用户在 tl.range 上写的 num_stages/loop_unroll_factor 不是运行时参数——追踪期就被刻成 scf.for 的 tt.num_stages/tt.loop_unroll_factor 属性，成为后续软件流水线 pass（前瞻第 29/30 章）与循环展开器读取的输入。前端把优化意图直接钉在循环上，pass 阶段照单执行。",
+      "figure_specs": [
+        {
+          "figure_id": "f17-7-range-attrs",
+          "claim": "tl.range(...,num_stages=3,loop_unroll_factor=2) 在追踪期即把两个流水线意图挂成 scf.for 的属性 `{tt.loop_unroll_factor = 2 : i32, tt.num_stages = 3 : i32}`——第 29/30 章 pass 的输入。",
+          "template": "before-after",
+          "numbers": [
+            {"value": "num_stages=3", "provenance": "traces/ch17_traces.json → ir.K1_for_range_attrs（tt.num_stages = 3 : i32）"},
+            {"value": "loop_unroll_factor=2", "provenance": "traces/ch17_traces.json → ir.K1_for_range_attrs（tt.loop_unroll_factor = 2 : i32）"},
+            {"value": "tt.num_stages 属性计数=1, tt.loop_unroll_factor 计数=1", "provenance": "traces/ch17_traces.json → op_counts.K1_for_range_attrs"},
+            {"value": "set_attr 挂载点", "provenance": "python/triton/compiler/code_generator.py:L991-L994"},
+            {"value": "num_stages/loop_unroll_factor 由 tl.range 构造记下", "provenance": "python/triton/language/core.py:L2570-L2582"}
+          ],
+          "caption_draft": "追踪期 TTIR（任何 pass 之前）就带着这两个属性——它们不是给循环本身用的，而是留给下游软件流水线 pass 的『施工单』，这正是控制流下降与性能优化的接缝。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m14-while-two-regions",
+      "intuition": "scf.while 用两个房间表达『先判条件再决定跑不跑体』：before 房间算 test 并用 scf.condition 把 loop-carried 变量『带过门』，after 房间跑循环体并用 scf.yield 回传。两个房间各持一份 loop-carried 块参数——就是 φ 的两条入边。对照 for：while 的诱导逻辑全在 before 区的用户条件里，没有 poison/负步长那套。",
+      "figure_specs": [
+        {
+          "figure_id": "f17-8-while-regions",
+          "claim": "while 下降成 scf.while 双区域：before 区 arith.cmpi + scf.condition 带出 loop-carried、after 区跑体 + scf.yield 回传；两区各持一份块参数。",
+          "template": "before-after",
+          "numbers": [
+            {"value": "%1:2 = scf.while (%arg2=%0, %arg3=%c0_i32)（2 个 loop-carried：acc, i）", "provenance": "traces/ch17_traces.json → ir.K5_while（scf.while 计数=1）"},
+            {"value": "before 区: arith.cmpi slt + scf.condition(%5) %arg2,%arg3", "provenance": "traces/ch17_traces.json → ir.K5_while（scf.condition 计数=1）"},
+            {"value": "after 区: scf.yield %12, %19", "provenance": "traces/ch17_traces.json → ir.K5_while（scf.yield 计数=1）"},
+            {"value": "before/after 各 create_block_with_parent 绑块参数", "provenance": "python/triton/compiler/code_generator.py:L847-L875"}
+          ],
+          "caption_draft": "while 的两个区域一目了然：上房间（before）只算条件并 scf.condition 决定要不要进下房间；下房间（after）跑体并 scf.yield 把新值交回上房间——每轮的 loop-carried 在两房间之间循环流转。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m15-structured-vs-cfg-perf",
+      "intuition": "同一段逻辑，写法决定它能不能被优化：不带 return 的循环/分支下降成结构化 scf.for/scf.if，软件流水线、循环展开等 pass 能直接『吃』；一旦循环体或函数中途 return，就掉进非结构化的 cf.cond_br CFG 路径，这些结构化 pass 吃不了，num_stages 也无处可挂。『循环体内 return』『函数中途 return』因此会削弱可优化性——这是本章给读者的性能判据。",
+      "figure_specs": [
+        {
+          "figure_id": "f17-9-structured-vs-cfg",
+          "claim": "控制流写法直接决定下降路径与可优化性：结构化 scf（能挂 num_stages、被流水线 pass 吃）对比带 return 的 cf.cond_br CFG（非结构化、pass 吃不了）。",
+          "template": "before-after",
+          "numbers": [
+            {"value": "结构化路径: scf.for + {tt.num_stages=3, tt.loop_unroll_factor=2}", "provenance": "traces/ch17_traces.json → ir.K1_for_range_attrs"},
+            {"value": "非结构化路径: cf.cond_br=1 + no predecessors 死块=1", "provenance": "traces/ch17_traces.json → op_counts.K3_if_return_cfg"},
+            {"value": "循环内 return → 编译期 raise（根本无法下降）", "provenance": "traces/ch17_traces.json → ir.K7_return_in_for_error"},
+            {"value": "分派判据: contains_return + scf_stack", "provenance": "python/triton/compiler/code_generator.py:L688-L697"}
+          ],
+          "caption_draft": "左边结构化 scf.for 身上挂着给流水线 pass 的属性、右边带 return 的 cf CFG 只有裸跳转和死块——把 return 写进循环/分支，等于亲手把这段代码挪出结构化优化的射程。"
+        }
+      ]
+    }
+  ]
+}
