@@ -242,7 +242,7 @@ writeV = await agent(
   (A.skip_impl
     ? '本章无精简版（方法论/概览章）——以真实源码 + 架构图为主线，不要提"精简版"。\n'
     : '精简版只作"运行看数值"的交叉验证，不是主角。\n若发现精简版缺了你要讲清的细节 → 用逃生舱拉闸（status=BLOCKED）让 implementer 补回，别将就。\n') +
-  '埋伏笔、`python3 ' + REPO + '/scripts/bible.py payoff --resolve` 回收应回收项。\n' +
+  '按 dossier.foreshadow_due 在正文写好应埋伏笔的铺垫、应回收伏笔的回指兑现——**只写正文,不碰 arc-map 状态**(不要跑 `bible.py payoff --resolve`)。伏笔的 resolved 回写由 archivist 归档时统一做:writer 在 Write 阶段改 arc-map,会在本章尚未提交时就把 resolved 泄漏进并行发车的别章 commit(exp-0717-2)。\n' +
   '**零脚手架泄漏**：规范 vllm/ 路径、自然标题(无 Cell N)、不提内部文件。\n' +
   '完成后自跑' + (PRIMER ? '五个 linter（chapter_structure/formulas/source_grounding/trace_consistency/paper_grounding --expect-primer，primer 章不跑 fidelity）' : (A.skip_impl ? '四个 linter（chapter_structure/formulas/source_grounding/trace_consistency，本章无精简版故不跑 fidelity）' : '五个 linter（chapter_structure/formulas/source_grounding/fidelity/trace_consistency）')) + '均无 BLOCKING（图的 linter 归 illustrator，不用你跑）。返回 status/note。' + ESC,
   { schema: WRITE_STATUS_SCHEMA, label: 'write r' + w, phase: 'Write', agentType: 'general-purpose', model: MODELS.write }

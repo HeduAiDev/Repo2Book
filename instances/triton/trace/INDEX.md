@@ -5,6 +5,7 @@
 ## Recent Activity
 
 | Date | Type | Chapter | Summary | File |
+| 2026-07-17 | delivery | 19 | ch19-tt-dialect-vocabulary-delivered-(code) | [2026-07-17_ch19-ch19-tt-dialect-vocabulary-delivered-(code).md](deliveries/2026-07-17_ch19-ch19-tt-dialect-vocabulary-delivered-(code).md) |
 | 2026-07-17 | delivery | 15 | ch15-ssa-and-structured-control-flow-delivered-(primer) | [2026-07-17_ch15-ch15-ssa-and-structured-control-flow-delivered-(primer).md](deliveries/2026-07-17_ch15-ch15-ssa-and-structured-control-flow-delivered-(primer).md) |
 | 2026-07-17 | delivery | 14 | ch14-compile-driver-loop-delivered-(skip_impl) | [2026-07-17_ch14-ch14-compile-driver-loop-delivered-(skip_impl).md](deliveries/2026-07-17_ch14-ch14-compile-driver-loop-delivered-(skip_impl).md) |
 | 2026-07-17 | delivery | 13 | ch13-triton-interpret-delivered-(skip_impl) | [2026-07-17_ch13-ch13-triton-interpret-delivered-(skip_impl).md](deliveries/2026-07-17_ch13-ch13-triton-interpret-delivered-(skip_impl).md) |
@@ -14,4 +15,3 @@
 | 2026-07-16 | delivery | 09 | ch09-self-hosted-libraries-delivered-(skip_impl) | [2026-07-16_ch09-ch09-self-hosted-libraries-delivered-(skip_impl).md](deliveries/2026-07-16_ch09-ch09-self-hosted-libraries-delivered-(skip_impl).md) |
 | 2026-07-16 | delivery | 08 | ch08-dot-reduce-scan-delivered-(deep) | [2026-07-16_ch08-ch08-dot-reduce-scan-delivered-(deep).md](deliveries/2026-07-16_ch08-ch08-dot-reduce-scan-delivered-(deep).md) |
 | 2026-07-16 | decision | 07 | 候选经验:write-review 回环够不到图,figure-only blocking 项必致 review-exhausted | [2026-07-16_ch07-候选经验:write-review-回环够不到图,figure-only-blocking-项必致-review-exh.md](decisions/2026-07-16_ch07-候选经验:write-review-回环够不到图,figure-only-blocking-项必致-review-exh.md) |
-| 2026-07-16 | delivery | 07 | ch07《造块、形状变换、访存与原子操作》定稿（Archive 补做） | [2026-07-16_ch07-ch07《造块、形状变换、访存与原子操作》定稿（archive-补做）.md](deliveries/2026-07-16_ch07-ch07《造块、形状变换、访存与原子操作》定稿（archive-补做）.md) |
