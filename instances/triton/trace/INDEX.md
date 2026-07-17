@@ -5,6 +5,7 @@
 ## Recent Activity
 
 | Date | Type | Chapter | Summary | File |
+| 2026-07-17 | delivery | ch42 | ch42《【原理篇】FlashAttention:在线 softmax 与分块遍历》定稿——Part IX 原理篇 | [2026-07-17_ch42-ch42《【原理篇】flashattention:在线-softmax-与分块遍历》定稿——part-ix-原理篇.md](deliveries/2026-07-17_ch42-ch42《【原理篇】flashattention:在线-softmax-与分块遍历》定稿——part-ix-原理篇.md) |
 | 2026-07-17 | delivery | ch41 | ch41《调试与学习:triton-opt 家族、tensor-layout 探针与 tutorials 阶梯》定稿——Part IX 工具生态收官 | [2026-07-17_ch41-ch41《调试与学习:triton-opt-家族、tensor-layout-探针与-tutorials-阶梯》定稿——.md](deliveries/2026-07-17_ch41-ch41《调试与学习:triton-opt-家族、tensor-layout-探针与-tutorials-阶梯》定稿——.md) |
 | 2026-07-17 | delivery | ch38 | ch38《对照落地:AMD HIP 后端——同一抽象的第二种实现》定稿——Part VIII 收官 | [2026-07-17_ch38-ch38《对照落地:amd-hip-后端——同一抽象的第二种实现》定稿——part-viii-收官.md](deliveries/2026-07-17_ch38-ch38《对照落地:amd-hip-后端——同一抽象的第二种实现》定稿——part-viii-收官.md) |
 | 2026-07-17 | delivery | ch37 | ch37《从 PTX 到 cubin 到发射:ptxas、二进制装载与 launcher》定稿——Part VIII 落地段 | [2026-07-17_ch37-ch37《从-ptx-到-cubin-到发射:ptxas、二进制装载与-launcher》定稿——part-viii-落.md](deliveries/2026-07-17_ch37-ch37《从-ptx-到-cubin-到发射:ptxas、二进制装载与-launcher》定稿——part-viii-落.md) |

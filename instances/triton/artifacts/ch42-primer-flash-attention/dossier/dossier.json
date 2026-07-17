@@ -1,0 +1,379 @@
+{
+  "kind": "primer",
+  "chapter_id": "ch42",
+  "slug": "ch42-primer-flash-attention",
+  "title": "FlashAttention：在线 softmax 与分块遍历",
+  "one_line": "朴素 attention 物化 N×N 打分矩阵 → 在线 softmax（不物化整行）+ 分块遍历 + rescale（增量更新恒等于全矩阵 softmax），落在 Triton 官方 FlashAttention v2 kernel（tutorials/06）逐行可核。",
+  "redline": "主真相源=A 档 pin v3.2.0 python/tutorials/06-fused-attention.py（FA v2 的 Triton 真实实现，逐字可核）。在线 softmax 递推与 rescale 恒等性从代码逐行推出（可核）。四篇论文（FA2 arXiv:2307.08691 / FA1 arXiv:2205.14135 / Rabe-Staats arXiv:2112.05682 / Milakov-Gimelshein online-softmax arXiv:1805.02867）：FA2 由 docstring:5、FA1+Rabe-Staats 由 docstring:11-12 逐字写出（source-cited）；Milakov 为 web-verified uncited 前身。论文内文（定理编号/复杂度证明/FA2 加速比数字/O(log n) 证明）本包组装环境无网络未逐字核实——一律标『待核·回指 arXiv:xxxx』，writer 绝不编造论文内文，回指出处即可（承 exp-0715-1）。",
+  "paper_grounding_note": "primer 章：subtraction_plan 留空对象（不做减法）；替代门禁 lint_paper_grounding。embed_excerpts 双源（tutorials/06 逐字代码 + paper.md 已定义公式，均带锚）。key_figures 已在 book/papers/ch42-primer-flash-attention/meta.json 登记 2 张（online-softmax 递推图 §42.2.2 / tiling-rescale 时序图 §42.3.2）。",
+  "code_spine": [
+    "python/tutorials/06-fused-attention.py:L534-L541  朴素参考实现（test_op 内）：物化 N×N 的 p = matmul(q,kᵀ)*scale → causal mask → softmax → matmul(p,v)。§1 动机的对照锚",
+    "python/tutorials/06-fused-attention.py:L154-L165  _attn_fwd 初始化：offs_m/offs_n、m_i=-inf、l_i=1.0、acc=0、qk_scale*=1/ln2、q 常驻 SRAM",
+    "python/tutorials/06-fused-attention.py:L166-L183  causal STAGE 两趟拆分：stage1 off-band（STAGE&1，传 4-STAGE）、stage2 on-band 对角块（STAGE&2，传 2）",
+    "python/tutorials/06-fused-attention.py:L34-L44   _attn_fwd_inner：STAGE 决定 K/V 遍历区间 lo,hi（off-band=[0,start_m*BLOCK_M) / on-band=对角块 / 非 causal=[0,N_CTX)）+ advance 指针到 lo",
+    "python/tutorials/06-fused-attention.py:L46-L60   内层循环：load K → qk=dot(q,k) →（STAGE==2 逐元素 mask -1e6）→ m_ij 抬 running max → qk-=m_ij（减 max）→ p=exp2(qk) → l_ij=sum(p,1) 块内和",
+    "python/tutorials/06-fused-attention.py:L61-L76   rescale 三件套：alpha=exp2(m_i-m_ij) → l_i=l_i*alpha+l_ij → acc=acc*alpha → load V → p→fp16 → acc=dot(p,v,acc) 增量累加 → m_i=m_ij 滚动 → advance K/V",
+    "python/tutorials/06-fused-attention.py:L184-L189  epilogue：m_i+=log2(l_i)（log-sum-exp 存反向用）→ acc=acc/l_i 延迟一次归一化 → store M、store O",
+    "python/tutorials/06-fused-attention.py:L451,L458  forward wrapper：stage=3 if causal else 1；grid=(cdiv(N_CTX,BLOCK_M), Z*H, 1) 每 Q 块一个 program（FA2 序列块并行）"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "python/tutorials/06-fused-attention.py",
+      "lines": "L534-L541",
+      "code": "    # reference implementation\n    M = torch.tril(torch.ones((N_CTX, N_CTX), device=\"cuda\"))\n    p = torch.matmul(q, k.transpose(2, 3)) * sm_scale\n    if causal:\n        p[:, :, M == 0] = float(\"-inf\")\n    p = torch.softmax(p.float(), dim=-1).half()\n    # p = torch.exp(p)\n    ref_out = torch.matmul(p, v)",
+      "elide": [
+        "紧随其后的 ref_out.backward(dout) 与 ref_dv/ref_dk/ref_dq 反向对照（L542-545）本 primer 只讲前向、可省略"
+      ],
+      "note": "§1 动机对照锚：朴素 attention 就是这一行数学翻译——中间 p 的形状是 N_CTX×N_CTX（=N×N），必须完整物化写进显存。FlashAttention 要证明的就是『算出与这段逐位相等的结果、却从不物化 p』。"
+    },
+    {
+      "path": "python/tutorials/06-fused-attention.py",
+      "lines": "L157-L165",
+      "code": "    # initialize pointer to m and l\n    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float(\"inf\")\n    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0\n    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)\n    # load scales\n    qk_scale = sm_scale\n    qk_scale *= 1.44269504  # 1/log(2)\n    # load q: it will stay in SRAM throughout\n    q = tl.load(Q_block_ptr)",
+      "elide": [
+        "前面 make_block_ptr 为 Q/K/V/O 构造块指针（L112-L153）——布局细节，本章只需知道 q/K/V 按块 load"
+      ],
+      "note": "§3.1 三件套初始化对应关系：m_i=running max m、l_i=running sum ℓ、acc=输出累加器 O。两工程要点：qk_scale*=1.44269504(=1/ln2) 让全程 exp2 等价 exp（纯性能，不改数学）；q 常驻 SRAM（注释 it will stay in SRAM throughout）= FlashAttention『都在片上算』的关键。l_i 初值取 1.0 而非 0——第一块 m_i=-inf 使 alpha=exp2(-inf)=0，l_i*alpha 把初值清零，不影响正确性。"
+    },
+    {
+      "path": "python/tutorials/06-fused-attention.py",
+      "lines": "L45-L77",
+      "code": "    # loop over k, v and update accumulator\n    for start_n in range(lo, hi, BLOCK_N):\n        start_n = tl.multiple_of(start_n, BLOCK_N)\n        # -- compute qk ----\n        k = tl.load(K_block_ptr)\n        qk = tl.dot(q, k)\n        if STAGE == 2:\n            mask = offs_m[:, None] >= (start_n + offs_n[None, :])\n            qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)\n            m_ij = tl.maximum(m_i, tl.max(qk, 1))\n            qk -= m_ij[:, None]\n        else:\n            m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)\n            qk = qk * qk_scale - m_ij[:, None]\n        p = tl.math.exp2(qk)\n        l_ij = tl.sum(p, 1)\n        # -- update m_i and l_i\n        alpha = tl.math.exp2(m_i - m_ij)\n        l_i = l_i * alpha + l_ij\n        # -- update output accumulator --\n        acc = acc * alpha[:, None]\n        # update acc\n        v = tl.load(V_block_ptr)\n        if fp8_v:\n            p = p.to(tl.float8e5)\n        else:\n            p = p.to(tl.float16)\n        acc = tl.dot(p, v, acc)\n        # update m_i and l_i\n        m_i = m_ij\n        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))\n        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))\n    return acc, l_i, m_i",
+      "elide": [
+        "fp8_v 分支（p.to(tl.float8e5)）是 fp8 数据类型特例，讲解取非 fp8 主路径 p.to(tl.float16) 即可"
+      ],
+      "note": "本章命门。逐行对上 §2.3 数学：qk=dot(q,k)→S^(j)；m_ij=max(m_i,max(qk)*qk_scale)→running max 抬升；qk*qk_scale-m_ij→减 running max（稳定）；p=exp2(qk)→P̃；l_ij=sum(p,1)→块内分母贡献；alpha=exp2(m_i-m_ij)→rescale 因子 α；l_i=l_i*alpha+l_ij→分母 rescale 后累加；acc=acc*alpha→累加器 rescale α·O^(j-1)；acc=dot(p,v,acc)→O^(j)=α·O^(j-1)+P̃·Vj（tl.dot 第三参=加到 acc）；m_i=m_ij→滚动。关键 alpha（L62/L65）：新块抬高 running max，旧 acc/l_i 以旧基准算得偏大，同乘 α=exp2(m_i-m_ij)≤1 降标度到新基准——这让分块增量与一次性全矩阵 softmax 严格恒等（exact，非近似）。"
+    },
+    {
+      "path": "python/tutorials/06-fused-attention.py",
+      "lines": "L184-L189",
+      "code": "    # epilogue\n    m_i += tl.math.log2(l_i)\n    acc = acc / l_i[:, None]\n    m_ptrs = M + off_hz * N_CTX + offs_m\n    tl.store(m_ptrs, m_i)\n    tl.store(O_block_ptr, acc.to(Out.type.element_ty))",
+      "elide": [],
+      "note": "§3.3 收尾。内层循环只累加未归一化的 acc 与分母 l_i，归一化推迟到所有块扫完只做一次除法 acc/l_i（对应 O=O^(last)/ℓ^(last)），省掉朴素实现每行都归一化的开销。m_i+=log2(l_i) 把 running max 与 log(分母) 合成一个 log-sum-exp 值存进 M——反向重算 softmax 时只需这一个标量（对应 FlashAttention 反向不存 N×N 思想，回指 arXiv:2205.14135，具体反向推导待核）。"
+    },
+    {
+      "path": "python/tutorials/06-fused-attention.py",
+      "lines": "L166-L183",
+      "code": "    # stage 1: off-band\n    # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE\n    # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE\n    if STAGE & 1:\n        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,  #\n                                        start_m, qk_scale,  #\n                                        BLOCK_M, HEAD_DIM, BLOCK_N,  #\n                                        4 - STAGE, offs_m, offs_n, N_CTX, V.dtype.element_ty == tl.float8e5  #\n                                        )\n    # stage 2: on-band\n    if STAGE & 2:\n        # barrier makes it easier for compielr to schedule the\n        # two loops independently\n        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,  #\n                                        start_m, qk_scale,  #\n                                        BLOCK_M, HEAD_DIM, BLOCK_N,  #\n                                        2, offs_m, offs_n, N_CTX, V.dtype.element_ty == tl.float8e5  #\n                                        )",
+      "elide": [
+        "两次调用重复的入参列表可在正文精简展示；重点是 STAGE&1 走 off-band、STAGE&2 走 on-band"
+      ],
+      "note": "§3.4 causal 分块。wrapper stage=3 if causal else 1（L451）：causal→STAGE=3 两趟都走（off-band 整块 + on-band 对角块）；非 causal→STAGE=1 一趟扫完整个 N（此时 STAGE&1 真、传给 inner 的是 4-STAGE=3，inner 的 else 分支 lo,hi=0,N_CTX 全程扫）。整块在对角线严格以下 → query 全可见、无需逐元素 mask；只有对角块（inner STAGE==2 分支 L51-55）需逐元素 mask。『整块跳过 mask』是分块框架白捡的便宜：因果结构天然只算下三角，分块让跳过整个上三角块零成本。"
+    },
+    {
+      "path": "python/tutorials/06-fused-attention.py",
+      "lines": "L5-L12",
+      "code": "This is a Triton implementation of the Flash Attention v2 algorithm from Tri Dao (https://tridao.me/publications/flash2/flash2.pdf)\n\nCredits: OpenAI kernel team\n\nExtra Credits:\n\n* Original flash attention paper (https://arxiv.org/abs/2205.14135)\n* Rabe and Staats (https://arxiv.org/pdf/2112.05682v2.pdf)",
+      "elide": [],
+      "note": "docstring 逐字 source-cited：实现的是 FlashAttention v2（L5）；FA1 arXiv:2205.14135 与 Rabe-Staats arXiv:2112.05682 由 L11-12 逐字写出。这三处论文 URL/存在可照引（source-cited）；论文内文定理/加速比数字待核。Milakov-Gimelshein online-softmax（arXiv:1805.02867）不在 docstring，为 web-verified uncited 学术前身。"
+    },
+    {
+      "path": "python/tutorials/06-fused-attention.py",
+      "lines": "L451,L458",
+      "code": "        stage = 3 if causal else 1\n        ...\n        grid = lambda args: (triton.cdiv(q.shape[2], args[\"BLOCK_M\"]), q.shape[0] * q.shape[1], 1)",
+      "elide": [
+        "L452-457 之间的 extra_kern_args 与 is_hip() AMD 调参分支，与本章原理无关"
+      ],
+      "note": "§3.4/§4：stage=3 if causal else 1 选走几趟；grid 第一维 cdiv(N_CTX,BLOCK_M)=每块 Q 一个 program、第二维 Z*H（batch×head）。FA2 相对 FA1 把并行度从『batch×head』扩到『序列块』维度——就体现在 grid 第一维。具体并行策略细节/加速比数字待核·回指 arXiv:2307.08691。",
+      "source": "code+paper"
+    },
+    {
+      "path": "book/papers/ch42-primer-flash-attention/paper.md",
+      "lines": "§2.2",
+      "code": "m_j = \\max(m_{j-1},\\, x_j)\n d_j = d_{j-1}\\, e^{\\,m_{j-1}-m_j} + e^{\\,x_j - m_j}",
+      "elide": [],
+      "note": "在线 softmax 标量递推（Milakov & Gimelshein）。m_j=到目前最大值、d_j=以当前 m_j 为基准的分母；精髓在 d_j 里 e^{m_{j-1}-m_j} 因子：新元素刷新最大值时把旧账降标度到新基准——就是 FlashAttention 的 rescale 雏形。可从 tutorials/06:L57-63 逐行推出（m_ij/l_i/alpha 三件套）。论文内定理编号/误差分析待核·回指 arXiv:1805.02867。source=paper。"
+    },
+    {
+      "path": "book/papers/ch42-primer-flash-attention/paper.md",
+      "lines": "§2.3",
+      "code": "m^{(j)} = \\max(m^{(j-1)}, \\mathrm{rowmax}(S^{(j)})), \\quad \\alpha = e^{m^{(j-1)} - m^{(j)}}\n \\tilde P^{(j)} = e^{S^{(j)} - m^{(j)}}, \\quad \\ell^{(j)} = \\alpha\\,\\ell^{(j-1)} + \\mathrm{rowsum}(\\tilde P^{(j)})\n O^{(j)} = \\alpha\\,O^{(j-1)} + \\tilde P^{(j)} V_j",
+      "elide": [],
+      "note": "attention 版在线 softmax：把标量递推升级到一块 K/V。三样东西（ℓ 分母、O 分子累加器）在 max 抬高时同乘 α rescale——保证无论分几块最后与一次性全矩阵 softmax 逐位相等（exact attention 的含义）。逐行对应代码 L57-72。收尾 O=O^(last)/ℓ^(last)（=L186 acc/l_i）。source=paper。"
+    }
+  ],
+  "key_classes": [
+    {
+      "name": "_attn_fwd_inner",
+      "file": "python/tutorials/06-fused-attention.py",
+      "responsibility": "@triton.jit：内层循环，遍历一段 K/V 块，把在线 softmax 三件套（m_i/l_i/acc）随每块增量更新——running max 抬升、rescale 补偿、增量矩阵乘累加。FlashAttention 算法核心就在这 L27-77。"
+    },
+    {
+      "name": "_attn_fwd",
+      "file": "python/tutorials/06-fused-attention.py",
+      "responsibility": "@triton.jit：前向核。每个 program 负责一块 Q（BLOCK_M 行）：初始化三件套 + q 常驻 SRAM（L154-165）→ 按 causal STAGE 分一/两趟调用 _attn_fwd_inner（L166-183）→ epilogue 延迟归一化 + log-sum-exp 存 M（L184-189）。"
+    },
+    {
+      "name": "_attention.forward / attention",
+      "file": "python/tutorials/06-fused-attention.py",
+      "responsibility": "torch.autograd.Function 的前向 wrapper：定 stage=3 if causal else 1（L451）、grid 每 Q 块一 program（L458）、分配 M（log-sum-exp）与 o，launch _attn_fwd。"
+    },
+    {
+      "name": "test_op（reference implementation）",
+      "file": "python/tutorials/06-fused-attention.py",
+      "responsibility": "测试里的朴素 attention 参考实现（L534-541）：物化 N×N 的 p=matmul(q,kᵀ)*scale → softmax → matmul(p,v)。§1 动机的对照物 + 数值正确性的黄金标准（证明 FlashAttention 与它逐位相等）。"
+    }
+  ],
+  "data_flow": [
+    "1. wrapper（forward, L451/458）：causal→stage=3、非 causal→stage=1；grid=(cdiv(N_CTX,BLOCK_M), Z*H, 1)，每 Q 块 × 每 (batch,head) 一个 program",
+    "2. _attn_fwd 初始化（L154-165）：本 program 的一块 Q load 进 SRAM 常驻；m_i=-inf、l_i=1.0、acc=0；qk_scale*=1/ln2",
+    "3. _attn_fwd 分派（L166-183）：STAGE&1 → _attn_fwd_inner off-band 整块（传 4-STAGE）；STAGE&2 → on-band 对角块（传 2）",
+    "4. _attn_fwd_inner 定区间（L34-44）：按 STAGE 算 lo,hi，advance K/V 指针到 lo",
+    "5. _attn_fwd_inner 内层循环每块（L46-76）：load K → qk=dot(q,k) →（对角块逐元素 mask）→ m_ij 抬 running max → 减 max → p=exp2 → l_ij 块内和 → alpha=exp2(m_i-m_ij) → l_i/acc 同乘 alpha rescale → load V → acc=dot(p,v,acc) 增量累加 → m_i 滚动 → advance",
+    "6. _attn_fwd epilogue（L184-189）：m_i+=log2(l_i) 存 log-sum-exp；acc/=l_i 延迟归一化一次；store O、store M",
+    "7. 全程无任何 N×N 张量落地 HBM——中间打分只在片上 BLOCK_M×BLOCK_N，running 状态 m_i/l_i/acc 均 O(block)"
+  ],
+  "design_decisions": [
+    {
+      "decision": "在线 softmax：一遍扫、边扫边更新 running max/sum，不先算完整行再 softmax",
+      "why": "softmax 天然要先看完整行找 max，会强制物化整行/整矩阵。在线递推用 running max + e^{m_old-m_new} 降标度因子，使『还没看完整行就动手、后面出现更大值再回头修正』成为可能——从三遍扫描降到一遍。",
+      "evidence": "python/tutorials/06-fused-attention.py:L57-L63"
+    },
+    {
+      "decision": "rescale：新块抬高 running max 时，旧 acc 与 l_i 同乘 alpha=exp2(m_i-m_ij) 补偿",
+      "why": "旧累加是以旧基准 m_i 算的，新 max 抬到 m_ij 后旧账整体偏大。同乘 α=e^{m_i-m_ij}≤1 降标度到新基准，让分块增量结果与一次性全矩阵 softmax 严格恒等（exact，非近似）。",
+      "evidence": "python/tutorials/06-fused-attention.py:L62-L65"
+    },
+    {
+      "decision": "延迟归一化：内层只累加未归一化 acc/l_i，最后 epilogue 只除一次",
+      "why": "每块都归一化会重复除法且需回读；把归一化推迟到扫完所有块只做一次 acc/l_i，省开销。",
+      "evidence": "python/tutorials/06-fused-attention.py:L186"
+    },
+    {
+      "decision": "log-sum-exp 存 M：m_i+=log2(l_i) 存一个标量给反向",
+      "why": "反向重算 softmax 只需 running max 与 log(分母) 合成的一个标量，避免反向也存 N×N（FlashAttention 反向重算思想，回指 arXiv:2205.14135，具体推导待核）。",
+      "evidence": "python/tutorials/06-fused-attention.py:L185"
+    },
+    {
+      "decision": "exp2 + 预乘 1/ln2：全程用 exp2（GPU 原生快指令）而非 exp",
+      "why": "e^x=2^{x/ln2}，把打分预乘 1/ln2 后 exp2 出来等于 exp。纯性能优化，数学不变。",
+      "evidence": "python/tutorials/06-fused-attention.py:L163"
+    },
+    {
+      "decision": "q 常驻 SRAM，QKᵀ/softmax/PV 融成一个 kernel",
+      "why": "attention 访存受限；把一块 Q 一次 load 进 SRAM 反复用、中间打分从不写回 HBM，把 IO 从 O(N²) 降到 O(N) 级（回指第 2 章访存判据尺、第 34 章共享内存）。",
+      "evidence": "python/tutorials/06-fused-attention.py:L165"
+    },
+    {
+      "decision": "causal 两趟 STAGE 拆分：off-band 整块无 mask + on-band 对角块逐元素 mask",
+      "why": "对角线严格以下的整块 query 全可见、无需逐元素 mask；只有对角块需 mask。分块让『跳过整个上三角块』零成本——因果结构天然只需算下三角。",
+      "evidence": "python/tutorials/06-fused-attention.py:L169-L183"
+    },
+    {
+      "decision": "FA2 序列块并行：每 Q 块一个 program（grid 第一维 cdiv(N_CTX,BLOCK_M)）",
+      "why": "相对 FA1，v2 把并行度从 batch×head 扩到序列块维度、减少非矩阵乘冗余 rescale。tutorials/06 实现的正是 v2（docstring:5）。具体加速比数字待核·回指 arXiv:2307.08691。",
+      "evidence": "python/tutorials/06-fused-attention.py:L458"
+    }
+  ],
+  "theory": [
+    {
+      "id": "naive-cost",
+      "claim": "朴素 attention 中间打分矩阵 p 形状 N×N，占 O(N²) 显存；在 HBM 上写一遍读三遍（算 QKᵀ 写、softmax 读写、乘 V 读）。",
+      "why_matters": "序列长 8K 单 head p≈8192²≈6.7×10⁷ 元素，32K/64K 平方增长撑爆显存——长上下文头号拦路虎。attention 本质访存受限，瓶颈是搬这张大矩阵而非算力。",
+      "evidence": "python/tutorials/06-fused-attention.py:L536（p=matmul(q,kᵀ)，形状 N_CTX×N_CTX）"
+    },
+    {
+      "id": "online-softmax-recurrence",
+      "claim": "在线 softmax 递推：m_j=max(m_{j-1},x_j)，d_j=d_{j-1}·e^{m_{j-1}-m_j}+e^{x_j-m_j}。扫完最后元素 d_N 即正确 softmax 分母。",
+      "why_matters": "证明『一遍过』可行：running max/sum 联合维护，新 max 出现时用 e^{m_old-m_new} 因子把旧分母降标度到新基准。这是 rescale 的标量原型。递推可从 L57-63 逐行推出（可核）；学术首出 Milakov & Gimelshein arXiv:1805.02867，论文内定理/误差分析待核。",
+      "evidence": "python/tutorials/06-fused-attention.py:L57-L63 + paper.md §2.2"
+    },
+    {
+      "id": "tiling-rescale-identity",
+      "claim": "attention 版三件套联合更新：α=e^{m^{(j-1)}-m^{(j)}}；ℓ^{(j)}=α·ℓ^{(j-1)}+rowsum(P̃);O^{(j)}=α·O^{(j-1)}+P̃·Vj；末尾 O=O^(last)/ℓ^(last)。",
+      "why_matters": "ℓ 与 O 在 max 抬高时同乘同一 α——保证分块增量结果与一次性全矩阵 softmax 逐位相等（exact attention）。这是 FlashAttention 正确性的全部；从 L62-72 三件套同乘 alpha 逐字坐实（可核）。回指 FlashAttention arXiv:2205.14135，论文内 IO 复杂度定理/反向证明待核。",
+      "evidence": "python/tutorials/06-fused-attention.py:L62-L72 + paper.md §2.3"
+    },
+    {
+      "id": "memory-and-io",
+      "claim": "running 状态 m_i([BLOCK_M])、l_i([BLOCK_M])、acc([BLOCK_M,HEAD_DIM]) 全为 O(block)、与 N 无关；全程无 N×N 落地 HBM，中间打分只在片上 BLOCK_M×BLOCK_N。",
+      "why_matters": "省显存（不物化 N×N，对应 Rabe-Staats O(n) 内存，回指 arXiv:2112.05682，O(log n) 证明待核）+ 快（不落 HBM，IO 从 O(N²) 降到 O(N) 级）——FlashAttention 两大收益都落到代码。",
+      "evidence": "python/tutorials/06-fused-attention.py:L158-L160（三件套均 O(block)）"
+    },
+    {
+      "id": "l-i-init-one",
+      "claim": "l_i 初值取 1.0 而非 0 仍正确：第一块 m_i=-inf ⇒ alpha=exp2(-inf)=0 ⇒ l_i*alpha 把初值清零。",
+      "why_matters": "看似反直觉的初值不破坏正确性——rescale 因子第一次迭代天然清零旧账。writer 需点破，否则读者困惑『初值 1 为何不污染分母』。",
+      "evidence": "python/tutorials/06-fused-attention.py:L159 + L62-L63"
+    }
+  ],
+  "subtraction_plan": {},
+  "mechanisms": [
+    {
+      "id": "m01-naive-materializes-nxn",
+      "name": "动机：朴素 attention 物化 N×N 打分矩阵 → O(N²) 显存、访存受限、长序列爆",
+      "kind": "dataflow",
+      "source_anchors": [
+        "python/tutorials/06-fused-attention.py:L534-L541"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "paper_origin": {
+        "paper": "arXiv:2205.14135",
+        "sections": [
+          "1. 动机：朴素 attention 要物化 N×N"
+        ]
+      },
+      "note": "primer 第(1)段动机。对照锚就是 test 里的 reference implementation：p=matmul(q,kᵀ)*sm_scale 形状 N_CTX×N_CTX。writer 用它引出『能不能不物化整张矩阵』。"
+    },
+    {
+      "id": "m02-online-softmax-recurrence",
+      "name": "在线 softmax 递推：running max + running sum 一遍过（m_j/d_j 与 e^{m_{j-1}-m_j} 降标度因子）",
+      "kind": "algorithm",
+      "source_anchors": [
+        "python/tutorials/06-fused-attention.py:L57-L63"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {
+        "paper": "arXiv:1805.02867",
+        "sections": [
+          "2.2 在线 softmax 递推"
+        ]
+      },
+      "note": "primer 第(2)段核心。key_figure『online-softmax-running-recurrence』(§42.2.2) 承载此机制。worked example：给一串标量走 3~4 步 running max/sum，高亮某步刷新 max 时旧 d 被降标度。递推可从 L57-63 逐行推出（可核）；论文内文待核。"
+    },
+    {
+      "id": "m03-attention-online-three-way",
+      "name": "attention 版三件套联合更新：m_i / l_i / acc 随 running max 同乘 α rescale",
+      "kind": "algorithm",
+      "source_anchors": [
+        "python/tutorials/06-fused-attention.py:L57-L74"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {
+        "paper": "arXiv:2205.14135",
+        "sections": [
+          "2.3 attention 版"
+        ]
+      },
+      "note": "把标量在线 softmax 升级到一块 K/V：除分母还维护输出累加器 O。三样在 max 抬高时同乘 α——恒等于全矩阵 softmax。worked example：分 2 块，手算两块结果与全矩阵 softmax 逐位相等。"
+    },
+    {
+      "id": "m04-rescale-identity-alpha",
+      "name": "rescale 恒等性：alpha=exp2(m_i-m_ij) 同乘 acc/l_i → 分块增量严格等于全矩阵 softmax（exact）",
+      "kind": "algorithm",
+      "source_anchors": [
+        "python/tutorials/06-fused-attention.py:L62-L72"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {
+        "paper": "arXiv:2205.14135",
+        "sections": [
+          "3.2 内层循环"
+        ]
+      },
+      "note": "本章命门、全章最强可核抓手。三行同乘 α（L62 alpha、L63 l_i*alpha、L65 acc*alpha）逐字坐实恒等性。key_figure『flashattention-tiling-rescale-timeline』(§42.3.2) 承载。worked example 可与 m03 合并：坐实『分几块都逐位相等』。恒等性从代码逐行推出（可核）。"
+    },
+    {
+      "id": "m05-tiling-loop-skeleton",
+      "name": "分块遍历骨架：外层锁一块 Q（常驻 SRAM）、内层遍历 K/V 块增量更新 acc",
+      "kind": "dataflow",
+      "source_anchors": [
+        "python/tutorials/06-fused-attention.py:L45-L50",
+        "python/tutorials/06-fused-attention.py:L164-L165"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "paper_origin_note": "分块遍历骨架是 tutorials/06 的实现结构（A 档源码逐字：for start_n in range(lo,hi,BLOCK_N) + q 常驻 SRAM），非某篇论文的定理——tiling 思想学术出处回指 FlashAttention arXiv:2205.14135，但骨架本身由代码坐实。",
+      "note": "primer 第(3)段展开的骨架。每 program 一块 Q（BLOCK_M 行），q 一次 load 常驻 SRAM 反复用；内层水平铺开 K/V 块逐块流过。tiling-rescale 时序图外层框架。"
+    },
+    {
+      "id": "m06-exp2-scale-optimization",
+      "name": "exp2 + 预乘 1/ln2：全程用 GPU 原生 exp2 等价 exp（qk_scale*=1.44269504）",
+      "kind": "config",
+      "source_anchors": [
+        "python/tutorials/06-fused-attention.py:L162-L163",
+        "python/tutorials/06-fused-attention.py:L59"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "paper_origin_note": "纯工程性能优化（e^x=2^{x/ln2}，代码 L163 qk_scale*=1.44269504 + L59 exp2），无论文出处——A 档源码逐字，不改数学。",
+      "note": "工程要点，writer 一句点破：为何满屏 exp2 而非 exp。不改数学、纯性能。"
+    },
+    {
+      "id": "m07-epilogue-lazy-norm-lse",
+      "name": "epilogue：延迟一次归一化 acc/l_i + log-sum-exp（m_i+=log2(l_i)）存反向",
+      "kind": "algorithm",
+      "source_anchors": [
+        "python/tutorials/06-fused-attention.py:L184-L189"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {
+        "paper": "arXiv:2205.14135",
+        "sections": [
+          "3.3 收尾：延迟归一化 + log-sum-exp"
+        ]
+      },
+      "note": "primer 第(3)段收尾。acc/l_i 只除一次=延迟归一化；m_i+=log2(l_i) 合成 log-sum-exp 标量存 M 给反向（反向不存 N×N）。worked example：手算 log-sum-exp 存的值。反向数学推导超本 primer 范围、论文证明待核。"
+    },
+    {
+      "id": "m08-causal-stage-split",
+      "name": "causal 分块 mask：off-band 整块跳过 mask + on-band 对角块逐元素 mask（STAGE 3/1 两趟拆分）",
+      "kind": "protocol",
+      "source_anchors": [
+        "python/tutorials/06-fused-attention.py:L166-L183",
+        "python/tutorials/06-fused-attention.py:L34-L44",
+        "python/tutorials/06-fused-attention.py:L51-L55"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "paper_origin_note": "causal 两趟 STAGE 拆分是 tutorials/06 的实现优化（A 档逐字：stage=3 if causal else 1、STAGE&1 off-band/STAGE&2 on-band、STAGE==2 逐元素 mask -1e6），非论文定理——因果 attention 概念读者已知，此处只讲分块框架下『整块跳过 mask 零成本』的实现巧思。",
+      "note": "primer 第(3)段补充。整块在对角线严格以下 query 全可见无需 mask，只对角块逐元素 mask（-1e6，exp2 后趋 0）。分块让跳过整个上三角块零成本。supporting，不必三层递进。"
+    },
+    {
+      "id": "m09-memory-savings-o-block",
+      "name": "省显存：running 状态 m_i/l_i/acc 全为 O(block)、与 N 无关，全程无 N×N 落地",
+      "kind": "dataflow",
+      "source_anchors": [
+        "python/tutorials/06-fused-attention.py:L157-L160"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "paper_origin": {
+        "paper": "arXiv:2112.05682",
+        "sections": [
+          "4. 落地：为什么省显存"
+        ]
+      },
+      "note": "primer 第(4)段落地之一。对照 §1 朴素 p(N×N)：FlashAttention 从头到尾无任何 N×N 张量落地。长序列不爆显存的根因。回指 Rabe-Staats arXiv:2112.05682，O(log n) 证明待核。"
+    },
+    {
+      "id": "m10-fused-kernel-io-and-fa2",
+      "name": "为什么快 + FA2 并行：融成一个 kernel 不落 HBM（IO O(N²)→O(N)）+ 每 Q 块一 program 序列块并行",
+      "kind": "dataflow",
+      "source_anchors": [
+        "python/tutorials/06-fused-attention.py:L165",
+        "python/tutorials/06-fused-attention.py:L451",
+        "python/tutorials/06-fused-attention.py:L458"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "paper_origin": {
+        "paper": "arXiv:2307.08691",
+        "sections": [
+          "4. 落地：为什么省显存"
+        ]
+      },
+      "note": "primer 第(4)段落地之二。QKᵀ/softmax/PV 融成一个 kernel、q 常驻 SRAM、中间打分不写回 HBM。回指第 29 章流水线、第 27 章 MMA 布局。FA2 序列块并行体现在 grid 第一维。加速比数字待核·回指 arXiv:2307.08691。supporting，一句带过。"
+    }
+  ],
+  "foreshadow_due": {
+    "埋": [],
+    "回收": [],
+    "note": "bible.py due ch42 返回空——本章无伏笔埋/回收（primer 原理地基章，任务书已声明）。"
+  }
+}
