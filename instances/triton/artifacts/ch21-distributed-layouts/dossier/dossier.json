@@ -1,0 +1,295 @@
+{
+  "chapter_id": "ch21",
+  "slug": "ch21-distributed-layouts",
+  "title": "Distributed 布局：Blocked、Slice、MMA 与 DotOperand 编码",
+  "kind": "skip_impl",
+  "one_line": "承 ch20 primer 的『布局=函数 L』抽象，把 distributed 布局的具体 encoding 形态走一遍：BlockedEncodingAttr 的 sizePerThread/threadsPerWarp/warpsPerCTA/order 三元组如何把张量切成『每线程一块连续元素』并促成访存合并；SliceEncodingAttr 挤掉一维作 expand_dims 的逆；NvidiaMma/DotOperand 编码为什么长成 Tensor Core 强制的样子。真相源=TritonGPUAttrDefs.td 的 .td 定义 + Dialect.cpp 的布局算术，全部 headless 可查。",
+
+  "code_spine": [
+    "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L466-L586  DistributedEncodingTrait 接口 + DistributedEncoding 基类：4 级计算层级 + 布局函数 L 的定义与 wrap-around/broadcast 语义",
+    "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L592-L768  BlockedEncodingAttr：三元组参数 + 三个手算 example + 自动推导 builder + getContigPerThread=sizePerThread",
+    "lib/Dialect/TritonGPU/IR/Dialect.cpp:L629-L688  BlockedEncoding 布局算术：squeeze / getElemsPerThread / getShapePerCTATile / 各访问器",
+    "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L1253-L1304  SliceEncodingAttr：给 parent 挤掉一维（dim），expand_dims 的逆",
+    "lib/Dialect/TritonGPU/IR/Dialect.cpp:L690-L789  SliceEncoding 布局算术：paddedShape 回填被挤维 + 各访问器 erase 掉 dim",
+    "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L1046-L1251  NvidiaMmaEncodingAttr：versionMajor/Minor + warpsPerCTA + instrShape + Volta/Ampere/Hopper 谓词",
+    "lib/Dialect/TritonGPU/IR/Dialect.cpp:L858-L908  NvidiaMma getElemsPerThread（Volta/Ampere/Hopper 三分支）",
+    "lib/Dialect/TritonGPU/IR/Dialect.cpp:L1858-L1900  NvidiaMma isVolta/isTuring/isAmpere/isHopper + getThreadsPerWarp（Ampere=[8,4]）",
+    "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L1306-L1361  DotOperandEncodingAttr：opIdx/parent/kWidth + Ampere kWidth=32/bitwidth builder + getContigPerThread",
+    "lib/Dialect/TritonGPU/IR/Dialect.cpp:L2145-L2159  NvidiaMma getSizePerThreadForOperand（opIdx=0/1 的 dot 操作数每线程尺寸）",
+    "lib/Dialect/TritonGPU/IR/Dialect.cpp:L1065-L1101  DotOperandEncodingAttr::verify（kWidth 对 Ampere 必填、对其它 mma parent 的取值约束）",
+    "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L805-L941  AMDMfma/AMDWmmaEncodingAttr：与 Nvidia 编码同继承 DistributedEncoding、并排同 .td（后端新增矩阵乘布局族的现成样板）"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L470-L483",
+      "what": "DistributedEncodingTrait 的顶层描述：所有 distributed 布局共享的 4 级计算层级——这是本章一切 encoding 的公共骨架，也是 ch20『布局=函数 L』落到 GPU 硬件的具体化",
+      "code": "The Distributed encoding describes the layout L with the 4-level compute hierarchy on GPU.\nIt is abstracted from the top to the bottom as CTAs Per CGA->Warps Per CTA->Threads Per Warp->Values Per Thread.\n\nFor CTAs Per CGA and Warps Per CTA level, the linear id is distributed contiguously with the shape and order.\nFor example, for a shape/order pair defines a distribution layout\nshape = [4, 4]\norder = [0, 1] // The fastest-changing axis first\n->\nlayout = [0  4  8  12]\n         [1  5  9  13]\n         [2  6  10 14]\n         [3  7  11 15]\n\nFor the Threads Per Warp and Values Per Thread level, the linear id distribution is variant for each sub-class encoding.",
+      "elide": []
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L595-L619",
+      "what": "BlockedEncodingAttr 描述头 + Example 1：一句点明『促成 LoadInst/StoreInst 访存合并』的用途，并用 16x16 张量 over 2 warps 的 example 手算展示三元组切法。注意每个线程号连续出现两次（sizePerThread={2,2}）——相邻元素归同一线程，相邻线程（0,1,2,3）拿相邻列 = 合并的物理基础",
+      "code": "An encoding where each warp owns a contiguous portion of the target tensor. This is typically the kind of data layout\nused to promote memory coalescing in LoadInst and StoreInst.\nIt is characterized by three tuples -- thread tile size, warp tile size, and block tile size -- which\nspecify the amount of elements owned by each CUDA thread, warp and CTA respectively.\n\nExample 1, a row-major coalesced layout may partition a 16x16 tensor over 2 warps (i.e. 64 threads) as follows:\n\n[ 0  0  1  1  2  2  3  3  ; 32 32 33 33 34 34 35 35 ]\n[ 0  0  1  1  2  2  3  3  ; 32 32 33 33 34 34 35 35 ]\n[ 4  4  5  5  6  6  7  7  ; 36 36 37 37 38 38 39 39 ]\n[ 4  4  5  5  6  6  7  7  ; 36 36 37 37 38 38 39 39 ]\n...\n[ 28 28 29 29 30 30 31 31 ; 60 60 61 61 62 62 63 63 ]\n[ 28 28 29 29 30 30 31 31 ; 60 60 61 61 62 62 63 63 ]\n\nfor\n\n#triton_gpu.blocked_layout<{\n  sizePerThread = {2, 2}\n  threadsPerWarp = {8, 4}\n  warpsPerCTA = {1, 2}\n  CTAsPerCGA = {1, 1}\n  CTASplitNum = {1, 1}\n}>",
+      "elide": ["Example 2（32x32 张量的 wrap-around 复用）与 Example 3（2x2 CTA 切分）同理演示同一切法在更大 shape / 多 CTA 下的重复铺排，正文取 Example 1 讲透即可，两者可省"]
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L678-L690",
+      "what": "BlockedEncodingAttr 的四个参数：sizePerThread__/threadsPerWarp__/warpsPerCTA__/order + 可选 CTALayout。order 注释『the fastest-changing axis first』是访存合并的关键——它决定哪根轴的相邻元素落到相邻 lane",
+      "code": "  let parameters = (\n    ins\n    ArrayRefParameter<\"unsigned\">:$sizePerThread__,\n    ArrayRefParameter<\"unsigned\">:$threadsPerWarp__,\n    ArrayRefParameter<\"unsigned\">:$warpsPerCTA__,\n    ArrayRefParameter<\"unsigned\">:$order, // the fastest-changing axis first\n\n    // CTALayout is optional in the textual IR.  If omitted, we infer it to be a\n    // single CTA (so CTAsPerCGA = [1,...,1], CTASplitNum = [1,...,1],\n    // CTAOrder=[n,n-1,...,0]).\n    \"CTALayoutAttr\":$CTALayout\n  );",
+      "elide": []
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L692-L728",
+      "what": "自动推导 builder：给定 shape + sizePerThread + order + numWarps + numThreadsPerWarp，从最连续维（order[0]）起逐级 clamp 反解 threadsPerWarp[i] 与 warpsPerCTA[i]，最后一维吃掉剩余 lane/warp。这是『拿到张量形状和 warp 数，自动切出合并友好布局』的核心算法",
+      "code": "    AttrBuilder<(ins \"ArrayRef<int64_t>\":$shape,\n                     \"ArrayRef<unsigned>\":$sizePerThread,\n                     \"ArrayRef<unsigned>\":$order,\n                     \"unsigned\":$numWarps,\n                     \"unsigned\":$numThreadsPerWarp,\n                     \"CTALayoutAttr\":$CTALayout), [{\n      unsigned rank = sizePerThread.size();\n      SmallVector<unsigned, 4> threadsPerWarp(rank);\n      SmallVector<unsigned, 4> warpsPerCTA(rank);\n      SmallVector<int64_t> shapePerCTA = getShapePerCTA(CTALayout.getCTASplitNum(), shape);\n\n      unsigned remainingLanes = numThreadsPerWarp;\n      unsigned remainingThreads = numWarps * numThreadsPerWarp;\n      unsigned remainingWarps = numWarps;\n      unsigned prevLanes = 1;\n      unsigned prevWarps = 1;\n\n      // starting from the contiguous dimension\n      for (unsigned d = 0; d < rank - 1; ++d) {\n        unsigned i = order[d];\n        unsigned threadsPerCTA = std::clamp<unsigned>(remainingThreads, 1, std::max<unsigned>(1, shapePerCTA[i] / sizePerThread[i]));\n        threadsPerWarp[i] = std::clamp<unsigned>(threadsPerCTA, 1, remainingLanes);\n        warpsPerCTA[i] = std::clamp<unsigned>(threadsPerCTA / threadsPerWarp[i], 1, remainingWarps);\n        remainingWarps /= warpsPerCTA[i];\n        remainingLanes /= threadsPerWarp[i];\n        remainingThreads /= threadsPerCTA;\n        prevLanes *= threadsPerWarp[i];\n        prevWarps *= warpsPerCTA[i];\n      }\n\n      // Expand the last dimension to fill the remaining lanes and warps\n      threadsPerWarp[order[rank - 1]] = numThreadsPerWarp / prevLanes;\n      warpsPerCTA[order[rank - 1]] = numWarps / prevWarps;\n\n      return $_get(context, sizePerThread, threadsPerWarp, warpsPerCTA, order, CTALayout);\n    }]>,",
+      "elide": ["紧随其后的第二个 builder（L730-L755）在此基础上再从 numCTAs 反解 CTAsPerCGA/CTASplitNum；正文可一句带过——多 CTA 是 Hopper CGA 才用到，与访存合并主线关系弱"]
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L758-L765",
+      "what": "BlockedEncoding 的 getContigPerThread 直接返回 sizePerThread——一句注释道破 blocked 布局的本质：『dense stride layout，每线程元素连续』。这正是访存能合并的编码层保证",
+      "code": "  let extraClassDeclaration = extraDistributedDeclaration # [{\n    SliceEncodingAttr squeeze(int axis);\n\n    SmallVector<unsigned> getContigPerThread() {\n      // Block encoding is dense stride layout. The elements per thread are contiguous.\n      return getSizePerThread();\n    };\n  }];",
+      "elide": []
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/IR/Dialect.cpp",
+      "lines": "L632-L652",
+      "what": "getElemsPerThread 布局算术：每维 t = sizePerThread*threadsPerWarp*warpsPerCTA 是一个 tile 覆盖的元素数，ceil(shapePerCTA/t) 是需要几个 tile（张量比布局大时 wrap-around），再乘 sizePerThread 得每线程该维元素数。全 CPU 可算，本章 worked example 的算术骨架",
+      "code": "SmallVector<unsigned>\nBlockedEncodingAttr::getElemsPerThread(ArrayRef<int64_t> shape,\n                                       Type eltTy) const {\n  size_t rank = shape.size();\n  auto sizePerThread = getSizePerThread();\n  auto warpsPerCTA = getWarpsPerCTA();\n  auto threadsPerWarp = getThreadsPerWarp();\n  auto shapePerCTA = getShapePerCTA(*this, shape);\n  assert(rank == sizePerThread.size() &&\n         \"unexpected rank in BlockedEncodingAttr::getElemsPerThread\");\n  SmallVector<unsigned> elemsPerThread(rank);\n  for (size_t i = 0; i < rank; ++i) {\n    unsigned t = sizePerThread[i] * threadsPerWarp[i] * warpsPerCTA[i];\n    elemsPerThread[i] = ceil<unsigned>(shapePerCTA[i], t) * sizePerThread[i];\n  }\n  return elemsPerThread;\n}\nunsigned BlockedEncodingAttr::getTotalElemsPerThread(ArrayRef<int64_t> shape,\n                                                     Type eltTy) const {\n  return product<unsigned>(getElemsPerThread(shape, eltTy));\n}",
+      "elide": []
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L1256-L1290",
+      "what": "SliceEncodingAttr 描述 + 参数：给 parent 布局挤掉 dim 维，把张量按新（降维）布局分发；末句点明用途『expand_dims 的逆』。参数极简：dim + parent Attribute",
+      "code": "    Given a `parent` layout and a `dim`, squeezes the given `dim` in the `parent`\n    layout and distributes values in a tensor T according to the new layout.\n\n    For example, given\n\n    T = [x  x  x  x  x  x  x  x]\n    L_parent = [0  1  2  3 ]\n               [4  5  6  7 ]\n               [8  9  10 11]\n               [12 13 14 15] (with 16 CUDA threads)\n\n    With dim = 0, squeezing out dim 0, we have\n    L = [{0,4,8,12},  {1,5,9,13}, {2,6,10,14},  {3,7,11,15} ]\n\n    Then the data of T would be distributed as follow between the 16 CUDA threads:\n    L(T) = [ {0,4,8,12} , {1,5,9,13} , ... {3,7,11,15}, {0,4,8,12} , ..., {3,7,11,15} ]\n\n    With dim = 1, squeezing out dim 1, we have\n    L = [ {0,1,2,3}, {4,5,6,7}, {8,9,10,11}, {12,13,14,15} ]\n\n    Then the data of T would be distributed as follow between the 16 CUDA threads:\n    L = [ {0,1,2,3}, {4,5,6,7}, ..., {12,13,14,15}, {0,1,2,3}, ..., {12,13,14,15} ]\n\n    This is useful for constructing the inverse layout of an expand_dims operation\n    during some optimization passes.\n  }];\n\n  let parameters = (\n    ins\n    \"unsigned\":$dim,\n    // TODO: constraint here to only take distributed encodings\n    \"Attribute\":$parent\n  );",
+      "elide": []
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/IR/Dialect.cpp",
+      "lines": "L690-L718",
+      "what": "SliceEncoding 布局算术核心：paddedShape 把被挤维回填成 1、还原成 parent 的 rank；getElemsPerThread 先按 parent 算再 erase 掉 dim 维——所有降维语义都靠『padded 回 parent 维度 → 算 → 抹掉该维』这一对操作实现",
+      "code": "template <class T>\nSmallVector<T> SliceEncodingAttr::paddedShape(ArrayRef<T> shape) const {\n  size_t rank = shape.size();\n  unsigned dim = getDim();\n  SmallVector<T> retShape(rank + 1);\n  for (unsigned d = 0; d < rank + 1; ++d) {\n    if (d < dim)\n      retShape[d] = shape[d];\n    else if (d == dim)\n      retShape[d] = 1;\n    else\n      retShape[d] = shape[d - 1];\n  }\n  return retShape;\n}\ntemplate SmallVector<unsigned>\nSliceEncodingAttr::paddedShape<unsigned>(ArrayRef<unsigned> shape) const;\ntemplate SmallVector<int64_t>\nSliceEncodingAttr::paddedShape<int64_t>(ArrayRef<int64_t> shape) const;\n\nSmallVector<unsigned>\nSliceEncodingAttr::getElemsPerThread(ArrayRef<int64_t> shape,\n                                     Type eltTy) const {\n  auto parent = getParent();\n  auto parentElemsPerThread =\n      ::getElemsPerThread(parent, paddedShape(shape), eltTy);\n  parentElemsPerThread.erase(parentElemsPerThread.begin() + getDim());\n  return parentElemsPerThread;\n}",
+      "elide": []
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L1049-L1061",
+      "what": "NvidiaMmaEncodingAttr 描述头：明确『由 tensor cores 产出的张量的布局』，两个关键参数 versionMajor（1=Volta / 2=Turing-Ampere）与 versionMinor 区分硬件世代——布局形态不是自由设计，是被 MMA 指令的输出寄存器排布反推出来的",
+      "code": "An encoding for tensors that have been produced by tensor cores.\n\nIt is characterized by two parameters:\n- A 'versionMajor' which specifies the generation the tensor cores\n  whose output is being partitioned:\n  - 1 for first-gen tensor cores (Volta), and\n  - 2 for second-gen tensor cores (Turing/Ampere).\n- A 'versionMinor' which indicates the specific layout of a tensor core\n  generation, e.g. for Volta, there might be multiple kinds of layouts\n  annotated by 0,1,2 and so on.\n- A `blockTileSize` to indicate how data should be partitioned between warps.",
+      "elide": ["紧随的 version=1 与 version=2 的 L 矩阵手算大表（L1062-L1127）展示 Volta/Ampere 两代具体寄存器排布，正文点到『长这样是硬件强制』即可，两张大表可省或只取一张示意"]
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L1130-L1137",
+      "what": "NvidiaMma 的五个参数：versionMajor/versionMinor + warpsPerCTA__ + CTALayout + instrShape。instrShape 就是 MMA 指令的 M×N×K 形状（如 Ampere 的 [16,8]）——布局直接携带硬件指令尺寸",
+      "code": "  let parameters = (\n    ins\n    \"unsigned\":$versionMajor,\n    \"unsigned\":$versionMinor,\n    ArrayRefParameter<\"unsigned\">:$warpsPerCTA__,\n    \"CTALayoutAttr\":$CTALayout,\n    ArrayRefParameter<\"unsigned\">:$instrShape\n  );",
+      "elide": []
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/IR/Dialect.cpp",
+      "lines": "L1858-L1866",
+      "what": "版本谓词：isVolta/isTuring/isAmpere/isHopper 全靠 versionMajor（+Turing 看 minor）。整个 Nvidia MMA 分支逻辑都由这四个谓词分派——一个整数字段编码了三代 Tensor Core",
+      "code": "bool NvidiaMmaEncodingAttr::isVolta() const { return getVersionMajor() == 1; }\n\nbool NvidiaMmaEncodingAttr::isTuring() const {\n  return getVersionMajor() == 2 && getVersionMinor() == 1;\n}\n\nbool NvidiaMmaEncodingAttr::isAmpere() const { return getVersionMajor() == 2; }\n\nbool NvidiaMmaEncodingAttr::isHopper() const { return getVersionMajor() == 3; }",
+      "elide": []
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L1309-L1329",
+      "what": "DotOperandEncodingAttr 描述 + 参数：tt.dot 的两操作数 a/b 必须是此布局（MMA v1/v2），opIdx（a=0,b=1）、parent（= dot 结果 d 的布局，通常是 mma）、kWidth（沿 K 维每线程存的连续元素数）",
+      "code": "In the TritonGPU dialect, given `d = tt.dot a, b, c` tt.dot's operands a and b\nmust be of DotOperandEncodingAttr layout, if the dot is MMA v1 or v2 (i.e.\npre-Hopper).  For MMA v3, the operands are *almost always* in a regular shared\nencoding, but sometimes the LHS is also a dot-operand encoding.\n\na's opIdx is 0, b's opIdx is 1.\n\nThe parent field is the layout of d.\n\nkWidth defines number of consecutive elements stored by one thread along k dimension.\nSome layouts do not use this parameter, either because they have a fixed number of\nelements along the K dim, or they use all elements of the tensor along the K dim.\n  }];\n\n  let parameters = (\n    ins\n    \"unsigned\":$opIdx,\n    \"Attribute\":$parent,\n    DefaultValuedParameter<\"unsigned\", \"0\">:$kWidth\n  );",
+      "elide": []
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L1331-L1343",
+      "what": "DotOperand 的 Ampere 专用 builder：kWidth = 32 / bitwidth——即『每线程沿 K 恰好凑满 32 bit』。fp16(16bit)→kWidth=2，与实测 ttgir 的 kWidth=2 吻合。这是 kWidth 不能拍脑袋、由数据类型+MMA 指令定死的证据",
+      "code": "  let builders = [\n        // Specially for MMAV1(Volta)\n    AttrBuilder<(ins \"unsigned\":$opIdx,\n                     \"Attribute\":$parent,\n                     \"Type\":$eltTy), [{\n      NvidiaMmaEncodingAttr parentAttr = mlir::dyn_cast<NvidiaMmaEncodingAttr>(parent);\n      if (!parentAttr || !parentAttr.isAmpere())\n        return $_get(context, opIdx, parent, 0);\n      unsigned bitwidth = eltTy.getIntOrFloatBitWidth();\n      unsigned MMAv2kWidth = 32 / bitwidth;\n      return $_get(context, opIdx, parent, MMAv2kWidth);\n    }]>\n  ];",
+      "elide": []
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/IR/Dialect.cpp",
+      "lines": "L2145-L2159",
+      "what": "getSizePerThreadForOperand：Ampere 下 dot 操作数每线程尺寸——opIdx=0（a，M×K）沿 K 是 2*kWidth、沿 M 是 2；opIdx=1（b，K×N）沿 K 是 2*kWidth、沿 N 是 1。这套数字直接对应 Ampere mma.16816 指令要求的操作数寄存器分块",
+      "code": "NvidiaMmaEncodingAttr::getSizePerThreadForOperand(int kWidth, int opIdx) const {\n  assert(isAmpere() && \"mmaLayout version = 1 is not implemented yet\");\n  auto rank = getWarpsPerCTA().size();\n  auto sizePerThread = SmallVector<unsigned>(rank, 1);\n  if (opIdx == 0) {\n    sizePerThread[rank - 2] = 2;\n    sizePerThread[rank - 1] = 2 * kWidth;\n  } else if (opIdx == 1) {\n    sizePerThread[rank - 2] = 2 * kWidth;\n    sizePerThread[rank - 1] = 1;\n  } else {\n    llvm::report_fatal_error(\"DotOperandEncodingAttr opIdx must be 0 or 1\");\n  }\n  return sizePerThread;\n}",
+      "elide": []
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L535-L537",
+      "what": "DistributedEncoding 基类模板：所有 distributed 编码（Blocked/Slice/NvidiaMma/AMDMfma/AMDWmma/DotOperand）都由这一行派生，自动获得 DistributedEncodingTrait 接口。这是『后端新增自有矩阵乘布局族』只需照抄一行继承的结构基础",
+      "code": "class DistributedEncoding<string name, string attrMnemonic, list<Trait> traits = [],\n                     Dialect dialect = TritonGPU_Dialect>\n  : TritonGPU_Attr<name, attrMnemonic, !listconcat([DistributedEncodingTrait], traits), dialect> {",
+      "elide": []
+    }
+  ],
+
+  "key_classes": [
+    {"name": "DistributedEncodingTrait", "file": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L466", "responsibility": "所有 distributed 布局的公共接口：暴露 getCTAsPerCGA/getWarpsPerCTA/getThreadsPerWarp/getSizePerThread/getShapePerCTATile/getContigPerThread/toLinearLayout 等访问器，抽象出 CTAsPerCGA→WarpsPerCTA→ThreadsPerWarp→ValuesPerThread 的 4 级层级"},
+    {"name": "BlockedEncodingAttr", "file": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L592", "responsibility": "本章 stakes 核心：sizePerThread/threadsPerWarp/warpsPerCTA/order 三元组把张量切成『每线程一块连续元素』，dense stride layout，用于 Load/Store 的访存合并；带自动推导 builder 与 getElemsPerThread 等布局算术"},
+    {"name": "SliceEncodingAttr", "file": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L1253", "responsibility": "对 parent 布局挤掉 dim 维的降维投影，作 expand_dims 的逆（也是 reduce/broadcast 结果布局），靠 paddedShape 回填 + erase(dim) 实现全部布局算术"},
+    {"name": "NvidiaMmaEncodingAttr", "file": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L1046", "responsibility": "Tensor Core 输出张量的布局：versionMajor/versionMinor 区分 Volta(1)/Turing-Ampere(2)/Hopper(3)，warpsPerCTA + instrShape 携带 MMA 指令尺寸；形态由硬件 MMA 指令反推"},
+    {"name": "DotOperandEncodingAttr", "file": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L1306", "responsibility": "tt.dot 操作数（a/b）的布局：opIdx(0/1)+parent(=结果 mma 布局)+kWidth(沿 K 每线程连续元素数)；kWidth 由 dtype 与 MMA 指令定死（Ampere=32/bitwidth）"},
+    {"name": "MmaEncodingTrait", "file": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L774", "responsibility": "所有 mma 系布局（Nvidia/AMDMfma/AMDWmma）共享的接口：supportReduction + getShapePerCTATileForOperand/getTotalElemsPerThreadForOperand/getSizePerThreadForOperand（为 dot 操作数算尺寸）"},
+    {"name": "AMDMfmaEncodingAttr / AMDWmmaEncodingAttr", "file": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L805,L941", "responsibility": "AMD 矩阵乘布局，与 Nvidia 编码同继承 DistributedEncoding、并排住同一 .td——本章 backend_seam：后端新增自有矩阵乘布局族的现成样板（对照，不深讲）"}
+  ],
+
+  "data_flow": [
+    "1. ConvertTritonToTritonGPU（ch25）给无布局张量默认贴 BlockedEncodingAttr——经 getDefaultBlockedEncoding(Dialect.cpp:L519) 或自动推导 builder(.td:L692)，从 shape + numWarps + numThreadsPerWarp 反解出 threadsPerWarp/warpsPerCTA",
+    "2. BlockedEncodingAttr 的三元组 + order 决定每个 CUDA 线程拥有哪几块连续元素：getContigPerThread()=getSizePerThread()（.td:L761），相邻 lane 拿相邻元素 → 访存合并（回指 ch07）",
+    "3. getElemsPerThread(Dialect.cpp:L632)：每维 ceil(shapePerCTA / (sizePerThread*threadsPerWarp*warpsPerCTA)) * sizePerThread，算出每线程元素数（张量大于布局 tile 时 wrap-around 复用）",
+    "4. expand_dims/reduce 类算子沿某维降维：结果张量套 SliceEncodingAttr（dim, parent），其算术经 paddedShape 回填被挤维再 erase(Dialect.cpp:L690-L718)；BlockedEncoding::squeeze(axis) 是构造入口(Dialect.cpp:L629)",
+    "5. tt.dot（ch25 TritonDotPattern 强制）：结果 d 套 NvidiaMmaEncodingAttr(versionMajor 按 capability 选代、instrShape=MMA 指令尺寸)，两操作数 a/b 套 DotOperandEncodingAttr(opIdx=0/1, parent=该 mma, kWidth=32/bitwidth)",
+    "6. dot 操作数每线程尺寸由 parent mma 的 getSizePerThreadForOperand(Dialect.cpp:L2145) 给出——布局层把『命中 Tensor Core 所需的操作数排布』固化进 encoding",
+    "7.（实测 ttgir 佐证）64x64=fp16 matmul @ sm80/num_warps=4 编译得：#mma=nvidia_mma<versionMajor=2,instrShape=[16,8]>，dot_op opIdx=0/1 parent=#mma kWidth=2，结果经 convert_layout 转回 #blocked 再 store"
+  ],
+
+  "design_decisions": [
+    {"decision": "Blocked 布局用『三元组 + order』而非直接给每线程元素列表", "why": "三元组是层级化的压缩表示（CTA/warp/thread/value 四级各一个 tile 尺寸），order 定最快变化轴；这样布局既紧凑又能直接读出『相邻 lane 是否拿相邻元素』——访存合并与否一眼可判", "evidence": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L595-L619"},
+    {"decision": "BlockedEncoding 的 getContigPerThread 恒等于 sizePerThread", "why": "blocked 是 dense stride layout，每线程的元素在张量里连续，故『连续度=每线程元素数』；这保证了 load 一块 = 一段连续地址 = 可合并成一笔事务", "evidence": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L761-L764"},
+    {"decision": "自动推导 builder 从最连续维（order[0]）起逐级 clamp 分配 lane/warp", "why": "让最快变化的连续维优先吃满一个 warp 的 32 lane，才能让 warp 内 32 个线程覆盖连续地址段——这是把访存合并直接编进布局推导算法", "evidence": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L710-L724"},
+    {"decision": "SliceEncoding 不自带三元组，全部委托 parent + erase(dim)", "why": "降维布局若独立存参数会与 parent 冗余/易漂移；委托 parent 保证 slice 与其 parent 的 warp/thread 排布严格一致（expand_dims/squeeze 才能互逆）", "evidence": "lib/Dialect/TritonGPU/IR/Dialect.cpp:L779-L783,L710-L718"},
+    {"decision": "NvidiaMma 用一个整数 versionMajor 编码三代 Tensor Core，布局形态硬编码在 getElemsPerThread/getThreadsPerWarp 分支里", "why": "MMA 指令的输出寄存器排布是硬件定死的（Volta mma.884 / Ampere mma.16816 / Hopper wgmma），布局只能忠实描述而非自由设计；用 version 分派最直接", "evidence": "lib/Dialect/TritonGPU/IR/Dialect.cpp:L858-L908,L1883-L1900"},
+    {"decision": "DotOperand 的 kWidth 对 Ampere 强制 = 32/bitwidth 且 verify 强制非零", "why": "Ampere ldmatrix/mma 要求每线程沿 K 恰好搬运 32bit 的连续数据；kWidth 由 dtype 定死不容自选，verify 拦住非法组合", "evidence": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L1336-L1341; lib/Dialect/TritonGPU/IR/Dialect.cpp:L1076-L1084"},
+    {"decision": "AMDMfma/AMDWmma 与 NvidiaMma 同继承 DistributedEncoding、并排同一 .td 文件", "why": "distributed 布局族是开放集：后端要加自己的矩阵乘布局，只需照抄一行 DistributedEncoding<...> 继承 + 实现接口方法，无需改公共框架——backend_seam 的体现", "evidence": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L535-L537,L805,L941,L1046"}
+  ],
+
+  "theory": [
+    "布局函数 L（承 ch20）：distributed 编码由一个 d 维 tensor T 完全刻画，布局函数 L(T)[i] 把逻辑张量索引映射到 (CTA,warp,thread,value) 硬件位置。当 T.shape[d] > L.shape[d] 时该维 wrap-around（每线程拥有多个值），反之 broadcast（一个值被多线程共享）——见 .td:L539-L570。",
+    "getElemsPerThread 的算术闭形式：每维 t = sizePerThread·threadsPerWarp·warpsPerCTA 为一个 CTA-tile 覆盖的元素数；每线程该维元素数 = ceil(shapePerCTA[i]/t)·sizePerThread[i]。总元素数 = 各维乘积。全程整数运算、无需设备，CPU 可逐值验证。",
+    "访存合并的编码层充要条件（本章把 ch07 的现场固化进 encoding）：order[0] 指向张量最连续（stride=1）维，且该维上相邻 lane（thread id 沿 order[0] 递增）映射到相邻元素（sizePerThread 连续块 + getContigPerThread=sizePerThread）。满足则一个 warp 的 32 lane 覆盖一段连续地址 → GPU 合并成最少事务；order 选错或 sizePerThread 断裂 → 跨步访存、事务数暴涨。硬件原理见 ch02/ch07。",
+    "Ampere dot 操作数尺寸推导：sizePerThreadForOperand(opIdx=0) 沿 (M,K)=(2, 2·kWidth)，opIdx=1 沿 (K,N)=(2·kWidth, 1)，kWidth=32/bitwidth。对 fp16：kWidth=2，故 a 每线程沿 K 有 4 个连续元素——恰好凑满 ldmatrix 一次搬运，是『命中 Tensor Core 的操作数布局条件』的量化。",
+    "实测 pin-compile 锚点（headless，triton==3.2.0 与 pin 逐字节同，无需 GPU）：(a) 1D copy N=1024 num_warps=4 → #blocked<sizePerThread=[1],threadsPerWarp=[32],warpsPerCTA=[4],order=[0]>，getElemsPerThread=ceil(1024/(1·32·4))·1=8；(b) 64×64 fp16 matmul @ sm80 → #mma=nvidia_mma<versionMajor=2,versionMinor=0,warpsPerCTA=[2,2],instrShape=[16,8]>，两操作数 dot_op<opIdx=0/1,parent=#mma,kWidth=2>，中间还出现 slice<dim=0,parent=#blocked>（来自 arange/expand_dims）。"
+  ],
+
+  "subtraction_plan": {
+    "note": "本章 kind=skip_impl（meta 章，无 subtract-only 精简版）：TritonGPUAttrDefs.td 是 tablegen 声明、Dialect.cpp 布局算术嵌在 MLIR 属性框架里，无法干净抽取成同名同结构可跑的 Python 精简版。可运行交叉验证改由 explainer 的 pin 精确编译承担（headless 观测真实 #blocked/#mma/#dot_op encoding，见 theory 末条）。故 delete 留空。",
+    "delete": [],
+    "must_keep": [
+      {"symbol": "BlockedEncodingAttr", "why": "本章 stakes 核心，三元组切法的载体，writer 必须逐段讲"},
+      {"symbol": "sizePerThread", "why": "三元组之一：每线程连续元素块尺寸，访存合并的直接决定因素"},
+      {"symbol": "threadsPerWarp", "why": "三元组之一：一个 warp 沿各维的线程排布，决定 32 lane 如何覆盖张量"},
+      {"symbol": "warpsPerCTA", "why": "三元组之一：CTA 内 warp 沿各维排布"},
+      {"symbol": "order", "why": "最快变化轴（the fastest-changing axis first），访存合并成立与否的关键——order[0] 须指向连续维"},
+      {"symbol": "getContigPerThread", "why": "blocked 布局恒返回 sizePerThread（dense stride），点破『每线程元素连续 → 可合并』"},
+      {"symbol": "getElemsPerThread", "why": "布局算术骨架，worked example 的核心公式（CPU 可算可验）"},
+      {"symbol": "getShapePerCTATile", "why": "一个 CTA-tile 覆盖的形状 = sizePerThread·threadsPerWarp·warpsPerCTA，getElemsPerThread 的中间量"},
+      {"symbol": "squeeze", "why": "BlockedEncoding→SliceEncoding 的构造入口，连接 blocked 与降维投影"},
+      {"symbol": "SliceEncodingAttr", "why": "降维投影布局，expand_dims 的逆，reduce/broadcast 结果布局"},
+      {"symbol": "paddedShape", "why": "SliceEncoding 全部布局算术的实现机制：回填被挤维再算再 erase"},
+      {"symbol": "NvidiaMmaEncodingAttr", "why": "Tensor Core 输出布局，MMA/DotOperand 一节的锚"},
+      {"symbol": "versionMajor", "why": "区分 Volta(1)/Ampere(2)/Hopper(3) 三代 Tensor Core 的唯一字段"},
+      {"symbol": "instrShape", "why": "MMA 指令尺寸（Ampere=[16,8]），布局直接携带硬件指令形状"},
+      {"symbol": "isAmpere", "why": "版本谓词，NvidiaMma 全部分支逻辑的分派依据（isVolta/isHopper 同族）"},
+      {"symbol": "DotOperandEncodingAttr", "why": "tt.dot 操作数布局，命中 Tensor Core 所需的操作数排布"},
+      {"symbol": "opIdx", "why": "dot 操作数编号（a=0,b=1），决定 K 维在哪一侧"},
+      {"symbol": "kWidth", "why": "沿 K 每线程连续元素数，Ampere 下=32/bitwidth，由 dtype+MMA 指令定死"},
+      {"symbol": "getSizePerThreadForOperand", "why": "dot 操作数每线程尺寸推导，量化『命中 Tensor Core 的操作数布局条件』"},
+      {"symbol": "DistributedEncodingTrait", "why": "4 级层级公共接口，所有 distributed 编码的骨架"},
+      {"symbol": "DistributedEncoding", "why": "基类模板，AMD/Nvidia 布局同继承的一行——backend_seam 的结构基础"}
+    ]
+  },
+
+  "mechanisms": [
+    {
+      "id": "distributed-hierarchy",
+      "name": "Distributed 布局的 4 级计算层级与布局函数 L",
+      "kind": "layout",
+      "source_anchors": ["include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L466-L586"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "notes": "承 ch20：CTAsPerCGA→WarpsPerCTA→ThreadsPerWarp→ValuesPerThread 四级；布局函数 L(T)[i] 逻辑索引→硬件位置，T 大于 L 时 wrap-around、小于时 broadcast。本章一切 encoding 的公共骨架。图：4 级层级 + 一个 L(T) wrap-around 小例。"
+    },
+    {
+      "id": "blocked-triple",
+      "name": "BlockedEncoding 三元组把张量切成每线程一块连续元素",
+      "kind": "layout",
+      "source_anchors": ["include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L592-L688", "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L758-L765"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "notes": "本章 stakes 核心。sizePerThread/threadsPerWarp/warpsPerCTA/order 三元组 + .td 里 16x16 over 2 warps 的 example 手算。getContigPerThread=sizePerThread（dense stride）。图：把 Example 1 的线程号铺排图化，凸显相邻 lane 拿相邻列。"
+    },
+    {
+      "id": "coalescing-encoding-condition",
+      "name": "三元组+order 如何决定一块 load 能否合并成一笔事务",
+      "kind": "layout",
+      "source_anchors": ["include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L595-L619", "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L761-L764"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "notes": "本章 perf_payoff。order[0]=连续维 + sizePerThread 连续块 + getContigPerThread=sizePerThread ⇒ warp 32 lane 覆盖连续地址段 ⇒ 合并。回指 ch07 coalescing 第一现场、ch02 硬件原理。worked example：对比 order=[1,0] vs [0,1] 下同一 warp 覆盖的地址段是否连续。图：合并 vs 跨步两种 order 的地址覆盖对照。"
+    },
+    {
+      "id": "blocked-auto-builder",
+      "name": "自动推导 builder：从 shape+numWarps 反解各级 tile",
+      "kind": "algorithm",
+      "source_anchors": ["include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L692-L728", "lib/Dialect/TritonGPU/IR/Dialect.cpp:L519-L532"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "notes": "从 order[0] 起逐级 clamp 分配 lane/warp，最后一维吃剩余。worked example：shape=[1024] num_warps=4 numThreadsPerWarp=32 → threadsPerWarp=[32],warpsPerCTA=[4]（与实测 ttgir 一致）；再走一个 2D 例子。getDefaultBlockedEncoding 是 1-elem/thread 的默认入口。"
+    },
+    {
+      "id": "blocked-elems-arithmetic",
+      "name": "getElemsPerThread 等布局算术（CPU 可查）",
+      "kind": "algorithm",
+      "source_anchors": ["lib/Dialect/TritonGPU/IR/Dialect.cpp:L632-L652", "lib/Dialect/TritonGPU/IR/Dialect.cpp:L681-L688"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "notes": "每维 t=sizePerThread·threadsPerWarp·warpsPerCTA，elemsPerThread=ceil(shapePerCTA/t)·sizePerThread。worked example：[1024] blocked 上算得 8；张量大于布局 tile 时 wrap-around 复用。纯整数、headless 可验。"
+    },
+    {
+      "id": "slice-squeeze",
+      "name": "SliceEncoding：对 parent 挤掉一维的降维投影（expand_dims 的逆）",
+      "kind": "layout",
+      "source_anchors": ["include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L1253-L1304", "lib/Dialect/TritonGPU/IR/Dialect.cpp:L629-L631", "lib/Dialect/TritonGPU/IR/Dialect.cpp:L690-L789"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "notes": "参数仅 dim+parent；全部算术靠 paddedShape 回填被挤维 + erase(dim)。worked example：以 .td 里 dim=0 / dim=1 两种挤法的线程分布表手算。图：parent 2D blocked → squeeze dim 得 1D slice 的投影示意。实测 ttgir 里 arange/expand_dims 处出现 slice<dim=0,parent=#blocked> 可作真证。"
+    },
+    {
+      "id": "nvidia-mma-encoding",
+      "name": "NvidiaMmaEncoding：Tensor Core 输出布局，versionMajor 区分三代",
+      "kind": "layout",
+      "source_anchors": ["include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L1046-L1251", "lib/Dialect/TritonGPU/IR/Dialect.cpp:L858-L908", "lib/Dialect/TritonGPU/IR/Dialect.cpp:L1858-L1900"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "notes": "点到即止（深化留 ch27）：versionMajor=1/2/3=Volta/Ampere/Hopper，instrShape=MMA 指令尺寸，getThreadsPerWarp 硬编码 Ampere=[8,4]。为什么长这样=硬件 mma 输出寄存器排布反推。图：Ampere mma.16816 输出的一个 warp 布局示意（取 .td version=2 大表的一角）。"
+    },
+    {
+      "id": "dot-operand-encoding",
+      "name": "DotOperandEncoding：命中 Tensor Core 所需的操作数布局",
+      "kind": "layout",
+      "source_anchors": ["include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L1306-L1361", "lib/Dialect/TritonGPU/IR/Dialect.cpp:L2145-L2159", "lib/Dialect/TritonGPU/IR/Dialect.cpp:L1065-L1101"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "notes": "opIdx(0=a,1=b)+parent(=结果 mma)+kWidth(沿 K 连续元素数, Ampere=32/bitwidth)。getSizePerThreadForOperand 给操作数每线程尺寸；verify 强制 Ampere kWidth 非零。worked example：fp16→kWidth=2，a 每线程沿 K 4 连续元素凑满 ldmatrix（对齐实测 ttgir dot_op kWidth=2）。图：a(M×K)/b(K×N) 操作数在一个 warp 内按 opIdx 的排布。"
+    },
+    {
+      "id": "backend-seam-mma-family",
+      "name": "AMD/Nvidia 矩阵乘布局同继承 DistributedEncoding——后端新增布局族的样板",
+      "kind": "config",
+      "source_anchors": ["include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L535-L537", "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L805-L941"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "notes": "backend_seam：AMDMfma/AMDWmma 与 NvidiaMma 并排同 .td、同继承 DistributedEncoding + MmaEncodingTrait。对照展示后端接缝——加自有矩阵乘布局只需照抄继承+实现接口。不深讲 AMD 具体算术。"
+    }
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_payoff": [],
+    "note": "bible.py due ch21 输出为空（无应埋伏笔、无应回收项）。本章上承 ch20 primer（布局=函数 L，回指不重讲）；下启 ch22 shared/swizzle（第二套心智模型，仅对照）、ch23 LinearLayout（GF(2) 统一，本章 toLinearLayout 接口一句带过留 ch23）、ch27 mma 与硬件 MMA 深化。"
+  }
+}

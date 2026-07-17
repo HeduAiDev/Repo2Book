@@ -1,0 +1,244 @@
+{
+  "chapter_id": "ch21",
+  "slug": "ch21-distributed-layouts",
+  "note": "素材真相源。两组 pin 精确编译（triton==3.2.0，与 pin 逐字节同，headless 无 GPU，stage=make_ttgir）落盘 traces/copy1d.json（1D copy）与 traces/matmul.json（64x64 fp16 matmul）：真实 #blocked / #mma / #dot_op / #slice encoding 逐字观测，布局算术在驱动脚本内按 C++ 同式重算并 dump（builder 反解结果与编译器实发 encoding 逐位吻合，互为交叉验证）。blocked-triple 用 .td 文档 Example 1（作者手写的固定示例 encoding，编译器不会为某 kernel 发这一个，故 manual + file 行号）。",
+  "mechanisms": [
+    {
+      "mechanism_id": "distributed-hierarchy",
+      "intuition": "把一张张量发给全班同学：先分组（CTA），每组再分小队（warp），每队 32 个人（thread），每人手里攥几张（value）。四级从粗到细，谁拿哪几格由一个『布局函数 L』一次算定——distributed 布局就是这套四级分发规则的统称。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-distributed-hierarchy",
+          "claim": "每个 distributed 布局都把张量沿 CTAsPerCGA→WarpsPerCTA→ThreadsPerWarp→ValuesPerThread 四级由粗到细依次切分，最上两级按 shape+order 连续分发线性 id。",
+          "template": "flow",
+          "numbers": [
+            {"label": "四级层级", "value": "CTAsPerCGA / WarpsPerCTA / ThreadsPerWarp / ValuesPerThread", "provenance": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L472-L474"},
+            {"label": "示例 shape", "value": "[4, 4]", "provenance": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L476-L478"},
+            {"label": "order（最快变化轴优先）", "value": "[0, 1]", "provenance": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L478"},
+            {"label": "L 首列（沿 dim0 连续）", "value": "0,1,2,3", "provenance": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L480-L483"},
+            {"label": "L 首行（沿 dim1 跨 4）", "value": "0,4,8,12", "provenance": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L480-L483"}
+          ],
+          "caption_draft": "四级计算层级是本章一切 encoding 的公共骨架：Blocked/Slice/NvidiaMma/DotOperand 只在最下两级（ThreadsPerWarp、ValuesPerThread）各自定义分发方式，上两级共享『按 shape+order 连续铺线性 id』。当张量某维大于布局该维时该维 wrap-around（每线程多值），小于时 broadcast（一值多线程共享）。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "blocked-triple",
+      "intuition": "发扑克：不是一张一张轮流发（那样相邻的牌散到不同人手里），而是每人一次抓『连续的一小叠』。sizePerThread 就是这一小叠的大小，threadsPerWarp/warpsPerCTA 决定这些小叠怎么在牌桌上拼成整副。相邻的人抓相邻的叠——这正是等会儿能『合并访存』的物理前提。",
+      "worked_example": {
+        "params": {"tensor": "16x16", "warps": 2, "threads": 64, "sizePerThread": [2, 2], "threadsPerWarp": [8, 4], "warpsPerCTA": [1, 2], "note": "取 .td 文档 Example 1 的固定示例 encoding"},
+        "trace_source": "manual",
+        "manual_reason": "这是 TritonGPUAttrDefs.td 文档里作者手写的 Example 1——一个用来展示 2×2 分块切法的固定 encoding（sizePerThread={2,2} 等），并非编译器为某个 kernel 推出来的布局，无法 dump；表格是按四级布局函数手工套用 .td 给出的线程号网格（L601-L619）复算得到，每个线程号都能在该网格里逐格核对。真实 kernel 实发的 #blocked（如 sizePerThread=[1] 的 1D copy）另见 blocked-auto-builder 的 run trace。",
+        "table": {
+          "columns": ["张量坐标 (row,col)", "落到哪个线程", "为什么", "同 warp 内相邻关系"],
+          "rows": [
+            ["(0,0)", "thread 0", "warp0；sizePerThread=2×2 → thread0 占 rows0-1×cols0-1 的连续 2×2 块", "起点"],
+            ["(0,1)", "thread 0", "仍在 thread0 的 2×2 块内（col 方向 sizePerThread=2）", "同一线程的连续元素"],
+            ["(0,2)", "thread 1", "跨过 thread0 的 2 列 → 下一线程，lane 沿 order[0]=col 方向 +1", "相邻 lane 拿相邻列块"],
+            ["(2,0)", "thread 4", "row 方向每跨 sizePerThread=2 行换一批 lane（threadsPerWarp 沿 row=8）", "沿 dim0 的下一排线程"],
+            ["(0,8)", "thread 32", "跨过 warp0 覆盖的左半 8 列 → warp1（warpsPerCTA 沿 col=2）", "换 warp，非相邻 lane"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "每维『sizePerThread·threadsPerWarp·warpsPerCTA』相乘正好等于该维一个 CTA-tile 覆盖的元素数；且同一线程在张量里握的 sizePerThread 个元素地址连续（getContigPerThread≡sizePerThread）。",
+        "argument": "基例：单维 sizePerThread=s 的线程占 [k·s, k·s+s) 这段连续下标，长度 s，无缝拼接不重叠。归纳：threadsPerWarp 把 warp 内 lane 沿各维铺开、warpsPerCTA 再铺 warp，各级 tile 尺寸相乘即 CTA-tile；getContigPerThread 恒等返回 sizePerThread（TritonGPUAttrDefs.td:L761-L764）保证『每线程连续』这一性质对任意合法三元组都成立。"
+      },
+      "quantified": "16×16=256 个元素 / 64 个线程 = 每线程 4 个元素，恰等于 sizePerThread 的乘积 2×2=4；warp0（threadsPerWarp=8×4=32 lane）覆盖 16 行 × 8 列的左半张量，warp1 覆盖右半——两 warp 沿 col 拼出整张 16×16。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-blocked-triple",
+          "claim": "sizePerThread={2,2} 让每个线程占一块 2×2 连续元素，threadsPerWarp={8,4} 把一个 warp 的 32 lane 铺成 8×4，warpsPerCTA={1,2} 让两个 warp 沿列拼出整个 16×16。",
+          "template": "tiling",
+          "numbers": [
+            {"label": "张量", "value": "16x16", "provenance": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L601"},
+            {"label": "sizePerThread", "value": "[2, 2]", "provenance": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L614"},
+            {"label": "threadsPerWarp", "value": "[8, 4]", "provenance": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L615"},
+            {"label": "warpsPerCTA", "value": "[1, 2]", "provenance": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L616"},
+            {"label": "thread0 占的块", "value": "rows 0-1 × cols 0-1", "provenance": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L603-L604"},
+            {"label": "warp1 起始线程号", "value": "32", "provenance": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L603"}
+          ],
+          "caption_draft": "把 .td Example 1 的线程号网格图化：每个数字出现在一个 2×2 连续块上（sizePerThread），相邻线程 0,1,2,3 沿列方向拿相邻列块——这就是访存合并的编码层长相。左半（cols 0-7）归 warp0（线程 0-31），右半（cols 8-15）归 warp1（线程 32-63）。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "coalescing-encoding-condition",
+      "intuition": "32 个人去仓库取货：如果他们的货位是连着的一排（0..31 号），保安一次就能开一整段货架放行（一笔事务）；如果每人的货位隔着一整行远（0,64,128... 号），保安得开 32 次锁。order 决定 32 个 lane 的『货位』沿哪根轴排——排到连续维上就合并，排错就跨步。",
+      "worked_example": {
+        "params": {"kernel": "64x64 fp16 matmul 的操作数 load", "encoding": "#blocked sizePerThread=[1,1] threadsPerWarp=[1,32] warpsPerCTA=[2,2] order=[1,0]", "bytes_per_elem": 2},
+        "trace_source": "run",
+        "trace_ref": "traces/matmul.json",
+        "table": {
+          "columns": ["order", "32 lane 落在哪", "地址跨度", "事务数"],
+          "rows": [
+            ["[1,0]（实发，order[0]=1=列=连续维）", "同一行的 32 个连续列", "32 元素连续 = 64 字节", "1 笔（合并）"],
+            ["[0,1]（反例，order[0]=0=行=跨步维）", "同一列的 32 个不同行", "每行相隔 64 元素 = 128 字节", "32 笔（跨步）"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "当且仅当 order[0] 指向 stride=1 维、且该维 getContigPerThread=sizePerThread 连续块首尾相接时，一个 warp 的 32 lane 覆盖一段连续地址；事务数 = ceil(warp 连续跨度字节 / 事务粒度)，取到最小。",
+        "argument": "lane 沿 order[0] 维以步长 sizePerThread 递增（TritonGPUAttrDefs.td:L761 getContigPerThread≡sizePerThread）。若 order[0] 是 stride=1 维，则 lane i 的元素物理地址 = base + i·sizePerThread·elemBytes，32 个 lane 铺成一段无洞连续区间 → GPU 合并成 ceil(区间/128B) 笔（本例 64B<128B → 1 笔）。若 order[0] 换成 stride=行宽 的维，相邻 lane 地址相隔一整行 → 无连续区间可合并，退化到每 lane 一笔。"
+      },
+      "quantified": "同一块 warp-load：合并版 1 笔事务，跨步版 32 笔——事务数相差 32×（traces/matmul.json analysis.coalescing）。这正是 order 选对与否在编码层的性能落点，硬件成因见 ch02/ch07。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-coalescing-order",
+          "claim": "order=[1,0] 让 32 lane 覆盖一行的 32 个连续列（64 字节，1 笔事务）；若 order=[0,1] 同样 32 lane 落在相隔 128 字节的 32 行上（32 笔事务）。",
+          "template": "before-after",
+          "numbers": [
+            {"label": "lane 数", "value": "32", "provenance": "traces/matmul.json analysis.coalescing.coalesced_lanes"},
+            {"label": "合并跨度", "value": "64 字节", "provenance": "traces/matmul.json analysis.coalescing.coalesced_span_bytes"},
+            {"label": "合并事务数", "value": "1", "provenance": "traces/matmul.json analysis.coalescing.coalesced_transactions"},
+            {"label": "跨步行距", "value": "128 字节", "provenance": "traces/matmul.json analysis.coalescing.strided_row_stride_bytes"},
+            {"label": "跨步事务数", "value": "32", "provenance": "traces/matmul.json analysis.coalescing.strided_transactions"}
+          ],
+          "caption_draft": "同一 warp、同一份数据，只换 order：左（order=[1,0]，编译器实发）32 lane 贴着一行的连续列，一段 64 字节合并成 1 笔；右（order=[0,1]，反例）32 lane 竖着落在 32 行、彼此相隔 128 字节，退化成 32 笔。order[0] 必须指向 stride=1 维——这是 ch07 访存合并现场在布局层的固化。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "blocked-auto-builder",
+      "intuition": "给定张量形状和 warp 数，怎么自动切出『合并友好』的布局？算法像分蛋糕：从最连续那根轴（order[0]）开刀，先尽量让一个 warp 的 32 把刀吃满这根轴，剩下的刀和 warp 再分给下一根轴，最后一根轴兜底吃掉所有没分完的 lane 和 warp。",
+      "worked_example": {
+        "params": {"shape": [64, 64], "sizePerThread": [1, 1], "order": [1, 0], "numWarps": 4, "numThreadsPerWarp": 32},
+        "trace_source": "run",
+        "trace_ref": "traces/matmul.json",
+        "table": {
+          "columns": ["步", "处理轴 i", "threadsPerCTA=clamp(剩余线程, 1, shape/size)", "threadsPerWarp[i]", "warpsPerCTA[i]"],
+          "rows": [
+            ["d=0（连续维）", "order[0]=1", "clamp(128, 1, 64/1=64) = 64", "clamp(64,1,32) = 32", "clamp(64/32=2,1,4) = 2"],
+            ["末维（兜底）", "order[1]=0", "—", "32/prevLanes=32/32 = 1", "4/prevWarps=4/2 = 2"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "循环恰跑 rank-1 轮（每轮处理一根非末轴）后必终止；且 ∏ threadsPerWarp[i]=numThreadsPerWarp、∏ warpsPerCTA[i]=numWarps 精确成立（lane/warp 不多不少全部分完）。",
+        "argument": "单调量：每轮 remainingLanes/remainingWarps/remainingThreads 都除以本轮 clamp 出的正整数（≥1），严格非增，循环下标 d 从 0 走到 rank-1 有限步必停。守恒：前 rank-1 轮累乘 prevLanes/prevWarps，末维直接令 threadsPerWarp[last]=numThreadsPerWarp/prevLanes、warpsPerCTA[last]=numWarps/prevWarps，两式相乘即还原总数。本例驱动脚本重跑该 clamp 循环得 threadsPerWarp=[1,32]、warpsPerCTA=[2,2]，与编译器实发 #blocked 逐位吻合（traces/matmul.json）。"
+      },
+      "quantified": "2D [64,64]：1 轮循环 + 末维兜底 → threadsPerWarp=[1,32]、warpsPerCTA=[2,2]（连续维 dim1 吃满 32 lane）。退化到 1D [1024]：rank-1=0 轮循环，直接兜底 → threadsPerWarp=[32]、warpsPerCTA=[4]（traces/copy1d.json）。两例的自动推导结果都与 pin 编译实发 encoding 一致。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "blocked-elems-arithmetic",
+      "intuition": "布局的一个 tile 像一块地砖，张量是地板。地板比地砖大时就得铺好几块砖（wrap-around），每铺一层，每个线程手里就多攒一份元素。getElemsPerThread 就是在数：这块地板要几层砖、每层每人分几个。",
+      "worked_example": {
+        "params": {"shape": [1024], "sizePerThread": [1], "threadsPerWarp": [32], "warpsPerCTA": [4], "note": "1D copy 实发 #blocked"},
+        "trace_source": "run",
+        "trace_ref": "traces/copy1d.json",
+        "table": {
+          "columns": ["量", "公式", "代入", "值"],
+          "rows": [
+            ["一个 CTA-tile 跨度 t", "sizePerThread·threadsPerWarp·warpsPerCTA", "1·32·4", "128"],
+            ["需几块 tile", "ceil(shape / t)", "ceil(1024 / 128)", "8"],
+            ["每线程元素数", "ceil(shape/t) · sizePerThread", "8 · 1", "8"],
+            ["交叉验证", "shape / (numWarps·32)", "1024 / 128", "8"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "elemsPerThread[i]=ceil(shapePerCTA[i]/t[i])·sizePerThread[i] ≥ sizePerThread[i] > 0，且 product(elemsPerThread)·numThreads ≥ product(shape)：整除时相等（无浪费），不整除时 wrap-around 使左式严格更大（末块补齐）。",
+        "argument": "ceil(x/t)≥1 故每线程至少 sizePerThread 个、恒正。总覆盖 = 每线程元素数 × 线程总数；ceil 只会向上取整到能盖住整个张量，故 ≥ product(shape)，当 t 整除 shapePerCTA 时 ceil 无余、取等。本例 1024=128·8 恰整除 → 8·128=1024 精确等于张量大小，无 wrap-around 浪费。"
+      },
+      "quantified": "[1024] over 4 warps：t=128，8 块 tile，每线程 8 个元素，总计 8×128=1024 覆盖全张量、零浪费；若张量换成 [1000]，则 ceil(1000/128)=8 仍是 8 个/线程，但 8×128=1024>1000 出现末块 wrap-around 的 24 元素冗余。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "slice-squeeze",
+      "intuition": "SliceEncoding 是『把一张 2D 布局压扁成 1D』的规则：沿某一维把它挤没（squeeze）。它和 expand_dims 是一对互逆操作——arange 拿到的是被挤掉一维的 slice 布局，expand_dims 再把那一维顶回来，恢复成原来的 2D blocked。",
+      "worked_example": {
+        "params": {"parent": "#blocked（matmul 操作数布局）", "source": "tl.arange(0,64) 生成行/列索引", "note": "slice 是 expand_dims 的逆"},
+        "trace_source": "run",
+        "trace_ref": "traces/matmul.json",
+        "table": {
+          "columns": ["IR 操作", "结果类型 / 布局", "语义"],
+          "rows": [
+            ["tt.make_range(0,64)（M 方向索引）", "tensor<64xi32, slice<dim=1,parent=#blocked>>", "沿 parent 的 dim1 挤掉一维，得 1D 布局"],
+            ["tt.expand_dims axis=1", "tensor<64x1xi32, #blocked>", "把 dim1 顶回成大小为 1 的维 → 正是 slice<dim=1> 的逆，还原 parent"],
+            ["tt.make_range(0,64)（N 方向索引）", "tensor<64xi32, slice<dim=0,parent=#blocked>>", "换挤 dim0，得另一根轴上的 1D 布局"],
+            ["tt.expand_dims axis=0", "tensor<1x64xi32, #blocked>", "把 dim0 顶回，同样还原 parent"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "paddedShape 把被挤维回填成 size-1，使 rank(parent)=rank(slice)+1；据此 squeeze(dim) 与 expand_dims(axis=dim) 在 dim 位置一致时严格互逆。",
+        "argument": "paddedShape(shape) 在下标 dim 处插入 1、其余原样（Dialect.cpp:L691-L705），把 slice 的 rank-1 形状抬回 parent 的 rank；getElemsPerThread 先按 parent 在这个 padded 形状上算、再 erase 掉第 dim 项（Dialect.cpp:L711-L718），保证 slice 的每维访问器与 parent 除 dim 外逐维一致。因回填与 erase 互为逆操作，expand_dims 恢复的正是原 parent 布局。IR 实证：make_range 得 slice<dim=1>，紧接 expand_dims(axis=1) 得回 #blocked（traces/matmul.json ttgir）。"
+      },
+      "quantified": "parent rank=2 → slice rank=1（挤 1 维降 1 阶）；64 元素的 arange 沿 slice<dim=1> 分布时，被挤掉的是 parent 沿 dim1 的 32 lane 排布，只保留 dim0 方向的线程映射。expand_dims 再把那 1 维顶回 size-1，rank 复位为 2。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-slice-squeeze",
+          "claim": "SliceEncoding 沿 dim 把 parent #blocked 挤掉一维得 1D 布局；expand_dims 把该维顶回 size-1，恢复原 parent——二者严格互逆。",
+          "template": "before-after",
+          "numbers": [
+            {"label": "parent rank", "value": "2", "provenance": "traces/matmul.json ttgir（tensor<64x1..#blocked>）"},
+            {"label": "slice rank", "value": "1", "provenance": "traces/matmul.json ttgir（tensor<64xi32, slice<..>>）"},
+            {"label": "挤 M 方向", "value": "slice<dim=1,parent=#blocked>", "provenance": "traces/matmul.json analysis.slice_from_arange"},
+            {"label": "expand_dims 还原", "value": "tensor<64x1xi32,#blocked>", "provenance": "traces/matmul.json analysis.slice_from_arange"},
+            {"label": "挤 N 方向", "value": "slice<dim=0,parent=#blocked>", "provenance": "traces/matmul.json analysis.slice_from_arange"}
+          ],
+          "caption_draft": "左：parent 2D #blocked 沿 dim=1 squeeze → 右：1D slice<dim=1,parent=#blocked>（被挤维的线程排布折叠进剩余维）。虚线箭头 expand_dims(axis=1) 反向把 size-1 维顶回，逐位还原 parent。matmul 里 arange→expand_dims 这一对就是 slice『作 expand_dims 的逆』的真实现场。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "nvidia-mma-encoding",
+      "intuition": "Tensor Core 是硬件里的矩阵乘专用电路，它算完把结果按一套固定格式塞进各线程的寄存器——这个格式不是软件想怎样就怎样，是电路定死的。NvidiaMmaEncoding 只是忠实描述这套硬件格式，用一个整数 versionMajor 就区分了 Volta/Ampere/Hopper 三代电路。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-nvidia-mma-version",
+          "claim": "NvidiaMma 用一个整数 versionMajor 编码三代 Tensor Core（1=Volta / 2=Ampere / 3=Hopper），instrShape 直接携带 MMA 指令的 M×N 形状（Ampere=[16,8]）。",
+          "template": "state-table",
+          "numbers": [
+            {"label": "versionMajor=1", "value": "Volta（isVolta）", "provenance": "lib/Dialect/TritonGPU/IR/Dialect.cpp:L1858"},
+            {"label": "versionMajor=2", "value": "Ampere/Turing（isAmpere）", "provenance": "lib/Dialect/TritonGPU/IR/Dialect.cpp:L1864"},
+            {"label": "versionMajor=3", "value": "Hopper（isHopper）", "provenance": "lib/Dialect/TritonGPU/IR/Dialect.cpp:L1866"},
+            {"label": "实发 mma", "value": "versionMajor=2, versionMinor=0", "provenance": "traces/matmul.json analysis.mma_encoding"},
+            {"label": "instrShape", "value": "[16, 8]", "provenance": "traces/matmul.json analysis.mma_encoding"},
+            {"label": "Ampere getThreadsPerWarp", "value": "[8, 4]", "provenance": "lib/Dialect/TritonGPU/IR/Dialect.cpp:L1858-L1900"}
+          ],
+          "caption_draft": "一个整数字段 versionMajor 分派整代 Tensor Core：谓词 isVolta/isAmpere/isHopper（Dialect.cpp:L1858-L1866）据它选布局分支；instrShape 携带 MMA 指令的 M×N（本章 64×64 fp16 matmul 实发 [16,8]，对应 Ampere mma.16816）。为什么布局长这样=硬件 MMA 输出寄存器排布反推，深化留 ch27。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "dot-operand-encoding",
+      "intuition": "要喂饱 Tensor Core，两个操作数得按它挑食的方式摆盘：每个线程沿收缩维 K 攥住恰好凑满一次搬运的连续几个数。kWidth 就是这个『连续几个』——它不能拍脑袋，由数据类型定死：fp16 一个数 16 位，凑满 32 位就得 2 个，所以 kWidth=2。",
+      "worked_example": {
+        "params": {"dtype": "fp16", "bitwidth": 16, "parent": "#mma（Ampere）", "note": "kWidth 与 getSizePerThreadForOperand"},
+        "trace_source": "run",
+        "trace_ref": "traces/matmul.json",
+        "table": {
+          "columns": ["量", "公式 / 来源", "代入", "值"],
+          "rows": [
+            ["kWidth", "32 / bitwidth（Ampere builder）", "32 / 16", "2"],
+            ["a 每线程尺寸 (M,K)", "opIdx=0 → [2, 2·kWidth]", "[2, 2·2]", "[2, 4]"],
+            ["b 每线程尺寸 (K,N)", "opIdx=1 → [2·kWidth, 1]", "[2·2, 1]", "[4, 1]"],
+            ["a 沿 K 连续元素", "2·kWidth", "2·2", "4（凑满 ldmatrix/mma.16816 一次搬运）"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "Ampere 下 kWidth 由 kWidth·bitwidth=32 唯一确定（每线程沿 K 一次搬运恰好 32 位连续数据），且 verify 强制 kWidth≠0——非法组合在编译期被拦。",
+        "argument": "builder 令 kWidth=32/bitwidth（TritonGPUAttrDefs.td:L1336-L1341），对 2 的幂位宽整除精确：fp16→2、fp32/tf32→1、fp8→4。verify（Dialect.cpp:L1080）对 isAmpere() 的 parent 断言 kWidth!=0，堵住『忘填 kWidth』的非法 DotOperand。getSizePerThreadForOperand（Dialect.cpp:L2145-L2159）据此给出每线程沿各维尺寸，opIdx∈{0,1} 之外 report_fatal_error。IR 实证：fp16 matmul 两操作数均为 dot_op<kWidth=2>（traces/matmul.json）。"
+      },
+      "quantified": "fp16（16 位）→ kWidth=32/16=2；a(opIdx=0) 每线程 (M,K)=[2,4]、b(opIdx=1) (K,N)=[4,1]，a 沿 K 攥住 4 个连续 fp16——恰好对齐 Ampere mma.16816 一次操作数搬运的粒度。与编译器实发 dot_op<opIdx=0/1,parent=#mma,kWidth=2> 逐字吻合。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-dot-operand-sizes",
+          "claim": "fp16→kWidth=32/16=2；getSizePerThreadForOperand 给 a(opIdx=0) 每线程 [M=2,K=4]、b(opIdx=1) [K=4,N=1]——a 沿 K 的 4 个连续 fp16 恰好凑满一次 mma.16816 操作数搬运。",
+          "template": "layout",
+          "numbers": [
+            {"label": "kWidth (fp16)", "value": "2", "provenance": "traces/matmul.json analysis.dot_operand.kWidth"},
+            {"label": "bitwidth", "value": "16", "provenance": "traces/matmul.json analysis.dot_operand.bitwidth_fp16"},
+            {"label": "a 每线程 (M,K)", "value": "[2, 4]", "provenance": "traces/matmul.json analysis.dot_operand.sizePerThread_opIdx0_MK"},
+            {"label": "b 每线程 (K,N)", "value": "[4, 1]", "provenance": "traces/matmul.json analysis.dot_operand.sizePerThread_opIdx1_KN"},
+            {"label": "a 沿 K 连续元素", "value": "4", "provenance": "traces/matmul.json analysis.dot_operand.a_contig_elems_along_K"}
+          ],
+          "caption_draft": "一个 warp 内 dot 操作数按 opIdx 的每线程分块：a（M×K，opIdx=0）每线程沿 M=2、沿 K=2·kWidth=4；b（K×N，opIdx=1）沿 K=4、沿 N=1。收缩维 K 上都攥 4 个连续 fp16——这是命中 Ampere mma.16816 的操作数排布条件，由 dtype+MMA 指令定死、不容自选。深化留 ch27。"
+        }
+      ]
+    }
+  ]
+}
