@@ -15,7 +15,7 @@ def text_w(s, size):
     return cjk * size * 1.0 + other * size * 0.56
 
 TITLE = "order 决定 32 个 lane 的访存能否合并成一笔事务"
-SUBTITLE = "64x64 fp16 matmul 操作数 load,同一个 warp、同一份数据,只换 order(traces/matmul.json)"
+SUBTITLE = "64x64 fp16 matmul 操作数 load,同一个 warp、同一份数据,只换 order(Triton v3.2.0 实测)"
 
 N_LANE_SHOW = 12          # 展示的 lane 数(其余用省略号示意,32 lane 结论不变)
 CELL = 26

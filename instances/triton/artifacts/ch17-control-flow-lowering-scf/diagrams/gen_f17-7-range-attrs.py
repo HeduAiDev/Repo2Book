@@ -75,7 +75,7 @@ L.append(f'<text x="{PAD}" y="{foot_y}" font-family="sans-serif" font-size="12" 
 L.append(f'<text x="{PAD}" y="{foot_y+22}" font-family="sans-serif" font-size="11" '
           f'fill="#64748b">{esc("挂载点 code_generator.py:L991-L994；num_stages/loop_unroll_factor 由 tl.range 构造记下(language/core.py:L2570-L2582)")}</text>')
 L.append(f'<text x="{PAD}" y="{foot_y+42}" font-family="sans-serif" font-size="11" '
-          f'fill="#94a3b8">{esc("traces/ch17_traces.json -> ir.K1_for_range_attrs")}</text>')
+          f'fill="#94a3b8">{esc("Triton v3.2.0 headless 实测:ir.K1_for_range_attrs")}</text>')
 
 L.append('</svg>')
 out = Path(__file__).with_name("f17-7-range-attrs.svg")

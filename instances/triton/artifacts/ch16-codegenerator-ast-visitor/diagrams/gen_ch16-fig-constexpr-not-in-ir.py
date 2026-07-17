@@ -85,7 +85,7 @@ for i, (llines, rlines, style) in enumerate(ROWS):
 
 foot_y = TOP + n * (BOX_H + VGAP) + 20
 L.append(f'<text x="{PAD}" y="{foot_y}" font-family="sans-serif" font-size="12" '
-          f'fill="#334155">{esc("Python 参数数=5 -> IR 参数数=4(traces/m8_functiondef_idx.json);BLOCK_SIZE 折叠值=1024")}</text>')
+          f'fill="#334155">{esc("Python 参数数=5 -> IR 参数数=4(Triton v3.2.0 headless 实测);BLOCK_SIZE 折叠值=1024")}</text>')
 L.append(f'<text x="{PAD}" y="{foot_y+20}" font-family="sans-serif" font-size="12" '
           f'fill="#334155">{esc("divisibility 标注数=3,值=16(backends/compiler.py:L77)")}</text>')
 L.append(f'<text x="{PAD}" y="{foot_y+40}" font-family="sans-serif" font-size="11" '

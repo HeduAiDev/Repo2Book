@@ -8,7 +8,7 @@ from pathlib import Path
 def esc(s): return xs.escape(s)
 
 TITLE = "fp8 家族与 16 / 32 bit 基准 —— (mantissa, exponent_bias) 决定精度↔动态范围"
-SUBTITLE = "同一条位宽线上，尾数位数与 exponent_bias 此消彼长；数据来自 traces/fp8_encoding.txt"
+SUBTITLE = "同一条位宽线上，尾数位数与 exponent_bias 此消彼长；Triton v3.2.0 headless 实测"
 COLS = ["bitwidth", "mantissa", "exponent_bias", "相对 fp32 带宽"]
 ROWS = [
     ("fp8e4nv", ["8", "3", "7", "0.250"], "bit8"),

@@ -12,7 +12,7 @@ def esc(s):
 
 
 TITLE = "name_lookup:local -> global(守卫) -> builtin 三级线性查找"
-SUBTITLE = "查找层数固定为 3(code_generator.py:L307);6 个名字里 1 个被 global 守卫拒绝(traces/m2_name_lookup.json)"
+SUBTITLE = "查找层数固定为 3(code_generator.py:L307);6 个名字里 1 个被 global 守卫拒绝(Triton v3.2.0 headless 实测)"
 
 COLS = ["名字", "①local", "②global(守卫)", "③builtin", "解析结果"]
 ROWS = [

@@ -15,7 +15,7 @@ def text_w(s, size):
     return cjk * size * 1.0 + other * size * 0.56
 
 TITLE = "SliceEncoding 是 expand_dims 的逆:挤掉一维 <-> 顶回 size-1"
-SUBTITLE = "matmul 里 tt.make_range -> tt.expand_dims 的真实 IR(traces/matmul.json)"
+SUBTITLE = "matmul 里 tt.make_range -> tt.expand_dims 的真实 IR(Triton v3.2.0 实测)"
 
 ROWS = [
     {

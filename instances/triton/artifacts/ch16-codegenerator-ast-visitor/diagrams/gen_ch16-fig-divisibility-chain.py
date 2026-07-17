@@ -79,7 +79,7 @@ foot_y = centers[-1] + BOX_H + 40
 L.append(f'<text x="{PAD_L}" y="{foot_y}" font-family="sans-serif" font-size="12" '
           f'fill="#334155">{esc("divisibility 值=16(backends/compiler.py:L77)")}</text>')
 L.append(f'<text x="{PAD_L}" y="{foot_y+20}" font-family="sans-serif" font-size="12" '
-          f'fill="#334155">{esc("本例落属性的参数数=3(traces/m8_functiondef_idx.json)")}</text>')
+          f'fill="#334155">{esc("本例落属性的参数数=3(Triton v3.2.0 headless 实测)")}</text>')
 L.append(f'<text x="{PAD_L}" y="{foot_y+40}" font-family="sans-serif" font-size="11" '
           f'fill="#64748b">{esc("灰=已讲过的上游(回指);蓝=链路中段;橙=本章 CodeGenerator 落属性的那一步;紫=尚未讲到的下游消费者(前瞻)")}</text>')
 

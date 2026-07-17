@@ -12,7 +12,7 @@ def esc(s):
 
 
 TITLE = "static_range vs range：追踪期就分道扬镳"
-SUBTITLE = "同样循环 4 轮（make_ir 追踪期，任何 pass 之前，pin triton==3.2.0 实测，traces/ranges_ir.txt）"
+SUBTITLE = "同样循环 4 轮（make_ir 追踪期，任何 pass 之前，pin triton==3.2.0 实测）"
 
 PANELS = [
     {

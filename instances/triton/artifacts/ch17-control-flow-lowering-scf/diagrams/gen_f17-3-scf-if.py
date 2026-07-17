@@ -57,7 +57,7 @@ L.append(f'<text x="{hl_cx}" y="{hl_y+BOX_H+18}" text-anchor="middle" font-famil
 
 foot_y = h - 20
 L.append(f'<text x="{PAD}" y="{foot_y}" font-family="sans-serif" font-size="11" '
-          f'fill="#64748b">{esc("traces/ch17_traces.json -> ir.K2_if_scf(scf.if 计数=1, scf.yield 计数=2)")}</text>')
+          f'fill="#64748b">{esc("Triton v3.2.0 headless 实测:ir.K2_if_scf(scf.if 计数=1, scf.yield 计数=2)")}</text>')
 
 L.append('</svg>')
 out = Path(__file__).with_name("f17-3-scf-if.svg")

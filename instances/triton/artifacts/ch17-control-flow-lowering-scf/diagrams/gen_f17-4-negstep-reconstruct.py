@@ -64,7 +64,7 @@ L.append(f'<text x="{PAD}" y="{foot_y0+22}" font-family="sans-serif" font-size="
           f'{esc("IR 体首反算:%9 = arith.subi %2(ub=10), %arg1(j)   %10 = arith.addi %9, %1(lb=0)")}</text>')
 L.append(f'<text x="{PAD}" y="{foot_y0+42}" font-family="sans-serif" font-size="10.5" '
           f'fill="#94a3b8">'
-          f'{esc("traces/ch17_traces.json -> neg_step_reconstruction；ir.K4_for_negstep(arith.subi=1, arith.addi=3)")}</text>')
+          f'{esc("Triton v3.2.0 headless 实测：ir.K4_for_negstep(arith.subi=1, arith.addi=3)")}</text>')
 
 L.append('</svg>')
 out = Path(__file__).with_name("f17-4-negstep-reconstruct.svg")

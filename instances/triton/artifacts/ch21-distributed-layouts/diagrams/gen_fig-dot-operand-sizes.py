@@ -15,7 +15,7 @@ def text_w(s, size):
     return cjk * size * 1.0 + other * size * 0.56
 
 TITLE = "DotOperandEncoding:kWidth 由 dtype 定死,不容自选"
-SUBTITLE = "Ampere fp16 matmul 操作数,每线程沿收缩维 K 恰好攥住一次 mma.16816 搬运量(traces/matmul.json)"
+SUBTITLE = "Ampere fp16 matmul 操作数,每线程沿收缩维 K 恰好攥住一次 mma.16816 搬运量(Triton v3.2.0 实测)"
 
 FORMULA = "kWidth = 32 / bitwidth = 32 / 16 = 2"
 CELL = 42

@@ -86,7 +86,7 @@ for i, row in enumerate(ROWS):
 # 实发数据卡片
 extra_y0 = TOP + HEADER_H + len(ROWS) * ROW_H + 26
 L.append(f'<text x="{PAD}" y="{extra_y0}" font-family="sans-serif" font-size="12" '
-          f'font-weight="bold" fill="#0f172a">{esc("本章 traces/matmul.json 实测:")}</text>')
+          f'font-weight="bold" fill="#0f172a">{esc("本章 Triton v3.2.0 实测:")}</text>')
 for i, (k, v) in enumerate(EXTRA):
     y = extra_y0 + 22 + i * 22
     L.append(f'<text x="{PAD}" y="{y}" font-family="sans-serif" font-size="12" '

@@ -78,7 +78,7 @@ L.append(f'<text x="{PAD}" y="{foot_y}" font-family="sans-serif" font-size="11.5
 L.append(f'<text x="{PAD}" y="{foot_y+20}" font-family="sans-serif" font-size="11.5" '
           f'fill="#334155">{esc("while 的诱导逻辑全在 before 区用户条件里,无 poison/负步长那套")}</text>')
 L.append(f'<text x="{PAD}" y="{foot_y+44}" font-family="sans-serif" font-size="10.5" '
-          f'fill="#64748b">{esc("traces/ch17_traces.json -> ir.K5_while(scf.while=1, scf.condition=1, scf.yield=1)")}</text>')
+          f'fill="#64748b">{esc("Triton v3.2.0 headless 实测:ir.K5_while(scf.while=1, scf.condition=1, scf.yield=1)")}</text>')
 L.append(f'<text x="{PAD}" y="{foot_y+62}" font-family="sans-serif" font-size="10.5" '
           f'fill="#94a3b8">{esc("code_generator.py:L847-L875")}</text>')
 

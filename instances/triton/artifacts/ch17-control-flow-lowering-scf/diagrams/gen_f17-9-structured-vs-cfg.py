@@ -86,7 +86,7 @@ foot_y = third_y + 60 + 34
 L.append(f'<text x="{PAD}" y="{foot_y}" font-family="sans-serif" font-size="12" '
           f'fill="#334155">{esc("把 return 写进循环/分支,等于亲手把这段代码挪出结构化优化的射程")}</text>')
 L.append(f'<text x="{PAD}" y="{foot_y+20}" font-family="sans-serif" font-size="10.5" '
-          f'fill="#64748b">{esc("traces/ch17_traces.json -> ir.K1_for_range_attrs / op_counts.K3_if_return_cfg / ir.K7_return_in_for_error")}</text>')
+          f'fill="#64748b">{esc("Triton v3.2.0 headless 实测:ir.K1_for_range_attrs / op_counts.K3_if_return_cfg / ir.K7_return_in_for_error")}</text>')
 
 L.append('</svg>')
 out = Path(__file__).with_name("f17-9-structured-vs-cfg.svg")

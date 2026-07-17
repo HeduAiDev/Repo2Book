@@ -118,7 +118,7 @@ for i, t in enumerate(note_lines):
 
 foot_y = H - 22
 L.append(f'<text x="{PAD}" y="{foot_y}" font-family="sans-serif" font-size="11" '
-          f'fill="#64748b">{esc("traces/ch17_traces.json -> ir.K3_if_return_cfg;op_counts.K3_if_return_cfg.cf.br=2")}</text>')
+          f'fill="#64748b">{esc("Triton v3.2.0 headless 实测:ir.K3_if_return_cfg;op_counts.K3_if_return_cfg.cf.br=2")}</text>')
 
 L.append('</svg>')
 out = Path(__file__).with_name("f17-2-cfg-blocks.svg")

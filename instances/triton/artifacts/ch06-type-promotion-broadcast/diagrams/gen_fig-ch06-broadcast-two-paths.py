@@ -51,7 +51,7 @@ L.append(f'<rect width="{w}" height="{h}" fill="white"/>')
 L.append(f'<text x="{PAD}" y="34" font-family="sans-serif" font-size="19" font-weight="bold" '
           f'fill="#0f172a">{esc("broadcast_impl_value：广播两支——splat 与补维+扩维")}</text>')
 L.append(f'<text x="{PAD}" y="58" font-family="sans-serif" font-size="13" '
-          f'fill="#475569">{esc("semantic.py:L744-L794 —— Triton 3.2.0 headless 真实取证（traces/ch06_run.json）")}</text>')
+          f'fill="#475569">{esc("semantic.py:L744-L794 —— Triton 3.2.0 headless 真实取证")}</text>')
 
 for i, (label, desc, lhs_shape, rhs_shape, out_shape, op_label) in enumerate(ROWS):
     y = TOP + i * ROW_H

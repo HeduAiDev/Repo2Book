@@ -8,7 +8,7 @@ from pathlib import Path
 def esc(s): return xs.escape(s)
 
 TITLE = "semantic.cast 大 dispatch —— 每支发一个真 IR op，bf16 借道两跳"
-SUBTITLE = "追踪期 IR（ASTSource.make_ir，任何 pass 之前）；数据来自 traces/cast_ir.txt"
+SUBTITLE = "追踪期 IR（ASTSource.make_ir，任何 pass 之前）；Triton v3.2.0 headless 实测"
 COLS = ["cast 表达式", "src → dst", "IR op", "op 数"]
 ROWS = [
     ("x.to(tl.float16)", "fp32 → fp16", "arith.truncf", "1", "normal"),

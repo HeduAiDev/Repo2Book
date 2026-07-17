@@ -12,7 +12,7 @@ def esc(s):
 
 
 TITLE = "constexpr：转发 dunder，追踪期常数性质闭合传播"
-SUBTITLE = "c = constexpr(256)，L = [10, 11, 12, 13]（pin triton==3.2.0 实测，traces/constexpr.txt）"
+SUBTITLE = "c = constexpr(256)，L = [10, 11, 12, 13]（pin triton==3.2.0 实测）"
 
 COLS = ["c + 8", "c * 4", "c // 64", "L[c2]  (c2=constexpr(2))"]
 ROW_LABELS = ["触发 dunder", "内层求值", "结果"]
