@@ -1,0 +1,206 @@
+{
+  "chapter_id": "ch37",
+  "title": "从 PTX 到 cubin 到发射：ptxas、二进制装载与 launcher",
+  "note_on_traces": "本章无精简版(skip_impl)。host 有真机(RTX PRO 6000 Blackwell/CUDA 12.8/triton 3.6.0),故所有数字均来自真实实跑取证(见 traces/OBSERVATIONS.md),用于锚定量级并验证公式;但书 pin 为 v3.2.0、host 装的是 3.6.0,版本不一致,故 trace_source 记为 manual(见各 manual_reason)。载荷源码常量(48KB 阈值 49152、n_spills 的 /4、format 前缀 iiiKKOOOO、32*num_warps)一律以 pin v3.2.0 源码 file:Lxxx 为准。",
+  "mechanisms": [
+    {
+      "mechanism_id": "m1-make-ptx",
+      "intuition": "LLVM 出的 PTX 像刚打印出的说明书：内容齐了，但版本号印的是草稿号、页边还夹着给排版工的批注(debug 标志)。make_ptx 做三件收尾——抄下唯一的函数名备查、把版本号改成汇编器认得的、撕掉那些会让汇编器不敢优化的批注——然后才交给下一道工序。",
+      "worked_example": {
+        "params": {
+          "kernel": "add_kernel (向量加，BLOCK_SIZE=1024 constexpr)",
+          "capability": 120,
+          "llvm_ptx_version": "8.8 (LLVM NVPTX 后端原始输出)",
+          "ptxas_supported": "8.7 (bundled ptxas 上限)"
+        },
+        "trace_source": "manual",
+        "manual_reason": "无精简版(skip_impl)。数字取自 host 真机实跑(traces/gen_ptx.py 生成的 add_kernel.ptx、traces/add_kernel_ptx_head.txt),但 host triton 3.6.0 ≠ pin v3.2.0,故不记为 run;kernel 名/版本号后处理逻辑跨版本稳定,实测与 pin 源码 compiler.py:L325-L333 一致。",
+        "table": {
+          "columns": ["步骤", "动作", "输入/条件", "输出/判定"],
+          "rows": [
+            ["1", "llvm.translate_to_asm 出 PTX 文本", "LLIR(LLVM IR 字符串) + triple nvptx64 + proc sm_90a/sm_120a", ".version 8.8 / .target sm_120a / .visible .entry add_kernel(compiler.py:L324)"],
+            ["2", "正则抓 kernel 名", "re.findall('.visible .entry (\\\\w+)') 扫全 PTX", "唯一匹配 add_kernel → metadata['name']='add_kernel'；assert len(names)==1(compiler.py:L325-L328)"],
+            ["3", "改写 .version", "re.sub('.version \\\\d+.\\\\d+') → 目标 ptx_version", ".version 8.8 → 8.7；不改则 ptxas 报 fatal: Unsupported .version 8.8; current version is '8.7'(compiler.py:L330-L331)"],
+            ["4", "去 debug 标志", "re.sub(',\\\\s*debug|debug,\\\\s*','')", "删掉会阻止 ptxas 优化的 debug 标志，返回干净 PTX(compiler.py:L332-L333)"]
+          ]
+        }
+      },
+      "quantified": "一次 make_ptx 恰产出 1 个 .visible .entry(assert len(names)==1, compiler.py:L327)。版本号先被规约成 major.minor 形式(ptx_version//10 '.' ptx_version%10, compiler.py:L330),再整体替换 PTX 里的 .version 行。add_kernel 实测：函数名 add_kernel、原始 .version 8.8 被改为 8.7、.target sm_120a、.address_size 64。",
+      "invariant": {
+        "claim": "一个 Triton 编译单元恰产出一个 kernel 入口——make_ptx 用 assert len(names)==1 守护这个『恰一个』不变量。",
+        "argument": "正则扫全 PTX 的所有 .visible .entry；Triton 一个编译单元只降出一个核，故匹配数应恒为 1。若为 0(未生成入口)或 >1(意外多入口内联)assert 立即失败——因为下游 loadBinary 靠这唯一的 metadata['name'] 去 cuModuleGetFunction 取句柄，个数不为 1 就无法确定取哪个。这是断言式不变量，其正当性在于下游取句柄的单值依赖(compiler.py:L325-L328 → driver.c cuModuleGetFunction)。",
+        "argument_kind": "assertion-invariant"
+      },
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m2-make-cubin-ptxas",
+      "intuition": "PTX 还是『伪汇编』，真正的机器码(SASS)只有 NVIDIA 的闭源汇编器 ptxas 能出。make_cubin 就像把稿子寄给唯一的印刷厂：写进临时 .ptx 文件、命令行喊一声 ptxas、附上 `-v` 让印刷厂把『这活儿占了多少寄存器、有没有溢出』的回执一起打回来；印坏了(非零返回码)按错误码翻译成人话报错，还附上能自己重跑的命令。",
+      "worked_example": {
+        "params": {
+          "kernel": "add_kernel",
+          "gpu_name": "sm_120a (capability=120, suffix='a')",
+          "ptxas": "bundled ptxas V12.8.93"
+        },
+        "trace_source": "manual",
+        "manual_reason": "无精简版。ptxas 是 CPU 程序，host 实跑取证(traces/ptxas_add_sm120.log，命令与 make_cubin L352 同形)；但 host ptxas 12.8/triton 3.6.0 ≠ pin v3.2.0 的 bundled ptxas，寄存器绝对值可能随 ptxas 版本微变，故记 manual。命令拼装/返回码分类逻辑以 pin 源码 compiler.py:L339-L378 为准。",
+        "table": {
+          "columns": ["阶段", "动作", "关键量", "结果"],
+          "rows": [
+            ["1", "定位 ptxas", "_path_to_binary('ptxas')：TRITON_PTXAS_PATH env 或 backend bin/ptxas", "找到 ptxas——编译链唯一的外部工具进程(compiler.py:L21-L37)"],
+            ["2", "拼命令", "ptxas_cmd = [ptxas, '-lineinfo', '-v', '--gpu-name=sm_120a', file.ptx, '-o', file.o]", "ptxas -lineinfo -v --gpu-name=sm_120a add_kernel.ptx -o add_kernel.o(compiler.py:L349-L351)"],
+            ["3", "起子进程(成功)", "subprocess.run(check=True) 返回码 0", "stderr: 'Used 28 registers, 0 bytes spill'；读回 cubin add_kernel.o = 10544 字节(compiler.py:L353-L380)"],
+            ["4", "起子进程(失败)", "CalledProcessError 按 returncode 分类", "255→'Internal Triton PTX codegen error'；128+SIGSEGV→'ptxas raised SIGSEGV'；其它→'ptxas failed with error code N'；均附 stderr + repro 命令(compiler.py:L361-L376)"]
+          ]
+        }
+      },
+      "quantified": "编译链共 5 段(add_stages 注册 ttir/ttgir/llir/ptx/cubin)，make_cubin 是唯一起外部进程的一段(compiler.py:L340)。add_kernel 实测：ptxas 出 cubin 10544 字节，stderr 报 28 个寄存器、0 bytes spill。命令固定带 `-v`(compiler.py:L351)拿占用回执、`--gpu-name=sm_120a`(sm_{capability}{suffix}，capability=120→suffix='a')定目标架构。",
+      "invariant": {
+        "claim": "ptxas 子进程要么成功产出 cubin 字节、要么抛出带 stderr 与可复现命令的 RuntimeError，绝不静默返回空/半成品。",
+        "argument": "subprocess.run(check=True) 在返回码非零时抛 CalledProcessError → 被 except 捕获 → 按 returncode(255 / 128+SIGSEGV / 其它)映射成可读 error 串，拼上 log 内容与 ' '.join(ptxas_cmd) 抛 RuntimeError；仅当 check 通过(返回码 0)代码才走到 open(fbin,'rb').read() 读回 cubin。两条路径由 try/except 结构互斥且穷尽(compiler.py:L353-L380)。",
+        "argument_kind": "case-exhaustive"
+      },
+      "figure_specs": [
+        {
+          "figure_id": "ch37-fig-make-cubin-io",
+          "template": "flow",
+          "claim": "make_cubin 起 ptxas 子进程把 PTX 文本汇编成 cubin 字节，`-v` 让 ptxas 同时把每核寄存器/spill 占用报告打到 stderr。",
+          "numbers": [
+            {"name": "cubin 字节数", "value": "10544", "provenance": "traces/ptxas_add_sm120.log 产出的 add_kernel.o 文件大小"},
+            {"name": "寄存器占用", "value": "28", "provenance": "traces/ptxas_add_sm120.log: 'Used 28 registers'"},
+            {"name": "spill 字节", "value": "0", "provenance": "traces/ptxas_add_sm120.log: '0 bytes spill stores, 0 bytes spill loads'"},
+            {"name": "编译链段数/外部进程段数", "value": "5/1", "provenance": "compiler.py:L384-L389 add_stages 注册 5 段，仅 cubin 段起 ptxas"}
+          ],
+          "caption_draft": "PTX 文本 → ptxas 子进程(-lineinfo -v --gpu-name=sm_120a) → cubin 字节：这是整条编译链唯一的外部工具进程；stderr 里的『Used N registers / M bytes spill』回执，是读者判断寄存器压力与 spill(慢信号)的第一手数据。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m3-loadbinary",
+      "intuition": "cubin 编好只是躺在磁盘上的字节；loadBinary 是把它搬进显存、拿到可调用句柄的那一刻。搬进去顺手做两件事：问驱动『这个核每线程占几个寄存器、溢出了多少』(两个 perf 命门数)，以及——如果这个核要的共享内存越过了 48KB 这条硬线——显式打报告申请动态额度，不申请就装不下大 block。",
+      "figure_specs": [
+        {
+          "figure_id": "ch37-fig-loadbinary-flow",
+          "template": "flow",
+          "claim": "loadBinary 装载 cubin、读回 n_regs/n_spills，并在 shared>48KB 且设备支持时 cuFuncSetAttribute 开 opt-in 动态共享内存。",
+          "numbers": [
+            {"name": "48KB 静态共享内存硬上限", "value": "49152", "provenance": "driver.c:L132 'if (shared > 49152 && shared_optin > 49152)'；host 实测 shared_memory_per_block=49152(OBSERVATIONS.md)"},
+            {"name": "n_spills 换算除数", "value": "4", "provenance": "driver.c:L124-L126 'n_spills /= 4'(LOCAL_SIZE_BYTES 字节→32-bit 槽位数)"},
+            {"name": "读回的 n_regs(mm_kernel)", "value": "212", "provenance": "traces/gen_matmul.py 装载读回 cuFuncGetAttribute NUM_REGS"},
+            {"name": "读回的 n_spills(heavy_kernel)", "value": "8", "provenance": "traces/gen_heavy.py 装载读回；= 32 bytes LOCAL_SIZE / 4，与 ptxas_heavy.log 的 '32 bytes stack frame' 一致"},
+            {"name": "触发 opt-in 的 shared(mm_kernel)", "value": "65536", "provenance": "traces/gen_matmul.py：mm_kernel shared=65536(64KB)>49152，走 opt-in 路径"},
+            {"name": "设备 opt-in 上限", "value": "101376", "provenance": "host 实测 shared_memory_per_block_optin=101376(OBSERVATIONS.md)"}
+          ],
+          "caption_draft": "装载期一步到位：cuModuleLoadData(cubin) → cuModuleGetFunction(name) 拿句柄 → cuFuncGetAttribute 读回 n_regs(NUM_REGS)/n_spills(LOCAL_SIZE_BYTES÷4)；若 metadata.shared>49152 且设备 opt-in 上限>49152，cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES=optin−static) 显式申请动态共享内存额度——不申请就编不出大 block(回指共享内存预算章的 48KB 硬线)。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m4-reg-occupancy-theory",
+      "intuition": "一个 SM 像一间自习室：寄存器是座位、共享内存是储物柜、线程数是人头上限。每个线程占几个寄存器(n_regs)决定这间自习室能同时塞下几个 block——n_regs 越大座位越快用光，能并发的线程就越少(occupancy 越低)。spill 更糟：座位不够、把东西堆到走廊(local memory，实为 global 的线程私有区)，每次取用都要跑一趟，是性能杀手——所以 n_spills>0 应当作立即优化的信号。",
+      "worked_example": {
+        "params": {
+          "regs_per_SM": 65536,
+          "max_threads_per_SM": 1536,
+          "shared_per_SM": 102400,
+          "add_kernel": "n_regs=28, blockDim=128, shared=0",
+          "mm_kernel": "n_regs=212, blockDim=128, shared=65536",
+          "heavy_kernel": "n_regs=26, n_spills=8(32 bytes local/4)"
+        },
+        "trace_source": "manual",
+        "manual_reason": "硬件占用率模型是算术推导(非论文)，无精简版。三个 kernel 的 n_regs/n_spills/shared 与设备常量均 host 实测取证(traces/OBSERVATIONS.md)；host 是 Blackwell sm_120a，pin v3.2.0 的目标架构可能不同，故占用率绝对值随架构常量变、记 manual，但 min(三约束) 的推导方法与 driver.c 读回的 n_regs 语义跨架构一致。",
+        "table": {
+          "columns": ["kernel", "n_regs", "寄存器限 blocks/SM", "线程限", "共享内存限", "min → occupancy"],
+          "rows": [
+            ["add_kernel", "28", "floor(65536/(28×128))=18", "floor(1536/128)=12", "∞ (shared=0)", "min=12 → 12×128=1536 → 1536/1536=100%"],
+            ["mm_kernel", "212", "floor(65536/(212×128))=2", "12", "floor(102400/65536)=1", "min=1 → 128 → 128/1536=8.33%"],
+            ["heavy_kernel", "26", "(不受限)", "12", "n_spills=8 → 走 local memory", "spill>0：每次溢出访存一趟高延迟 global，慢信号"]
+          ]
+        }
+      },
+      "quantified": "occupancy = min(寄存器限, 线程限, 共享限)。add_kernel：min(18,12,∞)=12 block=100%(线程受限，寄存器富余)。mm_kernel：min(2,12,1)=1 block=8.33%(共享内存受限)。对照鲜明——同 blockDim=128，n_regs 从 28 涨到 212 单把寄存器限从 18 压到 2。若把 mm 的 n_regs 降到 128，寄存器限升到 floor(65536/(128×128))=4，但共享限仍卡在 1 block——瓶颈转移到共享内存。heavy_kernel 的 n_spills=8 = 32 字节 local memory ÷ 4(driver.c:L126)，非零即每次 spill 访存一趟高延迟。",
+      "invariant": {
+        "claim": "实际 occupancy 由三条独立上限的最小值决定；固定其余量，n_regs 单增 → occupancy 单调不升。",
+        "argument": "寄存器限 floor(regs_per_SM/(n_regs·blockDim))、线程限 floor(max_threads/blockDim)、共享限 floor(shared_per_SM/shared_per_block)各给一个 blocks/SM 上限；SM 必须同时满足三者，故实际驻留数 = 三者取 min。单调性：其余量固定时 n_regs 单增 → 分母 n_regs·blockDim 单增 → 寄存器限 floor(·) 非增 → min(·) 非增。故 ptxas -v / loadBinary 读回的 n_regs 越大，occupancy 单调不升。",
+        "argument_kind": "monotone"
+      },
+      "figure_specs": [
+        {
+          "figure_id": "ch37-fig-occupancy-contrast",
+          "template": "state-table",
+          "claim": "同 blockDim 下寄存器/共享内存占用把 occupancy 从 add_kernel 的 100% 压到 mm_kernel 的 8.3%——n_regs 是占用率的直接杠杆。",
+          "numbers": [
+            {"name": "SM 寄存器总数", "value": "65536", "provenance": "host 实测 regs_per_multiprocessor(OBSERVATIONS.md)"},
+            {"name": "SM 最大线程数", "value": "1536", "provenance": "host 实测 max_threads_per_multi_processor(OBSERVATIONS.md)"},
+            {"name": "SM 共享内存", "value": "102400", "provenance": "host 实测 shared_memory_per_multiprocessor(OBSERVATIONS.md)"},
+            {"name": "add_kernel n_regs / occupancy", "value": "28 / 100%", "provenance": "traces/ptxas_add_sm120.log + 本例 min(18,12,∞) 推导"},
+            {"name": "mm_kernel n_regs / occupancy", "value": "212 / 8.33%", "provenance": "traces/gen_matmul.py + 本例 min(2,12,1) 推导"},
+            {"name": "heavy_kernel n_spills", "value": "8", "provenance": "traces/gen_heavy.py：32 bytes local / 4"}
+          ],
+          "caption_draft": "两个真核对照：add_kernel(28 寄存器、无共享内存)线程受限、跑满 100% occupancy；mm_kernel(212 寄存器、64KB 共享内存)寄存器限 2 block、共享限 1 block，实际只驻留 1 block=8.3% occupancy。ptxas -v 打印的 n_regs 与装载读回的 n_spills，就是判断这条约束的直接输入。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m5-make-launcher-codegen",
+      "intuition": "每种 kernel 的实参列表都不同(几个指针、几个标量)。与其写一个『什么都能收』的通用发射器(要在运行时反射类型、慢)，Triton 干脆按这次的签名现场焊一段专用 C 代码：用定长的 PyArg 格式串一次解析、指针实参走 getPointer 取设备地址、标量直传，编成 .so 缓存复用。像按订单尺寸现做一个卡槽托盘——第一次要开模(编译)，之后同款直接取。",
+      "worked_example": {
+        "params": {
+          "signature": "{0:*fp32, 1:*fp32, 2:*fp32, 3:i32}",
+          "constants": "BLOCK_SIZE(constexpr) 不入签名",
+          "kernel": "add_kernel(x_ptr, y_ptr, out_ptr, n_elements)"
+        },
+        "trace_source": "manual",
+        "manual_reason": "无精简版。生成的 C 源由 pin v3.2.0 源码的 make_launcher 直接实跑取证(traces/launcher_add.c，见 OBSERVATIONS.md m5)——make_launcher 是纯字符串生成、不依赖运行时，故这段实测就是 pin 源码 driver.py:L117-L239 的真实输出；仅因整章统一记 manual 而不标 run。",
+        "table": {
+          "columns": ["实参", "签名类型", "ty_to_cpp", "PyArg 格式字符", "取址方式(internal_arg)"],
+          "rows": [
+            ["arg0 (x_ptr)", "*fp32", "CUdeviceptr", "O (_extracted_type→PyObject*)", "ptr_info0.dev_ptr ← getPointer(_arg0,0)"],
+            ["arg1 (y_ptr)", "*fp32", "CUdeviceptr", "O", "ptr_info1.dev_ptr ← getPointer(_arg1,1)"],
+            ["arg2 (out_ptr)", "*fp32", "CUdeviceptr", "O", "ptr_info2.dev_ptr ← getPointer(_arg2,2)"],
+            ["arg3 (n_elements)", "i32", "int32_t", "i", "_arg3 (标量直传，无 getPointer)"]
+          ]
+        }
+      },
+      "quantified": "完整 format = 固定前缀 'iiiKKOOOO'(gridX/Y/Z 三个 i + stream/function 两个 K + metadata/launch_metadata/两 hook 四个 O)+ args_format 'OOOi' = 'iiiKKOOOOOOOi'(driver.py:L145，实测生成的 PyArg_ParseTuple 逐字一致)。arg_decls='CUdeviceptr arg0, CUdeviceptr arg1, CUdeviceptr arg2, int32_t arg3'。params=[0,1,2,3](无 constexpr 常量被剔)→ void *params[]={&arg0,&arg1,&arg2,&arg3}。_launch 里 blockDim 写作 32*num_warps(driver.py:L212)。生成 C 源 9027 字节 → compile_module_from_src 按 sha256 编成缓存 .so。",
+      "invariant": {
+        "claim": "生成的 format 串长度恰等于 9(固定前缀)+ len(signature)，且每个非 constexpr 实参在 params[] 与 _launch 调用里各出现恰一次。",
+        "argument": "args_format 由 signature.values() 逐一 map(format_of∘_extracted_type)得到，长度 = len(signature)；前缀 'iiiKKOOOO' 恒为 9 字符。params=[i for i in signature.keys() if i not in constants]，internal_args_list 同源遍历 signature.items()，故每个非常量参恰生成一个 params 槽 + 一个 internal_arg。取址按 ty 三分：ty[0]=='*'→ptr_info{i}.dev_ptr / nvTmaDesc→*tma_ptr{i} / else→_arg{i}，分类穷尽互斥。故签名到生成代码一一对应，无遗漏无重复(driver.py:L145-L159)。本例 4 参 → format 'iiiKKOOOO'+'OOOi'(9+4=13 字符)、params 4 槽。",
+        "argument_kind": "counting-bijection"
+      },
+      "figure_specs": [
+        {
+          "figure_id": "ch37-fig-launcher-codegen-map",
+          "template": "state-table",
+          "claim": "make_launcher 把一个 kernel 签名逐参映射成生成 C 扩展里的 PyArg 格式字符、C 类型与取址方式。",
+          "numbers": [
+            {"name": "固定前缀字符数", "value": "9", "provenance": "driver.py:L145 format='iiiKKOOOO'+args_format(iii+KK+OOOO)"},
+            {"name": "本例签名实参数", "value": "4", "provenance": "signature={0:*fp32,1:*fp32,2:*fp32,3:i32}"},
+            {"name": "完整 format 串长", "value": "13", "provenance": "traces/launcher_add.c: PyArg_ParseTuple(args, 'iiiKKOOOOOOOi', ...)，9+4=13"},
+            {"name": "指针参(走 getPointer)数", "value": "3", "provenance": "traces/launcher_add.c: ptr_info0/1/2 = getPointer(...)"},
+            {"name": "生成 C 源字节数", "value": "9027", "provenance": "traces/launcher_add.c 文件大小(OBSERVATIONS.md m5)"}
+          ],
+          "caption_draft": "签名 → 生成 C 源的逐参映射：3 个 *fp32 指针各得 PyArg 'O'、经 getPointer 取 dev_ptr；1 个 i32 标量得 'i'、直传。整串 format='iiiKKOOOOOOOi'(3 grid + 2 句柄 + 4 固定对象 + 4 实参)。同签名生成同 C 源 → 同 sha256 → 命中缓存 .so；不同签名首次触发一次 gcc 编译，是 Triton 首调延迟的来源之一。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m7-launch-dispatch",
+      "intuition": "kernel[grid](*args) 这一句背后：第一次调用要先『开机』——懒装载 cubin、焊好 launcher；之后每次调用就是把实参喂进那段生成的 C 代码，它解析参数、取指针、最后调一次 cuLaunchKernel 把活儿交给 GPU。普通发射走经典 API；只有 Hopper cluster(多 CTA 协作)才切到带 cluster 维度的 cuLaunchKernelEx。",
+      "figure_specs": [
+        {
+          "figure_id": "ch37-fig-launch-dispatch-chain",
+          "template": "flow",
+          "claim": "从 kernel[grid](*args) 到 cuLaunchKernel 的发射调用链：_init_handles 懒装载 → runner → 生成的 launch → _launch 按 num_ctas 分派。",
+          "numbers": [
+            {"name": "num_ctas==1 走经典 API 的判据", "value": "1", "provenance": "driver.py:L211 'if (num_ctas == 1)' → cuLaunchKernel，否则 cuLaunchKernelEx"},
+            {"name": "blockDim = 32×num_warps", "value": "32", "provenance": "driver.py:L212 cuLaunchKernel(..., 32*num_warps, 1, 1, ...)，每 warp 32 线程"},
+            {"name": "grid 判发射前提", "value": "0", "provenance": "driver.py:L210 'if (gridX*gridY*gridZ > 0)'：空 grid 不发射"},
+            {"name": "cluster launchAttr 数", "value": "2", "provenance": "driver.py:L214-L221 CLUSTER_DIMENSION + CLUSTER_SCHEDULING_POLICY 两个属性"}
+          ],
+          "caption_draft": "发射链路：kernel[grid](*args) → CompiledKernel 首调触发 _init_handles 懒装载(load_binary 填 module/function/n_regs/n_spills、建 launcher) → runner 调 self.run(grid, stream, function, metadata, hooks, *args) → 生成的 launch 解析参数、getPointer 取指针 → _launch：num_ctas==1 走 cuLaunchKernel(blockDim=32×num_warps)，否则组 CUlaunchConfig 带 cluster 维度、走 dlsym 出的 cuLaunchKernelEx。"
+        }
+      ]
+    }
+  ]
+}

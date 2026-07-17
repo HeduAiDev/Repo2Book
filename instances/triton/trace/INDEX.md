@@ -5,6 +5,7 @@
 ## Recent Activity
 
 | Date | Type | Chapter | Summary | File |
+| 2026-07-17 | delivery | ch37 | ch37《从 PTX 到 cubin 到发射:ptxas、二进制装载与 launcher》定稿——Part VIII 落地段 | [2026-07-17_ch37-ch37《从-ptx-到-cubin-到发射:ptxas、二进制装载与-launcher》定稿——part-viii-落.md](deliveries/2026-07-17_ch37-ch37《从-ptx-到-cubin-到发射:ptxas、二进制装载与-launcher》定稿——part-viii-落.md) |
 | 2026-07-17 | delivery | ch35 | 《矩阵乘指令选择、逐元素-归约降级与 LLVM→PTX 出口》定稿——Part VII 收官 | [2026-07-17_ch35-《矩阵乘指令选择、逐元素-归约降级与-llvm→ptx-出口》定稿——part-vii-收官.md](deliveries/2026-07-17_ch35-《矩阵乘指令选择、逐元素-归约降级与-llvm→ptx-出口》定稿——part-vii-收官.md) |
 | 2026-07-17 | delivery | 34 | ch34《共享内存降级与全局访存向量化》定稿——Part VII 第三跳,回收 f18 | [2026-07-17_ch34-ch34《共享内存降级与全局访存向量化》定稿——part-vii-第三跳,回收-f18.md](deliveries/2026-07-17_ch34-ch34《共享内存降级与全局访存向量化》定稿——part-vii-第三跳,回收-f18.md) |
 | 2026-07-17 | delivery | ch36 | ch36 CUDABackend 把五段 stages 注入编译管线 定稿 | [2026-07-17_ch36-ch36-cudabackend-把五段-stages-注入编译管线-定稿.md](deliveries/2026-07-17_ch36-ch36-cudabackend-把五段-stages-注入编译管线-定稿.md) |

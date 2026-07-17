@@ -1,0 +1,282 @@
+{
+  "chapter_id": "ch37",
+  "title": "从 PTX 到 cubin 到发射：ptxas、二进制装载与 launcher",
+  "kind": "skip_impl",
+  "one_line": "编译管线最后两段(make_ptx / make_cubin)怎么真正产出机器码，cubin 怎么装载进显存并读回寄存器占用，kernel 怎么按签名动态生成 C launcher 发射——toolchain 外部依赖最密的一章。",
+
+  "code_spine": [
+    "third_party/nvidia/backend/compiler.py:L317-L337  make_ptx: llvm.translate_to_asm 出 PTX 文本 + 版本改写/去 debug 后处理",
+    "third_party/nvidia/backend/compiler.py:L339-L382  make_cubin: 起 ptxas 子进程(-v/--gpu-name/返回码分类)出 cubin 字节",
+    "third_party/nvidia/backend/compiler.py:L384-L389  add_stages: 把 make_ptx/make_cubin 注册为 ptx/cubin 两段(回指 ch36)",
+    "python/triton/compiler/compiler.py:L379-L391    CompiledKernel._init_handles: 装载期把 cubin 交给 load_binary、建 launcher",
+    "third_party/nvidia/backend/driver.c:L93-L152     loadBinary: cuModuleLoadData 装载 + cuFuncGetAttribute 读回 n_regs/n_spills + >48KB opt-in 动态共享内存",
+    "third_party/nvidia/backend/driver.py:L117-L428   make_launcher: 按核签名动态生成一段 C 扩展源码(PyArg 解析/getPointer/cuLaunchKernel[Ex])",
+    "third_party/nvidia/backend/driver.py:L48-L64     compile_module_from_src: 把生成的 C 源编成缓存 .so 并 import 回来",
+    "third_party/nvidia/backend/driver.py:L431-L444   CudaLauncher: 组签名→make_launcher→compile_module_from_src→self.launch",
+    "third_party/nvidia/backend/driver.c:L193-L239    occupancyMaxActiveClusters: 算 cluster 占用率(Hopper cluster 场景)",
+    "third_party/nvidia/backend/driver.py:L447-L481   CudaDriver(GPUDriver): 后端落地(launcher_cls/get_current_target/is_active)——配对脊柱姊妹端"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "third_party/nvidia/backend/compiler.py",
+      "lines": "L317-L337",
+      "what": "make_ptx——LLVM IR 出成 PTX 文本，做版本改写与去 debug 后处理",
+      "code": "    @staticmethod\n    def make_ptx(src, metadata, opt, capability):\n        ptx_version = get_ptx_version_from_options(opt)\n\n        triple = 'nvptx64-nvidia-cuda'\n        proc = 'sm_90a' if capability == 90 else f'sm_{capability}'\n        features = get_features(opt)\n        ret = llvm.translate_to_asm(src, triple, proc, features, ['nvptx-short-ptr'], opt.enable_fp_fusion, False)\n        # Find kernel names (there should only be one)\n        names = re.findall(r\".visible .entry ([a-zA-Z_][a-zA-Z0-9_]*)\", ret)\n        assert len(names) == 1\n        metadata[\"name\"] = names[0]\n        # post-process\n        ptx_version = f'{ptx_version//10}.{ptx_version%10}'\n        ret = re.sub(r'\\.version \\d+\\.\\d+', f'.version {ptx_version}', ret, flags=re.MULTILINE)\n        # Remove the debug flag that prevents ptxas from optimizing the code\n        ret = re.sub(r\",\\s*debug|debug,\\s*\", \"\", ret)\n        if os.environ.get(\"NVPTX_ENABLE_DUMP\", \"0\") == \"1\":\n            print(\"// -----// NVPTX Dump //----- //\")\n            print(ret)\n        return ret",
+      "elide": ["NVPTX_ENABLE_DUMP 分支只是调试打印，讲解可略"]
+    },
+    {
+      "path": "third_party/nvidia/backend/compiler.py",
+      "lines": "L339-L382",
+      "what": "make_cubin——起 ptxas 子进程把 PTX 汇编成 cubin，-v 拿寄存器占用打印，返回码分类给可读报错",
+      "code": "    @staticmethod\n    def make_cubin(src, metadata, opt, capability):\n        ptxas, _ = _path_to_binary(\"ptxas\")\n        with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.ptx') as fsrc, \\\n            tempfile.NamedTemporaryFile(delete=False, mode='r', suffix='.log') as flog:\n            fsrc.write(src)\n            fsrc.flush()\n            fbin = fsrc.name + '.o'\n\n            line_info = [] if os.environ.get('TRITON_DISABLE_LINE_INFO') else ['-lineinfo']\n            fmad = [] if opt.enable_fp_fusion else ['--fmad=false']\n            suffix = 'a' if capability == 90 else ''\n            opt_level = ['--opt-level', '0'] if os.environ.get(\"DISABLE_PTXAS_OPT\", \"0\") == \"1\" else []\n            ptxas_cmd = [\n                ptxas, *line_info, *fmad, '-v', *opt_level, f'--gpu-name=sm_{capability}{suffix}', fsrc.name, '-o', fbin\n            ]\n            try:\n                subprocess.run(ptxas_cmd, check=True, close_fds=False, stderr=flog)\n                if os.path.exists(fsrc.name):\n                    os.remove(fsrc.name)\n                if os.path.exists(flog.name):\n                    os.remove(flog.name)\n            except subprocess.CalledProcessError as e:\n                with open(flog.name) as log_file:\n                    log = log_file.read()\n                if os.path.exists(flog.name):\n                    os.remove(flog.name)\n\n                if e.returncode == 255:\n                    error = 'Internal Triton PTX codegen error'\n                elif e.returncode == 128 + signal.SIGSEGV:\n                    error = '`ptxas` raised SIGSEGV'\n                else:\n                    error = f'`ptxas` failed with error code {e.returncode}'\n\n                raise RuntimeError(f'{error}\\n'\n                                   f'`ptxas` stderr:\\n{log}\\n'\n                                   f'Repro command: {\" \".join(ptxas_cmd)}\\n')\n\n            with open(fbin, 'rb') as f:\n                cubin = f.read()\n            if os.path.exists(fbin):\n                os.remove(fbin)\n        return cubin",
+      "elide": ["若干 os.path.exists(...) os.remove(...) 是临时文件清理，讲解可略；TRITON_DISABLE_LINE_INFO/DISABLE_PTXAS_OPT/enable_fp_fusion 三个 env 只改 ptxas 命令行开关"]
+    },
+    {
+      "path": "third_party/nvidia/backend/compiler.py",
+      "lines": "L384-L389",
+      "what": "add_stages——把 make_ptx/make_cubin 挂成 ptx/cubin 两段(本章讲这两段内部，注册机制见 ch36)",
+      "code": "    def add_stages(self, stages, options):\n        stages[\"ttir\"] = lambda src, metadata: self.make_ttir(src, metadata, options)\n        stages[\"ttgir\"] = lambda src, metadata: self.make_ttgir(src, metadata, options, self.capability)\n        stages[\"llir\"] = lambda src, metadata: self.make_llir(src, metadata, options, self.capability)\n        stages[\"ptx\"] = lambda src, metadata: self.make_ptx(src, metadata, options, self.capability)\n        stages[\"cubin\"] = lambda src, metadata: self.make_cubin(src, metadata, options, self.capability)",
+      "elide": ["前三段 ttir/ttgir/llir 是 ch33-ch36 的内容，本章只引最后两段 ptx/cubin"]
+    },
+    {
+      "path": "third_party/nvidia/backend/compiler.py",
+      "lines": "L21-L41",
+      "what": "_path_to_binary / get_ptxas_version——ptxas 可执行的定位(env 覆盖或 backend bin/)与版本探测，编译链唯一外部工具进程",
+      "code": "@functools.lru_cache()\ndef _path_to_binary(binary: str):\n    paths = [\n        os.environ.get(f\"TRITON_{binary.upper()}_PATH\", \"\"),\n        os.path.join(os.path.dirname(__file__), \"bin\", binary),\n    ]\n\n    for bin in paths:\n        if os.path.exists(bin) and os.path.isfile(bin):\n            result = subprocess.check_output([bin, \"--version\"], stderr=subprocess.STDOUT)\n            if result is not None:\n                version = re.search(r\".*release (\\d+\\.\\d+).*\", result.decode(\"utf-8\"), flags=re.MULTILINE)\n                if version is not None:\n                    return bin, version.group(1)\n    raise RuntimeError(f\"Cannot find {binary}\")\n\n\n@functools.lru_cache()\ndef get_ptxas_version():\n    version = subprocess.check_output([_path_to_binary(\"ptxas\")[0], \"--version\"]).decode(\"utf-8\")\n    return version",
+      "elide": []
+    },
+    {
+      "path": "third_party/nvidia/backend/driver.c",
+      "lines": "L93-L152",
+      "what": "loadBinary——cuModuleLoadData 装载 cubin、cuFuncGetAttribute 读回 n_regs/n_spills、>48KB opt-in 动态共享内存(需真机 CUDA)",
+      "code": "static PyObject *loadBinary(PyObject *self, PyObject *args) {\n  const char *name;\n  const char *data;\n  Py_ssize_t data_size;\n  int shared;\n  int device;\n  if (!PyArg_ParseTuple(args, \"ss#ii\", &name, &data, &data_size, &shared,\n                        &device)) {\n    return NULL;\n  }\n  CUfunction fun;\n  CUmodule mod;\n  int32_t n_regs = 0;\n  int32_t n_spills = 0;\n  // create driver handles\n  CUcontext pctx = 0;\n\n  Py_BEGIN_ALLOW_THREADS;\n  CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(cuCtxGetCurrent(&pctx));\n  if (!pctx) {\n    CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(\n        cuDevicePrimaryCtxRetain(&pctx, device));\n    CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(cuCtxSetCurrent(pctx));\n  }\n\n  CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(cuModuleLoadData(&mod, data));\n  CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(\n      cuModuleGetFunction(&fun, mod, name));\n  // get allocated registers and spilled registers from the function\n  CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(\n      cuFuncGetAttribute(&n_regs, CU_FUNC_ATTRIBUTE_NUM_REGS, fun));\n  CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(\n      cuFuncGetAttribute(&n_spills, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, fun));\n  n_spills /= 4;\n  // set dynamic shared memory if necessary\n  int shared_optin;\n  CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(cuDeviceGetAttribute(\n      &shared_optin, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,\n      device));\n  if (shared > 49152 && shared_optin > 49152) {\n    CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(\n        cuFuncSetCacheConfig(fun, CU_FUNC_CACHE_PREFER_SHARED));\n    int shared_total, shared_static;\n    CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(cuDeviceGetAttribute(\n        &shared_total, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR,\n        device));\n    CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(cuFuncGetAttribute(\n        &shared_static, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, fun));\n    CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(\n        cuFuncSetAttribute(fun, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,\n                           shared_optin - shared_static));\n  }\n  Py_END_ALLOW_THREADS;\n\n  if (PyErr_Occurred()) {\n    return NULL;\n  }\n  return Py_BuildValue(\"(KKii)\", (uint64_t)mod, (uint64_t)fun, n_regs,\n                       n_spills);\n}",
+      "elide": ["Py_BEGIN/END_ALLOW_THREADS 是释放 GIL 的包裹，讲装载逻辑时可略；n_spills 的字节数是 LOCAL_SIZE_BYTES，除以 4 换算成 32-bit 寄存器条目数"]
+    },
+    {
+      "path": "third_party/nvidia/backend/driver.py",
+      "lines": "L117-L161",
+      "what": "make_launcher 开头——按核签名把每个实参映射成 C 类型/PyArg 格式字符/内部取址方式(动态生成 C 扩展的骨架)",
+      "code": "def make_launcher(constants, signature, ids):\n    # Record the end of regular arguments;\n    # subsequent arguments are architecture-specific descriptors, such as tensor descriptors for CUDA.\n    arg_decls = ', '.join(f\"{ty_to_cpp(ty)} arg{i}\" for i, ty in signature.items())\n\n    def _extracted_type(ty):\n        if ty[0] == '*':\n            return \"PyObject*\"\n        if ty == \"nvTmaDesc\":\n            return \"PyObject*\"\n\n        return ty_to_cpp(ty)\n\n    def format_of(ty):\n        return {\n            \"PyObject*\": \"O\",\n            \"float\": \"f\",\n            \"double\": \"d\",\n            \"long\": \"l\",\n            \"int8_t\": \"b\",\n            \"int16_t\": \"h\",\n            \"int32_t\": \"i\",\n            \"int64_t\": \"l\",\n            \"uint8_t\": \"B\",\n            \"uint16_t\": \"H\",\n            \"uint32_t\": \"I\",\n            \"uint64_t\": \"K\",\n        }[ty]\n\n    args_format = ''.join([format_of(_extracted_type(ty)) for ty in signature.values()])\n    format = \"iiiKKOOOO\" + args_format\n    args_list = ', ' + ', '.join(f\"&_arg{i}\" for i, ty in signature.items()) if len(signature) > 0 else ''\n\n    internal_args_list = []\n    for i, ty in signature.items():\n        if ty[0] == \"*\":\n            internal_args_list.append(f\"ptr_info{i}.dev_ptr\")\n        elif ty == \"nvTmaDesc\":\n            # Note: we have to dereference the pointer\n            internal_args_list.append(f\"*tma_ptr{i}\")\n        else:\n            internal_args_list.append(f\"_arg{i}\")",
+      "elide": ["nvTmaDesc(TMA 描述符)分支是 Hopper 专属，非重点可略；ty_to_cpp 见相邻函数 L94-L114"]
+    },
+    {
+      "path": "third_party/nvidia/backend/driver.py",
+      "lines": "L208-L239",
+      "what": "生成的 C 扩展里的 _launch——num_ctas==1 走 cuLaunchKernel，否则(cluster)组 CUlaunchConfig 走 dlsym 出来的 cuLaunchKernelEx",
+      "code": "static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas, int clusterDimX, int clusterDimY, int clusterDimZ, int shared_memory, CUstream stream, CUfunction function{', ' + arg_decls if len(arg_decls) > 0 else ''}) {{\n  void *params[] = {{ {', '.join(f\"&arg{i}\" for i in params)} }};\n  if (gridX*gridY*gridZ > 0) {{\n    if (num_ctas == 1) {{\n      CUDA_CHECK(cuLaunchKernel(function, gridX, gridY, gridZ, 32*num_warps, 1, 1, shared_memory, stream, params, 0));\n    }} else {{\n      CUlaunchAttribute launchAttr[2];\n      launchAttr[0].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;\n      launchAttr[0].value.clusterDim.x = clusterDimX;\n      launchAttr[0].value.clusterDim.y = clusterDimY;\n      launchAttr[0].value.clusterDim.z = clusterDimZ;\n      launchAttr[1].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE;\n      launchAttr[1].value.clusterSchedulingPolicyPreference = CU_CLUSTER_SCHEDULING_POLICY_SPREAD;\n      CUlaunchConfig config;\n      config.gridDimX = gridX * clusterDimX;\n      config.gridDimY = gridY * clusterDimY;\n      config.gridDimZ = gridZ * clusterDimZ;\n      config.blockDimX = 32 * num_warps;\n      config.blockDimY = 1;\n      config.blockDimZ = 1;\n      config.sharedMemBytes = shared_memory;\n      config.hStream = stream;\n      config.attrs = launchAttr;\n      config.numAttrs = 2;\n      static cuLaunchKernelEx_t cuLaunchKernelExHandle = NULL;\n      if (cuLaunchKernelExHandle == NULL) {{\n        cuLaunchKernelExHandle = getLaunchKernelExHandle();\n      }}\n      CUDA_CHECK(cuLaunchKernelExHandle(&config, function, params, 0));\n    }}\n  }}\n}}",
+      "elide": ["注意这是 f-string 模板：{...} 双花括号是转义、单花括号(如 arg_decls/params)是 Python 插值；32*num_warps 即 blockDim(每 warp 32 线程)"]
+    },
+    {
+      "path": "third_party/nvidia/backend/driver.py",
+      "lines": "L246-L289",
+      "what": "生成的 getPointer——从 Python 实参取设备指针：整数直接用，否则调 data_ptr() 再 cuPointerGetAttribute 校验是设备指针(cpu tensor 报错)",
+      "code": "static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {{\n  DevicePtrInfo ptr_info;\n  ptr_info.dev_ptr = 0;\n  ptr_info.valid = true;\n  if (PyLong_Check(obj)) {{\n    ptr_info.dev_ptr = PyLong_AsUnsignedLongLong(obj);\n    return ptr_info;\n  }}\n  if (obj == Py_None) {{\n    // valid nullptr\n    return ptr_info;\n  }}\n  PyObject *ptr = PyObject_GetAttrString(obj, \"data_ptr\");\n  if(ptr){{\n    PyObject *empty_tuple = PyTuple_New(0);\n    PyObject *ret = PyObject_Call(ptr, empty_tuple, NULL);\n    Py_DECREF(empty_tuple);\n    Py_DECREF(ptr);\n    if (!PyLong_Check(ret)) {{\n      PyErr_SetString(PyExc_TypeError, \"data_ptr method of Pointer object must return 64-bit int\");\n      ptr_info.valid = false;\n      return ptr_info;\n    }}\n    ptr_info.dev_ptr = PyLong_AsUnsignedLongLong(ret);\n    if(!ptr_info.dev_ptr)\n      return ptr_info;\n    uint64_t dev_ptr;\n    int status = cuPointerGetAttribute(&dev_ptr, CU_POINTER_ATTRIBUTE_DEVICE_POINTER, ptr_info.dev_ptr);\n    if (status == CUDA_ERROR_INVALID_VALUE) {{\n        PyErr_Format(PyExc_ValueError,\n                     \"Pointer argument (at %d) cannot be accessed from Triton (cpu tensor?)\", idx);\n        ptr_info.valid = false;\n    }} else if (status != CUDA_SUCCESS) {{\n        CUDA_CHECK(status);  // Catch any other cuda API errors\n        ptr_info.valid = false;\n    }}\n    ptr_info.dev_ptr = dev_ptr;\n    Py_DECREF(ret);  // Thanks ChatGPT!\n    return ptr_info;\n  }}\n  PyErr_SetString(PyExc_TypeError, \"Pointer argument must be either uint64 or have data_ptr method\");\n  ptr_info.valid = false;\n  return ptr_info;\n}}",
+      "elide": ["引用计数 Py_DECREF 细节可略；核心是 data_ptr() → cuPointerGetAttribute 判设备指针有效性"]
+    },
+    {
+      "path": "third_party/nvidia/backend/driver.py",
+      "lines": "L48-L64",
+      "what": "compile_module_from_src——把生成的 C 源按 sha256 键缓存，未命中则 _build 编成 .so，再 import 回来当扩展模块",
+      "code": "def compile_module_from_src(src, name):\n    key = hashlib.sha256(src.encode(\"utf-8\")).hexdigest()\n    cache = get_cache_manager(key)\n    cache_path = cache.get_file(f\"{name}.so\")\n    if cache_path is None:\n        with tempfile.TemporaryDirectory() as tmpdir:\n            src_path = os.path.join(tmpdir, \"main.c\")\n            with open(src_path, \"w\") as f:\n                f.write(src)\n            so = _build(name, src_path, tmpdir, library_dirs(), include_dir, libraries)\n            with open(so, \"rb\") as f:\n                cache_path = cache.put(f.read(), f\"{name}.so\", binary=True)\n    import importlib.util\n    spec = importlib.util.spec_from_file_location(name, cache_path)\n    mod = importlib.util.module_from_spec(spec)\n    spec.loader.exec_module(mod)\n    return mod",
+      "elide": ["_build/get_cache_manager 是 runtime 通用工具(见对应章)，本章只需知它把 C 源编成缓存 .so"]
+    },
+    {
+      "path": "third_party/nvidia/backend/driver.py",
+      "lines": "L431-L444",
+      "what": "CudaLauncher——从 src 收签名/常量，make_launcher 生成 C 源，compile_module_from_src 编出 launch 函数",
+      "code": "class CudaLauncher(object):\n\n    def __init__(self, src, metadata):\n        ids = {\"ids_of_const_exprs\": src.fn.constexprs if hasattr(src, \"fn\") else tuple()}\n        constants = src.constants if hasattr(src, \"constants\") else dict()\n        cst_key = lambda i: src.fn.arg_names.index(i) if isinstance(i, str) else i\n        constants = {cst_key(key): value for key, value in constants.items()}\n        signature = {cst_key(key): value for key, value in src.signature.items()}\n        src = make_launcher(constants, signature, ids)\n        mod = compile_module_from_src(src, \"__triton_launcher\")\n        self.launch = mod.launch\n\n    def __call__(self, *args, **kwargs):\n        self.launch(*args, **kwargs)",
+      "elide": []
+    },
+    {
+      "path": "third_party/nvidia/backend/driver.py",
+      "lines": "L447-L468",
+      "what": "CudaDriver(GPUDriver)——后端落地：装 utils/launcher_cls、get_current_target 组 GPUTarget、is_active 判 torch.cuda 且非 hip(配对脊柱姊妹端 ascend 换自己的 Driver)",
+      "code": "class CudaDriver(GPUDriver):\n\n    def __init__(self):\n        self.utils = CudaUtils()  # TODO: make static\n        self.launcher_cls = CudaLauncher\n        super().__init__()\n\n    def get_current_target(self):\n        device = self.get_current_device()\n        capability = self.get_device_capability(device)\n        capability = capability[0] * 10 + capability[1]\n        warp_size = 32\n        return GPUTarget(\"cuda\", capability, warp_size)\n\n    def get_device_interface(self):\n        import torch\n        return torch.cuda\n\n    @staticmethod\n    def is_active():\n        import torch\n        return torch.cuda.is_available() and (torch.version.hip is None)",
+      "elide": ["get_benchmarker/get_empty_cache_for_benchmark 是基准工具，非本章重点"]
+    },
+    {
+      "path": "python/triton/compiler/compiler.py",
+      "lines": "L379-L391",
+      "what": "CompiledKernel._init_handles——发射前的装载点：建 launcher、校验共享内存不超上限、load_binary 拿回 module/function/n_regs/n_spills",
+      "code": "    def _init_handles(self):\n        if self.module is not None:\n            return\n        device = driver.active.get_current_device()\n        # create launcher\n        self.run = driver.active.launcher_cls(self.src, self.metadata)\n        # not enough shared memory to run the kernel\n        max_shared = driver.active.utils.get_device_properties(device)[\"max_shared_mem\"]\n        if self.metadata.shared > max_shared:\n            raise OutOfResources(self.metadata.shared, max_shared, \"shared memory\")\n        # TODO: n_regs, n_spills should be metadata generated when calling `ptxas`\n        self.module, self.function, self.n_regs, self.n_spills = driver.active.utils.load_binary(\n            self.name, self.kernel, self.metadata.shared, device)",
+      "elide": ["load_binary 就是 driver.c 的 loadBinary(经 CudaUtils 暴露为 mod.load_binary)"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "make_ptx (staticmethod)", "file": "third_party/nvidia/backend/compiler.py", "responsibility": "LLVM IR(str)→PTX 文本：llvm.translate_to_asm 生成 + 抓 kernel 名写 metadata['name'] + 改 .version 匹配 ptx_version + 去 debug 标志"},
+    {"name": "make_cubin (staticmethod)", "file": "third_party/nvidia/backend/compiler.py", "responsibility": "PTX→cubin：写临时 .ptx，起 ptxas 子进程(-v/-lineinfo/--gpu-name=sm_XX[a])出 .o，按返回码(255/SIGSEGV/其它)分类抛可读 RuntimeError(含 stderr+repro 命令)，读回字节"},
+    {"name": "_path_to_binary / get_ptxas_version", "file": "third_party/nvidia/backend/compiler.py", "responsibility": "定位 ptxas 可执行(TRITON_PTXAS_PATH env 或 backend bin/)并抓 release 版本号，编译链唯一外部工具进程的落地点"},
+    {"name": "loadBinary", "file": "third_party/nvidia/backend/driver.c", "responsibility": "cuModuleLoadData 把 cubin 装载进上下文、cuModuleGetFunction 拿 kernel 句柄、cuFuncGetAttribute 读回 n_regs(NUM_REGS)/n_spills(LOCAL_SIZE_BYTES/4)、shared>48KB 时 cuFuncSetAttribute 开 opt-in 动态共享内存"},
+    {"name": "make_launcher", "file": "third_party/nvidia/backend/driver.py", "responsibility": "按核签名(signature/constants)动态生成一段 C 扩展源码字符串：PyArg_ParseTuple 解析实参、getPointer 取 data_ptr、_launch 调 cuLaunchKernel 或 cluster 场景 cuLaunchKernelEx"},
+    {"name": "compile_module_from_src", "file": "third_party/nvidia/backend/driver.py", "responsibility": "sha256(src) 为键缓存，未命中则 _build 把 C 源编成 .so、put 进缓存，再 importlib 加载回来作扩展模块"},
+    {"name": "CudaLauncher", "file": "third_party/nvidia/backend/driver.py", "responsibility": "GPUDriver.launcher_cls 的落地：__init__ 组签名→make_launcher→compile_module_from_src→self.launch;__call__ 透传给 mod.launch"},
+    {"name": "CudaUtils", "file": "third_party/nvidia/backend/driver.py", "responsibility": "单例，__init__ 把 driver.c 编成 cuda_utils 扩展并暴露 load_binary/get_device_properties/cuOccupancyMaxActiveClusters 等符号"},
+    {"name": "CudaDriver", "file": "third_party/nvidia/backend/driver.py", "responsibility": "GPUDriver 的 NVIDIA 落地：装 CudaUtils/CudaLauncher、get_current_target 组 GPUTarget('cuda',capability,32)、is_active 判 torch.cuda 且 hip is None——配对脊柱基座端"},
+    {"name": "occupancyMaxActiveClusters", "file": "third_party/nvidia/backend/driver.c", "responsibility": "Hopper cluster 场景算 cluster 占用率：dlsym 出 cuOccupancyMaxActiveClusters，组 CUlaunchConfig(带 cluster 维度)后查询"},
+    {"name": "CompiledKernel._init_handles", "file": "python/triton/compiler/compiler.py", "responsibility": "发射前懒装载：建 launcher、校验 metadata.shared≤max_shared、load_binary 填 module/function/n_regs/n_spills"}
+  ],
+
+  "data_flow": [
+    "1. compiler 把 LLIR(LLVM IR 字符串)交给 make_ptx(compiler.py:make_ptx)：llvm.translate_to_asm 出 PTX 文本，正则抓出唯一 .visible .entry 名写入 metadata['name']，改写 .version 为目标 ptx_version，删掉 ptxas 会拒绝优化的 debug 标志。",
+    "2. PTX 文本交给 make_cubin(compiler.py:make_cubin)：_path_to_binary 定位 ptxas，写临时 .ptx，拼 `ptxas -lineinfo -v --gpu-name=sm_XX[a] file.ptx -o file.o` 命令，subprocess.run 起子进程；成功读回 cubin 字节，失败按返回码分类抛 RuntimeError(含 ptxas stderr 与 repro 命令)。`-v` 让 ptxas 把寄存器/spill 占用打到 stderr。",
+    "3. cubin 随 CompiledKernel 落盘/缓存;首次发射时 _init_handles(compiler/compiler.py) 触发懒装载：driver.active.utils.load_binary → driver.c 的 loadBinary。",
+    "4. loadBinary(driver.c)：确保有 CUcontext，cuModuleLoadData(cubin)→cuModuleGetFunction(name) 拿 CUfunction;cuFuncGetAttribute 读 NUM_REGS→n_regs、LOCAL_SIZE_BYTES→n_spills(/4);若 metadata.shared>49152 且设备 opt-in 上限>49152，cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES) 开动态共享内存。返回 (module,function,n_regs,n_spills)。",
+    "5. 同时 _init_handles 建 launcher：CudaLauncher(src,metadata) → make_launcher 按签名生成 C 源 → compile_module_from_src 编/取缓存 .so → self.launch = mod.launch。",
+    "6. 用户 kernel[grid](*args) → CompiledKernel.__getitem__ 的 runner 调 self.run(gridX,gridY,gridZ,stream,function,packed_metadata,launch_metadata,hooks,*args)。",
+    "7. 生成的 launch(driver.py 模板)：ensureCudaContext → PyArg_ParseTuple 解析 grid/stream/function/metadata + 各实参 → 对指针实参 getPointer 取 data_ptr → _launch。",
+    "8. _launch：num_ctas==1 走 cuLaunchKernel(function,grid…,32*num_warps,…,shared_memory,stream,params);否则(cluster)组 CUlaunchConfig 带 cluster 维度，dlsym 出的 cuLaunchKernelEx 发射。"
+  ],
+
+  "design_decisions": [
+    {"decision": "make_ptx 抓出唯一 kernel 名写 metadata['name'] 并 assert 只有一个", "why": "cubin 装载后要靠这个名字 cuModuleGetFunction 取句柄;Triton 一个编译单元恰一个 .entry，assert 守护此不变量", "evidence": "third_party/nvidia/backend/compiler.py:L325-L328"},
+    {"decision": "make_ptx 删掉 PTX 里的 debug 标志", "why": "带 debug 标志会阻止 ptxas 优化代码(注释明说)——保留会牺牲性能", "evidence": "third_party/nvidia/backend/compiler.py:L332-L333"},
+    {"decision": "make_cubin 起 ptxas 外部子进程而非库内汇编", "why": "ptxas 是 NVIDIA 闭源工具，PTX→SASS 的最终汇编只能交给它;这是整条编译链唯一的外部工具进程(回指 ch36 add_stages 五段的第五段)", "evidence": "third_party/nvidia/backend/compiler.py:L341,L352-L356"},
+    {"decision": "ptxas 命令带 `-v`", "why": "让 ptxas 把每核寄存器占用/spill 打到 stderr——这正是读者判断寄存器压力/spill(慢的信号)的直接来源", "evidence": "third_party/nvidia/backend/compiler.py:L352-L354"},
+    {"decision": "ptxas 失败按返回码分类(255→codegen error / 128+SIGSEGV→SIGSEGV / 其它→error code N)并附 stderr+repro 命令", "why": "外部工具失败对用户是黑盒;分类+可复现命令让报错可读可调试", "evidence": "third_party/nvidia/backend/compiler.py:L361-L376"},
+    {"decision": "loadBinary 用 LOCAL_SIZE_BYTES/4 作为 n_spills", "why": "CUDA 没有直接的 spill 计数;local memory 字节数是 spill 的代理指标，除以 4 换算成 32-bit 槽位数", "evidence": "third_party/nvidia/backend/driver.c:L124-L126"},
+    {"decision": "共享内存 >49152(48KB) 且设备支持时才 cuFuncSetAttribute 开动态共享内存", "why": "硬件对静态共享内存有 48KB 硬上限，超过必须显式 opt-in 动态共享内存否则装载失败(回指共享内存预算章的 48KB 阈值)", "evidence": "third_party/nvidia/backend/driver.c:L132-L144"},
+    {"decision": "cuFuncSetAttribute 的动态额度设为 shared_optin - shared_static", "why": "设备 opt-in 上限里要扣掉已被静态共享内存占用的部分，剩余才是这个核能拿的动态额度", "evidence": "third_party/nvidia/backend/driver.c:L139-L143"},
+    {"decision": "make_launcher 按签名动态生成一段 C 扩展源码(而非通用可变参运行时)", "why": "每种 kernel 签名的实参个数/类型不同;生成专用 C 代码可直接 PyArg_ParseTuple 定长解析、编译期定死取址方式，避免运行时反射开销——但每种新签名都要编一次 .so(launch overhead 来源)", "evidence": "third_party/nvidia/backend/driver.py:L117-L146"},
+    {"decision": "compile_module_from_src 以 sha256(src) 为缓存键", "why": "相同签名生成相同 C 源→相同 sha256→命中缓存 .so，避免每次发射都重编;不同签名首次触发编译", "evidence": "third_party/nvidia/backend/driver.py:L49-L59"},
+    {"decision": "cluster/cuLaunchKernelEx 与 cuOccupancyMaxActiveClusters 走 dlopen/dlsym('libcuda.so.1') 动态取符号", "why": "这些是较新 CUDA driver 才有的符号;dlsym 运行时探测让代码能在旧 driver 上编译/加载而不硬依赖新符号", "evidence": "third_party/nvidia/backend/driver.py:L189-L206; third_party/nvidia/backend/driver.c:L165-L188"},
+    {"decision": "num_ctas==1 走 cuLaunchKernel，否则走 cuLaunchKernelEx", "why": "普通发射用经典 API;cluster(多 CTA 协作，Hopper)需要 CUlaunchConfig 带 cluster 维度属性，只有 Ex 变体支持", "evidence": "third_party/nvidia/backend/driver.py:L210-L237"},
+    {"decision": "CudaDriver.is_active 判 torch.cuda.is_available() 且 torch.version.hip is None", "why": "同一 torch 可能是 ROCm 构建(hip);排除 hip 才是真 NVIDIA CUDA，避免与 AMD 后端冲突", "evidence": "third_party/nvidia/backend/driver.py:L465-L468"}
+  ],
+
+  "theory": [
+    "寄存器占用与占用率(occupancy)：每 SM 寄存器总数固定(cuDeviceGetAttribute MAX_REGISTERS_PER_BLOCK 取上限)。单线程用 n_regs 个寄存器，则一个 SM 能并发的 warp/block 数受 寄存器总数/(n_regs×blockDim) 约束。n_regs 越高，能同时驻留的线程越少、occupancy 越低——ptxas -v 打印的 n_regs 是这条约束的直接输入。",
+    "spill 的代价：当 n_regs 超过硬件/maxnreg 上限，ptxas 把变量溢出到 local memory(实为 global memory 的线程私有区)。n_spills = LOCAL_SIZE_BYTES/4 非零即表示发生 spill——每次 spill 访问是一次高延迟 global 访存，是性能杀手。读者应把 n_spills>0 当作立即优化的信号。",
+    "48KB 共享内存阈值：SM 上共享内存与 L1 共享同一物理 SRAM。静态共享内存硬上限 48KB(49152 字节);要用更大共享内存(如大 tile 的 GEMM/attention)必须 cuFuncSetAttribute 显式 opt-in 动态额度，且额度上限因架构而异(Hopper 可达 ~228KB)。不 opt-in 就编不出大 block——这解释了为何某些 BLOCK_SIZE 配置会在装载期失败。",
+    "cluster occupancy(Hopper)：Hopper 引入 thread block cluster(多个 CTA 组成 cluster、可跨 CTA 共享分布式共享内存)。cuOccupancyMaxActiveClusters 在给定 cluster 维度/共享内存下算出一个 GPU 能并发的最大 cluster 数——cluster 太大或共享内存太多都会压低这个数，是 Hopper 上调 num_ctas/cluster 维度的判据。",
+    "动态生成 launcher 的 overhead：每种新 kernel 签名首次发射要生成 C 源→gcc 编译→加载 .so(sha256 缓存后续复用)。这解释了 Triton 首次 kernel 调用的额外延迟来源之一;稳态下缓存命中，launch 路径退化为一次 PyArg 解析 + cuLaunchKernel。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "make_cubin 里的临时文件清理 os.path.exists(...)/os.remove(...) 冗余判断", "why_safe": "只是清理临时 .ptx/.log/.o，不影响 cubin 产出的正确性;讲解可略但精简版若保留 make_cubin 主体则不删控制流"},
+      {"what": "make_ptx 的 NVPTX_ENABLE_DUMP 调试打印分支", "why_safe": "仅在 env 置 1 时打印 PTX，纯调试旁路，删除不改返回值"},
+      {"what": "driver.py getTmaDesc / nvTmaDesc(TMA 描述符)相关分支", "why_safe": "Hopper TMA 专属特化路径，主流程(普通指针/标量实参)不经过;非本章核心可在讲解中标注省略"}
+    ],
+    "must_keep": [
+      {"symbol": "make_ptx", "why": "本章机制(1)主体——LLVM IR→PTX 与版本/去 debug 后处理"},
+      {"symbol": "make_cubin", "why": "本章机制(2)主体——起 ptxas 子进程出 cubin"},
+      {"symbol": "ptxas_cmd", "why": "ptxas 命令行拼装(-v/--gpu-name/-lineinfo)是读者理解外部工具调用的关键"},
+      {"symbol": "_path_to_binary", "why": "ptxas 定位逻辑——编译链唯一外部工具进程的入口"},
+      {"symbol": "loadBinary", "why": "本章机制(3)主体——装载 cubin + 读回 n_regs/n_spills + 48KB opt-in"},
+      {"symbol": "cuModuleLoadData", "why": "cubin 装载进显存的关键 CUDA API 调用"},
+      {"symbol": "cuFuncGetAttribute", "why": "读回 n_regs(NUM_REGS)/n_spills(LOCAL_SIZE_BYTES)的关键 API"},
+      {"symbol": "cuFuncSetAttribute", "why": ">48KB 开 opt-in 动态共享内存的关键 API"},
+      {"symbol": "n_regs", "why": "寄存器占用——perf 命门读者必须理解的核心量"},
+      {"symbol": "n_spills", "why": "spill 计数——慢的直接信号，读者必须理解"},
+      {"symbol": "make_launcher", "why": "本章机制(4)主体——按签名动态生成 C 扩展"},
+      {"symbol": "getPointer", "why": "从 data_ptr 取设备指针 + cpu tensor 校验，launcher 关键辅助"},
+      {"symbol": "_launch", "why": "cuLaunchKernel / cluster 场景 cuLaunchKernelEx 的分派点"},
+      {"symbol": "cuLaunchKernel", "why": "普通发射的核心 CUDA API"},
+      {"symbol": "cuLaunchKernelEx", "why": "cluster 发射的核心 API(dlsym 取)"},
+      {"symbol": "compile_module_from_src", "why": "把生成 C 源编成缓存 .so 的落地点，解释 launch overhead"},
+      {"symbol": "CudaLauncher", "why": "GPUDriver.launcher_cls 的落地实现"},
+      {"symbol": "CudaDriver", "why": "GPUDriver 的 NVIDIA 落地——配对脊柱基座端"},
+      {"symbol": "occupancyMaxActiveClusters", "why": "cluster 占用率查询，Hopper perf 判据"}
+    ]
+  },
+
+  "mechanisms": [
+    {
+      "id": "m1-make-ptx",
+      "name": "make_ptx：LLVM IR 出成 PTX 文本 + 版本/去 debug 后处理",
+      "kind": "dataflow",
+      "source_anchors": ["third_party/nvidia/backend/compiler.py:L317-L337", "third_party/nvidia/backend/compiler.py:L63-L82"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "worked example：对一段小 kernel 观测 make_ptx 出的 PTX 头(.version/.target/.visible .entry 名)——pin v3.2.0 可 headless 跑到 llir→ptx"
+    },
+    {
+      "id": "m2-make-cubin-ptxas",
+      "name": "make_cubin：起 ptxas 子进程出 cubin(-v 拿寄存器占用、--gpu-name 定目标、返回码错误分类)",
+      "kind": "protocol",
+      "source_anchors": ["third_party/nvidia/backend/compiler.py:L339-L382", "third_party/nvidia/backend/compiler.py:L21-L41"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "worked example：跑 ptxas -v 看真实 stderr 的寄存器/spill 打印(host 无卡也可跑，ptxas 是 CPU 程序);图：编译链最后一段外部子进程的 I/O(PTX 文本→ptxas→cubin 字节 + stderr 占用报告)"
+    },
+    {
+      "id": "m3-loadbinary",
+      "name": "loadBinary：cuModuleLoadData 装载 + 读回 n_regs/n_spills + 48KB opt-in 动态共享内存",
+      "kind": "protocol",
+      "source_anchors": ["third_party/nvidia/backend/driver.c:L93-L152"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "note": "需真机 CUDA。图：装载期的属性读回与 48KB 阈值分支(shared>49152 && optin>49152 → cuFuncSetAttribute)"
+    },
+    {
+      "id": "m4-reg-occupancy-theory",
+      "name": "寄存器占用/spill 与 occupancy 的量化关系(读者收益主线)",
+      "kind": "algorithm",
+      "source_anchors": ["third_party/nvidia/backend/driver.c:L122-L126", "third_party/nvidia/backend/compiler.py:L352-L354"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "algorithm→needs_worked_example=true。worked example：给定 n_regs 与 blockDim/SM 寄存器总数，算能驻留几个 block/occupancy;n_spills>0 的性能含义。无论文出处(硬件占用率模型，非 paper)"
+    },
+    {
+      "id": "m5-make-launcher-codegen",
+      "name": "make_launcher：按核签名动态生成一段 C 扩展(PyArg 解析/getPointer/cuLaunchKernel[Ex])",
+      "kind": "algorithm",
+      "source_anchors": ["third_party/nvidia/backend/driver.py:L117-L239", "third_party/nvidia/backend/driver.py:L246-L289"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "algorithm→needs_worked_example=true。worked example：对一个具体签名(如 (ptr,ptr,int32,constexpr))展开 make_launcher 生成的 arg_decls/format 字符串/internal_args_list;图：签名→生成 C 源各槽位的映射。无论文出处(工程 codegen)"
+    },
+    {
+      "id": "m6-compile-cache-so",
+      "name": "compile_module_from_src：C 源→sha256 缓存 .so→import 回来(launch overhead 来源)",
+      "kind": "dataflow",
+      "source_anchors": ["third_party/nvidia/backend/driver.py:L48-L64", "third_party/nvidia/backend/driver.py:L431-L444"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m7-launch-dispatch",
+      "name": "发射路径：_init_handles 懒装载 → runner → launch → _launch(num_ctas 分派 cuLaunchKernel/Ex)",
+      "kind": "dataflow",
+      "source_anchors": ["python/triton/compiler/compiler.py:L379-L391", "python/triton/compiler/compiler.py:L415-L426", "third_party/nvidia/backend/driver.py:L349-L404"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "note": "需真机 CUDA 才能真发射;host 上讲清生成的 launch 函数控制流与 num_ctas 分支即可。图：从 kernel[grid](*args) 到 cuLaunchKernel 的调用链"
+    },
+    {
+      "id": "m8-cluster-occupancy",
+      "name": "occupancyMaxActiveClusters：Hopper cluster 占用率查询(dlsym cuOccupancyMaxActiveClusters)",
+      "kind": "protocol",
+      "source_anchors": ["third_party/nvidia/backend/driver.c:L193-L239"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "note": "需真机 CUDA(且 Hopper)。cluster 场景 perf 判据，点到即可"
+    },
+    {
+      "id": "m9-cuda-driver-seam",
+      "name": "CudaDriver(GPUDriver)：后端落地与配对脊柱(launcher_cls/get_current_target/is_active)",
+      "kind": "config",
+      "source_anchors": ["third_party/nvidia/backend/driver.py:L447-L468", "python/triton/backends/driver.py:L31-L46"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "note": "配对脊柱：姊妹篇 ascend 换自己的 driver/launcher_cls，一句点到"
+    }
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recycle": [],
+    "note": "bible.py due ch37 返回空:本章无伏笔埋/回收(与任务说明一致)"
+  }
+}
