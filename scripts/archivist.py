@@ -877,9 +877,15 @@ def main():
             i += 1
 
     if cmd == "record":
+        # 护栏(exp-0717-4):无 --title/--what 的探针式调用拒绝写 Untitled 占位条目。
+        # archivist agent 反复用无参 `record` 探 CLI 用法,曾在 ch11/ch17/ch21 留下
+        # untitled.md 垃圾 + 污染 INDEX.md(每次靠下一个 archivist 手工清理)。
+        if not args.get("title") or not args.get("what"):
+            print("record 需要 --title 与 --what;拒绝写 Untitled 占位条目。\n" + __doc__)
+            sys.exit(1)
         record(
             entry_type=args.get("type", "decision"),
-            title=args.get("title", "Untitled"),
+            title=args.get("title"),
             what=args.get("what", ""),
             why=args.get("why", ""),
             chapter=args.get("chapter"),

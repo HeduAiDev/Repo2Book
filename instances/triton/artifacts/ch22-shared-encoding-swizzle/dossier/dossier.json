@@ -1,0 +1,192 @@
+{
+  "chapter_id": "ch22",
+  "slug": "ch22-shared-encoding-swizzle",
+  "title": "Shared 编码与 swizzle：共享内存里如何避开 bank 冲突",
+  "one_line": "SharedEncodingAttr 用 vec/perPhase/maxPhase/order/hasLeadingOffset 描述共享内存元素的 xor swizzle 排布；把 in[r][c] 存到 out[r][c^phase] 就能把同 bank 的并行访问打散——而这几个参数不是拍脑袋，是被下游目标 mma 指令的共享内存访问模式反推钉死的。",
+
+  "code_spine": [
+    "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L155-L161  SharedEncodingAttr 定义 + 语义（\\mathcal{L}(i)={0..32*num_warps-1}：元素被多线程经共享内存同时访问）",
+    "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L163-L238  description 里五个逐步加料的 swizzle 手算例子 + hasLeadingOffset 说明（本章 stakes 核心，逐字内嵌逐段讲）",
+    "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L240-L250  parameters：vec/perPhase/maxPhase/order/CTALayout/hasLeadingOffset 五（六）字段",
+    "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L252-L260  基础 AttrBuilder（直接给参数，hasLeadingOffset 默认 false）",
+    "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L274-L409  巨型 dotOperand+mma builder：MFMA/WMMA/Volta/Ampere/Hopper 各自反推 vec/perPhase/maxPhase（本章第 3 论点）",
+    "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L430-L456  MMAv3(Hopper) 按 eltTy + 连续维字节数选 64B/128B swizzle 模式，hasLeadingOffset=true",
+    "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L67-L105  CTALayoutAttr：CTAsPerCGA/CTASplitNum/CTAOrder，Hopper CGA 里张量跨 CTA 切分与 multicast（次要论点）",
+    "lib/Dialect/TritonGPU/IR/Dialect.cpp:L1484-L1547  SharedEncodingAttr::parse 文本 IR 反序列化",
+    "lib/Dialect/TritonGPU/IR/Dialect.cpp:L1549-L1558  SharedEncodingAttr::print 文本 IR 序列化（读者会在 dump 里看到的形态）",
+    "lib/Dialect/TritonGPU/IR/Dialect.cpp:L947-L957  getElemsPerThread/getTotalElemsPerThread 对 shared 直接 llvm_unreachable——shared 不是 per-thread 分布式布局（与 distributed 的分野证据）",
+    "lib/Dialect/TritonGPU/IR/Dialect.cpp:L375-L399  getShapePerCTA（CTASplitNum 参与 shared 布局算术）"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L155-L164",
+      "code": "def SharedEncodingAttr : TritonGPU_Attr<\"SharedEncoding\", \"shared_encoding\"> {\n  let mnemonic = \"shared\";\n\n  let description = [{\nAn encoding for tensors whose elements may be simultaneously accessed by\ndifferent cuda threads in the programs, via shared memory. In other words,\nfor all indices i \\in Z^d, \\mathcal{L}(i) = {0, 1, ..., 32*num_warps - 1}.\n\nIn order to avoid shared memory bank conflicts, elements may be swizzled.\nHere are some examples.  In all cases, the input tensor is [0, 1, ..., n-1].",
+      "elide": ["无。这段是本章开场 stakes：一句话点破 shared 布局的本质——不是把元素分给某个线程持有（那是 distributed），而是所有线程都能经共享内存同时访问同一片元素，swizzle 只是为了消 bank 冲突。"]
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L166-L175",
+      "code": "1. Basic swizzling\n\n  #shared<{vec=1, perPhase=1, maxPhase=4, order=[1,0]}>\n  [ 0,  1,  2,  3],  // xor with 0\n  [ 5,  4,  7,  6],  // xor with 1\n  [10, 11,  8,  9],  // xor with 2\n  [15, 14, 13, 12]   // xor with 3\n\nHere elements of row r are xor'ed with r (or more properly, in[r][c] ->\nout[r][c^r]).",
+      "elide": ["无。例 1 是 swizzle 命门的第一层：out[r][c]=in[r][c^r]。手算已核（Python 逐位复现完全一致）：第 r 行的每个列号异或 r，把原本落在同一 bank 的一整列打散到 4 个不同 bank。"]
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L177-L186",
+      "code": "2. Multiple rows per phase\n\n  #shared<{vec=1, perPhase=2, maxPhase=4, order=[1,0]}>\n  [ 0,  1,  2,  3],  // phase 0 (xor with 0)\n  [ 4,  5,  6,  7],\n  [ 9,  8, 11, 10],  // phase 1 (xor with 1)\n  [13, 12, 15, 14]\n\nElements of row r are xor'ed with r/2.  In other words, perPhase=2\nmeans that pairs of 2 rows get the same swizzling.",
+      "elide": ["无。例 2 引入 perPhase：xor 值改用 r/perPhase（整除）。perPhase 是『多少连续行共用同一 phase』——当一个 bank 宽度能容纳不止一行元素时，相邻几行本就不冲突，不必分开打散。"]
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L188-L201",
+      "code": "3. Max-phase applied\n\n  $shared<{vec=1, perPhase=1, maxPhase=2, order=[1,0]}>\n  [ 0,  1,  2,  3],  // phase 0 (xor with 0)\n  [ 5,  4,  7,  6],  // phase 1 (xor with 1)\n  [ 8,  9, 10, 11],  // phase 0\n  [13, 12, 15, 14],  // phase 1\n  [16, 17, 18, 19],  // ...\n  [21, 20, 23, 22],\n  [24, 25, 26, 27],\n  [29, 28, 31, 30]\n\nElements of row r are xor'ed with (r/2) % 2.  In other words, maxPhase=m has the\neffect of limiting the maximum value of the xor to m-1.",
+      "elide": ["无。例 3 引入 maxPhase：xor 值对 maxPhase 取模，限制 phase 只在 0..maxPhase-1 循环。原文这行 `$shared` 是笔误（应为 `#shared`），逐字保留但正文可一句点明。maxPhase 是『swizzle 图案多少行后重复一次』。"]
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L203-L217",
+      "code": "4. Max-phase and per-phase\n\n  #shared<{vec=1, perPhase=2, maxPhase=2, order=[1,0]}>\n  [ 0,  1,  2,  3],  // phase 0 (xor with 0)\n  [ 4,  5,  6,  7],  // phase 0\n  [ 9,  8, 11, 10],  // phase 1 (xor with 1)\n  [13, 12, 15, 14],  // phase 1\n  [16, 17, 18, 19],  // phase 0\n  [20, 21, 22, 23],  // phase 0\n  [25, 24, 27, 26],  // phase 1\n  [29, 28, 31, 30]]  // phase 1\n\nHere the xor value (the \"phase\", I guess?) changes every perPhase rows, up to a\nmaximum value of maxPhase-1.  In other words, elements of row r are xor'ed with\n(r/2) % 2.",
+      "elide": ["无。例 4 合并 perPhase 与 maxPhase，给出统一相位公式 phase(r) = (r/perPhase) % maxPhase。这就是三个标量字段（vec 尚未入场）合起来定义的完整相位序列。"]
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L219-L237",
+      "code": "5. Adding vec\n\n  #shared<{vec=2, perPhase=1, maxPhase=4, order=[1,0]}>\n  [ 0,  1,  2,  3,  4,  5,  6,  7],\n  [10, 11,  8,  9, 14, 15, 12, 13],\n  [20, 21, 22, 23, 16, 17, 18, 19],\n  [30, 31, 28, 29, 26, 27, 24, 25]\n\nWhen vec=2, elements are swizzled in pairs of 2.  In other words, the element at\n(r,c) has value\n\n  ((c / 2) ^ r) * 2 + (c % 2).\n\nFor MMAv3 eg Hopper GMMA, hasLeadingOffset should be true. In this case,\nwhen the matrix is stored in shared memory, there will be an offset not\nonly in the stride dimension, but also in the leading dimension. For example,\na matrix of size 16x128 and data type I8 is stored in the shared memory with\n64B-swizzle mode. The offset of the element with index (0, 64) will be 16*64,\ncompared to 1*64 when the hasLeadingOffset is false.",
+      "elide": ["无。例 5 引入 vec：以 vec 个元素为一个不可分的 swizzle 粒度（因为向量化 ld/st 会一次搬 vec 个连续元素，不能被打散），phase 作用在『第几个 vec 组』上。这凑齐了完整统一公式；末尾 hasLeadingOffset 段落交代 MMAv3/Hopper 的第六字段语义。"]
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L240-L250",
+      "code": "  // swizzle info: vec, perPhase, maxPhase\n  // order: the fastest-changing axis first\n  let parameters = (\n    ins\n    \"unsigned\":$vec,\n    \"unsigned\":$perPhase,\n    \"unsigned\":$maxPhase,\n    ArrayRefParameter<\"unsigned\">:$order,\n    \"CTALayoutAttr\":$CTALayout,\n    \"bool\":$hasLeadingOffset\n  );",
+      "elide": ["无。五（严格是六）个字段的定义处：三个 swizzle 标量 + order（最快变化轴在前）+ CTALayout（跨 CTA 切分）+ hasLeadingOffset（Hopper GMMA 开关）。这是把上面五个手算例子抽象成的正式 schema。"]
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L252-L260",
+      "code": "  let builders = [\n    AttrBuilder<(ins \"unsigned\":$vec,\n                     \"unsigned\":$perPhase,\n                     \"unsigned\":$maxPhase,\n                     \"ArrayRef<unsigned>\":$order,\n                     \"CTALayoutAttr\":$CTALayout), [{\n        bool hasLeadingOffset = false; // default value\n        return $_get(context, vec, perPhase, maxPhase, order, CTALayout, hasLeadingOffset);\n    }]>,",
+      "elide": ["无。最朴素的 builder：调用方直接给三个 swizzle 标量，hasLeadingOffset 默认 false（即非 Hopper 软件 swizzle 路径）。作为对照，凸显下面 dotOperand 版本的『自动反推』有多重。"]
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L282-L311",
+      "code": "        // ---- begin GFX908/GFX90A ----\n        if (auto mfmaEnc = mlir::dyn_cast<AMDMfmaEncodingAttr>(dotOpEnc.getParent())) {\n          int kDimNum = dotOpEnc.getOpIdx() == 0 ? 1 : 0;\n          if (needTrans)\n            kDimNum = 1 - kDimNum;\n          bool isKDimInner = (order[0] == kDimNum);\n          if (isKDimInner) {\n            const int numBanks = 32;\n            const int bankBitWidth = 32;\n            const int SIMDWidth = 16;\n\n            // number of inner dimension rows per one pattern repeat\n            int innerDimLength = shape[order[0]];\n            int elemsPerOneBanksRow = (numBanks * bankBitWidth) / typeWidthInBit;\n\n            int perPhase = std::max(1, elemsPerOneBanksRow / innerDimLength);\n            // vecSize is set to kWidth of the dotop layout\n            int vecSize = dotOpEnc.getKWidth();\n            int maxPhase = std::min(SIMDWidth / perPhase, innerDimLength / vecSize);\n\n            // TODO (zhanglx): figure out better parameters for mfma4\n            if (mfmaEnc.getMDim() == 4)\n              maxPhase = 4;\n\n            return get(context, vecSize, perPhase, maxPhase, order, CTALayout);\n          } else {\n            // Do not swizzle in case k dimension is not innermost.\n            // In this case accesses will go in different banks even without swizzling.\n            return get(context, 1, 1, 1, order, CTALayout);\n          }\n        }",
+      "elide": ["无。AMD MFMA 分支：这是把 swizzle 参数反推讲透的最清晰样本。numBanks=32、bankBitWidth=32bit 是硬件常量；elemsPerOneBanksRow=一整轮 32 个 bank 能容纳多少个元素；perPhase = 该行数 / innerDim（一个 bank 行装得下几整行 → 几行共用一个 phase）；vec=dotOp 的 kWidth（一次搬多少连续元素）；maxPhase 由 SIMDWidth 与 innerDim/vec 共同封顶。else 分支点破本章命门：若 K 维不在最内圈，天然就落不同 bank，直接不 swizzle（1,1,1）。"]
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L349-L362",
+      "code": "        // ---- begin Volta ----\n        if (mmaEnc.isVolta()) {\n          int perPhase = 128 / (shapePerCTA[order[0]] * (typeWidthInBit / 8));\n          perPhase = std::max<int>(perPhase, 1);\n          bool is_row = order[0] != 0;\n          bool is_vec4 = opIdx == 0 ? !is_row && (shapePerCTA[order[0]] <= 16) :\n              is_row && (shapePerCTA[order[0]] <= 16);\n          int pack_size = opIdx == 0 ? ((is_row || is_vec4) ? 1 : 2) :\n                                       ((is_row && !is_vec4) ? 2 : 1);\n          int rep = 2 * pack_size;\n          int maxPhase = (order[inner] == 1 ? 8 : 4) / perPhase;\n          int vec = 2 * rep;\n          return get(context, vec, perPhase, maxPhase, order, CTALayout);\n        }",
+      "elide": ["可省略正文不必逐字讲 Volta 的 is_vec4/pack_size 细节——只需点破共性：perPhase=128/(连续维字节数)，把 128 字节（NVIDIA 一轮 32 bank × 4B）除以一行的字节数得到共用相位的行数；maxPhase 由目标 mma 指令的 8/4 打散度除以 perPhase 得来。是 Ampere/MFMA 同一套骨架的 Volta 特化。"]
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L364-L398",
+      "code": "        // ---- begin Ampere ----\n        if (mmaEnc.isAmpere()) {\n          int perPhase = 128 / (shapePerCTA[order[0]] * 4 / dotOpEnc.getKWidth());\n          perPhase = std::max<int>(perPhase, 1);\n          std::vector<size_t> matShape = {8, 8, 4 * dotOpEnc.getKWidth()};\n          int vecWidth = 32 / typeWidthInBit;\n          if (vecWidth != dotOpEnc.getKWidth() && order[0] == inner) {\n              perPhase = std::max<int>(perPhase, 2 * vecWidth);\n          }\n          int rank = order.size();\n          // --- handle A operand ---\n          if (opIdx == 0) { // compute swizzling for A operand\n              int m = (needTrans) ? matShape[2] : matShape[0];\n              int k = (needTrans) ? matShape[0] : matShape[2];\n              int vec = (order[0] == rank-1) ? k : m;\n              int mmaStride = (order[0] == rank-1) ? m : k;\n              int maxPhase = mmaStride / perPhase;\n              return get(context, vec, perPhase, maxPhase, order, CTALayout);\n          }\n\n          // --- handle B operand ---\n          if (opIdx == 1) {\n              // we compute vec and maxPhase m, n and k size of the mma\n              // instruction. when matmul operands is transposed, we should\n              // consider that to get m, n and k.\n              int n = needTrans ? matShape[2] : matShape[1];\n              int k = needTrans ? matShape[1] : matShape[2];\n              int vec = (order[0] == rank-1) ? n : k;\n              int mmaStride = (order[0] == rank-1) ? k : n;\n              int maxPhase = mmaStride / perPhase;\n              return get(context, vec, perPhase, maxPhase, order, CTALayout);\n          }\n\n          llvm_unreachable(\"invalid operand index\");\n        }",
+      "elide": ["A/B 两支对称，正文选一支（A operand）逐字讲即可，另一支一句『B 同理，把 m 换成 n』带过。命门在 `matShape = {8, 8, 4*kWidth}`：这就是 Ampere mma.sync 指令一条硬件 tile 的 M/N/K 形状——vec 与 maxPhase(=mmaStride/perPhase) 全由这个『目标 mma 指令的 tile 形状』算出。这是全章第 3 论点『swizzle 参数被 mma 指令钉死』最直接的代码证据。"]
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L400-L408",
+      "code": "        // ---- begin version 3 ----\n        if (mmaEnc.isHopper()) {\n          llvm_unreachable(\"SharedEncodingAttr builder when the MMAEncodingAttr\"\n                           \" is Hopper has not been implemented yet\");\n          return $_get(context, 1, 1, 1, order, CTALayout, true);\n        }\n\n        // ---- not implemented ----\n        llvm_unreachable(\"unsupported swizzling for provided MMA version\");",
+      "elide": ["无。Hopper（MMAv3/GMMA）走的不是这条 dotOperand builder——它 llvm_unreachable，改由下面 L430 那条按 eltTy 选 64/128B swizzle 模式的 builder 承担（hasLeadingOffset=true）。这解释了为什么 Hopper 参数不出现在这个巨型 if 链里。"]
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L430-L456",
+      "code": "    AttrBuilder<(ins \"ArrayRef<int64_t>\":$shape,\n                     \"ArrayRef<unsigned>\":$order,\n                     \"CTALayoutAttr\":$CTALayout,\n                     \"Type\":$eltTy), [{\n        auto shapePerCTA = getShapePerCTA(CTALayout.getCTASplitNum(), shape);\n\n        int32_t eleBitWidth = eltTy.getIntOrFloatBitWidth();\n        int32_t vec = 128 / eleBitWidth, perPhase = 1, maxPhase = 1;\n\n        // get proper shared memory swizzling mode from the contiguous dimension\n        // size of the origin blocked layout.\n        auto contigDimSizeInByte = shapePerCTA[order[0]] * eleBitWidth / 8;\n        if (contigDimSizeInByte >= 128 && contigDimSizeInByte % 128 == 0) {\n          perPhase = 1;\n          maxPhase = 8;\n        } else if (contigDimSizeInByte >= 64 && contigDimSizeInByte % 64 == 0) {\n          perPhase = 2;\n          maxPhase = 4;\n        } else if (contigDimSizeInByte >= 32 && contigDimSizeInByte % 32 == 0) {\n          perPhase = 4;\n          maxPhase = 2;\n        } else {\n          llvm_unreachable(\"unsupported shared memory layout for MMAv3\");\n        }\n\n        return $_get(context, vec, perPhase, maxPhase, order, CTALayout, true);\n    }]>",
+      "elide": ["无。MMAv3/Hopper 的 swizzle builder：由连续维字节数落进 128B/64B/32B 三档 swizzle 模式，每档钉死 (perPhase,maxPhase)=(1,8)/(2,4)/(4,2)，vec=128/eltBit（一次 128bit 向量搬运），末位 hasLeadingOffset=true。注意 perPhase×maxPhase 三档都=8，正是硬件 swizzle 图案的 8 行周期。"]
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td",
+      "lines": "L80-L96",
+      "code": "The tensor is divided up into CTASplitNum pieces, which are distributed among\nthe CTAsPerCGA thread blocks.  Each CTA processes a subtensor of shape\n`tensor_shape / CTASplitNum`.\n\nExample 0: The tensor shape is [64, 128] and, there are two CTAs, each\nprocessing half the tensor [64, 64]. Then CTAsPerCGA = [1, 2] and\nCTASplitNum = [1, 2].\n\nExample 1: The tensor shape is [64, 128] and, there are two CTAs, both\nprocessing the complete tensor [64, 128]. This happens when multicast is\nenabled. In this case, CTAsPerCTA = [1, 2] but CTASplitNum = [1, 1].\n\nExample 2: Consider a matmul AxB=C, where A=[M,K], B=[K,N], C=[M,N].  The\nCTAsPerCGA for A, B, C are the same, [SplitM, SplitN], but the CTASplitNum are\ndifferent.",
+      "elide": ["Example 2 后半（各操作数 CTASplitNum 具体值）可省略。核心区分：CTAsPerCGA=CGA 里有几个 CTA；CTASplitNum=张量切成几片；两者相等=切开分给各 CTA，CTASplitNum=[1..]<CTAsPerCGA=multicast（同一片广播到多个 CTA）。这是 CTALayout 作为 SharedEncoding 第 5 字段的语义，属次要论点。"]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/IR/Dialect.cpp",
+      "lines": "L947-L957",
+      "code": "SmallVector<unsigned>\nSharedEncodingAttr::getElemsPerThread(ArrayRef<int64_t> shape,\n                                      Type eltTy) const {\n  llvm_unreachable(\"getElemsPerThread is not supported for shared layout\");\n  return SmallVector<unsigned>();\n}\nunsigned SharedEncodingAttr::getTotalElemsPerThread(ArrayRef<int64_t> shape,\n                                                    Type eltTy) const {\n  llvm_unreachable(\"getElemsPerThread is not supported for shared layout\");\n  return 0;\n}",
+      "elide": ["无。两套心智模型的分野证据：distributed 布局的核心问题是『每个线程分到几个元素』，而 shared 布局对这个问题直接 llvm_unreachable——因为 shared 里元素不归某个线程私有，是全体线程经共享内存共享访问的。一句话回指 ch21 的对照。"]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/IR/Dialect.cpp",
+      "lines": "L1549-L1558",
+      "code": "void SharedEncodingAttr::print(AsmPrinter &printer) const {\n  printer << \"<{\"\n          << \"vec = \" << getVec() //\n          << \", perPhase = \" << getPerPhase()\n          << \", maxPhase = \" << getMaxPhase() //\n          << \", order = [\" << getOrder() << \"]\";\n  maybePrintCTALayout(getContext(), printer, getCTALayout(),\n                      /*rank=*/getOrder().size());\n  printer << \", hasLeadingOffset = \" << getHasLeadingOffset() << \"}>\";\n}",
+      "elide": ["无。读者用 TRITON_KERNEL_DUMP 会亲眼看到的 `#shared<{vec=..., perPhase=..., maxPhase=..., order=[...], hasLeadingOffset=...}>` 就是这里打印出来的——把抽象字段接回读者能观测的 IR 文本形态，闭环 stakes。"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "SharedEncodingAttr", "file": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L155", "responsibility": "描述一块共享内存里张量元素的 xor-swizzle 排布：vec/perPhase/maxPhase 三个 swizzle 标量 + order + CTALayout + hasLeadingOffset。本章第一主角。"},
+    {"name": "CTALayoutAttr", "file": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L67", "responsibility": "描述张量在一个 CGA 内多个 CTA 之间如何切分（CTASplitNum）/分布（CTAsPerCGA）/排序（CTAOrder），支持 Hopper multicast。是 SharedEncodingAttr 的第 5 字段。"},
+    {"name": "DotOperandEncodingAttr", "file": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td", "responsibility": "巨型 builder 的输入：携带 opIdx（A=0/B=1）、kWidth、parent（AMDMfma/AMDWmma/NvidiaMma 目标 mma 编码）——swizzle 参数正是从它反推出来的。本章只作为反推输入引用，不展开（mma 布局深化见 ch27）。"}
+  ],
+
+  "data_flow": [
+    "1. 前序 pass 决定某张量要走 dot 操作数路径 → 构造 DotOperandEncodingAttr（携带 opIdx / kWidth / 目标 mma 父编码）。",
+    "2. SharedEncodingAttr::get(dotOpEnc, shape, order, CTALayout, typeWidthInBit[, needTrans])：按 dotOpEnc.getParent() 的类型分派 → AMDMfma / AMDWmma / NvidiaMma(Volta/Ampere/Hopper)。（TritonGPUAttrDefs.td:L274-L409）",
+    "3. 各分支用硬件常量（numBanks=32、bankBitWidth=32、SIMDWidth=16、matShape）+ 张量连续维尺寸/字节数，算出 (vec, perPhase, maxPhase)。K 维不在最内圈的分支直接返回 (1,1,1) 不 swizzle。",
+    "4. Hopper/MMAv3 走另一条 by-eltTy builder（TritonGPUAttrDefs.td:L430）：按连续维字节数落 128B/64B/32B 三档 → 钉死 (perPhase,maxPhase) 并置 hasLeadingOffset=true。",
+    "5. 得到的 SharedEncodingAttr 定义了 out[r][c] = in[r][ swizzle(r,c) ] 的存放规则；后续共享内存读写 lowering 据此计算物理偏移（swizzle 物理实现的 lowering 属 ch23 LinearLayout / 后续 codegen，本章不展开）。",
+    "6. SharedEncodingAttr::print 把它序列化成 `#shared<{...}>`，读者在 IR dump 里可见（Dialect.cpp:L1549）；parse 反序列化（Dialect.cpp:L1484）。"
+  ],
+
+  "design_decisions": [
+    {"decision": "用 xor（in[r][c]->out[r][c^phase]）而非加法/取模做 swizzle", "why": "xor 是自逆置换（swizzle 两次回到原位）、无进位、可用一条位运算在硬件地址计算里零开销完成；且能保证同一行内是一个排列（不冲突、不丢元素），把原本同列（同 bank）的一整列元素均匀打散到不同 bank。", "evidence": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L174-L175（out[r][c^r]）+ L227-L230（vec 版闭式 ((c/2)^r)*2+(c%2)）"},
+    {"decision": "swizzle 相位统一为 phase(r) = (⌊r/perPhase⌋) mod maxPhase，作用在 ⌊c/vec⌋ 组上", "why": "三个标量各司一职——vec=向量化搬运的不可拆粒度、perPhase=一个 bank 行能容纳的行数（这些行本就不冲突不必错开）、maxPhase=swizzle 图案的行周期。三者组合覆盖『元素多大、几行共相位、图案多久重复』三个自由度。", "evidence": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L215-L217 + L200-L201 + L185-L186（三例逐步加料给出统一公式）"},
+    {"decision": "swizzle 参数不由用户/前端指定，而由目标 mma 指令的访问模式在 builder 里反推", "why": "bank 冲突的模式取决于 mma 指令读共享内存操作数的 tile 形状（Ampere matShape={8,8,4*kWidth}、AMD SIMDWidth=16 等硬件常量）。参数拍脑袋会消不掉冲突甚至更糟——必须由下游消费者（mma 指令）的访问模式钉死。", "evidence": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L282-L408（MFMA/WMMA/Volta/Ampere 各自反推）+ L368 matShape 注释"},
+    {"decision": "K 维不在最内圈时直接 (vec,perPhase,maxPhase)=(1,1,1) 不 swizzle", "why": "若访问的连续维天然跨不同 bank，本就无冲突，swizzle 是纯浪费。这句注释是理解『swizzle 只为消 bank 冲突服务』的反证。", "evidence": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L306-L310（AMD）/ L328-L332（WMMA）注释：\"accesses will go in different banks even without swizzling\""},
+    {"decision": "Hopper/MMAv3 另起一条 by-eltTy builder 且 hasLeadingOffset=true", "why": "GMMA 用硬件 swizzle（按物理地址而非软件偏移），排布是固定的 128B/64B/32B 三档模式，且在 leading 维也带偏移；因此不走软件 swizzle 的 dotOperand 反推路径（那条对 Hopper llvm_unreachable）。", "evidence": "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L400-L405（Hopper unreachable）+ L442-L455（三档模式 + hasLeadingOffset=true）+ L232-L237（leading offset 语义）"},
+    {"decision": "shared 布局不实现 getElemsPerThread（直接 llvm_unreachable）", "why": "shared 与 distributed 是两套心智模型：distributed 关心『每线程持有几个元素』，shared 的元素归全体线程共享访问，这个问题无意义。这是本章与 ch21 分野的代码级证据。", "evidence": "lib/Dialect/TritonGPU/IR/Dialect.cpp:L947-L957"}
+  ],
+
+  "theory": [
+    "【bank 冲突为何串行化】共享内存按 32 个 bank 交错编址（一个 4B word 一个 bank，地址 a 落 bank (a/4)%32）；一个 warp 的 32 条并行访问若命中同一 bank 的不同地址，硬件只能拆成多拍串行完成（n-way 冲突 = n 倍延迟）。硬件原理一句回指 ch02，本章不重讲，只用其结论。",
+    "【为何 xor 能消冲突】设一个 warp 沿 order[0] 方向读一整列（列固定 c、行 r 变化）。未 swizzle 时它们物理列相同 → 落同一/少数 bank → 冲突。swizzle 后行 r 的列被映到 c^phase(r)，phase(r) 随 r 变化（取遍 0..maxPhase-1），于是同一逻辑列在不同行落到不同物理列 → 打散到 maxPhase 个不同 bank，冲突降为 1/maxPhase。手算五例（Python 逐位复现，与 .td 完全一致）即此机理的可验证佐证。",
+    "【统一 swizzle 公式（由五例归纳）】out[r][c] = in[r][ (⌊c/vec⌋ ⊕ ((⌊r/perPhase⌋) mod maxPhase))·vec + (c mod vec) ]。vec=1 时退化为 out[r][c]=in[r][ c ⊕ ((⌊r/perPhase⌋) mod maxPhase) ]（例 1-4）；vec=2 得例 5 闭式 ((c/2)⊕r)·2+(c%2)。",
+    "【参数反推的量纲直觉】以 AMD MFMA 为例：elemsPerOneBanksRow=(32 bank×32 bit)/typeBit=一轮 bank 能装的元素数；perPhase=max(1, 该数/innerDim)=一个 bank 行装得下几整行（这么多行本就不冲突，共用一相位）；vec=kWidth=向量搬运宽度；maxPhase=min(SIMDWidth/perPhase, innerDim/vec)=打散度不超过 SIMD 宽度也不超过可用组数。Ampere 侧 vec/maxPhase 直接来自 mma 指令 tile 的 matShape={8,8,4·kWidth}——参数量纲全部锚定在『目标 mma 指令一次读多大一块共享内存』上。",
+    "【与 ch21 distributed 的两条路径对照】ch21 distributed 编码优化的是寄存器/global 访存的合并（coalescing，每线程持有哪些元素）；本章 shared 编码优化的是共享内存的 bank 冲突（元素在 SRAM 里怎么摆）。同一张量在数据流不同阶段戴不同 encoding 帽子——寄存器路径 vs 共享内存路径，两套独立心智模型。（layout=function 的总观见 ch20，回指不重讲。）"
+  ],
+
+  "subtraction_plan": {
+    "note": "本章 kind=skip_impl（cartography 标注 mode=meta / kind=skip_impl）：MLIR TableGen 的 .td 与 C++ Dialect.cpp 无法做同名同结构的 Python 只删不增精简版，交叉验证由 explainer 走 pin 精确编译 + .td 五例手算逐位复现承担。故不产精简版；subtraction_plan 仅登记 writer 内嵌真源码时必须保留、不得删改的符号。",
+    "delete": [],
+    "must_keep": [
+      {"symbol": "SharedEncodingAttr", "why": "本章第一主角，内嵌 .td 定义逐段讲必现。"},
+      {"symbol": "vec", "why": "swizzle 三标量之一：向量化搬运的不可拆粒度，例 5 引入，writer 须讲清。"},
+      {"symbol": "perPhase", "why": "swizzle 三标量之一：几行共用一个 phase，例 2 引入。"},
+      {"symbol": "maxPhase", "why": "swizzle 三标量之一：swizzle 图案的行周期/xor 上界，例 3 引入。"},
+      {"symbol": "order", "why": "最快变化轴在前，决定沿哪个维度看 bank 冲突（K 维是否最内圈直接决定要不要 swizzle）。"},
+      {"symbol": "hasLeadingOffset", "why": "第六字段，MMAv3/Hopper GMMA 硬件 swizzle 开关，例 5 末尾 + L430 builder 讲。"},
+      {"symbol": "CTALayoutAttr", "why": "第五字段，Hopper CGA 跨 CTA 切分/multicast，次要论点须点到。"},
+      {"symbol": "CTAsPerCGA", "why": "CGA 里 CTA 数，与 CTASplitNum 对比讲 multicast。"},
+      {"symbol": "CTASplitNum", "why": "张量切几片，multicast 的判据（<CTAsPerCGA 即广播）。"},
+      {"symbol": "getElemsPerThread", "why": "shared 对它 llvm_unreachable——与 distributed 分野的代码证据，writer 须引。"},
+      {"symbol": "DotOperandEncodingAttr", "why": "巨型 builder 的输入载体，反推 swizzle 参数的信息来源。"},
+      {"symbol": "getKWidth", "why": "vec/perPhase 反推的关键输入（一次搬多少连续元素），MFMA/Ampere 分支都用。"},
+      {"symbol": "isVolta", "why": "NVIDIA mma 版本分派之一，示范同骨架不同特化。"},
+      {"symbol": "isAmpere", "why": "反推最清晰的样本（matShape={8,8,4*kWidth} 钉死 vec/maxPhase），第 3 论点主证。"},
+      {"symbol": "isHopper", "why": "走 llvm_unreachable → 改由 by-eltTy builder，解释 Hopper 参数为何不在 if 链里。"},
+      {"symbol": "matShape", "why": "Ampere 分支里目标 mma 指令的 M/N/K tile 形状，swizzle 参数被 mma 钉死的字面证据。"},
+      {"symbol": "numBanks", "why": "硬件常量 32，perPhase 反推分子；连接 bank 冲突原理与参数计算。"},
+      {"symbol": "SIMDWidth", "why": "AMD 分支 maxPhase 封顶来源，量纲锚定在硬件访问宽度。"}
+    ]
+  },
+
+  "mechanisms": [
+    {"id": "shared-encoding-fields", "name": "SharedEncodingAttr 五（六）字段 schema", "kind": "layout", "source_anchors": ["include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L240-L250", "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L155-L161"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "xor-swizzle-core", "name": "xor swizzle 命门：out[r][c]=in[r][c^phase] 如何打散同 bank 访问", "kind": "algorithm", "source_anchors": ["include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L166-L175"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "swizzle-five-examples", "name": "五个逐步加料例子归纳统一相位公式 phase=(r/perPhase)%maxPhase、作用于 c/vec 组", "kind": "algorithm", "source_anchors": ["include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L177-L231"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "bank-conflict-recap", "name": "bank 冲突为何使并行访问串行化（回指 ch02，只用结论）", "kind": "config", "source_anchors": ["include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L163-L164", "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L306-L310"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "mma-driven-derivation", "name": "dotOperand+mma 巨型 builder：swizzle 参数被目标 mma 指令访问模式反推钉死", "kind": "algorithm", "source_anchors": ["include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L274-L409"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "mfma-param-derivation", "name": "AMD MFMA 分支参数反推（numBanks/bankBitWidth/SIMDWidth → perPhase/vec/maxPhase）", "kind": "algorithm", "source_anchors": ["include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L282-L311"], "needs_figure": false, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "ampere-param-derivation", "name": "Ampere 分支：matShape={8,8,4*kWidth} 钉死 vec 与 maxPhase(=mmaStride/perPhase)", "kind": "algorithm", "source_anchors": ["include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L364-L398"], "needs_figure": false, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "hopper-mmav3-swizzle", "name": "Hopper/MMAv3 走 by-eltTy builder：128B/64B/32B 三档 + hasLeadingOffset=true", "kind": "config", "source_anchors": ["include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L400-L405", "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L430-L456", "include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L232-L237"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "ctalayout-multicast", "name": "CTALayoutAttr：CTAsPerCGA/CTASplitNum/CTAOrder 描述 Hopper CGA 跨 CTA 切分与 multicast", "kind": "layout", "source_anchors": ["include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L67-L105"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "shared-vs-distributed", "name": "两套心智模型分野：shared 不实现 getElemsPerThread（回指 ch21）", "kind": "dataflow", "source_anchors": ["lib/Dialect/TritonGPU/IR/Dialect.cpp:L947-L957"], "needs_figure": false, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "shared-parse-print", "name": "SharedEncodingAttr parse/print：读者在 IR dump 里看到的 #shared<{...}> 文本形态", "kind": "protocol", "source_anchors": ["lib/Dialect/TritonGPU/IR/Dialect.cpp:L1484-L1547", "lib/Dialect/TritonGPU/IR/Dialect.cpp:L1549-L1558"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"}
+  ],
+
+  "foreshadow_due": {"应埋伏笔": [], "应回收": [], "note": "bible.py due ch22 返回空（无登记的应埋/应回收项）。本章可主动登记的对照钩子：shared↔distributed 两套心智模型（回指 ch21）、layout=function 总观（回指 ch20）、mma 布局深化（前指 ch27）、swizzle 物理 lowering / LinearLayout（前指 ch23）；bank 冲突硬件原理回指 ch02。"}
+}
