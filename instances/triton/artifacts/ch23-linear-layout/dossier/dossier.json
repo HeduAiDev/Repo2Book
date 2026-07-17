@@ -1,0 +1,475 @@
+{
+  "kind": "primer",
+  "chapter": "ch23",
+  "title": "LinearLayout：一个抽象统一所有布局",
+  "one_line": "把 ch20 的布局函数 𝓛 揭示为 GF(2) 上的线性映射——一组基向量 + 异或线性律即可完整表示任意布局，复合/求逆退化成比特矩阵的 RREF，消除 N² 种成对布局转换代码（回收伏笔 f17）。",
+  "code_spine": [
+    "include/triton/Tools/LinearLayout.h:L18-L104  —— 头注释『高层总览』：LL=硬件位置→逻辑索引的函数、key fact、4×4 swizzle 例、xor 线性律、消除特殊情况",
+    "include/triton/Tools/LinearLayout.h:L106-L148  —— 头注释『布局例子』：1D 恒等/1D 零/2D 恒等/2D transpose/1D transpose/2D→1D broadcast 的 bases",
+    "include/triton/Tools/LinearLayout.h:L150-L181  —— 头注释『实现说明』：维序、满射/单射性、为何方向是硬件→逻辑（保证是函数）",
+    "include/triton/Tools/LinearLayout.h:L183-L277  —— 头注释『GF(2) 数学背景』：线性函数=Ba、GF(2) 加=xor/乘=and、比特矩阵-向量乘的紧凑写法、高维摞成 1D 的 1D 线性律",
+    "include/triton/Tools/LinearLayout.h:L313-L323  —— LinearLayout 类：bases[inDim][i]=L(…2^i…) 字段定义",
+    "include/triton/Tools/LinearLayout.h:L620-L672  —— compose / invertAndCompose 契约注释（O∘L、B⁻¹∘A、R/S 寄存器→shmem 例）",
+    "lib/Tools/LinearLayout.cpp:L65-L113  —— getMatrix：把布局压成 sum(outLog2)×sum(inLog2) 比特矩阵，每列一个 base",
+    "lib/Tools/LinearLayout.cpp:L115-L160  —— getInjectiveMat（补零列扩成单射）/ getMatrixRank（RREF 后数非零行=秩）+ 第一处 f2reduce 调用（:151）",
+    "lib/Tools/LinearLayout.cpp:L813-L841  —— compose 实现：把 this 的每个 base 喂给 outer.apply 求值 → 新 bases（比特矩阵相乘）",
+    "lib/Tools/LinearLayout.cpp:L843-L923  —— invertAndCompose：matOuter|matThis 横向拼接 → f2reduce RREF（:912）→ 左半单位阵=对 outer 求逆、右半=复合 bases",
+    "third_party/f2reduce/f2reduce.h:L7-L24  —— inplace_rref_strided 签名 + little-endian 位打包语义",
+    "third_party/f2reduce/README.md:L1-L29  —— f2reduce = GF(2) RREF 库；逐字点名 Kronrod『method of four Russians』；小/宽/低秩矩阵更快",
+    "include/triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h:L1-L45  —— toLinearLayout(shape, layout)：把 Blocked/Shared 等 Triton 布局『统一』转成一个 LinearLayout 的落地入口"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "include/triton/Tools/LinearLayout.h",
+      "lines": "L18-L34",
+      "code": "// # High-level overview of linear layouts\n//\n// The idea for linear layouts is due to Adam P. Goucher.\n//\n// In Triton, a linear layout (LL) is a function that maps from a \"hardware\n// location\" to a \"logical tensor index\".\n//\n// For example, suppose we have a 2D tensor T stored in GPU registers.  T's\n// layout (i.e., L) is the function that, given a \"hardware location\" tuple of\n// (thread-id, warp-id), returns an index (x,y) into T.  In other words, if\n// L(t,w) = (x,y) is our linear layout func, then a register in thread t in warp\n// w contains the value T[x,y].\n//\n// The key fact about LLs is, the mapping from (t,w) to (x,y) is not arbitrary.\n// We only need to specify the value of L(t,w) at certain special points\n// (namely, the values L(t,0) and L(0,w) where t and w are powers of 2), and\n// from those we can compute all the other values of L.",
+      "note": "开篇双锚：(1) LL 相对 ch20 的 𝓛 换了方向——硬件位置→逻辑索引；(2) key fact——只需给出 2 的幂次输入上的取值。这是全章立论的两句话。想法归功 Adam P. Goucher（:20 逐字）。"
+    },
+    {
+      "path": "include/triton/Tools/LinearLayout.h",
+      "lines": "L36-L74",
+      "code": "// Here's an example LL where we have 4 warps and 4 threads per warp, and the\n// tensor T has shape 4x4.  We define the function L by choosing the values of\n// L(0,1), L(0,2), L(1,0), and L(2,0).  Our choices are shown below.\n//\n//               t/w    0     1     2    3\n//               0      ? (0,1) (0,2)    ?\n//    L(t,w) =   1  (1,1)     ?     ?    ?\n//               2  (2,2)     ?     ?    ?\n//               3      ?     ?     ?    ?\n//\n// You only need to specify these four values to define the whole linear layout.\n// These special values are called the \"basis vectors\" or \"bases\" of the layout.\n// We complete the table by xor'ing together the bases, according to the\n// following rule.  (I write \"\\u2295\" for xor.)\n//\n//    L(t1 \\u2295 t2, w1 \\u2295 w2) = L(t1, w1) \\u2295 L(t2, w2)  (linearity rule).\n//\n// The linearity rule plus our four choices allows us to fill in the whole\n// table.  Here's how we might compute some of the values.\n//\n//    L(0,0) = L(1 \\u2295 1, 0 \\u2295 0) = L(1,0) \\u2295 L(1,0) = (1,1) \\u2295 (1,1) = (0,0)\n//    L(0,3) = L(0 \\u2295 0, 2 \\u2295 1) = L(0,2) \\u2295 L(0,1) = (0,2) \\u2295 (0,1) = (0,3)\n//    L(3,0) = L(2 \\u2295 1, 0 \\u2295 0) = L(2,0) \\u2295 L(1,0) = (2,2) \\u2295 (1,1) = (3,3)\n//    L(3,3) = L(3 \\u2295 0, 0 \\u2295 3) = L(3,0) \\u2295 L(0,3) = (3,3) \\u2295 (0,3) = (3,0).\n//\n// (Notice it's a consequence of the linearity rule that L(0,0) = (0,0), no\n// matter what values we chose for the table.)\n//\n// The whole table looks like this.\n//\n//              t/w   0     1     2     3\n//              0  (0,0) (0,1) (0,2) (0,3)\n//    L(t,w) =  1  (1,1) (1,0) (1,3) (1,2)\n//              2  (2,2) (2,3) (2,0) (2,1)\n//              3  (3,3) (3,2) (3,1) (3,0).\n//\n// Careful readers will recognize this as a classic \"swizzled\" layout where\n// (t, w) -> (t, w \\u2295 t).  To go from this formula to an LL, you only need to\n// compute the results at input points (0,1), (0,2), (1,0), and (2,0).",
+      "note": "本章的『核心顿悟抓手』——4×4 swizzle 亲手填表。读者应拿笔逐位异或验算 L(0,0)/L(0,3)/L(3,0)/L(3,3) 四格，再填满 16 格，最后认出这就是经典 swizzle (t,w)↦(t,w⊕t)。源码里 ⊕ 就是 xor（此处 \\u2295 是 UTF-8 ⊕ 符号的转义，源码里是字面 ⊕）。这一段逐字对应 fig-4x4-swizzle-fill。",
+      "elide": [
+        "无——这 39 行是本章第一张顿悟图的逐字底稿，一字不省。"
+      ]
+    },
+    {
+      "path": "include/triton/Tools/LinearLayout.h",
+      "lines": "L76-L85",
+      "code": "// Indeed the whole point of LLs is that they allow us to specify transposed and\n// swizzled layouts as a \"general case\".  Instead of a layout class for\n// registers in a thread, and another layout for registers in a thread but in\n// MMAv2 order, and so on, all of these can be represented by different LLs.\n// This gets rid of special cases and lets us write more general code.\n//\n// In this example, L was a 2D -> 2D function, but LLs are general MD -> ND\n// functions.  In practice, a GPU register layout usually has input dims (reg,\n// thread-id, warp-id, block-id), where reg represents the fact that one thread\n// may store values for the tensor in multiple registers.",
+      "note": "动机的核心句（§1、§7 均引）——LL 把 transpose/swizzle 表示成『一般情况』，消掉每种排布一个布局类的特殊情况。并给出真实 GPU 寄存器布局的四元组输入维 (reg, thread-id, warp-id, block-id)。"
+    },
+    {
+      "path": "include/triton/Tools/LinearLayout.h",
+      "lines": "L106-L148",
+      "code": "// # Examples of linear layouts\n//\n// 1. The 1D identity layout.  This maps L(x) = x.\n//\n//    Recall that our bases are the values of L(x) where x is a power of two.\n//    So for e.g. an 8-element layout, we have L(1) = 1, L(2) = 2, L(4) = 4, and\n//    therefore our bases are [1, 2, 4].\n//\n// 2. The 1D zeros layout.  This maps L(x) = 0.\n//\n//    For an 8-element layout, we have L(1) = L(2) = L(4) = 0, so our bases are\n//    [0, 0, 0].\n//\n// 3. A 2D -> 2D identity layout.  Our basis vectors are the values of L(x,0)\n//    and L(0,y) where x and y are powers of two.  The bases are\n//\n//    - L(0,1) = (0,1)\n//    - L(0,2) = (0,2)\n//    - L(1,0) = (1,0)\n//    - L(2,0) = (2,0).\n//\n// 4. A 2D -> 2D transpose layout.  For a 4x4 layout, we have:\n//\n//    - L(0,1) = (1,0)\n//    - L(0,2) = (2,0)\n//    - L(1,0) = (0,1)\n//    - L(2,0) = (0,2).\n//\n// 5. A 1D -> 1D \"transpose\" layout.  Consider the 16-element layout that maps\n//\n//    x    = 0 1 2 3 4 5 6 7 8 9 A B C D E F\n//    L(x) = 0 4 8 C 1 5 9 D 2 6 A E 3 7 B F.\n//\n//    The bases are [L(1), L(2), L(4), L(8)] = [4, 8, 1, 2].  You can also think\n//    of this as a rearrangement of the 1D identity layout [1, 2, 4, 8].\n//\n// 6. A 2D -> 1D broadcasted layout.  L(x,y) = x.  For a 4x4 -> 4 layout, our\n//    bases are\n//\n//    - L(0,1) = 0\n//    - L(0,2) = 0\n//    - L(1,0) = 1\n//    - L(2,0) = 2.",
+      "note": "『换一组 bases = 换一种布局』的六个逐字例子——支撑 fig-bases-xor-linear：transpose（例4）= 对调每个 base 的两分量；broadcast（例6）= 把某维 base 全置 0 把该维压扁。过去要写专门代码的布局操作，在 LL 里只是换 bases。"
+    },
+    {
+      "path": "include/triton/Tools/LinearLayout.h",
+      "lines": "L164-L181",
+      "code": "// LLs are not, in general, injective.  There might exist multiple input values\n// that map to the same output value.  This represents the idea that the same\n// logical tensor elements can be stored in multiple places in the hardware.\n//\n// ## Why map hardware loc -> tensor index and not the other way around?\n//\n// In Triton, a linear layout usually tells us which logical tensor value is\n// stored at a particular place in the hardware.  For example, an LL might map\n// the tuple (thread-id, warp-id, block-id) to a 2D index into a tensor, (x,y),\n// meaning that the register at (t,w,b) has value tensor[x,y].  Or it might map\n// from a shared memory (offset, block) to a tensor index.\n//\n// It might seem more natural to go the other way around, from tensor index to\n// place in the hardware.  But a particular tensor[x,y] value might be stored in\n// more than one place in the hardware, so if we went in this direction, the\n// layout would no longer be a proper function.  This would complicate\n// everything else.",
+      "note": "回答 §2 的关键设计问：为何方向选『硬件→逻辑』而非反过来——因为同一个 tensor[x,y] 可能存在硬件多处，反向就不再是函数（一输入多输出）。代价：LL 一般非单射（多硬件位置映同一逻辑元素=同一元素存多份）。"
+    },
+    {
+      "path": "include/triton/Tools/LinearLayout.h",
+      "lines": "L214-L266",
+      "code": "// Usually when we do linear algebra, the field \\U0001D53D from which `ai` and `bij` are\n// drawn is the real or complex numbers.  But in linear layouts, we let\t\\U0001D53D be a\n// different field: GF(2).\n//\n// GF(2) is the two-element field of bits.  To define a field, I need to give\n// you the set of elements and also addition and multiplication operations.  For\n// GF(2) the elements are simply {0,1}.  We define addition as xor, and\n// multiplication as binary `and`.\n//\n// Here's an example of a 4x4 matrix-vector multiply where the elements are in\n// GF(2).  I'm using \\u2295 to represent GF(2)'s addition operation (i.e xor) and \\u00d7\n// to represent multiplication (i.e. binary `and`).\n//\n//    | 1 0 0 0 | | 0 |     | 1 |         | 0 |         | 0 |         | 0 |\n//    | 0 1 1 0 | | 1 |  =  | 0 | \\u00d7 0  \\u2295  | 1 | \\u00d7 1  \\u2295  | 1 | \\u00d7 1  \\u2295  | 0 | \\u00d7 0\n//    | 0 0 1 1 | | 1 |     | 0 |         | 0 |         | 1 |         | 1 |\n//    | 0 0 1 1 | | 0 |     | 0 |         | 0 |         | 1 |         | 1 |\n//\n// This works, but it's cumbersome.  It's more compact to think of the vector\n// `a` as an M-bit integer, and each column Bi of the matrix B as an N-bit\n// integer.  Here's the same matrix-vector product written this way.\n//\n//   = | 1 2 14 12 | \\u00d7 6\n//   = | 1 2 14 12 | \\u00d7 0b0110\n//   = (1 \\u00d7 0) \\u2295 (2 \\u00d7 1) \\u2295 (14 \\u00d7 1) \\u2295 (12 \\u00d7 0)\n//   = 2 \\u2295 14\n//   = 12.\n//\n// Notice that the function F(a) is fully specified by the matrix B, and that\n// the four columns of B tell us the values of F at power-of-two values for `a`,\n// namely F(1), F(2), F(4), and F(8).  In other words, we specify four results\n// of F(x) (we call these the function's \"basis vectors\" or its \"bases\") and we\n// can then compute any other value by xor'ing together subsets of the bases.\n//\n// In the case of a 1D -> 1D layout, the implementation of an LL is\n// straightforward from the mathematical description.  If the LL is\n// higher-dimensional, we can \"stack\" the bit vectors to create 1D vectors.",
+      "note": "GF(2) 数学背景逐字（fig-bases-xor-linear 的代数底稿）：域 𝔽 取 GF(2)={0,1}、加=xor、乘=and；比特矩阵-向量乘的紧凑写法（列当 N-bit 整数、按输入 1-bit 挑列全部异或）；点明 bases = F 在 2 幂次点 F(1),F(2),F(4),F(8) 的取值。\\U0001D53D 是数学粗体 F 字符、\\u2295=⊕、\\u00d7=×（源码为字面 UTF-8）。此段解释『xor 线性律不是巧合，是 GF(2) 上线性的直接后果』。"
+    },
+    {
+      "path": "include/triton/Tools/LinearLayout.h",
+      "lines": "L268-L277",
+      "code": "// The linearity rule presented earlier is perhaps misleading at this point.  In\n// the 1D view of things, we really only need\n//\n//    L(x \\u2295 y) = L(x) \\u2295 L(y)  (1D linearity rule),\n//\n// which is part of the definition of L being a linear function.  The new 1D\n// linearity rule plus stacking/unstacking is equivalent to the earlier\n// N-dimensional linearity rule.\n//\n// That's all we need in order to define linear layouts mathematically!",
+      "note": "高维摞成 1D 后，N 维线性律退化成最朴素的 L(x⊕y)=L(x)⊕L(y)。这是 GF(2) 线性性的定义本身——收束『定义 LL 需要的数学就这些』。"
+    },
+    {
+      "path": "include/triton/Tools/LinearLayout.h",
+      "lines": "L314-L320",
+      "code": "  // bases[inDim][i] = L(0, ..., inDim=2^i, ..., 0).  All other values of L are\n  // computed by xor'ing bases together, using the linearity rule.  In addition:\n  //\n  // - Each inDim has the same set of outDims, in the same order.\n  // - The order of dims is minor-to-major, although this only affects reshape.\n  llvm::MapVector<StringAttr /*inDim*/,\n                  std::vector<std::vector<int32_t> /*size=getNumOutDims()*/>",
+      "note": "LinearLayout 类真实数据结构：bases 就是『每个 inDim 在其 2^i 幂次点上的 L 值』的列表；其余全靠 xor 补全。这是把『抽象数学』落成一个 MapVector 字段的落地锚——一个布局=一小组基向量。"
+    },
+    {
+      "path": "include/triton/Tools/LinearLayout.h",
+      "lines": "L620-L643",
+      "code": "  // Creates a new layout which is equivalent to running this layout, then\n  // running `outer`.  That is,\n  //\n  //  - let this layout be L(x), and\n  //  - let `outer` be O(x).\n  //  - Then compose(outer) returns the layout (O\\u2218L)(x), aka O(L(x)).\n  //\n  // ...\n  //\n  [[nodiscard]] LinearLayout compose(const LinearLayout &outer) const;\n\n  // Inverts or pseudo-inverts `outer` and composes it with `this`.\n  //\n  // Formally, if C = A.invertAndCompose(B), then for all x, C(x) = y implies\n  // A(x) = B(y), or in other words A(x) = B(C(x)).  If B is invertible, then\n  // C(x) = B^-1(A(x)), which is how this function gets its name.\n  //\n  //   - R is an LL representing registers, mapping (lane, warp) to a 2D index.\n  //   - S is an LL representing shared memory, mapping offset to a 2D index.\n  //   ...\n  //   R.invertAndCompose(S) computes this transformation.",
+      "note": "compose / invertAndCompose 的契约（\\u2218=∘ 函数复合符号；此处对 :620-672 的长注释做了省略摘录，用 // ... 标出省略）。compose = O∘L；invertAndCompose = 若 B 可逆则 C=B⁻¹∘A。给出典型用途 R.invertAndCompose(S)：寄存器→shared memory 的布局转换。",
+      "elide": [
+        "Requires/Postcondition 条款（:627-635）与 R/S 例的完整推理（:650-671）——摘录保留契约公式 O∘L、B⁻¹(A(x)) 与 R/S 命名由来，省略前置条件细节。"
+      ]
+    },
+    {
+      "path": "lib/Tools/LinearLayout.cpp",
+      "lines": "L65-L113",
+      "code": "// Build a matrix of size sum(outDimSizeLog2) x sum(inDimSizeLog2) representing\n// the bases of the given layout.  This can then be used by f2reduce.\n//\n// This function is called from the constructor of LinearLayout, so be careful\n// not to use any functions that create LLs in here.\nstd::unique_ptr<uint64_t[]> getMatrix(const LinearLayout &layout) {\n  int numRows = layout.getTotalOutDimSizeLog2();\n  int numCols = layout.getTotalInDimSizeLog2();\n\n  // Don't handle giant LLs.  This makes some things easier; for example, each\n  // row can be a single uint64_t.\n  assert(numCols <= 64 && \"LinearLayout too large\");\n  assert(numRows <= 64 && \"LinearLayout too large\");\n\n  // Suppose we have a layout specified by the following values.\n  //\n  //   L(0,1) = (0b01, 0b1)\n  //   L(0,2) = (0b10, 0b0)\n  //   L(1,0) = (0b10, 0b0)\n  //   L(2,0) = (0b11, 0b0)\n  //\n  // We will create one column per entry above.  The max bit width of the\n  // codomain is (2,1), so our matrix will have 2+1=3 rows.  The final matrix\n  // will be\n  //\n  //  | L(0,1)[0] L(0,2)[0] L(1,0)[0] L(2,0)[0] |   | 0b1001 |\n  //  |    \\u2193         \\u2193         \\u2193         \\u2193      |   | 0b0111 |\n  //  | L(0,1)[1] L(0,2)[1] L(1,0)[1] L(2,0)[1] | = | 0b1000 |\n  //  |    \\u2193         \\u2193         \\u2193         \\u2193      |\n  //\n  std::unique_ptr<uint64_t[]> m(new uint64_t[numRows]());\n  int r = 0;\n  for (StringAttr outDim : layout.getOutDimNames()) {\n    int c = 0;\n    for (StringAttr inDim : layout.getInDimNames()) {\n      for (int i = 0; i < layout.getInDimSizeLog2(inDim); i++) {\n        uint64_t basis = layout.getBasis(inDim, i, outDim);\n        for (int j = 0; j < layout.getOutDimSizeLog2(outDim); j++) {\n          m[r + j] |= ((basis >> j) & 1) << c;\n        }\n        c++;\n      }\n    }\n    r += layout.getOutDimSizeLog2(outDim);\n  }\n\n  return m;\n}",
+      "note": "getMatrix 把一个 LinearLayout 压成 sum(outLog2)×sum(inLog2) 比特矩阵，每列一个 base——正是 fig-compose-invert-rref 上半的 3×4 逐列例。注释里的 L(0,1)/L(0,2)/L(1,0)/L(2,0) → 0b1001/0b0111/0b1000 是可核对的填矩阵演算。每行打包进一个 uint64_t，故 assert(numCols<=64)——LL 不处理 >64 bit 布局。\\u2193=↓（源码字面）。",
+      "elide": [
+        "'Note new uint64_t[n]() is zero-initialized...' 一行内存初始化提示（:95）省略，不影响算法。"
+      ]
+    },
+    {
+      "path": "lib/Tools/LinearLayout.cpp",
+      "lines": "L139-L159",
+      "code": "// Compute the rank of the matrix formed by taking the bases for the given\n// outDim as columns.  In other words, finds the number of linearly-independent\n// bases for this output dimension.\nint getMatrixRank(std::unique_ptr<uint64_t[]> m, int numRows, int numCols) {\n  // f2reduce underflows if the number of cols is 0, return the rank early in\n  // this case.\n  if (numCols == 0) {\n    return 0;\n  }\n  // stride is specified in number of 64-bit words per row, and we pack our\n  // matrix so that there's only one uint64_t per row.\n  assert(numCols <= 64);\n  f2reduce::inplace_rref_strided(m.get(), numRows, numCols, /*stride=*/1);\n\n  // The rank of the reduced matrix is simply the number of nonzero rows.\n  int rank = 0;\n  for (int i = 0; i < numRows; i++) {\n    if (m[i] != 0)\n      rank++;\n  }\n  return rank;\n}",
+      "note": "getMatrixRank：把布局的比特矩阵 RREF 后数非零行=秩（判断布局是否满射/可逆）。第一处 f2reduce::inplace_rref_strided 调用（:151）。展示『求秩这种问题也归到同一个 GF(2) RREF 调用』。"
+    },
+    {
+      "path": "lib/Tools/LinearLayout.cpp",
+      "lines": "L813-L841",
+      "code": "LinearLayout LinearLayout::compose(const LinearLayout &outer) const {\n  assertDimsEqualIgnoringOrder(getOutDimNames(), outer.getInDimNames());\n  for (StringAttr outDim : getOutDimNames()) {\n    assert(getOutDimSize(outDim) <= outer.getInDimSize(outDim));\n  }\n\n  BasesT newBases;\n  for (const auto &[inDim, inDimBases] : bases) {\n    auto &newInDimBases = newBases[inDim];\n    for (const auto &basis : inDimBases) {\n      SmallVector<std::pair<StringAttr, int32_t>> bases;\n      for (auto [outDim, b] : llvm::zip(getOutDimNames(), basis)) {\n        bases.push_back({outDim, b});\n      }\n      auto newBases = outer.apply(bases);\n      auto newBasesRange = llvm::make_second_range(newBases);\n      newInDimBases.push_back(\n          std::vector<int32_t>(newBasesRange.begin(), newBasesRange.end()));\n    }\n  }\n\n  bool compositionIsSurjective =\n      isSurjective() && outer.isSurjective() &&\n      llvm::all_of(getOutDimNames(), [&](StringAttr outDim) {\n        return getOutDimSize(outDim) == outer.getInDimSize(outDim);\n      });\n  return LinearLayout(std::move(newBases), llvm::to_vector(outer.outDims),\n                      compositionIsSurjective);\n}",
+      "note": "compose 实现印证『复合=比特矩阵相乘』的操作性含义：因为线性，只需把 this 的每个 base 喂给 outer.apply 求值，得到的就是复合后的新 base（无需枚举全部输入）。这正是『基向量足以定义整个映射』的复用。"
+    },
+    {
+      "path": "lib/Tools/LinearLayout.cpp",
+      "lines": "L887-L923",
+      "code": "  auto [matThis, numRowsThis, numColsThis] = getInjectiveMat(*this);\n  auto [matOuter, numRowsOuter, numColsOuter] = getInjectiveMat(\n      outer.transposeOuts(llvm::to_vector(this->getOutDimNames())));\n\n  // Concatenate `matOuter` and `matThis` horizontally (i.e. `matThis`\n  // is to the right of `matOuter`).\n  int combinedNumRows = std::max(numRowsThis, numRowsOuter);\n  int combinedNumCols = numColsThis + numColsOuter;\n  assert(combinedNumCols <= 64 && \"Can't handle huge layouts\");\n\n  std::unique_ptr<uint64_t[]> m(new uint64_t[combinedNumRows]());\n  for (int r = 0; r < numRowsOuter; r++) {\n    m[r] = matOuter[r];\n  }\n  for (int r = 0; r < numRowsThis; r++) {\n    m[r] |= matThis[r] << numColsOuter;\n  }\n\n  // Perform Gaussian elimination on `m`.  Because `outer` was modified to\n  // be bijective, the first half of the matrix should be the identity\n  // matrix.  The remaining half are the bases for the combined\n  // transformation.\n  //\n  // `stride` is specified in number of 64-bit words per row, and we pack\n  // our matrix so that there's only one uint64_t per row.\n  f2reduce::inplace_rref_strided(m.get(), combinedNumRows, combinedNumCols,\n                                 /*stride=*/1);\n\n  // Check that the first half of the matrix is indeed the identity.\n  for (int r = 0; r < std::min(numRowsOuter, numColsOuter); r++) {\n    for (int c = 0; c < std::min(numColsOuter, numRowsOuter); c++) {\n      if (((m[r] >> c) & 1) != (r == c ? 1 : 0)) {\n        llvm::report_fatal_error(\"First half of the matrix was not the \"\n                                 \"identity, bug in invertAndCompose\");\n      }\n    }\n  }",
+      "note": "invertAndCompose 的核心——fig-compose-invert-rref 下半的逐字底稿：matOuter|matThis 横向拼接 → f2reduce RREF（第二处调用 :912）→ RREF 把左半化成单位阵（=对 outer 求逆）、右半自动变成复合后的 bases。末尾的断言正是『左半必为单位阵』的运行期校验。布局代数的全部重活（复合/求逆/求秩）最终都归到这一个 GF(2) RREF 调用。",
+      "elide": [
+        "invertAndCompose 开头的长注释（:850-886，解释为何把 this 也扩成单射=不跨 block 的选择偏好）——摘录从实际拼接矩阵的代码起，此段属实现取舍、非主线，正文可一句带过。"
+      ]
+    },
+    {
+      "path": "third_party/f2reduce/f2reduce.h",
+      "lines": "L7-L24",
+      "code": "/**\n * Converts a matrix over F_2 into row-reduced echelon form.\n *\n * The matrix should be in row-major format. The stride parameter specifies\n * the offset (in 64-bit words, *not* bytes!) between successive rows of the\n * matrix, and should obey the inequality:\n *\n *     64 |stride| >= cols\n *\n * We adopt 'little-endian' semantics: the element in row i and column j+64*k\n * of the matrix (zero-indexed) is given by (matrix[i * stride + k] >> j) & 1.\n *\n * The matrix is overwritten in place with its row-reduced echelon form.\n */\nvoid inplace_rref_strided(uint64_t *matrix, uint64_t rows, uint64_t cols, uint64_t stride);",
+      "note": "f2reduce 唯一函数签名：把 F₂ 上矩阵原地化成 RREF。little-endian 位打包语义（第 i 行第 j 列 = (matrix[i*stride+k]>>j)&1）——正好匹配 getMatrix 每行一个 uint64_t 的打包方式。布局代数的引擎就是这一个函数。"
+    },
+    {
+      "path": "third_party/f2reduce/README.md",
+      "lines": "L1-L25",
+      "code": "f2reduce: a MIT-licenced library for Gaussian elimination over GF(2)\n====================================================================\n\nThis is a very lightweight implementation for converting a binary matrix\nto row reduced echelon form. It incorporates the following optimisations:\n\n - Kronrod's algorithm ('method of four Russians');\n - Designed to properly autovectorise in both GCC and LLVM;\n ...\n\nFor simplicity, we do not use Strassen, so our performance is overtaken by\n[M4RI][1] whenever the matrices are large and have full column rank.\n\nFor all other cases, we have several advantages over M4RI:\n\n - Substantially better performance on small, wide, or low-rank matrices;",
+      "note": "§6 背景盒逐字实锤：f2reduce 是仓库内 GF(2) RREF 库，逐字点名『Kronrod's algorithm (method of four Russians)』（:7）。它不用 Strassen，大满秩会被 M4RI 反超，但在小/宽/低秩矩阵上更快——而 LL 的比特矩阵 ≤64 列正好命中这个强项。（此处以 // ... 省略中间的自动向量化等次要优化项。）",
+      "elide": [
+        ":8-16 的其它优化项（autovectorise/cache-align/ILP/AVX512）——摘录保留 Four Russians 出身与『小/宽/低秩更快』这两句本章要用的，省略工程细节。"
+      ]
+    },
+    {
+      "path": "include/triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h",
+      "lines": "L1-L45",
+      "code": "// Conversions from TritonGPU layouts (e.g. BlockedEncodingAttr) to\n// LinearLayout.\n//\n// - BlockedEncodingAttrs have the following input dimensions.\n//\n//   \"register\": elements in one thread\n//   \"lane\": threads in a warp\n//   \"warp\": warps in a block/CTA\n//   \"block\": blocks in a cluster\n//\n// - An n-dimensional SharedEncodingAttr has the following input dimensions.\n//\n//   \"offset\": the n'th element in the allocation, within a particular thread\n//      block (i.e. within a CTA)...\n//   \"block\": blocks in a cluster\n//\n// Returns std::nullopt if the given layout can't be converted to an LL.\n// TODO(jlebar): Remove the std::optional once all layouts are supported.\n//\nstd::optional<LinearLayout>\ntoLinearLayout(ArrayRef<int64_t> shape, Attribute layout,\n               std::optional<int32_t> elemBitWidth = std::nullopt);",
+      "note": "§7『统一』的落地实锤：toLinearLayout(shape, layout) 是把 Blocked/Shared 等各式 Triton 布局『统一』折叠成同一个 LinearLayout 的入口——这是 ch21/ch22 的具体布局形态被 LinearLayout 收编的真实代码接口（本章只回指，不重讲其形态）。std::optional + TODO 说明迁移仍在进行、意图是最终移除旧布局类。",
+      "elide": [
+        "SharedEncodingAttr offset 说明的细节 + 输出维 dimi 说明（:24-45）——摘录保留输入维命名与 toLinearLayout 签名，省略维度语义细则。"
+      ]
+    }
+  ],
+  "key_classes": [
+    {
+      "name": "LinearLayout",
+      "file": "include/triton/Tools/LinearLayout.h:L313",
+      "responsibility": "承载一个布局的全部信息——核心字段 bases[inDim][i]=L(…2^i…)：把任意布局压缩成一小组基向量；提供 compose/invertAndCompose/apply/getFreeVariableMasks 等布局代数操作。"
+    },
+    {
+      "name": "getMatrix (free fn)",
+      "file": "lib/Tools/LinearLayout.cpp:L70",
+      "responsibility": "把一个 LinearLayout 压成 sum(outLog2)×sum(inLog2) 的 GF(2) 比特矩阵（每列一个 base、每行一个 uint64_t），供 f2reduce 消元使用。"
+    },
+    {
+      "name": "getInjectiveMat / getMatrixRank (free fn)",
+      "file": "lib/Tools/LinearLayout.cpp:L118,L142",
+      "responsibility": "getInjectiveMat 通过给全零列补新行把布局扩成单射；getMatrixRank 对比特矩阵 RREF 后数非零行=秩（判满射/可逆）。"
+    },
+    {
+      "name": "LinearLayout::compose",
+      "file": "lib/Tools/LinearLayout.cpp:L813",
+      "responsibility": "复合两个布局 O∘L：把 this 每个 base 喂给 outer.apply 求值得新 bases（=比特矩阵相乘）。"
+    },
+    {
+      "name": "LinearLayout::invertAndCompose",
+      "file": "lib/Tools/LinearLayout.cpp:L843",
+      "responsibility": "求逆+复合 B⁻¹∘A：matOuter|matThis 横向拼接 → f2reduce RREF → 左半单位阵=对 outer 求逆、右半=复合 bases。布局转换的核心操作。"
+    },
+    {
+      "name": "f2reduce::inplace_rref_strided",
+      "file": "third_party/f2reduce/f2reduce.h:L24",
+      "responsibility": "f2reduce 唯一函数：把 GF(2) 上比特矩阵原地化成 RREF，用 Four Russians 分块查表加速。布局代数的底层引擎。"
+    },
+    {
+      "name": "toLinearLayout (free fn)",
+      "file": "include/triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h:L43",
+      "responsibility": "把 BlockedEncodingAttr / SharedEncodingAttr 等各式 Triton 布局统一转成一个 LinearLayout——『一个抽象统一所有布局』的落地入口。"
+    }
+  ],
+  "data_flow": [
+    {
+      "step": "1. 立论换向",
+      "detail": "LinearLayout.h:L22-L29 —— LL = 硬件位置(reg,lane,warp,block) → 逻辑张量索引 (x,y) 的函数；与 ch20 的 𝓛(索引→线程集合)方向相反，为的是保证是『函数』(:L169-L181)。"
+    },
+    {
+      "step": "2. bases 压缩",
+      "detail": "LinearLayout.h:L31-L47,L314-L320 —— key fact：只需给出 L 在 2 幂次输入点的取值（bases），存进 bases[inDim][i]；任意布局 = 一小组基向量。"
+    },
+    {
+      "step": "3. xor 线性律求值",
+      "detail": "LinearLayout.h:L49-L74 —— 4×4 swizzle 亲手填表：L(t1⊕t2,w1⊕w2)=L(t1,w1)⊕L(t2,w2)，从 4 个 base 推满 16 格，认出 (t,w)↦(t,w⊕t)。"
+    },
+    {
+      "step": "4. GF(2) 代数根据",
+      "detail": "LinearLayout.h:L183-L277 —— 为何线性律成立：域取 GF(2)，加=xor、乘=and；L(a)=Ba，bases 是 L 在 F(1),F(2),F(4),F(8) 的取值；高维摞成 1D 后退化成 L(x⊕y)=L(x)⊕L(y)。"
+    },
+    {
+      "step": "5. 布局→比特矩阵",
+      "detail": "LinearLayout.cpp:L65-L113 —— getMatrix 把布局压成比特矩阵（每列一 base、每行一 uint64_t，≤64）。"
+    },
+    {
+      "step": "6. 复合=矩阵乘",
+      "detail": "LinearLayout.cpp:L813-L841 —— compose 把 this 每个 base 喂 outer.apply 求值得新 bases（对应比特矩阵相乘）。"
+    },
+    {
+      "step": "7. 求逆复合=RREF",
+      "detail": "LinearLayout.cpp:L887-L923 —— invertAndCompose 拼接 matOuter|matThis → f2reduce::inplace_rref_strided(:912) → 左半单位阵=求逆、右半=复合 bases；求秩同理(:151)。"
+    },
+    {
+      "step": "8. RREF 引擎",
+      "detail": "f2reduce.h:L7-L24 + README:L1-L25 —— GF(2) RREF 由 Four Russians 分块查表加速；小/宽/低秩矩阵(LL ≤64 列)命中强项。"
+    },
+    {
+      "step": "9. 统一落地",
+      "detail": "LinearLayoutConversions.h:L43-L45 —— toLinearLayout(shape,layout) 把 Blocked/Shared/MMA 等全部折叠成同一个 LinearLayout，N² 种成对转换坍缩成一个 invertAndCompose。"
+    }
+  ],
+  "design_decisions": [
+    {
+      "decision": "映射方向选『硬件位置 → 逻辑张量索引』而非反向",
+      "why": "同一个 tensor[x,y] 可能存在硬件多处（同一元素存多份）；若从张量索引出发就一输入多输出、不再是函数，会让一切复杂化。代价是 LL 一般非单射。",
+      "evidence": "include/triton/Tools/LinearLayout.h:L169-L181,L164-L167"
+    },
+    {
+      "decision": "只用『2 的幂次输入上的取值』(bases) 表示整个布局，其余靠 xor 补全",
+      "why": "GF(2) 上线性函数被其在 F(1),F(2),F(4),F(8)… 处的值完全确定；把布局压成一小组基向量，是『统一 Blocked/MMA/Shared/transpose/broadcast』的根本机制。",
+      "evidence": "include/triton/Tools/LinearLayout.h:L31-L34,L255-L259,L314-L320"
+    },
+    {
+      "decision": "域选 GF(2)（加=xor，乘=and）",
+      "why": "硬件位置和张量索引都是比特串；在 GF(2) 上做线性代数使求值退化成纯异或（无乘法）、复合/求逆退化成布尔矩阵行化简，可在编译期廉价完成。",
+      "evidence": "include/triton/Tools/LinearLayout.h:L214-L221"
+    },
+    {
+      "decision": "把复合/求逆/求秩全部归约到一个 GF(2) RREF 调用",
+      "why": "布局既是比特矩阵，其代数运算就是矩阵运算；复合=矩阵乘、求逆复合=拼接矩阵后高斯消元使左半成单位阵。一个 f2reduce::inplace_rref_strided 承担全部重活，代码极简。",
+      "evidence": "lib/Tools/LinearLayout.cpp:L905-L913,L151"
+    },
+    {
+      "decision": "限制布局 ≤64 bit（numRows/numCols ≤ 64）",
+      "why": "每行打包进单个 uint64_t 让矩阵操作简单高效；真实 GPU 布局远小于此，不构成限制。",
+      "evidence": "lib/Tools/LinearLayout.cpp:L74-L77,L895"
+    },
+    {
+      "decision": "RREF 引擎用 f2reduce（Four Russians）而非通用线代库",
+      "why": "LL 的比特矩阵小/宽/低秩——正是 Four Russians 分块查表的强项；f2reduce 无依赖、MIT 许可、自动向量化，编译期开销可承受。",
+      "evidence": "third_party/f2reduce/README.md:L7,L17-L25"
+    },
+    {
+      "decision": "toLinearLayout 返回 std::optional（尚未全部布局可转）",
+      "why": "迁移期：并非所有旧 Triton 布局都已支持转 LL；意图是最终移除旧布局类、全部走 LinearLayout。",
+      "evidence": "include/triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h:L40-L45; include/triton/Tools/LinearLayout.h:L100-L104"
+    }
+  ],
+  "theory": [
+    {
+      "topic": "GF(2) 上线性函数由 bases 完全确定",
+      "content": "任意 GF(2)-线性 L:𝔽₂^M→𝔽₂^N 可写成 L(a)=a₁B₁⊕…⊕a_M B_M，其中 B_j=L(e_j)=L(2^{j-1}) 是 L 在 2 幂次输入点的取值。故给定 M 个 bases 即定义整个映射：填 2^M 个函数值只需存 M 个 base，指数级压缩。（LinearLayout.h:L188-L259）"
+    },
+    {
+      "topic": "xor 线性律是 GF(2) 线性性的直接后果",
+      "content": "GF(2) 加=xor，任意输入 a 按其比特分解成若干 2 幂次之异或 a=⊕_{i:a_i=1}2^i，由线性 L(a)=⊕_{i:a_i=1}L(2^i)=⊕ 选中的 bases。故 L(x⊕y)=L(x)⊕L(y) 恒成立，且 L(0)=0（线性函数必过原点，白送推论）。（LinearLayout.h:L61-L62,L268-L275）"
+    },
+    {
+      "topic": "布局复合=比特矩阵乘、求逆=RREF",
+      "content": "L↔比特矩阵 B（N×M，每列一 base，L(a)=Ba）。复合 O∘L ↔ 矩阵乘（compose 只需对 L 的 M 个 base 各求 O 值）。求逆复合 A.invertAndCompose(B)=B⁻¹∘A：把 [B|A] 横向拼接做 RREF，左半化成单位阵即对 B 求逆、右半即复合 bases；求秩=RREF 后非零行数。（LinearLayout.cpp:L813-L841,L887-L923,L142-L159）"
+    },
+    {
+      "topic": "Four Russians 复杂度削减（C 档背景）",
+      "content": "Method of Four Russians（Arlazarov, Dinitz, Kronrod, Faradžev, 1970）把矩阵切成 t×t 小块并预建查表替代逐格运算；取 t=log n 时把标准 GF(2) 高斯消元的处理量从 n² 级降到约 n²/(log n)² 级，整体约削一个对数因子（O(n³)→~O(n³/log n)）。f2reduce 据此实现，在小/宽/低秩矩阵上尤快。（Wikipedia：Method of Four Russians；f2reduce/README.md:L7）"
+    },
+    {
+      "topic": "N² 布局转换的坍缩",
+      "content": "传统方案每对布局 (A,B) 需一段专门转换代码，K 种布局→O(K²) 段。LL 下任意转换=A.invertAndCompose(B)，单一通用算法消除二次爆炸（论文 arXiv:2505.23819 摘要：generic layout-to-layout conversions, eliminating the quadratic explosion）。（LinearLayout.h:L76-L80）"
+    }
+  ],
+  "subtraction_plan": {},
+  "mechanisms": [
+    {
+      "id": "m1-ll-direction",
+      "name": "LinearLayout 的方向：硬件位置(reg,lane,warp,block) → 逻辑张量索引",
+      "kind": "layout",
+      "source_anchors": [
+        "include/triton/Tools/LinearLayout.h:L22-L29",
+        "include/triton/Tools/LinearLayout.h:L82-L85",
+        "include/triton/Tools/LinearLayout.h:L164-L181"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "paper_origin": {
+        "paper": "arXiv:2505.23819",
+        "sections": [
+          "§2"
+        ]
+      },
+      "paper_origin_note": "ch20 前瞻回收起点：把 ch20 的『索引→线程集合』换向为『硬件→逻辑索引』，理由是保证是函数。"
+    },
+    {
+      "id": "m2-bases",
+      "name": "bases（基向量）：只需给出 L 在 2 幂次输入点的取值，其余全推出",
+      "kind": "layout",
+      "source_anchors": [
+        "include/triton/Tools/LinearLayout.h:L31-L47",
+        "include/triton/Tools/LinearLayout.h:L106-L148",
+        "include/triton/Tools/LinearLayout.h:L314-L320"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "paper_origin": {
+        "paper": "arXiv:2505.23819",
+        "sections": [
+          "§3"
+        ]
+      }
+    },
+    {
+      "id": "m3-xor-linearity-4x4",
+      "name": "xor 线性律 L(a⊕b)=L(a)⊕L(b)——4×4 swizzle 亲手填表（核心顿悟）",
+      "kind": "algorithm",
+      "source_anchors": [
+        "include/triton/Tools/LinearLayout.h:L36-L74"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {
+        "paper": "arXiv:2505.23819",
+        "sections": [
+          "§4"
+        ]
+      },
+      "paper_origin_note": "本章核心顿悟——读者亲手逐位异或算 L(0,0)/L(0,3)/L(3,0)/L(3,3) 推满 16 格，认出 swizzle (t,w)↦(t,w⊕t)。主真相源=源码头注释逐字（A 档），论文 §4 作学术出处。"
+    },
+    {
+      "id": "m4-gf2-algebra",
+      "name": "GF(2) 数学背景：加=xor/乘=and，L(a)=Ba，bases=幂次点取值",
+      "kind": "layout",
+      "source_anchors": [
+        "include/triton/Tools/LinearLayout.h:L183-L259",
+        "include/triton/Tools/LinearLayout.h:L261-L277"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "paper_origin": {
+        "paper": "arXiv:2505.23819",
+        "sections": [
+          "§4"
+        ]
+      },
+      "paper_origin_note": "解释『xor 线性律不是巧合，是 GF(2) 上线性的直接后果』；高维摞成 1D 后退化成朴素 L(x⊕y)=L(x)⊕L(y)。"
+    },
+    {
+      "id": "m5-getmatrix",
+      "name": "getMatrix：把布局压成 GF(2) 比特矩阵（每列一 base、每行一 uint64_t）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "lib/Tools/LinearLayout.cpp:L65-L113"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "paper_origin": {
+        "paper": "arXiv:2505.23819",
+        "sections": [
+          "§5"
+        ]
+      },
+      "paper_origin_note": "把抽象比特矩阵落成真实代码；注释含 4 base→3×4 矩阵的可核演算。"
+    },
+    {
+      "id": "m6-compose",
+      "name": "compose：复合 O∘L = 把每个 base 喂 outer 求值（比特矩阵相乘）",
+      "kind": "algorithm",
+      "source_anchors": [
+        "include/triton/Tools/LinearLayout.h:L620-L637",
+        "lib/Tools/LinearLayout.cpp:L813-L841"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {
+        "paper": "arXiv:2505.23819",
+        "sections": [
+          "§5"
+        ]
+      },
+      "paper_origin_note": "worked example：对 this 的每个 base 应用 outer.apply 即得复合 bases——展示『基向量足以定义整个映射』的复用。"
+    },
+    {
+      "id": "m7-invert-compose-rref",
+      "name": "invertAndCompose：拼接比特矩阵 + f2reduce RREF = 求逆复合",
+      "kind": "algorithm",
+      "source_anchors": [
+        "include/triton/Tools/LinearLayout.h:L639-L672",
+        "lib/Tools/LinearLayout.cpp:L843-L923",
+        "lib/Tools/LinearLayout.cpp:L912"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {
+        "paper": "arXiv:2505.23819",
+        "sections": [
+          "§5"
+        ]
+      },
+      "paper_origin_note": "布局转换的核心操作：matOuter|matThis 横向拼接 → RREF → 左半单位阵=求逆、右半=复合 bases。worked example 用 R(寄存器).invertAndCompose(S(shmem))。"
+    },
+    {
+      "id": "m8-rank-rref",
+      "name": "getMatrixRank：RREF 后数非零行=秩（判满射/可逆）",
+      "kind": "algorithm",
+      "source_anchors": [
+        "lib/Tools/LinearLayout.cpp:L139-L159",
+        "lib/Tools/LinearLayout.cpp:L151"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting",
+      "paper_origin": {
+        "paper": "arXiv:2505.23819",
+        "sections": [
+          "§5"
+        ]
+      },
+      "paper_origin_note": "示范『连求秩都归到同一个 GF(2) RREF 调用』——第一处 f2reduce 调用点(:151)。"
+    },
+    {
+      "id": "m9-four-russians",
+      "name": "Four Russians / f2reduce：GF(2) RREF 为何在编译期跑得起（背景盒）",
+      "kind": "config",
+      "source_anchors": [
+        "third_party/f2reduce/README.md:L1-L25",
+        "third_party/f2reduce/f2reduce.h:L7-L24"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "paper_origin": {
+        "paper": "https://en.wikipedia.org/wiki/Method_of_Four_Russians",
+        "sections": [
+          "§6"
+        ]
+      },
+      "paper_origin_note": "C 档背景：分块 t×t 查表削一个对数因子；A 档 README 逐字点名 Kronrod/four Russians。LL 比特矩阵 ≤64 列命中 f2reduce 小/宽矩阵强项。"
+    },
+    {
+      "id": "m10-tolinearlayout-unify",
+      "name": "toLinearLayout：把 Blocked/Shared/MMA 统一折叠成一个 LinearLayout（落地）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "include/triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h:L1-L45",
+        "include/triton/Tools/LinearLayout.h:L76-L80"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "paper_origin": {
+        "paper": "arXiv:2505.23819",
+        "sections": [
+          "§7"
+        ]
+      },
+      "paper_origin_note": "『一个抽象统一所有布局』的真实代码入口；ch21/ch22 的具体布局形态在此被收编（本章只回指，不重讲形态）。"
+    }
+  ],
+  "foreshadow_due": {
+    "recycle": [
+      {
+        "id": "f17",
+        "planted_in": "ch20",
+        "summary": "布局函数 𝓛(索引→线程集合)其实不是任意函数，而是二元域 GF(2) 上的线性映射——只需给出 𝓛 在『2 的幂次输入』上的取值(bases/基向量)，其余函数值靠异或线性律 𝓛(a⊕b)=𝓛(a)⊕𝓛(b) 全部推出；布局的复合与求逆因此退化成 GF(2) 矩阵行化简(RREF，third_party/f2reduce 的 Four Russians 分块查表法)。ch20 前瞻框只给结论一句(挂 arXiv:2505.23819)，GF(2) 代数展开留给本章。",
+        "how_paid_off": "本章即 f17 的全面兑现：§2-§3 讲 bases（m2）、§4 讲 xor 线性律 + 4×4 亲手填表（m3/m4）、§5 讲复合/求逆=比特矩阵 RREF（m5/m6/m7/m8）、§6 讲 Four Russians/f2reduce（m9）。方向换向（m1）明确回指 ch20 的 𝓛 定义，不重讲。"
+      }
+    ],
+    "plant": []
+  }
+}
