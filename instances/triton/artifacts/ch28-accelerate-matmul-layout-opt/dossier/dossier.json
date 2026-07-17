@@ -1,0 +1,369 @@
+{
+  "chapter_id": "ch28",
+  "slug": "ch28-accelerate-matmul-layout-opt",
+  "title": "AccelerateMatmul 与布局最优化：tt.dot→MMA、减少 convert_layout",
+  "kind": "skip_impl",
+  "note_kind": "skip_impl 章：无 subtract-only 精简版；『运行起来看数值』由 pin 精确编译承担（explainer 用 pip install triton==3.2.0 headless dump make_ttgir 各阶段，观测 BlockedToMMA 换编码前后、RemoveLayoutConversions 消掉的 convert_layout 数）。subtraction_plan.delete 留空；must_keep 登记『读者需理解、writer 需讲清』的可检测 C++ 符号。",
+
+  "code_spine": [
+    "third_party/nvidia/backend/compiler.py:L225-L243  make_ttgir 里三个 pass 的落点：remove_layout(L225)→accelerate_matmul(L227)→remove_layout(L228)→optimize_dot_operands(L229)…后续 optimize_dot_operands(L242)→remove_layout(L243)。RemoveLayoutConversions 出现三次",
+    "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L552-L567  TritonGPUAccelerateMatmulPass::runOnOperation：getNVIDIAComputeCapability→加 BlockedToMMA+ScaledBlockedToMMAv2 两 pattern→贪心应用→decomposeMixedModeDotOp 收尾",
+    "lib/Dialect/TritonGPU/Transforms/Utility.cpp:L913-L931  getNVIDIAComputeCapability：从 module 的 target 属性 'cuda:NN' 解析出 compute capability",
+    "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L26-L45  getMMAVersionSafe：按 compute capability 给候选 MMA 版本表（<75→{1}/<90→{2}/<100→{3,2}），逐个 supportMMA 校验取首个成立者",
+    "lib/Analysis/Utility.cpp:L481-L537  supportMMA(DotOp,version) + supportMMA(Value,version)：MMAv3 的 K 尺寸/numWarps/shape/dtype 硬约束；F32 须 TF32 且 version>=2；FP8 可 promote",
+    "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L233-L349  BlockedToMMA::matchAndRewrite：主重写——挑版本、算 instrShape/warpsPerTile、造 mmaEnc、换累加器编码、MMAv3 走 WarpGroupDot+共享内存操作数 / v1v2 换 dot-operand 编码、最后 replaceOpWithNewOp<ConvertLayoutOp> 把结果转回旧编码",
+    "lib/Dialect/TritonGPU/Transforms/Utility.cpp:L26-L75  mmaVersionToInstrShape：v1→{16,16}/v2→{16,8}/v3→按 dtype+numWarps 选 {m,n,k}",
+    "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L47-L104  warpsPerTileV2：链式 dot 复用已有 mma warp 布局，否则按 shape 沿 M/N 倍增分配 warps",
+    "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L106-L132  warpsPerTileV3：MMAv3 最小 warp 形状 (4,1)，flash-attention 链式 dot 只沿一轴分",
+    "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L193-L212  computeOrigBitWidth：回溯 shape-preserving 一元链找到最低精度位宽 → 决定 dot-operand 的 kWidth",
+    "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L136-L166  getSharedMemoryMMAOperand：MMAv3 操作数进共享内存（LocalAlloc），不允许转置时按 opIdx 定 order",
+    "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L362-L392  decomposeMixedModeDotOp：挑完 mma 类型后，对非原生支持的精度组合插 FpToFp 提升操作数",
+    "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L394-L539  ScaledBlockedToMMAv2：mxfp/fp8 scaled dot → mmav2 编码 + toMMABf16 换 dot-operand 编码 + UpcastMXFPOp 施加 scale",
+    "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:L43-L60  四阶段算法总述注释：①找锚点 ②向后代传播布局 ③消解冲突（插 convert）④按支配序重写",
+    "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:L1126-L1185  TritonGPURemoveLayoutConversionsPass::runOnOperation：per-func 跑 LayoutPropagation 四步→canonicalize→backwardRematerialization→hoistConvert→最终清理",
+    "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:L168-L206  isLayoutAnchor + initAnchorLayout：dot/贵 load-store/permuting reshape/atomic 是锚点；函数参数也当锚点",
+    "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:L232-L332  propagateToUsers/setEncoding + resolveConflicts：沿 use 前向传播（convert 用 dst=src 抵消、其余 inferDstEncoding），多编码时启发式挑（load/store 偏 Blocked，其余偏 Mma）",
+    "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:L666-L717  rewriteOp：按分析选定编码重写；convert 用新 src 编码重建、可折叠的 clone 后接 convert、elementwise 克隆",
+    "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:L971-L1010  backwardRematerialization(convertOp)：不处理到 DotOperand 的转换；取可 remat 的向后切片重写以消掉 convert",
+    "lib/Dialect/TritonGPU/Transforms/OptimizeDotOperands.cpp:L315-L333  TritonGPUOptimizeDotOperandsPass::runOnOperation：canonicalize→SwizzleShmemConvert/HoistLayoutConversion/FuseTransHopper/MMAV3UseRegOperand 四 pattern 贪心应用",
+    "lib/Dialect/TritonGPU/Transforms/OptimizeDotOperands.cpp:L23-L74  SwizzleShmemConvert：convert(trans(x))#dot_operand → 把内层 convert 换成 swizzled 共享编码（needTrans=true）",
+    "lib/Dialect/TritonGPU/Transforms/OptimizeDotOperands.cpp:L206-L301  FuseTransHopper（MMAv3 折转置进 alloc）+ MMAV3UseRegOperand（把共享操作数换回寄存器 dot-operand）"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "third_party/nvidia/backend/compiler.py",
+      "lines": "L220-L246",
+      "code": "        passes.ttgpuir.add_coalesce(pm)\n        if capability // 10 >= 8:\n            passes.ttgpuir.add_f32_dot_tc(pm)\n        # TODO(Qingyi): Move PlanCTAPass to the front of CoalescePass\n        nvidia.passes.ttnvgpuir.add_plan_cta(pm, cluster_info)\n        passes.ttgpuir.add_remove_layout_conversions(pm)\n        passes.ttgpuir.add_optimize_thread_locality(pm)\n        passes.ttgpuir.add_accelerate_matmul(pm)\n        passes.ttgpuir.add_remove_layout_conversions(pm)\n        passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)\n        passes.common.add_cse(pm)\n        ...\n        passes.ttgpuir.add_prefetch(pm)\n        passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)\n        passes.ttgpuir.add_remove_layout_conversions(pm)\n        passes.ttgpuir.add_reduce_data_duplication(pm)",
+      "elide": ["中间被省略的 capability>=8 分支（warp-spec/pipeline/ws-lowering 一大段）——本章不涉及，用 ... 略去；关键是 remove_layout_conversions 在 L225/L228/L243 出现三次，accelerate_matmul 夹在第一二次之间，optimize_dot_operands 出现两次"]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp",
+      "lines": "L26-L45",
+      "code": "// Get the highest version supported for the hardware and the dot.\nstatic int getMMAVersionSafe(int computeCapability, DotOp op) {\n  // List supported mma version in order of preference.\n  SmallVector<int> versionsSupported;\n  if (computeCapability < 75) {\n    versionsSupported = {1};\n  } else if (computeCapability < 90) {\n    versionsSupported = {2};\n  } else if (computeCapability < 100) {\n    versionsSupported = {3, 2};\n  } else {\n    assert(false && \"computeCapability not supported\");\n  }\n  for (int baseVersion : versionsSupported) {\n    if (supportMMA(op, baseVersion))\n      return baseVersion;\n    if (baseVersion == 3)\n      op.emitRemark() << \"Warning: can't use MMA V3 for the dot op\";\n  }\n  return 0;\n}",
+      "elide": []
+    },
+    {
+      "path": "lib/Analysis/Utility.cpp",
+      "lines": "L481-L521",
+      "code": "bool supportMMA(triton::DotOp op, int version) {\n  auto aElemTy = op.getA().getType().getElementType();\n  auto bElemTy = op.getB().getType().getElementType();\n  if (version == 3) {\n    if (triton::tools::getBoolEnv(\"DISABLE_MMA_V3\"))\n      return false;\n    auto retType = op.getType();\n    RankedTensorType typeA = op.getA().getType();\n    int k = typeA.getShape().back();\n    // If k size is smaller than the native mma size, we cannot use MMA.\n    if (k < 256 / aElemTy.getIntOrFloatBitWidth())\n      return false;\n    auto retShapePerCTA = getShapePerCTA(retType);\n    auto rank = retShapePerCTA.size();\n    auto mod = op->getParentOfType<ModuleOp>();\n    int numWarps = TritonGPUDialect::getNumWarps(mod);\n    // TODO(Keren): for now, fallback to MMAv2 if handling batch matmul.\n    if (rank == 3)\n      return false;\n    if (!(numWarps % 4 == 0 && retShapePerCTA[rank - 2] % 64 == 0 &&\n          retShapePerCTA[rank - 1] % 8 == 0 &&\n          (aElemTy.isFloat8E5M2() || aElemTy.isFloat8E4M3FN() ||\n           aElemTy.isInteger(8) || aElemTy.isF16() || aElemTy.isBF16() ||\n           aElemTy.isF32()))) {\n      return false;\n    }\n    ...\n  }\n  if (aElemTy.isF32() && bElemTy.isF32()) {\n    return op.getInputPrecision() == InputPrecision::TF32 && version >= 2;\n  }\n  return supportMMA(op.getA(), version) && supportMMA(op.getB(), version);\n}",
+      "elide": ["L510-L515 的 maxNumImpreciseAcc<32 fp8 累加特判：'不能在 MMA 里用 F32 累加 fp8' 的边界 case——writer 可一句带过，不必逐行", "supportMMA(Value,version) 重载（L523-L537）判单操作数 dtype：FP8 可 promote 故恒真、F16/BF16 恒真、F32/int8 须 version>=2"]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp",
+      "lines": "L233-L311",
+      "code": "  mlir::LogicalResult\n  matchAndRewrite(triton::DotOp dotOp,\n                  mlir::PatternRewriter &rewriter) const override {\n    if (computeCapability < 70)\n      return failure();\n    RankedTensorType oldRetType = dotOp.getType();\n    if (!oldRetType.getEncoding() ||\n        mlir::isa<NvidiaMmaEncodingAttr>(oldRetType.getEncoding()))\n      return failure();\n\n    // get MMA encoding for the given number of warps\n    auto retShapePerCTA = getShapePerCTA(oldRetType);\n    auto mod = dotOp->getParentOfType<mlir::ModuleOp>();\n    int numWarps = TritonGPUDialect::getNumWarps(mod);\n    auto CTALayout = getCTALayout(oldRetType.getEncoding());\n\n    int versionMajor = getMMAVersionSafe(computeCapability, dotOp);\n    if (!(versionMajor >= 1 && versionMajor <= 3))\n      return failure();\n\n    auto instrShape = mmaVersionToInstrShape(\n        versionMajor, retShapePerCTA, dotOp.getA().getType().getElementType(),\n        numWarps);\n    // operands\n    Value a = dotOp.getA();\n    Value b = dotOp.getB();\n    auto oldAType = dotOp.getA().getType();\n    auto oldBType = dotOp.getB().getType();\n\n    NvidiaMmaEncodingAttr mmaEnc;\n    if (versionMajor == 1) {\n      ...\n    } else {\n      assert(versionMajor == 2 || versionMajor == 3);\n      int versionMinor = computeCapability == 75 ? 1 : 0;\n      auto warpsPerTile = getWarpsPerTile(dotOp, retShapePerCTA, versionMajor,\n                                          numWarps, instrShape);\n      mmaEnc = NvidiaMmaEncodingAttr::get(oldRetType.getContext(), versionMajor,\n                                          versionMinor, warpsPerTile, CTALayout,\n                                          instrShape);\n    }\n    PatternRewriterWithAsyncTaskIds taskIdRewriter(rewriter, dotOp);\n    auto newRetType = RankedTensorType::get(\n        oldRetType.getShape(), oldRetType.getElementType(), mmaEnc);\n    // convert accumulator\n    auto oldAcc = dotOp.getOperand(2);\n    auto newAcc =\n        rewriter.create<ConvertLayoutOp>(oldAcc.getLoc(), newRetType, oldAcc);",
+      "elide": ["守卫两条：computeCapability<70 直接 failure；oldRetType 已是 NvidiaMma 编码则 failure（幂等，避免重复重写）", "versionMajor==1 分支（L264-L294）：MMAv1/Volta 靠回溯 convert 链探 operand 行主/列主（isARow/isBRow）——sm70 老架构，writer 可略讲，把重心放 v2/v3"]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp",
+      "lines": "L312-L348",
+      "code": "    Operation *newDot = nullptr;\n    if (versionMajor == 3) {\n      auto eltType = dotOp.getA().getType().getElementType();\n      // In MMAV3 tranpose is only supported for f16 and bf16.\n      bool allowTranspose = eltType.isF16() || eltType.isBF16();\n      a = getSharedMemoryMMAOperand(a, rewriter, 0, allowTranspose);\n      b = getSharedMemoryMMAOperand(b, rewriter, 1, allowTranspose);\n      newDot = taskIdRewriter.create<triton::nvidia_gpu::WarpGroupDotOp>(\n          dotOp.getLoc(), newRetType, a, b, newAcc, nullptr,\n          dotOp.getInputPrecision(), dotOp.getMaxNumImpreciseAcc(), false);\n    } else {\n      // convert operands\n      int minBitwidth =\n          std::min(computeOrigBitWidth(a), computeOrigBitWidth(b));\n      Type minType = rewriter.getIntegerType(minBitwidth);\n      // convert A operand\n      auto newAEncoding = DotOperandEncodingAttr::get(\n          oldAType.getContext(), 0, newRetType.getEncoding(),\n          minBitwidth > 0 ? minType : oldAType.getElementType());\n      auto newAType = RankedTensorType::get(\n          oldAType.getShape(), oldAType.getElementType(), newAEncoding);\n      a = rewriter.create<ConvertLayoutOp>(a.getLoc(), newAType, a);\n      // convert B operand\n      auto newBEncoding = DotOperandEncodingAttr::get(\n          oldBType.getContext(), 1, newRetType.getEncoding(),\n          minBitwidth > 0 ? minType : oldBType.getElementType());\n      auto newBType = RankedTensorType::get(\n          oldBType.getShape(), oldBType.getElementType(), newBEncoding);\n      b = rewriter.create<ConvertLayoutOp>(b.getLoc(), newBType, b);\n      newDot = taskIdRewriter.create<DotOp>(dotOp.getLoc(), newRetType, a, b,\n                                            newAcc, dotOp.getInputPrecision(),\n                                            dotOp.getMaxNumImpreciseAcc());\n    }\n    // convert dot instruction\n    rewriter.replaceOpWithNewOp<ConvertLayoutOp>(dotOp, oldRetType,\n                                                 newDot->getResult(0));\n    return success();",
+      "elide": ["核心对照：v3 走 WarpGroupDotOp + 共享内存操作数（getSharedMemoryMMAOperand）；v1/v2 走 DotOp + 寄存器 dot-operand 编码（opIdx 0/1、parent=mma、kWidth=minBitwidth）。两分支最后都 replaceOpWithNewOp<ConvertLayoutOp> 把 mma 结果转回旧编码——这个 convert 正是 RemoveLayoutConversions 稍后要消的对象"]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp",
+      "lines": "L136-L166",
+      "code": "// Returns a shared memory allocation that can be used by a dotMMA op for the\n// given value.\nstatic Value getSharedMemoryMMAOperand(Value v, mlir::PatternRewriter &rewriter,\n                                       int opIdx, bool allowTranspose) {\n  OpBuilder::InsertionGuard g(rewriter);\n  Value arg = v;\n  if (auto cvtOp = v.getDefiningOp<ConvertLayoutOp>())\n    arg = cvtOp.getSrc();\n  auto argType = cast<RankedTensorType>(arg.getType());\n  assert(argType.getEncoding() && \"unexpected tensor type\");\n  auto newOrder = getOrder(argType.getEncoding());\n\n  // If the MMA op doesn't support transpose pick the layout expected by the MMA\n  // op.\n  if (!allowTranspose) {\n    if (opIdx == 1) {\n      newOrder = {0, 1};\n    } else {\n      newOrder = {1, 0};\n    }\n  }\n\n  Attribute SharedMemorySpace =\n      SharedMemorySpaceAttr::get(argType.getContext());\n  auto CTALayout = getCTALayout(argType.getEncoding());\n  auto newLayout =\n      SharedEncodingAttr::get(argType.getContext(), argType.getShape(),\n                              newOrder, CTALayout, argType.getElementType());\n  auto newType = MemDescType::get(argType.getShape(), argType.getElementType(),\n                                  newLayout, SharedMemorySpace);\n  rewriter.setInsertionPointAfterValue(arg);\n  return rewriter.create<LocalAllocOp>(arg.getLoc(), newType, arg);\n}",
+      "elide": []
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp",
+      "lines": "L193-L212",
+      "code": "  static int computeOrigBitWidth(Value x) {\n    int finalBitWidth = getElementTypeOrSelf(x).getIntOrFloatBitWidth();\n    int origBitWidth = finalBitWidth;\n    SetVector<Operation *> slice;\n    mlir::BackwardSliceOptions opt;\n    opt.omitBlockArguments = true;\n    opt.filter = bwdFilter;\n    getBackwardSlice(x, &slice, opt);\n    for (auto op : slice) {\n      if (Value arg = op->getOperand(0))\n        if (auto argTy = dyn_cast<RankedTensorType>(arg.getType())) {\n          auto argBitWidth = argTy.getElementType().getIntOrFloatBitWidth();\n          if (argBitWidth != origBitWidth) {\n            origBitWidth = std::min<int>(origBitWidth, argBitWidth);\n            break;\n          }\n        }\n    }\n    return origBitWidth;\n  }",
+      "elide": ["bwdFilter（L173-L179）限定回溯只穿 FpToFp/Bitcast/ConvertLayout/纯一元 inline-asm/arith 这类 shape-preserving 一元 op；origBitWidth 最终当作 dot-operand 的 kWidth（每线程一次装载的元素位宽）"]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp",
+      "lines": "L47-L104",
+      "code": "SmallVector<unsigned> warpsPerTileV2(DotOp dotOp, const ArrayRef<int64_t> shape,\n                                     int numWarps) {\n  auto rank = shape.size();\n  // Early exit for batched matmul\n  if (rank == 3)\n    return {(unsigned)numWarps, 1, 1};\n\n  auto filter = [&dotOp](Operation *op) {\n    return op->getParentRegion() == dotOp->getParentRegion() &&\n           !isa<TransOp>(op);\n  };\n  auto slices = multiRootGetSlice(dotOp, {filter}, {filter});\n  bool hasChainedDot = false;\n  for (Operation *op : slices) {\n    if (isa<DotOp>(op) && (op != dotOp)) {\n      auto chainedDot = cast<DotOp>(op);\n      auto resTy = chainedDot.getResult().getType();\n      if (resTy.getRank() != rank) {\n        continue;\n      }\n      if (auto mmaEncoding =\n              dyn_cast<NvidiaMmaEncodingAttr>(resTy.getEncoding())) {\n        return getWarpsPerCTA(mmaEncoding);\n      }\n      hasChainedDot = true;\n    }\n  }\n  if (hasChainedDot) {\n    if (shape[0] >= shape[1]) {\n      return {(unsigned)numWarps, 1};\n    } else {\n      return {1, (unsigned)numWarps};\n    }\n  }\n\n  SmallVector<unsigned> ret(rank, 1);\n  SmallVector<int64_t> shapePerWarp(rank, 1);\n  shapePerWarp[rank - 1] = 8;\n  shapePerWarp[rank - 2] = 16;\n  do {\n    if (ret[0] * ret[1] >= numWarps)\n      break;\n    if (shape[0] / shapePerWarp[0] / ret[0] >=\n        shape[1] / (shapePerWarp[1] * 2) / ret[1]) {\n      if (ret[0] < shape[0] / shapePerWarp[0]) {\n        ret[0] *= 2;\n      } else\n        ret[1] *= 2;\n    } else {\n      ret[1] *= 2;\n    }\n  } while (true);\n  return ret;\n}",
+      "elide": ["注释掉的 TODO(@daadaada) 大段说明（L86-L89）省略；核心：batched 早退；链式 dot 复用上游 mma 的 warp 布局或沿更长轴集中；否则从 {1,1} 起、每步把 warp 数沿 M 或 N 翻倍，直到 warp 用满"]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/Utility.cpp",
+      "lines": "L26-L37",
+      "code": "SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,\n                                                const ArrayRef<int64_t> &shape,\n                                                Type eltType, int numWarps) {\n  if (version == 1)\n    return {16, 16};\n  else if (version == 2) {\n    auto rank = shape.size();\n    SmallVector<unsigned, 3> ret(rank, 1);\n    ret[rank - 1] = 8;\n    ret[rank - 2] = 16;\n    return ret;\n  } else if (version == 3) {\n    ...",
+      "elide": ["version==3 分支（L37-L70）：k=256/位宽，按 dtype 给 validN 候选表，用 numWarps 拆 mWarps/nWarps 反推 maxN，选首个能整除 shape[1] 且 <=maxN 的 n → {m=16,n,k}。writer 讲到 v3 instrShape 时可给 f16 的具体一档举例，不必印整张 validN 表"]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp",
+      "lines": "L552-L567",
+      "code": "  void runOnOperation() override {\n    MLIRContext *context = &getContext();\n    ModuleOp m = getOperation();\n\n    auto computeCapability = getNVIDIAComputeCapability(m);\n\n    mlir::RewritePatternSet patterns(context);\n    patterns.add<BlockedToMMA, ScaledBlockedToMMAv2>(context,\n                                                     computeCapability);\n    if (applyPatternsAndFoldGreedily(m, std::move(patterns)).failed()) {\n      signalPassFailure();\n    }\n    // Now that we have picked the mma type, decompose dot that are not natively\n    // supported.\n    decomposeMixedModeDotOp(m, computeCapability);\n  }",
+      "elide": []
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp",
+      "lines": "L362-L392",
+      "code": "static void decomposeMixedModeDotOp(ModuleOp mod, int computeCapability) {\n  mod.walk([=](DotOp dotOp) -> void {\n    auto D = dotOp.getD();\n    OpBuilder builder(dotOp);\n    Type AElType = dotOp.getA().getType().getElementType();\n    Type promoteType;\n    NvidiaMmaEncodingAttr mmaLayout =\n        dyn_cast<NvidiaMmaEncodingAttr>(D.getType().getEncoding());\n    if (mmaLayout) {\n      bool isNativeFP8 = AElType.isFloat8E5M2() || AElType.isFloat8E4M3FN();\n      // promote operands for sm < 89 since fp8 mma is not natively supported\n      // promote operands for sm >= 90 when mma is not v3\n      if (!isNativeFP8 ||\n          (isNativeFP8 && (computeCapability == 89 || mmaLayout.isHopper())))\n        return;\n      promoteType = builder.getF16Type();\n    } else {\n      // FMA case.\n      Type AElType = dotOp.getA().getType().getElementType();\n      Type DElType = D.getType().getElementType();\n      if (AElType == DElType)\n        return;\n      promoteType = DElType;\n    }\n    Location loc = dotOp.getLoc();\n    Value promotedA = promoteOperand(builder, loc, dotOp.getA(), promoteType);\n    Value promotedB = promoteOperand(builder, loc, dotOp.getB(), promoteType);\n    dotOp.setOperand(0, promotedA);\n    dotOp.setOperand(1, promotedB);\n  });\n}",
+      "elide": ["promoteOperand（L353-L358）就是 create<FpToFpOp> 升精度；本函数是兜底：mma 选定后若操作数精度组合非原生（如 fp8 在 sm<89），插 FpToFp 升到 f16"]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp",
+      "lines": "L444-L462",
+      "code": "    // TODO run accelerate matmul on A and B first to choose their layouts\n    // Set return type\n    auto versionMajor = 2;\n    auto retShapePerCTA = getShapePerCTA(oldRetType);\n    auto mod = dotOp->getParentOfType<mlir::ModuleOp>();\n    unsigned numWarps = TritonGPUDialect::getNumWarps(mod);\n    auto instrShape = mmaVersionToInstrShape(versionMajor, retShapePerCTA,\n                                             rewriter.getBF16Type(), numWarps);\n    auto CTALayout = getCTALayout(oldRetType.getEncoding());\n    // TODO Use warpsPerTileV2\n    SmallVector<unsigned> warpsPerCTA = {numWarps, 1};\n    auto mmaEnc = NvidiaMmaEncodingAttr::get(ctx, /*versionMajor=*/versionMajor,\n                                             /*versionMinor=*/0, warpsPerCTA,\n                                             CTALayout, instrShape);\n    auto newRetType = RankedTensorType::get(\n        oldRetType.getShape(), oldRetType.getElementType(), mmaEnc);\n\n    // convert accumulator\n    auto oldAcc = dotOp.getOperand(2);\n    auto newAcc =\n        rewriter.create<ConvertLayoutOp>(oldAcc.getLoc(), newRetType, oldAcc);",
+      "elide": ["ScaledBlockedToMMAv2 处理 tt.dot_scaled（mxfp/fp8 带 scale）：固定走 mmav2、按 bf16 算 instrShape；后接 toMMABf16 把操作数换 dot-operand 编码并 upcast、再 create<UpcastMXFPOp> 把 scale 施加上去（L531-L532）；writer 一句点到 mxfp scaled dot 走这条支线即可，不必逐行"]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp",
+      "lines": "L43-L60",
+      "code": "// The current algorithm works by analyzing the IR and doing a one-shot rewrite\n// based on the analysis. The algorithm is as follows.\n//\n// 1. Find all the anchor ops. These are ops that have a layout we want to\n//    preserve.\n//\n// 2. For each anchor, propagate its layout to all its descendants.\n//    An op can have multiple ancestors that are anchors, so at this stage an op\n//    may have multiple layouts associated with it.\n//\n// 3. Resolve conflicts by deciding which of the multiple layouts the op should\n//    keep, inserting convert-layout ops to resolve conflicts.  After this\n//    stage, each value has only one layout associated with it.\n//\n// 4. Rewrite the IR by walking the function in dominance order. Since we\n//    assume the IR is structured we just need to process the regions in the\n//    correct order. For each op, rewrite it using the layout decided by the\n//    analysis phase.",
+      "elide": []
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp",
+      "lines": "L168-L206",
+      "code": "bool isLayoutAnchor(Operation *op) {\n  if (isa<LoadOp, StoreOp>(op))\n    return isExpensiveLoadOrStore(op);\n  if (isa<DotOp, nvidia_gpu::WarpGroupDotOp, AtomicRMWOp, AtomicCASOp>(op))\n    return true;\n\n  // Heuristic: Mark permuting reshape as a layout anchor. ...\n  if (auto reshape = dyn_cast<ReshapeOp>(op))\n    return reshape.getAllowReorder();\n\n  return false;\n}\n\nvoid LayoutPropagation::initAnchorLayout() {\n  auto addAnchor = [&](Value v) {\n    if (auto tensorType = dyn_cast<RankedTensorType>(v.getType())) {\n      layouts.insert({v, LayoutInfo(tensorType.getEncoding())});\n    }\n  };\n\n  // Consider function args as anchors. ...\n  for (auto arg : funcOp.getArguments()) {\n    addAnchor(arg);\n  }\n\n  funcOp.walk([&](Operation *op) {\n    if (isLayoutAnchor(op)) {\n      for (auto result : op->getResults()) {\n        addAnchor(result);\n      }\n    }\n  });\n}",
+      "elide": ["dot/warp-group-dot/贵 load-store/atomic/permuting-reshape 是锚点——它们的布局有性能意义、要保住；函数参数也当锚点便于测试写"]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp",
+      "lines": "L208-L230",
+      "code": "void LayoutPropagation::setEncoding(ValueRange values, LayoutInfo &info,\n                                    SmallVector<Value> &changed,\n                                    Operation *op) {\n  for (Value value : values) {\n    if (!isa<RankedTensorType>(value.getType()))\n      continue;\n    bool hasChanged = false;\n    for (auto encoding : info.encodings) {\n      std::optional<Attribute> dstEncoding;\n      if (isa<ConvertLayoutOp>(op)) {\n        // Try to remove the convert by making the dst encoding match the source\n        // encoding.\n        dstEncoding = encoding;\n      } else {\n        dstEncoding = inferDstEncoding(op, encoding);\n      }\n      if (dstEncoding)\n        hasChanged |= layouts[value].encodings.insert(*dstEncoding);\n    }\n    if (hasChanged)\n      changed.push_back(value);\n  }\n}",
+      "elide": ["关键一手：遇到 ConvertLayoutOp 时，直接把源编码当目标编码传下去（dstEncoding=encoding）——意图就是让 convert 两端编码相同、从而这个 convert 变成 no-op 被消掉；其余 op 用 inferDstEncoding 推断结果编码"]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp",
+      "lines": "L311-L332",
+      "code": "void LayoutPropagation::resolveConflicts() {\n  for (auto &it : layouts) {\n    Operation *op = it.first.getDefiningOp();\n    LayoutInfo &info = it.second;\n    if (info.encodings.size() <= 1)\n      continue;\n    // Hacky resolve, prefer block encoding.\n    // TODO: add a proper heuristic.\n    Attribute encoding = *info.encodings.begin();\n    bool isLoadOrStore =\n        op && isa<LoadOp, StoreOp, AtomicRMWOp, AtomicCASOp>(op);\n    for (Attribute e : info.encodings) {\n      if ((isLoadOrStore && isa<BlockedEncodingAttr>(e)) ||\n          (!isLoadOrStore && isa<MmaEncodingTrait>(e))) {\n        encoding = e;\n        break;\n      }\n    }\n    info.encodings.clear();\n    info.encodings.insert(encoding);\n  }\n}",
+      "elide": ["消解冲突启发式：一个值被多个锚点染上多种编码时，load/store 偏 Blocked、计算值偏 Mma——最终每个值只留一个编码"]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp",
+      "lines": "L1126-L1185",
+      "code": "  void runOnOperation() override {\n    MLIRContext *context = &getContext();\n    ModuleOp m = getOperation();\n\n    // 1. Propagate layout forward starting from \"anchor\" ops.\n    m.walk([](FuncOp funcOp) {\n      LayoutPropagation layoutPropagation(funcOp);\n      layoutPropagation.initAnchorLayout();\n      layoutPropagation.propagateLayout();\n      layoutPropagation.resolveConflicts();\n      layoutPropagation.rewrite();\n    });\n    ...\n    RewritePatternSet cleanUpPatterns(context);\n    ConvertLayoutOp::getCanonicalizationPatterns(cleanUpPatterns, context);\n    if (applyPatternsAndFoldGreedily(m, std::move(cleanUpPatterns)).failed()) {\n      signalPassFailure();\n    }\n    ...\n    // 2. For remaining convert ops, try to rematerialize the slice of producer\n    // operation to avoid having to convert.\n    backwardRematerialization(m);\n    ...\n    // 3. For remaining converts, try to hoist them above cast generating larger\n    // size types in order to reduce the cost of the convert op.\n    hoistConvert(m);\n    ...\n    // 4. Apply clean up patterns to remove remove dead convert and dead code\n    // generated by the previous transformations.\n    RewritePatternSet cleanUpPatterns2(context);\n    populateForOpDeadArgumentElimination(cleanUpPatterns2);\n    scf::ForOp::getCanonicalizationPatterns(cleanUpPatterns2, context);\n    scf::IfOp::getCanonicalizationPatterns(cleanUpPatterns2, context);\n    ConvertLayoutOp::getCanonicalizationPatterns(cleanUpPatterns2, context);\n    if (applyPatternsAndFoldGreedily(m, std::move(cleanUpPatterns2)).failed()) {\n      signalPassFailure();\n    }\n  }",
+      "elide": ["LLVM_DEBUG 的 m.dump() 调试块（每阶段后打印模块）省略。四阶段清晰：前向传播四步 → canonicalize 折叠 no-op convert → backward remat 消剩余 convert → hoist convert 抬到扩位/broadcast 之上降成本 → 最终死代码清理"]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/OptimizeDotOperands.cpp",
+      "lines": "L315-L332",
+      "code": "  void runOnOperation() override {\n    MLIRContext *context = &getContext();\n    ModuleOp m = getOperation();\n\n    mlir::PassManager pm(m.getContext());\n    pm.addPass(mlir::createCanonicalizerPass());\n    auto ret = pm.run(m);\n\n    mlir::RewritePatternSet patterns(context);\n    patterns.add<SwizzleShmemConvert>(context);\n    if (this->hoistLayoutConversion.getValue())\n      patterns.add<HoistLayoutConversion>(context);\n    patterns.add<FuseTransHopper>(context);\n    patterns.add<MMAV3UseRegOperand>(context);\n    ConvertLayoutOp::getCanonicalizationPatterns(patterns, context);\n    if (failed(applyPatternsAndFoldGreedily(m, std::move(patterns))))\n      signalPassFailure();\n  }",
+      "elide": ["hoistLayoutConversion 是 pass 选项：make_ttgir 里以 capability>=80 传入（compiler.py:L229/L242）"]
+    },
+    {
+      "path": "lib/Dialect/TritonGPU/Transforms/OptimizeDotOperands.cpp",
+      "lines": "L76-L98",
+      "code": "// Move convert-to-dot-operand \"up\" past elementwise ops:\n//\n//  convert(elementwise(x)) #dot_operand ->\n//  elementwise(convert(x, #dot_operand)).\n//\n// The goal is to put the convert right next to the originating load.  If we can\n// accomplish this, then we can save a shmem round-trip:\n//\n//   Before:\n//     - Load from global into shmem using an async copy.\n//     - Load from shmem into a #blocked layout.\n//     - Do elementwise ops over #blocked layout.\n//     - Convert to #dot_operand (round-trip through shmem).\n//     - Do dot.\n//\n//   After:\n//     - Load from global into shmem using an async copy (same as before).\n//     - Load from shmem into a #dot_operand layout.\n//     - Do elementwise ops over #dot_operand layout.\n//     - Do dot.",
+      "elide": ["HoistLayoutConversion 的意图注释——把 convert 上移贴近 load，省掉一次 shmem 往返；正文用它解释 OptimizeDotOperands 为何能提速"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "TritonGPUAccelerateMatmulPass", "file": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp", "responsibility": "pass 入口：取 NVIDIA compute capability，跑 BlockedToMMA + ScaledBlockedToMMAv2 两 pattern，再 decomposeMixedModeDotOp 兜底混合精度"},
+    {"name": "BlockedToMMA", "file": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp", "responsibility": "本章脊柱 pattern：把 blocked 编码的 tt.dot 重写成命中 Tensor Core 的 NvidiaMmaEncodingAttr——挑版本、算 instrShape/warpsPerTile、换累加器与操作数编码、v3 走 WarpGroupDot"},
+    {"name": "ScaledBlockedToMMAv2", "file": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp", "responsibility": "把 tt.dot_scaled（mxfp/fp8 带 scale）重写成 mmav2 + UpcastMXFPOp 施加 scale"},
+    {"name": "NvidiaMmaEncodingAttr", "file": "include/triton/Dialect/TritonGPU/IR/（TritonGPUAttrDefs）", "responsibility": "NVIDIA 专属 MMA 输出布局属性（versionMajor/Minor + warpsPerCTA + instrShape）——整章硬绑它，ascend 须 fork 等价 pass"},
+    {"name": "DotOperandEncodingAttr", "file": "include/triton/Dialect/TritonGPU/IR/", "responsibility": "dot 操作数布局（opIdx 0/1、parent=mma 编码、kWidth）——BlockedToMMA 给 A/B 换的就是它"},
+    {"name": "WarpGroupDotOp", "file": "include/triton/Dialect/TritonNvidiaGPU/IR/（nvidia_gpu）", "responsibility": "MMAv3/Hopper WGMMA 的 dot op，操作数在共享内存（回指 warp_group_dot 章的微架构）"},
+    {"name": "TritonGPURemoveLayoutConversionsPass", "file": "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp", "responsibility": "消除多余 convert_layout 的 pass（make_ttgir 里跑三次）：前向传播四步 + backward remat + hoist convert"},
+    {"name": "LayoutPropagation", "file": "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp", "responsibility": "四阶段分析-重写引擎：initAnchorLayout / propagateLayout / resolveConflicts / rewrite"},
+    {"name": "LayoutRematerialization", "file": "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp", "responsibility": "对前向传播后残余的 convert，做向后 rematerialize / hoist 到扩位之上以进一步消除或降本"},
+    {"name": "TritonGPUOptimizeDotOperandsPass", "file": "lib/Dialect/TritonGPU/Transforms/OptimizeDotOperands.cpp", "responsibility": "把 trans 融进 dot 操作数的 swizzled 共享编码，省 shmem 往返：SwizzleShmemConvert/HoistLayoutConversion/FuseTransHopper/MMAV3UseRegOperand"}
+  ],
+
+  "data_flow": [
+    "make_ttgir 入口：convert_to_ttgpuir 把 tt.dot 落成带 blocked 编码的 ttgir（compiler.py:add_convert_to_ttgpuir）",
+    "第一次 remove_layout_conversions（compiler.py:L225）：先清一遍 coalesce/plan_cta 后的多余 convert",
+    "accelerate_matmul（compiler.py:L227 → AccelerateMatmul.cpp:runOnOperation）：getNVIDIAComputeCapability 定架构",
+    "BlockedToMMA::matchAndRewrite：getMMAVersionSafe 选版本 → mmaVersionToInstrShape 定 instr 形状 → getWarpsPerTile 分 warp → 造 NvidiaMmaEncodingAttr",
+    "换累加器编码（ConvertLayoutOp oldAcc→mma）；v1/v2 给 A/B 换 DotOperandEncodingAttr（kWidth=computeOrigBitWidth）/ v3 getSharedMemoryMMAOperand 进共享内存 + WarpGroupDotOp",
+    "replaceOpWithNewOp<ConvertLayoutOp>：把 mma 结果转回旧编码——这一步引入了新的 convert_layout",
+    "decomposeMixedModeDotOp：mma 定型后对非原生精度组合插 FpToFp 提升",
+    "第二次 remove_layout_conversions（compiler.py:L228 → RemoveLayoutConversions.cpp:runOnOperation）：把上一步引入的 convert（accumulator/operand/result 转换）尽量传播消解掉——四阶段：锚点→传播→消冲突→支配序重写，再 backward remat + hoist",
+    "optimize_dot_operands（compiler.py:L229 → OptimizeDotOperands.cpp）：SwizzleShmemConvert 把 trans 融进 swizzled 共享编码、HoistLayoutConversion 把 convert 上移贴 load 省 shmem 往返、FuseTransHopper/MMAV3UseRegOperand 优化 MMAv3 操作数",
+    "第三次 remove_layout_conversions（compiler.py:L243）：pipeline/prefetch 后再清一遍残余 convert"
+  ],
+
+  "design_decisions": [
+    {"decision": "MMA 版本按 compute capability 选，且用『候选表 + supportMMA 校验』而非硬 map", "why": "同一架构上不是所有 dot 都能用最高版本（K 太小、batched、精度不支持都会 fallback）；sm90 给 {3,2} 表意味着 v3 不成立就退 v2", "evidence": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L26-L45"},
+    {"decision": "MMAv3 操作数放共享内存、走 WarpGroupDotOp，且仅 f16/bf16 允许转置", "why": "Hopper WGMMA 从共享内存读操作数；转置融合是硬件特性，只对 16-bit 浮点开放", "evidence": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L313-L321"},
+    {"decision": "dot-operand 的 kWidth 取回溯链上最低精度位宽（computeOrigBitWidth），而非最终位宽", "why": "upcast 场景下（load fp16→算 fp32）元素分发按低精度原语排布，kWidth 应取低精度位宽才能对齐 MMA 每线程装载粒度", "evidence": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L181-L212"},
+    {"decision": "RemoveLayoutConversions 用『一次性分析 + 一次性重写』而非局部 peephole", "why": "convert 的最优消除是全局问题（一个 op 可能被多个锚点染色），局部改写会漏或反复插；先全局定编码再重写更彻底", "evidence": "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:L43-L60"},
+    {"decision": "传播时对 ConvertLayoutOp 直接令 dst 编码=src 编码", "why": "这是消 convert 的核心手段——让 convert 两端同编码即变 no-op，随后 canonicalize 折叠掉", "evidence": "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:L217-L220"},
+    {"decision": "消解冲突启发式：load/store 偏 Blocked、计算值偏 Mma", "why": "访存 op 在 blocked 布局下合并访问最优，计算 op 在 mma 布局下命中 Tensor Core；这是布局取舍的经验规则（源码自注 hacky/TODO）", "evidence": "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:L317-L328"},
+    {"decision": "backward remat 与 hoist convert 均跳过到 DotOperandEncoding 的转换", "why": "启发式为 fused attention 让路——dot-operand 的 convert 交给 OptimizeDotOperands 专门处理，避免这里破坏 attention 的融合结构", "evidence": "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:L975-L977"},
+    {"decision": "RemoveLayoutConversions 在 make_ttgir 里跑三次", "why": "accelerate_matmul、pipeline、prefetch 等 pass 各自会引入新的 convert；每次结构性变换后都要再消一轮，收敛到最少搬运", "evidence": "third_party/nvidia/backend/compiler.py:L225,L228,L243"},
+    {"decision": "OptimizeDotOperands 把 convert 上移贴近 load（HoistLayoutConversion）", "why": "省掉一次 shmem 往返（blocked→dot_operand 的 convert 走共享内存）是大收益，值得为此重复少量 elementwise 计算", "evidence": "lib/Dialect/TritonGPU/Transforms/OptimizeDotOperands.cpp:L76-L105"},
+    {"decision": "AccelerateMatmul/RemoveLayoutConversions/OptimizeDotOperands 都是 analysis→transform 母范式（回指 ch25）的实例，且都在 layout 层做优化", "why": "先分析（选版本/传播编码/查依赖切片）再一次性重写，是 Triton 全部 ttgir pass 的统一骨架；布局选得好、搬运消得净 = matmul 快", "evidence": "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:L43-L60"}
+  ],
+
+  "theory": [
+    "MMA 版本判据：v3 要求 K >= 256/位宽（f16 即 K>=16）、numWarps%4==0、M%64==0、N%8==0、dtype 在 {fp8,int8,f16,bf16,f32} 内、非 batched；任一不满足退 v2。给读者一把『为什么我的 dot 没用上 WGMMA』的核对清单。",
+    "warpsPerTile 的贪心分配：从 {1,1} 起、每步比较沿 M / 沿 N 还能放多少个 warp-tile（v2 用 shapePerWarp={16,8}），把 warp 数往剩余空间更大的轴翻倍，直到 warps 用满；链式 dot（如 attention 的两个 back-to-back dot）为让归约留在同 warp 内，全部 warp 集中在一轴。",
+    "MMAv3 instrShape 的 n 选取：k=256/位宽固定、m=16，从 validN 降序表里选首个能整除 N 且 <= maxN(=N/nWarps) 的 n——即在硬件支持的 WGMMA 形状里挑尽量大的 N 分块。",
+    "convert_layout 的成本模型（回指 ch24：convert_layout=唯一跨线程数据搬运）：blocked→dot_operand 的 convert 走共享内存往返，是 matmul 隐藏开销；三个 pass 合力把 convert 数量压到最少——RemoveLayoutConversions 消冗余、OptimizeDotOperands 把必要的 convert 上移贴 load/融进 swizzled 共享编码。",
+    "四阶段传播的收敛性：propagateLayout 用工作队列做定点迭代（编码集合只增不减、有上界故必收敛）；resolveConflicts 把每个值的多编码坍缩到一个；rewrite 按支配序单遍重写——利用 IR 结构化（区域嵌套）避免了通用支配树计算。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [],
+    "must_keep": [
+      {"symbol": "BlockedToMMA", "why": "本章脊柱重写 pattern，writer 必须逐段讲"},
+      {"symbol": "getMMAVersionSafe", "why": "按 compute capability 选 MMA 版本的核心函数，perf 诊断第一现场"},
+      {"symbol": "supportMMA", "why": "MMA 版本可用性判据（K/warps/shape/dtype 约束），读者据此核对为何没命中 Tensor Core"},
+      {"symbol": "getNVIDIAComputeCapability", "why": "整章硬绑 NVIDIA 的证据符号，姊妹篇 ascend fork 点在此"},
+      {"symbol": "NvidiaMmaEncodingAttr", "why": "MMA 输出布局属性，BlockedToMMA 的产物、配对脊柱重灾区标志"},
+      {"symbol": "DotOperandEncodingAttr", "why": "操作数换的目标编码（回指 ch27 fragment 落地）"},
+      {"symbol": "warpsPerTileV2", "why": "warpsPerTile 计算（v2），需 worked example"},
+      {"symbol": "warpsPerTileV3", "why": "warpsPerTile 计算（v3，最小 (4,1)、flash-attention 特化）"},
+      {"symbol": "mmaVersionToInstrShape", "why": "instr 形状按版本/dtype 定，warpsPerTile 与 kWidth 的输入"},
+      {"symbol": "computeOrigBitWidth", "why": "决定 dot-operand kWidth 的回溯算法"},
+      {"symbol": "getSharedMemoryMMAOperand", "why": "MMAv3 操作数进共享内存（allowTranspose 仅 f16/bf16）"},
+      {"symbol": "WarpGroupDotOp", "why": "MMAv3 特判走的 dot op（回指 warp_group_dot 章微架构）"},
+      {"symbol": "decomposeMixedModeDotOp", "why": "混合精度兜底，插 FpToFp 提升操作数"},
+      {"symbol": "ScaledBlockedToMMAv2", "why": "mxfp/fp8 scaled dot 支线"},
+      {"symbol": "UpcastMXFPOp", "why": "scaled dot 施加 scale 的 op"},
+      {"symbol": "LayoutPropagation", "why": "四阶段引擎类，writer 必须讲四步"},
+      {"symbol": "initAnchorLayout", "why": "阶段①找锚点"},
+      {"symbol": "isLayoutAnchor", "why": "锚点判据（dot/贵 load-store/permuting reshape）"},
+      {"symbol": "propagateLayout", "why": "阶段②向后代传播布局"},
+      {"symbol": "resolveConflicts", "why": "阶段③消解多编码冲突的启发式"},
+      {"symbol": "rewriteOp", "why": "阶段④按支配序重写"},
+      {"symbol": "backwardRematerialization", "why": "前向传播后消残余 convert 的补充手段"},
+      {"symbol": "hoistConvertOnTopOfExtOrBroadcast", "why": "把 convert 抬到扩位/broadcast 之上降本"},
+      {"symbol": "SwizzleShmemConvert", "why": "把 trans 融进 swizzled 共享编码（回指 ch22 swizzle / ch24 tt.trans）"},
+      {"symbol": "HoistLayoutConversion", "why": "把 convert 上移贴 load 省 shmem 往返——OptimizeDotOperands 的提速主力"},
+      {"symbol": "FuseTransHopper", "why": "MMAv3 把转置折进 alloc"},
+      {"symbol": "MMAV3UseRegOperand", "why": "MMAv3 把共享操作数换回寄存器 dot-operand"}
+    ]
+  },
+
+  "mechanisms": [
+    {
+      "id": "mma-version-select",
+      "name": "按 compute capability 选 MMA 版本（getMMAVersionSafe + supportMMA）",
+      "kind": "algorithm",
+      "source_anchors": ["lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L26-L45", "lib/Analysis/Utility.cpp:L481-L537"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "warps-per-tile",
+      "name": "warpsPerTile 计算：把 warp 沿 M/N 分配到 tile（v2/v3）",
+      "kind": "algorithm",
+      "source_anchors": ["lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L47-L104", "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L106-L132"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "instr-shape",
+      "name": "mmaVersionToInstrShape：按版本/dtype/numWarps 定 MMA 指令形状",
+      "kind": "algorithm",
+      "source_anchors": ["lib/Dialect/TritonGPU/Transforms/Utility.cpp:L26-L75"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "blocked-to-mma-rewrite",
+      "name": "BlockedToMMA 主重写：造 mmaEnc、换累加器/操作数编码、replace 回旧编码",
+      "kind": "dataflow",
+      "source_anchors": ["lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L233-L349"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "dot-operand-encoding",
+      "name": "给 A/B 换 dot-operand 编码（opIdx/parent=mma/kWidth=computeOrigBitWidth）",
+      "kind": "layout",
+      "source_anchors": ["lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L322-L344", "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L193-L212"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "mmav3-shared-operand",
+      "name": "MMAv3 特判：操作数进共享内存 + WarpGroupDot（仅 f16/bf16 允许转置）",
+      "kind": "dataflow",
+      "source_anchors": ["lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L313-L321", "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L136-L166"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "decompose-mixed-mode",
+      "name": "decomposeMixedModeDotOp：非原生精度组合插 FpToFp 兜底",
+      "kind": "dataflow",
+      "source_anchors": ["lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L362-L392"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "scaled-blocked-to-mmav2",
+      "name": "ScaledBlockedToMMAv2：mxfp/fp8 scaled dot → mmav2 + UpcastMXFP",
+      "kind": "dataflow",
+      "source_anchors": ["lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L394-L539"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "remove-layout-four-phase",
+      "name": "RemoveLayoutConversions 四阶段：锚点→传播→消冲突→支配序重写",
+      "kind": "algorithm",
+      "source_anchors": ["lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:L43-L60", "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:L1126-L1137"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "layout-anchor",
+      "name": "isLayoutAnchor + initAnchorLayout：哪些 op 的布局要保住",
+      "kind": "config",
+      "source_anchors": ["lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:L168-L206"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "propagate-and-resolve",
+      "name": "前向传播（convert 用 dst=src 抵消 + inferDstEncoding）与冲突消解启发式",
+      "kind": "dataflow",
+      "source_anchors": ["lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:L208-L332"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "backward-remat-hoist",
+      "name": "backward remat + hoist convert：消/降本残余 convert（跳过 dot-operand）",
+      "kind": "dataflow",
+      "source_anchors": ["lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:L971-L1010", "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:L1014-L1030"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "remove-layout-thrice",
+      "name": "make_ttgir 里 RemoveLayoutConversions 出现三次（每次结构变换后再消一轮）",
+      "kind": "config",
+      "source_anchors": ["third_party/nvidia/backend/compiler.py:L225-L243"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "optimize-dot-operands-swizzle",
+      "name": "OptimizeDotOperands 四 pattern：融 trans 进 swizzled 共享编码、上移 convert 省 shmem 往返",
+      "kind": "dataflow",
+      "source_anchors": ["lib/Dialect/TritonGPU/Transforms/OptimizeDotOperands.cpp:L23-L74", "lib/Dialect/TritonGPU/Transforms/OptimizeDotOperands.cpp:L76-L198", "lib/Dialect/TritonGPU/Transforms/OptimizeDotOperands.cpp:L206-L301"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "analysis-transform-paradigm",
+      "name": "三 pass 同属 analysis→transform 母范式、且都在 layout 层做优化（回指 ch25）",
+      "kind": "protocol",
+      "source_anchors": ["lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L552-L567", "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:L1126-L1137", "lib/Dialect/TritonGPU/Transforms/OptimizeDotOperands.cpp:L315-L332"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    }
+  ],
+
+  "foreshadow_due": {"plant": [], "payoff": [], "note": "bible.py due ch28 返回空——本章无伏笔埋/回收（与 workflow 焦点一致）"}
+}

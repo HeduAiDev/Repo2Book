@@ -1,0 +1,262 @@
+{
+  "chapter_id": "ch28",
+  "slug": "ch28-accelerate-matmul-layout-opt",
+  "note": "skip_impl 章,无 subtract-only 精简版。pin dump make_ttgir 需 cuda:NN target(host 无 CUDA),故所有 worked_example 为手工推演(trace_source=manual)。三个纯算术机制(mma-version-select/warps-per-tile/instr-shape)另用 traces/port_verify.py——把 getMMAVersionSafe/supportMMA/warpsPerTileV2/V3/mmaVersionToInstrShape 逐分支移植到 Python——跑出数字校验,输出存 traces/port_verify.out;四阶段消 convert 为结构走查 traces/remove_layout_walkthrough.md。",
+
+  "mechanisms": [
+    {
+      "mechanism_id": "mma-version-select",
+      "intuition": "站台等级(compute capability)决定你能坐哪档车:sm70 只有绿皮(v1)、sm8x 是特快(v2)、sm90 才有高铁 WGMMA(v3)。但车太短(K 太小,一节车厢都填不满)、或超载没买对票(f32 没开 TF32)照样上不了高铁——只能退回下一档。getMMAVersionSafe 就是这个『按站台给候选表、逐档验票、取能上的最高档』的售票员。",
+      "worked_example": {
+        "params": {
+          "dot": "D[128,128]f32 = A[128,K]f16 @ B[K,128]f16 (retShapePerCTA=[128,128], numWarps=4)",
+          "varying": "compute capability / K / dtype / inputPrecision",
+          "note": "数字由 traces/port_verify.py 的 getMMAVersionSafe+supportMMA 移植跑出,见 traces/port_verify.out 第 1 段"
+        },
+        "trace_source": "manual",
+        "manual_reason": "skip_impl 章无精简版;pin dump 需 cuda 目标,host 无 CUDA。表内每行的候选表与逐版本 supportMMA 判定由 traces/port_verify.py(源码 1:1 移植)跑出核对,输出 traces/port_verify.out。K 门槛=256/位宽等常量标 file:Lxxx。",
+        "trace_ref": "traces/port_verify.out",
+        "table": {
+          "columns": ["场景(cap, A/B, K, prec)", "候选表 versionsSupported", "逐版本 supportMMA", "选中版本", "为什么"],
+          "rows": [
+            ["sm70, f16/f16, K=64, ieee", "{1}", "v1:True", "v1", "cap<75→只给 v1;f16 恒支持"],
+            ["sm80, f16/f16, K=64, ieee", "{2}", "v2:True", "v2", "75≤cap<90→只给 v2"],
+            ["sm90, f16/f16, K=64, ieee", "{3,2}", "v3:True", "v3", "K=64≥256/16=16、M=128%64=0、N=128%8=0、nW=4%4=0 全过→命中 WGMMA"],
+            ["sm90, f16/f16, K=8, ieee", "{3,2}", "v3:False, v2:True", "v2", "K=8<256/16=16→v3 失败退 v2(『我的 dot 没用上 WGMMA』头号原因)"],
+            ["sm90, f32/f32, K=64, TF32", "{3,2}", "v3:True", "v3", "f32/f32 需 inputPrecision==TF32 且 version≥2"],
+            ["sm90, f32/f32, K=64, ieee", "{3,2}", "v3:False, v2:False", "v0(退回 FMA)", "f32 未开 TF32→v3/v2 都失败,根本不进 Tensor Core"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "候选表长度有限(≤2)且按版本降序;循环遇首个 supportMMA 成立即返回,遍历完返回 0。返回值必是『硬件 + 该 dot 都支持的最高 MMA 版本』,否则 0。",
+        "argument": "versionsSupported 由 cap 分档硬编码({1}/{2}/{3,2}),元素数 ≤2 且严格降序→for 循环至多 2 次迭代必停(有限性)。每次只做 supportMMA 布尔判定不改状态,首个 True 即 return(选到的是遍历顺序即偏好顺序里第一个成立者=最高可用版本);无一成立 return 0。"
+      },
+      "quantified": "K 门槛(理论)= 256 / 元素位宽:f16 即 K≥256/16=16、f32 即 K≥256/32=8、fp8/int8 即 K≥256/8=32。本例 sm90 f16 下 K=64≥16 命中 v3,K=8<16 退 v2。f32/f32 额外需 TF32 且 version≥2:开 TF32→v3,IEEE→v3 与 v2 皆失败→版本 0、退回 blocked/FMA 完全不碰 Tensor Core。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-mma-version-gate",
+          "claim": "MMA 版本 = compute capability 选候选表,再让 dot 逐个过 supportMMA 的 K/warps/shape/dtype 门,任一不满足就退档或退回 FMA。",
+          "template": "flow",
+          "numbers": [
+            {"name": "cap 分档阈值", "value": "75 / 90 / 100", "provenance": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L30-L38"},
+            {"name": "v3 K 门槛(f16)", "value": "256/16=16", "provenance": "lib/Analysis/Utility.cpp:L494"},
+            {"name": "v3 shape/warps 门", "value": "M%64=0, N%8=0, numWarps%4=0", "provenance": "lib/Analysis/Utility.cpp:L503-L504"},
+            {"name": "f32/f32 门", "value": "inputPrecision==TF32 且 version>=2", "provenance": "lib/Analysis/Utility.cpp:L518"},
+            {"name": "失败落点", "value": "chosen=0 → 退回 blocked/FMA", "provenance": "traces/port_verify.out 第6行"}
+          ],
+          "caption_draft": "从 compute capability 到 MMA 版本的判定链:sm90 给 {3,2} 候选,v3 过不了 K/shape/dtype 门就退 v2;f32 没开 TF32 连 v2 也过不了,直接返回 0 不进 Tensor Core——这是『matmul 没提速』的第一诊断点。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "warps-per-tile",
+      "intuition": "8 个工人(warp)分一块 128×128 的地(输出 tile)。每人一次至少能耕 16×8 的一畦(shapePerWarp)。贪心分工:每一步看『行方向还剩几畦、列方向还剩几畦』,往剩得多的那边再派一个人(该维 warp 数 ×2),直到 8 个人派光。链式 dot(如 flash-attention 前后两个 dot)则反过来——把人全挤到一条轴上,让归约留在同一个 warp 内。",
+      "worked_example": {
+        "params": {
+          "shape": "输出 tile [M,N]=[128,128], numWarps=8, 单 dot(非链式), v2",
+          "shapePerWarp": "[16, 8] (rank-2→16, rank-1→8)",
+          "note": "逐 iter 数字由 traces/port_verify.py 的 warpsPerTileV2 移植跑出,见 traces/port_verify.out 第 2 段"
+        },
+        "trace_source": "manual",
+        "manual_reason": "skip_impl 章无精简版;pin dump 需 cuda 目标。warpsPerTileV2 的循环逐 iter 状态由 traces/port_verify.py(源码逐行移植)跑出核对,输出 traces/port_verify.out。",
+        "trace_ref": "traces/port_verify.out",
+        "table": {
+          "columns": ["iter", "ret 前", "prod", "LHS=M/16/ret0", "RHS=N/16/ret1", "分支", "ret 后"],
+          "rows": [
+            ["1", "[1,1]", "1", "8", "8", "LHS>=RHS 且 ret0<8 → M×2", "[2,1]"],
+            ["2", "[2,1]", "2", "4", "8", "LHS<RHS → N×2", "[2,2]"],
+            ["3", "[2,2]", "4", "4", "4", "LHS>=RHS 且 ret0<8 → M×2", "[4,2]"],
+            ["4", "[4,2]", "8", "—", "—", "prod>=numWarps → break", "[4,2]"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "每次迭代恰有一维 ×2 → ret[0]*ret[1] 严格翻倍;numWarps 有限 → 至多 ceil(log2(numWarps)) 次翻倍后 prod>=numWarps 而 break。且 M×2 分支带 `ret[0] < M/shapePerWarp[0]` 守卫,warp 不会沿某维过度切分超出 tile 容量。",
+        "argument": "乘积单调:循环体每轮把 ret[0] 或 ret[1] 之一乘 2,故 prod 每轮 ×2,是严格递增的正整数序列、上界 numWarps→有限步(log2)必触发 `prod>=numWarps` 的 break(终止性)。非过度切分:沿 M 加人前先验 `ret[0] < M/16`,达到上限就转投 N,保证每维 warp 数不超过该维可容纳的 warp-tile 数。"
+      },
+      "quantified": "numWarps=8 → log2(8)=3 次翻倍 + 1 次 break 检查 = 循环体进 4 次,得 warpsPerTile=[4,2](沿 M 放 4、沿 N 放 2,共 8)。每 warp 负责的子块 = [128/4, 128/2] = [32,64]。链式 dot(shape[0]>=shape[1])则直接 [numWarps,1]=[8,1];v3 最小 warp 单元固定 (4,1),flash-attention 同样只沿一轴分。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-warps-per-tile",
+          "claim": "128×128 输出 tile 上 8 个 warp 被贪心分成 4×2 网格,每个 warp 独占 32×64 的子块。",
+          "template": "tiling",
+          "numbers": [
+            {"name": "tile 尺寸", "value": "128×128", "provenance": "worked_example params"},
+            {"name": "numWarps", "value": "8", "provenance": "worked_example params"},
+            {"name": "warpsPerTile", "value": "[4,2]", "provenance": "traces/port_verify.out 第2段 => warpsPerTile"},
+            {"name": "每 warp 子块", "value": "32×64", "provenance": "traces/port_verify.out 第2段 per-warp tile"},
+            {"name": "shapePerWarp", "value": "[16,8]", "provenance": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L84-L86"}
+          ],
+          "caption_draft": "warpsPerTileV2 的贪心结果:8 个 warp 沿 M 分 4 份、沿 N 分 2 份,每 warp 管 32×64。分配沿『剩余空间更大的轴』翻倍,直到 warp 用满——warp 数与 tile 形状不匹配时这里就是 occupancy 损失的源头。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "instr-shape",
+      "intuition": "指令形状 (m,n,k) 是 Tensor Core 一条指令能吞下的最小 M×N×K 砖块。v1/v2 是固定砖(16×16 / 16×8);v3(Hopper WGMMA)砖可大可小——N 方向有一张从 256 往下的候选表,但一个 warp-group 分到的 N 预算(maxN)封顶,于是取『能整除输出 N 且不超预算的最大砖』,砖越大每条指令干的活越多。",
+      "worked_example": {
+        "params": {
+          "cases": "v1 / v2 / v3(两组 shape) 对照, dtype=f16",
+          "v3公式": "k=256/位宽; m=16; mWarps=max(M/16,1); nWarps=max(numWarps/mWarps,1); maxN=max(N/nWarps,8); n=validN 降序里首个满足 N%n==0 且 n<=maxN",
+          "note": "数字由 traces/port_verify.py 的 mmaVersionToInstrShape 移植跑出,见 traces/port_verify.out 第 3 段"
+        },
+        "trace_source": "manual",
+        "manual_reason": "skip_impl 章无精简版;pin dump 需 cuda 目标。v1/v2 为源码常量({16,16}/{16,8},Utility.cpp:L29-L36),v3 的 n 选取由 traces/port_verify.py(逐行移植 validN 表+maxN 反推)跑出核对,输出 traces/port_verify.out。",
+        "trace_ref": "traces/port_verify.out",
+        "table": {
+          "columns": ["version", "shape[M,N]", "numWarps", "k=256/16", "mWarps", "nWarps", "maxN", "选中 n", "instrShape"],
+          "rows": [
+            ["v1", "任意", "—", "—", "—", "—", "—", "—", "[16,16] (固定)"],
+            ["v2", "任意", "—", "—", "—", "—", "—", "—", "[16,8] (固定)"],
+            ["v3 f16", "[128,128]", "4", "16", "8", "1", "128", "128", "[16,128,16]"],
+            ["v3 f16", "[32,128]", "8", "16", "2", "4", "32", "32", "[16,32,16] (maxN 夹到 32)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "v3 沿 validN 降序遍历,返回首个同时满足 (N % n == 0) 且 (n <= maxN) 的 n,必是不超每 warp-group N 预算、又能整除输出 N 的最大合法砖;validN 含 8 且入口已断言 N%8==0 → 遍历必命中,不会走到末尾 assert。",
+        "argument": "validN 严格降序,循环取首个合法者→即最大合法 n(基例+单调:降序表中第一个通过双条件者不小于其后任何合法者)。命中性:validN 末元素为 8,而 mmaVersionToInstrShape 入口已保证 shape[1]%8==0(否则 assert),且 maxN=max(N/nWarps,8)>=8,故 n=8 至少满足双条件→循环必在 8 之前(含)返回。"
+      },
+      "quantified": "f16 下 k 恒 = 256/16 = 16。shape=[128,128]、numWarps=4:mWarps=128/16=8、nWarps=max(4/8,1)=1、maxN=128 → 取 n=128(validN 里 ≤128 的最大整除者),instrShape=[16,128,16]。改 shape=[32,128]、numWarps=8:mWarps=max(32/16)=2、nWarps=max(8/2)=4、maxN=max(128/4)=32 → n 被夹到 32,instrShape=[16,32,16]——同样 f16、同样 N=128,仅因 warp 沿 M 摊薄、每 warp-group N 预算变小,砖就缩了。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "remove-layout-four-phase",
+      "intuition": "一堆搬运工(convert_layout)在流水线上把数据从一种排布倒成另一种。RemoveLayoutConversions 不逐个 peephole,而是先『全局普查』:①认定哪些环节的排布必须保住(锚点:dot、贵 load/store);②让锚点的排布顺着数据流往下游『染色』,碰到搬运工就故意让它两端同色(dst=src)使其变成白干;③一个值被多个锚点染成多色时按启发式坍缩到一色;④最后按支配序一遍重写,两端同色的搬运工被 canonicalize 当死代码折掉。",
+      "worked_example": {
+        "params": {
+          "ir": "一个冗余 convert 往返:load#blocked → convert→#mma → convert→#blocked → addf → store#blocked(coalesce/plan_cta 常留这种转过去又转回来)",
+          "初始convert数": 2,
+          "note": "IR 与逐阶段 convert 计数见 traces/remove_layout_walkthrough.md;convert 数可由 IR 结构直接数出"
+        },
+        "trace_source": "manual",
+        "manual_reason": "skip_impl 章无精简版;pin dump make_ttgir 需 cuda:NN target,host 无 CUDA。四阶段按 RemoveLayoutConversions.cpp:L43-L60(算法总述)+L1126-L1185(runOnOperation)+L208-L230(convert 令 dst=src)手工走查,convert 计数由 IR 结构直接可数,详见 traces/remove_layout_walkthrough.md。",
+        "trace_ref": "traces/remove_layout_walkthrough.md",
+        "table": {
+          "columns": ["阶段", "源码", "动作", "convert 数"],
+          "rows": [
+            ["①initAnchorLayout", "L168-L206", "锚点 = load %0→#blocked、函数参数、store 期望#blocked(本例无 dot/atomic)", "2"],
+            ["②propagateLayout", "L208-L230", "前向定点迭代:遇 convert 令 dst:=src → %1:=#blocked、%2:=#blocked;addf inferDst → %3:=#blocked", "2"],
+            ["③resolveConflicts", "L311-L332", "每个值只剩单编码(全 #blocked)→无冲突,不插新 convert", "2"],
+            ["④rewrite+canonicalize", "L666-L717", "两个 convert 都成 #blocked→#blocked no-op → canonicalize 折掉死 convert", "0"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "②propagateLayout 的定点迭代必收敛:每个值的编码集合只增不减且有上界(有限种编码),故工作队列有限步内清空。整体消除量 >= 0,不会新增净 convert(③冲突只在必要处插 convert 换取每值单编码)。",
+        "argument": "收敛性:propagateLayout 用工作队列,setEncoding 仅当某值编码集合『新插入一个元素』时才把该值重新入队(hasChanged);编码种类有限→每个值被更新次数有上界→队列有限步清空(单调增+有上界=定点)。非劣化:①-②纯分析不改 IR;③给冲突值坍缩到单编码,至多在跨编码边界插 convert(把多处冲突集中成一次);④重写后两端同编码的 convert 被 canonicalize 删。故 convert 总数单调不增,冗余往返被清零。"
+      },
+      "quantified": "本例 2 个 convert → 0(消除率 100%,因两者构成纯往返)。matmul 场景 BlockedToMMA 后典型残留 4 个 convert(acc→mma、A→dot_operand、B→dot_operand、result mma→blocked):acc 若 splat 常量经 backward remat 消除、result 被 store 消费则存活为必要 convert、而两个 dot_operand convert 被 backward remat 显式跳过(L975-L977 给 fused-attention 让路)存活到 OptimizeDotOperands——这正是 make_ttgir 要跑三趟 RemoveLayoutConversions(compiler.py L225/L228/L243)的原因:单趟消不净。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-remove-layout-four-phase",
+          "claim": "RemoveLayoutConversions 四阶段把一个 blocked→mma→blocked 的冗余 convert 往返从 2 个消到 0:锚点定色→前向染色(convert 令 dst=src)→消冲突→支配序重写折死 convert。",
+          "template": "state-table",
+          "numbers": [
+            {"name": "初始 convert 数", "value": "2", "provenance": "traces/remove_layout_walkthrough.md 输入 IR"},
+            {"name": "①②③后 convert 数", "value": "2", "provenance": "traces/remove_layout_walkthrough.md 阶段表"},
+            {"name": "④后 convert 数", "value": "0", "provenance": "traces/remove_layout_walkthrough.md 阶段表"},
+            {"name": "convert 令 dst=src", "value": "L208-L230", "provenance": "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:L217-L220"}
+          ],
+          "caption_draft": "四阶段消 convert 的状态轨迹 2→2→2→0:前三阶段只做分析(convert 数不动),真正的删除发生在第四阶段——所有被染成两端同色的 convert 被 canonicalize 当死代码折掉。这是 matmul 隐藏搬运开销被清除的机制。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "blocked-to-mma-rewrite",
+      "figure_specs": [
+        {
+          "figure_id": "fig-blocked-to-mma-rewrite",
+          "claim": "BlockedToMMA 把 blocked 编码的 tt.dot 换成 NvidiaMmaEncodingAttr,补 3 个操作数 convert(acc/A/B)并在结果处补 1 个 convert 转回旧编码——这个结果 convert 正是 RemoveLayoutConversions 稍后要消的对象。",
+          "template": "before-after",
+          "numbers": [
+            {"name": "重写前 dot 编码", "value": "blocked", "provenance": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L237-L241"},
+            {"name": "重写后 dot 编码", "value": "NvidiaMmaEncodingAttr", "provenance": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L258-L263"},
+            {"name": "新增 convert 数", "value": "4 (acc→mma, A→dot_op, B→dot_op, result→blocked)", "provenance": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L233-L349"},
+            {"name": "结果 convert(消除对象)", "value": "replaceOpWithNewOp<ConvertLayoutOp> mma→oldRetType", "provenance": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L346-L348"}
+          ],
+          "caption_draft": "BlockedToMMA 的重写前后:tt.dot 的输出编码从 blocked 变成 mma,累加器/A/B 各补一次 convert 进 mma/dot-operand 编码,结果再 convert 回旧编码。它是『造 mma 编码』与『引入 convert』的同一步——引入的 convert 由下游 RemoveLayoutConversions/OptimizeDotOperands 收拾。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "dot-operand-encoding",
+      "figure_specs": [
+        {
+          "figure_id": "fig-dot-operand-encoding",
+          "claim": "v1/v2 分支给 A/B 各换成 DotOperandEncodingAttr(opIdx=0/1、parent=刚造的 mma 编码、kWidth=回溯链最低位宽 computeOrigBitWidth),把操作数排成 Tensor Core 每线程装载的粒度。",
+          "template": "layout",
+          "numbers": [
+            {"name": "A operand opIdx", "value": "0", "provenance": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L326-L328"},
+            {"name": "B operand opIdx", "value": "1", "provenance": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L335-L337"},
+            {"name": "parent 编码", "value": "newRetType 的 mma 编码", "provenance": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L327/L336"},
+            {"name": "kWidth (f16 上溯到 f16)", "value": "16", "provenance": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L193-L212 computeOrigBitWidth"},
+            {"name": "kWidth 语义", "value": "回溯 shape-preserving 一元链取最低位宽", "provenance": "lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L173-L212"}
+          ],
+          "caption_draft": "A/B 换 dot-operand 编码:opIdx 区分左右操作数、parent 指向 mma 编码(回指 ch27 fragment 落地)、kWidth 取回溯链最低精度位宽——upcast 场景(load f16 算 f32)下按低精度粒度分发才对齐 MMA 每线程装载。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "propagate-and-resolve",
+      "figure_specs": [
+        {
+          "figure_id": "fig-propagate-resolve",
+          "claim": "前向传播给每个值攒一个编码集合:遇 ConvertLayoutOp 令 dst=src(意图消掉它)、其余 op 用 inferDstEncoding 推;一个值攒到多个编码时按 load/store 偏 Blocked、计算值偏 Mma 坍缩到唯一编码。",
+          "template": "flow",
+          "numbers": [
+            {"name": "convert 传播规则", "value": "dstEncoding := 源编码", "provenance": "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:L217-L220"},
+            {"name": "非 convert 传播", "value": "inferDstEncoding(op, encoding)", "provenance": "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:L221-L222"},
+            {"name": "冲突偏好(访存)", "value": "Blocked", "provenance": "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:L322-L325"},
+            {"name": "冲突偏好(计算)", "value": "Mma", "provenance": "lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:L322-L325"}
+          ],
+          "caption_draft": "传播(setEncoding)与消冲突(resolveConflicts)两步:convert 被故意染成两端同色以待折除,多编码值按『访存偏 Blocked、计算偏 Mma』坍缩——保证每个值最终只有一个编码,重写才无歧义。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "remove-layout-thrice",
+      "figure_specs": [
+        {
+          "figure_id": "fig-remove-layout-thrice",
+          "claim": "make_ttgir 里 RemoveLayoutConversions 出现三次(compiler.py L225/L228/L243),夹着 accelerate_matmul、pipeline、prefetch——每次结构变换都引入新 convert,故要反复消一轮才收敛到最少搬运。",
+          "template": "flow",
+          "numbers": [
+            {"name": "第 1 次", "value": "L225 (coalesce/plan_cta 后)", "provenance": "third_party/nvidia/backend/compiler.py:L225"},
+            {"name": "accelerate_matmul", "value": "L227 (引入 acc/operand/result convert)", "provenance": "third_party/nvidia/backend/compiler.py:L227"},
+            {"name": "第 2 次", "value": "L228 (消 accelerate_matmul 引入的 convert)", "provenance": "third_party/nvidia/backend/compiler.py:L228"},
+            {"name": "第 3 次", "value": "L243 (pipeline/prefetch 后)", "provenance": "third_party/nvidia/backend/compiler.py:L243"},
+            {"name": "出现次数", "value": "3", "provenance": "third_party/nvidia/backend/compiler.py:L225-L243"}
+          ],
+          "caption_draft": "RemoveLayoutConversions 在 make_ttgir 跑三次:每次结构性变换(accelerate_matmul / pipeline / prefetch)都会引入新的 convert_layout,单趟消不净,反复消直到搬运收敛到最少——布局优化是个多轮不动点过程。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "optimize-dot-operands-swizzle",
+      "figure_specs": [
+        {
+          "figure_id": "fig-optimize-dot-operands",
+          "claim": "HoistLayoutConversion 把 blocked→dot_operand 的 convert 上移穿过 elementwise、贴到 load 处,省掉一次 shmem 往返(blocked→dot_operand 的 convert 走共享内存);SwizzleShmemConvert 则把 trans 融进 swizzled 共享编码。",
+          "template": "before-after",
+          "numbers": [
+            {"name": "改前 shmem 往返", "value": "1 (load→blocked→elementwise→convert dot_operand)", "provenance": "lib/Dialect/TritonGPU/Transforms/OptimizeDotOperands.cpp:L82-L88"},
+            {"name": "改后 shmem 往返", "value": "0 (load→dot_operand→elementwise→dot)", "provenance": "lib/Dialect/TritonGPU/Transforms/OptimizeDotOperands.cpp:L90-L98"},
+            {"name": "四 pattern", "value": "SwizzleShmemConvert / HoistLayoutConversion / FuseTransHopper / MMAV3UseRegOperand", "provenance": "lib/Dialect/TritonGPU/Transforms/OptimizeDotOperands.cpp:L323-L328"},
+            {"name": "hoist 开关", "value": "capability>=80", "provenance": "third_party/nvidia/backend/compiler.py:L229"}
+          ],
+          "caption_draft": "OptimizeDotOperands 的提速主力 HoistLayoutConversion:把 convert 上移贴近 load,让 elementwise 直接在 dot_operand 布局上做,省掉一次 shmem 往返(代价是重复少量 elementwise 计算)。SwizzleShmemConvert 顺手把 tt.trans 融进 swizzled 共享编码(回指 ch22 swizzle / ch24 tt.trans)。"
+        }
+      ]
+    }
+  ]
+}

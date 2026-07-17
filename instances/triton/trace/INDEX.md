@@ -5,6 +5,7 @@
 ## Recent Activity
 
 | Date | Type | Chapter | Summary | File |
+| 2026-07-17 | delivery | ch28 | ch28《AccelerateMatmul 与布局最优化：tt.dot→MMA、减少 convert_layout》定稿 | [2026-07-17_ch28-ch28《acceleratematmul-与布局最优化：tt.dot→mma、减少-convert_layout》定稿.md](deliveries/2026-07-17_ch28-ch28《acceleratematmul-与布局最优化：tt.dot→mma、减少-convert_layout》定稿.md) |
 | 2026-07-17 | delivery | ch26 | ch26《共享内存分配与屏障:Allocation、Alias 与 Membar》定稿——Part VI | [2026-07-17_ch26-ch26《共享内存分配与屏障:allocation、alias-与-membar》定稿——part-vi.md](deliveries/2026-07-17_ch26-ch26《共享内存分配与屏障:allocation、alias-与-membar》定稿——part-vi.md) |
 | 2026-07-17 | delivery | 27 | ch27《Tensor Core 与 MMA 布局》定稿——primer,fragment 硬件契约倒逼编码 | [2026-07-17_ch27-ch27《tensor-core-与-mma-布局》定稿——primer,fragment-硬件契约倒逼编码.md](deliveries/2026-07-17_ch27-ch27《tensor-core-与-mma-布局》定稿——primer,fragment-硬件契约倒逼编码.md) |
 | 2026-07-17 | delivery | ch24 | ch24《ttg.* 与 ttng.* 算子:布局转换、异步拷贝与 Hopper 硬件方言》定稿——Part V 收官（回收 f10+f15） | [2026-07-17_ch24-ttg-ttng-operations-定稿-part-v-收官.md](deliveries/2026-07-17_ch24-ttg-ttng-operations-定稿-part-v-收官.md) |
@@ -14,4 +15,3 @@
 | 2026-07-17 | delivery | 21 | ch21《Distributed 布局：Blocked、Slice、MMA 与 DotOperand 编码》定稿（skip_impl，无新伏笔） | [2026-07-17_ch21-ch21-distributed-layouts-delivered-(skip_impl).md](deliveries/2026-07-17_ch21-ch21-distributed-layouts-delivered-(skip_impl).md) |
 | 2026-07-17 | delivery | 20 | ch20《布局即函数：GPU 张量凭什么和普通张量不同》定稿（primer，回收 f14，新开 f17） | [2026-07-17_ch20-ch20-layout-is-a-function-delivered-(primer).md](deliveries/2026-07-17_ch20-ch20-layout-is-a-function-delivered-(primer).md) |
 | 2026-07-17 | delivery | 17 | ch17《控制流下降到结构化 IR：if/for/while 如何变成 scf 与 φ》定稿 | [2026-07-17_ch17-ch17《控制流下降到结构化-ir：if-for-while-如何变成-scf-与-φ》定稿.md](deliveries/2026-07-17_ch17-ch17《控制流下降到结构化-ir：if-for-while-如何变成-scf-与-φ》定稿.md) |
-| 2026-07-17 | delivery | 18 | ch18-pybind-bridge-libtriton-delivered-(skip_impl) | [2026-07-17_ch18-ch18-pybind-bridge-libtriton-delivered-(skip_impl).md](deliveries/2026-07-17_ch18-ch18-pybind-bridge-libtriton-delivered-(skip_impl).md) |
