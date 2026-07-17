@@ -49,8 +49,11 @@ _CODE_FENCE_RE = re.compile(r"```(?:python|py|cpp|c\+\+|cc|cxx|c|cuda)\b.*?```",
 # 行号区间相交。
 _MECH_ANCHOR_RE = re.compile(r"([\w./-]+\.(?:py|cpp|cc|cxx|h|hpp|cu)):L(\d+)-L(\d+)")
 _alt_prefixes = "|".join(re.escape(p) for p in sorted(set(_PREFIXES), key=len, reverse=True))
+# 接受 `#`(Python 注释)与 `//`(C/C++/MLIR 注释)两种锚点前缀:Part VI 起大量
+# .cpp/.h/.td 章节用 `//` 标注内嵌源码块行号,只认 `#` 会把 .cpp 锚定的 core 机制
+# 系统性误报『缺源码层』(ch24/ch28 均中招)。
 _BLOCK_MARKER_RE = re.compile(
-    r"^#\s*(?P<path>(?:" + _alt_prefixes + r")/[\w./-]+\.(?:py|cpp|cc|cxx|h|hpp|cu))"
+    r"^(?:#|//)\s*(?P<path>(?:" + _alt_prefixes + r")/[\w./-]+\.(?:py|cpp|cc|cxx|h|hpp|cu))"
     r"(?::L(?P<la>\d+)(?:-L?(?P<lb>\d+))?)?.*$",
     re.M,
 )
