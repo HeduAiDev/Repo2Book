@@ -1,0 +1,303 @@
+{
+  "chapter": "ch43-capstone-fused-attention-end-to-end",
+  "provenance_note": "本章 skip_impl(无精简版)。m1 数值走查用 host numpy 忠实复现 tutorial 06 的 exp2 在线 softmax 递推(traces/run_online_softmax.py → traces/online_softmax.json),非目标核实跑(核需 GPU);m3-m6 的 IR 地标全部取自真机抓到的 dump(dossier/ir-evidence/_attn_fwd.{ttir,ttgir,llir,ptx})。取证机(triton 3.6.0 / sm_120a)与 pin(3.2.0)不完全一致——引用的都是 3.2.0↔3.6.0 稳定的『地标』(tt.dot/#mma versionMajor=2/mma.sync.m16n8k16/ex2.approx/cp.async),writer/illustrator 须显式标注版本出入,勿把捕获版当 pin 版逐字呈现。",
+  "mechanisms": [
+    {
+      "mechanism_id": "m1-online-softmax-tl-surface",
+      "intuition": "把注意力想成『边读边打分、随时纠偏的评委』:K/V 序列太长,一次读不完,就分块喂进来。每读一块新 key,若发现新的最高分比之前记的更高,就把之前所有累积的分数按同一把新尺子缩小一点(alpha 重标定),再把新块加进来——这样永远不会因为某个超大分数把指数算爆(数值稳定),也永远不用把整张 N×N 的打分表摊在显存里。block pointer 的 tl.advance 就是那只『每读完一块把窗口往序列维挪一格、窗口形状/order/strides 全程不变、只挪起点』的手(回收 ch07 f8 伏笔)。",
+      "worked_example": {
+        "params": {
+          "HEAD_DIM": 4,
+          "BLOCK_M": 2,
+          "BLOCK_N": 2,
+          "N_CTX": 4,
+          "n_blocks": 2,
+          "sm_scale": 0.5,
+          "qk_scale": "0.72134752 = sm_scale * 1.44269504(1/ln2,源码 L162-L163)",
+          "query_row": "追踪 query 行 0,q=[1,0,1,0];block1 的 key 刻意与 q 对齐使其得分更高,让 m_i 真的增长、alpha<1 的重标定被触发(非退化)",
+          "recurrence_branch": "else / 非因果分支(_attn_fwd_inner L69-L77):m_ij=max(m_i, rowmax*qk_scale); qk=qk*qk_scale-m_ij; p=exp2(qk); alpha=exp2(m_i-m_ij); l_i=l_i*alpha+sum(p); acc=acc*alpha+p@v"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/online_softmax.json",
+        "table": {
+          "columns": [
+            "轮次/K块",
+            "qk 原始(未缩放)",
+            "rowmax",
+            "m_ij(本轮最高分)",
+            "alpha=exp2(m_i-m_ij)",
+            "l_i(累积分母)",
+            "acc(累积输出 4 维)",
+            "本轮判定"
+          ],
+          "rows": [
+            [
+              "1 / block 0",
+              "[1.0, 0.0]",
+              "1.0",
+              "0.7213",
+              "0.0",
+              "1.6065",
+              "[1.0, 0.6065, 0.0, 0.0]",
+              "m_i 初值 -inf → alpha=exp2(-inf)=0,把 l_i 的初值 1.0 一乘归零(源码里那个 +1.0 哨兵被首块自动抹掉);acc 从 0 起,直接吃第一块 p@v"
+            ],
+            [
+              "2 / block 1",
+              "[4.0, 0.0]",
+              "4.0",
+              "2.8854",
+              "0.2231",
+              "1.4938",
+              "[0.2231, 0.1353, 1.0, 0.1353]",
+              "新最高分 2.8854 > 旧 0.7213,m_i 增长;alpha=0.2231<1 把上一轮的 acc/l_i 按同一把尺子缩小,再加第二块——这是在线 softmax 的重标定核心"
+            ]
+          ]
+        },
+        "epilogue_note": "收尾(源码 L184-L186):acc /= l_i、M = m_i + log2(l_i)。本例 l_i=1.4938,输出 o = acc/l_i = [0.1494, 0.0906, 0.6694, 0.0906],M = 2.8854 + log2(1.4938) = 3.4644。数字全部出自 traces/online_softmax.json。"
+      },
+      "invariant": {
+        "claim": "m_i(running rowmax,以 log2 底计)沿 K 块单调非减,故每一步的重标定因子 alpha=exp2(m_i_old - m_ij) ∈ (0,1],所有进入 exp2 的指数 qk*qk_scale - m_ij 都 ≤ 0,exp2 结果落在 (0,1] —— 全程不溢出,且分块累积的 (l_i,acc) 在收尾除以 l_i 后等于对全序列一次性 softmax 的精确结果。",
+        "argument": "基例:第一块,m_ij=max(-inf, rowmax*qk_scale)=rowmax*qk_scale,qk-m_ij≤0 成立,alpha=exp2(-inf-m_ij)=0 把 l_i 的哨兵初值 1.0 清掉,得 l_i=sum(exp2(qk-m_ij)),acc=p@v —— 恰为『只到第一块为止』的精确 softmax 未归一化和。归纳步:设进第 t 块前 (l_i,acc) 是前 t-1 块相对旧基准 m_i 的精确未归一化和;取 m_ij=max(m_i, 本块rowmax*qk_scale)≥m_i,乘 alpha=exp2(m_i-m_ij)∈(0,1] 把旧和换算到新基准 m_ij,再加本块 exp2(qk*qk_scale-m_ij)·(1,v)——两部分同基准,和仍为前 t 块相对 m_ij 的精确未归一化和。单调量 = m_i(非减且有上界=全序列最大打分),归纳成立;基准可任意平移不改归一化后的商,故收尾 acc/l_i 与一次性 softmax 相等。断言之外的骨架即此基例+归纳步。",
+        "monotone_quantity": "m_i 沿 K 块非减(m_ij=max(m_i,·)≥m_i),上界为全序列最高打分 —— 有界单调,循环 cdiv(N_CTX,BLOCK_N) 步必停。"
+      },
+      "quantified": "显存/复杂度对比(用真机捕获配置 BLOCK_M=128、HEAD_DIM=64,dossier ir_dump_provenance):在线 softmax 常驻 acc = BLOCK_M×HEAD_DIM = 128×64 f32 = 8192 float ≈ 32 KB(128×64×4 = 32768 字节),与 N_CTX 无关;若物化整张 QK^T,N_CTX=1024 时是 128×1024 = 131072 float ≈ 512 KB(16× 于 acc)且随 N_CTX 线性膨胀——N_CTX=8192 时达 4 MB(128× 于 acc)。主循环轮数 = cdiv(N_CTX, BLOCK_N) = cdiv(1024,64) = 16 轮,每轮两个 tl.dot(QK^T 与 P·V);本走查的 toy 是 cdiv(4,2)=2 轮的最小非退化版。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m1-online-softmax-walk",
+          "template": "state-table",
+          "claim": "fused-attention 主循环每读一块 K/V 就按 exp2 递推更新 (m_i,l_i,acc):首块 alpha=0 抹掉 l_i 初值 1.0,次块 alpha=0.2231<1 把旧累加器重标定后再合并——永不物化 N×N 打分表。",
+          "numbers": [
+            {
+              "name": "qk_scale",
+              "value": "0.72134752",
+              "provenance": "python/tutorials/06-fused-attention.py:L162-L163(sm_scale=0.5 × 1.44269504);traces/online_softmax.json params.qk_scale"
+            },
+            {
+              "name": "block0 m_ij",
+              "value": "0.7213",
+              "provenance": "traces/online_softmax.json rounds[0].m_ij"
+            },
+            {
+              "name": "block0 alpha",
+              "value": "0.0",
+              "provenance": "traces/online_softmax.json rounds[0].alpha(m_i 初值 -inf → exp2(-inf)=0)"
+            },
+            {
+              "name": "block0 l_i",
+              "value": "1.6065",
+              "provenance": "traces/online_softmax.json rounds[0].l_i"
+            },
+            {
+              "name": "block0 acc",
+              "value": "[1.0, 0.6065, 0.0, 0.0]",
+              "provenance": "traces/online_softmax.json rounds[0].acc"
+            },
+            {
+              "name": "block1 m_ij",
+              "value": "2.8854",
+              "provenance": "traces/online_softmax.json rounds[1].m_ij"
+            },
+            {
+              "name": "block1 alpha",
+              "value": "0.2231",
+              "provenance": "traces/online_softmax.json rounds[1].alpha"
+            },
+            {
+              "name": "block1 l_i",
+              "value": "1.4938",
+              "provenance": "traces/online_softmax.json rounds[1].l_i"
+            },
+            {
+              "name": "block1 acc",
+              "value": "[0.2231, 0.1353, 1.0, 0.1353]",
+              "provenance": "traces/online_softmax.json rounds[1].acc"
+            },
+            {
+              "name": "final o(=acc/l_i)",
+              "value": "[0.1494, 0.0906, 0.6694, 0.0906]",
+              "provenance": "traces/online_softmax.json epilogue.o"
+            }
+          ],
+          "caption_draft": "结论:在线 softmax 用一次遍历、常驻 acc 就得到与一次性 softmax 相等的输出——重标定因子 alpha 是全部秘密(m_i 单调增,alpha∈(0,1] 保证不溢出);tl.advance 每轮把 K/V 窗口沿序列维挪一格(回收 ch07 f8:窗口形状/order/strides 不变、只挪起点)。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m2-jit-cache-key",
+      "intuition": "两把锁串起来防重编:同一个进程里再调一次这个核,先用『内存钥匙』= 签名+特化+constexpr 值(BLOCK_M/HEAD_DIM/STAGE 等)秒开;跨进程/换机器则用『磁盘钥匙』= sha256(triton 版本 + 源哈希 + 后端 + 编译选项 + 若干环境变量)。源哈希里含 AST 依赖与起始行号,所以你改一行核体,磁盘钥匙立刻变、旧 cubin 作废——这正是本章要『重新触发编译才抓得到各层 dump』(配 TRITON_ALWAYS_COMPILE=1)的原因。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m3-ast-to-ttir",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m3-blockptr-flattened",
+          "template": "before-after",
+          "claim": "make_block_ptr 这条『带 shape/strides/order 的结构化块指针』在 TTIR 里被 add_rewrite_tensor_pointer 抹平:源码里的一个 tl.make_block_ptr,降级后变成 tt.splat 出一整张 tensor<128x64x!tt.ptr<f16>>、加偏移张量、再 tt.load ——块指针消失、逐元素指针张量登场,tt.dot/tt.reduce/math.exp2 成形但还没有任何布局。",
+          "numbers": [
+            {
+              "name": "源码 make_block_ptr",
+              "value": "L121-L145(Q/K/V_block_ptr)",
+              "provenance": "python/tutorials/06-fused-attention.py:L121-L145"
+            },
+            {
+              "name": "TTIR 块指针塌成 addptr",
+              "value": "L63/L67/L69(tt.addptr %Q/%V/%K)",
+              "provenance": "dossier/ir-evidence/_attn_fwd.ttir:L63,L67,L69"
+            },
+            {
+              "name": "指针张量登场",
+              "value": "tensor<128x64x!tt.ptr<f16>>(tt.splat L78 + tt.load L91)",
+              "provenance": "dossier/ir-evidence/_attn_fwd.ttir:L78,L91"
+            },
+            {
+              "name": "QK^T 成 tt.dot",
+              "value": "tensor<128x64xf16> * tensor<64x64xf16> -> tensor<128x64xf32>",
+              "provenance": "dossier/ir-evidence/_attn_fwd.ttir:L105"
+            },
+            {
+              "name": "在线 softmax 成 tt.reduce/exp2",
+              "value": "tt.reduce(axis=1) ×2 + math.exp2 ×2",
+              "provenance": "dossier/ir-evidence/_attn_fwd.ttir:L106,L119,L120,L126"
+            }
+          ],
+          "caption_draft": "结论:AST→TTIR 这一跳做的是『把 Python/tl 表面语法降成 MLIR tt 方言』——block pointer 是纯前端便利,rewrite_tensor_pointer 把它化成裸指针张量;此时 tt.dot 还没有 #mma、tt.load 还没有 #blocked,布局是下一跳(TTGIR)的事。(回指 part-4 ch15-22)"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m4-layout-assignment-ttgir",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m4-three-layouts",
+          "template": "layout",
+          "claim": "TTGIR 里第一次出现『布局』:convert_to_ttgpuir 打上 num-warps=4/threads-per-warp=32,并派生三种布局——#blocked(访存布局)、#mma nvidia_mma versionMajor=2 instrShape[16,8](Tensor Core 布局)、#shared swizzled(共享内存布局);tt.dot 的两个操作数戴上 dot_op<parent=#mma>,P 从 #mma 经 ttg.convert_layout 转成 dot_op 再喂第二个 dot。",
+          "numbers": [
+            {
+              "name": "#blocked",
+              "value": "sizePerThread=[8,1], threadsPerWarp=[8,4], warpsPerCTA=[1,4], order=[0,1]",
+              "provenance": "dossier/ir-evidence/_attn_fwd.ttgir:L1"
+            },
+            {
+              "name": "#mma",
+              "value": "nvidia_mma versionMajor=2, warpsPerCTA=[4,1], instrShape=[16,8]",
+              "provenance": "dossier/ir-evidence/_attn_fwd.ttgir:L11"
+            },
+            {
+              "name": "#shared",
+              "value": "swizzled_shared vec=8, perPhase=1, maxPhase=8",
+              "provenance": "dossier/ir-evidence/_attn_fwd.ttgir:L12"
+            },
+            {
+              "name": "模块属性",
+              "value": "ttg.num-warps=4, threads-per-warp=32, num-ctas=1, target=cuda:120",
+              "provenance": "dossier/ir-evidence/_attn_fwd.ttgir:L46"
+            },
+            {
+              "name": "dot_op 操作数布局",
+              "value": "dot_op<opIdx=0/1, parent=#mma, kWidth=2>",
+              "provenance": "dossier/ir-evidence/_attn_fwd.ttgir:L172,L173,L174"
+            },
+            {
+              "name": "P 的 convert_layout",
+              "value": "tensor<128x64xf16,#mma> -> dot_op<opIdx=0,parent=#mma>",
+              "provenance": "dossier/ir-evidence/_attn_fwd.ttgir:L202"
+            }
+          ],
+          "caption_draft": "结论:TTGIR = TTIR + 布局注解。同一个 tt.dot,现在结果类型是 tensor<...xf32,#mma>、操作数是 dot_op<parent=#mma>;#blocked 管全局访存怎么分给 4 个 warp、#shared 管数据在 SRAM 怎么 swizzle 避 bank 冲突。ttg.convert_layout 是布局之间的显式搬运(有真实开销)。(回指 part-5 ch23-27)"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m5-coalesce-accelmatmul-pipeliner",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m5-three-passes-each-touch",
+          "template": "flow",
+          "claim": "三个 TTGIR 优化 pass 各在这个核上留下一处可指认的痕迹:Coalesce 选出访存合并的 #blocked(sizePerThread=[8,1]);AccelerateMatmul 把 tt.dot 从无布局改成结果 #mma、操作数 dot_op(matmul→Tensor Core);Pipeliner(add_pipeline)把 K/V load 做成 memdesc<2x64x64> 双缓冲 + async_copy_global_to_local 异步预取(软件流水)。",
+          "numbers": [
+            {
+              "name": "Coalesce → #blocked",
+              "value": "sizePerThread=[8,1](每线程连续搬 8 元素,访存合并)",
+              "provenance": "dossier/ir-evidence/_attn_fwd.ttgir:L1;pass 注册 third_party/nvidia/backend/compiler.py:L219"
+            },
+            {
+              "name": "AccelerateMatmul → tt.dot 带 #mma",
+              "value": "tt.dot ... -> tensor<128x64xf32,#mma>(versionMajor=2 instrShape[16,8])",
+              "provenance": "dossier/ir-evidence/_attn_fwd.ttgir:L174;pass 注册 third_party/nvidia/backend/compiler.py:L224"
+            },
+            {
+              "name": "Pipeliner → 双缓冲",
+              "value": "ttg.local_alloc memdesc<2x64x64xf16>(2 = num_stages 相关的双缓冲)",
+              "provenance": "dossier/ir-evidence/_attn_fwd.ttgir:L122,L123;pass 注册 third_party/nvidia/backend/compiler.py:L239"
+            },
+            {
+              "name": "Pipeliner → 异步预取",
+              "value": "ttg.async_copy_global_to_local(global→shared 不占寄存器,与计算重叠)",
+              "provenance": "dossier/ir-evidence/_attn_fwd.ttgir:L132,L152"
+            },
+            {
+              "name": "num_stages",
+              "value": "3(捕获配置,dossier ir_dump_provenance);双缓冲 memdesc 首维=2",
+              "provenance": "dossier/dossier.json ir_dump_provenance.captured_target"
+            }
+          ],
+          "caption_draft": "结论:同一段 TTGIR,三个 pass 各管一件事——Coalesce 让相邻线程读相邻地址(带宽),AccelerateMatmul 把矩阵乘换成 Tensor Core 指令(算力),Pipeliner 用双缓冲+异步拷贝把『搬下一块』和『算这一块』重叠(延迟隐藏)。这三处就是 ch28/ch29/ch30 在一个真核上的落点。(回指 part-6)"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m6-ttgir-to-llvm-ptx",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m6-descent-to-ptx",
+          "template": "flow",
+          "claim": "TTGIR 再降两跳到硬件:make_llir 里 allocate_shared_memory 给三块 memdesc 分配共享内存(2×64×64×2B ×2 + 128×64×2B = 49152 字节),to_llvmir 把 op 降成 NVVM/inline-asm;make_ptx 最终落到 mma.sync.aligned.m16n8k16(tt.dot)、ex2.approx.ftz.f32(tl.math.exp2)、cp.async.cg.shared.global(异步拷贝)。",
+          "numbers": [
+            {
+              "name": "LLIR kernel 签名",
+              "value": "define ptx_kernel void @_attn_fwd(...)",
+              "provenance": "dossier/ir-evidence/_attn_fwd.llir:L9"
+            },
+            {
+              "name": "program_id/线程号 NVVM",
+              "value": "llvm.nvvm.read.ptx.sreg.ctaid.x / tid.x",
+              "provenance": "dossier/ir-evidence/_attn_fwd.llir:L10,L31"
+            },
+            {
+              "name": "共享内存字节",
+              "value": "49152 = 2×(2×64×64×2B) + 128×64×2B(K/V 双缓冲 + Q 常驻)",
+              "provenance": "dossier/ir-evidence/_attn_fwd.ttgir:L112,L122,L123(memdesc 形状);pass third_party/nvidia/backend/compiler.py:L277 allocate_shared_memory"
+            },
+            {
+              "name": "PTX target/线程",
+              "value": ".target sm_120a, .reqntid 128(=4 warps×32)",
+              "provenance": "dossier/ir-evidence/_attn_fwd.ptx:L6,L37"
+            },
+            {
+              "name": "tt.dot → mma.sync",
+              "value": "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32(全核 256 条)",
+              "provenance": "dossier/ir-evidence/_attn_fwd.ptx:L644(首条);grep 计数 256"
+            },
+            {
+              "name": "exp2 → ex2.approx",
+              "value": "ex2.approx.ftz.f32(全核 136 条)",
+              "provenance": "dossier/ir-evidence/_attn_fwd.ptx:L1090(首条);grep 计数 136"
+            },
+            {
+              "name": "async_copy → cp.async",
+              "value": "cp.async.cg.shared.global + cp.async.commit_group(全核 48 条)",
+              "provenance": "dossier/ir-evidence/_attn_fwd.ptx:L251,L265(首组);grep 计数 48"
+            }
+          ],
+          "caption_draft": "结论:全链收口——一行 tl.dot 最终是 mma.sync.m16n8k16 的 Tensor Core 指令,一行 tl.math.exp2 是 ex2.approx 硬件指令,tl.load+软件流水是 cp.async 异步拷贝;#mma versionMajor=2 → m16n8k16 是 Ampere 系 MMA 形状,在 3.2.0↔3.6.0、Ampere/Hopper/Blackwell(fp16)上稳定。(回指 part-7 ch31-35,含 ch34 共享内存降级)"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m7-compile-dump-mechanism",
+      "intuition": "IR dump 不是每个 pass 自己写的,而是 compile() 的那圈降级循环顺手做的:stages 是有序字典 ttir→ttgir→llir→ptx→cubin,循环每算出一层 next_module,就 fn_cache_manager.put 进缓存、再(若 TRITON_KERNEL_DUMP=1)fn_dump_manager.put 落一份到 ~/.triton/dump/<src.hash>/_attn_fwd.<ext>。dump 目录用 src.hash()(只哈希源码、独立于 triton 版本)当键,所以你能按 kernel 稳定地找到它的各层 IR。add_stages 的注册顺序,就是本章六步串讲的目录。",
+      "figure_specs": []
+    }
+  ]
+}
