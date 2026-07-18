@@ -58,9 +58,15 @@ pin 逐字节同)headless 编译真 kernel,观测**真实** IR/dtype/报错(比 
 - 双语栈：Python DSL 层（python/triton）与 C++/MLIR 层（lib/include）。精简版（implementer）
   预计只对 Python 层可行，MLIR pass 层多数章走 `skip_impl` 轻流程——cartography 逐章标注。
 
-## 当前状态（2026-07-15）
-- ✅ scaffold + blobless clone + 钉版 v3.2.0；已设为 active_instance。
-- ✅ cartography 收官：43 章 / 9 Part / 7 primer；论文清单 25 条全部核真；roadmap 生成器就绪。
-- 🔄 ch01 施工中（dossier 已过 5 轮对抗性自核——开篇章定义全书心智模型，从严）。
+## 当前状态（2026-07-18）
+- ✅ **全书 43 章定稿归档收官**（ch01–ch43 连续、无洞；HEAD `6095b803`，vllm-book-v2-rebuild 已推送）。
+  - 18 条伏笔全部闭合（末伏笔 f8：ch07 block-ptr advance 滑窗守恒 → ch43 tutorial 06 真实兑现，跨 36 章）。
+  - Bible 终态：glossary 516 / concepts 359 / figures 95；trace state 43 章全 `done`、INDEX 置顶 ch43。
+  - primer 论文包（ch02/15/20/23/27/29/42）paper.md+meta 全部入库（07-18 补齐 ch15/20/29 的 paper.md 入库缺口）。
+- 🔄 批次收尾：book-retro（ch36–ch43 最终批）挖经验候选中；ledger 已有 exp-0716-1（figure-only
+  review-exhausted，5 样本，标「下次 book-retro 优先」）与 exp-0718-1（pin-vs-host arch 挑明）待落笔。
+- ⚠️ git add 教训（2026-07-18）：多 pathspec `git add` 任一 typo 即**原子全败**且易被 `2>/dev/null`
+  吞掉——ch40 曾因 `tritriton` typo 漏提交正文/素材两轮（9012327f→34228331 才补齐）。
+  **提交后必查 `git status --short` 验没有漏网**，勿静音 git add 的 stderr。
 - **审批闸豁免（2026-07-15 用户令）**：「查明所有引用论文和 gap 点，查明后无需经我审批，直接开工」
   ——论文清单+gap 点核清、primer 章并入大纲后，直接逐章发车，不等大纲审批。
