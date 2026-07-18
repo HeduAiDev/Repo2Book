@@ -95,3 +95,25 @@ run-ledger 显式列举），全部靠 dossier 对抗性自核（LLM）救场—
 approved patch 还含 analyst.md 自检清单补一句硬检查：「本片段是否逐字取自 pin blob/diff，
 而非训练记忆中的旧版本」。本条**未**随本批契约落笔（Lead 批准清单未列 analyst.md），
 建议 TDD 落地 linter 时一并加（linter 上线后该句可直接引用检查项名）。
+
+---
+
+## 7. 落地记录(2026-07-18,phase-1 已上线)
+
+TDD 完成:`scripts/tests/test_lint_dossier_embed.py` 11 用例 + 既有 17 回归全绿。
+oracle 对表(118 章全corpus)修正了 §3 的三个假设偏差:
+
+1. **「code 内零例内联省略标注」不成立**——裸 `...`/`# ...`/`// ...` 整行、行尾截断
+   `…text ...`、行中压缩 `raise NameError(...)` 三形态大量存在 → 实现为**省略感知匹配**
+   (纯省略行跳过、截断行按省略号前缀匹配)。
+2. **统一 dedent 普遍存在**(ch27 .td 8 例:analyst 把嵌套代码整体去缩进后内嵌) →
+   两侧各自去公共缩进再比,相对缩进仍严格。
+3. **`\uXXXX` ASCII 转写**(ch23:`⊕` 抄成 `⊕`) → 归一化还原为字符。
+
+**分级落点(与 §2 原案的差异)**:
+- blocking:全量模式行不符、行号越界(oracle 后假阳=0,残余 10 例全为真实区间错;
+  triton 3 例已修,vllm ch03×3 / ascend ch10·ch13·ch21·ch31 各 1 例遗留待修)。
+- warn:path 不在 pin(31 例全为前瞻 primer 上游码/vllm-ascend 跨仓引 vllm/*/论文包路径——
+  多真相源合法形态,原案「不存在即 blocking」不成立);子集模式不匹配(117 例混杂
+  改行宽重拼/重复行贪心错配/列表重排等转录形态,假阳未清零,按 §4 纪律暂不升级)。
+- 升级条件:下一本书新章的子集 warn 若能稳定人核清零,再评估升 blocking。

@@ -34,6 +34,10 @@ color: magenta
 ## 铁律
 - **只描述真实源码**。禁止建议任何目标代码仓没有的抽象/数据结构/玩具模拟。
 - `embed_excerpts.code` 必须是**逐字真实源码**（带规范 `<repo>/...:Lxxx`），并标出可省略的无关分支——目标是读者**不开源码也能懂**。
+  **逐字=逐字取自 pin blob/diff，而非训练记忆里的旧版本**（exp-2026-07-18-02：打印/格式化类
+  函数在训练语料里有大量旧版，默写极易踩旧版——ch13/ch27/ch35/ch41 四次实证）。写完每段
+  excerpt 先 `sed -n 'START,ENDp' <pin文件>` 对一眼再落 JSON；`lint_dossier` 的 embed_verbatim
+  检查会与 pin blob 空白归一后逐字比对（全量/越界 blocking，子集不匹配 warn 也须人核清零）。
 - `subtraction_plan` 要让 implementer 能据此"只删不增"：明确删什么、为什么删了仍正确、哪些骨架必须原样保留。
 - **防过度删减（关键）**：`delete` 是 implementer **唯一被批准的删除清单**（清单外一律不许删）；`must_keep` 列**可检测的符号名**（类/方法/常量），`lint_fidelity` 会校验它们出现在精简版。凡"读者需要理解、writer 需要讲清"的细节，务必放进 `must_keep`——宁可多留，不可误删。
 - 若需确认真实行为：**按当前实例的运行约束执行**（若目标代码仓有特殊运行环境要求，如 vLLM 实例须进容器 `scripts/vllm_docker.sh ...`、host 无 CUDA/vLLM）；行号仍以 pin 的源码为准，运行环境仅用于观察行为。
