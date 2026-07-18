@@ -324,7 +324,7 @@ compared to 1*64 when the hasLeadingOffset is false.
 | 任意（K 维不在最内圈） | accesses go in different banks even without swizzling | order[0]≠kDim | (1, 1, 1) 不 swizzle | TritonGPUAttrDefs.td:L306-L310 |
 | NVIDIA Hopper（MMAv3） | 此 builder llvm_unreachable → 改走 by-eltTy builder | isHopper() | → by-eltTy 三档 + hasLeadingOffset | TritonGPUAttrDefs.td:L401-L405 |
 
-先看 AMD MFMA（Matrix Fused Multiply-Add，AMD 的矩阵乘指令）这一支，它把「参数被硬件钉死」讲得最干净（`include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L282-L311`）：
+先看 AMD MFMA（Matrix Fused Multiply-Add，AMD 的矩阵乘指令）这一支，它把「参数被硬件钉死」讲得最干净（`include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L282-L311`）——代码顶上那行注释 `begin GFX908/GFX90A`（GFX908/GFX90A：AMD MI100／MI200 的 CDNA 架构代号，对应本节这条 MFMA 分支）标出了它服务的硬件世代：
 
 ```cpp
 # include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:L282-L311
@@ -433,7 +433,7 @@ NVIDIA Ampere 这一支，把「参数被 mma 指令钉死」写得最字面（`
 
 至此第三个论点闭环。回头看 §4 那张分派表的第三行——K 维不在最内圈时返回 `(1,1,1)` 不 swizzle——和这里的 `matShape` 反推是一体两面：参数只为消 bank 冲突而生，有冲突就按 mma tile 精确反推，没冲突就干脆不做。
 
-§4 分派表里还提过一句的 Volta（`isVolta()` 分支）与 WMMA（AMD GFX11 那一支）呢？它们是同一套「`perPhase`＝128 字节（一轮 32 bank×4B）除以连续维字节数、`maxPhase` 由目标 mma 的打散度封顶」骨架的另两种特化——具体系数不同（Volta 多一层 `is_vec4`／`pack_size` 特判，WMMA 干脆把 `maxPhase` 写死成 `16/perPhase`），但反推逻辑的骨架和 AMD MFMA、NVIDIA Ampere 一模一样。你不需要记住这些系数，只需要知道：这套「被目标 mma 访问模式钉死」的反推逻辑，覆盖了 Triton 支持的全部目标 mma 世代，没有例外。
+§4 分派表里还提过一句的 Volta（`isVolta()` 分支）与 WMMA（AMD GFX11 那一支，GFX11：AMD RDNA3 架构代号，对应 WMMA——Wave Matrix Multiply-Accumulate——指令分支）呢？它们是同一套「`perPhase`＝128 字节（一轮 32 bank×4B）除以连续维字节数、`maxPhase` 由目标 mma 的打散度封顶」骨架的另两种特化——具体系数不同（Volta 多一层 `is_vec4`／`pack_size` 特判，WMMA 干脆把 `maxPhase` 写死成 `16/perPhase`），但反推逻辑的骨架和 AMD MFMA、NVIDIA Ampere 一模一样。你不需要记住这些系数，只需要知道：这套「被目标 mma 访问模式钉死」的反推逻辑，覆盖了 Triton 支持的全部目标 mma 世代，没有例外。
 
 ## §6 两个收尾字段：Hopper 硬件 swizzle 与跨 CTA 切分
 

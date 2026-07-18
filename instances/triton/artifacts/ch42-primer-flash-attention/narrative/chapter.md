@@ -272,7 +272,7 @@ O = O^{(\mathrm{last})} \big/ \ell^{(\mathrm{last})}
 ```
 
 - `acc = acc / l_i[:, None]` 就是 §2.3 的收尾那一步——分子累加器除以分母，全程只在最后做这一次。**延迟归一化**：§2.3 的不变式保证扫完时 `acc` 与 `l_i` 都以最终的 running max 为同一基准，此时一次相除就是正确输出——与逐块归一化的结果相同，却把多次除法压成了一次。
-- `m_i += tl.math.log2(l_i)` 把 running max 和 log(分母) 合成一个 **log-sum-exp**（LSE，对数-和-指数）标量存进 `M`——wrapper 为每行 query 分配的标量缓冲（与 §1 参考实现里的掩码变量重名，两者无关）。恒等式：`l_i` 是以 `m_i` 为基准的 $`\sum e^{s-m}`$，故 $`m+\log(\ell)=\log\sum e^{s}`$——基准 $`m`$ 在和式里抵消，这个值与中间怎么换基准无关。反向传播重算 softmax 时，每行凭这一个标量就能重建归一化，不必保存 $`N\times N`$ 的权重矩阵（FlashAttention 的反向重算思想，出处 arXiv:2205.14135；反向核的推导超出本章范围，不展开）。
+- `m_i += tl.math.log2(l_i)` 把 running max 和 log(分母) 合成一个 **log-sum-exp**（LSE，对数-和-指数）标量存进 `M`——wrapper（这里指调用 `_attn_fwd[grid](...)` 发射核的**宿主侧 Python 函数**，源码里是 `attention.forward` 静态方法；与 [第 1 章](../../ch01-what-is-triton/narrative/chapter.md)、[第 4 章](../../ch04-tl-surface-and-constexpr/narrative/chapter.md)里 `@builtin` 装饰器内部那个同名 `wrapper` 是两回事）为每行 query 分配的标量缓冲（与 §1 参考实现里的掩码变量重名，两者无关）。恒等式：`l_i` 是以 `m_i` 为基准的 $`\sum e^{s-m}`$，故 $`m+\log(\ell)=\log\sum e^{s}`$——基准 $`m`$ 在和式里抵消，这个值与中间怎么换基准无关。反向传播重算 softmax 时，每行凭这一个标量就能重建归一化，不必保存 $`N\times N`$ 的权重矩阵（FlashAttention 的反向重算思想，出处 arXiv:2205.14135；反向核的推导超出本章范围，不展开）。
 
 接着 §2.3 的小例子把收尾账算完。注意量纲：代码的 `m_i` 全程在基-2 量纲累加（寄存器里实为 $`2\times\log_2 e\approx 2.885`$），下表统一换算成自然基准便于与 §2 对齐——内层扫完时 `m_i` 的自然基准值为 2、`l_i = 1.871094`、`acc = [2.735759, 2.503215]`：
 

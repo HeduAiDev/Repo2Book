@@ -386,7 +386,7 @@ struct TritonDotPattern : public OpConversionPattern<triton::DotOp> {
 };
 ```
 
-逐段对着上表读：
+逐段对着上表读。先说 `matchAndRewrite` 收到的两份视图：`op` 是原始的 `tt.dot` 节点本身，`adaptor`（OpAdaptor，MLIR 给转换 pattern 生成的操作数适配器）装的则是这个 op 的操作数**在按 patterns 转换后的当前值**——可能已经被别的规则改过类型/布局。所以下面取 A/B/C 一律走 `adaptor.getA()` 而非 `op.getA()`，正是为了拿到转换后的最新值；而形状这类不随转换变的信息才从 `op` 取。
 
 开头先给**结果 D** 算一个 Blocked 编码 `dEncoding`。GEMM 惯例里 D = A×B + C——C 是喂进去的累加器（输入），D 是 `tt.dot` 吐出来的新值（输出），二者形状/dtype 相同但是两个不同的 SSA 值，所以要分开编码。`retSizePerThread` 初值全 `1`，然后按 `numElements / (numWarps * threadsPerWarp)` 的比值抬——`≥ 4` 抬到 `2`、`≥ 16` 抬到 `4`。这是个纯启发式：结果元素越多、每线程分块越大，减少线程间协作次数。代入本例：`16×16` 的 `numElements` 是 `256`，分母 `numWarps * threadsPerWarp` 是 `4 × 32 = 128`，比值 `256 / 128 = 2`。`2 < 4`，所以 `retSizePerThread` 保持 `[1, 1]`——和实测 `#blocked1` 的 `sizePerThread = [1, 1]` 一致。（作为同一公式的手算外推：`32×32` 是 `1024/128 = 8 ≥ 4` 抬到 `[2, 2]`；`64×64` 是 `4096/128 = 32 ≥ 16` 抬到 `[4, 4]`。这只是启发式初值，不是最终布局——加速 MMA 的 pass 之后会把 parent 换成 mma 布局。）
 

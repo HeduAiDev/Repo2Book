@@ -517,7 +517,7 @@ Extra Credits:
 
 这段不在本章展开——`STAGE` 是是否做因果掩码（causal mask）的开关，`qk_scale` 是 $`1/\sqrt{d}`$ 的缩放系数，这些实现细节留给本书收尾的 FlashAttention 实战章；分块遍历 K/V、用 running max `m_i` 和 running sum `l_i` 增量归一化、`alpha` 重标定 `acc`，避免物化 N×N 的注意力矩阵，那套在线 softmax 的完整推导也是那一章的事。这里只引它当预告片，让你看一眼阶梯顶端长什么样：`tl.dot` / `tl.max` / `tl.sum` / `tl.advance` 全在这几行里齐活。别从 06 硬啃——先 01 立起 programming model，再沿阶梯每级吃一个新概念，到 06 时手里的零件都已就位。tutorials 的顺序，就是本书章节的顺序。
 
-后面 `07-extern`（调 libdevice 外部函数）、`08-grouped-gemm`（device 端静态调度）、`09-persistent`（persistent kernel 加 TMA）继续往上，各对应一个更进阶的子系统。你要给自己找一个真实、能跑、带 benchmark 的范式做起点，这道阶梯就是索引。
+后面 `07-extern`（调 libdevice 外部函数）、`08-grouped-gemm`（device 端静态调度：把「多个形状各异的子矩阵乘，各自的 tile 该派给哪个 CTA」这套分配算法从 host 端预算搬进 kernel 内部去算）、`09-persistent`（persistent kernel 加 TMA：只起满 SM 数的常驻 CTA、让每个 CTA 在内部循环里吃完所有 tile，省掉反复 launch 的开销）继续往上，各对应一个更进阶的子系统。你要给自己找一个真实、能跑、带 benchmark 的范式做起点，这道阶梯就是索引。
 
 ## 小结：三件工具，三个抓手
 

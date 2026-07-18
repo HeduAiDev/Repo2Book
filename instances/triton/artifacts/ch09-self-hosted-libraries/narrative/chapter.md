@@ -405,7 +405,7 @@ def exp(x, _builder=None):
 
 **不变量**。**dispatch 以入参 dtype 元组为 key 精确选符号；key 不在字典即报错，不会静默乱选。** 有符号 / 无符号、32 位 / 64 位的区分，全靠这层字典查表。
 
-**源码**。后端的声明是一个 `@core.extern` 薄包装，函数体就是调 `extern_elementwise`、递上一张「dtype 元组映射到（符号，返回 dtype）」的字典：
+**源码**。后端的声明是一个 `@core.extern` 薄包装（`@core.extern` 和上一节的 `@core.builtin` 一样会被注入 `_builder`——签名里那个 `_builder=None` 就是留给注入的坑，只是它最终不亲手建原生 IR 节点，而是转手调 `extern_elementwise`：算下来语言层的装饰器实际有三种，不止[第 1 章](../../ch01-what-is-triton/narrative/chapter.md)点名的那两层），函数体就是调 `extern_elementwise`、递上一张「dtype 元组映射到（符号，返回 dtype）」的字典：
 
 ```python
 # third_party/nvidia/language/cuda/libdevice.py:L29-L37

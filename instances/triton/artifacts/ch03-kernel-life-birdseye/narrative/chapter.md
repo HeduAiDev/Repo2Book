@@ -91,6 +91,8 @@ def add(x: torch.Tensor, y: torch.Tensor):
         if kernel is None:
 ```
 
+开头那三行 `driver.active.*` 是取当前设备/流/target 的运行时代理（`driver.active` 是 Triton 选中的活动驱动后端对象），`make_backend` 再按 target 挑出对应的后端对象——这条「先摸清跑在哪张卡上」的边界，本章只借它开个头，宿主运行时那一部分（[第 11 章](../../ch11-run-launch-pipeline/narrative/chapter.md)、[第 12 章](../../ch12-driver-backend-autotune-cache/narrative/chapter.md)）再深挖，这里按下不表。
+
 `binder` 把实参绑成几样东西：`sig_and_spec`（签名 + 特化位）、`constexpr_vals`（编译期常量的值），还有 `excess_kwargs`（调用时额外塞进、不在函数签名里的关键字参数，本章不展开）。缓存键 `key` 就由这三样拼出来——看 `L583` 那一行 `''.join(sig_and_spec) + str((constexpr_vals, excess_kwargs))`，三者都在键里，所以连手动改 launch 参数也会触发 miss。算出 `key` 拿去查 `self.cache[device]`——按设备分桶的进程内缓存。命中，直接跳到发射；没命中（`kernel is None`），才真开工。
 
 **这一层解答了读者最常见的困惑：「为什么我的核每次都在编译？」** 答案在缓存键的构成里。`sig_and_spec` 含每个指针实参的 dtype、是否 16 字节对齐、是不是等于 1 这些**特化位**；`constexpr_vals` 是你标了 `tl.constexpr`（编译期常量）的那些值。**这三者任一变化，键就变，缓存就 miss，整条编译重走一遍。** 换 dtype、换对齐、换 `BLOCK_SIZE`，都会触发重编。上一章讲过 constexpr 是全书第一个性能分水岭——它在这里第一次有了物理载体：`self.cache` 这个字典，就是「第一次慢、之后快，换机器/换 shape 又慢」的全部机理。这里要点透一步：`self.cache` 只活在进程内存里，换机器本质是另起一个进程，新进程里它天然是空字典——所以哪怕换到一模一样的 shape，也得从头把整条编译重走一遍。特化位的具体规则、`binder` 怎么预编译出来摊薄开销，是「宿主运行时」那一部分的正题。
@@ -327,7 +329,7 @@ def add(x: torch.Tensor, y: torch.Tensor):
                        self.CompiledKernel.launch_enter_hook, self.CompiledKernel.launch_exit_hook, *non_constexpr_vals)
 ```
 
-这段被开头的 `if not warmup` 守着：`warmup=True` 时只编译、把 kernel 塞进缓存就返回、不真发射（用于预热 / autotune 试跑），本章走的是 `warmup=False` 的正常路径，所以这段发射代码照常执行。还记得 §1 那个写成 lambda 的 `grid` 吗？就是在这一行 `grid = grid(bound_args)` 被求值的——可调用 grid 拿绑好的实参算出块数，再补齐到三维。然后 `kernel.run(...)` 把核异步下发到 stream。注意这个 `kernel.run` 不是本章开头那个圆心 `JITFunction.run`——它是编译产物 `kernel` 自己的 `run` 方法，真正触发 driver 发射的那一层；两者同名，却是两个不同对象上的方法。
+这段被开头的 `if not warmup` 守着：`warmup=True` 时只编译、把 kernel 塞进缓存就返回、不真发射（用于预热 / autotune 试跑），本章走的是 `warmup=False` 的正常路径，所以这段发射代码照常执行。还记得 §1 那个写成 lambda 的 `grid` 吗？就是在这一行 `grid = grid(bound_args)` 被求值的——可调用 grid 拿绑好的实参算出块数，再补齐到三维。然后 `kernel.run(...)` 把核异步下发到 stream。注意这个 `kernel.run` 不是本章开头那个圆心 `JITFunction.run`——它是编译产物 `kernel` 自己的 `run` 方法，真正触发 driver 发射的那一层；两者同名，却是两个不同对象上的方法。末尾那三个参数——`launch_metadata` 与 `launch_enter_hook` / `launch_exit_hook`——是留给 profiler 在发射前后挂观测钩子的接口，本章跳过不展开，宿主运行时（[第 11 章](../../ch11-run-launch-pipeline/narrative/chapter.md)）与剖析那一章（[第 39 章](../../ch39-proton-roofline-dobench/narrative/chapter.md)）再接上。
 
 **关键账**：这一段**每次调用都要走一遍**。缓存只省编译（§2 命中就跳过整条 for 循环），**不省发射**——每次调用都得重新算 grid、过 `kernel.run` 这层胶水、触发那个现编的 C launcher。所以如果你的核很小、又被高频调用，瓶颈很可能不是算力，而是这一段 host 侧的发射开销。这条发射热路径每一段的开销来源，是「宿主运行时」部分要逐段拆的；C launcher 的双语接缝[第 1 章](../../ch01-what-is-triton/narrative/chapter.md)也已点名，这里只在地图上标位。
 

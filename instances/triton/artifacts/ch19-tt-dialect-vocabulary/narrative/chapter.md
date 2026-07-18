@@ -122,7 +122,7 @@ def TT_AddPtrOp : TT_Op<"addptr",
 }
 ```
 
-`assemblyFormat` 里 ptr、offset 依次占位，所以 dump 里读成 `tt.addptr %x, %offs_2`；末尾的 `: type(result) , type(offset)` 决定了它打印两段类型 `tensor<4x!tt.ptr<f32>>, tensor<4xi32>`（`!tt.ptr<f32>` 是「指向 f32 的指针」，后面类型系统一节细讲）。trait 列表里那条 `TypesMatchWith`（一条 TableGen 谓词，声明两个类型槽必须相等、或经某个变换后相等，供 verifier 在建 IR 时校验）在这里把 `result` 钉成与 `ptr` 同型——所以 `addptr` 的结果类型不必在 dump 里单独写出，由它推得。
+`assemblyFormat` 里 ptr、offset 依次占位，所以 dump 里读成 `tt.addptr %x, %offs_2`；末尾的 `: type(result) , type(offset)` 决定了它打印两段类型 `tensor<4x!tt.ptr<f32>>, tensor<4xi32>`（`!tt.ptr<f32>` 是「指向 f32 的指针」，后面类型系统一节细讲）。trait 列表里那条 `TypesMatchWith`（一条 TableGen 谓词，声明两个类型槽必须相等、或经某个变换后相等，供 verifier（验证器，MLIR 对每个算子跑的合法性检查，后文细讲）在建 IR 时校验）在这里把 `result` 钉成与 `ptr` 同型——所以 `addptr` 的结果类型不必在 dump 里单独写出，由它推得。
 
 `load` 是这套模板里最复杂的样本，专治「可选操作数 + 默认值属性」：
 
@@ -393,7 +393,7 @@ public:
 };
 ```
 
-两条 trait 各转发到一个 verifier（验证器，MLIR 在建 IR 时对每个算子跑的合法性检查）。`TensorSizeTrait` 的执法处最能落到性能上：
+两条 trait 各转发到一个 verifier（就是前面 `addptr` 那节说的建 IR 时合法性检查器）。`TensorSizeTrait` 的执法处最能落到性能上：
 
 ```cpp
 # lib/Dialect/Triton/IR/Traits.cpp:L67-L82

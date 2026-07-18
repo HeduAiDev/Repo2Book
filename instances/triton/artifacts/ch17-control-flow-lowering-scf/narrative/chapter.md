@@ -448,7 +448,8 @@ def visit_For(self, node):
         step = constexpr(-step.value)
         negative_step = True
         lb, ub = ub, lb
-    # … 省略：lb/ub/step to_tensor + 整数类型检查 + 提升诱导变量类型 iv_type + create_int_cast 成 Index 类型 …
+    # … 省略：lb/ub/step to_tensor + 整数类型检查 + 提升诱导变量类型 iv_type + create_int_cast 成 Index 类型
+    #    （Index 是 MLIR 内建的平台整数类型，专表循环边界/计数器，与 i32 等定宽整数不同）…
     # Create placeholder for the loop induction variable
     iv = self.builder.create_poison(iv_ir_type)
     self.set_value(node.target.id, language.core.tensor(iv, iv_type))

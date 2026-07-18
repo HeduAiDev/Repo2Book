@@ -287,7 +287,7 @@ def min_dot_size(target: GPUTarget):
 
 ### 直觉：照抄五格，只改最后两格
 
-`add_stages` 是配对脊柱的命门。它要往 stages 字典里钉进「一个 kernel 从 IR 到机器码」要走的每一段。NVIDIA 钉了五段，AMD 也钉五段——而且**前三段连名字都一样**。差异只发生在产码的最后两段：NVIDIA 是 `ptx → cubin`，AMD 是 `amdgcn → hsaco`。
+`add_stages` 是配对脊柱的命门。它要往 stages 字典里钉进「一个 kernel 从 IR 到机器码」要走的每一段。NVIDIA 钉了五段，AMD 也钉五段——而且**前三段连名字都一样**。差异只发生在产码的最后两段：NVIDIA 是 `ptx → cubin`，AMD 是 `amdgcn → hsaco`（amdgcn 是 AMD GCN 架构的汇编文本，hsaco 是 AMD 的 GPU 可执行二进制格式——对位 NVIDIA 的 ptx/cubin，具体工具链留到本章末端「工具链末端」一节详解）。
 
 ### 机制：五段骨架并排看
 
@@ -528,6 +528,8 @@ class HIPAttrsDescriptor(AttrsDescriptor):
             and not param.do_not_specialize and not param.do_not_specialize_on_alignment
         ]
 ```
+
+（类头那行 `@register_descriptor` 装饰器只是把这个子类登记进后端可发现的描述子表，跟本节主线——覆写 `_add_backend_properties`——无关，读时可略过。）
 
 覆写后的钩子做一件事：给 IR 注入 `tt.pointer_range = 32` 这条属性，并把满足条件的参数一一标记。条件是 `is_within2gb(arg)`——这个指针背后的张量存储不超过 2GiB（即所有索引能用 32 位整数表示，$`2^{31}-1`$ 字节以内）。
 

@@ -346,7 +346,7 @@ grid 规范化本身很朴素：用户可以只给一维 `(4,)`，也可以给�
 
 第一行就是全部关窍：`launch_enter_hook`（发射入口观测钩子）为 None 时**直接返回 None**。绝大多数发射没有观测钩子，这条路径必须零额外开销。只有用户注册了 enter hook（或 `@triton.jit(launch_metadata=...)`）才往下组 `LazyDict`（惰性字典，`.get()` 时才真拼内容，避免无人看时白算）并挂用户回调。本例常态无 hook，`launch_metadata` 直接是 None。
 
-然后 `kernel.run(...)` 把七样东西一次交出去：grid 三维 `(4,1,1)`、stream、`kernel.function`（GPU 上的函数句柄）、`kernel.packed_metadata`（打包好的元数据）、刚才的 `launch_metadata`、一对 enter/exit hook（常态 None），以及 `*non_constexpr_vals`（本例 4 个运行期实参：3 指针 + 1 个 `i32`）。这些参数越过 Python|C++ 分界，进后端 launcher，最终落到 `cuLaunchKernel`。本书在无 GPU 的 host 上跑不到这一步，如实标注。
+然后 `kernel.run(...)` 把七样东西一次交出去：grid 三维 `(4,1,1)`、stream、`kernel.function`（GPU 上的函数句柄）、`kernel.packed_metadata`（打包好的元数据）、刚才的 `launch_metadata`、一对 enter/exit hook（常态 None），以及 `*non_constexpr_vals`（本例 4 个运行期实参：3 指针 + 1 个 `i32`）。这些参数越过 Python|C++ 分界，进后端 launcher，最终落到 `cuLaunchKernel`（CUDA driver 里真正把已装载的 GPU 函数句柄连同实参推上设备执行的那个底层调用，发射细节留给后面的发射专章）。本书在无 GPU 的 host 上跑不到这一步，如实标注。
 
 ## 惰性设备句柄：编译产物怎么接到发射路径
 

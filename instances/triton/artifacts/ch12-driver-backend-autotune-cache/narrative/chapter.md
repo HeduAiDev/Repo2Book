@@ -210,7 +210,7 @@ class GPUDriver(DriverBase):
         self.set_current_device = torch.cuda.set_device
 ```
 
-`DriverBase`（驱动抽象基类）用 `ABCMeta` 定了三个抽象方法：`is_active`（我这套设备可用吗）、`get_current_target`（当前设备的型号描述）、`get_benchmarker`（该用哪个计时器——autotune 会用到，下一节讲）。后端发现靠 `is_active` 做选择、靠 `not isabstract` 判 concrete 入表，全建立在它之上。
+`DriverBase`（驱动抽象基类）用 `ABCMeta` 定了三个抽象方法：`is_active`（我这套设备可用吗）、`get_current_target`（当前设备的型号描述）、`get_benchmarker`（该用哪个计时器——autotune 会用到，下一节讲；它的返回类型标注 `Benchmarker` 是个计时函数的类型别名，形如 `Callable[[...], ...]`，接受待计时的核调用、返回耗时）。后端发现靠 `is_active` 做选择、靠 `not isabstract` 判 concrete 入表，全建立在它之上。
 
 `GPUDriver`（GPU 驱动半成品基类）继承 `DriverBase`，`__init__` 里干的正是**上一章标出的那个断裂点**：把 `get_current_device` / `get_current_stream` / `set_current_device` / `get_device_capability` 全桥接到 `torch.cuda`。`get_current_device` 就是 `torch.cuda.current_device`，`get_current_stream` 要一条真 CUDA raw stream。这就是为什么 host 无卡时这道门一推就塌——**它一构造就 `import torch` 并伸手摸 `torch.cuda`**。上一章说「门后是真 GPU」，门后的真 GPU 就在这七行里。
 

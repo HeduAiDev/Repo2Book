@@ -651,7 +651,7 @@ def TTNG_RegAllocOp : TTNG_Op<"reg_alloc", []> {
 // … 省略：reg_dealloc（对称的寄存器回收）…
 ```
 
-`create_token` 建一张同步 token 张量；`producer_acquire`／`producer_commit` 和 `consumer_wait`／`consumer_release` 是生产者、消费者按 `idx`＋`phase` 的握手；`reg_alloc`／`reg_dealloc` 在 warpgroup 之间重新分配寄存器。warp-specialization（把一个 warpgroup 专门做搬运、另一个专门做计算）那一 pass 会消费这套词汇，本章只登记它占了样板里的这一格。此外 ttng 还有 `cluster_arrive`／`cluster_wait` 一对，做 Hopper 线程块簇（cluster，多个 CTA——协作线程数组，[第 2 章](../../ch02-gpu-execution-model/narrative/chapter.md)建立的硬件线程块——组成的一簇）内的同步。这些握手怎么拼成一条真流水，留给后面讲预取与 warp specialization 的那一章。
+先厘清一个同名陷阱：这里的 token 是 ttng 层另一套类型 `TTNG_TokenType`（一张张量、按 `idx`＋`phase` 索引，服务多缓冲槽之间的握手），不同于 §3 里 ttg 层的 `async.token`（单个 SSA 值，只穿起一条 `cp.async` 依赖链）——同名不同物。`create_token` 建一张同步 token 张量；`producer_acquire`／`producer_commit` 和 `consumer_wait`／`consumer_release` 是生产者、消费者按 `idx`＋`phase` 的握手；`reg_alloc`／`reg_dealloc` 在 warpgroup 之间重新分配寄存器。warp-specialization（把一个 warpgroup 专门做搬运、另一个专门做计算）那一 pass 会消费这套词汇，本章只登记它占了样板里的这一格。此外 ttng 还有 `cluster_arrive`／`cluster_wait` 一对，做 Hopper 线程块簇（cluster，多个 CTA——协作线程数组，[第 2 章](../../ch02-gpu-execution-model/narrative/chapter.md)建立的硬件线程块——组成的一簇）内的同步。这些握手怎么拼成一条真流水，留给后面讲预取与 warp specialization 的那一章。
 
 ## 小结：你带走的三把尺
 

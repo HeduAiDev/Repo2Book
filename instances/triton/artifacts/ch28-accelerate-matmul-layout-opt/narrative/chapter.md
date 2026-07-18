@@ -64,6 +64,8 @@
 - 第 2 次（L228）：专门收拾 `accelerate_matmul` 刚引入的那批 convert（累加器、A/B 操作数、结果各一个）。
 - 第 3 次（L243）：`pipeline`/`prefetch` 把循环重构后，再清一轮残余。
 
+（代码块里还夹了 `add_f32_dot_tc`、`add_optimize_thread_locality`、`add_cse`、`add_reduce_data_duplication` 几个 pass，和本章要讲的三件事——造编码、消搬运、挪搬运——无关，跳过即可。）
+
 **源码。** 这三行就是上面代码块里标了注释的 `add_remove_layout_conversions(pm)`。它们调的是同一个 pass，只是在管线里被放了三处。
 
 ![make_ttgir 里 RemoveLayoutConversions 跑三次：每次结构性变换（coalesce/plan_cta、accelerate_matmul、pipeline/prefetch）都引入新 convert_layout，单趟消不净](../diagrams/fig-remove-layout-thrice.png)
@@ -378,7 +380,7 @@ v1/v2 是固定砖：v1 恒 `[16,16]`、v2 恒 `[16,8]`。v3（WGMMA）的砖可
         rewriter.create<ConvertLayoutOp>(oldAcc.getLoc(), newRetType, oldAcc);
 ```
 
-两条守卫先挡掉不该重写的：`computeCapability < 70` 直接放弃；输出已经是 `NvidiaMmaEncodingAttr` 也放弃（幂等，避免重复重写）。然后把前三节的结果拼进 `NvidiaMmaEncodingAttr::get`——`versionMajor`（选中版本）、`warpsPerTile`、`instrShape` 全在参数里，这就是[第 27 章](../../ch27-tensor-core-mma-layout/narrative/chapter.md)讲的那套编码字段被真正**填值**的地方。造好 `newRetType` 后第一次 `ConvertLayoutOp`：把累加器从旧编码转成新 mma 编码。
+两条守卫先挡掉不该重写的：`computeCapability < 70` 直接放弃；输出已经是 `NvidiaMmaEncodingAttr` 也放弃（幂等，避免重复重写）。然后把前三节的结果拼进 `NvidiaMmaEncodingAttr::get`——`versionMajor`（选中版本）、`warpsPerTile`、`instrShape` 全在参数里，这就是[第 27 章](../../ch27-tensor-core-mma-layout/narrative/chapter.md)讲的那套编码字段被真正**填值**的地方。造好 `newRetType` 后第一次 `ConvertLayoutOp`：把累加器从旧编码转成新 mma 编码。（`PatternRewriterWithAsyncTaskIds taskIdRewriter` 只是给 warp-specialization——前面代码块里被省略的那一大段、本章不展开——用的一层 rewriter 包装，会把新建的 op 打上异步任务标记；这里把它当普通 rewriter 读即可。）
 
 后半段按版本分两条路（`lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:L312-L348`，逐字）：
 
@@ -652,7 +654,7 @@ void LayoutPropagation::initAnchorLayout() {
 }
 ```
 
-锚点判据：dot、WarpGroupDot、贵 load/store、atomic、permuting reshape——它们的布局有性能意义、要保住；函数参数也当锚点（方便写测试）。这就是「哪些编码不能动」的名单。
+锚点判据：dot、WarpGroupDot、贵 load/store、atomic、permuting reshape——它们的布局有性能意义、要保住；函数参数也当锚点（方便写测试）。这就是「哪些编码不能动」的名单。两个判据词值得一句解释：`isExpensiveLoadOrStore` 大致按访存量够不够大、能否合并来判「贵」（细节不展开）——并非所有 load/store 都够格当锚点；`permuting reshape` 指 `getAllowReorder()` 返回真的那种 reshape，它允许打乱底层元素的物理顺序来换取效率（区别于只改逻辑视图形状、不动数据的普通 reshape），因此它选定的布局也得保住。
 
 再看**传播**（`lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:L208-L230`，逐字）：
 

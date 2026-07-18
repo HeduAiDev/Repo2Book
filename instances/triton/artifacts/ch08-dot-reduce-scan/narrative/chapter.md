@@ -272,7 +272,7 @@ def _str_to_dot_input_precision(input_precision, builder):
                      ret_ty)
 ```
 
-`max_num_imprecise_acc`（fp8 累加时允许连续几步用低精度攒、多少步刷新一次高精度）只对 **fp8×fp8→fp32、且在 sm_90 上**有意义——sm_90 的 fp8 MMA 累加器有精度上限，允许每若干步刷新一次。默认值也是后端给的：
+`max_num_imprecise_acc`（fp8 累加时允许连续几步用低精度攒、多少步刷新一次高精度）只对 **fp8×fp8→fp32、且在 sm_90 上**有意义（sm_90 是 NVIDIA Hopper 一代的算力代号，即 compute capability=90——GPU 能力等级的编号；这套代号与 `self.capability` 背后的门禁在[第 36 章](../../ch36-cudabackend-inject-stages/narrative/chapter.md)正式建立，这里只需知道它标记「是不是 Hopper 卡」）——sm_90 的 fp8 MMA 累加器有精度上限，允许每若干步刷新一次。默认值也是后端给的：
 
 ```python
 # third_party/nvidia/backend/compiler.py:L158

@@ -430,7 +430,7 @@ bool NvidiaMmaEncodingAttr::isHopper() const { return getVersionMajor() == 3; }
 
 一个整数字段 `versionMajor` 编码了三代 Tensor Core：1=Volta、2=Ampere/Turing、3=Hopper。注意 `isAmpere()` 只查 `versionMajor==2`，并不排除 `versionMinor==1` 的 Turing——两者在 versionMajor 层面重叠，真要把 Turing 单摘出来得靠 `isTuring()` 再查一次 `versionMinor`；多数访问器不细分、就统一走 `isAmpere()` 分支。`getThreadsPerWarp`、`getElemsPerThread` 这些访问器内部都按这几个谓词分支，把每代硬件的寄存器排布硬编码进去——比如 Ampere 的 `getThreadsPerWarp` 返回 `[8, 4]`。本章那个 64×64 fp16 matmul 实发的正是 `versionMajor=2`、`versionMinor=0`、`instrShape=[16,8]`，对应 Ampere 的 `mma.16816` 指令（M16-N8-K16 的矩阵乘加）。
 
-为什么布局非长成这样不可？因为 MMA 指令的输出寄存器排布是硬件定死的（Volta 的 `mma.884` / Ampere 的 `mma.16816` / Hopper 的 `wgmma`），布局只能忠实描述、不能自由设计。这套「布局形态 ↔ 硬件 MMA 指令」的精确对应，是后面 Tensor Core 与 MMA 布局那一章的主题；本章点到为止，只带走一句：**mma 布局不是设计出来的，是从硬件反推出来的**。
+为什么布局非长成这样不可？因为 MMA 指令的输出寄存器排布是硬件定死的（Volta 的 `mma.884`：M8-N8-K4 的第一代 Tensor Core 矩阵乘；Ampere 的 `mma.16816`；Hopper 的 `wgmma`：warp-group matrix multiply-accumulate，按 warp 组整体发射的矩阵乘加），布局只能忠实描述、不能自由设计。这套「布局形态 ↔ 硬件 MMA 指令」的精确对应，是后面 Tensor Core 与 MMA 布局那一章的主题；本章点到为止，只带走一句：**mma 布局不是设计出来的，是从硬件反推出来的**。
 
 ![NvidiaMmaEncoding 用一个整数 versionMajor 分派三代 Tensor Core：1=Volta、2=Ampere/Turing、3=Hopper，谓词 isVolta/isAmpere/isHopper 据它选布局分支；instrShape 携带 MMA 指令的 M×N，本章 fp16 matmul 实发 versionMajor=2、instrShape=[16,8] 对应 mma.16816](../diagrams/fig-nvidia-mma-version.png)
 

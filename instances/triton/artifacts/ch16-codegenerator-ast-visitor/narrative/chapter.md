@@ -58,6 +58,8 @@ def ast_to_ttir(fn, specialization, context, options, codegen_fns, module_map):
     return ret
 ```
 
+这里的 `specialization` 就是 `compile()` 传进来那份 `ASTSource`（[第 14 章](../../ch14-compile-driver-loop/narrative/chapter.md)建立的编译输入体，打包了函数、签名与特化提示）实例本体——`ASTSource.make_ir` 调 `ast_to_ttir(self.fn, self, ...)` 时把 `self` 整个递进来，所以下面这三堆料都是它的属性。
+
 三堆料看这几行：
 
 - `constants`——`specialization.constants` 是「参数序号 → 编译期值」的映射（如 `{4: 1024}` 表示第 4 个参数是常量 `1024`）。它交给 `CodeGenerator.constants`。

@@ -113,7 +113,7 @@
     ccinfo = triton.compile(src, options=opts)
 ```
 
-`assert h in [1, 16]` 是那张对照表的定义域守门；`from_hints(hints)` 把 hints 物化成 `attrs`；紧接着的循环把 `get_constants()`（即 `:1` 的参数）**并回 constants 表**——这就是「`:1` 从运行期消失」的起点。最后 `ASTSource` + `triton.compile` 走的正是前面讲过的 ttir→ttgir→ptx→ptxas→cubin 全流水，本章只取它的产物 `ccinfo.asm["cubin"]`，不再展开。
+`assert h in [1, 16]` 是那张对照表的定义域守门；`from_hints(hints)` 把 hints 物化成 `attrs`；紧接着的循环把 `get_constants()`（即 `:1` 的参数）**并回 constants 表**——这就是「`:1` 从运行期消失」的起点。最后 `ASTSource` + `triton.compile` 走的正是前面讲过的 ttir→ttgir→ptx→ptxas→cubin 全流水，本章只取它的产物 `ccinfo.asm["cubin"]`，不再展开。`triton.compile` 返回的是一个 `CompiledKernel`（此处即 `ccinfo`），它带一个 `asm` 字典，按阶段名（`ttir`/`ptx`/`cubin`/`sass`…）分别存各级产物；`asm["cubin"]` 就是编译好的那串 cubin 字节，后文反汇编时取的 `kernel.asm["sass"]` 也是同一个字典换个键。
 
 `from_hints` 本身住在后端契约里，短得像一张查表：
 

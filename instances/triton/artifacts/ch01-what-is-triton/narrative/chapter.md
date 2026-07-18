@@ -197,7 +197,7 @@ def builtin(fn: T) -> T:
     return wrapper
 ```
 
-`@builtin` 包了一层 `wrapper`：进门先摸一把 `kwargs` 里有没有 `_builder`（那个从 pybind 过来的 MLIR builder；MLIR 是 Triton 用来表示 IR 的通用编译器基础设施，§4 细讲，这里先知道它是「建 IR 的那支笔」即可），没有就直接 `raise ValueError("Did you forget to add @triton.jit ?")`。这道守门是②号窗口的入场券——`visit_Call` 走②时注入的 `_builder`，正是为了让这里能通过。记住这句报错，§5 见。
+`@builtin` 包了一层 `wrapper`：进门先摸一把 `kwargs` 里有没有 `_builder`（那个从 pybind 过来的 MLIR builder；pybind 即 pybind11，把 C++ 对象/函数暴露给 Python 的绑定库，[第 18 章](../../ch18-libtriton-pybind-bridge/narrative/chapter.md)细讲；MLIR 是 Triton 用来表示 IR 的通用编译器基础设施，§4 细讲，这里先知道它是「建 IR 的那支笔」即可），没有就直接 `raise ValueError("Did you forget to add @triton.jit ?")`。这道守门是②号窗口的入场券——`visit_Call` 走②时注入的 `_builder`，正是为了让这里能通过。记住这句报错，§5 见。
 
 ## §4 一次 tl.cdiv 在 IR 里的两次形态
 
@@ -429,7 +429,7 @@ def cdiv(x: int, y: int):
 
 当 `if` 的条件不是运行期 tensor（比如 `if BLOCK_SIZE > 128:`），追踪器 `_unwrap_if_constexpr` 后**在 Python 里把它真的求值一遍**，然后只把选中的那一支 `visit` 进 IR，另一支根本不进 IR。**这就是「标 `constexpr` 就能消分支」的机制原型**：你把开关值标成 `constexpr`，编译器就在这里替你把死分支删掉了——留在最终 IR 里的只有活着的那一支。
 
-顺带堵一个对称的误区：`for i in range(N)` 里的 `range` **也不经过** `visit_Call`。`visit_For` 直接取迭代器类、单独 visit 各实参，普通 `range` 会被建成 `scf.for`，只有 `tl.static_range` 才在 Python 里展开成静态循环：
+顺带堵一个对称的误区：`for i in range(N)` 里的 `range` **也不经过** `visit_Call`。`visit_For` 直接取迭代器类、单独 visit 各实参，普通 `range` 会被建成 `scf.for`（`scf.` 是 MLIR 结构化控制流方言前缀，继前面见过的 `tt.`/`arith.` 之后本章遇到的第三个方言，它怎么降级留到[第 17 章](../../ch17-control-flow-lowering-scf/narrative/chapter.md)），只有 `tl.static_range` 才在 Python 里展开成静态循环：
 
 ```python
 # python/triton/compiler/code_generator.py:L898-L910

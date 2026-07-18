@@ -156,8 +156,8 @@ static bool pipelineLoop(scf::ForOp forOp, int numStages) {
 
 `DenseMap` 是 LLVM 的哈希表容器；表的两个维度各司其职：
 
-- **stage**（0 到 `numStages`−1）：这个 op 属于流水线第几级——**决定它比它的消费者提前几个迭代执行**。load 放前面的 stage（提前预取），dot 放最后的 stage。
-- **cluster**：**同一 stage 内部**的执行顺序分组（`ClusterList` 是一个有序链表，可从两头插入）。stage 决定「差几个迭代」，cluster 决定「同一迭代内谁先谁后」。
+- **stage**（0 到 `numStages`−1）：这个 op 属于流水线第几级——**决定它比它的消费者提前几个迭代执行**。load 放前面的 stage（提前预取），dot 放最后的 stage。（注意别跟[第 14 章](../../ch14-compile-driver-loop/narrative/chapter.md)里 `add_stages` 填的那张降级工位清单混淆：那里的 stage 是 TTIR→TTGIR→…这条编译降级链上的一级 pass，这里的 stage 是一个 op 在循环流水线里的第几级——同名，不同层次。）
+- **cluster**：**同一 stage 内部**的执行顺序分组（`ClusterList` 是一个有序链表，可从两头插入）。stage 决定「差几个迭代」，cluster 决定「同一迭代内谁先谁后」。（注意这里的 cluster 是 `CoarseSchedule` 的内部调度分组，跟[第 20 章](../../ch20-layout-is-a-function/narrative/chapter.md)、[第 24 章](../../ch24-ttg-ttng-operations/narrative/chapter.md)里 Hopper 的硬件线程块簇 CGA（thread block cluster，多个 CTA 组团协作）同名不同物，别混淆。）
 
 两个维度正交，分开表达两种调度自由度——这是 Triton 在经典 stage 概念之外自己加的工程抽象。排期完成后，`createFinalSchedule` 把二维表拍平成一个有序的 `(op, stage)` 序列（逐字）：
 
