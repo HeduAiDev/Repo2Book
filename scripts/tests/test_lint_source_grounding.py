@@ -187,3 +187,14 @@ def test_prefix_still_dynamic_for_oot_instance(tmp_path):
     ch = _mk_with_narrative(tmp_path, narrative)
     r = lint_source_grounding(ch)
     assert not r["vllm_files_listed"], f"{prefix}/ 前缀应被正确识别并计数"
+
+
+def test_hyphenated_paths_counted(tmp_path):
+    """回归(triton-ascend):src_ref_re 须匹配连字符文件名(tutorials/01-vector-add.py),
+    否则姊妹书引官方教程文件全被漏计→假 vllm_files_listed 不足。"""
+    import re
+    import lint_source_grounding as m
+    alt = "|".join(re.escape(p) for p in m._SRC_PREFIXES)
+    rx = rf'(?:{alt})/[\w/-]+\.(?:py|pyi|td|cpp|cc|cu|cuh|h|hpp)'
+    found = set(re.findall(rx, "见 vllm/tutorials/01-vector-add.py 与 vllm/x/02-fused-softmax.py"))
+    assert "vllm/tutorials/01-vector-add.py" in found and "vllm/x/02-fused-softmax.py" in found

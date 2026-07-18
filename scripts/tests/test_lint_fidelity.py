@@ -73,3 +73,17 @@ def test_must_keep_present_passes(tmp_path):
     }), encoding="utf-8")
     res = lint_fidelity(d)
     assert not res["over_subtraction"]
+
+
+def test_hyphenated_source_paths_match(tmp_path):
+    """回归(triton-ascend):官方教程文件名含连字符(01-vector-add.py)+ 路径段连字符,
+    _SRC_REF_RE 的字符类须含 '-',否则 hyphen 后整段路径匹配失败→假 narrative_grounding BLOCKING。
+    (ch03 vector-add on-ramp 实证:引 ≥6 个连字符 .py 却被判 2 处。)"""
+    import re
+    from lint_fidelity import _SRC_REF_RE
+    # 活动实例前缀下的连字符路径必须能整段匹配
+    m = _SRC_REF_RE.search("vllm/tutorials/01-vector-add.py")
+    assert m and m.group(0) == "vllm/tutorials/01-vector-add.py", \
+        "连字符路径应整段匹配,不能只从连字符后截取"
+    # 多段连字符 + 深路径
+    assert _SRC_REF_RE.search("vllm/a-b/c-d-e/02-fused-softmax.py")

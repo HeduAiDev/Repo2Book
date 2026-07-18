@@ -46,7 +46,7 @@ _SRC_REF_RE = re.compile(
     r"(?:" + "|".join(re.escape(p) for p in sorted(_SRC_PREFIXES, key=len, reverse=True))
     # Part V 起进入 MLIR/C++ 层：正文引用的是 .td/.cpp/.cc/.h（不是 .py）——一并识别，
     # 否则 C++/MLIR 章（ch19+）会被 .py-only 正则误判为「0 处源码引用」。
-    + r")/[\w/]+\.(?:py|pyi|td|cpp|cc|cu|cuh|h|hpp)"
+    + r")/[\w/-]+\.(?:py|pyi|td|cpp|cc|cu|cuh|h|hpp)"
 )
 
 

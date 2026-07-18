@@ -100,7 +100,10 @@ def lint_source_grounding(chapter_dir: str) -> dict:
         else r'#\s*(?:REFERENCE|SOURCE):\s*(.+)'
     )
     if impl_dir.exists():
-        for py_file in impl_dir.glob("*.py"):
+        # rglob（递归）而非 glob：多根仓 fork 的精简版按真实包树组织
+        # （implementation/python/triton/…、implementation/third_party/ascend/…），
+        # # SOURCE: 锚点落在嵌套 *.py 里；非递归 glob 只看顶层会全部漏掉。
+        for py_file in impl_dir.rglob("*.py"):
             code = py_file.read_text(encoding="utf-8")
             refs = re.findall(anchor_pattern, code)
             ref_count += len(refs)
@@ -126,7 +129,7 @@ def lint_source_grounding(chapter_dir: str) -> dict:
     # 实例无关：用活动实例规范前缀 + 对照基座前缀（姊妹篇引用基座 vllm/ 也算）计源码文件
     alt = "|".join(re.escape(p) for p in _SRC_PREFIXES)
     # 含 MLIR/C++ 层后缀：Part V 起正文引用 .td/.cpp/.cc/.h，不再是清一色 .py。
-    src_ref_re = rf'(?:{alt})/[\w/]+\.(?:py|pyi|td|cpp|cc|cu|cuh|h|hpp)'
+    src_ref_re = rf'(?:{alt})/[\w/-]+\.(?:py|pyi|td|cpp|cc|cu|cuh|h|hpp)'
     issues = []
     if narrative.exists():
         text = narrative.read_text(encoding="utf-8")
