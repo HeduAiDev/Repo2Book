@@ -1,0 +1,188 @@
+{
+  "chapter": "ch04-dual-builder-ascend-dispatch",
+  "title": "前端接缝——双 builder 与 Ascend 内建的分发路由",
+  "one_line": "fork 在同一前端 CodeGenerator 上挂了第二个 builder(self.ascend_builder),并在 visit_Call 上加了『第四岔』——按 extension.is_builtin(fn) 把 al.* 内建路由到 ascend_builder,由 @builtin 打的 __triton_builtin__/__ascend_builtin__ 双标记支撑这道判定。",
+
+  "code_spine": [
+    "python/triton/compiler/code_generator.py:L25-L31  (模块级:WITH_DISPATCH 空表 + 导入并合入 ASCEND_WITH_DISPATCH / setup_unified_builder;mangle_ty 被 override 钩子替换 L51)",
+    "python/triton/compiler/code_generator.py:L215-L231 (CodeGenerator.__init__:构造标准 self.builder(simd/simt) + 第二个 self.ascend_builder(ascendnpu_ir_builder) + buffer_builder,并 setup_unified_builder 把 ascend 方法挂到主 builder)",
+    "python/triton/compiler/code_generator.py:L1168-L1206 (visit_Call:核心——统一 builtin 入口门 language.core.is_builtin(fn),再用 extension.is_builtin(fn) 选择 _builder=ascend_builder 还是 builder,并在两 builder 间同步插入点/loc)",
+    "third_party/ascend/language/cann/extension/core.py:L66-L90 (@builtin 装饰器同时打 __triton_builtin__ 与 __ascend_builtin__;is_builtin 只读 __ascend_builtin__)",
+    "third_party/ascend/language/cann/extension/builder.py:L32-L87 (create_builder_method_wrapper/attach_builder_methods/setup_unified_builder:把 ascend_builder 的 emit 方法作为插入点同步 wrapper 挂到主 builder)",
+    "python/triton/compiler/code_generator.py:L801-L814 (visit_With:WITH_DISPATCH 查表分发 with al.scope(...))",
+    "third_party/ascend/language/cann/extension/dispatch.py:L28-L34 (ASCEND_WITH_DISPATCH 表:{scope: handle_scope_with, 'mangle_ty': mangle_ty})",
+    "third_party/ascend/language/cann/extension/code_generator.py:L137-L208 (handle_scope_with:把 with scope 体 emit 成 ascend 的 scope.scope op——本章只讲它经 WITH_DISPATCH 落地,region/SSA 细节归后续章)"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "python/triton/compiler/code_generator.py",
+      "lines": "L25-L31",
+      "code": "# Central registry for all 'with' statement handlers\nWITH_DISPATCH = {}\n\n# Import and register Ascend extension dispatch handlers\nfrom triton.language.extra.cann.extension.dispatch import ASCEND_WITH_DISPATCH\nfrom triton.language.extra.cann.extension.builder import setup_unified_builder\nWITH_DISPATCH.update(ASCEND_WITH_DISPATCH)",
+      "elide": ["导入路径 triton.language.extra.cann.extension 是安装期把 third_party/ascend/language/cann 链入 triton 包后的运行时路径;源码物理位置在 third_party/ascend/language/cann/extension/。此处只需知道:code_generator 在模块加载时就把 Ascend 的 dispatch 表与 setup_unified_builder 拉进来——fork 的接缝从 import 就开始了。"]
+    },
+    {
+      "path": "python/triton/compiler/code_generator.py",
+      "lines": "L215-L231",
+      "code": "        if hasattr(options, \"force_simt_only\") and options.force_simt_only:\n            self.builder = ir.builder(context, compile_mode=\"simt\")\n        else:\n            self.builder = ir.builder(context, compile_mode=\"simd\")\n        self.file_name = file_name\n        # node.lineno starts from 1, so we need to subtract 1\n        self.begin_line = begin_line - 1\n        self.builder.set_loc(file_name, begin_line, 0)\n        self.builder.options = options\n\n        # Set up unified builder interface with methods from specialized builders\n        self.ascend_builder = ascend_ir.ascendnpu_ir_builder(context, getattr(options, \"arch\", \"\"))\n        self.ascend_builder.set_loc(file_name, begin_line, 0)\n        setup_unified_builder(self.builder, self.ascend_builder)\n        self.buffer_builder = buffer_ir.buffer_builder(context)\n        self.buffer_builder.set_loc(file_name, begin_line, 0)\n        setup_unified_builder_with_buffer_builder(self.builder, self.buffer_builder)",
+      "elide": ["三个 builder 共享同一个 MLIR context;buffer_builder 是又一套(buffer 语言,归别处),本章只讲 self.builder(标准 Triton IR)与 self.ascend_builder(ascendnpu_ir_builder,emit hivm/ascend 方言)这一对。基座同位置只有一行 self.builder = ir.builder(context)——fork 在此加了 ascend_builder + buffer_builder 两条支线并各自 setup_unified_builder。"]
+    },
+    {
+      "path": "python/triton/compiler/code_generator.py",
+      "lines": "L1168-L1206",
+      "code": "    def visit_Call(self, node):\n        fn = _unwrap_if_constexpr(self.visit(node.func))\n        static_implementation = self.statically_implemented_functions.get(fn)\n        if static_implementation is not None:\n            return static_implementation(self, node)\n\n        kws = dict(self.visit(keyword) for keyword in node.keywords)\n        args = [self.visit(arg) for arg in node.args]\n        if isinstance(fn, JITFunction):\n            _check_fn_args(node, fn, args)\n            return self.call_JitFunction(fn, args, kws)\n        if (hasattr(fn, '__self__') and _is_triton_value(fn.__self__)) or language.core.is_builtin(fn):\n            # Copy builder's location and insertion point.\n            ip, last_loc = self._get_insertion_point_and_loc()\n            # Use ascend_builder if this function is a builtin extension operation.\n            _builder = self.ascend_builder if extension.is_builtin(fn) else self.builder\n            self._set_insertion_point_and_loc(ip, last_loc, _builder)\n            extra_kwargs = {\"_builder\": _builder}\n            sig = inspect.signature(fn)\n            if '_generator' in sig.parameters:\n                extra_kwargs['_generator'] = self\n            try:\n                ret = fn(*args, **extra_kwargs, **kws)\n                # Sync the builder's location before return.\n                ip, last_loc = self._get_insertion_point_and_loc(_builder)\n                self._set_insertion_point_and_loc(ip, last_loc)\n                return ret\n            except Exception as e:\n                # Normally when we raise a CompilationError, we raise it as\n                # `from None`, because the original fileline from the exception\n                # is not relevant (and often points into code_generator.py\n                # itself).  But when calling a function, we raise as `from e` to\n                # preserve the traceback of the original error, which may e.g.\n                # be in core.py.\n                raise CompilationError(self.jit_fn.src, node, repr(e)) from e\n\n        if fn in self.builtin_namespace.values():\n            args = map(_unwrap_if_constexpr, args)\n        return fn(*args, **kws)",
+      "elide": ["四岔顺序:①statically_implemented_functions(编译期常量折叠,如 tl.constexpr 数学);②JITFunction(@triton.jit 组合子,递归 codegen);③builtin 分支(本章重点)——入口门 `... or language.core.is_builtin(fn)` 对 tl.* 与 al.* 一切内建都为真;进门后 fork 加的关键一行 `_builder = self.ascend_builder if extension.is_builtin(fn) else self.builder` 就是『第四岔』:只有 al.* 内建(带 __ascend_builtin__)才路由到 ascend_builder;④builtin_namespace 兜底 Python 调用。except/raise 文本细节可略读。"]
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/core.py",
+      "lines": "L66-L90",
+      "code": "TRITON_BUILTIN = \"__triton_builtin__\"\nASCEND_BUILTIN = \"__ascend_builtin__\"\n\n\ndef builtin(fn: T) -> T:\n    \"\"\"Mark a function as a buffer language builtin.\"\"\"\n    assert callable(fn)\n\n    @wraps(fn)\n    def wrapper(*args, **kwargs):\n        if \"_builder\" not in kwargs or kwargs[\"_builder\"] is None:\n            raise ValueError(\"Did you forget to add @triton.jit ? \"\n                             \"(`_builder` argument must be provided outside of JIT functions.)\")\n        return fn(*args, **kwargs)\n\n    # also set triton_builtin to true so that CodeGenerator will recognize this function\n    setattr(wrapper, TRITON_BUILTIN, True)\n    setattr(wrapper, ASCEND_BUILTIN, True)\n\n    return wrapper\n\n\ndef is_builtin(fn) -> bool:\n    \"\"\"Is this a registered ascend language builtin function?\"\"\"\n    return getattr(fn, ASCEND_BUILTIN, False)",
+      "elide": ["对照:基座 python/triton/language/core.py 的 @builtin 只 setattr(wrapper, TRITON_BUILTIN, True),其 is_builtin 读 __triton_builtin__。fork 的这份 @builtin(al.builtin)同时打两个标记——__triton_builtin__ 让统一入口门认它、__ascend_builtin__ 让 extension.is_builtin 认它为『需走 ascend_builder』。两个谓词读两个不同标记,是整条路由的支点。"]
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/builder.py",
+      "lines": "L32-L86",
+      "code": "def create_builder_method_wrapper(main_builder, delegate_builder, method_name):\n    \"\"\"\n    Create a wrapper that delegates a method call to another builder while\n    synchronizing insertion points and locations.\n    \"\"\"\n    delegate_method = getattr(delegate_builder, method_name)\n\n    def wrapper(*args, **kwargs):\n        saved_ip = main_builder.get_insertion_point()\n        saved_loc = main_builder.get_loc()\n        delegate_builder.restore_insertion_point(saved_ip)\n        if saved_loc:\n            delegate_builder.set_loc(saved_loc)\n        result = delegate_method(*args, **kwargs)\n        main_builder.restore_insertion_point(saved_ip)\n        if saved_loc:\n            main_builder.set_loc(saved_loc)\n        return result\n\n    wrapper.__name__ = method_name\n    wrapper.__doc__ = getattr(delegate_method, '__doc__', None)\n    return wrapper\n\n\ndef attach_builder_methods(main_builder, delegate_builder, method_names):\n    \"\"\"Attach multiple methods from a delegate builder to the main builder.\"\"\"\n    for method_name in method_names:\n        wrapper = create_builder_method_wrapper(main_builder, delegate_builder, method_name)\n        setattr(main_builder, method_name, wrapper)\n\n\ndef setup_unified_builder(main_builder, ascend_builder):\n    \"\"\"Set up a unified builder interface by attaching methods from specialized builders.\"\"\"\n    main_builder._ascend_builder = ascend_builder\n    ascend_methods = [\n        'create_scope_op',\n        'scope_return',\n        'get_t_core_type_attr_name',\n        'get_t_core_type_cube_attr',\n        'get_t_core_type_vector_attr',\n        'get_target_attribute',\n        'create_get_sub_vec_id',\n        'create_copy_buffer',\n        'create_copy_tensor',\n        'create_fixpipe',\n        'create_annotation_mark',\n        'create_bind_buffer',\n        'create_debug_barrier',\n        'is_910_95',\n        \"sync_block_set\",\n        \"sync_block_wait\",\n        \"create_convert_layout\",\n        'sync_block_all',\n    ]\n    attach_builder_methods(main_builder, ascend_builder, ascend_methods)",
+      "elide": ["setup_unified_builder 把 ascend_builder 的一串 emit 方法(create_scope_op/create_copy_buffer/create_fixpipe/sync_block_* 等 hivm 方言原语)以 wrapper 形式 setattr 到 main_builder 上,并把 ascend_builder 反挂为 main_builder._ascend_builder。这样 handle_scope_with 里写 generator.builder.create_scope_op(...) 实际调到 ascend_builder(见 wrapper),且插入点在两 builder 间自动搬运。具体某个 create_* op 的 hivm 语义归 Part2 后续章/P5,本章只讲『方法怎么被挂上来』。"]
+    },
+    {
+      "path": "python/triton/compiler/code_generator.py",
+      "lines": "L801-L814",
+      "code": "    def visit_With(self, node):\n        \"\"\"Handle 'with' statements using dispatch pattern.\"\"\"\n        assert len(node.items) == 1\n        context = node.items[0].context_expr\n\n        # Check if context is a Call and dispatch to registered handler\n        if isinstance(context, ast.Call):\n            withitemClass = self.visit(context.func)\n            handler = WITH_DISPATCH.get(withitemClass)\n            if handler:\n                return handler(self, node)\n\n        # Fall back to visiting body for unhandled cases\n        return self.visit_compound_statement(node.body)",
+      "elide": ["基座没有 visit_With(with 语句非 Triton IR 关注点);fork 新增此方法,用 WITH_DISPATCH 查表:withitemClass 是 with 后的可调用对象(如 scope 类),命中则交注册的 handler(handle_scope_with)。这是 `with al.scope(core_mode=...)` 落地进 ascend 方言的入口。"]
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/dispatch.py",
+      "lines": "L25-L34",
+      "code": "from .scope import scope\nfrom .code_generator import handle_scope_with, mangle_ty\n\n__all__ = [\"ASCEND_WITH_DISPATCH\"]\n\n# Registry of 'with' statement handlers for Ascend extension\nASCEND_WITH_DISPATCH = {\n    scope: handle_scope_with,\n    \"mangle_ty\": mangle_ty,\n}",
+      "elide": ["表里两个键:scope 类 → handle_scope_with(供 visit_With 查);字符串 'mangle_ty' → ascend 版 mangle_ty(供 code_generator.py:L51 `mangle_ty = WITH_DISPATCH.get(\"mangle_ty\", mangle_ty)` 覆盖基座的类型名 mangling,让 buffer_type 等 ascend 类型也能编码进符号名)。同一张表既承载 with 分发、又承载函数级 override 钩子。"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "CodeGenerator", "file": "python/triton/compiler/code_generator.py", "responsibility": "AST → IR 的前端翻译器。fork 让它持有两个 IR builder:self.builder(标准 Triton IR)+ self.ascend_builder(ascendnpu_ir_builder);visit_Call/visit_With 上加分发,把 al.* 内建与 with scope 路由到 ascend_builder。"},
+    {"name": "scope", "file": "third_party/ascend/language/cann/extension/scope.py", "responsibility": "`with al.scope(core_mode=...)` 的上下文管理器类;作为 ASCEND_WITH_DISPATCH 的键,被 visit_With 查表命中后交 handle_scope_with 处理。本身 __enter__/__exit__ 仅做 kernel 内使用校验。"},
+    {"name": "ascendnpu_ir_builder", "file": "python/triton/_C/libtriton/ascend (C++ 绑定)", "responsibility": "Ascend 方言(hivm/ascend)的 IR builder,由 __init__ 构造为 self.ascend_builder;提供 create_scope_op/create_copy_buffer/create_fixpipe/sync_block_* 等 emit 方法。本章只讲 Python 表面如何 emit 进它,方法语义归后续章。"}
+  ],
+
+  "data_flow": [
+    "1. CodeGenerator.__init__ 按 options.force_simt_only 构造标准 self.builder(simt/simd 编译模式),这是基座就有的主 builder。 [code_generator.py:__init__ L215-223]",
+    "2. 紧接着 fork 构造第二个 builder:self.ascend_builder = ascend_ir.ascendnpu_ir_builder(context, arch),与主 builder 共享同一 context;再 setup_unified_builder(self.builder, self.ascend_builder)。 [code_generator.py:__init__ L226-228]",
+    "3. setup_unified_builder 把 ascend_builder 的 emit 方法(create_scope_op/create_copy_buffer/... )包成『插入点同步 wrapper』setattr 到 self.builder 上,并反挂 self.builder._ascend_builder = ascend_builder。 [builder.py:setup_unified_builder + attach_builder_methods + create_builder_method_wrapper]",
+    "4. 模块加载时 WITH_DISPATCH.update(ASCEND_WITH_DISPATCH),把 {scope→handle_scope_with, 'mangle_ty'→ascend mangle_ty} 合入全局分发表;mangle_ty 被 override。 [code_generator.py:L25-31, L51 + dispatch.py]",
+    "5. 遇到函数调用 al.copy(...)/tl.load(...):visit_Call 先试 statically_implemented / JITFunction 两岔;都不是则进 builtin 分支——入口门 `... or language.core.is_builtin(fn)` 对任何内建(tl.* 或 al.*)为真。 [code_generator.py:visit_Call L1176-1179]",
+    "6. 进门后选 builder:`_builder = self.ascend_builder if extension.is_builtin(fn) else self.builder`。al.copy 带 __ascend_builtin__ → extension.is_builtin 为真 → 走 ascend_builder;tl.load 无该标记 → 走标准 builder。这就是 fork 加的『第四岔』。 [code_generator.py:visit_Call L1183]",
+    "7. 调用前把主 builder 的 ip/loc 拷进所选 _builder,fn(*args, _builder=_builder, ...) 在该 builder 上 emit,返回后再把 _builder 的 ip/loc 同步回主 builder——保证两 builder 的插入点接力不断。 [code_generator.py:visit_Call L1180-1193]",
+    "8. al.* 内建之所以带 __ascend_builtin__,是因为它们用 al.builtin(extension.core.builtin)装饰——该装饰器同时 setattr __triton_builtin__ 与 __ascend_builtin__。 [core.py:builtin L70-85]",
+    "9. 遇到 `with al.scope(core_mode='vector'):`:visit_With 取 context.func→scope 类→WITH_DISPATCH.get(scope)=handle_scope_with,交它把 with 体 emit 成 ascend 的 scope.scope op(经挂上来的 create_scope_op)。 [code_generator.py:visit_With L801-811 + extension/code_generator.py:handle_scope_with]"
+  ],
+
+  "design_decisions": [
+    {"decision": "在同一个 CodeGenerator 上并挂第二个 builder(self.ascend_builder),而非另起一套前端", "why": "复用基座整套 AST 遍历/符号表/子作用域机制,fork 只在少数接缝(__init__ 构造 + visit_Call 选 builder + visit_With 分发)做原位改动。『同一前端、两套 emit』——tl.* 走标准 builder,al.* 走 ascend_builder,读者在同一段 kernel 里混写而分发透明。", "evidence": "python/triton/compiler/code_generator.py:L226-228"},
+    {"decision": "用两个布尔标记(__triton_builtin__ 入口门 / __ascend_builtin__ 选路)分层判定,而非在 visit_Call 里枚举 ascend 函数名", "why": "al.builtin 给每个 ascend 内建同时打两个标记 → ascend 内建集合是全体内建集合的子集。入口门 language.core.is_builtin(读 __triton_builtin__)必先于选路谓词通过,保证任何 al.* 内建都不会漏进兜底的普通 Python 调用;新增 ascend 内建只需加 @al.builtin,visit_Call 一行不改。", "evidence": "third_party/ascend/language/cann/extension/core.py:L70-90"},
+    {"decision": "两个 builder 共享同一 MLIR context,但各自维护插入点/loc,调用前后显式搬运", "why": "同一 context 才能让 tl.* 与 al.* 产出的 op 落进同一 module/同一函数体、互相引用 value;但每个 builder 有独立 insertion point,故 visit_Call 与 wrapper 都在切换 builder 前拷 ip/loc、emit 后同步回来,避免两条 emit 流的插入点错位。", "evidence": "python/triton/compiler/code_generator.py:L1180-1193"},
+    {"decision": "把 ascend_builder 的 emit 方法反向挂到主 builder(setup_unified_builder)", "why": "让 handle_scope_with 等处能统一写 generator.builder.create_scope_op(...) 而不必区分 builder;wrapper 在委托到 ascend_builder 的同时同步插入点,对调用方隐藏『其实在另一个 builder 上 emit』。", "evidence": "third_party/ascend/language/cann/extension/builder.py:L63-87"},
+    {"decision": "with 语句走 WITH_DISPATCH 查表分发,并复用同一张表承载 mangle_ty override", "why": "基座无 visit_With;fork 新增后用注册表模式,scope 类→handle_scope_with 做 with 分发,字符串键 'mangle_ty' 做函数级 override 钩子(L51),两类扩展点收敛到一张全局表,扩展 ascend 上下文管理器/类型 mangling 只需往表里加项。", "evidence": "third_party/ascend/language/cann/extension/dispatch.py:L28-34"}
+  ],
+
+  "theory": [
+    "谓词代数(整章支点):设 B = {带 __triton_builtin__ 的函数}(全体内建),A = {带 __ascend_builtin__ 的函数}(ascend 内建)。al.builtin 对每个 ascend 内建同时打两个标记 ⇒ A ⊆ B。visit_Call 的入口门用 language.core.is_builtin(读 __triton_builtin__)即判 fn∈B;进门后选路用 extension.is_builtin(读 __ascend_builtin__)判 fn∈A。因 A⊆B,任何 al.* 内建(∈A⊆B)必先过入口门,再被选路命中走 ascend_builder;tl.* 内建(∈B\\A)过门但选路失败,走标准 builder。这保证:没有 al.* 内建会漏出 builtin 分支落到兜底 Python 调用,且判定与函数名解耦(加新 ascend 内建零改 visit_Call)。",
+    "对照基座 ch04(python/triton 实例)的『三岔』:基座 visit_Call 只有 ①statically_implemented ②JITFunction ③统一 builtin(单一 self.builder)。fork 把第③岔内部一分为二——同一入口门下按 extension.is_builtin 再选 builder,即本章所称『第四岔』(第四个 emit 目标 ascend_builder,而非新增顶层分支)。基座 __init__ 只有一行 self.builder = ir.builder(context);基座无 visit_With;基座 @builtin 只打 __triton_builtin__——三处正是 fork 的原位改动落点。",
+    "插入点接力的必要性:两 builder 若各写各的插入点,tl.load 后紧跟 al.copy 会让 ascend_builder 从陈旧插入点插 op,破坏顺序/支配关系。visit_Call 每次切 builder 前 _get/_set_insertion_point_and_loc 搬运,setup_unified_builder 的 wrapper 亦然,使两条 emit 流在同一函数体里线性接续。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "code_generator.py 中与 builder 分发无关的 AST visitor 方法体(visit_For/visit_While/visit_If/visit_BinOp/visit_Compare 等)", "why_safe": "本章只讲 __init__ 双 builder 构造 + visit_Call 选 builder + visit_With 分发这三处接缝;其余 visitor 是基座通用逻辑,删除不影响双 builder/分发路由这条主线的可读性与正确性。"},
+      {"what": "code_generator.py __init__ 中 gscope 归一化、module_map、function_ret_types 等与双 builder 无关的初始化(L233 之后大段)", "why_safe": "这些是基座前端通用状态,与『第二个 builder 怎么建、怎么被 setup_unified_builder 挂方法』无关,保留 L215-231 的 builder 构造块即可讲清机制。"},
+      {"what": "extension/core.py 中各具体 @builtin 算子的完整校验体(fixpipe 的对齐检查、create_sync_block 的 pipe 推断、各 enum 类 CORE/PIPE/MODE/IteratorType/Fixpipe* 的全部成员)", "why_safe": "本章只需 1~2 个 @al.builtin 例子(如 copy / sub_vec_id)展示双标记与路由;fixpipe/sync_block 的 hivm 语义与对齐规则归 Part2 后续章/P5,删其算子体不影响『@builtin 打双标记 + is_builtin 读标记』的讲解。"},
+      {"what": "extension/code_generator.py 中 handle_scope_with 的 region/SSA 线程化细节及其私有助手(_extract_scope_attributes/_build_mlir_attrs_from_scope_attrs/_handle_core_mode_attr/_py_value_to_mlir_attr/_verify_loop_carried_variable/_reconstruct_value_from_ir)", "why_safe": "本章对 with scope 只讲『经 WITH_DISPATCH 命中 handle_scope_with,emit 成 scope.scope op』这一层落地关系;scope op 的属性构造/循环携带变量校验/SSA 重建是 scope 章(后续)的深水区,删除不影响本章分发主线。"},
+      {"what": "extension/builder.py setup_unified_builder 中 ascend_methods 列表的完整枚举(可保留 create_scope_op/create_copy_buffer 等 2~3 个代表)", "why_safe": "列表是被挂方法的清单,机制是『逐个包 wrapper 后 setattr』;保留代表项 + 说明『其余同理』即可讲清,全量枚举无额外机制信息。"}
+    ],
+    "must_keep": [
+      {"symbol": "self.ascend_builder", "why": "fork 的第二个 builder,整章主角;__init__ 构造、visit_Call 选路都指向它,读者必须看到它与 self.builder 并存。"},
+      {"symbol": "self.builder", "why": "标准 Triton IR builder,双 builder 的另一半;分发的『否则分支』落点。"},
+      {"symbol": "ascendnpu_ir_builder", "why": "self.ascend_builder 的实际构造类(ascend_ir.ascendnpu_ir_builder),点明第二个 builder emit 的是 ascend/hivm 方言。"},
+      {"symbol": "setup_unified_builder", "why": "把 ascend emit 方法挂到主 builder 的入口函数,__init__ 调用它,builder.py 定义它——机制枢纽。"},
+      {"symbol": "attach_builder_methods", "why": "setup_unified_builder 的实现主体,逐方法挂 wrapper;讲清『方法怎么被挂上来』必需。"},
+      {"symbol": "create_builder_method_wrapper", "why": "插入点同步 wrapper 的定义,承载『两 builder 插入点接力』这一设计决策的证据。"},
+      {"symbol": "extension.is_builtin", "why": "visit_Call 第四岔的选路谓词,读 __ascend_builtin__;决定路由到 ascend_builder 与否。"},
+      {"symbol": "is_builtin", "why": "extension.core.is_builtin 的定义(getattr __ascend_builtin__),须与基座 language.core.is_builtin(读 __triton_builtin__)对照,才讲清双标记分层判定。"},
+      {"symbol": "language.core.is_builtin", "why": "visit_Call 统一 builtin 入口门,读 __triton_builtin__;与 extension.is_builtin 构成两层谓词。"},
+      {"symbol": "builtin", "why": "extension.core.builtin(al.builtin)装饰器,同时打两个标记;ascend 内建带 __ascend_builtin__ 的根源。"},
+      {"symbol": "__triton_builtin__", "why": "入口门读的标记;双标记之一,谓词代数 B 集合的判据。"},
+      {"symbol": "__ascend_builtin__", "why": "选路谓词读的标记;双标记之一,谓词代数 A 集合的判据,fork 独有。"},
+      {"symbol": "visit_Call", "why": "第四岔分发的宿主方法;整章核心算法所在。"},
+      {"symbol": "visit_With", "why": "with al.scope 分发的宿主方法;fork 新增,WITH_DISPATCH 查表入口。"},
+      {"symbol": "WITH_DISPATCH", "why": "全局分发注册表,承载 with 分发 + mangle_ty override;visit_With/mangle_ty 都查它。"},
+      {"symbol": "ASCEND_WITH_DISPATCH", "why": "ascend 侧注册项 {scope→handle_scope_with, 'mangle_ty'→mangle_ty},合入 WITH_DISPATCH;fork 接缝之一。"},
+      {"symbol": "handle_scope_with", "why": "with al.scope 命中的 handler,把 with 体 emit 进 ascend scope.scope op(经挂上来的 create_scope_op)。"},
+      {"symbol": "mangle_ty", "why": "被 WITH_DISPATCH['mangle_ty'] 覆盖的类型名 mangling;示范同一张表也承载函数级 override 钩子。"},
+      {"symbol": "scope", "why": "with al.scope(...) 的上下文管理器类,作为 ASCEND_WITH_DISPATCH 的键;visit_With 查表命中它。"},
+      {"symbol": "create_scope_op", "why": "挂到主 builder 的代表性 ascend emit 方法;handle_scope_with 经它落 scope.scope op,示范 setup_unified_builder 挂上来的方法怎么被调用。"}
+    ]
+  },
+
+  "mechanisms": [
+    {
+      "id": "m1-dual-builder-construction",
+      "name": "双 builder 构造:同一 CodeGenerator 上并挂 self.builder + self.ascend_builder",
+      "kind": "dataflow",
+      "source_anchors": ["python/triton/compiler/code_generator.py:L215-L231"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m2-builtin-dispatch-fourth-branch",
+      "name": "visit_Call 第四岔:按 extension.is_builtin(fn) 选 ascend_builder / builder",
+      "kind": "algorithm",
+      "source_anchors": ["python/triton/compiler/code_generator.py:L1168-L1206"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m3-dual-builtin-marker",
+      "name": "双内建标记:@al.builtin 打 __triton_builtin__ + __ascend_builtin__,两谓词读两标记",
+      "kind": "protocol",
+      "source_anchors": ["third_party/ascend/language/cann/extension/core.py:L66-L90", "python/triton/compiler/code_generator.py:L1179-L1183"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m4-setup-unified-builder-attach",
+      "name": "setup_unified_builder:把 ascend emit 方法作为插入点同步 wrapper 挂到主 builder",
+      "kind": "dataflow",
+      "source_anchors": ["third_party/ascend/language/cann/extension/builder.py:L32-L86", "python/triton/compiler/code_generator.py:L228"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m5-with-dispatch-table",
+      "name": "WITH_DISPATCH 注册表:with al.scope 查表分发 + mangle_ty override 钩子",
+      "kind": "protocol",
+      "source_anchors": ["python/triton/compiler/code_generator.py:L25-L31", "python/triton/compiler/code_generator.py:L801-L814", "python/triton/compiler/code_generator.py:L51", "third_party/ascend/language/cann/extension/dispatch.py:L28-L34"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m6-insertion-point-sync",
+      "name": "两 builder 插入点/loc 接力:切 builder 前拷入、emit 后同步回",
+      "kind": "protocol",
+      "source_anchors": ["python/triton/compiler/code_generator.py:L1180-L1193", "python/triton/compiler/code_generator.py:L353-L365", "third_party/ascend/language/cann/extension/builder.py:L39-L49"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    }
+  ],
+
+  "foreshadow_due": {
+    "to_plant": [],
+    "to_payoff": [],
+    "note": "bible.py due ch04 返回空(应埋伏笔/应回收均为空);本章无伏笔埋/回收,与派单一致。"
+  }
+}
