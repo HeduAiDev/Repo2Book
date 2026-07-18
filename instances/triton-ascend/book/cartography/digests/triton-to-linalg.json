@@ -1,0 +1,156 @@
+{
+  "subsystem": "triton-to-linalg-adapter",
+  "one_line_spine": "把 Triton-MLIR 的『tensor-of-pointers + 指针算术』模型,通过一串 triton_adapter pass 逐步还原成结构化的 memref/Linalg 张量算子——这是昇腾 NPU 下降链与 GPU 路径最根本的分水岭:GPU 保留指针 SIMT 模型只往上贴布局(TTGIR),NPU 彻底换成结构化/仿射的 tiled dataflow。",
+
+  "entry_point": {
+    "python": "third_party/ascend/backend/compiler.py:96 ttir_to_linalg(mod, metadata, opt, *, named_ops)",
+    "pass_pipeline_order": [
+      "add_auto_blockify",
+      "(可选) add_dag_sync/add_dag_scope/add_dag_ssbuffer (auto-scheduling)",
+      "add_triton_to_structure (第一遍:PtrAnalysis 还原 addptr/mask 表达式)",
+      "add_discrete_mask_access_conversion",
+      "add_triton_to_annotation",
+      "add_triton_to_unstructure (标量化兜底 + BubbleUp)",
+      "add_triton_to_hivm / add_triton_to_hfusion / add_triton_to_llvm (下游子系统,非本子系统)",
+      "add_bubble_up_operation",
+      "add_triton_to_structure (第二遍)",
+      "add_triton_to_linalg (BlockPtrAnalysis→memref.reinterpret_cast + 全体 triton op→linalg)"
+    ],
+    "note": "本子系统覆盖 structure/unstructure/annotation/linalg 四段;hivm/hfusion/llvm 段属后端子系统(cartoBackend)。关键:triton-to-structure 在管线里出现两次(pass 幂等、迭代收敛更多结构化访存),这是与基座『一次性贴布局』最直观的对比。"
+  },
+
+  "chapters_proposed": [
+    {
+      "proposed_title": "分水岭:从指针张量到结构化张量——triton_adapter 总览",
+      "focus": "全景讲清『为什么 NPU 不能沿用 GPU 的 tensor-of-pointers 模型』和 ttir_to_linalg 这条 pass 管线的形状。核心对照:基座 ch32『第一跳 TTIR→TTGIR:给每个张量贴上布局』保留指针+加布局编码;这里第一跳直接 TTIR→Linalg,丢掉指针语义、重建 memref/subview/仿射访存。给出一个最小 add_kernel 的 ttir.mlir → ttadapter.mlir 前后对照(用 unittest/custom_op 里的 ttir_to_linalg 可实跑打印),让读者看见 tt.addptr/tt.load 消失、memref.reinterpret_cast/linalg.generic 出现。串起后续 4 章的地图。",
+      "key_source_paths": [
+        "third_party/ascend/backend/compiler.py:96-171",
+        "third_party/ascend/lib/TritonToLinalg/TritonToLinalgPass.cpp:768-921",
+        "third_party/ascend/include/TritonToLinalg/Passes.td",
+        "third_party/ascend/include/TritonToStructured/Passes.td"
+      ],
+      "pairs_with": "triton ch32 (第一跳 TTIR→TTGIR:给每个张量贴上布局) + 对照 ch19-24 布局系统",
+      "kind": "deep",
+      "teaching_value": "确立全书最重要的心智模型:同一个『前端之后往哪下降』问题,GPU 答案=贴布局保指针,NPU 答案=结构化重解释。没有这一章,读者会用 GPU 布局直觉误读后面所有内容。",
+      "difficulty": "medium"
+    },
+    {
+      "proposed_title": "指针算术的逆向工程:PtrAnalysis 把 addptr 链还原成 stride/offset",
+      "focus": "深读 TritonToStructured 的 PtrAnalysis/PtrState。Triton 前端把访存写成 `base + arange*stride + ...` 的指针算术链(addptr/make_range/splat/broadcast/expand_dims/mul/add/rem/div)。PtrAnalysis 用 visitOperand 递归遍历这条链,在 PtrState 里累积每维的 stride/shape/offset,把散落的指针算术重新表达成『结构化的 (offset, sizes, strides)』——即 tt.addptr/tt.make_tensor_ptr 的规范形式。核心机制:visitOperand 的算子分派表、PtrState 的 add/mul/sub/rem 状态代数、countContiguousAxes 的连续轴判定公式(axis i 连续 ⟺ stride[i]==prod(shape[0..i-1]))。worked example:二维 tile 指针 `a_ptr + (offs_m[:,None]*stride_am + offs_n[None,:]*stride_an)` 的逐步状态累积。",
+      "key_source_paths": [
+        "third_party/ascend/include/TritonToStructured/PtrAnalysis.h:52-99",
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:1277-1358",
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:594",
+        "third_party/ascend/lib/TritonToStructured/MemOpConverter.cpp"
+      ],
+      "pairs_with": "none-new",
+      "kind": "deep",
+      "teaching_value": "这是整个模型转换的算法内核:如何从『每个元素一个指针』的表象里,反推出编译器需要的『一块规则张量』的 (offset,sizes,strides) 描述。是理解后续 memref 落地的前提。kind=algorithm 级,需三层递进 + worked example。",
+      "difficulty": "hard"
+    },
+    {
+      "proposed_title": "落到 memref:BlockPtrAnalysis 与 reinterpret_cast,以及 load/store→linalg",
+      "focus": "深读 TritonToLinalg 的 BlockPtrAnalysis(BlockData/BlockDataParser)与 LoadStoreConverter。承接上一章的 (offset,sizes,strides):BlockDataParser::parse 再走一遍算子链,把它落成真正的 `memref.reinterpret_cast`(从裸 !tt.ptr 参数切出一块有 layout 的 memref 视图),BlockData::createCastOp 生成 cast。然后 LoadConverter/StoreConverter 把 tt.load/tt.store 换成 memref.copy→bufferization→linalg 消费,或 tensor.extract_slice/insert_slice。关键新概念:MemAccType(Structured/Unstructured/Undefined)的分类,决定一次访存走结构化 memref 路径还是标量化兜底路径(引出下一章)。同时覆盖 make_tensor_ptr/advance(block-ptr)如何直接落成 reinterpret_cast+offset 推进。",
+      "key_source_paths": [
+        "third_party/ascend/include/TritonToLinalg/BlockPtrAnalysis.h:46-146",
+        "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:392",
+        "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:322",
+        "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:1125",
+        "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp:226",
+        "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp:1053"
+      ],
+      "pairs_with": "triton ch33-34 (第二跳地基:类型塌缩/ConvertLayout;共享内存降级与全局访存向量化) 的 NPU 对位——GPU 往 shared/vectorize 走,NPU 往 memref/reinterpret_cast 走",
+      "kind": "deep",
+      "teaching_value": "把抽象的 stride/offset 状态真正变成 MLIR 里可跑的 memref 算子,是『指针→结构化张量』从分析走到 IR 重写的落地闭环。MemAccType 分类是全子系统的关键决策点。",
+      "difficulty": "hard"
+    },
+    {
+      "proposed_title": "边界的语义:MaskAnalysis 把 mask 还原成 extract_slice",
+      "focus": "深读 MaskAnalysis(TritonToStructured 与 TritonToLinalg 各有一份)。Triton 的越界保护写成 `mask = offs < N`,前端是逐元素布尔张量;NPU 需要把它解释成对张量『取前 k 个/中间一段』的结构化裁剪。MaskState::parse 递归解码 `cmp/and/broadcast/splat` 组成的 mask 表达式,推出每维的 (offset,dim) 有效区间;getMaskPosition 判定 Head/Tail/Middle;getExtractSlice/getInsertSlice 生成 tensor.extract_slice/insert_slice 来实现『只搬有效部分』。还讲 load 的 other(mask 填充值)如何用 linalg.fill 落地,以及 enable-mask-fallback-conversion 兜底路径。worked example:`tl.load(ptr, mask=offs<N, other=0)` 的完整下降。",
+      "key_source_paths": [
+        "third_party/ascend/include/TritonToLinalg/MaskAnalysis.h:42-140",
+        "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:81",
+        "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:133-145",
+        "third_party/ascend/lib/TritonToStructured/MaskAnalysis.cpp"
+      ],
+      "pairs_with": "none-new",
+      "kind": "deep",
+      "teaching_value": "mask 处理是 Triton 算子正确性的核心,GPU 靠 predication 逐 lane 屏蔽,NPU 靠结构化切片——同一语义两种硬件哲学的鲜明对照,读者写昇腾 kernel 时 mask 怎么写才高效直接依赖这套机制。kind=algorithm,需 worked example。",
+      "difficulty": "hard"
+    },
+    {
+      "proposed_title": "结构化装不下时:Unstructure 兜底路径与 gather/scatter 标量化",
+      "focus": "深读 TritonToUnstructure(OffsetAnalysis/UnstructureConversionPass/BubbleUpOperation)。不是所有访存都能还原成规则 stride:indirect load(`tl.load(base + tl.load(idx))`)、非连续 stride(muli 两个 range)、运行期未知偏移等。OffsetAnalysis 的 PtrOffsetInfo 用四态格(scalar⊆scalarlike⊆structured / unstructured=补集)分类每个偏移;凡判为 Unstructured 的访存,UnstructuredMemAccessConverter 把整块访存降级成 scf.for 嵌套循环 + tensor.extract/insert_slice 的逐元素标量搬运(头文件里有完整前后 IR 例子)。BubbleUpOperation 把 extract 往上冒泡以减少标量化范围。这是与结构化路径互补的安全网,也是 NPU 处理 gather/scatter 的真实代价所在。",
+      "key_source_paths": [
+        "third_party/ascend/include/TritonToUnstructure/OffsetAnalysis.h:40-110",
+        "third_party/ascend/lib/TritonToUnstructure/OffsetAnalysis.cpp:150-166",
+        "third_party/ascend/include/TritonToUnstructure/UnstructureConversionPass.h:52-95",
+        "third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp",
+        "third_party/ascend/include/TritonToUnstructure/BubbleUpOperation.h",
+        "third_party/ascend/lib/TritonToUnstructure/BubbleUpOperation.cpp"
+      ],
+      "pairs_with": "none-new",
+      "kind": "deep",
+      "teaching_value": "解释『为什么你的 gather kernel 在 NPU 上慢』:结构化恢复失败就退化成标量循环。四态分类格 + 标量化循环是理解性能悬崖的钥匙,也补全『结构化恢复不是万能』的诚实图景。",
+      "difficulty": "medium"
+    }
+  ],
+
+  "secondary_mechanisms_may_fold": [
+    {
+      "name": "UseAnalysis (meta/data use 分流)",
+      "path": "third_party/ascend/lib/TritonToLinalg/UseAnalysis.cpp",
+      "note": "在转换前对 FuncOp 跑 use analysis,区分一个值被当『地址计算(meta)』还是『数据』用——决定 addptr 链哪些留在指针世界、哪些进数据世界。可作为『指针→memref』章的一个支撑小节,不必单列。"
+    },
+    {
+      "name": "ImplicitPermute / HoistBroadcast",
+      "path": "third_party/ascend/lib/TritonToLinalg/ImplicitPermute.cpp, HoistBroadcast.cpp",
+      "note": "load 隐式转置(利用 permute 提升访存效率)与 broadcast 外提优化;可折进 memref 落地章的优化小节或后端 tiling 讨论。"
+    },
+    {
+      "name": "TritonOpConverter (全体 triton op → linalg)",
+      "path": "third_party/ascend/lib/TritonToLinalg/TritonOpConverter.cpp (115KB), include:65-710",
+      "note": "MakeRange/Splat/Broadcast/ExpandDims/Reduce/Scan/Dot/Transpose/Join/Split/Gather 等约 50 个 pattern 把非访存 triton op 逐一映射到 linalg.generic/named ops/tensor 算子。体量大但机械,建议在『memref 落地』章用 Reduce+Dot 两个代表讲清『linalg.generic + indexing_map』范式,其余列表带过,不单列成章(避免 catalog 式章节)。"
+    },
+    {
+      "name": "TritonToAnnotation",
+      "path": "third_party/ascend/lib/TritonToAnnotation/TritonToAnnotation.cpp (全文仅 78 行)",
+      "note": "只做一件事:把 triton.ascend.AnnotationOp 转成 annotation.MarkOp 并转发属性,给下游 tiling/调度传标记。太小,建议 kind=skip_impl,在总览章一句话带过,不单列。"
+    },
+    {
+      "name": "CannonicalizerConverter (结构化前的规范化)",
+      "path": "third_party/ascend/lib/TritonToStructured/CannonicalizerConverter.cpp (93KB)",
+      "note": "PromotePointerIterArgs(把 scf.for 里 loop-carried 的指针 iter_arg 提升成整数偏移)、SimplifyTensorIterArgs、AddPtrSplat/LoadBroadcast 等规范化,为 PtrAnalysis 铺路。可作 PtrAnalysis 章的『为什么循环里的指针要先规范化』支撑小节。"
+    }
+  ],
+
+  "divergence_from_base": "基座 TTIR→TTGIR(ch32)保留 tensor-of-pointers 的 SIMT 模型,只在张量类型上叠加 layout 编码(Blocked/MMA/Shared/LinearLayout),指针语义一路带到 LLVM;triton-ascend 的 TTIR→Linalg 则在编译早期就『抛弃指针模型』——用 PtrAnalysis/BlockPtrAnalysis 把指针算术逆向还原成 (offset,sizes,strides),落成 memref.reinterpret_cast + linalg 结构化算子,mask 变 extract_slice,还原不了的才标量化兜底。一句话:GPU 往『带布局的指针张量』下降,NPU 往『带仿射访存的结构化 memref』下降,这是两种硬件抽象(SIMT vs 结构化/tiled dataflow)在同一编译阶段的分岔。",
+
+  "paper_gap_candidates": [
+    {
+      "concept": "结构化访存恢复 (raising pointer arithmetic to structured/affine access)",
+      "why_prereq": "PtrAnalysis/BlockPtrAnalysis 本质是 MLIR 社区 triton-shared / 'raising to structured' 的思路(微软 triton-shared 项目,源码 copyright 里同时挂 Huawei + Microsoft,证实血缘)。读者需要先懂『为什么以及如何从低层指针算术抬升回高层结构化张量』这一编译器范式,才能读懂本子系统。",
+      "has_paper_root": false,
+      "note": "无正式 arXiv 论文,但有 triton-shared 的 RFC/设计文档可作前瞻 primer 的 external-source 溯源。建议 Lead 评估是否开一节『raising 范式』primer(可能挂在总览章而非独立 primer 章)。"
+    },
+    {
+      "concept": "MLIR Linalg / 结构化算子与 indexing_map",
+      "why_prereq": "全子系统的目标方言是 Linalg(linalg.generic + affine indexing maps)。基座书面向 GPU/PTX,读者可能不熟 Linalg/memref/tensor 方言与 destination-passing style。",
+      "has_paper_root": true,
+      "note": "有根:MLIR Linalg 官方文档 + 'Composable and Modular Code Generation in MLIR'(arXiv:2202.03293)。建议全书早段设一节 Linalg/memref primer(可能属另一子系统或全书 primer,提请 Lead 统筹避免与其他 analyst 重复)。"
+    },
+    {
+      "concept": "昇腾 NPU 结构化/tiled dataflow 执行模型(对位基座 ch02 GPU SIMT primer)",
+      "why_prereq": "读者只有基座给的 GPU SIMT 心智模型;要理解『为什么必须结构化』,需要一节讲清 NPU 的 Cube/Vector 单元 + 局部 buffer(UB/L1)+ tiling 的执行模型。这是本书专属地基。",
+      "has_paper_root": false,
+      "note": "无单一论文,靠昇腾架构公开资料。属全书 primer 范畴,非本子系统独有——提请 Lead 与 cartoBackend 协调归属(HIVM/tiling 子系统可能更适合承载)。"
+    }
+  ],
+
+  "open_questions": [
+    "triton-to-structure 在管线里出现两次(compiler.py:131 与 :152),第二遍靠什么新信息收敛出更多结构化访存?需实跑 dump 两遍中间 IR 对比确认——建议写章时用 debug=True 落 kernel.ttadapter.mlir 佐证,不要臆测。",
+    "MarkTensorKindPass(标 INPUT/OUTPUT/INPUT_OUTPUT)与 discrete_mask_access_conversion 的确切职责边界,与 tensor_kind 如何被下游 profiling/tiling 消费,跨到 cartoBackend 领地,需与其对齐,避免两本 digest 重复讲。",
+    "章数最终定 3 还是 5:PtrAnalysis 与 BlockPtrAnalysis 两套『指针→结构化』分析(一套出 tt 规范形式、一套出 memref)是否合并成一章讲『两级还原』,还是拆两章。倾向拆(各自算法足够重),但请 Lead 按全书篇幅预算裁决。",
+    "compile-on-910-95 / force-simt-template 等 flag 分出的 SIMT 模板路径是否属本子系统——它看起来是『结构化失败时退回类 GPU SIMT 执行』的另一条腿,可能与 Unstructure 章或后端子系统交叠。"
+  ]
+}

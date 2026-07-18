@@ -1,0 +1,111 @@
+{
+  "subsystem": "backend-pipeline-driver",
+  "one_line_spine": "Ascend 后端的『挂载点 + 下降链 + 运行时』——把同一份 Triton-MLIR 经 triton_adapter 降到 Linalg、交给闭源 bishengir-compile 出 NPU 二进制，再由 CANN 运行时注册/发射；是全书『GPU 与 NPU 走两条完全不同下降链』这一主叙事的落地骨架。",
+
+  "chapters_proposed": [
+    {
+      "proposed_title": "昇腾后端如何挂进 Triton：AscendBackend 契约、NPUOptions 与 hacc.target 注入",
+      "focus": "讲 Ascend 后端怎么被 Triton 发现并挂载。Triton 用 `_discover_backends()` 扫 `python/triton/backends/*/`（`backends/__init__.py`）找 `BaseBackend`/`DriverBase` 的唯一具体子类——昇腾侧就是 `AscendBackend`(compiler.py:877, `supports_target` 只认 `target.backend==\"npu\"`) 与 `NPUDriver`(driver.py:144)。重点讲 `AscendBackend` 对 ch14 六钩子的落地：`parse_options` 把用户参数灌进 `NPUOptions`(compiler.py:704，一个约 80 字段的 frozen dataclass，几乎每个字段都是后面 bishengir 的一个开关)、`get_codegen_implementation` 触发 `_apply_ascend_patch`(__init__.py:27) 猴补 `ASTSource.make_ir` 往 module 注入 `#hacc.target<...>` 属性、`get_attrs_descriptor`→`AscendAttrsDescriptor`(compiler.py:815，故意留空 `_add_backend_properties`)、`pack_metadata` 截断 kernel_name 到 49 字符(CANN 限制)。再讲 `NPUDriver.is_active`(driver.py:150) 靠探测 `bishengir-compile -print-targets` 是否含 `hiipu64` 来判活、`get_current_target` 造 `warp_size=0` 的 GPUTarget。",
+      "key_source_paths": [
+        "third_party/ascend/backend/compiler.py",
+        "third_party/ascend/backend/driver.py",
+        "third_party/ascend/backend/__init__.py",
+        "python/triton/backends/__init__.py"
+      ],
+      "pairs_with": "ch14-compile-driver-and-backend-contract",
+      "kind": "deep",
+      "teaching_value": "读者在基座书 ch14 学到 BaseBackend 是『留给后端的空格』；这一章正是第一次看到一个真实非 NVIDIA 后端如何精确填这些空格，并见到 NPU 特有的两处手法——monkey-patch 注入硬件 target 属性、以及用一个巨型 Options dataclass 承载闭源编译器的全部旋钮。",
+      "difficulty": "core"
+    },
+    {
+      "proposed_title": "三段下降链：add_stages 与 Triton-MLIR→Linalg（triton_adapter 的编排）",
+      "focus": "本子系统的主脊。`AscendBackend.add_stages`(compiler.py:939) 只登记三段：`ttir`(make_ttir) → `ttadapter`(ttir_to_linalg) → `npubin`(linalg_to_bin)，对照 GPU 的五段(ttir→ttgir→llir→ptx→cubin)——**没有 TTGIR 那层 layout/warp 指派**。`make_ttir`(compiler.py:73) 复用与所有后端相同的 TTIR pass(inliner/combine/canonicalizer/cse/licm/loop_unroll)。`ttir_to_linalg`(compiler.py:96) 是重点：把 TTIR 打成字符串写临时文件，然后在 `pass_manager` 上按序挂一长串 `ascend.passes.ttir.add_*`——auto_blockify、可选的 dag_sync/dag_scope/ssbuffer(auto-scheduling)、triton_to_structure、discrete_mask_access_conversion、annotation、unstructure、triton_to_hivm、triton_to_hfusion、triton_to_llvm、bubble_up、再 structure、最后 triton_to_linalg——产出 named-op 形态的 Linalg。讲清楚：这一章讲**编排**(Python 侧 pass 顺序与开关来自 NPUOptions)，每个 pass 的 C++ 内部实现属 triton_adapter/mlir-passes 子系统(交叉引用，不在此展开)。附带 `force_simt_only` 快路径：`add_stages` 会改挂 `ttir_to_npubin`(compiler.py:824)，绕过 Linalg 直接把 TTIR 喂 bishengir 的 SIMT 模式。",
+      "key_source_paths": [
+        "third_party/ascend/backend/compiler.py"
+      ],
+      "pairs_with": "ch36-cuda-backend-stages",
+      "kind": "deep",
+      "teaching_value": "ch36 让读者看清 CUDABackend 用 add_stages 把五段 pass 串成真实序列；这一章是它的对位镜像——同样是 add_stages，但只有三段且第二段整个换成对外部 triton_adapter pass 库的编排，直观呈现『同一前端、两条下降链』的分叉点到底在哪一行代码上。",
+      "difficulty": "core"
+    },
+    {
+      "proposed_title": "闭源边界 bishengir-compile：编译选项构造、子进程调用与元数据回收",
+      "focus": "讲下降链最后一段与全书唯一的闭源编译器边界。`linalg_to_bin_enable_npu_compile_910_95`(compiler.py:298) / `..._A2_A3`(compiler.py:502) 两个变体(按 `compile_on_910_95` 选)：先 `_parse_linalg_metadata`(compiler.py:183) 用**正则**从 Linalg 文本里抠出 `mix_mode`/`parallel_mode`/`kernel_name`/`tensor_kinds`/`bitcodes`(与 GPU 从结构化 pass 拿元数据形成鲜明对比)，再把 NPUOptions 的几十个字段翻译成 `--enable-auto-multi-buffer`/`--enable-hivm-graph-sync-solver`/`--link-aicore-bitcode` 等一长串命令行开关，`subprocess.run([bishengir-compile, ttadapter.mlir, ...opts, -o, kernel])`(compiler.py:465)——**边界就在这一行**：HFusion→HIVM→NPU 汇编全在闭源二进制内部，读到此为止。产物落地后还有两条元数据回收通道：从 stdout 正则抓 `UB size = N bits`(compiler.py:481)、以及 dlopen `libkernel.so` 用 ctypes 回调 `_infer_task_type_function`/`_infer_workspace_shape_function`/`_infer_sync_block_lock_*`(compiler.py:492) 取回 task_type/workspace/lock。编译器定位与版本探测 `_get_npucompiler_path`/`_check_bishengir_api_change`/`_check_bishengir_is_regbased`(utils.py:154/201/224)。",
+      "key_source_paths": [
+        "third_party/ascend/backend/compiler.py",
+        "third_party/ascend/backend/utils.py"
+      ],
+      "pairs_with": "ch37-ptx-to-cubin-and-launch",
+      "kind": "deep",
+      "teaching_value": "bishengir-compile 是 ptxas 的昇腾对位——同样是闭源、同样起子进程、同样从 stdout 抓资源占用(ptxas -v 的 n_regs/n_spills ↔ bishengir 的 UB size bits)。读者能学到一个真实工程如何在开源编译器里干净地封住一个闭源后端边界，以及『元数据靠正则解析 IR 文本 + dlopen 回调』这种非常规但真实的双通道设计。",
+      "difficulty": "core"
+    },
+    {
+      "proposed_title": "NPU 运行时驱动与二进制装载：NPUDriver、NPUUtils 与 npu_utils.cpp",
+      "focus": "讲编译产物如何进设备、Driver 如何对接框架。`NPUUtils`(driver.py:47) 单例在构造时把 `npu_utils.cpp` 就地编成 `.so` 并 import；`load_binary`(driver.py:77) 把 `name` 按 `_` 拆出 `mix_mode` 后转调 C 扩展 `load_kernel_binary`→`registerKernel`(npu_utils.cpp:40)，用 CANN 运行时 `rtDevBinaryRegister`+`rtFunctionRegister` 注册 kernel，magic 按 mix_mode 选 `RT_DEV_BINARY_MAGIC_ELF_AIVEC`(aiv) 或 `ELF`(其它)。设备属性来自 `getArch`(rtGetSocVersion)/`getAiCoreNum`(rtGetAiCoreCount)——并点明 `get_device_properties`(driver.py:82) 里 `num_aiv = num_aic * 2` 这一达芬奇架构事实(1 cube core + 2 vector cores)。`NPUDriver`(driver.py:144) 作为 DriverBase 落地：device/stream/current_device 全部转调 `get_backend_func`(下一章的多框架抽象)。",
+      "key_source_paths": [
+        "third_party/ascend/backend/driver.py",
+        "third_party/ascend/backend/npu_utils.cpp"
+      ],
+      "pairs_with": "ch37-ptx-to-cubin-and-launch",
+      "kind": "deep",
+      "teaching_value": "对位 ch37 的 driver.c loadBinary(cuModuleLoadData)。读者看清 CANN 运行时装载二进制的完整链路(rtDevBinaryRegister/rtFunctionRegister)、以及 aiv/aic 两种 kernel magic 的区分——这是理解后面发射与 profiling 里 mix_mode 分叉的物理基础。",
+      "difficulty": "core"
+    },
+    {
+      "proposed_title": "动态生成的发射器：generate_npu_wrapper_src、rtKernelLaunch 与 taskqueue/msprof",
+      "focus": "讲『按核签名现生成一段 C++ 发射器』。`NPULauncher`(driver.py:104) 构造时调 `generate_npu_wrapper_src`(driver.py:403) 按 signature 拼出 C++ 源、`make_npu_launcher_stub`(driver.py:244) 编成缓存 `.so`(带 precompiled header 加速)。发射器内部：`PyArg_ParseTuple` 按 format 串解参、`getPointer` 从 torch/ms tensor 取 `data_ptr` 并用 `aclrtPointerGetAttributes` 校验是 device 内存、按 `__attribute__((packed))` 拼 args 结构体(含 ffts_addr/syncBlockLock/workspace/grid)、`rtKernelLaunch`(driver.py:734；910_95+simt 走 `rtKernelLaunchWithFlagV2`)。两条昇腾特有支线：workspace 与 syncBlockLock 的**每次发射按 grid 现分配**(compiler 回收的 workspace_size/lock_num 在此用上)、以及深度内联的 msprof 打点(MsprofReportApi/CompactInfo，L0/L1 flag)。异步发射 `enable_taskqueue` 时把 launch 包成 lambda 交 `async_launch`(torch_npu OpCommand / mindspore OpExecutor)延迟派发。",
+      "key_source_paths": [
+        "third_party/ascend/backend/driver.py"
+      ],
+      "pairs_with": "ch37-ptx-to-cubin-and-launch",
+      "kind": "deep",
+      "teaching_value": "对位 ch37 的 CudaLauncher/make_launcher(cuLaunchKernel)。相同思路(按签名动态生成 C 扩展)在昇腾侧被推到极致——多出 workspace/syncBlockLock 生命周期、msprof 全套打点、taskqueue 异步派发。读者能理解 NPU launch overhead 的真实来源，以及为何发射器必须现生成而非预编译。",
+      "difficulty": "core"
+    },
+    {
+      "proposed_title": "一套后端，两个框架：torch_npu / mindspore 策略注册表",
+      "focus": "讲 Ascend 后端一个 GPU 侧完全没有的设计：同一份编译/发射代码同时服务 torch_npu 与 mindspore 两套 Python 框架运行时。`backend_register.py` 的 `BackendStrategyRegistry`(backend_register.py:25) 用 `@register(category, method)` 装饰器为两个框架各注册一份实现——`version_hash`/`cxx_abi`/`get_cc_cmd`/`header_file`/`allocate_memory`/`allocate_sync_block_lock`/`pre_launch`/`async_launch`/`get_current_device`/`get_current_stream`/`get_empty_tensor` 等。`utils.get_backend_func`(utils.py:40) 按 `TRITON_BACKEND` 环境变量或 import 探测选定 policy，然后 dispatch。讲清楚这些 hook 如何被前几章消费：header/allocate/async_launch 注入进 launcher 模板(driver.py 的 f-string 里 `get_backend_func(...)`)、get_cc_cmd 进 `_build_npu_ext`、device/stream 进 NPUDriver。",
+      "key_source_paths": [
+        "third_party/ascend/backend/backend_register.py",
+        "third_party/ascend/backend/utils.py"
+      ],
+      "pairs_with": "none-new",
+      "kind": "deep",
+      "teaching_value": "GPU 后端只对接 CUDA 运行时一家，没有这层。这一章展示一个真实的『可插拔运行时后端』抽象——策略注册表 + 环境变量选路，是很好的软件工程范例，也解释了前面几章里散落的 get_backend_func 调用到底在做什么。可考虑作 supporting 章或并入发射器章。",
+      "difficulty": "supporting"
+    }
+  ],
+
+  "divergence_from_base": "①段数：Ascend 三段(ttir→ttadapter/Linalg→npubin) vs GPU 五段(ttir→ttgir→llir→ptx→cubin)，**整层 TTGIR(layout/warp 指派)不存在**——Triton-MLIR 经 triton_adapter 直降 Linalg，之后的 HFusion→HIVM→NPU 汇编全在闭源 bishengir 内部。②闭源边界：bishengir-compile 是 ptxas 的对位(闭源、子进程、stdout 抓资源占用 UB bits ↔ n_regs/n_spills)，边界精确在 `subprocess.run([bishengir-compile,...])` 一行(compiler.py:465)。③元数据来源：Ascend 用**正则解析 IR 文本**(mix_mode/kernel_name/tensor_kinds/bitcodes，compiler.py:183) + **dlopen libkernel.so ctypes 回调**(task_type/workspace/lock) 两个非结构化通道，而 GPU 从结构化 pass/属性拿元数据。④并行模型：无真实 warp 概念(warp_size=0)，用 `mix_mode`(aiv/aic/mix) + 达芬奇 AI Core(1 cube + 2 vector，num_aiv=num_aic*2) 取代 GPU 的 warp/CTA/cluster。⑤运行时：`rtKernelLaunch`/CANN(rtDevBinaryRegister/rtFunctionRegister，ELF_AIVEC vs ELF magic) vs cuLaunchKernel/cuModuleLoadData；发射前**每次按 grid 现分配 workspace 与 syncBlockLock**；msprof 打点深度内联进发射器。⑥异步：taskqueue 把 launch 包 lambda 交 torch_npu OpCommand / mindspore OpExecutor 延迟派发 vs GPU 同步 cuLaunch。⑦多框架：一套后端同时服务 torch_npu 与 mindspore 两个运行时(策略注册表)，GPU 侧无对应物。⑧force_simt_only 快路径：绕过 Linalg，TTIR 直喂 bishengir SIMT 模式(compiler.py:824)——一条次要旁路下降链。",
+
+  "paper_gap_candidates": [
+    {
+      "concept": "达芬奇(DaVinci)/昇腾架构：AI Core = 1 Cube 核 + 2 Vector 核、片上 UB 内存 + double buffer、Cube/Vector(CV)融合、mix_mode(aiv/aic/mix)",
+      "why_prereq": "本子系统处处依赖这一硬件模型：driver.py `num_aiv=num_aic*2`、kernel magic 的 aiv/aic 分叉、mix_mode 决定 task_type/发射路径、bishengir 的 cv-balance/hfusion 开关。不懂达芬奇分核就无法理解 metadata 里 mix_mode 为何是一等公民。",
+      "has_paper_root": true,
+      "note": "已有 web-verified 论文根基(papers-recon-ascend.json)：HPCA'21 『Ascend: a Scalable and Unified Architecture...』(DOI 10.1109/HPCA51647.2021.00071) 与 Hot Chips'19 『DaVinci: A Scalable Architecture for Neural Network Computing』。建议由全书『昇腾硬件 primer』章统一承载，本子系统各章交叉引用而非各自重讲——需 Lead 定归属，避免与硬件 primer 子系统重复。"
+    },
+    {
+      "concept": "triton_adapter / TritonToLinalg 下降路径(Triton-MLIR → Linalg on tensors/memref)的设计原理，及其与 triton-shared 的渊源",
+      "why_prereq": "第二章『三段下降链』只讲 Python 侧 pass 编排，每个 ascend.passes.ttir.add_* 的 C++ 语义(structure/unstructure/mask/hivm/hfusion)属 triton_adapter 子系统。读者要真正读懂 ttir_to_linalg 需要这层原理支撑。",
+      "has_paper_root": false,
+      "note": "triton_adapter 源自 microsoft/triton-shared(工程项目，非学术论文)。papers-recon 记为 source-cited/unverified-candidate。归属应在 mlir-passes/triton_adapter 子系统，本子系统仅编排层，交叉引用即可。"
+    },
+    {
+      "concept": "CANN 运行时(rt.h / ACL)与 bishengir/HIVM/HFusion 编译栈",
+      "why_prereq": "驱动章与 bishengir 章直接调用 rt* / acl* API 且以 bishengir 为闭源黑盒。",
+      "has_paper_root": false,
+      "note": "工程栈非论文，且 bishengir 闭源、AscendNPU-IR 子模块未 checkout(见下)。作为 source-cited 背景交代即可，无需 primer 章。"
+    }
+  ],
+
+  "open_questions": [
+    "章数 6 vs 5：第 6 章(多框架策略注册表, supporting)是否独立成章，还是并入第 5 章(发射器)？get_backend_func 贯穿 driver/launcher/build 三处，独立讲更清晰但可能偏薄——请 Lead 定。类似地第 4(驱动装载)+第 5(发射器)材料都很厚(driver.py 966 行，其中 wrapper 模板约 560 行)，倾向拆两章，但基座 ch37 是合并讲的，需确认对位粒度。",
+    "边界划分：第 2 章『三段下降链』只讲 Python 侧 pass 编排，ascend.passes.ttir.add_*(structure/unstructure/mask/hivm/hfusion/triton_to_linalg) 的 C++ 内部实现应归 triton_adapter/mlir-passes 子系统。请 Lead 在综合大纲时明确本子系统与 triton_adapter 子系统的接缝，避免两边都讲或都不讲 ttir_to_linalg 的 pass 序列。",
+    "达芬奇架构 primer 归属：是否设独立『昇腾硬件 primer』章统一承载 DaVinci/AI Core/UB/mix_mode(有 HPCA'21/HotChips'19 论文根基)，本子系统各章交叉引用？还是各章按需自带一小节？影响 paper-gap 是否登记到本子系统。",
+    "cpu_driver.py 是明确的桩(CPUUtils/CPULauncher 多处 `TODO temporarily fake`、generate_cpu_wrapper_src 返回空模板)，非真实可用路径。建议全书跳过或仅在驱动章一句话带过『昇腾包内另存一个未完工的 CPU 参考后端』，不单独成章——请确认。",
+    "AscendNPU-IR 子模块(HIVM/HFusion IR 定义)当前 blobless clone 未 checkout(papers-recon 记 commit 47a0229)。因 bishengir 闭源边界，本子系统读到 subprocess 调用为止即可，预计无需 checkout；但若第 3 章想展示 HIVM/HFusion IR 形态样例，需 Lead 决定是否补 checkout 子模块。",
+    "force_simt_only 旁路(ttir_to_npubin，绕过 Linalg 的 SIMT 编译模式)分量：是并入第 2 章作次要分支一笔带过，还是值得在某章展开？倾向前者(supporting 级别，真实但非主线)。"
+  ]
+}

@@ -1,0 +1,870 @@
+{
+  "book": {
+    "title": "Triton-Ascend 源码解读",
+    "instance": "triton-ascend",
+    "kind": "source-reading",
+    "spine": "同一份 Triton 前端,昇腾后端如何抛弃 GPU 的 SIMT 指针张量模型、走一条 Triton→Linalg→HFusion→HIVM→AscendC 的结构化下降链,把 tl.* 核落到达芬奇 cube/vector 双核。",
+    "depends_on": {
+      "instance": "triton",
+      "version": "v3.2.0",
+      "source_dir": "instances/triton/source",
+      "sister_book": "《Triton 源码解读》(43 章)"
+    },
+    "reader_profile": {
+      "assumed_knowledge": [
+        "已读基座《Triton 源码解读》或等价:Triton 前端/TTIR/编译驱动",
+        "MLIR 基础(方言/op/region)有帮助但本书 primer 会补",
+        "了解 GPU 执行模型有助于体会 NPU 对照"
+      ],
+      "target_level": "advanced",
+      "language": "zh-CN"
+    }
+  },
+  "parts": [
+    {
+      "id": "part-1",
+      "title": "鸟瞰与达芬奇硬件模型",
+      "intent": "建立心智模型:fork 而非插件、同前端异后端、达芬奇 cube/vector 双核 + 显式内存搬运;vector-add on-ramp。"
+    },
+    {
+      "id": "part-2",
+      "title": "语言层:CANN 扩展",
+      "intent": "昇腾把 DaVinci 编程模型显式暴露到 tl.* 之上:双 builder、UB/GM 显式搬运、内建算子、自定义算子、scope/核间同步。"
+    },
+    {
+      "id": "part-3",
+      "title": "分水岭:Triton→Linalg",
+      "intent": "全书与基座最根本的 divergence:抛弃 tensor-of-pointers SIMT 模型,把指针算术逆向还原成结构化 memref/Linalg(triton-shared 血缘)。"
+    },
+    {
+      "id": "part-4",
+      "title": "昇腾优化 pass:异构双核编排",
+      "intent": "NPU 编译第一性问题:每个 op 放 cube 还是 vector 核(核亲和定点)+ 跨核显式同步 + UB 多缓冲软流水 + 网格合并 + 离散访存驯服。"
+    },
+    {
+      "id": "part-5",
+      "title": "HFusion/HIVM 硬件 IR 与下降",
+      "intent": "NPU 的硬件 IR(TTGIR+PTX 对位物):HFusion 融合层 + HIVM 达芬奇硬件方言 + 显式同步,一路降到 AscendC 库调用(全开源可读到底)。"
+    },
+    {
+      "id": "part-6",
+      "title": "后端与运行时",
+      "intent": "把各层收进后端框架:AscendBackend 契约、三段下降编排、bishengir 闭源边界、NPU 驱动装载、动态发射器、一后端两框架。"
+    },
+    {
+      "id": "part-7",
+      "title": "度量与实战",
+      "intent": "flash-attention CV 融合 capstone 把全链串一遍;测试套件揭示的诚实能力边界。"
+    }
+  ],
+  "chapters": [
+    {
+      "chapter_id": "ch01",
+      "slug": "ch01-birdseye-ascend-backend",
+      "title": "从 Triton 到昇腾:后端全景与三段下降流水线（鸟瞰）",
+      "focus": "全书取景框。核心心智模型:triton-ascend 是 Triton 的 fork(不是 vllm-ascend 那种 OOT 插件)——上游 Triton 3.2.0 整树在内，昇腾增量在 third_party/ascend/。同一份 @triton.jit 核不再编到 GPU，而是经三段下降 ttir→ttadapter(Triton-MLIR→Linalg)→npubin(bishengir-compile→NPU 二进制)落到达芬奇 cube/vector 指令。只挑三支柱最小锚点(fork 版权头/add_stages 三段/一个 vector-add 走通主线)，主线是搭心智模型；每章都是放大这张鸟瞰图的一块。",
+      "part": "part-1",
+      "subsystem": "birdseye",
+      "key_source_paths": [
+        "third_party/ascend/tutorials/01-vector-add.py",
+        "third_party/ascend/backend/compiler.py",
+        "third_party/ascend/ascend_ir.cc"
+      ],
+      "deps": [],
+      "est_size": "M",
+      "mode": "meta",
+      "kind": "skip_impl",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch01"
+        ]
+      },
+      "flagship": true
+    },
+    {
+      "chapter_id": "ch02",
+      "slug": "ch02-davinci-npu-hardware-model",
+      "title": "达芬奇 NPU 硬件模型:cube/vector 双核、片上内存层级与显式搬运（原理篇）",
+      "focus": "全书最高优先级先修。达芬奇 AI Core = 1 cube 矩阵核 + 2 vector 向量核(1:2)；片上 UB(Unified Buffer，192KB 级)/L1/L0/L0C 与 GM(DRAM)显式层级——数据搬运必须显式写(tl.load GM→UB / tl.store UB→GM，对比 GPU 隐式 cache/shared)。double-buffer 把可用 UB 减半→tiling 是硬件必然而非优化选项；32B/512B 末轴对齐、mix_mode(aic/aiv)、grid 强绑物理核。后面 HIVM/AutoBlockify/核亲和全部悬在这张图上。",
+      "part": "part-1",
+      "subsystem": "hardware-primer",
+      "key_source_paths": [
+        "docs/en/programming_guide.md",
+        "docs/en/migration_guide/architecture_difference.md",
+        "third_party/ascend/AscendNPU-IR/docs/source/en/introduction/architecture.md"
+      ],
+      "deps": [
+        "ch01"
+      ],
+      "est_size": "L",
+      "mode": "meta",
+      "kind": "primer",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch02"
+        ]
+      },
+      "papers": [
+        {
+          "title": "Ascend: a Scalable and Unified Architecture for Ubiquitous DNN Computing",
+          "venue": "HPCA 2021",
+          "doi": "10.1109/HPCA51647.2021.00071",
+          "verify": "web-verified"
+        },
+        {
+          "title": "DaVinci: A Scalable Architecture for Neural Network Computing",
+          "venue": "Hot Chips 2019",
+          "doi": "10.1109/HOTCHIPS.2019.8875654",
+          "verify": "web-verified"
+        }
+      ]
+    },
+    {
+      "chapter_id": "ch03",
+      "slug": "ch03-first-kernel-vector-add",
+      "title": "上手第一课:vector-add 与 GPU→NPU 的最小改写",
+      "focus": "读者 on-ramp。拿 tutorials/01 的 vector-add，逐行看它相对基座 triton 同名核改了什么:device='npu' + import torch_npu、grid/tiling 按物理核(ncore/xblock/xblock_sub 三级)改写、进阶用 tl.extra.cann.extension.compile_hint。把硬件 primer 的 tiling/显式搬运落到一个能跑通的最小核上，为后续拆解建立坐标系。",
+      "part": "part-1",
+      "subsystem": "tutorials",
+      "key_source_paths": [
+        "third_party/ascend/tutorials/01-vector-add.py",
+        "third_party/ascend/tutorials/04-low-memory-dropout.py",
+        "third_party/ascend/unittest/pytest_ut/test_01_vector_add.py"
+      ],
+      "deps": [
+        "ch01",
+        "ch02"
+      ],
+      "est_size": "S",
+      "mode": "meta",
+      "kind": "skip_impl",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch03"
+        ]
+      }
+    },
+    {
+      "chapter_id": "ch04",
+      "slug": "ch04-dual-builder-ascend-dispatch",
+      "title": "前端接缝:双 builder 与 Ascend 内建的分发路由",
+      "focus": "昇腾在语言层的接入点。fork 在 code_generator.py 里给 CodeGenerator 加了第二个 builder:self.builder(标准 Triton IR) + self.ascend_builder(emit hivm/ascend 方言)；visit_Call 用 extension.is_builtin 判定路由到哪个 builder，@builtin 同时打 __triton_builtin__ 与 __ascend_builtin__ 双标记，WITH_DISPATCH 表处理 with al.scope(...)。这是『同一前端、两套 emit』的机关。",
+      "part": "part-2",
+      "subsystem": "language-cann",
+      "key_source_paths": [
+        "python/triton/compiler/code_generator.py",
+        "third_party/ascend/language/cann/extension/dispatch.py",
+        "third_party/ascend/language/cann/extension/__init__.py"
+      ],
+      "deps": [
+        "ch01"
+      ],
+      "est_size": "M",
+      "mode": "code",
+      "kind": "deep",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch04"
+        ]
+      }
+    },
+    {
+      "chapter_id": "ch05",
+      "slug": "ch05-explicit-memory-hierarchy",
+      "title": "显式内存层级:UB/GM/L1/L0C、buffer 语言与 copy/fixpipe",
+      "focus": "基座 triton 隐藏的东西昇腾全部显式暴露。UB/GM/L1/L0C 地址空间对程序员可见，搬运必须显式写:al.copy(带地址空间逐条校验)、al.fixpipe(L0C→UB 带 NZ2ND 分形布局变换，仅部分芯片)。配套 buffer 语言 bl.alloc/bl.buffer 在指定 address_space 开缓冲。对位基座 ch07 的造块/访存，但多了一整套 NPU 显式内存语义。",
+      "part": "part-2",
+      "subsystem": "language-cann",
+      "key_source_paths": [
+        "third_party/ascend/language/cann/extension/core.py",
+        "third_party/ascend/language/cann/extension/semantic.py",
+        "third_party/ascend/language/cann/extension/mem_ops.py"
+      ],
+      "deps": [
+        "ch02",
+        "ch04"
+      ],
+      "est_size": "L",
+      "mode": "code",
+      "kind": "deep",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch07"
+        ]
+      }
+    },
+    {
+      "chapter_id": "ch06",
+      "slug": "ch06-ascend-builtin-ops",
+      "title": "昇腾内建算子:索引搬运、向量算子与定制 cast",
+      "focus": "昇腾扩展的算子词汇表。mem_ops 四个显式 GM↔UB 索引搬运(gather_out_to_ub/scatter_ub_to_out/index_put/index_select_simd，GPU 上是隐式的)；vec_ops 的 slice/get_element/sort/flip；Ascend 定制 cast 的 overflow/saturate 语义。对位基座 ch07/ch08(访存与块级计算)+ ch05(cast)，但都是 NPU 显式内存模型下的落地。",
+      "part": "part-2",
+      "subsystem": "language-cann",
+      "key_source_paths": [
+        "third_party/ascend/language/cann/extension/mem_ops.py",
+        "third_party/ascend/language/cann/extension/vec_ops.py",
+        "third_party/ascend/language/kernels/gather.py"
+      ],
+      "deps": [
+        "ch05"
+      ],
+      "est_size": "M",
+      "mode": "code",
+      "kind": "deep",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch07",
+          "ch08",
+          "ch05"
+        ]
+      }
+    },
+    {
+      "chapter_id": "ch07",
+      "slug": "ch07-custom-op-and-libdevice",
+      "title": "自定义算子框架与 Ascend libdevice:register_custom_op 与数学库",
+      "focus": "基座 ch09 的 extern_elementwise 只能调预置符号；昇腾的 register_custom_op(带 CORE/PIPE/MODE/bitcode/indexing_map)能注册自定义算子。Ascend libdevice 的 __hmf_ 数学符号与 extern 分野。对位基座 ch09 自举标准库/数学/extern。",
+      "part": "part-2",
+      "subsystem": "language-cann",
+      "key_source_paths": [
+        "third_party/ascend/language/cann/extension/custom_op.py",
+        "third_party/ascend/language/cann/libdevice.py",
+        "third_party/ascend/language/cann/extension/math_ops.py"
+      ],
+      "deps": [
+        "ch04"
+      ],
+      "est_size": "M",
+      "mode": "code",
+      "kind": "deep",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch09"
+        ]
+      }
+    },
+    {
+      "chapter_id": "ch08",
+      "slug": "ch08-scope-sync-pipeline-hints",
+      "title": "作用域、核间同步与流水线提示:scope/sync_block/PIPE/compile_hint",
+      "focus": "把双核编程模型暴露到语言层。CORE.CUBE/VECTOR + 8 条 PIPE 队列(S/V/M/MTE1-3/FIX/ALL)；with al.scope(core_mode='cube'|'vector') 指定代码块跑哪种核；sync_block_set/wait 在 cube↔vector 间按 event_id 做事件同步；compile_hint 挂 mayDiscretememaccess/bitwise_mask/multibuffer 等给后端。这些在 GPU warp 模型下都不存在——是后端异构双核编排(P4)在语言层的入口。",
+      "part": "part-2",
+      "subsystem": "language-cann",
+      "key_source_paths": [
+        "third_party/ascend/language/cann/extension/scope.py",
+        "third_party/ascend/language/cann/extension/code_generator.py",
+        "third_party/ascend/language/cann/extension/core.py"
+      ],
+      "deps": [
+        "ch02",
+        "ch04"
+      ],
+      "est_size": "M",
+      "mode": "code",
+      "kind": "deep",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch04"
+        ]
+      }
+    },
+    {
+      "chapter_id": "ch09",
+      "slug": "ch09-mlir-linalg-primer",
+      "title": "MLIR 与 Linalg:结构化张量 codegen 的编译基础设施（原理篇）",
+      "focus": "读昇腾下降链前的编译基础设施先修。MLIR 的方言/region/op 模型与渐进式下降；Linalg 的 structured op + indexing_map(仿射索引映射)——为什么『结构化』能让编译器推理循环嵌套与访存。昇腾整条 ttadapter→HFusion→HIVM 都建在 MLIR/Linalg 生态上；这一节讲一次，下游 opt/hivm 章交叉引用不重设。",
+      "part": "part-3",
+      "subsystem": "mlir-linalg-primer",
+      "key_source_paths": [
+        "third_party/ascend/AscendNPU-IR/docs/source/en/introduction/architecture.md",
+        "third_party/ascend/include/TritonToLinalg/Passes.td"
+      ],
+      "deps": [
+        "ch01"
+      ],
+      "est_size": "L",
+      "mode": "meta",
+      "kind": "primer",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch02"
+        ]
+      },
+      "papers": [
+        {
+          "title": "MLIR: A Compiler Infrastructure for the End of Moore's Law",
+          "arxiv": "2002.11054",
+          "verify": "web-verified"
+        },
+        {
+          "title": "Composable and Modular Code Generation in MLIR (Linalg)",
+          "arxiv": "2202.03293",
+          "verify": "web-verified"
+        }
+      ]
+    },
+    {
+      "chapter_id": "ch10",
+      "slug": "ch10-watershed-triton-to-linalg",
+      "title": "分水岭:从指针张量到结构化张量——triton_adapter 总览",
+      "focus": "全书与基座最根本的 divergence。基座 TTIR→TTGIR 保留 tensor-of-pointers 的 SIMT 模型、只往张量叠 layout 编码；triton-ascend 的 ttadapter 在编译早期就抛弃指针模型——把指针算术逆向还原成 (offset,sizes,strides)、落成 memref + linalg 结构化算子。这套『raise pointer-arithmetic to structured』源自微软 triton-shared(PtrAnalysis 版权 Huawei+Microsoft，RFC 有据、无 arXiv)。本章给 pass 管线全景 + 一个 add_kernel 的 ttir→ttadapter 前后对照。管线里的 TritonToAnnotation(轻量注解 pass)也在此一并点出。",
+      "part": "part-3",
+      "subsystem": "triton-to-linalg",
+      "key_source_paths": [
+        "third_party/ascend/backend/compiler.py",
+        "third_party/ascend/lib/TritonToLinalg/TritonToLinalgPass.cpp",
+        "third_party/ascend/include/TritonToLinalg/Passes.td",
+        "third_party/ascend/lib/TritonToAnnotation/TritonToAnnotation.cpp"
+      ],
+      "deps": [
+        "ch09b"
+      ],
+      "est_size": "L",
+      "mode": "code",
+      "kind": "deep",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch32"
+        ]
+      },
+      "flagship": true
+    },
+    {
+      "chapter_id": "ch11",
+      "slug": "ch11-ptranalysis",
+      "title": "指针算术的逆向工程:PtrAnalysis 把 addptr 链还原成 stride/offset",
+      "focus": "分水岭的算法心脏(上半)。PtrAnalysis 沿 addptr/splat/broadcast/make_range 的定义链前向传播，把一条指针算术链解析成结构化的 (offset, sizes, strides) 描述——这是把非结构化指针恢复成可结构化访存的关键分析。对位无(基座 GPU 路径不做此还原)。",
+      "part": "part-3",
+      "subsystem": "triton-to-linalg",
+      "key_source_paths": [
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp",
+        "third_party/ascend/include/TritonToStructured/PtrAnalysis.h"
+      ],
+      "deps": [
+        "ch10"
+      ],
+      "est_size": "L",
+      "mode": "code",
+      "kind": "deep"
+    },
+    {
+      "chapter_id": "ch12",
+      "slug": "ch12-blockptr-to-memref",
+      "title": "落到 memref:BlockPtrAnalysis、reinterpret_cast 与 load/store→linalg",
+      "focus": "分水岭的算法心脏(下半)。BlockPtrAnalysis 把 PtrAnalysis 的结构化描述物化成 memref.reinterpret_cast，load/store 变成 linalg 结构化算子；MemAccType 把访存分成结构化/非结构化的决策点。对位基座 ch33-34(第二跳地基:类型塌缩/共享内存降级)——GPU 往 shared/vectorize 走，NPU 往 memref/reinterpret_cast 走。",
+      "part": "part-3",
+      "subsystem": "triton-to-linalg",
+      "key_source_paths": [
+        "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp",
+        "third_party/ascend/include/TritonToLinalg/BlockPtrAnalysis.h",
+        "third_party/ascend/lib/TritonToLinalg/TritonToLinalgPass.cpp"
+      ],
+      "deps": [
+        "ch11"
+      ],
+      "est_size": "L",
+      "mode": "code",
+      "kind": "deep",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch33",
+          "ch34"
+        ]
+      }
+    },
+    {
+      "chapter_id": "ch13",
+      "slug": "ch13-maskanalysis",
+      "title": "边界的语义:MaskAnalysis 把 mask 还原成 extract_slice",
+      "focus": "结构化访存的边界处理。Triton kernel 用 mask 处理不整除的边界；MaskAnalysis 把 mask 表达式还原成 extract_slice 的边界语义(而非 GPU 的逐元素 predication)——结构化世界里边界是切片而不是掩码。对位无(基座不做此还原)。",
+      "part": "part-3",
+      "subsystem": "triton-to-linalg",
+      "key_source_paths": [
+        "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp",
+        "third_party/ascend/include/TritonToLinalg/MaskAnalysis.h"
+      ],
+      "deps": [
+        "ch12"
+      ],
+      "est_size": "M",
+      "mode": "code",
+      "kind": "deep"
+    },
+    {
+      "chapter_id": "ch14",
+      "slug": "ch14-unstructure-fallback",
+      "title": "结构化装不下时:Unstructure 兜底路径与 gather/scatter 标量化",
+      "focus": "分水岭的性能悬崖。当指针算术还原不出结构化访存(离散 gather/scatter)，OffsetAnalysis 用一个四态格判定、落到 Unstructure 兜底:标量化成 scf.for 逐元素访存。读者要懂『什么写法会掉进兜底、代价多大』。对位无。",
+      "part": "part-3",
+      "subsystem": "triton-to-linalg",
+      "key_source_paths": [
+        "third_party/ascend/lib/TritonToUnstructure/OffsetAnalysis.cpp",
+        "third_party/ascend/include/TritonToUnstructure/OffsetAnalysis.h",
+        "third_party/ascend/include/TritonToUnstructure/UnstructureConversionPass.h"
+      ],
+      "deps": [
+        "ch12",
+        "ch13"
+      ],
+      "est_size": "M",
+      "mode": "code",
+      "kind": "deep"
+    },
+    {
+      "chapter_id": "ch15",
+      "slug": "ch15-autoblockify",
+      "title": "AutoBlockify:把多个网格实例折成一条 blockify 循环",
+      "focus": "网格粒度重塑(注意:这不是 UB 容量 tiling——那在下游闭源 bishengir)。AutoBlockify 把 autoBlockifySize 个逻辑 program 实例折成一个前导张量维度批处理(UnrealizedConversionCast 作载体逐 op 下推)，摊薄启动开销、提升向量化。对位基座 ch25(重塑访存/执行粒度)——GPU 是 warp 内合并，昇腾是网格实例合并。",
+      "part": "part-4",
+      "subsystem": "ascend-opt",
+      "key_source_paths": [
+        "third_party/ascend/lib/AutoBlockify/AutoBlockify.cpp",
+        "third_party/ascend/lib/AutoBlockify/RewriteOperation.cpp",
+        "third_party/ascend/lib/AutoBlockify/Utils.cpp"
+      ],
+      "deps": [
+        "ch10"
+      ],
+      "est_size": "M",
+      "mode": "code",
+      "kind": "deep",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch25"
+        ]
+      }
+    },
+    {
+      "chapter_id": "ch16",
+      "slug": "ch16-cube-or-vector-affinity",
+      "title": "Cube 还是 Vector:AI Core 异构双核与核亲和定点传播",
+      "focus": "昇腾编译的第一性问题——不是『张量怎么映到线程』(GPU layout)，而是『每个算子该放 cube 还是 vector 核』。DAG.cpp 用一个数据流定点传播(absorb/diffuse worklist)给每个 op 判核亲和:DotOp→cube-only、张量 elementwise→prefer-vector、沿 isUpstreamOfCubeMem 传染。**注意:这里的 affine=核亲和(core affinity)，不是多面体/仿射调度**；数据流不动点属 Kildall 1973 一路。对位基座 ch27/28(cube≈Tensor Core 物理载体，但 GPU 选 mma 指令、昇腾放 op 到核)。",
+      "part": "part-4",
+      "subsystem": "ascend-opt",
+      "key_source_paths": [
+        "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp",
+        "third_party/ascend/include/TritonAffinityOpt/DAG.h"
+      ],
+      "deps": [
+        "ch02",
+        "ch15"
+      ],
+      "est_size": "L",
+      "mode": "code",
+      "kind": "deep",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch27",
+          "ch28"
+        ]
+      }
+    },
+    {
+      "chapter_id": "ch17",
+      "slug": "ch17-scope-split-cross-core-sync",
+      "title": "把双核落到 IR:Scope 切分与 cube↔vector 同步搬运",
+      "focus": "核亲和结果的物化。DAGScope 把每个 op 的核亲和物化成两个 scope(AIC/AIV)；DAGSync 在跨核数据流上插共享缓冲搬运 + set/wait 事件同步。对位基座 ch31(warp specialization)——cube/vector 分域 + producer/consumer 同步 ≈ 角色专门化，但昇腾跨的是物理核、用 scope + 事件而非 warp + mbarrier。",
+      "part": "part-4",
+      "subsystem": "ascend-opt",
+      "key_source_paths": [
+        "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp",
+        "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp",
+        "third_party/ascend/include/TritonAffinityOpt/DAG.h"
+      ],
+      "deps": [
+        "ch16"
+      ],
+      "est_size": "L",
+      "mode": "code",
+      "kind": "deep",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch31"
+        ]
+      }
+    },
+    {
+      "chapter_id": "ch18",
+      "slug": "ch18-dagssbuffer-pipelining",
+      "title": "DAGSSBuffer:UB 多缓冲与昇腾的软件流水线",
+      "focus": "昇腾版软流水。DAGSSBuffer 对循环做 UB double-buffer(显式 N 份 buffer + scf.for 迭代参数轮转)，重叠 load 与 compute。对位基座 ch29-30(软件流水线)——同是重叠 load/compute，但昇腾用 UB 里显式多份 buffer 而非 GPU 的 cp.async 队列 + num_stages。",
+      "part": "part-4",
+      "subsystem": "ascend-opt",
+      "key_source_paths": [
+        "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp",
+        "third_party/ascend/include/TritonAffinityOpt/DAG.h"
+      ],
+      "deps": [
+        "ch17"
+      ],
+      "est_size": "L",
+      "mode": "code",
+      "kind": "deep",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch29",
+          "ch30"
+        ]
+      }
+    },
+    {
+      "chapter_id": "ch19",
+      "slug": "ch19-discrete-mask-access",
+      "title": "不规则访存的驯服:离散掩码拆分与交错访存优化",
+      "focus": "访存规则性决定 DMA 效率。DiscreteMaskAccessConversion 用 MaskState 判连续 vs 离散，决定走 DMA 块搬运还是逐元素；InterleaveOptimization 优化交错访存。对位基座 ch25(AxisInfo 判连续性决定向量化)——同一命题:访存越规则越快。",
+      "part": "part-4",
+      "subsystem": "ascend-opt",
+      "key_source_paths": [
+        "third_party/ascend/lib/DiscreteMaskAccessConversion/DiscreteMaskAccessConversionPass.cpp",
+        "third_party/ascend/include/DiscreteMaskAccessConversion/Passes.td",
+        "third_party/ascend/lib/Utils/InterleaveOptimization.cpp"
+      ],
+      "deps": [
+        "ch13"
+      ],
+      "est_size": "M",
+      "mode": "code",
+      "kind": "deep",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch25"
+        ]
+      }
+    },
+    {
+      "chapter_id": "ch20",
+      "slug": "ch20-tritonascend-dialect-escape-hatches",
+      "title": "TritonAscend 方言与三条逃生舱:Triton 表达不了的 NPU 语义如何注入",
+      "focus": "Linalg 主链吞不下的 NPU 专属 op 走窄逃生舱。TritonAscend 方言承载显式 GM/UB 搬运与双核同步语义；三条 fork 侧逃生舱(TritonToHFusion/HIVM/LLVM，各只挂 2-3 pattern)治主链装不下的 op。对位基座 ch24(ttng.* 硬件方言 op)+ ch19(方言黏合层)。",
+      "part": "part-5",
+      "subsystem": "hivm-hfusion",
+      "key_source_paths": [
+        "third_party/ascend/include/Dialect/TritonAscend/IR/TritonAscendOps.td",
+        "third_party/ascend/lib/TritonToHFusion/TritonToHFusion.cpp",
+        "third_party/ascend/lib/TritonToHIVM/TritonToHIVM.cpp"
+      ],
+      "deps": [
+        "ch10"
+      ],
+      "est_size": "M",
+      "mode": "code",
+      "kind": "deep",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch24",
+          "ch19"
+        ]
+      }
+    },
+    {
+      "chapter_id": "ch21",
+      "slug": "ch21-hfusion-dialect",
+      "title": "HFusion 方言:Linalg 之上的张量级融合 IR 与算子上抬",
+      "focus": "NPU 侧的中层张量 IR。HFusion 是 Linalg 超集的 destination-style 结构化融合 IR:函数化 elementwise 词汇表(UnaryFn/BinaryFn 枚举)+ named 结构化 op + 专属 op(gather/sort/matmul_mx/atomic)，带 FusionKind 融合意图。LinalgToHFusion 把 Linalg 上抬进来。对位基座 ch19(tt.* 词汇表)——但 HFusion 建在 Linalg 之上、带融合意图，不是纯词汇表。",
+      "part": "part-5",
+      "subsystem": "hivm-hfusion",
+      "key_source_paths": [
+        "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HFusion/IR/HFusionOps.td",
+        "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HFusion/IR/HFusionStructuredOps.td",
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/LinalgToHFusion/LinalgToHFusion.cpp"
+      ],
+      "deps": [
+        "ch10"
+      ],
+      "est_size": "L",
+      "mode": "code",
+      "kind": "deep",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch19"
+        ]
+      }
+    },
+    {
+      "chapter_id": "ch22",
+      "slug": "ch22-fusionkind-autoschedule",
+      "title": "算子融合与自动调度:FusionKind 分类与 Cube/Vector 分工的 tile 策略",
+      "focus": "NPU 侧的调度决策。OpFusion(FusibleBlockAnalyzer/Outliner)按 FusionKind 决定把哪些算子融成一个核；AutoSchedule(AutoScheduleBase/ShallowCVSchedule/SingleCube...)把融合核切 tile 并显式分派到 Cube/Vector 双核 pipe。对位基座 ch29-31(软件流水/模调度/warp specialization)——GPU 用 num_stages 交硬件调度，NPU 用 FusionKind→调度器显式切 tile 分核。",
+      "part": "part-5",
+      "subsystem": "hivm-hfusion",
+      "key_source_paths": [
+        "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HFusion/IR/HFusionEnums.td",
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleBlockAnalyzer.cpp",
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/AutoScheduleBase.cpp"
+      ],
+      "deps": [
+        "ch21"
+      ],
+      "est_size": "L",
+      "mode": "code",
+      "kind": "deep",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch29",
+          "ch30",
+          "ch31"
+        ]
+      }
+    },
+    {
+      "chapter_id": "ch23",
+      "slug": "ch23-hivm-dialect",
+      "title": "HIVM 方言:达芬奇硬件 IR——显式内存层级、流水线与 Cube/Vector 双核",
+      "focus": "NPU 的硬件方言(op 带 hir. 前缀)，是基座 TTGIR+PTX 的对位物但抽象几乎零重叠。把片上存储金字塔(GM/L1/L0A/L0B/L0C/UB)、8 条流水线(S/V/M/MTE1-5/FIX)、Cube/Vector 双核、矩阵分形布局(nZ/zN)全部暴露成 IR op。对位基座 ch19-24(TTGIR 布局)+ ch27(MMA 布局)——GPU 摆 warp/lane 上的 layout，NPU 摆搬进哪级 buffer、走哪条 pipe、哪种核、矩阵靠 nZ/zN 分形。",
+      "part": "part-5",
+      "subsystem": "hivm-hfusion",
+      "key_source_paths": [
+        "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMVectorOps.td",
+        "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMDMAOps.td",
+        "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMAttrs.td"
+      ],
+      "deps": [
+        "ch02",
+        "ch21"
+      ],
+      "est_size": "L",
+      "mode": "code",
+      "kind": "deep",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch19",
+          "ch23",
+          "ch27"
+        ]
+      },
+      "flagship": true
+    },
+    {
+      "chapter_id": "ch24",
+      "slug": "ch24-hivm-explicit-sync",
+      "title": "HIVM 显式同步:set_flag/wait_flag 流水线同步与 Cube↔Vector 核间同步",
+      "focus": "『显式 vs 隐式并行』最锋利的对照。GPU 的流水线/屏障由 pass 建模交硬件调度；NPU 把 pipe 间事件同步(set_flag/wait_flag)与核间 barrier(sync_block)直接写成指令。对位基座 ch26(共享内存屏障 Membar)+ ch29-31(软件流水/warp specialization)。",
+      "part": "part-5",
+      "subsystem": "hivm-hfusion",
+      "key_source_paths": [
+        "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMSynchronizationOps.td",
+        "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMAttrs.td",
+        "third_party/ascend/lib/TritonToHIVM/TritonToHIVM.cpp"
+      ],
+      "deps": [
+        "ch23"
+      ],
+      "est_size": "M",
+      "mode": "code",
+      "kind": "deep",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch26",
+          "ch31"
+        ]
+      }
+    },
+    {
+      "chapter_id": "ch25",
+      "slug": "ch25-lowering-to-ascendc",
+      "title": "下降链收官:HFusion→HIVM→Standard——从融合张量 op 到 AscendC 库调用",
+      "focus": "全书下降链的终点 payoff。ConvertToHIVMPipeline 主链(HFusionToHIVM→[TritonGlobalKernelArgs]→TensorToHIVM→ConvertToHIVMOp)把融合张量 op 一路降到 func.call @库函数，打进 lib/Template 的 AscendC(__aiv__/__ubuf__)内联实现——读者亲眼看最终硬件码(比基座 ptxas 边界更深)。终点不是 PTX 汇编而是 AscendC 库调用，再由闭源 CCE 出二进制。对位基座 part-7 ch32-35(TTGIR→LLVM→PTX 五级台阶)。",
+      "part": "part-5",
+      "subsystem": "hivm-hfusion",
+      "key_source_paths": [
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HIVM/Pipelines/ConvertToHIVMPipeline.cpp",
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HFusionToHIVM/HFusionToHIVM.cpp",
+        "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Conversion/Passes.td"
+      ],
+      "deps": [
+        "ch23",
+        "ch24"
+      ],
+      "est_size": "L",
+      "mode": "code",
+      "kind": "deep",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch32",
+          "ch33",
+          "ch34",
+          "ch35"
+        ]
+      },
+      "flagship": true
+    },
+    {
+      "chapter_id": "ch26",
+      "slug": "ch26-ascend-backend-contract",
+      "title": "昇腾后端如何挂进 Triton:AscendBackend 契约、NPUOptions 与 hacc.target 注入",
+      "focus": "把前面各层收进后端框架。AscendBackend 实现 BaseBackend 六钩子、NPUOptions(~80 字段)、_apply_ascend_patch 注入 #hacc.target 猴补、_discover_backends 发现机制、is_active 探 bishengir。对位基座 ch14(编译驱动与后端契约)——同一 BaseBackend 抽象的昇腾填法。",
+      "part": "part-6",
+      "subsystem": "backend-runtime",
+      "key_source_paths": [
+        "third_party/ascend/backend/compiler.py",
+        "third_party/ascend/backend/driver.py",
+        "third_party/ascend/backend/__init__.py"
+      ],
+      "deps": [
+        "ch01"
+      ],
+      "est_size": "M",
+      "mode": "code",
+      "kind": "deep",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch14"
+        ]
+      }
+    },
+    {
+      "chapter_id": "ch27",
+      "slug": "ch27-add-stages-orchestration",
+      "title": "三段下降链:add_stages 与 Triton-MLIR→Linalg 的编排",
+      "focus": "站在后端 POV 把三段串起来(你已看过每段内部)。add_stages 定义 ttir(与基座共享 make_ttir)→ttadapter(ttir_to_linalg 编排 ascend.passes.ttir.add_* 调用)→npubin；force_simt_only 快路径。对位基座 ch36(CUDABackend add_stages)——五段 vs 三段。",
+      "part": "part-6",
+      "subsystem": "backend-runtime",
+      "key_source_paths": [
+        "third_party/ascend/backend/compiler.py"
+      ],
+      "deps": [
+        "ch10",
+        "ch26b"
+      ],
+      "est_size": "M",
+      "mode": "code",
+      "kind": "deep",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch36"
+        ]
+      }
+    },
+    {
+      "chapter_id": "ch28",
+      "slug": "ch28-bishengir-boundary",
+      "title": "闭源边界 bishengir-compile:编译选项、子进程调用与元数据回收",
+      "focus": "昇腾侧的 ptxas 对位闭源边界。linalg_to_bin 从 Linalg IR 文本正则抠元数据(mix_mode/parallel_mode/tensor_kinds)，构造几十个 --enable-* 开关，subprocess 调 bishengir-compile；UB-bits/dlopen 回调双通道回收产物。边界精确在 compiler.py 的 subprocess 调用点。对位基座 ch37(ptxas→cubin)。",
+      "part": "part-6",
+      "subsystem": "backend-runtime",
+      "key_source_paths": [
+        "third_party/ascend/backend/compiler.py",
+        "third_party/ascend/backend/utils.py"
+      ],
+      "deps": [
+        "ch27b"
+      ],
+      "est_size": "M",
+      "mode": "code",
+      "kind": "deep",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch37"
+        ]
+      }
+    },
+    {
+      "chapter_id": "ch29",
+      "slug": "ch29-npu-driver-load",
+      "title": "NPU 运行时驱动与二进制装载:NPUDriver、NPUUtils 与 npu_utils.cpp",
+      "focus": "把 NPU 二进制装上设备。NPUDriver/NPUUtils + npu_utils.cpp 的 registerKernel(rtDevBinaryRegister/rtFunctionRegister，aiv/aic magic)。对位基座 ch37(二进制装载与 launcher)——CANN rtDevBinaryRegister vs CUDA cubin 装载。",
+      "part": "part-6",
+      "subsystem": "backend-runtime",
+      "key_source_paths": [
+        "third_party/ascend/backend/driver.py",
+        "third_party/ascend/backend/npu_utils.cpp"
+      ],
+      "deps": [
+        "ch28b"
+      ],
+      "est_size": "M",
+      "mode": "code",
+      "kind": "deep",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch37"
+        ]
+      }
+    },
+    {
+      "chapter_id": "ch30",
+      "slug": "ch30-dynamic-launcher",
+      "title": "动态生成的发射器:generate_npu_wrapper_src、rtKernelLaunch 与 taskqueue/msprof",
+      "focus": "昇腾的发射器比基座厚得多。generate_npu_wrapper_src(~560 行 C++ 模板)动态生成 wrapper + rtKernelLaunch；workspace/syncBlockLock 每次发射现分配；msprof 剖析；taskqueue 异步派发。对位基座 ch37(launcher)——但昇腾多了 workspace 现分配 + 异步 taskqueue。",
+      "part": "part-6",
+      "subsystem": "backend-runtime",
+      "key_source_paths": [
+        "third_party/ascend/backend/driver.py"
+      ],
+      "deps": [
+        "ch29b"
+      ],
+      "est_size": "M",
+      "mode": "code",
+      "kind": "deep",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch37"
+        ]
+      }
+    },
+    {
+      "chapter_id": "ch31",
+      "slug": "ch31-two-frameworks",
+      "title": "一套后端，两个框架:torch_npu / mindspore 策略注册表",
+      "focus": "GPU 侧完全没有的一层。get_backend_func 按 torch_npu/mindspore 选路的策略注册表——同一昇腾后端服务两个框架。对位无(基座无此抽象)。",
+      "part": "part-6",
+      "subsystem": "backend-runtime",
+      "key_source_paths": [
+        "third_party/ascend/backend/backend_register.py",
+        "third_party/ascend/backend/utils.py"
+      ],
+      "deps": [
+        "ch26b"
+      ],
+      "est_size": "S",
+      "mode": "code",
+      "kind": "deep"
+    },
+    {
+      "chapter_id": "ch32",
+      "slug": "ch32-capstone-flash-attention",
+      "title": "实战收官:flash-attention 融合注意力在昇腾的 CV 融合落地",
+      "focus": "全书收官 capstone。拿 tutorials/06 fused-attention 当活体标本，把前面每一层(语言层显式搬运→ttadapter 结构化→核亲和双核→HFusion 融合→HIVM 下降→AscendC 库调用)在一个真核上串一遍，看它如何落成达芬奇 cube/vector 的 CV 融合。对位基座 ch43(fused-attention 从 tl.* 到 PTX)——终点是 AscendC 而非 PTX。",
+      "part": "part-7",
+      "subsystem": "tutorials",
+      "key_source_paths": [
+        "third_party/ascend/tutorials/06-fused-attention.py",
+        "third_party/ascend/tutorials/09-persistent-matmul.py",
+        "third_party/ascend/AscendNPU-IR/docs/source/en/user_guide/best_practice.md"
+      ],
+      "deps": [
+        "ch25",
+        "ch08"
+      ],
+      "est_size": "L",
+      "mode": "meta",
+      "kind": "skip_impl",
+      "pairs_with": {
+        "vllm_chapters": [
+          "ch43"
+        ]
+      },
+      "flagship": true
+    },
+    {
+      "chapter_id": "ch33",
+      "slug": "ch33-capability-boundary",
+      "title": "昇腾 Triton 的能力边界:测试套件揭示的支持/未支持谱系",
+      "focus": "诚实边界章。unittest 323 .py 揭示能力谱系:支持面广(math/reduce/scan/dot/matmul/attention/atomic/block_ptr + 昇腾扩展 compile_hint/sync_block/multibuffer/npu_indexing/fixpipe/paged_kvcache)；38 skip/xfail = 诚实未支持(waiting bishengir/TA、NPUIR 四月更新回退、UB overflow、attn_cp 整批跳)。对位基座 part-9(度量与实战)。",
+      "part": "part-7",
+      "subsystem": "tutorials",
+      "key_source_paths": [
+        "third_party/ascend/unittest/pytest_ut",
+        "third_party/ascend/unittest/autotune_ut",
+        "third_party/ascend/unittest/custom_op"
+      ],
+      "deps": [
+        "ch03"
+      ],
+      "est_size": "M",
+      "mode": "meta",
+      "kind": "skip_impl"
+    }
+  ]
+}

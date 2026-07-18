@@ -1,0 +1,114 @@
+{
+  "subsystem": "ascend-opt-passes",
+  "one_line_spine": "把一段硬件无关的 Triton 张量程序,重塑成能喂饱昇腾 AI Core 异构双单元(cube 矩阵核 + vector 向量核)的 IR:AutoBlockify 把网格里多个 program 折进一条 blockify 循环增加单核工作量;TritonAffinityOpt 用一个 DAG 定点传播(absorb/diffuse)给每个 op 判定该跑在 cube 还是 vector,再拆成两个 scope、在跨核数据流上插同步与搬运、并对循环做多缓冲软流水;DiscreteMask/Interleave 则把不规则的掩码/交错访存改写成 NPU 能高效执行的形态。",
+
+  "npu_tiling_model_one_line": "关键澄清:本子系统的核心不是『UB 容量自动 tiling』(那发生在下游闭源的 bishengir/HIVM),而是**异构双核的算子放置(cube vs vector)+ 跨核同步/搬运 + 多缓冲软流水**。昇腾 AI Core 把矩阵乘交给 cube(脉动阵列),把 elementwise/reduce 交给 vector,两者是物理上分离、各有流水线的核,数据经共享缓冲(UB/GM)往返并需显式 set/wait 事件同步——这正是这几个 pass 要在 IR 里显式建模的东西。AutoBlockify 则是正交的另一件事:网格粒度的『持久化/合并』——把 autoBlockifySize 个逻辑 program 实例折成一个新的前导张量维度批处理,摊薄启动与提升向量化。",
+
+  "divergence_from_base": "基座 part-6(ch25-31)是给『同构 SIMT GPU』做 IR 优化:Coalesce 让 warp 内线程合并访存、AccelerateMatmul 选 mma/wgmma 命中 Tensor Core、Pipeliner 用 num_stages 做 cp.async 多级流水、WarpSpecialization 把 producer/consumer 分到不同 warp。昇腾侧机制**完全不同但目标同构对位**:①GPU 的『线程/warp 是同构的、靠布局(layout)把张量映到线程』——昇腾没有 layout 这套,而是『cube 核 vs vector 核是异构的两种物理单元』,优化的第一命题从『怎么映到线程』变成『每个 op 该放哪种核』(TritonAffinityOpt 的 DAG absorb ≈ 一次核放置/算子分裂)。②GPU 的 Tensor Core 是 warp 内的一条指令(mma),昇腾的 cube 是**独立的核**,cube 与 vector 之间必须显式同步+经共享内存搬运(DAGSync ≈ warp specialization 的 producer/consumer + barrier,但跨的是物理核而非 warp)。③GPU 软流水靠 async_copy token + num_stages,昇腾软流水靠 DAGSSBuffer 给 scf.for 增加 double/multi-buffer 迭代参数做 ping-pong(同样是『重叠搬运与计算』,但缓冲是 UB 里显式的 N 份 buffer,不是硬件 cp.async 队列)。④DiscreteMask ≈ AxisInfo/Coalesce 的对位:GPU 靠 AxisInfo 判连续性决定能否向量化;昇腾靠 MaskState 把掩码拆成『连续矩形(可界定 GM 块搬运)』与『离散(需逐元素 select/gather)』两部分。**命名陷阱**:pass 目录叫 TritonAffinityOpt、DAGScope 摘要写『NPU-affine code』,这里 affine=核亲和(op 亲和于哪种核),**不是多面体/仿射调度(polyhedral affine)**,writer 切勿误引 polyhedral 论文。",
+
+  "chapters_proposed": [
+    {
+      "proposed_title": "AutoBlockify:把多个网格实例折成一条 blockify 循环",
+      "focus": "auto-blockify pass(V2):当 TRITON_ALL_BLOCKS_PARALLEL 开启、autoBlockifySize>1 时,把 3D 网格(program_id x/y/z)先展平成一维 logicalBlockId/logicalBlockNum,再造出 [logicalBlockId, logicalBlockId+size) 的一段连续块号张量(带上下界 mask),用一个 UnrealizedConversionCastOp 作『载体』,把这个新的前导维度经 PropagateUnrealizedCastDown 逐 op 下推(splat/expand_dims/reduce/scan/load/store/atomic/extract_slice/loop/if/while 各有 rewrite,axis 统一 +1),从而把 size 个逻辑 program 实例批处理进一条循环/一个批维度——摊薄核启动开销、提升单核工作量与向量化。checkBlockifiable 先做可行性剪枝(遇 DotOp/tensor-ptr/cf.cond_br 等直接放弃)。",
+      "key_source_paths": [
+        "third_party/ascend/lib/AutoBlockify/AutoBlockify.cpp",
+        "third_party/ascend/lib/AutoBlockify/RewriteOperation.cpp",
+        "third_party/ascend/lib/AutoBlockify/Utils.cpp",
+        "third_party/ascend/include/AutoBlockify/AutoBlockify.h",
+        "third_party/ascend/include/AutoBlockify/Passes.td"
+      ],
+      "pairs_with": "ch25-axisinfo-and-coalesce(都在重塑访存/执行粒度以提效,但一个是 warp 内合并、一个是网格实例合并);概念上也呼应 GPU 的 persistent kernel / grid coalescing",
+      "kind": "deep",
+      "teaching_value": "读者能懂『为什么昇腾要把多个 program 合起来跑』这个 GPU 上不常见的旋钮;而且这个 pass 是极干净的 MLIR『UnrealizedConversionCast 作载体 + greedy pattern 下推 + 收尾具体化』教学样本,checkBlockifiable 的 DAG 可行性遍历也很典型。",
+      "difficulty": "medium"
+    },
+    {
+      "proposed_title": "Cube 还是 Vector:AI Core 异构双核与 DAG 核亲和定点传播",
+      "focus": "TritonAffinityOpt 的 DAG 核心(DAG.h/DAG.cpp):先建立心智模型——昇腾 AI Core 有两类物理计算单元,cube(脉动阵列,专做矩阵乘)与 vector(向量核,做 elementwise/reduce),外加分层缓冲(UB 等)。pass 把函数建成一张 op/value 双节点图,每个 OpNode::canRunOn 给出能力(DotOp→CUBE_ONLY、大多张量 elementwise→PREFER_VECTOR、scf/constant→CUBE_AND_VECTOR、select 视 cond 是否向量);随后 absorbCommon 沿数据流做定点『吸收』(考虑内存读写副作用、isUpstreamOfCubeMem 传染),用 worklist『diffuse』迭代到收敛,未定者兜底 VECTOR_ONLY 再 diffuse 一轮——最终给每个 op/value 定下 CoreType。这是整条 NPU 优化链的第一性问题:算子放置。",
+      "key_source_paths": [
+        "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp",
+        "third_party/ascend/include/TritonAffinityOpt/DAG.h"
+      ],
+      "pairs_with": "ch27-tensor-core-mma-layout / ch28-accelerate-matmul-layout-opt(cube≈Tensor Core 的物理载体;但 GPU 是选 mma 指令,昇腾是把 op 放到 cube 核);核放置的定点传播也远呼应 ch31 warp specialization 的角色划分",
+      "kind": "deep",
+      "teaching_value": "这是理解『昇腾为什么这么编译』的总钥匙——GPU 读者第一次遇到『计算单元本身是异构的、编译器要决定算子放哪种核』。absorb/diffuse 是一个漂亮的 IR 数据流定点算法(worklist + 单调传播),needs_worked_example:拿一小段 load→mul→dot→store 手推每个节点吸收成 VECTOR/CUBE 的过程。",
+      "difficulty": "hard"
+    },
+    {
+      "proposed_title": "把双核落到 IR:Scope 切分与 cube↔vector 同步搬运",
+      "focus": "DAGScope(dag-scope)+ DAGSync(dag-sync)如何把上一章算出的核归属**物化**到 IR。DAGScope:encapsulateWithScope 造出一对 scope::ScopeOp(AIV=vector 域 / AIC=cube 域,各带 hivm::TCoreType 属性),SplitScope 按每个 op 的 CoreType 把它搬进对应 scope;并把 memref.alloc 上提到函数入口、补 buffer-wait 同步(addSyncOpsForBufferWait)。DAGSync:遍历数据流,needVectorCubeSync 判定何处一个值从 cube 流向 vector(或反向),用 insertCubeToVectorDataMovement / insertVectorToCubeDataMovement 经共享缓冲(getOrCreateAllocation)搬运,并插 set/wait 事件对做跨核同步(含跨 block 的 insertSyncAndMovementForCrossBlock);LegalizeDot 归一化 dot。",
+      "key_source_paths": [
+        "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp",
+        "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp"
+      ],
+      "pairs_with": "ch31-prefetch-warp-specialization(cube/vector 分域 + producer/consumer 同步 ≈ warp specialization 的角色专门化与 token/barrier,但昇腾跨的是物理核、用 scope + set/wait 事件而非 warp + mbarrier)",
+      "kind": "deep",
+      "teaching_value": "读者看到『核放置』如何变成真实 IR 结构(两个 scope + 显式同步),理解昇腾程序为何长成『AIC/AIV 两段 + 中间一堆 set/wait 搬运』;这是 GPU 上没有对应物、最能体现异构编译的一章。DAGSync 的『在正确位置插同步+搬运』是典型的调度/依赖分析。",
+      "difficulty": "hard"
+    },
+    {
+      "proposed_title": "DAGSSBuffer:UB 多缓冲与昇腾的软件流水线",
+      "focus": "dag-ssbuf pass:把 vector 运算转成基于共享存储缓冲(shared storage buffer)的形态,并对循环做 **double/multi-buffer**(ping-pong)以重叠数据搬运与计算——昇腾版的软件流水。核心机制:识别 vector scope 内的 forOp,对被 scf.if 产出、被后续消费的依赖 value,给 forOp 增加 (2+bufferNum-1) 组多缓冲迭代参数,把『前一个 ifOp 产出的 buffer』与『for iter_arg 里轮转的 buffer』组织成 N 份轮换(bufferNum==2 时退化为一个 select,免生成 scf.if);wait-set region 的贪心吸收(把相邻 op 吸进同一个搬运/等待区)决定流水的粒度。文件巨大(5.5k 行),教学取 double-buffer 特化路径与迭代参数扩展这条主干,其余按 subtraction 大幅裁剪。",
+      "key_source_paths": [
+        "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp",
+        "third_party/ascend/include/TritonAffinityOpt/DAG.h"
+      ],
+      "pairs_with": "ch29-software-pipelining-primer / ch30-pipeline-lowering(同样是『重叠 load 与 compute』的软流水,但昇腾用 UB 里显式 N 份 buffer + scf.for 迭代参数轮转,而非 GPU 的 cp.async 队列 + num_stages)",
+      "kind": "deep",
+      "teaching_value": "读者把 GPU 的 num_stages 软流水心智模型迁移到昇腾:同样是流水,但缓冲是显式的、在 IR 层用迭代参数轮换。double-buffer(N=2)特化是最好的 worked example。也是全书体量最大的单 pass,示范『如何对一个庞大 pass 只讲主干』。",
+      "difficulty": "hard"
+    },
+    {
+      "proposed_title": "不规则访存的驯服:离散掩码拆分与交错访存优化",
+      "focus": "两个访存形态改写 pass。DiscreteMaskAccessConversion(discrete-mask-access-conversion):当一个掩码不能被 MaskState::parse 分析成连续矩形(isDiscreteMask),就把它当离散掩码处理——decomposeAndMask 沿 AND 树(并把 broadcast 分配进 andi)把叶子拆成『连续 contMask(用来界定 GM 块访问范围)』与『离散 discMask(仍驱动逐元素 select)』;对 load/store/atomic 三类分别改写(atomic 按 RMWOp 选中性初值 fill 再 select)。选项:compile-on-910-95 / force-simt-template / enable-sync-block-lock。InterleaveOptimization(Utils):对 stride-2 的偶/奇(EVEN/ODD_MODE)交错访存,做 deinterleave/interleave 优化(recountReinterpretCastOffset / DeinterleaveStatusOptimization),把交错 load/store 变成 NPU 能高效执行的连续块 + 重排。",
+      "key_source_paths": [
+        "third_party/ascend/lib/DiscreteMaskAccessConversion/DiscreteMaskAccessConversionPass.cpp",
+        "third_party/ascend/include/DiscreteMaskAccessConversion/Passes.td",
+        "third_party/ascend/lib/Utils/InterleaveOptimization.cpp",
+        "third_party/ascend/include/Utils/InterleaveOptimization.h"
+      ],
+      "pairs_with": "ch25-axisinfo-and-coalesce(GPU 靠 AxisInfo 判连续性决定向量化;昇腾靠 MaskState 判连续 vs 离散决定 DMA 块搬运 vs 逐元素——同一命题:访存越规则越快)",
+      "kind": "deep",
+      "teaching_value": "把抽象的『连续 vs 离散访存』落到具体改写:读者理解为什么写 kernel 时掩码/访存模式直接决定能不能走块 DMA。掩码 AND 树的连续/离散分解是很实在的编译分析,交错访存优化也贴近实际(复数/多通道数据)。",
+      "difficulty": "medium"
+    }
+  ],
+
+  "paper_gap_candidates": [
+    {
+      "concept": "昇腾 AI Core / DaVinci 架构:cube(脉动阵列矩阵单元) + vector(向量单元) + 分层缓冲(L1/L0/UB)的异构结构",
+      "why_prereq": "整个 TritonAffinityOpt(核亲和 DAG、scope 切分、跨核同步、多缓冲)都建立在『AI Core 是异构双核 + 显式管理的片上缓冲』这一硬件前提上。读者(GPU 背景)不先建立这张硬件图,后面每个 pass 都悬空。这是本子系统最该前置的 primer。",
+      "has_paper_root": true,
+      "note": "有论文根基:Huawei DaVinci 架构(Liao et al., 'DaVinci: A Scalable Architecture for Neural Network Computing', Hot Chips 2019)。建议做一章硬件 primer(或并入『Cube 还是 Vector』章开篇),讲清 cube/vector 分工 + 内存层级(UB=Unified Buffer 等)。代码侧锚点:DAG.h 的 CoreType/OpAbility 枚举与 toHivm 映射。需 Lead/WebFetch 落论文包确认可得性。",
+      "target_section": "『Cube 还是 Vector』章开篇,或独立硬件 primer 章"
+    },
+    {
+      "concept": "脉动阵列(systolic array)矩阵乘 —— cube 核的原理",
+      "why_prereq": "解释『为什么 DotOp 只能跑 cube 核、且是独立单元』需要读者知道 cube 是脉动阵列(如 TPU)。这是理解 CUBE_ONLY 语义与 cube/vector 数据往返代价的物理基础。",
+      "has_paper_root": true,
+      "note": "经典论文根基:Kung 1982(systolic arrays)、Jouppi et al. 2017(TPU, ISCA)。基座书 ch27 讲 Tensor Core/MMA 已建立部分直觉,可交叉引用,昇腾侧只需点出『cube 是物理独立核而非 warp 内指令』的差异,不必重造 primer。",
+      "target_section": "与基座 ch27 交叉引用,昇腾『Cube 还是 Vector』章内简述"
+    },
+    {
+      "concept": "软件流水线 / 多缓冲(double buffering, ping-pong)",
+      "why_prereq": "DAGSSBuffer 的多缓冲迭代参数轮转是经典软件流水的 IR 落地;读者需要『重叠搬运与计算』的一般概念。",
+      "has_paper_root": true,
+      "note": "有经典根基(Lam 1988, software pipelining / modulo scheduling)。但基座 ch29 software-pipelining-primer 已系统讲过软流水,昇腾侧属于**复用而非新建 primer**——只需讲清昇腾实现差异(显式 UB N-buffer + scf.for iter_arg 轮转 vs GPU cp.async+num_stages)。gap 属性弱。",
+      "target_section": "DAGSSBuffer 章开篇,回指基座 ch29"
+    },
+    {
+      "concept": "异构核上的算子放置 / 数据流单调定点传播(absorb/diffuse worklist)",
+      "why_prereq": "DAG 的核亲和传播是本子系统的算法高潮,读者需要理解『在数据流图上做单调格传播直到不动点』这类分析(与 AxisInfo、Membar 同属数据流分析家族)。",
+      "has_paper_root": false,
+      "note": "无单一对应论文——这是一套工程化的数据流不动点算法(CoreType 构成一个小格 UNDETERMINED⊑{CUBE,VECTOR}⊑CUBE_AND_VECTOR,absorb 单调上升,worklist 迭代收敛)。可用经典 monotone dataflow framework(Kildall 1973)作理论背书性提法,但不必当独立论文 primer,讲清格与单调传播即可。**提醒:切勿因目录名 TritonAffinityOpt/『NPU-affine』误引 polyhedral/affine scheduling 论文——此 affine 指核亲和,非仿射调度。**",
+      "target_section": "『Cube 还是 Vector』章的算法讲解处"
+    }
+  ],
+
+  "open_questions": [
+    "UB/L1/L0 等具体缓冲层级与容量约束在这几个 pass 里只体现为『shared storage buffer』与 memref.alloc,真正的容量感知 tiling 发生在下游 bishengir/HIVM(AscendNPU-IR/,部分在 third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HIVM/Transforms/AutoBlockifyParallelLoop.cpp)。若书要覆盖『UB 容量如何决定 tile 大小』,需另派人测绘 bishengir/HIVM 子系统——本 digest 范围内的 pass 只做核放置/同步/多缓冲,不做容量 tiling。请 Lead 确认这块是否纳入大纲、归哪个子系统。",
+    "五章是否偏多?可压缩方案:DAGScope+DAGSync 已合为一章;若要更紧,DiscreteMask+Interleave 章可降级为 supporting/skip_impl。但 TritonAffinityOpt 三章(DAG 算法 / scope+sync / DAGSSBuffer)建议保留 deep——这是全书对位基座 part-6 的核心分量、也是昇腾最大的 divergence。请 Lead 定章数。",
+    "DAGSSBuffer 5534 行,单章 subtraction 压力大;是否值得再拆(缓冲化 vs 多缓冲软流水两章)?倾向不拆——多缓冲是主线,缓冲化是铺垫,一章内主次分明即可,但提请 Lead 权衡。",
+    "是否需要一章独立的『昇腾 AI Core 硬件 primer』(kind=primer,DaVinci 架构 + cube/vector + 内存层级),还是把硬件背景并入『Cube 还是 Vector』章开篇?独立成章更清晰、也给 illustrator 一张架构图的落点,但会多一章。请 Lead 定。"
+  ]
+}

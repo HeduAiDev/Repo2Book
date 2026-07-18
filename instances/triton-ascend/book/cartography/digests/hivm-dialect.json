@@ -1,0 +1,107 @@
+{
+  "subsystem": "hivm-hfusion-dialect",
+  "one_line_spine": "NPU 侧的『硬件 IR + 硬件机器码等价物』——Triton 经 triton-adapter 落到 Linalg 后，进入 bishengir(AscendNPU-IR,全开源) 的两级方言:HFusion(张量级融合 IR,Linalg 超集,决定『把哪些算子融成一个核、按哪种 FusionKind 调度』) 与 HIVM(达芬奇硬件 IR,显式内存层级 GM/L1/L0A/L0B/L0C/UB + 显式流水线 S/V/M/MTE/FIX + Cube/Vector 双核 + 显式核内/核间同步);下降链 Linalg→HFusion→HIVM→Standard(func.call 打进 AscendC Template 内联库) 是基座书 GPU 侧『TTGIR+布局→LLVM→PTX』的 NPU 对位物,但两条链的硬件抽象(warp/lane/layout 编码 vs 内存搬运/流水线同步)几乎无重叠。",
+  "boundary_note": "AscendNPU-IR(third_party/ascend/AscendNPU-IR/bishengir/) 是 Ascend 官方开源仓(GitCode/GitHub Ascend/AscendNPU-IR, Apache-2.0),.td 方言定义 + lib/Conversion 下降 + lib/Template AscendC 内联库实现全部可逐字读到底(Template 里 __aiv__/__ubuf__ 就是落到向量核 UB 的真实内联函数)。真正闭源的是 bishengir-compile 二进制里 Standard/LLVM→NPU 二进制那段 CCE codegen(由 cartoBackend 的 backend-pipeline digest 覆盖);本 digest 读到 HIVMToStandard 产出的 func.call @library 为止,库函数体(Template)开源可选读。triton-ascend fork 侧 lib/TritonToHFusion|HIVM|LLVM 是窄逃生舱(只处理 Linalg 表达不了的 NPU 专属 op),主下降在 bishengir。",
+  "chapters_proposed": [
+    {
+      "proposed_title": "TritonAscend 方言与三条逃生舱:Triton 表达不了的 NPU 语义如何注入并下降",
+      "focus": "讲 fork 自带的 `triton::ascend` 方言(TritonAscendOps.td)——一组 GPU 路径没有、Triton 通用方言也表达不了的 NPU 专属 op:`ascend.mod`(L68)、`ascend.custom`(L388,包 sync_block_* 字符串参数)、`ascend.index_put`/`gather_out_to_ub`/`scatter_ub_to_out`/`index_select_simd`(L84/L136/L195/L249,GM↔UB 的 embedding/scatter 访存)、`ascend.indirect_load`/`indirect_store`(L299/L350,编译器为离散访存自动 emit 的 built-in)、`ascend.flip`/`sort`/`annotation`(L402/L425/L47)。再讲三条『窄逃生舱』下降 pass 各只挂 2-3 个 pattern、用 greedy/partial conversion,专治 TritonToLinalg 主链吞不下的 op:TritonToHFusion.cpp(mod→ElemwiseBinaryOp、histogram、非 RTNE 的 fp_to_fp→CastOp)、TritonToHIVM.cpp(custom sync_block_*→HIVM 同步 op,GetCoreAndPipes 决定 Cube/Vector 核 + 生产/消费 pipe)、TritonToLLVM.cpp(elementwise_inline_asm→LLVM inline asm,含 32-bit 打包)。这是 fork 与 bishengir 的接缝层。",
+      "key_source_paths": [
+        "third_party/ascend/include/Dialect/TritonAscend/IR/TritonAscendOps.td",
+        "third_party/ascend/lib/TritonToHFusion/TritonToHFusion.cpp",
+        "third_party/ascend/lib/TritonToHIVM/TritonToHIVM.cpp",
+        "third_party/ascend/lib/TritonToLLVM/TritonToLLVM.cpp"
+      ],
+      "pairs_with": "base ch24 (ttng.* 硬件方言 op) + ch19 (方言黏合层)——同是『通用张量 IR 之外补硬件专属 op』,但 NPU 补的是显式 GM/UB 搬运与双核同步语义",
+      "kind": "deep",
+      "teaching_value": "读者在基座书看到 GPU 侧 tt.*/ttg.* 都是硬件无关或 warp 级;这里第一次看到 NPU 把『UB 缓冲区』『Cube/Vector 双核』『pipe』写进 op 语义。逃生舱模式(主链走 Linalg、专属 op 走窄 pass)本身是可迁移的编译器工程范式。",
+      "difficulty": "supporting"
+    },
+    {
+      "proposed_title": "HFusion 方言:Linalg 之上的张量级融合 IR 与算子上抬",
+      "focus": "讲 HFusion(hfusion 方言,HFusionBase.td:L30)——一个 Linalg 超集的 destination-style 结构化 op 方言,是『把哪些算子融成一个核』这一层的载体。三块:①函数化 elementwise 词汇表——UnaryFn/BinaryFn/CompareFn/TernaryFn/RoundMode 枚举(HFusionEnums.td:L29/L53/L77/L93/L109),配 yamlgen 出的 named 结构化 op(ElemwiseUnaryOp/BinaryOp,走 LinalgStructuredInterface,HFusionStructuredOps.td:L38/L63);②专属结构化 op:reduce_with_index(L69)、arange(L138)、gather/gather_mask(L192/L265)、conv1d(L324);③非库调用 op:mulext(HFusionOps.td:L114)、cumsum/cumprod(L284/L307)、atomic_cas/xchg/rmw(L330/L370/L414)、sort(L454)、histogram(L500)、matmul_mx 微缩放矩阵乘(L531)。下降入口 LinalgToHFusion.cpp:把 linalg.map/linalg.generic 里的 math 语义(exp/relu/tanh/rsqrt/isinf...)识别并上抬成 HFusion named op(LinalgMapToHFusionPattern:L45, LinalgGenericToHFusion:L230),抬不动的留在 linalg。",
+      "key_source_paths": [
+        "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HFusion/IR/HFusionStructuredOps.td",
+        "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HFusion/IR/HFusionOps.td",
+        "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HFusion/IR/HFusionEnums.td",
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/LinalgToHFusion/LinalgToHFusion.cpp"
+      ],
+      "pairs_with": "base ch19 (tt.* 词汇表:硬件无关张量 IR)——HFusion 是 NPU 侧对位的『中层张量 IR』,但它建在 Linalg 之上、且带 FusionKind 融合意图,不是纯词汇表",
+      "kind": "deep",
+      "teaching_value": "解释 NPU 编译栈为何多出一层 HFusion 而 GPU 没有:GPU 靠 tt.dot/tl.* 直接带布局下降,NPU 走 Linalg-first 生态(可复用 MLIR 上游 tiling/bufferization),再用 HFusion named op 把『可融合的算子模式』显式化,为后续 AutoSchedule 提供融合边界。",
+      "difficulty": "core"
+    },
+    {
+      "proposed_title": "算子融合与自动调度:FusionKind 分类与 Cube/Vector 分工的 tile 策略",
+      "focus": "讲 HFusion 存在的核心理由——『融合 + 自动调度』,这是 NPU 侧对位基座『软件流水线/调度』的主场(Lead 已裁定归本子系统,方言内聚)。两块:①OpFusion(lib/Dialect/HFusion/Transforms/OpFusion/:FusibleBlockAnalyzer/FusibleBlockOutliner/FusibleHelper)——分析哪些相邻 op 可融进一个核、切出可融块并外提成融合函数,给它打上 FusionKind 标签(HFusion_FusionKindAttr,HFusionAttrs.td:L39;枚举 HFusionEnums.td:L184-207)。②AutoSchedule(lib/Dialect/HFusion/Transforms/AutoSchedule/)——按 FusionKind 分派不同调度器决定 tile 形状与 Cube/Vector 分工:PureElemwiseSchedule(纯逐元素)、AnyPBRSchedule(producer-broadcast-reduce)、ShallowCVSchedule(浅 cube-vector 混合)、SingleCubeSchedule(单 cube),经 AutoScheduleBase/KernelInfoCollector 收集核信息、TilingUtils 算 tiling。对照基座 num_stages 软件流水线:NPU 的『调度』是把融合核切 tile 并绑到双核 pipe,而非 GPU 的模调度展开。",
+      "key_source_paths": [
+        "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HFusion/IR/HFusionEnums.td",
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleBlockAnalyzer.cpp",
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/AutoScheduleBase.cpp",
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/ShallowCVSchedule.cpp"
+      ],
+      "pairs_with": "base ch29-31 (软件流水线/模调度/warp specialization)——GPU 用 num_stages 建模循环流水线交硬件调度,NPU 用 FusionKind→调度器把融合核切 tile 并显式分派到 Cube/Vector 双核 pipe",
+      "kind": "deep",
+      "teaching_value": "读者理解 NPU 性能的第二大杠杆(第一是显式同步):融合边界与 tile 策略由 FusionKind 驱动的调度器自动决定,ShallowCV/MixCV 等分类直接对应『这个核里 Cube 和 Vector 怎么配合』。是 HFusion 从『能表达融合』走到『会调度融合』的落地。",
+      "difficulty": "core"
+    },
+    {
+      "proposed_title": "HIVM 方言:达芬奇硬件 IR——显式内存层级、流水线与 Cube/Vector 双核",
+      "focus": "讲 HIVM(hivm 方言,op mnemonic 带 `hir.` 前缀,HIVMBase.td:L36/L63)——NPU 的硬件指令级 IR,基座书 TTGIR+PTX 的对位物,但抽象完全不同。核心是三套硬件枚举(HIVMAttrs.td):①内存层级 AddressSpace——GM(gm)/L1(cbuf)/L0A(ca)/L0B(cb)/L0C(cc)/UB(ub)(L188-194),达芬奇存储金字塔;②流水线 PIPE——S(标量)/V(向量)/M(cube mmad)/MTE1-5(存储搬运引擎)/FIX(fixpipe)(L220-234);③核类型 TCoreType——CUBE(AIC)/VECTOR(AIV)/MIX(L315-317);外加矩阵分形布局 DataLayout(ND/nZ/zN/Fractal,L95-104)。再讲 op 词汇表分四类:向量指令(HIVMVectorOps.td,vexp/vadd/vmul/vreduce/vtranspose/vsort... 40+ op,PIPE_V+VectorCore,带 transpose/broadcast/temp_buffer,VExpOp:L117);数据搬运 DMA(HIVMDMAOps.td,load PIPE_MTE2:L62、store PIPE_MTE3:L145、copy:L199、fixpipe L0C→UB/GM 顺带 quant/relu/layout:L271、nd2nz 分形转换:L331);cube 宏指令(HIVMMacroOps.td,matmul:L247、mix_matmul cube+vector 融合:L331、mmadL1 local-buffer:L163);标量/控制 op(HIVMOps.td,get_block_idx:L38、set_atomic:L101、convert_layout:L157、pointer_cast:L229)。",
+      "key_source_paths": [
+        "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMAttrs.td",
+        "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMVectorOps.td",
+        "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMDMAOps.td",
+        "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMMacroOps.td",
+        "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMOps.td"
+      ],
+      "pairs_with": "base ch19-24 (TTGIR:Distributed/Shared 布局 + ttg/ttng op) + ch27 (MMA 布局)——同是『硬件方言 + 数据摆放』,但 GPU 摆的是 warp/lane 上的 layout 编码,NPU 摆的是搬进哪级 buffer(UB/L1/L0)、走哪条 pipe、Cube 还是 Vector 核,矩阵靠 nZ/zN 分形而非 MMA layout 编码",
+      "kind": "deep",
+      "teaching_value": "这是整个 NPU 侧最核心的一章:读者理解『为什么 Ascend 没有 SIMT/warp,而是把片上存储金字塔、DMA 引擎、Cube 阵列全部暴露成 IR op』。达芬奇 Cube(L1→L0A/L0B→mmad→L0C→fixpipe)与 GPU Tensor Core 的对照,是全书 GPU/NPU 双栈叙事的高潮。",
+      "difficulty": "core"
+    },
+    {
+      "proposed_title": "HIVM 显式同步:set_flag/wait_flag 流水线同步与 Cube↔Vector 核间同步",
+      "focus": "讲 GPU 靠 warp 调度器免费拿到、而 NPU 必须在 IR 里显式写出来的同步(HIVMSynchronizationOps.td)。①核内流水线同步:set_flag/wait_flag(L43/L60)带 (set_pipe, wait_pipe, event_id) 三元组,在 MTE2↔V↔MTE3↔M↔FIX 之间用事件寄存器做生产者-消费者同步(如 load(MTE2) 完成才能 vadd(V));pipe_barrier(L77) 同 pipe 内串行化。②核间同步:sync_block(L87) 用 SyncBlockMode(ALL_CUBE/ALL_VECTOR/BARRIER_CUBE/ALL,HIVMAttrs.td:L567) + FFTS mailbox(ffts_base_addr)在 GM 上做 Cube↔Vector 核汇合(约束:数据须先落 GM);sync_block_set/wait(L129/L159) 是细粒度版。对照 fork 侧 TritonToHIVM 的 GetCoreAndPipes:用户 `ascend.custom` 的 sync 语义如何映射成这些 op。可选补 InjectSync/GraphSyncSolver transform(Transforms/InjectSync/*,自动插同步)作为『谁来生成这些同步』的延伸。",
+      "key_source_paths": [
+        "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMSynchronizationOps.td",
+        "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMAttrs.td",
+        "third_party/ascend/lib/TritonToHIVM/TritonToHIVM.cpp"
+      ],
+      "pairs_with": "base ch26 (共享内存屏障 Membar) + ch29-31 (软件流水线/warp specialization)——GPU 的流水线/屏障由 pass 建模并交给硬件调度,NPU 把 pipe 间事件同步与核间 barrier 直接写成指令,是『显式 vs 隐式并行』最锋利的对照",
+      "kind": "deep",
+      "teaching_value": "读者理解 NPU 性能工程的核心难点:pipe 间/核间同步全靠编译器显式插入,漏插=数据竞争、多插=串行化。这是 GPU 程序员迁移到 Ascend 最反直觉的一层,也是 fork 里 sync_block custom op 存在的理由。",
+      "difficulty": "core"
+    },
+    {
+      "proposed_title": "下降链:HFusion→HIVM→Standard——从融合张量 op 到 AscendC 库调用",
+      "focus": "串起 bishengir 主下降链与其 pipeline 编排(ConvertToHIVMPipeline.cpp:buildConvertToHIVMPipeline L29 = HFusionToHIVM → [TritonGlobalKernelArgsToHIVM] → TensorToHIVM → ConvertToHIVMOp)。①HFusionToHIVM(Conversion/HFusionToHIVM/,2158 行,拆 HFusionToHIVM.cpp+Matmul.cpp+Reduction.cpp):把 HFusion 结构化 op 降成 HIVM 硬件 op,关键开关 mmMapMode——triton kernel 编译走 MacroInstr(local-buffer 的 mmadL1 宏,Passes.td:L77-95),否则 CoreOp(gm-buffer matmul);isEnableUbufSaving 控 UB 省用。②TensorToHIVM(178 行):残余 tensor op → HIVM。③HIVMToStandard(1933 行,Passes.td:L103):把每个 HIVM 向量/DMA/matmul op 降成 `func.call @<库函数>`(createLibCall:L106,库调用模式:L341),库函数体就是 lib/Template 里的 AscendC 内联实现(Vector/Cube/DMA/Fixpipe/Synchronization,__aiv__/__ubuf__),bishengir-compile 链接它们。到此 HIVM 出方言,交给闭源后端出 NPU 二进制。",
+      "key_source_paths": [
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HIVM/Pipelines/ConvertToHIVMPipeline.cpp",
+        "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Conversion/Passes.td",
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HFusionToHIVM/HFusionToHIVM.cpp",
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp"
+      ],
+      "pairs_with": "base part-7 ch32-35 (TTGIR→LLVM→PTX 五级台阶、指令选择、LLVM→PTX 出口)——NPU 的对位下降是 HFusion→HIVM→Standard,终点不是 PTX 汇编而是打进 AscendC 模板内联库的 func.call,再由闭源 CCE 出二进制",
+      "kind": "deep",
+      "teaching_value": "闭环全书『两条下降链』主叙事:读者看清 GPU 侧终于 PTX 文本、NPU 侧终于库调用+内联模板,且 matmul 的 CoreOp/MacroInstr 分流揭示 triton kernel 与通用算子走不同 codegen。是 HFusion/HIVM 两章的落地出口。",
+      "difficulty": "core"
+    }
+  ],
+  "divergence_from_base": "基座书 GPU 侧硬件 IR 是 TTGIR+PTX:数据摆放靠贴在张量上的 layout 编码(Blocked/MMA/DotOperand/Shared+swizzle,LinearLayout 统一),并行靠 SIMT warp/lane,同步/流水线由 pass 建模后交硬件调度器隐式执行,终点是 PTX 文本。NPU 侧走两级方言 HFusion+HIVM,且四处根本不同:①多一层 HFusion(Linalg 超集融合 IR)——GPU 无对应,因 NPU 复用 MLIR Linalg-first 生态;②数据摆放不是 layout 编码而是显式内存层级搬运——op 直接写明搬进 GM/L1/L0A/L0B/L0C/UB 哪级、走哪条 MTE/FIX pipe;③计算核显式二分 Cube(AIC,矩阵)/Vector(AIV,逐元素),矩阵靠 nZ/zN 分形布局 + fixpipe 出 L0C,不用 MMA layout;④并行同步全显式:set_flag/wait_flag(pipe 间事件)+ sync_block(Cube↔Vector via FFTS)写成 IR 指令,而非 GPU 的隐式 warp 调度;⑤下降终点是 func.call 打进 AscendC 内联模板库(开源可读到 __aiv__/__ubuf__),非 PTX 汇编文本。",
+  "paper_gap_candidates": [
+    {
+      "concept": "达芬奇(Da Vinci)架构:Cube/Vector/Scalar 三单元 + GM/L1/L0A/L0B/L0C/UB 存储金字塔 + MTE 搬运引擎",
+      "why_prereq": "HIVM 方言的 AddressSpace/PIPE/TCoreType 枚举与全部 DMA/matmul/fixpipe op 语义直接映射这套硬件;读者不先建立达芬奇存储金字塔与 Cube 数据通路(L1→L0A/L0B→mmad→L0C→fixpipe)的心智模型,无法理解 HIVM op 为何长这样。基座书 ch02 讲了 GPU SIMT 执行模型作为先修,NPU 侧需要对位的一章硬件先修。",
+      "has_paper_root": true,
+      "note": "【Lead 已裁:达芬奇硬件 primer 独立成章,归 cartoHw(Part-1)】。可溯源 HPCA'21 'Ascend: a Scalable and Unified Architecture...' by H. Liao et al. + CANN/AscendC 官方文档。本子系统 HIVM 章交叉引用该 primer 即可,不自带大段硬件铺陈。"
+    }
+  ],
+  "open_questions": [
+    "【已由 Lead 裁定,留档】AutoSchedule/FusionKind → 归本子系统(HFusion Part,方言内聚);cartoOpt 只讲 TritonAffinityOpt 核亲和,不碰 FusionKind,不重叠。已据此把 FusionKind/AutoSchedule 提升为正式章(本 digest 第 3 章)。",
+    "【已由 Lead 裁定,留档】lib/Template(AscendC 内联库)→ 折进本 digest『下降链→库调用』章作收官 payoff(读者亲眼看最终 AscendC 硬件码),暂不单开;综合时篇幅撑得开可升独立章。",
+    "【已由 Lead 裁定,留档】lib/Dialect/TritonStructured → 归 cartoLinalg 域(分水岭 Part),本 digest 不纳入。",
+    "【已由 Lead 裁定,留档】达芬奇硬件 primer → 独立章、cartoHw 持(Part-1);本子系统 HIVM 章交叉引用。",
+    "本 digest 现 6 章(补入 AutoSchedule 章),偏多;若全书总量受限,可合并『HIVM 方言』与『HIVM 同步』为一大章,或把逃生舱章并入 cartoLinalg 的 triton-adapter 叙事——留待 Lead 综合定夺。"
+  ]
+}

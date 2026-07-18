@@ -30,7 +30,18 @@
 - 运行验证需昇腾 NPU/CANN 工具链，宿主无此环境——tester/explainer 以编译期产物
   （IR dump/linalg 降级结果）与 interpreter 模式为主，trace_source 如实标注。
 
-## 当前状态（2026-07-15）
-- ✅ scaffold + clone（GitCode）+ 钉版 v3.2.1。
-- ⏸ 排队：待基座书（triton）大纲获批、开写后，再按姊妹篇 playbook（对照基座测绘、
-  配对脊柱）出本书大纲。
+## 当前状态（2026-07-18）
+- ✅ scaffold + clone（GitCode）+ 钉版 v3.2.1（main `2badfc89e`）。
+- ✅ **基座书《Triton 源码解读》43 章已全部完本**（gate 已开）；active_instance 已切到 triton-ascend。
+- ✅ **AscendNPU-IR submodule 已 populate**（此前为空）：`third_party/ascend/AscendNPU-IR`
+  @ `47a0229060e37f92a49cfb82d81c756628e6c7ae`（1522 文件；含 bishengir 的 HFusion/HIVM
+  方言定义与 Linalg→HFusion→HIVM→Standard 下降链——**开源可读**，不是纯闭源 blob）。
+- 🔄 **cartography 进行中（2026-07-18 起）**：6 子系统 analyst 并行测绘中——backend-pipeline /
+  triton-to-linalg / ascend-opt-passes（AutoBlockify）/ hivm-dialect / language-cann /
+  tutorials-hwmodel。digest 落 `book/cartography/digests/`，Lead 综合成 outline + ARCHITECTURE。
+- **下降链已探明**：`ttir（与基座共享）→ ttadapter(triton_adapter：Triton-MLIR→Linalg)→
+  npubin(bishengir-compile：Linalg→HFusion→HIVM→NPU binary)`。3 阶段（基座 GPU 是 5 段
+  ttir→ttgir→llir→ptx→cubin）；根本 divergence = **换模型**（SIMT 指针张量 → 结构化 Linalg/
+  仿射 tiled dataflow），bishengir 部分闭源（边界≈基座的 ptxas）。
+- ⏳ **审批闸**：本书大纲**须用户审批**（与基座 triton 的豁免不同，2026-07-15 kickoff 定）——
+  cartography 收口后把 Part/章列表 + 覆盖核对 + 论文清单交用户批，批后才逐章发车。
