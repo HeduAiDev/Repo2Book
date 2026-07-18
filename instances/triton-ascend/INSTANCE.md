@@ -43,5 +43,7 @@
   npubin(bishengir-compile：Linalg→HFusion→HIVM→NPU binary)`。3 阶段（基座 GPU 是 5 段
   ttir→ttgir→llir→ptx→cubin）；根本 divergence = **换模型**（SIMT 指针张量 → 结构化 Linalg/
   仿射 tiled dataflow），bishengir 部分闭源（边界≈基座的 ptxas）。
-- ⏳ **审批闸**：本书大纲**须用户审批**（与基座 triton 的豁免不同，2026-07-15 kickoff 定）——
-  cartography 收口后把 Part/章列表 + 覆盖核对 + 论文清单交用户批，批后才逐章发车。
+- ✅ **大纲已获用户审批（2026-07-18「同意」）**：33 章 / 7 Part（outline-final.json）+ ARCHITECTURE.md，
+  开始逐章发车。roadmap.py 生成器已建并验（7 Part 窄长条 5.17:1，4 调用/几何/Read-PNG 通过）。
+- 🚗 **施工中**：ch01 鸟瞰先行（skip_impl/meta，含 book-map 详细全书地图）→ 逐 Part 推进。
+  发车须 scriptPath（workflow-byname-stale-snapshot）+ 显式 instance:"triton-ascend"（护栏）。
