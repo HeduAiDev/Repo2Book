@@ -1,0 +1,315 @@
+{
+  "chapter": "ch01-birdseye-ascend-backend",
+  "meta_chapter": true,
+  "skip_impl": true,
+  "one_line_thesis": "triton-ascend = fork 上游 Triton（不改前端）+ 后端 add_stages 把 TTIR 经 triton_adapter 降成结构化 Linalg（抛弃 SIMT 指针模型）+ 经 bishengir 的 HFusion/HIVM 降到 AscendC 库调用 + 落到达芬奇 cube/vector 双核。",
+  "code_spine": [
+    "third_party/ascend/tutorials/01-vector-add.py:L50-L87  —— 三支柱的入口：同一份 @triton.jit 核（与基座逐字同构），唯一差异是 device='npu' / import torch_npu",
+    "third_party/ascend/backend/compiler.py:L877-L886  —— AscendBackend 实现 BaseBackend 契约，supports_target 只认 target.backend=='npu'（挂载点 = 支柱①）",
+    "third_party/ascend/backend/compiler.py:L939-L968  —— add_stages 登记三段下降链 ttir→ttadapter→npubin（支柱②主脊）",
+    "third_party/ascend/backend/compiler.py:L73-L93  —— make_ttir：与所有后端共享的 TTIR pass（与基座同源，分叉前的最后共同祖先）",
+    "third_party/ascend/backend/compiler.py:L96-L171  —— ttir_to_linalg：triton_adapter 把 tensor-of-pointers 指针模型抛弃、逆向还原成结构化 Linalg memref（分水岭）",
+    "third_party/ascend/backend/compiler.py:L298-L499  —— linalg_to_bin：把 Linalg 交给闭源 bishengir-compile 出 NPU 二进制（下降链末段，全书唯一闭源边界）",
+    "third_party/ascend/ascend_ir.cc:L420-L425  —— CoreType 枚举 CUBE/VECTOR：达芬奇双核在昇腾 IR 里的 C++ 侧接入点（支柱③）",
+    "third_party/ascend/ascend_ir.cc:L412-L418  —— AddressSpace 枚举 L1/UB/L0A/L0B/L0C：片上显式内存层级的 C++ 侧接入点",
+    "third_party/ascend/ascend_ir.cc:L492-L499  —— load_dialects：注册 HIVM/annotation/scope 三个昇腾专属 MLIR 方言",
+    "third_party/ascend/triton_ascend.cc:L361-L376  —— init_triton_ascend：把 passes/ascend_ir/ir 三个子模块拼进 libtriton.ascend（Python 侧 add_stages 调的 ascend.passes.* 就来自这里）"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "third_party/ascend/tutorials/01-vector-add.py",
+      "lines": "L50-L75",
+      "why": "支柱①的活证据：这段 @triton.jit 核与基座《Triton 源码解读》里的 vector-add 逐字同构——tl.program_id / tl.arange / tl.load / tl.store 一个不少。fork 的意义正在于此：前端一行没动，同一份核在基座编到 GPU、在本书 fork 后被后端改道编到 NPU。",
+      "code": "@triton.jit\ndef add_kernel(x_ptr,  # *Pointer* to first input vector.\n               y_ptr,  # *Pointer* to second input vector.\n               output_ptr,  # *Pointer* to output vector.\n               n_elements,  # Size of the vector.\n               BLOCK_SIZE: tl.constexpr,  # Number of elements each program should process.\n               # NOTE: `constexpr` so it can be used as a shape value.\n               ):\n    # There are multiple 'programs' processing different data. We identify which program\n    # we are here:\n    pid = tl.program_id(axis=0)  # We use a 1D launch grid so axis is 0.\n    # This program will process inputs that are offset from the initial data.\n    # For instance, if you had a vector of length 256 and block_size of 64, the programs\n    # would each access the elements [0:64, 64:128, 128:192, 192:256].\n    # Note that offsets is a list of pointers:\n    block_start = pid * BLOCK_SIZE\n    offsets = block_start + tl.arange(0, BLOCK_SIZE)\n    # Create a mask to guard memory operations against out-of-bounds accesses.\n    mask = offsets < n_elements\n    # Load x and y from DRAM, masking out any extra elements in case the input is not a\n    # multiple of the block size.\n    x = tl.load(x_ptr + offsets, mask=mask)\n    y = tl.load(y_ptr + offsets, mask=mask)\n    output = x + y\n    # Write x + y back to DRAM.\n    tl.store(output_ptr + offsets, output, mask=mask)",
+      "elide": [
+        "模块顶部的双版权头（Huawei + Tillet/OpenAI）——正文单独引用以佐证 fork 血统，不放进核代码块",
+        "add() host 包装 + __main__ 里的 torch.rand(..., device='npu') 校验段（L82-L101），正文只需一句点出 device='npu' 是唯一 NPU 侧改动"
+      ]
+    },
+    {
+      "path": "third_party/ascend/backend/compiler.py",
+      "lines": "L877-L886",
+      "why": "支柱①的挂载点：AscendBackend 是 BaseBackend 的一个具体实现，supports_target 只在 backend=='npu' 时返回真——这就是 fork（原位实现契约）与 vllm-ascend 式 OOT 插件（注册表顶替、不改一行源码）的根本区别。binary_ext='npubin' 决定了下降链终点。",
+      "code": "class AscendBackend(BaseBackend):\n\n    @staticmethod\n    def supports_target(target: GPUTarget):\n        return target.backend == \"npu\"\n\n    def __init__(self, target: GPUTarget) -> None:\n        super().__init__(target)\n        if target.backend == \"npu\":\n            self.binary_ext = \"npubin\"",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/backend/compiler.py",
+      "lines": "L939-L963",
+      "why": "支柱②的主脊，也是全书第一眼要抓的一行代码：昇腾只登记三段 ttir→ttadapter→npubin，对照基座 GPU 路的五段 ttir→ttgir→llir→ptx→cubin——没有 TTGIR 那层 SIMT layout/warp 指派。第二段 ttadapter 整个换成对 triton_adapter pass 库的编排，正是『同一前端、两条下降链』的分叉点。",
+      "code": "    def add_stages(self, stages, options):\n        if self.target.backend == \"npu\":\n            stages[\"ttir\"] = lambda src, metadata: make_ttir(src, metadata, options)\n            if options.force_simt_only:\n                stages[\"npubin\"] = (\n                    lambda src, metadata: ttir_to_npubin(\n                        src, metadata, options\n                    )\n                )\n                return\n            stages[\"ttadapter\"] = lambda src, metadata: ttir_to_linalg(\n                src, metadata, options, named_ops=True\n            )\n            if options.compile_on_910_95:\n                stages[\"npubin\"] = (\n                    lambda src, metadata: linalg_to_bin_enable_npu_compile_910_95(\n                        src, metadata, options\n                    )\n                )\n            else:\n                stages[\"npubin\"] = (\n                    lambda src, metadata: linalg_to_bin_enable_npu_compile_A2_A3(\n                        src, metadata, options\n                    )\n                )",
+      "elide": [
+        "else 分支（非 npu）只 raise NotImplementedError（L964-L968），正文一句带过",
+        "force_simt_only 快路径改挂 ttir_to_npubin 绕过 Linalg——meta 章仅提一句『还存在一条 SIMT 直通旁路，细节见后端篇』，不展开"
+      ]
+    },
+    {
+      "path": "third_party/ascend/backend/compiler.py",
+      "lines": "L131-L165",
+      "why": "支柱②的分水岭细节：ttir_to_linalg 在 pass_manager 上按序挂一长串 ascend.passes.ttir.add_*，最后 add_triton_to_linalg 产出 named-op 形态的 Linalg。这条链把 Triton-MLIR 的 tensor-of-pointers 指针模型逐步抛弃、逆向还原成结构化 memref——meta 章只展示编排顺序，每个 pass 的 C++ 内部实现留给 P3/P5 展开。",
+      "code": "        ascend.passes.ttir.add_triton_to_structure(\n            pm,\n            enable_mask_fallback_conversion,\n            optimize_dynamic_offset\n        )\n        ascend.passes.ttir.add_discrete_mask_access_conversion(\n            pm,\n            compile_on_910_95,\n            force_simt_template,\n            enable_sync_block_lock\n        )\n        ascend.passes.ttir.add_triton_to_annotation(pm)\n        ascend.passes.ttir.add_triton_to_unstructure(\n            pm,\n            compile_on_910_95,\n            force_simt_template\n        )\n        ascend.passes.ttir.add_triton_to_hivm(pm)\n        ascend.passes.ttir.add_triton_to_hfusion(pm)\n        ascend.passes.ttir.add_triton_to_llvm(pm)\n        ascend.passes.ttir.add_bubble_up_operation(pm)\n        ascend.passes.ttir.add_triton_to_structure(\n            pm,\n            enable_mask_fallback_conversion,\n            optimize_dynamic_offset\n        )\n        ascend.passes.ttir.add_triton_to_linalg(\n            pm,\n            False,\n            named_ops,\n            enable_nd2nz_on_vector,\n            enable_select_analysis,\n            compile_on_910_95\n        )\n        pm.run(mod)",
+      "elide": [
+        "函数开头把 TTIR 打成字符串写临时文件、从 metadata 取十来个开关（L96-L113）——meta 章一句『先序列化 TTIR』带过",
+        "add_auto_blockify 与可选的 add_auto_scheduling 分支（dag_sync/dag_scope/ssbuffer，L118-L130）——只提『链首还有分块与可选自动调度』，细节归 P4/P5",
+        "opt.debug 下 dump kernel.ttadapter.mlir（L167-L171）——正文用来说明『编译期可 dump 各级 IR』"
+      ]
+    },
+    {
+      "path": "third_party/ascend/ascend_ir.cc",
+      "lines": "L420-L425",
+      "why": "支柱③的 C++ 侧接入点：达芬奇 AI Core 的 cube（矩阵）/ vector（向量）双核在昇腾 IR 里被建模成 TCoreType 枚举，经 pybind 暴露给 Python。这是『一切下降的目标硬件』在编译器数据结构里的落点。",
+      "code": "  py::enum_<hivm::TCoreType>(m, \"CoreType\", py::module_local())\n      .value(\"CUBE\", hivm::TCoreType::CUBE)\n      .value(\"VECTOR\", hivm::TCoreType::VECTOR)\n      .value(\"CUBE_OR_VECTOR\", hivm::TCoreType::CUBE_OR_VECTOR)\n      .value(\"CUBE_AND_VECTOR\", hivm::TCoreType::CUBE_AND_VECTOR)\n      .export_values();",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/ascend_ir.cc",
+      "lines": "L412-L418",
+      "why": "支柱③的内存层级接入点：达芬奇片上显式内存层级（L1 / Unified Buffer / L0A / L0B / L0C）在 IR 里被建模成 AddressSpace 枚举。与 GPU 隐式 cache/shared 不同，昇腾数据搬运必须显式写——这几个地址空间就是 writer 必须显式落地的搬运目的地。",
+      "code": "  py::enum_<hivm::AddressSpace>(m, \"AddressSpace\", py::module_local())\n      .value(\"L1\", hivm::AddressSpace::L1)\n      .value(\"UB\", hivm::AddressSpace::UB)\n      .value(\"L0A\", hivm::AddressSpace::L0A)\n      .value(\"L0B\", hivm::AddressSpace::L0B)\n      .value(\"L0C\", hivm::AddressSpace::L0C)\n      .export_values();",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/ascend_ir.cc",
+      "lines": "L492-L499",
+      "why": "支柱①的方言注册：fork 在树内新增了 HIVM / annotation / scope 三个昇腾专属 MLIR 方言，load_dialects 把它们注册进 MLIRContext——这是『上游整树 + 昇腾原位增量』在方言层的证据。",
+      "code": "  m.def(\"load_dialects\", [](MLIRContext &context) {\n    gDefaultAscendContext = &context;\n    DialectRegistry registry;\n    registry.insert<annotation::AnnotationDialect, mlir::hivm::HIVMDialect,\n                    scope::ScopeDialect>();\n    context.appendDialectRegistry(registry);\n    context.loadAllAvailableDialects();\n  });",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/triton_ascend.cc",
+      "lines": "L361-L376",
+      "why": "把三支柱在 C++ 侧缝合起来的总装点：init_triton_ascend 建 passes 子模块、注册 TritonAscend 方言，并把 passes.ttir（Python 侧 add_stages 调的 ascend.passes.ttir.add_*）、ascend_ir、ir 三个子模块拼进 libtriton 的 ascend 命名空间。读者由此看清 compiler.py 里 `from triton._C.libtriton import ascend` 背后的 C++ 装配。",
+      "code": "void init_triton_ascend(py::module &&m) {\n  auto passes = m.def_submodule(\"passes\");\n  // load dialects\n  m.def(\"load_dialects\", [](mlir::MLIRContext &context) {\n    mlir::DialectRegistry registry;\n    registry.insert<mlir::triton::ascend::TritonAscendDialect>();\n    context.appendDialectRegistry(registry);\n    context.loadAllAvailableDialects();\n  });\n\n  init_triton_ascend_passes_ttir(passes.def_submodule(\"ttir\"));\n  init_triton_ascend_ir(m.def_submodule(\"ascend_ir\"));\n  \n  // Initialize ascend IR bindings (ascendnpu_ir_builder, scope/hivm dialects)\n  init_ascend_ir(m.def_submodule(\"ir\"));\n}",
+      "elide": [
+        "init_triton_ascend_passes_ttir 里逐个 m.def 的 pass（add_auto_blockify / add_triton_to_structure / ... / add_dag_ssbuffer，L299-L356）——正文只需说明这些即 add_stages 调到的 pass 出处，逐 pass 展开归 P3/P5"
+      ]
+    }
+  ],
+  "key_classes": [
+    {
+      "name": "AscendBackend",
+      "file": "third_party/ascend/backend/compiler.py:L877",
+      "responsibility": "BaseBackend 的昇腾具体实现；supports_target 认 'npu'、add_stages 登记三段下降链、parse_options 灌 NPUOptions、pack_metadata 截断 kernel_name。挂载点，支柱①落地。"
+    },
+    {
+      "name": "NPUOptions",
+      "file": "third_party/ascend/backend/compiler.py:L705",
+      "responsibility": "约 80 字段的 frozen dataclass，几乎每个字段是后段 bishengir 的一个编译开关；含 compile_on_910_95 / force_simt_only 等决定下降链走向的字段。meta 章仅点名，字段展开归后端篇。"
+    },
+    {
+      "name": "AscendNPUIROpBuilder",
+      "file": "third_party/ascend/ascend_ir.cc:L47",
+      "responsibility": "继承 TritonOpBuilder 的 C++ OpBuilder，暴露 cube/vector core-type attr、HIVM/scope op 构造器（create_fixpipe/create_scope_op/sync_block_* 等）。支柱③在 IR builder 层的接入。"
+    },
+    {
+      "name": "make_ttir",
+      "file": "third_party/ascend/backend/compiler.py:L73",
+      "responsibility": "与所有 Triton 后端共享的 TTIR 优化 pass（inliner/combine/canonicalizer/cse/licm/loop_unroll）；GPU 与 NPU 分叉前的最后共同祖先。"
+    },
+    {
+      "name": "ttir_to_linalg",
+      "file": "third_party/ascend/backend/compiler.py:L96",
+      "responsibility": "第二段（ttadapter）实现：编排一长串 ascend.passes.ttir.add_*，把 TTIR 的指针张量抛弃、逆向还原成结构化 Linalg memref。分水岭，支柱②核心。"
+    }
+  ],
+  "data_flow": [
+    "1. 用户写 @triton.jit add_kernel（tutorials/01-vector-add.py:add_kernel）——与基座逐字同构，唯一 NPU 差异是张量 device='npu' / import torch_npu",
+    "2. add_kernel[grid](...) 触发 JIT 编译；Triton 前端把核编成 Triton-MLIR（TTIR），此步与基座共享",
+    "3. AscendBackend.supports_target 认领 backend=='npu'（compiler.py:supports_target），AscendBackend.add_stages 登记三段（compiler.py:add_stages）",
+    "4. 段一 ttir：make_ttir 跑与所有后端相同的 TTIR pass（compiler.py:make_ttir）",
+    "5. 段二 ttadapter：ttir_to_linalg 经 triton_adapter pass 链把 tensor-of-pointers 抛弃→结构化 Linalg memref（compiler.py:ttir_to_linalg）——GPU 路在此改走 TTGIR（SIMT layout），这是根本 divergence",
+    "6. 段三 npubin：linalg_to_bin_* 把 Linalg 交闭源 bishengir-compile，经 HFusion→HIVM→AscendC 库调用→NPU 二进制（compiler.py:linalg_to_bin_enable_npu_compile_*）",
+    "7. 目标硬件：一切下降落到达芬奇 AI Core 的 cube/vector 双核（ascend_ir.cc:CoreType）+ 显式 UB/L1/L0 内存层级（ascend_ir.cc:AddressSpace）"
+  ],
+  "design_decisions": [
+    {
+      "decision": "fork 上游 Triton 整树、昇腾增量原位放 third_party/ascend/（含 AscendNPU-IR submodule），而非 vllm-ascend 式 OOT 插件",
+      "why": "编译器后端需要在 add_stages/OpBuilder/方言层做原位替换（换掉整条下降链），注册表顶替式插件做不到；fork 让上游 python/triton、lib、include 全量在树内，昇腾只在 third_party/ascend/ 加量。血统证据在两处:tutorials/01 保留 Tillet/OpenAI+华为双版权头;backend/compiler.py 直接 import 上游 triton（from triton._C.libtriton import ir,passes,ascend / from triton.backends.compiler import ...）——原位复用上游而非顶替。",
+      "evidence": "third_party/ascend/tutorials/01-vector-add.py:L1-L3 双版权头（Huawei+Tillet+OpenAI）；third_party/ascend/backend/compiler.py:L34-L64 直接 import 上游 triton（from triton._C.libtriton import ir,passes,ascend；from triton.backends.compiler import ...）——fork 血统在 import,不在该文件版权头（compiler.py 自身版权头为 Huawei-only,勿写成双版权）；AscendBackend 实现 BaseBackend（compiler.py:L877）"
+    },
+    {
+      "decision": "只登记三段 ttir→ttadapter→npubin，砍掉 GPU 路的 TTGIR 层",
+      "why": "TTGIR 承载 SIMT 的 layout/warp 指派，是为 GPU 的 SIMT 执行模型服务；NPU 是 cube/vector 结构化架构、非 SIMT，早早换成结构化 memref + 仿射访存更贴硬件。",
+      "evidence": "third_party/ascend/backend/compiler.py:L939-L963（add_stages 三段） 对照基座 CUDABackend 五段"
+    },
+    {
+      "decision": "第二段用 triton_adapter 把指针模型抛弃、逆向还原成结构化 Linalg",
+      "why": "Triton-MLIR 用 tensor-of-pointers 表达访存（面向 SIMT 隐式内存）；NPU 需要显式内存层级 + 仿射访存，故必须把指针语义逆向还原成结构化 memref 才能后续下降。",
+      "evidence": "third_party/ascend/backend/compiler.py:L96-L164（ttir_to_linalg 的 add_triton_to_structure→...→add_triton_to_linalg 链）"
+    },
+    {
+      "decision": "达芬奇 cube/vector 双核 + 显式片上内存层级建模进 HIVM 方言",
+      "why": "AI Core = 1 cube 矩阵核 + 2 vector 向量核（1:2），片上 UB/L1/L0/GM 层级须显式搬运（不像 GPU 隐式 cache/shared）；编译器必须把 core 归属与地址空间显式建模才能生成正确的搬运/同步指令。",
+      "evidence": "third_party/ascend/ascend_ir.cc:L420-L425（CoreType CUBE/VECTOR）+ L412-L418（AddressSpace L1/UB/L0A/L0B/L0C）"
+    }
+  ],
+  "theory": [
+    "下降链对位（本书 vs 基座）：基座 GPU 路 TTIR→TTGIR→LLVM→PTX→cubin，全程保留 SIMT 指针张量 + layout 编码；昇腾 NPU 路 TTIR→(ttadapter)Linalg→(bishengir)npubin，第二段即抛弃 SIMT 指针模型换成结构化 memref + 仿射访存。分叉点精确落在 add_stages 那几行。",
+    "达芬奇 AI Core 结构比：1 cube 矩阵核 : 2 vector 向量核（1:2）——属 ch02 达芬奇硬件 primer 的定量展开，meta 章只给一句心智模型，源码侧锚点是 TCoreType 的 CUBE/VECTOR 枚举。",
+    "内存层级显式性：GPU 有隐式 L1/L2 cache + 显式 shared memory；昇腾 UB(Unified Buffer)/L1/L0A/L0B/L0C/GM 全部显式，数据搬运必须由编译器显式生成——AddressSpace 枚举即这些层级在 IR 里的落点（ch02/P4/P5 展开）。"
+  ],
+  "subtraction_plan": {
+    "note": "本章 skip_impl（meta 概览章，无精简版）——只内嵌三支柱最小真源码锚点作自包含，不产出 minified、不跑精简版。以下 must_keep 供 writer 锚定必须讲清的符号，delete 留空。",
+    "delete": [],
+    "must_keep": [
+      {
+        "symbol": "AscendBackend",
+        "why": "支柱①挂载点，读者须理解 fork 如何原位实现 BaseBackend 契约"
+      },
+      {
+        "symbol": "supports_target",
+        "why": "认领 backend=='npu' 的那一行，是 fork 与 OOT 插件的分野证据"
+      },
+      {
+        "symbol": "add_stages",
+        "why": "支柱②主脊，全书第一眼要抓的三段下降链登记处"
+      },
+      {
+        "symbol": "make_ttir",
+        "why": "GPU/NPU 分叉前的最后共同祖先（与基座共享的 TTIR pass）"
+      },
+      {
+        "symbol": "ttir_to_linalg",
+        "why": "分水岭：triton_adapter 抛弃指针模型→结构化 Linalg"
+      },
+      {
+        "symbol": "linalg_to_bin_enable_npu_compile_910_95（注:此为 compile_on_910_95 条件分支;add_stages 默认 else 分支走 linalg_to_bin_enable_npu_compile_A2_A3（L502），meta 章以默认 A2_A3 为代表、910_95 为 910_95 芯片变体）",
+        "why": "下降链末段与闭源 bishengir 边界，读者须知道 npubin 从哪来"
+      },
+      {
+        "symbol": "CoreType",
+        "why": "支柱③ cube/vector 双核在 IR 的接入点"
+      },
+      {
+        "symbol": "AddressSpace",
+        "why": "支柱③显式内存层级（UB/L1/L0）在 IR 的接入点"
+      },
+      {
+        "symbol": "load_dialects",
+        "why": "HIVM/annotation/scope 三方言注册，佐证树内原位增量"
+      },
+      {
+        "symbol": "init_triton_ascend",
+        "why": "C++ 侧总装点，解释 Python 侧 ascend.passes.* 的出处"
+      },
+      {
+        "symbol": "add_kernel",
+        "why": "支柱①活证据：与基座逐字同构的 @triton.jit 核"
+      }
+    ]
+  },
+  "mechanisms": [
+    {
+      "id": "m01-fork-not-plugin",
+      "name": "fork 而非插件：上游 Triton 整树在内、昇腾原位增量在 third_party/ascend/",
+      "kind": "config",
+      "source_anchors": [
+        "third_party/ascend/backend/compiler.py:L877-L886",
+        "third_party/ascend/tutorials/01-vector-add.py:L1-L3",
+        "third_party/ascend/ascend_ir.cc:L492-L499"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m02-three-stage-lowering",
+      "name": "三段结构化下降链 ttir→ttadapter→npubin（对照 GPU 五段）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "third_party/ascend/backend/compiler.py:L939-L963"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m03-gpu-vs-npu-divergence",
+      "name": "GPU 路 vs NPU 路的根本分叉：SIMT 指针张量+layout(TTGIR→PTX) vs 结构化 memref+仿射访存",
+      "kind": "dataflow",
+      "source_anchors": [
+        "third_party/ascend/backend/compiler.py:L939-L963",
+        "third_party/ascend/backend/compiler.py:L96-L164"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m04-ttir-to-linalg-pipeline",
+      "name": "triton_adapter pass 链：抛弃 tensor-of-pointers、逆向还原结构化 Linalg",
+      "kind": "dataflow",
+      "source_anchors": [
+        "third_party/ascend/backend/compiler.py:L131-L164"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m05-davinci-cube-vector",
+      "name": "达芬奇 cube/vector 双核 + 显式片上内存层级（UB/L1/L0）——一切下降的目标硬件",
+      "kind": "layout",
+      "source_anchors": [
+        "third_party/ascend/ascend_ir.cc:L420-L425",
+        "third_party/ascend/ascend_ir.cc:L412-L418"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m06-ascend-ir-cpp-binding",
+      "name": "昇腾 IR 的 C++ 侧接入：HIVM/annotation/scope 方言 + pybind 装配（init_triton_ascend）",
+      "kind": "protocol",
+      "source_anchors": [
+        "third_party/ascend/ascend_ir.cc:L492-L499",
+        "third_party/ascend/triton_ascend.cc:L361-L376"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m07-book-map",
+      "name": "全书地图：7 Part × 33 章骨架 + 原理章（ch02/ch09）徽标 + 姊妹篇对照基座",
+      "kind": "config",
+      "source_anchors": [
+        "third_party/ascend/backend/compiler.py:L939-L963",
+        "third_party/ascend/ascend_ir.cc:L420-L425"
+      ],
+      "figure_source": "instances/triton-ascend/book/cartography/outline-final.json",
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m08-vector-add-lowering-trace",
+      "name": "vector-add 端到端下降轨迹（同一核如何逐段从 TTIR 走到 NPU 二进制）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "third_party/ascend/tutorials/01-vector-add.py:L50-L87",
+        "third_party/ascend/backend/compiler.py:L939-L963"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    }
+  ],
+  "figure_requests_hint": [
+    "全书地图（book-map）：7 Part × 33 章 + 原理章徽标 + 每章 pairs 基座章号——本章必画，后续各章 Roadmap『你在这里』挂这张图",
+    "两条下降链对照图：基座 TTIR→TTGIR→LLVM→PTX→cubin vs 昇腾 TTIR→Linalg→(HFusion/HIVM/AscendC)→npubin，标出分叉点在 add_stages",
+    "达芬奇 AI Core 结构图：1 cube : 2 vector + UB/L1/L0A/L0B/L0C/GM 内存层级（meta 版，ch02 精化）",
+    "vector-add 端到端下降轨迹：同一 @triton.jit 核逐段变形（需真机跑出编译期 IR dump；host 无 NPU/CANN，能出的编译期 dump 照抓、否则标『需真机』）"
+  ],
+  "acquisition_notes": [
+    "取证环境：host 无 NPU/CANN/bishengir-compile，无法真机运行 add() 或触发端到端 npubin 编译；下降轨迹的具体 IR dump 标注『需真机』，illustrator/tester 在真机或容器补抓 kernel.ttir.mlir / kernel.ttadapter.mlir。",
+    "所有 embed_excerpts 已逐字取自 pin 源码并经 Read 核对（compiler.py / 01-vector-add.py / ascend_ir.cc / triton_ascend.cc）。",
+    "本章为 meta 概览：三支柱各只内嵌一个最小锚点，其余机制（各 pass 内部、bishengir 选项构造、HIVM/HFusion 方言）交叉引用后续 Part，不在本章展开。"
+  ],
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_payoff": [],
+    "note": "bible.py due ch01 返回空——ch01 是全书开篇 meta 章，伏笔为自顶向下设计、由后续章从大纲注入；本章职责是搭心智模型 + 铺全书地图，不背具体伏笔回收。"
+  }
+}
