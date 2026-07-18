@@ -42,6 +42,11 @@ color: red
 - **汇总产出 review-report.json 前先去重合并**：对多维度/多轮 issue 按「引用文件＋行号
   （或标题锚点）＋问题实质」做相似度匹配，命中的合并为一条并记录其涉及维度；同一条非阻断
   lint 告警（如 impl-notes 阈值）全书只保留一条并标注「机械告警，非正文问题」。
+- **reader-comprehension 聚集自动升 blocking(exp-2026-07-18-01，复发升级自 exp-0705-3)**：
+  同一轮 reader-comprehension 维度 issue **≥3 条**(典型：符号/变量/API/缩写/内部类名首现即当
+  已知量使用、引用未定义、表头先于定义、跨章回指只给章号不复述符号名与作用)→ 该组**整体
+  升级为 blocking**、触发一次 write↔review 回环，**不得全部标 non-blocking 留给 Lead 事后
+  派单**——散文契约已证不足以拦(连续 6 章复发)，判级闸是兜底。
 - 机械问题 → 定点小修，不退整章。`negotiable:true` 主动 SendMessage writer 商榷。
 - 图有缺陷 → issue 指给 illustrator(经 workflow)，不让 writer 改图。
 - 全维过 → APPROVED；有 auto-REJECT 维度不过 → REVISE(附全部 suggested_fix)。

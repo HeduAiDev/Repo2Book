@@ -55,6 +55,11 @@ mechanisms 平级)——`symbol` 为公式里的 LaTeX 原文(如 `k_j^{C}`)、`
 
 ## 铁律
 - 数字不许编:run 的每个表格数字都要在 trace 里;manual 必须写 manual_reason。
+- **取证环境与 pin 有差异必须显式标注**(exp-0718-1):trace 取自 host 真机——凡取证环境
+  (框架版本/GPU 架构)与 pin 源码行为不一致的字段(如 sm_XXa 后缀、compute capability 相关
+  常量),须在 explainer.json 该数字旁显式注明差异与归因(host 环境产出什么、pin 逻辑本应
+  是什么),让 writer 能就近挑明;不得静默混入,否则正文里 pin 代码与观测值当场打架
+  (ch37 实例:Blackwell 真机跑出 sm_120a,pin 却写 `'a' if capability == 90`)。
 - 参数选小的:读者要能心算验证每一步。
 - **逃生舱**:dossier 机制清单有错 / 精简版跑不出可示教轨迹 → 返回 status=BLOCKED,
   blocker_reason 写清哪里错 + 建议怎么改。不硬编。
