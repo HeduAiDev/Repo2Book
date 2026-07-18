@@ -296,6 +296,63 @@ const DIMS = [
   'figure-integration（先跑 lint_diagrams；然后逐张用 Read 打开 PNG 亲眼看：图在其机制讲解附近？图注给结论而非描述画面？正文数字与图上一致？图对读懂机制真有帮助？）',
   'formula-structure（公式规则+Roadmap 开场+自包含+锚点/半角，跑 lint_formulas/lint_anchors/lint_punct/lint_chapter_structure）',
 ]
+// ---- revise 分流纯函数（exp-0716-1，SDD 2026-07-18-pipeline-revise-dimension-routing）----
+// 行为真相源在 .claude/workflows/lib/revise-routing.js（node --test 锁行为+DIMS 快照），
+// 此处函数体与之逐字同步（workflow 无模块系统，只能内联）。DIMS/dimThunks/readerPrompt 未动。
+function dimShortName(dimStr) {
+  const s = String(dimStr)
+  const i = s.indexOf('（')
+  return i === -1 ? s : s.slice(0, i)
+}
+function tagDimIssues(dimResults, dims) {
+  const out = []
+  for (let idx = 0; idx < dimResults.length; idx++) {
+    const d = dimResults[idx]
+    const dIssues = (d && d.issues) || []
+    for (const i of dIssues) {
+      out.push(i && i.dimension ? i : Object.assign({}, i, { dimension: dimShortName(dims[idx]) }))
+    }
+  }
+  return out
+}
+function routeIssues(issues) {
+  const figIssues = []
+  const textIssues = []
+  const nonBlocking = []
+  for (const i of issues || []) {
+    if (!i) continue
+    if (!i.blocking) { nonBlocking.push(i); continue }
+    if (i.dimension === 'figure-integration') figIssues.push(i)
+    else textIssues.push(i)
+  }
+  return { figIssues, textIssues, nonBlocking }
+}
+function toFigRequestItems(figIssues) {
+  return (figIssues || []).map(function (i) {
+    return {
+      figure_id: i.figure_id || i.figure || '',
+      problem: i.problem || '',
+      suggested_fix: i.suggested_fix || '',
+    }
+  })
+}
+function finalReviewDecision(reverify, lastB) {
+  if (reverify && reverify.all_cleared === true) {
+    return { verdict: 'APPROVED' }
+  }
+  if (reverify) {
+    return { verdict: 'review-exhausted', issues: reverify.uncleared || [] }
+  }
+  return { verdict: 'review-exhausted', issues: lastB || [], note: '终局复验 agent 失败，按未清处理（不假通过）' }
+}
+const FINAL_VERIFY_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['all_cleared', 'uncleared'],
+  properties: {
+    all_cleared: { type: 'boolean' },
+    uncleared: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['problem', 'evidence'], properties: { problem: { type: 'string' }, evidence: { type: 'string' }, dimension: { type: 'string' } } } },
+  },
+}
+let lastBlocking = []
 let reviewRounds = 0
 for (let r = 1; r <= 3; r++) {
   reviewRounds = r
@@ -355,24 +412,86 @@ for (let r = 1; r <= 3; r++) {
   const derivationIssues = ((derivation && derivation.issues) || []).map(function (i) { return Object.assign({}, i, { dimension: 'derivation-audit' }) })
   const issues = ok.flatMap(function (d) { return d.issues || [] }).concat(readerIssues).concat(derivationIssues)
   const blocking = issues.filter(function (i) { return i.blocking })
+  // 分流用副本：4 真维度 issues 按 DIMS 顺序补 dimension 标（ok 与 DIMS 已保证等长对齐；
+  // reader/derivation 维在上面聚合处已打标）——exp-0716-1，不改 DIMS 数组本身。
+  const taggedIssues = tagDimIssues(ok, DIMS).concat(readerIssues).concat(derivationIssues)
+  lastBlocking = taggedIssues.filter(function (i) { return i.blocking })
   if (!ok.some(function (d) { return !d.pass }) && blocking.length === 0) {
     reviewV = { verdict: 'APPROVED', issues: issues }
     break
   }
-  log('review 第 ' + r + ' 轮 REVISE：' + blocking.length + ' 个阻断项，回 writer')
-  const rev = await agent(
-    head('writer') +
-    '评审 REVISE（第 ' + r + ' 轮）。用 receiving-code-review skill 逐条处理（采纳或带理由反驳），改 ' + CH + '/narrative/chapter.md：\n' +
-    JSON.stringify(issues) + '\n完成后自跑' + (PRIMER ? '五个 linter（chapter_structure/formulas/source_grounding/trace_consistency/paper_grounding --expect-primer，primer 章不跑 fidelity）' : (A.skip_impl ? '四个 linter（chapter_structure/formulas/source_grounding/trace_consistency）' : '五个 linter（chapter_structure/formulas/source_grounding/fidelity/trace_consistency）')) + '均无 BLOCKING。返回 status/note。' + ESC,
-    { schema: STATUS_SCHEMA, label: 'revise r' + r, phase: 'Review', agentType: 'general-purpose', model: MODELS.write }
-  )
+  // ---- revise 分流（exp-0716-1）：figure-integration blocking → illustrator 子回环（修图→盲审
+  // 再验证在本步内闭合，进下一轮前 PENDING 已清）；其余 blocking → writer；两轨动不同文件可并行；
+  // 图轨完成后接 writer 微任务收尾图引/图注（串在并行组之后，避免双 writer 编 narrative 竞态）。
+  const routed = routeIssues(taggedIssues)
+  const writerPayload = routed.textIssues.concat(routed.nonBlocking)
+  log('review 第 ' + r + ' 轮 REVISE：' + blocking.length + ' 个阻断项（文 ' + routed.textIssues.length + ' / 图 ' + routed.figIssues.length + '）')
+  const reviseThunks = []
+  if (routed.textIssues.length) reviseThunks.push(function () {
+    return agent(
+      head('writer') +
+      '评审 REVISE（第 ' + r + ' 轮）。用 receiving-code-review skill 逐条处理（采纳或带理由反驳），改 ' + CH + '/narrative/chapter.md：\n' +
+      JSON.stringify(writerPayload) + '\n完成后自跑' + (PRIMER ? '五个 linter（chapter_structure/formulas/source_grounding/trace_consistency/paper_grounding --expect-primer，primer 章不跑 fidelity）' : (A.skip_impl ? '四个 linter（chapter_structure/formulas/source_grounding/trace_consistency）' : '五个 linter（chapter_structure/formulas/source_grounding/fidelity/trace_consistency）')) + '均无 BLOCKING。返回 status/note。' + ESC,
+      { schema: STATUS_SCHEMA, label: 'revise r' + r, phase: 'Review', agentType: 'general-purpose', model: MODELS.write }
+    )
+  })
+  if (routed.figIssues.length) reviseThunks.push(async function () {
+    const figFix = await agent(
+      head('illustrator') +
+      '任务：修复评审 figure-integration 维的阻断项（writer 无权动图，这些只有你能修）。清单（与 figure-requests done 条目同构）：\n' +
+      JSON.stringify(toFigRequestItems(routed.figIssues)) +
+      '\n逐张强制流程：改 ' + CH + '/diagrams/ 下 gen 脚本 → 重渲染 → xmllint → rsvg-convert 出 PNG → **用 Read 打开 PNG 亲眼看** → 六项自查全真 → 更新 figure-manifest.json 对应条目（blind_review 回写 PENDING 待重盲审）。**禁止即兴加示意数字**（数字须可溯源 explainer/正文）。完成后自跑 `python3 ' + REPO + '/scripts/lint_diagram_geometry.py ' + CH + '/diagrams/*.svg` 与 `python3 ' + REPO + '/scripts/lint_diagram_scaffolding.py ' + CH + '` 无问题。返回 status/note。' + ESC,
+      { schema: STATUS_SCHEMA, label: 'revise-fig r' + r, phase: 'Review', agentType: 'general-purpose', model: MODELS.illustrate }
+    )
+    if (!figFix || figFix.status === 'BLOCKED') return { escalate: { escalated: 'review-revise-fig', stage: 'Review', round: r, reason: (figFix && figFix.blocker_reason) || 'revise-fig agent 失败（限流/崩溃）' } }
+    const figBlind2 = await agent(
+      '你是插图盲审员（revise 步内闭合的再验证——修图后 manifest 为 PENDING，进入下一轮评审前必须在此清掉）。**只准看**：本轮被修各图的 PNG（用 Read 打开）+ 对应评审 issue 清单：\n' +
+      JSON.stringify(toFigRequestItems(routed.figIssues)) +
+      '\n**禁止**看 gen_*.py、禁止看正文。逐张核对 issue 是否真被修复（图上内容/数字与 suggested_fix 相符），verdict 回填 ' + CH + '/diagrams/figure-manifest.json 的 blind_review。返回 all_pass 与 failures。',
+      { schema: BLIND_SCHEMA, label: 'revise-fig-blind r' + r, phase: 'Review', agentType: 'general-purpose', model: MODELS.blind }
+    )
+    return { blind: figBlind2 }
+  })
+  const reviseOut = await parallel(reviseThunks)
+  let oi = 0
+  let rev = null
+  if (routed.textIssues.length) { rev = reviseOut[oi]; oi++ }
+  const figOut = routed.figIssues.length ? reviseOut[oi] : null
+  if (figOut && figOut.escalate) return Object.assign({ chapter: A.chapter_id }, figOut.escalate)
   if (rev && rev.status === 'BLOCKED') return { escalated: 'review-revise', stage: 'Review', round: r, reason: rev.blocker_reason }
-  reviewV = { verdict: 'REVISE', issues: issues }
+  if (routed.figIssues.length && figOut && figOut.blind && figOut.blind.all_pass) {
+    const cap = await agent(
+      head('writer') +
+      '微任务：本轮评审的图侧阻断项已由 illustrator 修复并过盲审再验证。用 Edit 定点核对 ' + CH + '/narrative/chapter.md 中这些图的引用与图注是否需同步（图注数字/结论与新图一致；无需改动则不改）。清单：\n' +
+      JSON.stringify(toFigRequestItems(routed.figIssues)) +
+      '\n**禁其他改动。**自跑 lint_chapter_structure + lint_formulas 无 BLOCKING。返回 status/note。' + ESC,
+      { schema: STATUS_SCHEMA, label: 'revise-fig-caption r' + r, phase: 'Review', agentType: 'general-purpose', model: MODELS.write }
+    )
+    if (cap && cap.status === 'BLOCKED') return { escalated: 'review-revise', stage: 'Review', round: r, reason: cap.blocker_reason }
+  } else if (routed.figIssues.length) {
+    log('revise 图轨第 ' + r + ' 轮盲审未全过，留给下一轮评审复检')
+  }
+  reviewV = { verdict: 'REVISE', issues: taggedIssues }
 }
 
-// 评审 3 轮仍未过 → 升级 Lead（兑现"同一问题 >3 轮自动升级"承诺），不静默归档 REVISE
+// 评审 3 轮仍未过 → 先终局复验再决定升级（ch29/ch39 变体：末轮修复动作完成后必须复核**最新稿**，
+// 不许拿修复前快照判死刑——修好了也逃逸正是此前的直接机制）。复验轻量：只核上轮 blocking 清单，
+// 不开新维度全审；全清 → APPROVED 免逃逸；未清/复验崩 → review-exhausted（不假通过）。
 if (reviewV && reviewV.verdict !== 'APPROVED') {
-  return { chapter: A.chapter_id, test: testV, escalated: 'review-exhausted', stage: 'Review', issues: reviewV.issues }
+  phase('Review')
+  const reverify = await agent(
+    '你是终局复验员（轻量：只核清单、不开新维度全审）。对下面每条上轮 blocking 项，逐条对照**当前最新**文件核实是否已解决：正文 ' + CH + '/narrative/chapter.md、图 ' + CH + '/diagrams/（PNG 用 Read 打开亲眼看、manifest 的 blind_review 状态），必要时跑对应 linter（' + REPO + '/scripts/lint_*.py）。清单：\n' +
+    JSON.stringify(lastBlocking) +
+    '\n已解决=从清单去掉；未解决=进 uncleared（problem + evidence 引最新稿/最新图证据）。全部解决 → all_cleared=true。宁严勿宽：拿不准的算未解决。',
+    { schema: FINAL_VERIFY_SCHEMA, label: 'review-final-verify', phase: 'Review', agentType: 'general-purpose', model: MODELS.review }
+  )
+  const fdec = finalReviewDecision(reverify, lastBlocking)
+  if (fdec.verdict === 'APPROVED') {
+    log('终局复验：上轮阻断项已全部在最新稿解决 → APPROVED（免逃逸，exp-0716-1 ch29/ch39 变体兜底）')
+    reviewV = { verdict: 'APPROVED', issues: reviewV.issues }
+  } else {
+    return { chapter: A.chapter_id, test: testV, escalated: 'review-exhausted', stage: 'Review', issues: fdec.issues, note: fdec.note }
+  }
 }
 
 // ---------- Phase F: Map（评审收敛后产出「本章地图」，站内自检+盲审回环 ≤2 轮） ----------

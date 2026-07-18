@@ -92,3 +92,26 @@ prompt 沿用「只看 PNG+对应 spec/issue，禁看 gen 代码与正文」纪�
 - review-exhausted 中 figure-only 占比 → 0；实现后新章零「图致逃逸」。
 - ch29/ch39 型「修好了仍逃逸」→ 0（终局复验兜底）。
 - 现 6 样本模式（ch05/ch07/ch27/ch29/ch33/ch39）在后续批次零复发。
+
+---
+
+## 5. 落地记录(2026-07-18,已上线)
+
+TDD 完成:`lib/revise-routing.js`(行为真相源,函数体与 workflow 内联版逐字同步)+
+`lib/revise-routing.test.js` node --test 10 用例全绿,含 §3 用例 6 的 DIMS/readerPrompt
+**逐字节快照回归**(实测锁住:本次实现未触碰任何受保护字符串)。
+
+实现落点(chapter-pipeline.js):
+- 分流函数内联在 DIMS 之后、review 循环之前(新增代码,不改既有行);
+- 聚合处新增 `taggedIssues`(ok 按 DIMS 序打 dimension 标)与 `lastBlocking` 追踪;
+- revise 步:routeIssues → `parallel([writer?, fig-fix→fig-blind])` → fig-caption 串后
+  (labels: `revise-fig r/revise-fig-blind r/revise-fig-caption r`,全新 label);
+- 逃逸前终局复验 `review-final-verify`(FINAL_VERIFY_SCHEMA,宁严勿宽,复验崩不假通过)。
+
+**缓存代价声明(§2.3 要求)**:revise writer 的载荷从全量 issues 改为
+textIssues+nonBlocking 子集——旧 run `resumeFromRunId` 跨 revise 步会重跑该 agent
+(其余站位 prompt 未变,缓存照常命中)。上线时点=triton 书收官、无在途 chapter run,
+批次间隙条件满足。**下次发车须用 scriptPath**(workflow-byname-stale-snapshot)。
+
+验收(§4)追踪:下一本书(triton-ascend)批次观察 review-exhausted 中 figure-only
+占比与「修好了仍逃逸」是否归零,book-retro 复盘对表。
