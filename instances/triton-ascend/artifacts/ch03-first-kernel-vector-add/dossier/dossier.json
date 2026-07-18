@@ -1,0 +1,122 @@
+{
+  "kind": "skip_impl",
+  "chapter": "ch03 — 上手第一课：vector-add 与 GPU→NPU 的最小改写",
+  "premise_correction": {
+    "summary": "本章计划里的三条卖点（①device='npu'+torch_npu ②grid/tiling 按物理核改写 ncore/xblock/xblock_sub 三级 ③进阶用 compile_hint）中，只有 ① 完全成立。② 和 ③ 在 vector-add 源码里根本不存在——vector-add 的 kernel 与 grid 与基座 triton 逐字节相同，没有任何三级 tiling、没有 compile_hint。分析后认定：这不是路线错误，而是『期望 vs 现实』的教学契机——最小移植其实小到惊人（就两处），三级 tiling / 物理核绑定 / compile_hint 都是『之后才加的优化』而非『跑通所必需』。dossier 已按真实源码重构，并把 ②③ 明确登记为 forward-pointer（真实出处在 ch02 primer / tut02 / best_practice.md，绝不塞进 vector-add 谎称其存在）。writer 必须照此讲，不得杜撰 vector-add 里有三级 tiling 或 compile_hint。",
+    "fact_1_true": "third_party/ascend/tutorials/01-vector-add.py 相对基座 python/tutorials/01-vector-add.py 的全部改动：加华为版权头 + import torch_npu + device='cuda'→device='npu'（外加删去 is_cuda 断言与整段 benchmark、lambda grid 改 def grid，纯风格）。add_kernel 函数体逐字节相同。",
+    "fact_2_false": "vector-add 的 grid 是 (triton.cdiv(n_elements, BLOCK_SIZE),)，与基座完全一致——没有 ncore/xblock/xblock_sub。三级 tiling 的规范 worked example 在 ch02 引用的 docs/en/migration_guide/architecture_difference.md:97-124（triton_better_kernel, ncore=32/xblock=32768/xblock_sub=8192），迁移原则在 best_practice.md:L5-9『Tiling strategy』。物理核绑定在代码里最早出现于 tut02 fused-softmax 的 num_programs=32。",
+    "fact_3_false": "compile_hint 只在 AscendNPU-IR/docs 里（best_practice.md）出现，没有任何 tutorial 用它。tl.extra.cann.extension 在 tut03/tut06 里用的是 parallel/extract_slice/insert_slice，不是 compile_hint。tut04 里有一处真实的 NPU 特化改动（tl.where(x_keep != 0, …)），正好可作为 compile_hint(\"bitwise_mask\") 的现实引子。"
+  },
+  "code_spine": [
+    "third_party/ascend/tutorials/01-vector-add.py:L43-L47 (imports: torch + torch_npu + triton + tl)",
+    "third_party/ascend/tutorials/01-vector-add.py:L50-L75 (add_kernel: SPMD 程序体，与基座逐字节相同)",
+    "third_party/ascend/tutorials/01-vector-add.py:L82-L87 (add: host 侧 launch，grid=cdiv)",
+    "third_party/ascend/tutorials/01-vector-add.py:L92-L101 (module 级 driver：device='npu' + 与 torch 对拍)",
+    "third_party/ascend/unittest/pytest_ut/test_01_vector_add.py:L80-L87 (test_vector_addition：取证锚，assert_close)",
+    "third_party/ascend/tutorials/04-low-memory-dropout.py:L38-L57 (_dropout：第二标本，含唯一 NPU 特化改动 x_keep != 0)",
+    "third_party/ascend/AscendNPU-IR/docs/source/en/user_guide/best_practice.md:L626,L634-L635 (compile_hint bitwise_mask：进阶 forward-pointer，非 vector-add 内容)"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "third_party/ascend/tutorials/01-vector-add.py",
+      "lines": "L43-L47",
+      "code": "import torch\nimport torch_npu\n\nimport triton\nimport triton.language as tl",
+      "elide": [],
+      "note": "最小改写第一处：多出 `import torch_npu` 这一行——基座只有 `import torch`。这一行是让 device='npu' 生效的前提。"
+    },
+    {
+      "path": "third_party/ascend/tutorials/01-vector-add.py",
+      "lines": "L50-L75",
+      "code": "@triton.jit\ndef add_kernel(x_ptr,  # *Pointer* to first input vector.\n               y_ptr,  # *Pointer* to second input vector.\n               output_ptr,  # *Pointer* to output vector.\n               n_elements,  # Size of the vector.\n               BLOCK_SIZE: tl.constexpr,  # Number of elements each program should process.\n               # NOTE: `constexpr` so it can be used as a shape value.\n               ):\n    # There are multiple 'programs' processing different data. We identify which program\n    # we are here:\n    pid = tl.program_id(axis=0)  # We use a 1D launch grid so axis is 0.\n    # This program will process inputs that are offset from the initial data.\n    # For instance, if you had a vector of length 256 and block_size of 64, the programs\n    # would each access the elements [0:64, 64:128, 128:192, 192:256].\n    # Note that offsets is a list of pointers:\n    block_start = pid * BLOCK_SIZE\n    offsets = block_start + tl.arange(0, BLOCK_SIZE)\n    # Create a mask to guard memory operations against out-of-bounds accesses.\n    mask = offsets < n_elements\n    # Load x and y from DRAM, masking out any extra elements in case the input is not a\n    # multiple of the block size.\n    x = tl.load(x_ptr + offsets, mask=mask)\n    y = tl.load(y_ptr + offsets, mask=mask)\n    output = x + y\n    # Write x + y back to DRAM.\n    tl.store(output_ptr + offsets, output, mask=mask)",
+      "elide": [],
+      "note": "关键事实：这 26 行相对基座 python/tutorials/01-vector-add.py 的 add_kernel 逐字节相同（连注释都一样）。SPMD 编程模型（program_id → block_start → offsets → mask → load/compute/store）在 GPU 与 NPU 上写法完全一致——这正是本章的头条结论：Triton 的抽象是可移植的，kernel 本体一个字都不用改。"
+    },
+    {
+      "path": "third_party/ascend/tutorials/01-vector-add.py",
+      "lines": "L82-L87",
+      "code": "def add(x: torch.Tensor, y: torch.Tensor):\n    output = torch.empty_like(x)\n    n_elements = output.numel()\n    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )\n    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)\n    return output",
+      "elide": [],
+      "note": "host 侧 launch。grid=(triton.cdiv(n_elements, BLOCK_SIZE),) 与基座一模一样——没有按物理核收缩逻辑 grid（对照 ch02『grid 强绑物理核』的期望，这里是反例：最小移植不做这件事）。基座此处多两行 `# We need to preallocate` 注释与 `assert x.is_cuda and y.is_cuda and output.is_cuda`，ascend 版删掉了 is_cuda 断言（因为张量在 npu 上）。"
+    },
+    {
+      "path": "third_party/ascend/tutorials/01-vector-add.py",
+      "lines": "L92-L101",
+      "code": "torch.manual_seed(0)\nsize = 98432\nx = torch.rand(size, device='npu')\ny = torch.rand(size, device='npu')\noutput_torch = x + y\noutput_triton = add(x, y)\nprint(output_torch)\nprint(output_triton)\nprint(f'The maximum difference between torch and triton is '\n      f'{torch.max(torch.abs(output_torch - output_triton))}')",
+      "elide": [],
+      "note": "最小改写第二处：device='cuda'→device='npu'（两处，x 与 y）。size=98432 不是 1024 的整数倍（98432/1024=96.125），所以最后一个 block 必被 mask 截断——正好演示 mask 的必要性。与 torch 逐元素对拍是『跑通看数值』的交叉验证。"
+    },
+    {
+      "path": "third_party/ascend/unittest/pytest_ut/test_01_vector_add.py",
+      "lines": "L80-L87",
+      "code": "def test_vector_addition():\n    torch.manual_seed(0)\n    size = 98432\n    x = torch.rand(size, device='npu')\n    y = torch.rand(size, device='npu')\n    output_torch = x + y\n    output_triton = add(x, y)\n    torch.testing.assert_close(output_triton, output_torch)",
+      "elide": [],
+      "note": "取证锚（测试即真相源）。pytest 版把 tutorial 的 print 对拍换成 torch.testing.assert_close 硬断言：triton 结果必须与 torch 参考在容差内相等。host 无 NPU/CANN 时无法真跑（需真机），但控制流照读——它权威地定义了『正确』=与 torch 对齐。"
+    },
+    {
+      "path": "third_party/ascend/tutorials/04-low-memory-dropout.py",
+      "lines": "L38-L57",
+      "code": "@triton.jit\ndef _dropout(\n    x_ptr,  # pointer to the input\n    x_keep_ptr,  # pointer to a mask of 0s and 1s\n    output_ptr,  # pointer to the output\n    n_elements,  # number of elements in the `x` tensor\n    p,  # probability that an element of `x` is changed to zero\n    BLOCK_SIZE: tl.constexpr,\n):\n    pid = tl.program_id(axis=0)\n    block_start = pid * BLOCK_SIZE\n    offsets = block_start + tl.arange(0, BLOCK_SIZE)\n    mask = offsets < n_elements\n    # Load data\n    x = tl.load(x_ptr + offsets, mask=mask)\n    x_keep = tl.load(x_keep_ptr + offsets, mask=mask)\n    # The line below is the crucial part, described in the paragraph above!\n    output = tl.where(x_keep != 0, x / (1 - p), 0.0)\n    # Write-back output\n    tl.store(output_ptr + offsets, output, mask=mask)",
+      "elide": [],
+      "note": "第二标本，同样的 pid/offsets/mask/load/store 骨架。唯一有实质意义的 NPU 特化改动在 L55：基座 triton 写 `tl.where(x_keep, …)`，ascend 版改成 `tl.where(x_keep != 0, …)`——把布尔条件写显式。根因见 best_practice.md:L626：Ascend 上布尔(i1) 张量在 GM 里按 i8 存，直接当条件用会触发 i1↔i8 反复转换；写成 `!= 0` 让语义明确。这是通往 compile_hint(\"bitwise_mask\") 的现实引子。"
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/docs/source/en/user_guide/best_practice.md",
+      "lines": "L634-L635",
+      "code": "mask = tl.where(cond, value1, value2)\ntl.compile_hint(cond, \"bitwise_mask\")",
+      "elide": [],
+      "note": "进阶 forward-pointer，非 vector-add 内容——出自文档 best_practice.md『Use bitwise_mask for mask memory』。它教你在 tl.where 的条件上加 compile_hint 让编译器按 bitmask 处理、免去 i1↔i8 转换开销。triton-adaptor 3.4.0 起接口改为 tl.extra.cann.extension.compile_hint(cond, \"bitwise_mask\")（best_practice.md:L642）。本章只作一句话预告：『跑通之后想调优，才会碰到 compile_hint』——具体展开留给后续章节。"
+    }
+  ],
+  "key_classes": [
+    {"name": "add_kernel", "file": "third_party/ascend/tutorials/01-vector-add.py", "responsibility": "@triton.jit device kernel：一个 program 处理一个 BLOCK_SIZE 大小的分块，load-加-store。与基座 triton 逐字节相同。"},
+    {"name": "add", "file": "third_party/ascend/tutorials/01-vector-add.py", "responsibility": "host 侧包装：分配输出、算 grid=cdiv、以 add_kernel[grid](…) 语法 launch。"},
+    {"name": "test_vector_addition", "file": "third_party/ascend/unittest/pytest_ut/test_01_vector_add.py", "responsibility": "取证锚：device='npu' 造数据，torch.testing.assert_close 断言 triton 与 torch 对齐——权威定义『正确』。"},
+    {"name": "_dropout", "file": "third_party/ascend/tutorials/04-low-memory-dropout.py", "responsibility": "第二标本 kernel：同骨架；唯一 NPU 特化改动 tl.where(x_keep != 0, …)（布尔条件显式化）。"}
+  ],
+  "data_flow": [
+    "import torch_npu（L44）→ 向 PyTorch 注册 Ascend NPU 设备后端，使 'npu' 成为合法 device 字符串；缺这一行 device='npu' 直接报错。",
+    "torch.rand(size, device='npu')（L94-95）→ 在 NPU 全局内存(GM)上分配并填充 x/y。",
+    "add(x, y)（L82）→ torch.empty_like 分配 output；n_elements=numel()。",
+    "grid = cdiv(n_elements, BLOCK_SIZE)（L85）→ 98432/1024 向上取整 = 97 个逻辑 program（与基座算法相同，未按物理核收缩）。",
+    "add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)（L86）→ 索引语法把 jit 函数变成可 launch 的 kernel，张量隐式转成首元素指针。",
+    "kernel 内：pid=program_id(0) → block_start=pid*BLOCK_SIZE → offsets=block_start+arange(0,BLOCK_SIZE) → mask=offsets<n_elements → x=load, y=load → output=x+y → store（L60-75）。第 97 个 program 的尾部越界元素被 mask 挡掉。",
+    "对拍：output_triton 与 output_torch 逐元素比较（tutorial 用 print max diff；pytest 用 assert_close）。"
+  ],
+  "design_decisions": [
+    {"decision": "GPU→NPU 最小移植只改两处：加 `import torch_npu`、把 device 字符串 'cuda'→'npu'。", "why": "Triton 的 @triton.jit kernel 是硬件无关的中间表达，后端(编译到 NPU vs PTX)由框架承担；kernel 本体因此逐字节可移植。torch_npu 的 import 负责把 NPU 注册为 PyTorch 设备后端，device='npu' 才能解析。", "evidence": "third_party/ascend/tutorials/01-vector-add.py:L44,L94-L95；add_kernel L50-L75 与基座 python/tutorials/01-vector-add.py 同名函数逐字节相同（diff 仅版权头/import/device/benchmark）。"},
+    {"decision": "vector-add 的逻辑 grid 保持 cdiv、不按物理核收缩。", "why": "最小移植追求『跑通』，不追求『跑快』。ch02 讲的达芬奇『grid 强绑物理核 + 三级 tiling(ncore/xblock/xblock_sub)』是移植后的优化步骤，不是跑通的前置条件。把逻辑核数收缩到接近物理核数(减少 launch/调度开销) 是 best_practice.md『Tiling strategy』教的下一步；代码里最早的实例是 tut02 fused-softmax 的 num_programs=32。", "evidence": "third_party/ascend/tutorials/01-vector-add.py:L85（grid=cdiv，与基座同）；third_party/ascend/AscendNPU-IR/docs/source/en/user_guide/best_practice.md:L5-L9；third_party/ascend/tutorials/02-fused-softmax.py:L92-L101（num_programs=32）。"},
+    {"decision": "dropout kernel 把 `tl.where(x_keep, …)` 改成 `tl.where(x_keep != 0, …)`。", "why": "Ascend 上布尔(i1) 张量在 GM 里以 i8(1 字节) 存；把 i8 掩码直接当条件会触发 i1↔i8 反复转换。写成 `!= 0` 把布尔语义显式化，是 NPU 上少数需要动 kernel 逻辑的地方之一，也是 compile_hint(\"bitwise_mask\") 优化的引子。", "evidence": "third_party/ascend/tutorials/04-low-memory-dropout.py:L55（对照基座 python/tutorials/04-low-memory-dropout.py 同行写 `tl.where(x_keep, …)`）；best_practice.md:L626。"},
+    {"decision": "测试用 torch.testing.assert_close 对拍 torch 参考，而非人工看数。", "why": "『测试即真相源』：把『正确』钉成一个可执行断言(triton==torch 在容差内)，去掉人眼判断的模糊。size=98432 特意取非 BLOCK_SIZE 整数倍，顺带覆盖 mask 尾块路径。", "evidence": "third_party/ascend/unittest/pytest_ut/test_01_vector_add.py:L80-L87。"}
+  ],
+  "theory": [
+    "grid 算术 worked example：n_elements=98432, BLOCK_SIZE=1024 → grid = ceil(98432/1024) = 97 个 program。前 96 个各处理满 1024 元素(0..98304)，第 97 个(pid=96) 处理 offsets 96*1024..96*1024+1023 = 98304..99327，但 n_elements=98432，故 offsets>=98432 的 (99327-98432+1)=896 个位置被 mask=offsets<n_elements 置假，load/store 跳过——这是 mask 存在的唯一理由。",
+    "复杂度：vector-add 是 memory-bound 的 O(n) 逐元素算子，每元素 2 读 1 写、1 次加法；无跨 program 依赖，纯 embarrassingly parallel。因此它是『最小标本』：没有 reduction、没有跨核同步、没有 tiling 压力，把 GPU→NPU 的移植面缩到最小，便于孤立观察『改哪两处』。",
+    "逻辑核 vs 物理核（ch02 回指）：本例 launch 97 个逻辑 program，而达芬奇物理 AI Core 数量固定(如 32)。GPU 习惯『逻辑核远多于物理核、靠硬件调度』；NPU 上逻辑核过多会放大 launch/调度开销，故优化时要把 grid 收缩到接近物理核数(tut02 的 num_programs=32 即此)。vector-add 不做这步——留给读者感知『期望(ch02) vs 现实(最小移植)』的落差。"
+  ],
+  "subtraction_plan": {
+    "delete": [],
+    "must_keep": [
+      {"symbol": "torch_npu", "why": "最小移植第一处改动的主角——注册 NPU 设备后端，writer 必须点明缺它则 device='npu' 报错。"},
+      {"symbol": "add_kernel", "why": "核心标本函数，全章围绕它讲 SPMD 模型可移植。"},
+      {"symbol": "tl.program_id", "why": "SPMD『我是第几个 program』的入口，读者须理解。"},
+      {"symbol": "BLOCK_SIZE", "why": "constexpr 分块大小，grid 与 offsets 都依赖它；worked example 的核心参数。"},
+      {"symbol": "tl.arange", "why": "构造块内偏移向量 offsets 的算子。"},
+      {"symbol": "mask", "why": "越界保护；size 非整数倍时的正确性关键，worked example 主角。"},
+      {"symbol": "tl.load", "why": "带 mask 的 GM→片上 加载，读者须懂 mask 参数。"},
+      {"symbol": "tl.store", "why": "带 mask 的写回。"},
+      {"symbol": "triton.cdiv", "why": "grid 大小 = 向上取整除；worked example 97 的来源。"},
+      {"symbol": "tl.where", "why": "dropout 标本里 NPU 特化改动(x_keep != 0) 的载体。"},
+      {"symbol": "torch.testing.assert_close", "why": "取证锚断言，定义『正确』。"}
+    ]
+  },
+  "mechanisms": [
+    {"id": "m1-minimal-rewrite", "name": "GPU→NPU 最小改写(两处：import torch_npu + device='npu')", "kind": "config", "source_anchors": ["third_party/ascend/tutorials/01-vector-add.py:L44", "third_party/ascend/tutorials/01-vector-add.py:L94-L95", "third_party/ascend/tutorials/01-vector-add.py:L50-L75"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m2-torch-npu-registration", "name": "import torch_npu 注册 NPU 设备后端", "kind": "config", "source_anchors": ["third_party/ascend/tutorials/01-vector-add.py:L44", "third_party/ascend/tutorials/01-vector-add.py:L94-L95"], "needs_figure": false, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m3-block-mask-arithmetic", "name": "分块+掩码算术(pid→offsets→mask, grid=cdiv)", "kind": "algorithm", "source_anchors": ["third_party/ascend/tutorials/01-vector-add.py:L60-L75", "third_party/ascend/tutorials/01-vector-add.py:L85"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m4-logical-vs-physical-grid", "name": "逻辑 grid vs 物理核：vector-add 不做物理核收缩(ch02 期望的反例/forward-pointer)", "kind": "config", "source_anchors": ["third_party/ascend/tutorials/01-vector-add.py:L85", "third_party/ascend/tutorials/02-fused-softmax.py:L92-L101", "third_party/ascend/AscendNPU-IR/docs/source/en/user_guide/best_practice.md:L5-L9"], "needs_figure": false, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m5-npu-mask-boolean-semantics", "name": "NPU 布尔掩码语义(tl.where(x_keep != 0) 与 compile_hint bitwise_mask 引子)", "kind": "config", "source_anchors": ["third_party/ascend/tutorials/04-low-memory-dropout.py:L55", "third_party/ascend/AscendNPU-IR/docs/source/en/user_guide/best_practice.md:L626", "third_party/ascend/AscendNPU-IR/docs/source/en/user_guide/best_practice.md:L634-L635"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m6-test-as-truth", "name": "测试即真相源(assert_close 对拍 torch)", "kind": "protocol", "source_anchors": ["third_party/ascend/unittest/pytest_ut/test_01_vector_add.py:L80-L87"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m7-extension-hooks-preview", "name": "进阶扩展钩子预告(tl.extra.cann.extension: compile_hint/parallel/extract_slice——非 vector-add)", "kind": "config", "source_anchors": ["third_party/ascend/AscendNPU-IR/docs/source/en/user_guide/best_practice.md:L642", "third_party/ascend/tutorials/03-matrix-multiplication.py:L133-L134", "third_party/ascend/tutorials/06-fused-attention.py:L129-L135"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"}
+  ],
+  "foreshadow_due": {"埋": [], "回收": [], "note": "bible.py due ch03 返回空——本章无伏笔（与任务说明一致）。"}
+}
