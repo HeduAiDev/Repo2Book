@@ -386,7 +386,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   %p = ttg.convert_layout %p_mma : tensor<128x64xf16, #mma> -> tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>>
 ```
 
-第三步里那条裸的 `tt.dot -> tensor<128x64xf32>`，现在结果类型变成了 `tensor<128x64xf32, #mma>`，两个操作数戴上了 `#ttg.dot_op<{parent = #mma}>`（其中 `kWidth = 2` 是每个操作数每次打包读取的元素宽度，也是这个 `dot_op` 布局携带的信息之一，这里不展开）。还多了一个第三步没有的算子——`ttg.convert_layout`：它把 `p`（第一个 dot 出来是 `#mma` 布局）显式转成 `dot_op` 布局，好喂给第二个 dot（P·V）。**这个 `convert_layout` 不是免费的，它是布局之间的真实数据搬运**，第 V 部分整章在讲怎么少插它。
+第三步里那条裸的 `tt.dot -> tensor<128x64xf32>`，现在结果类型变成了 `tensor<128x64xf32, #mma>`，两个操作数戴上了 `#ttg.dot_op<{parent = #mma}>`（其中 `kWidth = 2` 是每个操作数每次打包读取的元素宽度，也是这个 `dot_op` 布局携带的信息之一，这里不展开）。还多了一个第三步没有的算子——`ttg.convert_layout`：它把 `p`（第一个 dot 出来是 `#mma` 布局）显式转成 `dot_op` 布局，好喂给第二个 dot（P·V）。**这个 `convert_layout` 不是免费的，它是布局之间的真实数据搬运**，[第 28 章](../../ch28-accelerate-matmul-layout-opt/narrative/chapter.md)整章在讲怎么少插它。
 
 ![convert_to_ttgpuir 派生三种布局：#blocked 管访存、#mma 是 Tensor Core 布局、#shared 带 swizzle；tt.dot 操作数戴上 dot_op<parent=#mma>，P 经 ttg.convert_layout 转布局再喂第二个 dot](../diagrams/fig-m4-three-layouts.png)
 

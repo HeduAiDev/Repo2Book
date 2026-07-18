@@ -364,7 +364,7 @@ else {
 
 ## §5 归约降级：warp 内蝶形树，快在不碰共享内存
 
-**直觉。** 一个 warp 里 32 个车道要把各自的值求和，像 32 个人围成一圈玩「击鼓传花对折版」：每一轮所有人同时和「对折位置」的邻居交换手里的数并相加，能覆盖的人数每轮翻倍；`log₂32 = 5` 轮之后，每个人手里都是全场总和。全程不碰共享内存，只用 warp shuffle（车道间直接交换寄存器值的原语，机制见[第 34 章](../../ch34-shared-memory-lowering-vectorization/narrative/chapter.md)）。`tt.reduce` 的语言表面在[第 8 章](../../ch08-dot-reduce-scan/narrative/chapter.md)讲过，这里讲它怎么降到 shuffle。
+**直觉。** 一个 warp 里 32 个车道要把各自的值求和，像 32 个人围成一圈玩「击鼓传花对折版」：每一轮所有人同时和「对折位置」的邻居交换手里的数并相加，能覆盖的人数每轮翻倍；`log₂32 = 5` 轮之后，每个人手里都是全场总和。全程不碰共享内存，只用 warp shuffle（车道间直接交换寄存器值的原语，机制见[第 33 章](../../ch33-type-collapse-convertlayout-paths/narrative/chapter.md)）。`tt.reduce` 的语言表面在[第 8 章](../../ch08-dot-reduce-scan/narrative/chapter.md)讲过，这里讲它怎么降到 shuffle。
 
 ![warp 内 32 车道蝶形归约 5 步（N=16,8,4,2,1），每步 shuffleXor 取对折邻居 combine，lane0 累积和 16→48→112→240→496，覆盖车道数每步翻倍](../diagrams/fig-reduce-butterfly.png)
 

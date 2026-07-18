@@ -456,7 +456,7 @@ def add_kernel(x_ptr,  # *Pointer* to first input vector.
 
 这一屏正好把 SPMD（单程序多数据）分块模型的最小要素凑齐：`tl.program_id`（当前 program 的编号，回指[第 3 章鸟瞰](../../ch03-kernel-life-birdseye/narrative/chapter.md)讲的分块）、`BLOCK_SIZE`（`constexpr` 分块尺寸，编译期常量、能当形状用）、`tl.arange` 生成块内偏移、`mask` 挡越界、`tl.load`/`tl.store` 完成一次「读—加—写」。这是阶梯的第一级，也是往后每一级都要复用的地基。
 
-顺着往上：`02-fused-softmax` 引入融合与归约，`03-matmul` 上 block matmul 和 L2 swizzle 调度（对应[第 27 章](../../ch27-tensor-core-mma-layout/narrative/chapter.md)和[第 28 章](../../ch28-accelerate-matmul-layout-opt/narrative/chapter.md)的 MMA），`04-dropout` 引入并行 RNG，`05-layer-norm` 上反向与并行归约。到第六级 `06-fused-attention`，前面攒的 dot / reduce / block-ptr 全用上了——它是 FlashAttention v2 的 Triton 实现：
+顺着往上：`02-fused-softmax` 引入融合与归约，`03-matmul` 上 block matmul（对应[第 27 章](../../ch27-tensor-core-mma-layout/narrative/chapter.md)和[第 28 章](../../ch28-accelerate-matmul-layout-opt/narrative/chapter.md)的 MMA）和 L2 swizzle 调度（按 `GROUP_SIZE_M` 把 program-id 重排成分组蛇形、提升 L2 命中——教程自带的调度手法，本书未单列章），`04-dropout` 引入并行 RNG，`05-layer-norm` 上反向与并行归约。到第六级 `06-fused-attention`，前面攒的 dot / reduce / block-ptr 全用上了——它是 FlashAttention v2 的 Triton 实现：
 
 ```python
 # python/tutorials/06-fused-attention.py:L1-L14

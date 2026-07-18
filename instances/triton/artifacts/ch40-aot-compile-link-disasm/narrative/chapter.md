@@ -12,7 +12,7 @@
 
 只想把核脱离 Python 部署，读 §1–§7（compile 与 link）；只想学会读 SASS、看懂 profiler 里那串控制码，直接跳 §8；想顺着「编出来 → 链起来 → 读懂它」全程走，就从 §1 开始。
 
-本章不重讲两件已经讲过的事：特化（specialization）机制本身——`AttrsDescriptor`、`equal_to_1`、`divisibility_16` 这套怎么从参数值推断，见 [编译驱动主循环那章](../../ch14-compile-driver-loop/narrative/chapter.md)；以及 ptxas 怎么把 PTX 汇编成 cubin，见 [从 PTX 到 cubin 那章](../../ch37-ptx-cubin-launch/narrative/chapter.md)。本章站在它们的下游：AOT 是把前者的特化**钉到命令行**，读 SASS 是往后者的 cubin **再下一层**看结果。
+本章不重讲两件已经讲过的事：特化（specialization）机制本身——`AttrsDescriptor`、`equal_to_1`、`divisibility_16` 这套怎么从参数值推断，见 [JITFunction 与缓存键那章](../../ch10-jitfunction-and-cache-keys/narrative/chapter.md)；以及 ptxas 怎么把 PTX 汇编成 cubin，见 [从 PTX 到 cubin 那章](../../ch37-ptx-cubin-launch/narrative/chapter.md)。本章站在它们的下游：AOT 是把前者的特化**钉到命令行**，读 SASS 是往后者的 cubin **再下一层**看结果。
 
 ![本章地图：命令行唯一入口 compile.py 报关铸壳，产物分头喂给 link.py 暗号分派与 disasm.py 读懂 SASS 两条互相独立的真实数据流，十节各钉一处源码剖面](../diagrams/chapter-map.png)
 
@@ -402,7 +402,7 @@ class HeaderParser:
 
 ## §6 交通警察：运行期整除性分派链
 
-**直觉**。同一个核可能编了好几份特化版——有的假设 `N` 能被 16 整除、跑得更快，有的不假设、通用但慢些。运行期到底调哪份？`link.py` 生成一段 C 的 `if` 链当**交通警察**：先试约束最强（最特化）的那份，它的条件（`N%16==0`）成立就走它；不成立退而求其次；全不中就报错。**这正是 JIT 期那个从参数真实值推断 hints 的函数——`compute_spec_key`（第 14 章讲过）——的 C 化身**：JIT 期它在运行时算出「这个 `N` 对齐了 16」这把选实现的钥匙，AOT 期同一件事被提前编成了这段运行期 C 代码。
+**直觉**。同一个核可能编了好几份特化版——有的假设 `N` 能被 16 整除、跑得更快，有的不假设、通用但慢些。运行期到底调哪份？`link.py` 生成一段 C 的 `if` 链当**交通警察**：先试约束最强（最特化）的那份，它的条件（`N%16==0`）成立就走它；不成立退而求其次；全不中就报错。**这正是 JIT 期那个从参数真实值推断 hints 的函数——`compute_spec_key`（[第 10 章](../../ch10-jitfunction-and-cache-keys/narrative/chapter.md)讲过）——的 C 化身**：JIT 期它在运行时算出「这个 `N` 对齐了 16」这把选实现的钥匙，AOT 期同一件事被提前编成了这段运行期 C 代码。
 
 ![整除性分派链：运行期 N 先试最特化的 N%16==0 分支（调 012d），退而 if(1) 恒真兜底（调 012），皆不中返回 CUDA_ERROR_INVALID_VALUE](../diagrams/fig-m6-dispatch-chain.png)
 
