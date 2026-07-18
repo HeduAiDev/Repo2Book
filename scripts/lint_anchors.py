@@ -12,6 +12,7 @@ GitHub slug 规则(近似): 小写 → 去掉非「字母/数字/CJK/下划线/�
 import re
 import sys
 import glob
+import json
 import pathlib
 import instance
 
@@ -110,12 +111,20 @@ def check_stale_section_prefix(chapter_dir: str, all_chapter_nums: set):
     —— 视为交错重编号(chapter interleave/renumber)后遗留的旧节号，提示人核。
 
     跳过标题行/代码围栏内/图片行，避免误伤代码字面量或图注。
-    primer 原理章(目录名含 -primer-)整章豁免：其 §N.M 几乎全指论文自身章节
-    (合法引用，由 lint_paper_grounding 管辖)，非交错残留。
+    primer 原理章整章豁免(目录名含 -primer-，或 dossier.json 顶层 kind=="primer"——
+    ch27 这类未按 -primer- 命名的 primer 章靠后者覆盖)：其 §N.M 几乎全指论文/本章
+    自身章节(合法引用，由 lint_paper_grounding 管辖)，非交错残留。
     """
     p = pathlib.Path(chapter_dir)
     if "-primer-" in p.name:
         return []
+    dossier = p / "dossier" / "dossier.json"
+    if dossier.is_file():
+        try:
+            if json.loads(dossier.read_text(encoding="utf-8")).get("kind") == "primer":
+                return []
+        except (json.JSONDecodeError, OSError):
+            pass
     md = p / "narrative" / "chapter.md"
     if not md.is_file():
         return []
