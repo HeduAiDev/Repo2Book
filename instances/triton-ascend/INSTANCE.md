@@ -45,5 +45,22 @@
   仿射 tiled dataflow），bishengir 部分闭源（边界≈基座的 ptxas）。
 - ✅ **大纲已获用户审批（2026-07-18「同意」）**：33 章 / 7 Part（outline-final.json）+ ARCHITECTURE.md，
   开始逐章发车。roadmap.py 生成器已建并验（7 Part 窄长条 5.17:1，4 调用/几何/Read-PNG 通过）。
-- 🚗 **施工中**：ch01 鸟瞰先行（skip_impl/meta，含 book-map 详细全书地图）→ 逐 Part 推进。
+- 🚗 **施工中（2026-07-20 状态）**：ch01/ch02/ch03/ch04/ch05 已定稿提交；ch06 在跑；
+  ch07 无正文（早前 test-exhausted 逃生舱，需重发）；ch08-ch33 未开工。
   发车须 scriptPath（workflow-byname-stale-snapshot）+ 显式 instance:"triton-ascend"（护栏）。
+
+## 本书已踩过的坑（发车/写作前先看这条）
+
+- **地址空间「有几级」是本书最容易数错的数**（ch05 连错三轮，exp-2026-07-20-04）：
+  `.td`（HIVMAttrs.td:L188-L194）定义 **7** 级，但 `ascend_ir.cc:L412-L418` 的 `py::enum_`
+  **只 `.value()` 导出 5 级**（L1/UB/L0A/L0B/L0C）——**Zero 与 GM 不进 Python**。
+  语言层能写出哪些门牌号，取决于那几行 `.value()`，不取决于 `.td`。
+  ⇒ **凡断言「共 N 个 / N 级」，必须追到最窄的那一层**（pybind `.value()` / `__all__` / 注册表白名单），
+  不能停在「整体反射 / 遍历 `__dict__`」这类措辞上。
+- **写不出 `space=GM` 的 buffer**：GM↔UB 那一跳不由门牌号表达，走 ch02 的显式搬运与 ch06 的
+  索引搬运算子（后者吃的是基座 Triton 的**裸指针**，不是 buffer）。禁写「GM 是 address_space 之一」。
+- **精简版替身也会编码错模型**：ch05 的 conftest 曾照 `.td` 造出 7 个假枚举成员，测试遂「自洽地通过」。
+  替身的成员清单必须对齐**真正的绑定导出**，并优先写**反向断言**（某名字不存在）——那才是承重的。
+- **linter 批量扫要用退出码**，别 grep 输出里的 `BLOCKING`：`🟢 仅警告（无 BLOCKING）` 会被误判成红。
+- 跨实例 linter 已修（exp-2026-07-20-03）：显式传章节路径时按路径定实例，**不必**再带
+  `REPO2BOOK_INSTANCE=triton-ascend`。
