@@ -317,7 +317,7 @@ def run_busy_loop(self):
 | 输出回送 | `step()` 的 ZMQ 响应直接拿 | 背景 `output_handler` 多路复用回各队列 |
 | 适合场景 | 离线批量、吞吐 | 在线服务、低延迟高并发 |
 
-同一个 `EngineCore.step`，离线由你的线程一拍拍敲，服务由子进程自己一拍拍转。心跳一样，握把不同。离线面的全部细节在 [第 35 章](../../ch35-entrypoints/narrative/chapter.md)，服务面在 [第 36 章](../../ch36-entrypoints/narrative/chapter.md)。
+同一个 `EngineCore.step`，离线由你的线程一拍拍敲，服务由子进程自己一拍拍转。心跳一样，握把不同。离线面的全部细节在 [第 37 章](../../ch37-entrypoints/narrative/chapter.md)，服务面在 [第 38 章](../../ch38-entrypoints/narrative/chapter.md)。
 
 ## 1.4 配置是怎么搭起来的
 

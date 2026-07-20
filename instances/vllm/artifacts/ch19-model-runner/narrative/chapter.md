@@ -70,7 +70,7 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
 ```
 
-十个字段里两个字面上不好猜的：`ec_connector_output`（`ECConnectorOutput`）是多模态编码器缓存连接器这一拍的产出记账，本章不展开；`self.kv_connector_output`（前面第一段代码里单独挂在 `self` 上、没塞进这个 `NamedTuple`）则是 P/D 分离场景下 KV 传输连接器的产出，细节见 [第 34 章](../../ch34-pd-disaggregation/narrative/chapter.md)。两者本章都只管原样透传。
+十个字段里两个字面上不好猜的：`ec_connector_output`（`ECConnectorOutput`）是多模态编码器缓存连接器这一拍的产出记账，本章不展开；`self.kv_connector_output`（前面第一段代码里单独挂在 `self` 上、没塞进这个 `NamedTuple`）则是 P/D 分离场景下 KV 传输连接器的产出，细节见 [第 36 章](../../ch36-pd-disaggregation/narrative/chapter.md)。两者本章都只管原样透传。
 
 注释里 `Ephemeral`（短命）这个词点出了它的本质：它只在 `execute_model()` 和 `sample_tokens()` 之间活一瞬，采样一做完就被丢弃。它住在一个**单槽**字段里：
 

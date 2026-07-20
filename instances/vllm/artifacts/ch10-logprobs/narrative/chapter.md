@@ -243,7 +243,7 @@ def convert_ids_list_to_tokens(
 \mathrm{cumulative\_logprob} = \sum_{t} \log P(x_t \mid x_{<t})
 ```
 
-人话翻译：把每一步"模型确实吐出的那个词"的对数概率加起来，得到整句话的打分。越接近 0，模型对这句话越有把握；越负，越是勉强生成的。这个值后面随 `CompletionOutput` 一起返回，可用于 beam search（用同一份累计对数概率给多条候选序列打分排序，完整 API 见 [第 36 章](../../ch36-entrypoints/narrative/chapter.md)）或序列重排。prompt 路不碰它——prompt 不是模型生成的，累计它没意义。
+人话翻译：把每一步"模型确实吐出的那个词"的对数概率加起来，得到整句话的打分。越接近 0，模型对这句话越有把握；越负，越是勉强生成的。这个值后面随 `CompletionOutput` 一起返回，可用于 beam search（用同一份累计对数概率给多条候选序列打分排序，完整 API 见 [第 38 章](../../ch38-entrypoints/narrative/chapter.md)）或序列重排。prompt 路不碰它——prompt 不是模型生成的，累计它没意义。
 
 **写入**。最后 `append_logprobs_for_next_position` 把这一位置的所有候选写进容器，§10.6 拆它。
 

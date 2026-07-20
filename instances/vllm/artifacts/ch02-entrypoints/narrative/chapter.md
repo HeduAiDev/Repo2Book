@@ -62,7 +62,7 @@ generator = self.engine_client.generate(
 )
 ```
 
-注意 `engine_input` 这个名字——它是**已经渲染好**的引擎输入。从一堆聊天消息（`messages`）到这个 `engine_input`，中间隔着一层 chat template 套用 + 分词的「渲染」工序。这层渲染本身是一个专题，本章不展开，细节见 [第 36 章](../../ch36-entrypoints/narrative/chapter.md)；你只要知道：HTTP 请求走到这一行时，消息已经变成了引擎认得的输入，接下来 `engine_client.generate(...)` 拿到的是一个异步生成器，后面 `async for` 它、把每一片吐成 SSE 回客户端。
+注意 `engine_input` 这个名字——它是**已经渲染好**的引擎输入。从一堆聊天消息（`messages`）到这个 `engine_input`，中间隔着一层 chat template 套用 + 分词的「渲染」工序。这层渲染本身是一个专题，本章不展开，细节见 [第 38 章](../../ch38-entrypoints/narrative/chapter.md)；你只要知道：HTTP 请求走到这一行时，消息已经变成了引擎认得的输入，接下来 `engine_client.generate(...)` 拿到的是一个异步生成器，后面 `async for` 它、把每一片吐成 SSE 回客户端。
 
 这里的 `engine_client` 在生产部署里就是 `AsyncLLM`。**所以无论你走 HTTP 还是别的在线协议，最终都汇到 `AsyncLLM.generate()` 这一个函数**——它就是本章主线的「出口」，我们 [§2.9](#29-出口generate-只消费队列) 会回到它。
 
@@ -503,7 +503,7 @@ return sorted(outputs, key=lambda x: int(x.request_id))
 
 但**核心是同一套**：同一个 `EngineCore.step()`（同样的 schedule → execute → sample → update 四步），同一个 `OutputProcessor.process_outputs()`（同样的去 token 化 + 组装），只是被两种不同的方式驱动。离线场景不要并发、不要流式，就用最朴素的同步循环；在线场景要扛并发、要流式，就套上跨进程 + 后台协程那层壳。理解了这一点，你就抓住了 vLLM v1 引擎的骨架——**剩下的每一章，都是在放大这副骨架上的某一块**。
 
-离线 `LLM` 这扇门的完整 API（批量、chat、beam search 等）见 [第 36 章](../../ch36-entrypoints/narrative/chapter.md)；在线 OpenAI 兼容服务器的完整形态见 [第 36 章](../../ch36-entrypoints/narrative/chapter.md)。
+离线 `LLM` 这扇门的完整 API（批量、chat、beam search 等）见 [第 38 章](../../ch38-entrypoints/narrative/chapter.md)；在线 OpenAI 兼容服务器的完整形态见 [第 38 章](../../ch38-entrypoints/narrative/chapter.md)。
 
 ---
 

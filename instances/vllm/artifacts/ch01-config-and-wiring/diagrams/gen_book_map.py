@@ -54,17 +54,17 @@ PARTS = [
         ("ch28", "读整模型：DeepSeek-V4", False),
         ("ch29", "从模型代码到架构图", False),
         ("ch30", "Sampler 九步采样流水线", False),
-        ("ch31", "EAGLE：特征自回归与树验证", True),
-        ("ch32", "投机解码：提议与拒绝采样", False),
+        ("ch33", "EAGLE：特征自回归与树验证", True),
+        ("ch34", "投机解码：提议与拒绝采样", False),
     ]),
     ("Part VII", "Prefill/Decode 分离", [
-        ("ch33", "PD 分离 I：KV Connector 契约", False),
-        ("ch34", "PD 分离 II：Worker 执行与后端", False),
+        ("ch35", "PD 分离 I：KV Connector 契约", False),
+        ("ch36", "PD 分离 II：Worker 执行与后端", False),
     ]),
     ("Part VIII", "服务接口", [
-        ("ch35", "离线 LLM API", False),
-        ("ch36", "OpenAI 兼容服务器", False),
-        ("ch37", "高级引擎运维：弹性扩缩与多轮", False),
+        ("ch37", "离线 LLM API", False),
+        ("ch38", "OpenAI 兼容服务器", False),
+        ("ch39", "高级引擎运维：弹性扩缩与多轮", False),
     ]),
 ]
 
@@ -163,7 +163,7 @@ L.append(f'<rect x="{PAD}" y="{leg_y}" width="30" height="16" rx="4" fill="{PRIM
          f'stroke="{PRIMER_BD}" stroke-width="1.3" stroke-dasharray="3,2"/>')
 L.append(f'<text x="{PAD+38}" y="{leg_y+13}" font-size="12.5" fill="#475569">'
          f'= 原理篇（primer；论文精读，交错插入 Part VI，回指落地章）——'
-         f'共 4 章：ch24 / ch26 / ch27 / ch31</text>')
+         f'共 4 章：ch24 / ch26 / ch27 / ch33</text>')
 
 L.append('</svg>')
 import sys

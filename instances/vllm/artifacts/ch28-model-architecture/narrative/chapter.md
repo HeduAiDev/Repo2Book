@@ -507,7 +507,7 @@ def forward(
 
 这就是算子边界。注意这里**没有 for 循环逐个跑专家**——一个 `torch.ops.vllm.deepseek_v4_mega_moe_experts` 调用，DeepGEMM 在 kernel 内部把全部专家一次算完（需要对称缓冲、FP4/FP8 权重、SM100 硬件）。它的内部 scale 布局、staging kernel 是 DeepGEMM/FusedMoE 专章的事，本章只读到这条算子边界，知道「单 kernel 全专家」这个事实即可。
 
-**FusedMoE 路径**（`_forward_fused_moe`，没开 EP 时）走张量并行的 `FusedMoE`，它内部就把 `shared_experts` 一起聚合了。所以两条后端有个微妙差异：mega 路径在 forward 里**外部**手动 `+= shared_output`（上面那行），TP 路径则在 `FusedMoE` **内部**聚合。聚合的位置不同，但语义一致——路由 + 共享。FusedMoE 后端的细节本章不深挖；专家并行的扩缩容协调见[第 37 章的弹性专家并行](../../ch37-engine-core/narrative/chapter.md)。
+**FusedMoE 路径**（`_forward_fused_moe`，没开 EP 时）走张量并行的 `FusedMoE`，它内部就把 `shared_experts` 一起聚合了。所以两条后端有个微妙差异：mega 路径在 forward 里**外部**手动 `+= shared_output`（上面那行），TP 路径则在 `FusedMoE` **内部**聚合。聚合的位置不同，但语义一致——路由 + 共享。FusedMoE 后端的细节本章不深挖；专家并行的扩缩容协调见[第 39 章的弹性专家并行](../../ch39-engine-core/narrative/chapter.md)。
 
 FFN delta 讲完。第三摞 delta 在残差里，是 V4 最不像 Llama 的地方。
 

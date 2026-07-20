@@ -2,7 +2,7 @@
 """第 3 章「本章地图」——EngineArgs → VllmConfig 两级映射剖面。
 
 改写自 .claude/skills/svg-diagram/references/example-chapter-map.py（沿用
-instances/vllm/artifacts/ch37-engine-core 已验证过的 split_symbol() 长符号
+instances/vllm/artifacts/ch39-engine-core 已验证过的 split_symbol() 长符号
 拆行技法，处理本章比模板示例更多、更长的真实符号名）。
 
 本章骨架就是 3.13 节小结自己给出的结构：

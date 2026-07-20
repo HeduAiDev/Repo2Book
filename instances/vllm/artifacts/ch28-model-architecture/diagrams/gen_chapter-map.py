@@ -2,12 +2,12 @@
 """第 28 章「本章地图」—— DeepSeek-V4 前向剖面:Llama 骨架上叠的四摞 delta。
 
 改写自 .claude/skills/svg-diagram/references/example-chapter-map.py（多徽标节点/
-split_symbol/transition 边则参考 ch37 的 gen_chapter-map.py 先例扩展）。
+split_symbol/transition 边则参考 ch39 的 gen_chapter-map.py 先例扩展）。
 
 本章主线是"读一个真实大模型":DeepseekV4DecoderLayer.forward 每层内 hc_pre 包住
 attn(MLA)、hc_post 收尾,再 hc_pre 包住 ffn(MoE)、hc_post 收尾——这段代码同时是
 §28.1(骨架对照 Llama)和 §28.2/§28.3(各自的低秩/路由细节)的对象,所以 attn/ffn
-两个节点各挂两块 § 徽标(复用 ch37 的多徽标节点写法,不是模板之外的新样式)。
+两个节点各挂两块 § 徽标(复用 ch39 的多徽标节点写法,不是模板之外的新样式)。
 
 三类特殊边(均非模板默认,均如实标注语义,不与"章内主线调用边=蓝实线"混淆):
   - "loop"(ffn→attn,虚线蓝,同色不同款):forward 里 `for layer in islice(...)`
@@ -19,7 +19,7 @@ attn(MLA)、hc_post 收尾,再 hc_pre 包住 ffn(MoE)、hc_post 收尾——这�
     表达同一座"桥",全书内保持这一处的色彩一致性。
   - "transition"(mtp_block→load_w,虚线灰 #94a3b8):MTP 与权重装载是两个完全不
     同调用时机(前者在 decode 循环里,后者在模型构造时一次性跑),之间不存在调用
-    关系,只是 §28.5→§28.6 的行文顺序衔接,标法照抄 ch37 的"章内换题"先例。
+    关系,只是 §28.5→§28.6 的行文顺序衔接,标法照抄 ch39 的"章内换题"先例。
 
 ■ 不可变(全书 72 章统一视觉语言，未改动):
   1. §徽标胶囊 badge()；2. 入口=绿#22c55e/出口=橙#f97316 接口桩；
@@ -28,7 +28,7 @@ attn(MLA)、hc_post 收尾,再 hc_pre 包住 ffn(MoE)、hc_post 收尾——这�
 
 ■ 本章新增(仅本章需要，未改动上面的不可变部分):
   - 双徽标节点(attn/ffn)：同一段真实代码被 §28.1(骨架层面)和 §28.2/§28.3(delta
-    细节层面)分别讲过，两块徽标并排贴节点右上角，复用 ch37 的 NODES 徽标列表字段。
+    细节层面)分别讲过，两块徽标并排贴节点右上角，复用 ch39 的 NODES 徽标列表字段。
   - 出口只挂在 norm_out(真正 `return hidden_states` 的那个位置)——load_w(§28.6,
     权重装载)是全章最后讨论的真实机制，但它发生在模型构造期而非前向期，不是
     "返回上层"的语义，所以不占用出口桩，作为旁路的自然收尾悬空即可(全书首次
@@ -90,7 +90,7 @@ NODES = [
 # "loop" = 虚线蓝,同一主线边的循环重复(× N 层),旁边直接写文字自解释,不入图例;
 # "bridge" = 虚线红#ef4444,真实数据依赖但非直接调用(与 ch25-hc-residual-and-mtp
 #            图同色,同指 _mtp_hidden_buffer 这座桥);
-# "transition" = 虚线灰,章内换题,非函数调用(抄 ch37 先例)。
+# "transition" = 虚线灰,章内换题,非函数调用(抄 ch39 先例)。
 EDGES = [
     ("embed", "attn"),
     ("attn", "ffn"),

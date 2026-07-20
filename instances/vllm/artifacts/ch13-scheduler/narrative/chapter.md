@@ -78,7 +78,7 @@ def schedule(self) -> SchedulerOutput:
 「There's no decoding phase nor prefill phase in the scheduler.」——调度器里没有解码相，也没有预填相。每个请求身上只挂两个标量：
 
 - `num_computed_tokens`：**已经算过**的 token 数（KV cache 里已经有它们的 key/value）；
-- `num_tokens_with_spec`：**总共要算**的 token 数，等于 `len(prompt) + len(output) + len(spec)`——prompt 长度 + 已经生成的输出长度 + 这一拍的草稿 token 数（投机解码：一个更小的草稿模型先提议若干候选 token，目标模型一次前向验证、只接受其中一部分，完整的接受准则与分布等价性推导见 [第 32 章 §32.5](../../ch32-spec-decode/narrative/chapter.md)；本章只需知道它会往这个总数里叠加若干「草稿 token」）。
+- `num_tokens_with_spec`：**总共要算**的 token 数，等于 `len(prompt) + len(output) + len(spec)`——prompt 长度 + 已经生成的输出长度 + 这一拍的草稿 token 数（投机解码：一个更小的草稿模型先提议若干候选 token，目标模型一次前向验证、只接受其中一部分，完整的接受准则与分布等价性推导见 [第 34 章 §32.5](../../ch34-spec-decode/narrative/chapter.md)；本章只需知道它会往这个总数里叠加若干「草稿 token」）。
 
 每一拍，调度器干的事就一句话：**尽量让 `num_computed_tokens` 追上 `num_tokens_with_spec`。**
 

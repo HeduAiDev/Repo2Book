@@ -8,7 +8,7 @@
       "注意力: Llama LlamaAttention.qkv_proj(QKVParallelLinear 全量 Q/K/V) + o_proj  →  V4 DeepseekV4Attention.fused_wqa_wkv(低秩 q_lora_rank + 压缩 kv) + q_norm/kv_norm + wq_b(latent→full q) + wo_a/wo_b(输出也低秩 o_lora_rank/o_groups) + attn_sink + 解耦 RoPE(nope/rope 拆分)",
       "FFN: Llama LlamaMLP(单个 dense gate_up_proj/down_proj SwiGLU)  →  V4 DeepseekV4MoE(gate 路由 → top-k 个 routed expert + 始终走的 shared_experts，两条后端:DeepseekV4MegaMoEExperts 或 FusedMoE)",
       "残差: Llama input_layernorm/post_attention_layernorm 的标准融合 add-norm(hidden,residual)  →  V4 hc_pre/hc_post 在 hc_mult 条残差流上做学习式混合(torch.ops.vllm.mhc_pre/mhc_post)，最后 hc_head 把多流压回单流",
-      "解码头: Llama 单 lm_head/compute_logits  →  V4 主模型 lm_head + 旁路 DeepSeekV4MTP draft(消费 _mtp_hidden_buffer 的 pre-hc_head 残差)做多 token 预测，由投机解码(ch32)驱动",
+      "解码头: Llama 单 lm_head/compute_logits  →  V4 主模型 lm_head + 旁路 DeepSeekV4MTP draft(消费 _mtp_hidden_buffer 的 pre-hc_head 残差)做多 token 预测，由投机解码(ch34)驱动",
       "数值类型: Llama 通常 bf16  →  V4 强制 FP8 block 量化(DeepseekV4FP8Config)，专家 MXFP4(fp4) 或 FP8(fp8)，e8m0fnu scale 以 uint8 原始字节装载"
     ]
   },
@@ -117,7 +117,7 @@
       "lines": "L122-L150",
       "purpose": "MTP delta：draft 层把 (a) 当前 token 的 embedding(enorm 归一) 与 (b) target 模型暂存的 pre-hc_head 残差(hnorm 归一)经 e_proj/h_proj 融合，再跑一个完整的 DeepseekV4DecoderLayer，输出又一个 pre-hc_head 残差以便多步串联。这是'多 token 预测'与'混合残差(融合两路信号)'的真身。",
       "code": "    def forward(\n        self,\n        input_ids: torch.Tensor,\n        positions: torch.Tensor,\n        previous_hidden_states: torch.Tensor,\n        inputs_embeds: torch.Tensor | None = None,\n        spec_step_index: int = 0,\n    ) -> torch.Tensor:\n        assert inputs_embeds is not None\n        # masking inputs at position 0, as not needed by MTP\n        inputs_embeds = torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)\n        inputs_embeds = self.enorm(inputs_embeds)\n\n        # Target stashes pre-hc_head residual as flat (T, hc_mult * D);\n        # reshape to (T, hc_mult, D) — the training-time layout.\n        previous_hidden_states = previous_hidden_states.view(\n            -1, self.hc_mult, self.config.hidden_size\n        )\n        previous_hidden_states = self.hnorm(previous_hidden_states)\n        hidden_states = self.h_proj(previous_hidden_states) + self.e_proj(\n            inputs_embeds\n        ).unsqueeze(-2)\n        hidden_states = self.mtp_block(\n            positions=positions, x=hidden_states, input_ids=None\n        )\n        # Return the flat pre-hc_head residual so it can be re-fed as the\n        # next spec step's `previous_hidden_states` when\n        # num_speculative_tokens > 1. hc_head is deferred to compute_logits.\n        return hidden_states.flatten(1)",
-      "elide": ["DeepSeekV4MTP.load_weights 的检查/remap 细节(450+ 行)略；与 ch32 投机解码驱动 MTP 的协议(num_speculative_tokens 多步)在 ch32 讲，本章只交付接口边界"]
+      "elide": ["DeepSeekV4MTP.load_weights 的检查/remap 细节(450+ 行)略；与 ch34 投机解码驱动 MTP 的协议(num_speculative_tokens 多步)在 ch34 讲，本章只交付接口边界"]
     },
     {
       "path": "vllm/model_executor/models/deepseek_v4.py",
@@ -139,7 +139,7 @@
     {"name": "DeepseekV4FP8Config", "file": "vllm/model_executor/models/deepseek_v4.py:L121", "responsibility": "V4 量化配置：linear/attn 走 FP8 block；专家按 expert_dtype 惰性解析 fp4(MXFP4) 或 fp8(block FP8)，决定 scale e8m0/float32 与 weight 映射。回收'量化 delta'。"},
     {"name": "hc_head", "file": "vllm/model_executor/models/deepseek_v4.py:L1450", "responsibility": "torch.compile 函数：把 hc_mult 条残差流经 RMSNorm + sigmoid 门控加权求和压回单流。主模型末尾与 MTP compute_logits 都用。"},
     {"name": "DeepSeekV4MultiTokenPredictorLayer", "file": "vllm/model_executor/models/deepseek_v4_mtp.py:L61", "responsibility": "MTP draft 单层：enorm/hnorm + e_proj/h_proj 融合 token embedding 与 target 的 pre-hc_head 残差，跑一个 DeepseekV4DecoderLayer，输出新 pre-hc_head 残差(可多步串联)。"},
-    {"name": "DeepSeekV4MTP", "file": "vllm/model_executor/models/deepseek_v4_mtp.py:L244", "responsibility": "MTP draft 顶层：持有多 MTP 层 + embed + logits_processor；forward 按 spec_step 选层；compute_logits 补 hc_head 再过 shared_head。被投机解码(ch32)消费。"},
+    {"name": "DeepSeekV4MTP", "file": "vllm/model_executor/models/deepseek_v4_mtp.py:L244", "responsibility": "MTP draft 顶层：持有多 MTP 层 + embed + logits_processor；forward 按 spec_step 选层；compute_logits 补 hc_head 再过 shared_head。被投机解码(ch34)消费。"},
     {"name": "LlamaDecoderLayer / LlamaAttention / LlamaMLP", "file": "vllm/model_executor/models/llama.py:L253/L124/L81", "responsibility": "基线对照(ch22)：标准 add-norm 残差 + QKV-MHA + dense SwiGLU。本章每个 delta 都回到这三处对照。"}
   ],
   "data_flow": [
@@ -204,16 +204,16 @@
       {"symbol": "DeepseekV4MLP", "why": "SwiGLU MLP，作 shared_experts 复用，结构同构 LlamaMLP，是 MoE 内那条 dense 路径。"},
       {"symbol": "DeepseekV4FP8Config", "why": "量化配置 delta(expert_dtype fp4/fp8 惰性解析)，回收 f16 中的'量化'分支。"},
       {"symbol": "DeepSeekV4MultiTokenPredictorLayer", "why": "MTP draft 单层，融合 embedding 与 pre-hc_head 残差(e_proj/h_proj)，多 token 预测真身。"},
-      {"symbol": "DeepSeekV4MTP", "why": "MTP draft 顶层，与投机解码(ch32)的接口边界。"},
+      {"symbol": "DeepSeekV4MTP", "why": "MTP draft 顶层，与投机解码(ch34)的接口边界。"},
       {"symbol": "_mtp_hidden_buffer", "why": "target 与 draft 之间传递 pre-hc_head 残差的桥，可检测符号，连接主模型 forward 与 MTP。"},
-      {"symbol": "get_mtp_target_hidden_states", "why": "暴露 _mtp_hidden_buffer 的接口方法，ch32 据此取目标隐状态。"}
+      {"symbol": "get_mtp_target_hidden_states", "why": "暴露 _mtp_hidden_buffer 的接口方法，ch34 据此取目标隐状态。"}
     ]
   },
   "diagram_plan": [
     {
       "name": "ch25-roadmap",
       "kind": "roadmap",
-      "spec": "复用 assets/roadmap/roadmap.py。高亮节点：model-architecture / DeepSeek-V4 capstone。前接 ch22(Llama 基线)/ch23(注意力后端)/ch25(MLA 内核)，后接 ch29(FusedMoE/EP)与 ch32(投机解码消费 MTP)。"
+      "spec": "复用 assets/roadmap/roadmap.py。高亮节点：model-architecture / DeepSeek-V4 capstone。前接 ch22(Llama 基线)/ch23(注意力后端)/ch25(MLA 内核)，后接 ch29(FusedMoE/EP)与 ch34(投机解码消费 MTP)。"
     },
     {
       "name": "ch25-delta-stack",

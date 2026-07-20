@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """第 13 章「本章地图」——schedule() 一拍剖面 + update_from_output() 反馈环。
 
-改写自 .claude/skills/svg-diagram/references/example-chapter-map.py（沿用 ch37
+改写自 .claude/skills/svg-diagram/references/example-chapter-map.py（沿用 ch39
 新增的多徽标节点 / transition 边 / split_symbol 三项扩展）。本章代码主线其实是
 两个方法：`schedule()`（发出去）和 `update_from_output()`（收回来）——不是同一次
 调用栈里的两段，而是 EngineCore busy loop 里前后两次独立调用（中间隔着一次模型
@@ -18,8 +18,8 @@
     钻一层("KV 分配/抢占"、"AsyncScheduler 覆写")展示真实的更深一级符号——这两层
     都是"泳道=调用深度"的原教旨用法(与模板示例的 调度层→执行层→算子层 一致)。
 
-■ 不可变(全书统一视觉语言，抄自模板 + ch37 扩展，未改动):
-  1. §徽标胶囊 badge()（含 ch37 起支持的"一个节点挂多个 §"）；
+■ 不可变(全书统一视觉语言，抄自模板 + ch39 扩展，未改动):
+  1. §徽标胶囊 badge()（含 ch39 起支持的"一个节点挂多个 §"）；
   2. 入口=绿#22c55e/出口=橙#f97316 接口桩；
   3. 章内主线调用边=蓝#3b82f6；
   4. 底部路线条(高亮=实线蓝/次要=虚线灰)；

@@ -347,7 +347,7 @@ def _process_engine_step(self) -> bool:
 
 **输出塞进 `output_queue`**。`outputs.items()` 是 `{client_index: EngineCoreOutputs}`，逐个 `put_nowait` 进去。然后第 7 章那个 `process_output_sockets` IO 线程会把它们抽走、编码、经 ZMQ 推回客户端。忙循环只管往内存队列里塞，不碰网络——网络 IO 交给独立线程，互不阻塞。这是 `input_queue` / `output_queue` 这对内存队列存在的全部理由：**用一对线程安全队列，把「跑模型的循环」和「读写 socket 的 IO」彻底解耦**。忙循环只跟内存打交道，逻辑简单且不会被网络卡住；IO 线程的序列化和 socket 操作释放 GIL，能和 GPU 前向真正并行。
 
-**那 1 毫秒的 `time.sleep`**。看注释：有些请求会卡在 `WAITING_FOR_REMOTE_KVS`——等另一台机器把 KV cache 通过 NIXL（一种基于 RDMA 单边读的跨机器 KV 传输后端，[第 34 章 §34.8](../../ch34-pd-disaggregation/narrative/chapter.md) 细讲）握手传过来。这种请求没法 step（数据还没到），但又确实「没完成」。如果忙循环为它疯狂空转，会把 CPU 时间片全占了，做握手的后台线程反而饿死、永远握不上手。短睡 1 ms 把轮询频率压到约 1000 Hz，给后台线程让出时间片。这是一个「紧轮询会饿死协作线程」的经典折中。
+**那 1 毫秒的 `time.sleep`**。看注释：有些请求会卡在 `WAITING_FOR_REMOTE_KVS`——等另一台机器把 KV cache 通过 NIXL（一种基于 RDMA 单边读的跨机器 KV 传输后端，[第 36 章 §34.8](../../ch36-pd-disaggregation/narrative/chapter.md) 细讲）握手传过来。这种请求没法 step（数据还没到），但又确实「没完成」。如果忙循环为它疯狂空转，会把 CPU 时间片全占了，做握手的后台线程反而饿死、永远握不上手。短睡 1 ms 把轮询频率压到约 1000 Hz，给后台线程让出时间片。这是一个「紧轮询会饿死协作线程」的经典折中。
 
 精简版把这一圈也跑通了：输出确实进了 `output_queue`，请求消费完加关停信号后循环干净退出。
 
