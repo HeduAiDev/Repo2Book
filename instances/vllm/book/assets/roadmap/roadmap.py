@@ -45,6 +45,7 @@ SUBSYS = {
     "attention": ("engine-core", "注意力后端"),
     "model-architecture": ("engine-core", "模型架构"),
     "sampling": ("engine-core", "采样"),
+    "structured-output": ("engine-core", "结构化输出/约束解码"),
     "spec-decode": ("engine-core", "投机解码"),
     "pd-disaggregation": ("ipc", "P/D 分离"),
 }
