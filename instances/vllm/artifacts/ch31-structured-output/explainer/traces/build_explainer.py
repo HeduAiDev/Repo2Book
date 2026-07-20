@@ -1,0 +1,408 @@
+"""把 traces/*.json 的逐轮表原样搬进 ../explainer.json（表格数字零转写误差）。
+
+用法：先跑 run_m02.py / run_m03.py / run_m06.py / run_m07.py / run_m08.py /
+run_m09.py / run_m14.py / run_m20.py / run_bitmask_math.py（任意顺序），再跑本脚本。
+**重跑任一 run_*.py 之后必须重跑本脚本**——否则 explainer.json 里的表格数字会与
+新 trace 不一致，lint_explainer.py 会当场判 BLOCKING（m03 的耗时列尤其敏感）。
+"""
+import json
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+OUT = HERE.parent / "explainer.json"
+
+
+def tr(name):
+    return json.loads((HERE / name).read_text(encoding="utf-8"))
+
+
+m02, m03, m06, m07 = tr("m02.json"), tr("m03.json"), tr("m06.json"), tr("m07.json")
+m08, m09, m14, m20 = tr("m08.json"), tr("m09.json"), tr("m14.json"), tr("m20.json")
+bm = tr("bitmask_math.json")
+
+
+def we(mid, script, params, table, cols=None):
+    return {
+        "params": params,
+        "trace_source": "run",
+        "trace_ref": f"traces/{mid}.json",
+        "driver_script": f"explainer/traces/{script}",
+        "table": {"columns": cols or table["columns"], "rows": table["rows"]},
+    }
+
+
+mechanisms = []
+
+# ── m01 (figure only) ───────────────────────────────────────────────────────
+mechanisms.append({
+    "mechanism_id": "m01-mask-not-sample",
+    "figure_specs": [{
+        "figure_id": "fig-ch31-01-mask-before-sampling",
+        "claim": "约束解码不改采样算法：它只在采样之前，用一行位掩码回答『此刻哪些 token 合法』，采样器拿到的仍是同一套 logits 处理流程。",
+        "template": "flow",
+        "elements": [
+            "语法状态机（StructuredOutputGrammar）—— fill_bitmask(bitmask, batch_index) 是它与采样的**唯一**接口",
+            "位掩码行：每 token 1 bit，1=允许 / 0=禁止",
+            "logits 行：|V| 个 float32（ch30 的采样输入）",
+            "掩码作用点：采样之前（下一章讲怎么把 0 位打成 -inf）",
+            "采样器（ch30）：温度/top-p/top-k 逻辑一行不改",
+        ],
+        "numbers": [
+            {"label": "契约里与采样交互的方法数", "value": "1",
+             "provenance": "vllm/v1/structured_output/backend_types.py:L73-80（六方法中只有 fill_bitmask 面向采样）"},
+            {"label": "|V|=150000 时掩码一行", "value": "18752 B（18.3 KB）",
+             "provenance": "traces/bitmask_math.json rows[3]"},
+            {"label": "同一行 logits(float32)", "value": "600000 B（585.9 KB）",
+             "provenance": "traces/bitmask_math.json raw.cases[3].logits_row_bytes"},
+        ],
+        "caption_draft": "图 1：约束解码的作用点在采样之前——语法状态机只通过 fill_bitmask 交出一行位掩码（|V|≈15 万时 18.3 KB，约为同一行 logits 的 1/32），采样算法本身完全不知道约束的存在。",
+    }],
+})
+
+# ── m02 ─────────────────────────────────────────────────────────────────────
+mechanisms.append({
+    "mechanism_id": "m02-async-grammar-compile-gate",
+    "intuition": "新员工报到要先办门禁卡。卡在后台制作（可能要几分钟），人不会堵在门口让整条队伍停下——他被请到等候区（一个专门的『等门禁卡』状态）；前台每轮点名时顺口问一句『卡好了没』，好了才放进办公区排队。语法编译就是那张门禁卡：编译扔给后台线程池，请求进 WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR 等候区，调度循环一步都不停。",
+    "worked_example": we(
+        "m02", "run_m02.py",
+        {"约束": 'json={"type": "object"}', "后端": "xgrammar",
+         "编译耗时": "用 threading.Event 卡住，模拟『要跨好几轮调度』",
+         "线程池 max_workers": "max(1,(cpu_count+1)//2) = 2（本机观测）"},
+        m02,
+        cols=["轮次", "调度器动作", "本轮结束时 request.status",
+              "_is_blocked_waiting_status(轮询前)", "structured_output_req.grammar",
+              "_try_promote_blocked_waiting_request 返回"],
+    ),
+    "invariant": {
+        "claim": "『语法就绪』是单调的（False→True 后永不回退），因此不会出现『晋级之后又发现没编译完』的竞态，状态跃迁至多发生一次。",
+        "argument": "单调量取布尔值 ready = (_grammar 不是 Future)。写 _grammar 的只有两处：grammar_init（输入处理线程，只在请求入队时写一次 Future 或成品）与 _check_grammar_completion（调度线程，只做 Future→成品的**替换**）。替换后 isinstance(_grammar, Future) 恒为假，那个 try 分支再不执行，ready 只能从 False 变 True、不能反向。trace 印证：轮 1-2 grammar 为 None、promoted=False；轮 3 grammar 为成品、promoted=True 且 status 由 2 变 1；轮 4 状态已是 WAITING，_is_blocked_waiting_status 返回 False、晋级函数不再命中该分支（返回 False），跃迁不重复。",
+    },
+    "quantified": "编译是一次性的 O(语法规模 × 词表规模) 代价（要为每个状态求出词表上的可接受集合），门控则是每轮 O(1)：轮 1-2 各只花一次 Future.result(timeout=0.0001) 的 100 微秒预算（m03 实测 164 us/次，host CPython）。本机 cpu_count 下 max_workers = 2，即最多 2 个语法并发编译而不侵占调度线程。四轮里调度线程被阻塞的总时间 = 2 × 164 us ≈ 0.33 ms，与编译本身的量级完全解耦。",
+    "figure_specs": [{
+        "figure_id": "fig-ch31-02-async-compile-gate",
+        "claim": "语法编译在线程池里跑，调度线程每轮只花 100 微秒问一句『好了没』——请求靠 WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR 这个阻塞态等，而不是靠调度器去等。",
+        "template": "swimlane",
+        "elements": [
+            "泳道 1 输入处理线程：EngineCore.preprocess_add_request → grammar_init → executor.submit(_create_grammar)，立刻返回",
+            "泳道 2 线程池工作线程：_create_grammar → backend.compile_grammar(request_type, grammar_spec) → 成品语法对象写回 Future",
+            "泳道 3 调度线程：每轮 _is_blocked_waiting_status → skipped_waiting；_try_promote_blocked_waiting_request 读 grammar property",
+            "轮 1/轮 2：grammar=None → promoted=False（请求留在阻塞态）",
+            "轮 3：grammar=成品 → status 由 WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR 改成 WAITING，promoted=True",
+        ],
+        "numbers": [
+            {"label": "阻塞态枚举值", "value": "WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR = 2",
+             "provenance": "traces/m02.json raw.round_1.status_value_before"},
+            {"label": "晋级后的状态值", "value": "WAITING = 1",
+             "provenance": "traces/m02.json raw.round_3.status_value_after"},
+            {"label": "晋级发生在第几轮", "value": "3",
+             "provenance": "traces/m02.json raw.round_3.promoted = true"},
+            {"label": "每轮轮询预算", "value": "timeout=0.0001 秒（100 us）",
+             "provenance": "vllm/v1/structured_output/request.py:L48-49"},
+            {"label": "线程池 max_workers", "value": "2（= max(1,(cpu_count+1)//2)，本机观测）",
+             "provenance": "traces/m02.json raw.executor_max_workers"},
+        ],
+        "caption_draft": "图 2：异步编译门的三条泳道。编译整个跑在线程池里，调度线程只在每轮晋级检查时读一次 grammar property（100 微秒预算）；轮 1-2 拿到 None、请求留在阻塞态（枚举值 2），轮 3 拿到成品对象、状态改成 WAITING（枚举值 1）——调度循环一步都没有停。",
+    }],
+})
+
+# ── m03 ─────────────────────────────────────────────────────────────────────
+mechanisms.append({
+    "mechanism_id": "m03-future-poll-100us",
+    "intuition": "等电梯的正确姿势：按一下、抬头看 0.1 秒，来了就进，没来立刻去干别的——既不站着死等，又不至于电梯刚好到了却错过一轮。timeout=0.0001 就是这『抬头看的 0.1 秒』（这里是 100 微秒）。",
+    "worked_example": we(
+        "m03", "run_m03.py",
+        {"轮询预算": "timeout=0.0001 秒", "编译完成时点": "第 3 轮之前",
+         "取证环境": "host CPython 3.11 / WSL2，纯控制流，耗时仅反映 Future.result 的超时实现，与 GPU/真机无关；已预热以排除首次调用的一次性开销"},
+        m03),
+    "invariant": {
+        "claim": "轮询是幂等且自终结的：一旦成功取到结果，_grammar 被**原地替换**成成品，此后每次调用都跳过 try 块、不再产生任何等待。",
+        "argument": "基例：_grammar 是 Future 时，要么超时返回 False（字段不变），要么取到结果并赋值给 self._grammar（字段类型由 Future 变成语法对象）。归纳步：字段一旦不是 Future，`isinstance(self._grammar, Future)` 恒假，函数直接 return True——既不会再等待，也不会把成品换回 Future。trace 印证：轮 1-2 字段类型是 Future、耗时 164 us（≈ 100 us 预算 + 调用开销）；轮 3 替换成 Grammar、耗时 6 us；轮 4 只剩 1 us 的纯属性读。",
+    },
+    "quantified": "未就绪时每次轮询的成本上限是 100 us（本机实测 164 us，含 CPython 调用开销）；就绪后降到 1-6 us，即 2 个数量级的下降。按每请求每轮至多一次轮询计，一个卡在编译中的请求对调度循环的边际成本是 O(100 us)/轮，而不是编译本身的量级。注意 is_grammar_ready 这个属性在 v0.21.0 全仓**零 in-tree 调用者**——调度器读的是 grammar property，二者共用同一个 _check_grammar_completion。",
+})
+
+# ── m04 (figure only) ───────────────────────────────────────────────────────
+mechanisms.append({
+    "mechanism_id": "m04-grammar-abc-six-methods",
+    "figure_specs": [{
+        "figure_id": "fig-ch31-04-grammar-abc-six-methods",
+        "claim": "请求级契约的六个方法各自对应语法状态机上一种不可省略的操作：两种推进（真推进 / 试走）、一种回退、一种取掩码、一种问终态、一种归零。",
+        "template": "state-machine",
+        "elements": [
+            "状态机主体：GrammarMatcher（xgrammar）/ LLMatcher（guidance）",
+            "accept_tokens(request_id, tokens) → bool：用**这一步真采样出的** token 推进（调用点 scheduler.py:L1363）",
+            "validate_tokens(tokens) → list[int]：不推进的试走，返回被接受的前缀（调用点 scheduler.py:L1620 / L1650，只喂 spec_token_ids）",
+            "rollback(num_tokens)：投机解码专用的退回口子（下一章展开）",
+            "fill_bitmask(bitmask, batch_index)：与采样的唯一接口，写自己那一行",
+            "is_terminated() → bool：语法是否已走到终态",
+            "reset()：归零（注：v0.21.0 全仓无 in-tree 调用者，契约完整性存在、当前无人调用）",
+        ],
+        "numbers": [
+            {"label": "契约方法数", "value": "6",
+             "provenance": "vllm/v1/structured_output/backend_types.py:L31-96"},
+            {"label": "accept_tokens 的真实调用点", "value": "1 处（scheduler.py:L1363）",
+             "provenance": "dossier.mechanisms m21-who-advances-the-grammar"},
+            {"label": "validate_tokens 的真实调用点", "value": "2 处（scheduler.py:L1620 / L1650）",
+             "provenance": "dossier.mechanisms m21-who-advances-the-grammar"},
+            {"label": "reset() 的 in-tree 调用者", "value": "0",
+             "provenance": "dossier.analyst_notes_on_plan 死契约标注"},
+        ],
+        "caption_draft": "图：六方法环绕同一台语法状态机。真正推进它的是调度器在 update_from_output 里用采样结果调的 accept_tokens；validate_tokens 只做不留痕迹的试走，rollback 是留给投机解码的退回口子，fill_bitmask 是它与采样的唯一接口——而 reset 在 v0.21.0 里没有任何 in-tree 调用者。",
+    }],
+})
+
+# ── m06 ─────────────────────────────────────────────────────────────────────
+mechanisms.append({
+    "mechanism_id": "m06-rollback-for-spec-decode",
+    "intuition": "导航让你先按最可能的三条路各预演一遍，里程表也跟着往前跳；一旦发现走错，就得把里程表**准确地**退回去。只预演三步，所以最多也只需要退三步——回滚深度天然等于投机 token 数。",
+    "worked_example": we(
+        "m06", "run_m06.py",
+        {"num_speculative_tokens": 3, "词表": 128,
+         "真 token": "[11, 12]", "投机草稿": "[21, 22, 23]"},
+        m06),
+    "invariant": {
+        "claim": "num_processed_tokens 与底层 matcher 的已接受序列长度**成对**维护，回滚是精确逆操作——但这条成对关系只在 max_rollback_tokens（= num_speculative_tokens）深度以内被保证。",
+        "argument": "单调量取二者之差 d = num_processed_tokens − len(matcher.accepted)。基例 d=0（新建）。归纳步：accept_tokens 每成功接受一个 token，两边各 +1，d 不变；rollback(n) 一行 matcher.rollback(n)、一行 num_processed_tokens -= n，两边各 −n，d 仍不变。trace 五步全程 d=0（raw.invariant_check_num_processed_equals_accepted_len = true）。深度上限来自构造参数：GrammarMatcher(ctx, max_rollback_tokens=self.num_speculative_tokens)，超出上限库不再保证可退，故 theory 里『validate_tokens 的试走等价性』也只在这个深度内成立。",
+    },
+    "quantified": "本例 num_speculative_tokens=3 → matcher.max_rollback_tokens=3。5 个 token 推进后 rollback(2) 把计数从 5 退到 3、rollback(3) 再退到 0——第二次正好吃满上限。反面证据：lm-format-enforcer 干脆不接这活，backend_lm_format_enforcer.py:L120-129 在 max_rollback_tokens > 0 时直接 raise ValueError，等于用契约层面的拒绝换掉实现层面的复杂度。",
+})
+
+# ── m07 ─────────────────────────────────────────────────────────────────────
+mechanisms.append({
+    "mechanism_id": "m07-accept-vs-validate",
+    "intuition": "试穿不算买。validate_tokens 是把衣服套上照照镜子（看到哪一件开始穿不进去），照完必须原样挂回货架；accept_tokens 才是刷卡带走、库存真的少一件。",
+    "worked_example": we(
+        "m07", "run_m07.py",
+        {"词表": 128, "不被语法接受的 token": 99,
+         "调用点": "Scheduler._validate_spec_tokens_against_grammar / _advance_grammar_on_sampled_tokens"},
+        m07),
+    "invariant": {
+        "claim": "validate_tokens 前后语法状态严格不变（真·『不推进 FSM』），而 accept_tokens 是唯一会改变状态的推进操作。",
+        "argument": "xgrammar 的实现很坦诚：对输入前缀逐个 accept，成功计数 k，随后 `if len(accepted_tokens) > 0: self.matcher.rollback(k)`。由 m06 的成对不变式，rollback(k) 精确抵消这 k 次推进，故净变化为零；k=0 时不发 rollback（源码那句 if 就是为它准备的）。trace 印证：第 1 行 validate_tokens([31,32,99]) 返回前缀 [31,32] 而 num_processed_tokens 仍是 0、累计 rollback 调用 +1；第 3 行 validate_tokens([99,31]) 返回 []、rollback 调用数停在 1 不再增长；只有第 2 行的 accept_tokens 把计数从 0 推到 2。",
+    },
+    "quantified": "一次 k 长前缀的试走 = k 次 accept_token + 1 次 rollback(k)，即 O(k) 次状态机操作、恒定 1 次回滚；被拒时提前 break，最坏 k = len(tokens)。本例 3 个草稿 token 试走只做了 2 次 accept + 1 次 rollback（第 3 个当场被拒、跳出循环）。谁调用谁：accept_tokens 的真实调用点是 scheduler.py:L1363（用这一步真采样出的 token），validate_tokens 在 scheduler.py:L1620/L1650（只喂 spec_token_ids）。",
+})
+
+# ── m08 ─────────────────────────────────────────────────────────────────────
+mechanisms.append({
+    "mechanism_id": "m08-structured-output-key",
+    "intuition": "六种寄件方式（快递单、面单、二维码……）到了分拣中心统统换成同一张标准面单：一个『品类代号』加一串『地址文本』。后面的传送带只认这张面单，不必知道你当初是怎么下的单。",
+    "worked_example": we(
+        "m08", "run_m08.py",
+        {"输入": "六种约束形态各一（json 另测 dict/str 两种写法）",
+         "被测函数": "get_structured_output_key / StructuredOutputRequest.structured_output_key"},
+        m08),
+    "invariant": {
+        "claim": "归一结果的类型恒为 (StructuredOutputOptions, str)，因而可哈希、可比较；函数末尾那句 raise ValueError 在正常路径上不可达。",
+        "argument": "六个 if 分支覆盖 params 的全部六个约束字段，每个分支要么直接返回已是 str 的字段，要么先 json.dumps 成 str 再返回——返回类型封闭。不可达性由上游保证：StructuredOutputsParams.__post_init__ 双向校验 count>1 与 count<1 都报错（sampling_params.py:L59-80），故进到这里的 params 恰好有一个非 None 约束，必命中某个分支。trace 印证：7 组输入全部落到 6 个枚举之一，dict/list 形态（json、choice）的 spec 类型都变成 str（长度分别 18 / 15）。",
+    },
+    "quantified": "六种入口 → 6 个枚举值（JSON=1, JSON_OBJECT=2, REGEX=3, GRAMMAR=4, CHOICE=5, STRUCTURAL_TAG=6）。json_object 的 spec 是长度 0 的空串（规格全在枚举里）。structured_output_key 是 functools.cached_property：本例读 3 次、只真正计算 1 次。但它**不是跨请求的编译缓存键**——两个同 schema 的请求键相等（trace: two_requests_same_schema_keys_equal = true），vLLM 仍各调一次 backend.compile_grammar（见 m09）。",
+})
+
+# ── m09 ─────────────────────────────────────────────────────────────────────
+mechanisms.append({
+    "mechanism_id": "m09-compile-cache-reuse",
+    "intuition": "两个同事拿着同一份表格去复印，公司层面并没有『这份印过了』的登记本；省不省纸完全取决于各自那台复印机有没有『上一份』的记忆——有的机器有（xgrammar），有的机器压根没有（guidance）。",
+    "worked_example": we(
+        "m09", "run_m09.py",
+        {"请求": "两个内容完全相同的 JSON schema 请求",
+         "模式": "external_launcher=True（同步编译，便于确定性观察）",
+         "说明": "xgrammar 的库内缓存由替身按 cache_enabled=True 的可观察行为复刻（host 无该库）；guidance 一列是精简版真代码的真实计数"},
+        m09),
+    "invariant": {
+        "claim": "vLLM 侧 compile_grammar 的调用次数恒等于结构化请求数——引擎层没有任何去重路径；复用只可能发生在后端内部。",
+        "argument": "_create_grammar 的函数体是无条件的三步：取 structured_output_key、解包成 (request_type, grammar_spec)、调 backend.compile_grammar。没有 dict 查表、没有『已编译过』判断，也没有把成品挂到任何跨请求容器上。trace 印证：两个后端下 vLLM 侧调用计数都从 1 涨到 2（与请求数同步），差别只出现在『后端内部真正编译次数』这一列——xgrammar 停在 1（第二次是缓存命中），guidance 涨到 2。",
+    },
+    "quantified": "同 schema 两请求：xgrammar 真编译 1 次 + 缓存命中 1 次（GrammarCompiler(cache_enabled=True)，backend_xgrammar.py:L64-69）；guidance 真编译 2 次（源码里没有任何缓存）。另两家的键各不相同：outlines 自建 cache，键是 f\"{vocabulary._hash}_{regex_string}\"（backend_outlines.py:L57-67）；lm-format-enforcer 只 lru_cache 了 tokenizer_data（backend_lm_format_enforcer.py:L33）。四家四套策略——所以不能说成『vLLM 自己做了同 schema 去重』。注意每次调用都会新建一个 GrammarMatcher（本例 2 个），因为状态机必须逐请求独立。",
+})
+
+# ── m10 (figure only) ───────────────────────────────────────────────────────
+mechanisms.append({
+    "mechanism_id": "m10-xgrammar-compile-dispatch",
+    "figure_specs": [{
+        "figure_id": "fig-ch31-10-xgrammar-dispatch-five-branches",
+        "claim": "六个约束枚举，xgrammar 的 compile_grammar 却只有五个分支——少的那个是 CHOICE，它在前端校验期就被改写成 GRAMMAR 了。",
+        "template": "flow",
+        "elements": [
+            "入口：structured_output_key = (request_type, grammar_spec)",
+            "分支 1 JSON → compiler.compile_json_schema(grammar_spec, any_whitespace=…)",
+            "分支 2 JSON_OBJECT → compile_json_schema('{\"type\": \"object\"}')",
+            "分支 3 GRAMMAR → compiler.compile_grammar(spec)",
+            "分支 4 REGEX → compiler.compile_regex(spec)",
+            "分支 5 STRUCTURAL_TAG → compiler.compile_structural_tag(spec)",
+            "else → raise ValueError（『Validation should have already occurred』）",
+            "虚线旁注：CHOICE 在 validate_xgrammar_grammar 里被改写成 EBNF，走的是分支 3",
+            "出口：XgrammarGrammar(matcher=GrammarMatcher(ctx, max_rollback_tokens=num_speculative_tokens))",
+        ],
+        "numbers": [
+            {"label": "枚举成员数", "value": "6",
+             "provenance": "traces/m20.json raw.compile_dispatch.num_enum_members"},
+            {"label": "compile_grammar 分支数", "value": "5",
+             "provenance": "vllm/v1/structured_output/backend_xgrammar.py:L77-122"},
+            {"label": "CHOICE 走到这里的结果", "value": "落 else → ValueError",
+             "provenance": "traces/m20.json raw.compile_dispatch.choice_branch_in_compile_grammar"},
+            {"label": "改写后实际命中的分支", "value": "GRAMMAR(=4)",
+             "provenance": "traces/m20.json rows[2]"},
+        ],
+        "caption_draft": "图：xgrammar 的编译分派只有五条路。CHOICE 不是不被支持，而是在前端校验期就被 validate_xgrammar_grammar 原地改写成 EBNF 文法（choice=None, grammar='root ::= …'），到引擎侧时键已经是 (GRAMMAR, ebnf 串)——若真拿 CHOICE 调进来，只会落到 else 分支报错。",
+    }],
+})
+
+# ── m11 (figure only) ───────────────────────────────────────────────────────
+mechanisms.append({
+    "mechanism_id": "m11-backend-selection-auto",
+    "figure_specs": [{
+        "figure_id": "fig-ch31-11-auto-backend-ladder",
+        "claim": "后端选择发生在前端校验期而非引擎期：auto 是一条『先试 xgrammar，失败才降级』的两级阶梯，且从不选 lm-format-enforcer。",
+        "template": "flow",
+        "elements": [
+            "入口：SamplingParams._validate_structured_outputs（前端 Processor 调用）",
+            "backend 显式指定（xgrammar / guidance / outlines / lm-format-enforcer）→ 各自 validate_* 预检，不降级",
+            "backend == 'auto' → try: validate_xgrammar_grammar(self) → _backend='xgrammar'",
+            "except ValueError → 判 skip_guidance（非 tekken Mistral 分词器 或 schema 含 guidance 不支持特性如 patternProperties）",
+            "skip_guidance 为真 → validate_structured_output_request_outlines → _backend='outlines'",
+            "否则 → validate_guidance_grammar → _backend='guidance'",
+            "出口：params._backend 落定 + _backend_was_auto=True；引擎侧 grammar_init 只读 _backend，不做任何选择",
+            "旁注：lm-format-enforcer 不在阶梯上，只能显式指定",
+        ],
+        "numbers": [
+            {"label": "auto 阶梯涉及的后端数", "value": "3（xgrammar → guidance / outlines）",
+             "provenance": "vllm/sampling_params.py:L871-901"},
+            {"label": "阶梯从不选中的后端数", "value": "1（lm-format-enforcer）",
+             "provenance": "vllm/sampling_params.py:L871-901（分支里不出现该后端）"},
+            {"label": "auto 走完后 _backend_was_auto", "value": "True",
+             "provenance": "traces/m20.json raw.steps[1].backend_was_auto"},
+            {"label": "全引擎允许的后端实例数", "value": "1",
+             "provenance": "traces/m09.json raw.xgrammar_backend_instances"},
+        ],
+        "caption_draft": "图：auto 的降级阶梯。它跑在前端校验期——先真的试编一次 xgrammar，抛 ValueError 才降级到 guidance（schema 含 patternProperties 之类则改落 outlines）；lm-format-enforcer 从不在这条路上出现。结果只落成 params._backend 一个字段，引擎侧 grammar_init 照单全收、不再选择。",
+    }],
+})
+
+# ── m13 (figure only) ───────────────────────────────────────────────────────
+mechanisms.append({
+    "mechanism_id": "m13-four-backend-contract-matrix",
+    "figure_specs": [{
+        "figure_id": "fig-ch31-13-four-backend-matrix",
+        "claim": "四个后端实现同一份六方法契约，差异全部落在『支持哪些约束形态、能不能回滚、终态怎么算』三列上。",
+        "template": "state-table",
+        "elements": [
+            "行：xgrammar / guidance / outlines / lm-format-enforcer",
+            "列 1 编译分派支持的形态",
+            "列 2 回滚能力（rollback 的实现方式与上限）",
+            "列 3 is_terminated 的语义",
+            "列 4 编译复用（缓存在哪、键是什么）",
+        ],
+        "numbers": [
+            {"label": "xgrammar 支持的形态", "value": "5 个分支（CHOICE 由校验期改写并入 GRAMMAR）",
+             "provenance": "vllm/v1/structured_output/backend_xgrammar.py:L77-122"},
+            {"label": "outlines 支持的形态", "value": "3（JSON / REGEX / CHOICE）",
+             "provenance": "vllm/v1/structured_output/backend_outlines.py:L69-83"},
+            {"label": "lm-format-enforcer 支持的形态", "value": "4（JSON / JSON_OBJECT / REGEX / CHOICE）",
+             "provenance": "vllm/v1/structured_output/backend_lm_format_enforcer.py:L100-119"},
+            {"label": "lm-format-enforcer 的回滚能力", "value": "0（max_rollback_tokens>0 直接 raise）",
+             "provenance": "vllm/v1/structured_output/backend_lm_format_enforcer.py:L120-129"},
+            {"label": "guidance 回滚时的偏移", "value": "num_tokens − rollback_lag（EOS 后 lag=1）",
+             "provenance": "traces/m14.json raw.guidance_rollback_calls_on_ll_matcher = [1]（rollback(2) 只退 1）"},
+            {"label": "guidance 的编译缓存", "value": "0（无）",
+             "provenance": "traces/m09.json raw.guidance_req2.backend_internal_cache_hits"},
+        ],
+        "caption_draft": "图：四后端同契约对照。同一份六方法接口下，能力矩阵藏在各自的编译分派里（outlines 只认 3 种、LMFE 认 4 种，其余当场 ValueError），回滚能力从『上限=投机 token 数』到『干脆拒绝』，终态语义更是四家四说——这正是把契约切成 ABC 的价值：调度器一行都不用改。",
+    }],
+})
+
+# ── m14 ─────────────────────────────────────────────────────────────────────
+mechanisms.append({
+    "mechanism_id": "m14-terminated-semantics-divergence",
+    "intuition": "三个裁判判『比赛结束』：一个照着记分牌上写好的结论念（xgrammar 的缓存标志位），一个听到终场哨才记下、且之后倒带要少倒一格（guidance 的 rollback_lag），还有一个明明看到结束了也要等下一拍才承认，好让终场哨声先播出去（outlines 故意延迟一步）。",
+    "worked_example": we(
+        "m14", "run_m14.py",
+        {"EOS token": 2, "词表": 128,
+         "覆盖后端": "xgrammar / guidance（outlines 与 lm-format-enforcer 未纳入精简版，只在正文按源码行号引述）"},
+        m14),
+    "invariant": {
+        "claim": "所有实现都必须保证『终态之后不再错误地推进状态机』，同时不能挡住 EOS 本身的发出——各家用不同手段满足这同一条约束。",
+        "argument": "xgrammar：_is_terminated 是缓存标志位，只在 accept_tokens 末尾与 rollback 里由 matcher.is_terminated() 刷新；accept_tokens 开头 `if self._is_terminated: return False` 使终态后的推进被短路（trace 第 3 行返回 False 且 num_processed_tokens 停在 2 不再增长）。guidance：EOS 到达且 matcher 已 stopped 时置 rollback_lag=1，随后 rollback(n) 实际只调底层 rollback(n−1)——因为那一格 EOS 本来就没被 consume_tokens 消费过（trace 末行 rollback(2) 在底层只记了一次 rollback(1)，且 terminated 复位为 False）。两者的共同后置条件：回滚之后 is_terminated() 必须重新为假，否则请求再也无法继续生成。",
+    },
+    "quantified": "xgrammar 的 is_terminated() 是 O(1) 读字段（不问底层库）；guidance 的偏移量恒为 0 或 1（rollback_lag ∈ {0,1}）。本例 rollback(2) 在底层只退 1 格，差额正是那个 EOS。另两家：outlines 返回**上一次**的 is_finished()、故意延迟一步（backend_outlines.py:L155-160），lm-format-enforcer 看 current_tokens_prefix 末位是不是 EOS（backend_lm_format_enforcer.py:L81-88）——同一个 bool 返回值，四种算法。",
+})
+
+# ── m15 (figure only) ───────────────────────────────────────────────────────
+mechanisms.append({
+    "mechanism_id": "m15-bitmask-layout",
+    "figure_specs": [{
+        "figure_id": "fig-ch31-15-bitmask-layout",
+        "claim": "位掩码按每 token 一位打包成 int32，一行宽 ceil(|V|/32)——因此它比同一行 logits 小约 32 倍，才敢放进每步的热路径。",
+        "template": "layout",
+        "elements": [
+            "张量形状：(max_num_seqs, (vocab_size + 31) // 32)，dtype=int32",
+            "一行 = 一条序列；一个 int32 字 = 32 个连续 token 的允许位",
+            "初值 -1（补码 32 个 1）= 全部允许",
+            "fill_bitmask(bitmask, batch_index) 只写 batch_index 这一行",
+            "对照：同一条序列的 logits 是 |V| 个 float32",
+        ],
+        "numbers": [
+            {"label": "行宽公式", "value": "(vocab_size + 31) // 32",
+             "provenance": "vllm/v1/structured_output/backend_outlines.py:L95-101；backend_lm_format_enforcer.py:L137-143"},
+            {"label": "|V|=150000 时行宽", "value": "4688 个 int32",
+             "provenance": "traces/bitmask_math.json raw.cases[3].row_int32_words"},
+            {"label": "|V|=150000 时一行掩码", "value": "18752 B = 18.3 KB",
+             "provenance": "traces/bitmask_math.json rows[3]"},
+            {"label": "|V|=150000 时一行 logits", "value": "600000 B = 585.9 KB",
+             "provenance": "traces/bitmask_math.json raw.cases[3].logits_row_bytes"},
+            {"label": "两者之比", "value": "31.997（约 32 倍）",
+             "provenance": "traces/bitmask_math.json raw.cases[3].ratio_logits_over_mask"},
+            {"label": "全允许的填充值", "value": "-1",
+             "provenance": "traces/bitmask_math.json raw.fill_value_all_allowed"},
+        ],
+        "caption_draft": "图：位掩码的内存布局。每 token 一位、打包进 int32，|V|≈15 万时一行 4688 个字 = 18.3 KB，约为同一行 logits（585.9 KB）的 1/32；初值 -1 即『全部允许』。正因为便宜到这个程度，掩码才能在每一步解码的热路径上被重新填一遍。",
+    }],
+})
+
+# ── m18 (figure only) ───────────────────────────────────────────────────────
+mechanisms.append({
+    "mechanism_id": "m18-request-entry-and-handoff",
+    "figure_specs": [{
+        "figure_id": "fig-ch31-18-end-to-end-seam",
+        "claim": "一个带约束的请求从 SamplingParams 到 get_grammar_bitmask 只经过五个接缝，本章讲到最后一个交棒点为止。",
+        "template": "swimlane",
+        "elements": [
+            "① 前端：StructuredOutputsParams 六选一（__post_init__ 互斥校验）→ _validate_structured_outputs 定后端、并可能原地改写请求（choice→EBNF）",
+            "② 引擎建请求：Request.__init__ 挂 StructuredOutputRequest，初始 status = WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR",
+            "③ EngineCore.preprocess_add_request（ch11）：use_structured_output 为真 → grammar_init，编译入线程池",
+            "④ 调度（ch13）：阻塞态 → skipped_waiting；grammar 就绪 → status 改 WAITING，可被调度",
+            "⑤ 交棒：get_grammar_bitmask 筛出本步的结构化请求 id → 下一章（批装配 / 并行填充 / 上卡打 -inf）",
+        ],
+        "numbers": [
+            {"label": "用户可选的约束形态", "value": "6（json / json_object / regex / choice / grammar / structural_tag，互斥）",
+             "provenance": "vllm/sampling_params.py:L40-52 + L59-80"},
+            {"label": "带约束请求的初始状态", "value": "WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR(=2)",
+             "provenance": "traces/m02.json raw.initial_status_value"},
+            {"label": "晋级后的状态", "value": "WAITING(=1)",
+             "provenance": "traces/m02.json raw.round_3.status_value_after"},
+            {"label": "本章终点", "value": "scheduler.py:L1224-1246 get_grammar_bitmask",
+             "provenance": "dossier.code_spine 最后一项"},
+        ],
+        "caption_draft": "图：约束解码请求的端到端接缝。前端校验期定后端并可能改写请求，引擎侧把请求直接放进 WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR（枚举值 2）等编译，就绪后晋级为 WAITING（枚举值 1）；本章到 get_grammar_bitmask 这个交棒点为止，掩码怎么装配、怎么上卡是下一章的事。",
+    }],
+})
+
+# ── m20 ─────────────────────────────────────────────────────────────────────
+mechanisms.append({
+    "mechanism_id": "m20-validation-rewrites-request",
+    "intuition": "过海关时，官员不只是决定『你走哪个通道』，还顺手把你的行李重新打了一次包：choice 这种『多选一』在入关处就被翻译成一段 EBNF 文法，进了国门以后没人再见过『choice』这个词。",
+    "worked_example": we(
+        "m20", "run_m20.py",
+        {"用户写法": 'choice=["red", "blue"]', "backend": "auto",
+         "被测路径": "_validate_structured_outputs → validate_xgrammar_grammar → choice_as_grammar"},
+        m20),
+    "invariant": {
+        "claim": "改写是单向归一：写完 so_params.choice=None; so_params.grammar=EBNF 之后，六选一互斥仍然成立，且 structured_output_key 永远不再返回 CHOICE。",
+        "argument": "get_structured_output_key 的分支顺序是 json → json_object → regex → choice → grammar → structural_tag，逐个判 is not None。改写把 choice 置 None、grammar 置非 None，于是 choice 分支不可能再命中，必落 grammar 分支——键从 (CHOICE, '[\"red\", \"blue\"]') 变成 (GRAMMAR, 'root ::= \"red\" | \"blue\"')。互斥性也守住了：一个字段置 None、另一个由 None 变有值，非 None 计数恒为 1，所以 _validate_structured_outputs 末尾重跑一次 __post_init__ 不会报错。trace 印证三行：改写前 CHOICE(=5)、改写后 GRAMMAR(=4)、引擎侧实际命中的编译分支是 compiler.compile_grammar。",
+    },
+    "quantified": "6 个枚举成员，引擎侧 compile_grammar 只有 5 个分支，差的正是 CHOICE——若真拿 CHOICE 调进 xgrammar 后端，会落到 else 分支 raise ValueError（trace: choice_branch_in_compile_grammar = 『不存在（落 else → ValueError）』）。改写本身的代价是一次 O(选项数) 的字符串拼接（choice_as_grammar，utils.py:L451）加一次 xgr.Grammar.from_ebnf 试解析；本例两个选项拼出 24 字符的 EBNF。",
+})
+
+OUT.write_text(json.dumps({"mechanisms": mechanisms}, ensure_ascii=False, indent=2),
+                encoding="utf-8")
+print(f"wrote {OUT} with {len(mechanisms)} mechanisms")
