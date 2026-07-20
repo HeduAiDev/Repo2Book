@@ -53,6 +53,7 @@ python3 scripts/lint_paper_grounding.py {chapter_dir}    # primer 原理章:# PA
 python3 scripts/lint_chapter_map.py {chapter_dir} --require   # 本章地图:§徽标↔标题/符号防杜撰/画布预算/开篇位置+选读指引
 python3 scripts/lint_anchors.py --all   # 章内锚点+跨章三规(目标存在/文字号一致/../../ 深度)    python3 scripts/lint_punct.py --all   # 半角标点
 python3 scripts/lint_diagram_geometry.py --all   # 图：文字越界/相撞/压框/箭头悬空（--all 走活动实例）
+python3 scripts/lint_chapter_map.py --all   # 全书章图徽标↔标题一致（重编号后必跑：exp-2026-07-20-02 曾 7 章图印旧节号而 --all 全绿）
 ```
 机械问题让 writer 定点小修，不退整章。
 

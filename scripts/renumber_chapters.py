@@ -45,6 +45,7 @@ class Report:
     skipped_moves: int = 0
     files_changed: int = 0
     log: list = field(default_factory=list)
+    unresolved_sections: list = field(default_factory=list)
 
 
 def parse_moves(raw):
@@ -96,6 +97,110 @@ def _own_diagram_move(fname: str, moves):
     return None
 
 
+def _chapter_dir_of(fname: str):
+    """从实例内相对路径取章节目录段(artifacts/<chapter_dir>/...),取不到返回 None。"""
+    parts = fname.replace('\\', '/').split('/')
+    if len(parts) >= 2 and parts[0] == 'artifacts':
+        return parts[1]
+    return None
+
+
+def _refers_to(window: str, tgt: "Move", own_new):
+    """window 内是否有确凿线索指向 tgt 章(目录名/「第 N 章」/上下一章相对词)。"""
+    # 只认"新号"线索:规则 5 跑在规则 1(目录名)与规则 3(「第 N 章」)之后,窗口里的目录名与章号
+    # 此刻必已是新值。若也认旧号,就会在第二趟把已经改好的 §N.M 再推一格——真实翻车样本见
+    # test_no_double_shift_when_chapter_word_equals_another_moves_old_id。
+    if tgt.new_dir in window:
+        return True
+    tgt_new = int(tgt.new_id[2:])
+    if re.search(r'第\s*' + str(tgt_new) + r'\s*章', window):
+        return True
+    if own_new is not None:
+        if '下一章' in window and tgt_new == own_new + 1:
+            return True
+        if ('上一章' in window or '前一章' in window) and tgt_new == own_new - 1:
+            return True
+    return False
+
+
+def _window_points_at(window: str, n: int, cur_num=None):
+    """窗口里是否已有指向"第 n 章"的线索(目录名 chNN- 或「第 n 章」)。
+
+    用于识别"这处 §n.M 本来就对"——例如「第 36 章 §36.8」:36 虽恰是某条 move 的旧号,
+    但窗口明明白白指着现在的第 36 章,它已经自洽,既不该改也不该报。
+    """
+    if re.search(r'\bch0*' + str(n) + r'-', window):
+        return True
+    if re.search(r'第\s*' + str(n) + r'\s*章', window):
+        return True
+    if cur_num is not None:   # 「(上|下)一章 §N.M」——相对词也是确凿线索
+        if '下一章' in window and n == cur_num + 1:
+            return True
+        if ('上一章' in window or '前一章' in window) and n == cur_num - 1:
+            return True
+    return False
+
+
+def _rewrite_sections(text: str, moves, chapter_dir: str):
+    """正文小节号重编号:`## N.M` 标题 + `§N.M` 徽标/引用 + 标题派生的章内锚点。
+    返回 (新文本, unresolved 列表)。
+
+    分三档(见 scripts/tests/test_renumber_sections.py 的来源说明):
+      A 小节标题(^##..######):本章旧号即改——标题绝不会是论文引用。
+      B 本章自引 §N.M(N == 本章旧号):即改。
+      C 跨章引 §N.M:仅当同行近处有指向该章的确凿线索时才改;否则原样保留并登记 unresolved。
+    标题一改,GitHub 由标题派生的锚点(`## 36.2 顶层编排` → `#362-顶层编排`)随之变号,
+    故按本趟真实改过的标题收集 前缀映射,同步改写 `](#362-…)` → `](#382-…)`,否则章内链接全断。
+    条件都绑定到"某个具体的旧号→新号"而非号段,故天然幂等、且不会在同趟内级联位移。
+    """
+    unresolved = []
+    by_old = {int(m.old_id[2:]): m for m in moves}
+    own = next((m for m in moves if chapter_dir in (m.old_dir, m.new_dir)), None)
+    own_old = int(own.old_id[2:]) if own else None
+    own_new = int(own.new_id[2:]) if own else None
+    cur_mo = re.match(r'ch(\d+)', chapter_dir or '')
+    cur_num = int(cur_mo.group(1)) if cur_mo else None
+    anchor_map = {}
+
+    lines = text.split('\n')
+    for li, line in enumerate(lines):
+        if own is not None:
+            mo = re.match(r'(#{2,6}\s*)(\d{1,3})((?:\.\d{1,3})+)', line)
+            if mo and int(mo.group(2)) == own_old:
+                old_num, tail = mo.group(2) + mo.group(3), mo.group(3)
+                new_num = str(own_new) + tail
+                anchor_map[old_num.replace('.', '')] = new_num.replace('.', '')
+                line = mo.group(1) + new_num + line[mo.end():]
+
+        def _sec(mo):
+            n = int(mo.group(1))
+            if own is not None and n == own_old:
+                return '§' + str(own_new) + '.' + mo.group(2)
+            tgt = by_old.get(n)
+            if tgt is not None and n == cur_num:
+                # §N 恰是本章"现在"的号 → 自引,与某条 move 的旧号撞号纯属巧合。两种撞法都会发生:
+                #   ① 新章补进被腾空的号位(ch31-structured-output 的 §31.x 是它自己的小节);
+                #   ② 移动章改完号后,新号又正好是另一条 move 的旧号(ch35 的 §35.x vs 旧 ch35→ch37)。
+                # 不改也不报——上面的分支 B 已先处理过"本章旧号",走到这里的只可能是自引。
+                return mo.group(0)
+            if tgt is not None:
+                window = _sec.line[max(0, mo.start() - 160):mo.start() + 160]
+                if _refers_to(window, tgt, own_new):
+                    return '§' + str(int(tgt.new_id[2:])) + '.' + mo.group(2)
+                if _window_points_at(window, n, cur_num):
+                    return mo.group(0)   # 已自洽(见 _window_points_at),静默放过
+                unresolved.append(f'{chapter_dir}:L{li + 1} §{mo.group(1)}.{mo.group(2)}'
+                                  f' → 近处无指向 {tgt.new_dir} 的线索,未改,请人核')
+            return mo.group(0)
+
+        _sec.line = line
+        lines[li] = re.sub(r'§(\d{1,3})\.(\d{1,3})', _sec, line)
+    text = '\n'.join(lines)
+    for old_a, new_a in anchor_map.items():
+        text = text.replace('](#' + old_a + '-', '](#' + new_a + '-')
+    return text, unresolved
+
+
 def _rewrite_text(text: str, moves, report, fname):
     orig = text
     # 0) 链接路径规范化:](../chNN- → ](../../chNN-(历史笔误,narrative/ 出发需两层)
@@ -130,6 +235,13 @@ def _rewrite_text(text: str, moves, report, fname):
             return '§' + local_nummap[n] + '.' + mo.group(2) if n in local_nummap else mo.group(0)
 
         text = re.sub(r'§(\d{1,3})\.(\d{1,3})', _sec, text)
+    # 5) 正文 `## N.M` 小节标题与 §N.M 引用(exp-2026-07-20-02)——原引擎只改 diagrams/*.py,
+    #    导致移动章正文滞留旧号、与已改的图徽标打架、lint_chapter_map --require 全红。
+    if fname.replace('\\', '/').endswith('.md') and '/narrative/' in fname.replace('\\', '/'):
+        chdir = _chapter_dir_of(fname)
+        if chdir:
+            text, un = _rewrite_sections(text, moves, chdir)
+            report.unresolved_sections += un
     if text != orig:
         report.files_changed += 1
         report.log.append(f"rewrote {fname}")
@@ -172,6 +284,25 @@ def apply(inst: Path, moves, dry_run: bool) -> Report:
     return rep
 
 
+def apply_sections_only(inst: Path, moves, dry_run: bool) -> Report:
+    """补丁模式:目录已迁完、只有正文小节号滞留旧号时,单跑规则 5(exp-2026-07-20-02 修复通道)。
+
+    幂等——_rewrite_sections 的条件都绑定具体旧号,跑第二遍是 no-op。
+    """
+    rep = Report()
+    for f in sorted(inst.glob("artifacts/*/narrative/*.md")):
+        chdir = f.parent.parent.name
+        t = f.read_text(encoding="utf-8")
+        nt, un = _rewrite_sections(t, moves, chdir)
+        rep.unresolved_sections += un
+        if nt != t:
+            rep.files_changed += 1
+            rep.log.append(f"sections rewritten {f.relative_to(inst)}")
+            if not dry_run:
+                f.write_text(nt, encoding="utf-8")
+    return rep
+
+
 def validate(inst: Path):
     probs = []
     dirs = {d.name for d in (inst / "artifacts").iterdir() if d.is_dir()}
@@ -200,6 +331,8 @@ def main():
     ap.add_argument("--plan")
     ap.add_argument("--insert")
     ap.add_argument("--validate", action="store_true")
+    ap.add_argument("--sections-only", action="store_true",
+                    help="目录已迁完,只补正文 §N.M / `## N.M` 小节号(见 apply_sections_only)")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
     inst = ROOT / "instances" / a.instance
@@ -211,8 +344,13 @@ def main():
         slug, _, before = a.insert.partition("@before:")
         print(json.dumps(build_insert_plan(inst, slug, before), ensure_ascii=False, indent=2))
         return
-    rep = apply(inst, load_plan(a.plan), a.dry_run)
+    moves = load_plan(a.plan)
+    rep = (apply_sections_only(inst, moves, a.dry_run) if a.sections_only
+           else apply(inst, moves, a.dry_run))
     print("\n".join(rep.log))
+    if rep.unresolved_sections:
+        print("⚠️ 以下 §N.M 无法确证所指章节,未改,请人核:")
+        print("\n".join("   " + u for u in rep.unresolved_sections))
     print(f"moves done={rep.done_moves} skipped={rep.skipped_moves} files_changed={rep.files_changed}")
     probs = [] if a.dry_run else validate(inst)
     if probs:

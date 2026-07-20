@@ -135,15 +135,22 @@ def test_papers_map_arxiv_ref_untouched(tmp_path):
     assert json.loads(papers_map.read_text(encoding="utf-8")) == payload
 
 
-def test_chapter_self_reference_anchor_untouched(tmp_path):
-    """正文自引用锚点"[§2.9](#anchor)"是章内小节链接,不是 diagrams 徽标;即便 ch02 在本次
-    moves 里(SWAP: ch02→ch03),也不该被 §N.M 规则改写——否则会与未重写的 `## 2.9` 标题错位。"""
+def test_chapter_self_reference_section_follows_heading(tmp_path):
+    """正文自引用 "[§2.9](#anchor)" 与小节标题 `## 2.9` 是同一个号,必须同进同退。
+
+    历史上规则 4 只改 diagrams/*.py,正文标题不改,于是这里刻意保持 §2.9 不变以免与标题错位;
+    exp-2026-07-20-02 补上正文标题重编号(规则 5)后,该权宜失效——标题已成 `## 3.9`,
+    §徽标必须跟到 §3.9,否则正文自相矛盾(vLLM ch33-39 正是栽在这里)。
+    """
     inst = _mk(tmp_path)
     f = inst / "artifacts" / "ch02-beta" / "narrative" / "chapter.md"
-    f.write_text(f.read_text(encoding="utf-8") + "\n参见[§2.9](#anchor)。\n", encoding="utf-8")
+    f.write_text(f.read_text(encoding="utf-8") + "\n## 2.9 小节\n\n参见[§2.9](#anchor)。\n",
+                 encoding="utf-8")
     rc.apply(inst, rc.parse_moves(SWAP), dry_run=False)
-    moved = inst / "artifacts" / "ch03-beta" / "narrative" / "chapter.md"
-    assert "[§2.9](#anchor)" in moved.read_text(encoding="utf-8")
+    moved = (inst / "artifacts" / "ch03-beta" / "narrative" / "chapter.md").read_text(encoding="utf-8")
+    assert "## 3.9 小节" in moved
+    assert "[§3.9](#anchor)" in moved
+    assert "§2.9" not in moved
 
 
 def test_diagram_own_badge_scoped_and_zero_pad_normalized(tmp_path):

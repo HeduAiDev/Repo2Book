@@ -10,9 +10,9 @@
 
 ![本章地图：KV Connector 契约怎样按角色切分、调度器怎样用它决策与回收](../diagrams/chapter-map.png)
 
-只想看阻塞请求怎么被提升回调度，直接跳 §33.5；想跟一次调度步的决策全流程，从契约本身讲起，按 §33.2→§33.5 顺序读。
+只想看阻塞请求怎么被提升回调度，直接跳 §35.5；想跟一次调度步的决策全流程，从契约本身讲起，按 §35.2→§35.5 顺序读。
 
-## 33.1 为什么要把 prefill 和 decode 拆开
+## 35.1 为什么要把 prefill 和 decode 拆开
 
 先看一个让人头疼的现象。
 
@@ -37,7 +37,7 @@ vLLM 没有把"KV 怎么搬"写死。它在 `vllm/distributed/kv_transfer/kv_con
 
 这一章还要还一笔账。第 14 章讲调度循环时，我们见过 `waiting` 之外还有个 `skipped_waiting` 队列，专门隔离一种叫 `WAITING_FOR_REMOTE_KVS` 的阻塞态请求——当时只说"它在等远程 KV 传输"，把完整路径推给了后面。[第 14 章 §14.4](../../ch14-scheduler/narrative/chapter.md) 埋下的这条线，本章收尾：一个请求怎么进这个阻塞态、KV 到位后怎么被提升回来重新调度。
 
-## 33.2 role-split：一个 connector，两副面孔
+## 35.2 role-split：一个 connector，两副面孔
 
 设计这套抽象时，vLLM 面对一个本质矛盾：
 
@@ -240,9 +240,9 @@ The class provides the following primitives:
         return None, None
 ```
 
-`get_finished` 返回一对集合：（发完/存完的 req_id，收完/载完的 req_id）。这两个集合经 `KVConnectorOutput` 回传给调度器，就是图里那条细回传箭头。**收完**触发"提升请求重新调度"，**发完**触发"释放可以释放的 block"——后面 §33.5 我们会看到调度器怎么消化它们。
+`get_finished` 返回一对集合：（发完/存完的 req_id，收完/载完的 req_id）。这两个集合经 `KVConnectorOutput` 回传给调度器，就是图里那条细回传箭头。**收完**触发"提升请求重新调度"，**发完**触发"释放可以释放的 block"——后面 §35.5 我们会看到调度器怎么消化它们。
 
-## 33.3 KVConnectorFactory：按 role 各造一份
+## 35.3 KVConnectorFactory：按 role 各造一份
 
 契约定义好了，谁来实例化？`KVConnectorFactory`。它干两件事：维护一张**懒加载注册表**，以及按 role **分别构造**两份实例。
 
@@ -359,7 +359,7 @@ KVConnectorFactory.register_connector(
 
 命中了远程 token（`num_external_tokens > 0`），就把这个请求记进 `_requests_need_load`。下一步 `build_connector_meta` 会遍历这张表，把它打成 load 计划下发给 worker。决策侧的活儿，到此就是"查命中 → 登记 → 打包"三步，全程不碰一个 KV tensor。
 
-## 33.4 调度器集成：查命中、隔离、不堵队头
+## 35.4 调度器集成：查命中、隔离、不堵队头
 
 契约清楚了，现在看**调度器怎么把它编织进 WAITING 调度循环**。这是本章最硬的一段，也是第 14 章那笔账的正主。
 
@@ -450,7 +450,7 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
         )
 ```
 
-如果是阻塞态，就调 `_try_promote_blocked_waiting_request` 试着把它"提升"回可调度状态。提升成功就往下走正常调度；**提升失败**（KV 还没到），就 `pop` 出来 `prepend` 进 `step_skipped_waiting`——隔离，`continue` 下一个。`step_skipped_waiting` 是这一步攒下的隔离请求的临时筐，循环末尾再一并回灌。提升的细节是 §33.5 的事，先按下。
+如果是阻塞态，就调 `_try_promote_blocked_waiting_request` 试着把它"提升"回可调度状态。提升成功就往下走正常调度；**提升失败**（KV 还没到），就 `pop` 出来 `prepend` 进 `step_skipped_waiting`——隔离，`continue` 下一个。`step_skipped_waiting` 是这一步攒下的隔离请求的临时筐，循环末尾再一并回灌。提升的细节是 §35.5 的事，先按下。
 
 如果**不是**阻塞态（全新请求），走查命中主线。先看本地命中，再问 connector 要远程命中：
 
@@ -488,7 +488,7 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
                     )
 ```
 
-这段把 §33.2 的契约用上了。`get_num_new_matched_tokens` 返回 `(ext_tokens, load_kv_async)`。还记得返回值第一项可以是 `None` 吗——这里就是消费点：`ext_tokens is None` 表示"connector 还说不准"，调度器照样 `pop` + 隔离进 `step_skipped_waiting`，下步再问。否则把远程命中数和本地命中数加起来，得到总的 `num_computed_tokens`。
+这段把 §35.2 的契约用上了。`get_num_new_matched_tokens` 返回 `(ext_tokens, load_kv_async)`。还记得返回值第一项可以是 `None` 吗——这里就是消费点：`ext_tokens is None` 表示"connector 还说不准"，调度器照样 `pop` + 隔离进 `step_skipped_waiting`，下步再问。否则把远程命中数和本地命中数加起来，得到总的 `num_computed_tokens`。
 
 接下来 `load_kv_async` 标志开始驱动分支。异步加载时，本步**一个新 token 都不能算**：
 
@@ -533,9 +533,9 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
                     )
 ```
 
-`num_external_computed_tokens` 告诉分配器"还要为这么多远程命中 token 预留 block"。`delay_cache_blocks=load_kv_async` 是关键的安全阀：它**推迟**把这些 block 注册进 prefix cache。为什么要推迟？因为 block 此刻还是空的——远程 KV 没到。如果现在就把它们登记进 prefix cache，别的请求一查就"命中"了这些空 block，读到脏数据。所以推迟到 KV 真正到位（§33.5 的 `_update_waiting_for_remote_kv` 里）才 `cache_blocks`。
+`num_external_computed_tokens` 告诉分配器"还要为这么多远程命中 token 预留 block"。`delay_cache_blocks=load_kv_async` 是关键的安全阀：它**推迟**把这些 block 注册进 prefix cache。为什么要推迟？因为 block 此刻还是空的——远程 KV 没到。如果现在就把它们登记进 prefix cache，别的请求一查就"命中"了这些空 block，读到脏数据。所以推迟到 KV 真正到位（§35.5 的 `_update_waiting_for_remote_kv` 里）才 `cache_blocks`。
 
-分配成功后，立刻调 `update_state_after_alloc`——就是 §33.3 看过的那个一行实质逻辑的方法，让 connector 登记"这个请求下一步要 load"。决策侧的三步（查命中 / 算总数 / 登记）到这里齐了。
+分配成功后，立刻调 `update_state_after_alloc`——就是 §35.3 看过的那个一行实质逻辑的方法，让 connector 登记"这个请求下一步要 load"。决策侧的三步（查命中 / 算总数 / 登记）到这里齐了。
 
 最后是 `load_kv_async` 的收尾分支，请求进入阻塞态被隔离：
 
@@ -583,9 +583,9 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
 
 `build_connector_meta` 把本步所有 load/save 计划打包成不透明 meta，挂到 `scheduler_output.kv_connector_metadata`，随 `SchedulerOutput` 下发给 worker。worker 侧 `bind_connector_metadata` 取用、`start_load_kv` 启动搬运——那是下一章的故事。决策侧的一步，到此闭环。
 
-## 33.5 KV 到位：提升回 WAITING，重新调度
+## 35.5 KV 到位：提升回 WAITING，重新调度
 
-现在补上 §33.4 按下的那块：请求进了 `WAITING_FOR_REMOTE_KVS`，KV 在 worker 侧异步传输。**传完之后**，它怎么被唤醒、重新进入调度？这是第 14 章那笔账的最后一笔。
+现在补上 §35.4 按下的那块：请求进了 `WAITING_FOR_REMOTE_KVS`，KV 在 worker 侧异步传输。**传完之后**，它怎么被唤醒、重新进入调度？这是第 14 章那笔账的最后一笔。
 
 下面这张状态机图，是整条提升路径的全貌：
 
@@ -626,14 +626,14 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
             self._free_blocks(self.requests[req_id])
 ```
 
-还记得 §33.2 的 `get_finished` 返回（发完，收完）两个集合吗？这里就是它们的落点：
+还记得 §35.2 的 `get_finished` 返回（发完，收完）两个集合吗？这里就是它们的落点：
 
 - **`finished_recving`（收完）**：如果请求还在 `WAITING_FOR_REMOTE_KVS`，把它的 req_id 加进 `finished_recving_kv_req_ids`——这是个"可以提升了"的标记集。（若请求已经 finished，说明它收完时已结束，直接释放 block。）
 - **`finished_sending`（发完）**：KV 已经发出去了，对应的 block 可以安全释放，直接 `_free_blocks`。
 
 注意：这个方法**只打标记**，并不在这里提升。提升发生在**下一个调度步**遍历 `skipped_waiting` 时。这是个干净的解耦——`update_from_output` 只负责把 worker 的信号翻译成状态集，调度循环负责消费状态集。
 
-下一步 `schedule` 的 WAITING 循环遍历 `skipped_waiting`，又遇到这个 `WAITING_FOR_REMOTE_KVS` 请求。回到 §33.4 那个分叉：它是阻塞态，调 `_try_promote_blocked_waiting_request`。这次标记已经在了：
+下一步 `schedule` 的 WAITING 循环遍历 `skipped_waiting`，又遇到这个 `WAITING_FOR_REMOTE_KVS` 请求。回到 §35.4 那个分叉：它是阻塞态，调 `_try_promote_blocked_waiting_request`。这次标记已经在了：
 
 ```python
 # vllm/v1/core/sched/scheduler.py:L1998-L2013（grammar/streaming 分支与本章无关，已略）
@@ -691,7 +691,7 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
 
 正常路径（非失败）做两件事：
 
-**第一，`cache_blocks`**——现在 KV 真到位了，把之前 `delay_cache_blocks` 推迟登记的 block 正式注册进 prefix cache。这正是 §33.4 那个安全阀的另一半：分配时推迟、到位后补登记，全程没有任何空 block 被别的请求误命中。一前一后，闭合。
+**第一，`cache_blocks`**——现在 KV 真到位了，把之前 `delay_cache_blocks` 推迟登记的 block 正式注册进 prefix cache。这正是 §35.4 那个安全阀的另一半：分配时推迟、到位后补登记，全程没有任何空 block 被别的请求误命中。一前一后，闭合。
 
 **第二，整 prompt 全命中时回退一个 token。** 如果远程 KV 覆盖了**全部** prompt token（`num_computed_tokens == num_tokens`），那就一个 token 都不用再过前向了——可问题是，**不过前向就采不出下一个 token**。模型要先吃至少一个位置、算出 logits，才能采样出第一个生成 token。所以这里硬把 `num_computed_tokens` 回退一个：`num_tokens - 1`，留最后一个 token 走前向产生 logits。这是个容易被漏掉的边界，少了它，全命中的请求会卡死在"没东西可算、也没 token 可吐"。
 
@@ -731,11 +731,11 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
         return self.connector.request_finished(request, block_ids[0])
 ```
 
-`request_finished` 返回一个 bool：`False` 表示"我不管了，调度器你直接释放"；`True` 表示"**我接管这些 block 的异步释放**，你先别动"。返回 `True` 时，block 一直保留，直到 connector 经 `get_finished` 上报 `finished_sending`——也就是 §33.5 开头 `_update_from_kv_xfer_finished` 里 `finished_sending` 那个分支真正 `_free_blocks`。
+`request_finished` 返回一个 bool：`False` 表示"我不管了，调度器你直接释放"；`True` 表示"**我接管这些 block 的异步释放**，你先别动"。返回 `True` 时，block 一直保留，直到 connector 经 `get_finished` 上报 `finished_sending`——也就是 §35.5 开头 `_update_from_kv_xfer_finished` 里 `finished_sending` 那个分支真正 `_free_blocks`。
 
 这就把整章首尾扣上了：`get_finished`（搬运侧上报）→ `finished_sending`（决策侧消化）→ `_free_blocks`（延迟释放落地）。PD 分离的 KV 既能安全地搬进来，也能安全地送出去。
 
-## 33.6 亲手验证：状态机真的这么转吗
+## 35.6 亲手验证：状态机真的这么转吗
 
 正文一路是真实源码，但"控制流确实如此"光读容易将信将疑。配套的精简版把这套 KV connector 集成从 `vllm/v1/core/sched/scheduler.py` 里剥出来——同名、同结构、同控制流，只删掉与本章主线正交的分支（lora 约束、encoder 调度、chunked prefill、统计日志、HMA 多 group）。它不 import vllm、不需要 GPU，`pytest` 直接能跑，专门用来打断点亲眼看状态怎么转。
 
@@ -747,28 +747,28 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
 | —  | worker 报 `finished_recving` | `{req}`（加入） | — | — | — | — |
 | 2 | KV 已到，再遍历到该请求 | `{req}`（含 req） | `WAITING_FOR_REMOTE_KVS` | 0 | `True` | `WAITING`（提升，移出集合） |
 
-第一轮返回 `False`、请求被继续隔离；中间 worker 信号把 req 加进标记集；第二轮命中标记、提升回 `WAITING`、并从集合移除。如果把 `num_preemptions` 设成非零，第二轮出状态就变成 `PREEMPTED`——和 §33.5 的分支一致。
+第一轮返回 `False`、请求被继续隔离；中间 worker 信号把 req 加进标记集；第二轮命中标记、提升回 `WAITING`、并从集合移除。如果把 `num_preemptions` 设成非零，第二轮出状态就变成 `PREEMPTED`——和 §35.5 的分支一致。
 
 **为什么这个循环一定会收敛、不会无限隔离？** 关键在于**每个请求至多触发一次提升**：worker 的异步传输只会"完成"一次，完成后 `finished_recving` 把 req_id 一次性加进 `finished_recving_kv_req_ids`；下一个调度步遍历到它，标记命中即提升，`_update_waiting_for_remote_kv` 顺手把它从集合移出、状态不再阻塞。设传输需 $`k`$ 步，则前 $`k`$ 步该请求每步付出一次 $`O(1)`$ 检查后被隔离回去，第 $`k+1`$ 步标记到位、提升、移出集合。之后它不再是阻塞态，至多被检查 $`k+1`$ 步、永不重入这条路径。有限步内必然提升或失败，不存在活锁。
 
 失败路径同理收敛。worker 对一次传输只上报一次终结信号（`finished_recving` 或失败标记），`_update_waiting_for_remote_kv` 处理后都会把 req 移出对应集合、状态不再阻塞。失败后即便重试，那也是一次全新的远程查询、重新从头计数 $`k`$ ，而不是在同一阻塞态里空转。这样"每个请求至多被提升一次"的不变量就覆盖到了状态机里的全部箭头——成功支与红色失败回退支都闭合。
 
-再配一个 `align_to_block_size` 的边界数值，确认 block 粒度对齐没记错。函数本身按 `(n-1)//b*b` 算，对直接传入的实参：`align(9, 4) = 8`、`align(8, 4) = 4`、`align(1, 4) = 0`——命中数永远落在 block 边界上。但别忘了 `ExampleConnector` 调用时先减一（`len(token_ids) - 1`），所以一个 9-token prompt 真实命中是 `align(9-1, 4) = align(8, 4) = 4`，与 §33.4 那个数对上。
+再配一个 `align_to_block_size` 的边界数值，确认 block 粒度对齐没记错。函数本身按 `(n-1)//b*b` 算，对直接传入的实参：`align(9, 4) = 8`、`align(8, 4) = 4`、`align(1, 4) = 0`——命中数永远落在 block 边界上。但别忘了 `ExampleConnector` 调用时先减一（`len(token_ids) - 1`），所以一个 9-token prompt 真实命中是 `align(9-1, 4) = align(8, 4) = 4`，与 §35.4 那个数对上。
 
 把这个数继续往下串，就能把全章最微妙的两个数值点接成一条端到端追踪：`block_size=4`、prompt 共 9 token、远程**全命中**。`num_computed_tokens` 随调度阶段的演化如下。
 
 | 阶段 | 触发点 | `num_computed_tokens` | 含义 |
 |---|---|---|---|
-| 查命中 | `get_num_new_matched_tokens` | `0 + align(8,4) = 4` | 本地 0、远程命中对齐到 4（§33.4） |
+| 查命中 | `get_num_new_matched_tokens` | `0 + align(8,4) = 4` | 本地 0、远程命中对齐到 4（§35.4） |
 | 隔离 | 置 `WAITING_FOR_REMOTE_KVS` | `4` | 记下但暂不使用（L553） |
 | KV 到位 | `_update_waiting_for_remote_kv` 入口 | `4`（=`num_tokens-…`，仍 < 9） | `cache_blocks` 登记到位的 block |
 | 回退判定 | 若 `==num_tokens` | （此例 4≠9，不触发） | 全命中边界仅在覆盖满 9 token 时触发 |
 
-第三、四行就是边界的关键：只有当远程**真覆盖到全部** prompt token（`num_computed_tokens == num_tokens`，即对齐数恰好等于 `num_tokens`）时，回退分支才把它压回 `num_tokens - 1`，留最后一个 token 走前向产生 logits。本例对齐到 4、不等于 9，所以不触发回退；剩下的零头 token 正常走前向。把这条数值线在脑子里走一遍，§33.3 的"对齐"与 §33.5 的"回退"就拧成了同一根线。
+第三、四行就是边界的关键：只有当远程**真覆盖到全部** prompt token（`num_computed_tokens == num_tokens`，即对齐数恰好等于 `num_tokens`）时，回退分支才把它压回 `num_tokens - 1`，留最后一个 token 走前向产生 logits。本例对齐到 4、不等于 9，所以不触发回退；剩下的零头 token 正常走前向。把这条数值线在脑子里走一遍，§35.3 的"对齐"与 §35.5 的"回退"就拧成了同一根线。
 
 精简版与真实 `f3fef123` 源码逐行对照，测试全绿。但请记住：精简版只是"剥掉无关分支后能在本地跑的这几十行"，本章的主线，始终是真实源码本身。
 
-## 33.7 小结
+## 35.7 小结
 
 这一章拆了 PD 分离的"上半场"——抽象与调度集成。三件事串起来：
 

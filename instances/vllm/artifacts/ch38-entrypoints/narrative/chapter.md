@@ -1,6 +1,6 @@
 # 第 38 章　OpenAI 兼容服务器：从 HTTP 请求到 AsyncLLM 的异步桥
 
-## 36.1 你在这里
+## 38.1 你在这里
 
 ![本章在全书地图中的位置](../diagrams/roadmap.png)
 
@@ -20,11 +20,11 @@
 
 ![本章地图：请求剖面与服务器生命周期源码站牌图](../diagrams/chapter-map.png)
 
-只想看一条 chat 请求怎么从 HTTP 走到 AsyncLLM、再分叉成流式或非流式，跳读 §36.4→§36.5（鉴权门在 §36.8）。想看服务器自己怎么装配起来、又怎么优雅关停，则读 §36.3、§36.6、§36.7 这条独立支线；通读就按 §36.2 顺序往下走。
+只想看一条 chat 请求怎么从 HTTP 走到 AsyncLLM、再分叉成流式或非流式，跳读 §38.4→§38.5（鉴权门在 §38.8）。想看服务器自己怎么装配起来、又怎么优雅关停，则读 §38.3、§38.6、§38.7 这条独立支线；通读就按 §38.2 顺序往下走。
 
 ---
 
-## 36.2 顶层编排：一个 `async with` 框住引擎的一生
+## 38.2 顶层编排：一个 `async with` 框住引擎的一生
 
 进程的入口在 `vllm/entrypoints/openai/api_server.py`。剥掉日志装饰后，启动逻辑只有两层薄薄的协程：
 
@@ -97,7 +97,7 @@ def setup_server(args):
 
 那两条 `# workaround` 注释不是随口写的——它们各自指向一次踩过的坑。绑端口的注释挂着 issue 链接；`set_ulimit()` 则是为了防止 uvicorn 在并发请求过多时直接丢请求。源码里这种"伤疤注释"很值钱，它告诉你哪一行不能随手删。
 
-这里还顺手装了个 `SIGTERM` handler：初始化阶段收到 SIGTERM，就抛 `KeyboardInterrupt` 把启动打断。注意这只是**初始化期**的兜底；等服务器真正跑起来，关停信号会被 launcher 里另一套机制接管（见 [§36.7](#367-优雅关停信号watchdog与那个晚-await-的-shutdown_task)）。
+这里还顺手装了个 `SIGTERM` handler：初始化阶段收到 SIGTERM，就抛 `KeyboardInterrupt` 把启动打断。注意这只是**初始化期**的兜底；等服务器真正跑起来，关停信号会被 launcher 里另一套机制接管（见 [§38.7](#387-优雅关停信号watchdog与那个晚-await-的-shutdown_task)）。
 
 **第二，`async with build_async_engine_client(...)` 把引擎的整个生命周期框成了一个上下文。** 这是本章和第 4 章的接缝。进入这个 `with`，`AsyncLLM` 就起来了；离开它（无论正常退出还是抛异常），引擎一定被 shutdown。我们来看框子里装的是什么：
 
@@ -177,7 +177,7 @@ async def build_async_engine_client_from_engine_args(
 
 ---
 
-## 36.3 装配现场：FastAPI app、中间件与那一票 handler
+## 38.3 装配现场：FastAPI app、中间件与那一票 handler
 
 `async with` 拿到 `engine_client` 后，`build_and_serve` 负责把这台引擎"接线"到一个 FastAPI 应用上：
 
@@ -251,7 +251,7 @@ def build_app(
     return app
 ```
 
-三处看点。**一是 `FastAPI(lifespan=lifespan)`**——把生命周期钩子交给 `lifespan`，[§36.6](#366-lifespan-与启动序) 细看。**二是路由按 `supported_tasks` 条件注册**：我们关心的 `/v1/chat/completions` 在 `"generate"` 这一支里；`pooling`/`transcription` 那些是平行的其它 API 面，与 chat 请求的控制流互不相干。**三是那一排 `exception_handler`**：从最具体的 `HTTPException`、`EngineDeadError`，到兜底的 `Exception`，每种异常都有归宿，绝不让一个未捕获的异常裸奔到客户端。后面会看到 `EngineDeadError` 和 `GenerationError` 是怎么被一路抛上来、又在这里被翻译成体面错误响应的。
+三处看点。**一是 `FastAPI(lifespan=lifespan)`**——把生命周期钩子交给 `lifespan`，[§38.6](#386-lifespan-与启动序) 细看。**二是路由按 `supported_tasks` 条件注册**：我们关心的 `/v1/chat/completions` 在 `"generate"` 这一支里；`pooling`/`transcription` 那些是平行的其它 API 面，与 chat 请求的控制流互不相干。**三是那一排 `exception_handler`**：从最具体的 `HTTPException`、`EngineDeadError`，到兜底的 `Exception`，每种异常都有归宿，绝不让一个未捕获的异常裸奔到客户端。后面会看到 `EngineDeadError` 和 `GenerationError` 是怎么被一路抛上来、又在这里被翻译成体面错误响应的。
 
 `build_app` 造的是个"空壳应用"——路由注册了，但路由背后的 handler 对象还没造。这件事交给 `init_app_state`：
 
@@ -305,7 +305,7 @@ async def init_app_state(
 
 ---
 
-## 36.4 请求的一生（上）：从 HTTP 到 token
+## 38.4 请求的一生（上）：从 HTTP 到 token
 
 地基铺完，看一条真请求怎么走。入口是 chat 路由的 handler，在 `vllm/entrypoints/openai/chat_completion/api_router.py`：
 
@@ -443,7 +443,7 @@ async def create_chat_completion(
 
 把这段读成一条流水线：**渲染 → 取 request_id → 算 SamplingParams → 调引擎拿生成器 → 按 `request.stream` 分流**。每一步都值得拆开看。
 
-**渲染：`render_chat_request`。** 它是 [§36.3](#363-装配现场fastapi-app中间件与那一票-handler) 提到的"两层分层"的现形处：
+**渲染：`render_chat_request`。** 它是 [§38.3](#383-装配现场fastapi-app中间件与那一票-handler) 提到的"两层分层"的现形处：
 
 ```python
 # vllm/entrypoints/openai/chat_completion/serving.py:L198-L223
@@ -546,13 +546,13 @@ def _base_request_id(
 
 handler 只认这个协议——它不知道、也不需要知道背后是 `AsyncLLM`、是几个子进程、output_handler 怎么多路分发。它要的就是一个会持续吐 `RequestOutput` 的异步生成器。`RequestOutput` 的核心字段有：`prompt_token_ids`（输入 token 列表）、`outputs`（一组 `CompletionOutput`，每个含 `text` 增量或全文、`token_ids`、`finish_reason`、`index`）、`num_cached_tokens`（KV 缓存命中数）——下面两个分支直接从这些字段取值。`errored` / `dead_error` 这两个属性也在协议里，下一节就要用到。
 
-主线里那句 `assert len(generators) == 1` 值得解释。触发多个生成器的只有一件事：一次塞多段 prompt（`len(engine_inputs) > 1`）——这时才会派生出多个 `sub_request_id = f"{request_id}_{i}"`。`n > 1`（要多个候选回答）走的是完全独立的另一条通道：`request.to_sampling_params(...)` 把 `n=self.n` 原样塞进*同一个* `SamplingParams`（`vllm/entrypoints/openai/chat_completion/protocol.py:586`），引擎照样只起一个生成器，只是在同一个 `RequestOutput.outputs` 里一次给出多个 `CompletionOutput`（各有自己的 `index`）——[§36.5.1](#3651-流式逐-token-推成-sse) 那句 `num_choices = 1 if request.n is None else request.n` 和 `for output in res.outputs: i = output.index` 就是在消费这些并列的候选，而不是多个 sub_request_id。最常见的单回答单 prompt 场景，两条通道都退化成一，`generators` 自然长度为一。本章盯着这条主线走。
+主线里那句 `assert len(generators) == 1` 值得解释。触发多个生成器的只有一件事：一次塞多段 prompt（`len(engine_inputs) > 1`）——这时才会派生出多个 `sub_request_id = f"{request_id}_{i}"`。`n > 1`（要多个候选回答）走的是完全独立的另一条通道：`request.to_sampling_params(...)` 把 `n=self.n` 原样塞进*同一个* `SamplingParams`（`vllm/entrypoints/openai/chat_completion/protocol.py:586`），引擎照样只起一个生成器，只是在同一个 `RequestOutput.outputs` 里一次给出多个 `CompletionOutput`（各有自己的 `index`）——[§38.5.1](#3851-流式逐-token-推成-sse) 那句 `num_choices = 1 if request.n is None else request.n` 和 `for output in res.outputs: i = output.index` 就是在消费这些并列的候选，而不是多个 sub_request_id。最常见的单回答单 prompt 场景，两条通道都退化成一，`generators` 自然长度为一。本章盯着这条主线走。
 
 最后，`if request.stream:` 决定返回哪个生成器：流式返回 `chat_completion_stream_generator`，非流式 `await chat_completion_full_generator`。两个分支吃的是**同一个 `result_generator`**——这是下一节的关键。
 
 ---
 
-## 36.5 请求的一生（下）：同一个生成器，两种姿态
+## 38.5 请求的一生（下）：同一个生成器，两种姿态
 
 这里是本章的概念核心，所以慢一点。
 
@@ -564,7 +564,7 @@ handler 只认这个协议——它不知道、也不需要知道背后是 `Asyn
 
 > **v0.21.0 更新**：新请求开关 `return_prompt_text` 是这条"两种姿态"主线的一个干净注脚。置真时，响应会回显 `prompt_text`——chat template 渲染后、真正喂给模型的那串 prompt 文本，便于调试"我到底发进去了什么"。它的填充节奏正好被两种姿态分成两半：流式只在**首个 SSE chunk** 写 `prompt_text`（取 `res.prompt`，之后的增量 chunk 故意留空，填充点 `chat_completion/serving.py:L512`），非流式则在聚合后从 `final_res.prompt` 一次性写入（`:L1379`）。同一份信息，因消费姿态不同而落在流的两端——首块 vs 末尾，恰与下面 `role`/`usage` 的发放时机同构。
 
-### 36.5.1 流式：逐 token 推成 SSE
+### 38.5.1 流式：逐 token 推成 SSE
 
 先看流式。`chat_completion_stream_generator` 是个 async 生成器，它 `async for` 地消费 `result_generator`，每来一个 `RequestOutput` 就吐若干 SSE 帧。开头第一拍很特别：
 
@@ -667,9 +667,9 @@ yield "data: [DONE]\n\n"
 
 用量是**可选的、并且单独一块**：只有客户端在 `stream_options` 里要了 `include_usage`，才在所有内容块之后补一个 `choices=[]` 只带 `usage` 的块。最后无论如何都 `yield "data: [DONE]\n\n"`——SSE 流的终止哨兵，告诉客户端"说完了"。
 
-这里有个一眼容易滑过、却是整章关停设计的命门的细节：看那两个 `except`。**流里出了异常，不是抛出去，而是 `yield` 成一个 error data 帧。** 为什么不抛？因为流式响应一旦开始，HTTP 200 状态码**早就发出去了**——回想 [§36.4](#364-请求的一生上从-http-到-token) 那个 `StreamingResponse`，它在第一个字节落地时状态行就定了。状态码改不了，错误就只能作为流里的下一帧推给客户端。
+这里有个一眼容易滑过、却是整章关停设计的命门的细节：看那两个 `except`。**流里出了异常，不是抛出去，而是 `yield` 成一个 error data 帧。** 为什么不抛？因为流式响应一旦开始，HTTP 200 状态码**早就发出去了**——回想 [§38.4](#384-请求的一生上从-http-到-token) 那个 `StreamingResponse`，它在第一个字节落地时状态行就定了。状态码改不了，错误就只能作为流里的下一帧推给客户端。
 
-这个"200 已发、改不了状态码"的约束会留下一个尾巴：如果引擎在流式生成途中**彻底死了**，异常被吞进了 error 帧，服务器进程本身怎么知道该退出？这个问题留到 [§36.7](#367-优雅关停信号watchdog与那个晚-await-的-shutdown_task)，那里有个 watchdog 专门兜底。
+这个"200 已发、改不了状态码"的约束会留下一个尾巴：如果引擎在流式生成途中**彻底死了**，异常被吞进了 error 帧，服务器进程本身怎么知道该退出？这个问题留到 [§38.7](#387-优雅关停信号watchdog与那个晚-await-的-shutdown_task)，那里有个 watchdog 专门兜底。
 
 把上面这些规则落到一个具体的两 token 回答 `"Hi there"`（`include_usage=False`，单 choice）上，整个流逐帧长这样：
 
@@ -683,7 +683,7 @@ yield "data: [DONE]\n\n"
 
 读这张表只盯一件事：`role` 只在第 1 帧出现一次，之后每帧只追加 `content` 增量，`finish_reason` 直到末块才从 `null` 翻成 `"stop"`。客户端把第 2、3 帧的 `content` 顺序拼接，就还原出完整答案——这就是"打字机"效果的物理来源。
 
-### 36.5.2 非流式：攒到末个再聚合
+### 38.5.2 非流式：攒到末个再聚合
 
 非流式简单得多，因为它不在乎中间过程，只要最终结果：
 
@@ -756,7 +756,7 @@ async def chat_completion_full_generator(
         final_res = res
 ```
 
-它把每个 `RequestOutput` 赋给 `final_res`，循环结束后 `final_res` 就是**最后一个**。为什么只留最后一个就够？答案不在这个循环里，而在 [§36.4](#364-请求的一生上从-http-到-token) 那一步算 `SamplingParams` 时——`request.to_sampling_params` 会按 `request.stream` 给引擎设一个开关：
+它把每个 `RequestOutput` 赋给 `final_res`，循环结束后 `final_res` 就是**最后一个**。为什么只留最后一个就够？答案不在这个循环里，而在 [§38.4](#384-请求的一生上从-http-到-token) 那一步算 `SamplingParams` 时——`request.to_sampling_params` 会按 `request.stream` 给引擎设一个开关：
 
 ```python
 # vllm/entrypoints/openai/chat_completion/protocol.py:L605-L607
@@ -765,7 +765,7 @@ if self.stream
 else RequestOutputKind.FINAL_ONLY,
 ```
 
-这一行才是流式/非流式真正分家的地方。流式设 `DELTA`，引擎每拍只回一个**只含本拍增量**的 `RequestOutput`——所以 [§36.5.1](#3651-流式逐-token-推成-sse) 里 `delta_text = output.text` 直接当增量推是对的。非流式设 `FINAL_ONLY`，引擎干脆**只在终止那一拍回唯一一个 `RequestOutput`**，且它携带全文。
+这一行才是流式/非流式真正分家的地方。流式设 `DELTA`，引擎每拍只回一个**只含本拍增量**的 `RequestOutput`——所以 [§38.5.1](#3851-流式逐-token-推成-sse) 里 `delta_text = output.text` 直接当增量推是对的。非流式设 `FINAL_ONLY`，引擎干脆**只在终止那一拍回唯一一个 `RequestOutput`**，且它携带全文。
 
 把"只留最后一个就够"说成一句归纳：在 `FINAL_ONLY` 下，`async for` 循环体只会执行**恰好一次**（生成器只 yield 一个元素），所以"循环结束后 `final_res` 等于最后一个"与"`final_res` 等于那唯一一个全文 `RequestOutput`"是同一件事——不存在被丢弃的中间帧。换句话说，所谓"同一个生成器"，准确说是同一个 `generate` API 被 `output_kind` 配置成了两种产出语义，而不是非流式自己手动丢掉中间结果。这正是图里标的 `FINAL_ONLY`。
 
@@ -775,11 +775,11 @@ else RequestOutputKind.FINAL_ONLY,
 - 一个 `RequestOutput` 都没收到 → 返回 `500`；
 - 每个 output 的 `finish_reason` 若是 `"error"`，`_raise_if_error` 抛 `GenerationError`。
 
-这些错误回到 [§36.4](#364-请求的一生上从-http-到-token) 的路由 handler 后，能被包成带正确状态码的 `JSONResponse`——因为状态行还没发出去，想设几就设几。这是非流式相对流式的奢侈。
+这些错误回到 [§38.4](#384-请求的一生上从-http-到-token) 的路由 handler 后，能被包成带正确状态码的 `JSONResponse`——因为状态行还没发出去，想设几就设几。这是非流式相对流式的奢侈。
 
 聚合完毕，把 `choices` 和 `UsageInfo` 装进一个 `ChatCompletionResponse` 整个返回。路由那边 `isinstance(generator, ChatCompletionResponse)` 命中，包成 `JSONResponse`。一锤子买卖，干净利落。
 
-### 36.5.3 错误处理的真相源：基类 `OpenAIServing`
+### 38.5.3 错误处理的真相源：基类 `OpenAIServing`
 
 上面两个分支用到的 `create_error_response`、`create_streaming_error_response`、`_raise_if_error`，都不在 chat handler 里，而在它的基类 `OpenAIServing`（`vllm/entrypoints/openai/engine/serving.py`）。这个基类是所有 OpenAI handler 的共同地基——request_id 解析、模型校验、错误工厂，都在这儿统一：
 
@@ -845,13 +845,13 @@ async def _check_model(
     )
 ```
 
-请求里点名的模型若既不是本服务加载的模型、也不是已注册的 LoRA，就回一个 `404 NotFoundError`。这就是 [§36.4](#364-请求的一生上从-http-到-token) 里 `render_chat_request` 开头那次校验的落点。
+请求里点名的模型若既不是本服务加载的模型、也不是已注册的 LoRA，就回一个 `404 NotFoundError`。这就是 [§38.4](#384-请求的一生上从-http-到-token) 里 `render_chat_request` 开头那次校验的落点。
 
 > **v0.21.0 更新**：基类统一兜错在 v0.21.0 多了一条专为分离式 prefill 设的补偿路径。在第 7 章那种 P/D 分离架构下，带 `do_remote_prefill` 的请求会让 P 节点先**预占**远端 KV 块；如果这条请求在抵达引擎之前就被拒（`_check_model` 回 `ErrorResponse`、或前置校验抛错），那些块就成了没人认领的孤儿。v0.21.0 把每个 `create_*` 入口拆成两层——公开方法只是 `_with_kv_transfer_rejection_cleanup`（`vllm/entrypoints/openai/engine/serving.py:L661`）包住的薄壳，真身挪进 `_create_chat_completion`（调用点 `chat_completion/serving.py:L237`）。这个包裹器仅在构造期 `self.has_kv_connector` 为真且请求带 `do_remote_prefill` 时生效，用 `try/finally` 在请求未触达引擎时回调 `engine_client.notify_kv_transfer_request_rejected(...)`，通知连接器释放被钉住的远端块。这把"早退即资源泄漏"从隐患变成了显式的补偿回边，正是"基类统一兜错"这条论点在分离架构下的自然延伸。
 
 ---
 
-## 36.6 lifespan 与启动序
+## 38.6 lifespan 与启动序
 
 请求的一生讲完了。回头补地基：FastAPI app 是怎么"活过来"、又怎么收尾的。
 
@@ -903,7 +903,7 @@ async def lifespan(app: FastAPI):
 
 ---
 
-## 36.7 优雅关停：信号、watchdog，与那个晚 await 的 `shutdown_task`
+## 38.7 优雅关停：信号、watchdog，与那个晚 await 的 `shutdown_task`
 
 `serve_http`（`vllm/entrypoints/launcher.py`）是启动的最后一环，也是关停的中枢。它把 app 交给 uvicorn，同时布下两套关停机制：
 
@@ -975,7 +975,7 @@ async def lifespan(app: FastAPI):
 
 `engine_client.shutdown` 是个**同步阻塞**调用（要等子进程收摊）。直接在事件循环里 await 它会把整个循环卡死，所有别的协程都得跟着停摆。所以丢进 `run_in_executor`——扔到线程池里阻塞，事件循环继续转。引擎关停后才设 `server.should_exit = True`、cancel 掉另外两个 task。这是异步代码里处理阻塞调用的标准手法。
 
-**关停路径 B：watchdog 兜底。** 还记得 [§36.5.1](#3651-流式逐-token-推成-sse) 留下的尾巴吗——流式生成器把引擎死亡的异常吞成了 error 帧，进程本身不知道该退。`watchdog_loop` 就是来填这个坑的：
+**关停路径 B：watchdog 兜底。** 还记得 [§38.5.1](#3851-流式逐-token-推成-sse) 留下的尾巴吗——流式生成器把引擎死亡的异常吞成了 error 帧，进程本身不知道该退。`watchdog_loop` 就是来填这个坑的：
 
 ```python
 # vllm/entrypoints/launcher.py:L144-L167
@@ -1006,7 +1006,7 @@ def terminate_if_errored(server: uvicorn.Server, engine: EngineClient):
 
 它每 5 秒醒一次，查一下 `engine.errored and not engine.is_running`。一旦引擎确实暗死了，就设 `server.should_exit = True`，让 uvicorn 自己优雅收摊（除非你显式设了 `VLLM_KEEP_ALIVE_ON_ENGINE_DEATH` 想让服务苟着）。注释把道理讲透了：在这里不能 `await` server 的关停，因为当前 handler 必须先返回、关掉这条连接，server 才退得了——所以 watchdog 只是**置位**，把真正的退出交给 uvicorn 的主循环。
 
-这两条路径，连同 [§36.2](#362-顶层编排一个-async-with-框住引擎的一生) 那个被特意晚 await 的 `shutdown_task`，拼成了完整的优雅关停。回看 `serve_http` 返回的 `shutdown_task`，一路传回 `run_server_worker`，在退出 `build_async_engine_client` 上下文（触发 `async_llm.shutdown()`）**之后**才被 await。次序是定死的：
+这两条路径，连同 [§38.2](#382-顶层编排一个-async-with-框住引擎的一生) 那个被特意晚 await 的 `shutdown_task`，拼成了完整的优雅关停。回看 `serve_http` 返回的 `shutdown_task`，一路传回 `run_server_worker`，在退出 `build_async_engine_client` 上下文（触发 `async_llm.shutdown()`）**之后**才被 await。次序是定死的：
 
 1. 信号或 watchdog 触发 → `handle_shutdown` 关引擎、置 `server.should_exit`；
 2. `run_server_worker` 的 `async with` 退出 → `async_llm.shutdown()` 兜底再清一次；
@@ -1017,9 +1017,9 @@ def terminate_if_errored(server: uvicorn.Server, engine: EngineClient):
 
 ---
 
-## 36.8 中间件这道门：鉴权与 X-Request-Id
+## 38.8 中间件这道门：鉴权与 X-Request-Id
 
-最后补一块请求进门前的关卡。[§36.3](#363-装配现场fastapi-app中间件与那一票-handler) 里 `build_app` 挂了几个中间件，vLLM 没用 FastAPI 的依赖注入，而是写成更底层的**纯 ASGI 中间件**。鉴权这个最典型：
+最后补一块请求进门前的关卡。[§38.3](#383-装配现场fastapi-app中间件与那一票-handler) 里 `build_app` 挂了几个中间件，vLLM 没用 FastAPI 的依赖注入，而是写成更底层的**纯 ASGI 中间件**。鉴权这个最典型：
 
 ```python
 # vllm/entrypoints/openai/server_utils.py:L38-L86
@@ -1067,11 +1067,11 @@ class AuthenticationMiddleware:
 
 **token 比对走 `sha256` + `secrets.compare_digest`。** 不直接比字符串，而是先各自 `sha256` 成定长摘要，再用 `compare_digest` 做**恒定时间**比较。这是防时序侧信道攻击——普通的字符串相等会在第一个不同字符处提前返回，攻击者能靠响应时间一点点猜出 token；恒定时间比较把这条路堵死。一个生产级服务器该有的安全意识，都浓缩在这两行里。
 
-同文件里的 `XRequestIdMiddleware` 是它的姊妹——把 [§36.4](#364-请求的一生上从-http-到-token) 里解析出的 request_id 回写进响应头，让客户端也能拿到这条贯穿全链路的追踪 id。
+同文件里的 `XRequestIdMiddleware` 是它的姊妹——把 [§38.4](#384-请求的一生上从-http-到-token) 里解析出的 request_id 回写进响应头，让客户端也能拿到这条贯穿全链路的追踪 id。
 
 ---
 
-## 36.9 小结：一条请求，两套生命周期
+## 38.9 小结：一条请求，两套生命周期
 
 把这一章拢成一张图景。
 

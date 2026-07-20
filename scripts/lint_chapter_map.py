@@ -31,6 +31,7 @@ Usage:
 import json
 import re
 import sys
+import pathlib
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -242,6 +243,28 @@ if __name__ == "__main__":
     argv = [a for a in argv if a != "--require"]
     if len(argv) < 1:
         print("Usage: python3 lint_chapter_map.py <chapter_dir> [--require]")
+        sys.exit(1)
+
+    if argv[0] == "--all":
+        # 全书扫(exp-2026-07-20-02):本 gate 长期不在 --all 里,重编号后 7 章图徽标与标题打架
+        # 却被 --all 全绿掩盖。默认 require=False——本来就没画图的章仍豁免,画了图的章必须自洽。
+        import glob as _glob
+        import instance as _inst
+        dirs = sorted({str(pathlib.Path(f).parent.parent) for f in _glob.glob(_inst.chapters_glob())})
+        bad = 0
+        for d in dirs:
+            res = lint_chapter_map(d, require=require)
+            n = sum(len(v) for v in res.values())
+            if n:
+                bad += 1
+                print(f"❌ {pathlib.Path(d).name}: {n} 项")
+                for issues in res.values():
+                    for i in issues:
+                        print(i)
+        if bad == 0:
+            print(f"✓ 本章地图检查通过(全书 {len(dirs)} 章)")
+            sys.exit(0)
+        print(f"\n共 {bad} 章有问题")
         sys.exit(1)
 
     chapter_dir = argv[0]

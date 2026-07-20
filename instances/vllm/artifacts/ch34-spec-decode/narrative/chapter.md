@@ -34,11 +34,11 @@
 
 ![本章地图：投机解码剖面——proposer→摊平 index→rejection sampling](../diagrams/chapter-map.png)
 
-只想看残差分布怎么采、为什么这样采能保证分布不偏，可以直接跳 §32.5；想知道两条 kernel（greedy 与 random）在哪里分派，看 §32.4。想跟一遍完整数据流，就从 §32.1 按序读到 §32.6。
+只想看残差分布怎么采、为什么这样采能保证分布不偏，可以直接跳 §34.5；想知道两条 kernel（greedy 与 random）在哪里分派，看 §34.4。想跟一遍完整数据流，就从 §34.1 按序读到 §34.6。
 
 ---
 
-## 32.1 草稿从哪来：proposer 的统一契约
+## 34.1 草稿从哪来：proposer 的统一契约
 
 投机解码的第一步是产草稿。vLLM 里有好几种 proposer——n-gram、EAGLE、EAGLE3、DFlash、还有 [第 29 章](../../ch29-model-architecture/narrative/chapter.md) 那个 DeepSeek-V4 的 MTP draft 头——但它们对外都遵守同一份契约：**吃当前上下文，吐每请求 k 个草稿 token**。本章不深挖各个 proposer 内部的模型结构（那是 ch28 的事），只看它们怎么把草稿交出来。
 
@@ -183,7 +183,7 @@ return draft_token_ids
 
 ---
 
-## 32.2 把变长草稿摊平进一批：index 间接
+## 34.2 把变长草稿摊平进一批：index 间接
 
 现在每个请求手里有 0 到 k 个草稿。下一个难题很现实：**一个 batch 里不同请求草稿数不一样**（有的 3 个、有的 0 个、有的 2 个），怎么把它们一次性喂进目标模型、又一次性取回每个草稿位置的 logits？
 
@@ -310,7 +310,7 @@ calc_spec_decode_metadata(num_draft=[3,0,2,0,1], cu_sched=[4,104,107,207,209]):
 
 ---
 
-## 32.3 一次前向之后：切 logits、采 bonus
+## 34.3 一次前向之后：切 logits、采 bonus
 
 目标模型拿到这套 index，对"草稿被填进的输入流"跑一遍前向，吐出形状 `[num_tokens + batch_size, vocab]` 的扁平 logits——每个草稿位一行、每个 bonus 位一行，共 11 行。现在轮到 `RejectionSampler.forward`（`vllm/v1/sample/rejection_sampler.py`）把这堆 logits 分门别类。
 
@@ -384,7 +384,7 @@ output_token_ids = rejection_sample(
 
 ---
 
-## 32.4 接受还是拒绝：rejection sampling 的两条 kernel
+## 34.4 接受还是拒绝：rejection sampling 的两条 kernel
 
 `rejection_sample`（`vllm/v1/sample/rejection_sampler.py`）是调度核心。它先开一块输出 buffer，然后根据请求是 greedy 还是 random，分派到两个 Triton 内核：
 
@@ -474,7 +474,7 @@ def rejection_greedy_sample_kernel(
         )
 ```
 
-每个 Triton program 处理一个请求。第一件事就是用 `cu_num_draft_tokens` 反推本请求的草稿区间 `[start, end)`——这正是 §32.2 那个累积和的用途。以 §32.2 的例子说：`cu = [3, 3, 5, 5, 6]`，req2 的区间是 `[cu[1], cu[2]) = [3, 5)`，即摊平张量的第 3、4 位是它的两个草稿。
+每个 Triton program 处理一个请求。第一件事就是用 `cu_num_draft_tokens` 反推本请求的草稿区间 `[start, end)`——这正是 §34.2 那个累积和的用途。以 §34.2 的例子说：`cu = [3, 3, 5, 5, 6]`，req2 的区间是 `[cu[1], cu[2]) = [3, 5)`，即摊平张量的第 3、4 位是它的两个草稿。
 
 准则很简单：greedy 采样就是取概率最高的 token，所以目标模型在这个位置的"标准答案"是 `target_argmax`。草稿等于 argmax 就接受、否则拒绝。注意一个细节：**拒绝位仍然写入 `target_argmax_id`**——因为 greedy 语义下，纠正后的 token 就是目标的 argmax。而且一旦 `rejected = True`，`if not rejected` 这一守卫让后续位置不再写，自然保留预填的 −1。
 
@@ -585,7 +585,7 @@ P(\mathrm{accept}\ x) = \min\Bigl(1,\ \frac{p(x)}{q(x)}\Bigr)
 
 ---
 
-## 32.5 拒绝时采什么：残差分布与分布等价性
+## 34.5 拒绝时采什么：残差分布与分布等价性
 
 现在来回答开篇那个让人不安的问题：**纠错之后，输出还是原来那个分布吗？** 答案是严格相等，而关键就在拒绝时采的那个 recovered token。
 
@@ -688,9 +688,9 @@ float32 下均匀采样有非可忽略的概率精确得到 0.0，会让接受�
 
 ---
 
-## 32.6 收尾：把紧凑输出还原成变长
+## 34.6 收尾：把紧凑输出还原成变长
 
-三个内核跑完，输出是一块紧凑的 `[batch_size, max_spec_len + 1]` 张量，里面混着接受的草稿、recovered token、bonus token，以及一堆 −1。最后一步把它还原成每请求变长的 `list[list[int]]`，交回引擎。这是 `parse_output`（`vllm/v1/sample/rejection_sampler.py`），也是 §32.2 那个"摊平"的对偶操作：
+三个内核跑完，输出是一块紧凑的 `[batch_size, max_spec_len + 1]` 张量，里面混着接受的草稿、recovered token、bonus token，以及一堆 −1。最后一步把它还原成每请求变长的 `list[list[int]]`，交回引擎。这是 `parse_output`（`vllm/v1/sample/rejection_sampler.py`），也是 §34.2 那个"摊平"的对偶操作：
 
 ```python
 # vllm/v1/sample/rejection_sampler.py:L247
@@ -723,7 +723,7 @@ req0 这一轮净产 2 个 token，req1 净产 3 个。回到本章开头那个�
 
 ---
 
-## 32.7 这章解决了什么
+## 34.7 这章解决了什么
 
 把整条链收束一下。投机解码用"便宜地猜、昂贵地验"来榨 decode 阶段的闲算力，而 vLLM 的实现里有三处值得记住的设计：
 

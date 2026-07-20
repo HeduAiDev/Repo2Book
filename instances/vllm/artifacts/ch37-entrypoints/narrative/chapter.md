@@ -35,11 +35,11 @@ for out in outputs:
 
 ![本章地图：离线 LLM API 剖面——构造分叉 + 同步驱动脊](../diagrams/chapter-map.png)
 
-只想弄清"离线到底是不是进程内"这一反直觉点，沿灰色虚线跳读 §35.2→§35.3 即可；想跟四个入口怎么被同一个 `while` 循环一路拉到底，按蓝色实线 §35.4→§35.5 顺序往下读。
+只想弄清"离线到底是不是进程内"这一反直觉点，沿灰色虚线跳读 §37.2→§37.3 即可；想跟四个入口怎么被同一个 `while` 循环一路拉到底，按蓝色实线 §37.4→§37.5 顺序往下读。
 
 ---
 
-## 35.1 一张总图：同步阻塞这条脊
+## 37.1 一张总图：同步阻塞这条脊
 
 先看全景，后面所有细节都挂在它上面。把本章和第 4 章并排放：
 
@@ -58,7 +58,7 @@ for out in outputs:
 
 ---
 
-## 35.2 构造期：参数 → EngineArgs → LLMEngine
+## 37.2 构造期：参数 → EngineArgs → LLMEngine
 
 `LLM.__init__` 的形参表有几十个——`tensor_parallel_size`、`dtype`、`gpu_memory_utilization`、`enable_prefix_caching`……这一长串的命运是一致的：被收拢、归一化，最后拼成一个 `EngineArgs`。这部分纯属参数装配，不是本章主线，我们一句带过。真正的转折点在这里：
 
@@ -145,7 +145,7 @@ for out in outputs:
 
 ---
 
-## 35.3 LLMEngine 的两个客户端：硬分叉点
+## 37.3 LLMEngine 的两个客户端：硬分叉点
 
 `from_engine_args` 把 `multiprocess_mode` 传进 `LLMEngine.__init__`，后者建好渲染器、输入处理器、输出处理器之后，走到这一行——它决定了 EngineCore 究竟在哪儿、怎么通信：
 
@@ -221,7 +221,7 @@ class EngineCoreClient(ABC):
 
 下面分别看这两个客户端长什么样，对照着看最清楚。
 
-### 35.3.1 SyncMPClient：后台线程喂队列，主线程阻塞取
+### 37.3.1 SyncMPClient：后台线程喂队列，主线程阻塞取
 
 `SyncMPClient` 的"同步"二字，藏在一个生产者-消费者结构里。它的构造函数干两件事：起一个后台线程、备一个队列。
 
@@ -282,7 +282,7 @@ class SyncMPClient(MPClient):
 
 把这个结构和第 4 章对照：`AsyncMPClient` 那边，"生产者"不是后台线程而是一个 asyncio 协程 `output_handler`，"消费者"取数不是 `queue.get()` 而是 `await asyncio.Queue.get()`。两者都跨进程（EngineCore 都在后台），区别**只在主进程侧**——一边是阻塞线程队列，一边是事件循环协程。所以"同步 vs 异步"这组对比，跟"进程内 vs 跨进程"完全是两个维度，别混。
 
-### 35.3.2 InprocClient：真·进程内的回退
+### 37.3.2 InprocClient：真·进程内的回退
 
 为了让对照彻底，看一眼 `InprocClient`——它才是"真·进程内、无 ZMQ"的那个，而它**不是**默认：
 
@@ -323,11 +323,11 @@ class InprocClient(EngineCoreClient):
 
 ---
 
-## 35.4 四个入口，一条脊
+## 37.4 四个入口，一条脊
 
 回到 `LLM` 这一层。用户能调的任务方法有好几个，本章聚焦四个核心入口：`generate`、`chat`、`embed`、`encode`。它们入口形态各异，但很快就汇流到同一条提交+驱动的脊上。先看最常用的 `generate`。
 
-### 35.4.1 generate：守卫 + 默认参数 + 汇流
+### 37.4.1 generate：守卫 + 默认参数 + 汇流
 
 ```python
 # vllm/entrypoints/llm.py:L446
@@ -362,9 +362,9 @@ class InprocClient(EngineCoreClient):
 - **默认采样参数**。不传 `sampling_params` 就用默认的——温度、top-p 那套。
 - **汇流到 `_run_completion`**，并钉死 `output_type=RequestOutput`。这个 `output_type` 后面在 `_run_engine` 里会被 `assert` 校验，保证收上来的输出类型对得上。
 
-`generate` 走的是 completion 路径。这里要埋一个对照：completion 和 chat 进引擎的内部路径**不一样**，差别就在一条 warning 上，后面 §35.4.3 揭晓。先把 completion 这条走完。
+`generate` 走的是 completion 路径。这里要埋一个对照：completion 和 chat 进引擎的内部路径**不一样**，差别就在一条 warning 上，后面 §37.4.3 揭晓。先把 completion 这条走完。
 
-### 35.4.2 批量提交：FINAL_ONLY、自增 id、事务性回滚
+### 37.4.2 批量提交：FINAL_ONLY、自增 id、事务性回滚
 
 `_run_completion` 自己没什么内容——它把活分成两段：先把所有请求加进引擎，再驱动引擎跑：
 
@@ -377,7 +377,7 @@ class InprocClient(EngineCoreClient):
         return self._run_engine(use_tqdm=use_tqdm, output_type=output_type)
 ```
 
-`_add_completion_requests` 把每个 prompt 经一个**生成器**逐条渲染，交给 `_render_and_add_requests` 提交。注意"生成器"这个词，它是 §35.4.3 那条 warning 的关键。真正干提交的是 `_render_and_add_requests`：
+`_add_completion_requests` 把每个 prompt 经一个**生成器**逐条渲染，交给 `_render_and_add_requests` 提交。注意"生成器"这个词，它是 §37.4.3 那条 warning 的关键。真正干提交的是 `_render_and_add_requests`：
 
 ```python
 # vllm/entrypoints/llm.py:L1789
@@ -419,7 +419,7 @@ class InprocClient(EngineCoreClient):
 
 **第一个对照点：`output_kind = FINAL_ONLY`。** 离线 API 一次性返回完整结果，没人要逐 token 的增量。`FINAL_ONLY` 告诉下游的 OutputProcessor：这个请求只在 `finished` 那一刻产出一次完整 `RequestOutput`，中间步骤不要往外推。这正好是第 4 章流式路径 `DELTA` 的反面——那边每步都推增量、还得维护增量去 token 化的状态。离线选 `FINAL_ONLY`，省掉了逐步装配和传输的全部开销。
 
-**第二个对照点：`str(next(self.request_counter))`。** 还记得构造期那个自增 `Counter` 吗？这里就是它出场的地方。第 0 条请求拿 id `"0"`、第 1 条拿 `"1"`……id 严格按**提交顺序**递增。这个 id 就是"输入顺序"的全部凭据。为什么要凭据？因为接下来这批请求会并发跑、乱序完成——短的先好，长的后好——`generate` 返回的列表却必须和你传进来的 `prompts` 一一对应。靠的就是最后按这个 id 排个序。先记着，§35.5 收尾时回收。
+**第二个对照点：`str(next(self.request_counter))`。** 还记得构造期那个自增 `Counter` 吗？这里就是它出场的地方。第 0 条请求拿 id `"0"`、第 1 条拿 `"1"`……id 严格按**提交顺序**递增。这个 id 就是"输入顺序"的全部凭据。为什么要凭据？因为接下来这批请求会并发跑、乱序完成——短的先好，长的后好——`generate` 返回的列表却必须和你传进来的 `prompts` 一一对应。靠的就是最后按这个 id 排个序。先记着，§37.5 收尾时回收。
 
 请求进了 `LLMEngine.add_request`，做的是"双注册"，并顺手处理 `n>1` 的并行采样：
 
@@ -463,9 +463,9 @@ class InprocClient(EngineCoreClient):
 
 > *图注：四条泳道 LLM / LLMEngine / OutputProcessor / EngineCore。上半是提交期——`_add_request`（FINAL_ONLY + 自增 id）→ `add_request` 双注册（① 输出侧建 RequestState、② 送后台 EngineCore）；`n>1` 时虚线框内 ParentRequest 扇出。下半是驱动期——`_run_engine` 的 `while step()` 循环，每拍 get_output（阻塞取队列）→ process_outputs（去 token 化/装配）→ abort 停止串触发的请求，直到 finished；最后 LLM 收集、`sorted(by request_id)` 返回。*
 
-### 35.4.3 chat 与 completion 的分岔：那条物化 warning
+### 37.4.3 chat 与 completion 的分岔：那条物化 warning
 
-现在回收 §35.4.1 埋的对照。`chat` 入口的守卫和默认参数跟 `generate` 几乎一样，区别在它汇流到 `_run_chat`，而 `_run_chat` 把逐个对话渲染成一个**生成器**，交给 `_render_and_run_requests`——注意是 `_render_and_run_requests`，不是 completion 走的 `_render_and_add_requests`。多出来的这一层，就为了一条 warning：
+现在回收 §37.4.1 埋的对照。`chat` 入口的守卫和默认参数跟 `generate` 几乎一样，区别在它汇流到 `_run_chat`，而 `_run_chat` 把逐个对话渲染成一个**生成器**，交给 `_render_and_run_requests`——注意是 `_render_and_run_requests`，不是 completion 走的 `_render_and_add_requests`。多出来的这一层，就为了一条 warning：
 
 ```python
 # vllm/entrypoints/llm.py:L1760
@@ -498,7 +498,7 @@ class InprocClient(EngineCoreClient):
 
 两条路汇到 `_render_and_add_requests` 之后就完全一样了——同样 FINAL_ONLY、同样自增 id、同样双注册。分岔只在那一层 warning。
 
-### 35.4.4 encode / embed：pooling 家族的薄封装
+### 37.4.4 encode / embed：pooling 家族的薄封装
 
 `encode` 是 pooling 任务的入口（拿隐藏态、做检索向量等）。它和 `generate` 的骨架一致，只在两头多了 pooling 专属的预处理/后处理，中间那段提交+驱动完全复用：
 
@@ -532,7 +532,7 @@ class InprocClient(EngineCoreClient):
 
 ---
 
-## 35.5 同步驱动的灵魂：_run_engine 与 step()
+## 37.5 同步驱动的灵魂：_run_engine 与 step()
 
 提交完成，请求都在后台 EngineCore 里排着。现在到了本章最核心的几行——主线程怎么把它们一拍一拍拉到完成：
 
@@ -606,14 +606,14 @@ class InprocClient(EngineCoreClient):
 
 剥掉可观测性和数据并行的旁路，主干就是四步：
 
-1. **`get_output()`**——从 EngineCore 取一批输出。离线默认下，这就是 `SyncMPClient.get_output()` 那个**阻塞 `outputs_queue.get()`**（§35.3.1）。整个 `step()`、乃至整个 `while` 循环，阻塞的真身就在这里：主线程堵在队列上等后台线程从 ZMQ 喂回一份 `EngineCoreOutputs`。
+1. **`get_output()`**——从 EngineCore 取一批输出。离线默认下，这就是 `SyncMPClient.get_output()` 那个**阻塞 `outputs_queue.get()`**（§37.3.1）。整个 `step()`、乃至整个 `while` 循环，阻塞的真身就在这里：主线程堵在队列上等后台线程从 ZMQ 喂回一份 `EngineCoreOutputs`。
 2. **`process_outputs()`**——把引擎吐回的原始输出做去 token 化、装配成 `RequestOutput`，并判定哪些请求 `finished`。这是第 8、9、10 章 OutputProcessor 的活，这里只点它在 step 中的位置。
 3. **`abort_requests()`**——有些请求因为命中 stop string 而提前结束，告诉 EngineCore 把它们停掉、别再算。
 4. **记 stats**——可观测性，省略。
 
 四步里只有第 2 步把控制权"借"给了 OutputProcessor，其余都是这一拍的编排。返回 `request_outputs` 给 `_run_engine`，循环继续。
 
-### 35.5.1 为什么循环一定会停？
+### 37.5.1 为什么循环一定会停？
 
 `while self.llm_engine.has_unfinished_requests()` 是个无界 `while`——凭什么保证它不会永远转下去？
 
@@ -625,7 +625,7 @@ class InprocClient(EngineCoreClient):
 
 换句话说：每个请求的生成长度有上界 → 它必在有限拍内被移出未完成集合 → 非负整数 `N` 单调不增且终将归零 → 循环必然终止。
 
-### 35.5.2 排序还原：回收那个自增 id
+### 37.5.2 排序还原：回收那个自增 id
 
 循环跑完，`outputs` 列表里躺着所有 `finished` 的结果——但它们是**按完成顺序**进列表的，不是按提交顺序。短 prompt 早早就好了、排在前面，长 prompt 磨蹭到最后才进列表。这跟用户传进来的 `prompts` 顺序毫无关系。
 
@@ -635,11 +635,11 @@ class InprocClient(EngineCoreClient):
         return sorted(outputs, key=lambda x: int(x.request_id))
 ```
 
-回收 §35.4.2 埋的那个自增 `request_id`：每条请求提交时按输入顺序领了个递增整数 id。现在按 `int(request_id)` 排序，就把乱序完成的输出**还原成了输入顺序**。于是 `generate(["A", "B", "C"])` 返回的列表，第 0 个一定对应 `"A"`、第 1 个对应 `"B"`，哪怕实际上 `"C"` 最先跑完。
+回收 §37.4.2 埋的那个自增 `request_id`：每条请求提交时按输入顺序领了个递增整数 id。现在按 `int(request_id)` 排序，就把乱序完成的输出**还原成了输入顺序**。于是 `generate(["A", "B", "C"])` 返回的列表，第 0 个一定对应 `"A"`、第 1 个对应 `"B"`，哪怕实际上 `"C"` 最先跑完。
 
 这趟排序是 `O(n log n)`，`n` 是这批请求数。它是离线 API 顺序保证的代价——完成顺序由各请求的生成长度和调度决定，跟提交序天然无关，要给用户一个"列表一一对应"的承诺，就得花这一趟排序把乱序重新理直。
 
-把 §35.5.1 的终止性和这里的排序还原合到一张表上数着走最直观。设三条请求 `"0"`/`"1"`/`"2"`，生成长度不同，故意让 `"2"` 最先完成、`"1"` 最后完成（这正是精简版测试钉死的乱序场景）。一拍一拍走 `while step()`：
+把 §37.5.1 的终止性和这里的排序还原合到一张表上数着走最直观。设三条请求 `"0"`/`"1"`/`"2"`，生成长度不同，故意让 `"2"` 最先完成、`"1"` 最后完成（这正是精简版测试钉死的乱序场景）。一拍一拍走 `while step()`：
 
 | step 拍次 | 本拍 `finished` 的 request_id | 循环后 `outputs` 列表 | `N`（剩余未完成） |
 | --- | --- | --- | --- |
@@ -655,7 +655,7 @@ class InprocClient(EngineCoreClient):
 
 ---
 
-## 35.6 离线吞吐从哪来：一次提交一大批
+## 37.6 离线吞吐从哪来：一次提交一大批
 
 最后回答一个实践问题：`_run_engine`（`vllm/entrypoints/llm.py:L1839`）是单线程阻塞的 `while`，主线程一直堵在 `step()` 上等——这听起来很慢，离线推理的吞吐到底从哪来？
 

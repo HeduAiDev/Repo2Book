@@ -23,11 +23,11 @@
 
 ![本章地图：worker 侧 KV 生命周期与三类传输后端剖面](../diagrams/chapter-map.png)
 
-只想看生命周期骨架，跟主线读 §34.1 到 §34.4；想看某类后端具体怎么填契约，从 §34.6 跳去 §34.7（P2P NCCL）、§34.8（NIXL）或 §34.9（Offloading）；想跟全程，按序读完即可。
+只想看生命周期骨架，跟主线读 §36.1 到 §36.4；想看某类后端具体怎么填契约，从 §36.6 跳去 §36.7（P2P NCCL）、§36.8（NIXL）或 §36.9（Offloading）；想跟全程，按序读完即可。
 
 ---
 
-## 34.1 forward 被夹在哪里
+## 36.1 forward 被夹在哪里
 
 先从最外层看。一次 decode step，worker 侧的入口是 `gpu_model_runner.py` 的 `execute_model`。我们只看与 KV connector 相关的那段结构：
 
@@ -86,7 +86,7 @@ def maybe_get_kv_connector_output(
 
 ---
 
-## 34.2 生命周期：一个 context manager 夹住整条搬运线
+## 36.2 生命周期：一个 context manager 夹住整条搬运线
 
 现在看核心。`_get_kv_connector_output` 是整章的轴心——worker 侧 connector 的**整条生命周期**都被收进这一个 context manager：
 
@@ -142,9 +142,9 @@ def _get_kv_connector_output(
 
 **finally 段（`yield` 之后）——收尾。** 用 `finally` 是刻意的：哪怕 forward 抛异常，这段也保证执行，不漏块、不留脏状态。这里依次做四件事：
 
-1. `wait_for_save()`——**阻塞**到所有 save 真正完成（除非 `defer_finalize`，见 §34.5）。这是数据正确性的硬围栏，§34.4 会单独论证。
+1. `wait_for_save()`——**阻塞**到所有 save 真正完成（除非 `defer_finalize`，见 §36.5）。这是数据正确性的硬围栏，§36.4 会单独论证。
 2. `get_finished(finished_req_ids)`——问 connector："哪些请求的异步传输完成了？"返回 `(finished_sending, finished_recving)` 两个集合，填进 `output`。
-3. `build_connector_worker_meta()`——收集 worker 侧要回传的元信息（Offloading 的 store 完成就走这条道，§34.7 会讲）。
+3. `build_connector_worker_meta()`——收集 worker 侧要回传的元信息（Offloading 的 store 完成就走这条道，§36.7 会讲）。
 4. `clear_connector_metadata()`——清掉本步绑定的 metadata，和开头的 `bind` 配对，保证步与步之间状态干净。
 
 这个 `output`（一个 `KVConnectorOutput`）随 `ModelRunnerOutput` 回传给 scheduler 进程。它身上的 `finished_recving` 会驱动上一章的提升逻辑——把 `WAITING_FOR_REMOTE_KVS` 的请求拉回 `WAITING`；`finished_sending` 则驱动块的释放。**这就是上一章那条线的另一端，在这里接上了。**
@@ -159,7 +159,7 @@ def _get_kv_connector_output(
 
 ---
 
-## 34.3 重叠是怎么发生的：start_load_kv 与逐层 hook 的配合
+## 36.3 重叠是怎么发生的：start_load_kv 与逐层 hook 的配合
 
 上面说 load 和 compute 重叠，但只看 `_get_kv_connector_output` 还看不全——它只发起、只在最后收尾，中间那段"按层取 KV"发生在 forward 内部。这就要看 attention 层是怎么被包装的。
 
@@ -205,9 +205,9 @@ def maybe_transfer_kv_layer(func: Callable) -> Callable:
 - **进层前**：`wait_for_layer_load(layer_name)`——按契约的 docstring，应阻塞到**这一层**的 KV load 完成。
 - **出层后**：`save_kv_layer(layer_name, ...)`——按契约的 docstring，应**异步发起**这一层的 KV save。
 
-这两句话说的是 `KVConnectorBase_V1` 契约层面的**理想化钩子**，画的是"支持真·逐层流水线"的后端应该长成的样子。但**本章覆盖的三个后端没有一个是这样落地的**：NIXL 和 Offloading 的 `wait_for_layer_load`／`save_kv_layer` 都硬编码成空实现（§34.8、§34.9 会看到源码）——它们一次性处理整个请求的 KV，压根没有"逐层"这回事；P2P 的 `wait_for_layer_load` 同样是一句 `return`（§34.7 会看到），它真正的逐层收发发生在 `start_load_kv` 内部一个同步的 for 循环里，在 forward 开始之前就已经跑完，而不是分散到 forward 期间被 `wait_for_layer_load` 一层层放行。
+这两句话说的是 `KVConnectorBase_V1` 契约层面的**理想化钩子**，画的是"支持真·逐层流水线"的后端应该长成的样子。但**本章覆盖的三个后端没有一个是这样落地的**：NIXL 和 Offloading 的 `wait_for_layer_load`／`save_kv_layer` 都硬编码成空实现（§36.8、§36.9 会看到源码）——它们一次性处理整个请求的 KV，压根没有"逐层"这回事；P2P 的 `wait_for_layer_load` 同样是一句 `return`（§36.7 会看到），它真正的逐层收发发生在 `start_load_kv` 内部一个同步的 for 循环里，在 forward 开始之前就已经跑完，而不是分散到 forward 期间被 `wait_for_layer_load` 一层层放行。
 
-下面先按这套理想化契约把"重叠"的设计意图讲清楚——这有助于理解为什么契约要拆成"发起"和"逐层等待"两端；但请记住，从 §34.7 开始看到的三个具体后端，没有一个真的按这张图纸运行，读到 §34.8 时不必意外。
+下面先按这套理想化契约把"重叠"的设计意图讲清楚——这有助于理解为什么契约要拆成"发起"和"逐层等待"两端；但请记住，从 §36.7 开始看到的三个具体后端，没有一个真的按这张图纸运行，读到 §36.8 时不必意外。
 
 契约图纸上的样子是这样：`start_load_kv` 在第 0 层之前就把**所有层**的 load 一把发起，交给后端引擎自己管并发；模型照常往前跑，层 0、层 1……每跑一层，`wait_for_layer_load` 只等**当前这一层**的 KV 到位。理想情况下，第 0 层算的时候，后面层的 KV 正在后台搬；等模型算到第 k 层，第 k 层的 KV 早就搬完了，`wait_for_layer_load` 立刻返回，不阻塞。**传输延迟被藏进了前面层的计算里**——这是契约的设计意图，下面的量化模型算的也是这张图纸，不是本章任何一个后端的实测时序。
 
@@ -242,11 +242,11 @@ T_{overlap} \approx \max(T_{xfer},\; N \cdot t_c)
 
 读这张表的方式是看后两列：只有最前面那一两层可能真的等（传输刚起步、计算进度暂时领先搬运进度），一旦"已搬完层数"反超"算到第几层"——这里发生在第 1 层附近——之后每一层的 `wait_for_layer_load` 都立即返回。计算进度（每拍 +1 层，即每 1 ms 推进 1 层）始终慢于传输进度（每 1 ms 搬完 1÷0.625 ≈ 1.6 层），二者的差单调拉开，阻塞窗口只在开头出现一次。这就是"传输藏进计算"在逐层粒度上的**理想形状**：不是从头到尾零等待，而是开头交一点过路费、之后全程畅通——**但这是契约留给"真·逐层流水线"后端的设计目标，不是 P2P/NIXL/Offloading 任何一个的实际时序**：NIXL/Offloading 的这一整栏"等多久"恒为 0（`wait_for_layer_load` 直接 `return`），P2P 的等待则已经在 `start_load_kv` 里、forward 开始之前一次性做完，不会按层展开成这张表的样子。
 
-出层后的 `save_kv_layer` 同理：契约设想的是边算后面的层、边把前面层的 KV 异步搬出去。这一步对 P2P 是真的——producer 在 `save_kv_layer` 里真的逐层调用 `send_tensor` 异步发送（§34.7）；但 NIXL、Offloading 的 `save_kv_layer` 同样是空实现，它们的"保存"另有机制，§34.8、§34.9 会看到具体怎么回事。
+出层后的 `save_kv_layer` 同理：契约设想的是边算后面的层、边把前面层的 KV 异步搬出去。这一步对 P2P 是真的——producer 在 `save_kv_layer` 里真的逐层调用 `send_tensor` 异步发送（§36.7）；但 NIXL、Offloading 的 `save_kv_layer` 同样是空实现，它们的"保存"另有机制，§36.8、§36.9 会看到具体怎么回事。
 
 ---
 
-## 34.4 wait_for_save：一道不能省的围栏
+## 36.4 wait_for_save：一道不能省的围栏
 
 `save_kv_layer` 是**异步发起**的——发起即返回，真正的搬运在后台。这就埋了一个隐患。
 
@@ -271,17 +271,17 @@ docstring 把意图写得很白：在 forward context 退出前阻塞，确保 `
 
 用一句不变量来归纳它的正确性：**"所有 save 完成"是 forward 退出的前置条件**。这等价于在"buffer 复用"和"异步读"之间插了一道 happens-before——任何对某物理块的复用写入，都发生在该块上一次 save 读取完成之后。少了这道围栏，PD 分离下的数据一致性就破了。所以 `wait_for_save` 不是性能旋钮，是**正确性硬约束**，不能为了快而省掉。
 
-它落在 `_get_kv_connector_output` 的 `finally` 段里（§34.2），保证哪怕 forward 抛异常也会执行。后面会看到，三类后端各自给 `wait_for_save` 填了不同的实现，但都满足同一个语义。
+它落在 `_get_kv_connector_output` 的 `finally` 段里（§36.2），保证哪怕 forward 抛异常也会执行。后面会看到，三类后端各自给 `wait_for_save` 填了不同的实现，但都满足同一个语义。
 
 ---
 
-## 34.5 两个特例：无 token 的步、与投机解码的推迟
+## 36.5 两个特例：无 token 的步、与投机解码的推迟
 
 主路径讲完了。还有两个分支，揭示了这套生命周期的边界考量。
 
 ### 本步没有 token，也要走一遍收发
 
-PD 分离下，一个 engine 某一步可能**没有任何要计算的请求**——但它仍可能有正在进行的异步 send/recv 需要推进或收尾。还记得 §34.2 那句注释吗：传输涉及的请求"可能和正在运行的请求不相交"。如果"没 token 就直接返回空"，这些 disjoint 的传输就会卡死，永远不被推进。
+PD 分离下，一个 engine 某一步可能**没有任何要计算的请求**——但它仍可能有正在进行的异步 send/recv 需要推进或收尾。还记得 §36.2 那句注释吗：传输涉及的请求"可能和正在运行的请求不相交"。如果"没 token 就直接返回空"，这些 disjoint 的传输就会卡死，永远不被推进。
 
 于是有了 `kv_connector_no_forward`：
 
@@ -312,9 +312,9 @@ def kv_connector_no_forward(
 
 ### 投机解码：把 wait_for_save 推迟到草稿之后
 
-回头看 §34.1 那行 `defer_kv_connector_finalize = self.speculative_config is not None`。投机解码（[第 34 章](../../ch34-spec-decode/narrative/chapter.md)）里，主模型 forward 之后还要跑 draft model。如果在主 forward 一退出就 `wait_for_save`，会在主、草稿两次前向之间硬插一段阻塞，而且草稿模型还可能再动 KV。
+回头看 §36.1 那行 `defer_kv_connector_finalize = self.speculative_config is not None`。投机解码（[第 34 章](../../ch34-spec-decode/narrative/chapter.md)）里，主模型 forward 之后还要跑 draft model。如果在主 forward 一退出就 `wait_for_save`，会在主、草稿两次前向之间硬插一段阻塞，而且草稿模型还可能再动 KV。
 
-所以 `defer_finalize=True` 让主 forward 退出时**跳过** `wait_for_save`（回看 §34.2 的 `if wait_for_save and not defer_finalize`），把收尾推迟。等草稿前向跑完，再由 `finalize_kv_connector` 统一补做：
+所以 `defer_finalize=True` 让主 forward 退出时**跳过** `wait_for_save`（回看 §36.2 的 `if wait_for_save and not defer_finalize`），把收尾推迟。等草稿前向跑完，再由 `finalize_kv_connector` 统一补做：
 
 ```python
 # vllm/v1/worker/kv_connector_model_runner_mixin.py:L70-L79
@@ -330,7 +330,7 @@ def finalize_kv_connector() -> None:
 
 ---
 
-## 34.6 同一套 worker 契约
+## 36.6 同一套 worker 契约
 
 到这里，生命周期已经清楚了：worker 在 forward 两侧依次调 `bind` → `start_load_kv` → 逐层 `wait_for_layer_load` / `save_kv_layer` → `wait_for_save` → `get_finished`。但这些调用最终落到谁身上？落到具体的 connector 后端。它们都实现同一份抽象契约 `KVConnectorBase_V1`：
 
@@ -397,7 +397,7 @@ def get_finished(
 
 ---
 
-## 34.7 P2P NCCL：点对点直发
+## 36.7 P2P NCCL：点对点直发
 
 最直白的后端是 P2P NCCL：prefill worker 和 decode worker 之间，直接用 NCCL 点对点 send/recv 把 KV 搬过去。它是**单类自包含**的——不像后面两个后端要拆成 scheduler/worker 两个子对象，`P2pNcclConnector` 一个类里用 `is_producer` 区分 P 和 D 两种角色。
 
@@ -498,7 +498,7 @@ def wait_for_save(self):
 
 ### wait_for_save 落在哪：异步发为什么需要 fence
 
-P2P 的 `wait_for_save` 委托给引擎的 `wait_for_sent`。这里能看到 §34.4 那道围栏的**实证**。先看 `send_tensor` 的发送模式：
+P2P 的 `wait_for_save` 委托给引擎的 `wait_for_sent`。这里能看到 §36.4 那道围栏的**实证**。先看 `send_tensor` 的发送模式：
 
 ```python
 # vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py:L247-L258
@@ -519,7 +519,7 @@ if self.send_type == "PUT_ASYNC":
 
 `PUT` 是同步发，发完才返回。`PUT_ASYNC` 是异步发——只把 item 塞进 `send_queue`、唤醒后台发送线程，**立即返回**，tensor 此刻还没真正发出去。
 
-这就是问题所在。`save_kv_layer` 用 `PUT_ASYNC` 入队后立即返回，forward 接着往下跑。如果不等队列排空就结束 forward，那些还在 `send_queue` 里、还在被后台线程读着的 paged 块，下一步就可能被复用覆盖——正是 §34.4 的脏数据场景。`wait_for_sent` 堵住它：
+这就是问题所在。`save_kv_layer` 用 `PUT_ASYNC` 入队后立即返回，forward 接着往下跑。如果不等队列排空就结束 forward，那些还在 `send_queue` 里、还在被后台线程读着的 paged 块，下一步就可能被复用覆盖——正是 §36.4 的脏数据场景。`wait_for_sent` 堵住它：
 
 ```python
 # vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py:L486-L498
@@ -538,7 +538,7 @@ P2P 的 `get_finished` 委托给引擎，引擎在本进程内同时记着发和
 
 ---
 
-## 34.8 NIXL：RDMA 单边读，与不对称的完成信号
+## 36.8 NIXL：RDMA 单边读，与不对称的完成信号
 
 NIXL 是高性能 RDMA 后端。它和 P2P 有两个结构性的不同，都很能说明问题。
 
@@ -587,7 +587,7 @@ def wait_for_save(self):
         self.connector_worker.save_kv_to_host(self._connector_metadata)
 ```
 
-这就印证了 §34.3 提前打的预防针：`wait_for_layer_load` 和 `save_kv_layer` 都是 **no-op**。这不是偷懒，是 NIXL 的传输模型决定的——这是第二个、也是更深的不同。
+这就印证了 §36.3 提前打的预防针：`wait_for_layer_load` 和 `save_kv_layer` 都是 **no-op**。这不是偷懒，是 NIXL 的传输模型决定的——这是第二个、也是更深的不同。
 
 **第二个不同：RDMA 单边 READ。** P2P 是 producer 主动"推"（send）KV。NIXL 反过来——**decode worker 主动从 prefill worker 的显存里"读"（READ）KV**，而 prefill 端的 CPU/GPU 完全不参与这次传输。这是 RDMA 单边操作的本质：发起方给网卡一组地址，网卡直接搬对端内存，对端 CPU 无感。
 
@@ -670,7 +670,7 @@ def get_finished(self) -> tuple[set[str], set[str]]:
     return done_sending, done_recving
 ```
 
-两个完成信号来自**完全不同的源头**，这正是 §34.7 末尾埋的对照点：
+两个完成信号来自**完全不同的源头**，这正是 §36.7 末尾埋的对照点：
 
 - **收完成（`done_recving`）= 本地 handle 转 DONE。** D 是发起方，能直接问网卡"这次 READ 读完没"。
 - **发完成（`done_sending`）= 收到对端通知。** P 端没参与传输，自己根本不知道 D 读完没、那些被读的块何时能释放。只能靠 D 读完后 `send_notif` 主动通知，P 这边 `_get_new_notifs` 收到才算数。
@@ -708,7 +708,7 @@ for req_id, handles in list(transfers.items()):
 
 ---
 
-## 34.9 Offloading：不是跨节点，是分级缓存
+## 36.9 Offloading：不是跨节点，是分级缓存
 
 第三类后端 Offloading，结构上和 NIXL 一样是 facade，但它做的事根本不是 PD 分离——它把 GPU 上的 KV **卸载到 CPU/磁盘**当二级缓存。同一套 worker 契约，到这里语义又拧了一道，恰好把契约的弹性逼到极限。
 
@@ -799,11 +799,11 @@ def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
 
 ---
 
-## 34.10 亲手验证：生命周期真的这么转吗
+## 36.10 亲手验证：生命周期真的这么转吗
 
 道理讲完，下面把它跑起来看一眼。本章配的精简版把三类后端的网络/RDMA/磁盘细节都换成了形状一致的 loopback，但生命周期时序、契约方法、完成信号的语义都 1:1 保留，可以在纯 CPU 上验证几个关键不变量。
 
-最该验的是 §34.2 的核心结构——**`start_load_kv` 真的在 forward 前、`wait_for_save` 真的在 forward 后**。精简版用一个记录调用顺序的 connector 跑一遍生命周期 context，断言调用序列是：
+最该验的是 §36.2 的核心结构——**`start_load_kv` 真的在 forward 前、`wait_for_save` 真的在 forward 后**。精简版用一个记录调用顺序的 connector 跑一遍生命周期 context，断言调用序列是：
 
 ```
 bind_connector_metadata → start_load_kv → [forward 内：层级 hook] → wait_for_save → get_finished → clear
@@ -811,7 +811,7 @@ bind_connector_metadata → start_load_kv → [forward 内：层级 hook] → wa
 
 `start_load_kv` 的下标严格小于 forward 标记，`wait_for_save` 的下标严格大于——forward 被夹在中间这件事，从调用序列上就坐实了。
 
-第二个该验的是三类后端的完成信号差异（§34.7–34.9）：
+第二个该验的是三类后端的完成信号差异（§36.7–34.9）：
 
 | 后端 | start_load_kv 干什么 | wait_for_save 干什么 | finished_sending | finished_recving |
 |---|---|---|---|---|
@@ -825,7 +825,7 @@ bind_connector_metadata → start_load_kv → [forward 内：层级 hook] → wa
 
 ---
 
-## 34.11 小结
+## 36.11 小结
 
 这一章把 PD 分离的 worker 侧讲透了。回头看三条主线：
 
