@@ -162,14 +162,19 @@ def lint_source_grounding(chapter_dir: str) -> dict:
     return results
 
 
-def print_report(results: dict, chapter_dir: str):
+def print_report(results: dict, chapter_dir: str) -> int:
+    """打印报告并返回退出码(0=通过, 1=有 BLOCKING)。
+
+    exp-2026-07-20-06:原先无返回值且 __main__ 不 sys.exit,导致本门禁**退出码恒为 0**——
+    报告里打印着 `🔴 N BLOCKING`,任何按退出码判定的自动化却一律看作通过。
+    """
     total = sum(len(v) for v in results.values())
     print(f"Source Grounding Lint: {chapter_dir}")
     print(f"{'=' * 60}")
 
     if total == 0:
         print("✓ All grounding checks passed!")
-        return
+        return 0
 
     for check, issues in results.items():
         if issues:
@@ -181,11 +186,11 @@ def print_report(results: dict, chapter_dir: str):
     print(f"\n{'=' * 60}")
     if blocking > 0:
         print(f"🔴 {blocking} BLOCKING issue(s) — auto-REJECT")
+    return 1 if blocking > 0 else 0
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python lint_source_grounding.py <chapter_dir>")
         sys.exit(1)
-    results = lint_source_grounding(sys.argv[1])
-    print_report(results, sys.argv[1])
+    sys.exit(print_report(lint_source_grounding(sys.argv[1]), sys.argv[1]))
