@@ -1,0 +1,1097 @@
+{
+ "chapter_id": "ch32",
+ "slug": "ch32-structured-output",
+ "source_pin": "vLLM v0.21.0 @ ad7125a4",
+ "run_environment": {
+  "mode": "host(本轮 host 有真实 CUDA GPU + Triton,已现场核实;与本书多数 vLLM 章节「host 无 CUDA」的假定不同)",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+  "torch": "2.11.0+cu130",
+  "triton": "3.6.0",
+  "cpu_count": 4,
+  "xgrammar_installed": false,
+  "差异标注": [
+   "m04 的线程数:pin 公式 max(1, min(cpu_count//2, 8));本机 cpu_count=4 → 2 个线程,生产机(cpu_count ≥ 16)才是 8。表格里的『提交任务数 16』与词表/阈值无关,不受此影响。",
+   "m11 / m17:xgrammar 本体未安装,`xgr.apply_token_bitmask_inplace` 用忠实实现其语义(bit==0 → -inf)的替身顶替;被替身的只有外部库函数,vLLM 自己的重排/索引/门控逻辑全部真实执行。",
+   "所有 |V|=152064 的数字(4752 列 / 18.5625 KiB 每行 / grid 第二维 19 / 4.6406 MiB 每批)均按源码常量推算,不是实测耗时或实测显存。"
+  ]
+ },
+ "mechanisms": [
+  {
+   "mechanism_id": "m01-schedule-gate",
+   "intuition": "点名之后才发卷子。一整批被调度的请求里,只有「这一步真的要吐出下一个 token」的那些人需要一张答题限制单(掩码行);还在分段抄题干(分块 prefill 中段)的人这一步根本不作答,发给他也是浪费——而且会把「几张单子对几张答卷」的账算乱。",
+   "worked_example": {
+    "params": {
+     "vocab_size": 96,
+     "max_num_seqs": 4,
+     "max_num_spec_tokens": 0,
+     "requests": "rA(结构化,decode) / rB(非结构化,decode) / rC(结构化,但本步只调度 4/8 个 prompt token) / rD(结构化,decode)",
+     "note": "词表取 96 是为了让一行掩码只有 3 个 int32、读者能逐位心算;真实 |V| 见 quantified"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/t01_gate_and_row_order.json",
+    "table": {
+     "columns": [
+      "请求",
+      "本步调度 token 数",
+      "num_computed / num_tokens",
+      "is_prefill_chunk",
+      "use_structured_output",
+      "本步是否贡献掩码行",
+      "has_structured_output_requests(累积或)"
+     ],
+     "rows": [
+      [
+       "rA",
+       "3",
+       "3 / 3",
+       "False",
+       "True",
+       "是",
+       "True"
+      ],
+      [
+       "rB",
+       "3",
+       "3 / 3",
+       "False",
+       "False",
+       "否",
+       "True"
+      ],
+      [
+       "rC",
+       "4",
+       "4 / 8",
+       "True",
+       "True",
+       "否(prefill chunk 被排除)",
+       "True"
+      ],
+      [
+       "rD",
+       "3",
+       "3 / 3",
+       "False",
+       "True",
+       "是",
+       "True"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "掩码行数恒等于「本步会产出 logits 的结构化请求数」——门控的置位处与收集处用的是同一个判据。",
+    "argument": "基例:has_structured_output_requests 初值 False,只被 `|=` 单调置真,永不回落。归纳步:_update_after_schedule(scheduler.py:942-951)对每个被调度请求用 `use_structured_output and not is_prefill_chunk` 或一次;get_grammar_bitmask(scheduler.py:1229-1239)再用**逐字相同**的判据做列表推导。因此『has_... 为真』⟺『至少一个请求通过该判据』,且通过者集合两处必然相同——不是两套独立条件碰巧一致。trace 里 rC 两处都被判出局(4 < 8 → is_prefill_chunk),rB 因 use_structured_output 为假出局,最终 ids 恰为 [rA, rD] 两个,与掩码 2 行一一对应。"
+   },
+   "quantified": "本例 4 个被调度请求里只有 2 个通过门控,掩码从 4 行降到 2 行。放到真实规模:|V|=152064 时一行掩码是 4752 个 int32 = 18.5625 KiB(按源码常量推算,非实测),每挡掉一个 prefill chunk 请求就省下一次 4752 次位写 + 18.5625 KiB 的 H2D 搬运;分块 prefill 常态下一批里挡掉的往往是多数。",
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "m02-row-order-invariant",
+   "intuition": "托运行李不靠「第几个上传送带」认领,靠贴在箱子上的行李条。掩码行就是箱子,GrammarOutput 里随行同传的 req_id 列表就是行李条;worker 那头不数行号,只扫条码,再按 cu_num_logits 查这位旅客占哪几个座位。",
+   "worked_example": {
+    "params": {
+     "vocab_size": 96,
+     "调度顺序": "rA, rB, rC, rD(rB 非结构化、rC 是 prefill chunk,均不入表)",
+     "batch 顺序": "rD, rB, rA, rC(与调度顺序故意不同)",
+     "cu_num_logits": "[0, 1, 2, 3, 3](rC 本步 0 行 logits)"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/t01_gate_and_row_order.json",
+    "table": {
+     "columns": [
+      "掩码行 k",
+      "structured_output_request_ids[k]",
+      "worker 端 req_id→batch 下标",
+      "cu_num_logits 区间",
+      "落到 logits 行",
+      "该 logits 行存活 token 数",
+      "存活 token"
+     ],
+     "rows": [
+      [
+       "0",
+       "rA",
+       "2",
+       "[2, 3)",
+       "2",
+       "2",
+       "5, 7"
+      ],
+      [
+       "1",
+       "rD",
+       "0",
+       "[0, 1)",
+       "0",
+       "3",
+       "40, 41, 42"
+      ],
+      [
+       "无(rB 不在列表)",
+       "—",
+       "1",
+       "[1, 2)",
+       "未被改写",
+       "96",
+       "全部 96 个"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "不变式是「第 k 行掩码属于 structured_output_request_ids[k] 这个请求」,**不是**「掩码行序 == batch 行序」——正因为 id 列表随掩码同传,两侧顺序才被允许不一致。",
+    "argument": "装配侧:行序由 scheduler_output.num_scheduled_tokens 的迭代顺序唯一确定,并原样写进 GrammarOutput.structured_output_request_ids(scheduler.py:1232-1246)。落地侧:worker 不读行号,先建 req_id → batch 下标字典,再用 cu_num_logits 取该请求的 logits 行区间(worker/gpu/structured_outputs.py:40-48)。于是映射 k ↦ logits 行 是「id → 下标 → 区间」的复合,与两侧各自的排列无关。反证由 trace 给出:本例两侧顺序确实不同,若按行号硬对齐,rA 的掩码(只许 5、7)会落到 rD 的 logits 行上——而这种错位不会报任何错,只会静默生成错的 JSON。真机 kernel 跑完的结果是 logits 行 2(rA)存活 5、7,行 0(rD)存活 40、41、42,对号入座。"
+   },
+   "quantified": "本例 2 行掩码 × 3 列 int32 = 24 字节的紧凑表,配 2 个 req_id 字符串就完成了跨进程定序;若改用「约定顺序一致」的隐式契约,省下的也就是这 2 个字符串,换来的是一类不会报错的静默错配。真实规模下 id 列表长度 = 结构化请求数(≤ max_num_seqs),相对每行 18.5625 KiB(|V|=152064,按源码常量推算)的掩码本体可以忽略。",
+   "figure_specs": [
+    {
+     "figure_id": "fig-ch32-row-order-and-budget",
+     "claim": "掩码是一张「调度顺序的行 × ceil(|V|/32) 列」的紧凑表,某一行归谁由随行同传的 req_id 列表决定,而不是由行号与 batch 顺序的巧合决定。",
+     "template": "layout",
+     "numbers": [
+      {
+       "name": "缓冲行数上界",
+       "value": "max_num_seqs × (1 + num_spec) = 4 × 1 = 4 行(本例)",
+       "provenance": "vllm/v1/structured_output/__init__.py:L219-228 + explainer/traces/t01_gate_and_row_order.json → params.bitmask_buffer_rows"
+      },
+      {
+       "name": "本步实际行数",
+       "value": "2 行(裁到 cumulative_index)",
+       "provenance": "explainer/traces/t01_gate_and_row_order.json → stage2_assemble.rows_after_trim"
+      },
+      {
+       "name": "列数",
+       "value": "ceil(96/32) = 3 个 int32(真实 |V|=152064 时为 4752)",
+       "provenance": "explainer/traces/t01_gate_and_row_order.json → params.bitmask_cols_ceil_V_over_32;真实值见 traces/t04_kernel_apply.json → kernel_geometry_real_vocab_derived_not_measured.bitmask_cols_int32(按源码常量推算)"
+      },
+      {
+       "name": "调度顺序",
+       "value": "[rA, rD]",
+       "provenance": "explainer/traces/t01_gate_and_row_order.json → stage2_assemble.structured_output_request_ids"
+      },
+      {
+       "name": "batch 顺序",
+       "value": "[rD, rB, rA, rC]",
+       "provenance": "explainer/traces/t01_gate_and_row_order.json → stage3_worker_apply.batch_req_ids"
+      },
+      {
+       "name": "映射结果",
+       "value": "掩码行 0 → logits 行 2;掩码行 1 → logits 行 0",
+       "provenance": "explainer/traces/t01_gate_and_row_order.json → stage3_worker_apply.mapping_bitmask_row_to_logits_row"
+      }
+     ],
+     "caption_draft": "图 1:掩码行的归属由 req_id 列表钉死,不由行号。本例调度顺序 [rA, rD] 与 batch 顺序 [rD, rB, rA, rC] 故意不同,worker 用 req_id→batch 下标字典 + cu_num_logits 区间把第 0 行送到 logits 行 2、第 1 行送到 logits 行 0;若按行号硬对齐,两个请求的语法约束会互换且不报任何错。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m04-parallel-fill",
+   "intuition": "每个人填自己那张快递单,互不干扰,所以人多时开几个窗口分着填是安全的。但窗口是开门时(构造 manager 时)就按「这家店最多同时接多少单」决定要不要建的——店面上限只有 128 单的门店,压根不会建这些窗口。",
+   "worked_example": {
+    "params": {
+     "fill_bitmask_parallel_threshold": 128,
+     "fill_bitmask_parallel_batch_size": 16,
+     "vocab_size": 96,
+     "host_cpu_count": 4,
+     "取证环境差异": "max_workers = max(1, min(cpu_count//2, 8));本机 cpu_count=4 → 2 个线程,生产机 cpu_count≥16 时才是公式上界 8。pin 逻辑一致,取值随机器变化"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/t03_parallel_threshold.json",
+    "table": {
+     "columns": [
+      "配置",
+      "max_num_seqs",
+      "executor_for_fillmask 是否被构造",
+      "本步结构化请求数",
+      "max_num_spec_tokens",
+      "走哪一支",
+      "提交的线程池任务数",
+      "每任务请求数"
+     ],
+     "rows": [
+      [
+       "cfg1",
+       "128",
+       "否(128 < 128 为假)",
+       "128",
+       "0",
+       "串行",
+       "0",
+       "—"
+      ],
+      [
+       "cfg2",
+       "256",
+       "是",
+       "128",
+       "0",
+       "串行(128 > 128 为假)",
+       "0",
+       "—"
+      ],
+      [
+       "cfg3",
+       "256",
+       "是",
+       "256",
+       "0",
+       "并行",
+       "16",
+       "16"
+      ],
+      [
+       "cfg4",
+       "256",
+       "是",
+       "256",
+       "2",
+       "串行(投机被排除)",
+       "0",
+       "—"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "并行分支可达 ⟺ 三个条件同时成立:构造期 `128 < max_num_seqs`、运行期 `len(ids) > 128`、且 `max_num_spec_tokens == 0`。推论:max_num_seqs ≤ 128 的部署里,并行填充是**结构性死代码**。",
+    "argument": "前两个条件由同一个常量 128 把关,一个在构造期一个在运行期,而 len(ids) 的上界恰是 max_num_seqs(一步内被调度的请求数不超过它)。于是 `len(ids) > 128` 成立必然蕴含 `max_num_seqs > 128`,也就是构造期条件成立——两者要么同真、要么同假,唯一的中间态是 cfg2(池建了但这一步人不够多,走串行)。第三个条件是正确性要求而非性能取舍:并行分支里每个任务只写自己那一行(_fill_bitmasks 对 (grammar, index, apply) 三元组逐个处理,行间无共享可变状态),而投机场景下同一个 grammar 对象要按草稿序 accept_tokens/rollback,跨行有顺序依赖,不能并发。trace 的 cfg1 直接证实 executor_for_fillmask 属性根本不存在。"
+   },
+   "quantified": "B=256、|V|=152064、无投机时,整批填充是 256 × 4752 ≈ 1.22M 次 int32 位写、掩码本体 4.6406 MiB(按源码常量推算),被切成 ceil(256/16) = 16 个任务;并行度受 max(1, min(cpu_count//2, 8)) 限制——生产机(cpu_count ≥ 16)是 8 个线程,本次取证机 cpu_count=4 只有 2 个线程,trace 里实测到的正是 2 个工作线程名。",
+   "figure_specs": [
+    {
+     "figure_id": "fig-ch32-parallel-gate",
+     "claim": "并行填充要连过三道门(构造期阈值、运行期批量、无投机),其中第一道在 max_num_seqs ≤ 128 的部署里直接把这条分支变成死代码。",
+     "template": "flow",
+     "numbers": [
+      {
+       "name": "阈值",
+       "value": "fill_bitmask_parallel_threshold = 128",
+       "provenance": "vllm/v1/structured_output/__init__.py:L61-62"
+      },
+      {
+       "name": "分块大小",
+       "value": "fill_bitmask_parallel_batch_size = 16",
+       "provenance": "vllm/v1/structured_output/__init__.py:L63"
+      },
+      {
+       "name": "线程数公式",
+       "value": "max(1, min(cpu_count//2, 8));取证机 cpu_count=4 → 2",
+       "provenance": "vllm/v1/structured_output/__init__.py:L64-67 + explainer/traces/t03_parallel_threshold.json → host_env"
+      },
+      {
+       "name": "cfg1 结果",
+       "value": "max_num_seqs=128 → executor_for_fillmask 未构造,串行",
+       "provenance": "explainer/traces/t03_parallel_threshold.json → configs[0]"
+      },
+      {
+       "name": "cfg3 结果",
+       "value": "max_num_seqs=256、本步 256 个请求 → 并行,16 个任务 × 16 个请求",
+       "provenance": "explainer/traces/t03_parallel_threshold.json → configs[2]"
+      },
+      {
+       "name": "cfg4 结果",
+       "value": "同 cfg3 但 num_spec=2 → 回落串行",
+       "provenance": "explainer/traces/t03_parallel_threshold.json → configs[3]"
+      }
+     ],
+     "caption_draft": "图 2:三道门决定要不要并行填掩码。第一道在构造期——`128 < max_num_seqs` 为假时线程池根本不建,而一步内的结构化请求数又不会超过 max_num_seqs,因此 max_num_seqs ≤ 128 的部署里第二道门也永远过不去:并行分支是结构性死代码。第三道门排除投机,是因为投机行之间共享同一个 grammar 的推进/回滚顺序。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m05-serial-fill-spec",
+   "intuition": "为第 j 个草稿位置取「哪些词合法」,必须先假装前 j-1 个草稿都已被采纳,把语法状态机真的往前推 j-1 步;填完这一批行立刻倒带回原位——草稿最终认不认,要等验收(update_from_output)那一步说了算。",
+   "worked_example": {
+    "params": {
+     "vocab_size": 96,
+     "max_num_seqs": 4,
+     "max_num_spec_tokens": 2,
+     "语法": "位置 0 允许 {5, 7};位置 1 允许 {9};位置 2 允许 {11, 13}",
+     "rA 草稿": "[5, 9](全合法)",
+     "rB 草稿": "[5, -1](第二个被上一站过滤掉后补的 -1)"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/t02_serial_spec_fill.json",
+    "table": {
+     "columns": [
+      "请求",
+      "掩码行",
+      "本位置 token",
+      "填行前 FSM 位置",
+      "apply_bitmask",
+      "写入该行的内容",
+      "accept_tokens 被调用",
+      "填行后 FSM 位置",
+      "state_advancements"
+     ],
+     "rows": [
+      [
+       "rA",
+       "0",
+       "5",
+       "0",
+       "True",
+       "允许 5, 7",
+       "是",
+       "1",
+       "1"
+      ],
+      [
+       "rA",
+       "1",
+       "9",
+       "1",
+       "True",
+       "允许 9",
+       "是",
+       "2",
+       "2"
+      ],
+      [
+       "rA",
+       "2",
+       "-1(补齐位)",
+       "2",
+       "True",
+       "允许 11, 13",
+       "否(遇到 -1 停止推进)",
+       "2",
+       "2"
+      ],
+      [
+       "rA",
+       "—",
+       "循环结束",
+       "2",
+       "—",
+       "rollback(2)",
+       "否",
+       "0",
+       "2"
+      ],
+      [
+       "rB",
+       "3",
+       "5",
+       "0",
+       "True",
+       "允许 5, 7",
+       "是",
+       "1",
+       "1"
+      ],
+      [
+       "rB",
+       "4",
+       "-1(补齐位)",
+       "1",
+       "True",
+       "允许 9",
+       "否",
+       "1",
+       "1"
+      ],
+      [
+       "rB",
+       "5",
+       "-1",
+       "1",
+       "False",
+       "整行 -1(全允许)",
+       "否",
+       "1",
+       "1"
+      ],
+      [
+       "rB",
+       "—",
+       "循环结束",
+       "1",
+       "—",
+       "rollback(1)",
+       "否",
+       "0",
+       "1"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "串行分支对每个请求是语法状态的**恒等变换**:填完 1+k 行之后,FSM 一定回到本步开始时的位置。",
+    "argument": "取单调量 state_advancements:它只在 `apply_bitmask and not is_terminated` 且成功 accept_tokens 时 +1,初值 0,循环内单调不减;循环结束后恰好调用一次 rollback(state_advancements)(__init__.py:L284-285)。rollback 的语义是精确逆操作(上篇 ch31 已用数值表证明,本章只回指),故净位移 = state_advancements − state_advancements = 0。基例:state_advancements == 0 时连 rollback 都不调,净位移同样是 0。trace 双向验证:rA 推进 2 步后 rollback(2)、rB 推进 1 步后 rollback(1),两者 position 都回到 0;手工逐行展开与直接调用真实 grammar_bitmask 的 accept_log/rollback_log/fill_log 完全一致。另注意 `-1` 的两段式效果:遇到 -1 时**当前行已经填过**(用的是推进到此刻的状态),之后才把 apply_bitmask 置假,所以再往后的行才退化成整行 -1(rB 的第 5 行)。"
+   },
+   "quantified": "每个结构化请求恒占 1+k 行:k=2 时 3 行,两个请求共 6 行,缓冲按 max_num_seqs×(1+k) = 4×3 = 12 行预分配、末尾裁到 6 行返回(trace stageB)。真实规模下每行 18.5625 KiB(|V|=152064,按源码常量推算),这 6 行 ≈ 111.4 KiB;换言之投机把掩码的填充与搬运成本按 1+k 倍放大,这正是 allocate_token_bitmask 要按 (1+num_spec) 预留的原因。",
+   "figure_specs": [
+    {
+     "figure_id": "fig-ch32-serial-spec-rollback",
+     "claim": "一个投机请求的 1+k 行掩码是「推进—填行—再推进—…—整体回滚」的产物,回滚让本步对语法状态的净影响为零。",
+     "template": "state-table",
+     "numbers": [
+      {
+       "name": "行数/请求",
+       "value": "1 + k = 3(k=2)",
+       "provenance": "explainer/traces/t02_serial_spec_fill.json → params.rows_per_request"
+      },
+      {
+       "name": "rA 推进步数",
+       "value": "2,随后 rollback(2)",
+       "provenance": "explainer/traces/t02_serial_spec_fill.json → stageB_serial_fill.gA_rollback_log"
+      },
+      {
+       "name": "rB 推进步数",
+       "value": "1,随后 rollback(1)(第二个草稿位是 -1 补齐位)",
+       "provenance": "explainer/traces/t02_serial_spec_fill.json → stageB_serial_fill.gB_rollback_log"
+      },
+      {
+       "name": "各行允许集",
+       "value": "[{5,7}, {9}, {11,13}] / [{5,7}, {9}, 整行 -1]",
+       "provenance": "explainer/traces/t02_serial_spec_fill.json → stageB_crosscheck_real_call.per_row_allowed_tokens"
+      },
+      {
+       "name": "回滚后 FSM 位置",
+       "value": "0(与本步开始时相同)",
+       "provenance": "explainer/traces/t02_serial_spec_fill.json → stageB_serial_fill.gA_position_after_rollback / gB_position_after_rollback"
+      },
+      {
+       "name": "缓冲与裁剪",
+       "value": "预分配 12 行,本步用 6 行,返回前裁到 6",
+       "provenance": "explainer/traces/t02_serial_spec_fill.json → stageB_serial_fill.buffer_rows_allocated / rows_after_trim"
+      }
+     ],
+     "caption_draft": "图 3:投机场景下一个请求的掩码怎么长出 1+k 行。每填一行就试探性 accept 一个草稿 token 把 FSM 推前一格,遇到 -1 补齐位后停止推进、其后各行退化为整行 -1(全允许);循环末尾一次 rollback(state_advancements) 把状态精确复位——本步对语法状态的净影响为零,真正的推进留给验收阶段按接受结果做。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m08-h2d-copy-stream",
+   "figure_specs": [
+    {
+     "figure_id": "fig-ch32-copy-stream-swimlane",
+     "claim": "掩码与行映射走独立的 copy_stream 搬上卡,前后各一次 wait_stream 把「数据就位」和「缓冲用完」两件事钉死,拷贝才能安全地与计算流重叠。",
+     "template": "swimlane",
+     "numbers": [
+      {
+       "name": "第一次 H2D",
+       "value": "紧凑掩码 4 行 × 3 列 int32(本例);真实规模 4752 列 = 18.5625 KiB/行",
+       "provenance": "vllm/v1/worker/gpu/structured_outputs.py:L34-37 + explainer/traces/t04_kernel_apply.json → mapping.num_masks 与 kernel_geometry_real_vocab_derived_not_measured(按源码常量推算)"
+      },
+      {
+       "name": "第二次 H2D",
+       "value": "行映射 int32 张量,长度 = num_masks = 4",
+       "provenance": "vllm/v1/worker/gpu/structured_outputs.py:L51-58 + explainer/traces/t04_kernel_apply.json → mapping.len_mapping"
+      },
+      {
+       "name": "kernel 前同步",
+       "value": "current_stream.wait_stream(copy_stream)",
+       "provenance": "vllm/v1/worker/gpu/structured_outputs.py:L59-61"
+      },
+      {
+       "name": "kernel 后同步",
+       "value": "copy_stream.wait_stream(current_stream)",
+       "provenance": "vllm/v1/worker/gpu/structured_outputs.py:L78-80"
+      },
+      {
+       "name": "重叠对象",
+       "value": "掩码计算本身早在 execute_model 非阻塞发车之后才做(CPU 侧藏进前向影子里)",
+       "provenance": "vllm/v1/engine/core.py:L417-426"
+      },
+      {
+       "name": "缓冲复用",
+       "value": "预分配 [max_num_logits, ceil(V/32)] 卡上缓冲,每步只覆写前 num_masks 行",
+       "provenance": "vllm/v1/worker/gpu/structured_outputs.py:L17-19"
+      }
+     ],
+     "caption_draft": "图 4:两条流的泳道。copy_stream 上两次异步 H2D(掩码本体 + 行映射)与 current_stream 上的其它 kernel 重叠;kernel 启动前的 current_stream.wait_stream 保证数据已就位,kernel 之后的 copy_stream.wait_stream 保证这块预分配缓冲被用完才允许下一步覆写——两次 wait 方向相反,少任何一次都会读到半旧半新的掩码。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m09-row-mapping",
+   "intuition": "一张车票可能对应连着的好几个座位(投机时一个请求本步产出 1+k 行 logits)。cu_num_logits 是座位表的前缀和,告诉你这位旅客坐第几到第几号;掩码行就按同样的次序一个个填进这段区间。行数对不上,当场 assert 拦下,而不是让人坐错车厢。",
+   "worked_example": {
+    "params": {
+     "vocab_size": 96,
+     "batch 顺序": "rB, rA, rC",
+     "cu_num_logits": "[0, 1, 4, 5](rA 带 2 个草稿 → 占 3 行)",
+     "调度顺序的 grammar_req_ids": "[rA, rC]",
+     "取证环境": "真机 NVIDIA RTX PRO 6000 Blackwell + torch 2.11.0+cu130 + triton 3.6.0,kernel 真实执行"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/t04_kernel_apply.json",
+    "table": {
+     "columns": [
+      "掩码行",
+      "所属请求(调度序)",
+      "batch 下标",
+      "cu_num_logits 区间",
+      "mapping 值",
+      "落到 logits 行",
+      "存活 token"
+     ],
+     "rows": [
+      [
+       "0",
+       "rA 位置 0",
+       "1",
+       "[1, 4)",
+       "1",
+       "1",
+       "5, 7"
+      ],
+      [
+       "1",
+       "rA 位置 1",
+       "1",
+       "[1, 4)",
+       "2",
+       "2",
+       "9"
+      ],
+      [
+       "2",
+       "rA 位置 2",
+       "1",
+       "[1, 4)",
+       "3",
+       "3",
+       "11, 13"
+      ],
+      [
+       "3",
+       "rC 位置 0",
+       "2",
+       "[4, 5)",
+       "4",
+       "4",
+       "40, 41, 42"
+      ],
+      [
+       "无(rB 非结构化)",
+       "—",
+       "0",
+       "[0, 1)",
+       "—",
+       "0(未被改写)",
+       "全部 96 个"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "len(mapping) 恒等于掩码行数 num_masks;源码用 `assert num_masks == len(mapping)` 把它钉死。",
+    "argument": "逐请求相等 ⇒ 求和相等。装配侧对第 i 个结构化请求写 1+k_i 行(k_i = 该请求本步的草稿位数,含 -1 补齐位,见 m12);落地侧对同一请求展开 cu_num_logits[idx+1] − cu_num_logits[idx] 个下标,而这个差值正是该请求本步产出的 logits 行数 = 1+k_i。两侧的 k_i 来自同一份 scheduled_spec_decode_tokens(补齐后长度恒为原调度数),故逐项相等,求和后 len(mapping) = Σ(1+k_i) = num_masks。trace 里 2 个结构化请求(其一带 2 草稿)给出 3+1 = 4 行掩码与长度 4 的 mapping,assert 通过;非结构化的 rB 既不在掩码里也不在 mapping 里,其 logits 行 96 个 token 全部有限——未被误伤。"
+   },
+   "quantified": "本例 4 行掩码映射到 5 行 logits 中的 4 行。真实上界:batch=256、k=3 时掩码最多 256 × 4 = 1024 行 × 4752 int32 ≈ 18.5625 MiB,mapping 是 1024 个 int32 = 4 KiB —— 映射本身几乎不花钱,它买到的是「两侧顺序解耦」(按源码常量推算,非实测)。",
+   "figure_specs": [
+    {
+     "figure_id": "fig-ch32-mapping-expand",
+     "claim": "行映射把「调度序的紧凑掩码行」按 cu_num_logits 区间展开成「batch 序的 logits 行下标」,一个投机请求一次展开 1+k 个下标。",
+     "template": "tensor-flow",
+     "numbers": [
+      {
+       "name": "batch 顺序",
+       "value": "[rB, rA, rC]",
+       "provenance": "explainer/traces/t04_kernel_apply.json → mapping.batch_req_ids"
+      },
+      {
+       "name": "cu_num_logits",
+       "value": "[0, 1, 4, 5]",
+       "provenance": "explainer/traces/t04_kernel_apply.json → mapping.cu_num_logits"
+      },
+      {
+       "name": "调度序",
+       "value": "[rA, rC]",
+       "provenance": "explainer/traces/t04_kernel_apply.json → mapping.grammar_req_ids_schedule_order"
+      },
+      {
+       "name": "mapping",
+       "value": "[1, 2, 3, 4]",
+       "provenance": "explainer/traces/t04_kernel_apply.json → mapping.mapping_bitmask_row_to_logits_row"
+      },
+      {
+       "name": "对账",
+       "value": "num_masks = 4 == len(mapping) = 4",
+       "provenance": "explainer/traces/t04_kernel_apply.json → mapping.assert_num_masks_eq_len_mapping"
+      },
+      {
+       "name": "未参与的行",
+       "value": "logits 行 0(rB)96 个 token 全部有限",
+       "provenance": "explainer/traces/t04_kernel_apply.json → logits_rows[0].num_neg_inf = 0"
+      }
+     ],
+     "caption_draft": "图 5:从紧凑掩码到 logits 行的展开。rA 带 2 个草稿,占 cu_num_logits 的 [1,4) 三行,于是它的 3 行掩码依次映射到 logits 行 1、2、3;rC 占 [4,5) 一行。num_masks 与 len(mapping) 必须相等,源码在启动 kernel 前 assert 之——不等意味着某一侧的草稿位数算错了,宁可当场崩掉也不要静默错位。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m10-triton-kernel",
+   "intuition": "掩码是一张打孔卡:每 32 个 token 挤进一个 int32,打了孔(bit==1)的才准通过。kernel 做的事就是把打孔卡抖开成一排 0/1,凡是没打孔的位置,往对应的 logit 上盖一个 -inf 的戳。",
+   "worked_example": {
+    "params": {
+     "vocab_size": 96,
+     "BLOCK_SIZE": 8192,
+     "num_masks": 4,
+     "取证环境": "真机 NVIDIA RTX PRO 6000 Blackwell,triton 3.6.0,@triton.jit kernel 真实执行(非语法检查)",
+     "口径": "|V|=152064 一列的数字是按源码常量推算,不是实测耗时"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/t04_kernel_apply.json",
+    "table": {
+     "columns": [
+      "量",
+      "本例(|V| = 96)",
+      "Qwen 词表(|V| = 152064,按源码常量推算)"
+     ],
+     "rows": [
+      [
+       "BLOCK_SIZE(每个 program 负责的 token 数)",
+       "8192",
+       "8192"
+      ],
+      [
+       "每个 program 载入的 int32 数(BLOCK_SIZE // 32)",
+       "256",
+       "256"
+      ],
+      [
+       "grid 第 0 维 = num_masks",
+       "4",
+       "4(与词表无关,等于掩码行数)"
+      ],
+      [
+       "grid 第 1 维 = cdiv(|V|, BLOCK_SIZE)",
+       "1",
+       "19"
+      ],
+      [
+       "bitmask_stride = ceil(|V| / 32)",
+       "3",
+       "4752"
+      ],
+      [
+       "一行掩码字节数",
+       "12",
+       "19008 字节 = 18.5625 KiB"
+      ],
+      [
+       "第 0 行第 0 列的打包值",
+       "160",
+       "—"
+      ],
+      [
+       "解包后该列 bit == 1 的 token",
+       "5, 7",
+       "—"
+      ],
+      [
+       "kernel 跑完 logits 行 1 的存活 token",
+       "5, 7",
+       "—"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "kernel 只写「bit == 0 且 block_offset < vocab_size」的位置:合法 token 的 logit 逐字不变,词表尾部的越界地址一个都不碰。",
+    "argument": "写回是一次带谓词的 tl.store,谓词是两项合取 `bitmask & (block_offset < vocab_size)`。第一项:bitmask 由 `((packed >> arange(32)) & 1) == 0` 得到,bit==1 时为假 → 合法 token 不被写(不是「写回原值」,是根本不写)。第二项:最后一个 block 的尾部 block_offset ≥ |V| 时为假 → 越界不写;载入侧另有 `bitmask_offset < bitmask_stride` 挡住列方向的越界读。两个方向的越界都由谓词而非分支处理,所以每个 program 的形状是编译期常量。trace 证据:rB 的 logits 行未被映射,96 个 token 全部有限;rA 位置 0 的行恰好剩下 5 和 7,其余 94 个全为 -inf(逐元素检查 isneginf 为真)。"
+   },
+   "quantified": "本例 grid = (4, 1) 共 4 个 program。真实规模 |V|=152064、BLOCK_SIZE=8192 时 grid 第二维是 19,batch=256 无投机则 grid = (256, 19) = 4864 个 program,读入的掩码总量 4.6406 MiB(按源码常量推算,非实测耗时)。注意这条 kernel 属于 opt-in 的 V2 路径,默认部署并不执行它(见 m11)。",
+   "figure_specs": [
+    {
+     "figure_id": "fig-ch32-bit-unpack",
+     "claim": "一个 program 把 256 个打包 int32 广播移位成 [256, 32] 的位矩阵、reshape 成 8192 个布尔量,bit==0 的位置写 -inf。",
+     "template": "tiling",
+     "numbers": [
+      {
+       "name": "BLOCK_SIZE",
+       "value": "8192",
+       "provenance": "vllm/v1/worker/gpu/structured_outputs.py:L72 + explainer/traces/t04_kernel_apply.json → kernel_geometry_toy.BLOCK_SIZE"
+      },
+      {
+       "name": "每 program 的 int32 数",
+       "value": "8192 // 32 = 256",
+       "provenance": "explainer/traces/t04_kernel_apply.json → kernel_geometry_toy.int32_per_block"
+      },
+      {
+       "name": "解包形状",
+       "value": "[256, 1] >> [1, 32] → [256, 32] → reshape 8192",
+       "provenance": "vllm/v1/worker/gpu/structured_outputs.py:L107-109"
+      },
+      {
+       "name": "示例打包值",
+       "value": "160 = 0b10100000 → bit 5、bit 7 为 1",
+       "provenance": "explainer/traces/t04_kernel_apply.json → bit_unpack_row0_col0.packed_int32_value / bit_eq_1_token_ids"
+      },
+      {
+       "name": "写回",
+       "value": "tl.store(-inf, mask = bitmask & (block_offset < vocab_size))",
+       "provenance": "vllm/v1/worker/gpu/structured_outputs.py:L110-115"
+      },
+      {
+       "name": "实测结果",
+       "value": "logits 行 1 只剩 token 5、7 有限,其余 94 个为 -inf",
+       "provenance": "explainer/traces/t04_kernel_apply.json → logits_rows[1]"
+      }
+     ],
+     "caption_draft": "图 6:语法在这里变成一次位运算。打包的 int32 经广播移位抖成位矩阵,bit==0 即非法;写回是一次带谓词的 tl.store(-inf),谓词同时兼任词表尾部的越界保护。本例 packed=160 解出 bit 5 与 bit 7,kernel 跑完该 logits 行也恰好只剩 token 5 和 7 有限。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m11-legacy-path",
+   "intuition": "同一件事有两个师傅在做:老师傅(默认)把紧凑的掩码先摊平成跟 logits 一样大的一张表、空位填「全允许」,再交给 xgrammar 自带的库函数;新师傅(要显式开开关才上工)不摊平,直接把紧凑表和一份行号清单塞给 vLLM 自己写的 Triton kernel。成品完全一样,差别在中间那道工序。",
+   "worked_example": {
+    "params": {
+     "env": "VLLM_USE_V2_MODEL_RUNNER 默认 False(vllm/envs.py:251,:1711-1713 读 env 默认 \"0\")",
+     "分叉点": "vllm/v1/worker/gpu_worker.py:316-330 构造 GPUModelRunnerV1 / GPUModelRunnerV2",
+     "场景": "与 m09 同一批:batch [rB, rA, rC],cu_num_logits [0,1,4,5],rA 带 2 个草稿",
+     "替身说明": "xgrammar 本体未安装,库函数用忠实实现其语义(bit==0 → -inf)的替身顶替;vLLM 自身的重排与索引逻辑一字未改地真实执行"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/t07_two_paths.json",
+    "table": {
+     "columns": [
+      "路径",
+      "触发条件",
+      "中间物料",
+      "最终执行者",
+      "本例 logits 行 1 的存活 token"
+     ],
+     "rows": [
+      [
+       "默认(GPUModelRunnerV1)",
+       "VLLM_USE_V2_MODEL_RUNNER = 0(默认)",
+       "sorted_bitmask 5 × 3(其中 1 行整行 -1)+ indices [1, 2, 3, 4]",
+       "xgr.apply_token_bitmask_inplace(xgrammar 库函数)",
+       "5, 7"
+      ],
+      [
+       "opt-in(GPUModelRunnerV2)",
+       "VLLM_USE_V2_MODEL_RUNNER = 1",
+       "紧凑掩码 4 × 3 直接 H2D + 行映射 4 个 int32(不分配 sorted_bitmask)",
+       "_apply_grammar_bitmask_kernel(vLLM 自写 Triton kernel)",
+       "5, 7"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "两条路径对同一输入产出**逐元素相同**的 logits;差别只在中间物料的形状与搬运量,不在语义。",
+    "argument": "两条路径对每个 (logits 行, token) 的判据是同一个:「该请求该位置的掩码位是否为 0」。默认路径先把紧凑行按 batch 下标 + 草稿偏移重排进一张与 logits 同形的表,未覆盖的行留 -1(全 1 位 = 全允许),再用 out_indices 限定作用范围;V2 路径不重排,直接用 mapping 索引 logits 行。两种寻址方式都只是「同一个 (行, 掩码行) 配对关系」的不同表达,故写 -inf 的位置集合相同。trace 用同一批输入分别跑两条路径并逐元素比较,结果为 True;逐行看存活 token 也完全一致。"
+   },
+   "quantified": "本例默认路径要 CPU 侧新建并填一张 5 × 3 的 sorted_bitmask(比紧凑表多 1 行,其中整行 -1 的纯属占位),V2 路径只搬 4 × 3 加一个长度 4 的索引。放大到 batch=256、|V|=152064、无投机:默认路径的 sorted_bitmask 是 256 × 4752 int32 = 4.6406 MiB 的 CPU 侧新分配 + 填充,而结构化请求若只占其中一小部分,多出来的行全是「填 -1 的占位」(按源码常量推算)。**但这不是本章的默认剧情**——默认部署跑的正是前者。",
+   "figure_specs": [
+    {
+     "figure_id": "fig-ch32-two-paths",
+     "claim": "worker 侧有两条并存路径,默认走 xgrammar 库函数那条;vLLM 自写的 Triton kernel 要显式打开 VLLM_USE_V2_MODEL_RUNNER 才生效,两者结果逐元素相同。",
+     "template": "before-after",
+     "numbers": [
+      {
+       "name": "env 默认值",
+       "value": "VLLM_USE_V2_MODEL_RUNNER: bool = False",
+       "provenance": "vllm/envs.py:251(原文见 explainer/traces/t07_two_paths.json → env_gate_from_pin_source)"
+      },
+      {
+       "name": "env 读取",
+       "value": "int(os.getenv(\"VLLM_USE_V2_MODEL_RUNNER\", \"0\"))",
+       "provenance": "vllm/envs.py:1711-1713"
+      },
+      {
+       "name": "分叉点",
+       "value": "gpu_worker.py:316 `if self.use_v2_model_runner:`",
+       "provenance": "vllm/v1/worker/gpu_worker.py:L316-330"
+      },
+      {
+       "name": "默认路径落点",
+       "value": "gpu_model_runner.py:4245 → structured_output/utils.py:44",
+       "provenance": "vllm/v1/worker/gpu_model_runner.py:L4245"
+      },
+      {
+       "name": "默认路径物料",
+       "value": "sorted_bitmask 5×3 + indices 长度 4(本例)",
+       "provenance": "explainer/traces/t07_two_paths.json → default_path_material"
+      },
+      {
+       "name": "两路径结果",
+       "value": "逐元素相同(True)",
+       "provenance": "explainer/traces/t07_two_paths.json → two_paths_identical_result"
+      }
+     ],
+     "caption_draft": "图 7:一件事,两条路。VLLM_USE_V2_MODEL_RUNNER 默认为 False,默认部署走左边——把紧凑掩码重排成与 logits 同形的 sorted_bitmask,再交给 xgrammar 自带的 apply_token_bitmask_inplace;打开开关才走右边 vLLM 自写的 Triton kernel。同一批输入跑两条路,最终 logits 逐元素相同:kernel 是演进方向,不是当前的默认行为。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m12-spec-prefilter",
+   "intuition": "草稿先过一道安检:不合语法的从第一个违规处起全部作废,但队形不能乱——作废的位子用 -1 占着,这样「几个草稿位」始终等于调度时说好的数,掩码行数和 logits 行数才对得上。作废了几个另记一笔,免得把接受率算冤枉了。",
+   "worked_example": {
+    "params": {
+     "orig_num_spec_tokens": 2,
+     "语法": "位置 0 允许 {5, 7};位置 1 允许 {9}",
+     "rA 原草稿": "[5, 9]",
+     "rB 原草稿": "[5, 8](8 在位置 1 非法)"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/t02_serial_spec_fill.json",
+    "table": {
+     "columns": [
+      "请求",
+      "原草稿",
+      "validate_tokens 保留",
+      "-1 补齐后",
+      "num_invalid_spec_tokens",
+      "本请求掩码行数",
+      "统计里计入的草稿数",
+      "累计接受率"
+     ],
+     "rows": [
+      [
+       "rA",
+       "5, 9",
+       "5, 9",
+       "5, 9",
+       "未记录(0)",
+       "3",
+       "2",
+       "2 / 2 = 1.0"
+      ],
+      [
+       "rB",
+       "5, 8",
+       "5",
+       "5, -1",
+       "1",
+       "3",
+       "1",
+       "3 / 3 = 1.0"
+      ],
+      [
+       "对照:若不扣减",
+       "—",
+       "—",
+       "—",
+       "—",
+       "—",
+       "2 + 2 = 4",
+       "3 / 4 = 0.75"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "无论草稿合法与否,`len(scheduled_spec_decode_tokens[req]) ` 恒等于调度时定下的 orig_num_spec_tokens;因此掩码行数恒为 1 + orig,与 worker 侧 cu_num_logits 区间长度严格对齐。",
+    "argument": "两端夹逼:上界由 `del spec_token_ids[orig_num_spec_tokens:]` 裁掉(草稿器可能多产);下界由 `spec_token_ids.extend([-1] * num_invalid_tokens)` 补齐(语法过滤可能少留)。两步之后长度恒为 orig。串行装配对 `itertools.chain(req_tokens, (-1,))` 迭代,故行数 = orig + 1;而 worker 侧该请求的 logits 行数同样来自这份调度记录,故两者必然相等(m09 的 assert 就是这条不变式的运行期哨兵)。第二条不变式关于统计口径:make_spec_decoding_stats 先 `num_draft_tokens -= num_invalid_spec_tokens.get(request_id, 0)` 再 observe_draft,保证「被语法作废的位子」既不算命中也不算分母。trace 里 rB 的 1 个 -1 位若不扣减,接受率会从 1.0 掉到 0.75 —— 掉的那部分与草稿器质量无关,纯是语法否决。"
+   },
+   "quantified": "本例两请求各 2 个草稿位、各 3 行掩码;rB 有 1 个位子被语法作废,统计分母因此从 4 降到 3,接受率从 0.75 修正回 1.0(trace stageC)。放大看:掩码行数按 1 + k 计,不因作废而缩水——这正是「行数只由调度决定、不由内容决定」的代价与好处。",
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "m16-reasoning-gate",
+   "intuition": "推理模型先在草稿纸上想(<think> … </think>),想完才誊到答题卡上。誊写要按格式,打草稿不用——所以推理段里掩码整行放行、语法状态机原地不动;直到侦测到 </think> 那一步,才把闸门打开。",
+   "worked_example": {
+    "params": {
+     "vocab_size": 96,
+     "reasoning_end_token_id": 99,
+     "语法位置 0 允许": "{5, 7}",
+     "默认": "enable_in_reasoning = False",
+     "reasoner": "透明替身:is_reasoning_end / is_reasoning_end_streaming 只判「token 99 是否出现」(真实 parser 属 ch31/推理章)"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/t05_reasoning_gate.json",
+    "table": {
+     "columns": [
+      "step",
+      "本步吐出",
+      "reasoning_ended(步前)",
+      "should_fill_bitmask",
+      "掩码行内容",
+      "should_advance",
+      "reasoning_ended(步后)",
+      "FSM 位置"
+     ],
+     "rows": [
+      [
+       "1",
+       "50",
+       "None(首次惰性判定)",
+       "False",
+       "整行 -1(全允许,96 个)",
+       "False",
+       "False",
+       "0"
+      ],
+      [
+       "2",
+       "51",
+       "False",
+       "False",
+       "整行 -1(全允许,96 个)",
+       "False",
+       "False",
+       "0"
+      ],
+      [
+       "3",
+       "99(</think>)",
+       "False",
+       "False",
+       "整行 -1(全允许,96 个)",
+       "False",
+       "True(本步侦测到)",
+       "0"
+      ],
+      [
+       "4",
+       "5",
+       "True",
+       "True",
+       "只允许 5, 7",
+       "True",
+       "True",
+       "1"
+      ],
+      [
+       "对照:enable_in_reasoning=True 的 step 1",
+       "50",
+       "None",
+       "True",
+       "只允许 5, 7",
+       "True",
+       "None(判据被短路,从不写)",
+       "0"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "推理段内(reasoning_ended 为假且未开 enable_in_reasoning)掩码等价于「不设限」且语法状态机位置不变;reasoning_ended 一旦置真就单调不回退,约束从**下一步**开始生效。",
+    "argument": "两条腿分别管两件事。填掩码这条腿:should_fill_bitmask 为假 → _fill_bitmasks 走 else 分支写 _full_mask(-1,全 1 位)→ kernel 侧谓词 `bit == 0` 全假 → 该 logits 行一个字节都不改,等价于不设限。推进 FSM 这条腿:should_advance 在推理未结束时返回 False → accept_tokens 不被调用 → 位置严格不变(trace 里 step 1-3 的 FSM 位置恒为 0)。单调性:reasoning_ended 从 None 经一次惰性判定变 False,再由 should_advance 里的 is_reasoning_end_streaming 一次性置 True,代码中没有把它改回假的路径,故推理段是一段前缀、只结束一次。注意 step 3 的语义细节:侦测到 </think> 的那一步 should_advance 仍返回 False(「刚结束,这一趟先不推进」),约束从 step 4 才开始——否则会用 </think> 这个 token 去推进语法。"
+   },
+   "quantified": "推理段每一步都省掉一次 O(|V|/32) 的 fill_bitmask:|V|=152064 时每行 4752 次位写、18.5625 KiB(按源码常量推算)。但注意省的只是「填内容」——整行 -1 的写入仍要做,因为掩码缓冲跨步复用,不清就会带上一步的残留位(m06)。本例 4 步里前 3 步走的都是整行 -1 分支。",
+   "figure_specs": [
+    {
+     "figure_id": "fig-ch32-reasoning-gate",
+     "claim": "推理段内两道门都关着(不填掩码、不推进 FSM),侦测到 </think> 的那一步只置标志位,约束从下一步才生效。",
+     "template": "state-machine",
+     "numbers": [
+      {
+       "name": "推理段步数",
+       "value": "step 1-3,掩码整行 -1(96 个 token 全允许)",
+       "provenance": "explainer/traces/t05_reasoning_gate.json → default_enable_in_reasoning_false[0..2].bitmask_row"
+      },
+      {
+       "name": "翻转步",
+       "value": "step 3 吐出 token 99(</think>)→ reasoning_ended 置 True,但 should_advance 本步仍为 False",
+       "provenance": "explainer/traces/t05_reasoning_gate.json → default_enable_in_reasoning_false[2]"
+      },
+      {
+       "name": "生效步",
+       "value": "step 4:should_fill_bitmask=True,掩码只允许 5、7,FSM 位置推进到 1",
+       "provenance": "explainer/traces/t05_reasoning_gate.json → default_enable_in_reasoning_false[3]"
+      },
+      {
+       "name": "覆盖开关",
+       "value": "enable_in_reasoning=True → step 1 就受约束",
+       "provenance": "explainer/traces/t05_reasoning_gate.json → override_enable_in_reasoning_true[0]"
+      },
+      {
+       "name": "两道门的位置",
+       "value": "should_fill_bitmask(填不填) / should_advance(推不推进)",
+       "provenance": "vllm/v1/structured_output/__init__.py:L301-319 与 L321-357"
+      }
+     ],
+     "caption_draft": "图 8:推理段的两道门。默认 enable_in_reasoning=False 时,推理段内掩码整行 -1(等价不设限)、FSM 位置纹丝不动;吐出 </think> 的那一步只把 reasoning_ended 置真并明确不推进(否则会拿 </think> 去喂语法),真正的约束从下一步开始。打开 enable_in_reasoning 则第一步就受约束。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m17-inf-vs-large-negative",
+   "intuition": "把非法选项「划掉」和「写一个很小的分数」是两回事。划掉(-inf)之后无论怎么改判分规则(温度、top-k、top-p),它都拿不到一分;写一个很小的分数,只要合法选项的分更低,它照样能赢——而这种情况恰恰在「模型不想遵守格式」时最容易发生。",
+   "worked_example": {
+    "params": {
+     "vocab_size": 96,
+     "合法 token": "只有 42",
+     "合法 token 的 logit": "-25.0",
+     "其余 95 个非法 token 原始 logit": "5.0",
+     "取证": "-inf 那一路由真机 Triton kernel 实际写入,其余为同一 logits 上的对照计算"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/t06_neg_inf_vs_constant.json",
+    "table": {
+     "columns": [
+      "屏蔽值",
+      "温度",
+      "top_k",
+      "合法 token 42 的概率",
+      "非法 token 总概率"
+     ],
+     "rows": [
+      [
+       "-inf(kernel 实际写入)",
+       "1.0",
+       "无",
+       "1.000000",
+       "0.000000"
+      ],
+      [
+       "-inf(kernel 实际写入)",
+       "0.1",
+       "无",
+       "1.000000",
+       "0.000000"
+      ],
+      [
+       "-inf(kernel 实际写入)",
+       "1.0",
+       "4",
+       "1.000000",
+       "0.000000"
+      ],
+      [
+       "有限常数 C = -20",
+       "1.0",
+       "无",
+       "0.000071",
+       "0.999929"
+      ],
+      [
+       "有限常数 C = -20",
+       "0.1",
+       "无",
+       "0.000000",
+       "1.000000"
+      ],
+      [
+       "有限常数 C = -20",
+       "1.0",
+       "4",
+       "0.000000",
+       "1.000000(合法 token 直接落榜)"
+      ],
+      [
+       "有限常数 C = -10000",
+       "1.0",
+       "无",
+       "1.000000",
+       "0.000000"
+      ],
+      [
+       "有限常数 C = -10000,但合法 logit = -10001",
+       "1.0",
+       "无",
+       "0.003857",
+       "0.996143"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "写 -inf 使非法 token 的概率**精确为 0**(不是「很小」),且与温度、top-k、top-p 的任意组合无关;任何有限常数都做不到这一点。",
+    "argument": "采样链上的变换都是「先对 logits 做保序变换、再 softmax」。-inf 除以任何正温度仍是 -inf;在 top-k / top-p 的排序里 -inf 恒排最后——要么被裁掉,要么留下来但 exp(-inf) = 0。两种情况下该项对归一化分母的贡献都是精确的 0,故概率精确为 0,采样器一行都不用改(与 ch30 的所有变换正交)。有限常数 C 则没有这个性质:概率 ∝ exp(C/T),恒 > 0;更要命的是只要**某个合法 token 的 logit 低于 C**,非法项就会反超——trace 的最后一行正是这个反例(C = -10000、合法 logit = -10001 时非法总概率 0.996143)。而 C = -20 那三行说明:即使 C 高于合法 logit 只是「差得不够多」,在 T=1 时非法概率就已经是 0.999929,叠加 top_k=4 后合法 token 干脆进不了候选集。"
+   },
+   "quantified": "同一批 logits 下:-inf 在三种采样配置里非法概率都是 0.000000;C = -20 在 T=1 时是 0.999929、T=0.1 时是 1.000000、top_k=4 时是 1.000000;C = -10000 在本例「碰巧」有效(1.000000 落在合法 token 上),但把合法 logit 压到 -10001 就退化到 0.996143 —— 有效性依赖数据,不依赖设计。",
+   "figure_specs": []
+  }
+ ]
+}

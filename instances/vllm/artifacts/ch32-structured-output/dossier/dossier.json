@@ -1,0 +1,750 @@
+{
+  "chapter_id": "ch32",
+  "slug": "ch32-structured-output",
+  "title": "约束解码 II：bitmask 如何落到 logits",
+  "kind": "deep",
+  "source_pin": "vLLM v0.21.0 @ ad7125a4（引用一律写规范路径 vllm/…）",
+  "analyst_notes_on_plan": "路线核对结论：与真实源码一致，可执行。三点需要 writer 注意的事实校正/补充——(1) 任务书说『get_grammar_bitmask 按 batch 顺序装配位掩码』，源码里更准确的表述是：行顺序 = scheduler_output.num_scheduled_tokens 的迭代顺序（调度顺序），并把这一顺序以 GrammarOutput.structured_output_request_ids 显式随掩码同传给 worker；worker 并不假定它与 batch 顺序相同，而是用 req_id → batch_idx 字典把它重映射到 logits 行（vllm/v1/worker/gpu/structured_outputs.py:L41-L48）。不变式因此是『第 k 行掩码属于 structured_output_request_ids[k] 这个请求』，而不是『掩码顺序 == batch 顺序』——正因为 id 列表随行同传，两侧顺序才被允许不一致。旧路径 vllm/v1/structured_output/utils.py:L44-L135 是同一不变式的另一种实现（先重排成 sorted_bitmask 再调 xgrammar 内核）。(2) max_rollback_tokens 边界在后端构造处（xgrammar:L118、outlines:L85-L92、lm-format-enforcer:L120-L126），值 = num_speculative_tokens；本章只作『为什么回滚步数有上界』的一处回指，形态细节属上篇。(3) 投机耦合有两条线，都要讲：① 装配前——scheduler 用 grammar.validate_tokens 过滤草稿并用 -1 补齐（scheduler.py:L1646-L1655）；② 装配中——串行分支为每个草稿位置各填一行，边填边 accept_tokens 推进，最后 grammar.rollback(state_advancements) 还原（__init__.py:L277-L290）。注意此处 rollback 是『试探性推进后的无条件回滚』，与『草稿被拒后回滚』并非同一处代码——真正按接受结果推进发生在下一步 update_from_output 只对被接受 token 调 accept_tokens（scheduler.py:L1359-L1372，上篇已讲）。任务书原文『草稿 token 被拒时必须 rollback 语法状态』须按此精确化，否则会指错代码。\n\n【订正·max_rollback_tokens 不可跨后端概括】xgrammar/outlines 在后端构造处把 max_rollback_tokens 设为 num_speculative_tokens;但 **lm-format-enforcer 不是设上界而是直接拒绝投机解码**(backend_lm_format_enforcer.py:120-129 算出后 `if max_rollback_tokens > 0: raise ValueError(\"LM Format Enforcer backend does not support speculative tokens\")`);**guidance 构造时根本没有 max_rollback 参数**,它用 backend_guidance.py:144/198-202 的 rollback_lag 另一套做法。写作时勿按『四后端一致』概括。",
+  "code_spine": [
+    "vllm/v1/core/sched/scheduler.py:942-951 — _update_after_schedule：置位 has_structured_output_requests（prefill chunk 不计入）",
+    "vllm/v1/engine/core.py:417-426 — step()：schedule → execute_model(non_block) → get_grammar_bitmask → sample_tokens(grammar_output)",
+    "vllm/v1/core/sched/scheduler.py:1224-1246 — get_grammar_bitmask：门控早退 + 按调度顺序收集 req_id + 调 manager，产出 GrammarOutput(ids, bitmask)",
+    "vllm/v1/structured_output/__init__.py:203-234 — StructuredOutputManager.grammar_bitmask：首次分配 max_num_seqs*(1+num_spec) 行位掩码",
+    "vllm/v1/structured_output/__init__.py:236-264 — 并行分支：batch>128 且无投机时按 16 个请求一块提交线程池",
+    "vllm/v1/structured_output/__init__.py:265-299 — 串行分支：按草稿位置逐行填 + accept_tokens 推进 + rollback 复位；末尾裁行并 .numpy()",
+    "vllm/v1/structured_output/__init__.py:185-201 — _fill_bitmasks / _async_submit_fill_bitmask：每请求一行 fill_bitmask，否则整行 _full_mask",
+    "vllm/v1/structured_output/__init__.py:301-319 — should_fill_bitmask：推理段是否受约束的判据",
+    "vllm/v1/worker/gpu/model_runner.py:906-922 — sample()：compute_logits 之后、采样之前原地施加掩码",
+    "vllm/v1/worker/gpu/structured_outputs.py:23-61 — apply_grammar_bitmask：copy_stream 上 H2D 搬掩码 + 构造 bitmask→logits 行映射",
+    "vllm/v1/worker/gpu/structured_outputs.py:63-80 — grid=(num_masks, cdiv(V,8192)) 启动 kernel，双向 wait_stream 收口",
+    "vllm/v1/worker/gpu/structured_outputs.py:85-115 — _apply_grammar_bitmask_kernel：解包 32 位打包掩码，把非法 token 的 logit 写成 -inf",
+    "vllm/v1/core/sched/scheduler.py:1642-1657 — update_draft_token_ids_in_output：validate_tokens 过滤草稿 + -1 补齐（装配前的投机耦合）",
+    "vllm/v1/core/sched/scheduler.py:1359-1372 — update_from_output：只对真正被接受的 token 调 accept_tokens（上篇已讲，本章回指）"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L942-L951",
+      "code": "        num_scheduled_tokens = scheduler_output.num_scheduled_tokens\n        for req_id, num_scheduled_token in num_scheduled_tokens.items():\n            request = self.requests[req_id]\n            request.num_computed_tokens += num_scheduled_token\n            request.is_prefill_chunk = request.num_computed_tokens < (\n                request.num_tokens + request.num_output_placeholders\n            )\n            scheduler_output.has_structured_output_requests |= (\n                request.use_structured_output and not request.is_prefill_chunk\n            )",
+      "elide": [
+        "前面几行是 num_computed_tokens 推进与 is_prefill_chunk 判定的注释块（L933-L941）"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1224-L1246",
+      "code": "    def get_grammar_bitmask(\n        self, scheduler_output: SchedulerOutput\n    ) -> GrammarOutput | None:\n        # Collect list of scheduled request ids that use structured output.\n        # The corresponding rows of the bitmask will be in this order.\n        if not scheduler_output.has_structured_output_requests:\n            return None\n\n        structured_output_request_ids = [\n            req_id\n            for req_id in scheduler_output.num_scheduled_tokens\n            if (req := self.requests.get(req_id))\n            and (req.use_structured_output and not req.is_prefill_chunk)\n        ]\n        if not structured_output_request_ids:\n            return None\n\n        bitmask = self.structured_output_manager.grammar_bitmask(\n            self.requests,\n            structured_output_request_ids,\n            scheduler_output.scheduled_spec_decode_tokens,\n        )\n        return GrammarOutput(structured_output_request_ids, bitmask)",
+      "elide": [
+        "无——本函数完整；ch31 §31.9 已在交棒处展示过同一段，本章从它起步"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L417-L426",
+      "code": "        scheduler_output = self.scheduler.schedule()\n        future = self.model_executor.execute_model(scheduler_output, non_block=True)\n        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)\n        with (\n            self.log_error_detail(scheduler_output),\n            self.log_iteration_details(scheduler_output),\n        ):\n            model_output = future.result()\n            if model_output is None:\n                model_output = self.model_executor.sample_tokens(grammar_output)",
+      "elide": [
+        "with 块里的 log_error_detail / log_iteration_details 是可观测性外壳，与本章无关"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/__init__.py",
+      "lines": "L60-L68",
+      "code": "        max_batch_size = self.vllm_config.scheduler_config.max_num_seqs\n        self.fill_bitmask_parallel_threshold = 128\n        if self.fill_bitmask_parallel_threshold < max_batch_size:\n            self.fill_bitmask_parallel_batch_size = 16\n            # Use:\n            # - at least 1 CPU\n            # - at most half the number of CPUs or 8, whichever is less\n            max_workers = max(1, min(multiprocessing.cpu_count() // 2, 8))\n            self.executor_for_fillmask = ThreadPoolExecutor(max_workers=max_workers)",
+      "elide": [
+        "紧随其后的编译线程池 self.executor 构造（L70-L80）属上篇，本章不重讲"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/__init__.py",
+      "lines": "L185-L201",
+      "code": "    def _fill_bitmasks(\n        self, batch: Iterable[tuple[StructuredOutputGrammar, int, bool]]\n    ) -> None:\n        assert self._grammar_bitmask is not None\n        for grammar, index, apply_bitmask in batch:\n            if apply_bitmask and not grammar.is_terminated():\n                grammar.fill_bitmask(self._grammar_bitmask, index)\n            else:\n                # Note that for thinking support, we will need to\n                # reset the relevant part of the bitmask for consequent\n                # requests here.\n                self._grammar_bitmask[index].fill_(self._full_mask)\n\n    def _async_submit_fill_bitmask(\n        self, batch: list[tuple[StructuredOutputGrammar, int, bool]]\n    ) -> Future:\n        return self.executor_for_fillmask.submit(self._fill_bitmasks, batch)",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/structured_output/__init__.py",
+      "lines": "L203-L234",
+      "code": "    def grammar_bitmask(\n        self,\n        requests: dict[str, \"Request\"],\n        structured_output_request_ids: list[str],\n        scheduled_spec_decode_tokens: dict[str, list[int]],\n    ) -> \"npt.NDArray[np.int32] | None\":\n        # Prepare the structured output bitmask for this batch.\n        if not structured_output_request_ids:\n            return None\n\n        max_num_spec_tokens = 0\n        if self.vllm_config.speculative_config is not None:\n            max_num_spec_tokens = (\n                self.vllm_config.speculative_config.num_speculative_tokens\n            )\n\n        if self._grammar_bitmask is None:\n            assert self.backend is not None\n            max_batch_size = self.vllm_config.scheduler_config.max_num_seqs\n\n            # Allocate a bitmask for each token needing to be checked:\n            # one for each speculative position, and one more for the\n            # bonus token / non-speculative token.\n            self._grammar_bitmask = self.backend.allocate_token_bitmask(\n                max_batch_size * (1 + max_num_spec_tokens)\n            )\n\n        # Generate a batched bitmask for all structured output requests.\n        # When speculative decoding is enabled, we need to include multiple\n        # masks for each request, one for each possible bonus token position.\n        # These are stored inline in the tensor and unpacked by the gpu runner.\n        cumulative_index = 0",
+      "elide": [
+        "返回类型标注 npt.NDArray 仅为序列化类型说明"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/__init__.py",
+      "lines": "L236-L264",
+      "code": "        # Optimized parallel filling of bitmasks for\n        # non-spec, large-batch-size cases\n        if (\n            len(structured_output_request_ids) > self.fill_bitmask_parallel_threshold\n            and max_num_spec_tokens == 0\n        ):\n            promises = []\n            batch = []\n            for req_id in structured_output_request_ids:\n                request = requests[req_id]\n                structured_output_request = request.structured_output_request\n                if TYPE_CHECKING:\n                    assert structured_output_request is not None\n                    assert structured_output_request.grammar is not None\n                grammar = structured_output_request.grammar\n\n                apply_bitmask = self.should_fill_bitmask(request)\n                batch.append((grammar, cumulative_index, apply_bitmask))\n                if len(batch) == self.fill_bitmask_parallel_batch_size:\n                    promises.append(self._async_submit_fill_bitmask(batch))\n                    batch = []\n\n                cumulative_index += 1\n            if batch:\n                promises.append(self._async_submit_fill_bitmask(batch))\n\n            # Wait for all bitmask filling tasks to complete.\n            for promise in promises:\n                promise.result()",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/structured_output/__init__.py",
+      "lines": "L265-L299",
+      "code": "        else:\n            # Fallback to serial filling of bitmasks for small-batch-size cases\n            for req_id in structured_output_request_ids:\n                request = requests[req_id]\n                structured_output_request = request.structured_output_request\n\n                if TYPE_CHECKING:\n                    assert structured_output_request is not None\n                    assert structured_output_request.grammar is not None\n                grammar = structured_output_request.grammar\n                apply_bitmask = self.should_fill_bitmask(request)\n\n                state_advancements = 0\n                req_tokens = scheduled_spec_decode_tokens.get(req_id, ())\n                for token in itertools.chain(req_tokens, (-1,)):\n                    self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))\n                    if token == -1:\n                        # Stop advancing the grammar once we hit a padding token.\n                        apply_bitmask = False\n                    if apply_bitmask and not grammar.is_terminated():\n                        accepted = grammar.accept_tokens(req_id, [token])\n                        assert accepted, (token, req_id, scheduled_spec_decode_tokens)\n                        state_advancements += 1\n                    cumulative_index += 1\n                if state_advancements > 0:\n                    grammar.rollback(state_advancements)\n\n        bitmask_tensor = self._grammar_bitmask\n        if cumulative_index < bitmask_tensor.shape[0]:\n            bitmask_tensor = bitmask_tensor[:cumulative_index]\n\n        # After finishing with the xgrammar operations, we convert to\n        # np.ndarray, because that is much more efficient for serialization\n        # and deserialization when sending this to the GPU workers.\n        return bitmask_tensor.numpy()",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/structured_output/__init__.py",
+      "lines": "L301-L319",
+      "code": "    def should_fill_bitmask(self, request: \"Request\") -> bool:\n        # NOTE (Hanchen) if enable_in_reasoning is True, it means that\n        # the model needs to be constrained in reasoning. So we should always\n        # enable the bitmask filling.\n        reasoner = self._get_reasoner(request)\n        if reasoner is not None:\n            if self.enable_in_reasoning:\n                return True\n            assert request.structured_output_request is not None\n            if request.structured_output_request.reasoning_ended is None:\n                # This should be removed here, but since `openai_gptoss`\n                # is an independent code path, it is kept for now.\n                # After unifying the `openai_gptoss` and non-`openai_gptoss` styles,\n                # it can be removed.\n                request.structured_output_request.reasoning_ended = (\n                    reasoner.is_reasoning_end(request.prompt_token_ids or [])\n                )\n            return request.structured_output_request.reasoning_ended\n        return True",
+      "elide": [
+        "注释里关于 openai_gptoss 独立代码路径的 TODO 可略读，不影响判据"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/__init__.py",
+      "lines": "L321-L357",
+      "code": "    def should_advance(self, request: \"Request\") -> bool:\n        if not request.use_structured_output:\n            return False\n\n        # To determine whether we can advance the FSM.\n        # Supports thinking usage where we skip the reasoning components.\n        if TYPE_CHECKING:\n            assert request.structured_output_request is not None\n            assert request.structured_output_request.grammar is not None\n        # by default, we should always advance\n        # for cases that don't use thinking mode.\n        reasoner = self._get_reasoner(request)\n        if reasoner is None:\n            return True\n\n        # if the model needs structured in reasoning, we should advance\n        if self.enable_in_reasoning:\n            return True\n\n        structured_req = request.structured_output_request\n        if structured_req.reasoning_ended:\n            return True\n\n        # Check if reasoning ends in *this* step\n        delta_from = request.num_computed_tokens - request.num_output_placeholders\n        all_token_ids = request.all_token_ids\n        start = (\n            delta_from if delta_from >= 0 else max(len(all_token_ids) + delta_from, 0)\n        )\n        if reasoner.is_reasoning_end_streaming(\n            all_token_ids, itertools.islice(all_token_ids, start, None)\n        ):\n            # Reasoning just ended, so we shouldn't advance til\n            # next pass\n            structured_req.reasoning_ended = True\n\n        return False",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/worker/gpu/input_batch.py",
+      "lines": "L78-L85",
+      "code": "    # [total_num_logits]\n    logits_indices: torch.Tensor\n    # [num_reqs + 1]\n    cu_num_logits: torch.Tensor\n    cu_num_logits_np: np.ndarray\n\n    # Whether any requests in batch use structured output.\n    has_structured_output_reqs: bool",
+      "elide": [
+        "InputBatch 其余字段（block table、attention 元数据等）与本章无关"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu/model_runner.py",
+      "lines": "L906-L922",
+      "code": "    def sample(\n        self,\n        hidden_states: torch.Tensor,\n        input_batch: InputBatch,\n        grammar_output: GrammarOutput | None,\n    ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:\n        sample_hidden_states = hidden_states[input_batch.logits_indices]\n        logits = self.model.compute_logits(sample_hidden_states)\n        if grammar_output is not None:\n            # Apply grammar bitmask to the logits in-place.\n            assert self.structured_outputs_worker is not None\n            self.structured_outputs_worker.apply_grammar_bitmask(\n                logits,\n                input_batch,\n                grammar_output.structured_output_request_ids,\n                grammar_output.grammar_bitmask,\n            )",
+      "elide": [
+        "同函数后半是 sampler / rejection_sampler 的分派（L924+），属 ch30/ch34"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu/structured_outputs.py",
+      "lines": "L12-L21",
+      "code": "class StructuredOutputsWorker:\n    def __init__(self, max_num_logits: int, vocab_size: int, device: torch.device):\n        self.logits_indices = torch.zeros(\n            max_num_logits, dtype=torch.int32, device=device\n        )\n        self.grammar_bitmask = torch.zeros(\n            (max_num_logits, cdiv(vocab_size, 32)), dtype=torch.int32, device=device\n        )\n        self.device = device\n        self.copy_stream = torch.cuda.Stream()",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/worker/gpu/structured_outputs.py",
+      "lines": "L23-L61",
+      "code": "    def apply_grammar_bitmask(\n        self,\n        logits: torch.Tensor,\n        input_batch: InputBatch,\n        grammar_req_ids: list[str],\n        grammar_bitmask: np.ndarray,\n    ) -> None:\n        if not grammar_req_ids:\n            return\n\n        # Asynchronously copy the bitmask to GPU.\n        with torch.cuda.stream(self.copy_stream):\n            bitmask = async_copy_to_gpu(\n                grammar_bitmask, out=self.grammar_bitmask[: grammar_bitmask.shape[0]]\n            )\n\n        # Construct bitmask -> logits mapping\n        mapping: list[int] = []\n        req_ids = input_batch.req_ids\n        cu_num_logits = input_batch.cu_num_logits_np.tolist()\n        req_id_to_idx = {req_id: i for i, req_id in enumerate(req_ids)}\n        for grammar_req_id in grammar_req_ids:\n            req_idx = req_id_to_idx[grammar_req_id]\n            logits_start_idx = cu_num_logits[req_idx]\n            logits_end_idx = cu_num_logits[req_idx + 1]\n            mapping.extend(range(logits_start_idx, logits_end_idx))\n\n        # Asynchronously copy the mapping to GPU.\n        with torch.cuda.stream(self.copy_stream):\n            logits_indices = torch.tensor(\n                mapping, dtype=torch.int32, device=\"cpu\", pin_memory=True\n            )\n            logits_indices = self.logits_indices[: len(mapping)].copy_(\n                logits_indices, non_blocking=True\n            )\n\n        # Ensure all async copies are complete before launching the kernel.\n        current_stream = torch.cuda.current_stream()\n        current_stream.wait_stream(self.copy_stream)",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/worker/gpu/structured_outputs.py",
+      "lines": "L63-L80",
+      "code": "        num_masks = bitmask.shape[0]\n        assert num_masks == len(mapping)\n        vocab_size = logits.shape[-1]\n        BLOCK_SIZE = 8192\n        grid = (num_masks, triton.cdiv(vocab_size, BLOCK_SIZE))\n        _apply_grammar_bitmask_kernel[grid](\n            logits,\n            logits.stride(0),\n            logits_indices,\n            bitmask,\n            bitmask.stride(0),\n            vocab_size,\n            BLOCK_SIZE=BLOCK_SIZE,\n        )\n\n        # Ensure the copy stream waits for the device tensors to finish being used\n        # before it re-uses or deallocates them\n        self.copy_stream.wait_stream(current_stream)",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/worker/gpu/structured_outputs.py",
+      "lines": "L85-L115",
+      "code": "@triton.jit\ndef _apply_grammar_bitmask_kernel(\n    logits_ptr,\n    logits_stride,\n    logits_indices_ptr,\n    bitmask_ptr,\n    bitmask_stride,\n    vocab_size,\n    BLOCK_SIZE: tl.constexpr,\n):\n    bitmask_idx = tl.program_id(0)\n    logits_idx = tl.load(logits_indices_ptr + bitmask_idx)\n\n    # Load the bitmask.\n    block_id = tl.program_id(1)\n    bitmask_offset = (block_id * BLOCK_SIZE) // 32 + tl.arange(0, BLOCK_SIZE // 32)\n    packed_bitmask = tl.load(\n        bitmask_ptr + bitmask_idx * bitmask_stride + bitmask_offset,\n        mask=bitmask_offset < bitmask_stride,\n    )\n    # Unpack the bitmask.\n    bitmask = ((packed_bitmask[:, None] >> (tl.arange(0, 32)[None, :])) & 1) == 0\n    bitmask = bitmask.reshape(BLOCK_SIZE)\n\n    # Apply the bitmask to the logits.\n    block_offset = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)\n    tl.store(\n        logits_ptr + logits_idx * logits_stride + block_offset,\n        -float(\"inf\"),\n        mask=bitmask & (block_offset < vocab_size),\n    )",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/worker/gpu/buffer_utils.py",
+      "lines": "L17-L33",
+      "code": "def async_copy_to_gpu(\n    x: torch.Tensor | np.ndarray,\n    out: torch.Tensor | None = None,\n    device: torch.device | None = None,\n) -> torch.Tensor:\n    if isinstance(x, np.ndarray):\n        x = torch.from_numpy(x)\n    assert x.is_cpu\n\n    if out is None:\n        assert device is not None\n        out = torch.empty_like(x, device=device)\n\n    # Copy directly to GPU — explicit pin_memory() causes sporadic stalls\n    # under high concurrency due to CUDA driver contention. The driver\n    # handles the transfer efficiently without manual pinning.\n    return out.copy_(x, non_blocking=True)",
+      "elide": [
+        "同文件后面的 UvaBuffer 与本章无关"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1642-L1657",
+      "code": "            orig_num_spec_tokens = len(placeholder_spec_tokens)\n            # Trim drafts to scheduled number of spec tokens\n            # (needed for chunked prefill case for example).\n            del spec_token_ids[orig_num_spec_tokens:]\n            # Filter out spec tokens which do not adhere to the grammar.\n            if self.structured_output_manager.should_advance(request):\n                metadata = request.structured_output_request\n                assert metadata is not None and metadata.grammar is not None\n                spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)\n            # Pad to original number of spec tokens.\n            num_invalid_tokens = orig_num_spec_tokens - len(spec_token_ids)\n            if num_invalid_tokens:\n                spec_token_ids.extend([-1] * num_invalid_tokens)\n                num_invalid_spec_tokens[req_id] = num_invalid_tokens\n\n            sched_spec_tokens[req_id] = spec_token_ids",
+      "elide": [
+        "循环开头是请求存活性与 placeholder 取值的守卫（L1629-L1640）"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/backend_xgrammar.py",
+      "lines": "L115-L122",
+      "code": "        return XgrammarGrammar(\n            matcher=xgr.GrammarMatcher(\n                ctx,\n                max_rollback_tokens=self.num_speculative_tokens,\n            ),\n            vocab_size=self.vocab_size,\n            ctx=ctx,\n        )",
+      "elide": [
+        "上方是六种约束形态到 xgrammar 编译 API 的分派，属上篇 §31.6"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu/spec_decode/utils.py",
+      "lines": "L21-L38",
+      "code": "    def set_draft_tokens(\n        self, input_batch: InputBatch, draft_tokens: torch.Tensor\n    ) -> None:\n        self.req_ids = input_batch.req_ids\n        self.num_draft_tokens = draft_tokens.shape[1]\n        if not input_batch.has_structured_output_reqs:\n            # No draft token validation needs to be performed by\n            # the scheduler for this batch.\n            self.draft_tokens_np = None\n            return\n\n        # For spec decoding + structured outputs, we must transfer the\n        # draft tokens back to the scheduler for grammar validation.\n        current_stream = torch.cuda.current_stream(self.device)\n        self.copy_stream.wait_stream(current_stream)\n        with torch.cuda.stream(self.copy_stream):\n            self.draft_tokens_np = async_copy_to_np(draft_tokens)\n            self.copy_event.record()",
+      "elide": [
+        "get_draft_tokens 的同步取值（L40-L47）在下一步由 engine core 调用"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/async_scheduler.py",
+      "lines": "L18-L35",
+      "code": "    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:\n        super()._update_after_schedule(scheduler_output)\n        spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens\n        for req_id in scheduler_output.num_scheduled_tokens:\n            request = self.requests[req_id]\n            if request.is_prefill_chunk:\n                continue\n\n            scheduler_output.pending_structured_output_tokens |= (\n                request.use_structured_output and request.num_output_placeholders > 0\n            )\n            # The request will generate a new token plus num_spec_tokens\n            # in this scheduling step.\n            cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))\n            request.num_output_placeholders += 1 + cur_num_spec_tokens\n            # Add placeholders for the new draft/spec tokens.\n            # We will update the actual spec token ids in the worker process.\n            request.spec_token_ids = self._spec_token_placeholders",
+      "elide": []
+    }
+  ],
+  "key_classes": [
+    {
+      "name": "StructuredOutputManager.grammar_bitmask",
+      "file": "vllm/v1/structured_output/__init__.py",
+      "responsibility": "每步调度装配整批位掩码：按 structured_output_request_ids 顺序，每个请求（投机时每个草稿位置）占一行；返回 np.int32 二维数组，形状 [cumulative_index, ceil(V/32)]"
+    },
+    {
+      "name": "StructuredOutputManager._fill_bitmasks",
+      "file": "vllm/v1/structured_output/__init__.py",
+      "responsibility": "填一小批行：apply_bitmask 且语法未终止时调 grammar.fill_bitmask(bitmask, index)，否则整行填 _full_mask(-1) 表示不设限"
+    },
+    {
+      "name": "StructuredOutputManager.should_fill_bitmask / should_advance",
+      "file": "vllm/v1/structured_output/__init__.py",
+      "responsibility": "推理模型门控：推理段内不填掩码、不推进 FSM；enable_in_reasoning=True 时无条件约束"
+    },
+    {
+      "name": "GrammarOutput",
+      "file": "vllm/v1/core/sched/output.py",
+      "responsibility": "跨进程载荷：structured_output_request_ids（行序）+ grammar_bitmask（np.ndarray，便于序列化）"
+    },
+    {
+      "name": "StructuredOutputsWorker",
+      "file": "vllm/v1/worker/gpu/structured_outputs.py",
+      "responsibility": "worker 侧落地：预分配 [max_num_logits, ceil(V/32)] 卡上缓冲与独立 copy_stream，把掩码搬上卡、建行映射、启动 Triton kernel 原地改 logits"
+    },
+    {
+      "name": "_apply_grammar_bitmask_kernel",
+      "file": "vllm/v1/worker/gpu/structured_outputs.py",
+      "responsibility": "Triton kernel（改编自 xgrammar 的 apply_token_bitmask_inplace_triton）：解包位掩码，对 bit==0 的 token 把 logit 写成 -inf"
+    },
+    {
+      "name": "apply_grammar_bitmask（旧 gpu_model_runner 路径）",
+      "file": "vllm/v1/structured_output/utils.py",
+      "responsibility": "同一职责的另一实现：先把紧凑掩码重排成与 logits 同形的 sorted_bitmask（缺省 -1），再调 xgr.apply_token_bitmask_inplace；含 CPU dtype 兜底分支"
+    },
+    {
+      "name": "DraftTokensHandler",
+      "file": "vllm/v1/worker/gpu/spec_decode/utils.py",
+      "responsibility": "投机解码 + 结构化输出时把草稿 token D2H 回传调度器做语法校验；has_structured_output_reqs 为假则跳过回传"
+    },
+    {
+      "name": "AsyncScheduler._update_after_schedule",
+      "file": "vllm/v1/core/sched/async_scheduler.py",
+      "responsibility": "异步调度下置 pending_structured_output_tokens，告诉 engine core 本步必须等上一步输出落定后才能算掩码"
+    }
+  ],
+  "data_flow": [
+    "1. vllm/v1/core/sched/scheduler.py:_update_after_schedule — 逐请求 or 上 has_structured_output_requests（use_structured_output 且非 prefill chunk）",
+    "2. vllm/v1/engine/core.py:step — execute_model 非阻塞发车后立刻 get_grammar_bitmask（掩码计算与前向重叠）",
+    "3. vllm/v1/core/sched/scheduler.py:get_grammar_bitmask — 门控早退；按 num_scheduled_tokens 迭代顺序收集 structured_output_request_ids",
+    "4. vllm/v1/structured_output/__init__.py:grammar_bitmask — 首次按 max_num_seqs*(1+num_spec) 分配掩码张量；选并行或串行分支",
+    "5a. vllm/v1/structured_output/__init__.py:_async_submit_fill_bitmask → _fill_bitmasks — 每 16 个请求一个线程池任务，各写各行",
+    "5b. vllm/v1/structured_output/__init__.py:grammar_bitmask（串行分支）— 对每个 (草稿 token …, -1) 位置填一行、accept_tokens 推进、末尾 rollback(state_advancements) 复位",
+    "6. vllm/v1/structured_output/__init__.py:grammar_bitmask — 裁到 cumulative_index 行并 .numpy()，包成 GrammarOutput 随 sample_tokens 下发 worker",
+    "7. vllm/v1/worker/gpu/model_runner.py:sample — compute_logits 之后、sampler 之前调 structured_outputs_worker.apply_grammar_bitmask",
+    "8. vllm/v1/worker/gpu/structured_outputs.py:apply_grammar_bitmask — copy_stream 上 async_copy_to_gpu 搬 bitmask；用 req_id→batch_idx + cu_num_logits_np 展开出 mapping（bitmask 行 → logits 行）",
+    "9b. vllm/v1/engine/core.py:542-561(step_with_batch_queue 延后链)——take_draft_token_ids() → update_draft_token_ids_in_output() → get_grammar_bitmask() → sample_tokens();源码注释原文:『we need to get the draft token ids from the prior step before we can compute the grammar bitmask for the deferred request』。**这是投机耦合的因果骨架**:草稿必须先 D2H 回传调度器,掩码才算得出来。",
+    "9. vllm/v1/worker/gpu/structured_outputs.py:apply_grammar_bitmask — mapping 经 pin_memory 异步搬上卡；current_stream.wait_stream(copy_stream) 后 assert num_masks == len(mapping)",
+    "10. vllm/v1/worker/gpu/structured_outputs.py:_apply_grammar_bitmask_kernel — grid=(num_masks, cdiv(V, 8192))，解包 int32 位、对非法 token tl.store(-inf)；结束后 copy_stream.wait_stream(current_stream)",
+    "11. vllm/v1/worker/gpu/model_runner.py:sample — 被改写的 logits 交给 ch30 的 sampler / ch34 的 rejection_sampler",
+    "12. vllm/v1/core/sched/scheduler.py:update_from_output — should_advance 通过才 accept_tokens 推进 FSM（上篇已讲）"
+  ],
+  "design_decisions": [
+    {
+      "decision": "worker 侧有两条并存路径,默认走旧路径(xgrammar 库函数),新路径(vLLM 自写 Triton kernel)由 env 开关 opt-in",
+      "why": "VLLM_USE_V2_MODEL_RUNNER 默认 False → GPUModelRunnerV1 → apply_grammar_bitmask(utils.py:44)→ xgr.apply_token_bitmask_inplace;开关打开才走 GPUModelRunnerV2 → StructuredOutputsWorker → _apply_grammar_bitmask_kernel。两条路径做同一件事(把非法 token 的 logit 打成 -inf),但归属不同:一个是库函数、一个是 vLLM 自己的 kernel。**本章按『默认路径为主线、V2 为演进方向』组织**,kernel 深挖前必须先交代它当前默认不生效。",
+      "evidence": "vllm/envs.py:251 与 :1711-1713;vllm/v1/worker/gpu_worker.py:156,:316-330;vllm/v1/worker/gpu_model_runner.py:4245;vllm/v1/structured_output/utils.py:44"
+    },
+    {
+      "decision": "掩码行序由 GrammarOutput 显式携带 req_id 列表，而不是约定与 batch 顺序一致",
+      "why": "调度侧迭代顺序（num_scheduled_tokens）与 worker 侧 InputBatch.req_ids 顺序没有语言层保证；把顺序做成数据随掩码同传、worker 用字典重建映射，任一侧改动都不会静默错位——错位的代价是把语法约束加到别人的 logits 上且不会报错。",
+      "evidence": "vllm/v1/core/sched/scheduler.py:1229-1246"
+    },
+    {
+      "decision": "prefill chunk 不参与掩码装配",
+      "why": "只有本步会产出 logits 的请求才需要掩码；分块 prefill 中段的请求本步不采样，为它填一行既浪费 |V|/32 次位运算，也会打乱掩码行数与 logits 行数的对账。",
+      "evidence": "vllm/v1/core/sched/scheduler.py:946-951"
+    },
+    {
+      "decision": "get_grammar_bitmask 在 execute_model 非阻塞发车之后调用",
+      "why": "填掩码是纯 CPU 工作（|V|/32 量级位运算 × batch），放在前向 kernel 已经在卡上跑之后做，把 CPU 掩码计算藏进 GPU 前向的影子里。",
+      "evidence": "vllm/v1/engine/core.py:418-419"
+    },
+    {
+      "decision": "大 batch 且无投机时才启用线程池并行填充（阈值 128，块大小 16）",
+      "why": "每个请求写自己那一行，行间无共享可变状态，天然可并行；但线程池提交本身有开销，小 batch 得不偿失。投机场景被排除，是因为串行分支要按草稿序推进/回滚同一个 grammar 对象，跨行有顺序依赖。",
+      "evidence": "vllm/v1/structured_output/__init__.py:60-68"
+    },
+    {
+      "decision": "不受约束的行整行填 -1（_full_mask）而不是跳过",
+      "why": "掩码张量是跨步复用的缓冲，上一步的残留位会把本步的合法 token 误杀；-1 即全 1 位 = 全部允许，等价于不设限，同时让 worker 侧行数对账保持简单。",
+      "evidence": "vllm/v1/structured_output/__init__.py:189-196"
+    },
+    {
+      "decision": "投机位置上『先推进再整体 rollback』",
+      "why": "第 i 个草稿位置的合法集依赖前 i-1 个草稿 token 已被接受的假设，必须真的把 FSM 推进过去才能取到正确掩码；但这些草稿最终可能被拒，因此填完立刻 rollback(state_advancements) 还原到本步开始处，真正的推进留给 update_from_output 按接受结果做。",
+      "evidence": "vllm/v1/structured_output/__init__.py:277-290"
+    },
+    {
+      "decision": "rollback 步数上界 = num_speculative_tokens",
+      "why": "语法后端的回滚缓冲要预先开好；一步内最多试探性推进 num_speculative_tokens 步，故构造 matcher/guide 时就按这个数配 max_rollback_tokens。",
+      "evidence": "vllm/v1/structured_output/backend_xgrammar.py:115-122"
+    },
+    {
+      "decision": "worker 侧用独立 copy_stream 做两次 H2D，并双向 wait_stream",
+      "why": "掩码与映射的搬运可与当前计算流上的其它 kernel 重叠；kernel 启动前 current_stream.wait_stream(copy_stream) 保证数据就位，kernel 之后 copy_stream.wait_stream(current_stream) 保证缓冲被用完才允许下轮复写或释放。",
+      "evidence": "vllm/v1/worker/gpu/structured_outputs.py:59-61"
+    },
+    {
+      "decision": "掩码以 np.ndarray 而非 torch.Tensor 跨进程传",
+      "why": "序列化/反序列化效率——掩码每步都要从调度进程发到所有 worker 进程。",
+      "evidence": "vllm/v1/structured_output/__init__.py:296-299"
+    },
+    {
+      "decision": "自带 Triton kernel 而不是直接调 xgrammar 的 apply_token_bitmask_inplace",
+      "why": "新 gpu worker 路径需要把『bitmask 行 → logits 行』的映射以 int32 索引张量喂给 kernel，且掩码缓冲是预分配复用的；kernel 改编自 xgrammar 的 Triton 实现，语义相同但省掉了旧路径里那次 sorted_bitmask 的 CPU 重排与整表填充。",
+      "evidence": "vllm/v1/worker/gpu/structured_outputs.py:83-84"
+    },
+    {
+      "decision": "推理段默认不施加语法约束",
+      "why": "推理内容不属于目标 JSON/正则的一部分，若从第一个 token 就约束，模型没有思考空间；判据是 reasoner.is_reasoning_end*，reasoning_ended 置真之后才开始填掩码并推进 FSM。enable_in_reasoning=True 可覆盖。",
+      "evidence": "vllm/v1/structured_output/__init__.py:301-319"
+    }
+  ],
+  "theory": [
+    "掩码的空间与带宽量级：一行掩码是 ceil(|V|/32) 个 int32。以 |V|=152064（Qwen 系词表）为例每行 4752 个 int32 ≈ 18.6 KiB；batch=256 且无投机时整批 ≈ 4.6 MiB，每步都要 CPU 填一遍并 H2D 搬一遍。投机 k 步时行数放大到 batch*(1+k)——这正是 allocate_token_bitmask(max_batch_size * (1 + max_num_spec_tokens)) 的预算依据。",
+    "填充的时间复杂度：每行 O(|V|/32) 次位写（后端内部实现），整批 O(B·|V|/32)。这是纯 CPU、行间无共享写的可并行工作量——阈值 128 与块大小 16 把它切成 ceil(B/16) 个任务，理论并行度受 max_workers = max(1, min(cpu_count//2, 8)) 限制，故 B=256 时约 16 个任务落在不超过 8 个线程上。",
+    "kernel 的分块几何：grid=(num_masks, cdiv(|V|, BLOCK_SIZE))，BLOCK_SIZE=8192。第二维每个 program 负责 8192 个 token，对应 8192/32 = 256 个打包 int32；解包用形状 [256,1] >> [1,32] 的广播得到 [256,32] 位，再 reshape 成 8192 个布尔量——bit==0 即非法。写回是一次带谓词的 tl.store(-inf)，谓词同时挡住词表尾部越界。|V|=152064、BLOCK_SIZE=8192 时第二维 = 19。",
+    "为什么写 -inf 而不是一个很大的负数：softmax 前把 logit 置 -inf 使该 token 概率精确为 0，无论温度、top-p/top-k 如何组合都不可能被抽中；有限负值在低温或极端 top-k 下仍有非零残留概率。掩码因此与 ch30 的所有采样变换正交——采样器一行不改。",
+    "掩码行 → logits 行不是一一对应：请求 i 在本步产出 cu_num_logits[i+1]-cu_num_logits[i] 个 logits 行（无投机为 1，投机 k 步为 1+k）。mapping 把每个结构化请求的这一段行下标依次展开，因此 len(mapping) 必须等于掩码行数——源码用 assert num_masks == len(mapping) 把这个不变式钉死。",
+    "投机场景下的正确性论证：设本步草稿为 d_1..d_k。第 j 行掩码要回答『在已接受 d_1..d_{j-1} 的前提下第 j 个位置哪些 token 合法』，故必须先 accept_tokens 推进 j-1 步。填到 -1 哨兵（padding 位）时 apply_bitmask 置假，后续行退化为整行 -1；填完对该请求整体 rollback(state_advancements)，保证 grammar 状态与『本步尚未确认任何新 token』一致。"
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {
+        "what": "StructuredOutputManager.__init__ 中与本章无关的部分：tokenizer 构建、reasoning_parser_plugin 动态导入、_use_async_grammar_compilation 的 external_launcher 判定、编译线程池 self.executor 的构造",
+        "why_safe": "本章从『语法已就绪』起步，编译与阻塞门是上篇主题；精简版直接接受一个已构造好的 grammar 对象，不影响掩码装配与落地的任何控制流"
+      },
+      {
+        "what": "四种后端（xgrammar/guidance/outlines/lm-format-enforcer）的选择与构造分支（grammar_init 的 if/elif 链）",
+        "why_safe": "上篇已讲透；本章只依赖 fill_bitmask/accept_tokens/rollback/is_terminated/validate_tokens 这几个契约方法，后端身份对本章控制流不可见"
+      },
+      {
+        "what": "vllm/v1/structured_output/utils.py:apply_grammar_bitmask 的 CPU 兜底分支（logits.is_cpu 之后的 float32 转换与回写）",
+        "why_safe": "只在 CPU 后端且老版本 xgrammar 内核下触发，与 GPU 主路径正确性无关；正文以对照形式提一句即可"
+      },
+      {
+        "what": "worker 侧与掩码无关的采样后续：sampler / rejection_sampler 分派、prompt logprobs、routed_experts 等 model_runner.sample 的其余分支",
+        "why_safe": "属 ch30/ch34 主题；掩码是在它们之前原地改 logits，删掉不改变掩码语义"
+      },
+      {
+        "what": "TYPE_CHECKING 守卫下的类型断言与 logger 调用",
+        "why_safe": "纯类型/可观测性设施，运行期不改变行为（assert num_masks == len(mapping) 这类语义断言不在此列，必须保留）"
+      },
+      {
+        "what": "DraftTokensHandler.get_draft_tokens 中 async scheduling 关闭时的 [-1] 占位分支",
+        "why_safe": "精简版固定演示 async 开启路径；该分支只影响草稿 id 的来源，不影响语法校验流程"
+      },
+      {
+        "what": "engine/core.py 中 EC consumer、队列长度调度等与本章无关的分支",
+        "why_safe": "**不可整条删掉 step_with_batch_queue(core.py:447-563)**:m15 的 pending_structured_output_tokens(core.py:487-494)与 m12 所引的 update_draft_token_ids_in_output(scheduler.py:1642-1657)**只在这条路径上可达**(同步 step() core.py:406-435 既无延后采样也不调它),而 must_keep 又列了这几个符号——整条删会让 must_keep 落空、lint_fidelity 挂。**保留骨架**:pending → 延后 → take_draft_token_ids → update_draft_token_ids_in_output → get_grammar_bitmask → sample_tokens;只删 EC consumer / 队列长度调度等无关分支。"
+      }
+    ],
+    "must_keep": [
+      {
+        "symbol": "has_structured_output_requests",
+        "why": "调度侧门控开关，第一道早退；读者要看到它由『use_structured_output 且非 prefill chunk』或起来"
+      },
+      {
+        "symbol": "is_prefill_chunk",
+        "why": "prefill chunk 不参与掩码装配的判据本身"
+      },
+      {
+        "symbol": "get_grammar_bitmask",
+        "why": "上下篇交棒点，本章入口"
+      },
+      {
+        "symbol": "GrammarOutput",
+        "why": "行序（req_id 列表）与掩码同传的载体——本章第一个不变式的物理形式"
+      },
+      {
+        "symbol": "structured_output_request_ids",
+        "why": "掩码行序的唯一权威，worker 侧靠它重建映射"
+      },
+      {
+        "symbol": "grammar_bitmask",
+        "why": "manager 的每步热路径主函数"
+      },
+      {
+        "symbol": "allocate_token_bitmask",
+        "why": "行数预算 max_batch_size*(1+max_num_spec_tokens) 的出处"
+      },
+      {
+        "symbol": "_grammar_bitmask",
+        "why": "跨步复用的掩码缓冲，解释为什么不受约束的行必须显式填 -1"
+      },
+      {
+        "symbol": "_full_mask",
+        "why": "『全 1 = 全允许』的语义常量"
+      },
+      {
+        "symbol": "_fill_bitmasks",
+        "why": "单行填充的语义中心：填 or 整行放行"
+      },
+      {
+        "symbol": "_async_submit_fill_bitmask",
+        "why": "并行填充的提交口"
+      },
+      {
+        "symbol": "executor_for_fillmask",
+        "why": "填掩码专用线程池，与编译线程池是两个池，读者易混"
+      },
+      {
+        "symbol": "fill_bitmask_parallel_threshold",
+        "why": "并行阈值 128，判据可检测"
+      },
+      {
+        "symbol": "fill_bitmask_parallel_batch_size",
+        "why": "分块大小 16"
+      },
+      {
+        "symbol": "fill_bitmask",
+        "why": "六方法契约里与采样交互的唯一方法（上篇建立，本章兑现）"
+      },
+      {
+        "symbol": "is_terminated",
+        "why": "终态请求不再填掩码的判据"
+      },
+      {
+        "symbol": "accept_tokens",
+        "why": "投机位置上试探性推进 FSM"
+      },
+      {
+        "symbol": "rollback",
+        "why": "本章解释上篇契约里 rollback 为何存在的落点"
+      },
+      {
+        "symbol": "validate_tokens",
+        "why": "装配前过滤不合语法草稿的方法"
+      },
+      {
+        "symbol": "cumulative_index",
+        "why": "掩码行游标，最终决定裁剪行数与 assert 对账"
+      },
+      {
+        "symbol": "should_fill_bitmask",
+        "why": "推理模型门控之一：这一步填不填掩码"
+      },
+      {
+        "symbol": "should_advance",
+        "why": "推理模型门控之二：这一步推不推进 FSM"
+      },
+      {
+        "symbol": "reasoning_ended",
+        "why": "推理段结束标志，门控状态位"
+      },
+      {
+        "symbol": "enable_in_reasoning",
+        "why": "把约束也加到推理段的开关（覆盖默认判据）"
+      },
+      {
+        "symbol": "_get_reasoner",
+        "why": "请求级 reasoner 惰性构造，解释为什么 parser 不能跨请求共享"
+      },
+      {
+        "symbol": "StructuredOutputsWorker",
+        "why": "worker 侧落地主体"
+      },
+      {
+        "symbol": "apply_grammar_bitmask",
+        "why": "本章 payoff 函数"
+      },
+      {
+        "symbol": "async_copy_to_gpu",
+        "why": "掩码 H2D 搬运"
+      },
+      {
+        "symbol": "copy_stream",
+        "why": "独立拷贝流与双向 wait_stream 的正确性论证载体"
+      },
+      {
+        "symbol": "cu_num_logits_np",
+        "why": "请求 → logits 行区间的前缀和，行映射的原料"
+      },
+      {
+        "symbol": "req_id_to_idx",
+        "why": "req_id → batch 下标，跨侧顺序解耦的关键字典"
+      },
+      {
+        "symbol": "logits_indices",
+        "why": "bitmask 行 → logits 行的索引张量（kernel 的第三个参数）"
+      },
+      {
+        "symbol": "_apply_grammar_bitmask_kernel",
+        "why": "本章高潮：语法最终变成一次位运算"
+      },
+      {
+        "symbol": "BLOCK_SIZE",
+        "why": "kernel 分块几何 8192，与 grid 第二维直接相关"
+      },
+      {
+        "symbol": "packed_bitmask",
+        "why": "打包的 32 位掩码，解包算法的输入"
+      },
+      {
+        "symbol": "bitmask_stride",
+        "why": "行跨度 = ceil(V/32)，同时兼作越界谓词"
+      },
+      {
+        "symbol": "DraftTokensHandler",
+        "why": "投机草稿回传调度器做语法校验的通道"
+      },
+      {
+        "symbol": "has_structured_output_reqs",
+        "why": "worker 侧同一门控（决定要不要把草稿 D2H 回传）"
+      },
+      {
+        "symbol": "num_invalid_spec_tokens",
+        "why": "被语法过滤掉的草稿数，影响接受率统计"
+      },
+      {
+        "symbol": "pending_structured_output_tokens",
+        "why": "异步调度下必须延后采样的信号"
+      },
+      {
+        "symbol": "max_rollback_tokens",
+        "why": "回滚步数上界 = num_speculative_tokens 的出处"
+      }
+    ]
+  },
+  "mechanisms": [
+    {
+      "id": "m01-schedule-gate",
+      "name": "调度侧门控：has_structured_output_requests 与 prefill chunk 排除",
+      "kind": "protocol",
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L942-L951",
+        "vllm/v1/core/sched/scheduler.py:L1229-L1239"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m02-row-order-invariant",
+      "name": "掩码行序不变式：GrammarOutput 携带 req_id 列表，worker 端重建映射",
+      "kind": "protocol",
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L1232-L1246",
+        "vllm/v1/core/sched/output.py:L259-L263",
+        "vllm/v1/worker/gpu/structured_outputs.py:L40-L48"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "图合并 m03 的形状预算(行×列 + 谁占哪几行,一张讲清)。"
+    },
+    {
+      "id": "m03-bitmask-budget",
+      "name": "掩码缓冲的形状预算：max_num_seqs*(1+num_spec) 行 × ceil(V/32) 列",
+      "kind": "layout",
+      "source_anchors": [
+        "vllm/v1/structured_output/__init__.py:L219-L228",
+        "vllm/v1/worker/gpu/structured_outputs.py:L17-L19"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "note": "图与 m02 行序不变式合并为一张『行×列 + 谁占哪几行』。"
+    },
+    {
+      "id": "m04-parallel-fill",
+      "name": "并行填充：阈值 128 / 块 16 / 每行独写的线程安全边界",
+      "kind": "algorithm",
+      "source_anchors": [
+        "vllm/v1/structured_output/__init__.py:L61-L68",
+        "vllm/v1/structured_output/__init__.py:L238-L264",
+        "vllm/v1/structured_output/__init__.py:L198-L201",
+        "vllm/v1/structured_output/__init__.py:L62"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "结构性前提:__init__.py:62 `if self.fill_bitmask_parallel_threshold < max_batch_size:` 决定 executor_for_fillmask 是否被创建——**max_num_seqs ≤ 128 时并行分支是结构性死代码**;theory 用 B=256 举例,须先交代这个前提。"
+    },
+    {
+      "id": "m05-serial-fill-spec",
+      "name": "串行填充与投机展开：逐草稿位置填行 → accept_tokens 推进 → 整体 rollback 复位",
+      "kind": "algorithm",
+      "source_anchors": [
+        "vllm/v1/structured_output/__init__.py:L265-L290"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m06-full-mask-reset",
+      "name": "不受约束的行整行填 -1：复用缓冲下的残留位清理",
+      "kind": "layout",
+      "source_anchors": [
+        "vllm/v1/structured_output/__init__.py:L185-L196",
+        "vllm/v1/structured_output/__init__.py:L58-L58"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m07-overlap-with-forward",
+      "name": "掩码计算与前向重叠：execute_model 非阻塞发车后才算掩码",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/v1/engine/core.py:L417-L426"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m08-h2d-copy-stream",
+      "name": "worker 侧 H2D：独立 copy_stream 搬掩码与映射 + 双向 wait_stream",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/v1/worker/gpu/structured_outputs.py:L34-L37",
+        "vllm/v1/worker/gpu/structured_outputs.py:L51-L61",
+        "vllm/v1/worker/gpu/structured_outputs.py:L78-L80",
+        "vllm/v1/worker/gpu/buffer_utils.py:L17-L33"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m09-row-mapping",
+      "name": "bitmask 行 → logits 行映射的构造（cu_num_logits 展开 + assert 对账）",
+      "kind": "algorithm",
+      "source_anchors": [
+        "vllm/v1/worker/gpu/structured_outputs.py:L40-L48",
+        "vllm/v1/worker/gpu/structured_outputs.py:L63-L64",
+        "vllm/v1/worker/gpu/input_batch.py:L79-L85"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m10-triton-kernel",
+      "name": "Triton kernel：位解包与 -inf 写回（本章高潮）",
+      "kind": "algorithm",
+      "source_anchors": [
+        "vllm/v1/worker/gpu/structured_outputs.py:L86-L115",
+        "vllm/v1/worker/gpu/structured_outputs.py:L66-L76"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m11-legacy-path",
+      "name": "两条 worker 路径与 env 门控:默认 xgr.apply_token_bitmask_inplace,V2 才是自写 kernel",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/envs.py:L251",
+        "vllm/envs.py:L1711-L1713",
+        "vllm/v1/worker/gpu_worker.py:L316-L330",
+        "vllm/v1/worker/gpu_model_runner.py:L4245",
+        "vllm/v1/structured_output/utils.py:L44-L121"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "note": "本章路线诚实性的落点:先讲默认路径,再讲 V2 kernel(标明 opt-in/默认关)。"
+    },
+    {
+      "id": "m12-spec-prefilter",
+      "name": "投机耦合(装配前)本章独有部分:-1 补齐、num_invalid_spec_tokens、掩码行数与草稿位置对齐",
+      "kind": "protocol",
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L1642-L1659",
+        "vllm/v1/core/sched/scheduler.py:L1618-L1621",
+        "vllm/v1/core/sched/scheduler.py:L1906-L1914"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "回滚上界与 validate_tokens 语义归上篇(见 cross_refs,只回指)。本章讲:过滤后如何用 -1 补齐、num_invalid_spec_tokens 如何被 scheduler.py:1906-1914 消费(num_draft_tokens -= ...)、以及这如何保证掩码行数与草稿位置严格对齐。"
+    },
+    {
+      "id": "m14-draft-writeback",
+      "name": "草稿 D2H 回传通道：DraftTokensHandler 与 has_structured_output_reqs 门控",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/v1/worker/gpu/spec_decode/utils.py:L21-L38",
+        "vllm/v1/worker/gpu/model_runner.py:L876"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m15-async-deferral",
+      "name": "异步调度下的延后采样：pending_structured_output_tokens",
+      "kind": "protocol",
+      "source_anchors": [
+        "vllm/v1/core/sched/async_scheduler.py:L18-L28",
+        "vllm/v1/engine/core.py:L487-L494"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m16-reasoning-gate",
+      "name": "推理模型耦合：should_fill_bitmask / should_advance 让推理段不受约束",
+      "kind": "protocol",
+      "source_anchors": [
+        "vllm/v1/structured_output/__init__.py:L301-L319",
+        "vllm/v1/structured_output/__init__.py:L321-L357",
+        "vllm/v1/structured_output/__init__.py:L99-L112"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m17-inf-vs-large-negative",
+      "name": "为什么写 -inf：与 ch30 全部采样变换正交",
+      "kind": "algorithm",
+      "source_anchors": [
+        "vllm/v1/worker/gpu/structured_outputs.py:L110-L115"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m18-worker-callsite",
+      "name": "落地时机：compute_logits 之后、sampler 之前的原地改写",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/v1/worker/gpu/model_runner.py:L906-L922",
+        "vllm/v1/worker/gpu/model_runner.py:L229-L233"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    }
+  ],
+  "foreshadow_due": {
+    "to_plant": [],
+    "to_pay_off": [],
+    "note": "python3 scripts/bible.py due ch32 输出『应埋伏笔』与『应回收』两节均为空——本章无伏笔埋设/回收任务"
+  },
+  "cross_refs": [
+    "上篇 ch31《约束解码 I：语法编译与后端契约》→ ../../ch31-structured-output/narrative/chapter.md（六方法契约 ABC、四后端对照、异步编译与阻塞门、choice 就地改写、structured_output_key 非缓存键；本章只回指不重讲，从 §31.9 交棒点 get_grammar_bitmask 起步）",
+    "ch30 采样：掩码在 sampler 之前原地改 logits，采样算法一行不改",
+    "ch13 调度：has_structured_output_requests 的置位点在 _update_after_schedule，与 prefill chunk 判定同处",
+    "ch34 投机解码：validate_tokens 预过滤、掩码按草稿位置展开、rollback 与接受率统计",
+    {
+      "topic": "max_rollback_tokens = num_speculative_tokens 与 validate_tokens 的两处调用点",
+      "where": "上篇 ch31 已讲透(narrative:839/850 内嵌同段 backend_xgrammar 源码并明确回滚深度=num_speculative_tokens;:942-968 数值表证明回滚是精确逆操作;:972-978 已引 LMFE 拒绝作反面证据;:750-761 已展示 validate_tokens 两处调用点)",
+      "rule": "**本章只回指,不重讲**"
+    }
+  ],
+  "honesty_boundaries": [
+    "**【路线前提·最重要】本章 payoff 的 worker 新路径(StructuredOutputsWorker + _apply_grammar_bitmask_kernel + DraftTokensHandler + InputBatch.has_structured_output_reqs)在 pin 上是 opt-in 且默认关闭**:vllm/envs.py:251 `VLLM_USE_V2_MODEL_RUNNER: bool = False`(envs.py:1711-1713 由 env 取 \"0\"),gpu_worker.py:156 读它、:316-330 据此二选一构造 GPUModelRunnerV2 / GPUModelRunnerV1。**默认部署走旧路径**:gpu_model_runner.py:4245 → structured_output/utils.py:44 `apply_grammar_bitmask` → **xgrammar 自带的 `xgr.apply_token_bitmask_inplace`,没有 vLLM 自写的 Triton kernel**。另 config/vllm.py:1888-1896 对 V2 不支持的特性直接抛错、:1990 有 mamba_cache_mode 断言。**writer 必须在高潮段之前把这道 env 门与默认值交代清楚**,不得让读者以为『语法最终变成一次 kernel 上的位运算』是默认行为。",
+    "行号以 pin v0.21.0(ad7125a4) 为准；容器内镜像版本可能有行号差，容器仅用于观察行为。",
+    "host 无 CUDA/vLLM，kernel 实际耗时/占比未实测；正文中 18.6 KiB/行、4.6 MiB/批、grid 第二维 19 等数字均为按 |V|=152064、BLOCK_SIZE=8192 的源码常量推算，须注明『按源码常量推算』而非实测。",
+    "并行线程数上界 max(1, min(cpu_count//2, 8)) 依赖部署机 CPU 数，正文举例须说明取值前提。",
+    "『支持哪些约束形态』以上篇 §31.2 的六种形态为准（引擎侧实见五种，choice 被就地改写为 regex）；本章不重述。",
+    "新 gpu worker 路径（StructuredOutputsWorker）与旧 gpu_model_runner 路径（structured_output/utils.py）在 pin 上并存，正文须说明本章以新路径为主线、旧路径作对照。"
+  ]
+}
