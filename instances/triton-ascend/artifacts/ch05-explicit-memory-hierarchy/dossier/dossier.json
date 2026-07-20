@@ -1,0 +1,361 @@
+{
+ "chapter": "ch05",
+ "title": "显式内存层级:UB/GM/L1/L0C、buffer 语言与 copy/fixpipe",
+ "pairs_with": "triton ch07 (造块、形状变换、访存与原子)",
+ "scope_note": "本章只讲 Python 语言表面:ascend_address_space 地址空间可见性、buffer 语言扩展(bl.alloc/bl.buffer/buffer_type + buffer↔tensor 互转)、al.copy 的地址空间逐条校验、al.fixpipe 的 L0C→UB 搬运与对齐约束。mem_ops.py 的四个索引搬运算子(gather_out_to_ub/scatter_ub_to_out/index_put/index_select_simd)按已审批大纲归 ch06(昇腾内建算子),本章不深挖,以免与 ch06 重复;hivm op 语义与 fixpipe 的 NZ2ND 分形下降归 P5(ch23 HIVM 方言),本章仅给 Fractal NZ/NZ2ND 一句 gloss。呼应 ch02 达芬奇硬件 primer 的内存层级、接 ch04 双 builder 的 emit 接缝。",
+ "code_spine": [
+  "third_party/ascend/language/cann/extension/core.py:L143-L163  (ascend_address_space:把 ascend_ir.AddressSpace 逐个包成可 to_ir 下沉的 attribute)",
+  "python/triton/extension/buffer/language/core.py:L70-L107  (address_space 抽象基类 + buffer_type:带 shape/element_ty/space/strides,to_ir 建 memref)",
+  "python/triton/extension/buffer/language/core.py:L136-L208  (buffer 值对象 + bl.alloc 前端签名)",
+  "python/triton/extension/buffer/language/semantic.py:L35-L62  (alloc 实现:get_buffer_ty(shape,ety,addr_space)→builder.alloc→挂 effects 注解)",
+  "python/triton/extension/buffer/language/semantic.py:L65-L158  (to_buffer/to_tensor/subview:buffer↔tensor 互转与切片)",
+  "third_party/ascend/language/cann/extension/core.py:L174-L199  (al.copy / al.copy_from_ub_to_l1 前端 builtin,转发 semantic)",
+  "third_party/ascend/language/cann/extension/semantic.py:L94-L129  (copy/copy_from_ub_to_l1 实现:is_910_95 门禁 + 地址空间逐条校验 + create_copy_buffer)",
+  "third_party/ascend/language/cann/extension/core.py:L247-L333  (Fixpipe 四组枚举 + al.fixpipe builtin:910_95 门禁 + UB 目的校验 + 8/16 对齐约束)",
+  "third_party/ascend/language/cann/extension/semantic.py:L132-L148  (semantic.fixpipe:builder.create_fixpipe 建 hivm fixpipe op)"
+ ],
+ "embed_excerpts": [
+  {
+   "path": "third_party/ascend/language/cann/extension/core.py",
+   "lines": "L143-L163",
+   "what": "地址空间可见:把 C++ 侧 ascend_ir.AddressSpace 的每个成员(UB/L1/GM/L0C...)包成一个可下沉的 attribute。ascend_address_space.UB 等即由此动态生成。",
+   "code": "class ascend_address_space_base(bl.address_space):\n    def __init__(self, address_space_value: ascend_ir.AddressSpace) -> None:\n        super().__init__()\n        self.real_address_space = address_space_value\n\n    def to_ir(self, builder: ir.builder) -> ir.attribute:\n        return builder.get_target_attribute(self.real_address_space)\n\n\nclass ascend_address_space_group:\n\n    def __init__(self):\n        for k, v in {\n            k: v\n            for k, v in ascend_ir.AddressSpace.__dict__.items()\n            if isinstance(v, ascend_ir.AddressSpace)\n        }.items():\n            setattr(self, k, ascend_address_space_base(v))\n\n\nascend_address_space = ascend_address_space_group()",
+   "elide": [
+    "其余 core.py 顶部 enum(CORE/PIPE/MODE/IteratorType)属核类型/流水线/迭代器语义,归 ch08,本章不引"
+   ]
+  },
+  {
+   "path": "python/triton/extension/buffer/language/core.py",
+   "lines": "L82-L107",
+   "what": "buffer_type:buffer 的类型,携带 element_ty/shape/space(地址空间)/strides。to_ir 把地址空间转成 attribute 后建 memref 类型——这是『在哪级内存、什么形状』被显式编码进类型系统。",
+   "code": "class buffer_type(tl.dtype):\n\n    def __init__(self, element_ty: tl.dtype, shape: List, space: address_space = None, strides: List = None):\n        self.element_ty = element_ty\n        self.shape = shape if isinstance(shape, list) else list(shape)\n        self.space = space\n        self.strides = strides if strides is not None else []\n        self.name = self._make_name()\n\n    def _make_name(self):\n        res = '<buffer ' + 'x'.join(str(s) for s in self.shape) + 'x' + str(self.element_ty)\n        if self.strides:\n            res += ', strides=[' + ', '.join(str(s) for s in self.strides) + ']'\n        if self.space:\n            res += ', ' + str(self.space)\n        return res + '>'\n\n    def to_ir(self, builder: ir.builder) -> ir.type:\n        element_ty_ir = self.element_ty.to_ir(builder)\n        addr_space_attr = self.space.to_ir(builder) if self.space else builder.get_null_attr()\n\n        # use the method with strides if strides is not empty\n        if self.strides:\n            return builder.get_buffer_ty_with_strides(self.shape, element_ty_ir, self.strides, addr_space_attr)\n        else:\n            return builder.get_buffer_ty(self.shape, element_ty_ir, addr_space_attr)",
+   "elide": [
+    "__eq__/__ne__/__str__/scalar property 省略——只是相等比较与名字打印"
+   ]
+  },
+  {
+   "path": "python/triton/extension/buffer/language/core.py",
+   "lines": "L190-L208",
+   "what": "bl.alloc 前端 builtin:在指定 _address_space 上开一块 shape×etype 的缓冲。这是『在 UB/L1 上显式开一块内存』的用户入口,基座 Triton 完全没有这层。",
+   "code": "@builtin\ndef alloc(\n    etype: tl.dtype,\n    shape: List[tl.constexpr],\n    _address_space: address_space = None,\n    is_mem_unique: bool = False,\n    _builder=None\n) -> buffer:\n    \"\"\"\n    Allocates a region of local memory with the specified shape and type.\n\n    :param etype: the element type of the buffer.\n    :type etype: tl.dtype\n    :param shape: A list of non-negative integers representing the shape of the buffer.\n    :type shape: List[tl.constexpr]\n    :param _address_space: (Optional) backend-specific local memory address space\n    :type _address_space: bl.address_space\n    \"\"\"\n    return semantic.alloc(etype, shape, _address_space, is_mem_unique, _builder)",
+   "elide": []
+  },
+  {
+   "path": "python/triton/extension/buffer/language/semantic.py",
+   "lines": "L35-L62",
+   "what": "alloc 实现:地址空间转 attr → builder.get_buffer_ty 建 memref 类型 → builder.alloc 建 op → 挂 effects(read/write)注解;is_mem_unique 时另挂 mem_unique。返回包着 handle 与 buffer_type 的 bl.buffer。",
+   "code": "def alloc(\n    etype: tl.dtype,\n    shape: List[tl.constexpr],\n    address_space: bl.address_space,\n    is_mem_unique,\n    builder: ir.builder\n) -> bl.buffer:\n    shape = tl._unwrap_shape(shape)\n    if etype == tl.int1:\n        raise TypeError(\"Unsupported alloc int1 type\")\n    if not isinstance(shape, (tuple, list)):\n        raise TypeError(\"shape must be list/tuple\")\n    etype = tl._constexpr_to_value(etype)\n    address_space = tl._constexpr_to_value(address_space)\n    element_ty_ir = etype.to_ir(builder)\n    addr_space_attr = (\n        address_space.to_ir(builder) if address_space else builder.get_null_attr()\n    )\n    memref_ty = builder.get_buffer_ty(shape, element_ty_ir, addr_space_attr)\n    handle = builder.alloc(memref_ty)\n    if is_mem_unique:\n        builder.create_annotation_mark(handle, \"mem_unique\", builder.get_unit_attr())\n    builder.create_annotation_mark(\n        handle, \"effects\", builder.get_str_array_attr([\"write\", \"read\"])\n    )\n\n    buffer_ty = bl.buffer_type(element_ty=etype, shape=shape, space=address_space)\n    return bl.buffer(handle, buffer_ty)",
+   "elide": []
+  },
+  {
+   "path": "third_party/ascend/language/cann/extension/semantic.py",
+   "lines": "L94-L129",
+   "what": "al.copy 的地址空间逐条校验(本章核心):copy_from_ub_to_l1 要求 src=UB / dst=L1;copy 放宽 dst 到 {L1,UB}。二者都先过 is_910_95 门禁、拒绝 tl.tensor(只收 bl.buffer)、要求 shape/dtype 一致,最后 create_copy_buffer 建 op。搬运的合法性在语言层被逐条断言,而不是硬件默默处理。",
+   "code": "def copy_from_ub_to_l1(src: Union[tl.tensor, bl.buffer], dst: Union[tl.tensor, bl.buffer], builder):\n    if not builder.is_910_95():\n        raise RuntimeError(\"this feature is only supported on Ascend910_95\")\n    if isinstance(src, tl.tensor) or isinstance(dst, tl.tensor):\n        raise TypeError(\"tensor not support yet\")\n    if src.shape != dst.shape:\n        raise TypeError(\"src and dst must have same shape\")\n    if src.dtype != dst.dtype:\n        raise TypeError(\"src and dst need to have the same type\")\n    if isinstance(src, bl.buffer) and isinstance(dst, bl.buffer):\n        if src.space != al.ascend_address_space.UB:\n            raise TypeError(\"src's AddressSpace must be UB\")\n        if dst.space != al.ascend_address_space.L1:\n            raise TypeError(\"dst's AddressSpace must be L1\")\n        builder.create_copy_buffer(src.handle, dst.handle)\n    else:\n        raise TypeError(\"src and dst must be tl.tensor or bl.buffer\")\n\n\ndef copy(src: Union[tl.tensor, bl.buffer], dst: Union[tl.tensor, bl.buffer], builder):\n    if not builder.is_910_95():\n        raise RuntimeError(\"this feature is only supported on Ascend910_95\")\n    if isinstance(src, tl.tensor) or isinstance(dst, tl.tensor):\n        raise TypeError(\"tensor not support yet\")\n    if src.shape != dst.shape:\n        raise TypeError(\"src and dst must have same shape\")\n    if src.dtype != dst.dtype:\n        raise TypeError(\"src and dst need to have the same type\")\n    if isinstance(src, bl.buffer) and isinstance(dst, bl.buffer):\n        if src.space != al.ascend_address_space.UB:\n            raise TypeError(\"src's AddressSpace must be UB\")\n        if dst.space not in (al.ascend_address_space.L1, al.ascend_address_space.UB):\n            raise TypeError(\"dst's AddressSpace must be UB or L1\")\n        builder.create_copy_buffer(src.handle, dst.handle)\n    else:\n        raise TypeError(\"src and dst must be tl.tensor or bl.buffer\")",
+   "elide": []
+  },
+  {
+   "path": "third_party/ascend/language/cann/extension/core.py",
+   "lines": "L247-L270",
+   "what": "fixpipe 的四组模式枚举:DMA 布局变换模式(NZ2DN/NZ2ND/NZ2NZ)、双目的模式、前置量化模式、前置 ReLU 模式。NZ2ND 即『把 cube 产出的 Fractal NZ 分形布局转回常规 ND』——本章只给这一句 gloss,分形布局的下降细节归 P5(ch23)。",
+   "code": "class FixpipeDMAMode(enum.Enum):\n    NZ2DN = ascend_ir.FixpipeDMAMode.NZ2DN\n    NZ2ND = ascend_ir.FixpipeDMAMode.NZ2ND\n    NZ2NZ = ascend_ir.FixpipeDMAMode.NZ2NZ\n\n\nclass FixpipeDualDstMode(enum.Enum):\n    NO_DUAL = ascend_ir.FixpipeDualDstMode.NO_DUAL\n    COLUMN_SPLIT = ascend_ir.FixpipeDualDstMode.COLUMN_SPLIT\n    ROW_SPLIT = ascend_ir.FixpipeDualDstMode.ROW_SPLIT\n\n\nclass FixpipePreQuantMode(enum.Enum):\n    NO_QUANT = ascend_ir.FixpipePreQuantMode.NO_QUANT\n    F322BF16 = ascend_ir.FixpipePreQuantMode.F322BF16\n    F322F16 = ascend_ir.FixpipePreQuantMode.F322F16\n    S322I8 = ascend_ir.FixpipePreQuantMode.S322I8\n\n\nclass FixpipePreReluMode(enum.Enum):\n    LEAKY_RELU = ascend_ir.FixpipePreReluMode.LEAKY_RELU\n    NO_RELU = ascend_ir.FixpipePreReluMode.NO_RELU\n    NORMAL_RELU = ascend_ir.FixpipePreReluMode.NORMAL_RELU\n    P_RELU = ascend_ir.FixpipePreReluMode.P_RELU",
+   "elide": []
+  },
+  {
+   "path": "third_party/ascend/language/cann/extension/core.py",
+   "lines": "L273-L333",
+   "what": "al.fixpipe 前端 builtin(本章核心):把 L0C 上的 cube 计算结果搬到 UB 上的 buffer,同时按 dma_mode 做 layout 变换。层层校验:①仅 910_95;②src 必须 tl.tensor、dst 必须 bl.buffer 且在 UB;③按 dtype 位宽(32b/16b)与 dma_mode 施加末维/首维对齐约束(N%8、N%16、M%8、M%16、列切分 N%32)。校验通过后转 semantic.fixpipe。",
+   "code": "@builtin\ndef fixpipe(\n    src: tl.tensor,\n    dst: bl.buffer,\n    dma_mode: FixpipeDMAMode = FixpipeDMAMode.NZ2ND,\n    dual_dst_mode: FixpipeDualDstMode = FixpipeDualDstMode.NO_DUAL,\n    _builder=None,\n) -> None:\n    \"\"\"\n    Directly store a tensor on L0C to a local buffer via fixpipe.\n    Fixpipe is pipeline that performing data movement from L0C to other memory hierarchies.\n    Currently support:\n        - L0C to UB (for Ascend910_95 sereies)\n\n    :param src: the source tensor, Must be located in the l0C memory region.\n    :type src: tl.tensor\n    :param dst: The destination buffer, Must be located in the UB memory region.\n    :type dst: bl.buffer\n    :param dma_mode: DMA transfer mode, \"nz2nd\" enables NZ to ND layout transformation\n    :type dma_mode: str\n    \"\"\"\n    if not _builder.is_910_95():\n        raise RuntimeError(\"this feature is only supported on Ascend910_95\")\n    if not isinstance(src, tl.tensor):\n        raise TypeError(\"src is not of tensor type\")\n    elif not isinstance(dst, bl.buffer):\n        raise TypeError(\"dst is not of buffer type\")\n    if dst.space != ascend_address_space.UB:\n        raise TypeError(\"dst must be located in the UB memory region\")\n\n    if len(dst.shape) == 2 and (\n        dst.type.element_ty == tl.float32 or dst.type.element_ty == tl.int32\n    ):\n        N = dst.shape[1]\n        if N % 8 != 0:\n            raise ValueError(\"32b Fixpipe last dim must be aligned to 8\")\n        if (dma_mode != FixpipeDMAMode.NZ2ND) and (N % 16 != 0):\n            raise ValueError(\"32b non-NZ2ND Fixpipe last dim must be aligned to 16\")\n        if (dual_dst_mode == FixpipeDualDstMode.COLUMN_SPLIT) and (N % 32 != 0):\n            raise ValueError(\n                \"32b Column split dual Fixpipe last dim must be aligned to 32\"\n            )\n        M = dst.shape[0]\n        if (dma_mode == FixpipeDMAMode.NZ2DN) and (M % 8 != 0):\n            raise ValueError(\"32b NZ2DN Fixpipe first dim must be aligned to 8\")\n    dst16bits = (\n        dst.type.element_ty == tl.float16\n        or dst.type.element_ty == tl.int16\n        or dst.type.element_ty == tl.bfloat16\n    )\n    if len(dst.shape) == 2 and dst16bits:\n        N = dst.shape[1]\n        if N % 16 != 0:\n            raise ValueError(\"16b Fixpipe last dim must be aligned to 16\")\n        M = dst.shape[0]\n        if (dma_mode == FixpipeDMAMode.NZ2DN) and (M % 16 != 0):\n            raise ValueError(\"16b NZ2DN Fixpipe first dim must be aligned to 16\")\n\n    return semantic.fixpipe(\n        src, dst, dma_mode, dual_dst_mode, FixpipePreQuantMode.NO_QUANT, FixpipePreReluMode.NO_RELU, _builder\n    )",
+   "elide": [
+    "前端固定传 NO_QUANT/NO_RELU——量化/ReLU 融合枚举在语言层未开放,只保留占位"
+   ]
+  },
+  {
+   "path": "third_party/ascend/language/cann/extension/semantic.py",
+   "lines": "L132-L148",
+   "what": "semantic.fixpipe:把前端校验过的 src/dst 与四个模式值直接喂给 builder.create_fixpipe 建 hivm fixpipe op。语言层到此为止,op 的 IR 语义与 NZ2ND 下降归 P5(ch23)。",
+   "code": "def fixpipe(\n    src: tl.tensor,\n    dst,\n    dma_mode,\n    dual_dst_mode,\n    pre_quant_mode,\n    pre_relu_mode,\n    builder: ascend_ir.ascendnpu_ir_builder,\n) -> None:\n    builder.create_fixpipe(\n        src.handle,\n        dst.handle,\n        dma_mode.value,\n        dual_dst_mode.value,\n        pre_quant_mode.value,\n        pre_relu_mode.value,\n    )",
+   "elide": []
+  },
+  {
+   "path": "python/triton/extension/buffer/language/core.py",
+   "lines": "L136-L169",
+   "what": "buffer 值对象:承载 handle 与 buffer_type,暴露 dtype/shape/space/strides。space 即该缓冲所在的地址空间——al.copy/al.fixpipe 的校验读的就是这个 .space 字段。",
+   "code": "class buffer(tl._value):\n    \"\"\"Represents a region of memory.\n\n    :code:`buffer` is the fundamental data structure for Triton programs using\n    the buffer language extension. Most functions in\n    :py:mod:`triton.extension.buffer.language` operate on and return buffers.\n\n    Most of the named member functions here are duplicates of the free functions\n    in :code:`triton.language`.  For example, :code:`triton.language.sqrt(x)` is\n    equivalent to :code:`x.sqrt()`.\n\n    .. rubric:: Constructors\n    ..\n       For some reason Sphinx includes __init__ before printing the full table\n       of methods.  Not what I want, but I can't figure out how to fix it.  Give\n       it its own section so it looks intentional. :)\n    \"\"\"\n\n    def __init__(self, handle, buffer_ty: buffer_type):\n        \"\"\"Not called by user code.\"\"\"\n        super().__init__(handle)\n        self.type = buffer_ty\n        self.dtype = buffer_ty.element_ty.scalar\n        self.shape = buffer_ty.shape\n        self.space = buffer_ty.space\n        self.strides = buffer_ty.strides\n\n    def __str__(self) -> str:\n        # ex. \"<16x32xfloat32, address_space>\"\n        res = '<' + 'x'.join(str(s)\n                             for s in self.shape) + 'x' + str(self.dtype)\n        if self.space:\n            res += ', ' + str(self.space)\n        return res + '>'",
+   "elide": [
+    "subview/to_tensor 成员方法只是转发到自由函数,见 to_tensor/subview 机制"
+   ]
+  },
+  {
+   "path": "python/triton/extension/buffer/language/semantic.py",
+   "lines": "L87-L116",
+   "what": "to_tensor:把 bl.buffer 转回 tl.tensor 交给标准 tl.* 算子计算(可选 target_shape 触发 create_convert_layout 换布局)。与 to_buffer 互为逆——buffer(内存视角)↔tensor(值视角)的切换,是 al.copy/fixpipe(吃 buffer)与 tl.dot/tl.load(吃 tensor)在同一 kernel 里衔接的桥。",
+   "code": "def to_tensor(\n    memref: bl.buffer,\n    writable: bool,\n    builder: ir.builder,\n    target_shape=None\n) -> tl.tensor:\n    if not isinstance(memref, bl.buffer):\n        raise TypeError(\"memref must be bl.buffer\")\n    \n    need_convert_layout = False\n    shape = memref.shape\n    if target_shape:\n        need_convert_layout = True\n        shape = tl._unwrap_shape(target_shape)\n        assert shape != memref.shape, \"target shape is the same as source shape\"\n    if not isinstance(shape, (tuple, list)):\n        raise TypeError(\"shape must be list/tuple\")\n    tensor_type = tl.block_type(memref.dtype, shape)\n\n    memref_value = memref.handle\n    if need_convert_layout:\n        buffer_ty = bl.buffer_type(\n            element_ty=memref.dtype,\n            shape=shape,\n            space=memref.space,\n        )\n        memref_value = builder.create_convert_layout(\n            memref_value, buffer_ty.to_ir(builder))\n\n    return tl.tensor(builder.to_tensor(memref_value, writable), tensor_type)",
+   "elide": [
+    "to_buffer(L65-L84)对称:tensor→buffer,可 bind_buffer 复用已有缓冲;subview(L119-L158)按 offsets/sizes/strides 切子缓冲,前端 check_subview 施加 32-byte 对齐"
+   ]
+  }
+ ],
+ "key_classes": [
+  {
+   "name": "ascend_address_space_group / ascend_address_space",
+   "file": "third_party/ascend/language/cann/extension/core.py",
+   "responsibility": "把 C++ 侧 ascend_ir.AddressSpace 的每个成员(UB/L1/GM/L0C...)动态包成 ascend_address_space_base 实例,挂到单例 ascend_address_space 上。用户以 al.ascend_address_space.UB 引用;每个实例可 to_ir 下沉成 target attribute。地址空间对程序员可见的入口。"
+  },
+  {
+   "name": "ascend_address_space_base",
+   "file": "third_party/ascend/language/cann/extension/core.py",
+   "responsibility": "单个地址空间的语言层封装,继承 bl.address_space,to_ir 调 builder.get_target_attribute 把地址空间转成 MLIR attribute。"
+  },
+  {
+   "name": "buffer_type",
+   "file": "python/triton/extension/buffer/language/core.py",
+   "responsibility": "buffer 的类型:element_ty + shape + space(地址空间)+ strides。to_ir 建 memref 类型。『数据在哪级内存、什么形状/步长』被编码进类型系统。"
+  },
+  {
+   "name": "buffer",
+   "file": "python/triton/extension/buffer/language/core.py",
+   "responsibility": "buffer 值对象(继承 tl._value),承载 handle 与 buffer_type,暴露 dtype/shape/space/strides。al.copy/al.fixpipe 的地址空间校验读它的 .space 字段。"
+  },
+  {
+   "name": "address_space (抽象基类)",
+   "file": "python/triton/extension/buffer/language/core.py",
+   "responsibility": "buffer 语言的地址空间抽象基类,to_ir 抛 NotImplementedError;由昇腾侧 ascend_address_space_base 具体化。解耦『buffer 语言通用框架』与『昇腾具体地址空间集合』。"
+  },
+  {
+   "name": "FixpipeDMAMode / FixpipeDualDstMode / FixpipePreQuantMode / FixpipePreReluMode",
+   "file": "third_party/ascend/language/cann/extension/core.py",
+   "responsibility": "fixpipe 的四组模式枚举:DMA 布局变换(NZ2DN/NZ2ND/NZ2NZ)、双目的拆分、前置量化、前置 ReLU。前端只开放前两组,后两组固定 NO_QUANT/NO_RELU。"
+  }
+ ],
+ "data_flow": [
+  "① 开缓冲:用户在 @triton.jit kernel 里调 bl.alloc(dtype, shape, _address_space=al.ascend_address_space.UB) → core.alloc(前端 builtin,经 ch04 双 builder 拿到 ascend_builder 作 _builder) → semantic.alloc:地址空间 to_ir 成 attr → builder.get_buffer_ty(shape,ety,addr_space) 建 memref 类型 → builder.alloc 建 op → 挂 effects(read/write) 注解 → 返回 bl.buffer(handle, buffer_type)。",
+  "② 显式搬运(UB→UB/L1):al.copy(src_buffer, dst_buffer) → core.copy(前端 builtin)→ semantic.copy:is_910_95 门禁 → 拒 tl.tensor → shape/dtype 一致校验 → src.space 必须 UB、dst.space 必须 ∈{UB,L1}(copy_from_ub_to_l1 更严:dst 必须 L1)→ builder.create_copy_buffer(src.handle, dst.handle) 建 hivm copy op。",
+  "③ cube 结果落地(L0C→UB):al.fixpipe(src_tensor_on_L0C, dst_buffer_on_UB, dma_mode=NZ2ND) → core.fixpipe(前端 builtin):910_95 门禁 → src 必须 tl.tensor、dst 必须 UB 上的 bl.buffer → 按 dtype 位宽(32b/16b)与 dma_mode 施加末维/首维对齐约束 → semantic.fixpipe:builder.create_fixpipe(src,dst,dma_mode,dual_dst,pre_quant=NO_QUANT,pre_relu=NO_RELU) 建 hivm fixpipe op(顺带 NZ→ND 分形布局变换)。",
+  "④ buffer↔tensor 切换:需用 tl.* 算子(dot/load/vector)计算时,to_tensor(buffer) 把内存视角切回值视角(可选 create_convert_layout 换布局);算完 to_buffer(tensor) 切回,可 bind_buffer 复用已开缓冲;subview(buffer, offsets, sizes, strides) 切子缓冲(前端 check_subview 施加 32-byte 与全 1 stride 约束)。"
+ ],
+ "design_decisions": [
+  {
+   "decision": "地址空间(UB/GM/L1/L0C)对程序员可见,编码进 buffer 的类型(buffer_type.space)",
+   "why": "达芬奇 AI Core 的片上内存层级是异构、容量受限、需手工编排的(ch02 硬件 primer)。基座 Triton 对 NVIDIA 隐藏 shared memory(编译器托管),而昇腾把每级内存暴露到语言层——搬运的源/目的物理层级必须由程序员写出,这是 NPU 性能的第一现场。",
+   "evidence": "third_party/ascend/language/cann/extension/core.py:L143-L163 (ascend_address_space);python/triton/extension/buffer/language/core.py:L82-L107 (buffer_type.space)"
+  },
+  {
+   "decision": "al.copy 的合法搬运方向在语言层逐条 assert(src=UB;dst∈{UB,L1}),而非硬件默默处理",
+   "why": "达芬奇的 MTE 搬运引擎对『从哪级搬到哪级』有硬件约束;把约束前移到 Python 前端可在编译期(甚至 trace 期)就报错,给出可读的方向错误信息,而不是生成非法 IR 后在下游崩溃。copy_from_ub_to_l1 已弃用(warn),copy 是其超集(dst 放宽到 UB)。",
+   "evidence": "third_party/ascend/language/cann/extension/semantic.py:L94-L129;core.py:L184-L186 (deprecation warn)"
+  },
+  {
+   "decision": "fixpipe 专司 L0C→UB,且带 dtype/对齐/芯片门禁",
+   "why": "L0C 是 cube(矩阵)流水线的累加缓冲,产出是 Fractal NZ 分形布局;要被 vector 或搬回 GM 就得经 fixpipe 这条专用流水线做 NZ→ND 变换并落到 UB。对齐约束(32b:N%8;16b:N%16;NZ2DN 另加首维;列切分 N%32)源自 DMA 引擎的搬运粒度。仅 910_95 支持(is_910_95 门禁)。",
+   "evidence": "third_party/ascend/language/cann/extension/core.py:L273-L333;semantic.py:L132-L148"
+  },
+  {
+   "decision": "buffer(内存视角)与 tensor(值视角)分立、可互转",
+   "why": "al.copy/al.fixpipe 吃 bl.buffer(memref 语义,有地址空间),而 tl.dot/tl.load/vector 算子吃 tl.tensor(值语义)。分立让两套算子在同一 kernel 共存;to_tensor/to_buffer/subview 是它们之间的桥。alloc 顺带挂 effects(read/write) 注解供下游 pass 分析别名/依赖。",
+   "evidence": "python/triton/extension/buffer/language/semantic.py:L65-L158;L57-L59 (effects 注解)"
+  },
+  {
+   "decision": "地址空间集合由 C++ 侧 ascend_ir.AddressSpace 反射生成,而非 Python 硬编码",
+   "why": "地址空间是 target-specific 属性(bl.address_space 基类注释)。用 ascend_ir.AddressSpace.__dict__ 反射,让 Python 语言层与 C++ 后端定义的地址空间集合自动对齐,新增一级内存无需改 Python。",
+   "evidence": "third_party/ascend/language/cann/extension/core.py:L152-L163"
+  }
+ ],
+ "theory": [
+  "内存层级金字塔(ch02 达芬奇 primer 已立):GM(片外 Global Memory,大而慢)→ UB(Unified Buffer,片上 vector 侧统一缓冲)/ L1(片上,cube 侧输入缓冲)→ L0A/L0B(cube 输入)→ L0C(cube 累加输出)。地址空间在本仓有**四档待遇**,数错任何一档都会讲错本章:①**MLIR/HIVM 侧定义 7 级**(HIVMAttrs.td:L188-L194:Zero=0/GM=1/L1=2/L0A=3/L0B=4/L0C=5/UB=6);②**pybind 只导出 5 级**(ascend_ir.cc:L412-L417 只 .value 了 L1/UB/L0A/L0B/L0C)——**Zero 与 GM 根本没进 Python,语言层连名字都拿不到**,故 ascend_address_space_group 遍历 ascend_ir.AddressSpace.__dict__ 反射出来的只有这 5 个;bl.alloc 对这 5 个原样透传、不做白名单;但**能被前端校验拦住的只有 UB 与 L1 两级**——全仓对 .space 的比较仅 3 处 5 行(semantic.py:L104,L106 copy_from_ub_to_l1 src=UB/dst=L1;semantic.py:L123,L125 copy src=UB/dst∈{L1,UB};core.py:L300 fixpipe dst=UB),再无其他层级出现在任何 if 里。**L0C 是文档契约而非校验**:fixpipe docstring 要求 src 位于 L0C,但 src 是 tl.tensor、其类型上没有 .space 字段(space 只存在于 buffer_type/buffer),前端无从读取。GM 不出现在本章两条边上,其显式搬运属 ch02 主干。",
+  "Fractal NZ 分形布局(首现,一句 gloss):cube 单元为高效矩阵运算,把二维矩阵按 16×16(或类似)小块重排成 NZ(zN/nZ)分形排布,而非常规行主序 ND。fixpipe 的 dma_mode=NZ2ND 即在 L0C→UB 搬运途中把分形布局还原成 ND,使后续 vector/store 能按常规布局访问。分形布局的精确定义与 IR 下降归 P5(ch23 HIVM 方言),本章只需知道『cube 产出是 NZ,fixpipe 顺带转回 ND』。",
+  "对齐约束的算术:fixpipe 的对齐要求来自 DMA 搬运粒度。32b 元素(fp32/int32)末维 N 须 %8==0(一次搬 8 个 32b=256bit);非 NZ2ND 模式 N 须 %16;列切分双目的 N 须 %32;NZ2DN 模式首维 M 须 %8。16b 元素(fp16/bf16/int16)末维 N 须 %16、NZ2DN 首维 M 须 %16。可用小例演示:dst 形状 [64,100] fp32 → N=100,100%8=4≠0 → 报 '32b Fixpipe last dim must be aligned to 8';改 [64,128] → 128%8==0 通过。",
+  "为什么『显式』是负担也是旋钮:GPU warp 模型下 shared memory 由编译器托管,程序员写 tl.load/tl.store 即可;NPU 要程序员显式 alloc(在哪级)+copy(搬哪条边)+fixpipe(cube 落地),这是额外的编程负担,但也让程序员能精确控制每一次搬运——这是 NPU kernel 调优的第一现场(呼应 ch02『显式搬运 GM→UB / UB→GM』)。"
+ ],
+ "subtraction_plan": {
+  "delete": [
+   {
+    "what": "core.py 的 CORE/PIPE/MODE/IteratorType 枚举与 sync_block_set/wait/all、create_sync_block、sub_vec_id、sub_vec_num、debug_barrier、SYNC_IN_VF、int64、builtin/is_builtin 装饰器机制",
+    "why_safe": "这些属核类型/流水线队列/核间同步/迭代器语义,由 ch08(scope-sync-pipeline)与 ch04(双 builder @builtin 契约)负责。本章精简版只需 ascend_address_space + copy + fixpipe + Fixpipe 枚举,删除它们不影响内存层级/copy/fixpipe 的可运行演示。"
+   },
+   {
+    "what": "整个 mem_ops.py(index_put / gather_out_to_ub / scatter_ub_to_out / index_select_simd)",
+    "why_safe": "四个索引搬运算子按已审批大纲归 ch06(昇腾内建算子)。本章不涉及其数据流,删除不影响 copy/fixpipe/buffer 的讲解;保留会与 ch06 严重重复。"
+   },
+   {
+    "what": "buffer/language/core.py 的 check_subview 详细对齐推导注释与 subview 的 constexpr 规整分支细节",
+    "why_safe": "subview 在本章是 supporting(buffer↔tensor 桥的一部分),32-byte 对齐推导是次要细节;保留 subview 函数签名与 semantic.subview 骨架即可,详细注释可删不影响主线。"
+   },
+   {
+    "what": "core.py L61 的 PIPE = semantic.PIPE 冗余赋值(随后被 L111 的 class PIPE 覆盖)",
+    "why_safe": "被同名 class 定义覆盖,是死赋值;删除不改变行为。"
+   }
+  ],
+  "must_keep": [
+   {
+    "symbol": "ascend_address_space",
+    "why": "地址空间可见的用户入口;al.copy/al.fixpipe/bl.alloc 都靠它指定/校验内存层级。读者必须理解 al.ascend_address_space.UB/L1 的含义。"
+   },
+   {
+    "symbol": "ascend_address_space_base",
+    "why": "单个地址空间的 to_ir 下沉逻辑(get_target_attribute),解释地址空间如何变成 IR attribute。"
+   },
+   {
+    "symbol": "copy",
+    "why": "本章核心:UB→UB/L1 的显式搬运及其地址空间逐条校验。"
+   },
+   {
+    "symbol": "copy_from_ub_to_l1",
+    "why": "copy 的前身(已弃用),对照展示 dst 从 L1-only 放宽到 {UB,L1} 的演进;地址空间校验的原型。"
+   },
+   {
+    "symbol": "fixpipe",
+    "why": "本章核心:L0C→UB 搬运 + NZ2ND 布局变换 + 对齐/dtype/芯片校验。"
+   },
+   {
+    "symbol": "FixpipeDMAMode",
+    "why": "fixpipe 的 layout 变换模式(含 NZ2ND);读者需理解 NZ2ND 是干什么的。"
+   },
+   {
+    "symbol": "FixpipeDualDstMode",
+    "why": "fixpipe 双目的拆分模式;COLUMN_SPLIT 触发 N%32 对齐约束。"
+   },
+   {
+    "symbol": "FixpipePreQuantMode",
+    "why": "fixpipe 前置量化枚举;前端固定 NO_QUANT,但枚举存在解释了 create_fixpipe 六参签名。"
+   },
+   {
+    "symbol": "FixpipePreReluMode",
+    "why": "fixpipe 前置 ReLU 枚举;同上,解释签名占位。"
+   },
+   {
+    "symbol": "create_copy_buffer",
+    "why": "copy 最终建的 builder op 名;读者由此看到语言层到 IR 的落点。"
+   },
+   {
+    "symbol": "create_fixpipe",
+    "why": "fixpipe 最终建的 builder op 名;六参对应四组模式,是语言层到 hivm op 的接缝。"
+   },
+   {
+    "symbol": "is_910_95",
+    "why": "芯片门禁:copy/fixpipe 都仅 910_95 支持;读者需理解这是硬件能力分野而非 bug。"
+   },
+   {
+    "symbol": "alloc",
+    "why": "buffer 语言的开缓冲入口;在指定 address_space 上物化一块内存,基座完全没有的一层。"
+   },
+   {
+    "symbol": "buffer",
+    "why": "buffer 值对象;承载地址空间(.space),是 copy/fixpipe 校验读取的对象。"
+   },
+   {
+    "symbol": "buffer_type",
+    "why": "把『在哪级内存、什么形状/步长』编码进类型;to_ir 建 memref。"
+   },
+   {
+    "symbol": "to_tensor",
+    "why": "buffer→tensor 桥;让 bl.* 与 tl.* 算子在同一 kernel 衔接。"
+   },
+   {
+    "symbol": "to_buffer",
+    "why": "tensor→buffer 桥(可 bind_buffer 复用缓冲);与 to_tensor 对称。"
+   },
+   {
+    "symbol": "subview",
+    "why": "buffer 切片(带 32-byte 对齐约束);buffer↔tensor 数据流的组成部分。"
+   },
+   {
+    "symbol": "address_space",
+    "why": "buffer 语言的地址空间抽象基类;解耦通用框架与昇腾具体地址空间。"
+   }
+  ]
+ },
+ "mechanisms": [
+  {
+   "id": "M1",
+   "name": "地址空间可见:ascend_address_space 与内存层级到语言层的落地",
+   "kind": "dataflow",
+   "source_anchors": [
+    "third_party/ascend/language/cann/extension/core.py:L143-L163",
+    "python/triton/extension/buffer/language/core.py:L70-L79"
+   ],
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "difficulty": "core"
+  },
+  {
+   "id": "M2",
+   "name": "buffer 语言:bl.alloc 在指定 address_space 显式开缓冲",
+   "kind": "dataflow",
+   "source_anchors": [
+    "python/triton/extension/buffer/language/core.py:L190-L208",
+    "python/triton/extension/buffer/language/semantic.py:L35-L62",
+    "python/triton/extension/buffer/language/core.py:L82-L107"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": true,
+   "difficulty": "core"
+  },
+  {
+   "id": "M3",
+   "name": "al.copy 的地址空间逐条校验(UB→UB/L1)",
+   "kind": "protocol",
+   "source_anchors": [
+    "third_party/ascend/language/cann/extension/semantic.py:L94-L129",
+    "third_party/ascend/language/cann/extension/core.py:L174-L199"
+   ],
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "difficulty": "core"
+  },
+  {
+   "id": "M4",
+   "name": "al.fixpipe:L0C→UB 搬运 + NZ2ND 布局变换 + 对齐/dtype/芯片校验",
+   "kind": "protocol",
+   "source_anchors": [
+    "third_party/ascend/language/cann/extension/core.py:L273-L333",
+    "third_party/ascend/language/cann/extension/semantic.py:L132-L148",
+    "third_party/ascend/language/cann/extension/core.py:L247-L270"
+   ],
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "difficulty": "core"
+  },
+  {
+   "id": "M5",
+   "name": "buffer↔tensor 互转:to_tensor/to_buffer/subview 作为 bl.* 与 tl.* 的桥",
+   "kind": "dataflow",
+   "source_anchors": [
+    "python/triton/extension/buffer/language/semantic.py:L65-L158",
+    "python/triton/extension/buffer/language/core.py:L299-L363"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "supporting"
+  },
+  {
+   "id": "M6",
+   "name": "is_910_95 芯片门禁:copy/fixpipe 的硬件能力分野",
+   "kind": "config",
+   "source_anchors": [
+    "third_party/ascend/language/cann/extension/semantic.py:L95-L96",
+    "third_party/ascend/language/cann/extension/semantic.py:L114-L115",
+    "third_party/ascend/language/cann/extension/core.py:L294-L295"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "supporting"
+  },
+  {
+   "id": "M7",
+   "name": "fixpipe 对齐约束的算术(32b:N%8/16b:N%16/NZ2DN 首维/列切分 N%32)",
+   "kind": "protocol",
+   "source_anchors": [
+    "third_party/ascend/language/cann/extension/core.py:L303-L329"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": true,
+   "difficulty": "supporting"
+  }
+ ],
+ "foreshadow_due": {
+  "to_plant": [],
+  "to_payoff": [],
+  "note": "bible.py due ch05 返回空(『== ch05 应埋伏笔 ==』『== ch05 应回收 ==』均无条目)。与派单一致:本章无伏笔埋/回收。"
+ }
+}
