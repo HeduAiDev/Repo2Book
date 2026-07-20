@@ -1,0 +1,442 @@
+{
+ "chapter": "ch05",
+ "title": "显式内存层级:UB/GM/L1/L0C、buffer 语言与 copy/fixpipe",
+ "note": "trace 取自 host 真机跑本章精简版(implementation/,纯 Python);真实 ir.builder/ascendnpu_ir_builder 是需昇腾 NPU/CANN 工具链的 C++ 绑定,host 无此环境,故由 FakeBuilder 测试替身站位(见 tests/conftest.py 与 explainer/traces/_env.py:两者共用同一套 sys.modules 装配)。FakeBuilder 只记录调用+返回哨兵值,不模拟 MLIR/hivm op 语义——本章验证的是『地址空间校验 / copy 方向门禁 / fixpipe 对齐算术 / buffer↔tensor 桥』这些 Python 语言层可观察行为。IR dump 级验证需真机,归 P5(ch23)。数值表每个数字均可在对应 traces/*.json 里找到。",
+ "mechanisms": [
+  {
+   "mechanism_id": "M1",
+   "intuition": "把片上内存想成一栋楼:GM 是楼外的大仓库(慢但大),UB/L1 是各楼层的工作台(快但小),L0C 是流水线尽头的收料台(cube 算完的半成品堆在这)。基座 Triton 面对 GPU 时把这些楼层藏起来、由编译器代管;昇腾把每一层的门牌号(地址空间)直接印在 buffer 的类型上,搬东西必须写清『从几楼搬到几楼』。",
+   "quantified": "两层要分开数:.td(HIVMAttrs.td:L188-L194)定义 7 个(Zero=0/GM=1/L1=2/L0A=3/L0B=4/L0C=5/UB=6),但 pybind(ascend_ir.cc:L412-L417)只 .value() 导出 5 个(L1/UB/L0A/L0B/L0C)——Zero 与 GM 不进 Python。ascend_address_space_group 遍历的是 Python 侧 __dict__,故语言层只拿得到这 5 级,且都能 bl.alloc(原样透传,无白名单)。其中**能被边校验拦住的只有 UB 与 L1**(全仓 .space 比较仅 5 处:semantic.py:L104/L106、L123/L125、core.py:L300);L0C 仅是 fixpipe 的 docstring 契约(src 是无 .space 字段的 tl.tensor,校验不了);L0A/L0B 可 alloc 但无人比较。",
+   "figure_specs": [
+    {
+     "figure_id": "fig-ch05-mem-hierarchy",
+     "claim": "地址空间在语言层有四档待遇:.td 定义 7 级 → pybind 只导出 5 级(L1/UB/L0A/L0B/L0C,Zero 与 GM 不进 Python) → 边校验只拦得住 UB 与 L1 → L0C 仅是 fixpipe 的 docstring 契约(src 是无 .space 的 tl.tensor,校验不了)。两条显式搬运边:al.copy 覆盖 UB→{UB,L1}、al.fixpipe 覆盖 L0C(名义)→UB。",
+     "template": "layout",
+     "numbers": [
+      {
+       "label": "AddressSpace 成员数(.td 定义 / pybind 导出)",
+       "value": "7 / 5",
+       "provenance": "HIVMAttrs.td:L188-L194 定义 7 个;ascend_ir.cc:L412-L417 只 .value() 导出 5 个(L1/UB/L0A/L0B/L0C)"
+      },
+      {
+       "label": "语言层反射级数 / 被校验级数",
+       "value": "5 反射进语言层(L1/UB/L0A/L0B/L0C);其中 2 级被边校验(UB/L1)",
+       "provenance": "dossier.theory[0];code_spine copy/fixpipe 实际校验的地址空间"
+      },
+      {
+       "label": "al.copy 覆盖边",
+       "value": "UB → {UB, L1}",
+       "provenance": "third_party/ascend/language/cann/extension/semantic.py:L120-127 (copy dst∈{UB,L1})"
+      },
+      {
+       "label": "al.fixpipe 覆盖边",
+       "value": "L0C → UB",
+       "provenance": "third_party/ascend/language/cann/extension/core.py:L299-300 (dst 须 UB)"
+      }
+     ],
+     "caption_draft": "达芬奇内存金字塔在语言层的落地:能印进 buffer_type.space 的门牌号只有 pybind 导出的 5 个(UB/L1/L0A/L0B/L0C)——GM 在 MLIR 侧有、却没进 Python,故 kernel 里根本写不出 space=GM 的 buffer,片外那一跳不由这套门牌号表达;程序员用 al.copy(UB→UB/L1)与 al.fixpipe(L0C→UB)显式写出每一次搬运——这正是 ch02『显式搬运 GM→UB / UB→GM』在语言层的 API。基座 Triton 把这层全藏起来。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "M2",
+   "intuition": "bl.alloc 像在指定楼层订一张工作台:你说清『要多大、放什么、在几楼(地址空间)』,它就在那层物化一块内存,并给这块内存挂上『会被读也会被写』的标签(effects 注解)供下游 pass 分析依赖。基座 Triton 完全没有这道『显式订台』的手续。",
+   "quantified": "本例 3 次成功 alloc 各触发 3 个 builder 调用(get_target_attribute → alloc → effects 注解);is_mem_unique=True 时再加 1 个 mem_unique 注解(共 4)。alloc 的 IR 展开是 O(1),与 shape/dtype 无关——[64,128] 与 [8,8] 展开步数完全相同。",
+   "worked_example": {
+    "params": {
+     "cases": "fp32 [64,128]@UB / fp16 [16,32]@L1 / fp32 [8,8]@UB(mem_unique)/ int1 [8]@UB(拒)"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m2_alloc.json",
+    "table": {
+     "columns": [
+      "调用",
+      "地址空间",
+      "shape×dtype",
+      "builder 建的 memref_ty",
+      "注解",
+      "返回 / 报错"
+     ],
+     "rows": [
+      [
+       "bl.alloc(fp32,[64,128],UB)",
+       "UB",
+       "64×128 fp32",
+       "('buffer_ty',(64,128),fp32_ty,attr(UB))",
+       "effects=['write','read']",
+       "buffer.space=UB"
+      ],
+      [
+       "bl.alloc(fp16,[16,32],L1)",
+       "L1",
+       "16×32 fp16",
+       "('buffer_ty',(16,32),fp16_ty,attr(L1))",
+       "effects=['write','read']",
+       "buffer.space=L1"
+      ],
+      [
+       "bl.alloc(fp32,[8,8],UB,is_mem_unique)",
+       "UB",
+       "8×8 fp32",
+       "('buffer_ty',(8,8),fp32_ty,attr(UB))",
+       "mem_unique + effects=['write','read']",
+       "buffer.space=UB"
+      ],
+      [
+       "bl.alloc(int1,[8],UB)",
+       "UB",
+       "int1",
+       "—(未建 op)",
+       "—",
+       "TypeError: Unsupported alloc int1 type"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "alloc 返回的 buffer.space 恒等于传入的 _address_space(同一对象),effects 注解恒为 ['write','read'];int1 元素类型在建任何 op 之前即被拒。",
+    "argument": "semantic.alloc 把 address_space 原样存进 buffer_type.space,buffer 再把 buffer_type.space 原样暴露为 .space——中途无转换/拷贝分支,故是恒等映射;effects 注解无条件挂,不依赖任何输入;int1 判断在函数体最前(shape 校验前),命中即 raise,builder.calls 保持空——本例第 4 行 calls=[] 佐证。"
+   }
+  },
+  {
+   "mechanism_id": "M3",
+   "intuition": "al.copy 是一位严格的搬运工:交货前先逐条查『你从 UB 出发吗?终点是 UB 或 L1 吗?这台机器(910_95)支持吗?两头形状/类型一致吗?都是 buffer 不是 tensor 吗?』——任何一条不合格,当场退回并说明原因,绝不生成一条会在下游炸掉的非法搬运指令。旧接口 copy_from_ub_to_l1 更死板:终点只准 L1。",
+   "quantified": "copy 到 create_copy_buffer 前恒过 5 道 O(1) 校验(910 门禁 / 拒 tensor / shape 一致 / dtype 一致 / 地址空间方向);本例 9 次调用中 3 次成功建 op、6 次在校验阶段短路抛错,无一生成非法 IR。",
+   "worked_example": {
+    "params": {
+     "shape": "16×16 fp32",
+     "sweep": "src/dst 地址空间 × is_910_95 × tensor/buffer × shape 一致性"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m3_copy.json",
+    "table": {
+     "columns": [
+      "调用",
+      "src.space",
+      "dst.space",
+      "is_910_95",
+      "触发的校验判定",
+      "建 op / 报错"
+     ],
+     "rows": [
+      [
+       "copy",
+       "UB",
+       "UB",
+       "True",
+       "全通过",
+       "create_copy_buffer(handle#2,handle#5)"
+      ],
+      [
+       "copy",
+       "UB",
+       "L1",
+       "True",
+       "全通过",
+       "create_copy_buffer(handle#2,handle#5)"
+      ],
+      [
+       "copy",
+       "UB",
+       "L0C",
+       "True",
+       "dst∉{UB,L1}",
+       "TypeError: dst's AddressSpace must be UB or L1"
+      ],
+      [
+       "copy",
+       "L1",
+       "L1",
+       "True",
+       "src≠UB",
+       "TypeError: src's AddressSpace must be UB"
+      ],
+      [
+       "copy",
+       "UB",
+       "UB",
+       "False",
+       "芯片门禁",
+       "RuntimeError: only supported on Ascend910_95"
+      ],
+      [
+       "copy_from_ub_to_l1",
+       "UB",
+       "L1",
+       "True",
+       "全通过(旧接口,已弃用告警)",
+       "create_copy_buffer(handle#2,handle#5)"
+      ],
+      [
+       "copy_from_ub_to_l1",
+       "UB",
+       "UB",
+       "True",
+       "旧接口更严:dst≠L1",
+       "TypeError: dst's AddressSpace must be L1"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "builder.calls 里出现 create_copy_buffer,当且仅当 5 道校验全过(is_910_95 ∧ 皆 bl.buffer ∧ 同 shape ∧ 同 dtype ∧ src=UB ∧ dst∈{UB,L1});copy_from_ub_to_l1 的合法输入集是 copy 的真子集(dst 限 L1)。",
+    "argument": "五道校验按序短路,任一失败即 raise,create_copy_buffer 位于全部校验之后,故失败路径下 builder.calls 不含它——本例 6 个失败行 ops 皆为空即证。copy_from_ub_to_l1 与 copy 校验链逐行相同,仅 dst 条件从『∈{UB,L1}』收紧为『=L1』,故其放行集 ⊆ copy 的放行集。"
+   },
+   "figure_specs": [
+    {
+     "figure_id": "fig-ch05-copy-checks",
+     "claim": "al.copy 只放行 src=UB 且 dst∈{UB,L1};其余方向(UB→L0C、L1→任意)在语言层直接抛 TypeError,不生成 IR。",
+     "template": "state-table",
+     "numbers": [
+      {
+       "label": "UB→UB",
+       "value": "放行 → create_copy_buffer",
+       "provenance": "traces/m3_copy.json cases[0]"
+      },
+      {
+       "label": "UB→L1",
+       "value": "放行 → create_copy_buffer",
+       "provenance": "traces/m3_copy.json cases[1]"
+      },
+      {
+       "label": "UB→L0C",
+       "value": "拒:dst's AddressSpace must be UB or L1",
+       "provenance": "traces/m3_copy.json cases[2]"
+      },
+      {
+       "label": "L1→L1",
+       "value": "拒:src's AddressSpace must be UB",
+       "provenance": "traces/m3_copy.json cases[3]"
+      },
+      {
+       "label": "非 910_95",
+       "value": "拒:only supported on Ascend910_95",
+       "provenance": "traces/m3_copy.json cases[6]"
+      }
+     ],
+     "caption_draft": "al.copy 的地址空间放行矩阵:行=src、列=dst,绿格=建 create_copy_buffer,红格=语言层 TypeError。合法搬运方向被逐条 assert 在 Python 前端(而非硬件默默处理),错误在 trace 期就带可读原因抛出。旧接口 copy_from_ub_to_l1 是同矩阵里 dst 只留 L1 一列的更严子集。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "M4",
+   "intuition": "cube(矩阵单元)算完的结果堆在 L0C 上、且是为高效运算重排过的 Fractal NZ 分形布局,vector 侧和 GM 都看不懂。al.fixpipe 是一条专用传送带,把这堆半成品从 L0C 搬到 UB,顺路(dma_mode=NZ2ND)把分形布局还原成常规 ND——一次搬运兼做格式转换。上传送带前先验票:必须是 910_95、源必须是 tl.tensor(按约定来自 L0C,但 tl.tensor 无 .space 字段,前端校验不了)、目的必须是 UB 上的 buffer。",
+   "quantified": "fixpipe 前端对 32b 目的最多做 4 道对齐检查、16b 做 2 道,均 O(1);本例 2 次合法调用各建 1 个六参 create_fixpipe(dma/dual/quant/relu),4 次非法调用在结构校验阶段(src 类型 / dst 类型 / dst 须 UB / 芯片门禁)全部前置拦下,无一到达 create_fixpipe。",
+   "worked_example": {
+    "params": {
+     "valid": "NZ2ND fp32/fp16 [64,128]@UB",
+     "rejects": "src=buffer / dst=tensor / dst@L1 / is_910_95=False"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m4_fixpipe.json",
+    "table": {
+     "columns": [
+      "调用",
+      "src (应在 L0C)",
+      "dst (应在 UB)",
+      "首个失败校验",
+      "结果"
+     ],
+     "rows": [
+      [
+       "fixpipe(NZ2ND, fp32, [64,128])",
+       "tensor l0c-handle",
+       "buffer handle#2 @UB",
+       "—(全通过)",
+       "create_fixpipe(l0c-handle, handle#2, NZ2ND, NO_DUAL, NO_QUANT, NO_RELU)"
+      ],
+      [
+       "fixpipe(NZ2ND, fp16, [64,128])",
+       "tensor l0c-handle",
+       "buffer handle#2 @UB",
+       "—(全通过)",
+       "create_fixpipe(..., NZ2ND, NO_DUAL, NO_QUANT, NO_RELU)"
+      ],
+      [
+       "fixpipe(src=buffer)",
+       "buffer(非 tensor)",
+       "buffer @UB",
+       "src 须 tensor",
+       "TypeError: src is not of tensor type"
+      ],
+      [
+       "fixpipe(dst=tensor)",
+       "tensor l0c-handle",
+       "tensor(非 buffer)",
+       "dst 须 buffer",
+       "TypeError: dst is not of buffer type"
+      ],
+      [
+       "fixpipe(dst@L1)",
+       "tensor l0c-handle",
+       "buffer @L1",
+       "dst 须 UB",
+       "TypeError: dst must be located in the UB memory region"
+      ],
+      [
+       "fixpipe(is_910_95=False)",
+       "tensor l0c-handle",
+       "buffer @UB",
+       "芯片门禁",
+       "RuntimeError: only supported on Ascend910_95"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "create_fixpipe 恒以六参 (src, dst, dma_mode, dual_dst_mode, NO_QUANT, NO_RELU) 建——前端固定后两参,故量化/ReLU 融合在语言层永不开启;且到达 create_fixpipe 前必依次过芯片门禁 → src=tensor → dst=UB buffer → 对齐链。",
+    "argument": "前端 fixpipe 调 semantic.fixpipe 时把 pre_quant/pre_relu 硬编码为 NO_QUANT/NO_RELU(core.py:L331),六参签名的后两位无用户入口;结构校验(is_910_95 / isinstance src tensor / isinstance dst buffer / dst.space==UB)在对齐检查之前顺序短路,本例 4 个非法行均在此阶段抛错、create_fixpipe 从未被调用即证。"
+   },
+   "figure_specs": [
+    {
+     "figure_id": "fig-ch05-fixpipe-pipeline",
+     "claim": "al.fixpipe 把 L0C 上 cube 产出的 Fractal NZ 结果经 fixpipe 流水线搬到 UB 并转成 ND,校验通过后建六参 create_fixpipe op。",
+     "template": "flow",
+     "numbers": [
+      {
+       "label": "源",
+       "value": "L0C 上的 tl.tensor (Fractal NZ 布局)",
+       "provenance": "third_party/ascend/language/cann/extension/core.py:L286-289 docstring + L296 (src 须 tensor)"
+      },
+      {
+       "label": "目的",
+       "value": "UB 上的 bl.buffer",
+       "provenance": "third_party/ascend/language/cann/extension/core.py:L299-300 (dst 须 UB)"
+      },
+      {
+       "label": "布局变换",
+       "value": "NZ2ND (dma_mode 默认)",
+       "provenance": "traces/m4_fixpipe.json cases[0] create_fixpipe 第 3 参 = NZ2ND"
+      },
+      {
+       "label": "落 IR op 参数",
+       "value": "6 参: src, dst, NZ2ND, NO_DUAL, NO_QUANT, NO_RELU",
+       "provenance": "traces/m4_fixpipe.json cases[0]"
+      }
+     ],
+     "caption_draft": "fixpipe 是 L0C→其它内存层级的专用数据通路(本芯片系列仅支持 L0C→UB):cube 在 L0C 累加出 Fractal NZ 分形布局的结果,fixpipe 搬到 UB 途中按 dma_mode=NZ2ND 还原成常规 ND,使后续 vector/store 能按常规布局访问。语言层到 create_fixpipe(六参对应四组模式,前端固定 NO_QUANT/NO_RELU)为止;NZ→ND 的分形下降细节归 P5(ch23 HIVM 方言)。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "M7",
+   "intuition": "fixpipe 的对齐检查像一串安检门,一道比一道松的门先过、紧的门后卡:DMA 引擎一次搬固定粒度(32b 元素一拍 8 个、16b 一拍 16 个),所以末维 N 的元素数必须凑成整拍;换布局模式(非 NZ2ND)、列切分双目的、按列搬(NZ2DN)各自再加一道更严的模数门。凑不齐就当场报出差多少,而不是搬出一半错位数据。",
+   "quantified": "对齐链是常数步短路:32b 至多 4 道模检查(N%8 → 非NZ2ND:N%16 → 列切分:N%32 → NZ2DN:M%8),16b 至多 2 道(N%16 → NZ2DN:M%16);本例 10 组里 4 组全过、6 组各恰好命中 1 道门,如 fp32 [64,100] 卡在第 1 道(100%8=4≠0),改成 [64,128](128%8=0)即过。",
+   "worked_example": {
+    "params": {
+     "sweep": "dtype∈{fp32,fp16,bf16} × dma_mode∈{NZ2ND,NZ2NZ,NZ2DN} × dual∈{NO_DUAL,COLUMN_SPLIT} × (M,N)",
+     "note": "每组的 (M,N) 特意选成能清掉前面所有门、只卡住被测那一道"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m7_align.json",
+    "table": {
+     "columns": [
+      "dtype",
+      "dma_mode",
+      "dual_dst",
+      "M",
+      "N",
+      "决定性模数检查",
+      "结果"
+     ],
+     "rows": [
+      [
+       "fp32",
+       "NZ2ND",
+       "NO_DUAL",
+       "64",
+       "128",
+       "N%8=0",
+       "pass → create_fixpipe"
+      ],
+      [
+       "fp32",
+       "NZ2ND",
+       "NO_DUAL",
+       "64",
+       "100",
+       "N%8=4",
+       "ValueError: 32b Fixpipe last dim must be aligned to 8"
+      ],
+      [
+       "fp32",
+       "NZ2NZ",
+       "NO_DUAL",
+       "64",
+       "136",
+       "N%8=0, N%16=8 (非NZ2ND)",
+       "ValueError: 32b non-NZ2ND Fixpipe last dim must be aligned to 16"
+      ],
+      [
+       "fp32",
+       "NZ2ND",
+       "COLUMN_SPLIT",
+       "64",
+       "104",
+       "N%8=0, N%32=8 (列切分)",
+       "ValueError: 32b Column split dual Fixpipe last dim must be aligned to 32"
+      ],
+      [
+       "fp32",
+       "NZ2DN",
+       "NO_DUAL",
+       "100",
+       "128",
+       "N%8=0, M%8=4 (NZ2DN)",
+       "ValueError: 32b NZ2DN Fixpipe first dim must be aligned to 8"
+      ],
+      [
+       "fp32",
+       "NZ2DN",
+       "NO_DUAL",
+       "64",
+       "128",
+       "N%8=0, M%8=0",
+       "pass → create_fixpipe"
+      ],
+      [
+       "fp16",
+       "NZ2ND",
+       "NO_DUAL",
+       "64",
+       "128",
+       "N%16=0",
+       "pass → create_fixpipe"
+      ],
+      [
+       "fp16",
+       "NZ2ND",
+       "NO_DUAL",
+       "64",
+       "100",
+       "N%16=4",
+       "ValueError: 16b Fixpipe last dim must be aligned to 16"
+      ],
+      [
+       "bf16",
+       "NZ2DN",
+       "NO_DUAL",
+       "100",
+       "128",
+       "N%16=0, M%16=4 (NZ2DN)",
+       "ValueError: 16b NZ2DN Fixpipe first dim must be aligned to 16"
+      ],
+      [
+       "bf16",
+       "NZ2DN",
+       "NO_DUAL",
+       "64",
+       "128",
+       "N%16=0, M%16=0",
+       "pass → create_fixpipe"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "对齐检查有限且无循环(32b 至多 4 道、16b 至多 2 道 if),必在常数步内终止;通过全链 ⇒ 目的形状满足该 dtype/模式下所有适用的模数约束。",
+    "argument": "每道门只查一个模数(N%8 / N%16 / N%32 / M%8 或 M%16),通过才进下一道,任一失败即 raise;因门数固定且无回边,过程常数步终止。反向:能到达 semantic.fixpipe 意味着所有 if 条件均未触发 raise,即所有适用模数约束成立——本例 4 个 pass 行的 N/M 对各自 dtype 的模数全为 0 即佐证。"
+   }
+  }
+ ]
+}
