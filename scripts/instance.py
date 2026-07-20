@@ -10,6 +10,8 @@ CLI:  python3 scripts/instance.py [name|dir|artifacts|chapters|diagrams|source|c
 """
 import json
 import os
+import re
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -23,8 +25,32 @@ def _registry():
         return {}
 
 
+_ARGV_INSTANCE_RE = re.compile(r'(?:^|/)instances/([A-Za-z0-9._-]+)/')
+
+
+def name_from_argv(argv=None):
+    """从命令行参数里的 `instances/<name>/…` 路径推断实例名,推不出返回 None。
+
+    动机(exp-2026-07-20-03):linter 常被显式喂一个章目录,而 canonical_prefixes 在 import 期
+    就定死了。若此时 active_instance 指向另一本书,前缀完全对不上——lint_fidelity 会报
+    「真实源码引用仅 0 处」这种**假 BLOCKING**(triton-ascend 的章 + vllm 的前缀实测如此)。
+    命令行里那个路径才是调用者真正的意图,故让它压过全局 active_instance。
+    要求形如 instances/<name>/ 的真路径(后面必须还有一层),裸词 "instances" 不算。
+    """
+    for a in (argv if argv is not None else sys.argv[1:]):
+        if not isinstance(a, str) or a.startswith('-'):
+            continue
+        m = _ARGV_INSTANCE_RE.search(a.replace('\\', '/'))
+        if m:
+            return m.group(1)
+    return None
+
+
 def active_name():
-    return os.environ.get("REPO2BOOK_INSTANCE") or _registry().get("active_instance") or "vllm"
+    return (os.environ.get("REPO2BOOK_INSTANCE")
+            or name_from_argv()
+            or _registry().get("active_instance")
+            or "vllm")
 
 
 def instance_dir(name=None):
