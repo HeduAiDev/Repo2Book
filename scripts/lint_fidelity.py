@@ -176,13 +176,115 @@ def _spans_missing_source(pyfile: Path):
     return out
 
 
+# ── citation_range(exp-2026-07-20-01):正文 ```python 块的 `# path:La-Lb` 区间须真对应 ──
+# 背景:此前只验「引文出现在所指文件中」,不验 [a,b] 精确性,vLLM ch31 三处区间错全部漏过
+# (L94-98 应 L72-74 / L286-295 应 L286-296 / L1358-1369 应 L1359-1372,起点还落在空行上)。
+# 与 lint_dossier 的 embed_verbatim 同款口径:空白归一 + 省略号感知 + 有序子序列。
+_CITE_RE = re.compile(r'^#\s*([\w./-]+\.\w+):L(\d+)(?:\s*-\s*L?(\d+))?\s*$')
+_FENCE_RE = re.compile(r'```(?:python|py)\n(.*?)```', re.S)
+_NOTE_RE = re.compile(r'^\s*(?:#|//)\s*(?:\u2026|\.{3})')
+
+
+_CMT_RE = re.compile(r'^\s*(?:#|"""|\'\'\'|//)')
+
+
+def _cite_dedent(lines):
+    """去公共缩进:正文引文常为可读性整体去缩进,相对缩进仍保留。"""
+    ind = [len(x) - len(x.lstrip()) for x in lines if x.strip()]
+    if not ind:
+        return lines
+    k = min(ind)
+    return [x[k:] if x.strip() else x for x in lines]
+
+
+def _cite_source_root(chapter_dir: Path):
+    for q in Path(chapter_dir).resolve().parents:
+        if q.name == "artifacts":
+            return q.parent / "source"
+    return None
+
+
+def _cite_norm(line: str) -> str:
+    line = line.expandtabs().rstrip()
+    # 本书惯例:内嵌源码常把行尾英文注释译成中文——剥掉行尾注释再比对代码本体
+    # (只剥引号外的 '#';简化处理:行内引号数为偶数时才认作注释起点)
+    hp = line.find('#')
+    while hp > 0:
+        seg = line[:hp]
+        if seg.count('"') % 2 == 0 and seg.count("'") % 2 == 0:
+            line = seg.rstrip()
+            break
+        hp = line.find('#', hp + 1)
+    m = re.match(r'^(\s*)(.*)$', line)
+    return m.group(1) + re.sub(r'\s+', ' ', m.group(2))
+
+
+def _check_citation_ranges(chapter_dir, narrative_text: str):
+    """逐个 ```python 块:若首行是 `# path:La-Lb`,把块体与源码 [a,b] 行比对。
+    容忍:空白归一、`# …` 省略行、块体是区间的有序子序列(analyst 抽行)。
+    源文件不存在 → 跳过(可能是基座/外部引用,由别的检查管)。"""
+    src = _cite_source_root(chapter_dir)
+    if src is None or not src.exists():
+        return []
+    issues, cache = [], {}
+    for body in _FENCE_RE.findall(narrative_text or ""):
+        lines = body.split("\n")
+        if not lines:
+            continue
+        m = _CITE_RE.match(lines[0].strip())
+        if not m:
+            continue
+        rel, a = m.group(1), int(m.group(2))
+        b = int(m.group(3)) if m.group(3) else a
+        fp = src / rel
+        if not fp.exists():
+            continue
+        if rel not in cache:
+            cache[rel] = fp.read_text(encoding="utf-8", errors="replace").splitlines()
+        pin = cache[rel]
+        tag = f"{rel}:L{a}" + (f"-L{b}" if b != a else "")
+        if b > len(pin):
+            issues.append(f"  引文区间越界 {tag}(文件共 {len(pin)} 行)")
+            continue
+        region = _cite_dedent([_cite_norm(x) for x in pin[a - 1:b]])
+        quoted = _cite_dedent([_cite_norm(x) for x in lines[1:]
+                               if not _NOTE_RE.match(_cite_norm(x))])
+        # 本书惯例:内嵌源码常把英文注释译成中文——纯注释行不参与比对
+        region = [x for x in region if not _CMT_RE.match(x)]
+        quoted = [x for x in quoted if not _CMT_RE.match(x)]
+        while quoted and not quoted[-1].strip():
+            quoted.pop()
+        if not quoted:
+            continue
+        # 起点必须严格对齐:区间首行即引文首行(catch『区间起点落在空行/整体偏移』)
+        if region and quoted and region[0] != quoted[0]:
+            issues.append(
+                f"  引文区间起点不对齐 {tag}:区间首行 {region[0].strip()[:50]!r} "
+                f"≠ 引文首行 {quoted[0].strip()[:50]!r}(起点标早/标晚,或落在空行上)")
+            continue
+        # 有序子序列匹配(容忍抽行);非空行必须按序落在区间内
+        pi = 0
+        for q in quoted:
+            if not q.strip():
+                continue
+            while pi < len(region) and region[pi] != q:
+                pi += 1
+            if pi >= len(region):
+                issues.append(
+                    f"  引文与标注区间不符 {tag}:第 {quoted.index(q) + 1} 行 {q.strip()[:60]!r} "
+                    f"在该区间内按序找不到(区间标错/起点落在空行/末行超界)")
+                break
+            pi += 1
+    return issues
+
+
 def lint_fidelity(chapter_dir: str) -> dict:
     d = Path(chapter_dir)
     impl = d / "implementation"
     narrative = d / "narrative" / "chapter.md"
     res = {"missing_source": [], "invention": [], "narrative_grounding": [],
            "over_subtraction": [], "no_subtraction": [],
-           "elision_gap": [], "non_adjacent_splice": []}
+           "elision_gap": [], "non_adjacent_splice": [], "citation_range": []}
     # rglob：递归扫子目录——与真实源码同构的 backend/ 等子目录布局应被支持（顶层 glob 会漏判）。
     pyfiles = [p for p in impl.rglob("*.py") if p.name != "__init__.py"] if impl.exists() else []
     subtraction_seen = False
@@ -205,6 +307,7 @@ def lint_fidelity(chapter_dir: str) -> dict:
         if comp_refs > vllm_refs:
             res["narrative_grounding"].append(
                 f"  叙事引用精简版({comp_refs}) 多于真实源码({vllm_refs}) — 喧宾夺主")
+        res["citation_range"] += _check_citation_ranges(d, nt)
         gap_issues, splice_issues = _check_elision(d, nt)
         res["elision_gap"] += gap_issues
         res["non_adjacent_splice"] += splice_issues
@@ -235,9 +338,11 @@ def print_report(res: dict, chapter_dir: str) -> int:
     if total == 0:
         print("✓ 保真度检查全部通过！")
         return 0
+    _WARN_KEYS = {"elision_gap", "non_adjacent_splice", "citation_range"}
     for k, issues in res.items():
         if issues:
-            print(f"\n❌ {k} ({len(issues)}):")
+            mark = "⚠️ " if k in _WARN_KEYS else "❌"
+            print(f"\n{mark} {k} ({len(issues)}):")
             for i in issues:
                 print(i)
     # elision_gap / non_adjacent_splice：lint-exp-002 落地时对全书语料(vllm + vllm-ascend
@@ -245,6 +350,12 @@ def print_report(res: dict, chapter_dir: str) -> int:
     # BLOCKING（根因：dossier `elide` 字段在真实写作里常用来说明"代码已展示但正文不
     # 展开讨论的旁支"，并非总是"内容被裁掉"，启发式无法完全区分两种用法）。按
     # HARD RULE 防回归要求降级为非阻断提示，先跑几轮观察真实误报率，稳定后再考虑收紧。
+    # citation_range（exp-2026-07-20-01）：正文 ```python 块的 `# path:La-Lb` 区间校验。
+    # 上线前按 exp-0713-3 纪律做了全语料 oracle 对表（vllm + triton + triton-ascend 全部章节）：
+    # 已做 dedent 归一、纯注释行剔除、行尾注释剥离后仍报 786 处 / 81 章——存量语料的引文
+    # 区间普遍不够精确（也可能仍有本书写作惯例未被启发式覆盖）。按防回归要求**降级为警告**，
+    # 与 elision_gap 同档；它在新章上有效（ch31 三处真实区间错正是这一类，修好后本检查全绿）。
+    # 收紧为 blocking 需先做一轮存量清理 + 假阳逐条解释。
     blocking = (len(res["missing_source"]) + len(res["invention"])
                 + len(res["narrative_grounding"]) + len(res["over_subtraction"]))
     print(f"\n{'=' * 60}")
