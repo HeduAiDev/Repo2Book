@@ -76,8 +76,12 @@ def lint_source_grounding(chapter_dir: str) -> dict:
             refs = vllm_ref_pattern.findall(sec)
             refs_per_section[title] = len(refs)
 
-        # Meta sections that don't need source refs
-        meta_patterns = [r'验证', r'总结', r'这章要做什么', r'^#\s*第\d+章']
+        # Meta sections that don't need source refs.
+        # `^#\s` = 开篇块(H1 + hook + roadmap + 本章地图)——正文小节都是 `## ` 起,故单个 `#`
+        # 唯一标识开篇块。原写法 `^#\s*第\d+章` 要求「第」后紧跟数字,而全书 H1 实际是
+        # `# 第 39 章　标题`(带空格)、triton-ascend 更是自然标题,从来匹配不上 →
+        # 开篇 hook 只要没碰巧提到某个源码文件就吃假 BLOCKING(9/39 章中招,exp-2026-07-20-05)。
+        meta_patterns = [r'验证', r'总结', r'这章要做什么', r'^#\s']
         sections_without_refs = [
             t for t, n in refs_per_section.items()
             if n == 0 and not any(re.search(p, t) for p in meta_patterns)
