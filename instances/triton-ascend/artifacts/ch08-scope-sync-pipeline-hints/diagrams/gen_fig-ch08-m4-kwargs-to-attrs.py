@@ -29,7 +29,7 @@ PAD, TOP = 40, 96
 LEFT_W, RIGHT_W, GAP, TC_W = 470, 560, 16, 96
 ROW_H = 42
 w = PAD * 2 + LEFT_W + GAP + RIGHT_W + GAP + TC_W
-h = TOP + ROW_H * len(ROWS) + 96
+h = TOP + ROW_H * len(ROWS) + 116
 
 L = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}">',
      f'<rect width="{w}" height="{h}" fill="white"/>',
@@ -81,9 +81,12 @@ fy2 = fy1 + 20
 L.append(f'<text x="{PAD}" y="{fy1}" font-family="sans-serif" font-size="12.5" '
           f'font-weight="bold" fill="#0f172a">'
           f'{esc("带 tcore_type 的用例：6 / 10 —— 上表十行即全部用例，右列「✓ 有」正好 6 行。")}</text>')
-L.append(f'<text x="{PAD}" y="{fy2}" font-family="sans-serif" font-size="11" '
-          f'fill="#c2410c">'
-          f'{esc("⚠ 标记的 4 行不报任何错误——core_mode 拼错、用位置参数、传变量或 list，都会让 tcore_type 悄悄消失。")}</text>')
+# ⚠ 四行的「后果」分两类：前三行丢的是 tcore_type，末行丢的是 my_list 这一项本身
+for k, line in enumerate([
+        "⚠ 标记的 4 行都不报任何错误：core_mode 拼错、写成位置参数、传变量这 3 行，让 tcore_type 悄悄消失；",
+        "传 list 那行 tcore_type 照常落地（core_mode=\"cube\" 是 ast.Constant，照样过滤器），悄悄消失的是 my_list 这一项。"]):
+    L.append(f'<text x="{PAD}" y="{fy2+k*19}" font-family="sans-serif" font-size="11" '
+              f'fill="#c2410c">{esc(line)}</text>')
 L.append('</svg>')
 out = Path(__file__).with_name("fig-ch08-m4-kwargs-to-attrs.svg")
 out.write_text('\n'.join(L), encoding="utf-8")
