@@ -31,6 +31,18 @@ LEAK = re.compile(
     r'|\bimpl-notes\b'
     r'|\bdossier\.json\b'
     r'|instances/[\w-]+/source/'
+    # ↓ 内部产物名/机制编号的**裸用法**(不带斜杠)——exp-2026-07-21-14。
+    # 原规则要求 `explainer/` 带斜杠,于是 ch09 图上的
+    # 「halo 代价(与正文/explainer m15 逐字一致)」判绿:那是作图者写给评审看的
+    # 自证话术被烤进了出版物,由**独立盲审**(非作者自审)才抓出来。
+    # 全语料 881 张 SVG oracle:仅 2 处命中,均为真阳(另一处是 ch37 图上的
+    # 「dossier honest_gaps 第 2 条」),假阳 0。
+    r'|\bexplainer\b'
+    r'|\bdossier\b'
+    r'|\brun-ledger\b'
+    r'|\bfigure-manifest\b'
+    r'|\bfigure-spec\b'
+    r'|\bm\d{2}-[a-z][\w-]*'
 )
 TEXTNODE = re.compile(r'<text[^>]*>(.*?)</text>', re.S)
 TAG = re.compile(r'<[^>]+>')

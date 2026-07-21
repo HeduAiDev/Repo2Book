@@ -53,6 +53,12 @@ python3 scripts/lint_paper_grounding.py {chapter_dir}    # primer 原理章:# PA
 python3 scripts/lint_chapter_map.py {chapter_dir} --require   # 本章地图:§徽标↔标题/符号防杜撰/画布预算/开篇位置+选读指引
 python3 scripts/lint_anchors.py --all   # 章内锚点+跨章三规(目标存在/文字号一致/../../ 深度)    python3 scripts/lint_punct.py --all   # 半角标点
 python3 scripts/lint_diagram_geometry.py --all   # 图：文字越界/相撞/压框/箭头悬空（--all 走活动实例）
+python3 scripts/lint_diagram_scaffolding.py --all   # 图面脚手架泄漏（内部路径 + 内部产物名/机制编号的裸用法）
+#   ⚠️ 两个 --all 都只扫**活动实例**：换实例前先对旧实例显式跑一遍（exp-2026-07-21-14：
+#   vllm-ascend ch37 三处图面泄漏就是这样长期照不到的，其中两处旧正则本就能抓）。
+#   ⚠️ 图上「压框/相撞」有 rect-rect 盲区且**补不上**（exp-2026-07-21-13 负结果）——
+#   靠 illustrator 契约的「渲染→Read PNG 亲眼看→自查」兜，别指望 linter。
+#   ⚠️ 盲审必须**独立**：作图者自审天然看不见自己写的自证话术（ch09 就这么漏了一条泄漏）。
 python3 scripts/lint_chapter_map.py --all   # 全书章图徽标↔标题一致（重编号后必跑：exp-2026-07-20-02 曾 7 章图印旧节号而 --all 全绿）
 ```
 机械问题让 writer 定点小修，不退整章。
