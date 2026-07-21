@@ -131,9 +131,10 @@ L.append(f'<text x="{BUS_X-8}" y="{y_conv-10}" text-anchor="end" font-family="sa
           f'font-size="11" fill="#047857">{esc("五路成功分派出的属性在此汇入")}</text>')
 
 y = y_mark
-box(y, 48, [("create_annotation_mark(ptr.handle, hint_name, attr)", False),
+box(y, 60, [("create_annotation_mark(ptr.handle, hint_name, hint_val)", False),
+            ("此时 hint_val 已被五路分派重绑为 MLIR 属性，变量名未变", True),
             ("→ annotation::MarkOp + setAttr", True)], "#ecfdf5", "#047857")
-y2 = y + 48
+y2 = y + 60
 L.append(f'<text x="{CX}" y="{y2+18}" text-anchor="middle" font-family="sans-serif" '
           f'font-size="10.5" fill="#4d7c0f">{esc("ascend_ir.cc:L597-L603——落地的是旁挂标记 op，原 op 不改")}</text>')
 
@@ -148,8 +149,8 @@ L.append(f'<text x="{PAD+18}" y="{side_y+22}" font-family="sans-serif" font-size
 for k, (txt, col, indent) in enumerate([
         ("SIMT 模式下 compile_hint 早退，0 个 mark；但 multibuffer 直呼 compile_hint_impl，仍发 1 个 hivm.multi_buffer=2:i32", "#475569", 0),
         ("——生效中的门控只写在 compile_hint 里（aux_ops.py:L137-L139）；compile_hint_impl 里那份是注释掉的 FIXME（L115-L118），不拦任何东西", "#c2410c", 0),
-        ("——constexpr 一路同理：公开入口 L146-L150 先无条件解包——值是 str 时 impl 没有 str 分支 ⇒ ValueError；", "#6d28d9", 0),
-        ("值是 int/list 时则改走 int/list 一路。因此 impl 的 constexpr 分支（get_str_attr）只有直呼 impl 才走得到", "#6d28d9", 22)]):
+        ("——constexpr 一路同理：公开入口 L146-L150 先按真值解包（值为假时短路不解）——值是非空 str 时 impl 没有 str 分支 ⇒ ValueError；", "#6d28d9", 0),
+        ("值是非零 int / 非空 list 时则改走 int/list 一路。因此 impl 的 constexpr 分支（get_str_attr）只有直呼 impl 才走得到", "#6d28d9", 22)]):
     L.append(f'<text x="{PAD+18+indent}" y="{side_y+42+k*19}" font-family="sans-serif" font-size="11" '
               f'fill="{col}">{esc(txt)}</text>')
 
