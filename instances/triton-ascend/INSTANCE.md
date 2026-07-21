@@ -45,8 +45,8 @@
   仿射 tiled dataflow），bishengir 部分闭源（边界≈基座的 ptxas）。
 - ✅ **大纲已获用户审批（2026-07-18「同意」）**：33 章 / 7 Part（outline-final.json）+ ARCHITECTURE.md，
   开始逐章发车。roadmap.py 生成器已建并验（7 Part 窄长条 5.17:1，4 调用/几何/Read-PNG 通过）。
-- 🚗 **施工中（2026-07-20 状态）**：ch01/ch02/ch03/ch04/ch05 已定稿提交；ch06 在跑；
-  ch07 无正文（早前 test-exhausted 逃生舱，需重发）；ch08-ch33 未开工。
+- 🚗 **施工中（2026-07-21 状态）**：**ch01–ch07 已全部定稿提交并归档**（Part 1 完 + Part 2 语言层
+  已出 ch04/ch05/ch06/ch07）；ch08-ch33 未开工。下一章 ch08 按 outline-final.json 发车。
   发车须 scriptPath（workflow-byname-stale-snapshot）+ 显式 instance:"triton-ascend"（护栏）。
 
 ## 本书已踩过的坑（发车/写作前先看这条）
@@ -64,3 +64,14 @@
 - **linter 批量扫要用退出码**，别 grep 输出里的 `BLOCKING`：`🟢 仅警告（无 BLOCKING）` 会被误判成红。
 - 跨实例 linter 已修（exp-2026-07-20-03）：显式传章节路径时按路径定实例，**不必**再带
   `REPO2BOOK_INSTANCE=triton-ascend`。
+- **IR 算子名带方言前缀 `ascend.`,不是 `tt.`**：`TT_Ascend_Op` 绑定 `TritonAscend_Dialect`，
+  其 `let name = "ascend"` → 打印出来是 `ascend.indirect_load` / `ascend.index_select_simd`。
+  ch06 曾把 `tt.indirect_load` 写进正文+两张图+explainer+traces 共 6 处文件；正文改对后，
+  `lint_chapter_map` 的「杜撰符号」检查才把图里的错名暴露出来（此前靠正文那一格互相兜底）。
+- **「同名同签名、返回值语义被悄改」是 lint_fidelity 的盲区**：ch06 内嵌的 `gather.py` 被改了一行
+  （`* K + k_offs` → `* N + n_offs`，把对的改成错的）；ch07 精简版 `constexpr.__eq__` 标着「节选」
+  却把 `constexpr(...)` 包装改成裸 bool。**两次都是人工评审抓出来的**——`# SOURCE:` 标注只保证
+  「出处存在」，不保证「逐字未改」。写/改精简版与内嵌引文时，请拿 `sed -n 'a,bp' <pin 文件>` 对眼。
+- **归档不要漏章**：ch05 曾正文提交（9e5a02bd）却没派归档，Bible/trace 里一直没有它，
+  直到写 ch06/ch07 归档时对照 `state.json` 的章号序列（ch01–04 后直接跳 ch06）才发现。
+  **每章提交前顺手核一眼 `python3 -c "import json;print(sorted(json.load(open('instances/triton-ascend/trace/state.json'))['chapters']))"`。**
