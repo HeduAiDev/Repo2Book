@@ -182,7 +182,10 @@ def _spans_missing_source(pyfile: Path):
 # 与 lint_dossier 的 embed_verbatim 同款口径:空白归一 + 省略号感知 + 有序子序列。
 _CITE_RE = re.compile(r'^#\s*([\w./-]+\.\w+):L(\d+)(?:\s*-\s*L?(\d+))?\s*$')
 _FENCE_RE = re.compile(r'```(?:python|py)\n(.*?)```', re.S)
-_NOTE_RE = re.compile(r'^\s*(?:#|//)\s*(?:\u2026|\.{3})')
+# 省略标记行:①`# …` / `// …` 注释式;②**整行只有一个 `…`**(docstring 中段常这么省)。
+# ② 只认 U+2026,不认裸 `...`——后者是合法 Python(Ellipsis,`def f(): ...`),豁免它会掩盖真实不符。
+# (exp-2026-07-20-07:裸 `…` 漏网产生的噪音,正是 citation_range 被迫降为 warn 的原因之一。)
+_NOTE_RE = re.compile(r'^\s*(?:(?:#|//)\s*(?:\u2026|\.{3})|\u2026\s*$)')
 
 
 _CMT_RE = re.compile(r'^\s*(?:#|"""|\'\'\'|//)')
