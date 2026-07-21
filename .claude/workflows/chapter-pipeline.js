@@ -251,6 +251,28 @@ writeV = await agent(
 if (!writeV) return { chapter: A.chapter_id, escalated: 'write-failed', stage: 'Write', note: 'writer 多轮失败(限流/崩溃)，无 chapter.md，不进评审' }
 if (writeV && writeV.status === 'BLOCKED') return { escalated: 'write', stage: 'Write', reason: writeV.blocker_reason }
 
+// ---------- Phase D1.5: 落盘断言（exp-2026-07-21-01）----------
+// writer 返回 status=OK 不等于 chapter.md 真在盘上：ch09 就出现过 writer 报 OK、
+// 文件却还没落地（被隔离守卫拦去 tmp / 写到一半），下游 Review 各维遂对着不存在的
+// 文件评审，整条尾巴（Review/Map/Archive）白跑且无产物。workflow 沙箱无文件系统 API，
+// 只能借一个「只跑 bash、不做判断」的 agent 把 wc -c 的结果带回来。
+const landed = await agent(
+  '只做一件事，不要读文件内容、不要评价、不要修改任何东西：\n' +
+  '运行 `wc -c < ' + CH + '/narrative/chapter.md` 并把结果带回。\n' +
+  '- 文件不存在、或字节数 < 2000（正文不可能这么短）→ status=BLOCKED，' +
+  'blocker_reason 写实际情况（不存在 / 实际字节数）。\n' +
+  '- 否则 status=OK，note 写字节数。',
+  { schema: STATUS_SCHEMA, label: 'write-landed', phase: 'Write', agentType: 'general-purpose', model: MODELS.blind }
+)
+if (!landed || landed.status === 'BLOCKED') {
+  return {
+    chapter: A.chapter_id, escalated: 'write-not-landed', stage: 'Write',
+    reason: (landed && landed.blocker_reason) || 'chapter.md 落盘断言 agent 失败',
+    note: 'writer 报 OK 但 chapter.md 未落盘/过短——不进评审，Lead 需确认 writer 是否被隔离守卫拦到 tmp 中转区'
+  }
+}
+log('chapter.md 已落盘：' + (landed.note || ''))
+
 // ---------- Phase D2: 按需补图（2026-07-13 定图权归 writer：writer 提 requests → illustrator 画/删 → 盲审 → writer 插引用） ----------
 if (writeV.figure_requests > 0) {
   log('writer 提出 ' + writeV.figure_requests + ' 条图集变更，进入按需补图')
