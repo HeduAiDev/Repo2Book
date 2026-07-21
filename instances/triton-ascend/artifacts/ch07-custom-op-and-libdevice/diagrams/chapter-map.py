@@ -11,7 +11,7 @@ illustrator 契约,**禁用 §N.M 徽标**,站牌一律改用标题词本身的�
   泳道 0:自定义算子——register_custom_op 注册 → custom_semantic 六步调用
          (内部分支:_get_op_class 命中/未命中→_builtin_custom_op 哑类兜底)
          → _index_select 真实样例(__init__ 十一断言 + arg_type 动态定型)
-         → _make_attrs(core/pipe/mode 翻三条 hivm 属性)→ 最终 emit 的 hivm.CustomOp。
+         → _make_attrs(core/pipe/mode 翻三条 hivm 属性)→ 最终 emit 的 hivm.custom。
          列序是真实调用顺序(_index_select 先实例化,_make_attrs 才用它建属性)——
          **这与正文四个自然标题的先后顺序不完全相同**:正文顺序是"注册这道门"(L19)
          →"从名字到 IR"(L94)→"core/pipe/mode"(L195)→"真实的注册样例"(L274),
@@ -100,7 +100,7 @@ NODES = [
     ("dummy",     0, 1, 2, "_builtin_custom_op",  "未命中+__builtin_前缀→现造哑类", "从名字到 IR"),
     ("idxsel",    0, 2, 0, "_index_select",       "__init__十一断言+arg_type动态定型", "真实的注册样例"),
     ("attrs",     0, 3, 0, "_make_attrs",         "core/pipe/mode→三条hivm属性",   "core / pipe / mode"),
-    ("emitir",    0, 4, 0, "hivm.CustomOp",       "由 _builder.create_custom_op 建出", "从名字到 IR"),
+    ("emitir",    0, 4, 0, "hivm.custom",         "由 _builder.create_custom_op 建出", "从名字到 IR"),
 
     ("libdev",    1, 0, 0, "libdevice.py",        "37函数四类形态,__hmf_共66处",   "四类形态的拼装"),
     ("extdisp",   1, 1, 0, "extern_elementwise",  "dtype元组查表,查不到就报错",     "菜单的边界"),

@@ -22,7 +22,7 @@ STEPS = [
     (0, 0, ["③ _init_op → __init__ 断言 + arg_type 定型（src_rank=2, idx_rank=1）"]),
     (0, 2, ["④ _to_operands/_args_to_operands → outputs=1，inputs=10",
             "_make_attrs/_make_arg_attrs → attrs=4，arg_attrs=9 槽"]),
-    (0, 2, ["⑤ _builder.create_custom_op → emit 1 条 hivm.CustomOp（ttadapter 阶段）"]),
+    (0, 2, ["⑤ _builder.create_custom_op → emit 1 条 hivm.custom（ttadapter 阶段）"]),
     (2, 0, ["⑥ _to_result 按 out 类型把结果包回 tl.tensor（1 个）"]),
 ]
 
@@ -92,7 +92,7 @@ for i, (fr, to, labels) in enumerate(STEPS):
 
 foot_y = h - 12
 L.append(f'<text x="{PAD}" y="{foot_y}" font-family="sans-serif" font-size="11.5" '
-          f'fill="#64748b">{esc("三条泳道走完：10 个输入操作数、1 个输出、4 条属性（另 9 个 arg_attrs 槽=signature 形参数）落成 1 条 hivm.CustomOp。")}</text>')
+          f'fill="#64748b">{esc("三条泳道走完：10 个输入操作数、1 个输出、4 条属性（另 9 个 arg_attrs 槽=signature 形参数）落成 1 条 hivm.custom。")}</text>')
 
 L.append('</svg>')
 out = Path(__file__).with_name('fig-ch07-02-custom-semantic-swimlane.svg')

@@ -14,7 +14,7 @@
 
 这一章就顺着这两条线走：先把「注册」这道门从头拆到尾，再回头看昇腾的 libdevice 到底是怎么拼出来的——它比想象中厚得多。
 
-![本章地图：源码剖面沿两条泳道展开——上半程注册路线从 register_custom_op 经 custom_semantic、_index_select、_make_attrs 走到 hivm.CustomOp，下半程 libdevice 路线在 libdevice.py 与 extern_elementwise 之间来回查表，两条路线末尾收束成「注册是开集，点菜是闭集」的对照](../diagrams/chapter-map.png)
+![本章地图：源码剖面沿两条泳道展开——上半程注册路线从 register_custom_op 经 custom_semantic、_index_select、_make_attrs 走到 hivm.custom，下半程 libdevice 路线在 libdevice.py 与 extern_elementwise 之间来回查表，两条路线末尾收束成「注册是开集，点菜是闭集」的对照](../diagrams/chapter-map.png)
 
 只想弄清「自带菜谱」怎么注册进框架，读「注册这道门」「从名字到 IR」「`core`/`pipe`/`mode`」「一个真实的注册样例」这四节就够；只关心昇腾的数学库怎么拼、跟基座的点菜路线差在哪，直接跳「libdevice」「菜单的边界」「最后一层」三节；不挑读法，按顺序走下来，两条路线会在「小结」一节拧成同一句对照。
 
@@ -142,7 +142,7 @@ def custom(name: str, *args, _builder=None, **kwargs):
 3. **实例化**。`_init_op` 用实参真的构造一个算子实例出来。这一步会跑 `__init__`，也就是**跑那个类自己写的形状与 dtype 校验**。注册期只查了四要素，真正的参数合法性是在这里查的，而且用的是算子作者自己写的断言。
 4. **摊成操作数**。`out` 从关键字参数里 `pop` 出来（可以是单个也可以是列表），转成输出操作数（operand，即 IR 指令的实参句柄）；其余实参按注册期抄下的签名逐个转成输入操作数。
 5. **造属性**。`_make_attrs` 造整条指令级的属性，`_make_arg_attrs` 造每个参数各自的属性（比如对齐维度）。
-6. **emit**。`_builder.create_custom_op(...)` 建出一条 `hivm.CustomOp`——`hivm` 是昇腾硬件 IR 方言的前缀，讲双 builder 的那一章建立过；这条指令落在 ttadapter 阶段的 IR 里。最后 `_to_result` 按 `out` 的类型把结果包回张量。
+6. **emit**。`_builder.create_custom_op(...)` 建出一条 `hivm.custom`——`hivm` 是昇腾硬件 IR 方言的前缀，讲双 builder 的那一章建立过，`custom` 是这条指令在该方言里的助记符（C++ 侧建出它的类叫 `hivm::CustomOp`，是同一个东西的两种写法：点号后面跟的永远是助记符）；这条指令落在 ttadapter 阶段的 IR 里。最后 `_to_result` 按 `out` 的类型把结果包回张量。
 
 查表那一步的分野是这套框架的第二个设计决策：
 
@@ -180,7 +180,7 @@ def _get_op_class(name):
 | 3 | `_to_operands(out)` → outputs | len(outputs)=1 | 1 个输出操作数（out 张量 handle 直接透传） |
 | 4 | `_args_to_operands(args/kwargs)` → inputs | len(inputs)=10 | 2 个张量 + dim/bound 2 个标量 + 3 个二元组摊平共 6 个 = 10；other=None 被跳过 |
 | 5 | `_make_attrs` / `_make_arg_attrs` | len(attrs)=4, len(arg_attrs)=9 | hivm.tcore_type/hivm.pipe/hivm.vf_mode + extra_attr；`__builtin_` 前缀免 symbol/bitcode |
-| 6 | `_builder.create_custom_op` → `_to_result` | 1 次调用，1 个结果 | emit 一条 `hivm.CustomOp`（ttadapter 阶段 IR），结果张量类型与 out 一致（fp32） |
+| 6 | `_builder.create_custom_op` → `_to_result` | 1 次调用，1 个结果 | emit 一条 `hivm.custom`（ttadapter 阶段 IR），结果张量类型与 out 一致（fp32） |
 
 这些数字跑在本章的可运行精简版上（宿主没有昇腾 NPU 与 CANN 工具链，IR builder 由一层只记录「被调用了什么」的替身站位），所以它们说的是「哪个属性被建了、哪个符号被点了」，不是真机上的数值。
 
@@ -192,7 +192,7 @@ def _get_op_class(name):
 
 第二处在输出侧。**不变量：结果个数恒等于 `out` 的个数**，而且整条数据流对每个非 `None` 的实参恰好产出一个操作数，因此必然终止。`_to_result` 开头就断言结果个数与类型个数相等，而类型列表是 `[out.type for out in outs]`、结果是 builder 按 `outputs` 建出来的——三者同源于同一个 `outs` 列表，本例 1 对 1 对 1。至于终止性：第 4 步遍历的是注册期就固定下来的有限形参序列，元组再展开也只是有限次内层循环，无回退无递归。
 
-成本同样只在编译期：一次字典查表、一次 `__init__`（本例 11 条断言）、10 次装箱、4 个属性对象、9 个参数属性槽、一次 emit。跟张量里有多少个元素（这里索引长 4）完全无关。运行期只剩那一条 `hivm.CustomOp`。
+成本同样只在编译期：一次字典查表、一次 `__init__`（本例 11 条断言）、10 次装箱、4 个属性对象、9 个参数属性槽、一次 emit。跟张量里有多少个元素（这里索引长 4）完全无关。运行期只剩那一条 `hivm.custom`。
 
 ---
 
@@ -269,7 +269,7 @@ def _make_attrs(op, builder):
 
 紧接着是 `__builtin_` 分野的另一半：**非内建算子必须交出 `symbol` 和 `bitcode` 两样东西**。`symbol` 是算子实现的符号名，`bitcode` 是一份预编译好的 LLVM bitcode 文件路径——你自带的「菜谱」实体就是它。内建算子豁免（框架自己有 IR 模板），这就是为什么上一节表里 `_index_select` 的属性只有 4 条、没有 symbol 和 bitcode。
 
-后面那一串 `_add_optional_*` 都是可选属性的挂载点，其中两个名字值得先认一下，虽然本章不展开：`indexing_map` 是一组 MLIR 仿射映射（AffineMap），描述算子各操作数怎么被访问和迭代；`iterator_types` 与它配套，说明每一维是并行还是别的什么。它们和 `bitcode` 一样，本章只讲「这些参数存在、如何被挂成 IR 属性」这一层表面——它们的下降语义、`hivm.CustomOp` 在编译 pass 里怎么被 lowering，是后端那一部分的事。
+后面那一串 `_add_optional_*` 都是可选属性的挂载点，其中两个名字值得先认一下，虽然本章不展开：`indexing_map` 是一组 MLIR 仿射映射（AffineMap），描述算子各操作数怎么被访问和迭代；`iterator_types` 与它配套，说明每一维是并行还是别的什么。它们和 `bitcode` 一样，本章只讲「这些参数存在、如何被挂成 IR 属性」这一层表面——它们的下降语义、`hivm.custom` 在编译 pass 里怎么被 lowering，是后端那一部分的事。
 
 **一处诚实的空白**。`CORE.CUBE_OR_VECTOR` 与 `CUBE_AND_VECTOR` 的确切调度语义（是「二选一」还是「同时占用」），在本章涉及的 Python 源码与枚举定义里**没有说明**——能看到的只是它们被原样翻成属性值。同理，八个 `PIPE_*` 各自绑到达芬奇哪条流水线单元、`MODE` 的三个取值对算子内部代码生成有什么影响，也都不在本章源码范围内。这些答案在 hivm 方言的下降语义里，本书后面讲后端时才有源码可依。这里不猜。
 
@@ -577,7 +577,7 @@ __all__ = ["libdevice", "extension"]
 
 这一章讲了昇腾语言层相对基座 Triton **多出**的一件事，和一件**厚**得出乎意料的事。
 
-**多出的那件事是注册**。`register_custom_op`（`third_party/ascend/language/cann/extension/custom_op.py:L324-L345`）是一道类装饰器闸门：八条断言查「必须是类、名字不重、三要素齐且类型对」，全过了才抄一份 `__init__` 签名、往全局注册表写一条。注册表只增不改，名字到类的映射是编译期稳定的真相源。调用侧的 `al.custom`（同文件 `L294-L321`）凭名字查表、实例化跑算子自己写的校验、把实参摊成操作数、把 `core`/`pipe`/`mode` 翻成 `hivm.tcore_type`/`hivm.pipe`/`hivm.vf_mode` 三条 IR 属性，最后 emit 一条 `hivm.CustomOp`。`__builtin_` 前缀是随包自带算子的通行证——免注册、免 `symbol` 与 `bitcode`；你自己的算子没有这层豁免，必须交出实现符号和一份预编译 bitcode。
+**多出的那件事是注册**。`register_custom_op`（`third_party/ascend/language/cann/extension/custom_op.py:L324-L345`）是一道类装饰器闸门：八条断言查「必须是类、名字不重、三要素齐且类型对」，全过了才抄一份 `__init__` 签名、往全局注册表写一条。注册表只增不改，名字到类的映射是编译期稳定的真相源。调用侧的 `al.custom`（同文件 `L294-L321`）凭名字查表、实例化跑算子自己写的校验、把实参摊成操作数、把 `core`/`pipe`/`mode` 翻成 `hivm.tcore_type`/`hivm.pipe`/`hivm.vf_mode` 三条 IR 属性，最后 emit 一条 `hivm.custom`。`__builtin_` 前缀是随包自带算子的通行证——免注册、免 `symbol` 与 `bitcode`；你自己的算子没有这层豁免，必须交出实现符号和一份预编译 bitcode。
 
 那三个必填字段是整件事的支点。基座的 GPU 后端不需要它们：单核同构的模型里，「这个算子跑在哪个核、占哪条流水线」不是一个问题。达芬奇是多核异构的，这个问题必须有人回答——于是它被提到了语言层，变成注册时必须填的三个格子。**硬件模型的差异，最终会长成语言表面的差异**，这是本书反复出现的那条线索在语言层的又一次现形。
 
@@ -585,4 +585,4 @@ __all__ = ["libdevice", "extension"]
 
 两件事合起来是一句话：**基座只能点菜，昇腾能自带菜谱**。`extern_elementwise`（`python/triton/language/core.py:L2690-L2730`）的可调符号集合恒等于定义处那张静态菜单——闭集；`register_custom_op` 的注册表可以一直长——开集。
 
-本章只讲到「注册表面」：这些参数存在、如何被挂成 IR 属性。`bitcode` 怎么被加载、`indexing_map` 那组仿射映射怎么参与下降、`hivm.CustomOp` 在编译 pass 里被 lowering 成什么——全都留给后端那一部分。语言层这边还差最后一块：算子有了，多个核怎么分工、怎么同步、怎么给流水线下提示。下一章讲这个。
+本章只讲到「注册表面」：这些参数存在、如何被挂成 IR 属性。`bitcode` 怎么被加载、`indexing_map` 那组仿射映射怎么参与下降、`hivm.custom` 在编译 pass 里被 lowering 成什么——全都留给后端那一部分。语言层这边还差最后一块：算子有了，多个核怎么分工、怎么同步、怎么给流水线下提示。下一章讲这个。
