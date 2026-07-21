@@ -83,14 +83,39 @@ def _targets(chapter_dir: str):
             yield f
 
 
-def lint(chapter_dir: str):
+def _strip_review_notes(path: str, text: str) -> str:
+    """把 figure-manifest.json 里 `blind_review.notes` 的内容剔掉再扫。
+
+    评审记录必须能原样引用「被判错的写法」来说明问题(『页脚写着 X,应为 Y』)。
+    若不豁免,门禁对这类章会**永远红**——而永远红不掉的门禁等于没有门禁
+    (与 warn 噪音同一种失效模式)。豁免只限 notes;claim/figure_spec 等断言字段照常严查。
+    """
+    if os.path.basename(path) != "figure-manifest.json":
+        return text
+    try:
+        d = json.loads(text)
+    except ValueError:
+        return text
+
+    def scrub(o):
+        if isinstance(o, dict):
+            return {k: ("" if k == "notes" else scrub(v)) for k, v in o.items()}
+        if isinstance(o, list):
+            return [scrub(x) for x in o]
+        return o
+
+    return json.dumps(scrub(d), ensure_ascii=False)
+
+
+def lint(chapter_dir: str, dialects=None):
     issues = []
     for f in _targets(chapter_dir):
         try:
             text = open(f, encoding="utf-8", errors="replace").read()
         except OSError:
             continue
-        for bad, tip in scan_text(text):
+        text = _strip_review_notes(f, text)
+        for bad, tip in scan_text(text, dialects=dialects):
             issues.append(f"  {os.path.relpath(f, chapter_dir)}: `{bad}` —— {tip}")
     return issues
 

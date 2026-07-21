@@ -1,0 +1,792 @@
+{
+ "chapter_id": "ch08",
+ "slug": "ch08-scope-sync-pipeline-hints",
+ "pin": "2badfc89e70a9b7a5e88463a116c2feddce4b101",
+ "provenance_note": "宿主无昇腾 NPU / 无 CANN，ascend_ir pybind 扩展未编译，因此无法编译整条 kernel 取真机 IR 或时序。四份 trace 的取证口径统一为：**被测函数体逐字取自 pin**（整模块 import 或按 ast 行号切片后 exec，一个字符未改），只把 IR builder / CodeGenerator / semantic 换成记录型替身，PIPE 枚举成员名从 pin 源码解析、值用占位整数。所以 trace 里的『控制流走向、报什么错、默认配对、属性怎么翻译、哪些实参被丢』都是 pin 的真实行为；**MLIR 属性以文本形式呈现（如 `#hivm.tcore_type<VECTOR>`），是替身的渲染，不是编译器真实打印的 IR**，正文引用时须按此口径措辞。任何真机时序 / pipe 硬件语义均未取证，见 dossier.open_questions。",
+ "mechanisms": [
+  {
+   "mechanism_id": "M3",
+   "intuition": "像装修队进屋前先『空跑一遍』：第一趟在一间临时搭的样板房里把活干完，只为数清楚『这次装修会动到哪几件家具』（a 被改写、c 是新添的）；数完把样板房拆掉，按这份清单在正式房间里重做一遍，最后把动过的家具从正式房间的出口交还给屋主。屋主手里的『a』从此指向新交还的那一件，而不是进屋前那件。",
+   "worked_example": {
+    "params": {
+     "liveins": "a: tensor<128xf32>（scope 内被改写）、n: i32（scope 内不碰）",
+     "with_statement": "with scope(core_mode=\"vector\", disable_auto_sync=True, my_hint=3):",
+     "body": "a = a + 1；c = a * 2（两条赋值，scope_defs = {a, c}）",
+     "harness": "pin 的 handle_scope_with 整模块 import 执行，enter_sub_region 从 triton code_generator.py 按 ast 切片 exec；builder/CodeGenerator 为记录型替身"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m3_scope_ssa.json",
+    "driver": "traces/run_m3_scope_ssa.py",
+    "table": {
+     "columns": [
+      "step",
+      "阶段",
+      "插入点",
+      "builder 动作",
+      "本趟 SSA 产物",
+      "local_defs / 结果"
+     ],
+     "rows": [
+      [
+       "3",
+       "第 1 趟：搭样板房",
+       "func.entry → block1",
+       "create_block()（dummy）",
+       "—",
+       "local_defs 空"
+      ],
+      [
+       "6",
+       "第 1 趟：试跑 with 体",
+       "block1:start",
+       "visit_compound_statement（趟次 1）",
+       "a=%1, c=%2",
+       "local_defs = {a: %1, c: %2}"
+      ],
+      [
+       "9",
+       "第 1 趟收工：拆样板房",
+       "block1",
+       "dummy.erase()",
+       "%1 / %2 随 block 一起作废",
+       "只留下 names=[a, c] 与 ret_types"
+      ],
+      [
+       "13",
+       "建 scope.scope",
+       "回到 func.entry",
+       "create_scope_op(attrs, 2 个结果类型)",
+       "—",
+       "attrs = {noinline, tcore_type<VECTOR>, hivm.disable_auto_sync, my_hint}"
+      ],
+      [
+       "14",
+       "建 region 入口块",
+       "region#0",
+       "create_block_with_parent(region#0, [])",
+       "—",
+       "入口块参数列表为空（region 不带块参数）"
+      ],
+      [
+       "17",
+       "第 2 趟：正式重跑 with 体",
+       "block2:start",
+       "visit_compound_statement（趟次 2）",
+       "a=%3, c=%4",
+       "lscope 先被重置成 liveins 的副本"
+      ],
+      [
+       "21",
+       "封口",
+       "block2:end",
+       "scope_return([%3, %4])",
+       "—",
+       "2 个操作数，与 2 个结果一一对应"
+      ],
+      [
+       "23",
+       "回填外层符号表",
+       "func.entry",
+       "—",
+       "—",
+       "a → %scope_res0，c → %scope_res1，n 仍是 %n_outer"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "设第一趟试跑得到的 scope_defs 大小为 k（本例 k = 2），则 scope.scope 的结果数、scope.return 的操作数数、退出 with 后回填外层的名字数三者恒等于 k，且顺序一致。",
+    "argument": "基例：names 与 ret_types 在第一趟结束时一次性定好（`for name in scope_defs` 同步 append），此后代码里再无对这两个列表的写入。归纳步：① 建 op 时结果类型列表由 ret_types 逐个 to_ir 得到，长度 = k；② 第二趟重跑后，回收循环是 `for i in range(len(names))` 取 `lscope[names[i]].handle`，长度 = k、顺序 = names；③ 退出 enter_sub_region 后回填循环是 `for i, name in enumerate(names)`，长度 = k、顺序 = names。三处都以同一个 names 为唯一游标，故三者恒等且对齐。终止性：无循环嵌套，visit 固定两趟（trace 里 visit_compound_statement 恰出现 2 次）。",
+    "caveat": "第二趟前 `generator.lscope = liveins.copy()`，但 local_defs 未清空——trace step 16 显示第 2 趟入口处 local_defs 已含 {a, c}（第 1 趟的残留）。这不影响上面的不变量（names 早已冻结），但解释了为什么第二趟只能靠 lscope 取值。"
+   },
+   "quantified": "代价可量化：with 体被生成 2 遍、丢弃 1 遍。本例 k = 2 个跨界变量，共造出 4 个 SSA 值（%1…%4），其中 2 个（%1、%2）随 dummy block 被 erase 作废——即『试跑』的净开销 = 一趟完整 codegen。创建 block 2 个、erase 1 个、scope 结果 2 个、scope.return 操作数 2 个；整条 trace 23 个事件。推广：k 个被改写变量 ⇒ 2k 个 SSA 值被造、k 个被丢；scope.scope 的结果数线性于 k，而 region 入口块参数恒为 0（外层值靠 region 捕获引用，不走块参数）。",
+   "figure_specs": [
+    {
+     "figure_id": "fig-ch08-m3-two-pass-ssa",
+     "claim": "handle_scope_with 把 with 体生成两遍：第一趟在临时 block 里只为数出『哪些变量被改写』，拆掉后才建 scope.scope，第二趟的值经 scope.return 回到外层符号表。",
+     "template": "state-table",
+     "numbers": [
+      {
+       "label": "visit 趟次",
+       "value": "2",
+       "provenance": "traces/m3_scope_ssa.json summary.visit_passes"
+      },
+      {
+       "label": "创建 block 数",
+       "value": "2",
+       "provenance": "traces/m3_scope_ssa.json summary.blocks_created"
+      },
+      {
+       "label": "被 erase 的 dummy block",
+       "value": "1",
+       "provenance": "traces/m3_scope_ssa.json step 9 block.erase"
+      },
+      {
+       "label": "第 1 趟 SSA 值（作废）",
+       "value": "%1, %2",
+       "provenance": "traces/m3_scope_ssa.json step 6-7"
+      },
+      {
+       "label": "第 2 趟 SSA 值（保留）",
+       "value": "%3, %4",
+       "provenance": "traces/m3_scope_ssa.json step 17-18"
+      },
+      {
+       "label": "scope.return 操作数",
+       "value": "2",
+       "provenance": "traces/m3_scope_ssa.json step 21 n_operands"
+      },
+      {
+       "label": "回填外层的名字",
+       "value": "a → %scope_res0, c → %scope_res1",
+       "provenance": "traces/m3_scope_ssa.json step 23 lscope"
+      },
+      {
+       "label": "region 入口块参数个数",
+       "value": "0",
+       "provenance": "third_party/ascend/language/cann/extension/code_generator.py:L190（create_block_with_parent(..., [])）"
+      }
+     ],
+     "caption_draft": "两趟 visit 的状态表：第一趟是『只为盘点、随后作废』的试跑（%1/%2 与 dummy block 同归于尽），第二趟才是真正进 region 的代码；跨界变量 a、c 各自占一个 scope.scope 结果，退出 with 后外层的 a 已指向 %scope_res0——这就是 SSA 穿线的全部含义。",
+     "notes": "MLIR 属性/值的文本形式来自记录型替身，不是编译器打印的 ttadapter IR；图注勿写成『IR dump』。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "M7",
+   "intuition": "像两个人隔墙传递暗号：必须一个在墙这边、一个在墙那边（sender ≠ receiver），双方都得是这栋楼里真实存在的房间（只有 cube / vector 两间），且暗号编号取自墙上钉死的 16 个挂钩（0～15）之一——挂钩不够就得复用，编号写错就当场拦下，而不是等到墙那边空等。",
+   "worked_example": {
+    "params": {
+     "api_new": "al.sync_block_set / sync_block_wait（core.py::create_sync_block）",
+     "api_old": "aux_ops.sync_block_set / sync_block_wait（走 custom_op）",
+     "cases": "15 例穷举：合法 cube→vector / vector→cube、同核、event_id = 0 / 15 / 16 / -1 / constexpr(5) / constexpr(99)、非法核名、只给单边 pipe、两侧都给 pipe、sync_block_all('all_sub_vector', 7)",
+     "harness": "函数体逐字 exec，PIPE 成员名从 core.py 解析，semantic / builder 为记录型替身"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m7_sync_contract.json",
+    "driver": "traces/run_m7_sync_contract.py",
+    "table": {
+     "columns": [
+      "调用",
+      "sender → receiver",
+      "event_id",
+      "pipe 实参",
+      "结果",
+      "落到下游的是什么"
+     ],
+     "rows": [
+      [
+       "新代 sync_block_set",
+       "cube → vector",
+       "0",
+       "不给",
+       "OK",
+       "sender_pipe = PIPE_FIX，receiver_pipe = PIPE_MTE2"
+      ],
+      [
+       "新代 sync_block_wait",
+       "vector → cube",
+       "15",
+       "不给",
+       "OK",
+       "sender_pipe = PIPE_MTE3，receiver_pipe = PIPE_MTE2"
+      ],
+      [
+       "新代 sync_block_set",
+       "cube → cube",
+       "1",
+       "不给",
+       "ValueError",
+       "『Unexpected pair: cube -> cube』——同核直接拒绝"
+      ],
+      [
+       "新代 sync_block_set",
+       "cube → vector",
+       "16",
+       "不给",
+       "AssertionError",
+       "『event_id: 16 should be 0 ~ 15』"
+      ],
+      [
+       "新代 sync_block_set",
+       "cube → vector",
+       "-1",
+       "不给",
+       "AssertionError",
+       "『event_id: -1 should be 0 ~ 15』"
+      ],
+      [
+       "新代 sync_block_set",
+       "aicore → vector",
+       "2",
+       "不给",
+       "AssertionError",
+       "『only supports cube/vector』——核名白名单只有两项"
+      ],
+      [
+       "新代 sync_block_set",
+       "cube → vector",
+       "3",
+       "只给 sender_pipe = PIPE_V",
+       "TypeError",
+       "缺省配对是『两个都为 None』才触发，单边给等于把另一边留成 None"
+      ],
+      [
+       "新代 sync_block_set",
+       "cube → vector",
+       "4",
+       "PIPE_V / PIPE_MTE1",
+       "OK",
+       "显式两侧 pipe 原样透传"
+      ],
+      [
+       "新代 sync_block_set",
+       "cube → vector",
+       "constexpr(99)",
+       "不给",
+       "OK（未被拦）",
+       "event_id 没走 _constexpr_to_value，isinstance(int) 不成立 ⇒ 跳过范围检查"
+      ],
+      [
+       "旧代 sync_block_set",
+       "cube → vector",
+       "3",
+       "无此参数",
+       "OK + DeprecationWarning",
+       "custom_op → create_custom_op_for_inter_core_sync('sync_block_set', 'cube', 3)：receiver 被丢掉"
+      ],
+      [
+       "旧代 sync_block_set",
+       "cube → vector",
+       "constexpr(99)",
+       "无此参数",
+       "AssertionError",
+       "旧代先 _constexpr_to_value 再查范围，反而拦住了"
+      ],
+      [
+       "旧代 sync_block_set",
+       "cube → cube",
+       "3",
+       "无此参数",
+       "ValueError",
+       "同核判定两代一致（先 warn 后抛）"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "任何能走到 semantic 层的新代同步调用，出口状态必同时满足四条：sender、receiver ∈ {cube, vector} ∧ sender ≠ receiver ∧（event_id 是 int 时）0 ≤ event_id < 16 ∧ sender_pipe、receiver_pipe 均为 PIPE 实例。",
+    "argument": "基例：create_sync_block 函数体是一条**无循环、无提前 return 的直线**，四道检查全部排在唯一出口（return semantic.create_sync_block_set/wait）之前。归纳步（逐条落地）：① 两条 assert 把核名收进白名单；② `if sender == receiver: raise` 排除同核；③ 范围 assert 守住 0～15；④ 缺省配对之后紧跟 `if not isinstance(..., PIPE): raise TypeError`，无论走没走缺省分支都会被过一遍。任一条不成立即抛出，控制流不可能到达出口——15 例穷举佐证：8 例通过（含 sync_block_all 与两条 constexpr 用例），4 例 AssertionError、2 例 ValueError、1 例 TypeError。**约束里『event_id 是 int 时』这个前提不能删**：trace 里 constexpr(99) 一路走到出口，因为 create_sync_block 对 sender/receiver 调了 _constexpr_to_value、唯独没对 event_id 调。",
+    "caveat": "同一条 constexpr(99) 在旧代 aux_ops 里反被 AssertionError 拦下——旧代先做 _constexpr_to_value。所以『新 API 更严格』并不成立，两代各有各的漏洞面。"
+   },
+   "quantified": "合法输入空间是有限且很小的：核名 2 种 × 2 个位置 = 4 个有序对，去掉 2 个同核对，只剩 cube→vector 与 vector→cube 两条方向；event_id 16 个取值（0～15）。故不显式指定 pipe 时，一对核之间可区分的同步通道共 2 × 16 = 32 个，单向 16 个。显式 pipe 会把每条通道再乘以两侧 pipe 的可选值（Python 层各 8 档，见 M12），但真机上哪些组合有效未取证（见 dossier.open_questions）。旧代把 receiver 丢弃后，落到 IR 上的判别信息只剩 (op 名, sender, event_id) 三元组。",
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "M9",
+   "intuition": "同一张快递单，寄件人柜台记『已寄出』，收件人柜台记『等签收』——单号相同，登记的柜台却是两个。sync_block_set / sync_block_wait 只接一个 sender 参数，却要在两个不同的核上各留一条记录：C++ 侧的 GetCore 就是那位按『你是寄还是收』决定去哪个柜台的调度员。",
+   "worked_example": {
+    "params": {
+     "function": "GetCore(ctx, opName, sender)（third_party/ascend/ascend_ir.cc:L93-L113）",
+     "enumerated": "opName ∈ {sync_block_set, sync_block_wait} × sender ∈ {cube, vector, 其他} 全枚举",
+     "downstream": "buildSyncBlockOp 用返回的 tcore_type 建 hivm.sync_block_set / hivm.sync_block_wait（ascend_ir.cc:L115-L136）"
+    },
+    "trace_source": "manual",
+    "manual_reason": "GetCore 与 buildSyncBlockOp 是 C++（pybind 扩展 ascend_ir.cc），宿主无昇腾工具链、扩展未编译，无法运行取 trace；本表逐格由 pin 源码分支逐条读出，每行标注 ascend_ir.cc 行号，未做任何真机验证。",
+    "table": {
+     "columns": [
+      "opName",
+      "sender 实参",
+      "GetCore 返回的 tcore_type",
+      "含义",
+      "出处"
+     ],
+     "rows": [
+      [
+       "sync_block_set",
+       "\"cube\"",
+       "hivm::TCoreType::CUBE",
+       "set 落在发方核（cube）上：cube 宣告『我干完了』",
+       "ascend_ir.cc:L97-L99"
+      ],
+      [
+       "sync_block_wait",
+       "\"cube\"",
+       "hivm::TCoreType::VECTOR",
+       "同一个 sender=\"cube\"，wait 却落在收方核（vector）上：vector 在等 cube",
+       "ascend_ir.cc:L100-L101"
+      ],
+      [
+       "sync_block_set",
+       "\"vector\"",
+       "hivm::TCoreType::VECTOR",
+       "对称的另一半：vector 发、set 落 vector",
+       "ascend_ir.cc:L106-L107"
+      ],
+      [
+       "sync_block_wait",
+       "\"vector\"",
+       "hivm::TCoreType::CUBE",
+       "cube 在等 vector",
+       "ascend_ir.cc:L108-L109"
+      ],
+      [
+       "任意",
+       "\"aicore\"（既非 cube 也非 vector）",
+       "不返回，抛 std::runtime_error",
+       "C++ 侧再兜一次底：『only supports cube or vector as sender』",
+       "ascend_ir.cc:L103-L105"
+      ],
+      [
+       "非 set / 非 wait 的 opName",
+       "合法 sender",
+       "GetCore 正常返回，但 buildSyncBlockOp 抛 std::runtime_error",
+       "落核决定与建 op 是两段：op 名的合法性在建 op 处才兜底",
+       "ascend_ir.cc:L128-L135"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "对固定的 sender ∈ {cube, vector}，set 与 wait 两次调用得到的 tcore_type 恰好互补（一个 CUBE 一个 VECTOR），绝不会同时落在同一个核上。",
+    "argument": "GetCore 是纯函数，输入只有 (opName, sender)，函数体是两层二分支、无循环。基例：sender == \"cube\" 时，set 分支返回 CUBE、否则返回 VECTOR；归纳步（另一半对称）：sender == \"vector\" 时 set 返回 VECTOR、否则 CUBE。四种组合穷举后写成一句话即『set 落 sender 核、wait 落另一核』，两者取值恒不相等 ⇒ 互补。第三条出路只有 sender 非法时的 runtime_error，不产生 tcore_type。因此只要用户按契约成对写 set/wait（Python 层已保证 sender ≠ receiver，见 M7），事件的两端必分处两核，不存在同核自等的死锁形态。",
+    "caveat": "『成对』本身不由编译器保证：只写 set 不写 wait、或两处 event_id 不一致，静态层面无人检查——真机行为未取证（见 dossier.open_questions）。"
+   },
+   "quantified": "翻转表只有 2 × 2 = 4 格，却支撑起整个核间同步的落核规则；对应 Python 层 2 条合法核对 × 16 个 event_id = 32 条可区分通道（M7），每条通道在 IR 上体现为一对『不同 tcore_type 的 hivm.sync_block_set / hivm.sync_block_wait』。event_id 在 C++ 侧统一提升到 i64（ascend_ir.cc:L122-L128），与 Python 层 0～15 的取值范围相比，位宽富余而语义受限于那 16 个挂钩。",
+   "figure_specs": [
+    {
+     "figure_id": "fig-ch08-m9-getcore-flip",
+     "claim": "同一个 sender 实参，set 落发方核、wait 落收方核——GetCore 按 op 名把落核翻转过来，这是『一个参数、两处登记』的全部机关。",
+     "template": "state-table",
+     "numbers": [
+      {
+       "label": "组合数",
+       "value": "4",
+       "provenance": "ascend_ir.cc:L93-L113（opName 2 × sender 2 全枚举）"
+      },
+      {
+       "label": "set + cube",
+       "value": "TCoreType::CUBE",
+       "provenance": "third_party/ascend/ascend_ir.cc:L97-L99"
+      },
+      {
+       "label": "wait + cube",
+       "value": "TCoreType::VECTOR",
+       "provenance": "third_party/ascend/ascend_ir.cc:L100-L101"
+      },
+      {
+       "label": "set + vector",
+       "value": "TCoreType::VECTOR",
+       "provenance": "third_party/ascend/ascend_ir.cc:L106-L107"
+      },
+      {
+       "label": "wait + vector",
+       "value": "TCoreType::CUBE",
+       "provenance": "third_party/ascend/ascend_ir.cc:L108-L109"
+      },
+      {
+       "label": "非法 sender",
+       "value": "std::runtime_error",
+       "provenance": "third_party/ascend/ascend_ir.cc:L103-L105"
+      },
+      {
+       "label": "Python 层默认 pipe（cube 发）",
+       "value": "PIPE_FIX → PIPE_MTE2",
+       "provenance": "traces/m7_sync_contract.json case 1 emitted"
+      },
+      {
+       "label": "Python 层默认 pipe（vector 发）",
+       "value": "PIPE_MTE3 → PIPE_MTE2",
+       "provenance": "traces/m7_sync_contract.json case 2 emitted"
+      }
+     ],
+     "caption_draft": "GetCore 的 2×2 翻转表：sender 参数说的是『谁发』，落核却由 op 名决定——set 挂在发方核、wait 挂在收方核，两端恒互补，因此一句 sync_block_set(\"cube\",\"vector\",id) 与其配对的 wait 会生成分处两核的两个 hivm op。表格由 ascend_ir.cc 分支逐条读出（C++ 未编译，无真机验证）。",
+     "notes": "op 名写 hivm.sync_block_set / hivm.sync_block_wait（HIVM 方言），**不要**写成 tt. 或 ascend. 前缀；这两个 op 由 C++ 直接 create，不是 ascend 方言的 CustomOp（那是旧代路径，见 M6）。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "M1",
+   "figure_specs": [
+    {
+     "figure_id": "fig-ch08-m1-with-dispatch",
+     "claim": "`with scope(...)` 不走 Python 的上下文管理器协议：visit_With 先 visit 出 `scope` 这个**类对象**，拿它当键查 WITH_DISPATCH，命中就把整条 with 语句（连同 AST）交给 handle_scope_with，__enter__/__exit__ 根本不参与。",
+     "template": "flow",
+     "numbers": [
+      {
+       "label": "WITH_DISPATCH 初值",
+       "value": "{}（空表）",
+       "provenance": "python/triton/compiler/code_generator.py:L26"
+      },
+      {
+       "label": "注入项数",
+       "value": "2",
+       "provenance": "third_party/ascend/language/cann/extension/dispatch.py:L31-L34（scope 类 → handle_scope_with；\"mangle_ty\" → mangle_ty）"
+      },
+      {
+       "label": "查表键",
+       "value": "scope 类对象本身（不是字符串）",
+       "provenance": "third_party/ascend/language/cann/extension/dispatch.py:L32"
+      },
+      {
+       "label": "命中后调用",
+       "value": "handler(self, node) —— 传的是整条 with 的 AST 节点",
+       "provenance": "python/triton/compiler/code_generator.py:L809-L811"
+      },
+      {
+       "label": "未命中兜底",
+       "value": "visit_compound_statement(node.body)（等价于把 with 当透明壳）",
+       "provenance": "python/triton/compiler/code_generator.py:L813-L814"
+      },
+      {
+       "label": "with 项数断言",
+       "value": "1",
+       "provenance": "python/triton/compiler/code_generator.py:L803（assert len(node.items) == 1）"
+      }
+     ],
+     "caption_draft": "with 语句的分派路径：编译器在 AST 层就把 `scope` 认了出来——键是类对象、值是接管函数；命中即绕开 __enter__/__exit__ 直接建 IR，没命中才退回『把 with 当透明壳、只生成体』。这是 ch04 讲过的『按 is_builtin 路由』的同一思路在 with 语句上的第二个入口。",
+     "notes": "画成两条分支（命中 / 未命中）的流程，不要画成上下文管理器的时序图——那正是本章要破除的误解。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "M4",
+   "figure_specs": [
+    {
+     "figure_id": "fig-ch08-m4-kwargs-to-attrs",
+     "claim": "scope 的关键字实参按四条规则翻译成 scope.scope 上的属性：core_mode 走白名单换 tcore_type、noinline 默认挂上且只能被 False 摘掉、disable_auto_sync 仅在为真时加前缀落地、其余原样透传——而任何非字面量实参在 AST 抽取那一步就被静默丢弃。",
+     "template": "state-table",
+     "numbers": [
+      {
+       "label": "默认属性数",
+       "value": "1（noinline，unit attr）",
+       "provenance": "traces/m4_scope_attrs.json summary.default_attr_count / cases[0].mlir_attrs"
+      },
+      {
+       "label": "scope(core_mode=\"cube\")",
+       "value": "{noinline, tcore_type<CUBE>}",
+       "provenance": "traces/m4_scope_attrs.json cases[1].mlir_attrs"
+      },
+      {
+       "label": "scope(core_mode=\"vector\", noinline=False)",
+       "value": "{tcore_type<VECTOR>}（noinline 被 pop 掉）",
+       "provenance": "traces/m4_scope_attrs.json cases[3].mlir_attrs"
+      },
+      {
+       "label": "disable_auto_sync=True",
+       "value": "多出 hivm.disable_auto_sync = #bool<true>",
+       "provenance": "traces/m4_scope_attrs.json cases[4].mlir_attrs"
+      },
+      {
+       "label": "disable_auto_sync=False",
+       "value": "什么都不加（属性数回落到 2）",
+       "provenance": "traces/m4_scope_attrs.json cases[5].mlir_attrs"
+      },
+      {
+       "label": "core_mode=\"aicore\"",
+       "value": "静默无 tcore_type，只剩 {noinline}",
+       "provenance": "traces/m4_scope_attrs.json cases[6]（has_tcore_type=false）"
+      },
+      {
+       "label": "位置参数写法 scope(\"vector\")",
+       "value": "keywords 为空 ⇒ 无 tcore_type",
+       "provenance": "traces/m4_scope_attrs.json cases[0]（n_keywords=0）"
+      },
+      {
+       "label": "core_mode=mode_var（变量）",
+       "value": "被 _extract_scope_attributes 丢弃 ⇒ 无 tcore_type",
+       "provenance": "traces/m4_scope_attrs.json cases[7]（n_keywords=1, n_extracted=0）"
+      },
+      {
+       "label": "my_list=[7, 9]",
+       "value": "同样被丢弃（ast.List 不是 ast.Constant）",
+       "provenance": "traces/m4_scope_attrs.json cases[9]（extracted 里没有 my_list）"
+      },
+      {
+       "label": "带 tcore_type 的用例",
+       "value": "6 / 10",
+       "provenance": "traces/m4_scope_attrs.json summary.n_with_tcore_type 与 summary.n_cases"
+      }
+     ],
+     "caption_draft": "关键字 → 属性的翻译表：白名单之外的 core_mode 值、位置参数写法、非字面量实参三种情形都**不报错**，只是安静地不生成 tcore_type——scope 的『生效』与否在这里全凭 AST 里是不是一个字面量关键字。",
+     "notes": "属性以文本形式呈现（替身渲染），不是编译器打印的 IR；图注避免写『IR 输出』。list 分支在 `with scope(...)` 路径上取不到（抽取阶段就被滤掉），若要提及请说明是该分支在此入口上不可达。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "M5",
+   "figure_specs": [
+    {
+     "figure_id": "fig-ch08-m5-outline-scope",
+     "claim": "scope.scope 只是个临时容器：outline-scope pass 把它的 region 外提成独立的 func.func，把 tcore_type 等属性搬到函数上，原地换成一次 call——『这段代码跑在哪个核上』最终是函数级属性，不是语句级属性。",
+     "template": "before-after",
+     "numbers": [
+      {
+       "label": "before：一个 func 里两个 scope.scope",
+       "value": "tcore_type<CUBE> 与 tcore_type<VECTOR> 各一",
+       "provenance": "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/Scope/Transforms/Passes.td:L31-L45"
+      },
+      {
+       "label": "after：外提出的函数数",
+       "value": "2（@test_scope_0 / @test_scope_1）",
+       "provenance": "Scope/Transforms/Passes.td:L49-L64"
+      },
+      {
+       "label": "属性搬家",
+       "value": "tcore_type 从 op attr 变成 func.func 的 attributes",
+       "provenance": "Scope/Transforms/Passes.td:L50 与 L55"
+      },
+      {
+       "label": "原地留下",
+       "value": "call @…_scope_0 / call @…_scope_1",
+       "provenance": "Scope/Transforms/Passes.td:L59-L61"
+      },
+      {
+       "label": "ScopeOp 的形状约束",
+       "value": "SizedRegion<1>、NoRegionArguments、SingleBlockImplicitTerminator<scope::ReturnOp>",
+       "provenance": "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/Scope/IR/ScopeOps.td:L35-L65"
+      },
+      {
+       "label": "ScopeOp 声明的属性",
+       "value": "1 个（UnitAttr no_inline）；tcore_type 等以 discardable attr 形式挂上",
+       "provenance": "Scope/IR/ScopeOps.td:L60-L62"
+      },
+      {
+       "label": "反向 pass",
+       "value": "InlineScope（同一 Passes.td 内成对存在）",
+       "provenance": "Scope/Transforms/Passes.td:L70"
+      }
+     ],
+     "caption_draft": "outline-scope 的前后对照：`with scope(core_mode=...)` 在 AST → ttir 阶段先落成带属性的 scope.scope region，其后的 ttadapter 侧 outline-scope pass 一跑就外提成 func.func + call，核类型随之升格为函数属性——语言层写的那句 with，最终决定的是『哪段代码整体交给哪种核』。",
+     "notes": "左侧标 ttir（scope.scope 由 ast_to_ttir emit）、右侧标 ttadapter（outline-scope pass 之后）；示例 IR 逐字取自 Passes.td 的 description，勿自行改写函数名。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "M6",
+   "figure_specs": [
+    {
+     "figure_id": "fig-ch08-m6-two-generations",
+     "claim": "同名的 sync_block_set 有两条完全不同的下降路径：旧代经 custom_op 落成通用的 ascend.custom（只带 sender 与 id 两个属性），新代经 create_sync_block 落成专用的 hivm.sync_block_set（带 tcore_type 与两侧 pipe）。",
+     "template": "swimlane",
+     "numbers": [
+      {
+       "label": "旧代入口",
+       "value": "aux_ops.sync_block_set(sender, receiver, event_id)",
+       "provenance": "traces/m7_sync_contract.json sources['aux_ops.py::sync_block_set'] = L59-L75"
+      },
+      {
+       "label": "旧代进门先做的事",
+       "value": "DeprecationWarning：『Use al.sync_block_set instead』",
+       "provenance": "traces/m7_sync_contract.json 旧代用例 warnings 字段"
+      },
+      {
+       "label": "旧代落到 builder 的实参",
+       "value": "('sync_block_set', 'cube', 3) —— receiver 被丢弃",
+       "provenance": "traces/m7_sync_contract.json 旧代 cube→vector 用例 emitted"
+      },
+      {
+       "label": "旧代 IR 形态",
+       "value": "ascend.custom，属性 = ArrayAttr[StringAttr(sender), I32IntegerAttr(id)]",
+       "provenance": "third_party/ascend/triton_ascend.cc:L117-L125"
+      },
+      {
+       "label": "新代入口",
+       "value": "core.sync_block_set(sender, receiver, event_id, sender_pipe=None, receiver_pipe=None)",
+       "provenance": "traces/m7_sync_contract.json sources['core.py::sync_block_set'] = L228-L229"
+      },
+      {
+       "label": "新代多出的参数",
+       "value": "2（sender_pipe / receiver_pipe）",
+       "provenance": "third_party/ascend/language/cann/extension/core.py:L228 与 L233"
+      },
+      {
+       "label": "新代 IR 形态",
+       "value": "hivm::SyncBlockSetOp(coreAttr, prodPipe, consPipe, idI64)",
+       "provenance": "third_party/ascend/ascend_ir.cc:L115-L136"
+      },
+      {
+       "label": "两代共同的拒绝",
+       "value": "同核对：ValueError（旧代先 warn 后抛）",
+       "provenance": "traces/m7_sync_contract.json 两条 cube→cube 用例"
+      }
+     ],
+     "caption_draft": "两代核间同步的泳道对照：旧代把同步塞进 ch07 那张 custom_op 注册表里当『通用外挂 op』，代价是 receiver 与 pipe 信息在语言层就丢了；新代直接建 HIVM 专用 op，把落核（tcore_type）与两侧 pipe 一并写进 IR——同一个 API 名，下降链上却是两种东西。",
+     "notes": "IR 阶段：两者都在 AST → ttir（ast_to_ttir）阶段由 builder 直接 emit；旧代是 ascend. 方言的 CustomOp，新代是 hivm. 方言的 SyncBlockSetOp/WaitOp，**都不是 tt.**。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "M8",
+   "figure_specs": [
+    {
+     "figure_id": "fig-ch08-m8-default-pipe-pairing",
+     "claim": "两侧 pipe 只有『都不给』时才会被缺省配对（cube 发 → FIX/MTE2，vector 发 → MTE3/MTE2），只给一边等于把另一边留成 None，随即被类型检查打成 TypeError。",
+     "template": "state-table",
+     "numbers": [
+      {
+       "label": "触发缺省的条件",
+       "value": "sender_pipe is None and receiver_pipe is None（两者皆空）",
+       "provenance": "third_party/ascend/language/cann/extension/core.py:L213"
+      },
+      {
+       "label": "cube 发送",
+       "value": "sender_pipe = PIPE_FIX，receiver_pipe = PIPE_MTE2",
+       "provenance": "traces/m7_sync_contract.json case『cube→vector, event_id=0, 不给 pipe』emitted"
+      },
+      {
+       "label": "vector 发送",
+       "value": "sender_pipe = PIPE_MTE3，receiver_pipe = PIPE_MTE2",
+       "provenance": "traces/m7_sync_contract.json case『vector→cube, event_id=15, 不给 pipe』emitted"
+      },
+      {
+       "label": "只给 sender_pipe",
+       "value": "TypeError：must be instances of PIPE enum",
+       "provenance": "traces/m7_sync_contract.json case『只给 sender_pipe，receiver_pipe 留空』"
+      },
+      {
+       "label": "两侧都显式给",
+       "value": "PIPE_V / PIPE_MTE1 原样透传",
+       "provenance": "traces/m7_sync_contract.json case『两侧 pipe 都显式给』emitted"
+      },
+      {
+       "label": "收方 pipe 恒为",
+       "value": "PIPE_MTE2（两种缺省配对里都是它）",
+       "provenance": "third_party/ascend/language/cann/extension/core.py:L215-L220"
+      },
+      {
+       "label": "Python 层可选 pipe 档数",
+       "value": "8",
+       "provenance": "traces/m12_narrowing_census.json PIPE.python_layer.count"
+      }
+     ],
+     "caption_draft": "缺省 pipe 配对表：两侧留空才走缺省（cube 发方用 FIX、vector 发方用 MTE3，收方一律 MTE2），单边指定是最容易踩的坑——不是『另一边用缺省』，而是直接 TypeError。至于这些 pipe 各自对应哪条硬件队列、为何收方总是 MTE2，源码未给出依据（见 dossier.open_questions）。",
+     "notes": "严禁在图注里解释 FIX/MTE2/MTE3 的硬件时序语义——无出处，必须留作 open question。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "M12",
+   "figure_specs": [
+    {
+     "figure_id": "fig-ch08-m12-pipe-narrowing",
+     "claim": "PIPE 与 TCoreType 都在『.td 定义 → pybind 导出 → 语言层可用』这条链上被逐级收窄：PIPE 15 档定义只导出 8 档，TCoreType 4 档导出齐全却只有 2 档能从 scope(core_mode=…) 到达。",
+     "template": "layout",
+     "numbers": [
+      {
+       "label": "PIPE 三层档数",
+       "value": "15 → 8 → 8",
+       "provenance": "traces/m12_narrowing_census.json PIPE.narrowing"
+      },
+      {
+       "label": ".td 定义档数",
+       "value": "15（HIVMAttrs.td:L220-L234）",
+       "provenance": "traces/m12_narrowing_census.json PIPE.td_definition.count 与 cases[].line"
+      },
+      {
+       "label": "pybind 导出档数",
+       "value": "8（ascend_ir.cc:L428-L435）",
+       "provenance": "traces/m12_narrowing_census.json PIPE.pybind_export.count/lines"
+      },
+      {
+       "label": "Python class PIPE 档数",
+       "value": "8（core.py:L111-L119）",
+       "provenance": "traces/m12_narrowing_census.json PIPE.python_layer.count/lines"
+      },
+      {
+       "label": "在 pybind 处掉队的 7 档",
+       "value": "PIPE_MTE4, PIPE_MTE5, PIPE_V2, VIRTUAL_PIPE_MTE2_L1A, VIRTUAL_PIPE_MTE2_L1B, PIPE_NUM, PIPE_UNASSIGNED",
+       "provenance": "traces/m12_narrowing_census.json PIPE.dropped_at_pybind"
+      },
+      {
+       "label": "PIPE_UNASSIGNED 的枚举值",
+       "value": "99（其余为 0～13 连续）",
+       "provenance": "traces/m12_narrowing_census.json PIPE.td_definition.cases 末项 value"
+      },
+      {
+       "label": "TCoreType 三层",
+       "value": "4 → 4 → 2",
+       "provenance": "traces/m12_narrowing_census.json TCoreType.narrowing"
+      },
+      {
+       "label": "从 scope 到不了的两档",
+       "value": "CUBE_OR_VECTOR, CUBE_AND_VECTOR",
+       "provenance": "traces/m12_narrowing_census.json TCoreType.unreachable_from_scope"
+      },
+      {
+       "label": "语言层白名单",
+       "value": "(\"cube\", \"vector\")（code_generator.py:L84-L93）",
+       "provenance": "traces/m12_narrowing_census.json TCoreType.reachable_from_scope"
+      }
+     ],
+     "caption_draft": "同一条收窄链，第二次出现：ch05 讲地址空间时是『定义 → 导出 → 可用』三级台阶，这里 PIPE 从 15 档掉到 8 档、TCoreType 从 4 档掉到 2 档——底层 IR 表达力与语言层可写出来的东西之间，永远隔着一层人为的窄口。掉队的那几档在真机上意味着什么，源码未说（见 dossier.open_questions）。",
+     "notes": "画成三列台阶（定义 / 导出 / 可用），PIPE 与 TCoreType 各一行；掉队项灰显。不要给 MTE4/MTE5/V2/VIRTUAL_* 编造硬件含义。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "M14",
+   "figure_specs": [
+    {
+     "figure_id": "fig-ch08-m14-compile-hint-dispatch",
+     "claim": "compile_hint 不修改被提示的那个 op：它按提示值的 Python 类型五路分派成 MLIR 属性，再挂一个 annotation.mark 标记 op 到目标 handle 上——提示是『贴条』，不是『改写』。",
+     "template": "flow",
+     "numbers": [
+      {
+       "label": "类型分派路数",
+       "value": "5（bool / 假值 / int / constexpr / list，其余报错）",
+       "provenance": "third_party/ascend/language/cann/extension/aux_ops.py:L114-L131"
+      },
+      {
+       "label": "hint_val 缺省（None）",
+       "value": "unit attr",
+       "provenance": "traces/m14_compile_hint.json cases[0].emitted"
+      },
+      {
+       "label": "hint_val=False",
+       "value": "#bool<false>（bool 判在最前，不会掉进假值分支）",
+       "provenance": "traces/m14_compile_hint.json cases[2].emitted"
+      },
+      {
+       "label": "hint_val=0",
+       "value": "unit attr —— 整数 0 走的是 `not hint_val` 分支，不是 i32",
+       "provenance": "traces/m14_compile_hint.json cases[3].emitted"
+      },
+      {
+       "label": "hint_val=4",
+       "value": "4 : i32",
+       "provenance": "traces/m14_compile_hint.json cases[4].emitted"
+      },
+      {
+       "label": "hint_val=[1, 2]",
+       "value": "[1, 2] : i64",
+       "provenance": "traces/m14_compile_hint.json cases[5].emitted"
+      },
+      {
+       "label": "hint_val=1.5",
+       "value": "ValueError: Unsupported hint value type",
+       "provenance": "traces/m14_compile_hint.json cases[6]"
+      },
+      {
+       "label": "落地的 op",
+       "value": "annotation.mark(ptr) + setAttr(key, val)",
+       "provenance": "third_party/ascend/ascend_ir.cc:L597-L603"
+      },
+      {
+       "label": "SIMT 下 compile_hint",
+       "value": "直接 return，0 个 mark",
+       "provenance": "traces/m14_compile_hint.json cases[7]（n_emitted=0）"
+      },
+      {
+       "label": "SIMT 下 multibuffer",
+       "value": "仍发 1 个 hivm.multi_buffer = 2 : i32",
+       "provenance": "traces/m14_compile_hint.json cases[9]（simt_mode=true, n_emitted=1）"
+      }
+     ],
+     "caption_draft": "compile_hint 的五路类型分派与落地方式：值先按 Python 类型翻成属性，再由 annotation.mark 以『旁挂标记 op』的形式贴到目标 handle 上——原 op 一个字节不动。两个坑一并标出：整数 0 会掉进假值分支变成 unit attr；SIMT 门控只挡住 compile_hint 这个入口，multibuffer 直呼 compile_hint_impl，因而不受门控。",
+     "notes": "annotation.mark 属 annotation 方言，在 AST → ttir（ast_to_ttir）阶段就已 emit，**不是** tt. 也不是 ascend.；SIMT 内层的检查在 pin 里被注释掉并留了 FIXME（aux_ops.py:L136-L139），画图时可用虚线表示『失效的门』。"
+    }
+   ]
+  }
+ ]
+}

@@ -10,6 +10,7 @@
 而 C++ 类名一律 CamelCase 且以 `Op` 结尾 —— 故 `<小写方言>.<大写开头...Op>` 这个形态
 几乎必然是把 C++ 类名当成了 IR 名。
 """
+import json
 import pathlib
 import sys
 
@@ -78,3 +79,26 @@ def test_known_dialects_reads_td_let_name(tmp_path):
     (tmp_path / "d.td").write_text('def Foo_Dialect : Dialect {\n  let name = "mydialect";\n}\n', encoding="utf-8")
     assert "mydialect" in known_dialects(tmp_path)
     assert "func" in known_dialects(tmp_path)   # 内建方言恒在
+
+
+# ---------- 评审记录豁免 ----------
+
+def test_blind_review_notes_are_exempt(tmp_path):
+    """`figure-manifest.json` 的 `blind_review.notes` 是**评审记录**——它必须能原样引用
+    「被判错的写法」来说明问题(『页脚写着 ascend.CustomOp,这是错的』)。若不豁免,
+    门禁会对这类章永远红,而**永远红不掉的门禁等于没有门禁**(同 warn 噪音的失效模式)。
+    豁免只针对 notes;figure_spec/claim 等**断言性**字段照常严查。
+    """
+    from lint_ir_opname import lint
+    ch = tmp_path / "ch99"
+    (ch / "diagrams").mkdir(parents=True)
+    (ch / "diagrams" / "figure-manifest.json").write_text(json.dumps({"figures": [
+        {"id": "f1",
+         "claim": "落成 hivm.CustomOp",                       # 断言字段 → 必须报
+         "blind_review": {"verdict": "FAIL",
+                          "notes": "页脚写着 ascend.CustomOp,这是错的,应为 ascend.custom"}},
+    ]}, ensure_ascii=False), encoding="utf-8")
+    issues = lint(str(ch), dialects={"hivm", "ascend"})
+    joined = " ".join(issues)
+    assert "hivm.CustomOp" in joined, "断言字段里的错名必须报"
+    assert "ascend.CustomOp" not in joined, "评审记录 notes 不该报"

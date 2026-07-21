@@ -1,0 +1,891 @@
+{
+  "chapter_id": "ch08",
+  "slug": "ch08-scope-sync-pipeline-hints",
+  "pin": "2badfc89e70a9b7a5e88463a116c2feddce4b101",
+  "code_spine": [
+    "python/triton/compiler/code_generator.py:L25-L31 —— 基座 code_generator 在 import 期无条件把 ASCEND_WITH_DISPATCH 并进全局 WITH_DISPATCH",
+    "python/triton/compiler/code_generator.py:L801-L813 —— visit_With：with 的 context_expr 若是 Call，用 self.visit(context.func) 得到的『类对象本身』查表",
+    "third_party/ascend/language/cann/extension/dispatch.py:L31-L34 —— 表里 key 是 scope 类对象，value 是 handle_scope_with",
+    "third_party/ascend/language/cann/extension/scope.py:L49-L71 —— scope.__init__ 只做 core_mode 合法性校验；__enter__/__exit__ 不发任何 IR",
+    "third_party/ascend/language/cann/extension/code_generator.py:L152-L153 —— handle_scope_with 从 AST 上直接读 with 的关键字实参",
+    "third_party/ascend/language/cann/extension/code_generator.py:L155-L164 —— enter_sub_region + dummy block 试跑 body，收集 local_defs 后 erase",
+    "third_party/ascend/language/cann/extension/code_generator.py:L168-L177 —— 由 local_defs 定出 scope 的返回值名单与类型，与外层同名者做类型一致性校验",
+    "third_party/ascend/language/cann/extension/code_generator.py:L180-L187 —— 属性翻译 + create_scope_op（带结果类型列表）",
+    "third_party/ascend/language/cann/extension/code_generator.py:L190-L202 —— 建 region entry block、用 liveins 重置符号表、第二次 visit body、scope_return",
+    "third_party/ascend/language/cann/extension/code_generator.py:L206-L207 —— 退出子区域后把 scope op 的 result 回填成父作用域的 tensor（SSA 穿线收口）",
+    "third_party/ascend/ascend_ir.cc:L664-L681 —— create_scope_op/scope_return 的 pybind：dict → NamedAttribute → scope::ScopeOp",
+    "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/Scope/Transforms/Passes.td:L23-L68 —— 下游 outline-scope pass 把 scope.scope 外提成带 tcore_type 的 func.func",
+    "third_party/ascend/language/cann/extension/aux_ops.py:L57-L96 —— 旧代 sync_block_set/wait：DeprecationWarning + 四条校验 + _utils.custom_op",
+    "third_party/ascend/language/cann/extension/_utils.py:L5-L16 —— custom_op 三分支落到 create_custom_op_for_inter_core_sync",
+    "third_party/ascend/triton_ascend.cc:L117-L125 —— 旧路径 emit 的是通用 triton::ascend::CustomOp（属性只有 [sender/mode 字符串, i32 id]）",
+    "third_party/ascend/language/cann/extension/core.py:L202-L234 —— 新代 create_sync_block：同四条校验 + pipe 缺省配对 + PIPE 类型检查",
+    "third_party/ascend/language/cann/extension/semantic.py:L62-L87 —— create_sync_block_set/wait：event_id 三形态归一为 IR handle，pipe 取 .value",
+    "third_party/ascend/ascend_ir.cc:L93-L136 —— GetCore 按 op 名翻转 core + buildSyncBlockOp emit hivm::SyncBlockSetOp/SyncBlockWaitOp",
+    "third_party/ascend/language/cann/extension/core.py:L237-L244 —— sync_block_all 四模式，直连 _builder.sync_block_all",
+    "third_party/ascend/ascend_ir.cc:L138-L167 —— GetSyncBlockModeAndPipes 把 mode 字符串翻成 SyncBlockMode + 两侧 pipe",
+    "third_party/ascend/language/cann/extension/aux_ops.py:L136-L151 —— compile_hint：SIMT 早退 → constexpr 解包 → compile_hint_impl",
+    "third_party/ascend/language/cann/extension/aux_ops.py:L114-L133 —— compile_hint_impl 类型分派 → create_annotation_mark",
+    "third_party/ascend/ascend_ir.cc:L597-L603 —— create_annotation_mark：annotation::MarkOp + setAttr"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "third_party/ascend/language/cann/extension/scope.py",
+      "lines": "L28-L71",
+      "code": "class scope:\n    \"\"\"\n    Context manager for entering and exiting a scope, where operations within a scope shares some common characteristics.\n\n    Example:\n    ```python\n        import triton.language.extra.cann.extension as extension\n\n        @triton.jit\n        def kernel(x_ptr, y_ptr, N):\n            # specify annotation\n            with extension.scope(feature_a=True):\n                a = tl.load(x_ptr)\n                b = tl.load(y_ptr)\n                result = tl.dot(a, b)\n    ```\n\n    Reserved keywords:\n        - `core_mode`: Allows explicitly specify which core type should be used for operations within a code block, helping the compiler generate appropriate code for cube or vector cores.\n    \"\"\"\n\n    def __init__(self, core_mode: str, _builder=None, _semantic=None, **kwargs):\n        \"\"\"\n        :param core_mode: Either \"cube\" or \"vector\" to specify the core type\n        :param _builder: Internal builder object (set by code_generator)\n        :param _semantic: Internal semantic object (set by code_generator)\n        :param kwargs: Additional internal parameters\n        \"\"\"\n        # Convert constexpr to value if not being called from code generator\n        self.core_mode = _constexpr_to_value(core_mode) if _builder is None else core_mode\n        self._builder = _builder\n        self._semantic = _semantic\n\n        # Validate core_mode\n        if self.core_mode not in (\"cube\", \"vector\"):\n            raise ValueError(f'core_mode must be \"cube\" or \"vector\", got {self.core_mode}')\n\n    def __enter__(self):\n        if self._builder is None:\n            raise RuntimeError(\"scope can only be used inside a Triton kernel\")\n        return self\n\n    def __exit__(self, exc_type, exc_val, exc_tb):\n        return False",
+      "note": "scope 类全文（去掉文件头 license）：docstring + __init__ 校验 + 空的 __enter__/__exit__",
+      "elide": [
+        "文件头 L1-L21 的 Huawei/OpenAI license 头"
+      ]
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/dispatch.py",
+      "lines": "L25-L34",
+      "code": "from .scope import scope\nfrom .code_generator import handle_scope_with, mangle_ty\n\n__all__ = [\"ASCEND_WITH_DISPATCH\"]\n\n# Registry of 'with' statement handlers for Ascend extension\nASCEND_WITH_DISPATCH = {\n    scope: handle_scope_with,\n    \"mangle_ty\": mangle_ty,\n}",
+      "note": "ASCEND_WITH_DISPATCH 注册表：把 scope 类本身当 key 映射到 handle_scope_with",
+      "elide": [
+        "L1-L23 license 与模块 docstring"
+      ]
+    },
+    {
+      "path": "python/triton/compiler/code_generator.py",
+      "lines": "L25-L31",
+      "code": "# Central registry for all 'with' statement handlers\nWITH_DISPATCH = {}\n\n# Import and register Ascend extension dispatch handlers\nfrom triton.language.extra.cann.extension.dispatch import ASCEND_WITH_DISPATCH\nfrom triton.language.extra.cann.extension.builder import setup_unified_builder\nWITH_DISPATCH.update(ASCEND_WITH_DISPATCH)",
+      "note": "基座 code_generator 顶部：WITH_DISPATCH 空表 + 无条件 import 昇腾 dispatch 并 update",
+      "elide": []
+    },
+    {
+      "path": "python/triton/compiler/code_generator.py",
+      "lines": "L801-L813",
+      "code": "    def visit_With(self, node):\n        \"\"\"Handle 'with' statements using dispatch pattern.\"\"\"\n        assert len(node.items) == 1\n        context = node.items[0].context_expr\n\n        # Check if context is a Call and dispatch to registered handler\n        if isinstance(context, ast.Call):\n            withitemClass = self.visit(context.func)\n            handler = WITH_DISPATCH.get(withitemClass)\n            if handler:\n                return handler(self, node)\n\n        # Fall back to visiting body for unhandled cases",
+      "note": "基座 visit_With：只有 ast.Call 形态的 with 才查表；查不到则退化为直接 visit body（无 scope 语义）",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/code_generator.py",
+      "lines": "L63-L69",
+      "code": "def _extract_scope_attributes(context_expr):\n    \"\"\"Extract attributes from scope(...) call.\"\"\"\n    scope_attrs = {}\n    for keyword in context_expr.keywords:\n        if isinstance(keyword.value, ast.Constant):\n            scope_attrs[keyword.arg] = keyword.value.value\n    return scope_attrs",
+      "note": "_extract_scope_attributes：直接从 AST 关键字实参取值，只认 ast.Constant（非常量关键字被静默丢弃）",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/code_generator.py",
+      "lines": "L72-L93",
+      "code": "def _py_value_to_mlir_attr(builder, value):\n    \"\"\"Convert Python value to MLIR attribute.\"\"\"\n    attr_creators = {\n        str: lambda v: builder.get_str_attr(v),\n        bool: lambda v: builder.get_bool_attr(v),\n        int: lambda v: builder.get_int32_attr(v),\n        list: lambda v: builder.get_i64_array_attr(v),\n    }\n    creator = attr_creators.get(type(value))\n    return creator(value) if creator else value\n\n\ndef _handle_core_mode_attr(builder, core_mode):\n    \"\"\"Handle core_mode attribute conversion.\"\"\"\n    if core_mode not in (\"cube\", \"vector\"):\n        return {}\n    return {\n        builder.get_t_core_type_attr_name(): (\n            builder.get_t_core_type_cube_attr() if core_mode == \"cube\"\n            else builder.get_t_core_type_vector_attr()\n        )\n    }",
+      "note": "_py_value_to_mlir_attr 的 Python 类型→MLIR 属性构造表；_handle_core_mode_attr 把 core_mode 翻成 hivm.tcore_type",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/code_generator.py",
+      "lines": "L96-L118",
+      "code": "def _build_mlir_attrs_from_scope_attrs(builder, scope_attrs):\n    \"\"\"Convert Python scope attributes to MLIR attributes.\n    \n    Args:\n        builder: The IR builder\n        scope_attrs: Dict of scope attributes (e.g., {'core_mode': 'vector', 'noinline': True})\n        \n    Returns:\n        Dict of MLIR attributes\n    \"\"\"\n    mlir_attrs = {\"noinline\": builder.get_unit_attr()}\n    for k, v in scope_attrs.items():\n        if k == \"core_mode\":\n            mlir_attrs.update(_handle_core_mode_attr(builder, v))\n        elif k == \"noinline\":\n            if not v:\n                mlir_attrs.pop(\"noinline\")\n        elif k == \"disable_auto_sync\":\n            if v:\n                mlir_attrs[\"hivm.disable_auto_sync\"] = _py_value_to_mlir_attr(builder, v)\n        else:\n            mlir_attrs[k] = _py_value_to_mlir_attr(builder, v)\n    return mlir_attrs",
+      "note": "_build_mlir_attrs_from_scope_attrs：noinline 默认打开、可被 noinline=False 摘掉；disable_auto_sync 改名 hivm.disable_auto_sync；其余关键字原样透传",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/code_generator.py",
+      "lines": "L121-L129",
+      "code": "def _verify_loop_carried_variable(_is_triton_value, _is_triton_tensor, name, loop_val, live_val):\n    \"\"\"Verify that loop-carried variable types are consistent.\"\"\"\n    assert _is_triton_value(loop_val), f'cannot reassign constxpr {name} in the loop'\n    assert _is_triton_value(live_val), f'cannot reasign constexpr {name} in the loop'\n    assert type(loop_val) == type(live_val), f'Loop carried variable {name} changed type'\n    assert not _is_triton_tensor(loop_val) or loop_val.type == live_val.type, \\\n        f'Loop-carried variable {name} has initial type {live_val.type} '\\\n        f'but is re-assigned to {loop_val.type} in loop! '\\\n        f'Please make sure that the type stays consistent.'",
+      "note": "_verify_loop_carried_variable：scope 复用了 while 循环的『循环携带变量类型一致性』校验",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/code_generator.py",
+      "lines": "L137-L208",
+      "code": "def handle_scope_with(generator, node):\n    \"\"\"\n    Handle 'with scope(...)' statements by creating a scope.scope operation.\n    \n    This creates a scope.scope operation with a region for the scope block.\n    Uses SSA threading to properly handle variables modified inside the scope.\n    \n    Args:\n        generator: The CodeGenerator instance\n        node: AST node for the with statement\n    \"\"\"\n    # Lazy imports to avoid circular dependency\n    from triton import language\n    from triton.compiler.code_generator import enter_sub_region, _is_triton_value, _is_triton_tensor\n    \n    context_expr = node.items[0].context_expr\n    scope_attrs = _extract_scope_attributes(context_expr)\n    \n    with enter_sub_region(generator) as sr:\n        liveins, _ = sr\n        ip, last_loc = generator._get_insertion_point_and_loc()\n\n        # This implementation is similar to visit_while\n        dummy = generator.builder.create_block()\n        generator.builder.set_insertion_point_to_start(dummy)\n        generator.visit_compound_statement(node.body)\n        scope_defs = generator.local_defs\n        dummy.erase()\n\n        # Verify and get return type of the scope.scope\n        # (variables that exist in parent scope AND are modified in scope)\n        names = []\n        ret_types = []\n        for name in scope_defs:\n            scope_val = scope_defs[name]\n            ret_types.append(scope_val.type)\n            names.append(name)\n            if name in liveins:\n                live_val = liveins[name]\n                _verify_loop_carried_variable(\n                    _is_triton_value, _is_triton_tensor, name, scope_val, live_val)\n\n        # Convert Python primitives to MLIR attributes\n        mlir_attrs = _build_mlir_attrs_from_scope_attrs(generator.builder, scope_attrs)\n\n        # Create scope operation with operands (values from outside)\n        generator._set_insertion_point_and_loc(ip, last_loc)\n        scope_op = generator.builder.create_scope_op(\n            mlir_attrs,\n            [ty.to_ir(generator.builder) for ty in ret_types]\n        )\n\n        # Create the entry block with arguments matching the operands\n        entry_block = generator.builder.create_block_with_parent(scope_op.get_region(0), [])\n        generator.builder.set_insertion_point_to_start(entry_block)\n\n        # Initialize the scope's symbol table with liveins\n        generator.lscope = liveins.copy()\n        generator.visit_compound_statement(node.body)\n        generator.builder.set_insertion_point_to_end(entry_block)\n        reconstructed_values = []\n\n        for i in range(len(names)):\n            # generator.lscope[names[i]] is already a tensor, just get its IR handle\n            reconstructed_values.append(generator.lscope[names[i]].handle)\n        generator.builder.scope_return(reconstructed_values)\n\n    # After exiting enter_sub_region, update symbol table with results\n    # Convert IR values back to tensor objects\n    for i, name in enumerate(names):\n        generator.set_value(name, _reconstruct_value_from_ir(language, scope_op.get_result(i), ret_types[i]))\n    return None",
+      "note": "handle_scope_with 全文：dummy block 试跑收集 local_defs → 建 scope.scope + region → 重跑 body → scope_return → 结果回填父作用域",
+      "elide": [
+        "三行 lazy import 只为绕开循环依赖，讲解时可一句带过"
+      ]
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/aux_ops.py",
+      "lines": "L39-L54",
+      "code": "@_tensor_member_fn\n@builtin\ndef sync_block_all(mode, event_id, _builder=None):\n    import warnings\n\n    warnings.warn(\n        (\"This method would be deprecated. Use al.sync_block_all instead.\"),\n        DeprecationWarning,\n        stacklevel=1,\n    )\n    mode = _constexpr_to_value(mode)\n    event_id = _constexpr_to_value(event_id)\n    assert isinstance(mode, str), f\"mode: {mode} is not string\"\n    assert isinstance(event_id, int) and (event_id >= 0) and (event_id < 16), f\"event_id: {event_id} should be 0 ~ 15\"\n    assert mode == \"all_cube\" or mode == \"all_vector\" or mode == \"all\", f\"ERROR: mode = {mode}, only supports all_cube/all_vector/all\"\n    custom_op(_builder, \"sync_block_all\", mode=mode, event_id=event_id)",
+      "note": "旧代 sync_block_all：mode 三选一（all_cube/all_vector/all），event_id 0~15",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/aux_ops.py",
+      "lines": "L57-L76",
+      "code": "@_tensor_member_fn\n@builtin\ndef sync_block_set(sender, receiver, event_id, _builder=None):\n    import warnings\n\n    warnings.warn(\n        (\"This method would be deprecated. Use al.sync_block_set instead.\"),\n        DeprecationWarning,\n        stacklevel=1,\n    )\n    sender = _constexpr_to_value(sender)\n    receiver = _constexpr_to_value(receiver)\n    event_id = _constexpr_to_value(event_id)\n    assert isinstance(sender, str) and (sender == \"cube\" or sender == \"vector\"), f\"ERROR: sender = {sender}, only supports cube/vector\"\n    assert isinstance(receiver, str) and (receiver == \"cube\" or receiver == \"vector\"), f\"ERROR: receiver = {receiver}, only supports cube/vector\"\n    assert isinstance(event_id, int) and (event_id >= 0) and (event_id < 16), f\"event_id: {event_id} should be 0 ~ 15\"\n    if sender == receiver:\n        raise ValueError(f'Unexpected pair: {sender} -> {receiver}, only supports cube -> vector or vector -> cube')\n    custom_op(_builder, \"sync_block_set\", sender=sender, event_id=event_id)\n",
+      "note": "旧代 sync_block_set：进门就 DeprecationWarning，三条 assert + sender==receiver 的 ValueError，最后走 custom_op（receiver 只参与校验、不下传）",
+      "elide": [
+        "sync_block_wait(L80-L96) 与本函数逐字同构，只差 op 名，正文可只讲 set"
+      ]
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/_utils.py",
+      "lines": "L5-L16",
+      "code": "def custom_op(builder: ir.builder, op_name: str, **kwargs):\n    if op_name == \"sync_block_all\":\n        return builder.create_custom_op_for_inter_core_sync(op_name, kwargs[\"mode\"], kwargs[\"event_id\"])\n\n    elif op_name == \"sync_block_set\":\n        return builder.create_custom_op_for_inter_core_sync(op_name, kwargs[\"sender\"], kwargs[\"event_id\"])\n    \n    elif op_name == \"sync_block_wait\":\n        return builder.create_custom_op_for_inter_core_sync(op_name, kwargs[\"sender\"], kwargs[\"event_id\"])\n    \n    raise ValueError(f\"Unsupported custom op: {op_name}\")\n",
+      "note": "_utils.custom_op：只认三个 op 名的手写 dispatcher，落到 builder.create_custom_op_for_inter_core_sync（注意：这不是 ch07 的 register_custom_op 注册表）",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/triton_ascend.cc",
+      "lines": "L117-L125",
+      "code": "    .def(\"create_custom_op_for_inter_core_sync\",\n      [](TritonOpBuilder &self, std::string &op_name,\n        std::string &mode_or_sender, int id) -> void {\n          auto args = self.getBuilder().getArrayAttr(\n              {self.getBuilder().getStringAttr(mode_or_sender),\n              self.getBuilder().getI32IntegerAttr(id)}\n          );\n          self.create<triton::ascend::CustomOp>(op_name, args, ValueRange());\n      })",
+      "note": "create_custom_op_for_inter_core_sync 的 pybind 实现：把 (mode_or_sender, id) 打成 ArrayAttr 挂到 triton::ascend::CustomOp 上",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/core.py",
+      "lines": "L104-L126",
+      "code": "class CORE(enum.Enum):\n    VECTOR = ascend_ir.CoreType.VECTOR\n    CUBE = ascend_ir.CoreType.CUBE\n    CUBE_OR_VECTOR = ascend_ir.CoreType.CUBE_OR_VECTOR\n    CUBE_AND_VECTOR = ascend_ir.CoreType.CUBE_AND_VECTOR\n\n\nclass PIPE(enum.Enum):\n    PIPE_S = ascend_ir.PIPE.PIPE_S\n    PIPE_V = ascend_ir.PIPE.PIPE_V\n    PIPE_M = ascend_ir.PIPE.PIPE_M\n    PIPE_MTE1 = ascend_ir.PIPE.PIPE_MTE1\n    PIPE_MTE2 = ascend_ir.PIPE.PIPE_MTE2\n    PIPE_MTE3 = ascend_ir.PIPE.PIPE_MTE3\n    PIPE_ALL = ascend_ir.PIPE.PIPE_ALL\n    PIPE_FIX = ascend_ir.PIPE.PIPE_FIX\n\n\nclass MODE(enum.Enum):\n    SIMD = ascend_ir.MODE.SIMD\n    SIMT = ascend_ir.MODE.SIMT\n    MIX = ascend_ir.MODE.MIX\n",
+      "note": "CORE / PIPE / MODE 三个 Python 枚举——每一项都是对 pybind 导出的 ascend_ir 枚举的转手包装",
+      "elide": [
+        "ch07 已讲过这三个枚举如何被自定义算子当属性用，本章只用 PIPE/CORE 的取值集合"
+      ]
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/core.py",
+      "lines": "L202-L234",
+      "code": "def create_sync_block(sender, receiver, event_id, is_set: bool,\n                      sender_pipe=None, receiver_pipe=None,\n                      _builder=None):\n    sender = _constexpr_to_value(sender)\n    receiver = _constexpr_to_value(receiver)\n    assert isinstance(sender, str) and (sender == \"cube\" or sender == \"vector\"), f\"ERROR: sender = {sender}, only supports cube/vector\"\n    assert isinstance(receiver, str) and (receiver == \"cube\" or receiver == \"vector\"), f\"ERROR: receiver = {receiver}, only supports cube/vector\"\n    if isinstance(event_id, int):\n        assert (event_id >= 0) and (event_id < 16), f\"event_id: {event_id} should be 0 ~ 15\"\n    if sender == receiver:\n        raise ValueError(f'Unexpected pair: {sender} -> {receiver}, only supports cube -> vector or vector -> cube')\n    if sender_pipe is None and receiver_pipe is None:\n        if sender == \"cube\":\n            sender_pipe = PIPE.PIPE_FIX\n            receiver_pipe = PIPE.PIPE_MTE2\n        if sender == \"vector\":\n            sender_pipe = PIPE.PIPE_MTE3\n            receiver_pipe = PIPE.PIPE_MTE2\n    if not isinstance(sender_pipe, PIPE) or not isinstance(receiver_pipe, PIPE):\n        raise TypeError(\"sender_pipe and receiver_pipe must be instances of PIPE enum\")\n    if is_set:\n        return semantic.create_sync_block_set(sender, receiver, event_id, sender_pipe, receiver_pipe, _builder)\n    return semantic.create_sync_block_wait(sender, receiver, event_id, sender_pipe, receiver_pipe, _builder)\n\n\n@builtin\ndef sync_block_set(sender, receiver, event_id, sender_pipe=None, receiver_pipe=None, _builder=None):\n    return create_sync_block(sender, receiver, event_id, True, sender_pipe, receiver_pipe, _builder)\n\n\n@builtin\ndef sync_block_wait(sender, receiver, event_id, sender_pipe=None, receiver_pipe=None, _builder=None):\n    return create_sync_block(sender, receiver, event_id, False, sender_pipe, receiver_pipe, _builder)",
+      "note": "新代 create_sync_block + sync_block_set/wait：同样的四条校验，外加 sender_pipe/receiver_pipe 缺省配对与 PIPE 类型检查",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/core.py",
+      "lines": "L237-L244",
+      "code": "@builtin\ndef sync_block_all(mode, event_id, _builder=None):\n    mode = _constexpr_to_value(mode)\n    event_id = _constexpr_to_value(event_id)\n    assert isinstance(mode, str), f\"mode: {mode} is not string\"\n    assert isinstance(event_id, int) and (event_id >= 0) and (event_id < 16), f\"event_id: {event_id} should be 0 ~ 15\"\n    assert mode in (\"all_cube\", \"all_vector\", \"all\", \"all_sub_vector\"), f\"ERROR: mode = {mode}, only supports all_cube/all_vector/all/all_sub_vector\"\n    _builder.sync_block_all(mode, event_id)",
+      "note": "新代 sync_block_all：mode 多了 all_sub_vector，且不再经 custom_op、直接 _builder.sync_block_all",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/semantic.py",
+      "lines": "L62-L73",
+      "code": "def create_sync_block_set(sender, receiver, event_id, sender_pipe: PIPE, receiver_pipe: PIPE, _builder=None):\n    if isinstance(event_id, int):\n        _builder.sync_block_set(sender, receiver,\n                                real_semantic.to_tensor(tl.constexpr(event_id), _builder).handle,\n                                sender_pipe.value, receiver_pipe.value)\n    elif isinstance(event_id, tl.constexpr):\n        _builder.sync_block_set(sender, receiver,\n                                real_semantic.to_tensor(event_id, _builder).handle,\n                                sender_pipe.value, receiver_pipe.value)\n    else:\n        _builder.sync_block_set(sender, receiver,\n                                event_id.handle, sender_pipe.value, receiver_pipe.value)",
+      "note": "create_sync_block_set：event_id 三形态（int / constexpr / tensor）统一转成 IR handle，pipe 取 .value 后交给 builder",
+      "elide": [
+        "create_sync_block_wait(L76-L87) 逐字同构"
+      ]
+    },
+    {
+      "path": "third_party/ascend/ascend_ir.cc",
+      "lines": "L93-L113",
+      "code": "hivm::TCoreTypeAttr GetCore(MLIRContext *ctx, llvm::StringRef opName, llvm::StringRef sender)\n{\n  // Decide core type\n  hivm::TCoreTypeAttr core;\n  if (sender == \"cube\") {\n    if (opName == \"sync_block_set\")\n      core = hivm::TCoreTypeAttr::get(ctx, hivm::TCoreType::CUBE);\n    else\n      core = hivm::TCoreTypeAttr::get(ctx, hivm::TCoreType::VECTOR);\n  } else {\n    if (sender != \"vector\") {\n      throw std::runtime_error(\"sync_block_set/wait only supports 'cube' or 'vector' as sender\");\n    }\n    if (opName == \"sync_block_set\")\n      core = hivm::TCoreTypeAttr::get(ctx, hivm::TCoreType::VECTOR);\n    else\n      core = hivm::TCoreTypeAttr::get(ctx, hivm::TCoreType::CUBE);\n  }\n\n  return core;\n}",
+      "note": "GetCore：sync_block_set 落在 sender 核上、sync_block_wait 落在对侧核上——同一个 sender 字符串按 op 名翻转",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/ascend_ir.cc",
+      "lines": "L115-L136",
+      "code": "void buildSyncBlockOp(AscendNPUIROpBuilder &self, const std::string &opName, std::string &sender,\n                      std::string &receiver, Value id, hivm::PIPE senderPipe, hivm::PIPE receiverPipe)\n{\n  auto *ctx = self.getBuilder().getContext();\n  hivm::TCoreTypeAttr coreAttr = GetCore(ctx, opName, sender);\n  hivm::PipeAttr prodPipe = hivm::PipeAttr::get(ctx, senderPipe);\n  hivm::PipeAttr consPipe = hivm::PipeAttr::get(ctx, receiverPipe);\n  const size_t I64 = 64;\n  auto i64Ty = IntegerType::get(ctx, I64);\n  Value idI64 = id;\n  if (!id.getType().isInteger(I64)) {\n    idI64 = mlir::convertScalarToDtype(self.getBuilder(), id.getLoc(), id,\n                                       i64Ty, true);\n  }\n  if (opName == \"sync_block_set\") {\n    self.create<hivm::SyncBlockSetOp>(coreAttr, prodPipe, consPipe, idI64);\n  } else if (opName == \"sync_block_wait\") {\n    self.create<hivm::SyncBlockWaitOp>(coreAttr, prodPipe, consPipe, idI64);\n  } else {\n    throw std::runtime_error(\"Unsupported operation name for SyncBlockOp\");\n  }\n}",
+      "note": "buildSyncBlockOp：core 与两个 pipe 打成属性，flag id 统一提升到 i64，emit hivm::SyncBlockSetOp / SyncBlockWaitOp",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/ascend_ir.cc",
+      "lines": "L138-L167",
+      "code": "ModeAndPipes GetSyncBlockModeAndPipes(MLIRContext *ctx,\n                                      const std::string &mode)\n{\n  hivm::SyncBlockModeAttr modeAttr = {};\n  hivm::PipeAttr cubePipe = {};\n  hivm::PipeAttr vectorPipe = {};\n\n  if (mode == \"all_cube\") {\n    modeAttr = hivm::SyncBlockModeAttr::get(ctx, hivm::SyncBlockMode::ALL_CUBE);\n    cubePipe = hivm::PipeAttr::get(ctx, hivm::PIPE::PIPE_ALL);\n    vectorPipe = hivm::PipeAttr{};\n  } else if (mode == \"all_vector\") {\n    modeAttr =\n        hivm::SyncBlockModeAttr::get(ctx, hivm::SyncBlockMode::ALL_VECTOR);\n    cubePipe = hivm::PipeAttr{};\n    vectorPipe = hivm::PipeAttr::get(ctx, hivm::PIPE::PIPE_ALL);\n  } else if (mode == \"all\") {\n    modeAttr = hivm::SyncBlockModeAttr::get(ctx, hivm::SyncBlockMode::ALL);\n    cubePipe = hivm::PipeAttr::get(ctx, hivm::PIPE::PIPE_ALL);\n    vectorPipe = hivm::PipeAttr::get(ctx, hivm::PIPE::PIPE_ALL);\n  } else if (mode == \"all_sub_vector\") {\n    modeAttr =\n        hivm::SyncBlockModeAttr::get(ctx, hivm::SyncBlockMode::ALL_SUB_VECTOR);\n    cubePipe = hivm::PipeAttr{};\n    vectorPipe = hivm::PipeAttr::get(ctx, hivm::PIPE::PIPE_ALL);\n  } else {\n    llvm::report_fatal_error(llvm::StringRef(\"Invalid sync-block mode: \" + mode));\n  }\n  return {modeAttr, cubePipe, vectorPipe};\n}",
+      "note": "GetSyncBlockModeAndPipes：四种 all-模式各自决定 cube/vector 两侧的 pipe 是 PIPE_ALL 还是空",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/ascend_ir.cc",
+      "lines": "L420-L436",
+      "code": "  py::enum_<hivm::TCoreType>(m, \"CoreType\", py::module_local())\n      .value(\"CUBE\", hivm::TCoreType::CUBE)\n      .value(\"VECTOR\", hivm::TCoreType::VECTOR)\n      .value(\"CUBE_OR_VECTOR\", hivm::TCoreType::CUBE_OR_VECTOR)\n      .value(\"CUBE_AND_VECTOR\", hivm::TCoreType::CUBE_AND_VECTOR)\n      .export_values();\n\n  py::enum_<hivm::PIPE>(m, \"PIPE\", py::module_local())\n      .value(\"PIPE_S\", hivm::PIPE::PIPE_S)\n      .value(\"PIPE_V\", hivm::PIPE::PIPE_V)\n      .value(\"PIPE_M\", hivm::PIPE::PIPE_M)\n      .value(\"PIPE_MTE1\", hivm::PIPE::PIPE_MTE1)\n      .value(\"PIPE_MTE2\", hivm::PIPE::PIPE_MTE2)\n      .value(\"PIPE_MTE3\", hivm::PIPE::PIPE_MTE3)\n      .value(\"PIPE_ALL\", hivm::PIPE::PIPE_ALL)\n      .value(\"PIPE_FIX\", hivm::PIPE::PIPE_FIX)\n      .export_values();",
+      "note": "pybind 导出的 CoreType（4 档）与 PIPE（8 档）",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/ascend_ir.cc",
+      "lines": "L597-L603",
+      "code": "      .def(\"create_annotation_mark\",\n           [](TritonOpBuilder &self, Value &ptr, const std::string &attrKey,\n              Attribute &attrVal) {\n             auto annotationOp = self.create<annotation::MarkOp>(ptr);\n             annotationOp->setAttr(self.getBuilder().getStringAttr(attrKey),\n                                   attrVal);\n           })",
+      "note": "create_annotation_mark：compile_hint 的落地——建一个 annotation::MarkOp 并把 (key, value) 挂上去",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/ascend_ir.cc",
+      "lines": "L664-L681",
+      "code": "      .def(\"create_scope_op\",\n           [](AscendNPUIROpBuilder &self, py::dict &scopeAttrs,\n              std::vector<Type> resultTypes) -> OpState {\n             llvm::SmallVector<NamedAttribute> attrs;\n             for (auto item : scopeAttrs) {\n               std::string key = py::cast<std::string>(item.first);\n               Attribute value = py::cast<Attribute>(item.second);\n               attrs.push_back(\n                   NamedAttribute(self.getBuilder().getStringAttr(key), value));\n             }\n             auto scopeOp = self.create<scope::ScopeOp>(TypeRange(resultTypes));\n             scopeOp->setAttrs(attrs);\n             return OpState(scopeOp);\n           })\n      .def(\"scope_return\",\n           [](AscendNPUIROpBuilder &self,\n              std::vector<Value> operands) -> OpState {\n             return self.create<scope::ReturnOp>(ValueRange(operands));",
+      "note": "create_scope_op / scope_return 的 pybind：把 Python dict 逐项转成 NamedAttribute 挂到 scope::ScopeOp 上",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/aux_ops.py",
+      "lines": "L114-L151",
+      "code": "def compile_hint_impl(ptr: tensor, hint_name: str, hint_val, builder: ir.builder):\n    # simt mode does not support hint annotations\n    # FIXME: is_simt_mode\n    # if builder.is_simt_mode():\n    #     return\n    # Check isinstance(hint_val, bool) first to handle False explicitly\n    if isinstance(hint_val, bool):\n        hint_val = builder.get_bool_attr(hint_val)\n    elif not hint_val:\n        hint_val = builder.get_unit_attr()\n    elif isinstance(hint_val, int):\n        hint_val = builder.get_int32_attr(hint_val)\n    elif isinstance(hint_val, core.constexpr):\n        hint_val = builder.get_str_attr(hint_val.value)\n    elif isinstance(hint_val, list):\n        # only support i64 array attr for now\n        hint_val = builder.get_i64_array_attr(hint_val)\n    else:\n        raise ValueError(f\"Unsupported hint value type: {type(hint_val)}\")\n    builder.create_annotation_mark(ptr.handle, hint_name, hint_val)\n\n@builtin\ndef compile_hint(ptr, hint_name, hint_val=None, _builder=None):\n    # simt mode does not support hint annotations\n    if _builder.is_simt_mode():\n        return\n\n    def _unwrap(val):\n        return _unwrap_if_constexpr(val) if val else val\n\n    hint_name = _constexpr_to_value(hint_name)\n    assert isinstance(hint_name, str), f\"hint name: {hint_name} is not string\"\n    if isinstance(hint_val, list):\n        hint_val = [_unwrap(val) for val in hint_val]\n    else:\n        hint_val = _unwrap(hint_val)\n    hint_val = _unwrap_if_constexpr(hint_val) if hint_val else hint_val\n    compile_hint_impl(ptr, hint_name, hint_val, _builder)",
+      "note": "compile_hint_impl + compile_hint：hint 值按 Python 类型分派成 bool/unit/i32/str/i64-array 属性；外层在 SIMT 模式直接早退，内层的同款检查被 FIXME 注掉",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/aux_ops.py",
+      "lines": "L153-L162",
+      "code": "@builtin\ndef multibuffer(src: tensor, size, _builder=None):\n    \"\"\"\n    Set multi_buffer for an existing tensor\n    :src: tensor set to bufferize multiple time\n    :size: number of copies\n    \"\"\"\n    buffer_size = _constexpr_to_value(size)\n    assert isinstance(buffer_size, int) and buffer_size == 2, f\"only support bufferize equals 2\"\n    compile_hint_impl(src, \"hivm.multi_buffer\", buffer_size, _builder)",
+      "note": "multibuffer：只接受 size==2，绕过外层直接复用 compile_hint_impl 挂 hivm.multi_buffer",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/aux_ops.py",
+      "lines": "L99-L111",
+      "code": "class parallel(range):\n    \"\"\"\n    Iterator that counts upward forever, with parallel execution semantics.\n\n    This is a special iterator used to implement similar semantics to Python's :code:`range` in the context of\n    :code:`triton.jit` functions. In addition, it allows user to pass extra attributes to the compiler.\n    :param bind_sub_block: Tells the compiler if multiple vector cores participate in the loop.\n        This is used in the mixed cube-vector kernel on 910B. The number of vector cores is determined by the number of\n        iteration in this loop. Currently on 910B, max 2 vector cores could be used.\n    \"\"\"\n    def __init__(self, arg1, arg2=None, step=None, num_stages=None, loop_unroll_factor=None, bind_sub_block: bool = False):\n        super().__init__(arg1, arg2, step, num_stages, loop_unroll_factor)\n        self.bind_sub_block = bind_sub_block",
+      "note": "parallel：继承基座 range，多一个 bind_sub_block 关键字（docstring 称 910B 上最多 2 个 vector 核）",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/Scope/IR/ScopeOps.td",
+      "lines": "L34-L65",
+      "code": "def ScopeOp : Scope_Op<\"scope\", [\n    DeclareOpInterfaceMethods<RegionBranchOpInterface, [\n    \"getNumRegionInvocations\", \"getRegionInvocationBounds\",\n    \"getEntrySuccessorRegions\"]>,\n    NoRegionArguments,\n    SingleBlockImplicitTerminator<\"scope::ReturnOp\">,\n    SingleBlock,\n    RecursiveMemoryEffects]> {\n  let summary = \"Represents scope of a region\";\n  let description = [{\n    The \"scope.scope\" operation represents a scope of the\n    operations inside the region.\n\n    Example:\n    ```\n    scope.scope : () -> () {\n        scope.return\n    } {tcore_type = #hivm.tcore_type<CUBE>, ...}\n\n    scope.scope : () -> () {\n        scope.return\n    }\n    ```\n  }];\n  let arguments = (ins\n    UnitAttr:$no_inline\n  );\n  let results = (outs Variadic<AnyType>:$results);\n  let regions = (region SizedRegion<1>:$region);\n  let hasCustomAssemblyFormat = 1;\n  let hasCanonicalizer = 1;\n}",
+      "note": "scope.scope 的 ODS 定义：NoRegionArguments + SingleBlockImplicitTerminator<scope::ReturnOp>，属性挂在 op 尾部",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/Scope/Transforms/Passes.td",
+      "lines": "L23-L68",
+      "code": "def OutlineScope : Pass<\"outline-scope\", \"mlir::ModuleOp\"> {\n  let summary = \"Outline scope region within ScopeOp.\";\n  let description = [{\n    Convert `scope.scope` into a `func.func`.\n\n    Example:\n\n    ```mlir\n    module {\n      func.func @test() {\n        scope.scope : () -> () {\n          ...\n          scope.return\n        } {tcore_type = #hivm.tcore_type<CUBE>, ...}\n        scope.scope : () -> () {\n          ...\n          scope.return\n        } {tcore_type = #hivm.tcore_type<VECTOR>, ...}\n        return\n      }\n    }\n    ```\n\n    will be transformed into:\n\n    ```mlir\n    module {\n      func.func @test_scope_0() attributes {tcore_type = #hivm.tcore_type<CUBE>, ...} {\n        ...\n        return\n      }\n      func.func @test_scope_1() attributes {tcore_type = #hivm.tcore_type<VECTOR>, ...} {\n        ...\n        return\n      }\n      func.func @test() {\n        call @test_scope_scope_scope_0() : () -> ()\n        call @test_scope_scope_scope_1() : () -> ()\n        return\n      }\n    }\n    ```\n  }];\n  let constructor = \"mlir::scope::createOutlineScopePass()\";\n  let dependentDialects = [\"mlir::func::FuncDialect\"];\n}",
+      "note": "outline-scope pass 的说明：scope.scope 被外提成带 tcore_type 属性的 func.func + call",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMAttrs.td",
+      "lines": "L219-L253",
+      "code": "\ndef HIVM_PIPE_S : I32EnumAttrCase<\"PIPE_S\", 0>;\ndef HIVM_PIPE_V : I32EnumAttrCase<\"PIPE_V\", 1>;\ndef HIVM_PIPE_M : I32EnumAttrCase<\"PIPE_M\", 2>;\ndef HIVM_PIPE_MTE1 : I32EnumAttrCase<\"PIPE_MTE1\", 3>;\ndef HIVM_PIPE_MTE2 : I32EnumAttrCase<\"PIPE_MTE2\", 4>;\ndef HIVM_PIPE_MTE3 : I32EnumAttrCase<\"PIPE_MTE3\", 5>;\ndef HIVM_PIPE_ALL : I32EnumAttrCase<\"PIPE_ALL\", 6>;\ndef HIVM_PIPE_MTE4 : I32EnumAttrCase<\"PIPE_MTE4\", 7>;\ndef HIVM_PIPE_MTE5 : I32EnumAttrCase<\"PIPE_MTE5\", 8>;\ndef HIVM_PIPE_V2 : I32EnumAttrCase<\"PIPE_V2\", 9>;\ndef HIVM_PIPE_FIX : I32EnumAttrCase<\"PIPE_FIX\", 10>;\ndef HIVM_VIRTUAL_PIPE_MTE2_L1A : I32EnumAttrCase<\"VIRTUAL_PIPE_MTE2_L1A\", 11>;\ndef HIVM_VIRTUAL_PIPE_MTE2_L1B : I32EnumAttrCase<\"VIRTUAL_PIPE_MTE2_L1B\", 12>;\ndef HIVM_PIPE_NUM : I32EnumAttrCase<\"PIPE_NUM\", 13>;\ndef HIVM_PIPE_UNASSIGNED : I32EnumAttrCase<\"PIPE_UNASSIGNED\", 99>;\n\ndef HIVM_PipeEnum : HIVM_I32Enum<\n  \"PIPE\", \"HIVM Op Pipe\", [\n    HIVM_PIPE_S,\n    HIVM_PIPE_V,\n    HIVM_PIPE_M,\n    HIVM_PIPE_MTE1,\n    HIVM_PIPE_MTE2,\n    HIVM_PIPE_MTE3,\n    HIVM_PIPE_ALL,\n    HIVM_PIPE_MTE4,\n    HIVM_PIPE_MTE5,\n    HIVM_PIPE_V2,\n    HIVM_PIPE_FIX,\n    HIVM_VIRTUAL_PIPE_MTE2_L1A,\n    HIVM_VIRTUAL_PIPE_MTE2_L1B,\n    HIVM_PIPE_NUM,\n    HIVM_PIPE_UNASSIGNED\n  ]>;",
+      "note": "HIVM PIPE 枚举的 .td 全集（15 档，含 MTE4/MTE5/V2/两个 VIRTUAL_/PIPE_NUM/UNASSIGNED）——pybind 只导出其中 8 档",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMSynchronizationOps.td",
+      "lines": "L129-L145",
+      "code": "def SyncBlockSetOp : HIVM_SynchronizationOp<\"sync_block_set\", [AttrSizedOperandSegments]> {\n  let summary = \"hivm set block sync.\";\n  let arguments = (ins HIVM_TCoreTypeAttr:$tcore_type,\n                       HIVM_PipeAttr:$tpipe,\n                       HIVM_PipeAttr:$pipe,\n                       OptionalAttr<Builtin_IntegerAttr>:$static_flag_id,\n                       Optional<I64>:$dynamic_flag_id,\n                       Optional<I64>:$ffts_base_addr,\n                       DefaultValuedOptionalAttr<HIVM_SyncBlockInstrModeAttr,\n                         \"INTRA_BLOCK_SYNCHRONIZATION\">:$tsync_instr_mode\n  );\n  let assemblyFormat = [{\n    attr-dict `[` $tcore_type `,` $tpipe `,` $pipe`]`\n    `flag` `=` custom<FlagID>($static_flag_id, $dynamic_flag_id)\n    (`ffts_base_addr` `=` $ffts_base_addr^)?\n    (`sync_instr_mode` `=` $tsync_instr_mode^)?\n  }];",
+      "note": "hivm.sync_block_set 的 ODS：tcore_type + tpipe(生产侧) + pipe(消费侧) + 静态/动态 flag id",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/unittest/pytest_ut/test_scope.py",
+      "lines": "L38-L59",
+      "code": "@triton.jit\ndef kernel_nested_scope(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):\n    \"\"\"Test nested scopes.\"\"\"\n    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    with al.scope(core_mode=\"vector\"):\n        with al.scope(core_mode=\"vector\"):\n            with al.scope(core_mode=\"cube\"):\n                x = tl.load(x_ptr + i, mask=i < n)\n                y = tl.load(y_ptr + i, mask=i < n)\n                result = x + y\n                tl.store(out_ptr + i, result, mask=i < n)\n\n\n@triton.jit\ndef kernel_scope_escape(x_ptr, out_ptr, n, BLOCK: tl.constexpr):\n    \"\"\"Test variable defined inside scope, used outside.\"\"\"\n    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    with al.scope(core_mode=\"vector\"):\n        x = tl.load(x_ptr + i, mask=i < n)\n    # Use x outside of the scope\n    a = x + 1.0\n    tl.store(out_ptr + i, a, mask=i < n)",
+      "note": "官方 UT：嵌套 scope（vector 套 vector 套 cube）与『scope 内定义、scope 外使用』的变量逃逸",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/unittest/pytest_ut/test_scope.py",
+      "lines": "L84-L92",
+      "code": "@triton.jit\ndef kernel_scope_disable_auto_sync(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):\n    \"\"\"Test disable auto sync.\"\"\"\n    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    with al.scope(core_mode=\"vector\", disable_auto_sync=True):\n        x = tl.load(x_ptr + i, mask=i < n)\n        y = tl.load(y_ptr + i, mask=i < n)\n        result = x + y\n        tl.store(out_ptr + i, result, mask=i < n)",
+      "note": "官方 UT：scope(core_mode=\"vector\", disable_auto_sync=True) —— 唯一一处示范额外关键字",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/unittest/pytest_ut/test_sync_block_all.py",
+      "lines": "L38-L42",
+      "code": "@triton.jit\ndef test_sync_block_all():\n    al.sync_block_all(\"all_cube\", 8)\n    al.sync_block_all(\"all_vector\", 9)\n    al.sync_block_all(\"all\", 10)",
+      "note": "官方 UT：四种 sync_block_all 模式各来一发",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/unittest/pytest_ut/test_compile_hint.py",
+      "lines": "L32-L45",
+      "code": "def triton_compile_hint(in_ptr0, out_ptr0, xnumel, XBLOCK: tl.constexpr, XBLOCK_SUB: tl.constexpr):\n    xoffset = tl.program_id(0) * XBLOCK\n    for xoffset_sub in range(0, XBLOCK, XBLOCK_SUB):\n        xindex = xoffset + xoffset_sub + tl.arange(0, XBLOCK_SUB)[:]\n        xmask = xindex < xnumel\n        x0 = xindex\n        tmp0 = tl.load(in_ptr0 + (x0), xmask)\n        extension.compile_hint(tmp0, \"hint_a\")\n        extension.multibuffer(tmp0, 2)\n        tmp2 = tmp0\n        extension.compile_hint(tmp2, \"hint_b\", 42)\n        extension.compile_hint(tmp2, \"hint_c\", True)\n        extension.compile_hint(tmp2, \"hint_d\", [XBLOCK, XBLOCK_SUB])\n        tl.store(out_ptr0 + (xindex), tmp2, xmask)",
+      "note": "官方 UT：compile_hint 的四种 hint 值形态（无值/int/bool/list）+ multibuffer",
+      "elide": []
+    }
+  ],
+  "key_classes": [
+    {
+      "name": "scope",
+      "file": "third_party/ascend/language/cann/extension/scope.py",
+      "responsibility": "语言层的 with 标记对象。运行期职责极小：__init__ 校验 core_mode ∈ {cube, vector}，__enter__ 在无 _builder 时抛 RuntimeError 后 return self，__exit__ 直接 return False。它不发任何 IR——语义全部由编译器对 with 的特判提供。同时它还是 ASCEND_WITH_DISPATCH 的 key。"
+    },
+    {
+      "name": "ASCEND_WITH_DISPATCH",
+      "file": "third_party/ascend/language/cann/extension/dispatch.py",
+      "responsibility": "{scope: handle_scope_with, \"mangle_ty\": mangle_ty} 两项注册表。基座 code_generator 在 import 期无条件把它并进全局 WITH_DISPATCH，于是 with 语句的 AST 处理被昇腾接管。"
+    },
+    {
+      "name": "handle_scope_with",
+      "file": "third_party/ascend/language/cann/extension/code_generator.py",
+      "responsibility": "with scope(...) 的 AST handler。两趟 visit body（第一趟在 dummy block 上试跑，探明块内定义了哪些变量及其类型后 erase；第二趟在真正的 region 里生成 IR），中间建出带 region 的 scope.scope 操作，末尾 scope_return + 结果回填，完成 SSA 穿线。"
+    },
+    {
+      "name": "PIPE / CORE / MODE",
+      "file": "third_party/ascend/language/cann/extension/core.py",
+      "responsibility": "对 pybind 导出的 ascend_ir.PIPE / CoreType / MODE 的 Python 枚举包装。PIPE 8 档、CORE 4 档（含 CUBE_OR_VECTOR / CUBE_AND_VECTOR）、MODE 3 档（SIMD/SIMT/MIX；C++ 侧类型名是 hivm::VFMode，pybind 导出名才是 MODE）。"
+    },
+    {
+      "name": "create_sync_block",
+      "file": "third_party/ascend/language/cann/extension/core.py",
+      "responsibility": "新代核间同步的公共前端：校验 sender/receiver/event_id、在两个 pipe 都缺省时按 sender 填默认配对、检查 pipe 是 PIPE 枚举实例，再按 is_set 分流到 semantic.create_sync_block_set / _wait。"
+    },
+    {
+      "name": "aux_ops.sync_block_set / sync_block_wait / sync_block_all",
+      "file": "third_party/ascend/language/cann/extension/aux_ops.py",
+      "responsibility": "旧代（已 DeprecationWarning）核间同步 API。校验与新代基本一致，但没有 pipe 概念，且经 _utils.custom_op 落到通用 CustomOp。"
+    },
+    {
+      "name": "_utils.custom_op",
+      "file": "third_party/ascend/language/cann/extension/_utils.py",
+      "responsibility": "只认三个 op 名（sync_block_all/set/wait）的手写 dispatcher，落到 builder.create_custom_op_for_inter_core_sync。与 ch07 讲的 register_custom_op 注册表是同名不同物。"
+    },
+    {
+      "name": "compile_hint / compile_hint_impl",
+      "file": "third_party/ascend/language/cann/extension/aux_ops.py",
+      "responsibility": "把任意 (名字, 值) 编译提示挂到某个张量上。值按 Python 类型分派成 bool/unit/i32/str/i64-array 属性，最终 emit annotation.mark。"
+    },
+    {
+      "name": "multibuffer",
+      "file": "third_party/ascend/language/cann/extension/aux_ops.py",
+      "responsibility": "compile_hint 的具名特例：断言 size == 2，挂 hivm.multi_buffer 提示；因为直接调 compile_hint_impl，不经过 SIMT 早退。"
+    },
+    {
+      "name": "parallel",
+      "file": "third_party/ascend/language/cann/extension/aux_ops.py",
+      "responsibility": "继承基座 tl.range，多一个 bind_sub_block 关键字，用于告诉编译器该循环由多个 vector 核参与（docstring 称 910B 上最多 2 个）。"
+    }
+  ],
+  "data_flow": [
+    "1. import triton.compiler.code_generator（python/triton/compiler/code_generator.py:L25-L31）：WITH_DISPATCH 建空表，随即 import ASCEND_WITH_DISPATCH 并 update——昇腾的 with 处理在基座 import 期即已就位，无开关。",
+    "2. 用户写 with al.scope(core_mode=\"vector\"):，@triton.jit 触发 AST 遍历，CodeGenerator.visit_With（同文件 L801-L813）取 node.items[0].context_expr。",
+    "3. visit_With 判断 context 是 ast.Call → withitemClass = self.visit(context.func) 得到 scope 类对象 → WITH_DISPATCH.get(withitemClass) 命中 handle_scope_with → return handler(self, node)。注意：scope(...) 这个调用从未真正执行，__init__/__enter__/__exit__ 全部不被调用。",
+    "4. handle_scope_with（third_party/ascend/language/cann/extension/code_generator.py:L152-L153）：_extract_scope_attributes 遍历 context_expr.keywords，只收 ast.Constant 形态的关键字实参。",
+    "5. 同文件 L155-L164：enter_sub_region 保存 liveins；create_block 建一个 dummy block，把 body visit 一遍以收集 generator.local_defs，随后 dummy.erase()——这一趟只为探明『块内定义了哪些变量、类型是什么』。",
+    "6. 同文件 L168-L177：由 local_defs 定出 names/ret_types；凡与外层 liveins 同名者，用 _verify_loop_carried_variable 校验类型一致（复用 while 循环的循环携带变量规则）。",
+    "7. 同文件 L180-L187：_build_mlir_attrs_from_scope_attrs 把 Python 关键字翻成 MLIR 属性（noinline 默认打开、core_mode → hivm.tcore_type、disable_auto_sync → hivm.disable_auto_sync、其余透传），再 create_scope_op(attrs, ret_types)。",
+    "8. 同文件 L190-L202：在 scope_op 第 0 个 region 上建 entry block（无 block 参数），把 generator.lscope 重置为 liveins.copy()，第二次 visit body（这一趟才真的发 IR），最后 scope_return(names 对应的 handle)。",
+    "9. 同文件 L206-L207：退出 enter_sub_region 后，把 scope_op.get_result(i) 包成 tensor 写回父作用域符号表——块内被赋值的变量在块外可见，且已换成 scope op 的结果值（官方 UT kernel_scope_escape 就在测这条）。",
+    "10. 下游（编译期）：scope.scope 由 outline-scope pass 外提成带 tcore_type 属性的 func.func + call（Scope/Transforms/Passes.td:L23-L68）——『这段代码跑哪种核』最终落在函数属性上。",
+    "11. 核间同步（新代）：al.sync_block_set(sender, receiver, event_id[, sender_pipe, receiver_pipe]) → create_sync_block 校验 → 缺省 pipe 配对 → semantic.create_sync_block_set → _builder.sync_block_set → C++ GetCore + buildSyncBlockOp → hivm::SyncBlockSetOp（tcore_type + tpipe + pipe + i64 flag id）。",
+    "12. 核间同步（旧代）：extension.sync_block_set(...) → DeprecationWarning → 相同的四条校验 → _utils.custom_op(builder, \"sync_block_set\", sender=…, event_id=…) → create_custom_op_for_inter_core_sync → triton::ascend::CustomOp（属性只有 [sender 字符串, i32 id]，receiver 与 pipe 信息不下传）。",
+    "13. 全体同步：al.sync_block_all(mode, event_id) → _builder.sync_block_all → GetSyncBlockModeAndPipes 按 mode 决定 SyncBlockMode 与两侧 pipe → hivm::SyncBlockOp。",
+    "14. 编译提示：al.compile_hint(ptr, name[, val]) → SIMT 模式早退 → constexpr 解包 → compile_hint_impl 类型分派 → builder.create_annotation_mark(ptr.handle, name, attr) → annotation::MarkOp 且属性挂在该 mark op 上。"
+  ],
+  "design_decisions": [
+    {
+      "decision": "with 语句被编译器特判，而不是走 Python 上下文管理器协议",
+      "why": "scope.__enter__ 只在无 builder 时报错然后 return self、__exit__ 只 return False，一行 IR 都不发；真正建 scope.scope 的是 handle_scope_with，而它是被 visit_With 通过 WITH_DISPATCH 查表调到的。因此 scope 类对象的作用是『AST 上的一个可识别标记』，__init__ 的 core_mode 校验只在把 scope 当普通对象直接构造时才生效。",
+      "evidence": "third_party/ascend/language/cann/extension/scope.py:L65-L71 + python/triton/compiler/code_generator.py:L801-L813"
+    },
+    {
+      "decision": "属性从 AST 常量实参上抓，而不是从 scope 实例上读",
+      "why": "_extract_scope_attributes 遍历 context_expr.keywords 且只接受 isinstance(keyword.value, ast.Constant)。后果：scope 的属性只能写字面量；写成变量名或 tl.constexpr 名会被静默丢弃（不报错，属性直接不生成）。",
+      "evidence": "third_party/ascend/language/cann/extension/code_generator.py:L63-L69"
+    },
+    {
+      "decision": "handle_scope_with 复用 visit_while 的套路：先在 dummy block 上试跑一遍 body",
+      "why": "MLIR 的 region op 必须在建 op 时就给出结果类型列表，而『块内定义了哪些变量、各是什么类型』只有把 body 走一遍才知道。所以第一趟在临时 block 上生成后立即 erase，只留下 local_defs 这份类型信息；第二趟才在真 region 里发 IR。源码注释自陈 'This implementation is similar to visit_while'。",
+      "evidence": "third_party/ascend/language/cann/extension/code_generator.py:L159-L164"
+    },
+    {
+      "decision": "noinline 默认打开，且只能被 noinline=False 显式摘掉",
+      "why": "_build_mlir_attrs_from_scope_attrs 以 {\"noinline\": builder.get_unit_attr()} 起手；只有传 noinline=False 才 pop。这与 scope.scope 的下游命运一致——outline-scope 要把它外提成独立 func.func，内联会破坏『整段代码归属某一种核』的语义。",
+      "evidence": "third_party/ascend/language/cann/extension/code_generator.py:L106-L112 + third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/Scope/Transforms/Passes.td:L23-L68"
+    },
+    {
+      "decision": "core_mode 只翻 cube / vector 两档，而 hivm 的 TCoreType 实际有四档",
+      "why": "_handle_core_mode_attr 遇到其它值直接 return {}（不报错、不生成属性）；builder 侧也只导出了 get_t_core_type_cube_attr / get_t_core_type_vector_attr 两个构造器。CUBE_OR_VECTOR / CUBE_AND_VECTOR 在 pybind 的 CoreType 枚举与 .td 里都存在，但语言层的 scope 到不了它们。",
+      "evidence": "third_party/ascend/language/cann/extension/code_generator.py:L84-L93 + third_party/ascend/ascend_ir.cc:L420-L425"
+    },
+    {
+      "decision": "同步事件号硬限 0~15",
+      "why": "新旧两代实现的断言一致：event_id 必须落在 [0, 16)。这是语言层能看到的、关于同步事件资源规模的唯一硬数字。区别在于旧代先 assert isinstance(event_id, int) 再查区间，新代只在 isinstance(event_id, int) 时查区间——因为新代允许 event_id 是 constexpr 或运行期 tensor。",
+      "evidence": "third_party/ascend/language/cann/extension/aux_ops.py:L72 + third_party/ascend/language/cann/extension/core.py:L209-L210"
+    },
+    {
+      "decision": "sender == receiver 被直接拒绝，只支持 cube→vector 与 vector→cube",
+      "why": "两代实现都 raise ValueError('Unexpected pair: …, only supports cube -> vector or vector -> cube')。即 sync_block_* 是『跨核事件』原语，同核内的次序不归它管。",
+      "evidence": "third_party/ascend/language/cann/extension/core.py:L211-L212 + third_party/ascend/language/cann/extension/aux_ops.py:L73-L74"
+    },
+    {
+      "decision": "set 与 wait 共享同一个 sender 参数，靠 C++ 侧按 op 名翻转落核",
+      "why": "GetCore(ctx, opName, sender)：sender==\"cube\" 时，sync_block_set 生成 TCoreType::CUBE、sync_block_wait 生成 TCoreType::VECTOR；sender==\"vector\" 时反之。也就是说这一对调用用同样的 (sender, receiver, event_id) 写在两侧代码里，落到 IR 上自动变成『发方核置位、收方核等待』。",
+      "evidence": "third_party/ascend/ascend_ir.cc:L93-L113"
+    },
+    {
+      "decision": "pipe 的缺省配对由源码写死，不需要读者猜",
+      "why": "create_sync_block 在两个 pipe 都为 None 时：sender==\"cube\" → sender_pipe=PIPE_FIX, receiver_pipe=PIPE_MTE2；sender==\"vector\" → sender_pipe=PIPE_MTE3, receiver_pipe=PIPE_MTE2。这是源码里可直接引用的 pipe 语义线索（cube 侧产出经 FIX、vector 侧产出经 MTE3、接收侧一律 MTE2）。除此之外每条 PIPE 对应哪个硬件队列，本仓 Python/pybind 层没有文字说明，不作推断。",
+      "evidence": "third_party/ascend/language/cann/extension/core.py:L213-L219"
+    },
+    {
+      "decision": "旧代 sync_block_set 的 receiver 参数只参与校验、不下传",
+      "why": "custom_op(_builder, \"sync_block_set\", sender=sender, event_id=event_id) —— receiver 没进 kwargs；_utils.custom_op 也只把 (mode_or_sender, id) 打成 ArrayAttr。旧路径 emit 的是通用 triton::ascend::CustomOp，既没有 tcore_type 也没有 pipe；新代改走 hivm::SyncBlockSetOp 才把 core + 双 pipe + i64 flag id 完整表达出来。这就是『为什么要有第二代』的直接答案。",
+      "evidence": "third_party/ascend/language/cann/extension/aux_ops.py:L75 + third_party/ascend/language/cann/extension/_utils.py:L9-L13 + third_party/ascend/triton_ascend.cc:L117-L125"
+    },
+    {
+      "decision": "新代 sync_block_all 比旧代多一档 all_sub_vector，且不再经 custom_op",
+      "why": "core.py 的断言集合是 (all_cube, all_vector, all, all_sub_vector) 并直接调 _builder.sync_block_all；aux_ops 版只认前三档并走 custom_op。C++ 侧 GetSyncBlockModeAndPipes 对四档各自决定 cube/vector 两侧 pipe（ALL_CUBE 只给 cube 侧 PIPE_ALL、ALL_VECTOR 与 ALL_SUB_VECTOR 只给 vector 侧 PIPE_ALL、ALL 两侧都给）。",
+      "evidence": "third_party/ascend/language/cann/extension/core.py:L243-L244 + third_party/ascend/ascend_ir.cc:L138-L167"
+    },
+    {
+      "decision": "PIPE 在 Python 层被收窄到 8 档",
+      "why": "HIVMAttrs.td 定义了 15 档（含 MTE4/MTE5/V2、两个 VIRTUAL_PIPE_MTE2_L1x、PIPE_NUM、PIPE_UNASSIGNED），pybind 只 .value() 导出了 8 档，Python 又照抄这 8 档包一层 enum。与 ch05 讲过的地址空间口径收窄是同一种做法：编译器内部枚举全集 ≠ 语言层可写集合。",
+      "evidence": "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMAttrs.td:L219-L253 + third_party/ascend/ascend_ir.cc:L427-L436 + third_party/ascend/language/cann/extension/core.py:L111-L119"
+    },
+    {
+      "decision": "compile_hint 用『挂标记 op』而不是改被标记 op 本身",
+      "why": "create_annotation_mark 新建一个 annotation::MarkOp 指向目标 value，再把 (key, value) setAttr 到这个 mark op 上。好处是任意提示都能挂到任意张量上而不必扩张原 op 的属性表；代价是提示与被提示者的关联要靠 mark op 的 operand 维系。官方 UT test_ascend_barrier 断言的正是 'annotation.mark' 出现在 MLIR 里。",
+      "evidence": "third_party/ascend/ascend_ir.cc:L597-L603 + third_party/ascend/unittest/pytest_ut/test_ascend_barrier.py:L54-L61"
+    },
+    {
+      "decision": "SIMT 模式下编译提示被跳过——但只在外层跳过",
+      "why": "compile_hint 开头 if _builder.is_simt_mode(): return；而 compile_hint_impl 里同样的检查被注释掉并留了 '# FIXME: is_simt_mode'。于是绕过 compile_hint 直接调 compile_hint_impl 的 multibuffer 在 SIMT 模式下不会被跳过。这是源码自带 FIXME 的现状，如实点出，不作对错判断。",
+      "evidence": "third_party/ascend/language/cann/extension/aux_ops.py:L114-L119 + L136-L139 + L153-L162"
+    },
+    {
+      "decision": "core.py 里 PIPE 被绑定了两次",
+      "why": "L61 PIPE = semantic.PIPE，L111 又 class PIPE(enum.Enum) —— 后者覆盖前者，模块对外导出的是 core.py 自己定义的那个类。两者成员同名同值（都转手同一批 ascend_ir.PIPE），但是两个不同的 Python 类，isinstance 互不成立；create_sync_block 的类型检查用的是 core.py 内的名字（即 L111 那个），semantic.create_sync_block_set 的类型标注写的是 semantic.PIPE，但那只是标注，实际只取 .value，故不出错。",
+      "evidence": "third_party/ascend/language/cann/extension/core.py:L61 + L111-L119 + L220-L221"
+    },
+    {
+      "decision": "scope 的 docstring 与签名不一致（现状记录，非推断）",
+      "why": "docstring 示例写 with extension.scope(feature_a=True):，但 __init__ 签名是 (self, core_mode: str, …)，core_mode 是必填位置参数。在 kernel 外照 docstring 构造会 TypeError；而在 kernel 里这么写反而不报错——因为 handle_scope_with 根本不构造 scope 实例，feature_a 会被当普通关键字透传成 MLIR 属性。官方 UT 一律写 core_mode=\"…\"。",
+      "evidence": "third_party/ascend/language/cann/extension/scope.py:L39 + L49 + third_party/ascend/unittest/pytest_ut/test_scope.py:L42-L44"
+    }
+  ],
+  "theory": [
+    "事件号预算：event_id ∈ [0, 16) 共 16 个可用事件槽（新旧两代断言一致）。一对 set/wait 占用一个事件号；同一时刻语义上在飞的跨核依赖边若超过 16 就必须复用事件号，而复用即引入额外次序约束。源码只给出这个上界、不给复用策略，正文只陈述预算，不作调度推断。",
+    "两趟 visit 的编译期代价：handle_scope_with 会把 with 块的 body 完整 visit 两次（第一趟生成的 IR 随 dummy.erase() 丢弃）。因此 N 层嵌套 scope 会让最内层 body 的 AST 被走 2^N 次——test_scope.py:L42-L48 的三层嵌套即 2^3 = 8 次。这是纯编译期开销，不影响运行期语义，不得引申为运行期代价。",
+    "口径收窄的两组数字（与 ch05 地址空间四档口径并列）：PIPE 在 .td 里 15 档 → pybind 8 档 → Python 8 档；TCoreType 在 .td 与 pybind 里都是 4 档，但语言层 scope 只到 2 档（cube/vector），因为 builder 只导出了 cube/vector 两个属性构造器。"
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {
+        "what": "全部文件头 license 块（scope.py L1-L21、ascend 侧 code_generator.py L1-L19、core.py L1-L21 等）",
+        "why_safe": "纯法务声明，不参与任何控制流。"
+      },
+      {
+        "what": "ascend 侧 code_generator.py 的 mangle_ty（L29-L60）",
+        "why_safe": "虽同住 ASCEND_WITH_DISPATCH，但做的是类型名字修饰，与 with/scope 语义无关；删掉后 dispatch 表只留 scope 一项，仍能完整演示 with 特判。"
+      },
+      {
+        "what": "core.py 中与本章无关的成员：IteratorType、四个 Fixpipe* 枚举与 fixpipe、ascend_address_space_base/group、copy、copy_from_ub_to_l1、sub_vec_id、sub_vec_num、int64、SYNC_IN_VF 与 debug_barrier",
+        "why_safe": "分别属于 ch05（地址空间/搬运）与 ch06/ch07（算子）的题材，与 scope/sync_block/PIPE/compile_hint 的控制流不相交；删除后 create_sync_block 链路仍完整。注意 builtin/is_builtin 必须留（@builtin 装饰器本体，且是 ch04 路由的回指）。"
+      },
+      {
+        "what": "aux_ops.py 顶部 from triton.language.semantic import (…) 名单里本章保留代码未引用的项",
+        "why_safe": "纯 import 名单。只删未用项——_constexpr_to_value、_unwrap_if_constexpr、builtin、constexpr、tensor、core、range、ir、custom_op 必须保留。"
+      },
+      {
+        "what": "semantic.py 中除 PIPE、create_sync_block_set、create_sync_block_wait 之外的内容",
+        "why_safe": "本章数据流只经过这三项；其余（copy/fixpipe/地址空间等）属别章题材。"
+      },
+      {
+        "what": "_utils.py 中 custom_op 之外的辅助函数（_is_int_like_elem / _assert_int_like_tuple / _convert_elem_to_ir_value 等）",
+        "why_safe": "服务于 block pointer 参数转换，不在 sync_block 调用链上。"
+      },
+      {
+        "what": "基座 code_generator.py 中除 WITH_DISPATCH 建表/update 与 visit_With 之外的全部内容",
+        "why_safe": "精简版只需展示『with 如何被查表接管』这一条缝；基座其余 visit_* 属 Triton 基座题材（对位基座 ch04 已讲）。"
+      }
+    ],
+    "must_keep": [
+      {
+        "symbol": "scope",
+        "why": "本章主角类；读者要亲眼看到它有多空。"
+      },
+      {
+        "symbol": "__enter__",
+        "why": "空实现是本章第一个反直觉点。"
+      },
+      {
+        "symbol": "__exit__",
+        "why": "直接 return False，与 __enter__ 成对构成『上下文管理器协议在这里不承载语义』的证据。"
+      },
+      {
+        "symbol": "ASCEND_WITH_DISPATCH",
+        "why": "with 特判的注册表本体，key 是类对象这一点必须能看到。"
+      },
+      {
+        "symbol": "WITH_DISPATCH",
+        "why": "基座的全局表，import 期被昇腾 update——ch04 路由主题的回指。"
+      },
+      {
+        "symbol": "visit_With",
+        "why": "基座侧的查表点；没有它就看不出 scope(...) 其实从未被执行。"
+      },
+      {
+        "symbol": "handle_scope_with",
+        "why": "真正干活的 AST handler，本章核心。"
+      },
+      {
+        "symbol": "_extract_scope_attributes",
+        "why": "『属性从 AST 常量上抓』的证据，决定属性只能写字面量。"
+      },
+      {
+        "symbol": "_py_value_to_mlir_attr",
+        "why": "Python 类型 → MLIR 属性构造表，四种类型一目了然。"
+      },
+      {
+        "symbol": "_handle_core_mode_attr",
+        "why": "core_mode 只翻两档、其余静默返回空 dict。"
+      },
+      {
+        "symbol": "_build_mlir_attrs_from_scope_attrs",
+        "why": "noinline 默认打开 / disable_auto_sync 改名 / 其余透传三条规则都在这里。"
+      },
+      {
+        "symbol": "_verify_loop_carried_variable",
+        "why": "scope 复用 while 的循环携带变量类型校验，是『scope 像个 region op』的直接佐证。"
+      },
+      {
+        "symbol": "_reconstruct_value_from_ir",
+        "why": "SSA 穿线收尾：把 scope op 的 result 变回 tensor 写回父作用域。"
+      },
+      {
+        "symbol": "enter_sub_region",
+        "why": "liveins 的来源；两趟 visit 的作用域切换靠它。"
+      },
+      {
+        "symbol": "scope_return",
+        "why": "region 的终结符，SSA 穿线的出口。"
+      },
+      {
+        "symbol": "create_scope_op",
+        "why": "scope.scope 的建造点（属性 + 结果类型一次给全）。"
+      },
+      {
+        "symbol": "sync_block_set",
+        "why": "两代都要保留同名符号；核间同步的主角。"
+      },
+      {
+        "symbol": "sync_block_wait",
+        "why": "set/wait 成对才是协议；C++ 按 op 名翻转落核只有成对才能讲清。"
+      },
+      {
+        "symbol": "sync_block_all",
+        "why": "第三种同步形态（全体），新旧两代模式集合不同。"
+      },
+      {
+        "symbol": "create_sync_block",
+        "why": "新代公共前端：四条校验 + pipe 缺省配对 + PIPE 类型检查全在这里。"
+      },
+      {
+        "symbol": "create_sync_block_set",
+        "why": "event_id 三形态（int/constexpr/tensor）归一为 IR handle 的地方。"
+      },
+      {
+        "symbol": "create_sync_block_wait",
+        "why": "与 set 同构，成对保留。"
+      },
+      {
+        "symbol": "custom_op",
+        "why": "旧代落地路径；也是与 ch07 的 register_custom_op 划清界限的对照物。"
+      },
+      {
+        "symbol": "sender_pipe",
+        "why": "新代相对旧代多出的关键参数，缺省配对是本章唯一可引的 pipe 语义。"
+      },
+      {
+        "symbol": "receiver_pipe",
+        "why": "同上，成对。"
+      },
+      {
+        "symbol": "event_id",
+        "why": "0~15 的事件号预算，本章唯一的资源硬数字。"
+      },
+      {
+        "symbol": "PIPE",
+        "why": "8 档流水线枚举，章名四要素之一。"
+      },
+      {
+        "symbol": "PIPE_FIX",
+        "why": "cube 侧缺省 sender pipe，出现在源码写死的配对里。"
+      },
+      {
+        "symbol": "PIPE_MTE2",
+        "why": "两种缺省配对里共同的 receiver pipe。"
+      },
+      {
+        "symbol": "PIPE_MTE3",
+        "why": "vector 侧缺省 sender pipe。"
+      },
+      {
+        "symbol": "CORE",
+        "why": "四档核类型枚举，用来对比 scope 只到两档。"
+      },
+      {
+        "symbol": "CUBE_OR_VECTOR",
+        "why": "语言层 scope 到不了、但枚举里真实存在的一档，是『口径收窄』的证据。"
+      },
+      {
+        "symbol": "CUBE_AND_VECTOR",
+        "why": "同上。"
+      },
+      {
+        "symbol": "MODE",
+        "why": "SIMD/SIMT/MIX 三档，与 compile_hint 的 SIMT 早退呼应。"
+      },
+      {
+        "symbol": "compile_hint",
+        "why": "章名四要素之一；外层的 SIMT 早退在这里。"
+      },
+      {
+        "symbol": "compile_hint_impl",
+        "why": "类型分派表 + create_annotation_mark；被 FIXME 注掉的 SIMT 检查也在这里。"
+      },
+      {
+        "symbol": "multibuffer",
+        "why": "compile_hint 的具名特例，且是绕过 SIMT 早退的那条路。"
+      },
+      {
+        "symbol": "is_simt_mode",
+        "why": "SIMT 早退的判定；ch06 flip 双路径已见过。"
+      },
+      {
+        "symbol": "parallel",
+        "why": "bind_sub_block 是语言层另一处双核编排入口。"
+      },
+      {
+        "symbol": "bind_sub_block",
+        "why": "同上，可检测的关键字名。"
+      },
+      {
+        "symbol": "core_mode",
+        "why": "scope 的唯一保留关键字，也是 docstring/签名不一致的焦点。"
+      },
+      {
+        "symbol": "disable_auto_sync",
+        "why": "官方 UT 里唯一示范的额外关键字，落成 hivm.disable_auto_sync（改名规则的证据）。"
+      },
+      {
+        "symbol": "noinline",
+        "why": "默认打开、可被 False 摘掉；与下游 outline-scope 呼应。"
+      }
+    ]
+  },
+  "mechanisms": [
+    {
+      "id": "M1",
+      "name": "with 语句被编译器特判：WITH_DISPATCH 查表接管 AST",
+      "kind": "protocol",
+      "source_anchors": [
+        "python/triton/compiler/code_generator.py:L801-L813",
+        "python/triton/compiler/code_generator.py:L25-L31",
+        "third_party/ascend/language/cann/extension/dispatch.py:L31-L34"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "M2",
+      "name": "scope 类的空壳性：__enter__/__exit__ 不发 IR，构造函数在 kernel 内根本不被调用",
+      "kind": "protocol",
+      "source_anchors": [
+        "third_party/ascend/language/cann/extension/scope.py:L49-L71"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "M3",
+      "name": "handle_scope_with 的两趟 visit 与 SSA 穿线（dummy block 试跑 → 建 region → 重跑 → scope_return → 回填）",
+      "kind": "algorithm",
+      "source_anchors": [
+        "third_party/ascend/language/cann/extension/code_generator.py:L155-L164",
+        "third_party/ascend/language/cann/extension/code_generator.py:L168-L177",
+        "third_party/ascend/language/cann/extension/code_generator.py:L190-L207"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "M4",
+      "name": "scope 关键字 → MLIR 属性的翻译规则（core_mode / noinline / disable_auto_sync / 透传）",
+      "kind": "config",
+      "source_anchors": [
+        "third_party/ascend/language/cann/extension/code_generator.py:L63-L69",
+        "third_party/ascend/language/cann/extension/code_generator.py:L84-L118"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "M5",
+      "name": "scope.scope 的下游命运：outline-scope 把 region 外提成带 tcore_type 的 func.func",
+      "kind": "dataflow",
+      "source_anchors": [
+        "third_party/ascend/ascend_ir.cc:L664-L681",
+        "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/Scope/IR/ScopeOps.td:L34-L65",
+        "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/Scope/Transforms/Passes.td:L23-L68"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "M6",
+      "name": "sync_block 的两代实现对照：通用 CustomOp（旧）vs hivm.sync_block_set/wait（新）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "third_party/ascend/language/cann/extension/aux_ops.py:L57-L96",
+        "third_party/ascend/language/cann/extension/_utils.py:L5-L16",
+        "third_party/ascend/triton_ascend.cc:L117-L125",
+        "third_party/ascend/language/cann/extension/core.py:L202-L234"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "M7",
+      "name": "核间同步的参数契约：sender/receiver ∈ {cube, vector}、sender ≠ receiver、event_id ∈ [0,16)",
+      "kind": "protocol",
+      "source_anchors": [
+        "third_party/ascend/language/cann/extension/core.py:L205-L212",
+        "third_party/ascend/language/cann/extension/aux_ops.py:L67-L74"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "M8",
+      "name": "sender_pipe / receiver_pipe 的缺省配对（cube→FIX/MTE2、vector→MTE3/MTE2）与 PIPE 类型检查",
+      "kind": "config",
+      "source_anchors": [
+        "third_party/ascend/language/cann/extension/core.py:L213-L221"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "M9",
+      "name": "GetCore 按 op 名翻转落核：同一个 sender 参数，set 落发方核、wait 落收方核",
+      "kind": "algorithm",
+      "source_anchors": [
+        "third_party/ascend/ascend_ir.cc:L93-L113",
+        "third_party/ascend/ascend_ir.cc:L115-L136"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "M10",
+      "name": "event_id 三形态（int / constexpr / tensor）归一为 IR handle，并在 C++ 侧提升到 i64",
+      "kind": "dataflow",
+      "source_anchors": [
+        "third_party/ascend/language/cann/extension/semantic.py:L62-L87",
+        "third_party/ascend/ascend_ir.cc:L122-L128"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "M11",
+      "name": "sync_block_all 的四种模式与两侧 pipe 的映射（含新代独有的 all_sub_vector）",
+      "kind": "config",
+      "source_anchors": [
+        "third_party/ascend/language/cann/extension/core.py:L237-L244",
+        "third_party/ascend/language/cann/extension/aux_ops.py:L39-L54",
+        "third_party/ascend/ascend_ir.cc:L138-L167"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "M12",
+      "name": "PIPE 口径收窄：.td 15 档 → pybind 8 档 → Python 8 档（与 ch05 地址空间口径同型）",
+      "kind": "layout",
+      "source_anchors": [
+        "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMAttrs.td:L219-L253",
+        "third_party/ascend/ascend_ir.cc:L427-L436",
+        "third_party/ascend/language/cann/extension/core.py:L111-L119"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "M13",
+      "name": "TCoreType 四档 vs 语言层可达两档：CUBE_OR_VECTOR / CUBE_AND_VECTOR 从 scope 到不了",
+      "kind": "layout",
+      "source_anchors": [
+        "third_party/ascend/language/cann/extension/core.py:L104-L108",
+        "third_party/ascend/ascend_ir.cc:L420-L425",
+        "third_party/ascend/language/cann/extension/code_generator.py:L84-L93"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "M14",
+      "name": "compile_hint 的类型分派与 annotation.mark 落地（挂标记 op 而非改原 op）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "third_party/ascend/language/cann/extension/aux_ops.py:L114-L151",
+        "third_party/ascend/ascend_ir.cc:L597-L603"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "M15",
+      "name": "SIMT 模式下提示被跳过——外层跳、内层检查被 FIXME 注掉，故 multibuffer 不受门控",
+      "kind": "config",
+      "source_anchors": [
+        "third_party/ascend/language/cann/extension/aux_ops.py:L114-L119",
+        "third_party/ascend/language/cann/extension/aux_ops.py:L136-L139",
+        "third_party/ascend/language/cann/extension/aux_ops.py:L153-L162"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "M16",
+      "name": "parallel(bind_sub_block=…)：语言层另一处双核编排入口",
+      "kind": "config",
+      "source_anchors": [
+        "third_party/ascend/language/cann/extension/aux_ops.py:L99-L111"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "M17",
+      "name": "core.py 里 PIPE 被绑定两次（L61 转手 semantic.PIPE，L111 又自定义同名 enum 覆盖）",
+      "kind": "config",
+      "source_anchors": [
+        "third_party/ascend/language/cann/extension/core.py:L61",
+        "third_party/ascend/language/cann/extension/core.py:L111-L119",
+        "third_party/ascend/language/cann/extension/core.py:L220-L221"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "M18",
+      "name": "scope 的 doc/code 不一致：docstring 示例 feature_a=True vs 必填位置参数 core_mode",
+      "kind": "protocol",
+      "source_anchors": [
+        "third_party/ascend/language/cann/extension/scope.py:L32-L47",
+        "third_party/ascend/language/cann/extension/scope.py:L49-L63",
+        "third_party/ascend/unittest/pytest_ut/test_scope.py:L42-L44"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    }
+  ],
+  "open_questions": [
+    "8 条 PIPE 各自对应哪个硬件队列 / 有什么时序语义：本仓 Python、pybind 与 HIVMAttrs.td 均无文字说明（.td 只有 'HIVM Op Pipe' 一句 summary）。可引的线索仅有 create_sync_block 写死的缺省配对，以及散落在各 Op 上的 OpPipeTrait（如某 DMA op 标 PIPE_FIX、部分 macro op 标 'PIPE_MTE1, PIPE_M'）。正文只陈述这些出处，不得逐条给 PIPE 编派硬件语义。",
+    "CUBE_OR_VECTOR / CUBE_AND_VECTOR 的调度含义：枚举在 HIVMAttrs.td:L317-L318 与 pybind ascend_ir.cc:L423-L424 里真实存在，但 scope 的 _handle_core_mode_attr 到不了、sync_block 的 GetCore 也只产 CUBE/VECTOR。本章不推断其调度语义，只如实记『语言层够不着』。",
+    "scope 除 core_mode / noinline / disable_auto_sync 之外的『其它关键字』会被原样透传成 MLIR 属性——下游哪些 pass 会消费这些属性，本仓 Python 侧无文档；正文只讲翻译规则，不讲消费方。",
+    "event_id 上限 16 是否对应硬件 flag 寄存器数量：源码只有断言、无注释说明来源。",
+    "宿主无昇腾 NPU/CANN：本章一切 IR 结论应以 ast_to_ttir 的编译期产物为准（官方 UT test_scope.py 断言 'scope.scope'/'hivm.tcore_type'/'hivm.disable_auto_sync'、test_ascend_barrier.py 断言 'annotation.mark' 出现在输出 MLIR），不得给真机数值。",
+    "IR 阶段标注口径：scope.scope / hivm.sync_block_* / annotation.mark 均由 AST → ttir 阶段（ast_to_ttir）直接 emit；outline-scope 属其后的 ttadapter 侧 pass。正文给 IR 片段必标阶段，且方言前缀按各 op 真实前缀写（scope. / hivm. / annotation. / ascend.），不要一律写 tt.。"
+  ],
+  "lead_brief_corrections": [
+    "Lead brief 第 5 条称旧代 sync_block 走的 custom_op『正是 ch07 讲过的自定义算子注册表』——经核对不成立。aux_ops.py 用的是 from ._utils import custom_op（third_party/ascend/language/cann/extension/_utils.py:L5），那是一个只认三个 op 名的手写 dispatcher，落到 builder.create_custom_op_for_inter_core_sync；ch07 讲的是 custom_op.py 里的 register_custom_op 注册表。两者同名不同物。正文可以把这一点当『同名陷阱』点出，但不得说旧代 sync_block 复用了 ch07 的注册表。",
+    "Lead brief 第 2 条称 scope.__enter__『只 return self』——更准确：__enter__ 先在 self._builder is None 时 raise RuntimeError('scope can only be used inside a Triton kernel')，再 return self。结论（不发 IR）不变；且由于 with 被特判，kernel 内 __enter__ 根本不会被调用。",
+    "Lead brief 第 4 条把 SIMD/SIMT/MIX 那个枚举称作 VFMode——Python 侧导出名是 MODE（core.py:L122），C++ 侧类型才是 hivm::VFMode（ascend_ir.cc:L438 py::enum_<hivm::VFMode>(m, \"MODE\", …)）。另外 core.py 里的 is_simt_mode 是基座 TritonOpBuilder 的方法（python/src/ir.cc:L616），不是昇腾新增。",
+    "Lead brief 第 5 条称旧代 sync_block_all 有 mode 断言——确认；补：新代 core.py 版比旧代多一档 all_sub_vector（旧代只认 all_cube/all_vector/all）。",
+    "Lead brief 第 3 条 doc/code 不一致——确认，补一条：由于 handle_scope_with 从不构造 scope 实例，kernel 内照 docstring 写 scope(feature_a=True) 并不会 TypeError，只会把 feature_a 透传成 MLIR 属性；TypeError 只发生在 kernel 外手工构造时。",
+    "Lead brief 第 4 条称『PIPE 8 个』——Python/pybind 层确为 8 个，但 HIVMAttrs.td 里实际定义 15 档；本章按『口径收窄』讲，两个数字都要给。"
+  ],
+  "foreshadow_due": {
+    "raw": "python3 scripts/bible.py due ch08 → 『== ch08 应埋伏笔 ==』与『== ch08 应回收 ==』两节均为空",
+    "plant": [],
+    "harvest": [],
+    "note": "Bible 未登记 ch08 的伏笔项。本章仍须履行连贯性要求：承 ch02（cube/vector 双核）、ch04（双 builder 与 dispatch 路由——WITH_DISPATCH 是同一路由思路的第二个入口，不重复讲路由机制本身）、ch05（口径收窄叙事，本章以 PIPE 15→8 与 TCoreType 4→2 复用该口径）、ch07（custom_op 同名陷阱，须显式划清界限）；作为 Part 2 收官，小结须收拢语言层并指向 Part 3（MLIR/Linalg primer → 下降链，scope.scope 的 outline-scope 与 hivm.sync_block_* 正是下降链入口）。"
+  }
+}
