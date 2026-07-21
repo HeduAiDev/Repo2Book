@@ -1,0 +1,192 @@
+{
+  "chapter_id": "ch07",
+  "title": "自定义算子框架与 Ascend libdevice：register_custom_op 与数学库",
+  "one_line": "基座 triton 的 extern_elementwise 只能『调』预置符号；昇腾多出 register_custom_op『注册』自定义算子（把算子经 CORE/PIPE/MODE 绑到 cube/vector 核与流水线，带 bitcode/indexing_map 下降到 hivm.CustomOp），并用 __hmf_ 华为数学函数库支撑 libdevice——这是 GPU 侧没有的语言层扩展。",
+
+  "code_spine": [
+    "third_party/ascend/language/cann/extension/custom_op.py:L324-L345  register_custom_op：装饰类→校验 core/pipe/mode→抽 __init__ signature→塞进 _custom_op_registry",
+    "third_party/ascend/language/cann/extension/custom_op.py:L34  _custom_op_registry：name→op class 的全局注册表",
+    "third_party/ascend/language/cann/extension/custom_op.py:L318-L321  custom（@core.builtin 入口）→ custom_semantic",
+    "third_party/ascend/language/cann/extension/custom_op.py:L294-L315  custom_semantic：查表取 op class→实例化跑校验→拆 in/out operands→_make_attrs→create_custom_op→包结果",
+    "third_party/ascend/language/cann/extension/custom_op.py:L37-L51  _get_op_class：注册表命中或 __builtin_ 前缀走 dummy class（默认 VECTOR/PIPE_V/SIMT）",
+    "third_party/ascend/language/cann/extension/custom_op.py:L245-L271  _make_attrs：core/pipe/mode → hivm.tcore_type/hivm.pipe/hivm.vf_mode；非 builtin 强制 symbol+bitcode；挂 indexing_map/iterator_types/extra_buffers/source/compile",
+    "third_party/ascend/ascend_ir.cc:L618-L659  create_custom_op（C++ builder 绑定）：emit hivm::CustomOp，把 attrs/arg_attrs 挂上 —— 这是经 ch04 双 builder 下降的接缝",
+    "third_party/ascend/language/cann/extension/builtin_custom_ops.py:L30-L77  _index_select：@register_custom_op 的真实样例（__builtin_ 内建算子，CORE.VECTOR/PIPE_V/SIMT + __init__ 形状校验 + arg_type 动态定型）",
+    "third_party/ascend/language/cann/libdevice.py:L28-L34  reciprocal：@core.extern 经 extern_elementwise 调 __hmf_recipf/__hmf_recipDh（华为数学函数库符号）",
+    "third_party/ascend/language/cann/libdevice.py:L81-L93  tanh：SIMT/910_95 走 __hmf_tanh_fp32，否则退回多 dtype 的 __hmf_tanhf/__hmf_tanhDh —— libdevice『extern 调符号』分支",
+    "third_party/ascend/language/cann/libdevice.py:L215-L273  acos：SIMT 走 __hmf_acos_*，否则纯 triton 语义多项式逼近 —— libdevice『无 __hmf_ 时纯 IR 组合』分支",
+    "third_party/ascend/language/cann/extension/math_ops.py:L32-L42  isfinited：@jit 组合 isnan/isinf 的昇腾数学算子（非 extern、非 register_custom_op，第三条路）",
+    "third_party/ascend/language/cann/__init__.py:L24-L52  包组装：libdevice.atan2/isfinited/finitef 等被 math_ops 覆盖挂载，libdevice.exp/log/... 直接复用基座 math"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "third_party/ascend/language/cann/extension/custom_op.py",
+      "lines": "L324-L345",
+      "what": "register_custom_op —— 本章主角：把一个 Python 类『注册』成可经 al.custom() 调用的自定义算子",
+      "code": "def register_custom_op(op):\n    \"\"\"Register a custom operation so that we can invoke it using al.custom().\"\"\"\n    assert inspect.isclass(op), \"@register_custom_op should decorate on a class.\"\n    # Use class name if name not set.\n    if not hasattr(op, 'name'):\n        setattr(op, 'name', op.__name__)\n    # The op name should not be used.\n    assert op.name not in _custom_op_registry, f\"Custom op name '{op.name}' already used.\"\n\n    # Check required core, pipe, mode fields.\n    assert hasattr(op, 'core'), \"'core' field is required.\"\n    assert hasattr(op, 'pipe'), \"'pipe' field is required.\"\n    assert hasattr(op, 'mode'), \"'mode' field is required.\"\n    assert isinstance(op.core, core.CORE), \"Invalid 'core' field, CORE type is required.\"\n    assert isinstance(op.pipe, core.PIPE), \"Invalid 'pipe' field, PIPE type is required.\"\n    assert isinstance(op.mode, core.MODE), \"Invalid 'mode' field, MODE type is required.\"\n    # Retrieve arguments signature from __init__ method and save it.\n    signature = inspect.signature(op)\n    setattr(op, 'signature', signature)\n    # Register the custom op configuration.\n    _custom_op_registry[op.name] = op\n    return op",
+      "elide": ["无——整段是注册全流程，逐行都要讲"]
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/custom_op.py",
+      "lines": "L33-L34",
+      "what": "全局注册表 —— register_custom_op 写入、custom_semantic 读取的唯一真相源",
+      "code": "# Registry for custom op, mapping name to its configuration.\n_custom_op_registry = {}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/custom_op.py",
+      "lines": "L294-L321",
+      "what": "custom_semantic + custom：调用侧入口。查表→实例化（跑 __init__ 校验）→拆 operands→造 attrs→create_custom_op emit IR",
+      "code": "def custom_semantic(name: str, *args, _builder=None, **kwargs):\n    name = _unwrap_constexpr(name)\n    # Get op class according the name.\n    op_class = _get_op_class(name)\n    # Convert constexpr to value in arguments.\n    args = _unwrap_constexpr(args)\n    kwargs = _unwrap_constexpr(kwargs)\n    # Create op instance from op class with the arguments.\n    op = _init_op(op_class, *args, **kwargs)\n    # Prepare inputs and outputs operands.\n    out = kwargs.pop('out', [])\n    outs = out if isinstance(out, (list, tuple)) else [out]\n    outputs = _to_operands(outs, _builder)\n    inputs = _args_to_operands(op, _builder, args, kwargs)\n    # Setup attributes.\n    attrs = _make_attrs(op, _builder)\n    arg_attrs = _make_arg_attrs(op, _builder)\n    # Build IR for the custom op.\n    res = _builder.create_custom_op(name, attrs, inputs, outputs, arg_attrs)\n    # Results with same types as outputs.\n    res_types = [out.type for out in outs]\n    return _to_result(res, res_types)\n\n\n@core.builtin\ndef custom(name: str, *args, _builder=None, **kwargs):\n    \"\"\"Invoke a custom operation with the given name and arguments.\"\"\"\n    return custom_semantic(name, *args, _builder=_builder, **kwargs)",
+      "elide": ["_to_operands/_args_to_operands/_to_value 的逐类型 int/float→builder.get_intXX 转换细节可在 writer 处一句带过，不必逐行内嵌"]
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/custom_op.py",
+      "lines": "L37-L51",
+      "what": "_get_op_class：注册表未命中时，只允许 __builtin_ 前缀的内建算子走 dummy class（默认 VECTOR/PIPE_V/SIMT），否则报『未注册』",
+      "code": "def _get_op_class(name):\n    # Try to get op class in _custom_op_registry.\n    op_class = _custom_op_registry.get(name)\n    if op_class is None:\n        # Allow bulitin custom ops used without registry.\n        assert name.startswith('__builtin_'), f\"Custom Op '{name}' not registered.\"\n        # Return a dummy op class for builtin custom op.\n        op_class = type(\"_builtin_custom_op\", (object, ), {\n            \"name\": name,\n            \"core\": core.CORE.VECTOR,\n            \"pipe\": core.PIPE.PIPE_V,\n            \"mode\": core.MODE.SIMT,\n            \"signature\": inspect.signature(object),\n        })\n    return op_class",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/custom_op.py",
+      "lines": "L245-L271",
+      "what": "_make_attrs：把 op 的 core/pipe/mode 翻译成 hivm.tcore_type/hivm.pipe/hivm.vf_mode 三个 IR 属性；非 builtin 算子强制要 symbol+bitcode；可选挂 indexing_map/iterator_types/extra_buffers/source/compile",
+      "code": "def _make_attrs(op, builder):\n    attrs = {\n        'hivm.tcore_type': builder.get_core_type_attr(op.core.value),\n        'hivm.pipe': builder.get_pipe_attr(op.pipe.value),\n        'hivm.vf_mode': builder.get_vf_mode_attr(op.mode.value),\n    }\n\n    if not op.name.startswith('__builtin_'):\n        assert hasattr(op, 'symbol'), f\"Non builtin custom op, symbol is required.\"\n        assert hasattr(op, 'bitcode'), f\"Non builtin custom op, bitcode path is required.\"\n\n    # Add bit code path attribute, formalize to abosulte path.\n    _add_bitcode_attr(op, builder, attrs)\n\n\n    _add_optional_indexing_map_attr(op, builder, attrs)\n    _add_optional_iterator_types_attr(op, builder, attrs)\n\n    _add_optional_extra_buffer_attr(op, builder, attrs)\n\n    _add_optional_attr(op, 'symbol', builder, attrs)\n    _add_optional_attr(op, 'source', builder, attrs)\n    _add_optional_attr(op, 'compile', builder, attrs)\n    # Extra attributes can be added here, such as op.extra_attr=\"attr_a=xx\"\n    _add_optional_attr(op, 'extra_attr', builder, attrs)\n\n    return attrs",
+      "elide": ["_add_bitcode_attr / _add_optional_indexing_map_attr 等私有辅助函数的实现（Path 存在性断言、get_affine_map_array_attr 调用）可点到即止——bitcode/indexing_map 的『语义与下降』归 P5，本章只讲『register 表面：这些参数存在、如何挂成 IR 属性』"]
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/core.py",
+      "lines": "L104-L126",
+      "what": "CORE/PIPE/MODE 三枚举 —— register_custom_op 的必填字段类型，把算子绑到 cube/vector 核（呼应 ch02 硬件）、流水线 PIPE、执行模式 SIMT/SIMD/MIX（呼应 ch08 scope）",
+      "code": "class CORE(enum.Enum):\n    VECTOR = ascend_ir.CoreType.VECTOR\n    CUBE = ascend_ir.CoreType.CUBE\n    CUBE_OR_VECTOR = ascend_ir.CoreType.CUBE_OR_VECTOR\n    CUBE_AND_VECTOR = ascend_ir.CoreType.CUBE_AND_VECTOR\n\n\nclass PIPE(enum.Enum):\n    PIPE_S = ascend_ir.PIPE.PIPE_S\n    PIPE_V = ascend_ir.PIPE.PIPE_V\n    PIPE_M = ascend_ir.PIPE.PIPE_M\n    PIPE_MTE1 = ascend_ir.PIPE.PIPE_MTE1\n    PIPE_MTE2 = ascend_ir.PIPE.PIPE_MTE2\n    PIPE_MTE3 = ascend_ir.PIPE.PIPE_MTE3\n    PIPE_ALL = ascend_ir.PIPE.PIPE_ALL\n    PIPE_FIX = ascend_ir.PIPE.PIPE_FIX\n\n\nclass MODE(enum.Enum):\n    SIMD = ascend_ir.MODE.SIMD\n    SIMT = ascend_ir.MODE.SIMT\n    MIX = ascend_ir.MODE.MIX",
+      "elide": ["IteratorType 枚举（Parallel/Broadcast/…12 种）与 indexing_map 配套，属 P5 下降语义，本章只需一句 gloss，不逐项内嵌"]
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/builtin_custom_ops.py",
+      "lines": "L74-L103",
+      "what": "_index_select —— @register_custom_op 的真实内建样例：类字段 name/core/pipe/mode 就是注册表要的四要素（这里是 __builtin_ 前缀内建算子，故 symbol/bitcode 可省），__init__ 做形状/dtype 校验并用 self.arg_type 给参数动态定型",
+      "code": "    name = '__builtin_index_select'\n    core = CORE.VECTOR\n    pipe = PIPE.PIPE_V\n    mode = MODE.SIMT\n\n    def __init__(self, src, index, dim, bound: tl.int64, end_offset, start_offset, src_stride, other=None, out=None):\n        assert src.type.is_ptr() or src.dtype.is_ptr(), f\"src should be a pointer, but got {src.type}\"\n        assert index.dtype.is_int(), \"index should be integer tensor\"\n        src_rank = len(src_stride)\n        idx_rank = len(index.shape) \n        assert 2 <= src_rank <= 5, f\"src rank should in [2, 5], but got {src_rank}\"\n        assert 1 <= idx_rank <= 2, f\"index rank should in [1, 2], but got {idx_rank}\"\n        assert _is_int_like_elem(dim), \"dim should be an integer\"\n        assert _is_int_like_elem(bound), \"bound should be an integer\"\n        assert 0 <= dim < src_rank, f\"dim should in [0, {src_rank - 1}], but got {dim}\"\n        assert len(start_offset) == len(src_stride), \"start_offset and src_stride should have same size\"\n        assert len(end_offset) == idx_rank + len(start_offset) - 1, \"len(end_offset) should be equal to index rank + len(start_offset) - 1\"\n\n        _assert_int_like_tuple(\"end_offset\", end_offset)\n        _assert_int_like_tuple(\"start_offset\", start_offset)\n        _assert_int_like_tuple(\"src_stride\", src_stride)\n\n        assert out, \"out is required\"\n        assert out.dtype == src.dtype.element_ty, \"out should have same dtype as src\"\n\n        # use index type for end_offset, start_offset and src_stride.\n        self.arg_type['end_offset'] = index.dtype\n        self.arg_type['start_offset'] = index.dtype\n        self.arg_type['src_stride'] = index.dtype\n        self.extra_attr = f\"src_stride_len={len(src_stride)}\"",
+      "elide": ["类 docstring（L32-L73，含 2D~5D 各 rank 的 Reference formula）—— 说明算子语义，writer 可摘 1~2 行，不必内嵌；@register_custom_op 装饰器行 L30 在类定义上方"]
+    },
+    {
+      "path": "third_party/ascend/language/cann/libdevice.py",
+      "lines": "L28-L34",
+      "what": "reciprocal —— libdevice 最简样例：@core.extern 装饰，经基座 extern_elementwise 把 (dtype)→符号名 的映射调到华为数学函数库的 __hmf_ 符号",
+      "code": "@core.extern\ndef reciprocal(arg0, _builder=None):\n    return core.extern_elementwise(\n        \"\", \"\", [arg0], {\n            (core.dtype(\"fp32\"),): (\"__hmf_recipf\", core.dtype(\"fp32\")),\n            (core.dtype(\"fp16\"),): (\"__hmf_recipDh\", core.dtype(\"fp16\")),\n        }, is_pure=True, _builder=_builder)",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/language/cann/libdevice.py",
+      "lines": "L81-L93",
+      "what": "tanh —— libdevice 的双分支范式：910_95 + SIMT 开关下走单一 __hmf_tanh_fp32；否则退回多 dtype 的 __hmf_tanhf/__hmf_tanhDh。展示 __hmf_ 符号命名随 dtype/架构而变",
+      "code": "@core.extern\ndef tanh(arg0, _builder=None):\n    if triton_enable_libdevice_simt() and is_compile_on_910_95:\n        return core.extern_elementwise(\n            \"\", \"\", [arg0], {\n                (core.dtype(\"fp32\"), ): (\"__hmf_tanh_fp32\", core.dtype(\"fp32\")),\n            }, is_pure=True, _builder=_builder)\n    else:\n        return core.extern_elementwise(\n            \"\", \"\", [arg0], {\n                (core.dtype(\"fp32\"), ): (\"__hmf_tanhf\", core.dtype(\"fp32\")),\n                (core.dtype(\"fp16\"), ): (\"__hmf_tanhDh\", core.dtype(\"fp16\")),\n            }, is_pure=True, _builder=_builder)",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/language/cann/extension/math_ops.py",
+      "lines": "L32-L42",
+      "what": "isfinited —— 第三条路：既非 extern 调 __hmf_、也非 register_custom_op，而是 @jit 用纯 triton 语义组合 isnan/isinf。展示昇腾数学算子的组合式实现",
+      "code": "@core._tensor_member_fn\n@jit\n@math._add_math_1arg_docstr(\"isfinited\")\ndef isfinited(x):\n    _is_int8_type: core.constexpr = x.dtype.is_int8()\n    core.static_assert(not _is_int8_type, f\"Expected dtype fp16/fp32/bf16, but got int8 or int1\")\n    _is_floating_type: core.constexpr = x.dtype.is_floating()\n    core.static_assert(_is_floating_type == True, f\"Expected dtype fp16/fp32/bf16, but got {core.constexpr(x.dtype)}\")\n    nan_mask = isnan(x)\n    inf_mask = isinf(x)\n    return (~nan_mask & ~inf_mask).to(int1)",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/language/cann/__init__.py",
+      "lines": "L27-L52",
+      "what": "cann 包组装：libdevice 命名空间被 math_ops / 基座 triton math 动态覆盖挂载 —— 解释『为什么 libdevice.exp 直接是基座 math.exp、而 libdevice.isfinited 是昇腾 math_ops 的』",
+      "code": "extension.parallel = extension.aux_ops.parallel\nif not triton_enable_libdevice_simt():\n    libdevice.atan2 = extension.math_ops.atan2\nlibdevice.isfinited = extension.math_ops.isfinited\nlibdevice.finitef = extension.math_ops.finitef\nlibdevice.flip = extension.flip\n\nlibdevice.umulhi = math.umulhi\nlibdevice.exp = math.exp\nlibdevice.exp2 = math.exp2\nlibdevice.log = math.log\nlibdevice.log2 = math.log2\nlibdevice.cos = math.cos\nlibdevice.sin = math.sin\nlibdevice.sqrt = math.sqrt\nlibdevice.sqrt_rn = math.sqrt_rn\nlibdevice.rsqrt = math.rsqrt\nlibdevice.div_rn = math.div_rn\nlibdevice.erf = math.erf\nlibdevice.floor = math.floor\nlibdevice.ceil = math.ceil\nlibdevice.fdiv = math.fdiv\nlibdevice.fma = math.fma\nlibdevice.abs = math.abs\n\n__all__ = [\"libdevice\", \"extension\"]",
+      "elide": []
+    }
+  ],
+
+  "key_classes": [
+    {"name": "register_custom_op", "file": "third_party/ascend/language/cann/extension/custom_op.py", "responsibility": "装饰器/注册函数：校验被装饰类有合法 core/pipe/mode，抽取 __init__ 的 signature，把类以 op.name 为键写入 _custom_op_registry。返回原类。这是昇腾语言层相对基座 triton 多出的『注册自定义算子』能力。"},
+    {"name": "_custom_op_registry", "file": "third_party/ascend/language/cann/extension/custom_op.py", "responsibility": "全局 dict：name→op class。register 写、custom_semantic 经 _get_op_class 读。是自定义算子框架的唯一真相源。"},
+    {"name": "custom / custom_semantic", "file": "third_party/ascend/language/cann/extension/custom_op.py", "responsibility": "调用侧入口（al.custom(name, *args, out=...)）：查表取 op class、实例化跑 __init__ 校验、把 args/out 转成 IR operands、_make_attrs 造属性、调 create_custom_op emit hivm.CustomOp。"},
+    {"name": "CORE / PIPE / MODE", "file": "third_party/ascend/language/cann/extension/core.py", "responsibility": "三枚举，register 的必填字段。CORE 绑 cube/vector 核（ch02），PIPE 绑昇腾流水线单元，MODE 绑 SIMT/SIMD/MIX 执行模式（呼应 ch08 scope / ch01 mix_mode）。经 _make_attrs 翻成 hivm.tcore_type/hivm.pipe/hivm.vf_mode 三个 IR 属性。"},
+    {"name": "_index_select / _index_put / _gather_load / _scatter_store", "file": "third_party/ascend/language/cann/extension/builtin_custom_ops.py", "responsibility": "四个随包自带的 __builtin_ 内建自定义算子样例。展示 register_custom_op 的真实用法：类字段声明 name/core/pipe/mode，__init__ 做形状/dtype 校验并用 self.arg_type 给参数动态定型。"},
+    {"name": "reciprocal/tanh/acos/... (libdevice)", "file": "third_party/ascend/language/cann/libdevice.py", "responsibility": "昇腾数学库：@core.extern 装饰的函数把 (输入 dtype 元组)→(华为数学函数库 __hmf_ 符号名, 输出 dtype) 的映射交给基座 extern_elementwise 下降；无 __hmf_ 符号时退回纯 triton IR 组合实现（如 acos 多项式逼近、erfinv/gamma）。"},
+    {"name": "isfinited/finitef/atan2 (math_ops)", "file": "third_party/ascend/language/cann/extension/math_ops.py", "responsibility": "昇腾数学算子：@jit 修饰的纯 triton kernel，组合已有原语（isnan/isinf/atan）实现——既不走 extern 也不走 register_custom_op 的第三条实现路径。经 __init__.py 覆盖挂载进 libdevice 命名空间。"}
+  ],
+
+  "data_flow": [
+    "注册期（import 时）：@register_custom_op 装饰 builtin_custom_ops._index_select → register_custom_op 校验 core/pipe/mode → inspect.signature 抽 __init__ 形参 → _custom_op_registry['__builtin_index_select'] = 类",
+    "调用期入口：kernel 里 al.custom('__builtin_index_select', src, index, ..., out=o) → custom（@core.builtin）→ custom_semantic",
+    "custom_semantic：_unwrap_constexpr 拆常量 → _get_op_class 查表命中 → _init_op 实例化（跑 __init__ 断言，动态填 arg_type）",
+    "operand 化：out 拆成 outputs（_to_operands）；位置/关键字参数按 signature 逐个 _to_value 成 IR handle（标量按 arg_type/type-hint 定 dtype，int 默认 int32、float 默认 fp32）",
+    "属性化：_make_attrs 把 core/pipe/mode → hivm.tcore_type/hivm.pipe/hivm.vf_mode；非 builtin 强制挂 symbol+bitcode；可选挂 indexing_map/iterator_types/extra_buffers/source/compile。_make_arg_attrs 处理 align_dim 等 per-arg 属性",
+    "emit：_builder.create_custom_op(name, attrs, inputs, outputs, arg_attrs) → 经 ch04 双 builder 的 AscendNPUIROpBuilder（ascend_ir.cc:L618）create hivm::CustomOp，挂全部属性 →（bitcode/indexing_map 的下降与 hivm CustomOp 语义在 P5 讲）",
+    "libdevice 路径（对照）：al.libdevice.reciprocal(x) → @core.extern → core.extern_elementwise('','',[x],{(fp32,):('__hmf_recipf',fp32),...}) → 基座 dispatch → create_extern_elementwise，引用华为数学函数库 __hmf_ 符号"
+  ],
+
+  "design_decisions": [
+    {"decision": "自定义算子用『装饰类 + 全局注册表』而非函数表", "why": "类能同时携带静态配置（name/core/pipe/mode/symbol/bitcode 类字段）与参数校验逻辑（__init__），inspect.signature 还能自动抽形参用于 operand 绑定——一个类把『元数据 + 定型 + 校验』打包。基座 triton 无此机制。", "evidence": "third_party/ascend/language/cann/extension/custom_op.py:L324-L345"},
+    {"decision": "core/pipe/mode 为 register 的必填三要素并强制类型校验", "why": "自定义算子必须先决定它跑在 cube 还是 vector 核（CORE）、占哪条流水线（PIPE）、以何种执行模式（MODE：SIMT/SIMD/MIX）——这决定了 IR 里 hivm.tcore_type/hivm.pipe/hivm.vf_mode 三属性，是昇腾多核异构+显式流水线硬件模型的直接体现（ch02）。", "evidence": "third_party/ascend/language/cann/extension/custom_op.py:L334-L339 与 L245-L250"},
+    {"decision": "__builtin_ 前缀算子免注册、免 symbol/bitcode", "why": "随包自带的内建算子（index_select 等）由框架内建 IR 模板实现，无需用户提供外部 bitcode；用命名前缀区分『内建』与『用户带 bitcode 的自定义』，_get_op_class 未命中时只放行 __builtin_，_make_attrs 只对非 builtin 强制 symbol+bitcode。", "evidence": "third_party/ascend/language/cann/extension/custom_op.py:L42 与 L252-L254"},
+    {"decision": "libdevice 数学函数三种实现路径并存", "why": "① 有华为数学函数库 __hmf_ 硬件符号的（reciprocal/tanh 的 fast 分支）走 extern_elementwise 直调，最快最准；② 无 __hmf_ 或旧架构的退回纯 triton IR 组合（acos 多项式逼近、sinh/cosh 用 exp、erfinv/gamma 展开）；③ 纯组合式数学算子（isfinited/atan2）用 @jit。按『硬件有无该数学符号』与『910_95/SIMT 开关』分流。", "evidence": "third_party/ascend/language/cann/libdevice.py:L81-L93、L215-L273；third_party/ascend/language/cann/extension/math_ops.py:L32-L42"},
+    {"decision": "libdevice 命名空间在包 __init__ 处被动态覆盖挂载", "why": "libdevice 的一部分符号直接复用基座 triton math（exp/log/sin/cos/sqrt...），另一部分被昇腾专属实现覆盖（isfinited/finitef/atan2/flip）——用 import 期属性赋值而非重复定义，既复用基座又插入昇腾差异。", "evidence": "third_party/ascend/language/cann/__init__.py:L28-L52"},
+    {"decision": "自定义算子参数支持 self.arg_type 动态定型 + al.int64 逃生", "why": "Python int 默认降为 device 端 int32；当算子某参数（如 index 的 offset/stride）需与 index 张量同 dtype 或需 int64 时，__init__ 里写 self.arg_type['end_offset']=index.dtype，或调用时传 al.int64(x)。让『注册期声明的算子』能按运行时张量类型定型。", "evidence": "third_party/ascend/language/cann/extension/builtin_custom_ops.py:L99-L103；third_party/ascend/language/cann/extension/core.py:L93-L101"}
+  ],
+
+  "theory": [
+    "『注册 vs 调用』的语言层扩展维度：基座 triton 的 extern 机制（extern_elementwise）只能『引用』一个已存在于外部库的符号——用户不能新增一个带自定义核类型/流水线绑定/自定义 bitcode 的算子进 IR。昇腾 register_custom_op 把『算子定义』本身提升为语言层一等公民：一个类 = 一个新 IR op（hivm.CustomOp）的工厂，携带 core/pipe/mode 决定它在 DaVinci 多核异构硬件上的落点。这是 GPU 单核同构模型下不需要、因而 GPU 侧 triton 没有的能力。",
+    "SIMT/SIMD/MIX（MODE）与 CORE/PIPE 的正交组合：MODE 决定算子内部是标量-线程式（SIMT 模板，如 index_select 走 SIMT）还是向量-数据并行式（SIMD），或混合（MIX，呼应 ch01 mix_mode）；CORE 决定物理核（cube 做矩阵、vector 做逐元素）；PIPE 决定占用哪条流水线（PIPE_V 向量、PIPE_M 矩阵、PIPE_MTE* 搬运、PIPE_FIX 定点）。三者共同刻画『这个算子在昇腾硬件上怎么跑』，缺一不可。",
+    "libdevice 的实现分层等价类：对每个数学函数 f，实现集合 = {硬件 __hmf_ 符号直调, 纯 IR 组合逼近, @jit 原语组合}。选择由『该架构是否提供 __hmf_ 符号 + libdevice_simt 开关 + 910_95 与否』决定。极端例：erfinv/gamma 在无 __hmf_ 时用 Cephes/Lanczos 级数展开，是纯软件多项式逼近，精度边界由注释显式标注（近 ±1 / 近负整数处失稳）。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "libdevice.py 中除 reciprocal、tanh、acos 外的其余数学函数逐个 extern 定义（log1p/relu/isinf/tan/atan/ilogb/ldexp/pow/isnan/div_rz/fast_dividef/fast_expf/fmod/float_as_int/atan2/trunc/round/sinh/cosh/acosh/asinh/atanh/expm1/nextafter/hypot/cyl_bessel_i0/signbit/erfinv/gamma/lgamma/nearbyint/asin/log10/copysign/rint）", "why_safe": "它们是同一『extern 调 __hmf_ / 无符号退回纯 IR』范式的重复实例；精简版保留 reciprocal（最简 extern）、tanh（双分支范式）、acos（纯 IR 逼近范式）三个代表即覆盖全部实现路径。删除的仅是范式重复，控制流范式已被代表样例保留。"},
+      {"what": "builtin_custom_ops.py 中 _index_put / _gather_load / _scatter_store 三个内建算子的完整 __init__ 校验体", "why_safe": "四个内建算子结构同构（类字段 name/core/pipe/mode + __init__ 形状断言 + arg_type 定型）；保留 _index_select 一个完整样例即展示 register_custom_op 的真实用法，其余三个可删（只做减法，不改保留者的任何控制流）。"},
+      {"what": "libdevice.py 中 erfinv/gamma/cyl_bessel_i0 的完整多项式/级数系数数组与迭代展开体", "why_safe": "这些是特定数值逼近的系数常量与 Newton 迭代/递推循环，属实现细节而非本章主线（本章讲『三种实现路径的分野』，不讲某个特殊函数的数值分析）；acos 已作为『纯 IR 逼近』代表保留其核心结构。删除不影响读者理解 libdevice 的分层机制。"},
+      {"what": "custom_op.py 中 _to_value 的逐 intXX/uintXX/fpXX 分支（L78-L108）", "why_safe": "是把 Python 标量按 dtype 精确映射到 builder.get_intXX 的机械分派表，控制流平坦；精简版可保留函数骨架 + 一两个代表分支（int32/fp32 默认路径），注释标注 SUBTRACTED 其余同构分支。不影响主数据流理解。"}
+    ],
+    "must_keep": [
+      {"symbol": "register_custom_op", "why": "本章绝对主角——『注册自定义算子』能力的入口，读者必须理解它校验什么、往哪注册。"},
+      {"symbol": "_custom_op_registry", "why": "注册表本体，register 写 / custom 读的枢纽，删了框架不成立。"},
+      {"symbol": "custom_semantic", "why": "调用侧全流程（查表→实例化→operand→attrs→emit），把注册与 IR emit 串起来，writer 需逐段讲。"},
+      {"symbol": "custom", "why": "@core.builtin 用户入口 al.custom()，读者在 kernel 里实际调用的就是它。"},
+      {"symbol": "_get_op_class", "why": "体现『注册命中 vs __builtin_ 免注册』的分野与默认 VECTOR/PIPE_V/SIMT，是理解 __builtin_ 前缀语义的关键。"},
+      {"symbol": "_make_attrs", "why": "core/pipe/mode→hivm.tcore_type/hivm.pipe/hivm.vf_mode 的翻译 + symbol/bitcode/indexing_map 挂载点，是与 ch04 emit、P5 下降的接缝。"},
+      {"symbol": "CORE", "why": "必填字段，绑 cube/vector 核，呼应 ch02 硬件模型，读者需理解 VECTOR/CUBE/CUBE_OR_VECTOR/CUBE_AND_VECTOR 语义。"},
+      {"symbol": "PIPE", "why": "必填字段，绑昇腾流水线单元（PIPE_V/M/MTE*/FIX），是硬件显式流水线模型的体现。"},
+      {"symbol": "MODE", "why": "必填字段，SIMT/SIMD/MIX 执行模式，呼应 ch01 mix_mode / ch08 scope。"},
+      {"symbol": "_index_select", "why": "唯一保留的完整 register_custom_op 真实样例，展示类字段声明 + __init__ 校验 + arg_type 动态定型。"},
+      {"symbol": "reciprocal", "why": "libdevice 最简 extern 样例，展示 (dtype)→__hmf_ 符号映射与 extern_elementwise 调用。"},
+      {"symbol": "tanh", "why": "libdevice 双分支范式（910_95+SIMT 单符号 vs 退回多 dtype），展示 __hmf_ 符号随架构/dtype 变化。"},
+      {"symbol": "acos", "why": "libdevice『无 __hmf_ 时纯 triton IR 组合逼近』范式代表，与 extern 分野的另一半。"},
+      {"symbol": "isfinited", "why": "math_ops 第三条实现路径（@jit 组合 isnan/isinf），展示昇腾数学算子既非 extern 也非 register 的组合式实现。"},
+      {"symbol": "extern_elementwise", "why": "基座 triton 侧被 libdevice 复用的下降入口，是『extern 只能调预置符号』对照的落点，须点明它与 register_custom_op 的能力分野。"},
+      {"symbol": "__hmf_recipf", "why": "华为数学函数库符号命名的具体实例，读者需认得 __hmf_ 前缀 = 华为数学函数库符号。"}
+    ]
+  },
+
+  "mechanisms": [
+    {"id": "m1", "name": "register_custom_op 注册流程（校验 core/pipe/mode → 抽 signature → 入注册表）", "kind": "algorithm", "source_anchors": ["third_party/ascend/language/cann/extension/custom_op.py:L324-L345"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m2", "name": "custom/custom_semantic 调用期数据流（查表→实例化校验→operand→attrs→create_custom_op emit）", "kind": "dataflow", "source_anchors": ["third_party/ascend/language/cann/extension/custom_op.py:L294-L321", "third_party/ascend/language/cann/extension/custom_op.py:L37-L51", "third_party/ascend/ascend_ir.cc:L618-L659"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m3", "name": "CORE/PIPE/MODE 三属性到 hivm IR 属性的翻译（_make_attrs）", "kind": "protocol", "source_anchors": ["third_party/ascend/language/cann/extension/custom_op.py:L245-L271", "third_party/ascend/language/cann/extension/core.py:L104-L126"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m4", "name": "__builtin_ 前缀免注册/免 bitcode 的分野（内建 vs 用户带 bitcode）", "kind": "config", "source_anchors": ["third_party/ascend/language/cann/extension/custom_op.py:L37-L51", "third_party/ascend/language/cann/extension/custom_op.py:L252-L254"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m5", "name": "libdevice 数学函数三种实现路径分层（extern __hmf_ / 纯 IR 逼近 / @jit 组合）", "kind": "dataflow", "source_anchors": ["third_party/ascend/language/cann/libdevice.py:L28-L34", "third_party/ascend/language/cann/libdevice.py:L81-L93", "third_party/ascend/language/cann/libdevice.py:L215-L273", "third_party/ascend/language/cann/extension/math_ops.py:L32-L42"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m6", "name": "extern_elementwise：dtype 元组→__hmf_ 符号的 dispatch（基座能力，libdevice 复用）", "kind": "algorithm", "source_anchors": ["python/triton/language/core.py:L2691-L2730", "third_party/ascend/language/cann/libdevice.py:L28-L34"], "needs_figure": false, "needs_worked_example": true, "difficulty": "supporting"},
+    {"id": "m7", "name": "自定义算子参数动态定型（self.arg_type + al.int64）与 operand 转换", "kind": "protocol", "source_anchors": ["third_party/ascend/language/cann/extension/custom_op.py:L66-L152", "third_party/ascend/language/cann/extension/builtin_custom_ops.py:L99-L103", "third_party/ascend/language/cann/extension/core.py:L93-L101"], "needs_figure": false, "needs_worked_example": true, "difficulty": "supporting"},
+    {"id": "m8", "name": "libdevice 命名空间的 import 期动态覆盖挂载（基座 math 复用 + 昇腾差异覆盖）", "kind": "config", "source_anchors": ["third_party/ascend/language/cann/__init__.py:L28-L52"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"}
+  ],
+
+  "cross_chapter": {
+    "pairs_with_base": "vLLM 无关；对位基座 triton 第 9 章（自举标准库/数学·extern/随机数）。核心分野：基座 extern_elementwise 只能『调』预置外部符号，无『注册新算子』能力；本章讲昇腾多出的 register_custom_op。",
+    "back_refs": [
+      {"ref": "第 4 章", "path": "../../ch04-dual-builder-ascend-dispatch/narrative/chapter.md", "why": "custom_semantic 末尾 create_custom_op 经 ch04 双 builder 的 AscendNPUIROpBuilder emit hivm.CustomOp——本章讲注册框架表面，emit 机制引 ch04。"},
+      {"ref": "第 2 章", "path": "../../ch02-davinci-npu-hardware-model/narrative/chapter.md", "why": "CORE（cube/vector 核）与 PIPE（流水线单元）直接对应 ch02 的 DaVinci 多核异构硬件模型。"}
+    ],
+    "forward_defer_to_P5": ["bitcode 的加载/下降语义", "indexing_map（al.affine_map / MLIR AffineMap）与 iterator_types 的下降语义", "hivm.CustomOp 在 MLIR pass 中的 lowering"],
+    "glossary_first_appearance_need_gloss": [
+      {"term": "__hmf_", "gloss": "华为数学函数库（Huawei Math Function）符号前缀；libdevice 经 extern 引用的硬件数学符号名，如 __hmf_recipf。"},
+      {"term": "bitcode", "gloss": "用户自定义算子提供的预编译 LLVM bitcode 文件路径；非内建算子必填，深挖其下降归 P5。"},
+      {"term": "indexing_map", "gloss": "一组 MLIR AffineMap，描述自定义算子各操作数的访问/迭代映射；本章只提『它作为 register 参数存在并挂成 IR 属性』，语义归 P5。"},
+      {"term": "libdevice", "gloss": "设备侧数学函数库命名空间（al.libdevice.*），昇腾版由 __hmf_ extern、纯 IR 逼近、@jit 组合三类实现拼成。"},
+      {"term": "hivm", "gloss": "昇腾硬件 IR 方言前缀（如 hivm.CustomOp、hivm.tcore_type）；ch04 已建立，本章 _make_attrs 生成的属性挂在其上。"}
+    ]
+  },
+
+  "foreshadow_due": {"embed": [], "recycle": [], "note": "bible.py due ch07 返回空——本章无应埋伏笔、无应回收项。"}
+}
