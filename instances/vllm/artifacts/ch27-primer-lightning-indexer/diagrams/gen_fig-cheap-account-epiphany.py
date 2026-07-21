@@ -126,7 +126,7 @@ for label, fc, sc in items:
     txt(lx + 22, lgY + 2, label, size=12.5, anchor="start", fill=INK)
     lx += 22 + len(label) * 13 + 30
 # 溯源脚注
-txt(W - 30, H - 14, "对数/加速比源自 traces/run_complexity.json（L=131072, k=2048）",
+txt(W - 30, H - 14, "对数/加速比按本章复杂度账推算（代入 L=131072, k=2048）",
     size=11, anchor="end", fill=MUTE)
 
 L.append('</svg>')
