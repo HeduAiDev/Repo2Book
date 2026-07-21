@@ -45,9 +45,20 @@
   仿射 tiled dataflow），bishengir 部分闭源（边界≈基座的 ptxas）。
 - ✅ **大纲已获用户审批（2026-07-18「同意」）**：33 章 / 7 Part（outline-final.json）+ ARCHITECTURE.md，
   开始逐章发车。roadmap.py 生成器已建并验（7 Part 窄长条 5.17:1，4 调用/几何/Read-PNG 通过）。
-- 🚗 **施工中（2026-07-21 状态）**：**ch01–ch07 已全部定稿提交并归档**（Part 1 完 + Part 2 语言层
-  已出 ch04/ch05/ch06/ch07）；ch08-ch33 未开工。下一章 ch08 按 outline-final.json 发车。
+- 🚗 **施工中（2026-07-21 状态）**：**ch01–ch09 已全部定稿提交并归档**（Part 1 完 + Part 2 语言层完
+  + **Part 3 开篇 ch09 primer 完**）；ch10–ch33 未开工。下一章 **ch10** 按 outline-final.json 发车。
   发车须 scriptPath（workflow-byname-stale-snapshot）+ 显式 instance:"triton-ascend"（护栏）。
+- ⚠️ **ch10 发车必答项（务必注入 dossier brief）**：`namedOps` 的**实现语义**。
+  实测 `TritonToLinalgPass.cpp:L524`（namedOps 为真时张量上的 `arith` 保持合法）与 `L651`
+  （`if (!namedOps)` 才加载 `populateElementwiseToLinalgConversionPatterns`）⇒ 真实语义是
+  「**别把逐元素 `arith` 摊成 `linalg.generic`**」，**不是**「发射 linalg 具名算子」；
+  全仓搜 `linalg::AddOp` / 产出 `linalg.add` **零命中**。Bible 已立两条词条，但
+  `bible.py due ch10` 走 arc-map、**不会自动提醒**（本书 arc-map 至今为空数组）。
+- 📌 **待回修（已立案，勿遗忘）**：
+  - `ch01/reviews/LEAD-PENDING-FIX.md` — ch01:L147 的 `(如 linalg.add)` 举例无据（Bible 侧已订正，正文待 writer）。
+  - `ch09/reviews/LEAD-PENDING-FIX-forward-refs.md` — ch09 有 7 处裸 `chXX` 指向未写章，
+    ch10/ch11 定稿后改成 markdown 链接；建议与上一条**合并成一次派工**，少动老章。
+  - `instances/vllm-ascend/artifacts/ch37-primer-dspark/reviews/LEAD-PENDING-FIX.md` — 三处图面脚手架泄漏。
 
 ## 本书已踩过的坑（发车/写作前先看这条）
 
