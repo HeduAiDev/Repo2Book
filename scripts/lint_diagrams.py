@@ -47,7 +47,13 @@ def lint_diagrams(chapter_dir: str) -> dict:
                 if not (xm and fsm):
                     continue
                 x, fs = float(xm.group(1)), float(fsm.group(1))
-                stripped = re.sub(r'\s', '', content)
+                # 先剥掉嵌套标记(<tspan …> 等)再数字宽:标记本身不可见,
+                # 数进去会把估算撑大几十个字符宽 → 假 overflow。
+                # 全语料实测:修前 15 处唯一告警全部由 markup 撑出(如 esc_bold()
+                # 注入的 <tspan font-weight="normal">),修后 0 处;
+                # 合成回归:纯可见文字的真越界修前修后同样命中(450>200),不引入漏报。
+                visible = re.sub(r'<[^>]+>', '', content)
+                stripped = re.sub(r'\s', '', visible)
                 wd = sum(1.0 if CJK.match(c) else 0.55 for c in stripped) * fs
                 if 'text-anchor="middle"' in attrs:
                     left, right = x - wd / 2, x + wd / 2
