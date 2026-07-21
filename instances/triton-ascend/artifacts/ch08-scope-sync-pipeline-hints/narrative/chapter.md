@@ -8,7 +8,11 @@
 
 **姊妹篇约定**。这本书全程对照基座《Triton 源码解读》（读上游 Triton v3.2.0）。本章有两处直接对位：`with` 语句的 AST（抽象语法树，Python 源码被解析出来的那棵树）处理对位基座讲 [CodeGenerator 逐节点翻译 AST 的那一章](../../../../triton/artifacts/ch16-codegenerator-ast-visitor/narrative/chapter.md)；本章主角 `handle_scope_with` 的算法则是从基座 `visit_While` 里抄来的，源码注释自己写着「similar to visit_while」——那一趟 dummy 块试跑的套路在[基座讲控制流下降的那一章](../../../../triton/artifacts/ch17-control-flow-lowering-scf/narrative/chapter.md)已经拆过一遍。
 
-**取证口径**。宿主上没有昇腾 NPU、没有 CANN 工具链，所以本章**不存在任何真机数值**。正文里的数值表有两个来源，我会逐表标明：一类是把 pin 版本的函数体**逐字**取出来跑，只把 IR builder（构建 IR 的那个对象）换成「只记账、返回哨兵值」的替身——这类表读作「前端校验全过、走到了建 op 这一步」，表里出现的 MLIR 属性文本（如 `#hivm.tcore_type<VECTOR>`）是替身的渲染，不是编译器打印出来的 IR；另一类落在 C++ 侧（pybind 扩展未编译，跑不起来），由分支逐条读出，每格标行号。至于每条流水线在硬件上到底对应哪个队列、`PIPE_MTE2` 这个名字背后是什么时序，本仓从 Python 到 `.td` 定义文件都没有一句说明——**本章不编**，只把源码给出的线索摆出来。
+**取证口径**。宿主上没有昇腾 NPU、没有 CANN 工具链，所以本章**不存在任何真机数值**。正文里的数值表有两个来源，我会逐表标明：一类是把 pin 版本的函数体**逐字**取出来跑，只把 IR builder（构建 IR 的那个对象）换成「只记账、返回哨兵值」的替身——这类表读作「前端校验全过、走到了建 op 这一步」，表里出现的 MLIR 属性文本（如 `#hivm.tcore_type<VECTOR>`——`hivm` 是达芬奇的硬件 IR 方言，本章后面讲核间同步时会正式打交道）是替身的渲染，不是编译器打印出来的 IR；另一类落在 C++ 侧（pybind 扩展未编译，跑不起来），由分支逐条读出，每格标行号。至于每条流水线在硬件上到底对应哪个队列、`PIPE_MTE2` 这个名字背后是什么时序，本仓从 Python 到 `.td` 定义文件都没有一句说明——**本章不编**，只把源码给出的线索摆出来。
+
+![本章地图：源码剖面按三条泳道蛇形推进——「作用域 · 编译期特判」四站，从 `visit_With` 查表一路走到 `create_scope_op` 与外提成函数；「核间同步 · 两代与契约」四站自右向左，从两条下降路径走到 `GetCore` 的落核翻转；「全体同步 · 收窄与提示」四站收束到 `sync_block_all`、收窄链与 `annotation.mark` 贴条，末尾一枚橙色出口桩交棒给下一部分](../diagrams/chapter-map.png)
+
+只想会用 `with scope`，读讲上下文管理器特判、关键字变属性、外提成函数的那三节就够；只想搞定核间同步，从「同一个 `sync_block_set`，两条下降路径」一节起往下读，讲落核翻转的 `GetCore` 那节可跳过（不影响会用），其余四节顺次读完；只关心编译期到底发生了什么，挑两趟 visit、两处登记、收窄链、贴条这四节走；不挑读法，按顺序读下来最省事。
 
 ---
 
@@ -20,6 +24,8 @@
 with al.scope(core_mode="cube"):
     acc = tl.dot(a, b)
 ```
+
+（先交代一个别名：`al` 来自 `import triton.language.extra.cann.extension as al`，就是[第 4 章](../../ch04-dual-builder-ascend-dispatch/narrative/chapter.md)讲的那个装昇腾语言层增量的包。官方用例两种别名混着用——`test_scope.py:L9` 写 `as al`，`test_compile_hint.py:L23` 写 `as extension`——本章两种写法都会出现，指的是同一个模块。）
 
 第一反应大概是：`scope` 是个上下文管理器，进块时 `__enter__` 干点什么、出块时 `__exit__` 收尾。这个直觉在这里**整个是错的**。真实情况更像是：这句 `with` 从来没被执行过——它在**编译期**就被当成一个语法标记拦下来了，`scope(...)` 这个调用表达式压根没求值，`__enter__` / `__exit__` 一次都没被调到。
 
@@ -106,7 +112,9 @@ ASCEND_WITH_DISPATCH = {
 }
 ```
 
-第一项的键值得盯一眼：**键是 `scope` 这个类对象本身**，不是字符串 `"scope"`。为什么要这么设计，看查表那一侧就懂了：
+第二项先交代掉，它跟 `with` 没关系：键是字符串 `"mangle_ty"`，值是昇腾版的类型名修饰函数（把一个类型编码成短字符串，用来拼出带类型签名的函数名）。基座在 `python/triton/compiler/code_generator.py:L51` 写了一句 `mangle_ty = WITH_DISPATCH.get("mangle_ty", mangle_ty)`——**用同一张表把自己那份实现整个换掉**，换来的这份多认一种类型（[第 5 章](../../ch05-explicit-memory-hierarchy/narrative/chapter.md)那套 buffer 类型）。也就是说这张表兼作两件事的通道，本章只跟第一项打交道。
+
+第一项的键才值得盯一眼：**键是 `scope` 这个类对象本身**，不是字符串 `"scope"`。为什么要这么设计，看查表那一侧就懂了：
 
 ```python
 # python/triton/compiler/code_generator.py:L801-L813
@@ -529,7 +537,7 @@ def OutlineScope : Pass<"outline-scope", "mlir::ModuleOp"> {
 }
 ```
 
-左边那份 IR 是 ttadapter 段开头的形态——`scope.scope` 由 AST 到 ttir 这一步（`ast_to_ttir`）直接 emit，一路带到 ttadapter；右边是 `outline-scope` 这道 ttadapter 侧 pass 跑完之后的形态。看清楚发生了什么：**`tcore_type` 从算子属性搬到了函数属性上**，原地换成一次 `call`。
+左边那份 IR 是 ttadapter 段开头的形态——ttadapter 是[第 1 章](../../ch01-birdseye-ascend-backend/narrative/chapter.md)拆过的那条三段下降链 `ttir → ttadapter → npubin` 的第二段，也就是昇腾与 GPU 路分道扬镳的那一段。`scope.scope` 由 AST 到 ttir 这一步（`ast_to_ttir`）直接 emit，一路带到 ttadapter；右边是 `outline-scope` 这道 ttadapter 侧 pass 跑完之后的形态。看清楚发生了什么：**`tcore_type` 从算子属性搬到了函数属性上**，原地换成一次 `call`。
 
 ![`outline-scope` 前后对照：`scope.scope` 的 region 被外提成带 `tcore_type` 的 `func.func`，原地只留一次 call——核类型最终是函数级属性](../diagrams/fig-ch08-m5-outline-scope.png)
 
@@ -546,7 +554,7 @@ def OutlineScope : Pass<"outline-scope", "mlir::ModuleOp"> {
 **源码**。旧代长这样（`wait` 与它逐字同构，只差 op 名，这里只看 `set`）：
 
 ```python
-# third_party/ascend/language/cann/extension/aux_ops.py:L57-L76
+# third_party/ascend/language/cann/extension/aux_ops.py:L57-L75
 @_tensor_member_fn
 @builtin
 def sync_block_set(sender, receiver, event_id, _builder=None):
@@ -570,10 +578,10 @@ def sync_block_set(sender, receiver, event_id, _builder=None):
 
 进门第一件事就是 `DeprecationWarning`（Python 的弃用告警），指路「用 `al.sync_block_set`」。随后三次 `_constexpr_to_value`（把编译期常量拆成裸值），三条断言加一条 `ValueError`（下一节细讲），最后交给 `custom_op`。（头上那个 `@_tensor_member_fn` 是基座的装饰器，把函数同时挂成张量的方法，与本章的同步语义无关；`@builtin` 则是[第 4 章](../../ch04-dual-builder-ascend-dispatch/narrative/chapter.md)讲过的那枚双标记图章。）
 
-**这里有个同名陷阱，务必分清**：这个 `custom_op` **不是**[第 7 章](../../ch07-custom-op-and-libdevice/narrative/chapter.md)讲的那张自定义算子注册表。那一章的主角是 `custom_op.py` 里的 `register_custom_op` / `al.custom`；这里 `aux_ops.py` 顶部写的是 `from ._utils import custom_op`，指向另一个文件里的一个手写分发函数，全文十二行：
+**这里有个同名陷阱，务必分清**：这个 `custom_op` **不是**[第 7 章](../../ch07-custom-op-and-libdevice/narrative/chapter.md)讲的那张自定义算子注册表。那一章的主角是 `custom_op.py` 里的 `register_custom_op` / `al.custom`；这里 `aux_ops.py` 顶部写的是 `from ._utils import custom_op`，指向另一个文件里的一个手写分发函数，全文十一行：
 
 ```python
-# third_party/ascend/language/cann/extension/_utils.py:L5-L16
+# third_party/ascend/language/cann/extension/_utils.py:L5-L15
 def custom_op(builder: ir.builder, op_name: str, **kwargs):
     if op_name == "sync_block_all":
         return builder.create_custom_op_for_inter_core_sync(op_name, kwargs["mode"], kwargs["event_id"])
@@ -645,7 +653,7 @@ def sync_block_wait(sender, receiver, event_id, sender_pipe=None, receiver_pipe=
 
 多了两个参数：`sender_pipe` 与 `receiver_pipe`——发方和收方各自占哪条流水线。这两个东西最后会跟核类型一起写进一个 **HIVM 方言专用算子**（HIVM 是达芬奇的硬件 IR 方言，[第 1 章](../../ch01-birdseye-ascend-backend/narrative/chapter.md)点过名），而不是那个通用的 `ascend.custom`。
 
-![两代核间同步的泳道对照：旧代经十二行的手写分发落成通用的 `ascend.custom`（`receiver` 与流水线信息在语言层就丢了），新代经 `create_sync_block` 落成带核类型与两侧流水线的 `hivm.sync_block_set`](../diagrams/fig-ch08-m6-two-generations.png)
+![两代核间同步的泳道对照：旧代经十一行的手写分发落成通用的 `ascend.custom`（`receiver` 与流水线信息在语言层就丢了），新代经 `create_sync_block` 落成带核类型与两侧流水线的 `hivm.sync_block_set`](../diagrams/fig-ch08-m6-two-generations.png)
 
 还有一处细节值得点出：两代**挂在不同的 builder 上**。旧代那个 `create_custom_op_for_inter_core_sync` 定义在 `TritonOpBuilder`（基座 builder，被 fork 就地加了方法）上；新代的 `sync_block_set` / `sync_block_wait` 定义在 `AscendNPUIROpBuilder` 上（`third_party/ascend/ascend_ir.cc:L683-L696`，该类继承前者，见同文件 `L501`）——也就是[第 4 章](../../ch04-dual-builder-ascend-dispatch/narrative/chapter.md)那两个 builder 里的第二个。「换一代 API」在这个仓库里的具体含义是：**换一个 builder、换一个方言、把语言层原本丢掉的信息补进 IR**。
 
@@ -666,7 +674,7 @@ def sync_block_wait(sender, receiver, event_id, sender_pipe=None, receiver_pipe=
 
 第四条尤其要读进去：核间同步就是「跨核」原语，**同一个核内部的先后次序不归它管**。第三条那个 16 是整章唯一的资源硬数字——语言层能看见的、关于同步事件资源规模的全部信息就是这个上界；它是不是对应硬件上某组标志寄存器的数量，源码只有断言、没有一句注释，不猜。
 
-**数值推演**。把 15 种调用穷举跑一遍，看谁过、谁被拦、拦在哪一层。取证口径：两代函数体逐字取出执行，`PIPE` 成员名从源码解析，semantic 与 builder 是记录型替身；「落到下游的是什么」一列记的是替身收到的实参，不是真机行为。
+**数值推演**。把 15 种调用穷举跑一遍，看谁过、谁被拦、拦在哪一层——下表摘录其中 12 例（剩下 3 例都是通过的，正文随后点名）。取证口径：两代函数体逐字取出执行，`PIPE` 成员名从源码解析，semantic 与 builder 是记录型替身；「落到下游的是什么」一列记的是替身收到的实参，不是真机行为。
 
 <!-- trace: M7 -->
 
@@ -687,7 +695,7 @@ def sync_block_wait(sender, receiver, event_id, sender_pipe=None, receiver_pipe=
 
 **不变量**。任何能走到 semantic 层的**新代**同步调用，出口状态必同时满足四条：`sender`、`receiver` ∈ {cube, vector}，且 `sender ≠ receiver`，且（`event_id` 是 int 时）0 ≤ `event_id` < 16，且两个 pipe 都是 `PIPE` 枚举实例。
 
-论证靠函数体的形状：`create_sync_block` 是一条**无循环、无提前 return 的直线**，四道检查全部排在唯一出口（那两句 `return semantic.create_sync_block_*`）之前，任一条不成立即抛出，控制流到不了出口。上表 15 例穷举佐证：通过的 8 例（含全体同步与两条 constexpr 用例）、AssertionError 4 例、ValueError 2 例、TypeError 1 例。
+论证靠函数体的形状：`create_sync_block` 是一条**无循环、无提前 return 的直线**，四道检查全部排在唯一出口（那两句 `return semantic.create_sync_block_*`）之前，任一条不成立即抛出，控制流到不了出口。15 例穷举的分项计数是：通过 8 例、AssertionError 4 例、ValueError 2 例、TypeError 1 例——上表 12 例之外，另有三例均通过：新代把 `event_id` 传成合法范围内的编译期常量、旧代的 `vector → cube` 反向调用，以及全体同步 `sync_block_all` 用新代独有的 `all_sub_vector` 模式（这一档下一节讲）。
 
 括号里那个「`event_id` 是 int 时」的前提**不能删**——它正是这条契约的漏洞。表里 `constexpr(99)` 一路走到了出口：新代对 `sender` / `receiver` 都调了 `_constexpr_to_value`，**唯独没对 `event_id` 调**，于是 `isinstance(event_id, int)` 不成立，范围检查整条被跳过。有意思的是，同一个 `constexpr(99)` 在旧代反而被 `AssertionError` 拦住了——旧代先无条件解包再查范围。所以「新 API 更严格」并不成立，**两代各有各的漏洞面**：旧代丢信息，新代漏检查。
 
@@ -982,7 +990,7 @@ def HIVM_PipeEnum : HIVM_I32Enum<
 `PIPE` 只导出 8 档，**掉队 7 档**：`PIPE_MTE4`、`PIPE_MTE5`、`PIPE_V2`、`VIRTUAL_PIPE_MTE2_L1A`、`VIRTUAL_PIPE_MTE2_L1B`、`PIPE_NUM`、`PIPE_UNASSIGNED`。（顺带一提枚举值：前面各档是 0～13 连着排的，`PIPE_UNASSIGNED` 单独取了 99——一个「留白哨兵」的常见写法。）第三级，Python 侧照抄这 8 档包一层：
 
 ```python
-# third_party/ascend/language/cann/extension/core.py:L104-L126
+# third_party/ascend/language/cann/extension/core.py:L104-L125
 class CORE(enum.Enum):
     VECTOR = ascend_ir.CoreType.VECTOR
     CUBE = ascend_ir.CoreType.CUBE
@@ -1081,6 +1089,8 @@ def compile_hint(ptr, hint_name, hint_val=None, _builder=None):
 
 第六条不是分派，是**终止分支**：其余类型（比如 float）直接 `ValueError: Unsupported hint value type`，不产任何属性、也就走不到贴条那一步。
 
+**第 4 条有个陷阱，别照着它写代码**。读到「`constexpr` → 字符串属性」，很自然会推出「那我 `compile_hint(t, "k", tl.constexpr("abc"))` 就能挂个字符串提示」——挂不上，这句会抛 `ValueError`。看外层倒数第二行（`third_party/ascend/language/cann/extension/aux_ops.py:L150`）：`hint_val = _unwrap_if_constexpr(hint_val) if hint_val else hint_val`——**外层已经把 constexpr 解包成裸值了**，裸 `str` 在内层没有分支，只会掉进第六条终止分支。换句话说，第 4 条这一路**从公开入口根本到不了**，只有像 `multibuffer` 那样直呼内层实现才走得到。这又是一次「底层比语言层宽」，只是形态变了：前面几处是枚举掉档（`PIPE` 少 7 档、`TCoreType` 从 `scope` 只到得了 2 档），这次掉的是一整条分派分支——它在代码里写得好好的，公开入口却够不着。
+
 贴条本身在 C++ 侧，七行：
 
 ```cpp
@@ -1175,7 +1185,7 @@ class parallel(range):
 
 **`handle_scope_with` 走两趟**（`third_party/ascend/language/cann/extension/code_generator.py:L137-L208`）。第一趟在临时块里试跑，只为数出块内被定义/改写的变量名与类型，数完连块带值一起 erase；据此建出带 region 的 `scope.scope`，第二趟才真进 region 发 IR，末尾 `scope_return` 把跨界的值交出去、回填进外层符号表。三个数恒等于跨界变量个数 k：结果数、`scope.return` 操作数数、回填名字数。代价是块体被生成两遍，嵌 N 层就是 $`2^N`$ 遍——纯编译期。括号里的关键字则从 AST 上直接揭，四条翻译规则（`noinline` 默认开、`core_mode` 走两项白名单、`disable_auto_sync` 加前缀、其余透传）之外还有三种**静默失效**：拼错核名、用位置参数、传变量，都不报错，只是核类型声明悄悄消失。而 `scope.scope` 本身活不到最后——`outline-scope` pass 把它外提成带 `tcore_type` 的 `func.func`，所以「哪种核」最终是**函数级**属性。
 
-**核间同步有两代**。旧代（`third_party/ascend/language/cann/extension/aux_ops.py:L57-L96`）进门先 `DeprecationWarning`，经十二行的手写分发（`third_party/ascend/language/cann/extension/_utils.py:L5-L16`，**跟自定义算子注册表同名不同物**）落成通用的 `ascend.custom`，`receiver` 与流水线信息在语言层就丢了；新代（`third_party/ascend/language/cann/extension/core.py:L202-L234`）补上两个 pipe 参数，落成 `hivm.sync_block_set` / `wait`，核类型 + 双 pipe + 64 位事件号一并写进 IR。两代共守四条校验：核名白名单、`sender ≠ receiver`、事件号 0～15、pipe 必须是枚举实例；漏洞面各有各的——旧代丢信息，新代对 `event_id` 少调了一次解包，`constexpr` 形态能绕过范围检查。落核由 C++ 的 `GetCore`（`third_party/ascend/ascend_ir.cc:L93-L113`）按 op 名翻转：**set 落发方核、wait 落收方核**，两端恒互补。pipe 两侧要么都不给（走写死的缺省配对：cube 发 FIX/MTE2、vector 发 MTE3/MTE2），要么都给，单边给直接 `TypeError`。
+**核间同步有两代**。旧代（`third_party/ascend/language/cann/extension/aux_ops.py:L57-L96`）进门先 `DeprecationWarning`，经十一行的手写分发（`third_party/ascend/language/cann/extension/_utils.py:L5-L15`，**跟自定义算子注册表同名不同物**）落成通用的 `ascend.custom`，`receiver` 与流水线信息在语言层就丢了；新代（`third_party/ascend/language/cann/extension/core.py:L202-L234`）补上两个 pipe 参数，落成 `hivm.sync_block_set` / `wait`，核类型 + 双 pipe + 64 位事件号一并写进 IR。两代共守四条校验：核名白名单、`sender ≠ receiver`、事件号 0～15、pipe 必须是枚举实例；漏洞面各有各的——旧代丢信息，新代对 `event_id` 少调了一次解包，`constexpr` 形态能绕过范围检查。落核由 C++ 的 `GetCore`（`third_party/ascend/ascend_ir.cc:L93-L113`）按 op 名翻转：**set 落发方核、wait 落收方核**，两端恒互补。pipe 两侧要么都不给（走写死的缺省配对：cube 发 FIX/MTE2、vector 发 MTE3/MTE2），要么都给，单边给直接 `TypeError`。
 
 **`compile_hint` 只贴条**（`third_party/ascend/language/cann/extension/aux_ops.py:L114-L151`）。按值的 Python 类型五路分派成属性，再由 `annotation.mark` 旁挂到目标张量上，原算子一个字节不动；`bool` 判断必须排在假值判断前面，而整数 `0` 会掉进假值分支变成 unit 属性。SIMT 门控只挡住 `compile_hint` 这一个入口，`multibuffer` 直呼内层实现，因而不受门控——源码自己留着 FIXME。
 

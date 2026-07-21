@@ -84,7 +84,7 @@ L.append('</svg>')
 ```bash
 python3 gen_<figure_id>.py                       # 生成 <figure_id>.svg
 xmllint --noout <figure_id>.svg                  # 1a. XML 语法
-python3 scripts/validate_svg.py <figure_id>.svg  # 1b. 语义(双转义/裁剪/缺箭头)
+python3 .claude/skills/svg-diagram/scripts/validate_svg.py <figure_id>.svg  # 1b. 语义(双转义/裁剪/缺箭头)
 rsvg-convert -z 2 <figure_id>.svg -o <figure_id>.png   # 勿用 ImageMagick convert(丢中文/错位)
 ```
 
