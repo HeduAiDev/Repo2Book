@@ -1,0 +1,89 @@
+{
+  "chapter": "ch10",
+  "note": "skip_impl 章（纯 C++ MLIR pass，无可运行精简版）。素材来源：pin @2badfc89e 精确源码逐段推演 + unittest/Conversion 下的 .mlir lit 夹具作 IR 前后对照。trace_source 一律 manual，manual_reason 写清宿主编不动、按源码规则手工推演。凡引用源码常量的数字标 file:Lxxx。",
+  "mechanisms": [
+    {
+      "mechanism_id": "m1-pass-pipeline",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch10-m1-pipeline",
+          "claim": "ttir_to_linalg 把一条固定顺序的 18 趟 pass（11 趟必挂 + 可选 auto_scheduling 段 7 趟）挂到 pass_manager，triton_to_structure 出现两次，收官的 triton_to_linalg 才把 named_ops 传进去。",
+          "template": "flow",
+          "numbers": [
+            {"name": "总趟数", "value": "18", "provenance": "compiler.py:L96-L171 依序挂载的 pass 调用计数（11 必挂 + auto_scheduling 段 7 可选）"},
+            {"name": "必挂趟数", "value": "11", "provenance": "compiler.py:L118-L164：auto_blockify + triton_to_structure×2 + discrete_mask_access + annotation + unstructure + hivm + hfusion + llvm + bubble_up + triton_to_linalg"},
+            {"name": "auto_scheduling 可选趟数", "value": "7", "provenance": "compiler.py:L120-L126：add_dag_sync/add_dag_scope/add_cse/add_canonicalizer/add_dag_ssbuffer/add_cse/add_canonicalizer，仅 metadata['add_auto_scheduling'] 为真时挂"},
+            {"name": "triton_to_structure 出现次数", "value": "2", "provenance": "compiler.py:L128（第一次）与 L152（第二次，收官前）"},
+            {"name": "named_ops 落点", "value": "1", "provenance": "compiler.py:L154-L162 add_triton_to_linalg 第三位参数；取值 True 固定来自 L949-L951 的 named_ops=True"}
+          ],
+          "caption_draft": "分水岭的整体地形：ttir 进来，18 趟 pass 顺序碾过（含两次 triton_to_structure 做指针分析），末趟 triton_to_linalg 交出 memref/tensor 混合 IR——这条唯一装配点固定 named_ops=True。",
+          "trace_source": "manual",
+          "manual_reason": "pass 计数与顺序直接数 compiler.py:L96-L171 的静态调用序列，非运行时观测；宿主无 CANN 工具链无法实跑 pm.run。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m2-ptr-to-structured-raise",
+      "intuition": "读地址就像读一句『从第 8 个格子起，连着数 4 个格子，每次跳 1 格』。SIMT 把它拆成 4 个各自算好的门牌号（tensor-of-pointers），谁也不知道它们其实排成一条等差数列；PtrAnalysis 做的是反向侦探——顺着 addptr/splat/make_range 的算式往回倒推，把这 4 个孤立门牌号重新说成一句『起点 8、长度 4、步长 1』。这句话就是结构化三元组 (offset, sizes, strides)。",
+      "worked_example": {
+        "params": {"BLOCK": 4, "pid": 2, "block_start": 8, "kernel": "add_kernel 的 x 侧地址 x_ptr + (pid*BLOCK + arange(0,BLOCK))"},
+        "trace_source": "manual",
+        "manual_reason": "本章 skip_impl，无可运行精简版；纯 C++ pass 需 CANN/NPU 工具链编译 triton-opt，宿主环境编不动、跑不出 IR dump。轨迹按 pin @2badfc89e 的 PtrAnalysis.cpp 还原规则逐算子手工推演，每步常量标 file:Lxxx，参数 BLOCK=4 对齐真实夹具 parseMakeRange.mlir/legal_stride.mlir。完整推演见 traces/m2_manual_derivation.md。",
+        "trace_ref": "traces/m2_manual_derivation.md",
+        "table": {
+          "columns": ["轮次", "当前算子", "还原规则(函数)", "得到的 PtrState {source, offset, [(stride,size)]}", "源码依据 file:Lxxx"],
+          "rows": [
+            ["1", "tt.make_range {0,4}", "visitOperandMakeRange", "{∅, off=0, [(stride=1, size=4)]}", "stride=(4-0+4-1)/4=1 PtrAnalysis.cpp:L778,L786；size=shape[0]=4 L787；off=start=0 L788"],
+            ["2", "tt.splat %bs (标量 8)", "visitOperandSplat", "{∅, off=8, [(stride=0, size=4)]}", "标量 splat 各维 stride=0 L908,L913；off=标量值 8"],
+            ["3", "arith.addi(#2,#1)", "visitOperandAdd→addState", "{∅, off=8, [(stride=1, size=4)]}", "逐维 stride 相加 0+1=1 L561；offset 相加 8+0=8 L578"],
+            ["4", "tt.splat %x_ptr (指针)", "visitOperandSplat", "{x_ptr, off=0, [(stride=0, size=4)]}", "指针 splat：source=x_ptr、各维 stride=0 L908,L913"],
+            ["5", "tt.addptr(#4,#3)", "visitOperandAddptr→addState", "{x_ptr, off=8, [(stride=1, size=4)]}", "ptr 态+offset 态 addState L279；stride 0+1=1 L561；off 0+8=8 L578"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "visitOperand 的递归对指针算术 DAG 必然停机，且要么返回一个完全确定的 PtrState、要么整体 failure，绝不产出半还原的错误地址。",
+        "argument": "停机：每次递归都下潜到操作数的 defining-op（DAG 无环、深度有限），叶子是 make_range/scalar/pointer 三种基例，各自不再递归即返回——严格递减的结构深度是单调量，有限步必达叶子。全或无：分派器对每一种已知算子调对应 visitOperandXxx 并检查其 LogicalResult，任一子调用 .failed() 立即 return failure（visitOperandAddptr:L252-L279）；遇到不认识/不安全的算子（load 派生地址、FPToSI、未知 op）落到兜底分支直接 failure（visitOperand:L1317-L1354）。因此返回 success 时每一维的 stride/size/offset 都已被某条基例规则确定，不存在‘猜一半’的中间态。"
+      },
+      "quantified": "add_kernel 一个 BLOCK=4 的 x 侧地址 DAG 共 5 个节点（make_range/splat/addi/splat/addptr），visitOperand 恰好访问 5 次、每节点 O(1) 代数合并，把 4 个独立指针（tensor<4x!ptr>）压缩成 1 组三元组 (offset=8, sizes=[4], strides=[1])——即用 3 个标量完全描述了原本 4 路并行的地址。推广到 rank-N、每维 size s_i：还原代价与 DAG 节点数线性相关，产物恒为 2N+1 个标量（N 个 stride、N 个 size、1 个 offset），与 BLOCK 大小无关。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch10-m2-raise-statetable",
+          "claim": "顺着 add_kernel 的地址 DAG 后序还原（BLOCK=4, pid=2），每个算子按固定规则更新三元组，五步后 x_ptr+(pid*BLOCK+arange) 收敛成 (offset=8, size=4, stride=1)。",
+          "template": "state-table",
+          "numbers": [
+            {"name": "make_range stride", "value": "1", "provenance": "PtrAnalysis.cpp:L778,L786 stride=(4-0+4-1)/4"},
+            {"name": "make_range size", "value": "4", "provenance": "PtrAnalysis.cpp:L787 size=shape[0]；BLOCK=4 对齐 parseMakeRange.mlir 夹具"},
+            {"name": "splat stride", "value": "0", "provenance": "PtrAnalysis.cpp:L908,L913 标量/指针 splat 各维 zeroAttr"},
+            {"name": "block_start(=off)", "value": "8", "provenance": "手工推演 pid×BLOCK=2×4；splat 携带标量值 off=8"},
+            {"name": "addState 后 stride", "value": "1", "provenance": "PtrAnalysis.cpp:L561 逐维 stride 相加 0+1"},
+            {"name": "最终 offset", "value": "8", "provenance": "PtrAnalysis.cpp:L578,L279 offset 相加 8+0，addptr 落 addState"}
+          ],
+          "caption_drag_note": "结论型 caption 见 caption_draft",
+          "caption_draft": "还原是一场后序侦探：make_range 供 (stride=1,size=4)、splat 供 stride=0 与标量 offset=8、addState 逐维相加，五步把散开的 4 个指针重新说成一句『起点 8、长 4、步长 1』——这就是 (offset,sizes,strides) 从裸 IR 里长出来的全过程。",
+          "trace_source": "manual",
+          "manual_reason": "同 worked_example：skip_impl，数值按 PtrAnalysis.cpp 规则手工推演，详见 traces/m2_manual_derivation.md。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m3-memref-materialization",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch10-m3-before-after",
+          "claim": "分水岭落地时刻：ttir 里的 tensor-of-pointers（tt.addptr 结果）被 BlockPtrAnalysis 用重构出的 (offset=8,sizes=[4],strides=[1]) 铸成一条 ttadapter 的 memref.reinterpret_cast，指针张量正式变成结构化 memref。",
+          "template": "before-after",
+          "numbers": [
+            {"name": "reinterpret_cast offset", "value": "8", "provenance": "承 m2 还原结果 offset=8（traces/m2_manual_derivation.md）；createCastOp 取 inferBlockOffset @BlockPtrAnalysis.cpp:L322-L343"},
+            {"name": "reinterpret_cast size", "value": "4", "provenance": "承 m2 还原结果 sizes=[4]；对齐 legal_stride.mlir 夹具 sizes: [4, 1] 的首维"},
+            {"name": "reinterpret_cast stride", "value": "1", "provenance": "承 m2 还原结果 strides=[1]；StridedLayoutAttr 由 getResultMemrefType 构造 @BlockPtrAnalysis.cpp:L153-L165"},
+            {"name": "被替换的 tt.addptr 数", "value": "1", "provenance": "rewriteAddPtr 末尾 rewriter.replaceOp(op, src) 一对一替换 @BlockPtrAnalysis.cpp:L1211"}
+          ],
+          "caption_draft": "左边 ttir：tensor<4x!tt.ptr<f32>>，4 个各算各的门牌号；右边 ttadapter：一条 memref.reinterpret_cast to offset:[8], sizes:[4], strides:[1]。同一段访存，从『4 路指针』变成『1 块结构化视图』——昇腾达芬奇吃的正是右边这种 memref。",
+          "trace_source": "manual",
+          "manual_reason": "skip_impl，宿主编不动 triton-opt。前后 IR 形态取自真实 lit 夹具 legal_stride.mlir 的 CHECK 行（memref.reinterpret_cast ... sizes: [4, 1] ...），数值 (8,4,1) 承 m2 手工推演。"
+        }
+      ]
+    }
+  ]
+}
