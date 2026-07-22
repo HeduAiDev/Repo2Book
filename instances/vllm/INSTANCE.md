@@ -12,6 +12,18 @@
 
 ## 实例专属硬规则
 - **vLLM 相关代码调试一律进 Docker 容器**（host 无 CUDA/vLLM）：`scripts/vllm_docker.sh ...`，镜像 `vllm/vllm-openai:latest`。容器内 vLLM 版本可能与 v0.21.0 有行号差，仅用于观察行为。
+  - **跑测试用 `repo2book/vllm-test:latest`**（= vllm-openai + pytest + pytest-asyncio，见 `scripts/vllm-test.Dockerfile`）：
+    官方镜像不带 pytest，`vllm_docker.sh` 又是 `docker run --rm`，故固化成薄镜像。用法
+    `VLLM_IMAGE=repo2book/vllm-test:latest scripts/vllm_docker.sh -m pytest /work/instances/vllm/artifacts/<ch>/tests -q`。
+    ⚠️ **逐章跑、不要从 artifacts 根一把跑**（各章 tests 同名 `implementation.*` 模块会撞、collection error）；
+    部分章需 `PYTHONPATH=implementation`（primer 章）或 `cd 章目录`（见各章 test-report 的 command 字段）。
+  - **2026-07-22 全书 GPU 复跑结论**（RTX PRO 6000 Blackwell / CUDA / 容器 vllm 0.15.1）：36 份 test-report
+    逐章在真 GPU 下复跑，**35/36 通过、零 skip**——4 个 GPU 门控测试(ch18/ch32×2/ch34)真在 GPU 上算、非被跳过。
+    唯一真缺陷 **ch25-attention**：`test_hopper_auto_selects_flash_attn` 等 host 下「自洽假通过」——
+    registry 把 `TRITON_ATTN`/`FLASHINFER` 留成真实 vllm dotted path，host 无 vllm 时竞争者 `ImportError` 被吞、
+    FA「不战而胜」，根本没验到选择逻辑；容器有真 vllm 则签名不符炸出来。已修（见 run-ledger）。
+  - ⚠️ **容器 vllm 0.15.1 ≠ 钉版 v0.21.0(ad7125a4)**：容器只给 GPU 行为/数值，行号与 API 以 pin 为准；
+    二者不一致时正文必须挑明（exp-2026-07-18-01）。
 - 正文规范路径前缀 `vllm/…`（**绝不** `instances/vllm/source/…`）。
 - 架构地图 + 大纲在 `instances/vllm/book/cartography/`（`ARCHITECTURE.md` 全量、`outline-final.json` 8 Part/33 章、`map.json` 结构化）。章节用 `ch`-前缀 slug，置于 `instances/vllm/artifacts/`。
 
