@@ -13,7 +13,7 @@ ROWS = [
         "name": "论文 Algorithm 1",
         "gran_lines": ["逐请求 · 逐位置置信度", "c_k 贪心早停"],
         "landed": "仅论文侧，未落地",
-        "detail_lines": ["paper.md §五", "dossier honest_gaps 第 2 条"],
+        "detail_lines": ["paper.md §五", "无对应调度器实现", "（本 PR 快照未接入）"],
         "color": ("#f8fafc", "#94a3b8", "#64748b"),
         "dashed": True,
     },

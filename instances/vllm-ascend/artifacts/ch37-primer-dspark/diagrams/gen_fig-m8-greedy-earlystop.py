@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """fig-m8-greedy-earlystop：state-table 模板。列=录取到第几位 k=1..4，
 行=c_k/累计存活/期望接受/SPS/吞吐Θ/决策，决策行按语义色（录取绿/达峰金/早停红）。
-数据取自 explainer.json worked_example（traces/m8_scheduler.out 复现）。论文 Algorithm 1 机制，
+数据取自 explainer.json worked_example（已用 host 纯 Python 复现）。论文 Algorithm 1 机制，
 本 PR #46995 快照无对应调度器代码——图注需诚实标注。"""
 import xml.sax.saxutils as xs
 from pathlib import Path
@@ -9,7 +9,7 @@ from pathlib import Path
 def esc(s): return xs.escape(s)
 
 TITLE = "硬件感知动态调度 Algorithm 1：贪心录取，吞吐首次下降即早停（论文机制）"
-SUBTITLE = "玩具 c=[.9,.8,.5,.4]（traces/m8_scheduler.out 复现）——本 PR #46995 快照无此调度器代码"
+SUBTITLE = "玩具 c=[.9,.8,.5,.4]（已用 host 纯 Python 复现）——本 PR #46995 快照无此调度器代码"
 COLS = ["k=1", "k=2", "k=3", "k=4"]
 ROW_LABELS = [
     "c_k（置信度）",

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """fig-m6-loop-statetable：state-table 模板。列=块内位置 i=0,1,2（玩具 V=4/N=3/r=2），
 行=prev/嵌入/偏置/基础logits/合成logits/base argmax/draft，高亮末行(draft)标注"翻转"。
-数据取自 explainer.json worked_example（traces/m6_sequential.out 复现）。"""
+数据取自 explainer.json worked_example（已用 host 纯 Python 脚本复现）。"""
 import xml.sax.saxutils as xs
 from pathlib import Path
 
 def esc(s): return xs.escape(s)
 
 TITLE = "序列 Markov 头：玩具 V=4/N=3 逐位翻转 argmax"
-SUBTITLE = "锚点 A 出发；base_logits 只算 1 次，每步用 prev token 生成偏置逐位修正（traces/m6_sequential.out 复现）"
+SUBTITLE = "锚点 A 出发；base_logits 只算 1 次，每步用 prev token 生成偏置逐位修正（已用 host 纯 Python 脚本复现）"
 COLS = ["i=0（prev=A 锚点）", "i=1（prev=B）", "i=2（prev=C）"]
 ROW_LABELS = [
     "prev（前驱 token）",

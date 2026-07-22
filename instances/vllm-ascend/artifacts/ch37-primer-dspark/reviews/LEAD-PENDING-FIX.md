@@ -1,3 +1,16 @@
+# ✅ 已处置(2026-07-22)——三处图面脚手架泄漏已清 + 独立盲审 PASS
+
+**结案**:三张图的 gen 脚本已改、重渲染,`lint_diagram_scaffolding` 由 3 处 BLOCKING 转绿,独立盲审(非作者自审)三图全 PASS 并逐字复核数值无回归。blind_review 已落 PASS。
+- `fig-m6-loop-statetable`:`（traces/m6_sequential.out 复现）`→`（已用 host 纯 Python 脚本复现）`
+- `fig-m8-greedy-earlystop`:`（traces/m8_scheduler.out 复现）`→`（已用 host 纯 Python 复现）`(诚实 PR 说明保留)
+- `fig-m8-granularity-landed`:`dossier honest_gaps 第 2 条`→该 gap 内容本身`无对应调度器实现（本 PR 快照未接入）`
+
+**遗留(可选、非阻断,下次动 ch37 图时顺手)**:`fig-m6` 页脚 `真实 r=256（file 摘要）` 的裸英文 `file` 指代含糊,真相源(explainer symbol_table)实际称 `ai-infrastructure.net 摘要`,可改成 `（论文/厂方摘要）`。**非泄漏、linter 判绿、盲审 PASS**,仅清晰化。
+
+---
+
+_以下为原立案记录_
+
 # ch37 图面脚手架泄漏 3 处 —— 待回修(2026-07-21 立)
 
 发现经过:写 triton-ascend ch09 时，独立盲审抓出 ch09 图上一句作图者自证话术
