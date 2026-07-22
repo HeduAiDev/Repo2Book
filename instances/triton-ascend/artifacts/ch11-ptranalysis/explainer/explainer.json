@@ -1,0 +1,325 @@
+{
+  "chapter": "ch11",
+  "title": "指针算术的逆向工程:PtrAnalysis 把 addptr 链还原成 stride/offset",
+  "trace_note": "skip_impl=true 纯 C++ pass 章,全部 worked_example 为 trace_source=manual:依 PtrAnalysis.cpp 算法手工代入 pin 内 lit 夹具的真实 IR 推导,数字标 file:Lxxx 或夹具行号。推导记录见 explainer/traces/manual_derivation.md。宿主无 CANN/NPU,不跑真实编译器 dump。",
+  "mechanisms": [
+    {
+      "mechanism_id": "m1-ptrstate-vocab",
+      "intuition": "PtrState 就是给一整块张量指针填的一张「收货单」:base 指针是发货仓库(source),标量 offset 是从仓库门口先走几步(块内起点),而 stateInfo 是逐维的「每走一格地址跳多远(stride)、这一维有多少格(shape)、这是原张量第几维(dimIndex)」。逆向分析的全部工作,就是把散在 make_range/mul/add/broadcast 里的地址算术,一格一格填进这张单子。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m1-ptrstate-anatomy",
+          "template": "layout",
+          "claim": "一个 PtrState 由 source(base 指针)+offset(标量起点)+stateInfo(逐维 stride/shape/dimIndex 向量)+sizes(原始形状) 四组槽位构成,addState/mulState 就是把两张这样的单子合成一张。",
+          "numbers": [
+            {"name": "stateInfo 元素三元组", "value": "(stride, shape, dimIndex)", "provenance": "PtrAnalysis.h:L41-L50 struct StateInfo"},
+            {"name": "示例 2D 行主序块的 stateInfo", "value": "[(stride=%arg4, shape=64, dim0), (stride=1, shape=256, dim1)]", "provenance": "manual_derivation.md %27 终态; PtrAnalysis.cpp:L520-L583 addState"},
+            {"name": "示例 source", "value": "%arg1 (!tt.ptr<i8> base)", "provenance": "simplify_for_loop.mlir:L64 %26=splat(%arg1)"},
+            {"name": "示例 offset", "value": "rem(%9,1024)", "provenance": "manual_derivation.md %27 终态"},
+            {"name": "shouldLinearize 标志", "value": "bool(默认 false)", "provenance": "PtrAnalysis.h:L64"}
+          ],
+          "caption_draft": "PtrState 结构解剖:一份指针分析结果 = base 仓库 + 块内起点 + 逐维跳格规则。全章一切代数都在改这四组槽位。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m2-visitoperand-dispatch",
+      "intuition": "visitOperand 像一个顺着「这个地址是谁算出来的」问上去的侦探:拿到一个 SSA 值,先看笔记本(knownPtrs 缓存)有没有记过;没有就看它是不是标量、是不是裸指针;都不是就看它是被哪个算子(add/mul/make_range/broadcast/…)造出来的,转交对应的子侦探去解析它的上游。问到叶子(make_range/裸指针)就有了确定答案,一路回填。",
+      "worked_example": {
+        "params": {"probe": "对 simplify_for_loop.mlir @matmul_kernel 的 %27 起分派,并列举各判定分支落点"},
+        "trace_source": "manual",
+        "manual_reason": "纯 C++ 分派逻辑,无精简版可跑;宿主无 CANN 不跑 triton-opt。分派分支与落点依 PtrAnalysis.cpp:L1280-L1355 逐行核对(sed 对眼),操作数取自真实夹具。",
+        "table": {
+          "columns": ["被分派的 operand", "命中的判定", "转交/落点", "结果"],
+          "rows": [
+            ["%27 (tt.addptr 结果)", "getDefiningOp<AddPtrOp>", "visitOperandAddptr", "递归拆 ptr+offset"],
+            ["%arg1 (!tt.ptr block-arg)", "operandIsScalar 否(只认 Int/Index) → isa<PointerType> 是", "initStateByPointer", "成功:source=%arg1,offset=0"],
+            ["%9 (i32 标量)", "operandIsScalar 是", "initStateByScalar", "成功:offset=index_cast(%9)"],
+            ["%14 (make_range 结果)", "getDefiningOp<MakeRangeOp>", "visitOperandMakeRange", "叶子:stride=1,shape=64"],
+            ["一个 tt.load 结果当 offset 源", "getDefiningOp<LoadOp>", "显式 return failure()", "保守失败,冒泡回退"],
+            ["非指针非标量裸 block-arg 且不在 knownPtrs", "!getDefiningOp() && !knownPtrs.contains", "return failure()", "「input parameters not supported」"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "visitOperand 沿 SSA def-use 反方向递归必终止:每层递归的 operand 严格是当前 operand 的定义算子的操作数,即在有限的 SSA use-def DAG 上向定义方向单调前进。",
+        "argument": "Triton IR 的 use-def 图是有向无环的(SSA 支配 + 无循环依赖),向定义方向的路径长度受支配深度上界约束;叶子(make_range/常量/block-arg)无上游操作数,递归到此返回。故沿任一路径有限步必达叶子,knownPtrs 缓存进一步把重复子树剪成常数。"
+      },
+      "quantified": "分派表共 14 个 getDefiningOp<> 分支(PtrAnalysis.cpp:L1292-L1349):12 个产状态(Add/Mul/Sub/MakeRange/Broadcast/Splat/ExpandDims/AddPtr/ConstSplat/Rem/Div/ExtSI),2 个显式保守失败(LoadOp/FPToSIOp)。加上前置 3 判定(cache/scalar/pointer)与 2 兜底(裸 block-arg / 其余 unsupported op)。m8 主链 12 个节点全部命中前 12 个产状态分支之一,0 次失败。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m2-dispatch-tree",
+          "template": "flow",
+          "claim": "visitOperand 是一棵三层决策:先查缓存/标量/指针三个快门,再按 defining-op 分派到 12 个产状态子例程,LoadOp/FPToSIOp/裸入参/未知算子落到 failure。",
+          "numbers": [
+            {"name": "前置快门数", "value": "3 (knownPtrs 命中 / operandIsScalar / PointerType)", "provenance": "PtrAnalysis.cpp:L1280-L1291"},
+            {"name": "产状态的 defining-op 分支数", "value": "12", "provenance": "PtrAnalysis.cpp:L1292-L1333 (Add/Mul/Sub/MakeRange/Broadcast/Splat/ExpandDims/AddPtr/ConstSplat/Rem/Div/ExtSI)"},
+            {"name": "显式保守失败分支数", "value": "2 (LoadOp, FPToSIOp)", "provenance": "PtrAnalysis.cpp:L1334-L1349"},
+            {"name": "裸 block-arg 分叉", "value": "在 knownPtrs→复用(loop iter-arg);否则 failure", "provenance": "PtrAnalysis.cpp:L1350-L1362"}
+          ],
+          "caption_draft": "分派决策树:14 个 defining-op 分支里 12 产状态、2 保守失败;指针/标量/缓存三快门先行。认不出就 failure,交给下游线性化回退。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m3-visitoperand-addptr",
+      "intuition": "addptr 是「在某个 base 指针上再叠一层偏移」。逆向时它把自己拆成两个独立子问题:左手 getPtr() 解析出「仓库在哪」(必须带 source 的子状态),右手 getOffset() 解析出「这一步叠多少地址算术」(纯偏移子状态),再用 addState 把两张单子焊在一起。它是整棵递归树的根——每条指针链最外层都是一个 addptr。",
+      "worked_example": {
+        "params": {"node": "simplify_for_loop.mlir @matmul_kernel %27 = tt.addptr(%26, %25)"},
+        "trace_source": "manual",
+        "manual_reason": "纯 C++,无精简版;子状态值依 PtrAnalysis.cpp:L250-L279 手工推导,操作数 %26/%25 取自真实夹具 L64-L65。",
+        "table": {
+          "columns": ["步骤", "动作", "得到的子状态关键值", "判定/返回"],
+          "rows": [
+            ["1. 拆 ptr", "visitOperand(%26=splat(%arg1))", "ptrState.source=%arg1, offset=0, stateInfo=[(0,64,d0),(0,256,d1)]", "成功"],
+            ["2. 拆 offset", "visitOperand(%25)", "offsetState.source=∅, offset=rem(%9,1024), stateInfo=[(%arg4,64,d0),(1,256,d1)]", "成功"],
+            ["3. 校验 source", "if(!ptrState.source)", "ptrState.source=%arg1 非空", "通过(否则 'ptr field should provide source')"],
+            ["4. 合并", "state.addState(ptrState, offsetState)", "source=%arg1, stateInfo=[(%arg4,64,d0),(1,256,d1)], offset=rem(%9,1024)", "成功,返回终态"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "addptr 合成的结果 source 恒且仅取自 ptr 侧子状态:base 指针在整条链上唯一。",
+        "argument": "getOffset() 子状态由纯整型地址算术(make_range/mul/add/broadcast/rem)构成,这些算子的叶子只有 make_range(source=null)/整型常量/整型 block-arg,永不引入 source;唯一引入 source 的入口是 splat(标量 !tt.ptr)/裸指针 block-arg,只可能出现在 getPtr() 侧。故 addState 里 lhs?lhs:rhs 恒取 ptr 侧那一个非空 source。"
+      },
+      "quantified": "根节点 addptr 触发 2 次子递归(ptr 侧 + offset 侧);对 m8 主链,ptr 侧子树深 2(splat→pointer),offset 侧子树深 6(broadcast→addi→…→make_range),合计一次 addptr 展开覆盖 12 个上游算子。若 ptr 侧解析不出 source(如 base 由 load 得来),整个 addptr 立即 failure,不进 addState。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m4-addstate-algebra",
+      "intuition": "addState 不是把两个向量对齐逐位相加那么简单——因为两个加数的 stateInfo 可能维数不同、同一维的 shape 也可能一个是另一个的整数倍(broadcast/expand_dims 造成的)。它像拉链一样按 dimIndex 对齐两侧:小编号的维先各走各的;编号相同就要求 shape 互为倍数,取二者较小的 shape 作公共段、stride 相加,较大的那侧把 shape 除掉公共段留待下一轮——这就是「维拆分」。",
+      "worked_example": {
+        "params": {"node": "simplify_for_loop.mlir @matmul_kernel %25 = arith.addi(%23, %24)"},
+        "trace_source": "manual",
+        "manual_reason": "纯 C++;逐维归并结果依 PtrAnalysis.cpp:L520-L583 手工推导,两加数 %23/%24 的 stateInfo 由上游 m8 推导得出。",
+        "table": {
+          "columns": ["维 dimIndex", "lhs(%23) 该维 (stride,shape)", "rhs(%24) 该维 (stride,shape)", "isMultiple 兼容?", "newShape=min", "newStride=lhs+rhs", "前进侧"],
+          "rows": [
+            ["d0", "(%arg4, 64)", "(0, 64)", "64|64 是", "64", "%arg4+0=%arg4", "两侧同前进"],
+            ["d1", "(0, 256)", "(1, 256)", "256|256 是", "256", "0+1=1", "两侧同前进"],
+            ["收尾", "无剩余", "无剩余", "-", "-", "offset: 0 + rem(%9,1024)", "source: ∅?∅→∅"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "双指针归并必终止:每轮循环至少令 lIt 或 rIt 之一严格前进,或令某侧 shape 严格变小(除以 newShape>1)。",
+        "argument": "分三种走法:①dimIndex 不等→取小的那侧 ++,指针进 1;②dimIndex 相等且某侧 shape==newShape→该侧 ++;③某侧 shape>newShape→不前进但 shape/=newShape,因 newShape≥2 使 shape 严格递减到有限下界(shape 是正整数因子链)。两指针位置(单调不减)与各 shape(单调减)构成字典序单调量,故有限步归并完 ≤rank 个维。"
+      },
+      "quantified": "归并复杂度 O(rank + 拆分次数):双指针沿两侧 stateInfo(长度 ≤rank≤3 量级)线性推进,每步 O(1) 的 OpFoldResult 代数;拆分次数受 shape 因子分解上界约束。m8 主链的 %25 是无拆分的对齐加(两侧维 shape 逐维恰好相等),2 维 2 步完成。真正触发拆分需一侧 shape 是另一侧的严格倍数(如 contiguous+broadcast 段合并)。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m4-merge-align",
+          "template": "state-table",
+          "claim": "addState 用 dimIndex 拉链对齐:同维要求 shape 互为倍数,取 min 作公共段、stride 相加,较大侧 shape 除公共段留待拆分。",
+          "numbers": [
+            {"name": "%25 d0 归并", "value": "(%arg4,64)+(0,64) → (%arg4,64)", "provenance": "manual_derivation.md %25; PtrAnalysis.cpp:L544-L546"},
+            {"name": "%25 d1 归并", "value": "(0,256)+(1,256) → (1,256)", "provenance": "manual_derivation.md %25; PtrAnalysis.cpp:L544-L546"},
+            {"name": "兼容性判定", "value": "isMultiple(shapeL,shapeR)‖isMultiple(shapeR,shapeL) 否则 failure", "provenance": "PtrAnalysis.cpp:L529-L541"},
+            {"name": "拆维判定", "value": "shape/=newShape (isEqual 否则前进)", "provenance": "PtrAnalysis.cpp:L565-L568"},
+            {"name": "offset 合成", "value": "0 + rem(%9,1024) = rem(%9,1024)", "provenance": "manual_derivation.md %25; PtrAnalysis.cpp:L573"}
+          ],
+          "caption_draft": "两条 stateInfo 按 dimIndex 拉链归并:同维 shape 互为倍数取 min、stride 相加。此例逐维恰好等长,是无拆分的对齐加。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m5-mulstate-substate",
+      "intuition": "mulState 只处理「张量 × 标量」这一种形态——因为地址算术里的乘法几乎总是「逐元素索引 × 一个 stride 标量」(如 row_idx*stride_bk)。它先 swap 把标量挪到 rhs,再让张量侧每一维的 stride 都乘上这个标量:make_range 原本 stride=1 的维,乘 %arg4 后就变成真正的行 stride。subState 更严:减法不可交换,只允许 rhs 是标量,stateInfo 照抄 lhs、只把 offset 相减。",
+      "worked_example": {
+        "params": {"nodes": "mul: %21=arith.muli(%19,%20);  sub 边界:见 subState 守卫(L474-L494)"},
+        "trace_source": "manual",
+        "manual_reason": "纯 C++;结果依 PtrAnalysis.cpp:L437-L460(mul)/L474-L494(sub)手工推导,%19/%20 取自真实夹具与 m8 上游推导。",
+        "table": {
+          "columns": ["步骤", "算子/守卫", "关键判定", "结果 stateInfo / offset"],
+          "rows": [
+            ["mul-1", "swap 归一", "%20 isScalar(全 0 stride+offset=%arg4);%19 非 scalar → 不 swap,rhs=%20", "lhs=%19"],
+            ["mul-2", "逐维 stride×rhs.offset", "d0:1×%arg4=%arg4;d1:0×%arg4=0", "stateInfo=[(%arg4,64,d0),(0,1,d1)]"],
+            ["mul-3", "offset×offset", "%19.offset(0) × %20.offset(%arg4) = 0", "offset=0"],
+            ["sub-守卫", "两侧 hasSource? / rhs isScalar?", "两侧同带 source→failure;rhs 非标量→failure", "仅 tensor−scalar 放行"],
+            ["sub-算", "offset 相减,stateInfo 照抄 lhs", "newOffset=lhs.offset−rhs.offset", "stateInfo=lhs.stateInfo 不变"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "mulState 保持「至多一侧带 stride 张量」的不变式:输出 stateInfo 恒来自非标量侧,标量侧只贡献一个乘数,不引入新维。",
+        "argument": "三守卫(L413-L435)排除两侧都 hasSource、两侧都非标量;swap 后 rhs 必为标量(所有 stride 静态 0、只有 offset)。循环只遍历 lhs(非标量侧)的 stateInfo 并逐维 stride×rhs.offset——rhs 不贡献任何 StateInfo 条目,故维数、dimIndex 布局与 lhs 完全一致。"
+      },
+      "quantified": "mul 把 stride 从 1 提升为 %arg4,是「索引→字节/元素跨步」转换的唯一发生点。m8 主链恰 1 次 mulState(%21),把 64 维的 stride 从 1 变 %arg4;其余 stride 由 make_range 直接给 1、或 broadcast/expand_dims 给 0。sub 在 m8 主链 0 次(matmul b_ptrs 无减法)。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m6-makerange-stride-formula",
+      "intuition": "make_range(start,end) 造的是 [start, start+1, …, end-1] 这条等差为 1 的索引。逆向只需回答一个是非题:这 n 个数是不是恰好步长 1、连续铺满?公式 stride=(end-start+n-1)/n(整型除,n=结果长度)就是干这个的——对 make_range(0,n) 恒得 1;凡「跳着取」使 n 小于跨度,stride 就 >1,直接保守失败,不给结构化。",
+      "worked_example": {
+        "params": {"ranges": "m8 主链的 %14=make_range(0,64) 与 %10=make_range(0,256);外加一个反例 make_range 跨度128取64个 → n=64"},
+        "trace_source": "manual",
+        "manual_reason": "纯 C++;stride 由 PtrAnalysis.cpp:L778 公式 (end-start+shape[0]-1)/shape[0] 手工代入,前两行的 range 取自真实夹具 L48/L52。",
+        "table": {
+          "columns": ["make_range", "start", "end", "n=shape[0]", "stride=(end-start+n-1)/n", "判定", "叶子 stateInfo"],
+          "rows": [
+            ["%14 (夹具 L52)", "0", "64", "64", "(64-0+63)/64=1", "==1 通过", "[(1, 64)] offset=0 source=∅"],
+            ["%10 (夹具 L48)", "0", "256", "256", "(256-0+255)/256=1", "==1 通过", "[(1, 256)] offset=0 source=∅"],
+            ["反例(跨度128取64个)", "0", "128", "64", "(128-0+63)/64=2", "!=1 保守失败", "return failure()"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "make_range 是分析的叶子:它的输出 PtrState 无 source(nullptr)、单维 stateInfo=(stride,size=n)、offset=start,不依赖任何子递归。",
+        "argument": "visitOperandMakeRange 不调 visitOperand(无上游 operand 要解析),直接从 rangeOp 的 start/end/结果 shape 读常量算出三元组并 updatePtrState。故它是递归的基例,终止性由此保证——所有指针链的 stride=1 连续段最终都追溯到某个 make_range 叶子。"
+      },
+      "quantified": "公式 stride=ceil((end-start)/n):对合法 make_range 恒 n=end-start ⇒ stride=ceil(1)=1。只有 stride==1 单点被接受,其余全拒——把「一维是否 unit-stride 连续」压缩成一次整数除法+一次 !=1 判定,O(1)。m8 主链两个 make_range 都落在 stride=1。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m7-shape-ops",
+      "intuition": "splat/broadcast/expand_dims 是三个「只改形状、不动基向量」的算子。splat 把一个标量沿每一维铺开、每维 stride=0(处处同址)——base 指针正是靠 splat 从标量 !tt.ptr 变成整块张量的 source。broadcast 把某个 size=1 的维加宽到目标宽度,stride 保持不变(通常是 0,所以被广播的维偏移恒 0)。expand_dims 在指定 axis 插一个 stride=0、shape=1 的新维,其余维 dimIndex 右移。三者都不碰 offset 和 source。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m7-shape-evolution",
+          "template": "tensor-flow",
+          "claim": "make_range→expand_dims→(mul)→broadcast 是一条「1D 索引长成 2D 块的一列」的形状演化:expand_dims 插零 stride 维,broadcast 只加宽 size=1 维的 shape,stride 全程不被 splat/broadcast/expand_dims 改动。",
+          "numbers": [
+            {"name": "make_range %14", "value": "[(1,64,d0)] sizes=[64]", "provenance": "manual_derivation.md %14; PtrAnalysis.cpp:L785-L790"},
+            {"name": "expand_dims(axis=1) %19", "value": "[(1,64,d0),(0,1,d1)] sizes=[64,1]", "provenance": "manual_derivation.md %19; PtrAnalysis.cpp:L932-L968"},
+            {"name": "broadcast %23", "value": "d1: shape 1→256, stride 仍 0 → [(%arg4,64,d0),(0,256,d1)]", "provenance": "manual_derivation.md %23; PtrAnalysis.cpp:L848-L865"},
+            {"name": "splat(%arg1) 铺 source", "value": "[(0,64,d0),(0,256,d1)] source=%arg1", "provenance": "manual_derivation.md %26; PtrAnalysis.cpp:L899-L922"}
+          ],
+          "caption_draft": "三个纯形状算子:expand_dims 插零 stride 维、broadcast 只加宽 size=1 维的 shape、splat 把标量(含 base 指针)沿各维铺成 stride=0。stride/offset/source 三者不被它们篡改。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m8-forward-prop-2d-chain",
+      "intuition": "把 matmul 里 b_ptrs 这条真实的 2D 块指针链,从头到尾走一遍逆向:12 个算子(两个 make_range、两次 expand_dims、一次 mul、两次 broadcast、一次 rem、两次 addi、一次 splat、一个 addptr),每个把上游 PtrState 确定性地映成下游。终点自动浮现出「base=%arg1、行 stride=%arg4、列 stride=1、块内 offset=rem(%9,1024)」——正是行主序 2D 块 base + row*stride_bk + col*1 的结构化还原,读者能逐行心算跟上。",
+      "worked_example": {
+        "params": {"fixture": "simplify_for_loop.mlir @matmul_kernel", "chain": "b_ptrs 子链 %14→%27", "base": "%arg1", "row_stride": "%arg4(运行期)"},
+        "trace_source": "manual",
+        "manual_reason": "纯 C++ pass 无精简版,宿主无 CANN 不跑 triton-opt dump。逐节点 PtrState 由各 visitOperand* 算法(PtrAnalysis.cpp)手工代入夹具真实 IR(simplify_for_loop.mlir L48-L65)推导,记录见 traces/manual_derivation.md。",
+        "table": {
+          "columns": ["节点", "算子", "stateInfo(stride,shape,dim)", "offset", "source"],
+          "rows": [
+            ["%14", "make_range(0,64)", "[(1,64,d0)]", "0", "∅"],
+            ["%19", "expand_dims(ax=1)", "[(1,64,d0),(0,1,d1)]", "0", "∅"],
+            ["%20", "splat(%arg4:i32)", "[(0,64,d0),(0,1,d1)]", "%arg4", "∅"],
+            ["%21", "muli(%19,%20)", "[(%arg4,64,d0),(0,1,d1)]", "0", "∅"],
+            ["%23", "broadcast(%21)", "[(%arg4,64,d0),(0,256,d1)]", "0", "∅"],
+            ["%10", "make_range(0,256)", "[(1,256,d0)]", "0", "∅"],
+            ["%12", "addi(splat %9,%10)", "[(1,256,d0)]", "%9", "∅"],
+            ["%13", "remsi(%12,1024)", "[(1,256,d0)]", "rem(%9,1024)", "∅ (shouldLinearize=true)"],
+            ["%22", "expand_dims(ax=0)", "[(0,1,d0),(1,256,d1)]", "rem(%9,1024)", "∅"],
+            ["%24", "broadcast(%22)", "[(0,64,d0),(1,256,d1)]", "rem(%9,1024)", "∅"],
+            ["%25", "addi(%23,%24)", "[(%arg4,64,d0),(1,256,d1)]", "rem(%9,1024)", "∅"],
+            ["%26", "splat(%arg1:!ptr)", "[(0,64,d0),(0,256,d1)]", "0", "%arg1"],
+            ["%27", "addptr(%26,%25)", "[(%arg4,64,d0),(1,256,d1)]", "rem(%9,1024)", "%arg1"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "整条链的终态 PtrState 是其算子序列的纯函数:不依赖遍历顺序,knownPtrs 缓存只做加速不改结果。",
+        "argument": "每个 visitOperand* 把子状态确定性映成父状态(无随机、无外部可变态);addptr 的两个子递归相互独立、结果由 addState 合并,合并对 lhs/rhs 的角色由调用结构固定(ptr 侧恒 lhs)。故对同一 SSA 链,无论以何顺序展开子树,PtrState 恒等——这正是把「从 base 到最终地址的正向算术」在分析域一次性重演的体现。"
+      },
+      "quantified": "12 个算子、13 个节点(含 base splat),1 个 addptr 根、2 个 make_range 叶,递归树最深 6 层(%27→%25→%24→%22→%13→%12→make_range)。终态还原出 3 个结构化量:strides=[%arg4,1]、sizes=[64,256]、offset=rem(%9,1024)——ch12 据此发 reinterpret_cast。全程 0 次 failure。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m8-chain-evolution",
+          "template": "state-table",
+          "claim": "b_ptrs 子链 %14→%27 逐节点 PtrState 演化:12 个地址算子把散落的 stride/offset 一步步归并成 base=%arg1、strides=[%arg4,1]、offset=rem(%9,1024) 的结构化 2D 块。",
+          "numbers": [
+            {"name": "终态 strides", "value": "[%arg4, 1]", "provenance": "manual_derivation.md %27; addState PtrAnalysis.cpp:L520-L583"},
+            {"name": "终态 sizes", "value": "[64, 256]", "provenance": "simplify_for_loop.mlir L64 tensor<64x256>; manual_derivation.md %27"},
+            {"name": "终态 offset", "value": "rem(%9,1024)", "provenance": "manual_derivation.md %13→%27; remsi %cst_7=dense<1024> 夹具 L33"},
+            {"name": "终态 source", "value": "%arg1", "provenance": "simplify_for_loop.mlir L64 splat(%arg1); initStateByPointer L370-L401"},
+            {"name": "链长", "value": "12 算子 / 13 节点", "provenance": "manual_derivation.md 主链推导表"}
+          ],
+          "caption_draft": "一条真实 matmul b_ptrs 链的完整逆向:每行一个算子,PtrState 逐步长成行主序 2D 块指针。逆向的成果 strides=[%arg4,1]/offset=rem(%9,1024) 正是 ch12 造 reinterpret_cast 的输入。"
+        },
+        {
+          "figure_id": "fig-m8-recursion-tree",
+          "template": "flow",
+          "claim": "从 %27=addptr 起,visitOperand 展开成一棵递归树:ptr 侧(%26→%arg1)浅、offset 侧(%25→…→make_range)深,叶子是两个 make_range 和 base 指针。",
+          "numbers": [
+            {"name": "根节点", "value": "%27 addptr", "provenance": "simplify_for_loop.mlir L65"},
+            {"name": "ptr 侧深度", "value": "2 (%26 splat → %arg1 pointer)", "provenance": "manual_derivation.md; PtrAnalysis.cpp:L899-L922 splat"},
+            {"name": "offset 侧最深路径", "value": "6 (%25→%23→%21→%19→%14 make_range)", "provenance": "manual_derivation.md 主链推导"},
+            {"name": "叶子数", "value": "2 make_range + 1 base 指针", "provenance": "simplify_for_loop.mlir L48/L52/L64"}
+          ],
+          "caption_draft": "递归树:addptr 一分为二,ptr 侧两跳到 base、offset 侧六跳到 make_range 叶。子树各自求解后由 addState 焊接成终态。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m9-failure-conservative",
+      "intuition": "PtrAnalysis 的信条是「能结构化就结构化,不能就体面退场」——它从不因为看不懂一条指针链而报错中断整个 pass,而是标记 shouldLinearize=false、原样把 tt.addptr 链交回去,让下游 mask/discrete 线性化路径接手。哪些情况会退场?offset 依赖另一个 load 的结果(编译期不可知)、地址里掺了浮点转整、或者一个非指针非标量的裸入参凭空出现。注意:base 指针 block-arg 反而是成功入口,不在此列。",
+      "worked_example": {
+        "params": {"survey": "visitOperand 的四类 failure 触发点 + createNewPtr 回退落点"},
+        "trace_source": "manual",
+        "manual_reason": "纯 C++ 控制流;各触发点依 PtrAnalysis.cpp:L1334-L1362 与 MemOpConverter.cpp:L352-L359 逐行核对,无可运行精简版。",
+        "table": {
+          "columns": ["触发点", "源码判定", "为什么拒", "落点"],
+          "rows": [
+            ["offset 来自 tt.load 结果", "getDefiningOp<LoadOp> → failure", "地址依赖运行期加载值,编译期无法推 stride/offset", "冒泡 → createNewPtr 回退 oldPtr"],
+            ["地址掺 float→int", "getDefiningOp<FPToSIOp> → failure", "浮点转整精度不可控,破坏可折叠性", "同上,回退"],
+            ["非指针非标量裸 block-arg", "!getDefiningOp() && !knownPtrs.contains → failure", "「input parameters not supported」:无上游可解析且未被父循环 populate", "同上,回退"],
+            ["其余未知 defining-op", "else 兜底 → failure", "无对应 visitOperand* 规则", "同上,回退"],
+            ["对照:base 指针 block-arg", "operandIsScalar 否 → isa<PointerType> 是 → initStateByPointer", "裸指针 !getDefiningOp() → newSource=operand,offset=0", "成功,非失败"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "任一 visitOperand* 返回 failure,失败沿递归链单调冒泡至 createNewPtr,pass 状态保持一致:置 shouldLinearize=false 且 return oldPtr,IR 不被部分改写。",
+        "argument": "所有 visitOperand* 在改写前只在栈上的 PtrState 里累积,不改 IR;失败即 return failure(),调用者 (visitOperandAddptr/addState 等) 检测到 .failed() 立刻 return failure() 上抛,不落任何 knownPtrs。故失败路径无副作用,createNewPtr 拿到 failure 时 oldPtr 仍是原始未改的指针,原样返回给下游线性化——不存在半结构化的中间态。"
+      },
+      "quantified": "共 4 类 failure 触发点(LoadOp/FPToSIOp/裸非指针 block-arg/未知 op)+ 各 visitOperand* 开头的 isEmpty 守卫(内部错误)。对照成功入口有 3 个(缓存命中/标量/指针)+ 12 个产状态算子。m8 主链命中 0 个 failure。回退代价:一条 tt.addptr 链原样保留,交 ch12/ch13 的 mask/discrete 路径,structured 访存收益放弃但正确性不受损。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m10-normalize-state",
+      "intuition": "每次 updatePtrState 收尾都调 normalizeState 做「整理书架」:把相邻的、属于同一原始维的零 stride 条目乘并成一条(stride[0,0,1] shape[4,32,16] → stride[0,1] shape[128,16]),再剔除那些「shape=1 且原始维本来就不是 1」的多余单元维。这保证 stateInfo 始终是规范形——所以各 visitOperand 里 emplace 出的中间 stateInfo,落地前都先被它压平,读者看到的相邻态才对得上。",
+      "worked_example": {
+        "params": {"case": "源码注释示例 stride[0,0,1] shape[4,32,16] 与单元维保留判定"},
+        "trace_source": "manual",
+        "manual_reason": "纯 C++;规范化结果依 PtrAnalysis.cpp:L209-L228 手工推导(示例即源码 L200-L206 注释给出的样例)。",
+        "table": {
+          "columns": ["轮次", "输入 stateInfo(stride,shape,dim)", "规则命中", "输出 stateInfo"],
+          "rows": [
+            ["合并零 stride", "[(0,4,d0),(0,32,d0),(1,16,d1)]", "前两条同 dim0 零 stride → 乘并 shape 4×32=128", "[(0,128,d0),(1,16,d1)]"],
+            ["保留孤立单元维", "[(0,1,d0),(1,128,d1)] sizes=[1,128]", "isOne(shape=1) 但 sizes[d0]=1 → 不删", "[(0,1,d0),(1,128,d1)]"],
+            ["剔除多余单元维", "[(0,64,d0),(0,1,d0)] sizes=[64]", "第二条 shape=1 且 sizes[d0]=64≠1 → 跳过", "[(0,64,d0)]"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "normalizeState 是幂等的:对已规范的 stateInfo 再跑一次不改变它。",
+        "argument": "规范形的定义即「无相邻同 dim 零 stride 条目、无 shape=1 且 sizes≠1 的条目」;normalizeState 恰好消除这两类,输出满足定义。再次运行时:无相邻零 stride 可并(while 内层循环空转)、无可剔单元维(continue 不触发),newStateInfo 逐条照抄输入,故 f(f(x))=f(x)。"
+      },
+      "quantified": "单趟 O(rank) 线性扫描,每条 StateInfo 访问 O(1) 次(外层 for + 内层零 stride 合并共同前进迭代器,不回退)。合并把维数从 ≤rank 压到规范维数;对 m8 的 %26 splat(全零 stride 两维,dimIndex 不同)不合并(dimIndex 需相同),保持 [(0,64,d0),(0,256,d1)]。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m11-rem-div-split",
+      "intuition": "rem/div 是把地址「按块折叠」的进阶算子。取模 i%128 的效果是:一条长 256 的连续索引,被折成「[0..127] 重复 2 遍」——逆向就把它拆成两段:一个 stride=1 长 128 的连续段(块内)+ 一个 stride=0 长 2 的重复段(块间被取模抹平)。规则:除数必须是标量;某维 stride 是除数倍数→该维置 0;除数是 stride 倍数→按 divisor/stride 拆出 contiguous 段;都不整除→保守失败。",
+      "worked_example": {
+        "params": {"fixture": "parseRem.mlir @kernel_with_rem_safe", "node": "%2 = arith.remsi(%1, dense<128>)", "opt": "optimize-dynamic-offset=true"},
+        "trace_source": "manual",
+        "manual_reason": "纯 C++;拆维结果依 PtrAnalysis.cpp:L1083-L1122 手工代入夹具真实 IR(parseRem.mlir L10-L11:%1=make_range(0,256), %cst_2=dense<128>)。宿主无 CANN 不跑真实 dump。",
+        "table": {
+          "columns": ["步骤", "动作", "关键判定", "结果 stateInfo / offset"],
+          "rows": [
+            ["1", "解析 rhs 除数", "%cst_2=128,isScalar 且无 source", "divisor=128"],
+            ["2", "解析 lhs %1=make_range(0,256)", "stride=1,shape=256,offset=0", "state=[(1,256,d0)] off=0"],
+            ["3", "静态 offset 兼容", "staticOffset=0,isMultiple(0,128)=true", "放行(否则需 annotation)"],
+            ["4", "逐维拆分", "isMultiple(1,128)? 1%128≠0 否;isMultiple(128,1)? 128%1=0 是", "走 divisor/stride 拆分支"],
+            ["5", "算 contiguous 段", "contig=min(128/1,256)=128;nonContig=256/128=2(>1 保留)", "emplace (0,2,d0) 再 (1,128,d0)"],
+            ["6", "算 offset", "rem(0,128)=0;shouldLinearize=true", "state=[(0,2,d0),(1,128,d0)] off=0"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "rem 拆分保持元素总数:拆出的各段 shape 之积等于原维 shape。",
+        "argument": "divisor 是 stride 倍数分支里,contiguousSize=min(divisor/stride, shape),nonContiguousSize=shape/contiguousSize;二者相乘 = shape/contiguousSize × contiguousSize = shape(当 contiguousSize 整除 shape,由 isMultiple 前置校验保证)。此例 2×128=256=原 shape,无元素丢失或重复计数——取模只是把线性地址重排成 (repeat, block) 两级,不改张量元素数。"
+      },
+      "quantified": "每维 O(1) 的整除判定 + 至多产 2 条 StateInfo(nonContig + contig)。此例 divisor=128、stride=1:拆出 contig=128、repeat=2。相比之下 stride 是 divisor 倍数(如 stride=256,divisor=128)则该维直接置 stride=0(取模完全抹平)。都不整除→failure(如 divisor=100,stride=3)。m8 主链的 %13 rem 除数 1024>shape 256,contig=min(1024,256)=256、nonContig=1 不加,等价于 rem 不改 stateInfo(只改 offset 与 shouldLinearize)。",
+      "figure_specs": []
+    }
+  ]
+}
