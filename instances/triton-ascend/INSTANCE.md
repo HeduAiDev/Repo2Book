@@ -45,9 +45,10 @@
   仿射 tiled dataflow），bishengir 部分闭源（边界≈基座的 ptxas）。
 - ✅ **大纲已获用户审批（2026-07-18「同意」）**：33 章 / 7 Part（outline-final.json）+ ARCHITECTURE.md，
   开始逐章发车。roadmap.py 生成器已建并验（7 Part 窄长条 5.17:1，4 调用/几何/Read-PNG 通过）。
-- 🚗 **施工中（2026-07-22 状态）**：**ch01–ch11 已全部定稿提交并归档**（Part 1 完 + Part 2 语言层完
-  + **Part 3 分水岭 ch09 primer / ch10 总览 / ch11 PtrAnalysis 深入 完**）；ch12–ch33 未开工。
-  下一章 **ch12**（落到 memref:BlockPtrAnalysis、reinterpret_cast，triton-to-linalg 子系统 → **发车须 skip_impl:true**）。
+- 🚗 **施工中（2026-07-22 状态）**：**ch01–ch12 已全部定稿提交并归档**（Part 1 完 + Part 2 语言层完
+  + **Part 3 分水岭 ch09 primer / ch10 总览 / ch11 PtrAnalysis / ch12 BlockPtrAnalysis→memref 完**——分水岭算法心脏两半齐）；ch13–ch33 未开工。
+  下一章 **ch13**（边界的语义:MaskAnalysis 把 mask 还原成 extract_slice，triton-to-linalg 子系统 → **发车须 skip_impl:true**）。
+  ✅ ch12 是本会话首个**零逃生**章（skip_impl 从发车即带 + 计数交 analyst + 内嵌重排首块声明，ch10/ch11 教训前置生效）。
   发车须 scriptPath（workflow-byname-stale-snapshot）+ 显式 instance:"triton-ascend"（护栏）。
   ⚠️ triton-to-linalg 子系统章交付普遍经逃生：dossier-verify 拦计数/分析错（ch10 pass 数、ch11 m9 失败规则）、
   Implement 拦非 skip_impl、Review 偶发 API 崩溃靠 Lead 补跑缺维。**别信 brief 快照的任何计数**、
