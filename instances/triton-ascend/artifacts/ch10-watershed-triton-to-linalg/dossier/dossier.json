@@ -1,0 +1,443 @@
+{
+  "chapter": "ch10",
+  "title": "分水岭:从指针张量到结构化张量——triton_adapter 总览",
+  "kind": "deep",
+  "one_line": "全书与基座 Triton 最根本的分叉点:ttir_to_linalg 这条 pass 管线,以 PtrAnalysis/BlockPtrAnalysis 把 Triton 的裸指针算术(tensor-of-pointers)逆向还原成结构化的 (offset, sizes, strides) 三元组进而落成 memref,LoadStore 随之从 SIMT 指针访存变成结构化 memref 搬运;namedOps 开关顺带定义『逐元素 arith 不摊成 linalg.generic』。",
+  "code_spine": [
+    "third_party/ascend/backend/compiler.py:L939-L963  add_stages:npu 后端注册 ttir→ttadapter→npubin 三段;ttadapter 段=ttir_to_linalg,唯一装配点固定传 named_ops=True",
+    "third_party/ascend/backend/compiler.py:L96-L171  ttir_to_linalg:整条 ttadapter pass 管线在此依序挂载,pm.run(mod) 前 共 18 趟 pass（11 趟必挂 + auto_scheduling 段可选 7 趟） 的确定序列",
+    "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L1277-L1356  visitOperand:按 defining-op 递归下潜指针算术 DAG 的分派器",
+    "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L234-L280  visitOperandAddptr:把 addptr 拆成 ptr 状态 + offset 状态再合并",
+    "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L764-L797  visitOperandMakeRange:make_range 还原成 (stride=1, size, offset=start) 的一维 StateInfo",
+    "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L869-L930  visitOperandSplat:标量 splat 成 stride=0 的各维",
+    "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L799-L867  visitOperandBroadcast:size=1 维按 stride 保持广播",
+    "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L497-L592  PtrState::addState:两个子状态按 dimIndex 归并 stride/shape/offset",
+    "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L1358-L1372  rewriteAddptrOp:落地——用重构出的 PtrState 重新发射规范化 addptr,记入 knownPtrs/ptrMap",
+    "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L392-L499  BlockDataParser::parse:TritonToLinalg 侧的对应递归分派器,填 BlockData",
+    "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L1125-L1214  rewriteAddPtr:把 BlockData 的 (offsets,sizes,strides) 落成 memref.reinterpret_cast,替换掉 tt.addptr",
+    "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L322-L343  BlockData::createCastOp:构造 StridedLayoutAttr 的 MemRefType 并发射 memref.reinterpret_cast",
+    "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp:L225-L452  LoadConverter::matchAndRewrite:tt.load → memref.alloc 局部缓冲 + memref.copy(从 reinterpret_cast 视图搬入) + bufferization.to_tensor",
+    "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp:L1052-L1146  StoreConverter::matchAndRewrite:tt.store → bufferization.materialize_in_destination 写回 memref 视图",
+    "third_party/ascend/lib/TritonToLinalg/TritonToLinalgPass.cpp:L768-L921  runOnOperation:收官 pass 的驱动;先描述算子转换合法性、再 applyPartialConversion",
+    "third_party/ascend/lib/TritonToLinalg/TritonToLinalgPass.cpp:L510-L525 / L651-L653  namedOps 的两处实际语义位:张量 arith 保持合法 + 不加载 ElementwiseToLinalg 摊平"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "third_party/ascend/backend/compiler.py",
+      "lines": "L939-L963",
+      "what": "add_stages:npu 后端把三段下降链注册进 stages 字典;ttadapter 段就是 ttir_to_linalg,且这个唯一的编译产物装配点固定传 named_ops=True——分水岭的入口",
+      "code": "    def add_stages(self, stages, options):\n        if self.target.backend == \"npu\":\n            stages[\"ttir\"] = lambda src, metadata: make_ttir(src, metadata, options)\n            if options.force_simt_only:\n                stages[\"npubin\"] = (\n                    lambda src, metadata: ttir_to_npubin(\n                        src, metadata, options\n                    )\n                )\n                return\n            stages[\"ttadapter\"] = lambda src, metadata: ttir_to_linalg(\n                src, metadata, options, named_ops=True\n            )\n            if options.compile_on_910_95:\n                stages[\"npubin\"] = (\n                    lambda src, metadata: linalg_to_bin_enable_npu_compile_910_95(\n                        src, metadata, options\n                    )\n                )\n            else:\n                stages[\"npubin\"] = (\n                    lambda src, metadata: linalg_to_bin_enable_npu_compile_A2_A3(\n                        src, metadata, options\n                    )\n                )",
+      "elide": [
+        "force_simt_only 与 compile_on_910_95 两条备用支路:正文主线走 else 分支的 linalg_to_bin_enable_npu_compile_A2_A3,前两支后续章节再讲"
+      ]
+    },
+    {
+      "path": "third_party/ascend/backend/compiler.py",
+      "lines": "L96-L171",
+      "what": "ttir_to_linalg:整条 ttadapter pass 管线在此依序挂到 pass_manager 上,pm.run(mod) 前共 18 趟 pass（11 趟必挂 + auto_scheduling 段可选 7 趟）;末趟 add_triton_to_linalg 收官,named_ops 经此传入第三个位置参数",
+      "code": "def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):\n    # use triton_adapter to lower Triton-MLIR to linalg\n    # Get Triton-MLIR as string\n    ttir_code = str(mod)\n    with tempfile.TemporaryDirectory() as tmpdir:\n        src_path = os.path.join(tmpdir, \"kernel.ttir.mlir\")\n        dst_path = os.path.join(tmpdir, \"kernel.ttadapter.mlir\")\n        Path(src_path).write_text(ttir_code)\n        triton_adapter_opt_path = _get_triton_adapter_opt_path()\n\n        enable_nd2nz_on_vector = metadata[\"enable_nd2nz_on_vector\"]\n        enable_select_analysis = metadata[\"enable_select_analysis\"]\n        compile_on_910_95 = metadata[\"compile_on_910_95\"]\n        force_simt_template = metadata[\"force_simt_template\"]\n        enable_sync_block_lock = metadata[\"enable_sync_block_lock\"]\n        enable_mask_fallback_conversion = metadata[\"enable_mask_fallback_conversion\"]\n        optimize_dynamic_offset = metadata[\"optimize_dynamic_offset\"]\n        auto_blockify_size = metadata[\"auto_blockify_size\"]\n        if not _is_auto_map_parallel_blocks_enabled():\n            auto_blockify_size = 1\n        pm = ir.pass_manager(mod.context)\n        pm.enable_debug()\n        ascend.passes.ttir.add_auto_blockify(\n            pm,\n            auto_blockify_size\n        )\n        if (metadata[\"add_auto_scheduling\"]):\n            ascend.passes.ttir.add_dag_sync(pm)\n            ascend.passes.ttir.add_dag_scope(pm)\n            passes.common.add_cse(pm)\n            passes.common.add_canonicalizer(pm)\n            ascend.passes.ttir.add_dag_ssbuffer(pm)\n            passes.common.add_cse(pm)\n            passes.common.add_canonicalizer(pm)\n\n        ascend.passes.ttir.add_triton_to_structure(\n            pm,\n            enable_mask_fallback_conversion,\n            optimize_dynamic_offset\n        )\n        ascend.passes.ttir.add_discrete_mask_access_conversion(\n            pm,\n            compile_on_910_95,\n            force_simt_template,\n            enable_sync_block_lock\n        )\n        ascend.passes.ttir.add_triton_to_annotation(pm)\n        ascend.passes.ttir.add_triton_to_unstructure(\n            pm,\n            compile_on_910_95,\n            force_simt_template\n        )\n        ascend.passes.ttir.add_triton_to_hivm(pm)\n        ascend.passes.ttir.add_triton_to_hfusion(pm)\n        ascend.passes.ttir.add_triton_to_llvm(pm)\n        ascend.passes.ttir.add_bubble_up_operation(pm)\n        ascend.passes.ttir.add_triton_to_structure(\n            pm,\n            enable_mask_fallback_conversion,\n            optimize_dynamic_offset\n        )\n        ascend.passes.ttir.add_triton_to_linalg(\n            pm,\n            False,\n            named_ops,\n            enable_nd2nz_on_vector,\n            enable_select_analysis,\n            compile_on_910_95\n        )\n        pm.run(mod)",
+      "elide": [
+        "各 metadata[...] 读取只是把 NPUOptions 里的开关取出来透传给对应 pass;dump 与临时文件路径逻辑(src_path/dst_path/opt.debug 落盘)与主线无关"
+      ]
+    },
+    {
+      "path": "third_party/ascend/include/TritonToLinalg/Passes.td",
+      "lines": "L6-L26",
+      "what": "TritonToLinalg pass 的 ODS 声明;namedOps Option 的声明默认值是 false,但正文路径上实际传 True(见 compiler.py:L950)——『声明默认 ≠ 实际取值』的证据",
+      "code": "def TritonToLinalg : Pass<\"triton-to-linalg\", \"mlir::ModuleOp\"> {\n    let summary = \"Convert Triton to Linalg dialect\";\n    let constructor = \"triton::createTritonToLinalgPass()\";\n    let options = [\n        Option<\"globalKernel\", \"global-kernel\", \n            \"bool\", /*default*/\"true\",\n            \"generate a global kernel\">,\n        Option<\"namedOps\", \"named-ops\", \n            \"bool\", /*default*/\"false\",\n            \"use linalg named ops instead of linalg.generic\">,\n        Option<\"enableNd2nzOnVector\", \"enable-nd2nz-on-vector\", \n            \"bool\", /*default*/\"false\",\n            \"enable nd2nz on vector\">,\n        Option<\"enableSelectAnalysis\", \"enable-select-analysis\",\n            \"bool\", /*default*/\"true\",\n            \"enable select analysis\">,\n        Option<\"compileOn91095\", \"compile-on-910-95\", \n            \"bool\", /*default*/\"false\",\n            \"compile on 910_95\">\n    ];\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/TritonToLinalgPass.cpp",
+      "lines": "L510-L525",
+      "what": "namedOps 的实际语义位之一(addDynamicLegal 内):张量上的 arith/math 算子在 namedOps 为真时被判为『合法、无需转换』——于是它们原样保留、不被摊成 linalg.generic",
+      "code": "  target.addDynamicallyLegalDialect<arith::ArithDialect, math::MathDialect>(\n      [this](Operation *op) {\n        if (op->hasAttr(\"MetaUse\")) {\n          return false;\n        }\n\n        if (isa<arith::ConstantOp>(op)) {\n          return true;\n        }\n\n        bool operateOnTensors =\n            llvm::all_of(op->getOperandTypes(),\n                         [](Type type) { return isa<RankedTensorType>(type); });\n\n        return this->namedOps || !operateOnTensors;\n      });",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/TritonToLinalgPass.cpp",
+      "lines": "L648-L654",
+      "what": "namedOps 的实际语义位之二(populateTritonToLinalgConversionPatterns 末尾):只有 namedOps 为假才加载『逐元素→linalg.generic』的转换 pattern;为真则跳过。与 L524 合起来证明真实语义是『别把逐元素 arith 摊成 linalg.generic』,不是『发射 linalg 具名算子』",
+      "code": "  // Add convert pattern for CustomOp.\n  patterns.add<CustomOpConverter>(patterns.getContext());\n\n  if (!this->namedOps) {\n    linalg::populateElementwiseToLinalgConversionPatterns(patterns);\n  }\n}",
+      "elide": [
+        "此函数前半 L590-L649 注册了几十个 Triton 算子的 Converter(LoadConverter/StoreConverter/MakeRangeConverter/SplatConverter/BroadcastConverter…);此处只截 namedOps 分岔的尾部"
+      ]
+    },
+    {
+      "path": "third_party/ascend/include/TritonToStructured/PtrAnalysis.h",
+      "lines": "L52-L99",
+      "what": "PtrState:PtrAnalysis 的核心载体——把一段指针算术凝练成 (source 基址, offset 标量偏移, stateInfo 每维的 stride/shape) 的结构化三元组;成员方法 add/mul/sub State 即在这套三元组上做代数",
+      "code": "struct PtrState {\n    SmallVector<StateInfo> stateInfo;  // shape info when load, maintained with visitOps\n    SmallVector<OpFoldResult> sizes;    // original shape, maintained with visitOps\n    SmallVector<size_t> permuteIds;\n    SmallVector<size_t> order;   // the order of the original data format, only used for block_ptr\n    SmallVector<OpFoldResult> dimOffsets; // the offsets per dimension, only used for block_ptr\n\n    Value source;                // base address (ptr), maintained with visitOps\n    OpFoldResult offset;        // scalar offset (int), maintained with visitOps\n\n    // whether the record needs to be processed in the current pass, when ignore is true,\n    // it indicates that this scenario should not be processed within the current pass\n    bool shouldLinearize = false;\n    bool isPermuted = false;\n\n    void dump() const;\n    bool isEmpty() const;\n    bool isScalar() const;\n    bool hasSource() const;\n    bool isBlockPtr() const;\n    bool isSameSizeAs(const PtrState& x) const;\n\n    void generateOriginPermuteIds();\n\n    // Formula of \"contiguous axes\"\n    // - axis i is contiguous if stride[i] == product(shape[0..i-1]).\n    size_t countContiguousAxes(SmallVector<StateInfo> stateInfo) const;\n    void analyzePermute();\n\n    void updatePtrState(SmallVector<StateInfo> stateInfo, SmallVector<OpFoldResult> sizes,\n                        Value source, OpFoldResult offset, const Location loc,\n                        OpBuilder& builder, bool shouldLinearize = false);\n\n    void normalizeState(const Location loc, OpBuilder& builder);\n\n    LogicalResult mulState(const PtrState& lhsState, const PtrState& rhsState,\n                          Operation* op, OpBuilder& builder);\n\n    LogicalResult subState(const PtrState& lhsState, const PtrState& rhsState,\n                          Operation* op, OpBuilder& builder);\n\n    LogicalResult addState(PtrState& lhsState, PtrState& rhsState, Operation* op,\n                          OpBuilder& builder);\n\n    triton::AddPtrOp createAddPtrOp(OpBuilder& builder, Location loc);\n\n    triton::MakeTensorPtrOp createMakeTensorPtrOp(OpBuilder& builder, Location loc);\n};",
+      "elide": [
+        "permuteIds/order/dimOffsets/isPermuted 只服务 block_ptr 与转置场景,首讲可先按下不表"
+      ]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp",
+      "lines": "L1277-L1356",
+      "what": "visitOperand:PtrAnalysis 的递归分派器——按 defining-op 类型下潜整棵指针算术 DAG(addptr/mul/add/make_range/broadcast/splat/expand_dims…),每种 op 各有一个 visitOperandXxx 还原其对 PtrState 的贡献;非法算子(load 派生 offset、浮点转整地址)直接 failure 保守退出",
+      "code": "LogicalResult PtrAnalysis::visitOperand(Value operand, PtrState &state,\n                                        const Location loc,\n                                        OpBuilder &builder) {\n    if (knownPtrs.find(operand) != knownPtrs.end()) {\n        state = knownPtrs.lookup(operand);\n        return success();\n    }\n\n    if (operandIsScalar(operand)) {\n        return initStateByScalar(operand, state, loc, builder);\n    }\n\n    if (isa<triton::PointerType>(operand.getType())) {\n        return initStateByPointer(operand, state, loc, builder);\n    }\n\n    if (auto op = operand.getDefiningOp<arith::AddIOp>()) {\n        return visitOperandAdd(op, state, loc, builder);\n    } else if (auto op = operand.getDefiningOp<arith::MulIOp>()) {\n        return visitOperandMul(op, state, loc, builder);\n    } else if (auto op = operand.getDefiningOp<arith::SubIOp>()) {\n        return visitOperandSub(op, state, loc, builder);\n    } else if (auto op = operand.getDefiningOp<triton::MakeRangeOp>()) {\n        return visitOperandMakeRange(op, state, loc, builder);\n    } else if (auto op = operand.getDefiningOp<triton::BroadcastOp>()) {\n        return visitOperandBroadcast(op, state, loc, builder);\n    } else if (auto op = operand.getDefiningOp<triton::SplatOp>()) {\n        return visitOperandSplat(op, state, loc, builder);\n    } else if (auto op = operand.getDefiningOp<triton::ExpandDimsOp>()) {\n        return visitOperandExpandDims(op, state, loc, builder);\n    } else if (auto op = operand.getDefiningOp<triton::AddPtrOp>()) {\n        return visitOperandAddptr(op, state, loc, builder);\n    } else if (auto op = operand.getDefiningOp<arith::ConstantOp>()) {\n        return visitOperandConstSplat(op, state, loc, builder);\n    } else if (auto op = operand.getDefiningOp<arith::RemSIOp>()) {\n        return visitOperandRem(op, state, loc, builder);\n    } else if (auto op = operand.getDefiningOp<arith::DivSIOp>()) {\n        return visitOperandDiv(op, state, loc, builder);\n    } else if (auto op = operand.getDefiningOp<arith::ExtSIOp>()) {\n        return visitOperandExtSI(op, state, loc, builder);\n    } else if (auto op = operand.getDefiningOp<triton::LoadOp>()) {\n        LLVM_DEBUG({\n            op.emitRemark(\"TritonToStructured: Invalid dynamic offset\"\n                        \"The load operation's offset cannot be derived from another load result.\");\n        });\n        return failure();\n    } else if (auto op = operand.getDefiningOp<arith::FPToSIOp>()) {\n        LLVM_DEBUG({\n            op.emitWarning(\"IllegalTypeConversionInAddressCalculation\"\n                        \"float-to-int precision conversion is not supported during address computation.\");\n            llvm::dbgs() << \"Operand: \\n\";\n            operand.dump();\n            llvm::dbgs() << \"----------------------------------------------\\n\";\n        });\n        return failure();\n    } else if (!operand.getDefiningOp()) {\n        if (!knownPtrs.contains(operand)) {\n            LLVM_DEBUG({\n                llvm::dbgs() << \"TritonToStructured: Pointer analysis is not supported for input parameters\\n\";\n            });\n            return failure();\n        }\n\n        // This operand must be an iter-arg of an inner-loop in a multiple-level\n        // nested loop, which means its PtrState must have already been populated\n        // during rewriteForOp of the parent loop.\n        state = knownPtrs[operand];\n        return success();\n    } else {\n        auto op = operand.getDefiningOp();\n        LLVM_DEBUG({\n            op->emitWarning(\"TritonToStructured: encountered addptr operand produced by an unsupported operation\");\n            llvm::dbgs() << \"Operand: \\n\";\n            operand.dump();\n            llvm::dbgs() << \"----------------------------------------------\\n\";\n        });\n        return failure();\n    }\n    return success();\n}",
+      "elide": [
+        "末段几个 else-if(load/FPToSI/无 defining-op iter-arg/兜底)都是保守失败路径,首讲可只点『不认识的算子就整体 failure、绝不猜』这一原则"
+      ]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp",
+      "lines": "L764-L797",
+      "what": "visitOperandMakeRange:最基础的还原——tt.make_range(start,end) 被还原成一维 StateInfo(stride=1, size=shape[0], offset=start);非单位步长直接拒绝。这是 (offset,sizes,strides) 从裸 IR 里长出来的第一块砖",
+      "code": "LogicalResult PtrAnalysis::visitOperandMakeRange(triton::MakeRangeOp rangeOp,\n                                                 PtrState &state, Location loc,\n                                                 OpBuilder &builder) {\n    if (!state.isEmpty()) {\n        LLVM_DEBUG({\n            rangeOp.emitError(\"PtrAnalysis: PtrState should be empty when visiting make_range\");\n        });\n        return failure();\n    }\n\n    auto shape = cast<ShapedType>(rangeOp.getType()).getShape();\n\n    auto start = rangeOp.getStart();\n    auto end = rangeOp.getEnd();\n    auto stride = (end - start + shape[0] - 1) / shape[0];\n    if (stride != 1) {\n        LLVM_DEBUG({\n            rangeOp.emitError(\"PtrAnalysis: make_range op with stride != 1 is not supported\");\n        });\n        return failure();\n    }\n\n    auto infoStride = builder.getIndexAttr(stride);\n    auto size = builder.getIndexAttr(shape[0]);\n    auto offset = builder.getIndexAttr(start);\n\n    SmallVector<StateInfo> stateInfo;\n    SmallVector<OpFoldResult> sizes;\n    stateInfo.emplace_back(infoStride, size);\n    sizes.emplace_back(size);\n\n    state.updatePtrState(stateInfo, sizes, nullptr, offset, loc, builder);\n    return success();\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp",
+      "lines": "L497-L592",
+      "what": "PtrState::addState:指针加法的代数核心——两个子状态按 dimIndex 对齐归并,逐维把 stride 相加、shape 取相容的较小者(可分裂),offset 相加,source 取非空的一方。add_kernel 里 `x_ptr + offsets` 的 tt.addptr 最终走到这里",
+      "code": "LogicalResult PtrState::addState(PtrState &lhsState,\n                                 PtrState &rhsState, Operation *op,\n                                 OpBuilder &builder) {\n    auto loc = op->getLoc();\n\n    if (!isEmpty()) {\n        LLVM_DEBUG({\n            op->emitError(\"PtrAnalysis: PtrState should be empty when adding\");\n        });\n        return failure();\n    }\n    if (!lhsState.isSameSizeAs(rhsState)) {\n        LLVM_DEBUG({\n            op->emitError(\"PtrAnalysis: The original size of the addition should be the same\");\n        });\n        return failure();\n    }\n\n    SmallVector<StateInfo> newStateInfo;\n    auto lIt = lhsState.stateInfo.begin();\n    auto rIt = rhsState.stateInfo.begin();\n    while (lIt != lhsState.stateInfo.end() && rIt != rhsState.stateInfo.end()) {\n        if (lIt->dimIndex != rIt->dimIndex) {\n            auto newInfo = lIt->dimIndex < rIt->dimIndex ? *lIt++ : *rIt++;\n            newStateInfo.emplace_back(newInfo);\n            continue;\n        }\n        if (!isMultiple(lIt->shape, rIt->shape) &&\n            !isMultiple(rIt->shape, lIt->shape)) {\n            return failure();\n        }\n\n        auto newShape = minOpFoldResult(lIt->shape, rIt->shape, loc, builder);\n        if ((isLess(newShape, lIt->shape) && !isZero(lIt->stride) ||\n            isLess(newShape, rIt->shape) && !isZero(rIt->stride))) {\n            return failure();\n        }\n\n        auto newStride = addOpFoldResult(lIt->stride, rIt->stride, loc, builder);\n        newStateInfo.emplace_back(newStride, newShape, lIt->dimIndex);\n\n        if (isEqual(lIt->shape, newShape))  ++lIt;\n        else    lIt->shape = divOpFoldResult(lIt->shape, newShape, loc, builder);\n        if (isEqual(rIt->shape, newShape))  ++rIt;\n        else    rIt->shape = divOpFoldResult(rIt->shape, newShape, loc, builder);\n    }\n\n    while (rIt != rhsState.stateInfo.end()) {\n        newStateInfo.push_back(*rIt++);\n    }\n    while (lIt != lhsState.stateInfo.end()) {\n        newStateInfo.push_back(*lIt++);\n    }\n\n    auto newSource = source = lhsState.source ? lhsState.source : rhsState.source;\n    auto newOffset = addOpFoldResult(lhsState.offset, rhsState.offset, loc, builder);\n    auto newShouldLinearize = lhsState.shouldLinearize || rhsState.shouldLinearize;\n    auto newSizes = lhsState.sizes;\n\n    updatePtrState(newStateInfo, newSizes, newSource,\n        newOffset, loc, builder, newShouldLinearize);\n\n    return success();\n}",
+      "elide": [
+        "多处 LLVM_DEBUG 的 dump/emitError 诊断块(约束不满足时打印 lhs/rhs 状态)已省;逻辑不受影响"
+      ]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp",
+      "lines": "L1125-L1214",
+      "what": "BlockDataParser::rewriteAddPtr:分水岭的落地时刻——parseAddPtr 递归填好 BlockData 的 (offsets,sizes,strides,source),末尾 createCastOp 发射 memref.reinterpret_cast 并 replaceOp 掉 tt.addptr。指针张量至此变成结构化 memref",
+      "code": "void BlockDataParser::rewriteAddPtr(\n    triton::AddPtrOp op, triton::AddPtrOp::Adaptor &adaptor,\n    ConversionPatternRewriter &rewriter,\n    llvm::SmallDenseMap<Value, BlockData> &known) {\n  auto insertPoint = rewriter.saveInsertionPoint();\n  rewriter.setInsertionPoint(op);\n\n  BlockData data;\n  parseAddPtr(op, data, op.getLoc(), rewriter, known);\n\n  if (auto src = data.getSource();\n      data.getMemAccTypeRef().isUnstructured() &&\n      !(src && isa_and_nonnull<triton::IntToPtrOp>(src.getDefiningOp()))) {\n    // TODO: Based on more info, try to create a performant IR\n    rewriteAddPtrToUnstrucMemAcc(op, adaptor, rewriter, data);\n    return;\n  }\n\n  if (data.getSizesRef().size() == 0) {\n    data.getSizesRef().push_back(rewriter.getIndexAttr(1));\n    data.getStridesRef().push_back(rewriter.getIndexAttr(0));\n    data.getOffsetsRef().push_back(data.getScalarRef());\n  }\n\n  ArrayRef<int64_t> resultShape;\n  // shape {1,} is stub for single ptr\n  SmallVector<int64_t> stubScalarTypeShape(1, 1);\n  if (auto shapedType = dyn_cast<ShapedType>(op.getResult().getType())) {\n    resultShape = shapedType.getShape();\n  } else {\n    assert(data.getRank() == 1);\n    resultShape = stubScalarTypeShape;\n  }\n\n  known[op.getResult()] = data;\n\n  auto inferedSize = 1;\n  auto hoistDim = op->getAttrOfType<IntegerAttr>(\"hoist_dim\");\n  for (int i = data.getSizesRef().size() - 1; i >= 0; i--) {\n    auto strideConst = getConstantIntValue(data.getStridesRef()[i]);\n    auto sizeConst = getConstantIntValue(data.getSizesRef()[i]);\n    assert(sizeConst.has_value());\n    bool shouldReplaceStride = (sizeConst.value() == 1) || (hoistDim && hoistDim.getValue() == i);\n    if (shouldReplaceStride && strideConst && strideConst.value() == 0) {\n      data.getStridesRef()[i] = rewriter.getIndexAttr(inferedSize);\n    }\n    inferedSize *= sizeConst.value();\n  }\n\n  memref::ReinterpretCastOp castOp =\n      data.createCastOp(resultShape, op.getLoc(), rewriter);\n  Value src = castOp.getResult();\n\n  rewriter.replaceOp(op, src);\n  rewriter.restoreInsertionPoint(insertPoint);\n}",
+      "elide": [
+        "非结构化访存回退(rewriteAddPtrToUnstrucMemAcc)、IntToPtrOp→hivm.pointer_cast、bitcast 场景(resElemTy 走 UnrealizedConversionCast)三处旁支已省,主线是结构化访存→createCastOp;LLVM_DEBUG 打印亦省"
+      ]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp",
+      "lines": "L322-L343",
+      "what": "BlockData::createCastOp:把 (offset,sizes,strides) 铸成带 StridedLayoutAttr 的 MemRefType,发射 memref.reinterpret_cast——这一个算子就是『结构化张量』的物化形态,后续 load/store 都锚在它上面",
+      "code": "memref::ReinterpretCastOp BlockData::createCastOp(ArrayRef<int64_t> resultShape,\n                                                  const Location &loc,\n                                                  OpBuilder &builder) const {\n  OpFoldResult resOffset = this->inferBlockOffset(loc, builder);\n  auto resultType = this->getResultMemrefType(\n      isa<Attribute>(resOffset) ? getConstantIntValue(resOffset).value()\n                                : ShapedType::kDynamic,\n      resultShape);\n\n  SmallVector<OpFoldResult> strides(this->strides);\n  for (size_t i = 0; i < strides.size(); i++) {\n    if (resultShape[i] == 1) {\n      if (auto strideValue = dyn_cast<Value>(strides[i])) {\n        auto oneIdx = builder.create<arith::ConstantOp>(loc, builder.getIndexAttr(1));\n        strides[i] = builder.create<arith::MaxSIOp>(loc, strideValue, oneIdx).getResult();\n      }\n    }\n  }\n\n  return builder.create<memref::ReinterpretCastOp>(\n      loc, resultType, this->source, resOffset, this->sizes, strides);\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp",
+      "lines": "L425-L453",
+      "what": "LoadConverter 无 mask 主路:tt.load 落成 memref.copy(从 reinterpret_cast 得到的源视图 ptr → 本地 alloc 的缓冲 allocOp)+ bufferization.to_tensor。SIMT『每线程解引用一个指针』至此变成『把一块结构化 memref 搬进本地再转成 tensor』",
+      "code": "  if (!mask) {\n    assert(!other && \"can not input 'other' when 'mask' is not set\");\n    if (auto unrealizedCastOp =\n            ptr.getDefiningOp<UnrealizedConversionCastOp>()) {\n      // TODO : not support handle  associate with \"module\"\n      // hint : can be handled in Linearize\n      op->emitError(\"meeting unexpected UCC in LoadConverter!\");\n      return failure();\n    } else {\n      // If last dimension stride equals 2, try deinterleave optimization.\n      auto [ptrStrides, ptrOffsets] = getStridesAndOffset(memRefType);\n      if (ptrStrides.back() == 2 && (memRefShape.back() % 2 == 0) &&\n          mlir::triton::DeinterleaveStatusOptimization(op, adaptor, rewriter)\n              .succeeded()) {\n        return success();\n      }\n      auto copyOp = rewriter.create<memref::CopyOp>(loc, ptr, allocOp);\n      propagateWasBoolToInt8Attr(op.getOperation(), copyOp.getOperation(), rewriter);\n      if (mayImplicitTransposeWithLastAxis && allocOp.getDefiningOp<memref::AllocOp>()) {\n        auto markOp = rewriter.create<annotation::MarkOp>(loc, allocOp);\n        markOp->setAttr(MayImplicitTransposeWithLastAxisTAG, UnitAttr::get(rewriter.getContext()));\n      } else if (mayImplicitTransposeWithLastAxis && allocOp.getDefiningOp<memref::SubViewOp>()) {\n        auto markOp = rewriter.create<annotation::MarkOp>(loc, allocOpTmp);\n        markOp->setAttr(MayImplicitTransposeWithLastAxisTAG, UnitAttr::get(rewriter.getContext()));\n      }\n    }\n\n    return this->toTensorAndReplace(op, tensorType, allocOp, mayImplicitTransposeWithLastAxis, loc, rewriter);\n  }",
+      "elide": [
+        "deinterleave(stride==2)优化与 mayImplicitTransposeWithLastAxis 转置标记两条旁支只在特殊 stride/dot 场景触发;主线只需 memref.copy + toTensorAndReplace(内部即 bufferization.to_tensor)"
+      ]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToAnnotation/TritonToAnnotation.cpp",
+      "lines": "L47-L71",
+      "what": "TritonToAnnotation:管线中一趟轻量注解 pass(排在第一次 triton_to_structure 之后（中间隔着 add_discrete_mask_access_conversion）),把 triton.ascend.annotation 算子改写成通用 annotation.mark 并转发全部属性——把 Triton 侧的注解桥接到 bishengir 的 annotation 方言,供后续 pass/profiling 读取",
+      "code": "struct TritonAnnotationConversionPattern\n    : OpRewritePattern<mlir::triton::ascend::AnnotationOp> {\n  using OpRewritePattern<mlir::triton::ascend::AnnotationOp>::OpRewritePattern;\n\n  LogicalResult matchAndRewrite(mlir::triton::ascend::AnnotationOp op,\n                                PatternRewriter &rewriter) const final {\n    auto markOp = rewriter.create<annotation::MarkOp>(op.getLoc(), op.getSrc());\n    // Forward all annotations.\n    markOp->setAttrs(op->getAttrs());\n    rewriter.eraseOp(op);\n    return success();\n  }\n};\n\nvoid TritonToAnnotationPass::runOnOperation() {\n  auto module = getOperation();\n  ConversionTarget target(getContext());\n  target.addLegalDialect<annotation::AnnotationDialect>();\n\n  RewritePatternSet patterns(&getContext());\n  patterns.add<TritonAnnotationConversionPattern>(patterns.getContext());\n  if (failed(applyPartialConversion(module, target, std::move(patterns)))) {\n    signalPassFailure();\n  }\n}",
+      "elide": []
+    }
+  ],
+  "key_classes": [
+    {
+      "name": "PtrState (struct)",
+      "file": "third_party/ascend/include/TritonToStructured/PtrAnalysis.h:L52",
+      "responsibility": "TritonToStructured 侧承载『指针算术还原结果』的结构体:source 基址 + offset 标量偏移 + stateInfo(每维 stride/shape)+ sizes(原始形状)。add/mul/sub State 在其上做代数,createAddPtrOp 据它重发射规范化 IR。"
+    },
+    {
+      "name": "PtrAnalysis (class)",
+      "file": "third_party/ascend/include/TritonToStructured/PtrAnalysis.h:L101",
+      "responsibility": "TritonToStructured 的指针分析器:visitOperand 递归下潜指针算术 DAG,各 visitOperandXxx 还原单个算子贡献;rewriteAddptrOp 落地并把结果记入 knownPtrs/ptrMap。"
+    },
+    {
+      "name": "BlockData (class)",
+      "file": "third_party/ascend/lib/TritonToLinalg/include/TritonToLinalg/BlockPtrAnalysis.h:L77",
+      "responsibility": "TritonToLinalg 侧的对应载体:显式持有 offsets/sizes/strides/source/scalar 与 memAccType;createCastOp 把它铸成 memref.reinterpret_cast。add/sub/mul/divBlock 做块级代数。"
+    },
+    {
+      "name": "BlockDataParser (类)",
+      "file": "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L392",
+      "responsibility": "驱动 BlockData 的递归解析:parse 分派、parseAddPtr 处理指针加法、rewriteAddPtr 把 tt.addptr 替换成 memref。与 PtrAnalysis 结构平行但直接产 memref。"
+    },
+    {
+      "name": "TritonToLinalgPass",
+      "file": "third_party/ascend/lib/TritonToLinalg/TritonToLinalgPass.cpp:L768",
+      "responsibility": "收官 pass:注册所有 Triton 算子 Converter(含 LoadStore/MakeRange/Splat/Broadcast),描述转换合法性,applyPartialConversion。namedOps 选项在此定义『张量 arith 是否保留原样』。"
+    },
+    {
+      "name": "LoadConverter / StoreConverter",
+      "file": "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp:L225 / L1052",
+      "responsibility": "把 tt.load/tt.store 落成对 memref 的结构化访存:load = alloc + memref.copy + to_tensor;store = materialize_in_destination 写回 reinterpret_cast 视图。"
+    },
+    {
+      "name": "AddPtrConverter",
+      "file": "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp:L78",
+      "responsibility": "tt.addptr 的转换 pattern,委托 BlockDataParser::rewriteAddPtr 完成指针张量→memref 的重写。"
+    },
+    {
+      "name": "TritonToAnnotationPass",
+      "file": "third_party/ascend/lib/TritonToAnnotation/TritonToAnnotation.cpp:L40",
+      "responsibility": "轻量注解 pass:triton.ascend.annotation → annotation.mark,转发属性,桥接到 bishengir annotation 方言。"
+    }
+  ],
+  "data_flow": [
+    "1. AscendBackend.add_stages(compiler.py:L939):npu 后端注册 ttir → ttadapter → npubin;ttadapter 段=ttir_to_linalg,固定 named_ops=True(L949-L951)。",
+    "2. ttir_to_linalg(compiler.py:L96):把整条 pass 管线依序挂到 pass_manager——add_auto_blockify →(可选 auto_scheduling:dag_sync/dag_scope/cse/canonicalizer/dag_ssbuffer)→ add_triton_to_structure →add_discrete_mask_access_conversion →add_triton_to_annotation →add_triton_to_unstructure →add_triton_to_hivm →add_triton_to_hfusion →add_triton_to_llvm →add_bubble_up_operation →add_triton_to_structure(第二次)→ add_triton_to_linalg(收官,传 named_ops)。",
+    "3. triton_to_structure(PtrAnalysis):对每个 tt.addptr,visitOperand 递归下潜其指针算术 DAG,make_range/splat/broadcast/mul/add 各自还原对 PtrState 的贡献(stride/shape/offset),addState 归并;rewriteAddptrOp 用重构出的 PtrState 重发射规范化的 addptr(去掉冗余的 rem/div/mask 表达),记入 knownPtrs。",
+    "4. triton_to_linalg(BlockPtrAnalysis + Converters):AddPtrConverter→BlockDataParser::rewriteAddPtr 再做一次同构的递归解析,填 BlockData(offsets/sizes/strides/source),createCastOp 发射 memref.reinterpret_cast,replaceOp 掉 tt.addptr——指针张量正式变成结构化 memref。",
+    "5. LoadConverter/StoreConverter:tt.load → memref.alloc 本地缓冲 + memref.copy(源 reinterpret_cast 视图 → 本地)+ bufferization.to_tensor;tt.store → bufferization.materialize_in_destination 写回 memref 子视图。",
+    "6. namedOps=True 的效应(TritonToLinalgPass L510-L525 / L651-L653):张量上的逐元素 arith/math 被判为合法、原样保留,不加载 populateElementwiseToLinalgConversionPatterns、不摊成 linalg.generic。产物是 tensor 上的 arith + linalg 结构化算子的混合体,交给下游 HFusion/HIVM。"
+  ],
+  "design_decisions": [
+    {
+      "decision": "把变换搬到张量/结构化层:先用 PtrAnalysis 逆向还原 (offset,sizes,strides),而不是沿用 GPU 的 SIMT 逐指针模型",
+      "why": "昇腾达芬奇是向量/立方体架构,吃的是结构化访存与 memref,不吃 SIMT 每线程解引用一个指针的模型。承 ch09 立的 Linalg 底座:结构化算子+迭代域让循环/tiling/融合变换有据可依。这是本仓与基座 Triton(→ TritonGPU → LLVM)最根本的分叉点。",
+      "evidence": "third_party/ascend/backend/compiler.py:L96-L164;third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L1125-L1214"
+    },
+    {
+      "decision": "指针分析做两遍、两个平行实现:TritonToStructured/PtrAnalysis(重发射规范 addptr)在前,TritonToLinalg/BlockPtrAnalysis(直接产 memref)在后",
+      "why": "第一遍在 Triton 方言内把复杂指针表达式(含 rem/div/mask)规范化成干净的 addptr/make_tensor_ptr,并处理循环 iter-arg;第二遍才铸成 memref.reinterpret_cast。管线里 add_triton_to_structure 出现两次(L131、L152)即对应此分工。",
+      "evidence": "third_party/ascend/backend/compiler.py:L131-L156;PtrAnalysis.cpp:L1358-L1372 vs BlockPtrAnalysis.cpp:L1125-L1214"
+    },
+    {
+      "decision": "分析器遇到不认识/不安全的算子(load 派生地址、浮点转整、未知 op)一律整体 failure,绝不猜",
+      "why": "地址算术错一位就是越界/静默错数;保守失败让这段 kernel 走非结构化回退路径而非产出错误 memref。",
+      "evidence": "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L1317-L1354"
+    },
+    {
+      "decision": "namedOps 在编译产物路径固定为 True,语义是『别把逐元素 arith 摊成 linalg.generic』而非『发射 linalg 具名算子』",
+      "why": "下游 HFusion 吃 tensor 上的 arith/具名结构化算子;把逐元素运算摊成 linalg.generic 反而妨碍融合。开关名 use-linalg-named-ops 易误读——真实效果是两处:L524 让张量 arith 合法(保留)、L651 跳过 ElementwiseToLinalg。全仓无 linalg.add 产出。",
+      "evidence": "TritonToLinalgPass.cpp:L510-L525、L648-L654;compiler.py:L949-L951;Passes.td:L13-L15"
+    },
+    {
+      "decision": "PtrAnalysis 这套 raise pointer-arithmetic to structured 借鉴微软 triton-shared",
+      "why": "复用成熟的『把张量指针算术还原成结构化访存』的工程方案,PtrAnalysis.h/cpp 顶部版权同时署 Huawei 与 Microsoft。此为工程来源、非学术论文(RFC 有据、无 arXiv)。",
+      "evidence": "third_party/ascend/include/TritonToStructured/PtrAnalysis.h:L2-L3(Copyright Huawei + Microsoft)"
+    }
+  ],
+  "theory": [
+    {
+      "topic": "结构化三元组 (offset, sizes, strides) 与 strided memref 的等价",
+      "content": "一个 rank-N 的规则张量访问可由基址 base、每维 size s_i、每维 stride d_i 完全刻画:线性地址 = base + Σ_i idx_i · d_i,idx_i ∈ [0, s_i)。MLIR 的 StridedLayoutAttr(offset + strides)正是这个抽象。PtrAnalysis/BlockPtrAnalysis 做的就是从裸 IR 反解出这组 (base,offset,{s_i,d_i}),再用 memref.reinterpret_cast 物化。",
+      "grounding": "BlockPtrAnalysis.cpp:L153-L165(getResultMemrefType 构造 StridedLayoutAttr);L322-L343"
+    },
+    {
+      "topic": "各算子对结构化三元组的作用规则(可推导)",
+      "content": "make_range(0..n):新增一维 stride=1,size=n,offset=start。splat(标量→张量):各维 stride=0(广播),size=目标形状。broadcast(size1→sizeN):对 src size==1 的维,把 shape 提到目标而 stride 保持。mul(range·常量):stride 乘常量(mulState)。add(两个指针分量):按 dimIndex 归并、stride 相加、offset 相加(addState)。这套规则让 add_kernel 里 `x_ptr + (pid*BLOCK + arange(0,BLOCK))` 一步步长成 (offset=pid·BLOCK, size=BLOCK, stride=1)。",
+      "grounding": "PtrAnalysis.cpp:L764-L797(makeRange)、L869-L930(splat)、L799-L867(broadcast)、L497-L592(addState)"
+    },
+    {
+      "topic": "normalizeState:合并连续零步长维、消除冗余单元维",
+      "content": "更新状态后做规范化:连续的 stride=0 维(广播维)可合并成一维(shape 相乘),单元 size 维在不丢信息时消去。保证同一访问模式有唯一规范形,便于后续等价判断与 memref 生成。",
+      "grounding": "PtrAnalysis.cpp:L208-L232(normalizeState)"
+    }
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {
+        "what": "PtrAnalysis 各 visitOperandXxx 与 addState/mulState 里的 LLVM_DEBUG{ dump()/emitError/emitRemark } 诊断块",
+        "why_safe": "纯调试输出,不影响还原逻辑与返回值;精简版保留 success/failure 控制流即可复现行为。"
+      },
+      {
+        "what": "block_ptr/make_tensor_ptr 相关支路:visitOperandMakeTensorPtr、PtrState 的 permuteIds/order/dimOffsets/analyzePermute/generateOriginPermuteIds/countContiguousAxes 及 createMakeTensorPtrOp",
+        "why_safe": "add_kernel 主线用的是裸指针算术(addptr+make_range),不经 make_tensor_ptr;转置/块指针属独立场景,删去不影响『指针张量→(offset,sizes,strides)→memref』这条主脊的正确性。"
+      },
+      {
+        "what": "BlockPtrAnalysis 的非结构化回退 rewriteAddPtrToUnstrucMemAcc、IntToPtrOp→hivm.pointer_cast、bitcast(resElemTy/UnrealizedConversionCast)三条旁支",
+        "why_safe": "都是特殊/回退场景;主线结构化访存只需 parseAddPtr→createCastOp。删去不改变规则访问的 memref 生成。"
+      },
+      {
+        "what": "LoadConverter 的 deinterleave(stride==2)优化、mayImplicitTransposeWithLastAxis 转置标记、discreteAttrName 的 index-select 大缓冲支路,以及 mask/other 的完整 MaskState 处理",
+        "why_safe": "均为特定 stride/dot/mask 场景的优化或分支;无 mask 主路(memref.copy + to_tensor)已足以讲清 SIMT→结构化访存的转变。精简版聚焦无 mask 主路。"
+      },
+      {
+        "what": "compiler.py 中 ttir_to_linalg 的 tempfile 落盘(src_path/dst_path/opt.debug dump)与 metadata 读取的完整清单",
+        "why_safe": "落盘只为 debug dump;metadata 读取是把 NPUOptions 开关透传给各 pass。精简版保留 pass 挂载顺序这条主线即可。"
+      },
+      {
+        "what": "Atomic 系列(AtomicRMWConverter/AtomicCASConverter/各 Canonicalizer)与 ArgMinMax/Scan/Sort/Gather/Descriptor 等 Converter",
+        "why_safe": "add_kernel 不涉及原子/规约/gather/descriptor;这些是独立算子的转换器,与指针→结构化主脊正交。"
+      }
+    ],
+    "must_keep": [
+      {
+        "symbol": "ttir_to_linalg",
+        "why": "ttadapter 段入口,整条 pass 管线的挂载点;读者要看到 named_ops 从这里透传。"
+      },
+      {
+        "symbol": "add_triton_to_structure",
+        "why": "指针分析所在 pass;管线里出现两次,是『分水岭』动作的触发点。"
+      },
+      {
+        "symbol": "add_triton_to_linalg",
+        "why": "收官 pass,namedOps 参数落点;产 memref/tensor 混合 IR。"
+      },
+      {
+        "symbol": "named_ops",
+        "why": "跨章硬口径符号,ch09 留给 ch10 的必答项;精简版须体现其取值与效应。"
+      },
+      {
+        "symbol": "PtrState",
+        "why": "结构化三元组 (source/offset/stateInfo) 的载体,还原逻辑的中心数据结构。"
+      },
+      {
+        "symbol": "visitOperand",
+        "why": "递归下潜指针算术 DAG 的分派器,还原算法的骨架。"
+      },
+      {
+        "symbol": "visitOperandAddptr",
+        "why": "addptr 拆成 ptr+offset 两个子状态再 addState 的关键节点。"
+      },
+      {
+        "symbol": "visitOperandMakeRange",
+        "why": "最基础的还原:make_range→(stride=1,size,offset);(offset,sizes,strides) 的起点。"
+      },
+      {
+        "symbol": "addState",
+        "why": "指针加法代数核心,add_kernel 主线走到这里合并 stride/offset。"
+      },
+      {
+        "symbol": "rewriteAddptrOp",
+        "why": "PtrAnalysis 侧落地:据 PtrState 重发射规范化 addptr。"
+      },
+      {
+        "symbol": "BlockData",
+        "why": "TritonToLinalg 侧显式持有 offsets/sizes/strides 的载体。"
+      },
+      {
+        "symbol": "rewriteAddPtr",
+        "why": "把 BlockData 落成 memref.reinterpret_cast、replaceOp 掉 tt.addptr——分水岭落地时刻。"
+      },
+      {
+        "symbol": "createCastOp",
+        "why": "发射 memref.reinterpret_cast，结构化张量的物化形态。"
+      },
+      {
+        "symbol": "ReinterpretCastOp",
+        "why": "指针张量还原后的目标算子;结构化访存的锚点。"
+      },
+      {
+        "symbol": "LoadConverter",
+        "why": "tt.load→memref.copy+to_tensor,SIMT 访存→结构化搬运的体现。"
+      },
+      {
+        "symbol": "StoreConverter",
+        "why": "tt.store→materialize_in_destination 写回 memref 视图。"
+      },
+      {
+        "symbol": "populateElementwiseToLinalgConversionPatterns",
+        "why": "namedOps 为假才加载它;是『摊成 linalg.generic』的确切开关,证明 namedOps 真实语义。"
+      },
+      {
+        "symbol": "visitOperandSplat",
+        "why": "splat→stride=0 的还原规则(theory 明确教,m2 worked example 依赖);PtrAnalysis.cpp:L869"
+      },
+      {
+        "symbol": "visitOperandBroadcast",
+        "why": "broadcast 还原规则(theory 明确教);PtrAnalysis.cpp:L800"
+      },
+      {
+        "symbol": "mulState",
+        "why": "mul→stride×const 的指针代数规则(theory 明确教);PtrAnalysis.cpp:L403"
+      }
+    ]
+  },
+  "mechanisms": [
+    {
+      "id": "m1-pass-pipeline",
+      "name": "ttir_to_linalg 的 ttadapter pass 管线全景",
+      "kind": "dataflow",
+      "source_anchors": [
+        "third_party/ascend/backend/compiler.py:L96-L171",
+        "third_party/ascend/backend/compiler.py:L939-L963"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "note": "18 趟 pass 的确定序列（11 趟必挂 + 可选 auto_scheduling 段 7 趟）;配 pass 管线全景图。分水岭的整体地形。"
+    },
+    {
+      "id": "m2-ptr-to-structured-raise",
+      "name": "PtrAnalysis 把指针算术 DAG 逆向还原成 (offset, sizes, strides)",
+      "kind": "algorithm",
+      "source_anchors": [
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L1277-L1356",
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L234-L280",
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L764-L797",
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L497-L592",
+        "third_party/ascend/include/TritonToStructured/PtrAnalysis.h:L52-L99"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin_note": "工程来源=微软 triton-shared 的 raise pointer-arithmetic to structured(RFC 有据、无 arXiv);PtrAnalysis 版权署 Huawei+Microsoft。非学术论文,不引 arXiv。",
+      "note": "本章技术核心;需 add_kernel 的 x_ptr+arange(0,BLOCK) 逐算子还原的 worked example(make_range→mul→add→addptr 如何一步步长成 offset/size/stride)。"
+    },
+    {
+      "id": "m3-memref-materialization",
+      "name": "BlockPtrAnalysis:结构化三元组落成 memref.reinterpret_cast",
+      "kind": "dataflow",
+      "source_anchors": [
+        "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L1125-L1214",
+        "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L322-L343",
+        "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L153-L165"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "note": "分水岭落地时刻:tt.addptr 被 memref.reinterpret_cast 替换;配 ttir(tensor-of-pointers)→ttadapter(memref) 前后对照图。"
+    },
+    {
+      "id": "m4-loadstore-structured-access",
+      "name": "LoadStoreConverter:tt.load/tt.store 落成对 memref 的结构化访存",
+      "kind": "dataflow",
+      "source_anchors": [
+        "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp:L225-L452",
+        "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp:L1052-L1146",
+        "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp:L78-L98"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "note": "load=alloc+memref.copy+to_tensor;store=materialize_in_destination。SIMT 逐指针解引用→结构化 memref 搬运。"
+    },
+    {
+      "id": "m5-namedops-semantics",
+      "name": "namedOps 开关的真实语义:别把逐元素 arith 摊成 linalg.generic",
+      "kind": "config",
+      "source_anchors": [
+        "third_party/ascend/lib/TritonToLinalg/TritonToLinalgPass.cpp:L510-L525",
+        "third_party/ascend/lib/TritonToLinalg/TritonToLinalgPass.cpp:L648-L654",
+        "third_party/ascend/backend/compiler.py:L949-L963",
+        "third_party/ascend/include/TritonToLinalg/Passes.td:L6-L26"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "note": "ch09 留给 ch10 的必答项。硬口径:L524 张量 arith 保持合法 + L651 !namedOps 才加载 ElementwiseToLinalg。禁举 linalg.add(全仓零命中)。"
+    },
+    {
+      "id": "m6-triton-to-annotation",
+      "name": "TritonToAnnotation:轻量注解 pass 在管线里的位置与作用",
+      "kind": "protocol",
+      "source_anchors": [
+        "third_party/ascend/lib/TritonToAnnotation/TritonToAnnotation.cpp:L40-L76",
+        "third_party/ascend/backend/compiler.py:L142-L142"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "note": "triton.ascend.annotation → annotation.mark,转发属性;桥接到 bishengir annotation 方言。排在第一次 triton_to_structure 之后（中间隔着 add_discrete_mask_access_conversion）。"
+    },
+    {
+      "id": "m7-conservative-failure",
+      "name": "分析器的保守失败原则:不认识/不安全的算子整体 failure",
+      "kind": "protocol",
+      "source_anchors": [
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L1317-L1354",
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L764-L784"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "note": "load 派生地址、浮点转整、未知 op、非单位步长 make_range 都直接 failure,走非结构化回退而非产出错误 memref。地址算术的正确性纪律。"
+    }
+  ],
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_pay_off": [],
+    "note": "bible.py due ch10 对『应埋伏笔』与『应回收』均返回空。本章承接的跨章约定不在伏笔登记表、而在 Bible glossary 的 namedOps 两条词条(声明默认≠实际取值 / 实现语义留 ch10)与 ttadapter/triton_adapter/make_ttir 词条——ch09 已明确把 namedOps 实现语义留给 ch10 系统展开,本章 m5 落地。为后续昇腾优化 pass(AutoBlockify)、HFusion/HIVM 方言诸章立『指针已被 raise 成结构化 memref』这一前提。"
+  }
+}
