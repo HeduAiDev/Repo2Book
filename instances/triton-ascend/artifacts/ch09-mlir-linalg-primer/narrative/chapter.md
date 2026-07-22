@@ -176,7 +176,7 @@ def TritonToLinalg : Pass<"triton-to-linalg", "mlir::ModuleOp"> {
 
 **第二，`let constructor` 指向一个手写的 C++ 工厂函数** `triton::createTritonToLinalgPass()`：声明式定义并不消灭手写实现，它只是把「样板」和「逻辑」切开。
 
-**第三，`namedOps` 这个开关**（命令行写法 `--named-ops`，`.td` 里的默认值是 `false`，说明文字是 "use linalg named ops instead of linalg.generic"）。它是本章后面「named op 与 generic op」那一节在本仓的落点，稍后专门讲——包括「`.td` 里的默认值到底是不是实际编译路径上的取值」这个必须掰开的问题。另外四个开关（`globalKernel` 生成全局 kernel、`enableNd2nzOnVector` 的 nd2nz 向量化、`enableSelectAnalysis` 的 select 分析、`compileOn91095` 面向 910_95 型号编译）的**真实语义要读实现才能定论**，属于 ch10 与后面讲后端选项的章节，本章不替它们下结论。
+**第三，`namedOps` 这个开关**（命令行写法 `--named-ops`，`.td` 里的默认值是 `false`，说明文字是 "use linalg named ops instead of linalg.generic"）。它是本章后面「named op 与 generic op」那一节在本仓的落点，稍后专门讲——包括「`.td` 里的默认值到底是不是实际编译路径上的取值」这个必须掰开的问题。另外四个开关（`globalKernel` 生成全局 kernel、`enableNd2nzOnVector` 的 nd2nz 向量化、`enableSelectAnalysis` 的 select 分析、`compileOn91095` 面向 910_95 型号编译）的**真实语义要读实现才能定论**，留待[第 10 章](../../ch10-watershed-triton-to-linalg/narrative/chapter.md)与后面讲后端选项的章节展开，本章不替它们下结论。
 
 同一份 33 行文件里还有第二个 pass 声明，用来说明「一份 `.td` 可以声明多个 pass」这一体例事实：
 
@@ -188,7 +188,7 @@ def MarkTensorKind : Pass<"mark-tensor-kind", "mlir::ModuleOp"> {
 }
 ```
 
-它做什么，是 ch10 的事；这里只认体例。
+它做什么，留待[第 10 章](../../ch10-watershed-triton-to-linalg/narrative/chapter.md)展开；这里只认体例。
 
 **其余四件基础设施**，各一句，够用就好：
 
@@ -549,7 +549,7 @@ HFusion（Hybrid Fusion，昇腾自研的融合方言）被文档定义成 **Lin
 
 **所以结论是**：`.td` 声明的默认值与函数签名的默认值都是 `False`，而 Python 侧那条产出编译产物的路上，每一处调用传的都是 `True`——与 HFusion 只吃 named op 的自述**并不矛盾**。这也正是 [第 1 章](../../ch01-birdseye-ascend-backend/narrative/chapter.md)在介绍 `ttir_to_linalg`（把 TTIR 降成结构化 Linalg 的那个阶段函数）时，说它产出的是带名字的 Linalg 算子的依据。
 
-**留一个问题给下一章**：这个开关打开之后，在实现里**具体改变哪些算子的产出形态**——哪些走了具名路径、哪些仍落成 `linalg.generic`——要读 `third_party/ascend/lib/TritonToLinalg/TritonToLinalgPass.cpp` 才能答，属于 ch10 分水岭那一章。本章只把「为什么会有这么个开关」讲清楚。
+**留一个问题给下一章**：这个开关打开之后，在实现里**具体改变哪些算子的产出形态**——哪些走了具名路径、哪些仍落成 `linalg.generic`——要读 `third_party/ascend/lib/TritonToLinalg/TritonToLinalgPass.cpp` 才能答，见[第 10 章](../../ch10-watershed-triton-to-linalg/narrative/chapter.md)分水岭那一章。本章只把「为什么会有这么个开关」讲清楚。
 
 ---
 
@@ -863,8 +863,8 @@ The AscendNPU IR toolchain is bishengir-compile, which compiles high-level tile-
 
 **三条本章不下结论、留给后面的问题**：
 
-1. **`ttadapter` 究竟怎么把「指针张量」变成结构化张量**——这是本书与基座 Triton 最根本的分叉，属 ch10 分水岭总览与 ch11 的指针算术逆向工程。本章只提供「为什么值得变成 Linalg」的理由，不碰实现。
-2. **`namedOps` 打开之后，具体改变了哪些算子的产出形态**——前面已经确认实际编译路径上传的是 `True`，但「哪些算子因此走具名路径」要读 `TritonToLinalgPass.cpp` 才能答，属 ch10。
+1. **`ttadapter` 究竟怎么把「指针张量」变成结构化张量**——这是本书与基座 Triton 最根本的分叉，见[第 10 章](../../ch10-watershed-triton-to-linalg/narrative/chapter.md)分水岭总览与[第 11 章](../../ch11-ptranalysis/narrative/chapter.md)的指针算术逆向工程。本章只提供「为什么值得变成 Linalg」的理由，不碰实现。
+2. **`namedOps` 打开之后，具体改变了哪些算子的产出形态**——前面已经确认实际编译路径上传的是 `True`，但「哪些算子因此走具名路径」要读 `TritonToLinalgPass.cpp` 才能答，见[第 10 章](../../ch10-watershed-triton-to-linalg/narrative/chapter.md)。
 3. **昇腾的 tiling 与融合，和论文的 tiling 与融合是不是同一套机制**——论文的 tiling 面向 cache 层级与向量 ISA，昇腾面向 UB 容量、double-buffer 与 cube/vector 分工（[第 2 章](../../ch02-davinci-npu-hardware-model/narrative/chapter.md)量化过这些约束）。**形式相似不等于机制相同**，须由后面讲昇腾优化 pass 与 HIVM 的章节据源码定论。
 
 ---
@@ -881,4 +881,4 @@ The AscendNPU IR toolchain is bishengir-compile, which compiles high-level tile-
 
 回头再看[第 1 章](../../ch01-birdseye-ascend-backend/narrative/chapter.md)那张下降链图，`ttir → ttadapter → npubin` 上的每个箭头，现在都可以从「一次神秘的翻译」读成「一次有原则的渐进下降」。
 
-下一章就走进第二个箭头：Triton 的 IR 里是一堆算术出来的指针，Linalg 要的是带 offset/size/stride 的结构化 memref，这中间隔着一整套逆向工程——那就是 ch10 分水岭：从指针张量到结构化张量。
+下一章就走进第二个箭头：Triton 的 IR 里是一堆算术出来的指针，Linalg 要的是带 offset/size/stride 的结构化 memref，这中间隔着一整套逆向工程——那就是[第 10 章](../../ch10-watershed-triton-to-linalg/narrative/chapter.md)分水岭：从指针张量到结构化张量。

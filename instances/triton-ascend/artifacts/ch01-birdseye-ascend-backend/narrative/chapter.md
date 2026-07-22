@@ -144,7 +144,7 @@ def add_stages(self, stages, options):
 `stages` 是一个有序字典，`add_stages` 往里塞三个键：`ttir`、`ttadapter`、`npubin`。每个值是一个 lambda，只吃前一段的 `(src, metadata)`——即上一工位的产物 IR 和元数据。三个键依次是：
 
 - `ttir` → `make_ttir`：跑与所有后端共享的通用 TTIR(Triton IR,Triton 的中间表示)pass。
-- `ttadapter` → `ttir_to_linalg`：把 TTIR 降成结构化 Linalg(MLIR 的线性代数方言)。`named_ops=True` 要求产出带名字的 Linalg 算子(如 `linalg.add`)，便于后段识别。
+- `ttadapter` → `ttir_to_linalg`：把 TTIR 降成结构化 Linalg(MLIR 的线性代数方言)。`named_ops=True` 让逐元素算子尽量保持 `arith` 原样、不被摊成 `linalg.generic`(这个开关的真实语义要读实现才能定论，见[第 10 章](../../ch10-watershed-triton-to-linalg/narrative/chapter.md))。
 - `npubin` → `linalg_to_bin_enable_npu_compile_A2_A3`(A2_A3 指昇腾 A2/A3 系列芯片，是与下面 910_95 并列的另一代目标芯片代号，本章默认走这条)：把 Linalg 交给闭源编译器出 NPU 二进制。
 
 注意最后那个 `if options.compile_on_910_95` 分支：`compile_on_910_95`(是否编到 910_95 芯片)默认为假，走 `else` 分支的 `linalg_to_bin_enable_npu_compile_A2_A3`——本章就以这条默认路径为代表；为真时改走 `linalg_to_bin_enable_npu_compile_910_95`，那只是同一段的 **910_95 芯片条件变体**，末段职责不变。开头还有一条 `force_simt_only`(强制只走 SIMT 模板)快路径，`return` 直接跳过 `ttadapter`、`ttir_to_npubin` 一步出二进制——那是给特殊场景的旁路，细节留给 ch20 逃生舱与 SIMT 直通一章。
