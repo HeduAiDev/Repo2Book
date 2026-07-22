@@ -1,0 +1,310 @@
+{
+  "chapter": "ch12",
+  "title": "落到 memref：BlockPtrAnalysis、reinterpret_cast 与 load/store→linalg",
+  "kind": "deep",
+  "skip_impl": true,
+  "one_line": "ch11 在 TritonToStructured 侧把指针算术逆向成 (offset,sizes,strides) 结构化描述；ch12 换到 TritonToLinalg 侧，讲 BlockPtrAnalysis 如何把这套描述『铸成』memref.reinterpret_cast，再把 tt.load/tt.store 落成 memref.copy+to_tensor / materialize_in_destination，并用 MemAccType 决定结构化访存 vs 逐元素 gather 回退。",
+
+  "boundary_notes": {
+    "vs_ch10": "ch10《分水岭总览》已给出 createCastOp/rewriteAddPtr/LoadConverter/StoreConverter 各一句话概述与 18 趟管线定位。ch10 design_decision 明确：『指针分析做两遍、两个平行实现——TritonToStructured/PtrAnalysis（重发射规范 addptr）在前，TritonToLinalg/BlockPtrAnalysis（直接产 memref）在后』。本章是后一遍的深挖。凡与 ch10 总览重叠用 markdown 链接回指 ch10。",
+    "vs_ch11": "ch11 深挖的是 TritonToStructured/PtrAnalysis.cpp（PtrState、visitOperand 递归、addState/mulState 代数、make_range/splat/broadcast、rem/div、保守失败）。本章 BlockPtrAnalysis.cpp 里的 parse()/addBlock/mulBlock/parseMakeRange/parseSplat/parseBroadcast 是同一套逆向算法在 BlockData（TritonToLinalg 侧状态类）上的**镜像实现**——数据流一致，只是状态载体从 PtrState 换成 BlockData（offsets/sizes/strides 用 OpFoldResult 而非分析期整型）。**凡『(offset,sizes,strides) 怎么来的』一律 markdown 链接回指 ch11，本章不重新推导前向传播代数**。本章增量只在『物化落地』这一半：createCastOp / parseReinterpretCast / rewriteAddPtr（TritonToLinalg 侧，与 ch11 的 rewriteAddptrOp 不同侧，别混）/ MemAccType 决策 / rewriteAddPtrToUnstrucMemAcc gather 回退 / load-store→memref / make_tensor_ptr→reinterpret_cast。",
+    "opname_convention": "C++ 类写带 :: 的完整形式（memref::ReinterpretCastOp、bufferization::ToTensorOp、bufferization::MaterializeInDestinationOp、hivm::StoreOp）；IR 里写两段点分助记符（memref.reinterpret_cast、memref.copy、bufferization.to_tensor、bufferization.materialize_in_destination、hivm.hir.store）。别写三段。所有 IR 均属 TritonToLinalg 落地后的 linalg/memref/bufferization/hivm 阶段。",
+    "atomic_rmw_correction": "任务 brief 说『atomicRMW→linalg.generic』——这是**旧路径 / 文档注释里的示意**（LoadStoreConverter.cpp:L525-L548 的注释块画的是 linalg.generic + GenericAtomicRMW 形态）。**真实现行代码不产 linalg.generic**：AtomicRMWConverter::matchAndRewrite 按硬件支持度落到 hivm::StoreOp(atomic=<add>) / hfusion::AtomicRMWOp / hfusion::AtomicXchgOp（L664-L686）。lit 夹具 atomic_rmw.mlir 顶部 CHECK 就是 `CHECK-NOT: GenericAtomicRMW` + `hivm.hir.store ... atomic = <add>`，坐实之。writer 讲此处须按真实源码，别抄 brief 的 linalg.generic。真正用 linalg::GenericOp 的是 AtomicCASConverter（L767），不是 RMW。"
+  },
+
+  "code_spine": [
+    "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp:L78-L84  (AddPtrConverter::matchAndRewrite 入口:每个 tt.addptr 建空 known 表 → 委托 BlockDataParser::rewriteAddPtr)",
+    "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L1125-L1214  (rewriteAddPtr 驱动:parseAddPtr 得 BlockData → 若 Unstructured 走 gather 回退 → 零 stride 修复 → intToPtr/bitcast 源处理 → createCastOp 发射 reinterpret_cast → replaceOp)",
+    "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L846-L894  (parseAddPtr:拆 ptr/offset 两个子 BlockData → 传播 MemAccType → addBlock 合并。逆向代数镜像 ch11,链接回指)",
+    "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L144-L165  (inferBlockOffset 把各维 offset 累加成总偏移 + getResultMemrefType 组装 StridedLayoutAttr 的结果 memref 类型)",
+    "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L322-L343  (createCastOp:三元组物化成 memref.reinterpret_cast 的核心——总 offset + size==1 维零 stride 抬成 1 + 发射)",
+    "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L896-L915  (parseReinterpretCast:reinterpret_cast 读回 BlockData——offset 是多维塌缩总和,只落第一维,其余维补零)",
+    "third_party/ascend/include/TritonToLinalg/BlockPtrAnalysis.h:L46-L75  (MemAccType/MemAccVal:Undefined/StrucMemAcc/UnstrucMemAcc 三态 + merge 取大)",
+    "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L962-L1003  (parseIndirectLoad:间接 load 派生的地址标 UnstrucMemAcc——MemAccType 的产生点)",
+    "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L2158-L2232  (rewriteAddPtrToUnstrucMemAcc:非结构化访存回退——按 blockSizes 建嵌套 scf.for,逐元素 extract offset→单元素 reinterpret_cast→把 tt.load 挪进循环打 IndirectLoad 标)",
+    "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp:L225-L520  (LoadConverter::matchAndRewrite:scalar / boundary_check / 无 mask / 有 mask 四路,主干=alloc + memref.copy + bufferization.to_tensor)",
+    "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp:L1052-L1150  (StoreConverter::matchAndRewrite:boundary_check / 无 mask / 连续 mask 三路,统一落 bufferization.materialize_in_destination)",
+    "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp:L549-L692  (AtomicRMWConverter::matchAndRewrite:硬件支持度决策→hivm.store(atomic)/hfusion.atomic_rmw/hfusion.atomic_xchg,非 linalg.generic)",
+    "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L1277-L1361  (rewriteMakeTensorPtrOp:block_ptr 物化——offset×stride + 累加 base 偏移 + createRedundantOp 记全 shape 供 boundary_check + 两级 reinterpret_cast)"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "third_party/ascend/include/TritonToLinalg/BlockPtrAnalysis.h",
+      "lines": "L46-L75",
+      "note": "MemAccType：结构化 / 非结构化访存的决策载体。三态枚举 + merge『取大』——一条地址链上只要有一处非结构化，整条就退化成 UnstrucMemAcc。这是 rewriteAddPtr 分岔的开关。",
+      "code": "enum class MemAccVal { Undefined = 0, StrucMemAcc = 1, UnstrucMemAcc = 2 };\n\nstruct MemAccType {\n\n  MemAccVal value;\n\n  explicit constexpr MemAccType(MemAccVal v = MemAccVal::Undefined)\n      : value(v) {}\n\n  constexpr operator MemAccVal() const { return value; }\n  explicit operator bool() = delete;\n\n  constexpr bool isUndefined() const { return value == MemAccVal::Undefined; }\n  constexpr bool isStructured() const {\n    return value == MemAccVal::StrucMemAcc;\n  }\n  constexpr bool isUnstructured() const {\n    return value == MemAccVal::UnstrucMemAcc;\n  }\n\n  void merge(MemAccType &other) {\n    this->value = (this->value > other.value) ? this->value : other.value;\n  }\n\n  std::string_view toString() const {\n    static constexpr std::string_view names[] = {\"Undefined\", \"StrucMemAcc\",\n                                                 \"UnstrucMemAcc\"};\n    return names[static_cast<int>(value)];\n  }\n};",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp",
+      "lines": "L144-L165",
+      "note": "两个私有辅助：inferBlockOffset 把 BlockData 各维 offset 逐项相加成一个『从 source 起的总偏移』（对应 reinterpret_cast 里那个单一 offset 参数）；getResultMemrefType 用 strides 组一个 StridedLayoutAttr，拼出结果 memref 的类型。offset 若是编译期常量传常量、否则传 ShapedType::kDynamic。",
+      "code": "OpFoldResult BlockData::inferBlockOffset(const Location &loc,\n                                         OpBuilder &builder) const {\n  OpFoldResult retOffset = builder.getIndexAttr(0);\n  for (auto ofr : offsets) {\n    retOffset = addOpFoldResult(retOffset, ofr, loc, builder);\n  }\n  return retOffset;\n}\n\nMemRefType BlockData::getResultMemrefType(int64_t offset,\n                                          ArrayRef<int64_t> resultShape) const {\n  SmallVector<int64_t> staticStrides;\n  SmallVector<Value> dynamicStrides;\n  dispatchIndexOpFoldResults(strides, dynamicStrides, staticStrides);\n\n  auto baseMemrefType = dyn_cast<BaseMemRefType>(this->source.getType());\n  assert(baseMemrefType && \"Invalid element type. It should be a base memref type.\");\n  auto elementType = baseMemrefType.getElementType();\n  auto layout =\n      StridedLayoutAttr::get(this->source.getContext(), offset, staticStrides);\n  return MemRefType::get(resultShape, elementType, layout);\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp",
+      "lines": "L322-L343",
+      "note": "本章心脏：createCastOp 把 BlockData 的 (offset,sizes,strides) 三元组『铸成』一条 memref.reinterpret_cast。resOffset 来自 inferBlockOffset 的多维塌缩；随后对 resultShape[i]==1 且 stride 是动态 Value 的维，把 stride 抬成 max(stride,1)——避免退化维产生零 stride 让下游 memref 非法。最后 create<memref::ReinterpretCastOp>(source, offset, sizes, strides)。",
+      "code": "memref::ReinterpretCastOp BlockData::createCastOp(ArrayRef<int64_t> resultShape,\n                                                  const Location &loc,\n                                                  OpBuilder &builder) const {\n  OpFoldResult resOffset = this->inferBlockOffset(loc, builder);\n  auto resultType = this->getResultMemrefType(\n      isa<Attribute>(resOffset) ? getConstantIntValue(resOffset).value()\n                                : ShapedType::kDynamic,\n      resultShape);\n\n  SmallVector<OpFoldResult> strides(this->strides);\n  for (size_t i = 0; i < strides.size(); i++) {\n    if (resultShape[i] == 1) {\n      if (auto strideValue = dyn_cast<Value>(strides[i])) {\n        auto oneIdx = builder.create<arith::ConstantOp>(loc, builder.getIndexAttr(1));\n        strides[i] = builder.create<arith::MaxSIOp>(loc, strideValue, oneIdx).getResult();\n      }\n    }\n  }\n\n  return builder.create<memref::ReinterpretCastOp>(\n      loc, resultType, this->source, resOffset, this->sizes, strides);\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp",
+      "lines": "L896-L915",
+      "note": "反方向：parseReinterpretCast 把一条已存在的 memref.reinterpret_cast 读回 BlockData（当地址链里已含 block_ptr / 前一趟 recast 时用到）。关键语义注释在源码里：reinterpret_cast 的 offset 是『多维塌缩后的总和』，对应 BlockData 第一维 offset，其余维在这里补零。这正是 createCastOp 的逆运算，两者一起构成三元组⇄memref 的往返。",
+      "code": "void BlockDataParser::parseReinterpretCast(\n    memref::ReinterpretCastOp op, BlockData &data, const Location &loc,\n    ConversionPatternRewriter &rewriter,\n    const llvm::SmallDenseMap<Value, BlockData> &known) {\n  assert(data.isEmpty());\n\n  data.setOffsets(op.getMixedOffsets());\n  data.setSizes(op.getMixedSizes());\n  data.setStrides(op.getMixedStrides());\n  data.setSource(op.getSource());\n\n  // In memref::ReinterpretCastOp, offset means the total of collapsing multiple\n  // dimensions, which corresponds to first dim offset in block data.\n  // Here populate the rest of the dimensions with zeroes.\n  assert(data.getOffsetsRef().size() == 1);\n  size_t loopLimit = data.getSizesRef().size();\n  for (size_t i = 1; i < loopLimit; i++) {\n    data.getOffsetsRef().push_back(rewriter.getIndexAttr(0));\n  }\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp",
+      "lines": "L1125-L1214",
+      "note": "rewriteAddPtr——AddPtrConverter 的落地驱动，把整章串起来。为讲解，writer 引用时可分段并加中文注释，但控制流须与 pin 一致、完整原文见 L1125-L1214。流程：① parseAddPtr 逆向出 BlockData（代数镜像 ch11，链接回指）；② 若 MemAccType 是 Unstructured 且 source 不是 intToPtr → 转 rewriteAddPtrToUnstrucMemAcc 走 gather 回退，早返回；③ 空 size 补单元；④ 取 resultShape；⑤ known[result]=data 存未修改态（后续指针算术仍用原 0 stride）；⑥ 关键：逆序扫维，对 size==1 或 hoist_dim 命中且 stride 常量 0 的维，把 stride 替成 inferedSize（所有低维 size 之积），避免零 stride；⑦ intToPtr → hivm.pointer_cast；⑧ bitcast(resElemTy) → unrealized_conversion_cast；⑨ createCastOp 发射 reinterpret_cast；⑩ replaceOp。省略：L1205-L1210 LLVM_DEBUG 打印。",
+      "code": "void BlockDataParser::rewriteAddPtr(\n    triton::AddPtrOp op, triton::AddPtrOp::Adaptor &adaptor,\n    ConversionPatternRewriter &rewriter,\n    llvm::SmallDenseMap<Value, BlockData> &known) {\n  auto insertPoint = rewriter.saveInsertionPoint();\n  rewriter.setInsertionPoint(op);\n\n  BlockData data;\n  parseAddPtr(op, data, op.getLoc(), rewriter, known);\n\n  if (auto src = data.getSource();\n      data.getMemAccTypeRef().isUnstructured() &&\n      !(src && isa_and_nonnull<triton::IntToPtrOp>(src.getDefiningOp()))) {\n    // TODO: Based on more info, try to create a performant IR\n    rewriteAddPtrToUnstrucMemAcc(op, adaptor, rewriter, data);\n    LLVM_DEBUG({ llvm::dbgs() << *getModuleOpFromOperation(op) << \"\\n\"; });\n    return;\n  }\n\n  if (data.getSizesRef().size() == 0) {\n    data.getSizesRef().push_back(rewriter.getIndexAttr(1));\n    data.getStridesRef().push_back(rewriter.getIndexAttr(0));\n    data.getOffsetsRef().push_back(data.getScalarRef());\n  }\n\n  ArrayRef<int64_t> resultShape;\n  // shape {1,} is stub for single ptr\n  SmallVector<int64_t> stubScalarTypeShape(1, 1);\n  if (auto shapedType = dyn_cast<ShapedType>(op.getResult().getType())) {\n    resultShape = shapedType.getShape();\n  } else {\n    assert(data.getRank() == 1);\n    resultShape = stubScalarTypeShape;\n  }\n\n  known[op.getResult()] = data;\n\n  // If there are dimensions with size 1 and stride 0, replace 0 stride with the\n  // product of sizes of all lower dimensions. This avoids creating memref with\n  // zero stride.\n  // And here store the unmodified state into known ptrs, since any following\n  // pointer arithmetic operations should still use the original 0 stride.\n  auto inferedSize = 1;\n  auto hoistDim = op->getAttrOfType<IntegerAttr>(\"hoist_dim\");\n  for (int i = data.getSizesRef().size() - 1; i >= 0; i--) {\n    auto strideConst = getConstantIntValue(data.getStridesRef()[i]);\n    auto sizeConst = getConstantIntValue(data.getSizesRef()[i]);\n    assert(sizeConst.has_value());\n    bool shouldReplaceStride = (sizeConst.value() == 1) || (hoistDim && hoistDim.getValue() == i);\n    if (shouldReplaceStride && strideConst && strideConst.value() == 0) {\n      data.getStridesRef()[i] = rewriter.getIndexAttr(inferedSize);\n    }\n    inferedSize *= sizeConst.value();\n  }\n\n  if (auto intToPtrOp =\n          dyn_cast<triton::IntToPtrOp>(data.getSourceRef().getDefiningOp())) {\n    auto rtype = cast<triton::PointerType>(intToPtrOp.getResult().getType());\n    auto memrefType =\n        MemRefType::get({ShapedType::kDynamic}, rtype.getPointeeType());\n    auto hivmPointCastOp = rewriter.create<hivm::PointerCastOp>(\n        intToPtrOp.getLoc(), memrefType, ValueRange{intToPtrOp.getSrc()});\n    data.setSource(hivmPointCastOp.getResult());\n  }\n\n  if (data.hasResElemTy()) {\n    // Handle bitcast scenario\n    auto memrefType = dyn_cast<BaseMemRefType>(data.getSourceRef().getType())\n                          .cloneWith(std::nullopt, data.getResElemTyRef());\n    UnrealizedConversionCastOp castOp =\n        rewriter.create<mlir::UnrealizedConversionCastOp>(\n            op.getLoc(), memrefType, data.getSourceRef());\n    data.setSource(castOp.getOutputs()[0]);\n  }\n\n  // ToDo: need to handle module scenario\n\n  memref::ReinterpretCastOp castOp =\n      data.createCastOp(resultShape, op.getLoc(), rewriter);\n  Value src = castOp.getResult();\n  LLVM_DEBUG({\n    llvm::dbgs() << \"cast MemRefType:\\n\";\n    castOp.getOperation()->print(llvm::dbgs(),\n                                 OpPrintingFlags().printGenericOpForm());\n    llvm::dbgs() << \"\\n\";\n  });\n\n  rewriter.replaceOp(op, src);\n  rewriter.restoreInsertionPoint(insertPoint);\n}",
+      "elide": ["L1205-L1210 的 LLVM_DEBUG 打印 castOp 的 generic 形式，仅调试用，不影响控制流"]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp",
+      "lines": "L962-L1003",
+      "note": "MemAccType 的产生点之一：parseIndirectLoad。地址若派生自 tt.load（间接/gather），结果无法用 (offset,sizes,strides) 静态描述，标 UnstrucMemAcc；仅当是 <1> 形状单元素或标量 load（用作 scalar offset）才降级回 StrucMemAcc。setSource(opRes) 让链上留下『存在间接 load』的痕迹。这个标志经 addBlock/parseAddPtr 的 merge 一路带到 rewriteAddPtr 的分岔判断。",
+      "code": "template <typename OpTy>\nvoid parseIndirectLoad(OpTy op, BlockData &data, const Location &loc,\n                       ConversionPatternRewriter &rewriter,\n                       const llvm::SmallDenseMap<Value, BlockData> &known,\n                       unsigned resultIdx)\n{\n  assert(resultIdx < op->getNumResults() &&\n         \"resultIdx out of range for parseIndirectLoad\");\n  auto opRes = op->getResult(resultIdx);\n  auto opResTy = opRes.getType();\n  std::vector<int64_t> resShape;\n  if (auto shapedResTy = dyn_cast<ShapedType>(opResTy)) {\n    // For now, we consider this is UnstrucMemAcc because we have no other info.\n    // Visiting other ops may change the type due to more info.\n    resShape = shapedResTy.getShape().vec();\n    auto numOperands = 3;\n    if (resShape.size() == 1 && resShape[0] == 1 && op->getNumOperands() == numOperands) {\n        Value zeroIdx = rewriter.create<arith::ConstantIndexOp>(loc, 0);\n        Value extracted = rewriter.create<tensor::ExtractOp>(loc, opRes, ValueRange{zeroIdx});\n        Value scalarIdx = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), extracted);\n        data.setMemAccVal(MemAccVal::StrucMemAcc);\n        data.setScalar(scalarIdx);\n        data.getSizesRef().push_back(rewriter.getIndexAttr(1));\n        data.getStridesRef().push_back(rewriter.getIndexAttr(0));\n        data.getOffsetsRef().push_back(scalarIdx);\n        return;\n    }\n    data.setMemAccVal(MemAccVal::UnstrucMemAcc);\n  } else {\n    // scalar load means this is used as offset. It is StrucMemAcc.\n    data.setMemAccVal(MemAccVal::StrucMemAcc);\n    resShape.push_back(1);\n  }\n  for (auto &s : resShape) {\n    data.getOffsetsRef().push_back(rewriter.getIndexAttr(0));\n    data.getSizesRef().push_back(rewriter.getIndexAttr(s));\n    data.getStridesRef().push_back(rewriter.getIndexAttr(1));\n  }\n  // set the source in BlockData so that we know an indirect-load op exists in\n  // the chain.\n  data.setSource(opRes);\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp",
+      "lines": "L2158-L2232",
+      "note": "非结构化访存的回退路径 rewriteAddPtrToUnstrucMemAcc：当 MemAccType 判为 Unstructured（如 gather），无法一条 reinterpret_cast 描述整块，改为按 blockSizes 建嵌套 scf.for（createNestedLoops），循环体里逐元素 tensor.extract 出散乱 offset、加 base、造一个 <1> 单元素 reinterpret_cast，并把原 tt.load 挪进循环、打上 IndirectLoad 标（供 LoadConverter 的 continueModifyFromAddPtrConverter 接手补 memref.load+tensor.insert）。这是『结构化不成就逐元素』的兜底。",
+      "code": "void BlockDataParser::rewriteAddPtrToUnstrucMemAcc(\n    triton::AddPtrOp op, triton::AddPtrOp::Adaptor &adaptor,\n    ConversionPatternRewriter &rewriter, BlockData &data) {\n  auto loc = op.getLoc();\n  auto &offsets = data.getOffsetsRef();\n  auto &blockSizes = data.getSizesRef();\n  auto &strides = data.getStridesRef();\n  Value ptrOffset = adaptor.getOffset();\n  Value zeroIdx =\n      rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0));\n  Value oneIdx =\n      rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(1));\n  auto addptrRes = op.getResult();\n  assert(addptrRes.hasOneUse() && \"Invalid: tt.addptr has multiple users\");\n  auto loadOp = *(addptrRes.user_begin());\n\n  // Prepare empty tensor for loop based scalar load\n  // FIXME: We use cast here because addptr must return tensor<?x!tt.ptr<f32>>.\n  // True?\n  auto resTy = cast<ShapedType>(addptrRes.getType());\n  auto resEPtrTy = resTy.getElementType();\n  auto resETy = cast<triton::PointerType>(resEPtrTy).getPointeeType();\n  Value loaded = rewriter.create<tensor::EmptyOp>(loc, blockSizes, resETy);\n  SmallVector<Value> initArgs;\n  initArgs.push_back(loaded);\n\n  SmallVector<Value> forLBs;\n  SmallVector<Value> forUBs;\n  SmallVector<Value> forSteps;\n  for (auto &s : offsets) {\n    forLBs.push_back(zeroIdx);\n  }\n  for (auto &s : blockSizes) {\n    forUBs.push_back(getValueOrCreateConstantIndexOp(rewriter, loc, s));\n  }\n  for (auto &s : strides) {\n    forSteps.push_back(oneIdx);\n  }\n  SmallVector<Value> ivs;\n  OpBuilder builder(op);\n  auto loop = createNestedLoops(\n      builder, loc, 0, blockSizes.size(), forLBs, forUBs, forSteps, ivs,\n      initArgs,\n      [&](OpBuilder &bB, Location bLoc, SmallVector<Value> &allIVs,\n          ValueRange iterArgs) {\n        OpBuilder::InsertionGuard g(bB);\n        bB.setInsertionPointToStart(bB.getBlock());\n\n        Value scalarOffsetRaw =\n            bB.create<tensor::ExtractOp>(bLoc, ptrOffset, allIVs);\n        Value scalarOffset = bB.create<arith::IndexCastOp>(\n            bLoc, bB.getIndexType(), scalarOffsetRaw);\n        OpFoldResult baseOffset = bB.getIndexAttr(0);\n        for (auto ofr : data.getOffsetsRef()) {\n          baseOffset = addOpFoldResult(baseOffset, ofr, bLoc, bB);\n        }\n        Value baseVal =\n            getValueOrCreateConstantIndexOp(bB, bLoc, baseOffset);\n        Value combinedOffset =\n            bB.create<arith::AddIOp>(bLoc, baseVal, scalarOffset);\n        // Replace offset & size. Only single element.\n        data.getOffsetsRef().clear();\n        data.getOffsetsRef().push_back(combinedOffset);\n        data.getSizesRef().clear();\n        data.getSizesRef().push_back(bB.getIndexAttr(1));\n        data.getStridesRef().clear();\n        data.getStridesRef().push_back(bB.getIndexAttr(1));\n        memref::ReinterpretCastOp castOp = data.createCastOp({1}, bLoc, bB);\n        rewriter.replaceOp(op, castOp);\n        // Move tt.load using this tt.addptr into this block\n        loadOp->moveAfter(castOp);\n        loadOp->setAttr(\"IndirectLoad\", UnitAttr::get(op.getContext()));\n        bB.create<scf::YieldOp>(bLoc, iterArgs);\n      });\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp",
+      "lines": "L425-L453",
+      "note": "LoadConverter 的主干（无 mask、无 boundary_check 情形）：ptr 此刻已是 reinterpret_cast 出的 memref。造一块 memref.alloc 的本地缓冲，memref.copy 把结构化 memref 搬进来，再 bufferization.to_tensor（restrict+writable）拿到 tensor 值替换 tt.load。这就是『tt.load → memref.copy + to_tensor』。省略：deinterleave 优化（末维 stride==2 时走 DeinterleaveStatusOptimization 早返回）与 UCC 报错分支、以及 mayImplicitTransposeWithLastAxis 的 annotation.mark 标注。allocOp 在 L338-L341 由前文按 discrete 与否创建。",
+      "code": "  if (!mask) {\n    assert(!other && \"can not input 'other' when 'mask' is not set\");\n    if (auto unrealizedCastOp =\n            ptr.getDefiningOp<UnrealizedConversionCastOp>()) {\n      // TODO : not support handle  associate with \"module\"\n      // hint : can be handled in Linearize\n      op->emitError(\"meeting unexpected UCC in LoadConverter!\");\n      return failure();\n    } else {\n      // If last dimension stride equals 2, try deinterleave optimization.\n      auto [ptrStrides, ptrOffsets] = getStridesAndOffset(memRefType);\n      if (ptrStrides.back() == 2 && (memRefShape.back() % 2 == 0) &&\n          mlir::triton::DeinterleaveStatusOptimization(op, adaptor, rewriter)\n              .succeeded()) {\n        return success();\n      }\n      auto copyOp = rewriter.create<memref::CopyOp>(loc, ptr, allocOp);\n      propagateWasBoolToInt8Attr(op.getOperation(), copyOp.getOperation(), rewriter);\n      if (mayImplicitTransposeWithLastAxis && allocOp.getDefiningOp<memref::AllocOp>()) {\n        auto markOp = rewriter.create<annotation::MarkOp>(loc, allocOp);\n        markOp->setAttr(MayImplicitTransposeWithLastAxisTAG, UnitAttr::get(rewriter.getContext()));\n      } else if (mayImplicitTransposeWithLastAxis && allocOp.getDefiningOp<memref::SubViewOp>()) {\n        auto markOp = rewriter.create<annotation::MarkOp>(loc, allocOpTmp);\n        markOp->setAttr(MayImplicitTransposeWithLastAxisTAG, UnitAttr::get(rewriter.getContext()));\n      }\n    }\n\n    return this->toTensorAndReplace(op, tensorType, allocOp, mayImplicitTransposeWithLastAxis, loc, rewriter);\n  }",
+      "elide": ["同一函数前面的 scalar 分支(L240-L259)、boundary_check 分支(L344-L423)、有 mask 分支(L455-L519) 另行登记/概述"]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp",
+      "lines": "L86-L98",
+      "note": "toTensorAndReplace 抽出的公共尾巴：bufferization.to_tensor(restrict=true, writable=true) 把本地缓冲变回 tensor 值，替换掉原 tt.load。三条 load 路径（无 mask / boundary / 有 mask）最后都汇到这里。",
+      "code": "LogicalResult LoadConverter::toTensorAndReplace(\n    triton::LoadOp &op, RankedTensorType &tensorType, Value localMem,\n    bool mayImplicitTransposeWithLastAxis, const Location &loc, ConversionPatternRewriter &rewriter) const {\n  Value loadedTensor = rewriter.create<bufferization::ToTensorOp>(loc, tensorType, localMem, true, true);\n  propagateWasBoolToInt8Attr(op.getOperation(), loadedTensor.getDefiningOp(), rewriter);\n\n  if(mayImplicitTransposeWithLastAxis){\n    auto markOp = rewriter.create<annotation::MarkOp>(loc, loadedTensor);\n    markOp->setAttr(MayImplicitTransposeWithLastAxisTAG, UnitAttr::get(rewriter.getContext()));\n  }\n  rewriter.replaceOp(op, loadedTensor);\n  return success();\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp",
+      "lines": "L1124-L1150",
+      "note": "StoreConverter 的两条核心路径：无 mask 时直接 bufferization.materialize_in_destination(val in writable ptr)；连续 mask 时先 MaskState 解析出实际搬运区间，getExtractSlice(val) 取源片、getSubview(ptr) 取目标窗，再 materialize_in_destination。这就是『tt.store → materialize_in_destination』。setWritable(true) 后 eraseOp。省略：boundary_check 分支(L1064-L1122) 另行概述。",
+      "code": "  // 2. Simple load with no mask\n  if (!mask) {\n    auto storeOp = rewriter.create<bufferization::MaterializeInDestinationOp>(\n        loc, val, ptr);\n    storeOp.setWritable(true);\n    rewriter.eraseOp(op);\n    return success();\n  }\n\n  // 3. Continuous masked stores.\n  // Analyze the mask operand to determine at runtime the size of the data we\n  // are moving.\n  MaskState mstate;\n  auto isContMask = mstate.parse(mask, loc, rewriter);\n\n  if (isContMask.failed()) {\n    return failure();\n  }\n  LLVM_DEBUG({ llvm::dbgs() << *getModuleOpFromOperation(op) << \"\\n\"; });\n  auto srcSlice = mstate.getExtractSlice(val, loc, rewriter);\n  auto dstSubview = mstate.getSubview(ptr, loc, rewriter);\n  auto storeOp = rewriter.create<bufferization::MaterializeInDestinationOp>(\n      loc, srcSlice, dstSubview);\n  storeOp.setWritable(true);\n  rewriter.eraseOp(op);\n  return success();",
+      "elide": ["boundary_check 分支 L1064-L1122（含 original_order 维序置换）；注释 '2. Simple load with no mask' 是源码原文（笔误，实为 store），逐字保留"]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp",
+      "lines": "L664-L686",
+      "note": "AtomicRMWConverter 的真实落地（纠 brief『→linalg.generic』之误）：按硬件支持度 isHardwareSupported（add/fadd/max/min × f16/bf16/f32/i8/i16/i32）与 rmwOp 种类，分派到 hivm.hir.store(atomic=<kind>) / hfusion.atomic_xchg / hfusion.atomic_rmw / hfusion.store（91095 分支）。全无 linalg.generic。硬件不支持的算子用软件模拟。上文 L641-L650 若 result 被用则先 alloc+copy+to_tensor 取旧值。",
+      "code": "  } else {\n    if (isHardwareSupported)\n      rewriter.create<hivm::StoreOp>(op.getLoc(), TypeRange {}, inputVal, dstMemref, atomicKind);\n    else if (rmwOp == RMWOp::XCHG)\n      rewriter.create<hfusion::AtomicXchgOp>(op.getLoc(), TypeRange(), inputMemref, dstMemref);\n    else {\n      if (rmwOp == RMWOp::OR || rmwOp == RMWOp::XOR || rmwOp == RMWOp::AND) {\n        if (!elementType.isSignlessIntOrIndex()) {\n          return op->emitOpError() << \"must be signless-integer-like, but got \" << elementType;\n        }\n      }\n      // Currently, for atomic kind and element type that is not supported by the hardware, we use software to simulate\n      // the computation. However, decompose now happens in both HFusion and HIVM, and is not consistent for 910B and\n      // 91095. Therefore, we convert to different atomic/store ops for now. This should be unified and refactored\n      // later.\n      if (compileOn91095Flag) {\n        rewriter.create<hfusion::StoreOp>(op.getLoc(), TypeRange {}, ValueRange {inputMemref}, ValueRange {dstMemref},\n                                          hfusionAtomicKind, ArrayRef<NamedAttribute> {});\n      } else {\n        rewriter.create<hfusion::AtomicRMWOp>(op.getLoc(), TypeRange(), inputMemref, dstMemref, hfusionAtomicKind);\n      }\n    }\n  }",
+      "elide": ["前文 atomicKindMap/hfusionAtomicKindMap 建表(L568-L595)、mask 与 discrete-mask 处理(L616-L663)、isDiscreteMask/XCHG 特判"]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp",
+      "lines": "L78-L84",
+      "note": "AddPtrConverter 入口——ConversionPattern 每匹配一个 tt.addptr，就 new 一张空的 known 表并把活儿全交给 BlockDataParser::rewriteAddPtr。它是本章 C++ 侧的 pass 挂载点，与 ch10 的 18 趟管线里 ttir_to_linalg 那一趟对应。",
+      "code": "LogicalResult\nAddPtrConverter::matchAndRewrite(triton::AddPtrOp op, OpAdaptor adaptor,\n                                 ConversionPatternRewriter &rewriter) const {\n  llvm::SmallDenseMap<Value, BlockData> known;\n  BlockDataParser::rewriteAddPtr(op, adaptor, rewriter, known);\n  return success();\n}",
+      "elide": []
+    }
+  ],
+
+  "lit_fixtures": [
+    {
+      "path": "third_party/ascend/unittest/Conversion/General/TritonToLinalg/legal_stride.mlir",
+      "shows": "端到端最佳素材：一个 nested scf.for 里 memref.reinterpret_cast（sizes [4,1]、strides 里 size==1 维的 %c0 被抬成 %c1，正对应 createCastOp 的 MaxSIOp 抬 stride）→ memref.copy → bufferization.to_tensor（load 三件套）→ bufferization.materialize_in_destination（store）。RUN: triton-opt --triton-to-linalg=\"named-ops=True\" --split-input-file %s | FileCheck。CHECK 顶部直接核对 reinterpret_cast 的 offset/sizes/strides 与被抬的 stride。",
+      "use_for": ["m3 createCastOp 物化 worked example 的 IR 对照", "m7 load→copy+to_tensor", "m8 store→materialize_in_destination"]
+    },
+    {
+      "path": "third_party/ascend/unittest/Conversion/General/TritonToLinalg/atomic_rmw.mlir",
+      "shows": "matmul_atomic_add：CHECK-NOT: GenericAtomicRMW + CHECK: hivm.hir.store ... atomic = <add>。坐实 AtomicRMWConverter 现行不产 linalg.generic，而落 hivm.hir.store。是纠 brief『→linalg.generic』的直接证据。",
+      "use_for": ["m9 atomicRMW 真实落地", "boundary_notes.atomic_rmw_correction 的夹具背书"]
+    },
+    {
+      "path": "third_party/ascend/unittest/Conversion/General/TritonToLinalg/parse_select.mlir",
+      "shows": "parseSelect 路径的 lit 夹具（arith.select 参与地址计算时如何进 BlockData）。supporting，本章不主讲 select，可备注。",
+      "use_for": ["parse 分派镜像的旁证（若讲到 select 分支）"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "BlockData", "file": "third_party/ascend/include/TritonToLinalg/BlockPtrAnalysis.h", "responsibility": "TritonToLinalg 侧的指针状态类，持有 offsets/sizes/strides（均为 OpFoldResult，可静可动）+ source（已是 memref）+ scalar + resElemTy + memAccTy。是 ch11 PtrState 在本侧的对应物；addBlock/subBlock/mulBlock/divBlock 做逆向代数（镜像 ch11 addState/mulState），createCastOp 做物化。"},
+    {"name": "BlockDataParser", "file": "third_party/ascend/include/TritonToLinalg/BlockPtrAnalysis.h", "responsibility": "无状态静态方法集合：parse 递归分派 + 各 parseXxx（addptr/makeRange/splat/broadcast/reinterpretCast/indirectLoad…）+ rewriteAddPtr/rewriteMakeTensorPtrOp/rewriteAdvanceOp/rewriteLoopOp 落地驱动 + rewriteAddPtrToUnstrucMemAcc gather 回退。"},
+    {"name": "MemAccType / MemAccVal", "file": "third_party/ascend/include/TritonToLinalg/BlockPtrAnalysis.h", "responsibility": "访存结构化度三态（Undefined/StrucMemAcc/UnstrucMemAcc），merge 取大。决定 rewriteAddPtr 走结构化 reinterpret_cast 还是 gather 循环回退。"},
+    {"name": "AddPtrConverter", "file": "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp", "responsibility": "tt.addptr 的 ConversionPattern，薄封装，委托 BlockDataParser::rewriteAddPtr。"},
+    {"name": "LoadConverter", "file": "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp", "responsibility": "tt.load → alloc + memref.copy + bufferization.to_tensor；分 scalar/boundary_check/无 mask/有 mask 四路，含 IndirectLoad 循环续写、deinterleave 优化、mask fill-other。"},
+    {"name": "StoreConverter", "file": "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp", "responsibility": "tt.store → bufferization.materialize_in_destination；分 boundary_check/无 mask/连续 mask 三路。"},
+    {"name": "AtomicRMWConverter", "file": "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp", "responsibility": "tt.atomic_rmw → hivm.hir.store(atomic)/hfusion.atomic_rmw/atomic_xchg，按硬件支持度与芯片(91095)分派；非 linalg.generic。"}
+  ],
+
+  "data_flow": [
+    "1. AddPtrConverter::matchAndRewrite 匹配 tt.addptr → 建空 known 表 → BlockDataParser::rewriteAddPtr",
+    "2. rewriteAddPtr → parseAddPtr：把 ptr / offset 两个操作数各自 parse 成子 BlockData（递归分派镜像 ch11），addBlock 合并成含 (offset,sizes,strides)+MemAccType 的 BlockData",
+    "3. 分岔：MemAccType.isUnstructured() 且 source 非 intToPtr → rewriteAddPtrToUnstrucMemAcc（嵌套 scf.for 逐元素 gather，打 IndirectLoad 标），早返回；否则继续结构化路径",
+    "4. 结构化路径：size==1/hoist_dim 维的零 stride 抬成低维 size 之积；intToPtr→hivm.pointer_cast；bitcast(resElemTy)→unrealized_conversion_cast；known[result]=未修改态",
+    "5. createCastOp：inferBlockOffset 塌缩总 offset + getResultMemrefType 组 StridedLayoutAttr + size==1 维动态 stride 抬 max(_,1) → 发射 memref.reinterpret_cast，replaceOp 替掉 tt.addptr",
+    "6. LoadConverter::matchAndRewrite 接手 tt.load（其 ptr 现为 reinterpret_cast）：alloc 本地缓冲 → memref.copy 搬入 → bufferization.to_tensor 变回 tensor 值 → replaceOp（IndirectLoad 情形改走 continueModifyFromAddPtrConverter 在循环里 memref.load+tensor.insert）",
+    "7. StoreConverter::matchAndRewrite 接手 tt.store：val（tensor）→ bufferization.materialize_in_destination 写回 reinterpret_cast 出的 memref（有 mask 先取 slice/subview）",
+    "8. block_ptr 分支：make_tensor_ptr/advance 经 rewriteMakeTensorPtrOp/rewriteAdvanceOp → offset×stride + 累加 base 偏移 + createRedundantOp 记全 shape（供 boundary_check）+ 两级 reinterpret_cast；转置由 original_order 属性在 Load/StoreConverter 里对 boundary_check 维序做置换",
+    "9. tt.atomic_rmw：AtomicRMWConverter 按硬件支持度落 hivm.hir.store(atomic)/hfusion 原子算子"
+  ],
+
+  "design_decisions": [
+    {"decision": "第二遍分析（TritonToLinalg/BlockPtrAnalysis）直接产 memref，与第一遍（TritonToStructured/PtrAnalysis 重发射规范 addptr）平行", "why": "两遍职责分离：先规范化再物化，各自独立可测。BlockPtrAnalysis 的 parse/addBlock 是同一逆向算法的镜像，但状态载体是 BlockData（OpFoldResult，可直接建 memref），终点是 memref.reinterpret_cast 而非 tts 结构化算子", "evidence": "artifacts/ch10-watershed-triton-to-linalg/dossier design_decision『指针分析做两遍、两个平行实现』；third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L1125"},
+    {"decision": "reinterpret_cast 的 offset 是多维塌缩后的单一总和，其余维 offset 归零", "why": "memref.reinterpret_cast 只接受一个标量 offset（从 base 起的线性偏移），多维 block 的各维 offset 必须先由 inferBlockOffset 加总；反向 parseReinterpretCast 也据此只填第一维、其余补零，保证往返一致", "evidence": "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L144-L151,L896-L915"},
+    {"decision": "size==1（或 hoist_dim 命中）维的零 stride 要抬成非零（rewriteAddPtr 抬成低维 size 之积；createCastOp 对动态 stride 抬成 max(_,1)）", "why": "零 stride 的退化维会让下游 memref/搬运非法或语义歧义；但 known 表里存的是未修改的原始 0 stride，保证后续指针算术仍用原值——分析态与物化态解耦", "evidence": "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L1162-L1178,L331-L339；lit legal_stride.mlir CHECK 的 strides [%c4,%c1]"},
+    {"decision": "MemAccType 决定结构化 reinterpret_cast vs 逐元素 gather 循环；merge『取大』使一处非结构化污染全链", "why": "间接 load 派生的地址无法静态描述成 (offset,sizes,strides)，硬套会错；宁可退化成 scf.for 逐元素 gather（正确但慢）也不猜。这是 ch10『不认识就整体失败/保守』原则在访存物化侧的体现", "evidence": "third_party/ascend/include/TritonToLinalg/BlockPtrAnalysis.h:L66-L68；BlockPtrAnalysis.cpp:L1135-L1142,L2158"},
+    {"decision": "load 用 memref.copy+to_tensor（拷进本地缓冲再变 tensor），store 用 materialize_in_destination（tensor 就地写回 memref）", "why": "达芬奇需要显式的本地缓冲搬运语义（对应 UB/local memory），bufferization 这套 op 让 tensor 计算域与 memref 内存域在同一 kernel 内接力；restrict+writable 标注给后续 bufferization 免别名分析", "evidence": "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp:L86-L98,L441,L1126-L1128"},
+    {"decision": "atomicRMW 落硬件原子算子（hivm.hir.store atomic / hfusion.atomic_rmw），不落 linalg.generic", "why": "昇腾有原生原子指令，直接映射比软件 linalg.generic 循环高效；硬件不支持的 kind×dtype 才软件模拟。文档注释里那段 linalg.generic 是旧示意，现行代码已改", "evidence": "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp:L664-L686；lit atomic_rmw.mlir CHECK-NOT: GenericAtomicRMW"}
+  ],
+
+  "theory": [
+    "三元组⇄memref 往返：createCastOp 是 (offset[],sizes[],strides[]) → memref.reinterpret_cast(offset=Σoffset[i], sizes, strides) 的正映射；parseReinterpretCast 是逆映射（offset 拆回第一维、余维零）。正逆自洽是 block_ptr 链能多趟 recast 折叠而不丢信息的前提。",
+    "零 stride 修复的数量关系：逆序扫维时 inferedSize = ∏_{j>i} size[j]（所有低于 i 的维 size 之积）。size==1 且 stride==0 的维被抬成 inferedSize，等价于把该退化维『假想成连续排布』，使 memref layout 合法而不改变实际寻址（因为 size==1，跨不跨步都只取一个元素）。",
+    "MemAccType 格：Undefined(0) < StrucMemAcc(1) < UnstrucMemAcc(2)，merge=max 即在此全序上取上确界。一条地址链的最终结构化度 = 所有子表达式结构化度的上确界——单调、可结合，故递归 merge 与遍历顺序无关。",
+    "gather 回退的复杂度代价：结构化路径一条 reinterpret_cast + 一次 memref.copy 搬整块（O(1) 条指令描述 O(N) 数据）；非结构化回退退化成 ∏size[i] 次循环、每次一条单元素 reinterpret_cast + memref.load（O(N) 条指令）。这量化了『为何要尽量判成 StrucMemAcc』。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [],
+    "must_keep": [
+      {"symbol": "createCastOp", "why": "本章心脏——三元组物化成 memref.reinterpret_cast 的构造点，含 size==1 维 stride 抬升"},
+      {"symbol": "inferBlockOffset", "why": "多维 offset 塌缩成单一总偏移，reinterpret_cast offset 语义的来源"},
+      {"symbol": "getResultMemrefType", "why": "用 strides 组 StridedLayoutAttr 拼结果 memref 类型"},
+      {"symbol": "parseReinterpretCast", "why": "reinterpret_cast 读回 BlockData 的逆映射，offset 塌缩往返自洽"},
+      {"symbol": "rewriteAddPtr", "why": "落地驱动，把 parse→物化 + 零 stride 修复 + intToPtr/bitcast 串起来；与 ch11 的 rewriteAddptrOp 不同侧"},
+      {"symbol": "rewriteAddPtrToUnstrucMemAcc", "why": "非结构化 gather 回退，MemAccType 分岔的另一半"},
+      {"symbol": "MemAccType", "why": "结构化/非结构化访存决策载体，三态 + merge 取大"},
+      {"symbol": "MemAccVal", "why": "MemAccType 的底层枚举，Undefined/StrucMemAcc/UnstrucMemAcc"},
+      {"symbol": "parseIndirectLoad", "why": "UnstrucMemAcc 的产生点，间接 load 派生地址的判定"},
+      {"symbol": "BlockData", "why": "TritonToLinalg 侧指针状态类，ch11 PtrState 的对应物"},
+      {"symbol": "AddPtrConverter", "why": "tt.addptr 的 pass 挂载点，委托 rewriteAddPtr"},
+      {"symbol": "LoadConverter", "why": "tt.load → memref.copy + to_tensor 的 converter"},
+      {"symbol": "toTensorAndReplace", "why": "三条 load 路径共用的尾巴：bufferization.to_tensor 替换 tt.load"},
+      {"symbol": "StoreConverter", "why": "tt.store → materialize_in_destination 的 converter"},
+      {"symbol": "MaterializeInDestinationOp", "why": "store 落地的目标 op（IR 写 bufferization.materialize_in_destination）"},
+      {"symbol": "AtomicRMWConverter", "why": "tt.atomic_rmw 落硬件原子算子（非 linalg.generic）的 converter"},
+      {"symbol": "rewriteMakeTensorPtrOp", "why": "block_ptr 物化成 reinterpret_cast，含 redundant op 记 shape 供 boundary_check——回收伏笔 f1 的转置/维序落点"}
+    ]
+  },
+
+  "mechanisms": [
+    {
+      "id": "m1-blockdata-memacc-vocab",
+      "name": "BlockData 与 MemAccType：TritonToLinalg 侧的状态词汇",
+      "kind": "layout",
+      "source_anchors": ["third_party/ascend/include/TritonToLinalg/BlockPtrAnalysis.h:L46-L146"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "note": "BlockData(offsets/sizes/strides 用 OpFoldResult + source 已是 memref + scalar + resElemTy + memAccTy) 与 ch11 PtrState 对位表；MemAccType 三态。needs_figure：一张 BlockData vs PtrState 对照 + MemAccType 格图。链接回指 ch11 PtrState。"
+    },
+    {
+      "id": "m2-parse-mirror-of-ch11",
+      "name": "parse/addBlock/mulBlock：ch11 逆向代数在 BlockData 上的镜像",
+      "kind": "dataflow",
+      "source_anchors": ["third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L392-L498", "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L167-L218", "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L846-L894"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "note": "parse() 递归分派 + parseAddPtr + addBlock/mulBlock/parseMakeRange/parseSplat/parseBroadcast——数据流与 ch11 addState/mulState/visitOperand 一一对应。**writer 必须 markdown 链接回指 ch11 深挖，不重新推导 (offset,sizes,strides) 怎么来的**；本章只点出『这是同一算法的本侧镜像，差别在状态载体与终点』。故不设 worked_example（在 ch11 已做）。"
+    },
+    {
+      "id": "m3-createcastop-materialize",
+      "name": "createCastOp：三元组铸成 memref.reinterpret_cast（本章心脏）",
+      "kind": "algorithm",
+      "source_anchors": ["third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L322-L343", "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L144-L165"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "inferBlockOffset 塌缩 + getResultMemrefType 组类型 + size==1 维 stride 抬升 + 发射。worked_example：接 ch10 那个 x 侧地址还原到 (offset=8,sizes=4,strides=1) 的结果，走 createCastOp 得 memref.reinterpret_cast %src to offset:[8], sizes:[4], strides:[1]；配 legal_stride.mlir 的二维 [4,1] + stride 抬升做对照。needs_figure：三元组格子 → reinterpret_cast 参数的映射图。"
+    },
+    {
+      "id": "m4-reinterpretcast-roundtrip",
+      "name": "parseReinterpretCast：offset 塌缩语义与三元组⇄memref 往返",
+      "kind": "dataflow",
+      "source_anchors": ["third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L896-L915"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "note": "createCastOp 的逆运算：offset 是多维塌缩总和 → 只落第一维、余维补零。用于 block_ptr 链已含 recast 时读回。讲清『为何 reinterpret_cast 只有一个 offset 参数』。"
+    },
+    {
+      "id": "m5-rewriteaddptr-driver",
+      "name": "rewriteAddPtr：落地驱动 + 零 stride 修复 + intToPtr/bitcast 源处理",
+      "kind": "algorithm",
+      "source_anchors": ["third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L1125-L1214", "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp:L78-L84"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "把 parse→物化的十步串起来（见 data_flow 3-5）。worked_example：一条 tt.addptr 从入口到发出 reinterpret_cast+replaceOp 的全流水，标出零 stride 修复(inferedSize=∏低维 size)与 known 表存未修改态的解耦。needs_figure：rewriteAddPtr 控制流图（含 Unstructured 分岔）。与 ch11 rewriteAddptrOp 不同侧，须显式区分。"
+    },
+    {
+      "id": "m6-memacc-decision-gather-fallback",
+      "name": "MemAccType 结构化决策与 rewriteAddPtrToUnstrucMemAcc gather 回退",
+      "kind": "algorithm",
+      "source_anchors": ["third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L962-L1003", "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L2158-L2232", "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L1135-L1142"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "parseIndirectLoad 产 UnstrucMemAcc → merge 取大污染全链 → rewriteAddPtr 分岔 → gather 循环（嵌套 scf.for 逐元素 extract offset+单元素 reinterpret_cast+挪 tt.load 打 IndirectLoad 标）。worked_example：一个 gather（tl.load(ptr+idx_tensor)）如何退化成逐元素循环，对照结构化路径的一条 copy，量化复杂度差(theory 第4条)。needs_figure：结构化 vs gather 两条落地路径对比图。"
+    },
+    {
+      "id": "m7-load-to-copy-totensor",
+      "name": "LoadConverter：tt.load → memref.copy + bufferization.to_tensor",
+      "kind": "dataflow",
+      "source_anchors": ["third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp:L225-L520", "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp:L86-L98"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "note": "主干 alloc+copy+to_tensor（restrict+writable）；四路分支（scalar/boundary_check/无 mask/有 mask）概述即可，主讲无 mask 主干 + toTensorAndReplace 汇合点。needs_figure：load 落地的 memref/tensor 域接力图。lit legal_stride.mlir 作 IR 对照。"
+    },
+    {
+      "id": "m8-store-to-materialize",
+      "name": "StoreConverter：tt.store → bufferization.materialize_in_destination",
+      "kind": "dataflow",
+      "source_anchors": ["third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp:L1052-L1150"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "note": "无 mask 直接 materialize_in_destination；连续 mask 先 extract_slice/subview 再 materialize。与 load 对称。lit legal_stride.mlir 末尾 materialize_in_destination 作对照。"
+    },
+    {
+      "id": "m9-atomicrmw-hivm",
+      "name": "AtomicRMWConverter：tt.atomic_rmw → 硬件原子算子（非 linalg.generic）",
+      "kind": "protocol",
+      "source_anchors": ["third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp:L549-L692"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "note": "硬件支持度 isHardwareSupported 决策 → hivm.hir.store(atomic=<kind>)/hfusion.atomic_rmw/atomic_xchg/hfusion.store(91095)。**纠 brief『→linalg.generic』**：现行不产 linalg.generic（那是文档旧注释；真 linalg::GenericOp 在 AtomicCASConverter）。lit atomic_rmw.mlir CHECK-NOT: GenericAtomicRMW 背书。"
+    },
+    {
+      "id": "m10-make-tensor-ptr-block",
+      "name": "make_tensor_ptr/advance → reinterpret_cast：block_ptr 物化与转置维序（回收 f1）",
+      "kind": "dataflow",
+      "source_anchors": ["third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L1277-L1361", "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L1216-L1275", "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp:L346-L366"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "回收伏笔 f1：三元组 + block_ptr 铸成 reinterpret_cast、并处理转置与维序。rewriteMakeTensorPtrOp：offset×stride + accumulatePotentialOffsetOnBase 累加 base 偏移 + createRedundantOp 造带 tensor_ptr_full_shape 的冗余 recast 记全 shape（供 boundary_check）+ 目标块 recast。转置/维序：make_tensor_ptr 的 original_order 属性在 Load/StoreConverter 里对 boundary_check 维序做置换(L346-L366)。worked_example：一个 tl.make_block_ptr 带 order=(1,0) 转置的落地。省略 nd2nzFlag 大段(L1363-L1445，nd2nz 布局附加，另属特化)。"
+    }
+  ],
+
+  "foreshadow_due": {
+    "recover": [
+      {
+        "id": "f1",
+        "text": "PtrAnalysis 分析终态里的 strides/sizes/offset 三元组 + 一路带过来的 shouldLinearize 标志，在 ch12 要被铸成 memref.reinterpret_cast、并处理 block_ptr 的转置与维序（埋于 ch11）",
+        "how_recovered": "本章 m3(createCastOp) 兑现『三元组铸成 memref.reinterpret_cast』；m10(rewriteMakeTensorPtrOp + original_order 维序置换) 兑现『block_ptr 的转置与维序』。**须如实说明一处口径**：f1 里的 shouldLinearize 是 TritonToStructured/PtrAnalysis 侧 PtrState 的字段（ch11 深挖的那条平行管线）；本章 TritonToLinalg/BlockPtrAnalysis 侧 BlockData 没有 shouldLinearize，其结构化/非结构化的对应决策由 **MemAccType**(m6) 承担。两条管线平行（ch10 已立），writer 回收 f1 时要把『结构化落地 memref』这条主线接上，并点明本侧的决策载体是 MemAccType 而非 shouldLinearize，避免把两条管线的字段混为一谈。"
+      }
+    ],
+    "plant": []
+  }
+}

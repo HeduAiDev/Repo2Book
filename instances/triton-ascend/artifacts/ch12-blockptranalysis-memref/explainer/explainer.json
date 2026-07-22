@@ -1,0 +1,227 @@
+{
+  "chapter": "ch12",
+  "title": "落到 memref：BlockPtrAnalysis、reinterpret_cast 与 load/store→linalg",
+  "note_manual_chapter": "skip_impl=true 纯 C++ MLIR pass 章：所有 worked_example 的 trace_source=manual，数字来源见 explainer/traces/manual_derivations.md（每数字标 file:Lxxx 或 lit 夹具 CHECK）。凡 chosen 参数为 explainer 自选的小而具体值，凡 file:Lxxx 数字可溯源到 pin @2badfc89e 源码常量。lit 夹具 legal_stride.mlir / atomic_rmw.mlir 为 pin 内真实存在的 RUN+CHECK 对照，非伪造 dump。",
+
+  "mechanisms": [
+    {
+      "mechanism_id": "m1-blockdata-memacc-vocab",
+      "intuition": "换到 TritonToLinalg 这一侧，登记表还是那张登记表——ch11 用 PtrState 记『从哪起(offset)、取几个(sizes)、隔多远(strides)』，这里换成 BlockData 记同样三件事，只是格子里填的从『分析期整型』升级成 OpFoldResult（可以是编译期常量，也可以是运行期 Value），因为它最终要直接拿去建 memref。另外多带一枚『访存体检章』MemAccType：这块地址能不能整整齐齐排成规整块（结构化），还是散乱到只能逐个捡（非结构化）。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m1-blockdata-vs-ptrstate",
+          "claim": "BlockData 是 ch11 PtrState 在 TritonToLinalg 侧的镜像状态类：同样的 offsets/sizes/strides 三元组，载体从分析期整型升级为 OpFoldResult，source 从 tt.ptr 升级为 memref，并新增 MemAccType 决策位。",
+          "template": "state-table",
+          "numbers": [
+            {"label": "offsets/sizes/strides 载体", "value": "OpFoldResult（可静可动）", "provenance": "third_party/ascend/include/TritonToLinalg/BlockPtrAnalysis.h BlockData 定义"},
+            {"label": "source 类型", "value": "已是 memref（非 tt.ptr）", "provenance": "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L157 getResultMemrefType 取 source 的 BaseMemRefType"},
+            {"label": "新增字段", "value": "scalar / resElemTy / memAccTy", "provenance": "dossier key_classes BlockData responsibility"}
+          ],
+          "caption_draft": "同一套逆向算法的两个状态载体：ch11 PtrState（分析、重发射规范 addptr）↔ 本章 BlockData（物化、直接产 memref）；三元组语义一致，差别在载体精度与终点。"
+        },
+        {
+          "figure_id": "fig-m1-memacc-lattice",
+          "claim": "MemAccType 是一个三态全序格 Undefined(0) < StrucMemAcc(1) < UnstrucMemAcc(2)，merge 取大（上确界），一条地址链上任一处非结构化都会把整链染成 UnstrucMemAcc。",
+          "template": "state-machine",
+          "numbers": [
+            {"label": "Undefined", "value": "0", "provenance": "third_party/ascend/include/TritonToLinalg/BlockPtrAnalysis.h:L46"},
+            {"label": "StrucMemAcc", "value": "1", "provenance": "third_party/ascend/include/TritonToLinalg/BlockPtrAnalysis.h:L46"},
+            {"label": "UnstrucMemAcc", "value": "2", "provenance": "third_party/ascend/include/TritonToLinalg/BlockPtrAnalysis.h:L46"},
+            {"label": "merge 规则", "value": "value = max(this, other)", "provenance": "third_party/ascend/include/TritonToLinalg/BlockPtrAnalysis.h:L66-L68"}
+          ],
+          "caption_draft": "结构化度的偏序：merge=max 使『一颗老鼠屎坏一锅汤』——只要地址链里出现一处间接 load，整条链退化为 UnstrucMemAcc，rewriteAddPtr 据此分岔到 gather 回退。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m3-createcastop-materialize",
+      "intuition": "三元组 (offset, sizes, strides) 是一张『抓药配方』：从第 offset 个元素起、每维取 sizes 个、每维相邻元素隔 strides 个。createCastOp 就是照方抓药——把这张配方铸成一条 memref.reinterpret_cast，开出一扇看进底层内存的规整窗口。关键一步：多维的各维偏移要先『塌缩』成一个总偏移（reinterpret_cast 只收一个 offset 参数）。",
+      "worked_example": {
+        "params": {
+          "offsets_chosen": [8, 3],
+          "sizes_chosen": [4, 2],
+          "strides_chosen": [2, 1],
+          "source": "memref<?xf32>",
+          "note": "chosen=explainer 自选的小而具体 2 维非退化参数；无 size==1 维，故不触发 MaxSIOp 抬升（抬升分支另在 m5 用 legal_stride 演示）"
+        },
+        "trace_source": "manual",
+        "manual_reason": "skip_impl 纯 C++ pass 章，宿主无 CANN 无法产编译器 dump；createCastOp 是确定性构造函数，逐步语义对 pin BlockPtrAnalysis.cpp:L322-L343 + L144-L165，IR 形态交叉参考 lit legal_stride.mlir。见 traces/manual_derivations.md。",
+        "trace_ref": "traces/manual_derivations.md",
+        "table": {
+          "columns": ["步骤", "源码", "输入", "计算", "输出/发射"],
+          "rows": [
+            ["inferBlockOffset 塌缩", "L144-L151", "offsets=[8,3]", "retOffset: 0 +8 → 8 +3 → 11", "总 offset = 11（单一线性偏移）"],
+            ["getResultMemrefType 组类型", "L153-L165", "offset=11, sizes=[4,2], strides=[2,1]", "StridedLayoutAttr(offset=11, strides=[2,1])", "memref<4x2xf32, strided<[2,1], offset:11>>"],
+            ["size==1 维 stride 抬升检查", "L325-L339", "sizes=[4,2]", "无 resultShape[i]==1 的维 → MaxSIOp 不触发", "strides 保持 [2,1]"],
+            ["发射 reinterpret_cast", "L341-L342", "以上三元组 + source", "create<memref::ReinterpretCastOp>", "memref.reinterpret_cast %src to offset:[11], sizes:[4,2], strides:[2,1]"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "createCastOp 发射的 reinterpret_cast，其单一 offset 参数恒等于 BlockData 各维 offset 之和（inferBlockOffset 的塌缩），且塌缩可被 parseReinterpretCast 逆向复原（余维补零），保证三元组⇄memref 往返自洽。",
+        "argument": "inferBlockOffset 从 0 起对 offsets 逐项 addOpFoldResult（L146-L150），结果与相加顺序无关（加法结合律）；parseReinterpretCast 反向把这个总和只填回第一维、其余维置 0（L907-L914），两者构成互逆映射——这是 block_ptr 链能多趟 recast 折叠而不丢寻址信息的前提。"
+      },
+      "quantified": "本例：2 维 block、offsets=[8,3] 塌缩成 1 个总 offset=11，1 条 reinterpret_cast 即完整描述 4×2=8 个元素的规整视图——O(1) 条指令描述 O(N) 数据。若某维 size==1 且其 stride 是动态 Value，会被 L331-L336 的 MaxSIOp 抬成 max(stride,1) 以避免下游 memref 出现非法零 stride。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m3-triple-to-recast",
+          "claim": "createCastOp 把 BlockData 三元组映射成 memref.reinterpret_cast 的三个参数槽：各维 offset 先经 inferBlockOffset 塌缩成单一 offset，sizes/strides 逐维对位填入。",
+          "template": "flow",
+          "numbers": [
+            {"label": "输入 offsets", "value": "[8, 3]", "provenance": "chosen（traces/manual_derivations.md m3）"},
+            {"label": "塌缩总 offset", "value": "11", "provenance": "inferBlockOffset 累加 8+3，third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L146-L150"},
+            {"label": "sizes", "value": "[4, 2]", "provenance": "chosen"},
+            {"label": "strides", "value": "[2, 1]", "provenance": "chosen"},
+            {"label": "发射结果", "value": "reinterpret_cast offset:[11] sizes:[4,2] strides:[2,1]", "provenance": "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L341-L342"}
+          ],
+          "caption_draft": "本章心脏一图：三元组→reinterpret_cast。注意 offset 槽只有一个，多维偏移必须先塌缩成总和（8+3=11），这正是 reinterpret_cast『单 offset』语义的由来。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m5-rewriteaddptr-driver",
+      "intuition": "rewriteAddPtr 是 tt.addptr 落地的『总装车间』：先让 parseAddPtr 把指针算术逆向回三元组（这步是 ch11 前向传播代数的本侧镜像，不重推），再决定走结构化还是 gather，然后做一道『零 stride 修复』——把 size==1 维那条『隔 0 个元素』的退化步长，抬成低维 size 之积，免得下游 memref 出现非法零 stride；最后交给 createCastOp 发射、replaceOp 替掉原 op。一个微妙点：修好的 stride 只用于物化，known 登记表里存的仍是原始 0 stride，供后续指针算术继续用。",
+      "worked_example": {
+        "params": {
+          "source_fixture": "hand-constructed（为讲解构造的 tt.addptr，非取自某 lit 夹具）",
+          "sizes": [4, 1],
+          "strides_in": [4, 0],
+          "memacc": "StrucMemAcc",
+          "note": "为讲解构造的一组小而具体的值：size==1 维带 stride 0，触发 rewriteAddPtr 的内联 0→1 抬升。注意：lit 夹具 legal_stride.mlir 里有一处形态相同的 0→1 抬升，但那条 IR 无 tt.addptr，抬升由独立 pass ReinterpretCastStrideCanonicalizer（LoadStoreConverter.cpp:L1182-L1236，经 processLegalStrideOperations TritonToLinalgPass.cpp:L746-L758 触发）完成，非 rewriteAddPtr——同形不同源，勿混。"
+        },
+        "trace_source": "manual",
+        "manual_reason": "skip_impl 纯 C++ pass 章，宿主无 CANN；rewriteAddPtr 控制流对 pin BlockPtrAnalysis.cpp:L1125-L1214，inferedSize 逆序循环 L1162-L1178。worked_example 为讲解构造（非取自 lit 夹具，因 legal_stride.mlir 无 tt.addptr、其 0→1 抬升是另一条独立 canonicalizer pass 干的）。见 traces/manual_derivations.md。",
+        "trace_ref": "traces/manual_derivations.md",
+        "table": {
+          "columns": ["步骤", "源码", "动作", "关键值", "结果"],
+          "rows": [
+            ["1 parseAddPtr", "L846-L894", "逆向出 BlockData（镜像 ch11，链接回指）", "sizes=[4,1] strides=[4,0]", "MemAccType=StrucMemAcc"],
+            ["2 Unstructured 分岔", "L1135-L1142", "isUnstructured()？", "StrucMemAcc → 否", "走结构化路径"],
+            ["3 取 resultShape", "L1152-L1158", "从 result 类型取 shape", "[4,1]", "resultShape=[4,1]"],
+            ["4 known 存未修改态", "L1160", "known[result]=data（原始 stride）", "strides=[4,0]（原始 0 保留）", "分析态/物化态解耦"],
+            ["5 逆序 stride 修复 i=1", "L1170-L1177", "size==1 且 stride==0 → 替成 inferedSize", "inferedSize=1 → strides[1]=1", "strides=[4,1]，inferedSize 累积 1"],
+            ["5 逆序 stride 修复 i=0", "L1170-L1177", "size=4≠1 → 不替；inferedSize×=4", "strides[0]=4 不变", "strides=[4,1]，inferedSize 累积 4"],
+            ["6 createCastOp + replaceOp", "L1195,L1200", "发射 reinterpret_cast 替掉 tt.addptr", "offset:[base] sizes:[4,1] strides:[4,1]", "修好的 strides:[4,1] 交 createCastOp 物化"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "零 stride 修复不改变实际寻址：被抬升的一定是 size==1（或 hoist_dim 命中）维，该维只取一个元素，无论步长多大都只落在同一个地址，故抬 stride 只让 memref layout 合法而语义等价。",
+        "argument": "L1173 的 shouldReplaceStride 仅在 sizeConst==1 或 hoistDim==i 时为真，且 L1174 只在 strideConst==0 时替换；size==1 的维寻址表达式为 offset + stride×k，k∈{0}，恒等于 offset，与 stride 取值无关——所以抬成 inferedSize 后寻址不变，只消除了非法零 stride。而 known 表存原始 0 stride（L1160+注释 L1163-L1165）保证后续指针算术仍见原值。"
+      },
+      "quantified": "本例 sizes=[4,1] 的逆序扫共 2 轮：i=1 命中 size==1 且 stride==0，抬成 inferedSize=∏_{j>1}size[j]=1（空积）；i=0 size=4 不命中，inferedSize 累积到 4。最终 strides [4,0]→[4,1]，退化维的非法零 stride 被抬成合法值。整条 addptr 落地=1 条 reinterpret_cast + replaceOp，O(1) 描述整块。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m5-rewriteaddptr-flow",
+          "claim": "rewriteAddPtr 的控制流：parseAddPtr 逆向→按 MemAccType 分岔（结构化 vs gather 回退）→结构化路径做零 stride 修复+源处理→createCastOp 发射→replaceOp。",
+          "template": "flow",
+          "numbers": [
+            {"label": "Unstructured 分岔判据", "value": "isUnstructured() 且 source 非 intToPtr", "provenance": "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L1135-L1142"},
+            {"label": "零 stride 修复示例", "value": "strides [4,0] → [4,1]", "provenance": "为讲解构造；rewriteAddPtr 内联修复逻辑 BlockPtrAnalysis.cpp:L1170-L1177"},
+            {"label": "known 存态", "value": "原始 stride 0（未修改）", "provenance": "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L1160"}
+          ],
+          "caption_draft": "落地驱动全景：与 ch11 的 rewriteAddptrOp（TritonToStructured 侧，重发射规范 addptr）不同侧——本图这条终点是 memref.reinterpret_cast。零 stride 修复是本侧独有的物化前置。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m6-memacc-decision-gather-fallback",
+      "intuition": "会计对账：绝大多数流水能整整齐齐填进规整表格（结构化，一条 reinterpret_cast 搞定整块）；可一旦出现『金额得去另一张表里逐笔查』的间接项（gather，地址来自另一次 tt.load），这块就没法用一个 (offset,sizes,strides) 静态描述了。MemAccType 的 merge 取大就是『一处非结构化污染全链』，rewriteAddPtr 于是退化成逐元素循环：按块大小建嵌套 scf.for，每次捡一个散乱 offset、造一个单元素 reinterpret_cast，把原 tt.load 挪进循环打上 IndirectLoad 标。正确但慢——这就是不肯瞎猜的兜底。",
+      "worked_example": {
+        "params": {
+          "idx_tensor_chosen": [10, 3, 7, 1],
+          "base_chosen": 100,
+          "N": 4,
+          "note": "chosen：一个 gather（tl.load(base + idx_tensor)），idx 来自前一次 tt.load 故 idx 载体标 UnstrucMemAcc；N=4 让循环≥2 轮可观察"
+        },
+        "trace_source": "manual",
+        "manual_reason": "skip_impl 纯 C++ pass 章，宿主无 CANN；MemAccType 三态与 merge 取大对 pin H:L46/L66-L68，parseIndirectLoad UnstrucMemAcc 落点 L989，gather 回退 rewriteAddPtrToUnstrucMemAcc L2158-L2232（单元素 sizes[1]/strides[1] L2222/L2224）。combinedOffset 为 base+散乱 offset 的算术。见 traces/manual_derivations.md。",
+        "trace_ref": "traces/manual_derivations.md",
+        "table": {
+          "columns": ["循环 iv", "extract 散乱 offset", "+ base", "combinedOffset", "发射（单元素）"],
+          "rows": [
+            ["0", "10", "100", "110", "reinterpret_cast offset:[110] sizes:[1] strides:[1]"],
+            ["1", "3", "100", "103", "reinterpret_cast offset:[103] sizes:[1] strides:[1]"],
+            ["2", "7", "100", "107", "reinterpret_cast offset:[107] sizes:[1] strides:[1]"],
+            ["3", "1", "100", "101", "reinterpret_cast offset:[101] sizes:[1] strides:[1]"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "MemAccType 的最终结构化度 = 地址链所有子表达式结构化度的上确界（merge=max），与遍历顺序无关；且 gather 回退的嵌套循环必然终止。",
+        "argument": "值域 {0,1,2} 上 max 满足结合律与交换律，故递归 merge 的结果与 parse 遍历顺序无关（H:L66-L68），是良定义的上确界。终止性：gather 的嵌套 scf.for 上界取自 blockSizes（L2185-L2189），是编译期已知的有限维度积 ∏size[i]，每层步长为 1，故迭代次数有限、必停。"
+      },
+      "quantified": "N=4 的这块：结构化路径=1 条 reinterpret_cast + 1 条 memref.copy=2 条 op（O(1) 描述 O(N) 数据）；gather 回退=4 次循环 ×（1 tensor.extract + 1 reinterpret_cast + 1 memref.load）=12 条 op（O(N)）+ 循环开销。这个 2 vs 12 的差量化了『为何要尽量判成 StrucMemAcc』（dossier theory 第 4 条）。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m6-struct-vs-gather",
+          "claim": "MemAccType 分岔的两条落地路径对比：结构化=1 条 reinterpret_cast 描述整块（O(1) 指令）；非结构化 gather=按 blockSizes 嵌套 scf.for 逐元素单元素 recast（O(N) 指令）。",
+          "template": "before-after",
+          "numbers": [
+            {"label": "结构化 op 数(N=4)", "value": "2（reinterpret_cast + memref.copy）", "provenance": "dossier theory 第 4 条；LoadStoreConverter.cpp:L441 copy"},
+            {"label": "gather op 数(N=4)", "value": "12（4×[extract+recast+load]）", "provenance": "traces/manual_derivations.md m6 复杂度；循环体 BlockPtrAnalysis.cpp:L2210,L2225 + LoadConverter memref.load"},
+            {"label": "UnstrucMemAcc 触发点", "value": "间接 load 派生地址", "provenance": "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L989 setMemAccVal(UnstrucMemAcc)"},
+            {"label": "循环上界", "value": "blockSizes（本例 4）", "provenance": "third_party/ascend/lib/TritonToLinalg/BlockPtrAnalysis.cpp:L2185-L2189"}
+          ],
+          "caption_draft": "结构化不成就逐元素：一处间接 load 经 merge 取大污染全链，rewriteAddPtr 从『一条 copy 搬整块』退化为『N 次单元素 gather 循环』——正确性优先于性能的保守兜底。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m7-load-to-copy-totensor",
+      "intuition": "tt.load 落地=把外部内存里的一块数据先『搬』进一块本地缓冲，再把缓冲『认领』成 tensor 值供后续计算用。三步：memref.alloc 开一块本地缓冲，memref.copy 从 reinterpret_cast 出的规整 memref 把数据搬进来，bufferization.to_tensor(restrict+writable) 把缓冲变回 tensor 替换掉原 tt.load。达芬奇架构需要这种显式的『内存域→计算域』接力。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m7-load-domain-relay",
+          "claim": "LoadConverter 主干（无 mask）把 tt.load 落成三步内存/计算域接力：reinterpret_cast(memref) → memref.copy 到 alloc 本地缓冲 → bufferization.to_tensor 回到 tensor 值。",
+          "template": "tensor-flow",
+          "numbers": [
+            {"label": "步1 源 memref", "value": "reinterpret_cast → memref<4x1xf32, strided<[?,?],offset:?>>", "provenance": "legal_stride.mlir reinterpret_cast 行"},
+            {"label": "步2 本地缓冲", "value": "memref.alloc() : memref<4x1xf32>", "provenance": "legal_stride.mlir %alloc 行；LoadStoreConverter.cpp:L441 memref.copy"},
+            {"label": "步3 认领为 tensor", "value": "bufferization.to_tensor %alloc restrict writable", "provenance": "legal_stride.mlir to_tensor 行；LoadStoreConverter.cpp:L86-L98 toTensorAndReplace"}
+          ],
+          "caption_draft": "tt.load → memref.copy + to_tensor 的域接力（无 mask 主干）：三条 load 路径（无 mask/boundary/有 mask）最后都汇到 toTensorAndReplace 这条公共尾巴，restrict+writable 标注给下游 bufferization 免别名分析。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m10-make-tensor-ptr-block",
+      "intuition": "block_ptr 是『整块搬运的施工图』：make_tensor_ptr 给出大张量的 shape/strides、这一块的起始 offset 和块尺寸。rewriteMakeTensorPtrOp 先把各维起始 offset 乘上对应 stride 再累加，算出这块砖在大楼里的线性起点；然后特意留一张『整栋楼平面图』(带 tensor_ptr_full_shape 标的冗余 reinterpret_cast，记着 parent 全 shape) 供后续 load/store 做 boundary_check；最后开出这块砖自己的窗口。转置(order 属性)则是交换『楼层号与房间号』的读法——boundary_check 的轴号要按 original_order 公式回改。",
+      "worked_example": {
+        "params": {
+          "parent_shape_chosen": [128, 64],
+          "parent_strides_chosen": [64, 1],
+          "block_sizes_chosen": [16, 32],
+          "block_offsets_chosen": [2, 1],
+          "base_recast_offset_chosen": 0,
+          "note": "chosen：row-major parent 128×64，非退化（offset×stride 产生实际位移 128≠0）；转置一行引用源码注释自带示例 original_order=(0,1)"
+        },
+        "trace_source": "manual",
+        "manual_reason": "skip_impl 纯 C++ pass 章，宿主无 CANN；rewriteMakeTensorPtrOp 逐步对 pin BlockPtrAnalysis.cpp:L1277-L1361，offset×stride L1311-L1313，base 累加 L1327，全 shape 冗余 op L1232-L1275/L1354-L1355，目标 createCastOp L1360；转置 boundary_check 置换公式逐字引自 LoadStoreConverter.cpp:L350-L353 源码注释。见 traces/manual_derivations.md。",
+        "trace_ref": "traces/manual_derivations.md",
+        "table": {
+          "columns": ["步骤", "源码", "动作", "关键值", "结果"],
+          "rows": [
+            ["1 parse base + 映射", "L1287-L1308", "base→source memref；offsets 过 max(v,0)；strides 映射", "offsets=[2,1] strides=[64,1]", "source=memref<?xf32>"],
+            ["2 offset×stride", "L1311-L1313", "newOffsets[i]=offset[i]×stride[i]", "[2×64, 1×1]", "newOffsets=[128,1]"],
+            ["3 累加 base 于 front", "L1327", "newOffsets[0]+=base recast offset", "128 + 0", "newOffsets=[128,1]"],
+            ["4 冗余全 shape op", "L1232-L1275,L1354-L1355", "sizes←parent [128,64]，offsets=[0,0]，打 tensor_ptr_full_shape 标", "记全 shape 供 boundary_check", "第 1 条 reinterpret_cast（全 shape）"],
+            ["5 目标块 createCastOp", "L1360,L144", "inferBlockOffset 塌缩 + 发射目标块", "128 + 1 = 129", "第 2 条 reinterpret_cast offset:[129] sizes:[16,32] strides:[64,1]"],
+            ["6 转置维序 boundary_check", "LoadStoreConverter.cpp:L350-L353", "original_order 置换 boundary_check 轴", "order=(0,1) bc=(1,) → new_bc[0]=2-1-1=0", "边界检查轴回改为 0"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "每个 block_ptr 恒物化出两条 reinterpret_cast——一条记 parent 全 shape（各维 offset=0，仅 front 累加 base）、一条记目标块——且目标块的总 offset = Σ(block_offset[i]×stride[i]) + base，与维序处理解耦。",
+        "argument": "createRedundantOp 用 op.getShape() 重置 sizes、curOffsets 初始化为全 0 再仅对 front 累加 base（L1264-L1269），发一条全 shape recast；随后 data 恢复目标块 sizes/offsets（L1270-L1274），createCastOp 再发目标块（L1360）——故恒为 2 条。目标块总 offset 由 newOffsets=offset×stride（L1313）+ base 累加（L1327）+ inferBlockOffset 塌缩（L146-L150）三步合成，本例 2×64 + 1×1 + 0 = 129，各步互不依赖维序，转置仅事后调 boundary_check 轴号。"
+      },
+      "quantified": "本例每个 tl.make_block_ptr 展开成 2 条 reinterpret_cast；目标块总 offset=128+1=129，块视图 16×32=512 元素由 1 条 recast 描述。转置代价：仅在有 boundary_check 时按 L350-L353 公式对轴号做 O(rank) 置换，无数据搬运开销。",
+      "figure_specs": []
+    }
+  ]
+}
