@@ -45,9 +45,12 @@
   仿射 tiled dataflow），bishengir 部分闭源（边界≈基座的 ptxas）。
 - ✅ **大纲已获用户审批（2026-07-18「同意」）**：33 章 / 7 Part（outline-final.json）+ ARCHITECTURE.md，
   开始逐章发车。roadmap.py 生成器已建并验（7 Part 窄长条 5.17:1，4 调用/几何/Read-PNG 通过）。
-- 🚗 **施工中（2026-07-22 状态）**：**ch01–ch09 已全部定稿提交并归档**（Part 1 完 + Part 2 语言层完
-  + **Part 3 开篇 ch09 primer 完**）；ch10 施工中，ch11–ch33 未开工。
+- 🚗 **施工中（2026-07-22 状态）**：**ch01–ch10 已全部定稿提交并归档**（Part 1 完 + Part 2 语言层完
+  + **Part 3 分水岭 ch09 primer / ch10 triton_adapter 总览 完**）；ch11–ch33 未开工。下一章 **ch11**
+  （PtrAnalysis 深入，triton-to-linalg 子系统 → **发车须 skip_impl:true**，见上条）。
   发车须 scriptPath（workflow-byname-stale-snapshot）+ 显式 instance:"triton-ascend"（护栏）。
+  ⚠️ ch10 交付经 3 发 3 逃生（dossier-verify/Implement/Review），教训已固化：pass 序列等计数别信 brief 快照、
+  子系统发车用 skip_impl、Review 的 API 崩溃靠 Lead 补跑缺维（详见 ch10 run-ledger）。
 - ⚠️ **triton-to-linalg 子系统（ch10–ch14+）是纯 C++ MLIR pass 章，发车须 `skip_impl:true`**
   （2026-07-22 定，对齐姊妹篇《Triton 源码解读》ch25/28/30/32/33 的 skip_impl 先例）。
   这些章的 must_keep 全是 C++ 符号（PtrAnalysis/BlockPtrAnalysis/MaskAnalysis/Unstructure 等
