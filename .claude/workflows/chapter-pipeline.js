@@ -316,7 +316,7 @@ const DIMS = [
     : 'fidelity（保真度+过度删减+零脚手架泄漏，跑 lint_fidelity/lint_source_grounding/lint_chapter_structure）',
   'algorithm-pedagogy（逐机制对账：对 dossier.mechanisms 每条填勾选表——直觉在场？数值推演表在场且带 trace 标记？不变量论证？量化落数字？core 三层齐？先跑 lint_trace_consistency 作客观依据；输出逐机制勾选表，不是整体印象）',
   'figure-integration（先跑 lint_diagrams；然后逐张用 Read 打开 PNG 亲眼看：图在其机制讲解附近？图注给结论而非描述画面？正文数字与图上一致？图对读懂机制真有帮助？）',
-  'formula-structure（公式规则+Roadmap 开场+自包含+锚点/半角，跑 lint_formulas/lint_anchors/lint_punct/lint_chapter_structure）',
+  'formula-structure（公式规则+Roadmap 开场+自包含+锚点/半角+IR 算子名两段点分，跑 lint_formulas/lint_anchors/lint_punct/lint_chapter_structure/lint_ir_opname）',
 ]
 // ---- revise 分流纯函数（exp-0716-1，SDD 2026-07-18-pipeline-revise-dimension-routing）----
 // 行为真相源在 .claude/workflows/lib/revise-routing.js（node --test 锁行为+DIMS 快照），
