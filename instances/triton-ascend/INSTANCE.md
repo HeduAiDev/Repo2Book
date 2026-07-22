@@ -45,9 +45,15 @@
   仿射 tiled dataflow），bishengir 部分闭源（边界≈基座的 ptxas）。
 - ✅ **大纲已获用户审批（2026-07-18「同意」）**：33 章 / 7 Part（outline-final.json）+ ARCHITECTURE.md，
   开始逐章发车。roadmap.py 生成器已建并验（7 Part 窄长条 5.17:1，4 调用/几何/Read-PNG 通过）。
-- 🚗 **施工中（2026-07-21 状态）**：**ch01–ch09 已全部定稿提交并归档**（Part 1 完 + Part 2 语言层完
-  + **Part 3 开篇 ch09 primer 完**）；ch10–ch33 未开工。下一章 **ch10** 按 outline-final.json 发车。
+- 🚗 **施工中（2026-07-22 状态）**：**ch01–ch09 已全部定稿提交并归档**（Part 1 完 + Part 2 语言层完
+  + **Part 3 开篇 ch09 primer 完**）；ch10 施工中，ch11–ch33 未开工。
   发车须 scriptPath（workflow-byname-stale-snapshot）+ 显式 instance:"triton-ascend"（护栏）。
+- ⚠️ **triton-to-linalg 子系统（ch10–ch14+）是纯 C++ MLIR pass 章，发车须 `skip_impl:true`**
+  （2026-07-22 定，对齐姊妹篇《Triton 源码解读》ch25/28/30/32/33 的 skip_impl 先例）。
+  这些章的 must_keep 全是 C++ 符号（PtrAnalysis/BlockPtrAnalysis/MaskAnalysis/Unstructure 等
+  `lib/*/*.cpp`），**.py 零命中、宿主无 CANN/NPU 编不动、用 Python 重写违反 HARD RULE 2（deep 不享 primer 豁免）**。
+  ⚠️ **outline-final.json 里这些章标 `mode=code` 是模板默认、对本子系统不适用**——照它发车会在 Implement 站逃生（ch10 已踩，2026-07-22）。
+  **交叉验证不走精简版，走两样**：① pin 精确源码逐段解读；② `unittest/Conversion/**/*.mlir` 的 lit 夹具（真实、pin 内、带 RUN+CHECK 前后对照）作 IR-dump 素材，explainer/illustrator 阶段用，trace_source 标『pin 内 lit 夹具』，**不伪造编译器 dump**。
 - ⚠️ **ch10 发车必答项（务必注入 dossier brief）**：`namedOps` 的**实现语义**。
   实测 `TritonToLinalgPass.cpp:L524`（namedOps 为真时张量上的 `arith` 保持合法）与 `L651`
   （`if (!namedOps)` 才加载 `populateElementwiseToLinalgConversionPatterns`）⇒ 真实语义是
