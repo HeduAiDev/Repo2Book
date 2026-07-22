@@ -1,0 +1,443 @@
+{
+  "chapter": "ch11",
+  "title": "指针算术的逆向工程:PtrAnalysis 把 addptr 链还原成 stride/offset",
+  "kind": "deep",
+  "skip_impl": true,
+  "one_line": "深挖 TritonToStructured::PtrAnalysis 的核心算法上半:visitOperand 递归分派器如何在 tt.addptr 定义链上做前向数据流传播,把散落在 make_range/splat/broadcast/mul/add 里的地址算术,逐维还原成一份 (per-dim stride/shape) + 标量 offset + base source 的 PtrState;下半(落到 memref/reinterpret_cast、BlockPtrAnalysis)交 ch12。",
+  "boundary_with_ch10": {
+    "ch10_already_covered": [
+      "visitOperand 分派器的存在与它是整个逆向的入口(ch10 一句话概述 @PtrAnalysis.cpp:L1277)",
+      "addState 的直觉版三条(逐维 stride 相加 / offset 相加 / source 取非空)",
+      "make_range→stride=1、splat→stride=0 的直觉结论",
+      "一个 1D add_kernel 的 x_ptr+(pid*BLOCK+arange(0,BLOCK)) worked example",
+      "18 趟 triton_adapter 管线全景、namedOps 语义(别把逐元素 arith 摊成 linalg.generic)"
+    ],
+    "ch11_increment": [
+      "m3 visitOperandAddptr 逐行:addptr=拆 ptr 子状态+offset 子状态,再 addState 合并;source 缺失即 failure",
+      "m4 addState 完整代数:不是简单逐维相加,而是按 dimIndex 归并 + shape 兼容性校验(isMultiple)+ 维拆分(min/div shape)+ source 唯一性 + shouldLinearize 传播",
+      "m5 mulState/subState 的 scalar×tensor 唯一支持形态与 swap 归一",
+      "m6 make_range→stride 的精确公式 stride=(end-start+n-1)/n 及其 !=1 保守失败",
+      "m8 一条真实 2D 指针链(matmul b_ptrs)走完整个 visitOperand 递归树的前向传播",
+      "m9 失败/保守路径:visitOperand 认不出算子/踩 LoadOp/FPToSIOp/入参 block-arg 时的 failure 语义,以及 MemOpConverter 拿到 failure 后 returns oldPtr、shouldLinearize=false 的落点"
+    ],
+    "rule": "凡与 ch10 重叠(分派器存在性、直觉版结论、1D 例)一律用 markdown 链接回指 ch10 对应节,不重新内嵌同一段源码;ch11 只内嵌 ch10 未逐行展开的函数体。"
+  },
+  "code_spine": [
+    "third_party/ascend/lib/TritonToStructured/MemOpConverter.cpp:L343-L365  (入口:每个 load/store 的 ptr 操作数进 PtrAnalysis;失败即回退 oldPtr)",
+    "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L1277-L1356  (visitOperand 递归分派器:缓存命中→scalar→pointer→按 defining-op 分派→失败/保守分支)",
+    "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L234-L280   (visitOperandAddptr:拆 ptr/offset 两个子 PtrState,校验 source,再 addState)",
+    "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L764-L797   (visitOperandMakeRange:stride=(end-start+n-1)/n,!=1 失败;叶子状态)",
+    "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L869-L930   (visitOperandSplat:标量源→全零 stride 铺满各维;非标量拒绝)",
+    "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L932-L968   (visitOperandExpandDims:在 axis 处插入零 stride/oriShape=1 的维,其余维 dimIndex 右移)",
+    "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L799-L867   (visitOperandBroadcast:把 src=1 的维 shape 加宽到 dst;stride 不动)",
+    "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L403-L461   (mulState:仅一侧标量;逐维 stride×标量 offset)",
+    "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L497-L592   (addState:核心代数——dimIndex 归并 + shape 兼容 + 维拆分 + offset 相加 + source 取非空)",
+    "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L208-L232   (normalizeState:合并相邻零 stride 维、剔除多余 oriShape=1 的维)"
+  ],
+  "key_classes": [
+    {
+      "name": "PtrAnalysis",
+      "file": "third_party/ascend/include/TritonToStructured/PtrAnalysis.h:L101-L177",
+      "responsibility": "指针逆向的驱动器:持有 knownPtrs(Value→PtrState 缓存)与 ptrMap(重写映射);对外入口 visitOperand(递归解析任意 Value),内部按算子类型分派到 visitOperand{Addptr,Mul,Sub,MakeRange,Broadcast,Splat,ExpandDims,ConstSplat,ExtSI,Rem,Div,Add}。构造参数 optimizeDynamicOffset 决定 rem/div 前动态 offset 能否靠 tt.divisibility 注解放行。"
+    },
+    {
+      "name": "PtrState",
+      "file": "third_party/ascend/include/TritonToStructured/PtrAnalysis.h:L52-L99",
+      "responsibility": "一个张量指针的分析结果:stateInfo(每维 stride/shape/dimIndex 的向量)、sizes(原始逐维形状)、source(base 指针)、offset(标量整型偏移),外加 block_ptr 专用的 order/dimOffsets 与 permute/linearize 标志。核心代数 addState/mulState/subState 都是 PtrState 的成员——两个子状态合成一个。"
+    },
+    {
+      "name": "StateInfo",
+      "file": "third_party/ascend/include/TritonToStructured/PtrAnalysis.h:L41-L50",
+      "responsibility": "PtrState.stateInfo 的元素:一维上的 (stride, shape, dimIndex)。stride/shape 是 OpFoldResult(可编译期常量 attr,也可运行期 Value);dimIndex 记录该条目属于原张量的哪一维——归并/拆分算法全靠 dimIndex 对齐。"
+    },
+    {
+      "name": "MemOpTransformer",
+      "file": "third_party/ascend/lib/TritonToStructured/MemOpConverter.cpp:L343",
+      "responsibility": "TritonToStructured pass 里 load/store 的重写驱动:createNewPtr 对 memory op 的指针操作数起一个 PtrAnalysis 实例、调 visitOperand;成功则据 PtrState 生成结构化访存,失败则原样返回 oldPtr(留给 mask/discrete 回退路径)。是 PtrAnalysis 的真实调用点。"
+    }
+  ],
+  "data_flow": [
+    "1. TritonToStructured pass 遍历到一个 tt.load/tt.store,MemOpTransformer::createNewPtr 拿到它的指针操作数 oldPtr(MemOpConverter.cpp:L343)。",
+    "2. 构造 PtrAnalysis(optimizeDynamicOffset),调 ptrAnalysis.visitOperand(oldPtr, ptrState, ...)(MemOpConverter.cpp:L352)。",
+    "3. visitOperand(PtrAnalysis.cpp:L1277)沿 oldPtr 的 SSA 定义链向上递归:先查 knownPtrs 缓存,再判 operandIsScalar / PointerType,否则按 defining-op 类型分派。",
+    "4. 叶子:make_range 产 (stride=1,shape=n) 的一维状态;splat(标量) 产全零 stride;block-arg 指针/整型经 initStateByPointer/initStateByScalar 产 source-only / offset-only 状态。",
+    "5. 内节点:mul→mulState(逐维 stride×标量);add→addState(逐维归并);broadcast→加宽 src=1 的维;expand_dims→插入零 stride 维;rem/div→按除数把维拆成 contiguous/非 contiguous 段。",
+    "6. 根:addptr→visitOperandAddptr,把 ptr 子状态(带 source)与 offset 子状态 addState 成最终 PtrState(PtrAnalysis.cpp:L279)。",
+    "7. 每步末尾 updatePtrState→normalizeState 合并相邻零 stride 维、消去多余 oriShape=1 维,保持 stateInfo 规范形。",
+    "8. 回到 createNewPtr:成功→据 PtrState.stateInfo 造结构化访存并记 knownPtrs;失败→ptrState.shouldLinearize=false 且 return oldPtr(MemOpConverter.cpp:L357-L359),交给后续 mask/discrete 回退(ch12/ch13 主题)。"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "third_party/ascend/include/TritonToStructured/PtrAnalysis.h",
+      "lines": "L41-L64",
+      "what": "StateInfo 与 PtrState 的状态词汇——读者理解全章的地基",
+      "code": "struct StateInfo {\n    OpFoldResult stride;\n    OpFoldResult shape;  // rem value\n    size_t dimIndex;\n\n    StateInfo() : dimIndex(0) {}\n    StateInfo(OpFoldResult stride, OpFoldResult shape, size_t dimIndex = 0)\n        : stride(stride), shape(shape), dimIndex(dimIndex) {}\n    void dump() const;\n};\n\nstruct PtrState {\n    SmallVector<StateInfo> stateInfo;  // shape info when load, maintained with visitOps\n    SmallVector<OpFoldResult> sizes;    // original shape, maintained with visitOps\n    SmallVector<size_t> permuteIds;\n    SmallVector<size_t> order;   // the order of the original data format, only used for block_ptr\n    SmallVector<OpFoldResult> dimOffsets; // the offsets per dimension, only used for block_ptr\n\n    Value source;                // base address (ptr), maintained with visitOps\n    OpFoldResult offset;        // scalar offset (int), maintained with visitOps\n\n    // whether the record needs to be processed in the current pass, when ignore is true,\n    // it indicates that this scenario should not be processed within the current pass\n    bool shouldLinearize = false;",
+      "elide": [
+        "紧随其后的 isPermuted 标志与一批成员方法声明(isEmpty/isScalar/hasSource/isBlockPtr/mulState/subState/addState/createAddPtrOp 等)见 PtrAnalysis.h:L65-L99;permuteIds/order/dimOffsets 是 block_ptr(ch12)与 permute 分析(supporting)专用,ch11 主线只用 stateInfo/sizes/source/offset/shouldLinearize。"
+      ]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp",
+      "lines": "L1280-L1355",
+      "what": "visitOperand 递归分派器全貌——ch11 逐行展开(ch10 只给了它的存在)",
+      "code": "    if (knownPtrs.find(operand) != knownPtrs.end()) {\n        state = knownPtrs.lookup(operand);\n        return success();\n    }\n\n    if (operandIsScalar(operand)) {\n        return initStateByScalar(operand, state, loc, builder);\n    }\n\n    if (isa<triton::PointerType>(operand.getType())) {\n        return initStateByPointer(operand, state, loc, builder);\n    }\n\n    if (auto op = operand.getDefiningOp<arith::AddIOp>()) {\n        return visitOperandAdd(op, state, loc, builder);\n    } else if (auto op = operand.getDefiningOp<arith::MulIOp>()) {\n        return visitOperandMul(op, state, loc, builder);\n    } else if (auto op = operand.getDefiningOp<arith::SubIOp>()) {\n        return visitOperandSub(op, state, loc, builder);\n    } else if (auto op = operand.getDefiningOp<triton::MakeRangeOp>()) {\n        return visitOperandMakeRange(op, state, loc, builder);\n    } else if (auto op = operand.getDefiningOp<triton::BroadcastOp>()) {\n        return visitOperandBroadcast(op, state, loc, builder);\n    } else if (auto op = operand.getDefiningOp<triton::SplatOp>()) {\n        return visitOperandSplat(op, state, loc, builder);\n    } else if (auto op = operand.getDefiningOp<triton::ExpandDimsOp>()) {\n        return visitOperandExpandDims(op, state, loc, builder);\n    } else if (auto op = operand.getDefiningOp<triton::AddPtrOp>()) {\n        return visitOperandAddptr(op, state, loc, builder);\n    } else if (auto op = operand.getDefiningOp<arith::ConstantOp>()) {\n        return visitOperandConstSplat(op, state, loc, builder);\n    } else if (auto op = operand.getDefiningOp<arith::RemSIOp>()) {\n        return visitOperandRem(op, state, loc, builder);\n    } else if (auto op = operand.getDefiningOp<arith::DivSIOp>()) {\n        return visitOperandDiv(op, state, loc, builder);\n    } else if (auto op = operand.getDefiningOp<arith::ExtSIOp>()) {\n        return visitOperandExtSI(op, state, loc, builder);\n    } else if (auto op = operand.getDefiningOp<triton::LoadOp>()) {\n        LLVM_DEBUG({\n            op.emitRemark(\"TritonToStructured: Invalid dynamic offset\"\n                        \"The load operation's offset cannot be derived from another load result.\");\n        });\n        return failure();\n    } else if (auto op = operand.getDefiningOp<arith::FPToSIOp>()) {\n        LLVM_DEBUG({\n            op.emitWarning(\"IllegalTypeConversionInAddressCalculation\"\n                        \"float-to-int precision conversion is not supported during address computation.\");\n            llvm::dbgs() << \"Operand: \\n\";\n            operand.dump();\n            llvm::dbgs() << \"----------------------------------------------\\n\";\n        });\n        return failure();\n    } else if (!operand.getDefiningOp()) {\n        if (!knownPtrs.contains(operand)) {\n            LLVM_DEBUG({\n                llvm::dbgs() << \"TritonToStructured: Pointer analysis is not supported for input parameters\\n\";\n            });\n            return failure();\n        }\n\n        // This operand must be an iter-arg of an inner-loop in a multiple-level\n        // nested loop, which means its PtrState must have already been populated\n        // during rewriteForOp of the parent loop.\n        state = knownPtrs[operand];\n        return success();\n    } else {\n        auto op = operand.getDefiningOp();\n        LLVM_DEBUG({\n            op->emitWarning(\"TritonToStructured: encountered addptr operand produced by an unsupported operation\");\n            llvm::dbgs() << \"Operand: \\n\";\n            operand.dump();\n            llvm::dbgs() << \"----------------------------------------------\\n\";\n        });\n        return failure();\n    }\n    return success();",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp",
+      "lines": "L250-L279",
+      "what": "visitOperandAddptr 主体:拆 ptr 子状态 + offset 子状态,校验 source 后 addState",
+      "code": "    PtrState ptrState;\n    if (visitOperand(addptrOp.getPtr(), ptrState, addptrOp.getLoc(), builder)\n            .failed()) {\n        return failure();\n    }\n\n    PtrState offsetState;\n    if (visitOperand(addptrOp.getOffset(), offsetState, addptrOp.getLoc(),\n                     builder)\n            .failed()) {\n        return failure();\n    }\n\n    LLVM_DEBUG({\n        llvm::dbgs() << \"----------------------------------------------\\n\";\n        llvm::dbgs() << \"Before visiting addptr operands: \\n\";\n        llvm::dbgs() << \"PtrState: \\n\";\n        ptrState.dump();\n        llvm::dbgs() << \"OffsetState: \\n\";\n        offsetState.dump();\n        llvm::dbgs() << \"----------------------------------------------\\n\";\n    });\n\n    if (!ptrState.source) {\n        LLVM_DEBUG({\n            addptrOp.emitError(\"ptr field should provide source / base pointer\");\n        });\n        return failure();\n    }\n    return state.addState(ptrState, offsetState, addptrOp, builder);",
+      "elide": [
+        "函数开头(L238-L249)先断言 state.isEmpty()(每个子状态必须从空开始),否则 emitError+failure;此处省略只保留分析主体。"
+      ]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp",
+      "lines": "L520-L583",
+      "what": "addState 核心代数:按 dimIndex 归并、shape 兼容性校验、维拆分、offset 相加、source 取非空",
+      "code": "    SmallVector<StateInfo> newStateInfo;\n    auto lIt = lhsState.stateInfo.begin();\n    auto rIt = rhsState.stateInfo.begin();\n    while (lIt != lhsState.stateInfo.end() && rIt != rhsState.stateInfo.end()) {\n        if (lIt->dimIndex != rIt->dimIndex) {\n            auto newInfo = lIt->dimIndex < rIt->dimIndex ? *lIt++ : *rIt++;\n            newStateInfo.emplace_back(newInfo);\n            continue;\n        }\n        if (!isMultiple(lIt->shape, rIt->shape) &&\n            !isMultiple(rIt->shape, lIt->shape)) {\n            LLVM_DEBUG({\n                llvm::dbgs() << \"LHS PtrState: \\n\";\n                lhsState.dump();\n                llvm::dbgs() << \"RHS PtrState: \\n\";\n                rhsState.dump();\n                llvm::dbgs() << \"----------------------------------------------\\n\";\n            });\n            LLVM_DEBUG({\n                op->emitError(\"PtrAnalysis: the add operation have incompatible sizes\");\n            });\n            return failure();\n        }\n\n        auto newShape = minOpFoldResult(lIt->shape, rIt->shape, loc, builder);\n        if ((isLess(newShape, lIt->shape) && !isZero(lIt->stride) ||\n            isLess(newShape, rIt->shape) && !isZero(rIt->stride))) {\n            LLVM_DEBUG({\n                llvm::dbgs() << \"LHS PtrState: \\n\";\n                lhsState.dump();\n                llvm::dbgs() << \"RHS PtrState: \\n\";\n                rhsState.dump();\n                llvm::dbgs() << \"----------------------------------------------\\n\";\n            });\n            LLVM_DEBUG({\n                op->emitError(\"PtrAnalysis: the add operation have incompatible sizes.\"\n                            \"Valid dimensions are split.\");\n            });\n            return failure();\n        }\n\n        auto newStride = addOpFoldResult(lIt->stride, rIt->stride, loc, builder);\n        newStateInfo.emplace_back(newStride, newShape, lIt->dimIndex);\n\n        if (isEqual(lIt->shape, newShape))  ++lIt;\n        else    lIt->shape = divOpFoldResult(lIt->shape, newShape, loc, builder);\n        if (isEqual(rIt->shape, newShape))  ++rIt;\n        else    rIt->shape = divOpFoldResult(rIt->shape, newShape, loc, builder);\n    }\n\n    while (rIt != rhsState.stateInfo.end()) {\n        newStateInfo.push_back(*rIt++);\n    }\n    while (lIt != lhsState.stateInfo.end()) {\n        newStateInfo.push_back(*lIt++);\n    }\n\n    auto newSource = source = lhsState.source ? lhsState.source : rhsState.source;\n    auto newOffset = addOpFoldResult(lhsState.offset, rhsState.offset, loc, builder);\n    auto newShouldLinearize = lhsState.shouldLinearize || rhsState.shouldLinearize;\n    auto newSizes = lhsState.sizes;\n\n    updatePtrState(newStateInfo, newSizes, newSource,\n        newOffset, loc, builder, newShouldLinearize);",
+      "elide": [
+        "函数前导(L507-L518)两道前置校验:this 必须 isEmpty、lhsState.isSameSizeAs(rhsState)(原始 sizes 必须逐维一致),否则 failure;末尾(L585-L591)是 LLVM_DEBUG dump + return success()。"
+      ]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp",
+      "lines": "L437-L460",
+      "what": "mulState:swap 归一后逐维 stride×标量 offset;两侧标量则 offset×offset",
+      "code": "    PtrState const *lhs = &lhsState;\n    PtrState const *rhs = &rhsState;\n\n    if (!rhs->isScalar() && lhs->isScalar()) {\n        std::swap(lhs, rhs);\n    }\n\n    SmallVector<StateInfo> newStateInfo;\n    for(auto info : lhs->stateInfo) {\n        OpFoldResult newStride = mulOpFoldResult(info.stride, rhs->offset, loc, builder);\n        newStateInfo.emplace_back(newStride, info.shape, info.dimIndex);\n    }\n\n    auto newOffset = mulOpFoldResult(lhsState.offset, rhsState.offset, loc, builder);\n    updatePtrState(newStateInfo, lhs->sizes, lhs->source,\n                   newOffset, loc, builder, lhs->shouldLinearize);\n\n    LLVM_DEBUG({\n        llvm::dbgs() << \"After mulState: \\n\";\n        this->dump();\n        llvm::dbgs() << \"----------------------------------------------\\n\";\n    });\n\n    return success();",
+      "elide": [
+        "前导(L413-L435)三道守卫:this 必须 isEmpty;两侧都不能 hasSource(乘 base 指针无意义→failure);两侧不能都非标量(只支持 tensor×scalar→failure)。这三条正是 mulState 的适用边界。"
+      ]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp",
+      "lines": "L474-L494",
+      "what": "subState:两侧不得都带 source、rhs 必须标量;offset 相减,stateInfo 沿用 lhs",
+      "code": "    if (lhsState.hasSource() && rhsState.hasSource()) {\n        LLVM_DEBUG({\n            op->emitError(\"PtrAnalysis: do not support both sides have base pointers in sub\");\n        });\n        return failure();\n    }\n\n    if (!rhsState.isScalar()) {\n        LLVM_DEBUG({\n            op->emitError(\n                \"PtrAnalysis: only support sub when one of \"\n                \"them represents a scalar\");\n        });\n        return failure();\n    }\n\n    auto newOffset = subOpFoldResult(lhsState.offset, rhsState.offset, loc, builder);\n    updatePtrState(lhsState.stateInfo, lhsState.sizes, lhsState.source,\n                   newOffset, loc, builder, lhsState.shouldLinearize);\n\n    return success();",
+      "elide": [
+        "前导(L467-L472)this 必须 isEmpty 的守卫已略。注意 sub 与 mul 的不对称:sub 只允许 rhs 是标量(减号不可交换),而 mul 允许任一侧是标量(靠 swap 归一)。"
+      ]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp",
+      "lines": "L774-L796",
+      "what": "visitOperandMakeRange:stride 精确公式与 !=1 保守失败——本章核心公式",
+      "code": "    auto shape = cast<ShapedType>(rangeOp.getType()).getShape();\n\n    auto start = rangeOp.getStart();\n    auto end = rangeOp.getEnd();\n    auto stride = (end - start + shape[0] - 1) / shape[0];\n    if (stride != 1) {\n        LLVM_DEBUG({\n            rangeOp.emitError(\"PtrAnalysis: make_range op with stride != 1 is not supported\");\n        });\n        return failure();\n    }\n\n    auto infoStride = builder.getIndexAttr(stride);\n    auto size = builder.getIndexAttr(shape[0]);\n    auto offset = builder.getIndexAttr(start);\n\n    SmallVector<StateInfo> stateInfo;\n    SmallVector<OpFoldResult> sizes;\n    stateInfo.emplace_back(infoStride, size);\n    sizes.emplace_back(size);\n\n    state.updatePtrState(stateInfo, sizes, nullptr, offset, loc, builder);\n    return success();",
+      "elide": [
+        "前导(L767-L772)this 必须 isEmpty 已略。注意 make_range 是叶子:source=nullptr(无 base),offset=start,单维 stateInfo=(stride,end)。"
+      ]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp",
+      "lines": "L899-L922",
+      "what": "visitOperandSplat:标量源→各维零 stride 铺满(offset/source 从子状态继承)",
+      "code": "    if (!state.isScalar()) {\n        LLVM_DEBUG({\n            splatOp.emitRemark(\"PtrAnalysis: splat source should be scalar\");\n        });\n        return failure();\n    }\n\n    SmallVector<StateInfo> newStateInfo;\n    SmallVector<OpFoldResult> newSizes;\n    auto zeroAttr = builder.getIndexAttr(0);\n    if (isa<IntegerType, IndexType, triton::PointerType>(src.getType())) {\n        for (size_t i = 0; i < dstShape.size(); ++i) {\n            auto currentSize = builder.getIndexAttr(dstShape[i]);\n            newSizes.emplace_back(currentSize);\n            newStateInfo.emplace_back(zeroAttr, currentSize, i);\n        }\n    } else {\n        LLVM_DEBUG({\n            splatOp.emitRemark(\"PtrAnalysis: unsupported splat pattern\");\n        });\n        return failure();\n    }\n    state.updatePtrState(newStateInfo, newSizes, state.source,\n                         state.offset, loc, builder, state.shouldLinearize);",
+      "elide": [
+        "前导(L873-L897)先 isEmpty 守卫、visitOperand(src) 递归得到标量子状态、DEBUG dump 已略。关键:splat 把标量(整型/索引/指针)沿每一维铺成 stride=0——凡 base 指针都是靠 splat 从标量 !tt.ptr 变成 source,offset/source 原样从子状态取。"
+      ]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp",
+      "lines": "L848-L865",
+      "what": "visitOperandBroadcast:把 src=1 的维 shape 加宽到 dst;stride 不动",
+      "code": "    for (size_t i = 0; i < dstShape.size(); ++i) {\n        newSizes.emplace_back(builder.getIndexAttr(dstShape[i]));\n        if (srcShape[i] == dstShape[i]) {\n            continue;\n        } else if (srcShape[i] < dstShape[i] && srcShape[i] == 1) {\n            for (auto &info : newStateInfo) {\n                if (info.dimIndex != i)  continue;\n                info.shape = builder.getIndexAttr(dstShape[i]);\n            }\n        } else {\n            LLVM_DEBUG({\n                broadcastOp.emitRemark(\"unexpected dimensions used in broadcast\");\n            });\n            return failure();\n        }\n    }\n    state.updatePtrState(newStateInfo, newSizes, state.source,\n                         state.offset, loc, builder, state.shouldLinearize);",
+      "elide": [
+        "前导(L803-L847)先 isEmpty、dst 必须 ShapedType、src/dst 同 rank、visitOperand(src) 递归。broadcast 只在 stateInfo 里改被广播维的 shape,不改 stride——因此一个被 broadcast 出来的维,其 stride 保持原样(通常是 expand_dims 插进来的 0),偏移沿该维恒为 0。"
+      ]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp",
+      "lines": "L209-L228",
+      "what": "normalizeState:合并相邻零 stride 维、剔除多余 oriShape=1 维——保持 stateInfo 规范形",
+      "code": "    SmallVector<StateInfo> newStateInfo;\n    auto zeroAttr = builder.getIndexAttr(0);\n\n    // merge continuous zero strides\n    // e.g., stride [0, 0, 1] shape [4, 32, 16]  --> stride [0, 1] shape [128, 16]\n    for (auto it = this->stateInfo.begin(); it != this->stateInfo.end(); ++it) {\n        while (it != this->stateInfo.end() && isZero(it->stride)) {\n            auto newShape = it->shape;\n            auto dimIndex = it->dimIndex;\n            for (++it; it != this->stateInfo.end() && isZero(it->stride)\n                   && it->dimIndex == dimIndex; ++it) {\n                newShape = mulOpFoldResult(newShape, it->shape, loc, builder);\n            }\n            newStateInfo.emplace_back(zeroAttr, newShape, dimIndex);\n        }\n        if (it == this->stateInfo.end())    break;\n        // if the info is the only one with oriSize 1 in this dimension, skip it\n        // e.g., stride [0, 1] shape [1, 128] sizes [1, 128] do not delete the first info\n        if (isOne(it->shape) && !isOne(sizes[it->dimIndex]))    continue;\n        newStateInfo.emplace_back(*it);",
+      "elide": [
+        "末尾(L231-L232)`this->stateInfo = newStateInfo;` 回写。updatePtrState 每次都调它,所以上文各 visitOperand 里 emplace 出的 stateInfo 都会先规范化再落地。"
+      ]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToStructured/MemOpConverter.cpp",
+      "lines": "L343-L359",
+      "what": "真实调用入口:每个 load/store 的 ptr 进 PtrAnalysis;失败即回退 oldPtr、shouldLinearize=false",
+      "code": "Value MemOpTransformer::createNewPtr(Value oldPtr,\n                                     const Location loc, PatternRewriter &rewriter) {\n    TritonToStructured::PtrAnalysis ptrAnalysis(optimizeDynamicOffset);\n\n    LLVM_DEBUG({\n        llvm::dbgs() << \"----------------------------------------------\\n\";\n        llvm::dbgs() << \"PtrAnalysis: analyzing load/store's ptr.\\n\";\n    });\n\n    if (ptrAnalysis.visitOperand(oldPtr, ptrState, loc, rewriter).failed()) {\n        ptrState.shouldLinearize = false;\n        LLVM_DEBUG({\n            InFlightDiagnostic diag =\n            emitWarning(loc) << \"PtranAlysis: failed to analyze load/store ptr.\";\n        });\n        return oldPtr;\n    }",
+      "elide": [
+        "L360 起是成功路径:据 stateInfo 反推缺失 stride(shape=1 且 stride=0 的尾维补成右侧累积尺寸)、再造结构化访存——那部分是 ch12 的 memref 落地主题,ch11 只讲到 failure 分叉这一步。"
+      ]
+    }
+  ],
+  "mechanisms": [
+    {
+      "id": "m1-ptrstate-vocab",
+      "name": "PtrState / StateInfo:指针分析的状态词汇",
+      "kind": "dataflow",
+      "source_anchors": [
+        "third_party/ascend/include/TritonToStructured/PtrAnalysis.h:L41-L99",
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L161-L193"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "note": "读者必须先看懂 PtrState 携带什么:stateInfo(每维 stride/shape/dimIndex 向量)、sizes(原始逐维形状)、source(base 指针)、offset(标量整型)、shouldLinearize。以及三个谓词:isEmpty(空初态)、isScalar(所有 stride 静态为 0 且有 offset/source)、hasSource。这是全章一切代数的对象。图:一张 PtrState 结构解剖图(某个 2D 指针的 stateInfo/sizes/source/offset 各槽填什么)。"
+    },
+    {
+      "id": "m2-visitoperand-dispatch",
+      "name": "visitOperand 递归分派器:沿 SSA 定义链前向传播",
+      "kind": "algorithm",
+      "source_anchors": [
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L1277-L1356"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "ch10 只指出它存在;ch11 逐行:①knownPtrs 缓存命中直接返回(循环 iter-arg 复用)②operandIsScalar→initStateByScalar ③PointerType→initStateByPointer ④按 defining-op 分派到 12 个能产状态的 visitOperand*(Add/Mul/Sub/MakeRange/Broadcast/Splat/ExpandDims/AddPtr/ConstSplat/Rem/Div/ExtSI)⑤LoadOp/FPToSIOp 两个显式保守失败 ⑥无 defining-op 的裸入参→failure(除非已在 knownPtrs)⑦其余 unsupported op→failure。计数已核:共 14 个 getDefiningOp<> 分支,其中 12 产状态、2 保守失败。图:一张分派决策树。"
+    },
+    {
+      "id": "m3-visitoperand-addptr",
+      "name": "visitOperandAddptr:addptr = 拆 ptr 子状态 + offset 子状态,再 addState",
+      "kind": "algorithm",
+      "source_anchors": [
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L234-L280"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "对 addptr 的两个操作数 getPtr()/getOffset() 各起一个空 PtrState 递归 visitOperand;要求 ptr 侧子状态必须带 source(!ptrState.source→failure,'ptr field should provide source / base pointer');最后 addState(ptrState, offsetState) 合成。这是整棵递归树的根,ch10 只一句话概述,此处逐行。worked example:接 m8 的 2D 链末端。"
+    },
+    {
+      "id": "m4-addstate-algebra",
+      "name": "addState 完整代数:dimIndex 归并 + shape 兼容校验 + 维拆分 + offset 相加 + source 取非空",
+      "kind": "algorithm",
+      "source_anchors": [
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L497-L592"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "ch10 直觉版只说'逐维 stride 相加'。真相远不止:①前置 isSameSizeAs 校验(原始 sizes 逐维一致)②双指针沿两侧 stateInfo 归并:dimIndex 不等则取小的那维原样推进;相等则要求 shape 互为倍数(isMultiple),否则 incompatible→failure ③newShape=min(两 shape);若某侧被 min 缩小且其 stride!=0→failure('Valid dimensions are split')④newStride=两 stride 相加 ⑤谁的 shape 等于 newShape 谁前进,否则该侧 shape/=newShape(维拆分,支持一维被拆成 contiguous+broadcast 两段)⑥收尾把剩余维 push ⑦source=lhs?lhs:rhs(非空唯一性由此保证——两侧都带 source 的情形被 addptr 的调用结构排除)⑧offset 相加、shouldLinearize 取或。图:两条 stateInfo 归并的对齐动画(dimIndex 对齐 + shape 倍数拆分)。"
+    },
+    {
+      "id": "m5-mulstate-substate",
+      "name": "mulState / subState:scalar×tensor 的唯一支持形态",
+      "kind": "algorithm",
+      "source_anchors": [
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L403-L461",
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L463-L495"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "mulState 三守卫:两侧都不能 hasSource(乘 base 无意义);两侧不能都非标量;swap 使 rhs 为标量;然后 lhs 每维 stride×rhs.offset,offset×offset。这解释了'x_index*stride'为什么把 make_range 的 stride=1 变成真正的 stride。subState 不对称:只允许 rhs 标量(减不可交换),offset 相减、stateInfo 沿用 lhs。worked example:m8 中 %21=%19*splat(%arg4) 一步。"
+    },
+    {
+      "id": "m6-makerange-stride-formula",
+      "name": "make_range → stride 的精确公式 stride=(end-start+n-1)/n",
+      "kind": "algorithm",
+      "source_anchors": [
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L764-L797"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "ch10 直觉结论是 stride=1。真实是天花板除法 stride=(end-start+n-1)/n(整型除),对 make_range(0,n) 恒为 1;凡结果!=1 立即保守失败('make_range op with stride != 1 is not supported')。叶子状态:source=nullptr、offset=start、单维 stateInfo=(stride, size=shape[0]=n 结果长度,仅 start=0 时 =end)、sizes=[n]。worked example:m8 中 %10=make_range(0,256)、%14=make_range(0,64),各得 stride=1。理论:该式=ceil((end-start)/n),要求 range 步长恰好铺满 n 个元素、步幅为 1 才可结构化。"
+    },
+    {
+      "id": "m7-shape-ops",
+      "name": "splat / broadcast / expand_dims:改形状不改基向量",
+      "kind": "dataflow",
+      "source_anchors": [
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L869-L930",
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L799-L867",
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L932-L968"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "note": "三个纯形状算子:splat(标量→各维 stride=0 铺满;base 指针正是靠 splat 从标量 !tt.ptr 变成 source);broadcast(把 src=1 的维 shape 加宽到 dst,stride 不动→被广播维偏移恒 0);expand_dims(在 axis 处插入 stride=0/oriShape=1 的新维,其余维 dimIndex 右移)。三者共同点:不改 offset/source,只改 stateInfo 的形状与维数。图:一张 make_range→expand_dims→broadcast 的形状演化条带。"
+    },
+    {
+      "id": "m8-forward-prop-2d-chain",
+      "name": "一条真实 2D 指针链的完整前向传播(matmul b_ptrs)",
+      "kind": "algorithm",
+      "source_anchors": [
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L1277-L1356",
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L497-L592"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "选 pin 内 lit 夹具 simplify_for_loop.mlir @matmul_kernel 的 b_ptrs 子链(%14→%27):make_range(0,64) → expand_dims(axis=1) → *splat(%arg4) → broadcast(→64x256);另一支 make_range(0,256) → (…rem 1024) → expand_dims(axis=0) → broadcast;两支 addi 合成 offset,再 addptr(splat(%arg1))。走完整棵 visitOperand 递归树,PtrState 逐节点演化到 source=%arg1、stateInfo=[(stride=%arg4,64,dim0),(stride=1,256,dim1)]、offset=rem(%9,1024)。这正是行主序 2D 块指针 base + row*stride_bk + col*1 的结构化还原。见 worked_example 字段的逐节点 state 表。图:递归树 + 每节点 PtrState 快照。"
+    },
+    {
+      "id": "m9-failure-conservative",
+      "name": "失败 / 保守路径:认不出算子时的 failure 语义与落点",
+      "kind": "protocol",
+      "source_anchors": [
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L1317-L1354",
+        "third_party/ascend/lib/TritonToStructured/MemOpConverter.cpp:L352-L359"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "note": "ch10 m7 只泛说'保守失败'。ch11 落到具体触发点:①LoadOp 作 offset 来源(offset 依赖另一 load 结果,编译期不可知)②FPToSIOp(浮点转整参与地址计算,精度不可控)③非指针、非标量的裸 block-arg(如未 populate 进 knownPtrs 的张量 iter-arg,`!operand.getDefiningOp() && !knownPtrs.contains`,\"input parameters not supported\")——**注意:指针 block-arg 反而是成功入口**,先被 isa<PointerType> 命中走 initStateByPointer→source=该指针/offset=0(见 worked example %arg1),不在此列;④任何其余 unsupported defining-op。这些都 return failure()。failure 顺着递归一路冒泡到 MemOpTransformer::createNewPtr:置 ptrState.shouldLinearize=false 并 return oldPtr——即放弃结构化、原样留下 tt.addptr 链交给 mask/discrete 回退(ch12/ch13 主题)。此外各 visitOperand* 开头还有共性守卫:调用时目标 PtrState 必须 isEmpty,否则内部错误 failure。"
+    },
+    {
+      "id": "m10-normalize-state",
+      "name": "normalizeState:相邻零 stride 维合并、多余单元维剔除",
+      "kind": "algorithm",
+      "source_anchors": [
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L195-L232"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting",
+      "note": "每次 updatePtrState 末尾都调:把连续的、同 dimIndex 的零 stride 维乘并成一维(stride[0,0,1] shape[4,32,16]→stride[0,1] shape[128,16]);对 oriShape=1 且该原始维 sizes 也是 1 的条目才保留(唯一单元维不删),否则跳过。保证 stateInfo 始终是规范形——writer 讲例子时要提醒读者:各 visitOperand 里 emplace 的中间 stateInfo 会先被它规范化再落地。"
+    },
+    {
+      "id": "m11-rem-div-split",
+      "name": "rem / div:按除数把一维拆成 contiguous / 非 contiguous 段(进阶)",
+      "kind": "algorithm",
+      "source_anchors": [
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L1027-L1139",
+        "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L1141-L1261"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting",
+      "note": "remsi/divsi 是取模/整除折叠地址的进阶算子。rhs 必须标量除数;当 offset 动态且非除数倍数时,靠 optimizeDynamicOffset(tt.divisibility 注解)放行,否则保守失败。逐维:stride 是除数倍数→该维置 0(取模抹平);除数是 stride 倍数→把该维按 divisor/stride 拆成 contiguous 段(size=min(divisor/stride, shape))+ 余下非 contiguous 段;都不整除→failure。div 对称地做整除方向的拆分。ch11 只需点到:这是 addState 之外第二类会'拆维'的算子,细节可略讲;worked example 用 parseRem.mlir @kernel_with_rem_safe(1D remsi 安全路径)。"
+    }
+  ],
+  "worked_example": {
+    "fixture": "third_party/ascend/unittest/Conversion/General/TritonAscendAllPass/simplify_for_loop.mlir",
+    "func": "@matmul_kernel",
+    "trace_source": "pin 内 lit 夹具(RUN 经 --triton-to-structured;host 无 CANN/NPU,不跑真实编译器 dump,PtrState 逐节点值由 analyst 依 PtrAnalysis.cpp 算法手工推导,writer/explainer 复核)",
+    "chain": "b_ptrs 子链 %14→%27(行主序 2D 块指针)",
+    "steps": [
+      "%14 = tt.make_range(0,64) : tensor<64xi32>  → visitOperandMakeRange: stride=(64-0+64-1)/64=1 → PtrState{ stateInfo=[(stride=1, shape=64, dim0)], sizes=[64], source=null, offset=0 }",
+      "%19 = tt.expand_dims(%14, axis=1) : →tensor<64x1>  → visitOperandExpandDims: 在 dim1 插入 (0,1,dim1) → stateInfo=[(1,64,dim0),(0,1,dim1)], sizes=[64,1], offset=0",
+      "%20 = tt.splat(%arg4:i32) : →tensor<64x1>  → visitOperandSplat(标量 i32): initStateByScalar 把 %arg4 index-cast 成 offset → stateInfo=[(0,64,dim0),(0,1,dim1)], sizes=[64,1], offset=%arg4, source=null",
+      "%21 = arith.muli(%19,%20)  → mulState: %20 是 scalar(全零 stride),%19 非 scalar → lhs=%19; 每维 stride×%arg4 → stateInfo=[(%arg4,64,dim0),(0,1,dim1)], offset=0*%arg4=0",
+      "%23 = tt.broadcast(%21) : tensor<64x1>→tensor<64x256>  → visitOperandBroadcast: dim1 从 1 加宽到 256(stride 仍 0) → stateInfo=[(%arg4,64,dim0),(0,256,dim1)], sizes=[64,256], offset=0",
+      "%10 = tt.make_range(0,256)  → stride=1 → stateInfo=[(1,256,dim0)], sizes=[256], offset=0",
+      "%12 = arith.addi(tt.splat(%9), %10)  → addState: splat(%9) 给 (0,256,dim0)+offset=%9,与 %10 的 (1,256,dim0) 归并 → stateInfo=[(1,256,dim0)], offset=%9",
+      "%13 = arith.remsi(%12, dense<1024>)  → visitOperandRem(optimize-dynamic-offset=true): 除数 1024;(1,256) 维 divisor 是 stride 倍数、contiguousSize=min(1024,256)=256、nonContiguous=1(不加) → stateInfo=[(1,256,dim0)], offset=rem(%9,1024), shouldLinearize=true",
+      "%22 = tt.expand_dims(%13, axis=0) : →tensor<1x256>  → 在 dim0 插入 (0,1,dim0),原维右移到 dim1 → stateInfo=[(0,1,dim0),(1,256,dim1)], sizes=[1,256], offset=rem(%9,1024)",
+      "%24 = tt.broadcast(%22) : →tensor<64x256>  → dim0 从 1 加宽到 64 → stateInfo=[(0,64,dim0),(1,256,dim1)], sizes=[64,256]",
+      "%25 = arith.addi(%23,%24)  → addState: 逐维归并 dim0:(%arg4)+(0)=%arg4,dim1:(0)+(1)=1 → stateInfo=[(%arg4,64,dim0),(1,256,dim1)], sizes=[64,256], offset=0+rem(%9,1024)=rem(%9,1024)",
+      "%26 = tt.splat(%arg1:!tt.ptr<i8>)  → visitOperandSplat(标量指针): initStateByPointer(%arg1 裸入参)→ source=%arg1,offset=0,空 stateInfo;splat 铺成 stateInfo=[(0,64,dim0),(0,256,dim1)], source=%arg1, offset=0",
+      "%27 = tt.addptr(%26,%25)  → visitOperandAddptr: ptr 子状态=%26(source=%arg1), offset 子状态=%25; addState 合成 → source=%arg1(非空取自 ptr 侧), stateInfo=[(%arg4,64,dim0),(1,256,dim1)], offset=rem(%9,1024), sizes=[64,256]"
+    ],
+    "conclusion": "最终 PtrState 把散落在 12 个算子里的地址算术还原成:base=%arg1、行 stride=%arg4(即 stride_bk,运行期值)、列 stride=1(contiguous)、块内起始 offset=rem(%9,1024)。这正是结构化访存 reinterpret_cast(offset=…, sizes=[64,256], strides=[%arg4,1]) 所需的一切——ch12 把它落到 memref。"
+  },
+  "design_decisions": [
+    {
+      "decision": "指针分析做成沿 SSA 定义链的前向数据流,而非模式匹配固定的 addptr 惯用法",
+      "why": "Triton 前端产的地址算术形态多样(program_id 参与、rem/div 折叠、多维 broadcast),固定模板覆盖不全;递归 visitOperand 让每个算子只需局部定义'我如何变换子状态',组合出任意链",
+      "evidence": "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L1277-L1356"
+    },
+    {
+      "decision": "stride/shape 用 OpFoldResult(编译期 attr 或运行期 Value)而非 int64",
+      "why": "stride 常含运行期量(如 %arg4=stride_bk 是 kernel 入参),必须能携带 Value;静态可折的走 attr 便于 isMultiple/isEqual 等编译期判定",
+      "evidence": "third_party/ascend/include/TritonToStructured/PtrAnalysis.h:L42-L43"
+    },
+    {
+      "decision": "addState 用 dimIndex 双指针归并 + shape 倍数拆分,而非假设两侧维完全对齐",
+      "why": "broadcast/expand_dims 会让两个加数的 stateInfo 维数/维尺寸不一致;按 dimIndex 对齐并允许把一维按倍数拆成两段,才能正确合并'一维恰好是另一维若干倍'的情形",
+      "evidence": "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L523-L568"
+    },
+    {
+      "decision": "分析失败不报错、而是保守回退(shouldLinearize=false + return oldPtr)",
+      "why": "PtrAnalysis 只负责'能结构化的就结构化';认不出的指针链(依赖 load 结果/浮点转换/裸入参)留给下游 mask/discrete 线性化路径处理,pass 不因此中断",
+      "evidence": "third_party/ascend/lib/TritonToStructured/MemOpConverter.cpp:L352-L359"
+    },
+    {
+      "decision": "make_range 只接受 stride==1、rem/div 只接受标量除数且(动态时)需 tt.divisibility 注解",
+      "why": "结构化访存要求可静态推理的规则步幅;非 1 步长或动态除数会破坏 stride/offset 的可折叠性,宁可保守失败也不产错误布局",
+      "evidence": "third_party/ascend/lib/TritonToStructured/PtrAnalysis.cpp:L778-L784"
+    }
+  ],
+  "theory": [
+    "make_range 步幅公式:stride = (end - start + n - 1) / n(整型除)= ceil((end-start)/n)。对 tt.make_range(start,end) 恒有 n=end-start(结果张量长度),故 stride=ceil(n/n)=1;任何'跳着取'的 range 会使 n<end-start 从而 stride>1,被拒。这把'一维 range 是否 unit-stride 连续'化成一次整数判定。",
+    "addState 的维归并复杂度:双指针沿两侧 stateInfo(长度 ≤ rank)线性推进,每步 O(1) 的 OpFoldResult 代数;含一次维拆分时该侧指针不前进但 shape 严格变小(除以 newShape>1),故总步数 O(rank + 拆分次数),拆分次数受 shape 因子分解界定,实际 rank≤3 量级下近似常数。",
+    "为什么 source 唯一性成立:mulState/subState 都禁止两侧同时 hasSource;addState 里两加数唯一可能带 source 的入口是 addptr(ptr 侧带 source、offset 侧不带),故 source=lhs?lhs:rhs 永远只有一侧非空——base 指针在整条链上唯一且只由 splat(标量 !tt.ptr) 或 block-arg 引入。",
+    "前向传播 vs 反向:分析从 memory op 的指针操作数出发、沿 def-use 反方向(向定义)递归,但语义上是把'从 base 到最终地址'的正向算术在 PtrState 上一次性重演——每个算子把子状态确定性地映成父状态,故整条链的 PtrState 是其算子序列的纯函数(不依赖遍历顺序,除 knownPtrs 缓存加速)。"
+  ],
+  "subtraction_plan": {
+    "delete": [],
+    "note": "skip_impl=true:本章为纯 C++ MLIR pass,无精简版(triton-to-linalg 子系统惯例,对齐姊妹篇 ch25/28/30/32/33)。交叉验证走 pin 精确源码逐段 + unittest/Conversion/**/*.mlir lit 夹具(带 RUN+CHECK),不产精简 .py、不伪造编译器 dump。delete 清单为空(无实现可删);must_keep 列 writer/reader 必须讲清的可检测 C++ 符号。",
+    "must_keep": [
+      {
+        "symbol": "PtrAnalysis",
+        "why": "驱动类,全章主角"
+      },
+      {
+        "symbol": "PtrState",
+        "why": "指针分析结果的载体,一切代数的对象"
+      },
+      {
+        "symbol": "StateInfo",
+        "why": "每维 (stride,shape,dimIndex) 的元素类型"
+      },
+      {
+        "symbol": "visitOperand",
+        "why": "递归分派器,逆向的入口与骨架(m2)"
+      },
+      {
+        "symbol": "visitOperandAddptr",
+        "why": "addptr 拆分-合并的根节点(m3)"
+      },
+      {
+        "symbol": "addState",
+        "why": "核心归并代数(m4)"
+      },
+      {
+        "symbol": "mulState",
+        "why": "scalar×tensor 乘法规则(m5)"
+      },
+      {
+        "symbol": "subState",
+        "why": "标量减法规则,与 mul 的不对称(m5)"
+      },
+      {
+        "symbol": "visitOperandMakeRange",
+        "why": "stride 精确公式所在(m6)"
+      },
+      {
+        "symbol": "visitOperandSplat",
+        "why": "base 指针如何从标量变 source(m7)"
+      },
+      {
+        "symbol": "visitOperandBroadcast",
+        "why": "改形不改 stride 的代表(m7)"
+      },
+      {
+        "symbol": "visitOperandExpandDims",
+        "why": "插入零 stride 维(m7)"
+      },
+      {
+        "symbol": "normalizeState",
+        "why": "stateInfo 规范化,解释中间态为何被合并(m10)"
+      },
+      {
+        "symbol": "shouldLinearize",
+        "why": "成功/失败与线性化回退的关键标志(m9)"
+      },
+      {
+        "symbol": "isScalar",
+        "why": "mul/sub/splat 判分支的谓词"
+      },
+      {
+        "symbol": "isMultiple",
+        "why": "addState/rem/div 的 shape 兼容与拆分判定"
+      },
+      {
+        "symbol": "createNewPtr",
+        "why": "PtrAnalysis 的真实调用入口 + 失败回退落点(m9)"
+      }
+    ]
+  },
+  "foreshadow_due": {
+    "埋": [],
+    "回收": [],
+    "note": "bible.py due ch11 返回空(本书 arc-map 至今为空数组)。连贯性靠 markdown 链接:承 ch10《triton_adapter 总览》,启 ch12《落到 memref:BlockPtrAnalysis / reinterpret_cast》。"
+  }
+}
