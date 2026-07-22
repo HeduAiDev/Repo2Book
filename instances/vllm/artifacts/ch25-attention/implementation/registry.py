@@ -53,17 +53,18 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     """
 
     FLASH_ATTN = "flash_attn.FlashAttentionBackend"
-    TRITON_ATTN = (
-        "vllm.v1.attention.backends.triton_attn.TritonAttentionBackend"
-    )
-    FLASHINFER = "vllm.v1.attention.backends.flashinfer.FlashInferBackend"
+    TRITON_ATTN = "triton_attn.TritonAttentionBackend"
+    FLASHINFER = "flashinfer.FlashInferBackend"
     # SUBTRACTED: 真实枚举约二十余项（ROCM_*/XPU_*/各 MLA 后端/FLEX_ATTENTION/TREE_ATTN/
     # CPU_ATTN/TURBOQUANT/...，registry.py:L44-L88）——都是「名字 = 完整类路径字符串」的同构
-    # 条目。本章只保留 FLASH_ATTN（贯穿全章的具体后端，类路径指向本精简版 flash_attn.py 以便
-    # get_class() 真能懒加载到本章的 FlashAttentionBackend）+ 两个代表项。
-    # NOTE: 真实里 FLASH_ATTN 值是 "vllm.v1.attention.backends.flash_attn.
-    # FlashAttentionBackend"；本精简版把 implementation/ 放进 sys.path、值改成可顶层 import 的
-    # "flash_attn.FlashAttentionBackend"，仅为让 get_class() 在 host 真能解析到本章后端类。
+    # 条目。本章只保留 FLASH_ATTN（贯穿全章的具体后端）+ TRITON_ATTN/FLASHINFER 两个代表项
+    # （`_get_backend_priorities` 优先级列表里的候选者）。
+    # NOTE: 真实里三者的值是 "vllm.v1.attention.backends.<mod>.<Backend>" 的完整类路径；本精简版
+    # 把 implementation/ 放进 sys.path，三者的值都改成可顶层 import 的本章缩影模块路径
+    # （flash_attn/triton_attn/flashinfer），使 get_class() 在 host **无 vllm** 时也能懒加载到本章
+    # 的忠实缩影类。这样平台层选后端逻辑对三个候选**都真跑** validate_configuration，
+    # FLASH_ATTN 因「优先级最高 + 合法」而胜出——是被选择逻辑判定选中，而非因竞争者 import 不进来
+    # 而被动剩下（后者会让精简版行为取决于宿主装没装真 vllm、装哪一版，违背自包含定位）。
 
     # Placeholder for third-party/custom backends - must be registered before use.
     # set to None to avoid alias with other backend, whose value is an empty string.

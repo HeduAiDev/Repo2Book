@@ -168,6 +168,38 @@ def test_hopper_auto_selects_flash_attn():
     assert backend is FlashAttentionBackend
 
 
+def test_selection_runs_across_candidates_not_competitor_absence(monkeypatch):
+    """反向守卫：选后端逻辑必须对三个候选（FA/FLASHINFER/TRITON_ATTN）都真跑
+    validate_configuration，FA 是「优先级最高 + 合法」被判定胜出——而非因竞争者 import 不进来
+    被动剩下。做法：先断言前置条件（正常配置 FA 合法且被选中），再把 FA 弄成只支持 sm100 →
+    在 Hopper(9.0) 上非法，断言选择逻辑落到次优的合法候选 FLASHINFER（而非报「无可用后端」或仍返
+    回 FA）。若三个候选没都真跑，此断言无法成立。"""
+    from flashinfer import FlashInferBackend
+
+    _cached_get_attn_backend.cache_clear()
+    CudaPlatform._device_capability = DeviceCapability(9, 0)
+    # 前置条件成立：正常配置下 FA 合法且优先级最高 → 被选中。
+    assert (
+        get_attn_backend(head_size=64, dtype=torch.bfloat16, kv_cache_dtype="auto")
+        is FlashAttentionBackend
+    )
+
+    _cached_get_attn_backend.cache_clear()
+    # 触发条件：把 FA 的能力探针弄成只支持 sm100，Hopper 9.0 → FA 非法。
+    monkeypatch.setattr(
+        FlashAttentionBackend,
+        "supports_compute_capability",
+        classmethod(lambda cls, cap: cap >= DeviceCapability(10, 0)),
+    )
+    # 目标效应：次优的合法候选 FLASHINFER 胜出（Hopper 列表里 FA 之后就是 FLASHINFER）。
+    picked = get_attn_backend(
+        head_size=64, dtype=torch.bfloat16, kv_cache_dtype="auto"
+    )
+    assert picked is FlashInferBackend
+    assert picked is not FlashAttentionBackend
+    _cached_get_attn_backend.cache_clear()  # monkeypatch 自动还原 FA，清缓存避免污染后续用例
+
+
 def test_explicit_invalid_backend_raises():
     _cached_get_attn_backend.cache_clear()
     CudaPlatform._device_capability = DeviceCapability(9, 0)
