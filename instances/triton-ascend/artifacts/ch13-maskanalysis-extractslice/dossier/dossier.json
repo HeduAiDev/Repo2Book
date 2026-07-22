@@ -1,0 +1,194 @@
+{
+  "chapter": "ch13",
+  "title": "边界的语义:MaskAnalysis 把 mask 还原成 extract_slice",
+  "kind": "deep",
+  "skip_impl": true,
+  "pin": "2badfc89e70a9b7a5e88463a116c2feddce4b101",
+  "trace_source": "pin 精确源码(MaskAnalysis.cpp/.h @2badfc89e ~735 行) + pin 内 lit 夹具(unittest/Conversion/**/*.mlir 的 RUN+CHECK 前后对照)作 IR 素材;宿主无 CANN,不伪造编译器 dump",
+
+  "code_spine": [
+    "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L48-L64  runMaskAnalysisImpl:load/store/atomic 有 mask 才进,setInsertionPoint(op) 后 mstate.parse(mask)",
+    "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L719-L731 runMaskAnalysis:按 LoadOp/StoreOp/AtomicRMWOp 三类算子分派到模板 impl",
+    "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L81-L130  MaskState::parse:递归下降——先处理整数标量/循环块参数,再 TypeSwitch 按 mask 表达式的 defining op 分派",
+    "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L560-L582 parseMakeRange:tt.make_range 的叶子——填 start/end/dims[0]=len/offsets[0]=0(强制 stride==1)",
+    "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L612-L661 parseSplat:tt.splat 把标量/布尔铺成张量;splat-as-mask 特判把 i1 标量乘进每维 dim",
+    "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L584-L610 parseBroadcast:tt.broadcast 沿被展维把 dims[i] 改成目标形状",
+    "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L663-L681 parseExpandDims:tt.expand_dims 在 axis 处插入长度 1 的维",
+    "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L440-L558 parseCmp:核心——arith.cmpi(slt/sle/sge/eq/ne)把某一维的 (start,end,scalar) 熔进 (offset,dim)",
+    "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L378-L399 parseAnd:arith.andi 两侧都必须 isMask,交给 minStates 求矩形交",
+    "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L280-L306 minStates:逐维求区间交 [max(off),min(end)),dim=end-off 再 clamp≥0",
+    "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L68-L79   clampToNonNegativeIndex:常量 dim 夹到 max(0,·);非常量原样返回(atomic max/min UT 会挂)",
+    "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L133-L158 getExtractSlice:把 offsets/dims + 全 1 strides 发射成 tensor.extract_slice",
+    "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L180-L195 getSubview:memref 版本——发射 memref.subview,rank 不足处补 offset0/dim1",
+    "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp:L455-L519 消费端:有 mask 分支 mstate.parse→getSubview(src)/getSubview(dst)→memref.copy(ch12 §12.7 指过来的那条分支)"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "third_party/ascend/include/TritonToLinalg/MaskAnalysis.h",
+      "lines": "L50-L104",
+      "what": "MaskState 的五个字段 + 三个判定谓词(getRank/isEmpty/isMask)——一个 MaskState 要么是标量、要么是矩形掩码",
+      "code": "class MaskState {\npublic:\n  OpFoldResult start;\n  OpFoldResult end;\n  SmallVector<OpFoldResult> dims;\n  SmallVector<OpFoldResult> offsets;\n  OpFoldResult scalar;\n\n  int64_t getRank() const {\n    assert(dims.size() == offsets.size() && \"dims and offsets rank mismatch!\");\n    return dims.size();\n  }\n\n  // ... getMaskPosition(...) 见 L63-L98(Head/Middle/Unknown 分类,本章仅点名)\n\n  bool isEmpty() const { return getRank() == 0 && !scalar && !start && !end; }\n\n  bool isMask() const {\n    return !start && !end && !scalar && dims.size() != 0 && offsets.size() != 0;\n  }",
+      "elide": ["getMaskPosition(L63-L98):把已解析的 offsets/dims 归类为 Head/Middle/Unknown(枚举里还有 Tail 但从不返回);仅 TritonOpConverter 的 select 下沉用到,本章点名不展开", "private 段(L132-L199):全部 parseXxx / addStates / minStates / clamp 的声明"]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp",
+      "lines": "L48-L64",
+      "what": "入口模板:算子没有 mask 直接 nullopt;有 mask 就把插入点钉在算子前,建一个空 MaskState 调 parse",
+      "code": "template <typename MemAccOpTy>\nstd::optional<MaskState> runMaskAnalysisImpl(MemAccOpTy op, OpBuilder &builder)\n{\n  auto mask = op.getMask();\n  if (!mask) {\n    return std::nullopt;\n  }\n\n  PatternRewriter::InsertionGuard insertGuard(builder);\n  builder.setInsertionPoint(op);\n\n  MaskState mstate;\n  if (mstate.parse(mask, op.getLoc(), builder).failed()) {\n    return std::nullopt;\n  }\n  return mstate;\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp",
+      "lines": "L81-L130",
+      "what": "递归下降解析器:整数标量/循环 iter_arg 短路后,用 TypeSwitch 按 mask 表达式的 defining op 分派到 11 个 parseXxx(ExtSI 透传、DivSI 已停用)",
+      "code": "LogicalResult MaskState::parse(Value operand, const Location &loc,\n                               OpBuilder &builder) {\n  if (isa<IntegerType>(operand.getType())) {\n    return parseIntScalar(operand, loc, builder);\n  }\n\n  if (auto blockArgument = dyn_cast<BlockArgument>(operand)) {\n    auto parentOp = blockArgument.getOwner()->getParentOp();\n    if (auto loopOp = dyn_cast<LoopLikeOpInterface>(parentOp)) {\n      OpOperand *initArgOperand = loopOp.getTiedLoopInit(blockArgument);\n      if (initArgOperand) {\n        Value initArg = initArgOperand->get();\n        return parse(initArg, loc, builder);\n      }\n    }\n  }\n\n  auto definingOp = operand.getDefiningOp();\n  if (!definingOp)\n    return failure();\n\n  // ... LLVM_DEBUG 打印(L102-L105,略)\n  return TypeSwitch<Operation *, LogicalResult>(definingOp)\n      .Case<arith::ConstantOp>(\n          [&](auto op) { return this->parseConstant(op, loc, builder); })\n      .Case<arith::AddIOp>(\n          [&](auto op) { return this->parseAdd(op, loc, builder); })\n      .Case<arith::AndIOp>(\n          [&](auto op) { return this->parseAnd(op, loc, builder); })\n      .Case<arith::CmpIOp>(\n          [&](auto op) { return this->parseCmp(op, loc, builder); })\n      .Case<triton::MakeRangeOp>(\n          [&](auto op) { return this->parseMakeRange(op, loc, builder); })\n      .Case<triton::BroadcastOp>(\n          [&](auto op) { return this->parseBroadcast(op, loc, builder); })\n      .Case<triton::SplatOp>(\n          [&](auto op) { return this->parseSplat(op, loc, builder); })\n      .Case<triton::ExpandDimsOp>(\n          [&](auto op) { return this->parseExpandDims(op, loc, builder); })\n      .Case<arith::ExtSIOp>(\n          [&](auto op) { return this->parse(op.getIn(), loc, builder); })\n      .Case<arith::DivSIOp>(\n          [&](auto op) { return this->parseDiv(op, loc, builder); })\n      .Case<arith::SelectOp>(\n          [&](auto op) { return this->parseSel(op, loc, builder); })\n      .Default([&](Operation *op) { return failure(); });\n}",
+      "elide": ["LLVM_DEBUG 块(L102-L105):调试打印当前 defining op,与解析逻辑无关"]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp",
+      "lines": "L560-L582",
+      "what": "叶子:tt.make_range → start/end/dims[0]=长度/offsets[0]=0;强制隐含 stride==1(否则报警失败)",
+      "code": "LogicalResult MaskState::parseMakeRange(triton::MakeRangeOp rangeOp,\n                                        const Location &loc,\n                                        OpBuilder &builder) {\n  assert(this->isEmpty());\n  auto shape = cast<ShapedType>(rangeOp.getType()).getShape();\n  auto start = rangeOp.getStart();\n  auto end = rangeOp.getEnd();\n  auto stride = (end - start + shape[0] - 1) / shape[0];\n\n  if (stride != 1) {\n    InFlightDiagnostic diag =\n        emitWarning(loc)\n        << \"stride must be 1 for make_range whose result is used \"\n           \"as load or store masks\";\n    return failure();\n  }\n\n  this->start = builder.getIndexAttr(start);\n  this->end = builder.getIndexAttr(end);\n  this->dims.push_back(builder.getIndexAttr(shape[0]));\n  this->offsets.push_back(builder.getIndexAttr(0));\n  return success();\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp",
+      "lines": "L440-L558",
+      "what": "核心:arith.cmpi 把一维的 range(start/end)与标量 bound 熔进 (offset,dim)。只支持 5 种谓词;要求恰有一维长度 >1(cmpDim);逐谓词算新边界并 clamp",
+      "code": "LogicalResult MaskState::parseCmp(arith::CmpIOp cmpOp, const Location &loc,\n                                  OpBuilder &builder) {\n  assert(this->isEmpty());\n  auto predicate = cmpOp.getPredicate();\n  // Only support <, <=, >=, =, !=\n  if (predicate != arith::CmpIPredicate::slt &&\n      predicate != arith::CmpIPredicate::sle &&\n      predicate != arith::CmpIPredicate::sge &&\n      predicate != arith::CmpIPredicate::eq &&\n      predicate != arith::CmpIPredicate::ne) {\n    LLVM_DEBUG({ llvm::dbgs() << \"Unsupported cmpi predicate\\n\"; });\n    return failure();\n  }\n\n  MaskState lhsState;\n  MaskState rhsState;\n  auto lhs = cmpOp.getLhs();\n  auto rhs = cmpOp.getRhs();\n\n  // ... ne 特判(L459-L465):lhs 必须来自 select、rhs 必须来自 constant,否则失败\n\n  if (failed(lhsState.parse(lhs, loc, builder))) {\n    return failure();\n  }\n\n  if (failed(rhsState.parse(rhs, loc, builder))) {\n    return failure();\n  }\n\n  if (!(!lhsState.scalar && rhsState.scalar)) {\n    InFlightDiagnostic diag = emitWarning(loc)\n                                << \"[MaskState] Unsupported cmpi scenario\";\n    return failure();\n  }\n\n  int32_t cmpDim = -1;\n  for (int32_t i = 0; i < lhsState.getRank(); i++) {\n    auto constDimLength = getConstantIntValue(lhsState.dims[i]);\n    if (!constDimLength || constDimLength.value() != 1) {\n      if (cmpDim != -1) {\n        InFlightDiagnostic diag = emitWarning(loc)\n                                  << \"Unsupported cmpi with more than one  \"\n                                     \"dimension with size larger than 1\";\n        return failure();\n      }\n      cmpDim = i;\n    }\n  }\n\n  assert(cmpDim != -1 &&\n         \"Unexpected case where no dimension has size larger than 1\");\n\n  this->offsets = lhsState.offsets;\n  this->dims = lhsState.dims;\n  switch (predicate) {\n  case arith::CmpIPredicate::slt: {\n    auto realBound =\n        maxOpFoldResult(lhsState.start, rhsState.scalar, loc, builder);\n    auto newEnd = minOpFoldResult(lhsState.end, realBound, loc, builder);\n    auto newDim = subOpFoldResult(newEnd, lhsState.start, loc, builder);\n    auto clampedNewDim = clampToNonNegativeIndex(newDim, loc, builder);\n\n    this->dims[cmpDim] = clampedNewDim;\n    break;\n  }\n  case arith::CmpIPredicate::sle: {\n    // lhs <= rhs  <=>  lhs < rhs + 1\n    auto rhsPlusOne = addOpFoldResult(rhsState.scalar, builder.getIndexAttr(1), loc, builder);\n    auto realBound = maxOpFoldResult(lhsState.start, rhsPlusOne, loc, builder);\n    auto newEnd = minOpFoldResult(lhsState.end, realBound, loc, builder);\n    auto newDim = subOpFoldResult(newEnd, lhsState.start, loc, builder);\n    auto clampedNewDim = clampToNonNegativeIndex(newDim, loc, builder);\n\n    this->dims[cmpDim] = clampedNewDim;\n    break;\n  }\n  case arith::CmpIPredicate::sge: {\n    auto realBound =\n        maxOpFoldResult(lhsState.start, rhsState.scalar, loc, builder);\n    auto newStart = minOpFoldResult(lhsState.end, realBound, loc, builder);\n    auto newOffset = subOpFoldResult(newStart, lhsState.start, loc, builder);\n    auto newDim = subOpFoldResult(lhsState.end, newStart, loc, builder);\n    auto clampedNewDim = clampToNonNegativeIndex(newDim, loc, builder);\n\n    this->offsets[cmpDim] = newOffset;\n    this->dims[cmpDim] = clampedNewDim;\n    break;\n  }\n  case arith::CmpIPredicate::eq: {\n    auto newOffset =\n        subOpFoldResult(rhsState.scalar, lhsState.start, loc, builder);\n    auto newDim = builder.getIndexAttr(1);\n\n    this->offsets[cmpDim] = newOffset;\n    this->dims[cmpDim] = newDim;\n    break;\n  }\n  case arith::CmpIPredicate::ne: {\n    // only support lhs != 0\n    auto rhsScalar = dyn_cast<IntegerAttr>(rhsState.scalar.get<Attribute>());\n    if (!rhsScalar || rhsScalar.getInt() != 0) {\n      return failure();\n    }\n\n    start = lhsState.start;\n    end = lhsState.end;\n    break;\n  }\n  default:\n    return failure();\n  }\n  return success();\n}",
+      "elide": ["ne 特判块(L459-L465):当谓词是 != 时,先要求 lhs 出自 arith.select、rhs 出自 arith.constant,否则直接 failure——为 parseSel 造出的『select≠0』掩码开的窄口"]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp",
+      "lines": "L378-L399",
+      "what": "arith.andi:两侧都必须解析成功且 isMask(纯矩形、无标量),再交给 minStates 求矩形交",
+      "code": "LogicalResult MaskState::parseAnd(arith::AndIOp andOp, const Location &loc,\n                                  OpBuilder &builder) {\n  assert(this->isEmpty());\n  MaskState lhsState;\n  if (failed(lhsState.parse(andOp.getLhs(), loc, builder)) ||\n      !lhsState.isMask()) {\n    return failure();\n  }\n\n  MaskState rhsState;\n  if (failed(rhsState.parse(andOp.getRhs(), loc, builder)) ||\n      !rhsState.isMask()) {\n    return failure();\n  }\n\n  if (!lhsState.isMask() && !rhsState.isMask()) {\n    return failure();\n  }\n\n  // Only support both lhs and rhs satisfy `isMask` condition\n  return this->minStates(lhsState, rhsState, loc, builder);\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp",
+      "lines": "L280-L306",
+      "what": "minStates:逐维求区间交——新 offset=max(两 offset),新 end=min(两 end),新 dim=end-offset 再 clamp≥0",
+      "code": "LogicalResult MaskState::minStates(const MaskState &lhsState,\n                                   const MaskState &rhsState,\n                                   const Location &loc, OpBuilder &builder) {\n  if (lhsState.getRank() != rhsState.getRank()) {\n    InFlightDiagnostic diag =\n        emitError(loc)\n        << \"Unexpected case where lhs and rhs have different ranks\";\n    return failure();\n  }\n\n  for (uint32_t i = 0; i < lhsState.getRank(); i++) {\n    auto lhsOffset = lhsState.offsets[i];\n    auto rhsOffset = rhsState.offsets[i];\n    auto newOffset = maxOpFoldResult(lhsOffset, rhsOffset, loc, builder);\n    auto lhsDim = lhsState.dims[i];\n    auto rhsDim = rhsState.dims[i];\n    auto lhsEnd = addOpFoldResult(lhsOffset, lhsDim, loc, builder);\n    auto rhsEnd = addOpFoldResult(rhsOffset, rhsDim, loc, builder);\n    auto newEnd = minOpFoldResult(lhsEnd, rhsEnd, loc, builder);\n    auto newDim = subOpFoldResult(newEnd, newOffset, loc, builder);\n    auto clampedNewDim = clampToNonNegativeIndex(newDim, loc, builder);\n\n    offsets.push_back(newOffset);\n    dims.push_back(clampedNewDim);\n  }\n  return success();\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp",
+      "lines": "L68-L79",
+      "what": "负索引夹到 0:仅常量夹 max(0,·);非常量本可发 max(value,0),但会挂 atomic max/min UT,故原样返回",
+      "code": "OpFoldResult MaskState::clampToNonNegativeIndex(const OpFoldResult value,\n                                                const Location &loc,\n                                                OpBuilder &builder) const\n{\n  if (auto cst = getConstantIntValue(value)) {\n    return builder.getIndexAttr(std::max<int64_t>(0, *cst));\n  }\n\n  // For non-constant value, we could generate max(value, 0) to ensure the value is non-negative.\n  // But this caused error in atomic max/min ut test. We need to investigate more on this.\n  return value;\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp",
+      "lines": "L132-L158",
+      "what": "getExtractSlice:把解析出的 offsets/dims 配全 1 strides,推断结果类型后发射 tensor.extract_slice(两个重载:成员字段版 + 显式传参版)",
+      "code": "// extractSlice\ntensor::ExtractSliceOp MaskState::getExtractSlice(Value source,\n                                                  const Location &loc,\n                                                  OpBuilder &builder) const {\n  auto sourceRType = cast<RankedTensorType>(source.getType());\n  SmallVector<OpFoldResult> strides(getRank(), builder.getIndexAttr(1));\n\n  auto dstRType = tensor::ExtractSliceOp::inferResultType(sourceRType, offsets,\n                                                          dims, strides);\n  return builder.create<tensor::ExtractSliceOp>(loc, dstRType, source, offsets,\n                                                dims, strides);\n}\n\n// ... 第二个重载(L145-L158)省略:offsets/dims 由调用方显式传入,其余逐字相同",
+      "elide": ["第二个重载(L145-L158):签名多两个参数 offsets/dims 由调用方传入,函数体逐字相同——TritonOpConverter 处理 select 时对 false 张量切不同区间"]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp",
+      "lines": "L180-L195",
+      "what": "getSubview:memref 版切片——发 memref.subview;offsets/dims 长度不足源 rank 时,尾部补 offset0/dim1",
+      "code": "memref::SubViewOp MaskState::getSubview(Value source, const Location &loc,\n                                        OpBuilder &builder) const {\n  auto sourceType = cast<MemRefType>(source.getType());\n  int64_t rank = sourceType.getRank();\n  SmallVector<OpFoldResult> strides(rank, builder.getIndexAttr(1));\n\n  SmallVector<OpFoldResult> fixedOffsets(offsets.begin(), offsets.end());\n  SmallVector<OpFoldResult> fixedDims(dims.begin(), dims.end());\n  fixedOffsets.resize(rank, builder.getIndexAttr(0));\n  fixedDims.resize(rank, builder.getIndexAttr(1));\n\n  auto dstType =\n      memref::SubViewOp::inferResultType(sourceType, fixedOffsets, fixedDims, strides);\n  return builder.create<memref::SubViewOp>(loc, cast<MemRefType>(dstType),\n                                           source, fixedOffsets, fixedDims, strides);\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp",
+      "lines": "L612-L661",
+      "what": "parseSplat:tt.splat 铺张量;splat-as-mask 特判——当源是 i1 且全部用户都把它当掩码用时,把布尔标量乘进每维 dim(true→满维、false→0 维),再清掉 scalar 使之成为纯矩形掩码",
+      "code": "LogicalResult MaskState::parseSplat(triton::SplatOp splatOp,\n                                    const Location &loc, OpBuilder &builder) {\n  assert(this->isEmpty());\n\n  auto src = splatOp.getSrc();\n  auto dst = splatOp.getResult();\n  auto dstShape = cast<ShapedType>(dst.getType()).getShape();\n\n  if (!isa<IntegerType>(src.getType())) {\n    InFlightDiagnostic diag =\n        emitWarning(loc)\n        << \"splat source must be an integer scalar for load/store masks\";\n    return failure();\n  }\n\n  if (failed(this->parse(src, loc, builder)))\n    return failure();\n\n  auto splatAsMask = [&](Operation *userOp) -> bool {\n    return TypeSwitch<Operation *, bool>(userOp)\n        .Case<arith::AndIOp>([&](arith::AndIOp andOp) { return true; })\n        .Case<arith::SelectOp>([&](arith::SelectOp selectOp) {\n          return selectOp.getCondition() == dst;\n        })\n        .Case<triton::LoadOp>(\n            [&](triton::LoadOp loadOp) { return loadOp.getMask() == dst; })\n        .Case<triton::StoreOp>(\n            [&](triton::StoreOp storeOp) { return storeOp.getMask() == dst; })\n        .Default([&](Operation *op) { return false; });\n  };\n\n  if (src.getType().isInteger(1) && !splatOp->use_empty() &&\n      llvm::all_of(splatOp->getUsers(), splatAsMask)) {\n    for (auto s : dstShape) {\n      auto currentDim =\n          mulOpFoldResult(builder.getIndexAttr(s), this->scalar, loc, builder);\n      this->dims.push_back(currentDim);\n      this->offsets.push_back(builder.getIndexAttr(0));\n    }\n\n    this->scalar = nullptr;\n    return success();\n  }\n\n  for (auto s : dstShape) {\n    this->dims.push_back(builder.getIndexAttr(s));\n    this->offsets.push_back(builder.getIndexAttr(0));\n  }\n  return success();\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp",
+      "lines": "L719-L731",
+      "what": "对外入口 runMaskAnalysis:按算子类型(LoadOp/StoreOp/AtomicRMWOp)分派到模板 impl,其它算子返回 nullopt",
+      "code": "std::optional<MaskState> runMaskAnalysis(Operation *op, OpBuilder &builder)\n{\n  if (auto loadOp = dyn_cast<triton::LoadOp>(op)) {\n    return runMaskAnalysisImpl(loadOp, builder);\n  }\n  if (auto storeOp = dyn_cast<triton::StoreOp>(op)) {\n    return runMaskAnalysisImpl(storeOp, builder);\n  }\n  if (auto atomicRMWOp = dyn_cast<triton::AtomicRMWOp>(op)) {\n    return runMaskAnalysisImpl(atomicRMWOp, builder);\n  }\n  return std::nullopt;\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp",
+      "lines": "L455-L498",
+      "what": "消费端(ch12 §12.7 指向的『有 mask 分支』):parse 失败→拒绝下沉『不连续掩码』;成功→对源 memref 和本地缓冲各切一个 memref.subview,只 copy 那一片",
+      "code": "  MaskState mstate;\n  auto isContMask = mstate.parse(mask, loc, rewriter);\n  if (isContMask.failed()) {\n    return rewriter.notifyMatchFailure(\n        op, \"can not lower uncontinuout masked loads\");\n  }\n\n  // ... other(缺省值填充)分支 L462-L471、deinterleave 优化 L473-L489、UCC 保护 L491-L495,本章略\n\n  } else {\n    memref::SubViewOp srcSubView = mstate.getSubview(ptr, loc, rewriter);\n    memref::SubViewOp dstSubView = mstate.getSubview(allocOp, loc, rewriter);",
+      "elide": ["other 分支(L462-L471):若 load 带缺省值 other,先把整块本地缓冲填满 other 再 copy 有效片;deinterleave 分支(L473-L489):末维 stride==2 的去交织优化;UCC 保护(L491-L495)"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "MaskState", "file": "third_party/ascend/include/TritonToLinalg/MaskAnalysis.h", "responsibility": "掩码解析的状态载体 + 发射器。五个字段:start/end(一维 range 的闭开边界,来自 make_range)、offsets/dims(每维矩形区间 [offset, offset+dim))、scalar(标量值)。既是 parse 递归累积的目的地,也提供 getExtractSlice/getSubview/getInsertSlice 把矩形发射成切片算子。一个 MaskState 语义上要么是标量(isEmpty 之外仅 scalar 有值)、要么是矩形掩码(isMask:仅 dims/offsets 有值)、要么是裸 range(start/end 有值)"},
+    {"name": "MaskPosition (enum)", "file": "third_party/ascend/include/TritonToLinalg/MaskAnalysis.h", "responsibility": "Head/Tail/Middle/Unknown,给已解析矩形按 offset 是否全 0 归类;仅 getMaskPosition 用,且实际只返回 Head/Middle/Unknown(Tail 从不返回)。本章点名不主讲"},
+    {"name": "runMaskAnalysis / runMaskAnalysisImpl", "file": "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp", "responsibility": "对外自由函数入口:按 LoadOp/StoreOp/AtomicRMWOp 分派,取 op.getMask() 后建空 MaskState 调 parse,返回 optional<MaskState>(无 mask 或解析失败→nullopt)"}
+  ],
+
+  "data_flow": [
+    "1. runMaskAnalysis(op):算子无 mask → nullopt;否则把 builder 插入点钉在算子前,新建空 MaskState",
+    "2. MaskState::parse(mask):对掩码张量的 SSA 表达式做递归下降——整数标量走 parseIntScalar;循环块参数回溯到 iter 初值;其余按 defining op TypeSwitch 分派",
+    "3. 叶子 parseMakeRange:tt.make_range → start/end + dims[0]=长度、offsets[0]=0(强制 stride==1)",
+    "4. 形状传播 parseSplat/parseBroadcast/parseExpandDims:沿张量形状把每维 dims/offsets 补齐/改写;splat-as-mask 特判把 i1 标量乘进 dim",
+    "5. parseCmp(arith.cmpi):在恰有一维 >1 的那维(cmpDim)上,用标量 bound 把 range(start/end)熔成 (offset,dim)——slt 缩 end、sge 抬 offset、eq 定成长度 1、ne!=0 保持满维",
+    "6. parseAnd(arith.andi)→minStates:两个矩形掩码逐维求区间交 [max(off),min(end)),dim 再 clamp≥0",
+    "7. clampToNonNegativeIndex:任何算出的 dim 若为负常量夹到 0(空切片);非常量原样(避免 atomic UT 回归)",
+    "8. 消费端 getExtractSlice / getSubview:把最终 offsets/dims + 全 1 strides 发射成 tensor.extract_slice(tensor 域)或 memref.subview(memref 域);LoadStoreConverter 有 mask 分支据此只 copy 有效矩形片"
+  ],
+
+  "design_decisions": [
+    {"decision": "结构化世界用『切片』表达边界,而非 GPU 的逐元素 predication", "why": "在张量层,越界元素不参与访存 = 把访存范围收缩成一个连续的矩形子区间(offsets/sizes/strides),交给 tensor.extract_slice / memref.subview 表达。这天然可被后续的 tiling/bufferization/循环变换识别与优化;逐元素谓词是运行期掩码,张量层变换看不透。核心洞察 ④", "evidence": "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L133-L158,L180-L195"},
+    {"decision": "只接受『连续/矩形』掩码,解析失败即拒绝下沉(交给别的路径)", "why": "MaskState 只能表达每维一个连续区间的笛卡尔积(矩形);parseAnd 只支持 andi(交=矩形),无 parseOr——两段 cmpi 的 ori 会产生不连续掩码,parse 直接 failure。消费端据此 notifyMatchFailure『can not lower uncontinuout masked loads』,由 DiscreteMaskAccess/Unstructure 兜底(ch14)", "evidence": "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L378-L399;third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp:L457-L460"},
+    {"decision": "两种坐标表示:make_range 产 start/end(闭开 range),cmpi 才熔成 offsets/dims(矩形)", "why": "make_range 只知道自己是 [start,end);要变成『从哪切、切多长』必须知道和谁比(bound)。parseCmp 是唯一的熔合点——头文件注释直言其为『fuse scalar, start and end into dims and offset』的必要方法", "evidence": "third_party/ascend/include/TritonToLinalg/MaskAnalysis.h:L176-L179;third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L498-L557"},
+    {"decision": "负维度只在常量时夹到 0,非常量原样返回", "why": "clamp 的目的是让越界比较产生空切片(dim=0)而非负 size。但对动态(非常量)dim 发射 max(value,0) 会让 atomic max/min 的 UT 挂掉,作者留 TODO 暂不处理", "evidence": "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L68-L79"},
+    {"decision": "parseDiv 已停用", "why": "parseDiv 函数体第一句就是 return failure()(temporarily disable),其后 divStates 逻辑是死代码。即 arith.divsi 目前不被当作合法掩码构造", "evidence": "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L362-L376"},
+    {"decision": "splat-as-mask:仅当 i1 标量的全部用户都把它当掩码时才特殊处理", "why": "tt.splat 一个 i1 标量到张量,可能是『全 true/全 false』整块掩码。只有当 splat 结果的所有 user 都是 andi/select-cond/load-mask/store-mask 时才判定为掩码语义,把布尔值(0/1)乘进每维长度——true→满维、false→0 维(空切片),否则退化为普通 splat(满维)", "evidence": "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L630-L660"},
+    {"decision": "解析入口把插入点钉在被分析算子前", "why": "parse 过程中 min/max/sub 等边界算术会即时建 arith 算子(OpFoldResult 可能物化成 Value);setInsertionPoint(op) 保证这些辅助算子插在 load/store 之前,语义正确。事后由 eraseInsertedOps 回收死掉的分析算子", "evidence": "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L56-L57,L683-L717"}
+  ],
+
+  "theory": [
+    "矩形区间代数:每维掩码是一个半开区间 [offset, offset+dim);整块掩码是各维区间的笛卡尔积(一个 N 维矩形)。这正是 tensor.extract_slice / memref.subview 能表达的全部——连续、轴对齐的超矩形。",
+    "cmpi 逐谓词的边界推导(设该维 range 为 [start,end),标量 bound=b):slt(range<b):newEnd=min(end,max(start,b)),dim=newEnd-start —— 收缩尾部。sle(≤b):等价 <b+1,同 slt 但 bound 换 b+1。sge(range≥b):newStart=min(end,max(start,b)),offset=newStart-start,dim=end-newStart —— 抬升头部(唯一改 offset 的比较)。eq(=b):offset=b-start,dim=1 —— 单点。ne!=0:保持整维(start/end 不变)。所有 dim 结果都过 clampToNonNegativeIndex,越界→dim=0=空切片。",
+    "AND=矩形交:两个矩形掩码逐维取区间交,newOffset=max(o1,o2)、newEnd=min(o1+d1,o2+d2)、newDim=newEnd-newOffset(clamp≥0)。这解释了为什么只支持 andi 不支持 ori——两矩形的并一般不是矩形,无法用单个 extract_slice 表达。",
+    "复杂度:parse 是对掩码表达式 DAG 的一次线性递归下降,每个 op 常数工作;边界算术每维 O(1);整体 O(表达式规模 × rank)。无迭代不动点,纯语法制导。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [],
+    "must_keep": [
+      {"symbol": "MaskState", "why": "全章核心数据结构;读者须理解其 start/end/dims/offsets/scalar 五字段的语义与三种形态(标量/range/矩形掩码)"},
+      {"symbol": "parse", "why": "递归下降解析器主干,TypeSwitch 分派表是理解『哪些 mask 表达式被支持』的入口"},
+      {"symbol": "parseCmp", "why": "核心机制——把 arith.cmpi 熔成 (offset,dim) 的唯一地方;5 谓词逐条边界推导必须讲清"},
+      {"symbol": "parseAnd", "why": "andi=矩形交的入口,连出 minStates;解释『只支持 AND 不支持 OR』"},
+      {"symbol": "minStates", "why": "逐维区间交算法,矩形交的实现"},
+      {"symbol": "parseMakeRange", "why": "range 叶子——start/end/dims/offsets 的初始来源,stride==1 约束"},
+      {"symbol": "parseSplat", "why": "splat-as-mask 特判,布尔标量→维长度的特殊语义"},
+      {"symbol": "clampToNonNegativeIndex", "why": "负索引夹 0 的边界处理;核心洞察 ③;常量/非常量分叉与 atomic UT 缘由"},
+      {"symbol": "getExtractSlice", "why": "把矩形发射成 tensor.extract_slice——核心洞察 ④『切片而非 predication』的落点"},
+      {"symbol": "getSubview", "why": "memref 域的对应发射(memref.subview),LoadStoreConverter 有 mask 分支实际调用"},
+      {"symbol": "runMaskAnalysis", "why": "对外入口,算子类型分派(load/store/atomic)"},
+      {"symbol": "isMask", "why": "判定谓词——纯矩形无标量,parseAnd 的门槛,理解三形态的关键"}
+    ]
+  },
+
+  "mechanisms": [
+    {"id": "m1", "name": "MaskState 五字段与三形态(标量 / range / 矩形掩码)", "kind": "layout", "source_anchors": ["third_party/ascend/include/TritonToLinalg/MaskAnalysis.h:L50-L104"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m2", "name": "parse 递归下降 + TypeSwitch 分派(11 个 parseXxx)", "kind": "algorithm", "source_anchors": ["third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L81-L130"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m3", "name": "parseCmp:cmpi 把 range 熔成 (offset,dim)——5 谓词逐条边界推导", "kind": "algorithm", "source_anchors": ["third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L440-L558"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m4", "name": "parseAnd → minStates:AND = 逐维矩形区间交", "kind": "algorithm", "source_anchors": ["third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L378-L399", "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L280-L306"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m5", "name": "parseMakeRange:range 叶子(start/end/dims/offsets,stride==1 约束)", "kind": "algorithm", "source_anchors": ["third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L560-L582"], "needs_figure": false, "needs_worked_example": true, "difficulty": "supporting"},
+    {"id": "m6", "name": "形状传播:parseSplat / parseBroadcast / parseExpandDims", "kind": "dataflow", "source_anchors": ["third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L612-L661", "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L584-L610", "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L663-L681"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m7", "name": "clampToNonNegativeIndex:负维度夹 0(常量夹、非常量原样)", "kind": "algorithm", "source_anchors": ["third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L68-L79"], "needs_figure": false, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m8", "name": "getExtractSlice / getSubview:矩形发射成 tensor.extract_slice / memref.subview", "kind": "dataflow", "source_anchors": ["third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L133-L158", "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L180-L195"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m9", "name": "scalar 分支:parseConstant / parseIntScalar / parseAdd → addStates", "kind": "algorithm", "source_anchors": ["third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L309-L336", "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L347-L360", "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L209-L248"], "needs_figure": false, "needs_worked_example": true, "difficulty": "supporting"},
+    {"id": "m10", "name": "parseSel + cmpi ne 特判:select 造出的『≠0』掩码", "kind": "algorithm", "source_anchors": ["third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L401-L438", "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L459-L465"], "needs_figure": false, "needs_worked_example": true, "difficulty": "supporting"},
+    {"id": "m11", "name": "runMaskAnalysis 入口:load/store/atomic 分派 + 插入点管理", "kind": "protocol", "source_anchors": ["third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L48-L64", "third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L719-L731"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m12", "name": "消费端衔接:LoadStoreConverter 有 mask 分支(ch12 §12.7 指向处)拒绝不连续掩码 → getSubview → memref.copy 有效片", "kind": "protocol", "source_anchors": ["third_party/ascend/lib/TritonToLinalg/LoadStoreConverter.cpp:L455-L519"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m13", "name": "eraseInsertedOps:回收解析期插入的死算子", "kind": "dataflow", "source_anchors": ["third_party/ascend/lib/TritonToLinalg/MaskAnalysis.cpp:L683-L717"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"}
+  ],
+
+  "foreshadow_due": {"plant": [], "harvest": [], "note": "bible.py due ch13 返回空(无应埋/应回收);本章承 ch12 结构化访存物化,为 ch14 Unstructure 兜底路径铺路——小结指向 ch14"},
+
+  "cross_refs": [
+    {"to": "ch12", "anchor": "../ch12-blockptranalysis-memref/narrative/chapter.md 的 §12.7 tt.load 落地", "why": "ch12 §12.7 明确点出 load 有『有 mask 分支 L455-L519』未展开;本章 = 把那条分支彻底讲清。mask 张量本身怎么被 PtrAnalysis 看待(ch11)、结构化 memref 怎么物化(ch12)用链接回指,不重推导"},
+    {"to": "ch14", "anchor": "Unstructure 兜底路径", "why": "parse 失败(不连续/离散掩码,如两段 cmpi 的 ori)时,LoadStoreConverter 拒绝下沉,交给 DiscreteMaskAccess / Unstructure 路径——ch14 讲『结构化装不下时』的兜底。小结指向 ch14"}
+  ]
+}

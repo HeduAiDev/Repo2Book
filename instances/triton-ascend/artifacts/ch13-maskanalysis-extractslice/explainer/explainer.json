@@ -1,0 +1,277 @@
+{
+  "chapter": "ch13",
+  "title": "边界的语义:MaskAnalysis 把 mask 还原成 extract_slice",
+  "trace_note": "本章 skip_impl(纯 C++ MLIR pass,无精简版)。所有 worked_example 的 trace_source=manual:数字按 pin 源码(MaskAnalysis.cpp @2badfc89e)逐行整数公式手工推演,并经 host 复刻脚本 traces/mask_model.py 自校验(输出 traces/model_out.json);真实 IR 前后对照取自 pin 内 lit 夹具(atomic_rmw.mlir / parse_select.mlir / loadstore.mlir 的 RUN+CHECK)。宿主无 CANN,不跑 triton-opt 真编译器 dump。凡引用源码常量的数字均标 file:Lxxx。",
+
+  "mechanisms": [
+    {
+      "mechanism_id": "m1",
+      "intuition": "把 MaskState 想成一张『访存许可证』:它不逐个盖章说『第 3 个元素能读、第 4 个不能』,而是只填三种表格之一——要么写一个标量数字(scalar),要么写一段闭开区间 [start,end)(range),要么写一个矩形『从 offsets 起、切 dims 长』(矩形掩码)。五个字段(start/end/dims/offsets/scalar)按当前是哪种表格各有取值,其余留空。",
+      "worked_example": {
+        "params": {"note": "一个 MaskState 对象在三种形态下的字段取值;形态判定见谓词 isEmpty/isMask"},
+        "trace_source": "manual",
+        "manual_reason": "字段语义与判定谓词是 C++ 类定义(MaskAnalysis.h L50-L104),无运行数值;取值示例取自本章 m3/m5 的手算结果,谓词真值表按 isMask/isEmpty 源码求。",
+        "table": {
+          "columns": ["形态", "start", "end", "offsets", "dims", "scalar", "isMask()", "谁产出"],
+          "rows": [
+            ["标量 scalar", "—", "—", "—", "—", "10", "false", "parseIntScalar/parseConstant(L339/L309)"],
+            ["裸 range", "0", "16", "—", "—", "—", "false", "parseMakeRange 叶子(L560-L582)"],
+            ["矩形掩码", "—", "—", "[0]", "[10]", "—", "true", "parseCmp 熔合后(L498-L500)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "isMask()==true 当且仅当 start/end/scalar 三者皆空且 dims/offsets 非空(纯矩形)——三形态互斥,同一 MaskState 不会既是标量又是矩形。",
+        "argument": "基例:空 MaskState 满足 isEmpty()(getRank()==0 且无 scalar/start/end,L100)。归纳步:每个 parseXxx 都以 assert(isEmpty()) 开始,只往一种形态写字段——parseMakeRange 写 start/end/dims/offsets(range),parseCmp 结束时留 offsets/dims(把 range 的 start/end 丢弃),parseConstant 标量分支只写 scalar。isMask() 的定义 `!start && !end && !scalar && dims!=0 && offsets!=0`(MaskAnalysis.h:L100-L102)因此对矩形唯一为真。"
+      },
+      "quantified": "结构上只需 5 个 OpFoldResult 字段就能表达任意 N 维轴对齐矩形掩码:offsets/dims 各 N 项 + start/end/scalar 各 1(仅一维 range 或标量时用)。相比逐元素谓词的 O(总元素数) 位图,矩形表示是 O(N)(rank),对 16×16=256 元素的掩码只存 2 组 (offset,dim)=4 个整数。",
+      "figure_specs": [
+        {
+          "figure_id": "fig13-1",
+          "template": "layout",
+          "claim": "一个 MaskState 是三选一的载体:标量 / 闭开 range / 轴对齐矩形,五个字段按形态各有取值、其余留空。",
+          "numbers": [
+            {"name": "字段数", "value": "5", "provenance": "MaskAnalysis.h:L52-L59 (start/end/dims/offsets/scalar)"},
+            {"name": "标量态", "value": "scalar=10", "provenance": "parseConstant 标量分支 MaskAnalysis.cpp:L331-L332"},
+            {"name": "range 态", "value": "start=0,end=16", "provenance": "parseMakeRange MaskAnalysis.cpp:L577-L580"},
+            {"name": "矩形态", "value": "offsets=[0],dims=[10]", "provenance": "traces/model_out.json m3.slt"},
+            {"name": "isMask 谓词", "value": "!start&&!end&&!scalar&&dims!=0&&offsets!=0", "provenance": "MaskAnalysis.h:L100-L102"}
+          ],
+          "caption_draft": "MaskState 五字段与三形态。矩形态(isMask=true)是发射切片的唯一合法形态——只有它 start/end/scalar 全空、offsets/dims 双非空;标量与 range 是解析中间态,最终都要被 parseCmp 熔进矩形或被丢弃。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m2",
+      "intuition": "parse 像顺着一张『配方图』倒着做菜:要理解最终这盘 mask 是怎么来的,就看它的 defining op(上一道工序),按工序类型(cmpi/andi/make_range/splat…)分头去问它的原料,一路递归到叶子(make_range 或常量),再把答案往回拼。TypeSwitch 就是那本『看到这道工序就翻到这一页』的索引。",
+      "worked_example": {
+        "params": {"mask_expr": "arith.cmpi slt, tt.make_range(0,16), arith.constant dense<10>", "shape": "tensor<16xi32>", "bound": 10},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl 纯 C++ pass,宿主无 CANN 不跑 triton-opt;递归轨迹按 parse 的 TypeSwitch 分派(L104-L129)与各 parseXxx 公式手推,经 traces/mask_model.py 自校验(m2 段)。表达式形态对照 pin 内 loadstore.mlir L12-L13 的 make_range+cmpi 真实 IR。",
+        "table": {
+          "columns": ["递归深度", "当前 operand", "operand 类型", "分派到(TypeSwitch)", "返回后 MaskState"],
+          "rows": [
+            ["0", "%m = cmpi slt %r, %c", "tensor<16xi1>(有 defining op)", "parseCmp (L440)", "待子结果"],
+            ["1a", "%r = make_range(0,16)", "tensor<16xi32>", "parseMakeRange (L560)", "start=0,end=16,dims=[16],offsets=[0]"],
+            ["1b", "%c = constant dense<10>", "tensor<16xi32>(splat 整数)", "parseConstant (L309)", "scalar=10"],
+            ["0(回填)", "熔合 slt,bound=10", "—", "parseCmp switch slt (L501)", "offsets=[0],dims=[10]"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "parse 对掩码表达式的 use-def DAG 做有限步递归下降必然终止:每次递归都从一个 SSA 值走到它 defining op 的操作数(严格更靠近叶子),而合法 mask 的 DAG 无环、深度有限。",
+        "argument": "单调量=从当前 operand 到 make_range/constant 叶子的最长 def 链长度,每进入一层 parseXxx(parseCmp→parse(lhs)、parseAnd→parse(两侧))该长度严格减 1。基例:叶子 make_range/constant 不再递归(parseMakeRange/parseConstant 无内部 parse 调用)。整数标量与循环 iter_arg 在 parse 开头即短路返回(L82-L94)。无环由 SSA 支配关系保证,故有限步必停。"
+      },
+      "quantified": "本例 DAG 有 3 个节点(cmpi/make_range/constant),parse 递归 3 次、每次常数工作;整体复杂度 O(表达式节点数 × rank),无迭代不动点。TypeSwitch 覆盖 11 个可解析 op(ConstantOp/AddIOp/AndIOp/CmpIOp/MakeRangeOp/BroadcastOp/SplatOp/ExpandDimsOp/ExtSIOp/DivSIOp/SelectOp,L106-L127),其中 ExtSIOp 仅透传、DivSIOp 已停用,其余全 Default→failure。",
+      "figure_specs": [
+        {
+          "figure_id": "fig13-2",
+          "template": "flow",
+          "claim": "parse 顺着 mask 表达式的 use-def 链递归下降,cmpi 分派向两个操作数各要一份 MaskState,叶子(make_range/constant)返回后 parseCmp 熔成矩形。",
+          "numbers": [
+            {"name": "根 op", "value": "cmpi slt", "provenance": "parse TypeSwitch → parseCmp MaskAnalysis.cpp:L112-L113"},
+            {"name": "左叶子", "value": "make_range(0,16)→dims=[16]", "provenance": "traces/model_out.json m2.leaf_range"},
+            {"name": "右叶子", "value": "constant 10→scalar=10", "provenance": "parseConstant MaskAnalysis.cpp:L331-L332"},
+            {"name": "熔合结果", "value": "offsets=[0],dims=[10]", "provenance": "traces/model_out.json m2.after_slt_10"},
+            {"name": "可解析 op 数", "value": "11", "provenance": "MaskAnalysis.cpp:L106-L127 TypeSwitch 分支数"}
+          ],
+          "caption_draft": "parse 的递归下降与 TypeSwitch 分派。根 cmpi 向左要 range、向右要标量 bound,叶子返回后在 parseCmp 内熔合——这是『表达式 DAG→矩形』的一次线性遍历,无不动点迭代。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m3",
+      "intuition": "make_range 只知道自己是 [0,16) 这 16 个下标,但『能不能访问』要等它和一个 bound 比一比才定。parseCmp 就是那次比较:`< 10` 把尾巴剪短(留前 10 个)、`>= 10` 把头抬高(留后 6 个)、`== 10` 只留 1 个点、`!= 0` 全留。一次比较,把『和谁比』这个信息熔进『从哪切、切多长』。",
+      "worked_example": {
+        "params": {"range": "[0,16) (make_range(0,16))", "bound": 10, "note": "bound=10 落在区间内部,5 种谓词各产不同切片(非退化)"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl,宿主无 CANN;每谓词的 offset/dim 按 parseCmp switch 各 case 的 min/max/sub 公式(L501-L553)手推,经 traces/mask_model.py 自校验(m3 段)。二维 slt+bound 的真实 IR 见 pin 内 atomic_rmw.mlir L36/L39。",
+        "table": {
+          "columns": ["谓词", "语义", "关键运算(start=0,end=16,b=10)", "offset", "dim", "→ 切片 [off:off+dim)"],
+          "rows": [
+            ["slt (<)", "range<10", "newEnd=min(16,max(0,10))=10;dim=10-0", "0", "10", "[0:10]"],
+            ["sle (<=)", "range<=10 即 <11", "newEnd=min(16,max(0,11))=11;dim=11-0", "0", "11", "[0:11]"],
+            ["sge (>=)", "range>=10", "newStart=min(16,max(0,10))=10;off=10-0;dim=16-10", "10", "6", "[10:16]"],
+            ["eq (==)", "range==10", "off=10-0;dim=1", "10", "1", "[10:11]"],
+            ["ne (!=0)", "range!=0(仅支持 !=0)", "保持 start/end 不变", "0", "16", "[0:16]"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "parseCmp 只在恰有一维长度 >1 的那一维(cmpDim)上改边界,其余维原样;且所有算出的 dim 都过 clampToNonNegativeIndex,保证 dim≥0(越界比较→空切片而非负 size)。",
+        "argument": "cmpDim 由 L481-L494 的循环确定:遍历各维,长度非 1 的维记为 cmpDim,若出现第二个非 1 维即 failure(『more than one dimension with size larger than 1』)——故 cmpDim 唯一。switch 各 case 只写 dims[cmpDim]/offsets[cmpDim](L508/L519/L529-L530/L539-L540)。slt/sle/sge 的 newDim 末尾都调 clampToNonNegativeIndex(L507/L518/L528);eq 直接置 1;ne 不改 dim。故 dim 恒非负。"
+      },
+      "quantified": "5 种受支持谓词(slt/sle/sge/eq/ne),源码显式列举于 L443-L450;其余谓词(如 sgt/ult)直接 failure。本例 bound=10 在 [0,16) 内部,slt/sle 剪出 10/11 长(非满 16)、sge 抬 offset 到 10(非 0)、eq 缩到 1、ne 保 16——五者互不相同,无退化重合。仅 sge 会改 offset(唯一抬头部的比较,L529)。",
+      "figure_specs": [
+        {
+          "figure_id": "fig13-3",
+          "template": "before-after",
+          "claim": "对同一 range [0,16) 与 bound=10,五种 cmpi 谓词各熔出不同的 (offset,dim) 矩形切片。",
+          "numbers": [
+            {"name": "slt", "value": "[0:10] dim=10", "provenance": "traces/model_out.json m3.slt"},
+            {"name": "sle", "value": "[0:11] dim=11", "provenance": "traces/model_out.json m3.sle"},
+            {"name": "sge", "value": "[10:16] off=10 dim=6", "provenance": "traces/model_out.json m3.sge"},
+            {"name": "eq", "value": "[10:11] off=10 dim=1", "provenance": "traces/model_out.json m3.eq"},
+            {"name": "ne", "value": "[0:16] dim=16", "provenance": "traces/model_out.json m3.ne"}
+          ],
+          "caption_draft": "cmpi 五谓词把 range 熔成矩形。slt/sle 剪尾(改 dim)、sge 抬头(唯一改 offset)、eq 定点(dim=1)、ne 全保——这是唯一把标量 bound 熔进 (offset,dim) 的地方,越界值经 clamp 变成空切片。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m4",
+      "intuition": "两个矩形掩码用 andi 相与,几何上就是求这两个矩形的重叠区域。重叠矩形的每一维:起点取两者靠右的那个(max),终点取两者靠左的那个(min)。这正是 minStates 干的事——逐维取区间交。这也解释了为什么只支持 AND 不支持 OR:两矩形的并集一般不是矩形,一个 extract_slice 装不下。",
+      "worked_example": {
+        "params": {"tensor": "16x16", "row_mask": "dim0<10", "col_mask": "dim1<12", "note": "两 bound 都<16,两维都真收缩(非退化)"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl,宿主无 CANN;逐维交按 minStates 的 max/min/sub/clamp(L292-L302)手推,经 traces/mask_model.py 自校验(m4 段)。行/列 slt→broadcast→andi 的真实 IR 见 pin 内 atomic_rmw.mlir L36-L42(cmpi slt %22,%23 → cmpi slt %25,%26 → andi %28,%29)。",
+        "table": {
+          "columns": ["维", "左矩形 [off,off+dim)", "右矩形 [off,off+dim)", "newOff=max", "newEnd=min", "newDim=clamp(end-off)"],
+          "rows": [
+            ["dim0(行)", "[0,10)", "[0,16)", "0", "min(10,16)=10", "10"],
+            ["dim1(列)", "[0,16)", "[0,12)", "0", "min(16,12)=12", "12"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "minStates 要求两侧 rank 相等,逐维输出 newDim=min(两 end)−max(两 off) 再 clamp≥0;当两区间不相交时该维 dim 夹成 0(整块空切片),故结果恒是合法矩形(所有 dim≥0)。",
+        "argument": "rank 校验在 L285-L290(不等即 emitError failure)。对每维 i:newOff=max(o1,o2)、newEnd=min(o1+d1,o2+d2)(L292-L299),newDim=newEnd−newOff(L300)。若区间相交则 newEnd≥newOff→dim≥0;若不相交则 newEnd<newOff→dim<0,经 clampToNonNegativeIndex(L301)夹到 0。parseAnd 前置门槛 isMask()(L382/L389)保证两侧都是纯矩形无标量,minStates 才有 offsets/dims 可取。"
+      },
+      "quantified": "本例 16×16 掩码交后得 offsets=[0,0]、dims=[10,12],即左上角 10×12=120 个有效元素(全 256 中的 46.9%),用一个 tensor.extract_slice offset=[0,0] size=[10,12] stride=[1,1] 表达。只支持 andi(交=矩形)、无 parseOr——两段 cmpi 的 ori 产生非矩形掩码,parse 直接 failure 交给 ch14 兜底。",
+      "figure_specs": [
+        {
+          "figure_id": "fig13-4",
+          "template": "tiling",
+          "claim": "andi 两个矩形掩码 = 逐维区间交:行掩码 [0,10)×全 与 列掩码 全×[0,12) 交成左上角 10×12 矩形。",
+          "numbers": [
+            {"name": "行掩码 A", "value": "offsets=[0,0] dims=[10,16]", "provenance": "traces/model_out.json m4.A"},
+            {"name": "列掩码 B", "value": "offsets=[0,0] dims=[16,12]", "provenance": "traces/model_out.json m4.B"},
+            {"name": "交集", "value": "offsets=[0,0] dims=[10,12]", "provenance": "traces/model_out.json m4.intersection"},
+            {"name": "有效元素", "value": "10×12=120 / 256", "provenance": "dims 乘积 vs 16×16(atomic_rmw.mlir 张量形状)"}
+          ],
+          "caption_draft": "AND=矩形交。在 16×16 网格上,行约束与列约束的重叠是左上 10×12 子矩形——一个 extract_slice 即可表达。OR 的并集会是 L 形,单个切片装不下,故 parseAnd 有、parseOr 无。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m5",
+      "intuition": "make_range 是掩码分析的『叶子/原料』:它一出场就带着 [start,end) 这段连续下标,parseMakeRange 把它抄进 MaskState 的 start/end,并记下这一维长 shape[0]、从 0 起(offsets[0]=0)。它坚持一个隐含约定:下标必须步长为 1(连续),否则不认。",
+      "worked_example": {
+        "params": {"cases": "make_range(0,16)/shape16, make_range(0,128)/shape128, 反例 make_range(0,32)/shape16", "stride_formula": "(end-start+shape-1)/shape"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl,宿主无 CANN;stride 判定按 L566 整数公式手算,经 traces/mask_model.py 自校验(m5 段)。真实 make_range 掩码 IR 见 pin 内 loadstore.mlir L12(make_range end=1024)。",
+        "table": {
+          "columns": ["make_range(start,end)", "shape[0]", "stride=(end-start+shape-1)/shape", "判定", "start/end/dims/offsets"],
+          "rows": [
+            ["(0,16)", "16", "(16+15)/16=1", "通过", "0/16/[16]/[0]"],
+            ["(0,128)", "128", "(128+127)/128=1", "通过", "0/128/[128]/[0]"],
+            ["(0,32) 反例", "16", "(32+15)/16=2", "warning+failure", "—(拒绝)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "parseMakeRange 只接受隐含步长为 1 的连续 range;stride≠1 即发 warning 并 failure,不写任何字段。合法 make_range(triton 验证器要求 end−start==size)恒满足 stride==1,故该守卫在正常 IR 中恒通过、反例路径是防御性拦截。",
+        "argument": "stride=(end−start+shape−1)/shape(向上取整式)。当 end−start==shape 时 stride=(shape+shape−1)/shape=1(整数除,因 2·shape−1<2·shape);L568 判 stride!=1→failure。triton MakeRangeOp 验证器强制 end−start==tensor 长度,故合法 IR 里 end−start==shape[0]→stride 恒 1;反例 (0,32)/shape16 违反该约定,stride=2 被拦。"
+      },
+      "quantified": "叶子代价 O(1):读 start/end/shape、一次整除判 stride、push 一维 dims/offsets。它是 range 态的唯一产地——offsets 恒 [0]、dims 恒 [shape[0]]、start/end 保留原值供 parseCmp 后续熔合。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "m7",
+      "intuition": "算出来的『切多长』可能是负数(比如两个矩形根本不重叠,或者 bound 比区间起点还小)。负长度没意义,clampToNonNegativeIndex 把它夹到 0——0 长度就是『空切片,一个都不读』,语义正好。但它只对能当场算出常量的值这么夹;算不出常量的动态值,它选择原样放行(不生成 max),因为给动态值套 max 会让 atomic max/min 的单元测试挂掉。",
+      "worked_example": {
+        "params": {"cases": "常量 -6(不相交 AND)/ 常量 10(正常)/ 非常量(动态 bound)"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl,宿主无 CANN;常量夹值按 std::max<int64_t>(0,·)(L74)手算,不相交 dim=-6 由 minStates 产出(经 traces/mask_model.py m7 段自校验);非常量分支按 L76-L78 注释(getConstantIntValue 失败即原样返回)。",
+        "table": {
+          "columns": ["输入 value", "来源", "getConstantIntValue", "clamp 后", "含义"],
+          "rows": [
+            ["-6", "不相交 AND:[0,4)∩[10,16),newDim=4-10", "成功(常量)", "max(0,-6)=0", "空切片(dim=0)"],
+            ["10", "正常 slt 后 newDim", "成功(常量)", "max(0,10)=10", "10 长切片"],
+            ["%dyn(非常量)", "动态 bound 参与的 newDim", "失败(非常量)", "原样返回 %dyn", "不夹(TODO:atomic UT 回归)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "clampToNonNegativeIndex 对常量输入返回 max(0,value)≥0;对非常量输入原样返回。故常量维的 dim 永不为负;非常量维可能漏过负值(已知局限,源码留 TODO)。",
+        "argument": "L72-L74:若 getConstantIntValue(value) 成功,返回 builder.getIndexAttr(std::max<int64_t>(0,*cst))——恒≥0。L76-L78:否则注释指出『本可发 max(value,0) 但会让 atomic max/min ut 挂』,故 return value 原样。这是一处有意识的正确性妥协:动态越界 size 交由更下游处理,换取 atomic UT 通过。"
+      },
+      "quantified": "两条分支各 O(1)。常量分支覆盖了 slt/sle/sge 的 newDim(L507/L518/L528)与 minStates 的每维 newDim(L301)——凡编译期能定形状的掩码(本章所有 worked example)都走常量分支,负值必被夹 0。本例不相交 AND 的 newDim=4−10=−6 被夹成 0,得整块空切片 offsets=[10] dims=[0]。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "m9",
+      "intuition": "掩码的下标常常不是光秃秃的 make_range,而是『range 加一个偏移』,比如 (make_range(0,16) + 5) 表示从第 5 个元素起的一段。parseAdd 遇到『一段区间 + 一个标量』时,不改形状,只把区间整体平移:start/end 各加 5,长度不变。addStates 负责判断哪边是标量、哪边是区间。",
+      "worked_example": {
+        "params": {"expr": "arith.addi make_range(0,16), constant dense<5>", "shape": "16", "note": "标量 5 非零,区间真平移"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl,宿主无 CANN;平移按 addStateScalar 的 start/end+=scalar(L213-L214)手推,经 traces/mask_model.py 自校验(m9 段)。addStates 择路见 L228-L248。",
+        "table": {
+          "columns": ["步", "当前 operand", "分派", "结果 MaskState"],
+          "rows": [
+            ["0", "%a = addi %r, %c", "parseAdd (L347)", "递归两侧"],
+            ["1a", "%r = make_range(0,16)", "parseMakeRange", "start=0,end=16,dims=[16],offsets=[0],scalar=∅"],
+            ["1b", "%c = constant dense<5>", "parseConstant(整数)", "scalar=5"],
+            ["0(回填)", "addStates:rhs 是标量", "addStateScalar (L209)", "start=5,end=21,dims=[16],offsets=[0]"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "addStates 要求恰有一侧是标量(异或):两侧都标量→failure,两侧都非标量→failure;仅一侧标量时把标量平移进另一侧的 start/end。故 parseAdd 的合法输入是『区间 + 标量』或『标量 + 区间』。",
+        "argument": "L232-L240:lhsState.scalar && rhsState.scalar → emitWarning failure;!lhs.scalar && !rhs.scalar → emitWarning failure。L242-L246:哪侧有 scalar 就以另一侧为 base 调 addStateScalar。addStateScalar(L213-L214)只把 scalar 加到 base 的 start/end,dims/offsets 透传(L215-L216)——形状不变,仅平移。特例:若 base 各维 dim 全 1(L218-L221)则把结果也标记成 scalar(退化回标量态)。"
+      },
+      "quantified": "本例区间 [0,16) 平移 +5 → [5,21),dims 仍 [16]、offsets 仍 [0];平移量 5≠0 故非退化。这段平移后的 range 通常再喂给一个 cmpi(如 (range+5)<21),由 parseCmp 熔成最终矩形。代价 O(rank):两次 addOpFoldResult + dims/offsets 拷贝。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "m10",
+      "intuition": "有时 mask 不是直接比出来的,而是先用 select 把布尔条件『物化』成 0/1 张量(true→1、false→0),再拿 `!= 0` 变回布尔掩码。parseSel + cmpi 的 ne 特判就是识破这套障眼法:`select(cond,1,0) != 0` 语义上等于 cond 本身,于是把 cond 那个矩形原封不动还原出来。",
+      "worked_example": {
+        "params": {"expr": "cmpi ne, arith.select(cond, 1, 0), 0", "cond": "make_range(0,16) slt 10", "note": "select 的 true=1/false=0 是 ne 识别的唯一形态"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl,宿主无 CANN;还原轨迹按 parseCmp 的 ne 特判(L459-L465 要求 lhs=select、rhs=constant;L544-L553 保持 start/end)+ parseSel 复制 cond 的 offsets/dims(L423-L430)手推,经 traces/mask_model.py 自校验(m10 段)。真实 select 掩码 IR 见 pin 内 parse_select.mlir L26/L30(select %2,%cst_0,%cst → 后续用作 mask)。",
+        "table": {
+          "columns": ["步", "当前算子", "分派 / 判定", "结果 MaskState"],
+          "rows": [
+            ["0", "%m = cmpi ne %s, %c0", "parseCmp:ne 特判 lhs 须 select、rhs 须 const(L459-L465)✓", "待子结果"],
+            ["1", "%s = select %cond,1,0", "parseSel(L401):cond 须 cmpi、true/false 须标量 1/0", "复制 cond 的 offsets/dims"],
+            ["2", "%cond = cmpi slt(range,10)", "parseCmp slt", "offsets=[0],dims=[10]"],
+            ["0(回填)", "ne,rhs=0", "ne case:rhsScalar==0✓,保持不变(L544-L553)", "offsets=[0],dims=[10](还原 cond)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "parseSel 仅接受 select(cmpi-cond, 1, 0) 这一种形态:condition 必须由 cmpi 定义、true 值须标量 1、false 值须标量 0,否则 failure;满足时结果等于 condition 的 MaskState。cmpi ne 仅接受 lhs 来自 select、rhs 是常量 0。",
+        "argument": "parseSel(L405-L438):cond 的 defining 非 CmpIOp→failure(L408-L410);trueState/falseState 必须 .scalar 非空(L413-L419);取整数值须 true==1 且 false==0(L433-L436)才复制 condState 的 start/end/dims/offsets,否则 failure。parseCmp 的 ne 前置(L459-L465):lhs.getDefiningOp<SelectOp> 与 rhs.getDefiningOp<ConstantOp> 缺一即 failure;ne case 内再验 rhsScalar.getInt()==0(L546-L549)。两道窄门保证只有『物化后又比 0』的规范形被还原。"
+      },
+      "quantified": "本例 cond 掩码 offsets=[0]/dims=[10] 经 select→ne!=0 原样还原为 offsets=[0]/dims=[10]——恒等回路,无信息损失。ne 唯一支持 !=0(L546-L549),!=其他常量一律 failure;这是 5 谓词中唯一不改 offset/dim、只透传 start/end 的分支。",
+      "figure_specs": []
+    },
+
+    {
+      "mechanism_id": "m8",
+      "figure_specs": [
+        {
+          "figure_id": "fig13-5",
+          "template": "tensor-flow",
+          "claim": "解析出的矩形 (offsets,dims) 配全 1 strides,在 tensor 域发射成 tensor.extract_slice、在 memref 域发射成 memref.subview——同一个矩形,两种落点。",
+          "numbers": [
+            {"name": "输入矩形", "value": "offsets=[0,0] dims=[10,12]", "provenance": "traces/model_out.json m4.intersection"},
+            {"name": "strides", "value": "全 1 [1,1]", "provenance": "getExtractSlice MaskAnalysis.cpp:L137;getSubview L184"},
+            {"name": "源张量", "value": "16x16", "provenance": "atomic_rmw.mlir 张量形状 tensor<16x16>"},
+            {"name": "tensor 域", "value": "tensor.extract_slice 结果 10x12", "provenance": "getExtractSlice MaskAnalysis.cpp:L133-L143;真实 CHECK atomic_rmw.mlir:L4"},
+            {"name": "memref 域", "value": "memref.subview(rank 不足补 offset0/dim1)", "provenance": "getSubview MaskAnalysis.cpp:L180-L195"}
+          ],
+          "caption_draft": "矩形掩码的两个发射器。offsets/dims 配全 1 strides:tensor 域走 getExtractSlice→tensor.extract_slice(LoadStoreConverter 有 mask 分支据此只 copy 有效片),memref 域走 getSubview→memref.subview(源 rank 不足处尾部补 offset0/dim1)。这就是核心洞察④——结构化世界用『切片』而非逐元素 predication 表达边界。"
+        }
+      ]
+    }
+  ]
+}
