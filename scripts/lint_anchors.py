@@ -21,7 +21,10 @@ HEADING = re.compile(r'^#{1,6}\s+(.*?)\s*$', re.M)
 INCHAPTER = re.compile(r'\]\(#([^)]+)\)')
 
 # 跨章链接: [text](../../chNN-slug/...) 或旧写法 [text](../chNN-slug/...)
-CROSSLINK = re.compile(r'\[([^\]]*)\]\(((?:\.\./)+)(ch\d{2})-([\w\-]+)/[^)]*\)')
+# 跨书链接: [text](../../../../<book>/artifacts/chNN-slug/...) —— 多一层 <book>/artifacts/
+# 段(triton-ascend 对位基座 triton 时常用);可选非捕获段,组序不变(exp-2026-07-23:
+# 全语料 141 章 oracle 表 OLD 1148→NEW 1159、+11 全为真跨书链接、0 漏 OLD)。
+CROSSLINK = re.compile(r'\[([^\]]*)\]\(((?:\.\./)+)((?:[\w.-]+/artifacts/)?)(ch\d{2})-([\w\-]+)/[^)]*\)')
 # 裸文字章号(无链接): "第 N 章"
 BARENUM = re.compile(r'第\s*(\d{1,3})\s*章')
 # 章目录名开头的两位章号，如 "ch20-foo" → 20
@@ -81,11 +84,15 @@ def check_cross(path: str):
     spans = []
     for m in CROSSLINK.finditer(text):
         spans.append(m.span())
-        label, dots, cid, slug = m.group(1), m.group(2), m.group(3), m.group(4)
-        if dots == "../":
+        label, dots, book, cid, slug = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+        # 单层旧路径只对**本书内**链接判(跨书 book 段非空、天然多层),否则误伤跨书。
+        if dots == "../" and not book:
             res["bad_depth"].append(f"  {p.name}: 单层相对路径 ]({dots}{cid}-…(narrative/ 出发须 ../../)")
-        if not (arts / f"{cid}-{slug}").is_dir():
-            res["broken"].append(f"  {p.name}: 悬空跨章链接 → {cid}-{slug}")
+        # 存在性:本书内查 arts/{cid}-{slug};跨书(book 非空)按实际相对路径从 narrative/ 解析,
+        # 落到另一本书的 artifacts(exp-2026-07-23:triton-ascend 对位基座 triton 时链 ../../../../triton/artifacts/chNN)。
+        target = (arts / f"{cid}-{slug}") if not book else (p.parent / f"{dots}{book}{cid}-{slug}")
+        if not target.is_dir():
+            res["broken"].append(f"  {p.name}: 悬空跨章链接 → {book}{cid}-{slug}")
         nm = BARENUM.search(label)
         if nm and int(nm.group(1)) != int(cid[2:]):
             res["num_mismatch"].append(
