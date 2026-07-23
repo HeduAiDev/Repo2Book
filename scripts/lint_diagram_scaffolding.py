@@ -42,6 +42,10 @@ LEAK = re.compile(
     r'|\brun-ledger\b'
     r'|\bfigure-manifest\b'
     r'|\bfigure-spec\b'
+    # fixture_checks(.json):explainer/traces/extract_fixture_checks.py 造的中间产物,
+    # 不带 traces/ 前缀的裸用法漏检过(ch24 fig-m5 图面裸写「fixture_checks.json 无 MTE2→MTE3 项」,
+    # lint 判绿=假阴,独立盲审才抓出——原正则只认带斜杠前缀的中间数据)。全语料 SVG oracle 0 假阳。
+    r'|\bfixture_checks\b'
     r'|\bm\d{2}-[a-z][\w-]*'
 )
 TEXTNODE = re.compile(r'<text[^>]*>(.*?)</text>', re.S)
