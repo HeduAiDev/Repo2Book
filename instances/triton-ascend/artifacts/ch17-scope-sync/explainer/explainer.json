@@ -1,0 +1,415 @@
+{
+  "chapter": "ch17",
+  "title": "把双核落到 IR：Scope 切分与 cube↔vector 同步搬运",
+  "trace_source_note": "skip_impl 章：两 pass 均纯 C++ MLIR、无精简版、宿主无 CANN 环境、dag-sync/dag-scope 本身无 lit 夹具，故全部机制 trace_source=manual，逐轮表由逐字对 pin @2badfc89e 源码手工推演（见 explainer/traces/manual-derivation.md），引用源码常量的数字标 file:Lxxx。其中 m7(nz shape)/m15(flag%14) 的纯整数算术另用 traces/verify_arith.py 按源码同式在 host 复算交叉验证（traces/verify_arith.out），该脚本只 replay 确定性整数公式，非 pass dump。贯穿实例 out=a@b+bias。",
+
+  "mechanisms": [
+    {
+      "mechanism_id": "m1-pipeline-order",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m1-pass-order",
+          "template": "flow",
+          "claim": "add_auto_scheduling 下，DAGSync 先在还没切 scope 的扁平 IR 上插同步+搬运，DAGScope 后把函数体切成 AIV/AIC 两个 scope。",
+          "numbers": [
+            {"label": "pass 顺序第 1 步", "value": "add_dag_sync", "provenance": "third_party/ascend/backend/compiler.py:L123"},
+            {"label": "pass 顺序第 2 步", "value": "add_dag_scope", "provenance": "third_party/ascend/backend/compiler.py:L124"},
+            {"label": "pass 顺序第 3 步(收尾)", "value": "add_dag_ssbuffer", "provenance": "third_party/ascend/backend/compiler.py:L127"}
+          ],
+          "caption_draft": "先在线性数据流上找跨核边插 set/wait+搬运最直观；切 scope 会把 cube/vector 拆进两个 region，那时再找跨核边要跨 region，复杂得多——所以 DAGSync 必须先跑。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m2-why-cross-core-sync",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m2-race-vs-sync",
+          "template": "before-after",
+          "claim": "cube 写 buffer、vector 读同一 buffer；无 set/wait 时 vector 可能在 cube 写完前就开读，读到半成品——数据竞争，编译能过但数值随机错。",
+          "numbers": [
+            {"label": "触发同步的核对组合数(只有一端 cube 另一端 vector)", "value": "1", "provenance": "needVectorCubeSync 仅 CUBE_ONLY↔VECTOR_ONLY 为真，third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L243-247"},
+            {"label": "一次跨核依赖需要的握手 op 数(1 set + 1 wait)", "value": "2", "provenance": "insertSyncAndMovement 成对插 set/wait，third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L646-671"}
+          ],
+          "caption_draft": "左：无同步，vector 的读与 cube 的写时序未定，读到旧值/半成品。右：cube 写完 set 发信号、vector wait 到信号再读——握手保证读到的一定是写完的数据。这就是本章存在的根本理由。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m3-legalize-dot",
+      "intuition": "cube 是只擅长纯矩阵乘的车间。带偏置的 a@b+bias 里，「+bias」是逐元素加，本该 vector 车间干。LegalizeDot 把这两步拆开——像把「印刷+装订」拆成两个工位，各归各的车间，中间自然出现一条交接边。",
+      "worked_example": {
+        "params": {"a": "[16,32] fp16", "b": "[32,16] fp16", "c(累加器)": "bias[16,16] 非零", "dot": "triton.dot(a,b,c)"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl：DAGSync 是纯 C++ MLIR pass、无精简版、宿主编不动、dag-sync 无 lit 夹具，逐字对 pin @2badfc89e DAGSync.cpp:L793-843 手工推演（不伪造 pass dump）。",
+        "table": {
+          "columns": ["步", "动作", "判定/值", "IR 结果"],
+          "rows": [
+            ["1", "取 dot 三操作数 a/b/c，判累加器 c 是否 dense splat 0 (L805-812)", "bias 非零 → isZeroAccumulator=false", "进入拆分分支 (L813)"],
+            ["2", "建全零常量作新累加器 (L820-822)", "zeroConstant = arith.constant splat-0 [16,16]", "新增 1 个 constant op"],
+            ["3", "建新 dot，累加器换成零 (L825-826)", "newDot = triton.dot(a,b,zeroConstant)", "newDot 结果核 = CUBE_ONLY"],
+            ["4", "建加法把 bias 加回 (L829)", "addOp = arith.addf(newDot, bias)", "addOp 结果核 = VECTOR_ONLY"],
+            ["5", "replaceAllUsesWith(addOp)；原 dot use_empty→erase (L834,L837-839)", "原 dot 被 addf 顶替并删除", "产出 1 条 dot(cube)→addf(vector) 数据边"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "拆分后新 dot 的累加器恒为 splat-0，dot 回归「纯乘累加」这一 cube 唯一职责；bias 的加法被剥离成独立 addf 落到 vector。walk 对每个 DotOp 恰处理一次，原 dot erase 后不再被匹配，故过程终止。",
+        "argument": "基例：累加器已是 splat-0 的 dot 不进拆分分支（isZeroAccumulator=true），保持原样。归纳步：非零累加器的 dot 被替换为 constant+dot(零)+addf 三 op 且原 dot erase；新 dot 的累加器是刚建的 splat-0，不会再次触发拆分——单调收敛，无重复展开。"
+      },
+      "quantified": "拆分把 1 个「兼做乘+加」的 dot 变成 3 个 op（constant、dot、addf），净增 2 个 op，换来 1 条边界清晰的 cube→vector 边——后续所有同步/搬运机制都挂在这条边上。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m4-sync-walk-trigger",
+      "intuition": "编译器沿数据流走一遍，每看到「上游在一颗核、下游在另一颗核，且一个是 cube 一个是 vector」，就在这条边上补一次同步；已经处理过的 (上游,下游) 对用一个集合记下，不重复插。",
+      "worked_example": {
+        "params": {"IR": "m3 产出：newDot(cube) → addf(vector) → store(vector)", "syncFlag 起始": "0"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl：手工对 pin DAGSync.cpp:L1258-1273(判据) + L243-247(needVectorCubeSync) + L1281(flag%14) 推演，无 pass dump。",
+        "table": {
+          "columns": ["轮", "当前 op(核)", "输入 op(核)", "needVectorCubeSync?", "去重(processedPairs)", "动作"],
+          "rows": [
+            ["1", "addf (VECTOR)", "newDot (CUBE)", "true (一 cube 一 vector)", "首见，insert 成功", "插 set/wait，flag=syncFlag%14=0，之后 syncFlag++ →1 (L1281)"],
+            ["2", "addf (VECTOR)", "bias (VECTOR)", "false (同核 VECTOR)", "不触发", "跳过，不插"],
+            ["3", "store (VECTOR)", "addf (VECTOR)", "false (同核 VECTOR)", "不触发", "跳过，不插"],
+            ["4", "(设想)addf 二次遇同一 (newDot,addf) 对", "newDot (CUBE)", "true", "已在集合中，insert 返回 false", "去重命中，不重复插"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "processedPairs 是只增不减的集合，每个 (inputOp,op) 对最多插一次同步；数据流边数有限，故 walk 必然停止且无重复同步。",
+        "argument": "单调量：已处理对的集合大小随每次成功 insert 严格 +1，上界是「跨核边总数」这个有限值。needVectorCubeSync 只对 CUBE_ONLY↔VECTOR_ONLY 返回 true，同核/标量边永不触发；每条跨核边首见插一次、再见被 set.insert 的 false 挡掉——集合单调有界 ⇒ 有限步收敛。"
+      },
+      "quantified": "本例 3 条数据边中只有 1 条(newDot→addf)跨核、插 1 组 set/wait；另 2 条同核不插。flag=syncFlag%14 ⇒ 取值恒落在 [0,13]（见 m15）。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m5-cube-to-vector-movement",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m5-cube-to-vector",
+          "template": "tensor-flow",
+          "claim": "CUBE→VECTOR：srcOp 后插 set(CUBE,PIPE_FIX/PIPE_V)，fixpipe(NZ2ND) 把 cube 结果(L0C/nz)搬进 UB，dstOp 前(FindEarliestPosition)插 wait(VECTOR) 再读。",
+          "numbers": [
+            {"label": "set 的 tcore_type", "value": "CUBE", "provenance": "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L649-650"},
+            {"label": "set 的 tpipe/pipe", "value": "PIPE_FIX / PIPE_V", "provenance": "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L651-652"},
+            {"label": "fixpipe DMA 模式", "value": "NZ2ND", "provenance": "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L324-325"},
+            {"label": "wait 的 tcore_type", "value": "VECTOR", "provenance": "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L668-669"}
+          ],
+          "caption_draft": "同步管时序、搬运管位置+格式：set 在搬运源之后、wait 在搬运目的之前，fixpipe 负责把 nz 布局的 cube 结果 NZ2ND 落进 vector 能读的 UB。少了 fixpipe，vector 连地址空间都够不着。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m6-vector-to-cube-movement",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m6-vector-to-cube",
+          "template": "tensor-flow",
+          "claim": "VECTOR→CUBE：set(VECTOR,PIPE_MTE3/PIPE_MTE1) 插在 FindLastestPosition，to_memref(UB)→CBUF(L1) nz alloc→copy→convert_layout(ND)，dstOp 前 wait(CUBE) 再算。",
+          "numbers": [
+            {"label": "set 的 tcore_type", "value": "VECTOR", "provenance": "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L681"},
+            {"label": "set 的 tpipe/pipe", "value": "PIPE_MTE3 / PIPE_MTE1", "provenance": "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L682-683"},
+            {"label": "CBUF 目标地址空间", "value": "L1", "provenance": "insertVectorToCubeDataMovement 走 CBUF alloc，third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L423-545"},
+            {"label": "wait 的 tcore_type", "value": "CUBE", "provenance": "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L702-703"}
+          ],
+          "caption_draft": "反方向比正方向多一层：cube 读数据要进 L1(CBUF) 且按 32B 对齐重排成 nz(见 m7)，所以搬运链更长——to_memref 出 UB、copy 进 CBUF、convert_layout 转 ND，全部搬完 set，cube 侧 wait 到才开算。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m7-cbuf-nz-align",
+      "intuition": "cube 读 L1(CBUF) 要求最内维凑满 32 字节整块，像货架每格必须放满 32 字节才好取。所以把 2D 矩阵重排成 4D「分形块」nz 布局：每块 16 行高、最内维 blk 个元素，blk 恰好让最内维 = 32 字节。",
+      "worked_example": {
+        "params": {"memref": "[M=32, N=64]", "约束": "M%16==0 否则不重排(返回 nullopt)"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl：手工对 pin DAGSync.cpp:L386-419 推演；纯整数算术另用 traces/verify_arith.py 按源码同式在 host 复算(traces/verify_arith.out 一致)，非 pass dump。",
+        "table": {
+          "columns": ["元素类型", "elem_bytes", "blk=32/elem_bytes", "nz shape=(N/blk, M/16, 16, blk)", "最内维字节=blk*elem_bytes"],
+          "rows": [
+            ["fp16", "2", "16", "(4, 2, 16, 16)", "32"],
+            ["fp32", "4", "8", "(8, 2, 16, 8)", "32"],
+            ["int8", "1", "32", "(2, 2, 16, 32)", "32"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "blk*elem_bytes 恒等于 32（因 blk=32/elem_bytes），故重排后最内维必然 32 字节对齐；且总元素数守恒 (N/blk)*(M/16)*16*blk = N*M，不丢不增数据。",
+        "argument": "基例整除：只有 elem_bytes 整除 32 时 getBlockElemsFor32BAlign 才成功(否则 failure)，故 blk=32/elem_bytes 为整且 blk*elem_bytes=32 精确成立；elem_bytes≥32 时 blk=1、最内维=elem_bytes≥32 仍达标(L390-391)。守恒：4 维乘积 = N/blk * M/16 * 16 * blk = N*M，blk 与 16 各自约去。前置 M%16!=0 直接 nullopt(L414-415)不做重排，避免不整除的分形。"
+      },
+      "quantified": "三种类型最内维字节 = blk*elem_bytes = 16*2 = 8*4 = 32*1 = 32B，全部对齐；三例总元素均守恒为 32*64=2048（verify_arith.out 复算一致）。源码注释 L417 的 (N/16,M/16,16,16) 仅 fp16 特例，非 fp16 须以代码 blk 为准。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m7-nz-layout",
+          "template": "layout",
+          "claim": "fp16 下 memref[32,64] 重排为 4D nz (4,2,16,16)：最内维 16 元素 ×2B = 32B 对齐，供 cube 读 CBUF。",
+          "numbers": [
+            {"label": "M", "value": "32", "provenance": "worked_example 选参(M%16==0)，公式 third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L418"},
+            {"label": "N", "value": "64", "provenance": "worked_example 选参"},
+            {"label": "fp16 的 blk", "value": "16", "provenance": "blk=32/2，third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L386-396"},
+            {"label": "nz shape", "value": "(4,2,16,16)", "provenance": "(N/blk,M/16,16,blk)，third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L418；verify_arith.out"},
+            {"label": "最内维字节", "value": "32", "provenance": "16*2B，kAlignBytes=32，third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L387"}
+          ],
+          "caption_draft": "2D 逻辑矩阵 → cube 要的 4D 分形 nz：16 是 cube 分形块高、blk 是 32B 对齐后的最内维宽。这就是 VECTOR→CUBE 搬运里 copy 之前那步 reshape 的目标形状。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m8-scf-for-sync",
+      "intuition": "循环里若「这一轮某核算出的值，下一轮要喂给另一颗核用」，跨核依赖就藏在迭代参数里——数据不走一条明线，而是绕过 yield 再从 iter_arg 回到循环体。要在 yield 定义处 set、在循环体里首个用它的 op 前 wait。",
+      "worked_example": {
+        "params": {"循环": "scf.for iter_args(%acc=%init)", "体内": "%c=dot(...)(cube)；%v=addf(%acc,...)(vector) 用 %acc；yield %c"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl：手工对 pin DAGSync.cpp:L106-212 推演，dag-sync 无 lit 夹具、不伪造 dump。",
+        "table": {
+          "columns": ["迭代参数 i", "firstUser(核)=iterType", "yield 定义 op(核)=yieldType", "匹配分支", "插入"],
+          "rows": [
+            ["0 (%acc)", "addf → VECTOR_ONLY", "dot → CUBE_ONLY", "yieldType=CUBE && iterType=VECTOR (L164)", "yieldDefiningOp 后 set(CUBE,PIPE_FIX/PIPE_V)；firstUser 前 wait(VECTOR)；插 cube→vector 搬运"],
+            ["1 (设想 %m)", "dot → CUBE_ONLY", "dot → CUBE_ONLY", "两核同为 CUBE，无匹配", "不插"],
+            ["2 (设想 %n)", "dot → CUBE_ONLY", "addf → VECTOR_ONLY", "yieldType=VECTOR && iterType=CUBE (L190)", "set(VECTOR,PIPE_MTE3/PIPE_MTE1)+wait(CUBE)；注意此支数据搬运调用被注释掉(源码 L202)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "每个迭代参数最多插一次同步；firstUser 唯一确定为循环体内第一个使用该 iterArg 的非 yield op。遍历 initArgs 是有限循环，必然终止。",
+        "argument": "单调量：外层 for 遍历 initArgs 索引 i 从 0 递增到 size()-1，有限步。每个 i 独立处理一次，firstUser 由「体内首个 use」唯一定义(找到即 break, L142-145)；只有 (yieldType,iterType) 恰为 (CUBE,VECTOR) 或 (VECTOR,CUBE) 两种异核组合才插，其余组合直接跳过——无重复、无遗漏地覆盖每个跨核迭代参数。"
+      },
+      "quantified": "循环携带的跨核依赖同样一次 set+wait/参数；flag 由调用方传入 syncFlag%14(L1241)。本例 3 个迭代参数中 2 个跨核(各插 1 组)、1 个同核(不插)。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m9-set-wait-placement",
+      "intuition": "同步点不是死板贴在 src 后 / dst 前。wait 尽量往前挪、set 尽量往「数据最小」处挪（回溯到 broadcast/expand_dims 之前），让跨核 buffer 在 UB 里存活时间最短、占用最小；一旦撞上已有的同类 sync 就停，绝不越过既有屏障。",
+      "worked_example": {
+        "params": {"CUBE→VECTOR": "dstOp=addf，其上游序列 …→set(VECTOR)→broadcast→addf", "VECTOR→CUBE": "srcOp 下游序列 …→expand_dims→broadcast→(首个依赖 cube 的 vector op)"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl：手工对 pin DAGSync.cpp:L547-602 推演，无 pass dump。",
+        "table": {
+          "columns": ["函数", "方向", "扫描", "命中/停止条件", "落点"],
+          "rows": [
+            ["FindEarliestPosition(dstOp)", "CUBE→VECTOR 的 wait", "从 dstOp 向上 getPrevNode，insertPos 逐步上移(L594-599)", "遇 SyncBlockSetOp(VECTOR) 立即返回 insertPos(L596-598)；跨 block 的 prevOp 跳过(L595)", "wait 插在 broadcast 前(即既有 set 之后)——比贴 dstOp 前更早，UB 存活更短"],
+            ["FindLastestPosition(srcOp)", "VECTOR→CUBE 的 set", "从 srcOp 向下 getNextNode 找首个「非 cube 且操作数有 cube 定义」的 op(L552-560)", "命中后向上回溯到首个 BroadcastOp(其前若 ExpandDimsOp 取之)(L562-569)；遇 SyncBlockWaitOp(VECTOR) 即返回(L580-583)", "set 插在 expand_dims 前——shape 最小处，防 UB 溢出"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "落点微调只在同 block 内移动，且遇到反向 sync 立即停止，绝不越过已有屏障；回溯目标（broadcast/expand_dims 的最小 shape 点）由 IR 结构唯一确定，故收敛。",
+        "argument": "有界性：向上/向下扫描都以 getPrevNode/getNextNode 为步、以 block 边界为界(nullptr 或跨 block 即止)，步数不超过 block 内 op 数。安全性：撞到反向 SyncBlockSet/Wait 立刻返回当前 insertPos，保证新同步不会被挪到既有屏障的另一侧而破坏顺序。最优性目标固定：回溯锁定「首个 broadcast(前含 expand_dims)」这个 shape 收缩点，唯一且可达。"
+      },
+      "quantified": "broadcast 通常把 [1,N] 扩成 [M,N]；把同步插到 broadcast 前的小 shape 处，跨核 buffer 的 UB 占用相应省下被广播的那一维（源码注释「prevent UB overflow, break at the point where the result shape is minimized」，L560-563）。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m10-mem-effects-sync",
+      "intuition": "有些跨核依赖不走 SSA 明线，而是两颗核先后读/写了同一块内存（别名）。SSA 的 use-def 看不见这种隐式依赖，得靠别名分析额外补同步——像两人往同一个信箱塞信/取信，即使没直接把信递给对方，也得约定先后，否则取到空信箱或旧信。",
+      "worked_example": {
+        "params": {"读写对": "cube 写 buf(prev)，vector 读 buf(curr)，mayAlias=true", "syncFlag": "调用方传入"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl：手工对 pin DAGSync.cpp:L1085-1105(判据)+L1114-1117(pipe/flag) 推演，无 pass dump。",
+        "table": {
+          "columns": ["读写对(prev,curr)", "(prevWrite||curr isWrite)", "mayAlias?", "异核(isOn 不同)?", "登记候选?"],
+          "rows": [
+            ["cube-Write buf, vector-Read buf", "true(prev 是 Write)", "true", "true(CUBE≠VECTOR)", "登记：srcCoreType=prevNode->isOn()=CUBE(L1092)，push SyncCandidate(L1103)"],
+            ["vector-Read bufA, vector-Read bufB", "false(两个都是 Read)", "-", "-", "不登记(纯读无 WAR/WAW/RAW)"],
+            ["cube-Write buf, vector-Write buf(setAfter==waitBefore)", "true", "true", "true", "不登记：公共祖先里 setAfter==waitBefore 直接 continue(L1100-1102)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "只有「至少一方是写 + 可能别名 + 异核」三条件同真时才登记候选（覆盖 WAR/WAW/RAW 隐式依赖）；同一公共祖先 block 内 setAfter≠waitBefore 才成对插，按支配序去重不重复。",
+        "argument": "三重合取门(L1087-1091)是充要过滤：纯读-读无内存冲突(第一条假)、不别名则无共享(第二条假)、同核靠硬件流水有序(第三条假)——任一为假即跳过，杜绝无谓同步。去重按 dominance/postDominance 排序后丢掉被包含/重复候选，且 setAfter==waitBefore(同一点)无需同步直接 continue，保证每对隐式依赖至多一组 set/wait。"
+      },
+      "quantified": "登记的 set/wait pipe：srcPipe = (srcCoreType==CUBE ? PIPE_FIX : PIPE_MTE2)，dstPipe = PIPE_S，flag = syncFlag%14（L1114-1117）。这是数据流边同步之外的第二类同步来源。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m11-encapsulate-scope",
+      "intuition": "先造两个空车间(scope.scope)：一个贴 VECTOR 牌、一个贴 CUBE 牌。先把函数体所有 op 一股脑塞进 VECTOR 车间，CUBE 车间暂时空着，后面 SplitScope 再往 CUBE 里复制/裁剪。像先把所有工具堆进一个房间，再分拣到两个工位。",
+      "worked_example": {
+        "params": {"函数体": "dot、addf、store 等（含已插好的 sync/搬运 op）"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl：手工对 pin DAGScope.cpp:L69-151 推演，dag-scope 无 lit 夹具、不伪造 dump。",
+        "table": {
+          "columns": ["步", "动作", "scope 状态"],
+          "rows": [
+            ["1", "收集 lastBlock 内非 constant/programid/alloc 的 op 按原序(L69-138)", "待搬清单 = [dot, addf, store, …]"],
+            ["2", "建第一个 scope.scope=scopeOp，全部搬入并补 scope.return", "scopeOp = { 全部 op }"],
+            ["3", "scopeOp.setAttr(tcore_type=VECTOR) (L146-148)", "scopeOp 贴 VECTOR 牌(aivScope)"],
+            ["4", "建第二个空 scope.scope=newScopeOp，setAttr(tcore_type=CUBE) (L149)", "newScopeOp = { 空 }(aicScope)"],
+            ["5", "return {scopeOp(aiv), newScopeOp(aic)} (L150)", "两 scope 就位，待 SplitScope 填 CUBE"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "encapsulateWithScope 恰建 2 个 scope，顺序固定为 VECTOR 先、CUBE 后；constant/programid/alloc 不搬进 scope（留在函数头）。",
+        "argument": "构造式恒成立：函数体只 new 两次 scope.scope，第一次必打 VECTOR、第二次必打 CUBE(L146-149 硬编码顺序)，故「第一个=aiv、第二个=aic」是不变式，被后续 addSyncOpsForBufferWait 按 tcore_type 反查时依赖。常量/programid/alloc 被排除在收集范围外(L69-138 过滤)，保证它们不被封进某一颗核的 scope。"
+      },
+      "quantified": "1 次全量搬入 + 2 个 scope；此时 aivScope 含全部 op、aicScope 为空——真正的按核分发在 m13(SplitScope)完成。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m11-encapsulate",
+          "template": "before-after",
+          "claim": "扁平函数体 → [VECTOR scope { 全部 op }] + [CUBE scope { 空 }]，两 scope 靠 tcore_type 属性区分归属。",
+          "numbers": [
+            {"label": "建立的 scope 数", "value": "2", "provenance": "两次 create scope.scope，third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L69-151"},
+            {"label": "第一个 scope 属性", "value": "VECTOR", "provenance": "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L146-148"},
+            {"label": "第二个 scope 属性", "value": "CUBE", "provenance": "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L149"}
+          ],
+          "caption_draft": "scope.scope 是中性容器，靠挂 #hivm.tcore_type<CUBE|VECTOR> 属性标记归哪颗物理核。先全塞进 VECTOR、CUBE 留空，是为让下一步 SplitScope 用「复制+裁剪」而非「搬移」来填 CUBE。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m12-collect-ops-routing",
+      "intuition": "分拣规则决定每个 op 去哪个车间：copy 只去 vector、fixpipe 只去 cube、循环/scope 这种骨架两边都要，其余按 ch16 算出的核标注(valueTypes)走。像按工序把零件分到不同工位，而传送带(骨架)两个工位都得有一截。",
+      "worked_example": {
+        "params": {"待路由 op": "dot、addf、copy、fixpipe、scf.for、sync_block_set(tcore_type=CUBE/VECTOR)"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl：手工对 pin DAGScope.cpp:L158-310 推演，无 pass dump。",
+        "table": {
+          "columns": ["op", "规则来源", "needsMoveAiv", "needsMoveCube"],
+          "rows": [
+            ["dot", "valueTypes=CUBE_ONLY (L164-185)", "false", "true"],
+            ["addf", "valueTypes=VECTOR_ONLY (L164-185)", "true", "false"],
+            ["copy", "isa CopyOp 专规 (L186-189)", "true", "false"],
+            ["fixpipe", "isa FixpipeOp 专规 (L191-194)", "false", "true"],
+            ["scf.for / scope.scope / scf.yield", "结构 op 专规 (L196-200)", "true", "true"],
+            ["sync_block_set(tcore_type=CUBE)", "sync 按 tcore_type 属性 (L251-261)", "false", "true"],
+            ["sync_block_set(tcore_type=VECTOR)", "sync 按 tcore_type 属性 (L251-261)", "true", "false"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "结构 op（scf.for/if/scope/yield）必两侧都要，骨架在两个 scope 里都不能缺；纯计算 op 按 valueTypes 或专规恰选一侧（copy→aiv、fixpipe→cube）；sync op 按自身 tcore_type 属性归位。",
+        "argument": "路由是「先按 valueTypes 置位、再让专规覆盖」的确定映射：每个 op 走完 L164-261 后 (needsMoveAiv,needsMoveCube) 取值唯一确定。结构 op 强制两侧(L196-200)保证循环/分支骨架在 cube、vector scope 各有一份可裁剪的副本(下一步 m13 才裁 arg/result)；copy/fixpipe 各锚一核，与其数据搬运语义(copy 出 UB 归 vector、fixpipe 搬出归 cube)一致。"
+      },
+      "quantified": "路由输入 = ch16 的 valueTypes(Value→CoreType，见 [ch16](../ch16-core-affinity/narrative/chapter.md))交位 + 5 类专规(copy/fixpipe/结构/store/assert/sync)覆盖特例；输出是每个 op 的 (aiv?,cube?) 二元标记，喂给 SplitScope。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m12-routing-table",
+          "template": "state-table",
+          "claim": "op 路由到 (aiv?,cube?)：copy→仅 aiv、fixpipe→仅 cube、scf/scope/yield→两侧、sync→按 tcore_type、其余→按 valueTypes。",
+          "numbers": [
+            {"label": "结构 op 两侧都要的类别数(yield/scope/for)", "value": "3", "provenance": "isa<scf::YieldOp>||isa<scope::ScopeOp>||isa<scf::ForOp>，third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L196-200"},
+            {"label": "copy 归属", "value": "aiv", "provenance": "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L186-189"},
+            {"label": "fixpipe 归属", "value": "cube", "provenance": "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L191-194"}
+          ],
+          "caption_draft": "分拣表一列 aiv、一列 cube：勾两个的是骨架 op(循环/分支)，各勾一个的是计算/搬运/同步 op。这张表就是 SplitScope 双遍的输入。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m13-split-scope-rebuild",
+      "intuition": "真正分拣时把 op 复制进目标 scope。循环/分支这种带迭代参数和结果的骨架不能整个照搬——得按核裁剪：aiv 侧丢掉 CUBE_ONLY 的结果/参数、aic 侧丢掉 VECTOR_ONLY 的，各留半个数据流；最后逆序删掉原 op(先删用、后删定义，不留悬空引用)。",
+      "worked_example": {
+        "params": {"骨架": "一个 scf.for，迭代参数含 1 个 vector 的、1 个 cube 的"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl：手工对 pin DAGScope.cpp:L327-690 推演，无 pass dump。",
+        "table": {
+          "columns": ["遍", "MoveType", "处理集", "scf.for 迭代参数怎么裁", "去重"],
+          "rows": [
+            ["1 (aiv)", "CUBE_ONLY(丢 cube)", "aivToMove", "重建时丢掉 CUBE_ONLY 迭代参数/结果，保留 vector 的", "aivUsedOp 已含则 return，防同 op 处理两次(L652-657)"],
+            ["2 (aic)", "VECTOR_ONLY(丢 vector)", "cubeToMove", "重建时丢掉 VECTOR_ONLY 迭代参数/结果，保留 cube 的", "aicUsedOp 同上(L666-670)"],
+            ["3 (收尾)", "-", "aivToMove∪cubeToMove 原 op", "-", "汇入 deleteOp 逆序 erase(L672-688)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "逆序 erase 保证先删使用者、后删定义者，无悬空引用；MoveType 过滤保证每个 scope 只含本核该有的迭代参数/结果；aivUsedOp/aicUsedOp 防同一 op 被处理两次。",
+        "argument": "SSA 安全：原 op 按逆序(后定义的先删)erase，任何被删 op 的结果此时已无使用者——因为使用它的 op 更靠后、已先被删或已被 clone 进 scope 并改指到副本。裁剪正确性：processOperationToMove 对 scf.for/if/yield 按 MoveType 逐 result 过滤重建(L378-462)，CUBE_ONLY 遍丢 cube result、VECTOR_ONLY 遍丢 vector result，两副本迭代参数互补、合起来恰是原骨架。去重集合保证幂等。"
+      },
+      "quantified": "一个 scf.for → 两份按核裁剪的副本(aiv 保 vector arg/result、aic 保 cube 的)；原 N 个 op → 逆序 erase N 个。两遍 MoveType 恰互为对方的补(CUBE_ONLY vs VECTOR_ONLY)。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m13-split-rebuild",
+          "template": "before-after",
+          "claim": "一个 scf.for → aiv 副本(裁去 cube 迭代参数/结果) + aic 副本(裁去 vector 的)，原 op 逆序 erase。",
+          "numbers": [
+            {"label": "aiv 遍 MoveType(丢弃的核)", "value": "CUBE_ONLY", "provenance": "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L658"},
+            {"label": "aic 遍 MoveType(丢弃的核)", "value": "VECTOR_ONLY", "provenance": "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L670"},
+            {"label": "一个骨架产出的副本数", "value": "2", "provenance": "双遍各 clone 一份，third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L650-670"}
+          ],
+          "caption_draft": "不是简单 move 而是 clone+裁剪：循环骨架在两个 scope 各留一份，各自只跑本核那半迭代。裁掉不属本核的 arg/result 是关键——否则副本会引用另一颗核的值。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m14-buffer-wait-sync",
+      "intuition": "scope 切好后，cube 车间里的 fixpipe(往 UB 搬结果)和 vector 车间里的 to_memref(往 cube 交数据)还需要一层「缓冲就绪」握手：fixpipe 前先等 vector 把 buffer 腾空(wait)、cube 尾也等、vector 头 set——形成「我腾好了 / 我用完了」的双向闭环，靠 static_flag_id 跨两个 region 配对。",
+      "worked_example": {
+        "params": {"aicRegion": "含 1 个 fixpipe", "aivRegion": "含对应 to_memref"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl：手工对 pin DAGScope.cpp:L885-939(processFixpipeOpsInAIC)+L693-810(构造/配对) 推演，无 pass dump。",
+        "table": {
+          "columns": ["步", "位置", "插入 op", "flag"],
+          "rows": [
+            ["1", "aic 内 fixpipe 前", "wait(CUBE, PIPE_V/PIPE_FIX)", "newflag=findFixPipeFlagSafe(fixpipe)(取其下一行 sync_block_set 的 static_flag_id，L848-866)"],
+            ["2", "aic 尾 return 前", "wait(CUBE, PIPE_V/PIPE_FIX) (insertWaitBeforeFinalReturn, L725-753)", "newflag"],
+            ["3", "aiv 头", "set(VECTOR, PIPE_V/PIPE_FIX) (insertSetAtRegionStart, L756-782)", "newflag"],
+            ["4 (回程)", "aiv 内同 flag2 的 wait 之后", "set(newflag)", "flag2 = fixpipe 后下一个 sync_block_set 的 flag(L905-939)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "每个 wait 都有配对的同 static_flag_id 的 set（正程：aiv 头 set ↔ aic fixpipe/尾 wait；回程：aiv set ↔ 后续 wait），跨 region 靠 flag 唯一标识，故无孤儿 wait，不死锁。",
+        "argument": "配对构造式成对生成：processFixpipeOpsInAIC 对每个 fixpipe 一次性插「aiv 头 set(newflag) + aic 两处 wait(newflag)」，set 与 wait 同 newflag、分处两 region，findWaitOpInRegionWithFlag 按 static_flag_id 精确匹配(L806-817)。回程再补一对。newflag 取自 findFixPipeFlagSafe——若返回 -1(找不到既存 set)则该 fixpipe 不配(退化保护)，不会插出等不到的 wait。"
+      },
+      "quantified": "每个 fixpipe 触发 3 个正程同步 op(1 set + 2 wait) + 回程 1 set；flag 复用现存 set 的 static_flag_id(findFixPipeFlagSafe，失败返 -1)。这层是 pipeline 级 buffer 就绪握手，叠加在 m4~m6 的数据流级 set/wait 之上。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m14-buffer-wait",
+          "template": "swimlane",
+          "claim": "aic region(fixpipe 前 wait、尾 wait) 与 aiv region(头 set、回程 set) 靠 static_flag_id 跨 region 配对，构成双向 buffer 就绪握手。",
+          "numbers": [
+            {"label": "每个 fixpipe 正程同步 op 数", "value": "3", "provenance": "1 set(aiv头)+2 wait(fixpipe前/aic尾)，third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L885-903"},
+            {"label": "fixpipe 前 wait 的 tcore_type", "value": "CUBE", "provenance": "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L889-896"},
+            {"label": "aiv 头 set 的 tcore_type", "value": "VECTOR", "provenance": "insertSetAtRegionStart，third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L756-772"},
+            {"label": "配对键", "value": "static_flag_id", "provenance": "findWaitOpInRegionWithFlag，third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L806-817"}
+          ],
+          "caption_draft": "两条泳道 = 两颗核的 region。箭头是同 flag 的 set→wait 配对：aiv 头 set 告诉 aic「buffer 腾好了」，aic fixpipe 前 wait 等到才搬。每个 wait 都有源，才不会有人干等——这就是不死锁的保证。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m15-flag-pool-deadlock",
+      "intuition": "昇腾跨核事件靠有限个「信号旗」(flag id)标识：每次 set 举一面旗、对应 wait 落一面同号旗。旗只有 14 面(0..13)，用 syncFlag%14 循环复用。若某个 wait 等的旗永远没人举(配对丢失)，或两核互等成环，对应核就永久卡住——死锁。",
+      "worked_example": {
+        "params": {"旗池大小": "14", "计数器": "syncFlag 每插一条边 +1"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl：手工对 pin DAGSync.cpp:L1116/L1241/L1281 推演；纯整数取模另用 traces/verify_arith.py 复算(traces/verify_arith.out 一致)，非 pass dump。",
+        "table": {
+          "columns": ["第几条跨核边", "syncFlag", "flag=syncFlag%14", "配对状态"],
+          "rows": [
+            ["第 1 条", "0", "0", "set flag0 ↔ wait flag0 ✓"],
+            ["第 14 条", "13", "13", "举到旗池最后一面 flag13 ✓"],
+            ["第 15 条", "14", "0", "旗号回绕复用 flag0(须前一个 flag0 握手已完成才安全)"],
+            ["(故障)wait flag=5 无对应 set", "-", "5", "该核永久阻塞 → 死锁"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "set 与 wait 一一按 flag 配对，每个 wait 终会被某个同 flag 的 set 释放，故无死锁；旗号 flag∈[0,13] 恒成立(=syncFlag%14)。",
+        "argument": "值域：任意非负 syncFlag，syncFlag%14∈{0,…,13}，恒落在 14 面旗池内(L1116/L1241/L1281 三处一致)。活性：只要每个 wait 都能追溯到一个先行的同 flag set(由 m4 成对插入、m14 按 static_flag_id 配对保证)，且同号旗不被两组未完成握手同时占用(顺序结构 + 计数器递增保证)，则每个等待终被释放。破坏任一前提(丢 set / 复用未完成的旗 / 交叉成环)即死锁——这正是配对与取模两条规则要防的。"
+      },
+      "quantified": "旗池大小 14；第 k 条跨核边用旗 k%14；超过 14 条边即开始复用同号旗(第 15 条回到 flag0)。verify_arith.out：syncFlag 0/13/14 → flag 0/13/0，复算一致。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m16-warp-spec-contrast",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m16-warp-vs-scope",
+          "template": "before-after",
+          "claim": "昇腾用 scope.scope + sync_block_set/wait 跨两颗物理核(cube/vector)做 producer/consumer 分工，对位 Hopper 用 warp 分组 + mbarrier 在同一 SM 内([ch31](../ch31-warp-specialization/narrative/chapter.md))。",
+          "numbers": [
+            {"label": "昇腾分域的物理核数(cube+vector)", "value": "2", "provenance": "encapsulateWithScope 建 CUBE/VECTOR 两 scope，third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L139-150"},
+            {"label": "昇腾同步原语", "value": "sync_block_set/wait", "provenance": "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L647-707"},
+            {"label": "昇腾事件旗池", "value": "14", "provenance": "syncFlag%14，third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L1116"}
+          ],
+          "caption_draft": "同一个「生产者/消费者分工 + 同步」思想，两种硬件两套物化：Hopper 是同一 SM 内 warp 分组 + 共享内存 mbarrier；昇腾是两颗异构物理核跨核 + block 级事件 + 显式跨地址空间数据搬运(fixpipe/copy)。跨物理核这一点决定了昇腾必须显式搬数据而非共享内存。"
+        }
+      ]
+    }
+  ]
+}

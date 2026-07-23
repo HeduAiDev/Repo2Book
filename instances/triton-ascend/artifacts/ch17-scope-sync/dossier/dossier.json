@@ -1,0 +1,248 @@
+{
+  "chapter": "ch17",
+  "title": "把双核落到 IR：Scope 切分与 cube↔vector 同步搬运",
+  "skip_impl": true,
+  "trace_source_note": "本章两文件 third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp(1333 行) + DAGScope.cpp(1139 行) 均为纯 C++ MLIR pass，仓内无 .py 精简版，宿主无 CANN 环境编不动，故 skip_impl=true（发车已跳过 Implement/Test）。交叉验证走：① pin @2badfc89e 逐字源码；② IR 语法素材取自 bishengir 子模块的真实 lit 夹具（test/Dialect/Scope/ops.mlir、test/Dialect/HIVM/IR/sync-ops.mlir、inject-block-sync.mlir），这些夹具展示 scope.scope / hivm.hir.sync_block_set/wait 的真实文本形态。⚠️ 注意：dag-sync / dag-scope 这两个 triton-ascend pass 本身没有 lit 夹具（只经 python compiler.py 在昇腾硬件上跑），所以 explainer 不得伪造这两个 pass 的前后 IR dump；要展示 scope 切分结果只能手工从源码逻辑推演并显式标注为『示意，非真实 dump』。",
+  "pipeline_context": "compiler.py 的 add_auto_scheduling 分支里，pass 顺序是 dag_sync → dag_scope →（cse/canonicalize）→ dag_ssbuffer。即 DAGSync 先跑（在还没有 scope 的扁平 IR 上插数据搬运 + set/wait 事件），DAGScope 后跑（把整个函数体封进 AIV/AIC 两个 scope、按核标注把 op 分发进各自 scope、并在 fixpipe/to_memref 周围补 pipeline 级 set/wait）。承 ch16：Value→CoreType 核标注由 DAG.cpp 的不动点传播算出，经 Graph::getValueTypes() 暴露；ch17 只『消费』这份标注、不重新推导（回指 ch16）。",
+
+  "code_spine": [
+    "third_party/ascend/backend/compiler.py:L122-L129  add_auto_scheduling 分支：pass 顺序 dag_sync → dag_scope → dag_ssbuffer（确立本章两 pass 的先后与上下文）",
+    "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L1188-L1320  DAGSyncPass::runOnOperation —— 本章前半入口：逐函数 LegalizeDot → 建/取 AffinityDAG（fromMultiBlockFunc，ch16 机制）→ addMemEffectsSync → walk 每条 cube↔vector 数据边插 sync+搬运 → rewriteCopyChainForCbub",
+    "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L793-L843  LegalizeDot —— 把带非零累加器的 dot 拆成 dot(零累加) + arith.addf：让 dot 纯 cube、bias-add 归 vector（matmul+bias 例子的种子）",
+    "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L243-L247  needVectorCubeSync —— 只有 VECTOR_ONLY↔CUBE_ONLY 的相邻边才需要跨核同步",
+    "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L605-L708  insertSyncAndMovement —— 同 block 内一条 cube↔vector 边：插 set/wait + 调数据搬运（分 CUBE→VECTOR / VECTOR→CUBE 两支）",
+    "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L309-L372  insertCubeToVectorDataMovement —— cube 结果搬到 vector：fixpipe(NZ2ND)→UB alloc→memory_space_cast→to_tensor，替换 dstOp 操作数",
+    "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L423-L545  insertVectorToCubeDataMovement —— vector 结果搬到 cube：to_memref(UB)→CBUF(L1) alloc→copy→convert_layout(ND)→memory_space_cast→to_tensor；CBUF alloc 走 32B 对齐 nz shape",
+    "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L374-L420  getElemBytesForAlign / getBlockElemsFor32BAlign / newCbubAllocShape —— 32B 对齐块大小 blk 与 CBUF 4D nz shape (N/blk, M/16, 16, blk)",
+    "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L106-L212  processScfForSync —— scf.for 迭代参数跨核：比对首用者核 vs yield 核，跨核则在 yield 定义后插 set、首用者前插 wait",
+    "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L547-L602  FindLastestPosition / FindEarliestPosition —— set/wait 落点微调：向 broadcast/expand_dims 回溯以最小化 UB 占用、遇已有 sync 即停",
+    "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L1051-L1186  addMemEffectsSync —— 基于内存效应+别名分析的 WAR/WAW 跨核同步：may-alias 且异核的读写对建 SyncCandidate，按支配/后支配排序去重后成对插 set/wait",
+    "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L845-L940  rewriteCopyChainForCbub —— DAGSync 收尾：把 copy 前的 tensor 经 reshape/trans/reshape 重排成 nz 4D 布局喂给 cube",
+    "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L1077-L1133  DAGScopePass::runOnOperation —— 本章后半入口：提 alloc 到函数头 → encapsulateWithScope → SplitScope → addSyncOpsForBufferWait",
+    "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L69-L151  encapsulateWithScope —— 建两个 scope.scope：第一个打 VECTOR(aivScope)、第二个打 CUBE(aicScope)，先把函数体全部 op 搬进 aivScope",
+    "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L158-L310  collectOpsToMove —— 递归给每个 op 定路由 needsMoveAiv/needsMoveCube：按 valueTypes + 特定 op 规则（copy→aiv、fixpipe→cube、scf/scope 结构 op→两边、store/assert 按操作数核、sync 按 tcore_type 属性）",
+    "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L327-L630  processOperationToMove —— 把 op clone/move 进目标 scope；scf.for/scf.if/scf.yield 按 MoveType 过滤结果重建（丢掉不属本核的迭代参数/结果）",
+    "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L632-L690  SplitScope —— 两遍：aiv 侧用 MoveType=CUBE_ONLY（保留非 cube）、aic 侧用 MoveType=VECTOR_ONLY（保留非 vector），最后逆序 erase 原 op",
+    "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L1044-L1074  addSyncOpsForBufferWait —— 按 tcore_type 属性找到 aicRegion/aivRegion，对 fixpipe(在 aic)、to_memref(在 aiv) 补 pipeline 级 set/wait",
+    "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L693-L941  createSyncBlockSetOp/WaitOp + insertWaitBeforeFinalReturn/insertSetAtRegionStart + processFixpipeOpsInAIC/processToMemrefOpsInAIV —— buffer-wait 同步的构造与 flag 配对细节"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "third_party/ascend/backend/compiler.py",
+      "lines": "L122-L129",
+      "what": "pass 顺序：DAGSync 先、DAGScope 后（确立本章脊梁）",
+      "code": "        if (metadata[\"add_auto_scheduling\"]):\n            ascend.passes.ttir.add_dag_sync(pm)\n            ascend.passes.ttir.add_dag_scope(pm)\n            passes.common.add_cse(pm)\n            passes.common.add_canonicalizer(pm)\n            ascend.passes.ttir.add_dag_ssbuffer(pm)\n            passes.common.add_cse(pm)\n            passes.common.add_canonicalizer(pm)",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp",
+      "lines": "L805-L834",
+      "what": "LegalizeDot 核心：dot 累加器非零→拆成 dot(零累加)+arith.addf，dot 留 cube、addf 归 vector",
+      "code": "      if (auto constantOp = c.getDefiningOp<arith::ConstantOp>()) {\n        if (auto denseAttr = dyn_cast<DenseElementsAttr>(constantOp.getValue())) {\n          if (denseAttr.isSplat() && denseAttr.getSplatValue<FloatAttr>().getValueAsDouble() == 0.0) {\n            isZeroAccumulator = true;\n          }\n        }\n      }\n\n      if (!isZeroAccumulator) {\n        // 创建新的零累加器\n        Location loc = dotOp.getLoc();\n        auto resultType = dotOp.getResult().getType();\n\n        Value originalResult = dotOp.getResult();\n        builder.setInsertionPoint(dotOp);\n        // 创建全零张量\n        auto zeroAttr = DenseElementsAttr::get(\n            dyn_cast<RankedTensorType>(resultType),\n            APFloat(0.0f));\n        auto zeroConstant = builder.create<arith::ConstantOp>(loc, zeroAttr);\n\n        // 创建新的dot操作，使用零作为累加器\n        auto newDot = builder.create<triton::DotOp>(\n            loc, resultType, a, b, zeroConstant);\n\n        // 创建加法操作，将新的dot结果与原来的累加器c相加\n        auto addOp = builder.create<arith::AddFOp>(loc, newDot, c);\n\n        // 用addOp替换原来的dotOp\n        originalResult.replaceAllUsesWith(addOp.getResult());",
+      "elide": ["外层 funcOp.walk([&](triton::DotOp dotOp){...}) 与取 a/b/c 三操作数的开头（L795-L804）；末尾 dotOp.use_empty() 则 erase 的收尾（L836-L840）省略"]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp",
+      "lines": "L243-L247",
+      "what": "跨核同步的判据：只有一端纯 cube、另一端纯 vector 才需要",
+      "code": "bool DAGSyncPass::needVectorCubeSync(CoreType src, CoreType dst)\n{\n    return (src == CoreType::VECTOR_ONLY && dst == CoreType::CUBE_ONLY) ||\n           (src == CoreType::CUBE_ONLY && dst == CoreType::VECTOR_ONLY);\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp",
+      "lines": "L1258-L1273",
+      "what": "runOnOperation 主 walk：对当前 op 的每个输入，若输入核≠当前核则触发同步（去重后）",
+      "code": "            for (ValueNode *inputValNode : currentNode->getInputs()) {\n                auto inputOp = inputValNode->value.getDefiningOp();\n                if (!inputOp || !opMap->contains(inputOp)) {\n                    continue;\n                }\n\n                auto inputNode = (*opMap)[inputOp];\n\n                // 获取输入节点的设备类型\n                CoreType inputType = getNodeDeviceType(inputNode, valueTypes);\n\n                // 5. 判断是否需要插入同步和数据搬运\n                if (needVectorCubeSync(inputType, currentType)) {\n                    // 检查是否已经处理过这对操作\n                    auto opPair = std::make_pair(inputOp, op);\n                    if (processedPairs.insert(opPair).second) {",
+      "elide": ["insert 成功后按 srcBlock==dstBlock 分派 insertSyncAndMovement / insertSyncAndMovementForCrossBlock（L1274-L1308），且跨 block 仅处理『外层→内层』一种情形"]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp",
+      "lines": "L646-L671",
+      "what": "CUBE→VECTOR 同 block：set(CUBE,PIPE_FIX,PIPE_V) 在 srcOp 后、wait(VECTOR,同 pipe) 在 dstOp 前，中间插数据搬运",
+      "code": "    // CUBE -> VECTOR\n    if (srcType == CoreType::CUBE_ONLY && dstType == CoreType::VECTOR_ONLY) {\n\n        // 2. 插入同步指令\n        auto coreAttr = hivm::TCoreTypeAttr::get(builder.getContext(), hivm::TCoreType::CUBE);\n        auto setPipe = PipeAttr::get(builder.getContext(), hivm::PIPE::PIPE_FIX);\n        auto waitPipe = PipeAttr::get(builder.getContext(), hivm::PIPE::PIPE_V);\n        auto lastSetPipe = PipeAttr::get(builder.getContext(), hivm::PIPE::PIPE_MTE3);\n        auto lastWaitPipe = PipeAttr::get(builder.getContext(), hivm::PIPE::PIPE_MTE1);\n        auto flagId = builder.getIntegerAttr(builder.getI64Type(), flag);\n        auto flagAddId = builder.getIntegerAttr(builder.getI64Type(), flag * 2);\n        auto lastFlagAddId = builder.getIntegerAttr(builder.getI64Type(), (flag - 1) * 2);\n\n        // set 在 srcOp 后\n        builder.setInsertionPointAfter(srcOp);\n        builder.create<SyncBlockSetOp>(loc, coreAttr, setPipe, waitPipe, flagId);\n\n        // wait 在 dstOp 前\n\n        auto posOp = FindEarliestPosition(dstOp, mainGraph, builder);\n        builder.setInsertionPoint(posOp);\n        coreAttr = hivm::TCoreTypeAttr::get(builder.getContext(), hivm::TCoreType::VECTOR);\n        builder.create<SyncBlockWaitOp>(loc, coreAttr, setPipe, waitPipe, flagId);\n\n        // 1. 插入数据搬运\n        insertCubeToVectorDataMovement(srcOp, dstOp, srcResult, builder, loc, nullptr);",
+      "elide": ["lastSetPipe/lastWaitPipe/flagAddId/lastFlagAddId 四个局部变量在本函数内声明后未被使用（死变量），仅 flagId 生效；VECTOR→CUBE 对称支（L676-L707）用 set(VECTOR,PIPE_MTE3,PIPE_MTE1)/wait(CUBE) 并调 FindLastestPosition，此处省略"]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp",
+      "lines": "L313-L338",
+      "what": "CUBE→VECTOR 搬运：srcOp 后建 UB alloc，插 fixpipe(NZ2ND) 把 cube 结果搬到 UB",
+      "code": "    auto srcTensorType = getTensorType(srcResult);\n    if (!srcTensorType) {\n        return;\n    }\n\n    // 1. 在 srcOp 之后创建 UB 空间的 memref.alloc\n    builder.setInsertionPointAfter(srcOp);\n    mlir::Value ubAlloc = getOrCreateAllocation(srcOp, srcTensorType,\n                                                hivm::AddressSpace::UB, builder, loc);\n\n    // 2. 创建 fixpipe 指令\n    builder.setInsertionPointAfter(srcOp);\n    FixpipeDMAModeAttr dmaModeAttr = FixpipeDMAModeAttr::get(builder.getContext(), FixpipeDMAMode::NZ2ND);\n\n    auto fixpipeOp = builder.create<hivm::FixpipeOp>(\n        loc,\n        mlir::TypeRange{}, // 没有返回值\n        srcResult,         // src\n        ubAlloc,           // dst\n        /*unit_flag_cond=*/mlir::ValueRange{},\n        /*dma_mode=*/dmaModeAttr,\n        /*dual_dst_mode=*/nullptr,\n        /*pre_quant=*/nullptr,\n        /*pre_relu=*/nullptr,\n        /*channel_split=*/nullptr,\n        /*unit_flag_mode=*/mlir::ArrayAttr{});",
+      "elide": ["fixpipe 后的 dstOp 前建 memory_space_cast + bufferization.to_tensor 并把结果 valueTypes 标 VECTOR_ONLY、最后 replaceOperandWithNewValue 替换 dstOp 操作数（L343-L371）省略"]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp",
+      "lines": "L398-L420",
+      "what": "CBUF 的 4D nz 对齐 shape：静态 2D + M 16 对齐时，新 shape = (N/blk, M/16, 16, blk)",
+      "code": "static std::optional<SmallVector<int64_t, 4>> newCbubAllocShape(memref::AllocOp allocOp) {\n  auto type = dyn_cast<MemRefType>(allocOp.getType());\n  // 仅支持静态 2D MemRef\n  if (!type || type.getRank() != 2)\n    return std::nullopt;\n\n  auto shape = type.getShape();\n  int64_t M = shape[0];\n  int64_t N = shape[1];\n  auto elemType = type.getElementType();\n  auto blkOr = getBlockElemsFor32BAlign(elemType);\n  int64_t blk = (int64_t)*blkOr;\n  // 必须是静态且 16 对齐\n  if (ShapedType::isDynamic(M) || ShapedType::isDynamic(N))\n    return std::nullopt;\n  if (M % 16 != 0)\n    return std::nullopt;\n\n  // 新 shape: (N/16, M/16, 16, 16)\n  SmallVector<int64_t, 4> newShape = {N / blk, M / 16, 16, blk};\n\n  return newShape;\n}",
+      "elide": ["注意源码注释写 (N/16, M/16, 16, 16) 是按 fp16(blk=16) 举例，实际代码用 blk=32/元素字节数（getBlockElemsFor32BAlign），故一般为 (N/blk, M/16, 16, blk)——注释与代码在非 fp16 类型上不严格一致，讲解须以代码 blk 为准"]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp",
+      "lines": "L164-L187",
+      "what": "scf.for 迭代参数跨核（CUBE 产、VECTOR 用）：yield 定义后插 set(CUBE)、首用者前插 wait(VECTOR)，中间搬运",
+      "code": "    if (yieldType == CoreType::CUBE_ONLY && iterType == CoreType::VECTOR_ONLY) {\n\n        // 2. 插入同步指令\n        auto coreAttr = hivm::TCoreTypeAttr::get(builder.getContext(), hivm::TCoreType::CUBE);\n        auto setPipe = PipeAttr::get(builder.getContext(), hivm::PIPE::PIPE_FIX);\n        auto waitPipe = PipeAttr::get(builder.getContext(), hivm::PIPE::PIPE_V);\n        auto flagId = builder.getIntegerAttr(builder.getI64Type(), flag);\n\n        // set 在 yieldDefiningOp 后\n        builder.setInsertionPointAfter(yieldDefiningOp);\n        builder.create<SyncBlockSetOp>(loc, coreAttr, setPipe, waitPipe, flagId);\n\n        mlir::Value srcResult = yieldDefiningOp->getResult(0);\n\n        // // 1. 插入数据搬运\n        insertCubeToVectorDataMovement(yieldDefiningOp, firstUser, srcResult, builder, loc, iterArg);\n\n        // wait 在 firstUser 前\n        builder.setInsertionPoint(firstUser);\n        coreAttr = hivm::TCoreTypeAttr::get(builder.getContext(), hivm::TCoreType::VECTOR);\n        builder.create<SyncBlockWaitOp>(loc, coreAttr, setPipe, waitPipe, flagId);\n    }",
+      "elide": ["前半（L106-L163）：遍历 initArgs、定位每个迭代参数的 firstUser 与 yield 操作数、查表得 iterType/yieldType；对称的 VECTOR→CUBE 支（L189-L210）省略，且注意其数据搬运调用被注释掉（源码 L202 为注释）"]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp",
+      "lines": "L1085-L1105",
+      "what": "addMemEffectsSync 候选检测：可能别名 + 异核的读写对，登记为一条 set/wait 候选",
+      "code": "            bool isWrite = isa<MemoryEffects::Write>(effect.getEffect());\n            for (auto &[prevNode, prevEffect] : memOps) {\n                if ((isa<MemoryEffects::Write>(prevEffect.getEffect()) || isWrite) &&\n                    mayAlias(solver, prevEffect.getValue(), effect.getValue()) &&\n                    prevNode->isOn() != currNode->isOn() // write is forced on single core type, so we are safe to judge\n                                                         // based on whether the core types are different\n                ) {\n                    CoreType srcCoreType = isWrite ? !currNode->isOn() : prevNode->isOn();\n                    auto opPair = findAncestorCommonBlock(prevNode->op, currNode->op);\n                    if (!opPair.has_value()) {\n                        op->emitWarning(\n                            llvm::formatv(\"Unable to find ancestors in common block with {0}\\n\", *prevNode->op));\n                        continue;\n                    }\n                    auto [setAfter, waitBefore] = opPair.value();\n                    if (setAfter == waitBefore) {\n                        continue;\n                    }\n                    candidates.push_back(SyncCandidate {srcCoreType, prevNode->op, setAfter, op, waitBefore});\n                }\n            }",
+      "elide": ["前置：SharedMemoryAliasAnalysis 初始化 + funcOp.walk 收集 Read/Write 效应（L1053-L1084）；后置：按 dominance/postDominance 排序候选并去掉被包含/重复者，再成对插 set(srcPipe)/wait(PIPE_S)，flag 取 syncFlag%14（L1109-L1185）省略"]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp",
+      "lines": "L139-L150",
+      "what": "encapsulateWithScope 收尾：两个 scope.scope 分别打 VECTOR / CUBE 属性，返回 (aivScope, aicScope)",
+      "code": "    // 设置属性\n    auto vecAttr = hivm::TCoreTypeAttr::get(\n        builder.getContext(),\n        hivm::TCoreType::VECTOR);\n    auto aicAttr = hivm::TCoreTypeAttr::get(\n        builder.getContext(),\n        hivm::TCoreType::CUBE);\n\n    scopeOp->setAttr(hivm::TCoreTypeAttr::name, vecAttr);\n    newScopeOp->setAttr(hivm::TCoreTypeAttr::name, aicAttr);\n\n    return std::make_pair(scopeOp, newScopeOp);",
+      "elide": ["前半（L69-L138）：收集 lastBlock 里非 constant/programid/alloc 的 op 按原序搬进第一个 scope（scopeOp，VECTOR），补 scope.return；再建空的第二个 scope（newScopeOp，CUBE）。即『先把全部 op 塞进 vector scope，再交给 SplitScope 复制/裁剪出 cube scope』"]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp",
+      "lines": "L186-L200",
+      "what": "collectOpsToMove 的算子路由规则（一部分）：copy→只 aiv，fixpipe→只 cube，scf/scope 结构 op→两边都要",
+      "code": "  // 检查特定操作类型\n  if (isa<hivm::CopyOp>(op)) {\n    needsMoveAiv = true;\n  }\n\n  // 检查特定操作类型\n  if (isa<hivm::FixpipeOp>(op)) {\n    needsMoveCube = true;\n  }\n\n  // 检查特定操作类型\n  if (isa<scf::YieldOp>(op) || isa<scope::ScopeOp>(op) || isa<scf::ForOp>(op)) {\n    needsMoveAiv = true;\n    needsMoveCube = true;\n  }",
+      "elide": ["前置：按 op 结果的 valueTypes 交 VECTOR_ONLY/CUBE_ONLY 位置位（L164-L185，含 annotation.mark）；后续：triton.store 按第 1/0/2 操作数核决定、triton.assert 按 condition 核决定、sync_block_set/wait 按 tcore_type 属性决定（L202-L261），均省略"]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp",
+      "lines": "L251-L261",
+      "what": "sync 算子的路由：sync_block_set/wait 按自身 tcore_type 属性归 cube 或 aiv",
+      "code": "  // 检查 Sync 操作的 tcore_type 属性\n  if ((isa<hivm::SyncBlockSetOp>(op) || isa<hivm::SyncBlockWaitOp>(op))) {\n    mlir::OpBuilder builder(op);\n    auto coreAttr = hivm::TCoreTypeAttr::get(builder.getContext(), hivm::TCoreType::CUBE);\n    if (op->getAttr(\"tcore_type\") == coreAttr) {\n      needsMoveCube = true;\n    }\n    else {\n      needsMoveAiv = true;\n    }\n  }",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp",
+      "lines": "L650-L670",
+      "what": "SplitScope 双遍：aiv 侧 MoveType=CUBE_ONLY（丢 cube 结果）、aic 侧 MoveType=VECTOR_ONLY（丢 vector 结果）",
+      "code": "  llvm::SmallVector<mlir::Operation*> aivUsedOp; // 改为函数内静态，保持原有逻辑\n  for (const auto& info : aivToMove) {\n    if (std::find(aivUsedOp.begin(), aivUsedOp.end(), info.op) != aivUsedOp.end()) {\n      return;\n    }\n    aivUsedOp.push_back(info.op);\n    processOperationToMove(info, aivparentMap, builder, aivmapper, aivBlock, terminator, graph, AffinityDAG::CoreType::CUBE_ONLY);\n  }\n\n  llvm::DenseMap<Operation*, Operation*> aicparentMap;\n  mlir::IRMapping aicmapper;\n  mlir::Block* aicBlock = &aicScope->getRegion(0).front(); // 或者使用合适的block\n  terminator = aicBlock->getTerminator();\n  llvm::SmallVector<mlir::Operation*> aicUsedOp; // 改为函数内静态，保持原有逻辑\n  for (const auto& info : cubeToMove) {\n    if (std::find(aicUsedOp.begin(), aicUsedOp.end(), info.op) != aicUsedOp.end()) {\n      return;\n    }\n    aicUsedOp.push_back(info.op);\n    processOperationToMove(info, aicparentMap, builder, aicmapper, aicBlock, terminator, graph, AffinityDAG::CoreType::VECTOR_ONLY);\n  }",
+      "elide": ["前置 collectOpsToMove 两个 SmallVector 收集（L633-L648）；后置：把 aivToMove/cubeToMove 里的原 op 汇总进 deleteOp 并逆序 erase（L672-L688）省略"]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp",
+      "lines": "L1054-L1072",
+      "what": "addSyncOpsForBufferWait：按 tcore_type 属性找到 CUBE/VECTOR 两 scope 的 region，再对 fixpipe/to_memref 补 buffer-wait 同步",
+      "code": "        funcOp.walk([&](scope::ScopeOp scopeOp) {\n          auto coreTypeAttr = scopeOp->getAttrOfType<hivm::TCoreTypeAttr>(\n              hivm::TCoreTypeAttr::name);\n          if (!coreTypeAttr) return;\n\n          if (coreTypeAttr.getTcoretype() == hivm::TCoreType::CUBE) {\n            aicRegion = &scopeOp.getRegion();\n          }\n          if (coreTypeAttr.getTcoretype() == hivm::TCoreType::VECTOR) {\n            aivRegion = &scopeOp.getRegion();\n          }\n        });\n\n        if (!aicRegion || !aivRegion) {\n          continue;\n        }\n\n        processFixpipeOpsInAIC(aicRegion, aivRegion);\n        processToMemrefOpsInAIV(aivRegion, aicRegion);",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp",
+      "lines": "L885-L903",
+      "what": "processFixpipeOpsInAIC 三步：fixpipe 前插 wait(CUBE)、aic 尾 return 前插 wait、aiv 开头插 set——buffer-wait 事件配对",
+      "code": "      for (auto fixpipeOp : fixpipes) {\n      \n      auto newflag = findFixPipeFlagSafe(fixpipeOp);\n        // 1. 在 FixpipeOp 前插 Wait\n        builder.setInsertionPoint(fixpipeOp);\n        createSyncBlockWaitOp(\n          builder,\n          fixpipeOp->getLoc(),\n          hivm::TCoreType::CUBE,\n          hivm::PIPE::PIPE_V,\n          hivm::PIPE::PIPE_FIX,\n          newflag);\n        bool coretypebool = true;\n\n        // 2. 在 aicRegion 末尾 Return 前插 Wait\n        insertWaitBeforeFinalReturn(aicRegion, builder, newflag, coretypebool);\n\n        // 3. 在 aivRegion 开头插 Set\n        insertSetAtRegionStart(aivRegion, builder, newflag, coretypebool);",
+      "elide": ["步骤 4-6（L905-L939）：在 aic 内 fixpipe 后找下一个 sync_block_set 取其 flag → 在 aiv 内找同 flag 的 wait → 从该 wait 向下（跳过 advance、遇 to_memref/yield 停）插一个 set(newflag)，把 aiv→aic 的回程事件也配上"]
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/test/Dialect/Scope/ops.mlir",
+      "lines": "L8-L14",
+      "what": "IR 素材（真实 lit 夹具）：scope.scope 带 tcore_type 属性、内含 scope.return 的文本形态",
+      "code": "func.func @test_scope_scope() {\n  // CHECK: scope.scope\n  scope.scope : () -> () {\n    // CHECK: scope.return\n    scope.return\n  // CHECK: {tcore_type = #hivm.tcore_type<CUBE>}\n  } {tcore_type = #hivm.tcore_type<CUBE>}",
+      "elide": ["这是 Scope 方言自身的 IR 圆环测试，不是 dag-scope pass 的输出；仅用于展示 scope.scope / tcore_type 属性的合法文本语法"]
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/test/Dialect/HIVM/IR/sync-ops.mlir",
+      "lines": "L45-L48",
+      "what": "IR 素材（真实 lit 夹具）：hivm.hir.sync_block_set 的文本形态 [tcore_type, tpipe, pipe] flag = N",
+      "code": "  hivm.hir.sync_block_set[#hivm.tcore_type<CUBE>, #hivm.pipe<PIPE_FIX>, #hivm.pipe<PIPE_FIX>]\n    flag = 1\n    ffts_base_addr = %ffts_base_addr\n    sync_instr_mode = #hivm.sync_block_instr_mode<INTER_BLOCK_SYNCHRONIZATION>",
+      "elide": ["对应的 sync_block_wait 语法见同文件 L67：hivm.hir.sync_block_wait[#hivm.tcore_type<CUBE>, #hivm.pipe<PIPE_M>, #hivm.pipe<PIPE_V>] flag = 1"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "DAGSyncPass", "file": "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp", "responsibility": "dag-sync pass（先跑）。在还没切 scope 的扁平 IR 上：LegalizeDot 拆 dot、建/取 AffinityDAG、addMemEffectsSync 补别名同步、walk 每条 cube↔vector 数据边插 set/wait + 数据搬运（fixpipe / copy 链）、rewriteCopyChainForCbub 把 copy 源重排成 nz。IR 名对应 pass 标识 dag-sync。"},
+    {"name": "DAGScopePass", "file": "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp", "responsibility": "dag-scope pass（后跑）。把函数体封进两个 scope.scope（VECTOR=aivScope / CUBE=aicScope），按 ch16 核标注 + 算子规则把 op 分发（复制/裁剪）进各自 scope，并对 fixpipe/to_memref 补 pipeline 级 buffer-wait set/wait。IR 名对应 pass 标识 dag-scope。"},
+    {"name": "scope::ScopeOp", "file": "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/Scope/IR/ScopeOps.td", "responsibility": "IR 算子 scope.scope：一个带单 region 的容器 op，通过 tcore_type 属性(#hivm.tcore_type<CUBE|VECTOR>)标记该 region 归哪颗物理核。是『把核归属物化到 IR』的载体。"},
+    {"name": "hivm::SyncBlockSetOp / SyncBlockWaitOp", "file": "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMSynchronizationOps.td", "responsibility": "IR 算子 hivm.hir.sync_block_set / hivm.hir.sync_block_wait：跨核事件。三元 [tcore_type, tpipe, pipe] + static_flag_id 标识一个事件；生产核 set、消费核 wait 同 flag 配对，实现跨物理核的『发信号/等信号』。"},
+    {"name": "hivm::FixpipeOp", "file": "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMDMAOps.td", "responsibility": "IR 算子 hivm.hir.fixpipe：cube 侧的 DMA 搬出算子，把 cube 计算结果（L0C/nz 布局）搬到 UB（NZ2ND），是 CUBE→VECTOR 数据搬运的核心。"},
+    {"name": "hivm::CopyOp / ConvertLayoutOp", "file": "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMDMAOps.td", "responsibility": "IR 算子 hivm.hir.copy / hivm.hir.convert_layout：VECTOR→CUBE 搬运用——copy 把 UB memref 搬进 CBUF(L1)，convert_layout 转 ND 布局，配合 32B 对齐 nz reshape 供 cube 消费。"},
+    {"name": "AffinityDAG::Graph", "file": "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp", "responsibility": "ch16 建立的核亲和图。本章只经 getValueTypes()(Value→CoreType) 与 getOpMap/getOpMapLegacy 消费其结果；DAGSync 用 fromMultiBlockFunc 建图并 registerGraph，DAGScope 用 GraphManager::getGraph 取回。核标注怎么算见 ch16。"}
+  ],
+
+  "data_flow": [
+    {"step": "1. compiler.py: add_dag_sync → add_dag_scope → add_dag_ssbuffer", "detail": "确立顺序：先在扁平 IR 上插搬运+同步，再切 scope。"},
+    {"step": "2. DAGSyncPass.runOnOperation → LegalizeDot(funcOp)", "detail": "遍历每个 triton.dot，若累加器非零则拆成 dot(零累加)+arith.addf——dot 纯 cube、加 bias 归 vector，制造出一条 CUBE→VECTOR 数据边。"},
+    {"step": "3. Graph::fromMultiBlockFunc(funcOp)（ch16 不动点传播）", "detail": "算出 valueTypes(Value→CoreType) 与 opMap；registerGraph 存起来供 DAGScope 复用。"},
+    {"step": "4. addMemEffectsSync(funcOp, graph, builder, syncFlag)", "detail": "SharedMemoryAliasAnalysis 找『可能别名且异核』的读写对，成对插 set/wait（basename 事件），去重后落到公共祖先 block。"},
+    {"step": "5. funcOp.walk：每 op 每输入边判 needVectorCubeSync", "detail": "输入核≠当前核（一 cube 一 vector）→ 去重后插同步+搬运；scf.for 迭代参数走 processScfForSync。"},
+    {"step": "6a. CUBE→VECTOR: insertSyncAndMovement + insertCubeToVectorDataMovement", "detail": "set(CUBE,PIPE_FIX→PIPE_V) 在 src 后、wait(VECTOR) 在 dst 前(FindEarliestPosition)；搬运 = fixpipe(NZ2ND)→UB alloc→memory_space_cast→to_tensor，替换 dst 操作数。"},
+    {"step": "6b. VECTOR→CUBE: insertSyncAndMovement + insertVectorToCubeDataMovement", "detail": "set(VECTOR,PIPE_MTE3→PIPE_MTE1) 在 src 后(FindLastestPosition)、wait(CUBE) 在 dst 前；搬运 = to_memref(UB)→CBUF(L1) nz alloc→copy→convert_layout(ND)→memory_space_cast→to_tensor。"},
+    {"step": "7. funcOp.walk(CopyOp)：rewriteCopyChainForCbub", "detail": "把 copy 的输入 tensor 经 reshape(3D)→trans[1,0,2]→reshape(4D nz)→新 to_memref 重排成 CBUF 需要的 nz 4D 布局，换掉旧 copy。"},
+    {"step": "8. DAGScopePass.runOnOperation：alloc 提头 + encapsulateWithScope", "detail": "把所有 memref.alloc 移到函数入口；建两个 scope.scope，第一个 VECTOR(aivScope)、第二个 CUBE(aicScope)，先把体内 op 全搬进 aivScope。"},
+    {"step": "9. SplitScope → collectOpsToMove → processOperationToMove", "detail": "递归给每 op 定 needsMoveAiv/needsMoveCube；aiv 侧丢 CUBE_ONLY 结果、aic 侧丢 VECTOR_ONLY 结果；scf.for/if/yield 按 MoveType 过滤重建；最后逆序 erase 原 op。两个 scope 各得自己那半个数据流。"},
+    {"step": "10. addSyncOpsForBufferWait → processFixpipeOpsInAIC / processToMemrefOpsInAIV", "detail": "按 tcore_type 属性找 aic/aiv region；对 fixpipe(aic)、to_memref(aiv) 补 pipeline 级 set/wait，用 static_flag_id 跨 region 配对，形成完整的双向 buffer 就绪握手。"}
+  ],
+
+  "design_decisions": [
+    {"decision": "先 DAGSync 后 DAGScope（在扁平 IR 上插同步+搬运，再切 scope）", "why": "同步/搬运要看『跨核数据边』和相邻算子的自然顺序；在还没被 scope 切开、还是一条线性数据流时插入最直观。切 scope 会把 cube/vector 拆到两个 region，那时再找跨核边要跨 region 复杂得多。DAGScope 只需把已插好的 set/wait 按 tcore_type 属性分发进对应 scope、再补 buffer 级握手。", "evidence": "third_party/ascend/backend/compiler.py:L122-L129"},
+    {"decision": "LegalizeDot 把 dot(非零累加) 拆成 dot(零累加)+addf", "why": "cube 的 matmul 单元只擅长纯乘累加；带偏置的 a@b+c 若整体留在 cube，会把本该 vector 干的逐元素加也压给 cube。拆开后 dot 纯 cube、addf 归 vector，正好制造出教科书式的 cube→vector 数据边，让核亲和/同步机制有清晰边界可切。", "evidence": "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L793-L843"},
+    {"decision": "只对 VECTOR_ONLY↔CUBE_ONLY 边插跨核同步", "why": "同核内部靠硬件流水（pipe）天然有序，无需 block 级事件；只有数据从一颗物理核流到另一颗（cube↔vector）才存在跨核可见性问题，必须显式 set/wait。CUBE_AND_VECTOR / 标量等不触发。", "evidence": "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L243-L247"},
+    {"decision": "跨核搬运不是纯拷贝，而是带布局/地址空间转换的算子链", "why": "cube 结果在 L0C/nz 布局、vector 在 UB/ND；反向 vector→cube 还要进 CBUF(L1) 并按 32B 对齐重排成 nz。所以 CUBE→VECTOR 用 fixpipe(NZ2ND)，VECTOR→CUBE 用 to_memref→copy→convert_layout(ND)+nz reshape。搬运和同步是一体的：先搬数据、再用 set/wait 保证对端看到搬完的数据。", "evidence": "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L309-L545"},
+    {"decision": "set/wait 用 static_flag_id 配对，flag 取值 syncFlag % 14", "why": "昇腾的 block 间事件靠有限个事件寄存器（flag id）标识；同一个 flag 的 set 与 wait 构成一次握手。取模 14 把 flag 限制在事件 id 池内（DAGSSBuffer 同样以 14 为界），循环复用。配对不成/池耗尽即可能死锁——这是『少了同步会怎样』之外的另一类风险。", "evidence": "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L1281, L1241, L1116"},
+    {"decision": "scope 用 tcore_type 属性而非 op 类型区分核", "why": "scope.scope 本身是中性容器，靠挂 #hivm.tcore_type<CUBE|VECTOR> 属性标记归属。这让后续 pass（含 addSyncOpsForBufferWait、DAGSSBuffer）只需读属性就能定位 cube/vector region，解耦『切分』与『用途』。", "evidence": "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L139-L150, L1054-L1064"},
+    {"decision": "结构算子(scf.for/if/scope/yield)两个 scope 都要，按 MoveType 过滤重建", "why": "循环/分支的骨架在 cube 和 vector 两侧都要保留（各自跑自己那半迭代），但迭代参数/结果要按核裁剪——aiv 侧丢 CUBE_ONLY 的、aic 侧丢 VECTOR_ONLY 的。所以不是简单 move，而是 clone 出一份再删掉不属于本核的 arg/result。", "evidence": "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L378-L462, L650-L670"},
+    {"decision": "对位基座 warp specialization 但用 scope+事件而非 warp+mbarrier", "why": "≈ Triton/Hopper 的 warp specialization（producer/consumer warp 分工 + mbarrier 同步，见 ch31）。差异：昇腾是两颗异构物理核（cube/vector）跨核，同步用 block 级 sync_block_set/wait 事件 + 显式数据搬运（跨地址空间），而非同一 SM 内 warp 分组 + 共享内存 barrier。", "evidence": "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L647-L707"}
+  ],
+
+  "theory": [
+    "跨核为什么必须同步（核心直觉，reader 第一诉求）：cube 和 vector 是两颗独立异步推进的物理核。cube 算完 a@b 把结果写进某块 buffer，vector 要读这块 buffer 做 +bias。若没有同步，vector 可能在 cube 还没写完时就开读——读到旧值/半成品，结果错乱。set/wait 事件就是『cube 写完发信号(set)，vector 等到信号再读(wait)』的握手；少了它，编译能过、跑出来数值随机错（数据竞争）。这也是本章存在的根本理由。",
+    "为什么还要数据搬运而不只是同步：同步解决『时序』，搬运解决『位置+格式』。cube 结果在 L0C/nz 布局，vector 的 UB 读不了那个地址空间/布局；所以 CUBE→VECTOR 要 fixpipe 把数据 NZ2ND 搬进 UB，VECTOR→CUBE 要 copy 进 CBUF(L1) 并 nz reshape。同步与搬运成对出现：set 在搬运源之后、wait 在搬运目的之前。",
+    "32B 对齐与 nz 布局的量化（VECTOR→CUBE）：cube 读 CBUF 要求最内维按 32 字节对齐。blk = 32 / 元素字节数（fp16→16、fp32→8）。2D (M,N) 张量重排成 4D nz：(N/blk, M/16, 16, blk)——16 是 cube 的分形基本块高、blk 是对齐后的最内维宽。源码注释按 fp16 写成 (N/16,M/16,16,16)，非 fp16 时应以 blk 为准（注释是特例、代码是通式）。",
+    "flag 配对与死锁（protocol 层直觉）：一次跨核依赖 = 一个 set + 一个同 flag 的 wait。若 wait 等的 flag 永远没有对应 set（或 set/wait 顺序在两核上交叉成环），对应核会永久阻塞——死锁。addSyncOpsForBufferWait 在 scope 切分后按 static_flag_id 逐个把 aic 的 set 与 aiv 的 wait（及回程）对上，就是在保证每个 wait 都有配对的 set；flag % 14 则保证不越过事件 id 池上限。",
+    "addMemEffectsSync 的必要性（同步的第二来源）：数据流边（SSA use-def）只覆盖『值直接传递』的依赖；但两核可能通过内存别名产生 WAR/WAW/RAW 依赖（如都写同一 buffer）。SSA 看不见这种隐式依赖，需要 SharedMemoryAliasAnalysis 找出『可能别名且异核』的读写对额外补同步——否则又是一类静默数据竞争。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [],
+    "must_keep": [
+      {"symbol": "DAGSyncPass", "why": "dag-sync pass 主体，本章前半的落点"},
+      {"symbol": "DAGScopePass", "why": "dag-scope pass 主体，本章后半的落点"},
+      {"symbol": "LegalizeDot", "why": "matmul+bias 例子的起点：dot 拆分制造 cube→vector 边"},
+      {"symbol": "needVectorCubeSync", "why": "跨核同步判据，reader 必须懂『何时才插同步』"},
+      {"symbol": "insertSyncAndMovement", "why": "同 block 一条跨核边的 set/wait+搬运总入口"},
+      {"symbol": "insertCubeToVectorDataMovement", "why": "CUBE→VECTOR 搬运链（fixpipe→UB→to_tensor）"},
+      {"symbol": "insertVectorToCubeDataMovement", "why": "VECTOR→CUBE 搬运链（to_memref→CBUF→copy→convert_layout）"},
+      {"symbol": "newCbubAllocShape", "why": "CBUF 32B 对齐 nz 4D shape，量化讲解要用"},
+      {"symbol": "processScfForSync", "why": "循环迭代参数的跨核同步（跨迭代场景）"},
+      {"symbol": "addMemEffectsSync", "why": "别名分析补的第二类同步来源"},
+      {"symbol": "encapsulateWithScope", "why": "建 AIV/AIC 两 scope 并打 tcore_type 属性"},
+      {"symbol": "collectOpsToMove", "why": "算子路由规则：谁进 aiv / 谁进 cube / 谁两边都要"},
+      {"symbol": "processOperationToMove", "why": "按 MoveType 过滤重建 scf 结构 op"},
+      {"symbol": "SplitScope", "why": "两 scope 分发的双遍主循环"},
+      {"symbol": "addSyncOpsForBufferWait", "why": "scope 切分后补 pipeline 级 buffer-wait 同步"},
+      {"symbol": "processFixpipeOpsInAIC", "why": "fixpipe 周围 set/wait 事件配对（aic 侧）"},
+      {"symbol": "processToMemrefOpsInAIV", "why": "to_memref 周围 set/wait 事件配对（aiv 侧）"},
+      {"symbol": "SyncBlockSetOp", "why": "IR 算子 hivm.hir.sync_block_set，跨核发信号"},
+      {"symbol": "SyncBlockWaitOp", "why": "IR 算子 hivm.hir.sync_block_wait，跨核等信号"},
+      {"symbol": "FixpipeOp", "why": "IR 算子 hivm.hir.fixpipe，cube 搬出"},
+      {"symbol": "ScopeOp", "why": "IR 算子 scope.scope + tcore_type 属性，核归属载体"},
+      {"symbol": "TCoreTypeAttr", "why": "标记 scope/sync 归 CUBE 还是 VECTOR 的属性"}
+    ]
+  },
+
+  "mechanisms": [
+    {"id": "m1-pipeline-order", "name": "两 pass 的分工与先后：DAGSync 先插同步搬运、DAGScope 后切 scope", "kind": "config", "source_anchors": ["third_party/ascend/backend/compiler.py:L122-L129", "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L1188-L1194", "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L1077-L1083"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m2-why-cross-core-sync", "name": "跨核为什么必须同步：异步双核 + 数据竞争（少了会怎样）", "kind": "protocol", "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L243-L247", "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMSynchronizationOps.td:L129-L175"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m3-legalize-dot", "name": "LegalizeDot：dot(非零累加) 拆成 dot(零)+addf，制造 cube→vector 边（matmul+bias 例子种子）", "kind": "algorithm", "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L793-L843"], "needs_figure": false, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m4-sync-walk-trigger", "name": "runOnOperation 主 walk：逐数据边判 needVectorCubeSync + 去重触发", "kind": "algorithm", "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L1226-L1311", "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L243-L247"], "needs_figure": false, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m5-cube-to-vector-movement", "name": "CUBE→VECTOR 搬运+同步：fixpipe(NZ2ND)→UB→to_tensor + set(FIX)/wait(V)", "kind": "dataflow", "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L647-L674", "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L309-L372"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m6-vector-to-cube-movement", "name": "VECTOR→CUBE 搬运+同步：to_memref→CBUF(L1)→copy→convert_layout(ND) + set(MTE3)/wait(MTE1)", "kind": "dataflow", "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L676-L707", "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L423-L545"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m7-cbuf-nz-align", "name": "CBUF 32B 对齐 nz 布局：blk=32/字节数，shape=(N/blk, M/16, 16, blk)", "kind": "layout", "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L374-L420", "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L845-L940"], "needs_figure": true, "needs_worked_example": true, "difficulty": "supporting"},
+    {"id": "m8-scf-for-sync", "name": "processScfForSync：循环迭代参数跨核（yield 核 vs 首用者核）", "kind": "algorithm", "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L106-L212"], "needs_figure": false, "needs_worked_example": true, "difficulty": "supporting"},
+    {"id": "m9-set-wait-placement", "name": "set/wait 落点微调：FindLastestPosition/FindEarliestPosition（回溯 broadcast 省 UB、遇已有 sync 停）", "kind": "algorithm", "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L547-L602"], "needs_figure": false, "needs_worked_example": true, "difficulty": "supporting"},
+    {"id": "m10-mem-effects-sync", "name": "addMemEffectsSync：别名分析补 WAR/WAW 跨核同步 + 支配序去重", "kind": "algorithm", "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L1051-L1186"], "needs_figure": false, "needs_worked_example": true, "difficulty": "supporting"},
+    {"id": "m11-encapsulate-scope", "name": "encapsulateWithScope：建 AIV/AIC 两 scope.scope 并打 tcore_type 属性", "kind": "algorithm", "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L69-L151"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m12-collect-ops-routing", "name": "collectOpsToMove：算子路由规则（valueTypes + copy/fixpipe/scf/store/assert/sync 专规）", "kind": "algorithm", "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L158-L310"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m13-split-scope-rebuild", "name": "SplitScope+processOperationToMove：按 MoveType 过滤重建 scf 结构 op、逆序 erase 原 op", "kind": "algorithm", "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L327-L690"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m14-buffer-wait-sync", "name": "addSyncOpsForBufferWait：scope 切分后对 fixpipe/to_memref 补 pipeline set/wait，按 flag 跨 region 配对", "kind": "protocol", "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L693-L1074"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m15-flag-pool-deadlock", "name": "flag 事件池与死锁：static_flag_id 配对、syncFlag % 14 循环复用、配对不成即阻塞", "kind": "protocol", "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L1116", "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L1241", "third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L1281", "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L794-L805"], "needs_figure": false, "needs_worked_example": true, "difficulty": "supporting"},
+    {"id": "m16-warp-spec-contrast", "name": "对位基座 warp specialization：scope+事件 vs warp+mbarrier（跨物理核 vs 同 SM 内）", "kind": "config", "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAGSync.cpp:L647-L707", "third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L139-L150"], "needs_figure": true, "needs_worked_example": false, "difficulty": "supporting"}
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recycle": [
+      {"id": "f2", "text": "本章只求解出 Value→CoreType 核标注（经 toHivm 翻成 hivm::TCoreType），不负责把它落进 IR；下一章 DAGScope 按核标注把 op 切进 vector-scope/cube-scope 并打 hivm::TCoreTypeAttr 属性，DAGSync 在跨核边界插同步搬运", "planted_in": "ch16", "recycle_note": "本章正是 f2 的回收点：ch16 的 valueTypes(Value→CoreType) 经 Graph::getValueTypes() 被 DAGScope/DAGSync 消费 —— DAGScope 的 encapsulateWithScope 打 TCoreTypeAttr(VECTOR/CUBE) 属性到 scope.scope、collectOpsToMove/SplitScope 按核标注切 scope；DAGSync 在 needVectorCubeSync 判出的跨核边插 sync_block_set/wait + fixpipe/copy 搬运。写作时用 markdown 链接回指 ch16，不重推导核标注怎么算出来的。"}
+    ]
+  }
+}
