@@ -1,0 +1,238 @@
+{
+  "chapter": "ch16",
+  "title": "Cube 还是 Vector：AI Core 异构双核与核亲和定点传播",
+  "skip_impl": true,
+  "trace_source": "纯 C++ MLIR pass 章，宿主无 CANN 工具链编不动；triton-ascend 树内无针对 dag-scope/AffinityDAG 的 lit 夹具（grep RUN dag-* / TritonAffinity 全空；找到的 *-infer-core-type.mlir 属 bishengir HIVM 方言自身的 core-type 推断，是下沉链更深一层、非本 pass）。故本章交叉验证以 pin 源码 @2badfc89e 逐段为主，不伪造编译器 dump。行号基线 = book-baseline 分支（= v3.2.1 钉版 2badfc89e70a9b7a5e88463a116c2feddce4b101）。",
+
+  "code_spine": [
+    "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp:L421-L532  Graph::fromMultiBlockFunc —— 本子系统对外入口：建图 → 两遍 diffuse 不动点 → 落 isOnPrivate（供 DAGScope/DAGSync 经 getValueTypes 消费）",
+    "third_party/ascend/include/TritonAffinityOpt/DAG.h:L27-L44   OpAbility / CoreType 两枚举 + toCoreType（静态能力 vs 已决放置，两套位编码经 toCoreType 对齐）",
+    "third_party/ascend/include/TritonAffinityOpt/DAG.h:L46-L98   CoreType 格：operator| / operator& / intersects / operator! / exactlyOneType / toHivm（映射到 HIVM 方言 TCoreType）",
+    "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp:L139-L182   OpNode::canRunOn —— 判核规则（静态能力）：scf 早返回 + TypeSwitch 四臂",
+    "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp:L109-L137   valueIsScalar / valueIsTensorOfPtr —— 张量 vs 标量判定（判核规则的谓词）",
+    "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp:L62-L107    Graph::Graph —— 逐 block 建 ValueNode/OpNode",
+    "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp:L184-L281   OpNode::OpNode —— 连边：operand→input、result→output、RegionBranch/Loop 子图跨区连边",
+    "third_party/ascend/include/TritonAffinityOpt/DAG.h:L176-L287 Node/OpNode/ValueNode —— 节点模型：isOnPrivate、isUpstreamOfCubeMem、outputs、absorb/getAffected/getSourceOpNode",
+    "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp:L323-L399   Node::absorbCommon —— 传递函数（核心）：从『下游消费者』回吸核约束 + isUpstreamOfCubeMem 传染 + WRITE 顺数据源",
+    "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp:L305-L315   getWriteDataSource —— 取写操作的数据源（跳过 i1 mask）",
+    "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp:L401-L419   OpNode::absorbImpl / ValueNode::absorbImpl —— scf→CUBE_AND_VECTOR，否则 absorbCommon",
+    "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp:L452-L481   diffuse worklist + 两遍不动点 + UNDETERMINED 兜底 VECTOR_ONLY"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "third_party/ascend/include/TritonAffinityOpt/DAG.h",
+      "lines": "L27-L44",
+      "note": "两套枚举：OpAbility=op『能』跑在哪个核（静态能力，canRunOn 算），CoreType=op『被决定』放哪个核（不动点的格）。二者位编码不同（OpAbility::PREFER_VECTOR=1 对齐 CoreType::VECTOR_ONLY=1，CUBE_ONLY 两侧都=2），toCoreType 按底层位重解释把能力搬进格。",
+      "code": "enum class OpAbility {\n  PREFER_VECTOR = 1 << 0,\n  CUBE_ONLY = 1 << 1,\n  CUBE_AND_VECTOR = PREFER_VECTOR | CUBE_ONLY\n\n};\n\nenum CoreType {\n  UNDETERMINED = 0,\n  VECTOR_ONLY = 1 << 0,\n  CUBE_ONLY = 1 << 1,\n  CUBE_AND_VECTOR = VECTOR_ONLY | CUBE_ONLY\n};\n\ninline constexpr CoreType toCoreType(OpAbility ct) {\n  using U = std::underlying_type_t<OpAbility>;\n  return static_cast<CoreType>(static_cast<U>(ct));\n}"
+    },
+    {
+      "path": "third_party/ascend/include/TritonAffinityOpt/DAG.h",
+      "lines": "L62-L98",
+      "note": "格上的运算：operator!（在 {CUBE,VECTOR} 内取补）、toHivm（把内部 CoreType 翻成 HIVM 方言的 hivm::TCoreType，UNDETERMINED→CUBE_OR_VECTOR，是本 pass 结果最终对外的口径）、exactlyOneType（恰好单核）。省略：operator| / operator& / intersects（见 L46-L60，格的并/交/相交判定，语义标准）。",
+      "code": "inline CoreType operator!(CoreType ct)\n{\n    CoreType newCt = UNDETERMINED;\n    if ((ct & CoreType::CUBE_ONLY) == UNDETERMINED) {\n        newCt = newCt | CoreType::CUBE_ONLY;\n    }\n\n    if ((ct & CoreType::VECTOR_ONLY) == UNDETERMINED) {\n        newCt = newCt | CoreType::VECTOR_ONLY;\n    }\n\n    return newCt;\n}\n\ninline hivm::TCoreType toHivm(CoreType ct)\n{\n    switch (ct) {\n        case UNDETERMINED:\n            return hivm::TCoreType::CUBE_OR_VECTOR;\n        case CUBE_ONLY:\n            return hivm::TCoreType::CUBE;\n        case VECTOR_ONLY:\n            return hivm::TCoreType::VECTOR;\n        case CUBE_AND_VECTOR:\n            return hivm::TCoreType::CUBE_AND_VECTOR;\n        default:\n            llvm_unreachable(\"Invalid CoreType that cannot convert to hivm\");\n    }\n}\n\ninline bool exactlyOneType(CoreType ct) {\n  return (ct == CUBE_ONLY) || (ct == VECTOR_ONLY);\n}"
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp",
+      "lines": "L109-L137",
+      "note": "『标量 vs 张量』的判定，是判核规则的底层谓词：int/index/float 是标量；rank-0 张量算标量；triton 指针（scalar ptr）算标量；其余（rank≥1 张量）非标量=向量候选。valueIsTensorOfPtr 在活路径未被调用（其唯一调用点在 canRunOn 里被注释掉，见 L160-162/L169-171），但保留其定义以忠实原码。",
+      "code": "bool valueIsScalar(Value value) {\n  auto type = value.getType();\n\n  if (type.isIntOrIndexOrFloat()) {\n    return true;\n  }\n\n  if (auto tensorType = llvm::dyn_cast<RankedTensorType>(type)) {\n    return tensorType.getRank() == 0;\n  }\n\n  if (auto _ = llvm::dyn_cast<triton::PointerType>(type)) {\n    return true;\n  }\n\n  return false;\n}\n\nbool valueIsTensorOfPtr(Value value) {\n  auto type = value.getType();\n  if (auto tensorType = llvm::dyn_cast<RankedTensorType>(type)) {\n    auto elementType = tensorType.getElementType();\n    if (llvm::isa<triton::PointerType>(elementType)) {\n      return true;\n    }\n  }\n\n  return false;\n}"
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp",
+      "lines": "L139-L182",
+      "note": "判核规则（静态能力 canRunOn）：① scf 方言 op → CUBE_AND_VECTOR（控制流不挑核）② tt.dot（triton::DotOp）→ CUBE_ONLY（矩阵乘只在 cube）③ arith.constant / tt.advance / tt.trans / annotation.mark 四类 → CUBE_AND_VECTOR ④ arith.select → 条件是标量则 CUBE_AND_VECTOR，否则 PREFER_VECTOR ⑤ Default → 任一 operand/result 非标量（即张量）则 PREFER_VECTOR，全标量则 CUBE_AND_VECTOR。注意 valueIsTensorOfPtr 的两处判定被注释（Default 内），故 tensor-of-ptr 在此不特殊处理。规则条数=scf 早返回 + TypeSwitch 四臂（DotOp / 四类常量流 / SelectOp / Default）。",
+      "code": "OpAbility OpNode::canRunOn() const {\n  if (opIsScf(op)) {\n    return OpAbility::CUBE_AND_VECTOR;\n  }\n  return llvm::TypeSwitch<Operation*, OpAbility>(op)\n    .Case<triton::DotOp>([](auto) {\n      return OpAbility::CUBE_ONLY;\n    })\n    .Case<arith::ConstantOp, triton::AdvanceOp, triton::TransOp, annotation::MarkOp>([](auto) {\n      return OpAbility::CUBE_AND_VECTOR;\n    })\n    .Case<arith::SelectOp>([](arith::SelectOp op) {\n      // when cond is vector, selectOp should be vector, otherwise scalar\n      return (\n        valueIsScalar(op.getCondition()) ? OpAbility::CUBE_AND_VECTOR : OpAbility::PREFER_VECTOR\n      );\n    })\n    .Default([](Operation* op) {\n      auto isVector = false;\n      for(auto operand : op->getOperands()) {\n        if (!valueIsScalar(operand)) {\n          isVector = true;\n        }\n      }\n\n      for(auto result : op->getResults()) {\n        if (!valueIsScalar(result)) {\n          isVector = true;\n        }\n      }\n\n      if (isVector) {\n        return OpAbility::PREFER_VECTOR;\n      }\n\n      return OpAbility::CUBE_AND_VECTOR;\n    });\n}",
+      "elide": ["Default 分支内 valueIsTensorOfPtr(operand)/valueIsTensorOfPtr(result) 两处 `return SCALAR;` 判定被 // 注释（原码 L160-162 / L169-171），此处如实删去以免混淆——写作时若引这段须声明『去掉两处注释掉的 tensor-of-ptr 分支』"]
+    },
+    {
+      "path": "third_party/ascend/include/TritonAffinityOpt/DAG.h",
+      "lines": "L176-L223",
+      "note": "节点基类 Node：isOnPrivate=当前已决核（CoreType 格，初值 UNDETERMINED）、isUpstreamOfCubeMem=『我位于喂给 cube 内存的上游』这个传染标记、outputs=下游节点。absorb()=跑 absorbImpl() 算新核、比对旧值、写回、返回是否变化（worklist 据此决定是否重排下一轮）。absorbImpl 抽象，OpNode/ValueNode 各实现。省略：NodeKind/getKind 样板。",
+      "code": "class Node : MoveOnly {\nprotected:\n  friend class Graph;\n  friend class ValueNode;\n  bool isUpstreamOfCubeMem = false;\n  virtual CoreType absorbImpl() = 0;\n  llvm::SmallVector<Node*, 4> outputs;\n\npublic:\n  CoreType isOnPrivate = UNDETERMINED;\n\n  inline CoreType isOn() const {\n    return isOnPrivate;\n  }\n\n  bool absorb() {\n    auto newCoreType = absorbImpl();\n    auto changed = newCoreType != isOnPrivate;\n    isOnPrivate = newCoreType;\n\n    return changed;\n  };\n\n  virtual llvm::SmallVector<Node*, 4> getAffected() const = 0;\n  virtual OpNode* getSourceOpNode() = 0;\n\n  ArrayRef<Node*> getOutputs() const {\n    return outputs;\n  }\n\n  CoreType absorbCommon();\n};",
+      "elide": ["enum NodeKind {NK_Op, NK_Value}; / getKind() / 构造 Node(NodeKind) 等样板；friend/protected 修饰细节（原码 L187-L222）"]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp",
+      "lines": "L323-L399",
+      "note": "★核心传递函数 absorbCommon。方向=后向：一个节点的核由它『下游消费者(outputs)』的核回吸决定。步骤：(a) 无 source op（block arg/dummy）→ 并所有 outputs 的 isOn，并传播 isUpstreamOfCubeMem。(b) 有 source：起点=当前 isOn，ability=canRunOn。CUBE_ONLY 能力→硬钉 CUBE_ONLY 直接返回。(c) 按 MemoryEffect 定 memPolicy（Write/Read/None）。(d) WRITE：核跟随写入的数据源——getWriteDataSource 取到且 exactlyOneType 则返回该核（若是 CUBE_ONLY 则打 isUpstreamOfCubeMem=true），否则 VECTOR_ONLY。(e) 否则遍历 outputs：CUBE_AND_VECTOR→并 VECTOR_ONLY 且 fall-through（无 break，故意）到 CUBE_ONLY 处理；CUBE_ONLY→仅当『能力不是 PREFER_VECTOR，或下游 isUpstreamOfCubeMem，或本 op 是 READ』时才把 CUBE_ONLY 并进来并传染 isUpstreamOfCubeMem（这就是『喂 cube 内存的读』把上游拉向 cube 的传染路径）；VECTOR_ONLY→并 VECTOR_ONLY；UNDETERMINED→跳过。",
+      "code": "CoreType Node::absorbCommon() {\n\n  auto sourceNode = getSourceOpNode();\n  auto op = sourceNode ? sourceNode->op : nullptr;\n\n  if (!sourceNode || !op) {\n    CoreType newCoreType = isOnPrivate;\n    for(auto output : outputs) {\n      newCoreType = newCoreType | output->isOn();\n      isUpstreamOfCubeMem = isUpstreamOfCubeMem || output->isUpstreamOfCubeMem;\n    }\n    return newCoreType;\n  }\n\n  CoreType newCoreType = sourceNode->isOn();\n\n  OpAbility ability = sourceNode->canRunOn();\n\n  if (ability == OpAbility::CUBE_ONLY) {\n    return CUBE_ONLY;\n  }\n\n  auto memIface = llvm::dyn_cast<MemoryEffectOpInterface>(op);\n  auto memPolicy = MemPolicy::NONE;\n\n  if (memIface) {\n    if (memIface.hasEffect<MemoryEffects::Write>()) {\n      memPolicy = MemPolicy::WRITE;\n    } else if (memIface.hasEffect<MemoryEffects::Read>()) {\n      memPolicy = MemPolicy::READ;\n    }\n  }\n\n  if (memPolicy == MemPolicy::WRITE) {\n    if (auto data = getWriteDataSource(sourceNode)) {\n      auto currCt = data->isOn();\n      if (exactlyOneType(currCt)) {\n        if (currCt == CUBE_ONLY) {\n          isUpstreamOfCubeMem = true;\n        }\n        return currCt;\n      }\n    }\n\n    // data is not cube_only\n    return VECTOR_ONLY;\n  }\n\n  for(auto output : outputs) {\n    switch (output->isOn()) {\n      case CUBE_AND_VECTOR:\n        newCoreType = newCoreType | VECTOR_ONLY;\n        // not breaking the switch because we need to handle cube\n      case CUBE_ONLY:\n        if (\n          ability != OpAbility::PREFER_VECTOR ||\n          output->isUpstreamOfCubeMem ||\n          memPolicy == MemPolicy::READ\n        ) {\n          isUpstreamOfCubeMem = (\n            isUpstreamOfCubeMem ||\n            output->isUpstreamOfCubeMem ||\n            memPolicy == MemPolicy::READ\n          );\n          newCoreType = newCoreType | CUBE_ONLY;\n        }\n        break;\n      case VECTOR_ONLY:\n        newCoreType = newCoreType | VECTOR_ONLY;\n      default: // UNDETERMINED, skip\n        break;\n    };\n  }\n\n  return newCoreType;\n}",
+      "elide": ["memIface 上方一句注释 `// Possible improvements: Determine the policy...`（L349）省略，不影响控制流"]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp",
+      "lines": "L305-L315",
+      "note": "写操作的数据源：跳过第一个 operand（约定为写入目标），在其余 input 里找第一个非 i1（i1=bool，即 mask）的值——它就是被写出的『数据』，写操作的核跟它走。",
+      "code": "ValueNode* getWriteDataSource(OpNode* op) {\n  auto inputRange = op->getInputs();\n  for(auto node : inputRange.drop_front()) {\n    auto typ = getElementTypeOrSelf(node->value);\n    if (!typ.isInteger(1)) {\n      return node;\n    }\n  };\n\n  return nullptr;\n}"
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp",
+      "lines": "L401-L419",
+      "note": "两个 absorbImpl：OpNode 对 scf op 直接判 CUBE_AND_VECTOR（控制流双核可跑），其余委托 absorbCommon；ValueNode 一律 absorbCommon。省略：OpNode 内被注释掉的『CUBE_AND_VECTOR 时并 inputs』实验块（L408-412）。",
+      "code": "CoreType OpNode::absorbImpl() {\n  if (opIsScf(op)) {\n    return CUBE_AND_VECTOR;\n  }\n\n  auto newCoreType = absorbCommon();\n\n  return newCoreType;\n}\n\nCoreType ValueNode::absorbImpl() {\n  return absorbCommon();\n}",
+      "elide": ["OpNode::absorbImpl 内被 // 注释的 4 行实验代码（若 canRunOn==CUBE_AND_VECTOR 则把 inputs 的 isOn 并进来），当前不生效，删去"]
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp",
+      "lines": "L452-L481",
+      "note": "★不动点驱动器 diffuse + 两遍策略。diffuse：把全部节点塞进 SmallSetVector worklist（自动去重），阈值=节点数×5 作迭代上限（安全网，防不收敛）；每轮 pop 一个节点跑 absorb()，若核变化则把 getAffected()（inputs+outputs / outputs+source）重排回 worklist，直到空或触顶。两遍：先 diffuse 一次；再把仍 UNDETERMINED 的节点兜底成 VECTOR_ONLY（『拿不准就放向量核』）；再 diffuse 一次让这批默认值继续传染到不动点。这是『为什么不是一遍扫』的答案：核约束沿数据流双向传染，需迭代到稳定。省略：nodes 收集样板（L436-450）与其后的 dbgs 调试 dump（L482-529，仅打印，不改结果）。",
+      "code": "  auto diffuse = [&]() {\n    // Not sure if determinism is required\n    llvm::SmallSetVector<Node*, 16> worklist(nodes.begin(), nodes.end());\n\n    size_t threshold = worklist.size() * 5;\n\n    for(size_t i = 0; i< threshold; i++) {\n      if (worklist.empty()) {\n        break;\n      }\n\n      auto node = worklist.pop_back_val();\n\n      if (node->absorb()) {\n        auto affected = node->getAffected();\n        worklist.insert(affected.begin(), affected.end());\n      }\n    }\n  };\n\n  diffuse();\n\n  for(auto node : nodes) {\n    if (node->isOn() == UNDETERMINED) {\n      node->isOnPrivate = VECTOR_ONLY;\n    }\n  }\n\n  diffuse();",
+      "elide": ["diffuse() 之后的整段 TypeSwitch dbgs 打印循环（L485-529）只做调试输出、不影响 isOnPrivate 结果，省略；其上 dummyBlock/dummyNode/nodes.reserve 收集样板亦省略"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "OpAbility (enum class)", "file": "third_party/ascend/include/TritonAffinityOpt/DAG.h", "responsibility": "op 的『静态能力』：PREFER_VECTOR / CUBE_ONLY / CUBE_AND_VECTOR。由 canRunOn() 依 op 类型算出，是『它能跑在哪个核』；与 CoreType 是两套东西。"},
+    {"name": "CoreType (enum)", "file": "third_party/ascend/include/TritonAffinityOpt/DAG.h", "responsibility": "2-bit 位掩码格：UNDETERMINED=0 / VECTOR_ONLY=1 / CUBE_ONLY=2 / CUBE_AND_VECTOR=3。不动点在这个格上迭代，是『op 被决定放哪个核』。经 toHivm 落成 HIVM 方言的 hivm::TCoreType 对外。"},
+    {"name": "Graph", "file": "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp", "responsibility": "一个 block 的节点图（含 opMap/valueMap，父子 Graph 共享 map 以跨区连边）。fromMultiBlockFunc 是对外入口：建全函数图→两遍 diffuse→结果落节点。getValueTypes() 把结果导成 DenseMap<Value,CoreType> 供 DAGScope/DAGSync 消费。"},
+    {"name": "Node / OpNode / ValueNode", "file": "third_party/ascend/include/TritonAffinityOpt/DAG.h", "responsibility": "数据流图节点：Node 基类持 isOnPrivate(已决核)/isUpstreamOfCubeMem(传染标记)/outputs；OpNode 包一个 mlir Operation*、持 inputs 与子图；ValueNode 包一个 mlir Value、持 source(定义者)。三者的 absorbImpl 定义传递函数。"},
+    {"name": "GraphManager", "file": "third_party/ascend/include/TritonAffinityOpt/DAG.h", "responsibility": "单例：按 funcName 注册/取回已建好的 Graph，让后续 DAGSync/DAGScope 复用同一张图与其核标注（避免重复建图）。"}
+  ],
+
+  "data_flow": [
+    "1. Graph::fromMultiBlockFunc(funcOp)：建 dummyGraph + dummyNode(nullptr op)，逐 block emplace 子图。DAG.cpp:Graph::fromMultiBlockFunc",
+    "2. Graph::Graph(block,...)：为每个 block arg 建 ValueNode，为每个 op 建 OpNode（顺带触发 OpNode 构造连边）。DAG.cpp:Graph::Graph",
+    "3. OpNode::OpNode：operand→input ValueNode（并把 this 记进该 ValueNode.outputs）、result→output ValueNode（source=this）；对 RegionBranchOpInterface(scf.if/scf.for) 递归建子图并跨区连 yield/iter_arg 边。DAG.cpp:OpNode::OpNode",
+    "4. 收集全部 Op/Value 节点入 nodes。DAG.cpp:fromMultiBlockFunc",
+    "5. 第一遍 diffuse()：worklist 迭代，每节点 absorb()→absorbImpl()→absorbCommon() 从 outputs 回吸核；变则重排 getAffected()。DAG.cpp:diffuse / Node::absorbCommon",
+    "6. 兜底：仍 UNDETERMINED 的节点 isOnPrivate=VECTOR_ONLY。DAG.cpp:fromMultiBlockFunc",
+    "7. 第二遍 diffuse()：让默认 VECTOR 值继续传染到不动点。DAG.cpp:diffuse",
+    "8.（消费者，本章外）DAGScope/DAGSync 经 Graph::getValueTypes() 拿 DenseMap<Value,CoreType>，据核把 op 切进 vector-scope / cube-scope 并打 hivm::TCoreTypeAttr。DAGScope.cpp:collectOpsToMove / DAGSync.cpp"
+  ],
+
+  "design_decisions": [
+    {"decision": "能力(OpAbility)与放置(CoreType)分成两套枚举、两套位编码，经 toCoreType 按底层位重解释对齐", "why": "『能跑在哪』是 op 类型的静态属性（canRunOn 一次算定），『被放到哪』是要沿数据流传染求解的动态结果；分开后传递函数可以用『能力』当约束（如 CUBE_ONLY 能力硬钉、PREFER_VECTOR 能力可被下游拉向 cube）而放置在格上自由并。位编码刻意让 PREFER_VECTOR 位==VECTOR_ONLY 位，使 toCoreType 直接位重解释即可。", "evidence": "third_party/ascend/include/TritonAffinityOpt/DAG.h:L27-L44"},
+    {"decision": "核约束用『后向数据流不动点』求解，而非一遍前向扫描", "why": "tt.dot 硬钉 CUBE_ONLY、store 顺其数据源、PREFER_VECTOR 的 elementwise 会被『喂 cube 内存的读』沿 isUpstreamOfCubeMem 拉向 cube——这些约束互相牵连、需从消费者回吸到生产者并反复收敛。单遍扫无法处理这种双向传染，故用 worklist 迭代到不动点。", "evidence": "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp:L323-L399, L452-L481"},
+    {"decision": "两遍 diffuse，中间把残留 UNDETERMINED 兜底成 VECTOR_ONLY", "why": "第一遍后仍无约束触达的节点（孤立/纯标量）没有理由上 cube，默认落向量核最省；但这批默认值本身还可能作为别人的下游影响传染，故需第二遍再跑到不动点。", "evidence": "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp:L474-L481"},
+    {"decision": "迭代上限 threshold = 节点数 × 5 的安全网", "why": "worklist 迭代靠『核变化才重排』收敛，但传递函数并非纯单调 join（WRITE 分支会覆盖式返回、不总是并旧值），为防病态输入不收敛，加硬上限兜底。", "evidence": "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp:L456"},
+    {"decision": "store(WRITE) 的核跟随其『数据源』而非目标指针，且跳过 i1 mask", "why": "写操作本身没有计算语义，它该在哪个核取决于被写出的数据在哪个核算出来的；mask(i1) 是控制而非数据，故 getWriteDataSource 跳过第一个 operand（目标）再滤掉 i1。", "evidence": "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp:L305-L315, L357-L370"},
+    {"decision": "scf 控制流 op 一律 CUBE_AND_VECTOR（双核可跑）", "why": "scf.if/scf.for 是结构而非算子，不占具体核，能力和放置都判双核，避免控制流误钉某核阻断传染。", "evidence": "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp:L140-L142, L402-L404"},
+    {"decision": "结果最终经 toHivm 落成 hivm::TCoreType（UNDETERMINED→CUBE_OR_VECTOR）供下沉链", "why": "本 pass 是 triton→NPU-affine 下沉的一环，核决策要以 HIVM 方言属性(hivm::TCoreTypeAttr)承载，交后续 DAGScope 切 scope、DAGSync 插跨核同步。", "evidence": "third_party/ascend/include/TritonAffinityOpt/DAG.h:L76-L90; third_party/ascend/lib/TritonAffinityOpt/DAGScope.cpp:L140-L148"}
+  ],
+
+  "theory": [
+    {"topic": "达芬奇异构双核模型（承 ch02，链接回指、不重讲硬件）", "content": "昇腾 AI Core 内含两类计算单元：Cube（矩阵/Tensor-Core 类，擅长 MatMul）与 Vector（逐元素/规约类，擅长 elementwise）。本 pass 要为每个 IR op 决定放哪个核。对位基座 GPU：cube≈Tensor Core 的物理载体，但抽象层不同——GPU 是选 mma 指令，昇腾是把 op 放到核（ch27/28 对照）。"},
+    {"topic": "格与传递函数", "content": "CoreType 是 {∅, {V}, {C}, {V,C}} 的 2-bit 幂集格，⊑=位包含，⊔=operator|(位或)。canRunOn 给每个 op 一个静态能力约束；absorbCommon 是传递函数，把下游消费者的核并回本节点。tt.dot 提供 CUBE_ONLY 的『源』，store 经数据源锚定，二者是传染的种子。"},
+    {"topic": "定点迭代收敛性（Kildall 1973 数据流分析一路，如实标注、不硬套论文）", "content": "worklist 算法属经典单调数据流框架谱系（Kildall《A unified approach to global program optimization》，1973）：节点反复应用传递函数、变则唤醒邻居、迭代到不动点。但需诚实标注：本实现的传递函数并非纯单调 join——WRITE 分支覆盖式返回（不并旧值），故不保证格意义上的单调上升，代码用 threshold=节点数×5 的硬上限兜底而非依赖理论收敛。可点出理论谱系，不宜宣称严格单调收敛证明。"},
+    {"topic": "为什么用不动点而非一遍扫（传染的收敛性）", "content": "核约束双向牵连：CUBE_ONLY 从 tt.dot 沿 use-def 回吸到上游生产者；VECTOR_ONLY 从兜底默认沿数据流扩散；isUpstreamOfCubeMem 标记让『喂给 cube 内存的读链路』把本可 PREFER_VECTOR 的 op 拉向 cube。一遍扫无法同时满足这些互相依赖的约束，必须迭代。"}
+  ],
+
+  "subtraction_plan": {
+    "delete": [],
+    "must_keep": [
+      {"symbol": "OpAbility", "why": "静态能力枚举，判核规则的输出类型；读者须懂它与 CoreType 的区别。"},
+      {"symbol": "CoreType", "why": "不动点求解所在的格；全章核心数据类型。"},
+      {"symbol": "canRunOn", "why": "判核规则（静态能力）的实现，writer 须逐 case 讲。"},
+      {"symbol": "valueIsScalar", "why": "张量 vs 标量判定，判核规则的底层谓词。"},
+      {"symbol": "absorbCommon", "why": "核心传递函数，全章算法主体。"},
+      {"symbol": "absorb", "why": "单节点一步迭代（跑 absorbImpl+比对+返回 changed），worklist 的驱动单元。"},
+      {"symbol": "isUpstreamOfCubeMem", "why": "把 PREFER_VECTOR op 拉向 cube 的传染标记，理解传播方向的关键。"},
+      {"symbol": "getWriteDataSource", "why": "WRITE 分支的核跟随数据源规则；解释 store 为何跳 mask。"},
+      {"symbol": "diffuse", "why": "worklist 不动点驱动器 + 两遍 + threshold 上限。"},
+      {"symbol": "fromMultiBlockFunc", "why": "对外入口，串起建图→两遍不动点→落结果的全流程。"},
+      {"symbol": "toHivm", "why": "结果对外口径，映射到 HIVM 方言 TCoreType。"},
+      {"symbol": "exactlyOneType", "why": "WRITE 分支判『数据源是否恰好单核』的谓词。"},
+      {"symbol": "getSourceOpNode", "why": "ValueNode 沿 source 链找到定义 op，传递函数取 op 的前提。"},
+      {"symbol": "getAffected", "why": "决定 absorb 变化后唤醒哪些邻居（inputs+outputs/outputs+source），传播拓扑。"}
+    ]
+  },
+
+  "mechanisms": [
+    {
+      "id": "m1-heterogeneous-dual-core",
+      "name": "异构双核模型：Cube vs Vector 各擅长什么",
+      "kind": "config",
+      "source_anchors": ["third_party/ascend/include/TritonAffinityOpt/DAG.h:L27-L44", "third_party/ascend/include/TritonAffinityOpt/DAG.h:L76-L90"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m2-ability-vs-placement",
+      "name": "两套枚举：静态能力(OpAbility) vs 已决放置(CoreType) 与位编码对齐",
+      "kind": "layout",
+      "source_anchors": ["third_party/ascend/include/TritonAffinityOpt/DAG.h:L27-L44"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m3-coretype-lattice",
+      "name": "CoreType 2-bit 格与格上运算(| & ! toHivm exactlyOneType)",
+      "kind": "layout",
+      "source_anchors": ["third_party/ascend/include/TritonAffinityOpt/DAG.h:L34-L98"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m4-judge-rules-canRunOn",
+      "name": "判核规则 canRunOn：scf/DotOp/常量流/Select/Default 各判什么核",
+      "kind": "algorithm",
+      "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAG.cpp:L139-L182", "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp:L109-L137"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m5-node-graph-model",
+      "name": "数据流图节点模型与连边(OpNode/ValueNode/source/outputs/子图跨区连边)",
+      "kind": "dataflow",
+      "source_anchors": ["third_party/ascend/include/TritonAffinityOpt/DAG.h:L176-L287", "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp:L184-L281"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m6-transfer-function-absorb",
+      "name": "传递函数 absorbCommon：从下游回吸核 + WRITE 顺数据源 + PREFER_VECTOR 被 CUBE 拉扯",
+      "kind": "algorithm",
+      "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAG.cpp:L323-L399", "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp:L401-L419"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m7-isUpstreamOfCubeMem-taint",
+      "name": "isUpstreamOfCubeMem 传染：喂给 cube 内存的读链路把 PREFER_VECTOR 拉向 cube",
+      "kind": "dataflow",
+      "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAG.cpp:L357-L396"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m8-write-datasource",
+      "name": "store 核跟随数据源(getWriteDataSource 跳 i1 mask)",
+      "kind": "algorithm",
+      "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAG.cpp:L305-L315", "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp:L357-L370"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m9-fixpoint-diffuse",
+      "name": "不动点驱动 diffuse：worklist 迭代 + 两遍 + UNDETERMINED 兜底 VECTOR + threshold 上限",
+      "kind": "algorithm",
+      "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAG.cpp:L452-L481"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m10-result-consumption",
+      "name": "结果落地：getValueTypes/toHivm 交 DAGScope 切 scope、GraphManager 复用",
+      "kind": "protocol",
+      "source_anchors": ["third_party/ascend/include/TritonAffinityOpt/DAG.h:L289-L327", "third_party/ascend/lib/TritonAffinityOpt/DAG.cpp:L76-L90"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    }
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_payoff": [],
+    "note": "bible.py due ch16 返回空（应埋/应回收均无条目）。"
+  }
+}
