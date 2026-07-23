@@ -52,7 +52,7 @@
     // … 省略：随后三段 walk 做 HIVM op 局部改写、属性搬运、annotation 清理 …
 ```
 
-这段短短的合法性声明，其实精确地钉死了 HIVM 在下降链上的坐标。`addIllegalDialect<linalg, hfusion>()` 说的是「本 pass 之后，`linalg` 和 `hfusion` 的算子一个都不许剩」；`addLegalDialect<hivm, …>()` 说的是「hivm 是这一步的产物」。注意合法列表里还有 `memref`／`tensor`／`arith`／`scf`（结构化控制流方言，`scf.for` 等）／`func`——它们**不是**被降的对象，而是 HIVM 之下继续存在的宿主方言：HIVM 算子会和它们混排在同一个函数体里。所以这条转换的一句话总结是：**把 HFusion 融合出来的张量算子，降到 HIVM 这一层**；再往下（降到 Standard／AscendC）就超出本章了。
+这段短短的合法性声明，其实精确地钉死了 HIVM 在下降链上的坐标。`addIllegalDialect<linalg, hfusion>()` 说的是「本 pass 之后，`linalg` 和 `hfusion` 的算子一个都不许剩」；`addLegalDialect<hivm, …>()` 说的是「hivm 是这一步的产物」。注意合法列表里还有 `memref`／`tensor`／`arith`／`scf`（结构化控制流方言，`scf.for` 等）／`func`——它们**不是**被降的对象，而是 HIVM 之下继续存在的宿主方言：HIVM 算子会和它们混排在同一个函数体里。所以这条转换的一句话总结是：**把 HFusion 融合出来的张量算子，降到 HIVM 这一层**；再往下（降到 Standard／AscendC——AscendC 是昇腾更贴近硬件的 C 类编程接口，本章不展开）就超出本章了。
 
 ![HIVM 在 bishengir 下降链上的位置：入口 pass 判 linalg／hfusion 为 illegal、hivm 为 legal](../diagrams/fig-ch23-lowering-position.png)
 
@@ -170,7 +170,7 @@ class HIVM_VectorOp<string mnemonic, list<Trait> traits = [],
 }
 ```
 
-看那个 `vecSpecialTraits` 默认参数——`[OpPipeTrait<"PIPE::PIPE_V">, VectorCoreTypeTrait]`。`PIPE_V` 是硬件的向量流水引擎，`VectorCoreTypeTrait` 标明「本算子属 Vector 核」。这两个 Trait 被拼进基类的 Trait 列表，于是**每一个**向量算子（`vadd`／`vexp`／`vreduce`／`vcast`／`vsel`……全书统称的四十多个，见 §23.6）一出生就带着它们。这就是「向量路径走 UB」的 IR 根据：向量算子的操作数在后面的内存层级推断里，会兜底落到 UB。
+看那个 `vecSpecialTraits` 默认参数——`[OpPipeTrait<"PIPE::PIPE_V">, VectorCoreTypeTrait]`。`PIPE_V` 是硬件的向量流水引擎，`VectorCoreTypeTrait` 标明「本算子属 Vector 核」。这两个 Trait 被拼进基类的 Trait 列表，于是**每一个**向量算子（`vadd`／`vexp`／`vreduce`／`vcast`／`vsel`……全书统称的四十多个，见 §23.6）一出生就带着它们。这就是「向量路径走 UB」的 IR 根据：向量算子的操作数在后面的内存层级推断里，会兜底落到 UB。（代码尾部的 `DestinationStyleOpInterface`／`getDpsInitsMutable` 涉及 DPS——destination-passing style，目标即初值的写入位；§23.5 讲 `mmadL1` 的累加器时展开。）
 
 **源码：Cube 侧的对偶。** 矩阵路径的核心算子从 `LocalMmad` 基类派生，基类固定带 `CubeCoreTypeTrait`（落 Cube 核）和一个 `MacroOpPipeTrait<MTE1, M>`：
 
@@ -186,7 +186,7 @@ class HIVM_LocalMmadOp<string mnemonic, list<Trait> traits = []> :
   // … 省略：基类 arguments（L65-L97）与 assemblyFormat／builders（L121-L161），讲 MmadL1Op 操作数时再展开 …
 ```
 
-`CubeCoreTypeTrait` 是 Vector 侧的镜像——标明「本算子属 Cube 核」。更耐读的是 `MacroOpPipeTrait<MTE1, M>`：它说明 `LocalMmad` 是个**宏算子**（macro op，内部藏了不止一段硬件流水）。这里藏了两段：`MTE1`（一条存储传输引擎，负责把数据从 L1 搬到 L0A／L0B）和 `M`（Cube 矩阵单元，做乘累加、写 L0C）。这个细节直接解释了一个后面会反复用到的事实——**L0A／L0B 是宏算子的「内部」缓冲，不出现在算子的操作数上**。
+`CubeCoreTypeTrait` 是 Vector 侧的镜像——标明「本算子属 Cube 核」。更耐读的是 `MacroOpPipeTrait<MTE1, M>`：它说明 `LocalMmad` 是个**宏算子**（macro op，内部藏了不止一段硬件流水）。这里藏了两段：`MTE1`（一条存储传输引擎，负责把数据从 L1 搬到 L0A／L0B）和 `M`（Cube 矩阵单元，做乘累加、写 L0C）。这个细节直接解释了一个后面会反复用到的事实——**L0A／L0B 是宏算子的「内部」缓冲，不出现在算子的操作数上**。（这一点在 §23.8 的真实 `hivm.hir.mmadL1` 调用里可当场验证：整条 `ins`／`outs` 只有 A／B／C 三个矩阵操作数外加几个标量参数，没有独立的 L0A／L0B 缓冲操作数。）
 
 核归属除了算子级的 Trait，还有函数级的 `func_core_type`。它有三态：`AIC`（纯 Cube 核）、`AIV`（纯 Vector 核）、`MIX`（两者都有，后续会被拆成 AIC／AIV 两个子核协同）。算子级 Trait 决定单个算子的归属，函数级 `func_core_type` 决定整个核落哪个物理核——两者配合，就是下图两条泳道的全部规则。
 
@@ -417,7 +417,7 @@ LogicalResult elementwiseMatchAndRewriteHelper(Operation *op,
 
 **直觉。** 像给一栋楼里每件家具贴「该放哪层」的标签，规矩分优先级：先按硬约束定死——矩阵机（`mmadL1`）的三件套 A、B 必进 L1、累加器 C 必进 L0C（不然 Cube 单元没法工作）；再给大门口卸的货（函数参数）统一贴「片外仓 GM」；剩下没贴标的家具，按「这层是矩阵车间还是向量车间」兜底（AIC→L1、AIV→UB）。而且标签会顺着家具的搬运路线（`scf.for` 的 iter_arg／yield、subview）一路级联贴到底，保证整条数据流层级自洽。
 
-**机制：四步优先级 + 级联。** 下表用夹具里三个真实函数，覆盖四步优先级与 AIC／AIV 两支兜底：
+**机制：优先级 + 级联。** 下表用夹具里三个真实函数，覆盖步①硬约束、步②函数参数、步④核类型兜底（含 AIC／AIV 两支），以及贯穿其间的 use-def 级联；步③的 pointer cast 传播这些夹具没触及，留到本节末尾的总调度段单独说明：
 
 <!-- trace: m9-infer-mem-scope -->
 
@@ -426,7 +426,7 @@ LogicalResult elementwiseMatchAndRewriteHelper(Operation *op,
 | ① mmadL1 约束 | A、B 输入 alloc（128×128 f16） | `inferAndPropagateMemScopeForMmadL1`：mA／mB→L1 | `cbuf`（L1） | complicated L43／L48 CHECK `#hivm.address_space<cbuf>` |
 | ① mmadL1 约束 | C 累加 alloc（128×128 f32） | 同上：mC→L0C | `cc`（L0C） | complicated L32 CHECK `#hivm.address_space<cc>` |
 | ② func 参数 GM | device func 三参数（A／B／C 的 GM 视图） | `inferAndPropagateMemScopeForFunc`：memref 型入参→GM | `gm`（GM） | complicated L26-L27 CHECK-SAME `#hivm.address_space<gm>` |
-| ③ use-def 级联 | scf.for 的 iter_arg 与结果类型 | `propagateMemScopeToUsers`：沿 ForOp 传播 C 的 cc | `cc`（L0C） | complicated L38-L39 CHECK-SAME `-> (…<cc>)` |
+| 级联传播（附加过程，非独立优先级） | scf.for 的 iter_arg 与结果类型 | `propagateMemScopeToUsers`：沿 ForOp 传播 C 的 cc | `cc`（L0C） | complicated L38-L39 CHECK-SAME `-> (…<cc>)` |
 | ④ 核类型兜底（AIC） | AIC 核里未定的剩余 alloc（8×16 f32） | `queryFuncCoreType=AIC` → 剩余 alloc 落 L1 | `cbuf`（L1） | set_cbuf_for_aic L260 CHECK `#hivm.address_space<cbuf>` |
 | ④ 核类型兜底（AIV） | AIV 核里未定的剩余 alloc（16 f32） | `queryFuncCoreType=AIV` → 剩余 alloc 落 UB | `ub`（UB） | fused_kernel_1 L94 CHECK `#hivm.address_space<ub>` |
 
@@ -473,7 +473,7 @@ LogicalResult hivm::inferAndPropagateMemScopeForMmadL1(hivm::MmadL1Op op) {
   }
 ```
 
-`getDpsInputOperand(0／1)` 取 A／B 输入、`getDpsInitOperand(0)` 取累加器 C（这三个正是 §23.5 说的三件套）。`tracebackMemRefToAlloc` 沿 use-def 链回溯到根 `memref.alloc`，然后 `helper.Run(*allocA, l1SpaceAttr)` 把 L1 地址空间赋给它——`helper` 会顺着 `scf.for`／`yield`／view 把这个地址空间级联传播下去（下面步③会再看这个 helper）。C 单独赋 L0C。这直接对应夹具里两个 f16 alloc 变 `cbuf`、f32 累加 alloc 变 `cc`。
+`getDpsInputOperand(0／1)` 取 A／B 输入、`getDpsInitOperand(0)` 取累加器 C（这三个正是 §23.5 说的三件套）。`tracebackMemRefToAlloc` 沿 use-def 链回溯到根 `memref.alloc`，然后 `helper.Run(*allocA, l1SpaceAttr)` 把 L1 地址空间赋给它——`helper` 会顺着 `scf.for`／`yield`／view 把这个地址空间级联传播下去（后面讲 use-def 级联时会再看这个 helper）。C 单独赋 L0C。这直接对应夹具里两个 f16 alloc 变 `cbuf`、f32 累加 alloc 变 `cc`。
 
 **源码：步②，函数参数打 GM。** device kernel 的每个 `memref` 型入参都住在片外，统一打 GM：
 
@@ -547,7 +547,7 @@ LogicalResult hivm::inferAndPropagateMemScopeForFunc(func::FuncOp op) {
   }
 ```
 
-四步一目了然：①`mmadL1` 约束 → ②func 参数 GM → ③pointer cast 标记 → ④剩余 `alloc` 按 `func_core_type` 兜底。兜底那段是双核分工在编译器里的**最终裁决点**：`space` 默认 `UB`，只有当 `funcCoreType == AIC`（纯 Cube 核）时才改成 `L1`——这就是「Cube 核剩余缓冲落 L1、Vector 核落 UB」。
+四步一目了然：①`mmadL1` 约束 → ②func 参数 GM → ③pointer cast 标记 → ④剩余 `alloc` 按 `func_core_type` 兜底。这里的步③处理 `hivm::PointerCastOp`（指针转型算子——把一个 `memref` 重新解释成另一种指针视图的算子）：这类算子在转型时带一个标注（annotation mark，就是上面注释里那句 pointer cast's annotation mark）记下它期望落到哪级地址空间，`inferAndPropagateMemScopeForPointerCast` 单独把这个标注上的地址空间传播出去。它之所以自成一步、排在②之后④之前，是因为地址空间既不由 `mmadL1` 硬约束、也不由函数参数决定，只能靠算子自带的标注来定；本章的三个夹具都不含这种转型，所以上面的机制表里没有它的行。兜底那段（步④）是双核分工在编译器里的**最终裁决点**：`space` 默认 `UB`，只有当 `funcCoreType == AIC`（纯 Cube 核）时才改成 `L1`——这就是「Cube 核剩余缓冲落 L1、Vector 核落 UB」。
 
 **不变量。** 优先级单调、赋值幂等收敛：高优先级规则（`mmadL1` 约束）先给的地址空间，后续步骤不再覆盖；兜底步只对**仍未标注**的 `alloc` 生效（helper 对已定的 alloc 不改写），所以先定的 L1／L0C 不会被后面的 UB／L1 兜底盖掉。次序若反了，就会把本该在 L1 的矩阵操作数误兜到 UB——这是四步必须有序的根本原因。级联传播则沿 iter_arg／yield／view 把地址空间改写到一致后，`memref` 类型不再不匹配、无新的待传播点 → 单调到不动点、有限步停。量化上，`complicated` 夹具一趟推断定死 7 处地址空间：①给 3 处（2×cbuf 输入 ＋ 1×cc 累加）、②3 个 func 参数→gm、③scf.for 结果级联→cc；级联传播是一遍 use-def 遍历 `$`O(V+E)`$`。核类型兜底把复杂度从「逐 alloc 人工标」降到「一次 `func_core_type` 查询 ＋ 一遍 walk」。
 

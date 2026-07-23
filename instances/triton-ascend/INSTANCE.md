@@ -51,6 +51,9 @@
   (HIVM AddressSpace 六级 GM/L1/L0A/L0B/L0C/UB) + Cube(L0A/L0B→L0C)/Vector(UB) 双核分工 + DMA 搬运。
   HIVM 方言 td 在 `…/bishengir/include/bishengir/Dialect/HIVM/IR/`,lib 在 `…/lib/Dialect/HIVM` 与 `…/lib/Conversion/HFusionToHIVM`。
   ⚠️ ch22 曾 Review round1 逃逸(计数陷阱 15→4 Scheduler/未验证子核个数/MixCV 14×14 结构错),Lead 手动接管修复+独立盲审,已归档。
+  ⚠️ **发车 slug 必须含 `chNN-` 前缀**(workflow 里 `CH = artifacts/ + A.slug`,slug 直接当目录名):ch23 误传裸 `hivm-dialect`→
+  产物落到 `artifacts/hivm-dialect/`(缺前缀、--all glob `ch??-*` 扫不到),事后 mv 回 `ch23-hivm-dialect` 才对。ch24+ 传 `ch24-<name>`。
+  ⚠️ ch23 另有两处工作流盲区(rename 后 Lead 补):dossier.json 里 `scf.ForOp` 等 C++ 类名点分写法(lint_ir_opname 只在 narrative 跑、漏了 dossier)→改 `scf::ForOp`;archivist 归档时目录名还没 mv,figures.json 的 ch23 图未登记(事后补)。
   ⚠️ HFusion/HIVM 在 **bishengir submodule** 内,路径须带 `third_party/ascend/AscendNPU-IR/bishengir/` 前缀。
   ⚠️ API 近期偶发 Connection-closed 崩(Dossier/Illustrate/Review/writer 各站都中过):有产物→带 skip_dossier 重跑;0 产物→干净重发。
   ⚠️ workflow 偶发 API 崩溃(Illustrate/Review 站):带 verified dossier 用 skip_dossier 重跑即可(非内容问题)。

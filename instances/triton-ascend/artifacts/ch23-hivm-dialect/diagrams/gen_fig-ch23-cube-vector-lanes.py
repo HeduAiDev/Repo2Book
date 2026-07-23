@@ -48,9 +48,7 @@ L = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}">',
      f'<text x="{w/2}" y="34" text-anchor="middle" font-family="sans-serif" font-size="18" '
      f'font-weight="bold" fill="#0f172a">{esc(TITLE)}</text>',
      f'<text x="{w/2}" y="58" text-anchor="middle" font-family="sans-serif" font-size="12" '
-     f'fill="#64748b">{esc(SUBTITLE)}</text>',
-     f'<text x="{w/2}" y="76" text-anchor="middle" font-family="sans-serif" font-size="11" '
-     f'fill="#94a3b8">{esc("TCoreType 枚举：CUBE=1 / VECTOR=2 / CUBE_OR_VECTOR=3 / CUBE_AND_VECTOR=4 —— HIVMAttrs.td:L315-L318")}</text>']
+     f'fill="#64748b">{esc(SUBTITLE)}</text>']
 
 L.append(f'<text x="{w/2}" y="{SEL_Y-14}" text-anchor="middle" font-family="sans-serif" '
           f'font-size="12.5" font-weight="bold" fill="#475569">'
