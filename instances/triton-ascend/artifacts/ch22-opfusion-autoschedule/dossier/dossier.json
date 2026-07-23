@@ -1,0 +1,358 @@
+{
+  "chapter": "ch22",
+  "title": "算子融合与自动调度：FusionKind 分类与 Cube/Vector 分工的 tile 策略",
+  "skip_impl": true,
+  "scope_note": "本章只走两条脊梁：① OpFusion 如何用 FusionKind 决定融合边界（FusibleBlockAnalyzer 主逻辑 + FusibleHelper 的 per-kind isFusible 规则表）；② AutoSchedule 如何把融合核选调度器、切 tile、分 cube/vector——以 ShallowCVSchedule 一条为 worked example，AutoScheduleBase 只讲框架骨架。AutoSchedule 子系统共 15 个 schedule 文件（AnyPBR/SingleCube/PureElemwise/AnyPB… 各 FusionKind 一条、机制同构），本章一律点名不展开。FusionKind 十值语义、HFusion op 定义链接回指 ch21，不重讲。",
+  "code_spine": [
+    "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion.cpp:L256-L312 (HFusionOpFusionPass::runOnOperation — 每个 func 读 FusionKindAttr，按 host/device × multiKernel 路由到 outlineFusedFuncs / outlineMultiKernel)",
+    "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion.cpp:L134-L169 (outlineFusedFuncs — 单一 FusionKind 路径：getFusibleBlocks → FusibleBlockOutliner.outline)",
+    "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleBlockAnalyzer.cpp:L34-L44 (getFusibleBlocks — 每个 Block 建一个 analyzer)",
+    "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleBlockAnalyzer.cpp:L177-L285 (fuseBlock — union-find 融合主循环：先纵向 verifyRulesAndJoin，再横向融合，最后 checkGroupRequirements 出组)",
+    "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleBlockAnalyzer.cpp:L86-L147 (verifyRulesAndJoin — 融合规则关卡)",
+    "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleHelper.cpp:L557-L582 (isFusible — 按 fusionKind_ 分派到 per-kind 兼容表)",
+    "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleHelper.cpp:L673-L712 (isShallowCVFusible — ShallowCV 允许 matmul 与 vector pattern 互融的兼容表)",
+    "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleBlockAnalyzer.cpp:L149-L173 (checkGroupRequirements — ShallowCV/MixCV 组内必须含 matmul)",
+    "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleBlockOutliner.cpp:L211-L235 (outline + setOutlineFuncAttributes — 融合块外提成设 FusionKindAttr 的 device func + 建 call)",
+    "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/AutoScheduleBase.cpp:L579-L611 (SchedulerBase::applySchedule — 按 FusionKind switch 选具体 scheduler)",
+    "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/AutoScheduleBase.cpp:L1211-L1233 (setOptionsForFunc — cube/mix/ShallowCV 的 blockDim 减半，cube:vector=1:2)",
+    "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/AutoScheduleBase.cpp:L281-L295 (runOnOperation — pre → schedule → post 调度骨架)",
+    "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/AutoScheduleBase.cpp:L245-L256 (runScheduleProcedure — calculateTiling → selectTiling → createAndApplySchedules)",
+    "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/AutoScheduleBase.cpp:L550-L577 (createAndApplySchedules — 逐 tiling key 建 transform 序列并解释执行)",
+    "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/ShallowCVSchedule.cpp:L40-L65 (ShallowCVScheduler::runOnOperation — worked example：拆 vector 子核 + 调度 + TensorResultToOutParam)"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion.cpp",
+      "lines": "L56-L66",
+      "note": "融合意图从 func 上的 FusionKindAttr 读出——FusionKind 是 ch21 InferFuncFusionKind 推断并挂上去的（回指 ch21）；OpFusion 只是消费者。",
+      "code": "inline std::optional<HFusionOpFusionOptions>\ngetOptionFromLabel(func::FuncOp func, const HFusionOpFusionOptions &options) {\n  HFusionOpFusionOptions newOptions = options;\n  auto fusionKindAttr =\n      func->getAttrOfType<FusionKindAttr>(FusionKindAttr::name);\n  if (!fusionKindAttr)\n    return std::nullopt;\n  auto fusionKind = fusionKindAttr.getFusionKind();\n  newOptions.fusionMode = fusionKind;\n  return newOptions;\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleHelper.cpp",
+      "lines": "L557-L582",
+      "note": "整个 FusionKind→融合规则的分派枢纽。每个 FusionKind 有一张自己的 pattern×pattern 兼容表；'FusionKind 驱动融合' 的核心就落在这个 switch。SingleCube 恒返回 false（单算子无融合可言）。",
+      "code": "bool FusibleHelper::isFusible(const OpPattern &patternA,\n                              const OpPattern &patternB) const {\n  switch (fusionKind_) {\n  case FusionKind::PureElemwise:\n    return isPureElemwiseFusible(patternA, patternB);\n  case FusionKind::AnyPB:\n    return isAnyPBFusible(patternA, patternB);\n  case FusionKind::LastAxisPBR:\n    return isLastAxisPBRFusible(patternA, patternB);\n  case FusionKind::AnyPBR:\n    return isAnyPBRFusible(patternA, patternB);\n  case FusionKind::ShallowCV:\n    return isShallowCVFusible(patternA, patternB);\n  case FusionKind::ShallowVV:\n    return isShallowVVFusible(patternA, patternB);\n  case FusionKind::MixCV:\n    return isMixCVFusible(patternA, patternB);\n  case FusionKind::MixC2:\n    return isMixC2Fusible(patternA, patternB);\n  case FusionKind::SingleCube:\n    // single cube is not considered as fusible because there is only one op\n    return false;\n  default:\n    llvm_unreachable(\"Invalid fusion mode\");\n  }\n} // namespace opfusion",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleHelper.cpp",
+      "lines": "L673-L712",
+      "note": "ShallowCV 的兼容表——注意 patternA/patternB 的 case 集合里都含 kMatmul，且 matmul 可与全部 vector pattern（elementwise/reduce/broadcast/slice…）互融：这正是 'cube 与 vector 浅配合' 的结构根据。对照 isMixCVFusible（L719）：MixCV 里 matmul 只能后接纯 elementwise，不能后接 reduce/broadcast——两者的分类边界差异就藏在这两张表。",
+      "code": "bool FusibleHelper::isShallowCVFusible(const OpPattern &patternA,\n                                       const OpPattern &patternB) const {\n  switch (patternA) {\n  case OpPattern::kElementWise:\n  case OpPattern::kZeroRankElemwise:\n  case OpPattern::kExtractSlice:\n  case OpPattern::kInsertSlice:\n  case OpPattern::kInterleave:\n  case OpPattern::kLastAxisBroadcast:\n  case OpPattern::kLastAxisReduce:\n  case OpPattern::kLoadStore:\n  case OpPattern::kMatmul:\n  case OpPattern::kMidFusionAuxiliary:\n  case OpPattern::kMidFusionImportantAux:\n  case OpPattern::kOtherBroadcast:\n  case OpPattern::kReshape:\n  case OpPattern::kTranspose:\n    switch (patternB) {\n    case OpPattern::kElementWise:\n    case OpPattern::kZeroRankElemwise:\n    case OpPattern::kExtractSlice:\n    case OpPattern::kInsertSlice:\n    case OpPattern::kInterleave:\n    case OpPattern::kLastAxisBroadcast:\n    case OpPattern::kLastAxisReduce:\n    case OpPattern::kLoadStore:\n    case OpPattern::kMatmul:\n    case OpPattern::kMidFusionAuxiliary:\n    case OpPattern::kMidFusionImportantAux:\n    case OpPattern::kOtherBroadcast:\n    case OpPattern::kReshape:\n    case OpPattern::kTranspose:\n      return true;\n    default:\n      return false;\n    }\n  default:\n    return false;\n  }\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleBlockAnalyzer.cpp",
+      "lines": "L86-L147",
+      "note": "融合规则关卡：两个并查集根 parentU/parentV 要合并前，依次过 reduceRank / reduceDim / nodeType / (横向)shapePivot / dependency 五道关卡，全过才 join。各关卡是否生效由 FusibleHelper 按当前 fusionKind_ 决定（如 isRestrictedByReduceRank 只对 LastAxisPBR/AnyPBR 生效，isRestrictedByNodeType 只对 MixCV 生效）——同一套流程，不同 FusionKind 打开不同关卡。",
+      "code": "bool FusibleBlockAnalyzer::verifyRulesAndJoin(int nodeU, int nodeV,\n                                              bool horizontal) {\n  // Try to join\n  int parentU = find(nodeU);\n  int parentV = find(nodeV);\n  // Already in one set, skip fusing\n  if (parentU == parentV)\n    return false;\n\n  LLVM_DEBUG(llvm::dbgs() << \"Joining and checking by reduce dimensions\\n\";);\n  // Reduce dimension checker\n  if (fusibleHelper_->isRestrictedByReduceRank(opMaxRank_[parentU],\n                                               opMaxRank_[parentV])) {\n    LLVM_DEBUG(llvm::dbgs() << \"Not allowed by reduce ranks\\n\";);\n    return false;\n  }\n\n  if (fusibleHelper_->isRestrictedByReduceDim(opReduceDim_[parentU],\n                                              opReduceDim_[parentV])) {\n    LLVM_DEBUG(llvm::dbgs() << \"Not allowed by reduce dimensions\\n\";);\n    return false;\n  }\n\n  // Node type checker\n  if (fusibleHelper_->isRestrictedByNodeType(setType_[parentU],\n                                             setType_[parentV], horizontal)) {\n    LLVM_DEBUG(llvm::dbgs() << \"Not allowed by node Type\\n\";);\n    return false;\n  }\n\n  if (horizontal) {\n    if (isRestrictedByShapePivot(parentU, parentV)) {\n      LLVM_DEBUG(llvm::dbgs() << \"Not allowed by shape pivot\\n\";);\n      return false;\n    }\n  }\n\n  // Restricted by dependency\n  if (isRestrictedByDependency(parentU, parentV, horizontal)) {\n    LLVM_DEBUG(llvm::dbgs() << \"Not allowed by fusion graph dependency\\n\";);\n    return false;\n  }\n\n  if (horizontal) {\n    // Check the opposite as well\n    if (isRestrictedByDependency(parentV, parentU, horizontal)) {\n      LLVM_DEBUG(llvm::dbgs()\n                     << \"Not allowed by opposite fusion graph dependency\\n\";);\n      return false;\n    }\n    if (importantSize_[parentU] == 0 || importantSize_[parentV] == 0) {\n      LLVM_DEBUG(\n          llvm::dbgs()\n              << \"Skipping horizontal function without vv operations\\n\";);\n      return false;\n    }\n  }\n\n  LLVM_DEBUG(llvm::dbgs() << \"Joining\\n\";);\n  join(parentU, parentV, horizontal);\n  return true;\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleBlockAnalyzer.cpp",
+      "lines": "L177-L221",
+      "note": "融合主循环（纵向部分）。先 reInitEdges/reinitTopoRank，枚举每条 use 边 (nodeU→user) 作候选，按被消费者 topoRank 升序排序，逐边过 isFusible + verifyRulesAndJoin。省略的后半段（L223-L266）是横向融合：把彼此无依赖的重要 op 组两两尝试合并，受 maxHorizontalFusion 上限约束；L272-L284 把并查集各根收集成 group，checkGroupRequirements 过滤后返回。",
+      "code": "SmallVector<SetVector<Operation *>> FusibleBlockAnalyzer::fuseBlock() {\n  reInitEdges();\n  reinitTopoRank();\n  SmallVector<NodeNodePair> fusionCandidates;\n  for (size_t nodeU = 0; nodeU < ops_.size(); ++nodeU) {\n    // Fusing\n    Operation *op = ops_[nodeU];\n    LLVM_DEBUG(llvm::dbgs() << \"\\n\\nComputing \" << nodeU << \": \" << *op\n                            << \"\\n ------- \";);\n\n    // Restricted the fusion if it's shallowCV and shape is dynamic\n    if (fusibleHelper_->isRestrictedByDynamicShape(op))\n      continue;\n\n    for (Operation *user : op->getUsers()) {\n      int32_t nodeV = static_cast<int32_t>(opIdx_[user]);\n      fusionCandidates.emplace_back(nodeU, nodeV);\n    }\n  }\n\n  // Sort all users based on its ascending topoRank\n  llvm::sort(fusionCandidates.begin(), fusionCandidates.end(),\n             [&](const NodeNodePair &a, const NodeNodePair &b) {\n               if (topoRank_[a.second] != topoRank_[b.second])\n                 return topoRank_[a.second] < topoRank_[b.second];\n               return topoRank_[a.first] < topoRank_[b.first];\n             });\n  for (const NodeNodePair &candidate : fusionCandidates) {\n    Operation *nodeU = ops_[candidate.first];\n    Operation *nodeV = ops_[candidate.second];\n    LLVM_DEBUG(llvm::dbgs() << \"Ok getting \" << candidate.first << \" \"\n                            << candidate.second << \"\\n\";);\n    LLVM_DEBUG(llvm::dbgs()\n                   << \"parent toporank: \" << topoRank_[find(candidate.first)]\n                   << \" \" << topoRank_[find(candidate.second)] << \"\\n\";);\n    if (fusibleHelper_->isRestrictedByDynamicShape(nodeV))\n      continue;\n\n    if (fusibleHelper_->isFusible(nodeU, nodeV)) {\n      // Verify graph and parent rules\n      LLVM_DEBUG(llvm::dbgs()\n                     << \"Fusible nodes \" << *nodeU << \" \" << *nodeV << \"\\n\";);\n      verifyRulesAndJoin(candidate.first, candidate.second);\n    }\n  }",
+      "elide": [
+        "L223-L266：横向融合段（把无依赖的重要 op 两两 verifyRulesAndJoin(true)，受 maxHorizontalFusion 上限约束）",
+        "L272-L284：按并查集根收集 group，group.size()>1 且 checkGroupRequirements 通过才 push 进 fusedGroups"
+      ]
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleBlockAnalyzer.cpp",
+      "lines": "L149-L173",
+      "note": "出组的最后一道 FusionKind 相关约束：若当前 kind 是 ShallowCV 或 MixCV，融合组内必须至少有一个 matmul（否则拒绝——纯 vector 的组不该走 cube 分类）；且任何组至少要有 2 个 important op 才值得融。",
+      "code": "bool FusibleBlockAnalyzer::checkGroupRequirements(\n    const SetVector<Operation *> &group) {\n  // Count vv ops here\n  int importantCount = 0;\n  int matmulCount = 0;\n  for (Operation *op : group) {\n    if (FusibleHelper::isImportantPattern(op))\n      importantCount++;\n    if (FusibleHelper::getOpPattern(op) == OpPattern::kMatmul) {\n      matmulCount++;\n    }\n  }\n  // If its shallow cv, check if there is a matmul\n  if (fusibleHelper_->getFusionKind() == FusionKind::ShallowCV ||\n      fusibleHelper_->getFusionKind() == FusionKind::MixCV) {\n    if (matmulCount == 0)\n      return false;\n  }\n  if (importantCount <= 1) {\n    LLVM_DEBUG(llvm::dbgs()\n                   << \"There is only one operation in this single function\\n\";);\n    return false;\n  }\n  return true;\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleBlockOutliner.cpp",
+      "lines": "L211-L235",
+      "note": "融合的落地：每个 FusibleBlock 被 outlineFunc 克隆进一个新 device func，并在原处建 call 替换。关键是 setOutlineFuncAttributes 把 curBlock.fusibleHelper_->getFusionKind() 原样写到新 func 的 FusionKindAttr 上——FusionKind 由此从 OpFusion 传递到下游 AutoSchedule。",
+      "code": "bool FusibleBlockOutliner::outline(const std::string &prefixOutline) {\n  for (FusibleBlock &curBlock : fusibleBlocks_) {\n    func::FuncOp fusedFunc = outlineFunc(curBlock, prefixOutline);\n    if (!fusedFunc)\n      return false;\n    outlinedFuncs_.push_back(fusedFunc);\n\n    func::CallOp fusionInvoke = createInvoke(fusedFunc, curBlock);\n    if (!fusionInvoke)\n      return false;\n  }\n  return true;\n}\n\nvoid FusibleBlockOutliner::setOutlineFuncAttributes(\n    func::FuncOp &func, const FusionKind &fusionKind, OpBuilder &builder,\n    bool isCallerHost) {\n  func->setAttr(FusionKindAttr::name,\n                FusionKindAttr::get(func->getContext(), fusionKind));\n  // Set outlined function to be a device function.\n  hacc::utils::setDevice(func);\n  // If the caller is a host function, the device function has to be an entry.\n  if (isCallerHost)\n    hacc::utils::setDeviceEntry(func);\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/AutoScheduleBase.cpp",
+      "lines": "L579-L611",
+      "note": "AutoSchedule 侧的对偶枢纽：从 func 上读回 FusionKindAttr（正是 outliner 写上的那个），switch 选具体 scheduler——PBR 家族共用 AnyPBRScheduler，SingleCube/ShallowCV 各有专属 scheduler，ShallowVV 直接 no-op 返回。'FusionKind 选调度策略' 就是这个 switch。这里也点明了 15 个 schedule 变体在源头上只由这一个 switch 分派。",
+      "code": "  auto fusionKind = fusionKindAttr.getFusionKind();\n  std::unique_ptr<SchedulerBase> scheduler;\n  funcOp->setAttr(utils::kEnableAutoMarkBufferSize, opBuilder.getUnitAttr());\n  switch (fusionKind) {\n  case FusionKind::PureElemwise:\n  case FusionKind::AnyPB:\n  case FusionKind::LastAxisPBR:\n  case FusionKind::AnyPBR:\n    scheduler = std::make_unique<AnyPBRScheduler>(funcOp);\n    break;\n  case FusionKind::SingleCube:\n    scheduler = std::make_unique<SingleCubeScheduler>(funcOp);\n    break;\n  case FusionKind::ShallowCV:\n    scheduler = std::make_unique<ShallowCVScheduler>(funcOp);\n    break;\n  case FusionKind::ShallowVV:\n    return success();\n  case FusionKind::Unknown:\n  default:\n    return funcOp.emitError(\"Unknown kernel fusion kind\");\n  }\n  return scheduler->runOnOperation(opBuilder);\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/AutoScheduleBase.cpp",
+      "lines": "L1221-L1231",
+      "note": "cube/vector 分工的资源侧证据：凡涉及 cube 的 FusionKind（MixCV/SingleCube/ShallowCV），blockDim 减半——注释直说 'cube 和 vector 是 1:2'（一个 cube 核配两个 vector 核，故 cube 侧核数取半）。",
+      "code": "  auto maybeFusionKind = hfusion::tryGetFusionKind(func);\n  // For cube and mix fusion kind, the block dim is set to half because cube\n  // and vector is 1:2 for now.\n  if (maybeFusionKind.has_value() &&\n      ((*maybeFusionKind) == FusionKind::MixCV ||\n       (*maybeFusionKind) == FusionKind::SingleCube ||\n       (*maybeFusionKind) == FusionKind::ShallowCV)) {\n    options.blockDim = std::max(this->blockDim / 2, (unsigned int)1);\n  } else {\n    options.blockDim = this->blockDim;\n  }",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/AutoScheduleBase.cpp",
+      "lines": "L245-L256",
+      "note": "调度骨架的三步主干（runScheduleProcedure）：calculateTiling 造 host 端 tiling 函数、selectTiling 尝试把 tiling key 常量化剪枝、createAndApplySchedules 逐 tiling case 生成并解释 transform 序列。ShallowCV 会override整个 runOnOperation，但 AnyPBR/SingleCube 等标准 scheduler 都跑这条主干。",
+      "code": "LogicalResult SchedulerBase::runScheduleProcedure(OpBuilder &opBuilder) {\n  func::FuncOp currentFunc = getOriginalKernel();\n  if (failed(calculateTiling(opBuilder)))\n    return currentFunc->emitWarning(\"Failed to calculate tiling.\");\n\n  if (failed(selectTiling()))\n    return currentFunc->emitWarning(\"Failed to select tiling.\");\n\n  if (failed(createAndApplySchedules(opBuilder)))\n    return currentFunc->emitWarning(\"Failed to create and apply schedule.\");\n  return success();\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/ShallowCVSchedule.cpp",
+      "lines": "L40-L65",
+      "note": "worked example 的核心：ShallowCVScheduler 是个 meta-scheduler，不亲自切 tile。它 (1) 对 ShallowCV 核再跑一遍 LastAxisPBR opfusion——把纯 vector 段外提成独立 device 子核；(2) 逐个 applySchedule（子核带 LastAxisPBR 标 → 走 AnyPBRScheduler 真正切 tile；matmul/cube 段另行处理）；(3) 对原核跑 TensorResultToOutParam。这就是 'cube/vector 分工' 在 pass 层面的具体形态：一个 CV 核被拆成 cube 子核 + vector 子核，各归各的 scheduler。",
+      "code": "LogicalResult ShallowCVScheduler::runOnOperation(OpBuilder &opBuilder) {\n  func::FuncOp shallowCVFunc = getOriginalKernel();\n  // Step 1: Apply LastAxsiPBR opfusion\n  HFusionOpFusionOptions options;\n  options.fusionMode = FusionKind::LastAxisPBR;\n  options.alwaysInline = true;\n  // Fuse all tensor.empty inside and let TensorResultToOutParam do its work.\n  options.moveOutToParam = false;\n  FailureOr<SmallVector<func::FuncOp>> outlinedFuncs =\n      applyOpFusionOutline(shallowCVFunc, options);\n  if (failed(outlinedFuncs))\n    return shallowCVFunc->emitError(\"Failed to apply LastAxisPBR fusion.\");\n\n  // Step 2: Apply Schedule for outlined kernels.\n  for (auto funcOp : *outlinedFuncs) {\n    LDBG(\"Scheduling outlined func: \" << *funcOp);\n    if (failed(applySchedule(funcOp, opBuilder)))\n      return failure();\n  }\n\n  // Step 3: Apply TensorResultToOutParam to the original ShallowCV kernel.\n  if (failed(applyTensorResultToOutParamsPass(shallowCVFunc)))\n    return failure();\n\n  return success();\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/test/Dialect/HFusion/AutoSchedule/test-shallow-cv.mlir",
+      "lines": "L4-L32",
+      "note": "worked example 的输入（pin 内 lit 夹具，带 RUN: bishengir-opt -hfusion-auto-schedule + FileCheck）。一个三层 MLP：每层 matmul_transpose_b(cube) → broadcast+add(bias, vector) → max(relu, vector)。整个 func 挂 hfusion.fusion_kind<SHALLOW_CV>——正是 cube 与 vector 逐层浅交替的典型 ShallowCV 图，供 explainer/illustrator 展示 fusion 边界与 cube/vector 拆分（trace_source：pin 内 lit 夹具，不伪造 dump）。",
+      "code": "// CHECK: @forward\nfunc.func @forward(%arg0: tensor<2x10xf32>, %cst : tensor<2x20xf32> ,%cst_0 : tensor<20x10xf32>, %cst_1 : tensor<20xf32>, %cst_2: tensor<20x20xf32>, %cst_3: tensor<20xf32>, %cst_4: tensor<10x20xf32>, %cst_5: tensor<10xf32>) -> tensor<2x10xf32>\n    attributes {hacc.function_kind = #hacc.function_kind<DEVICE>, hfusion.fusion_kind = #hfusion.fusion_kind<SHALLOW_CV>} {\n  %0 = tensor.empty() : tensor<2x20xf32>\n  %1 = linalg.matmul_transpose_b ins(%arg0, %cst_0 : tensor<2x10xf32>, tensor<20x10xf32>) outs(%0 : tensor<2x20xf32>) -> tensor<2x20xf32>\n  %2 = tensor.empty() : tensor<2x20xf32>\n  %broadcasted = linalg.broadcast ins(%cst_1 : tensor<20xf32>) outs(%2 : tensor<2x20xf32>) dimensions = [0]\n  %3 = tensor.empty() : tensor<2x20xf32>\n  %4 = linalg.elemwise_binary {fun = #linalg.binary_fn<add>} ins(%1, %broadcasted : tensor<2x20xf32>, tensor<2x20xf32>) outs(%3 : tensor<2x20xf32>) -> tensor<2x20xf32>\n  %5 = tensor.empty() : tensor<2x20xf32>\n  %6 = linalg.elemwise_binary {fun = #linalg.binary_fn<max_signed>} ins(%4, %cst : tensor<2x20xf32>, tensor<2x20xf32>) outs(%5 : tensor<2x20xf32>) -> tensor<2x20xf32>\n  %7 = tensor.empty() : tensor<2x20xf32>\n  %8 = linalg.matmul_transpose_b ins(%6, %cst_2 : tensor<2x20xf32>, tensor<20x20xf32>) outs(%7 : tensor<2x20xf32>) -> tensor<2x20xf32>\n  %9 = tensor.empty() : tensor<2x20xf32>\n  %broadcasted_6 = linalg.broadcast ins(%cst_3 : tensor<20xf32>) outs(%9 : tensor<2x20xf32>) dimensions = [0]\n  %10 = tensor.empty() : tensor<2x20xf32>\n  %11 = linalg.elemwise_binary {fun = #linalg.binary_fn<add>} ins(%8, %broadcasted_6 : tensor<2x20xf32>, tensor<2x20xf32>) outs(%10 : tensor<2x20xf32>) -> tensor<2x20xf32>\n  %12 = tensor.empty() : tensor<2x20xf32>\n  %13 = linalg.elemwise_binary {fun = #linalg.binary_fn<max_signed>} ins(%11, %cst : tensor<2x20xf32>, tensor<2x20xf32>) outs(%12 : tensor<2x20xf32>) -> tensor<2x20xf32>\n  %14 = tensor.empty() : tensor<2x10xf32>\n  %15 = linalg.matmul_transpose_b ins(%13, %cst_4 : tensor<2x20xf32>, tensor<10x20xf32>) outs(%14 : tensor<2x10xf32>) -> tensor<2x10xf32>\n  %16 = tensor.empty() : tensor<2x10xf32>\n  %broadcasted_7 = linalg.broadcast ins(%cst_5 : tensor<10xf32>) outs(%16 : tensor<2x10xf32>) dimensions = [0]\n  %17 = tensor.empty() : tensor<2x10xf32>\n  %18 = linalg.elemwise_binary {fun = #linalg.binary_fn<add>} ins(%15, %broadcasted_7 : tensor<2x10xf32>, tensor<2x10xf32>) outs(%17 : tensor<2x10xf32>) -> tensor<2x10xf32>\n  return %18 : tensor<2x10xf32>\n}",
+      "elide": ["同文件后续 shallow_cv_multiple_vv / shallow_cv_with_reshape_output 两个 case 只是变体，本章不展开"]
+    }
+  ],
+  "key_classes": [
+    {
+      "name": "FusibleHelper",
+      "file": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleHelper.cpp",
+      "responsibility": "承载所有 FusionKind 相关的融合规则：getOpPattern 把 op 分类成 OpPattern，isFusible 按 fusionKind_ 分派到 per-kind pattern×pattern 兼容表，以及各关卡谓词（isRestrictedByReduceRank/ReduceDim/NodeType、isShapePivot、schedulable）。FusionKind 就是通过它把'意图'翻译成'哪些 op 能进一个核'。"
+    },
+    {
+      "name": "FusibleBlockAnalyzer",
+      "file": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleBlockAnalyzer.cpp",
+      "responsibility": "单个 Block 内的融合决策器。用并查集(disjointSet_)维护融合组，用拓扑秩(topoRank_)保证按序尝试；fuseBlock 先纵向后横向融合，verifyRulesAndJoin 过五道关卡才 join，checkGroupRequirements 出组。产物是若干 SetVector<Operation*> 融合组。"
+    },
+    {
+      "name": "FusibleBlockOutliner",
+      "file": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleBlockOutliner.cpp",
+      "responsibility": "把 analyzer 产出的融合组物化成 IR：outlineFunc 克隆算子进新 device func、createInvoke 在原处建 call、setOutlineFuncAttributes 把 FusionKind 写进新 func 属性（下游 AutoSchedule 据此选调度器）。SingleMode 下还会按输出把大块拆成单输出子块。"
+    },
+    {
+      "name": "SchedulerBase",
+      "file": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/AutoScheduleBase.cpp",
+      "responsibility": "所有具体 scheduler 的基类与框架骨架。applySchedule(静态)按 FusionKind switch 出具体 scheduler；runOnOperation 编排 pre(cacheIO+分析)→schedule(tiling→选择→建schedule)→post；calculateTiling/createAndApplySchedules 生成 host tiling 函数与 transform 序列并解释执行。切 tile 的具体规则由派生类 calculateTilingImpl/createScheduleImpl 提供。"
+    },
+    {
+      "name": "ShallowCVScheduler",
+      "file": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/ShallowCVSchedule.cpp",
+      "responsibility": "worked example scheduler。不自己切 tile，而是把一个 ShallowCV 融合核再拆分：对其跑 LastAxisPBR opfusion 外提 vector 子核，逐子核 applySchedule（vector→AnyPBRScheduler，cube 段独立处理），最后 TensorResultToOutParam。体现 cube/vector 分工的最外层编排。"
+    },
+    {
+      "name": "HFusionOpFusionPass",
+      "file": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion.cpp",
+      "responsibility": "OpFusion 的 pass 入口（module pass）。逐 func 从 FusionKindAttr 取融合意图，按 host/device × enableMultiKernel × shallow 与否路由到 outlineFusedFuncs / outlineMultiKernel / outlineSingleFusedFuncs。"
+    }
+  ],
+  "data_flow": [
+    {"step": "1. 承 ch21：InferFuncFusionKind 已在每个 func 上挂好 hfusion.fusion_kind 属性", "ref": "回指 ch21（FusibleHelper/InferFuncFusionKind）"},
+    {"step": "2. HFusionOpFusionPass::runOnOperation 逐 func getOptionFromLabel 读出 FusionKind → fusionMode", "ref": "OpFusion.cpp:runOnOperation / getOptionFromLabel"},
+    {"step": "3. outlineFusedFuncs → getFusibleBlocks(entryFunc, fusibleHelper)：每 Block 构 FusibleBlockAnalyzer", "ref": "OpFusion.cpp:outlineFusedFuncs → FusibleBlockAnalyzer.cpp:getFusibleBlocks"},
+    {"step": "4. FusibleBlockAnalyzer::fuseBlock：并查集 + 拓扑秩，纵向 verifyRulesAndJoin（过 reduceRank/reduceDim/nodeType/dependency 关卡，关卡开关由 FusionKind 决定），再横向融合", "ref": "FusibleBlockAnalyzer.cpp:fuseBlock / verifyRulesAndJoin"},
+    {"step": "5. isFusible 按 FusionKind 查兼容表（如 isShallowCVFusible 允许 matmul↔vector 互融）决定候选边能否融", "ref": "FusibleHelper.cpp:isFusible / isShallowCVFusible"},
+    {"step": "6. checkGroupRequirements 过滤：ShallowCV/MixCV 组必须含 matmul，组内 important op>1", "ref": "FusibleBlockAnalyzer.cpp:checkGroupRequirements"},
+    {"step": "7. FusibleBlockOutliner::outline：每融合组 → outlineFunc 克隆成 device func + setOutlineFuncAttributes 写 FusionKindAttr + createInvoke 建 call", "ref": "FusibleBlockOutliner.cpp:outline / setOutlineFuncAttributes"},
+    {"step": "8. AutoSchedule pass：SchedulerBase::applySchedule 读回 FusionKindAttr，switch 选 scheduler（PBR家族→AnyPBR / SingleCube / ShallowCV / ShallowVV no-op）；cube 类 blockDim 减半(1:2)", "ref": "AutoScheduleBase.cpp:applySchedule / setOptionsForFunc"},
+    {"step": "9a. 标准 scheduler：runOnOperation → runPreScheduleProcedure(cacheIO+analyzeAndVerifyKernel) → runScheduleProcedure(calculateTiling→selectTiling→createAndApplySchedules) 逐 tiling key 建 transform 序列并解释执行切 tile", "ref": "AutoScheduleBase.cpp:runOnOperation / runScheduleProcedure / createAndApplySchedules"},
+    {"step": "9b. worked example ShallowCVScheduler::runOnOperation：对 CV 核再跑 LastAxisPBR opfusion 外提 vector 子核 → 逐子核 applySchedule（vector→AnyPBR，cube 独立）→ TensorResultToOutParam。cube/vector 由此落到不同子核不同 scheduler", "ref": "ShallowCVSchedule.cpp:runOnOperation"}
+  ],
+  "design_decisions": [
+    {
+      "decision": "每个 FusionKind 用一张独立的 pattern×pattern 兼容表（isPureElemwiseFusible / isShallowCVFusible / isMixCVFusible …），而非一套带参数的通用规则",
+      "why": "不同融合意图对'什么能进一个核'的判据差异巨大：ShallowCV 允许 matmul 与全部 vector pattern 互融；MixCV 只允许 matmul 后接纯 elementwise；PureElemwise 完全不含 matmul。用分表把差异显式化、可读可改。",
+      "evidence": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleHelper.cpp:L557-L820"
+    },
+    {
+      "decision": "融合流程统一为'并查集 + 拓扑秩 + 五道关卡'，各关卡的启用与否由 FusionKind 在 FusibleHelper 里决定",
+      "why": "同一套图算法复用给全部 FusionKind：verifyRulesAndJoin 里 reduceRank/reduceDim 只对 LastAxisPBR/AnyPBR 生效、nodeType 只对 MixCV 生效——关卡开关内联在谓词里，避免每个 kind 各写一遍融合循环。",
+      "evidence": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleHelper.cpp:L294-L312 (isRestrictedByReduceRank/Dim 的 kind 守卫), L211-L242 (isRestrictedByNodeType 只对 MixCV)"
+    },
+    {
+      "decision": "融合边界与调度策略共用同一个 FusionKind 属性——outliner 写、scheduler 读",
+      "why": "让 OpFusion 与 AutoSchedule 解耦却对齐：融合时确定的意图直接决定后续用哪个 scheduler，无需二次推断。setOutlineFuncAttributes 写、applySchedule 读同一个 FusionKindAttr。",
+      "evidence": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleBlockOutliner.cpp:L225-L235 与 AutoScheduleBase.cpp:L581-L610"
+    },
+    {
+      "decision": "cube 类 FusionKind 的 blockDim 减半（cube:vector=1:2）",
+      "why": "Ascend AI Core 里 cube 单元与 vector 单元数量比约 1:2，一个 cube 核搭配两个 vector 核；调度时给 cube 侧核数取半以匹配硬件配比。",
+      "evidence": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/AutoScheduleBase.cpp:L1222-L1231"
+    },
+    {
+      "decision": "ShallowCV 不用单一 scheduler 直接切 tile，而是二次拆分（vector 段外提成 LastAxisPBR 子核交给 AnyPBRScheduler）",
+      "why": "cube 与 vector 的 tiling 规则本质不同，与其在一个 scheduler 里塞两套逻辑，不如把 vector 段外提复用成熟的 PBR 调度、cube 段走 cube 路径——这是 'shallow' 浅配合的直接体现。源码注释亦标 'TODO: refactor ShallowCV'，说明是过渡设计。",
+      "evidence": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/ShallowCVSchedule.cpp:L40-L65 与 OpFusion.cpp:L119-L128 (TODO refactor ShallowCV)"
+    },
+    {
+      "decision": "调度产物是 host 端 tiling 函数 + 按 tiling key 的 scf.index_switch 多核分派，而非直接 inline 一套固定 tile",
+      "why": "动态 shape 下 tile 尺寸需运行期算；用 host tiling 函数算出 tiling key，device 侧 index_switch 到对应 tiling case 的 kernel，静态时 selectTiling 再把 key 常量化剪枝掉多余分支。",
+      "evidence": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/AutoScheduleBase.cpp:L453-L523 (calculateTiling), L785-L851 (generateDeviceCallers index_switch)"
+    }
+  ],
+  "theory": [
+    {
+      "topic": "融合为何用并查集 + 按拓扑秩排序尝试",
+      "detail": "融合是把 DAG 上的算子聚成不相交子集的问题，天然是并查集。disjointSet_ 复用 union-by-size（负值存大小、非负存父指针，见 FusibleBlockAnalyzer.cpp:L372-L385 注释），find 带路径压缩，均摊近线性。按被消费者 topoRank 升序尝试候选边，保证融合方向不制造环——isRestrictedByDependency 用诱导子图 indegree 检测融合后是否引入多重依赖（indegree>1 即拒）。"
+    },
+    {
+      "topic": "cube/vector 1:2 与 blockDim 减半的量化",
+      "detail": "AI Core 内 cube(矩阵)单元与 vector 单元约 1:2。调度侧对 cube 类 FusionKind 取 blockDim = max(blockDim/2, 1)，即 cube 核只占一半 block，剩余算力留给配套 vector 核。这是把硬件 PE 配比直接映射到核数分配的最简近似（源码注释 'for now' 表明是当前粗粒度策略）。"
+    },
+    {
+      "topic": "为什么 ShallowCV/MixCV 出组强制含 matmul",
+      "detail": "ShallowCV/MixCV 的存在意义是 cube+vector 协同；若某融合组退化成纯 vector（无 matmul），它就不该占用 cube 调度路径，应交给纯 vector 的 kind。checkGroupRequirements 里 matmulCount==0 直接 return false，把这类组踢回。"
+    }
+  ],
+  "subtraction_plan": {
+    "note": "本章 skip_impl=true（纯 C++ pass，无精简版）。delete 留空；交叉验证走 pin 精确源码逐段解读 + pin 内 lit 夹具（test-shallow-cv.mlir / compile-shallow-cv.mlir，trace_source 标『pin 内 lit 夹具』，不伪造编译器 dump）。must_keep 列 writer 必须讲清、读者必须理解的符号。",
+    "delete": [],
+    "must_keep": [
+      {"symbol": "FusibleHelper::isFusible", "why": "FusionKind→融合规则的分派枢纽，'FusionKind 驱动融合' 的落点"},
+      {"symbol": "isShallowCVFusible", "why": "ShallowCV 允许 matmul↔vector 互融的兼容表，主题'双核浅配合'的结构根据"},
+      {"symbol": "FusibleBlockAnalyzer::fuseBlock", "why": "融合主循环（并查集+拓扑秩，纵向+横向）"},
+      {"symbol": "verifyRulesAndJoin", "why": "五道融合关卡，各 kind 打开不同关卡"},
+      {"symbol": "checkGroupRequirements", "why": "ShallowCV/MixCV 出组必须含 matmul 的约束"},
+      {"symbol": "FusibleBlockOutliner::outline", "why": "融合组物化成 device func + call"},
+      {"symbol": "setOutlineFuncAttributes", "why": "把 FusionKind 写进 outlined func，桥接 OpFusion→AutoSchedule"},
+      {"symbol": "SchedulerBase::applySchedule", "why": "AutoSchedule 侧按 FusionKind 选 scheduler 的对偶枢纽"},
+      {"symbol": "ShallowCVScheduler::runOnOperation", "why": "worked example：cube/vector 分工的最外层编排"},
+      {"symbol": "runScheduleProcedure", "why": "调度骨架三步：calculateTiling→selectTiling→createAndApplySchedules"},
+      {"symbol": "createAndApplySchedules", "why": "逐 tiling key 建 transform 序列并解释执行切 tile"},
+      {"symbol": "setOptionsForFunc", "why": "cube 类 blockDim 减半、cube:vector=1:2 的资源证据"},
+      {"symbol": "FusionKind", "why": "贯穿两条脊梁的核心枚举（十值语义在 ch21，本章讲其如何驱动）"},
+      {"symbol": "OpPattern", "why": "融合兼容表的行列维度：op 被 getOpPattern 分类成的 pattern"}
+    ]
+  },
+  "mechanisms": [
+    {
+      "id": "opfusion-pass-dispatch",
+      "name": "OpFusion pass 按 FusionKind 路由",
+      "kind": "dataflow",
+      "source_anchors": [
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion.cpp:L256-L312",
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion.cpp:L56-L66"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "fusionkind-fusible-table",
+      "name": "FusionKind→融合兼容表（isFusible 分派）",
+      "kind": "config",
+      "source_anchors": [
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleHelper.cpp:L557-L582",
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleHelper.cpp:L673-L712",
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleHelper.cpp:L719-L758"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "fusible-unionfind",
+      "name": "并查集+拓扑秩融合主循环（fuseBlock）",
+      "kind": "algorithm",
+      "source_anchors": [
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleBlockAnalyzer.cpp:L177-L285",
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleBlockAnalyzer.cpp:L386-L431"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "fusion-rule-gauntlet",
+      "name": "融合五道关卡（verifyRulesAndJoin）",
+      "kind": "algorithm",
+      "source_anchors": [
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleBlockAnalyzer.cpp:L86-L147",
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleBlockAnalyzer.cpp:L433-L486",
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleHelper.cpp:L294-L312"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "group-requirements",
+      "name": "出组约束：ShallowCV/MixCV 必含 matmul",
+      "kind": "config",
+      "source_anchors": [
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleBlockAnalyzer.cpp:L149-L173"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "block-outline",
+      "name": "融合块外提成 device func 并回写 FusionKind",
+      "kind": "dataflow",
+      "source_anchors": [
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleBlockOutliner.cpp:L211-L235",
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion/FusibleBlockOutliner.cpp:L258-L319"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "schedule-dispatch",
+      "name": "AutoSchedule 按 FusionKind 选 scheduler + blockDim 减半",
+      "kind": "protocol",
+      "source_anchors": [
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/AutoScheduleBase.cpp:L579-L611",
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/AutoScheduleBase.cpp:L1211-L1233"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "schedule-skeleton",
+      "name": "调度骨架 pre→schedule→post 与 tiling-key 分派",
+      "kind": "dataflow",
+      "source_anchors": [
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/AutoScheduleBase.cpp:L281-L295",
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/AutoScheduleBase.cpp:L245-L256",
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/AutoScheduleBase.cpp:L550-L577"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "tiling-key-codegen",
+      "name": "host tiling 函数 + scf.index_switch 多 tiling case",
+      "kind": "dataflow",
+      "source_anchors": [
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/AutoScheduleBase.cpp:L453-L523",
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/AutoScheduleBase.cpp:L525-L548",
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/AutoScheduleBase.cpp:L785-L851"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "shallowcv-metaschedule",
+      "name": "ShallowCV 二次拆分：vector 子核外提 + cube/vector 分调度",
+      "kind": "algorithm",
+      "source_anchors": [
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/ShallowCVSchedule.cpp:L40-L65",
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/AutoSchedule/AutoScheduleBase.cpp:L1079-L1092",
+        "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HFusion/Transforms/OpFusion.cpp:L171-L228"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    }
+  ],
+  "foreshadow_due": {
+    "recover": [
+      {
+        "id": "f5",
+        "text": "ch21 埋：十种 kind 的调度差异（Cube/Vector 怎么分工、tile 策略怎么选）留给 ch22——OpFusion(FusibleBlockAnalyzer/Outliner) 按 FusionKind 决定融合边界，AutoSchedule(AutoScheduleBase/ShallowCVSchedule/SingleCube...) 按 kind 分派具体调度器。",
+        "recovered_by": "本章两条脊梁正是 f5 的回收：脊梁① OpFusion 用 isFusible/FusibleBlockAnalyzer 按 FusionKind 决定融合边界；脊梁② AutoSchedule 用 applySchedule switch 按 FusionKind 选 scheduler，以 ShallowCVScheduler 展开 cube/vector 分工与 tile 拆分。十值语义仍回指 ch21，本章讲'如何驱动'。"
+      }
+    ],
+    "plant": []
+  }
+}
