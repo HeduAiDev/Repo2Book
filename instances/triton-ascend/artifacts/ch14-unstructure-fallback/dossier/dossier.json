@@ -1,0 +1,226 @@
+{
+  "chapter": "ch14",
+  "title": "结构化装不下时:Unstructure 兜底路径与 gather/scatter 标量化",
+  "kind": "deep",
+  "skip_impl": true,
+  "skip_impl_reason": "纯 C++ MLIR pass 章,triton-to-linalg 子系统惯例(对齐姊妹篇 ch25/28/30/32/33)。无精简版;交叉验证走 pin 精确源码 + unittest/Conversion/General/TritonToUnstructure/*.mlir lit 夹具(RUN+CHECK 前后对照),不伪造编译器 dump(宿主无 CANN)。subtraction_plan.delete 留空,must_keep 记录 writer 必须讲清的符号。",
+  "boundary_note": "承 ch11《PtrAnalysis》/ch12《BlockPtrAnalysis→memref》/ch13《MaskAnalysis→extract_slice》讲的结构化成功路径(指针→(offset,sizes,strides)→memref+切片)。本章 = 结构化失败时的兜底对偶路径。凡与 ch11-13 重叠(结构化路径怎么成功)用 markdown 链接回指,不重推导。",
+
+  "code_spine": [
+    "third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp:L672-L732  TritonToUnstructurePass::runOnOperation —— pass 主入口:replacePtrArguments → IfYieldAddHoist → runPreparse(循环) → runParse(每个 load/store/atomic 触发 parse 计算 offsetMap)→ 挂 4 个 UnstructuredMemAccessConverter pattern → CSE+Canonicalize",
+    "third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp:L646-L655  runParse —— 对每个访存 op 调 parse(op.getPtr()) 灌 offsetMap,并 isFromTensorArg 标记",
+    "third_party/ascend/lib/TritonToUnstructure/OffsetAnalysis.cpp:L206-L284  parse —— 沿 def-use 递归求每个 Value 的 PtrOffsetInfo(四态格),按方言分派 parseArithOp/parseTritonOp/scf/tensor;兜底 setUnstructured",
+    "third_party/ascend/lib/TritonToUnstructure/OffsetAnalysis.cpp:L192-L204  combineInfo —— 二元 op 的格 meet:逐维 std::min,scalarLike 取 &&",
+    "third_party/ascend/lib/TritonToUnstructure/OffsetAnalysis.cpp:L644-L672  parseMulI —— 不连续 stride 的判定核心:arange*arange → unstructured",
+    "third_party/ascend/lib/TritonToUnstructure/OffsetAnalysis.cpp:L629-L642  parseLoad —— 从内存 load 出来的值(数据依赖)→ unstructured(gather 索引源头)",
+    "third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp:L236-L306  matchAndRewrite 前半 —— 判定这个访存要不要兜底:isStructured 早退 / annotation / discreteMask / forceScalarize|scalarLike|fromTensorArg / splatAndLoad",
+    "third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp:L325-L342  对齐检查 —— 结构化尾部连续字节数 % 32 != 0 → 强制标量化",
+    "third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp:L392-L520  标量化 codegen —— 逐 unstructured 维建 scf.for,结构化尾维保留为 extract_slice 向量切片;逐点 addptr+load/store,insert_slice 写回",
+    "third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp:L206-L226  splatAndLoadScenario —— scalarLike load 的快捷路径:extract 单元素 → 单次 load → splat 广播"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "third_party/ascend/include/TritonToUnstructure/OffsetAnalysis.h",
+      "lines": "L76-L81",
+      "what": "四态格的状态集合(AxisInfo enum)。这是全章的地基:每个张量的每一维被标成四态之一。enum 声明顺序即格的偏序(见 combineInfo 的 std::min)。",
+      "code": "  enum class AxisInfo {\n    unstructured,\n    structured,\n    scalarlike,\n    scalar\n  };",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/include/TritonToUnstructure/OffsetAnalysis.h",
+      "lines": "L41-L73",
+      "what": "PtrOffsetInfo 头注释:三个概念范畴(ScalarLike/Structured/Unstructured)的语义定义与例子。ScalarLike⊆Structured,Unstructured=Structured 的补。注意:实现层用 4 个 enum 值(scalar 是 dim size==1 的 scalarlike 特例),概念层是 3 类。",
+      "code": "  /**\n  Possible status of the ptr offset:\n   - ScalarLike:\n      - Tensor's elements are all the same such as [[2.0,2.0,2.0],[2.0,2.0,2.0]]\n      - Constant integer or floating-point such as 2, 2.0, and `load\n  tensor<1xptr>`\n   - Unstructured:\n      - Not a `ScalarLike` ptr offset\n      - Or satisfy any below conditions:\n        - Incontinuous stride such as\n          - `muli [0,1,2,3] [0,1,2,3]` => [0,1,4,9]\n          - `divsi [9,8,7] [3,2,1]` => [3,4,7]\n          - `minsi [3,4,5] [5,4,3]` => [3,4,3]\n        - From non-`scalarLike` floating point element type such as\n          - `fptosi [1.0,2.0,3.0]` => [1,2,3]\n        - Compilation time unknown value\n          - `load %ptr, %offset` => %value\n    - Structured:\n      - orthongonal to `Unstructured`\n        - if PtrOffsetInfo isn't `Unstructured`, it is `Structured`\n\n  In short:\n  ScalarLike ⊆ Structured\n  Unstructured = {x| x ∉ Structured}\n\n  Example:\n  ```\n  %y = sitofp %x\n  %z = fptosi %y\n  ```\n  If %x is scalarLike (structured), %z will be scalar (structured) as well.\n  If %x is non-scalarLike structured, %z will be unstructured.\n  */",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToUnstructure/OffsetAnalysis.cpp",
+      "lines": "L150-L171",
+      "what": "四态到二分('能否结构化访存')的坍缩:isStructured(dim)—— scalar/scalarlike(经 scalarLike 标志)/structured 都算'可结构化';isUnstructured—— 全维 unstructured;isUnstructuredOrScalarlike—— 无 structured 维(判'完全逐元素')。这三个谓词是 codegen 的开关。",
+      "code": "bool PtrOffsetInfo::isStructured(int dim) const {\n  return this->scalarLike || structured[dim] == AxisInfo::structured ||\n         structured[dim] == AxisInfo::scalar;\n}\n\nbool PtrOffsetInfo::isStructured() const {\n  return this->scalarLike || llvm::all_of(structured, [](auto dim) {\n           return dim == AxisInfo::structured || dim == AxisInfo::scalar;\n         });\n}\n\nbool PtrOffsetInfo::isUnstructured() const {\n  return llvm::all_of(structured,\n                      [](auto dim) { return dim == AxisInfo::unstructured; });\n}\n\nbool PtrOffsetInfo::isUnstructuredOrScalarlike() const {\n  return llvm::all_of(structured, [](auto dim) {\n    return dim == AxisInfo::unstructured || dim == AxisInfo::scalarlike ||\n           dim == AxisInfo::scalar;\n  });\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToUnstructure/OffsetAnalysis.cpp",
+      "lines": "L192-L204",
+      "what": "格的 meet 操作(二元 op 汇合):逐维 std::min(enum 序 unstructured=0 < structured=1 < scalarlike=2 < scalar=3),scalarLike 标志取 &&。min 把结果拉向 unstructured(格底)—— 任一操作数在某维是 unstructured,结果该维就 unstructured。这是'一处离散污染整维'的机制。",
+      "code": "PtrOffsetInfo combineInfo(const PtrOffsetInfo &lhs, const PtrOffsetInfo &rhs) {\n  PtrOffsetInfo info;\n  assert(lhs.getRank() == rhs.getRank() && \"Rank must be same to be combined\");\n\n  info.setScalarLike(lhs.isScalarLike() && rhs.isScalarLike());\n  auto &structuredRef = info.getStructuredRef();\n  auto lhsStructured = lhs.getStructured();\n  auto rhsStructured = rhs.getStructured();\n  structuredRef.resize(lhs.getRank());\n  for (size_t i = 0; i < structuredRef.size(); i++)\n    structuredRef[i] = std::min(lhsStructured[i], rhsStructured[i]);\n  return info;\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToUnstructure/OffsetAnalysis.cpp",
+      "lines": "L644-L672",
+      "what": "不连续 stride 判定的核心 transfer function。muli 特判:若一侧 scalarLike(常数样)则透传另一侧结构;两侧都非 scalarLike(如 arange*arange)则该维 → unstructured。这正是头注释里 `muli [0,1,2,3] [0,1,2,3] => [0,1,4,9]` 二次多项式偏移无法用单一 stride 描述的落地。",
+      "code": "void parseMulI(arith::MulIOp op, const Location &loc, RewriterBase &rewriter,\n               llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap) {\n  // Get muli lhs\n  auto lhs = op.getLhs();\n  parse(lhs, op.getLoc(), rewriter, offsetMap);\n  PtrOffsetInfo lhsOffsetInfo = offsetMap.at(lhs);\n  auto &lhsStructured = lhsOffsetInfo.getStructuredRef();\n  bool lhsScalarLike = lhsOffsetInfo.isScalarLike();\n  // Get muli rhs\n  auto rhs = op.getRhs();\n  parse(rhs, op.getLoc(), rewriter, offsetMap);\n  PtrOffsetInfo rhsOffsetInfo = offsetMap.at(rhs);\n  auto &rhsStructured = rhsOffsetInfo.getStructuredRef();\n  bool rhsScalarLike = rhsOffsetInfo.isScalarLike();\n  // Set muli offset map\n  size_t maxSize = std::max(lhsStructured.size(), rhsStructured.size());\n  auto dst = op.getResult();\n  offsetMap[dst] = PtrOffsetInfo();\n  offsetMap[dst].setScalarLike(lhsScalarLike && rhsScalarLike);\n  auto &dstStructured = offsetMap[dst].getStructuredRef();\n  dstStructured.resize(maxSize);\n  for (size_t i = 0; i < maxSize; i++)\n    if (lhsScalarLike)\n      dstStructured[i] = rhsStructured[i];\n    else if (rhsScalarLike)\n      dstStructured[i] = lhsStructured[i];\n    else\n      dstStructured[i] = PtrOffsetInfo::AxisInfo::unstructured;\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToUnstructure/OffsetAnalysis.cpp",
+      "lines": "L629-L642",
+      "what": "gather 索引的源头 transfer function。tt.load 出来的张量值是'编译期未知'的(运行期才有内容),故整体 setUnstructured。当这个 loaded 值再拿去当另一次 addptr 的 offset(`ptr[idx[i]]`),那次访存就必然掉进兜底。scalarLike 标志只从 ptr 是否 scalarLike 继承。",
+      "code": "void parseLoad(triton::LoadOp op, const Location &loc, RewriterBase &rewriter,\n               llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap) {\n  // Get load ptr\n  auto ptr = op.getPtr();\n  parse(ptr, op.getLoc(), rewriter, offsetMap);\n  // Set load offset map\n  auto dst = op.getResult();\n  offsetMap[dst] = PtrOffsetInfo();\n  offsetMap[dst].setScalarLike(offsetMap[ptr].isScalarLike());\n  auto tensorType = dyn_cast<RankedTensorType>(dst.getType());\n  if (!tensorType)\n    return;\n  offsetMap[dst].setUnstructured(tensorType.getRank());\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToUnstructure/OffsetAnalysis.cpp",
+      "lines": "L585-L592",
+      "what": "结构化的源头之一:tt.make_range(即 tl.arange)产出 1 维、单维 structured 的偏移(连续 stride=1)。这是与 parseLoad 对偶的'好'源头——arange 天然可结构化。",
+      "code": "void parseMakeRange(triton::MakeRangeOp op, const Location &loc,\n                    RewriterBase &rewriter,\n                    llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap) {\n  // Set makeRange offset map\n  auto dst = op.getResult();\n  offsetMap[dst] = PtrOffsetInfo();\n  offsetMap[dst].setStructured(1);\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToUnstructure/OffsetAnalysis.cpp",
+      "lines": "L493-L499",
+      "what": "scalarlike 与 scalar 的区分(parseSplat 尾部):splat 出来的每一维,size==1 标 scalar,size>1 标 scalarlike;并置 scalarLike 标志=true。这解释了两个'广播态'的差别——scalar 是真单点轴,scalarlike 是'全同值但有宽度'的轴。",
+      "code": "  auto &dstStructured = dstOffsetInfo.getStructuredRef();\n  for (auto dim : dstType.getShape())\n    dstStructured.push_back(dim == 1 ? PtrOffsetInfo::AxisInfo::scalar\n                                     : PtrOffsetInfo::AxisInfo::scalarlike);\n  dstOffsetInfo.setScalarLike(true);\n  offsetMap[dst] = dstOffsetInfo;",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp",
+      "lines": "L251-L263",
+      "what": "兜底与否的第一道闸(matchAndRewrite 早退):已标 discrete 的跳过;offsetMap 必须有该 ptr;若整体 isStructured() 且非 discreteMask 且(非 scalarLike 或所有维都是 1)→ return failure() 放行给结构化路径(ch12/ch13 处理)。反过来:非 structured(含任一 unstructured 维)才继续走本 pass。",
+      "code": "  if (!ptrType || op->hasAttr(ConverterUtils::discreteAttrName))\n    return failure();\n  if (!offsetMap.contains(ptr))\n    return op.emitError() << \"PtrOffsetInfo should be computed\\n\" << ptr;\n\n  auto ptrOffsetInfo = offsetMap.at(ptr);\n\n  if (checkUnstructureAnnotated(op, rewriter))\n    ptrOffsetInfo.setUnstructured(ptrOffsetInfo.getRank());\n\n  if (ptrOffsetInfo.isStructured() && !isDiscreteMask &&\n      (!ptrOffsetInfo.isScalarLike() || llvm::all_of(ptrType.getShape(), [](int64_t dim) { return dim == 1; })))\n      return failure();",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp",
+      "lines": "L303-L306",
+      "what": "第二类触发兜底:forceScalarizeMode(pass 选项强制)、或 ptr 本身 scalarLike、或 fromTensorArg(offset 溯源自某个 tensor 类型的函数入参/循环参,静态形状未知)→ 整体 setUnstructured 强制标量化。fromTensorArg 见 isFromTensorArg(L628-644)递归溯源。",
+      "code": "  if (forceScalarizeMode || ptrOffsetInfo.isScalarLike() ||\n      fromTensorArg.at(ptr)) {\n    ptrOffsetInfo.setUnstructured(ptrOffsetInfo.getRank());\n  }",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp",
+      "lines": "L334-L342",
+      "what": "第三类触发兜底:非对齐访存。从最内维往外累乘'结构化尾部'的连续字节数;一旦碰到非 isStructured 维就 break。若这段连续字节数不是 32 的倍数(昇腾内存对齐粒度)→ 强制整体标量化。这是'对齐访存 vs 非对齐'掉坑的量化闸门。",
+      "code": "  for (int i = ptrOffsetInfo.getRank() - 1; i >= 0; i--) {\n    if (!ptrOffsetInfo.isStructured(i))\n      break;\n    sizeInByte *= resultShape[i];\n  }\n\n  // Force scalarize if memory is not aligned\n  if (sizeInByte % 32 != 0)\n    ptrOffsetInfo.setUnstructured(ptrOffsetInfo.getRank());",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp",
+      "lines": "L408-L466",
+      "what": "标量化 codegen 的骨架:按 rank 逐维扫描。若该维是 structured → 整段保留为 [0:size] 的向量切片(offsets=0,sizes=size);若非 structured → 建一层 scf.for 循环(step=1),该维退化成单元素(sizes=1),循环变量当 offset。load 场景带 iter_args 累积结果张量。MakeTensorPtr 时用 minsi 夹逼实际 shape;有 mask 时用 mstate 收窄循环上下界。这就是'部分标量化':unstructured 维循环、structured 尾维仍向量化。",
+      "code": "  for (size_t i = 0; i < resultShape.size(); i++) {\n    auto size = resultShape[i];\n    auto structured = ptrOffsetInfo.getStructuredRef()[i] == PtrOffsetInfo::AxisInfo::structured;\n    // handle indirect dimension\n    strides.push_back(rewriter.getIndexAttr(1));\n    Value sizeVal =\n        rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(size));\n    if (structured) {\n      offsets.push_back(rewriter.getIndexAttr(0));\n      sizes.push_back(rewriter.getIndexAttr(size));\n      extractedShape.push_back(size);\n    } else {\n      scf::ForOp forOp;\n      if (auto mtptOp =\n              srcPtr.template getDefiningOp<triton::MakeTensorPtrOp>()) {\n        auto tptShape = mtptOp.getShape()[i];\n        if (tptShape.getType() != rewriter.getIndexType()) {\n          tptShape = rewriter.create<arith::IndexCastOp>(\n              loc, rewriter.getIndexType(), tptShape);\n        }\n        sizeVal = rewriter.create<arith::MinSIOp>(loc, sizeVal, tptShape);\n      }\n\n      Value loopLower = zeroIdx;\n      Value loopUpper = sizeVal;\n      if (mstate && i < mstate->dims.size() && i < mstate->offsets.size()) {\n        Value maskOffset = getValueOrCreateConstantIndexOp(\n            rewriter, loc, mstate->offsets[i]);\n        maskOffset = rewriter.create<arith::MaxSIOp>(loc, maskOffset, zeroIdx);\n        maskOffset = rewriter.create<arith::MinSIOp>(loc, maskOffset, sizeVal);\n        loopLower = maskOffset;\n\n        Value maskDim = getValueOrCreateConstantIndexOp(\n            rewriter, loc, mstate->dims[i]);\n        maskDim = rewriter.create<arith::AddIOp>(loc, maskOffset, maskDim);\n        maskDim = rewriter.create<arith::MinSIOp>(loc, maskDim, sizeVal);\n        loopUpper = maskDim;\n      }\n\n      if (isLoadLike) {\n        forOp = rewriter.create<scf::ForOp>(loc, loopLower, loopUpper, oneIdx,\n                                            ValueRange({iterArg}));\n        if (!newOpResult) {\n          newOpResult = forOp->getResult(0);\n        } else {\n          rewriter.create<scf::YieldOp>(loc, forOp->getResult(0));\n        }\n        iterArg = forOp.getRegionIterArg(0);\n      } else {\n        forOp = rewriter.create<scf::ForOp>(loc, loopLower, loopUpper, oneIdx);\n      }\n      sizes.push_back(rewriter.getIndexAttr(1));\n      offsets.push_back(forOp.getInductionVar());\n      extractedShape.push_back(1);\n      forOp->setAttr(\"ExtractedLoadOrStore\",\n                     UnitAttr::get(rewriter.getContext()));\n      rewriter.setInsertionPointToStart(forOp.getBody());\n    }\n  }",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp",
+      "lines": "L211-L225",
+      "what": "scalarLike load 的快捷路径(不进循环):偏移全同 → 只 extract 第 0 个指针、单次 tt.load、再 tt.splat 广播成整张量;有 mask 时 select(mask, loaded, other)。这是 scalarLike 不走 O(N) 循环、而走 O(1) 单点 load 的优化,与真 gather 区别开。",
+      "code": "  auto loc = op.getLoc();\n  SmallVector<OpFoldResult> idx(rank, rewriter.getIndexAttr(0));\n  auto extractedPtr = createExtractOp(loc, op.getPtr(), rewriter, idx);\n  Value mask = op.getMask();\n  Value other = op.getOther();\n  Value loadedValue = rewriter.create<triton::LoadOp>(\n      loc, extractedPtr, /*mask=*/nullptr, /*other=*/nullptr,\n      /*boundaryCheck=*/ArrayRef<int32_t>(),\n      /*PaddingOptionAttr=*/nullptr);\n  loadedValue = rewriter.create<triton::SplatOp>(loc, op.getResult().getType(),\n                                                 loadedValue);\n  if (mask)\n    rewriter.replaceOpWithNewOp<arith::SelectOp>(op, mask, loadedValue, other);\n  else\n    rewriter.replaceOp(op, loadedValue);",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp",
+      "lines": "L468-L512",
+      "what": "标量化循环体:fullyUnstructured(所有维都非 structured)时用 tensor.extract 逐元素取偏移(或 MakeTensorPtr 时按 stride 重算 i64 线性偏移);部分结构化时用 tensor.extract_slice 取整段偏移+splat 指针。再 addptr+具体访存 op,打 DiscreteMemAccess 标记。这是逐点访存指令的生成。",
+      "code": "  bool fullyUnstructured = ptrOffsetInfo.isUnstructuredOrScalarlike();\n  auto extractedType = RankedTensorType::get(extractedShape, resultElementType);\n\n  Value extractedOffset;\n  if (fullyUnstructured) {\n    if (auto mtptOp =\n            srcPtr.template getDefiningOp<triton::MakeTensorPtrOp>()) {\n      auto I64Type = rewriter.getIntegerType(64);\n      srcPtr = mtptOp.getBase();\n      extractedOffset = rewriter.create<arith::ConstantIntOp>(loc, 0, 64);\n      for (auto [indVar, offset, stride] :\n           llvm::zip_equal(offsets, ptrOffsetInfo.getOffsets(), mtptOp.getStrides())) {\n        Value inductionVar = rewriter.create<arith::IndexCastOp>(\n            loc, I64Type, cast<Value>(indVar));\n        Value tptOffset = rewriter.create<arith::ExtSIOp>(loc, I64Type, offset);\n        Value tptStride = rewriter.create<arith::ExtSIOp>(loc, I64Type, stride);\n        tptOffset = rewriter.create<arith::MulIOp>(loc, tptStride, tptOffset);\n        tptStride =\n            rewriter.create<arith::MulIOp>(loc, tptStride, inductionVar);\n        extractedOffset =\n            rewriter.create<arith::AddIOp>(loc, extractedOffset, tptOffset);\n        extractedOffset =\n            rewriter.create<arith::AddIOp>(loc, extractedOffset, tptStride);\n      }\n    } else {\n      extractedOffset = createExtractOp(loc, ptrOffset, rewriter, offsets);\n    }\n  } else {\n    extractedOffset =\n        createExtractOp(loc, ptrOffset, rewriter, offsets, sizes, strides);\n  }\n\n  LLVM_DEBUG({\n    auto &os = llvm::dbgs();\n    os << \"Extracted offset\\n\";\n    os << extractedOffset << \"\\n\";\n  });\n\n  assert(isa<triton::PointerType>(srcPtr.getType()) && \"src must be ptr type\");\n  if (!fullyUnstructured) {\n    srcPtr = rewriter.create<triton::SplatOp>(\n        loc, RankedTensorType::get(extractedShape, srcPtr.getType()), srcPtr);\n  }\n  Value ptrToAccess = rewriter.create<triton::AddPtrOp>(\n      loc, srcPtr.getType(), srcPtr, extractedOffset);",
+      "elide": ["L500-L504 的 LLVM_DEBUG 打印块保留原文;其后 createMemAccOp / insert_slice 写回见 L514-L564,已在 code_spine 覆盖"]
+    },
+    {
+      "path": "third_party/ascend/include/TritonToUnstructure/UnstructureConversionPass.h",
+      "lines": "L56-L82",
+      "what": "官方在 pass 头文件里给的完整 before/after 示例注释:tt.load %structured(索引张量)→ addptr → tt.load %1(用索引当偏移的间接访存)如何被转成双层 scf.for + tensor.extract + tt.addptr 标量 + tt.load + insert_slice。可直接作为读者的第一眼直觉图。",
+      "code": "//  For example, in unstructured load case\n//  %0 = tt.load %structured : tensor<128x128x!tt.ptr<i32>>\n//  %ptr_2 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<128x128x!tt.ptr<f32>>\n//  %1 = tt.addptr %ptr_2, %0 : tensor<128x128x!tt.ptr<f32>>,\n//  tensor<128x128xi32> %2 = tt.load %1 : tensor<128x128x!tt.ptr<f32>> tt.store\n//  %output %2 : tensor<128x128x!tt.ptr<f32>>\n//\n//\n//  In this case, this will be converted to\n//\n//  %0 = tt.load %structured : tensor<128x128x!tt.ptr<i32>>\n//  %1 = tensor.empty() : tensor<128x128xf32>\n//  %2 = scf.for %arg2 = %c0 to %c128 step %c1 iter_args(%arg3 = %1) ->\n//  (tensor<128x128xf32>) {\n//    %4 = scf.for %arg4 = %c0 to %c128 step %c1 iter_args(%arg5 = %arg3) ->\n//    (tensor<128x128xf32>) {\n//      %extracted = tensor.extract %10[%arg3, %arg5] {DiscreteMemAccess} :\n//      tensor<128x128xi32> %5 = arith.extsi %extracted : i32 to i64 %6 =\n//      tt.addptr %arg1, %5 : !tt.ptr<f32>, i64 %7 = tt.load %6\n//      {DiscreteMemAccess}  : tt.ptr<f32> %inserted_slice = tensor.insert_slice\n//      %7 into %arg5[%arg2, %arg4] [1, 1] [128, 1] {DiscreteMemAccess} :\n//      tensor<1x1xf32> into tensor<128x128xf32> scf.yield %inserted_slice :\n//      tensor<128x128xf32>\n//    }\n//    scf.yield %4 : tensor<128x128xf32>\n//  }\n//  tt.store %output %2 : tensor<128x128x!tt.ptr<f32>>",
+      "elide": []
+    }
+  ],
+
+  "lit_fixtures": [
+    {
+      "path": "third_party/ascend/unittest/Conversion/General/TritonToUnstructure/unstructure_mix.mlir",
+      "run": "triton-opt --triton-to-unstructure %s | FileCheck %s",
+      "role": "本章头号 worked example(部分标量化)。@indirect_mix_kernel:先结构化 load 一个 tensor<16xi64> 索引(%8),expand_dims+broadcast 后当第二次 load 的行偏移;结果指针结构化态 = [unstructured(dim0=16), structured(dim1=8)]。CHECK 显示:生成 1 层 scf.for(0→16),循环内 tensor.extract_slice %25[%28,0][1,8][1,1] 取 1x8 偏移切片、splat arg2、addptr、tt.load {DiscreteMemAccess}、insert_slice 写回。dim1(=8,f32→32 字节,对齐)保留为向量切片,dim0 逐行循环。量化:16 次循环 vs 结构化的 1 次。",
+      "check_anchors": ["L62-L70 tensor.empty + scf.for(0→16) + extract_slice[1,8] + tt.load{DiscreteMemAccess} + insert_slice"]
+    },
+    {
+      "path": "third_party/ascend/unittest/Conversion/General/TritonToUnstructure/nested_loop.mlir",
+      "run": "triton-opt --triton-to-unstructure --split-input-file %s | FileCheck %s",
+      "role": "完全标量化 + 循环携带指针 + scf.while 变体。@test_kernel:%10=load(结构化 arg2)当 arg3 的偏移 → %12 addptr 得完全 unstructured 的 tensor<128xi64> 间接指针,循环携带进 scf.for。转换后循环体内单层 scf.for(0→128)+tensor.extract{DiscreteMemAccess}+addptr 标量 arg3+tt.load{DiscreteMemAccess}+insert_slice。对照:同体内 %19=addptr(arg0, 结构化 %arg9)的 load 不被标量化(结构化路径放行)。@test_kernel2 同逻辑走 scf.while。128 次单元素 load vs 结构化 1 次连续 load —— 量化对照最尖锐的一例。",
+      "check_anchors": ["L67-L74 tensor.empty + scf.for(0→128) + tensor.extract{DiscreteMemAccess} + tt.addptr scalar + tt.load{DiscreteMemAccess} + insert_slice"]
+    },
+    {
+      "path": "third_party/ascend/unittest/Conversion/General/TritonToUnstructure/splat.mlir",
+      "run": "triton-opt %s --triton-to-unstructure | FileCheck %s",
+      "role": "splatAndLoadScenario 的最小夹具。@test_unstructure_splatandloadscenario:base 指针 splat + 常数偏移 splat → scalarLike load;转换后是 tensor.extract 单指针 {DiscreteMemAccess} + 单次 tt.load + tt.splat 广播成 tensor<128xf32>。证明 scalarLike ≠ gather:走 O(1) 单点 load,不进循环。",
+      "check_anchors": ["L3-L6 tensor.extract{DiscreteMemAccess} + tt.load(标量) + tt.splat 广播"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "PtrOffsetInfo", "file": "third_party/ascend/include/TritonToUnstructure/OffsetAnalysis.h", "responsibility": "承载一个指针/偏移 Value 的分析结果:关联的基指针(ptr)、i64 偏移值(offset,以及 MakeTensorPtr 的多维 offsets)、scalarLike 标志、以及逐维的四态结构化标注(SmallVector<AxisInfo>)。isStructured/isUnstructured/isUnstructuredOrScalarlike 三谓词把四态坍缩成 codegen 开关。"},
+    {"name": "PtrOffsetInfo::AxisInfo", "file": "third_party/ascend/include/TritonToUnstructure/OffsetAnalysis.h", "responsibility": "四态格的状态枚举:unstructured / structured / scalarlike / scalar(声明序即偏序 0<1<2<3)。每个张量的每一维取其一。"},
+    {"name": "TritonToUnstructurePass", "file": "third_party/ascend/include/TritonToUnstructure/UnstructureConversionPass.h", "responsibility": "ModuleOp 级 pass(--triton-to-unstructure)。runOnOperation 里:replacePtrArguments → IfYieldAddHoist → runPreparse(循环 iter_args 预解析)→ 遍历每个 load/store/atomic 调 runParse 灌 offsetMap 与 fromTensorArg → 挂 4 个 converter pattern → CSE+Canonicalize。持有 offsetMap/offsetMapForLoopArgs/fromTensorArg 三张表。"},
+    {"name": "UnstructuredMemAccessConverter<MemAccOpTy>", "file": "third_party/ascend/include/TritonToUnstructure/UnstructureConversionPass.h", "responsibility": "OpRewritePattern 模板,MemAccOpTy ∈ {LoadOp, StoreOp, AtomicRMWOp, AtomicCASOp}。matchAndRewrite 依 offsetMap 判定该访存要不要兜底,要则生成 scf.for 标量化循环 + tensor.extract/extract_slice + 逐点 addptr + 访存 op + insert/insert_slice 写回。含 splatAndLoadScenario(scalarLike 快捷)与 A5 indirect_load/store 快路径。"}
+  ],
+
+  "data_flow": [
+    {"step": "1 分析准备", "detail": "runOnOperation: replacePtrArguments 把指针型函数参数登记进 offsetMapForLoopArgs;processIfYieldAddHoistOperations 规整 if/yield/add;runPreparse 对每个循环把 iter_args 与其 yield 值绑定预解析(offsetMap[arg]=parse(yield))。"},
+    {"step": "2 逐访存求偏移态", "detail": "moduleOp.walk 每个 tt.load/store/atomic → runParse(op) → parse(op.getPtr()) 沿 def-use 递归,给路径上每个 Value 填 PtrOffsetInfo;并 isFromTensorArg 递归标记 ptr 是否溯源自 tensor 入参。"},
+    {"step": "3 transfer function 传播", "detail": "parse 按方言分派:make_range→structured;splat/constant→scalarlike/scalar+scalarLike 标志;load→unstructured(gather 源);muli 两侧非 scalarLike→unstructured(不连续 stride);addi/subi→combineInfo 逐维 min;broadcast/expand_dims/reduce 按维重排;fptosi/select 等按 scalarLike 与否分流。"},
+    {"step": "4 判定兜底", "detail": "matchAndRewrite:isStructured()&&非 scalarLike 且非全 1 维 → failure() 放行结构化路径;否则 annotation/discreteMask/forceScalarize/scalarLike/fromTensorArg/非 32 字节对齐 任一 → setUnstructured。"},
+    {"step": "5a scalarLike 快捷", "detail": "load 且 isScalarLike → splatAndLoadScenario:extract 单指针 + 单 load + splat 广播(+ mask select)。O(1)。"},
+    {"step": "5b A5 快路径", "detail": "compileOn91095Flag && forceSimtTemplateFlag && (unstructuredOrScalarlike || discreteMask) → 直接改写成 triton.ascend.indirect_load / indirect_store,交给 SIMT 模板。"},
+    {"step": "5c 标量化循环", "detail": "否则逐维:structured 维保留 [0:size] 向量切片;非 structured 维建 scf.for(step 1,单元素),mask 时用 MaskAnalysis 收窄上下界,MakeTensorPtr 时 minsi 夹逼真实 shape。fullyUnstructured 用 tensor.extract 取偏移标量、否则 extract_slice 取偏移切片;addptr + 访存 op(打 DiscreteMemAccess);load 场景 insert_slice/insert 累积进 tensor.empty 的 iter_arg。"},
+    {"step": "6 收尾", "detail": "applyPatternsAndFoldGreedily 应用全部 pattern;再跑 CSE + Canonicalizer 清理。"}
+  ],
+
+  "design_decisions": [
+    {"decision": "用四态格(unstructured<structured<scalarlike<scalar)而非布尔'结构化/否'做逐维分析", "why": "scalar(size1 单点)与 scalarlike(全同值有宽度)都能当结构化处理但语义不同;broadcast/expand_dims 需要精确区分单点轴与广播轴才能正确重排偏移维度。四态提供的偏序让 combineInfo 用一个 std::min 就实现'任一操作数离散则整维离散'的保守汇合。", "evidence": "third_party/ascend/include/TritonToUnstructure/OffsetAnalysis.h:L76-L81 与 lib/.../OffsetAnalysis.cpp:L192-L204"},
+    {"decision": "meet 用 std::min,unstructured 取格底(=0)", "why": "分析必须保守:只要一个操作数在某维是 unstructured,结果那维就不可能安全地用单一 stride 描述,故取 min 拉到 unstructured。这保证不会把真正离散的访存误判成结构化(误判会生成错误的连续访存)。", "evidence": "third_party/ascend/lib/TritonToUnstructure/OffsetAnalysis.cpp:L201-L202"},
+    {"decision": "部分标量化:只对 unstructured 维建 scf.for,结构化尾维保留为向量切片", "why": "gather 通常只有部分维离散(如按行 gather、列连续)。对连续维仍走向量 load/store 能保住带宽,只有离散维付 O(size) 循环代价。比整体标量化(每个元素一次访存)代价小得多。", "evidence": "third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp:L408-L466(structured 分支 vs scf.for 分支);unstructure_mix.mlir 的 [1,8] 切片"},
+    {"decision": "32 字节对齐不足则强制标量化", "why": "昇腾内存访问以 32 字节为对齐/搬运粒度;结构化尾部连续区间若不是 32 的倍数,向量搬运不合法/低效,退化为逐元素更安全。", "evidence": "third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp:L325-L342"},
+    {"decision": "scalarLike load 走 splatAndLoadScenario 单点 load+splat,而非 O(N) 循环", "why": "偏移全同(scalarLike)意味着所有'线程'读同一地址,只需读一次再广播,避免 N 次冗余访存。把 scalarLike 与真 gather(unstructured)在 codegen 上分开对待。", "evidence": "third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp:L206-L226、L275-L280"},
+    {"decision": "fromTensorArg 溯源(offset 来自 tensor 入参)也触发标量化", "why": "偏移若递归溯源到一个 tensor 类型的函数参数/循环参,其静态形状/连续性在编译期不可知,保守当作 unstructured 处理,防止对不可分析的偏移做错误的结构化假设。", "evidence": "third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp:L303-L306、L628-L644"},
+    {"decision": "annotation mayDiscretememaccess 允许上游显式标注强制离散", "why": "给上游 pass/前端一个显式逃生口:即便分析判为结构化,也能强制走离散访存路径。", "evidence": "third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp:L51-L74、L258-L259"}
+  ],
+
+  "theory": [
+    {"topic": "格(lattice)与保守数据流分析", "content": "AxisInfo 四态构成一条全序链 unstructured(0)⊑structured(1)⊑scalarlike(2)⊑scalar(3),combineInfo 的逐维 meet=greatest-lower-bound=min。二元算子把两个操作数的结构化态汇合;min 保证结果不高估结构化程度(sound)。scalarLike 布尔标志独立地取 && 传播(全同值只有两操作数都全同才全同)。"},
+    {"topic": "为什么 arange*arange 不连续", "content": "结构化偏移=仿射 base + stride·i 的一维/多维网格。arange=[0,1,2,3] stride=1;两 arange 逐元素相乘得 [0,1,4,9],相邻差 [1,3,5] 非常数 → 无单一 stride → 不可用 (offset,sizes,strides) 三元组描述 → parseMulI 判 unstructured。同理 divsi/minsi/fptosi 破坏仿射性。"},
+    {"topic": "代价量化:O(1) 结构化描述 vs O(N) 标量化", "content": "结构化路径(ch12/ch13)把整个 tensor<M×N> 访存压成一个 memref+extract_slice,一条连续搬运指令、O(1) 元数据。标量化后:每个 unstructured 维贡献一层 scf.for。unstructure_mix 的 16×8、dim0 离散:16 次循环 × 每次 1×8 连续 load = 16 次搬运(vs 结构化 1 次)。nested_loop 的 128 完全离散:128 次单元素 load(vs 1 次)。循环 trip 数 = ∏(unstructured 维的 size);连续带宽只在 structured 尾维上保住。"},
+    {"topic": "四态到二分的坍缩", "content": "分析用四态精确传播,但 codegen 只关心两个问题:'这一维要不要循环'(isStructured(i):structured 或 scalar 或 scalarLike 标志→否)与'整体是否无连续维'(isUnstructuredOrScalarlike→用 extract 逐元素还是 extract_slice 切片)。scalarlike 逐维态在 isStructured() 的 all_of 里并不算(只有 structured/scalar 算),要靠 scalarLike 布尔短路——这是 scalarlike 张量整体被 setUnstructured 强制标量化(L303)的原因。"}
+  ],
+
+  "subtraction_plan": {
+    "delete": [],
+    "must_keep": [
+      {"symbol": "PtrOffsetInfo", "why": "全章的分析载体;writer 必须讲清它承载 ptr/offset/scalarLike/逐维四态。"},
+      {"symbol": "AxisInfo", "why": "四态格枚举本体;'实到底几个态、每态含义'的直接证据(unstructured/structured/scalarlike/scalar)。"},
+      {"symbol": "combineInfo", "why": "格的 meet(逐维 std::min)——'一处离散污染整维'与保守分析的核心。"},
+      {"symbol": "isStructured", "why": "四态→'能否结构化'的坍缩谓词;codegen 是否放行/是否循环的开关。"},
+      {"symbol": "isUnstructured", "why": "全维离散判定,与 isStructured 对偶。"},
+      {"symbol": "isUnstructuredOrScalarlike", "why": "'完全逐元素 vs 部分切片'的开关(fullyUnstructured),决定 tensor.extract 还是 extract_slice。"},
+      {"symbol": "parseMulI", "why": "不连续 stride(arange*arange→unstructured)的判定 transfer function——'什么写法掉坑'的第一手证据。"},
+      {"symbol": "parseLoad", "why": "gather 索引源头(loaded 值→unstructured)——间接寻址掉坑的根因。"},
+      {"symbol": "parseMakeRange", "why": "结构化源头(arange→structured),与 parseLoad 对偶,讲清'好写法'。"},
+      {"symbol": "matchAndRewrite", "why": "兜底判定与标量化 codegen 的主函数;所有触发条件与循环生成都在此。"},
+      {"symbol": "isFromTensorArg", "why": "fromTensorArg 溯源——offset 来自 tensor 入参也触发标量化的机制。"},
+      {"symbol": "splatAndLoadScenario", "why": "scalarLike load 的 O(1) 快捷路径;区分 scalarLike 与真 gather。"},
+      {"symbol": "UnstructuredMemAccessConverter", "why": "承载 4 类访存(load/store/atomicRMW/atomicCAS)标量化的 pattern 模板。"},
+      {"symbol": "TritonToUnstructurePass", "why": "pass 主体;runOnOperation 的分析→判定→改写→清理流程。"},
+      {"symbol": "DiscreteMemAccess", "why": "标量化后每个逐点访存/循环被打的属性标记(ConverterUtils::discreteAttrName),下游据此识别离散访存;lit CHECK 里到处出现。"}
+    ]
+  },
+
+  "mechanisms": [
+    {"id": "m1", "name": "四态格 AxisInfo(unstructured/structured/scalarlike/scalar)与其偏序", "kind": "layout", "source_anchors": ["third_party/ascend/include/TritonToUnstructure/OffsetAnalysis.h:L76-L81", "third_party/ascend/include/TritonToUnstructure/OffsetAnalysis.h:L40-L73"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m2", "name": "格 meet(combineInfo 逐维 std::min)与 scalarLike 布尔传播", "kind": "algorithm", "source_anchors": ["third_party/ascend/lib/TritonToUnstructure/OffsetAnalysis.cpp:L192-L204"], "needs_figure": false, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m3", "name": "transfer functions:哪些写法产生 unstructured(parseMulI 不连续 stride / parseLoad gather 源 / parseMakeRange 结构化源 / parseSplat scalarlike)", "kind": "dataflow", "source_anchors": ["third_party/ascend/lib/TritonToUnstructure/OffsetAnalysis.cpp:L644-L672", "third_party/ascend/lib/TritonToUnstructure/OffsetAnalysis.cpp:L629-L642", "third_party/ascend/lib/TritonToUnstructure/OffsetAnalysis.cpp:L585-L592", "third_party/ascend/lib/TritonToUnstructure/OffsetAnalysis.cpp:L469-L500"], "needs_figure": false, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m4", "name": "parse 递归求 offsetMap:沿 def-use 按方言分派的驱动", "kind": "dataflow", "source_anchors": ["third_party/ascend/lib/TritonToUnstructure/OffsetAnalysis.cpp:L206-L284", "third_party/ascend/lib/TritonToUnstructure/OffsetAnalysis.cpp:L308-L361"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m5", "name": "兜底触发条件:isStructured 早退 / annotation / discreteMask / forceScalarize|scalarLike|fromTensorArg / 32 字节对齐", "kind": "protocol", "source_anchors": ["third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp:L251-L306", "third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp:L325-L342", "third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp:L628-L644"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m6", "name": "部分标量化 codegen:unstructured 维建 scf.for、structured 尾维保留向量切片", "kind": "algorithm", "source_anchors": ["third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp:L392-L466", "third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp:L468-L564"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m7", "name": "标量化代价量化:O(1) 结构化描述 vs O(N)=∏(unstructured 维 size) 循环 trip", "kind": "algorithm", "source_anchors": ["third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp:L334-L342", "third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp:L408-L466"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m8", "name": "scalarLike load 快捷路径 splatAndLoadScenario(单点 load + splat 广播)", "kind": "algorithm", "source_anchors": ["third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp:L206-L226", "third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp:L275-L280"], "needs_figure": false, "needs_worked_example": true, "difficulty": "supporting"},
+    {"id": "m9", "name": "A5 快路径:改写成 triton.ascend.indirect_load/indirect_store(compileOn91095 && forceSimtTemplate)", "kind": "config", "source_anchors": ["third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp:L353-L390"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m10", "name": "MakeTensorPtr 完全离散时按 stride 重算 i64 线性偏移", "kind": "dataflow", "source_anchors": ["third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp:L472-L494"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m11", "name": "循环/分支的态传播(preparse iter_args、parseIf/parseYield/parseLoopOp、while 变体)", "kind": "dataflow", "source_anchors": ["third_party/ascend/lib/TritonToUnstructure/UnstructureConversionPass.cpp:L594-L626", "third_party/ascend/lib/TritonToUnstructure/OffsetAnalysis.cpp:L970-L1035"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"}
+  ],
+
+  "foreshadow_due": {
+    "plant": [],
+    "harvest": [],
+    "note": "bible.py due ch14 返回空——本章无登记的应埋/应回收伏笔。承 ch11-13 结构化路径,本章讲失败兜底(分水岭'代价'的一面),为 Part 3 后续昇腾优化 pass / HFusion-HIVM 铺路;跨章一律 markdown 链接回指,不重推导。"
+  }
+}
