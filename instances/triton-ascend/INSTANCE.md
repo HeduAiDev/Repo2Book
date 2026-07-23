@@ -45,9 +45,10 @@
   仿射 tiled dataflow），bishengir 部分闭源（边界≈基座的 ptxas）。
 - ✅ **大纲已获用户审批（2026-07-18「同意」）**：33 章 / 7 Part（outline-final.json）+ ARCHITECTURE.md，
   开始逐章发车。roadmap.py 生成器已建并验（7 Part 窄长条 5.17:1，4 调用/几何/Read-PNG 通过）。
-- 🚗 **施工中（2026-07-23 状态）**：**ch01–ch19 已全部定稿提交并归档**（Part 1/2 完 + **Part 3 triton-to-linalg 核心 ch09–ch14**
-  + **ascend-opt ch15–ch18** + **ch19 离散掩码/交错访存**）；ch20–ch33 未开工。
-  下一章 **ch20**（按 outline-final.json;先查 subsystem+源码定 skip_impl）。
+- 🚗 **施工中（2026-07-23 状态）**：**ch01–ch20 已全部定稿提交并归档**（Part 1/2 完 + **Part 3 triton-to-linalg 核心 ch09–ch14**
+  + **ascend-opt ch15–ch18** + **ch19 离散掩码** + **ch20 TritonAscend 方言+三逃生舱**(hivm-hfusion 开篇)）;ch21–ch33 未开工。
+  下一章 **ch21**（按 outline-final.json;先查 subsystem+源码定 skip_impl）。
+  ⚠️ ch20 是全书 ascend.* IR 命名权威章(Bible 已登 11 op 正确名,index_put 带下划线最易错)。
   ⚠️ workflow 偶发 API 崩溃(Illustrate/Review 站):带 verified dossier 用 skip_dossier 重跑即可(非内容问题)。
   ✅ ch12–ch16 连续零逃生;评审持续抓实质正确性错(ch14 完整性四类漏第5、ch15 尾块 mask、ch16 operator! 位补/kernel节点),
   revise 循环内修、Lead 逐条核 pin 确认后提交。
