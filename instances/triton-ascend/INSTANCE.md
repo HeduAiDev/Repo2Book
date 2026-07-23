@@ -45,11 +45,13 @@
   仿射 tiled dataflow），bishengir 部分闭源（边界≈基座的 ptxas）。
 - ✅ **大纲已获用户审批（2026-07-18「同意」）**：33 章 / 7 Part（outline-final.json）+ ARCHITECTURE.md，
   开始逐章发车。roadmap.py 生成器已建并验（7 Part 窄长条 5.17:1，4 调用/几何/Read-PNG 通过）。
-- 🚗 **施工中（2026-07-23 状态）**：**ch01–ch23 已全部定稿提交并归档**（Part 1/2 完 + **Part 3 triton-to-linalg 核心**
+- 🚗 **施工中（2026-07-23 状态）**：**ch01–ch24 已全部定稿提交并归档**（Part 1/2 完 + **Part 3 triton-to-linalg 核心**
   + **ascend-opt ch15–ch18** + **ch19 离散掩码** + **hivm-hfusion:ch20 TritonAscend 方言/ch21 HFusion 方言/ch22 算子融合与自动调度**
-  + **ch23 HIVM 方言/达芬奇硬件 IR**）;ch24–ch33 未开工。
-  下一章 **ch24**（按 outline:HIVM 显式同步——set_flag/wait_flag 流水线同步 + Cube↔Vector 核间同步;skip_impl 纯 C++ MLIR）。
-  **⚠️ 发车 slug 传 `ch24-<name>`(含前缀)**。HIVM 同步 op 在 `…/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMSynchronizationOps.td`。
+  + **ch23 HIVM 方言** + **ch24 HIVM 显式同步**）;ch25–ch33 未开工。
+  **ch25 发车中**（下降链收官 HFusion→HIVM→Standard→AscendC 库调用,★,skip_impl;slug `ch25-lowering-to-ascendc`）:
+  焦点=HIVMToStandard 把 HIVM 硬件 op(MmadL1/ND2NZ/NZ2ND/vector)经 createLibCall + OpWithLibraryFunction.getOpLibraryCallName
+  重写成 func.call @AscendC 库函数;reduceMemrefsToNestedFor 给需循环的 op 生成显式 for;全链夹具 hivm-pipeline.mlir。
+  ⚠️ ch24 曾 Review round3 因 API 崩逃逸(revise-fig 改了图脚本没重渲染=陈旧 SVG),Lead 接管重渲染+独立盲审+纠 fixture 保真错,已归档。
   ⚠️ ch22 曾 Review round1 逃逸(计数陷阱 15→4 Scheduler/未验证子核个数/MixCV 14×14 结构错),Lead 手动接管修复+独立盲审,已归档。
   ⚠️ **发车 slug 必须含 `chNN-` 前缀**(workflow 里 `CH = artifacts/ + A.slug`,slug 直接当目录名):ch23 误传裸 `hivm-dialect`→
   产物落到 `artifacts/hivm-dialect/`(缺前缀、--all glob `ch??-*` 扫不到),事后 mv 回 `ch23-hivm-dialect` 才对。ch24+ 传 `ch24-<name>`。
