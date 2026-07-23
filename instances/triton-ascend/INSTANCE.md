@@ -45,9 +45,10 @@
   仿射 tiled dataflow），bishengir 部分闭源（边界≈基座的 ptxas）。
 - ✅ **大纲已获用户审批（2026-07-18「同意」）**：33 章 / 7 Part（outline-final.json）+ ARCHITECTURE.md，
   开始逐章发车。roadmap.py 生成器已建并验（7 Part 窄长条 5.17:1，4 调用/几何/Read-PNG 通过）。
-- 🚗 **施工中（2026-07-23 状态）**：**ch01–ch18 已全部定稿提交并归档**（Part 1/2 完 + **Part 3 triton-to-linalg 核心 ch09–ch14**
-  + **ascend-opt 子系统 ch15–ch18 全完**：AutoBlockify / 核亲和 / Scope+同步 / SSBuffer 软流水）；ch19–ch33 未开工。
-  下一章 **ch19**（按 outline-final.json;先查 subsystem+源码定 skip_impl）。
+- 🚗 **施工中（2026-07-23 状态）**：**ch01–ch19 已全部定稿提交并归档**（Part 1/2 完 + **Part 3 triton-to-linalg 核心 ch09–ch14**
+  + **ascend-opt ch15–ch18** + **ch19 离散掩码/交错访存**）；ch20–ch33 未开工。
+  下一章 **ch20**（按 outline-final.json;先查 subsystem+源码定 skip_impl）。
+  ⚠️ workflow 偶发 API 崩溃(Illustrate/Review 站):带 verified dossier 用 skip_dossier 重跑即可(非内容问题)。
   ✅ ch12–ch16 连续零逃生;评审持续抓实质正确性错(ch14 完整性四类漏第5、ch15 尾块 mask、ch16 operator! 位补/kernel节点),
   revise 循环内修、Lead 逐条核 pin 确认后提交。
   ✅ ch12/ch13 零逃生;ch14 零逃生但评审 12 issue/3 blocking(完整性『四类』漏第5条 + 两图 vs 源码矛盾)全经 Lead 核源码处置。
