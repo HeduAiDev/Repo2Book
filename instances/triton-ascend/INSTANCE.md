@@ -45,10 +45,11 @@
   仿射 tiled dataflow），bishengir 部分闭源（边界≈基座的 ptxas）。
 - ✅ **大纲已获用户审批（2026-07-18「同意」）**：33 章 / 7 Part（outline-final.json）+ ARCHITECTURE.md，
   开始逐章发车。roadmap.py 生成器已建并验（7 Part 窄长条 5.17:1，4 调用/几何/Read-PNG 通过）。
-- 🚗 **施工中（2026-07-22 状态）**：**ch01–ch15 已全部定稿提交并归档**（Part 1 完 + Part 2 语言层完
-  + **Part 3 triton-to-linalg 子系统核心 ch09–ch14 全完** + **ascend-opt 子系统开篇 ch15 AutoBlockify 完**）；ch16–ch33 未开工。
-  下一章 **ch16**（Cube 还是 Vector:核亲和定点传播，DAG.cpp，ascend-opt 子系统 → **发车须 skip_impl:true**，纯 C++ pass 已核）。
-  ⚠️ ch16 术语坑:`affine`=**核亲和(core affinity)**、**不是**多面体/仿射调度;数据流不动点属 Kildall 一路。
+- 🚗 **施工中（2026-07-23 状态）**：**ch01–ch16 已全部定稿提交并归档**（Part 1/2 完 + **Part 3 triton-to-linalg 核心 ch09–ch14**
+  + **ascend-opt ch15 AutoBlockify / ch16 核亲和定点传播 完**）；ch17–ch33 未开工。
+  下一章 **ch17**（按 outline-final.json；ascend-opt 子系统多为纯 C++ pass → 大概率 **skip_impl:true**，先查 subsystem+源码）。
+  ✅ ch12–ch16 连续零逃生;评审持续抓实质正确性错(ch14 完整性四类漏第5、ch15 尾块 mask、ch16 operator! 位补/kernel节点),
+  revise 循环内修、Lead 逐条核 pin 确认后提交。
   ✅ ch12/ch13 零逃生;ch14 零逃生但评审 12 issue/3 blocking(完整性『四类』漏第5条 + 两图 vs 源码矛盾)全经 Lead 核源码处置。
   ⚠️ **图 blocking 错终检必须 vs 源码/正文,不能只信 blind-vs-spec**(exp-2026-07-22-03);改 gen 后必重渲+重置 PENDING;
   读 review-report 前先看现盘是否已被 revise 循环改掉(别照单重复施工)。
