@@ -1,0 +1,244 @@
+{
+  "chapter": "ch25",
+  "title": "下降链收官：HFusion→HIVM→Standard——把带同步的 HIVM 硬件 IR 一路降成 AscendC 库调用",
+  "code_spine": [
+    "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HIVM/Pipelines/HIVMPipelines.cpp:L365-L382  (buildOptimizeHIVMPipeline：整条 optimize-hivm-pipeline 的收尾，最后一站就是 createConvertHIVMToStandardPass —— 本章讲的最后一跳)",
+    "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp:L1823-L1903  (ConvertHIVMToStandardPass::runOnOperation：建 ConversionTarget，把 func/memref/arith/scf/LLVM 设 legal、把每个 HIVM 硬件 op 设 illegal，然后对每个 device func 跑 applyPartialConversion)",
+    "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp:L1751-L1809  (populateHIVMToStandardConversionPatterns：把 45+ 个 OpRewritePattern 一次性塞进 pattern set)",
+    "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp:L345-L367  (MmadL1OpToLibraryCallPattern：矩阵 op 的重写样板——收操作数、追加同步参数、replaceWithLibCall)",
+    "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp:L106-L168  (createLibCall：先 getOrInsert 一个 func.func 外部声明，再 emit 一条 func.call —— 全书唯一真正落地『张量级 op → C 库调用』的函数)",
+    "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp:L170-L180  (replaceWithLibCall：createLibCall 之后 rewriter.replaceOp 把原 op 换掉)",
+    "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HIVM/IR/LibraryFunctionOpInterface/LibraryFunctionOpInterfaceImpl.cpp:L511-L584  (getOpLibraryCallName 泛型分支：按 op 名 + rank + 数据类型 mangle 出库函数名，如 vadd_1d_half)",
+    "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp:L910-L964  (VectorOpToLibraryCallPattern：向量 op——rank<=maxRank 直接调库，否则先 reduceMemrefsToNestedFor 拆嵌套 scf.for 再逐块调库)",
+    "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp:L229-L338  (reduceMemrefsToNestedForUsingAxes / reduceMemrefsToNestedFor：把 memref 按轴拆成嵌套循环 + subview，把张量级库调用降到库支持的最大 rank)"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HIVM/Pipelines/HIVMPipelines.cpp",
+      "lines": "L365-L382",
+      "code": "void buildOptimizeHIVMPipeline(OpPassManager &pm,\n                               const HIVMPipelineOptions &options) {\n  pm.nest<func::FuncOp>().addPass(createInitEntryKernelPass());\n  if (!options.disableHIVMTensorCompile) {\n    hivmPreBufferizationOptimizationPipeline(pm, options);\n    bufferizationPipeline(pm, options);\n  }\n  hivmPostBufferizationOptimizationPipeline(pm, options);\n  // Optimizations that relies on scope should be done after this point. Inline\n  // all `scope.scope` ops.\n  pm.addPass(\n      scope::createInlineScopePass(InlineScopeOptions{/*forceInline=*/true}));\n  pm.addPass(createEnableHIVMCCompatiblePrintPass());\n  pm.addPass(annotation::createAnnotationLoweringPass());\n  pm.nest<func::FuncOp>().addPass(createInsertInitAndFinishForDebugPass());\n  pm.nest<func::FuncOp>().addPass(createMarkDisableLoadPass());\n  pm.addPass(createConvertHIVMToStandardPass());\n}",
+      "elide": ["中间的 bufferization / postBufferization 各子流水线（ch24 之前的活）不展开，只要读者看到整条 optimize-hivm-pipeline 的最后一行就是 createConvertHIVMToStandardPass —— 本章讲的收官 pass"]
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp",
+      "lines": "L1823-L1903",
+      "code": "void ConvertHIVMToStandardPass::runOnOperation() {\n  auto module = getOperation();\n  ConversionTarget target(getContext());\n  target.addLegalDialect<func::FuncDialect, memref::MemRefDialect,\n                         arith::ArithDialect, scf::SCFDialect,\n                         LLVM::LLVMDialect>();\n  target.addLegalOp<hivm::PointerCastOp>();\n  // Abstract Intrinsic Ops must be converted.\n  // clang-format off\n  target.addIllegalOp<hivm::MmadL1Op,\n                      hivm::ND2NZOp,\n                      hivm::NZ2NDOp,\n                      hivm::FixpipeOp,\n                      hivm::MatmulOp,\n                      hivm::CopyOp,\n                      hivm::CustomOp,\n                      hivm::LoadOp,\n                      hivm::StoreOp,\n                      hivm::VAddOp,\n                      hivm::VMulOp,\n                      // ... 约 40 个向量 / 规约 / 转置 / 同步 op 同样列为 illegal ...\n                      hivm::VSortOp\n                      >();\n\n  // clang-format on\n\n  RewritePatternSet patterns(&getContext());\n  SmallVector<func::FuncOp> deviceFuncs;\n  module->walk([&](func::FuncOp func) {\n    if (hacc::utils::isDevice(func)) {\n      deviceFuncs.push_back(func);\n    }\n  });\n\n  for (auto deviceFunc : deviceFuncs) {\n    patterns.clear();\n    populateHIVMToStandardConversionPatterns(\n        patterns,\n        /*isOpsAligned=*/deviceFunc->hasAttr(hivm::StrideAlignDimsAttr::name) ||\n            this->isOpsAligned);\n    if (failed(\n            applyPartialConversion(deviceFunc, target, std::move(patterns)))) {\n      signalPassFailure();\n    }\n  }",
+      "elide": ["addIllegalOp<> 里约 40 个 op 的完整清单（VMul/VSub/.../VReduce/VTranspose/DebugOp/SyncBlockLockOp/VSortOp）逐行列出——正文只需展示头尾 + 一句『每个 HIVM 硬件 op 都被显式设为 illegal，逼着 partial conversion 必须把它降掉』", "runOnOperation 尾部的 canonicalization（SubViewOp/ForOp）与 debug 全局串核类型标注（L1905-L1927）属收尾清理，不是主线"]
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp",
+      "lines": "L106-L168",
+      "code": "static func::CallOp createLibCall(PatternRewriter &rewriter, Operation *op,\n                                  ModuleOp mod, const std::string &libCallName,\n                                  const SmallVector<Value> &inputOperands,\n                                  TypeRange resultTypes) {\n  Location loc = op->getLoc();\n  MLIRContext *ctx = rewriter.getContext();\n\n  FlatSymbolRefAttr fnNameAttr = SymbolRefAttr::get(ctx, libCallName);\n  if (!mod.lookupSymbol(fnNameAttr.getAttr())) {\n    auto libFnType = rewriter.getFunctionType(\n        extractOperandTypes(inputOperands), resultTypes);\n    OpBuilder::InsertionGuard guard(rewriter);\n    rewriter.setInsertionPoint(mod.getBody(), std::prev(mod.getBody()->end()));\n\n    func::FuncOp funcOp = rewriter.create<func::FuncOp>(\n        mlir::FileLineColLoc::get(ctx, \"internal\", 0, 0), fnNameAttr.getValue(),\n        libFnType);\n    funcOp->setAttr(LLVM::LLVMDialect::getEmitCWrapperAttrName(),\n                    UnitAttr::get(ctx));\n\n    auto haccAlwaysInlineAttr = hacc::stringifyHACCToLLVMIRTranslateAttr(\n        hacc::HACCToLLVMIRTranslateAttr::ALWAYS_INLINE);\n    funcOp->setAttr(haccAlwaysInlineAttr, rewriter.getUnitAttr());\n\n    funcOp.setPrivate();\n\n    // label a func core type attribute to the lib call decl, based on either\n    // special cases such as debug helper functions or the core\n    // type of original op.\n    // ... (根据 op 的 CoreTypeInterface 给声明打 AIC / AIV 核类型标签) ...\n  }\n\n  return rewriter.create<func::CallOp>(\n      loc, fnNameAttr.getValue(), resultTypes,\n      createTypeCanonicalizedMemRefOperands(rewriter, loc, inputOperands));\n}",
+      "elide": ["L132-L162 的核类型标注块（把 debug helper 标 AIC_OR_AIV、否则读原 op 的 CoreTypeInterface 得到 CUBE→AIC / VECTOR→AIV）是给声明打属性的辅料，不影响『getOrInsert 声明 + emit call』这条主干；正文用一句话概括即可"]
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp",
+      "lines": "L170-L180",
+      "code": "template <typename OpType>\nstatic void replaceWithLibCall(PatternRewriter &rewriter, OpType op,\n                               const std::string &libCallName,\n                               const SmallVector<Value> &inputOperands,\n                               TypeRange resultTypes) {\n  ModuleOp mod = op->template getParentOfType<ModuleOp>();\n  func::CallOp call =\n      createLibCall(rewriter, op, mod, libCallName, inputOperands, resultTypes);\n\n  rewriter.replaceOp(op, call);\n}",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp",
+      "lines": "L345-L367",
+      "code": "class MmadL1OpToLibraryCallPattern : public OpRewritePattern<hivm::MmadL1Op> {\npublic:\n  using OpRewritePattern<hivm::MmadL1Op>::OpRewritePattern;\n  LogicalResult matchAndRewrite(MmadL1Op op,\n                                PatternRewriter &rewriter) const final {\n    // inputs\n    SmallVector<Value> libParams =\n        op.getInputOperands(/*includeSyncRelatedArgs=*/false);\n\n    // outputs\n    libParams.push_back(op.getC());\n\n    // additional sync arguments\n    SmallVector<Value> additionalArgs;\n    genAdditionalFunctionArgs(op, additionalArgs, rewriter);\n    libParams.append(additionalArgs.begin(), additionalArgs.end());\n\n    replaceWithLibCall(rewriter, op,\n                       cast<OpWithLibraryFunction>(op.getOperation())\n                           .getOpLibraryCallName(/*isOpsAligned=*/std::nullopt),\n                       libParams, {});\n    return success();\n  }",
+      "elide": ["private 的 genAdditionalFunctionArgs（L370-L385）把 ch24 插好的 syncRelatedArgs 拷进参数尾、再追加 unitFlagMode——正文可用一句『矩阵 op 把带来的同步参数原样透传给库函数』带过，或单独一小节讲同步透传"]
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp",
+      "lines": "L388-L419",
+      "code": "class ND2NZOpToLibraryCallPattern : public OpRewritePattern<hivm::ND2NZOp> {\npublic:\n  using OpRewritePattern<hivm::ND2NZOp>::OpRewritePattern;\n  LogicalResult matchAndRewrite(ND2NZOp op,\n                                PatternRewriter &rewriter) const final {\n    if (!op.getDstContinuous()) {\n      op->emitError(\n          \"ND2NZOp's library function implementation requires continuous dst!\");\n      return failure();\n    }\n\n    replaceWithLibCall(rewriter, op,\n                       cast<OpWithLibraryFunction>(op.getOperation())\n                           .getOpLibraryCallName(/*isOpsAligned=*/std::nullopt),\n                       op->getOperands(), {});\n    return success();\n  }\n};\n\nclass NZ2NDOpToLibraryCallPattern : public OpRewritePattern<hivm::NZ2NDOp> {\n  using OpRewritePattern<hivm::NZ2NDOp>::OpRewritePattern;\n\n  LogicalResult matchAndRewrite(hivm::NZ2NDOp op,\n                                PatternRewriter &rewriter) const final {\n    // TODO: merge this with ND2NZOpToLibraryCallPattern\n    replaceWithLibCall(rewriter, op,\n                       cast<OpWithLibraryFunction>(op.getOperation())\n                           .getOpLibraryCallName(/*isOpsAligned=*/std::nullopt),\n                       op->getOperands(), {});\n    return success();\n  }\n};",
+      "elide": ["ND2NZ 的连续 dst 检查是格式转换的前置约束；两个格式转换 pattern 结构几乎相同（TODO 注释也承认要合并），是『直接一条 call』这类 pattern 最干净的样板"]
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp",
+      "lines": "L229-L338",
+      "code": "static SmallVector<Value>\nreduceMemrefsToNestedForUsingAxes(PatternRewriter &rewriter, Location loc,\n                                  ValueRange memrefValsMaybe,\n                                  std::set<int> reducedAxes) {\n  Value memrefVal;\n  for (auto val : memrefValsMaybe) {\n    if (isa<MemRefType>(val.getType())) {\n      memrefVal = val;\n      break;\n    }\n  }\n  if (!memrefVal) {\n    // nothing needs to be reduced\n    return memrefValsMaybe;\n  }\n\n  MemRefType vecType = cast<MemRefType>(memrefVal.getType());\n  int64_t rank = vecType.getRank();\n  // ... 若各 memref rank 不一致则原样返回 ...\n\n  std::vector<scf::ForOp> nestedFor;\n  OpBuilder::InsertionGuard guard(rewriter);\n\n  SmallVector<Value> reducedVals;\n  auto buildLoopBody =\n      [&rewriter, &loc, &memrefValsMaybe, &reducedAxes, &rank,\n       &reducedVals](llvm::SmallVector<Value> indexes) -> void {\n    for (auto val : memrefValsMaybe) {\n      MemRefType vecType = dyn_cast<MemRefType>(val.getType());\n      if (!vecType) {\n        reducedVals.push_back(val);\n        continue;\n      }\n\n      SmallVector<OpFoldResult> viewOffset, viewSize,\n          viewStride(rank, rewriter.getIndexAttr(1));\n      std::vector<int64_t> reducedSize;\n\n      int nestedForIdx = 0;\n      for (int dim = 0; dim < rank; dim++) {\n        if (reducedAxes.count(dim)) {\n          viewOffset.push_back(indexes[nestedForIdx++]);\n          viewSize.push_back(rewriter.getIndexAttr(1));\n        } else {\n          viewOffset.push_back(rewriter.getIndexAttr(0));\n          viewSize.push_back(memref::getMixedSize(rewriter, loc, val, dim));\n\n          reducedSize.push_back(vecType.getDimSize(dim));\n        }\n      }\n\n      MemRefType reducedType = cast<MemRefType>(inferRankReducedResultType(\n          reducedSize, vecType, viewOffset, viewSize, viewStride, reducedAxes));\n\n      reducedVals.push_back(rewriter.create<memref::SubViewOp>(\n          loc, reducedType, val, viewOffset, viewSize, viewStride));\n    }\n  };\n  createNestedLoops(rewriter, loc, memrefVal, reducedAxes, buildLoopBody);\n\n  return reducedVals;\n}",
+      "elide": ["L248-L255 的 rank 一致性检查（rank 不同就原样返回不拆循环）；inferRankReducedResultType 的具体 stride 推导（L182-L227）是 subview 结果类型细节，正文只需说明『每个被拆轴生成一层 scf.for，循环体内对每个 memref 建一个降 rank 的 subview』"]
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp",
+      "lines": "L300-L338",
+      "code": "// reduce the rank of the values(with type MemRefType) inside memrefValsMaybe,\n// by wrapping them inside nested for loops. the scalar values inside will be\n// returned intact.\n//\n// the indices of the reducing axis are in the range of [forRangeStart,\n// forRangeEnd). these axis must have the same size in each reduced dimension.\n//\n// every reduced value will be converted to a subview of the original value,\n// residing in the innest loop. all value reduced are aggregated in a collection\n// and return. the sequence of the returned collection are guaranteed to obey\n// the lexicial sequence in the block.\n//\n// Example:\n//   memrefValsMaybe = {v1 : memref<1x8x16x32x64x128xi16>,\n//                      v2 : memref<10x8x16x32x64x128xi16>,\n//                      v3 : i16}\n//   forRangeStart = 1\n//   forRangeEnd = 4\n//\n//   will generate:\n//     for i in [0, 8]\n//       for j in [0, 16]\n//         for k in [0, 32]\n//           v1' = subview of v1 : memref<1x64x128xi16>\n//           v2' = subview of v2 : memref<10x64x128xi16>\n//     return {v1', v2', v3}\nstatic SmallVector<Value> reduceMemrefsToNestedFor(PatternRewriter &rewriter,\n                                                   Location loc,\n                                                   ValueRange memrefValsMaybe,\n                                                   int forRangeStart,\n                                                   int forRangeEnd) {\n  std::set<int> indices;\n  for (int i = forRangeStart; i < forRangeEnd; ++i) {\n    indices.insert(i);\n  }\n\n  return reduceMemrefsToNestedForUsingAxes(rewriter, loc, memrefValsMaybe,\n                                           indices);\n}",
+      "elide": ["这段源码自带的注释 + Example 已经是最好的 worked example，正文直接引用它即可讲清『rank>maxRank 时怎么拆循环』"]
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp",
+      "lines": "L920-L964",
+      "code": "  LogicalResult matchAndRewrite(HIVMVectorOp op,\n                                PatternRewriter &rewriter) const final {\n    assert(op.hasPureBufferSemantics() &&\n           \"Operating on tensor, please bufferize.\");\n    auto opWithLibCall = cast<OpWithLibraryFunction>(op.getOperation());\n    int64_t rank = op.getNumLoops();\n    int maxOpRank = opWithLibCall.getOpLibraryMaxRank().value();\n    std::string fnName =\n        opWithLibCall.getOpLibraryCallName(/*isOpsAligned=*/std::nullopt);\n    if (rank <= maxOpRank) {\n      // Directly create library calls when doing 1d/2d/3d/4d vector ops.\n      replaceWithLibCall(rewriter, op, fnName,\n                         this->getLibraryCallOperands(rewriter, op), {});\n      return success();\n    }\n    // All subsequent ops need to be reconstructed to first complete the\n    // external throw and then call getLibraryCallOperands.\n    SmallVector<Value> reducedVals = reduceMemrefsToNestedFor(\n        rewriter, op.getLoc(),\n        this->getLibraryCallOperands(rewriter, op,\n                                     /*includeExtraBuffer=*/false),\n        0, rank - maxOpRank);\n\n    // the 'dst' of an elementwise op must be a memref value\n    rewriter.setInsertionPointAfter(\n        reducedVals[reducedVals.size() - 1].getDefiningOp());\n\n    if (auto opWithExtraBuffer =\n            dyn_cast<ExtraBufferOpInterface>(op.getOperation())) {\n      auto extraBuffers = opWithExtraBuffer.getExtraBuffers();\n      reducedVals.insert(reducedVals.end(), extraBuffers.begin(),\n                         extraBuffers.end());\n      if (extraBuffers.size() == 0) {\n        if constexpr (isElementwiseOp()) {\n          // tmp_buf is required in the elementwise scene op library.\n          createDummyBuffer(rewriter, op, reducedVals);\n        }\n      }\n    }\n\n    ModuleOp mod = op->template getParentOfType<ModuleOp>();\n    createLibCall(rewriter, op, mod, fnName, reducedVals, {});\n    rewriter.eraseOp(op);\n    return success();\n  }",
+      "elide": ["extra-buffer / dummy tmp_buf 追加（L947-L958）是给某些 elementwise 库函数补一块临时 buffer 的细节，正文可略；isElementwiseOp() 白名单（L968-L1009）只是判断谁需要 tmp_buf。核心是那个 if：rank<=maxOpRank 直调、否则先 reduceMemrefsToNestedFor 再调"]
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp",
+      "lines": "L1751-L1766",
+      "code": "void mlir::hivm::populateHIVMToStandardConversionPatterns(\n    RewritePatternSet &patterns, bool isOpsAligned) {\n  // clang-format off\n  patterns.add<\n               MmadL1OpToLibraryCallPattern,\n               ND2NZOpToLibraryCallPattern,\n               NZ2NDOpToLibraryCallPattern,\n               FixpipeOpToLibraryCallPattern,\n               MatmulOpToLibraryCallPattern,\n               MixMatmulOpToLibraryCallPattern,\n               MixGroupMatmulOpToLibraryCallPattern,\n               CopyOpToLibraryCallPattern<hivm::CopyOp>,\n               CopyOpToLibraryCallPattern<hivm::LoadOp>,\n               CopyOpToLibraryCallPattern<hivm::StoreOp>,\n               VectorOpToLibraryCallPattern<hivm::VAddOp>,\n               VectorOpToLibraryCallPattern<hivm::VMulOp>,",
+      "elide": ["紧接其后 L1767-L1805 还有 30+ 个 VectorOpToLibraryCallPattern<hivm::VXxxOp>（VSub/VDiv/VMax/.../VGatherMask）以及 VArange/VCast/Reduce/Cum/Transpose/Debug/Custom/VInterleave/PlainOp/SyncBlockOp/Sort/Flip 等 pattern 逐行 add，随后 (patterns.getContext()) 收尾；末尾 L1809 单独 patterns.add<BrcOpToLibraryCallPattern>(ctx, isOpsAligned) —— Brc 单独 add 是因为它要吃 isOpsAligned 参数。正文展示头几个即可说明『每类硬件 op 都有一个对应 pattern，全部注册进同一个 pattern set』"]
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HIVM/IR/LibraryFunctionOpInterface/LibraryFunctionOpInterfaceImpl.cpp",
+      "lines": "L30-L37",
+      "code": "std::string concatVectorOpLibraryCallName(const std::string &baseCallName,\n                                          int rank,\n                                          const std::string &elemTypeName) {\n  std::stringstream ss;\n  ss << baseCallName << \"_\" << rank << \"d\"\n     << \"_\" << elemTypeName;\n  return ss.str();\n}",
+      "elide": ["向量 op 库名的拼装规则：<op名>_<rank>d_<元素类型>。elemTypeName 由 getTypeName 给出（f16→half、f32→float、i32→int32_t）"]
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HIVM/IR/LibraryFunctionOpInterface/LibraryFunctionOpInterfaceImpl.cpp",
+      "lines": "L91-L113",
+      "code": "std::string getLibraryCallNameForCopyLikeOp(std::string baseCallName,\n                                            Type srcType, Type dstType,\n                                            Location loc, int rank) {\n  auto srcScope = getHIVMAddressSpace(srcType);\n  assert(kAddressSpace2LibraryName.find(srcScope) !=\n             kAddressSpace2LibraryName.cend() &&\n         \"Unsupported src address space\");\n  auto dstScope = getHIVMAddressSpace(dstType);\n  assert(kAddressSpace2LibraryName.find(dstScope) !=\n             kAddressSpace2LibraryName.cend() &&\n         \"Unsupported dst address space\");\n  std::string srcScopeName = kAddressSpace2LibraryName.at(srcScope);\n  std::string dstScopeName = kAddressSpace2LibraryName.at(dstScope);\n  std::string src2DstName =\n      llvm::formatv(\"{0}_to_{1}\", srcScopeName, dstScopeName);\n\n  std::string dataTypeStr = getTypeName(loc, getElementTypeOrSelf(srcType));\n  std::string libCallDim = std::to_string(rank) + \"d\";\n\n  std::string callLibraryName = llvm::formatv(\n      \"{0}_{1}_{2}_{3}\", baseCallName, src2DstName, libCallDim, dataTypeStr);\n  return callLibraryName;\n}",
+      "elide": ["kAddressSpace2LibraryName（L86-L89）把内存域映射成串：UB→ubuf / GM→gm / L1→cbuf。搬运类 op 库名 = <op名>_<src域>_to_<dst域>_<rank>d_<类型>，例如 load 从 gm 到 ub 的 1d f16 = load_gm_to_ubuf_1d_half"]
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HIVM/Interfaces/LibraryFunctionOpInterface.td",
+      "lines": "L27-L50",
+      "code": "def LibraryFunctionOpInterface : OpInterface<\"OpWithLibraryFunction\"> {\n  let cppNamespace = \"::mlir::hivm\";\n  let methods = [\n    InterfaceMethod<\n      /*desc=*/[{\n        Get the name registered for this op when lowering to an external library call.\n      }],\n      /*retTy=*/\"std::string\",\n      /*methodName=*/\"getOpLibraryCallName\",\n      /*args=*/(ins \"std::optional<bool>\":$isOpsAligned),\n      /*methodBody=*/\"\"\n    >,\n    InterfaceMethod<\n      /*desc=*/[{\n        Get the max op rank to generate the corresponding library call.\n      }],\n      /*retTy=*/\"std::optional<int>\",\n      /*methodName=*/\"getOpLibraryMaxRank\",\n      /*args=*/(ins),\n      /*methodBody=*/\"\",\n      /*defaultImplementation=*/[{\n        llvm_unreachable(\"getOpLibraryMaxRank not implemented\");\n      }]\n    >,",
+      "elide": ["getOpLibraryCallRank / inferOpLibraryMaxRank 两个附加方法（L51-L77）是 rank clamp 的辅助，正文只需 getOpLibraryCallName + getOpLibraryMaxRank 两把钥匙"]
+    }
+  ],
+  "key_classes": [
+    {"name": "ConvertHIVMToStandardPass", "file": "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp", "responsibility": "本章主 pass：在 module 上建 ConversionTarget（标准方言 legal、HIVM 硬件 op illegal），逐个 device func 跑 applyPartialConversion，把所有 HIVM 硬件 op 换成 func.call；收尾做 subview/for 规范化"},
+    {"name": "createLibCall / replaceWithLibCall", "file": "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp", "responsibility": "所有 pattern 共用的落地函数：按库函数名 getOrInsert 一个 private func.func 外部声明（打 emit_c_wrapper + always_inline + 核类型属性），再 emit 一条 func.call 传入类型规范化后的操作数，最后 replaceOp"},
+    {"name": "MmadL1OpToLibraryCallPattern / ND2NZOpToLibraryCallPattern / NZ2NDOpToLibraryCallPattern / FixpipeOpToLibraryCallPattern", "file": "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp", "responsibility": "『直接一条 call』类 pattern：矩阵 op / 格式转换 op / fixpipe——操作数不需拆循环，收齐操作数（矩阵 op 还追加同步参数与 unit-flag）后一步 replaceWithLibCall"},
+    {"name": "MultiDimOpToLibraryCallPattern<SourceOp>", "file": "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp", "responsibility": "多维 op pattern 基类：提供 getLibraryCallOperands（从 HIVMStructuredOp 接口取操作数）与常量构造工具，被 Vector/Copy/Cum 等子类继承"},
+    {"name": "VectorOpToLibraryCallPattern<HIVMVectorOp> / CopyOpToLibraryCallPattern<CopyOpType>", "file": "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp", "responsibility": "『rank 门控』类 pattern：rank<=getOpLibraryMaxRank 直调库；否则 reduceMemrefsToNestedFor 把超出的高维拆成嵌套 scf.for，循环体内对降 rank 的 subview 调库"},
+    {"name": "ReduceOpToLibraryCallPattern / TransposeOpToLibraryCallPattern / CumOpToLibraryCallPattern / BrcOpToLibraryCallPattern", "file": "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp", "responsibility": "『按指定轴拆循环』类 pattern：规约/转置/累积/广播必须沿特定语义轴（reducedAxes）拆循环，走 reduceMemrefsToNestedForUsingAxes 后调库"},
+    {"name": "OpWithLibraryFunction (interface) / getOpLibraryCallName / getOpLibraryMaxRank", "file": "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HIVM/Interfaces/LibraryFunctionOpInterface.td", "responsibility": "op 接口：让每个硬件 op 自报『我对应哪个库函数名』和『库支持的最大 rank』。pattern 只调接口，具体 mangle 逻辑在各 op 的 ExternalModel 实现里"},
+    {"name": "StaticMaxRankExternalModel / getLibraryCallNameForCopyLikeOp / concatVectorOpLibraryCallName / getTypeName", "file": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HIVM/IR/LibraryFunctionOpInterface/LibraryFunctionOpInterfaceImpl.cpp", "responsibility": "getOpLibraryCallName 的落地：按 op 名 + rank + 数据类型（+ 搬运的内存域、+ 对齐/vs-sv 后缀）拼出库函数名字符串"},
+    {"name": "buildOptimizeHIVMPipeline / buildConvertToHIVMPipeline", "file": "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HIVM/Pipelines/HIVMPipelines.cpp", "responsibility": "前者是 optimize-hivm-pipeline，最后一站就是 createConvertHIVMToStandardPass（本章）；后者 convert-to-hivm-pipeline 把 HFusion/tensor/memref 降成 HIVM op，是本章的上游喂料"}
+  ],
+  "data_flow": [
+    {"step": "1. 入口", "detail": "buildOptimizeHIVMPipeline 跑完 bufferization、显式同步注入（ch24）、内存规划等所有优化后，最后 addPass(createConvertHIVMToStandardPass())：此时 IR 是带 set_flag/wait_flag 同步的 HIVM 硬件 op（memref 语义）"},
+    {"step": "2. 建 target", "detail": "runOnOperation 建 ConversionTarget：func/memref/arith/scf/LLVM 方言 legal、hivm.hir.pointer_cast legal，其余每个 HIVM 硬件 op（Mmad/ND2NZ/Copy/Load/Store/VAdd.../VReduce/VTranspose/SyncBlockLock...）显式 addIllegalOp"},
+    {"step": "3. 逐 device func", "detail": "module->walk 收集所有 hacc device func；对每个 func clear+populate pattern set（isOpsAligned 取决于该 func 是否带 StrideAlignDims 属性），跑 applyPartialConversion"},
+    {"step": "4. pattern 匹配", "detail": "每个 illegal 的 HIVM op 被对应 OpRewritePattern 匹配。三种形态：(a) 直接调库（Mmad/ND2NZ/Fixpipe，操作数原样）；(b) rank 门控（Vector/Copy，rank>maxRank 先拆循环）；(c) 按轴拆循环（Reduce/Transpose/Cum/Brc）"},
+    {"step": "5. 拆循环（需要时）", "detail": "reduceMemrefsToNestedFor(UsingAxes) 对每个被拆轴生成一层 scf.for，循环体内用 memref.subview 把每个 memref 降到库支持的 rank；标量操作数原样透传"},
+    {"step": "6. 求库名", "detail": "cast<OpWithLibraryFunction>(op).getOpLibraryCallName(isOpsAligned)：按 op 名 + rank + 数据类型（搬运还含 src/dst 内存域、广播/规约还含对齐/轴类）mangle 出库函数名字符串，如 load_gm_to_ubuf_1d_half、vadd_1d_half"},
+    {"step": "7. getOrInsert 声明", "detail": "createLibCall 若 module 里还没这个符号，就在 module 末尾插一个 private func.func 外部声明：签名 = 规范化后的操作数类型（memref 统一成动态 strided layout），并打 emit_c_wrapper + hacc always_inline + 核类型（AIC/AIV）属性"},
+    {"step": "8. emit call + 替换", "detail": "rewriter.create<func::CallOp> 生成 func.call @<库名>(规范化操作数)，replaceOp 把原 HIVM op 换掉。HIVM 方言彻底消失，只剩 func/scf/memref/arith 标准方言 + 对 AscendC 运行库的 call"},
+    {"step": "9. 收尾", "detail": "对 subview/for 跑 canonicalization；给 debug 全局串打 AIC_OR_AIV 核类型标签。至此下降链收官，IR 可继续降到 LLVM/AscendC C"}
+  ],
+  "design_decisions": [
+    {"decision": "硬件 op 不内联展开成标量循环，而是降成对预编译 AscendC 库函数的一条 func.call", "why": "AscendC 运行库里有手工优化好的 kernel（用满 Cube/Vector 单元、流水、对齐），编译器只要生成正确的调用点即可，把微架构优化留给库。createLibCall 给声明打 always_inline，最终由后端把库实现内联回来", "evidence": "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp:L120-L131"},
+    {"decision": "库函数名由 op 自己通过 OpWithLibraryFunction 接口生成，而非在 pattern 里硬编码", "why": "同一个 op 的库名依赖运行期属性（rank、元素类型、内存域、对齐、vs/sv 变体），把 mangle 逻辑收进 op 的 ExternalModel，pattern 只负责『收操作数→调接口→emit call』的通用骨架，避免每个 pattern 重复拼名", "evidence": "third_party/ascend/AscendNPU-IR/bishengir/include/bishengir/Dialect/HIVM/Interfaces/LibraryFunctionOpInterface.td:L27-L38"},
+    {"decision": "库函数只支持到某个最大 rank（getOpLibraryMaxRank），超出的高维靠 reduceMemrefsToNestedFor 拆成嵌套 scf.for", "why": "AscendC 库 kernel 通常只实现 1~4 维；更高维张量在编译期用 subview 沿高维切片、逐块调库，既复用库又不限制输入维度", "evidence": "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp:L929-L941"},
+    {"decision": "调库前把 memref 操作数类型统一成『全动态 strided layout』并 memref.cast", "why": "库函数是按 C ABI 声明的、不带静态 shape/layout 信息；在 std 层规范化类型避免引入 DialectCastOp，让同一个库声明能吃不同静态 shape 的实参（extractOperandTypes + createTypeCanonicalizedMemRefOperands）", "evidence": "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp:L63-L104"},
+    {"decision": "conversion 按 device func 逐个跑、每次重建 pattern（携带该 func 的 isOpsAligned）", "why": "对齐信息是 per-func 属性（StrideAlignDims），影响广播/规约类库名的 mangle；逐 func 传参才能给每个 kernel 生成正确变体，也把 partial conversion 的作用域限定在设备侧代码", "evidence": "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp:L1893-L1903"},
+    {"decision": "矩阵 / fixpipe op 把 ch24 插好的同步参数（syncRelatedArgs）与 unit-flag 模式原样追加到库调用参数尾", "why": "本章降的是『带同步的 IR』：set_flag/wait_flag 的 event id 等要作为库函数的额外实参透传给 AscendC，硬件同步在库内部按这些参数执行——若同步参数为空则填 -1 默认值", "evidence": "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp:L370-L385"}
+  ],
+  "theory": [
+    "Partial conversion 的收敛性：把每个 HIVM 硬件 op 标 illegal、把 func/scf/memref/arith legal，greedy driver 会反复应用 pattern 直到没有 illegal op 残留；每个 pattern 保证把一个 illegal op 换成一堆 legal op（func.call + 可选 scf.for/subview），故必然收敛且终态无 HIVM 方言。",
+    "Rank 拆分的复杂度：对 rank=R、库支持 maxRank=M 的 op，reduceMemrefsToNestedFor 生成 R-M 层嵌套循环、循环体内一条库调用；等价于把张量运算沿高 R-M 维串行化、内 M 维交给库并行。库调用次数 = 高 R-M 维尺寸之积。",
+    "库名 mangle 是一个确定性函数 name = f(opName, rank', elemType, [srcScope,dstScope], [alignKind,axisKind], [vs/sv/s_vs 变体])，其中 rank' = min(rank, maxRank)。例：hivm.hir.vadd 作用于 1 维 f16 → concatVectorOpLibraryCallName(\"vadd\",1,\"half\") = \"vadd_1d_half\"；hivm.hir.load gm→ub 1 维 f16 → \"load_gm_to_ubuf_1d_half\"；hivm.hir.store ub→gm 1 维 f16 → \"store_ubuf_to_gm_1d_half\"（f16 经 getTypeName 映射为 half）。"
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {"what": "populateHIVMToStandardConversionPatterns 里 30+ 个 VectorOpToLibraryCallPattern<hivm::VXxxOp> 实例化，只保留 VAddOp/VMulOp 两三个代表", "why_safe": "它们是同一个模板对不同 op 的实例化，控制流完全一致；保留 VAdd 即可讲清『rank 门控』pattern，删其余不损结构"},
+      {"what": "MatmulOp/MixMatmulOp/MixGroupMatmulOp/SortOp/FlipOp/VInterleaveOp/VArange/VCast/Custom/Debug/PlainOp/SyncBlockOp 等 pattern 类的完整实现，只保留 MmadL1（直接调库代表）、ND2NZ（格式转换代表）、Vector（rank 门控代表）、Copy（搬运代表）、Reduce 或 Cum（按轴拆循环代表）", "why_safe": "全部 pattern 落在三种形态（直接调库 / rank 门控 / 按轴拆循环）里，各留一个代表即可覆盖，其余是同形态的重复；删除后 populate/target 里对应条目一并删，不影响被保留代表的可运行性"},
+      {"what": "FixpipeOpToLibraryCallPattern::genPreQuant 里 f32→f16/bf16、s32→i8 的 preQuant 特判（L443-L474）", "why_safe": "这是 fixpipe 量化模式的细枝末节，属 TODO 过渡逻辑；不选 Fixpipe 作代表即可整体删去，不影响主线三形态的讲解"},
+      {"what": "createLibCall 里 L132-L162 的核类型（AIC/AIV）属性标注块与 runOnOperation 尾部 L1919-L1927 的 debug 全局串核类型标注", "why_safe": "给声明/全局串打核类型属性是给后端用的辅助元数据，删掉不影响『getOrInsert 声明 + emit call』的核心数据流；但要在注释里说明这里省略了核类型标注"},
+      {"what": "inferRankReducedResultType 两个重载（L182-L227）的 stride 推导细节", "why_safe": "它只是给 subview 算降 rank 后的结果类型，属实现细节；精简版可保留函数调用点、把内部简化为一句注释说明其职责"}
+    ],
+    "must_keep": [
+      {"symbol": "createLibCall", "why": "全章核心：getOrInsert func.func 外部声明 + emit func.call 的落地函数，读者必须看到这一步"},
+      {"symbol": "replaceWithLibCall", "why": "pattern 与 createLibCall 之间的桥：调 createLibCall 后 replaceOp，所有直接调库的 pattern 都用它"},
+      {"symbol": "extractOperandTypes", "why": "构造库声明签名时把 memref 类型统一成动态 strided layout，是类型规范化的一半"},
+      {"symbol": "createTypeCanonicalizedMemRefOperands", "why": "emit call 时给实参插 memref.cast 到动态 layout，是类型规范化的另一半"},
+      {"symbol": "reduceMemrefsToNestedFor", "why": "rank 门控形态的拆循环入口；自带的注释 + Example 是最佳 worked example"},
+      {"symbol": "reduceMemrefsToNestedForUsingAxes", "why": "按轴拆循环的实现，Reduce/Transpose/Cum/Brc 都走它；展示 subview + createNestedLoops 如何降 rank"},
+      {"symbol": "MmadL1OpToLibraryCallPattern", "why": "『直接调库 + 追加同步参数』代表，串起 ch24 同步透传"},
+      {"symbol": "ND2NZOpToLibraryCallPattern", "why": "格式转换 op 直接调库的最干净样板"},
+      {"symbol": "VectorOpToLibraryCallPattern", "why": "『rank 门控』pattern 代表：if(rank<=maxRank) 直调 else 拆循环"},
+      {"symbol": "CopyOpToLibraryCallPattern", "why": "搬运 op（load/store/copy）代表，库名带 src/dst 内存域"},
+      {"symbol": "MultiDimOpToLibraryCallPattern", "why": "多维 pattern 基类，提供 getLibraryCallOperands，Vector/Copy 都继承它"},
+      {"symbol": "getLibraryCallOperands", "why": "从 HIVMStructuredOp 接口取库调用操作数，pattern 收操作数的统一入口"},
+      {"symbol": "populateHIVMToStandardConversionPatterns", "why": "把所有 pattern 注册进 pattern set，读者看到 pattern 全景 + isOpsAligned 的传入"},
+      {"symbol": "ConvertHIVMToStandardPass", "why": "本章主 pass 类"},
+      {"symbol": "runOnOperation", "why": "pass 主流程：建 target + 逐 device func 跑 applyPartialConversion"},
+      {"symbol": "addLegalDialect", "why": "标准方言设 legal，转换目标的正面清单"},
+      {"symbol": "addIllegalOp", "why": "HIVM 硬件 op 设 illegal，逼着 partial conversion 把它们全降掉——是『HIVM 方言消失』的机制根据"},
+      {"symbol": "applyPartialConversion", "why": "真正驱动转换的 MLIR API 调用点"},
+      {"symbol": "getOpLibraryCallName", "why": "库函数名从这个接口方法来，mangle 的入口"},
+      {"symbol": "getOpLibraryMaxRank", "why": "库支持的最大 rank，rank 门控与拆循环层数都靠它"},
+      {"symbol": "getEmitCWrapperAttrName", "why": "给库声明打 emit_c_wrapper 属性，是后端按 C ABI 生成 wrapper 的开关，读者需理解为什么是『C 库调用』"},
+      {"symbol": "concatVectorOpLibraryCallName", "why": "向量库名拼装规则 <op>_<rank>d_<type>，worked example 要用"},
+      {"symbol": "getLibraryCallNameForCopyLikeOp", "why": "搬运库名拼装规则 <op>_<src>_to_<dst>_<rank>d_<type>，worked example 要用"},
+      {"symbol": "getTypeName", "why": "元素类型→库名字符串映射（f16→half 等），worked example 名字对不上时读者会困惑"}
+    ]
+  },
+  "mechanisms": [
+    {
+      "id": "m1",
+      "name": "getOrInsert 库声明 + emit func.call：张量级硬件 op 落地为 C 库调用",
+      "kind": "protocol",
+      "source_anchors": ["third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp:L106-L168", "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp:L170-L180"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m2",
+      "name": "库函数名 mangle：getOpLibraryCallName 按 op名/rank/类型/内存域/对齐拼名",
+      "kind": "algorithm",
+      "source_anchors": ["third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HIVM/IR/LibraryFunctionOpInterface/LibraryFunctionOpInterfaceImpl.cpp:L511-L584", "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HIVM/IR/LibraryFunctionOpInterface/LibraryFunctionOpInterfaceImpl.cpp:L30-L37", "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HIVM/IR/LibraryFunctionOpInterface/LibraryFunctionOpInterfaceImpl.cpp:L91-L113", "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HIVM/IR/HIVMImpl.cpp:L456-L496"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m3",
+      "name": "reduceMemrefsToNestedFor：rank>maxRank 时把 memref 按轴拆成嵌套 scf.for + subview",
+      "kind": "algorithm",
+      "source_anchors": ["third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp:L229-L338"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m4",
+      "name": "pattern 三形态分类：直接调库 / rank 门控 / 按轴拆循环",
+      "kind": "dataflow",
+      "source_anchors": ["third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp:L345-L419", "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp:L910-L964", "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp:L541-L585"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m5",
+      "name": "ConvertHIVMToStandardPass 主流程：target 定 legal/illegal + 逐 device func applyPartialConversion",
+      "kind": "protocol",
+      "source_anchors": ["third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp:L1823-L1903", "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp:L1751-L1809"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m6",
+      "name": "同步参数透传：矩阵/fixpipe 把 ch24 插好的 syncRelatedArgs + unit-flag 追加到库调用",
+      "kind": "protocol",
+      "source_anchors": ["third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp:L370-L385", "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp:L476-L494"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m7",
+      "name": "调库前的类型规范化：memref 统一成动态 strided layout + emit_c_wrapper",
+      "kind": "layout",
+      "source_anchors": ["third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp:L55-L104", "third_party/ascend/AscendNPU-IR/bishengir/lib/Conversion/HIVMToStandard/HIVMToStandard.cpp:L122-L124"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m8",
+      "name": "下降链收官在流水线中的位置：optimize-hivm-pipeline 末站 + convert-to-hivm 上游喂料",
+      "kind": "config",
+      "source_anchors": ["third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HIVM/Pipelines/HIVMPipelines.cpp:L365-L382", "third_party/ascend/AscendNPU-IR/bishengir/lib/Dialect/HIVM/Pipelines/ConvertToHIVMPipeline.cpp:L29-L44", "third_party/ascend/AscendNPU-IR/bishengir/test/Dialect/HIVM/hivm-pipeline.mlir:L1-L19"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    }
+  ],
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_payoff": [],
+    "note": "bible.py due ch25 返回空（无应埋/应回收登记项）"
+  }
+}

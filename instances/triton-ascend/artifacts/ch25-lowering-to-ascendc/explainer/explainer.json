@@ -1,0 +1,116 @@
+{
+  "chapter": "ch25",
+  "note": "本章降的是编译器内部的 MLIR conversion pass（ConvertHIVMToStandardPass，C++），无 host 可跑精简版；库名 mangle 与 rank 拆循环发生在编译期 pattern 重写。所有数字从源码常量直接推演，逐项标 file:Lxxx；手工推演台账见 explainer/traces/derivation.md。",
+  "mechanisms": [
+    {
+      "mechanism_id": "m1",
+      "intuition": "把张量级硬件 op 交给库，就像餐厅前台不自己下厨：hivm.vadd 这道『菜』不再被展开成一堆标量循环，而是前台在菜单末尾登记一次这道菜的名字（getOrInsert 一条外部函数声明），然后在座位上写一张点单（一条 func.call）。同名的菜只登记一次，后面再点直接复用同一行菜单。真正的烹饪（用满 Cube/Vector 单元的手工优化 kernel）留给后厨（AscendC 运行库）。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m1-libcall",
+          "claim": "一个 illegal 的 hivm.vadd 被重写成两样东西：module 末尾一条 getOrInsert 的 private func.func 外部声明（同名仅首次插入、打三个属性），加原地一条 func.call——HIVM op 就此消失。",
+          "template": "before-after",
+          "numbers": [
+            {"label": "去重开关：lookupSymbol 命中则跳过插声明", "value": "L114", "provenance": "HIVMToStandard.cpp:L114 (if (!mod.lookupSymbol(...)))"},
+            {"label": "声明属性1 emit_c_wrapper（按 C ABI 生成 wrapper）", "value": "L123", "provenance": "HIVMToStandard.cpp:L123-L124"},
+            {"label": "声明属性2 hacc always_inline（后端把库实现内联回来）", "value": "L126", "provenance": "HIVMToStandard.cpp:L126-L128"},
+            {"label": "声明属性3 private（外部符号、无 body）", "value": "L130", "provenance": "HIVMToStandard.cpp:L130 (funcOp.setPrivate())"},
+            {"label": "emit 一条 func.call（传类型规范化后的操作数）", "value": "L165", "provenance": "HIVMToStandard.cpp:L165-L167"},
+            {"label": "replaceOp 把原 HIVM op 换掉", "value": "L179", "provenance": "HIVMToStandard.cpp:L179 (replaceWithLibCall)"}
+          ],
+          "caption_draft": "createLibCall 是全书唯一真正落地『张量级 op → C 库调用』的函数：库名去重 + 一条 call。左边 hivm.vadd（memref 语义），右边 = 一条 `func.func private @vadd_1d_half`（emit_c_wrapper + always_inline）声明 + 一条 `func.call @vadd_1d_half`，原 op 被 replaceOp 抹去。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m2",
+      "intuition": "库函数名就像螺丝的规格标签：同一种『加法』螺丝，1 毫米和 3 毫米、不锈钢和铜、装在这个孔还是那个孔，都是不同型号，必须写全规格才能领对货。getOpLibraryCallName 就是这台打标机——把 op 名、维度、数据类型（搬运还含源/目的内存域）逐字段拼成一个确定的字符串，pattern 只管拿这个名字去点货、不自己拼名。",
+      "worked_example": {
+        "params": {"ops": "vadd(1D f16), vadd(5D f16), vmul(2D f32), load(gm→UB 1D f16), store(UB→gm 1D f16), mmadL1(f16→f32), nd2nz(f16)", "maxRank_vector": "3", "clamp": "rank' = min(rank, maxRank)"},
+        "trace_source": "manual",
+        "manual_reason": "库名 mangle 发生在编译期 C++ pattern 重写（getOpLibraryCallName）里，无 host 可跑精简版；观测其输出需构建 bishengir-opt 全套 LLVM/MLIR+Ascend 工具链（本环境无）。名字逐字段从源码常量推演，见 explainer/traces/derivation.md，各字段规则标 file:Lxxx。",
+        "table": {
+          "columns": ["op", "原始 rank", "库 maxRank", "rank'=min", "元素类型→库名", "内存域", "拼出的库函数名"],
+          "rows": [
+            ["hivm.hir.vadd", "1", "3", "1", "f16→half", "UB", "vadd_1d_half"],
+            ["hivm.hir.vadd", "5", "3", "3", "f16→half", "UB", "vadd_3d_half"],
+            ["hivm.hir.vmul", "2", "3", "2", "f32→float", "UB", "vmul_2d_float"],
+            ["hivm.hir.load", "1", "3", "1", "f16→half", "gm→ubuf", "load_gm_to_ubuf_1d_half"],
+            ["hivm.hir.store", "1", "3", "1", "f16→half", "ubuf→gm", "store_ubuf_to_gm_1d_half"],
+            ["hivm.hir.mmadL1", "—", "NoMaxRank", "—", "f16→float", "—", "mmadL1_half_to_float"],
+            ["hivm.hir.nd2nz", "—", "NoMaxRank", "—", "f16→half", "—", "nd2nz_half"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "getOpLibraryCallName 是一个确定性全函数：任给 (op名, rank', elemType, [srcScope,dstScope]) 必产出唯一字符串，且 rank' 恒落在 [1, maxRank]；配合 createLibCall 里 lookupSymbol 去重，同规格的 op 全局只插一条声明。",
+        "argument": "名字由有限字段的顺序拼接构成，无循环无递归，故必然终止且单值——同输入同输出（基例）。rank' = min(rank, maxRank)（LibraryFunctionOpInterfaceImpl.cpp:L52）把任意 rank 钳到 [1, maxRank]，保证名字里的维度后缀落在库实现的范围内（归纳步：任意大 rank 都映到 ≤maxRank 的合法后缀）。去重由 lookupSymbol(L114) 保证：字符串相等⇒符号命中⇒不重复插声明，故『名字确定』直接推出『声明唯一』。",
+        "source": "LibraryFunctionOpInterfaceImpl.cpp:L30-L37,L47-L53,L91-L113; HIVMImpl.cpp:L456-L496; HIVMToStandard.cpp:L114"
+      },
+      "quantified": "本例 7 个 op 拼出 7 个互不相同的库名 → module 末尾插 7 条不同的 func.func 声明；若把第 1、2 行都换成 1D f16 的 vadd，两者同名 vadd_1d_half，则声明只插 1 条、point 2 条 call（去重生效）。mangle 本身对每个 op 是 O(字段数)=O(1) 的字符串拼接，与张量大小无关。数据类型映射为查表 O(1)（f16→half 等，HIVMImpl.cpp:L456-L496）。"
+    },
+    {
+      "mechanism_id": "m3",
+      "intuition": "库函数只会处理最多 3 维的小盒子，可你手里是个 5 维的大柜子。办法不是重造库，而是把最外两层抽屉一层层拉开：外层每拉开一格（一层 scf.for），就露出里面一个 3 维小盒子（一个 rank-3 的 subview），对这个小盒子调一次库。拉完所有外层组合，整柜就处理完了——库只需懂小盒子，编译器负责一格格喂。",
+      "worked_example": {
+        "params": {"op": "hivm.hir.vadd", "input_type": "memref<2x3x4x8x16xf16> (rank=5)", "maxRank": "3 (VAddOp, L1122)", "reduced_axes": "[0, rank-maxRank) = [0,2) = {0,1}", "outer_dims": "2 与 3", "inner_subview": "memref<4x8x16xf16> (rank=3)"},
+        "trace_source": "manual",
+        "manual_reason": "reduceMemrefsToNestedFor 在编译期 pattern 重写里生成 scf.for + memref.subview，无 host 可跑精简版；观测需 bishengir-opt 全套工具链（本环境无）。循环次数/subview 形状从 rank 与 maxRank 常量推演，见 explainer/traces/derivation.md；源码自带 Example（HIVMToStandard.cpp:L300-L323，rank=6 拆 [1,4)）为佐证。",
+        "table": {
+          "columns": ["轮次", "i0∈[0,2)", "i1∈[0,3)", "subview offset", "subview 类型", "生成的调用"],
+          "rows": [
+            ["1", "0", "0", "[0,0,·]", "memref<4x8x16xf16>", "func.call @vadd_3d_half"],
+            ["2", "0", "1", "[0,1,·]", "memref<4x8x16xf16>", "func.call @vadd_3d_half"],
+            ["3", "0", "2", "[0,2,·]", "memref<4x8x16xf16>", "func.call @vadd_3d_half"],
+            ["4", "1", "0", "[1,0,·]", "memref<4x8x16xf16>", "func.call @vadd_3d_half"],
+            ["5", "1", "1", "[1,1,·]", "memref<4x8x16xf16>", "func.call @vadd_3d_half"],
+            ["6", "1", "2", "[1,2,·]", "memref<4x8x16xf16>", "func.call @vadd_3d_half"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "拆循环后每条库调用的操作数 rank 恒等于 maxRank，且循环嵌套深度恰为 rank-maxRank（≥0 有限），故过程必然终止、且终态没有超出库能力的高维调用。",
+        "argument": "基例 rank ≤ maxRank：不进拆循环分支（HIVMToStandard.cpp:L934 的 if），直接一条 call，rank 本就合法。归纳步 rank > maxRank：reduceMemrefsToNestedFor(...,0,rank-maxRank)（L936-L940）对每个被拆轴 dim∈[0,rank-maxRank) 生成一层 scf.for，循环体内 subview 把这些轴 rank-reduce 掉（size=1 且丢维，L229-L338）→ 结果 rank = rank-(rank-maxRank)=maxRank，严格降到目标。被拆轴数 = rank-maxRank 是有限正整数，循环深度有限、每层 for 上界是该轴静态尺寸，故总迭代次数 = 各被拆轴尺寸之积（有限）→ 必然停机。",
+        "source": "HIVMToStandard.cpp:L229-L338,L920-L964; LibraryFunctionOpInterfaceImpl.cpp:L47-L53,L1122"
+      },
+      "quantified": "本例 R=5、M=3 → 拆 R-M=2 层 scf.for；库调用次数 = 被拆轴尺寸之积 = 2×3 = 6；每条调用的 subview rank = M = 3（memref<4x8x16xf16>）。一般地：调用次数 = ∏_{i∈[0,R-M)} dim_i，深度 = R-M；等价于把张量沿高 R-M 维串行化、内 M 维交给库并行（对照 dossier.theory 第 2 条）。若 R≤M（如 3D vadd）则次数=1、深度=0，退化为直接一条 call。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m3-ranksplit",
+          "claim": "rank=5 的 vadd 超过库 maxRank=3，reduceMemrefsToNestedFor 把外 2 轴（size 2、3）拆成 2 层嵌套 scf.for，循环体内对 rank-3 subview（memref<4x8x16xf16>）调库，共 2×3=6 条 func.call @vadd_3d_half。",
+          "template": "tensor-flow",
+          "numbers": [
+            {"label": "输入张量 rank", "value": "5", "provenance": "worked_example params (memref<2x3x4x8x16xf16>)"},
+            {"label": "库支持 maxRank（VAddOp）", "value": "3", "provenance": "LibraryFunctionOpInterfaceImpl.cpp:L1122"},
+            {"label": "被拆轴数 = 嵌套 scf.for 层数 = rank-maxRank", "value": "2", "provenance": "HIVMToStandard.cpp:L936-L940 (reduceMemrefsToNestedFor(...,0,rank-maxOpRank))"},
+            {"label": "外轴 0 尺寸（最外层 for 上界）", "value": "2", "provenance": "worked_example params (dim0)"},
+            {"label": "外轴 1 尺寸（内层 for 上界）", "value": "3", "provenance": "worked_example params (dim1)"},
+            {"label": "总库调用次数 = 外轴尺寸之积", "value": "6", "provenance": "derivation.md m3 逐轮表（2×3）"},
+            {"label": "内层 subview rank（= maxRank）", "value": "3", "provenance": "HIVMToStandard.cpp:L229-L338 (rank-reduced subview → memref<4x8x16xf16>)"}
+          ],
+          "caption_draft": "高维张量不重造库、而是编译期拆循环喂库：外 2 维变 2 层 scf.for，每格切一个 rank-3 subview 调一次 vadd_3d_half，6 次调完。库只需懂 ≤maxRank 维，维度自由留给编译器。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m4",
+      "intuition": "45+ 个硬件 op 看着吓人，其实只有三张脸：一类操作数拿来就能直接点单（矩阵/格式转换/fixpipe，不设 rank 上限）；一类要先量身高——够矮（rank≤maxRank）直接点、太高先拆几层循环再点（普通向量 op、搬运 op）；一类天生沿某条语义轴才有意义（规约/转置/累积/广播），必须按指定轴拆循环再点。认得这三张脸，整章 pattern 就都对上号了。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m4-threeforms",
+          "claim": "populate 进同一 pattern set 的 45+ 个硬件 op pattern 全落在三种形态：直接调库（无 rank 门控）、rank 门控（超 maxRank 才拆循环）、按轴拆循环（沿语义轴），差别只在『调库前要不要拆循环、按哪些轴拆』。",
+          "template": "flow",
+          "numbers": [
+            {"label": "形态A 直接调库 · MmadL1Op（NoMaxRank）", "value": "L1167", "provenance": "LibraryFunctionOpInterfaceImpl.cpp:L1167 (REGISTER_NO_MAX_RANK(MmadL1Op))"},
+            {"label": "形态A 直接调库 · ND2NZOp / FixpipeOp（NoMaxRank）", "value": "L1160", "provenance": "LibraryFunctionOpInterfaceImpl.cpp:L1160-L1161"},
+            {"label": "形态B rank 门控 · VAddOp maxRank=3（rank≤3 直调，否则拆）", "value": "3", "provenance": "LibraryFunctionOpInterfaceImpl.cpp:L1122; HIVMToStandard.cpp:L934"},
+            {"label": "形态B rank 门控 · LoadOp/StoreOp/CopyOp maxRank=3", "value": "3", "provenance": "LibraryFunctionOpInterfaceImpl.cpp:L1156-L1158"},
+            {"label": "形态C 按轴拆循环 · VReduce/VTranspose/VBrc（InferMaxRank，沿语义轴）", "value": "L1107", "provenance": "LibraryFunctionOpInterfaceImpl.cpp:L1107-L1110"},
+            {"label": "三形态共用出口 createLibCall（getOrInsert 声明 + emit call）", "value": "L106", "provenance": "HIVMToStandard.cpp:L106-L168"}
+          ],
+          "caption_draft": "HIVM→Standard 的 pattern 全景 = 三形态殊途同归：无论直接调库、rank 门控还是按轴拆循环，最后都汇到同一个 createLibCall 出口把 op 变成 func.call。看懂这张分类图，就不必逐个读 45+ 个 pattern。"
+        }
+      ]
+    }
+  ]
+}
