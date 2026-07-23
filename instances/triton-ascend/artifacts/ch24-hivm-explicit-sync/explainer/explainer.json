@@ -1,0 +1,282 @@
+{
+  "chapter": "ch24",
+  "title": "HIVM 显式同步——达芬奇为什么必须把同步摆到 IR 里、怎么摆",
+  "trace_provenance_note": "本章无精简版(implementation/ 缺席)。三条 pass(-hivm-inject-sync / -hivm-inject-block-sync / -hivm-cross-core-gss)活在 bishengir-opt 里,需从头构建整套 BiShengIR/MLIR 工具链方能运行,host 无预构建二进制、无 CUDA,跑不起来。改用上游 lit 夹具的 `// CHECK:` 行作地面真值——这些行是 pass 的**期望输出**,上游 CI 每次用 FileCheck 对着它校验,等价于 pass 的可复现真实产出。抽取脚本 traces/extract_fixture_checks.py → traces/fixture_checks.json;同名函数去重盲区由 traces/cross_core_manual_notes.md 手抄补齐。所有 trace_source=manual,数字均标夹具锚点或 file:Lxxx。",
+  "mechanisms": [
+    {
+      "mechanism_id": "m1",
+      "intuition": "一个达芬奇核像一条厨房流水线上并排的几个师傅:MTE2 负责把食材从冷库(gm)搬到备料台(L1)、M 师傅炒(矩阵)、V 师傅拌(向量)、FIX 师傅摆盘、MTE3 端菜出去(搬回 gm)。每个师傅只顾埋头按自己的清单干活、彼此不看对方进度;更要命的是这间厨房没有领班盯着谁等谁。于是 V 师傅可能在 MTE2 还没把食材搬到台上时就伸手去拌——拌到一半的空气。谁都不会自动喊停,得有人把'等 MTE2 摆好再动手'这句话明写在清单上。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m1-engines-race",
+          "template": "swimlane",
+          "claim": "达芬奇一个核内 6+ 条异步引擎各跑各的指令流、互不知情,硬件不自动检测跨引擎数据依赖——生产者没写完、消费者就可能开读到脏数据。",
+          "numbers": [
+            {"name": "搬运引擎数(MTE1/MTE2/MTE3)", "value": "3", "provenance": "HIVMDMAOps.td:L64(load=MTE2)/L146(store=MTE3);MTE1 见 ch23 引擎枚举"},
+            {"name": "计算/定点引擎(M 矩阵 / V 向量 / FIX 定点 / S 标量)", "value": "4", "provenance": "GetPipe.cpp:L41-L45(UB→UB=V, L0C→GM=FIX);fixpipe=FIX 见 HIVMDMAOps.td:L272"},
+            {"name": "核内每 pipe-pair 同步信号位上限", "value": "8", "provenance": "SyncEventIdAllocation.h:L29 kTotalEventIdNum=8"}
+          ],
+          "caption_draft": "同一核里 MTE2/MTE3/M/V/FIX/S 是各自顺序、彼此乱序的独立泳道;硬件不建跨泳道依赖,红色竞态(V 读到 MTE2 未写完的 buffer)只能靠编译器显式插同步 op 挡住。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m2",
+      "intuition": "set_flag / wait_flag 就像两个师傅之间的一面小旗:生产者干完活把旗立起来(set),消费者动手前先盯着这面旗、没立起来就干等(wait)。一面旗 = 一个 event id。pipe_barrier 则是同一个师傅对自己说'把手上这批全做完再做下一批'——同引擎本就排队,不需要旗,一句串行令即可。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m2-handshake",
+          "template": "swimlane",
+          "claim": "set_flag/wait_flag 是跨引擎的一对信号(生产者 pipe 置位、消费者 pipe 等待、共享一个 event id);pipe_barrier 是同引擎的单参串行屏障。",
+          "numbers": [
+            {"name": "set_flag/wait_flag 参数:set_pipe, wait_pipe, event_id", "value": "3", "provenance": "HIVMSynchronizationOps.td:L45-L48(SetFlagOp arguments)"},
+            {"name": "pipe_barrier 参数:pipe", "value": "1", "provenance": "HIVMSynchronizationOps.td:L74(PipeBarrierOp arguments = ins HIVM_PipeAttr:$pipe)"},
+            {"name": "基本例握手 event id 编号(EVENT_ID0)", "value": "0", "provenance": "inject-sync.mlir:L17(@test_mem_injcet_sync_basic)set_flag[<PIPE_MTE2>,<PIPE_V>,<EVENT_ID0>]"}
+          ],
+          "caption_draft": "生产者引擎(MTE2)干完在 pipeAfter 立 set_flag、消费者引擎(V)在 pipeBefore 等 wait_flag,两者 set_pipe/wait_pipe 一致、共用 EVENT_ID0,建立 write≺read;同引擎则退化为一条 pipe_barrier。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m3",
+      "intuition": "编译器判'两步之间要不要同步',全看它们碰的是不是同一块内存。就像两个人是否会撞手,只需看他们伸向的抽屉:抽屉不在同一个柜子(不同内存空间,如一个在 UB 一个在 L1)——绝不可能撞;同一个柜子里,再看抽屉编号区间 [起, 起+大小) 有没有交叠。地址说不准(变量地址)就宁可假定会撞。",
+      "worked_example": {
+        "params": {"fixture": "inject-sync.mlir @test_mem_injcet_sync_basic + @test_injcet_sync_two_event_id", "buffer_type": "memref<16x16x16xf16>", "byte_size_per_buffer": "16*16*16*2 = 8192 B", "ub_offsets_bytes": [0, 8192, 16384, 24576]},
+        "trace_source": "manual",
+        "manual_reason": "pass 需 bishengir-opt(整套 MLIR 工具链)才能跑,host 无二进制。地面真值取自 lit 夹具:MemAlias 建的边等价于夹具中同步 op 落在哪两个 op 之间(traces/fixture_checks.json);byte 区间由 memref 形状 16*16*16*2=8192 与夹具 pointer_cast 偏移常量(0/8192/16384/24576)算出。",
+        "table": {
+          "columns": ["候选对", "空间A / 空间B", "区间A(字节)", "区间B(字节)", "重叠?", "建生产者-消费者边?"],
+          "rows": [
+            ["load 写 %0 ↔ vadd 读 %0", "UB / UB", "[0, 8192)", "[0, 8192)", "是(同址)", "是 → load→vadd"],
+            ["vadd 读 %4 ↔ load 写 %0", "UB / UB", "[8192, 16384)", "[0, 8192)", "否(相邻不交)", "否"],
+            ["链0 vadd 写 %0 ↔ 链1 vadd 写 %2", "UB / UB", "[0, 8192)", "[8192, 16384)", "否", "否(两条链独立,无跨链同步)"],
+            ["(反例)UB 里的 buffer ↔ L1/gm 里的 buffer", "UB / L1", "任意", "任意", "否(异空间短路)", "否"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "保守性不变量:凡真有数据重叠的一对(同空间且区间相交)必被判为有依赖;地址/大小不确定时退化为'有依赖'(宁多勿漏)。漏判(真重叠却判无依赖)不可能发生。",
+        "argument": "MemAlias 三分支全覆盖:①addressSpaceA≠addressSpaceB → return false(物理上不可能同址,安全);②a->rootBuffer==b->rootBuffer → return true;③否则 isBufferAddressRangeOverlap 按 [addr,addr+size) 相交判,且 hasVariableAddress 支保守 return true。三支穷尽,唯一返回 false 的是'确定不同空间'或'确定区间不交'——两者都真无重叠。故正确性由'不漏'保证,代价只是可能多判(不同 rootBuffer 的保守假定)。"
+      },
+      "quantified": "基本例 3 个计算 op → 至多 C(3,2)=3 个候选对;实际只建 2 条边(load→vadd、vadd→store),第 3 对(load%0 与 vadd%4)因区间 [0,8192) 与 [8192,16384) 不交被剔除。单缓冲下每对 MemAlias 是 1×1=1 次区间比较,总 3 次;地址区间判 isBufferOverlap 复杂度 O(baseAddr_a × baseAddr_b),多缓冲才 >1。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m4",
+      "intuition": "拿到一条'A 产、B 消'的依赖,编译器只问一句:A 和 B 是不是同一个师傅?是——一句 pipe_barrier 让这个师傅把前半批做完再做后半批就够(同引擎本就排队);不是——才需要立旗:在 A 后面 set_flag、在 B 前面 wait_flag,一对信号跨引擎建立先后。",
+      "worked_example": {
+        "params": {"fixture": "inject-sync.mlir @test_mem_injcet_sync_basic(异 pipe)+ @test_injcet_sync_if_else(同 pipe)", "chain": "load(MTE2) → vadd(V) → store(MTE3)"},
+        "trace_source": "manual",
+        "manual_reason": "同 m3:pass 跑不起,取夹具 CHECK 行作真值(traces/fixture_checks.json)。基本例注入 5 条同步 op、if_else 例注入 pipe_barrier[<PIPE_MTE2>],逐条与 InsertSyncOperation 的同/异 pipe 二分支对账。",
+        "table": {
+          "columns": ["生产者→消费者", "front pipe", "now pipe", "同引擎?", "注入的同步 op"],
+          "rows": [
+            ["load → vadd", "MTE2", "V", "否", "set_flag[<PIPE_MTE2>,<PIPE_V>,<EVENT_ID0>](挂 load 后) + wait_flag[<PIPE_MTE2>,<PIPE_V>,<EVENT_ID0>](挂 vadd 前)"],
+            ["vadd → store", "V", "MTE3", "否", "set_flag[<PIPE_V>,<PIPE_MTE3>,<EVENT_ID0>] + wait_flag[<PIPE_V>,<PIPE_MTE3>,<EVENT_ID0>]"],
+            ["load → load(if_else 首两个 load 同引擎)", "MTE2", "MTE2", "是", "pipe_barrier[<PIPE_MTE2>](仅 1 个,无 flag)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "每条有依赖的边被恰好一种同步覆盖:同 pipe → 恰 1 个 pipe_barrier;异 pipe → 恰 1 对 set_flag/wait_flag(共享同一 syncIndex 配对)。无第三种出口。",
+        "argument": "InsertSyncOperation 是全分支二分:if (nowPipe==frontPipe) 走 barrier 分支——造 1 个 TYPE::PIPE_BARRIER 压进 syncIR[now].pipeBefore;else 走 flag 分支——setFlag(TYPE::SET_EVENT)入 syncIR[front].pipeAfter、waitFlag=setFlag->GetMatchSync 入 syncIR[now].pipeBefore,GetMatchSync 保证二者同 syncIndex。两分支覆盖全部情形且各只产一组,故计数确定。",
+        "argument_evidence": "SyncAnalysis.cpp:L861-L887"
+      },
+      "quantified": "基本例 2 条异 pipe 边 → 2×(1 set+1 wait)=4 个 flag op;末尾另有一条 return 前的 pipe_barrier[<PIPE_ALL>] 收尾,合计 5 个同步 op(对齐夹具 CHECK 计数)。若把这两条边都错当同引擎则只需 2 个 barrier——但会漏掉跨引擎 happens-before,读脏数据。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m4-barrier-vs-flag",
+          "template": "before-after",
+          "claim": "同引擎依赖插 1 个 pipe_barrier;异引擎依赖插 1 对 set_flag/wait_flag——基本例 3 条裸 op 经 pass 后夹进 4 个 flag + 1 个收尾 barrier。",
+          "numbers": [
+            {"name": "裸 IR 计算 op 数(load/vadd/store)", "value": "3", "provenance": "inject-sync.mlir:L15-L25 @test_mem_injcet_sync_basic"},
+            {"name": "异 pipe 边 → set/wait 对数", "value": "2", "provenance": "fixture_checks.json:MTE2→V 一对、V→MTE3 一对"},
+            {"name": "收尾 pipe_barrier[<PIPE_ALL>] 数", "value": "1", "provenance": "inject-sync.mlir:L26"},
+            {"name": "同 pipe 依赖 → pipe_barrier 数(if_else 对照)", "value": "1", "provenance": "inject-sync.mlir:L105 pipe_barrier[<PIPE_MTE2>]"}
+          ],
+          "caption_draft": "决策二分一目了然:MTE2→V、V→MTE3 是异引擎,各得一对 set/wait 夹住;而两个相邻 load 同属 MTE2,只需一条 pipe_barrier。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m5",
+      "intuition": "如果 A 已经通过 B 间接跟 C 排好了先后(A→B、B→C 都插了同步),那 A→C 再单独立一面旗就是浪费——旗子(event id)本就稀缺。所以编译器只在'没有任何已有路径能把 A 排到 C 前面'时才补直连同步。但有个陷阱:如果中间那步 B 藏在 if 里、可能根本不执行,这条间接路径就断了,A→C 必须补上直连。",
+      "worked_example": {
+        "params": {"fixture": "inject-sync.mlir @test_mem_injcet_sync_basic(无条件)vs @test_injcet_sync_if(vadd 在 scf.if 内)", "dep_in_question": "load(MTE2) 写 %0 → store(MTE3) 读 %0"},
+        "trace_source": "manual",
+        "manual_reason": "同 m3。两夹具的差异('基本例无 MTE2→MTE3 直连 flag'vs'if 例出现 set_flag[<PIPE_MTE2>,<PIPE_MTE3>]+wait_flag[<PIPE_MTE2>,<PIPE_MTE3>]')直接读 fixture_checks.json 即可对账 isAlreadySync 剪枝是否生效。",
+        "table": {
+          "columns": ["场景", "待判依赖边", "中间节点 vadd", "被传递覆盖?", "补插 MTE2→MTE3 直连同步?"],
+          "rows": [
+            ["基本例(无条件)", "load → store", "vadd(V)无条件夹在中间", "是:load→vadd(MTE2→V)与 vadd→store(V→MTE3)两跳已同步", "否 — 夹具里 0 对 MTE2→MTE3 flag"],
+            ["if 例(条件)", "load → store", "vadd 落在 scf.if 内,分支不取时不执行", "否:间接路径可能断", "是 — 补 1 对 set_flag[<PIPE_MTE2>,<PIPE_MTE3>]+wait_flag[<PIPE_MTE2>,<PIPE_MTE3>]"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "已插同步集是依赖 DAG 的传递归约:一条边当且仅当无已有同步路径能传递覆盖它时才被插入;删去任一被覆盖的冗余同步,可达性(happens-before 闭包)不变。",
+        "argument": "MemAnalyze 首门 isAlreadySync(now,front) 检查该依赖是否已被更近记录覆盖,覆盖则直接 return 不插。新一代 GraphSolver.runDijkstra 把 (core,pipe) 建图、已有同步是带 [startIndex,endIndex] 的边,对待满足依赖跑最短路——src 能在时序窗内到达 dst 即冗余、跳过。条件分支使'中间跳存在'不再恒真 → 覆盖路径可能断 → 必补直连。单调量:每补一条边至少新增 1 个此前不可达的 (生产者,消费者) 对(否则被剪),故同步集无冗余且有限。",
+        "argument_evidence": "SyncAnalysis.cpp:L531-L535 / GraphSyncSolver/GraphSolver.cpp:L122-L177"
+      },
+      "quantified": "基本例:load→store 这条边被 load→vadd→store 覆盖,省下 1 对 flag——否则总同步 op 会从实际的 5 个涨到 7 个(多 1 对 MTE2→MTE3)。if 例:因 vadd 条件化,恰好把这 1 对补回来(夹具 L151/L160 各 1 条),印证'覆盖失效即补插'。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m5-transitive-reduction",
+          "template": "before-after",
+          "claim": "load→vadd→store 时 load→store 依赖被传递覆盖、不插直连同步;一旦 vadd 落入条件分支使覆盖路径可能断,就补一对 MTE2→MTE3 直连。",
+          "numbers": [
+            {"name": "基本例中 load→store 直连 flag 对数", "value": "0", "provenance": "inject-sync.mlir:L4-L29,fixture_checks.json 无 MTE2→MTE3 项"},
+            {"name": "if 例中补插的 MTE2→MTE3 flag 对数", "value": "1", "provenance": "inject-sync.mlir:L151 set_flag[<PIPE_MTE2>,<PIPE_MTE3>] + L160 wait_flag"},
+            {"name": "被覆盖时省下的 event id 消耗", "value": "1", "provenance": "推论:1 对 flag 占 1 个 event id"}
+          ],
+          "caption_draft": "左(无条件):三节点链上 load→store 的虚线依赖被 load→vadd→store 传递覆盖,不实体化;右(条件):vadd 进 if,覆盖路径断,虚线升级成实体 set/wait。可达即冗余,断路即补插。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m6",
+      "intuition": "event id 是稀缺的信号旗,每对引擎之间只有 8 面。分配像给会议室排班:同一对引擎(同池)里,两个握手只要'占用时段'(set 到 wait 的指令区间)不重叠,就能共用一面旗;重叠就得各拿一面。不同引擎对之间是不同的旗架,编号可以各自从 0 数起、互不干扰。",
+      "worked_example": {
+        "params": {"fixture": "inject-sync.mlir @test_injcet_sync_two_event_id(两条并行链)+ @test_widen_sync(8 路占满)", "op_index_order": "load0=0, load1=1, vadd0=2, vadd1=3, store0=4, store1=5"},
+        "trace_source": "manual",
+        "manual_reason": "同 m3。event id 编号直接读夹具 CHECK 行的 <EVENT_IDn>;生命周期区间由同步 op 挂载位置(set 在生产者 pipeAfter、wait 在消费者 pipeBefore)对应的 op 序推出。",
+        "table": {
+          "columns": ["同步对", "池 (src,dst)", "生命周期区间 [set 序, wait 序]", "同池内冲突", "分得 event id"],
+          "rows": [
+            ["链0 MTE2→V", "(MTE2, V)", "[0, 2]", "与链1 [1,3] 重叠", "EVENT_ID0"],
+            ["链1 MTE2→V", "(MTE2, V)", "[1, 3]", "与链0 [0,2] 重叠", "EVENT_ID1"],
+            ["链0 V→MTE3", "(V, MTE3)", "[2, 4]", "与链1 [3,5] 重叠;但与 (MTE2,V) 池异池、互不冲突", "EVENT_ID0(异池复用同号,是不同物理信号位)"],
+            ["链1 V→MTE3", "(V, MTE3)", "[3, 5]", "与链0 [2,4] 重叠", "EVENT_ID1"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "同一 (srcPipe,dstPipe) 池内,两同步对共享 event id ⟺ 生命周期区间不相交;所需 id 数 = 池内冲突图色数 ≤ kTotalEventIdNum=8。",
+        "argument": "ScopePair 把 (src,dst) 编码成池键 (dstT<<8)|srcT,不同 pipe pair 落不同池;SYNC_BLOCK 例外恒返回 0(全局共享)。SetEventId 在该池的 EventCyclePool 里找生命周期不冲突的空闲位复用、冲突则占新位。'生命周期重叠'是对称冲突关系 → 图着色问题,色数 = 最大重叠团大小。kTotalEventIdNum=8 是每池上限,超出触发 widen/多缓冲回退/降级 pipe_all。",
+        "argument_evidence": "SyncEventIdAllocation.cpp:L360-L372(ScopePair)/ SyncEventIdAllocation.h:L29(=8)"
+      },
+      "quantified": "two_event_id:2 条并行链使 (MTE2,V) 池峰值并发 2 → 用 EVENT_ID0/ID1;跨到 (V,MTE3) 池又从 EVENT_ID0 起复用(异池,同号不同位)。widen_sync:8 路展开把单个 (S,MTE2) 池的并发顶到 8,EVENT_ID0..7 全部占满,恰达 kTotalEventIdNum=8 上限——再多一路就得加宽或回退多缓冲。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m6-eventid-lifetime",
+          "template": "state-table",
+          "claim": "两条并行 load→vadd 链因 (MTE2,V) 池内生命周期重叠分到 EVENT_ID0/ID1;跨到 (V,MTE3) 池后编号从 0 复用——分池让同号成为不同物理信号位,8 是每池天花板。",
+          "numbers": [
+            {"name": "(MTE2,V) 池最高 event id 编号(EVENT_ID1)", "value": "1", "provenance": "inject-sync.mlir:L246/L249 EVENT_ID0 与 EVENT_ID1"},
+            {"name": "(V,MTE3) 池最低复用编号(EVENT_ID0)", "value": "0", "provenance": "inject-sync.mlir:L254/L259 EVENT_ID0/EVENT_ID1"},
+            {"name": "单池 event id 硬上限", "value": "8", "provenance": "SyncEventIdAllocation.h:L29 kTotalEventIdNum=8"},
+            {"name": "widen 例占满时最高 event id 编号(EVENT_ID7)", "value": "7", "provenance": "inject-sync.mlir:L446-L453/L512-L519,EVENT_ID0 到 EVENT_ID7"}
+          ],
+          "caption_draft": "横轴指令序、每行一个同步对:同池(同色)内区间重叠者错开到不同 id,不重叠者复用;(MTE2,V) 与 (V,MTE3) 是两个独立旗架,故都能从 EVENT_ID0 起。widen 例 8 路把一池顶满到 kTotalEventIdNum=8。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m7",
+      "intuition": "把裸 IR 变成带同步的 IR,不是一锤子买卖,而是一条六道工序的小流水线:先把弯弯绕绕的 IR 拍平成一串指令(翻译)、再逐条往前找谁跟谁有依赖(规划)、把能提出循环的同步往外挪(外提)、删掉重复的(去冗余)、给每对握手发旗号(分配 event id)、最后把抽象的'这里要同步'落成真的 set_flag/wait_flag(codegen)。只有一条指令时直接收工——没人可等。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m7-six-stage-pipeline",
+          "template": "flow",
+          "claim": "核内同步 pass AutoInjectSync 是六阶段流水线:IRTranslator→Plan→MoveState→RemoveRedundant→EventIdAllocation→Codegen;线性 SyncIR ≤1 条指令时早退。",
+          "numbers": [
+            {"name": "阶段数", "value": "6", "provenance": "InjectSync.cpp:L62-L107(IRTranslator/Plan/StateOptimize/RemoveRedundant/eventIdAllocation/Codegen)"},
+            {"name": "早退阈值 syncIR.size()", "value": "1", "provenance": "InjectSync.cpp:L74 if (syncIR.size() <= 1) return"},
+            {"name": "翻译产物:每个 op → CompoundInstanceElement 数", "value": "1", "provenance": "IRTranslator.cpp:L356-L484,每个 hivm op 变 1 个带 def/use+pipe 的 element"}
+          ],
+          "caption_draft": "六个方框顺序串接、数据是同一份 SyncIR:翻译建线性表 → 规划找依赖插同步 → 外提循环不变量 → 删传递冗余 → 分配 event id → 落成真 op;开头一道 size≤1 早退闸。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m8",
+      "intuition": "Cube 核和 Vector 核是两颗物理核,各自的片上小仓库(L1/UB)对方看不见,唯一能交接货的地方是公共大仓库 gm。所以跨核握手比核内更重:Cube 把算好的结果经 FIX(定点)引擎落到 gm,立一面'跨核旗'(sync_block_set);Vector 要用这批数据前先等这面旗(sync_block_wait),等到了再从 gm 搬进自己的 UB。这套旗走的是专门的 FFTS 硬件通道,总共只有 16 面。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m8-cross-core-handshake",
+          "template": "swimlane",
+          "claim": "Cube 把结果经 FIX 落 gm 后 sync_block_set 置位,Vector sync_block_wait 等到再从 gm 读——两颗物理核经 FFTS+global memory 握手,Cube 侧默认等 PIPE_FIX、Vector 侧默认等 PIPE_MTE3。",
+          "numbers": [
+            {"name": "test_block_sync_normal 跨核握手 flag 编号", "value": "0", "provenance": "inject-block-sync.mlir:L58-L59 sync_block_set/wait[<...>,<PIPE_FIX>,<PIPE_S>] flag=0"},
+            {"name": "跨核 flag 全局上限", "value": "16", "provenance": "SyncEventIdAllocation.h:L35 kBlockSyncSetWaitEventIdNum=16;InjectBlockSync.cpp:L129 0x0f & flagIdCnt++"},
+            {"name": "跨核 block sync 保留 event id", "value": "2", "provenance": "SyncEventIdAllocation.cpp:L170 reservedBlockSyncEventIdNum=2"}
+          ],
+          "caption_draft": "三泳道 Cube / gm / Vector:Cube 的 fixpipe(FIX 引擎,cubePipeAttr=PIPE_FIX 见 InjectBlockSync.cpp:L141-L145)把结果写进 gm 缓冲后立 sync_block_set flag=0,Vector 的 load 前 sync_block_wait flag=0;Vector 侧默认等 PIPE_MTE3(L146-L147),数据必经 gm、信号走 FFTS,全核只有 16 面跨核旗。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m9",
+      "intuition": "跨核同步只在'一颗 kernel 里既有 Cube 段又有 Vector 段'(MIX 核)时才需要;纯 Cube 或纯 Vector 的 kernel 根本没有跨核交接,pass 直接跳过。真要插时,先给这颗核设好 FFTS 基址(跨核旗走 FFTS 硬件收集,得知道去哪写),再看融合方式:浅融合(matmul 后接逐元素)走简单的逐算子插法,深融合(Cube/Vector 反复交错)复用核内那套依赖分析、只是改成产跨核旗。",
+      "worked_example": {
+        "params": {"fixture": "inject-block-sync.mlir @test_block_sync_normal(MIX_CV)+ @matmul_add_mul(SHALLOW_CV)+ @add_mul_0(纯 AIV,早退)", "exchange_buffer": "arg2(gm)"},
+        "trace_source": "manual",
+        "manual_reason": "同 m3;跨核 pass 尤其依赖整套工具链。地面真值:test_block_sync_normal 注入 1 对 sync_block_set/wait(flag=0)、matmul_add_mul 注入 sync_block[ALL_CUBE]+set/wait(flag=1),见 traces/cross_core_manual_notes.md(手抄补 extract 去重盲区)。",
+        "table": {
+          "columns": ["夹具", "fusion_kind", "生产者(核,引擎)", "消费者(核,引擎)", "交换缓冲", "注入的跨核 op(flag)"],
+          "rows": [
+            ["test_block_sync_normal", "MIX_CV", "Cube, FIX(fixpipe 写 gm)", "Vector, MTE2(load 读 gm)", "arg2 (gm)", "sync_block_set[<CUBE>,<PIPE_FIX>,<PIPE_S>] + sync_block_wait[<VECTOR>,<PIPE_FIX>,<PIPE_S>](flag=0)"],
+            ["matmul_add_mul", "SHALLOW_CV", "Cube, FIX(matmul→fixpipe)", "Vector, MTE2(add_mul 段)", "SSA tensor + gm", "sync_block[<ALL_CUBE>,0] tcube_pipe=<PIPE_FIX> + set/wait[<CUBE/VECTOR>,<PIPE_FIX>,<PIPE_MTE2>](flag=1)"],
+            ["add_mul_0(纯 AIV 子函数)", "PURE_ELEMWISE", "—", "—", "—", "无:func_core_type≠MIX,runOnOperation 早退"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "跨核同步被注入 ⟺ func_core_type==MIX 且存在经 gm 的 Cube↔Vector 生产-消费;非 MIX 核(纯 AIC / 纯 AIV / host)pass 直接 return、零注入。",
+        "argument": "runOnOperation 三道早退闸顺序把关:①isHost(funcOp) → return;②queryFuncCoreType 无值或 ≠ TFuncCoreType::MIX → return;唯 MIX 继续。继续后先 insertSetFFTSBaseAddrOp(跨核旗需基址),再按 fusion_kind 二分派 ShallowCV / MixCV。故单核 kernel 永不产 block sync,跨核 op 仅现于双核并存的 MIX kernel——与 m3 的内存依赖判据正交:MIX 是必要条件、gm 重叠是充分触发。",
+        "argument_evidence": "InjectBlockSync.cpp:L468-L508"
+      },
+      "quantified": "test_block_sync_normal:1 条跨核 gm 依赖(fixpipe 产 arg2、load 消费)→ 1 对 sync_block(2 个 op)+ 1 个 set_ffts_base_addr,共 3 个注入 op。相比核内 flag(纳秒级片上信号),这一对跨核握手要走 FFTS 硬件 + gm,重得多——正是编译器'尽量把计算留同核、只在必须跨核的边界插 block sync'的成本动机。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m10",
+      "intuition": "跨核旗和核内旗的记账方式不一样。核内旗按'引擎对'分成一格格旗架(每架 8 面),同架才谈复用;跨核旗则是一个全局大池,不分方向,总共 16 面,谁要谁从同一个计数器领下一个号。所以哪怕是两个完全不同方向的跨核依赖(Cube→Vector 和 Vector→Cube),它们的旗号也是从这同一个全局计数器顺次发下来的 0、1。",
+      "worked_example": {
+        "params": {"fixture": "sync-solver-cross-core.mlir @test_block_sync_loop(CrossCoreGSS,循环内 Cube/Vector 交替)", "loop": "scf.for %c0 to %c16 step %c4", "exchange_buffer": "arg2(gm),跨迭代复用"},
+        "trace_source": "manual",
+        "manual_reason": "同 m3;-hivm-cross-core-gss 更需完整工具链。两个全局 flag(0,1)及外提位置手抄自 sync-solver-cross-core.mlir:L60-L90(见 traces/cross_core_manual_notes.md;此函数与另一同名函数触发 extract 脚本去重盲区,故手抄)。",
+        "table": {
+          "columns": ["同步对", "方向(核→核)", "引擎 tpipe", "flag id", "全局池(scope=0)?", "外提循环?"],
+          "rows": [
+            ["flag=0 set/wait", "Cube → Vector(RAW)", "PIPE_FIX(等定点写完 gm)", "0", "是", "否,留在循环体(每轮 fixpipe→load)"],
+            ["flag=1 set/wait", "Vector → Cube(WAR back-edge)", "PIPE_MTE2(Vector 读完 arg2 才可覆写)", "1", "是", "是:set 提到循环前(L69)、wait 沉到循环后(L88)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "跨核 flag id 来自单个全局池、上限 16;ScopePair 对 block sync 恒返回 0——不按 pipe pair 分池,与核内'每 (src,dst) 池 8 个'正交。两条不同方向的跨核依赖仍从同一全局计数器顺次领号。",
+        "argument": "ScopePair 首支 if type∈{SYNC_BLOCK_SET,SYNC_BLOCK_WAIT} → return 0(注释:event id is global shared,scope pair always same);generateFlagId 返回 0x0f & flagIdCnt++(对 16 取模,故 0..15 循环)。因此 flag=0 的 Cube→Vector 与 flag=1 的 Vector→Cube 虽方向相反,仍共用全局计数器得 0、1。单调量:flagIdCnt 每分配一个新跨核依赖 ++1;同一依赖跨迭代复用同号(不递增),故循环内 flag 数 = 不同跨核依赖数,与迭代次数无关。",
+        "argument_evidence": "SyncEventIdAllocation.cpp:L360-L366(ScopePair)/ InjectBlockSync.cpp:L129(0x0f & flagIdCnt++)"
+      },
+      "quantified": "loop 例 2 条跨核依赖(Cube→Vector 的 RAW、Vector→Cube 的 WAR back-edge)→ 占全局 16 个 flag 位中的 2 个(flag=0、flag=1)。flag=1 的 back-edge 被外提:set 到循环前 1 次 + 每轮体尾续 1 次、wait 每轮体首 1 次 + 循环后收 1 次,与 m12 的核内外提同构,只是这里是跨核旗。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m12",
+      "intuition": "循环里每轮都'先等上一轮把 buffer 腾出来、再装新数据'(双缓冲的 WAR 依赖)。如果每轮都完整立旗+等旗,开销白白重复。聪明的做法:把'第一次的预置'提到循环外头一次搞定、把'最后一次的收尾等待'挪到循环外末尾,循环体内每轮只留必要的那一次续期握手。总账不变,每迭代的净成本降下来。",
+      "worked_example": {
+        "params": {"fixture": "inject-sync.mlir @test_injcet_sync_loop", "loop": "scf.for %c0 to %c1024 step %c128 → 8 迭代", "chain": "load(MTE2) → store(MTE3),buffer %0 跨迭代复用(WAR back-edge MTE3→MTE2)"},
+        "trace_source": "manual",
+        "manual_reason": "同 m3。外提结果直接读夹具 CHECK 行位置(相对 scf.for 的前/内/后),对账 MoveSyncState 的外提逻辑。",
+        "table": {
+          "columns": ["同步 op", "位置", "方向", "作用"],
+          "rows": [
+            ["set_flag[<PIPE_MTE3>,<PIPE_MTE2>,<EVENT_ID0>]", "循环前(L42)", "MTE3→MTE2", "预置'buffer 空闲'信号,让第 0 轮 load 不空等"],
+            ["wait_flag[<PIPE_MTE3>,<PIPE_MTE2>,<EVENT_ID0>]", "循环体首(L44)", "MTE3→MTE2", "每轮 load 前等上轮 store 用完 buffer(WAR)"],
+            ["set_flag[<PIPE_MTE2>,<PIPE_MTE3>] + wait_flag[<PIPE_MTE2>,<PIPE_MTE3>]", "循环体中(L47-L48)", "MTE2→MTE3", "load 写完 → store 读(RAW),留体内每轮跑"],
+            ["set_flag[<PIPE_MTE3>,<PIPE_MTE2>,<EVENT_ID0>]", "循环体尾(L51)", "MTE3→MTE2", "store 用完 buffer,置位供下一轮 load"],
+            ["wait_flag[<PIPE_MTE3>,<PIPE_MTE2>,<EVENT_ID0>]", "循环后(L53)", "MTE3→MTE2", "收尾等末轮 store 完成"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "外提后语义等价:每次迭代的 load 前仍恰有一个与其配对 set 建立 happens-before 的 MTE3→MTE2 wait;set/wait 在整个循环上计数配平。",
+        "argument": "稳态下第 k 轮体尾 set(L51)→ 第 k+1 轮体首 wait(L44)构成跨迭代握手链;边界由循环前 set(L42,喂第 0 轮 wait)与循环后 wait(L53,收末轮 set)补齐。故 MTE3→MTE2 的 set 数 = wait 数(体内各 1 + 边界各 1),配对不丢、happens-before 完整。外提只是把'恒定的首置位/末收尾'从每迭代提到循环边界,体内每轮净剩 1 wait + 1 set。",
+        "argument_evidence": "MoveSyncState.cpp:L1-L232 / inject-sync.mlir:L31-L56"
+      },
+      "quantified": "loop 例 1024/128=8 迭代。WAR back-edge 的首置位与末收尾各外提 1 次(循环前 set、循环后 wait)= 2 次固定开销、与迭代数无关;若不外提,这 2 次握手会在每轮重复,8 迭代多付约 8 倍冗余。体内每轮稳定 1 对 RAW(MTE2→MTE3)+ 1 wait/1 set 的 WAR 续期,event id 始终复用 EVENT_ID0(单缓冲、区间不跨轮重叠)。",
+      "figure_specs": []
+    }
+  ]
+}
