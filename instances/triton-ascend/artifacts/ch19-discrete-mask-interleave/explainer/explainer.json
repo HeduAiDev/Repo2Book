@@ -1,0 +1,302 @@
+{
+  "chapter": "ch19",
+  "title": "不规则访存的驯服：离散掩码拆分与交错访存优化",
+  "note": "skip_impl 章（纯 C++ MLIR pass，无 Python 精简版）。所有 worked_example 均 trace_source=manual：小例是 pin @2badfc89e 源码语义的手工推演，已用 traces/verify_small_examples.py 复刻各 pattern 语义、跑出 traces/verify_small_examples.out.json 校验自洽；真实前后对照以 pin 源码 + unittest/Conversion/General/DiscreteMaskAccess/{loadstore,atomic}.mlir 的 RUN+CHECK 为准。引用源码常量的数字均标 file:Lxxx。",
+
+  "mechanisms": [
+    {
+      "mechanism_id": "m1",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m1-gate",
+          "claim": "本 pass 的总闸复用 ch13 的 MaskState::parse：能还原成连续矩形区间→撤销副作用后放行给结构化 DMA 路径；parse 失败→判定离散、本 pass 接管。",
+          "template": "flow",
+          "numbers": [
+            {"value": "parse 成功 → eraseInsertedOps + return failure()（放行）", "provenance": "DiscreteMaskAccessConversionPass.cpp:L64-L69"},
+            {"value": "parse 失败 → return success()（本 pass 接管）", "provenance": "DiscreteMaskAccessConversionPass.cpp:L71"},
+            {"value": "已标 is_discrete_mask → failure（防重入）", "provenance": "DiscreteMaskAccessConversionPass.cpp:L61-L63"},
+            {"value": "夹具 mask = (idx<200) ori (idx>400) 非连续矩形 → 判离散", "provenance": "loadstore.mlir:L13-L15"}
+          ],
+          "caption_draft": "连续走结构化 DMA、离散才进本 pass——判据就是 MaskState::parse 的成败，与结构化下降链零重复、互斥分流；parse 有副作用 op，判连续时要 eraseInsertedOps 撤回。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m2",
+      "intuition": "把一串用 & 串起来的条件像剥洋葱一样拆成一条条独立的原子条件；只有一层特殊——藏在 broadcast 里的 &，要先像乘法分配律那样把 broadcast 分发到每个因子上，才能看清里面的每个条件。",
+      "worked_example": {
+        "params": {"mask": "broadcast(a & b) & c，其中 a、b、c 为单条 cmp 掩码"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl（纯 C++ pass，无 Python 精简版可运行）。递归拍平是结构变换、无数值，此表按 collectAndLeaves 源码（DiscreteMaskAccessConversionPass.cpp:L78-L102）逐步手工推演；叶子数已在 traces/verify_small_examples.py 的注释对照。",
+        "table": {
+          "columns": ["轮次", "当前节点", "defining op 类型", "动作", "leaves 累积"],
+          "rows": [
+            ["1", "andi(broadcast(a&b), c)", "arith.andi", "拆两枝：recurse lhs、rhs", "[]"],
+            ["2", "broadcast(a&b)", "tt.broadcast(src 是 andi)", "分配律下推：造 broadcast(a)、broadcast(b) 各自 recurse", "[]"],
+            ["3", "broadcast(a)", "tt.broadcast(src 非 andi)", "叶子，push", "[bc(a)]"],
+            ["4", "broadcast(b)", "tt.broadcast(src 非 andi)", "叶子，push", "[bc(a), bc(b)]"],
+            ["5", "c", "非 andi/非 broadcast", "叶子，push", "[bc(a), bc(b), c]"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "递归必终止，且每个原子因子恰好进 leaves 一次。",
+        "argument": "每次递归实参都是原 mask DAG 更小的子表达式：andi 递归到两个操作数，broadcast(andi) 递归到把 src 的两个操作数各包一层新 broadcast（内层比原 src 更小）。子表达式规模严格下降、有下界（非 andi/非 broadcast(andi) 的叶子），故有限步内每条路径抵达叶子并 push 一次返回——不遗漏、不重复。"
+      },
+      "quantified": "mask = broadcast(a&b)&c 拍平出 3 个叶子 [bc(a), bc(b), c]；一般 k 个 & 因子的树拍平成 k 个叶子，一次后序遍历 O(k)。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m2-flatten",
+          "claim": "andi 掩码树被递归拍平成叶子集合；broadcast(a&b) 用分配律下推成 broadcast(a)&broadcast(b) 再各自成叶。",
+          "template": "before-after",
+          "numbers": [
+            {"value": "输入：broadcast(a & b) & c（1 棵 andi 树，含 1 个 broadcast）", "provenance": "手工推演，traces/verify_small_examples.py"},
+            {"value": "输出：3 个叶子 [bc(a), bc(b), c]", "provenance": "DiscreteMaskAccessConversionPass.cpp:L78-L102 语义推演"},
+            {"value": "broadcast(andi) 下推为 2 个 broadcast 因子", "provenance": "DiscreteMaskAccessConversionPass.cpp:L84-L96"}
+          ],
+          "caption_draft": "3 个 & 因子拍平成 3 个叶子；藏在 broadcast 里的 & 先按分配律下推，一个因子都不漏，好让每个因子被单独判连续/离散。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m3",
+      "intuition": "一张掩码常是『尾块边界（能画成一个连续区间）』和『逐元素的值条件（东一个西一个）』用 & 拼起来的。把能画成连续区间的因子挑出来当『安全护栏』收窄搬运范围，剩下管不了的留给逐元素挑选——既不越界，又不放弃能连续的那半。",
+      "worked_example": {
+        "params": {"BLOCK": 8, "contMask": "idx < 6（尾块边界，validLen=6）", "discMask": "运行期值谓词，真值位置 {1,3,4,6}"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl，无法运行真实 pass。contMask/discMask 分流与逐元素 combined 由 decomposeAndMask 源码（DiscreteMaskAccessConversionPass.cpp:L104-L151）+ AndIOp 按位语义手工推演；数字已在 traces/verify_small_examples.py（m3）复刻，输出见 verify_small_examples.out.json。真实前后对照见 loadstore.mlir 的 CHECK。",
+        "table": {
+          "columns": ["idx", "contMask (idx<6)", "discMask", "combined = cont & disc", "无 contMask 全载是否 OOB"],
+          "rows": [
+            ["0", "T", "F", "F", "安全"],
+            ["1", "T", "T", "T（选中）", "安全"],
+            ["2", "T", "F", "F", "安全"],
+            ["3", "T", "T", "T（选中）", "安全"],
+            ["4", "T", "T", "T（选中）", "安全"],
+            ["5", "T", "F", "F", "安全"],
+            ["6", "F", "T", "F（被护栏挡）", "OOB（idx≥6）"],
+            ["7", "F", "F", "F", "OOB（idx≥6）"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "combined ⊆ contMask，故 select 只会取到安全范围 [0, validLen) 内的数据，零越界。",
+        "argument": "combined = contMask & discMask（按位与）→ combined 为真必 contMask 为真。load 用 contMask 当 mask 参数，硬件只搬 contMask 为真的 [0,6)；idx=6 虽 discMask 为真但 contMask 为假被排除在外，不触碰 [validLen, N) 的未初始化/越界内存。"
+      },
+      "quantified": "8 元素、validLen=6：不拆则全载会触碰 idx∈{6,7} 共 2 个 OOB 位置；拆后 load 收窄到 [0,6)、combined 选中 {1,3,4} 共 3 个，零越界。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m3-split",
+          "claim": "混合掩码 (idx<6) & 运行期谓词：contMask 收窄 load 到 [0,6) 挡住 OOB，discMask 只管逐元素选择。",
+          "template": "state-table",
+          "numbers": [
+            {"value": "contMask 真值区间 [0,6)（idx 0-5）", "provenance": "traces/verify_small_examples.out.json m3.contMask_true"},
+            {"value": "discMask 真值位置 {1,3,4,6}", "provenance": "traces/verify_small_examples.out.json m3.discMask_true"},
+            {"value": "combined 选中 {1,3,4}", "provenance": "traces/verify_small_examples.out.json m3.combined_selected"},
+            {"value": "无 contMask 全载触 OOB 位置 {6,7}", "provenance": "traces/verify_small_examples.out.json m3.oob_touched_if_no_contMask"}
+          ],
+          "caption_draft": "不拆则全载触 idx∈{6,7} 越界；拆后 load 用 contMask 收窄到 [0,6)、combined 选中 {1,3,4}，安全与向量化连续因子两不误。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m4",
+      "intuition": "达芬奇的向量搬运没有高效散点读——想读东一个西一个的元素，只能把整段先全读回来，再把没选中的位置就地擦成缺省值 other。",
+      "worked_example": {
+        "params": {"BLOCK": 8, "mask": "(idx<2) ori (idx>5)", "mem[idx]": "10+idx", "other": 0},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl，无 Python 精简版可运行。改写为『无条件全载 + arith.select(mask, loaded, other)』，语义由 DiscreteMaskLoadConversion fallback（DiscreteMaskAccessConversionPass.cpp:L272-L285）+ 夹具 discrete_load 的 CHECK（loadstore.mlir:L4-L23）确定；小例数字由 traces/verify_small_examples.py（m4）复刻。此纯离散例（两区间 OR）无 contMask，走 fallback 路径。",
+        "table": {
+          "columns": ["idx", "mask = (idx<2)∨(idx>5)", "全载 loaded = 10+idx", "select 后 result"],
+          "rows": [
+            ["0", "T", "10", "10"],
+            ["1", "T", "11", "11"],
+            ["2", "F", "12", "0"],
+            ["3", "F", "13", "0"],
+            ["4", "F", "14", "0"],
+            ["5", "F", "15", "0"],
+            ["6", "T", "16", "16"],
+            ["7", "T", "17", "17"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "改写后结果与『逐点条件读』语义逐位等价：选中处得真实内存值，未选中处得 other。",
+        "argument": "全载拿到每个位置的真实值 loaded[i]；arith.select(mask, loaded, other) 逐位取舍：mask[i] 真→loaded[i]，假→other。故对外可见结果与『只读选中点、其余填 other』逐位相等——多读进来的未选中值被 select 丢弃，不进结果。"
+      },
+      "quantified": "小例：为服务 4 个选中点搬了 8 元素一整趟（2× 冗余读带宽）。夹具 discrete_load 的全载是 tensor<1024> 一整趟（loadstore.mlir:L20 原 masked load → 改写后 L5-L7 CHECK 全载 + select）。缺省 other 由 specializeTypelessValueToConstant 造 0（loadstore.mlir:L26 default dense<0>）。"
+    },
+
+    {
+      "mechanism_id": "m5",
+      "intuition": "离散写更亏：硬件不能只写散点。做法是把目标整段先读回来（origin），在寄存器里用 select 把选中处换成新值、其余保留原值，再整段写回去。一次逻辑散点写 = 一读一写两趟全量搬运。",
+      "worked_example": {
+        "params": {"BLOCK": 8, "src(新值)": "10+idx", "origin(dst原值)": "90+idx", "mask": "(idx<2) ori (idx>5)"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl，无 Python 精简版。读-改-写语义由 DiscreteMaskStoreConversion fallback（DiscreteMaskAccessConversionPass.cpp:L206-L226）+ 夹具 discrete_store 的 CHECK（loadstore.mlir:L47-L67：load src、load origin、select、store）确定；小例数字由 traces/verify_small_examples.py（m5）复刻。",
+        "table": {
+          "columns": ["idx", "mask", "src（待写新值）", "origin（dst 原值）", "written = select(mask, src, origin)"],
+          "rows": [
+            ["0", "T", "10", "90", "10"],
+            ["1", "T", "11", "91", "11"],
+            ["2", "F", "12", "92", "92"],
+            ["3", "F", "13", "93", "93"],
+            ["4", "F", "14", "94", "94"],
+            ["5", "F", "15", "95", "95"],
+            ["6", "T", "16", "96", "16"],
+            ["7", "T", "17", "97", "17"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "读-改-写对未选中位置是恒等：整段写回后，未选中位置的值仍等于其原值。",
+        "argument": "written[i] = select(mask, src, origin)：mask[i] 假→origin[i]（即刚读回的 dst 原值），整段写回后该位置值不变；真→src[i]。故净效果等价于『只改选中点』。hivm.sync_block_lock/unlock 把这段非原子读-改-写序列化，保证并发下 origin 读与写回之间目标段不被他核改写而丢更新。",
+        "argument_note": "sync_block_lock 仅在 enableSyncBlockLock flag 打开时插入（DiscreteMaskAccessConversionPass.cpp:L189-L192, L221-L223）。"
+      },
+      "quantified": "改 4 个元素付出 2 趟 8 元素全量 DMA（load origin + store 回写）+ 1 次 select；逻辑上 O(选中数=4) 的写，实际成本 O(N=8) 且翻倍——这就是离散写『有多亏』的定量答案。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m5-rmw",
+          "claim": "离散 store = 读-改-写：load 目标原值 → select 拼新值 → store 回写，一次逻辑散点写付两趟全量 DMA。",
+          "template": "flow",
+          "numbers": [
+            {"value": "written = [10,11,92,93,94,95,16,17]", "provenance": "traces/verify_small_examples.out.json m5.written"},
+            {"value": "实际改动 4 个元素", "provenance": "traces/verify_small_examples.out.json m5.changed_count"},
+            {"value": "DMA 趟数 = 2（load origin + store）", "provenance": "traces/verify_small_examples.out.json m5.dma_passes"},
+            {"value": "每趟仍搬 8 元素", "provenance": "traces/verify_small_examples.out.json m5.total_elems"}
+          ],
+          "caption_draft": "改 4 个元素付 2 趟 8 元素 DMA（读 origin + 写回）+ sync_block_lock 序列化临界区——逻辑 O(4) 的写实付 O(8)×2。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m6",
+      "intuition": "原子加/取最值也不能只挑散点做。诀窍：对整段做原子操作，但把没选中的位置填成该运算的『幺元』——加填 0、取最小填最大值——让它们参与也不改变结果。",
+      "worked_example": {
+        "params": {"op": "atomic min i32", "BLOCK": 8, "mask": "(idx<2) ori (idx>5)", "src": "[5,3,7,2,9,1,4,8]", "幺元": "i32 max = 2147483647"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl，无 Python 精简版。幺元填充语义由 DiscreteMaskAtomicConversion（DiscreteMaskAccessConversionPass.cpp:L303-L334）+ 夹具 atomic_min_i32 的 CHECK（atomic.mlir:L83-L101：default dense<2147483647>、select、atomic_rmw min）确定；maskedValue 由 traces/verify_small_examples.py（m6）复刻。幺元常量逐类型取自 atomic.mlir，见 quantified。",
+        "table": {
+          "columns": ["idx", "mask", "src", "maskedValue = select(mask, src, MAX)", "对全段 atomic min 的影响"],
+          "rows": [
+            ["0", "T", "5", "5", "参与"],
+            ["1", "T", "3", "3", "参与"],
+            ["2", "F", "7", "2147483647", "无影响（min(t,MAX)=t）"],
+            ["3", "F", "2", "2147483647", "无影响"],
+            ["4", "F", "9", "2147483647", "无影响"],
+            ["5", "F", "1", "2147483647", "无影响"],
+            ["6", "T", "4", "4", "参与"],
+            ["7", "T", "8", "8", "参与"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "给未选中位置填幺元 e 后，全段原子操作等价于只对选中点做原子（∀x: x ⊕ e = x）。",
+        "argument": "min 的幺元是类型最大值 MAX，min(target, MAX) = target 不改目标；未选中位置填 MAX → 对目标无副作用。选中位置填 src 正常参与。故全段 atomic min 的净效果 = 只 min 选中点。add/or/xor→0、and→MAX、max→MIN 同理（各自幺元，x⊕e=x）。xchg 无幺元（任何值都覆盖），无法用此技巧，改打 DiscreteMask 属性 + return failure() 交 AscendNPU-IR 后端拆解（DiscreteMaskAccessConversionPass.cpp:L317-L322）。"
+      },
+      "quantified": "10 种 RMW 的幺元表（initMap，DiscreteMaskAccessConversionPass.cpp:L303-L313）：add/fadd/umax/or/xor→0；min/umin/and→类型 Max；max→类型 Min；xchg→Undefined。lit 夹具逐类印证 default 常量：min_i32=2147483647（atomic.mlir:L84）、max_i32=-2147483648（L44）、add_i32=0（L4）、and_i32=2147483647（L124）、or_i32=0（L144）、umax_i32=0（L64）、umin_i32=2147483647（L104）、max_i16=-32768（L164）、max_f16=0xFC00（L184）。"
+    },
+
+    {
+      "mechanism_id": "m9",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m9-expand",
+          "claim": "expandInterleaveMemRefType 把 memref 末维 shape×2、stride 归 1——将 stride=2 的交错视图还原成 2N 连续段的描述。",
+          "template": "before-after",
+          "numbers": [
+            {"value": "末维 shape ×2（例：4 → 8）", "provenance": "InterleaveOptimization.cpp:L51-L52"},
+            {"value": "末维 stride → 1（例：2 → 1）", "provenance": "InterleaveOptimization.cpp:L64-L65"},
+            {"value": "offset 静态则归 0", "provenance": "InterleaveOptimization.cpp:L57-L60"}
+          ],
+          "caption_draft": "末维翻倍 + stride 归 1，跨步 2 的交错视图变成整段连续 2N，DMA 从跨步搬运恢复成一次连续搬运。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m10",
+      "intuition": "怎么知道这次交错访问取的是偶数位还是奇数位？看指针 offset 里有没有一个『+1』。triton 里偶列是 dim*2、奇列是 dim*2+1，那个孤零零的加 1 就是奇数位的唯一胎记。",
+      "worked_example": {
+        "params": {"even_range": "dim*2（offset 常量 0）", "odd_range_const": "常量 1", "odd_range_value": "addi(x, 1)"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl，无 Python 精简版。偶/奇判定由 recountReinterpretCastOffset + checkIsCaseOffsetValid 源码（InterleaveOptimization.cpp:L94-L167）逐分支手工推演；无数值 dump，判定是结构/常量匹配。源码 NOTE 注释（L70-L93）给出 dim*2 / dim*2+1 的来历。",
+        "table": {
+          "columns": ["情形", "originOffset", "isa 类型", "有『+1』?", "IndexMode", "newOffset"],
+          "rows": [
+            ["偶", "dim*2 → 常量 0", "Attribute(IndexAttr)", "无", "EVEN_MODE", "复用原 offset（0）"],
+            ["奇（常量）", "常量 1", "Attribute(IndexAttr)", "有（=1）", "ODD_MODE", "归 0"],
+            ["奇（值）", "addi(x, 1)", "Value(arith.addi)", "有（traceOffset 命中）", "ODD_MODE", "取『+1』前的累加结果"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "常量 offset 只可能是 0 或 1；偶/奇判定二值互斥且完备。",
+        "argument": "checkIsCaseOffsetValid 断言常量 offset ∈ {0,1}（InterleaveOptimization.cpp:L99-L100），值型 offset 的 addi 常量操作数必为 1（L128-L135 assert）。有『+1』↔ODD、无『+1』↔EVEN，二值互斥全覆盖。ODD 下 newOffset 剥掉『+1』只留非末维累加，把奇偶交给后续 insert/extract_slice 的 offset（0/1）承载。"
+      },
+      "quantified": "两种模式靠 1 个『+1』区分；枚举值 EVEN_MODE=0 / ODD_MODE=1（IndexMode，InterleaveOptimization.h:L69），成对 materialize 用异或校验 EVEN^ODD=1 保证偶奇互补、不重叠不遗漏。"
+    },
+
+    {
+      "mechanism_id": "m11",
+      "intuition": "stride=2 的访问（只取偶或只取奇）对 DMA 很亏——跨着步搬。干脆把整段连续的 2N 一次搬回片上，再在片上 tensor 里用 extract_slice 隔一个取一个，把跨步的代价从访存挪到便宜的片上变形。",
+      "worked_example": {
+        "params": {"N": 4, "interleaved (2N=8)": "[0,100,1,101,2,102,3,103]（偶半 [0,1,2,3] 与奇半 [100,101,102,103] 交织）"},
+        "trace_source": "manual",
+        "manual_reason": "skip_impl，无 Python 精简版。deinterleave 五步（末维翻倍→新 reinterpret_cast→alloc+copy→bufferize→extract_slice stride2）由 DeinterleaveStatusOptimization 源码（InterleaveOptimization.cpp:L169-L245）确定；触发条件 stride==2 且末维偶数（LoadStoreConverter.cpp:L436）。even/odd 抽取结果由 traces/verify_small_examples.py（m11）复刻。",
+        "table": {
+          "columns": ["步", "动作", "末维 shape / stride", "结果"],
+          "rows": [
+            ["1", "expandInterleaveMemRefType 末维翻倍", "shape 4→8, stride 2→1", "描述整段连续 2N"],
+            ["2", "新 reinterpret_cast（size 8, stride 1, offset 由偶/奇定）", "8 / 1", "连续视图"],
+            ["3", "alloc + copy 连续 2N 搬上片", "8", "片上 [0,100,1,101,2,102,3,103]"],
+            ["4", "bufferize to_tensor", "8", "tensor<8>"],
+            ["5a", "extract_slice offset0 stride2 size4 → even", "4 / 2", "[0,1,2,3]"],
+            ["5b", "extract_slice offset1 stride2 size4 → odd", "4 / 2", "[100,101,102,103]"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "翻倍 + extract_slice(stride 2) 与原 stride=2 访问逐元素等价。",
+        "argument": "原 stride=2 从 offset o∈{0,1} 取 N 个 = 整段 2N 的下标 o, o+2, …, o+2(N-1)；扩成连续 2N 搬回后，extract_slice(offset=o, stride=2, size=N) 取的正是同一下标集 → 逐元素相等。触发前置 stride==2 且末维偶数（LoadStoreConverter.cpp:L436）保证 2N 可被 2 整除、N 为整数。"
+      },
+      "quantified": "N=4：交错缓冲 8 元素一趟连续搬运替代 4 次跨步 stride-2 访问；even/odd 各抽 4 个。末维 shape 4→8、stride 2→1。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m11-deinterleave",
+          "claim": "Deinterleave（load 侧）：stride=2 视图翻倍成连续 2N 搬回，再用 extract_slice 隔一取一分出偶/奇半。",
+          "template": "tensor-flow",
+          "numbers": [
+            {"value": "交错缓冲 2N=8：[0,100,1,101,2,102,3,103]", "provenance": "traces/verify_small_examples.out.json m11.interleaved"},
+            {"value": "even = extract offset0 stride2 → [0,1,2,3]", "provenance": "traces/verify_small_examples.out.json m11.even_extract_off0_stride2"},
+            {"value": "odd = extract offset1 stride2 → [100,101,102,103]", "provenance": "traces/verify_small_examples.out.json m11.odd_extract_off1_stride2"},
+            {"value": "末维 shape 4→8、stride 2→1", "provenance": "InterleaveOptimization.cpp:L51-L52, L64-L65"}
+          ],
+          "caption_draft": "跨步 2 的偶/奇访问被还原成一次连续 2N 搬运 + 片上 extract_slice——跨步开销从访存挪到便宜的 tensor 变形。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m12",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m12-interleave",
+          "claim": "Interleave（store 侧）：两条偶/奇 materialize 经 insert_slice(stride 2, offset 0/1) 交织进 2N tensor，最后单次搬运落盘——deinterleave 的逆运算。",
+          "template": "tensor-flow",
+          "numbers": [
+            {"value": "偶半 [0,1,2,3] insert offset0 stride2", "provenance": "InterleaveOptimization.cpp:L466-L478 + traces/verify_small_examples.out.json m11.even_extract_off0_stride2"},
+            {"value": "奇半 [100,101,102,103] insert offset1 stride2", "provenance": "InterleaveOptimization.cpp:L480-L490 + traces/verify_small_examples.out.json m11.odd_extract_off1_stride2"},
+            {"value": "交织成 2N=8：[0,100,1,101,2,102,3,103]", "provenance": "traces/verify_small_examples.out.json m11.interleaved"},
+            {"value": "单次 MaterializeInDestination 落盘、erase 原两条", "provenance": "InterleaveOptimization.cpp:L502-L509"}
+          ],
+          "caption_draft": "偶半 offset0、奇半 offset1，两次 stride-2 insert_slice 交织成连续 2N，单次 materialize 落盘，替代两趟跨步写。"
+        }
+      ]
+    }
+  ]
+}
