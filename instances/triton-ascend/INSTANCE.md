@@ -45,9 +45,12 @@
   仿射 tiled dataflow），bishengir 部分闭源（边界≈基座的 ptxas）。
 - ✅ **大纲已获用户审批（2026-07-18「同意」）**：33 章 / 7 Part（outline-final.json）+ ARCHITECTURE.md，
   开始逐章发车。roadmap.py 生成器已建并验（7 Part 窄长条 5.17:1，4 调用/几何/Read-PNG 通过）。
-- 🚗 **施工中（2026-07-23 状态）**：**ch01–ch21 已全部定稿提交并归档**（Part 1/2 完 + **Part 3 triton-to-linalg 核心**
-  + **ascend-opt ch15–ch18** + **ch19 离散掩码** + **hivm-hfusion:ch20 TritonAscend 方言/ch21 HFusion 方言**）;ch22–ch33 未开工。
-  下一章 **ch22**（按 outline-final.json;可能 HIVM 方言,先查 subsystem+源码定 skip_impl）。
+- 🚗 **施工中（2026-07-23 状态）**：**ch01–ch22 已全部定稿提交并归档**（Part 1/2 完 + **Part 3 triton-to-linalg 核心**
+  + **ascend-opt ch15–ch18** + **ch19 离散掩码** + **hivm-hfusion:ch20 TritonAscend 方言/ch21 HFusion 方言/ch22 算子融合与自动调度**）;ch23–ch33 未开工。
+  **ch23 发车中**（HIVM 方言,skip_impl 纯 C++ MLIR;wf_b8a4424b-6d8）:焦点=方言身份 + 显式内存层级
+  (HIVM AddressSpace 六级 GM/L1/L0A/L0B/L0C/UB) + Cube(L0A/L0B→L0C)/Vector(UB) 双核分工 + DMA 搬运。
+  HIVM 方言 td 在 `…/bishengir/include/bishengir/Dialect/HIVM/IR/`,lib 在 `…/lib/Dialect/HIVM` 与 `…/lib/Conversion/HFusionToHIVM`。
+  ⚠️ ch22 曾 Review round1 逃逸(计数陷阱 15→4 Scheduler/未验证子核个数/MixCV 14×14 结构错),Lead 手动接管修复+独立盲审,已归档。
   ⚠️ HFusion/HIVM 在 **bishengir submodule** 内,路径须带 `third_party/ascend/AscendNPU-IR/bishengir/` 前缀。
   ⚠️ API 近期偶发 Connection-closed 崩(Dossier/Illustrate/Review/writer 各站都中过):有产物→带 skip_dossier 重跑;0 产物→干净重发。
   ⚠️ workflow 偶发 API 崩溃(Illustrate/Review 站):带 verified dossier 用 skip_dossier 重跑即可(非内容问题)。
