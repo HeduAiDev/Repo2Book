@@ -1,0 +1,149 @@
+{
+  "chapter": "ch18",
+  "title": "DAGSSBuffer:UB 多缓冲与昇腾的软件流水线",
+  "trace_note": "本章 skip_impl=true:DAGSSBuffer.cpp 单文件 5534 行纯 C++ MLIR pass,宿主无 CANN、编不动,无 .py 精简版。所有逐轮数字为**手工推演**(trace_source=manual),并由 traces/run_double_buffer.py 忠实重写 pin @2badfc89e 的 buildNBufferProducer/buildNBufferConsumer(N==2 特化)select 逻辑交叉核对(输出 traces/double_buffer.json);IR 片段为按 double-buffer 前后语义手工构造的最小 scf.for 示例,**非编译器 dump**,仅演示用。凡引用源码常量的数字均标 file:Lxxx。",
+
+  "mechanisms": [
+    {
+      "mechanism_id": "m1-iterarg-expand",
+      "intuition": "本来循环每轮只揣一个饭盒(一份 buffer),现在改成揣两个饭盒轮流用,外加两个小计数器记『这轮该往哪个饭盒装、从哪个饭盒取』——多带的饭盒副本和两个计数器都塞进循环的『随身行李』(scf.for 迭代参数 iterArgs)里,跟着每一轮循环往下传。空间换时间的『空间』就花在这里。",
+      "worked_example": {
+        "params": {
+          "bufferNum_N": 2,
+          "dep_count": 1,
+          "example_loop": "scf.for %i = 0 to 4 step 1 iter_args(%acc, %buf) —— %acc 代表某个已有携带值,%buf 是要多缓冲的那份 UB tile",
+          "note": "N=2、1 个待多缓冲 dep 的最小情形;数字可心算"
+        },
+        "trace_source": "manual",
+        "manual_reason": "skip_impl:DAGSSBuffer.cpp 5534 行纯 C++ pass,宿主无 CANN 编不动,无精简版可运行取 dump。iterArg 增量由源码 L4528-L4547 的两层 push 循环逐字推得,并经 traces/run_double_buffer.py::iterarg_expand 交叉核对(traces/double_buffer.json.m1_iterarg_expand)。",
+        "trace_ref": "traces/double_buffer.json",
+        "table": {
+          "columns": ["场景", "scf.for iterArgs 布局", "iterArg 总数", "相对变换前新增"],
+          "rows": [
+            ["变换前", "%acc, %buf", "2", "—"],
+            ["变换后(N=2)", "%acc, %buf0, %buf1, %frontCnt, %postCnt", "5", "+3 = (N-1)=1 份 buffer 副本 + 2 个计数器"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "扩容只增不改:原有 iterArgs 原样保留,每个被多缓冲的 dep 恰好追加 (N-1) 份 buffer 副本 + 2 个计数器;新循环 iterArg 数 = 原数 + dep 数 ×(N+1)。",
+        "argument": "基例:源码 L4529-L4539 对每个 dep 先 `for i in [0, bufferNum-1): iterArgs.push_back(originalInitArgs[idx])`(压 N-1 份同初值副本),再 `for i in [0,2): iterArgs.push_back(counterInit)`(压 2 个初值 0 的计数器);归纳步:循环边界/step/原 initArgs 一律不动(L4542-L4547 用 originalLowerBound/UpperBound/Step + 扩容后的 iterArgs 重建 scf.for)。故每 dep 新增 =(N-1)+2 = N+1,N=2 即 +3;这与 addMultiBuffCaculate 反算 iterArg 起点用的步长 extraArgBaseIdx=(2+bufferNum-1)=3(L5177/L5182)逐位对齐——若增量不是 3,反算就会错位读到别的携带值。"
+      },
+      "quantified": "本例 1 个 dep、N=2:新增 iterArg =(2-1)+2 = 3(1 份 buffer 副本 + frontCnt + postCnt),循环携带值从 2 涨到 5;UB 占用翻 N=2 倍(呼应 ch02:double-buffer 默认开,把可用 UB 从 192KB 砍半到约 96KB)。若改 N=3 则每 dep 新增 4 个 iterArg、UB 占用 3 倍。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch18-m1-iterarg-expand",
+          "claim": "double-buffer 的空间代价落在 scf.for 迭代参数:每个被多缓冲的 buffer,iterArgs 从 1 份扩成 N 份加 2 个计数器。",
+          "template": "before-after",
+          "numbers": [
+            {"label": "buffer 副本新增 (N-1)", "value": "1", "provenance": "DAGSSBuffer.cpp:L4530-L4532 (for i<bufferNum-1 push buff 副本);N=2"},
+            {"label": "计数器新增", "value": "2", "provenance": "DAGSSBuffer.cpp:L4535-L4537 (for i<2 push counterInit)"},
+            {"label": "每 dep 新增 iterArg 合计", "value": "3", "provenance": "traces/double_buffer.json.m1_iterarg_expand.total_new_iterargs_per_dep;= (N-1)+2"},
+            {"label": "变换前 iterArg 数(本例)", "value": "2", "provenance": "本例构造:%acc,%buf"},
+            {"label": "变换后 iterArg 数(本例)", "value": "5", "provenance": "2 + 3"}
+          ],
+          "caption_draft": "一份要流水的 UB buffer 被扩成 buffer0/buffer1 两份并新增 frontCnt/postCnt 两个游标,全部塞进 scf.for 的迭代参数随每轮传递——这就是双缓冲『2× UB 占用』的物化位置(DAGSSBuffer.cpp:L4528-L4547)。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m2-producer-consumer-select",
+      "intuition": "两个人共用一排只有两格的储物柜(buffer0/buffer1)。搬运工按自己手里的号码牌 frontCnt 决定东西塞哪格——双数塞左格、单数塞右格;取货的人按自己的号码牌 postCnt 决定开哪格。各数各的牌、各开各的格,互不打断,这就是 N==2 时一条 arith.select 就能『二选一』、连 scf.if 都不用生成的原因。",
+      "worked_example": {
+        "params": {
+          "bufferNum_N": 2,
+          "counter_values": [0, 1, 2, 3],
+          "modulus": "constants[N]=constants[2]=2 (DAGSSBuffer.cpp:L5191 constants[i]=i)",
+          "note": "frontCnt / postCnt 各取 0..3,看 bufferIndex=cnt%2 把写/读引向哪份 buffer"
+        },
+        "trace_source": "manual",
+        "manual_reason": "skip_impl 无法运行编译器 pass;select 走向由 producer(L4626-L4636)与 consumer(L4750-L4758)的 arith.select 语义逐行推得,并经 traces/run_double_buffer.py::producer/consumer 忠实重写核对(traces/double_buffer.json.m2_producer / m2_consumer)。",
+        "trace_ref": "traces/double_buffer.json",
+        "table": {
+          "columns": ["计数器值 cnt", "bufferIndex = cnt % 2", "isBuffer0 (==0)", "producer 写侧命中 buffer", "consumer 读侧命中 buffer"],
+          "rows": [
+            ["0", "0", "true", "buffer0", "buffer0"],
+            ["1", "1", "false", "buffer1", "buffer1"],
+            ["2", "0", "true", "buffer0", "buffer0"],
+            ["3", "1", "false", "buffer1", "buffer1"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "N==2 时 producer 与 consumer 的『选哪份 buffer』都退化成 bufferIndex = cnt % 2 ∈ {0,1},命中的 buffer 编号恒等于 cnt%2,周期为 2,全程只用 arith.select、不生成 scf.if。",
+        "argument": "基例(cnt=0):bufferIndex=0、isBuffer0=true,producer 的 `newBuff0=select(mask,newDepVal,buffs[0])` 把新数据落 buffer0(L4621)、consumer 的 `selected=select(mask,oldBuffs[0],oldBuffs[1])` 读 buffer0(L4751)。归纳步:cnt 每轮 +1(producer L4630 addi frontCnt+1、consumer L4752 addi postCnt+1),cnt%2 在 0/1 间严格交替,故命中 buffer 编号 = cnt%2、周期 2。N==2 分支(producer L4626/consumer L4750)直接 return 单个 select 结果,不进入 L4638 起的 rootIf+nestedIf 嵌套链——因此无 scf.if。",
+        "note": "N>2 才走嵌套 scf.if 链(producer L4638-L4729 / consumer L4760-L4828),本章如实标注省略、只讲 N=2。"
+      },
+      "quantified": "producer(N==2)生成的 op:1 arith.remsi + 1 arith.cmpi + 1 tensor.splat + 2 arith.select + 1 arith.addi = 6 个;consumer(N==2):1 remsi + 1 cmpi + 1 splat + 1 select + 1 addi = 5 个(consumer 少一个 select——只取一份,producer 要同时更新两份)。两侧皆零 scf.if,控制流不膨胀。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch18-m2-counter-mod-select",
+          "claim": "写指针 frontCnt 与读指针 postCnt 各自 mod 2 选 buffer:偶数轮碰 buffer0、奇数轮碰 buffer1,一条 arith.select 完成二选一。",
+          "template": "state-table",
+          "numbers": [
+            {"label": "cnt=0 → bufferIndex", "value": "0", "provenance": "traces/double_buffer.json.m2_producer[0];0%2=0"},
+            {"label": "cnt=1 → bufferIndex", "value": "1", "provenance": "traces/double_buffer.json.m2_producer[1];1%2=1"},
+            {"label": "cnt=2 → bufferIndex", "value": "0", "provenance": "traces/double_buffer.json.m2_producer[2];2%2=0"},
+            {"label": "cnt=3 → bufferIndex", "value": "1", "provenance": "traces/double_buffer.json.m2_producer[3];3%2=1"},
+            {"label": "N==2 modulus", "value": "2", "provenance": "DAGSSBuffer.cpp:L4611 remsi frontCnt, constants[N];constants[2]=2 (L5191)"},
+            {"label": "producer op 数", "value": "6", "provenance": "DAGSSBuffer.cpp:L4602-L4636 逐 builder.create 计数"},
+            {"label": "consumer op 数", "value": "5", "provenance": "DAGSSBuffer.cpp:L4732-L4758 逐 builder.create 计数"}
+          ],
+          "caption_draft": "N=2 双缓冲下,producer 按 frontCnt%2、consumer 按 postCnt%2 各自二选一:偶数轮 buffer0、奇数轮 buffer1;每侧一条 arith.select,全程不生成 scf.if(DAGSSBuffer.cpp:L4626-L4636 / L4750-L4758)。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "m3-load-compute-overlap",
+      "intuition": "单缓冲像单车道:搬完这块料才能开算,算完才能搬下一块,搬和算永远一个等一个,访存单元忙时计算单元空转、反之亦然。双缓冲修成两条车道:一条道在往 buffer B 搬第 i+1 块料的同时,另一条道在读 buffer A 算第 i 块——两件事同时干,一轮的墙钟时间从『搬 + 算』缩到『max(搬, 算)』。让这成立的关键,是写指针 frontCnt 永远比读指针 postCnt 领先一个身位,于是每一刻写的那份 buffer 和读的那份 buffer 不是同一份。",
+      "worked_example": {
+        "params": {
+          "bufferNum_N": 2,
+          "num_tiles": 4,
+          "T_load": 3,
+          "T_compute": 2,
+          "schedule": "prologue 先 load tile0(frontCnt 0→1、postCnt 仍 0,建立领先 1),稳态每轮同时 load 下一块 + compute 当前块,epilogue 算最后一块",
+          "note": "T_load/T_compute 为演示所选的延迟单位、非实测;调度反映 double-buffer 变换使能的重叠"
+        },
+        "trace_source": "manual",
+        "manual_reason": "skip_impl 无法运行 pass 取真实时间线;逐轮 frontCnt/postCnt 与写读 buffer 命中由 producer/consumer select 语义 + 两计数器错位(L5182-L5184 取两独立计数器、L4630 frontCnt+1、L4752 postCnt+1)手工推得,并经 traces/run_double_buffer.py::trace_overlap 交叉核对(traces/double_buffer.json.m3_overlap_rows)。T_load=3/T_compute=2 为演示常量。",
+        "trace_ref": "traces/double_buffer.json",
+        "table": {
+          "columns": ["阶段", "本轮动作", "frontCnt(前→后)", "写 buffer", "postCnt(前→后)", "读 buffer", "写读同块?", "搬算重叠?"],
+          "rows": [
+            ["prologue", "load tile0", "0→1", "buffer0", "0", "—", "—", "否(暖机)"],
+            ["iter0", "load tile1 + compute tile0", "1→2", "buffer1", "0→1", "buffer0", "否", "是"],
+            ["iter1", "load tile2 + compute tile1", "2→3", "buffer0", "1→2", "buffer1", "否", "是"],
+            ["iter2", "load tile3 + compute tile2", "3→4", "buffer1", "2→3", "buffer0", "否", "是"],
+            ["epilogue", "compute tile3", "—", "—", "3→4", "buffer1", "—", "否(收尾)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "只要 frontCnt 恒比 postCnt 领先 1(两者奇偶相反),写侧 buffer(frontCnt%2)与读侧 buffer(postCnt%2)必为不同块,读写无冲突,搬与算可并行;退回单计数器则写读同块、必须串行。",
+        "argument": "基例:prologue 做一次 load 令 frontCnt 0→1 而 postCnt 仍 0,差 = 1(领先建立)。归纳步:稳态每轮 load-if 命中使 frontCnt+1(L4630)、compute-if 命中使 postCnt+1(L4752),两者同步各 +1,差恒保持为 1。差为奇数 ⇒ frontCnt%2 ≠ postCnt%2 ⇒ 写读落不同 buffer——逐轮表 iter0/1/2 三轮『写读同块?』皆『否』正是此不变量的体现,终止性由 for 迭代 0..3 有界保证。反证:若写读共用一个计数器(单缓冲),bufferIndex 相同 ⇒ 同块 ⇒ compute 必须等 load 写完、load 必须等 compute 读完,退化成串行。",
+        "note": "本机理是**单核循环内部**的访存-计算重叠,与 ch17 的跨核 scope/sync 正交;cube 算第 N 块同时 vector 处理第 N-1 块的跨核并行部分见 ch17。"
+      },
+      "quantified": "演示延迟(T_load=3, T_compute=2, 4 个 tile):单缓冲串行 = 4×(3+2) = 20 个单位;双缓冲(此处 DMA 受限,T_load>T_compute)= 3(暖机 load)+ 3×3(三次背靠背 load)+ 2(尾计算)= 14 个单位,加速 20/14 ≈ 1.43×;tile 数趋大时逼近渐近上界 (3+2)/max(3,2) = 5/3 ≈ 1.67×。延迟值为演示所选、非实测。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch18-m3-overlap-timeline",
+          "claim": "frontCnt 领先 postCnt 一个身位,使 DMA 搬第 i+1 块与 Vector 算第 i 块落在不同 buffer、在时间上完全重叠;单缓冲则搬算严格串行。",
+          "template": "swimlane",
+          "numbers": [
+            {"label": "T_load(演示)", "value": "3", "provenance": "traces/double_buffer.json.meta.T_load;演示常量非实测"},
+            {"label": "T_compute(演示)", "value": "2", "provenance": "traces/double_buffer.json.meta.T_compute;演示常量非实测"},
+            {"label": "单缓冲串行总耗时", "value": "20", "provenance": "traces/double_buffer.json.m3_timeline_totals.serial_total;4×(3+2)"},
+            {"label": "双缓冲重叠总耗时", "value": "14", "provenance": "traces/double_buffer.json.m3_timeline_totals.double_total;3+3×3+2"},
+            {"label": "本例加速比", "value": "1.43", "provenance": "traces/double_buffer.json.m3_timeline_totals.speedup_x;20/14"},
+            {"label": "渐近加速比", "value": "1.67", "provenance": "traces/double_buffer.json.m3_timeline_totals.asymptotic_speedup_x;5/3"},
+            {"label": "frontCnt−postCnt 稳态差", "value": "1", "provenance": "traces/double_buffer.json.m3_overlap_rows iter0/1/2 皆 front 领先 post 1"}
+          ],
+          "caption_draft": "双缓冲把单车道拆成 DMA / Vector 两条并行泳道:稳态每轮搬第 i+1 块(写 frontCnt%2 那份 buffer)与算第 i 块(读 postCnt%2 那份)同时进行,一轮时间从 load+compute=5 降到 max(load,compute)=3;本例 4 tile 从 20 降到 14 个单位(约 1.43×,渐近 1.67×)。延迟为演示值。"
+        }
+      ]
+    }
+  ]
+}

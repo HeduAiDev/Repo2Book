@@ -1,0 +1,193 @@
+{
+  "chapter": "ch18",
+  "title": "DAGSSBuffer:UB 多缓冲与昇腾的软件流水线",
+  "kind": "deep",
+  "skip_impl": true,
+  "scale_note": "DAGSSBuffer.cpp 单文件 5534 行(本书至今最大单文件),无 .py 精简版,宿主无 CANN 编不动。本档案**狠选核心脊梁 = N-buffer 变换本身**:① 把一份 buffer 扩成 N 份 + 2 个计数器塞进 scf.for 迭代参数(addDoubleBuffForArgs)② producer 按 frontCnt%N 决定写哪份、consumer 按 postCnt%N 决定读哪份(buildNBufferProducer/buildNBufferConsumer,N==2 退化成纯 select 免 scf.if)③ addMultiBuffCaculate 把这两段接到已有的『load-if / compute-if』上并回填 for.yield 让 buffer 轮转。**大胆省略**:AddIfCondition 里 wait-set 分块合并的一大坨(~1000 行 MergeWaitSetRegions/ExpandMergedRegionOps* 各种 V2/V3/V4 变体)、边界/多层嵌套/N>2 的嵌套 if 链细节,只作 supporting 机制点到、如实标注省略。",
+  "trace_source": "pin 精确源码 @2badfc89e(triton-lang 官方仓 v3.2.1);本章**无专用 lit 夹具**(unittest 内无 dag-ssbuf 的 RUN/CHECK 用例),交叉验证仅走 pin 逐段解读 + Passes.td 声明 + compiler.py 流水线位次。IR 素材由 explainer 依本档案的 double-buffer 前后语义**手工构造最小 scf.for 示例**并标注『非编译器 dump、演示用』,绝不伪造真实 dump。",
+
+  "code_spine": [
+    "third_party/ascend/backend/compiler.py:L122-L129  (流水线位次:add_dag_sync→add_dag_scope→cse/canon→add_dag_ssbuffer,ssbuf 在 scope/sync 之后,承 ch16/ch17)",
+    "third_party/ascend/include/TritonAffinityOpt/Passes.td:L11-L15  (pass 声明 dag-ssbuf,summary=Convert vector operations to shared storage buffer operations)",
+    "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L5513-L5528  (runOnOperation:5 段编排)",
+    "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L5461-L5511  (WalkAIVNestedForAndProcess:遍历非 cube scope 的外层 for,逐 level 触发 double-buffer)",
+    "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L4453-L4600  (addDoubleBuffForArgs:把 buffer 扩成 N 份 + 2 计数器塞进 scf.for iterArgs,重建循环)",
+    "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L4602-L4730  (buildNBufferProducer:frontCnt%N 决定写哪份 buffer)",
+    "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L4732-L4829  (buildNBufferConsumer:postCnt%N 决定读哪份 buffer)",
+    "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L5115-L5288  (addMultiBuffCaculate:接 producer/consumer 到 front/post IfOp,回填 for.yield 让 buffer 轮转)"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp",
+      "lines": "L5513-L5528",
+      "note": "整个 pass 的编排入口。5 段:①AddIfCondition 把循环体切成『load 的 if / compute 的 if』(供后续多缓冲改写的骨架);②FlowSssbuf/③ControlSsbufV2 做 buffer 流分析与控制;④ChangeAdvanceOpForm 规避 advance 落进 if;⑤WalkAIVNestedForAndProcess 传 bufferNum=2 做真正的 double-buffer 变换。原注释含中文,逐字保留。IR pass 名 = dag-ssbuf。",
+      "code": "void DAGSSBufferPass::runOnOperation() {\n  auto module = getOperation();\n\n  AddIfCondition(module);\n\n  FlowSssbuf(module);\n  ControlSsbufV2(module);\n\n  // advance不能出现在if里, 规避处理\n  ChangeAdvanceOpForm(module);\n\n  DenseMap<scf::IfOp, SmallVector<Value>> ifResultDeps;\n  WalkAIVNestedForAndProcess(module, ifResultDeps, 2);\n\n  return;\n}"
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp",
+      "lines": "L5497-L5508",
+      "note": "double-buffer 的驱动循环(节选自 WalkAIVNestedForAndProcess)。对每个外层 for,先 assignIfOpLevels 数出嵌套层数,再逐 level:collectIfInfo 找出该层要多缓冲的依赖 buffer(uniqueDeps),addDoubleBuffForArgs 把循环 iterArgs 扩容,最后 addMultiBuffCaculate 落多缓冲计算。bufferNum 从 runOnOperation 传入固定为 2。elide:上文的 module.walk/isCube 过滤、hasSSBufferIf/hasAncestorRootFor 筛选、诊断 llvm::outs 打印。",
+      "elide": ["module.walk(scope) + isCube(scope) 过滤只处理非 cube(vector)scope","hasSSBufferIf/hasAncestorRootFor 筛出根 for","llvm::outs()<<\"targetFors\"... 等诊断打印"],
+      "code": "      for (int level = 1; level <= maxLevels; level++) {\n        auto uniqueDeps = collectIfInfo(currentFor, ifResultDeps, level);\n        llvm::outs()<<\"maxLevels:\"<<maxLevels<<\"\\n\";\n        if (uniqueDeps.empty()) {\n          continue;\n        }\n        llvm::outs()<<\"uniqueDeps:\"<<uniqueDeps.size()<<\"\\n\";\n        auto newForOp = addDoubleBuffForArgs(module, uniqueDeps, bufferNum);\n        DenseMap<scf::IfOp, SmallVector<Value>> newIfResultDeps;\n        auto uniqueList = collectIfInfo(newForOp, newIfResultDeps, level);\n        addMultiBuffCaculate(module, uniqueList, newIfResultDeps, newForOp, bufferNum);\n      }"
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp",
+      "lines": "L4528-L4547",
+      "note": "core:一份 buffer → N 份 + 2 计数器。对每个要多缓冲的迭代参数索引 idx:push (bufferNum-1) 份**同一初值**的 buffer 副本(加上原有那份共 N 份),再 push 2 个初值为 0 的计数器(counterInit=arith.constant 0)。随后用扩容后的 iterArgs 重建 scf.for。可见 double-buffer=N 份 buffer + 2 计数器的空间代价就落在这里。elide:上文 depValueForIdxs 的定位、循环边界/step 的读取、counterInit 建立、IRMapping 克隆循环体、replaceAllUsesWith+erase 旧循环。IR 名:scf.for / arith.constant。",
+      "elide": ["depValueForIdxs 通过 scf.if else-yield → for iterArg 反查(L4463-4495)","originalLowerBound/UpperBound/Step/InitArgs 读取","counterInit = arith::ConstantIntOp 0 的建立(L4526)","IRMapping 映射 induction var + iterArgs、克隆 body、克隆 yield(L4549-4585)","forOp.replaceAllUsesWith + forOp.erase(L4587-4596)"],
+      "code": "    // 添加和depValueForIdxs相同的迭代参数和计数器\n    for (int64_t idx : depValueForIdxs) {\n        for (int i = 0; i < bufferNum - 1; i++) {\n            iterArgs.push_back(originalInitArgs[idx]);\n        }\n        \n        // 在迭代参数中添加计数器\n        for (int i = 0; i < 2; i++) {\n            iterArgs.push_back(counterInit);\n        }\n    }\n\n    builder.setInsertionPoint(forOp);\n    // 创建新的for循环\n    auto newForOp = builder.create<scf::ForOp>(\n        forOp.getLoc(),\n        originalLowerBound,\n        originalUpperBound,\n        originalStep,\n        iterArgs);"
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp",
+      "lines": "L4602-L4636",
+      "note": "core producer(写侧):本轮新算出的 newDepVal 该写进哪份 buffer。bufferIndex = frontCnt % N;isBuffer0 = (bufferIndex==0);把标量条件 splat 成张量 mask;newBuff0 = select(mask, newDepVal, buffs[0]) —— 轮到 0 号就把新数据写进 buffer0、否则保持旧值。**N==2 特化**(下半):newBuff1 = select(mask, buffs[1], newDepVal) 取相反侧(轮到 0 号写 buffer0 就保 buffer1;否则新数据落 buffer1),纯 select 免生成 scf.if;nextCnt = frontCnt+1。返回 [newBuff0, newBuff1, nextCnt]。elide:N>2 的嵌套 scf.if 链(L4638-4729,rootIf + nestedIf 链逐级更新一份 buffer,末级 yield 两份)——本书只讲 N=2,N>2 如实标注省略。IR 名:arith.remsi / arith.cmpi / tensor.splat / arith.select / arith.addi。",
+      "elide": ["N>2 时的 rootIf + nestedIf 嵌套链(L4638-4717):resultTypes 收集 buffs[1..N-1]、rootIf THEN 直接转发、else 链每级 cmp bufferIndex==i 后 select 更新 buffs[i]、末级(i==N-2)yield 两份 buffer","N>2 的 frontCnt 自增与 results 收集(L4719-4727)"],
+      "code": "SmallVector<Value> buildNBufferProducer(OpBuilder &builder, Location loc,\n                                        Value frontCnt, Value newDepVal,\n                                        ArrayRef<Value> buffs,\n                                        ArrayRef<Value> constants) {\n  // N-buffer producer: determines which buffer is written to newDepVal based on frontCnt % N\n  const int N = buffs.size();\n  SmallVector<Value> results;\n\n  // idx = frontCnt % N\n  Value bufferIndex =\n      builder.create<arith::RemSIOp>(loc, frontCnt, constants[N]);\n\n  // 1. buffer0: handle the first buffer separately\n  Value isBuffer0 = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,\n                                                  bufferIndex, constants[0]);\n\n  auto dstShapedType = mlir::dyn_cast<ShapedType>(newDepVal.getType());\n  auto maskType = RankedTensorType::get(dstShapedType.getShape(), isBuffer0.getType());\n  Value mask = builder.create<tensor::SplatOp>(loc, maskType, isBuffer0);\n  Value newBuff0 = builder.create<arith::SelectOp>(loc, mask, newDepVal, buffs[0]);\n\n  results.push_back(newBuff0);\n\n  // 2. Double-buffer specialization (when N == 2, a direct select is sufficient)\n  if (N == 2) {\n\n    Value newBuff1 = builder.create<arith::SelectOp>(loc, mask, buffs[1], newDepVal);\n\n    auto nextCnt = builder.create<arith::AddIOp>(loc, frontCnt, constants[1]);\n\n    results.push_back(newBuff1);\n    results.push_back(nextCnt.getResult());\n\n    return results;\n  }"
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp",
+      "lines": "L4732-L4758",
+      "note": "core consumer(读侧):本轮 compute 该**读**哪份 buffer。bufferIndex = postCnt % N;isBuffer0 = (bufferIndex==0)。**N==2 特化**:selected = select(mask, oldBuffs[0], oldBuffs[1]) —— 轮到 0 号就读 buffer0、否则读 buffer1;nextCnt = postCnt+1。返回 [selected, nextCnt]。与 producer 用**独立**的 postCnt(≠frontCnt),二者错开正是 load/compute 重叠的机理:producer 写第 i+1 轮要用的 buffer,consumer 读第 i 轮写好的另一份 buffer。elide:N>2 的 rootIf+nestedIf 读侧链(L4760-4828)。IR 名同 producer。",
+      "elide": ["N>2 时读侧 rootIf + nestedIf 链(L4760-4816):按 bufferIndex 逐级 cmp,命中即 yield oldBuffs[i],末级用 select 收尾","N>2 的 postCnt 自增与 results 收集(L4818-4826)"],
+      "code": "SmallVector<Value> buildNBufferConsumer(OpBuilder &builder, Location loc,\n                                        Value postCnt, ArrayRef<Value> oldBuffs,\n                                        ArrayRef<Value> constants) {\n  // Consumer: selects which buffer to read based on postCnt % N\n  const int bufferNum = oldBuffs.size();\n  SmallVector<Value> results;\n\n  // idx = postCnt % N\n  Value bufferIndex =\n      builder.create<arith::RemSIOp>(loc, postCnt, constants[bufferNum]);\n\n  Value isBuffer0 = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,\n                                                bufferIndex, constants[0]);\n  auto dstShapedType = mlir::dyn_cast<ShapedType>(oldBuffs[0].getType());\n  auto maskType = RankedTensorType::get(dstShapedType.getShape(), isBuffer0.getType());\n  auto mask = builder.create<tensor::SplatOp>(loc, maskType, isBuffer0);\n\n  // 1. Double-buffer specialization (avoid generating scf.if)\n  if (bufferNum == 2) {\n    Value selected = builder.create<arith::SelectOp>(loc, mask, oldBuffs[0], oldBuffs[1]);\n    auto nextCnt = builder.create<arith::AddIOp>(loc, postCnt, constants[1]);\n\n    results.push_back(selected);\n    results.push_back(nextCnt);\n\n    return results;\n  }"
+    },
+    {
+      "path": "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp",
+      "lines": "L5170-L5184",
+      "note": "接线处(节选自 addMultiBuffCaculate):明确 N 份 buffer 与 2 个计数器**从哪来**。buffer0 取自 front IfOp 的 else-yield(即上一轮循环带进来的旧值);buffer1..N-1 取自 addDoubleBuffForArgs 新加的 for iterArgs;两个计数器 frontCnt、postCnt 紧跟在这些 buffer iterArg 之后。extraArgBaseIdx 用 (2 + bufferNum - 1) 反算出本 dep 的 iterArg 起点——正对应扩容时每 dep 加的『N-1 份 buffer + 2 计数器』。elide:上文 postIfOps 收集、ifResultDeps 匹配、frontIfOp/depResultIndex 定位、constants 建立;下文 addResultsForFrontIfOp/addResultsForPostIfOp 调用与 for.yield 回填(step4-9)。",
+      "elide": ["postIfOps 收集与 ifResultDeps 匹配(L5132-5163)","constants 0..bufferNum 建立(L5186-5195)","addResultsForFrontIfOp(内部调 buildNBufferProducer)/ addResultsForPostIfOp(内部调 buildNBufferConsumer)(L5201-5233)","for.yield 回填 buffer1..N + frontCnt + postCnt 让状态跨轮传播(L5239-5282)"],
+      "code": "      // Collect all buffers\n      SmallVector<Value> buffers;\n\n      // buffer0 来自 else yield\n      buffers.push_back(frontIfOp.elseYield()->getOperand(depResultIndex));\n\n      // Other buffers come from for iter args\n      for (int i = 1; i < bufferNum; ++i) {\n        buffers.push_back(newForOp.getRegionIterArgs()[extraArgBaseIdx + i - 1]);\n      }\n\n      // Two counters\n      Value frontCnt =\n          newForOp.getRegionIterArgs()[extraArgBaseIdx + bufferNum - 1];\n      Value postCnt = newForOp.getRegionIterArgs()[extraArgBaseIdx + bufferNum];"
+    }
+  ],
+
+  "key_classes": [
+    {"name": "DAGSSBufferPass", "file": "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L69-L77", "responsibility": "pass 外壳(继承 DAGSSBufferBase),runOnOperation 编排 5 段;IR 名 dag-ssbuf;依赖方言 hivm/bufferization/scope/annotation(Passes.td:L14)。"},
+    {"name": "addDoubleBuffForArgs", "file": "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L4453", "responsibility": "把每个要多缓冲的 buffer 迭代参数扩成 N 份 + 2 计数器,重建 scf.for(空间代价的落点)。返回新 for。"},
+    {"name": "buildNBufferProducer", "file": "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L4602", "responsibility": "写侧选择:frontCnt%N 决定本轮 load/算出的 newDepVal 写进哪份 buffer;N==2 纯 select、N>2 嵌套 scf.if 链。"},
+    {"name": "buildNBufferConsumer", "file": "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L4732", "responsibility": "读侧选择:postCnt%N 决定本轮 compute 读哪份 buffer;postCnt 独立于 frontCnt,错开即重叠。"},
+    {"name": "addMultiBuffCaculate", "file": "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L5115", "responsibility": "把 producer/consumer 接到已有的 front(load)/post(compute)IfOp 上,回填 for.yield 让 N 份 buffer 与 2 计数器跨轮传播。"},
+    {"name": "WalkAIVNestedForAndProcess", "file": "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L5461", "responsibility": "驱动:遍历非 cube(vector)scope 内的根 for,逐嵌套 level 触发 double-buffer(bufferNum=2)。"},
+    {"name": "AddIfCondition", "file": "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L4158", "responsibility": "前置阶段(supporting):按 wait-set 把循环体切/合并成『load 的 scf.if / compute 的 scf.if』分区,给多缓冲阶段提供 front/post IfOp 骨架。内部含大量 Merge/Expand 变体,本书大幅省略。"},
+    {"name": "collectIfInfo", "file": "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L5373", "responsibility": "按 ssbuffer.level 属性逐层收集 if 间的依赖 buffer(一个 if 产出、另一个 if 消费的 Value),给多缓冲阶段一份 uniqueDeps 清单。"},
+    {"name": "assignIfOpLevels / hasSSBufferIf / isCube", "file": "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L5307,L5329,L5450", "responsibility": "辅助判定:标注 if 嵌套层级、判断 for 是否含 ssbuffer if、判断 scope 是否 cube(含 tt.dot)——ssbuf 只处理 vector scope。"}
+  ],
+
+  "data_flow": [
+    {"step": "1. 流水线定位", "detail": "compiler.py add_dag_ssbuffer 在 add_dag_scope/add_dag_sync + cse/canon 之后调用(compiler.py:L127);即先有 ch17 的 scope+sync 骨架,再做 UB 多缓冲。仅当 metadata['add_auto_scheduling'] 为真才进这条自动调度链。"},
+    {"step": "2. 切分 load/compute if", "detail": "AddIfCondition 把单核循环体按 wait-set 切成『搬运(load)的 scf.if』与『计算(compute)的 scf.if』分区(带 ssbuffer 属性/ssbuffer.level),这是后续多缓冲改写的骨架。(大量合并/扩展细节省略)"},
+    {"step": "3. buffer 流分析", "detail": "FlowSssbuf/ControlSsbufV2 识别带 sync_block_set 且 ssbuffer 属性的目标 for、处理跨 wait 的 buffer 流与控制。ChangeAdvanceOpForm 把 tt.advance 挪出 if 规避非法嵌套。"},
+    {"step": "4. 逐层找依赖", "detail": "WalkAIVNestedForAndProcess 遍历非 cube scope 根 for;assignIfOpLevels 数嵌套层;collectIfInfo(level) 找出该层『前一个 if 产出、后一个 if 消费』的 buffer 依赖 uniqueDeps。"},
+    {"step": "5. 扩 iterArgs", "detail": "addDoubleBuffForArgs 对每个 dep 在 scf.for iterArgs 追加 (bufferNum-1) 份 buffer 副本 + 2 个计数器(frontCnt/postCnt,初值 0),重建循环。"},
+    {"step": "6. 装 producer", "detail": "addMultiBuffCaculate → addResultsForFrontIfOp 在 load-if 内插 buildNBufferProducer:frontCnt%N 选写侧 buffer(N==2 纯 select),把新数据写进当轮 buffer、其余保持,frontCnt+1。"},
+    {"step": "7. 装 consumer", "detail": "addResultsForPostIfOp 在 compute-if 内插 buildNBufferConsumer:postCnt%N 选读侧 buffer,取出上一轮写好的另一份 buffer,postCnt+1。"},
+    {"step": "8. 回填 yield", "detail": "addMultiBuffCaculate 把 N 份 buffer 与两个计数器的新值写回 for.yield 对应位置(L5239-5282),使 buffer 状态与计数器跨迭代轮转——第 i 轮写的 buffer 在第 i+1 轮被读,load 与 compute 就此在时间上错开重叠。"}
+  ],
+
+  "design_decisions": [
+    {"decision": "double-buffer 用『iterArgs 里放 N 份 buffer + 循环携带值』而非改写内存 alloc", "why": "在 scf 结构化控制流层做变换:buffer 作为 for 的迭代携带值(loop-carried value)在 SSA 里显式轮转,select/if 纯值语义、无需别名分析;下游再 bufferize 成真实 UB 分配。这也是为何空间代价=多留 N-1 份 buffer 迭代参数。", "evidence": "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L4528-L4547"},
+    {"decision": "N==2 特化为纯 arith.select、跳过 scf.if", "why": "双缓冲是最常见档位;两份 buffer 的『二选一』一条 select 即可,避免生成 scf.if 造成控制流膨胀与后续 pass 负担。N>2 才退回嵌套 if 链。", "evidence": "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L4626-L4636 (producer) / L4750-L4758 (consumer)"},
+    {"decision": "producer 与 consumer 用两个独立计数器 frontCnt / postCnt", "why": "写侧与读侧在**不同 if 分支**里各自推进(load-if 命中才 frontCnt+1,compute-if 命中才 postCnt+1),二者错开一个身位,才能『写第 i+1 份的同时读第 i 份』实现访存-计算重叠。单计数器会让读写落到同一份 buffer、退回串行。", "evidence": "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L5182-L5184 (两计数器) / L4630 frontCnt+1 / L4752 postCnt+1"},
+    {"decision": "只对 vector(非 cube)scope 做 UB 多缓冲", "why": "UB(Unified Buffer)是服务 vector 核的片上缓冲;isCube(含 tt.dot)的 scope 走 cube 路(L0A/L0B/L0C),不在本 pass 职责内。", "evidence": "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L5468-L5471 (isCube 跳过) / L5450-L5458 (isCube 定义)"},
+    {"decision": "标量条件先 tensor.splat 成张量 mask 再 select", "why": "被多缓冲的 buffer 是张量(RankedTensorType);arith.select 要求 mask 与被选值同形,故把标量 i1 条件 splat 成与 buffer 同 shape 的布尔张量。", "evidence": "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L4618-L4621"}
+  ],
+
+  "theory": [
+    "重叠原理(核心直觉,writer 必须讲透『少了会怎样』):单缓冲下一轮循环是『搬(load)→算(compute)→搬→算』严格串行,算的时候访存单元空转、搬的时候计算单元空转。双缓冲把一份 buffer 变两份 ping-pong:第 i 轮 compute 读 buffer A(第 i-1 轮已搬好)的同时,第 i+1 轮的 load 正往 buffer B 搬;下一轮角色互换。稳态下访存与计算在时间上完全重叠,单次迭代时间从 T_load+T_compute 降到 max(T_load, T_compute)。",
+    "为何是『2 份 + 2 计数器』:N 份 buffer 允许 load 领先 consumer 最多 N-1 步(更深流水、掩藏更长/更抖的访存延迟),代价是 N 倍 UB 占用(呼应 ch02:double-buffer 默认开、把可用 UB 从 192KB 砍半到约 96KB)。本 pass runOnOperation 固定传 bufferNum=2,即最经典的双缓冲。frontCnt/postCnt 两个模 N 游标分别驱动写指针与读指针,读指针滞后写指针即形成流水深度。",
+    "与 GPU 软件流水线的对位(承 ch17、对位基座 ch29-30):GPU 靠 cp.async + num_stages 让编译器自动多级预取、异步拷贝硬件自然重叠;昇腾没有隐式异步 DMA + cache,必须在 IR 里**显式**把 buffer 复制成 N 份、用 select/if 手写轮转指针,并配合 ch17 的跨核事件同步保证读到的是搬完的数据。同一个『软件流水线』目标,GPU 是隐式声明 stage 数、昇腾是显式物化每一份 buffer 与每一步搬运。",
+    "复杂度/规模事实(经得起复算):addDoubleBuffForArgs 每个 dep 新增 iterArg 数 = (bufferNum-1) 份 buffer + 2 计数器 = 对 N=2 恰 3 个(1 份 buffer + 2 计数器);addMultiBuffCaculate 里 extraArgBaseIdx 反算用的 (2 + bufferNum - 1) 与之逐位对齐。producer N==2 生成 3 个 arith.select 之外的 op:1 remsi + 1 cmpi + 1 splat + 2 select + 1 addi;consumer N==2:1 remsi + 1 cmpi + 1 splat + 1 select + 1 addi。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [],
+    "must_keep": [
+      {"symbol": "addDoubleBuffForArgs", "why": "core 机制①:buffer→N 份+2 计数器的扩容点,读者理解空间代价与轮转载体的锚。"},
+      {"symbol": "buildNBufferProducer", "why": "core 机制②写侧:frontCnt%N 选写 buffer;N==2 纯 select 特化是最小可讲实例。"},
+      {"symbol": "buildNBufferConsumer", "why": "core 机制②读侧:postCnt%N 选读 buffer;与 producer 错开即重叠。"},
+      {"symbol": "addMultiBuffCaculate", "why": "core 机制③:producer/consumer 接线到 load/compute if + 回填 yield 轮转的总装。"},
+      {"symbol": "WalkAIVNestedForAndProcess", "why": "驱动入口,读者据此知道『何时/对谁』做双缓冲(vector scope 的根 for、逐 level)。"},
+      {"symbol": "frontCnt", "why": "写指针游标;双计数器机理的一半,writer 必须显式对比 postCnt 讲清错位。"},
+      {"symbol": "postCnt", "why": "读指针游标;滞后 frontCnt 形成流水深度。"},
+      {"symbol": "bufferNum", "why": "缓冲份数(runOnOperation 传 2);N=2 与 N>2 分叉、空间代价的参数。"},
+      {"symbol": "isCube", "why": "职责边界:只对 vector scope 做 UB 多缓冲,与 cube 路划清。"},
+      {"symbol": "runOnOperation", "why": "5 段编排骨架,读者据此定位 double-buffer 在整个 pass 的位置。"}
+    ],
+    "skip_impl_note": "本章 skip_impl=true:5534 行纯 C++ MLIR pass,无 .py 精简版,宿主无 CANN 编不动。delete 留空(无精简版可减);must_keep 供 writer 判断哪些符号必须在正文讲清,lint_fidelity 本章不跑。"
+  },
+
+  "mechanisms": [
+    {
+      "id": "m1-iterarg-expand",
+      "name": "一份 buffer 扩成 N 份 + 2 计数器(塞进 scf.for 迭代参数)",
+      "kind": "algorithm",
+      "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L4453-L4600", "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L4528-L4547"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "worked example:展示一个带单 buffer iterArg 的 scf.for 被扩成 (buffer0, buffer1, frontCnt, postCnt) 的前后 IR。"
+    },
+    {
+      "id": "m2-producer-consumer-select",
+      "name": "producer/consumer 按计数器 mod N 选 buffer(N==2 纯 select 特化)",
+      "kind": "algorithm",
+      "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L4602-L4636", "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L4732-L4758"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "worked example:N=2 时 frontCnt=0,1,2,3 各轮 producer 写哪份、postCnt 各轮 consumer 读哪份的逐轮对照表(bufferIndex=cnt%2 → select 走向)。kind=algorithm 且无论文出处(编译器变换)。"
+    },
+    {
+      "id": "m3-load-compute-overlap",
+      "name": "load 与 compute 跨迭代重叠(双计数器错位=流水深度)",
+      "kind": "dataflow",
+      "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L5170-L5184", "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L5239-L5282"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "note": "本章的『为什么值得』:图/例展示单缓冲串行 vs 双缓冲重叠的时间线(第 i 轮读 A 同时第 i+1 轮写 B),以及 frontCnt/postCnt 错一位如何保证读到的是上一轮搬好的数据。"
+    },
+    {
+      "id": "m4-pass-orchestration",
+      "name": "runOnOperation 5 段编排",
+      "kind": "config",
+      "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L5513-L5528", "third_party/ascend/backend/compiler.py:L122-L129"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "note": "定位 double-buffer 在整条 dag-ssbuf pass 及编译流水线(ssbuf 在 dag-scope/dag-sync 之后)中的位置,承 ch16/ch17。"
+    },
+    {
+      "id": "m5-load-compute-if-partition",
+      "name": "AddIfCondition 把循环体切成 load-if / compute-if 分区(骨架)",
+      "kind": "dataflow",
+      "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L4158-L4263"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "note": "多缓冲阶段改写的 front(load)/post(compute)IfOp 从这里来。内部 wait-set 合并/扩展(MergeWaitSetRegions/ExpandMergedRegionOps* 各 V2/V3/V4)大幅省略,只作骨架来源交代。"
+    },
+    {
+      "id": "m6-level-dep-collection",
+      "name": "按 ssbuffer.level 逐层收集 if 间依赖 buffer(collectIfInfo)",
+      "kind": "dataflow",
+      "source_anchors": ["third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L5373-L5448", "third_party/ascend/lib/TritonAffinityOpt/DAGSSBuffer.cpp:L5307-L5327"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "note": "决定『对哪些 buffer、在哪一嵌套层』做多缓冲(前一个 if 产出、后一个 if 消费的 Value);嵌套循环的分层处理,细节省略。"
+    }
+  ],
+
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_pay_off": [
+      {
+        "id": "f3",
+        "planted_in": "ch17",
+        "text": "切好的两个 scope 里跨核 buffer 只是单块分配(够用就好);真机要榨干双核并行度需要 UB 多缓冲,让 cube 算第 N 块同时 vector 处理第 N-1 块——这是管线第三趟 add_dag_ssbuffer(DAGSSBuffer)的活儿,下一章开讲",
+        "how_to_pay_off": "本章正是 f3 的兑现:开篇回指 ch17 f3,点明 DAGSSBuffer 就是那趟 UB 多缓冲。**校准**:f3 措辞是『cube 算第 N 块同时 vector 处理第 N-1 块』(偏跨核 CV 流水语气),而 DAGSSBuffer 的真实增量是**单核循环内部**把一份 UB buffer 扩成 N 份、用 frontCnt/postCnt 错位让 load 与 compute 在时间上重叠(与 ch17 的跨核 scope/sync 正交、不重复)。writer 回收时须把口径落到『单核内 UB 多缓冲、访存↔计算重叠』,cube/vector 跨核并行的部分链接回指 ch17,勿在本章重复讲跨核同步。"
+      }
+    ]
+  }
+}
