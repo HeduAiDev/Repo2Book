@@ -55,21 +55,30 @@ def manifest_figure_ids(chapter_dir):
     return [f.get("figure_id") for f in figs if isinstance(f, dict) and f.get("figure_id")]
 
 
+_FIG = re.compile(r'^fig-')
+_CHNN = re.compile(r'^ch\d{2}-')
+
+
+def _core(fid):
+    """归一化 figure_id：去掉可选的 `fig-` 前缀、再去掉可选的 `chNN-` 前缀，
+    得到「核心名」。各章登记体例不一(有的 fig-chNN-m1-x、有的 fig-m1-x、
+    有的 chNN-m1-x、chapter-map↔fig-chNN-chapter-map),核心名统一后可比。"""
+    s = _FIG.sub('', fid, count=1)
+    s = _CHNN.sub('', s, count=1)
+    return s
+
+
 def check(chapter_dir, bible_idx):
-    """→ [未登记的 figure_id...]。"""
+    """→ [未登记的 figure_id...]（按归一化核心名比对，容忍 fig-/chNN- 前缀差异）。"""
     p = pathlib.Path(chapter_dir)
     mnum = CHNN.search(p.name)
     if not mnum:
         return []
     cid = mnum.group(1)
-    registered = bible_idx.get(cid, set())
+    registered_cores = {_core(f) for f in bible_idx.get(cid, set())}
     missing = []
     for fid in manifest_figure_ids(chapter_dir):
-        # chapter-map 在 bible 里登记为 fig-<chNN>-chapter-map
-        candidates = {fid}
-        if fid == "chapter-map":
-            candidates.add(f"fig-{cid}-chapter-map")
-        if not (candidates & registered):
+        if _core(fid) not in registered_cores:
             missing.append(fid)
     return missing
 
