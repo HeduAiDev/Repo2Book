@@ -323,7 +323,7 @@ def get_current_stream(self, device: Optional[int] = None) -> int:
 
 `get_current_target` 产出一个 `GPUTarget`（triton 描述编译目标的三元组，尽管名字带 GPU，昇腾照用）：`backend="npu"`；`arch`（架构描述串）优先取环境变量 `TRITON_ASCEND_ARCH`，没设就落到 `self.utils.get_arch()` 探硬件（下一节讲）；`warp_size=0`。**`warp_size=0` 是一处诚实的留白**——warp（线程束，SIMT 架构里一组锁步执行的线程）是 GPU 概念，达芬奇不是 SIMT 架构、根本没有 warp，所以这个字段填 0，等于告诉上层「此概念在我这儿不适用」。这和 §29.3 里四元组末两位补 0、`shared` 标 meaningless 是同一种手法：**为对齐 GPU 契约而保留字段，用零值／空值诚实标注「不适用」**。
 
-`device` 和 `stream` 三个方法都转手给 `get_backend_func`（一层薄封装，按名字去 `torch_npu` 模块取同名属性再调用，内部机制本章不展开）——分派到 `torch_npu`（昇腾的 PyTorch 扩展，[第 2 章](../../ch02-davinci-npu-hardware-model/narrative/chapter.md)提过 `import torch_npu` 即把加工线切到 NPU 路）。注释点破了缘由：`torch.npu.Stream` 的内容本质就是一个 `rtStream_t`（CANN 的流句柄），既然 `torch_npu` 已经管好了设备与流，直接复用免得自己再封一层；源码那句 `TODO: use CANN API instead` 也老实标了这是权宜、将来想改成直接调 CANN。
+`device` 和 `stream` 三个方法都转手给 `get_backend_func`（一层薄封装：按名字查一张两级策略注册表、分派到当前框架的对应实现，这套注册表机制是[第 31 章](../../ch31-two-frameworks/narrative/chapter.md)的主题，本章不展开）——分派到 `torch_npu`（昇腾的 PyTorch 扩展，[第 2 章](../../ch02-davinci-npu-hardware-model/narrative/chapter.md)提过 `import torch_npu` 即把加工线切到 NPU 路）。注释点破了缘由：`torch.npu.Stream` 的内容本质就是一个 `rtStream_t`（CANN 的流句柄），既然 `torch_npu` 已经管好了设备与流，直接复用免得自己再封一层；源码那句 `TODO: use CANN API instead` 也老实标了这是权宜、将来想改成直接调 CANN。
 
 ## 29.8　探硬件规格：SoC 版本与双核数
 
