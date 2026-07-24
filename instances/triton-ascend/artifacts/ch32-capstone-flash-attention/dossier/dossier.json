@@ -1,0 +1,302 @@
+{
+  "chapter_id": "ch32",
+  "slug": "ch32-capstone-flash-attention",
+  "title": "实战收官:flash-attention 融合注意力在昇腾的 CV 融合落地",
+  "mode": "meta",
+  "kind": "skip_impl",
+  "one_line": "拿仓库自带的 tutorials/06-fused-attention.py(365 行真实 Flash Attention v2 kernel)当活体标本,把全书讲过的每一层——语言层显式搬运→ttadapter 结构化下降→核亲和双核分工→HFusion 融合→HIVM 下降→AscendC 库调用——在这一个真核上从头串一遍,看一段 Triton kernel 如何落成达芬奇 Cube/Vector 协同的 CV 融合注意力。",
+
+  "code_spine": [
+    "third_party/ascend/tutorials/06-fused-attention.py:L263-L317  用户入口:_attention(torch.autograd.Function).forward + attention = _attention.apply,分配 acc/M workspace、按 causal 定 STAGE、以 num_cores=20 的一维网格发射 _attn_fwd",
+    "third_party/ascend/tutorials/06-fused-attention.py:L148-L172  主 kernel _attn_fwd:tl.program_id(0) 取核号,for block_idx in range(pid, NUM_BLOCKS, 20) 持久化 grid-stride 循环把逻辑块摊到 20 个物理核",
+    "third_party/ascend/tutorials/06-fused-attention.py:L174-L226  为 Q/K/V/Out 建 make_block_ptr 块指针 + 初始化 offs_m/offs_n、m_i(-inf)、l_i(1.0)、acc,q = tl.load(Q_block_ptr) 常驻",
+    "third_party/ascend/tutorials/06-fused-attention.py:L228-L245  STAGE 位掩码分派:causal 时 STAGE=3,先 STAGE&1(off-band,传 4-STAGE=1)再 STAGE&2(on-band,传 2);非 causal 时 STAGE=1 直接传 3 全序列",
+    "third_party/ascend/tutorials/06-fused-attention.py:L48-L84  _attn_fwd_inner:按 STAGE 定列区间 [lo,hi),tl.advance 把 K/V 块指针推到 lo,进入按 BLOCK_N 步进的内循环",
+    "third_party/ascend/tutorials/06-fused-attention.py:L86-L119  内循环心跳:tl.dot(q,trans_k)→QK^T(Cube)、减 max 求 exp 求 sum→softmax(Vector)、tl.dot(p_cast,v)→PV(Cube),在线更新 m_i/l_i/acc",
+    "third_party/ascend/tutorials/06-fused-attention.py:L247-L260  收尾:m_i += log(l_i)、acc/l_i 归一、tl.store 写回 M(logsumexp)与 O",
+    "third_party/ascend/AscendNPU-IR/docs/source/en/user_guide/best_practice.md:L861-L897  Cube-Vector(CV)最佳实践:cube→vector→cube 生命周期重叠可致 L1 溢出,对第二个 tl.dot(pv) 加 hivm.tile_mix_cube_num 提示让编译器子切分——文档正拿 _attn_fwd_inner 举例",
+    "third_party/ascend/unittest/pytest_ut/test_06_fused_attention.py:L329-L353  交叉验证夹具:torch_npu.npu_fusion_attention 作参考实现,atol/rtol=1e-2 比对(host 无 NPU,靠逐行核源码 + 该夹具兜底)"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "third_party/ascend/tutorials/06-fused-attention.py",
+      "lines": "L47-L53",
+      "what": "_attn_fwd_inner 签名——注意力内循环的全部输入。acc_ptr/l_i/m_i 是在线 softmax 的三件累加器,q 是常驻查询块,K_block_ptr/V_block_ptr 是块指针,STAGE 决定处理哪段列。",
+      "code": "@triton.jit\ndef _attn_fwd_inner(acc_ptr, l_i, m_i, q,  # Accumulator, local l, local m, query vector\n                    K_block_ptr, V_block_ptr,  # Key and value block pointers for current stage\n                    start_m, qk_scale,  # Starting position of current query block, qk scale factor\n                    BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  # Block size constants\n                    STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  # Current stage flag, m and n offset indices\n                    N_CTX: tl.constexpr, fp8_v: tl.constexpr):  # Total context length, whether to enable FP8 for value precision",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/tutorials/06-fused-attention.py",
+      "lines": "L61-L76",
+      "what": "因果掩码的 STAGE 分段:STAGE==1 处理查询块之前的全部列(off-band,无需逐元素掩码),STAGE==2 只处理对角的当前块(on-band,需三角掩码),else(STAGE==3,非因果)扫全序列。分段的意义:把绝大多数不需要掩码的列和少数需要掩码的对角块拆开,让编译器能独立调度两段循环。tl.advance 把 K/V 块指针推进到列起点 lo。",
+      "code": "    if STAGE == 1:\n        # Stage 1: process all tokens before the query block\n        tl.static_assert(BLOCK_M >= BLOCK_N)\n        lo, hi = 0, start_m * BLOCK_M\n    elif STAGE == 2:\n        # Stage 2: process the current query block\n        tl.static_assert(BLOCK_M >= BLOCK_N)\n        lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M\n        lo = tl.multiple_of(lo, BLOCK_M)  # Align starting position\n    # causal = False (no need for masking)\n    else:\n        lo, hi = 0, N_CTX  # Process the entire context\n\n    # Adjust K and V block pointers to the starting position `lo`\n    K_block_ptr = tl.advance(K_block_ptr, (lo, 0))  # K is [HEAD_DIM, N_CTX], shift along the second dim by lo\n    V_block_ptr = tl.advance(V_block_ptr, (lo, 0))  # V is [N_CTX, HEAD_DIM], shift along the first dim by lo",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/tutorials/06-fused-attention.py",
+      "lines": "L84-L120",
+      "what": "整章的心脏:一次 K/V 块的 Cube→Vector→Cube 心跳。tl.dot(q, trans_k) 是第一次矩阵乘(→Cube 核);从 qk*qk_scale 到 tl.where 掩码、tl.max、tl.math.exp、tl.sum、tl.math.exp(m_i-m_ij) 全是逐元素/规约(→Vector 核);tl.dot(p_cast, v) 是第二次矩阵乘(→Cube 核)。alpha=exp(m_i-m_ij) 是在线 softmax 的重标定因子,acc_ptr = acc_ptr*alpha + dot(p_cast,v) 就是 Flash Attention v2 的核心累加。这段代码把「注意力=两次 matmul 夹一个 softmax」这个双核分工的事实写在了明面上。",
+      "code": "    for start_n in range(lo, hi, BLOCK_N):  # Process BLOCK_N columns at a time\n        start_n = tl.multiple_of(start_n, BLOCK_N)  # Align column start position\n        # -- Compute qk ----\n        k = tl.load(K_block_ptr)\n        # Modify K\n        trans_k = tl.trans(k)\n        qk = tl.dot(q, trans_k)\n        # Apply causal mask for STAGE 2\n        if STAGE == 2:\n            mask = offs_m[:, None] >= (start_n + offs_n[None, :])  # Construct upper triangular mask\n            qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)  # Set invalid positions to -∞\n            m_ij = tl.maximum(m_i, tl.max(qk, 1))  # Update m_ij = max(m_i, max(qk))\n            qk -= m_ij[:, None]  # Subtract max for softmax stability\n        else:\n            qk = qk * qk_scale\n            m_ij = tl.maximum(m_i, tl.max(qk, 1))  # Scaled max\n            qk = qk - m_ij[:, None]  # Stabilize\n\n        # Softmax weights p = exp(qk)\n        p = tl.math.exp(qk)\n\n        # Convert softmax weight type depending on FP8 usage\n        if fp8_v:\n            p_cast = p.to(tl.float8e5)  # Convert to FP8 format (save memory)\n        else:\n            p_cast = p.to(k.dtype)\n\n        v = tl.load(V_block_ptr)  # Load corresponding V block\n        pv = tl.dot(p_cast, v)\n        l_ij = tl.sum(p, 1)  # Softmax denominator (sum of each row)\n        # -- Update m_i and l_i\n        alpha = tl.math.exp(m_i - m_ij)  # Update factor: exp difference between old and new max\n        l_i = l_i * alpha + l_ij  # Update softmax denominator\n        # -- Update output accumulator --\n        if HEAD_DIM < 256:\n            acc_ptr = acc_ptr * alpha[:, None]\n            acc_ptr = tl.dot(p_cast, v, acc_ptr)",
+      "elide": ["HEAD_DIM >= 256 的 else 分支(L121-L137)用 extension.extract_slice/insert_slice 按 1/4 BLOCK_M 分片更新 acc 以避免 UB 溢出——单独作为 mechanism head-dim-256-slicing 讲,此处只保留 HEAD_DIM<256 的直白路径"]
+    },
+    {
+      "path": "third_party/ascend/tutorials/06-fused-attention.py",
+      "lines": "L165-L173",
+      "what": "持久化(persistent)网格:一维网格只发 num_cores=20 个 program,每个 program 用 grid-stride 循环 range(pid, NUM_BLOCKS, 20) 领走属于自己的那批逻辑块。这正是 best_practice.md「Tiling strategy」建议——让逻辑核数贴近物理核数、避免海量逻辑核的发射/调度开销;对照 09-persistent-matmul.py 的 matmul_kernel_persistent 是同一模式的另一处示范。",
+      "code": "    # Current M-dimension block index\n    pid = tl.program_id(0)\n\n    for block_idx in range(pid, NUM_BLOCKS, 20):\n        task_hz_idx = block_idx // NUM_BLOCKS_M\n        task_m_idx = block_idx % NUM_BLOCKS_M\n        off_z = task_hz_idx // H\n        off_h = task_hz_idx % H\n        qvk_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/tutorials/06-fused-attention.py",
+      "lines": "L174-L206",
+      "what": "块指针(block_ptr)是全书语言层「显式搬运」主线的活例——用 tl.make_block_ptr 给 Q/K/V/Out 各造一个带 base/shape/strides/offsets/block_shape/order 六元组的块指针,后续 tl.load/tl.store/tl.advance 都对它操作。呼应 ch12 BlockPtrAnalysis:编译器正是靠这六元组把块访问物化成结构化张量。",
+      "code": "        # Create block pointers for Q, K, V, Output\n        Q_block_ptr = tl.make_block_ptr(\n            base=Q + qvk_offset,\n            shape=(N_CTX, HEAD_DIM),\n            strides=(stride_qm, stride_qk),\n            offsets=(task_m_idx * BLOCK_M, 0),\n            block_shape=(BLOCK_M, HEAD_DIM),\n            order=(1, 0),\n        )\n        V_block_ptr = tl.make_block_ptr(\n            base=V + qvk_offset,\n            shape=(N_CTX, HEAD_DIM),\n            strides=(stride_vn, stride_vk),\n            offsets=(0, 0),\n            block_shape=(BLOCK_N, HEAD_DIM),\n            order=(1, 0),\n        )\n        K_block_ptr = tl.make_block_ptr(\n            base=K + qvk_offset,\n            shape=(N_CTX, HEAD_DIM),\n            strides=(stride_kn, stride_kk),\n            offsets=(0, 0),\n            block_shape=(BLOCK_N, HEAD_DIM),\n            order=(1, 0),\n        )\n        O_block_ptr = tl.make_block_ptr(\n            base=Out + qvk_offset,\n            shape=(N_CTX, HEAD_DIM),\n            strides=(stride_om, stride_on),\n            offsets=(task_m_idx * BLOCK_M, 0),\n            block_shape=(BLOCK_M, HEAD_DIM),\n            order=(1, 0),\n        )",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/tutorials/06-fused-attention.py",
+      "lines": "L227-L245",
+      "what": "STAGE 位掩码的两趟调用。causal=True→外层 STAGE=3(二进制 11):STAGE&1 触发 off-band 一趟(传给内层的 STAGE 是 4-STAGE=1),STAGE&2 触发 on-band 一趟(传 2)。causal=False→外层 STAGE=1(二进制 01):只 STAGE&1 触发一趟,传 4-1=3 走全序列 else 分支。注释里的 barrier 说法解释了为什么拆两趟:方便编译器独立调度两段循环。",
+      "code": "        # stage 1: off-band\n        # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE\n        # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE\n        if STAGE & 1:\n            acc_ptr, l_i, m_i = _attn_fwd_inner(acc_ptr, l_i, m_i, q, K_block_ptr, V_block_ptr,  #\n                                                task_m_idx, sm_scale,  #\n                                                BLOCK_M, HEAD_DIM, BLOCK_N,  #\n                                                4 - STAGE, offs_m, offs_n, N_CTX, V.dtype.element_ty == tl.float8e5  #\n                                                )\n        # stage 2: on-band\n        if STAGE & 2:\n            # barrier makes it easier for compielr to schedule the\n            # two loops independently\n            acc_ptr, l_i, m_i = _attn_fwd_inner(acc_ptr, l_i, m_i, q, K_block_ptr, V_block_ptr,  #\n                                                task_m_idx, sm_scale,  #\n                                                BLOCK_M, HEAD_DIM, BLOCK_N,  #\n                                                2, offs_m, offs_n, N_CTX, V.dtype.element_ty == tl.float8e5  #\n                                                )",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/tutorials/06-fused-attention.py",
+      "lines": "L247-L260",
+      "what": "收尾:m_i += log(l_i) 得到 logsumexp(反向要用),acc/l_i[:, None] 完成 softmax 的除法归一(在线算法把除法拖到最后一次做),再 tl.store 把 logsumexp 写回 M、把归一化输出写回 O。",
+      "code": "        m_i += tl.math.log(l_i)\n        if HEAD_DIM < 256:\n            accumulator = acc_ptr / l_i[:, None]\n        else:\n            row = tl.arange(0, BLOCK_M)[:, None]\n            col_head_dim = tl.arange(0, HEAD_DIM)[None, :]\n            block2d_acc = row * HEAD_DIM + col_head_dim\n            accumulator = tl.load(acc_ptr + block2d_acc)\n            accumulator = accumulator / l_i[:, None]\n\n        m_ptrs = M + task_hz_idx * N_CTX + offs_m\n\n        tl.store(m_ptrs, m_i)\n        tl.store(O_block_ptr, accumulator.to(Out.type.element_ty))",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/tutorials/06-fused-attention.py",
+      "lines": "L288-L298",
+      "what": "Host 侧发射:stage = 3 if causal else 1;显式在 GM 里 torch.zeros 一块 acc workspace(HEAD_DIM>=256 时 kernel 直接读写它);num_cores=20 硬编码物理核数作为一维网格大小;M 存 logsumexp。这是持久化网格与 GM workspace 两个 NPU 友好选择的 Host 侧根源。",
+      "code": "        out = torch.empty_like(q)\n        stage = 3 if causal else 1\n        extra_kern_args = {}\n        \n\n        # Number of NPU cores (adjust based on hardware)\n        num_cores = 20\n        acc = torch.zeros((q.shape[0], q.shape[1], q.shape[2], HEAD_DIM_K), dtype=torch.float32, device=q.device)\n        M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)\n\n        _attn_fwd[(num_cores,)](",
+      "elide": ["紧随其后 L299-L309 是把 q/k/v/M/out/acc/sm_scale + 全部 stride + Z/H/N_CTX/HEAD_DIM/BLOCK_M/BLOCK_N/STAGE 传进 kernel 的实参列表,逐一对应 _attn_fwd 签名,无新语义"]
+    },
+    {
+      "path": "third_party/ascend/AscendNPU-IR/docs/source/en/user_guide/best_practice.md",
+      "lines": "L891-L897",
+      "what": "CV 融合的一条编译提示,文档正拿本章的 _attn_fwd_inner 举例:cube(qk)→vector(softmax)→cube(pv)三段生命周期重叠,编译器只单独分析一个 matmul、看不到第二个 dot 的 tiling,可能 L1 越界;给第二个 dot 的结果 pv 加 hivm.tile_mix_cube_num 提示让编译器对它子切分。这把 ch21-22 HFusion 的 CV 融合、ch23-25 HIVM 的 L1/L0 内存层级,落回到 flash-attention 这个真核上。",
+      "code": "qk = tl.dot(q, trans_k)\n# softmax calculation in between\nqk = ...\np = tl.math.exp(qk)\npv = tl.dot(p, v)\ntl.compile_hint(pv, \"hivm.tile_mix_cube_num\", 2)",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/unittest/pytest_ut/test_06_fused_attention.py",
+      "lines": "L338-L352",
+      "what": "诚实边界:host 无 NPU 跑不了真核,交叉验证靠这个夹具——用 torch_npu.npu_fusion_attention(昇腾官方融合注意力算子)作参考,input_layout=BNSD、atol/rtol=1e-2 比对 Triton 版输出。参数矩阵(L320-L327)全部 causal=False,即测试实际只覆盖 STAGE=1/内层 STAGE=3 这条全序列路径。",
+      "code": "    sm_scale = 0.5\n    tri_out = attention(q, k, v, causal, sm_scale, BM, BN)\n    ref_out = torch_npu.npu_fusion_attention(\n        q, k, v, H,\n        padding_mask=None,\n        atten_mask=None,\n        scale=sm_scale,\n        keep_prob=1.0,\n        input_layout=\"BNSD\",\n        pre_tockens=65535,\n        next_tockens=65535,\n        sparse_mode=0,\n    )[0]\n\n    torch.testing.assert_close(ref_out, tri_out, atol=1e-2, rtol=1e-2, equal_nan=True)",
+      "elide": []
+    }
+  ],
+
+  "key_classes": [
+    {
+      "name": "_attn_fwd_inner",
+      "file": "third_party/ascend/tutorials/06-fused-attention.py:L48",
+      "responsibility": "@triton.jit 设备函数。注意力内循环:对一批 K/V 列块循环,每块做 QK^T(Cube)→在线 softmax(Vector)→PV(Cube),在线更新 acc/l_i/m_i。全章 Cube↔Vector 心跳都在这里。"
+    },
+    {
+      "name": "_attn_fwd",
+      "file": "third_party/ascend/tutorials/06-fused-attention.py:L148",
+      "responsibility": "@triton.jit 主 kernel。tl.program_id 取核号 + grid-stride 持久化循环分逻辑块;为 Q/K/V/Out 建 make_block_ptr;初始化在线 softmax 累加器;按 STAGE 位掩码调 _attn_fwd_inner 一/两趟;收尾归一并 tl.store 写回 M 与 O。"
+    },
+    {
+      "name": "_attention",
+      "file": "third_party/ascend/tutorials/06-fused-attention.py:L263",
+      "responsibility": "torch.autograd.Function 前向包装。校验 HEAD_DIM,按 causal 定 stage,在 GM 里分配 acc/M workspace,以 num_cores=20 的一维网格发射 _attn_fwd,保存反向上下文。attention = _attention.apply 是用户入口。"
+    },
+    {
+      "name": "extension.extract_slice / insert_slice",
+      "file": "third_party/ascend/tutorials/06-fused-attention.py:L129-L135",
+      "responsibility": "triton.language.extra.cann.extension 的昇腾扩展 op。HEAD_DIM>=256 时把 acc 按 1/4 BLOCK_M 分片读改写,避免整块 acc 撑爆 UB(Unified Buffer)。"
+    },
+    {
+      "name": "matmul_kernel_persistent",
+      "file": "third_party/ascend/tutorials/09-persistent-matmul.py:L121",
+      "responsibility": "对照标本。持久化 matmul:一维网格发 NUM_SMS 个 program,每个用软件流水的双重循环领 tiles_per_sm 个 tile。与 _attn_fwd 的 grid-stride 是同一「逻辑核数贴物理核数」模式的另一处示范。"
+    }
+  ],
+
+  "data_flow": [
+    "1. 用户调 attention(q,k,v,causal,sm_scale,BM,BN) → _attention.forward:校验 HEAD_DIM∈{16,32,64,128,256},stage=3 if causal else 1,GM 分配 acc(全零 f32)与 M。",
+    "2. _attn_fwd[(20,)] 发射:一维网格 20 个 program 对应 20 个物理核。",
+    "3. _attn_fwd 每核:pid=program_id(0),grid-stride for block_idx in range(pid, NUM_BLOCKS, 20) 领逻辑块;解码出 (off_z, off_h, task_m_idx);make_block_ptr 建 Q/K/V/O 块指针;m_i=-inf,l_i=1.0,acc 就位;q=tl.load(Q_block_ptr) 常驻。",
+    "4. STAGE 位掩码:STAGE&1 调 _attn_fwd_inner(off-band,内层 STAGE=4-STAGE);STAGE&2 再调(on-band,内层 STAGE=2)。",
+    "5. _attn_fwd_inner 每 K/V 块:tl.load(K)→tl.trans→tl.dot(q,trans_k)=QK^T(Cube);(STAGE==2 时)tl.where 三角掩码;tl.max→减 max→tl.math.exp→tl.sum=softmax(Vector);tl.dot(p_cast,v)=PV(Cube);alpha=exp(m_i-m_ij) 重标定;acc=acc*alpha+PV;推进 K/V 块指针。",
+    "6. 回到 _attn_fwd:m_i += log(l_i)=logsumefx;accumulator=acc/l_i;tl.store 写回 M(logsumexp)与 O(归一化输出)。",
+    "7. 交叉验证:test_06 用 torch_npu.npu_fusion_attention 作参考,atol/rtol=1e-2 比对(host 无 NPU,靠逐行核源码兜)。"
+  ],
+
+  "design_decisions": [
+    {
+      "decision": "num_cores=20 硬编码 + grid-stride 持久化循环,而非「一逻辑块一 program」的海量网格",
+      "why": "GPU 上惯用海量逻辑块靠硬件调度器分发;搬到 NPU,逻辑核远多于物理核会带来巨大发射/调度开销。best_practice.md「Tiling strategy」建议把逻辑核数调到贴近物理核数。这里直接发 20 个 program(物理核数),每核 grid-stride 领活。",
+      "evidence": "third_party/ascend/tutorials/06-fused-attention.py:L168,L292; third_party/ascend/AscendNPU-IR/docs/source/en/user_guide/best_practice.md:L9"
+    },
+    {
+      "decision": "因果注意力拆成 off-band(STAGE 1)+ on-band(STAGE 2)两趟,只在 on-band 那趟构造三角掩码",
+      "why": "查询块之前的列全部有效、无需逐元素掩码;只有对角的当前块需要三角掩码。拆开后绝大多数列走无掩码的快路径,且注释明说 barrier 让编译器能独立调度两段循环。",
+      "evidence": "third_party/ascend/tutorials/06-fused-attention.py:L61-L68,L91-L94,L238-L239"
+    },
+    {
+      "decision": "HEAD_DIM>=256 时把 acc 放 GM workspace 并用 extension.extract_slice/insert_slice 按 1/4 BLOCK_M 分片更新",
+      "why": "整块 [BLOCK_M, HEAD_DIM] 的 f32 acc 在 HEAD_DIM>=256 时会撑爆片上 UB。分片处理是昇腾 UB(192KB)约束的直接产物,呼应 best_practice.md「UB overflow」整节。",
+      "evidence": "third_party/ascend/tutorials/06-fused-attention.py:L121-L137,L217-L223"
+    },
+    {
+      "decision": "对第二个 tl.dot(pv) 加 hivm.tile_mix_cube_num 编译提示(best_practice 文档级建议)",
+      "why": "cube(qk)→vector(softmax)→cube(pv)生命周期重叠;编译器只对单个 matmul 分析 tiling、看不到第二个 dot,可能 L1 越界。提示令编译器对该 dot 子切分。文档正拿 _attn_fwd_inner 举例——这是 CV 融合在真核上最直接的一处工程折痕。",
+      "evidence": "third_party/ascend/AscendNPU-IR/docs/source/en/user_guide/best_practice.md:L861-L897"
+    },
+    {
+      "decision": "在线 softmax(running max / running sum)而非先物化整张 N×N 注意力矩阵",
+      "why": "Flash Attention 的立身之本:m_i/l_i/alpha 递推让 softmax 分块流式计算,峰值显存从 O(N^2) 降到 O(N·HEAD_DIM),避免物化 N×N。除法归一拖到最后一次做。",
+      "evidence": "third_party/ascend/tutorials/06-fused-attention.py:L95-L119,L247-L248"
+    }
+  ],
+
+  "theory": [
+    "在线 softmax 正确性:设第 j 块局部最大 m_ij=max(m_{i,j-1}, max(qk_j)),重标定因子 alpha_j=exp(m_{i,j-1}-m_ij)。累加器递推 l_i←l_i·alpha+sum(exp(qk_j-m_ij)),acc←acc·alpha+exp(qk_j-m_ij)·V_j。归纳可证:处理完所有块后 acc/l_i 恰等于 softmax(QK^T/√d)·V,与一次性物化整张矩阵的结果数值等价(在线算法只是把同一求和重排+边界重标定)。这是 Flash Attention v2 的核心不变式,writer 需以小规模 worked example 走一遍两块的 m/l/alpha/acc 演化。",
+    "显存复杂度:朴素注意力物化 N×N 的 QK^T 需 O(N^2) 中间显存;分块在线算法每步只持有 [BLOCK_M,BLOCK_N] 的 qk 与 [BLOCK_M,HEAD_DIM] 的 acc,峰值 O(N·HEAD_DIM)。这正是 IO-aware 的收益来源。",
+    "双核算力归属:QK^T 与 PV 都是矩阵乘 → 达芬奇 Cube 核(脉动阵列,每拍一批 MAC);减 max / exp / sum / 重标定都是逐元素与规约 → Vector 核。一次内循环迭代 = Cube→Vector→Cube 三段,这是 CV 融合的算力级依据(呼应 ch16 核亲和:Cube 只做矩阵乘、Vector 做逐元素与规约)。",
+    "STAGE 位掩码算术:causal=True→STAGE=3(0b11),4-STAGE=1(off-band 内层标志);causal=False→STAGE=1(0b01),4-STAGE=3(全序列)。STAGE&1 / STAGE&2 两个位测试恰好把三种情形(全序列 / off-band / on-band)编码进一个整数。"
+  ],
+
+  "mechanisms": [
+    {
+      "id": "online-softmax-recurrence",
+      "name": "在线 softmax 递推(running max/sum + alpha 重标定)",
+      "kind": "algorithm",
+      "source_anchors": ["third_party/ascend/tutorials/06-fused-attention.py:L95-L119", "third_party/ascend/tutorials/06-fused-attention.py:L247-L248"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "cube-vector-heartbeat",
+      "name": "内循环心跳:QK^T(Cube)→softmax(Vector)→PV(Cube)的双核交替",
+      "kind": "dataflow",
+      "source_anchors": ["third_party/ascend/tutorials/06-fused-attention.py:L86-L119", "third_party/ascend/AscendNPU-IR/docs/source/en/user_guide/best_practice.md:L880-L886"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "full-descent-chain-recall",
+      "name": "全链回望:kernel 每个构造对应下降链哪一层(语言层→ttadapter→核亲和→HFusion→HIVM→AscendC)",
+      "kind": "dataflow",
+      "source_anchors": ["third_party/ascend/tutorials/06-fused-attention.py:L174-L206", "third_party/ascend/tutorials/06-fused-attention.py:L86-L119", "third_party/ascend/AscendNPU-IR/docs/source/en/user_guide/best_practice.md:L861-L897"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "causal-mask-staging",
+      "name": "因果掩码的 STAGE 位掩码分段(off-band / on-band / 全序列)",
+      "kind": "algorithm",
+      "source_anchors": ["third_party/ascend/tutorials/06-fused-attention.py:L61-L76", "third_party/ascend/tutorials/06-fused-attention.py:L91-L94", "third_party/ascend/tutorials/06-fused-attention.py:L227-L245"],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "block-ptr-explicit-movement",
+      "name": "块指针显式搬运:make_block_ptr 六元组 + load/store/advance(呼应 ch12 BlockPtrAnalysis)",
+      "kind": "layout",
+      "source_anchors": ["third_party/ascend/tutorials/06-fused-attention.py:L174-L206", "third_party/ascend/tutorials/06-fused-attention.py:L74-L76"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "persistent-grid-loop",
+      "name": "持久化网格:num_cores=20 一维网格 + grid-stride 循环把逻辑核数贴物理核数",
+      "kind": "dataflow",
+      "source_anchors": ["third_party/ascend/tutorials/06-fused-attention.py:L165-L173", "third_party/ascend/tutorials/06-fused-attention.py:L288-L298", "third_party/ascend/tutorials/09-persistent-matmul.py:L121-L195"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "head-dim-256-slicing",
+      "name": "HEAD_DIM>=256 时 acc 走 GM workspace + extract_slice/insert_slice 分片避免 UB 溢出",
+      "kind": "layout",
+      "source_anchors": ["third_party/ascend/tutorials/06-fused-attention.py:L118-L137", "third_party/ascend/tutorials/06-fused-attention.py:L214-L223"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "cv-fusion-tiling-hint",
+      "name": "CV 融合工程折痕:hivm.tile_mix_cube_num 提示给第二个 dot 子切分,避 L1 溢出",
+      "kind": "config",
+      "source_anchors": ["third_party/ascend/AscendNPU-IR/docs/source/en/user_guide/best_practice.md:L861-L897"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "honest-boundary-test-harness",
+      "name": "诚实边界:torch_npu.npu_fusion_attention 参考对拍 + 参数矩阵全 causal=False 的覆盖真相",
+      "kind": "protocol",
+      "source_anchors": ["third_party/ascend/unittest/pytest_ut/test_06_fused_attention.py:L320-L352"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    }
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "文件头部 MIT 许可证块(L1-L19)与模块 docstring(L21-L34)", "why_safe": "版权/出处说明,非算法逻辑;正文可引用其中 Flash Attention v2 / Tri Dao / arXiv:2205.14135 出处但无需内嵌整块。"},
+      {"what": "反向相关的 ctx.save_for_backward / ctx.sm_scale / ctx.HEAD_DIM / ctx.causal(L311-L314)", "why_safe": "本章只讲前向;保存反向上下文不影响前向数值,可在讲解时一句带过。"},
+      {"what": "FP8 分支 p.to(tl.float8e5) 与 fp8_v 判定(L105-L107)", "why_safe": "参数矩阵全部 float16/bfloat16,fp8_v 恒 False,该分支在被测路径上不触发;可作为「省略的无关分支」说明,主线走 p.to(k.dtype)。"},
+      {"what": "test_op / __main__ 自跑段中 host 侧的 7 组 parametrize 与打印(06 文件 L358-L365)", "why_safe": "驱动样例,非 kernel 语义;交叉验证以 test_06 夹具为准。"}
+    ],
+    "must_keep": [
+      {"symbol": "_attn_fwd_inner", "why": "注意力内循环,全章 Cube↔Vector 心跳所在,writer 必须逐段讲。"},
+      {"symbol": "_attn_fwd", "why": "主 kernel,持久化网格 + 块指针 + STAGE 分派 + 收尾归一都在此。"},
+      {"symbol": "_attention", "why": "用户入口与 Host 侧发射(num_cores=20 / GM workspace / stage 定值)的根源。"},
+      {"symbol": "tl.dot", "why": "两处矩阵乘(QK^T 与 PV)落 Cube 核的直接标记,是 CV 双核分工的锚点。"},
+      {"symbol": "tl.trans", "why": "trans_k = tl.trans(k) 给 QK^T 转置 K,读者需理解 QK^T 的构造。"},
+      {"symbol": "tl.math.exp", "why": "softmax 的 exp 与在线重标定 alpha=exp(m_i-m_ij) 都用它,落 Vector 核。"},
+      {"symbol": "tl.max", "why": "求每行最大(数值稳定),在线 softmax 的 running max 来源。"},
+      {"symbol": "tl.sum", "why": "求 softmax 分母 l_ij,running sum 来源。"},
+      {"symbol": "tl.make_block_ptr", "why": "块指针六元组,语言层显式搬运主线的活例,呼应 ch12 BlockPtrAnalysis。"},
+      {"symbol": "tl.advance", "why": "把 K/V 块指针推进到列区间起点与下一 BLOCK_N,显式搬运的一环。"},
+      {"symbol": "tl.load", "why": "显式从 GM 加载 Q/K/V 块,自包含讲清数据进片。"},
+      {"symbol": "tl.store", "why": "显式写回 O 与 logsumexp M,搬运闭环。"},
+      {"symbol": "tl.program_id", "why": "取核号,持久化 grid-stride 循环的起点。"},
+      {"symbol": "STAGE", "why": "位掩码分派(3/1 与 4-STAGE)编码因果三情形,读者需看懂两趟调用。"},
+      {"symbol": "alpha", "why": "在线 softmax 重标定因子,writer 必须讲清它为什么等于 exp(m_i-m_ij)。"},
+      {"symbol": "m_i", "why": "running max 累加器,数值稳定与 logsumexp 的载体。"},
+      {"symbol": "l_i", "why": "running sum(softmax 分母)累加器。"},
+      {"symbol": "acc_ptr", "why": "输出累加器,acc*alpha+PV 的载体,HEAD_DIM 两路的核心。"},
+      {"symbol": "extension.extract_slice", "why": "HEAD_DIM>=256 分片避 UB 溢出的昇腾扩展 op,读者需知它为何出现。"},
+      {"symbol": "extension.insert_slice", "why": "分片写回的另一半,与 extract_slice 成对。"},
+      {"symbol": "num_cores", "why": "=20 硬编码物理核数,持久化网格设计决策的直接证据。"},
+      {"symbol": "tl.compile_hint", "why": "best_practice 的 hivm.tile_mix_cube_num 提示载体,CV 融合工程折痕。"},
+      {"symbol": "torch_npu.npu_fusion_attention", "why": "交叉验证参考实现,诚实边界章节的对拍基准。"}
+    ]
+  },
+
+  "cross_refs": [
+    {"to": "ch08", "what": "scope/sync 软件流水:注意力内循环的两趟 off-band/on-band 拆分与 barrier 注释正是为独立调度;09-persistent-matmul 的软件流水双循环对照。", "kind": "dep"},
+    {"to": "ch12", "what": "BlockPtrAnalysis:make_block_ptr 六元组如何被物化成结构化张量访问。", "kind": "recall"},
+    {"to": "ch13", "what": "掩码下降:STAGE==2 的 tl.where 三角掩码。", "kind": "recall"},
+    {"to": "ch16", "what": "核亲和:两处 tl.dot 落 Cube、softmax 逐元素落 Vector 的判核依据。", "kind": "recall"},
+    {"to": "ch21", "what": "HFusion FusionKind:cube 段与 vector 段融成 ShallowCV/MixCV;MmadL1Op 是 cube 矩阵累加落地。", "kind": "recall"},
+    {"to": "ch24", "what": "HIVM 跨核同步:Cube↔Vector 经 FFTS+显存 sync_block_set/wait 握手。", "kind": "recall"},
+    {"to": "ch25", "what": "下降链收官:整条链在这一个真核上跑通,终点是 func.call @AscendC 库函数。", "kind": "dep"},
+    {"to": "ch33", "what": "诚实能力边界章:test_06 参数矩阵全 causal=False 引出的覆盖真相在下一章系统展开。", "kind": "forward"},
+    {"to": "vllm/ch43", "what": "对位基座姊妹篇:同一个 fused-attention 从 tl.* 一路到 NVIDIA PTX;这里终点是 AscendC 而非 PTX。", "kind": "pair"}
+  ],
+
+  "foreshadow_due": {
+    "plant": [],
+    "harvest": [],
+    "note": "bible.py due ch32 返回空(无应埋/应回收伏笔)。"
+  }
+}

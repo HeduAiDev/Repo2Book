@@ -1,0 +1,170 @@
+{
+  "chapter_id": "ch32",
+  "slug": "ch32-capstone-flash-attention",
+  "note": "kind=skip_impl 综合实战章。真 kernel 06-fused-attention.py 需 CANN/NPU 才能编译真跑，host 无 NPU（见各 worked_example.manual_reason）。凡引用源码常量的数字均标 file:Lxxx（06-fused-attention.py 相对行号）。online-softmax 递推是纯标量/矩阵算术、与 NPU 无关，另用 host numpy 忠实复现（traces/run_online_softmax.py→run_online_softmax.json）并与一次性物化 softmax 对拍（差 0），供该 worked_example 每个数字溯源；trace_source 仍按本章约定标 manual（真 kernel 不可 host 运行），但数字可在该 json 里逐个核对。",
+
+  "mechanisms": [
+    {
+      "mechanism_id": "online-softmax-recurrence",
+      "intuition": "像给一叠考卷滚动记总分，却不留底稿。先按第一批卷子的最高分定一条『曲线』（running max m_i），把每份卷子折算成相对这条曲线的权重累加进跑分（acc）和权重和（l_i）。当第二批冒出更高分，就先把旧曲线整体抬到新高分——旧的跑分和权重和统一乘一个缩水因子 alpha=exp(旧max-新max) 再继续加。全程只留三个累加器（m_i, l_i, acc），从不把整叠卷子（整张 N×N 注意力矩阵）摊在桌上。",
+      "worked_example": {
+        "params": {
+          "q": "[1.0, 0.0]（单查询行 BLOCK_M=1, HEAD_DIM=2）",
+          "sm_scale": "1.0（教学取值，便于心算；真实 test_06 用 0.5，见 test_06_fused_attention.py:L339）",
+          "K_block0": "[[1,0],[0,1]]",
+          "K_block1": "[[2,0],[0.5,1]]",
+          "V_block0": "[[1,0],[0,1]]",
+          "V_block1": "[[1,1],[2,0]]",
+          "path": "非因果全序列（内层 STAGE=3，无掩码），BLOCK_N=2，两块 K/V 合成完整 softmax",
+          "init": "m_i=-inf（file:L211）, l_i=1.0（file:L212）, acc=[0,0]"
+        },
+        "trace_source": "manual",
+        "manual_reason": "本章 kind=skip_impl，无精简版；真 kernel 06-fused-attention.py 需 CANN/NPU 编译真跑，host 无 NPU 不能运行。但在线 softmax 递推是纯标量/矩阵算术，与 NPU 无关——已用 host numpy 严格照搬源码初值与更新序（m/l/alpha/acc）复现，原始输出存 traces/run_online_softmax.json，并与一次性物化 softmax(QK^T·scale)·V 对拍验证等价（max_abs_diff=0.0）。表中每个数字可在该 json 逐个核对。",
+        "trace_ref": "traces/run_online_softmax.json",
+        "table": {
+          "columns": ["块 j", "qk·scale", "m_ij=max(m_i, max qk)", "alpha=exp(m_prev−m_ij)", "p=exp(qk−m_ij)", "l_i←l_i·alpha+Σp", "acc←acc·alpha+p·V"],
+          "rows": [
+            ["块0", "[1.0, 0.0]", "1.0", "0.0（m_prev=−inf→exp(−inf)=0，恰把 l_i 初值 1.0 清零）", "[1.0, 0.3679]", "1.3679", "[1.0, 0.3679]"],
+            ["块1", "[2.0, 0.5]", "2.0", "0.3679（running max 从 1.0 升到 2.0，旧累加器缩水）", "[1.0, 0.2231]", "1.7263", "[1.8141, 1.1353]"],
+            ["收尾", "—", "m_i=2.0, log(l_i) 得 logsumexp=2.546（file:L247）", "—", "—", "l_i=1.7263", "acc/l_i=[1.0509, 0.6577]（file:L249 归一）"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "处理完所有 K/V 块后，acc/l_i 恰等于对整段 QK^T·scale 一次性做 softmax 再乘 V 的结果（本例两者逐位相等，max_abs_diff=0.0）。",
+        "argument": "归纳：设块 j 处理后 acc_j = Σ_{i≤当前列} exp(s_i−m_j)·V_i、l_j = Σ exp(s_i−m_j)，其中 m_j 为至今 running max。基例块0：m 从 −inf 变为 max(qk0)，alpha=exp(−inf−m)=0 把初值 l=1 与 acc=0 清零，故 acc0/l0 只含块0 的加权（成立）。归纳步：块 j+1 遇新 max m_{j+1}≥m_j，重标定因子 alpha=exp(m_j−m_{j+1})≤1 把旧 acc/l 从『以 m_j 为基』整体换算到『以 m_{j+1} 为基』——exp(s_i−m_j)·alpha=exp(s_i−m_{j+1})，与新块项同基后直接相加，不变式保持。终止：块数有限（N_CTX/BLOCK_N），末块后 acc/l 即以全局 max 为基的完整加权和，除法归一得 softmax·V。单调量：m_i 逐块非降、块计数逐块严格 +1 到上界即停。"
+      },
+      "quantified": "显存复杂度：朴素注意力要物化 N×N 的 QK^T——本例 N_CTX=4 即 4×4=16 个分数项常驻；在线算法每步只持有 [BLOCK_M,BLOCK_N]=1×2 的 qk 与 [BLOCK_M,HEAD_DIM]=1×2 的 acc，峰值约 4 个标量，与 N 无关（O(N·HEAD_DIM) vs O(N²)，见 dossier.theory）。放大到 test_06 的 N_CTX=4096（file:test_06:L327）：朴素约 1.6×10⁷ 项，在线仍只按 BLOCK 常驻，这正是 Flash Attention IO-aware 的收益来源。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-online-softmax-evolution",
+          "claim": "两块 K/V 上 running max 从 1.0 升到 2.0，触发 alpha=0.368 把旧累加器整体缩水，末端 acc/l_i=[1.05,0.66] 与一次性物化 softmax 逐位相等（差 0）。",
+          "template": "state-table",
+          "numbers": [
+            {"label": "块0 qk·scale", "value": "[1.0, 0.0]", "provenance": "traces/run_online_softmax.json rounds[0].qk_scaled"},
+            {"label": "块0 m_ij", "value": "1.0", "provenance": "traces/run_online_softmax.json rounds[0].m_ij"},
+            {"label": "块0 alpha", "value": "0.0", "provenance": "traces/run_online_softmax.json rounds[0].alpha"},
+            {"label": "块0 l_i", "value": "1.3679", "provenance": "traces/run_online_softmax.json rounds[0].l_i_after"},
+            {"label": "块0 acc", "value": "[1.0, 0.3679]", "provenance": "traces/run_online_softmax.json rounds[0].acc_after"},
+            {"label": "块1 qk·scale", "value": "[2.0, 0.5]", "provenance": "traces/run_online_softmax.json rounds[1].qk_scaled"},
+            {"label": "块1 m_ij", "value": "2.0", "provenance": "traces/run_online_softmax.json rounds[1].m_ij"},
+            {"label": "块1 alpha", "value": "0.3679", "provenance": "traces/run_online_softmax.json rounds[1].alpha"},
+            {"label": "块1 l_i", "value": "1.7263", "provenance": "traces/run_online_softmax.json rounds[1].l_i_after"},
+            {"label": "块1 acc", "value": "[1.8141, 1.1353]", "provenance": "traces/run_online_softmax.json rounds[1].acc_after"},
+            {"label": "归一输出 acc/l_i", "value": "[1.0509, 0.6577]", "provenance": "traces/run_online_softmax.json finalize.out"},
+            {"label": "参考 softmax 输出", "value": "[1.0509, 0.6577]", "provenance": "traces/run_online_softmax.json reference.out_ref"},
+            {"label": "在线 vs 参考最大差", "value": "0.0", "provenance": "traces/run_online_softmax.json reference.max_abs_diff_online_vs_ref"}
+          ],
+          "caption_draft": "在线 softmax 只带 m_i/l_i/acc 三个累加器分块流式扫过 K/V：新块最高分抬高 running max 时用 alpha 把旧累加器同基缩水，末端一次除法归一。结果与摊开整张矩阵的 softmax 逐位相等——省的是 O(N²) 显存，不是精度。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "causal-mask-staging",
+      "intuition": "因果注意力=只能回头看、不能偷看未来。与其对每个位置都逐格判断『这列在我之后吗』，不如把列分成两段：查询块『之前』的整片列必然全部合法（走无掩码快路径），只有查询块『自己那一格对角块』才需要一张三角掩码逐格挡未来。一个整数 STAGE 的两个二进制位（&1 管前段、&2 管对角段）就把『非因果全扫 / 因果前段 / 因果对角段』三种情形编码干净。",
+      "worked_example": {
+        "params": {
+          "N_CTX": "4（file:test_06 类比，此处取小值便于列举）",
+          "BLOCK_M_BLOCK_N": "BLOCK_M=2, BLOCK_N=2",
+          "query_block": "task_m_idx=1（第 2 个查询块，覆盖行 offs_m=[2,3]，file:L208）",
+          "STAGE_source": "stage = 3 if causal else 1（file:L289）"
+        },
+        "trace_source": "manual",
+        "manual_reason": "本章 kind=skip_impl，无精简版；真 kernel 需 NPU 编译，host 无 NPU。但 STAGE 分段是纯整数位运算与静态区间算术（4−STAGE、STAGE&1、STAGE&2、lo/hi），无运行时数据依赖——下表每个值直接由源码常量推出并标 file:Lxxx，可对着 06-fused-attention.py L61-L72 / L227-L245 逐行核对。",
+        "table": {
+          "columns": ["causal", "外层 STAGE", "位测试", "传入内层 STAGE", "分支/列区间 [lo,hi)", "掩码"],
+          "rows": [
+            ["True", "3 (0b11)", "STAGE&1 命中", "4−3=1（file:L235）", "off-band：lo=0, hi=start_m·BLOCK_M=1·2=2 → 列[0,2)（file:L64）", "无（前段整片合法）"],
+            ["True", "3 (0b11)", "STAGE&2 命中", "2（file:L244）", "on-band：lo=start_m·BLOCK_M=2, hi=(start_m+1)·BLOCK_M=4 → 列[2,4)（file:L68）", "三角掩码 tl.where(mask,0,−1e6)（file:L94）"],
+            ["False", "1 (0b01)", "仅 STAGE&1", "4−1=3（file:L235）", "else 全序列：lo=0, hi=N_CTX=4 → 列[0,4)（file:L72）", "无"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "两个位测试 STAGE&1、STAGE&2 对三种情形（非因果全扫 / 因果前段 / 因果对角段）穷尽且互不重叠地分派，且任何查询行都不会加权到严格未来的 key。",
+        "argument": "编码穷尽性：causal=True→STAGE=3=0b11，两位均置位，前段(&1,内层1)+对角段(&2,内层2)各跑一趟；causal=False→STAGE=1=0b01，仅 &1 置位，一趟且内层收到 4−1=3 走 else 全序列。三值 {3,1,2}∪全序列覆盖全部路径且每条互斥。无未来泄漏：off-band 列区间 [0, start_m·BLOCK_M) 全严格早于查询块首行，天然合法无需掩码；on-band 区间恰为对角块 [start_m·BLOCK_M,(start_m+1)·BLOCK_M)，其上 mask=offs_m[:,None]≥(start_n+offs_n[None,:]) 把列号>行号处填 −1e6，exp 后≈0——本例对角块行 offs_m=[2,3]、列=[2,3]，掩码矩阵行2=[T,F]、行3=[T,T]，恰保留下三角、挡掉『行2 看列3』这个未来项。故每行只加权到≤自身位置的 key。"
+      },
+      "quantified": "对 start_m=1 的查询块：因果路径处理 off-band 2 列（无掩码）+ on-band 2 列（掩码后有效项由 4 降到 3，挡掉 1 个未来项）；非因果路径无差别扫全 4 列。掩码只施于 1 个对角块而非全程——随查询块序号 b 增大，无掩码的 off-band 列数 b·BLOCK_M 线性增长、始终只有 1 个对角块带掩码，这是把『少数需掩码列』与『多数免掩码列』拆开调度的直接收益（file:L238-L240 注释：barrier 让编译器独立调度两段循环）。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-causal-stage-tiling",
+          "claim": "对 4×4 因果注意力、查询块 start_m=1，STAGE=3 拆成 off-band 列[0,2)无掩码 + on-band 对角块列[2,4)带下三角掩码，恰挡掉『行2看列3』这一未来项。",
+          "template": "tiling",
+          "numbers": [
+            {"label": "N_CTX×N_CTX 网格", "value": "4×4", "provenance": "worked_example.params N_CTX=4"},
+            {"label": "off-band 列区间", "value": "[0,2)", "provenance": "06-fused-attention.py:L64 lo=0,hi=start_m*BLOCK_M"},
+            {"label": "on-band 列区间", "value": "[2,4)", "provenance": "06-fused-attention.py:L68 lo=start_m*BLOCK_M,hi=(start_m+1)*BLOCK_M"},
+            {"label": "对角块行索引 offs_m", "value": "[2,3]", "provenance": "06-fused-attention.py:L208 offs_m=task_m_idx*BLOCK_M+arange"},
+            {"label": "对角块掩码矩阵", "value": "行2=[保留,挡] 行3=[保留,保留]", "provenance": "06-fused-attention.py:L93 mask=offs_m>=start_n+offs_n"},
+            {"label": "掩码填充值", "value": "-1000000.0", "provenance": "06-fused-attention.py:L94 tl.where(mask,0,-1.0e6)"}
+          ],
+          "caption_draft": "因果掩码不是逐格判断，而是按查询块位置切两段：对角线左下方整片列免检直接算，只有对角块自己套一张下三角掩码挡未来。图中深色=被 −1e6 挡掉的未来项（仅 1 格），浅色=参与 softmax 的合法项。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "cube-vector-heartbeat",
+      "figure_specs": [
+        {
+          "figure_id": "fig-cube-vector-heartbeat",
+          "claim": "内循环一次迭代 = Cube→Vector→Cube 三段心跳：两次 tl.dot（QK^T、PV）落达芬奇 Cube 矩阵核，夹在中间的 max/exp/sum/重标定全落 Vector 核。",
+          "template": "swimlane",
+          "numbers": [
+            {"label": "QK^T：tl.dot(q,trans_k)", "value": "Cube 段", "provenance": "06-fused-attention.py:L90"},
+            {"label": "减 max / 稳定化：tl.max, qk−m_ij", "value": "Vector 段", "provenance": "06-fused-attention.py:L95-L100"},
+            {"label": "softmax 权重：tl.math.exp(qk)", "value": "Vector 段", "provenance": "06-fused-attention.py:L103"},
+            {"label": "分母求和：tl.sum(p,1)", "value": "Vector 段", "provenance": "06-fused-attention.py:L113"},
+            {"label": "重标定：alpha=tl.math.exp(m_i−m_ij)", "value": "Vector 段", "provenance": "06-fused-attention.py:L115"},
+            {"label": "PV：tl.dot(p_cast,v[,acc])", "value": "Cube 段", "provenance": "06-fused-attention.py:L112,L120"},
+            {"label": "内循环步长 BLOCK_N", "value": "按 BLOCK_N 列步进", "provenance": "06-fused-attention.py:L84 for start_n in range(lo,hi,BLOCK_N)"}
+          ],
+          "caption_draft": "注意力=两次矩阵乘夹一个 softmax，这个事实在源码里就是两处 tl.dot 夹一串逐元素/规约。搬到昇腾，两次 tl.dot 天然归 Cube 脉动阵列、softmax 归 Vector 核——这就是 CV 融合的算力级依据（呼应 ch16 核亲和）。best_practice.md L878 正拿这段 _attn_fwd_inner 当 cube→vector→cube 的样板。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "full-descent-chain-recall",
+      "figure_specs": [
+        {
+          "figure_id": "fig-full-descent-chain",
+          "claim": "flash-attention 真核里每个 Triton 构造，恰好对应全书下降链的一层——从语言层显式搬运一路落到 AscendC 库调用，六层在一个真核上串通。",
+          "template": "flow",
+          "numbers": [
+            {"label": "语言层显式搬运：make_block_ptr 六元组 + load/store/advance（ch03-08,ch12）", "value": "L175", "provenance": "06-fused-attention.py:L175-L206 tl.make_block_ptr"},
+            {"label": "ttadapter 结构化下降：块指针→结构化张量→linalg（ch10-14）", "value": "L226", "provenance": "06-fused-attention.py:L226 q=tl.load(Q_block_ptr) 经 BlockPtrAnalysis 物化"},
+            {"label": "核亲和双核分工：两处 tl.dot 落 Cube、softmax 落 Vector（ch16）", "value": "L90,L112", "provenance": "06-fused-attention.py:L90,L112 两处 tl.dot"},
+            {"label": "HFusion 融合：cube 段与 vector 段融成 ShallowCV/MixCV（ch21-22）", "value": "L86-L120", "provenance": "06-fused-attention.py:L86-L120 内循环 cube→vector→cube 段"},
+            {"label": "HIVM 下降：显式内存层级 + 跨核同步 + tile_mix_cube_num 提示（ch23-25）", "value": "L896", "provenance": "best_practice.md:L861-L897 hivm.tile_mix_cube_num"},
+            {"label": "AscendC 库调用：整条链的终点（ch25，对位基座 ch43 终点是 PTX）", "value": "6 层", "provenance": "dossier.cross_refs ch25/vllm:ch43"}
+          ],
+          "caption_draft": "本章的价值是回望：同一段 365 行真核，语言层看是显式 block_ptr 搬运，ttadapter 看是结构化张量，核亲和看是 Cube/Vector 分工，HFusion 看是 CV 段融合，HIVM 看是内存层级+同步，最终落成 AscendC 库调用。六层不是六个例子，是同一个真核的六个剖面。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "persistent-grid-loop",
+      "figure_specs": [
+        {
+          "figure_id": "fig-persistent-grid-stride",
+          "claim": "一维网格只发 num_cores=20 个 program（贴物理核数），每核用 grid-stride 循环 range(pid,NUM_BLOCKS,20) 领活；test_06 的 (Z,H,N_CTX,BM)=(4,32,64,32) 共 256 个逻辑块，均摊成 16 核各 13 块、4 核各 12 块。",
+          "template": "tiling",
+          "numbers": [
+            {"label": "网格大小 num_cores", "value": "20", "provenance": "06-fused-attention.py:L294 num_cores=20"},
+            {"label": "grid-stride 步长", "value": "20", "provenance": "06-fused-attention.py:L168 range(pid,NUM_BLOCKS,20)"},
+            {"label": "示例参数 Z,H,N_CTX,BM", "value": "4,32,64,32", "provenance": "test_06_fused_attention.py:L325 (4,32,64,64,False,fp16,32,64)"},
+            {"label": "NUM_BLOCKS_M=N_CTX//BM", "value": "2", "provenance": "06-fused-attention.py:L161 NUM_BLOCKS_M=N_CTX//BLOCK_M (64//32)"},
+            {"label": "NUM_BLOCKS=NUM_BLOCKS_M·Z·H", "value": "256", "provenance": "06-fused-attention.py:L163 (2*4*32)"},
+            {"label": "核0 领块数（idx 0,20,...,240）", "value": "13", "provenance": "grid-stride range(0,256,20) 计数"},
+            {"label": "核19 领块数（idx 19,39,...,239）", "value": "12", "provenance": "grid-stride range(19,256,20) 计数"},
+            {"label": "对照标本 09-persistent-matmul", "value": "NUM_SMS 同模式", "provenance": "09-persistent-matmul.py:L138,L146,L164 tiles_per_sm/NUM_SMS"}
+          ],
+          "caption_draft": "GPU 惯用海量逻辑块靠硬件调度器分发；搬到 NPU，逻辑核远多于物理核会带来巨大发射开销。这里直接发 20 个 program（物理核数），每核 grid-stride 领走 range(pid,NUM_BLOCKS,20) 的逻辑块——256 块摊成 16 核×13+4 核×12，负载几乎均衡。这正是 best_practice.md『Tiling strategy』建议，09-persistent-matmul 的 tiles_per_sm 是同一模式的另一处示范。"
+        }
+      ]
+    }
+  ]
+}
