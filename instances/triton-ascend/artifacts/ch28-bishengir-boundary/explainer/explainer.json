@@ -1,0 +1,187 @@
+{
+  "chapter": "ch28",
+  "title": "闭源边界 bishengir-compile：编译选项、子进程调用与元数据回收",
+  "trace_note": "本章无精简版：npubin 段的核心是把 IR 文件喂给闭源二进制 bishengir-compile（昇腾侧的 ptxas 对位），该二进制不可在本环境运行、无源码可读，subprocess 调用点之后不猜。但 npubin 段在闭源边界『之前』的开源侧逻辑——正则抠元数据、名字编码、命令行按开关条件拼接——都是纯 Python，可用 verbatim 源码常量直接跑。故 4 个 needs_worked_example 机制的数值表 trace_source=run（驱动 traces/run_ch28.py，原始输出 traces/ch28.json，正则/编码常量逐字复制自 compiler.py 并标了行号）；subprocess 调用本身与三通道回收、两候选差异等以 figure-spec 呈现边界结构，不伪造闭源内部数值。",
+  "mechanisms": [
+    {
+      "mechanism_id": "regex-metadata-extraction",
+      "intuition": "闭源编译器不吃 Python 对象，只吃命令行加一个 IR 文件；而 ttadapter 交出来的 Linalg IR 本身就是一大段文本，运行时要用的『这个 kernel 叫啥、混算模式是啥、每个参数是入还是出』这些信息早已作为属性写在文本里。与其去绑 MLIR 的 C++ API，不如把 IR 当普通字符串，用 6 条正则各抠一处——像用记号笔在打印稿上圈关键词。",
+      "worked_example": {
+        "params": {"ir": "module attributes {mix_mode=\"aiv\", parallel_mode=\"mix_simd_simt\", bitcode=\"libdevice.bc\"} + func.func @add_kernel(2 输入 tensor_kind=0, 1 输出 tensor_kind=1, 1 标量 %arg3 无 tensor_kind)"},
+        "trace_source": "run",
+        "trace_ref": "traces/ch28.json",
+        "table": {
+          "columns": ["正则(compiler.py L197-L212)", "命中的 IR 文本", "re 方法", "抽取结果", "metadata 落点"],
+          "rows": [
+            ["MIX_MODE_REGEX", "mix_mode = \"aiv\"", "re.search().group(1)", "aiv", "metadata['mix_mode']"],
+            ["PARALLEL_MODE_REGEX", "parallel_mode = \"mix_simd_simt\"", "re.search().group(1)", "mix_simd_simt", "metadata['parallel_mode']"],
+            ["KERNEL_NAME_REGEX", "func.func @add_kernel", "re.search().group(1)", "add_kernel", "metadata['kernel_name']"],
+            ["TENSOR_KIND_REGEX", "3 个 %argN 的 {tt.tensor_kind=k}", "re.findall→list", "[0, 0, 1]", "metadata['tensor_kinds']"],
+            ["BITCODES_REGEX", "bitcode = \"libdevice.bc\"", "re.findall 展平", "['libdevice.bc']", "metadata['bitcodes']"],
+            ["DISABLE_AUTO_TILE…REGEX", "(本例不含该属性)", "not re.search (None→True)", "True", "metadata['auto_tile_and_bind_subblock']"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "抽取是纯函数：同一 IR 文本恒映射到同一 metadata；re.search 类字段只取首处命中，re.findall 类字段（tensor_kinds/bitcodes）按参数在文本中的出现顺序收集。",
+        "argument": "6 条正则各对固定的、有限长的 IR 字符串跑一次 re.search/re.findall，无状态、无循环依赖、单遍扫描 → 有限步必终止且可重放；findall 的返回顺序即扫描顺序，而参数在 Linalg 文本里按 %arg0、%arg1… 递增排列，故 tensor_kinds[i] 恒对应第 i 个带 tt.tensor_kind 属性的参数。"
+      },
+      "quantified": "本例：6 条正则、IR 文本约 400 字符、每条正则一次 O(len) 扫描；产出 metadata 字段 7 个（mix_mode/parallel_mode/kernel_name/name/tensor_kinds/bitcodes/auto_tile_and_bind_subblock），另有 shared=1、required_ub_bits=0 两个硬编码初值（compiler.py:L216,L229）。tensor_kinds 长度=3（等于带属性的参数数），标量 %arg3 不计入。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch28-regex-extract",
+          "claim": "_parse_linalg_metadata 用 6 条正则把 Linalg IR 的文本表示一次性抠成一组 metadata 字段。",
+          "template": "state-table",
+          "numbers": [
+            {"value": "6 条正则", "provenance": "compiler.py:L197-L212"},
+            {"value": "tensor_kinds=[0,0,1]", "provenance": "traces/ch28.json regex_metadata_extraction.metadata.tensor_kinds"},
+            {"value": "shared=1（硬编码）", "provenance": "compiler.py:L216"},
+            {"value": "required_ub_bits=0（初值，后续从 stdout 回填）", "provenance": "compiler.py:L229"}
+          ],
+          "caption_draft": "结论：元数据不走 MLIR C++ API，而是把 IR 当文本抠——mix_mode/parallel_mode/kernel_name 各一条 re.search 取首处命中，tensor_kinds/bitcodes 用 re.findall 收集成列表；shared 与 required_ub_bits 是硬编码初值。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "tensor-kind-regex",
+      "intuition": "六条正则里最难的一条，因为它要在一段花括号属性里精确定位 tt.tensor_kind 又不被相邻的 tt.divisibility 干扰，还要同时抓住是第几个参数（%argN 的 N）和它的方向标签（0=入/1=出）。像在一行杂乱的标签里只圈出『第几号箱子』和『进/出』两个字，跳过箱子上其它贴纸。关键是：没贴 tensor_kind 标签的参数（如纯标量）根本不该被圈中。",
+      "worked_example": {
+        "params": {"args": "%arg0(tensor_kind=0), %arg1(tensor_kind=0), %arg2(tensor_kind=1), %arg3: i32(无 tt.tensor_kind)"},
+        "trace_source": "run",
+        "trace_ref": "traces/ch28.json",
+        "table": {
+          "columns": ["参数", "IR 属性片段", "group(1)=idx", "group(2)=kind", "int(kind)", "进 tensor_kinds？"],
+          "rows": [
+            ["%arg0", "{tt.divisibility=16, tt.tensor_kind=0}", "0", "0", "0", "是 → [0]"],
+            ["%arg1", "{…, tt.tensor_kind=0}", "1", "0", "0", "是 → [0, 0]"],
+            ["%arg2", "{…, tt.tensor_kind=1}", "2", "1", "1", "是 → [0, 0, 1]"],
+            ["%arg3", "i32（标量，无 tt.tensor_kind）", "—", "—", "—", "否（结构不匹配，跳过）"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "findall 的命中数恒等于带 tt.tensor_kind 属性的 %argN 个数；缺该属性的参数（如标量 %arg3）绝不进 tensor_kinds 列表。",
+        "argument": "正则 `%arg(\\d+):[^,)]*?\\{[^}]*?tt\\.tensor_kind\\s*=\\s*([^:\\s}]+)...\\}` 强制要求同一参数段内必须出现 `{...tt.tensor_kind...}` 结构才成立 → 无此属性的参数结构不满足、被 findall 直接跳过；满足的参数因非贪婪 `[^}]*?` 锁在单个花括号块内，恰好贡献一个 (idx, kind) 对，不重不漏。"
+      },
+      "quantified": "本例 4 个参数中 3 个匹配、1 个（标量）跳过；正则用非贪婪限定符把匹配锁死在单个 `{...}` 块内，避免跨越到相邻参数。tt.divisibility=16 与 tt.tensor_kind 同框但被 `tt\\.tensor_kind` 字面锚点区分开。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "cmdline-conditional-assembly",
+      "intuition": "bishengir-compile 有几十个开关，绝大多数默认『不填、由编译器自己决定』。triton 侧的做法是：为每个开关准备一行 `if metadata[x] is not None:`，只有上游/用户显式设了值才把对应 `--enable-xxx=val` 追加进列表，None 就整行跳过。像点菜——默认套餐不动，只把你特别指定的加菜写进单子，其余留白交给厨房。",
+      "worked_example": {
+        "params": {"metadata_subset": "multibuffer=2, disable_tightly_coupled_buffer_reuse=False, auto_tile=True/enable_auto_bind_sub_block=None, sync_solver=None, unit_flag=1, enable_vf_fusion=True, bitcodes=['libdevice.bc']（910_95 分支）"},
+        "trace_source": "run",
+        "trace_ref": "traces/ch28.json",
+        "table": {
+          "columns": ["开关(metadata 键)", "本例取值", "判定", "落地参数"],
+          "rows": [
+            ["get_common → target", "Ascend910B", "恒加", "--target=Ascend910B"],
+            ["multibuffer", "2", "is not None → 加", "--enable-auto-multi-buffer=2"],
+            ["disable_tightly_coupled_buffer_reuse", "False", "假值 → 跳过", "(无)"],
+            ["auto-bind-sub-block", "user=None, 模块=True", "user 为 None → 用模块属性", "--enable-auto-bind-sub-block=True"],
+            ["sync_solver", "None", "is None → 跳过", "(无)"],
+            ["unit_flag", "1", "is not None → 加", "--enable-hivm-unit-flag-sync=1"],
+            ["enable_vf_fusion", "True", "真值 → 裸 flag", "--enable-vf-fusion"],
+            ["bitcodes(循环)", "libdevice.bc", "逐个 → 加", "--link-aicore-bitcode=libdevice.bc"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "最终 cmd 选项数恒等于『值非 None（或真值）的开关数 + 固定项』；任何 None 开关都不产生命令行参数，互不干扰。",
+        "argument": "每个 `if metadata[x] is not None:`（或真值判断）分支是独立的：命中则恰 append 一项、未命中则完全跳过，无跨开关副作用 → 落地项数单调等于命中开关数；get_common 的 --target 与 bishengir-compile 结尾的 --enable-hfusion-compile 等属恒加固定项。",
+        "argument_note": "auto-bind-sub-block 体现『用户开关高于模块属性』：enable_auto_bind_sub_block 非 None 时用它，否则回退模块读到的 auto_tile_and_bind_subblock（compiler.py:L269-L277）。"
+      },
+      "quantified": "910_95 分支约三十个条件开关（compiler.py:L312-L446）；本例考察 9 个、落地 6 个（3 个因 None/假值被跳过）。三种取值形态：环境探测的裸 flag（force_disable_ffts 等）、metadata 三态值（None 跳过 / 数值·布尔拼成 --x=val）、以及编译器结尾的固定 flag。A2_A3 分支开关更多（多出 ubuf-saving/preload/tile-mix-* 等）。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch28-cmdline-assembly",
+          "claim": "命令行按 `if metadata[x] is not None` 逐项拼接：None 开关不产生参数，只有显式设值才 append。",
+          "template": "state-table",
+          "numbers": [
+            {"value": "9 个开关考察", "provenance": "traces/ch28.json cmdline_conditional_assembly.n_switches_considered"},
+            {"value": "6 个参数落地", "provenance": "traces/ch28.json cmdline_conditional_assembly.n_emitted"},
+            {"value": "约 30 个条件开关(910_95)", "provenance": "compiler.py:L312-L446"}
+          ],
+          "caption_draft": "结论：910_95 分支约三十个开关，本例 9 个里只有 6 个非 None/真值的落进命令行——其余留白（None）交给 bishengir-compile 用自己的默认；这就是几十个 `--enable-*` 参数为何能既全又不冗余。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "kernel-name-mix-mode-encoding",
+      "intuition": "kernel 名和混算模式要一起带到运行时，但运行时拿到的是一个字符串。约定：用一个下划线把两者粘起来 name = kernel_name + '_' + mix_mode，运行时再从最右边切一刀还原。妙处在于 kernel_name 内部可能自带下划线（gather_sorted_kernel），所以还原必须『从右切一刀』（rsplit('_', 1)）而不是从左，才不会把名字本身切碎。",
+      "worked_example": {
+        "params": {"cases": "('add_kernel','aiv'), ('gather_sorted_kernel','mix')（名字含内部下划线）, (55 字符超长名,'aic')（触发 49 截断）"},
+        "trace_source": "run",
+        "trace_ref": "traces/ch28.json",
+        "table": {
+          "columns": ["kernel_name", "mix_mode", "encode → name", "rsplit('_',1)", "截断后长度", "触发 49 截断？"],
+          "rows": [
+            ["add_kernel", "aiv", "add_kernel_aiv", "('add_kernel', 'aiv')", "10", "否"],
+            ["gather_sorted_kernel", "mix", "gather_sorted_kernel_mix", "('gather_sorted_kernel', 'mix')", "20", "否（内部 3 个 '_' 不受影响）"],
+            ["a×55（超长名）", "aic", "…_aic（len 59）", "(len 55, 'aic')", "49", "是（取后 49）"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "decode(encode(kn, mm)) 还原出的模式段恒等于 mm，且 kn 内部的下划线不受影响——round-trip 对任意含内部 '_' 的名字都成立。",
+        "argument": "encode 只在末尾追加一个 '_'+mm；pack_metadata 的 rsplit('_', 1) 从右切恰好一次 → 精确还原这最后一段 mm，前缀（含任意内部 '_'）整体保留；随后 KERNEL_NAME_MAX_LEN=49 的截断只作用于前缀长度（超长取后 49 字符），改变的是长度、不破坏这个还原不变量。"
+      },
+      "quantified": "KERNEL_NAME_MAX_LEN=49（compiler.py:L912，因 CANN 限 kernel 名 ≤50、留一位给 '\\n'）；本例 3 个名字中仅第 3 个（原名 55 字符）触发截断，取后 49 字符；前两个（10、20 字符）原样保留。gather_sorted_kernel 含 3 个内部下划线仍被正确还原，证明必须用 rsplit 而非 split。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "subprocess-closed-boundary",
+      "intuition": "所有前戏——抠元数据、拼几十个命令行参数——都是为了这一行 subprocess.run。它把 IR 文件和命令行交给闭源的 bishengir-compile 二进制，然后就是黑盒：Linalg 怎么降到 HFusion、HIVM、再到 NPU 机器码，全在二进制内部，开源侧看不到也不猜。这是这本书诚实的分界线——读到子进程调用点为止。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch28-closed-boundary",
+          "claim": "subprocess.run(cmd_list, check=True) 是开源可读与闭源黑盒的诚实分界——书读到这一行为止。",
+          "template": "swimlane",
+          "numbers": [
+            {"value": "cmd_list = [编译器, ttadapter_path] + 选项 + ['-o', bin_file]", "provenance": "compiler.py:L448-L452"},
+            {"value": "subprocess.run(cmd_list, env, PIPE, check=True)", "provenance": "compiler.py:L465-L471"},
+            {"value": "闭源侧: Linalg→HFusion→HIVM→NPU 二进制（无源码）", "provenance": "本章 theory[4]"}
+          ],
+          "caption_draft": "结论：开源侧只负责把 IR 文件+命令行喂进 bishengir-compile，再从产物/stdout/so 取回结果；check=True 让编译失败直接抛 CalledProcessError。边界之后的编译过程是闭源二进制内部行为，不猜、无源码可读。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "three-channel-recovery",
+      "intuition": "闭源编译器跑完后，运行时要用的信息散落在三个地方：主产物（NPU 二进制）、编译器打在 stdout 里的一行 UB size、以及它顺带生成的一个 .so 里的几个导出函数。triton 就分三条路把它们收回来——像收快递：主包裹直接搬、单据从纸条上抄、贵重件要用钥匙（dlopen）开柜子取。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch28-three-channel",
+          "claim": "编译产物分三条通道回收：kernel.o 二进制 read_bytes、stdout 正则抠 UB size、libkernel.so 的 4 个 dlopen 回调。",
+          "template": "flow",
+          "numbers": [
+            {"value": "通道1: Path(bin_path).read_bytes() → npubin 字节", "provenance": "compiler.py:L499"},
+            {"value": "通道2: re.search(r'UB\\s+size\\s*=\\s*(\\d+)\\s*bits') → required_ub_bits", "provenance": "compiler.py:L481-L484"},
+            {"value": "通道3: 4 个 ctypes 回调 (bs_task_type/workspace_size/lock_num/lock_init_val)", "provenance": "compiler.py:L492-L497"}
+          ],
+          "caption_draft": "结论：不同用途的元数据走不同回收路径——npubin 字节给 driver 发射、required_ub_bits 给 inductor autotune、4 个 sync/task 字段藏在闭源生成的 libkernel.so 导出函数里，只能 dlopen+ctypes（__get_metadata_attr_by_callback，restype=c_int64、无参）取回。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "npu-branch-divergence",
+      "intuition": "npubin 段有两个几乎一模一样的函数：910_95 一个、A2/A3 一个，由 is_compile_on_910_95 在 add_stages 时二选一（这正是 ch27 埋下的 f7『两个候选到底差在哪』）。它们骨架同构（抠元数据→拼开关→subprocess→三通道回收），差异集中在几处：用哪个二进制、--target 怎么取、sync_solver 挂几条、以及一批 A2/A3 独有开关。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch28-branch-divergence",
+          "claim": "910_95 与 A2_A3 两候选实现结构同构，但 target 取法、regbased 分叉、sync_solver 挂载、独有开关不同（f7 的答案）。",
+          "template": "before-after",
+          "numbers": [
+            {"value": "910_95: --target 取 metadata['target'].arch（get_common）", "provenance": "compiler.py:L263-L266,L310"},
+            {"value": "A2_A3: --target 取 NPUUtils().get_arch()", "provenance": "compiler.py:L518-L519"},
+            {"value": "A2_A3: sync_solver 多挂 --enable-hivm-cross-core-gss", "provenance": "compiler.py:L560-L565"},
+            {"value": "A2_A3 独有开关: enable_ubuf_saving/enable_preload/tile_mix_vector_loop/tile_mix_cube_loop", "provenance": "compiler.py:L528-L538,L607-L615"},
+            {"value": "A2_A3: regbased 分叉 --reg-based=true vs --enable-hivm-compile=true", "provenance": "compiler.py:L512-L515,L646-L649"}
+          ],
+          "caption_draft": "结论：f7 回收——两候选差在 (1) 二进制目录 bishengir-a5 vs bishengir、(2) --target 来源、(3) A2_A3 用 --help grep 探 regbased/membased 选 --reg-based vs --enable-hivm-compile、(4) sync_solver 在 A2_A3 多挂一条 cross-core-gss、(5) ubuf-saving/preload/tile-mix-* 等 A2_A3 独有开关；由 is_compile_on_910_95 在 add_stages 选定。"
+        }
+      ]
+    }
+  ]
+}

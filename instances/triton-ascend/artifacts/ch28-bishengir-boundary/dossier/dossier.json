@@ -1,0 +1,153 @@
+{
+  "chapter": "ch28",
+  "title": "闭源边界 bishengir-compile：编译选项、子进程调用与元数据回收",
+  "one_line": "npubin 段的最后一跳——linalg_to_bin 用一组正则从 Linalg IR 文本抠元数据、按十几个 enable 开关拼出几十个命令行参数、subprocess.run 把 IR 文件喂给闭源 bishengir-compile，再从二进制/UB-bits/dlopen 回调三处回收运行时元数据；书读到 subprocess 调用点为止，闭源内部不猜。对位基座 ch37(ptxas→cubin)。",
+  "code_spine": [
+    "third_party/ascend/backend/compiler.py:L939-L963  AscendBackend.add_stages —— npubin 段的三个候选实现由 force_simt_only / compile_on_910_95 两个开关选定：force_simt_only→ttir_to_npubin(TTIR 直编)；否则 compile_on_910_95→linalg_to_bin_enable_npu_compile_910_95，else→..._A2_A3(本章从这个分叉点接过 ch27 埋的 f7)",
+    "third_party/ascend/backend/compiler.py:L183-L234  _parse_linalg_metadata —— 第①段：用 6 条正则从 Linalg IR 的文本表示里 re.search/re.findall 抠出 mix_mode/parallel_mode/kernel_name/tensor_kinds/bitcodes/auto_tile_and_bind_subblock，写进 metadata dict",
+    "third_party/ascend/backend/compiler.py:L263-L277  get_common_bishengir_compile_options + get_auto_bind_sub_block_option —— 命令行地基：--target= 与 auto-bind-sub-block 的『用户开关高于模块属性』优先级",
+    "third_party/ascend/backend/compiler.py:L298-L499  linalg_to_bin_enable_npu_compile_910_95 —— 第②③段(910_95 分支)：按 metadata 各 enable 开关拼 _compile_option_list → 拼 cmd_list → subprocess.run(闭源边界) → 从 stdout 正则抠 UB size → 读回 kernel.o 二进制 + dlopen libkernel.so 回调抠 bs_task_type/workspace_size/lock_num/lock_init_val",
+    "third_party/ascend/backend/compiler.py:L502-L696  linalg_to_bin_enable_npu_compile_A2_A3 —— 910_95 的姊妹实现：结构同构，但 --target 取 NPUUtils().get_arch()、多一个 regbased/membased 分叉(--reg-based vs --enable-hivm-compile)、sync_solver 多挂一条 cross-core-gss、多出 preload/ubuf-saving/tile-mix-* 等开关(f7『两个候选到底差在哪』的答案)",
+    "third_party/ascend/backend/compiler.py:L824-L874  ttir_to_npubin —— force_simt_only 快路径的完整命令行：绕过 Linalg，TTIR 直编，走 --pure-simt/--num-warps/--threads-per-warp 等一组 SIMT 专属参数(ch27 只讲『这条快路径存在』，本章补它的命令行)",
+    "third_party/ascend/backend/compiler.py:L174-L180  __get_metadata_attr_by_callback —— dlopen 回调通道的取值 helper：按 kernel_name+postfix 在 libkernel.so 里找符号，ctypes 调用取 int64 回填 metadata",
+    "third_party/ascend/backend/utils.py:L154-L173  _get_npucompiler_path —— 定位 bishengir-compile 二进制(bishengir-a5/bin vs bishengir/bin，随 is_compile_on_910_95)并把其目录塞进子进程 PATH",
+    "third_party/ascend/backend/utils.py:L188-L244  _is_valid_bishengir_path / _check_bishengir_api_change / _check_bishengir_is_regbased —— 能力探测通道：跑 `bishengir-compile --help` 抓 stdout 里的特性字符串，据此改产物名(kernel.o vs kernel_reloc.o)与命令行分支",
+    "python/triton/tools/get_ascend_devices.py:L52-L55  is_compile_on_910_95 —— 导入期常量：探 PCI 设备号/npu-smi 判是否 910_95，决定选哪个 linalg_to_bin 实现、哪个 bishengir 二进制"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "third_party/ascend/backend/compiler.py",
+      "lines": "L195-L234",
+      "code": "    # --- Regular expressions and examples ---\n\n    DISABLE_AUTO_TILE_AND_BIND_SUBBLOCK_REGEX = r'hivm.disable_auto_tile_and_bind_subblock'\n\n    # Example: mix_mode = \"aiv\" -> aiv\n    MIX_MODE_REGEX = r'mix_mode\\s*=\\s*\"([^\"]+)\"'\n\n    # Example: parallel_mode = \"mix_simd_simt\" -> mix_simd_simt\n    PARALLEL_MODE_REGEX = r'parallel_mode\\s*=\\s*\"([^\"]+)\"'\n\n    # Example: func.func @gather_sorted_kernel(%arg0: ...) -> gather_sorted_kernel\n    KERNEL_NAME_REGEX = r\"func\\.func\\s+@(\\w+)\"\n\n    # Example: %arg1: memref<?xf32> {tt.divisibility = 16 : i32, tt.tensor_kind = 0 : i32} -> ('1', '0')\n    TENSOR_KIND_REGEX = r'%arg(\\d+):[^,)]*?\\{[^}]*?tt\\.tensor_kind\\s*=\\s*([^:\\s}]+)\\s*:[^}]*?\\}'\n\n    # Example: bitcode = \"a.bc\"\n    BITCODES_REGEX = r'bitcode\\s*=\\s*(?:\"([^\"]+)\"|\\'([^\\']+)\\'|(\\w+))'\n\n    # Note: Compiled Kernel requires to estimate size of shared memory to occupy\n    # Currently, NPU backend does not limit on shared memory\n    metadata[\"shared\"] = 1\n    # Force disable auto tile and bind subblock if attribute is present in module\n    metadata[\"auto_tile_and_bind_subblock\"] = not re.search(DISABLE_AUTO_TILE_AND_BIND_SUBBLOCK_REGEX, linalg)\n    # the mix mode is also encoded into metadata['name'] for runtime to distinguish\n    metadata[\"mix_mode\"] = re.search(MIX_MODE_REGEX, linalg).group(1)\n    metadata[\"parallel_mode\"] = re.search(PARALLEL_MODE_REGEX, linalg).group(1)\n    metadata[\"kernel_name\"] = re.search(KERNEL_NAME_REGEX, linalg).group(1)\n    # Use while \"_\" to split kernel_name and mix_mode.\n    # Check the function load_binary in npu_driver.py.\n    metadata[\"name\"] = metadata[\"kernel_name\"] + \"_\" + metadata[\"mix_mode\"]\n    # Parse all tensor kinds from arguments\n    metadata[\"tensor_kinds\"] = [int(kind) for _, kind in re.findall(TENSOR_KIND_REGEX, linalg)]\n    # init the ub bits of triton kernel for inductor autotune using\n    metadata[\"required_ub_bits\"] = 0\n\n    # Parse all bitcode paths\n    bitcodes = re.findall(BITCODES_REGEX, linalg)\n    metadata[\"bitcodes\"] = [val for group in bitcodes for val in group if val]\n    return linalg, metadata",
+      "elide": ["def _parse_linalg_metadata 的 docstring(L184-L194)已在 code_spine 概述，可省略"]
+    },
+    {
+      "path": "third_party/ascend/backend/compiler.py",
+      "lines": "L263-L277",
+      "code": "def get_common_bishengir_compile_options(metadata):\n    bishengir_target = metadata['target'].arch\n    bishengir_target_opt = f\"--target={bishengir_target}\"\n    return [bishengir_target_opt]\n\n\ndef get_auto_bind_sub_block_option(metadata):\n    # auto_tile_and_bind_subblock is read from the module.\n    # enable_auto_bind_sub_block is set by the user and has a higher priority.\n    enable_auto_bind_sub_block = metadata[\"enable_auto_bind_sub_block\"]\n    return (\n        metadata[\"auto_tile_and_bind_subblock\"]\n        if enable_auto_bind_sub_block is None\n        else enable_auto_bind_sub_block\n    )",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/backend/compiler.py",
+      "lines": "L298-L334",
+      "code": "def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):\n    linalg, metadata = _parse_linalg_metadata(linalg, metadata)\n    with tempfile.TemporaryDirectory() as tmpdir:\n        ttadapter_path = os.path.join(tmpdir, \"kernel.ttadapter.mlir\")\n        Path(ttadapter_path).write_text(linalg)\n        bin_file = os.path.join(tmpdir, \"kernel\")\n        if _check_bishengir_api_change():\n            bin_file_with_ext = \"kernel.o\"\n        else:\n            bin_file_with_ext = \"kernel_reloc.o\"\n        bin_path = os.path.join(tmpdir, bin_file_with_ext)\n        callback_path = os.path.join(tmpdir, \"libkernel.so\")\n        _compile_option_list = get_common_bishengir_compile_options(metadata)\n\n        multibuffer = metadata[\"multibuffer\"]\n        if multibuffer is not None:\n            _compile_option_list += [\n                f\"--enable-auto-multi-buffer={multibuffer}\",\n            ]\n\n        disable_tightly_coupled_buffer_reuse = metadata[\"disable_tightly_coupled_buffer_reuse\"]\n        if disable_tightly_coupled_buffer_reuse:\n            _compile_option_list += [\"--disable-tightly-coupled-buffer-reuse\"]\n\n        _compile_option_list += [\n            f\"--enable-auto-bind-sub-block={get_auto_bind_sub_block_option(metadata)}\",\n        ]\n\n        if force_disable_ffts():\n            _compile_option_list += [\"--disable-ffts\"]\n        if _is_ascend_sanitizer_enabled():\n            _compile_option_list += [\"--enable-sanitizer=true\"]\n        if not _is_debug_line_info_disabled():\n            _compile_option_list += [\"--enable-debug-info=true\"]\n\n        if _enable_print_ub_bits():\n            _compile_option_list += [\"--enable-print-memory-allocated-size\"]",
+      "elide": ["L336-L446 是同一模式再重复十几遍(enable_hivm_auto_cv_balance / sync_solver / unit_flag / inject_barrier_all / ... 每个 `if metadata[x] is not None: _compile_option_list += [f\"--...={x}\"]`)——展示前 4~5 个即见套路，其余可省略"]
+    },
+    {
+      "path": "third_party/ascend/backend/compiler.py",
+      "lines": "L448-L499",
+      "code": "        cmd_list = (\n            [npu_compiler_path, ttadapter_path]\n            + _compile_option_list\n            + [\"-o\", bin_file]\n        )\n        vf_merge_level = metadata[\"vf_merge_level\"]\n        if vf_merge_level is not None:\n            cmd_list += [f\"--enable-vf-merge-level={vf_merge_level}\"]\n\n        hfusion_enable_multiple_consumer_fusion = metadata[\"hfusion_enable_multiple_consumer_fusion\"]\n        if hfusion_enable_multiple_consumer_fusion:\n            cmd_list += [f\"--hfusion-enable-multiple-consumer-fusion={hfusion_enable_multiple_consumer_fusion}\"]\n\n        if opt.debug:\n            print(f\"[DEBUG] cmd_list: {' '.join(cmd_list)}\")\n\n        try:\n            ret = subprocess.run(\n                cmd_list,\n                env=env,\n                stdout=subprocess.PIPE,\n                stderr=subprocess.PIPE,\n                check=True\n            )\n        except subprocess.CalledProcessError as e:\n            if opt.debug:\n                _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata[\"hash\"])\n            raise\n\n        if opt.debug:\n            _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata[\"hash\"])\n\n        stdout_str = ret.stdout.decode('utf-8') if ret.stdout else ''\n        match = re.search(r'UB\\s+size\\s*=\\s*(\\d+)\\s*bits', stdout_str)\n        if match:\n            # get the ub bits of triton kernel from bisheng for inductor autotune using\n            metadata[\"required_ub_bits\"] = int(match.group(1))\n\n        if not Path(bin_path).exists():\n            error_msg = ret.stderr.decode('utf-8') if ret.stderr else ''\n            print(f\"[DEBUG] {bin_path} is not found\")\n            print(f\"[DEBUG] Stderr:\\n{error_msg}\")\n            raise subprocess.CalledProcessError(ret.returncode, cmd_list, ret.stdout, ret.stderr)\n\n        if Path(callback_path).is_file():\n            lib = ctypes.CDLL(callback_path)\n            __get_metadata_attr_by_callback(lib, \"_infer_task_type_function\", metadata, \"bs_task_type\")\n            __get_metadata_attr_by_callback(lib, \"_infer_workspace_shape_function\", metadata, \"workspace_size\")\n            __get_metadata_attr_by_callback(lib, \"_infer_sync_block_lock_num_function\", metadata, \"lock_num\")\n            __get_metadata_attr_by_callback(lib, \"_infer_sync_block_lock_init_function\", metadata, \"lock_init_val\")\n\n        return Path(bin_path).read_bytes()",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/backend/compiler.py",
+      "lines": "L174-L180",
+      "code": "def __get_metadata_attr_by_callback(lib, postfix: str, metadata, meta_key: str):\n    func_symbol = metadata[\"kernel_name\"] + postfix\n    if hasattr(lib, func_symbol):\n        callback_func = getattr(lib, func_symbol)\n        callback_func.restype = ctypes.c_int64\n        callback_func.argtypes = []\n        metadata[meta_key] = callback_func()",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/backend/compiler.py",
+      "lines": "L508-L520",
+      "code": "        if _check_bishengir_api_change():\n            bin_file_with_ext = \"kernel.o\"\n        else:\n            bin_file_with_ext = \"kernel_reloc.o\"\n        if _check_bishengir_is_regbased():\n            bishengir_hivm_opt = \"--reg-based=true\"\n        else:\n            bishengir_hivm_opt = \"--enable-hivm-compile=true\"\n        bin_path = os.path.join(tmpdir, bin_file_with_ext)\n        callback_path = os.path.join(tmpdir, \"libkernel.so\")\n        _compile_option_list = [\n            f\"--target={NPUUtils().get_arch()}\",\n        ]",
+      "elide": ["这是 A2_A3 分支相对 910_95 的差异切片：910_95 用 get_common_bishengir_compile_options(取 metadata['target'].arch)，A2_A3 直接 NPUUtils().get_arch()；且 A2_A3 多一个 regbased/membased 探测分叉"]
+    },
+    {
+      "path": "third_party/ascend/backend/compiler.py",
+      "lines": "L836-L868",
+      "code": "        _compile_option_list = get_common_bishengir_compile_options(metadata)\n        if opt.force_simt_only:\n            _compile_option_list += [\"--enable-hivm-compile=false\"]\n            _compile_option_list += [\"--enable-triton-ir-compile\"]\n            _compile_option_list += [\"--pure-simt\"]\n            _compile_option_list += [f\"--num-warps={opt.num_warps}\"]\n            _compile_option_list += [f\"--threads-per-warp={opt.warp_size}\"]\n            if opt.enable_bishengir_simt_optimization != 000:\n                _compile_option_list += [f\"--enable-bishengir-simt-optimization={opt.enable_bishengir_simt_optimization}\"]\n            if opt.simt_stack_limit:\n                _compile_option_list += [f\"--simt-stack-limit={opt.simt_stack_limit}\"]\n            if opt.shared_mem_dynamic_size is not None:\n                _compile_option_list += [f\"--shared-mem-dynamic-size={opt.shared_mem_dynamic_size}\"]\n            if opt.enable_simt_reorder_instruction:\n                _compile_option_list += [\"--enable-simt-reorder-instruction=true\"]\n            if opt.disable_fma:\n                _compile_option_list += [f\"--disable-fma\"]\n\n            enable_libdevice_simt = triton_enable_libdevice_simt()\n            if (enable_libdevice_simt):\n                bisheng_options = metadata[\"bisheng_options\"]\n                if bisheng_options is not None:\n                    _compile_option_list += [\n                        f\"--append-bisheng-options={bisheng_options}\"\n                    ]\n\n        npu_compiler_path, env = _get_npucompiler_path()\n        cmd_list = (\n            [npu_compiler_path, src_path]\n            + _compile_option_list\n            + [\"-o\", bin_file]\n        )",
+      "elide": ["ttir_to_npubin 开头 L824-L835 (str(mod) + _parse_ttir_metadata + 写临时 ttir 文件 + bin 路径准备) 见 code_spine；subprocess/read_bytes 收尾(L868-L874)与 910_95 同构"]
+    },
+    {
+      "path": "third_party/ascend/backend/utils.py",
+      "lines": "L154-L173",
+      "code": "def _get_npucompiler_path() -> str:\n    ascend_dir = os.path.dirname(os.path.abspath(__file__))\n    env = os.environ.copy()\n    if is_compile_on_910_95:\n        npu_compiler_path = os.path.join(ascend_dir, \"bishengir-a5\", \"bin\", \"bishengir-compile\")\n    else:\n        npu_compiler_path = os.path.join(ascend_dir, \"bishengir\", \"bin\", \"bishengir-compile\")\n    if os.path.exists(npu_compiler_path):\n        npuir_env_path = os.path.dirname(npu_compiler_path)\n        env[\"PATH\"] = npuir_env_path + \":\" + env[\"PATH\"]\n    else:\n        npu_compiler_path = shutil.which(\"bishengir-compile\")\n        if npu_compiler_path is None:\n            npu_compiler_root = os.getenv(\"TRITON_NPU_COMPILER_PATH\", None)\n            if npu_compiler_root is None:\n                raise EnvironmentError(\n                    \"Couldn't find executable bishengir-compile or TRITON_NPU_COMPILER_PATH.\"\n                )\n            npu_compiler_path = os.path.join(npu_compiler_root, \"npuc\")\n    return npu_compiler_path, env",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/backend/utils.py",
+      "lines": "L188-L221",
+      "code": "def _is_valid_bishengir_path(path: str) -> bool:\n    if not path or not isinstance(path, str):\n        return False\n    if os.path.basename(path) != \"bishengir-compile\":\n        return False\n    if not os.path.isfile(path) or not os.access(path, os.X_OK):\n        return False\n    return True\n\n\n# grep bishengir-compile's option limit-auto-multi-buffer-buffer to check\n# if bishengir-compile is a newer version which does not generate kernel_reloc.o\n# any more.\ndef _check_bishengir_api_change() -> bool:\n    bishengir_path, _ = _get_npucompiler_path()\n    if not _is_valid_bishengir_path(bishengir_path):\n        print(f\"ERROR: Invalid bishengir path format: {bishengir_path}\")\n        return False\n    try:\n        result = subprocess.run(\n            [bishengir_path, \"--help\"],\n            stdout=subprocess.PIPE,\n            stderr=subprocess.PIPE,\n            text=True,\n        )\n        if result.returncode == 0 and 'limit-auto-multi-buffer-buffer' in result.stdout:\n            # bishengir-compile is newer version\n            return True\n        else:\n            # bishengir-compile is older version\n            return False\n    except Exception as e:\n        print(f\"ERROR: {e}\")\n        return False",
+      "elide": ["_check_bishengir_is_regbased(L224-L244)与 _check_bishengir_able_save_ir(L486-L504)是同一模式：跑 `--help` 抓另一个特性字符串('reg-based' / 'save-linked-ir')"]
+    }
+  ],
+  "key_classes": [
+    {"name": "_parse_linalg_metadata", "file": "third_party/ascend/backend/compiler.py", "responsibility": "第①段：6 条正则从 Linalg IR 文本表示抠 mix_mode/parallel_mode/kernel_name/name/tensor_kinds/bitcodes/auto_tile_and_bind_subblock，硬编码 shared=1、required_ub_bits=0，写进 metadata 供后续命令行构造与运行时用"},
+    {"name": "_parse_ttir_metadata", "file": "third_party/ascend/backend/compiler.py", "responsibility": "force_simt_only 快路径的简化版元数据抽取：从 TTIR(非 Linalg)抠 kernel_name/tensor_kinds，mix_mode 硬编码为 'aiv'(注释：TTIR 输入只支持 vector kernel)"},
+    {"name": "linalg_to_bin_enable_npu_compile_910_95", "file": "third_party/ascend/backend/compiler.py", "responsibility": "910_95 分支的 npubin 段：解析元数据→按十几个 enable 开关拼 _compile_option_list→拼 cmd_list→subprocess.run 调 bishengir-compile(闭源边界)→从 stdout 正则抠 UB size→读回 kernel.o 二进制+dlopen 回调抠 4 个运行时字段"},
+    {"name": "linalg_to_bin_enable_npu_compile_A2_A3", "file": "third_party/ascend/backend/compiler.py", "responsibility": "非 910_95(A2/A3)分支：与 910_95 结构同构，差异见 mechanism npu-branch-divergence(target 取法、regbased 分叉、sync_solver 双挂、preload/ubuf-saving/tile-mix-* 独有开关)"},
+    {"name": "ttir_to_npubin", "file": "third_party/ascend/backend/compiler.py", "responsibility": "force_simt_only 快路径：绕过 Linalg，TTIR 直接编 npubin，用 --pure-simt/--num-warps/--threads-per-warp 等 SIMT 专属参数喂 bishengir-compile"},
+    {"name": "__get_metadata_attr_by_callback", "file": "third_party/ascend/backend/compiler.py", "responsibility": "dlopen 回调通道 helper：按 kernel_name+postfix 在 libkernel.so 里找导出符号，设置 ctypes 签名(restype=c_int64/无参)后调用，回填 metadata[meta_key]"},
+    {"name": "_get_npucompiler_path", "file": "third_party/ascend/backend/utils.py", "responsibility": "定位 bishengir-compile 二进制：优先 backend 目录下 bishengir-a5/bishengir(随 is_compile_on_910_95)，回退 shutil.which，再回退 TRITON_NPU_COMPILER_PATH/npuc；并把其目录前插进子进程 env['PATH']"},
+    {"name": "_check_bishengir_api_change / _check_bishengir_is_regbased / _check_bishengir_able_save_ir", "file": "third_party/ascend/backend/utils.py", "responsibility": "能力探测通道：跑 `bishengir-compile --help` 在 stdout 里 grep 特性字符串('limit-auto-multi-buffer-buffer'/'reg-based'/'save-linked-ir')，据此调整产物名与命令行分支——用于兼容闭源二进制的版本演进"},
+    {"name": "is_compile_on_910_95", "file": "python/triton/tools/get_ascend_devices.py", "responsibility": "导入期计算的模块常量：探 PCI 设备号(0xd806)或 npu-smi info 判是否运行在 910_95，全局决定 linalg_to_bin 实现选择、bishengir 二进制目录、multibuffer 默认值"}
+  ],
+  "data_flow": [
+    {"step": "1. add_stages 选实现", "detail": "compiler.py:AscendBackend.add_stages —— npubin 段按 force_simt_only(→ttir_to_npubin) / compile_on_910_95(→910_95 else A2_A3) 挑一个 lambda 注册；本章从这里接过 ch27 的 f7"},
+    {"step": "2. 抠元数据", "detail": "compiler.py:_parse_linalg_metadata —— 拿 ttadapter 段产出的 Linalg IR 字符串，6 条正则 re.search/re.findall 抠 mix_mode/parallel_mode/kernel_name/name/tensor_kinds/bitcodes/auto_tile_and_bind_subblock，写 metadata"},
+    {"step": "3. 落临时文件", "detail": "compiler.py:linalg_to_bin_* —— tempfile.TemporaryDirectory 里把 linalg 写成 kernel.ttadapter.mlir(ttadapter_path)，规划 bin_file/bin_path/callback_path"},
+    {"step": "4. 探能力定产物名", "detail": "utils.py:_check_bishengir_api_change/_check_bishengir_is_regbased —— `--help` grep 决定 bin_path 是 kernel.o 还是 kernel_reloc.o、A2_A3 用 --reg-based 还是 --enable-hivm-compile"},
+    {"step": "5. 拼命令行", "detail": "compiler.py:linalg_to_bin_* —— get_common_bishengir_compile_options 起头(--target=)，再按 metadata 各 enable 开关(None 即跳过)逐个 append 几十个 --enable-*/--disable-*/--tile-* 参数，尾部补 vf_merge_level/hfusion_enable_multiple_consumer_fusion"},
+    {"step": "6. 定位编译器", "detail": "utils.py:_get_npucompiler_path —— 得到 bishengir-compile 绝对路径 + 注入了其目录的子进程 env"},
+    {"step": "7. 子进程调用(闭源边界)", "detail": "compiler.py:linalg_to_bin_* —— cmd_list=[编译器, ttadapter_path]+选项+['-o', bin_file]；subprocess.run(cmd_list, env, PIPE, check=True)。★书读到此为止：闭源二进制内部把 Linalg→HFusion→HIVM→NPU 二进制的过程不猜、无源码可读"},
+    {"step": "8. 回收 UB-bits", "detail": "compiler.py:linalg_to_bin_* —— ret.stdout decode 后 re.search(r'UB\\s+size\\s*=\\s*(\\d+)\\s*bits')，命中则 metadata['required_ub_bits']=int(...)，供 inductor autotune"},
+    {"step": "9. 回收二进制", "detail": "compiler.py:linalg_to_bin_* —— 校验 bin_path 存在(否则打印 stderr 并 raise CalledProcessError)，Path(bin_path).read_bytes() 返回 npubin 字节"},
+    {"step": "10. 回收 dlopen 回调元数据", "detail": "compiler.py:linalg_to_bin_* + __get_metadata_attr_by_callback —— 若生成了 libkernel.so，ctypes.CDLL 加载，按 kernel_name+4 个 postfix 取 bs_task_type/workspace_size/lock_num/lock_init_val 回填 metadata(运行时发射要用)"}
+  ],
+  "design_decisions": [
+    {"decision": "元数据从 IR 文本用正则抠，而非结构化 API", "why": "ttadapter 产出的是 Linalg IR 的文本表示(str(mod))；mix_mode/parallel_mode/kernel_name/tensor_kind 等已作为属性编码在 IR 文本里，正则 re.search/re.findall 是最直接的跨语言(Python 侧读 MLIR 文本)取值方式，无需绑 MLIR C++ API", "evidence": "third_party/ascend/backend/compiler.py:L200-L227"},
+    {"decision": "命令行按 `if metadata[x] is not None` 逐项条件拼接", "why": "几十个开关默认 None(见 NPUOptions dataclass)，None 表示『不传该参数、由 bishengir-compile 自己用默认』；只有用户/上游显式设值才 append，避免把默认值也硬塞进命令行", "evidence": "third_party/ascend/backend/compiler.py:L336-L440"},
+    {"decision": "subprocess.run(check=True) 停在闭源边界", "why": "bishengir-compile 是闭源二进制(昇腾侧的 ptxas 对位)，开源侧只能把 IR 文件 + 命令行喂进去、从产物/stdout/so 回调取回结果；这是开源可读与闭源黑盒的诚实分界", "evidence": "third_party/ascend/backend/compiler.py:L465-L471"},
+    {"decision": "三通道回收元数据(二进制/UB-bits stdout/dlopen so)", "why": "npubin 字节要给 driver 发射；required_ub_bits 从 stdout 正则抠给 inductor autotune；bs_task_type/workspace_size/lock_num/lock_init_val 藏在闭源生成的 libkernel.so 导出函数里，只能 dlopen+ctypes 回调取——不同用途的元数据走不同回收路径", "evidence": "third_party/ascend/backend/compiler.py:L480-L499"},
+    {"decision": "用 `--help` grep 做闭源二进制的能力/版本探测", "why": "bishengir-compile 版本会演进(产物名 kernel_reloc.o→kernel.o、新增 reg-based/save-linked-ir 选项)，开源侧无法读其版本号，只能跑 --help 抓特性字符串来适配——把闭源演进的兼容负担放在探测而非硬编码版本", "evidence": "third_party/ascend/backend/utils.py:L198-L221"},
+    {"decision": "910_95 与 A2/A3 两套并行实现而非一份带分支", "why": "两代硬件的 bishengir 选项集差异大(A2/A3 独有 preload/ubuf-saving/tile-mix-*、regbased 分叉、sync_solver 多挂 cross-core-gss)，且用不同二进制(bishengir-a5 vs bishengir)，拆成两个函数比一份满是 if 的更清晰；由 is_compile_on_910_95 在 add_stages 时选定", "evidence": "third_party/ascend/backend/compiler.py:L952-L963"},
+    {"decision": "force_simt_only 快路径绕过 Linalg 直编 TTIR", "why": "纯 SIMT 场景不需要 Linalg 结构化那套下降，TTIR 直接交 bishengir-compile 走 --pure-simt/--num-warps/--threads-per-warp；元数据也简化为 _parse_ttir_metadata(mix_mode 固定 aiv)", "evidence": "third_party/ascend/backend/compiler.py:L837-L861"}
+  ],
+  "theory": [
+    "kernel_name 与 mix_mode 的编码约定：metadata['name'] = kernel_name + '_' + mix_mode，运行时(npu_driver.py 的 load_binary)按最后一个 '_' rsplit 还原；pack_metadata 里 KERNEL_NAME_MAX_LEN=49(CANN 限制 kernel 名 ≤50，留一位给 '\\n')会对超长名取后 49 字符",
+    "tensor_kind 正则的语义：TENSOR_KIND_REGEX 从每个 %argN 的 {tt.tensor_kind = k : i32} 属性抠出 k(0/1/2 类，代表 input/output/inout 语义)，findall 收集成 tensor_kinds 列表，pack_metadata 透传给运行时决定参数搬运方向",
+    "命令行开关的三种取值形态：布尔环境探测(force_disable_ffts/_is_ascend_sanitizer_enabled 等→加不加 flag)、metadata 三态值(None 跳过 / True/False/数值 拼成 --x={val})、以及固定 flag(bishengir-compile 结尾才加 --enable-hfusion-compile 等)",
+    "UB(Unified Buffer) bits 的用途：bishengir-compile 在 stdout 打印实际分配的 UB 位数，triton 抠回填进 metadata['required_ub_bits'] 供 torch inductor 的 autotune 估算 kernel 的片上内存占用",
+    "闭源边界的复杂度界定：本章能量化到 subprocess 调用点——命令行参数个数、元数据字段数、回收通道数都可数；调用之后 Linalg→HFusion→HIVM→NPU 二进制的编译过程是闭源二进制内部行为，无源码、不做复杂度分析(HFusion/HIVM 方言定义本身在 AscendNPU-IR submodule 内可读，但 bishengir-compile 的编译实现闭源)"
+  ],
+  "subtraction_plan": {
+    "delete": [],
+    "must_keep": [
+      {"symbol": "_parse_linalg_metadata", "why": "第①段元数据正则抽取的核心函数，writer 必须逐条讲 6 个正则各抠什么"},
+      {"symbol": "MIX_MODE_REGEX", "why": "抠 mix_mode 的正则，读者需看到正则形态与它匹配的 IR 文本例子"},
+      {"symbol": "PARALLEL_MODE_REGEX", "why": "抠 parallel_mode 的正则"},
+      {"symbol": "KERNEL_NAME_REGEX", "why": "抠 kernel_name 的正则(func.func @name)"},
+      {"symbol": "TENSOR_KIND_REGEX", "why": "抠 tensor_kinds 的正则，是最复杂的一条(嵌套属性匹配)，writer 需拆解"},
+      {"symbol": "linalg_to_bin_enable_npu_compile_910_95", "why": "第②③段主函数(910_95 分支)，命令行构造+subprocess+回收全在此"},
+      {"symbol": "linalg_to_bin_enable_npu_compile_A2_A3", "why": "姊妹实现，f7 要回收『两个候选到底差在哪』"},
+      {"symbol": "get_common_bishengir_compile_options", "why": "命令行地基(--target=)"},
+      {"symbol": "get_auto_bind_sub_block_option", "why": "体现『用户开关 > 模块属性』优先级的取值逻辑"},
+      {"symbol": "subprocess.run", "why": "闭源边界的调用点本身——本章的价值锚点"},
+      {"symbol": "__get_metadata_attr_by_callback", "why": "dlopen 回调通道取值 helper"},
+      {"symbol": "required_ub_bits", "why": "UB-bits 回收通道的落点字段(inductor autotune 用)"},
+      {"symbol": "ttir_to_npubin", "why": "force_simt_only 快路径的命令行，补 ch27 埋的坑"},
+      {"symbol": "_get_npucompiler_path", "why": "定位闭源二进制 + 注入 PATH，是子进程能跑起来的前提"},
+      {"symbol": "_check_bishengir_api_change", "why": "能力探测通道代表，决定产物名 kernel.o vs kernel_reloc.o"},
+      {"symbol": "is_compile_on_910_95", "why": "全局分叉开关，决定选哪个实现/哪个二进制"}
+    ]
+  },
+  "mechanisms": [
+    {"id": "regex-metadata-extraction", "name": "从 Linalg IR 文本正则抠元数据(第①段)", "kind": "algorithm", "source_anchors": ["third_party/ascend/backend/compiler.py:L183-L234"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "tensor-kind-regex", "name": "TENSOR_KIND_REGEX 嵌套属性匹配逐字拆解", "kind": "algorithm", "source_anchors": ["third_party/ascend/backend/compiler.py:L208-L209", "third_party/ascend/backend/compiler.py:L227"], "needs_figure": false, "needs_worked_example": true, "difficulty": "supporting"},
+    {"id": "cmdline-conditional-assembly", "name": "按 metadata 开关条件拼几十个命令行参数(第②段)", "kind": "algorithm", "source_anchors": ["third_party/ascend/backend/compiler.py:L310-L459"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "subprocess-closed-boundary", "name": "subprocess.run 调 bishengir-compile：闭源边界(第②段收口)", "kind": "protocol", "source_anchors": ["third_party/ascend/backend/compiler.py:L448-L490"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "three-channel-recovery", "name": "产物/UB-bits/dlopen 三通道回收元数据(第③段)", "kind": "dataflow", "source_anchors": ["third_party/ascend/backend/compiler.py:L480-L499", "third_party/ascend/backend/compiler.py:L174-L180"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "dlopen-callback-metadata", "name": "dlopen libkernel.so 回调抠 bs_task_type/workspace_size/lock_num/lock_init_val", "kind": "protocol", "source_anchors": ["third_party/ascend/backend/compiler.py:L174-L180", "third_party/ascend/backend/compiler.py:L492-L497"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "npu-branch-divergence", "name": "910_95 vs A2_A3 两候选实现的差异(f7 回收)", "kind": "config", "source_anchors": ["third_party/ascend/backend/compiler.py:L298-L324", "third_party/ascend/backend/compiler.py:L502-L565"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "force-simt-fastpath-cmdline", "name": "force_simt_only 快路径的 TTIR 直编命令行", "kind": "config", "source_anchors": ["third_party/ascend/backend/compiler.py:L824-L868"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "npucompiler-path-resolution", "name": "_get_npucompiler_path 定位二进制并注入子进程 PATH", "kind": "dataflow", "source_anchors": ["third_party/ascend/backend/utils.py:L154-L173"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "bishengir-capability-probe", "name": "`--help` grep 探闭源二进制能力/版本以适配命令行与产物名", "kind": "protocol", "source_anchors": ["third_party/ascend/backend/utils.py:L188-L244", "third_party/ascend/backend/compiler.py:L304-L308"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "compile-on-910-95-gate", "name": "is_compile_on_910_95 导入期探测决定全局分叉", "kind": "config", "source_anchors": ["python/triton/tools/get_ascend_devices.py:L52-L55", "third_party/ascend/backend/compiler.py:L952-L963"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "kernel-name-mix-mode-encoding", "name": "metadata['name']=kernel_name+'_'+mix_mode 的编码与运行时还原约定", "kind": "protocol", "source_anchors": ["third_party/ascend/backend/compiler.py:L223-L225", "third_party/ascend/backend/compiler.py:L905-L923"], "needs_figure": false, "needs_worked_example": true, "difficulty": "supporting"}
+  ],
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_recover": [
+      {"id": "f7", "note": "npubin 段怎么把 ttadapter 产出的 Linalg 产物拼成 bishengir-compile 的命令行、子进程怎么调用、compile_on_910_95 在 linalg_to_bin_enable_npu_compile_910_95 与 ..._A2_A3 两个候选实现之间到底差在哪——本章完整回收：命令行构造(mechanism cmdline-conditional-assembly)、subprocess 调用(subprocess-closed-boundary)、两候选差异(npu-branch-divergence)。ch27 只讲到分叉与 force_simt_only 快路径开头，本章补齐 subprocess 边界为止的全部开源侧细节", "planted_in": "ch27"}
+    ]
+  }
+}
