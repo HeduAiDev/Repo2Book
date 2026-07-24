@@ -1,0 +1,125 @@
+{
+  "chapter": "ch27",
+  "title": "三段下降链:add_stages 与 Triton-MLIR→Linalg 的编排",
+  "note_to_illustrator_and_writer": "本章是综合/编排章,无精简版。所有 pass 顺序与计数均由 explainer/traces/extract_pass_sequence.py 从 compiler.py 源码静态抽取(host 上确定性可复现),原始输出见 explainer/traces/pass_sequence.txt。凡引用源码常量/行号的数字均标 file:Lxxx。特别提醒 writer:warp_size 有两个不同对象——GPUTarget 硬件描述符 warp_size=0(driver.py:L173,昇腾无真实 warp,主叙事所指),与 NPUOptions.warp_size=32(compiler.py:L716,仅在 force_simt_only 拼 --threads-per-warp 选项字符串时用)。两者都为真、不同用途,勿混为一谈。f6 伏笔本章回收:npubin 段完整命令行构造顺延 ch28,本章只到分叉与边界,须显式向读者指路。",
+
+  "mechanisms": [
+    {
+      "mechanism_id": "three-stage-registration",
+      "intuition": "add_stages 像餐厅后厨的『排班表』——它本身不炒菜,只是把『谁负责哪一道工序』写进班表(stages dict)。昇腾这张班表永远只排三个岗:ttir(前端优化)→ttadapter(降到 Linalg)→npubin(出二进制);两个 if 开关决定最后一岗谁上、以及中间那岗要不要排。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch27-registration",
+          "claim": "add_stages 只做『登记』不做『编译』——按名把三段可调用体塞进 stages dict,force_simt_only 与 compile_on_910_95 两个 if 只改『登记哪个实现』。",
+          "template": "state-machine",
+          "numbers": [
+            {"label": "stages['ttir'] 无条件登记 = make_ttir", "value": "L941", "provenance": "compiler.py:L941"},
+            {"label": "分叉①: if force_simt_only → 只登记 npubin=ttir_to_npubin 后 return", "value": "L942-L948", "provenance": "compiler.py:L942-L948"},
+            {"label": "stages['ttadapter'] 登记 = ttir_to_linalg(named_ops=True)", "value": "L949-L951", "provenance": "compiler.py:L949-L951"},
+            {"label": "分叉②: if compile_on_910_95 → npubin 二选一(910_95 vs A2/A3)", "value": "L952-L963", "provenance": "compiler.py:L952-L963"},
+            {"label": "常规路登记的 stage 数", "value": "3", "provenance": "compiler.py:L941/L949/L953(ttir/ttadapter/npubin 三个 key)"},
+            {"label": "快路径(force_simt_only)登记的 stage 数", "value": "2", "provenance": "compiler.py:L941+L943(ttir/npubin,ttadapter 整段不注册)"}
+          ],
+          "caption_draft": "add_stages 是装配层:三段登记 + 两处 if 分叉,分叉靠『少登记/换登记一段』实现,而非在 pass 链内部加 if。常规三段(ttir→ttadapter→npubin),force_simt_only 退化为两段。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "ttadapter-pass-orchestration",
+      "intuition": "如果说 ch10-24 每章都在放大看『一块拼图』(某个 add_* pass 内部怎么工作),那本章 ttir_to_linalg 就是拼图盒盖上的『完成图』——它按真实顺序把这些 pass 一块块拼进 pass_manager。读者第一次看到:auto_blockify、triton_to_structure、hivm、hfusion……原来是这样首尾相接成一条真实流水线的。",
+      "worked_example": {
+        "params": {
+          "config": "默认生产路径:force_simt_only=False(走 ttadapter 段)、add_auto_scheduling=False(自动调度块跳过,compiler.py:L770 默认)、_is_auto_map_parallel_blocks_enabled()=False → auto_blockify_size 被强制归 1(compiler.py:L114-L115)、named_ops=True(add_stages 写死,compiler.py:L950)",
+          "why_these": "选最普通的一次 kernel 编译:不开激进自动调度、不开自动并行块映射、非快路径。这样主线 11 个 add_* 全部按序执行且无可选块干扰,读者能顺着数下来。"
+        },
+        "trace_source": "manual",
+        "manual_reason": "本章无精简版(skip_impl):真实 triton-ascend 下降流水线要跑起来需 Ascend 工具链(bishengir-compile + CANN + NPU 硬件),host 无法执行。但本章教学对象是『编排』(哪些 pass、什么顺序、带什么开关),该信息完全静态可从 compiler.py 抽取,无需运行编译器。逐轮表的 pass 名与行号由确定性脚本 explainer/traces/extract_pass_sequence.py 从源码抽出(输出 explainer/traces/pass_sequence.txt),非人工誊写;各 pass 的『IR 入→出』语义来自各自专章(ch10-24)与 dossier.data_flow。",
+        "trace_ref": "traces/pass_sequence.txt",
+        "table": {
+          "columns": ["轮次", "add_* pass(行号)", "对应章", "IR 形态: 入 → 出(概念)", "关键参数/条件"],
+          "rows": [
+            ["0(前置)", "make_ttir 8 个 TTIR pass(L79-L86)", "与基座共享", "Triton-MLIR → 优化后 Triton-MLIR", "inliner→combine→canonicalizer→reorder_broadcast→cse→licm→symbol_dce→loop_unroll"],
+            ["1", "add_auto_blockify(L118)", "ch15", "多网格实例 → blockify 循环", "auto_blockify_size=1(未开自动并行块映射,L114-L115 归 1,不折叠)"],
+            ["2", "add_triton_to_structure(L131,第一遍)", "ch10-13", "指针访存 → 结构化张量访存", "enable_mask_fallback_conversion / optimize_dynamic_offset"],
+            ["3", "add_discrete_mask_access_conversion(L136)", "ch19", "连续掩码 → 离散掩码访存拆分", "compile_on_910_95 / force_simt_template / enable_sync_block_lock"],
+            ["4", "add_triton_to_annotation(L142)", "结构化轨道标注", "结构化张量 → 带标注的结构化张量", "无额外开关"],
+            ["5", "add_triton_to_unstructure(L143)", "ch14", "结构化装不下的部分 → 非结构化兜底形态", "compile_on_910_95 / force_simt_template"],
+            ["6", "add_triton_to_hivm(L148)", "ch23", "→ HIVM 达芬奇硬件方言", "无额外开关"],
+            ["7", "add_triton_to_hfusion(L149)", "ch21", "→ HFusion 张量级融合方言", "无额外开关"],
+            ["8", "add_triton_to_llvm(L150)", "标量/控制流下降", "标量与控制流部分 → LLVM 方言", "无额外开关"],
+            ["9", "add_bubble_up_operation(L151)", "清理/重排", "操作上抬重排后的 IR", "无额外开关"],
+            ["10", "add_triton_to_structure(L152,第二遍)", "ch10-13", "新暴露的可结构化模式 → 再结构化一轮", "与第一遍参数完全相同(L131 vs L152)"],
+            ["11", "add_triton_to_linalg(L157,收口)", "ch10", "→ Linalg named-op 形态(不再有 triton.* op)", "named_ops=True → 产 linalg named op 而非 linalg.generic"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "ttir_to_linalg 的 pass 链是『有限有序、单向收敛』的:pm.run 按源码顺序把 11 个 add_* 各执行一次即返回(必然终止);顺序不可任意打乱,因为存在前置依赖偏序——收口 add_triton_to_linalg 必须排在 structure/hivm/hfusion 之后。",
+        "argument": "终止性(基例):pass 链是编译期就写死的固定长度列表(主线 11 项,L118-L157),pm.run 遍历一次即停,步数上界=登记的 pass 数,有限。正确性(归纳/偏序):add_triton_to_linalg 要求输入已是『结构化 + 已下降到 HIVM/HFusion』的形态,故它必在 add_triton_to_structure(把指针变结构化)与 add_triton_to_hivm/hfusion 之后;同理 annotation/unstructure 依赖 structure 先跑。因此这是一条拓扑序(topological order)而非可交换序——把 triton_to_linalg 提前会因输入仍含未降的 triton.* op 而失败。structure 跑两遍(L131 与 L152 参数全同)正是为在中间 pass 暴露新结构后再收一轮,是迭代收敛而非冗余。"
+      },
+      "quantified": "默认路径一次 kernel 编译共挂 8(make_ttir,L79-L86) + 11(ttir_to_linalg 主线 ascend pass,L118-L157) = 19 个 pass 调用。开启自动调度(add_auto_scheduling=True)则 ttadapter 段再插入 7 个(3 个 ascend:dag_sync/dag_scope/dag_ssbuffer + 4 个 cse/canonicalizer 清理,L122-L129),合计 8+18=26。相反,若走 force_simt_only 快路径,ttadapter 段整段不注册——该段 add_* 计数从 11 直接归 0(compiler.py:L942-L948 只登记 ttir+npubin 两段)。计数来源:explainer/traces/pass_sequence.txt(确定性抽取)。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch27-pass-pipeline",
+          "claim": "ttir_to_linalg 把散落 ch10-24 的 add_* pass 按真实顺序串成一条流水线,每个 pass 恰对应全书某一章——本章是这条流水线的『边框』,各专章是『拼图块』。",
+          "template": "flow",
+          "numbers": [
+            {"label": "第一段 make_ttir 共享 TTIR pass 数", "value": "8", "provenance": "compiler.py:L79-L86;traces/pass_sequence.txt(make_ttir.count=8)"},
+            {"label": "第二段 ttadapter 主线 ascend pass 数", "value": "11", "provenance": "compiler.py:L118-L157;traces/pass_sequence.txt(ttir_to_linalg_mainline.count=11)"},
+            {"label": "auto_blockify(网格折叠)", "value": "ch15 · L118", "provenance": "compiler.py:L118 + dossier.data_flow#7"},
+            {"label": "triton_to_structure(指针→结构化,跑两遍)", "value": "ch10-13 · L131,L152", "provenance": "compiler.py:L131/L152 + dossier.data_flow#9,#17"},
+            {"label": "discrete_mask_access_conversion(离散掩码)", "value": "ch19 · L136", "provenance": "compiler.py:L136 + dossier.data_flow#10"},
+            {"label": "triton_to_unstructure(非结构化兜底)", "value": "ch14 · L143", "provenance": "compiler.py:L143 + dossier.data_flow#12"},
+            {"label": "triton_to_hivm(达芬奇方言)", "value": "ch23 · L148", "provenance": "compiler.py:L148 + dossier.data_flow#13"},
+            {"label": "triton_to_hfusion(张量融合)", "value": "ch21 · L149", "provenance": "compiler.py:L149 + dossier.data_flow#14"},
+            {"label": "triton_to_linalg(收口)", "value": "ch10 · L157", "provenance": "compiler.py:L157 + dossier.data_flow#18"}
+          ],
+          "caption_draft": "第二段 ttadapter 的 11 个 add_* 按拓扑序首尾相接:auto_blockify→structure→discrete_mask→annotation→unstructure→hivm→hfusion→llvm→bubble_up→structure(第二遍)→triton_to_linalg 收口。每块拼图的内部实现见对应专章;本章只讲顺序与开关。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "force-simt-fast-path",
+      "intuition": "常规路要过『装修队』(ttadapter 段十来个 pass 把 IR 降成 Linalg)才交给楼下的施工队(bishengir);force_simt_only 是一条『毛坯直交』的旁路——房子(TTIR)不装修,直接甩给施工队用 SIMT 模式自己搞。分叉就在 add_stages 的一行 if 上:真则少登记 ttadapter 这一整段。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch27-simt-bypass",
+          "claim": "force_simt_only 通过『在装配层少登记一段』实现旁路:ttadapter 段整段不注册,TTIR 直接喂 ttir_to_npubin 交 bishengir 的 SIMT 纯路,而非在 pass 链里加分支。",
+          "template": "before-after",
+          "numbers": [
+            {"label": "分叉点(add_stages 里的一行 if)", "value": "L942", "provenance": "compiler.py:L942 `if options.force_simt_only:`"},
+            {"label": "常规路 stage 数(ttir→ttadapter→npubin)", "value": "3", "provenance": "compiler.py:L941/L949/L953"},
+            {"label": "快路径 stage 数(ttir→npubin,跳过 ttadapter)", "value": "2", "provenance": "compiler.py:L941+L943-L948(登记后立即 return)"},
+            {"label": "快路径 ttadapter 段 add_* 数", "value": "0", "provenance": "compiler.py:L942-L948(ttir_to_linalg 整个不被登记)"},
+            {"label": "SIMT 纯路声明的三个 bishengir 开关", "value": "--enable-hivm-compile=false / --enable-triton-ir-compile / --pure-simt", "provenance": "compiler.py:L838-L840(ttir_to_npubin 内)"},
+            {"label": "force_simt_only 默认值", "value": "False", "provenance": "compiler.py:L775(NPUOptions.force_simt_only=False)"}
+          ],
+          "caption_draft": "旁路是装配层的减法:force_simt_only 为真时 add_stages 只登记 ttir+npubin(L943-L948)并 return,ttadapter 那 11 个 add_* 归 0。TTIR 经 ttir_to_npubin 直交 bishengir SIMT 纯路(--pure-simt),完整命令行构造见 ch28。"
+        }
+      ]
+    },
+
+    {
+      "mechanism_id": "three-vs-five-stage-contrast",
+      "intuition": "同一个 Triton kernel,GPU 后端要过五道关(ttir→ttgir→llir→ptx→cubin),昇腾只过三道(ttir→ttadapter→npubin)。少的正是 TTGIR 那道——GPU 在 TTGIR 层显式派 layout/warp/CTA 给线程模型,而昇腾没有真实 warp(硬件描述符 warp_size=0),这些决策全被推进闭源 bishengir 里。段少不等于简单,复杂度只是从『前端可见的 pass』搬到了『闭源二进制内部』。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch27-3vs5-stages",
+          "claim": "昇腾三段比基座 CUDA 五段少一整层 TTGIR——因为昇腾无真实 warp(warp_size=0),不需 GPU 那层显式 layout/warp/CTA 指派,Triton-MLIR 经 triton_adapter 直降 Linalg。",
+          "template": "before-after",
+          "numbers": [
+            {"label": "昇腾 add_stages 登记的 stage 数", "value": "3", "provenance": "compiler.py:L941/L949/L953(ttir→ttadapter→npubin)"},
+            {"label": "基座 CUDABackend 五段", "value": "5", "provenance": "dossier.title/code_spine(ttir→ttgir→llir→ptx→cubin),对位基座 ch36"},
+            {"label": "昇腾少掉的中间层", "value": "TTGIR(1 层)", "provenance": "dossier.design_decisions#2 与 theory#2(昇腾无 TTGIR 层)"},
+            {"label": "昇腾硬件描述符 warp_size", "value": "0", "provenance": "driver.py:L173 `warp_size = 0`"},
+            {"label": "GPU 典型 warp_size(对照)", "value": "32", "provenance": "对照:CUDA warp 为 32 线程(昇腾用 mix_mode+达芬奇 AI Core 取代 warp 概念)"},
+            {"label": "昇腾专属下降段(ttadapter)承载的 add_* 数", "value": "11", "provenance": "compiler.py:L118-L157;traces/pass_sequence.txt(mainline.count=11)"}
+          ],
+          "caption_draft": "三段 vs 五段的本质是抽象层级取舍:GPU 在 TTGIR 层做 layout/warp 指派(warp_size=32 线程模型);昇腾 warp_size=0、无真实 warp,省掉 TTGIR,Triton-MLIR 经 triton_adapter 直降 Linalg,并行/内存/流水决策全推给闭源 bishengir。段少不代表简单——复杂度转移到闭源内部。"
+        }
+      ]
+    }
+  ]
+}

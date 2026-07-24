@@ -1,0 +1,147 @@
+{
+  "chapter": "ch27",
+  "title": "三段下降链:add_stages 与 Triton-MLIR→Linalg 的编排",
+  "one_line": "站在昇腾后端 POV，把 compiler.py 的两个编排函数 make_ttir(8 个共享 TTIR pass)与 ttir_to_linalg(一长串 ascend.passes.ttir.add_* pass)拆开——每个 add_* 对应全书哪一章、为什么是这个顺序、哪些是条件分支——从而把散落 ch10-24 的各 pass 拼成一条真实流水线的鸟瞰；对位基座 ch36 CUDABackend 五段 add_stages。",
+
+  "code_spine": [
+    "third_party/ascend/backend/compiler.py:L939-L968  AscendBackend.add_stages —— 三段登记的总入口(ttir→ttadapter→npubin)，含 force_simt_only 与 compile_on_910_95 两个分叉",
+    "third_party/ascend/backend/compiler.py:L73-L93   make_ttir —— 第一段 ttir：与基座 GPU 路共享的 8 个 TTIR 前端优化 pass",
+    "third_party/ascend/backend/compiler.py:L96-L171  ttir_to_linalg —— 第二段 ttadapter(昇腾专属)：把 TTIR 打成字符串写临时文件，在 pass_manager 上按序挂一长串 ascend.passes.ttir.add_*，产出 named-op 形态 Linalg",
+    "third_party/ascend/backend/compiler.py:L824-L874 ttir_to_npubin —— force_simt_only 快路径：绕过 Linalg 那套，TTIR 直编 npubin(仅本章讲『快路径存在与分叉点』，bishengir 命令细节归 ch28)"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "third_party/ascend/backend/compiler.py",
+      "lines": "L939-L968",
+      "code": "    def add_stages(self, stages, options):\n        if self.target.backend == \"npu\":\n            stages[\"ttir\"] = lambda src, metadata: make_ttir(src, metadata, options)\n            if options.force_simt_only:\n                stages[\"npubin\"] = (\n                    lambda src, metadata: ttir_to_npubin(\n                        src, metadata, options\n                    )\n                )\n                return\n            stages[\"ttadapter\"] = lambda src, metadata: ttir_to_linalg(\n                src, metadata, options, named_ops=True\n            )\n            if options.compile_on_910_95:\n                stages[\"npubin\"] = (\n                    lambda src, metadata: linalg_to_bin_enable_npu_compile_910_95(\n                        src, metadata, options\n                    )\n                )\n            else:\n                stages[\"npubin\"] = (\n                    lambda src, metadata: linalg_to_bin_enable_npu_compile_A2_A3(\n                        src, metadata, options\n                    )\n                )\n        else:\n            raise NotImplementedError(\n                f\"Backend '{self.target.backend}' is not supported. \"\n                \"Please ensure the target backend is set to 'npu'.\"\n            )",
+      "elide": ["末尾 else 分支只是对非 npu target 抛 NotImplementedError——supports_target 已保证只有 npu 走到这，属防御性代码，讲解时可一句带过。"]
+    },
+    {
+      "path": "third_party/ascend/backend/compiler.py",
+      "lines": "L73-L93",
+      "code": "def make_ttir(mod, metadata, opt):\n    if \"hash\" not in metadata:\n        metadata[\"hash\"] = hashlib.sha256(f\"{mod}-{metadata}\".encode()).hexdigest()\n    # the same optimize pass for triton-ir as all other backends\n    pm = ir.pass_manager(mod.context)\n    pm.enable_debug()\n    passes.common.add_inliner(pm)\n    passes.ttir.add_combine(pm)\n    passes.common.add_canonicalizer(pm)\n    passes.ttir.add_reorder_broadcast(pm)\n    passes.common.add_cse(pm)\n    passes.common.add_licm(pm)\n    passes.common.add_symbol_dce(pm)\n    passes.ttir.add_loop_unroll(pm)\n    pm.run(mod)\n    if opt.debug:\n        dump_manager = get_dump_manager(metadata[\"hash\"])\n        print(f\"Dumping intermediate results to {dump_manager.cache_dir}\")\n        dump_manager.put(str(mod), \"kernel.ttir.mlir\", binary=False)\n\n    return mod",
+      "elide": ["`if opt.debug:` 块只在调试时把中间 TTIR dump 到磁盘，不影响主数据流；讲『8 个 pass 的顺序』时可省。注意源码原文注释 `# the same optimize pass for triton-ir as all other backends` 正是本章要强调的『第一段与基座共享』的自证依据，不可省。"]
+    },
+    {
+      "path": "third_party/ascend/backend/compiler.py",
+      "lines": "L96-L171",
+      "code": "def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):\n    # use triton_adapter to lower Triton-MLIR to linalg\n    # Get Triton-MLIR as string\n    ttir_code = str(mod)\n    with tempfile.TemporaryDirectory() as tmpdir:\n        src_path = os.path.join(tmpdir, \"kernel.ttir.mlir\")\n        dst_path = os.path.join(tmpdir, \"kernel.ttadapter.mlir\")\n        Path(src_path).write_text(ttir_code)\n        triton_adapter_opt_path = _get_triton_adapter_opt_path()\n\n        enable_nd2nz_on_vector = metadata[\"enable_nd2nz_on_vector\"]\n        enable_select_analysis = metadata[\"enable_select_analysis\"]\n        compile_on_910_95 = metadata[\"compile_on_910_95\"]\n        force_simt_template = metadata[\"force_simt_template\"]\n        enable_sync_block_lock = metadata[\"enable_sync_block_lock\"]\n        enable_mask_fallback_conversion = metadata[\"enable_mask_fallback_conversion\"]\n        optimize_dynamic_offset = metadata[\"optimize_dynamic_offset\"]\n        auto_blockify_size = metadata[\"auto_blockify_size\"]\n        if not _is_auto_map_parallel_blocks_enabled():\n            auto_blockify_size = 1\n        pm = ir.pass_manager(mod.context)\n        pm.enable_debug()\n        ascend.passes.ttir.add_auto_blockify(\n            pm,\n            auto_blockify_size\n        )\n        if (metadata[\"add_auto_scheduling\"]):\n            ascend.passes.ttir.add_dag_sync(pm)\n            ascend.passes.ttir.add_dag_scope(pm)\n            passes.common.add_cse(pm)\n            passes.common.add_canonicalizer(pm)\n            ascend.passes.ttir.add_dag_ssbuffer(pm)\n            passes.common.add_cse(pm)\n            passes.common.add_canonicalizer(pm)\n\n        ascend.passes.ttir.add_triton_to_structure(\n            pm,\n            enable_mask_fallback_conversion,\n            optimize_dynamic_offset\n        )\n        ascend.passes.ttir.add_discrete_mask_access_conversion(\n            pm,\n            compile_on_910_95,\n            force_simt_template,\n            enable_sync_block_lock\n        )\n        ascend.passes.ttir.add_triton_to_annotation(pm)\n        ascend.passes.ttir.add_triton_to_unstructure(\n            pm,\n            compile_on_910_95,\n            force_simt_template\n        )\n        ascend.passes.ttir.add_triton_to_hivm(pm)\n        ascend.passes.ttir.add_triton_to_hfusion(pm)\n        ascend.passes.ttir.add_triton_to_llvm(pm)\n        ascend.passes.ttir.add_bubble_up_operation(pm)\n        ascend.passes.ttir.add_triton_to_structure(\n            pm,\n            enable_mask_fallback_conversion,\n            optimize_dynamic_offset\n        )\n        ascend.passes.ttir.add_triton_to_linalg(\n            pm,\n            False,\n            named_ops,\n            enable_nd2nz_on_vector,\n            enable_select_analysis,\n            compile_on_910_95\n        )\n        pm.run(mod)\n\n        if opt.debug:\n            dump_manager = get_dump_manager(metadata[\"hash\"])\n            dump_manager.put(str(mod), \"kernel.ttadapter.mlir\", binary=False)\n\n        return str(mod)",
+      "elide": ["`dst_path` 与 `triton_adapter_opt_path` 两个局部变量在本函数体内实际未被后续使用(下降走的是 in-process pass_manager 而非外部 opt 二进制)——是历史遗留/为将来备用，讲编排时可不提。", "开头 8 行 `xxx = metadata[...]` 只是把 NPUOptions 承载的开关取出成局部量，逐个喂给对应 add_*；讲『pass 从 metadata 取参』这一机制时挑 enable_mask_fallback_conversion / force_simt_template / auto_blockify_size 三个代表即可，不必逐字段念。", "结尾 `if opt.debug:` dump 块同 make_ttir，可省。"]
+    },
+    {
+      "path": "third_party/ascend/backend/compiler.py",
+      "lines": "L824-L874",
+      "code": "def ttir_to_npubin(mod, metadata, opt):\n    # Get Triton-MLIR as string\n    ttir_code = str(mod)\n    metadata = _parse_ttir_metadata(ttir_code, metadata)\n    with tempfile.TemporaryDirectory() as tmpdir:\n        # prepare input\n        src_path = os.path.join(tmpdir, \"kernel.ttir.mlir\")\n        Path(src_path).write_text(ttir_code)\n        # prepare output\n        bin_file = os.path.join(tmpdir, \"kernel\")\n        bin_path = os.path.join(tmpdir, \"kernel.o\")\n        # build compile options\n        _compile_option_list = get_common_bishengir_compile_options(metadata)\n        if opt.force_simt_only:\n            _compile_option_list += [\"--enable-hivm-compile=false\"]\n            _compile_option_list += [\"--enable-triton-ir-compile\"]\n            _compile_option_list += [\"--pure-simt\"]\n            _compile_option_list += [f\"--num-warps={opt.num_warps}\"]\n            _compile_option_list += [f\"--threads-per-warp={opt.warp_size}\"]",
+      "elide": ["本章只用 ttir_to_npubin 的开头证明『force_simt_only 直接把 TTIR 喂 bishengir、并用 --enable-hivm-compile=false / --enable-triton-ir-compile / --pure-simt 三个开关声明走 SIMT 纯路而非 Linalg 那套』这一分叉事实。后续 simt 相关子开关(enable_bishengir_simt_optimization / simt_stack_limit / shared_mem_dynamic_size ...)与 subprocess.run 调用属 ch28 bishengir 边界章，本章省略。"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "AscendBackend.add_stages", "file": "third_party/ascend/backend/compiler.py", "responsibility": "后端下降链的装配总入口。BaseBackend 契约钩子，被 Triton 编译驱动调用往 stages dict 里按名登记每一段的可调用体。昇腾只登记三段(ttir→ttadapter→npubin)，并按 force_simt_only / compile_on_910_95 两个开关选不同的末段实现。对位基座 CUDABackend.add_stages 的五段(ttir→ttgir→llir→ptx→cubin)。"},
+    {"name": "make_ttir", "file": "third_party/ascend/backend/compiler.py", "responsibility": "第一段 ttir 的实现体。在 ir.pass_manager 上按序挂 8 个 TTIR 前端优化 pass(inliner→combine→canonicalizer→reorder_broadcast→cse→licm→symbol_dce→loop_unroll)后 pm.run。源码注释明确『与所有其它后端相同』——这是全书『GPU 与 NPU 前端共享、后端分叉』主叙事里『共享的那一半』。"},
+    {"name": "ttir_to_linalg", "file": "third_party/ascend/backend/compiler.py", "responsibility": "第二段 ttadapter(昇腾专属)的实现体，本章主脊。把优化后的 TTIR 字符串化写临时文件，在 pass_manager 上按真实顺序挂一长串 ascend.passes.ttir.add_*(auto_blockify→[可选 dag_* 自动调度]→triton_to_structure→discrete_mask→annotation→unstructure→hivm→hfusion→llvm→bubble_up→再 structure→triton_to_linalg)，产出 named-op 形态 Linalg。每个 add_* 的 C++ 内部实现散见 ch10-24；本章只讲『编排』:顺序与开关。"},
+    {"name": "ttir_to_npubin", "file": "third_party/ascend/backend/compiler.py", "responsibility": "force_simt_only 快路径的末段实现。绕过整个 Linalg 下降(ttadapter 段被跳过)，TTIR 直接喂 bishengir-compile 的 SIMT 纯路模式。本章只用于说明『存在一条旁路下降链、分叉发生在 add_stages 的 if options.force_simt_only 一行』;命令行细节归 ch28。"}
+  ],
+
+  "data_flow": [
+    "1. 编译驱动调用 AscendBackend.add_stages(stages, options)(compiler.py:L939)。首先无条件登记 stages['ttir']=make_ttir。",
+    "2. 分叉①(force_simt_only, L942)：若 options.force_simt_only 为真，只再登记 stages['npubin']=ttir_to_npubin 并 return——ttadapter 段整段不存在，走两段快路径。",
+    "3. 否则登记 stages['ttadapter']=ttir_to_linalg(named_ops=True, L949)。",
+    "4. 分叉②(compile_on_910_95, L952)：末段 stages['npubin'] 在 linalg_to_bin_enable_npu_compile_910_95(910_95) 与 linalg_to_bin_enable_npu_compile_A2_A3(A2/A3) 间二选一(两者细节归 ch28)。",
+    "5. 运行期第一段 make_ttir(L73)：新建 pass_manager，按序挂 add_inliner→add_combine→add_canonicalizer→add_reorder_broadcast→add_cse→add_licm→add_symbol_dce→add_loop_unroll，pm.run 出优化后 TTIR。",
+    "6. 运行期第二段 ttir_to_linalg(L96)：str(mod) 拿 TTIR 文本 → 从 metadata 取出 8 个开关局部量 → 新建 pass_manager。",
+    "7. add_auto_blockify(pm, auto_blockify_size)(L118)：网格折叠(ch15);若 _is_auto_map_parallel_blocks_enabled() 为假则 auto_blockify_size 先被强制成 1(L114)。",
+    "8. 可选自动调度块(if metadata['add_auto_scheduling'], L122)：add_dag_sync(ch17)→add_dag_scope(ch17)→add_cse→add_canonicalizer→add_dag_ssbuffer(ch18)→add_cse→add_canonicalizer。默认关(NPUOptions.add_auto_scheduling=False)。",
+    "9. add_triton_to_structure(enable_mask_fallback_conversion, optimize_dynamic_offset)(L131)：指针→结构化张量分水岭(ch10-13)。",
+    "10. add_discrete_mask_access_conversion(compile_on_910_95, force_simt_template, enable_sync_block_lock)(L136)：离散掩码拆分(ch19)。",
+    "11. add_triton_to_annotation(pm)(L142)：结构化轨道上的标注 pass。",
+    "12. add_triton_to_unstructure(compile_on_910_95, force_simt_template)(L143)：结构化装不下时的非结构化兜底(ch14)。",
+    "13. add_triton_to_hivm(pm)(L148)：下降到 HIVM 达芬奇硬件方言(ch23)。",
+    "14. add_triton_to_hfusion(pm)(L149)：张量级融合 HFusion 方言(ch21)。",
+    "15. add_triton_to_llvm(pm)(L150)：标量/控制流部分下降到 LLVM。",
+    "16. add_bubble_up_operation(pm)(L151)：操作上抬/重排的清理 pass。",
+    "17. add_triton_to_structure(...)第二遍(L152)：同 pass 二次运行，把前面 pass 新暴露出的结构再结构化一轮。",
+    "18. add_triton_to_linalg(pm, False, named_ops, enable_nd2nz_on_vector, enable_select_analysis, compile_on_910_95)(L157)：收口成 Linalg(ch10);named_ops=True → 生成 linalg named op 形态。pm.run 后 return str(mod)。",
+    "19. 第三段 npubin：ttadapter 文本交 bishengir-compile 出 NPU 二进制(ch28)。"
+  ],
+
+  "design_decisions": [
+    {"decision": "第一段 ttir 与所有后端共享同一套 TTIR 优化 pass", "why": "TTIR 前端优化(内联/组合/规范化/CSE/LICM/循环展开)与目标硬件无关；昇腾复用基座路径，分叉留到第二段才发生——这具体化了全书『同一前端、两条下降链』的主叙事，让读者看到分叉的精确起点。", "evidence": "third_party/ascend/backend/compiler.py:L76 注释 `# the same optimize pass for triton-ir as all other backends`;L79-L86 八个 pass 全部来自 passes.common / passes.ttir(与基座同一命名空间)"},
+    {"decision": "第二段整段换成对外部 triton_adapter pass 库(ascend.passes.ttir.add_*)的编排，且比基座少一整层 TTGIR", "why": "昇腾没有 GPU 的 layout/warp 指派需求(warp_size=0)，Triton-MLIR 经 triton_adapter 直降 Linalg，之后的 HFusion→HIVM→NPU 汇编全在闭源 bishengir 内部;因此段数为三(ttir→ttadapter→npubin)而非五。", "evidence": "third_party/ascend/backend/compiler.py:L96-L164 一长串 ascend.passes.ttir.add_*;对照 add_stages 只登记三个 key(L941/L949/L953)"},
+    {"decision": "pass 顺序与开关不硬编码，全部由 NPUOptions/metadata 承载后逐个喂给对应 add_*", "why": "把编译器旋钮从 pass 逻辑里解耦——同一条 pass 链可被 compile_on_910_95 / force_simt_template / enable_mask_fallback_conversion 等开关参数化出不同行为，而 add_stages 只负责『登记』、ttir_to_linalg 只负责『按序挂』。", "evidence": "third_party/ascend/backend/compiler.py:L106-L113 从 metadata 取 8 个开关;L131-L164 逐个作实参传入 add_*"},
+    {"decision": "auto_blockify_size 在未开启 auto-map-parallel-blocks 时强制归 1", "why": "auto_blockify 是把多个网格实例折成一条 blockify 循环(ch15);若全局未启用自动并行块映射，则退化为 size=1(不折叠)，保证语义安全的默认。", "evidence": "third_party/ascend/backend/compiler.py:L114-L115 `if not _is_auto_map_parallel_blocks_enabled(): auto_blockify_size = 1`"},
+    {"decision": "自动调度(dag_sync/dag_scope/dag_ssbuffer)整块设为可选、默认关", "why": "scope 切分/多缓冲软件流水(ch17/ch18)是激进优化，用 metadata['add_auto_scheduling'] 门控;NPUOptions.add_auto_scheduling 默认 False，普通路径不进这块。块内穿插 cse/canonicalizer 清理是为在两个重 pass 之间收敛 IR。", "evidence": "third_party/ascend/backend/compiler.py:L122-L129 `if (metadata[\"add_auto_scheduling\"]):` 块;NPUOptions 定义 L770 `add_auto_scheduling: bool = False`"},
+    {"decision": "triton_to_structure 在链中运行两遍(L131 与 L152)", "why": "第一遍先把能结构化的指针访存结构化;中间经 unstructure/hivm/hfusion/llvm/bubble_up 等 pass 后可能暴露出新的可结构化模式，第二遍再收一轮，最后才 triton_to_linalg 收口。体现 MLIR pass 编排里『同一 pass 多次运行以迭代收敛』的常见手法。", "evidence": "third_party/ascend/backend/compiler.py:L131-L135 与 L152-L156 两处调用参数完全相同"},
+    {"decision": "force_simt_only 用『改登记』而非『改 pass 链内部』实现旁路", "why": "add_stages 在 force_simt_only 为真时直接把 npubin 段绑到 ttir_to_npubin 并 return，ttadapter 段根本不注册——旁路是在装配层做减法(少登记一段)，而非在 ttir_to_linalg 里加分支;干净地把两条下降链分在 add_stages 的一个 if 上。", "evidence": "third_party/ascend/backend/compiler.py:L942-L948 `if options.force_simt_only: stages[\"npubin\"]=...ttir_to_npubin...; return`"},
+    {"decision": "named_ops=True 固定传入 ttir_to_linalg", "why": "add_stages 登记 ttadapter 段时写死 named_ops=True(L950)，使收口 pass add_triton_to_linalg 产出 linalg named op 形态(而非 generic linalg.generic)，便于下游 bishengir 识别高层算子。ttir_to_linalg 函数签名默认 named_ops=False，但真实生产路径永远走 True。", "evidence": "third_party/ascend/backend/compiler.py:L949-L951 `ttir_to_linalg(src, metadata, options, named_ops=True)`;L96 默认参数 `named_ops=False`;L157-L164 named_ops 传给 add_triton_to_linalg 第三实参"}
+  ],
+
+  "theory": [
+    "pass 编排 = 有序的 IR 重写序列。ttir_to_linalg 里 pass 的『顺序』是有语义依赖的:必须先 structure(把指针访存变成结构化张量)才能 annotation/unstructure/hivm/hfusion，最后才能 triton_to_linalg 收口——不是任意可换序。本章的价值在于用这条真实序列把 ch10-24 逐个讲过的 pass『拼图』:每个 add_* 是一块拼图，add_stages+ttir_to_linalg 是拼图的边框。",
+    "三段 vs 五段的本质差异是抽象层级的取舍:GPU 五段在 TTGIR 层显式做 layout/warp/CTA 指派(因为要喂 SIMT 硬件的线程模型);昇腾没有真实 warp(warp_size=0)、用 mix_mode(aiv/aic/mix)+达芬奇 AI Core 取代，故不需要 TTGIR 那层，Triton-MLIR 经 triton_adapter 直降 Linalg on tensors/memref，把并行/内存/流水的决策全推给闭源 bishengir。段数少不代表简单——复杂度从『前端可见的 pass』转移到了『闭源二进制内部』。",
+    "『共享前端 + 分叉后端』的工程复杂度守恒:make_ttir 8 个 pass 逐字复用基座，说明前端优化是硬件无关不变量;真正的后端知识(ch10-24 全部)压缩在 ttir_to_linalg 的十来个 add_* 里。读者读完本章应能回答:给定一个 Triton kernel，它从 Python DSL 到 NPU 二进制一共经过哪几段、每段谁负责、分叉点在哪几行代码。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "linalg_to_bin_enable_npu_compile_910_95(L298-L499) 与 linalg_to_bin_enable_npu_compile_A2_A3(L502-L696) 两个函数体", "why_safe": "这是第三段 npubin 的 bishengir 命令行构造与子进程调用，属 ch28『闭源边界』章的核心材料。本章只需知道 add_stages 会把 npubin 段绑到其中之一;精简版可保留函数名作为被 add_stages 引用的薄桩(pass 或 return b''),删掉其几百行选项拼装体不影响本章讲『三段编排』的正确性。"},
+      {"what": "_parse_linalg_metadata(L183)、_parse_ttir_metadata(L237)、__get_metadata_attr_by_callback(L174)、_save_npuir_debug_output(L280)、get_common_bishengir_compile_options(L263)、get_auto_bind_sub_block_option(L269)、get_libdevice(L699)", "why_safe": "全部是 npubin 段的元数据正则解析 / bishengir 选项 / ctypes 回调辅助，属 ch28。ttir_to_npubin 在快路径里引用 _parse_ttir_metadata 与 get_common_bishengir_compile_options——精简版保留这两个名字作薄桩即可(本章 ttir_to_npubin 只截前半段证明分叉存在)。"},
+      {"what": "AscendBackend 的其余方法:supports_target、__init__、parse_options、pack_metadata、get_codegen_implementation、load_dialects、get_attrs_descriptor、hash、get_module_map", "why_safe": "这些是 ch26『后端挂载契约』已讲过的钩子;本章只聚焦 add_stages 一个方法。删掉其余方法后 add_stages 仍可独立阅读(它不依赖同类其它方法，只读 self.target.backend)。"},
+      {"what": "AscendAttrsDescriptor 类(L815)、min_dot_size(L69)、AscendBackend 之外的 register_descriptor 装饰", "why_safe": "codegen/attrs 描述符属 ch26 材料，与三段编排无关。"},
+      {"what": "NPUOptions dataclass 中未被三个编排函数读取的字段(绝大多数 bishengir 旋钮:multibuffer/enable_ubuf_saving/sync_solver/vf_merge_level/... 等约 60 个)与 __post_init__/hash 方法的完整实现", "why_safe": "ttir_to_linalg 只读 8 个开关字段(enable_nd2nz_on_vector/enable_select_analysis/compile_on_910_95/force_simt_template/enable_sync_block_lock/enable_mask_fallback_conversion/optimize_dynamic_offset/auto_blockify_size)加 add_auto_scheduling;add_stages 只读 force_simt_only/compile_on_910_95。精简版保留这些被读字段即可,其余 bishengir 旋钮属 ch28,__post_init__ 的 compile_mode 派生逻辑属 ch26。删除不破坏本章数据流。"}
+    ],
+    "must_keep": [
+      {"symbol": "add_stages", "why": "本章的装配总入口,三段登记与两处分叉都在这;必须原样保留其 stages 三个 key 的登记与 force_simt_only/compile_on_910_95 两个 if。"},
+      {"symbol": "make_ttir", "why": "第一段实现,8 个共享 pass 的顺序是读者要理解的核心之一。"},
+      {"symbol": "ttir_to_linalg", "why": "第二段主脊,整条 ascend.passes.ttir.add_* 编排的载体。"},
+      {"symbol": "ttir_to_npubin", "why": "force_simt_only 快路径的末段,证明旁路下降链存在与分叉点。"},
+      {"symbol": "add_inliner", "why": "make_ttir 第 1 个 TTIR pass,读者需看到共享 pass 全序列。"},
+      {"symbol": "add_combine", "why": "make_ttir 第 2 个 pass。"},
+      {"symbol": "add_canonicalizer", "why": "make_ttir 第 3 个 pass,且在 ttir_to_linalg 自动调度块里作清理 pass 复用。"},
+      {"symbol": "add_reorder_broadcast", "why": "make_ttir 第 4 个 pass。"},
+      {"symbol": "add_cse", "why": "make_ttir 第 5 个 pass,且在 ttir_to_linalg 自动调度块里作清理复用。"},
+      {"symbol": "add_licm", "why": "make_ttir 第 6 个 pass。"},
+      {"symbol": "add_symbol_dce", "why": "make_ttir 第 7 个 pass。"},
+      {"symbol": "add_loop_unroll", "why": "make_ttir 第 8 个 pass。"},
+      {"symbol": "add_auto_blockify", "why": "ttir_to_linalg 第一个 ascend pass(ch15 网格折叠),且带 auto_blockify_size 参数门控。"},
+      {"symbol": "add_dag_sync", "why": "自动调度块(ch17 scope 同步)可选 pass。"},
+      {"symbol": "add_dag_scope", "why": "自动调度块(ch17)可选 pass。"},
+      {"symbol": "add_dag_ssbuffer", "why": "自动调度块(ch18 多缓冲流水)可选 pass。"},
+      {"symbol": "add_triton_to_structure", "why": "指针→结构化张量分水岭(ch10-13),链中运行两遍,是编排语义依赖的关键。"},
+      {"symbol": "add_discrete_mask_access_conversion", "why": "离散掩码拆分(ch19)。"},
+      {"symbol": "add_triton_to_annotation", "why": "结构化轨道标注 pass,链中一环。"},
+      {"symbol": "add_triton_to_unstructure", "why": "非结构化兜底(ch14)。"},
+      {"symbol": "add_triton_to_hivm", "why": "下降到 HIVM 达芬奇方言(ch23)。"},
+      {"symbol": "add_triton_to_hfusion", "why": "张量级融合 HFusion(ch21)。"},
+      {"symbol": "add_triton_to_llvm", "why": "标量/控制流下降到 LLVM,链中一环。"},
+      {"symbol": "add_bubble_up_operation", "why": "操作上抬清理 pass,任务描述未列但源码真实存在,读者需看到完整链。"},
+      {"symbol": "add_triton_to_linalg", "why": "收口成 Linalg(ch10),named_ops 从这里生效。"},
+      {"symbol": "add_auto_scheduling", "why": "metadata 键,门控自动调度块是否进链的开关(可检测字符串)。"},
+      {"symbol": "force_simt_only", "why": "add_stages 快路径分叉开关。"},
+      {"symbol": "compile_on_910_95", "why": "add_stages 末段选择开关,且传入多个 add_*。"},
+      {"symbol": "force_simt_template", "why": "传入 discrete_mask/unstructure 的开关,读者需理解其影响。"},
+      {"symbol": "named_ops", "why": "add_stages 写死 True 传入 ttir_to_linalg,决定收口产 named op 形态。"},
+      {"symbol": "auto_blockify_size", "why": "add_auto_blockify 参数,含 _is_auto_map_parallel_blocks_enabled 归 1 逻辑。"}
+    ]
+  },
+
+  "mechanisms": [
+    {"id": "three-stage-registration", "name": "add_stages 三段登记与两处分叉", "kind": "protocol", "source_anchors": ["third_party/ascend/backend/compiler.py:L939-L968"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "make-ttir-shared-passes", "name": "make_ttir:与基座共享的 8 个 TTIR 前端优化 pass", "kind": "dataflow", "source_anchors": ["third_party/ascend/backend/compiler.py:L73-L93"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "ttadapter-pass-orchestration", "name": "ttir_to_linalg:ascend.passes.ttir.add_* 全序列编排(每个 pass 对应哪一章、为何这个顺序)", "kind": "dataflow", "source_anchors": ["third_party/ascend/backend/compiler.py:L116-L165"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "auto-scheduling-conditional-block", "name": "可选自动调度块(dag_sync/dag_scope/ssbuffer + cse/canonicalizer 清理),默认关", "kind": "config", "source_anchors": ["third_party/ascend/backend/compiler.py:L122-L129"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "pass-params-from-metadata", "name": "pass 参数从 NPUOptions/metadata 取出后逐个喂给 add_*(编排与旋钮解耦)", "kind": "config", "source_anchors": ["third_party/ascend/backend/compiler.py:L106-L113", "third_party/ascend/backend/compiler.py:L131-L164"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "structure-pass-twice", "name": "triton_to_structure 两遍运行:pass 迭代收敛手法", "kind": "dataflow", "source_anchors": ["third_party/ascend/backend/compiler.py:L131-L135", "third_party/ascend/backend/compiler.py:L152-L156"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "auto-blockify-size-gate", "name": "auto_blockify_size 未开自动并行块映射时强制归 1", "kind": "config", "source_anchors": ["third_party/ascend/backend/compiler.py:L113-L121"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "force-simt-fast-path", "name": "force_simt_only 快路径:绕过 Linalg,TTIR 直编 npubin", "kind": "dataflow", "source_anchors": ["third_party/ascend/backend/compiler.py:L942-L948", "third_party/ascend/backend/compiler.py:L824-L874"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "three-vs-five-stage-contrast", "name": "三段(ttir→ttadapter→npubin) vs 基座五段(ttir→ttgir→llir→ptx→cubin):无 TTGIR 层", "kind": "protocol", "source_anchors": ["third_party/ascend/backend/compiler.py:L941", "third_party/ascend/backend/compiler.py:L949", "third_party/ascend/backend/compiler.py:L953-L962"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"}
+  ],
+
+  "foreshadow_due": {
+    "埋伏笔": [],
+    "回收": [
+      {"id": "f6", "text": "add_stages 只登记了 ttir/ttadapter/npubin 三段 stage 的注册与串接;ttadapter 段内部 triton_adapter 怎样把 Triton IR 一步步下降成 Linalg(ascend.passes.ttir.add_* pass 序列的编排),npubin 段怎样拼命令行交给 bishengir-compile——这些下降链每一段的内部实现,留给下一章站在同一 add_stages 上做后端 POV 的编排细读", "planted_in": "ch26", "recovered_here": "本章正是 f6 承诺的兑现:ttadapter 段的 ascend.passes.ttir.add_* pass 序列编排(make_ttir 8 pass + ttir_to_linalg 十余 add_*)在本章逐一拆解。注意:npubin 段『怎样拼命令行交给 bishengir-compile』本章只讲到分叉与边界,完整命令行构造顺延给 ch28(闭源边界章),本章须显式向读者指路而非在此展开。"}
+    ]
+  }
+}
