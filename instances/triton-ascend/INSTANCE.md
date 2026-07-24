@@ -45,12 +45,13 @@
   仿射 tiled dataflow），bishengir 部分闭源（边界≈基座的 ptxas）。
 - ✅ **大纲已获用户审批（2026-07-18「同意」）**：33 章 / 7 Part（outline-final.json）+ ARCHITECTURE.md，
   开始逐章发车。roadmap.py 生成器已建并验（7 Part 窄长条 5.17:1，4 调用/几何/Read-PNG 通过）。
-- 🚗 **施工中（2026-07-23 状态）**：**ch01–ch25 已全部定稿提交并归档**（Part 1/2 完 + **Part 3 triton-to-linalg 核心**
-  + **ascend-opt ch15–ch18** + **ch19 离散掩码** + **hivm-hfusion ch20-25 六章全收官:方言→融合→硬件 IR→同步→下降**）;ch26–ch33 未开工。
-  **ch26 发车中**（昇腾后端如何挂进 Triton:AscendBackend 契约/NPUOptions/hacc.target 注入,skip_impl;slug `ch26-ascend-backend-plugin`,deps ch14）:
-  焦点=`third_party/ascend/backend/compiler.py`(977 行)的 AscendBackend 实现 BaseBackend 契约、NPUOptions dataclass(编译选项+hash=缓存键)、add_stages 注册 make_ttir/ttgir/npubin 管线、hacc.target 注入。
-  ⚠️ skip_impl 因真 backend 需编译版 triton._C.libtriton + CANN/NPU 工具链,host 跑不了;交叉验证走 pytest_ut 夹具 + BaseBackend 基类契约。
-  ⚠️ ch24/ch25 均曾 Review 阶段 API Connection-closed 崩逃逸(revise-fig 改了图脚本没重渲染=陈旧 SVG+假 manifest PASS),Lead 接管重渲染+独立盲审,已归档(见 memory revise-fig-stale-render)。
+- 🚗 **施工中（2026-07-24 状态）**：**ch01–ch26 已全部定稿提交并归档**（Part 1/2 完 + Part 3 triton-to-linalg 核心
+  + ascend-opt ch15–ch18 + ch19 离散掩码 + **hivm-hfusion ch20-25 六章收官** + **Part 6 后端与运行时开篇 ch26 后端插件**）;ch27–ch33 未开工。
+  **ch27 发车中**（三段下降链:add_stages 与 Triton-MLIR→Linalg 的编排,skip_impl;slug `ch27-add-stages-orchestration`,deps ch10/ch26）:
+  **综合章**——ttir_to_linalg(ttadapter 段,compiler.py L96)把全书 ch10-24 讲过的各 pass 按真实顺序串成流水线:
+  make_ttir(8 pass 前端优化)→ auto_blockify→dag_sync/scope/ssbuffer→triton_to_structure→discrete_mask→triton_to_unstructure→triton_to_hivm→triton_to_hfusion→triton_to_linalg → make_npubin;force_simt_only 快路径。对位基座 ch36(CUDABackend 五段)。
+  ⚠️ skip_impl(ascend.passes 需 triton._C);交叉验证靠 pytest_ut + pass 顺序逐行核 compiler.py。
+  ⚠️ 逃逸恢复:Review 阶段 API Connection-closed 崩→revise-fig 常改了图脚本没重渲染=陈旧 SVG+假 PASS,Lead 接管重渲染+独立盲审(见 memory revise-fig-stale-render);figures.json 归档易漏登、chNN- slug 前缀必带(见 memory)。
   ⚠️ ch22 曾 Review round1 逃逸(计数陷阱 15→4 Scheduler/未验证子核个数/MixCV 14×14 结构错),Lead 手动接管修复+独立盲审,已归档。
   ⚠️ **发车 slug 必须含 `chNN-` 前缀**(workflow 里 `CH = artifacts/ + A.slug`,slug 直接当目录名):ch23 误传裸 `hivm-dialect`→
   产物落到 `artifacts/hivm-dialect/`(缺前缀、--all glob `ch??-*` 扫不到),事后 mv 回 `ch23-hivm-dialect` 才对。ch24+ 传 `ch24-<name>`。
