@@ -1,0 +1,117 @@
+{
+  "chapter": "ch29",
+  "title": "NPU 运行时驱动与二进制装载",
+  "note": "本章为运行时装载章，无精简版(implementation/ 空)。装载主线 loadKernelBinary→registerKernel 是 C++ 扩展，依赖 CANN 闭源 rt* 运行时 + 达芬奇 NPU 设备(host 无)，无法整体真跑。唯一 needs_worked_example 机制 m5(stubName 计数器)是纯控制流、语言无关，用 host Python 忠实镜像 registered_names[name]++ 逻辑跑出可复现 trace(traces/run_m5_stubname.py → m5_stubname.json)。figure-only 机制 m1/m2/m3 只出 figure-spec，数字均以 file:Lxxx 溯源到源码常量。",
+  "mechanisms": [
+    {
+      "mechanism_id": "m1",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m1-jit-cache",
+          "claim": "NPUUtils 首次实例化即以 npu_utils.cpp 源码 md5 为缓存 key 决定「复用已编 .so」还是「就地 _build_npu_ext 重编」，改一行 C++ 就换 key 触发重编。",
+          "template": "flow",
+          "nodes": [
+            "__new__: hasattr(cls,'instance')? 是→返回旧单例 / 否→新建",
+            "__init__: 读 npu_utils.cpp 源文本 src",
+            "key = md5(src)",
+            "cache = get_cache_manager(key); cache_path = cache.get_file('npu_utils.so')",
+            "cache_path is None? (缓存命中判定)",
+            "命中: 直接用 cache_path 里已编好的 .so",
+            "未命中: _build_npu_ext 就地把 .cpp 编成 .so → cache.put 落盘",
+            "importlib 动态加载 .so → self.npu_utils_mod",
+            "对外: load_binary / get_arch / get_aicore_num"
+          ],
+          "numbers": [
+            {"label": "单例 instance 数", "value": "1 (hasattr(cls,'instance') 守卫)", "provenance": "driver.py:L48-L51"},
+            {"label": "缓存 key", "value": "md5(src) 32 位十六进制", "provenance": "driver.py:L57"},
+            {"label": "缓存文件名", "value": "npu_utils.so", "provenance": "driver.py:L59"},
+            {"label": "命中判定", "value": "cache_path is None", "provenance": "driver.py:L61"}
+          ],
+          "caption_draft": "结论：装载扩展是「首次用时即时编译 + 源码 md5 缓存」——同一 CANN/ABI 环境下第一次付编译代价、之后复用；源码一改 md5 变、key 变、自动重编，无需为每个环境预打包 .so。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m2",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m2-crosslang-chain",
+          "claim": "一个二进制 blob 从 triton 核心到设备句柄，跨了「triton 核心侧→Python 驱动层→C++ 扩展→CANN 运行时」四道栏，中途在 driver.py 用 rsplit 拆出双核 mix_mode、在 C++ 侧用 PyArg_ParseTuple 解包。",
+          "template": "swimlane",
+          "lanes": ["triton 核心 (compiler.py)", "Python 驱动层 (driver.py)", "C++ 扩展 (npu_utils.cpp)", "CANN 运行时 (rt*)"],
+          "steps": [
+            "triton 核心: _init_handles 调 driver.active.utils.load_binary(self.name, self.kernel=blob, shared, device)",
+            "Python 驱动层: NPUUtils.load_binary — name.rsplit('_',1) → (fnname, mix_mode) → self.npu_utils_mod.load_kernel_binary(fnname, kernel, shared, device, mix_mode)",
+            "C++ 扩展: loadKernelBinary — PyArg_ParseTuple('ss#iis') 解出 name/data/data_size/shared/device/kernel_mode → registerKernel(...)",
+            "CANN 运行时: registerKernel 里 rtSetDevice/rtDevBinaryRegister/rtFunctionRegister 拿 (devbinHandle, func_stub_handle)",
+            "C++ 扩展: Py_BuildValue('(KKii)') 打包 (module, function, 0, 0) 回传",
+            "triton 核心: self.module, self.function, self.n_regs, self.n_spills = 该四元组"
+          ],
+          "numbers": [
+            {"label": "rsplit 切分次数", "value": "1 (从右切一刀)", "provenance": "driver.py:L78"},
+            {"label": "PyArg 格式串", "value": "ss#iis (6 个入参)", "provenance": "npu_utils.cpp:L92"},
+            {"label": "返回打包格式", "value": "(KKii) 四元组", "provenance": "npu_utils.cpp:L106"},
+            {"label": "跨语言边界数", "value": "4 层 (核心/Python/C++/CANN)", "provenance": "code_spine ch29 两层结构 + compiler.py:L403-L415"}
+          ],
+          "caption_draft": "结论：装载是一条严格的跨语言接力——mix_mode(双核模式)在 Python 侧就被 rsplit 拆出并一路带到 C++ 决定 magic；四元组末两位 n_regs/n_spills 恒为 0 只为对齐 triton GPU 契约。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m3",
+      "figure_specs": [
+        {
+          "figure_id": "fig-m3-rt-sequence",
+          "claim": "registerKernel 装一个 kernel 恰好按序调三个 CANN rt* 接口(rtSetDevice→rtDevBinaryRegister→rtFunctionRegister)，每步失败即 printf 错误码并返回 {nullptr,nullptr}，全过关才产出两个句柄。",
+          "template": "flow",
+          "nodes": [
+            "填 rtDevBinary_t: data=blob, length=data_size, magic=(aiv?AIVEC:ELF), version=0",
+            "rtSetDevice(device) — 失败→printf 0x%x→return {nullptr,nullptr}",
+            "rtDevBinaryRegister(&devbin,&devbinHandle) — 拿 devbinHandle；失败→return {nullptr,nullptr}",
+            "stubName = name + '_' + registered_names[name]; registered_names[name]++",
+            "func_stubs.emplace(stubName, unique_ptr<size_t>(0)); func_stub_handle = .get()",
+            "rtFunctionRegister(devbinHandle, func_stub_handle, stubName, name, 0) — 失败→return {nullptr,nullptr}",
+            "return (devbinHandle, func_stub_handle)"
+          ],
+          "numbers": [
+            {"label": "rt* 调用步数", "value": "3 (rtSetDevice/rtDevBinaryRegister/rtFunctionRegister)", "provenance": "npu_utils.cpp:L55,L62,L73"},
+            {"label": "devbin.version", "value": "0", "provenance": "npu_utils.cpp:L53"},
+            {"label": "rtFunctionRegister 末参 funcMode", "value": "0", "provenance": "npu_utils.cpp:L74"},
+            {"label": "成功产出句柄数", "value": "2 (devbinHandle, func_stub_handle)", "provenance": "npu_utils.cpp:L81"},
+            {"label": "错误路径返回", "value": "{nullptr, nullptr}", "provenance": "npu_utils.cpp:L58,L65,L78"}
+          ],
+          "caption_draft": "结论：装载是「设备→二进制→函数」逐级注册的三步链——rtDevBinaryRegister 把 blob 变成设备可识别的二进制(对位 CUDA cuModuleLoad)、rtFunctionRegister 把函数名绑成可调用 stub(对位 cuModuleGetFunction)；任一步非 RT_ERROR_NONE 即短路吐出双 nullptr。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m5",
+      "intuition": "像停车场给同名的车发号牌：同一个函数名 add_kernel 可能来自不同的二进制(binA/binB)，每来一辆就发下一个递增号(_0、_1……)，号牌永不重复；凭这张号牌背后那个专属车位(unique_ptr 的堆地址)就能唯一找回这辆车。",
+      "worked_example": {
+        "params": {
+          "sequence": ["add_kernel(binA)", "add_kernel(binB)", "mul_kernel(binC)"],
+          "note": "刻意让 add_kernel 连注册两次(模拟同名 kernel 来自不同 binary，会踩到「同名冲突」这个非平凡分支)，再注册一个不同名 mul_kernel 作对照。registered_names 默认构造为 0(size_t)。"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/m5_stubname.json",
+        "manual_reason": "",
+        "table": {
+          "columns": ["轮次", "注册 name (来自)", "registered_names[name] 读值", "stubName = name+'_'+读值", "++ 后计数"],
+          "rows": [
+            ["1", "add_kernel (binA)", "0", "add_kernel_0", "1"],
+            ["2", "add_kernel (binB)", "1", "add_kernel_1", "2"],
+            ["3", "mul_kernel (binC)", "0", "mul_kernel_0", "1"]
+          ]
+        },
+        "trace_notes": "trace(m5_stubname.json)确认：distinct_stub_names=3、total_registrations=3、registered_names_final={add_kernel:2, mul_kernel:1}、func_stubs_keys=3、all_handles_distinct=true。轮 2 的 add_kernel 读到的是轮 1 自增后的 1，故拿到 add_kernel_1 而非再一个 _0——这正是防同名冲突的关键分支被真实触发。func stub 句柄是 emplace 新建 unique_ptr<size_t> 的 .get() 堆地址(真值非确定、进程间不同，故表中不列具体地址，只由 trace 断言互异)。"
+      },
+      "invariant": {
+        "claim": "任意注册序列下，每次注册产出的 stubName 全局唯一(同名 kernel 也不冲突)，且每个 func stub 句柄是互异且生命周期内稳定的堆地址。",
+        "argument": "单调量：registered_names[name] 是「name 已注册次数」的计数器，每注册一次严格 +1(L70)，故对同一 name，各次读到的计数值 0,1,2,… 两两不同。stubName = name + '_' + 计数(L68-69)，同 name 后缀互异 → stubName 互异；不同 name 前缀已互异。故 (name, 计数) 这个二元组是单射到 stubName，全局唯一得证。句柄：func_stubs.emplace(stubName, make_unique<size_t>(0)) 为每个新 stubName 建一个独立堆对象(L71)，.get() 取其地址(L72)——不同对象地址必异，且 unique_ptr 持有期间对象不搬家 → 地址稳定。",
+        "termination": "registerKernel 无循环，单次调用固定走完 3 个 rt* 步骤即返回；计数器只增不减，但每次装载只推进一步，不构成不终止风险。"
+      },
+      "quantified": "注册 N 个 kernel(其中同名任意)→ 生成 N 个互异 stubName + N 个互异 func stub 句柄，消耗 N 个 unique_ptr<size_t> 堆槽。registered_names 的键数 = 去重后的 name 数(本例 2：add_kernel、mul_kernel)，func_stubs 的键数 = N(本例 3)。unordered_map 查表/插入均摊 O(1)，故 N 次装载总代价 O(N)。本例 N=3：stubName={add_kernel_0, add_kernel_1, mul_kernel_0}，registered_names_final={add_kernel:2, mul_kernel:1}，func_stubs_keys=3(均与 trace 一致)。",
+      "figure_specs": []
+    }
+  ]
+}

@@ -1,0 +1,243 @@
+{
+  "chapter": "ch29",
+  "title": "NPU 运行时驱动与二进制装载",
+  "code_spine": [
+    "python/triton/compiler/compiler.py:L403-L415  CompiledKernel._init_handles —— triton 核心侧的调用入口：拿 driver.active.utils.load_binary(name, kernel, shared, device) 换回 (module, function, n_regs, n_spills)",
+    "third_party/ascend/backend/driver.py:L53-L75  NPUUtils.__init__ —— 首次实例化即读 npu_utils.cpp 源文件、md5 做缓存 key、miss 则 _build_npu_ext 就地编出 npu_utils.so、动态 import 成模块挂到 self.npu_utils_mod",
+    "third_party/ascend/backend/driver.py:L77-L79  NPUUtils.load_binary —— name.rsplit('_',1) 拆出 fnname 与 mix_mode，转调 C++ 扩展 load_kernel_binary",
+    "third_party/ascend/backend/npu_utils.cpp:L84-L107  loadKernelBinary —— PyArg_ParseTuple 解 (name,data,data_size,shared,device,kernel_mode)，调 registerKernel，把返回的两个 handle 打包成 Python (K,K,i,i) 元组",
+    "third_party/ascend/backend/npu_utils.cpp:L40-L82  registerKernel —— 装载核心：填 rtDevBinary_t(按 aiv/非 aiv 选 magic) → rtSetDevice → rtDevBinaryRegister 拿 devbinHandle → 生成唯一 stubName → rtFunctionRegister 拿 func stub handle",
+    "third_party/ascend/backend/driver.py:L166-L194  NPUDriver.get_current_target/get_current_device/get_current_stream —— triton 运行时认的 driver 契约实现",
+    "third_party/ascend/backend/npu_utils.cpp:L109-L137  getArch/getAiCoreNum —— rtGetSocVersion / rtGetAiCoreCount 探硬件规格"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "python/triton/compiler/compiler.py",
+      "lines": "L403-L415",
+      "code": "    def _init_handles(self):\n        if self.module is not None:\n            return\n        device = driver.active.get_current_device()\n        # create launcher\n        self.run = driver.active.launcher_cls(self.src, self.metadata)\n        # not enough shared memory to run the kernel\n        max_shared = driver.active.utils.get_device_properties(device)[\"max_shared_mem\"]\n        if self.metadata.shared > max_shared:\n            raise OutOfResources(self.metadata.shared, max_shared, \"shared memory\")\n        # TODO: n_regs, n_spills should be metadata generated when calling `ptxas`\n        self.module, self.function, self.n_regs, self.n_spills = driver.active.utils.load_binary(\n            self.name, self.kernel, self.metadata.shared, device)",
+      "elide": ["这是 triton 核心通用侧（非 ascend 专有）；引出本章：ch28 编出的 self.kernel(二进制 blob) 就是在这里首次装上设备，换回可调用的 self.function。__getattribute__ 在首次访问 run 时惰性触发 _init_handles(见 L417-L420)，可略。"]
+    },
+    {
+      "path": "third_party/ascend/backend/driver.py",
+      "lines": "L53-L75",
+      "code": "    def __init__(self):\n        dirname = os.path.dirname(os.path.realpath(__file__))\n        src_path = os.path.join(dirname, \"npu_utils.cpp\")\n        src = Path(src_path).read_text()\n        key = hashlib.md5(src.encode(\"utf-8\")).hexdigest()\n        cache = get_cache_manager(key)\n        fname = \"npu_utils.so\"\n        cache_path = cache.get_file(fname)\n        if cache_path is None:\n            with tempfile.TemporaryDirectory() as tmpdir:\n                tmp_src_path = os.path.join(tmpdir, \"npu_utils.cpp\")\n                with open(tmp_src_path, \"w\") as f:\n                    f.write(src)\n                so = _build_npu_ext(\"npu_utils\", None, tmp_src_path)\n                with open(so, \"rb\") as f:\n                    cache_path = cache.put(f.read(), fname, binary=True)\n        import importlib.util\n        spec = importlib.util.spec_from_file_location(\"npu_utils\", cache_path)\n        mod = importlib.util.module_from_spec(spec)\n        spec.loader.exec_module(mod)\n        self.npu_utils_mod = mod\n        # setup for remote run\n        env_arch = get_ascend_arch_from_env()",
+      "elide": ["__new__(L48-L51) 用 hasattr(cls,'instance') 实现单例，可用一句话概括；env_arch 取到后本函数未再使用(仅触发环境校验)。缓存 key = npu_utils.cpp 源文件 md5，源不变则复用已编好的 .so，改一行 C++ 即换 key 重编。"]
+    },
+    {
+      "path": "third_party/ascend/backend/driver.py",
+      "lines": "L77-L79",
+      "code": "    def load_binary(self, name, kernel, shared, device):\n        fnname, mix_mode = name.rsplit(\"_\", 1)\n        return self.npu_utils_mod.load_kernel_binary(fnname, kernel, shared, device, mix_mode)",
+      "elide": ["name 形如 \"<kernel>_aiv\"/\"<kernel>_aic\"/\"<kernel>_mix\"，rsplit('_',1) 从右切一刀 → fnname 是真正函数名、mix_mode 是双核模式后缀；mix_mode 一路传进 C++ 决定 magic。"]
+    },
+    {
+      "path": "third_party/ascend/backend/npu_utils.cpp",
+      "lines": "L36-L82",
+      "code": "// Use map to differentiate same name functions from different binary\nstatic std::unordered_map<std::string, size_t> registered_names;\nstatic std::unordered_map<std::string, std::unique_ptr<size_t>> func_stubs;\n\nstatic std::tuple<void *, void *>\nregisterKernel(const char *name, const void *data, size_t data_size,\n               int device, const char *kernel_mode_str) {\n  rtError_t rtRet;\n\n  rtDevBinary_t devbin;\n  devbin.data = data;\n  devbin.length = data_size;\n  const std::string kernel_mode{kernel_mode_str};\n  if (kernel_mode == \"aiv\")\n    devbin.magic = RT_DEV_BINARY_MAGIC_ELF_AIVEC;\n  else\n    devbin.magic = RT_DEV_BINARY_MAGIC_ELF;\n  devbin.version = 0;\n\n  rtRet = rtSetDevice(device);\n  if (rtRet != RT_ERROR_NONE) {\n    printf(\"rtSetDevice failed, 0x%x\\n\", rtRet);\n    return {nullptr, nullptr};\n  }\n\n  void *devbinHandle = nullptr;\n  rtRet = rtDevBinaryRegister(&devbin, &devbinHandle);\n  if (rtRet != RT_ERROR_NONE) {\n    printf(\"rtDevBinaryRegister failed, 0x%x\\n\", rtRet);\n    return {nullptr, nullptr};\n  }\n\n  std::string stubName = name;\n  stubName += \"_\" + std::to_string(registered_names[name]);\n  registered_names[name]++;\n  auto registered = func_stubs.emplace(stubName, std::make_unique<size_t>(0));\n  void *func_stub_handle = registered.first->second.get();\n  rtRet = rtFunctionRegister(devbinHandle, func_stub_handle, stubName.c_str(),\n                             (void *)name, 0);\n  if (rtRet != RT_ERROR_NONE) {\n    printf(\"rtFunctionRegister failed(stubName = %s), 0x%x\\n\", stubName.c_str(),\n           rtRet);\n    return {nullptr, nullptr};\n  }\n\n  return std::make_tuple(devbinHandle, func_stub_handle);\n}",
+      "elide": ["这是本章最核心的 40 行。magic 分支：kernel_mode==\"aiv\" 用 AIVEC 魔数(纯 Vector 核二进制)，其余(aic/mix)统一用 RT_DEV_BINARY_MAGIC_ELF——注意源码是「aiv vs 非 aiv」二分，不是 aiv/aic 对称三分。stubName 用全局计数器 registered_names[name]++ 保证同名 kernel(来自不同 binary)有唯一 stub。func_stubs 存 unique_ptr<size_t>，.get() 拿到的稳定地址就是 CANN 认的 func stub 句柄。rt* 全是 CANN 闭源运行时 API(rt.h 由 CANN 在编译期提供，仓内无源码)——书讲到调用点与参数语义为止。"]
+    },
+    {
+      "path": "third_party/ascend/backend/npu_utils.cpp",
+      "lines": "L84-L107",
+      "code": "static PyObject *loadKernelBinary(PyObject *self, PyObject *args) {\n  const char *name;        // kernel name\n  const char *data;        // binary pointer\n  Py_ssize_t data_size;    // binary size\n  int shared;              // shared_memory(meaningless now)\n  int device;              // device ID\n  const char *kernel_mode; // kernel mode\n\n  if (!PyArg_ParseTuple(args, \"ss#iis\", &name, &data, &data_size, &shared,\n                        &device, &kernel_mode)) {\n    return nullptr;\n  }\n\n  auto [module_handle, func_handle] =\n      registerKernel(name, data, data_size, device, kernel_mode);\n\n  uint64_t mod = reinterpret_cast<uint64_t>(module_handle);\n  uint64_t func = reinterpret_cast<uint64_t>(func_handle);\n  if (PyErr_Occurred()) {\n    return nullptr;\n  }\n\n  return Py_BuildValue(\"(KKii)\", mod, func, 0, 0);\n}",
+      "elide": ["PyArg_ParseTuple 格式串 \"ss#iis\"：s=name, s#=data+data_size(带长度的字节串), i=shared, i=device, s=kernel_mode，正好对上 Python 侧 load_kernel_binary(fnname,kernel,shared,device,mix_mode)。返回 (KKii)=(module_handle, func_handle, 0, 0)，末两个 0 对应 triton 侧 n_regs/n_spills(NPU 无此概念，占位)。shared 注释标注 meaningless now。"]
+    },
+    {
+      "path": "third_party/ascend/backend/npu_utils.cpp",
+      "lines": "L109-L137",
+      "code": "static PyObject *getArch(PyObject *self, PyObject *args) {\n  char name[64] = {'\\0'};\n\n  rtError_t rtRet = rtGetSocVersion(name, 64);\n\n  if (rtRet != RT_ERROR_NONE) {\n    printf(\"rtGetSocVersion failed, 0x%x\", rtRet);\n    return nullptr;\n  }\n  if (PyErr_Occurred()) {\n    return nullptr;\n  }\n  return Py_BuildValue(\"s\", name);\n}\n\nstatic PyObject *getAiCoreNum(PyObject *self, PyObject *args) {\n  uint32_t aiCoreCnt;\n\n  rtError_t rtRet = rtGetAiCoreCount(&aiCoreCnt);\n\n  if (rtRet != RT_ERROR_NONE) {\n    printf(\"rtGetAiCoreCount failed, 0x%x\", rtRet);\n    return nullptr;\n  }\n  if (PyErr_Occurred()) {\n    return nullptr;\n  }\n  return Py_BuildValue(\"I\", aiCoreCnt);\n}",
+      "elide": ["硬件规格探测：rtGetSocVersion 回 SoC 字符串(如 Ascend910B*)当 arch；rtGetAiCoreCount 回 AI Core(Cube 核 AIC)数量。Python 侧 get_device_properties 由此推 num_vectorcore = num_aicore * 2(AIV=AIC*2 的达芬奇双核比例，见 driver.py L85-87)。"]
+    },
+    {
+      "path": "third_party/ascend/backend/driver.py",
+      "lines": "L166-L194",
+      "code": "    def get_current_target(self):\n        backend = \"npu\"\n        env_target = get_ascend_arch_from_env()\n        if env_target:\n            arch = env_target\n        else:\n            arch = self.utils.get_arch()\n        warp_size = 0\n        return GPUTarget(backend, arch, warp_size)\n\n    def get_current_device(self):\n        \"\"\"\n        Get current device\n        \"\"\"\n        return get_backend_func(\"get_current_device\")\n\n    def set_current_device(self, device):\n        \"\"\"\n        Set current device as the given device\n        \"\"\"\n        return get_backend_func(\"set_current_device\", device)\n\n    def get_current_stream(self, device: Optional[int] = None) -> int:\n        \"\"\"\n        Get stream for current device\n        \"\"\"\n        # According to torch_npu, the content of a torch.npu.Stream is essentilly an rtStream_t\n        # TODO: use CANN API instead of torchnpu\n        return get_backend_func(\"get_current_stream\", device)",
+      "elide": ["NPUDriver 实现 triton DriverBase 契约。get_current_target: 环境变量 TRITON_ASCEND_ARCH 优先，否则 rtGetSocVersion 探；warp_size=0(NPU 无 warp 概念)。device/stream 走 get_backend_func 分派到 torch_npu 后端(torch.npu.Stream 本质就是 rtStream_t)。get_benchmarker/get_device_interface 等余下方法(L196-205)属辅助，可略。"]
+    },
+    {
+      "path": "third_party/ascend/backend/npu_utils.cpp",
+      "lines": "L322-L349",
+      "code": "static PyMethodDef NpuUtilsMethods[] = {\n    {\"load_kernel_binary\", loadKernelBinary, METH_VARARGS,\n     \"Load NPU kernel binary into NPU driver\"},\n    {\"get_arch\", getArch, METH_VARARGS, \"Get soc version of NPU\"},\n    // sentinel\n    {\"get_aicore_num\", getAiCoreNum, METH_VARARGS, \"Get the number of AI core\"},\n\t{\"create_stream\", createStream, METH_VARARGS, \"Create a stream\"},\n\t{\"read_data_from_file\", readDataFromBinaryFileWrapper, METH_VARARGS, \"Read binary file into the array already allocated\"},\n\t{\"write_data_to_file\", writeDataToBinaryFileWrapper, METH_VARARGS, \"Write an array to a binary file\"},\n\t{\"allocate_device_memory\", allocateDeviceMemory, METH_VARARGS, \"Allocate device memory\"},\n\t{\"allocate_host_memory\", allocateHostMemory, METH_VARARGS, \"Allocate host memory\"},\n\t{\"copy_memory\", copyMemory, METH_VARARGS, \"Copy data between host and device\"},\n    {nullptr, nullptr, 0, nullptr}};\n\nstatic PyModuleDef ModuleDef = {\n    PyModuleDef_HEAD_INIT, \"npu_utils\",\n    \"Utilities for fetching NPU device info and preparing kernel binary\", -1,\n    NpuUtilsMethods};\n\nPyMODINIT_FUNC PyInit_npu_utils(void) {\n  PyObject *m = PyModule_Create(&ModuleDef);\n  if (m == nullptr) {\n    return nullptr;\n  }\n\n  PyModule_AddFunctions(m, NpuUtilsMethods);\n  return m;\n}",
+      "elide": ["CPython 扩展的样板收尾：把 C 函数登记进 npu_utils 模块，Python 侧 self.npu_utils_mod.load_kernel_binary(...) 即调到 loadKernelBinary。本章重点是 load_kernel_binary/get_arch/get_aicore_num 三个；create_stream 及 read/write/alloc/copy_memory 是独立 host/device 内存搬运工具(未参与本章主装载路径，可一句话带过)。"]
+    }
+  ],
+  "key_classes": [
+    {
+      "name": "NPUUtils",
+      "file": "third_party/ascend/backend/driver.py",
+      "responsibility": "单例(__new__ 缓存 instance)。首次实例化即时编译并动态加载 npu_utils.so(C++ 扩展)，把它挂到 self.npu_utils_mod。对外暴露 load_binary(装二进制) 与 get_arch/get_aicore_num/get_aivector_core_num/get_device_properties(探硬件规格)。"
+    },
+    {
+      "name": "NPUDriver",
+      "file": "third_party/ascend/backend/driver.py",
+      "responsibility": "triton DriverBase 的 NPU 实现，是 triton 运行时认的那个 driver 对象。持有 self.utils=NPUUtils()、self.launcher_cls=NPULauncher。实现 get_current_target/get_current_device/get_current_stream 等契约方法；is_active() 通过探 bishengir 是否含 hiipu64 target 判定本后端可用。"
+    },
+    {
+      "name": "NPULauncher",
+      "file": "third_party/ascend/backend/driver.py",
+      "responsibility": "实际发射器。__init__ 由 metadata 生成 wrapper 源码、build 出 __triton_launcher.so 并取出 launch 函数；__call__ 调 self.launch(*args) 真正把 kernel 发到 stream。本章聚焦装载(NPUUtils/NPUDriver)，Launcher 的 wrapper 代码生成(generate_npu_wrapper_src)属发射细节，仅点到接口。"
+    },
+    {
+      "name": "registerKernel",
+      "file": "third_party/ascend/backend/npu_utils.cpp",
+      "responsibility": "C++ 扩展内真正干活的装载函数。填 rtDevBinary_t(magic 按 aiv/非 aiv 分) → rtSetDevice → rtDevBinaryRegister 拿 devbinHandle → 用全局计数器造唯一 stubName → rtFunctionRegister 拿 func stub。返回 (devbinHandle, func_stub_handle) 两个句柄。"
+    }
+  ],
+  "data_flow": [
+    "1. compiler.py:CompiledKernel._init_handles 首次访问 .run 时惰性触发，调 driver.active.utils.load_binary(self.name, self.kernel, shared, device)。self.kernel = ch28 闭源 bishengir-compile 产出的二进制 blob。",
+    "2. driver.py:NPUUtils.load_binary 用 name.rsplit('_',1) 拆出 fnname 与 mix_mode(aiv/aic/mix)，转调 self.npu_utils_mod.load_kernel_binary(fnname, kernel, shared, device, mix_mode)。",
+    "3. (首次) driver.py:NPUUtils.__init__ 已在实例化时把 npu_utils.cpp 就地 _build_npu_ext 编成 npu_utils.so 并 import——load_kernel_binary 就是这个 so 里的 C 函数。",
+    "4. npu_utils.cpp:loadKernelBinary 用 PyArg_ParseTuple('ss#iis') 解出 name/data/data_size/shared/device/kernel_mode，调 registerKernel。",
+    "5. npu_utils.cpp:registerKernel 填 rtDevBinary_t：magic 按 kernel_mode=='aiv' 选 RT_DEV_BINARY_MAGIC_ELF_AIVEC，否则 RT_DEV_BINARY_MAGIC_ELF；data/length 指向 blob。",
+    "6. rtSetDevice(device) 选设备 → rtDevBinaryRegister(&devbin,&devbinHandle) 把 blob 注册成设备二进制、拿 devbinHandle。",
+    "7. 用全局 registered_names[name]++ 造唯一 stubName，func_stubs.emplace 存 unique_ptr<size_t>；rtFunctionRegister(devbinHandle, func_stub_handle, stubName, name, 0) 把函数名注册进去、func_stub_handle(unique_ptr.get() 的稳定地址)成为可调用 stub。",
+    "8. loadKernelBinary 把 (devbinHandle, func_stub_handle) reinterpret 成 uint64、Py_BuildValue('(KKii)') 打包成 (module,function,0,0) 返回。",
+    "9. compiler.py 侧收下 (module, function, n_regs=0, n_spills=0)；function 即后续 NPULauncher 发射时传给 rtKernelLaunch 的 func 句柄。"
+  ],
+  "design_decisions": [
+    {
+      "decision": "npu_utils.so 首次用时即时编译(JIT build)而非预编译分发",
+      "why": "以 npu_utils.cpp 源文件 md5 作缓存 key：源不变复用已编 .so，改一行 C++ 即换 key 重编。免去为每个 CANN/ABI 组合预打包二进制，装载扩展始终对齐当前源与编译环境。",
+      "evidence": "third_party/ascend/backend/driver.py:L57-L68"
+    },
+    {
+      "decision": "用 aiv/非 aiv 二分选择设备二进制 magic 魔数",
+      "why": "达芬奇双核架构下 Vector 核(AIV)与 Cube 核(AIC)/混合(mix)二进制格式不同，CANN 靠 rtDevBinary_t.magic 区分。kernel_mode==\"aiv\" → RT_DEV_BINARY_MAGIC_ELF_AIVEC，其余(aic/mix) → RT_DEV_BINARY_MAGIC_ELF。前面章节的双核分工在运行时装载这一步落地为一个 magic 选择。",
+      "evidence": "third_party/ascend/backend/npu_utils.cpp:L49-L52"
+    },
+    {
+      "decision": "用全局计数器 registered_names 为同名 kernel 生成唯一 stubName",
+      "why": "不同 binary 可能含同名函数；stubName = name + '_' + registered_names[name]++ 保证每次注册的 stub 名唯一，避免 CANN 端函数名冲突。func_stubs 存 unique_ptr<size_t>，.get() 的堆地址作为稳定的 func stub 句柄。",
+      "evidence": "third_party/ascend/backend/npu_utils.cpp:L37-L38,L68-L74"
+    },
+    {
+      "decision": "load_kernel_binary 返回四元组 (module, function, 0, 0)",
+      "why": "对齐 triton 核心 load_binary 契约的 (module, function, n_regs, n_spills)；NPU 无寄存器溢出概念，末两位恒为占位 0。shared 参数注释 'meaningless now' 同理为对齐 GPU 接口而保留。",
+      "evidence": "third_party/ascend/backend/npu_utils.cpp:L106, python/triton/compiler/compiler.py:L414-L415"
+    },
+    {
+      "decision": "NPUDriver 的 device/stream 经 get_backend_func 分派到 torch_npu，而非直接 CANN API",
+      "why": "torch.npu.Stream 内容本质即 rtStream_t，复用 torch_npu 既有的 device/stream 管理免去自行封装；源码 TODO 注明未来改用 CANN API 直取。",
+      "evidence": "third_party/ascend/backend/driver.py:L188-L194"
+    }
+  ],
+  "theory": [
+    "达芬奇双核比例：get_device_properties 里 num_vectorcore = num_aicore * 2(AIV = AIC × 2)。rtGetAiCoreCount 只回 Cube 核数，Vector 核数按固定 2:1 比例推得——这是 910B 架构的硬件常量，非运行时探测。",
+    "装载 vs 发射的职责边界：本章 registerKernel 只做「注册」(把 blob 变成设备可识别的二进制 + 拿到 func stub 句柄)，不涉及任何 kernel 执行；真正的 rtKernelLaunch(func, blockNum, args, ...) 发生在 NPULauncher 生成的 wrapper 里(下游)。装载一次、发射多次。",
+    "CANN 运行时边界：rt* 系列(rtDevBinaryRegister/rtFunctionRegister/rtSetDevice/rtGetSocVersion/rtGetAiCoreCount)是 CANN 闭源运行时 API，rt.h 由 CANN 在编译期通过 -I$ASCEND/include/... 提供(仓内无源码)。书讲到调用点、参数语义、返回句柄的用途为止，不猜 CANN 内部实现。"
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {
+        "what": "npu_utils.cpp 中 createStream / readDataFromBinaryFile(+Wrapper) / writeDataToBinaryFile(+Wrapper) / allocateHostMemory / allocateDeviceMemory / copyMemory 七个独立内存/流工具函数(L139-L320)",
+        "why_safe": "它们不参与本章主线(二进制装载路径 loadKernelBinary→registerKernel)，是 host/device 内存搬运的旁路工具；删掉不影响装载正确性，精简版只保留装载 + 规格探测路径即可自洽。"
+      },
+      {
+        "what": "driver.py 中 NPULauncher 的 msprof/profiler 相关分支(enable_msprof_register_tensor、profiler_registered 回写)与 generate_npu_wrapper_src 里 msprof/device_print/ffts/taskqueue 的大量条件生成块",
+        "why_safe": "这些是发射侧的 profiling/调试/特性开关，与本章「装载」主题正交；本章聚焦 NPUUtils 装载 + NPUDriver 契约，wrapper 生成仅需点到接口，其内部条件分支可整体略去不影响装载叙事。"
+      },
+      {
+        "what": "driver.py 中 _precompile_npu_ext_with_lock / make_npu_launcher_stub / extract_device_print_code_from_cann / generate_npu_header_src 的实现细节",
+        "why_safe": "属 launcher stub 的预编译/头文件拼装机制，是发射侧构建细节；本章保留 NPUUtils._build_npu_ext(装载扩展的即时编译)已足以讲清「即时编译加载」这一核心，launcher 侧的并行预编译细节可删。"
+      }
+    ],
+    "must_keep": [
+      {"symbol": "NPUUtils", "why": "本章两层结构的 Python 装载层核心，单例即时编译加载 npu_utils.so。"},
+      {"symbol": "load_binary", "why": "triton load_binary 契约的 NPU 实现入口，name.rsplit 拆 mix_mode 的关键一步在此。"},
+      {"symbol": "load_kernel_binary", "why": "Python→C++ 的跨语言装载调用名，读者需看到它连接 driver.py 与 npu_utils.cpp。"},
+      {"symbol": "NPUDriver", "why": "triton 运行时认的 driver 对象，DriverBase 契约实现。"},
+      {"symbol": "get_current_target", "why": "driver 契约方法，展示 arch(SoC 版本)+warp_size=0 的 NPU 目标描述。"},
+      {"symbol": "get_arch", "why": "探硬件 arch 的入口，转调 C++ getArch/rtGetSocVersion。"},
+      {"symbol": "get_aicore_num", "why": "探 AI Core(AIC/Cube 核)数，双核比例推 AIV 数的基础。"},
+      {"symbol": "get_aivector_core_num", "why": "AIV 数 = AIC×2 的达芬奇双核比例落点。"},
+      {"symbol": "registerKernel", "why": "C++ 装载核心，rt* 调用序列 + magic 分支全在此，本章逐行核的对象。"},
+      {"symbol": "loadKernelBinary", "why": "C++ 扩展入口，PyArg_ParseTuple 解参 + 打包 (KKii) 返回四元组。"},
+      {"symbol": "rtDevBinaryRegister", "why": "把 blob 注册成设备二进制、拿 devbinHandle 的 CANN 调用，对位基座 CUDA cuModuleLoad。"},
+      {"symbol": "rtFunctionRegister", "why": "把 kernel 函数名注册进去、拿可调用 func stub 的 CANN 调用。"},
+      {"symbol": "rtDevBinary_t", "why": "设备二进制描述结构体，magic/data/length/version 四字段是装载的载荷。"},
+      {"symbol": "RT_DEV_BINARY_MAGIC_ELF_AIVEC", "why": "AIV(Vector 核)二进制魔数，双核区分的常量之一。"},
+      {"symbol": "RT_DEV_BINARY_MAGIC_ELF", "why": "非 aiv(aic/mix)二进制魔数，与 AIVEC 对立的另一分支。"},
+      {"symbol": "registered_names", "why": "全局计数器 map，为同名 kernel 生成唯一 stubName 防冲突。"},
+      {"symbol": "getArch", "why": "rtGetSocVersion 探 SoC 版本字符串作 arch。"},
+      {"symbol": "getAiCoreNum", "why": "rtGetAiCoreCount 探 AI Core 数。"}
+    ]
+  },
+  "mechanisms": [
+    {
+      "id": "m1",
+      "name": "npu_utils.so 首次用时即时编译加载(单例 + md5 缓存)",
+      "kind": "dataflow",
+      "source_anchors": ["third_party/ascend/backend/driver.py:L48-L73"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m2",
+      "name": "跨语言装载调用链：load_binary → load_kernel_binary → registerKernel",
+      "kind": "dataflow",
+      "source_anchors": ["third_party/ascend/backend/driver.py:L77-L79", "third_party/ascend/backend/npu_utils.cpp:L84-L107", "third_party/ascend/backend/npu_utils.cpp:L40-L82", "python/triton/compiler/compiler.py:L403-L415"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m3",
+      "name": "registerKernel 的 CANN rt* 调用序列(rtSetDevice → rtDevBinaryRegister → rtFunctionRegister)",
+      "kind": "protocol",
+      "source_anchors": ["third_party/ascend/backend/npu_utils.cpp:L40-L82"],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m4",
+      "name": "aiv/非 aiv magic 魔数选择(双核分工在装载落地)",
+      "kind": "config",
+      "source_anchors": ["third_party/ascend/backend/npu_utils.cpp:L48-L53", "third_party/ascend/backend/driver.py:L77-L79"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m5",
+      "name": "同名 kernel 唯一 stubName 生成 + func stub 句柄稳定地址",
+      "kind": "algorithm",
+      "source_anchors": ["third_party/ascend/backend/npu_utils.cpp:L37-L38", "third_party/ascend/backend/npu_utils.cpp:L68-L74"],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m6",
+      "name": "loadKernelBinary 的参数解包与四元组返回((KKii) 对齐 triton load_binary 契约)",
+      "kind": "protocol",
+      "source_anchors": ["third_party/ascend/backend/npu_utils.cpp:L92-L107", "python/triton/compiler/compiler.py:L414-L415"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m7",
+      "name": "NPUDriver 的 triton DriverBase 契约实现(target/device/stream)",
+      "kind": "protocol",
+      "source_anchors": ["third_party/ascend/backend/driver.py:L144-L205"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m8",
+      "name": "硬件规格探测与达芬奇双核比例(AIV = AIC × 2)",
+      "kind": "config",
+      "source_anchors": ["third_party/ascend/backend/driver.py:L81-L101", "third_party/ascend/backend/npu_utils.cpp:L109-L137"],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    }
+  ],
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_payoff": [],
+    "note": "bible.py due ch29 返回空(应埋伏笔/应回收均无条目)。"
+  }
+}
