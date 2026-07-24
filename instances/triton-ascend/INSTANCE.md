@@ -47,11 +47,12 @@
   开始逐章发车。roadmap.py 生成器已建并验（7 Part 窄长条 5.17:1，4 调用/几何/Read-PNG 通过）。
 - 🚗 **施工中（2026-07-24 状态）**：**ch01–ch26 已全部定稿提交并归档**（Part 1/2 完 + Part 3 triton-to-linalg 核心
   + ascend-opt ch15–ch18 + ch19 离散掩码 + **hivm-hfusion ch20-25 六章收官** + **Part 6 后端与运行时开篇 ch26 后端插件**）;ch27–ch33 未开工。
-  **ch27 已交付归档**(综合章,回收 f6,clean run)。
-  **ch28 发车中**（闭源边界 bishengir-compile:编译选项/子进程调用/元数据回收,skip_impl;slug `ch28-bishengir-boundary`,deps ch27）:
-  linalg_to_bin 从 Linalg IR 文本正则抠元数据(mix_mode/parallel_mode/kernel_name/tensor_kinds)→构造几十个 --enable-* 开关
-  →subprocess.run 调 bishengir-compile(闭源二进制,昇腾侧 ptxas 对位)→UB-bits + dlopen 回调双通道回收产物;书读到 subprocess 边界为止、闭源内部不猜。对位基座 ch37(ptxas→cubin)。
-  ⚠️ skip_impl(subprocess 需闭源工具链);交叉验证靠 compiler.py/utils.py 逐行核正则与命令行构造 + pytest_ut。
+  **ch27(综合章 f6)、ch28(闭源边界 f7)已交付归档,均 clean run**。
+  **ch29 发车中**（NPU 运行时驱动与二进制装载:NPUDriver/NPUUtils/npu_utils.cpp,skip_impl;slug `ch29-npu-driver-load`,deps ch28）:
+  NPUUtils 编译加载 npu_utils.so(C++ 扩展)→ load_binary→load_kernel_binary 把二进制装上设备;npu_utils.cpp 的 registerKernel
+  用 rtDevBinaryRegister(注册设备二进制)+ rtFunctionRegister(注册 kernel 函数)、aiv/aic magic 区分 vector/cube 核;NPUDriver(DriverBase) 实现 triton 驱动契约。对位基座 ch37(CANN rtDevBinaryRegister vs CUDA cubin 装载)。
+  ⚠️ skip_impl(rt* API 需 CANN 运行时 + NPU 设备);交叉验证靠 driver.py/npu_utils.cpp 逐行核 + pytest_ut。
+  ✅ 近 3 章(ch26/27/28)工作流干净跑完无逃逸;figures.json 归档登记也已稳(ch28 archivist 正确登记 6 图);Lead 后置只补少量可读性/保真微调。
   ⚠️ 逃逸恢复:Review 阶段 API Connection-closed 崩→revise-fig 常改了图脚本没重渲染=陈旧 SVG+假 PASS,Lead 接管重渲染+独立盲审(见 memory revise-fig-stale-render);figures.json 归档易漏登、chNN- slug 前缀必带(见 memory)。
   ⚠️ ch22 曾 Review round1 逃逸(计数陷阱 15→4 Scheduler/未验证子核个数/MixCV 14×14 结构错),Lead 手动接管修复+独立盲审,已归档。
   ⚠️ **发车 slug 必须含 `chNN-` 前缀**(workflow 里 `CH = artifacts/ + A.slug`,slug 直接当目录名):ch23 误传裸 `hivm-dialect`→
