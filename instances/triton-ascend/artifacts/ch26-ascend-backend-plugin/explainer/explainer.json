@@ -1,0 +1,192 @@
+{
+  "chapter": "ch26",
+  "title": "昇腾后端如何挂进 Triton——AscendBackend 契约、NPUOptions 与 hacc.target 注入",
+  "trace_note": "本章无精简版(implementation/ 为空)。四个 needs_worked_example 机制里,parse-options / npuoptions-hash / backend-hash 三个是纯控制流(字典过滤 + 字符串拼接 + sha256/字符串化),用 traces/run_ch26.py 在 host 忠实复现算法本体取得真实 trace(traces/ch26.json);因真实 NPUOptions ~80 字段且依赖 ascend-only 的 C 扩展 import,host 无法实例化 pin 原对象,故 digest 是真 sha256 但对应缩减 key 串(字段值逐字取自 compiler.py 默认值),用于示教雪崩/正交,非对账 pin 的字面哈希——trace_source 一律标 manual 并在各 manual_reason 写清。hacc-target-injection 是 monkey-patch 控制流,依赖编译期 C 扩展,手工推演。",
+  "mechanisms": [
+    {
+      "mechanism_id": "parse-options",
+      "intuition": "像海关白名单:用户递上一大袋 kwargs,parse_options 只放行护照(NPUOptions 字段名)上登记过的键,其余当场丢弃;若忘带 arch,就用 target 上的默认给你补一张。",
+      "worked_example": {
+        "params": {
+          "user_kwargs": {"num_warps": 8, "num_stages": 2, "enable_fp_fusion": false, "block_size": 128, "foo": "bar"},
+          "target_arch": "Ascend910B",
+          "field_gate": "NPUOptions.__dataclass_fields__ 字段名全集(compiler.py:L705-790)"
+        },
+        "trace_source": "manual",
+        "trace_ref": "traces/ch26.json",
+        "manual_reason": "parse_options 主体是纯字典推导 {k: opts[k] for k in NPUOptions.__dataclass_fields__ if k in opts} + args.setdefault('arch', target.arch)(compiler.py:L890-897);真实 NPUOptions 依赖 ascend-only import 无法在 host 实例化,故 traces/run_ch26.py 用与之等价的字段名集合精确复现该过滤逻辑,输出见 traces/ch26.json 的 parse_options 段。表内取舍与 kept/dropped 与该 trace 一致。",
+        "table": {
+          "columns": ["键=值", "是否 NPUOptions 字段名", "动作", "进入 NPUOptions 的键"],
+          "rows": [
+            ["num_warps=8", "是", "保留", "num_warps=8"],
+            ["num_stages=2", "是", "保留", "num_stages=2"],
+            ["enable_fp_fusion=False", "是", "保留", "enable_fp_fusion=False"],
+            ["block_size=128", "否(非字段名)", "丢弃", "—"],
+            ["foo=bar", "否(非字段名)", "丢弃", "—"],
+            ["arch 缺席 → setdefault", "—", "从 target.arch 补(compiler.py:L896)", "arch=Ascend910B"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "过滤后交给 NPUOptions(**kept) 的每个键都是合法 dataclass 字段名,构造绝不会因未知 kwarg 抛 TypeError。",
+        "argument": "kept 由字典推导 {k: opts[k] for k in NPUOptions.__dataclass_fields__ if k in opts} 构造——遍历的是字段名全集,故每个 k 必是字段;唯一额外键 arch 经 setdefault 补入,arch 本身也是字段(compiler.py:L710)。两来源皆字段 ⇒ **kept 合法。用户多递的 block_size/foo 在遍历范围外,永不进入 kept。"
+      },
+      "quantified": "本例 5 个用户 kwargs → 3 个命中字段名(num_warps/num_stages/enable_fp_fusion)被保留 + 1 个 setdefault 补 arch = 4 个键进入 NPUOptions;2 个(block_size/foo)被丢弃。过滤成本 O(字段数),与用户 kwargs 大小无关。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "npuoptions-hash",
+      "intuition": "选项对象的指纹:把每个开关的「名-值」串成一行长字符串,再压成 64 位十六进制哈希。任何一个开关拨动一格,指纹整个变样(雪崩),编译缓存就 miss、触发重编——这正是「选项不同不复用编译产物」的保证。",
+      "worked_example": {
+        "params": {
+          "base_fields": {"debug": false, "num_warps": 32, "num_stages": 1, "arch": "Ascend910B", "compile_mode": "simd"},
+          "note": "字段值逐字取自 compiler.py 默认:debug=False(L706)、num_warps=32(L713)、num_stages=1(L715)、compile_mode='simd'(L787);为可手算只取 5 字段代表,真对象 ~80 字段"
+        },
+        "trace_source": "manual",
+        "trace_ref": "traces/ch26.json",
+        "manual_reason": "NPUOptions.hash 主体两行:key = '_'.join(f'{name}-{val}' for name,val in self.__dict__.items());return sha256(key.encode()).hexdigest()(compiler.py:L810-812)。真实 ~80 字段对象因 ascend-only import 无法在 host 实例化,traces/run_ch26.py 用缩减 5 字段集逐字复现同一 join→sha256,digest 是真 sha256 但对应缩减 key 串,示教雪崩用,不等于 pin 全字段对象的字面 digest。前 8 位 digest 与共享前缀长度取自 traces/ch26.json 的 npuoptions_hash 段。",
+        "table": {
+          "columns": ["场景(相对 base 的改动)", "key 字符串(节选)", "sha256 前 8 位", "与 base digest 的公共前缀"],
+          "rows": [
+            ["base(默认)", "debug-False_num_warps-32_..._arch-Ascend910B_compile_mode-simd", "27b4ce00", "—(基准)"],
+            ["仅 num_warps 32→16", "..._num_warps-16_...", "6c652952", "0 字符(首字符即不同)"],
+            ["仅 arch 910B→950", "..._arch-Ascend950_...", "7f55aa82", "0 字符(首字符即不同)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "改动任一字段值,新 digest 与原 digest 的十六进制公共前缀长度为 0(雪崩),故不同选项必得不同缓存键、不会误命中同一编译产物。",
+        "argument": "key 是所有字段名-值的确定性拼接:字段变一处 ⇒ key 串变一处 ⇒ sha256 输入变化。sha256 具雪崩性(单 bit 输入变化平均翻转半数输出 bit),实测 base 与 num_warps 变体、arch 变体的公共前缀长度均为 0(traces/ch26.json avalanche 段)。反向:key 相同 ⇒ digest 必相同(哈希是函数),即选项完全一致才可能命中。"
+      },
+      "quantified": "digest 恒为 64 个十六进制字符(256 bit)。本例仅改 1 个字段,base 与两个变体的公共前缀长度均为 0——64 位无一位可复用,缓存键完全不同。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "backend-hash",
+      "intuition": "后端的目标身份证:AscendBackend.hash 干脆就是把 GPUTarget 打印成字符串(backend+arch+warp_size)。它和选项指纹是两把独立的锁,两把都对上才复用编译产物——而 arch 是唯一能同时拨动两把锁的量。",
+      "worked_example": {
+        "params": {
+          "target_910B": "GPUTarget('npu', 'Ascend910B', 0)",
+          "target_950": "GPUTarget('npu', 'Ascend950', 0)",
+          "note": "AscendBackend.hash 主体一行 return str(self.target)(compiler.py:L971-974);warp_size 在 NPU 恒填 0(driver.py:L173)"
+        },
+        "trace_source": "manual",
+        "trace_ref": "traces/ch26.json",
+        "manual_reason": "AscendBackend.hash 就是 str(self.target),target 为 GPUTarget frozen dataclass(python/triton/backends/compiler.py:L217-223)。traces/run_ch26.py 用同结构 frozen dataclass 复现其 __repr__,取得两个 arch 的真实字符串(traces/ch26.json 的 backend_hash 段)。正交结论(改 num_warps 只动 options_hash 不动 backend_hash)由源码组成推得:str(target) 里不含 num_warps。",
+        "table": {
+          "columns": ["改动维度", "AscendBackend.hash = str(target)", "NPUOptions.hash 前 8 位", "缓存命中?"],
+          "rows": [
+            ["基准(910B, num_warps=32)", "GPUTarget(backend='npu', arch='Ascend910B', warp_size=0)", "27b4ce00", "—(基准)"],
+            ["改 arch 910B→950", "GPUTarget(backend='npu', arch='Ascend950', warp_size=0)", "7f55aa82", "miss(两指纹都变)"],
+            ["只改 num_warps 32→16", "GPUTarget(backend='npu', arch='Ascend910B', warp_size=0) [不变]", "6c652952", "miss(只 options 指纹变)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "缓存命中 ⟺ backend_hash 相等 且 options_hash 相等(两维正交合取);改 arch 会同时改变两维,故 arch 是双重敏感量。",
+        "argument": "backend_hash=str(target) 只含 backend/arch/warp_size;options_hash 含 arch 在内的全部字段。arch 同时出现在两者:parse_options 用 setdefault('arch', target.arch) 把 target.arch 复制进 options.arch(compiler.py:L896),故 arch 变 ⇒ backend_hash 变 且 options_hash 变。仅 options 专属字段(如 num_warps)变 ⇒ 只 options_hash 变、backend_hash 不变;合取要求两者都等,故仍 miss。任何一维不等即 miss。"
+      },
+      "quantified": "两个 arch(910B/950)→ 两个互不相等的 backend_hash 字符串。改 num_warps 时 backend_hash 逐字节不变(str(target) 中无 num_warps),但 options_hash 前 8 位由 27b4ce00 变为 6c652952——单维变化即足以 miss。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch26-two-level-cache-key",
+          "claim": "编译缓存命中要求 target 指纹与 options 指纹两把锁同时对上;arch 变化会同时拨动两把锁,而 num_warps 之类只拨动 options 一把。",
+          "template": "state-table",
+          "numbers": [
+            {"label": "backend_hash(910B)", "value": "GPUTarget(backend='npu', arch='Ascend910B', warp_size=0)", "provenance": "traces/ch26.json → backend_hash.target_910B(str(GPUTarget), 复现 compiler.py:L971-974)"},
+            {"label": "backend_hash(950)", "value": "GPUTarget(backend='npu', arch='Ascend950', warp_size=0)", "provenance": "traces/ch26.json → backend_hash.target_950"},
+            {"label": "options_hash base 前8位", "value": "27b4ce00", "provenance": "traces/ch26.json → npuoptions_hash.base.digest"},
+            {"label": "options_hash arch950 前8位", "value": "7f55aa82", "provenance": "traces/ch26.json → npuoptions_hash.arch_910B_to_950.digest"},
+            {"label": "options_hash num_warps16 前8位", "value": "6c652952", "provenance": "traces/ch26.json → npuoptions_hash.num_warps_32to16.digest"}
+          ],
+          "caption_draft": "两级缓存键正交合取:只有 target 与 options 两个指纹都命中才复用编译产物。改 num_warps 只让 options 指纹变(27b4ce00→6c652952),target 指纹不变;而改 arch 把两个指纹一起改(910B→950 行两列全变)——因为 parse_options 把 target.arch 复制进 options.arch,arch 是唯一双重敏感的量。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "hacc-target-injection",
+      "intuition": "昇腾在门口给 IR 贴标签:Triton 上游的 make_ir 只生成通用 Triton IR,不认识昇腾芯片型号。昇腾用一层幂等 monkey-patch 包住 make_ir——module 一生成就贴上 #hacc.target<\"Ascend910B\"> 这张便签,后面每道 pass 抬头就知道给哪代芯片生成。贴一次就够,再调只是空转。",
+      "worked_example": {
+        "params": {
+          "options_arch": "Ascend910B",
+          "scenario": "连续调用 get_codegen_implementation 两次 + 一次 arch='' 的编译",
+          "note": "触发点 get_codegen_implementation → _apply_ascend_patch(compiler.py:L925-931);注入体在 __init__.py:L27-52"
+        },
+        "trace_source": "manual",
+        "trace_ref": "",
+        "manual_reason": "hacc.target 注入靠 monkey-patch ASTSource.make_ir,并调用 ascend_ir.ascendnpu_ir_builder / module.set_attr——二者来自 triton._C.libtriton.ascend 编译期 C 扩展,host 无该 .so 无法真跑,无可运行精简版。逐步依 __init__.py:L27-52 与 compiler.py:L925-931 源码手工推演;本机制无数值常量,涉及的行号已标注。",
+        "table": {
+          "columns": ["轮次", "事件", "_ascend_patch_applied", "make_ir 实际行为", "module 上的 hacc.target"],
+          "rows": [
+            ["1", "首次 get_codegen_implementation → _apply_ascend_patch", "False → True", "把 ASTSource.make_ir 换成 _patched_make_ir(L51)", "(patch 装上,尚未编译)"],
+            ["2", "编译 kernel(arch='Ascend910B'),走 _patched_make_ir", "True", "先调原 make_ir 生成 module,再 set_attr(L42,L45)", "#hacc.target<\"Ascend910B\">"],
+            ["3", "再次 get_codegen_implementation → _apply_ascend_patch", "True(守卫命中,L30)", "no-op,不再包裹", "不变(不重复嵌套)"],
+            ["4", "编译另一 kernel(arch=''),走 _patched_make_ir", "True", "生成 module;if options.arch 为空 ⇒ 跳过注入(L43)", "无(arch 空,便签不贴)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "无论 get_codegen_implementation 被调多少次,ASTSource.make_ir 只被真正包裹一次(幂等),绝不层层嵌套。",
+        "argument": "基例:首次进入 _apply_ascend_patch 时 getattr(ASTSource,'_ascend_patch_applied',False) 缺省为 False ⇒ 进入函数体、替换 make_ir、末尾置 _ascend_patch_applied=True(L52)。归纳步:此后任意调用,守卫 if not getattr(...,True) 恒为假 ⇒ 整个函数体跳过,make_ir 不再被二次包裹。故包裹次数恒为 1,不会出现 _patched_make_ir 套 _patched_make_ir 的嵌套调用。注入失败时降级为 warning(L46-47),不阻断编译。"
+      },
+      "quantified": "N 次 get_codegen_implementation 调用 ⇒ 恰 1 次实际 patch + (N-1) 次 no-op。每次编译在 module 生成后至多 1 次 set_attr:arch 非空注入 1 张 #hacc.target 便签,arch 为空则 0 次。",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch26-hacc-target-patch",
+          "claim": "hacc.target 不是编译 stage,而是靠幂等 monkey-patch 包住 ASTSource.make_ir——module 生成后立刻 set_attr 目标型号,供后续所有 pass 读取。",
+          "template": "flow",
+          "numbers": [
+            {"label": "实际 patch 次数", "value": "1", "provenance": "__init__.py:L30/L52 幂等守卫 _ascend_patch_applied ⇒ 恰 1 次包裹"},
+            {"label": "注入的属性", "value": "#hacc.target<\"Ascend910B\">", "provenance": "__init__.py:L44-45 target_attr_str = f'#hacc.target<\"{options.arch}\">' → module.set_attr"},
+            {"label": "arch 空时注入次数", "value": "0", "provenance": "__init__.py:L43 if hasattr(options,'arch') and options.arch 分支为假 ⇒ 跳过"}
+          ],
+          "caption_draft": "get_codegen_implementation 调 _apply_ascend_patch,把 ASTSource.make_ir 换成 _patched_make_ir(仅首次生效)。此后每次编译:_patched_make_ir 先调原 make_ir 生成 Triton IR module,再把 #hacc.target<\"arch\"> 解析为 MLIR 属性 set_attr 到 module——目标硬件型号在 module 一诞生就挂上,后续 pass 全程可读;arch 为空则不贴,注入失败仅告警不阻断。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "backend-discovery",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch26-backend-discovery",
+          "claim": "后端免注册表:_discover_backends 扫 triton/backends/ 每个子目录,取其 compiler.py/driver.py 里恰好一个非抽象子类装配成 Backend;nvidia/amd 被显式跳过。",
+          "template": "flow",
+          "numbers": [
+            {"label": "被跳过的目录数", "value": "2", "provenance": "python/triton/backends/__init__.py:L40 ignored_dirs={'nvidia','amd'}(该包不发行 nvidia/amd 加载文件)"},
+            {"label": "每目录要求的非抽象子类数", "value": "1", "provenance": "python/triton/backends/__init__.py:L16-26 _find_concrete_subclasses 要求恰 1 个(0 个或 >1 个都 raise)"}
+          ],
+          "caption_draft": "装配期一步到位:_discover_backends 遍历 triton/backends/ 下的子目录,跳过 nvidia/amd,对每个目录 import compiler.py 与 driver.py 并各取唯一非抽象子类,得到 backends['ascend']=Backend(AscendBackend, NPUDriver)。放对目录、类具体化即被发现——「一目录一后端」由「恰 1 个非抽象子类」这条硬约束强制。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "basebackend-contract",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch26-basebackend-contract",
+          "claim": "Triton 通用编译驱动只认 BaseBackend 这 6 个抽象方法;任何硬件实现这份契约即可挂入,核心代码不改。",
+          "template": "layout",
+          "numbers": [
+            {"label": "契约必需的抽象方法数", "value": "6", "provenance": "python/triton/backends/compiler.py:L226-290 六个 @abstractmethod:supports_target / hash / parse_options / add_stages / load_dialects / get_module_map"}
+          ],
+          "caption_draft": "BaseBackend(ABCMeta)是后端无关契约:supports_target(认领 target)、hash(参与缓存键)、parse_options(kwargs→选项对象)、add_stages(注册下降管线)、load_dialects(装 MLIR dialect)、get_module_map(接口→设备实现)共 6 个抽象方法。Triton 编译驱动只面向这 6 个签名,不认识具体硬件——昇腾只需在 AscendBackend 里逐一实现,无需改动 Triton 核心。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "add-stages-pipeline",
+      "figure_specs": [
+        {
+          "figure_id": "fig-ch26-add-stages-pipeline",
+          "claim": "add_stages 用闭包按 options 分支拼下降管线:常规 ttir→ttadapter(linalg)→npubin;force_simt_only 时 ttir 直编 npubin 跳过 linalg;compile_on_910_95 与否切换两个 npubin 实现。",
+          "template": "flow",
+          "numbers": [
+            {"label": "常规路径 stage 数", "value": "3", "provenance": "compiler.py:L941-963 stages['ttir']=make_ttir、['ttadapter']=ttir_to_linalg、['npubin']=linalg_to_bin_*"},
+            {"label": "force_simt_only 路径 stage 数", "value": "2", "provenance": "compiler.py:L945-951 stages['ttir']=make_ttir、['npubin']=ttir_to_npubin 后 return(跳过 ttadapter)"}
+          ],
+          "caption_draft": "昇腾下降管线没有 ttgir(TritonGPU IR):常规三段 ttir→ttadapter(经 triton_adapter 把 Triton IR 下降到 linalg)→npubin(交 bishengir 出二进制)。stage 是捕获 options 的 lambda 闭包,按插入序执行、经 metadata dict 串接;组合由 options 动态决定——force_simt_only 走 ttir 直编 npubin(2 段),compile_on_910_95 与否切换 910_95 与 A2_A3 两个 linalg_to_bin 实现。末段返回 bytes(NPU 二进制),其余返回 str(IR 文本)。"
+        }
+      ]
+    }
+  ]
+}

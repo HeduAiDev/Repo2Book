@@ -1,0 +1,181 @@
+{
+  "chapter": "ch26",
+  "title": "昇腾后端如何挂进 Triton——AscendBackend 契约、NPUOptions 与 hacc.target 注入",
+  "deps": ["ch14"],
+
+  "PLAN_CORRECTIONS": [
+    "章计划/INSTANCE.md 的措辞 'add_stages 注册 make_ttir/make_ttgir/make_npubin 三段' 与真实源码不符：AscendBackend.add_stages 注册的 stage 键是 'ttir'→'ttadapter'→'npubin'（force_simt_only 分支下只有 'ttir'→'npubin'）。三个键对应的实现函数分别是 make_ttir / ttir_to_linalg / (linalg_to_bin_enable_npu_compile_910_95 | linalg_to_bin_enable_npu_compile_A2_A3 | ttir_to_npubin)。昇腾侧没有 'ttgir'（TritonGPU IR）这一阶段——它把 Triton IR 直接经 triton_adapter 下降到 linalg（ttadapter），再交 bishengir-compile 出 NPU 二进制。writer 必须按真实的 ttir/ttadapter/npubin 讲，禁止杜撰 'make_ttgir'。",
+    "章计划的措辞 'hacc.target 在 make_ttir/make_ttgir 阶段注入' 与真实源码不符：hacc.target 不是在 add_stages 的任何 stage 里注入的。真实机制是 get_codegen_implementation() 调用 _apply_ascend_patch()（third_party/ascend/backend/__init__.py），后者 monkey-patch triton.compiler.compiler.ASTSource.make_ir——在 AST→Triton IR 生成 module 之后、进入 'ttir' stage 之前，读 options.arch、构造 ascendnpu_ir_builder、把 #hacc.target<\"arch\"> 解析成 MLIR 属性 set_attr 到 module 上。writer 须按 monkey-patch ASTSource.make_ir 这个真实位置讲。",
+    "章计划的措辞 '910/310 等 DaVinci 型号' 里的 '310' 在本章焦点源码中无出处：真实出现的 arch 字符串是 'Ascend910B*'、'Ascend910*'、'Ascend950'、'Ascend910_95'（见 _get_kernel_target 与 test_arch.py 的 Options.arch='Ascend950'）。writer 引用具体型号时只用源码里出现过的字符串，勿写 310。"
+  ],
+
+  "code_spine": [
+    "python/triton/backends/__init__.py:L35-L55  _discover_backends 扫 triton/backends/<name>/ 装配 {compiler,driver}",
+    "python/triton/backends/compiler.py:L226-L290  BaseBackend 抽象契约（supports_target/hash/parse_options/add_stages/load_dialects/get_module_map）",
+    "third_party/ascend/backend/driver.py:L166-L174  NPUDriver.get_current_target 造 GPUTarget(backend='npu', arch, warp_size=0)",
+    "third_party/ascend/backend/compiler.py:L877-L903  AscendBackend.supports_target/__init__/parse_options",
+    "third_party/ascend/backend/compiler.py:L704-L812  NPUOptions dataclass(frozen)+__post_init__+hash",
+    "third_party/ascend/backend/compiler.py:L925-L931  get_codegen_implementation → _apply_ascend_patch()",
+    "third_party/ascend/backend/__init__.py:L27-L52  _apply_ascend_patch monkey-patch ASTSource.make_ir 注入 hacc.target",
+    "third_party/ascend/backend/compiler.py:L939-L968  add_stages 注册 ttir/ttadapter/npubin 下降管线",
+    "third_party/ascend/backend/compiler.py:L73-L93  make_ttir（ttir stage 实现，与其他后端共用 TTIR 优化 pass）",
+    "third_party/ascend/backend/compiler.py:L970-L974  AscendBackend.hash 用 target 参与缓存键"
+  ],
+
+  "embed_excerpts": [
+    {
+      "path": "python/triton/backends/__init__.py",
+      "lines": "L35-L55",
+      "code": "def _discover_backends():\n    backends = dict()\n    root = os.path.dirname(__file__)\n    # The package does not ship the files required to load the\n    # upstream nvidia and amd backends, so skip discovering them here.\n    ignored_dirs = {\"nvidia\", \"amd\"}\n    for name in os.listdir(root):\n        if name in ignored_dirs:\n            continue\n        if not os.path.isdir(os.path.join(root, name)):\n            continue\n        if name.startswith('__'):\n            continue\n        compiler = _load_module(name, os.path.join(root, name, 'compiler.py'))\n        driver = _load_module(name, os.path.join(root, name, 'driver.py'))\n        backends[name] = Backend(_find_concrete_subclasses(compiler, BaseBackend),\n                                 _find_concrete_subclasses(driver, DriverBase))\n    return backends\n\n\nbackends = _discover_backends()",
+      "elide": ["_load_module(L9-13) 和 _find_concrete_subclasses(L16-26) 的具体实现可只文字说明：前者按路径 import compiler.py/driver.py，后者要求每个模块里恰好一个非抽象子类（0 个或 >1 个都 raise）。"]
+    },
+    {
+      "path": "python/triton/backends/compiler.py",
+      "lines": "L226-L290",
+      "code": "class BaseBackend(metaclass=ABCMeta):\n\n    def __init__(self, target: GPUTarget) -> None:\n        self.target = target\n        assert self.supports_target(target)\n\n    @abstractclassmethod\n    def supports_target(target: GPUTarget):\n        raise NotImplementedError\n\n    @abstractmethod\n    def hash(self) -> str:\n        \"\"\"Returns a unique identifier for this backend\"\"\"\n        raise NotImplementedError\n\n    @abstractmethod\n    def parse_options(self, options: dict) -> object:\n        \"\"\"\n        Converts an `options` dictionary into an arbitrary object and returns it.\n        This function may contain target-specific heuristics and check the legality of the provided options\n        \"\"\"\n        raise NotImplementedError\n\n    @abstractmethod\n    def add_stages(self, stages: dict, options: object) -> None:\n        \"\"\"\n        Populates `stages` dictionary with entries of the form:\n        ir_name [str] => Function[(src: str, metadata: dict) -> str|bytes]\n        Stages will be run sequentially (in inseriton order) and can communicate using `metadata`.\n        All stages are expected to return a `str` object, except for the last stage which returns\n        a `bytes` object for execution by the launcher.\n        \"\"\"\n        raise NotImplementedError\n\n    @abstractmethod\n    def load_dialects(self, context):\n        \"\"\"\n        Load additional MLIR dialects into the provided `context`\n        \"\"\"\n        raise NotImplementedError\n\n    @abstractmethod\n    def get_module_map(self) -> Dict[str, ModuleType]:\n        \"\"\"\n        Return a map of interface modules to their device-specific implementations\n        \"\"\"\n        raise NotImplementedError",
+      "elide": ["_path_to_binary(L232-247) 是 CUDA 专用找二进制辅助，与契约无关，可省。get_attrs_descriptor(L292-298)/compute_spec_key(L300-304) 是有默认实现的非抽象方法，讲契约时可只提一句默认落到 AttrsDescriptor。逐字微调：原文 add_stages docstring 中间还有一行 'The value of each entry may populate a `metadata` dictionary.'，为压缩已省，引用时应保留原文。"]
+    },
+    {
+      "path": "third_party/ascend/backend/driver.py",
+      "lines": "L166-L174",
+      "code": "    def get_current_target(self):\n        backend = \"npu\"\n        env_target = get_ascend_arch_from_env()\n        if env_target:\n            arch = env_target\n        else:\n            arch = self.utils.get_arch()\n        warp_size = 0\n        return GPUTarget(backend, arch, warp_size)",
+      "elide": ["get_ascend_arch_from_env / NPUUtils.get_arch 的实现细节可略——只需说明 arch 字符串（如 'Ascend910B'/'Ascend950'）来自环境变量覆盖或 npu_utils 探测硬件；warp_size 在 NPU 上填 0。"]
+    },
+    {
+      "path": "third_party/ascend/backend/compiler.py",
+      "lines": "L877-L903",
+      "code": "class AscendBackend(BaseBackend):\n\n    @staticmethod\n    def supports_target(target: GPUTarget):\n        return target.backend == \"npu\"\n\n    def __init__(self, target: GPUTarget) -> None:\n        super().__init__(target)\n        if target.backend == \"npu\":\n            self.binary_ext = \"npubin\"\n\n    def parse_options(self, opts) -> Any:\n        # TODO: get available targets when building options?\n        if self.target.backend == \"npu\":\n            args = {\n                k: opts[k]\n                for k in NPUOptions.__dataclass_fields__.keys()\n                if k in opts\n            }\n            args.setdefault(\"arch\", self.target.arch)\n            options = NPUOptions(**args)\n        else:\n            raise NotImplementedError(\n                f\"Backend '{self.target.backend}' is not supported. \"\n                \"Please ensure the target backend is set to 'npu'.\"\n            )\n        return options",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/backend/compiler.py",
+      "lines": "L704-L742",
+      "code": "@dataclass(frozen=True)\nclass NPUOptions:\n    debug: bool = False\n    sanitize_overflow: bool = True\n    llvm_version: int = 15\n    kernel_name: str = \"triton_\"\n    arch: str = \"\"\n\n    cluster_dims: tuple = (1, 1, 1)\n    num_warps: int = 32\n    num_ctas: int = 1\n    num_stages: int = 1\n    warp_size: int = 32\n    num_buffers_warp_spec: int = 0\n    num_consumer_groups: int = 0\n    reg_dec_producer: int = 0\n    reg_inc_consumer: int = 0\n\n    auto_blockify_size: int = 1\n    compile_on_910_95: bool = is_compile_on_910_95\n    optimize_dynamic_offset: bool = False\n    enable_mask_fallback_conversion: bool = False\n    enable_warp_specialization: bool = False\n    enable_nd2nz_on_vector: bool = False\n    enable_persistent: bool = False\n    optimize_epilogue: bool = False\n    enable_fp_fusion: bool = True\n    allow_fp8e4nv: bool = False\n    auto_tile_and_bind_subblock: bool = True\n    vf_merge_level: int = 0\n    supported_fp8_dtypes: Tuple[str] = (\"fp8e5\", \"fp8e4b15\", \"fp8e4nv\", \"fp8e4b8\", \"fp8e5b16\")\n    deprecated_fp8_dtypes: Tuple[str] = ()\n    vf_merge_level: int = 1\n    default_dot_input_precision: str = \"ieee\"\n    allowed_dot_input_precisions: Tuple[str] = (\"ieee\", \"hf32\")\n    max_num_imprecise_acc_default: int = 0\n    extern_libs: dict = None\n    bisheng_options: str = \"-cce-link-aicore-ll-module \" + get_libdevice()",
+      "elide": ["L743-L791 是另外约 60 个 bishengir/hivm 编译开关字段（multibuffer、enable_ubuf_saving、sync_solver、tile_mix_*、compile_mode、force_simt_* 等），绝大多数默认 None 表示'不透传该 flag'。讲解时不必逐字段列举，只需说明：这些字段是 dataclass 的一部分，因而全部进 hash()，即每一个开关都参与缓存键。compile_on_910_95 默认值是模块级常量 is_compile_on_910_95（由 PCI id/npu-smi 探测得到），multibuffer 默认 'not is_compile_on_910_95'。注意 vf_merge_level 在 L733 与 L736 被定义了两次（源码原样如此，后者 =1 生效）。"]
+    },
+    {
+      "path": "third_party/ascend/backend/compiler.py",
+      "lines": "L793-L812",
+      "code": "    def __post_init__(self):\n        # Parse compile_mode and set related fields\n        if self.compile_mode == \"simd\":\n            object.__setattr__(self, \"parallel_mode\", \"simd\")\n        elif self.compile_mode == \"unstructured_in_simt\":\n            # For historical compatibility reasons, force_simt_template will still be used.\n            object.__setattr__(self, \"force_simt_template\", True)\n        elif self.compile_mode == \"simt_only\":\n            object.__setattr__(self, \"force_simt_only\", True)\n            object.__setattr__(self, \"parallel_mode\", \"simt\")\n\n        if self.force_simt_only:\n            if self.shared_mem_dynamic_size is None:\n                object.__setattr__(self, \"shared_mem_dynamic_size\", 122880)\n        else:\n            object.__setattr__(self, \"shared_mem_dynamic_size\", 221184)\n\n    def hash(self):\n        key = \"_\".join([f\"{name}-{val}\" for name, val in self.__dict__.items()])\n        return hashlib.sha256(key.encode(\"utf-8\")).hexdigest()",
+      "elide": ["object.__setattr__ 的用法值得讲一句：因为 @dataclass(frozen=True) 冻结了实例，普通赋值会抛异常，__post_init__ 里派生字段必须用 object.__setattr__ 绕过冻结。"]
+    },
+    {
+      "path": "third_party/ascend/backend/compiler.py",
+      "lines": "L925-L931",
+      "code": "    def get_codegen_implementation(self):\n        # Note: a dict of functions is required to generate vendor-specific code piecies\n        #       e.g. convert custom types like fp8e4b15\n        from triton.backends.ascend import _apply_ascend_patch\n        _apply_ascend_patch()\n        codegen_fns = {\"min_dot_size\": min_dot_size(self.target)}\n        return codegen_fns",
+      "elide": ["min_dot_size(L69-70) 目前是占位实现（返回 lambda 恒为 (1,1,1)），可只提一句。本 excerpt 的教学重点是：get_codegen_implementation 是 hacc.target 注入的触发点——它调用 _apply_ascend_patch()。"]
+    },
+    {
+      "path": "third_party/ascend/backend/__init__.py",
+      "lines": "L27-L52",
+      "code": "def _apply_ascend_patch():\n    from triton.compiler.compiler import ASTSource\n\n    if not getattr(ASTSource, \"_ascend_patch_applied\", False):\n        _original_make_ir = ASTSource.make_ir\n\n        def _patched_make_ir(self, options, codegen_fns, module_map, context):\n            \"\"\"\n            Monkey Patch for Ascend:\n            Injects 'hacc.target' attribute into the module after generation.\n            \"\"\"\n            module = _original_make_ir(self, options, codegen_fns, module_map, context)\n\n            if hasattr(options, \"arch\") and options.arch:\n                try:\n                    builder = ascend_ir.ascendnpu_ir_builder(context, options.arch)\n\n                    target_attr_str = f'#hacc.target<\"{options.arch}\">'\n                    module.set_attr(\"hacc.target\", builder.parse_attr(target_attr_str))\n                except Exception as e:\n                    logging.warning(f\"[Ascend Patch] Failed to set hacc.target: {e}\")\n\n            return module\n\n        ASTSource.make_ir = _patched_make_ir\n        ASTSource._ascend_patch_applied = True",
+      "elide": ["幂等守卫（_ascend_patch_applied 标志）保证多次调用只 patch 一次。ascend_ir 来自 from triton._C.libtriton.ascend import ir as ascend_ir（L22）。异常被降级为 warning——注入失败不阻断编译，只是后续 pass 拿不到目标硬件信息。"]
+    },
+    {
+      "path": "third_party/ascend/backend/compiler.py",
+      "lines": "L939-L968",
+      "code": "    def add_stages(self, stages, options):\n        if self.target.backend == \"npu\":\n            stages[\"ttir\"] = lambda src, metadata: make_ttir(src, metadata, options)\n            if options.force_simt_only:\n                stages[\"npubin\"] = (\n                    lambda src, metadata: ttir_to_npubin(\n                        src, metadata, options\n                    )\n                )\n                return\n            stages[\"ttadapter\"] = lambda src, metadata: ttir_to_linalg(\n                src, metadata, options, named_ops=True\n            )\n            if options.compile_on_910_95:\n                stages[\"npubin\"] = (\n                    lambda src, metadata: linalg_to_bin_enable_npu_compile_910_95(\n                        src, metadata, options\n                    )\n                )\n            else:\n                stages[\"npubin\"] = (\n                    lambda src, metadata: linalg_to_bin_enable_npu_compile_A2_A3(\n                        src, metadata, options\n                    )\n                )\n        else:\n            raise NotImplementedError(\n                f\"Backend '{self.target.backend}' is not supported. \"\n                \"Please ensure the target backend is set to 'npu'.\"\n            )",
+      "elide": []
+    },
+    {
+      "path": "third_party/ascend/backend/compiler.py",
+      "lines": "L73-L93",
+      "code": "def make_ttir(mod, metadata, opt):\n    if \"hash\" not in metadata:\n        metadata[\"hash\"] = hashlib.sha256(f\"{mod}-{metadata}\".encode()).hexdigest()\n    # the same optimize pass for triton-ir as all other backends\n    pm = ir.pass_manager(mod.context)\n    pm.enable_debug()\n    passes.common.add_inliner(pm)\n    passes.ttir.add_combine(pm)\n    passes.common.add_canonicalizer(pm)\n    passes.ttir.add_reorder_broadcast(pm)\n    passes.common.add_cse(pm)\n    passes.common.add_licm(pm)\n    passes.common.add_symbol_dce(pm)\n    passes.ttir.add_loop_unroll(pm)\n    pm.run(mod)\n    if opt.debug:\n        dump_manager = get_dump_manager(metadata[\"hash\"])\n        print(f\"Dumping intermediate results to {dump_manager.cache_dir}\")\n        dump_manager.put(str(mod), \"kernel.ttir.mlir\", binary=False)\n\n    return mod",
+      "elide": ["教学点：make_ttir 跑的是与 nvidia/amd 后端完全相同的一组 TTIR 优化 pass（inliner/combine/canonicalizer/reorder_broadcast/cse/licm/symbol_dce/loop_unroll）——这正体现 '编译器前端后端无关'：Triton IR 层的优化是共享的，昇腾的差异从 ttadapter（linalg 下降）才开始。注意 hacc.target 已在此之前由 patched make_ir 注入 module，make_ttir 不碰它。"]
+    },
+    {
+      "path": "third_party/ascend/backend/compiler.py",
+      "lines": "L970-L974",
+      "code": "    @functools.lru_cache()\n    def hash(self):\n        # TODO fetch compiler version\n        version_key = self.target\n        return str(version_key)",
+      "elide": ["与 NPUOptions.hash 区分：AscendBackend.hash 只把 self.target（GPUTarget，即 backend+arch+warp_size）字符串化——这是'后端/目标'维度的缓存键；NPUOptions.hash 是'编译选项'维度的缓存键。二者共同决定最终缓存命中。"]
+    },
+    {
+      "path": "third_party/ascend/unittest/pytest_ut/test_arch.py",
+      "lines": "L35-L53",
+      "code": "class Options:\n    num_warps = 4\n    num_stages = 3\n    num_ctas = 1\n    cluster_dims = (1, 1, 1)\n    enable_fp_fusion = True\n    debug = False\n    arch = \"Ascend950\"\n\n\ndef compile_kernel(kernel, signature, constants):\n    \"\"\"Helper to compile a kernel to MLIR.\"\"\"\n    src = ASTSource(kernel, signature, constants)\n    context = ir.context()\n    ir.load_dialects(context)\n    buffer_ir.load_dialects(context)\n    ascend_ir.load_dialects(context)\n    module = ast_to_ttir(kernel, src, context, Options(), {}, {})\n    return str(module)",
+      "elide": ["test_arch.py 是一个佐证性夹具：它用一个简化的 Options（含 arch='Ascend950'、num_warps/num_stages 等，字段名与 NPUOptions 对齐）直接把 kernel 编到 Triton MLIR（ast_to_ttir），并 load 三套 dialect（ir/buffer_ir/ascend_ir）。它印证了两点：(1) arch 字符串就是 'Ascend950' 这种 DaVinci 型号串；(2) 选项对象承载 num_warps 等字段。它不经 AscendBackend 全链路，故不涉及 bishengir。copy kernel（L56-76）体略。"]
+    }
+  ],
+
+  "key_classes": [
+    {"name": "BaseBackend", "file": "python/triton/backends/compiler.py", "responsibility": "后端无关的编译器契约（ABCMeta 抽象基类）：规定每个后端必须实现 supports_target/hash/parse_options/add_stages/load_dialects/get_module_map。Triton 的通用编译驱动只面向这个接口，不认识具体硬件。"},
+    {"name": "GPUTarget", "file": "python/triton/backends/compiler.py", "responsibility": "frozen dataclass，描述编译目标：backend(如 'npu')、arch(如 'Ascend910B'/'Ascend950')、warp_size。是 supports_target 的判据，也是 AscendBackend.hash 的全部内容。"},
+    {"name": "AscendBackend", "file": "third_party/ascend/backend/compiler.py", "responsibility": "昇腾侧 BaseBackend 实现。supports_target 认领 backend=='npu'；parse_options 把 kwargs 过滤成 NPUOptions；add_stages 注册 ttir/ttadapter/npubin 下降管线；get_codegen_implementation 触发 hacc.target monkey-patch；hash 用 target 参与缓存键。"},
+    {"name": "NPUOptions", "file": "third_party/ascend/backend/compiler.py", "responsibility": "@dataclass(frozen=True)，承载全部昇腾编译选项（num_warps/mix_mode/compile_mode/arch 及 ~60 个 bishengir 开关）。__post_init__ 由 compile_mode 派生 parallel_mode/force_simt_*/shared_mem_dynamic_size；hash() 拼接所有字段做 sha256，是编译选项维度的缓存键。"},
+    {"name": "_apply_ascend_patch", "file": "third_party/ascend/backend/__init__.py", "responsibility": "幂等 monkey-patch：包裹 ASTSource.make_ir，在 AST→Triton IR 生成 module 后读 options.arch，把 #hacc.target<\"arch\"> 解析为 MLIR 属性 set_attr 到 module 上，让后续 pass 知道目标硬件。由 get_codegen_implementation 触发。"},
+    {"name": "AscendAttrsDescriptor", "file": "third_party/ascend/backend/compiler.py", "responsibility": "AttrsDescriptor 子类，经 @register_descriptor 注册进 _descriptor_table；_add_backend_properties 目前留空（昇腾运行期收集 tensor 形状）。说明后端可扩展编译期参数属性的机制。"},
+    {"name": "NPUDriver", "file": "third_party/ascend/backend/driver.py", "responsibility": "DriverBase 实现；get_current_target 造出 GPUTarget(backend='npu', arch, warp_size=0)，arch 来自环境变量或 npu_utils 硬件探测——这是 AscendBackend 被实例化时喂进去的 target 来源。"}
+  ],
+
+  "data_flow": [
+    "0. 装配期：triton/backends/__init__.py:_discover_backends 扫 triton/backends/ 下各子目录（跳过 nvidia/amd），import 每个目录的 compiler.py/driver.py，_find_concrete_subclasses 各取唯一非抽象子类，得到 backends['ascend']=Backend(AscendBackend, NPUDriver)。",
+    "1. 目标解析：NPUDriver.get_current_target() 返回 GPUTarget('npu', arch, 0)，arch 由 get_ascend_arch_from_env() 或 NPUUtils.get_arch() 得到。",
+    "2. 后端实例化：AscendBackend(target) → BaseBackend.__init__ assert supports_target(target)（即 target.backend=='npu'）；设 self.binary_ext='npubin'。",
+    "3. 选项解析：AscendBackend.parse_options(opts) 只取 opts 中命中 NPUOptions 字段名的键，arch 缺省填 self.target.arch，构造 NPUOptions；__post_init__ 依 compile_mode 派生 parallel_mode/force_simt_*/shared_mem_dynamic_size。",
+    "4. codegen 准备 + hacc.target 注入：get_codegen_implementation() 调 _apply_ascend_patch()，把 ASTSource.make_ir 换成 _patched_make_ir。",
+    "5. IR 生成：编译驱动调 ASTSource.make_ir（已被 patch）→ 先原样生成 Triton IR module，再读 options.arch 把 #hacc.target<\"arch\"> set_attr 到 module。",
+    "6. 阶段注册：add_stages(stages, options) 按 options 分支写 stages['ttir']=make_ttir；非 simt 时 stages['ttadapter']=ttir_to_linalg(named_ops=True)；stages['npubin']= (compile_on_910_95 ? linalg_to_bin_enable_npu_compile_910_95 : linalg_to_bin_enable_npu_compile_A2_A3)；force_simt_only 时直接 stages['npubin']=ttir_to_npubin 并 return。",
+    "7. 顺序执行：驱动按插入序跑各 stage，前一 stage 返回 str（IR 文本）喂后一 stage，经 metadata dict 传递副产物（kernel_name/mix_mode/tensor_kinds/hash 等）；最后一个 stage（npubin）返回 bytes = NPU 二进制。",
+    "8. 缓存键：AscendBackend.hash()=str(target) 与 NPUOptions.hash()=sha256(所有字段拼接) 一起决定编译缓存是否命中（选项/目标任一不同即 miss）。"
+  ],
+
+  "design_decisions": [
+    {"decision": "编译器前端后端无关，靠 BaseBackend 抽象契约挂各后端", "why": "Triton 通用编译驱动只依赖 6 个抽象方法，任何硬件（nvidia/amd/ascend）实现该契约即可挂入；昇腾无需改 Triton 核心。make_ttir 甚至跑与其他后端完全相同的 TTIR 优化 pass，差异从 ttadapter 才开始。", "evidence": "python/triton/backends/compiler.py:L249-L290"},
+    {"decision": "后端按目录约定自动发现，每目录恰好一个非抽象 BaseBackend/DriverBase 子类", "why": "免注册表——放对目录、类具体化即被 _discover_backends 装配；0 个或 >1 个具体子类都 raise，强制'一目录一后端'。nvidia/amd 被显式 ignored（不随包发行）。", "evidence": "python/triton/backends/__init__.py:L16-L26, L40-L52"},
+    {"decision": "昇腾管线是 ttir→ttadapter(linalg)→npubin，没有 ttgir", "why": "昇腾不走 TritonGPU IR，而是经 triton_adapter 把 Triton IR 直接下降到 linalg（ttadapter stage），再交 bishengir-compile 出 NPU 二进制。这与 GPU 后端 ttir→ttgir→llir→ptx 的分层不同。（章计划'make_ttgir'措辞有误，见 PLAN_CORRECTIONS。）", "evidence": "third_party/ascend/backend/compiler.py:L939-L963"},
+    {"decision": "add_stages 用闭包+options 分支动态决定 stage 组合", "why": "同一后端按 options 走不同下降路径：force_simt_only 走 ttir 直编 npubin（跳过 linalg）；compile_on_910_95 与否切换两个不同的 linalg_to_bin 实现（910_95 vs A2/A3 硬件代际）。stage 是 lambda 闭包，捕获 options 并经 metadata dict 串接。", "evidence": "third_party/ascend/backend/compiler.py:L941-L963"},
+    {"decision": "hacc.target 用 monkey-patch ASTSource.make_ir 注入，而非新增 stage", "why": "目标硬件属性必须在 module 一生成就挂上，供后续所有 pass 读取；Triton 上游的 make_ir 不认识昇腾，故用幂等 monkey-patch 包裹它，在 module 生成后 set_attr('hacc.target', #hacc.target<\"arch\">)。注入失败降级为 warning 不阻断编译。（章计划'make_ttir/make_ttgir 阶段注入'措辞有误，见 PLAN_CORRECTIONS。）", "evidence": "third_party/ascend/backend/__init__.py:L33-L51"},
+    {"decision": "编译选项做成 frozen dataclass，hash() 拼全部字段", "why": "frozen 保证选项不可变（可安全做缓存键/lru_cache）；hash 把每个字段名-值拼接后 sha256——任一开关不同即换缓存键，杜绝'不同选项复用同一份编译产物'。派生字段用 object.__setattr__ 在 __post_init__ 里绕过冻结写入。", "evidence": "third_party/ascend/backend/compiler.py:L704-L705, L793-L812"},
+    {"decision": "两级缓存键：后端/目标(AscendBackend.hash) + 选项(NPUOptions.hash)", "why": "target 维度（arch/backend）与 options 维度正交，分别参与缓存键，命中要求两者都相同。parse_options 里 arch 从 target 灌进 options，使 arch 变化同时影响两处。", "evidence": "third_party/ascend/backend/compiler.py:L970-L974, L810-L812, L896-L897"},
+    {"decision": "compile_mode 作为高层旋钮派生底层 simt/simd 标志", "why": "用户设一个 compile_mode('simd'/'unstructured_in_simt'/'simt_only')，__post_init__ 自动展开成 parallel_mode/force_simt_only/force_simt_template 及 shared_mem_dynamic_size(122880 vs 221184)，降低误配风险。", "evidence": "third_party/ascend/backend/compiler.py:L793-L808"}
+  ],
+
+  "theory": [
+    "缓存键的正交分解：最终编译缓存键 = f(AscendBackend.hash(), NPUOptions.hash())。前者=str(GPUTarget)=backend+arch+warp_size；后者=sha256(join_{field}(name-val))。命中当且仅当两者都相等。因 parse_options 把 target.arch 复制进 NPUOptions.arch，改 arch 会同时改变两个 hash——arch 是双维度都敏感的量。",
+    "monkey-patch 的幂等性：_apply_ascend_patch 用 ASTSource._ascend_patch_applied 标志确保 make_ir 只被包裹一次。若无守卫，get_codegen_implementation 每次编译都调一遍会导致 _patched_make_ir 层层嵌套（每层再调上一层的 _original_make_ir），既低效又可能重复注入。守卫把它变成'首次生效、后续 no-op'。",
+    "stage 契约的类型约束：add_stages 注册的每个 stage 是 (src, metadata)->str|bytes；除最后一个返回 bytes（可执行二进制）外，其余返回 str（IR 文本）。stage 间唯一通道是可变 metadata dict——例如 make_ttir 往 metadata['hash'] 写值，_parse_linalg_metadata 往里写 kernel_name/mix_mode/tensor_kinds，供后续 stage 与 launcher 消费。"
+  ],
+
+  "subtraction_plan": {
+    "delete": [
+      {"what": "linalg_to_bin_enable_npu_compile_A2_A3(compiler.py:L502-L696) 整个函数体", "why_safe": "它与 linalg_to_bin_enable_npu_compile_910_95 是近重复的两个硬件代际变体（A2/A3 vs 910_95），逐字段拼 bishengir 命令行开关。精简版保留 910_95 一个作代表并在注释标注'另有 A2_A3 变体，仅命令行开关差异'即可，讲后端契约无需两份。属减法：删的是重复实现，非新增。"},
+      {"what": "linalg_to_bin_enable_npu_compile_910_95(compiler.py:L298-L499) 中约 40 段 'metadata[x]; if x is not None: _compile_option_list += [f\"--flag={x}\"]' 的逐开关拼接（L312-L459）", "why_safe": "这些是把 NPUOptions 字段一条条翻译成 bishengir-compile 命令行 flag 的机械管线，与本章主题（插件契约/选项/target 注入）无关。保留函数骨架（_parse_linalg_metadata → 组 cmd_list → subprocess.run → 读 bin_path.read_bytes）与 2~3 个代表性开关，其余整体删并注释'其余 ~40 个 bishengir 开关按同一模式透传'。"},
+      {"what": "__get_metadata_attr_by_callback(compiler.py:L174-L180) 及其在两个 linalg_to_bin 里的 4 次调用（bs_task_type/workspace_size/lock_num/lock_init_val）", "why_safe": "这是编译产物 libkernel.so 回调抽取运行期元数据的细节，属 npubin stage 内部实现，不影响'stage 如何注册/串接'的主线。删调用与函数体，注释一句即可。"},
+      {"what": "ttir_to_linalg(compiler.py:L96-L171) 里 add_auto_scheduling 分支（L122-L130）与逐条 ascend.passes.ttir.add_* pass 调用的完整清单（L118-L164）", "why_safe": "ttadapter stage 内部的 triton_adapter pass 序列是 ch27+ 的题材；本章只需说明'ttadapter 把 Triton IR 经 triton_adapter 下降为 linalg 字符串'。保留函数签名/tempdir 写读/返回 str(mod) 骨架，pass 清单折成一句注释。"},
+      {"what": "ttir_to_npubin(compiler.py:L824-L874) 的 force_simt_only 选项拼接细节（L837-L860）", "why_safe": "force_simt_only 是旁路分支，本章 add_stages 只需点出'simt_only 时 ttir 直编 npubin、跳过 ttadapter'。保留函数存在与 subprocess 骨架，simt 专属 flag 拼接可略。"}
+    ],
+    "must_keep": [
+      {"symbol": "BaseBackend", "why": "后端无关契约的锚，读者须看到 6 个抽象方法才理解'挂进来'是挂进什么。"},
+      {"symbol": "supports_target", "why": "后端认领 target 的判据（target.backend=='npu'），装配与 assert 都靠它。"},
+      {"symbol": "add_stages", "why": "本章核心机制之一：三段下降管线如何注册进 stages dict。"},
+      {"symbol": "parse_options", "why": "本章核心：kwargs→NPUOptions 的过滤与 arch 缺省灌入。"},
+      {"symbol": "NPUOptions", "why": "选项对象本体，frozen dataclass，读者须理解其字段即缓存键的组成。"},
+      {"symbol": "get_codegen_implementation", "why": "hacc.target 注入的触发点，不保留则 target 注入链断。"},
+      {"symbol": "_apply_ascend_patch", "why": "hacc.target 注入机制本体（monkey-patch make_ir），writer 必须讲清。"},
+      {"symbol": "make_ttir", "why": "ttir stage 实现，体现'TTIR 优化 pass 后端共享'的关键论点。"},
+      {"symbol": "get_current_target", "why": "GPUTarget('npu', arch, 0) 的产地，target 从哪来。"},
+      {"symbol": "GPUTarget", "why": "target 数据结构，supports_target 判据 + AscendBackend.hash 内容。"},
+      {"symbol": "_discover_backends", "why": "后端自动发现装配机制，'插件如何被找到'。"},
+      {"symbol": "hash", "why": "两个 hash（AscendBackend.hash 与 NPUOptions.hash）都须保留——两级缓存键的证据。lint 检测符号名。"},
+      {"symbol": "__post_init__", "why": "compile_mode→派生字段的逻辑，frozen dataclass 用 object.__setattr__ 的教学点。"},
+      {"symbol": "ttir_to_linalg", "why": "ttadapter stage 实现存在性须保留（骨架），证明管线中间段真实存在。"},
+      {"symbol": "linalg_to_bin_enable_npu_compile_910_95", "why": "npubin stage 的代表实现须保留骨架（parse→cmd→subprocess→read_bytes），证明最后一段返回 bytes。"}
+    ]
+  },
+
+  "mechanisms": [
+    {"id": "backend-discovery", "name": "后端自动发现与装配（一目录一后端）", "kind": "protocol", "source_anchors": ["python/triton/backends/__init__.py:L35-L55", "python/triton/backends/__init__.py:L16-L26"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "basebackend-contract", "name": "BaseBackend 后端无关契约（6 个抽象方法）", "kind": "protocol", "source_anchors": ["python/triton/backends/compiler.py:L226-L290"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "target-resolution", "name": "GPUTarget 目标解析（backend='npu' + arch）", "kind": "config", "source_anchors": ["third_party/ascend/backend/driver.py:L166-L174", "python/triton/backends/compiler.py:L217-L223"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "parse-options", "name": "parse_options：kwargs 过滤成 NPUOptions", "kind": "config", "source_anchors": ["third_party/ascend/backend/compiler.py:L888-L903"], "needs_figure": false, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "npuoptions-postinit", "name": "NPUOptions.__post_init__：compile_mode 派生 simt/simd 字段", "kind": "config", "source_anchors": ["third_party/ascend/backend/compiler.py:L793-L808"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "npuoptions-hash", "name": "NPUOptions.hash：选项维度缓存键", "kind": "algorithm", "source_anchors": ["third_party/ascend/backend/compiler.py:L810-L812"], "needs_figure": false, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "backend-hash", "name": "AscendBackend.hash：目标维度缓存键 + 两级缓存键正交", "kind": "algorithm", "source_anchors": ["third_party/ascend/backend/compiler.py:L970-L974"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "add-stages-pipeline", "name": "add_stages 注册 ttir→ttadapter→npubin 下降管线", "kind": "dataflow", "source_anchors": ["third_party/ascend/backend/compiler.py:L939-L968"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "stage-metadata-channel", "name": "stage 契约：(src,metadata)->str|bytes，末段返回 bytes，metadata 串接", "kind": "protocol", "source_anchors": ["python/triton/backends/compiler.py:L266-L276", "third_party/ascend/backend/compiler.py:L73-L93"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "ttir-shared-passes", "name": "make_ttir 与其他后端共享的 TTIR 优化 pass", "kind": "dataflow", "source_anchors": ["third_party/ascend/backend/compiler.py:L73-L93"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "hacc-target-injection", "name": "hacc.target 注入：monkey-patch ASTSource.make_ir", "kind": "protocol", "source_anchors": ["third_party/ascend/backend/__init__.py:L27-L52", "third_party/ascend/backend/compiler.py:L925-L931"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"}
+  ],
+
+  "foreshadow_due": {"埋伏笔": [], "回收": []}
+}
