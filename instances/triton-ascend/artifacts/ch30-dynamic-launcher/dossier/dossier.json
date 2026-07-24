@@ -1,0 +1,198 @@
+{
+  "chapter": "ch30",
+  "title": "动态生成的发射器——编译链的最后一环",
+  "one_liner": "kernel 二进制已装上设备(ch29)后，每次真正『发射』一个 kernel 时发生什么：driver.py 用 Python f-string 现拼出一段约 560 行的 C++ wrapper 源码、即时编译成 .so 再 dlopen，拿到可调用的 launch；昇腾发射器比基座 GPU 厚，多出 workspace/syncBlockLock 每次现分配、msprof 剖析、taskqueue 异步派发三样。",
+  "code_spine": [
+    "third_party/ascend/backend/driver.py:L104-L142  (NPULauncher：构造期生成+编译 wrapper，__call__ 每次发射入口)",
+    "third_party/ascend/backend/driver.py:L403-L523  (generate_npu_wrapper_src：解析 metadata/signature，内嵌 _ty_to_cpp/_format_of/_format_of_msprof_task_type_ratio 等 helper，拼 format 串与 arg_decls)",
+    "third_party/ascend/backend/driver.py:L589-L731  (msprof 剖析片段：extern 声明/ProfCtrlHandle 回调/发射前后计时与 tensor 上报)",
+    "third_party/ascend/backend/driver.py:L733-L744  (cpp_kernel_launch：rtKernelLaunch 基础发射 / rtKernelLaunchWithFlagV2 带 cfgInfo 变体)",
+    "third_party/ascend/backend/driver.py:L764-L843  (_launch C++ 函数体：pre_launch → workspace/syncBlockLock 现分配 → 打包 packed args struct → 发射 → taskqueue async_launch 或同步)",
+    "third_party/ascend/backend/driver.py:L846-L965  (launch PyObject 入口：PyArg_ParseTuple 按 format 解包 → getPointer 解 tensor → 调 _launch；PyInit 注册 MsprofRegisterCallback)",
+    "third_party/ascend/backend/driver.py:L244-L288  (make_npu_launcher_stub：wrapper 源码→sha256 缓存 .so→_build_npu_ext 编译)",
+    "third_party/ascend/backend/backend_register.py:L276-L336  (torch_npu/mindspore 双后端：header_file/allocate_memory/allocate_sync_block_lock/pre_launch/async_launch 各出一段 C++ 文本)"
+  ],
+  "embed_excerpts": [
+    {
+      "path": "third_party/ascend/backend/driver.py",
+      "lines": "L104-L142",
+      "code": "class NPULauncher(object):\n    def __init__(self, src, metadata):\n        self.compile_only = os.getenv(\"TRITON_COMPILE_ONLY\", 'false').lower() in ('true', '1')\n        self.enable_msprof_register_tensor = os.getenv(\"TRITON_REGISTER_TENSOR_MSPROF\", 'false').lower() in ('true', '1')\n        debug_mode = metadata.debug\n        header_src = generate_npu_header_src()\n        constants = src.constants if hasattr(src, \"constants\") else dict()\n        cst_key = lambda i: src.fn.arg_names.index(i) if isinstance(i, str) else i\n        constants = {cst_key(key): value for key, value in constants.items()}\n        signature = {cst_key(key): value for key, value in src.signature.items()}\n        wrapper_src = generate_npu_wrapper_src(constants, signature, metadata)\n        so_launcher_path = make_npu_launcher_stub(header_src, wrapper_src, metadata.debug)\n        # setup for remote run\n        # TODO: use a var to pack all vars required to run on a remote machine\n        self.mix_mode = metadata.mix_mode\n        self.shared = metadata.shared\n        # initialize launcher\n        import importlib.util\n        spec = importlib.util.spec_from_file_location(\"__triton_launcher\", so_launcher_path)\n        mod = importlib.util.module_from_spec(spec)\n        spec.loader.exec_module(mod)\n        self.launch = getattr(mod, \"launch\")\n\n    def __call__(self, *args, **kwargs):\n        if self.compile_only:\n            cache_manager = get_cache_manager(args[5]['hash'])\n            print(\"[INFO]: skip running kernel\")\n            print(f\"[INFO]: The compiled kernel cache is in {cache_manager.cache_dir}\")\n        if self.enable_msprof_register_tensor:\n            tensor_params_shape = get_backend_func(\"get_tensor_params_shape\", *args)\n            # args[5] must be the packed metadata.\n            # Check the launch wrapper in which PyArg_ParseTuple specifies the ordering of args\n            args[5]['tensor_params_shape'] = tensor_params_shape\n        else:\n            if self.compile_only:\n                return\n            profiler_registered = self.launch(*args, **kwargs)\n            import triton\n            triton.backends.ascend.utils.TRITON_PROFILER_REGISTERED = True if profiler_registered == 1 else False",
+      "elide": ["构造函数里 self.mix_mode/self.shared 只是为远程运行预留的字段（注释 TODO 已言明），本章不展开远程执行路径。"]
+    },
+    {
+      "path": "third_party/ascend/backend/driver.py",
+      "lines": "L402-L416",
+      "code": "# the template is from triton-adapter HEAD. Wrapping the generated kernel binary into a python module\ndef generate_npu_wrapper_src(constants, signature, metadata):\n    import os\n    workspace_size = int(metadata.workspace_size) \\\n                          if hasattr(metadata, 'workspace_size') else -1\n    lock_init_value = int(metadata.lock_init_value) \\\n                          if hasattr(metadata, 'lock_init_value') else 0\n    lock_num = int(metadata.lock_num) \\\n                          if hasattr(metadata, 'lock_num') else -1\n    bs_task_type = metadata.bs_task_type if hasattr(metadata, 'bs_task_type') else 0\n    mix_mode = metadata.mix_mode\n    compile_on_910_95 = metadata.compile_on_910_95\n    parallel_mode = metadata.parallel_mode\n    enable_simt = (\"simt\" in parallel_mode) or metadata.force_simt_only",
+      "elide": ["metadata 各字段来自 ch28/ch29 编译期落定的 kernel metadata；workspace_size/lock_num 缺省 -1 表示本 kernel 无 workspace/无同步锁。"]
+    },
+    {
+      "path": "third_party/ascend/backend/driver.py",
+      "lines": "L493-L503",
+      "code": "    arg_decls = ', '.join(f\"{_ty_to_cpp(ty)} arg{i}\" for i, ty in signature.items())\n    \"\"\"\n    args:\n        int gridX, gridY, gridZ;\n        rtStream_t stream;\n        const void *functon;\n        PyObject* packed_metadata, *launch_metadata;\n        PyObject* launch_enter_hook, *launch_exit_hook;\n        *args_expand\n    \"\"\"\n    format = \"iiiKKOOOO\" + ''.join([_format_of(_extracted_ty(ty)) for ty in signature.values()])",
+      "elide": ["_ty_to_cpp/_extracted_ty/_format_of 三张类型映射表（L417-473）把 Triton 签名类型逐一翻成 C++ 类型与 PyArg_ParseTuple 的格式字符——正文引其中几行即可，无需全表。"]
+    },
+    {
+      "path": "third_party/ascend/backend/driver.py",
+      "lines": "L764-L776",
+      "code": "static void _launch(const char* kernelName, const void* func, rtStream_t stream, int gridX, int gridY, int gridZ, std::vector<std::vector<int64_t>> &tensorShapes, std::vector<int> &tensorKinds{', ' + arg_decls if len(signature) > 0 else ''}) {{\n  // only 1D parallelization is supported for NPU\n  // Pointer type becomes flattend 1-D Memref tuple: base_ptr, data_ptr, offset, shape, stride\n  // base_ptr offset shape and stride are not used, arbitrarily set for now\n  std::string name = \"\";\n  name.append(kernelName);\n  void *workspace_addr_ptr = NULL;\n  uint32_t blockNum4Workspace = gridX * gridY * gridZ;\n  {get_backend_func(\"pre_launch\", True)}\n  {f'''\n  uint64_t totalWorkSpaceSize = {workspace_size} * blockNum4Workspace;\n  {get_backend_func(\"allocate_memory\", \"totalWorkSpaceSize\", \"stream\")}\n  ''' if workspace_size > 0 else ''}",
+      "elide": ["注意这是一段 Python f-string 拼出的 C++ 文本：双花括号 {{ }} 是转义后的字面花括号，单花括号 { } 是 Python 求值点。totalWorkSpaceSize = workspace_size × 本次 grid 的总 block 数，即按本次发射的 grid 现算现开。"]
+    },
+    {
+      "path": "third_party/ascend/backend/driver.py",
+      "lines": "L797-L816",
+      "code": "    // stub argument for workspace\n    void *syncBlockLock_ptr = NULL;\n    uint16_t ModuleId = 0;\n    {f'''\n    uint64_t syncBlockLockSize = {lock_num} * sizeof(int64_t);\n    {get_backend_func(\"allocate_sync_block_lock\", \"syncBlockLockSize\", \"stream\")}\n    if (!syncBlockLock_ptr) {{\n      {alloc_success_code if enable_taskqueue else sync_lock_fail_code}\n    }}\n    std::vector<int64_t> lockInitData({lock_num}, {lock_init_value});\n    ret = rtMemcpy(\n        syncBlockLock_ptr, syncBlockLockSize,\n        reinterpret_cast<void *>(lockInitData.data()), syncBlockLockSize,\n        RT_MEMCPY_HOST_TO_DEVICE\n    );\n    if (ret != RT_ERROR_NONE) {{\n      return {'ret' if enable_taskqueue else ''};\n    }}\n    ''' if lock_num > 0 else ''}",
+      "elide": ["syncBlockLock 分配后须 rtMemcpy 把 lock_num 个 int64 初值(lock_init_value)拷到设备，作为 block 间同步锁的初始状态。仅当 lock_num > 0 才注入这段。"]
+    },
+    {
+      "path": "third_party/ascend/backend/driver.py",
+      "lines": "L817-L833",
+      "code": "    struct __attribute__((packed)) {{\n      {'void* ffts_addr __attribute__((aligned(8)));' if target_support_ffts else ''}\n      {'void* syncBlockLock __attribute__((aligned(8)));' if not metadata.force_simt_only else ''}\n      {'void* workspace_addr __attribute__((aligned(8)));' if not metadata.force_simt_only else ''}\n      {' '.join(f'{_ty_to_cpp(ty)} arg{i} __attribute__((aligned({4 if ty[0] != \"*\" and ty[-2:] != \"64\" else 8})));' for i, ty in signature.items() if i not in constants)}\n      {' '.join(f'{_ty_to_cpp(ty)} grid{mark} __attribute__((aligned(4)));' for mark, ty in grid_info.items())}\n      {'void* DTData __attribute__((aligned(8)));' if enable_device_print else ''}\n    }} args = {{\n      {'static_cast<void*>(ffts_addr),' if target_support_ffts else ''}\n      {('static_cast<void*>(syncBlockLock_ptr),' if lock_num > 0 else 'nullptr,') if not metadata.force_simt_only else ''}\n      {('static_cast<void*>(workspace_addr_ptr),' if workspace_size > 0 else 'nullptr,') if not metadata.force_simt_only else ''}\n      {(lambda _rt: (', '.join(_rt) + ',') if _rt else '')(\n        [f'static_cast<{_ty_to_cpp(ty)}>(arg{i})' for i, ty in signature.items() if i not in constants]\n      )}\n      {', '.join(f'static_cast<{_ty_to_cpp(ty)}>(grid{mark})' for mark, ty in grid_info.items())}\n      {', static_cast<void*>(DTData)' if enable_device_print else ''}\n    }};",
+      "elide": ["这个 packed struct 就是最终按值传给设备 kernel 的参数块：布局固定为 [ffts?][syncBlockLock?][workspace?][kernel 实参...][gridX,gridY,gridZ][DTData?]，与 AscendNPU-IR 降级出的 kernel 入参约定一一对应。constants（编译期常量）不进 struct。"]
+    },
+    {
+      "path": "third_party/ascend/backend/driver.py",
+      "lines": "L733-L744",
+      "code": "    cpp_kernel_launch = f\"\"\"\n    ret = rtKernelLaunch(func, blockNum, static_cast<void*>(&args), sizeof(args), NULL, stream);\n\"\"\"\n    if compile_on_910_95 and enable_simt:\n        cpp_kernel_launch = f\"\"\"\n    rtArgsEx_t argsInfo = {{}};\n    argsInfo.args = static_cast<void*>(&args);\n    argsInfo.argsSize = sizeof(args);\n    rtTaskCfgInfo_t cfgInfo = {{}};\n    cfgInfo.localMemorySize = {metadata.shared_mem_dynamic_size};\n    ret = rtKernelLaunchWithFlagV2(func, blockNum, &argsInfo, NULL, stream, 0, &cfgInfo);\n\"\"\"",
+      "elide": ["默认走 rtKernelLaunch（func、blockNum、args 指针、args 大小、NULL、stream）。仅 910_95 + SIMT 模式改用 rtKernelLaunchWithFlagV2，多带 rtTaskCfgInfo_t（localMemorySize = 动态共享内存大小）。两者都是 CANN 闭源运行时 API，讲到调用点与参数语义为止。"]
+    },
+    {
+      "path": "third_party/ascend/backend/driver.py",
+      "lines": "L777-L843",
+      "code": "  {'auto launch_call = [=]() -> rtError_t' if enable_taskqueue else ''} {{\n    {get_backend_func(\"pre_launch\", False)}\n    uint32_t blockNum = gridX * gridY * gridZ;\n\n    #ifdef ENABLE_GRID_WARN_PRINT\n      static bool warned = false;\n      if (!warned && blockNum > (uint32_t){num_physical_blocks}) {{\n        printf(\"WARNING: Grid %u > physical limit {num_physical_blocks}, performance maybe reduced.\\\\n\",blockNum);\n        warned = true;\n    }}\n    #endif\n    {'blockNum = std::min(blockNum, (uint32_t)' + str(num_physical_blocks) + ');' if enable_auto_map_parallel_blocks else ''}",
+      "elide": ["enable_taskqueue 为真时，整段发射逻辑被包进一个 [=]()->rtError_t 的 lambda（launch_call），后面交给 async_launch 异步派发；为假时就是裸块，末尾直接 rtStreamSynchronize 同步。中间省略了 msprof 计时、args struct 打包与 rtKernelLaunch 调用（另段单列）。"]
+    },
+    {
+      "path": "third_party/ascend/backend/driver.py",
+      "lines": "L839-L843",
+      "code": "    {'return ret;' if enable_taskqueue else 'ret = rtStreamSynchronize(stream);'}\n   }};\n   {f'''{get_backend_func(\"async_launch\", \"launch_call\") if enable_taskqueue else ''}'''}\n  return;\n}}",
+      "elide": ["taskqueue 开：lambda 末尾 return ret，随后 async_launch(launch_call) 把这个可调用体推入异步任务队列（torch_npu 下经 OpCommand.SetCustomHandler().Run()）。taskqueue 关：同步块末尾直接 rtStreamSynchronize 阻塞等 kernel 完成。"]
+    },
+    {
+      "path": "third_party/ascend/backend/driver.py",
+      "lines": "L876-L895",
+      "code": "static PyObject* launch(PyObject* self, PyObject* args) {{\n  int gridX, gridY, gridZ;\n  rtStream_t stream;\n  const void *function;\n  PyObject *packedMetadata = NULL;\n  PyObject *launch_metadata = NULL;\n  PyObject *launch_enter_hook = NULL;\n  PyObject *launch_exit_hook = NULL;\n  std::vector<std::vector<int64_t>> tensorShapes;\n  {' '.join([f\"{_extracted_ty(ty)} _arg{i}; \" for i, ty in signature.items()])}\n  if(!PyArg_ParseTuple(\n      args, \\\"{format}\\\",\n      &gridX, &gridY, &gridZ, &stream, &function,\n      &packedMetadata, &launch_metadata,\n      &launch_enter_hook, &launch_exit_hook\n      {', ' + ', '.join(f\"&_arg{i}\" for i, ty in signature.items()) if len(signature) > 0 else ''}\n      )\n    ) {{\n    return NULL;\n  }}",
+      "elide": ["launch 是 dlopen 回来的 C 扩展入口（对应 self.launch）：按前面拼好的 format 串 PyArg_ParseTuple 解包 Python 传进来的 (gridX,gridY,gridZ, stream, function, packedMetadata, launch_metadata, launch_enter_hook, launch_exit_hook, *kernel_args)。后续 getPointer 解 tensor 指针、调 _launch（L929-930）本段省略。"]
+    },
+    {
+      "path": "third_party/ascend/backend/driver.py",
+      "lines": "L589-L619",
+      "code": "    cpp_msprof_extern = \"\"\"\nextern \"C\" {\n  typedef int (* callback)(unsigned int type, void* data, unsigned int len);\n  extern int MsprofReportApi(unsigned int  agingFlag, const MsprofApi *api);\n  extern unsigned long int  MsprofSysCycleTime();\n  extern int MsprofRegisterCallback(unsigned int moduleId, callback handle);\n  static unsigned int __MsprofFlagL0  = 0;\n  static unsigned int __MsprofFlagL1  = 0;\n\n  int ProfCtrlHandle(unsigned int CtrlType, void* CtrlData, unsigned int DataLen) {\n    if ((CtrlData == nullptr) || (DataLen == 0U)) {\n      return 1;\n    }\n\n    if (CtrlType == 1) {\n      MsprofCommandHandle* handle = (MsprofCommandHandle *)(CtrlData);\n      if (handle->type >= 6)  // 6 is not used here\n        return 1;\n      if (handle->type == 1) {  // init - 0  , start - 1\n        __MsprofFlagL0 = ((0x00000800ULL & handle->profSwitch) == 0x00000800ULL) ? 1 : 0;\n        __MsprofFlagL1 = ((0x00000002ULL & handle->profSwitch) == 0x00000002ULL) ? 1 : 0;\n      }\n    }\n    return 0;\n  }\n}\n\"\"\"\n\n    cpp_msprof_callback = \"\"\"\n  MsprofRegisterCallback(8, ProfCtrlHandle);      // 8 - CCE defined in msprof headerfile slog.h\n\"\"\"",
+      "elide": ["ProfCtrlHandle 是 profiling 控制回调：CANN 侧打开 msprof 时通过它把 profSwitch 里的 L0/L1 开关位（0x800/0x2）拨进 __MsprofFlagL0/L1 两个静态标志，后续发射前后的计时/上报都以这两个标志为条件。MsprofRegisterCallback(8, ...) 在模块初始化时注册。"]
+    },
+    {
+      "path": "third_party/ascend/backend/driver.py",
+      "lines": "L621-L649",
+      "code": "    cpp_msprof_call_before_launch = \"\"\"\n    unsigned long int beginTime = 0;\n    unsigned long int endTime = 0;\n    unsigned long int opNameHashID = 0;\n    unsigned int threadId = 0;\n    char* _kernelName = const_cast<char*>(name.c_str());\n    size_t length = name.length();\n    if (__MsprofFlagL0 || __MsprofFlagL1)\n    {\n      beginTime = MsprofSysCycleTime();\n    }\n\"\"\"\n\n    cpp_msprof_call_after_launch = f\"\"\"\n    if (__MsprofFlagL0 || __MsprofFlagL1)\n    {{\n      endTime = MsprofSysCycleTime();\n      opNameHashID = MsprofGetHashId(_kernelName, length);\n      threadId = (unsigned int)(syscall(SYS_gettid));\n      MsprofApi info;\n      info.level = MSPROF_REPORT_NODE_LEVEL;\n      info.magicNumber = 0x5a5a;      //MSPROF_REPORT_DATA_MAGIC_NUM\n      info.type = MSPROF_REPORT_NODE_LAUNCH_TYPE;\n      info.threadId = threadId;\n      info.reserve = 0;\n      info.beginTime = beginTime;\n      info.endTime = endTime;\n      info.itemId = opNameHashID;\n      MsprofReportApi(false, &info);\n    }}",
+      "elide": ["发射前记 beginTime（MsprofSysCycleTime），发射后记 endTime 并以 opName 哈希 + 线程 id 组一条 MsprofApi node-launch 记录上报（MsprofReportApi）。L651 起的 __MsprofFlagL1 分支进一步上报 node basic info、mix ctxId 与 tensor shape/dtype（另段），只在 L1 开时执行。"]
+    },
+    {
+      "path": "third_party/ascend/backend/driver.py",
+      "lines": "L244-L288",
+      "code": "def make_npu_launcher_stub(header_src, wrapper_src, debug=False):\n    \"\"\"\n    Generate the launcher stub to launch the kernel\n    \"\"\"\n    enable_precompile = not os.getenv(\"TRITON_DISABLE_PRECOMPILE\", 'false').lower() in ('true', '1')\n    # if precompile header file and its gch file not exist, do precompile\n    header_path = _precompile_npu_ext_with_lock(header_src, enable_precompile)\n    assert header_path is not None, \"the precompiled.h path is empty.\"\n\n    # try to get cached file\n    so_cache_key = hashlib.sha256(wrapper_src.encode(\"utf-8\")).hexdigest()\n    so_cache_manager = get_cache_manager(so_cache_key)\n    # append the cxx11_abi value to the launcher name to avoid\n    # linking to a launcher with wrong cxx11_abi.\n    use_cxx11_abi = _check_cxx11_abi()\n    name = f\"launcher_cxx11abi{use_cxx11_abi}\"\n    suffix = sysconfig.get_config_var('EXT_SUFFIX')\n    so_name = f\"{name}{suffix}\"",
+      "elide": ["debug 分支把 precompiled.h 与 .cxx 源码 dump 出去（L263-269）便于排错。核心：wrapper_src 的 sha256 作缓存键——签名/metadata 相同的 kernel 复用同一个 launcher .so，不重复编译。cache miss 时写临时 .cxx → _build_npu_ext 编译成 .so → 缓存并返回路径。"]
+    },
+    {
+      "path": "third_party/ascend/backend/backend_register.py",
+      "lines": "L285-L336",
+      "code": "@backend_strategy_registry.register(\"torch_npu\", \"header_file\")\ndef header_file(enable_taskqueue):\n    return f'''#include <ATen/ATen.h>\n#include <torch_npu/csrc/core/npu/NPUWorkspaceAllocator.h>\n{'#include <torch_npu/csrc/framework/OpCommand.h>' if {enable_taskqueue} else ''}'''\n\n\n@backend_strategy_registry.register(\"torch_npu\", \"allocate_memory\")\ndef allocate_memory(size, stream):\n    return f\"workspace_addr_ptr = const_cast<void *>(at::empty({size}, at::TensorOptions().device(at::kPrivateUse1).dtype(at::kByte)).storage().data());\"\n\n\n@backend_strategy_registry.register(\"torch_npu\", \"allocate_sync_block_lock\")\ndef allocate_sync_block_lock(size, stream):\n    return f\"syncBlockLock_ptr = const_cast<void *>(at_npu::native::allocate_workspace({size}, {stream}).storage().data());\"\n\n\n@backend_strategy_registry.register(\"torch_npu\", \"pre_launch\")\ndef pre_launch(first_call):\n    return \"\"\n\n\n@backend_strategy_registry.register(\"torch_npu\", \"async_launch\")\ndef async_launch(func):\n    return f'''at_npu::native::OpCommand cmd;\n    cmd.Name(name.c_str()).SetCustomHandler({func}).Run();'''",
+      "elide": ["每个策略同时注册了 mindspore 与 torch_npu 两套实现（本段只列 torch_npu）。get_backend_func 依 TRITON_BACKEND 环境或 import torch_npu 是否成功选后端。torch_npu 下 workspace 用 at::empty(kPrivateUse1) 现开，async_launch 走 OpCommand.SetCustomHandler().Run() 把 lambda 推入 torch_npu 的算子队列。"]
+    }
+  ],
+  "key_classes": [
+    {"name": "NPULauncher", "file": "third_party/ascend/backend/driver.py", "responsibility": "发射器主体。构造期用 generate_npu_header_src + generate_npu_wrapper_src 现拼 C++ 源码、经 make_npu_launcher_stub 编译成 .so 并 dlopen 拿到 self.launch；__call__ 是每次 kernel 调用的 Python 入口，按需注册 msprof tensor 形状、转调 self.launch。"},
+    {"name": "generate_npu_wrapper_src", "file": "third_party/ascend/backend/driver.py", "responsibility": "约 560 行的 C++ wrapper 模板生成器（f-string 拼装）。据 constants/signature/metadata 动态拼出 launch(PyObject) 入口 + _launch 发射体：类型映射、PyArg_ParseTuple 格式串、getPointer、workspace/syncBlockLock 现分配、packed args struct、rtKernelLaunch、msprof 剖析。"},
+    {"name": "make_npu_launcher_stub", "file": "third_party/ascend/backend/driver.py", "responsibility": "把 wrapper 源码编译成 launcher .so 并做 sha256 缓存（签名相同复用），返回 .so 路径供 dlopen。"},
+    {"name": "generate_npu_header_src", "file": "third_party/ascend/backend/driver.py", "responsibility": "生成 wrapper 的公共头（rt.h/acl.h + 按后端注入的 header_file），供预编译头 precompiled.h 使用。"},
+    {"name": "NPUDriver", "file": "third_party/ascend/backend/driver.py", "responsibility": "后端 Driver 落地：把 launcher_cls 定为 NPULauncher，并提供 get_current_target/get_current_device/get_current_stream 等（本章只需知道 launcher_cls = NPULauncher 这个配对点）。"},
+    {"name": "NPUUtils", "file": "third_party/ascend/backend/driver.py", "responsibility": "设备信息与 kernel 二进制装载（ch29）。本章仅用其 get_aicore_num/get_aivector_core_num 供模板算 num_physical_blocks（grid warn / auto-map 上限）。"},
+    {"name": "get_backend_func / backend_strategy_registry", "file": "third_party/ascend/backend/backend_register.py", "responsibility": "torch_npu/mindspore 双后端策略表。模板里 header_file/allocate_memory/allocate_sync_block_lock/pre_launch/async_launch 五个注入点各由所选后端出一段 C++ 文本——workspace/锁分配与异步派发的具体实现按框架不同而不同。"}
+  ],
+  "data_flow": [
+    "编译期(ch28/ch29)落定 metadata（workspace_size/lock_num/mix_mode/parallel_mode/bs_task_type…）与 signature/constants；kernel 二进制已装载拿到 func stub(ch29)。",
+    "首次用到该 kernel：CompiledKernel 构造 NPULauncher(src, metadata) → generate_npu_header_src() 出头 → generate_npu_wrapper_src(constants, signature, metadata) 按本 kernel 现拼 C++ wrapper 源码。",
+    "make_npu_launcher_stub(header_src, wrapper_src)：sha256(wrapper_src) 作缓存键；miss 则 _build_npu_ext 把 .cxx 编成 launcher .so，命中直接取缓存。",
+    "importlib 动态 import 该 .so，getattr(mod, 'launch') 存进 self.launch —— 发射器就绪。",
+    "每次发射：NPULauncher.__call__(*args) —— 若 TRITON_REGISTER_TENSOR_MSPROF 开，先算 tensor_params_shape 塞进 args[5] 元数据；否则调 self.launch(*args) 进入 C 扩展。",
+    "C 扩展 launch()：PyArg_ParseTuple 按 format 解包 grid/stream/function/metadata/hooks/*kernel_args；L1 profiling 开则收集 tensor shape；跑 launch_enter_hook；getPointer 把每个 tensor 参数解成设备指针。",
+    "_launch()：pre_launch(True) → 若 workspace_size>0 按 blockNum4Workspace(=本次 grid 总 block 数) 现分配 totalWorkSpaceSize；进入(可能是 lambda 的)发射块。",
+    "发射块内：pre_launch(False) → 算 blockNum → 若 lock_num>0 现分配 syncBlockLock 并 rtMemcpy 初值 → 打包 packed args struct([ffts?][syncBlockLock?][workspace?][args][grid][DTData?]) → msprof 记 beginTime → rtKernelLaunch / rtKernelLaunchWithFlagV2 派上设备 → msprof 记 endTime 并上报。",
+    "收尾：taskqueue 开则整块作 launch_call lambda 交 async_launch 异步入队(不阻塞)；关则 rtStreamSynchronize 同步等完成。跑 launch_exit_hook，返回 profiler_registered。"
+  ],
+  "design_decisions": [
+    {"decision": "wrapper 用 Python f-string 在运行期现拼 C++ 源码再编译，而非写死一份 .cpp", "why": "kernel 的参数个数/类型、是否要 workspace、锁数量、mix_mode、是否 device_print 各不相同，PyArg_ParseTuple 的 format 串、args struct 布局、类型 cast 都随签名/metadata 变——动态生成才能对每个签名生成最紧凑正确的发射代码；相同签名经 sha256 缓存复用 .so。", "evidence": "third_party/ascend/backend/driver.py:L403-L503, L254"},
+    {"decision": "workspace 与 syncBlockLock 每次发射按本次 grid 现分配，而非静态预留", "why": "总量 = 单 block 用量 × 本次 grid 的总 block 数(blockNum4Workspace = gridX*gridY*gridZ)，grid 每次可变，无法像基座 GPU 那样编译期定死；故 totalWorkSpaceSize 现算、经框架 allocator(at::empty / allocate_workspace)现开。", "evidence": "third_party/ascend/backend/driver.py:L770-L776, L800-L815"},
+    {"decision": "发射走 CANN 运行时 rtKernelLaunch；仅 910_95+SIMT 用 rtKernelLaunchWithFlagV2 带 cfgInfo", "why": "基础派发只需 func/blockNum/args/stream；910_95 的 SIMT 模式需要额外传动态本地内存大小(localMemorySize)，用带 flag 的 V2 变体。", "evidence": "third_party/ascend/backend/driver.py:L733-L744"},
+    {"decision": "taskqueue 异步派发（默认开），把发射逻辑包成 lambda 交后端算子队列", "why": "同步直发每次都要 rtStreamSynchronize 阻塞，overhead 高；异步入队(torch_npu 的 OpCommand / mindspore 的 OpExecutor)让 host 不等 device，贴合框架的算子流水。TRITON_ENABLE_TASKQUEUE 可关。", "evidence": "third_party/ascend/backend/driver.py:L777, L839-L841; backend_register.py:L328-L336"},
+    {"decision": "msprof 剖析钩子内嵌进 wrapper：注册回调 + 发射前后计时 + tensor 上报", "why": "让每次 kernel 发射的耗时/算子名/tensor 形状能被 CANN 的 msprof 采到，做性能剖析；用 __MsprofFlagL0/L1 两级开关按 profSwitch 位控制开销，未开 profiling 时几乎零成本。", "evidence": "third_party/ascend/backend/driver.py:L589-L731, L963"},
+    {"decision": "header_file/allocate_memory/allocate_sync_block_lock/pre_launch/async_launch 五点经 backend_strategy_registry 抽象成 torch_npu/mindspore 双实现", "why": "同一套发射模板要同时支持 PyTorch(torch_npu) 与 MindSpore 两种前端框架，其 workspace 分配、异步派发 API 完全不同；用策略表把差异隔离在这几段 C++ 文本注入点，模板主体不变。", "evidence": "third_party/ascend/backend/backend_register.py:L276-L336; utils.py:L40-L53"}
+  ],
+  "theory": [
+    "workspace 现分配的量化：totalWorkSpaceSize = workspace_size(单 block 字节) × (gridX·gridY·gridZ)。基座 CUDA launcher 无此步——GPU 端 shared/local 由硬件与编译期占用决定；昇腾把每 block 的暂存搬到 HBM 上的 workspace，故须按运行期 grid 现开。",
+    "同步锁 syncBlockLock：lock_num 个 int64（syncBlockLockSize = lock_num × 8 字节），初值 lock_init_value，rtMemcpy 到设备后作为 block 间同步的共享锁数组；仅当 kernel 用到跨 block 同步(lock_num>0)才注入。这是 NPU 上多 block 协作原语的落地。",
+    "packed args struct 的对齐规则：每个非 64 位标量按 4 字节对齐、指针与 64 位标量按 8 字节对齐（__attribute__((aligned(...)))），整体 __attribute__((packed))——必须与 AscendNPU-IR 降级出的 kernel 入参 ABI 逐字段吻合，错位即 wrong result / 崩溃。",
+    "msprof 两级开销模型：__MsprofFlagL0(0x800 位) 只记 node-launch 起止时间；__MsprofFlagL1(0x2 位) 额外记 node basic info + mix ctxId + 每个 tensor 的 shape/dtype/format(ND)。未开时两标志为 0，发射路径上只多两个 if 判空，近零成本。",
+    "对位基座 ch37(CUDA launcher)：基座 make_launcher 同样动态生成 C 扩展、PyArg 解析、getPointer、cuLaunchKernel[Ex]；昇腾在此之上多出三样——① workspace/syncBlockLock 每次现分配(基座无)②taskqueue 异步入队(基座直调 cuLaunchKernel)③msprof 剖析钩子内嵌(基座无)。这三样正是本章相对基座的 divergence。"
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {"what": "generate_npu_wrapper_src 中 enable_device_print / DebugTunnel 相关分支（L510-511, L753, L793, L823, L832, L836-837）与 extract_device_print_code_from_cann（L291-356）", "why_safe": "device print 是可选调试特性(默认关)，非主发射路径；讲清默认路径即可，注明这是 device_print 开关注入的分支。"},
+      {"what": "mindspore 后端那一套 header_file/allocate_memory/... 实现（backend_register.py 的 mindspore 分支）", "why_safe": "torch_npu 与 mindspore 是等价的两套后端实现，讲透 torch_npu 一套即可说明策略表机制，另一套结构同构，正文点到为止。"},
+      {"what": "NPUUtils 的 get_device_properties/get_arch/load_binary 等（L77-101）细节", "why_safe": "属 ch29 kernel 装载/设备信息范畴，本章只借 get_aicore_num/get_aivector_core_num 算 num_physical_blocks，其余引 ch29 即可。"}
+    ],
+    "must_keep": [
+      {"symbol": "NPULauncher", "why": "发射器主类，本章主角。"},
+      {"symbol": "__call__", "why": "每次 kernel 调用的 Python 入口，读者须知发射从这里进。"},
+      {"symbol": "generate_npu_wrapper_src", "why": "560 行 C++ 模板生成器，本章核心机制。"},
+      {"symbol": "make_npu_launcher_stub", "why": "把 wrapper 源码编译成 .so + sha256 缓存，发射器就绪的关键一步。"},
+      {"symbol": "generate_npu_header_src", "why": "wrapper 公共头生成，说明 precompiled.h 由来。"},
+      {"symbol": "rtKernelLaunch", "why": "CANN 基础发射 API，kernel 真正上设备的调用点。"},
+      {"symbol": "rtKernelLaunchWithFlagV2", "why": "910_95+SIMT 的带 cfgInfo 发射变体。"},
+      {"symbol": "_launch", "why": "wrapper 里的 C++ 发射函数体，workspace/锁/args/发射全在其中。"},
+      {"symbol": "launch", "why": "dlopen 回来的 C 扩展入口(self.launch)，PyArg_ParseTuple 解包发生处。"},
+      {"symbol": "PyArg_ParseTuple", "why": "按动态 format 串解包 Python 传进来的 args，读者须理解 format 串怎么来。"},
+      {"symbol": "getPointer", "why": "把 tensor 的 data_ptr 解成设备指针并校验，参数入设备前必经。"},
+      {"symbol": "workspace_addr_ptr", "why": "workspace 现分配的落点变量。"},
+      {"symbol": "blockNum4Workspace", "why": "workspace 现算依据 = 本次 grid 总 block 数，体现『每次现开』。"},
+      {"symbol": "totalWorkSpaceSize", "why": "workspace 总量 = 单 block × grid block 数的量化。"},
+      {"symbol": "syncBlockLock_ptr", "why": "block 间同步锁现分配的落点。"},
+      {"symbol": "lock_num", "why": "同步锁个数，决定是否注入 syncBlockLock 段。"},
+      {"symbol": "workspace_size", "why": "单 block workspace 字节，决定是否注入 workspace 段。"},
+      {"symbol": "enable_taskqueue", "why": "同步直发 vs 异步入队的总开关，控制是否包 lambda。"},
+      {"symbol": "async_launch", "why": "taskqueue 异步派发注入点(OpCommand/OpExecutor)。"},
+      {"symbol": "pre_launch", "why": "发射前设备绑定注入点(mindspore 有实体、torch_npu 为空)。"},
+      {"symbol": "allocate_memory", "why": "workspace 分配的后端实现注入点。"},
+      {"symbol": "allocate_sync_block_lock", "why": "syncBlockLock 分配的后端实现注入点。"},
+      {"symbol": "header_file", "why": "wrapper 头文件的后端实现注入点。"},
+      {"symbol": "get_backend_func", "why": "选 torch_npu/mindspore 后端并取对应 C++ 文本的入口。"},
+      {"symbol": "backend_strategy_registry", "why": "双后端策略表本体。"},
+      {"symbol": "cpp_msprof_extern", "why": "msprof extern 声明 + ProfCtrlHandle 回调，剖析机制根基。"},
+      {"symbol": "MsprofRegisterCallback", "why": "模块初始化时注册 profiling 控制回调。"},
+      {"symbol": "MsprofReportApi", "why": "上报一条 node-launch 记录。"},
+      {"symbol": "ProfCtrlHandle", "why": "把 profSwitch 位拨进 L0/L1 标志的控制回调。"},
+      {"symbol": "__MsprofFlagL0", "why": "L0 profiling 开关(只记起止时间)。"},
+      {"symbol": "__MsprofFlagL1", "why": "L1 profiling 开关(额外记 basic/ctxId/tensor)。"},
+      {"symbol": "_format_of_msprof_task_type_ratio", "why": "据 bs_task_type/mix_mode 定 msprof 上报的 taskType 与 mix block ratio。"},
+      {"symbol": "convert_sigtype_to_int", "why": "把签名类型映射成 msprof tensor dtype 整数码。"},
+      {"symbol": "_get_tensor_shape", "why": "从 PyObject tensor 取 shape 供 L1 tensor 上报。"},
+      {"symbol": "enable_msprof_register_tensor", "why": "__call__ 里是否预先注册 tensor 形状的开关。"},
+      {"symbol": "get_tensor_params_shape", "why": "__call__ 里取各 tensor 形状(按后端)供 msprof。"},
+      {"symbol": "num_physical_blocks", "why": "物理核数上限，grid warn / auto-map block 的依据。"},
+      {"symbol": "launcher_cls", "why": "NPUDriver 把 launcher_cls 定为 NPULauncher 的配对点。"}
+    ]
+  },
+  "mechanisms": [
+    {"id": "m1", "name": "wrapper 源码动态生成：f-string 现拼一段 C++ 发射器", "kind": "algorithm", "source_anchors": ["third_party/ascend/backend/driver.py:L403-L503", "third_party/ascend/backend/driver.py:L750-L843"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m2", "name": "类型映射与 PyArg_ParseTuple format 串生成(_ty_to_cpp/_extracted_ty/_format_of)", "kind": "algorithm", "source_anchors": ["third_party/ascend/backend/driver.py:L417-L473", "third_party/ascend/backend/driver.py:L493-L503", "third_party/ascend/backend/driver.py:L885-L895"], "needs_figure": false, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m3", "name": "launcher 生命周期：构造期生成→编译→sha256 缓存→dlopen→__call__ 转调", "kind": "dataflow", "source_anchors": ["third_party/ascend/backend/driver.py:L104-L142", "third_party/ascend/backend/driver.py:L244-L288"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m4", "name": "workspace 每次按 grid 现分配(totalWorkSpaceSize = workspace_size × blockNum4Workspace)", "kind": "algorithm", "source_anchors": ["third_party/ascend/backend/driver.py:L770-L776", "third_party/ascend/backend/backend_register.py:L298-L300"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m5", "name": "syncBlockLock 现分配 + rtMemcpy 初值(block 间同步锁)", "kind": "algorithm", "source_anchors": ["third_party/ascend/backend/driver.py:L798-L816", "third_party/ascend/backend/backend_register.py:L309-L311"], "needs_figure": false, "needs_worked_example": true, "difficulty": "supporting"},
+    {"id": "m6", "name": "packed args struct 布局与对齐(设备 kernel 入参 ABI)", "kind": "layout", "source_anchors": ["third_party/ascend/backend/driver.py:L817-L833"], "needs_figure": true, "needs_worked_example": true, "difficulty": "core"},
+    {"id": "m7", "name": "rtKernelLaunch / rtKernelLaunchWithFlagV2 发射调用点", "kind": "protocol", "source_anchors": ["third_party/ascend/backend/driver.py:L733-L744"], "needs_figure": false, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m8", "name": "taskqueue 异步派发：发射逻辑包成 lambda 交后端算子队列", "kind": "dataflow", "source_anchors": ["third_party/ascend/backend/driver.py:L777-L778", "third_party/ascend/backend/driver.py:L839-L843", "third_party/ascend/backend/backend_register.py:L328-L336"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m9", "name": "msprof 剖析钩子：回调注册 + 发射前后计时 + tensor 上报(L0/L1 两级)", "kind": "protocol", "source_anchors": ["third_party/ascend/backend/driver.py:L589-L619", "third_party/ascend/backend/driver.py:L621-L731", "third_party/ascend/backend/driver.py:L957-L965"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m10", "name": "torch_npu / mindspore 双后端策略表(五个 C++ 注入点)", "kind": "config", "source_anchors": ["third_party/ascend/backend/backend_register.py:L276-L336", "third_party/ascend/backend/utils.py:L40-L53"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"},
+    {"id": "m11", "name": "launch C 入口全流程：解包→hook→getPointer→_launch→hook", "kind": "dataflow", "source_anchors": ["third_party/ascend/backend/driver.py:L876-L942"], "needs_figure": true, "needs_worked_example": false, "difficulty": "core"},
+    {"id": "m12", "name": "compile_only / register_tensor_msprof 两条 __call__ 旁路", "kind": "config", "source_anchors": ["third_party/ascend/backend/driver.py:L127-L142"], "needs_figure": false, "needs_worked_example": false, "difficulty": "supporting"}
+  ],
+  "foreshadow_due": {"埋伏笔": [], "回收": []}
+}

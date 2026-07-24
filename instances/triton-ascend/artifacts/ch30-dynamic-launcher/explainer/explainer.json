@@ -1,0 +1,251 @@
+{
+  "chapter": "ch30",
+  "title": "动态生成的发射器——编译链的最后一环",
+  "scenario": {
+    "kernel": "add_kernel(x_ptr, y_ptr, out_ptr, n_elements, BLOCK_SIZE: constexpr)",
+    "signature": {"0": "*fp32", "1": "*fp32", "2": "*fp32", "3": "i32"},
+    "constants_for_launcher": {},
+    "metadata": {"workspace_size": 256, "lock_num": 2, "lock_init_value": 0, "force_simt_only": false, "compile_on_910_95": false, "target_support_ffts": false, "enable_device_print": false, "enable_taskqueue": true, "backend": "torch_npu"},
+    "launch_A_grid": [4, 1, 1],
+    "launch_B_grid": [8, 1, 1],
+    "note": "BLOCK_SIZE 为编译期 constexpr,已在编译期折叠、不进 launcher 签名;所有数值为对 generate_npu_wrapper_src 拼装逻辑的手工推演(见 traces/derivation_ch30.md)。"
+  },
+  "mechanisms": [
+    {
+      "mechanism_id": "m1",
+      "name": "wrapper 源码动态生成:f-string 现拼一段 C++ 发射器",
+      "intuition": "像宜家按你这一单的家具清单现打印一份专属安装说明书——螺丝几颗、要不要配某块加固板,都据你这单现列;下次来同款清单,直接复用上次印好的那份说明书,不重印。发射器源码就是这份说明书:据本 kernel 的 metadata 现拼,相同签名复用同一份编译产物。",
+      "worked_example": {
+        "params": {"workspace_size": 256, "lock_num": 2, "enable_taskqueue": true, "target_support_ffts": false, "enable_device_print": false, "compile_on_910_95": false, "signature_len": 4},
+        "trace_source": "manual",
+        "manual_reason": "本章无精简版(skip_impl);发射器 wrapper 依赖 CANN 闭源运行时(rtKernelLaunch/msprof)与昇腾 NPU 设备,host 无 CANN/无 NPU 无法真跑。命中集为对 generate_npu_wrapper_src(driver.py:L403-965)条件注入逻辑的手工推演,每行标 file:Lxxx。",
+        "trace_ref": "traces/derivation_ch30.md",
+        "table": {
+          "columns": ["注入点", "控制条件", "本例取值", "命中?", "源码行"],
+          "rows": [
+            ["workspace 分配段", "workspace_size > 0", "256 > 0", "命中", "driver.py:L773-776"],
+            ["syncBlockLock 段", "lock_num > 0", "2 > 0", "命中", "driver.py:L800-815"],
+            ["发射逻辑包成 lambda(异步)", "enable_taskqueue", "True", "命中", "driver.py:L777,841"],
+            ["ffts_addr 字段/取址", "target_support_ffts", "False", "跳过", "driver.py:L795,818"],
+            ["device_print(DTData)", "enable_device_print", "False", "跳过", "driver.py:L752,823"],
+            ["rtKernelLaunchWithFlagV2 变体", "compile_on_910_95 and enable_simt", "False", "跳过", "driver.py:L736-744"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "同一 (constants, signature, metadata) 拼出的 wrapper 源码逐字节确定 → sha256 相同 → 复用同一个 launcher .so,永不重复编译。",
+        "argument": "wrapper_src 完全由 (constants, signature, metadata) 三个入参决定(generate_npu_wrapper_src 是纯函数,无随机/时间/全局可变输入);相同输入必得逐字节相同的字符串,make_npu_launcher_stub 以 hashlib.sha256(wrapper_src) 为缓存键(driver.py:L253),故相同签名的 kernel 第二次发射直接命中缓存 .so、跳过编译。"
+      },
+      "quantified": "本例 6 个条件注入点命中 3(workspace/syncBlockLock/异步 lambda)、跳过 3(ffts/device_print/V2 发射);模板主体约 560 行 C++(driver.py:L750-965),据 signature=4 参 + workspace_size=256 + lock_num=2 定制出唯一一份。换一个命中集不同的 kernel 就是另一份 .so。",
+      "figure_specs": [
+        {
+          "figure_id": "ch30-m1-inject",
+          "template": "flow",
+          "claim": "同一段 f-string 模板据 metadata 的三个开关现开现关注入点,拼出本 kernel 专属的 C++ 发射器源码。",
+          "numbers": [
+            {"label": "workspace_size", "value": "256", "provenance": "本例 metadata(traces/derivation_ch30.md);注入条件 driver.py:L776"},
+            {"label": "lock_num", "value": "2", "provenance": "本例 metadata;注入条件 driver.py:L815"},
+            {"label": "命中注入点数", "value": "3", "provenance": "traces/derivation_ch30.md m1 表(workspace/lock/lambda)"},
+            {"label": "跳过注入点数", "value": "3", "provenance": "traces/derivation_ch30.md m1 表(ffts/print/V2)"},
+            {"label": "模板行数", "value": "约 560", "provenance": "driver.py:L750-965 return f-string 主体"}
+          ],
+          "caption_draft": "同一段 f-string 模板据 metadata 的 workspace_size/lock_num/enable_taskqueue 现开现关注入点:本例命中 workspace+syncBlockLock+异步 lambda 三段、跳过 ffts/device_print/V2;换个 kernel 命中集不同,故每种签名一份定制 wrapper、以 sha256 缓存复用。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m2",
+      "name": "类型映射与 PyArg_ParseTuple format 串生成",
+      "intuition": "format 串像一张报关格式单:先填 9 个固定栏位(网格 XYZ、流、函数、两份元数据、两个钩子),再按这批货——每个 kernel 参数——一件一栏地续填;海关(PyArg_ParseTuple)照着这串逐栏验货、逐栏落进对应变量,栏数错一位就整批退回(return NULL)。",
+      "worked_example": {
+        "params": {"signature": {"0": "*fp32", "1": "*fp32", "2": "*fp32", "3": "i32"}},
+        "trace_source": "manual",
+        "manual_reason": "无精简版;format 串是 generate_npu_wrapper_src 在 host 端对 signature 做的纯字符串拼装(driver.py:L503),不涉及设备,但本章统一走手工推演口径,逐格式符标出 _extracted_ty/_format_of 的映射行号。",
+        "trace_ref": "traces/derivation_ch30.md",
+        "table": {
+          "columns": ["槽位", "源类型", "_extracted_ty(L438)", "_format_of 格式符(L459)", "累计 format 串"],
+          "rows": [
+            ["定长前缀", "gridXYZ/stream/func/元数据×2/钩子×2", "iii + KK + OOOO", "iiiKKOOOO", "iiiKKOOOO"],
+            ["slot 0", "*fp32", "PyObject*", "O", "iiiKKOOOOO"],
+            ["slot 1", "*fp32", "PyObject*", "O", "iiiKKOOOOOO"],
+            ["slot 2", "*fp32", "PyObject*", "O", "iiiKKOOOOOOO"],
+            ["slot 3", "i32", "int32_t", "i", "iiiKKOOOOOOOi"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "format 串的格式符个数 = 9(定长前缀) + len(signature),且与 launch() 里 PyArg_ParseTuple 的取址参数个数逐一对应,解包不会越界或错位。",
+        "argument": "前缀恒为 'iiiKKOOOO'(driver.py:L503),9 个格式符 ↔ 9 个定长实参(gridX/Y/Z, stream, function, packedMetadata, launch_metadata, enter_hook, exit_hook);此后每个 signature slot 恰好由 _format_of(_extracted_ty(ty)) 追加 1 个格式符(L503),而 launch() 里也恰好对每个 slot 追加 1 个 &_argi 取址(driver.py:L893)——追加是同一个 signature.items() 循环,故格式符数严格等于取址数,PyArg_ParseTuple 一一消费。"
+      },
+      "quantified": "本例 format = 'iiiKKOOOOOOOi',长 13 = 9 + 4;PyArg_ParseTuple 一次解包 13 个参数,其中 4 个是 kernel 实参(3 个 *fp32 用 'O' 收成 PyObject* 再经 getPointer 解指针、1 个 i32 用 'i' 直收)。arg_decls = 'void* arg0, void* arg1, void* arg2, int32_t arg3'。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m4",
+      "name": "workspace 每次按 grid 现分配",
+      "intuition": "摆流水席:这次来 4 桌就摆 4 桌的碗筷,下次来 8 桌就摆 8 桌;碗筷总数按今晚客人数现算现摆,不像固定餐厅那样预留死数量的餐位。昇腾把每个 block 的暂存搬到 HBM 上的 workspace,每次发射按本次 grid 的总 block 数现开。",
+      "worked_example": {
+        "params": {"workspace_size": 256, "launch_A_grid": [4, 1, 1], "launch_B_grid": [8, 1, 1]},
+        "trace_source": "manual",
+        "manual_reason": "无精简版;分配走 torch_npu 的 at::empty(kPrivateUse1)(backend_register.py:L300)需 NPU + CANN,host 无法真跑。totalWorkSpaceSize 为 driver.py:L774 的乘法 workspace_size × blockNum4Workspace 手工代入,blockNum4Workspace 定义见 L771。",
+        "trace_ref": "traces/derivation_ch30.md",
+        "table": {
+          "columns": ["发射", "grid(X,Y,Z)", "blockNum4Workspace = X·Y·Z", "totalWorkSpaceSize = 256 × 上一列(字节)", "是否复用上次"],
+          "rows": [
+            ["A(首发)", "(4,1,1)", "4", "256 × 4 = 1024", "否(进 _launch 先置 NULL, L770)"],
+            ["B(同 kernel 再发)", "(8,1,1)", "8", "256 × 8 = 2048", "否(按本次 grid 重算, L771/L774)"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "totalWorkSpaceSize 随本次 grid 严格随动、每次 _launch 现算现开,不跨调用复用上次分配。",
+        "argument": "每进 _launch 先 `void *workspace_addr_ptr = NULL;`(driver.py:L770),再 `blockNum4Workspace = gridX*gridY*gridZ`(L771)、`totalWorkSpaceSize = workspace_size * blockNum4Workspace`(L774),无任何跨调用缓存变量参与;blockNum4Workspace 关于 grid 每一维单调不减 → totalWorkSpaceSize 关于 grid 单调不减,grid 变大分配必变大。"
+      },
+      "quantified": "本例两次发射 workspace 分别 1024 / 2048 字节,比值 = grid 之比 = 8/4 = 2:1;对位基座 CUDA launcher 此步为 0(GPU 端 shared/local 由硬件与编译期占用定死,不在发射路径现分配)——这是昇腾相对基座多出的第一样。",
+      "figure_specs": [
+        {
+          "figure_id": "ch30-m4-workspace",
+          "template": "state-table",
+          "claim": "同一 kernel 两次发射,workspace 分配量随 grid 从 1024 涨到 2048 字节,每次现算现开、不预留。",
+          "numbers": [
+            {"label": "workspace_size(单 block 字节)", "value": "256", "provenance": "本例 metadata(traces/derivation_ch30.md);量纲见 driver.py:L774"},
+            {"label": "发射 A blockNum4Workspace", "value": "4", "provenance": "grid(4,1,1) 代入 driver.py:L771"},
+            {"label": "发射 A totalWorkSpaceSize", "value": "1024", "provenance": "256×4, driver.py:L774"},
+            {"label": "发射 B blockNum4Workspace", "value": "8", "provenance": "grid(8,1,1) 代入 driver.py:L771"},
+            {"label": "发射 B totalWorkSpaceSize", "value": "2048", "provenance": "256×8, driver.py:L774"}
+          ],
+          "caption_draft": "workspace 不预留:同一 kernel 两次发射,grid 从 (4,1,1) 到 (8,1,1),totalWorkSpaceSize 随之从 1024 涨到 2048 字节(=256×blockNum4Workspace),每次 _launch 现算现开——这是昇腾相对基座 GPU 多出的一步。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m5",
+      "name": "syncBlockLock 现分配 + rtMemcpy 初值",
+      "intuition": "发令枪响前先把 2 条跑道的计时器都归零再发令:block 间同步锁数组进 kernel 前必须写成确定初值(全 0),否则各 block 抢锁时读到设备上一批残留的脏值,同步就乱了。只有用到跨 block 同步的 kernel(lock_num>0)才需要这道工序。",
+      "worked_example": {
+        "params": {"lock_num": 2, "lock_init_value": 0},
+        "trace_source": "manual",
+        "manual_reason": "无精简版;allocate_sync_block_lock 走 at_npu::native::allocate_workspace(backend_register.py:L311)、rtMemcpy 是 CANN 运行时 API,均需 NPU+CANN,host 无法真跑。syncBlockLockSize 为 driver.py:L801 的 lock_num × sizeof(int64_t) 手工代入。",
+        "trace_ref": "traces/derivation_ch30.md",
+        "table": {
+          "columns": ["步", "动作", "关键标量", "判定/返回", "源码行"],
+          "rows": [
+            ["1", "判是否注入 syncBlockLock 段", "lock_num = 2", "2 > 0 → 注入", "driver.py:L815"],
+            ["2", "算锁数组字节数 syncBlockLockSize", "2 × 8 = 16", "16 字节", "driver.py:L801"],
+            ["3", "allocate_sync_block_lock 现开", "syncBlockLock_ptr", "ptr==NULL 则报错早退", "driver.py:L802-805 / backend_register.py:L311"],
+            ["4", "建初值向量 lockInitData(lock_num, lock_init_value)", "{0, 0}", "2 个 int64 全为 0", "driver.py:L806"],
+            ["5", "rtMemcpy 初值 host→device", "16 字节, H2D", "ret!=RT_ERROR_NONE 则早退", "driver.py:L807-814"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "syncBlockLock 仅当 lock_num>0 注入;分配的字节数与 rtMemcpy 拷贝的字节数同为 syncBlockLockSize,锁数组进 kernel 前必被 lock_num 个 lock_init_value 完整初始化,无越界、无未初始化。",
+        "argument": "注入条件是 `... if lock_num > 0 else ''`(driver.py:L815);分配大小 syncBlockLockSize = lock_num × sizeof(int64_t)(L801),rtMemcpy 的 destMax 与 count 两个长度参数都填 syncBlockLockSize(L808),lockInitData 也恰好 lock_num 个元素(L806)——三者字节数一致,故拷贝范围严格等于分配范围,不多不少。"
+      },
+      "quantified": "本例 syncBlockLockSize = 2 × 8 = 16 字节,rtMemcpy 拷 16 字节 host→device、初值全 0;对位基座 CUDA launcher 无此步(GPU 用硬件 barrier/shared 做 block 内同步)——属昇腾多出项的一部分。lock_num 缺省 -1(driver.py:L410) → 无锁 kernel 整段不注入。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m6",
+      "name": "packed args struct 布局与对齐(设备 kernel 入参 ABI)",
+      "intuition": "给设备寄快递前,把所有零件按固定顺序码进一个不留缝隙的盒子(packed):先放同步锁地址、再放暂存区地址、再三个数据指针、最后放长度和网格三维;设备那头按同一张装箱单(AscendNPU-IR 降级出的入参约定)逐格拆——码错一格,拆出来就是错的地址/错的数,直接算错或崩。",
+      "worked_example": {
+        "params": {"signature": {"0": "*fp32", "1": "*fp32", "2": "*fp32", "3": "i32"}, "force_simt_only": false, "target_support_ffts": false, "grid": [4, 1, 1]},
+        "trace_source": "manual",
+        "manual_reason": "无精简版;struct 布局是 generate_npu_wrapper_src 在 host 端拼出的 C++ 文本(driver.py:L817-833),sizeof(args) 由字段宽度相加得(packed 无补齐)。对齐规则取自 L821 `4 if ty[0]!='*' and ty[-2:]!='64' else 8`,逐字段手工代入。",
+        "trace_ref": "traces/derivation_ch30.md",
+        "table": {
+          "columns": ["顺", "字段", "C++ 类型", "对齐(L821)", "宽度(字节)", "累计偏移", "初值来源"],
+          "rows": [
+            ["0", "syncBlockLock", "void*", "8", "8", "0", "syncBlockLock_ptr(lock_num>0, L826)"],
+            ["1", "workspace_addr", "void*", "8", "8", "8", "workspace_addr_ptr(workspace_size>0, L827)"],
+            ["2", "arg0", "void*", "8", "8", "16", "x_ptr 设备指针"],
+            ["3", "arg1", "void*", "8", "8", "24", "y_ptr 设备指针"],
+            ["4", "arg2", "void*", "8", "8", "32", "out_ptr 设备指针"],
+            ["5", "arg3", "int32_t", "4", "4", "40", "n_elements"],
+            ["6", "gridX", "int32_t", "4", "4", "44", "4"],
+            ["7", "gridY", "int32_t", "4", "4", "48", "1"],
+            ["8", "gridZ", "int32_t", "4", "4", "52", "1"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "packed struct 的字段声明顺序 == 初始化列表顺序,constants 不入 struct,argsSize 恒 = sizeof(args) 随字段增减自动;host 侧参数块与设备侧入参 ABI 逐字段吻合。",
+        "argument": "字段声明(driver.py:L818-823)与初值列表(L825-832)是同一批条件、同一个 signature.items() 循环、按同一顺序生成,故第 k 个声明对第 k 个初值;两处都带 `if i not in constants`(L821/L829),编译期常量绝不进 struct;rtKernelLaunch 传的 argsSize 就是 sizeof(args)(driver.py:L734),字段增删时 sizeof 自动变、无手写长度可失配。__attribute__((packed)) 保证无编译器补齐,偏移即宽度前缀和。"
+      },
+      "quantified": "本例 sizeof(args) = 8+8+8+8+8+4+4+4+4 = 56 字节 = 2 个头指针(syncBlockLock+workspace,16) + 3 个 tensor 指针(24) + 1 个 int32 长度(4) + 3 个 grid int32(12);rtKernelLaunch(func, blockNum=4, &args, 56, NULL, stream)(driver.py:L734)。",
+      "figure_specs": [
+        {
+          "figure_id": "ch30-m6-argstruct",
+          "template": "layout",
+          "claim": "打给设备的 packed 参数块共 56 字节,字段顺序与对齐固定,argsSize 与之同源。",
+          "numbers": [
+            {"label": "syncBlockLock/workspace/指针 对齐", "value": "8", "provenance": "driver.py:L821 规则(指针→8)"},
+            {"label": "int32 字段对齐", "value": "4", "provenance": "driver.py:L821 规则(i32:ty[-2:]!='64'→4)"},
+            {"label": "arg3(n_elements) 偏移", "value": "40", "provenance": "traces/derivation_ch30.md m6 表累计偏移"},
+            {"label": "gridX 偏移", "value": "44", "provenance": "traces/derivation_ch30.md m6 表累计偏移"},
+            {"label": "sizeof(args)", "value": "56", "provenance": "字段宽度和(packed),traces/derivation_ch30.md;传入 rtKernelLaunch argsSize driver.py:L734"}
+          ],
+          "caption_draft": "打给设备的 packed 参数块共 56 字节,字段顺序固定为 [syncBlockLock, workspace, arg0..arg2, arg3(n_elements), gridX/Y/Z]:指针与 64 位按 8 对齐、其余按 4;argsSize = sizeof(args) 与该布局同源,错一字节即 wrong result 或崩溃。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m3",
+      "name": "launcher 生命周期:构造期生成→编译→sha256 缓存→dlopen→__call__ 转调",
+      "figure_specs": [
+        {
+          "figure_id": "ch30-m3-lifecycle",
+          "template": "flow",
+          "claim": "发射器一生只编译一次:构造期生成并按 sha256 缓存编译成 .so 再 dlopen,之后每次调用只走 __call__→self.launch。",
+          "numbers": [
+            {"label": "构造期入口", "value": "NPULauncher.__init__", "provenance": "driver.py:L105"},
+            {"label": "现拼 wrapper 源码", "value": "generate_npu_wrapper_src", "provenance": "driver.py:L115(调用)/L403(定义)"},
+            {"label": "编译+缓存键", "value": "sha256(wrapper_src)", "provenance": "driver.py:L253(make_npu_launcher_stub)"},
+            {"label": "dlopen 拿到入口", "value": "self.launch = getattr(mod,'launch')", "provenance": "driver.py:L124-126"},
+            {"label": "每次发射入口", "value": "__call__ → self.launch(*args)", "provenance": "driver.py:L128/L139"}
+          ],
+          "caption_draft": "发射器一生只编译一次:构造期 generate_npu_wrapper_src 现拼源码 → make_npu_launcher_stub 以 wrapper_src 的 sha256 为键查缓存、miss 才编译成 .so → importlib dlopen 拿到 self.launch;之后每次 kernel 调用只走 __call__ → self.launch,不再触碰编译。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m8",
+      "name": "taskqueue 异步派发:发射逻辑包成 lambda 交后端算子队列",
+      "figure_specs": [
+        {
+          "figure_id": "ch30-m8-taskqueue",
+          "template": "before-after",
+          "claim": "enable_taskqueue(默认真) 决定收尾:真则整段发射包成 lambda 异步入队、host 不阻塞;假则末尾 rtStreamSynchronize 同步等完成。",
+          "numbers": [
+            {"label": "enable_taskqueue 默认值", "value": "true", "provenance": "driver.py:L512-513(TRITON_ENABLE_TASKQUEUE 缺省 'true')"},
+            {"label": "异步:包 lambda", "value": "auto launch_call = [=]() -> rtError_t", "provenance": "driver.py:L777"},
+            {"label": "异步:入队", "value": "async_launch(launch_call)", "provenance": "driver.py:L841 / backend_register.py:L333-336"},
+            {"label": "torch_npu 入队实现", "value": "OpCommand.SetCustomHandler().Run()", "provenance": "backend_register.py:L335-336"},
+            {"label": "同步:收尾阻塞", "value": "rtStreamSynchronize(stream)", "provenance": "driver.py:L839"}
+          ],
+          "caption_draft": "enable_taskqueue(默认真) 决定收尾:真则整段发射逻辑包成 [=]()->rtError_t 的 lambda 交 async_launch(torch_npu 走 OpCommand.SetCustomHandler().Run())异步入队、host 不阻塞;假则同步块末尾 rtStreamSynchronize 阻塞等 kernel 完成——这是昇腾相对基座多出的第二样。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m11",
+      "name": "launch C 入口全流程:解包→hook→getPointer→_launch→hook",
+      "figure_specs": [
+        {
+          "figure_id": "ch30-m11-launch-flow",
+          "template": "swimlane",
+          "claim": "launch C 入口一次发射的定序流水:解包→enter hook→解指针→_launch→exit hook→返回。",
+          "numbers": [
+            {"label": "① 按 format 解包", "value": "PyArg_ParseTuple(args, format, ...)", "provenance": "driver.py:L886-895"},
+            {"label": "② 入口钩子", "value": "launch_enter_hook", "provenance": "driver.py:L876-942 区间(dossier m11 锚)"},
+            {"label": "③ tensor 解指针", "value": "getPointer", "provenance": "dossier subtraction_plan.must_keep getPointer;调用于 launch()"},
+            {"label": "④ 转调发射", "value": "_launch(...)", "provenance": "driver.py:L929-930(dossier data_flow)"},
+            {"label": "⑤ 返回", "value": "profiler_registered", "provenance": "driver.py:L139-142(__call__ 收 self.launch 返回)"}
+          ],
+          "caption_draft": "launch C 入口一次发射的定序流水:PyArg_ParseTuple 按 format 解包 (grid, stream, function, metadata, hooks, *kernel_args) → 跑 launch_enter_hook → getPointer 把每个 tensor 解成设备指针 → _launch 派发 → launch_exit_hook → 返回 profiler_registered 给 __call__。"
+        }
+      ]
+    }
+  ]
+}
