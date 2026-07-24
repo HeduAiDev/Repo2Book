@@ -47,12 +47,12 @@
   开始逐章发车。roadmap.py 生成器已建并验（7 Part 窄长条 5.17:1，4 调用/几何/Read-PNG 通过）。
 - 🚗 **施工中（2026-07-24 状态）**：**ch01–ch26 已全部定稿提交并归档**（Part 1/2 完 + Part 3 triton-to-linalg 核心
   + ascend-opt ch15–ch18 + ch19 离散掩码 + **hivm-hfusion ch20-25 六章收官** + **Part 6 后端与运行时开篇 ch26 后端插件**）;ch27–ch33 未开工。
-  **ch27(综合章 f6)、ch28(闭源边界 f7)已交付归档,均 clean run**。
-  **ch29 发车中**（NPU 运行时驱动与二进制装载:NPUDriver/NPUUtils/npu_utils.cpp,skip_impl;slug `ch29-npu-driver-load`,deps ch28）:
-  NPUUtils 编译加载 npu_utils.so(C++ 扩展)→ load_binary→load_kernel_binary 把二进制装上设备;npu_utils.cpp 的 registerKernel
-  用 rtDevBinaryRegister(注册设备二进制)+ rtFunctionRegister(注册 kernel 函数)、aiv/aic magic 区分 vector/cube 核;NPUDriver(DriverBase) 实现 triton 驱动契约。对位基座 ch37(CANN rtDevBinaryRegister vs CUDA cubin 装载)。
-  ⚠️ skip_impl(rt* API 需 CANN 运行时 + NPU 设备);交叉验证靠 driver.py/npu_utils.cpp 逐行核 + pytest_ut。
-  ✅ 近 3 章(ch26/27/28)工作流干净跑完无逃逸;figures.json 归档登记也已稳(ch28 archivist 正确登记 6 图);Lead 后置只补少量可读性/保真微调。
+  **ch27(综合章 f6)、ch28(闭源边界 f7)、ch29(NPU 驱动装载)已交付归档,均 clean run**。
+  **ch30 发车中**（动态生成的发射器:generate_npu_wrapper_src/rtKernelLaunch/taskqueue/msprof,skip_impl;slug `ch30-dynamic-launcher`,deps ch29）:
+  昇腾发射器比基座厚——NPULauncher.__call__ → generate_npu_wrapper_src(~560 行 C++ 模板 f-string)动态生成 wrapper:
+  解析 args/signature、workspace/syncBlockLock 每次现分配、rtKernelLaunch/rtKernelLaunchWithFlagV2 发射、msprof 剖析钩子、taskqueue 异步派发。对位基座 ch37(昇腾多 workspace 现分配 + 异步 taskqueue + msprof)。
+  ⚠️ skip_impl(rtKernelLaunch 需 CANN 运行时 + NPU);交叉验证靠 driver.py 逐行核模板与发射序列。
+  ✅ 近 4 章(ch26-29)工作流干净跑完无逃逸;figures.json 归档登记已稳;Lead 后置只补少量可读性/保真微调(行号/跨书 API 精度/reader 桥句)。
   ⚠️ 逃逸恢复:Review 阶段 API Connection-closed 崩→revise-fig 常改了图脚本没重渲染=陈旧 SVG+假 PASS,Lead 接管重渲染+独立盲审(见 memory revise-fig-stale-render);figures.json 归档易漏登、chNN- slug 前缀必带(见 memory)。
   ⚠️ ch22 曾 Review round1 逃逸(计数陷阱 15→4 Scheduler/未验证子核个数/MixCV 14×14 结构错),Lead 手动接管修复+独立盲审,已归档。
   ⚠️ **发车 slug 必须含 `chNN-` 前缀**(workflow 里 `CH = artifacts/ + A.slug`,slug 直接当目录名):ch23 误传裸 `hivm-dialect`→
