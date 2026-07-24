@@ -62,7 +62,29 @@ class StructuredOutputsParams:
     structural_tag: str | None = None
 ```
 
-六个约束字段各有分工：`json` 给 JSON schema；`regex` 给正则；`choice` 给一组候选字符串，要求输出必须是其中之一；`grammar` 直接给一段 EBNF（扩展巴科斯范式，描述上下文无关文法的标准写法）；`json_object` 只要求「是个 JSON 对象」而不限内部结构；`structural_tag` 则是「只在特定标记之间强制结构」的混合形态（典型用途是工具调用：自由文本里夹一段必须合法的 JSON）。夹在中间的三个 `disable_*` / `whitespace_pattern` 不是约束，是编译开关（比如是否允许任意空白）。
+六个约束字段各有分工：`json` 给 JSON schema；`regex` 给正则；`choice` 给一组候选字符串，要求输出必须是其中之一；`grammar` 直接给一段 EBNF（扩展巴科斯范式，书写上下文无关文法的标准记法——上下文无关文法就是「每条规则左边一个名字、右边一串名字或字面量，名字可以递归引用自己」的那族文法，递归让它写得出任意深度的嵌套，§31.2 见到实物时再逐符号细读）；`json_object` 只要求「是个 JSON 对象」而不限内部结构；`structural_tag` 则是「只在特定标记之间强制结构」的混合形态。夹在中间的三个 `disable_*` / `whitespace_pattern` 不是约束，是编译开关（比如是否允许任意空白）。
+
+前五种都能一句话说清，`structural_tag` 值得单独看个例子——它是六种里唯一「不整段约束」的形态，为 LLM 工具调用（function calling，让模型按约定格式发起函数调用）量身定制。工具调用的真实输出天然是「自由文本夹结构」：模型先解释一句「我来查下天气」，再按厂商约定的标记格式给出调用参数。对这种输出，全文强制 JSON 会杀掉解释性文本，撒手不管则参数 JSON 会写坏——structural_tag 的答案是 **只强制该强制的那几段**。看 vLLM 官方文档里的示例（说明性示例，展示的是用户要传的约束串，不是引擎源码）：
+
+```json
+{
+  "type": "structural_tag",
+  "structures": [{
+    "begin": "<function=get_weather>",
+    "schema": {"type": "object", "properties": {"city": {"type": "string"}}},
+    "end": "</function>"
+  }],
+  "triggers": ["<function="]
+}
+```
+
+四个字段各管一段语义。`triggers`——模型自由输出时，引擎只盯这个前缀，它没出现之前 **什么约束都没有**；`begin`——触发词一出现，接下来必须完整吐出 `<function=get_weather>`；`schema`——begin 与 end 之间那段必须是合法的 `{"city": "..."}` 形状的 JSON；`end`——收尾标签一出，又回到自由文本，直到下一次命中触发词。于是这样一条输出是合法的：
+
+```text
+好的，我来查询。<function=get_weather>{"city": "Beijing"}</function>查询已发出。
+```
+
+前后的中文完全自由，被语法强制的只有标签之间那一段。还有一条隐含约定值得点破：**trigger 必须是 begin 的前缀**。引擎靠它在模型刚吐出 `<function=` 的一瞬就知道该切进哪一组候选标签；多个工具就在 `structures` 里并列多个三元组、共享这一个 trigger，靠 begin 的剩余部分（函数名）分辨这次调的是谁。vLLM 对这串 JSON 不做任何加工，原样透传给默认后端 xgrammar 编译——§31.6 的编译分派里那个按有没有 `"structures"` 字段区分新旧两代格式的分支，接住的就是它（这里的写法是旧一代格式，已被 xgrammar 标为过时但仍被支持；格式演进见 [xgrammar 的 structural tag 文档](https://xgrammar.mlc.ai/docs/api/python/structural_tag.html)）。
 
 这六个字段是**互斥**的，而且互斥由 `__post_init__` 双向把关——多于一个报错，少于一个也报错：
 
@@ -219,9 +241,30 @@ def choice_as_grammar(choice: list[str]) -> str:
 
 不讲清这次改写，读者只看引擎侧的编译代码，会得出一个错误结论：「xgrammar 不支持 choice」。恰恰相反——它支持，只是支持的方式是提前把 choice 变成别的东西。
 
+### 读懂这条 EBNF：从记号到表达力
+
+既然 choice 的归宿是一条 EBNF，就顺手把它逐符号读透——这是本章第一条见到实物的文法，这套记法后面还要反复出现：
+
+```text
+root ::= "red" | "blue"
+```
+
+四个成分。`root` 是 **规则名**（术语叫非终结符）；这里用的方言约定全文法必须有一条名为 `root` 的规则，它就是「整个输出」的定义、语法的起点。`::=` 读作「定义为」。带引号的 `"red"` 是 **终结符**：字面字符串，输出里必须逐字出现。`|` 是「或」，左右任选其一。整条规则连起来读：合法输出恰好是 `red` 或 `blue` 这两个字符串之一，一个字符都不能多——正是 choice 语义的忠实翻译。
+
+记法本身有条承继链：BNF（巴科斯范式）诞生于上世纪五六十年代，为描述 ALGOL（那个年代的一门先驱编程语言）而生，只有「规则定义、竖线选择、递归」三板斧；EBNF 在 1970 年代加入了重复、可选这类正则风格的算子；而默认后端 xgrammar 认的方言叫 **GBNF**（GGML BNF）——llama.cpp 项目 2023 年为约束 LLM 输出定下的 EBNF 变体（规则用 `::=` 定义、以 `root` 为起点），xgrammar 的文法格式明确沿用[这份规范](https://github.com/ggml-org/llama.cpp/blob/master/grammars/README.md)。
+
+文法比正则表达式强在哪，两行就能看清（示意文法，非本章请求实际产生）：
+
+```text
+root ::= "[" [item ("," item)*] "]"
+item ::= "a" | root
+```
+
+`item` 的定义里又引用了 `root`——这种 **自引用（递归）** 正是文法超出正则的地方：它能定义任意深度的嵌套列表（`[a,[a,a],[[a]]]` 都合法），而正则写不出「括号必须配平」。把 root/item 换成 object/value，就是 JSON 文法的骨架。这条表达力分界线值得记住：§31.7 比较四家后端时会看到，有人真支持递归文法，有人把一切化归正则、干脆放弃了递归。
+
 ## 31.3 后端在进引擎之前就选好了
 
-vLLM 支持四个语法后端：**xgrammar**（默认，C++ 实现的语法编译器 + 逐 token 匹配器）、**guidance**（llguidance 库，Rust 实现）、**outlines**（把一切先转成正则再编成 DFA，即确定有限自动机）、**lm-format-enforcer**（下文简称 LMFE，按已生成前缀查允许集，不持状态机）。
+vLLM 支持四个语法后端：**xgrammar**（默认，C++ 实现的语法编译器 + 逐 token 匹配器）、**guidance**（llguidance 库，Rust 实现）、**outlines**（把一切先转成正则再编成 DFA——确定有限自动机，一张「当前状态 × 读到的字符 → 唯一下一状态」的查表机，每读一个字符只花常数时间，读完看停在哪个状态）、**lm-format-enforcer**（下文简称 LMFE，按已生成前缀查允许集，不持状态机）。四家各是什么路数、代价何在、什么时候该选谁，留到 §31.7 专门比对；这里先看 vLLM 怎么在它们之间做选择。
 
 选哪一个，**不在引擎里决定**，而在前端的请求校验期就定死了：入口是 `SamplingParams._validate_structured_outputs`（`vllm/sampling_params.py:L773`），由前端的请求处理器调用。`backend='auto'` 落在这个函数末尾的分支上，是一条「先试最优、失败降级」的阶梯：
 
@@ -296,7 +339,9 @@ def has_xgrammar_unsupported_json_features(schema: dict[str, Any]) -> bool:
         # … 省略：object 的 patternProperties / propertyNames 判断与向下递归，形状同上 …
 ```
 
-**第二，阶梯只有三家。** 降级的两个落点是 guidance（默认）与 outlines（当分词器是非 tekken 的 Mistral，tekken 是 Mistral 较新的一代分词器；或 schema 用了 guidance 啃不动的特性，如按键名正则匹配属性的 `patternProperties`）。**LMFE 从不出现在这条路上**——它只能由用户显式指定。所以「auto 会自动帮我挑最合适的四选一」是错的：自动挑的范围是三选一。
+这张黑名单有它的理论出身。JSON schema 里的 **结构** 约束——对象、数组、任意深度的嵌套——都是文法写得出的；而 `multipleOf`、`uniqueItems` 这类关键字要求「记住并比较任意多的历史值」，越出了上下文无关文法（从而也越出了逐 token 状态机）的表达力。被列进黑名单不是实现没写完，是路线使然。
+
+**第二，阶梯只有三家。** 降级的两个落点是 guidance（默认）与 outlines（当分词器是非 tekken 的 Mistral——tekken 是 Mistral 自 2024 年起换用的新一代分词器，基于 OpenAI 的 tiktoken 分词库训练，取代早年基于谷歌 SentencePiece 分词库的老款，「非 tekken」指的就是老款；或 schema 用了 guidance 啃不动的特性，如按键名正则匹配属性的 `patternProperties`）。**LMFE 从不出现在这条路上**——它只能由用户显式指定。所以「auto 会自动帮我挑最合适的四选一」是错的：自动挑的范围是三选一。
 
 **第三，选择的结果只落成一个字段**：`params._backend`（附带一个 `_backend_was_auto` 记账位，用来区分「用户指定的」和「auto 选出来的」，这样复用同一份 params 时不会误报后端冲突）。引擎侧照单全收，不再做任何选择——下一节那段 `grammar_init` 里，`_backend` 只被读、不被写。
 
@@ -845,6 +890,8 @@ class StructuredOutputBackend(ABC):
 
 数一数：JSON、JSON_OBJECT、GRAMMAR、REGEX、STRUCTURAL_TAG——**五个分支，枚举却有六个成员**。缺的正是 §31.2 讲过的 `CHOICE`：它在校验期就被改写成 EBNF，到这里时面单已经是 `(GRAMMAR, ebnf 串)`，走的是第三个分支。要是真拿 `CHOICE` 调进来，只会掉进 `else` 里报错——而那句 `Validation should have already occurred` 正是在说「能走到这儿的都该是校验过的类型」。
 
+顺带把 STRUCTURAL_TAG 分支也对上号：那个 `"structures" in s_tag` 判断，认的正是 §31.1 里 get_weather 示例那种旧一代格式——拆出每个 begin/schema/end 三元组、连同 triggers 一起交给编译器；不带 `structures` 字段的新一代格式则整串原样透传。两代格式 vLLM 都认，分辨的代价只是一次 `json.loads`。
+
 ![图 31-5：xgrammar 的编译分派只有五条路，CHOICE 在校验期已被改写并入 GRAMMAR 分支](../diagrams/fig-ch31-10-xgrammar-dispatch-five-branches.png)
 
 出口那句同样关键：编译产物 `ctx`（`CompiledGrammar`，编译好的语法，可共享）被包进一个 `GrammarMatcher`（逐 token 走的匹配器，持有状态，逐请求独立）。**回滚深度 `max_rollback_tokens` 直接等于 `num_speculative_tokens`**——为什么是它，下面就讲。
@@ -1012,7 +1059,23 @@ vLLM 这一层的答案是**会**——`_create_grammar` 无条件调用 `backen
 
 ## 31.7 同一份契约，四种活法
 
-契约的价值要靠「换一个实现、上层一行不改」来兑现。四个后端就是四份答卷，差异集中在四个地方：支持哪些约束形态、能不能回滚、终态怎么算、编译在哪里复用。
+契约的价值要靠「换一个实现、上层一行不改」来兑现。四个后端就是四份答卷。落到 vLLM 的代码里，差异集中在四个地方：支持哪些约束形态、能不能回滚、终态怎么算、编译在哪里复用。但在逐个读代码之前，值得先认清四位答卷人——它们的分歧不是实现细节，而是四条对着同一道题的技术路线。
+
+### 四条路线：把计算搬到哪里
+
+这道题是：每生成一个 token，都要对整个词表（十万量级）回答一次「哪些下一 token 合法」——也就是 §31.1 那个 $`A(s)`$ 怎么算得快。四家的答案，本质是 **把这笔计算搬到哪里** 的四种选择：搬去编译期一次算完，还是留在每步运行期现算，以及用哪种机器去算。
+
+**xgrammar：赌「文法会被复用、序列会很长」，把大头搬进编译期。** 它（MLC 团队 2024 年的工作，C++ 实现）把文法编成 **字节级下推自动机**——DFA 加一个栈，栈记得「还欠几个未闭合的括号」，所以递归嵌套不在话下。真正的招数在编译期对词表做的二分：大多数 token 仅凭语法的局部位置就能判定合法与否（论文称之为上下文无关 token），它们被预先算好、存进掩码缓存；剩下少数要看整个栈状态的，才留到运行期用持久化执行栈快速判定。于是每步运行期只剩查表加少量栈操作。代价是编译成了一次性重开销（竞品 llguidance 的博客称这类预计算「有时要数秒甚至数分钟」——留意这是竞争对手的口径），必须靠缓存摊薄——§31.6 那个 `cache_enabled=True` 正为此而设；schema 各不相同的流量则吃不到这份便宜。**同一份 schema 反复来、生成又长的场景选它**；它也是四家里唯一把六种约束形态全接下来的后端。深入读：[xgrammar 论文](https://arxiv.org/abs/2411.15100)。
+
+**guidance：鲜明的反题——不做预计算，每步现算，但算得极快。** vLLM 里实际干活的是 llguidance：微软研究院把 guidance 的引擎用 Rust 重写的产物。路线是编译器教科书里的经典两层——词法在前、句法在后：一个基于正则导数（对正则做「读掉一个字符后还剩什么可匹配」的代数运算，状态用到才构造、从不预先展开全表）的 **惰性词法器** 包办绝大多数判定，Earley 分析器（一种能处理任意上下文无关文法的经典句法解析算法）只在真正需要递归能力的少数场合介入。掩码则是每步现算：沿分词器的字节前缀树（把全部 token 按字节逐层排成一棵树）走一遍，某个字节非法，以它开头的整棵 token 子树一次剪光。官方给的量级是启动平均 2 毫秒、算一个掩码约 50 微秒（128k 词表）——用「每步都真算」换来任意上下文无关文法的表达力加近零启动。反面同样直接：没有编译产物，也就没有可缓存的东西——§31.6 那张复用对照表里它同 schema 次次重编，不是疏忽，是路线的必然。**schema 千变万化、在乎首 token 延迟的流量选它**；2025 年起 OpenAI 的 Structured Outputs 底层用的也是它（据 [llguidance 官方博客](https://guidance-ai.github.io/llguidance/llg-go-brrr)，那也是理解这条路线最好的一手材料）。
+
+**outlines：一切化归正则，正则编成 DFA，每步只剩查表。** 最早把这个问题形式化的就是这条路线（2023 年的 [outlines 论文](https://arxiv.org/abs/2307.09702)）：核心洞见是「文本生成可以重写为有限状态机上的状态转移」。JSON schema 先翻译成正则、choice 拼成交替正则（形如 `(red|blue)`，下面那段源码里就有这一步），正则编成 DFA，再预先为 **每个 DFA 状态** 算出「词表里哪些 token 从这里走得通」、存成索引；生成时带着一个状态号走图，每步查一次表，开销恒定、与词表大小无关。代价落在 §31.2 那条分界线上：化归正则等于放弃真正的递归——DFA 没有栈，数不了「还欠几个未闭合的括号」，任意深度嵌套的 schema 它写不出。**约束本身就是正则或枚举、且会复用的场景是它的主场。**
+
+**LMFE：不编任何自动机，用性能换灵活性。** 它只维护一个字符级解析器（记着已生成前缀走到了哪）加一棵分词器前缀树，每步把「解析器还能接受的字符」与「各 token 的下一个字符」做交集遍历，遍历完即得允许集。没有状态机，每步都是真遍历，性能在四家里垫底；也没有可回滚的状态——上一节它对投机解码直接抛错，根源就在这。换来的是独一份的哲学：**不逼模型走唯一格式**，JSON 的字段顺序、空白、换行都留给模型自己定（[官方 README](https://github.com/noamgat/lm-format-enforcer) 的核心卖点，并称这样更贴近模型的自然分布、有助减少幻觉），还能逐 token 对比「被约束选中的」与「模型本想选的」，帮你诊断约束是否下手过狠。**在乎输出自然度、或需要这份诊断能力时，显式指定它。**
+
+把四家放上时间线，正好是约束解码生态三波演进的缩影：2023 年第一波（guidance、outlines、LMFE，加上 llama.cpp 的文法支持）确立了「逐 token 掩码」这个四家至今共用的原语；2024 年第二波以 xgrammar 为代表，把大头搬进编译期、把每步开销压到近零；2024 到 2025 年第三波又摆了回来——llguidance 以「不做预计算」为反题登场，进入 OpenAI、llama.cpp、vLLM 等一众引擎。vLLM v0.21.0 的 auto 阶梯（§31.3）先试 xgrammar，就是对这张路线图的一次编码：它能力最全、缓存命中后每 token 最省，先试它；啃不动再按条件降级到 guidance 或 outlines；LMFE 永远留给显式指定。
+
+### 回到代码
 
 ![图 31-6：四后端同契约对照，能力矩阵藏在各自的编译分派与实现细节里](../diagrams/fig-ch31-13-four-backend-matrix.png)
 
@@ -1259,5 +1322,5 @@ W \;=\; \left\lceil \frac{|V|}{32} \right\rceil, \qquad
 - **校验期做了两件事，不是一件。** 除了在 xgrammar → guidance / outlines 三家间选后端（LMFE 从不在这条阶梯上），它还会原地改写请求——`choice` 被翻译成 EBNF，所以引擎侧的编译分派只有五个分支而非六个。
 - **命门是异步编译加一道状态门。** 编译扔进半核数的线程池，请求进 `WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR` 阻塞态；调度器每轮只花 100 微秒的预算读一次 `grammar` 属性，就绪则晋级为 `WAITING`。就绪是单调的，因此不存在竞态。
 - **契约切成两层。** 引擎级三方法管编译与掩码分配（重资源共享），请求级六方法管推进与产出（轻状态独立）。真正推进状态机的是调度器用采样出的真 token 调 `accept_tokens`；草稿 token 只配走「不留痕迹」的 `validate_tokens`；`rollback` 是给投机解码留的口子，深度上限就等于每步的草稿数。
-- **四个后端，四种活法。** 能力矩阵写死在各自的编译分派里，回滚能力从「上限等于草稿数」到「干脆拒绝」，终态语义更是四家四说，编译复用也各搞各的——而调度器一行都不用改。
+- **四个后端，四种活法。** 分歧的根子是「把『哪些 token 合法』这笔计算搬到哪里」：xgrammar 搬进编译期（下推自动机 + 预算掩码），guidance 留在运行期每步现算（惰性词法 + Earley），outlines 化归正则预建索引，LMFE 干脆不编自动机、逐步试探。落到代码上：能力矩阵写死在各自的编译分派里，回滚能力从「上限等于草稿数」到「干脆拒绝」，终态语义四家四说，编译复用各搞各的——而调度器一行都不用改。
 - **掩码便宜。** 每 token 一位打进 `int32`，15 万词表下一行约 18.3 KB，是同一行 logits 的三十二分之一。贵的编译扔后台，便宜的填充留热路径。
