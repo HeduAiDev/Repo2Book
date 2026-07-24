@@ -49,11 +49,11 @@
   + ascend-opt ch15–ch18 + ch19 离散掩码 + **hivm-hfusion ch20-25 六章收官** + **Part 6 后端与运行时开篇 ch26 后端插件**）;ch27–ch33 未开工。
   **ch27-ch30 已交付归档,Part 6(ch26-30)后端与运行时收官;全书 30/33**。
   **ch31 已交付归档(双框架注册表,两度逃逸均逃生舱拦截+Lead 接管;联动修 ch29 get_backend_func 勘误);全书 31/33**。
-  **ch32 发车中**（实战收官 capstone:flash-attention 在昇腾的 CV 融合落地,part-7,skip_impl;slug `ch32-capstone-flash-attention`,deps ch25/ch08）——**倒数第二章**:
-  拿 tutorials/06-fused-attention.py(365 行,_attn_fwd_inner QK=tl.dot→cube/softmax→vector/PV 累加 + _attn_fwd 块指针/因果掩码)当活体标本,把前面每层
-  (语言层显式搬运 ch03-08→ttadapter 结构化 ch10-14→核亲和双核 ch16→HFusion 融合 ch21-22→HIVM 下降 ch23-25→AscendC 库调用 ch25)在一个真核上串一遍,看它落成达芬奇 cube/vector CV 融合。对位基座 ch43(到 PTX;此处终点 AscendC)。
-  ⚠️ skip_impl(编译真跑需 CANN/NPU);交叉验证靠 06-fused-attention.py 逐行核 + pytest_ut/test_06_fused_attention.py。
-  剩余最后一章:ch33 能力边界(part-7,deps ch03,unittest 323 .py 揭示支持/未支持谱系)。
+  **ch32 已交付归档(capstone flash-attention);全书 32/33**。
+  **ch33 发车中——全书最后一章**（昇腾 Triton 的能力边界:测试套件揭示的支持/未支持谱系,part-7,skip_impl;slug `ch33-capability-boundary`,deps ch03）:
+  诚实边界章——把 unittest 323 个 .py 当能力谱系文档读:①支持面广(tutorials 01-17 + 语言 op math/reduce/scan/dot/matmul/attention/atomic/block_ptr + 昇腾扩展 compile_hint/sync_block/multibuffer/npu_indexing/fixpipe/paged_kvcache_krope/ascend_barrier);
+  ②诚实未支持(29 文件 skip/xfail:等 TA×13、等 bishengir-compile×9、NPUIR 四月更新回退×5、UB overflow×3、attn_cp 整批跳×3、randomly failed 等)。收官:摊开「昇腾 triton 能/不能做什么、为什么」。对位基座 part-9(度量与实战)。
+  ⚠️ skip_impl(读测试套件、非跑核);交叉验证靠 unittest/pytest_ut 逐一核 skip/xfail 标记与 reason。**这是第 33 章、全书收官——归档后跑 book-retro 复盘 + 连贯性审计。**
   ⚠️ 逃逸恢复:Review 阶段 API Connection-closed 崩→revise-fig 常改了图脚本没重渲染=陈旧 SVG+假 PASS,Lead 接管重渲染+独立盲审(见 memory revise-fig-stale-render);figures.json 归档易漏登、chNN- slug 前缀必带(见 memory)。
   ⚠️ ch22 曾 Review round1 逃逸(计数陷阱 15→4 Scheduler/未验证子核个数/MixCV 14×14 结构错),Lead 手动接管修复+独立盲审,已归档。
   ⚠️ **发车 slug 必须含 `chNN-` 前缀**(workflow 里 `CH = artifacts/ + A.slug`,slug 直接当目录名):ch23 误传裸 `hivm-dialect`→
