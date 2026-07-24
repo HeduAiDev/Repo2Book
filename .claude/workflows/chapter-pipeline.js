@@ -3,6 +3,7 @@ export const meta = {
   description: '单章流水线：档案(真相源)→只做减法实现+测试→真源码解读叙事→多维协作评审→归档（含逃生舱：任一阶段发现路线错可拉闸升级）',
   phases: [
     { title: 'Dossier', detail: 'analyst 深读真实源码产出共享档案，并对抗性自核' },
+    { title: 'Research', detail: 'researcher 刨根问底查透非常识名词/竞争项目/自定义模式/标准记法，产 research/concepts.json 供 writer 深入浅出（无外部 gap 则少产）' },
     { title: 'Implement', detail: 'implementer 产出 subtract-only 精简版 (TDD)' },
     { title: 'Test', detail: 'tester 验证复现 vLLM 行为（反压闸门）' },
     { title: 'Explain', detail: 'explainer 跑精简版取数值轨迹，产教学素材+figure-spec' },
@@ -49,7 +50,7 @@ const CH = REPO + '/instances/' + INST + '/artifacts/' + A.slug
 const HL = A.highlight || A.subsystem || ''
 // 模型分配(spec §7:全流水线 opus/sonnet,不继承主会话模型;args.models 可覆盖)
 const MODELS = Object.assign(
-  { analyst: 'opus', verify: 'opus', implement: 'sonnet', test: 'sonnet', explain: 'opus', illustrate: 'sonnet', blind: 'sonnet', write: 'opus', review: 'sonnet', archive: 'sonnet' },
+  { analyst: 'opus', verify: 'opus', research: 'sonnet', implement: 'sonnet', test: 'sonnet', explain: 'opus', illustrate: 'sonnet', blind: 'sonnet', write: 'opus', review: 'sonnet', archive: 'sonnet' },
   A.models || {})
 const PRIMER = A.kind === 'primer'
 // 2026-07-13 用户定:原理章 writer 能用 fable5 就用 fable5(ch21 对比验证:主线定理/悬崖诊断/事实修正均更优)。args.models.write 可覆盖。
@@ -128,6 +129,25 @@ log('dossier 已通过对抗性核对')
 } else {
   log('复用已人工审核的 dossier，跳过档案阶段')
 }
+
+// ---------- Phase A2: Research（深度研究员，产读者定向背景真相源）----------
+// 用户 2026-07-24 定:介绍初学者不懂的名词/项目自定义模式/竞争性外部项目/标准记法,不能只给
+// 压缩括注,要带充满好奇的专家气质、刨根问底、查透了才讲、深入浅出。researcher 真去 Web 查、
+// 每条给出处,产 research/concepts.json 供 writer 消费——它是**读者定向的外部背景**,与 analyst/
+// explainer 的 pin 源码解读清楚分开。无外部 gap 的章(纯内部机制)如实少产、别硬凑。
+if (!A.skip_research) {
+  phase('Research')
+  const research = await agent(
+    head('researcher') +
+    '任务：为本章做**概念深度研究**，产 ' + CH + '/research/concepts.json（结构见你的契约）。\n' +
+    '读 dossier（尤其 mechanisms/embed_excerpts/glossary_candidates）判断本章会向读者介绍哪些「初学者看描述还是不懂、需例子或背景」的**非常识名词 / 标准记法 / 项目自定义模式 / 竞争性外部项目**；逐一 WebSearch/WebFetch 查透。\n' +
+    '**真去查、每条断言给出处 + 版本/日期**（不靠陈旧记忆）；**只做读者定向的外部/常识背景，不解读本仓 pin 源码**（那是 analyst/explainer 的活）；notation/custom_pattern **必给具体可核的例子**；竞争性外部项目给**各自独特特征 + 何时选它 + 一条权威链接**（点到即止交给链接）。深入浅出、刨根问底；版本敏感的锚定到本章 pin 版本、别写成放之四海皆准。\n' +
+    '本章聚焦真会用到的点，**无外部 gap 就如实少产、别硬凑**（多为纯内部机制、已有 dossier 覆盖的章可能只有 0-2 项）。若无法联网立刻 status=BLOCKED 报告。' + ESC,
+    { schema: STATUS_SCHEMA, label: 'research', phase: 'Research', agentType: 'researcher', model: MODELS.research }
+  )
+  if (!research) return { chapter: A.chapter_id, escalated: 'research-failed', stage: 'Research', note: 'researcher agent 失败（限流/崩溃）——无背景素材,writer 会退回薄括注,不放行' }
+  if (research.status === 'BLOCKED') return { escalated: 'research', stage: 'Research', reason: research.blocker_reason }
+} else { log('skip_research: 本章跳过深度研究（无需外部概念背景）') }
 
 // ---------- Phase B/C: Implement (TDD) + Test，有界回环 ----------
 let ledger = []
@@ -236,6 +256,7 @@ writeV = await agent(
   head('writer') +
   '任务：以**真实目标源码为主线**写 ' + CH + '/narrative/chapter.md（你唯一有权写它）。\n' +
   '读 dossier、implementation、' + REPO + '/instances/' + INST + '/book/bible/voice-guide.md，并跑 `python3 ' + REPO + '/scripts/bible.py due ' + A.chapter_id + '`。\n' +
+  '**若本章有 ' + CH + '/research/concepts.json（深度研究员产出）：介绍任何「初学者看描述还是不懂」的非常识名词/项目自定义模式/竞争性外部项目/标准记法时，把里面查透的背景按各条 writer_note 融进正文——带充满好奇的专家声线、刨根问底、深入浅出（把深的讲得初学者也懂）；notation/custom_pattern 必给具体例子，竞争项目给差异+如何选+链接、点到即止。它是读者定向外部背景，与 pin 源码解读自然分层、例子/记法明标「说明性/外部」（非 `# SOURCE:`）；版本敏感的锚定 pin；每条外部断言按其 confidence 保守写、可溯源。不能只甩术语给薄括注。**\n' +
   '素材已备好：读 ' + CH + '/explainer/explainer.json（数值轨迹/直觉/不变量）与 ' + CH + '/diagrams/（已过盲审的图 + roadmap.png——先 Read 几张 PNG 看图长什么样再落笔）。**怎么讲由你**：结构/顺序/风格/篇幅自由。**必达物要在场**：difficulty=core 机制三层递进（直觉→机制→源码）；explainer 的数值推演表进正文，表格前一行放 `<!-- trace: <mechanism_id> -->` 标记，数字一个不许改（排版随意）；每张仍贴合的已验收图被引用且在其机制讲解附近；开场引用 roadmap.png（开篇「你在这里」窄长条横幅）；**ch01/鸟瞰章**另需 book-map.png（详细全书地图:各 Part×各章+primer 徽标）。**图集由你定**(契约必达物3)：已备图不贴合可 drop、新叙事需要新图就写 ' + CH + '/diagrams/figure-requests.json(add/replace/drop,数字带溯源)，并在返回值 figure_requests 填条数(无变更填 0)——workflow 会派 illustrator 处理后再让你插/删引用；**不许自己画**。\n' +
   (PRIMER ? '本章四段式必达物：动机 → 数学推导（**每个关键公式给论文锚 §/Eq + arXiv id**）→ 小参数数值推演（explainer 素材）→ 落地（vllm_ascend 真实代码锚点 + 链接对应码章）。\n' : '') +
   '正文内嵌**真实源码片段**(裁剪无关分支用 `# … 省略 …`)，逐段解读设计决策。' +

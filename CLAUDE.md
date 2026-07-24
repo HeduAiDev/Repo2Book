@@ -29,11 +29,12 @@
 - **B 只做减法的可运行精简版**：忠实子集，`# SOURCE:`/`# SUBTRACTED:` 全标注。**防过度删减**：只删 dossier `delete` 批准项、`must_keep` 符号必保留（`lint_fidelity` 校验）。
 - **C 自包含、内嵌真源码**：不指望读者开着源码——正文直接内嵌真实源码片段（裁剪无关分支），逐段解读。精简版作"跑起来看数值"的交叉验证，不是主角。
 - **D 素材先行**：图与数值轨迹先于写作、经运行验证产出（explainer.json 素材真相源 + figure-spec）；illustrator 强制"渲染→Read PNG 亲眼看→自查→盲审"；writer 拿素材自由叙事——**写作自由、门禁从严**。
+- **E 概念查透先行（背景真相源）**：介绍初学者不懂的**非常识名词/标准记法/项目自定义模式/竞争性外部项目**，不许只给压缩括注——要带**充满好奇的专家**声线、刨根问底、**深入浅出**：讲清来龙去脉、记法/模式给具体例子、竞争项目给差异+如何选+权威链接。背景由 **researcher** 角色真去 Web 查透产 `research/concepts.json`（带 sources/confidence/writer_note），是 pipeline 的 Research 站产物、writer 消费——它是**读者定向的外部背景**，与 A(pin 源码档案) **自然分层**（例子明标「说明性/外部」、不标 `# SOURCE:`；版本敏感锚定 pin；立场性口径带出处）。首例 = vllm ch31/ch32 结构化输出回修（xgrammar/guidance/outlines 生态、structural_tag/EBNF 给例子）。
 - **每章开场 Roadmap**：复用 `instances/<active>/book/assets/roadmap/roadmap.py` 出"你在这里"图 + 前后衔接。
 
 ## 运转工厂：混合编排（Workflow + 少量持久角色）
 
-- **per-chapter workflow** `.claude/workflows/chapter-pipeline.js`：8 阶段 `Dossier→Implement→Test→Explain→Illustrate→Write→Review→Archive`，含 impl↔test / write↔review 有界回环、多维并行评审、插图盲审门禁(只看 PNG+spec 核论点/数字)、**逃生舱**（任一阶段返回 `status=BLOCKED` → 立即中止升级 Lead）、dossier 对抗性自核。
+- **per-chapter workflow** `.claude/workflows/chapter-pipeline.js`：9 阶段 `Dossier→Research→Implement→Test→Explain→Illustrate→Write→Review→Map→Archive`，含 impl↔test / write↔review 有界回环、多维并行评审、插图盲审门禁(只看 PNG+spec 核论点/数字)、**逃生舱**（任一阶段返回 `status=BLOCKED` → 立即中止升级 Lead）、dossier 对抗性自核、Research 站(researcher 查透非常识概念产背景真相源,`skip_research` 可跳)。
 - **发车**（详见 RUNBOOK）：`Workflow({name:"chapter-pipeline", args:{chapter_id, slug, source_root, focus, highlight, paths}})`。后台跑，完成/逃生舱触发会通知我；可 `/workflows` 看进度、`TaskStop` 急停、`resumeFromRunId` 续跑。
 - **8 角色 = 持久提示词**（`.claude/agents/{analyst,implementer,tester,explainer,illustrator,writer,reviewer,archivist}.md`，已去 vLLM 化、仓库无关），workflow 经 agentType 调用 / 或 agent 自读契约。**持久分两层**：提示词+经验持久（文件），进程按任务 spawn（迭代靠 dossier+ledger+SendMessage 续接）。
 - **存量回修** `.claude/workflows/chapter-retrofit.js`：外科式——逐机制体检(免修早退)→增量素材→补图/换错图→定点 Edit 算法段(禁整章重写)。
