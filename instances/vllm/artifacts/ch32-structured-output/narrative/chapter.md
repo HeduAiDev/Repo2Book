@@ -535,7 +535,7 @@ int32 的 `-1` 补码全是 1 位，也就是**每个 token 都允许** ，等�
 
 `accept_tokens` 是**试探性** 推进。第 $`j`$ 行掩码要回答的是「在已接受 $`d_1 \dots d_{j-1}`$ 的前提下第 $`j`$ 个位置哪些 token 合法」，不真把状态机推过去就取不到正确答案。那个 `assert accepted` 也不多余：草稿已经在 §32.3 被 `validate_tokens` 筛过一遍了，此刻还被拒说明两处判据不一致，属于必须当场暴露的 bug。
 
-`rollback(state_advancements)` 是收尾。这些草稿最终可能被拒，所以填完立刻还原到本步开始处。**注意这里的 rollback 和「草稿被拒所以回滚」不是同一处代码** ——这里是无条件的、试探完就撤；真正按接受结果推进语法的，是下一步 `update_from_output` 里只对被接受的 token 调 `accept_tokens`（[第 31 章](../../ch31-structured-output/narrative/chapter.md)已经讲过那一处）。回滚步数的上界等于 `num_speculative_tokens`，在构造语法对象时就配好了，同样是上一章的内容；顺带一提，这个上界的形态**不能跨后端概括** ：xgrammar 和 outlines 设上界，lm-format-enforcer 干脆拒绝投机解码，guidance 连这个参数都没有、用的是另一套 `rollback_lag` 。
+`rollback(state_advancements)` 是收尾。这些草稿最终可能被拒，所以填完立刻还原到本步开始处。**注意这里的 rollback 和「草稿被拒所以回滚」不是同一处代码** ——这里是无条件的、试探完就撤；真正按接受结果推进语法的，是下一步 `update_from_output` 里只对被接受的 token 调 `accept_tokens`（[第 31 章](../../ch31-structured-output/narrative/chapter.md)已经讲过那一处）。回滚步数的上界等于 `num_speculative_tokens`，在构造语法对象时就配好了，同样是上一章的内容——但这道「上界」要锚定版本读。本章 pin 的 vLLM 确实把这个值传给了 xgrammar 的 `max_rollback_tokens` 构造参数；而据 [xgrammar 官方文档](https://xgrammar.mlc.ai/docs/api/python/grammar_matcher.html)，这个参数在较新版本里已被标为弃用，内部改为总是允许无限回滚——新的 Earley 解析器（一种增量记录所有可能推导路径的上下文无关文法解析算法）让要保存的历史状态大减，上界失去了存在的必要。所以「回滚上界 = 投机步数」只是 pin 版本的接口现状，vLLM 照旧传值更多是历史沿革，别把它读成任何 xgrammar 版本下都生效的硬约束。顺带一提，回滚的形态本来就**不能跨后端概括** ：lm-format-enforcer 干脆拒绝投机解码，guidance 连这个参数都没有、用的是另一套 `rollback_lag` 。
 
 由此得到本节的不变式：**串行分支对每个请求是语法状态的恒等变换** 。取 `state_advancements` 作单调量，它初值为 0、循环内只增不减，循环末尾恰好调一次同额的 `rollback`，净位移为零；`state_advancements` 为 0 时连 `rollback` 都不调，净位移同样为零。
 
@@ -841,6 +841,10 @@ vLLM 用**两道独立的门** 管两件事。第一道管「这一步填不填�
 
 摊平后的整张表异步搬上卡，索引也搬上卡（`pin_memory` 是页锁定内存，让主机到设备的拷贝能真正异步），然后一次 `xgr.apply_token_bitmask_inplace` 收工。如果**所有** logits 行都被覆盖了，连索引都省掉。函数在这里 `return` ——后面还有一段 CPU 后端的兜底分支（老版本 xgrammar 的 CPU kernel 要求 float32），与 GPU 主路径无关。
 
+括号里那句「真正异步」值得刨一下根：为什么钉住内存，拷贝才能异步？操作系统的虚拟内存会把普通（pageable）内存页按需换出，而 GPU 的 DMA（直接内存访问）引擎不能对着一块搬运途中可能被挪走的内存直接取数。所以 CUDA 驱动搬普通内存时，会先把数据拷进自己内部的一块页锁定（page-locked，即 pinned，操作系统保证不换出）暂存区，再从暂存区上卡——凭空多一次隐藏拷贝，主线程还得陪着等。数据一开始就放在页锁定内存里，这道暗手续就免了，`non_blocking=True` 才名副其实：CPU 发完搬运指令立刻返回，拷贝在后台走（[NVIDIA 官方讲解](https://developer.nvidia.com/blog/how-optimize-data-transfers-cuda-cc/)）。不过这枚硬币还有反面——「钉住」这个动作本身并不免费，§32.9 会撞见。
+
+再交代 `xgr.apply_token_bitmask_inplace` 的身份：它是 [xgrammar 官方自带](https://xgrammar.mlc.ai/docs/api/python/bitmask_ops.html)的掩码落地函数——几乎每个接入 xgrammar 的推理引擎都要把「位掩码打进 logits」这段位运算重写一遍，库索性统一提供，内置 cpu、cuda、triton 等多种后端按张量设备自动选；`indices` 参数正是上面 `out_indices` 的去处。「32 个 token 挤一个 int32、位为 0 即屏蔽」的打包格式也是它官方钉死的口径。§32.11 那条 vLLM 自写的 Triton kernel，正是对着这个库函数的语义改编的——只是把行映射做成了自己可控的预分配缓冲。两条路不是平行发明，是同宗。
+
 对照着跑一遍两条路。同一批输入：batch 顺序 `[rB, rA, rC]`，`cu_num_logits` 为 `[0, 1, 4, 5]`（`rA` 带 2 个草稿，占 3 行）：
 
 <!-- trace: m11-legacy-path -->
@@ -950,7 +954,7 @@ def async_copy_to_gpu(
     return out.copy_(x, non_blocking=True)
 ```
 
-注释里那句经验值得记：**高并发下显式 `pin_memory()` 反而会因 CUDA 驱动争用偶发卡顿** ，交给驱动自己处理更稳。注意搬运的目标是 `self.grammar_bitmask` 的前几行——**写进预分配缓冲，不新分配显存** 。
+注释里那句经验值得记：**高并发下显式 `pin_memory()` 反而会因 CUDA 驱动争用偶发卡顿** ，交给驱动自己处理更稳。这就是 §32.8 预告的硬币反面：[PyTorch 官方教程](https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html)实测过方向一致的现象——对一块本来 pageable 的张量先手动 `.pin_memory()` 再搬，可能比直接 `.to(device, non_blocking=True)` 慢约两倍，因为「钉住」这个操作本身在主线程上是同步阻塞的，而驱动反正会在内部做暂存，手动做等于把暗手续搬到明面上多等一次。当然，外部文献佐证的只是「手动 pin 往往不划算」这个方向；「高并发下驱动争用」这个具体归因，是 vLLM 自己的工程观察。注意搬运的目标是 `self.grammar_bitmask` 的前几行——**写进预分配缓冲，不新分配显存** 。
 
 真正精妙的是那两次方向相反的 `wait_stream` 。kernel 启动之前是 `current_stream.wait_stream(self.copy_stream)` ：计算流等拷贝流，保证 kernel 读到的掩码已经就位。kernel 发射之后是 `self.copy_stream.wait_stream(current_stream)`（在下一节那段启动代码的末尾）：拷贝流等计算流，保证这块预分配缓冲**被用完** 之后，下一步才允许覆写或释放它。少了前一次，kernel 读到半旧半新的掩码；少了后一次，下一步的拷贝可能在 kernel 还在读时就把缓冲改了。两次都是必需的，方向相反。
 
@@ -1025,6 +1029,8 @@ def async_copy_to_gpu(
 ## 32.11 V2 路径之三：语法在这里变成一次位运算
 
 直觉：**掩码是一张打孔卡** 。每 32 个 token 挤进一个 int32，打了孔（bit 为 1）的才准通过。kernel 做的事就是把打孔卡抖开成一排 0 和 1，凡是没打孔的位置，往对应的 logit 上盖一个负无穷的戳。
+
+进 kernel 之前补一笔这门语言本身的来历——它在[第 18 章](../../ch18-model-runner/narrative/chapter.md)算 slot_mapping 时已经露过面，这里正好把账补上。Triton 起于 Philippe Tillet 在哈佛读博期间的编译器研究，2019 年以论文《Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations》发表；OpenAI 在其基础上重写，2021 年以 MIT 协议开源。它选的位置在「手写 CUDA」与「只用现成库」之间：前者要自己安排成千上万个线程怎么分组、怎么把数据搬进片上内存、线程间何时同步，能榨出极限性能但门槛高；后者遇到「按位掩码原地改 logits」这种库里没有的算子就没辙。Triton 的交换条件是：你按「每个并行实例处理一块固定大小的数据」来写，线程组织、内存合并这些底层细节全交给编译器，换来接近专家手写的性能，让出的是逐指令的控制权——vLLM 的大量自定义 kernel 选它，赌的就是这笔交换划算。想系统入门可从[官方教程](https://triton-lang.org/main/getting-started/tutorials/01-vector-add.html)的向量加法起步，它用到的 API 与下面这段一一对应。
 
 ```python
 # vllm/v1/worker/gpu/structured_outputs.py:L85-L115

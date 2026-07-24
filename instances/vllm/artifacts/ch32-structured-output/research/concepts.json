@@ -1,0 +1,91 @@
+{
+  "chapter_id": "ch32",
+  "slug": "ch32-structured-output",
+  "produced_by": "researcher",
+  "date": "2026-07-24",
+  "scope_note": "ch32 讲『掩码怎么落到 logits』(worker 侧)。ch31 的 research/concepts.json 已经深挖过四个语法后端生态(xgrammar/guidance-llguidance/outlines/lm-format-enforcer)、structural_tag、EBNF、CFG、DFA、token mask、tekken 分词器——本章不重复,凡涉及后端身份的背景一律回指 ch31 研究。本章只研究 ch31 未覆盖、且本章正文真用到的新缺口:(1) Triton 这门 GPU kernel 语言本身(本章 §32.9-§32.11 是全书第一次深入走读一个真实 Triton kernel,ch18 只是用了 Triton kernel 但未讲它是什么);(2) xgrammar 库自带的 apply_token_bitmask_inplace 函数族与 triton backend——本章 kernel 明确说『改编自』它;(3) 投机解码下语法回滚(rollback)的外部 API 口径,补 ch31 competing_set 里已提但未展开的跨后端差异;(4) pinned memory / CUDA 流重叠——本章两次搬运+双向 wait_stream 的通用背景。四项都真查过官方文档/论文/源码仓库,逐条给出处与访问日期(2026-07-24)。",
+  "concepts": [
+    {
+      "id": "triton-language",
+      "term": "Triton（GPU kernel 编写语言）",
+      "kind": "external_project",
+      "one_line": "OpenAI 发布的 Python 嵌入式 GPU 编程语言：像写 NumPy 一样按『一块数据』（tile）编程，编译器自动搞定线程组织、内存合并、同步这些手写 CUDA 才需要操心的细节。",
+      "what_it_is": "普通人写 GPU 代码要么用现成库（如 xgrammar 自带的 CUDA/CPU 实现），要么手写 CUDA C++——后者要自己管理成千上万个线程怎么分组、怎么从显存搬数据进更快的片上内存、线程间怎么同步，门槛很高。Triton 把编程模型抬高一层：开发者只需要写『每个并行实例（Triton 叫 program）处理一块固定大小的数据（tile/block）』的逻辑——从显存读一块、算一块、写回一块——编译器自己把这套 tile 级代码翻译成高效的底层 GPU 指令（NVIDIA 上是 PTX）。本章 `_apply_grammar_bitmask_kernel` 正是这种写法：`tl.program_id` 认领『这次归我管哪一块』，`tl.load`/`tl.store` 配合 `mask` 参数一次性读写一整块数据并自动挡住越界，`BLOCK_SIZE: tl.constexpr` 告诉编译器这个块大小在编译期就固定，可以据此做向量化优化。",
+      "background": "Triton 最初是 Philippe Tillet 在哈佛读博期间（导师 H.T. Kung、David Cox）的研究项目，2019 年以论文《Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations》发表于 MAPL/PLDI 2019；他 2018 年就在做 CUDA 矩阵乘法自动调优器和 OpenCL 库 ViennaCL，2020 年博士论文主题正是『分块算法在 GPU 上的编译器』。OpenAI 在此基础上重新实现，2021-07-28 以 1.0 版本开源发布（MIT 协议）。它要解决的问题是：手写 CUDA 能榨出最高性能但开发周期长、门槛高；纯用现成库（cuBLAS 等）灵活性差，遇到库里没有的算子（比如本章这种『按位掩码原地改 logits』）就没现成实现。Triton 的定位是中间地带——用 Python 写，接近专家级 CUDA 的性能。它后来被深度集成进 PyTorch 的 `torch.compile`（作为默认 GPU 代码生成后端之一），也被 vLLM、SGLang 等推理框架广泛用来写自定义 kernel（如本章的掩码 kernel、attention kernel 等）。截至本次核实（2026-07-24），项目仍以 OpenAI/Tillet 主导、MIT 协议开源，Meta 等公司也有持续贡献；是否已经或计划转移到更中立的基金会治理，未查到权威定论，写作不宜断言。",
+      "example": "官方教程给出的最小 kernel（向量加法，逐行对应本章 kernel 里同名 API 的通用语义）：\n\n```python\n@triton.jit\ndef add_kernel(x_ptr, y_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):\n    pid = tl.program_id(axis=0)\n    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)\n    mask = offsets < n_elements\n    x = tl.load(x_ptr + offsets, mask=mask)\n    y = tl.load(y_ptr + offsets, mask=mask)\n    tl.store(output_ptr + offsets, x + y, mask=mask)\n\ngrid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )\nadd_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)\n```\n\n逐词对应本章读者已经见过的写法：`tl.program_id(axis=0)`——『我是哪一个并行实例』，本章 kernel 里对应 `bitmask_idx = tl.program_id(0)`（认领哪一行掩码）；`BLOCK_SIZE: tl.constexpr`——块大小编译期常量，本章同名参数语义相同；`mask=` 参数——用一个布尔数组同时表达『越界的位置』或『不该写的位置』，本章 `tl.store(..., mask=bitmask & (block_offset < vocab_size))` 是把『语义上非法』和『物理上越界』两个条件合成一个 mask，是同一个 API 习惯用法的复合形态；`grid = (...)` 决定总共起多少个并行实例，本章是二维 `(num_masks, cdiv(V, BLOCK_SIZE))`——第一维对应上例的 pid，第二维是本章特有的『词表也要分块』。",
+      "links": [
+        "https://triton-lang.org/main/getting-started/tutorials/01-vector-add.html",
+        "https://github.com/triton-lang/triton",
+        "https://pldi19.sigplan.org/details/mapl-2019-papers/1/Triton-An-Intermediate-Language-and-Compiler-for-Tiled-Neural-Network-Computations"
+      ],
+      "sources": [
+        {"url": "https://triton-lang.org/main/getting-started/tutorials/01-vector-add.html", "got": "官方教程逐行示例：@triton.jit、tl.program_id、tl.constexpr 的编译期常量语义、tl.load/tl.store 配 mask、grid 的定义方式", "accessed": "2026-07-24"},
+        {"url": "https://pldi19.sigplan.org/details/mapl-2019-papers/1/Triton-An-Intermediate-Language-and-Compiler-for-Tiled-Neural-Network-Computations", "got": "确认 2019 年 MAPL/PLDI 论文题目与作者（Tillet, Kung, Cox）及会议信息", "accessed": "2026-07-24"},
+        {"url": "https://openai.com/index/triton/", "got": "（经搜索摘要）OpenAI 官方发布博客要点：Python 嵌入式 DSL、目标是不用专家级 CUDA 知识也能写出接近专家级性能的 kernel、FP16 matmul 25 行代码匹配 cuBLAS", "accessed": "2026-07-24"},
+        {"url": "https://aiwiki.ai/wiki/openai_triton", "got": "历史脉络：Tillet 哈佛博士项目起源、2018 年前置工作、2020 年博士论文主题、OpenAI 2021-07-28 以 1.0 版本 MIT 协议开源发布", "accessed": "2026-07-24"}
+      ],
+      "confidence": "high",
+      "confidence_note": "论文与官方教程一手核实；OpenAI 官方发布博客因反爬未能直接抓取全文，改用搜索摘要交叉印证（medium 降档仅限于具体性能倍数如『2x』『25 行』这类营销数字，写作若引用建议模糊化或省略）。当前治理归属（是否仍完全由 OpenAI 主导）未查到 2026 年的权威定论，故背景段落用『据本次核实』限定，不写成绝对现状。",
+      "writer_note": "本章 §32.9-§32.11 已经把这个具体 kernel 逐行讲透（program_id/constexpr/load-store-mask 全部结合真实代码解释过），**不需要再展开 Triton 教程**。这条研究的价值在开篇那句『Triton 是 OpenAI 的 GPU 内核编写语言』——建议在那句括注里补半句『和手写 CUDA 比：不用管线程分组/内存合并这些细节，编译器包了，代价是less可控』，一句话立住『为什么 vLLM 选它写自定义 kernel 而不是纯手写 CUDA』的取舍感；深入交给 links 里的官方教程。"
+    },
+    {
+      "id": "xgrammar-apply-token-bitmask-inplace",
+      "term": "xgr.apply_token_bitmask_inplace（xgrammar 库的掩码落地函数族）",
+      "kind": "external_concept",
+      "one_line": "xgrammar 官方提供的『把一批掩码原地打进一批 logits』的现成函数，自带 cpu/cuda/triton/torch_compile/torch_native 五种后端可选——本章 vLLM 自写的 Triton kernel，就是把这个函数家族里的 triton 分支改写成自己要的调用形态。",
+      "what_it_is": "xgrammar（本章、上一章反复出现的语法后端库）不仅负责『算出哪些 token 合法』，也顺带提供了『把算出来的掩码真正应用到 logits 上』的工具函数，因为几乎每个接入它的推理引擎都要重新实现一遍同样的位运算，索性由库统一提供、按需选后端。函数签名是 `apply_token_bitmask_inplace(logits, bitmask, *, vocab_size=None, indices=None, backend='auto')`：`logits` 和 `bitmask` 形状分别是 `(batch_size, vocab_size)` 和 `(batch_size, ceil(vocab_size/32))`——和本章 §32.2 讲的形状预算完全一致；`indices` 是可选的『只改这几个 batch 下标』的名单，用来支持结构化/非结构化请求混批（本章默认路径 §32.8 的 `out_indices` 正是喂给这个参数的东西）；`backend` 里的 `triton` 官方文档称之为『默认的 CUDA 实现』。位打包格式也是官方钉死的：32 个 token 挤进一个 int32，某一位是 0 表示该 token 被掩掉（对应 logit 会被设为负无穷），是 1 表示放行——这与本章 kernel 里 `((packed_bitmask >> bit) & 1) == 0` 才判『非法』的写法逐位对应。",
+      "background": "本章 dossier 明确说 vLLM 自写的 `_apply_grammar_bitmask_kernel`『改编自 xgrammar 的 Triton 实现』——这不是巧合，而是因为两者要解决的问题完全相同（把紧凑打包的位掩码解包、原地写 -inf），xgrammar 官方仓库本身就维护着一份可选的 Triton 后端实现（据搜索到的 xgrammar 发布记录，其 Triton 路径有过『异步拷贝到设备』『AMD GPU 上 warp_size 修正』等针对性优化提交）。vLLM 没有直接调用这个库函数、而是照着语义重写一份，原因在本章已经讲清楚——新 gpu worker 路径需要把『bitmask 行 → logits 行』的映射以自定义的、跨预分配缓冲复用的方式喂给 kernel，直接调库函数拿不到这种控制权；而**默认路径**（§32.8，`VLLM_USE_V2_MODEL_RUNNER=False` 时）走的恰恰就是这个库函数本身（`backend='auto'` 场景下它会按 tensor 设备自动选 cuda/triton 实现）。",
+      "links": [
+        "https://xgrammar.mlc.ai/docs/api/python/bitmask_ops.html"
+      ],
+      "sources": [
+        {"url": "https://xgrammar.mlc.ai/docs/api/python/bitmask_ops.html", "got": "XGrammar 0.2.5 文档：apply_token_bitmask_inplace 完整签名与参数语义（logits/bitmask 形状、indices 用途、backend 五选项，triton 被称为『默认 CUDA 实现』）；位打包格式（32 token/int32，0=masked/1=unmasked）；allocate_token_bitmask/get_bitmask_shape 等配套函数", "accessed": "2026-07-24"},
+        {"url": "https://xgrammar.mlc.ai/docs/tutorials/engine_integration.html", "got": "（经搜索摘要）该函数在推理引擎集成教程里的定位：引擎侧算完 bitmask 后统一调它落地", "accessed": "2026-07-24"}
+      ],
+      "confidence": "high",
+      "confidence_note": "函数签名/参数/位打包格式来自官方 API 文档一手核实（版本 0.2.5，与 vLLM v0.21.0 要求的 xgrammar>=0.2.0,<1.0.0 兼容）。『vLLM 自写 kernel 具体改编自哪次 xgrammar commit』未逐行比对两份源码，只核实了官方确有此库函数与 triton 后端存在，属于本章 dossier 已定性的『改编』关系的外部佐证，不重新裁定改编程度。",
+      "writer_note": "本章 §32.7-§32.8 已经交代『默认路径调 xgr.apply_token_bitmask_inplace』，但正文没有展开这个库函数本身的签名/位格式——建议在 §32.8 提到它的地方补一两句：『这个库函数自己也内置了 triton 等多种后端可选，本章的自写 kernu 正是对着它的语义重写，只是把行映射做成了可复用缓冲』，能让读者明白『两条路本来就是同宗』，不是平行发明。位打包格式（0=masked/1=unmasked，32/int32）本章正文已经用另一种方式讲透（packed_bitmask 解包那段），不需要重复，只需一句『这是 xgrammar 官方钉死的格式』的溯源。"
+    },
+    {
+      "id": "grammar-rollback-speculative-decoding-api",
+      "term": "语法回滚（rollback）在投机解码里的外部 API 口径",
+      "kind": "external_concept",
+      "one_line": "『先假装接受了草稿、取完掩码再倒带』这套操作，各语法后端库都留了口子给它——但口子的名字和语义并不统一：xgrammar 叫 max_rollback_tokens/rollback()，且据其最新文档这个参数已经名存实亡（内部允许无限回滚）；llguidance 走的是另一套 rollback_lag 机制。",
+      "what_it_is": "投机解码（草稿模型先猜几个 token，目标模型一次性验证）和语法约束凑在一起时有个通用矛盾：算第 j 个草稿位置的合法集，必须假装前 j-1 个草稿已经被接受、把语法状态机推过去；但草稿最终可能被拒，状态机推错了地方必须能退回去。『能退回去』这件事在自动机层面不是免费的——大多数语法后端的状态是不可变数据结构或历史记录，支持撤销需要额外的簿记（最朴素的实现是记住走过的每一步，回滚就是弹栈）。xgrammar 的 `GrammarMatcher` 构造时接受 `max_rollback_tokens` 参数（本章 dossier 指出 vLLM 传入的值是 `num_speculative_tokens`），语义是『最多能退回多少步』；据 xgrammar 0.2.5 官方文档，这个参数**已被标记为 deprecated**——文档原话是『不需要设置它，它总是无限的（-1）；新的 Earley 解析器大幅减少了状态数量，所以可以允许无限回滚』。也就是说，在较新的 xgrammar 内部实现里，『回滚步数上界 = 投机步数』这条本章 dossier 记录的设计决策，其上界值实际上可能已经不再是硬约束，而是一个向后兼容但基本不生效的旧接口。",
+      "background": "『回滚』作为通用能力，各家实现哲学不同：xgrammar 的 GrammarMatcher 文档明确把 `rollback()` 方法定位为『jump-forward 解码和投机解码都要用到』，且支持 `fork()` 做分支式解码（进一步佐证它把状态管理当作一等公民设计）。llguidance（guidance 库当前的 Rust 引擎，见 ch31 research 的 grammar-backend-ecosystem 词条）走的是另一套路线——它的惰性词法分析器基于正则导数按需构造状态，官方口径里投机解码相关的机制叫 `rollback_lag`，但公开资料对其精确语义的记录比 xgrammar 少（本次检索到的多是社区讨论投机解码+结构化约束的一般性矛盾，未找到 llguidance 官方对 rollback_lag 参数的专门文档页）。这印证了本章 dossier 已经指出的结论：**回滚的上界形态不能跨后端概括**——lm-format-enforcer 干脆不支持（详见 ch31 research）、guidance 用的参数名字都不一样，xgrammar 这条本身也在向『不设上界』演进。",
+      "links": [
+        "https://xgrammar.mlc.ai/docs/api/python/grammar_matcher.html",
+        "https://github.com/guidance-ai/llguidance"
+      ],
+      "sources": [
+        {"url": "https://xgrammar.mlc.ai/docs/api/python/grammar_matcher.html", "got": "GrammarMatcher 0.2.5 文档原文：max_rollback_tokens 构造参数已 deprecated，默认 -1、内部总是无限，注明是 Earley 解析器让状态数大幅减少后的结果；rollback(num_tokens=1) 方法文档提及用于 jump-forward 与投机解码；fork() 支持分支/投机解码", "accessed": "2026-07-24"},
+        {"url": "https://github.com/vllm-project/vllm (经间接核实 requirements/common.txt)", "got": "vLLM 对 xgrammar 的版本约束是 >=0.2.0,<1.0.0，与上面核实的 0.2.5 文档版本落在同一约束区间内，说明该弃用状态大概率适用于当前部署", "accessed": "2026-07-24"},
+        {"url": "https://github.com/sgl-project/sglang/issues/9187", "got": "（社区 issue）投机解码与结构化输出结合时的一般性矛盾描述：投机一次产出多个 token，结构约束的回滚要处理『不止一个 token』而不能只按『退最后一个』设计——佐证本章为什么需要 state_advancements 计数式回滚而非简单退一步", "accessed": "2026-07-24"}
+      ],
+      "confidence": "medium",
+      "confidence_note": "xgrammar 侧的『deprecated/无限回滚』是官方文档一手原文，confidence high；但『llguidance 的 rollback_lag 具体语义』未找到官方专门文档页，只有间接社区讨论佐证『投机+结构化的回滚要处理多 token』这一共性问题，这部分标 medium，写作不应对 rollback_lag 的具体行为做断言。另外，vLLM v0.21.0 pin 实际锁定的 xgrammar 具体版本号本次未逐一核实到底是不是恰好 0.2.5——只核实了版本区间约束覆盖 0.2.5，属合理但非精确匹配的证据链。",
+      "writer_note": "本章 §32.5/小结已经提到『回滚步数上界=num_speculative_tokens，在构造语法对象时配好』且引了 ch31 的『不可跨后端概括』订正——这条研究给的增量是：**xgrammar 官方文档显示这个上界参数本身已经名存实亡（总是无限回滚）**。建议在提到 max_rollback_tokens 那句后加一个不喧宾夺主的旁注,例如『据 xgrammar 官方文档，这个参数在较新版本里已经不再是真正的硬限制，内部总允许无限回滚——vLLM 仍然传了这个值，更多是接口层面的历史沿革』,避免让读者以为这道上界在任何 xgrammar 版本下都是强约束。不必展开 llguidance 的 rollback_lag 细节（未核实到官方口径），维持正文现有的『guidance 用的是另一套 rollback_lag』一句带过即可，不必加细节。"
+    },
+    {
+      "id": "pinned-memory-and-cuda-streams",
+      "term": "页锁定内存（pinned/page-locked memory）与 CUDA 流重叠",
+      "kind": "external_concept",
+      "one_line": "普通内存要经操作系统『搬家』才能到显卡，页锁定内存钉死在物理内存里、显卡可以直接伸手来拿——这是『异步搬运能真正后台跑』和『拷贝流能和计算流并行』这两件事共同的物理前提。",
+      "what_it_is": "操作系统的虚拟内存机制会把普通（pageable）内存页面按需换出到磁盘；这意味着 GPU 不能直接对着这类内存做 DMA（直接内存访问）搬运——因为它可能在搬运途中被换页移走。CUDA 驱动的应对方式是：搬运普通内存时先在内部悄悄开一块『页锁定』（page-locked，即 pinned，操作系统保证不换出）的临时缓冲，把数据拷进去，再从这块缓冲搬去显卡——多了一次隐藏的内存拷贝。如果开发者一开始就把数据放在页锁定内存里（本章代码里的 `pin_memory=True`），就跳过了这道隐藏拷贝，搬运可以真正异步——CPU 发起搬运指令后立刻去干别的，不用等搬完。**但**这跳过的前提是内存本来就是 pinned 的；若临时对着一块本来是 pageable 的张量调用 `.pin_memory()` 再搬运，这个『钉住』操作本身是同步的、要等它做完才能继续——PyTorch 官方教程实测过这种『先手动 pin 再搬』的写法比直接 `.to(device, non_blocking=True)` 慢达两倍，因为 CUDA 本来就会在内部做这件事，多此一举反而阻塞了主线程。",
+      "background": "光有 pinned memory 还不够快——要真正让『搬运』和『计算』同时发生，还需要 CUDA 流（stream）：一个流是 GPU 上一串按顺序执行的操作队列，同一个流内部严格顺序执行，不同流之间可以交错甚至并发执行。NVIDIA 官方的说法是，要让核函数执行和数据搬运重叠，需要三个条件同时满足：设备支持并发拷贝与执行、核函数与数据搬运分别挂在不同的非默认流上、且主机内存是页锁定的。本章 worker 侧的 `copy_stream` 正是这第二个条件的体现——把两次搬运（掩码本体、行映射）挂在一条独立于计算主流的流上；而两次方向相反的 `wait_stream`（kernel 启动前『计算流等拷贝流』、kernel 结束后『拷贝流等计算流』）则是流间同步的标准用法：不用阻塞式的『等它彻底搬完』（那样就白费了重叠的意义），而是让一个流去等另一个流到达某个点，两条队列各自继续排后面的活。",
+      "links": [
+        "https://developer.nvidia.com/blog/how-optimize-data-transfers-cuda-cc/",
+        "https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html",
+        "https://developer.nvidia.com/blog/how-overlap-data-transfers-cuda-cc/"
+      ],
+      "sources": [
+        {"url": "https://developer.nvidia.com/blog/how-optimize-data-transfers-cuda-cc/", "got": "NVIDIA 官方博客：pageable 内存搬运时驱动内部先拷进临时 pinned 缓冲再传显卡（多一次拷贝）；显式用 cudaMallocHost 分配 pinned 内存可跳过这一步、提升带宽", "accessed": "2026-07-24"},
+        {"url": "https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html", "got": "PyTorch 官方教程：pinned memory 定义（不会被换出到磁盘）；非阻塞传输的三前提（多 DMA 引擎/独立流/pinned 源数据）；实测『先手动 .pin_memory() 再搬』比直接 .to(device, non_blocking=True) 慢达 2 倍，因为该操作本身在主线程上是阻塞的", "accessed": "2026-07-24"},
+        {"url": "https://developer.nvidia.com/blog/how-overlap-data-transfers-cuda-cc/", "got": "NVIDIA 官方博客：流的定义（GPU 上按序执行的操作队列，不同流可交错/并发）；重叠核函数执行与数据搬运的三个前提条件（并发拷贝执行支持、非默认流分离、pinned 主机内存）；事件（event）用于流间同步的机制", "accessed": "2026-07-24"}
+        ],
+      "confidence": "high",
+      "confidence_note": "核心事实（pinned memory 跳过隐藏拷贝、流重叠的三前提、事件/wait 机制）均来自 NVIDIA 与 PyTorch 官方文档一手核实。本章 vLLM 源码注释里『显式 pin_memory() 在高并发下因驱动争用偶发卡顿』是 vLLM 自己的工程经验注释（第一手 CUDA 优化文献未见逐字对应表述），本词条只用 PyTorch 官方教程实测的『手动 pin 更慢』这一相关但不完全等同的事实做旁证，不代为坐实 vLLM 那句『驱动争用』的具体归因。",
+      "writer_note": "本章 §32.9 已经用『流是 GPU 上一条串行执行队列』把 stream 讲得很直觉、也引用了 vLLM 源码自己那句『高并发下显式 pin_memory 反而更慢』的注释——这条研究提供的是**独立于 vLLM 注释之外的官方佐证**：PyTorch 官方教程证实过『手动 pin_memory() 再搬』确实比『直接 to(device, non_blocking=True)』慢（约 2 倍），可以在引用 vLLM 那句注释旁边补一句『这与 PyTorch 官方教程给出的实测结论方向一致』，但不要把『驱动争用』这个具体机理说成是外部来源验证过的（那是 vLLM 自己的归因，本词条没有验证到这一步）。两次反向 wait_stream 的通用背景（NVIDIA 三前提）如果 writer 觉得当前直觉讲解已经够，这条可以完全不引，留给 links。"
+    }
+  ]
+}
