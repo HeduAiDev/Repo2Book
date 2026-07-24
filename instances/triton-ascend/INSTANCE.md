@@ -48,11 +48,12 @@
 - 🚗 **施工中（2026-07-24 状态）**：**ch01–ch26 已全部定稿提交并归档**（Part 1/2 完 + Part 3 triton-to-linalg 核心
   + ascend-opt ch15–ch18 + ch19 离散掩码 + **hivm-hfusion ch20-25 六章收官** + **Part 6 后端与运行时开篇 ch26 后端插件**）;ch27–ch33 未开工。
   **ch27-ch30 已交付归档,Part 6(ch26-30)后端与运行时收官;全书 30/33**。
-  **ch31 发车中**（一套后端两个框架:torch_npu/mindspore 策略注册表,skip_impl;slug `ch31-two-frameworks`,deps ch26)——**倒数第三章,Part 6 补遗**:
-  backend_register.py(336 行)的 BackendStrategyRegistry 两级注册表(category=框架 torch_npu/mindspore × method=能力 version_hash/cxx_abi/type_convert/header_file/allocate_memory/async_launch)+ @register 装饰器 + _LazyBackendStrategyRegister 懒单例;get_backend_func 按当前框架查表取实现——同一昇腾后端服务两框架,**GPU 侧无此层(对位无)**。
-  ⚠️ skip_impl(策略函数体 import torch_npu/mindspore);交叉验证靠 backend_register.py 逐行核 @register 注册表。
-  剩余:ch32 capstone flash-attention(part-7,deps ch25/ch08)、ch33 能力边界(part-7,deps ch03,测试套件揭示支持谱系)。
-  📌 逃逸新类型(ch30):Review revise-fig 拿到占位/测试数据(figure_id 空、"test problem one")→agent 正确拒绝杜撰+升级;Lead 核实为 glitch、真实发现已修,直接接管 Map+Archive 即可。
+  **ch31 已交付归档(双框架注册表,两度逃逸均逃生舱拦截+Lead 接管;联动修 ch29 get_backend_func 勘误);全书 31/33**。
+  **ch32 发车中**（实战收官 capstone:flash-attention 在昇腾的 CV 融合落地,part-7,skip_impl;slug `ch32-capstone-flash-attention`,deps ch25/ch08）——**倒数第二章**:
+  拿 tutorials/06-fused-attention.py(365 行,_attn_fwd_inner QK=tl.dot→cube/softmax→vector/PV 累加 + _attn_fwd 块指针/因果掩码)当活体标本,把前面每层
+  (语言层显式搬运 ch03-08→ttadapter 结构化 ch10-14→核亲和双核 ch16→HFusion 融合 ch21-22→HIVM 下降 ch23-25→AscendC 库调用 ch25)在一个真核上串一遍,看它落成达芬奇 cube/vector CV 融合。对位基座 ch43(到 PTX;此处终点 AscendC)。
+  ⚠️ skip_impl(编译真跑需 CANN/NPU);交叉验证靠 06-fused-attention.py 逐行核 + pytest_ut/test_06_fused_attention.py。
+  剩余最后一章:ch33 能力边界(part-7,deps ch03,unittest 323 .py 揭示支持/未支持谱系)。
   ⚠️ 逃逸恢复:Review 阶段 API Connection-closed 崩→revise-fig 常改了图脚本没重渲染=陈旧 SVG+假 PASS,Lead 接管重渲染+独立盲审(见 memory revise-fig-stale-render);figures.json 归档易漏登、chNN- slug 前缀必带(见 memory)。
   ⚠️ ch22 曾 Review round1 逃逸(计数陷阱 15→4 Scheduler/未验证子核个数/MixCV 14×14 结构错),Lead 手动接管修复+独立盲审,已归档。
   ⚠️ **发车 slug 必须含 `chNN-` 前缀**(workflow 里 `CH = artifacts/ + A.slug`,slug 直接当目录名):ch23 误传裸 `hivm-dialect`→
