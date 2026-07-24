@@ -47,12 +47,12 @@
   开始逐章发车。roadmap.py 生成器已建并验（7 Part 窄长条 5.17:1，4 调用/几何/Read-PNG 通过）。
 - 🚗 **施工中（2026-07-24 状态）**：**ch01–ch26 已全部定稿提交并归档**（Part 1/2 完 + Part 3 triton-to-linalg 核心
   + ascend-opt ch15–ch18 + ch19 离散掩码 + **hivm-hfusion ch20-25 六章收官** + **Part 6 后端与运行时开篇 ch26 后端插件**）;ch27–ch33 未开工。
-  **ch27(综合章 f6)、ch28(闭源边界 f7)、ch29(NPU 驱动装载)已交付归档,均 clean run**。
-  **ch30 发车中**（动态生成的发射器:generate_npu_wrapper_src/rtKernelLaunch/taskqueue/msprof,skip_impl;slug `ch30-dynamic-launcher`,deps ch29）:
-  昇腾发射器比基座厚——NPULauncher.__call__ → generate_npu_wrapper_src(~560 行 C++ 模板 f-string)动态生成 wrapper:
-  解析 args/signature、workspace/syncBlockLock 每次现分配、rtKernelLaunch/rtKernelLaunchWithFlagV2 发射、msprof 剖析钩子、taskqueue 异步派发。对位基座 ch37(昇腾多 workspace 现分配 + 异步 taskqueue + msprof)。
-  ⚠️ skip_impl(rtKernelLaunch 需 CANN 运行时 + NPU);交叉验证靠 driver.py 逐行核模板与发射序列。
-  ✅ 近 4 章(ch26-29)工作流干净跑完无逃逸;figures.json 归档登记已稳;Lead 后置只补少量可读性/保真微调(行号/跨书 API 精度/reader 桥句)。
+  **ch27-ch30 已交付归档,Part 6(ch26-30)后端与运行时收官;全书 30/33**。
+  **ch31 发车中**（一套后端两个框架:torch_npu/mindspore 策略注册表,skip_impl;slug `ch31-two-frameworks`,deps ch26)——**倒数第三章,Part 6 补遗**:
+  backend_register.py(336 行)的 BackendStrategyRegistry 两级注册表(category=框架 torch_npu/mindspore × method=能力 version_hash/cxx_abi/type_convert/header_file/allocate_memory/async_launch)+ @register 装饰器 + _LazyBackendStrategyRegister 懒单例;get_backend_func 按当前框架查表取实现——同一昇腾后端服务两框架,**GPU 侧无此层(对位无)**。
+  ⚠️ skip_impl(策略函数体 import torch_npu/mindspore);交叉验证靠 backend_register.py 逐行核 @register 注册表。
+  剩余:ch32 capstone flash-attention(part-7,deps ch25/ch08)、ch33 能力边界(part-7,deps ch03,测试套件揭示支持谱系)。
+  📌 逃逸新类型(ch30):Review revise-fig 拿到占位/测试数据(figure_id 空、"test problem one")→agent 正确拒绝杜撰+升级;Lead 核实为 glitch、真实发现已修,直接接管 Map+Archive 即可。
   ⚠️ 逃逸恢复:Review 阶段 API Connection-closed 崩→revise-fig 常改了图脚本没重渲染=陈旧 SVG+假 PASS,Lead 接管重渲染+独立盲审(见 memory revise-fig-stale-render);figures.json 归档易漏登、chNN- slug 前缀必带(见 memory)。
   ⚠️ ch22 曾 Review round1 逃逸(计数陷阱 15→4 Scheduler/未验证子核个数/MixCV 14×14 结构错),Lead 手动接管修复+独立盲审,已归档。
   ⚠️ **发车 slug 必须含 `chNN-` 前缀**(workflow 里 `CH = artifacts/ + A.slug`,slug 直接当目录名):ch23 误传裸 `hivm-dialect`→
