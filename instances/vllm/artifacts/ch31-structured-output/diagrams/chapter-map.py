@@ -15,9 +15,15 @@
     渲染比 cjk_text_width() 的半角系数宽,PNG 上两处文字压在节点框左右边线上。
     本轮把可用宽度收到 (NODE_W-TEXT_INSET)、字号下限降到 10.2 重渲,复核确认
     两处文字完整落在框内,现在的 True 是重新看过 PNG 的结果。
-  - 其余五项两轮均为 True(数字 18.3 KB / 词表 1/32 / 五分支 / 四家实现 /
+  - 其余五项两轮均为 True(数字 18.3 KB / 词表 1/32 / 五分支 / 四条路线 /
     六方法逐个对正文;箭头两端均贴边;中文无豆腐块;上段→接下段→承上段→下段
     的折行顺序在图上显式)。
+[FIX-2026-07-24](ch31 §31.7 正文回修:新增「四条路线:把计算搬到哪里」子节,按
+  编译期/运行期把四家的技术路线与取舍摆开。原节点概括「四家实现,能力各不同」
+  已 under-represent → 改为「四条路线:计算搬到哪里」,贴合回修后的组织主线;
+  源码符号 StructuredOutputBackend 不动。§31.2 choice_as_grammar 节点未改——
+  该节新增的是「读懂这条 EBNF」读者背景,源码走线(choice→EBNF 改写)未变。
+  重渲 + 重新 Read PNG 复核见 blind_review 重置 PENDING。)
 """
 import xml.sax.saxutils as xs
 from pathlib import Path
@@ -50,7 +56,7 @@ NODES = [
 
     ("create",   2, 0, 0, "_create_grammar",           "工作线程里取面单开编",    "§31.4"),
     ("compile",  2, 1, 0, "compile_grammar",           "xgrammar 五分支分派",     "§31.6"),
-    ("backend",  2, 1, 1, "StructuredOutputBackend",   "四家实现,能力各不同",     "§31.7"),
+    ("backend",  2, 1, 1, "StructuredOutputBackend",   "四条路线:计算搬到哪里",   "§31.7"),
     ("grammar",  2, 2, 0, "StructuredOutputGrammar",   "请求级六方法契约",        "§31.5"),
     ("bitmask",  2, 2, 1, "fill_bitmask",              "一行 18.3 KB,词表 1/32",  "§31.8"),
     ("promote",  3, 3, 0, ["_try_promote_blocked", "_waiting_request"],
