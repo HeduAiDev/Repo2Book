@@ -45,15 +45,13 @@
   仿射 tiled dataflow），bishengir 部分闭源（边界≈基座的 ptxas）。
 - ✅ **大纲已获用户审批（2026-07-18「同意」）**：33 章 / 7 Part（outline-final.json）+ ARCHITECTURE.md，
   开始逐章发车。roadmap.py 生成器已建并验（7 Part 窄长条 5.17:1，4 调用/几何/Read-PNG 通过）。
-- 🚗 **施工中（2026-07-24 状态）**：**ch01–ch26 已全部定稿提交并归档**（Part 1/2 完 + Part 3 triton-to-linalg 核心
-  + ascend-opt ch15–ch18 + ch19 离散掩码 + **hivm-hfusion ch20-25 六章收官** + **Part 6 后端与运行时开篇 ch26 后端插件**）;ch27–ch33 未开工。
-  **ch27-ch30 已交付归档,Part 6(ch26-30)后端与运行时收官;全书 30/33**。
-  **ch31 已交付归档(双框架注册表,两度逃逸均逃生舱拦截+Lead 接管;联动修 ch29 get_backend_func 勘误);全书 31/33**。
-  **ch32 已交付归档(capstone flash-attention);全书 32/33**。
-  **ch33 发车中——全书最后一章**（昇腾 Triton 的能力边界:测试套件揭示的支持/未支持谱系,part-7,skip_impl;slug `ch33-capability-boundary`,deps ch03）:
-  诚实边界章——把 unittest 323 个 .py 当能力谱系文档读:①支持面广(tutorials 01-17 + 语言 op math/reduce/scan/dot/matmul/attention/atomic/block_ptr + 昇腾扩展 compile_hint/sync_block/multibuffer/npu_indexing/fixpipe/paged_kvcache_krope/ascend_barrier);
-  ②诚实未支持(29 文件 skip/xfail:等 TA×13、等 bishengir-compile×9、NPUIR 四月更新回退×5、UB overflow×3、attn_cp 整批跳×3、randomly failed 等)。收官:摊开「昇腾 triton 能/不能做什么、为什么」。对位基座 part-9(度量与实战)。
-  ⚠️ skip_impl(读测试套件、非跑核);交叉验证靠 unittest/pytest_ut 逐一核 skip/xfail 标记与 reason。**这是第 33 章、全书收官——归档后跑 book-retro 复盘 + 连贯性审计。**
+- 🎉 **全书 33/33 定稿归档（2026-07-24 收官）**：《Triton-Ascend 源码解读》ch01–ch33 全部写就/16 门验证/提交推送。
+  Part 1/2/3(triton-to-linalg)/ascend-opt(ch15-18)/ch19 离散掩码/hivm-hfusion(ch20-25 六章)/Part 6 后端与运行时(ch26-30)/Part 7 收官(ch31 双框架 + ch32 flash-attention capstone + ch33 能力边界)全交付。
+  **伏笔 f1-f8 全闭合;全书 200 图全登记(新增 lint_figures_registered 门禁);全 --all 门绿(9 处裸章号 warn=标题自引,非阻断)。**
+  收尾待办:①book-retro 经验复盘(本轮候选:figures.json 漏登已修成 linter;revise-fig 陈旧渲染;Review API 崩逃逸;dossier-verify 抓计数错——多为 ≥2 复发,curator 可固化);②可选 Part 级连贯性审计(伏笔已全收、术语见 glossary)。
+  下一本书或存量回修由用户定。
+  ---历史施工记录(供追溯)---
+  ⚠️ skip_impl 章(纯 C++ MLIR pass / 后端 Python 需 CANN)交叉验证靠 pin 源码逐行核 + lit 夹具/pytest_ut,不伪造 dump。
   ⚠️ 逃逸恢复:Review 阶段 API Connection-closed 崩→revise-fig 常改了图脚本没重渲染=陈旧 SVG+假 PASS,Lead 接管重渲染+独立盲审(见 memory revise-fig-stale-render);figures.json 归档易漏登、chNN- slug 前缀必带(见 memory)。
   ⚠️ ch22 曾 Review round1 逃逸(计数陷阱 15→4 Scheduler/未验证子核个数/MixCV 14×14 结构错),Lead 手动接管修复+独立盲审,已归档。
   ⚠️ **发车 slug 必须含 `chNN-` 前缀**(workflow 里 `CH = artifacts/ + A.slug`,slug 直接当目录名):ch23 误传裸 `hivm-dialect`→

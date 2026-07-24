@@ -60,6 +60,7 @@ python3 scripts/lint_diagram_scaffolding.py --all   # 图面脚手架泄漏（�
 #   靠 illustrator 契约的「渲染→Read PNG 亲眼看→自查」兜，别指望 linter。
 #   ⚠️ 盲审必须**独立**：作图者自审天然看不见自己写的自证话术（ch09 就这么漏了一条泄漏）。
 python3 scripts/lint_chapter_map.py --all   # 全书章图徽标↔标题一致（重编号后必跑：exp-2026-07-20-02 曾 7 章图印旧节号而 --all 全绿）
+python3 scripts/lint_figures_registered.py   # 每章 manifest 图都登记进 bible/figures.json（archivist 反复漏登 chapter-map：ch23/25/26/27/32/33 六次；前缀容忍归一化比对，替掉 Lead 手工 grep）
 ```
 机械问题让 writer 定点小修，不退整章。
 
