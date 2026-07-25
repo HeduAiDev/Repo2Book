@@ -1,0 +1,77 @@
+{
+  "chapter_id": "ch08-ascend-parallel-groups",
+  "concepts": [
+    {
+      "id": "hccl",
+      "term": "HCCL（Huawei Collective Communication Library）",
+      "kind": "external_project",
+      "one_line": "华为昇腾自己的集合通信库——NPU 世界里 NCCL 的对应物，负责 AllReduce/AllGather/AlltoAll 这类跨卡通信的真正执行。",
+      "what_it_is": "HCCL 是 CANN（昇腾计算架构）里的集合通信组件，跑在昇腾 AI 处理器上，给单机多卡、多机多卡场景提供数据并行/模型并行所需的集合通信原语：AllReduce、Broadcast、AllGather、ReduceScatter、AlltoAll 等，底层可以走 HCCS（华为自研高速互联）、RoCE 或 PCIe 链路，通信算法上支持 Ring、Mesh、Halving-Doubling 等拓扑。对来自 CUDA/NCCL 生态的读者，最直接的理解方式就是：HCCL 之于昇腾 NPU，正如 NCCL 之于 NVIDIA GPU——都是『把多张卡的进程组织成集合通信组』这件事在各自硬件上的实现。",
+      "background": "本章代码里两处直接出现它：worker 初始化时 `init_distributed_environment(..., \"hccl\")` 显式把后端字符串写成 \"hccl\"；`init_ascend_model_parallel` 里 `backend = torch.distributed.get_backend(get_world_group().device_group)` 拿到的也是这同一个后端。PyTorch 的 `torch.distributed` 本身是后端无关的抽象层（backend 是个可插拔字符串，CUDA 上常见 \"nccl\"），昇腾通过把这个字符串换成 \"hccl\"，让本章讲的所有 `GroupCoordinator`/`init_model_parallel_group` 复用代码在底层实际调用的是 HCCL 而不是 NCCL——这正是『复用基座机制、只换后端』的又一处证据，只是这次换的是通信库而不是 Python 层的类。",
+      "links": [
+        "https://www.hiascend.com/document/detail/en/canncommercial/800/hcclug/hcclug/hcclug_000001.html"
+      ],
+      "sources": [
+        {"url": "https://www.hiascend.com/document/detail/en/canncommercial/800/hcclug/hcclug/hcclug_000001.html", "note": "HCCL 官方文档 Overview 页：定义、支持的通信原语（AllReduce/Broadcast/AllGather/ReduceScatter/AlltoAll）、通信算法（Ring/Mesh/HD）、传输链路（HCCS/RoCE/PCIe）。访问日期 2026-07-25。"},
+        {"url": "https://www.mindspore.cn/tutorials/experts/en/r2.1/parallel/train_ascend.html", "note": "MindSpore 官方教程侧面印证 HCCL 是昇腾分布式训练的通信底座，PyTorch 后端也内嵌了 HCCL 的单算子 API。访问日期 2026-07-25。"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文已经点到 \"hccl\" 这个后端字符串，不需要展开讲通信算法内部；一句话点破『HCCL = 昇腾版 NCCL，PyTorch 后端字符串一换，本章所有 GroupCoordinator 底层通信就切到它』即可，深入交给链接。"
+    },
+    {
+      "id": "mc2-fusion-op",
+      "term": "MC2（通算融合算子，Ascend CANN）",
+      "kind": "external_concept",
+      "one_line": "昇腾 CANN 里一族把矩阵乘法和集合通信『焊'在一起、让计算和通信流水重叠执行的融合算子（如 MatmulAllReduce），本章的 `_MC2` 进程组就是为调用它们而建的专属通信域。",
+      "what_it_is": "在张量并行/序列并行场景下，一次线性层前向常常是『矩阵乘法 → AllReduce/AllGather』这样紧挨着的两步：先算完矩阵乘，再等通信同步结果，两者顺序执行、互相等待。MC2（Merged/Matmul + Communication 的缩写，CANN 官方文档写法为『通算融合』）是 CANN 里的一族硬件级融合算子——AllGatherMatmul、MatmulAllReduce、MatmulReduceScatter 等——把矩阵乘法按行/列切块，让『当前块的通信』和『下一块的矩阵乘计算』在硬件流水线上并行执行，从而把通信时间藏进计算时间里。CANN 官方《MC2 算子性能调优案例》给出的是一个具体算子实测（Matmul + hcom_allReduce，M=4096/N=8192/K=4096，half 精度）：优化前单算子耗时 1913 微秒，仅切一阶段带来 26% 收益、切两阶段带来 34% 收益——这是算子级别的实测数字，官方案例页未给出『整网提升多少』的口径，之前若有『GPT-3 规模整网约 10%』的说法未能在该页核实到，故不采用，只引用这组已核实的算子级数字。要用上这类融合算子，前提是有一批 rank 组成一个专属的通信域给它调度——这正是本章 `_MC2 = init_model_parallel_group(...)` 要建的那个组：它的名字直接取自这族算子。",
+      "background": "MC2 是 Ascend C 算子编程语言 2.0 版本新增的特性，定位是『大模型场景下让通信和计算并行、隐藏彼此延迟』的硬件级手段——和 flashcomm2（见另一条）的『重排 rank 拓扑实现软件级重叠』是同一个目标（隐藏通信延迟）的两种不同手段：MC2 在算子内部做流水线融合，flashcomm2 在进程组拓扑层面做重叠调度。vllm-ascend 里 `_MC2` 组同时服务 MoE 的专家通信（token dispatch）——因为 MoE 的专家分布在 dp×tp 域上，需要一个跨越两者的通信域，而这个域上的通信原语（dispatch/combine）正好是 MC2 系列融合算子的目标场景之一。据 vllm-ascend 项目文档（2026-07 访问），MoE 的通信策略里 MC2 与其变体 Fused MC2（面向 DeepSeek 优化，走 `npu_moe_distribute_dispatch_v2`）是与 AllGather、AlltoAll 并列的可选项之一，本章的 `_MC2` 组是这些策略共用的底层通信域，具体调度选择留给 ch10 附近的 MoE 章节。",
+      "links": [
+        "https://www.hiascend.com/document/detail/zh/canncommercial/800/developmentguide/opdevg/ascendcbestP/atlas_ascendc_best_practices_10_0043.html",
+        "https://deepwiki.com/vllm-project/vllm-ascend/7.6-multi-node-deployment"
+      ],
+      "sources": [
+        {"url": "https://www.hiascend.com/document/detail/zh/canncommercial/800/developmentguide/opdevg/ascendcbestP/atlas_ascendc_best_practices_10_0043.html", "note": "CANN 官方《MC2 算子性能调优案例》：原文『MC2通算融合算子的性能收益主要来自于通信、计算的并行执行，即对Matmul计算的矩阵进行切分，通过下一块数据的Matmul计算与当前数据块的通信任务并行执行』；Matmul+hcom_allReduce 算子级实测（M=4096/N=8192/K=4096, half）从 1913 微秒优化到分阶段切分收益 26%/34%。二次核实：本页未提及『GPT-3』或『整网提升 10%』，此前草稿曾误引该数字，已在 what_it_is 里改正为只用页面已核实的算子级数字。访问日期 2026-07-25。"},
+        {"url": "https://deepwiki.com/vllm-project/vllm-ascend/7.6-multi-node-deployment", "note": "DeepWiki 对 vllm-ascend 仓库的索引页：MoE 通信支持 AllGather/AlltoAll/MC2/FusedMC2 四种策略，FusedMC2 走 npu_moe_distribute_dispatch_v2、面向 DeepSeek 优化。DeepWiki 为第三方生成索引非一手官方文档，仅作旁证，标记见 confidence。访问日期 2026-07-25。"}
+      ],
+      "confidence": "medium",
+      "writer_note": "正文目前只用一句括注带过 MC2（『matmul + communication 融合，服务 MoE 专家通信』），可以再点一句『融合算子靠矩阵分块流水、把通信藏进计算里，CANN 官方案例给出的是算子级 26%~34% 的实测收益（非整网数字）』——但不必展开融合算子内部机制，那是 CANN 算子库的范畴，非本仓源码；MoE 通信策略选择（MC2 vs AlltoAll vs FusedMC2）留给 ch10 附近的 MoE 专章，这里不展开。DeepWiki 来源非一手官方文档，只作旁证；若不想引用具体百分比数字，直接省略也完全可以，只讲『融合算子把通信藏进计算流水线』这个原理即可。"
+    },
+    {
+      "id": "flashcomm-family",
+      "term": "FlashComm / FlashComm2（vllm-ascend 通信-计算重叠优化）",
+      "kind": "external_concept",
+      "one_line": "vllm-ascend 自己的一族『少通信、通信藏进计算』优化：FlashComm(v1) 把序列并行里的 AllGather 尽量后移，FlashComm2 进一步把 o_proj 处的 AllReduce 换成 AlltoAll+AllGather、省掉一步通信。",
+      "what_it_is": "张量并行每算完一层就要做一次 AllReduce（或 AllGather/ReduceScatter）同步结果，序列长、并行度高时这部分通信开销会成为瓶颈。FlashComm 是 vllm-ascend 官方文档里对『在 NPU 上强化过的序列并行（Sequence Parallelism）』的称呼：FlashComm v1（FC1）针对 MLA 结构模型把 AllGather 推迟到 QKV 投影之后、针对 MoE 模型推迟到 Gating+动态量化之后，目的都是减少通信量；本章讲的 FlashComm2（flashcomm2）是它的下一步优化，专门处理 attention 里 o_proj（输出投影）这一步——把原本『TP 组内 AllReduce』换成『先 AlltoAll、再 AllGather』的两步走，并因此把原来一整个 TP 组拆成两层：otp（output-projection 张量并行，组内做矩阵乘的切分）和 odp（output-projection 数据并行，组间做重叠调度）。据 vllm-ascend 一条已合并的 PR 描述（2026 年，具体日期未标注），在 TP16DP1 配置下，FlashComm2 能在 FlashComm1 的基础上再提升 DeepSeek 模型约 8% 的 prefill 性能，推荐两者搭配、尤其在长序列+大 TP 配置下收益明显。",
+      "background": "FlashComm 是 vllm-ascend / CANN 生态自己的优化命名，不是某篇学术论文的直接实现——需要注意的是，学术界另有一篇同名相近的论文《Flash Communication: Reducing Tensor Parallelization Bottleneck for Fast Large Language Model Inference》（arXiv 2412.04964），讲的是低比特压缩通信数据的技术，与 vllm-ascend 这里『重排进程组拓扑实现通信-计算重叠』的 FlashComm 是两件不同的事——本仓的 FlashComm/FlashComm2 目前只能在 vllm-ascend 官方用户文档（覆盖 v1）和 GitHub PR（覆盖 v2 的实现细节，尚未见独立成篇的官方设计文档）里查到第一手描述，没有查到二者之间明确的技术传承关系，因此这条背景标 medium 置信度，避免把两者混为一谈。",
+      "links": [
+        "https://docs.vllm.ai/projects/ascend/en/latest/user_guide/feature_guide/sequence_parallelism.html",
+        "https://github.com/vllm-project/vllm-ascend/pull/3232"
+      ],
+      "sources": [
+        {"url": "https://docs.vllm.ai/projects/ascend/en/latest/user_guide/feature_guide/sequence_parallelism.html", "note": "vllm-ascend 官方用户指南《Sequence Parallelism》：FlashComm V1 是『基于 NPU 强化过的序列并行』，MLA 模型把 AllGather 后移到 QKV 投影后、MoE 模型后移到 Gating+动态量化后以减少通信量；FC1 与 SP 目前互斥（FC1 不支持 VL 类模型）。页面未涉及 FlashComm V2。访问日期 2026-07-25。"},
+        {"url": "https://github.com/vllm-project/vllm-ascend/pull/3232", "note": "vllm-ascend PR #3232（flashcomm_v2 optim solution）：描述把 Attention 里的 AllReduce 换成『pre-AlltoAll + post-AllGather』、拆出 otp/odp 两组、TP16DP1 下较 FlashComm1 再提升 DeepSeek prefill 性能约 8%、建议长序列大 TP 场景搭配 FlashComm1 使用。访问日期 2026-07-25。"},
+        {"url": "https://arxiv.org/abs/2412.04964", "note": "同名相近但不同技术的学术论文《Flash Communication》，用于说明命名相似但不是同一件事，避免误导读者去查错方向。访问日期 2026-07-25。"}
+      ],
+      "confidence": "medium",
+      "writer_note": "正文已经把 flashcomm2 的排布代数（strided 切 otp/odp）讲得很透，这条背景只需补一句『FlashComm 是 vllm-ascend 自己的通信-计算重叠优化家族，v1 减少 AllGather、v2 进一步把 o_proj 的 AllReduce 换成 AlltoAll+AllGather，PR 里给出约 8% 的 prefill 提升数据』；务必不要把它和 arXiv 那篇同名论文（低比特压缩技术）混为一谈——如果正文要点名，最好显式说『不是同名那篇论文』或干脆不提论文，只留链接给愿意深挖的读者。"
+    },
+    {
+      "id": "verl-rl-framework",
+      "term": "verl（Volcano Engine Reinforcement Learning，字节跳动开源 RL 训练框架）",
+      "kind": "external_project",
+      "one_line": "一个专门做大模型 RLHF/Agent 强化学习后训练的框架，把 vLLM 当作『生成训练样本』的推理后端——本章 `ExternalDP` 这个维度就是为了适配它的集成场景而留的。",
+      "what_it_is": "verl（HybridFlow 论文的开源实现，由字节跳动 Seed 团队发起、现由社区维护）是一个强化学习训练库，支持 PPO/GRPO/GSPO/RLOO/DAPO 等多种 RL 算法，训练侧可接 FSDP 或 Megatron-LM，推理/生成侧可接 vLLM 或 SGLang。RL 后训练的每一轮通常要『用当前策略模型生成一批样本（rollout）→ 用奖励打分 → 更新参数』，verl 的做法是在 rollout 阶段直接调用 vLLM 做高吞吐生成，训练和生成之间通过它的 3D-HybridEngine 做资源和显存复用，减少两个阶段切换时的浪费。verl 支持把 vLLM 扩展到几百张卡、671B 参数规模的模型。",
+      "background": "本章 `init_ascend_model_parallel` 里 `all_ranks` 5D 网格最外层维度是 `ExternalDP`，源码注释写明『ExternalDP is the data parallel group that is not part of the model, every dp rank can generate independently (in verl integration)』——也就是说这一维不是 vLLM 模型本身的并行维度，而是专门给 verl 这类『多个数据并行副本各自独立跑生成』的外部训练框架留的坐标位。verl 是这条注释里唯一点名的场景，所以理解 ExternalDP 绕不开知道 verl 是什么、它为什么需要『dp rank 各自独立 generate』这种能力（每个 rollout worker 用不同的 prompt batch 独立推理，互不通信，天然是加性并行的一维）。",
+      "links": [
+        "https://github.com/verl-project/verl",
+        "https://verl.readthedocs.io/"
+      ],
+      "sources": [
+        {"url": "https://github.com/verl-project/verl", "note": "verl 官方 GitHub README：定义（HybridFlow 开源实现，字节跳动 Seed 团队发起）、支持算法、支持推理后端（vLLM/SGLang）、3D-HybridEngine 减少训练-生成切换开销、可扩展到 671B 模型/数百 GPU、Apache 2.0 协议。访问日期 2026-07-25。"},
+        {"url": "https://verl.readthedocs.io/en/latest/perf/perf_tuning_on_ascend.html", "note": "verl 官方文档专门有昇腾性能调优页，佐证 verl 与昇腾/vllm-ascend 生态确有实际集成，而非仅注释提及。访问日期 2026-07-25。"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文已经用一句括注解释了 verl（『一个把 vLLM 当推理后端的强化学习训练框架』），信息量已经够用；如果想再点透一句，可以补『每个 dp rank 独立 generate、互不通信』这个 ExternalDP 维度存在的直接原因，链接留给想深挖 verl 本身的读者，不必展开 RL 算法细节。"
+    }
+  ]
+}

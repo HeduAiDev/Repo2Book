@@ -1,0 +1,145 @@
+{
+  "chapter": "ch07-sleep-mode-camem-allocator",
+  "concepts": [
+    {
+      "id": "cuda-vmm-api",
+      "term": "CUDA 低层虚拟内存管理 API（cuMemAddressReserve / cuMemCreate / cuMemMap）",
+      "kind": "external_concept",
+      "one_line": "NVIDIA 在 CUDA 10.2 加的一组驱动级 API，把「占一段虚拟地址」和「拿一块物理显存」拆成两步分别调用——本章 VA/物理页解耦思想的原始出处。",
+      "what_it_is": "在这组 API 出现之前，CUDA 程序只能用 cudaMalloc 一步到位地要一块「虚拟地址+物理显存」绑死的内存，用完只能整块 cudaFree，中途没法只挪物理部分。CUDA 10.2 引入了驱动级 API 把这一步拆成几个可以分别调用的原语：cuMemAddressReserve（只占一段虚拟地址范围，不消耗任何物理显存，类似在地图上圈地）、cuMemCreate（申请一块物理显存句柄，这步才真正花显存）、cuMemMap + cuMemSetAccess（把物理显存句柄映射/授权到某段已保留的虚拟地址上）。有了这几步拆开，才可能做到「解绑物理页、虚拟地址原地保留、以后再换一批物理页映射回来」——这正是 vLLM CuMemAllocator／本章 CaMemAllocator 的 sleep/wake_up 依赖的底层能力模型。",
+      "background": "在此之前，PyTorch/CUDA 生态的显存管理长期被两个问题卡住：①显存碎片化——cudaMalloc 每次返回的地址范围互相独立，永远没法合并成更大的连续块；②没法做「原地」释放再恢复——要归还物理显存就得连虚拟地址一起放弃，之后重新分配拿到的地址大概率变了，所有指针失效。NVIDIA 参照操作系统虚拟内存的思路（mmap/munmap 那一套），把这套能力下放到 CUDA 驱动层，2019 年底随 CUDA 10.2 发布。这组 API 后来被两条产品线复用：一条是 PyTorch allocator 自己的 expandable_segments 特性（用它做「可扩展显存段」减少碎片，见下方 expandable_segments 条目）；另一条正是 vLLM 的 CuMemAllocator——不追求减碎片，而是拿它做「sleep 时保留 VA、物理页说还就还」。vllm-ascend 的 camem.py 走的是同一个设计骨架，只不过底层原语换成了 CANN 的等价接口（本章封在 vllm_ascend_C 扩展的 python_create_and_map / python_unmap_and_release 里）。",
+      "example": null,
+      "links": [
+        "https://developer.nvidia.com/blog/introducing-low-level-gpu-virtual-memory-management/",
+        "https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__VA.html"
+      ],
+      "sources": [
+        {"url": "https://developer.nvidia.com/blog/introducing-low-level-gpu-virtual-memory-management/", "note": "NVIDIA 官方博客：CUDA 10.2 引入 cuMemAddressReserve/cuMemCreate/cuMemMap 的动机与语义，访问于 2026-07-25"},
+        {"url": "https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__VA.html", "note": "CUDA Driver API 官方参考：Virtual Memory Management 分组的函数签名，访问于 2026-07-25"}
+      ],
+      "confidence": "high",
+      "writer_note": "本章 §7.2 已经把「VA/物理页两层解耦」讲得很透彻（且是用 vllm-ascend 自己 CANN 的说法讲的），这条背景不必展开细讲——只需一句『这套两层拆分的思路，最早是 NVIDIA 在 CUDA 10.2 加的一组驱动 API（cuMemAddressReserve/cuMemCreate/cuMemMap），vLLM CuMemAllocator 就是拿它实现 sleep mode 的，camem.py 是同一骨架换到 CANN』，链接留给想深挖的读者。"
+    },
+    {
+      "id": "pytorch-pluggable-allocator",
+      "term": "PyTorch pluggable / custom allocator（CUDAPluggableAllocator 与 MemPool）",
+      "kind": "external_concept",
+      "one_line": "PyTorch 官方支持的机制：允许用户提供自己的 malloc/free 函数（编译成 .so），接管一段区间内所有 GPU 张量分配——本章 NPUPluggableAllocator 就是它在昇腾侧的对应物。",
+      "what_it_is": "PyTorch 默认自带一套显存缓存分配器（CUDA Caching Allocator），但也开了一个后门：你可以自己写两个 C 函数（一个负责分配、一个负责释放），编译成动态库，用 torch.cuda.memory.CUDAPluggableAllocator(so_path, malloc_symbol, free_symbol) 加载进来，PyTorch 之后的张量分配就会调你的函数而不是内置分配器。配合 torch.cuda.MemPool + torch.cuda.use_mem_pool(pool) 这个上下文管理器，还能做到「只在某段代码区间内」切换到自定义分配器，出了区间恢复默认行为——这正是本章 use_memory_pool(tag=...) 打标签的底层机制。PyTorch 官方文档给的最简示例里，两个 C 函数就叫 my_malloc / my_free：这两个名字与 vllm-ascend camem.py 里 NPUPluggableAllocator(lib_name, \"my_malloc\", \"my_free\") 用的符号名完全一样——不是巧合，是 vLLM/vllm-ascend 照抄了官方示例的命名习惯。",
+      "background": "这个机制解决的问题是：某些场景（RAPIDS Memory Manager 这类第三方显存池、或者本章这种需要精细控制物理页去留的 sleep mode）不满足于 PyTorch 默认分配器「只管缓存、不管虚拟地址与物理页解耦」的行为，需要在分配这一层就接管控制权。PyTorch 把这个口子开放出来后，vLLM 团队拿它做了两件事：①在 CUDAPluggableAllocator 之下再包一层自己的 C 扩展（cumem_allocator，内部调 cuMemCreate/cuMemMap 等底层 VMM API）；②给这层再套一个 Python 回调（malloc_callback/free_callback），把每次分配的 handle 记进一本 Python 账本，方便之后按账本逐块 sleep/wake。vllm-ascend 把这整条链路原样搬到 NPU：torch.npu.memory.NPUPluggableAllocator 对应 CUDAPluggableAllocator，torch.npu.memory.MemPool/use_mem_pool 对应 torch.cuda.MemPool/use_mem_pool，接口形状几乎一模一样——这也是 §7.4 反复讲的「换符号」在 PyTorch 这一层的体现。",
+      "example": {
+        "description": "PyTorch 官方文档给的最小可用示例（C++ 端定义 malloc/free，Python 端加载并临时切换）——与 camem.py 里 get_pluggable_allocator 的结构一一对应，但这里是官方通用示例，非 vllm-ascend 源码。",
+        "snippet": "// alloc.cc —— 编译成 alloc.so\nextern \"C\" {\nvoid* my_malloc(ssize_t size, int device, cudaStream_t stream) {\n    void *ptr;\n    cudaMalloc(&ptr, size);\n    return ptr;\n}\nvoid my_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {\n    cudaFree(ptr);\n}\n}\n\n# Python 端\nimport torch\nnew_alloc = torch.cuda.memory.CUDAPluggableAllocator('alloc.so', 'my_malloc', 'my_free')\npool = torch.cuda.MemPool(new_alloc._allocator)\nwith torch.cuda.use_mem_pool(pool):\n    t = torch.zeros(10, device='cuda')  # 这次分配走 my_malloc，不走默认分配器",
+        "annotation": "逐行对照本章：my_malloc/my_free 就是 camem.py 里 NPUPluggableAllocator(lib_name, \"my_malloc\", \"my_free\") 那两个符号名的官方出处；with use_mem_pool(pool) 就是 use_memory_pool_with_allocator 里 with torch.npu.memory.use_mem_pool(mem_pool) 的原型。区别只在于：官方示例的 my_malloc 直接调 cudaMalloc（拿到就是能用的物理显存）；vLLM/vllm-ascend 的版本里，真正的 C 扩展 my_malloc 内部调的是 VMM 那套 reserve+create+map，并且多做一步——回调回 Python 记账本。"
+      },
+      "links": [
+        "https://docs.pytorch.org/docs/stable/notes/cuda.html",
+        "https://github.com/pytorch/pytorch/blob/main/torch/csrc/cuda/CUDAPluggableAllocator.cpp"
+      ],
+      "sources": [
+        {"url": "https://docs.pytorch.org/docs/stable/notes/cuda.html", "note": "PyTorch 官方 CUDA 语义文档「Using custom memory allocators for CUDA」一节，含 my_malloc/my_free 完整示例代码与 MemPool/use_mem_pool 用法，访问于 2026-07-25"},
+        {"url": "https://github.com/pytorch/pytorch/issues/147851", "note": "PyTorch issue：expandable_segments 与 CUDAPluggableAllocator+MemPool 不兼容——camem.py __init__ 里那句 assert 引用的正是这个 issue 号，访问于 2026-07-25"}
+      ],
+      "confidence": "high",
+      "writer_note": "§7.4 已经把回调闭环讲得很细，这条主要是坐实『NPUPluggableAllocator/MemPool/use_mem_pool 不是昇腾自己发明的，是 PyTorch 官方开放的通用机制，CUDA 版叫 CUDAPluggableAllocator』，可以在 7.4.1 开头或换符号那张图旁边点一句、给个链接；my_malloc/my_free 这个『符号名连官方示例都用一样的名字』的细节适合当一个小彩蛋，不必展开例子全贴，一两句带过即可。"
+    },
+    {
+      "id": "cann-ascendcl",
+      "term": "CANN 与 AscendCL（ACL）",
+      "kind": "external_project",
+      "one_line": "CANN 是华为昇腾 AI 芯片的软件栈总称，AscendCL（ACL）是这套软件栈里面向开发者的统一 C API 层（Python 版叫 pyACL）——本章反复出现的 acl.rt.memcpy 就来自这一层。",
+      "what_it_is": "CANN（Compute Architecture for Neural Networks）是华为为昇腾（Ascend）AI 处理器打的整套软件栈，定位大致对标 NVIDIA 的 CUDA 生态。CANN 里离开发者最近的一层叫 AscendCL（Ascend Computing Language，简称 ACL）：一套 C 语言 API 库，覆盖运行时资源管理、内存管理、模型/算子加载与执行、媒体数据处理等能力。AscendCL 还提供了 pyACL——用 CPython 把 AscendCL 包一层，让开发者可以直接用 Python 调这些接口，不必写 C。本章 camem.py 顶部那句 `from acl.rt import memcpy`，`acl.rt` 就是 pyACL 里 runtime 子模块的绑定，`memcpy` 对应的底层 C 接口就是 `aclrtMemcpy`（见下方 notation 条目）。",
+      "background": "CUDA 从一开始就是「驱动 API + 运行时 API」双层设计，围绕它长出了 cuDNN、cuBLAS 等一整套库生态；CANN 是华为对标着搭的同类软件栈，AscendCL 承担的角色约等于 CUDA Runtime API（再往下还有更底层的驱动接口，不在本章范围）。vLLM 生态原生只认 CUDA/ROCm；vllm-ascend 要把整套推理引擎搬到昇腾硬件上，第一层要解决的就是「CUDA 的 API 调用点，换成 CANN 对应的 API 调用点」——本章的 camem.py 与 vLLM cumem.py 逐行对照，正是这条移植主线在显存分配器这一个模块上的体现：cudart/libcudart.cudaMemcpy 换成了 acl.rt.memcpy（aclrtMemcpy），torch.cuda.* 换成 torch.npu.*（NPU 后端是 PyTorch 通过 CANN 提供的适配层暴露出来的设备类型）。",
+      "example": null,
+      "links": [
+        "https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/80RC2alpha002/devguide/appdevg/aclpythondevg/aclpythondevg_0003.html",
+        "https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/81RC1alpha002/apiref/appdevgapi/aclcppdevg_03_0105.html"
+      ],
+      "sources": [
+        {"url": "https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/80RC2alpha002/devguide/appdevg/aclpythondevg/aclpythondevg_0003.html", "note": "昇腾社区官方文档：pyACL 概述，确认 pyACL 是对 AscendCL 的 CPython 封装、CANN 是两者的底层软件框架，访问于 2026-07-25"}
+      ],
+      "confidence": "high",
+      "writer_note": "章首已经有一句『CANN（昇腾的计算架构，对位 CUDA）』带过，够用了——这条背景不需要大段展开，最多在 §7.3.1 讲 acl.rt.memcpy 出处时补一句『acl.rt 是 AscendCL 的 Python 绑定 pyACL 里的 runtime 子模块』，链接留给读者深挖 CANN 全貌，别在正文铺开讲 CANN 的完整架构（跑题）。"
+    },
+    {
+      "id": "aclrtmemcpy-signature",
+      "term": "aclrtMemcpy 函数签名",
+      "kind": "notation",
+      "one_line": "CANN 官方 C API `aclrtMemcpy(dst, destMax, src, count, kind)`——本章反复用到的 memcpy 就是它的 Python 绑定，签名比 CUDA 的 cudaMemcpy 多两个参数。",
+      "what_it_is": "这是 AscendCL 里做主机/设备间内存拷贝的核心接口，官方 C 签名是：`aclError aclrtMemcpy(void *dst, size_t destMax, const void *src, size_t count, aclrtMemcpyKind kind)`。五个参数依次是：目的地址指针、目的缓冲区的最大容量（字节，超过这个数系统会认为写越界）、源地址指针、要拷贝的字节数、拷贝方向枚举。方向枚举 `aclrtMemcpyKind` 至少有四个取值：`ACL_MEMCPY_HOST_TO_HOST`、`ACL_MEMCPY_HOST_TO_DEVICE`、`ACL_MEMCPY_DEVICE_TO_HOST`、`ACL_MEMCPY_DEVICE_TO_DEVICE`。对照 CUDA 的 `cudaMemcpy(dst, src, count, kind)`——参数更少，因为 CUDA 版本没有 destMax 这个上界参数。",
+      "background": null,
+      "example": {
+        "description": "本章 camem.py 里两处真实调用（sleep 里的 D2H、wake_up 里的 H2D），逐参数对上官方签名。",
+        "snippet": "# sleep（D2H）—— vllm_ascend/device_allocator/camem.py:L203\nACL_MEMCPY_DEVICE_TO_HOST = 2\ndest_max = cpu_ptr + size_in_bytes * 2\nmemcpy(cpu_ptr, dest_max, ptr, size_in_bytes, ACL_MEMCPY_DEVICE_TO_HOST)\n#      ^dst    ^destMax  ^src ^count          ^kind\n\n# wake_up（H2D）—— vllm_ascend/device_allocator/camem.py:L226\nACL_MEMCPY_HOST_TO_DEVICE = 1\ndest_max = ptr + size_in_bytes * 2\nmemcpy(ptr, dest_max, cpu_ptr, size_in_bytes, ACL_MEMCPY_HOST_TO_DEVICE)\n#      ^dst ^destMax  ^src     ^count         ^kind",
+        "annotation": "第一处：把设备显存 (ptr) 拷到 CPU 备份 (cpu_ptr)，方向 D2H=2；第二处反过来，H2D=1。两处的 dest_max 都不是精确值，是 `目的地址数值本身 + size*2` 这种远超实际拷贝量的宽松上界——只要不小于 count 就不会被判越界，具体见 §7.5.4 的解释。枚举值 1/2 与官方文档给出的 `ACL_MEMCPY_HOST_TO_DEVICE`/`ACL_MEMCPY_DEVICE_TO_HOST` 对应，已用昇腾社区官方 API 文档核实。"
+      },
+      "links": [
+        "https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/81RC1alpha002/apiref/appdevgapi/aclcppdevg_03_0105.html"
+      ],
+      "sources": [
+        {"url": "https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/81RC1alpha002/apiref/appdevgapi/aclcppdevg_03_0105.html", "note": "昇腾社区官方 AscendCL API 参考：aclrtMemcpy 完整签名、参数语义（含 destMax/kind）、aclrtMemcpyKind 枚举值列表，访问于 2026-07-25"}
+      ],
+      "confidence": "medium",
+      "writer_note": "§7.5.4 已经把 destMax/kind 讲得很到位、也给了源码级例子——签名与枚举值本身已核实一致，不必再改写正文。**但有一处需 Lead/writer 知悉的细节**：昇腾社区文档（CANN Community Edition 8.1.RC1.alpha002 版 aclrtMemcpy 页）里 kind 参数的官方措辞是『预留参数，配置枚举值中的值无效，系统内部会根据源/目的内存地址指针判断能否拷贝』——即近期 CANN 文档口径下 kind 更像『声明性/向前兼容占位』，并非像 CUDA 早期那样必须靠它才能定方向（系统会自动按地址判断）。这与正文 §7.5.4『CANN 则要求你把方向写明』的表述存在张力，但因：①未能核实 vllm-ascend v0.21.0 实际锚定的 CANN 版本是否也是这个措辞（不同 CANN 版本文档用词可能有别）；②即便 kind 值被忽略，代码仍然物理上传了这个参数、且传的枚举值语义上是对的，不算错误陈述——只是『是否必需』这个强调点可以更精确。故未改写正文，标 medium 是因为这条只单一来源核实、未跨版本交叉验证；仅供 writer/Lead 参考，是否要把『要求』软化成『沿用了 CUDA 的显式方向习惯，尽管 CANN 新版文档说这个值实际已不影响判断』，由 Lead 定夺。",
+      "caveat": {
+        "finding": "CANN 官方文档（Community Edition 8.1.RC1.alpha002）称 aclrtMemcpy 的 kind 参数为『预留参数，配置枚举值中的值无效，系统内部会根据源/目的地址指针判断』——即方向实际由地址自动推断，不完全依赖 kind 取值。",
+        "source": "https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/81RC1alpha002/apiref/appdevgapi/aclcppdevg_03_0105.html（访问于 2026-07-25）",
+        "unverified": "未核实 vllm-ascend v0.21.0rc1 实际适配/pin 的 CANN 工具链版本是否用同一措辞；不同 CANN 版本的文档用词可能不同，未做跨版本交叉验证。",
+        "impact": "正文 §7.5.4『CANN 则要求你把方向写明』这句的『要求』二字可能偏强；建议 Lead 视情况决定是否软化措辞或保留（代码确实显式传了正确的枚举值，陈述本身不算错）。"
+      }
+    },
+    {
+      "id": "vllm-sleep-mode-feature",
+      "term": "vLLM 官方 sleep mode 特性（与 RLHF 场景的关系）",
+      "kind": "external_concept",
+      "one_line": "vLLM 上游自己就有的一个官方特性：睡眠时最多能还回 90% 以上显存，专为「同一张卡上推理引擎和训练框架轮流用」的 RLHF 场景设计——本章 CaMemAllocator 移植的正是这个特性的底座。",
+      "what_it_is": "vLLM 官方文档把 sleep mode 描述为：在不停止 server、不销毁进程的前提下，临时释放模型权重和 KV cache 占用的显存；level 1 offload 权重到 CPU、丢弃 KV cache；level 2 权重和 KV cache 都丢（只留 buffer 在 CPU），用于彻底腾地方或者要整体换模型/更新权重的场景。文档明确点名的核心用例就是 RLHF 训练：训练进程和 vLLM 推理进程如果分时复用同一批 GPU（所谓 colocate/hybrid engine），推理阶段用 vLLM 生成 rollout，切到训练阶段要计算梯度、更新权重，这时候如果两边都各自占着显存互不相让，很容易 OOM；sleep mode 让推理侧在不用的间隙把显存让出来，且支持唤醒时只挑权重或只挑 KV cache 醒。",
+      "background": "这条能力最初是为解决 RLHF 系统里「训练与推理左右互搏、抢显存」的痛点而生的：像 OpenRLHF 这类框架早期的做法是训练、推理各占一批 GPU（分离部署），显存不冲突但机器利用率低；后来出现「hybrid engine / colocate」思路——训练和推理挤在同一批 GPU 上分时复用，这样机器利用率上去了，但显存冲突的问题就必须靠类似 sleep mode 这种「按需释放/恢复」的机制来解。vLLM 社区围绕这个方向还有专门的 RFC 讨论如何优化训练进程到 vLLM worker 之间的权重同步（把训练侧算出来的新权重高效地灌回处于 wake 状态的 vLLM）。本章开篇 §7.1 举的『RLHF 场景』例子，讲的正是这条真实存在的上游动机，不是虚构的教学场景。",
+      "example": null,
+      "links": [
+        "https://docs.vllm.ai/en/latest/features/sleep_mode/",
+        "https://github.com/vllm-project/vllm/issues/15254"
+      ],
+      "sources": [
+        {"url": "https://docs.vllm.ai/en/latest/features/sleep_mode/", "note": "vLLM 官方文档：sleep mode 概览、level 1/level 2 语义、RLHF 场景与选择性 wake_up(tags) 用法，2025-11-12 版本，访问于 2026-07-25"},
+        {"url": "https://github.com/vllm-project/vllm/issues/15254", "note": "vLLM RFC：为 RLHF 场景优化 sleep mode 唤醒时的权重更新流程，佐证 sleep mode 的核心驱动场景确为 RLHF，访问于 2026-07-25"}
+      ],
+      "confidence": "high",
+      "writer_note": "§7.1 开篇的 RLHF 场景已经写得很好、也自洽，这条背景主要是给 writer 一个『这不是我编的教学场景，vLLM 官方文档本就是这么写的』的底气——可选在 §7.1 或小结里点一句『这正是 vLLM 官方文档点名的核心场景』并挂个链接，不必展开讲 vLLM 那条 RFC 的细节（离题）。"
+    },
+    {
+      "id": "expandable-segments",
+      "term": "expandable_segments（PYTORCH_CUDA_ALLOC_CONF / PYTORCH_NPU_ALLOC_CONF）",
+      "kind": "external_concept",
+      "one_line": "PyTorch 显存分配器的一个可选特性开关，靠同一套虚拟内存 API 把显存段做成「可扩展」来减少碎片——正因为它和 CaMemAllocator 底层抢用同一套 VA/物理页机制，两者互斥。",
+      "what_it_is": "PyTorch 默认的显存分配器每次向驱动要一段新内存（cudaMalloc）时，拿到的地址范围都是独立的，用完之后即使相邻的两段都空闲，也没法合并成一块更大的连续内存——这是显存碎片化的根源。expandable_segments 是一个可以通过环境变量 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`（NPU 侧对应 `PYTORCH_NPU_ALLOC_CONF`）打开的分配器行为：它底层用的正是前面提到的那套虚拟内存管理 API（先 reserve 一段可以后续扩大的虚拟地址、需要时再往后追加映射物理页），让一段「段」可以按需长大，从而减少因地址不连续造成的碎片。",
+      "background": "expandable_segments 和本章的 CaMemAllocator（vLLM CuMemAllocator）走的是同一层底层机制（cuMemAddressReserve/cuMemCreate/cuMemMap 这套 VMM API），但目的完全不同：一个是为了减碎片，一个是为了 sleep/wake。两者都要在虚拟地址层面做「预留/扩展」的操作，一旦同时开启就会互相踩踏——这正是 camem.py `__init__` 里那句 `assert \"expandable_segments:True\" not in conf` 硬拒绝的原因，PyTorch 官方也在 issue #147851 里确认了 CUDAPluggableAllocator + MemPool 组合与 expandable_segments 不兼容。vLLM 上游在这条 issue 讨论之后，把处理方式从『构造时硬拒绝』改成了『进入 use_memory_pool 时临时关掉、退出再恢复』——dossier 已经指出 vllm-ascend 这版还停留在硬拒绝阶段，是移植时点较早的版本差，不是本章要重点展开的内容。",
+      "example": null,
+      "links": [
+        "https://github.com/pytorch/pytorch/issues/147851"
+      ],
+      "sources": [
+        {"url": "https://github.com/pytorch/pytorch/issues/147851", "note": "PyTorch 官方 issue：expandable_segments 与 CUDAPluggableAllocator+MemPool 不兼容的确认与讨论，camem.py 断言注释里引用的正是这个 issue，访问于 2026-07-25"}
+      ],
+      "confidence": "medium",
+      "writer_note": "正文 §7.4.2 已经点了这个 assert 和差异的来龙去脉，不需要额外展开；这条背景的价值是解释『为什么 expandable_segments 和内存池不兼容』这个更底层的原因（两者抢同一套虚拟地址管理 API），如果 writer 觉得篇幅够可以补半句，不够就完全留给读者点链接自己看，非必需。"
+    },
+    {
+      "id": "vllm-pr-22724-callback-lifetime",
+      "term": "vLLM PR #22724：pluggable allocator 回调的悬垂引用 bug（\"deallocating None\"）",
+      "kind": "external_concept",
+      "one_line": "vLLM 上游一个真实修过的 bug：free 回调对象是「借用引用」，可能在内存池上下文退出后被 GC 提前回收，之后再触发释放就会调用一个已经死掉的函数——本章正文点名的『PR 22724』就是这个。",
+      "what_it_is": "camem.py/cumem.py 里的 python_malloc_callback/python_free_callback 是 CaMemAllocator 实例上的绑定方法（bound method）。C 扩展 init_module 拿到这两个方法对象时，只是『借用』了它们的引用（borrowed reference），没有替它们增加一次强引用计数。绑定方法对象本身很『短命』——一旦没有变量再持有它，CPython 就可能把它回收掉。如果 use_memory_pool(...) 的上下文退出之后，某个当初在这个池里分配的张量才被垃圾回收、触发 C 扩展去调 free 回调，而这个回调对象已经被提前 GC 掉了，C 扩展手里攥的就是一个『指向已死对象』的悬垂引用——调用它属于未定义行为，观察到的症状之一就是 sleep() 里 unmap_and_release 报『deallocating None』，或抛出别的 c10::Error。",
+      "background": "这个 bug 由社区用户 EricMarcus-ai 在 vLLM 仓库报出并提交修复（PR #22724），标题就是『CUDA pluggable allocator callback lifetime in CuMem (“deallocating None”)』。修法是在 C 扩展里改用显式引用计数（不再依赖 borrowed reference），确保只要内存池还可能触发 free 回调，Python 侧的回调对象就有人稳稳攥着不被 GC 提前收走。这处修复合入的是 vLLM 较新版本的 cumem.py；vllm-ascend 的 camem.py 是基于更早的 vLLM 版本移植的，尚未包含这处修复——dossier 已指出这一点（camem.py 的 __init__ 末尾没有给两个回调建强引用），本条研究只是给『PR 22724 确有其事、改了什么』补上一手核实的出处，不改变本章『移植=同构换符号，此处属版本时点差而非有意设计』的结论。",
+      "example": null,
+      "links": [
+        "https://github.com/vllm-project/vllm/pull/22724"
+      ],
+      "sources": [
+        {"url": "https://github.com/vllm-project/vllm/pull/22724", "note": "vLLM 官方 PR：标题、根因描述（borrowed reference 导致回调对象被提前 GC）、修复方式（显式引用计数）均已核实，访问于 2026-07-25"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文 §7.4.2 已提到『vLLM 新版在 __init__ 末尾给两个回调建了强引用（防一个 GC bug，见其 PR 22724）』——这条研究就是给这句话上的『PR 22724』一手核实其真实内容，不需要展开讲，维持正文现有的一句带过即可；若 writer 想加链接，可在这句话末尾挂 PR 链接。"
+    }
+  ]
+}
