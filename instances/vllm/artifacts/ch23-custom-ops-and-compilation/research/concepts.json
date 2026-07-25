@@ -1,0 +1,130 @@
+{
+  "chapter_id": "ch23-custom-ops-and-compilation",
+  "concepts": [
+    {
+      "id": "torch-compile-dynamo-inductor-pipeline",
+      "term": "torch.compile 的编译栈：Dynamo → FX Graph → 后端（Inductor / vLLM 自定义 VllmBackend）",
+      "kind": "external_project",
+      "one_line": "torch.compile 不是一个编译器，而是一条流水线：Dynamo 把 Python 字节码追踪成一张 FX 图，再把这张图整个甩给一个『后端』去优化——Inductor 是 PyTorch 官方后端，vLLM 的 VllmBackend 是自己写的替代后端。",
+      "what_it_is": "本章反复出现『Dynamo』『Inductor』『后端』『graph break』这些词，它们都属于 PyTorch 2.x 的 torch.compile 体系，不是 vLLM 自造的。分工是：(1) TorchDynamo 在 CPython 的帧求值层挂钩子，逐条解释 Python 字节码，把遇到的张量算子记成一张计算图（FX 图），遇到追不动的代码（比如依赖 Python 对象身份、复杂控制流）就『graph break』——把已经攒到的图先编译执行，剩下的代码退回普通 Python 解释，然后从下一条指令重新开始追踪；(2) 追完一段，Dynamo 把这张 FX 图连同示例输入一起交给一个『backend』函数，backend 的唯一契约是『输入一张 FX GraphModule，返回一个可调用对象』；(3) PyTorch 官方默认的 backend 叫 TorchInductor，它把图降层、做算子融合，再生成 GPU 上的 Triton kernel 或 CPU 上的 C++/OpenMP 代码。vLLM 没有直接用 Inductor 兜底整张图，而是自己写了一个 backend（本章的 `VllmBackend`）：拿到 Dynamo 给的整图后先按算子切段，规整段再各自送进 Inductor 编译，attention 段整段保持 eager——这解释了为什么本章的『第 2 级 dispatch』要在 `torch.compile(backend=VllmBackend(...))` 这层做文章。",
+      "background": "TorchDynamo/TorchInductor 是 PyTorch 2.0（2023）引入的新一代编译栈，取代早期基于 TorchScript/`torch.jit.trace` 的方案。此前 PyTorch 的『图捕获』要么侵入式地要求模型可 script 化，要么用 `torch.fx.symbolic_trace` 但碰到动态控制流就直接失败。Dynamo 的思路是在 CPython 字节码层面做『尽力而为』的追踪，遇到不支持的代码不报错，而是切一刀（graph break）继续跑，用户体验上表现为『大多数模型不用改代码就能获得部分加速』。torch.compile 的 backend 是一个开放接口（可通过 `torch.compile(backend=...)` 传自定义 callable），vLLM 正是利用这个口子插入自己的 piecewise 编译逻辑，而不是直接把整图交给官方 Inductor。",
+      "links": [
+        "https://docs.pytorch.org/docs/main/user_guide/torch_compiler/torch.compiler_dynamo_overview.html",
+        "https://docs.pytorch.org/docs/stable/compile/programming_model.graph_breaks_index.html",
+        "https://pytorch.org/docs/stable/torch.compiler.html"
+      ],
+      "sources": [
+        {"url": "http://docs.pytorch.org/docs/main/user_guide/torch_compiler/torch.compiler_dynamo_overview.html", "note": "官方文档：Dynamo 在字节码层追踪、生成 FX Graph，再交给可插拔的 backend；2026-07-24 查阅"},
+        {"url": "https://docs.pytorch.org/docs/stable/compile/programming_model.graph_breaks_index.html", "note": "官方文档：graph break 的定义——编译已追到的部分图、eager 跑不支持的代码、从下一条指令续追；2026-07-24 查阅"},
+        {"url": "https://uwplse.org/2025/04/28/torchdynamo.html", "note": "第三方技术博客，交叉印证 Dynamo→FX→Inductor 流水线角色划分；2026-07-24 查阅"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文已经把 Dynamo/Inductor/graph break 用得很自然，不需要大段插入百科式解释——在首次出现『Dynamo』『Inductor』『VllmBackend 是 torch.compile 的后端』时，点一句『backend 是 torch.compile 的可插拔契约：输入 FX 图、输出可调用对象，Inductor 是官方默认实现，vLLM 自己写了一个』，链接留给想深入的读者即可。"
+    },
+    {
+      "id": "fx-graphmodule-split-module",
+      "term": "torch.fx 的 GraphModule 与 split_module（整图如何被切成子模块）",
+      "kind": "external_concept",
+      "one_line": "FX 图不是抽象描述——`GraphModule` 是一个真的能跑的 `nn.Module`，`torch.fx.passes.split_module.split_module` 是 PyTorch 官方提供的『按你给的分区函数把一张大图切成若干子 `GraphModule`』的工具，vLLM 的 `split_graph` 直接调它。",
+      "what_it_is": "`torch.fx` 是 PyTorch 的图捕获/图变换基础设施：`symbolic_trace`（或 Dynamo）把一个模型的前向过程记录成一张由 `call_function`/`call_module`/`placeholder`/`output` 等节点组成的图，再包装成 `GraphModule`——它既是这张图的容器，又是一个可以直接调用、可以 `.forward(...)` 的 `nn.Module`。`torch.fx.passes.split_module.split_module(graph, root_module, split_callback, keep_original_order=...)` 是官方给的一个通用切图工具：你传一个『节点 → 分区编号』的回调（`split_callback`），它就把图按分区编号切成若干子 `GraphModule`、拼回一个顶层 `GraphModule`（每个分区变成一次 `call_module`）。`keep_original_order=True` 保证切分后各子图之间的执行顺序和原图一致，不会因为拓扑重排把有先后依赖的算子顺序打乱。本章 `split_graph` 里那句 `torch.fx.passes.split_module.split_module(graph, None, lambda node: node_to_subgraph_id[node], keep_original_order=True)` 正是直接调用这个官方 API，`node_to_subgraph_id` 就是喂给它的分区回调。",
+      "background": "`torch.fx` 是 2020 年左右 PyTorch 引入的『Python 到 Python』图变换框架，定位介于『完全不追踪』和『追踪成低级 IR（如 TorchScript）』之间——它保留 Python 语义、用普通 Python 对象表示图，方便写各种图变换 pass（量化、算子融合、并行切分等）。`split_module` 最初就是为流水线并行（pipeline parallelism，把一个大模型的层切到不同 GPU 上）这类『按需要把一张图切成几段、各段各自处理』的场景写的通用工具，vLLM 只是复用它来实现『按算子切分编译段』这个不同的目的。",
+      "links": [
+        "https://docs.pytorch.org/docs/stable/fx.html",
+        "https://github.com/pytorch/pytorch/blob/main/torch/fx/passes/split_module.py"
+      ],
+      "sources": [
+        {"url": "https://docs.pytorch.org/docs/stable/fx.html", "note": "官方文档：symbolic_trace 返回 GraphModule，GraphModule 包装图使其可运行；2026-07-24 查阅"},
+        {"url": "https://github.com/pytorch/pytorch/pull/65542", "note": "PyTorch PR 讨论 split_module 文档改进，确认 split_callback/keep_original_order 参数语义；2026-07-24 查阅"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文已经内嵌了 split_graph 调 split_module 的真实代码，读者看到 `torch.fx.passes.split_module.split_module(...)` 这行时可能疑惑『这是 vLLM 写的还是 PyTorch 自带的』——一句『这是 PyTorch fx 自带的官方切图工具，不是 vLLM 自己写的』就够，不必展开 split_module 内部实现。"
+    },
+    {
+      "id": "op-qualified-name-notation",
+      "term": "PyTorch 算子的限定名记法 `namespace::name`（OpOverloadPacket vs OpOverload）",
+      "kind": "notation",
+      "one_line": "PyTorch 里每个算子都有一个『命名空间::名字』的限定名，比如内置的 `aten::add`、vLLM 自己注册的 `vllm::unified_attention_with_output`；`should_split` 判断切点用的正是这份名字。",
+      "what_it_is": "PyTorch 的算子注册系统用 `命名空间::算子名`（如 `aten::sin`、`mylib::my_linear`）区分『谁定义的算子』，避免不同库注册同名算子时互相覆盖——`aten` 是 PyTorch 内置算子的命名空间，vLLM 通过 `direct_register_custom_op` 把自己的算子注册进 `vllm` 这个命名空间，于是它的全名是 `vllm::unified_attention_with_output`。同一个算子名下还可能有多个『重载』（overload），比如 `aten::add.Tensor`（两个张量相加）和 `aten::add.Scalar`（张量加标量）——`.Tensor`/`.Scalar` 这段后缀就是重载名。在 Python 里访问 `torch.ops.aten.add` 拿到的是一个 `OpOverloadPacket`（还没选定具体重载的『包』），继续访问 `torch.ops.aten.add.Tensor` 拿到的才是一个具体的 `OpOverload`。本章 `should_split` 函数正是在处理这个区分：如果 FX 节点的 `target` 是 `OpOverloadPacket`，直接用它的 `_qualified_op_name`（形如 `aten::add`）去匹配 `splitting_ops`；如果是 `OpOverload`，就拼出 `packet_name.overload名` 或退回 `packet_name` 去匹配。",
+      "example": "以 vLLM 自己注册的算子为例：`direct_register_custom_op(op_name=\"unified_attention_with_output\", ...)` 把它注册进 `vllm` 这个 Library，于是它的**限定名**是 `vllm::unified_attention_with_output`——这正是 `config/compilation.py` 里 `_attention_ops` 列表里那一串字符串的格式（`\"vllm::unified_attention_with_output\"`）。当 Dynamo 追踪出的 FX 图节点调用它时，`node.target` 是一个 `OpOverload`（因为 `direct_register_custom_op` 默认只定义一个重载），`should_split` 里 `target.name()` 拿到的 `packet_name` 就是 `vllm::unified_attention_with_output`，再和 `splitting_ops` 里的同名字符串做字符串匹配——匹配上就判定为切点。对照内置算子的例子：`torch.ops.aten.add` 是 `OpOverloadPacket`，`torch.ops.aten.add.Tensor` 才是具体的 `OpOverload`，`.Tensor` 就是重载名。",
+      "links": [
+        "https://docs.pytorch.org/docs/2.9/library.html"
+      ],
+      "sources": [
+        {"url": "https://docs.pytorch.org/docs/2.9/library.html", "note": "官方文档：算子用 namespace::name 限定名避免命名冲突，举例 aten::sin、mylib::my_linear；2026-07-24 查阅"},
+        {"url": "https://gemfury.com/turingmotors/python:torch/-/content/_ops.py", "note": "torch/_ops.py 源码镜像：OpOverloadPacket 持有『未解析』的基础算子，通过属性访问得到具体 OpOverload，如 torch.ops.aten._leaky_relu 是包、torch.ops.aten._leaky_relu.default 是重载；2026-07-24 查阅"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文 `should_split` 那段代码本身已经很清楚，读者可能只是没见过 `namespace::name` 这种记法——补一句『这是 PyTorch 给算子起的限定名规则，vllm:: 是 vLLM 自己注册算子用的命名空间，和 PyTorch 内置的 aten:: 是同一套机制』即可，不必展开 OpOverloadPacket/OpOverload 的实现细节。"
+    },
+    {
+      "id": "cuda-graph-capture-replay",
+      "term": "CUDA Graph（捕获/重放，消除 CPU launch 开销）",
+      "kind": "external_concept",
+      "one_line": "CUDA Graph 是 NVIDIA/PyTorch 提供的机制：把一串 GPU 操作『录』成一个静态结构，之后一次 CPU 调用就能重放整段操作，省掉每个 kernel 单独 launch 的 CPU 开销。",
+      "what_it_is": "正常情况下，每一次 GPU kernel 调用都要经过一次『CPU 发起 → 驱动 → GPU 排队执行』的流程，这个发起动作本身有几微秒到几十微秒的固定开销（launch overhead）。当模型很深、每层算子很小很多时，这部分 CPU 开销可能比 GPU 真正计算的时间还长，GPU 大部分时间在『等 CPU 喂下一个 kernel』，利用率上不去。CUDA Graph 的做法是：先进入『捕获模式』，把一段连续的 GPU 操作序列（kernel、内存拷贝等）整个记录下来，形成一张静态的『图』；之后每次要跑同样的操作序列，只需要一次『重放』（replay）调用，GPU 驱动按录好的图一次性把所有操作提交上去，避免了逐个 kernel 反复走 CPU-GPU 交互的开销。本章说的『piecewise CUDA graph』，就是把切图后每个『规整段』单独捕获成一个 CUDA Graph，按 batch size 重放。",
+      "background": "CUDA Graph API 由 NVIDIA 在 CUDA 10 引入，PyTorch 从约 1.10 版本起提供 `torch.cuda.graph`/`torch.cuda.make_graphed_callables` 等原生支持。它对『GPU 计算本身很快、但算子数量很多导致 CPU 端调度成为瓶颈』的场景最有效——这正是大模型推理里逐 token/逐层调用大量小算子的场景，也是 vLLM 为什么要把编译后的规整段包成 CUDA Graph 的动机。torch.compile 生态里进一步有 `CUDAGraph Trees` 这种更高级的自动化机制来管理多张 CUDA Graph 之间的内存复用，但本章讨论的是 vLLM 自己手动决定『哪些段要不要包 CUDA graph』（`wrap_with_cudagraph_if_needed`），不依赖 Inductor 内建的 CUDAGraph Trees。",
+      "links": [
+        "https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/",
+        "https://docs.pytorch.org/docs/stable/torch.compiler_cudagraph_trees.html"
+      ],
+      "sources": [
+        {"url": "https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/", "note": "PyTorch 官方博客：CUDA Graph 通过流捕获记录一串操作，重放时省去逐 kernel CPU launch 开销，尤其在 GPU workload 小、CPU 调度成瓶颈时收益大；2026-07-24 查阅"},
+        {"url": "https://docs.pytorch.org/docs/stable/torch.compiler_cudagraph_trees.html", "note": "官方文档：torch.compile 生态里管理多图内存复用的 CUDAGraph Trees 机制（用于对照说明 vLLM 走的是自管理路线）；2026-07-24 查阅"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文已经讲透了 CUDA graph 在本章场景里的收益（CPU launch 开销归零），这条主要是给『CUDA Graph 到底是什么、为什么捕获/重放能省开销』补一个通用背景，一两句带过，链接留给想看官方博客的读者。"
+    },
+    {
+      "id": "torch-library-custom-op-fake-impl",
+      "term": "torch.library 自定义算子注册：schema / mutates_args / fake（meta）实现",
+      "kind": "external_concept",
+      "one_line": "PyTorch 允许把任意 Python/C++ 函数注册成一个『正式的』torch 算子——声明它的类型签名（schema）、告诉框架它会原地改写哪些参数（mutates_args），再配一个『假实现』（fake/meta kernel）教 Dynamo 在不真正跑它的情况下推断输出形状。",
+      "what_it_is": "Dynamo 追踪时需要知道『这个算子的输出长什么样』才能继续往下追（用 FakeTensor 做符号传播），对 PyTorch 内置算子它有内建规则，但对一个全新注册的自定义算子（比如 vLLM 的 attention kernel）它完全不知道输出形状怎么算。这时如果没有『假实现』，Dynamo 只能真的执行一遍来看结果——但像 attention 这种依赖外部状态（KV cache）、原地写显存的操作，真执行是不安全/不可控的，于是 Dynamo 只能放弃追踪、graph break。`register_fake`（或老接口里的 `_register_fake`）就是解决这个问题的机制：开发者另写一个『假实现』，接收的是没有真实数据的 FakeTensor，只需要返回和真实输出『形状/dtype/device/stride 一致』的空壳张量（本章 attention 的 fake 实现甚至什么都不算，直接 `return`，因为它是原地写输出、没有返回值）。`mutates_args` 则是另一半契约：告诉 PyTorch『这个算子会原地修改哪些参数』，框架据此正确处理依赖顺序，不会把它误当成无副作用的纯函数去做激进优化（比如重排或去重）。",
+      "background": "早期 PyTorch 自定义算子（`torch.autograd.Function` 或裸 C++ 扩展）对 `torch.compile`/`torch.export` 不透明，很容易导致图断裂或行为不一致。PyTorch 2.x 引入了 `torch.library.custom_op`/`torch.library.register_fake` 这套标准化接口，明确『定义 schema + 提供 fake 实现』是让自定义算子融入编译图的正规路径。vLLM 在这套标准接口之外又写了一个更薄的 `direct_register_custom_op`（直接调 `Library.define`/`Library.impl`/`_register_fake` 三步），跳过 `torch.library.custom_op` 装饰器那层分发开销——但底层用的仍是同一套 `torch.library.Library` 机制，`mutates_args`/fake 实现这两个契约的语义完全一致，只是接口更底层、更手写。",
+      "links": [
+        "https://docs.pytorch.org/tutorials/advanced/python_custom_ops.html",
+        "https://docs.pytorch.org/docs/2.9/library.html"
+      ],
+      "sources": [
+        {"url": "https://docs.pytorch.org/tutorials/advanced/python_custom_ops.html", "note": "PyTorch 官方教程：fake kernel 让 torch.compile 在不真正执行的情况下推断输出元数据，没有它会 graph break；mutates_args 必须列出所有被原地修改的参数；2026-07-24 查阅"},
+        {"url": "https://docs.pytorch.org/docs/2.9/library.html", "note": "torch.library 官方文档：Library.define/impl/register_fake 的三段式注册，schema 字符串格式示例；2026-07-24 查阅"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文 §23.8 已经把 fake_impl/mutates_args 在 vLLM 里的作用讲得很细——这条背景主要用来印证『这不是 vLLM 独创的技巧，是 PyTorch 官方标准机制』,可以在提到 direct_register_custom_op 时一句带过'PyTorch 标准接口是 torch.library.custom_op，vLLM 这里绕开了它的分发开销、但契约相同'，链接留给想对照官方标准写法的读者。"
+    },
+    {
+      "id": "inductor-pre-post-grad-passes",
+      "term": "Inductor 的 pre-grad pass 与 post-grad pass（自定义图变换的两个挂载点）",
+      "kind": "external_concept",
+      "one_line": "TorchInductor 在把 FX 图变成最终 kernel 之前，留了两个『你可以插自己代码进去改图』的时间点：pre-grad（在图交给 autograd 分析之前，图还很『原始』）和 post-grad（autograd/lowering 之后，图已经规整、更适合做正式的模式匹配替换）。",
+      "what_it_is": "torch.compile 拿到 Dynamo 追出的图后，会经过若干阶段：先做一些早期变换（pre-grad），然后过 AOTAutograd 得到前向/反向图，再进入 post-grad 阶段（这里会跑 Inductor 的 pattern matcher，把常见子图模式替换成融合算子），最后才降层生成 Triton/C++代码。PyTorch 官方在这两个阶段各留了『自定义 pass』的挂载点：`pre_grad_custom_pass`（在 autograd 分析之前，官方文档明确警告这一层 IR『非函数式、未规范化、容易变』，不建议依赖）、`post_grad_custom_pre_pass`/`post_grad_custom_post_pass`（在 post-grad 阶段的模式匹配前/后各插一刀）。vLLM 章节末尾提到的 v0.21.0 更新——把 in-place 算子先以函数式形态喂给 Inductor、再由一道 pass 在编译期还原成就地写——用的正是这套官方挂载点：把自己的 pass 注册到 `pre_grad_custom_pass` 这个钩子上。",
+      "background": "这两个挂载点是 TorchInductor 给『既不想改 PyTorch 源码、又想在编译流程里插入自己图变换逻辑』的第三方（比如 vLLM、其他推理框架）开的口子，2023-2024 年间随 Inductor 的 pattern matcher 基础设施一起完善。它们和本章前面讲的『custom backend』是两种不同粒度的介入方式：custom backend（如 `VllmBackend`）替换的是『整个编译流程』，而 pre/post-grad custom pass 只是在官方标准流程里的某个时间点插一段自己的图变换，之后仍然继续走 Inductor 后面的融合/降层/代码生成。",
+      "links": [
+        "https://github.com/pytorch/pytorch/blob/main/torch/_inductor/config.py",
+        "https://github.com/pytorch/pytorch/issues/153532"
+      ],
+      "sources": [
+        {"url": "https://github.com/pytorch/pytorch/blob/main/torch/_inductor/config.py", "note": "Inductor config 源码注释：pre_grad_custom_pass 的 IR 非函数式/未规范化/易变，建议优先用 post-grad pass；post_grad_custom_pre_pass/post_pass 分别在 pattern_matcher 前后跑；2026-07-24 查阅"},
+        {"url": "https://github.com/pytorch/pytorch/issues/153532", "note": "PyTorch issue 讨论 Inductor 自定义 pass 注册接口现状，列出 pre_grad_custom_pass/post_grad_custom_pre_pass/post_grad_custom_post_pass/joint_custom_pre_pass 等钩子；2026-07-24 查阅"}
+      ],
+      "confidence": "medium",
+      "writer_note": "这条只对应正文 §23.3 末尾『v0.21.0 更新』那一段一句话背景——读者看到『pre-grad pass 跑在图交给 autograd 之前，post-grad pass 跑在图降层之后』时，可点一句『这是 Inductor 官方开的两个自定义图变换挂载点，不是 vLLM 自造』，不必展开细节；confidence 定 medium 是因为『pre-grad IR 不稳定、官方建议优先用 post-grad』这一细节来自 config.py 注释而非独立教程页，建议核实版本是否与本章 pin 一致后再下定论。"
+    },
+    {
+      "id": "rmsnorm-paper",
+      "term": "RMSNorm（Root Mean Square Layer Normalization）",
+      "kind": "external_concept",
+      "one_line": "RMSNorm 是 2019 年提出的一种比 LayerNorm 更省算力的归一化方法：只按『均方根』缩放，不做 LayerNorm 那步『减均值』的重新居中，效果相近但更快。",
+      "what_it_is": "LayerNorm 对每个样本做两件事：先减去均值（re-centering），再除以标准差（re-scaling），使输出均值为 0、方差为 1。RMSNorm 的论文提出一个假设：re-centering 这一步其实『可有可无』，模型效果主要来自 re-scaling 这一半。于是 RMSNorm 干脆跳过减均值，只用均方根（RMS，即 `sqrt(mean(x^2))`）去缩放输入，公式就是本章代码注释里写的 `x -> w * x / sqrt(E[x^2] + eps)`（`w` 是可学习权重）。少算一次均值和一次减法，换来计算量的下降，论文报告在不同模型上实测提速 7%~64%，同时精度基本不掉。这也是为什么现在几乎所有主流 LLM（Llama 系、Qwen 等）都用 RMSNorm 而不是原始 LayerNorm。",
+      "background": "论文《Root Mean Square Layer Normalization》由 Biao Zhang 与 Rico Sennrich 发表于 NeurIPS 2019。它是对 2016 年提出的 LayerNorm 的一个简化改进：LayerNorm 本身是为了解决 BatchNorm 依赖 batch 统计量、不适合变长序列/小 batch 场景而提出的替代方案；RMSNorm 则进一步精简 LayerNorm，只保留其中被认为最关键的『按幅度缩放』部分。",
+      "links": [
+        "https://arxiv.org/abs/1910.07467"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/abs/1910.07467", "note": "论文摘要：假设 re-centering 可省略，只保留 re-scaling 的 RMS 归一化；实测比 LayerNorm 快 7%~64%、精度相当；2026-07-24 查阅"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文 RMSNorm 类的 docstring 已经引用了这篇论文和公式，属于『初学者第一次见 RMSNorm 这个名字』的背景补充——一句话点出『它是 LayerNorm 的简化版，省掉减均值那步』即可，不需要展开论文实验细节，链接留给想读原文的读者。"
+    }
+  ]
+}

@@ -1,0 +1,91 @@
+{
+  "chapter_id": "ch22-model-definitions",
+  "generated": "2026-07-24",
+  "concepts": [
+    {
+      "id": "megatron-tensor-parallelism",
+      "term": "Megatron-LM 风格张量并行（列并行 + 行并行成对）",
+      "kind": "external_concept",
+      "one_line": "把一个大矩阵乘沿列或沿行切到多张卡上并行算，vLLM 的 ColumnParallelLinear/RowParallelLinear 直接沿用这套设计。",
+      "what_it_is": "张量并行（Tensor Parallelism, TP）是把单个大算子（矩阵乘）而不是把不同层切到多卡上的并行方式。Megatron-LM（NVIDIA, 2019）针对 transformer 的 MLP 和 attention 提出了一个经典配对：第一层权重沿输出维（列）切，第二层权重沿输入维（行）切。列并行的输出天然已经按列切好，可以直接喂给下一层的行并行（无需通信）；行并行在其内部（非线性激活之后）把各卡的部分和用一次 all-reduce 汇总。这样一个 MLP 或 attention 子块从头到尾只需要 1~2 次集合通信，而不是每个算子都通信一次。vLLM 的 `ColumnParallelLinear`/`RowParallelLinear`/`QKVParallelLinear`/`MergedColumnParallelLinear` 这套类名和切分语义，是这套 Megatron 模式在推理框架里的落地——本章看到的『列并行接行并行、末尾一次 all_reduce』的成对结构，其设计源头就是这篇论文，不是 vLLM 自己发明的。",
+      "background": "2019 年之前，大模型多卡训练主要靠数据并行（复制整个模型，切分 batch）或朴素的层间流水线并行（不同层放不同卡）。当单层参数量本身就大到放不进一张卡时，需要把『一层内部』也切开——这就是模型/张量并行。Megatron-LM 论文给出了一个不需要修改上层代码、只在少数几个通信点插入 all-reduce 就能做到的实现方案，后来成为几乎所有大模型训练/推理框架（DeepSpeed、vLLM、TensorRT-LLM 等）张量并行实现的事实模板。vLLM 的线性层命名和切分逻辑与 Megatron-LM 论文里 `ColumnParallelLinear`/`RowParallelLinear` 的概念完全对应。",
+      "example": "以论文给出的两层 MLP 为例：`Y = GeLU(XA)`，`Z = Dropout(YB)`。`A` 沿列切成 `[A_1, A_2]`（每卡一半输出），`Y_i = GeLU(X A_i)` 各卡独立算、无需通信；`B` 沿行切成 `[B_1; B_2]`（每卡一半输入），因为 `Y` 已经按列（=B 的行）切好，各卡直接算 `Y_i B_i` 得到部分和，最后一次 all-reduce 求和得到完整 `Z`。本章看到的 `qkv_proj`（列并行）→`attn`→`o_proj`（行并行+all_reduce），以及 `gate_up_proj`（列并行）→`SiluAndMul`→`down_proj`（行并行+all_reduce），是这个两层模板在 attention 和 MLP 上的两次复用。",
+      "links": [
+        "https://arxiv.org/abs/1909.08053",
+        "https://github.com/NVIDIA/Megatron-LM"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/abs/1909.08053", "note": "Megatron-LM 论文摘要与提交信息（作者 Shoeybi et al., 2019-09-17 提交），确认列并行/行并行的成对设计与通信点数量；访问日期 2026-07-24"},
+        {"url": "https://github.com/NVIDIA/Megatron-LM", "note": "官方实现仓库，核对 ColumnParallelLinear/RowParallelLinear 命名与切分方向的现状；访问日期 2026-07-24"}
+      ],
+      "confidence": "high",
+      "writer_note": "已在正文按需点到（22.3 节讲清了列/行并行的切分方向与通信代价），可不必展开讲 Megatron 论文本身；如需一句溯源，可在『为什么这样划算』附近补一句『这是 Megatron-LM 论文提出的经典模板』，链接留给读者深入。"
+    },
+    {
+      "id": "gqa-grouped-query-attention",
+      "term": "GQA（Grouped-Query Attention，分组查询注意力）",
+      "kind": "external_concept",
+      "one_line": "介于『每个 query 头各配一份 K/V』（MHA）和『所有 query 头共用一份 K/V』（MQA）之间的折中：query 头分组，组内共享一份 K/V。",
+      "what_it_is": "标准多头注意力（MHA）里，每个 query 头都有自己独立的 key/value 头，头数相等。生成阶段每步都要把所有 KV 头的缓存搬进显存，头数越多、KV cache 越大、内存带宽压力越大。多查询注意力（MQA，Shazeer 2019）把所有 query 头压到共享同一份 KV，KV cache 缩小到 1/num_heads，但质量会打折。GQA（Ainslie et al., 2023）取中间值：把 query 头分成 `G` 组，组内共享一份 KV 头，`G` 通常远小于总头数、又大于 1。这样 KV cache 大小按组数（而非头数）线性增长，质量比 MQA 更接近标准 MHA，同时论文给出了『把已训练好的 MHA checkpoint uptrain 成 GQA』的低成本方案（约 5% 原始预训练算力）。",
+      "background": "MQA 最早在 Shazeer 2019 年的论文里提出，动机是自回归解码时反复从显存读取 K/V 张量的带宽瓶颈。但业界发现 MQA 直接从头训练或从 MHA 转换质量损失偏大、训练也不稳定。2023 年的 GQA 论文在此基础上提出折中方案并给出可行的 uptraining 方法，很快被 Llama 2/3、Mistral 等主流开源模型采用，GQA 也就成为如今『标准 KV 头数远小于 query 头数』这种模型配置的来源。本章看到的 `num_kv_head_replicas`（KV 头数小于 TP size 时需要复制而非切分）正是因为 GQA 把 KV 头数设计得很小（如 Llama-3-8B 只有 8 个 KV 头，用 16 卡以上做 TP 时 8 < 16，必然要复制）。",
+      "links": [
+        "https://arxiv.org/abs/2305.13245",
+        "https://arxiv.org/abs/1911.02150"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/abs/2305.13245", "note": "GQA 论文（Ainslie, Lee-Thorp, de Jong, Zemlyanskiy, Lebrón, Sanghai；2023-05-22 提交，2023-12-23 修订，EMNLP 2023 录用），确认 GQA 定义、uptraining 方案与约 5% 算力成本；访问日期 2026-07-24"},
+        {"url": "https://arxiv.org/abs/1911.02150", "note": "MQA 前身论文（Shazeer, 2019-11-06），确认 GQA 是对 MQA 的折中推广，动机是解码期 KV 带宽瓶颈；访问日期 2026-07-24"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文 22.4 节已经把 vLLM 内部的 K<P 复制推导讲得很透（这部分是本仓机制，researcher 不重复），但『GQA 这个概念本身从哪来、为什么现代 Llama 的 KV 头数远小于 query 头数』值得补一两句背景 + 链接，帮读者理解这不是 vLLM 独创的取舍，而是模型架构层面的既定设计；vLLM 只是要适配它。"
+    },
+    {
+      "id": "rope-rotary-position-embedding",
+      "term": "RoPE（旋转位置编码）",
+      "kind": "external_concept",
+      "one_line": "给 query/key 按绝对位置做一次确定性旋转，让两者点积的结果只依赖相对位置差，而不是绝对位置本身。",
+      "what_it_is": "标准 transformer 需要某种方式把 token 的位置信息注入模型（否则 attention 对顺序不敏感）。RoPE（Su et al., RoFormer, 2021）的做法是：把 query/key 的向量看成若干个二维子空间，对每个子空间按 token 的绝对位置角度做一次旋转（旋转矩阵），旋转后的 q、k 做点积时，位置信息会以『两个 token 位置差』的形式自然出现在结果里——不需要像早期 transformer 那样把位置编码直接加到 embedding 上。它的优点是对序列长度外推友好、可以和线性 attention 结合，且不额外增加参数。本章 `LlamaAttention.forward` 里的 `self.rotary_emb(positions, q, k)` 就是在做这一步：拿 token 的绝对位置对 q、k 做旋转，再送去做点积注意力。",
+      "background": "RoPE 之前主流位置编码分两派：一派是原始 Transformer 论文用的正弦函数绝对位置编码（直接加到 embedding），另一派是 T5 等模型用的可学习相对位置偏置。RoPE 提出了『用旋转而不是加法』的第三条路，2021 年论文发表后先在中文预训练模型 RoFormer 上验证，随后被 GPT-NeoX、PaLM、LLaMA 等主流大模型采用，现已成为事实标准，绝大多数 2023 年之后的开源 LLM（含 Llama 系列）都用它。",
+      "links": [
+        "https://arxiv.org/abs/2104.09864"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/abs/2104.09864", "note": "RoFormer/RoPE 原论文（Su, Lu, Pan, Murtadha, Wen, Liu；2021-04-20 提交），确认旋转矩阵编码绝对位置、点积结果只依赖相对位置差的核心性质；访问日期 2026-07-24"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文已经用一句括注给了一个足够初学者上手的定义（『按 token 的绝对位置对 q/k 做一次确定性旋转…』），这条研究只是给这句话托底 + 提供深入链接，不需要在正文展开讲旋转矩阵数学——那是第 29 章『解耦 RoPE』的地盘。"
+    },
+    {
+      "id": "swiglu-glu-variants",
+      "term": "SwiGLU（GLU 门控变体，SiLU + 逐元素相乘）",
+      "kind": "external_concept",
+      "one_line": "MLP 里把输入投影成两份，一份过 SiLU 激活当『门』，另一份原样当『值』，两者逐元素相乘作为输出——比单纯的 ReLU/GELU MLP 效果更好。",
+      "what_it_is": "GLU（Gated Linear Unit）最早是『输入分两路，一路过 sigmoid 当门控，两路相乘』的结构。Shazeer 2020 年的论文系统比较了把 GLU 里的门控函数换成不同激活函数（ReLU、GELU、Swish/SiLU 等）在 transformer FFN 层里的效果，其中 SwiGLU（门控用 SiLU/Swish）和 GEGLU（门控用 GELU）表现最好。SwiGLU 的具体计算是：`FFN(x) = (SiLU(xW_gate) ⊙ (xW_up)) W_down`——即『门控分支』过 SiLU 后与『值分支』逐元素相乘，再降维输出。本章看到的 `gate_up_proj`（把 gate 和 up 两个投影 fuse 成一个矩阵）+`SiluAndMul`（gate 过 SiLU 后与 up 相乘）+`down_proj`，就是 SwiGLU 的标准实现结构。",
+      "background": "原始 Transformer 的 FFN 是 `ReLU(xW1)W2` 这种简单两层结构。2020 年 GLU 变体论文验证了『加一个门控分支』能稳定提升下游任务效果，此后 SwiGLU 被 PaLM、LLaMA 系列采用并成为主流开源 LLM 的标配 FFN 结构，几乎取代了朴素 ReLU/GELU MLP。",
+      "links": [
+        "https://arxiv.org/abs/2002.05202"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/abs/2002.05202", "note": "GLU Variants Improve Transformer（Shazeer, 2020-02-12），确认 SwiGLU/GEGLU 定义与相对朴素 FFN 的效果提升，及后续被 PaLM/LLaMA 采用；访问日期 2026-07-24"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文一句括注（『SiLU 激活门控：gate 分支过 SiLU 后与 up 分支逐元素相乘，即 SwiGLU 的实现』）已经足够，这条研究是给这句话的背景托底，不需要展开公式，链接留给想深入的读者。"
+    },
+    {
+      "id": "python-for-else",
+      "term": "Python `for...else`（循环的 else 子句）",
+      "kind": "notation",
+      "one_line": "for 循环的 else 块只在循环『正常耗尽』（没被 break 打断）时执行——常用来表达『遍历完都没找到就走这条路』。",
+      "what_it_is": "Python 的 `for` 语句可以带一个 `else` 子句。它不是『循环体一次都没跑就执行』的意思（这是常见误解），而是『循环的可迭代对象被完全耗尽、循环没有被 `break` 中途打断』就执行；如果循环体里执行了 `break`，`else` 块会被跳过。这个语法常用来表达『在一堆候选里找一个满足条件的，找到就处理并跳出，找不到就走兜底逻辑』这种模式——正是本章 `LlamaModel.load_weights` 里 `for param_name, weight_name, shard_id in stacked_params_mapping: ... break` / `else: ...` 的用法：for 循环遍历 `stacked_params_mapping` 找这个权重名该映射成哪个 fused 参数，命中就 `break`（走 fused 装载路径），没命中任何映射就落到 `else`（走 `default_weight_loader` 直装）。",
+      "example": "```python\nfor i in range(3):\n    print(i)\nelse:\n    print(\"循环正常结束\")\n# 输出 0 1 2 循环正常结束\n\nfor i in range(3):\n    if i == 1:\n        break\n    print(i)\nelse:\n    print(\"这不会被执行\")\n# 输出 0    （break 跳出，else 不执行）\n```\n对应到本章的用法：`for` 遍历 `stacked_params_mapping` 三元组列表，命中某个 `weight_name`（如 `.q_proj`）就重命名、调用对应 `weight_loader`、`break`；如果这个权重名（比如 `embed_tokens.weight`）在整张映射表里一个都没命中，`for` 正常耗尽，落进 `else`，改用 `default_weight_loader` 直接装载——这就是『fused 权重 vs 非 fused 权重』两条装载路径在语法层面的分野。",
+      "links": [
+        "https://docs.python.org/3/reference/compound_stmts.html#the-for-statement"
+      ],
+      "sources": [
+        {"url": "https://docs.python.org/3/reference/compound_stmts.html#the-for-statement", "note": "Python 3 官方语言参考 §8.3，逐字确认 for-else 语义：『迭代器耗尽时执行 else 块；break 会跳过 else』；访问日期 2026-07-24（Python 3.14 文档，该条语义自 Python 2 起长期不变）"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文已提示『这段的骨架是 Python 的 for/else——一个容易看漏的语法』并紧跟给出解释，此条研究只是给这句提示补一个官方出处 + 更干净的独立示例；如果篇幅紧张可以完全不改动正文，这条留给可能的脚注或链接。"
+    }
+  ]
+}

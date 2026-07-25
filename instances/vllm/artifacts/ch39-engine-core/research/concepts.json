@@ -1,0 +1,76 @@
+{
+  "chapter_id": "ch39-engine-core",
+  "note": "本章两条主线（弹性 EP 扩缩状态机 / Responses API 多轮）本身是本仓自定义机制，属 analyst dossier 范畴，不在此重复解读。本文件只挖正文里真正的外部背景：(1) OpenAI Responses API 的 previous_response_id/store 语义（vLLM 在实现的官方 API 规范）；(2) Harmony 消息格式的 channel 记法（OpenAI 开源、非 vLLM 自造）；(3) Ray placement group（正文提到‘释放 ray placement group’一笔带过，读者未必知道是什么）；(4) torch.distributed 的 TCPStore/all_reduce/barrier 三个集合通信原语（正文大量使用但未展开讲）。四项均查过官方文档/仓库，给出处与访问日期。",
+  "concepts": [
+    {
+      "id": "openai-responses-api-multiturn",
+      "term": "OpenAI Responses API：previous_response_id 与 store",
+      "kind": "external_concept",
+      "one_line": "OpenAI 定义的一套 HTTP API 规范：客户端不必每轮把全部历史消息重新发一遍，服务器用一个 response id 帮你记住上文。",
+      "what_it_is": "Responses API 是 OpenAI 在 Chat Completions API 之后推出的新一代对话/生成接口。它的核心差异化能力是服务器端会话状态：调用时若带 `store=true`，本次生成的 response 对象会被服务器保存（官方文档写的是保存 30 天）；下一轮请求带上 `previous_response_id=<上次的 response.id>`，服务器就会自动把上一轮的输入输出接到这一轮前面，模型据此续答。客户端因此只需发『新增的这一句』，不用像用 Chat Completions 那样自己维护并每次回传整个 messages 数组。vLLM 的 `OpenAIServingResponses` 就是在实现这套官方 API 语义（用进程内字典 `response_store`/`msg_store` 模拟服务器存储）。",
+      "background": "Chat Completions API（`/v1/chat/completions`）是无状态设计：每次请求都必须带完整的 `messages` 数组，历史越长，客户端要传的数据越多，服务端也要重新处理整条历史。Responses API（`/v1/responses`）是 OpenAI 为简化多轮场景、并统一工具调用/推理链等新特性而设计的下一代接口，`previous_response_id` 就是它标志性的『服务器记忆』机制；更进一步的是官方还提供了 Conversations API，把会话本身建模成一个有独立 id 的长期对象，比逐个 response 链更持久。",
+      "example": "客户端两轮调用（据官方文档示例简化）：第一轮 `client.responses.create(model=..., input=\"tell me a joke\", store=True)` 拿到 `response.id`；第二轮 `client.responses.create(model=..., previous_response_id=response.id, input=[{\"role\":\"user\",\"content\":\"explain why this is funny.\"}], store=True)`——第二轮请求体里完全不含第一轮的问题和回答，服务器凭 `previous_response_id` 补上历史。这正是本章 §39.10 `create_responses` 里 `request.previous_response_id` → `response_store.get(...)` 那段在实现的语义。",
+      "links": [
+        "https://platform.openai.com/docs/api-reference/responses",
+        "https://platform.openai.com/docs/guides/conversation-state"
+      ],
+      "sources": [
+        {"url": "https://developers.openai.com/api/docs/guides/conversation-state", "note": "官方 conversation-state 指南（platform.openai.com/docs/guides/conversation-state 重定向到此）：previous_response_id 用法示例、store 参数保存 30 天、Conversations API 作为更持久方案；访问日期 2026-07-24"}
+      ],
+      "confidence": "high",
+      "writer_note": "已在正文点到『previous_response_id / store』的行为，无需展开讲 OpenAI 官方规范细节；这条研究主要是让 writer/读者确认『这是在实现一套外部标准 API，不是 vLLM 自造协议』，可在链接处一句带过即可。"
+    },
+    {
+      "id": "openai-harmony-format",
+      "term": "Harmony 消息格式（channel: final / analysis / commentary）",
+      "kind": "notation",
+      "one_line": "OpenAI 为 gpt-oss 系列开源模型设计的一种对话记法：用 `<|channel|>...<|message|>...<|end|>` 这样的特殊 token 把一条消息标成『最终答案』『思维链』或『工具调用』三种通道之一。",
+      "what_it_is": "Harmony 不是 vLLM 自造的格式，而是 OpenAI 随 gpt-oss 模型开源的一套渲染/解析规范（GitHub `openai/harmony`，含 Python/Rust 实现）。普通 chat 格式只有 `role`（system/user/assistant），Harmony 在此之上给 assistant 消息加了一个 `channel` 字段，用来区分模型输出的『性质』：面向用户的正式答案、内部推理草稿、还是工具调用请求，三者互不混淆，方便下游决定『哪些该展示给用户、哪些该隐藏、哪些该转发给工具执行器』。",
+      "background": "早期 chat 模型的输出是一整段纯文本，思维链（reasoning）如果想输出就得和最终答案混在一起，前端要么全展示（暴露不该给用户看的中间推理）要么全隐藏（用户看不到解释）。Harmony 通过显式的 channel 分类解决了这个问题：`analysis` 通道装思维链（不受和 `final` 一样的安全审查标准）、`commentary` 通道装工具调用相关的旁白、`final` 通道才是真正要展示给用户的正式回复。gpt-oss-120b/20b 就是照这套格式训练和微调的，因此推理服务必须按这套记法解析模型吐出的 token 序列，才能正确切分『答案』和『草稿』。",
+      "example": "一条完整 Harmony 序列长这样（简化）：\n```\n<|start|>system<|message|>You are a helpful assistant.<|end|>\n<|start|>user<|message|>2+2 是多少？<|end|>\n<|start|>assistant<|channel|>analysis<|message|>用户问一道简单算术，直接算：2+2=4。<|end|>\n<|start|>assistant<|channel|>final<|message|>2+2 等于 4。<|end|>\n```\n逐行看：前两行是普通 system/user 消息；第三行 assistant 消息带 `<|channel|>analysis`，是模型的内部推理草稿，正常情况下不展示给终端用户；第四行带 `<|channel|>final`，才是真正要回给用户的答案。本章 §39.12 `HarmonyContext.append_output` 解析的正是这样一串 token，`self.parser.messages` 拆出来的每条消息就带着这个 channel 标签。",
+      "links": [
+        "https://github.com/openai/harmony",
+        "https://developers.openai.com/cookbook/articles/openai-harmony"
+      ],
+      "sources": [
+        {"url": "https://developers.openai.com/cookbook/articles/openai-harmony", "note": "OpenAI Cookbook 文章（原 cookbook.openai.com/articles/openai-harmony 重定向到此），给出 `<|channel|>{name}<|message|>{content}<|end|>` 的确切 token 语法、三通道定义（final 面向用户/analysis 思维链不受同等安全约束/commentary 装 function tool call）、gpt-oss 模型适用范围；文章署期 2025-08-05，访问日期 2026-07-24"},
+        {"url": "https://github.com/openai/harmony", "note": "官方仓库 README：确认 harmony 是 OpenAI 为 gpt-oss 开源模型系列设计（非 vLLM 自造），解决多通道输出（思维链/工具调用前言/正式回复）与指令层级问题；访问日期 2026-07-24"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文 §39.10 把 Harmony 描述为『vLLM 内部的一种增强消息格式』——建议 writer 视情况澄清一句『其实是 OpenAI 为 gpt-oss 开源的格式，vLLM 拿来解析』，避免读者以为是本仓自造协议；channel 的三分（final/analysis/commentary）可用上面例子点一下，具体语法/token 细节留给链接，不必在正文展开完整 BNF。"
+    },
+    {
+      "id": "ray-placement-group",
+      "term": "Ray Placement Group",
+      "kind": "external_concept",
+      "one_line": "Ray（分布式计算框架）里的一种『资源预订单』：把一组 task/actor 需要的 CPU/GPU 在集群里一次性、原子地占好位置，而不是各自去抢、抢漏了就死锁。",
+      "what_it_is": "Placement Group 用『bundle』（一份资源需求，比如 `{\"GPU\": 4}`）作最小单位，把多个 bundle 按策略（挤在一个节点 `STRICT_PACK`/尽量挤但可分散 `PACK`/强制分散到不同节点 `STRICT_SPREAD`/尽量分散 `SPREAD`）在集群里原子地占位。所谓『原子』是指：要么这组资源全部预留成功，要么全部失败，不会出现『4 个 worker 里 3 个已经拿到 GPU、第 4 个卡在排队』这种半吊子状态，从根上避免了分布式训练里经典的 gang-scheduling 死锁。占位释放时，`remove_placement_group()` 会立刻收回资源，但也会强制终止正在用这批资源的 actor/task。",
+      "background": "分布式训练/推理常需要『一组进程必须同时就绪才能开始通信』（比如本章的 DP 进程组）。如果每个 worker 各自向调度器申请资源，可能出现有的 worker 排到了、有的排不到，先排到的傻等，占着资源却干不了活，是常见死锁源。Ray 的 placement group 就是为解决这类『group scheduling』问题而设计：先把整组资源原子地占下来，占不全就直接失败，不会出现互相卡死。vLLM 用 Ray 作为多进程/多节点编排后端时，每台被拉起的 EngineCore worker 都由一个 placement group 占位；本章 §39.9 提到被裁引擎退场时要『释放它的 ray placement group』，说的就是这组预留资源。",
+      "links": [
+        "https://docs.ray.io/en/latest/ray-core/scheduling/placement-group.html"
+      ],
+      "sources": [
+        {"url": "https://docs.ray.io/en/latest/ray-core/scheduling/placement-group.html", "note": "Ray 官方文档：placement group 定义（原子预留跨节点资源）、bundle 概念、四种放置策略（STRICT_PACK/PACK/STRICT_SPREAD/SPREAD）、生命周期与 remove_placement_group 的强制终止语义；访问日期 2026-07-24"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文只有一处顺带提到『释放它的 ray placement group（Ray 预留给这批 worker 的那组节点资源）』，已经给了括号内解释，符合『点到即止』——这条研究是给这句括号解释做一手核实背书，不需要再展开讲 Ray 或调度策略，除非 writer 想加一句『这是 gang scheduling 的常见解法』。"
+    },
+    {
+      "id": "torch-distributed-collectives",
+      "term": "torch.distributed 的 TCPStore / all_reduce / barrier",
+      "kind": "external_concept",
+      "one_line": "PyTorch 分布式库里的三个基础原语：TCPStore 是所有进程能读写的『共享黑板』，all_reduce 是『把大家的数字汇总算出同一个结果再发回每个人』，barrier 是『所有人走到这一行才能一起往下走』。",
+      "what_it_is": "TCPStore 是一个基于 TCP 的键值存储服务，本身通常由 rank 0 起一个小 server、其余 rank 当 client 连过去，提供 `set`/`get`/`add`（计数自增）/`wait`/`check` 等操作——它不参与模型计算，只是让分布式进程之间能低成本地『对暗号』（比如某个字符串键有没有被设置过、计数器到没到齐）。`all_reduce` 是集合通信操作：每个 rank 各贡献一个张量，操作把它们按指定的归约方式（`ReduceOp.SUM`/`MAX`/… 等）逐元素合并，再把合并结果广播回每一个 rank——用 `ReduceOp.MAX` 就是『取全组里最大的那份，所有人都拿到这个最大值』。`torch.distributed.barrier` 则是最朴素的同步点：调用它的进程会阻塞，直到组里所有进程都调用到了这一行，才一起放行——用来确保『没有谁跑到前面去』。",
+      "background": "这三者都是 PyTorch 分布式训练/推理的标准构件，不是 vLLM 自造：TCPStore 常见于进程组初始化时的 rendezvous（互相发现、交换连接信息）；all_reduce 是数据并行训练里最常见的梯度同步操作，`MAX` 归约在本章之外也常用于『取全局最大值/最新进度』这类场景；barrier 则是任何需要『大家先对齐再往下走』的分布式代码的标配。本章把三者组合出了一套自定义用法——TCPStore 计数 `eep_barrier_engine_count` 追踪『到齐了没』、两阶段 barrier（带超时/不带超时）容忍各 rank 收到通知的先后差、all_reduce(MAX) 用来对齐 DP wave 三元组——但这套组合本身是本仓机制（dossier 已讲透），三个原语各自是什么则是本条要补的外部背景。",
+      "example": "以 all_reduce(MAX) 为例，若三个 rank 各持 `[engines_running, current_wave, step_counter]` 三元组 `[1,7,142]`、`[1,7,141]`、`[0,0,0]`，调用 `torch.distributed.all_reduce(tensor, op=ReduceOp.MAX, group=...)` 后，三个 rank 收到的都是逐分量最大值 `[1,7,142]`——这正是本章 §39.6 时序图里那张表格演示的取值。barrier 的最简用法就是 `torch.distributed.barrier(group)`：单独一行，调用它的进程停在这，直到 group 里其他进程也都调用了同一行代码才继续。",
+      "links": [
+        "https://docs.pytorch.org/docs/stable/distributed.html"
+      ],
+      "sources": [
+        {"url": "https://docs.pytorch.org/docs/2.13/distributed.html", "note": "PyTorch 官方 torch.distributed 文档（stable 版重定向到具体版本页）：TCPStore 作为进程 rendezvous 的键值协调服务及 set/get/add/wait 操作、all_reduce 归约+广播语义与 ReduceOp.MAX 用法、barrier 的全员同步阻塞语义；访问日期 2026-07-24"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文对这三个原语的具体用法（eep_barrier_engine_count 计数、两阶段 barrier、all_reduce(MAX) 对齐 wave）已经讲得很细——这条研究只补『TCPStore/all_reduce/barrier 本身是 PyTorch 标准分布式原语，不是本仓自造』这层背景，供 writer 需要时轻点一句『这是 torch.distributed 的标准集合通信操作』，不必展开讲 PyTorch 分布式 API 全貌。"
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "chapter_id": "ch19-model-runner",
+  "concepts": [
+    {
+      "id": "cuda-graph-capture-replay",
+      "term": "CUDA Graph（图捕获/回放）",
+      "kind": "external_concept",
+      "one_line": "把一串本要逐个提交给 GPU 的 kernel 启动，预先录成一张『图』，以后一次调用把整张图重放，省掉每个 kernel 单独的调度开销。",
+      "what_it_is": "GPU 上每跑一个算子（kernel），CPU 都要经过驱动/运行时的一套调用把它『发射』给 GPU，这个动作本身有几微秒的固定开销（launch overhead）。当模型一拍前向要发射成百上千个小算子、而每个算子自己只算几十微秒时，这些几微秒的发射开销叠起来会显著拖慢整体——CPU 忙着一个个发射，GPU 之间还可能出现空档。CUDA Graph 是 NVIDIA CUDA 运行时提供的一种机制：先把一段 GPU 操作序列（kernel 调用、异步拷贝、事件等）连同它们的依赖关系『捕获』成一张有向无环图（一次性代价），之后每次要跑同样的操作序列，只需一次 `cudaGraphLaunch` 调用把整张图提交给 GPU，由 GPU 内部按图重放，不再需要 CPU 逐个发射。代价是牺牲了运行时的灵活性——图里的形状、参数结构在捕获时就定死了，输入形状变了通常需要重新捕获一张新图（或走非图路径）。",
+      "background": "这是 NVIDIA CUDA 运行时自 CUDA 10 引入的通用特性（CUDA Graphs API），PyTorch 从较早版本开始通过 `torch.cuda.graph`/`torch.cuda.CUDAGraph`（基于『流捕获』stream capture）暴露给用户：把一个 CUDA stream 置入捕获模式，这段时间内提交给它的操作不会真的执行，而是被记录进图；捕获结束后即可反复 replay。这套机制天然适合『同一段计算反复执行、形状不变』的场景——LLM 推理里一拍前向要在几十毫秒内反复跑，正是典型场景，因此 vLLM 等推理引擎大量借助它压缩每拍的 launch 开销。",
+      "example": "概念性对比：eager 模式下跑 3 个算子 `A(x); B(y); C(z)`，CPU 依次发射 3 次 kernel launch（每次几微秒调度开销 + kernel 自身执行时间）。CUDA Graph 模式下先『捕获』一次——把 `A→B→C` 连同它们的依赖记录成一张图 `G`；以后只需 `G.replay()`（对应 `cudaGraphLaunch`）一次调用，GPU 内部按图顺序执行三者，CPU 侧只有一次调度开销。前提是 `A`/`B`/`C` 用的输入输出张量地址、形状在每次 replay 时保持一致（或用同一块预先分配好的缓冲区）——这也是为什么『批次形状必须精确匹配捕获时的形状』会成为 CUDA Graph 使用中的一条硬约束。",
+      "links": [
+        "https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/",
+        "https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#cuda-graphs"
+      ],
+      "sources": [
+        {"url": "https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/", "note": "PyTorch 官方博客：CUDA Graph 的捕获/回放机制、stream capture 用法、launch overhead 问题的量化描述（访问日期 2026-07-24）"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文已经把『NONE/PIECEWISE/FULL 三态的 launch 开销量级』讲得很清楚，这条背景不必展开复述，只需在首次出现『CUDA graph』『replay』『capture』字眼时点一句『这是 NVIDIA CUDA 的通用图捕获/回放机制，不是 vLLM 自创』，把『为什么形状必须精确匹配』这条硬约束的来历交代一句即可，深挖交给链接。"
+    },
+    {
+      "id": "vllm-cudagraph-mode-design",
+      "term": "vLLM CUDAGraphMode（PIECEWISE / FULL 分级捕获设计）",
+      "kind": "custom_pattern",
+      "one_line": "vLLM 自己的编译框架把『整图捕获』和『分段图捕获』做成可按批次形状分别选择的两级策略，而不是非此即彼。",
+      "what_it_is": "CUDA Graph 本身只提供『捕获一段固定操作序列、之后重放』的通用机制（见上一条），但一个 Transformer 前向里有的算子（尤其某些 attention 后端）在给定后端下并不支持被塞进同一张图、或要求批次内所有请求的查询长度一致才能捕获。vLLM 的编译框架因此没有做『整个前向要么全图化要么全不图化』的二选一，而是把 CUDA graph 的适用范围拆成两级：`PIECEWISE`——把前向里 attention 等『图不兼容』的算子留在 eager（每拍照常发射），其余连续的算子段各自录成小图；`FULL`——连 attention 也一起录进同一张整图，launch 开销最低但要求这一拍的批次形状精确匹配某张已捕获的图（用一个 `BatchDescriptor` 描述批次特征，含 `num_tokens`/`num_reqs`/`uniform` 等字段作为图的『键』）。`NONE` 是彻底不用图的 eager 兜底。运行时的 `CudagraphDispatcher` 就是按这套键去查『这一拍的形状有没有一张对应的图』，查不到就退到更保守的模式。",
+      "background": "vLLM 的这套分级设计是在原有『编译与图捕获强耦合、体验非此即彼』的旧方案上演进出来的——官方设计文档明确写道新设计要『显式区分 prefill/mixed 批次与（uniform）decode 批次，分别捕获』，因为像 FlashInfer、FlashMLA 这类注意力后端只在批次内请求的查询长度一致（uniform decode）时才支持整图捕获，级联注意力等后端则完全不支持整图。除 `NONE`/`PIECEWISE`/`FULL` 这三个『具体运行时模式』外，vLLM 配置层还有面向用户的组合选项 `FULL_DECODE_ONLY`（只对 decode 批次上整图，混合批次不上图，P/D 分离部署里的 decode 实例常用）和 `FULL_AND_PIECEWISE`（decode 上整图、prefill/混合批次上分段图，官方称为对多数模型最省的设置）——但 dispatch 时最终落到的仍是 `NONE`/`PIECEWISE`/`FULL` 这三个具体值，与本章讲的 dispatch 逻辑一致。",
+      "links": [
+        "https://github.com/vllm-project/vllm/blob/main/docs/design/cuda_graphs.md",
+        "https://docs.vllm.ai/en/v0.21.0/api/vllm/config/compilation/"
+      ],
+      "sources": [
+        {"url": "https://github.com/vllm-project/vllm/blob/main/docs/design/cuda_graphs.md", "note": "vLLM 官方设计文档：piecewise/full 两种捕获模式的动机、BatchDescriptor 作为 dispatch 键、按批次一致性分别捕获的原因（访问日期 2026-07-24，文档为 main 分支活文档，非逐字锚定 v0.21.0 tag，但描述的设计与本章 pin 版一致）"},
+        {"url": "https://docs.vllm.ai/en/v0.21.0/api/vllm/config/compilation/", "note": "v0.21.0（本书 pin 版本）API 文档：CUDAGraphMode 各枚举值官方释义，确认 NONE/PIECEWISE/FULL 为『具体运行时模式』、FULL_DECODE_ONLY/FULL_AND_PIECEWISE 为组合配置项（访问日期 2026-07-24）"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文已经把 PIECEWISE/FULL/NONE 三态和 dispatch 顺序讲透，这条背景的价值在于让读者知道『这不是本仓临时发明，是 vLLM 编译框架的正式设计，有官方设计文档』，以及一句带过『配置层还有 FULL_DECODE_ONLY/FULL_AND_PIECEWISE 这类组合选项，但落到 dispatch 时仍是这三个具体值』——避免读者查资料时被这两个名字搞混。不必展开讲 P/D 分离用例，链接留给想深入的读者。"
+    }
+  ]
+}

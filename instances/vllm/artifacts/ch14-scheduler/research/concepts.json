@@ -1,0 +1,63 @@
+{
+  "chapter": "ch14-scheduler",
+  "generated": "2026-07-24",
+  "scope_note": "本章高度聚焦本仓自定义调度机制（抢占循环、双队列、RequestStatus 状态机），绝大多数名词无需外部研究。逐句核对 dossier.json 与 narrative/chapter.md 后，找到 3 处正文已经在使用、但没有点名/溯源的标准外部背景：(1) 双队列防「队头阻塞」这个现象在网络/系统领域有标准名字和历史；(2) 「投机解码」与 bonus token 的算术来自两篇 2023 年论文；(3) 正文『很多推理系统换出到 CPU』这句对比，最贴切、最可查证的出处其实是 vLLM 自己的奠基论文（PagedAttention, SOSP'23），而非某个泛泛的『别的引擎』。三者均已挖到权威一手来源。",
+  "concepts": [
+    {
+      "id": "hol-blocking",
+      "term": "队头阻塞（Head-of-Line Blocking, HOL blocking）",
+      "kind": "external_concept",
+      "one_line": "排在队列最前面的一项卡住走不动，会连累它后面本来可以立刻处理的所有项目一起被拖住——一个在网络与系统领域反复出现的经典问题。",
+      "what_it_is": "HOL blocking 描述这样一个场景：一个 FIFO（先进先出）队列里，只有队头的元素能被检查/处理；如果队头这一项因为某个外部条件没满足而暂时处理不了，即便队列后面排着大把『现在就能处理』的元素，它们也必须干等队头让开，因为规则只允许按顺序来。结果是吞吐大幅下降、后面本不该等待的请求被无辜拖慢，最坏情况下（队头长期卡死）吞吐可以塌缩到接近 0。本章 §14.4 描述的场景——一个等远程 KV / 等 grammar 编译的请求卡在 waiting 队头，后面一堆『随时能跑』的请求被迫等它——就是这个问题在调度器里的具体形态；vLLM 给出的解法（把阻塞态请求隔离到 skipped_waiting 第二队列）本质上是网络界处理 HOL blocking 的经典思路（虚拟输出队列 virtual output queueing 的同源想法：给不同『去向』的东西分开排，别让一种去向堵住另一种）的调度器版本。",
+      "background": "这个词最早出现在 1980~90 年代的电路/包交换网络研究里：输入缓冲交换机（input-buffered switch）用单一 FIFO 缓存待转发的包，如果队头的包因为它的目标输出端口正忙而无法转发，即便队列后面的包目标是空闲端口，也一样卡住——理论分析显示，均匀随机目的地时，这种设计下交换机吞吐的渐进上限只有约 58.6%（Karol et al. 的经典结果）。业界后来的标准解法是虚拟输出队列（Virtual Output Queueing, VOQ）——给每个目标分别开一个队列，从根源上避免相互阻塞。这个概念此后被反复复用：TCP 的可靠字节流里，一个丢包会让它之后所有已到达的数据都无法交付给应用层（必须等重传补齐）；HTTP/1.1 的单连接顺序响应、以及 HTTP/2 在 TCP 层的队头阻塞（应用层多路复用解决了，但底层单个 TCP 连接的丢包重传问题仍在，这也是 HTTP/3 改用 QUIC/UDP 的动机之一）。vLLM 调度器的 `waiting`/`skipped_waiting` 双队列，正是这套『别让一种去向堵住另一种』思路在请求调度场景的具体应用——只不过这里的『去向』是『可调度』与『阻塞态』两类。",
+      "example": "单队列场景：FIFO 队列 `[R0(阻塞:等远程KV), R1, R2, R3]`，R1/R2/R3 都已就绪可调度。若必须严格按队头顺序处理，R0 没准备好就卡住整条队列，R1/R2/R3 全部被迫等待——即便它们和 R0 完全无关。双队列场景（vLLM 实际做法）：R0 一开始就被 `_enqueue_waiting_request` 按状态分流进 `skipped_waiting`，`waiting` 里只剩 `[R1, R2, R3]`；调度循环从 `waiting` 正常拉起 R1/R2/R3，R0 只在 `skipped_waiting` 里等被 `_try_promote_blocked_waiting_request` 定期尝试『提升』。",
+      "links": [
+        "https://en.wikipedia.org/wiki/Head-of-line_blocking"
+      ],
+      "sources": [
+        {"url": "https://en.wikipedia.org/wiki/Head-of-line_blocking", "note": "HOL blocking 定义、输入缓冲交换机的 58.6% 吞吐上限结果、HTTP/1.1→HTTP/2→HTTP/3 的演进关系；WebFetch 核实于 2026-07-24"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文 §14.4 已经用『队头阻塞』描述了这个现象，但没有点名它是网络/系统领域的标准术语（英文 head-of-line blocking / HOL blocking）。可以考虑在首次出现『队头阻塞』时加一个简短夹注或脚注，让读者知道这不是 vLLM 自造词，而是借用了网络交换机/HTTP 领域的经典问题和经典解法（虚拟队列隔离）；链接留给想深入的读者，正文不必展开历史，一句『这在网络交换机、HTTP/2 里也是经典问题，解法都是“分开排队”』足够。"
+    },
+    {
+      "id": "speculative-decoding-bonus-token",
+      "term": "投机解码（Speculative Decoding）与 bonus token",
+      "kind": "external_concept",
+      "one_line": "先用一个便宜的小模型『蒙』出几个候选 token（草稿），再用大模型一次前向并行验证要不要这些草稿——统计上和大模型逐个采样完全等价，但摊薄了大模型的调用次数；验证全部通过时还能额外白捡一个大模型自己采的『bonus token』。",
+      "what_it_is": "投机解码的核心动作分两步：draft（草稿）——用一个更小更快的模型自回归生成 K 个候选 token；verify（验证）——把这 K 个候选连同上文一起喂给大模型做一次前向，大模型在同一次前向里对每个候选位置都算出自己的概率分布，然后逐个用『修正过的拒绝采样』规则判断：候选 token 以 $`\\min(1, p_{\\text{target}}/p_{\\text{draft}})`$ 的概率被接受；一旦某个候选被拒绝，就在该位置从『目标分布减去草稿分布、再归一化』的残差分布里重新采样一个 token 替代它，并把这个候选之后的草稿全部丢弃。如果全部 K 个候选都被接受，大模型这次前向其实还多算出了『下一个位置』的分布（因为验证批次本身就比原来的自回归多铺了一个位置），可以顺手从这个分布再采一个 token——这就是本章代码里 `num_accepted = len(generated_token_ids) - 1` 里那个『-1』对应的东西：`generated_token_ids` 里最多的一个就是这个额外白捡的 bonus token，它不算『被接受的草稿』，要单独减掉。这套机制保证最终采样的 token 序列，分布和『不用投机、老老实实让大模型逐个采样』完全一致——不是近似加速，是无损加速。",
+      "background": "投机解码由两个研究组在 2023 年初几乎同时独立提出：Leviathan、Matias 等人（Google Research）发表《Fast Inference from Transformers via Speculative Decoding》（arXiv:2211.17192，ICML 2023），Chen、Borgeaud 等人（DeepMind）发表《Accelerating Large Language Model Decoding with Speculative Sampling》（arXiv:2302.01318）。两篇论文用的数学框架高度一致（都是『用一个廉价近似模型做提议分布，再用目标模型做拒绝采样式的精确修正』），核心贡献都是证明了这套『先猜后验』的过程在分布上与直接从目标模型采样完全等价（exact，不掉点数）。Leviathan 等人在 T5-XXL 上报告 2-3 倍加速，Chen 等人在 Chinchilla（70B）上分布式场景下报告 2-2.5 倍加速。这个思路此后被整个业界迅速工程化（vLLM、TensorRT-LLM、SGLang 等推理引擎均实现了投机解码变体），衍生出用 n-gram/树状多候选/自蒸馏草稿模型等大量变种，但『draft-then-verify + 拒绝采样 + bonus token』这套骨架来自这两篇奠基论文。",
+      "example": "假设本拍某请求的草稿给了 3 个候选 token（`num_draft_tokens=3`），大模型验证后：第 1、2 个候选被接受，第 3 个候选被拒绝并在该位置重采样出替代 token——那么 `generated_token_ids` 长度是 3（2 个被接受 + 1 个重采样替代），`num_accepted = len(generated_token_ids) - 1 = 2`，`num_rejected = num_draft_tokens - num_accepted = 1`，与直觉『猜 3 个，中 2 个』一致。如果反过来 3 个候选全部被接受，大模型这次前向会额外产出一个 bonus token，`generated_token_ids` 长度变成 4，`num_accepted = 4 - 1 = 3`（3 个草稿全中，那个额外的 bonus token 不算在『接受的草稿』里），`num_rejected = 0`。",
+      "links": [
+        "https://arxiv.org/abs/2211.17192",
+        "https://arxiv.org/abs/2302.01318"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/abs/2211.17192", "note": "Leviathan et al. 论文摘要：draft-then-verify 框架、精确分布等价性、T5-XXL 上 2-3x 加速；WebSearch 核实于 2026-07-24"},
+        {"url": "https://arxiv.org/abs/2302.01318", "note": "Chen et al. 论文摘要：modified rejection sampling、Chinchilla 70B 上 2-2.5x 加速；WebSearch 核实于 2026-07-24"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文 §14.5 已经用一句话点了『投机解码会先用小模型猜草稿 token，再用大模型一次性验证』以及『减 1 是因为有个 bonus token』，这两条已经讲得足够清楚，不需要展开算法细节或数学推导（那是投机解码专章的活，若全书另有投机解码章可交叉引用）。这条研究主要是给『为什么减 1』这句话补一个可查证的出处（两篇 2023 年论文），writer 可选择性加一条『这套投机解码源自 2023 年 Leviathan/Chen 两篇论文』的脚注或不动——链接留给想深挖算法的读者即可，正文密度已经够了。"
+    },
+    {
+      "id": "kv-preemption-swap-vs-recompute",
+      "term": "KV 缓存抢占恢复策略：swap（换出到 CPU）vs recomputation（丢弃重算）",
+      "kind": "external_concept",
+      "one_line": "当 KV 缓存块不够用、必须抢占某个正在跑的请求腾地方时，业界有两条经典路：把它的 KV 缓存『存起来』（换出到 CPU 内存，以后原样换回）,还是『扔掉』（以后从头重新算）——这两条路径最早正是在 vLLM 自己的奠基论文里被并列提出的。",
+      "what_it_is": "抢占恢复（recovery）指的是：一个请求被抢占腾出显存后，等它下次有机会继续跑时，怎么把它『之前跑到哪儿了』这件事恢复回来。两种经典策略：swapping——把被驱逐请求的 KV 缓存物理块整体拷贝（序列化）到 CPU 内存里存着，等重新调度时再原样拷贝回 GPU，代价是走 PCIe 带宽、且需要在 CPU 侧管理一块换出缓冲区；recomputation——干脆不存，直接把这些 KV 块释放掉，等请求重新被调度时，把它已经生成的那些 token 和原始 prompt 拼在一起当成一个『新 prompt』，用一次 prefill 迭代把所有位置的 KV 重新批量算出来（不是逐 token 慢慢重跑 decode，是当一整批 prefill 一次算完，所以延迟通常远低于当初『一个个 decode 出来』的原始延迟）。本章看到的 `_preempt_request`——直接 `kv_cache_manager.free(request)` + `num_computed_tokens = 0`，完全没有任何『拷到 CPU』的动作——走的正是 recomputation 这条路径。",
+      "background": "这两种策略在 vLLM 项目自己的奠基论文《Efficient Memory Management for Large Language Model Serving with PagedAttention》（Kwon et al., SOSP 2023，arXiv:2309.06180）里就已经并列给出：论文原话讲 swapping 是『把驱逐的页拷贝到磁盘上的交换空间；在我们这里，是把驱逐的块拷贝到 CPU 内存』，讲 recomputation 是『在被抢占的序列重新被调度时，我们直接重新计算它的 KV 缓存』，并特别指出重算的延迟可以显著低于原始延迟——因为解码阶段生成出来的 token 可以和原始用户 prompt 拼成一个新 prompt，其所有位置的 KV 缓存能在一次 prefill 迭代里批量算出来（prefill 阶段的批处理效率远高于逐 token decode）。也就是说，vLLM 从一开始的设计（对应本书 v0.21.0 pin 之前更早的历史版本）就同时支持两种策略，工程上以引擎参数 `preemption_mode`（可选 `SWAP` / `RECOMPUTE`）暴露给用户选择。据 2026-07 访问的官方文档《Optimization and Tuning》页面，V1 架构『默认抢占模式是 RECOMPUTE 而不是 SWAP，因为在 V1 架构下重算的开销更低』；进一步检索发现，较新版本文档站的 `vllm.config.scheduler.SchedulerConfig` 参考页里，已经完全查不到 `preemption_mode` 这个字段——提示 V1 可能已经把 `SWAP` 这条路径整个收窄甚至去掉，只留 recompute 一条腿（这一点与本章源码 `_preempt_request` 里没有任何 CPU 拷贝逻辑的实现是吻合的），但没有查到 vLLM 官方 changelog/PR 明确写『移除 preemption_mode』的一手声明，这部分暂标 medium 置信度。",
+      "example": null,
+      "links": [
+        "https://arxiv.org/abs/2309.06180",
+        "https://docs.vllm.ai/en/stable/configuration/optimization/"
+      ],
+      "sources": [
+        {"url": "https://ar5iv.labs.arxiv.org/html/2309.06180", "note": "PagedAttention 论文 HTML 镜像：直接引到 swapping／recomputation 两段原话（『copy evicted pages to swap space... we copy evicted blocks to CPU memory』『we simply recompute the KV cache when the preempted sequences are rescheduled』『recomputation latency can be significantly lower... concatenated with the original user prompt as a new prompt』）；WebFetch 核实于 2026-07-24"},
+        {"url": "https://docs.vllm.ai/en/stable/configuration/optimization/", "note": "官方文档确认 V1 默认抢占模式为 RECOMPUTE、原因是『V1 架构下重算开销更低』；WebFetch 核实于 2026-07-24"},
+        {"url": "https://docs.vllm.ai/en/latest/api/vllm/config/scheduler/", "note": "较新版本 SchedulerConfig 参考页未见 preemption_mode 字段（间接佐证 V1 或已不对外暴露 SWAP 选项，未找到官方一手声明，故此点为 medium 置信）；WebFetch 核实于 2026-07-24"}
+      ],
+      "confidence": "medium",
+      "writer_note": "正文 §14.1 写的是『很多推理系统遇到内存压力会把 KV 缓存换出到 CPU』，这句对比的『别的引擎』其实最贴切、最可查证的出处正是 vLLM 自己更早的奠基论文（PagedAttention, SOSP'23）——swap/recompute 二选一这套框架本来就是 vLLM 论文提出的，只是 V1 架构后来选择只留 recompute 一条腿。writer 可以考虑把这句稍微精确化，例如改成『vLLM 自己的奠基论文就并列提出过换出和重算两条路，V1 选择只留后者』，会比含糊的『很多推理系统』更准确、也更有意思（呼应『v1 架构演进』的叙事）；若不改，也可以保持现状、只补一条脚注链接到论文，不是必须项，这条更偏事实校准建议，供 Lead/writer 取舍。"
+    }
+  ]
+}

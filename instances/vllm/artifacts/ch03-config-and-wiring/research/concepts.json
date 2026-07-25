@@ -1,0 +1,118 @@
+{
+  "chapter": "ch03-config-and-wiring",
+  "note": "本章正文（narrative/chapter.md，含 v0.21.0 更新框）里出现了几处需要外部背景才看得懂的非常识名词：torch.compile 的内部构成（Dynamo/Inductor）、CUDA Graph 的原理、Ray 作为分布式执行后端的定位、FlashInfer 及其 autotune 的正确性问题、KV transfer 兼容闸门背后的 RDMA/CUDA 虚拟内存冲突，以及一笔带过的 safetensors 格式。逐项 WebSearch/WebFetch 核实后产出以下 6 条。均为读者定向外部背景，不解读本仓 pin 源码逻辑本身（pin 源码的『它在 vLLM 里怎么用』留给 dossier/正文）。",
+  "concepts": [
+    {
+      "id": "ch03-torch-compile-dynamo-inductor",
+      "term": "torch.compile / TorchDynamo / TorchInductor",
+      "kind": "external_project",
+      "one_line": "torch.compile 是 PyTorch 2.0 起提供的『一行装饰器让模型跑得更快』的 JIT 编译器，内部由 TorchDynamo（抓图）+ TorchInductor（生成代码）两级组成——这正是 vLLM O1 级『Dynamo+Inductor 编译』这句话的全部含义。",
+      "what_it_is": "torch.compile 不要求你重写模型，它在运行时工作：TorchDynamo 借助 CPython 的 Frame Evaluation API，在字节码执行层面拦截 Python 函数调用，把能识别的 PyTorch 算子序列『抓』成一张计算图（FX Graph）；遇到它看不懂的动态分支（比如依赖张量值的 if），就在那里断开（graph break），那一小段退回普通 Python/eager 执行，抓到的图段继续往下走。TorchInductor 拿到 Dynamo 抓出的图后负责『生成快代码』——对 NVIDIA/AMD/Intel GPU，它用 OpenAI Triton 生成融合过的 kernel；对 CPU 生成向量化的 C++。两者合起来（外加 AOTAutograd 处理反向传播）构成 torch.compile 的完整流水线。vLLM 的『compilation_config.mode = VLLM_COMPILE』落地的正是调用这条流水线。",
+      "background": "PyTorch 2.0（2023 年）之前，TorchScript / torch.fx 也尝试过把动态 Python 模型转成静态图，但要求较严格、兼容性有限。torch.compile 走的是『JIT + 运行时图捕获 + 遇不懂就退化』的路线，目标是尽量不改代码就能吃到编译加速，是当前 PyTorch 官方主推的编译栈。",
+      "links": [
+        "https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html",
+        "https://github.com/pytorch/torchdynamo",
+        "https://docs.pytorch.org/docs/main/user_guide/torch_compiler/torch.compiler.html"
+      ],
+      "sources": [
+        {"url": "https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html", "note": "2026-07-24 WebFetch：确认 torch.compile 于 PyTorch 2.0 引入，TorchDynamo 负责追踪代码/处理 graph break。"},
+        {"url": "https://github.com/pytorch/torchdynamo", "note": "2026-07-24 WebSearch：TorchDynamo 用 CPython Frame Evaluation API 做字节码层拦截，抓 FX Graph；TorchInductor 是默认后端，NVIDIA/AMD/Intel GPU 走 OpenAI Triton。"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文（3.9 节 O0-O3 定义处）已经点了一句『Dynamo 负责图捕获，Inductor 负责代码生成』——这条研究确认了这句话准确，且可以补一句『遇到看不懂的动态分支会 graph break、退回 eager』帮读者理解为什么 O1/O2 有时也会有『没编译到』的部分；不必展开 Frame Evaluation API 细节，链接留给深入读者。"
+    },
+    {
+      "id": "ch03-cuda-graph",
+      "term": "CUDA Graph（cudagraph）",
+      "kind": "external_concept",
+      "one_line": "把一串 GPU kernel 调用连同它们的依赖关系『录制』成一张图，之后用一次 host 调用整体重放，省掉逐条 kernel launch 的 CPU 开销——这是 vLLM cudagraph_mode（NONE/PIECEWISE/FULL_AND_PIECEWISE）里 cudagraph 这个词的全部所指。",
+      "what_it_is": "问题背景：GPU 上每个算子跑得很快（微秒级），但 CPU 每 launch 一次 kernel 都有几微秒到几十微秒的固定开销；当模型算子很多、每个都很小时，CPU 发指令的速度反而成了瓶颈，GPU 大量时间在『等下一条指令』。CUDA Graph 的解法：先跑一遍『capture』——这期间 CUDA 只记录 GPU 端要做的操作（kernel、内存拷贝、事件）和它们的依赖顺序，不是真的执行；capture 完，把这张图『实例化』，以后每次要跑同样的操作序列，只需要一次 cudaGraphLaunch 调用，GPU 按预录的依赖图自己把整串操作跑完，CPU 不用逐条再发指令。缺点/前提：图里的形状、控制流必须在 capture 时就固定死（同一份显存地址、同一个 shape），所以碰到真正的动态 shape 或依赖数据的分支就没法整图 capture——这正是 vLLM 用 PIECEWISE（只对可静态化的子图开 cudagraph，其余部分留给正常 eager/编译执行）而不是无脑 FULL 的原因。",
+      "example": "PyTorch 官方给出的最小 capture/replay 模式：\n```python\ng = torch.cuda.CUDAGraph()\nwith torch.cuda.graph(g):\n    static_y = model(static_input)   # 这里只是『录制』，不是真跑\n...\nfor data in real_inputs:\n    static_input.copy_(data)\n    g.replay()   # 一次 host 调用，把整个前向重放一遍\n```\ncapture 阶段的 Python/CPU 逻辑正常跑一次（用来确定要录哪些 GPU 操作），但真正加速发生在 replay：以后每轮只需要 `g.replay()` 这一次调用，而不是原来那一长串逐个算子的 launch。",
+      "background": "CUDA Graph 由 NVIDIA 在 CUDA 10（2018 年）引入，专门针对『GPU 算子越来越小、越来越多，CPU launch 开销占比越来越高』这个大规模分布式训练/低延迟推理里的通用瓶颈。",
+      "links": [
+        "https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/",
+        "https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html"
+      ],
+      "sources": [
+        {"url": "https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/", "note": "2026-07-24 WebFetch：capture/replay 机制、静态 shape 前提、make_graphed_callables 局部 capture（对应 vLLM 的 piecewise 思路）、CUDA 10 引入、实测加速数字（Mask R-CNN 1.70x 等）。"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文 3.9 节已用一句话解释了『录制重放、full 抓整图/piecewise 抓子图』，这条研究可以印证并给 writer 一个更具体的最小代码例子（若需要在正文里落一段真实 API 帮读者建立直觉），链接给想深挖 capture 约束细节的读者。"
+    },
+    {
+      "id": "ch03-ray",
+      "term": "Ray（分布式执行框架）",
+      "kind": "external_project",
+      "one_line": "一个通用的分布式计算框架，给 task（无状态远程函数）和 actor（有状态远程对象）两个原语；vLLM 的 distributed_executor_backend=\"ray\" 就是把执行器的多进程/多机编排整个交给它。",
+      "what_it_is": "Ray Core 提供三个基本抽象：task（用 @ray.remote 包一个函数，调用后立刻拿到一个『未来值』引用，函数在某个 worker 进程上异步跑）、actor（一个有状态的远程对象，方法调用在它自己的进程里顺序执行，用来在多次调用之间共享/保持状态）、object（task/actor 产生的结果，用引用而不是值来传递，可能存在集群任意一台机器上）。一个 Ray 集群有一个 head node（管调度和元数据）和若干 worker node（真正跑 task/actor），可以跨机器、跨容器。相比 vLLM 默认的 \"mp\" 后端（Python 标准 multiprocessing，只能管本机的子进程），Ray 天然支持跨节点调度、有 placement group（把一组 actor 绑定到特定资源布局）、以及基于世系（lineage）的容错——这解释了为什么 vLLM 只在『多机部署』或『检测到已经在 Ray 环境里』时才把默认后端从 mp 切到 ray：单机场景 mp 更轻，跨机场景才需要 Ray 这套更重的编排能力。",
+      "background": "Ray 由 UC Berkeley RISELab 发布（2017 年公开博客，2017/2018 年论文《Ray: A Distributed Framework for Emerging AI Applications》），现由 Anyscale 主导维护，是当前 AI/ML 训练与推理领域最常用的通用分布式执行框架之一（也被用在 RLHF、超参搜索等场景）。",
+      "links": [
+        "https://docs.ray.io/en/latest/ray-core/walkthrough.html",
+        "https://docs.ray.io/en/latest/ray-core/key-concepts.html",
+        "https://arxiv.org/pdf/1712.05889"
+      ],
+      "sources": [
+        {"url": "https://docs.ray.io/en/latest/ray-core/walkthrough.html", "note": "2026-07-24 WebSearch：Ray Core 三原语（task/actor/object）定义。"},
+        {"url": "https://docs.ray.io/en/latest/ray-core/key-concepts.html", "note": "2026-07-24 WebSearch：head node/worker node 集群架构、容错机制。"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文只需一句『Ray 是通用分布式计算框架，能跨机器调度 task/actor』定位它是什么、为什么多机场景默认切过去；不必展开 task/actor API 细节，链接给要深入的读者。"
+    },
+    {
+      "id": "ch03-flashinfer-autotune",
+      "term": "FlashInfer 与 autotune",
+      "kind": "external_project",
+      "one_line": "FlashInfer 是一个面向 LLM 推理的 GPU kernel 库（attention/采样/MoE 等融合算子），vLLM 用它的『autotune』在运行时对同一计算任务试跑多种 kernel 参数组合、挑最快的那个——但这条开关不是零风险，O2 默认关着正是因为一次实测过的正确性问题。",
+      "what_it_is": "FlashInfer 提供可定制的 attention kernel（支持 JIT 编译『自带的注意力变体』）、免排序的 top-k/top-p/min-p 采样融合 kernel，并且它生成的 kernel 能被 CUDA Graph 和 torch.compile 捕获（这也是它能嵌进 vLLM 编译流水线的原因）。『autotune』指的是：同一个计算任务（比如某个 GEMM 或 MoE 路由 kernel）往往有多种可选的底层实现参数（tile 大小、并行策略等），autotune 在运行时/首次调用时都试一遍、测出实际最快的那一种，此后固定用它——原理上类似 cuBLAS/cuDNN 常见的『算法自动搜索』。",
+      "background": "FlashInfer 由 flashinfer-ai 组织维护，是开源的 LLM 推理 kernel 库，被多个推理引擎（含 vLLM）用作可选的 attention/采样/MoE kernel 后端。vLLM 源码里 `enable_flashinfer_autotune` 旁边引用的 GitHub issue #3197（2026 年报告）记录了一起真实的正确性问题：在特定硬件上，FlashInfer 的 FP4 MoE 后端开启 autotune 后 GPQA 评测分数下降，关掉 autotune 或换别的 MoE 实现就恢复正常——这正是 vLLM 把 `enable_flashinfer_autotune` 在 O0-O2 都设为 False、只在 O3 打开的直接依据（O3 定位『未来预留 / 更激进』，与文档字符串里的说明一致）。",
+      "links": [
+        "https://github.com/flashinfer-ai/flashinfer",
+        "https://github.com/flashinfer-ai/flashinfer/issues/3197"
+      ],
+      "sources": [
+        {"url": "https://github.com/flashinfer-ai/flashinfer", "note": "2026-07-24 WebSearch：FlashInfer 定位（LLM serving 用 kernel 库）、JIT 可定制 attention、可被 CUDAGraph/torch.compile 捕获。"},
+        {"url": "https://github.com/flashinfer-ai/flashinfer/issues/3197", "note": "2026-07-24 WebFetch：issue 一手内容——FP4 MoE + autotune 在 DSV4 硬件上导致 GPQA 评测失败，禁用 autotune 或换 MoE 实现可规避，vLLM 集成测试中发现。"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文 3.9 节代码注释里已经引用了这个 issue 链接（`# Disabled for now due to correctness issues: .../issues/3197`）；这条研究把这句注释背后『到底出了什么问题』坐实了，writer 可以在讲『O2 为什么不开 flashinfer autotune』那句时点一句『2026 年曾报过 FP4 MoE 精度回归』，issue 链接留给愿意翻的读者，不必展开 GPQA/DSV4 细节。"
+    },
+    {
+      "id": "ch03-rdma-cuda-vmm-conflict",
+      "term": "RDMA 内存注册（ibv_reg_mr）与 CUDA 虚拟内存重映射（expandable_segments）的冲突",
+      "kind": "external_concept",
+      "one_line": "RDMA 网卡要求把一段内存『注册』并钉死虚拟地址到物理页的映射，好绕过 CPU 直接读写；而 PyTorch 的 expandable_segments 分配器为了省显存碎片，会把同一段虚拟地址背后的物理页动态换来换去——两套机制的假设互相矛盾，同时启用就可能让跨机 KV 传输在运行中突然失败。",
+      "what_it_is": "拆成两半看：(1) RDMA 侧——网卡要直接读写主机/显存内容而不经过 CPU/操作系统介入，前提是它自己维护一张『虚拟地址→物理地址』映射表；`ibv_reg_mr()` 这个调用做的就是把一段内存『注册』(registration)：把它钉住（pin，防止操作系统把这块内存换出或挪动），并把当前的虚实地址映射写进网卡硬件，之后网卡就能拿着这张表直接访问物理内存，不再需要每次都问 CPU。(2) CUDA VMM 侧——PyTorch 打开 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 后，显存分配器改用 CUDA 提供的底层虚拟内存管理 API（把『预留一段虚拟地址』和『真正映射物理页』拆成两步），可以按需把物理页映射进/移出某段虚拟地址，让一块内存池能像 mmap 一样弹性伸缩、减少因反复分配释放产生的碎片。矛盾点：如果一块被 RDMA 网卡『注册』(钉住、记了物理地址)的 KV cache 内存，恰好活在这样一段『背后物理页会被动态换掉』的虚拟地址上，网卡硬件里存的那张映射表会在某次重映射后过期——它还以为自己在读写 A 物理页，实际数据已经搬到了 B 物理页。下一次跨机 RDMA 读写就会在硬件层面直接报错（`IBV_WC_REM_ACCESS_ERR` 是 InfiniBand Verbs 完成队列里的一个错误码，字面意思是『远端拒绝访问』，通常正是映射失效/权限校验不过的信号）。",
+      "background": "这不是 vLLM 独有的坑，而是两套各自成熟、面向不同目标的机制放在一起用时的通用摩擦：RDMA 靠『地址映射长期不变』换极致的旁路 CPU 性能；现代显存分配器（包括 PyTorch 的 expandable_segments）靠『地址映射可以动态调整』换更少的显存碎片。PyTorch 自己的 issue 列表里也能看到与之同源的问题——比如 expandable_segments 和 NCCL 的 `ncclMemAlloc`（同样是『钉住内存』的场景）之间互操作性的讨论。",
+      "links": [
+        "https://www.rdmamojo.com/2012/09/07/ibv_reg_mr/",
+        "https://man7.org/linux/man-pages/man3/ibv_reg_mr.3.html",
+        "https://docs.pytorch.org/devlogs/eager/2026-06-01-cuda-caching-allocator/"
+      ],
+      "sources": [
+        {"url": "https://www.rdmamojo.com/2012/09/07/ibv_reg_mr/", "note": "2026-07-24 WebSearch：ibv_reg_mr() 的作用——注册内存、pin 住、把虚实地址映射写进网卡，使硬件可绕过 CPU 直接访问。"},
+        {"url": "https://man7.org/linux/man-pages/man3/ibv_reg_mr.3.html", "note": "2026-07-24 WebSearch 佐证：ibv_reg_mr 官方 man page，注册/pin 语义的权威定义来源。"},
+        {"url": "https://docs.pytorch.org/devlogs/eager/2026-06-01-cuda-caching-allocator/", "note": "2026-07-24 WebSearch：PyTorch expandable_segments 用 CUDA VMM API（cuMemCreate/cuMemAddressReserve/cuMemMap）按需映射/解除映射物理页以减少碎片的机制说明。"},
+        {"url": "https://github.com/pytorch/pytorch/issues/165419", "note": "2026-07-24 WebSearch：PyTorch 自己的 issue，讨论 expandable_segments 与其他『钉住内存』的 VMM-based allocator（NCCL ncclMemAlloc）互操作性问题，佐证这是通用摩擦而非 vLLM 特例。"}
+      ],
+      "confidence": "medium",
+      "writer_note": "RDMA『注册即钉死映射』与 CUDA VMM『按需动态重映射』这两条通用机制均一手核实、可放心讲；但『两者相撞精确产生 IBV_WC_REM_ACCESS_ERR』这条具体因果链，除了 vLLM 源码自己的注释外，我没找到独立的第三方权威来源逐字复核过——正文（3.4 节 v0.21.0 更新框）已经如实转述的是 vLLM 工程师给出的诊断，建议 writer 维持『据 vLLM 源码注释』这个措辞、不要把这条因果链包装成外部已公认的定论；两套机制各自的一般原理可以放心展开一两句帮读者建立直觉，具体报错码留给愿意深挖 InfiniBand Verbs 的读者。"
+    },
+    {
+      "id": "ch03-safetensors",
+      "term": "safetensors",
+      "kind": "external_project",
+      "one_line": "Hugging Face 推出的模型权重序列化格式，用来替代 Python 的 pickle（常见的 .bin 权重文件）——核心目的是『加载模型权重不会顺带执行任意代码』，顺带也更快。",
+      "what_it_is": "PyTorch 权重传统上用 pickle 序列化成 .bin 文件；pickle 反序列化时会执行文件里编码的任意 Python 代码，这意味着一个『看起来只是权重』的 .bin 文件理论上可以夹带恶意代码，加载即中招。safetensors 换了个思路：文件里只存纯张量数据，外加一个 JSON 头描述每个张量的名字/形状/dtype/在文件里的字节偏移，加载时不执行任何代码，只是按头信息去读字节——因此天然安全；又因为可以做内存映射/零拷贝读取，通常也比 pickle 反序列化快。vLLM 里提到的 `safetensors_prefetch_num_threads`/`safetensors_prefetch_block_size` 这类旋钮，就是在这个『按偏移读字节』的加载过程上加一层多线程预取，让读盘和后续处理重叠起来。",
+      "background": "由 Hugging Face 发布并维护，现在是 Hugging Face Hub 上模型权重的推荐格式，绝大多数新发布模型都同时提供 .safetensors 权重。",
+      "links": [
+        "https://huggingface.co/docs/safetensors/index",
+        "https://huggingface.co/docs/text-generation-inference/main/en/conceptual/safetensors"
+      ],
+      "sources": [
+        {"url": "https://huggingface.co/docs/safetensors/v0.3.2/index", "note": "2026-07-24 WebSearch：safetensors 官方定位——安全（不执行代码）+ 快的张量序列化格式，pickle 的替代品。"}
+      ],
+      "confidence": "high",
+      "writer_note": "本章只在 v0.21.0 更新框里带过 `safetensors_prefetch_num_threads` 这个新增旋钮，如果正文要提这个词，一句『safetensors 是 HF 的安全权重格式（不像 pickle 那样加载时会执行代码），prefetch 就是多线程提前把权重文件分块读进内存』就够，不必展开格式细节，链接留给好奇的读者。"
+    }
+  ]
+}

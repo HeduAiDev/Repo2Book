@@ -1,0 +1,87 @@
+{
+  "chapter_id": "ch18-model-runner",
+  "slug": "ch18-model-runner",
+  "produced_by": "researcher",
+  "date": "2026-07-24",
+  "scope_note": "本章大部分是本仓 pin 源码机制(持久批次/slot 复用/token 拍扁收集)——那是 analyst/explainer 的活，不在本清单。真正需要外部背景的只有四处：(1) `_compute_slot_mapping_kernel` 用的 Triton 是什么（本章是全书第一次真正走读一个 Triton kernel；ch32 之后会深入教一遍，本章只需点透『为什么这么写』的最小背景，避免读者对 `tl.program_id`/`tl.constexpr`/`grid` 一头雾水）；(2) `pin_memory=True` 为什么能让 `commit_block_table` 的拷贝与 CPU 计算重叠（页锁定内存与异步 DMA）；(3) 正文两次提到 CUDA graph 要求固定形状（本章只用它解释 PAD_SLOT_ID 尾部填充，未展开，ch01/ch19 已有更完整背景，这里给一份贴合本章用法的精简版）；(4) v0.21.0 更新侧栏点名的 TRTLLM MLA 这一外部项目/后端名词。PagedAttention 虽被提及（『这是 PagedAttention 的落点』）但 ch15 已高置信度深挖过，本章只是回指、不构成新缺口，未重复研究。四项均于 2026-07-24 实抓官方文档/教程核实，逐条给出处。",
+  "concepts": [
+    {
+      "id": "triton-language-ch18",
+      "term": "Triton（GPU kernel 编写语言）",
+      "kind": "external_project",
+      "one_line": "OpenAI 发布的 Python 嵌入式 GPU 编程语言：按『一整块数据』（tile）写逻辑，编译器自动把线程分组、内存合并这些手写 CUDA 才要操心的细节包办掉。",
+      "what_it_is": "本章 `_compute_slot_mapping_kernel` 顶着 `@triton.jit` 装饰器、用 `tl.program_id`/`tl.load`/`tl.store`/`mask=` 写成，这些不是 vLLM 自造的 API，而是 Triton 这门语言的标准写法。普通思路写 GPU 代码，要么调现成库（没有『按位置算 slot』这种现成算子），要么手写 CUDA C++——后者要自己管理成千上万个线程怎么分组、怎么把数据从显存搬进更快的片上内存、线程间怎么同步，门槛很高。Triton 把编程模型抬高一层：开发者只写『每个并行实例（Triton 叫 program，用 `tl.program_id` 认领『这次是哪一个』）处理一块数据』的逻辑——读一块、算一块、写回一块，`mask` 参数负责『越界/不该写的位置』一次性挡住，`BLOCK_SIZE: tl.constexpr` 告诉编译器这个块大小编译期已知、可以据此做向量化优化——编译器自己把这套 tile 级代码翻译成高效的底层 GPU 指令。本章 kernel 的 grid 是 `(num_reqs + 1,)`：每个请求一个 program，多出的最后一个 program（用 `tl.program_id(0) == tl.num_programs(0) - 1` 判断）专门负责把尾部 padding 成 `PAD_SLOT_ID`，这正是『program 各管一块、`tl.store` 配 `mask` 写』这套标准模式的一次具体应用。",
+      "background": "Triton 最初是 Philippe Tillet 在哈佛读博期间的研究项目，2019 年以论文《Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations》发表于 MAPL/PLDI 2019；OpenAI 在此基础上重新实现，2021 年以 1.0 版本开源（MIT 协议）。它的定位是『手写 CUDA 的高性能』与『调库的低门槛』之间的中间地带：写 Python、编译器管线程调度，换来接近专家级 CUDA 的性能。后来被深度集成进 PyTorch 的 `torch.compile`（作为 GPU 代码生成后端之一），也被 vLLM、SGLang 等推理框架广泛用来写自定义 kernel——本章的 slot 映射、后面章节的 attention/采样 kernel，都是这类『标准库没有现成实现，用 Triton 自己写』的例子。截至本次核实（2026-07-24），2026 年最新进展是 NVIDIA 为 Triton 集成了 CUDA Tile IR 后端（面向 Blackwell 架构），但这属于底层编译后端的扩展，不影响本章看到的 `@triton.jit` 表层写法。",
+      "example": "Triton 官方入门教程的向量加法 kernel，逐个 API 与本章 kernel 一一对应：\n\n```python\n@triton.jit\ndef add_kernel(x_ptr, y_ptr, output_ptr, n_elements,\n               BLOCK_SIZE: tl.constexpr):\n    pid = tl.program_id(axis=0)                       # 我是第几个并行实例\n    block_start = pid * BLOCK_SIZE\n    offsets = block_start + tl.arange(0, BLOCK_SIZE)   # 我这块负责哪些下标\n    mask = offsets < n_elements                        # 挡住越界\n    x = tl.load(x_ptr + offsets, mask=mask)\n    y = tl.load(y_ptr + offsets, mask=mask)\n    tl.store(output_ptr + offsets, x + y, mask=mask)\n\ngrid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )\nadd_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)\n```\n\n对照本章 `_compute_slot_mapping_kernel`：`tl.program_id(0)` 在这里认领的是『哪个请求』而非『哪块向量』；`grid=(num_reqs+1,)` 比请求数多开一个 program，就是靠同一个 `program_id` 判断『我是不是那个额外的』来实现『大多数 program 算 slot、最后一个 program 专门收尾 padding』；`tl.store(..., mask=...)` 同样用来防止往越界位置写。这就是本章那段 Triton 代码『看得懂但不知道语言规则』时最需要的最小背景。",
+      "links": [
+        "https://triton-lang.org/main/getting-started/tutorials/01-vector-add.html",
+        "https://github.com/triton-lang/triton",
+        "https://openai.com/index/triton/"
+      ],
+      "sources": [
+        {"url": "https://triton-lang.org/main/getting-started/tutorials/01-vector-add.html", "note": "官方教程完整抓取核实：@triton.jit、tl.program_id(axis=0)、tl.arange、mask=offsets<n_elements、tl.load/tl.store 配 mask、grid=triton.cdiv(...) 的写法与语义；访问日期 2026-07-24", "accessed": "2026-07-24"},
+        {"url": "https://openai.com/index/triton/", "note": "OpenAI 官方发布博客（经搜索摘要交叉确认）：Triton 是 Python 嵌入式 GPU 编程语言，目标是不需要专家级 CUDA 知识也能写出接近专家级性能的 kernel；访问日期 2026-07-24", "accessed": "2026-07-24"},
+        {"url": "https://github.com/triton-lang/triton", "note": "官方仓库：确认现行版本仍以 tile 级编程模型为核心卖点，MIT 协议开源；访问日期 2026-07-24", "accessed": "2026-07-24"}
+      ],
+      "confidence": "high",
+      "writer_note": "本章第一次出现真实 Triton kernel，读者大概率没见过 `tl.program_id`/`tl.constexpr`/`mask=` 这套写法——建议在 §18.8 讲 `_compute_slot_mapping_kernel` 时补一两句『这是 Triton，一种按 tile 编程的 GPU kernel 语言，program_id 认领哪块数据、mask 挡越界』，不必展开教程级细节（那是 ch32 §18.9-32.11 的活，正文可以说『后面章节还会更深入地走读一个 Triton kernel』做个预告）。当前正文已经把 `grid=(num_reqs+1,)` 和『最后一个 program 做 padding』讲清楚了，这条研究主要补『Triton 本身是什么』这一层，不重复正文已讲的具体逻辑。"
+    },
+    {
+      "id": "pinned-memory-async-dma-ch18",
+      "term": "页锁定内存（pinned memory）与异步 DMA 拷贝",
+      "kind": "external_concept",
+      "one_line": "普通内存可能被操作系统换页搬走，GPU 不敢直接对它做直接内存访问；『钉住』（pinned）不换页的内存，GPU 才能绕开一次隐藏拷贝、真正异步地把数据搬走。",
+      "what_it_is": "本章 `token_ids_cpu_tensor = torch.zeros(..., pin_memory=self.pin_memory)` 里的 `pin_memory=True`，以及后面 `commit_block_table`／各种 `.copy_to_gpu()`／`non_blocking=True` 拷贝，背后都依赖同一个 CUDA 机制：操作系统的虚拟内存会把普通（pageable）内存页按需换出到磁盘，这意味着 GPU 不能直接对着这类内存发起 DMA（直接内存访问）——它可能在搬运途中被换页移走。CUDA 驱动应对的办法是：搬普通内存时，先在内部悄悄开一块页锁定（不会被换出）的临时缓冲，把数据拷进去，再从这块缓冲搬去显卡——多了一次隐藏拷贝，且这次拷贝是同步的（CPU 得等它做完）。如果一开始就把数据放在页锁定内存里（本章的 `pin_memory=True`），就跳过了这道隐藏拷贝：CPU 发起搬运指令后可以立刻去做别的事，不用等搬完。这正是正文说『commit_block_table 能把块表拷贝和 CPU 计算重叠，前提就在这里』的物理原因——没有 pinned memory，这次拷贝本身就是阻塞的，无从谈重叠。",
+      "background": "这是 CUDA 平台的通用机制，不是 vLLM 独创；NVIDIA 官方一直建议对『频繁反复传输的数据』显式分配页锁定内存以获得更高带宽和真正的异步性。但它不是没有代价：页锁定内存不能被换出，用多了会侵占物理内存、影响系统里其他程序的可用内存；因此实践里通常只对『确实要反复异步搬运』的缓冲区（如本章跨迭代存活的 `token_ids_cpu`、块表镜像）用 pinned memory，而不是无脑全开。",
+      "links": [
+        "https://developer.nvidia.com/blog/how-optimize-data-transfers-cuda-cc/",
+        "https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html"
+      ],
+      "sources": [
+        {"url": "https://developer.nvidia.com/blog/how-optimize-data-transfers-cuda-cc/", "note": "NVIDIA 官方博客：pageable 内存搬运时驱动内部先拷进临时 pinned 缓冲再传显卡（多一次拷贝且该步骤同步）；显式分配 pinned 内存可跳过这一步、提升带宽并支持真正异步传输；访问日期 2026-07-24", "accessed": "2026-07-24"},
+        {"url": "https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html", "note": "PyTorch 官方教程：pinned memory 定义（保证不被换出）、非阻塞传输需要 pinned 源数据这一前提；访问日期 2026-07-24", "accessed": "2026-07-24"}
+      ],
+      "confidence": "high",
+      "confidence_note": "核心事实（pageable 内存的隐藏同步拷贝、pinned memory 跳过它、这是非阻塞异步传输的前提）均一手核实于 NVIDIA/PyTorch 官方文档。ch32 的研究已经更完整地覆盖了这个概念（含 CUDA 流重叠三前提），本条是贴合本章『commit_block_table 为什么能重叠』这个具体用法的精简版，不重复展开流（stream）细节——本章正文没提 CUDA 流。",
+      "writer_note": "正文 §18.2 那句括注『pin_memory=True 让这块 CPU 缓冲驻留在页锁定内存里，CUDA 才能对它发起真正的异步 DMA』已经把结论讲对了，这条研究是给这句话托底——如果 writer 想再落一点点实感，可以补半句『普通内存搬运前 CUDA 会偷偷多拷一次到临时 pinned 缓冲，这一步是同步的』来说明『为什么不 pin 就重叠不起来』，但不必展开，一句话的量级足够，链接留给深挖的读者。"
+    },
+    {
+      "id": "cuda-graph-fixed-shape-ch18",
+      "term": "CUDA Graph 对固定形状的要求",
+      "kind": "external_concept",
+      "one_line": "CUDA Graph 把一串内核调用『录制』成一张可重放的图，但重放要求每次张量形状都和录制时一致——这就是本章 slot_mapping 尾部要 padding 成固定长度、而不是按实际 token 数变长的原因。",
+      "what_it_is": "本章 `_compute_slot_mapping_kernel` 的最后一个 program 专门把 `[num_tokens, max_num_batched_tokens)` 这段尾部填成 `PAD_SLOT_ID`，正文解释是『给 CUDA graph 留固定形状』。CUDA Graph 是 NVIDIA 提供的机制：把一串 GPU 内核调用连同它们的依赖关系一次性『录制』成一个图对象，之后只需一次 API 调用就能把整段『回放』，省掉逐个内核单独启动的 CPU 调度开销。但『录制—回放』模型有个硬约束：图是按录制时的具体内存地址和张量形状生成的，回放时如果张量形状变了，图就不能直接复用（要么报错要么退化重新捕获）。本章每拍实际 token 数会变（req 数量、每请求 token 数都不固定），如果 `slot_mapping` 就按实际长度变长变短，配 CUDA graph 用就会不断触发重新捕获，图捕获带来的收益就没了。把它 padding 到一个固定的 `max_num_batched_tokens` 长度，多出来的部分填一个『写了也无害』的 `PAD_SLOT_ID`，形状就总是恒定的，可以放心复用同一张已捕获的图。",
+      "background": "CUDA Graph 是 CUDA 10 引入的通用平台能力，对『很多小内核、每个内核本身跑得快』的场景收益最大——LLM 推理的 decode 阶段正是这种场景（batch 小、算子多、每个都执行得很快，内核启动开销能占到总时间的 7%-10% 甚至更高）。vLLM 只对『CUDA graph 友好的段』做捕获，而这些段的入口张量必须形状恒定，本章 `PAD_SLOT_ID` 的尾部填充就是为满足这个前提做的工程妥协。CUDA graph 在 vLLM 里的分级捕获策略（FULL/PIECEWISE/NONE）与更完整的背景，留给后续 model-runner 章节展开。",
+      "links": [
+        "https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html",
+        "https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/"
+      ],
+      "sources": [
+        {"url": "https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html", "note": "NVIDIA 官方 CUDA 编程指南：CUDA Graph『捕获一串内核+依赖关系成一个可回放对象』的定义；访问日期 2026-07-24", "accessed": "2026-07-24"},
+        {"url": "https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/", "note": "PyTorch 官方博客：内核启动开销量化数字（约 4-6μs/次，占比 7%-10%）与 CUDA graph 摊薄开销的原理；访问日期 2026-07-24", "accessed": "2026-07-24"}
+      ],
+      "confidence": "high",
+      "confidence_note": "本条与 ch01 研究的『CUDA Graph』词条是同一批一手来源，这里只是换了个贴合本章用法（padding 保形状）的切入角度，核心事实未变，未重新核实『捕获要求形状恒定』这句是否在官方文档字面出现——这句是本词条基于官方『录制—回放』定义做的合理推断，属于常见工程共识（PyTorch/NVIDIA 教程均隐含要求 static shape），非官方逐字断言，故不标为绝对现状。",
+      "writer_note": "正文当前只用一句『CUDA graph 要求每拍的张量形状固定才能捕获重放』带过，这个量级对本章已经够——不需要展开 CUDA graph 分级捕获、也不需要重复 ch01 已经讲过的『内核启动开销』背景，那些留给专门的 model-runner 章节。这条研究的价值只是确认『固定形状』这个断言站得住、并给出为什么。"
+    },
+    {
+      "id": "tensorrt-llm-trtllm-mla",
+      "term": "TensorRT-LLM（TRT-LLM）与 TRTLLM MLA 后端",
+      "kind": "external_project",
+      "one_line": "TensorRT-LLM 是 NVIDIA 官方的 LLM 推理加速库（vLLM 的同类竞品之一）；本章侧栏提到的『TRTLLM MLA』，指的是它给 MLA（多头潜在注意力）这类注意力机制提供的专用 attention 后端。",
+      "what_it_is": "TensorRT-LLM 是 NVIDIA 开源的大模型推理库，提供 Python API 定义模型、把模型编译成 TensorRT 引擎，并附带 C++/Python 运行时来编排推理执行；它集成了算子融合、量化、KV cache、continuous batching、paged attention 等一整套推理优化技术，是 vLLM、SGLang 之外另一条独立的开源 LLM 服务技术栈。本章 v0.21.0 更新侧栏提到的『TRTLLM MLA』，是 vLLM 里以 TensorRT-LLM 核实现为后端的一种 MLA（Multi-head Latent Attention，DeepSeek 系模型用的注意力变体，详见第 28 章）attention 后端选项——vLLM 官方文档把它列在 MLA prefill 后端之一（`TRTLLM_RAGGED`，限定 `qk_nope_head_dim=128, qk_rope_head_dim=64, v_head_dim=256` 等具体头维度组合），意思是：某些 attention 后端不是 vLLM 自己纯手写，而是调用/借用了 TensorRT-LLM 提供的核函数实现。",
+      "background": "TensorRT-LLM 的定位与 vLLM 相近但技术路线不同：vLLM 走『Python 为主 + PyTorch + 自定义 CUDA/Triton kernel』的路子，TensorRT-LLM 走『把模型编译成 TensorRT 引擎』的路子，二者都在做 paged attention、continuous batching 这类同名机制的各自实现。vLLM 支持接入 TensorRT-LLM 的部分 kernel 作为可选后端（如本章提到的 MLA 场景），是两个生态在底层 kernel 层面的一次互操作，而不是把整个 TensorRT-LLM 嫁接进来。至于本章正文提到的『block table 列数 128 元素对齐』这个具体约束，是 vLLM 自己代码库里为兼容这类外部后端做的工程决策（源码 PR #39324），并非 TensorRT-LLM 官方文档逐字写明的规范——这一点未能在 TensorRT-LLM/vLLM 官方文档里找到直接对应表述，标记为 vLLM 一侧的适配细节。",
+      "links": [
+        "https://github.com/NVIDIA/TensorRT-LLM",
+        "https://docs.vllm.ai/en/latest/design/attention_backends/"
+      ],
+      "sources": [
+        {"url": "https://github.com/NVIDIA/TensorRT-LLM", "note": "官方仓库简介：TensorRT-LLM 提供 Python API 定义 LLM、编译 TensorRT 引擎并配 Python/C++ 运行时执行；访问日期 2026-07-24", "accessed": "2026-07-24"},
+        {"url": "https://docs.vllm.ai/en/latest/design/attention_backends/", "note": "vLLM 官方文档 Attention Backend 页面：MLA prefill 后端列表中含 TRTLLM_RAGGED（TensorRT-LLM ragged attention），限定头维度组合 qk_nope_head_dim=128/qk_rope_head_dim=64/v_head_dim=256；未见 block table 对齐相关说明；访问日期 2026-07-24", "accessed": "2026-07-24"}
+      ],
+      "confidence": "medium",
+      "confidence_note": "TensorRT-LLM 本身的定义与 vLLM 官方文档里 TRTLLM_RAGGED 后端的存在均一手核实；但『block table 128 元素对齐是为了兼容 TRTLLM MLA』这一因果链条只见于本章 dossier 转述的源码 PR，未在 TensorRT-LLM/vLLM 官方文档里查到对应的一手确认，故整体标 medium、且在 background 里明确点出这一步是转述而非外部核实。",
+      "writer_note": "正文这处只是一条版本更新侧栏里的括注，点到『TensorRT-LLM 官方推理库、给 MLA 提供的一种后端』这个量级就够，不必展开 TensorRT-LLM 全貌（那更适合放进 ch25 attention 后端章或做个链接）；『128 对齐』这个具体数字本身是本仓工程细节，不属于本条研究范围，writer 引用时按 dossier/analyst 口径来，不要引这条研究去坐实它是 TensorRT-LLM 官方规范。"
+    }
+  ]
+}
