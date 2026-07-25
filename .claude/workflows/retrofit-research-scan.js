@@ -9,9 +9,9 @@ export const meta = {
 // ⚠️ 本环境 Workflow 的 args 注入不可靠(实测 args.chapters 到不了脚本)→ 用脚本内 CFG 作可靠配置,
 // args 有值时优先。换书时改 CFG（chapters 列该书待扫章目录名）。
 const CFG = {
-  instance: 'vllm',
-  source_root: 'instances/vllm/source',
-  chapters: ['ch01-config-and-wiring','ch02-entrypoints','ch03-config-and-wiring','ch04-async-llm','ch05-input-processing','ch06-input-processor','ch07-engine-core','ch08-output-processor','ch09-detokenization','ch10-logprobs','ch11-engine-core','ch12-engine-core','ch13-scheduler','ch14-scheduler','ch15-kv-cache','ch16-kv-cache','ch17-worker-and-executor','ch18-model-runner','ch19-model-runner','ch20-distributed-parallelism','ch21-async-engine','ch22-model-definitions','ch23-custom-ops-and-compilation','ch24-primer-flash-attention','ch25-attention','ch26-primer-quantization','ch27-primer-lightning-indexer','ch28-model-architecture','ch29-model-architecture','ch30-sampling','ch33-primer-eagle','ch34-spec-decode','ch35-pd-disaggregation','ch36-pd-disaggregation','ch37-entrypoints','ch38-entrypoints','ch39-engine-core'],
+  instance: 'vllm-ascend',
+  source_root: 'instances/vllm-ascend/source',
+  chapters: ['ch01-birdseye-oot-plugin','ch02-entry-points-and-npuplatform','ch03-two-stage-monkey-patch','ch04-patch-engine-core-kvcache','ch05-check-and-update-config','ch06-npu-communicator','ch07-sleep-mode-camem-allocator','ch08-ascend-parallel-groups','ch09-primer-eplb','ch10-eplb-expert-load-balancing','ch11-pd-disaggregation-mooncake','ch12-kv-pooling-ascend-store','ch13-kv-offloading-host-cpu','ch14-npuworker-execution-control','ch15-npumodelrunner-cuda-monkeypatch','ch16-single-step-forward-context-dp-sync','ch17-kv-cache-allocation-reshape-bind','ch18-310p-inference-chip-specialization','ch19-attention-backend-selection','ch20-ascend-attention-mha','ch21-primer-mla','ch22-mla-on-npu','ch23-primer-sparse-attention','ch24-sparse-attention-sfa-dsa','ch25-kv-manager-and-schedulers','ch26-primer-v4-csa-hca','ch27-customop-oot-replacement','ch28-torch-library-and-meta','ch29-ascend-compiler-aclgraph','ch30-fusedmoe-batch-invariant','ch31-primer-quantization','ch32-ascend-quantization-framework','ch33-sampling-npu-adaptation','ch34-primer-speculative-sampling','ch35-primer-dflash','ch36-speculative-decode-npu','ch37-primer-dspark','ch38-model-lora-netloader-registration'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapters && args.chapters.length) ? args : CFG
 const REPO = '/mnt/e/Laboratory/Repo2Book'
