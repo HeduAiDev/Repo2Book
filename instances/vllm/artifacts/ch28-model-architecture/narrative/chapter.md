@@ -123,7 +123,9 @@ def forward(
 
 那个 2 是 K 和 V 各一份。头数多、维度大，KV cache 就吃显存——长上下文场景下，它常常比模型权重还大。
 
-MLA（Multi-head Latent Attention，多头潜变量注意力，由 DeepSeek-V2 提出，arXiv:2405.04434）的思路是：别缓存满血的 K/V，缓存一个**低秩潜变量**。`kv_lora_rank` 是该潜变量的维数（DeepSeek-V4 取 512），远小于 `n_heads × d_head` 的几千维。把 K/V 压到这个 `kv_lora_rank` 维，缓存这个压缩版；真正算注意力时再升回去。压缩比（缓存满血 K/V 的字节 ÷ 缓存潜变量的字节）大致是
+在 MLA 之前，业界摁这笔账的主流路线是**减头**：MQA（Multi-Query Attention，所有 Q 头共用同一组 K/V）走到极端，GQA（Grouped-Query Attention，若干 Q 头分组、组内共享 K/V）取折中——都是靠「少存几份 K/V」换显存，代价是共享：头与头被迫看同一份 K/V，表达力打了折。MLA（Multi-head Latent Attention，多头潜变量注意力，由 DeepSeek-V2 提出，[arXiv:2405.04434](https://arxiv.org/abs/2405.04434)）是同一条「压 KV cache」脉络上的另一条路：不共享，改**压缩**——别缓存满血的 K/V，缓存一个**低秩潜变量**；每个头仍从这个潜变量升维出自己专属的 K/V，理论上表达力更接近满血 MHA，代价是多几次矩阵乘。论文自报的战果是 KV cache 比标准 MHA 缩小 93.3%。
+
+`kv_lora_rank` 是该潜变量的维数（DeepSeek-V4 取 512），远小于 `n_heads × d_head` 的几千维。把 K/V 压到这个 `kv_lora_rank` 维，缓存这个压缩版；真正算注意力时再升回去。压缩比（缓存满血 K/V 的字节 ÷ 缓存潜变量的字节）大致是
 
 ```math
 \frac{2 \times n_{\mathrm{heads}} \times d_{\mathrm{head}}}{kv\_lora\_rank + qk\_rope\_head\_dim}
@@ -171,7 +173,7 @@ if self.rotary_emb is not None:
 
 RoPE（旋转位置编码）和低秩压缩有个根本矛盾。低秩压缩想把 K「吸收」进潜变量、推迟升维；但 RoPE 是个跟绝对位置有关的旋转，一旦施加，K 就和位置纠缠在一起，没法干净地被低秩矩阵吸收了。
 
-DeepSeek 的解法是**解耦**：把每个 head 的维度劈成两段。
+DeepSeek 的解法是**解耦**：把每个 head 的维度劈成两段。这个配套设计在论文里就叫解耦 RoPE（Decoupled RoPE），和 MLA 主体同出那篇 DeepSeek-V2 论文——不奇怪，「压缩与位置编码打架」这个矛盾本来就是 MLA 的低秩压缩自己制造出来的，论文得自己把它解掉。
 
 ```math
 d_{\mathrm{head}} = qk\_nope\_head\_dim + qk\_rope\_head\_dim
@@ -332,7 +334,9 @@ MoE（Mixture of Experts，专家混合）换个玩法：准备 `n_routed_expert
 
 举个 DeepSeek 量级：256 个专家、每 token 选 8 个。那么每 token 只碰到 8/256 ≈ 3% 的路由专家参数。**参数量可以堆到几百 B，但每 token 的算力近似不变**——这就是 MoE 的核心权衡：用稀疏激活把模型容量做大，而不把单 token 的 FLOPs 做大。
 
-注意这和 MLA 省的不是一回事：MLA 省 **KV cache 显存**，MoE 省**每 token 算力**。两个 delta 各打各的痛点。V4 用的这套「细粒度路由专家 + 一条共享专家」，正是 DeepSeek-V2/V3 定型的 DeepSeekMoE 设计（arXiv:2405.04434 / 2412.19437）。
+注意这和 MLA 省的不是一回事：MLA 省 **KV cache 显存**，MoE 省**每 token 算力**。两个 delta 各打各的痛点。
+
+V4 用的这套「细粒度路由专家 + 一条共享专家」有自己的名字和出处：**DeepSeekMoE**（[arXiv:2401.06066](https://arxiv.org/abs/2401.06066)）。它针对的是早期 MoE（GShard、Switch Transformer 那一代：专家不多、每 token 只选 1~2 个）的一个具体病灶——稀有知识和常见知识挤在同一批专家里竞争，专家学到的东西彼此重叠，谁都不够「专」。药方两条：**细粒度分割**，把专家切小切多、相应多选几个（N 个专家切成 mN 个、选 mK 个），让每个专家分到的「专精领域」更窄更聚焦；**共享专家隔离**，固定几个所有 token 无条件都过的共享专家兜住通用知识，让被路由挑选的专家不必人人重复背常识。这套设计先在 DeepSeekMoE 论文里以中等规模验证，随后被 DeepSeek-V2、V3 原样继承并放大到数百 B 参数——下一节代码里的 `gate` + `shared_experts`，就是它的直接落地。
 
 ### 28.3.2　gate + shared_experts：路由之外那条「dense 残留」
 
@@ -385,9 +389,9 @@ else:
 
 - **`gate`**：一个小线性层，把 `hidden` 投到 `n_routed_experts` 维，输出每个专家的打分（router logits）。它决定每个 token 该去哪几个专家。
 - **`shared_experts`**：注意它的类型是 `DeepseekV4MLP`——就是一条普通的 SwiGLU MLP，**结构和 `LlamaMLP` 同构**。它不参与路由，每个 token 都走。
-- **路由的两种打分模式**：`tid2eid`（hash-MoE，用 `input_ids` 直接查表定专家，所以 §28.1 那个 `input_ids` 参数派上了用场）或 `e_score_correction_bias`（noaux_tc 打分的修正偏置——noaux_tc 即 DeepSeek-V3（arXiv:2412.19437）提出的免辅助损失负载均衡方案：不再靠额外的负载均衡 loss 项，而是给每个专家维护一个可学习/可更新的偏置去修正打分，让路由自然趋于均衡）。hash-MoE 是 V4 特有的一类层，这里点名不深挖。
+- **路由的两种打分模式**：`tid2eid`（hash-MoE，用 `input_ids` 直接查表定专家，所以 §28.1 那个 `input_ids` 参数派上了用场）或 `e_score_correction_bias`（noaux_tc 打分的修正偏置——noaux_tc 即 DeepSeek-V3 采纳定型的免辅助损失负载均衡方案：不再靠额外的负载均衡 loss 项，而是给每个专家维护一个可学习/可更新的偏置去修正打分，让路由自然趋于均衡）。hash-MoE 是 V4 特有的一类层，这里点名不深挖。
 
-**偏置怎么更新、为什么能把负载摁平**：`e_score_correction_bias` 在 vLLM 里是 `requires_grad=False` 的纯推理期参数——它的取值是训练阶段一条更新规则喂出来的结果，这条规则最早由 Loss-Free Balancing 提出（arXiv:2408.15664），DeepSeek-V3 沿用并定型了记号（arXiv:2412.19437）：路由排序看打分加偏置之和，谁的和进 top-k 谁就被选中；但**门控权重**（专家输出乘多大的系数去加权求和）用的是**原始**打分，偏置从不参与加权。每一轮统计每个专家实际收到的 token 数 $`c_i`$ ，跟均匀负载 $`\bar c`$ 比：过载的专家（ $`c_i > \bar c`$ ）把偏置减一个固定步长 γ，欠载的专家（ $`c_i < \bar c`$ ）把偏置加 γ：
+**偏置怎么更新、为什么能把负载摁平**：`e_score_correction_bias` 在 vLLM 里是 `requires_grad=False` 的纯推理期参数——它的取值是训练阶段一条更新规则喂出来的结果，这条规则最早由专门的 Loss-Free Balancing 论文提出（[arXiv:2408.15664](https://arxiv.org/abs/2408.15664)，作者含多位 DeepSeek 研究员），DeepSeek-V3 技术报告采纳后定型了记号（[arXiv:2412.19437](https://arxiv.org/abs/2412.19437)）：路由排序看打分加偏置之和，谁的和进 top-k 谁就被选中；但**门控权重**（专家输出乘多大的系数去加权求和）用的是**原始**打分，偏置从不参与加权。每一轮统计每个专家实际收到的 token 数 $`c_i`$ ，跟均匀负载 $`\bar c`$ 比：过载的专家（ $`c_i > \bar c`$ ）把偏置减一个固定步长 γ，欠载的专家（ $`c_i < \bar c`$ ）把偏置加 γ：
 
 ```math
 b_i \leftarrow b_i - \gamma \quad (c_i > \bar c)
@@ -479,7 +483,7 @@ V4 的专家计算有两条后端，由 `use_mega_moe` 分叉：
 > *MegaMoE 把全部专家塞进一个 DeepGEMM 算子（EP / FP4 / SM100）；FusedMoE 走张量并行。*
 > *`shared_experts` 那条 dense 始终并行走；两路聚合它的位置不同——mega 在外相加，TP 在 FusedMoE 内部。*
 
-**MegaMoE 路径**（开了 expert parallel + DeepGEMM 后端）把所有路由专家的计算塞进**一个**自定义算子（DeepGEMM 是 DeepSeek 开源的低比特矩阵乘内核库，专为 FP4/FP8 精度和 Hopper/Blackwell SM100 架构优化，能在单次 kernel launch 内处理全部专家的 GEMM）。EP（expert parallel，专家并行）是按专家切——不同 rank 各常驻一部分专家，请求路由到哪个专家就把 token 发到哪个 rank，区别于第 20 章按 head/列切的 TP、按请求切的 DP。`vllm/model_executor/models/deepseek_v4.py`：
+**MegaMoE 路径**（开了 expert parallel + DeepGEMM 后端）把所有路由专家的计算塞进**一个**自定义算子（DeepGEMM 是 DeepSeek 开源的低精度矩阵乘内核库——它凭什么能一个 kernel 吞下全部专家，读完算子边界马上展开）。EP（expert parallel，专家并行）是按专家切——不同 rank 各常驻一部分专家，请求路由到哪个专家就把 token 发到哪个 rank，区别于第 20 章按 head/列切的 TP、按请求切的 DP。`vllm/model_executor/models/deepseek_v4.py`：
 
 ```python
 # vllm/model_executor/models/deepseek_v4.py:L602
@@ -505,7 +509,9 @@ def forward(
     return y
 ```
 
-这就是算子边界。注意这里**没有 for 循环逐个跑专家**——一个 `torch.ops.vllm.deepseek_v4_mega_moe_experts` 调用，DeepGEMM 在 kernel 内部把全部专家一次算完（需要对称缓冲、FP4/FP8 权重、SM100 硬件）。它的内部 scale 布局、staging kernel 是 DeepGEMM/FusedMoE 专章的事，本章只读到这条算子边界，知道「单 kernel 全专家」这个事实即可。
+这就是算子边界。注意这里**没有 for 循环逐个跑专家**——一个 `torch.ops.vllm.deepseek_v4_mega_moe_experts` 调用，DeepGEMM 在 kernel 内部把全部专家一次算完（需要对称缓冲、FP4/FP8 权重、SM100 硬件）。
+
+「一个 kernel 跑全部专家」凭什么做得到？答案在 **DeepGEMM**（[github.com/deepseek-ai/DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)）这个库本身。它是 DeepSeek 伴随 V3/R1 一系推理优化开源的 GEMM 内核库（GEMM 跑在 GPU 的 Tensor Core 上——专做矩阵乘累加的硬件单元），定位与 cuBLAS（NVIDIA 官方闭源的 GEMM 库）、CUTLASS（NVIDIA 开源的模板化 GEMM 组件库）那种重模板、求全覆盖的路线刻意相反：只保留少量核心 kernel、运行时靠轻量 JIT（just-in-time，即时编译——用到哪个形状才现编哪个 kernel，装包时不必预编整套 CUDA）产出内核、代码以干净可读为卖点，支持 FP8/FP4/BF16，针对 Hopper（SM90）与 Blackwell（SM100）调优（SM90/SM100 是 NVIDIA 给这两代 GPU 的计算能力代号）——官方 README 自报 H800 上最高约 1550 TFLOPS（每秒万亿次浮点运算，厂商自测口径）。对本节最要紧的是它专为 MoE 提供的 **Mega MoE** 内核：把「EP dispatch（按路由把 token 发给持有对应专家的 rank）→ 专家第一段线性层 → SwiGLU 激活 → 第二段线性层 → EP combine（把算完的结果收回原 token 位置）」整条专家流水**全部融进一个 mega-kernel**，让 NVLink（NVIDIA 的卡间高速互联）上的通信和 Tensor Core 上的计算在 kernel 内部相互重叠，而不是拆成几次 kernel launch、通信与计算互相干等。所以上面那段代码里既没有专家 for 循环、也看不见任何一次显式通信——循环、两段 GEMM、激活、EP 收发全被吃进了这一个算子。按官方 README（2026-04 更新的版本），Mega MoE 走 FP8×FP4 混合精度、要求 SM100 与 PyTorch ≥ 2.9——正对上前面括号里「FP4/FP8 权重、SM100 硬件」两个前置条件；它的量化 scale 用 UE8M0（8 位纯指数、无尾数）编码，就是 §28.6 装载权重时必须按字节搬运的那个 `float8_e8m0fnu`。内核内部的 scale 布局、staging kernel 留给 DeepGEMM 仓库和感兴趣的读者，本章只读到这条算子边界，知道「单 kernel 全专家」这个事实即可。
 
 **FusedMoE 路径**（`_forward_fused_moe`，没开 EP 时）走张量并行的 `FusedMoE`，它内部就把 `shared_experts` 一起聚合了。所以两条后端有个微妙差异：mega 路径在 forward 里**外部**手动 `+= shared_output`（上面那行），TP 路径则在 `FusedMoE` **内部**聚合。聚合的位置不同，但语义一致——路由 + 共享。FusedMoE 后端的细节本章不深挖；专家并行的扩缩容协调见[第 39 章的弹性专家并行](../../ch39-engine-core/narrative/chapter.md)。
 
@@ -552,9 +558,17 @@ return hidden_states
 
 关键就第二行：`hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)`。embedding 出来本是 `[T, hidden]`，这里 unsqueeze 加一维、repeat 成 `[T, hc_mult, hidden]`——**一条流复制成 `hc_mult` 条平行残差流**，一起穿过所有层。
 
-回头看 §28.1 那个 `DeepseekV4DecoderLayer.forward`：每层用 `hc_pre`（前处理）和 `hc_post`（后处理）包住 attn 和 ffn。`hc_pre` 返回三元组 `(x, post, comb)`——`x` 是本段（attn 或 ffn）的输入张量，`post` 和 `comb` 是 `hc_pre` 内部学习的门控信息（混合系数与残差组合参数），被原封不动传给 `hc_post`，让 `hc_post` 知道该如何把本段的输出写回多条残差流。Llama 的 layernorm 是固定的「加回上一段输出」，而 hc 在 `hc_mult` 条流之间做**学习式的门控混合**——`hc_attn_fn`/`hc_attn_scale`/`hc_attn_base` 这些都是可学习参数。这套混合的内核（`torch.ops.vllm.mhc_pre`/`mhc_post`，含 Sinkhorn 归一——一种反复对矩阵的行、列交替做归一化、使其收敛为「每行每列都和为 1」的双随机矩阵的迭代算法，这里用来让 `hc_mult` 条流之间的门控权重更均衡，和下面 §28.4.2 `hc_head` 用的 sigmoid 门控是两种不同的混合算法）是 GPU-only 的，本章只读它在残差骨架里的位置——它**取代的是 Llama layernorm 里顺手做的那次残差相加**：归一化本身仍由 `attn_norm`/`ffn_norm` 承担（对应 `input_layernorm`/`post_attention_layernorm` 的归一职能没有消失），只是原来融合在 layernorm 里的「加回残差」被单独摘出来，做成了 `hc_pre`/`hc_post`——这正是 §28.1 对照表里「残差处理」单独成行、且 `attn_norm`/`ffn_norm` 不再和 layernorm 融合调用的原因。
+回头看 §28.1 那个 `DeepseekV4DecoderLayer.forward`：每层用 `hc_pre`（前处理）和 `hc_post`（后处理）包住 attn 和 ffn。`hc_pre` 返回三元组 `(x, post, comb)`——`x` 是本段（attn 或 ffn）的输入张量，`post` 和 `comb` 是 `hc_pre` 内部学习的门控信息（混合系数与残差组合参数），被原封不动传给 `hc_post`，让 `hc_post` 知道该如何把本段的输出写回多条残差流。Llama 的 layernorm 是固定的「加回上一段输出」，而 hc 在 `hc_mult` 条流之间做**学习式的门控混合**——`hc_attn_fn`/`hc_attn_scale`/`hc_attn_base` 这些都是可学习参数。这套混合的内核（`torch.ops.vllm.mhc_pre`/`mhc_post`，含 Sinkhorn 归一，下面单独讲这个名词）是 GPU-only 的，本章只读它在残差骨架里的位置——它**取代的是 Llama layernorm 里顺手做的那次残差相加**：归一化本身仍由 `attn_norm`/`ffn_norm` 承担（对应 `input_layernorm`/`post_attention_layernorm` 的归一职能没有消失），只是原来融合在 layernorm 里的「加回残差」被单独摘出来，做成了 `hc_pre`/`hc_post`——这正是 §28.1 对照表里「残差处理」单独成行、且 `attn_norm`/`ffn_norm` 不再和 layernorm 融合调用的原因。
+
+先把刚才那个陌生名词讲透。**Sinkhorn 归一化**不是 V4 的发明，而是一个 1964 年就被 Richard Sinkhorn 证明的老定理配一个朴素到近乎笨拙的算法（Sinkhorn-Knopp）：任给一个全正矩阵，反复交替做「每行除以行和、每列除以列和」，它就会收敛成**双随机矩阵**（doubly stochastic matrix）——每行、每列的和都恰好等于 1。
+
+> **说明性示例（通用小例子，与 V4 无关）**：取打分矩阵 `[[4, 1], [2, 3]]`，可以想成两个「专家」对两个「token」的偏好。行归一：第一行和为 5，变 `[0.8, 0.2]`；第二行和也是 5，变 `[0.4, 0.6]`。再列归一：第一列和 1.2、第二列和 0.8，各元素除以所在列的和。如此「行 → 列 → 行 → …」迭代下去，矩阵越来越接近「每行每列都和为 1」——原来大的位置仍相对更大，但不会再有哪一行或哪一列整体畸高畸低。
+
+它在机器学习里因「熵正则化最优传输」（最优传输 = 给两组分布找一个搬运成本最低的匹配方案；加熵正则后恰好能用 Sinkhorn 迭代高效求解）的走红而重新流行，此后凡是「手里一堆偏好打分，想强制摊成均衡分配」的场景都常借用它——这正是多流门控混合关心的那类性质。至于 `mhc` 内核具体把它作用在哪个矩阵、迭代几轮，属于未公开的 GPU 内核实现，本章不猜；想深究定理本身，从 [Sinkhorn 定理词条](https://en.wikipedia.org/wiki/Sinkhorn%27s_theorem)入手即可。顺带一句：它和下面 §28.4.2 `hc_head` 用的 sigmoid 门控是两种不同的混合算法，别混为一谈。
 
 直觉上，Llama 的 add-norm 是「一条信息高速路，每层上下匝道」；hc 是「`hc_mult` 条平行车道，每层之间可以学习着变道、并道」。表达力更强，代价是 hidden 翻了 `hc_mult` 倍的显存和算力——典型的「容量换资源」。
+
+「把残差流从一条展开成多条、层间用可学习矩阵混合」这个思路，在学术界有独立先例：字节跳动 Seed 团队 2024 年的 Hyper-Connections（超连接，[arXiv:2409.19606](https://arxiv.org/abs/2409.19606)）把残差流按一个「展开率 n」复制成 n 条，层间用两类可学习矩阵动态混合：**深度连接** 决定当前层的输出怎么写回各条流，**宽度连接** 决定流与流之间怎么互相交换信息——读到这里你大概会觉得眼熟，V4 的 `hc_post` 写回、`hc_pre` 取用，操心的是同一类问题。论文称这样能同时缓解「梯度消失」（信号逐层衰减到学不动）与「表征坍缩」（各层表征趋同、失去区分度）这对通常此消彼长的跷跷板。要说清楚的是：V4 源码和 DeepSeek 官方文档都没有引用这篇论文，hc 与它是否同源无从考证——这里只作旁证：多流可学习残差不是 V4 的孤例，学术界已经独立走到过同一条路上。
 
 > **v0.21.0 更新**：上面这版 `forward` 把每层写成「`hc_pre` → attn → `hc_post`」「`hc_pre` → ffn → `hc_post`」四段独立调用，读起来最清楚。新版做了算子融合：把**上一层的 `hc_post` 与本层的 `hc_pre` 合并成一个自定义算子** `torch.ops.vllm.mhc_fused_post_pre`，于是 `DeepseekV4DecoderLayer.forward` 不再每层自闭收口，而是在层间流水一个 `(residual, post_mix, res_mix)` 三元组——只有第一层单独跑 `hc_pre`，最后一层的 `hc_post` 被提到 `DeepseekV4Model.forward` 末尾统一收口；前面纯 PyTorch 的 `hc_head` 也整体落进 `torch.ops.vllm.hc_head_fused_kernel`。语义不变（仍是同一套 RMSNorm + sigmoid 门控的多流合并），只是读者看到的不再是逐行可读的张量算子，而是一次 kernel 调用——把它理解成「融合算子 = 原四步的等价合并」即可，上面的数学推导依然成立。
 
@@ -615,7 +629,7 @@ def hc_head(
 
 ### 28.5.1　_mtp_hidden_buffer：目标模型留给 draft 的隐状态
 
-Llama 末尾就一个 `lm_head`，`compute_logits` 出一个 token 的分布。V4 在这之外旁挂了一个 **MTP（Multi-Token Prediction，多 token 预测，作为训练目标由 DeepSeek-V3 提出，arXiv:2412.19437）** draft：训练时它多头预测后面 N 个 token，推理时它当**投机解码的 draft 模型**，一口气猜好几个 token，再由主模型批量验证（投机解码的协议是后面讲投机解码那章的主题，本章只交付 MTP 这个 draft 的接口）。
+Llama 末尾就一个 `lm_head`，`compute_logits` 出一个 token 的分布。V4 在这之外旁挂了一个 **MTP（Multi-Token Prediction，多 token 预测）** draft。MTP 是 DeepSeek-V3 技术报告（[arXiv:2412.19437](https://arxiv.org/abs/2412.19437)）提出的**训练目标**：标准语言模型每个位置只有「预测下一个 token」这一个监督信号，MTP 在此之外加几级链式预测模块，让模型在同一位置还要预测第 2、第 3……个未来 token——注意不是简单把窗口右移多滑几格，每一级都要把「已知的未来 token embedding」和「当前隐状态」融合之后再往前猜一步。报告说这既让模型学到更强的表征，也可以用于投机解码加速推理——后半句正是 vLLM 接住它的原因：训练出来的这些预测头，推理时原样当**投机解码的 draft 模型**用，一口气猜好几个 token，再由主模型批量验证（投机解码的协议是后面讲投机解码那章的主题，本章只交付 MTP 这个 draft 的接口）。下一小节读 draft 层时你会看到，「融合未来 token embedding 与当前隐状态」这句话，就是两行投影相加的代码。
 
 draft 要工作，得拿到主模型的隐状态。但拿哪个版本？回看 §28.4.1：主模型在 **`hc_head` 之前**（即多流还没压回单流时）就 `copy_` 了一份到 `_mtp_hidden_buffer`：
 

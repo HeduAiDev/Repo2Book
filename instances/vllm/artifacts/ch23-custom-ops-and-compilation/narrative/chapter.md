@@ -9,14 +9,20 @@
 > *本章拆开两件事：单个算子怎么选实现，整张图怎么被切成融合 + 图捕获的段。*
 > *下一章接着进 `self.attn` 内部，看不同 attention 后端怎么实现。*
 
-[上一章](../../ch22-model-definitions/narrative/chapter.md)结尾留了个钩子。`LlamaAttention.forward` 里那行 `self.attn(q, k, v)`，把后端选择、KV cache 读写、量化统统吞了进去。而让这个算子能进 `torch.compile` 图、又不把整张图撕碎的机制，被推给了本章。本章的两条主线分别落在 `vllm/model_executor/custom_op.py` 和 `vllm/compilation/decorators.py`。
+[上一章](../../ch22-model-definitions/narrative/chapter.md)结尾留了个钩子。`LlamaAttention.forward` 里那行 `self.attn(q, k, v)`，把后端选择、KV cache 读写、量化统统吞了进去。而让这个算子能进 `torch.compile`（PyTorch 2.x 的模型即时编译入口，本章第 2 级的主角）的图、又不把整张图撕碎的机制，被推给了本章。本章的两条主线分别落在 `vllm/model_executor/custom_op.py` 和 `vllm/compilation/decorators.py`。
 
-这一章就来还债。但在还债之前，先得搞清楚一件更基础的事：vLLM 里同一个算子——比如 RMSNorm——为什么会有两份实现？一份是手写的融合 CUDA kernel，一份是一串普通的 `torch` 算子。运行时到底走哪一份？谁来决定？
+这一章就来还债。但在还债之前，先得搞清楚一件更基础的事：vLLM 里同一个算子——比如 RMSNorm（Root Mean Square Layer Normalization，均方根归一化，LayerNorm 的简化版，§23.3 细说）——为什么会有两份实现？一份是手写的融合 CUDA kernel，一份是一串普通的 `torch` 算子。运行时到底走哪一份？谁来决定？
 
 答案是**两级 dispatch**。这是本章的脊梁：
 
 - **第 1 级**在「构造期」工作，粒度是**单个算子**。`CustomOp` 基类在 `__init__` 里一次性决定，这个算子今后走 `forward_cuda`（预编译融合 kernel）还是 `forward_native`（纯 torch）。
-- **第 2 级**在「首次前向」工作，粒度是**整张图**。`@support_torch_compile` 把整个模型交给 `torch.compile`，由 vLLM 自己的后端把图切成段，规整段编译 + 图捕获，attention 段保持 eager。
+- **第 2 级**在「首次前向」工作，粒度是**整张图**。`@support_torch_compile` 把整个模型交给 `torch.compile`，由 vLLM 自己的后端把图切成段，规整段编译 + **图捕获**（把一串 GPU 调用录成一张 CUDA graph、之后整体重放，§23.7 展开），attention 段保持 **eager**（不编译，由 Python 逐算子直接下发的原生执行模式）。
+
+第 2 级会反复出现三个来自 PyTorch 的名字——Dynamo、FX 图、backend——先一次性认清楚，后面就不必再停下来解释。**`torch.compile` 不是一个编译器，而是一条流水线。**
+
+第一站是 **TorchDynamo**（下文简称 Dynamo）。它在 CPython 的帧求值层挂钩子，逐条解释你的 Python 字节码，把其中的张量运算记成一张 **FX 图**（`torch.fx` 的计算图：每个节点是一次算子调用或一个输入/输出占位符，整张图被包成一个仍然能直接跑的 `nn.Module`）。碰到追不动的代码——依赖 Python 对象身份、复杂控制流之类——Dynamo 不报错，而是就地 **graph break**：把已经攒到的那半张图先编译执行，追不动的那段退回普通 Python 解释，然后从下一条字节码重新开始追。这条「尽力而为、追不动就切一刀」的路线正是 PyTorch 2.0 用来取代 TorchScript 的思路，好处是大多数模型不改代码就能吃到部分加速，代价是一次 graph break 就把一张大图撕成两半——§23.8 反复强调的「attention 不能 graph break」，说的就是这件事。
+
+第二站是 **backend**（后端）。Dynamo 追完一段，把 FX 图连同示例输入交给一个 backend，契约简到只有一句：**输入一张 FX 图，返回一个可调用对象**，中间你想怎么优化 `torch.compile` 一概不管。PyTorch 官方默认的 backend 叫 **TorchInductor**（下文简称 Inductor），它把图降层、做算子融合，再生成 GPU 上的 Triton kernel（Triton 是一门用 Python 语法写 GPU kernel 的开源编译器语言，Inductor 的 GPU 代码生成目标）或 CPU 上的 C++ 代码——本章后面说「把融合机会让给 Inductor」，让的就是这一步。而 vLLM 并没有把整张图丢给 Inductor 兜底：它利用 `torch.compile(backend=...)` 这个公开口子塞进了自己写的后端 `VllmBackend`，拿到整图后先按算子切段，规整段各自送进 Inductor，attention 段整段保持 eager。**第 2 级的全部文章，就做在这个可插拔的 backend 契约上。** 想顺着官方文档深挖这条流水线，可看 [TorchDynamo 概览](https://docs.pytorch.org/docs/main/user_guide/torch_compiler/torch.compiler_dynamo_overview.html) 与 [graph break 说明](https://docs.pytorch.org/docs/stable/compile/programming_model.graph_breaks_index.html)。
 
 两级看似无关，其实咬合得很紧：第 1 级之所以有时候故意选「纯 torch」那份，正是为了把算子暴露给第 2 级的编译器去融合。先看这张总图，心里有个骨架，后面逐段拆。
 
@@ -196,7 +202,9 @@ assert RMSNorm.enabled() is False
 
 ## 23.3 RMSNorm：一个 CustomOp 长什么样
 
-抽象讲了两节，落到一个真实实例上。RMSNorm 是最干净的 `CustomOp` 范例（基线 `f3fef123` 的 `vllm/model_executor/layers/layernorm.py:L102`；v0.21.0 该类移到 `L38`，见本节末「v0.21.0 更新」）：
+抽象讲了两节，落到一个真实实例上。先兑现开篇的承诺，把 RMSNorm 本身讲清楚。它出自论文 [Root Mean Square Layer Normalization](https://arxiv.org/abs/1910.07467)（Zhang & Sennrich，NeurIPS 2019），是对 LayerNorm 的一次「减法」：LayerNorm 对每个样本做两件事——先减均值（re-centering，重新居中），再除以标准差（re-scaling，按幅度缩放）；论文的假设是前一半可有可无，模型效果主要来自后一半。于是 RMSNorm 干脆跳过减均值，只用均方根去缩放输入，即下面 docstring 里那条 $`x \mapsto w \cdot x / \sqrt{\mathbb{E}[x^2] + \epsilon}`$（$`w`$ 是可学习权重）。少算一次均值和一次减法，论文实测比 LayerNorm 快 7% 到 64% 而精度相当——这也是 Llama、Qwen 等主流 LLM 的归一化层清一色用它、而非原始 LayerNorm 的原因。
+
+计算短小、每层都出现，又同时有手写 kernel 与纯 torch 两份实现——RMSNorm 因此是最干净的 `CustomOp` 范例（基线 `f3fef123` 的 `vllm/model_executor/layers/layernorm.py:L102`；v0.21.0 该类移到 `L38`，见本节末「v0.21.0 更新」）：
 
 ```python
 # vllm/model_executor/layers/layernorm.py:L102 (基线 f3fef123)
@@ -223,7 +231,9 @@ class RMSNorm(CustomOp):
         # … 省略：ROCm aiter 与 SM100 fast-path 等硬件特例检测 …
 ```
 
-两个地方要盯住。
+先花两句认一下这个算子本身。docstring 里那行 `x -> w * x / sqrt(E[x^2] + eps)` 就是 RMSNorm 的全部内容：LayerNorm 对每个样本做两件事——先减均值（re-centering，重新居中）、再除以标准差（re-scaling，重新缩放）；RMSNorm 的论文（Zhang 与 Sennrich，NeurIPS 2019，[arXiv:1910.07467](https://arxiv.org/abs/1910.07467)）提出减均值那一半可有可无，效果主要来自按幅度缩放，于是干脆只用均方根 $`\sqrt{\mathrm{E}[x^2]+\epsilon}`$ 去缩放输入，再乘上可学习权重 `w`（`eps` 是防止除零的小常数，对应代码里的 `variance_epsilon`）。少算一次均值、少一次减法，论文报告实测比 LayerNorm 快 7%~64% 而精度基本不掉——这也是 Llama、Qwen 这些主流模型普遍改用它、而不再用原始 LayerNorm 的原因。对本章来说，重点不在这个算法多妙，而在它**简单到能用五六个纯 torch 算子直接写出来**，因此是「一个算子、两份实现」最干净的样本。
+
+代码本身有两个地方要盯住。
 
 第一行 `@CustomOp.register("rms_norm")`。这个装饰器把类登进一个注册表，并给类挂上 `name = "rms_norm"` 属性——`enabled()` 里那句 `f"+{cls.name}"` 用的就是它。注册逻辑很简单：
 
@@ -537,7 +547,9 @@ def split_graph(graph, splitting_ops):
     return split_gm, outputs
 ```
 
-`subgraph_id` 是一个递增的「子图编号」。算法的精髓就在那个 `if should_split` 分支：
+先把最后那行 `torch.fx.passes.split_module.split_module(...)` 认清楚：**它不是 vLLM 写的，是 PyTorch `torch.fx` 自带的官方切图工具**。它的用法只有一条——你传一个「节点 → 分区编号」的回调（这里就是 `lambda node: node_to_subgraph_id[node]`），它按编号把大图拆成若干子 `GraphModule`，再拼回一个顶层 `GraphModule`，每个分区在顶层变成一次 `call_module` 调用。参数 `keep_original_order=True` 要求切完之后各子图的执行顺序与原图一致，不因拓扑重排把有先后依赖的算子打乱——这个承诺待会儿论证「切完还是同一个函数」时要用。`split_module` 原本是为流水线并行（把一个大模型的层切到不同 GPU 上）写的通用工具，vLLM 只是拿它来干一件不同的事：按算子切出编译段。所以 `split_graph` 自己真正负责的只有一件事——**给每个节点算出分区编号**，切的动作外包给官方。
+
+那么 `subgraph_id` 就是这个「子图编号」，逐节点单调递增。算法的精髓在那个 `if should_split` 分支：
 
 - 碰到一个**普通节点**（不是切点）→ 沿用当前 `subgraph_id`，它和前面的普通节点归为同一段。
 - 碰到一个**切点**（如 attention）→ `subgraph_id += 1`，把这个切点**单独**成一段；记下它是切分子图；然后再 `+= 1`，让切点之后的普通节点开启**新的**一段。
@@ -563,7 +575,19 @@ def should_split(node: torch.fx.Node, splitting_ops: list[str]) -> bool:
     return False
 ```
 
-逻辑很硬核：只看这个节点调用的算子，它的 `namespace::name` 是否在 `splitting_ops` 清单里。在，就切。
+逻辑很硬核：只看这个节点调用的算子，它的**限定名**是否在 `splitting_ops` 清单里。在，就切。
+
+`namespace::name`（命名空间::算子名）这种写法是 PyTorch 给算子起名的规矩，不是 vLLM 自造的记号：每个算子都归属某个命名空间，以免不同库注册同名算子时互相覆盖。`aten` 是 PyTorch 内置算子的命名空间（`aten::add`、`aten::sin`），vLLM 则把自己注册的算子放进 `vllm` 命名空间，于是 attention 算子的限定名是 `vllm::unified_attention_with_output`——它是怎么被注册进去的，§23.8 会拆开看。
+
+代码里那两个 `isinstance` 分支，对应的是同一套记法的两个层级。同一个算子名下还可能挂多个**重载**（overload），比如 `aten::add.Tensor`（张量加张量）和 `aten::add.Scalar`（张量加标量），`.Tensor`/`.Scalar` 就是重载名。在 Python 里这两层是这样区分的：
+
+```python
+# 说明性示例：PyTorch 通用记法，非本仓源码
+torch.ops.aten.add          # OpOverloadPacket：只到 aten::add 这一层，还没选定重载
+torch.ops.aten.add.Tensor   # OpOverload：具体重载，限定名是 aten::add.Tensor
+```
+
+于是 `should_split` 拿到的 `node.target` 若是 `OpOverloadPacket`（未选重载的「包」），就直接拿它的 `_qualified_op_name`（形如 `aten::add`）去比；若是 `OpOverload`（具体重载），先拼出 `包名.重载名` 去比，没命中再退回只用包名比。这样 `splitting_ops` 里既可以写精确到重载的名字，也可以写 `vllm::unified_attention_with_output` 这种整包名字——默认配置写的正是后者。
 
 那 `splitting_ops` 清单里是什么？默认就是一串 attention 类算子（`vllm/config/compilation.py:L738`）：
 
@@ -582,6 +606,8 @@ _attention_ops: ClassVar[list[str]] = [
 `set_splitting_ops_for_v1` 在 `mode == VLLM_COMPILE` 时把 `splitting_ops` 设成这份 `_attention_ops` 的拷贝（`vllm/config/compilation.py:L1104`）。于是默认的切点，正是 `vllm::unified_attention_with_output` ——记住这个名字，它就是上一章那行 `self.attn(q, k, v)` 背后的算子。
 
 为什么偏偏在 attention 处切？因为 attention 是**没法被 Inductor 融合、也难以塞进单张 CUDA graph** 的：它要读写变长的 KV cache、依赖随 batch 变化的 metadata、还原地写 output。把它单独切出来让它 eager，反倒成全了它两边的规整段——norm、linear、激活、残差这些形状规整、无数据依赖的算子，可以放心地融合 + 图捕获。
+
+这里的 CUDA graph 值得单独讲透，因为下一节整笔收益账都压在它身上。GPU 上每发起一个 kernel，都要走一遍「CPU 提交 → 驱动 → GPU 排队执行」的流程，这个发起动作本身有微秒量级的固定开销（launch overhead，启动开销）。模型一深、每层算子又小又多，这笔 CPU 开销就可能比 GPU 真正算的时间还长，GPU 大半时间在等 CPU 喂下一个 kernel。NVIDIA 自 CUDA 10 起提供的 **CUDA Graph** 正是治这个的：先进入「捕获」（capture）模式，把一段连续的 GPU 操作序列（kernel、显存拷贝等）整个录成一张静态图；之后要跑同样的序列，只需一次「重放」（replay）调用，驱动按录好的图把全部操作一次性提交下去，逐 kernel 反复走 CPU-GPU 交互的开销就此消失（PyTorch 约自 1.10 起提供 `torch.cuda.graph` 这类原生封装，细节可看官方博客 [Accelerating PyTorch with CUDA Graphs](https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/)）。代价写在「静态」两个字上：录下来的形状、显存地址、控制流都不许再变。attention 恰恰是变长 KV cache、随 batch 变化的 metadata——它进不了 CUDA graph，根子就在这。
 
 我们可以拿一张真实的两层 attention FX 图喂给 `split_graph`，看它切成几段：
 
@@ -639,7 +665,7 @@ def call_module(self, target, args, kwargs):
 - **规整段**（名字在 `compile_submod_names` 里）→ 给它建一个 `PiecewiseBackend`，让 Inductor 把这段编译掉；再用 `wrap_with_cudagraph_if_needed` 按需在外面包一层 CUDA graph wrapper。
 - **attention 段**（名字不在清单里）→ 这个 `if` 不进，什么都不做，它就保持原样、eager 执行。
 
-`wrap_with_cudagraph_if_needed` 判断这一段要不要被 CUDA graph 捕获（满足条件的规整段，运行时按 batch size 重放捕获好的图，CPU launch 开销几乎归零）。整个 piecewise 编译的成果就是下面这张图：
+`wrap_with_cudagraph_if_needed` 判断这一段要不要被 CUDA graph 捕获（满足条件的规整段，运行时按 batch size 重放捕获好的图，CPU launch 开销几乎归零）。值得留意的是这个决定权在谁手里：torch.compile 生态里另有一套 CUDAGraph Trees，由 Inductor 自动管理多张 CUDA graph 之间的显存复用；而 vLLM 走的是自管理路线——**哪一段包 CUDA graph、哪一段不包，由自己这行 `wrap_with_cudagraph_if_needed` 说了算**，因为只有它知道哪些段是被 attention 隔开的规整段。整个 piecewise 编译的成果就是下面这张图：
 
 ![piecewise 切图](../diagrams/piecewise-split.png)
 
@@ -673,7 +699,7 @@ for name, mod in split_gm.named_children():
 
 「非切分子图才建 backend、才包 CUDA graph；attention 子图保持 eager」——和真实控制流一处不差。
 
-> **v0.21.0 更新**：[§23.3](#233-rmsnorm一个-customop-长什么样) 提到的 `ir.ops.fused_add_rms_norm.maybe_inplace`，它的「下半场」就落在这条编译管线上。`vllm.ir` 把带就地（in-place）语义的算子先以**函数式**形态喂给 Inductor（避免 in-place 写法干扰图追踪），再由一道 **pre-grad pass** 在编译期把它还原成就地写（Inductor 把编译流程切成两段 pass：pre-grad pass 跑在图交给 autograd 之前，post-grad pass 跑在图降层之后——两者都挂在同一个 pass manager 上，只是介入的时机不同）。这道 pass 就是 v0.21.0 新增的 `VllmIRInplaceFunctionalizationPass`：`VllmBackend.configure_post_pass`（`vllm/compilation/backends.py`）在配置 post-grad pass manager 的同时，把它注册为 Inductor 的 `pre_grad_custom_pass`，并刻意把这个 key 加入缓存忽略前缀——它不该参与编译缓存键的计算。同一区间里，codegen 侧的 `generate_execution_code(...)` 返回值也从二元组扩成**三元组**（新增 `consts`），缓存路径同步带上 `consts=consts`。这些都不改本章 `split_graph → 逐段编译 → 包 CUDA graph` 的主骨架，只是在「送进 Inductor 之前」多了一道 IR 就地函数化的工序。
+> **v0.21.0 更新**：[§23.3](#233-rmsnorm一个-customop-长什么样) 提到的 `ir.ops.fused_add_rms_norm.maybe_inplace`，它的「下半场」就落在这条编译管线上。`vllm.ir` 把带就地（in-place）语义的算子先以**函数式**形态喂给 Inductor（避免 in-place 写法干扰图追踪），再由一道 **pre-grad pass**（pass：一趟图变换）在编译期把它还原成就地写。这里的 pre-grad/post-grad 是 Inductor 官方开给第三方的两个**挂载点**，不是 vLLM 自造的概念：图从 Dynamo 手里出来后要先过 AOTAutograd 拆出前反向图、再降层生成 kernel，`pre_grad_custom_pass` 挂在过 AOTAutograd **之前**（此时图还很「原始」，官方在 Inductor 配置里也提醒这层 IR 未规范化、更易变），`post_grad_custom_pre_pass`/`post_grad_custom_post_pass` 则挂在降层后的模式匹配**前后**，是做正式融合替换的常规位置。它们和本章讲的 custom backend 是两种粒度：backend 替换的是整条编译流程，custom pass 只是在官方流程的某个时刻插一段自己的图变换，插完继续走 Inductor 后面的融合与代码生成。v0.21.0 新增的这道 pass 叫 `VllmIRInplaceFunctionalizationPass`：`VllmBackend.configure_post_pass`（`vllm/compilation/backends.py`）在配置自家 post-grad pass manager（它挂的是 `post_grad_custom_post_pass` 那个钩子）的同时，把这道新 pass 单独塞进 `pre_grad_custom_pass`，并刻意把这个 key 加入缓存忽略前缀——它不该参与编译缓存键的计算。同一区间里，codegen 侧的 `generate_execution_code(...)` 返回值也从二元组扩成**三元组**（新增 `consts`），缓存路径同步带上 `consts=consts`。这些都不改本章 `split_graph → 逐段编译 → 包 CUDA graph` 的主骨架，只是在「送进 Inductor 之前」多了一道 IR 就地函数化的工序。
 
 ## 23.8 还债：attention 算子怎么进 torch.compile 图
 
@@ -724,7 +750,7 @@ direct_register_custom_op(
 
 两个关键点。
 
-第一，`fake_impl`（这里是 `unified_attention_with_output_fake`）。它什么也不算，直接 `return`。它的作用是给 Dynamo 一个「假实现」——追踪时 Dynamo 用 fake tensor 逐算子传播形状，对内置 torch 算子有内建规则；但对一个全新注册的 C++ 算子，它没有任何形状推断规则。这时 Dynamo 只能真执行一次来推断输出，而真执行 attention 涉及变长 KV cache 等外部状态，Dynamo 无法安全完成，就只能 graph break。有了 fake_impl，Dynamo 调它（什么也不算、直接 return）就知道**输出形状**（原地写 `output`、无返回值），可以安全地把节点接进图里。**fake_impl 是「不 graph break」的技术前提。**
+第一，`fake_impl`（这里是 `unified_attention_with_output_fake`）。它什么也不算，直接 `return`。它的作用是给 Dynamo 一个「假实现」——追踪时 Dynamo 用 fake tensor 逐算子传播形状，对内置 torch 算子有内建规则；但对一个全新注册的 C++ 算子，它没有任何形状推断规则。这时 Dynamo 只能真执行一次来推断输出，而真执行 attention 涉及变长 KV cache 等外部状态，Dynamo 无法安全完成，就只能 graph break。有了 fake_impl，Dynamo 调它（什么也不算、直接 return）就知道**输出形状**（原地写 `output`、无返回值），可以安全地把节点接进图里。**fake_impl 是「不 graph break」的技术前提。** 这不是 vLLM 的独门技巧：PyTorch 官方管它叫 fake kernel（早期文档里也叫 meta kernel），标准写法是 `torch.library.register_fake`，凡是想被 `torch.compile` 干净追踪的自定义算子都得配一个——它接到的是没有真实数据的 fake tensor，只需返回形状/dtype/device 与真实输出一致的空壳（本例连空壳都不用，因为算子原地写 `output`、根本没有返回值）。
 
 第二，`mutates_args=["output", ...]`。它告诉 torch：这个算子会**原地改写** `output`。这让 `torch.compile` 知道 output 是被这个算子写的，从而正确处理依赖关系、不会把它当成纯函数乱优化。
 
@@ -741,7 +767,9 @@ def direct_register_custom_op(op_name, op_func, mutates_args=None, fake_impl=Non
         my_lib._register_fake(op_name, fake_impl)
 ```
 
-函数开头的注释解释了为什么叫 `direct`：`torch.library.custom_op` 那套标准注册有可观的 dispatch 开销（要考虑复杂的分发逻辑），而 vLLM 直接 `define` + `impl`（+ `_register_fake`）到自己的 Library，绕开那层开销。三步就是：定义 schema、绑真实实现、绑 fake 实现。
+函数开头的注释解释了为什么叫 `direct`：`torch.library.custom_op` 那套标准注册有可观的 dispatch 开销（要考虑复杂的分发逻辑），而 vLLM 直接 `define` + `impl`（+ `_register_fake`）到自己的 Library，绕开那层开销。三步就是：定义 schema（算子的类型签名，写明参数与返回值的类型，这里由 `infer_schema` 从函数注解加 `mutates_args` 自动推出来）、绑真实实现、绑 fake 实现。
+
+值得说清楚的是这三步和 PyTorch 官方推荐写法的关系。官方给自定义算子的正规入口是 `torch.library.custom_op` 装饰器加 `torch.library.register_fake`——PyTorch 2.x 才有的标准化接口，为的正是解决早期自定义算子（裸 C++ 扩展、`torch.autograd.Function`）对 `torch.compile` 不透明、动不动就把图撕断的老问题。vLLM 这个 `direct_register_custom_op` 并没有绕开这套体系，它用的仍是同一个底座 `torch.library.Library`，只是跳过了装饰器那层封装、手写三步。**契约完全一样**：schema、`mutates_args`、fake 实现，缺一个都会让 `torch.compile` 追不动或行为不对。想看官方标准写法长什么样，[Python Custom Operators 教程](https://docs.pytorch.org/tutorials/advanced/python_custom_ops.html) 是最短的一篇。
 
 还有个容易被略过的参数：调用处那个 `kv_cache_dummy_dep`。它是上一步 `unified_kv_cache_update` 的返回值，作为一个**假数据依赖**传进 attention 算子。attention 根本不用它的值，但「用到了它」这件事本身，强迫 `torch.compile` 保持「先更新 KV cache、后算 attention」的顺序。否则编译器可能把两者重排，读到还没写进去的 KV。这是一个用「假依赖」给编译器下命令的小技巧。
 

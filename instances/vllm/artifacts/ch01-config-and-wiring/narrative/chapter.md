@@ -53,6 +53,8 @@ RequestOutput → 回到你手里
 
 如果你用过 v0，会发现 v1 几乎是重写。四个关键转变，每一个都对应本书后面某个 Part 的深挖。这里逐一点到为止。
 
+先把"v0/v1"这两个称呼的来历交代清楚，免得你以为是本书发明的记号：它们是 vLLM 项目自己的版本里程碑。项目跑了约一年半后，团队发现早期架构攒下不少历史包袱——调度、tokenize/detokenize、模型执行搅在一起，深层的异步重叠做不动。于是官方在 2025 年 1 月 27 日发布了 [vLLM V1](https://vllm.ai/blog/2025-01-27-v1-alpha-release)，博客里的原话是"基于 1.5 年开发的经验教训，重新审视关键设计决策"：把多进程架构更深地织进 `AsyncLLM`，让 `EngineCore` 变成一个只管调度与模型执行的独立循环，好让 tokenize、detokenize 这些 CPU 密集的活跟核心循环重叠起来。发布当时 v1 还只是个可开关的过渡形态——设一个环境变量 `VLLM_USE_V1=1` 就能切过去，调用代码一行不用改；而在本书锚定的 v0.21.0 里，这个开关连同它在 `vllm/envs.py` 里的定义都已经消失，`vllm/v1/...` 就是唯一的引擎路径。那篇发布博客是下面四个转变的产品视角版本，我们接下来换成源码视角。
+
 ### 转变一：异步三段式解耦（旗舰）
 
 v0 的引擎是一坨：tokenize、调度、前向、detokenize 全挤在一个进程、一个事件循环里。结果是 CPU 干重活（比如 detokenize 一长串输出）时，GPU 只能干等；反过来 GPU 忙时，新请求的 tokenize 也排不上队。
@@ -116,9 +118,14 @@ self.engine_core = EngineCoreClient.make_async_mp_client(
 
 同步版用 `make_client`，服务版用 `make_async_mp_client`。后者的注释直说：`starts the engine in background process`——**引擎内核被搬进了一个独立的子进程**。
 
-先按住一个容易生的误会：别把"子进程 + IPC"当成服务面的专属特征。真正决定"内核进不进独立子进程"的是 `multiprocess_mode`（默认 `True`），默认配置下同步离线面的 `make_client` 同样把 `EngineCore` 放进子进程、同样靠 ZMQ 通信；`async` 与 `sync` 的真正区别只是**用不用 asyncio 事件循环来驱动**，而非"有没有子进程"。这里之所以在服务面才点出它，是因为下一步的背景任务只有在事件循环里才需要——离线面同样藏着这层 IPC，§1.3 会拿源码把它挖出来对照。
+先按住一个容易生的误会：别把"子进程 + IPC"当成服务面的专属特征。真正决定"内核进不进独立子进程"的是 `multiprocess_mode`（默认 `True`），默认配置下同步离线面的 `make_client` 同样把 `EngineCore` 放进子进程、同样靠 ZMQ（ZeroMQ，一个不需要额外跑代理进程的轻量消息库，下一段展开）通信；`async` 与 `sync` 的真正区别只是**用不用 asyncio 事件循环来驱动**，而非"有没有子进程"。这里之所以在服务面才点出它，是因为下一步的背景任务只有在事件循环里才需要——离线面同样藏着这层 IPC，§1.3 会拿源码把它挖出来对照。
 
-这就是解耦的物理基础。GPU 重活的 `EngineCore` 在另一个进程跑，API 这边的事件循环不会被它的前向计算阻塞。两个进程之间靠进程间通信（IPC）传消息，那套 ZMQ + msgpack 的机制本身就是一章的分量，[第 7 章会专门拆开它](../../ch07-engine-core/narrative/chapter.md)。
+这就是解耦的物理基础。GPU 重活的 `EngineCore` 在另一个进程跑，API 这边的事件循环不会被它的前向计算阻塞。两个进程之间靠进程间通信（IPC）传消息，用的是 ZMQ + msgpack 这一对现成的外部件，都不是 vLLM 自己造的轮子：
+
+- **ZeroMQ**（ZMQ／ØMQ）是个异步消息传递库，给你 socket 风格的收发接口和几种内置通信模式（请求-应答、发布-订阅等），但**不需要像 RabbitMQ 那类传统消息队列一样额外跑一个 broker（居中转发的代理服务）进程**——两端直接连，开销比一般 RPC 框架小。这正是它适合"同一台机器上主进程↔子进程"这种场景的原因（官方指南：<https://zguide.zeromq.org/docs/chapter2/>）。
+- **msgpack**（MessagePack）负责把 Python 对象打包成字节流。ZMQ 本身只管搬字节、不管序列化格式，得你自己选一个。msgpack 语义上像 JSON——嵌套的字典、数组、基础类型都能表示——但编码是二进制的：小整数一个字节就装下，比 JSON 更紧凑也更快。本书锚定的版本用的是 `msgspec` 库自带的 msgpack 编解码器（`vllm/v1/serial_utils.py`），跨进程传的 `EngineCoreRequest`／`EngineCoreOutputs` 干脆直接声明成 `msgspec.Struct`，省掉一层对象转字典的开销。
+
+合起来就是"先 msgpack 打包，再由 ZMQ socket 送到另一个进程"这套轻量 IPC。具体的消息结构、socket 拓扑与优雅退出，本身就是一章的分量，[第 7 章会专门拆开它](../../ch07-engine-core/narrative/chapter.md)。
 
 可一旦内核进了另一个进程，新问题来了：它在那边一拍拍吐 token，谁负责把这些输出送回每个等待中的请求？答案是一个**背景任务**：
 
@@ -176,6 +183,8 @@ async def output_handler():
 
 第二个转变在内核里。v0 是"凑一批请求、一起跑到底、再凑下一批"，慢请求会拖住整批。v1 不这么干——它一拍（one step）只决定"这一拍跑哪些请求、哪些 token"，请求逐拍动态进出。这就是 continuous batching（连续批处理）。
 
+这个思路本身不是 vLLM 首创。把调度粒度从"一整个请求的生命周期"缩小到"一次前向迭代"的做法，最早由 Orca 这套系统（首尔大学团队，OSDI 2022）系统化提出，论文里管它叫 iteration-level scheduling（逐迭代调度）——静态批处理的病根在于批里最长的那个请求没生成完，早就结束的短请求也得占着槽位干等；改成逐拍决策后，谁跑完谁立刻让位，新请求立刻补进来。vLLM 的贡献是把它和自己的分页 KV cache 绑到一起：调度器敢每一拍重新洗牌，前提是显存能按页动态分配与回收，两件事互为条件（转变四就是另一半）。想读原始论文：<https://www.usenix.org/conference/osdi22/presentation/yu>。
+
 看 `EngineCore.step`，一拍的全貌就三步：
 
 ```python
@@ -212,7 +221,31 @@ def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
 
 ### 转变三：torch.compile piecewise 编译
 
-第三个转变关于性能。v1 默认走 `torch.compile`，但用的是 vLLM 自定义的编译路径。这里有个**极易踩的坑**，先把两个枚举并排放出来看清楚：
+第三个转变关于性能。v1 默认走 `torch.compile`，但用的是 vLLM 自定义的编译路径。这条线上的名词密度很高，先把两个前置概念交代清楚，不然后面的枚举名会像天书。
+
+**`torch.compile`：PyTorch 官方的即时编译栈。** 它从 PyTorch 2.0 起提供，一行装饰器背后是两级流水线。前端 TorchDynamo 挂进 CPython 的帧求值接口，把你那段 Python 代码的字节码"符号执行"一遍，把其中的张量运算抽出来攒成一张 FX 计算图（FX 是 PyTorch 自带的图中间表示，把运算记成一张可分析、可改写的节点图）；后端 TorchInductor 再把这张图翻译成 GPU 上的 Triton 内核（Triton：用 Python 语法写 GPU 核函数的编译器语言）或 CPU 上的 C++ 代码。它的设计动机是 PyTorch 的老问题——动态图好写但难做整体优化——而它相对早年 TorchScript 那类静态化路线的卖点，是"不用改用户代码就能享受编译加速"。代价在覆盖率上：一旦遇到 Dynamo 没法符号执行的东西（打印一个具体数值、按张量内容决定分支），就会发生 **graph break（图中断）** ——Dynamo 把已追踪到的这一段就地编译掉，让中断点原样在 Python 里执行，再从下一条指令开始追踪新的一张图。记住 graph break 这个词，vLLM 的整套编译设计正是围着它转的（PyTorch 官方教程：<https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html>）。
+
+**CUDA Graph：和编译无关的另一件事。** 这是 CUDA 平台层面的通用能力（NVIDIA 在 CUDA 10 引入，PyTorch 侧有 `torch.cuda.graphs` 封装）。CPU 每发起一次 GPU 内核（kernel，跑在 GPU 上的一段并行函数）调用都要走一遍驱动栈，单次开销以微秒计；而 decode 阶段（一个 token 一个 token 往外吐的那段，区别于一口气吃完整个 prompt 的 prefill 阶段）恰恰是"算子很多、每个算子只跑几十微秒"的场景，于是 GPU 时间线上全是等 CPU 发指令的空隙。CUDA Graph 让你把一串内核调用连同它们之间的依赖关系一次性"录制"成一个对象，之后每跑一遍这段逻辑只需一次 API 调用把整张图回放，启动开销被摊薄到接近于零。它的适用面很挑：**内核多而小才划算，而且回放时的形状与控制流必须和录制时完全一致**（NVIDIA 文档：<https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html>）。
+
+**piecewise 就是这两件事撞在一起后的组合拳。** 把上面两段的约束摆在一起，vLLM 的处境就清楚了：attention 要处理变长序列和按页寻址的 KV cache，既容易触发 graph break，也满足不了 CUDA Graph"形状与控制流恒定"的要求；可模型里其余那些线性层、归一化、激活，恰恰是"多而小"、最该被 CUDA Graph 收编的部分。vLLM 的解法是不做二选一：先让 Dynamo 把整个前向追成一张大图，再在**指定的切分算子**处把图切成若干段——attention 那些段保持 eager（原生 PyTorch 逐算子执行，不进图），夹在中间的段各自编译、各自用 CUDA Graph 捕获回放。"切成段分别对待"，就是 piecewise（分段）这个词的由来。
+
+切在哪里也不是玄学：本书锚定的版本里由 `CompilationConfig.splitting_ops`（`vllm/config/compilation.py:L491`）这个字段决定，它的文档把自己定义成"要从 CUDA graph 里排除的算子清单"，缺省值正是那批 attention 算子。一次前向被切完，大致是这么个形状：
+
+```text
+（说明性示意，非本章实抓 dump；按 vLLM 官方设计文档描述的流程画）
+[embedding / 线性层 / 归一化 段]   →  Inductor 编译 + CUDA Graph 回放
+        ↓
+[attention]                        →  eager 执行，不进图
+        ↓
+[线性层 / 激活 / 归一化 段]        →  Inductor 编译 + CUDA Graph 回放
+        ↓
+[attention]                        →  eager 执行，不进图
+        ↓   （逐层重复）
+```
+
+买到的是：attention 后端可以继续保持它的动态性，不必等所有后端都支持整图捕获；付出的是段与段之间多了若干次进出图的边界。这不是通用编译界的标准做法，而是 vLLM 结合自己的 attention 后端生态量身定制的模式（官方设计文档：<https://docs.vllm.ai/en/latest/design/torch_compile/>）。
+
+组合拳说完了，来看它在配置里怎么落成名字——这里有个**极易踩的坑**，先把两个枚举并排放出来看清楚：
 
 ```python
 # vllm/config/compilation.py:L37
@@ -254,9 +287,11 @@ class CUDAGraphMode(enum.Enum):
 
 ### 转变四：分页 KV cache
 
-第四个转变是内存。v1 的 KV cache 是**分页**的：先做一遍显存 profiling，按剩下多少显存切成固定大小的块，再由调度器和块池统一管理。分页之后能做前缀复用、动态分配、避免碎片——这是高吞吐推理的内存基石。
+第四个转变是内存。v1 的 KV cache 是**分页**的：先做一遍显存 profiling（跑一遍试探性的前向，量出权重与激活到底吃掉多少显存、还剩多少可用），按剩下多少显存切成固定大小的块，再由调度器和块池统一管理。分页之后能做前缀复用、动态分配、避免碎片——这是高吞吐推理的内存基石。
 
-它就建在 `EngineCore` 的构造里：profiling 跑完才初始化分页 KV cache，紧接着建调度器。块池、前缀缓存、块的引用计数与 LRU 回收，是 [Part IV 第 15–16 章](../../ch15-kv-cache/narrative/chapter.md) 的主场。本章不展开，只标明它的位置。
+这套机制有个正式名字叫 **PagedAttention**，正是 vLLM 项目赖以成名的核心创新，出自团队自己的论文《Efficient Memory Management for Large Language Model Serving with PagedAttention》（Kwon 等，SOSP 2023）。它要治的病是这样的：传统实现要求一个请求的 KV cache 占一段连续显存，可这个请求会生成多长事先并不知道，只能按最大长度预留——于是大量显存"预留了但没用满"，白白烂在那里，请求之间也没法互相共享。论文的解法是把操作系统那套虚拟内存分页搬过来：KV cache 切成固定大小的物理块，每个请求逻辑上连续的序列通过一张**块表**（block table）映射到若干个物理块上，物理块之间不必连续、可以按需追加、用完回收，相同前缀的块甚至能在多个请求之间共享。项目名 "vLLM" 里的那个 v，指的就是 virtual memory（虚拟内存）这层类比。论文自报的口径是相对 FasterTransformer（NVIDIA 早年的 Transformer 推理加速库）、Orca 等同期系统拿到 2–4 倍吞吐（<https://arxiv.org/abs/2309.06180>）；块表长什么样、前缀怎么命中，是后面的正题。
+
+回到 v1 的源码：这套分页 KV cache 就建在 `EngineCore` 的构造里——profiling 跑完才初始化它，紧接着建调度器。块池、前缀缓存、块的引用计数与 LRU（最近最少使用）回收，是 [Part IV 第 15–16 章](../../ch15-kv-cache/narrative/chapter.md) 的主场。本章不展开，只标明它的位置。
 
 ## 1.3 两个使用面：同一个内核，两种驱动
 

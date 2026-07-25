@@ -8,14 +8,14 @@
 
 前面几章，我们已经有了纵览全局的底子：[vLLM v1 的整体心智模型](../../ch01-config-and-wiring/narrative/chapter.md)、[一个请求端到端的鸟瞰路径](../../ch02-entrypoints/narrative/chapter.md)，以及[从 `EngineArgs` 怎么组装出 `VllmConfig`](../../ch03-config-and-wiring/narrative/chapter.md)——本章构造三段所依赖的那套配置，正是上一章拼出来的。但有个问题一直没回答：**一个请求从 HTTP 进来、到 token 一个一个吐回客户端，中间到底经过几只手？**
 
-这章给答案。主角是 `vllm/v1/engine/async_llm.py:L70` 里的 `AsyncLLM` 类。它是 OpenAI 兼容服务器背后的异步引擎前端，一个不到 800 行的 facade。它干的事可以浓缩成一句话：
+这章给答案。主角是 `vllm/v1/engine/async_llm.py:L70` 里的 `AsyncLLM` 类。它是 OpenAI 兼容服务器背后的异步引擎前端，一个不到 800 行的 **facade**。facade（外观）是《设计模式》（1994 年那本，作者四人常被合称 GoF，Gang of Four）总结的经典结构型模式，核心动作就是"包一层"：子系统内部再复杂——这里是输入预处理、跨进程通信、输出后处理三套机器——对外只暴露少数几个简单方法（这里是 `generate()` / `add_request()`），调用方只管这层门面，门面背后怎么拆、怎么重构都不惊动外面。命名借的是建筑学"外立面"的比喻：立面统一美观，复杂的结构和管线全藏在背后（想系统了解这个模式，可看 [refactoring.guru 的 Facade 条目](https://refactoring.guru/design-patterns/facade)）。`AsyncLLM` 这层门面干的事可以浓缩成一句话：
 
 > 把一个请求拆成**三段**，让 CPU 干的活和 GPU 干的活在不同进程里**重叠**跑，互不挡道。
 
 这章我们只讲清楚 `AsyncLLM` 这一层怎么**编排**这三段——它怎么接请求、怎么把请求扇出到三段、怎么用一个背景任务把结果收回来再分发给成百上千个并发的 `generate()` 协程。三段各自的内部细节会在后面解锁：
 
 - **Stage1 输入预处理**（tokenize、校验）—— [第 5 章：输入处理](../../ch05-input-processing/narrative/chapter.md)
-- **Stage2 EngineCore 跨进程 IPC**（ZMQ、msgpack、进程编排）—— [第 7 章：IPC 边界](../../ch07-engine-core/narrative/chapter.md)
+- **Stage2 EngineCore 跨进程 IPC**（ZMQ 消息库、MessagePack 二进制序列化、进程编排——这两个名词是什么，§4.1 就会交代）—— [第 7 章：IPC 边界](../../ch07-engine-core/narrative/chapter.md)
 - **Stage3 输出后处理**（detokenize、累积、停止串检测）—— [第 8 章：输出处理](../../ch08-output-processor/narrative/chapter.md)
 
 下一章会钻进 [Stage1 的输入处理](../../ch05-input-processing/narrative/chapter.md)；本章只把它当黑盒用。读完这章，你会对"一个 token 怎么流回客户端"有一张完整的地图。
@@ -35,6 +35,8 @@
 > *图注：三条泳道。左边「本进程 Frontend」做 CPU 活（tokenize/detokenize）；右边「独立进程 EngineCore」做 GPU 活（调度+执行）；中间虚线是进程边界（IPC，机制留 [第 7 章：IPC 边界](../../ch07-engine-core/narrative/chapter.md)）。蓝线是请求进入引擎的方向（`EngineCoreRequest`），红线是结果返回前端的方向（`EngineCoreOutput`）。图里特意标出的三处，是本章会逐一拆开的三块骨架：每请求一条的队列、把前后端分到两个进程的边界，以及在后台把结果收回来再分发的生产者-消费者背景任务。*
 
 为什么非要拆成三段、还要跨进程？答案藏在一个朴素的事实里：**tokenize 是 CPU 干的纯 Python 活，模型前向是 GPU 干的活，这两件事如果挤在同一个进程同一个线程，会被 Python 的 GIL 逼着串行。**
+
+先把 GIL 说清楚。GIL（Global Interpreter Lock，全局解释器锁）是 CPython 解释器内部的一把全局锁，规则只有一条：不管开多少个线程，同一时刻只有一个线程在执行 Python 字节码。它换来了 dict/list 这些内置类型并发访问的天然安全，代价是纯 Python 的 CPU 密集代码开再多线程也吃不到多核——tokenize 恰恰就是这种活。所以想让 tokenize 和模型前向真正同时跑，拆线程没用，得拆 **进程**：两个进程各有一个解释器、各有各的 GIL，互不相干。顺带一句免责，GIL 并非永恒真理：[PEP 703](https://peps.python.org/pep-0703/) 的"自由线程"CPython 构建从 Python 3.14 起已由实验性转为官方支持，但标准构建至今默认仍带 GIL，而本书 pin 的 vLLM 要求 Python `>=3.10,<3.15`（`pyproject.toml`），正落在"GIL 仍是默认"的窗口里——本章"拆进程绕过 GIL"的论证对 pin 版本完全成立，vLLM 也未依赖自由线程构建。
 
 来源：`vllm/v1/engine/async_llm.py:L132-L153`（`__init__` 一次性构造三段）。我们先把三段诞生的地方看一眼，下一节再逐行解读：
 
@@ -67,7 +69,9 @@
 - `OutputProcessor` —— Converts EngineCoreOutputs → RequestOutput（Stage3，本进程）
 - `EngineCoreClient` —— **starts the engine in background process**（Stage2，独立进程）
 
-注意第三行那句注释：`make_async_mp_client` 不是构造一个对象那么简单，它会**起一个独立的子进程**把 EngineCore 跑起来。这个进程边界是三段式的物理前提，它的 IPC 机制（ZMQ + msgpack）留到 [第 7 章：IPC 边界](../../ch07-engine-core/narrative/chapter.md) 揭晓；本章只需要知道：**Stage2 在另一个进程里，前端通过两个异步方法跟它对话。**
+（片段第一行那个 `renderer` 不是三段之一，是三段共用的前置件：`renderer_from_config` 按模型配置装出一个"渲染器"，内含该模型的 tokenizer，负责把聊天消息按 chat template 拼成模型认得的输入文本——Stage1 拿它做 tokenize、Stage3 拿它做 detokenize。它自己的构造细节见 [第 38 章：OpenAI 兼容服务器](../../ch38-entrypoints/narrative/chapter.md)。）
+
+注意第三行那句注释：`make_async_mp_client` 不是构造一个对象那么简单，它会**起一个独立的子进程**把 EngineCore 跑起来。这个进程边界是三段式的物理前提。跨过它靠两样东西：**ZeroMQ**（ZMQ，一个内嵌在应用里的消息传递库——给套接字包上"一次 `send()`/`recv()` 就是一条完整消息"的语义，不用像裸 TCP 那样自己处理消息在哪断句；它也不需要像 RabbitMQ 那样单独部署一个中间件进程，而是作为库直接跑在应用里，[官方](https://zeromq.org/)因此把它形容成"看着像可嵌入的网络库，用起来像并发框架"）负责传输，**MessagePack**（一种二进制序列化格式，[官方](https://msgpack.org/)自我定位是"像 JSON，但更快更小"——能表达的东西和 JSON 一样，只是编成紧凑的二进制字节流，人眼读不懂但机器省时省空间）负责编码。两者怎么握手、怎么保证消息不丢，留到 [第 7 章：IPC 边界](../../ch07-engine-core/narrative/chapter.md) 揭晓；本章只需要知道：**Stage2 在另一个进程里，前端通过两个异步方法跟它对话。**
 
 ### 拆段到底省了多少？给个数
 
@@ -131,7 +135,20 @@ T_{\mathrm{pipelined}} = \max(T_{cpu},\, T_{gpu})
 
 `AsyncLLM` 对外最重要的入口是 `generate()`。服务器每收到一个请求，就调一次它，拿到一个**异步生成器**（`AsyncGenerator`），然后 `async for` 迭代它，把吐出来的 `RequestOutput` 转成 SSE 推给客户端。
 
-先看它的 docstring（vLLM 原文）和主循环——它把这层 facade 的工作流程逐字列清了：
+SSE（Server-Sent Events）值得停半步讲清：它是 WHATWG 标准化的**单向**服务器推送协议，全部建立在普通 HTTP 上——客户端发一次请求，服务器把 `Content-Type` 设成 `text/event-stream` 后**不关闭连接**，随时往响应流里追加一条条 `data: ...` 文本消息，每条以一个空行结尾。`generate()` 每 `yield` 一个 `RequestOutput`，vLLM 的 OpenAI 兼容层就把它包成一条这样的消息写回去：
+
+```text
+data: {"id":"cmpl-abc","choices":[{"delta":{"content":"Hello"}}]}
+
+data: {"id":"cmpl-abc","choices":[{"delta":{"content":" world"}}]}
+
+data: [DONE]
+
+```
+
+（说明性示例，非本仓源码：OpenAI 流式协议约定的 SSE 消息形状——`data:` 后面跟这次增量的 JSON，随后的空行标志一条消息结束；客户端的 SSE 解析器一读到空行就把这条 `data:` 交给应用层，浏览器里对应 `EventSource.onmessage` 回调。末尾那条 `data: [DONE]` 是 OpenAI 协议自己约定的终止标记，不属于 SSE 标准。）落到本仓，这正是兼容层的写法：`vllm/entrypoints/openai/chat_completion/api_router.py:L74` 把 `generate()` 一路传上来的生成器包成 `StreamingResponse(content=generator, media_type="text/event-stream")`，`chat_completion/serving.py:L486-L487` 逐条 `yield f"data: {data}\n\n"`（那两个 `\n` 就是"一行内容 + 一个空行"）、最后补一条 `data: [DONE]\n\n`；completions / responses / speech-to-text 等流式端点同理。所以任何认得 OpenAI 协议的现成客户端都能直接消费。选 SSE 而不是 WebSocket，是因为流式吐 token 只需要单向推送：SSE 纯 HTTP 就能做、浏览器原生 `EventSource` API 自带断线重连；要双向交互才轮到 WebSocket（协议细节见 [MDN 的 SSE 指南](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events)）。
+
+回到 `generate()` 本身。先看它的 docstring（vLLM 原文）和主循环——它把这层 facade 的工作流程逐字列清了：
 
 ```python
     # vllm/v1/engine/async_llm.py:L524-L635
@@ -401,7 +418,7 @@ T_{\mathrm{pipelined}} = \max(T_{cpu},\, T_{gpu})
 
 但单线程协作式有个代价：**任何一段不带 `await` 的长循环，都会霸占整个线程，把其它所有协程饿死。**
 
-`process_outputs` 处理一大批输出是纯 CPU 循环，中间没有 `await`。如果一批有几百个请求的输出，一口气处理完，期间事件循环被完全占住——最要命的是，此时新请求的 `add_request` 没法被处理，**前端接客被卡住，请求接收尾延迟飙升**。
+`process_outputs` 处理一大批输出是纯 CPU 循环，中间没有 `await`。如果一批有几百个请求的输出，一口气处理完，期间事件循环被完全占住——最要命的是，此时新请求的 `add_request` 没法被处理，**前端接客被卡住，请求接收的尾延迟飙升**（尾延迟：一批请求里最慢那一小撮的延迟，工程上通常看 P99，也就是"99% 的请求都比它快"的那条线——服务体感往往就毁在这几个上，平均值再漂亮也救不回来）。
 
 解法就是 `await asyncio.sleep(0)`。它不是真的睡：
 
@@ -423,6 +440,8 @@ T_{\mathrm{pipelined}} = \max(T_{cpu},\, T_{gpu})
 来源：`vllm/v1/engine/output_processor.py:L48-L109`。
 
 前面反复提到"每请求一个队列"，现在拆开看它到底是什么。它的名字叫 `RequestOutputCollector`，但**它不是 `asyncio.Queue`**——而是一个更轻的东西：**一个单槽 + 一个 `asyncio.Event`**。
+
+先把 `asyncio.Event` 的官方语义摆上桌：它是 asyncio 标准库里最简单的同步原语，内部就是一个布尔标志位 + 一组等待者——`set()` 把标志置真并唤醒**所有**正在 `wait()` 的协程；`wait()` 在标志为假时挂起当前协程（标志已为真则立刻返回）；`clear()` 把标志复位为假。语义和多线程编程里的 `threading.Event` 相似，但官方文档明确 asyncio 的同步原语**不是线程安全的**——它只用来协调同一个事件循环里的协程，不能跨 OS 线程用（[asyncio 同步原语文档](https://docs.python.org/3/library/asyncio-sync.html#asyncio.Event)）。本章前端恰好整个跑在单线程事件循环上（4.5.1 刚论证过），正是它的用武之地。
 
 ```python
 # vllm/v1/engine/output_processor.py:L48-L109
@@ -632,7 +651,7 @@ class RequestOutputCollector:
 
 **反例：共享一条输出流。** 若所有请求共用一条队列，第 $`j`$ 个请求的 token 取走前要和其它请求的 token 争抢同一条流——这层**排队竞争**随并发数线性恶化，量级 $`O(N)`$ 。
 
-**per-request 队列：物理隔离 N 路。** `output_handler` 处理到本请求时，一次 `put` 直接命中它专属的 `Event`，**只唤醒那一个请求的 `generate()`**，不和任何别的请求争同一条队列。每个 `asyncio.Event` 最多只有一个等待者（该请求的 `generate()` 协程），所以 `Event.set()` 的唤醒成本恒为 O(1)。也就是说，**「派发到本请求」这一步的队列成本**约等于：
+**per-request 队列：物理隔离 N 路。** `output_handler` 处理到本请求时，一次 `put` 直接命中它专属的 `Event`，**只唤醒那一个请求的 `generate()`**，不和任何别的请求争同一条队列。每个 `asyncio.Event` 最多只有一个等待者——注意这是本设计的用法限定而非 `Event` 类的限制（4.6 节说过，`set()` 的官方语义是唤醒 **所有** 等待者，只是这里每个队列专属一个请求、天生只有该请求的 `generate()` 协程这一个等待者）——所以 `Event.set()` 的唤醒成本恒为 O(1)。也就是说，**「派发到本请求」这一步的队列成本**约等于：
 
 ```math
 T_{\mathrm{dispatch}} \approx T_{\mathrm{put}} + T_{\mathrm{resume}}
@@ -690,7 +709,9 @@ class EngineCoreOutput(
 
 特别留意末尾那个 `finished` 属性：`return self.finish_reason is not None`。**这就是 4.3 节 `generate()` 主循环 `finished = out.finished` 判停的最终来源**——一路从 EngineCore 进程的采样结果，经 IPC、经 `process_outputs` 装配进 `RequestOutput`，最后让消费者协程知道"可以收工了"。
 
-两个结构体都继承自 `msgspec.Struct`——`msgspec` 是 Python 的高性能序列化库，类似 `dataclasses` 但支持直接 encode 成 MessagePack 二进制，反序列化速度比 `pickle`/`json` 快一个数量级，专为进程间高频消息设计。`array_like=True` 让它序列化成数组（省字段名开销），`gc=False` 告诉 Python GC 不必追踪这个对象（纯值对象，无循环引用）——具体怎么 encode、怎么过 ZMQ，是 [第 7 章：IPC 边界](../../ch07-engine-core/narrative/chapter.md) 的事。本章你只要记住：**IPC 上进去的是 tokenize 好的请求，回来的是新 token + 完成标志。**
+两个结构体都继承自 `msgspec.Struct`。`msgspec` 值得认识一下：在它出现之前，Python 生态在"序列化 + 校验"这件事上基本只能二选一——要么 pydantic，拿到强 schema 校验但速度平平；要么 orjson/ujson 这类纯速度型 JSON 库，快但完全不做类型校验。`msgspec`（Jim Crist-Harif 开发）的思路是两个都要，抓手是 **把校验和解码合成一步做**：按类型注解边解码边校验，省掉"先解成通用 dict、再整个遍历一遍校验"的第二趟循环和一堆临时对象。`msgspec.Struct` 用起来很像标准库的 `dataclasses`（声明字段 + 类型注解即得 schema），但编解码走 C 扩展：官方基准给出的量级是 Struct 创建/比较比 dataclasses/attrs 快 5-60 倍、JSON 编解码+校验比 pydantic v2 快约 10 倍（数字出自 [msgspec 官方基准页](https://msgspec.dev/benchmarks)，口径为库作者自测）。它内置 JSON 与 MessagePack 双编码器，vLLM 走 MessagePack 这一路——4.1 节介绍过：像 JSON 但编成紧凑二进制，小整数、短字符串常常一个前缀字节就编完；而且它和 JSON 一样是无 schema 文件的自描述格式，不像 Protocol Buffers 要先写 `.proto` 再编译，这正是 msgspec 能直接拿 Python 类型注解当 schema 的原因——对 `EngineCoreRequest`/`EngineCoreOutput` 这种"轻量强类型 + 每个调度步都要跨进程"的高频消息正对胃口。
+
+结构体声明上那三个开关，也都是冲着这条高频路径去的：`array_like=True` 让它序列化成数组而不是带键的字典（省去每条消息重复携带字段名的开销），`omit_defaults=True` 让取值仍等于默认值的字段尽量不编码（`EngineCoreOutput` 里那一串可选字段平时大多是 `None`，省的就是这份空转），`gc=False` 告诉 Python 的垃圾回收器不必追踪这个对象（纯值对象、无循环引用，省一分 GC 扫描）——具体怎么 encode、怎么过 ZMQ，是 [第 7 章：IPC 边界](../../ch07-engine-core/narrative/chapter.md) 的事。本章你只要记住：**IPC 上进去的是 tokenize 好的请求，回来的是新 token + 完成标志。**
 
 ---
 

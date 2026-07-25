@@ -6,7 +6,7 @@
 
 > *图注：全书地图高亮当前位置。前面 [第 4 章](../../ch04-async-llm/narrative/chapter.md) 把引擎拆成三段、在两个进程里重叠跑；本章钻进那条把前端和 EngineCore 分开的虚线，看清跨进程到底怎么通信；再往后 EngineCore 进程内部的调度→执行→采样循环，是后续章节的事。*
 
-本章的代码主线集中在四个文件：`vllm/v1/engine/core_client.py`（前端三层 client）、`vllm/v1/engine/core.py`（engine 侧 `EngineCoreProc` 的两个 IO 线程与 busy loop）、`vllm/v1/serial_utils.py`（msgpack 多帧编解码）、`vllm/v1/engine/tensor_ipc.py`（多模态张量旁路）。
+本章的代码主线集中在四个文件：`vllm/v1/engine/core_client.py`（前端三层 client）、`vllm/v1/engine/core.py`（engine 侧 `EngineCoreProc` 的两个 IO 线程与 busy loop）、`vllm/v1/serial_utils.py`（msgpack——一种"二进制版 JSON"的通用序列化格式，[§7.11](#711-msgpack-多帧零拷贝小张量内联大张量旁路) 会正式介绍——的多帧编解码）、`vllm/v1/engine/tensor_ipc.py`（多模态张量旁路）。
 
 [第 3 章](../../ch03-config-and-wiring/narrative/chapter.md) 拼出 `VllmConfig`、用工厂选好了 IPC 客户端的类，但它说："这些客户端的内部机制——ZMQ、msgpack、跨进程怎么通信——留给本章。"
 
@@ -158,10 +158,12 @@ class InprocClient(EngineCoreClient):
 
 > *图注：左边前端进程持 ROUTER（input_socket，bind）+ PULL（output_socket）；右边 EngineCoreProc 进程持 DEALER（connect，带 identity）+ PUSH，外加两个 IO 线程、两个内部 queue、一个 run_busy_loop。蓝线是请求方向（ROUTER→DEALER），绿虚线是握手 ready 帧（DEALER 必须先发），灰线是输出方向（PUSH→PULL）。底部紫线是另一条独立通道：多模态大张量经 torch.mp.Queue 共享内存旁路，根本不进 ZMQ 帧。*
 
-为什么是这两对 socket，而不是随便挑？ZMQ 的 socket 类型不是花样，是语义：
+先把 ZMQ 本身立住——它不是 vLLM 自造的协议，是一个有近二十年历史的外部消息库。[ZeroMQ](https://zeromq.org/socket-api/)（ØMQ / libzmq）2007 年由 iMatix 的 Pieter Hintjes 团队发起，最初的目标是给 AMQP（高级消息队列协议）做一个更快的参考实现，做着做着发现"砍掉中心 broker"这个思路本身更有价值，于是独立成型：它不像 RabbitMQ/Kafka 那样需要一个独立的中转进程（broker），两端直接建连，排队、重连、流控全在库内部完成。可以把它理解成 **"加了强类型消息语义的 socket"**——收发的单位是**整条消息**而非字节流，而且 socket 创建时就要选一种**类型**（REQ/REP 一问一答、PUB/SUB 广播、ROUTER/DEALER 带身份路由、PUSH/PULL 单向管道……），选对类型就等于选对了通信拓扑，不必在应用层再垒一层协议。vLLM 用的是其 Python 绑定 [PyZMQ](https://github.com/zeromq/pyzmq)；各类型的语义在官方免费在线书[《ØMQ - The Guide》](https://zguide.zeromq.org/docs/chapter2/)里有权威讲解，想深挖的读者从那里进。
 
-- **ROUTER↔DEALER**——带身份（identity）的双向异步对。ROUTER 收发都带一帧"身份"，DEALER 自带 identity。前端用 ROUTER `bind`，engine 用 DEALER `connect`。这样**前端能按身份把请求精确路由到指定 engine**（数据并行有多个 engine 时按 rank 选谁），engine 的 DEALER 自带身份让 ROUTER 知道回信地址。
-- **PUSH↔PULL**——单向的负载均衡/汇聚管道。engine 用 PUSH 发、前端用 PULL 收。**多个 engine 的输出汇聚到一个前端的单一出口**——回想第 4 章的 `output_handler`，它从"一个 IPC 出口统一收所有请求的输出"，物理来源就是这个 PULL。
+所以"为什么是这两对 socket"不是随便挑——**类型即语义**：
+
+- **ROUTER↔DEALER**——带身份（identity）的双向异步对。ROUTER 收发都带一帧"身份"，DEALER 自带 identity。前端用 ROUTER `bind`，engine 用 DEALER `connect`。这样**前端能按身份把请求精确路由到指定 engine**（数据并行有多个 engine 时按 rank 选谁），engine 的 DEALER 自带身份让 ROUTER 知道回信地址。这对类型的来历值得一句：它是更严格的 REQ/REP（一问必答、答完才能问下一个）的"异步放开版"——REQ/REP 做不到一个 socket 同时应对多个飞行中的请求，ROUTER/DEALER 去掉了这个锁步限制，才撑得起本章"多个请求乱序在飞"的场面。
+- **PUSH↔PULL**——单向管道：PUSH 只能发（往下游轮询分发），PULL 只能收（从所有上游公平汇聚），行为在 ZMQ 官方 [RFC 30/PIPELINE](https://rfc.zeromq.org/spec/30/) 里有正式定义。engine 用 PUSH 发、前端用 PULL 收。**多个 engine 的输出汇聚到一个前端的单一出口**——回想第 4 章的 `output_handler`，它从"一个 IPC 出口统一收所有请求的输出"，物理来源就是这个 PULL。
 
 请求方向选 ROUTER/DEALER（因为需要定向），输出方向选 PUSH/PULL（因为只需汇聚），各取所需。
 
@@ -222,7 +224,7 @@ def __init__(
 
 socket 建好了，但还不能直接发请求。这里有个 ZMQ 的硬性约束，不绕过去就会丢消息。
 
-ROUTER 的规矩是：**它只能向"见过的身份"回发消息**。前端的 ROUTER 刚 `bind`，还没收到过任何 engine 的消息，它压根不知道有哪些 DEALER 连上来、它们的 identity 是什么。这时候前端要是抢先 `send` 请求，ROUTER 不知道发给谁，消息直接被丢弃。
+ROUTER 的规矩是：**它只能向"见过的身份"回发消息**。这不是 vLLM 的私约，是 ZMQ 官方 Guide 白纸黑字的规则——ROUTER 只能回复它已经听到过消息的 peer，不能凭空主动联系一个身份（[ØMQ Guide 第 3 章](https://zguide.zeromq.org/docs/chapter3/)）。前端的 ROUTER 刚 `bind`，还没收到过任何 engine 的消息，它压根不知道有哪些 DEALER 连上来、它们的 identity 是什么。这时候前端要是抢先 `send` 请求，ROUTER 不知道发给谁，消息直接被丢弃。
 
 破解办法：**让 engine 的 DEALER 先开口**。engine 进程一启动，第一件事就是主动发一帧 ready 给前端。ROUTER 收到这一帧，记下这个 DEALER 的 identity，从此双向通道才打通。
 
@@ -276,7 +278,7 @@ def process_input_sockets(
 三个点：
 
 1. DEALER `connect`，且带 `identity=identity`——这个 identity 是 engine 的 rank，编成 2 字节小端（`engine_index.to_bytes(2, "little")`）。
-2. `send(ready_payload)`——主动把一帧 `EngineCoreReadyResponse` 发给前端。源码注释写得明明白白："this is required before the front-end ROUTER socket can send input messages back to us."（前端 ROUTER 必须先收到这一帧，才能往回发请求。）
+2. `send(ready_payload)`——主动把一帧 `EngineCoreReadyResponse` 发给前端（负载由 `msgspec.msgpack.encode` 编出，`msgspec` 是 vLLM 全程使用的 msgpack 编解码库，[§7.11](#711-msgpack-多帧零拷贝小张量内联大张量旁路) 会连同 msgpack 格式本身一起讲）。源码注释写得明明白白："this is required before the front-end ROUTER socket can send input messages back to us."（前端 ROUTER 必须先收到这一帧，才能往回发请求。）
 3. ready 帧里带着 `max_model_len`、`num_gpu_blocks`——engine 进程初始化时可能自动调整了这些值（比如按显存自适应 KV cache 块数），握手时同步回前端。
 
 前端这一侧，在请求开始流动之前，先在 input socket 上轮询等所有 engine 的 ready：
@@ -392,6 +394,8 @@ def _send_input(self, request_type: EngineCoreRequestType, request: Any):
 
 1. `track=True`——拿到一个 `MessageTracker`，它能告诉你"ZMQ 发完了没"(`tracker.done`)。
 2. `self.add_pending_message(tracker, request)`——**把请求对象的引用攥住**，直到 tracker 报告发送完成才放手。
+
+`copy` 和 `track` 这两个开关不是 vLLM 自造的参数，是 PyZMQ（ZMQ 的 Python 绑定）为"Python 内存 × libzmq 后台 IO 线程"这对搭档专门补的一层协调机制：C 库 libzmq 自己的零拷贝靠引用计数管，而 Python 这边有垃圾回收，谁也不知道对方什么时候撒手，于是 PyZMQ 用 `MessageTracker.done` 把"libzmq 用完了没"这个事实暴露给 Python 侧，让调用方自己决定何时回收内存（[PyZMQ API 文档](https://pyzmq.readthedocs.io/en/stable/api/zmq.html)）。同一份文档还提醒了一件反直觉的事：**零拷贝本身有非平凡的协调开销，对几十 KB 以下的小消息，`copy=False` 可能比老老实实拷一份还慢**——"零拷贝"从来不是无条件的免费午餐。记住这句话，[§7.11](#711-msgpack-多帧零拷贝小张量内联大张量旁路) 那个"小张量直接内联进主帧、不走零拷贝帧"的 256 字节阈值，正是同一个权衡的另一面。
 
 `add_pending_message` / `free_pending_messages` 这对就是干这个的：
 
@@ -601,7 +605,9 @@ def _process_engine_step(self) -> bool:
 
 难点在于：ZMQ 的 DEALER/PUSH 是**单向流**，没有内建的"请求-响应"配对。前端发一个 UTILITY 请求出去，稍后输出通道回来一批东西，但前端怎么知道**哪个返回对应哪个调用**?尤其是可能同时有好几个 RPC 在飞。
 
-vLLM 的答案是分布式系统的经典套路：**correlation-id**（关联 id）。每次调用生成一个唯一 id，带在请求里发出去；返回时原样带回这个 id，前端按 id 找回对应的等待者。
+vLLM 的答案是分布式系统的经典套路：**correlation-id**（关联标识）。每次调用生成一个唯一 id，带在请求里发出去；返回时原样带回这个 id，前端按 id 找回对应的等待者。
+
+这个套路有名有姓，不是 vLLM 的临时发明：它在《企业集成模式》（Enterprise Integration Patterns，Gregor Hohpe 与 Bobby Woolf 2003 年那本消息中间件设计模式的分类词典）里被正式命名为 **Correlation Identifier**，专治"发起方如何知道某条回复对应哪次请求"（[模式原文](https://www.enterpriseintegrationpatterns.com/patterns/messaging/CorrelationIdentifier.html)）。同一个想法你其实到处见过：HTTP/2 的 stream ID、TCP 的序列号、各家 RPC 框架的 request id，都是它。凡是"通道是单向的、回复会乱序到达"，答案基本都收敛到这一条。
 
 ![call_utility RPC 时序](../diagrams/03-rpc-correlation-flow.png)
 
@@ -622,7 +628,9 @@ def call_utility(self, method: str, *args) -> Any:
 
 四步走：
 
-1. `call_id = uuid.uuid1().int >> 64`——生成一个唯一 id。`uuid.uuid1()` 产出 128 位 UUID，按 RFC 4122 布局，高 64 位是 `time_low`+`time_mid`+`time_hi_and_version` 三段拼成的纯时间戳（不含时钟序列/MAC），右移 64 位取的正是这一段，得到一个 64 位整数，可直接被 msgpack 原生编码、无需额外类型包装；被丢弃的低 64 位才是 `clock_seq`（用来消解同一时间戳内碰撞）和 `node`（MAC 地址）。碰撞概率可忽略不计，理由不是时钟序列兜底，而是 RPC 调用频率远低于该时间戳的最小可分辨间隔（100ns 级）。
+1. `call_id = uuid.uuid1().int >> 64`——生成一个唯一 id。这行值得慢放，因为它依赖 UUID（通用唯一标识符）规范里一处具体的位域布局。Python 标准库的 `uuid.uuid1()` 产出的**不是**随机数，而是"基于时间"的 v1 版：核心是一个 60 位计数器，记录"自 1582-10-15 00:00:00 UTC 起过了多少个 100 纳秒"（这个古怪起点是格里高利历改历的日子，纯属历史遗留）。这 60 位按规范拆成三段塞进 128 位里：最低 32 位进 `time_low`、中间 16 位进 `time_mid`、最高 12 位进 `time_hi_and_version` 的低 12 位（该字段高 4 位不是时间，是版本号，固定标记"这是 v1"）。UUID 的字段序是 `time_low-time_mid-time_hi_and_version-clock_seq-node`，前三个字段恰好占满高 64 位——所以 `>> 64` 丢掉的低 64 位正是 `clock_seq`（消解同一时间戳内的碰撞）和 `node`（原规范建议填 MAC 地址，现代实现常用随机数代替以保护隐私），留下的是一个纯由时间戳与版本号构成的 64 位整数，可直接被 msgpack 原生编码、无需额外类型包装。
+
+   一处容易看走眼的细节：这 64 位虽然全部来自时间戳，却**不随时间单调递增**——`time_low` 排在最高位，装的偏偏是时间戳数值**最低**的 32 位，于是相邻两次调用拿到的 id 谁大谁小是乱的。这不影响用途：`call_id` 只需**唯一**，从不需要有序。唯一性这边，碰撞概率可忽略不计，理由不是低 64 位的时钟序列兜底（它恰好被移掉了），而是 RPC 调用频率远低于该时间戳的最小可分辨间隔（100 纳秒级）。规范出处值得点准：这套布局原属 RFC 4122，2024 年 5 月起该文档已被 [RFC 9562](https://www.rfc-editor.org/rfc/rfc9562) 取代，但 v1 的时间戳位域在新规范里原样保留（新规范主要是补了更适合数据库主键的 v6/v7/v8，其中 v7 是如今新系统推荐的默认选择）。
 2. 建一个空 `Future`，存进 `utility_results[call_id]`——这是"在此等待这个 id 的返回"的登记。
 3. `_send_input(UTILITY, (0, call_id, method, args))`——把 `(client_index, call_id, method, args)`（即客户端号、调用号、方法名、参数）当负载发出去。
 4. `future.result()`——**阻塞**等结果（同步版会卡住调用线程，直到 Future 被置值）。
@@ -749,6 +757,8 @@ class BackgroundResources:
 ```
 
 注释点透：`engine_dead` 标志放在这里，是为了"让输出处理线程能访问它，而不必持有 client 引用"。`weakref.finalize(self, self.resources)` 注册了一个终结器：当 client 被 GC（或构造中途异常）,`BackgroundResources.__call__` 被调，干净地关 socket、cancel 任务。**线程引用的是 `resources`，不是 `client`，循环引用就此打破。**
+
+`weakref.finalize` 也不是 vLLM 的私房技巧，而是 Python 标准库给"对象没了就把原生资源（socket、文件句柄、显存句柄）收干净"准备的推荐做法。它的签名是 `weakref.finalize(obj, func, *args)`：`obj` 被回收时自动执行 `func(*args)`，而终结器对 `obj` 只持**弱引用**（不阻止它被回收）。为什么不用更眼熟的 `__del__`？因为 `__del__` 是挂在对象自己身上的方法，一旦该对象卷进循环引用，历史上就有"干脆不被调用"的坑；`finalize` 把清理逻辑连同它需要的资源一起搬到对象**外面**，只要这些资源不反过来引用对象，环就闭不上——正是这里 `BackgroundResources` 只装 socket、不装 client 的原因（[Python 官方文档](https://docs.python.org/3/library/weakref.html#weakref.finalize)）。
 
 回看 [§7.6.3](#763-engine-落地字节标签选-decoder投-input_queue) 提过 `SyncMPClient` 构造时那句注释："Ensure that the outputs socket processing thread does not have a ref to the client which prevents gc."——它把 `resources`、`decoder`、`outputs_queue` 等局部变量先取出来，再喂给后台线程函数，刻意绕开 `self`。同一个意图。
 
@@ -887,7 +897,20 @@ def process_outputs_socket():
 
 ## 7.11 msgpack 多帧零拷贝：小张量内联，大张量旁路
 
-前面反复提到 `encoder.encode(request)` 返回"多帧"，现在拆开看这个编码器的本事。它要解决的问题是：`EngineCoreRequest` 里可能带着大张量（比如多模态的图像特征、`prompt_embeds`），怎么序列化才**既正确又不浪费拷贝**?
+先把 msgpack 本身交代清楚，因为后面每一步都建立在"它能做什么、不能做什么"上。**MessagePack**（简称 msgpack）是一个跨语言的二进制序列化格式，由 Sadayuki Furuhashi 在 2008 年前后发起，官方口号直白得可爱——"It's like JSON, but fast and small"（[msgpack.org](https://msgpack.org/)）。它能表达的数据结构和 JSON 完全一样（数字、字符串、数组、字典），只是把 JSON 的文本编码换成了紧凑的二进制编码。紧凑到什么程度，看两个最小例子就有体感：
+
+```text
+说明性外部示例：MessagePack 的字节编码（外部格式规范，非本仓源码）
+
+  整数 1     ->  0x01           # 小正整数直接编码进类型字节本身，共 1 字节
+  字符串 "a" ->  0xa1 0x61      # 0xa1 = 「定长字符串，长度 1」，0x61 = ASCII 'a'，共 2 字节
+```
+
+同一份数据换成 JSON 文本是 `1`（1 字节）和 `"a"`（3 字节，两个引号也要占位），差距在大批量小字段上会滚起来；更重要的是二进制解析不用做文本扫描，CPU 也省。规范里还定义了一个叫 **Ext（扩展类型）** 的口子：`msgpack.Ext(type_code, data)` 产出"一个自定义类型码 + 一段原始字节"的块，解码端认得这个类型码就知道该怎么把它变回对象——这是格式**原生**支持的自定义机制，本章后面小张量内联用的 `CUSTOM_TYPE_RAW_VIEW` 走的就是它（格式细节见官方[规范 spec.md](https://github.com/msgpack/msgpack/blob/master/spec.md)）。vLLM 用的 Python 实现是 `msgspec`（一个带类型定义、编解码很快的序列化库，前面 ready 帧那句 `msgspec.msgpack.encode` 就是它）。
+
+需要提前划清一条界线：**"一条消息拆成多个物理帧、大数据不进消息体"这件事，msgpack 标准里没有**。msgpack 的输出永远是一段连续字节。下面要拆的 `aux_buffers` 多帧机制，是 vLLM 在 msgpack 编码结果**之上**自己加的一层协议——别把它当成 msgpack 的特性去别处找。
+
+理清了地基，再拆 `encoder.encode(request)` 返回"多帧"的本事。它要解决的问题是：`EngineCoreRequest` 里可能带着大张量（比如多模态的图像特征、`prompt_embeds`），怎么序列化才**既正确又不浪费拷贝**?
 
 编码入口很简洁：
 
@@ -993,6 +1016,10 @@ def _decode_tensor(self, arr: Any) -> torch.Tensor:
 ![张量 IPC 零拷贝旁路](../diagrams/04-tensor-ipc-zerocopy.png)
 
 > *图注：对照两条路。上半（路径 A）是默认的 aux_buffers 多帧——张量字节随 ZMQ 帧跨进程，内核拷贝一次。下半（路径 B）是 OOB 旁路——张量经 share_memory_() 后放进 torch.mp.Queue 共享内存，msgpack 主帧里只塞一个 {sender_id, message_id, tensor_id} 占位 dict，接收端按这个 id 从共享内存直接取回，零进程间拷贝。*
+
+这条通道的两个零件都来自 PyTorch 自带的能力，不是 vLLM 造的。`tensor.share_memory_()` 是个**原地**操作（末尾下划线是 PyTorch 表示"就地修改"的命名惯例），把张量的底层存储搬进操作系统级的共享内存段——一块多个进程都能映射访问的物理内存；搬完 `tensor.is_shared()` 返回 True，若张量本来就在共享内存里（或本身是 CUDA 张量）则什么也不做。`torch.multiprocessing` 则是 Python 标准库 `multiprocessing` 的直接替代品，它给队列注册了认识 Tensor 的自定义 reducer：塞进队列的张量不走"序列化成字节流、对面再反序列化"的老路，而是只传一个指向同一块共享内存的句柄，接收方取出的张量和发送方**物理上是同一份数据**（[PyTorch 文档](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.share_memory_.html)）。
+
+这套机制的原生用途其实是多进程 DataLoader 和分布式训练——避免每个 worker 反复拷贝大批量数据。vLLM 在这里把它挪用到了新场景：几十 MB 的多模态特征张量，走 ZMQ 帧哪怕零拷贝也逃不掉内核态的一次搬运，走共享内存则连这次搬运都省了。
 
 发送端 `TensorIpcSender` 实现了编码器期望的 `OOBTensorConsumer` 接口——也就是 `_encode_tensor` 第二条路调的那个 `oob_consumer(obj)`:
 

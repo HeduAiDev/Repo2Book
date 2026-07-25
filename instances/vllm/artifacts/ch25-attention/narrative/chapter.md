@@ -164,7 +164,7 @@ class AttentionBackend(ABC):
 - 头维 `2`：K 和 V。后面读 KV 时一句 `kv_cache.unbind(0)` 就能把它们拆成 `key_cache` 和 `value_cache`。
 - `num_blocks`：一共多少个物理块（由可用显存反推，见 [KV cache 容量规划那章](../../ch16-kv-cache/narrative/chapter.md)）。
 - `block_size`：每块装多少个 token（默认 16，所以这里 `block_size % 16 != 0` 直接报错）。
-- `num_kv_heads × head_size`：每个 token 的 KV 向量本体。GQA 下 `num_kv_heads < num_heads`，大幅压缩 KV。
+- `num_kv_heads × head_size`：每个 token 的 KV 向量本体。GQA（Grouped-Query Attention，分组查询注意力，arXiv:2305.13245）下 `num_kv_heads < num_heads`——把 query head 分成 `num_kv_heads` 组，每组共享同一对 key/value head。举个数：32 个 query head 配 8 个 kv head，就是每 4 个 query head 共用一对 KV，KV cache 直接压到 1/4。它妙在不必从头重训——把训练好的标准多头模型里同组的 KV head 做均值池化就能转成 GQA、几乎不掉点，LLaMA-2/3、Mistral 等主流开源模型因此都用了它，`num_kv_heads` 也就成了现代 LLM 配置里的标准字段。
 
 **逻辑形状统一，物理布局留给后端调。** 这是这里的设计巧思。`get_kv_cache_shape` 给的是逻辑形状，框架照它分配、绑定显存；但不同 kernel 对显存连续性的偏好不同，于是 `get_kv_cache_stride_order` 再给一个**重排序**，把逻辑维排成物理内存序：
 
@@ -317,7 +317,7 @@ AttentionBackendEnum.FLASH_ATTN.clear_override()  # 清掉覆盖 → 回退默�
         return invalid_reasons
 ```
 
-结构高度规整：每个能力探针（`supports_head_size`、`supports_dtype`、`supports_compute_capability`……）失败一次，就往 `invalid_reasons` 追加一条字符串。**返回空列表 = 这个后端在此配置下合法。** `DeviceCapability` 就是 `(major, minor)` 两个整数——对应 CUDA compute capability 的主次版本号，如 `(9, 0)` = sm90 = Hopper，`(8, 0)` = sm80 = Ampere；`supports_compute_capability` 在这里用它过滤不支持当前 GPU 世代的后端。
+结构高度规整：每个能力探针（`supports_head_size`、`supports_dtype`、`supports_compute_capability`……）失败一次，就往 `invalid_reasons` 追加一条字符串。**返回空列表 = 这个后端在此配置下合法。** `DeviceCapability` 就是 `(major, minor)` 两个整数——对应 CUDA compute capability 的主次版本号：NVIDIA 给每代 GPU 发一个 `X.Y` 版本号标记"这块卡支持哪些指令集特性"，口语里常把它拼成 `smXY`，如 `(9, 0)` = sm90 = Hopper（H100），`(8, 0)` = sm80 = Ampere（A100）；完整的"GPU 型号 → capability"对照见 [NVIDIA 官方表](https://developer.nvidia.com/cuda/gpus)。`supports_compute_capability` 在这里用它过滤不支持当前 GPU 世代的后端。
 
 为什么不返回 bool？因为"不行"也要可读。当所有后端都被排除时，框架能把每个后端的拒绝理由拼成一句人能看懂的报错（`No valid backend ... Reasons: {...}`），而不是干巴巴一句"找不到后端"。对平台层来说，判定也简单：遍历候选，留下 `invalid_reasons` 为空的那些。
 
@@ -508,7 +508,17 @@ def _cached_get_attn_backend(
             ]
 ```
 
-这就是"平台最优"的体现：Blackwell（`major == 10`，sm100）把 FlashInfer 提到第一；Hopper 及以下（普通非 MLA decoder）默认 FlashAttention 优先、其次 FlashInfer、再 Triton。原因在于 FlashInfer 较早为 sm100 的 wgmma（warpgroup 级矩阵乘累加指令，Hopper/Blackwell 上新增的底层矩阵乘指令）做了专项适配，而 FlashAttention 对 Blackwell 的支持引入更晚；Hopper（sm90）上二者性能接近，但 FlashAttention 在 vLLM 里集成更早、测试覆盖更广，故仍排在前。
+这就是"平台最优"的体现：Blackwell（`major == 10`，即 sm100——B200/B300 一类数据中心卡；消费级 Blackwell RTX 50 系是另一档 sm120）把 FlashInfer 提到第一；Hopper 及以下（普通非 MLA decoder）默认 FlashAttention 优先、其次 FlashInfer、再 Triton。原因是 FlashInfer 对 Blackwell 的专项适配来得更早——为 sm100 先行提供了 TMA 分块 kernel 与 FP4 量化注意力支持，vLLM 官方也把它定为 Blackwell 上的默认后端；而 FlashAttention 对 Blackwell 的支持引入更晚。Hopper（sm90）上二者性能接近，但 FlashAttention 在 vLLM 里集成更早、测试覆盖更广，故仍排在前。
+
+为什么一张优先级表上要挂好几个名字？值得停下来说清：**这几个候选不是同一份代码的几个版本，而是几个独立演化的项目**，各自的取舍不同——谁排第一取决于"这台 GPU 上谁更合适"，不存在一个全局最优：
+
+- **FlashAttention**（Dao-AILab，Tri Dao 团队自 2022 年起持续迭代）：集成 vLLM 最早、覆盖场景最广（几乎任意 head_size）、测试最充分，是普适性担当——Hopper 及更早架构上的稳妥默认项。
+- **FlashInfer**（2024 年前后发起的"可定制注意力引擎"，论文 arXiv:2501.01005）：定位是给 LLM 服务系统提供一整套可组合的 attention / paged-attention kernel，对新硬件跟进最快——上面说的 Blackwell TMA 分块 kernel、FP4 量化都是它先做到的。追新硬件特性、要 FP8/FP4 量化注意力时优先它。
+- **Triton Attention**：用 OpenAI 的 Triton（2021 年开源的 Python 嵌入式 GPU kernel DSL——用 Python 语法写 GPU kernel、由编译器生成各家硬件代码）手写，参数支持最宽（几乎不限 head_size / block_size）、不依赖厂商专有 kernel 库，可读性与可移植性最好，峰值性能通常稍逊——前两者都校验不通过时的兜底。
+
+新后端在新硬件上的"专项适配"具体指什么？核心是敢不敢直接用新架构的专属指令。Hopper 新增了 `wgmma`（warpgroup 级异步矩阵乘累加指令）：把 4 个 warp 共 128 线程编成一个 warpgroup，合作异步算一整块矩阵乘——一条形如 `wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16` 的指令（说明性外部记法，非本仓源码）就算完一块 M=64、N=64、K=16 的矩阵乘块，fp16 输入、fp32 累加；"异步"指发出指令后 warpgroup 不必空等它算完、可以接着搬下一块数据，算完再显式同步取结果，矩阵乘与访存得以重叠。FA3、FlashInfer 正是靠这类指令（Blackwell 上的后继叫 `tcgen05`）而非上一代 warp 级的通用 `mma` 指令，才拿到相对旧 kernel 的显著加速；指令级细节见 [NVIDIA CUTLASS 文档](https://docs.nvidia.com/cutlass/4.6.0/media/docs/pythonDSL/mma_docs/wgmma_programming.html)。
+
+"追新硬件极限性能"和"通用兜底"这两个目标，本就很难由一份代码同时满足——这才是三者在 vLLM 里长期共存、按 GPU 世代切换优先级的真正原因。各后端更完整的支持矩阵见 [vLLM 官方设计文档](https://docs.vllm.ai/en/latest/design/attention_backends/)。
 
 **选后端贵不贵？** 一点都不贵。`validate_configuration` 对优先级列表里 $`O(B)`$ 个候选（ $`B`$ = 后端数），各做常数次探针检查，全是 Python 端常数级别；而且整条链被 `@cache` 摊销到每模型只算一次。它根本不在前向热路径上。精简版正好复现了 Hopper 默认选 FlashAttention、以及显式指定不合法后端直接报错这两条路：
 
@@ -677,7 +687,7 @@ metadata 翻译好了，`block_table` 和 `slot_mapping` 都到了后端手里�
 
 ## 25.9 PagedAttention：照表读写 KV 显存
 
-[KV cache 那章](../../ch15-kv-cache/narrative/chapter.md) 立下了两张表的语义，但只到"表算好了"为止。现在两张表落进了后端的手里，我们终于能看清它们怎么真正读写显存。这套「逻辑块→物理块」的分页间接寻址，正是 vLLM 原始论文提出的 **PagedAttention**（arXiv:2309.06180）的核心。先把寻址恒等式钉死。
+[KV cache 那章](../../ch15-kv-cache/narrative/chapter.md) 立下了两张表的语义，但只到"表算好了"为止。现在两张表落进了后端的手里，我们终于能看清它们怎么真正读写显存。这套「逻辑块→物理块」的分页间接寻址，正是 vLLM 原始论文提出的 **PagedAttention**（SOSP 2023，arXiv:2309.06180）的核心。值得知道这篇论文的分量：它就是 vLLM 的奠基论文——PagedAttention 算法与 vLLM 系统是同一篇论文的两面，前者是把操作系统"虚拟内存分页 + 页表"思想搬进 GPU 显存的内存管理算法，后者是实现它的服务系统。论文实测当时主流服务系统（FasterTransformer、Orca）因为要按"最坏情况长度"预留整段连续显存，KV cache 的实际利用率只有 20%–38%；改成按定长块按需分配、页表间接寻址后，浪费降到接近零，换来 2–4 倍吞吐。本章的 `slot_mapping`（写）与 `block_table`（读），就是这张"页表"在 v1 代码里的具体落点。先把寻址恒等式钉死。
 
 **PagedAttention 寻址恒等式。** 对第 $`i`$ 个 token：
 
@@ -836,6 +846,10 @@ assert torch.count_nonzero(key_cache[0, 1]) == 0  # slot -1 的 token 没写，�
 又是 `kv_cache.unbind(0)` 拆出 `key_cache` / `value_cache`，然后 `flash_attn_varlen_func` 上场。关键参数是 `block_table=block_table`——它就是从 metadata 里取出的、每请求的逻辑块号表。kernel 顺着这张表，把该请求散落在各物理块里的历史 KV 读出来，再按 `seq_lens` 决定每请求读多少个 token，与 `query` 算 causal 注意力，结果写进 `output`。这是 PagedAttention 的"读"半边。
 
 > **v0.21.0 更新**：FlashAttention 后端（`vllm/v1/attention/backends/flash_attn.py`）在这一层有两处实现修正。其一是**版本决策收口**：`head_size > 256` 时在 SM90+ 由 FA3 升到 FA4 的判断，原先散落在 `FlashAttentionImpl` 构造里，现已统一迁入 `get_flash_attn_version()`——FA3↔FA4 的版本选择只剩这一个真相源，构造路径不再各自拍板。其二是 **KV 缓存退化 stride 规整**：`forward` 在 `kv_cache.unbind(0)` 取出 `key_cache`/`value_cache` 后，对二者调一次 `canonicalize_singleton_dim_strides(...)`。原因是当 `num_kv_heads = 1` 配合 TP 时，size-1 的头维会产生退化 stride，而 H100+ 上 FA3/FA4 走 TMA（Tensor Memory Accelerator，Hopper 引入的硬件异步显存搬运单元）要求 ≥16 字节的 stride 对齐，否则触发 `cudaErrorIllegalInstruction`；写缓存（scatter）那条路不走 TMA，故无需规整。
+
+这里冒出的 FA3/FA4 值得一个背景锚点：FlashAttention 不是一份代码用到老，而是绑着 GPU 世代一代代重写——FA2（2023）最通用、几乎任意卡都能跑；FA3（2024）专为 Hopper（H100/H800）重写，吃透 [§25.7](#257-平台层显式优先否则按-capability-自动挑) 讲过的 wgmma 与这里的 TMA 等 Hopper 专属特性；FA4 则用 CuTeDSL（NVIDIA CUTLASS 矩阵库的 Python DSL）重写、同时面向 Hopper 与 Blackwell。所以"选注意力 kernel"其实是两层决策：[§25.7](#257-平台层显式优先否则按-capability-自动挑) 先在 FlashAttention / FlashInfer / Triton 之间选**后端**，选定 FlashAttention 之后，`get_flash_attn_version()` 再在 FA2/FA3/FA4 这三代实现里按当前 GPU 挑**一代**。版本沿革见 [Dao-AILab 官方仓库](https://github.com/Dao-AILab/flash-attention)。
+
+顺带把 TMA 说透一点，上面那条故障链才好懂。TMA 出现之前，把数据从全局显存搬进共享内存，要靠线程逐个算地址、发一堆零散的 load 指令，占用计算单元的调度资源。TMA 把"搬什么"封装成一个可复用的**描述符**（tensor map——记好张量的基址、维度、步长、遍历顺序、越界行为），之后每次搬运只发一条硬件指令、把描述符和坐标喂给它，硬件就异步把整块数据搬好，计算单元完全不用参与——FA3/FA4、FlashInfer 从 paged KV cache 里"取一个块"，就是这样做成一条指令的。代价是它对步长挑剔：非连续方向的 stride 通常要求 16 字节对齐（某些交织模式要求 32 字节），不满足时硬件直接报非法指令错、而不是静默算错——上面 size-1 头维踩的正是这条硬件红线，也因此报错是硬崩而非精度劣化。入门教程见 [Colfax 的 TMA 专题](https://research.colfax-intl.com/tutorial-hopper-tma/)。
 
 **读一个请求要走多少块？** 与该请求的历史长度 `seq_lens` 成线性。kernel 顺 `block_table` 走过的物理块数是
 

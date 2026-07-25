@@ -34,7 +34,7 @@
 
 先算一笔账。一个 70B（700 亿参数）模型，BF16 权重要 140 GB；压成 INT8（8 位整数）砍一半到 70 GB，压成 INT4（4 位整数）再砍一半到 35 GB。推理是**带宽瓶颈**的：每生成一个 token，都要把全部权重从显存搬进计算单元一遍——矩阵乘本身的算力其实常常吃不饱，真正卡脖子的是这趟显存搬运。权重小一半，搬运就快一倍。这就是量化的甜头。
 
-甜头之外还有第二种量化：不只压权重，连**激活**（activation，层与层之间流动的中间张量）也压成 8 位——**W8A8**（权重 8 位、激活 8 位）。这样连矩阵乘本身都能跑在整数或 FP8（8 位浮点）的张量核上，算得更快、更省。FP8 又分两种排布：**e4m3**（4 位指数、3 位尾数，动态范围小但精度高，用来存数值本身）和 **e8m0**（8 位指数、0 位尾数，纯指数，用来存缩放因子）——后面 §八会看到 e8m0 的妙用。
+甜头之外还有第二种量化：不只压权重，连**激活**（activation，层与层之间流动的中间张量）也压成 8 位——**W8A8**（权重 8 位、激活 8 位）。这样连矩阵乘本身都能跑在整数或 FP8（8 位浮点）的张量核上，算得更快、更省。这里的 FP8 不是随手约定，而是 NVIDIA、ARM、Intel 2022 年联合提出、如今已成业界事实标准的 8 位浮点编码（[arXiv:2209.05433](https://arxiv.org/abs/2209.05433)），标准里有两种排布：**e4m3**（1 位符号+4 位指数+3 位尾数，动态范围小但精度高，本章用它存数值本身）和 **e5m2**（5 位指数+2 位尾数，范围更大、保留 IEEE 754——通用浮点标准——的 Inf/NaN 约定，多用于对范围敏感的梯度，本章用不到）。另有一个容易和它们混淆的第三者 **e8m0**（8 位指数、0 位尾数，纯指数）：它不属于这份 FP8 标准、也不存数值本身，专职存一整块数值共享的缩放因子——后面 §八会看到它的来历与妙用。
 
 险在哪？**离群值**（outlier，个别数值比同伴大出一两个数量级）。量化的本质是「用一把刻度有限的尺子去量一堆数」。尺子的量程必须罩住最大的那个数；一旦有个离群值把量程撑爆，其余正常数值就被挤到尺子最底下几格，精度全丢。激活里的离群值尤其凶——某些通道天生比别人大 50~100 倍。
 
@@ -203,6 +203,8 @@ SmoothQuant 论文（arXiv:2211.10438）§2/Fig.3/Table 1 把这件事讲得很�
 
 普通量化像挨个把家具推到最近的格线上，推歪了就算了。GPTQ（arXiv:2210.17323）像一个会**找补**的搬运工：每把一件家具推到格线（不可避免地推歪一点），立刻用二阶信息算出这点歪会怎样连累输出，然后微调所有**还没摆放**的家具去抵消它。等轮到那些家具时，它们已经预先偏移好了。
 
+这套「找补」出自 Elias Frantar、Dan Alistarh 等人 2022 年 10 月的论文《GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers》——**训练后量化**（post-training quantization，PTQ：不重新训练模型，只用少量校准数据离线做量化）路线的里程碑：一次性（one-shot）跑完校准即把 175B 模型压到 3~4 位、精度损失可忽略；推理端论文报告 A100 上约 3.25 倍、更便宜的 A6000 上约 4.5 倍的生成加速。本章其余两法（AWQ、SmoothQuant）同属 PTQ，不同的只是拧哪个旋钮。
+
 ### 机制：误差不能消灭，只能搬运
 
 先把洞见亮出来。量化第 $`q`$ 列必然产生误差 $`w_q-\mathrm{quant}(w_q)`$ ——铁律管着，躲不掉；GPTQ 的全部机制是一行—— **把这份误差沿逆 Hessian 的第 $`q`$ 列，一次性摊给所有未量化的列**（GPTQ §3 Eq.2 右式，arXiv:2210.17323）：
@@ -228,7 +230,7 @@ w_q = \arg\min_{w_q}\frac{\big(\mathrm{quant}(w_q)-w_q\big)^2}{[H_F^{-1}]_{qq}}
 
 分母 $`[H_F^{-1}]_{qq}`$ 越大，说明这个权重的扰动本来就不太牵动输出，误差摊在它身上代价最小。（这里的下标 $`q`$ 是「正在量化的这一列」的位置索引，和 §二整数码 $`q=\mathrm{clamp}(\dots)`$ 里表示量化后整数值的 $`q`$ 撞了字母，别混。）
 
-> **严谨（想要深度再展开）**：这对公式不是 GPTQ 原创，而是 OBQ 的逐权重贪心规则——GPTQ 论文自己的 §3 Background 说得很直白：「quantizing one weight at a time while always updating all not-yet-quantized weights, in order to compensate for the error incurred by quantizing a single weight」。推导只需一次拉格朗日乘子法：层输出重构误差展开是二次型 $`\|\delta_F X_F\|^2 = \delta_F\,(X_F X_F^{\top})\,\delta_F^{\top} = \tfrac{1}{2}\,\delta_F H_F\,\delta_F^{\top}`$ （代入 $`H_F=2X_FX_F^{\top}`$ ， $`\delta_F`$ 视作行向量）；「第 $`q`$ 个权重挪到格点」是一条线性约束 $`(\delta_F)_q = \mathrm{quant}(w_q)-w_q`$ 。对带约束二次型求驻点，解的方向只能沿 $`\big((H_F^{-1})_{:,q}\big)^{\top}`$ ，代回约束定出比例系数，正是上面 $`\delta_F`$ 那条式子；此时的最小目标值为 $`\big(\mathrm{quant}(w_q)-w_q\big)^2\big/\big(2[H_F^{-1}]_{qq}\big)`$ ——挑选规则的分式（差一个与 $`q`$ 无关的常数 2，不影响 argmin）就是它。贪心最优性的完整证明属于 OBQ 原论文（候选出处 arXiv:2208.11580，具体篇目本章未逐字核验），不读它也能接着往下推。
+> **严谨（想要深度再展开）**：这对公式不是 GPTQ 原创，而是 OBQ 的逐权重贪心规则——GPTQ 论文自己的 §3 Background 说得很直白：「quantizing one weight at a time while always updating all not-yet-quantized weights, in order to compensate for the error incurred by quantizing a single weight」。推导只需一次拉格朗日乘子法：层输出重构误差展开是二次型 $`\|\delta_F X_F\|^2 = \delta_F\,(X_F X_F^{\top})\,\delta_F^{\top} = \tfrac{1}{2}\,\delta_F H_F\,\delta_F^{\top}`$ （代入 $`H_F=2X_FX_F^{\top}`$ ， $`\delta_F`$ 视作行向量）；「第 $`q`$ 个权重挪到格点」是一条线性约束 $`(\delta_F)_q = \mathrm{quant}(w_q)-w_q`$ 。对带约束二次型求驻点，解的方向只能沿 $`\big((H_F^{-1})_{:,q}\big)^{\top}`$ ，代回约束定出比例系数，正是上面 $`\delta_F`$ 那条式子；此时的最小目标值为 $`\big(\mathrm{quant}(w_q)-w_q\big)^2\big/\big(2[H_F^{-1}]_{qq}\big)`$ ——挑选规则的分式（差一个与 $`q`$ 无关的常数 2，不影响 argmin）就是它。贪心最优性的完整证明属于 OBQ 原论文——Frantar、Singh、Alistarh 2022 年 8 月的《Optimal Brain Compression》（[arXiv:2208.11580](https://arxiv.org/abs/2208.11580)，NeurIPS 2022），它把 1993 年的经典剪枝框架 Optimal Brain Surgeon（OBS，「逐权重删除+二阶补偿」这一思路的鼻祖）精确、高效地推广到量化与剪枝两个场景，量化那半边就叫 OBQ；GPTQ 论文原文明写「builds on the recently-proposed Optimal Brain Quantization (OBQ) method (Frantar et al., 2022)」，指向的正是这篇。不读它也能接着往下推。
 
 OBQ 逐权重贪心太慢，175B 模型跑不动。GPTQ 自己的贡献是三步优化——固定全行同序（放弃逐步挑列：实测按固定列序量化几乎不损精度，上面的 argmin 挑选被整个省掉）+ lazy batch（惰性批更新， $`B=128`$ ）+ Cholesky 稳定化（对 $`H_F^{-1}`$ 做 Cholesky 分解再取上三角部分参与递推，避免直接求逆在迭代多轮后累积数值误差、乃至矩阵不再正定）——把这套数学从「能算但跑不动 175B 模型」改造成「约 4 GPU·小时跑完」（GPTQ §4）：
 
@@ -278,7 +280,7 @@ for i = 0, B, 2B, ...:                       # 按块推进
 
 *图 3：左 RTN 各列独立取整（0.0253），右 GPTQ 逐列量化即时补偿（0.0057，−77%）。blocksize 1/2/4 结果完全相同——lazy batch 是效率重排。*
 
-这整套 Hessian 找补是**离线校准**的活（autogptq 之类的工具在部署前跑一次）；推理期只剩打包 INT 权重、per-group scales 与 g_idx（act_order 分组索引，记录列的重排顺序）被 `vllm/model_executor/layers/quantization/gptq.py` 里一条融合反量化的 GEMM 消费，二阶补偿早已折进这些张量的数值里、一行 Hessian 都不用算——装配面见[模型定义层的 Linear 装配](../../ch22-model-definitions/narrative/chapter.md)。
+这整套 Hessian 找补是**离线校准**的活——具体工具如 [AutoGPTQ](https://github.com/AutoGPTQ/AutoGPTQ)（把 GPTQ 校准算法封装成几行 API 的开源库，可量化到 8/4/3/2 位，HuggingFace Hub 上大量 GPTQ 检查点由它产出），部署前跑一次；推理期只剩打包 INT 权重、per-group scales 与 g_idx（act_order 分组索引，记录列的重排顺序）被 `vllm/model_executor/layers/quantization/gptq.py` 里一条融合反量化的 GEMM 消费，二阶补偿早已折进这些张量的数值里、一行 Hessian 都不用算——装配面见[模型定义层的 Linear 装配](../../ch22-model-definitions/narrative/chapter.md)。
 
 ---
 
@@ -286,7 +288,7 @@ for i = 0, B, 2B, ...:                       # 按块推进
 
 ### 直觉：不是所有权重同等重要
 
-乘上大激活的那些权重（**显著**权重）一旦量化歪了，对输出的伤害会被激活放大。AWQ（Activation-aware Weight Quantization，激活感知权重量化，arXiv:2306.00978）的做法像给重要选手戴放大镜——量化前把显著权重乘一个 $`s>1`$ （对应激活除以 $`s`$ ，数学上完全抵消），于是它在量化格子里占的相对位置更精细、舍入误差被摊薄。但 $`s`$ 太大又会撑大整组的格距连累其他人，所以有个甜点。
+乘上大激活的那些权重（**显著**权重）一旦量化歪了，对输出的伤害会被激活放大。AWQ（Activation-aware Weight Quantization，激活感知权重量化）出自 Ji Lin 等（MIT）的同名论文（arXiv:2306.00978），后获 MLSys 2024（机器学习系统方向的顶会）最佳论文奖；论文的起点是一个实验发现——只保护约 1% 的显著权重通道，量化误差就大幅回落，而识别谁显著要看**激活**的量级、不是看权重本身。论文还配套发布了面向端侧的推理框架 TinyChat，据其自报比 HuggingFace Transformers（业界通用的模型参考实现库）的 FP16 版本快 3 倍以上。它的做法像给重要选手戴放大镜——量化前把显著权重乘一个 $`s>1`$ （对应激活除以 $`s`$ ，数学上完全抵消），于是它在量化格子里占的相对位置更精细、舍入误差被摊薄。但 $`s`$ 太大又会撑大整组的格距连累其他人，所以有个甜点。
 
 ![重绘自 arXiv:2306.00978 Fig.2：给 1% 显著通道戴放大镜，比混合精度更硬件友好地达到同等 PPL（OPT-6.7B，INT3-g128）](../diagrams/paper-fig-2-awq.png)
 
@@ -333,7 +335,7 @@ $`\mathrm{diag}(s)`$ 是把向量 $`s`$ 摆上对角线构成的对角矩阵（�
 
 *图 4：损失-α 曲线呈 U 形。α=0 不保护、α=1 过度缩放，甜点 α=0.25 降损 31%。缩放全在离线完成，vllm 只见已折进 scales 的打包 INT4 权重。*
 
-和 GPTQ 一样， $`\alpha`$ 搜索全在离线完成，缩放 $`s`$ 直接折进 scales 与打包权重（推理期由 `vllm/model_executor/layers/quantization/awq.py` 消费，装配面同见[模型定义层的 Linear 装配](../../ch22-model-definitions/narrative/chapter.md)）。AWQ 与 GPTQ 同属 weight-only INT4，区别只在 scale 的来历：一个来自激活感知缩放（第一旋钮），一个来自二阶补偿（第二旋钮）——各拧各的。要留意：这两者都只把**权重**离线压成 INT4，运行期激活仍是全精度浮点（AWQ 里那个 $`\mathrm{diag}(s)^{-1}X`$ 也从不真被量化）；把激活也压到 8 位、让矩阵乘直接跑在低精度张量核上的 W8A8，是下一节 SmoothQuant 才处理的制式。
+和 GPTQ 一样， $`\alpha`$ 搜索全在离线完成——社区常用的封装是 [AutoAWQ](https://github.com/casper-hansen/AutoAWQ)，地位相当于 GPTQ 那边的 AutoGPTQ——缩放 $`s`$ 直接折进 scales 与打包权重（推理期由 `vllm/model_executor/layers/quantization/awq.py` 消费，装配面同见[模型定义层的 Linear 装配](../../ch22-model-definitions/narrative/chapter.md)）。AWQ 与 GPTQ 同属 weight-only INT4，区别只在 scale 的来历：一个来自激活感知缩放（第一旋钮），一个来自二阶补偿（第二旋钮）——各拧各的。要留意：这两者都只把**权重**离线压成 INT4，运行期激活仍是全精度浮点（AWQ 里那个 $`\mathrm{diag}(s)^{-1}X`$ 也从不真被量化）；把激活也压到 8 位、让矩阵乘直接跑在低精度张量核上的 W8A8，是下一节 SmoothQuant 才处理的制式。
 
 ---
 
@@ -341,7 +343,7 @@ $`\mathrm{diag}(s)`$ 是把向量 $`s`$ 摆上对角线构成的对角矩阵（�
 
 ### 直觉：难度守恒，但可以搬家
 
-激活里常有几个「大嗓门」通道（离群值），一把 per-tensor 尺子被它们撑爆、其他通道没了精度。SmoothQuant（arXiv:2211.10438）不删嗓门，而是把难度**搬家**：给这些通道的激活除以 $`s`$ 、对应权重乘以 $`s`$ （矩阵乘里两者代数相消，输出在浮点舍入内不变，下文机制段给出实测），于是激活被抹平、权重稍微变陡——权重本来分布规整、扛得住。难度守恒，但被均分到激活和权重两边。
+激活里常有几个「大嗓门」通道（离群值），一把 per-tensor 尺子被它们撑爆、其他通道没了精度。SmoothQuant 出自 Guangxuan Xiao、Ji Lin 等（MIT，与 AWQ 同一实验室）2022 年 11 月的论文（arXiv:2211.10438）。它和前两法的分野一句话说清：GPTQ、AWQ 都只压权重、激活留全精度，矩阵乘仍跑在浮点张量核上；SmoothQuant 是三法里唯一把激活也压到 8 位、让矩阵乘真正跑上 INT8 张量核的一路——论文自报最高 1.56 倍加速、2 倍显存节省，并借此把 530B 参数模型塞进单节点推理。它不删嗓门，而是把难度**搬家**：给这些通道的激活除以 $`s`$ 、对应权重乘以 $`s`$ （矩阵乘里两者代数相消，输出在浮点舍入内不变，下文机制段给出实测），于是激活被抹平、权重稍微变陡——权重本来分布规整、扛得住。难度守恒，但被均分到激活和权重两边。
 
 ![重绘自 arXiv:2211.10438 Fig.2：把量化难度从激活搬到权重，两边都变得好量化](../diagrams/paper-fig-2-smoothquant.png)
 
@@ -434,7 +436,11 @@ W8A8 制式（激活+权重 8-bit per-tensor）：SmoothQuant $`0.2604`$ 完胜 
 
 *图 6：灰=RTN 基线，绿=对应缓解。W8A8 下 SmoothQuant 0.2604 vs 0.8424（−69%），W4 下 AWQ 2.2373 vs 3.5991（−38%）。误差按制式分组，每种缓解都赢过自己制式的裸量化。*
 
-这台秤本身，就是 §二那两行 `w_ref` 反量化外加一次输出重构——参考实现让你能在主机上亲手复算论文的每个数字。表里两种缓解拧的都是主线第一旋钮（重塑 absmax，让共享 scale 少被离群值绑架）；第二旋钮 GPTQ 的账已在 §四 单独称过（0.0253 → 0.0057）。三种算法的昂贵校准（Hessian、 $`\alpha`$ 网格搜、迁移因子）全在离线完成，vllm 推理期只消费定点权重和 scale。最后一节看这笔账的最后一扣：scale 本身也是个连续实数——硬件连它都要量化。
+这台秤本身，就是 §二那两行 `w_ref` 反量化外加一次输出重构——参考实现让你能在主机上亲手复算论文的每个数字。表里两种缓解拧的都是主线第一旋钮（重塑 absmax，让共享 scale 少被离群值绑架）；第二旋钮 GPTQ 的账已在 §四 单独称过（0.0253 → 0.0057）。三种算法的昂贵校准（Hessian、 $`\alpha`$ 网格搜、迁移因子）全在离线完成，vllm 推理期只消费定点权重和 scale。
+
+顺手把落地选型也从两个旋钮读出来：显存装不下是唯一痛点，选 weight-only 4-bit——追求极限压缩率（可下探 3-bit 甚至 2-bit）选 GPTQ，要更快的离线校准（一次网格搜、不碰 Hessian 求逆）和设备端硬件友好选 AWQ；算力才是瓶颈、想让矩阵乘本身跑上 INT8/FP8 张量核，选 SmoothQuant 式 W8A8，代价是 8-bit 的压缩率不如 4-bit。想再深入的读者可以从原文入手：[GPTQ](https://arxiv.org/abs/2210.17323)、[AWQ](https://arxiv.org/abs/2306.00978)、[SmoothQuant](https://arxiv.org/abs/2211.10438)。
+
+最后一节看这笔账的最后一扣：scale 本身也是个连续实数——硬件连它都要量化。
 
 ---
 
@@ -442,7 +448,9 @@ W8A8 制式（激活+权重 8-bit per-tensor）：SmoothQuant $`0.2604`$ 完胜 
 
 先收回 §一埋下的伏笔：e8m0（8 位纯指数、0 位尾数）能装什么？8 个比特全给指数、没有尾数，能表示的**只有 2 的幂**。它在 FP8 块量化（如 DeepSeek 系 128×128 块，每块共享一个 scale）里的角色正是承载块 scale——换句话说，**量化被用到了 scale 自己身上**：amax 定出的连续 scale，也要被取整到「只有 2 的幂次刻度」的那把尺子上。
 
-> 直觉：OCP（Open Compute Project，硬件厂商联合制定开放计算规范的组织）Microscaling（MX，块级共享缩放因子的低精度格式标准）规范的核心约定就是「一个块共享一个缩放因子，且这个缩放因子只能是 2 的幂」——这样硬件做缩放只需要移位、不需要乘法电路。相关规范材料的候选出处是 arXiv:2310.10537《Microscaling Data Formats for Deep Learning》，具体篇目本章未逐字核验；不需要读它，接受「scale 只能是 2 的幂」这条约定即可。
+> 直觉：OCP（Open Compute Project，硬件厂商联合制定开放计算规范的组织）Microscaling（MX，块级共享缩放因子的低精度格式标准）规范的核心约定就是「一个块共享一个缩放因子，且这个缩放因子只能是 2 的幂」——这样硬件做缩放只需要移位、不需要乘法电路。这套格式由微软、AMD、Intel、Meta、NVIDIA、Qualcomm 等厂商 2023 年联合提出（论文版 arXiv:2310.10537《Microscaling Data Formats for Deep Learning》，正式文本为 [OCP MX Specification v1.0](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf)）；规范里 e8m0 被定义为无符号纯指数格式——能且只能表示 $`2^{-127}`$ 到 $`2^{127}`$ 的 2 的幂，编码 0xFF 保留给 NaN——标准块大小是 32 个元素（DeepSeek 系的 128×128 块粒度更粗，沿用的是同一条 e8m0 约定）。不需要读它，接受「scale 只能是 2 的幂」这条约定即可。
+
+具体到比特，这个格式简单得可以口算：8 位就是一个无符号整数，直接当指数用、偏置 127——字节 `0x7F`（十进制 127）代表 $`2^{0}=1`$ ，往下每减 1 就除以 2，`0x79`（121）代表 $`2^{-6}`$ ，往上 `0x81`（129）代表 $`2^{2}=4`$ ，两端 `0x00` 与 `0xFE` 对应 $`2^{-127}`$ 与 $`2^{127}`$ ，`0xFF` 单独留给 NaN（not a number，非数值，浮点里表示无效结果的特殊编码）。没有符号位这件事正好合用：scale 是 absmax 除出来的，天生非负，正负号留在被它缩放的那些 FP8 数值身上。PyTorch 里对应的 dtype 叫 `float8_e8m0fnu`，后缀三个字母各有所指——`f` 表示只有有限值（不表示 Inf）、`n` 表示用的是非标准的 NaN 编码（就是刚才那个 `0xFF`）、`u` 表示无符号。上面举的 $`2^{-6}`$ 与 $`2^{2}`$ 不是随手挑的，它们正是下文 overshoot 那笔账里的两个落点。
 
 取整的方向不容商量：scale 一旦偏小，FP8 格就罩不住块内最大值、amax 会被硬裁——所以必须**向上**取整（ceil），宁可格子偏松：
 
@@ -451,7 +459,7 @@ s_{\mathrm{raw}} = \frac{\mathrm{absmax}}{\mathrm{FP8_{max}}},\qquad
 s = 2^{\lceil \log_2 s_{\mathrm{raw}} \rceil}
 ```
 
-$`s_{\mathrm{raw}}`$ 就是 §二对称思想给出的连续 scale（ $`\mathrm{FP8_{max}}`$ 对 e4m3 是 $`448.0`$ ）， $`\lceil\cdot\rceil`$ 把它抬到最近的 2 的幂。这套复合函数在 vllm 激活侧的在线量化里逐字就是一行（`use_ue8m0` 即微缩放的无符号 e8m0 变体）：
+$`s_{\mathrm{raw}}`$ 就是 §二对称思想给出的连续 scale（ $`\mathrm{FP8_{max}}`$ 对 e4m3 是 $`448.0`$ ）， $`\lceil\cdot\rceil`$ 把它抬到最近的 2 的幂。这套复合函数在 vllm 激活侧的在线量化里逐字就是一行。代码里那个开关 `use_ue8m0`（名字即 unsigned e8m0，无符号 e8m0）管的正是「scale 要不要取整到 2 的幂」这一件事，与决定块大小的 `group_size` 是彼此独立的两个参数：
 
 ```python
 # vllm/model_executor/layers/quantization/input_quant_fp8.py:L240-L248
