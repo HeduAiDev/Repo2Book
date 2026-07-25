@@ -11,7 +11,7 @@ export const meta = {
 const CFG = {
   instance: 'vllm-ascend',
   source_root: 'instances/vllm-ascend/source',
-  chapters: ['ch01-birdseye-oot-plugin','ch02-entry-points-and-npuplatform','ch03-two-stage-monkey-patch','ch04-patch-engine-core-kvcache','ch05-check-and-update-config','ch06-npu-communicator','ch07-sleep-mode-camem-allocator','ch08-ascend-parallel-groups','ch09-primer-eplb','ch10-eplb-expert-load-balancing','ch11-pd-disaggregation-mooncake','ch12-kv-pooling-ascend-store','ch13-kv-offloading-host-cpu','ch14-npuworker-execution-control','ch15-npumodelrunner-cuda-monkeypatch','ch16-single-step-forward-context-dp-sync','ch17-kv-cache-allocation-reshape-bind','ch18-310p-inference-chip-specialization','ch19-attention-backend-selection','ch20-ascend-attention-mha','ch21-primer-mla','ch22-mla-on-npu','ch23-primer-sparse-attention','ch24-sparse-attention-sfa-dsa','ch25-kv-manager-and-schedulers','ch26-primer-v4-csa-hca','ch27-customop-oot-replacement','ch28-torch-library-and-meta','ch29-ascend-compiler-aclgraph','ch30-fusedmoe-batch-invariant','ch31-primer-quantization','ch32-ascend-quantization-framework','ch33-sampling-npu-adaptation','ch34-primer-speculative-sampling','ch35-primer-dflash','ch36-speculative-decode-npu','ch37-primer-dspark','ch38-model-lora-netloader-registration'],
+  chapters: ['ch10-eplb-expert-load-balancing','ch11-pd-disaggregation-mooncake','ch12-kv-pooling-ascend-store','ch13-kv-offloading-host-cpu','ch14-npuworker-execution-control','ch15-npumodelrunner-cuda-monkeypatch','ch16-single-step-forward-context-dp-sync','ch17-kv-cache-allocation-reshape-bind','ch18-310p-inference-chip-specialization','ch19-attention-backend-selection','ch20-ascend-attention-mha','ch21-primer-mla','ch22-mla-on-npu','ch23-primer-sparse-attention','ch24-sparse-attention-sfa-dsa','ch25-kv-manager-and-schedulers','ch26-primer-v4-csa-hca','ch27-customop-oot-replacement','ch28-torch-library-and-meta','ch29-ascend-compiler-aclgraph','ch30-fusedmoe-batch-invariant','ch31-primer-quantization','ch32-ascend-quantization-framework','ch33-sampling-npu-adaptation','ch34-primer-speculative-sampling','ch35-primer-dflash','ch36-speculative-decode-npu','ch37-primer-dspark','ch38-model-lora-netloader-registration'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapters && args.chapters.length) ? args : CFG
 const REPO = '/mnt/e/Laboratory/Repo2Book'
@@ -44,7 +44,9 @@ const results = await parallel(CHS.map((ch) => async () => {
     '**真去查、每条给出处 + 版本/日期**；**只做读者定向外部背景、不解读 pin 源码**；notation/custom_pattern **必给具体可核例子**；竞争项目给差异 + 何时选 + 权威链接（点到即止）；深入浅出、刨根问底；版本敏感的锚定本章 pin 版本。\n' +
     '**本章聚焦真会用到的点——无外部 gap 就如实产一份 `{"concepts": []}`、gaps 返 0，别硬凑**（很多纯内部机制章确实没什么可查）。\n' +
     '返回：gaps（真需研究的概念数）/blocked/note。无法联网则 blocked=true。',
-    { schema: SCHEMA, label: ch + ':research', phase: 'Scan', agentType: 'researcher', model: 'sonnet' }
+    // 用户 2026-07-24 定:不是非常难的问题优先 opus5,不用 fable5。research 是全书事实真相源、
+    // 质量向下游所有写作复利,故用 opus(实测 sonnet 研究员出过归属/数字失实,需二次核实)。
+    { schema: SCHEMA, label: ch + ':research', phase: 'Scan', agentType: 'researcher', model: 'opus' }
   )
   return { chapter: ch, gaps: r ? r.gaps : null, blocked: r ? r.blocked : true, note: r ? r.note : 'agent 失败' }
 }))

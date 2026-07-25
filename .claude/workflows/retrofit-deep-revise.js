@@ -11,11 +11,11 @@ export const meta = {
 // ⚠️ args 注入不可靠 → CFG 为准（换批改 CFG.chapters）。
 const CFG = {
   instance: 'vllm',
-  // 每批填入待回修章目录名（vllm 批次1：gap>=7 的 10 章；ch31/ch32 试点已完成不重复）
+  // vllm 批次2：批次1 因限额未完成的 3 章 + 次高 gap 5 章（批次1 的 7 章已提交完成）
   chapters: [
-    'ch07-engine-core', 'ch26-primer-quantization', 'ch28-model-architecture',
-    'ch01-config-and-wiring', 'ch04-async-llm', 'ch23-custom-ops-and-compilation',
-    'ch25-attention', 'ch29-model-architecture', 'ch35-pd-disaggregation', 'ch38-entrypoints',
+    'ch29-model-architecture', 'ch35-pd-disaggregation', 'ch38-entrypoints',
+    'ch03-config-and-wiring', 'ch09-detokenization', 'ch12-engine-core',
+    'ch17-worker-and-executor', 'ch20-distributed-parallelism',
   ],
 }
 const A = (typeof args !== 'undefined' && args && args.chapters && args.chapters.length) ? args : CFG
@@ -84,7 +84,7 @@ const results = await pipeline(
       '若需改：改 `chapter-map.py` → 重渲染 svg+png → **Read PNG 亲眼看**（文字对不对/越界/相撞/箭头悬空/中文豆腐）→ 把 figure-manifest.json 里 chapter-map 的 blind_review 重置 **PENDING**（交独立盲审）。跑 `python3 ' + REPO + '/scripts/lint_chapter_map.py ' + CH + '/ --require` 与 `lint_diagram_geometry.py` 单文件确认。\n' +
       '**alt-text 归 writer（HARD RULE 1）**：你**不许改正文**；若认为开篇 alt-text 也该跟着调，把建议文字写进 alt_text_suggestion。\n' +
       '返回：changed / note / alt_text_suggestion（无则空）。',
-      { schema: MAP_SCHEMA, label: ch + ':mapsync', phase: 'MapSync', agentType: 'illustrator', model: 'sonnet' }
+      { schema: MAP_SCHEMA, label: ch + ':mapsync', phase: 'MapSync', agentType: 'illustrator' }
     )
     return Object.assign({}, prev, { map: m })
   },
@@ -99,7 +99,7 @@ const results = await pipeline(
       '核：①改动是否忠实反映正文（§徽标↔各 H2 节标题逐一对应；被改节点的概括与该节现在的正文一致）；②源码符号未被误改/杜撰（图上符号须在正文或源码真实出现）；③其余节点/泳道/阅读路线未误伤；④几何：越界/相撞/压框/箭头悬空/中文豆腐；⑤零脚手架泄漏。\n' +
       '若 PASS：把 manifest 该图 blind_review 置 **PASS**（注明核的要点），并跑 `python3 ' + REPO + '/scripts/lint_diagrams.py ' + CH + '/` 确认转绿。若 FAIL：保持 PENDING，note 写清哪里错、该怎么改。\n' +
       '返回：pass / note。',
-      { schema: BLIND_SCHEMA, label: ch + ':mapblind', phase: 'MapBlind', agentType: 'illustrator', model: 'sonnet' }
+      { schema: BLIND_SCHEMA, label: ch + ':mapblind', phase: 'MapBlind', agentType: 'illustrator' }
     )
     return Object.assign({}, prev, { blind: b })
   }
