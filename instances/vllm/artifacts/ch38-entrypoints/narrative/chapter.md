@@ -10,7 +10,7 @@
 
 第 37 章的离线 `LLM` 很省心：你给它一个列表，它阻塞着算完，一次性还给你。但生产环境不长这样。生产环境是一台常驻服务器，前面挂着负载均衡，后面是一颗滚烫的 GPU，成百上千条请求同时涌进来，每条都想要"打字机"式的逐字回显。
 
-这正是 vLLM 的 OpenAI 兼容服务器要解决的事，代码集中在 `vllm/entrypoints/openai/api_server.py` 与 `vllm/entrypoints/launcher.py` 这两处。它对外说的是 OpenAI 的方言——`POST /v1/chat/completions`、`data: {...}\n\n` 的 SSE 流、`[DONE]` 哨兵；对内接的是第 4 章那台异步三段式引擎 `AsyncLLM`。本章就站在这两者之间，看一条请求如何穿过 FastAPI、被校验、被渲染成 token，再分流成"逐 token 推"或"攒齐了一次还"两种姿态，最后被一个优雅关停的 uvicorn 收尾。
+这正是 vLLM 的 OpenAI 兼容服务器要解决的事，代码集中在 `vllm/entrypoints/openai/api_server.py` 与 `vllm/entrypoints/launcher.py` 这两处。它对外说的是 OpenAI 的方言——`POST /v1/chat/completions`、`data: {...}\n\n` 的 SSE 流（SSE = Server-Sent Events，服务器沿一条普通 HTTP 连接持续往客户端推纯文本帧的 web 标准，[§38.5.1](#3851-流式逐-token-推成-sse) 拆开讲）、`[DONE]` 哨兵；对内接的是第 4 章那台异步三段式引擎 `AsyncLLM`。本章就站在这两者之间，看一条请求如何穿过 FastAPI、被校验、被渲染成 token，再分流成"逐 token 推"或"攒齐了一次还"两种姿态，最后被一个优雅关停的 uvicorn 收尾。
 
 我们先把请求的一生看完整（这是主线），再回头补上"服务器怎么起来、怎么倒下"这层地基。主线代码落在 `vllm/entrypoints/openai/chat_completion/serving.py`，地基在 `vllm/entrypoints/openai/api_server.py`。
 
@@ -26,7 +26,11 @@
 
 ## 38.2 顶层编排：一个 `async with` 框住引擎的一生
 
-进程的入口在 `vllm/entrypoints/openai/api_server.py`。剥掉日志装饰后，启动逻辑只有两层薄薄的协程：
+进程的入口在 `vllm/entrypoints/openai/api_server.py`。命令行 `vllm serve` 把参数解析校验完，最后一句只是 `uvloop.run(run_server(args))`（`vllm/entrypoints/openai/api_server.py:L733`）——整台服务器的异步世界从这一行开张。
+
+这里顺手换了个轮子。uvloop 不是 vLLM 的东西，而是 MagicStack 团队维护的 asyncio 事件循环替代品：它保持 asyncio 的全部语义，只把标准库那个偏通用、偏可调试的循环实现，换成用 Cython 包在 libuv（Node.js 底层那个久经考验的高性能异步 I/O 库）外面的实现，项目 README 给自己的定位是比标准事件循环快 2–4 倍。关键在于换掉的只是"轮子"：`async`/`await`、`Task`、`Future` 的行为一个字不变，所以本章后面所有协程代码，跑在 `asyncio.run` 还是 `uvloop.run` 之上都完全一样——这也是为什么 vLLM 敢在最外层直接换掉它。新版本 uvloop 推荐的接入方式正是这里用的 `uvloop.run(main())`，老写法则是先 `uvloop.install()` 再照常 `asyncio.run()`。想深挖实现与基准，见 [MagicStack/uvloop](https://github.com/MagicStack/uvloop)。
+
+剥掉日志装饰后，启动逻辑只有两层薄薄的协程：
 
 ```python
 # vllm/entrypoints/openai/api_server.py:L686-L718
@@ -385,6 +389,12 @@ def with_cancellation(handler_func):
 
 思路很干净：同时起两个 task，一个跑真正的 handler，一个专门盯着"客户端断没断"。`asyncio.wait(..., FIRST_COMPLETED)` 让它俩赛跑，谁先完成就取消另一个。客户端先断线，`cancellation_task` 先返回，`handler_task` 被 cancel——算了一半的请求当场刹车，不再白烧 GPU。这是异步服务器里很典型的"竞速取消"模式。
 
+不过这里有两个"为什么"值得刨一下：断连信号究竟从哪来，以及为什么不用现成的接口。
+
+**信号来自 ASGI。** ASGI（Asynchronous Server Gateway Interface，异步版的 Web 服务器网关接口）是 Python 异步 web 世界的插拔标准，它规定一个应用或中间件必须长成 `async def app(scope, receive, send)` 这个样子：`scope` 是个 dict，装着本次连接的元信息（是 HTTP 还是 WebSocket、path、headers）；`receive` 是个异步函数，await 它就拿到下一条"客户端事件"（请求体分片，或者连接断开）；`send` 也是异步函数，用来把状态码、响应体分片发回去。它是 2016 年前后由 Django 社区（Andrew Godwin）提出来接 WSGI（Web Server Gateway Interface，Python 沿用多年的同步版网关接口）班的：WSGI 假设"一次请求进、一次响应出"，天生表达不了 WebSocket 那种来回收发的长连接，也表达不了分块流式响应；ASGI 把"一次调用"换成"不断收发事件"，成了 uvicorn / Starlette / FastAPI 这一代异步框架的共同底座。规范里明确定义：服务器一旦发现客户端断开，就往这次请求的 `receive` 通道塞一条 `{"type": "http.disconnect"}` 消息。`listen_for_disconnect` 做的正是守在 `receive` 上死等这条消息。协议全貌见 [ASGI 官方文档](https://asgi.readthedocs.io/en/latest/introduction.html)。
+
+**那为什么不用 `request.is_disconnected()`？** Starlette 自带这个方法，一行就能问出"客户端断没断"。源码 docstring 第一句就把选型理由写死了：`This does _not_ use request.is_disconnected, which does not work with middleware.` 差别在于姿态——`is_disconnected()` 是**查询式**的：它非阻塞地问一次 `receive()` 里有没有 `http.disconnect`，没有就返回 False；而一次请求的 `receive` 是条单消费者队列，中间件或请求体读取逻辑要是已经在别处消费过它，这一问就可能扑空。vLLM 于是把"问一次"换成"常驻监听"：专开一个 task 一直守在通道上，再让它和 handler 赛跑，不存在错过事件的时序窗口。代价也写在同一段 docstring 里——监听期间它会吞掉并丢弃这次请求后续的所有消息，所以这个装饰器只能套在请求体已被 FastAPI 解析成 pydantic 模型的 handler 上（chat 路由正是如此），挪到别处就不安全了。
+
 现在进 handler 内部。`OpenAIServingChat.create_chat_completion` 是 chat 请求的主方法，骨架如下：
 
 ```python
@@ -566,7 +576,15 @@ handler 只认这个协议——它不知道、也不需要知道背后是 `Asyn
 
 ### 38.5.1 流式：逐 token 推成 SSE
 
-先看流式。`chat_completion_stream_generator` 是个 async 生成器，它 `async for` 地消费 `result_generator`，每来一个 `RequestOutput` 就吐若干 SSE 帧。开头第一拍很特别：
+读代码之前，先把"SSE 帧"这个词拆成两层。它们是两套独立的协议，vLLM 一层都没发明，只是两层都照着实现。
+
+**下层：SSE 只管怎么切帧。** Server-Sent Events 是 W3C/WHATWG 定的 web 标准，比 WebSocket 出现得更早，专治"只要服务器往客户端推、客户端不用回话"这类场景（行情、通知、日志尾随）。它不需要 WebSocket 那种协议升级握手，就在一条普通 HTTP 响应上做文章：响应头写 `Content-Type: text/event-stream`，然后持续往连接里写文本行。规则简单到用 `curl` 就能读懂——一条消息由若干 `字段名: 值` 的行组成，消息之间用一个**空行**隔开；标准字段有 `data`（消息体）、`event`（自定义事件名）、`id`（断线重连续传用）、`retry`（重连间隔），以 `:` 开头的行是注释、常被当心跳保活。vLLM 只用到 `data` 一个字段，其余本章不涉及。要紧的是最后这句：**SSE 只负责按帧切分，完全不关心 `data:` 后面装的是什么，也没有规定流该怎么结束**——"流终止"这件事协议里根本没有。想看协议全貌见 [MDN：Using server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events)。
+
+**上层：OpenAI 的约定管帧里装什么。** "首帧只报角色、后续帧只带内容增量、末帧带 `finish_reason`、可选再补一帧用量、最后发 `data: [DONE]`"——这些全是 OpenAI Chat Completions API 在 SSE 之上自定的应用层规矩，随 2023 年 `stream=True` 上线逐渐固定成事实标准。`[DONE]` 尤其耐人寻味：它并没有作为正式关键字写进 OpenAI 公开的 API 参考（官方 SDK 内部替使用者吞掉了这个哨兵，用 SDK 的人根本看不见它），但因为下层 SSE 不定义流终止，它就成了纯 HTTP 层面唯一能说"说完了"的信号，于是手写客户端都依赖它，各家"OpenAI 兼容"服务端——vLLM、TGI（Hugging Face 的 Text Generation Inference）、SGLang 等同类推理服务框架——也都照抄。抄准这套约定的收益很直接：用户把 `base_url` 一改，OpenAI 官方 SDK 就能指向自建的 vLLM，客户端一行代码都不用动。想看客户端侧怎么消费，可对照 [OpenAI Cookbook 的流式示例](https://developers.openai.com/cookbook/examples/how_to_stream_completions)。
+
+下面这段代码同时落地这两层：`yield f"data: {...}\n\n"` 是下层的切帧，JSON 里的 `delta`/`finish_reason` 是上层的约定。
+
+回到代码。`chat_completion_stream_generator` 是个 async 生成器，它 `async for` 地消费 `result_generator`，每来一个 `RequestOutput` 就吐若干 SSE 帧。开头第一拍很特别：
 
 ```python
 # vllm/entrypoints/openai/chat_completion/serving.py:L495-L551, L606-L671
@@ -665,7 +683,7 @@ except Exception as e:
 yield "data: [DONE]\n\n"
 ```
 
-用量是**可选的、并且单独一块**：只有客户端在 `stream_options` 里要了 `include_usage`，才在所有内容块之后补一个 `choices=[]` 只带 `usage` 的块。最后无论如何都 `yield "data: [DONE]\n\n"`——SSE 流的终止哨兵，告诉客户端"说完了"。
+用量是**可选的、并且单独一块**：只有客户端在 `stream_options` 里要了 `include_usage`，才在所有内容块之后补一个 `choices=[]` 只带 `usage` 的块。最后无论如何都 `yield "data: [DONE]\n\n"`——上层约定的终止哨兵（切帧那层的 SSE 并不定义流何时结束），告诉客户端"说完了"。
 
 这里有个一眼容易滑过、却是整章关停设计的命门的细节：看那两个 `except`。**流里出了异常，不是抛出去，而是 `yield` 成一个 error data 帧。** 为什么不抛？因为流式响应一旦开始，HTTP 200 状态码**早就发出去了**——回想 [§38.4](#384-请求的一生上从-http-到-token) 那个 `StreamingResponse`，它在第一个字节落地时状态行就定了。状态码改不了，错误就只能作为流里的下一帧推给客户端。
 
@@ -682,6 +700,23 @@ yield "data: [DONE]\n\n"
 | 5 | 终止哨兵 | — | — | `data: [DONE]\n\n` |
 
 读这张表只盯一件事：`role` 只在第 1 帧出现一次，之后每帧只追加 `content` 增量，`finish_reason` 直到末块才从 `null` 翻成 `"stop"`。客户端把第 2、3 帧的 `content` 顺序拼接，就还原出完整答案——这就是"打字机"效果的物理来源。
+
+表里的 `data: {…}` 落到网线上，就是下面这几行字节（**说明性示例**：按上表逐帧手写的外部协议格式，字段照 OpenAI 的写法精简，不是本仓源码）：
+
+```
+data: {"id":"chatcmpl-abc","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-abc","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-abc","choices":[{"index":0,"delta":{"content":" there"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-abc","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+```
+
+每条消息之间那个空行不是排版留白，而是 SSE 的帧分隔符——源码里 `yield f"data: {data}\n\n"` 末尾那两个 `\n`，一个结束 `data:` 这行、一个空出分隔行。少写一个，客户端就会以为这帧还没写完，继续等下一行来拼接。而 `data:` 后面那串 JSON 归上层的 OpenAI 约定管，SSE 自己完全不认识它：第 1 帧的 `role`、中间帧的 `content` 增量、末帧的 `finish_reason` 和那个空 `delta`，切帧这一层一视同仁，都只是"一行文本"。
 
 ### 38.5.2 非流式：攒到末个再聚合
 
@@ -1019,7 +1054,7 @@ def terminate_if_errored(server: uvicorn.Server, engine: EngineClient):
 
 ## 38.8 中间件这道门：鉴权与 X-Request-Id
 
-最后补一块请求进门前的关卡。[§38.3](#383-装配现场fastapi-app中间件与那一票-handler) 里 `build_app` 挂了几个中间件，vLLM 没用 FastAPI 的依赖注入，而是写成更底层的**纯 ASGI 中间件**。鉴权这个最典型：
+最后补一块请求进门前的关卡。[§38.3](#383-装配现场fastapi-app中间件与那一票-handler) 里 `build_app` 挂了几个中间件，vLLM 没用 FastAPI 的依赖注入，而是写成更底层的**纯 ASGI 中间件**——就是 [§38.4](#384-请求的一生上从-http-到-token) 那套 `scope`/`receive`/`send` 三件套：下面 `__call__` 的签名一字不差地实现了 ASGI 规定的应用接口，于是它站在 FastAPI 路由系统之外、更靠近服务器一侧。鉴权这个最典型：
 
 ```python
 # vllm/entrypoints/openai/server_utils.py:L38-L86
@@ -1061,11 +1096,17 @@ class AuthenticationMiddleware:
         return self.app(scope, receive, send)
 ```
 
+先认一下它读的那个头。`Authorization: Bearer <token>` 不是 vLLM 的自造格式，而是 RFC 6750 定下的标准写法。"Bearer"直译"持有者"，这类令牌的定义就是"任何持有它的一方都能像其他持有者一样使用它"——不像某些方案要你额外证明自己握着对应私钥，它只看你手里有没有这串字符。所以格式极简：请求头名叫 `Authorization`，值是 `Bearer` 加一个空格再加 token 本体。代码里那句 `authorization_header_value.partition(" ")` 拆的正是这个空格：客户端发 `Authorization: Bearer sk-abc123`，`scheme` 拿到 `Bearer`、`param` 拿到 `sk-abc123`，校验 `scheme.lower() == "bearer"` 通过后才拿 `param` 去比对；漏了 `Bearer ` 前缀、或写成 `Basic sk-abc123`，一律判失败。
+
+这套格式本是给 OAuth 2.0 的访问令牌配的传输规范，但因为足够简单通用，后来被大量非 OAuth 场景直接借去当朴素的 API Key 认证——vLLM 正是这种轻量用法：没有任何授权流程，只是把 `--api-key` 传入的值（或环境变量 `VLLM_API_KEY`）放进 Bearer 的位置比一比。顺带记住 RFC 里两条硬要求：Bearer token 必须走 TLS 传输，且不该塞进 URL 查询参数（会被访问日志、浏览器历史留痕）。原文见 [RFC 6750](https://datatracker.ietf.org/doc/html/rfc6750)。
+
 为什么用纯 ASGI 而不是 FastAPI 依赖？因为它在更低的一层拦截——还没进路由系统就能放行或拒绝。两个细节体现了它的克制：
 
 **只管 `/v1` 路径，且跳过 `OPTIONS`。** 健康检查、文档页这些非 `/v1` 路由不需要 token；`OPTIONS` 是 CORS 预检请求，按规范不能要鉴权，否则浏览器跨域全挂。所以 `scope.get("method") == "OPTIONS"` 和 `url_path.startswith("/v1")` 这两道判断把鉴权精确收窄到该管的范围。
 
-**token 比对走 `sha256` + `secrets.compare_digest`。** 不直接比字符串，而是先各自 `sha256` 成定长摘要，再用 `compare_digest` 做**恒定时间**比较。这是防时序侧信道攻击——普通的字符串相等会在第一个不同字符处提前返回，攻击者能靠响应时间一点点猜出 token；恒定时间比较把这条路堵死。一个生产级服务器该有的安全意识，都浓缩在这两行里。
+**token 比对走 `sha256` + `secrets.compare_digest`。** 不直接比字符串，而是先各自 `sha256` 成定长摘要，再用 `compare_digest` 做**恒定时间**比较。这是防时序侧信道攻击——普通的字符串相等会在第一个不同字符处提前返回，攻击者能靠响应时间一点点猜出 token；恒定时间比较把这条路堵死。
+
+`secrets.compare_digest` 也不是随手挑的函数，而是标准库专门给这件事备的密码学原语：Python 3.3 先在 `hmac` 模块里提供 `hmac.compare_digest`，3.6 引入的 `secrets` 模块又把同一能力重新导出一份，官方文档写明它用于"降低时序攻击风险"，比较密码、token、MAC 值时应当优先于 `==`。时序攻击也不是纸上谈兵——HMAC 校验、session token 比对都曾真的被这条侧信道攻破过，所以几乎每个密码学库都会提供一个恒定时间比较。至于为什么先 `sha256` 再比：摘要定长，顺手把"两个 token 长度不同"这点信息也一并抹平了。原始出处见 [Python 文档：secrets.compare_digest](https://docs.python.org/3/library/secrets.html#secrets.compare_digest)。一个生产级服务器该有的安全意识，都浓缩在这两行里。
 
 同文件里的 `XRequestIdMiddleware` 是它的姊妹——把 [§38.4](#384-请求的一生上从-http-到-token) 里解析出的 request_id 回写进响应头，让客户端也能拿到这条贯穿全链路的追踪 id。
 

@@ -110,7 +110,7 @@ class EngineArgs:
 
 这是「单一真相源」（single source of truth）模式。子配置类 `ModelConfig` 里的 `max_model_len` 默认值改了，CLI 的默认值**自动跟着变**——因为它们引用的是同一个东西，不存在两处维护、互相漂移的可能。如果哪天你看到 vLLM 文档里说某个 CLI 参数的默认值是 X，去翻 `EngineArgs` 发现写的是 `= SomeConfig.foo`，别困惑，那就是说「默认值跟 `SomeConfig.foo` 保持一致」。
 
-还有一个有意思的字段：`distributed_executor_backend` 默认是 `None`。它不是「没设置」的意思那么简单——`None` 是一个**待推导**的信号，后面 vLLM 会根据你的卡数、平台、是否有 Ray 来填它。这是本章第一个「三态/可推导默认」的例子，[3.6 节](#36-第二级映射之一执行器工厂-executorget_class) 会接着讲。
+还有一个有意思的字段：`distributed_executor_backend` 默认是 `None`。它不是「没设置」的意思那么简单——`None` 是一个**待推导**的信号，后面 vLLM 会根据你的卡数、平台、以及你是不是已经站在 Ray（一个通用的分布式执行框架，[3.6 节](#36-第二级映射之一执行器工厂-executorget_class) 会讲清它为什么会出现在这里）的地盘上来填它。这是本章第一个「三态/可推导默认」的例子，[3.6 节](#36-第二级映射之一执行器工厂-executorget_class) 会接着讲。
 
 值得一提的是，「字段类型驱动 CLI 形态」这条规则随版本还在变得更完整。`bool` 字段会自动派生出 `--x/--no-x` 这样的成对开关，这套自动化由 `arg_utils.py` 里的 `get_kwargs`（内核是 `_compute_kwargs`）统一负责——它读字段的类型注解，决定生成什么样的 argparse 参数。
 
@@ -201,6 +201,8 @@ class EngineArgs:
 就是「把扁平的 `self.*` 字段，重新打包成一个结构化的子配置对象」。每个关键字参数要么直接来自 `EngineArgs` 字段（`self.block_size`），要么来自上面推导出的局部变量（`resolved_cache_dtype`、`sliding_window`），要么从已经建好的 `model_config` 派生（`model_config.is_attention_free`）。
 
 > **v0.21.0 更新**：`LoadConfig` 的打包同样在持续长字段——新增了两个权重预取旋钮 `safetensors_prefetch_num_threads`（预取 worker 线程数）和 `safetensors_prefetch_block_size`（每文件预取读取块字节数），对应 CLI `--safetensors-prefetch-num-threads` / `--safetensors-prefetch-block-size`，由 `create_load_config` 回填进 `LoadConfig`。后者跟 `max_num_batched_tokens` 一样支持人类可读写法（如 `16M`）。这是纯加法旋钮，不改主控制流，只是「`EngineArgs` 这个扁平袋子持续长字段、CLI 自动派生」模式的又一例。
+>
+> 旋钮名里的 **safetensors** 值得单独一句：它是 Hugging Face 推出的权重序列化格式，用来顶掉 PyTorch 传统的 pickle（就是那些 `.bin` 权重文件）。pickle 反序列化时会执行文件里编码的任意 Python 代码，也就是说「加载一份看起来只是权重的文件」理论上等于「执行一段陌生代码」；safetensors 换了个存法——文件里只有纯张量字节，外加一个 JSON 头描述每个张量的名字、形状、dtype 和在文件里的字节偏移，加载时只按偏移读字节、不执行任何代码，顺带还能内存映射零拷贝，所以通常也更快。这两个新旋钮加的正是在「按偏移读字节」这一步上做多线程分块预取，让读盘和后续处理重叠起来。格式细节见 [safetensors 官方文档](https://huggingface.co/docs/safetensors/index)。
 
 `SchedulerConfig`、`ParallelConfig`、`LoadConfig`、`CompilationConfig`……全是**同一个套路**。看 `SchedulerConfig`，注意它怎么从 `model_config` 派生标志：
 
@@ -307,7 +309,11 @@ class EngineArgs:
 
 这些是「热身」。`__post_init__` 还是一切「跨子配置硬约束」的兜底落地点——单看某一个子配置都合法、凑在一起才知道不行的组合，校验就集中写在这里。v0.21.0 又往这里补了两道这样的闸门，正好是这个模式的典型例证：
 
-> **v0.21.0 更新（KV transfer 兼容闸门）**：`__post_init__` 在 KV transfer 收尾处新增了 `_verify_kv_transfer_compat`。逻辑是——只要配置了任意 KV connector（NIXL / Mooncake 之类），又把环境变量 `PYTORCH_CUDA_ALLOC_CONF` 打开成 `expandable_segments:True`、且没开 sleep mode，就直接 `raise ValueError`。原因很有教学性：PyTorch 的 CUDA 虚拟内存分配器会把 KV cache 的虚拟地址重映射到不同物理页，使 connector 通过 `ibv_reg_mr` 注册（pin）的 KV 内存指向被搬走的废弃物理页，运行时触发 `IBV_WC_REM_ACCESS_ERR`。单看 `KVTransferConfig` 或那个环境变量都合法，凑在一起才知道会出错——这正是为什么这类约束必须集中在 `__post_init__`。（sleep mode 是例外，因为它的内存池作用域内会自动关掉 expandable_segments。）
+> **v0.21.0 更新（KV transfer 兼容闸门）**：`__post_init__` 在 KV transfer 收尾处新增了 `_verify_kv_transfer_compat`。逻辑是——只要配置了任意 KV connector（把 KV cache 跨进程、跨机器搬运出去的插件，NIXL / Mooncake 之类），又把环境变量 `PYTORCH_CUDA_ALLOC_CONF` 打开成 `expandable_segments:True`、且没开 sleep mode，就直接 `raise ValueError`。
+>
+> 这道闸门挡的是两套各自成熟、底层假设却互相矛盾的机制，值得摊开看。**一边是 RDMA**（Remote Direct Memory Access，远程直接内存访问——让网卡绕开 CPU 和操作系统，直接读写对端机器的内存，跨机搬 KV 靠的就是它）：网卡要自己拿着一张「虚拟地址→物理地址」的映射表干活，而 `ibv_reg_mr()`（InfiniBand Verbs 这套 RDMA 编程接口里的「注册内存」调用）做的正是把一段内存**注册**给网卡——把它钉住（pin，禁止操作系统换出或搬走），并把当时的虚实映射写进网卡硬件，此后网卡就能照表直取物理页，不必每次再问 CPU。**另一边是 expandable_segments**：PyTorch 显存分配器的一个可选模式，改用 CUDA 底层的虚拟内存管理接口，把「预留一段虚拟地址」和「真正映射物理页」拆成两步，于是能按需把物理页映射进、移出同一段虚拟地址，让显存池像 mmap 一样弹性伸缩，换来的好处是碎片更少。**一个要求映射一经注册就永久不变，一个的存在意义就是动态改映射**——同一块 KV cache 上同时用这两样，网卡里那张表迟早过期。
+>
+> 据 vLLM 这处源码注释给出的诊断：重映射之后，connector 注册过的那段 KV 内存指向了被搬走的废弃物理页，第一次跨机 KV 传输就在硬件层面报出 `IBV_WC_REM_ACCESS_ERR`（Verbs 完成队列里「远端拒绝访问」那个错误码）。单看 `KVTransferConfig` 或那个环境变量都合法，凑在一起才知道会出错——这正是为什么这类约束必须集中在 `__post_init__`。（sleep mode 是例外，因为它的内存池作用域内会自动关掉 expandable_segments。）想深挖注册语义的读者可以从 [`ibv_reg_mr` 的 man page](https://man7.org/linux/man-pages/man3/ibv_reg_mr.3.html) 读起。
 
 > **v0.21.0 更新（路由专家返回的能力边界）**：新增 CLI `--enable-return-routed-experts`（落在 `ModelConfig.enable_return_routed_experts`）。它带来的不是一段执行逻辑，而是 `__post_init__` 里一组「这个特性目前支持到哪」的校验：一旦开启，`_validate_return_routed_experts` 会拒绝尚未端到端验证的并行组合——`pipeline_parallel_size > 1`、`prefill_context_parallel_size > 1`、`decode_context_parallel_size > 1`，以及 `async_scheduling`，任一命中即报错。这也印证了本节的观点：`VllmConfig.__post_init__` 是把「能力边界」这类跨配置约束兜底落地的地方。
 
@@ -461,6 +467,10 @@ class EngineArgs:
 - 检测到 Ray 环境 → `"ray"`；
 - `world_size` 比本机 GPU 数还多 → 直接 `raise`，省得你后面莫名其妙崩。
 
+这四条里，`"ray"` 那条引进来的是一整个外部框架，值得单独交代。**Ray** 是 UC Berkeley RISELab 2017 年放出、现由 Anyscale 主导维护的通用分布式计算框架（论文《Ray: A Distributed Framework for Emerging AI Applications》，arXiv:1712.05889），核心其实只有两个原语：**task**——用 `@ray.remote` 装饰一个普通函数，调用它立刻返回一个「未来值」引用，函数体在集群某个 worker 进程上异步跑；**actor**——一个有状态的远程对象，方法调用在它自己的进程里排队顺序执行，用来在多次调用之间保住状态（多卡推理里每个 rank 的 worker 正是这种「有状态」角色，所以 Ray 后端拿 actor 来装它们）。一个 Ray 集群由一个 head 节点（管调度与元数据）加若干 worker 节点组成，可以跨机器、跨容器，还提供 placement group（把一组 actor 按指定的资源布局绑到具体节点上）这类集群级编排能力。
+
+代价就是这一整层编排本身。所以 vLLM 的口径很克制：默认走 `"mp"`——直接按 rank 起子进程，不引入任何额外的集群概念；只有当你本来就站在 Ray 的地盘上时（上面省略的那两条分支：显式把数据并行后端设成 ray，或者当前进程已经在一个 Ray placement group 里），才顺势切成 `"ray"`，把 worker 的排布交给它。想深挖的读者可以从官方的 [Ray Core 核心概念](https://docs.ray.io/en/latest/ray-core/key-concepts.html) 读起——本章只需要知道它在这张查表里代表「集群级编排」这一档。
+
 你不指定 backend，vLLM 就用这套规则给你推一个合理的默认；你显式指定了，它就尊重你的。又是「合理默认 + 显式优先」那一套——本章你会一次次看到这个模式。
 
 回头看执行器工厂里被借去当「能力查询」的 `supports_async_scheduling()`。不同执行器类对它的回答不一样，这正是 [3.5 节](#35-async_scheduling-三态决策默认开但会自动退化) 那个决策的依据：基类 `Executor` 默认返回 `False`，而 `UniProcExecutor` 和 `MultiprocExecutor` 都重写成 `True`。所以单卡 `uni`、多卡 `mp` 这两条主流路径，执行器都是支持异步调度的——这也是为什么默认情况下异步调度通常是开着的。
@@ -596,7 +606,23 @@ class OptimizationLevel(IntEnum):
     """O3: Currently the same as -O2s."""
 ```
 
-在往下看对照表之前，先把反复出现的 CUDA Graph 这个词钉住：它是把一段 GPU kernel 调用序列录制下来、之后整体重放，省掉逐条 launch 的 CPU 开销；full 模式抓整个前向图，piecewise 模式只抓可静态化的子图（用来兼容动态 shape 分支）。
+这四行 docstring 里有两个词反复出现，又最容易囫囵读过去：**编译** 和 **cudagraph**。O0→O3 这个旋钮拨的其实就是它们俩，所以先把它们钉死。
+
+**其一，torch.compile（Dynamo + Inductor）。** 它是 PyTorch 2.0（2023 年）起官方主推的编译栈，卖点是「不用重写模型，加一层就能吃到编译加速」——在它之前，TorchScript / torch.fx 也尝试过把动态的 Python 模型转成静态图，但对写法要求严、兼容性有限。torch.compile 换了条路子：不要求你提前静态化，而是在**运行时**边跑边抓。抓图的那半叫 **TorchDynamo**，它借 CPython 的帧求值接口在**字节码层**拦截函数调用，把认得出的 PyTorch 算子序列攒成一张计算图（FX 图，PyTorch 的算子级中间表示）；一旦碰到它看不懂的动态控制流（典型是依赖张量取值的 `if`），就在那里 **graph break**——断开，那一小段退回普通 Python/eager（逐算子即时执行）跑，之后再接着攒新的图段。生成代码的那半叫 **TorchInductor**：拿到图之后，在 NVIDIA/AMD/Intel GPU 上生成融合过的 Triton kernel，在 CPU 上生成向量化 C++。O1 那句「Dynamo+Inductor compilation」说的就是调用这条流水线，vLLM 里它落成 `CompilationMode.VLLM_COMPILE`。顺带解答一个常见困惑：开了 O1/O2，模型里仍可能有「没被编译到」的部分——那正是 graph break 断口处退回 eager 的片段。想看完整用法，PyTorch 官方教程是最好的入口：[torch.compile tutorial](https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html)。
+
+**其二，CUDA Graph。** 它治的是另一种病。GPU 上单个算子往往跑得飞快（微秒级），但 CPU 每发起一次 kernel launch 都有固定开销；当模型的算子又多又碎时，GPU 反而常在**等 CPU 发指令**。NVIDIA 在 CUDA 10（2018 年）给的解法是把「发指令」批发掉：先 **capture**（录制）一遍——这一遍里 CUDA 只记下要做哪些 GPU 操作（kernel、内存拷贝、事件）以及它们的依赖顺序，并不真的执行；录完实例化成一张图，以后要跑同一串操作，只需一次 host 调用，GPU 照着预录的依赖图把整串跑完。用 PyTorch 的 API 写出来就这么几行：
+
+```python
+# 说明性外部示例：PyTorch 的 CUDA Graph 最小用法，非 vLLM 源码
+g = torch.cuda.CUDAGraph()
+with torch.cuda.graph(g):
+    static_y = model(static_input)   # 只录制这次前向要发哪些 GPU 操作，不是真跑
+# … 之后每一轮 …
+static_input.copy_(data)             # 新数据写进那块固定的输入显存
+g.replay()                           # 一次 host 调用，重放整串 kernel
+```
+
+关键在变量名的 `static_` 前缀：录下来的是**具体地址上的具体形状**，replay 时输入必须写回同一块显存、形状不能变，图里也不能有依赖数据取值的分支。这条硬约束直接解释了 vLLM 为什么给 `cudagraph_mode` 留了几档而不是一个开关：`NONE` 不用；`FULL` 把整个前向录成一张图，最省 CPU，但要求整条前向都能静态化；`PIECEWISE` 只把能静态化的子图录进去、动态的部分留给正常执行路径，牺牲一点收益换适用面。O2/O3 默认的 `FULL_AND_PIECEWISE` 则是个组合档——它的枚举值本身就写成 `(FULL, PIECEWISE)` 这一对，`decode_mode()` 取前者、`mixed_mode()` 取后者，意思是纯 decode（逐 token 生成，形状规整）的批次走 full，混入 prefill（提示词一次性吃进去，长度不定）的批次退回 piecewise。capture 的约束细节可以看 PyTorch 官方博客 [Accelerating PyTorch with CUDA Graphs](https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/)。
 
 它是个「启动时间 vs 运行性能」的单调旋钮：
 

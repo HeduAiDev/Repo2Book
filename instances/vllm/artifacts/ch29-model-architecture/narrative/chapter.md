@@ -6,7 +6,7 @@
 
 ## 这章要做什么
 
-上一章我们逐行读完了 DeepSeek-V4 的真实源码——MLA 投影、MoE 双后端、MTP 旁路、还有那条 hc 多流残差。读完之后，脑子里其实已经攒下了一张图：哪个模块拥有哪个模块，张量从哪儿流到哪儿。
+上一章我们逐行读完了 DeepSeek-V4 的真实源码——MLA 投影、MoE 双后端、MTP 旁路（Multi-Token Prediction，多 token 预测：主干之外挂一条小分支，一次前向多猜几个 token 当草稿）、还有那条 hc 多流残差。读完之后，脑子里其实已经攒下了一张图：哪个模块拥有哪个模块，张量从哪儿流到哪儿。
 
 这一章不再讲「V4 是什么」。我们要把上一章那个「读着读着图就浮现出来」的过程**拆成一套明确的步骤**，让它不再靠灵感、靠经验，而是像查字典一样——翻到 `__init__` 查框，翻到 `forward` 查边。然后把这套步骤原样跑在 DeepSeek-V4 上，产出它的架构图，并逐一交代：**每个框、每条边、每种着色，是从源码哪一行读出来的。**
 
@@ -259,7 +259,15 @@ P1 照搬：数 `self.X =`。这里三条——`self.model`、`self.lm_head`、`
 
 到了叶子层，P1 变成一种很机械的体验：**一行一框**。`fused_wqa_wkv`、`q_norm`、`wq_b`、`kv_norm`、`wo_a`、`wo_b`——一条 `self.X =` 一个框，连 `prefix=f"{prefix}.<name>"` 都对齐了图里的层级标签。这就是 MLA 的投影子树，不多不少。
 
-这里 P1 还顺手把 P3 的一半活干了：**框的着色判据，就写在类名里。** `MergedColumnParallelLinear`、`ColumnParallelLinear`、`RowParallelLinear`——这些类名本身就标了张量并行的方式。列并行（Column）按输出维切、行并行（Row）按输入维切，是两种不同的跨设备通信模式。所以画图时按类名着色：列并行一种颜色、行并行另一种、合并复制的（`fused_wqa_wkv` 带 `disable_tp=True` 的 ReplicatedLinear）再一种。**你不用主观判断「这块是不是并行」——读类名就行。**
+这里 P1 还顺手把 P3 的一半活干了：**框的着色判据，就写在类名里。** `MergedColumnParallelLinear`、`ColumnParallelLinear`、`RowParallelLinear`——这些类名本身就标了张量并行的方式。
+
+这对「列 / 行」的名字不是 vLLM 自造的记法。它出自 NVIDIA 2019 年的 Megatron-LM（[arXiv:1909.08053](https://arxiv.org/abs/1909.08053)）——那篇论文第一次系统化地提出**层内**张量并行：不是按层把模型切给不同卡（那是流水线并行），而是把单个矩阵乘法本身横着或竖着切开。此后 DeepSpeed、PyTorch 官方的张量并行 API（`ColwiseParallel` / `RowwiseParallel`）直到 vLLM，都沿用了这套命名，它已经是大模型并行框架的事实标准记法，见到就该条件反射。
+
+具体到一次线性变换 `y = xW`，两种切法是这样的：**列并行**把权重 `W` 按列切成 N 份发给 N 张卡，每张卡吃的是**完整**的 `x`，各自算出输出特征里互不重叠的一段——入口不需要通信，出口天然是「按特征分片」的。**行并行**反过来把 `W` 按行切，每张卡只吃输入的对应分片，各算出一份**部分和**；这些部分和必须做一次 all-reduce（跨卡求和归约，算完每张卡都持有同一份完整结果）才是真正的输出。
+
+两者的分片方向正好咬合：列并行吐出来的分片，恰是行并行想吃的分片。所以框架里它们总是**成对**出现——最典型的例子是 MLP：把隐藏维升到中间维的那两个投影（Llama 里叫 `gate_proj` / `up_proj`）用列并行切中间维，再降回隐藏维的那个投影（`down_proj`）用行并行切同一个中间维；中间那一段各卡各算各的、一句通信都不需要，整个 MLP 块只在末尾 all-reduce 一次，而不是每个矩阵乘法后都要通信一次。回头看 MLA 的这串投影：`wq_b`、`wo_a` 是 `ColumnParallelLinear`，收尾的 `wo_b` 是 `RowParallelLinear`——**先列后行，是刻意的配对，不是随手挑的类名**；这条投影链上的跨卡求和，就只发生在 `wo_b` 那一格。（all-reduce 底下的通信组怎么建、集合通信算子怎么落到 NCCL，见[第 20 章](../../ch20-distributed-parallelism/narrative/chapter.md)。）
+
+所以画图时按类名着色：列并行一种颜色、行并行另一种、合并复制的（`fused_wqa_wkv` 带 `disable_tp=True`，即关掉张量并行、每张卡各存一份完整权重的 ReplicatedLinear）再一种。**你不用主观判断「这块是不是并行」——读类名就行。**
 
 把四层下钻的结果叠起来，就是 DeepSeek-V4 的完整模块树：
 
@@ -311,9 +319,30 @@ P2 照 tensor 赋值顺序自上而下读，每一句 `hidden_states = ...(...)`
 
 **一、形状变化要标在边上。** 第二行 `hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)`——这不是一个子模块（所以不进模块树），但它把张量从 `[T, H]` 变成了 `[T, hc_mult, H]`（以 DeepSeek-V4 为例：H=7168，hc\_mult=4，即从 `[T, 7168]` 展开到 `[T, 4, 7168]`）。`unsqueeze`、`repeat`、`view`、`flatten` 这类纯形状算子，**画图时不画框，但必须在那条边上标形状**：`[T,H]→[T,hc_mult,H]`。不标的话，读者后面会一脸懵——中途怎么凭空多出来一个 `hc_mult` 维？这个维就是 hc 多流，标在边上它才有来处。
 
-**二、`for` 循环就是穿过堆叠层的那一条边——但这条边上现在跑着四个状态量，不止 `hidden_states` 一个。** `for layer in islice(self.layers, ...)` 对应 P1 里那个 `× N` 复数框——数据流箭头穿过这个复数框一次，代表依次流过所有层；但每次 `layer(...)` 调用是四进四出：`hidden_states, residual, post_mix, res_mix = layer(hidden_states, positions, input_ids, post_mix, res_mix, residual)`。后三个是 hc 残差状态量，随每次迭代原样传给下一层，不在 `× N` 框内部消失。循环结束后紧跟的 `else: hidden_states = layer.hc_post(...)`——这是 Python `for...else` 语法，循环正常穷尽（没有 `break`）就执行——是收尾最后一段残差状态的独立一条边，画在 `× N` 复数框**外面**。下钻到 `DecoderLayer.forward` 时会看到这三个状态量在层内具体怎么流转、`hc_post` 为什么要挪到这里单独收尾。
+**二、`for` 循环就是穿过堆叠层的那一条边——但这条边上现在跑着四个状态量，不止 `hidden_states` 一个。** `for layer in islice(self.layers, ...)` 对应 P1 里那个 `× N` 复数框——数据流箭头穿过这个复数框一次，代表依次流过所有层；但每次 `layer(...)` 调用是四进四出：`hidden_states, residual, post_mix, res_mix = layer(hidden_states, positions, input_ids, post_mix, res_mix, residual)`。后三个是 hc 残差状态量，随每次迭代原样传给下一层，不在 `× N` 框内部消失。循环结束后紧跟的 `else: hidden_states = layer.hc_post(...)`——这是 Python 的 `for...else` 语法——是收尾最后一段残差状态的独立一条边，画在 `× N` 复数框**外面**。
 
-**三、`copy_` 是一条分叉旁路。** `self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))` 把主干上的隐状态拷一份进 `_mtp_hidden_buffer`（这就是[上一章](../../ch29-model-architecture/narrative/chapter.md)介绍的 MTP 草稿共享缓冲区）。这就是 §29.3 说的那个 buffer——它不在模块树里，现在以**数据流端点**的身份出现：主干上分一条旁路出去，喂给 MTP 草稿。旁路边画成一条岔出去的箭头，指向那个 buffer 框。
+`for...else` 值得单独停一下：它是 Python 特有、也最容易被误读的一组关键字。很多带着 C / Java / JavaScript 经验来的读者，第一眼会把 `else` 当成「循环一次都没跑」的兜底分支，而它的真实语义几乎相反——`else` 问的是「这个循环有没有**清清白白跑到底、中途没被 `break` 打断**」。两行代码就能看清：
+
+```python
+# 说明性示例（非本仓源码），只为演示 for...else 的触发条件
+for i in range(3):
+    print(i)
+else:
+    print("穷尽了")      # 输出 0 1 2 穷尽了 —— 没有 break，else 执行
+
+for i in range(3):
+    if i == 1:
+        break
+    print(i)
+else:
+    print("不会打印")    # 只输出 0 —— i==1 时 break，else 整个被跳过
+```
+
+这个语法当初是为「遍历查找：找到就 `break`，找不到就在 `else` 里报『没找到』」这种模式设计的，省掉一个手写的 `found = False` 标志位（[Python 官方语言参考](https://docs.python.org/3/reference/compound_stmts.html#the-for-statement)里有正式定义）。把它放回主干这段：`for layer in islice(self.layers, ...)` 的循环体里**没有任何 `break`**，所以 `else` 分支每次都会执行——它不是「万一循环没跑」的异常兜底，而是「所有层都走完之后必然执行一次」的收尾动作，专门用来收掉最后一层残留的残差状态。画图时它就该老老实实画成复数框外的一条边，而不是被当成条件分支。
+
+下钻到 `DecoderLayer.forward` 时会看到这三个状态量在层内具体怎么流转、`hc_post` 为什么要挪到这里单独收尾。
+
+**三、`copy_` 是一条分叉旁路。** `self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))` 把主干上的隐状态拷一份进 `_mtp_hidden_buffer`（[上一章](../../ch28-model-architecture/narrative/chapter.md)读过这块缓冲区：MTP 草稿分支就是从它这里取走主干的隐状态）。这就是 §29.3 说的那个 buffer——它不在模块树里，现在以**数据流端点**的身份出现：主干上分一条旁路出去，喂给 MTP 草稿。旁路边画成一条岔出去的箭头，指向那个 buffer 框。
 
 **四、`hc_head` 把形状压回来。** `hc_head(...)` 接收 `[T, hc_mult, H]`，内部做完混合后输出 `[T, H]`——又一条要标形状的边，`[T,hc_mult,H]→[T,H]`，和开头那次展开正好对称。最后 `self.norm(...)` 收尾。
 
@@ -403,7 +432,25 @@ P2 照 tensor 赋值顺序自上而下读，每一句 `hidden_states = ...(...)`
         return torch.ops.vllm.mhc_post(x, residual, post, comb)
 ```
 
-证据确凿：`hc_pre` 直接 dispatch 到 `torch.ops.vllm.mhc_pre`，`hc_post` 到 `torch.ops.vllm.mhc_post`。它们不是普通子模块前向，是自定义算子。所以图里这两个框用特殊填充、旁注算子名，和普通 `nn.Module` 框区分开。判据就一条：**`torch.ops.vllm.` 前缀。** 这种自定义算子的注册机制本身——为什么要绕开 `nn.Module`、怎么注册进 `torch.ops`——是另一套独立的话题，不在画图这条线上展开。
+证据确凿：`hc_pre` 直接 dispatch 到 `torch.ops.vllm.mhc_pre`，`hc_post` 到 `torch.ops.vllm.mhc_post`。它们不是普通子模块前向，是自定义算子。所以图里这两个框用特殊填充、旁注算子名，和普通 `nn.Module` 框区分开。判据就一条：**`torch.ops.vllm.` 前缀。**
+
+那 `torch.ops.vllm.mhc_pre` 到底是个什么东西？它写起来像一次普通的属性访问加函数调用，其实不是：`torch.ops` 是 PyTorch **算子分发表**（dispatcher，一张「算子名 → 各设备实现」的全局注册表）的门牌，后面两段分别是**命名空间**（`vllm`，vLLM 自己的私有算子库）和**算子名**（`mhc_pre`）。一个名字要能出现在这张表里，必须先被显式**注册**过——而注册它的，正是 §29.3 里那行带副作用的 `import vllm.model_executor.layers.mhc`：那个模块里排着一串这样的注册调用，本章遇到的 `mhc_pre`、`mhc_post`、`mhc_fused_post_pre` 都在其中，一次一个地挂进 `vllm` 命名空间：
+
+```python
+# vllm/model_executor/layers/mhc.py:L817-L822
+direct_register_custom_op(
+    op_name="mhc_pre",
+    op_func=mhc_pre,
+    mutates_args=[],
+    fake_impl=_mhc_pre_fake,
+)
+```
+
+`direct_register_custom_op` 是 vLLM 在 `vllm/utils/torch_utils.py` 里包的一层薄封装，底下做的就是 PyTorch `torch.library` 那套标准动作：推断出算子 schema（输入输出类型，以及 `mutates_args`——声明它会不会原地改写哪些入参）后 `define` 进 vLLM 私有算子库，把 Python 实现 `impl` 到当前平台的 dispatch key（设备分发键，CUDA 上就是 CUDA 那一档）上，再登记一份 `fake_impl`。
+
+这份 `fake_impl`（也叫 fake/meta 实现）恰恰是「为什么非要注册、不能就写个普通方法」的答案：它不算真数值，只按输入形状返回一个形状正确的空张量。有了它，`torch.compile`（PyTorch 2.0 起自带的即时编译器，下一条判据马上展开）在编译期**不执行 kernel 也能推出输出形状**，于是可以把这个算子当成计算图里一个规规矩矩的节点，而不是一个看不懂、只能就地断图的黑盒。这也顺带说明本条判据为什么天然成立：普通子模块调用是一次 Python 方法调用，注册算子调用要经过分发表，两者在源码形态上根本长得不一样，扫一眼就能分开。
+
+至于每个算子背后的 kernel 怎么写、vLLM 怎么在多份实现之间挑一份，[第 23 章](../../ch23-custom-ops-and-compilation/narrative/chapter.md)讲 CustomOp 两级 dispatch 时已经拆过；本章只借它的**外形**当画图判据。想看 PyTorch 侧完整的注册 API，官方 [`torch.library` 文档](https://docs.pytorch.org/docs/stable/library.html)是入口。
 
 **判据二：顶着 `@torch.compile` 装饰器的，是编译区框。** 看 `hc_head`（`vllm/model_executor/models/deepseek_v4.py:L1552-L1580`）：
 
@@ -425,6 +472,10 @@ def hc_head(
     y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
     return y.to(dtype)
 ```
+
+读判据之前，先把 `torch.compile` 本身讲清楚——这条判据的全部依据都在它身上。`torch.compile` 是 PyTorch 2.0（2023）随新一代编译栈一起带进来的入口。在它之前，想让一段 PyTorch 代码跑得更快又不亲手写 CUDA，基本只能去写 TorchScript / `torch.jit.script`，得迁就编译器认得的那个语言子集，侵入性强、覆盖面窄。`torch.compile` 把这件事拆成两级：前端 TorchDynamo 在这段代码**第一次真正执行**时截获字节码，把里面的张量运算「录」成一张静态计算图；后端再把这张图编成融合、去冗余之后的机器码——PyTorch 默认后端是 TorchInductor，本章这里写的 `backend=current_platform.simple_compile_backend` 是把「选哪个后端」交给平台层去定，在 NVIDIA GPU 这条线上取到的仍是默认的 `inductor`。录好的图带着一组 guard（守卫条件，比如输入形状），下次条件相符就直接复用；形状变了 guard 失效，重录一次。碰到编译器看不懂的控制流，它会就地断图（graph break），把那一段退回普通 Python 执行——除非你显式要求 `fullgraph=True` 不许断。
+
+对画图的人来说，重要的不是这套机制的内部，而是**它的触发方式是一个装饰器**：装饰器顶在哪儿，编译区的边界就在哪儿，肉眼可见、无需推断。（想深入的读者，官方入门文档在 [PyTorch: torch.compiler 入门](https://docs.pytorch.org/docs/stable/torch.compiler_get_started.html)。）
 
 这页一次给了三个画图判据。其一，顶上的 `@torch.compile(backend=...)` 装饰器就是编译边界——画图时用虚线容器把它圈出来，标「编译区」。装饰器位置即编译边界，这是客观的。和它对照的是类级装饰器 `@support_torch_compile`，它顶在 `DeepseekV4Model` 上（`vllm/model_executor/models/deepseek_v4.py:L1255`），把整个主干圈成一个大编译区。一个是函数级编译、一个是类级编译，判据是同一条：**看装饰器圈编译区。**
 
@@ -523,7 +574,17 @@ P2 在这里读出两件事：
 
 前三步已经把图的内容定下来了：P1 出框、P2 出边、P3 出着色。P4 只是渲染——但渲染工具的选择本身也是有讲究的。
 
-模块树加数据流，是一张 dense 的多元素图：嵌套容器要精确对齐、多对多的连边要不打架、形状标注要贴在正确的边上。这种图，Mermaid 的自动布局会把节点缠成一团，Excalidraw 的手工坐标又总会错位。所以本章这几张图都用 svg-diagram 工具渲染：Python 脚本用循环算出每个坐标（零手填坐标）→ 生成 SVG → `xmllint` 校验是合法 XML → `rsvg-convert` 转成 PNG（它会自动为中文字形做字体回退，排版才不乱）。
+模块树加数据流，是一张 dense 的多元素图：嵌套容器要精确对齐、多对多的连边要不打架、形状标注要贴在正确的边上。用代码把这种图做出来，业界常见的是三条路，各有各的适用面：
+
+| 路子 | 它怎么工作 | 什么时候选它 |
+| --- | --- | --- |
+| [Mermaid](https://mermaid.js.org/intro/) | 写一段类 Markdown 的文本描述节点与连线，库自动排布局、直接吐 SVG | 拓扑稀疏、层级浅的流程图 / 树；图想和文档写在一起、随文档一起改 |
+| [Excalidraw](https://github.com/excalidraw/excalidraw) | 手绘风格的白板应用，节点和连线靠人在画布上拖拽摆放 | 一次性的草图、结构不规律的示意图；画完不打算再机械重生成 |
+| 脚本化 SVG | 自己写脚本按规则算出每个矩形 / 箭头的坐标，生成 SVG 源码 | 元素多、嵌套深、结构规律，且图会随源码（层数、子模块数）变化而重新生成 |
+
+Mermaid 的定位是「文档里嵌一段文本就能出图」，对抗的是配图与代码脱节（它自己称之为 doc-rot，文档腐化）；Excalidraw 的定位是「像在白板上画草图一样自由」。两者都不是为「元素多、嵌套深、连线多对多、还要随源码变化重新生成」这类图设计的，而本章要画的恰恰是这一类。按工程经验，这种密度下 Mermaid 的通用布局算法容易把节点挤成一团，而你几乎无法指定某个节点具体该摆在哪；Excalidraw 精确但全靠手工，模型的层数或子模块一变就得重排一遍坐标——需要说明的是，这两条属于实践中的观察，两家官方文档并没有正面承认这类局限。
+
+所以本章这几张图走第三条路——也就是 P4 那步说的 svg-diagram 渲染，把「画图」变成「编程」：Python 脚本用循环算出每个坐标（零手填坐标）→ 生成 SVG → 用 `xmllint --noout` 校验（`xmllint` 是老牌 XML 解析库 libxml2 自带的命令行工具，`--noout` 表示不打印解析出的内容、只用退出码回答「这份 SVG 是不是合法 XML」：标签闭没闭、属性引号对不对）→ 用 `rsvg-convert` 转成 PNG（GNOME 的 SVG 渲染库 librsvg 的命令行入口，把矢量图栅格化成位图；它会自动为中文字形做字体回退，排版才不乱）。布局规则写在脚本里，改一条规则整张图重新生成，产物还能被校验工具机械检查——这正是这类图最需要的性质。
 
 但 P4 不是终点。真正让这套程序「可审计」的，是最后那条**验证回边**——画完之后，拿图逐元素对回源码核一遍。判据三条，对应本章一路下来的三步：
 

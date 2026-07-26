@@ -25,7 +25,9 @@
 
 人话翻译：prefill 像一次性搬一卡车货（要大马力），decode 像每隔几秒递一个快递（要稳、要快、不能卡顿）。把卡车和快递员塞进同一条单行道，结果就是——卡车一过，所有快递的递送时延（inter-token latency，ITL）全被顶上去。一个长 prompt 的 prefill 突发，能让正在 decode 的几十个请求集体卡一下。
 
-**PD 分离**（Prefill-Decode disaggregation）的思路很直接：把这两类活儿拆到**不同的 engine**上去。这不是 vLLM 一家的发明——把 prefill 和 decode 拆到不同集群、按各自瓶颈独立配比资源，正是 DistServe（arXiv:2401.09670）系统性提出并论证的服务架构；本章要讲的 KV Connector，就是 vLLM 把这套思路落进真实调度器的产物。
+**PD 分离**（Prefill-Decode disaggregation）的思路很直接：把这两类活儿拆到**不同的 engine**上去。
+
+这不是 vLLM 一家的发明，而是一条有出处的研究脉络。在 2024 年之前，几乎所有推理引擎（早期 vLLM 也一样）都让 prefill 和 decode 挤在同一批 GPU 上、由同一个调度循环交替安排。[DistServe](https://arxiv.org/abs/2401.09670)（arXiv:2401.09670）是较早把"拆开更优"系统性论证清楚的工作之一，它的出发点正是上面那两个瓶颈：prefill 关心"多快吐出第一个 token"，decode 关心"后续每个 token 隔多久吐一个"，两个延迟目标在共置时互相打架，谁都调不好；拆到不同 GPU 后，两边可以各自独立选并行策略、独立配资源。此后 Mooncake 等一批系统沿着同一条线继续往前走（下面就会点到）。本章要讲的 KV Connector，就是 vLLM 把这条脉络里"prefill 端把 KV 递给 decode 端"这一环，落成生产级、可插拔多后端的调度器机制。
 
 - **Prefill engine** 专心算 prompt，按算力配比、独立扩缩容；
 - **Decode engine** 专心吐 token，按显存带宽配比、独立扩缩容；
@@ -33,7 +35,18 @@
 
 拆开之后，两边各按各的瓶颈调配资源，互不抖动。代价是多了一条**跨进程、甚至跨节点的 KV 搬运通道**。这条通道的统一接口，就是本章的主角：**KV Connector**。
 
-vLLM 没有把"KV 怎么搬"写死。它在 `vllm/distributed/kv_transfer/kv_connector/v1/base.py` 定义了一个抽象基类 `KVConnectorBase_V1`，让 NIXL、LMCache、Mooncake、磁盘 offloading 等十几种后端都来实现同一套契约。本章讲清楚这套契约**长什么样**、调度器（`vllm/v1/core/sched/scheduler.py`）怎么**集成**它；下一章讲 worker 侧**怎么真正搬**、各后端有何不同。
+vLLM 没有把"KV 怎么搬"写死。它在 `vllm/distributed/kv_transfer/kv_connector/v1/base.py` 定义了一个抽象基类 `KVConnectorBase_V1`，让 NIXL、LMCache、Mooncake、磁盘 offloading 等十几种后端都来实现同一套契约。
+
+这四个名字并排出现容易让人以为它们是同一档次的竞品、挑一个用就行。其实**它们分处四个完全不同的层次**，值得先各认个脸——不然后面读契约时会不明白：为什么一套接口要抽象得这么宽。
+
+- **NIXL**（NVIDIA Inference Xfer Library，NVIDIA 推理传输库）——NVIDIA 官方开源的**点对点数据搬运库**，干的事很单一：把一份数据在 GPU 显存、CPU 内存、文件/对象存储之间搬过去，统一接口、插件式支持不同传输通道，贴近 RDMA（Remote Direct Memory Access，一种绕开 CPU、让网卡直接读写对端显存/内存的网络技术）这一层。它是"管子"本身，NVIDIA 自家的 Dynamo 推理框架也用它做底层搬运。想要接近硬件极限的跨节点搬运、又不介意绑定 NVIDIA 生态时选它（[ai-dynamo/nixl](https://github.com/ai-dynamo/nixl)）。
+- **LMCache**——跑在引擎进程**之外**的一个独立守护进程（daemon，常驻后台服务），是通用的 **KV 缓存管理中间件**。它做的不只是"P 端传给 D 端"这一次搬运，还包括跨请求、跨会话地复用同一段上文的 KV（不限于必须从头对齐的前缀命中），以及把 KV 从显存逐级卸载到 CPU 内存、本地磁盘、Redis、S3 等多级存储；因为是独立进程，引擎崩了缓存还在。需求不止 P/D 传递、还想要缓存复用与冷热分层时选它（[LMCache/LMCache](https://github.com/LMCache/LMCache)）。
+- **Mooncake**——月之暗面（Moonshot AI）Kimi 线上服务实际在用的**一整套 PD 分离架构**，含全局调度器和一个横跨 GPU/CPU 内存/SSD 的分布式 KV cache 池。它属于"系统设计参考"这个量级，而不是一根管子；vLLM 接入的是它的存储层（[arXiv:2407.00079](https://arxiv.org/abs/2407.00079)）。
+- **磁盘 offloading**——最朴素的一档：KV 直接存成本地文件，没有跨节点能力。本章后面要逐行读的参考实现 `ExampleConnector` 就属于这一类，它的作用是把契约"填实"给人看，不是拿去生产的。
+
+四者的差异要到搬运侧才真正显形。此刻只需记住一句：契约之所以要抽象成后面看到的那个形状，正是因为下游挂着这样一批层次高低不一的东西。
+
+本章讲清楚这套契约**长什么样**、调度器（`vllm/v1/core/sched/scheduler.py`）怎么**集成**它；下一章讲 worker 侧**怎么真正搬**、各后端有何不同。
 
 这一章还要还一笔账。第 14 章讲调度循环时，我们见过 `waiting` 之外还有个 `skipped_waiting` 队列，专门隔离一种叫 `WAITING_FOR_REMOTE_KVS` 的阻塞态请求——当时只说"它在等远程 KV 传输"，把完整路径推给了后面。[第 14 章 §14.4](../../ch14-scheduler/narrative/chapter.md) 埋下的这条线，本章收尾：一个请求怎么进这个阻塞态、KV 到位后怎么被提升回来重新调度。
 
@@ -258,7 +271,7 @@ KVConnectorFactory.register_connector(
 # … 省略：NIXL / LMCache / Mooncake / P2pNccl / Offloading 等十余种注册 …
 ```
 
-注册表只存 `(name → 模块路径 + 类名)`，**不 import**。为什么不直接 import？因为 vLLM 支持十几种 connector，每个都拖一堆重依赖（NIXL 要 RDMA 库、LMCache 要它自己的 runtime……），且这张表还在持续增长——v0.21.0 又添了一项 `MooncakeStoreConnector`（把 KV cache 卸载到 Mooncake 分布式存储，类在 `vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.connector`——Mooncake 是月之暗面 Kimi 线上服务的 KVCache-centric 分离式架构，arXiv:2407.00079，这里接入的正是它的存储层），后端越多，"启动即全量 import"的代价越不可接受。如果启动就把它们全 import 一遍，无关重依赖会拖慢甚至拖崩进程。懒加载注册表把实际 `import_module` 推迟到 `create_connector` 真要用那一个时，只加载当前选中的后端：
+注册表只存 `(name → 模块路径 + 类名)`，**不 import**。为什么不直接 import？因为 vLLM 支持十几种 connector，每个都拖一堆重依赖（NIXL 要 RDMA 库、LMCache 要它自己的 runtime……），且这张表还在持续增长——v0.21.0 又添了一项 `MooncakeStoreConnector`（把 KV cache 卸载到 Mooncake 分布式存储，类在 `vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.connector`——接的就是 §35.1 点过的那套架构里的存储层，而不是一根点对点的传输管子），后端越多，"启动即全量 import"的代价越不可接受。如果启动就把它们全 import 一遍，无关重依赖会拖慢甚至拖崩进程。懒加载注册表把实际 `import_module` 推迟到 `create_connector` 真要用那一个时，只加载当前选中的后端：
 
 ```python
 # vllm/distributed/kv_transfer/kv_connector/factory.py:L42-L75（HMA 校验/日志已略）
@@ -315,7 +328,11 @@ KVConnectorFactory.register_connector(
 
 ### 契约怎么被填实：ExampleConnector
 
-抽象方法都是 `pass`，光看签名容易悬浮。vLLM 自带一个调试参考实现 `ExampleConnector`，把 KV cache 存/取到磁盘 safetensors 文件，给每个方法最朴素的真实落地。看它怎么实现决策侧的查命中：
+抽象方法都是 `pass`，光看签名容易悬浮。vLLM 自带一个调试参考实现 `ExampleConnector`，把 KV cache 存/取到磁盘 safetensors 文件，给每个方法最朴素的真实落地。
+
+safetensors 是 Hugging Face 出的一种**张量存盘格式**（[官方文档](https://huggingface.co/docs/safetensors/index)），如今是模型权重分发的事实标准之一。它替代的是 PyTorch 传统的 `torch.save`/`.pt` 存档——后者底层用 Python 的 `pickle`，而 `pickle` 反序列化时**能执行任意代码**，加载一个来路不明的权重文件等于在自己机器上跑陌生脚本。safetensors 换成纯数据、不含可执行逻辑的格式，加载时把文件内容直接映射成 tensor（零拷贝），既安全又快。这里它只是被当作一个"现成可靠的张量落盘方案"借来演示契约，和 PD 分离本身没有更深的关系。
+
+看它怎么实现决策侧的查命中：
 
 ```python
 # vllm/distributed/kv_transfer/kv_connector/v1/example_connector.py:L262-L290
@@ -379,6 +396,8 @@ KVConnectorFactory.register_connector(
 为什么非要隔离？设想不隔离：一个等远程 KV 的请求 R0 占着 `waiting` 队头。远程传输要 $`k`$ 个调度步才完成。那么 R0 后面排着的 $`m`$ 个本来立刻就能调度的请求，每一个都被 R0 堵着，各推迟约 $`k`$ 步才有机会——这就是**队头阻塞**（Head-of-Line blocking，HoL）。 $`m`$ 个请求白白多等 $`k`$ 步，吞吐塌缩。
 
 隔离的代价对比呢？把 R0 挪到独立的 `skipped_waiting` 后，主 `waiting` 队列继续畅通，那 $`m`$ 个请求该调度就调度。R0 自己每步只付出**一次 $`O(1)`$ 的检查**——"我在不在 `finished_recving_kv_req_ids` 里"。代价从 $`m \times k`$ 步的集体空等，压成每步一次 $`O(1)`$ 跳过。这就是双队列的全部收益。
+
+"队头阻塞"这个词不是 LLM 推理圈造的，它借自计算机网络，讲的是同一个结构。最经典的场景是包交换机：如果一台交换机对每个输入端口只维护一条 FIFO（First-In-First-Out，先进先出）队列，队列里依次排着三个包，分别要发往端口 A、B、C。此刻端口 A 正忙，队头那个"去 A"的包发不出去——于是哪怕 B、C 端口完全空闲，后面"去 B""去 C"的包也只能干等，因为 FIFO 不许插队。一个被卡住的队头，把一整队本来无关的后来者全拖住了。网络界的标准解法是给每个输出方向单独开一条队列（虚拟输出队列，Virtual Output Queuing, VOQ），让可能卡住的流量不占用公共队头。vLLM 这里用 `skipped_waiting` 把 `WAITING_FOR_REMOTE_KVS` 请求挪出主队列，是同一个思路在另一个领域的再发明——凡是"共享一条 FIFO、而队头元素可能因外部依赖卡住"的系统（TCP、HTTP/1.1 管线化、操作系统任务队列……），最后都会长出这条分流。想看词源与网络场景的完整分析，可以从[维基百科的 Head-of-line blocking 条目](https://en.wikipedia.org/wiki/Head-of-line_blocking)进去。
 
 ### 一次调度迭代的完整控制流
 

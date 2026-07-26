@@ -19,8 +19,8 @@ stop_string = req_state.detokenizer.update(
 
 为什么这件事不简单？四个坑，每个都能让输出错乱：
 
-1. **空格**。一个 token 解成什么字，取决于它两边是谁。`"▁world"` 单独解是 `"world"`，但接在 `"hello"` 后面要不要加空格，得看上下文。逐 token 解码若丢了上下文，空格就乱。
-2. **UTF-8 多字节边界**。一个中文字符在 byte-fallback tokenizer 里可能被拆到两三个 token 上。解到一半是半截字节，显示成乱码 `�`。这半个字符绝不能吐给用户。
+1. **空格**。一个 token 解成什么字，取决于它两边是谁。`"▁world"`（那个 `▁` 不是下划线，是 SentencePiece 分词器用来顶替空格的元符号，§9.5 细说）单独解是 `"world"`，但接在 `"hello"` 后面要不要加空格，得看上下文。逐 token 解码若丢了上下文，空格就乱。
+2. **UTF-8 多字节边界**。一个中文字符在 byte-fallback tokenizer（词表里没有的字符不标成"未知"，而是按 UTF-8 拆成一个个字节、用预留的字节 token 表示的分词器，§9.5 细说）里可能被拆到两三个 token 上。解到一半是半截字节，显示成乱码 `�`（U+FFFD 替换字符，解码器遇到不合法或不完整字节序列时的标准占位符）。这半个字符绝不能吐给用户。
 3. **stop string 跨 token**。stop=`"END"` 可能是 `"E"`、`"N"`、`"D"` 三个 token 才拼齐。流式输出时，你不能把可能是 stop 前缀的尾字符提前吐出去——一旦事后要截断就晚了。
 4. **min_tokens**。用户要求"至少生成 20 个 token 再允许停"。这期间就算文字里出现了 stop string，也不能停。
 
@@ -74,7 +74,11 @@ def from_new_request(
 
 **没 tokenizer，走空壳。** 有些请求根本不需要文字（比如只要 token id 喂给下游、或者纯 embedding 任务）。这时返回根类 `IncrementalDetokenizer` 本身——它只攒 token_ids，`update` 永远返回 `None`，`get_next_output_text` 永远返回空串。什么都不解码，省掉开销。
 
-**Fast tokenizer，走快路径。** 这是绝大多数请求的归宿。条件有两个，缺一不可：tokenizer 是 `PreTrainedTokenizerFast`（HuggingFace 的快速 tokenizer，底层是 Rust），且 `USE_FAST_DETOKENIZER` 为真。后者是个版本闸：
+**Fast tokenizer，走快路径。** 这是绝大多数请求的归宿。条件有两个，缺一不可：tokenizer 是 `PreTrainedTokenizerFast`，且 `USE_FAST_DETOKENIZER` 为真。
+
+先说清第一个条件在判什么。HuggingFace 的 transformers 库里，几乎每个模型的分词器都**成对存在**：一套纯 Python 实现（比如 `LlamaTokenizer`），一套底层转发给 Rust 写的 `tokenizers` 库（比如 `LlamaTokenizerFast`，它继承自 `PreTrainedTokenizerFast`）。社区管前者叫 slow、后者叫 fast——Rust 后端是 HuggingFace 在 2019 年前后为批量分词的并行加速另起的炉灶，`PreTrainedTokenizerFast` 则是 transformers 给它套的统一外壳：对外暴露和慢速版一致的 Python API，内部转发给 Rust。两者分词结果通常一致，差别在速度，以及**是否暴露底层能力**——本章要用的 `DecodeStream` 就只有 fast 版才能拿到底层 Rust 对象去调用。所以"这个 tokenizer 是不是 fast"，标准答法就是这行 `isinstance(tokenizer, PreTrainedTokenizerFast)`；两套实现的官方对照见 [HuggingFace: Fast tokenizers](https://huggingface.co/docs/transformers/en/fast_tokenizers)。
+
+第二个条件 `USE_FAST_DETOKENIZER` 是个版本闸：
 
 ```python
 # vllm/v1/engine/detokenizer.py:L22
@@ -86,7 +90,9 @@ USE_FAST_DETOKENIZER = version.parse(tokenizers.__version__) >= version.parse("0
 INVALID_PREFIX_ERR_MSG = "Invalid prefix encountered"
 ```
 
-为什么卡 0.22.0？因为快路径要用 `tokenizers` 库的 `DecodeStream`，并用它的 `ids` 参数做 **native prefill**——一次性把 prompt 喂进流里预热（细节见 §9.5）。这个 `ids` 参数是 0.22.0 才加的。版本不够，就只能退回慢路径。那个 `INVALID_PREFIX_ERR_MSG` 字符串先记一笔，它是快路径错误恢复的判别钥匙，§9.6 会用到。
+为什么卡 0.22.0？得先说清 `DecodeStream` 是什么。`tokenizers` 是 HuggingFace 用 Rust 写、给 Python 提供绑定的分词库（刚才那个 `PreTrainedTokenizerFast` 的底座正是它），批量分词是它的老本行；`DecodeStream` 则是它里面专给"流式生成"准备的一个类：它自己在内部维护一段 token 缓冲区，每来一个新 token id 就调一次 `step()`，吐出这个 token 此刻该显示的文字——**返回值可能是空串**，因为一个可显示字符可能横跨好几个 token（就是坑 2 那种 byte-fallback 情形）。换句话说，慢路径要用纯 Python 手算的那套增量逻辑（§9.5 详述），`DecodeStream` 已经在 Rust 里替你做完了。
+
+而 `ids` 参数——vLLM 注释里说的 **native prefill**——是 `tokenizers` v0.22.0 才给这个类的构造函数新加的：建流时一次性塞进一批已知 token id（这里就是 prompt）把内部状态预热好，不必再一个个 `step()` 喂进去（怎么用见 §9.6）。版本不够就没有这个入口，只能退回慢路径。想自己核实这条时间线，可对着 [tokenizers v0.22.0 的发布说明](https://github.com/huggingface/tokenizers/releases/tag/v0.22.0) 与 [Python 绑定里 `DecodeStream` 的构造签名](https://github.com/huggingface/tokenizers/blob/main/bindings/python/src/decoders.rs) 看。那个 `INVALID_PREFIX_ERR_MSG` 字符串先记一笔，它是快路径错误恢复的判别钥匙，§9.6 会用到。
 
 **其余情况，走慢路径。** 非 fast tokenizer，或者 tokenizers 太老。慢路径是纯 Python 的增量去 token 化，任何 tokenizer 都能跑，代价是慢。
 
@@ -340,6 +346,20 @@ O(\mathrm{new\_char\_count} + L)
 
 难点在开篇提过的坑 1：**tokenizer 的 `convert_tokens_to_string` 会按相邻 token 决定加不加空格**（这叫 cleanup 算法——HuggingFace tokenizer 在把 token 列表转为字符串时，用前后邻居判断要不要在 `"▁world"` 这类以下划线/空格标记开头的 token 前补一个空格）。你要是只把单个新 token 拿去解码，就丢了它和左邻右舍的关系，空格全错。
 
+那个 `▁` 值得单独说一句，因为它正是"相邻 token 决定空格"这件事的物理依据。按空格切词天然不可逆：把 `"hello world"` 切成 `["hello","world"]` 之后，你无从知道两词之间原本是恰好一个空格、还是压根没有空格。SentencePiece（Google 2018 年开源的子词分词器，Llama 系分词器的底子）的解法是在分词**之前**就把每个空格换成 `▁`（码点 U+2581，正名 Lower One Eighth Block，长得像下划线但不是下划线），让空格降格成词表里的普通字符，跟着一起参与 BPE/Unigram 切分。于是空格信息被烘焙进了 token 自身：
+
+**说明性示例**（外部记法，不是本仓源码）：
+
+```text
+原文        "hello world"
+分词        ["▁hello", "▁world"]
+拼回        "▁hello" 在句首，去掉 ▁ 得 "hello"
+            "▁world" 带 ▁ 前缀 → 先补一个空格再接 → "hello world"
+反例        若模型解出的是不带 ▁ 的 "world"，它是上一个词的延续片段，中间不加空格
+```
+
+`convert_tokens_to_string` 这类"把 token 列表拼回字符串"的函数，判断插不插空格靠的就是有没有这个 `▁` 前缀——所谓 cleanup 算法"看相邻 token"，看的正是它（官方说明见 [SentencePiece：空格被当作基本符号](https://github.com/google/sentencepiece#whitespace-is-treated-as-a-basic-symbol)）。反过来也就明白了：单拿 `"▁world"` 去解码，你不知道它前面是句首还是另一个词，插不插空格的答案完全相反。
+
 慢路径的对策是 `detokenize_incrementally`，核心是一对 offset——`prefix_offset` 和 `read_offset`——圈出一段上下文窗口。先看慢路径子类怎么调它（`vllm/v1/engine/detokenizer.py`）：
 
 ```python
@@ -480,6 +500,20 @@ if len(new_text) <= len(prefix_text) or new_text.endswith("�"):
 - `len(new_text) <= len(prefix_text)`：新 token 没让文本变长，说明它还没解出可见字符。
 - `new_text.endswith("�")`：末尾是替换字符 U+FFFD（`�`）。byte-fallback tokenizer 把一个多字节 UTF-8 字符拆到几个 token 上，解到一半就是半截字节，显示成 `�`。
 
+**byte-fallback 究竟是怎么回事？** 传统分词遇到词表外的字符（比如一个生僻汉字）只能标成 `<unk>`（unknown，未知词占位符），信息就此丢失、不可逆。byte-fallback 是 SentencePiece 提供的一个训练选项（`--byte_fallback`）：在词表末尾额外预留 256 个特殊 token，形如 `<0x00>` 到 `<0xFF>`，各对应一个字节的 256 种取值。真碰上没见过的字符，就把它的 UTF-8 编码拆成 1 到 4 个字节，逐字节映射到这些字节 token 上——于是任何字符都能被完整、可逆地表示，代价是它要占掉好几个 token。Llama、Mistral 等主流开源模型的分词器都开着这个选项（[HuggingFace 的 Llama 文档](https://huggingface.co/docs/transformers/model_doc/llama)明写其 tokenizer "uses notably ByteFallback"，选项本身见 [SentencePiece 选项文档](https://github.com/google/sentencepiece/blob/master/doc/options.md)）。模型自回归生成时也是一个字节 token 一个字节 token 地吐，一个汉字就被摊到了相邻好几步里：
+
+**说明性示例**（外部记法，不是本仓源码）：
+
+```text
+"你" 的 UTF-8 编码    E4 BD A0（三字节）
+byte-fallback 编成    <0xE4> <0xBD> <0xA0> 三个 token
+第 1 步吐 <0xE4>      解 b'\xe4'          → 凑不齐合法字符 → �
+第 2 步吐 <0xBD>      解 b'\xe4\xbd'      → 还差一个字节   → 仍是 �
+第 3 步吐 <0xA0>      解 b'\xe4\xbd\xa0'  → 三字节齐       → "你"
+```
+
+而那个 `�` 就是 Unicode 标准里的 U+FFFD REPLACEMENT CHARACTER：解码器碰到不合法或不完整的字节序列时，不崩溃也不报错，而是按标准建议用它占坑（Python 里 `b'\xe4\xbd'.decode('utf-8', errors='replace')` 返回的正是一个 `�`）。它本身是个合法码点，住在 Unicode 的 Specials 特殊符号区块（[官方码表](https://www.unicode.org/charts/PDF/UFFF0.pdf)），只是被业界约定俗成地当成"这段字节没解出来"的信号——`detokenize_incrementally` 借的正是这个约定。
+
 关键判断是**末尾**：末尾的 `�` 意味着"字节序列还没拼完"，应当等下一个 token 补全，所以吐空串、按兵不动（offset 不变，下次还从这儿接着解）。而**中间**的 `�` 才是模型真生成了一个非法 id——那不归这里管。
 
 **省略说明**：上面省掉了一个 `else` 分支（非 fast 且带 added vocab 的 tokenizer）。它把 added token 切出来逐段拼接，但对 offset 和 UTF-8 逻辑而言行为等价，只是写法绕，本章按主线 fast / 无 added-vocab 路径讲。
@@ -515,7 +549,9 @@ self.stream = tokenizers.decoders.DecodeStream(
 
 prompt 一次性喂进流里预热，之后只喂新 token。这正是 §9.1 那个版本闸卡 0.22.0 的原因——`ids` 参数那时才有。
 
-> **v0.21.0 更新**：注意这里写的是全名 `tokenizers.decoders.DecodeStream(...)` 而非裸名 `DecodeStream`——后面错误恢复时重建解码流（`vllm/v1/engine/detokenizer.py:L243` 附近）也是同样写法，模块导入相应由 `from tokenizers.decoders import DecodeStream` 改成 `import tokenizers.decoders`。区别在于：裸名会在导入期被绑死成一个局部名，谁先 import 谁说了算；按模块属性解析后，像 fastokens（一个可替换/加速 `tokenizers` 后端实现的第三方库）这类后端在运行期替换 `tokenizers.decoders.DecodeStream` 的 shim 才会被尊重，不再受 import 顺序影响。`FastIncrementalDetokenizer` 的流式语义不变，只是把底层解码流实现从"导入期绑死"放开为"可热替换"。
+> **v0.21.0 更新**：注意这里写的是全名 `tokenizers.decoders.DecodeStream(...)` 而非裸名 `DecodeStream`——后面错误恢复时重建解码流（`vllm/v1/engine/detokenizer.py:L243` 附近）也是同样写法，模块导入相应由 `from tokenizers.decoders import DecodeStream` 改成 `import tokenizers.decoders`。区别在于：裸名会在导入期被绑死成一个局部名，谁先 import 谁说了算；按模块属性解析后，像 fastokens 这类第三方后端在运行期替换 `tokenizers.decoders.DecodeStream` 的 shim（垫片：运行期把某个名字换成另一份实现的薄封装）才会被尊重，不再受 import 顺序影响。`FastIncrementalDetokenizer` 的流式语义不变，只是把底层解码流实现从"导入期绑死"放开为"可热替换"。
+>
+> 顺带说说注释里点名的 fastokens 是什么：它是 Crusoe Cloud 开源的第三方 Rust 分词库（[crusoecloud/fastokens](https://github.com/crusoecloud/fastokens)），读的是同一份 `tokenizer.json`（HuggingFace 分词器的标准序列化文件，词表 + 合并规则都在里面）、编码结果与 HuggingFace `tokenizers` 对齐，主打用并行预分词加并行 BPE 把编码吞吐拉上去——agentic、RAG 这类超长 prompt 场景里，分词本身会变成首 token 延迟里不小的一块；解码这一侧它目前仍交回 HuggingFace `tokenizers`（NVIDIA Dynamo 的文档把它定位成 [drop-in 替换](https://docs.nvidia.com/dynamo/dev/user-guides/fastokens-tokenizer)，加载失败自动回退）。这里点它的名，是**举例说明这行写法留了热替换的口子**这个设计考量本身——并不等于 vLLM 主线已把某个第三方后端做成了开箱即用的功能：vLLM 仓库里就有一条文档 issue 指出，被写进文档的相关开关在当时版本的代码里其实并不存在（[vllm-project/vllm#43446](https://github.com/vllm-project/vllm/issues/43446)）。
 
 解码就是调 `step`（`vllm/v1/engine/detokenizer.py`）：
 
