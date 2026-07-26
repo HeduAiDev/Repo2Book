@@ -184,134 +184,240 @@ def cross_links(model, cid, cur_sub):
     return out
 
 
-def build(model, cid):
-    """渲染第 cid 章的架构剖面。
+def plan_panel(cls, st_map, rel, width):
+    """把本章组件排成**有组织关系的架构**，而不是一列类名。
 
-    形态（用户 2026-07-26 指定，参照其给出的 vLLM 架构图）：**自顶向下的架构分层 + 组件盒**，
-    全书同一张图；本章只是它的一个**更细粒度的切片**——本章所属组件就地展开成若干类，
-    本章站点标在这些类上。不是文件级调用图。
+    用户 2026-07-26：参考图表达的是「各模块的相互作用与组织关系」，靠列举类名表现不出来。
+    于是按源码抽到的真实关系分三种角色排版：
+      · 契约(contract)：被 >=2 个类继承的基类 → 画成**容器盒**，实现类嵌在里面
+        （对应参考图里 Backend 底下并排挂 Flash/Blocksparse/Ipex/Rocm 那种结构）
+      · 持有者(owner) ：有 has-a 指向别人的类 → 左列，画箭头指向被持有者
+      · 其余          ：左列普通盒
+    """
+    is_a, has_a = rel.get('is_a', []), rel.get('has_a', [])
+    names = {c['name']: c for c in cls}
+
+    def canon(n):
+        for k in names:
+            if n == k or n in [x.strip() for x in re.split(r'[/（(]', k)]:
+                return k
+        return None
+
+    kids = OrderedDict()
+    for a, b in is_a:
+        ca, cb = canon(a), canon(b)
+        if ca and cb and ca != cb:
+            kids.setdefault(cb, [])
+            if not any(x[0] == a for x in kids[cb]):
+                kids[cb].append((a, ca))      # (源码真实类名, 所属 key_class 条目)
+    contracts = OrderedDict((k, v) for k, v in kids.items() if len(v) >= 2)
+    inside = {ck for v in contracts.values() for _, ck in v} | set(contracts)
+    left = [c for c in cls if c['name'] not in inside]
+    owns = OrderedDict()
+    for a, b in has_a:
+        ca, cb = canon(a), canon(b)
+        if ca and cb and ca != cb and cb in contracts:
+            owns.setdefault(ca, [])
+            if cb not in owns[ca]:
+                owns[ca].append(cb)
+    return {'left': left, 'contracts': contracts, 'owns': owns, 'inside': inside}
+
+
+def build(model, cid):
+    """渲染第 cid 章的架构剖面 —— **第 1 章那张「一个请求的端到端旅程」长大后的样子**。
+
+    骨架与 ch01 图一一对应（入口两扇门 → InputProcessor → IPC → EngineCore 大框 → OutputProcessor），
+    EngineCore 是容器，后续章节把新组件装进去；本章的组件就地展开成源码里的真实组织关系
+    （契约 + 实现 + 持有），站点标在组件上。
     """
     idx = _chapter_index(cid)
     ch = model['chapters'][cid]
     cur_sub = ch['subsystem']
     subs = {s['id']: s for s in model['levels']['L2_subsystems']}
-    layers = model['levels']['layers']
+    rows = model['levels']['layers']
+    cgroups = model['levels']['core_groups']
     spine = ch['spine']
 
     W, M = 1180, 24
-    LBL = 104                       # 左侧层标签宽
-    CW, CH_, CG = 132, 34, 9        # 折叠组件盒
-    L = []
-    y = 92
-    boxpos = {}
+    L, boxpos, bands = [], {}, []
+    y = 96
+    CW, CH_, CG = 138, 34, 9
 
     cls, st_map = (pick_classes(model, cid, cur_sub, spine) if cur_sub else ([], {}))
     covered = sorted({i for v in st_map.values() for i in v})
+    pan = plan_panel(cls, st_map, ch.get('relations', {}), W) if cls else None
+    in_core = bool(cur_sub) and cur_sub in {s for g in cgroups for s in g['subsystems']}
 
-    text(L, M, y - 16, '架构分层（自顶向下）｜蓝＝前面章节已读，橙＝本章展开，虚线＝后续章节才讲',
-         11.5, C_MUTE, anchor='start')
+    def state(sid):
+        s_ = subs.get(sid)
+        if not s_:
+            return None
+        if sid == cur_sub:
+            return 'cur'
+        return 'built' if _chapter_index(s_['opened_in']) < idx else 'todo'
 
-    RG = 40                         # 右侧关系箭头通道
-    inner_w = W - 2 * M - LBL - RG
-    for lay in layers:
-        members = [subs[s] for s in lay['subsystems'] if s in subs]
-        if not members:
-            continue
-        others = [s for s in members if s['id'] != cur_sub]
-        has_cur = any(s['id'] == cur_sub for s in members)
-        per_row = max(1, int((inner_w + CG) // (CW + CG)))
-        rows = (len(others) + per_row - 1) // per_row if others else 0
-        exp_h = 0
-        if has_cur and cls:
-            ccols = 2 if len(cls) > 5 else 1
-            crows = (len(cls) + ccols - 1) // ccols
-            exp_h = 26 + crows * 30 + 10
-        band_h = max(CH_ + 16, rows * (CH_ + CG) + 8 + exp_h + (8 if exp_h and rows else 0))
+    def comp(x, cy, sid, w=CW):
+        st = state(sid)
+        f_, k_ = colors(st)
+        box(L, x, cy, w, CH_, f_, k_, dash=(st == 'todo'), r=6, sw=1.3)
+        fit(L, x + w / 2, cy + 15, subs[sid]['name_cn'], w - 10, 10.5, C_TXT)
+        n_ch = subs[sid]['opened_in'].replace('ch', '')
+        fit(L, x + w / 2, cy + 27, (f'第 {n_ch} 章已读' if st == 'built' else f'第 {n_ch} 章才讲'),
+            w - 10, 8.8, C_MUTE)
+        boxpos[sid] = (x, cy, w, CH_)
 
-        L.append(f'<rect x="{M}" y="{y:.1f}" width="{W - 2 * M}" height="{band_h:.1f}" rx="8" '
-                 f'fill="#f8fafc" stroke="#e2e8f0" stroke-width="1"/>')
-        text(L, M + 12, y + 20, lay['name'], 11.5, C_TXT, anchor='start', bold=True)
-        text(L, M + 12, y + 34, lay['code'], 9.5, C_MUTE, anchor='start')
+    def panel_h():
+        if not pan:
+            return 0
+        lh = 30 + len(pan['left']) * 30
+        rh = 30 + sum(24 + ((len(v) + 1) // 2) * 22 + 8 for v in pan['contracts'].values())
+        return max(lh, rh) + 10
 
-        x0 = M + LBL
-        for i, s in enumerate(others):
-            r, c = divmod(i, per_row)
-            x = x0 + c * (CW + CG)
-            cy = y + 8 + r * (CH_ + CG)
-            built = _chapter_index(s['opened_in']) < idx
-            f_, k_ = (C_BUILT_F, C_BUILT_S) if built else (C_TODO_F, C_TODO_S)
-            box(L, x, cy, CW, CH_, f_, k_, dash=not built, r=6, sw=1.3)
-            fit(L, x + CW / 2, cy + 15, s['name_cn'], CW - 10, 10.5, C_TXT, bold=False)
-            n_ch = s['opened_in'].replace('ch', '')
-            fit(L, x + CW / 2, cy + 27, (f'第 {n_ch} 章已读' if built else f'第 {n_ch} 章才讲'),
-                CW - 10, 8.8, C_MUTE)
-            boxpos[s['id']] = (x, cy, CW, CH_, y + band_h)
-
-        if has_cur and cls:
-            ey = y + 8 + rows * (CH_ + CG) + (8 if rows else 0)
-            ccols = 2 if len(cls) > 5 else 1
-            crows = (len(cls) + ccols - 1) // ccols
-            chip_w = (inner_w - (ccols - 1) * 10) / ccols
-            ew = inner_w
-            box(L, x0, ey, ew, exp_h, '#fff7ed', C_CUR_S, r=7, sw=2.0)
-            boxpos[cur_sub] = (x0, ey, ew, exp_h, y + band_h)
-            cur_name = subs[cur_sub]['name_cn']
-            text(L, x0 + 12, ey + 17, f'{cur_name}　← 本章展开', 11.5, C_CUR_S,
-                 anchor='start', bold=True)
-            text(L, x0 + ew - 12, ey + 17,
-                 f'本章 {len(spine)} 站，其中 {len(covered)} 站落在下列组件上',
-                 9.5, C_MUTE, anchor='end')
-            for i, c in enumerate(cls):
-                cc, cr = (i % ccols, i // ccols) if ccols > 1 else (0, i)
-                cx = x0 + 10 + cc * (chip_w + 10)
-                cy2 = ey + 26 + cr * 30
-                isnew = c['introduced_in'] == cid
-                f_, k_ = (C_CUR_F, C_CUR_S) if isnew else (C_BUILT_F, C_BUILT_S)
-                box(L, cx, cy2, chip_w - 20, 26, f_, k_, r=5, sw=1.3)
-                ids = st_map.get(c['name'], [])
-                badge = f'第 {rng(ids)} 站' if ids else ''
-                bw_ = tw(badge, 9, True) + 10 if badge else 0
-                fit(L, cx + 8, cy2 + 17, short(c['name']), chip_w - 40 - bw_, 10, C_TXT,
-                    bold=isnew, anchor='start')
-                if badge:
-                    text(L, cx + chip_w - 28, cy2 + 17, badge, 9, C_CUR_S, anchor='end', bold=True)
-                if not isnew:
-                    text(L, cx + chip_w - 28 - bw_, cy2 + 17,
-                         f"第 {c['introduced_in'].replace('ch','')} 章", 8.2, C_MUTE, anchor='end')
-        y += band_h + 9
-
-    # ---- 关系箭头：本章结构如何接到前面已读的结构上 ----
-    links = cross_links(model, cid, cur_sub) if cur_sub else {}
-    if cur_sub in boxpos:
-        tx, ty, tw_, th, _tb = boxpos[cur_sub]
-        tright = tx + tw_
-        for k, (other, info) in enumerate(links.items()):
-            if other not in boxpos:
+    def draw_panel(px, py, pw):
+        box(L, px, py, pw, panel_h(), '#fff7ed', C_CUR_S, r=7, sw=2.0)
+        boxpos[cur_sub] = (px, py, pw, panel_h())
+        text(L, px + 12, py + 18, f"{subs[cur_sub]['name_cn']}　← 本章展开", 11.5, C_CUR_S,
+             anchor='start', bold=True)
+        text(L, px + pw - 12, py + 18,
+             f'本章 {len(spine)} 站，其中 {len(covered)} 站落在下列组件上', 9.3, C_MUTE, anchor='end')
+        has_r = bool(pan['contracts'])
+        LW = (pw - 30) * (0.42 if has_r else 1.0)
+        RW = (pw - 30) - LW - (10 if has_r else 0)
+        lx0, rx0 = px + 10, px + 10 + LW + 20
+        lpos, rpos = {}, {}
+        for i, c in enumerate(pan['left']):
+            cy2 = py + 29 + i * 30
+            isnew = c['introduced_in'] == cid
+            f_, k_ = (C_CUR_F, C_CUR_S) if isnew else (C_BUILT_F, C_BUILT_S)
+            box(L, lx0, cy2, LW, 26, f_, k_, r=5, sw=1.3)
+            ids = st_map.get(c['name'], [])
+            bd = f'第 {rng(ids)} 站' if ids else ''
+            fit(L, lx0 + 8, cy2 + 17, short(c['name']),
+                LW - 20 - (tw(bd, 9, True) + 8 if bd else 0), 10, C_TXT, bold=isnew, anchor='start')
+            if bd:
+                text(L, lx0 + LW - 8, cy2 + 17, bd, 9, C_CUR_S, anchor='end', bold=True)
+            lpos[c['name']] = (lx0, cy2, LW, 26)
+        ry = py + 29
+        for ct, members in pan['contracts'].items():
+            mrows = (len(members) + 1) // 2
+            hh = 24 + mrows * 22 + 8
+            box(L, rx0, ry, RW, hh, '#ffffff', C_CUR_S, r=6, sw=1.5)
+            ids = st_map.get(ct, [])
+            fit(L, rx0 + 8, ry + 16, short(ct) + '（契约）', RW - 96, 10, C_CUR_S, bold=True,
+                anchor='start')
+            if ids:
+                text(L, rx0 + RW - 8, ry + 16, f'第 {rng(ids)} 站', 9, C_CUR_S, anchor='end',
+                     bold=True)
+            mw = (RW - 24) / 2
+            for j, (real, key) in enumerate(members):
+                mx = rx0 + 8 + (j % 2) * (mw + 8)
+                my = ry + 24 + (j // 2) * 22
+                box(L, mx, my, mw, 19, '#fff7ed', '#fdba74', r=4, sw=1.1)
+                # 站号只标在**真正对应该实现**的那一站上：key_classes 常把
+                # 'XgrammarBackend / XgrammarGrammar' 并成一条，直接套用会让两个实现都印同样的站号。
+                # ⚠️ key_classes 常把 'XgrammarBackend / XgrammarGrammar' 并成一条,
+                # 直接套用会让两个实现都印上同一串站号(实测 XgrammarGrammar 被误标 9-10 站,
+                # 而 9-10 其实属于 Backend)。改为按源码精确归属:显式类名前缀 > 该类自有方法名。
+                # ⚠️ 两道坑都踩过,故归属规则必须同时看**类名前缀**和**文件**:
+                #   ① key_classes 把 'XgrammarBackend / XgrammarGrammar' 并成一条 →
+                #      直接套用会让两个实现都印同一串站号(XgrammarGrammar 被误标 9-10 站)。
+                #   ② 只按方法名归属又会误伤:compile_grammar 四个后端各有一份 →
+                #      站 10 会同时印到 Guidance/Outlines/LMFormatEnforcer 上,而它其实在 backend_xgrammar.py。
+                _rel = ch.get('relations', {})
+                meth = set((_rel.get('methods') or {}).get(real, []))
+                rfile = (_rel.get('files') or {}).get(real)
+                mids = []
+                for _i, _u in enumerate(spine, 1):
+                    _sym = _u.get('symbol') or ''
+                    if not _sym:
+                        continue
+                    if _sym.split('.')[0] == real:
+                        mids.append(_i)
+                    elif _sym in meth and rfile and _u['path'] == rfile:
+                        mids.append(_i)
+                mb = f'第 {rng(mids)} 站' if mids else ''
+                fit(L, mx + 6, my + 13, real,
+                    mw - 14 - (tw(mb, 8.2, True) + 6 if mb else 0), 9, C_TXT, anchor='start')
+                if mb:
+                    text(L, mx + mw - 5, my + 13, mb, 8.2, C_CUR_S, anchor='end', bold=True)
+            rpos[ct] = (rx0, ry, RW, hh)
+            ry += hh + 8
+        for owner, targets in pan['owns'].items():
+            if owner not in lpos:
                 continue
-            ax, ay, aw, ah, abot = boxpos[other]
-            chx = tright + 10 + k * 11       # 右侧通道，逐条错开，避开层标签与组件盒
-            # 从源盒**底边**出发、走**层带之间的空隙**再上/下到目标 ——
-            # 不能在组件行的中线上横穿:实测那条线会直接穿过「IPC 边界」「ModelRunner 执行」
-            # 等无关组件盒,读者会误以为它们参与其中。
-            sx = ax + aw / 2
-            gy = abot + 4.5
-            ey2 = ty + th / 2
-            m_end = ' marker-end="url(#a2)"'
-            m_st = ' marker-start="url(#a2s)"' if info['both'] else ''
-            L.append(f'<path d="M{sx:.1f},{ay + ah:.1f} L{sx:.1f},{gy:.1f} L{chx:.1f},{gy:.1f} '
-                     f'L{chx:.1f},{ey2:.1f} L{tright:.1f},{ey2:.1f}" fill="none" '
-                     f'stroke="{C_CUR_S}" stroke-width="1.5"{m_st}{m_end}/>')
-            # 说「交接」而非只给站号:这些站号是**控制权移交发生的那一站**,
-            # 与「某组件内部停了哪几站」是两回事,不加限定词读者会混淆。
-            text(L, chx - 7, gy - 4, f'第 {rng(info["stations"])} 站交接', 8.8, C_CUR_S,
-                 anchor='end', bold=True)
+            ox, oy, ow, oh = lpos[owner]
+            for t in targets:
+                if t not in rpos:
+                    continue
+                tx2, ty2, tw2, th2 = rpos[t]
+                sy2, ey3 = oy + oh / 2, ty2 + th2 / 2
+                mx = ox + ow + 9
+                L.append(f'<path d="M{ox + ow:.1f},{sy2:.1f} L{mx:.1f},{sy2:.1f} L{mx:.1f},{ey3:.1f} '
+                         f'L{tx2:.1f},{ey3:.1f}" fill="none" stroke="{C_CUR_S}" stroke-width="1.4" '
+                         f'marker-end="url(#a2)"/>')
 
-    H = y + 46
-    ly = H - 26
+    text(L, M, y - 16, '这张图是第 1 章那张「一个请求的端到端旅程」长大后的样子：'
+                       '蓝＝前面章节已读，橙＝本章新增，虚线＝后续章节才讲', 11.2, C_MUTE, anchor='start')
+
+    for row in rows:
+        members = [s for s in row['subsystems'] if s in subs]
+        is_core = row['id'] == 'core'
+        rh = CH_ + 22
+        if is_core:
+            gh = []
+            for g in cgroups:
+                ms = [s for s in g['subsystems'] if s in subs]
+                exp_here = in_core and cur_sub in ms
+                cols = max(1, min(4, len(ms)))
+                gr = (len(ms) + cols - 1) // cols
+                h = 20 + gr * (CH_ + 6) + 8 + (panel_h() + 8 if exp_here else 0)
+                gh.append((g, ms, h, exp_here, cols))
+            rh = 30 + CH_ + 10 + sum(h for _, _, h, _, _ in gh) + 8 * len(gh) + 6
+        elif any(s == cur_sub for s in members):
+            rh = CH_ + 22 + panel_h() + 8
+
+        box(L, M, y, W - 2 * M, rh, '#f8fafc' if not is_core else '#fffdf7',
+            '#e2e8f0' if not is_core else '#f5c98a', r=8, sw=1.0 if not is_core else 1.8)
+        fit(L, M + 12, y + 18, row['name'], W - 2 * M - 24, 11.5,
+            C_TXT if not is_core else '#b45309', bold=True, anchor='start')
+
+        if is_core:
+            gy = y + 30
+            for g, ms, h, exp_here, cols in gh:
+                box(L, M + 14, gy, W - 2 * M - 28, h, '#ffffff', '#e2e8f0', r=6, sw=1.1)
+                text(L, M + 24, gy + 14, g['name'], 10, C_MUTE, anchor='start')
+                gw = (W - 2 * M - 28 - 20 - (cols - 1) * 8) / cols
+                for i, sid in enumerate(ms):
+                    if sid == cur_sub and exp_here:
+                        continue
+                    r_, c_ = divmod(i, cols)
+                    comp(M + 24 + c_ * (gw + 8), gy + 20 + r_ * (CH_ + 6), sid, gw)
+                if exp_here:
+                    draw_panel(M + 24, gy + h - panel_h() - 6, W - 2 * M - 48)
+                gy += h + 8
+        else:
+            x = M + 14
+            for sid in members:
+                if sid == cur_sub and pan:
+                    continue
+                comp(x, y + 26, sid)
+                x += CW + CG
+            if any(s == cur_sub for s in members) and pan:
+                draw_panel(M + 14, y + 26 + CH_ + 8, W - 2 * M - 28)
+
+        bands.append((row['id'], y, rh))
+        if row is not rows[-1]:
+            cx = M + (W - 2 * M) / 2
+            L.append(f'<path d="M{cx},{y + rh:.1f} L{cx},{y + rh + 13:.1f}" stroke="#94a3b8" '
+                     f'stroke-width="1.6" marker-end="url(#a)"/>')
+        y += rh + 18
+
+    H = y + 40
+    ly = H - 22
+    lx = M
     items = [(C_BUILT_F, C_BUILT_S, '前面章节已读（带章号）', False),
              (C_CUR_F, C_CUR_S, '本章新增的结构', False),
              (C_TODO_F, C_TODO_S, '后续章节才讲', True)]
-    lx = M
     for f_, k_, lab, dash in items:
         box(L, lx, ly - 11, 16, 13, f_, k_, dash=dash, r=3, sw=1.2)
         text(L, lx + 22, ly, lab, 10.2, C_MUTE, anchor='start')
@@ -322,23 +428,18 @@ def build(model, cid):
 
     n_built = len([s for s in model['levels']['L2_subsystems']
                    if _chapter_index(s['opened_in']) < idx])
-    title = (f"你的架构模型读到第 {idx} 章：{n_built} 个组件已读，本章展开「"
-             f"{subs[cur_sub]['name_cn']}」" if cur_sub
-             else f"你的架构模型读到第 {idx} 章：全景导览")
+    title = (f"你的架构模型读到第 {idx} 章：{n_built} 个组件已读，本章展开「{subs[cur_sub]['name_cn']}」"
+             if cur_sub else f"你的架构模型读到第 {idx} 章：全景导览")
     head = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H:.0f}">',
             '<defs>'
             f'<marker id="a" viewBox="0 0 10 6" refX="9" refY="3" markerWidth="6" markerHeight="4" '
-            f'orient="auto"><path d="M0,0 L10,3 L0,6 Z" fill="{C_MUTE}"/></marker>'
+            f'orient="auto"><path d="M0,0 L10,3 L0,6 Z" fill="#94a3b8"/></marker>'
             f'<marker id="a2" viewBox="0 0 10 6" refX="9" refY="3" markerWidth="6" markerHeight="4" '
             f'orient="auto"><path d="M0,0 L10,3 L0,6 Z" fill="{C_CUR_S}"/></marker>'
-            f'<marker id="a2s" viewBox="0 0 10 6" refX="1" refY="3" markerWidth="6" markerHeight="4" '
-            f'orient="auto"><path d="M10,0 L0,3 L10,6 Z" fill="{C_CUR_S}"/></marker>'
             '</defs>',
             f'<rect width="{W}" height="{H:.0f}" fill="white"/>']
-    head.append(f'<text x="{M}" y="32" font-family="sans-serif" font-size="16" fill="{C_TXT}" '
+    head.append(f'<text x="{M}" y="34" font-family="sans-serif" font-size="16" fill="{C_TXT}" '
                 f'font-weight="bold">{esc(title)}</text>')
-    head.append(f'<text x="{M}" y="51" font-family="sans-serif" font-size="11" fill="{C_MUTE}">'
-                f'{esc("整本书共用这一张架构图：每章在已铺好的结构上长出新的一块，并标出本章站点落在哪些组件上")}</text>')
     return '\n'.join(head + L + ['</svg>'])
 
 
