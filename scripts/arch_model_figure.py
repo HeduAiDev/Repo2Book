@@ -207,7 +207,7 @@ def build(model, cid):
     # ---------- Tier 4: 本章走线（按目录归并成站组）----------
     sg = spine_groups(spine)
     y4 = 350
-    text(L, M, y4 - 12, f'③ 本章走线共 {len(spine)} 站，落在这些模块里（站号即正文出现顺序）',
+    text(L, M, y4 - 12, f'③ 本章走线共 {len(spine)} 站，落在这些模块里（站号＝请求流经代码的顺序）',
          11.5, C_MUTE, anchor='start')
     rh, rgap = 34, 7
     panel_h = len(sg) * rh + (len(sg) - 1) * rgap + 20
