@@ -1,0 +1,271 @@
+{
+  "chapter": "ch20",
+  "title": "标准 MHA 的 NPU 内核与状态机：AscendAttentionBackendImpl",
+  "researched_at": "2026-07-26",
+  "pin_anchor": "vllm-ascend v0.21.0rc1（commit 80610e44，release notes 日期 2026-06-16）；配套基座 vLLM v0.21.0；本仓 installation.md 的配套依赖表指向 CANN 9.0.0。外部算子文档以「Ascend Extension for PyTorch 7.2.0」API 参考为准（最接近该 CANN 代际的公开文档），凡版本敏感处已在条目内注明。",
+  "scope_note": "本章大量出现的 PagedAttention（ch17）、MHA/GQA/MLA（ch17）、FRACTAL_NZ（ch18）、CUDAGraphMode 五个取值含 FULL_DECODE_ONLY（ch16）、ACL Graph 图捕获（ch01/ch16）、投机解码（ch16）、pinned memory（ch13）、workspace 的 ATB 视角（ch14）、A2/A3/310P/A5 硬件代际标签（ch14）、C8 命名（ch04）均已在前面章节的 research 里查过，本章不重复立条，writer 直接回指即可；本条目只收本章新出现、且前面没查过的外部背景。",
+
+  "concepts": [
+    {
+      "id": "fia-operator",
+      "term": "`npu_fused_infer_attention_score`（FIA，昇腾的「融合推理注意力」算子）",
+      "kind": "external_project",
+      "one_line": "昇腾把「prefill 用的全量注意力算子」和「decode 用的增量注意力算子」合并成的一个新算子——一个入口通吃两种形态，本章 fused-infer 那条主干调的就是它。",
+      "what_it_is": "CANN 算子库里的推理侧注意力融合算子，torch_npu 把它暴露成 `torch_npu.npu_fused_infer_attention_score`。官方定义原话：「适配增量&全量推理场景的 FlashAttention 算子，既可以支持全量计算场景（PromptFlashAttention），也可支持增量计算场景（IncreFlashAttention）」。\n\n三个要点，读者抓住就够：\n1. **fused（融合）指什么**：把 QK^T → scale → mask → softmax → PV 这一串压进一次 kernel 调用，而不是拆成几个算子来回读写显存——和 FlashAttention 的算子融合思路同源。\n2. **一个算子两种形态**：走哪条内部分支不用调用方指定，文档说「当 Query 矩阵的 S 为 1，进入 IncreFlashAttention 分支，其余场景进入 PromptFlashAttention 分支」。\n3. **自带 PageAttention**：给了合法的 `block_table` + `block_size`，它就能直接从分页 KV cache 里按块取历史 K/V；文档原话「PageAttention 的使能必要条件是 block_table 存在且有效」。所以它并不是「只会算 prefill」的算子。",
+      "background": "昇腾早期是两个独立算子各管一段：`npu_prompt_flash_attention`（PFA，全量/prefill）与 `npu_incre_flash_attention`（IFA，增量/decode），调用方得自己判断这一批是哪种形态、去调哪个 API。FIA 是这两者的合并版，参数面因此比任何一方都大（PageAttention、KV 伪量化、MLA 的解耦 RoPE、attention sink 全塞得下）。\n\n它在 C++ aclnn 层还有一条明确的版本线：CANN 9.0.0 的版本说明里写着「aclnnFusedInferAttentionScore/aclnnFusedInferAttentionScoreV2/aclnnFusedInferAttentionScoreV3 接口废弃，替换为：aclnnFusedInferAttentionScoreV4」，并注明「将在 2027 年 3 月 30 日之后的版本删除」。这就是为什么 Python 侧同时存在 `npu_fused_infer_attention_score` 与 `npu_fused_infer_attention_score_v2` 两个入口——后者是同一算子的新版签名，多出 `query_rope`/`key_rope`（MLA 的解耦 RoPE）、`learnable_sink`（attention sink）、KV 伪量化的 scale/offset 等参数。",
+      "example": "官方文档给的最小调用（说明性、外部；等长定长的教科书形态，便于和本章的变长用法对照）：\n\n```python\n# query: (B=1, N=8, S=164, D=128)；key/value: (1, 8, 1024, 128)，float16\nout = torch_npu.npu_fused_infer_attention_score(\n    q, k, v,\n    num_heads=8,\n    input_layout=\"BNSD\",   # 定长布局：S 是真实的一根轴，短序列得 padding\n    scale=1.0 / math.sqrt(128),\n)\n```\n\n本章的用法只在两处不同，但意味完全变了：\n\n```python\n# 变长打平 + 分页 KV\ntorch_npu.npu_fused_infer_attention_score(\n    query=query, key=key, value=value,\n    input_layout=\"TND\",                       # ① 不再有 B/S 两根轴，全部打平成 T\n    actual_seq_lengths=[1, 2, 7, 14],         #    因此必须另给前缀和边界\n    actual_seq_lengths_kv=[...],\n    block_table=block_table, block_size=128,  # ② KV 不是连续张量，而是分页 cache 里按块取\n    num_heads=..., num_key_value_heads=...,   #    两者不等即 GQA（回指 ch17）\n    scale=self.scale, sparse_mode=3,\n)\n```\n\n把 ①② 两行去掉，它就退化成上面那个教科书调用——这正是「一个算子通吃各种形态」的具体含义。",
+      "links": [
+        "https://www.hiascend.com/document/detail/zh/Pytorch/720/apiref/torchnpuCustomsapi/context/torch_npu-npu_fused_infer_attention_score.md",
+        "https://www.hiascend.com/document/detail/zh/Pytorch/720/apiref/torchnpuCustomsapi/context/torch_npu-npu_fused_infer_attention_score_v2.md",
+        "https://www.hiascend.com/document/detail/zh/canncommercial/900/releasenote/release-notes.md"
+      ],
+      "sources": [
+        {"url": "https://www.hiascend.com/document/detail/zh/Pytorch/720/apiref/torchnpuCustomsapi/context/torch_npu-npu_fused_infer_attention_score.md", "note": "torch_npu 7.2.0 官方 API 页：取到算子功能原话「适配增量&全量推理场景的FlashAttention算子，既可以支持全量计算场景（PromptFlashAttention），也可支持增量计算场景（IncreFlashAttention）」、input_layout 取值含 TND、sparse_mode 取值表、block_table/block_size 说明、支持 Atlas A2/A3 系列。访问于 2026-07-26。"},
+        {"url": "https://www.hiascend.com/document/detail/zh/Pytorch/600/apiref/apilist/ptaoplist_000144.html", "note": "torch_npu 6.0.0（旧一代）同名算子页：取到「当Query矩阵的S为1，进入IncreFlashAttention分支，其余场景进入PromptFlashAttention分支」与「PageAttention 的使能必要条件是 block_table 存在且有效」，并可见早期版本 input_layout 尚不含 TND——TND 是后来加的，构成版本敏感证据。访问于 2026-07-26。"},
+        {"url": "https://www.hiascend.com/document/detail/zh/Pytorch/720/apiref/torchnpuCustomsapi/context/torch_npu-npu_fused_infer_attention_score_v2.md", "note": "torch_npu 7.2.0 的 v2 页：取到 v2 相对 v1 新增的参数族（query_rope/key_rope 的 MLA RoPE、learnable_sink、KV 伪量化 dequant_scale/offset、inner_precise 等）。访问于 2026-07-26。"},
+        {"url": "https://www.hiascend.com/document/detail/zh/canncommercial/900/releasenote/release-notes.md", "note": "CANN 商用版 9.0.0 版本说明：取到「aclnnFusedInferAttentionScore/aclnnFusedInferAttentionScoreV2/aclnnFusedInferAttentionScoreV3接口废弃，替换为：aclnnFusedInferAttentionScoreV4」与「将在2027年3月30日之后的版本删除」。访问于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§20.6 讲「先说清 fused（融合）是什么意思」时，把官方那句定义摆出来最省力：它本来就是 PFA+IFA 合体、Q_S=1 自动走增量分支——这正解释了为什么昇腾这条主干能四态通吃。`_v2` 只需一句「同一算子的新版签名，多带 MLA rope / learnable_sink 等参数」。一个别说错的点：不要写成「FIA 只管 prefill、paged 才管 decode」——FIA 自己就内建 PageAttention 且能吃 Q_S=1，两条路径的取舍另有原因（见 competing set 那条）。aclnn V1–V3 废弃、V4 接棒的版本线留给链接。"
+    },
+
+    {
+      "id": "input-layout-tnd",
+      "term": "`input_layout=\"TND\"` 与 `actual_seq_lengths`（昇腾算子的变长打包记法）",
+      "kind": "notation",
+      "one_line": "TND 不是什么高深布局，就是「把一批里所有序列的 token 首尾相接摞成一根长条」，再用一串**前缀和**告诉算子每条序列在长条上到哪儿为止。",
+      "what_it_is": "昇腾的注意力算子用一个字符串参数 `input_layout` 声明输入张量的轴顺序，字母都是缩写：\n\n- **B** = batch（几条序列）\n- **S** = sequence length（序列长）\n- **N** = number of heads（头数）\n- **D** = head dim（每个头的维度）\n- **H** = hidden（H = N × D，头维打平在一起）\n- **T** = token 总数（打平后的第 0 轴长度）\n\n常见取值 `BSH`/`BSND`/`BNSD` 都要求「一批里各序列等长」——因为 S 是一个实打实的张量维度，短序列必须 padding 补齐。`TND` 是变长版：第 0 轴不再是 batch，而是 T = Σ 各序列长度，一批序列首尾相接摞成一根长条。\n\n既然轴上看不出边界了，就必须另给一个数组说明边界：`actual_seq_lengths`（query 侧）与 `actual_seq_lengths_kv`（KV 侧）。**关键约定：TND 下这个数组给的是前缀和，不是每条序列各自的长度。** torch_npu 7.2.0 文档原话：「该入参中每个元素的值表示当前 Batch 与之前所有 Batch 的 Sequence Length 和，因此后一个元素的值必须大于等于前一个元素的值」。\n\n还有一处同名参数两种语义的分叉值得记住：`actual_seq_lengths_kv` 只有在 KV 也按 TND 打平时才是前缀和；一旦传了 `block_table` 开启 PageAttention，文档改口——「必须开启 page attention，此时长度等于 batch 值，代表每个 batch 的实际长度，值不大于 KV_S」，即回到「每序列各自的 KV 长度」。",
+      "example": "**官方最小例子**（说明性、外部；出自 torch_npu 训练侧同族算子 `npu_fusion_attention` 的 TND 说明，FIA 的 TND 沿用同一约定）：\n\n```\n真实序列长度列表：   2  2  2  2  2\nactual_seq_qlen 传： 2  4  6  8  10\n```\n\n逐项读：五条序列各长 2，打平后 T = 10；数组第 i 项 = 前 i+1 条序列的长度之和，也就是第 i 条序列在长条上的**右边界**。\n\n**套到本章 §20.3 那一批** `query_lens = [1, 1, 5, 7]`（说明性推演）：\n\n```\nT = 1 + 1 + 5 + 7 = 14                # query 张量第 0 轴的长度\nactual_seq_lengths_q = [1, 2, 7, 14]  # 前缀和 = 各序列右边界\n                        ↑  ↑  ↑   ↑\n                     req0 req1 req2 req3\n\n长条上的占位：req0 → [0,1)   req1 → [1,2)   req2 → [2,7)   req3 → [7,14)\n```\n\n这就是为什么源码里 `num_tokens = attn_metadata.actual_seq_lengths_q[-1]`——最后一项天然等于 T。",
+      "background": "「不 padding、把变长序列打平 + 另给边界数组」不是昇腾独创，GPU 侧 flash-attn 的 `cu_seqlens` 是同一件事（见下一条 `varlen-cu-seqlens`），更早可以追到 BERT 时代的 unpadded 实现。差别只在记法细节：昇腾的前缀和数组长度 = batch 数、不带前导 0；flash-attn 的 `cu_seqlens` 长度 = batch + 1、第一项恒为 0。另需注意版本：早一代（torch_npu 6.0 系）的 FIA 文档里 `input_layout` 只有 BSH/BSND/BNSD/BNSD_BSND，TND 是后来才加进这个推理算子的。",
+      "links": [
+        "https://www.hiascend.com/document/detail/zh/Pytorch/720/apiref/torchnpuCustomsapi/context/torch_npu-npu_fused_infer_attention_score.md",
+        "https://www.hiascend.com/doc_center/source/zh/Pytorch/60RC1/apiref/apilist/ptaoplist_000742.html"
+      ],
+      "sources": [
+        {"url": "https://www.hiascend.com/doc_center/source/zh/Pytorch/60RC1/apiref/apilist/ptaoplist_000742.html", "note": "torch_npu.npu_fusion_attention 官方页：取到 input_layout 支持「BSH、SBH、BSND、BNSD、TND」，以及 actual_seq_qlen 的定义「query 每个 S 的累加和长度」与那个可核的最小例子「比如真正的S长度列表为：2 2 2 2 2 则actual_seq_qlen传：2 4 6 8 10」。访问于 2026-07-26。"},
+        {"url": "https://www.hiascend.com/document/detail/zh/Pytorch/720/apiref/torchnpuCustomsapi/context/torch_npu-npu_fused_infer_attention_score.md", "note": "torch_npu 7.2.0 FIA 页：取到 input_layout 取值含 TND/TND_NTD/NTD_TND 与字母含义；TND 下 actual_seq_lengths(_kv) 的前缀和定义原话；以及「开启 page attention 时…代表每个 batch 的实际长度，值不大于 KV_S」这一语义切换。访问于 2026-07-26。"},
+        {"url": "https://www.hiascend.com/document/detail/zh/Pytorch/600/apiref/apilist/ptaoplist_000144.html", "note": "torch_npu 6.0.0 FIA 页：input_layout 仅列 BSH/BSND/BNSD/BNSD_BSND，用作「TND 是后加的」版本敏感证据。访问于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§20.6「第二，`input_layout=\"TND\"` 是变长的关键」那段建议补两件事：(1) 先把字母含义摆一行（T/N/D 各是什么、BSH 为什么必须 padding），再用官方 `2 2 2 2 2 → 2 4 6 8 10` 那个例子把「前缀和」落地，然后接现有的 `[1,1,5,7]` 算账，衔接非常顺；(2) 点破 `actual_seq_lengths_kv` 的两种语义（TND 打平时=前缀和、开 PageAttention 时=每序列实际长度）——这正好解释了 §20.6 `_get_fia_params` 里 PrefillNoCache 传 `actual_seq_lengths_q`、其余三态传 `seq_lens_list` 的不对称，目前正文完全没解释这处，是个现成的「讲透」点。"
+    },
+
+    {
+      "id": "varlen-cu-seqlens",
+      "term": "`cu_seqlens`（CUDA 侧 flash-attn 的变长边界记法）与 `flash_attn_varlen_func`",
+      "kind": "notation",
+      "one_line": "GPU 上做同一件「不 padding、把变长序列摞成长条」的事时用的记法——本章说 TND「等价于 cu_seqlens」，指的就是它；但两边差着一个前导 0。",
+      "what_it_is": "`flash_attn_varlen_func` 是 flash-attn 的变长入口，`varlen` = variable length。它的 docstring 把约定说得很直白：\n\n- `q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.`——query 是打平的，第 0 轴是整批的 token 总数，没有 batch 轴。\n- `cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths ...`——`cu` = cumulative（累积）。长度是 batch + 1，第一项恒为 0，第 i 条序列占 `[cu_seqlens_q[i], cu_seqlens_q[i+1])`。\n- 另外还要传 `max_seqlen_q`（批内最长），kernel 据此分块；`causal`（是否因果）；`window_size=(left, right)`（滑窗）。\n\n和昇腾侧的 TND 完全同构，只差记法：昇腾的 `actual_seq_lengths_q` 不带前导 0。",
+      "example": "同一批 `query_lens = [1, 1, 5, 7]`，两边并排（说明性对照）：\n\n```\nCUDA 侧（vLLM 基座）  cu_seqlens_q         = [0, 1, 2, 7, 14]   长度 = batch+1，带前导 0\n昇腾侧（vllm-ascend） actual_seq_lengths_q = [   1, 2, 7, 14]   长度 = batch，无前导 0\n```\n\n信息量完全相同：后者 = 前者砍掉首元素。对照本章 `build()` 里那行 `actual_seq_lengths_q=query_start_loc_cpu[1:].tolist()`——`query_start_loc` 本来就是 `cu_seqlens` 形状（带 0 的前缀和），`[1:]` 正是那一刀。读者由此可以自己验证：`query_start_loc = [0,1,2,7,14]` → `[1:]` → `[1,2,7,14]`，与上面的 TND 数组逐位相等。\n\n唯一不能对上号的是 `max_seqlen_q`：昇腾 FIA 没有这个入参（分块策略由算子内部据前缀和自己定）。",
+      "background": "`cu_seqlens` 这套「打平 + indptr」记法在 GPU 生态里高度通用：FlashInfer 的 ragged tensor 用 `indptr`、xformers 的 BlockDiagonalMask 也是等价物，形式上就是稀疏矩阵 CSR 的 indptr（行指针）。vLLM 侧 `query_start_loc` 这个名字也来自同一族。",
+      "links": [
+        "https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/flash_attn_interface.py",
+        "https://github.com/vllm-project/flash-attention"
+      ],
+      "sources": [
+        {"url": "https://raw.githubusercontent.com/Dao-AILab/flash-attention/main/flash_attn/flash_attn_interface.py", "note": "Dao-AILab flash-attention main 分支源文件：逐字取到 flash_attn_varlen_func docstring 的 `q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.`、`cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths`、`max_seqlen_q: int. Maximum query sequence length in the batch.`、causal 与 window_size 的说明。访问于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§20.7 那句「`cu_seqlens_q/k`（变长边界）→ `actual_seq_lengths_q/kv` + `input_layout=\"TND\"`。换了名字，同一个概念」可以更硬一点：并排给出两个数组、点破「差一个前导 0，那一刀就是源码里的 `[1:]`」。同时别把话说满——`max_seqlen_q` 在昇腾侧没有对应入参，说「同一个概念」而不是「一一对应的签名」。cu_seqlens 的完整 docstring 留给链接。"
+    },
+
+    {
+      "id": "sparse-mode-and-2048-mask",
+      "term": "`sparse_mode` 取值表，以及那张 2048×2048 压缩 mask 的来历",
+      "kind": "notation",
+      "one_line": "`sparse_mode` 是一个整数，替算子回答「这一批用哪种遮罩」；而源码里那张看着像随手挑的 2048×2048 上三角 int8 矩阵，其实是 CANN 为这些模式规定的**标准件尺寸**。",
+      "what_it_is": "**取值表**（torch_npu 7.2.0 FIA 文档）：\n\n| 值 | 名字 | 含义与 mask 要求 |\n|---|---|---|\n| 0 | defaultMask | 不传 `atten_mask` 就不做遮罩；传了则要完整的 S1×S2 矩阵 |\n| 1 | allMask | 必须传完整的 S1×S2 矩阵 |\n| 2 | leftUpCausal | 以**左上顶点**划分的下三角；传「优化后的压缩矩阵（2048×2048）」 |\n| 3 | rightDownCausal | 以**右（下）顶点**划分的下三角；同样传 2048×2048 压缩矩阵 |\n| 4 | band | 只算 `pre_tokens` 与 `next_tokens` 之间的带状区域；同样传 2048×2048 |\n| 5–8 | prefix / global / dilated / block_local | 文档标注「暂不支持」 |\n\n**三个初学者一定会卡住的点：**\n\n1. **为什么是 2048**：因为 sparse_mode = 2/3/4 不吃真实尺寸的 mask，只吃一张固定的「优化后的压缩下三角矩阵（2048×2048）」——真实序列多长都传这一张，算子内部按模式自己推导实际遮罩。所以 mask 工厂造一次、尺寸恒为 2048，不是拍脑袋定的缓存大小，是按算子规格造标准件。\n2. **1 还是 0 表示遮住**：官方 `atten_mask` 说明写得很清楚——「取值为 1 代表该位不参与计算（不生效），为 0 代表该位参与计算」。\n3. **2 和 3 差在哪**：只有当 query 段长度 ≠ KV 长度时才显形。leftUpCausal 把因果三角的直角顶点对齐到左上角；rightDownCausal 对齐到右下角。decode / chunked prefill 里 query 只有一小段、KV 是整段历史，「第 i 个新 token 能看到全部历史 + 到自己为止」这件事必须按右下角对齐才对——这就是本章选 3 而不是 2 的原因。\n\n`pre_tokens` / `next_tokens` 只有 band 模式（4）用得上，文档定义：`pre_tokens` 表示 attention 需要和前几个 Token 计算关联，`next_tokens` 表示和后几个。滑动窗口即 `pre_tokens = window`、`next_tokens = 0`。",
+      "example": "**官方推荐的压缩 mask 构造**（说明性、外部；出自昇腾《PyTorch 训练模型迁移调优指南》FlashAttentionScore 章节）：\n\n```python\natten_mask_npu = torch.triu(torch.ones([2048, 2048]), diagonal=1).bool().to(device)\n```\n\n逐段读：\n- `torch.ones([2048, 2048])` —— 先铺一张全 1 的方阵；\n- `torch.triu(..., diagonal=1)` —— 只保留**严格上三角**（对角线以上），对角线及以下清 0；\n- `1 = 不参与计算` —— 于是「每个 query 位置看不到排在它后面的 token」，正是因果遮罩。\n\n对照本章 `get_splitfuse_attn_mask()` 里那行 `torch.triu(torch.ones(2048, 2048), diagonal=1).to(torch.int8)`——除了 dtype 用 int8 而非 bool，与官方示例逐字一致。这不是巧合，是照规格造件。\n\n**band 模式的一行直觉**（sparse_mode=4，滑窗）：`pre_tokens=4, next_tokens=0` 时，第 i 个 query 只与 `[i-4, i]` 这几个 KV 位置关联，遮罩形状从「下三角」收窄成「贴着对角线的一条带」。",
+      "background": "「用一个整数选 mask 语义 + 传一张固定尺寸压缩件」是昇腾 FlashAttentionScore 系列算子一贯的设计：完整 mask 是 S1×S2，长序列下光是这张矩阵就能吃掉大量显存与带宽；压缩件把它降成常数开销。文档还给了反向建议：当全网 `atten_mask` 相同且 shape 小于 2048×2048 时，反而推荐用 defaultMask 模式以省显存。",
+      "links": [
+        "https://www.hiascend.com/document/detail/zh/Pytorch/720/apiref/torchnpuCustomsapi/context/torch_npu-npu_fused_infer_attention_score.md",
+        "https://www.hiascend.com/document/detail/zh/Pytorch/60RC1/ptmoddevg/trainingmigrguide/performance_tuning_0027.html"
+      ],
+      "sources": [
+        {"url": "https://www.hiascend.com/document/detail/zh/Pytorch/720/apiref/torchnpuCustomsapi/context/torch_npu-npu_fused_infer_attention_score.md", "note": "torch_npu 7.2.0 FIA 页：取到 sparse_mode 0/1/2/3/4 的名字与 mask 要求、5–8「暂不支持」、2/3/4 需「优化后的压缩下三角矩阵（2048×2048）」。访问于 2026-07-26。"},
+        {"url": "https://www.mindspore.cn/docs/en/r2.7.0/api_python/ops/mindspore.ops.fused_infer_attention_score.html", "note": "MindSpore 2.7.0 同一 CANN 算子的英文 API 页（交叉印证）：0 defaultMask / 1 allMask / 2 leftUpCausal / 3 rightDownCausal「the lower triangular scenario divided by the right vertex」/ 4 band「the part between counting pre_tokens and next_tokens」，以及 pre_tokens/next_tokens 默认 2147483647。访问于 2026-07-26。"},
+        {"url": "https://www.hiascend.com/document/detail/zh/Pytorch/60RC1/ptmoddevg/trainingmigrguide/performance_tuning_0027.html", "note": "昇腾《PyTorch 训练模型迁移调优指南》FlashAttentionScore 章节：取到官方压缩 mask 构造代码 `atten_mask_npu = torch.triu(torch.ones([2048, 2048]), diagonal=1).bool().to(device)`、sparse_mode 2/3/4 均需 2048×2048 压缩矩阵、以及「全网 atten_mask 相同且 shape 小于 2048*2048 时推荐 defaultMask 省显存」的建议。访问于 2026-07-26。"},
+        {"url": "https://www.hiascend.com/doc_center/source/zh/Pytorch/60RC3/apiref/apilist/ptaoplist_000762.html", "note": "torch_npu.npu_fusion_attention 页的 atten_mask 参数说明：取到「取值为1代表该位不参与计算（不生效），为0代表该位参与计算」这一遮罩取值语义。访问于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "这是本章最值钱的一条。§20.6「第一，`sparse_mode` 编码 mask 语义」建议补三处：(1) 给出完整取值表（含 1=allMask、5–8 暂不支持），并把 3 的准确名字点出来——rightDownCausal，「以右下顶点对齐的因果三角」，顺势解释 Q 段短、KV 长时为什么必须右下对齐；(2) **把 2048 的来历讲透**：CANN 对 sparse_mode 2/3/4 规定就传这张固定 2048×2048 压缩件，官方示例代码与源码那行逐字一致——这把「@singleton 缓存 2048×2048」从「一个省心小优化」升级成「按算子规格造标准件」，§20.6 结尾那句「这是个很省心的小优化」值得据此改写；(3) 一句 `1=遮蔽 / 0=参与`。注意别把读者绕晕：正文说的「上三角」讲的是张量长相，文档说的「压缩下三角矩阵」讲的是保留计算的区域，两者不矛盾，最好用一句话说明白。"
+    },
+
+    {
+      "id": "torch-npu-two-namespaces",
+      "term": "torch_npu 算子的两块门牌：`_npu_xxx`（下划线内部算子）与 `npu_xxx`（公开 API）",
+      "kind": "custom_pattern",
+      "one_line": "本章调的算子有的带下划线、有的不带——这不是命名风格随意，而是两条来源不同的算子线：带下划线的多是 op-plugin 里由 ATB 实现、官方 API 文档里查不到的内部算子。",
+      "what_it_is": "torch_npu（Ascend Extension for PyTorch）负责把 CANN 的算子暴露给 PyTorch，自定义算子统一在 Ascend/op-plugin 仓注册。落到使用者眼里大体两类：\n\n1. **公开自定义 API（`torch_npu.npu_xxx`）**：在昇腾官方《API 参考》里有独立文档页，写明参数、约束、支持的产品型号，底层多为 aclnn（AOL 算子加速库）接口。本章的 `npu_fused_infer_attention_score` 属这一类。\n2. **内部算子（`torch_npu._npu_xxx`，下划线开头）**：同样注册进 torch_npu 可以直接调，但一般不出现在 API 参考里；本章用到的 `_npu_reshape_and_cache`、`_npu_paged_attention`、`_npu_paged_attention_get_workspace`，以及 310P 那条路上的 `_npu_paged_attention_splitfuse` 都是。其中 `_npu_paged_attention` 已一手核实是由 ATB（Ascend Transformer Boost，昇腾 Transformer 加速库，见 ch14）实现的。\n\n实用推论（对读者很有用）：**在昇腾官方 API 文档里搜 `_npu_paged_attention` 大概率搜不到**——要看它到底吃哪些参数，只能去读 op-plugin 源码或 ATB 侧文档。社区里「昇腾算子接口类型太多、找不到 API」正是常见困惑。",
+      "example": "`_npu_paged_attention` 在 op-plugin 里的落地文件是 `op_plugin/ops/atb/PagedAttentionAtb.cpp`（说明性、外部源码），两行足以看清血统：\n\n```cpp\n// 注册：Python 侧 torch_npu._npu_paged_attention 绑到这个实现\nm.impl(\"_npu_paged_attention\", TORCH_FN(atb::_npu_paged_attention));\n\n// 执行：最终交给 ATB 的 PagedAttentionOperation\nRunAtbCmd(opPaged, paramsetter, \"PagedAttentionOperation\");\n```\n\n中间还能看到 `atb::infer::PagedAttentionParam`（ATB 的参数结构体）、`OpParamCache<PagedAttentionParam>`（参数缓存）、`ParamSetter().Input(...).Output(...)`（输入输出装配）——一条典型的 ATB 调用链。\n\n对照之下，`npu_fused_infer_attention_score` 有自己的官方文档页（参数表、sparse_mode 取值、支持型号一应俱全）。同一段 Python 代码里的两个算子，文档待遇天差地别，原因就在这块门牌上。",
+      "background": "ATB 是华为面向 Transformer 的加速库（本书 ch14 已介绍），很多推理常用融合算子先在 ATB 落地、再由 op-plugin 包成 torch_npu 的自定义算子给 PyTorch 用；aclnn/AOL 则是 CANN 的通用单算子加速库，走公开 API 路线。两条线并存，是「算子供给来自不同层」的自然结果。",
+      "links": [
+        "https://gitee.com/ascend/op-plugin",
+        "https://www.hiascend.com/document/detail/zh/Pytorch/720/apiref/torchnpuCustomsapi/context/torch_npu-npu_fused_infer_attention_score.md"
+      ],
+      "sources": [
+        {"url": "https://raw.giteeusercontent.com/ascend/op-plugin/raw/master/op_plugin/ops/atb/PagedAttentionAtb.cpp", "note": "Ascend/op-plugin 仓 master 分支源文件 op_plugin/ops/atb/PagedAttentionAtb.cpp：逐字确认 `m.impl(\"_npu_paged_attention\", TORCH_FN(atb::_npu_paged_attention));` 的注册行，以及 atb::infer::PagedAttentionParam / OpParamCache / ParamSetter / `RunAtbCmd(opPaged, paramsetter, \"PagedAttentionOperation\")` 的 ATB 调用链。访问于 2026-07-26。"},
+        {"url": "https://gitee.com/ascend/op-plugin/blob/604edfd2797af6de4efa3a2799b78b37d289f696/test/test_custom_ops/test_atb_paged_attention_splitfuse.py", "note": "op-plugin 仓 test/test_custom_ops/ 下的 ATB 算子测试文件名 test_atb_paged_attention_splitfuse.py：佐证下划线系列（含 splitfuse 变体）属 op-plugin 的 ATB 自定义算子。经搜索结果确认文件存在与路径，网页直取被 gitee 拒（HTTP 405），故此条为「路径与文件名已确认、内容未逐字核」。访问于 2026-07-26。"},
+        {"url": "https://github.com/vllm-project/vllm-ascend/issues/962", "note": "vllm-ascend issue《[Usage]: how to find ascend ops api, Too many interface types》：作为「昇腾算子接口分散、使用者难以定位公开文档」这一现象的社区佐证。访问于 2026-07-26（经搜索结果确认标题）。"}
+      ],
+      "confidence": "medium",
+      "writer_note": "§20.4 落到 `torch_npu._npu_reshape_and_cache` 那一拍、或 §20.6 两条算子并列处，插一句把这件事点破（读者一定会好奇为什么有的算子带下划线、为什么查不到文档）：下划线的是 op-plugin 里的内部算子、很多由 ATB 实现、官方 API 参考里没有独立页；不带下划线的是有文档页的公开 API。**口径要收紧**：只说本章这几个（已核实的是 `_npu_paged_attention` 走 ATB），别断言「所有下划线算子都是 ATB 实现」或「所有下划线算子都没文档」——那是归纳、不是官方明文规定。ATB 本体回指 ch14。"
+    },
+
+    {
+      "id": "aclnn-two-stage-workspace",
+      "term": "aclnn 的「两段式接口」与 workspace（`*_get_workspace` 是从哪冒出来的）",
+      "kind": "external_concept",
+      "one_line": "CANN 规定：每个算子都要先被问一句「你要多大草稿纸」，由调用方掏钱买好再执行——`_npu_paged_attention_get_workspace` 就是这条规矩漏到 Python 层的样子。",
+      "what_it_is": "CANN 的单算子 API（aclnn / AOL 算子加速库）统一是**两段式接口**：\n\n```c\n// 第一段：只算「要多少 workspace」，外加一个装着计算流程的 executor\naclnnStatus aclnnXxxGetWorkspaceSize(<算子入参...>, uint64_t *workspaceSize, aclOpExecutor **executor);\n\n// 第二段：把申请好的 workspace 指针交进去，真正执行\naclnnStatus aclnnXxx(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream);\n```\n\n官方措辞：「每个算子分为两段式接口，必须先调用 `aclnnXxxGetWorkspaceSize` 接口获取计算所需 workspace 大小以及包含了算子计算流程的执行器，再调用 `aclnnXxx` 接口执行计算」。workspace 就是算子**除输入输出之外**、在 device 上临时要用的那块内存（本书 ch14 称之为「算子的草稿纸」）；标准流程是「量大小 → `aclrtMalloc` 申请 → 交给第二段执行」。\n\n**一处要防止讲过头的对照**：「workspace 由调用方申请」并不是昇腾独有。NVIDIA 的 cuDNN 同样是这套路子——`cudnnGetConvolutionForwardWorkspaceSize` 查大小、`cudaMalloc` 申请、再把 `void* workspace` 和 `size_t workspaceSizeInBytes` 一起传给卷积函数；算法不需要草稿纸时返回 0。真正的差别是两点：**覆盖面**（CANN 把两段式定成所有 aclnn 算子的统一调用约定，而不是个别算子的特例）和**可见度**（PyTorch 层平时把两段封在一次 Python 调用里，你根本看不见；只有在图捕获这种「录制期不能临时分配显存」的场合，才必须把第一段提前拎到 Python 层显式跑一次、把结果缓存起来）。",
+      "example": "**C 侧的规矩长这样**（说明性、外部；`Xxx` 换成任一算子名都成立）：\n\n```c\nuint64_t workspaceSize = 0;\naclOpExecutor *executor = nullptr;\n\n// 第一段：只量大小，不算结果\naclnnXxxGetWorkspaceSize(/* 算子入参… */, &workspaceSize, &executor);\n\n// 中间：调用方自己掏钱买草稿纸\nvoid *workspace = nullptr;\nif (workspaceSize > 0) { aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST); }\n\n// 第二段：把草稿纸交进去，真正执行\naclnnXxx(workspace, workspaceSize, executor, stream);\n```\n\n**Python 侧平时看不到它**，因为 torch_npu 把两段封在一次调用里；本章 §20.7 那个 `*_get_workspace` 就是「第一段被单独拎出来」的样子——入参与真算子**一模一样**（同样的 query/key_cache/value_cache/block_table/context_lens），区别只在于它只回答「要多大」，不产出注意力结果。量出来的大小按 `num_tokens` 缓存，之后同形状的调用直接复用，不必再量一次。\n\n为什么图捕获非这么做不可：图捕获要求录制期间不发生临时显存分配（分配动作没法被录进图、每次重放地址还可能变），所以必须在录制之前把 workspace 备好。",
+      "background": "同一套哲学在 ATB 侧的另一副面孔是 `CreateOperation → Setup（算 workspace 大小）→ aclrtMalloc → Execute`（本书 ch14 已用 ATB 这条讲过 workspace 是什么）。往上看，这属于「资源与计算分离」的通用做法：提前知道内存需求，就能避免执行期分配失败，也便于内存池化与复用。",
+      "links": [
+        "https://www.hiascend.com/document/detail/zh/canncommercial/800/apiref/aolapi/context/aclnnStd.md",
+        "https://docs.nvidia.com/deeplearning/cudnn/latest/api/cudnn-cnn-library.html"
+      ],
+      "sources": [
+        {"url": "https://www.hiascend.com/document/detail/zh/canncommercial/800/apiref/aolapi/context/aclnnStd.md", "note": "CANN 商用版 8.0.0《aclnnStd》算子页：取到两段式接口的官方措辞「每个算子分为两段式接口，必须先调用 aclnnStdGetWorkspaceSize 接口获取计算所需 workspace 大小以及包含了算子计算流程的执行器，再调用 aclnnStd 接口执行计算」，以及两段签名的参数构成（第二段收 workspace / workspaceSize / executor / stream）。访问于 2026-07-26。"},
+        {"url": "https://www.hiascend.com/document/detail/zh/canncommercial/63RC2/inferapplicationdev/aclcppdevg/aclcppdevg_03_0196.html", "note": "CANN《单算子 API 执行》aclnnConvolution 页（经搜索摘要取得）：两段式接口定义 `aclnnStatus aclnnXxxGetWorkspaceSize(..., uint64_t *workspaceSize, aclOpExecutor **executor)` 与 `aclnnStatus aclnnXxx(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream)`，以及「先算大小 → 按 workspaceSize 申请 device 内存 → 调第二段」的流程。页面正文 WebFetch 只取到导航壳，故此条依据检索摘要，标注为未逐字一手核。访问于 2026-07-26。"},
+        {"url": "https://docs.nvidia.com/deeplearning/cudnn/latest/api/cudnn-cnn-library.html", "note": "cuDNN 官方 API 文档（cudnn_cnn library）：确认 cudnnGetConvolutionForwardWorkspaceSize 这一「查大小 → 自行 cudaMalloc → 把 workspace 指针与字节数传给卷积函数」的调用者分配模式，用作「workspace 非昇腾独有」的反例。访问于 2026-07-26（经检索结果确认该 API 属官方 cuDNN CNN 库）。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§20.7「workspace 预取：NPU 算子的特有节拍」现在写的是「CUDA 内核的暂存显存（workspace）由内核内部自管，调用方不操心」——这句会被懂 CUDA 的读者抓住：cuDNN 就是 `cudnnGetConvolutionForwardWorkspaceSize` 查大小、调用方 `cudaMalloc`。建议改成更准的口径：workspace 本身不是 NPU 特产，特别之处是 CANN 把「两段式」定成**所有** aclnn 算子的统一约定，且 PyTorch 层平时替你封住了，只有图捕获（录制期不能临时分配）逼它在 Python 层显形。这样「NPU 特有节拍」的叙事不但没削弱，反而站得更稳。两段式签名可以摆一小段 C 伪码，读者立刻看懂 `*_get_workspace` 是什么。ATB 版的 Setup/Execute 回指 ch14。"
+    },
+
+    {
+      "id": "splitfuse-name",
+      "term": "splitfuse（`get_splitfuse_attn_mask` 里那个词）",
+      "kind": "external_concept",
+      "one_line": "splitfuse 就是 chunked prefill 的另一个名字——「把长 prompt 切块（split）、再和解码 token 拼进同一次 forward（fuse）」；昇腾生态干脆把这个词用成了算子名和 mask 名。",
+      "what_it_is": "读者在 `get_splitfuse_attn_mask()` 这个方法名上卡住是很正常的：它既不是 PyTorch 的词，也不是 vLLM 的词。\n\n词源是 DeepSpeed-FastGen 的 **Dynamic SplitFuse**：一种「token 组合策略」——长 prompt 被拆成小块、分散到多次 forward，只有最后一次真正产出 token；短 prompt 则被拼起来凑满一个目标 token 预算，好让每次 forward 的规模稳定对齐。同一思想的论文先声是 **SARATHI** 的 chunked-prefills + decode-maximal batching：把 prefill 切成等长块，一批里放一个 prefill 块、其余槽位塞满 decode，decode 就「搭便车（piggyback）」跟着算完。DeepSpeed-FastGen 论文自己也点了名：「A similar approach has been proposed in Sarathi」。\n\nvLLM 生态把这件事叫 chunked prefill（本章 `AscendAttentionState.ChunkedPrefill` 正是这一态）；昇腾生态则沿用了 splitfuse 这个叫法——torch_npu 里真有 `_npu_paged_attention_splitfuse` 这个算子（op-plugin 的 ATB 自定义算子测试文件就叫 `test_atb_paged_attention_splitfuse.py`）。\n\n所以 `get_splitfuse_attn_mask()` 读作：**「给混批（分块 prefill 与 decode 同处一批）用的那张遮罩」**。",
+      "background": "为什么要 split + fuse：纯 prefill 批能把算力打满但会拖长解码请求的延迟；纯 decode 批则是访存受限、算力大量闲置。把两者混进同一次 forward，既吃满算力又压住 decode 的尾延迟。收益量级（论文自报）：SARATHI 在 LLaMA-13B/A6000 上 decode 吞吐最高 10x、端到端最高 1.33x；DeepSpeed-FastGen 报有效吞吐最高 2.3x、平均延迟低 2x、token 级尾延迟最高低 3.7x（对比当时的 vLLM）。",
+      "links": [
+        "https://arxiv.org/abs/2308.16369",
+        "https://arxiv.org/abs/2401.08671"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/abs/2308.16369", "note": "SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills（2023-08-31，Agrawal 等）：取到 chunked-prefills + decode-maximal batching 的定义与收益数字（LLaMA-13B/A6000 decode 吞吐最高 10x、端到端最高 1.33x）。访问于 2026-07-26。"},
+        {"url": "https://arxiv.org/abs/2401.08671", "note": "DeepSpeed-FastGen: High-throughput Text Generation for LLMs via MII and DeepSpeed-Inference（arXiv:2401.08671）：取到 Dynamic SplitFuse 的定义（长 prompt 分块跨多次 forward、只有最后一次产出；短 prompt 拼满 token 预算）、与 Sarathi 的关系表述，以及 2.3x 有效吞吐 / 2x 平均延迟 / 3.7x 尾延迟的自报收益。访问于 2026-07-26。"},
+        {"url": "https://gitee.com/ascend/op-plugin/blob/604edfd2797af6de4efa3a2799b78b37d289f696/test/test_custom_ops/test_atb_paged_attention_splitfuse.py", "note": "op-plugin 的 ATB 自定义算子测试文件名 test_atb_paged_attention_splitfuse.py，佐证 `_npu_paged_attention_splitfuse` 是昇腾侧真实存在的算子名（文件路径经搜索确认，正文未逐字取）。访问于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§20.6 引 `get_splitfuse_attn_mask` 时给一到两句词源：splitfuse = chunked prefill 的别名，词出 DeepSpeed-FastGen 的 Dynamic SplitFuse、思想先声是 SARATHI；昇腾生态把它用成了算子名（310P 那条路上真有 `_npu_paged_attention_splitfuse`）。这样读者不会误以为是本仓自造词，也顺带把「为什么要把 prefill 切块和 decode 混批」的动机补上（正文目前只说 ChunkedPrefill 是「分块 prefill 与 decode 混在一批」，没说为什么值得这么干）。两篇论文留链接，别展开收益数字之外的实现细节。"
+    },
+
+    {
+      "id": "flashattention-family",
+      "term": "FlashAttention 家族，以及 vLLM 实际用的是哪一支",
+      "kind": "external_concept",
+      "one_line": "本章反复说「昇腾要顶替的那个 CUDA flash 内核」——它具体是 vLLM 自家 fork 的 flash-attn，而且会按 GPU 代际在 FA2 / FA3 / FA4 之间自动挑一支。",
+      "what_it_is": "家族谱系（按发表顺序）：\n\n- **FlashAttention**（arXiv:2205.14135，《FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness》）：不改注意力的数学，改访存——Q/K/V 分块搬进片上 SRAM，用在线 softmax 分块递推地累加输出，全程不物化 N×N 分数矩阵。\n- **FlashAttention-2**（arXiv:2307.08691，《Faster Attention with Better Parallelism and Work Partitioning》）：重排并行策略与 warp 间的工作划分。\n- **FlashAttention-3**（arXiv:2407.08608，《Fast and Accurate Attention with Asynchrony and Low-precision》）：吃 Hopper 的异步能力（warp specialization、TMA），并支持 FP8 低精度。\n- **FlashAttention-4**（2026-03 发布，arXiv:2603.05451）：为 Blackwell 重写，用 NVIDIA CUTLASS 的 CuTe-DSL 实现；据第三方复现报道，B200 上约 1605 TFLOP/s。\n\n落到 vLLM：基座并不直接依赖 Dao-AILab 的发行包，而是自家 fork（Python 侧命名空间 `vllm.vllm_flash_attn`，仓库 vllm-project/flash-attention），并由 `get_flash_attn_version` 按设备算力自动挑版本（Hopper 9.x → FA3、Blackwell 10.x → FA4、其余 → FA2）。所以严格说，「昇腾顶替的那条 CUDA 内核」= vLLM fork 版 flash-attn 的变长前向。",
+      "background": "为什么昇腾无法直接复用：这些 kernel 是深度绑定 NVIDIA 硬件特性的 CUDA/CUTLASS 代码（Tensor Core 指令、TMA、warp specialization、CuTe DSL），换一种加速器就得整套重写——这正是 OOT 插件必须在「算子」这一层做替换、而不是在框架层打补丁的物理原因。",
+      "links": [
+        "https://arxiv.org/abs/2205.14135",
+        "https://arxiv.org/abs/2407.08608",
+        "https://github.com/vllm-project/flash-attention"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/pdf/2205.14135", "note": "FlashAttention 原论文：确认题名《FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness》与分块 + 在线 softmax（维护 m 行最大、ℓ 指数和）不物化 N×N 的核心做法。访问于 2026-07-26。"},
+        {"url": "https://arxiv.org/pdf/2307.08691", "note": "FlashAttention-2：确认题名《FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning》与其并行/工作划分改进定位。访问于 2026-07-26。"},
+        {"url": "https://arxiv.org/pdf/2407.08608", "note": "FlashAttention-3：确认题名《Fast and Accurate Attention with Asynchrony and Low-precision》与三项技术（Tensor Core/TMA 异步 + warp specialization、matmul 与 softmax 交错、FP8 块量化与 incoherent processing）。访问于 2026-07-26。"},
+        {"url": "https://modal.com/blog/reverse-engineer-flash-attention-4", "note": "第三方（Modal）对 FlashAttention-4 的复现分析：取到「Blackwell 专用、CuTe-DSL 实现、B200 约 1605 TFLOP/s、在线 softmax 的 rescale 触发条件被放宽」等要点，以及 2026-03-05 发布、arXiv:2603.05451 的时间线。二手来源，故 FA4 细节标 medium。访问于 2026-07-26。"},
+        {"url": "https://github.com/vllm-project/flash-attention", "note": "vLLM 维护的 flash-attention fork 仓库，佐证「vLLM 用的是自家 fork 而非上游发行包」。另：本书 pin 的基座 vLLM v0.21.0 源码 vllm/v1/attention/backends/fa_utils.py 从 `vllm.vllm_flash_attn` 导入，并在 get_flash_attn_version 中按 device_capability 选 FA3(9.x)/FA4(10.x)/FA2，可交叉印证。访问于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "开篇那段 FlashAttention 直觉（在线 softmax、不物化 N×N）写得很好，保留。只建议两处微调：(1) 家族补一句 FA2/FA3/FA4 各自的关键词（并行划分 / Hopper 异步+FP8 / Blackwell 重写），让「flash 内核」不再是一个模糊的单数名词；(2) 点明 vLLM 用的是自家 fork、且按算力自动选 FA2/3/4——这让 §20.7「换内核」的对照更精确。FA4 属新鲜事物且我依据的是二手复现报道，正文点到即可、别引具体 TFLOP/s 数字。完整推导仍留给姊妹篇。"
+    },
+
+    {
+      "id": "attention-sink-learnable",
+      "term": "attention sink 与 `learnable_sink`",
+      "kind": "external_concept",
+      "one_line": "模型总会把一部分注意力「倒」给开头那几个没什么语义的 token，这现象叫 attention sink；新一代模型干脆给每个头配一个可学习的「垃圾桶」参数，而昇腾的 FIA v2 为此专门开了个入参。",
+      "what_it_is": "**现象**：StreamingLLM（arXiv:2309.17453，《Efficient Streaming Language Models with Attention Sinks》）发现，即使开头的几个 token 语义并不重要，模型也会给它们异常高的注意力分数——它们充当了概率质量的「汇（sink）」。原因直觉上不难理解：softmax 强制所有分数加和为 1，当某个 query 其实「谁也不特别想看」时，它总得把质量倒到某处，于是倒给了人人都能看到的开头几个 token。据此，滑窗模型只要把开头这几个 token 永久留在窗口里，就能稳定外推到极长输入（论文称可支撑到 400 万 token 级别的稳定语言建模）。\n\n**参数化**：后来的模型不再依赖「开头那几个真 token」，而是直接给每个注意力头加一个**可学习的 sink logit**——相当于在 softmax 里多加一列「谁也不看」的选项，让模型能把概率质量正大光明地倒掉。gpt-oss 系列就是这么做的（每头一个可学习参数）。\n\n**和本章的关系**：`forward_fused_infer_attention` 里 `self.sinks is not None` 那条分支之所以要改调 `npu_fused_infer_attention_score_v2`，是因为 `learnable_sink` 是 v2 才有的入参（torch_npu 7.2.0 文档把它列在 v2 的参数里）。也就是说，算子层面已经把这个模型特性当一等公民支持了，不需要上层用 mask 去凑。",
+      "background": "「sink」这条线索后来长成了一个独立的研究小分支（sink 为什么出现、和量化/低精度推理的关系等）。对本章读者只需知道：它是模型侧的一个结构特性，落到推理框架就是「算子要不要支持多算一列」。",
+      "links": [
+        "https://arxiv.org/abs/2309.17453",
+        "https://www.hiascend.com/document/detail/zh/Pytorch/720/apiref/torchnpuCustomsapi/context/torch_npu-npu_fused_infer_attention_score_v2.md"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/abs/2309.17453", "note": "StreamingLLM 论文页：确认题名《Efficient Streaming Language Models with Attention Sinks》、attention sink 的定义（对初始 token 的强注意力，即便语义不重要）、以及可支撑最多 400 万 token 稳定建模的说法。访问于 2026-07-26。"},
+        {"url": "https://hanlab.mit.edu/blog/streamingllm", "note": "作者团队（MIT HAN Lab）的官方博文，交叉印证 sink 现象与 StreamingLLM 的做法。访问于 2026-07-26。"},
+        {"url": "https://www.hiascend.com/document/detail/zh/Pytorch/720/apiref/torchnpuCustomsapi/context/torch_npu-npu_fused_infer_attention_score_v2.md", "note": "torch_npu 7.2.0 的 FIA v2 页：`learnable_sink`（可学习 Sink Token，用于吸收注意力）被列为 v2 相对 v1 的新增参数——直接解释了源码里 sinks 分支为何必须换 _v2。访问于 2026-07-26。"}
+      ],
+      "confidence": "medium",
+      "writer_note": "§20.6 现有的括注（StreamingLLM + arXiv 号 + learnable_sink 是可学习变体）方向对，可再准一格并更简洁：加一句「sink 分支之所以必须换 `_v2`，是因为 `learnable_sink` 是 v2 才有的入参」——这把一个看似随意的分支变成有据可依的算子能力差异。gpt-oss「每头一个可学习 sink logit」这一点我依据的是权威二手整理、未逐字核 OpenAI 原始说明，故整条标 medium；正文一句带过即可，别展开具体实现。StreamingLLM 留链接。"
+    },
+
+    {
+      "id": "c8-and-quarot",
+      "term": "C8 与 QuaRot（§20.8 那对写在一起的名字）",
+      "kind": "external_concept",
+      "one_line": "这是两件事被并排写进了一个括号：C8 是本项目「KV cache 存 int8」的命名档位，QuaRot 是让低比特量化不掉点的一种旋转方法（NeurIPS 2024 论文）——前者是格子，后者是把东西塞进格子的手艺。",
+      "what_it_is": "**C8 是命名法，不是算法。** vllm-ascend 的量化命名把 W / A / C 三个槽分别留给权重（Weight）、激活（Activation）、KV cache（Cache）的比特数：官方 release notes 里既有「C8 (INT8 KV cache) support for GQA attention models」这样的单槽写法，也有「support W8A8C8 quantization」这样的三槽合写。所以 C8 = cache int8。（C8 这个命名本身本书 ch04 已经查过并立过条。）\n\n**QuaRot 是方法。** arXiv:2404.00456，《QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs》（NeurIPS 2024）：用随机 Hadamard 旋转把隐藏态里的离群值（outlier）「摊平」，而旋转矩阵可以融进权重、不改变网络输出（计算不变性）——离群值一去，权重、激活、KV cache 就都能量到 4-bit。论文自报 LLaMa2-70B 在 4-bit 下 WikiText-2 困惑度损失至多 0.47、零样本性能保住 99%；6/8-bit 甚至无需校准数据即可近乎无损。\n\n**两者为什么被写在一起**：在这个项目里，QuaRot 路线量化出来的 checkpoint（如 `MiniMax-M2.5-w8a8-QuaRot`）正是配 int8 KV cache 使用的那一类模型，pin 版子类的 docstring 因此写成 \"INT8 KV cache (C8/QuaRot) models\"。但要分清层次：**Hadamard 旋转发生在离线量化的权重与模型结构里，不在这个 attention 子类中**；子类自己做的是静态 per-channel int8 量化 / 反量化。",
+      "background": "上游 vLLM 的 KV cache 量化主推 fp8 路线，昇腾侧选 int8（硬件与算子生态所致），这是 ch04 已经建立的对照。QuaRot 之后，旋转类量化（Hadamard/正交变换消离群值）成了低比特推理的一条主流技术路径，同族工作还有 SpinQuant、HadaCore 等（本条不展开）。",
+      "links": [
+        "https://arxiv.org/abs/2404.00456",
+        "https://docs.vllm.ai/projects/ascend/en/latest/user_guide/release_notes.html"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/abs/2404.00456", "note": "QuaRot 论文页：确认题名《QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs》、随机 Hadamard 旋转融入权重的计算不变性、覆盖 weights/activations/KV cache 的端到端 4-bit，以及 LLaMa2-70B 至多 0.47 WikiText-2 困惑度损失、保 99% 零样本性能、6/8-bit 无需校准数据的结论；NeurIPS 2024 收录。访问于 2026-07-26。"},
+        {"url": "https://docs.vllm.ai/projects/ascend/en/latest/user_guide/release_notes.html", "note": "vllm-ascend 官方 release notes：取到 v0.21.0rc1（2026-06-16，即本书 pin 版）条目「Added C8 (INT8 KV cache) support for GQA attention models」，v0.18.0（2026-04-30）的「support W8A8C8 quantization」与「Eagle3 now supports QuaRot quantization without embedding」——三条合起来证明 C8 是 W/A/C 命名槽位、QuaRot 是与之并列的另一件事（量化方案）。访问于 2026-07-26。"},
+        {"url": "https://docs.vllm.ai/projects/ascend/zh-cn/main/tutorials/models/MiniMax-M2.5.html", "note": "vllm-ascend 官方模型教程页：MiniMax-M2.5-w8a8-QuaRot 权重与 `--quantization ascend` 用法（经检索摘要确认；直取该 zh-cn 页时 WebFetch 报 404，故标为未逐字一手核）。访问于 2026-07-26。"}
+      ],
+      "confidence": "medium",
+      "writer_note": "§20.8 现在写作「INT8 KV 量化（C8 / QuaRot，即 QuaRot: … 提出的旋转量化思路）」，读起来像「C8 就是 QuaRot」。建议拆成两句：C8 = 项目命名法里的 cache-int8 档（就是 W8A8C8 里那个 C，回指 ch04），QuaRot = 一种旋转量化方法/论文、本项目支持的一类 checkpoint 用它量化；再补半句「旋转发生在离线量化的权重里，不在这个 attention 子类中」。这样既保住源码 docstring 的原话，又不会把两个层次的东西讲混。QuaRot 论文留链接，per-channel 量化数学继续回指 ch31。「为什么两者总一起出现」这层因果我是据 docstring 与 release notes 用法归纳的，正文语气要留余地。"
+    },
+
+    {
+      "id": "prefill-decode-kernel-split",
+      "term": "prefill 与 decode：一个算子通吃，还是两个算子分工？",
+      "kind": "competing_set",
+      "one_line": "昇腾把 vLLM 的一条 flash 内核拆成 paged + fused-infer 两条，看着像「不得已的将就」，其实是业界三种主流摆法之一——GPU 上也有把两者分开的。",
+      "what_it_is": "同一件事（算注意力）为什么会长出不同数量的算子入口？根子在两种形态的性质差异：prefill 是一次算很多 query token、算力受限；decode 每序列只算 1 个 query token、却要扫过整段历史 KV，是**访存**受限。一个 kernel 想同时把两种极端调到最优很难，于是不同框架做了不同取舍。读者看清这三种摆法，就不会把昇腾的「两条路径」当成能力缺口。",
+      "alternatives": [
+        {
+          "name": "vLLM + flash-attn（本章对照的 CUDA 线）",
+          "unique": "一个 `flash_attn_varlen_func` 通吃：prefill、decode、混批共用一个入口，靠 `cu_seqlens` 描述变长形态，KV 在分页 cache 里也照算——把 `block_table` 直接传给 kernel 即可。",
+          "when": "在 NVIDIA GPU 上、希望调度器随意混批且上层少一层分支判断时。代价是 kernel 内部要自己覆盖两种极端形态。",
+          "link": "https://github.com/vllm-project/flash-attention"
+        },
+        {
+          "name": "FlashInfer",
+          "unique": "prefill 与 decode 拆成两组 wrapper（`BatchPrefillWithPagedKVCacheWrapper` / `BatchDecodeWithPagedKVCacheWrapper`），并把 `plan()`（规划）与 `run()`（执行）分离，让按批型算好的辅助数据结构能跨 Transformer 层复用。",
+          "when": "想针对两种形态各自深度调优、且愿意多管一层 plan 生命周期时；vLLM 也把它作为可选后端（本书 ch05 已介绍过 FlashInfer）。",
+          "link": "https://docs.flashinfer.ai/api/attention.html"
+        },
+        {
+          "name": "昇腾 CANN（本章）",
+          "unique": "`_npu_paged_attention`（ATB 的 PagedAttentionOperation，纯 decode 专用）+ `npu_fused_infer_attention_score`（aclnn，prefill/混批，且自己也内建 PageAttention）。注意后者本来就能吃 `block_table` 和 Q_S=1，所以「拆两条」不是能力缺口。",
+          "when": "在昇腾 NPU 上。纯 decode 这一形态另有更省的专用算子可走，于是被单列成快车道——但要过本章 §20.5 那几道门槛（图模式、shape 命中、非投机、非 A5、无滑窗），过不了就回落到 fused-infer。",
+          "link": "https://www.hiascend.com/document/detail/zh/Pytorch/720/apiref/torchnpuCustomsapi/context/torch_npu-npu_fused_infer_attention_score.md"
+        }
+      ],
+      "links": [
+        "https://docs.flashinfer.ai/api/attention.html",
+        "https://github.com/vllm-project/flash-attention"
+      ],
+      "sources": [
+        {"url": "https://docs.flashinfer.ai/api/attention.html", "note": "FlashInfer 官方 API 文档（Attention Kernels）：确认 BatchPrefillWithPagedKVCacheWrapper 与 BatchDecodeWithPagedKVCacheWrapper 是两个分开的 wrapper，且 plan()/run() 分离、辅助数据结构可跨层复用。访问于 2026-07-26（经检索摘要取得文档表述，未逐页逐字核，故本条整体标 medium）。"},
+        {"url": "https://www.hiascend.com/document/detail/zh/Pytorch/720/apiref/torchnpuCustomsapi/context/torch_npu-npu_fused_infer_attention_score.md", "note": "torch_npu 7.2.0 FIA 页：确认 FIA 自身内建 PageAttention（block_table 有效即启用）且 Q_S=1 时走 IncreFlashAttention 分支——用以说明「昇腾拆两条」不是因为 FIA 不能做 decode。访问于 2026-07-26。"},
+        {"url": "https://raw.giteeusercontent.com/ascend/op-plugin/raw/master/op_plugin/ops/atb/PagedAttentionAtb.cpp", "note": "op-plugin 源文件：确认 `_npu_paged_attention` 落到 ATB 的 PagedAttentionOperation，即两条路径来自两个不同的算子供给层（ATB vs aclnn）。访问于 2026-07-26。"}
+      ],
+      "confidence": "medium",
+      "writer_note": "§20.6 开头或 §20.5 结尾放一句就够：「拆成两条算子不是昇腾特例——GPU 侧 FlashInfer 同样把 prefill 与 decode 分成两组 wrapper；差别在于昇腾这两条还来自不同的算子供给层（ATB 与 aclnn）」。这能立刻消解读者「NPU 是不是功能不全才要分两条」的疑虑。**动机务必 hedge**：源码没写为什么要给纯 decode 单开快车道，我也没找到官方说明；正文最多说「纯 decode 这一形态上另有更省的专用算子」，别断言性能原因。三方对比点到即止，深入交给链接。"
+    }
+  ],
+
+  "open_questions": [
+    {
+      "q": "`decode_threshold <= 16` 的那句 assert（\"decode_threshold exceeded npu_fused_infer_attention_score TND layout's limit of 16\"）在公开文档里找得到依据吗？",
+      "status": "未找到。torch_npu 7.2.0 / 6.0 系 FIA 文档里能查到的相关数字是 PageAttention 下 block_size 的对齐与上限（fp16/bf16 需 16 对齐、int8 需 32 对齐，最大 512），与「TND 单序列长度上限 16」不是同一件事。",
+      "advice_to_writer": "§20.3 现有写法（引用源码 assert 原文，说这是算子对上层调度参数的倒逼）是安全的，保持「据源码 assert」的口径即可；不要把它升级成「官方文档规定 TND 上限 16」——我查不到这个出处。"
+    },
+    {
+      "q": "`using_paged_attention` 里把 A5 显式排除，公开出处是什么？",
+      "status": "本条未另查（A2/A3/310P/A5 硬件代际标签本书 ch14 的 research 已立条）。源码没给排除原因。",
+      "advice_to_writer": "§20.5 门槛 2 现在的写法（照实说被显式排除、不臆测原因）正确，保持；硬件代际标签回指 ch14。"
+    }
+  ]
+}

@@ -1,0 +1,152 @@
+{
+  "chapter": "ch14",
+  "chapter_title": "NPUWorker：从 WorkerBase 重写执行主控",
+  "pin_anchor": "本书 pin：vllm-ascend v0.21.0rc1（commit 80610e44）+ 配套基座 vLLM v0.21.0。以下所有『现在怎样』的判断均注明依据的版本/日期，外部生态随时会变。",
+  "researched_at": "2026-07-26",
+  "scope_note": "只做读者定向的外部背景（外部库/标准记法/生态项目）；不解读本仓 pin 源码（那是 dossier/explainer 的活）。本条目里的代码例子一律为「说明性/外部」示例，来自外部官方文档，不是本仓源码，writer 引用时勿标 # SOURCE。已避开前面章节研究过的名词：HCCL（ch01/ch08）、ACL Graph vs CUDA Graph（ch01）、CANN/torch_npu（ch02/ch07）、NUMA（ch05）、openEuler Xlite（ch05）、DSA（ch04）。",
+
+  "concepts": [
+    {
+      "id": "atb-ascend-transformer-boost",
+      "term": "ATB（Ascend Transformer Boost，昇腾 Transformer 加速库）",
+      "kind": "external_project",
+      "one_line": "华为随 CANN 一起发布的一套「Transformer 专用高性能算子库」——矩阵乘、注意力、KV 写入这类大模型热点算子的昇腾优化实现，本章 `_warm_up_atb` 要提前热的就是它。",
+      "what_it_is": "ATB 是 CANN 软件包里的一个领域加速库，官方定位是「一款高效、可靠的加速库，基于华为 Ascend AI 处理器，专门为 Transformer 模型的训练和推理而设计」。它提供三层能力：(1) 底层基础高性能算子（如 `LinearOperation` 矩阵乘、`PagedAttentionOperation` 分页注意力、`ReshapeAndCacheOperation` 把算出来的 K/V 写进 KV cache）；(2) 图算子（Graph），把多个原生/自定义算子组合成一张高效计算图；(3) 插件（Plugin）机制，允许用户塞自己的算子进去。上层可对接 PyTorch / MindSpore / Paddle。对 GPU 读者的类比：它在昇腾栈里占的位置，类似 cuBLAS/cuDNN 这类厂商优化算子库 + FlashAttention 这类融合算子实现的合体，只不过专门面向 Transformer。\n\n**为什么『首次调用要付一笔初始化开销』？** 看 ATB 官方给的算子调用流程就明白了：一个算子不是「调一次函数」那么简单，而是 `CreateOperation`（创建算子对象）→ `Setup`（算出这次调用需要多大的 workspace 临时缓冲区）→ 调用方按这个大小 `aclrtMalloc` 申请 NPU 内存 → `Execute`（真正执行）。第一次跑到某个算子时，这套「建对象、算 workspace、申请显存、可能还要加载/编译 kernel」的准备工作全要现做；之后再调同一个算子就能复用。所以开服前故意打一发 ATB 的 matmul，把这笔一次性开销从用户的第一条请求里挪走——这就是本章 `_warm_up_atb` 那三行随机张量 + 一次矩阵乘加的全部动机。",
+      "background": "大模型推理框架早期是「一个算子一个 kernel」地拼，Transformer 里 attention/MLP 那几段热点被反复重写。厂商于是把这些高频模式打包成领域库：NVIDIA 侧有 FasterTransformer / TensorRT-LLM 这条线，华为昇腾侧就是 ATB。ATB 之上还有 MindIE-LLM 等更上层的模型库；而 vllm-ascend 只挑着用 ATB 的算子（通过 torch_npu 暴露的接口），把调度、显存管理留给 vLLM 自己——这也是为什么本章看到的是「热一发 ATB matmul」这种点状使用，而不是整套 ATB 图。据 CANN 商用版 8.0.RC2.2 / 8.0.RC3 开发文档（访问于 2026-07-26）。",
+      "example": "**（说明性示例，取自 CANN ATB 官方《算子使用指导》，非本仓源码）** ATB 里跑一个算子的标准三段式：\n\n```cpp\n// 1) 创建算子对象\natb::Operation *op = nullptr;\natb::CreateOperation(param, &op);\n\n// 2) Setup：算出这次调用需要多大的 workspace（临时缓冲区）\nuint64_t workspaceSize = 0;\nop->Setup(variantPack, workspaceSize, context);\n\n// 3) 调用方自己按这个大小申请 NPU 内存（workspaceSize 为 0 时跳过，否则会报错）\nvoid *workspace = nullptr;\naclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);\n\n// 4) Execute：真正执行\nop->Execute(variantPack, (uint8_t *)workspace, workspaceSize, context);\n```\n\n逐行读：`CreateOperation` 建一次算子对象；`Setup` **只算不跑**，把「这个算子跑起来需要多少块草稿纸」写进 `workspaceSize`；草稿纸由**调用方**申请（这是 CANN 生态的一贯约定，也是下面 workspace 那条概念的由来）；`Execute` 才真正下发到 NPU。第一次走完这一整套的成本，就是预热要提前付掉的东西。",
+      "links": [
+        "https://www.hiascend.com/document/detail/zh/canncommercial/80RC22/developmentguide/acce/ascendtb/ascendtb_0001.html",
+        "https://www.hiascend.com/document/detail/zh/canncommercial/80RC3/developmentguide/acce/ascendtb/ascendtb_0037.html",
+        "https://gitee.com/ascend/ascend-transformer-boost"
+      ],
+      "sources": [
+        {"url": "https://www.hiascend.com/document/detail/zh/canncommercial/80RC22/developmentguide/acce/ascendtb/ascendtb_0001.html", "note": "CANN 商用版 8.0.RC2.2《Ascend Transformer Boost 加速库·简介》：取到官方定义原句（『一款高效、可靠的加速库，基于华为 Ascend AI 处理器，专门为 Transformer 模型的训练和推理而设计』）、三层能力（基础算子 / 图算子 Graph / 插件 Plugin）、上层对接 PyTorch/MindSpore/Paddle、以及『优化矩阵乘法等核心算子与注意力机制』的说明。访问于 2026-07-26。"},
+        {"url": "https://www.hiascend.com/document/detail/zh/canncommercial/80RC3/developmentguide/acce/ascendtb/ascendtb_0037.html", "note": "CANN 商用版 8.0.RC3《ATB 算子使用指导》：取到 CreateOperation → Setup（计算 workspace 大小）→ 按大小 aclrtMalloc 申请 NPU 内存 → Execute 的完整流程，含『当 workspace 大小为 0 时，无需执行该步骤，否则会报错』。访问于 2026-07-26。"},
+        {"url": "https://www.hiascend.com/developer/techArticles/20250709-1", "note": "昇腾社区技术文章（2025-07-09，RazorAttention）：取到原句『CANN 软件包中的 ATB 加速库接口 PagedAttentionOperation 和 ReshapeAndCacheOperation 通过参数 compressType 选择是否开启多头自适应压缩』——即 ReshapeAndCache 确实是 ATB 加速库的算子接口、负责把 K/V 写入 cache。访问于 2026-07-26。"},
+        {"url": "https://github.com/vllm-project/vllm-ascend/pull/2823", "note": "vllm-ascend PR #2823『adjust the position of warm_up_atb』：确认该预热逻辑是从某个模型的 __init__ 里挪到 NPUWorker.compile_or_warm_up_model、以便对所有模型生效，且 review 里讨论过 torch_npu._npu_matmul_add_fp32 是私有 API 的可维护性风险（建议改用 torch.addmm 之类公开 API）。注意：该页由摘要式抓取，PR 正文简短，故『首次调用开销』的机理以 ATB 官方 Setup/Execute 流程为准，不引 PR 的推断。访问于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§14.1 的缩写对表里 ATB 现在写作『昇腾高度优化的算子加速库，专攻 matmul 这类矩阵运算』——可以升级成一句更准的：『Transformer 专用算子库（矩阵乘 / 分页注意力 / KV 写入都在里面），随 CANN 发布』。§14.6 讲 _warm_up_atb 时，把『首次调用有初始化开销』落到实处最有价值：点一句 ATB 算子是 CreateOperation→Setup(算 workspace)→Execute 三段式，第一次要现建对象、现算 workspace、现申请显存。ReshapeAndCache 可顺势点明是 ATB 里负责把 K/V 写进 KV cache 的算子（所以它是推理第一个真正跑到的 ATB 算子，恰好撞上冷启动）。三段式的完整例子留给链接，正文别贴 C++。"
+    },
+    {
+      "id": "torchinductor-triton-ascend",
+      "term": "TorchInductor 与 Triton（以及 `torch_npu._inductor` / triton-ascend）",
+      "kind": "external_concept",
+      "one_line": "PyTorch 2 的编译后端 TorchInductor 会把模型「翻译」成 Triton 语言写的 kernel 再编译执行；`torch_npu._inductor` 就是把这条 Python→Triton→机器码的流水线接到昇腾 NPU 上的那块适配层。",
+      "what_it_is": "拆成三层看：\n\n**Triton** 是一门写 GPU/加速器 kernel 的 Python 风格语言。官方定位是「提供比 CUDA 高得多的生产力，同时有能力打败 cuDNN 这类高度优化库的性能」——你用类似 numpy 的写法描述一个 block 的计算，编译器负责生成向量化、调度、内存搬运的细节。\n\n**TorchInductor** 是 PyTorch 2 的默认编译后端（`torch.compile` 背后那位）。官方描述是「a new compiler for PyTorch, which is able to represent all of PyTorch」；它拿 TorchDynamo 抓下来的计算图，做融合、调度，**然后为 GPU 生成 Triton 代码**再编译。所以「inductor 编译栈」在实践中约等于「自动生成 Triton kernel」。\n\n**`torch_npu._inductor` / triton-ascend** 是这条路的昇腾分支：Triton 语言本身要有一个昇腾后端才能编出 NPU 机器码，这就是 triton-ascend（`triton-lang/triton-ascend`，官方 README 一句话定位『Triton language and compiler for Ascend NPU』，据 2026 年 4 月的 3.2.1 版，支持 Atlas A2/A3/950 系列，依赖 CANN）；而 `torch_npu._inductor` 是 Ascend Extension for PyTorch 里的 inductor 适配，负责把 Inductor 的代码生成规则改成昇腾能用的（NPU 专属的 tiling/调度/lowering 规则、把 exp/sqrt 这类算子映射到 Triton 的数学库）。\n\n**所以本章那两行 `if HAS_TRITON: import torch_npu._inductor` 的意思是**：只有当环境里装了 Triton（因而这条「编译成 Triton kernel」的 graph 模式路径可用）时，才需要把昇腾的 inductor 适配导进来。注意这条路和 ACL Graph 是两件事：ACL Graph 是「录一遍算子调用再重放」，inductor/Triton 是「把算子重新编译成一份新 kernel」。",
+      "background": "PyTorch 1.x 时代加速靠手写 CUDA kernel 或 TorchScript；2.0 引入 torch.compile 后，路线变成 TorchDynamo（抓图）+ TorchInductor（生成代码），而 Inductor 选择用 Triton 而不是直接吐 CUDA C，理由正是 Triton 的『高生产力 + 可比肩手工库的性能』。这一选择的连锁效应是：**任何想接进 PyTorch 编译栈的新硬件，都得先有一个 Triton 后端**——于是有了 triton-ascend（昇腾）、以及其他厂商的同类后端。这也是为什么昇腾这边同时存在好几条 graph 路径：Triton/Inductor 一条、Torchair/GE 图引擎一条、npugraph_ex 一条。据 PyTorch dev-discuss TorchInductor 公告（2022-08-31）与 triton-ascend 官方仓库（访问于 2026-07-26）。",
+      "example": null,
+      "links": [
+        "https://dev-discuss.pytorch.org/t/torchinductor-a-pytorch-native-compiler-with-define-by-run-ir-and-symbolic-shapes/747",
+        "https://github.com/triton-lang/triton-ascend",
+        "https://ascend.github.io/triton-ascend/"
+      ],
+      "sources": [
+        {"url": "https://dev-discuss.pytorch.org/t/torchinductor-a-pytorch-native-compiler-with-define-by-run-ir-and-symbolic-shapes/747", "note": "PyTorch dev-discuss 官方公告（jansel，2022-08-31）：取到 TorchInductor 定义原句『a new compiler for PyTorch, which is able to represent all of PyTorch…』与『用 Triton 为 NVIDIA GPU 生成 kernel』、以及 Triton 的定位原句（『much higher productivity than CUDA, but with the ability to beat the performance of highly optimized libraries like cuDNN』）。访问于 2026-07-26。"},
+        {"url": "https://github.com/triton-lang/triton-ascend", "note": "triton-ascend 官方仓库 README：取到定位『Triton language and compiler for Ascend NPU』、支持硬件『Atlas A2/A3/950 series』、最新正式版 3.2.1（2026-04，前一版 3.2.0 于 2026-01）、依赖 CANN 9.0.0。访问于 2026-07-26。"},
+        {"url": "https://deepwiki.com/Ascend/pytorch/8-compiler-integration-(dynamo-and-inductor)", "note": "第三方（DeepWiki 对 Ascend/pytorch 仓库的自动索引，非官方文档）：取到 torch_npu 的 inductor 后端『生成优化的 Triton kernel，并以 NPU 专属的调度/tiling/lowering 规则扩展标准 Inductor 流水线』、NPUTritonKernelOverrides 把 exp/sqrt/tanh 映射到 tl_math、以及昇腾侧还并存 Torchair/GE 与 npugraph_ex 等多条 graph 路径。此条为二手来源、未在 hiascend 官方文档逐字核对，故本条整体标 medium。访问于 2026-07-26。"}
+      ],
+      "confidence": "medium",
+      "writer_note": "§14.4 现在只说『Triton 是写自定义加速器 kernel 的语言，torch_npu._inductor 把 Triton 的代码生成接进昇腾的图编译』——方向对，可再补一层因果让初学者真懂：TorchInductor 是 torch.compile 的后端，它**为 GPU 生成的正是 Triton kernel**，所以新硬件要接 PyTorch 编译栈就得先有 Triton 后端（昇腾这边是 triton-ascend）。建议再点一句「这条路和 ACL Graph 不是一回事：一个是重新编译出 kernel，一个是录制-重放已有算子」，避免读者把两种『图模式』混成一团。triton-ascend 版本/支持面留给链接。torch_npu 侧的 inductor 细节只有二手来源，正文别写死实现细节。"
+    },
+    {
+      "id": "torch-memory-stats-keys",
+      "term": "`allocated_bytes.all.peak` —— PyTorch 缓存分配器统计项的记法（以及 allocated / reserved / 「非 torch 显存」）",
+      "kind": "notation",
+      "one_line": "PyTorch 用一串点号分层的 key 报告显存统计，`allocated_bytes.all.peak` 读作「所有内存池上、张量实际占用字节数的历史峰值」——本章量激活峰值取的就是这一项。",
+      "what_it_is": "PyTorch（以及对齐它的 torch_npu）不直接向驱动一次次要显存，中间隔着一个**缓存分配器**：它向驱动大块地要（reserve），再从这些大块里切给张量（allocate），张量释放时内存并不还给驱动、而是留在池子里等下次复用（所以少了反复申请的开销，也因此 `nvidia-smi` / `npu-smi` 看到的占用总比张量实际用量大）。\n\n`memory_stats()` 返回的就是这个分配器的统计字典，key 的记法是 **`<指标>.<池>.<聚合方式>`** 三段：\n- 指标：`allocated_bytes`（官方释义 *amount of allocated memory*，即真正分给张量的量）/ `reserved_bytes`（*amount of reserved memory*，分配器通过 `cudaMalloc` 从驱动预留的总量）/ 还有 `requested_bytes` 等；\n- 池：`all` / `large_pool` / `small_pool`（大块与小块两个子池，`all` 是合计）；\n- 聚合：`current`（当前值）/ `peak`（历史最大值）/ `allocated`（历史累计增长）/ `freed`（历史累计减少）。\n\n所以 `allocated_bytes.all.peak` = 「张量实际占用量」在「全部池」上的「历史峰值」。这正是「跑一遍前向，激活最多占到多少」要的数——**峰值**而不是当前值，因为激活是算完就释放的，只有峰值才决定会不会 OOM。\n\n**还有一块统计不到的：非 torch 显存。** NCCL/HCCL 通信 buffer、算子库（如 ATB）自己申请的 workspace、CANN/CUDA 运行时的上下文，都不经过 PyTorch 分配器，因此 `memory_stats` 里根本看不见它们。要量这块，只能拿「设备总空闲显存的变化」减去「torch 自己涨的部分」——这就是本章账本里 `non_torch` 那一项的来历。读到 `non_kv = non_torch + torch_peak + weights` 时，记住这三项分别是「PyTorch 看不见的」「PyTorch 看得见的峰值」「权重」。",
+      "example": "**（说明性示例，外部；key 定义据 PyTorch 官方 memory_stats 文档）**\n\n```python\nimport torch\ntorch.cuda.reset_peak_memory_stats()\nx = torch.empty(1024, 1024, 1024, dtype=torch.float16, device=\"cuda\")  # 2 GiB\ndel x                                                                   # 张量没了\n\ns = torch.cuda.memory_stats()\ns[\"allocated_bytes.all.current\"]  # ≈ 0        —— 张量已释放，当前占用回到 0\ns[\"allocated_bytes.all.peak\"]     # ≈ 2 GiB    —— 但峰值记住了刚才那 2 GiB\ns[\"reserved_bytes.all.current\"]   # ≈ 2 GiB    —— 分配器没把这块还给驱动，留着复用\n```\n\n逐行点一下：`current` 归零而 `peak` 仍是 2 GiB —— 这就是为什么量激活要读 `peak`；`reserved` 仍是 2 GiB 而 `allocated` 是 0 —— 这就是「显存明明释放了，`nvidia-smi` 还显示占着」的原因。昇腾侧把 `torch.cuda.*` 换成 `torch.npu.*`，key 的记法完全一致。",
+      "links": [
+        "https://docs.pytorch.org/docs/stable/generated/torch.cuda.memory.memory_stats.html",
+        "https://docs.pytorch.org/docs/stable/notes/cuda.html#memory-management"
+      ],
+      "sources": [
+        {"url": "https://docs.pytorch.org/docs/2.13/generated/torch.cuda.memory.memory_stats.html", "note": "PyTorch 官方 memory_stats 文档（stable 重定向到 2.13）：取到 key 三段式结构 allocated_bytes.{all,large_pool,small_pool}.{current,peak,allocated,freed}、reserved_bytes.* 的释义（『amount of allocated memory』/『amount of reserved memory』，后者是分配器通过 cudaMalloc 向驱动预留的量），以及四个后缀 current=当前值 / peak=历史最大值 / allocated=历史累计增长 / freed=历史累计减少。访问于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§14.5 里 `torch.npu.memory_stats(self.device).get(\"allocated_bytes.all.peak\", 0)` 这个字符串 key 是初学者的硬门槛——建议正文用一句话把三段式记法拆开（指标.池.聚合），并点明「取 peak 不取 current，是因为激活算完即释放、只有峰值决定会不会 OOM」。顺带把 `non_torch` 讲清：那是 PyTorch 分配器看不见的显存（通信 buffer / 算子库 workspace / 运行时上下文），只能靠「设备空闲显存的变化」倒推——这一句能让 non_kv 三项加法从「三个变量名」变成「三类真实占用」。allocated vs reserved 的完整表可留给链接。"
+    },
+    {
+      "id": "graph-capture-private-memory-pool",
+      "term": "图捕获为什么额外吃显存：捕获期的「私有内存池」（graph pool）",
+      "kind": "external_concept",
+      "one_line": "把一段计算录成可重放的图之后，录制时用到的那些显存地址必须原样留着不能被别人占用，于是框架给图开一个私有内存池——这块显存就是本章要从 KV 预算里单独扣掉的 ACLGraph 开销。",
+      "what_it_is": "图捕获-重放（CUDA Graph / 昇腾的 ACL Graph，机制本身第 1 章已介绍）有一个初学者常忽略的副作用：**它会吃掉一块额外显存，而且这块显存的生命周期和图一样长**。原因在 PyTorch 官方文档里写得很直白：「A captured graph acts on the same virtual addresses every time it replays.（被捕获的图每次重放都作用在同一批虚拟地址上）」——如果这些地址上的显存被释放，之后重放就会踩到非法内存；如果被分配给了别的张量，重放又会把人家的数据覆写掉。于是「PyTorch 的缓存分配器会检测到正在捕获，并从一个**图私有内存池**（graph-private memory pool）里满足捕获期的分配」，这个池子对其他张量不可见，直到图对象和捕获期创建的张量全部离开作用域才释放。\n\n把这件事翻译成本章的账本语言就是：\n1. **捕获图 = 长期占住一块显存**，所以给 KV cache 分预算时必须把它预留出来，否则运行期真去捕获时就 OOM——这正是 `npugraph_memory_estimate` 存在的理由；\n2. **这块显存又确实是「PyTorch 分配器分出去的」**，所以它会算进 `allocated_bytes.all.peak`——如果不小心，它会被误当成「激活峰值」再算一遍。这就是本章那个「在图捕获之前抓 torch peak」的反双计小心思要防的事：同一块 graph pool 只能从 `npugraph_memory_estimate` 这一条路进账，不能混进激活。\n\n昇腾的 ACL Graph 走的是同一套思路（vllm-ascend 官方把它定义为 vLLM 静态图执行的昇腾实现），所以这条外部背景可以直接迁移过来读本章。",
+      "background": "CUDA Graph 在 CUDA 10 成为 driver 层能力，PyTorch 随后把它包进 `torch.cuda.CUDAGraph` 并配了 `torch.cuda.graph_pool_handle()` 让多张图共享同一个私有池（否则每张图各占一份、显存翻倍）。后来 torch.compile 的 CUDAGraph Trees 进一步做了池的 checkpoint/复用。推理框架捕获的是「每个 batch size 一张图」，图的数量往往几十张——池子共享与显存预留就从细节变成了必须正面处理的预算问题，vLLM/vllm-ascend 在 profiling 阶段单独估一笔 graph 显存，正是这个演进的产物。据 PyTorch 官方 CUDA 文档与 CUDAGraph Trees 文档（访问于 2026-07-26）。",
+      "example": null,
+      "links": [
+        "https://docs.pytorch.org/docs/stable/notes/cuda.html#cuda-graphs",
+        "https://docs.pytorch.org/docs/stable/torch.compiler_cudagraph_trees.html",
+        "https://docs.vllm.ai/projects/ascend/en/main/developer_guide/Design_Documents/ACL_Graph.html"
+      ],
+      "sources": [
+        {"url": "https://docs.pytorch.org/docs/2.13/notes/cuda.html", "note": "PyTorch 官方 CUDA notes（stable 重定向到 2.13）CUDA Graphs 一节：取到原句『A captured graph acts on the same virtual addresses every time it replays.』『If PyTorch frees the memory, a later replay can hit an illegal memory access.』『If PyTorch reassigns the memory to new tensors, the replay can corrupt the values seen by those tensors.』以及『The PyTorch caching allocator achieves this by detecting when capture is underway and satisfying the capture's allocations from a graph-private memory pool.』——即图捕获使用私有内存池、且该池不可被其他张量复用。访问于 2026-07-26。"},
+        {"url": "https://deepwiki.com/pytorch/pytorch/3.2.2-cuda-graph-capture-and-memory-pools", "note": "第三方索引（DeepWiki 对 pytorch 仓库）：补充 torch.cuda.graph_pool_handle() 返回 MemPool ID、由 CUDACachingAllocator 的 graph_pools 管理 PrivatePool 对象等实现细节；二手来源，仅用于背景，不作断言依据。访问于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§14.5 的『反双计不变量』是本章最漂亮的一段，但读者会卡在一个前置问题上：**图捕获凭什么额外吃显存？** 建议在讲 profile_torch_peak 之前用两句话补上：捕获的图每次重放都作用在同一批虚拟地址，所以那块显存必须原样留住 → 框架给图开一个私有内存池 → 这块池子既要从 KV 预算里预留（npugraph_memory_estimate），又恰好会被 PyTorch 的 peak 统计计入（因而必须在捕获前抓 peak 才不会双计）。有了这层因果，65/68 GiB 那张表和不变量段落就水到渠成。ACL Graph 的机制本身第 1 章讲过，这里只补『为什么吃显存』这一面，别重复展开捕获-重放。"
+    },
+    {
+      "id": "workspace-ubatch-dbo",
+      "term": "workspace（算子的草稿纸）与 `num_ubatches` / DBO（Dual Batch Overlap，双批重叠）",
+      "kind": "external_concept",
+      "one_line": "workspace 是「算子跑起来临时要用、且由调用方掏钱申请」的一块草稿纸显存；vLLM 把它统一成一个 WorkspaceManager，每个「微批槽位」一块，而槽位数为 2 的场景来自 DBO——把一个 batch 劈成两个微批，让一半算、一半通信，互相盖住时间。",
+      "what_it_is": "**先说 workspace。** 加速器算子（CANN 的 aclnn、ATB 都是如此）普遍采用「两段式调用」：先问算子「你这次要多大的临时缓冲区」，调用方按这个数字申请显存，再把这块显存连同输入一起交给算子执行。ATB 官方文档写得很明白：`Setup` 接口负责「计算 workspace 大小」，然后「根据 workspace 大小申请 NPU 内存」，最后才 `Execute`。为什么不让算子自己申请？因为推理框架要求显存分配是可控、可预算、可复用的——每个算子各自 malloc 会带来碎片和不可预测的峰值。于是框架的做法是：**预先开一块足够大的 workspace，所有算子轮流借用**。\n\n**再说 `num_ubatches`。** 本章调的 `init_workspace_manager(device, num_ubatches)` 来自**上游 vLLM**（`vllm/v1/worker/workspace.py`，不是昇腾自己的东西），它的类文档一句话讲清了这个参数：「Manages one workspace buffer per active ubatch slot.（每个活跃的微批槽位管一块 workspace 缓冲区）」——槽位数默认 1。\n\n**最后是 ubatch 与 DBO。** `ubatch` 是 microbatch（微批）的 ASCII 写法（µ-batch 的 ASCII 友好版），vLLM 官方文档专门解释过这个缩写。而槽位数会变成 2，是因为 **DBO = Dual Batch Overlap（双批重叠）**：把一个 batch 劈成两个微批，交给两个 worker 线程乒乓执行，让其中一个做计算时另一个在等通信——目的是「把 MoE 层里稀疏的 all-to-all 通信和前后的计算重叠起来」。它由 `--enable-dbo` 打开，还要求 `--data-parallel-size N`（N>1）与 `--enable-expert-parallel`。两个微批同时在跑，各自的算子都要草稿纸，所以 workspace 要开两份——这就是 `num_ubatches` 为什么与 DBO 挂钩。昇腾这边固定传 1，即不走双批重叠这条路。据 vLLM 官方设计文档 docs/design/dbo（访问于 2026-07-26；vLLM 当前实现把微批数硬编码为 2，社区有扩展到多批 XBO 的提案 issue #30105）。",
+      "example": "**（说明性示例，外部）** 「两段式 + 调用方申请 workspace」在 CANN 生态里的通用长相（ATB 版见 ATB 条目的例子；aclnn 算子同理）：\n\n```text\n第 1 段：xxxSetup / aclnnXxxGetWorkspaceSize(输入张量…, &workspaceSize, &executor)\n         └─ 算子只回答「我要多大草稿纸」，不做任何计算\n第 2 段：workspace = 分配器给我 workspaceSize 字节\n         └─ 由调用方（框架）掏钱，于是框架能统一预算、复用、避免碎片\n第 3 段：xxxExecute / aclnnXxx(workspace, workspaceSize, executor, stream)\n         └─ 拿着草稿纸真正下发执行\n```\n\n把它和 vLLM 的 `WorkspaceManager` 对上：管理器就是「第 2 段」的统一实现——**开一块能满足最大需求的缓冲区，谁要用谁借**；`num_ubatches=1` 表示只开一份（单条执行流），DBO 场景下开两份（两个微批线程各一份，互不踩踏）。",
+      "links": [
+        "https://docs.vllm.ai/en/latest/design/dbo/",
+        "https://github.com/vllm-project/vllm/blob/main/vllm/v1/worker/workspace.py",
+        "https://www.hiascend.com/document/detail/zh/canncommercial/80RC3/developmentguide/acce/ascendtb/ascendtb_0037.html"
+      ],
+      "sources": [
+        {"url": "https://docs.vllm.ai/en/latest/design/dbo/", "note": "vLLM 官方设计文档 Dual Batch Overlap：取到 DBO 的目的原句（『overlap the sparse all-to-all communication in the MoE layer with the surrounding computation』）、实现方式（在 model runner 里劈批、两个 worker 线程乒乓）、ubatch 术语解释（『ubatch may be used as a short form of microbatch; this is an ASCII-friendly version』）、启用条件（--enable-dbo + --data-parallel-size N>1 + --enable-expert-parallel）。访问于 2026-07-26。"},
+        {"url": "https://github.com/vllm-project/vllm/blob/main/vllm/v1/worker/workspace.py", "note": "上游 vLLM 源文件（main 分支）：确认 init_workspace_manager(device, num_ubatches=None) 的签名与 WorkspaceManager 文档串『Manages one workspace buffer per active ubatch slot. Can be locked to prevent further growth during execution.』，即 workspace 管理器是上游 vLLM 的通用设施而非昇腾自造。访问于 2026-07-26。"},
+        {"url": "https://github.com/vllm-project/vllm/issues/30105", "note": "vLLM issue #30105『Extend Dual Batch Overlap (DBO) to Multi-Batch Overlap (XBO)』：取到『当前 DBO 实现把微批数硬编码为 2』这一现状说明（据搜索结果摘要，未逐条展开原文，标记为佐证而非主依据）。访问于 2026-07-26。"},
+        {"url": "https://www.hiascend.com/document/detail/zh/canncommercial/80RC3/developmentguide/acce/ascendtb/ascendtb_0037.html", "note": "CANN 商用版 8.0.RC3《ATB 算子使用指导》：取到 Setup『计算 workspace 大小』→『根据 workspace 大小申请 NPU 内存』（aclrtMalloc）→ Execute 的两段式约定，作为『workspace 由调用方申请』的一手依据。访问于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "⚠️ **正文有一处需要改**：§14.4 现在写『init_workspace_manager 申请 workspace（昇腾给算子运算预留的工作缓冲区池…基座开 dbo（动态批优化）时为 2）』——两处偏差：(1) workspace manager 是**上游 vLLM** 的通用设施（`vllm/v1/worker/workspace.py`），不是昇腾自造；(2) **DBO = Dual Batch Overlap（双批重叠）**，不是「动态批优化」。建议改成：『workspace 是算子跑起来要用的临时缓冲区，按 CANN 的约定由调用方申请、框架统一开一块给算子借用；vLLM 的 workspace 管理器每个微批槽位开一块，`num_ubatches` 就是槽位数——昇腾固定开 1，上游启用 DBO（Dual Batch Overlap，把一批劈成两个微批让计算与通信互相盖住）时才是 2』。DBO 的启用条件与 MoE 背景点到即止，留给链接。"
+    },
+    {
+      "id": "msmonitor-dynamic-profile",
+      "term": "msMonitor 与 `torch_npu.profiler.dynamic_profile`（`dp.step()`）",
+      "kind": "external_project",
+      "one_line": "昇腾的「在线性能监测」工具链：不重启服务、靠一个守护进程和命令行就能对正在跑的推理进程开关性能采集——本章 `execute_model` 里那句 `dp.step()` 就是给它报「我又跑完一拍」的打点。",
+      "what_it_is": "两个东西，一上一下：\n\n**msMonitor** 是华为面向昇腾 NPU 的轻量化在线监测工具，**基于开源项目 dynolog** 构建。它由三部分组成：`dyno`（命令行工具，用户用它指定监测模式和参数）、`dynolog`（守护进程，接收 dyno 的指令并把 Profiler 配置下发给训练/推理进程）、以及 `msmonitor-plugin` 这个 Python 插件包（提供 IPCMonitor、MsptiMonitor 等能力，底层用的是 MSPTI —— MindStudio Profiling Tool Interface，昇腾细粒度性能数据采集接口）。功能上分两块：NPU Monitor（常态化监测 kernel 执行、API 调用、HCCL 通信等指标）和 NPU Trace-dump（按需触发的多维性能数据采集）。启用方式正是本章那个开关的来历：拉起 dynolog 守护进程，给业务进程设 `MSMONITOR_USE_DAEMON=1` 和 `LD_PRELOAD`，之后用 dyno CLI 控制采什么、采多久。\n\n**`torch_npu.profiler.dynamic_profile`（代码里常 `import ... as dp`）** 是 Ascend Extension for PyTorch 里的「动态 profiling」入口：不重启进程就能开关采集，靠配置文件/共享内存在监控侧与业务进程之间传递配置。它要求业务代码在每次迭代的边界调一次 `dp.step()`——**它的作用是告诉 profiler「一步结束了」**，profiler 才能按「等待 N 步 / 预热 N 步 / 采集 N 步」的节奏工作（和 PyTorch 原生 profiler 的 `prof.step()` 同一个套路）。\n\n对读者的意义很简单：`dp.step()` 不参与任何计算，它是**观测钩子**——只有打开 msMonitor 守护模式时才会走到，平时是关的。同理 §14.8 那个 `TorchNPUProfilerWrapper` 是另一条采集路径（torch_npu 原生 profiler），两者互斥。",
+      "background": "大规模分布式推理/训练的性能问题往往「不复现就抓不到」：等你想采集时，服务已经跑在生产上，重启一次成本高、现象还可能消失。业界的解法是「常驻守护进程 + 按需触发采集」——Meta 开源的 dynolog 就是这个范式的代表（面向 GPU 集群的常驻监测守护进程，可远程触发 PyTorch profiler）。msMonitor 把这套范式搬到昇腾栈，并接上昇腾自家的 MSPTI 采集接口。所以你在 vllm-ascend 里看到的是「一个环境变量 + 一句 step 打点」这种极轻的侵入，重活都在进程外。据昇腾社区技术文章（2025-07-11）。",
+      "example": null,
+      "links": [
+        "https://www.hiascend.com/developer/techArticles/20250711-1",
+        "https://www.hiascend.com/document/detail/zh/Pytorch/710/apiref/torchnpuCustomsapi/context/torch_npu-profiler-profile.md"
+      ],
+      "sources": [
+        {"url": "https://www.hiascend.com/developer/techArticles/20250711-1", "note": "昇腾社区技术文章《MindStudio 全新支持训练数据在线监测》（2025-07-11）：取到 msMonitor 定位原句（『面向昇腾 NPU 的轻量化在线监测工具』）、『基于 dynolog 开源项目』、三大组件（dyno / dynolog 守护进程 / msmonitor-plugin.whl，含 IPCMonitor、MsptiMonitor）、两大功能模块（NPU Monitor 常态监测 / NPU Trace-dump 精准采集）、以及启用步骤中明确出现的环境变量 `MSMONITOR_USE_DAEMON=1` 与 `LD_PRELOAD`——与本章 msmonitor_use_daemon 开关同名，可直接互证。访问于 2026-07-26。"},
+        {"url": "https://deepwiki.com/Ascend/pytorch/7.2-profiling-and-performance-analysis", "note": "第三方索引（DeepWiki 对 Ascend/pytorch 仓库）：取到 dynamic profiling『不重启进程即可开关采集、用共享内存在监控进程与业务进程间传配置』『_DynamicProfile 单例管理本地采集状态与 step』以及 profiler 用 step() 配合 schedule(wait/warmup/active/repeat) 的节奏说明。二手来源，故本条 dynamic_profile 部分标 medium（msMonitor 部分有官方一手依据）。访问于 2026-07-26。"}
+      ],
+      "confidence": "medium",
+      "writer_note": "§14.7 现在把 `dp.step()` 一笔带过为『推进 msMonitor 性能监控守护进程』——可以补半句让读者知道它是什么：msMonitor 是昇腾基于 dynolog 的在线监测工具，靠**进程外的守护进程 + 一个环境变量**按需开关采集，业务侧只需在每拍边界打一个 `dp.step()` 报「又跑完一拍」。这样『可选观测钩子，不参与前向』的定位就有了实感。dyno/MSPTI/Trace-dump 的细节留给链接，别展开。"
+    },
+    {
+      "id": "ascend-device-generations",
+      "term": "A2 / A3 / 310P / A5 —— 昇腾硬件代际标签",
+      "kind": "external_concept",
+      "one_line": "vllm-ascend 用 A2/A3/310P/A5 这几个短标签区分昇腾硬件的代际，本章多处「A5 设备跳过」指的就是最新一代（昇腾 950 系列）尚未适配的那些路径。",
+      "what_it_is": "这几个标签对应的是华为昇腾产品线的代际，读者按下面这张对表看即可：\n\n- **A2**：Atlas 800T A2 训练服务器 / Atlas 800I A2 推理服务器这一代，芯片是昇腾 910B 家族（单 die 设计）。这是目前 vllm-ascend 最主力、文档默认假设的硬件。\n- **A3**：Atlas 800T A3 / Atlas 900 A3 SuperPoD（超节点）这一代，芯片是昇腾 910C（双 die 封装，把两颗 910B 级 die 合封）。定位是更大规模的训练/推理集群。\n- **310P**：Atlas 300I Duo / Atlas 200I Pro 这类**推理专用**加速卡（昇腾 310P 芯片），算力与显存都小得多，vllm-ascend 里对它有专门的特化路径（本书另有一章讲），官方标注为实验性支持。\n- **A5**：对应昇腾 **950** 这一代（vllm-ascend 的构建脚本按 `SOC_VERSION` 是否匹配 `ascend950` 来判定 A5）。据华为 2025 年 9 月公布的路线图，昇腾 950PR 于 2026 年 Q1 推出、950DT 计划 2026 年 Q4，Atlas 950 SuperPoD 同期。因为是最新代际，很多算子/特性还没跟上，所以源码里能看到不少「if 不是 A5 才做」的守卫。\n\n**为什么代码要按代际分叉？** 因为这几代在算子支持面、指令集、通信拓扑上并不一致：某些 ATB 算子在新芯片上还没有实现或换了 API，某些特性（如超节点内的通信资源初始化）只有 A3/A5 才有。框架于是在运行期读芯片的 SoC 版本号，把不适用的路径整段跳过。\n\n**版本注意**：截至 vllm-ascend 官方安装文档 v0.22.1rc1（访问于 2026-07-26），公开支持矩阵里只列出 Atlas A2 系列、A3 系列与 Atlas 300I（310P），**没有列 A5/Atlas 950**——说明本书 pin 版本（v0.21.0rc1）里的 A5 分支属于早期适配、尚未进入官方公开支持面。",
+      "example": null,
+      "links": [
+        "https://docs.vllm.ai/projects/ascend/en/latest/installation.html",
+        "https://github.com/vllm-project/vllm-ascend/pull/7151",
+        "https://docs.vllm.ai/projects/ascend/en/latest/tutorials/hardwares/310p.html"
+      ],
+      "sources": [
+        {"url": "https://docs.vllm.ai/projects/ascend/en/latest/installation.html", "note": "vllm-ascend 官方安装文档（页面标注版本 v0.22.1rc1）：取到支持硬件清单——Atlas 800 A2 系列、Atlas A3 系列、Atlas 推理产品（310P），Docker 镜像表同样只有 A2/A3/310P 三档；明确**未出现** A5 / Atlas 950 / Ascend 950。访问于 2026-07-26。"},
+        {"url": "https://github.com/vllm-project/vllm-ascend/pull/7151", "note": "vllm-ascend PR #7151『[Build] Add support for Ascend950 chip』（据抓取显示合入于 2026-03-12）：取到构建脚本按 `SOC_VERSION MATCHES \"ascend950\"` 分叉、并为该芯片排除部分自定义算子（mla_preprocess / batch_matmul_transpose）的做法——即 A5 这一设备类型对应昇腾 950 芯片。访问于 2026-07-26。"},
+        {"url": "https://github.com/triton-lang/triton-ascend", "note": "triton-ascend 官方 README：其支持硬件写作『Atlas A2/A3/950 series』——旁证 A2/A3/950 是昇腾生态通行的代际写法。访问于 2026-07-26。"},
+        {"url": "https://www.laoyaoba.com/n/959458", "note": "行业媒体报道华为 2025-09 公布的昇腾路线图：昇腾 950PR 2026 年 Q1、950DT 2026 年 Q4、960 于 2027 Q4、970 于 2028 Q4；Atlas 950 SuperPoD 计划 2026 Q4。非厂商一手资料，仅用于给『A5 是最新一代』提供时间坐标，故本条整体标 medium。访问于 2026-07-26。"},
+        {"url": "https://deepwiki.com/vllm-project/vllm-ascend/1.2-supported-hardware-and-models", "note": "第三方索引：列出 A2 训练/推理系列（Atlas 800T A2、800I A2 等）与 A3 系列（800T A3、900 A3 SuperPoD）具体型号，作为 A2/A3 ↔ 产品型号对表的佐证。910B↔A2、910C↔A3（双 die）的芯片对应关系来自中文技术科普文章而非厂商文档，属 medium。访问于 2026-07-26。"}
+      ],
+      "confidence": "medium",
+      "writer_note": "本章两次出现「A5 设备跳过」（`_register_atb_extensions` 与 `_warm_up_atb`）却从未解释 A5 是什么，读者会卡住。建议在 §14.3 第一次出现处加一句括注即可：『A2/A3/A5 是昇腾硬件代际标签——A2 是 910B 那代（Atlas 800I/T A2），A3 是 910C 超节点那代，A5 对应最新的昇腾 950 系列；新代际算子还没铺齐，所以源码里常见「非 A5 才做」的守卫』。910B↔A2、910C↔A3 的芯片对应来自技术科普而非厂商文档，正文措辞宜用「对应/大致对位」，别写成官方口径；A5↔昇腾 950 有 vllm-ascend 构建脚本一手佐证，可以说。代际路线图/型号清单留给链接。"
+    }
+  ]
+}

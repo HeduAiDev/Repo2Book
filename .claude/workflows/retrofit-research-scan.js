@@ -11,7 +11,7 @@ export const meta = {
 const CFG = {
   instance: 'vllm-ascend',
   source_root: 'instances/vllm-ascend/source',
-  chapters: ['ch12-kv-pooling-ascend-store','ch13-kv-offloading-host-cpu','ch14-npuworker-execution-control','ch15-npumodelrunner-cuda-monkeypatch','ch16-single-step-forward-context-dp-sync','ch17-kv-cache-allocation-reshape-bind','ch18-310p-inference-chip-specialization','ch19-attention-backend-selection','ch20-ascend-attention-mha','ch21-primer-mla','ch22-mla-on-npu','ch23-primer-sparse-attention','ch24-sparse-attention-sfa-dsa','ch25-kv-manager-and-schedulers','ch26-primer-v4-csa-hca','ch27-customop-oot-replacement','ch28-torch-library-and-meta','ch29-ascend-compiler-aclgraph','ch30-fusedmoe-batch-invariant','ch31-primer-quantization','ch32-ascend-quantization-framework','ch33-sampling-npu-adaptation','ch34-primer-speculative-sampling','ch35-primer-dflash','ch36-speculative-decode-npu','ch37-primer-dspark','ch38-model-lora-netloader-registration'],
+  chapters: ['ch19-attention-backend-selection','ch21-primer-mla','ch23-primer-sparse-attention','ch24-sparse-attention-sfa-dsa','ch25-kv-manager-and-schedulers','ch26-primer-v4-csa-hca','ch27-customop-oot-replacement','ch28-torch-library-and-meta','ch29-ascend-compiler-aclgraph','ch30-fusedmoe-batch-invariant','ch31-primer-quantization','ch32-ascend-quantization-framework','ch33-sampling-npu-adaptation','ch34-primer-speculative-sampling','ch35-primer-dflash','ch36-speculative-decode-npu','ch37-primer-dspark','ch38-model-lora-netloader-registration'],
 }
 const A = (typeof args !== 'undefined' && args && args.chapters && args.chapters.length) ? args : CFG
 const REPO = '/mnt/e/Laboratory/Repo2Book'

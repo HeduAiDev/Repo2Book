@@ -1,0 +1,291 @@
+{
+  "chapter_id": "ch17",
+  "chapter_title": "KV cache 在昇腾上的落地：分配、reshape 与绑定",
+  "researched_at": "2026-07-26",
+  "pin_context": {
+    "vllm_ascend": "v0.21.0rc1 (commit 80610e44)",
+    "vllm_base": "v0.21.0",
+    "note": "凡涉及外部生态「现在怎样」的断言，均注明依据的文档版本/日期；外部文档常跟随 main 分支，与 pin 版本可能有差，已在各条 confidence/writer_note 里标出。"
+  },
+  "in_book_crosslinks": {
+    "note": "本书自带 primer 章，深挖交给它们，ch17 只给『够用的一句 + 内链』，别在本章重述数学。",
+    "map": {
+      "MLA / 解耦 RoPE / nope-rope": "../../ch21-primer-mla/narrative/chapter.md",
+      "DSA / Lightning Indexer 谱系": "../../ch23-primer-sparse-attention/narrative/chapter.md",
+      "MTP / 投机采样": "../../ch34-primer-speculative-sampling/narrative/chapter.md",
+      "PD 分离与 Mooncake": "../../ch11-pd-disaggregation-mooncake/narrative/chapter.md",
+      "KVCacheSpec / block_size 16→128": "../../ch04-patch-engine-core-kvcache/narrative/chapter.md"
+    },
+    "gap_found": "正文 §17.3/§17.4/§17.5/§17.7 分别用括注解释了 MLA nope/rope、sparse-c8 indexer、MTP，却没有内链到 ch21 / ch23 / ch34 这三章 primer（只链了 ch04/ch11/ch14/ch16/ch26）。建议 writer 各补一条内链。"
+  },
+  "concepts": [
+    {
+      "id": "torch-strided-view",
+      "term": "PyTorch 的跨步视图：stride / storage_offset / torch.as_strided",
+      "kind": "notation",
+      "one_line": "在 PyTorch 里，一个张量 =「一段连续的存储 + 三元组（形状 size、步长 stride、起点 storage_offset）」；`torch.as_strided` 就是绕过所有便利封装、直接手写这三元组，造出一个不搬运任何数据的新视图。",
+      "what_it_is": "读一个张量的元素时，PyTorch 并不知道「二维」「四维」是什么，它只做一次算术：元素 [i, j, k] 的地址 = storage_offset + i·stride[0] + j·stride[1] + k·stride[2]（单位是元素，不是字节）。三个量各管一件事——size 说每一维有几格，stride 说「这一维往前走一格，底层要跳多少个元素」（官方原话：the jump necessary to go from one element to the next one in the specified dimension），storage_offset 说「从这段存储的第几个元素开始算」。正因为读取只是这条算术式，改形状/转置/切片都可以只改三元组、一个字节都不搬——这就是「视图（view）」。`torch.as_strided(input, size, stride, storage_offset=None)` 是这套机制的完全手动档：你把三元组直接写死，PyTorch 照单全收。它的自由度也正是它的危险：官方文档明确警告，如果造出的视图是「重叠」的（多个下标指向同一个内存元素），在这个视图上做原地（in-place）操作行为未定义；并建议优先用 `view()`/`expand()` 这些安全封装。",
+      "background": "这套 shape/stride/offset 模型不是 PyTorch 发明的，它继承自 NumPy 的 strided array（ndarray 的 shape+strides）——正是这个抽象让 transpose、切片、广播从 O(n) 拷贝降成 O(1) 改元数据，代价是引入了「连续（contiguous）/ 非连续」这个概念：一个转置后的张量元素还在原地，只是 stride 变了，于是某些要求连续内存的算子（以及 `.view()` 本身）会拒绝它，得先 `.contiguous()` 拷一份。`as_strided` 则是这条演进线上的「逃生舱」——当你要表达的布局连转置+切片都拼不出来（比如「每个 block 之间刻意留一段空隙」）时，只能手写 stride。",
+      "example": "说明性外部例子（PyTorch 官方文档原样，可在任意 CPU 上复现，非本仓源码）：\n\n(1) stride 是什么：\n>>> x = torch.tensor([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]])\n>>> x.stride()\n(5, 1)\n读法：行维走一格要跳 5 个元素（一整行），列维走一格跳 1 个元素。\n\n(2) storage_offset 以「元素」计，不是字节：\n>>> x = torch.tensor([1, 2, 3, 4, 5])\n>>> x.storage_offset()\n0\n>>> x[3:].storage_offset()\n3\n\n(3) as_strided 手写三元组：\n>>> x = torch.randn(3, 3)\n>>> torch.as_strided(x, (2, 2), (1, 2))          # size=(2,2) stride=(1,2) offset=0\n>>> torch.as_strided(x, (2, 2), (1, 2), 1)       # 同上，但从第 1 个元素起算\n两次结果错开一格，正说明 storage_offset 只是「起点」。\n\n(4) 把首维 stride 撑大 = 刻意留缝（说明性，作者构造）：\n对 shape=(4, 2, 1, 8) 的张量，自然 stride 是 (16, 8, 8, 1)——首维一格正好 2×1×8=16 个元素、块块相接；若手写 stride=(24, 8, 8, 1)，则 block i 的起点变成 24·i（0/24/48…），每块真实数据仍只占 16 个元素，于是每块尾部稳定露出 24−16=8 个元素的空当。",
+      "links": [
+        "https://docs.pytorch.org/docs/stable/generated/torch.as_strided.html",
+        "https://docs.pytorch.org/docs/stable/generated/torch.Tensor.stride.html",
+        "https://docs.pytorch.org/docs/stable/generated/torch.Tensor.storage_offset.html"
+      ],
+      "sources": [
+        {"url": "https://docs.pytorch.org/docs/2.13/generated/torch.as_strided.html", "took": "签名 torch.as_strided(input, size, stride, storage_offset=None)；官方警告『若生成的视图是 overlapped（多个下标指向同一内存元素），在其上做 inplace 操作行为未定义』、『在非标准 PyTorch 后端会报错』、建议优先 view()/expand()；两段官方示例（(2,2)/(1,2) 与带 offset=1）。", "accessed": "2026-07-26"},
+        {"url": "https://docs.pytorch.org/docs/2.13/generated/torch.Tensor.stride.html", "took": "stride 定义原话『the jump necessary to go from one element to the next one in the specified dimension』与 2×5 张量 stride()==(5,1) 的官方示例。", "accessed": "2026-07-26"},
+        {"url": "https://docs.pytorch.org/docs/2.13/generated/torch.Tensor.storage_offset.html", "took": "原话『Returns self tensor's offset in the underlying storage in terms of number of storage elements (not bytes)』与 x[3:].storage_offset()==3 的示例。", "accessed": "2026-07-26"}
+      ],
+      "confidence": "high",
+      "writer_note": "§17.6 目前一上来就用 stride/storage_offset，建议在 `_adjust_kv_layout` 源码之前补 2-3 句「张量 = 存储 + (size, stride, offset)」并直接引官方那个 2×5 → (5,1) 的例子，读者才接得住后面的 target_stride。两个可点到即止的精确点：① storage_offset 的单位是**元素**不是字节（源码里变量名带 `_bytes` 只因裸张量是 int8，1 元素恰好 1 字节，这个巧合值得半句点破，否则读者会以为 PyTorch 返回字节）；② 官方对 overlap 视图 in-place 未定义的警告说的是**单个视图内部自重叠**，与本章「多个不同视图共享同一块裸内存」不是一回事，别把警告错安到 sparse-c8 头上。深入留给链接。"
+    },
+    {
+      "id": "tensor-view-dtype",
+      "term": "Tensor.view(dtype)：同一段字节按另一种 dtype 重新解释",
+      "kind": "notation",
+      "one_line": "`.view(shape)` 换的是「怎么排」，`.view(dtype)` 换的是「怎么读这些字节」——同一片内存，一个字节都不动，只是把 int8 的一串字节当成 bf16/fp16 的元素来解释。",
+      "what_it_is": "`Tensor.view` 有两个重载，本章两个都用到，容易混。`.view(shape)` 要求**元素总数守恒**；`.view(dtype)` 则是**字节总数守恒**：目标 dtype 的元素更宽，最后一维的长度就按 element_size 的比例缩小（反之放大）。这就是「先按 int8 裸字节分配、再 view 成目标 dtype」这一模式的语言学基础：分配器只认字节，dtype 留到最后一刻再决定。但它不是无条件的——官方文档给了一串硬约束（当目标 dtype 更宽时）：`self.dim() > 0`；`self.stride(-1) == 1`（最后一维必须紧密相邻）；`self.size(-1)`、`self.storage_offset()`、以及除最后一维外所有维的 stride，都必须能被两种 dtype 的 element_size 之比整除。不满足就抛 RuntimeError——注意 **storage_offset 必须整除** 这条：它意味着一个从奇数字节偏移开始的 int8 切片，根本没法 view 成 float16。",
+      "background": "这是 C 里 type punning / reinterpret_cast 在张量层面的等价物，也是零拷贝系统里的通用套路：谁负责分配就只管字节数与地址，谁负责计算才管类型。RDMA 注册、KV 量化、跨进程共享内存都吃这一套——把「多少字节」和「什么类型」解耦，一条分配路径就能同时服务 bf16 / fp16 / fp8 / int8 量化的 KV。",
+      "example": "说明性外部例子（PyTorch 官方文档原样）：\n>>> x = torch.randn(4, 4)          # float32，每元素 4 字节\n>>> x.view(torch.uint8).size()\ntorch.Size([4, 16])                # 1 字节元素：最后一维 ×4\n>>> x.view(torch.cfloat).size()\ntorch.Size([4, 2])                 # 8 字节元素：最后一维 ÷2\n\n两步 view 的必要性（说明性，作者构造）：一块 128 字节的 int8 裸张量，想变成 shape=(2,4,8) 的 float16：\n- 直接 `raw.view((2,4,8))` ✗ —— int8 张量有 128 个元素，而 (2,4,8) 只要 64 个，元素数对不上。\n- `raw.view(torch.float16)` → 64 个元素（128÷2），再 `.view((2,4,8))` ✓ —— 先换单位、再换形状。\n\n对齐约束现形（说明性，作者构造）：`raw[:101]` 之后紧跟的切片 `raw[101:117]` 起点偏移是奇数 101，`.view(torch.float16)` 会因 storage_offset 不能被 2 整除而失败；把起点抬到 102 就合法——这正是「把下一段的起点向上取整到 element_size 的倍数」这类做法存在的外部理由。",
+      "links": [
+        "https://docs.pytorch.org/docs/stable/generated/torch.Tensor.view.html"
+      ],
+      "sources": [
+        {"url": "https://docs.pytorch.org/docs/2.13/generated/torch.Tensor.view.html", "took": "view(dtype) 的语义（按 element_size 比例缩放最后一维）与完整约束清单：dim()>0、stride(-1)==1、size(-1) 可被比例整除、storage_offset() 可被比例整除、除最后一维外所有 stride 可被比例整除；官方示例 x.view(torch.uint8).size()==[4,16]、x.view(torch.cfloat).size()==[4,2]。", "accessed": "2026-07-26"}
+      ],
+      "confidence": "high",
+      "writer_note": "§17.5 已用自己的话解释了「为何非两步 view」，说得对，可以只加一句权威背书（官方约束是 size(-1)/storage_offset/stride 都要能被 element_size 比整除）。真正值得补的是 §17.4：那里的 `_align_up(dsa_k_size, scale_dtype_size)` 与三条 assert，正文只说「PyTorch 的 .view(scale_dtype) 要求 data_ptr 按元素宽度对齐」——官方原文的准确口径是 **storage_offset 必须能被 element_size 之比整除**（外加 stride(-1)==1），建议按这个措辞修一下，比「data_ptr 对齐」更可核。别展开 C 语言 type punning 的历史，一句带过即可。"
+    },
+    {
+      "id": "rdma-mr-2mb-hugepage",
+      "term": "RDMA 内存注册（memory registration）与 2MB 大页对齐",
+      "kind": "external_concept",
+      "one_line": "要让网卡绕过 CPU 直接读写一块内存，得先把它「注册」——钉住物理页、建地址翻译表、拿到一对钥匙；而按 2MB 对齐，是为了让这块内存能被**大页**覆盖，把翻译表条目数降几个数量级。",
+      "what_it_is": "RDMA（远程直接内存访问）让远端网卡直接读写本机内存，不惊动 CPU。代价是内存不能随便读：必须先调 `ibv_reg_mr()` 注册出一个 Memory Region——内核会把这段虚拟内存的物理页**钉住（pin）**，不许换出或迁移；驱动建立虚拟地址到物理地址的翻译表交给网卡；返回一对钥匙 lkey（本地用）/ rkey（给远端用）。这套动作要进内核、要遍历页表，很慢，所以官方口径是「不要在数据路径上做注册」——推理框架于是都在**启动时一次性**把整个 KV cache 池注册好，这正是本章「分配阶段就要把地址摆对」的根因。\n\n关键澄清：**RDMA 注册本身并不要求缓冲区页对齐**（verbs 权威参考 rdmamojo 原话：The registered memory buffer doesn't have to be page-aligned）。那 2MB 从哪来？来自**大页**。在 x86-64 和 arm64（4KB 粒度）上，页表 PMD 一级对应的大页尺寸就是 2MB。页越大，覆盖同样容量所需的页表/MR 条目越少：Mooncake 自己的 RFC 给过一张对照表——注册 256GB，4KB 页需要约 6700 万个页，2MB 页降到约 12.8 万，1GB 页只要 256 个；某些 RDMA 实现（如阿里云 eRDMA）在 4KB 页下最多只能注册 128GB，根本装不下大模型的 KV 池。所以「首地址按 2MB 对齐」的真实动机是：让这块 KV 内存能整齐落在大页边界上，被大页化 / 被具体传输引擎按大页粒度注册。",
+      "background": "「注册才能直读」的模型来自 InfiniBand verbs（后来 RoCE、iWARP 沿用同一套 API），本质是把「地址翻译 + 权限校验」从 CPU 移到网卡：网卡拿 rkey 和虚拟地址就能寻址，前提是内核事先把翻译表喂给它、并保证页不会跑。大模型推理把这套老技术推到了新的规模——KV cache 动辄几十上百 GB，MR 条目数、网卡地址翻译缓存（ATC/ICM）成了新瓶颈，于是「大页 + 少量大 MR」成了 2024-2026 年这批 KV 传输引擎（Mooncake / NIXL / 昇腾 ADXL）不约而同的做法。",
+      "example": "说明性外部数据（引自 Mooncake RFC #1407，2026-01-20）——注册 256GB KV 池所需的页/MR 数量：\n| 页大小 | 覆盖 256GB 所需页数 | 可行性 |\n|---|---|---|\n| 4KB   | ~67,000,000 | 超出 eRDMA 上限（4KB 页下最多注册 128GB） |\n| 2MB   | ~128,000    | 在限度内 |\n| 1GB   | 256         | 绰绰有余 |\nRFC 原话：Using huge pages (2MB or 1GB) significantly reduces the number of Memory Regions (MRs) needed.",
+      "links": [
+        "https://www.rdmamojo.com/2012/09/07/ibv_reg_mr/",
+        "https://github.com/kvcache-ai/Mooncake/issues/1407",
+        "https://github.com/torvalds/linux/blob/master/Documentation/arch/arm64/hugetlbpage.rst"
+      ],
+      "sources": [
+        {"url": "https://www.rdmamojo.com/2012/09/07/ibv_reg_mr/", "took": "注册做了什么（pin 页 / 建地址翻译表 / 生成 lkey+rkey）、『The registered memory buffer doesn't have to be page-aligned』原话、以及『注册很慢，别放在数据路径上』。rdmamojo 是 verbs 事实上的参考手册（作者 Dotan Barak），非厂商官方但业界公认。", "accessed": "2026-07-26"},
+        {"url": "https://github.com/kvcache-ai/Mooncake/issues/1407", "took": "RFC: ERDMA Support with HugeTLB Memory Allocation（2026-01-20）：4KB 页下 eRDMA 最多注册 128GB；256GB 所需页数 4KB≈67M / 2MB≈128K / 1GB=256；『Using huge pages (2MB or 1GB) significantly reduces the number of Memory Regions (MRs) needed』。", "accessed": "2026-07-26"},
+        {"url": "https://github.com/torvalds/linux/blob/master/Documentation/arch/arm64/hugetlbpage.rst", "took": "arm64 大页尺寸表：4K 粒度下为 64K [CONT PTE]、2M [PMD]、32M [CONT PMD]、1G [PUD]——确认『2MB = 4KB 粒度下的 PMD 级大页』，昇腾主机（鲲鹏 arm64）适用。", "accessed": "2026-07-26"},
+        {"url": "https://docs.pytorch.org/docs/2.13/generated/torch.nn.Module.html", "took": "torch.nn.Module.register_buffer(name, tensor, persistent=True) 的语义：把非参数状态登记进 module、默认随 state_dict 保存（例：register_buffer('running_mean', ...)）——用于消歧，它与传输引擎的『内存注册』完全无关。", "accessed": "2026-07-26"}
+      ],
+      "confidence": "high",
+      "writer_note": "⚠ 这条含一处**口径修订建议**：§17.2 现在写「这套注册要求起始地址按 2MB 大页边界对齐。对不齐，注册就失败。」——按公开权威口径，RDMA 注册本身**不要求**页对齐（rdmamojo/ibv_reg_mr），2MB 是大页粒度，对齐是为了能被大页覆盖、把 MR/页表条目降几个数量级（Mooncake RFC 的 67M→128K→256 那张表很适合直接引用，读者一眼看懂『为什么是 2MB』）。「不对齐就失败」是 Mooncake/ADXL 这类**具体引擎**的实现约束（源码 docstring 的口径），可以照写但要标明主语是引擎、不是 RDMA 协议通则。我没找到 Mooncake/ADXL 公开文档正面写死『2MB 否则注册失败』——如需在正文断言，请标注依据为源码 docstring。另建议半句消歧：§17.4 docstring 里的 `register_buffer` 指传输引擎的内存注册，**不是** PyTorch 的 `nn.Module.register_buffer`（后者是把非参数张量登记进 state_dict），同名不同物，初学者极易误读。"
+    },
+    {
+      "id": "kv-transfer-backends",
+      "term": "PD 分离的 KV 搬运后端：Mooncake / ADXL(HIXL) / LLMDataDist / NIXL",
+      "kind": "competing_set",
+      "one_line": "prefill 算完的 KV 要跨节点搬给 decode，这趟活儿由一层「传输引擎」承担；同一个位置上现在并存好几套——开源跨厂的 Mooncake、昇腾原生的 ADXL/HIXL 与 LLMDataDist、英伟达 Dynamo 生态的 NIXL——它们抢的是同一个插槽。",
+      "what_it_is": "PD 分离（prefill/decode disaggregation）把首 token 的计算与后续解码拆到不同节点，好处是两段各自按自己的瓶颈扩容；代价是每条请求的 KV cache 必须从 prefill 节点搬到 decode 节点。这层搬运被抽象成「KV connector / 传输引擎」：上层给一组 (本地地址, 远端地址, 长度)，下层选 RDMA / RoCE / 共享内存 / NVMe 把字节送到。它们对上层提的共同要求，就是本章讲的那些内存几何约束——地址要能注册（对齐）、每块要连续、第 0 维要是 block 维，这样才能按 block 粒度切片搬运。vllm-ascend 侧把它们做成可插拔的 connector（MooncakeConnectorV1 / AscendStoreConnector / LLMDataDistCMgrConnector / MultiConnector 组合）。",
+      "background": "2024 年之前 KV 传输基本是各家推理框架自己写；2024-2025 年 PD 分离成为长上下文服务的标配后，这层被独立抽出来成为公共基础设施——Moonshot 把 Mooncake 的传输引擎开源并接进 vLLM，NVIDIA 在 Dynamo 里推 NIXL，华为在 CANN 里提供 ADXL/LLMDataDist。结果是同一个插槽上出现多套实现，选谁基本由「你在哪块硬件上、要不要跨厂」决定。",
+      "alternatives": [
+        {
+          "name": "Mooncake Transfer Engine",
+          "unique": "以 KVCache 为中心的分离式架构里的数据面：两个核心抽象 Segment（一段可被远端读写的连续地址空间，RAM/VRAM 或 NVMe-oF）与 BatchTransfer（一批非连续区间之间的批量同步）；零拷贝，后端插件覆盖 RDMA、TCP、NVMe-oF/cuFile、EFA、NVLink、HIP，**也包含 Ascend 后端**。已直接集成进 vLLM v1 作为 PD 分离的 KV connector。",
+          "when": "要跨厂/跨介质（显存↔内存↔SSD），或想同时用它做 KV 池存储与前缀缓存共享时选它；vllm-ascend 文档里 MooncakeConnectorV1 做 PD 传输 + AscendStoreConnector 做前缀缓存节点是推荐组合。",
+          "link": "https://kvcache-ai.github.io/Mooncake/design/transfer-engine/index.html"
+        },
+        {
+          "name": "ADXL（Ascend Direct Xfer Library）/ HIXL（ascend_direct）",
+          "unique": "CANN 提供的**昇腾单边通信库**，官方定义：提供高性能、零拷贝的点对点数据传输能力，主要用于分布式集群内存传输（据 CANN 社区版 8.5.0.alpha001 文档）。单边（one-sided）= 远端不需要发起方参与即可被读写。vllm-ascend 的发布说明记载它已被设为 PD 分离的**默认后端**（提升性能与稳定性），并有实验性的 FabricMem 模式。",
+          "when": "全昇腾集群、追求原生栈的最短路径时选它——它是 vllm-ascend 这一版 PD 分离的默认；跨厂或要接第三方 KV 池时反而是 Mooncake 更通用。",
+          "link": "https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850alpha001/acce/llmdatadistdev/llmcdv2_42_20.html"
+        },
+        {
+          "name": "LLMDataDist（LLMDataDistCMgrConnector）",
+          "unique": "CANN 侧面向大模型的 KV 数据分发能力，vllm-ascend 通过 `LLMDataDistCMgrConnector` 暴露成一条独立的 PD 分离路径（教程里以 `\"kv_connector\": \"LLMDataDistCMgrConnector\"` 配置多机 PD）。",
+          "when": "沿用 CANN 官方 KV 分发栈、或参照官方多机 PD 教程部署时；它与 Mooncake 路线是同一插槽的两个选项。",
+          "link": "https://docs.vllm.ai/projects/ascend/en/v0.11.0/tutorials/multi_node_pd_disaggregation_llmdatadist.html"
+        },
+        {
+          "name": "NIXL（NVIDIA Inference Xfer Library）",
+          "unique": "GPU 世界的对位物，README 自述『targeted for accelerating point to point communications in AI inference frameworks such as NVIDIA Dynamo』；插件化后端（UCX 为主，另有 POSIX、GDS、GPUNETIO、LIBFABRIC、对象存储，甚至有 MOONCAKE 插件），统一抽象 CPU/GPU 内存与文件/块/对象存储。",
+          "when": "读者若在 NVIDIA Dynamo 生态里做同一件事，NIXL 是对应答案——列在这里是为了让读者看清『这不是昇腾独有的一层，而是行业普遍分工』。",
+          "link": "https://github.com/ai-dynamo/nixl"
+        }
+      ],
+      "links": [
+        "https://kvcache-ai.github.io/Mooncake/design/transfer-engine/index.html",
+        "https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850alpha001/acce/llmdatadistdev/llmcdv2_42_20.html",
+        "https://github.com/ai-dynamo/nixl"
+      ],
+      "sources": [
+        {"url": "https://kvcache-ai.github.io/Mooncake/design/transfer-engine/index.html", "took": "Transfer Engine 定义（high-performance, zero-copy data transfer library）、Segment/BatchTransfer 两个抽象、支持的后端列表含 RDMA/TCP/NVMe-oF/EFA/**Ascend**/NVLink/HIP。", "accessed": "2026-07-26"},
+        {"url": "https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850alpha001/acce/llmdatadistdev/llmcdv2_42_20.html", "took": "ADXL 官方定义原文：『ADXL（Ascend Direct Xfer Library）即昇腾单边通信库，提供高性能、零拷贝的点对点数据传输的能力』；文档版本 CANN 社区版 8.5.0.alpha001；该页未给出对齐/注册的量化要求。", "accessed": "2026-07-26"},
+        {"url": "https://docs.vllm.ai/projects/ascend/zh-cn/main/user_guide/feature_guide/kv_pool.html", "took": "vllm-ascend 用户文档：MooncakeConnectorV1 做 kv_transfer、AscendStoreConnector 做 prefix-cache 节点、MultiConnector 组合；故障定位处把底层传输层称作『HIXL (ascend_direct)』。文档为 main（开发预览）分支。", "accessed": "2026-07-26"},
+        {"url": "https://docs.vllm.ai/projects/ascend/en/v0.11.0/tutorials/multi_node_pd_disaggregation_llmdatadist.html", "took": "LLMDataDistCMgrConnector 作为多机 PD 分离的 KV 传输 connector（配置项与模块路径 vllm_ascend.distributed.llmdatadist_c_mgr_connector）；文档版本 v0.11.0。", "accessed": "2026-07-26"},
+        {"url": "https://github.com/ai-dynamo/nixl", "took": "NIXL 全称与一句话定位、插件后端列表（UCX/POSIX/GDS/GPUNETIO/LIBFABRIC/OBJ/AZURE_BLOB/HF3FS/MOONCAKE/GUSLI/UCCL）、与 Dynamo 的关系。", "accessed": "2026-07-26"},
+        {"url": "本仓 pin 内文档 vllm_ascend/../docs/source/user_guide/release_notes.md", "took": "发布说明两条：『Set ADXL engine as default backend for disaggregated prefill with improved performance and stability』（PR #3761/#3950/#5008/#3072）与『[Experimental] Support FabricMem Mode for ADXL/HIXL interconnect』（PR #6806）——ADXL 与 HIXL 被并称。", "accessed": "2026-07-26"}
+      ],
+      "confidence": "medium",
+      "writer_note": "本章只在 §17.2 括注里点名 Mooncake/ADXL，**保持点到即止**（PD 分离主场在 ch11，别抢戏）。可升级的一处是那句含糊的「ADXL 是昇腾另一套与 Mooncake 并列的 P2P 传输后端」——现在有权威定义可用：ADXL = Ascend Direct Xfer Library，CANN 的昇腾单边通信库，提供零拷贝点对点传输（CANN 8.5.0.alpha001 文档），且本仓发布说明记载它已是 PD 分离默认后端。⚠ **ADXL 与 HIXL(ascend_direct) 的确切关系我未查到权威说明**（vllm-ascend 文档在故障定位处叫 HIXL，发布说明写作『ADXL/HIXL interconnect』并称），正文不要断言二者是同一物或上下层，写『昇腾侧的 ADXL/HIXL 传输栈』这种不表态的措辞最安全。另：正文说「二者都走同一套 2MB 对齐要求」——依据只有源码 docstring，别当外部事实写。NIXL/LLMDataDist 只适合放进「延伸阅读」而非正文。"
+    },
+    {
+      "id": "attention-kv-layout-family",
+      "term": "MHA / MQA / GQA / MLA：KV cache 的四种摆法",
+      "kind": "competing_set",
+      "one_line": "同样是「把每个 token 的 K、V 存下来」，这四种注意力变体存的东西差着一个数量级——本章 `calc_split_factor` 那张 GQA 对半、MLA 偏成 8:1 的表，根子就在这里。",
+      "what_it_is": "自回归解码时，每生成一个 token 都要回看之前所有 token 的 K、V，于是把它们缓存下来。缓存有多大，取决于「每个 token 每层要存多少个数」。四种做法沿着「省缓存 vs 保质量」这条轴排开：MHA 每个注意力头各存一份 K、V；MQA 让所有头共享**一份** K、V；GQA 折中，分成 n_g 组、每组一份；MLA 干脆不存 K、V 本身，只存一个低秩压缩过的潜向量（外加一小段带位置信息的 key）。DeepSeek-V2 论文的 Table 1 给了统一口径的每 token 元素数（l = 层数、n_h = 头数、d_h = 头维、n_g = 组数）：MHA 为 `2·n_h·d_h·l`，GQA 为 `2·n_g·d_h·l`，MQA 为 `2·d_h·l`，MLA 为 `(d_c + d_h^R)·l ≈ (9/2)·d_h·l`——按 DeepSeek-V2 的取值相当于「只有 2.25 组的 GQA」，而论文称其效果反而强于 MHA。\n\n对本章的意义：K 与 V 是否对称，直接决定「把一层 KV 按比例切成两块」时切多少。MHA/MQA/GQA 的 K、V 形状天然对称（各占一半）；MLA 存的两段（压缩潜向量 512、位置段 64）严重不对称，比例就成了 8:1。",
+      "background": "顺序是历史顺序：MHA 出自 2017 年的 Transformer；MQA 是 Noam Shazeer 2019 年为解码时的显存带宽瓶颈提的（One Write-Head is All You Need），省得狠但掉点；GQA（2023）在两者之间插值，并给出用 5% 预训练算力把已有 MHA 权重「升训」成 GQA 的办法，于是迅速成为 Llama-2/3 一代的默认；MLA（2024，DeepSeek-V2）换了条路——不是减少头数，而是把 KV 压进低秩潜空间，宣称 KV cache 降 93.3%、最大生成吞吐提到 5.76 倍。",
+      "alternatives": [
+        {"name": "MHA（Multi-Head Attention）", "unique": "每头独立 K、V，每 token 每层 `2·n_h·d_h` 个元素——缓存最大、质量基线。", "when": "小模型 / 短上下文，或作为对照基线；长上下文服务基本不再用。", "link": "https://arxiv.org/abs/1706.03762"},
+        {"name": "MQA（Multi-Query Attention）", "unique": "所有查询头共享一份 K、V，`2·d_h`——缓存最小（比 MHA 小 n_h 倍），Shazeer 2019 的原始动机是解码时的**内存带宽**而非容量。", "when": "极端在意解码带宽、可接受一定质量损失时。", "link": "https://arxiv.org/abs/1911.02150"},
+        {"name": "GQA（Grouped-Query Attention）", "unique": "介于两者之间的 n_g 组 KV 头，`2·n_g·d_h`；论文原话『uptrained GQA achieves quality close to multi-head attention with comparable speed to MQA』，且只需 5% 原预训练算力即可从 MHA checkpoint 升训。", "when": "绝大多数开源稠密模型的默认选择；K/V 形状对称，KV 布局最简单。", "link": "https://arxiv.org/abs/2305.13245"},
+        {"name": "MLA（Multi-head Latent Attention）", "unique": "不存 K/V，存低秩联合压缩的潜向量 c^KV 加一段解耦 RoPE key，`(d_c + d_h^R)`；DeepSeek-V2 取 d_c=4·d_h=512、d_h^R=d_h/2=64，等效『2.25 组的 GQA』而质量强于 MHA。代价是缓存里两段**维度悬殊且语义不同**。", "when": "DeepSeek 系（V2/V3/V3.2/V4）与跟进者；也正是本章 K/V 按 512:64 偏比例切分的原因。", "link": "https://arxiv.org/abs/2405.04434"}
+      ],
+      "links": [
+        "https://arxiv.org/abs/2305.13245",
+        "https://arxiv.org/abs/1911.02150",
+        "https://arxiv.org/abs/2405.04434"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/html/2405.04434v5", "took": "DeepSeek-V2 论文 Table 1 的四行公式：MHA 2·n_h·d_h·l、GQA 2·n_g·d_h·l、MQA 2·d_h·l、MLA (d_c+d_h^R)·l≈(9/2)·d_h·l；以及『MLA requires only a small amount of KV cache, equal to GQA with only 2.25 groups, but can achieve stronger performance than MHA』。", "accessed": "2026-07-26"},
+        {"url": "https://arxiv.org/abs/2405.04434", "took": "DeepSeek-V2 摘要：MLA 把 KV cache 压成潜向量，KV cache 降 93.3%，最大生成吞吐 ×5.76；提交日 2024-05-07（v5 2024-06-19）。", "accessed": "2026-07-26"},
+        {"url": "https://arxiv.org/abs/2305.13245", "took": "GQA 论文标题《GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints》、2023-05-22、插值定位与 5% 算力升训、质量近 MHA 速度近 MQA。", "accessed": "2026-07-26"},
+        {"url": "https://arxiv.org/abs/1911.02150", "took": "MQA 论文《Fast Transformer Decoding: One Write-Head is All You Need》，Noam Shazeer，2019-11-06；共享 K/V 以降低增量解码的显存带宽需求。", "accessed": "2026-07-26"}
+      ],
+      "confidence": "high",
+      "writer_note": "§17.3 那张 GQA `[64,64]` vs MLA `[512,64]` 的对照表是全章最好的一处「机制不是硬编码对半」的说明，但它默认读者知道 GQA/MLA 是什么——现在正文只给了两个括注。建议在表前加一句带出处的定位：GQA（2023，MHA 与 MQA 之间的插值，K/V 头数对称）与 MLA（2024 DeepSeek-V2，把 KV 压成低秩潜向量，等效『2.25 组的 GQA』），并把深挖交给 ch21-primer-mla 与论文链接。**不要**在本章展开四种变体的数学，一句定位 + 两条 arXiv 链接足够。"
+    },
+    {
+      "id": "mla-nope-rope",
+      "term": "MLA 缓存里的 nope 段与 rope 段（kv_lora_rank / qk_rope_head_dim）",
+      "kind": "external_concept",
+      "one_line": "MLA 每个 token 只缓存两样东西：一段被压扁的「内容」潜向量（nope，512 维）和一小段专门扛位置信息的 key（rope，64 维）——名字看着像一对孪生词，其实是两个来源完全不同的东西。",
+      "what_it_is": "MLA 把每层每 token 的 K、V 联合压成一个低秩潜向量 c^KV（维度 d_c = kv_lora_rank），用时再用上投影矩阵还原出 K、V。麻烦出在位置编码：RoPE 是「按位置旋转」的操作，如果对还原出的 key 施加 RoPE，上投影矩阵 W^UK 就与位置相关的旋转矩阵纠缠在一起，推理时再也不能被吸收进 W^Q（论文原话：W^UK cannot be absorbed into W^Q anymore during inference），省算的把戏就废了。DeepSeek 的解法是**解耦 RoPE**：额外拿出一小段专门承载位置的 query/key（维度 d_h^R = qk_rope_head_dim），只对这一段施加 RoPE，其余「内容」部分不带位置——不带位置的那部分就被叫作 **nope（no positional embedding）**。于是缓存里躺着两段：nope 段 = 压缩潜向量（DeepSeek 系 d_c = 512），rope 段 = 解耦位置 key（d_h^R = 64），每 token 每层共 576 个元素。这就是本章把一层 KV 切成 K 块（nope）与 V 块（rope）、比例 512:64 的全部来历。\n\n⚠ 一个极易踩的命名坑：配置里还有个 `qk_nope_head_dim`（DeepSeek-V3.2 取 128），指的是 query/key **每个头**内不带位置的那部分维度，**不是**缓存里那个 512 维的 nope。缓存侧的 nope = `kv_lora_rank`。",
+      "background": "MLA 出自 DeepSeek-V2（2024-05），V3、V3.2、V4 一路沿用。为什么会长成「一大一小两段」这种别扭形状？因为它是两个约束的交集：既要压缩 KV（低秩），又要保住『上投影矩阵能被吸收进 Q』这个推理期加速前提（解耦 RoPE）。RoPE 本身来自 RoFormer（Su et al., 2021），用旋转矩阵编码绝对位置、让注意力自然带上相对位置依赖，是当代 LLM 的事实标准位置编码。",
+      "example": "说明性外部数值（取自 DeepSeek-V3.2-Exp 官方 config.json 与 DeepSeek-V2 论文，可核）：\n| 字段 | 值 | 含义 |\n|---|---|---|\n| `kv_lora_rank` (d_c) | 512 | 缓存里的 nope 段：压缩潜向量维度（论文：d_c = 4·d_h，d_h=128） |\n| `qk_rope_head_dim` (d_h^R) | 64 | 缓存里的 rope 段：解耦 RoPE key 维度（论文：d_h/2） |\n| 合计 | 576 | 每 token 每层缓存的元素数 |\n| `qk_nope_head_dim` | 128 | ⚠ 是 q/k 每头的无位置分量，**不进缓存**，别与上面的 nope 混 |\n交叉验证：vLLM 官方博客给 DeepSeek-V3.2 的 MLA 每 token 缓存 656 字节 = 512 字节量化潜向量 + 16 字节 scale + 128 字节未量化 RoPE 段（64 维 × 2 字节）。",
+      "links": [
+        "https://arxiv.org/abs/2405.04434",
+        "https://arxiv.org/abs/2104.09864",
+        "https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/config.json"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/html/2405.04434v5", "took": "MLA 的低秩联合压缩 c^KV = W^DKV·h_t、k^C = W^UK·c^KV、v^C = W^UV·c^KV；d_c = 4·d_h（=512，d_h=128）；解耦 RoPE 小节原话『If we apply RoPE for the keys k^C, W^UK will be coupled with a position-sensitive RoPE matrix... W^UK cannot be absorbed into W^Q anymore during inference』；额外 q^R/k^R 维度 d_h^R = d_h/2 = 64；总缓存 (d_c + d_h^R)·l。", "accessed": "2026-07-26"},
+        {"url": "https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/config.json", "took": "官方配置实测值：kv_lora_rank=512、qk_rope_head_dim=64、qk_nope_head_dim=128、v_head_dim=128、num_hidden_layers=61、num_nextn_predict_layers=1；量化 fp8/e4m3、base dtype bfloat16。", "accessed": "2026-07-26"},
+        {"url": "https://vllm.ai/blog/2025-09-29-deepseek-v3-2", "took": "『MLA's KV cache consists of 656 bytes per token: 512 bytes of quantized values, 16 bytes of scale factors, and 128 bytes of unquantized RoPE data』——与 512/64 维度口径互证。博客日期 2025-09-29。", "accessed": "2026-07-26"},
+        {"url": "https://arxiv.org/abs/2104.09864", "took": "RoPE 出处：RoFormer: Enhanced Transformer with Rotary Position Embedding，Su Jianlin 等，2021-04-20；用旋转矩阵编码绝对位置并自然引入相对位置依赖。", "accessed": "2026-07-26"},
+        {"url": "https://arxiv.org/abs/2405.04434", "took": "MLA 的整体收益口径（KV cache −93.3%、吞吐 ×5.76），用于一句话定位。", "accessed": "2026-07-26"}
+      ],
+      "confidence": "high",
+      "writer_note": "§17.3 与 §17.5 各有一处括注解释 nope/rope，目前只说「nope（kv_lora_rank 低秩压缩段）与 rope（qk_rope_head_dim 旋转位置段）」——准确但没解答读者心里那句「为什么非拆成一大一小两段？」。建议在 §17.5 MLA 那段补一句**带因果**的解释：RoPE 会让上投影矩阵与位置纠缠、破坏推理期的权重吸收，所以 DeepSeek 把位置信息单独拎成一小段（解耦 RoPE），缓存里才成了 512 + 64 这种悬殊形状——然后立刻内链 ch21-primer-mla（那一章就是讲这个推导的），**别在本章推导**。另强烈建议补一句命名消歧：`qk_nope_head_dim=128` 与缓存里的 nope(512) 不是一回事，否则读者去翻 config 会当场困惑。可用的可核数字：512/64/576、656 字节 = 512+16+128。"
+    },
+    {
+      "id": "deepseek-sparse-attention-indexer",
+      "term": "DSA（DeepSeek Sparse Attention）与 Lightning Indexer 自带的那份 K cache",
+      "kind": "external_concept",
+      "one_line": "DeepSeek-V3.2 在算注意力之前先用一个轻量「闪电索引器」挑出最相关的 2048 个 token——而这个索引器自己也要缓存一份 K，于是每层 KV 之外凭空多出 `dsa_k` 和它的量化 scale 两块张量。",
+      "what_it_is": "DSA 由两部分组成：**lightning indexer**（闪电索引器，一个很轻的相关性打分网络）与 **token selector**（按分数取 top-k）。对每个 query token，索引器先算出它与上下文各 token 的相关分，选出 top-2048，真正昂贵的注意力只在这 2048 个 token 上算——于是推理开销随上下文近似线性增长而非平方。代价落在显存布局上：索引器打分要用自己的一套 key，所以**每个 token 除了 MLA 的 KV，还要再缓存一份 indexer K**（vLLM 官方博客原话：for each token, there is now another K cache used by the indexer）。这份索引 K cache 用 FP8 存、**按块带 scale**，而且博客明确指出「一个 token 的 cache 不是连续存的」——前 `block_size × head_dim` 项存值，其后存 scale。这正好解释了本章为什么要给 `dsa_k` / `dsa_k_scale` 单独分配、还要用跨步视图把它们按页摆进同一块内存：值段与 scale 段在一个页内是分开的两段，不是简单的结构体数组。",
+      "background": "稀疏注意力不是新东西（滑窗、局部+全局、块稀疏都有前作），DeepSeek 这一支的谱系是 NSA（原生可训练稀疏注意力）→ DSA：关键转变是「稀疏模式由一个可学习的轻量索引器在线决定」，而不是写死的固定模式。DeepSeek-V3.2-Exp（2025-09）是在 V3.1-Terminus 上继续训练植入 DSA 的实验版本；索引器用 21 亿 token 学习去预测原稠密注意力会关注哪些 token。vLLM 在发布当天（day 0）就接入，用 DeepGEMM 的索引器 kernel 与 FlashMLA 的稀疏注意力 kernel。",
+      "example": "说明性外部数值（DeepSeek-V3.2-Exp 官方 config.json + vLLM 官方博客，2025-09-29）：\n| 量 | 值 | 说明 |\n|---|---|---|\n| `index_n_heads` | 64 | 索引器的头数 |\n| `index_head_dim` | 128 | 索引器 key 的每头维度——`dsa_k` 张量最后一维的来源 |\n| `index_topk` | 2048 | 每个 query 最终参与注意力的 token 数 |\n| block_size | 64 | 博客说明这一版被钉死为 64，因为 FlashMLA 与索引器 cache 布局都按它裁剪 |\n索引 K cache 的页内布局（博客原话转述）：前 `block_size × head_dim` 个位置放 FP8 的值，其余位置放该块的 scale factor——所以「一个 token 的 cache 并不连续」。",
+      "links": [
+        "https://vllm.ai/blog/2025-09-29-deepseek-v3-2",
+        "https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp",
+        "https://arxiv.org/abs/2512.02556"
+      ],
+      "sources": [
+        {"url": "https://vllm.ai/blog/2025-09-29-deepseek-v3-2", "took": "『The lightning indexer module has cached K values specifically for indexing. This means that for each token, there is now another K cache used by the indexer』；索引 K cache 用 FP8 + per-block scaling，『the first block_size * head_dim entries contain the value, the rest contain the scaling factor』『the cache for one token is not stored contiguously』；top-2048；block size 固定 64（FlashMLA tailored to it）。博客日期 2025-09-29。", "accessed": "2026-07-26"},
+        {"url": "https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/config.json", "took": "index_head_dim=128、index_n_heads=64、index_topk=2048（与博客口径一致）。", "accessed": "2026-07-26"},
+        {"url": "https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp", "took": "模型卡口径：V3.2-Exp = 在 V3.1-Terminus 上继续训练植入 DSA 的实验版本；DSA = lightning indexer + token selector。", "accessed": "2026-07-26"}
+      ],
+      "confidence": "high",
+      "writer_note": "§17.4 开头那句「DeepSeek-V3.2 的稀疏注意力（sparse-c8）在 K、V 之外还要一对 indexer 张量」是对的，但读者会卡在「indexer 是什么、为什么它还要自己的 K」。建议补两句有出处的因果：索引器先给全上下文打分、挑 top-2048 再算注意力，所以它需要一套自己的 key，于是每 token 多一份 K cache（FP8 + per-block scale，且**一个 token 的 cache 在页内并不连续**）——最后这一点正是本章 dsa_k/dsa_k_scale 要共享一块页对齐内存、并用跨步视图分段落位的外部根因，是全章最能把 §17.4 与 §17.6 串起来的一句。深挖（NSA→DSA 谱系与数学）内链 ch23-primer-sparse-attention、后端实现内链 ch24。注意 `sparse-c8` 这个名字是本仓/昇腾侧的内部叫法，外部文献里只有 DSA / lightning indexer，别把 sparse-c8 当作论文术语写。"
+    },
+    {
+      "id": "multi-token-prediction",
+      "term": "MTP（Multi-Token Prediction）：为什么模型里会多出几层「排在最后」的层",
+      "kind": "external_concept",
+      "one_line": "MTP 是让模型在训练时一次预测好几个后续 token 的目标函数；落到推理，这几个额外的小层可以直接当草稿模型用来做投机解码——它们在配置里是**附加**在主模型之后的层，这正是本章绑定阶段要为它们特殊排序的原因。",
+      "what_it_is": "标准语言模型每步只预测下一个 token。MTP 在训练时加一个目标：同一位置同时预测未来第 2、第 3 个 token，用若干**很轻**的额外模块（DeepSeek-V3 每个 MTP 模块只有一层）承担。它带来两件事：(1) 训练信号更密，效果更好；(2) 推理时这些模块可以被「改作他用」——先用它们廉价地草拟出后面几个 token，再让主模型一次性并行验证，也就是自草稿式的投机解码。DeepSeek-V3 报告的第二 token 接受率在各类主题上稳定在 85%–90%，实测解码速度约 1.8 倍 TPS。\n\n对本章的意义只在**层的编号**上：MTP 模块是附加在主干之后的层，在配置的按层数组里排在所有主模型层之后（DeepSeek-V3.2 的 `num_nextn_predict_layers=1`，即 1 个 MTP 层），而运行期模块名仍保留自己的命名空间（如 `mtp.0`）。默认按模块名里的层号排序会把它们排到主模型层中间去，所以绑定时要用一个「MTP 层号 += 主模型层数」的排序键把它们推到队尾。",
+      "background": "多 token 预测的思路在 Gloeckle et al. 2024（Better & Faster Large Language Models via Multi-token Prediction）等工作里已有；DeepSeek-V3（2024-12）把它作为训练目标写进技术报告（摘要原话：sets a multi-token prediction training objective for stronger performance），并明确它在推理时可复用于投机解码。此后 MTP 成了国产大模型的常见配置项，vLLM 侧也把它接成一种 speculative decoding 的 draft 方式。",
+      "example": "说明性外部数值：\n- DeepSeek-V3.2-Exp 官方 config.json：`num_hidden_layers = 61`、`num_nextn_predict_layers = 1` —— 即 61 层主干 + 1 个 MTP 模块。若按「配置按层数组」的下标编排，MTP 模块占的就是第 61 号（0-based）这个位置，也就是**主模型层之后**。\n- DeepSeek-V3 技术报告口径：第二个 token 的接受率 85%–90%，配合投机解码约 1.8× TPS。",
+      "links": [
+        "https://arxiv.org/abs/2412.19437",
+        "https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/config.json"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/abs/2412.19437", "took": "DeepSeek-V3 技术报告摘要：采用 MLA + DeepSeekMoE，并『sets a multi-token prediction training objective for stronger performance』；提交 2024-12-27（2025-02-18 修订）。摘要本身未提投机解码。", "accessed": "2026-07-26"},
+        {"url": "https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/config.json", "took": "num_hidden_layers=61、num_nextn_predict_layers=1——MTP 模块数量与主干层数的实际取值。", "accessed": "2026-07-26"},
+        {"url": "https://deepwiki.com/deepseek-ai/DeepSeek-V3/4.4-multi-token-prediction-(mtp)", "took": "MTP 模块每个仅一层、推理期可复用于投机解码、第二 token 接受率 85%-90%、约 1.8× TPS 的转述口径（二手整理，非 DeepSeek 官方页面）。", "accessed": "2026-07-26"}
+      ],
+      "confidence": "medium",
+      "writer_note": "§17.7 现在只有「MTP（多 token 预测）层」一个括注，读者接不住「为什么它排在后面」。建议扩成一句半：MTP 是训练时多预测几个后续 token 的轻量附加模块（DeepSeek-V3 每个只一层），推理期可复用作投机解码的草稿；它们是**附加在主干之后**的层（V3.2: 61 主干层 + 1 个 MTP），所以配置的按层数组把它们编在主模型层之后——默认按模块名层号排序就会排错。然后内链 ch34-primer-speculative-sampling / ch36。⚠ 两处 confidence 说明：接受率 85–90% 与 1.8× TPS 我只在二手整理页核到（DeepWiki），**arXiv 摘要页未见**，若正文要写这两个数请标「据 DeepSeek-V3 技术报告」并最好由 primer 章的论文包核实；「MTP 层在配置按层数组里排在主模型层之后」这一条的直接依据是本仓 `extract_dsv4_layer_index` 的 docstring + config 的 num_nextn_predict_layers 语义，外部无正面权威陈述，别写成论文原文。"
+    },
+    {
+      "id": "longcat-flash",
+      "term": "LongCat-Flash（美团）：为什么它一层要挂两组 attention",
+      "kind": "external_project",
+      "one_line": "美团开源的 MoE 大模型，架构上每一层放了**两个** MLA 注意力块（中间夹 FFN/MoE）——所以给它绑定 KV 时必须告诉绑定逻辑「一层对应两组」。",
+      "what_it_is": "LongCat-Flash 是美团 LongCat 团队 2025 年 9 月放出的大规模 MoE 模型（技术报告 arXiv:2509.01322）。它有两个架构特点：(1) **Shortcut-Connected MoE（ScMoE）**——把第一个注意力块的输出用一条捷径直接送到 MoE 块，从而把「计算」与「专家并行的通信」重叠窗口拉大，提升推理吞吐；(2) **零计算专家（zero-computation experts）**——按 token 的重要性动态决定算多少，平均每 token 激活约 27B 参数（区间 18.6B–31.3B）。为了搭出这条捷径，它的**每一层集成了两个 MLA 块**外加多个异构 FFN 块。对本章而言，重点只有一句：一层两个注意力模块 ⇒ 每层要挂两份 KV ⇒ 绑定时 `num_attn_module=2`。",
+      "background": "「一层两注意力」不是为了效果而是为了**并行与重叠**：MoE 的专家并行通信（all-to-all）很贵，若一层里只有一段计算，通信就没法藏；把注意力拆成两段并给 MoE 加一条捷径，就能让第二段计算与第一段的通信重叠。这类「为通信重叠重排架构」的思路在 2025 年的大 MoE（DeepSeek 的双微批重叠、LongCat 的 ScMoE）里成了共同主题。",
+      "links": [
+        "https://arxiv.org/abs/2509.01322",
+        "https://huggingface.co/meituan-longcat/LongCat-Flash-Chat"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/pdf/2509.01322", "took": "技术报告口径：每层集成两个 MLA 块与多个异构 FFN 块，第一个 MLA 输出经 shortcut 直连 MoE 块（ScMoE）以扩大计算-通信重叠窗口；零计算专家；平均每 token 激活 27B（18.6B–31.3B）。（经 WebSearch 检索该 PDF 与 arXiv 摘要页得到，未逐页通读全文）", "accessed": "2026-07-26"}
+      ],
+      "confidence": "medium",
+      "writer_note": "§17.7 的括注「（美团 LongCat-Flash 模型）… 这个模型每个解码层含 2 个 attention module」结论正确，可以补一句**为什么**：它每层放两个 MLA 块，是为了给 Shortcut-Connected MoE 腾出计算-通信重叠窗口——读者立刻明白 `num_attn_module=2` 不是随便的魔法数，而是架构外形的直接后果。一句 + arXiv 链接即可，别展开 MoE。confidence 标 medium 是因为我依据的是检索到的技术报告转述而非逐页通读原文；若正文要写「两个 MLA 块」这一具体措辞，保守写成「每层含两组注意力模块（据 LongCat-Flash 技术报告 arXiv:2509.01322）」。"
+    },
+    {
+      "id": "hccl",
+      "term": "HCCL：昇腾的集合通信库",
+      "kind": "external_project",
+      "one_line": "CANN 里对应 NVIDIA NCCL 的那一层——多张 NPU 之间做 AllReduce / AllGather / AlltoAll 等集合通信的高性能库。",
+      "what_it_is": "HCCL（Huawei Collective Communication Library）是基于昇腾硬件的高性能集合通信库，提供 AllReduce、Broadcast、AllGather、ReduceScatter、AlltoAll、Send/Recv 等原语，实现 Ring、Mesh、递归折半倍增（RHD）等算法，跑在 HCCS、RoCE、PCIe 等高速链路上（据 CANN 商用版 8.5.0 文档）。在分布式推理里，张量并行/专家并行的每一次通信都落到它身上。本章只在一处用到它：把 KV 内存注册进通信/传输栈时，条目越少越好——把相邻两段合并成一次注册，就是在给 HCCL/Mooncake 的注册表减负。",
+      "background": "位置上它对应 GPU 世界的 NCCL：同样的原语集、同样的拓扑感知算法族，换了硬件互联（HCCS 之于 NVLink、RoCE 之于 IB）。读者若熟悉 NCCL，可以一比一迁移直觉。",
+      "links": [
+        "https://www.hiascend.com/document/detail/en/canncommercial/850/commlib/hcclug/hcclug_000001.html",
+        "https://www.hiascend.com/cann/hccl"
+      ],
+      "sources": [
+        {"url": "https://www.hiascend.com/document/detail/en/canncommercial/850/commlib/hcclug/hcclug_000001.html", "took": "官方定义『Huawei Collective Communication Library (HCCL) is a high-performance collective communication library based on Ascend hardware』；原语 AllReduce/Broadcast/AllGather/ReduceScatter/AlltoAll/Send/Recv；算法 Ring/Mesh/RHD；链路 HCCS、RoCE、PCIe。文档版本 CANN 商用版 8.5.0。", "accessed": "2026-07-26"}
+      ],
+      "confidence": "high",
+      "writer_note": "§17.4 两次出现「HCCL/Mooncake 注册」但全章没解释 HCCL 是什么。若本书前面章节（ch06 NPU communicator / ch08 并行组）已介绍过，这里内链回去即可；若没有，加半句「HCCL 是昇腾的集合通信库，相当于 CUDA 世界的 NCCL」就够——本章它只是注册条目的消费方，不要展开。"
+    },
+    {
+      "id": "vllm-hybrid-kv-cache-groups",
+      "term": "KV cache group 与「manager 的块 ≠ kernel 的块」",
+      "kind": "external_concept",
+      "one_line": "当一个模型里混着好几种注意力（全注意力、滑窗、Mamba），vLLM 会把同类层归成一个「KV cache group」并强制各组页大小一致——代价就是某些层的 block_size 会被抬高，于是「管理器眼里的块」和「算子眼里的块」不再是同一个数。",
+      "what_it_is": "vLLM 的 KV cache manager 按固定大小的块分配显存。麻烦在于新一代模型是**混合**的：gpt-oss、Gemma 2/3、Ministral 等混滑窗与全注意力，另一些混 Mamba 与注意力——不同类型的层每个请求需要的块数根本不同。vLLM 的解法是把层分组：**一个 group 里只放同类型的层**，这样组内每个请求需要的块数一致；同时要求**所有 group 的页大小相同**（否则同一个块池没法共用）。为了凑齐页大小，官方设计文档明说会「抬高注意力层的 block_size」——这就是本书里 16→128 这类块大小跃迁的上游来源。抬高之后，KV 管理器按 128 个 token 一块去申请/复用/调度，而注意力算子内部可能仍按更小的粒度算，于是需要把两个粒度都记下来（manager 侧 block_size + kernel 侧 block_size），寻址时才对得上。",
+      "background": "vLLM v1 早期假设全模型同一种注意力、同一个 block_size；2025 年混合架构模型集中出现后，社区提了 Hybrid Memory Allocator RFC（vllm#11382），把「一个块池 + 多个 group」这套做进 v1，官方 design 文档《Hybrid KV Cache Manager》即其产物。文档自称『This feature is still in its early stage and things may change』——所以这是一块**还在动**的地基，版本敏感。",
+      "links": [
+        "https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager/",
+        "https://github.com/vllm-project/vllm/issues/11382"
+      ],
+      "sources": [
+        {"url": "https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager/", "took": "混合模型举例（滑窗+全注意力：gpt-oss、Gemma 2/3、Ministral、cohere；Mamba+注意力）；KV cache group 定义『Each group only contains layers with the same attention type and thus need the same number of blocks for a given request』；各组页大小必须一致，混合 Mamba 时的对策是『Increase the block_size of attention layers』；文档自述早期阶段、对应 commit 458e74。", "accessed": "2026-07-26"}
+      ],
+      "confidence": "medium",
+      "writer_note": "§17.8 现在用自己的话解释了「虚拟 block 切分」，方向对但缺出处、也容易让读者以为这是昇腾独有的。建议加一句有出处的定位：KV cache group 与「组间页大小必须一致 ⇒ 抬高注意力层 block_size」是 vLLM 基座 Hybrid KV Cache Manager 的设计（官方 design 文档），16→128 正是这条规则的产物；昇腾这边多做的只是把 kernel 侧粒度记成 `self.kernel_block_sizes` 实例属性。⚠ 版本敏感：我读的是 docs.vllm.ai 的 latest（对应 commit 458e74，文档自称仍在早期、可能变），本书 pin 的是 v0.21.0——正文若引用请写「据 vLLM 官方 Hybrid KV Cache Manager 设计文档（2026-07 访问）」，别写成 pin 版本内的固定事实。另：「kernel 按 16 token 一块算」这个具体数字是正文举例，不是文档口径，保持『比如』的措辞。"
+    },
+    {
+      "id": "paged-attention",
+      "term": "PagedAttention",
+      "kind": "external_concept",
+      "one_line": "把操作系统的虚拟内存分页搬到 KV cache 上：不给每条序列预留一整段连续显存，而是切成固定大小的块、用一张块表做「逻辑页→物理页」的映射。",
+      "what_it_is": "论文的观察是：KV cache 随生成动态涨缩，若按最大长度预留连续显存，会产生大量内部/外部碎片和重复拷贝，把能同时跑的 batch 卡死。PagedAttention 借用经典虚拟内存与分页：KV 按块存放、块可以不连续、用块表间接寻址。两个直接收益——碎片几乎消失（块粒度而非序列粒度）；相同前缀的请求可以**共享**同一批物理块（论文强调 flexible sharing of KV cache within and across requests）。论文报告在同等时延下吞吐提升 2–4 倍，序列越长、模型越大收益越明显。这套机制正是本章一切「块（block）」「页大小（page_size_bytes）」「块表」词汇的来源。",
+      "background": "出自 vLLM 的原始论文《Efficient Memory Management for Large Language Model Serving with PagedAttention》（arXiv:2309.06180，SOSP 2023），也是 vLLM 这个项目的起点；此后成为几乎所有推理引擎的标配，并衍生出前缀缓存、KV 卸载、PD 分离等一整条生态。",
+      "links": [
+        "https://arxiv.org/abs/2309.06180",
+        "https://docs.vllm.ai/en/latest/design/paged_attention/"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/abs/2309.06180", "took": "标题《Efficient Memory Management for Large Language Model Serving with PagedAttention》、2023-09-12、SOSP 2023；摘要口径：KV cache 动态涨缩导致碎片与重复浪费、灵感来自操作系统的虚拟内存与分页、支持请求内与请求间的 KV 共享、同等时延下吞吐 2–4×。", "accessed": "2026-07-26"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文开头（第 3 段）那段 PagedAttention 介绍口径与论文一致，**不需要扩写**——本条只作核对与配链。若要微调，可把「2–4× 吞吐（SOSP 2023）」这个可核数字加进去，一个数比一句形容词更有说服力；其余深入维持交给姊妹篇《vLLM 源码解读》与 arXiv 链接。"
+    }
+  ]
+}

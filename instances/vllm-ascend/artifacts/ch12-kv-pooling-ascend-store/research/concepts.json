@@ -1,0 +1,264 @@
+{
+  "chapter": "ch12-kv-pooling-ascend-store",
+  "researched_at": "2026-07-26",
+  "pin_anchor": "vllm-ascend v0.21.0rc1（commit 80610e44），配套 vLLM v0.21.0。凡「外部项目现在怎样」的断言均注明查证日期 2026-07-26 与所依据的文档分支/版本；外部生态变化快（本章涉及的 Mooncake Store、Ascend MemCache、openYuanrong 都是 2025 年才开源的项目），正文转述时务必保留时间限定，别写成永恒事实。",
+  "scope_note": "只做读者定向的外部背景：Mooncake Store（区别于 ch11 已讲的 Transfer Engine）、三个池后端的生态定位、内容寻址存储、vLLM 上游 block hash 记法、Python Queue 的 join/task_done 语义与「背压」一词、PCP/DCP 并行坐标、NPU/CUDA event 语义、RadixAttention、写放大。本仓 pin 源码解读归 dossier/explainer。所有 example 均为**说明性/外部**示例，不标 # SOURCE:。ch11 concepts.json 已覆盖并**本章不重复**的：Mooncake Transfer Engine 本体、RDMA 与注册内存（register_buffer 的底层原理）、vLLM v1 KVConnector 契约、HMA / KV cache group、zmq REQ-REP 与 msgpack、PD 分离论文谱系——正文遇到这些时按「第 11 章讲过」一句带过即可。",
+  "concepts": [
+    {
+      "id": "mooncake-store",
+      "term": "Mooncake Store（不是 Transfer Engine，是建在它之上的那个分布式 KV 池）",
+      "kind": "external_project",
+      "one_line": "Mooncake 的第二个主件：一个**专为 LLM 推理设计的分布式键值缓存引擎**——key 由 value 内容哈希而来、写入后不可变，集群里各节点贡献一段内存拼成池子，读写走 Transfer Engine 的零拷贝 RDMA。",
+      "what_it_is": "第 11 章用的是 Mooncake 的 **Transfer Engine（TE）**——只管「把这段字节从 A 机搬到 B 机」，不管数据叫什么名字、存多久。本章 `MooncakeBackend` 用的是它上面那一层 **Mooncake Store**：一个**对象级**的分布式 KV 存储。官方设计文档的定位原句是「a distributed key-value (KV) cache storage engine designed specifically for LLM inference scenarios」，并特别点明它的对象语义：**「the key is derived from the value through hashing, so value is immutable after inserting」**（key 由 value 内容哈希得来，插入后 value 不可变）——这一句直接解释了为什么本章的 `PoolKey` 里塞的是 chunk 内容哈希、也解释了为什么「存前先 exists 去重」是安全的（同 key 必同内容，不必担心覆盖旧值）。\n\n它的结构分两半：**Master Service**（中心编排，管对象空间分配与元数据、节点上下线、内存分配与**淘汰策略**——文档称为近似 LRU，带 lease / soft-pin / hard-pin 保护）和 **Client**（既发请求，又「hosts a segment of contiguous memory that contributes to the distributed KV cache」——每个客户端都捐一段连续内存进池子）。特性清单里与本章直接对上的有：对象级 Put/Get/Remove、多副本尽力放置、**强一致读**、经 TE 的零拷贝 RDMA、RAM + SSD 多级存储。官方 CMakeLists 里的版本号是 **2.0.0**（访问 2026-07-26）。\n\n本章代码用到的三个 Python 批量接口都是它的：`batch_is_exist(keys)` 按官方 API 参考返回逐 key 的 `1`=存在 / `0`=不存在 / 其他值=错误；`batch_put_from_multi_buffers(keys, addrs, sizes, config)` 从**已注册**的多段 buffer 批量写；`batch_get_into_multi_buffers(keys, addrs, sizes)` 批量读回到多段 buffer，逐项返回**读到的字节数（正数）或负数错误码**——这正是昇腾侧要把「正数归一成 0」才能对上「0=成功」上层约定的原因。`ReplicateConfig` 是这批 API 的可选配置结构，字段含 `replica_num`（副本数）、`preferred_segment` / `preferred_segments`（优先放在哪段内存上）、`prefer_alloc_in_same_node`（优先在同节点分配，官方注明目前只 `batch_put_from_multi_buffers` 支持、不支持磁盘段且 `replica_num` 限 1）、`with_soft_pin` / `with_hard_pin`（抗淘汰）等。",
+      "background": "落地顺序：论文《Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving》（arXiv:2407.00079，FAST'25 最佳论文）→ 2024-11 开源 Transfer Engine → **2025-03 开源 Mooncake Store** → 各推理引擎把它当 KV 池底座接进去。也就是说，「把闲置 DRAM/SSD 攒成一个集群级 KVCache 池」这个主张是论文的核心，Store 是它的开源实现，而本章的 `ascend_store` 是昇腾侧「怎么把这个池接进 vLLM 调度循环」的那一层。上游 vLLM 社区也在做同一件事（RFC #38474「Add Mooncake Store Connector for Shared KV Cache Reuse」），可见这不是昇腾一家的独门设计。",
+      "example": "**说明性示例**（形态取自官方 Python API 参考，非本仓源码）——一次批量存 + 批量查 + 批量取的返回值长相：\n\n```python\nfrom mooncake.store import MooncakeDistributedStore, ReplicateConfig\n\nstore.register_buffer(base_ptr, length)      # 先把这段内存登记给引擎（RDMA 前提，见第 11 章）\n\ncfg = ReplicateConfig()                      # 空构造 = 默认副本策略\ncfg.prefer_alloc_in_same_node = True         # 优先在同节点分配副本\n\nstore.batch_put_from_multi_buffers(keys, addrs, sizes, cfg)\n#   keys = ['modelA@...@chunk_hash_0', 'modelA@...@chunk_hash_1']\n#   addrs/sizes 是每个 key 对应的若干 (地址, 长度) 段\n\nstore.batch_is_exist(keys)                   # -> [1, 0]  第 1 个 key 在池里，第 2 个不在\nstore.batch_get_into_multi_buffers(keys, addrs, sizes)\n#   -> [4096, -1]  正数=读到的字节数（成功），负数=该项失败\n```\n\n逐行读：`register_buffer` 是 RDMA 的前置（网卡只能直接访问登记过的内存）；`batch_is_exist` 回的是 0/1 而不是布尔，所以上层写成 `if not exists` 判断；`batch_get_*` 回的**正数是字节数不是状态码**——这就是昇腾后端要做一次「正数→0」归一化的全部原因，归一之后整个上层才能只认「0=成功、非 0=失败块」这一条约定。",
+      "links": [
+        "https://kvcache-ai.github.io/Mooncake/design/mooncake-store.html",
+        "https://kvcache-ai.github.io/Mooncake/python-api-reference/mooncake-store.html",
+        "https://arxiv.org/abs/2407.00079"
+      ],
+      "sources": [
+        {
+          "url": "https://kvcache-ai.github.io/Mooncake/design/mooncake-store.html",
+          "note": "一手抓取：Store 的定位原句、「key derived from the value through hashing / value immutable」、Master Service 与 Client 两组件、多副本 / 强一致 / 零拷贝 RDMA / 近似 LRU（lease、soft-pin、hard-pin）/ RAM+SSD 多级、版本 2.0.0。访问 2026-07-26。"
+        },
+        {
+          "url": "https://kvcache-ai.github.io/Mooncake/python-api-reference/mooncake-store.html",
+          "note": "batch_is_exist 返回 1=存在 / 0=不存在 / 其他=错误；batch_get_into_multi_buffers 逐项返回读到的字节数、负数为错误；ReplicateConfig 字段清单（replica_num / preferred_segment(s) / prefer_alloc_in_same_node / with_soft_pin / with_hard_pin / group_id）与 prefer_alloc_in_same_node 的限制。**注意**：该页直接 WebFetch 返回空正文（疑为脚本渲染），以上要点取自搜索引擎对该官方页的摘要，未逐字比对原页——故本条 confidence 记 medium。访问 2026-07-26。"
+        },
+        {
+          "url": "https://kvcache-ai.github.io/Mooncake/",
+          "note": "官网大事记：TE 2024-11 开源、Mooncake Store 2025-03 开源。访问 2026-07-26。"
+        },
+        {
+          "url": "https://github.com/vllm-project/vllm/issues/38474",
+          "note": "上游 vLLM 的 RFC「Add Mooncake Store Connector for Shared KV Cache Reuse」——同一思路也在上游推进。访问 2026-07-26（仅取标题与主旨）。"
+        }
+      ],
+      "confidence": "medium",
+      "writer_note": "12.8「一个代表：MooncakeBackend 怎么落地」这一节现在只说了「Mooncake 是月之暗面开源的分离式架构」——补一层关键区分：**第 11 章用的是它的 Transfer Engine（只管搬），本章用的是它上面的 Mooncake Store（管存、管命名、管淘汰）**，并引官方那句「key 由 value 哈希而来、写入后不可变」，正好给 12.7 的内容寻址做外部背书。`batch_get` 返回正数字节数这条能把「为什么要归一化」讲成有出处的事实（措辞用「据官方 API 参考」）。Master Service / LRU 淘汰一句带过给链接即可，别展开部署。"
+    },
+    {
+      "id": "kv-pool-backends",
+      "term": "三个池后端：Mooncake Store / Ascend MemCache / openYuanrong DataSystem",
+      "kind": "competing_set",
+      "one_line": "`backend_map` 里那三个名字不是三个类名而已——它们是三个真实存在、各有出身的分布式 KV 池项目：一个社区通用（Mooncake），一个昇腾原生（MemCache，建在 MemFabric 上），一个来自华为开源的 Serverless 数据系统（openYuanrong）。",
+      "what_it_is": "读者看到 `backend_map = {mooncake, memcache, yuanrong}` 的第一反应通常是「后两个是什么？」。按 vllm-ascend **官方 Ascend Store 部署指南**（`docs/source/user_guide/feature_guide/kv_pool.md`，main 分支，访问 2026-07-26）：`kv_connector_extra_config.backend` 可取 `mooncake`（默认）/ `memcache` / `yuanrong`，三者是同一个 `Backend` 契约的三种落地，**换后端只改配置**——这正是本章「可插拔」那节的现实意义。它们的共同点是都提供「注册显存 + 按 key 批量存取」的零拷贝接口，差别在**出身、传输底座与部署形态**。同一份官方文档还给了部署前提：CANN ≥ 8.5.0、用 Mooncake 后端需 Mooncake ≥ 0.3.11.post1、各后端要先起自己的服务进程（`mooncake_master` / MemCache MetaService / Yuanrong etcd + Datasystem worker），以及一条容易忽略的全局要求——**所有节点的 `PYTHONHASHSEED` 必须一致（文档示例设为 0）**，否则各实例算出的 block hash 对不上，跨实例复用直接失效（见下一条 `vllm-block-hash`）。",
+      "alternatives": [
+        {
+          "name": "Mooncake Store（kvcache-ai，默认后端）",
+          "unique": "社区通用、跨生态：Transfer Engine 覆盖 TCP/RDMA/NVMe-oF/NVLink/**Ascend Transport** 等多链路，Store 提供对象级 KV 池 + 近似 LRU 淘汰 + RAM/SSD 多级；出自 Kimi 生产系统，FAST'25 最佳论文；被 SGLang / vLLM / LMCache 等多家引擎共用。",
+          "when": "想要一个**不绑定硬件厂商**、社区验证过、既能 P2P 直传又能做集群级池的统一底座时；也是 vllm-ascend 的默认值，不确定选什么就用它。"
+        },
+        {
+          "name": "Ascend MemCache（Ascend/memcache，底座 MemFabric）",
+          "unique": "昇腾原生：官方定位是「面向 AI 推理场景的高性能分布式 KVCache 缓存」，核心是大容量内存池 + **H2D / D2H / D2RH / RH2D** 四向数据访问；底座 MemFabric 提供 **OneCopy** 跨机跨介质直访，在昇腾上走 device_rdma(A2) / device_sdma(A3) / host_rdma 等路径。2025-11 开源，2025-12 更新对接 vllm-ascend。",
+          "when": "整个集群就是昇腾超节点 / A2·A3 服务器，想吃满昇腾专有互联（device SDMA、超节点内直访）而不是通用 RDMA 时。代价是绑定昇腾生态。"
+        },
+        {
+          "name": "openYuanrong DataSystem（openEuler / 华为，`yr.datasystem`）",
+          "unique": "它不是「一个 KV 池库」，而是华为开源的 **Serverless 分布式计算引擎 openYuanrong** 里的数据系统组件：用集群的 HBM/DRAM/SSD 建近计算的多级缓存，对外给三类接口——**异构对象（HeteroClient，NPU HBM 抽象、卡间高速直传）**、零拷贝 KV、本地 object；ETCD 做节点发现与故障恢复，支持 write-through / write-back 等可靠性策略。本章代码 import 的 `yr.datasystem.hetero_client.HeteroClient` 就是那个异构对象接口。",
+          "when": "推理只是整条流水线的一环——还要做训推切换的参数同步、checkpoint 快存快取、RL 参数分发——希望这些共用一套数据面时；或本来就跑在 openYuanrong 上。"
+        }
+      ],
+      "links": [
+        "https://docs.vllm.ai/projects/ascend/en/main/user_guide/feature_guide/kv_pool.html",
+        "https://github.com/Ascend/memcache",
+        "https://pages.openeuler.openatom.cn/openyuanrong-datasystem/docs/zh-cn/latest/"
+      ],
+      "sources": [
+        {
+          "url": "https://raw.githubusercontent.com/vllm-project/vllm-ascend/main/docs/source/user_guide/feature_guide/kv_pool.md",
+          "note": "一手抓取官方 Ascend Store 部署指南（main 分支）：三个后端取值与默认 mooncake；kv_transfer_config / kv_connector_extra_config 选项（kv_connector、kv_role、kv_load_failure_policy=recompute|fail、backend、lookup_rpc_port、load_async 默认 false、consumer_is_to_put 默认 false）；前提 CANN ≥ 8.5.0、Mooncake ≥ 0.3.11.post1、各后端服务进程、**PYTHONHASHSEED 全节点一致**。访问 2026-07-26。"
+        },
+        {
+          "url": "https://github.com/Ascend/memcache",
+          "note": "一手抓取 README：MemCache 定位「面向 LLM 推理与图推理的高性能分布式 KV 缓存」；建在 MemFabric 之上；H2D/D2H/D2RH/RH2D 与 OneCopy；对接 vllm-ascend（2025/12 更新）；2025-11 开源。访问 2026-07-26。"
+        },
+        {
+          "url": "https://pages.openeuler.openatom.cn/openyuanrong-datasystem/docs/zh-cn/latest/",
+          "note": "一手抓取官方概述：datasystem 是分布式多级缓存（HBM/DRAM/SSD）；三类接口（异构对象/KV/object）、Worker 组件、ETCD 集群管理；典型场景含「分布式 KV Cache，实现 Prefill 阶段的 KV Cache 缓存」。访问 2026-07-26。"
+        },
+        {
+          "url": "https://github.com/vllm-project/vllm-ascend/issues/6410",
+          "note": "RFC「KV pool supports Memcache」——memcache 后端进入 vllm-ascend 的入口议题（仅取标题与主旨，未逐条核对讨论）。访问 2026-07-26。"
+        }
+      ],
+      "confidence": "medium",
+      "writer_note": "12.8 现文只有一句「仓库里还有 memcache、yuanrong 等后端实现」，读者会卡在「这俩是啥」。补三五句：三个都是**真项目**、各一句差异化定位（社区通用 / 昇腾原生 MemFabric / openYuanrong 数据系统的异构对象接口），点明「默认 mooncake、换后端只改配置」，然后给三条链接收尾。**不要**展开部署命令。可顺带引一句官方部署指南里的 `PYTHONHASHSEED` 要求，和 12.7 的内容寻址呼应（性能数字与开源时间均为官方口径，措辞带「官方称 / 据官方文档（2026-07-26）」）。"
+    },
+    {
+      "id": "content-addressed-storage",
+      "term": "内容寻址（content-addressed storage, CAS）",
+      "kind": "external_concept",
+      "one_line": "别用「谁存的、存在哪」当名字，直接用「存的是什么」的哈希当名字——同样的内容必然算出同样的名字，于是天然去重、天然可跨机复用。",
+      "what_it_is": "传统存储是**位置寻址**：你告诉系统「放到 /data/req_42/kv.bin」，取的时候也得记住这个路径。内容寻址反过来：把内容本身喂给哈希函数，得到的摘要就是它的名字（key）。三条性质是它的全部魅力：\n\n1. **确定性**——同内容 → 同 key，任何机器、任何时刻算出来都一样，所以「跨请求 / 跨实例复用」不需要任何协商；\n2. **天然去重**——要写之前先问一句「这个 key 在不在」，在就不写了（本章 put 前那道 `exists`）；\n3. **不可变**——既然名字由内容决定，写进去的值就不该再改（改了名字就不对了）。Mooncake Store 官方文档把这条写死成对象语义：「the key is derived from the value through hashing, so value is immutable after inserting」。\n\n代价也很实在：(a) 无法「原地更新」，改内容就是造一个新对象；(b) 依赖哈希不碰撞（工业界用 SHA-1/SHA-256 这类摘要，碰撞概率低到可忽略，但多租户场景仍建议用密码学哈希而非随机化的内置 hash）；(c) 想知道「某个对象是谁的、什么时候能删」得靠额外的元数据与淘汰策略（Mooncake Store 那边是 Master Service 的近似 LRU）。",
+      "background": "这不是 LLM 圈发明的东西。**Git** 是最好懂的例子——它的官方书直接说「Git is a content-addressable filesystem… you can insert any kind of content into a Git repository, for which Git will hand you back a unique key you can use later to retrieve that content」。同一谱系里还有备份 / 存储系统的重复数据删除（dedup）、IPFS 的 CID、容器镜像层的 digest。本章的 `PoolKey`（并行坐标 + `chunk_hash`）就是这套老办法在 KV cache 上的一次应用：把「这段 KV 是哪段 prompt 算出来的」压成哈希当名字。",
+      "example": "**说明性示例**（Git 官方书里的最小演示，非本仓源码）——同样的内容两次入库，拿到同一个 key：\n\n```bash\n$ echo -n \"what is up, doc?\" | git hash-object --stdin\nbd9dbf5aae1a3862dd1526723246b20206e5fc37\n$ echo -n \"what is up, doc?\" | git hash-object --stdin\nbd9dbf5aae1a3862dd1526723246b20206e5fc37     # 一模一样\n```\n\n对照到本章：把 `git hash-object` 换成 `process_tokens`、把文件内容换成「这段 prompt 前缀的 token」、把那串 SHA-1 换成 `model@…@chunk_hash`，故事完全一样——**两条请求前缀相同 → 算出同一个 key → 第二条直接命中，第二次 put 被 `exists` 挡掉**。顺带看清 Git 的一个细节：它哈希的不只是内容，还前置了一个 `\"blob <字节数>\\0\"` 头，用来把「类型 + 长度」也纳入身份；本章 key 里那串并行坐标（`pcp/dcp/tp/pp/group`）扮演的正是同一个角色——把「这份 KV 是在什么布局下算出来的」写进身份，防止不同布局的数据撞成同一个名字。",
+      "links": [
+        "https://git-scm.com/book/en/v2/Git-Internals-Git-Objects",
+        "https://kvcache-ai.github.io/Mooncake/design/mooncake-store.html"
+      ],
+      "sources": [
+        {
+          "url": "https://git-scm.com/book/en/v2/Git-Internals-Git-Objects",
+          "note": "一手抓取 Pro Git《Git Internals - Git Objects》：content-addressable filesystem 的定义原句、SHA-1 由「类型+空格+字节数+NUL+内容」算出、`git hash-object --stdin` 同内容两次同 key 的演示。访问 2026-07-26。"
+        },
+        {
+          "url": "https://kvcache-ai.github.io/Mooncake/design/mooncake-store.html",
+          "note": "「key is derived from the value through hashing, so value is immutable after inserting」——池后端自身就把内容寻址写成了对象语义。访问 2026-07-26。"
+        }
+      ],
+      "confidence": "high",
+      "writer_note": "12.7「上路：内容寻址的 key」现在把机制讲清了，但「内容寻址」这个词本身是甩出来的。补两三句背景：这是 Git / dedup 存储那套老办法（一句 Git 例子最省字），三条性质里重点点**确定性 → 跨实例复用不用协商**与**去重**，再点一句代价（不可变、需要额外淘汰策略）。Git 那个 `blob <len>\\0` 头与本章并行坐标的类比很好用，可压成一句。别展开 IPFS/CID。"
+    },
+    {
+      "id": "vllm-block-hash",
+      "term": "vLLM 的 block hash：一条「链式」哈希，不是每块各哈希各的",
+      "kind": "notation",
+      "one_line": "`request.block_hashes` 里第 i 个哈希，算的是「**从第一个 token 到本块末尾的整段前缀**」，因为它把上一块的哈希也当输入喂了进去——所以只要有一个 token 不同，后面所有块的哈希全变。",
+      "what_it_is": "这是本章反复出现却最容易被读者想歪的一处。vLLM v1 给每个**写满的** block 算一个哈希，输入有三样（据上游 `docs/design/prefix_caching.md`，main 分支，访问 2026-07-26）：\n\n1. **parent hash value**——上一个块的哈希（第一个块为 `None`）；\n2. **block tokens**——本块内的 token 元组（「include the exact tokens is to reduce potential hash value collision」，把真 token 也放进去是为降低碰撞）；\n3. **extra hashes**——让这个块唯一所需的其它值：LoRA ID、多模态输入哈希、多租户隔离用的 cache salt 等。\n\n关键是第 1 项：哈希被**串成链**，第 i 块的哈希实际编码了「整段前缀」。于是「前缀命中」这件事退化成一个极简操作——**逐块比对哈希，比到第一个不相等就停**，前面连续相等的块数 × block_size 就是命中的 token 数。本章调度端把整串 `block_hashes` 发给 worker、worker 拿它生成 key 去 `exists` 逐个查，用的就是这个性质。\n\n还有两处版本敏感的坑值得知道：(a) **哈希算法可选**——上游文档列了 `sha256`（默认，用 pickle 序列化，「hashes may not be reproducible across different Python or vLLM versions」）、`sha256_cbor`（用 CBOR，可复现、跨语言，**推荐用于跨实例确定性缓存**）、`xxhash` / `xxhash_cbor`；(b) **哈希种子**——vLLM 用 `PYTHONHASHSEED` 派生 hash seed，不设就随机生成，所以 vllm-ascend 官方部署指南要求**所有节点设成同一个值（示例 0）**。这两条直接决定「跨实例复用」到底成不成立：算法/版本/种子任一不一致，两台机器对同一段 prompt 会算出不同的 key，池子看着有数据却永远命中不了。",
+      "example": "**说明性示例**（结构取自 vLLM 上游设计文档的说明，token 为杜撰）——block_size = 4，一条 12 token 的 prompt 切成 3 块：\n\n```text\nBlock 0: hash(None,      [A, gentle, breeze, stirred])          -> h0\nBlock 1: hash(h0,        [the, leaves, as, children])           -> h1\nBlock 2: hash(h1,        [laughed, in, the, distance])          -> h2\n```\n\n再来一条 prompt，前 8 个 token 完全相同、第 9 个起不同：\n\n```text\nBlock 0': hash(None, [A, gentle, breeze, stirred])   -> h0   ✅ 与上面相同\nBlock 1': hash(h0,   [the, leaves, as, children])    -> h1   ✅ 相同\nBlock 2': hash(h1,   [danced, in, the, moonlight])   -> h2'  ❌ 不同\n```\n\n逐行读：因为 `h1` 一样，第二条请求前两块**必然**得到同样的哈希 → 生成同样的 PoolKey → 在池里命中 8 个 token；第 3 块 token 变了，`h2' ≠ h2`，从这里开始池里没有、只能本地算。**注意链式的副作用**：假如换成第 1 个 token 不同，那么 `h0` 就变了，`h1`、`h2` 会跟着全变——所以命中永远是「一段前缀」，绝不会出现「中间某块命中、两头不命中」的情形。这也正是本章命中查询只需回一个整数 $`H`$（命中前缀长度）、而不必回一张命中位图的原因。",
+      "links": [
+        "https://docs.vllm.ai/en/stable/design/prefix_caching/",
+        "https://github.com/vllm-project/vllm/blob/main/docs/design/prefix_caching.md"
+      ],
+      "sources": [
+        {
+          "url": "https://raw.githubusercontent.com/vllm-project/vllm/main/docs/design/prefix_caching.md",
+          "note": "一手抓取上游设计文档（main 分支）：block hash 三项输入（parent hash / block tokens / extra hashes）与「exact tokens 用于降低碰撞」原句；sha256 默认且 pickle 序列化跨 Python/vLLM 版本不保证可复现、sha256_cbor 可复现跨语言、xxhash 系列。访问 2026-07-26。"
+        },
+        {
+          "url": "https://docs.vllm.ai/en/latest/design/prefix_caching/",
+          "note": "同一文档的官方渲染版：「we hash each kv-cache block by the tokens in the block and the tokens in the prefix before the block」、只缓存写满的块、三块链式哈希的示例（A gentle breeze stirred / the leaves as children / laughed in the distance）。访问 2026-07-26。"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/vllm-project/vllm-ascend/main/docs/source/user_guide/feature_guide/kv_pool.md",
+          "note": "官方 Ascend Store 部署指南要求全节点 PYTHONHASHSEED 一致（示例 0）——跨实例复用的前提条件。访问 2026-07-26。"
+        },
+        {
+          "url": "https://docs.vllm.ai/en/v0.9.2/api/vllm/v1/core/kv_cache_utils.html",
+          "note": "hash seed 由 PYTHONHASHSEED 派生、未设置时随机生成的说明（经搜索摘要取得该 API 页要点，未逐字通读）。访问 2026-07-26。"
+        }
+      ],
+      "confidence": "high",
+      "writer_note": "12.3 现文把 `request.block_hashes` 说成「每个 block 一个由其 token 内容算出的哈希」——**不够准，建议改口径**：它是**链式**的（含 parent hash），所以第 i 个哈希代表「到第 i 块为止的整段前缀」。这一改能顺手把两件事讲通：为什么命中一定是连续前缀、为什么 lookup 只回一个整数就够。再补一句版本敏感的实务提醒（PYTHONHASHSEED 须全节点一致、算法选 sha256_cbor 更利于跨实例复现，据上游文档 2026-07-26），呼应 12.7 的「跨实例复用」。示例三行链式哈希可直接压进正文。"
+    },
+    {
+      "id": "queue-join-backpressure",
+      "term": "`Queue.task_done()` / `Queue.join()` 与「背压（backpressure）」",
+      "kind": "notation",
+      "one_line": "Python 队列内部有个「未完成任务」计数器：`put` 加一、`task_done` 减一、`join()` 阻塞到它归零——本章那道屏障的全部魔法就在这三行规则里。",
+      "what_it_is": "`queue.Queue` 除了「放/取」还多管一件事：**这批活干完没有**。官方文档说得极干脆——`task_done()`「Indicate that a formerly enqueued task is complete… For each `get()` used to fetch a task, a subsequent call to `task_done()` tells the queue that the processing on the task is complete」；`join()`「Blocks until all items in the queue have been gotten and processed」；而计数规则是：「The count of unfinished tasks goes up whenever an item is added to the queue. The count goes down whenever a consumer thread calls `task_done()`… When the count of unfinished tasks drops to zero, `join()` unblocks.」还有一条容易被忽略的保险：`task_done()` 调用次数**超过**入队数会抛 `ValueError`。\n\n三条推论，正好是本章终止性论证的前提：(1) 只 `get` 不 `task_done`，`join()` 就永远不返回——所以「消费者每条路径都必须恰好调一次 `task_done`」不是风格问题，是正确性要求；(2) 计数器是「入队即加」，不是「取出才加」，所以生产者一入队，`join()` 立刻有活等；(3) `join()` 等的是**处理完成**，不是**取出**——这才使它能当「存已可见」的屏障用。\n\n**背压（backpressure）** 是另一个词：它借自流体力学，在数据流系统里指「下游处理不过来时，把压力反向传给上游、让上游慢下来」，Reactive Streams 规范把它列为核心目标之一——「the primary intention… is to govern the exchange of stream data across an asynchronous boundary… with backpressure」。严格说，本章 `join()` 更像**可见性屏障 / 同步点**（等这一拍全落地）而不是典型的「限速」背压；不过在效果上它确实让主循环被慢 IO 拖住、从而自动降速，所以叫「背压屏障」不算离谱——但读者最好知道这两层含义的区别。",
+      "example": "**说明性示例**（Python 官方文档的生产者—消费者范例，非本仓源码）：\n\n```python\nimport threading, queue\nq = queue.Queue()\n\ndef worker():\n    while True:\n        item = q.get()          # 取一个任务\n        print(f'Working on {item}')\n        print(f'Finished {item}')\n        q.task_done()           # ← 少了这一句，下面的 join() 永远不返回\n\nthreading.Thread(target=worker, daemon=True).start()\n\nfor item in range(30):\n    q.put(item)                 # unfinished 计数 0 → 30\n\nq.join()                        # 阻塞，直到 30 次 task_done 把计数打回 0\nprint('All work completed')\n```\n\n逐行读：`put` 30 次 → 未完成计数 30；工作线程每处理完一个调一次 `task_done` → 计数递减；`join()` 在计数归零那一刻返回，此时**所有 30 个任务都已处理完毕**（不是「都已取出」）。把 30 换成「这一拍要 put 的请求数」、把 `print` 换成 `m_store.put`，就是本章 `wait_for_save` 的骨架——也一眼看出那条隐患：如果 `_handle_request` 里抛异常越过了 `task_done`，计数永远不归零，`join()` 就挂死。",
+      "links": [
+        "https://docs.python.org/3/library/queue.html",
+        "https://www.reactive-streams.org/"
+      ],
+      "sources": [
+        {
+          "url": "https://docs.python.org/3/library/queue.html",
+          "note": "一手抓取 CPython 官方文档：task_done()/join() 原句、未完成计数的增减规则与「归零则 join 解除」、task_done 超调抛 ValueError、官方生产者-消费者 30 任务示例。访问 2026-07-26。"
+        },
+        {
+          "url": "https://www.reactive-streams.org/",
+          "note": "Reactive Streams 规范首页对 back pressure 的定位（异步边界上的流数据交换需带背压）。经搜索结果与规范首页表述取得要点，未逐条核对规范条款——故本词的严格定义在正文用「借自数据流领域」的柔性措辞。访问 2026-07-26。"
+        }
+      ],
+      "confidence": "high",
+      "writer_note": "12.6 的终止性论证已经把计数器规则讲对了，缺的是「这是标准库写死的语义、有出处」这一层——加半句引官方原句（「计数归零 join 解除」+「task_done 超调抛 ValueError」）并给链接，论证立刻从「作者说」升级成「文档保证」。另可用一句澄清「背压」：严格讲这是可见性屏障，只是效果上也起到了给主循环降速的作用。官方 30 任务示例太长，别整段搬，压成一句即可。"
+    },
+    {
+      "id": "pcp-dcp-parallel-coords",
+      "term": "key 里的并行坐标：`pcp` / `dcp` / `tp` / `pp` / `group` 分别是什么",
+      "kind": "notation",
+      "one_line": "PoolKey 里那串 `@pcp0@dcp0@head_or_tp_rank:…@pp_rank:…@group:…`，是在给这份 KV 标注「它是在什么并行布局的哪一片上算出来的」——布局不同，同一段 prompt 的 KV 字节根本不是同一份东西。",
+      "what_it_is": "逐个拆（定义据 vLLM 上游与 vllm-ascend 官方文档，访问 2026-07-26）：\n\n- **TP（Tensor Parallel，张量并行）** rank：把每层的权重与 KV 头切给多张卡，rank r 只持有属于自己的那几个 KV head。所以「同一段 prompt 的 KV」在 TP=8 下是 8 份**互不相同**的分片。\n- **PP（Pipeline Parallel，流水并行）** rank：把**层**切段，rank r 只持有第 r 段那些层的 KV。\n- **DCP（Decode Context Parallel，解码上下文并行）** rank：vLLM/vllm-ascend 里较新的一种切法——**沿序列维度**把 KV cache 切给 TP 组内各设备，官方定义是「shards the KV cache along the sequence dimension across devices in a Tensor Parallel (TP) group. It removes redundant KV-cache copies and can increase the batch size available for long-context decoding」。各 rank 交错持有不同 token 位置的 KV，交错粒度由 `cp_kv_cache_interleave_size` 控制（默认 1，即逐 token 交错）。\n- **PCP（Prefill Context Parallel，预填充上下文并行）** rank：同样是沿序列维切，但作用在 prefill 阶段。**版本敏感**：vllm-ascend 官方 CP 文档（main 分支，访问 2026-07-26）明确写「Prefill Context Parallel is not supported by vLLM Ascend. The upstream `prefill_context_parallel_size` option must remain at its default value of `1`」——也就是说在这一版部署下 `pcp_rank` 实际恒为 0，字段留在 key 里是为了未来/上游对齐（key 的命名空间设计要面向所有维度，缺一个维度就可能撞名）。\n- **group（KV cache group）**：**不是**并行维度，是**单个 worker 内部**按注意力类型/块布局对层做的逻辑分组（第 11 章的 HMA 那条讲过）。\n\n为什么这些必须进 key：内容寻址的前提是「同名必同内容」。TP rank 不同 → 存的是不同的 head；PP rank 不同 → 不同的层；DCP rank 不同 → 不同的 token 位置切片。少写任何一维，两台布局不同的实例就会用同一个名字存下**语义不同**的字节，命中即数据错乱。所以这串坐标既是复用的**约束**（布局必须对齐才复用得上），也是正确性的**护栏**。",
+      "example": "**说明性示例**（key 形态取自本章 `to_string()` 的字段顺序，取值为杜撰）——同一段前缀、TP=2 的两张卡，各自存自己的分片：\n\n```text\nrank 0: Qwen3-32B@pcp0@dcp0@head_or_tp_rank:0@pp_rank:0@group:0@cache_role:kv@cache_family:default@a3f9…\nrank 1: Qwen3-32B@pcp0@dcp0@head_or_tp_rank:1@pp_rank:0@group:0@cache_role:kv@cache_family:default@a3f9…\n                                          ^^^ 只有这一位不同\n```\n\n逐段读：末尾的 `a3f9…` 是内容哈希——两张卡算的是**同一段 prompt**，所以这一段相同；但 `head_or_tp_rank` 一个 0 一个 1，于是它们是池里两个不同的对象，各装各的 KV head 分片。后来一条前缀相同、**同样跑 TP=2** 的请求来查，rank 0 查 `…tp_rank:0…a3f9…`、rank 1 查 `…tp_rank:1…a3f9…`，两边各自命中自己那份 → 拼起来正好是完整 KV。反过来，若那条请求跑在 TP=4 的实例上，它要找的是 `tp_rank:0..3` 四个名字，池里一个都没有——**命中为 0，这是设计使然，不是 bug**。",
+      "links": [
+        "https://docs.vllm.ai/projects/ascend/en/main/user_guide/feature_guide/context_parallel.html",
+        "https://docs.vllm.ai/projects/ascend/en/main/developer_guide/Design_Documents/context_parallel.html"
+      ],
+      "sources": [
+        {
+          "url": "https://docs.vllm.ai/projects/ascend/en/main/user_guide/feature_guide/context_parallel.html",
+          "note": "一手抓取 vllm-ascend 官方 CP 用户指南（main）：DCP 定义原句（沿序列维在 TP 组内切 KV、去冗余副本、提升长上下文 batch）、配置项 decode_context_parallel_size；**PCP 明确不支持、prefill_context_parallel_size 须保持 1**。访问 2026-07-26。"
+        },
+        {
+          "url": "https://docs.vllm.ai/projects/ascend/en/main/developer_guide/Design_Documents/context_parallel.html",
+          "note": "一手抓取设计文档页：DCP 交错布局与 cp_kv_cache_interleave_size（默认 1）、virtual block 计算；同样声明 PCP 不支持。访问 2026-07-26。"
+        },
+        {
+          "url": "https://deepwiki.com/vllm-project/vllm-ascend/7.3-context-parallelism-(pcpdcp)",
+          "note": "第三方（DeepWiki）对 vllm-ascend PCP/DCP 的整理：PCP 作用于 prefill、cp_size = pcp_size × dcp_size 等关系。**非官方来源**，与官方「PCP 不支持」的口径存在张力（很可能是代码里已有 PCP 骨架但官方尚未开放/未支持）——正文若要提 PCP，一律以官方口径为准并注明日期。访问 2026-07-26。"
+        }
+      ],
+      "confidence": "medium",
+      "writer_note": "12.7 现文用括注给了 pcp/dcp 的中文展开，但读者仍不知道 **CP 到底怎么切、为什么必须进 key**。补两三句：CP = 沿**序列维**切 KV（DCP 在 decode 阶段、TP 组内、交错持有），并用「TP=2 两张卡两条 key、末尾内容哈希相同而 tp_rank 不同」的小例子把「布局对齐才复用」讲实。**版本口径注意**：官方文档（main，2026-07-26）说 vllm-ascend 不支持 PCP、`prefill_context_parallel_size` 须为 1——正文提 `pcp` 时宜写成「key 预留了这一维，本版部署下实际恒为 0」，别暗示它在用。"
+    },
+    {
+      "id": "npu-event-sync",
+      "term": "NPU/CUDA 的 event：一个插在异步执行流里的「到这儿了」标记",
+      "kind": "external_concept",
+      "one_line": "算子是异步下发的——Python 那行 `x = attn(...)` 返回时设备可能还没算完；event 就是插在设备执行流里的一个书签，`synchronize()` 让 CPU 线程等到设备越过这个书签为止。",
+      "what_it_is": "要理解 `torch.npu.Event()` + `record()` + `synchronize()` 这三下，先得接受一个事实：**Host（CPU）和 Device（NPU/GPU）是异步的**。CPU 把算子一个个「下发」到一条执行流（stream）里就返回了，设备在后台按序执行。于是 CPU 手里的张量对象存在，不代表它的字节已经写好。\n\n**event** 就是解决「怎么知道写好了」的标准原语（语义与 CUDA 一致，NVIDIA 官方 Runtime API 文档：`cudaEventRecord` 「Captures in event the contents of stream at the time of this call」——把「此刻这条流里已下发的全部工作」捕获进事件；`cudaEventSynchronize` 则让「host thread… block until the event actually completes」，即 CPU 线程阻塞到设备把该事件之前的活干完）。三步用法：造一个 event → 在某条流上 `record()`（插书签）→ 别处 `synchronize()`（等书签）。\n\n昇腾侧就是同一套：Ascend Extension for PyTorch（torch_npu）把 CUDA 接口按「`torch.cuda.***` 变换为 `torch_npu.npu.***`」的规则映射过来，所以 `torch.npu.Event` 之于 `torch.cuda.Event`，基本是改个前缀的关系。\n\n**为什么本章非用它不可**：搬运在**另一个 Python 线程**里跑，它要读的是模型前向刚写进去的 KV 显存。若不等一等，后台线程可能把「还没写完的显存」读去塞进池子——存进去的是半成品，而且因为 key 由内容哈希决定，这份坏数据还会被后来的请求当成有效缓存命中。`record()` 在存请求入队前打标记、发线程 put 前 `synchronize()`，恰好把「前向写完」排在「读出去搬」之前。记住一句话：**event 管的是先后顺序，不是一份数据**。",
+      "links": [
+        "https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EVENT.html",
+        "https://docs.pytorch.org/docs/stable/generated/torch.cuda.Event.html"
+      ],
+      "sources": [
+        {
+          "url": "https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EVENT.html",
+          "note": "一手抓取 NVIDIA CUDA Runtime API《Event Management》：cudaEventRecord「Captures in event the contents of stream at the time of this call」；cudaEventSynchronize 使 host thread 阻塞至事件真正完成。访问 2026-07-26。"
+        },
+        {
+          "url": "https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/80RC1alpha001/apiref/fmkadptapi/ptaoplist_000012.html",
+          "note": "昇腾 CANN 文档中 torch.cuda 接口支持清单页，给出改写规则原句「在使用支持的 cuda 接口时，需要将 API 名称中的 cuda 变换为 NPU 形式：torch.cuda.*** 变换为 torch_npu.npu.***」。**注意**：该页属较老版本（CANN 8.0.RC1 alpha），其支持矩阵把 Event 的部分方法标为不支持，与本章 pin 版本代码实际使用 record()/synchronize() 不符——故正文只引「命名映射规则」，不引该页的支持与否结论。访问 2026-07-26。"
+        }
+      ],
+      "confidence": "medium",
+      "writer_note": "12.6 已用一段把 event 讲得不错（「事件管的是写完没的先后顺序，不是一份数据」这句很好，保留）。可补两处出处感：一句「这是 CUDA 传下来的标准原语，NVIDIA 文档的定义是『捕获此刻流中已下发的全部工作』/『host 线程阻塞至事件完成』」，一句「torch_npu 按 `torch.cuda.*` → `torch_npu.npu.*` 的规则映射」。**别**引昇腾那张老支持矩阵（与 pin 版本代码矛盾）。再点一句风险后果（不同步 → 把半成品 KV 存进池，还会被后来请求命中）即可。"
+    },
+    {
+      "id": "radix-attention",
+      "term": "RadixAttention（SGLang）：同一件事的另一种索引结构",
+      "kind": "external_concept",
+      "one_line": "同样是「跨请求复用共享前缀的 KV」，SGLang 不用哈希表按 key 查，而是把所有活跃前缀组织成一棵 **radix tree（基数树）**，来一条请求就在树上做最长前缀匹配。",
+      "what_it_is": "本章的路线是：把前缀切 chunk → 每 chunk 算一个内容哈希 key → 去池里 `exists` 逐个查。SGLang 的 RadixAttention 是另一条路线：把「token 序列 → KV cache 张量」的映射维护成一棵 radix tree（trie 的空间优化版，**一条边可以标一整段变长 token 序列**，而不是一个 token 一条边）；新请求到来时在树上做前缀匹配，匹上多少就复用多少，剩下的继续算并挂成新枝。显存不够时按 **LRU 递归淘汰叶子节点**——树形结构的好处正在这儿：淘汰一个叶子不影响它与兄弟共享的那些父节点（= 共享前缀）。再配一个 **cache-aware scheduling**（调度时优先挑与缓存内容重合多的请求）把命中率抬上去，官方博客报告的命中率在各基准上从 50% 到接近 99%，端到端吞吐相比当时的系统最高约 5x（论文摘要口径为 up to 6.4x）。\n\n**两条路线怎么比**（不是谁替代谁）：radix tree 天然做「最长前缀匹配」、能表达任意长度的共享段、淘汰时能保住公共祖先，代价是它得是一棵**有状态的、进程内的**树；哈希 + 定长 block（vLLM/本章这条）则把匹配退化成「逐块比哈希」，无状态、天然可分布式——一个 chunk 存到远端池里，别的机器只要算得出同样的 key 就能捞，不需要共享任何树结构。**本章要的正是后者**：跨请求还要跨实例，索引必须能「无协商地」在不同进程/机器间重合。",
+      "links": [
+        "https://arxiv.org/abs/2312.07104",
+        "https://www.lmsys.org/blog/2024-01-17-sglang/"
+      ],
+      "sources": [
+        {
+          "url": "https://arxiv.org/abs/2312.07104",
+          "note": "一手抓取 arXiv 摘要页：《SGLang: Efficient Execution of Structured Language Model Programs》，作者含 Lianmin Zheng / Ying Sheng 等，2023-12-12 首版（2024-06 修订）；RadixAttention 作为 runtime 的新优化用于 KV cache reuse；摘要口径 up to 6.4x 吞吐。访问 2026-07-26。"
+        },
+        {
+          "url": "https://www.lmsys.org/blog/2024-01-17-sglang/",
+          "note": "一手抓取作者团队博客（2024-01-17）：radix tree 是 trie 的空间优化版、边可标变长序列；token 序列为 key、KV 张量为 value（paged 布局）；LRU 递归淘汰叶子；cache-aware scheduling；最高 5x 吞吐、无命中时无明显开销；图 4 展示九步树演化。访问 2026-07-26。"
+        }
+      ],
+      "confidence": "high",
+      "writer_note": "12.7 末尾那句 RadixAttention 一句话带过是对的——**别扩写成一节**。建议只把「差异点」讲实一句：radix tree 是进程内有状态的最长前缀匹配（+LRU 递归淘汰叶子、cache-aware 调度），哈希+定长 block 是无状态、可跨机重合的索引，本章要跨实例复用所以必须选后者。arXiv 号已在文中且核对无误；可再给 LMSYS 博客链接给想深入的读者。"
+    },
+    {
+      "id": "write-amplification",
+      "term": "写放大（write amplification）",
+      "kind": "external_concept",
+      "one_line": "来自 SSD 世界的术语：**实际写到介质上的数据量 ÷ 上层真正想写的数据量**——比值越大越亏，理想是 1。",
+      "what_it_is": "这个词最早用来描述闪存的尴尬：主机只想改 4 KB，SSD 因为擦除块粒度与垃圾回收，可能实际往 NAND 上写了几十 KB。JEDEC 的标准定义就是一个比值——**写放大因子 WAF = 写入非易失介质的数据量 / 主机请求写入的数据量**，恒 ≥ 1，越接近 1 越好。后来这个词被借去描述一切「实际写入 > 有效写入」的存储系统（LSM-tree 的层层 compaction 是另一个经典例子）。\n\n放到本章：同一段前缀被 $`R`$ 条请求命中时，**不去重**就会把同样的字节往池里写 $`R`$ 遍——按 JEDEC 口径，这就是 WAF = $`R`$（有效数据只有一份，介质上写了 R 份）。put 前那道 `exists` 去重把它压回 **WAF = 1**，即「同一前缀在池里只存一份」。省下的不只是带宽，还有池容量与后端的淘汰压力（多写一份就多挤掉一份别人的缓存）。",
+      "links": [
+        "https://www.jedec.org/sites/default/files/Alvin_Cox%20[Compatibility%20Mode]_0.pdf"
+      ],
+      "sources": [
+        {
+          "url": "https://www.jedec.org/sites/default/files/Alvin_Cox%20[Compatibility%20Mode]_0.pdf",
+          "note": "JEDEC（JC-64.8 主席 Alvin Cox）SSD 规范讲义：Write amplification factor (WAF) = 写入 NVM 的数据 ÷ 主机写入 SSD 的数据。经搜索结果摘要取得该定义（PDF 未逐页通读）——故 confidence 记 medium。访问 2026-07-26。"
+        }
+      ],
+      "confidence": "medium",
+      "writer_note": "**这条主要是纠一个口径**：12.7 与 12.10 现在写「写放大 `write_amp = 1/R`」，与业界标准定义（WAF = 实际写 ÷ 有效写，恒 ≥ 1）方向相反，懂存储的读者会绊一下。建议改写成「不去重时写放大 = R（同一份数据写了 R 遍），去重后降到 1」，或干脆换成中性说法「相对不去重，池上的写入量降到 1/R」。顺手补半句词源（来自 SSD/JEDEC，指实际写入 ÷ 有效写入）让术语落地，一句话足够，别展开闪存 GC。"
+    }
+  ]
+}

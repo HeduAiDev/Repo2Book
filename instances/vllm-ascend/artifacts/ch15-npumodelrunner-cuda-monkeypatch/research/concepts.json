@@ -1,0 +1,192 @@
+{
+  "chapter_id": "ch15-npumodelrunner-cuda-monkeypatch",
+  "researched_at": "2026-07-26",
+  "pin_context": {
+    "note": "本章 pin 的 vllm-ascend 依赖 torch==2.10.0 / torch-npu==2.10.0（source/requirements.txt:L16-L17）。凡涉及 PyTorch API『现在有没有/叫什么』的断言，一律以 torch 2.10 文档为准；更新的版本变化（如 2.12 的 torch.accelerator.Graph）单独标注日期，供 writer 写『未来方向』时用，不得当成本书环境的既成事实。",
+    "already_covered_elsewhere": [
+      "monkey-patch 这个词的来龙去脉 + `from M import f` 的名字缓存陷阱（unittest.mock《Where to patch》）→ ch03 research 已查透，本章不重复，只在 c02 里接上『函数 __globals__』这条更深的因果。",
+      "Stream / Event 异步执行模型 → ch13 research 已查透（stream-event-model）。",
+      "ACL Graph vs CUDA Graph → ch01 research 已查透（acl-graph-vs-cuda-graph）。",
+      "PrivateUse1 / torch_npu 怎么把 npu 注册进 PyTorch → ch01/ch02 research 已查透。"
+    ]
+  },
+  "concepts": [
+    {
+      "id": "seam-legacy-code",
+      "term": "接缝（seam）与使能点（enabling point）",
+      "kind": "external_concept",
+      "one_line": "「接缝」不是本书生造的比喻，是 Michael Feathers 在《Working Effectively with Legacy Code》(2004) 里给出的正式术语——「程序里一个你不必在那儿改代码、却能改变那儿行为的地方」。",
+      "what_it_is": "Feathers 的原话定义只有一句：**A seam is a place where you can alter behavior in your program without editing in that place.**（接缝是这样一个位置：你能改变程序在那里的行为，却不用编辑那个位置的代码。）它天生是一对概念，另一半叫**使能点（enabling point）**：**Every seam has an enabling point, a place where you can make the decision to use one behavior or another.**（每条接缝都有一个使能点——你在那里做出「用哪种行为」的决定。）\n\n这两句话正好把本章的两个角色分开了：接缝在**别人的代码里**（父类 `GPUModelRunner` 那 7000 行——它不知道自己被改了、也没有为你改过一个字符），使能点在**你自己的代码里**（`with _torch_cuda_wrapper(): …` 这一行——决定「这一段时间里用 NPU 那套行为」的开关就在这儿）。判断「有没有接缝」的标准也随之清楚：不是「这段代码好不好改」，而是「**我不碰它，能不能让它的行为变掉**」。\n\nFeathers 按「靠语言的哪层机制换行为」把接缝分了三类，每类的使能点位置不同：\n- **预处理接缝（preprocessing seam）**——C/C++ 编译前的宏预处理阶段换掉一段文本，使能点是某个 `#define`。\n- **链接接缝（link seam）**——编译之后、靠链接器/运行时加载器决定「同一个符号名到底连到哪份实现」，使能点在程序文本之外（构建脚本、classpath、`LD_LIBRARY_PATH` 这类）。\n- **对象接缝（object seam）**——面向对象语言里，一次方法调用具体跑哪份实现由对象的运行期类型决定，使能点是「谁来决定造哪个对象 / 传哪个对象进去」。\n\n这套分类是给静态语言设计的；Python 这种把「模块也是对象、函数也是属性」贯彻到底的动态语言，几乎每个全局名字天然就是一条接缝——本章三类接缝里的后两类（`torch.cuda.*`、模块级 `graph_capture`）本质是「同一个名字换连到哪份实现」，效果上最贴近 link seam，但它的使能点不在构建脚本里，而在运行期的一句 `with`。",
+      "background": "这个词出自 Feathers 2004 年的《Working Effectively with Legacy Code》，写作动机是「给遗留代码补测试」这个具体困境：要测一段代码，就得把它对数据库、网络、硬件的依赖切开，可你又常常不被允许（或不敢）改那段代码本身。Feathers 的答案是先去找程序里已经存在的接缝，从接缝处把依赖换掉，从而做到「生产环境和测试环境跑的是同一份源码，行为却不同」。Martin Fowler 在自己的 bliki 里专门给这个词立了条目，并点出它的用处早已超出测试：加探针提高可观测性、把老系统的行为逐步改道到新环境（绞杀者式迁移），靠的都是同一批接缝。\n\n把这段来历放回本章，反差就有味道了：Feathers 谈的是「**我想测它，但不能改它**」；vllm-ascend 面对的是「**我想让它跑在另一种硬件上，但不能改它**」（改了就得维护一份 vLLM 分叉）。约束不同，破法却是同一个——先问「父类把设备差异表达成了什么形态、有没有留下接缝」，再在接缝处做文章。这也解释了为什么 ch14 的 Worker 只能重写：`if cuda / else raise` 里没有任何「不改那儿也能改行为」的位置，按定义就是**没有接缝**。",
+      "links": [
+        "https://www.informit.com/articles/article.aspx?p=359417",
+        "https://martinfowler.com/bliki/LegacySeam.html"
+      ],
+      "sources": [
+        {"url": "https://www.informit.com/articles/article.aspx?p=359417&seqNum=2", "note": "InformIT 刊出的该书第 4 章《Seams》正式节选：seam 的逐字定义『A seam is a place where you can alter behavior in your program without editing in that place』，以及 object seam 的定义与示例（子类覆写虚方法把原调用行为置空）；访问于 2026-07-26。"},
+        {"url": "https://www.informit.com/articles/article.aspx?p=359417&seqNum=3", "note": "同一节选的下一页《Seam Types》：enabling point 的逐字定义『Every seam has an enabling point, a place where you can make the decision to use one behavior or another』，以及 preprocessing / link / object 三类接缝各自的机制与使能点位置；访问于 2026-07-26。"},
+        {"url": "https://martinfowler.com/bliki/LegacySeam.html", "note": "Martin Fowler bliki 词条：确认 seam 一词由 Feathers 在《Working Effectively with Legacy Code》中提出、复述同一条定义，并补充其在『加探针提高可观测性』与『遗留系统迁移改道』上的用途；访问于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "本章 §15.1 把「接缝」立为题眼，但目前只有一句括注（『指代码里可被外部替换的薄弱点』）——建议升级成「这词有正主」：给 Feathers 的一句原定义 + 点出配套的『使能点』（接缝在父类里、使能点在那句 with 上），一两句足矣，三类接缝分类法与遗留代码测试的历史留给链接。注意别把本章三类接缝硬套 Feathers 的三分法（那是给 C++/Java 设计的），上面的映射是本书视角，不是 Feathers 原文的说法。"
+    },
+    {
+      "id": "python-function-globals",
+      "term": "函数的 `__globals__`：为什么「换符号」必须换进定义它的那个模块",
+      "kind": "external_concept",
+      "one_line": "Python 里每个函数身上都别着一本「我的全局字典」，指向**定义它的那个模块**的命名空间——函数体里那些没在本地赋过值的名字，运行时一律去这本字典里查，和「谁调用它、从哪个模块调用」毫无关系。",
+      "what_it_is": "分三层说清楚：\n\n**① 什么叫自由变量。** 语言参考的定义是：`If a variable is used in a code block but not defined there, it is a free variable.`（一个变量在某个代码块里被用到、却不是在那儿定义的，它就是自由变量。）父方法体里写的 `graph_capture(...)`、`torch`、`CUDAGraphWrapper` 全属此类——函数内部没给它们赋过值，只是拿来用。\n\n**② 自由变量去哪儿查。** 语言参考写得很死：`Names are resolved in the top-level namespace by searching the global namespace, i.e. the namespace of the module containing the code block, and the builtins namespace`（在顶层命名空间里解析名字，就是先查全局命名空间——**也就是包含这段代码块的那个模块的命名空间**——再查 builtins）。这就是俗称 LEGB（Local→Enclosing→Global→Built-in）里的那个 G，它的落点是**定义处所在模块**，不是调用处。数据模型文档把这件事直接做成了函数对象的一个属性：`function.__globals__` = `A reference to the dictionary that holds the function's global variables – the global namespace of the module in which the function was defined.`\n\n**③ 什么时候查。** 关键的一句：`Name resolution of free variables occurs at runtime, not at compile time.`（自由变量的名字解析发生在**运行期**，不是编译期。）正因为是每次执行到那一行才去字典里查，你才可能在「函数已经写好、甚至已经开始跑」之后，通过改那本字典，让它下一次查到别的东西。整个运行期换符号的把戏，全部建立在这两条上：**查的是定义处模块的字典，而且每次都现查**。\n\n合起来就是本章 §15.6 那个坑的完整答案：父方法定义在 `vllm/v1/worker/gpu_model_runner.py`，它的 `__globals__` 就是那个模块的字典；你把 NPU 版 `graph_capture` 塞进自己的模块，父方法一辈子也看不见——必须 `setattr` 到父类那个模块上。",
+      "example": "语言参考自带的最小例子（说明性、非本仓源码），一眼看穿「运行期现查」：\n\n```python\ni = 10\ndef f():\n    print(i)      # i 是自由变量：函数里没定义，去 f.__globals__ 里查\ni = 42\nf()               # 打印 42 —— 查的是「调用那一刻」模块字典里的值，不是 def 时的值\n```\n\n把它改写成「跨模块」的版本，就是本章父方法的处境（说明性例子）：\n\n```python\n# parent.py\nfrom tools import helper          # parent 模块字典里多了个名字 helper\ndef work():\n    return helper()               # 自由变量 → 查 parent.__dict__['helper']\n\n# child.py\nimport sys, parent\ndef helper():                     # 我自己也定义一个同名的\n    return \"npu\"\n\nparent.work()                     # 仍然走 tools 那份 —— child 里定义的它看不见\nsys.modules[\"parent\"].helper = helper   # ← 打到 parent 模块的字典上\nparent.work()                     # 现在返回 \"npu\"\n```\n\n逐行点一下：`parent.work` 的 `__globals__` 就是 `parent` 模块的字典；只有往这本字典里写（倒数第二行），`work()` 下一次执行时查到的才是新实现。写进 `child` 自己的命名空间对 `work()` 毫无影响——这正是 `_get_gpu_model_runner_module_name` 存在的全部理由：先问出「父方法住在哪个模块」，再往那本字典上动手。",
+      "links": [
+        "https://docs.python.org/3/reference/executionmodel.html",
+        "https://docs.python.org/3/reference/datamodel.html#function.__globals__"
+      ],
+      "sources": [
+        {"url": "https://docs.python.org/3/reference/executionmodel.html", "note": "Python 语言参考《Execution model》：自由变量定义（used in a code block but not defined there）、『the namespace of the module containing the code block』作为全局命名空间、以及『Name resolution of free variables occurs at runtime, not at compile time』连同 i=10/i=42 打印 42 的官方示例；访问于 2026-07-26（页面为 Python 3.14.6 文档）。"},
+        {"url": "https://docs.python.org/3/reference/datamodel.html", "note": "Python 数据模型：function.__globals__ 条目逐字——『the global namespace of the module in which the function was defined』；访问于 2026-07-26。"},
+        {"url": "https://docs.python.org/3/glossary.html", "note": "术语表 free variable 条目：『any variable used in a namespace which is not a local variable in that namespace』；访问于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§15.6 已经把这条讲对了（LEGB 的 G 查函数定义所在模块的 __globals__），本条给它权威出处 + 一个 8 行可核例子。建议正文补的不是更多术语，而是**那个官方 i=10/i=42 的例子**或上面 parent/child 那段的精简版——读者一旦看见「改模块字典 → 下次调用就变」，后面所有猴补都不用再解释。ch03 的《Where to patch》讲的是「from-import 复制了名字」，本章这条是同一枚硬币的另一面（「函数体查的是定义处的字典」），可以在正文里点一句互相呼应，但别重复展开 mock 那个例子。"
+    },
+    {
+      "id": "contextmanager-exception-semantics",
+      "term": "`@contextmanager` 的异常语义与 `with A(), B():` 的嵌套/LIFO 规则",
+      "kind": "notation",
+      "one_line": "`@contextmanager` 写的生成器里，`yield` 那一行不只是「交出控制权」——`with` 体里抛出的异常会被**原地扔回到这个 yield 处**，所以你能用一个普通的 try/except/finally 把整个 with 体的成败都兜住；而 `with A(), B():` 在语义上就等于两层嵌套的 with，退出时严格后进先出。",
+      "what_it_is": "本章 §15.5、§15.9 那套「安全性论证」，全部的形式依据是标准库这两条明文规定：\n\n**① 异常会被抛回 yield 处。** `contextlib` 文档原话：`If an unhandled exception occurs in the block, it is reraised inside the generator at the point where the yield occurred. Thus, you can use a try…except…finally statement to trap the error (if any), or ensure that some cleanup takes place.` 翻成人话：`with _torch_cuda_wrapper():` 的**函数体**（也就是父类那 7000 行）里出了任何没人接的异常，Python 会把它「送回」到 wrapper 里 `yield` 停住的那一行再抛一次。于是 wrapper 那个包着 `yield` 的 `try/except/finally` 是**同时**在管两件事的：`try` 里那几行赋值自己抛的错，和 with 体里跑出来的错。这解释了一个初读容易困惑的点——「`except` 分支是在接谁的异常？」答案：也接父方法的。\n\n**② 接了就必须重抛，否则等于「吞掉」。** 文档专门警告：`If an exception is trapped merely in order to log it or to perform some action (rather than to suppress it entirely), the generator must reraise that exception. Otherwise the generator context manager will indicate to the with statement that the exception has been handled, and execution will resume with the statement immediately following the with statement.` 也就是说，如果 `except` 分支只装了 placeholder 就默默结束，调用方会**以为一切正常**、接着往下跑——所以那句 `raise RuntimeError(...)` 不是可有可无的礼貌，是语义上必需的一步。\n\n**③ 清理写在 finally 才有保证。** 文档给的标准骨架就是 `try: yield resource / finally: release(resource)`，理由是只有 `finally` 能覆盖「正常结束 / 抛异常 / return」三条退出路径。\n\n**④ 多个上下文管理器 = 嵌套。** 语言参考写死了这条等价：`with A() as a, B() as b: SUITE` 语义上等于 `with A() as a:` 里再套一层 `with B() as b:`。由此推出两件事：进入顺序 A→B，退出顺序 B→A（后进先出）；且 `with` 语句保证 `if the __enter__() method returns without an error, then __exit__() will always be called`——进得去就一定退得出。本章表格 t4（内层 `_replace_...` 先还原）早于 t5（外层 `_torch_cuda_wrapper` 后落稳态），就是这条规则的直接后果，不是作者的编排。",
+      "example": "两个说明性最小例子（非本仓源码）。先看「异常被送回 yield 处」：\n\n```python\nfrom contextlib import contextmanager\n\n@contextmanager\ndef patcher():\n    print(\"装\")\n    try:\n        yield                    # ← with 体在这儿运行；体内抛的异常会在这一行被重新抛出\n    except Exception as e:\n        print(\"except 接到了:\", e)\n        raise                    # 不重抛 = 吞掉异常，调用方会以为没事发生\n    finally:\n        print(\"卸\")              # 三条退出路径都会走到\n\nwith patcher():\n    raise ValueError(\"父方法炸了\")\n\n# 输出：装 / except 接到了: 父方法炸了 / 卸，然后 ValueError 继续向外传播\n```\n\n再看「一行两个 = 嵌套 + LIFO」：\n\n```python\n@contextmanager\ndef cm(name):\n    print(\"enter\", name)\n    try:\n        yield\n    finally:\n        print(\"exit\", name)\n\nwith cm(\"A\"), cm(\"B\"):\n    print(\"body\")\n\n# 输出顺序：enter A / enter B / body / exit B / exit A\n```\n\n把第二个例子里的 A、B 换成 `_torch_cuda_wrapper` 和 `_replace_gpu_model_runner_function_wrapper`，就是本章 §15.8 时间轴上 ③④→⑤→⑥⑦ 那条对称的进出线。",
+      "links": [
+        "https://docs.python.org/3/library/contextlib.html#contextlib.contextmanager",
+        "https://docs.python.org/3/reference/compound_stmts.html#the-with-statement"
+      ],
+      "sources": [
+        {"url": "https://docs.python.org/3/library/contextlib.html", "note": "标准库 contextlib 文档：『reraised inside the generator at the point where the yield occurred』、『the generator must reraise that exception，否则 with 会以为异常已处理并继续往下执行』、以及官方 try/finally 释放资源骨架示例；访问于 2026-07-26。"},
+        {"url": "https://docs.python.org/3/reference/compound_stmts.html#the-with-statement", "note": "语言参考 with 语句：多个上下文管理器等价于嵌套 with 的逐字等价代码；『The with statement guarantees that if the __enter__() method returns without an error, then __exit__() will always be called』；异常时 __exit__ 返回 false 则异常继续抛出；访问于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "这条是 §15.5③ 与 §15.9「核心不变量」的语言级地基，正文目前只说了『Python 保证 finally 在三条路径上都执行』——建议补的是读者最容易漏的那一层：**with 体里的异常会被抛回 yield 处，所以 wrapper 的 except 接的是父方法的错，而末尾那句 raise RuntimeError 是「不吞异常」的必需动作**（一句话 + 可选 6 行小例子）。§15.8「LIFO」那句也可以顺手加半句出处：`with A(), B()` 在语言参考里就等价于嵌套 with。别把 contextlib 其它 API（ExitStack 之类）扯进来。"
+    },
+    {
+      "id": "mro-c3-linearization",
+      "term": "MRO（方法解析顺序）与 `__mro__`",
+      "kind": "notation",
+      "one_line": "`SomeClass.__mro__` 是一个**类元组**，按「从自己出发、由近到远」排好的祖先名单；Python 每次找属性/方法都沿这张名单顺次查，第一个命中的就算数。",
+      "what_it_is": "官方 HOWTO 的定义：linearization（线性化）是 `The list of the ancestors of a class C, including the class itself, ordered from the nearest ancestor to the furthest`，而 **MRO 就是构造这张名单的那套规则**。数据模型里对应的属性是 `type.__mro__` — `The tuple of classes that are considered when looking for base classes during method resolution.`（在方法解析时会被考察的类构成的元组。）\n\n它管两件本章都用到的事：\n\n**① 父类调子类的 override 会「自动」落到子类。** 属性查找沿 `type(self).__mro__` 从头走，`NPUModelRunner` 排在 `GPUModelRunner` 前面，所以父类方法体里的 `self._sync_device()` 查到的是子类那份——这不是什么特殊机制，就是同一条名单查找规则（§15.2 的「MRO 落到子类的 override」）。\n\n**② 它是一份可编程遍历的「继承族谱」。** `__mro__` 是个普通元组，可以直接迭代——`_get_gpu_model_runner_module_name` 正是拿它当族谱查：沿名单找到叫 `GPUModelRunner` 的那个类，再问它 `__module__`。\n\nPython 3 用的具体算法叫 **C3 线性化**，它保证两条性质：**单调性**（`if C1 precedes C2 in the linearization of C, then C1 precedes C2 in the linearization of any subclass of C`——父类名单里的先后次序，在任何子类的名单里都不会被颠倒）与**局部优先序**（写 `class G(F, E)`，名单里 F 一定排在 E 前）。多继承（菱形继承）下这两条才是真正吃劲的地方；本章是单继承，名单简单到一眼能背：`NPUModelRunner → GPUModelRunner → …`。",
+      "example": "说明性最小例子（非本仓源码）：\n\n```python\nclass Base:\n    def sync(self):  print(\"base sync\")\n    def run(self):   self.sync()          # 父类方法体里调 self.sync()\n\nclass Child(Base):\n    def sync(self):  print(\"child sync\")  # 只覆盖这一个\n\nChild.__mro__\n# (<class 'Child'>, <class 'Base'>, <class 'object'>)  ← 由近到远的族谱\n\nChild().run()\n# 打印 \"child sync\" —— run 一行没改，self.sync 沿 __mro__ 先命中 Child\n\nnext(c for c in Child.__mro__ if c.__name__ == \"Base\").__module__\n# '__main__' ← 和 _get_gpu_model_runner_module_name 一模一样的用法：\n#              沿族谱按类名找到目标类，再问它住在哪个模块\n```\n\n最后一行就是本章 `_get_gpu_model_runner_module_name` 的骨架：`next(cls for cls in ...__mro__ if cls.__name__ == \"GPUModelRunner\")` 后取 `.__module__`。",
+      "links": [
+        "https://docs.python.org/3/howto/mro.html",
+        "https://docs.python.org/3/reference/datamodel.html#type.__mro__"
+      ],
+      "sources": [
+        {"url": "https://docs.python.org/3/howto/mro.html", "note": "官方 HOWTO《The Python 2.3 Method Resolution Order》：linearization 定义（由近到远的祖先名单）、MRO 是构造该名单的规则、C3 的单调性与局部优先序的逐字表述、L[C(B1..BN)] = C + merge(...) 公式；访问于 2026-07-26。"},
+        {"url": "https://docs.python.org/3/reference/datamodel.html", "note": "数据模型：type.__mro__ 逐字定义；并说明属性在基类中的查找『uses the C3 method resolution order』、菱形继承下依然正确；访问于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§15.2 和 §15.6 各用了一次 MRO，都只给了括注。建议只补一处：在 §15.6 讲 `_get_gpu_model_runner_module_name` 时，用一句「`__mro__` 就是一个由近到远的祖先类元组，可以直接迭代」把它从术语变成看得见的数据结构（读者才明白那行 next(...) 在遍历什么）；C3/单调性/菱形继承是多继承才吃劲的东西，本章单继承，点到即止、留给链接。"
+    },
+    {
+      "id": "explicit-parent-call-vs-super",
+      "term": "`GPUModelRunner.capture_model(self)`：类名点方法再手传 self",
+      "kind": "notation",
+      "one_line": "在 Python 3 里，`SomeClass.method` 取出来的就是一个**普通函数**，所以 `SomeClass.method(self)` 只是「把这个函数拿来、把 self 当第一个参数传进去」——效果是点名调用某个具体类的那份实现，绕开 `super()` 的沿 MRO 解析。",
+      "what_it_is": "Python 3.0 的官方 What's New 里有一条容易被忽略的变更：`The concept of \"unbound methods\" has been removed from the language. When referencing a method as a class attribute, you now get a plain function object.`（「未绑定方法」这个概念被移出语言；通过类去引用一个方法，现在拿到的就是一个普通函数对象。）Python 2 时代 `C.f` 会得到一个会检查 `self` 类型的 unbound method 对象，3.0 起这层包装没了——`C.f` 就是当初 `def f(self, ...)` 定义的那个函数本身，`self` 不过是它的第一个形参，你手动传进去完全合法。\n\n所以 `GPUModelRunner.capture_model(self)` 读作：**「我要的就是 `GPUModelRunner` 这个类身上的那份 `capture_model`，把当前实例当 self 交给它跑」**。\n\n和 `super().capture_model()` 的差别在**怎么选那份实现**：`super()` 不是「我父类」的意思，它是「沿着 `type(self).__mro__` 从当前类的下一位开始往后找」；单继承下两者结果相同，但一旦有人把 `NPUModelRunner` 再混进别的 mixin，`super()` 的落点会随 MRO 变化，而 `Class.method(self)` 永远钉在写死的那个类上。本章选后者，图的是把意图摆平：先用 `with` 布好猴补环境，再让**指定的那一份**巨方法原样跑一遍。（Python 3.0 同时引入了 PEP 3135 的无参 `super()`，本章那句 `super().__init__(vllm_config, device)` 用的就是它。）",
+      "example": "说明性最小例子（非本仓源码），看清「类名点方法 = 普通函数」：\n\n```python\nclass Base:\n    def hello(self):  return f\"Base hello from {self.name}\"\n\nclass Child(Base):\n    name = \"child\"\n    def hello(self):  return \"Child hello\"\n\ntype(Base.hello)          # <class 'function'>  ← 就是个普通函数，不是什么特殊对象\nc = Child()\nc.hello()                 # 'Child hello'                 —— 常规调用，沿 MRO 命中 Child\nBase.hello(c)             # 'Base hello from child'       —— 点名要 Base 那份，把 c 当 self\n```\n\n第三行是关键证据：`Base.hello` 的类型就是 `function`。最后一行与本章 `GPUModelRunner.capture_model(self)` 是同一个写法——绕过子类的同名 override，直接跑指定类的那份实现（否则在子类的 override 里再调自己，就是无限递归）。",
+      "links": [
+        "https://docs.python.org/3/whatsnew/3.0.html",
+        "https://peps.python.org/pep-3135/"
+      ],
+      "sources": [
+        {"url": "https://docs.python.org/3/whatsnew/3.0.html", "note": "What's New in Python 3.0 逐字：『The concept of \"unbound methods\" has been removed from the language. When referencing a method as a class attribute, you now get a plain function object.』；以及 PEP 3135 无参 super() 的说明（带参数时行为不变）；访问于 2026-07-26。"},
+        {"url": "https://docs.python.org/3/howto/mro.html", "note": "MRO HOWTO：super() 的解析依据是线性化名单，用于对照说明『super() 沿 MRO 找下一位』与『Class.method(self) 钉死一个类』的差别；访问于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§15.8 已经点了这个写法「比 super() 更直白」，但没说**为什么这样写合法**——初学者看到「方法怎么能手传 self」会卡住。建议补半句：Python 3 里 `类名.方法` 取出来的就是个普通函数（3.0 起取消了 unbound method），`self` 只是它的第一个参数；再加半句差异：单继承下和 super() 等价，区别在 super() 沿 MRO 解析、这种写法钉死一个类。别展开成 super() 教程。另：正文若要说『递归风险』可以点一句 —— 在同名 override 里调 self.capture_model() 会无限递归，这也是必须点名父类的实际原因（此点属常识推论，未另找出处）。"
+    },
+    {
+      "id": "torch-accelerator-device-agnostic",
+      "term": "`torch.accelerator`：PyTorch 的设备无关运行时 API",
+      "kind": "external_concept",
+      "one_line": "PyTorch 官方为「同一份代码跑在 CUDA / XPU / MPS / 厂商自带后端上」提供的统一运行时门面——你写 `torch.accelerator.synchronize()`，它去问「当前加速器是谁」再转发，不必写死 `torch.cuda.*`。",
+      "what_it_is": "本章内嵌的父类源码里，同一段代码同时出现了两种写法：`torch.cuda.mem_get_info()`（写死 CUDA）和 `torch.accelerator.synchronize()`（设备无关）。后者是 PyTorch 官方推的新门面：`torch.accelerator` 文档的开篇一句就是 `This package introduces support for the current accelerator in python.`，它把「当前加速器是哪一个」抽象成运行期状态，再提供一组不带设备名的 API——据 PyTorch 2.10 文档（本书 pin 的 torch 版本），这个包提供 `current_accelerator` / `is_available` / `device_count` / `current_stream` / `set_stream` / `synchronize` / `empty_cache` / `memory_stats` / `get_memory_info` 等函数。\n\n为什么这对本章重要：**父类里每多一处 `torch.accelerator.*`，昇腾就少一处要猴补的地方**。设备无关 API 本身就是父类作者主动留下的、最规矩的一种接缝——不需要外人偷偷换符号，因为它天生就会转发给当前设备。本章那份「要临时换掉的符号清单」，反过来看正是**上游还没来得及设备无关化的残留**。\n\n**但「设备无关」是设计目标，不等于每个后端都已接齐。** 昇腾这类走 PrivateUse1 的树外（out-of-tree）后端，要靠 `torch_npu` 注册 hooks 才能被 `torch.accelerator` 正确转发；覆盖不全时，某个 `torch.accelerator.xxx` 落到 NPU 上就可能不生效。判断某个具体 API 在 torch 2.10 + torch_npu 下到底通不通，属于版本相关的实证问题，不能凭「它叫 accelerator」就断定通。",
+      "background": "这套抽象是 PyTorch「让新硬件更容易接进来」这条长期路线的一部分：先有 PrivateUse1 分派键（把树外设备接进算子分派系统，ch01/ch02 已讲），再把上层 Python 运行时 API 逐个设备无关化。`torch.accelerator` 作为统一运行时门面在 2.6 一代成型（当时的宣传点之一就是 DDP/FSDP 内部改用设备无关 API 取代 CUDA 专用写法），此后逐版本扩面。\n\n值得写进正文的一笔是**这条路线正好指向本章那句 TODO**（源码里写着「将来移到 platform 层」）：据 PyTorch 官方 2.12 发布博客（2026-05-13 发布），该版本新增了 `torch.accelerator.Graph` —— `a new device-agnostic API for graph capture and replay, providing a unified abstraction over backend-specific implementations such as torch.xpu.XPUGraph`，各后端通过一个轻量的 `GraphImplInterface` 注册自己的实现；博客明确说这套 stream/graph 管理的跨后端对齐『extensibility to out-of-tree backends via PrivateUse1』（可经 PrivateUse1 扩展到树外后端）。也就是说，本章要靠临时换符号才能对齐的「图捕获」这件事，上游正在做成一等公民的设备无关 API。**注意时间线**：2.12 晚于本书 pin 的 torch 2.10，这属于「未来方向」，不是本书环境里已有的东西。",
+      "links": [
+        "https://docs.pytorch.org/docs/2.10/accelerator.html",
+        "https://pytorch.org/blog/pytorch-2-12-release-blog/"
+      ],
+      "sources": [
+        {"url": "https://docs.pytorch.org/docs/2.10/accelerator.html", "note": "PyTorch 2.10（= 本书 pin 的 torch 版本）官方 API 文档：torch.accelerator 包的定位句『This package introduces support for the current accelerator in python.』与函数清单（current_accelerator / is_available / device_count / current_stream / set_stream / synchronize / empty_cache / memory_stats / get_memory_info 等）；访问于 2026-07-26。"},
+        {"url": "https://pytorch.org/blog/pytorch-2-12-release-blog/", "note": "PyTorch 2.12 官方发布博客（2026-05-13 发布）：torch.accelerator.Graph 作为设备无关图捕获/重放 API 的逐字介绍、GraphImplInterface 注册机制、以及『extensibility to out-of-tree backends via PrivateUse1』；访问于 2026-07-26。用于说明上游方向，非本书 pin 版本的现状。"},
+        {"url": "https://docs.pytorch.org/tutorials/advanced/privateuseone.html", "note": "PyTorch 官方教程《Facilitating New Backend Integration by PrivateUse1》：树外后端经 PrivateUse1 接入、须注册 hooks 才能被上层通用设施识别（用于支撑『设备无关 ≠ 每个后端都已接齐』这句谨慎表述）；2026-07-26 经搜索结果获取要点，未逐条比对 hooks 覆盖表，故本条整体标 medium。"}
+      ],
+      "confidence": "medium",
+      "writer_note": "§15.3 内嵌的父类片段里 `torch.accelerator.synchronize()` 和 `torch.cuda.mem_get_info()` 并排出现，读者一定会问「这俩为什么待遇不同」——这是本条最该用的地方：一句『torch.accelerator 是 PyTorch 的设备无关门面，写它就不用写死 cuda；父类里每多一处它，昇腾就少一处要换的符号』，把「要猴补的清单 = 上游尚未设备无关化的残留」这层意思点出来。§15.6 那句 TODO（将来移到 platform）也可以顺势带一句上游方向（2.12 的 torch.accelerator.Graph），但**必须标明那是 pin 之后的版本、是趋势不是现状**。⚠️ 不要断言「torch.accelerator 在 NPU 上一切正常」——本仓自己另有一处模块加载期的永久猴补把 torch.accelerator 的若干内存 API 改指 torch.npu.*（属 ch03 patch 台账范畴），若 writer 想引用这个反例，请让 analyst 从 pin 源码核实后再写。"
+    },
+    {
+      "id": "sm-vs-ascend-ai-core",
+      "term": "SM（流多处理器）与昇腾的对位物 AI Core",
+      "kind": "external_concept",
+      "one_line": "SM 是 NVIDIA GPU 上「一块能独立跑一堆线程的计算单元」，一张卡有几十上百个，数量直接决定并行规模；昇腾没有叫这个名字的东西，它的对位物是达芬奇架构里的 AI Core（内含 Cube / Vector / Scalar 三种计算单元）——所以 `num_sms = None` 不是偷懒，是「这个量在这台机器上没有对应物」。",
+      "what_it_is": "**GPU 侧。** NVIDIA 官方文档的说法：`The NVIDIA GPU architecture is built around a scalable array of multithreaded Streaming Multiprocessors (SMs).`（NVIDIA GPU 架构围绕一组可伸缩的、多线程的流多处理器阵列构建。）启动一个 kernel 时，`the blocks of the grid are enumerated and distributed to multiprocessors with available execution capacity`（网格里的线程块被逐个分发到还有余力的多处理器上）；SM 内部按 warp（一组并行线程，通常 32 个）调度执行。因此「这张卡有多少个 SM」是写高性能 kernel 时的一个基础参数——常被用来决定切多少块、每块多大，好让所有 SM 都吃饱不闲着。父类那句 `self.num_sms = num_compute_units(...)` 取的就是这个数。\n\n**昇腾侧。** 昇腾用的是达芬奇（Da Vinci）架构，计算核心叫 **AI Core**。据昇腾社区 CANN 官方文档，AI Core 内部有三类基础计算单元：**Cube（矩阵）计算单元**负责矩阵乘（一次执行完成 A(M×K) 与 B(K×N) 的矩阵乘）、**Vector（向量）计算单元**负责向量运算、**Scalar（标量）计算单元**「功能上可以看做一个小 CPU」，负责循环控制、分支判断、给 Cube/Vector 算地址和参数；三者形成三条独立流水线，由系统软件统一调度配合。\n\n**为什么这决定了 `num_sms = None`。** 两边都是「一块芯片上若干个并行计算单元」，但切分粒度、调度模型、编程模型都不一样（GPU 是 warp/线程块那套 SIMT 抽象与硬件管理的缓存层次；昇腾这边是 Cube/Vector 分工、并把片上缓冲交给软件显式搬运）。「SM 数量」这个标量在昇腾上没有语义等价物，硬凑一个数反而会误导下游按 GPU 直觉去切分——直接置 `None`，比编一个数诚实。",
+      "links": [
+        "https://docs.nvidia.com/cuda/parallel-thread-execution/index.html",
+        "https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/82RC1alpha001/opdevg/Ascendcopdevg/atlas_ascendc_10_0009.html"
+      ],
+      "sources": [
+        {"url": "https://docs.nvidia.com/cuda/parallel-thread-execution/index.html", "note": "NVIDIA PTX ISA 官方文档引言：『The NVIDIA GPU architecture is built around a scalable array of multithreaded Streaming Multiprocessors (SMs).』、线程块被分发到有余力的多处理器、SIMT 单元以 warp（通常 32 线程）为单位调度；访问于 2026-07-26。"},
+        {"url": "https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/82RC1alpha001/opdevg/Ascendcopdevg/atlas_ascendc_10_0009.html", "note": "昇腾社区 CANN 官方开发文档《计算单元-硬件架构-Ascend C 算子开发》：AI Core 三类基础计算单元 Cube/Vector/Scalar 的分工（Scalar『功能上可以看做一个小 CPU』、Cube 一次执行完成 M×K 与 K×N 矩阵乘）、三条独立流水线由系统软件统一调度；2026-07-26 经站内搜索结果取得要点，未逐字抓取整页，故本条标 medium。"}
+      ],
+      "confidence": "medium",
+      "writer_note": "§15.2 目前一句『num_compute_units 是 CUDA 的 SM 数量，昇腾没有这个概念』——建议补到「一句半」：SM 是 GPU 上一块能独立跑一堆线程的计算单元、数量决定并行规模；昇腾的对位物是 AI Core（Cube/Vector/Scalar 三件套），粒度与调度模型都不同，所以没有语义等价的「SM 数」，置 None 比编一个数诚实。达芬奇架构细节、warp/SIMT 都留给链接——本章主题是接缝，不是硬件架构。"
+    },
+    {
+      "id": "duck-typing-hot-swap",
+      "term": "鸭子类型（duck typing）：为什么「长得像」就能换进去",
+      "kind": "external_concept",
+      "one_line": "Python 调一个对象的方法时不问「你是什么类」，只管「你有没有这个方法、能不能这么调」——所以只要 `ACLGraphWrapper` 和 `CUDAGraphWrapper` 该有的都有、签名对得上，父方法根本察觉不到自己手里换了个类。",
+      "what_it_is": "Python 官方术语表的定义：`A programming style which does not look at an object's type to determine if it has the right interface; instead, the method or attribute is simply called or used (\"If it looks like a duck and quacks like a duck, it must be a duck.\") By emphasizing interfaces rather than specific types, well-designed code improves its flexibility by allowing polymorphic substitution. Duck-typing avoids tests using type() or isinstance().`（不看对象的类型来判断它是否具备正确的接口，而是直接调用/使用那个方法或属性——「如果它看起来像鸭子、叫起来像鸭子，那它就是鸭子」；强调接口而非具体类型，代码因此更灵活，允许多态替换；鸭子类型避免用 `type()` 或 `isinstance()` 做检查。）\n\n注意最后一句的现实含义：**鸭子类型能不能奏效，取决于调用方有没有做类型检查**。父方法只是 `CUDAGraphWrapper(self.model, vllm_config, runtime_mode, ...)` 地构造、`._all_instances` 地访问、`(...)`地调用——全是「直接用」，没有一句 `isinstance`，所以换成同形的另一个类完全无感。反过来，只要父方法里出现一句 `assert isinstance(x, CUDAGraphWrapper)`，这套热替换就当场失效。所以本章说的「同形」得说全：**不只是构造签名对齐，还包括被用到的每一个类属性/方法/返回值形状都对齐**（`_all_instances`、`clear_all_graphs`、`graph_capture()` 返回对象要有 `.stream` 字段……），而「哪些被用到」是由父方法的代码决定的、随上游改动而变——这正是这类替换需要跟着上游版本走的原因。",
+      "background": "「duck typing」这个说法在 Python 社区流行开来通常被追到 2000 年前后 comp.lang.python 上的讨论（常被引述的出处是 Alex Martelli 的帖子），此后进了官方术语表，成为描述 Python 多态风格的标准词。它和 Java 那种「先声明 interface 再 implements」的名义类型（nominal typing）形成对照：后者要求你事先约定一个共同的类型名，前者只要求运行时「该有的都有」。术语表也提醒它不是非此即彼——鸭子类型可以和抽象基类（ABC）互补：想要显式契约时，用 ABC 把「该有哪些方法」写下来。**注**：本条的词源（Martelli / comp.lang.python 2000）为社区通行说法，本次只核实了官方术语表的定义原文，未一手核实那封原帖，故整体标 medium。",
+      "links": [
+        "https://docs.python.org/3/glossary.html#term-duck-typing"
+      ],
+      "sources": [
+        {"url": "https://docs.python.org/3/glossary.html", "note": "Python 官方术语表 duck-typing 条目原文（不看类型只管调用、if it looks like a duck…、强调接口而非具体类型带来多态替换、避免 type()/isinstance() 检查、可与抽象基类互补）；访问于 2026-07-26。"}
+      ],
+      "confidence": "medium",
+      "writer_note": "§15.7 已经用『鸭子兼容（duck-compatible，长得像就当得了）』把意思讲到了——本条只值加半句**限定条件**：鸭子类型成立的前提是调用方「直接用、不做 isinstance 检查」，而「要长得多像」由父方法实际用到哪些成员决定（所以这类替换天生跟着上游版本走）。这半句比再解释一遍「什么是鸭子类型」有价值得多。词源那段（Martelli/2000）confidence 只有 medium，正文不必写。"
+    },
+    {
+      "id": "weakset-instance-registry",
+      "term": "`WeakSet`：不会把成员「养着」的登记表",
+      "kind": "external_concept",
+      "one_line": "一个普通的集合会让被放进去的对象永远死不掉；`WeakSet` 只拿弱引用登记成员——对象在别处没人用了就照常被回收，登记表里的那一项自动消失。",
+      "what_it_is": "Python 标准库对弱引用的解释：`A weak reference to an object is not enough to keep the object alive: when the only remaining references to a referent are weak references, garbage collection is free to destroy the referent and reuse its memory for something else.`（对一个对象的弱引用不足以让它活着：当只剩弱引用指着它时，垃圾回收随时可以销毁它、把内存挪作他用。）`WeakSet` 就是基于此的集合类型——文档定义：`Set class that keeps weak references to its elements. An element will be discarded when no strong reference to it exists any more.`（保存元素弱引用的集合类；当某元素不再有任何强引用时，它会被丢弃。）\n\n为什么这类「全局登记表」非用弱引用不可：文档给的典型场景就是缓存/映射——`a primary use for weak references is to implement caches or mappings holding large objects, where it's desired that a large object not be kept alive solely because it appears in a cache or mapping`（不希望一个大对象仅仅因为「出现在某张表里」就一直活着）。图包装器（每个里面都攥着已捕获的图和显存池）正是这种「大对象」：用普通 `set` 登记，等于宣布所有包装器和它们占的显存在进程结束前都别想释放；用 `WeakSet`，登记表只负责「现在还活着的有哪些」，谁被弃用了自己就从表里消失。本章 §15.7 只需要读者知道：`_all_instances` 是这样一张「活着的实例名单」，父方法遍历它给每个实例换图池——`ACLGraphWrapper` 也备了同名的一张，所以父方法那句 `CUDAGraphWrapper._all_instances` 换过来照样能跑。",
+      "links": [
+        "https://docs.python.org/3/library/weakref.html#weakref.WeakSet"
+      ],
+      "sources": [
+        {"url": "https://docs.python.org/3/library/weakref.html", "note": "标准库 weakref 文档：弱引用不足以维持对象存活的定义原文、WeakSet 类定义（元素失去强引用即被丢弃）、以及『不希望大对象仅因出现在缓存/映射里就被一直保活』的典型用途说明；访问于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§15.7 目前是括注『一个 WeakSet，登记所有实例』——加半句就够：弱引用登记，成员在别处没人用了就自动从表里消失，所以这张全局名单不会把图包装器和它们占的显存一直吊着。别展开 weakref 家族（WeakValueDictionary 等），链接留给好奇的读者。"
+    },
+    {
+      "id": "noqa-b010-setattr",
+      "term": "`# noqa: B010` 这条挂在 setattr 后面的注释",
+      "kind": "notation",
+      "one_line": "`# noqa: XXX` 是给静态检查工具看的「这一行的这条告警别报了」；`B010` 是 flake8-bugbear 的一条规则——「别用 `setattr(x, 'attr', val)`，直接写 `x.attr = val`」。",
+      "what_it_is": "本章内嵌的 `_replace_gpu_model_runner_function_wrapper` 里，每个 `setattr(...)` 后面都跟着一条 `# noqa: B010`。读者会问这是什么咒语，拆成两半就明白：\n\n**`# noqa`** 是 flake8 系工具的行内抑制注释（社区常把它读作 no quality assurance，官方文档未给出这个展开，当趣闻听即可）。裸写 `# noqa` 会忽略该行**所有**告警；带冒号列出编码（`# noqa: E731,E123`）则只忽略列出的那几条，`If there are other errors on the line then those will be reported`（该行其它错误照报）。加编码的写法更克制，也更能说明「作者知道自己在压哪条」。\n\n**`B010`** 来自 flake8-bugbear 插件，规则原文：`Do not call setattr(x, 'attr', val), instead use normal property access: x.attr = val. There is no additional safety in using setattr if you know the attribute name ahead of time.`（属性名如果是编译期就写死的常量，用 `setattr` 并不比直接赋值更安全。）\n\n**为什么这里要压掉它。** 这条规则的前提是「属性名写死、对象就在手边」，改成 `target_module.graph_capture = graph_capture` 确实完全等价。但在这段代码里，`setattr` 的写法和紧邻的**还原循环** `for attr_name, attr_value in original_attrs.items(): setattr(target_module, attr_name, attr_value)` 是同一套写法——那里的属性名是从字典里取出来的变量，**只能**用 `setattr`。作者为「装」和「卸」保持同一副面孔，代价就是压掉这条风格告警。所以这行 `# noqa` 与其说是技术细节，不如说是一个**可读性取舍的留痕**。",
+      "example": "说明性最小例子（非本仓源码）：\n\n```python\n# 触发 B010：属性名是写死的常量\nsetattr(obj, \"mode\", \"npu\")          # B010: Do not call setattr with a constant attribute value\nobj.mode = \"npu\"                     # ← bugbear 建议的写法，完全等价\n\n# 必须用 setattr：属性名是运行期才知道的变量\nfor name, value in backup.items():\n    setattr(module, name, value)     # 名字来自字典，写不成 module.<name> = value\n\n# 明知故犯时的写法：只压这一条，其它告警照常报\nsetattr(obj, \"mode\", \"npu\")  # noqa: B010\n```\n\n第二段就是本章 finally 里那个还原循环的骨架——这也是第一段为什么宁可挨一条告警也要写成 `setattr` 的原因：装和卸长一个样。",
+      "links": [
+        "https://github.com/PyCQA/flake8-bugbear",
+        "https://flake8.pycqa.org/en/latest/user/violations.html"
+      ],
+      "sources": [
+        {"url": "https://github.com/PyCQA/flake8-bugbear", "note": "flake8-bugbear 官方仓库 README 规则清单：B010 原文『Do not call setattr(x, 'attr', val), instead use normal property access: x.attr = val. There is no additional safety in using setattr if you know the attribute name ahead of time.』（另见相邻的 B009 getattr 版）；访问于 2026-07-26。"},
+        {"url": "https://flake8.pycqa.org/en/latest/user/violations.html", "note": "flake8 官方文档《Selecting and Ignoring Violations》：裸 `# noqa` 忽略该行全部告警、`# noqa: E731,E123` 只忽略列出的编码且『If there are other errors on the line then those will be reported』、noqa 大小写不敏感；访问于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "这是「读者盯着内嵌源码会被卡住」的典型小石头：§15.6 那段代码里三处 `# noqa: B010` 目前无人解释。建议在讲 setattr 那几行时加一句脚注级说明（`# noqa: B010` = 压掉 flake8-bugbear 那条『属性名是常量就直接赋值』的风格告警），并顺手点出**为什么明知故犯**——因为 finally 的还原循环里属性名是变量、只能用 setattr，装卸两边保持同一副写法。这半句能把一条噪声注释变成设计留痕，性价比很高；规则清单/flake8 配置细节留给链接。"
+    }
+  ]
+}

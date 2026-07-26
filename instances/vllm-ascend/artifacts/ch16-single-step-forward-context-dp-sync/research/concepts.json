@@ -1,0 +1,199 @@
+{
+  "chapter_id": "ch16-single-step-forward-context-dp-sync",
+  "source_pin": "vllm-ascend v0.21.0rc1 (80610e44) / 配套基座 vLLM v0.21.0",
+  "researched_on": "2026-07-26",
+  "scope_note": "本文件只做读者定向的外部背景（基座 vLLM / PyTorch / 集合通信 / 图捕获 / 昇腾公开文档与 PR），不解读 vllm_ascend pin 源码——那是 dossier 的活。凡涉及外部项目「现在怎样」的说法，一律注明依据的版本与访问日期。",
+  "concepts": [
+    {
+      "id": "dp-lockstep-moe",
+      "term": "vLLM 语境下的数据并行（DP）与「必须齐步走」",
+      "kind": "external_concept",
+      "one_line": "DP 就是「每一份卡上都放一整套模型权重、各自服务各自的请求」；可一旦模型是 MoE，各卡就不能各跑各的了——必须每一拍一起前向，这正是本章要跨卡同步的根本原因。",
+      "what_it_is": "先分清两种「并行」：张量并行（TP）是把同一个权重矩阵横着竖着切开、分给多张卡，一次前向要靠通信把碎片拼回来；数据并行（DP）反过来——权重整份复制到每个实例上，各实例处理互不相干的请求批次。vLLM 官方文档的原话是：『model weights are replicated across separate instances/GPUs to process independent batches of requests』。按这个定义，DP 各卡本该像互不相干的兄弟进程，谁也不用等谁。\n\n但 MoE（混合专家）模型把这份「互不相干」打破了。MoE 服务的常见摆法是：注意力层走 DP（每卡一份完整注意力权重），专家层走 EP/TP（专家被摊到所有卡上），官方文档写作『it can be advantageous to use data parallel for the attention layers and expert or tensor parallel (EP or TP) for the expert layers』，并给出规模关系 EP_SIZE = TP_SIZE × DP_SIZE。于是每张卡的 token 在专家层都得按路由结果被发到别的卡上去算——这是一次全组参与的集合通信。文档因此把约束写死了：『Forward passes must be aligned, and expert layers across all ranks are required to synchronize during every forward pass, even when there are fewer requests to be processed than DP ranks.』（前向必须对齐；哪怕待处理请求比 DP rank 还少，专家层每一拍都要全组同步。）\n\n约束的直接后果有两条，正文都会用到：其一，某张卡这拍恰好没请求，也不能闲着——官方做法是让它跑一次空的 dummy forward：『we must ensure that empty dummy forward passes are performed in all ranks that don't currently have any requests scheduled』；vLLM 为此专门起了一个 DP Coordinator 进程，每 N 步做一次集合操作，判断是不是所有 rank 都空了、可以一起歇。其二（本章的主题），既然大家必须一起迈步，那「这一拍每卡各跑多少 token、跑不跑图」就得先谈拢——这就是 _sync_metadata_across_dp 存在的理由。",
+      "background": "为什么偏偏是 MoE 逼出这条约束？dense 模型的一次前向里，DP 各卡之间根本没有集合通信（权重是整份复制的，算完各自的 batch 就完事），所以各卡步调差一点无所谓。MoE 把 FFN 换成「若干专家 + 路由」，专家又被 EP 摊到各卡上，token 必须跨卡去找自己的专家——这一步 dispatch/all-to-all 是全组语义的：所有卡要在同一时刻、以互相匹配的形状发起，缺一个或形状对不上，通信就会错位甚至挂死。这也解释了本章 should_skip_allreduce_across_dp_group 里那条最干脆的捷径：dense 模型直接跳过同步。",
+      "links": [
+        "https://docs.vllm.ai/en/v0.21.0/serving/data_parallel_deployment/",
+        "https://docs.vllm.ai/en/latest/serving/expert_parallel_deployment/"
+      ],
+      "sources": [
+        {"url": "https://docs.vllm.ai/en/v0.21.0/serving/data_parallel_deployment/", "note": "vLLM v0.21.0（与本章 pin 的基座同版）官方《Data Parallel Deployment》：DP 定义『model weights are replicated across separate instances/GPUs to process independent batches of requests』；MoE 建议『data parallel for the attention layers and expert or tensor parallel (EP or TP) for the expert layers』；齐步走约束『Forward passes must be aligned, and expert layers across all ranks are required to synchronize during every forward pass, even when there are fewer requests to be processed than DP ranks.』；dummy forward 与 DP Coordinator 两段原话。访问日期 2026-07-26。"},
+        {"url": "https://docs.vllm.ai/en/latest/serving/expert_parallel_deployment/", "note": "vLLM 官方《Expert Parallel Deployment》（latest，2026-07-26 访问）：EP_SIZE = TP_SIZE × DP_SIZE；专家分片到各 rank、attention 权重在 DP rank 间复制；EP 与 DP 搭配更高效。此页取自 latest 而非 v0.21.0，规模公式属稳定口径；若正文要引具体措辞，建议改引 v0.21.0 同名页。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§16.3 开头『为什么非同步不可』现在是作者自述，可以换成官方口径背书一句：vLLM 文档白纸黑字要求『前向必须对齐、专家层每拍全组同步，哪怕请求数比 rank 数还少』，没请求的卡还要跑空的 dummy forward。点到即止即可，DP Coordinator 与空转判定的细节留给链接（也别和本章的 all_reduce 混为一谈：那是另一层机制）。"
+    },
+    {
+      "id": "collective-primitives",
+      "term": "集合通信四件套：all_reduce / all_gather / reduce_scatter / all_to_all",
+      "kind": "notation",
+      "one_line": "多卡程序里的四个标准动作名——本章的 dist.all_reduce、flashcomm 回收用的 all_gather、MoE 用的 all_to_all，都是从这套词汇表里取的。",
+      "what_it_is": "先立三个词：一组一起干活的进程叫「通信组（process group）」，组里每个进程有个编号叫 rank（0, 1, 2, …），组的大小叫 world_size。PyTorch 文档的说法是『Rank is a unique identifier assigned to each process within a distributed process group. They are always consecutive integers ranging from 0 to world_size.』所谓「集合通信（collective）」，就是组里所有 rank 都必须调用、才能一起完成的那种通信动作。四个最常用的（用 NVIDIA NCCL 文档的定义，HCCL 等库语义相同）：\n\n- all_reduce：『performs reductions on data (for example, sum, min, max) across devices and stores the result in the receive buffer of every rank』——各卡拿出同样形状的数据，逐元素做一次归约（默认求和），每张卡都拿到同一份结果。PyTorch 侧还有两条关键补充：调用结束后『tensor is going to be bitwise identical in all processes』，而且它是原地改写传进去的那个张量。\n- all_gather：『gathers N values from k ranks into an output buffer of size k*N, and distributes that result to all ranks』——不做运算，只是把各卡那一份按 rank 顺序拼成一根长的，每卡各得一份完整拼接结果。\n- reduce_scatter：先归约、再把结果切块分发，rank i 只拿第 i 块。NCCL 文档还点明一条恒等式：『Executing ReduceScatter, followed by AllGather, is equivalent to the AllReduce operation.』\n- all_to_all：『each rank provides an input buffer of size k*N values, where the j-th chunk of N values is sent to destination rank j』——相当于一次跨卡「转置」，每卡给每卡各发一块。MoE 把 token 按路由结果送到专家所在卡，用的就是它。",
+      "background": "这套词汇不是 GPU 时代发明的，它来自更早的 MPI（消息传递接口）标准；NCCL（NVIDIA）、HCCL（华为昇腾，见第 8 章）、Gloo（CPU）等库都沿用同一组名字与语义，PyTorch 的 torch.distributed 则在其上盖了一层后端无关的 API：同一句 dist.all_reduce(t, group=g)，底层走 nccl 还是 hccl 还是 gloo，取决于建组时给的 backend 字符串。所以读本章代码时不必关心底层是哪家实现——语义是这套标准词汇表定死的。",
+      "example": "两张卡（dp_size=2），每卡持有一个长度 2 的整数张量（说明性例子，非本仓源码）：\n\n```\n初始：  rank0 = [1, 2]          rank1 = [10, 20]\n\nall_reduce(SUM)  -> rank0 = [11, 22]      rank1 = [11, 22]       # 逐元素求和，两卡同得\nall_gather       -> rank0 = [1,2,10,20]   rank1 = [1,2,10,20]    # 按 rank 顺序拼接\nreduce_scatter   -> rank0 = [11]          rank1 = [22]           # 先求和再切块，各拿一块\nall_to_all       -> rank0 = [1, 10]       rank1 = [2, 20]        # 第 j 块发给 rank j，形同转置\n```\n\n逐行看：all_reduce 之后两卡内容完全一样（这正是它能当「广播」使的原因，见下一条）；all_gather 结果长度变成 k×N；reduce_scatter 是 all_reduce 的「一半」；all_to_all 谁也没做加法，只是把数据换了个位置。",
+      "links": [
+        "https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html",
+        "https://docs.pytorch.org/docs/stable/distributed.html"
+      ],
+      "sources": [
+        {"url": "https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html", "note": "NCCL 官方《Collective Operations》：AllReduce / AllGather / ReduceScatter / AlltoAll 四条定义原话，以及『Executing ReduceScatter, followed by AllGather, is equivalent to the AllReduce operation.』访问日期 2026-07-26。"},
+        {"url": "https://docs.pytorch.org/docs/stable/distributed.html", "note": "PyTorch 官方 torch.distributed 文档（stable 实际落到 2.13 版页面）：rank/world_size 定义原话；all_reduce 默认 ReduceOp.SUM、原地、『After the call tensor is going to be bitwise identical in all processes』；后端矩阵（nccl 面向 CUDA GPU、gloo 面向 CPU、mpi 可选）。访问日期 2026-07-26。"},
+        {"url": "https://www.hiascend.com/document/detail/en/canncommercial/800/hcclug/hcclug/hcclug_000001.html", "note": "HCCL 官方文档（第 8 章已引）：昇腾侧同样提供 AllReduce/Broadcast/AllGather/ReduceScatter/AlltoAll 这组原语，佐证「同一套词汇表、换实现不换语义」。访问日期 2026-07-25（承第 8 章研究）。"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文第一次出现 dist.all_reduce 时已有一句解释，可把上面小表的前两行（all_reduce 与 all_gather 的数值对比）压成一两句：『all_reduce 是各卡逐元素归约、结果人手一份；all_gather 是不做运算的拼接』——因为本章后面 flashcomm 回收要用 all_gather、MoE 要用 all_to_all，读者需要这组词。reduce_scatter 与那条恒等式属加分项，可省，留给链接。"
+    },
+    {
+      "id": "onehot-sum-allreduce-idiom",
+      "term": "「零张量 + 各填己列 + sum-allreduce」= 一次通信当 all_gather 用",
+      "kind": "custom_pattern",
+      "one_line": "分布式推理代码里反复出现的小手法：先把缓冲清零，每张卡只写自己那一格，再做一次求和 all_reduce——所有卡就都拿到了「谁是多少」的完整表，一次通信搞定，还能顺手把多个量打包在一起。",
+      "what_it_is": "要让每张卡都知道「别的卡这拍有多少 token」，直觉做法是 all_gather。但有个更省事的写法：开一个长度等于 dp_size 的全零张量，rank i 只把自己的值写进第 i 格，其余格保持 0，然后做一次 all_reduce(SUM)。\n\n为什么这等价于 all_gather？因为 0 是加法的单位元：第 i 格上只有 rank i 那一份是非零的，其他卡都往上加了个 0，所以求和结果的第 i 格恒等于 rank i 写进去的值。而 all_reduce 保证「结束后所有卡逐位相同」，于是每张卡都拿到同一张完整表。\n\n好处有三个：一是只用最常见、最被优化的那个原语（很多栈里 all_reduce 是打磨得最狠的一条路径）；二是收发共用同一块缓冲，不用操心 all_gather 的输出布局；三是可以顺手加行——想再同步一个量，就把张量从 [dp_size] 加高成 [2, dp_size]，通信次数不变，只是每次多搬几个 int32。代价也要说清：它只对「求和是对的」这类聚合成立（max/min 之类留到解包后在本地算），而且强依赖零初始化——哪张卡忘了清零或多写了别人的格子，加出来就是错的，还悄无声息。",
+      "background": "这不是昇腾发明的写法，本仓所在的整条技术线都这么写。基座 vLLM v0.21.0 里，vllm/v1/worker/dp_utils.py 的 _run_ar 就是同一个模子：torch.zeros(4, dp_size, ...)，四行分别填「未 padding 的 token 数 / padding 后的 token 数 / 要不要微批 / cudagraph 模式」，各 rank 只写自己那一列，然后一次 dist.all_reduce。更早的 DPMetadata 里也有同款：先 num_tokens_across_dp = [0] * dp_size，再 num_tokens_across_dp[dp_rank] = num_tokens，再 all_reduce，而函数 docstring 直接把它叫做『Gather the num_tokens across all DP ranks』——名字是 gather、干活的是 allreduce，这句 docstring 本身就是这条惯用法的自白。（坊间常说这是 MPI 时代传下来的老技巧，此说法我未找到可引的一手权威出处，故不写死；上面的等价性推导与 vLLM 的同款用法则都可核实。）",
+      "example": "dp_size = 2，rank0 这拍 40 个 token、图模式 FULL(=2)，rank1 这拍 24 个 token、图模式 NONE(=0)。缓冲是 [2, dp_size]（说明性例子，非本仓源码）：\n\n```\n第 1 步  开全零缓冲，两卡都一样：\n  rank0: [[0, 0],        rank1: [[0, 0],\n          [0, 0]]                [0, 0]]\n\n第 2 步  每张卡只写自己那一列（rank0 写第 0 列，rank1 写第 1 列）：\n  rank0: [[40, 0],       rank1: [[0, 24],\n          [ 2, 0]]               [0,  0]]\n\n第 3 步  一次 all_reduce(SUM)，两卡同得：\n  [[40, 24],     <- 第 0 行：各卡的 token 数\n   [ 2,  0]]     <- 第 1 行：各卡的图模式\n\n第 4 步  本地解包（不再需要通信）：\n  max(第 0 行) = 40   -> 需要补齐时大家都补到 40\n  min(第 1 行) = 0    -> 图模式取 NONE，全卡一起 eager\n```\n\n注意第 3 步里 40 = 40 + 0、24 = 0 + 24：每一格都只有一个「真值」参与求和，其余是零加法，这就是等价于 all_gather 的全部秘密。第 4 步的 max/min 是纯本地运算，一次通信就够了。",
+      "links": [
+        "https://github.com/vllm-project/vllm/blob/v0.21.0/vllm/v1/worker/dp_utils.py",
+        "https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html"
+      ],
+      "sources": [
+        {"url": "https://raw.githubusercontent.com/vllm-project/vllm/v0.21.0/vllm/v1/worker/dp_utils.py", "note": "基座 vLLM v0.21.0 的 _run_ar：torch.zeros(4, dp_size, ...)，四行依次填 orig_num_tokens / padded_num_tokens / should_ubatch / cudagraph_mode，各 rank 只写自己那列，再 dist.all_reduce(tensor, group=group)。证明「零张量 + 各填己列 + sum-allreduce」是这条技术线的通行写法。访问日期 2026-07-26。"},
+        {"url": "https://raw.githubusercontent.com/vllm-project/vllm/v0.11.0/vllm/forward_context.py", "note": "更早的 vLLM v0.11.0 DPMetadata.num_tokens_across_dp：docstring『Gather the num_tokens across all DP ranks and return results in a CPU tensor of size dp_size.』，实现却是 [0]*dp_size -> 只写 [dp_rank] -> dist.all_reduce。用作「这条惯用法在上游由来已久」的旁证（该文件在 v0.21.0 已重构，故标明版本）。访问日期 2026-07-26。"},
+        {"url": "https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html", "note": "NCCL 官方 AllReduce 定义（求和语义、结果写入每个 rank 的接收缓冲），支撑等价性推导。访问日期 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文 §16.3『各填己列、求和即聚合』已经讲对了，例子也齐。唯一要改的是归属口径：别写成「昇腾比基座多同步一个量、却没多花一次通信」——基座 v0.21.0 自己就是 [4, dp_size]（详见 base-dp-coordination-v0210 那条）。稳妥写法是讲成「这是这条技术线的通行手法，昇腾这版打两行、基座那版打四行」，同时保留「加一行几乎不要钱」这个正确直觉。另可加半句提醒：这手法吃「零初始化」，是它唯一的脆弱点。"
+    },
+    {
+      "id": "cudagraph-mode-enum",
+      "term": "CUDAGraphMode 的取值与序：NONE=0 / PIECEWISE=1 / FULL=2（外加两个复合值）",
+      "kind": "notation",
+      "one_line": "vLLM 用来表示「这一拍怎么进图」的枚举——它的整数取值是有序的，本章那句「取 min 就是保守对齐」全靠这个序才成立。",
+      "what_it_is": "CUDAGraphMode 定义在基座的 vllm/config/compilation.py 里，共五个成员，但要分两类看：\n\n- 三个「运行时模式」（真正用于每拍派发的具体取值，也是能塞进整数张量的那三个）：NONE = 0（完全不进图，逐算子 eager 执行）、PIECEWISE = 1（分段图：把不适合进图的算子——典型是注意力——留在图外 eager 跑，其余段落进图）、FULL = 2（整张前向捕成一张图）。官方文档原话：『the subset enum NONE, PIECEWISE and FULL are also treated as concrete runtime mode for cudagraph runtime dispatching』。\n- 两个复合配置值（值是元组不是整数，属于「策略」而非「本拍模式」）：FULL_DECODE_ONLY = (FULL, NONE)——只在纯解码批上用整图、混合批不进图；FULL_AND_PIECEWISE = (FULL, PIECEWISE)——解码批走整图、prefill 与混合批走分段图，官方称它是默认、且『the most performant mode for most models』。\n\n对本章有两点直接影响：其一，被打包进 [2, dp_size] 那个 int32 张量的 cudagraph_mode.value，一定是 0/1/2 三者之一（复合值是编译期策略，落到每拍派发时已经收敛成运行时模式）；其二，0 < 1 < 2 这个序不是巧合，它恰好是「保守程度」的排序——NONE 最保守（什么图都不进），FULL 最激进。所以 min 的语义不只是「有 NONE 就全 NONE」，而是全组听最保守那张卡的。",
+      "background": "这套分级是 vLLM 一路演进出来的：早期只有「用不用 cudagraph」一个布尔。后来 torch.compile 接入、注意力后端各有各的图兼容性，就分出了 PIECEWISE（把注意力挖出去、其余进图）；再后来某些后端在纯解码批上能整图捕获、混合批不行，于是又有了 FULL_DECODE_ONLY / FULL_AND_PIECEWISE 这类「按批型分派」的复合策略。昇腾侧沿用同一套枚举与同一套派发流程，只是底层图实体换成 ACLGraph（见下一条）。",
+      "example": "枚举本体（据 vLLM v0.21.0 官方 API 文档）：\n\n```python\nclass CUDAGraphMode(enum.Enum):\n    NONE = 0\n    PIECEWISE = 1\n    FULL = 2\n    FULL_DECODE_ONLY = (FULL, NONE)         # 元组：策略，不是运行时模式\n    FULL_AND_PIECEWISE = (FULL, PIECEWISE)  # 元组：默认策略\n```\n\n把 min 的三种情形摆开（说明性例子）：\n\n```\n两卡本地模式          all_reduce 后那一行     min -> 全组模式    读作\n(FULL,   NONE)        [2, 0]                  0  = NONE         有人不进图 -> 全体 eager\n(FULL,   PIECEWISE)   [2, 1]                  1  = PIECEWISE    有人只能分段 -> 全体分段\n(FULL,   FULL)        [2, 2]                  2  = FULL         都能整图 -> 全体整图\n```\n\n第二行是「min 不是二值开关」的证据：结果既不是 NONE 也不是 FULL，而是落在中间那档——取 min 取的是「最保守的那一档」。",
+      "links": [
+        "https://docs.vllm.ai/en/v0.21.0/api/vllm/config/compilation/",
+        "https://docs.vllm.ai/en/latest/design/cuda_graphs/"
+      ],
+      "sources": [
+        {"url": "https://docs.vllm.ai/en/v0.21.0/api/vllm/config/compilation/", "note": "vLLM v0.21.0（与本章 pin 的基座同版）官方 API 文档：CUDAGraphMode 的 NONE=0 / PIECEWISE=1 / FULL=2，复合值 FULL_DECODE_ONLY=(FULL, NONE)、FULL_AND_PIECEWISE=(FULL, PIECEWISE)；各模式说明；『the subset enum NONE, PIECEWISE and FULL are also treated as concrete runtime mode for cudagraph runtime dispatching』；FULL_AND_PIECEWISE 为默认且『the most performant mode for most models』。访问日期 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§16.3 现在写的是『NONE=0 表示不进图；非零值（如 FULL）表示进完整图』——建议补准一格：中间还有 PIECEWISE=1（注意力留图外、其余进图），因此 min 的正确读法是『全组听最保守那张卡的』，而「有 NONE 就全 NONE」只是它的特例。再加半句『复合值 FULL_DECODE_ONLY / FULL_AND_PIECEWISE 是元组、属编译期策略，落到每拍派发时只剩 0/1/2，所以才能塞进整数张量』——正好解释了打包为什么可行。五个成员的完整含义留给链接。"
+    },
+    {
+      "id": "graph-capture-static-shape",
+      "term": "图捕获（CUDA Graph / 昇腾 ACLGraph）与「形状必须对得上」",
+      "kind": "external_concept",
+      "one_line": "把一长串 kernel 调用录成一张静态图、之后整张回放，省掉逐个下发的 CPU 开销；代价是录的时候形状和地址都写死了——所以跑之前要把 token 数补齐到录过的尺寸，这就是本章满篇 padding 的由来。",
+      "what_it_is": "解码阶段一拍只算一个 token，单个算子的活儿很少，CPU 逐个下发 kernel 的开销反而成了大头。图捕获的思路是：先「排练」一遍，把这一串 kernel 的调用顺序、参数、用到的显存地址原样录下来变成一张图；之后遇到同样的批型，不再逐个下发，而是让设备整张回放。vLLM 文档的说法是『CUDA Graphs capture GPU command sequences for replay, reducing CPU-GPU communication overhead』。\n\n代价是「静态」二字：录的时候张量的形状和显存地址就固定了，回放时不能改。所以 5 个请求的批不能直接去跑为 8 个请求录的那张图，得先 padding 到 8。vLLM 因此只为若干个「捕获过的尺寸」录图，运行时按一个批描述符去查、命中哪张就 padding 到哪张——这正是本章 dispatch_cudagraph 与 batch_descriptor 在做的事，也是 DP 各卡必须把 token 数补到同一个数的另一半原因（前一半是 MoE 集合通信要形状一致）。\n\n还有一个「为什么不干脆整张图录到底」的问题：注意力这类算子对图不友好（KV cache 的布局与长度每拍都在变），所以 vLLM 提供了分段图：『attention or other CUDA Graphs-incompatible operations stay eager, everything else goes into CUDA Graphs』。\n\n昇腾侧的对位物叫 ACLGraph：官方文档写明它是『capture/replay via torch.npu.NPUGraph』，是昇腾默认的图执行路径，由 cudagraph_mode 控制（不为 NONE 即启用），enforce_eager=True 可整体关掉退回 eager。也就是说本章代码里那些 CUDAGraphMode 字眼在昇腾上落地的是 ACLGraph——名字沿用基座，实体是 NPU 的图。",
+      "background": "「录制-回放」这套东西最早是 NVIDIA 在 CUDA 10 引入的 CUDA Graph，动机就是把 launch 开销从关键路径上摘掉；LLM 推理的解码阶段是它的完美用例（同一串算子重复成千上万次、形状还高度规整）。昇腾这边由 CANN / torch_npu 提供 torch.npu.NPUGraph，vllm-ascend 在其上做了 ACLGraph 路径，并继续复用基座那套 cudagraph_mode 配置与派发流程——这就是为什么昇腾代码里到处是 cudagraph 与 aclgraph 混着叫的名字。另注：据 vllm-ascend 官方文档（latest，2026-07-26 访问），昇腾侧还有 TorchAir（GE 图）与更新的 Xlite 图路径可选，与 ACLGraph 并列；本章 pin（v0.21.0rc1）的主线走的是 ACLGraph。",
+      "links": [
+        "https://docs.vllm.ai/en/latest/design/cuda_graphs/",
+        "https://docs.vllm.ai/projects/ascend/en/latest/user_guide/feature_guide/graph_mode.html"
+      ],
+      "sources": [
+        {"url": "https://docs.vllm.ai/en/latest/design/cuda_graphs/", "note": "vLLM 官方设计文档《CUDA Graphs》（latest，2026-07-26 访问）：图捕获降低 CPU-GPU 下发开销；需要固定形状与固定显存地址、批要 padding 到捕获过的尺寸；派发靠『uniquely identify a (padded) batch』的描述符；分段图原话『attention or other CUDA Graphs-incompatible operations stay eager, everything else goes into CUDA Graphs』；CUDAGraphWrapper 的 capture/replay 缓存。"},
+        {"url": "https://docs.vllm.ai/projects/ascend/en/latest/user_guide/feature_guide/graph_mode.html", "note": "vllm-ascend 官方《Graph Mode Guide》（latest，2026-07-26 访问）：ACLGraph 是默认图路径、『capture/replay via torch.npu.NPUGraph』，由 compilation_config 的 cudagraph_mode 控制（NONE / PIECEWISE / FULL / FULL_DECODE_ONLY / FULL_AND_PIECEWISE），enforce_eager=True 整体关闭；另有 TorchAir(GE)、Xlite 等并列路径。注意该页为 latest，pin 版本 v0.21.0rc1 无对应版本页（已试，404），故此处只取「ACLGraph = NPUGraph 的 capture/replay、由 cudagraph_mode 控制」这类稳定口径。"}
+      ],
+      "confidence": "high",
+      "writer_note": "本章两处需要它兜底：一是『进图』这个词第一次出现时（§16.3），补一句『图是按固定形状录下来的、只能按录过的尺寸回放，所以不够就补齐』——padding 的动机就此闭环；二是可点一句『昇腾这边的图实体叫 ACLGraph，走 torch.npu.NPUGraph 的录制与回放，名字沿用基座的 cudagraph_mode』，读者才不会被满屏的 cuda 字样绊住。TorchAir / Xlite 属并列路径，本章不必提，留给链接。"
+    },
+    {
+      "id": "base-dp-coordination-v0210",
+      "term": "基座 vLLM v0.21.0 的 DP 协调实际长什么样（coordinate_batch_across_dp）",
+      "kind": "external_concept",
+      "one_line": "一条校正性背景：本章 pin 的基座 v0.21.0 早就在一次 all_reduce 里同步四个量（含 cudagraph_mode，也取 min），所以「基座只同步 num_tokens」这个说法对不上——昇腾源码里那句 TODO 注释相对该版本已经过时。",
+      "what_it_is": "基座把 DP 协调放在 vllm/v1/worker/dp_utils.py：coordinate_batch_across_dp -> _synchronize_dp_ranks -> _run_ar。_run_ar 开的是一个 [4, dp_size] 的零张量，每 rank 只写自己那列，四行依次是：\n\n1. orig_num_tokens_per_ubatch（未 padding 的 token 数）\n2. padded_num_tokens_per_ubatch（含非 DP padding 的 token 数）\n3. should_ubatch（这卡想不想走微批，1/0）\n4. cudagraph_mode（本卡的图模式整数值）\n\n一次 dist.all_reduce 之后本地解包：图模式取 min（函数 _post_process_cudagraph_mode，docstring 是『Synchronize cudagraph_mode across DP ranks by taking the minimum. If any rank has NONE (0), all ranks use NONE.』），微批要全体同意才算数，然后 should_dp_pad = synced_cudagraph_mode != 0 or should_ubatch 决定要不要把各卡都补到 max。调用点在 vllm/v1/worker/gpu_model_runner.py，注释是『Extra coordination when running data-parallel since we need to coordinate across ranks』。\n\n把它和昇腾那版并排看，关系就清楚了：同一套做法的裁剪版，外加两处昇腾特有的加装。裁剪：[4, dp_size] 变 [2, dp_size]，去掉微批那两行（本章 §16.4 里恒为 False / None 的 should_ubatch 与 ubatch_slices 正对应这一刀）。加装：一是 should_skip_allreduce_across_dp_group 这条捷径（dense 直接跳、KV consumer 侧条件跳），二是 dp_allreduce_on_npu 可改走 NPU 通信组。至于取 min 的那个后处理函数，两边连 docstring 措辞都一样，只是行下标从 tensor[3, :] 变成 tensor[1, :]——是照着基座改的行号。",
+      "background": "为什么会出现「注释比代码旧」？vllm-ascend 是紧跟上游的插件：它先照着某个时期的基座写下 _sync_metadata_across_dp（那时基座确实只需要同步 token 数），随后上游自己也把 cudagraph_mode 与微批标志并进了同一次 all_reduce，而插件里那句 TODO 注释没跟着更新。这类「注释停在过去某个上游版本」的痕迹在跟随型插件里很常见，也正是「版本敏感的断言必须锚定 pin 去核」的活教材。",
+      "example": "基座 v0.21.0 与昇腾 v0.21.0rc1 的打包张量并排（据两侧源码，说明性对照）：\n\n```\n基座 _run_ar                  昇腾 _sync_metadata_across_dp\n[4, dp_size] 零张量           [2, dp_size] 零张量\n  行0 未 padding token 数        行0 token 数\n  行1 已 padding token 数        行1 cudagraph_mode\n  行2 should_ubatch\n  行3 cudagraph_mode\n一次 all_reduce                一次 all_reduce\n  模式取 min(行3)                模式取 min(行1)\n  token 视 should_dp_pad         token 视 allow_dp_padding\n     取 max 或原样                  取 max 或原样\n```\n\n可见「打包一次 all_reduce、模式取 min、按条件决定补不补」这套结构两边同源；差别在行数，以及两处昇腾特有的开关。",
+      "links": [
+        "https://github.com/vllm-project/vllm/blob/v0.21.0/vllm/v1/worker/dp_utils.py"
+      ],
+      "sources": [
+        {"url": "https://raw.githubusercontent.com/vllm-project/vllm/v0.21.0/vllm/v1/worker/dp_utils.py", "note": "vLLM v0.21.0 dp_utils.py 一手核实：_run_ar 建 (4, dp_size) 张量、四行依次为 orig / padded token 数、should_ubatch、cudagraph_mode，各 rank 填己列后一次 all_reduce；_post_process_cudagraph_mode 取 min，docstring『If any rank has NONE (0), all ranks use NONE. This ensures all ranks send consistent values (all padded or all unpadded).』；_synchronize_dp_ranks docstring 列明三件事（是否微批、各 rank 跑多少 token、模式取 min）；DP padding 条件『padding is applied when either cudagraph is enabled (non-zero synced mode) or when microbatching is active』。访问日期 2026-07-26。"},
+        {"url": "https://docs.vllm.ai/en/v0.21.0/serving/data_parallel_deployment/", "note": "同版官方文档，佐证该版本 DP 路径的整体语境（前向必须对齐）。访问日期 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "这条要请 Lead 拍板。正文两处说法与 pin 基座对不上：§16.3『基座 vLLM 只同步第一件（num_tokens）』，以及『昇腾比基座多同步了一个 cudagraph_mode，却没多花一次集合通信……只是把原本 [dp_size] 的张量加高成 [2, dp_size]』。事实是基座 v0.21.0 打的是 [4, dp_size]（含 cudagraph_mode 且同样取 min），昇腾那版更像裁剪加加装。三种改法任选：(a) 保留源码 TODO 引用但加一句版本注脚『这句注释相对 v0.21.0 基座已过时——同版基座也在同一次 all_reduce 里同步 cudagraph_mode』；(b) 把对比重写成「同源手法：基座打四行、昇腾打两行，昇腾另加跳过捷径与 NPU 组选项」，顺势把 §16.4 那个恒为 False 的 should_ubatch 解释得更有来历（基座那两行微批标志被裁掉了）；(c) 只讲昇腾自己这版、不与基座对比。我建议 (b) 加 (a)：既保住『打包一次 all_reduce、多同步一个量几乎不要钱』这个正确直觉，又不会让去翻 vllm/v1/worker/dp_utils.py 的读者对不上账。"
+    },
+    {
+      "id": "cpu-group-vs-device-group",
+      "term": "cpu_group（gloo）与 device_group（HCCL/NCCL）：同一组 rank 的两条通信路",
+      "kind": "external_concept",
+      "one_line": "同一批 rank 在 vLLM 里其实建了两个通信组——一个走加速卡（HCCL/NCCL），一个走 CPU（gloo）；本章那个 dp_allreduce_on_npu 开关，选的就是这两条路。",
+      "what_it_is": "vLLM 用 GroupCoordinator 包装 PyTorch 的 ProcessGroup，它的类注释说自己『manages both CPU and device communication』。同一批 rank 会同时建两个组：\n\n- device_group：backend 是加速卡的集合通信库（GPU 上是 nccl，昇腾上是 hccl），跑设备内存里的张量，带宽高。\n- cpu_group：显式用 gloo 后端建的，源码注释写得很直白——『a group with gloo backend, to allow direct coordination between processes through the CPU』，跑主机内存里的张量。\n\n为什么要留 CPU 这条路？因为有些通信压根不是「大张量」，而是控制流：广播一个 Python 对象、对个表、打个 barrier。这类事走设备组反而别扭，源码里那句吐槽很传神：『don't use device_group here! barrier in NCCL is terrible because it is internally a broadcast operation with secretly created GPU tensors.』DP 元数据同步（几个 int32）正属于这类「小而关键」的通信，所以默认落在谁那儿，是有讲究的。\n\n有意思的是，两个项目在这个默认值上选了相反的方向，理由也相反：\n\n- 基座 vLLM v0.21.0 默认走 device 组。dp_utils._get_device_and_group 先取 get_dp_group().device_group，只有开了 disable_nccl_for_dp_synchronization 才退回 CPU 组；注释给出的动机是反过来的——『Transferring this tensor from GPU to CPU will introduce a GPU sync point that could adversely affect performance of vllm with asynch scheduling.』（结果拷回 host 会插一个同步点，伤异步调度）。\n- vllm-ascend（本章 pin 的 v0.21.0rc1）默认走 CPU 组，把 NPU 组做成可选逃生舱。这条正是 pin 版本的新增项：v0.21.0rc1 发布说明里写着『Added environment variable to control DP metadata all_reduce communication.』（PR #10046）。PR 描述给出了理由与适用面：某些设备上『CPU-side all_reduce communication may carry dirty data during DP metadata synchronization in _sync_metadata_across_dp』，会导致取到错值甚至挂死；于是加了 VLLM_ASCEND_DP_ALLREDUCE_ON_NPU，0（默认）用 cpu_group、1 用 device_group，PR 里点名的受影响硬件是 A5。",
+      "background": "gloo 是 PyTorch 分布式的 CPU 后端，NCCL / HCCL 则是各家加速卡的集合通信库；PyTorch 的后端矩阵里，CPU 张量的集合通信通常由 gloo 承担，设备张量由 nccl / hccl 承担。vLLM 从早期就同时持有两条路，正是为了让「控制面的小通信」和「数据面的大通信」各走各的。本章这个开关的故事又给它加了一层现实注脚：小通信走 CPU 未必更稳——它同样依赖底层实现的正确性，一旦某代硬件与驱动的组合上出问题，就得给用户留一条切换的路。",
+      "example": "GroupCoordinator 建 CPU 组的那两行（vLLM v0.21.0，说明性引用，非本仓源码；原文用双引号，此处改用单引号以免与外层格式冲突）：\n\n```python\n# a group with `gloo` backend, to allow direct coordination between\n# processes through the CPU.\ncpu_group = torch.distributed.new_group(ranks, backend='gloo')\n```\n\n于是同一批 rank 有了两个句柄：get_dp_group().device_group（hccl / nccl）与 get_dp_group().cpu_group（gloo）。本章那段二选一的赋值，选的就是这两个句柄之一，外加对应的 device 字符串（npu 或 cpu）。",
+      "links": [
+        "https://github.com/vllm-project/vllm-ascend/pull/10046",
+        "https://github.com/vllm-project/vllm/blob/v0.21.0/vllm/v1/worker/dp_utils.py",
+        "https://docs.pytorch.org/docs/stable/distributed.html"
+      ],
+      "sources": [
+        {"url": "https://github.com/vllm-project/vllm-ascend/pull/10046", "note": "vllm-ascend PR #10046『[BugFix] Add env var to control DP metadata all_reduce communication』：描述称某些设备上 _sync_metadata_across_dp 的 CPU 侧 all_reduce『may carry dirty data』、可能取到错值或挂死；引入 VLLM_ASCEND_DP_ALLREDUCE_ON_NPU（0 = 默认走 cpu_group，1 = 走 device_group）；点名受影响硬件为 A5；说明基于 vLLM v0.20.2 测试后并入 main。访问日期 2026-07-26。"},
+        {"url": "https://docs.vllm.ai/projects/ascend/en/latest/user_guide/release_notes.html", "note": "vllm-ascend 官方发布说明：v0.21.0rc1（2026.06.16）的 Stability and Bug Fixes 条目下有『Added environment variable to control DP metadata all_reduce communication.』并链到 PR #10046——把这条开关精确锚定到本章 pin 的版本。（该页最新记录到 v0.23.0rc1 / 2026.07.20。）访问日期 2026-07-26。"},
+        {"url": "https://raw.githubusercontent.com/vllm-project/vllm/v0.21.0/vllm/v1/worker/dp_utils.py", "note": "基座 v0.21.0 _get_device_and_group 一手核实：默认 get_dp_group().device_group，注释『Transferring this tensor from GPU to CPU will introduce a GPU sync point that could adversely affect performance of vllm with asynch scheduling.』，只有 disable_nccl_for_dp_synchronization 时才退回 cpu_group——与昇腾默认相反。访问日期 2026-07-26。"},
+        {"url": "https://raw.githubusercontent.com/vllm-project/vllm/v0.21.0/vllm/distributed/parallel_state.py", "note": "vLLM v0.21.0 GroupCoordinator：类注释『manages both CPU and device communication』；建 CPU 组的注释与代码『a group with gloo backend, to allow direct coordination between processes through the CPU』加 torch.distributed.new_group(ranks, backend=gloo)；barrier() 里『don't use device_group here! barrier in NCCL is terrible…』。访问日期 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§16.3 结尾那段 dp_allreduce_on_npu 现在只转述了源码注释，可以升一档：(1) 先交代「同一批 rank 本来就有两条路：device 组走 HCCL、CPU 组走 gloo，后者原本是给 barrier、传对象这类控制面小通信用的」；(2) 再点这条开关正是本章 pin 版本（v0.21.0rc1）新加的——发布说明有条目、PR #10046 说明症状是 CPU 侧 all_reduce 携带脏数据、可能挂死、受影响的是 A5，默认仍走 CPU、NPU 是 opt-in；(3) 反差彩蛋（可选一句）：基座默认恰好相反——默认走 device 组，因为把结果拷回 CPU 会插同步点伤异步调度。这三点比原文的『某些设备』具体得多，且都可溯源。"
+    },
+    {
+      "id": "forward-context-ambient-pattern",
+      "term": "「环境上下文」（ambient context）：模块级全局加 with 语句，代替逐层传参",
+      "kind": "custom_pattern",
+      "one_line": "把「这一拍的元数据」放进一个进程内的全局槽位、用 with 语句管好它的生命周期，模型深处的任何算子想用就地取——省掉了把参数一层层塞进几十个 forward 签名的苦差。",
+      "what_it_is": "模型的 forward(input_ids, positions) 签名是模型自己的事（还要和 HuggingFace 那套对齐），但推理引擎有一堆「这一拍才知道」的东西要送给最里层的算子：注意力元数据、DP 元数据、本拍图模式……要是逐层传参，从顶层模型到某个 MoE 层要穿过十几个 forward，每加一个字段就得改一串签名。\n\nvLLM 的做法是「环境上下文」：在模块里放一个全局槽位 _forward_context，用上下文管理器 set_forward_context(...) 在一拍开始时装好、结束时恢复；消费方在任意深度调 get_forward_context() 取用。没设就用会直接断言失败，错误信息写得很明白：『Forward context is not set. Please use set_forward_context to set the forward context.』这个模式的通用叫法是 ambient context（环境上下文）或隐式参数传递，与之相对的是显式逐层传参。\n\n为什么这里非它不可（据 v0.21.0 的代码与官方设计文档旁证，属结构性理由而非源码明写）：一是元数据的类型随后端而变（不同注意力后端的 attn_metadata 结构不同），塞进签名会污染所有模型代码；二是这条路要穿过 torch.compile 与图捕获——vLLM 的做法是把注意力整体包成自定义算子、让 Dynamo 别往里看，元数据自然也不适合当作被 trace 的图输入；三是它天然给「平台扩展」留了口子：ForwardContext 里有个 additional_kwargs 字段，由 current_platform.set_additional_forward_context(...) 填，正是本章昇腾挂钩的那个正规入口。\n\n代价也值得说给读者：依赖是隐式的——看某个算子的签名看不出它其实吃 forward context，调试时得知道去哪儿找；而且它是进程内全局，跨线程或嵌套使用要靠上下文管理器严格配对地保存与恢复。",
+      "example": "两端最小用法（据 vLLM v0.21.0 的 vllm/forward_context.py，说明性精简；docstring 与断言文案改用单引号以免与外层格式冲突）：\n\n```python\n# 存放处：模块级全局槽位\n_forward_context: ForwardContext | None = None\n\ndef get_forward_context() -> ForwardContext:\n    '''Get the current forward context.'''\n    assert _forward_context is not None, (\n        'Forward context is not set. '\n        'Please use `set_forward_context` to set the forward context.'\n    )\n    return _forward_context\n\n# 设置端：每拍一次，把本拍元数据装进去\nwith set_forward_context(attn_metadata, vllm_config, num_tokens=num_tokens):\n    hidden_states = model(input_ids, positions)   # 只传张量，不传元数据\n\n# 消费端：模型深处任意一层，就地取用\nfrom vllm.forward_context import get_forward_context\nattn_metadata = get_forward_context().attn_metadata\n```\n\n逐行看：全局变量是「唯一的那块黑板」；with 负责进入时写黑板、退出时擦回原样（所以嵌套也安全）；model(...) 的签名保持干净；最里层的算子不必知道谁写的黑板，读就完了。本章昇腾那层包裹之所以能成立，全靠这块黑板是同一块——包住基座、拿到同一个对象、继续往上写字段。",
+      "links": [
+        "https://docs.vllm.ai/en/stable/api/vllm/forward_context/",
+        "https://docs.vllm.ai/en/latest/design/torch_compile/"
+      ],
+      "sources": [
+        {"url": "https://raw.githubusercontent.com/vllm-project/vllm/v0.21.0/vllm/forward_context.py", "note": "vLLM v0.21.0 一手核实：模块级 _forward_context: ForwardContext | None = None；get_forward_context() 的断言文案『Forward context is not set. Please use set_forward_context to set the forward context.』；ForwardContext 字段含 attn_metadata / dp_metadata / cudagraph_runtime_mode / batch_descriptor / additional_kwargs，且 additional_kwargs 来自 current_platform.set_additional_forward_context()。访问日期 2026-07-26。"},
+        {"url": "https://docs.vllm.ai/en/latest/design/torch_compile/", "note": "vLLM 官方《torch.compile integration》（latest，2026-07-26 访问）：把整个注意力包成自定义算子 torch.ops.vllm.unified_attention_with_output『so that Dynamo will not try to inspect any of the internal operations』；分段 cudagraph 与分段编译对齐。用作「元数据为何不适合当图输入」的旁证——该页并未直接解释 forward context 的动机，故此理由在 what_it_is 里已标为结构性推断。"},
+        {"url": "https://docs.vllm.ai/en/stable/api/vllm/forward_context/", "note": "vLLM 官方 forward_context API 页，作为给读者深入的入口链接（stable，2026-07-26 访问）。"}
+      ],
+      "confidence": "medium",
+      "writer_note": "§16.5『为什么是「包」而不是「改」』已经把插件视角讲透了，这条补的是前一个为什么：为什么会有 forward context 这么一块全局黑板？建议在进入昇腾那层 with 之前补两三句：元数据要穿过几十层 forward、类型还随后端变，逐层传参不现实，于是上游用「全局槽位 + with 管生命周期」的环境上下文模式（没设就断言报错）；正因为它是同一块黑板，昇腾才能包住基座后继续往上写字段。注意口径：『为了 torch.compile 才这么设计』上游并没明说，别写成既成事实，可写成『也与它要穿过 torch.compile 与图捕获有关』。隐式依赖的代价可一句带过，属加分。"
+    },
+    {
+      "id": "speculative-decoding-rejection-sampling",
+      "term": "投机解码（speculative decoding）与拒绝采样验证",
+      "kind": "external_concept",
+      "one_line": "让一个便宜的「草稿源」先猜出接下来的好几个 token，再让真模型一次前向把它们批量验收，猜中就白赚——验收用的正是本章 _sample 里那个 rejection_sampler。",
+      "what_it_is": "自回归解码一次只能出一个 token，慢在「每出一个字都要完整跑一遍大模型」。投机解码分两步：草稿阶段，用一个便宜得多的来源（小模型、n-gram 表、或模型自带的多 token 预测头）一口气猜 K 个后续 token；验证阶段，把这 K 个候选拼进一次大模型前向，一次性拿到它们各自位置上的真实分布，再用拒绝采样逐个验收：接受就留下，第一个被拒的地方截断并从修正分布重采一个。猜得准就一次前向出好几个 token，猜不准最多退化回逐个出。\n\n关键性质是不改变输出分布：原始论文的说法是这套接受与拒绝规则让加速『without changing the distribution』；vLLM 文档的表述更工程化——『Speculative decoding sampling is theoretically lossless up to the precision limits of hardware numerics.』（理论上无损，受限于硬件数值精度。）\n\n这条对本章有两处直接影响：其一，开了投机解码后，每个请求这拍要采样的位置不止一个（K 个草稿位都要验），所以 logits_indices 不再是「每请求最后一个位置」那么简单；其二，采样派发要分叉——没有草稿走普通 sampler，有草稿走 rejection sampler。至于草稿从哪来，vLLM v0.21.0 文档列了几条路：n-gram（最轻量、提速有限）、EAGLE（通用的模型型方法）、MTP（模型自带多 token 预测头时最好）、独立 draft model、suffix decoding 等。本章代码里出现的 is_draft_model 与 eagle 字样即属此列。",
+      "background": "这条线的起点是 2022 年底的工作，最常被引的是 Leviathan、Kalman、Matias 的《Fast Inference from Transformers via Speculative Decoding》（arXiv:2211.17192，后发表于 ICML 2023），它证明了「草稿加拒绝采样验收」可以在不改变输出分布的前提下加速现成模型（论文报告 T5-XXL 上 2 到 3 倍）。之后的演进主要在「草稿怎么来更准更便宜」：EAGLE（arXiv:2401.15077）改在特征空间做草稿并用树状草稿提高命中率，MTP 则把草稿头直接训进主模型。工程侧的挑战随之转向批处理与调度——这也是为什么 spec_decode_metadata 会一路渗进 model runner 的输入整形与采样派发。",
+      "links": [
+        "https://docs.vllm.ai/en/v0.21.0/features/speculative_decoding/",
+        "https://arxiv.org/abs/2211.17192",
+        "https://arxiv.org/abs/2401.15077"
+      ],
+      "sources": [
+        {"url": "https://docs.vllm.ai/en/v0.21.0/features/speculative_decoding/", "note": "vLLM v0.21.0 官方《Speculative Decoding》：定位为降低中低 QPS、访存受限场景的 inter-token latency；方法清单 EAGLE / MTP / n-gram / draft model / suffix decoding 及各自适用面；『Speculative decoding sampling is theoretically lossless up to the precision limits of hardware numerics.』以及 logprobs 不保证稳定的提醒。访问日期 2026-07-26。"},
+        {"url": "https://arxiv.org/abs/2211.17192", "note": "Leviathan, Kalman, Matias《Fast Inference from Transformers via Speculative Decoding》摘要页一手核实：标题与作者无误，摘要强调加速『without changing the distribution』、无需重训、T5-XXL 上 2 到 3 倍。访问日期 2026-07-26。"},
+        {"url": "https://arxiv.org/pdf/2401.15077", "note": "EAGLE《Speculative Sampling Requires Rethinking Feature Uncertainty》：作为「草稿怎么来」这条演进线的代表作与深入入口（本章仅点名，不展开）。访问日期 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "本章两处点名即可、别展开（正文已明说留给后续采样章）：§16.2 讲 logits_indices 时补半句『开了投机解码后每个请求要验的位置不止一个，所以取址表改由 spec 元数据给出』；§16.7 的 _sample 二选一处补一句『草稿 token 要用拒绝采样逐个验收，理论上不改变输出分布』，并把 arXiv:2211.17192 作为深入链接给出。EAGLE / MTP / n-gram 的差别属草稿来源的分类学，本章一个词都不必展开。"
+    },
+    {
+      "id": "enpu-soft-segmentation",
+      "term": "ENPU 与「软切分（soft segmentation）」——一条查不到公开出处的名词",
+      "kind": "external_concept",
+      "one_line": "本章 §16.7 顺带解释了 enable_enpu 是「昇腾的软切分模式」，但这个名词在公开资料里查不到任何定义——建议把正文口径收敛到可核实的范围。",
+      "what_it_is": "我按以下渠道都查过，没有找到 ENPU 的公开定义：vllm-ascend 官方文档站（用户指南、开发者指南、发布说明）、昇腾 CANN 官方文档，以及公开检索。发布说明里能查到的近似项是 enable_npugraph_ex（图编译期的 FX 优化开关，与 ENPU 不是一回事，仅名字接近，容易误认）。\n\n可核实的只有两点：其一，这个开关在本仓不是通过配置项、而是读一个环境变量启用的，源码自己把它标作内部或非公开开关（不在 envs.py 里登记）；其二，soft segmentation 这个措辞出自本仓源码里那行解释执行顺序的注释本身。也就是说，「ENPU = 昇腾的软切分模式」这个等式目前只有一行代码注释作依据，既没有公开文档解释 ENPU 是什么，也没有公开资料说明「软切分」在昇腾语境下具体指什么。",
+      "background": "对读者而言，这类「代码里出现、生态里查不到」的内部开关并不罕见：厂商的实验特性常常先落地代码、后（或从不）见文档。写书时的稳妥姿势是不把它当既成事实展开，只说清它在本章数据流里的位置（决定 _update_full_graph_params_if_needed 相对 run_model() 的先后），把「它到底是什么」明确标注为未公开。",
+      "links": [
+        "https://docs.vllm.ai/projects/ascend/en/latest/user_guide/release_notes.html"
+      ],
+      "sources": [
+        {"url": "https://docs.vllm.ai/projects/ascend/en/latest/user_guide/release_notes.html", "note": "vllm-ascend 官方发布说明全文检索：无 ENPU 或 soft segmentation 条目；最接近的是 enable_npugraph_ex（Atlas 推理产品不支持、需显式关闭），与 ENPU 无关。访问日期 2026-07-26。"},
+        {"url": "https://docs.vllm.ai/projects/ascend/en/latest/", "note": "vllm-ascend 官方文档站（latest）用户指南与特性指南目录中未见 ENPU 相关页面。访问日期 2026-07-26。"},
+        {"url": "https://github.com/vllm-project/vllm-ascend", "note": "公开检索 vllm-ascend 仓库与文档均未命中 ENPU 的定义性描述（仅命中代码内使用）。属否定性结论，故本条 confidence 标 low。访问日期 2026-07-26。"}
+      ],
+      "confidence": "low",
+      "writer_note": "建议把 §16.7 那句『ENPU 是昇腾的软切分（soft segmentation）模式』改成不做断言的口径，例如：『enable_enpu 是一个内部开关（由环境变量启用、未在公开文档中说明），源码注释称在「软切分」场景下要求先 event.record 再 event.wait，因此把参数更新提到跑模型之前——本章只需知道它换的是这两步的先后。』这样既保住正文对代码事实的解释力，又不会把一个查无出处的名词当既成事实抛给读者。若 Lead 认为不值得为一个横切开关费笔墨，直接删掉那半句解释、只说「这是个执行顺序的适配分支」也可以。"
+    }
+  ]
+}

@@ -1,0 +1,256 @@
+{
+  "chapter": "ch13-kv-offloading-host-cpu",
+  "researched_at": "2026-07-26",
+  "pin_anchor": "vllm-ascend v0.21.0rc1（commit 80610e44），配套 vLLM v0.21.0。凡「外部项目/上游生态现在怎样」的断言均标注查证日期 2026-07-26 与所依据的文档版本；外部生态变化快，正文转述时请保留时间限定（如「据 vLLM 官方博客 2026-01-08」）。",
+  "scope_note": "只做读者定向的外部背景：PyTorch/设备侧的流与事件模型、pinned 内存与 DMA、张量 storage/stride/view 记法、torch.ops 自定义算子记法、批量 memcpy 算子家族、Python 取模语义、上游 vLLM 卸载连接器谱系、队列+毒丸并发模式、2 MiB 大页对齐常数。本仓 pin 源码解读归 dossier/explainer；本文件所有 example 均为**说明性/外部**最小示例，不标 # SOURCE:，也不冒充本章源码。",
+  "concepts": [
+    {
+      "id": "stream-event-model",
+      "term": "流（Stream）与事件（Event）：设备侧的异步执行模型",
+      "kind": "external_concept",
+      "one_line": "「流」是设备上一条按提交顺序执行的活儿队列，「事件」是插在流里的一个时间戳兼路标——本章所有 wait_stream / wait_event / record / query / synchronize，都是在这两个概念上做文章。",
+      "what_it_is": "读本章前必须先建立的心智模型：CPU（host）把活儿**提交**给加速器（GPU/NPU），提交完立刻返回，活儿在设备上排队跑。PyTorch 官方文档对流的定义是「a linear sequence of execution that belongs to a specific device」——同一条流里的操作按创建顺序**串行**执行；而**不同流之间可以并发、相对顺序任意**，除非你显式插同步（PyTorch 文档原话：operations from different streams can execute concurrently in any relative order, unless explicit synchronization functions … are used）。默认情况下每个设备有一条「默认流 / current stream」，模型 forward 就跑在它上面。\n\n这套模型里有四类动作，本章全用到了：\n1. **`record(stream)`**：往流里插一个 Event（路标）。它不阻塞，只是排进队列，等前面的活儿跑完时这个 Event 才「到达」。\n2. **`Event.query()`**：**非阻塞**问一句「这个路标到了没」，返回 True/False（PyTorch 文档：checks if all work currently captured by event has completed）。\n3. **`Event.synchronize()`**：**阻塞**当前 CPU 线程，一直等到路标到达。\n4. **`Stream.wait_stream(other)` / `Stream.wait_event(e)`**：**流等流 / 流等事件**——注意这两个**不阻塞 CPU**，它们只是在被调用的那条流上排一道「等到条件满足再往下跑」的关卡。PyTorch 文档给的典型用法：`Stream.wait_stream()` 确保另一条流上的 `normal_()` 跑完，才在本流上开始 `sum(A)`。\n\n把这四个动作分成两类，本章的节拍就一眼看穿：**`wait_stream` / `wait_event` 是「设备侧排队等」（CPU 不停），`query` / `synchronize` 是「CPU 侧问 / 等」（一个不阻塞、一个阻塞）**。「发了不等、轮询回收」的异步节拍，本质就是「用 record + query 替代 synchronize」。",
+      "background": "这套抽象源自 CUDA 的 stream/event 模型（NVIDIA 用它把「拷贝」和「计算」放到不同的硬件引擎上重叠执行），PyTorch 在 `torch.cuda.Stream` / `torch.cuda.Event` 里原样暴露；昇腾的 PyTorch 适配层 torch_npu 走 PyTorch 的 PrivateUse1 后端机制注册为 `npu` 设备，并对齐同名 API（`torch.npu.Stream` / `torch.npu.Event`）——所以本章代码读起来和 CUDA 版几乎逐字一致。**但对齐不等于全等**：本章就撞上一处缺口——`torch.cuda.Stream.priority_range()`（流优先级）在 `torch.npu` 下不可用。这类「同名 API 覆盖率」的差异是跨后端移植的常见坑。",
+      "example": "一个**说明性**最小例子（CUDA 记法，torch.npu 同形），演示本章那两道同步点的语义差别：\n\n```python\nimport torch\n\ncompute = torch.cuda.current_stream()   # 默认流：forward 在这上面跑\ncopy_s  = torch.cuda.Stream()           # 另起一条搬运流\n\nx = torch.randn(1 << 20, device=\"cuda\")\ny = x * 2                                # 排进 compute 流（异步，立即返回）\n\ncopy_s.wait_stream(compute)              # ①「流等流」：copy_s 上后续活儿要等 compute 排空\n                                         #    注意：这行不阻塞 CPU，只是排关卡\nend = torch.cuda.Event()\nwith torch.cuda.stream(copy_s):\n    z = y.to(\"cpu\", non_blocking=True)   # 搬运排进 copy_s\n    end.record(copy_s)                   # ② 在搬运后面插路标\n\nprint(end.query())                       # ③ 非阻塞探测：多半打印 False（还在搬）\nend.synchronize()                        # ④ 阻塞等到搬完\nprint(end.query())                       # 现在必定 True\n```\n\n逐行读：①如果去掉 `wait_stream`，`copy_s` 上的搬运可能在 `y = x * 2` 还没算完时就开搬，**读到半成品**——这正是本章卸载（d2h）前必须等 compute 流的原因；反过来，加载（h2d）写的是没人在算的空闲 block，所以不需要这一道。②`record` 只是排路标。③`query()` 是「问一句就走」，主循环每拍调它才不会卡住。④`synchronize()` 是「我现在就要」，会把 CPU 钉在这儿。\n\n**读者最容易混的一点**：`stream.wait_event(e)` 与 `event.synchronize()` 名字都带「等」，但一个是**设备等**（CPU 继续跑，只是流内排序），一个是**CPU 等**（线程真被挂住）。本章 handler 里前者用来把同方向的多次搬运串成有序链，后者只在显式 `wait(job_ids)` 时才出现。",
+      "links": [
+        "https://docs.pytorch.org/docs/stable/notes/cuda.html",
+        "https://docs.pytorch.org/docs/stable/generated/torch.cuda.Event.html",
+        "https://docs.pytorch.org/docs/stable/generated/torch.cuda.Stream.html"
+      ],
+      "sources": [
+        {
+          "url": "https://docs.pytorch.org/docs/2.13/notes/cuda.html",
+          "note": "PyTorch「CUDA semantics」：流的定义 a linear sequence of execution that belongs to a specific device；不同流可并发、须显式同步；wait_stream 的示例语义（等 normal_() 完成再 sum(A)）；pinned 内存章节。访问 2026-07-26（stable 页会 302 到 /docs/2.13/）。"
+        },
+        {
+          "url": "https://docs.pytorch.org/docs/stable/generated/torch.Event.html",
+          "note": "Event 通用文档：record / query（checks if all work currently captured by event has completed，返回 bool）/ synchronize（阻塞至完成）/ elapsed_time（两个 Event 之间毫秒数）。访问 2026-07-26。"
+        },
+        {
+          "url": "https://github.com/Ascend/pytorch",
+          "note": "torch_npu（Ascend PyTorch adapter）仓库：通过 PyTorch PrivateUse1 后端注册 npu 设备、对齐 torch.cuda 同名 API 的定位说明。访问 2026-07-26（经搜索摘要取得要点，未逐条比对 API 覆盖表）。"
+        }
+      ],
+      "confidence": "high",
+      "writer_note": "§13.5/§13.6/§13.9 的地基。建议在首次出现 wait_stream 之前用两三句把「设备等 vs CPU 等」「query vs synchronize」这组对照立起来（可直接借上面例子的骨架，但要标为说明性外部示例），之后正文就能直接说「第一拍让路、第二拍串行」而不必反复解释。torch_npu 的 API 覆盖缺口（priority_range）只在 §13.7 点一句即可，别展开成移植综述。"
+    },
+    {
+      "id": "pinned-memory",
+      "term": "pinned memory（页锁定 / page-locked 主机内存）",
+      "kind": "external_concept",
+      "one_line": "普通 host 内存会被操作系统换页挪窝，设备的 DMA 引擎不敢直接读；把它「钉」在物理内存里不许挪，DMA 就能直取——这就是 `pin_memory=True` 干的事。",
+      "what_it_is": "操作系统的虚拟内存会把进程的页换出到磁盘、或在物理内存里搬家，所以一块普通（pageable）host 内存的**物理地址不稳定**。DMA 引擎按物理地址搬字节，没法应付这种「搬到一半地址变了」的情况。于是驱动的做法是：**先偷偷开一块页锁定的暂存区，把你的数据拷进去，再从暂存区 DMA 到设备**。NVIDIA 官方博客把这段说得最直白——「the CUDA driver must first allocate a temporary page-locked, or 'pinned', host array, copy the host data to the pinned array, and then transfer the data from the pinned array to device memory」。\n\n所以 pinned 内存省掉的**不是「一半带宽」这种玄学，而是明确的一段「暂存拷贝」**：一次多余的 host 内存拷贝 + 它带来的延迟。PyTorch 文档的说法是「Host to GPU copies are much faster when they originate from pinned (page-locked) memory」，并且只有 pinned 内存才能配合 `non_blocking=True` 做**真异步**的拷贝（否则拷贝会退化成同步）。NVIDIA 博客给过一组量级参考：某笔记本平台上 pinned 约 5.8 GB/s vs pageable 约 2.3 GB/s（2 倍多），而在 CPU 更快的台式机上差距缩到 6.2–6.7 vs 5.4–5.6 GB/s——**收益随平台而变，不要当成固定倍数**。\n\n代价也要说清楚：pinned 页锁死了就不能被换出，NVIDIA 明确警告「You should not over-allocate pinned memory. Doing so can reduce overall system performance」。KV 卸载动辄申请几十上百 GB 的 host 镜像，这条警告不是摆设。",
+      "background": "为什么本章基座（CUDA 版）要绕一圈「先非 pinned 分配、再 `cudaHostRegister` 钉住」，而不直接 `pin_memory=True`？因为 PyTorch 的**主机端缓存分配器**（CachingHostAllocator）对 pinned 分配做**2 的幂上取整**——社区 issue 里用 `c10::llvm::PowerOf2Ceil(size)` 一句话点破：请求 4.5 GB 会被取到 8 GB，请求略超 128 MB 会占掉 256 MB。对 100 GB 级的 CPU KV 镜像，这意味着白白吃掉近 28 GB。`cudaHostRegister`（把一块已有的普通内存**就地钉住**）正是绕开这个分配器的通道。昇腾侧没有这个 API 的对应物，所以只能直接 `pin_memory=True` 分配——**这不是偷懒，是可用工具集不同**。",
+      "example": "**说明性**最小对照（外部示例，非本仓源码）：\n\n```python\nimport torch\n\npageable = torch.zeros(1 << 24)                    # 普通 host 内存\npinned   = torch.zeros(1 << 24, pin_memory=True)   # 页锁定\nprint(pageable.is_pinned(), pinned.is_pinned())    # False True\n\ndst = torch.empty_like(pinned, device=\"cuda\")\ndst.copy_(pageable, non_blocking=True)  # non_blocking 形同虚设：驱动仍要走暂存拷贝\ndst.copy_(pinned,   non_blocking=True)  # 真异步：DMA 直取，函数立刻返回\n```\n\n关键对照：同样写 `non_blocking=True`，源是 pageable 时**不会真的异步**（数据得先被拷进驱动的暂存区）；源是 pinned 时才既省掉暂存拷贝、又能和计算重叠。本章 CPU 镜像张量一律 `pin_memory=True`，正是为了让 `swap_blocks_batch` 背后的 DMA 走这条直取路径。",
+      "links": [
+        "https://developer.nvidia.com/blog/how-optimize-data-transfers-cuda-cc/",
+        "https://docs.pytorch.org/docs/stable/notes/cuda.html",
+        "https://github.com/pytorch/pytorch/issues/106606"
+      ],
+      "sources": [
+        {
+          "url": "https://developer.nvidia.com/blog/how-optimize-data-transfers-cuda-cc/",
+          "note": "NVIDIA 官方博客《How to Optimize Data Transfers in CUDA C/C++》：pageable→device 传输时驱动先建临时 pinned 暂存区再 DMA 的原文；cudaMallocHost/cudaHostAlloc；不要过量分配 pinned 的警告；5.8 vs 2.3 GB/s 与 6.2–6.7 vs 5.4–5.6 GB/s 两组平台对比。访问 2026-07-26。"
+        },
+        {
+          "url": "https://docs.pytorch.org/docs/2.13/notes/cuda.html",
+          "note": "PyTorch CUDA semantics「Use pinned memory buffers」：Host to GPU copies are much faster when they originate from pinned (page-locked) memory；pin_memory() 与 non_blocking=True 的配合。访问 2026-07-26。"
+        },
+        {
+          "url": "https://github.com/pytorch/pytorch/issues/106606",
+          "note": "PyTorch issue「More Performant CachingHostAllocator for Pinned Memory Allocation」：CachingHostAllocator 用 c10::llvm::PowerOf2Ceil(size) 做 2 的幂上取整（4.5GB→8GB），无合并、浪费显著。另 issue #150517 记录「略超 128MB 的张量 pin 后占 256MB」。访问 2026-07-26。"
+        }
+      ],
+      "confidence": "high",
+      "writer_note": "§13.3 首次出现 pin_memory 时用一句「省掉的是暂存拷贝」带过即可，量化留到 §13.11——正文已正确地拒绝给「带宽翻倍」式数字，保持这个克制；若要给量级就明确标成 NVIDIA 博客的平台相关参考值，别说成昇腾实测。§13.7 讲基座 cudaHostRegister 那段，可把「2 的幂上取整」的具体后果（100 GB→128 GB）点实，这条已一手核实。"
+    },
+    {
+      "id": "tensor-storage-stride-view",
+      "term": "PyTorch 张量的四元组记法：storage / storage_offset / size / stride",
+      "kind": "notation",
+      "one_line": "一个张量并不「拥有」一块方方正正的多维内存，它只是对一条**一维字节流**的解释方式——由「哪条流、从第几个元素起、每维多长、每维走一步跳几个元素」四件事定义。",
+      "what_it_is": "PyTorch 把「数据」和「视图」彻底分开：\n- **storage**：一条扁平的一维数据缓冲区（`untyped_storage()` 拿到的是按**字节**计的那条）。\n- **storage_offset**：这个张量的第 0 个元素，位于 storage 的第几个**元素**处（注意单位是元素，不是字节——所以代码里到处是 `storage_offset() * element_size()` 这种换算）。\n- **size**（即 `shape`）：各维长度。\n- **stride**：**各维「走一步」要在 storage 里跳过几个元素**。`stride(0)` 就是「第 0 维索引 +1，指针要前进多少个元素」。\n\n于是有了那条本章反复出现的换算：**每个 block 的字节数 = `stride(0) × element_size()`**——当第 0 维恰好是 block 维时，「block 索引 +1 要跳多少字节」正是一个 block 的字节步长。\n\n所谓 **view（视图）**，就是「换一组 (offset, size, stride) 去读同一条 storage」，**零数据拷贝**。PyTorch 文档的原话：「View tensor shares the same underlying data with its base tensor. Supporting View avoids explicit data copy, thus allows us to do fast and memory efficient reshaping, slicing and element-wise operations.」本章 `_build_block_views` 做的就是这件事——不搬一个字节，只是换一副「眼镜」去看同一块 NPU 显存。\n\n最后是那个看着吓人的 `Tensor.set_`。官方签名是 `Tensor.set_(source=None, storage_offset=0, size=None, stride=None)`，作用是「Sets the underlying storage, size, and strides」，且**不复制数据**——它是「手工造视图」的底层原语：给我一条 storage、一个起点、一个尺寸，我就当它是个张量。\n\n**为什么不能拿 `storage.nbytes()` 当尺寸依据**：`nbytes()` 描述的是**这条 storage 有多大**，而不是**这个张量用了其中哪一段**。二者在「分配时多要了一截做对齐」的场景下会差出一头一尾两段废字节——这正是本章 §13.8 的全部戏剧性所在。",
+      "background": "这套「storage + stride」设计继承自 Torch/NumPy 的 strided array 传统：让 transpose、slice、reshape 这类操作退化成改元数据、不动数据，从而 O(1) 完成。代价是元数据算错时**不会当场报错**——因为压根没碰数据，错误会一路潜伏到真正按指针读写的那一刻（本章即 `swap_blocks_batch` 的指针算术）。",
+      "example": "一个**说明性**最小例子（外部示例，可在任意装了 PyTorch 的机器上逐行复现）：\n\n```python\nimport torch\nt = torch.arange(16, dtype=torch.int16).reshape(4, 4)\nt.shape                # torch.Size([4, 4])\nt.stride()             # (4, 1)  ← 第0维走一步跳 4 个元素，第1维跳 1 个\nt.element_size()       # 2  （int16 = 2 字节）\nt.storage_offset()     # 0\nt.untyped_storage().nbytes()   # 32 = 16 个元素 × 2 字节\n\n# 每「行」（把第 0 维当 block 维）的字节数：\nt.stride(0) * t.element_size()          # 4 * 2 = 8 字节\n\n# 切片是视图，不拷贝：只改 offset 和 size\ns = t[1:]\ns.shape, s.stride(), s.storage_offset() # (3,4), (4,1), 4  ← 起点挪到第 4 个元素\ns.untyped_storage().nbytes()            # 仍是 32！storage 没变小\n```\n\n最后一行就是要点：`s` 只用了 32 字节里的 24 字节，但 `storage.nbytes()` 照样报 32。**「storage 多大」≠「我这个张量占了哪一段」**——把这条记住，§13.8 里「为什么不能用 `nbytes()` 数 block」就成了显然的推论。\n\n再看手工造视图（`set_` 的最小形态）：\n\n```python\nraw = torch.empty(0, dtype=torch.int8).set_(t.untyped_storage(), 8, (16,))\n# 含义：拿 t 的那条 storage，从第 8 个 int8（=第 8 字节）起，当成长度 16 的 int8 一维张量\nraw.view(2, 8).shape    # torch.Size([2, 8]) —— 再 reshape 成「2 个 block × 每块 8 字节」\n```\n\n逐段读：`torch.empty(0, dtype=torch.int8)` 只是造个空壳当载体；`set_(storage, offset, size)` 把它重定向到别人的 storage 上；因为壳是 int8，offset 和 size 的单位就是**字节**。这正是本章「按字节裁 `[num_blocks, block_bytes]` 视图」的手法。",
+      "links": [
+        "https://docs.pytorch.org/docs/stable/tensor_view.html",
+        "https://docs.pytorch.org/docs/stable/generated/torch.Tensor.set_.html",
+        "https://docs.pytorch.org/docs/stable/generated/torch.Tensor.stride.html"
+      ],
+      "sources": [
+        {
+          "url": "https://docs.pytorch.org/docs/2.13/tensor_view.html",
+          "note": "PyTorch「Tensor Views」：View tensor shares the same underlying data with its base tensor … avoids explicit data copy；视图靠改 stride / storage offset 实现；transpose/view/basic indexing 为视图操作。访问 2026-07-26。"
+        },
+        {
+          "url": "https://docs.pytorch.org/docs/2.13/generated/torch.Tensor.set_.html",
+          "note": "Tensor.set_(source=None, storage_offset=0, size=None, stride=None) 官方签名与「Sets the underlying storage, size, and strides」「不发生数据拷贝，共享同一底层内存」的描述。访问 2026-07-26。"
+        }
+      ],
+      "confidence": "high",
+      "writer_note": "§13.8 讲透 block 视图重建的前置知识。建议在 §13.8 开头（或 §13.3 首次出现 `stride(0) * element_size()` 处）用 3-5 句把「张量 = storage + (offset, size, stride) 的解释」立起来，并**明确点出 storage.nbytes() 与本张量占用段的区别**——这一句是后面整节论证的支点。上面 `t[1:]` 的例子很短，值得原样借用（标为说明性外部示例）；`set_` 的例子若嫌长可只留一行注释。"
+    },
+    {
+      "id": "torch-ops-namespace",
+      "term": "`torch.ops.<namespace>.<op>` —— 自定义算子的调用记法",
+      "kind": "notation",
+      "one_line": "看到 `torch.ops._C_ascend.swap_blocks_batch(...)` 别慌：这不是什么魔法属性链，而是 PyTorch 调用「用 C++ 写、注册到名为 `_C_ascend` 的算子库里、叫 `swap_blocks_batch` 的那个算子」的标准写法。",
+      "what_it_is": "PyTorch 允许项目用 C++/CUDA/Ascend C 写自己的算子，编译成动态库后注册进一张全局算子表。注册在 C++ 侧用 `TORCH_LIBRARY(<namespace>, m)` 宏：`m.def(\"opname(Tensor a, ...) -> Tensor\")` 声明签名。注册完，Python 侧就能通过**固定的三段式**访问：`torch.ops.<namespace>.<opname>(...)`。PyTorch 官方教程的原话是「This makes the operator available from Python via `torch.ops.extension_cpp.mymuladd`」。\n\n所以这串点号该这样断句：\n\n```\ntorch.ops  .  _C_ascend  .  swap_blocks_batch\n   ^            ^                ^\n 算子表入口   命名空间(库名)      算子名\n```\n\n`_C_ascend` 这个名字本身没有语法含义，只是该项目给自己的 C++ 扩展库取的命名空间（前缀 `_C` 是 Python 生态里「这是本包的 C 扩展」的惯用命名）。\n\n对读者的实际意义有两点：**其一，这行就是 Python 与 C++ 的分界线**——上面所有记账、粒度换算、指针拼装都在 Python，跨过这一行才真正碰硬件。**其二，它是可被查证的契约**：算子的参数个数、类型、顺序都在 C++ 侧的 `m.def(...)` 签名里写死，Python 侧传错会在调度时报错，而不是静默跑偏。",
+      "background": "这套机制最早是为 TorchScript 服务的（把自定义算子暴露给 JIT 编译器），教程名字还叫「Extending TorchScript with Custom C++ Operators」；后来演化成 PyTorch 通用的自定义算子注册体系，并在近年补上了 Python 侧的对等物 `torch.library.custom_op`（名字格式 `\"{namespace}::{opname}\"`）。所有需要「自己写 kernel」的后端插件——vLLM 自己的 `torch.ops._C.*`、昇腾的 `torch.ops._C_ascend.*`——走的都是这条路。",
+      "example": "**说明性**最小例子（取自 PyTorch 官方教程形态，非本仓源码）：\n\n```cpp\n// C++ 侧：声明算子签名并登记到名为 extension_cpp 的库\nTORCH_LIBRARY(extension_cpp, m) {\n  m.def(\"mymuladd(Tensor a, Tensor b, float c) -> Tensor\");\n}\n```\n\n```python\n# Python 侧：三段式调用\nresult = torch.ops.extension_cpp.mymuladd(tensor_a, tensor_b, 2.5)\n#              ^命名空间        ^算子名\n```\n\n对照着读本章那行 `torch.ops._C_ascend.swap_blocks_batch(batch_src, batch_dst, batch_sizes, direction)`：命名空间是 `_C_ascend`，算子名是 `swap_blocks_batch`，四个实参分别是「源地址数组 / 目标地址数组 / 每段字节数组 / 方向码」。**读者若想追到底**，就去这个项目的 C++ 源码里 grep `TORCH_LIBRARY` 与 `swap_blocks_batch` 的 `m.def` 签名——那里写着这份契约的权威版本。",
+      "links": [
+        "https://docs.pytorch.org/tutorials/advanced/cpp_custom_ops.html",
+        "https://docs.pytorch.org/tutorials/advanced/python_custom_ops.html"
+      ],
+      "sources": [
+        {
+          "url": "https://docs.pytorch.org/tutorials/advanced/cpp_custom_ops.html",
+          "note": "PyTorch 官方教程「Custom C++ and CUDA Operators」：TORCH_LIBRARY(extension_cpp, m) { m.def(\"mymuladd(Tensor a, Tensor b, float c) -> Tensor\"); } 与「This makes the operator available from Python via torch.ops.extension_cpp.mymuladd」。访问 2026-07-26。"
+        },
+        {
+          "url": "https://docs.pytorch.org/tutorials/advanced/python_custom_ops.html",
+          "note": "Python 侧对等物 torch.library.custom_op，名字格式 \"{namespace}::{operator_name}\"；佐证「命名空间::算子名」是 PyTorch 自定义算子的统一寻址方式。访问 2026-07-26。"
+        }
+      ],
+      "confidence": "high",
+      "writer_note": "§13.10 收口那一节最需要它——用两句把三段式拆开（算子表入口 / 命名空间 / 算子名），顺势点明「这一行就是 Python 与 C++ 的分界线」，与该节主旨「只换碰硬件的那一小段」正好合流。TORCH_LIBRARY 的 C++ 例子可只留一行或干脆略去，给链接即可。"
+    },
+    {
+      "id": "batch-memcpy-op",
+      "term": "批量内存拷贝算子（`aclrtMemcpyBatchAsync` / CUDA 的 `cuMemcpyBatchAsync`）",
+      "kind": "external_concept",
+      "one_line": "与其发 768 次「搬这一小块」，不如把 768 个 (源地址, 目标地址, 长度) 打成一捆发一次——批量 memcpy 算子存在的唯一理由，就是摊薄每次搬运的**发起开销**。",
+      "what_it_is": "传统的异步拷贝 API（CUDA 的 `cudaMemcpyAsync`、CANN 的 `aclrtMemcpyAsync`）一次只描述**一段**搬运。KV 卸载的场景恰恰相反：一次要搬的是「所有层 × K/V × 一批 block」这么多**互不相邻的小段**，段数轻松上千。逐段发起，光是 CPU 侧和驱动侧的调度开销就吃掉大头。\n\n批量 memcpy API 的做法是把「一批搬运」变成**一次调用**：参数不再是单个指针，而是**指针数组 + 长度数组**。NVIDIA 在 CUDA 12.8 引入了这类接口（`cuMemcpyBatchAsync` / `cudaMemcpyBatchAsync` 及其 3D 变体），官方文档的说明是它「allows the programmer to specify a batch of memory transfers, allowing the amortization of transfer setup overheads」——批处理的目的就是**减少逐个下发所带来的 CPU 与驱动开销**。CANN 侧的对应物即 `aclrtMemcpyBatchAsync`。\n\n对读者的意义：本章两条路径费那么大劲用 numpy 广播把地址「拼平」成一维数组，不是炫技，而是**这个算子的入参形态就要求如此**——它吃的是数组，你就得把 (子张量 × block) 的二维笛卡儿积摊成一维。",
+      "background": "关于「这个 API 有多新」有一条可核的旁证：vllm-ascend 提供了环境变量 `VLLM_ASCEND_ENABLE_BATCH_MEMCPY`，官方文档描述为「Control the aclrtMemcpyBatchAsync compile path for KV cache offloading. \"1\": force enable, \"0\": force disable, None: auto-detect from CANN headers.」——**默认要从 CANN 头文件里自动探测**，这说明该接口只在**较新的 CANN 版本**里存在，项目必须为老版本留退路。这也正是新硬件生态的典型样貌：上层框架的能力被底层 runtime 的版本卡着。CUDA 侧的时间线可作参照：批量 memcpy 直到 CUDA 12.8 才进主线，此前大家也是逐段发 `cudaMemcpyAsync`。",
+      "example": "**说明性**伪代码（形态取自批量 memcpy API 家族的公共约定，非任何一家的逐字签名）：\n\n```text\n# 传统：一段一调用（n 段就 n 次下发）\nfor i in range(n):\n    MemcpyAsync(dst[i], src[i], size[i], stream)\n\n# 批量：三个数组 + 一次下发\nMemcpyBatchAsync(dst_array, src_array, size_array, count=n, stream)\n#                 ^目标地址数组 ^源地址数组 ^每段字节数组\n```\n\n本章的 `(num_sub_tensors, n)` 拍平约定，说白了就是在填这三个数组：设 48 层、每层 K/V 两份（子张量 96 个）、本次搬 8 个 block，则三个数组各有 `96 × 8 = 768` 个元素，一次调用带走。每个元素的值由那条指针公式给出：`base_ptr + block_id × bytes_per_block`。",
+      "links": [
+        "https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/advanced-host-programming.html",
+        "https://docs.vllm.ai/projects/ascend/zh-cn/main/user_guide/configuration/env_vars.html",
+        "https://www.hiascend.com/document/detail/zh/canncommercial/800/apiref/appdevgapi/aclcppdevg_03_0105.html"
+      ],
+      "sources": [
+        {
+          "url": "https://docs.nvidia.com/cuda/archive/12.8.0/cuda-features-archive/index.html",
+          "note": "CUDA 12.8 Features：新增批量异步拷贝 API（cuMemcpyBatchAsync / cuMemcpyBatch3DAsync），用于多源多目的、变长的批量传输。访问 2026-07-26。"
+        },
+        {
+          "url": "https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/advanced-host-programming.html",
+          "note": "CUDA 编程指南：cudaMemcpyBatchAsync 允许指定一批传输，用以 amortize transfer setup overheads；批处理的目的是减少逐个下发的 CPU/驱动开销。访问 2026-07-26。"
+        },
+        {
+          "url": "https://docs.vllm.ai/projects/ascend/zh-cn/main/user_guide/configuration/env_vars.html",
+          "note": "vllm-ascend 官方环境变量表：VLLM_ASCEND_ENABLE_BATCH_MEMCPY —— Control the aclrtMemcpyBatchAsync compile path for KV cache offloading，None 时 auto-detect from CANN headers。证明该 CANN 接口存在且受 CANN 版本门控。访问 2026-07-26（页面为 main 分支文档，晚于本书 pin 版本，引用时请带时间限定）。"
+        },
+        {
+          "url": "https://www.hiascend.com/document/detail/zh/canncommercial/800/apiref/appdevgapi/aclcppdevg_03_0105.html",
+          "note": "CANN AscendCL 官方 aclrtMemcpy 文档（同步版；异步版 aclrtMemcpyAsync 多一个 stream 入参）——作为 acl 内存拷贝 API 家族的权威锚点。**未能**在公开检索到的 CANN 文档中找到 aclrtMemcpyBatchAsync 的独立 API 页（截至 2026-07-26），故该批量接口的逐字签名未一手核实。"
+        }
+      ],
+      "confidence": "medium",
+      "writer_note": "§13.10 用得上：一句「为什么要批量」（摊薄发起开销）+ 一句「所以入参才是数组，前面的拼指针都是在填这三个数组」即可，正好把 §13.5 第三步与 §13.10 串起来。**注意口径**：`aclrtMemcpyBatchAsync` 的官方 API 页未检索到，正文别写出该函数的具体签名/参数表；说「底层是 CANN 的批量异步拷贝接口」并给 CUDA 侧同类 API 作类比是安全的。若要提「这接口比较新」，请引 vllm-ascend 那个环境变量的 auto-detect from CANN headers 措辞，这条已一手核实。"
+    },
+    {
+      "id": "python-floor-mod",
+      "term": "`-n % f`：Python 取模为什么总是非负",
+      "kind": "notation",
+      "one_line": "`dst_sub_blocks_to_skip = -src_blocks.size % dst_block_size_factor` 不是笔误——Python 的 `%` 结果符号跟**除数**走，所以 `-5 % 4` 是 3 而不是 -1，这行等价于「凑齐一整块还差几个」。",
+      "what_it_is": "很多人从 C/Java 带来的直觉是「取模结果跟被除数同号」（C 里 `-5 % 4 == -1`）。Python 不是这样。Python 语言参考写得很死：\n\n> The modulo operator always yields a result with the same sign as its second operand (or zero); the absolute value of the result is strictly smaller than the absolute value of the second operand.\n\n配套的恒等式是 `x == (x//y)*y + (x%y)`，其中 `//` 是**向下取整**（floor）除法。于是 `-5 // 4 == -2`（向下取整到 -2，不是截断到 -1），代回恒等式：`-5 % 4 == -5 - (-2)*4 == 3`。\n\n这带来一个非常好用的惯用法：**`(-n) % f` = 「把 n 向上凑到 f 的整数倍，还差多少」**。它等价于 `(f - n % f) % f`，但少一次分支、也不用担心 `n % f == 0` 时算成 `f` 的边界错误。\n\n（一个容易被忽略的细节：本章这个表达式作用在 numpy 整数上。numpy 的 `%` 与 Python 的语义一致——同样是 floor 取模、结果随除数符号，所以这条惯用法在 `np.int64` 上照样成立。）",
+      "background": "这是「floored division」与「truncated division」两种约定之争的直接后果：C89 之后的 C/C++、Java 选截断（结果向零取整、余数随被除数），Python、Ruby 以及数学上的模运算习惯选向下取整（余数随除数）。Python 之所以选后者，好处正是这类环形/对齐运算——索引取模不会跑出负数、`(-n) % f` 天然就是「补齐量」。",
+      "example": "逐值验证（**说明性**外部示例，可直接在 `python3` 里敲）：\n\n```python\n>>> -5 % 4, -8 % 4, -1 % 4, -4 % 1\n(3, 0, 3, 0)\n>>> (-5) // 4          # 向下取整，不是截断\n-2\n>>> -5 == (-5//4)*4 + (-5%4)   # 恒等式 x == (x//y)*y + (x%y)\nTrue\n```\n\n把它读成「补齐量」，本章那张表就顺了：\n\n| 要搬的细粒度块数 n | 每个粗粒度块容纳 f 个 | `(-n) % f` | 读作 |\n|---|---|---|---|\n| 8 | 4 | 0 | 8 已是 4 的整数倍，不用跳 |\n| 5 | 4 | 3 | 5 距下一个 4 的倍数（8）还差 3 → 首块前 3 个槽位跳过 |\n| 4 | 1 | 0 | f=1 时恒为 0（任何数都是 1 的倍数） |\n\n**一句话记住**：`(-n) % f` 读作「n 向上补齐到 f 的整数倍，缺的那几个」。",
+      "links": [
+        "https://docs.python.org/3/reference/expressions.html#binary-arithmetic-operations",
+        "https://docs.python.org/3/faq/programming.html"
+      ],
+      "sources": [
+        {
+          "url": "https://docs.python.org/3/reference/expressions.html#binary-arithmetic-operations",
+          "note": "Python 语言参考「Binary arithmetic operations」：恒等式 x == (x//y)*y + (x%y)、divmod(x,y) == (x//y, x%y)，以及原句「The modulo operator always yields a result with the same sign as its second operand (or zero); the absolute value of the result is strictly smaller than the absolute value of the second operand.」访问 2026-07-26（页面标注 Python 3.14.6 文档）。"
+        }
+      ],
+      "confidence": "high",
+      "writer_note": "§13.5 第二步已有一张数值表，很好；缺的只是**为什么 `-n % f` 是合法且优雅的写法**这一句——建议补一句「Python 的 % 结果符号跟除数走（语言参考原文），所以 (-n) % f 恰好读作『向上补齐还差几个』」，并给 Python 文档链接。别展开 floored vs truncated 的语言学史，一句带过即可。"
+    },
+    {
+      "id": "vllm-offloading-connector",
+      "term": "vLLM 上游的 KV 卸载框架：OffloadingConnector（`vllm.v1.kv_offload`）",
+      "kind": "external_project",
+      "one_line": "本章「标准路径」接的那套框架不是昇腾发明的，而是 vLLM 上游自 0.11.0 起演进的 OffloadingConnector——它把「往哪存、存什么、谁记账」和「字节怎么搬」拆成两半，后者才留给各家硬件填。",
+      "what_it_is": "OffloadingConnector 是 vLLM 官方的 KV 卸载连接器：**把前缀缓存（prefix cache）延伸到 GPU 之外**——已算完的 KV block 在产出时顺手写到更慢但更大的层（首选 host CPU DRAM，可选再挂二级存储），后续请求若在这些层命中，就异步搬回 GPU，省掉重算。官方使用指南的措辞是：「Transfers between GPU and CPU use DMA (`cudaMemcpyAsync`) and run asynchronously alongside model computation, so offloading adds minimal CPU- and GPU-core overhead.」\n\n框架的分层正是本章 §13.2 讲的那两半：**调度侧的 Manager**（记账：哪些 block 在哪层、命中查询、LRU 淘汰、事件上报——与硬件无关）与 **worker 侧的 Handler**（真把字节从一个介质搬到另一个——绕不开硬件）；`OffloadingSpec` 是把二者产出来的工厂式接入点，`LoadStoreSpec` 用来描述「源/目标在哪个介质、哪些 block」。硬件插件要做的，**只是提供自己的 Spec + Handler**。\n\n昇腾这一支的官方启用方式（据 vllm-ascend 官方 feature guide，查证 2026-07-26）长这样——它同时也解释了本章代码里 `num_cpu_blocks` 为什么必须显式配：\n\n```bash\nvllm serve Qwen/Qwen3-0.6B --kv-transfer-config '{\n  \"kv_connector\": \"OffloadingConnector\", \"kv_role\": \"kv_both\",\n  \"kv_connector_extra_config\": {\n    \"num_cpu_blocks\": 1000, \"block_size\": 128,\n    \"spec_name\": \"NPUOffloadingSpec\",\n    \"spec_module_path\": \"vllm_ascend.kv_offload.npu\"}}'\n```\n\n注意 `spec_name` + `spec_module_path` 这对参数——**这就是「插件如何被上游框架发现」的机制**：上游按模块路径动态导入昇腾提供的 Spec 类。",
+      "background": "演进线索（均据 vLLM 官方 PR / 博客，查证 2026-07-26）：\n- **PR #20075**「[KV offload][2/N] Introduce LRU-based CPU offloading management」奠基——抽象出可插拔的 `OffloadingManager` 与 backend 接口，先给一个 LRU 策略 + CPU 介质实现。\n- **PR #21448**「[KV offload][3/N] Add worker-side CPU support」补上 worker 侧，用 `swap_blocks` 做 GPU↔CPU 实拷贝。\n- **v0.11.0** 正式引入该连接器（官方博客）；**v0.12.0** 做了一次关键的布局优化——把「所有层的 KV 合成一个连续物理块」，块大小从 8–72 KB 涨到 0.44–2.5 MB，官方称卸载连接器吞吐因此提升了一个数量级（相对 0.11.0：TTFT 降到 1/4、吞吐 5 倍）。**这条对本章特别有解释力**：块越大、单次搬运的描述符越少，DMA 效率越高——和本章「拼平成一次批量搬运」是同一个道理的两种做法。\n- **PR #24498** 把容量配置从 `num_cpu_blocks` 改成更直观的 `cpu_bytes_to_use`；**PR #31341**「Wait for compute before offloading KV to CPU」修的正是本章 §13.5 那道 `wait_stream(compute)`——上游一开始漏了它，会读到还没算完的 KV。\n- **RFC #38260**（2026-03-26）继续往多级（CPU 之上再挂文件系统/对象存储/P2P）扩展。",
+      "links": [
+        "https://blog.vllm.ai/2026/01/08/kv-offloading-connector.html",
+        "https://docs.vllm.ai/en/latest/features/kv_offloading_usage/",
+        "https://docs.vllm.ai/projects/ascend/en/main/user_guide/feature_guide/kv_cache_cpu_offload.html"
+      ],
+      "sources": [
+        {
+          "url": "https://blog.vllm.ai/2026/01/08/kv-offloading-connector.html",
+          "note": "vLLM 官方博客（2026-01-08）《Inside vLLM's New KV Offloading Connector》：0.11.0 引入、依托 0.9.0 起的异步 connector API；CPU 后端用 cudaMemcpyAsync + DMA；0.12.0 把所有层 KV 合成一个连续物理块（块大小 8–72 KB → 0.44–2.5 MB，吞吐提升一个数量级；相对 0.11.0 TTFT 降 4 倍、吞吐 5 倍）。访问 2026-07-26。"
+        },
+        {
+          "url": "https://docs.vllm.ai/en/latest/features/kv_offloading_usage/",
+          "note": "vLLM 官方「KV Offloading Usage Guide」：OffloadingConnector 定位（延伸 prefix cache 到更慢更大的层、按需提回 GPU）、DMA 异步与低开销的原话、单层/多层配置示例（cpu_bytes_to_use / secondary_tiers / TieringOffloadingSpec）、平台支持 CUDA/ROCm/XPU。访问 2026-07-26（latest 文档晚于本书 pin，引用须带时间限定）。"
+        },
+        {
+          "url": "https://docs.vllm.ai/projects/ascend/en/main/user_guide/feature_guide/kv_cache_cpu_offload.html",
+          "note": "vllm-ascend 官方「KV Cache CPU Offload Guide」：功能定位、完整 CLI/Python 启用示例（kv_connector=OffloadingConnector、num_cpu_blocks、block_size、spec_name=NPUOffloadingSpec、spec_module_path=vllm_ascend.kv_offload.npu）、需 vLLM v1 引擎、num_cpu_blocks 配过大会 host OOM。访问 2026-07-26。"
+        },
+        {
+          "url": "https://github.com/vllm-project/vllm/pull/20075",
+          "note": "PR #20075：抽象 OffloadingManager + backend 可插拔架构、首个 LRU 策略与 CPU 介质实现（框架奠基）。另 #21448 加 worker 侧 CPU 支持（用 swap_blocks 实拷贝）、#24498 把 num_cpu_blocks 换成 cpu_bytes_to_use、#31341 修「卸载前须等 compute 流」。访问 2026-07-26（经检索摘要取得要点，PR 正文未逐字通读）。"
+        }
+      ],
+      "confidence": "high",
+      "writer_note": "§13.2 开头点到即止：这套 Manager/Handler 二分是**上游的**设计，昇腾只填 Handler——这正好坐实本章「最小覆写」的主题。官方启用命令值得给（读者真要用），但只给标准路径那一条。**重要口径提醒**：极简路径对应的上游 `SimpleCPUOffloadConnector`（`vllm.v1.simple_kv_offload`）在 vLLM 官方文档站与 PR 检索中**均未找到公开说明**（截至 2026-07-26，官方 KV Offloading Usage Guide 只列 OffloadingConnector）——所以正文**不要**替上游解释「为什么会有两套框架」或「该选哪套」，只陈述「上游另有一套更简的框架，昇腾也接了」这一事实即可。0.12.0「合并成大块 → 吞吐涨一个数量级」这条很适合放进 §13.11 当旁证，但须注明是 CUDA 侧上游的数据、且是相对 0.11.0 的自比。"
+    },
+    {
+      "id": "queue-thread-poison-pill",
+      "term": "「队列 + 后台守护线程 + 毒丸」并发模式",
+      "kind": "custom_pattern",
+      "one_line": "主线程把活儿丢进队列就走，一条后台线程排队消费；要收工时往队列里丢一个约定好的假活儿（`None`），线程看见它就自己退出——这个假活儿俗称「毒丸（poison pill）」。",
+      "what_it_is": "这是生产者-消费者模式的一个标准变体，由三件东西组成：\n1. **一条线程安全队列**：主线程 `put`，后台线程 `get`。队列自带阻塞语义——没活儿时 `get()` 就把后台线程挂起，不用自己写忙等。\n2. **一条 daemon（守护）线程**：`daemon=True` 的语义是「主程序退出时不等它」，适合这种永远在 `while True` 的服务型循环，免得进程退不掉。\n3. **毒丸**：因为 `while True: q.get()` 没有自然出口，收工信号只能**也从队列走**——约定一个不可能是正常任务的值（最常见就是 `None`），消费者取到它就 `return`。之所以要走队列而不是设个标志位，是因为线程可能正阻塞在 `get()` 上，标志位它看不见。\n\n**为什么用 `SimpleQueue` 而不是 `Queue`**：Python 官方文档说 `SimpleQueue` 是「Constructor for an unbounded FIFO queue. Simple queues lack advanced functionality such as task tracking.」——它没有 `task_done()`/`join()`/`shutdown()` 这些账本功能，换来的是更轻、且 C 实现可重入（`put()` 不会阻塞、除非底层分配失败）。当你只要「先进先出地传活儿」、不需要「等所有活儿干完」时，`SimpleQueue` 就是合适的那一个。\n\n**这个模式和「流」是两层东西，别混**：后台线程解决的是「谁去调 API 下发命令」（host 侧），流解决的是「设备上这些命令怎么排队执行」（device 侧）。后台线程下发完就回去等下一个活儿，设备上的搬运还在跑——完成与否靠 Event 回报。",
+      "example": "**说明性**最小骨架（外部示例，非本仓源码）：\n\n```python\nimport queue, threading\n\nq = queue.SimpleQueue()\n\ndef worker():\n    while True:\n        item = q.get()      # 没活儿就阻塞在这儿\n        if item is None:    # 毒丸：约定好的收工信号\n            return\n        do_work(item)\n\nt = threading.Thread(target=worker, daemon=True)\nt.start()\n\nq.put(job1); q.put(job2)   # 生产者「发了不等」\nq.put(None); t.join()      # 收工：投毒丸 + 等线程自己退出\n```\n\n逐行点一下：`q.get()` 的阻塞替代了忙等；`if item is None: return` 是**唯一**的循环出口；`daemon=True` 保证即便忘了投毒丸，进程也退得掉；`q.put(None)` 之后再 `join()`，就是「优雅停机」的标准两步。\n\n**若有多个消费者线程，就得投多颗毒丸**（一颗只毒死一个），这是这个模式最经典的踩坑点；本章只有一条线程，投一颗即可。",
+      "links": [
+        "https://docs.python.org/3/library/queue.html",
+        "https://docs.python.org/3/library/threading.html#thread-objects"
+      ],
+      "sources": [
+        {
+          "url": "https://docs.python.org/3/library/queue.html",
+          "note": "Python 官方 queue 文档：SimpleQueue「Constructor for an unbounded FIFO queue. Simple queues lack advanced functionality such as task tracking.」、C 实现可重入、put 从不阻塞且总是成功；Queue.shutdown() 系 3.13 新增；模块示例本身**未**演示 sentinel 写法。访问 2026-07-26。"
+        },
+        {
+          "url": "https://dzone.com/articles/producers-and-consumers-part-3",
+          "note": "「poison pill」术语与生产者-消费者停机语义的通行说明（每个消费者各需一颗毒丸）。**非一手权威**（技术媒体文章）：术语本身在 Python 官方文档中未出现，故此项按业界通用说法处理。访问 2026-07-26。"
+        }
+      ],
+      "confidence": "medium",
+      "writer_note": "§13.9 用两三句点透即可：队列解耦提交与执行、daemon 线程避免退不掉、`None` 毒丸是唯一出口；顺带一句「为什么是 SimpleQueue」（不需要 task 账本，选更轻的那个，官方文档原话可引）。**术语提示**：「毒丸」是业界通行叫法而非 Python 官方术语，正文首次出现时括注英文 poison pill 即可，别把它说成 Python 标准库的概念。最值得强调的是那句「后台线程（host 侧下发）与流（device 侧执行）是两层」——读者极易把它们混成一件事。"
+    },
+    {
+      "id": "two-mib-alignment",
+      "term": "2 MiB 对齐：这个数字是从哪来的",
+      "kind": "external_concept",
+      "one_line": "2 MiB 不是随手挑的整数，它是主流 CPU 架构上「大页（huge page）」的标准粒度——按它对齐，是为了让一大片内存能用一个页表项覆盖，减少地址翻译的开销。",
+      "what_it_is": "现代 CPU 的内存管理默认以 4 KiB 为一页，每次访问都要经 TLB（地址翻译缓存）把虚拟地址换成物理地址。一块几十 GB 的 KV cache 若全按 4 KiB 分页，页表项多到 TLB 装不下，翻译失败（TLB miss）就成了常态开销。**大页**就是对策：用一个页表项覆盖一大片连续内存，从而「TLB reach（一条 TLB 项能覆盖的地址范围）」暴涨、miss 率骤降。\n\n2 MiB 恰是这个体系里最主流的大页尺寸：Linux 内核文档明确 x86-64 支持 2 MiB 与 1 GiB 两种 HugeTLB 页；GPU 侧也有同源实践（NVIDIA GPU 原生支持 4 KiB / 64 KiB / 2 MiB 多种页尺寸）。所以当你在各种加速器的内存分配代码里看到「按 2 MiB 对齐 / 多要 2 MiB 再切回」这种写法，**多半就是在往大页边界上靠**。\n\n对本章的意义只有一条，但很关键：**对齐是要付代价的**——想让数据区的起点落在 2 MiB 边界上，就得先多申请一截，把起点往后推到边界（前导偏移），末尾自然也剩一截（尾部 padding）。这两截**不属于数据**，却实实在在地算在 `storage.nbytes()` 里。§13.8 那笔字节账的全部来源就在这儿。",
+      "background": "大页并非免费午餐，学界与工程界都记录了它的两面：TLB 命中率上去了，但内存**碎片与浪费**也上去了（有研究测得按 2 MiB 分页时内存占用平均膨胀 40.2%、最坏 367%），缺页时单次搬运的代价也更大。这解释了为什么各系统通常是「关键的大块按大页对齐、其余仍走小页」，而不是全局启用。",
+      "example": null,
+      "links": [
+        "https://docs.kernel.org/admin-guide/mm/hugetlbpage.html",
+        "https://docs.kernel.org/admin-guide/mm/transhuge.html"
+      ],
+      "sources": [
+        {
+          "url": "https://docs.kernel.org/admin-guide/mm/hugetlbpage.html",
+          "note": "Linux 内核官方文档 HugeTLB Pages：x86-64 支持 2 MiB 与 1 GiB 大页；大页用于减少 TLB 压力。访问 2026-07-26（经检索摘要取得要点，未逐段通读整页）。"
+        },
+        {
+          "url": "https://research.ece.cmu.edu/safari/pubs/mosaic-micro17.pdf",
+          "note": "CMU SAFARI《Mosaic》(MICRO'17)：以 2 MiB 及以上粒度做映射可大幅提高 TLB reach、降低 miss 率；同时记录大页导致的内存膨胀（平均 40.2%、最坏 367%）。访问 2026-07-26（学术论文，作为「大页收益/代价」的通用依据，非昇腾平台专属结论）。"
+        }
+      ],
+      "confidence": "medium",
+      "writer_note": "§13.8 讲「runner 为什么要 +2 MiB 超额分配」时，用一句话回答读者心里那个「为啥偏偏是 2 MiB」——大页标准粒度、为的是 TLB。**口径注意**：本条给的是通用体系结构背景，**没有**昇腾官方文档说明该常数的确切动机，所以正文措辞用「2 MiB 是主流架构的大页粒度，按它对齐是常见做法」这类表述，别断言昇腾 runner 的具体意图。「对齐必然产生前导偏移 + 尾部 padding」这个因果是本条对本章最有用的部分，值得点实。"
+    }
+  ]
+}

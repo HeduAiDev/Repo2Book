@@ -1,0 +1,169 @@
+{
+  "chapter": "ch18",
+  "title": "310P 推理芯片：受限硬件上的全栈特化",
+  "pin": "vllm-ascend v0.21.0rc1（commit 80610e44）+ vLLM v0.21.0；本文件所有外部结论均注明抓取日期 2026-07-26，凡与外部生态版本相关的说法都锚定该日期，勿当永久事实",
+  "scope_note": "本章大量名词已在前面章节查过，不重复：Atlas 300I 卡的硬件规格（ch06 atlas-300i-310p-hardware）、A2/A3/310P/A5 代际标签与 Triton/TorchInductor/triton-ascend 本身（ch14）、HCCL 基本盘（ch08/ch17）、集合通信四件套语义（ch16）、MLA/DSA/MTP/CP 与「manager 的块 ≠ kernel 的块」（ch04/ch17）、流与事件（ch13）、CANN/AscendCL（ch07）、CustomOp 树外顶替（ch27）。本文件只补本章新引入、且读者看正文描述仍不懂的那几项。",
+  "concepts": [
+    {
+      "id": "fractal-nz-layout",
+      "term": "FRACTAL_NZ（昇腾的「分形 NZ」内存排布，aclFormat = 29）",
+      "kind": "notation",
+      "one_line": "同一批数字在内存里换个摆法：把矩阵切成一块块 16×16 的「分形」，块内按行走、块间按列走——摆成这样，昇腾的矩阵计算单元才能一口口吃得顺。",
+      "what_it_is": "先分清两个词：**逻辑形状**（这个张量是 128×256）和**内存排布**（这 32768 个数在内存里按什么顺序躺）。平时我们默认的是 **ND**（N-Dimension，行优先的通用排布，CANN 的 `aclFormat` 里取值 2），最后一维连续，就是 C/NumPy/PyTorch 的老样子。\n\n**NZ（`FRACTAL_NZ`，`aclFormat` 取值 29）** 是昇腾的私有排布。CANN 官方对它的定义只有一句话，但每个词都有用：**「(M，N)大小的矩阵被分为 M1 * N1 个分形，按照 column major（列优先）排布，形状如 N 字形；每个分形内部有 M0 * N0 个元素，按照 row major（行优先）排布，形状如 Z 字形」**——名字里的 **N** 和 **Z** 就是这么来的：**大 N（分形之间列优先走位）套小 z（分形内部行优先）**。\n\n完整的变换链官方也写了：`(..., N, H, W) -> pad -> (..., N, H1*H0, W1*W0) -> reshape -> (..., N, H1, H0, W1, W0) -> transpose -> (..., N, W1, H1, H0, W0)`。翻译成人话三步：**先补齐**（H、W 各自向上补到分形大小的整数倍，这就是「16 对齐」的来源）、**再切块**、**最后把块的两个维度调个个儿**（W1 跑到 H1 前面 = 分形之间变成列优先）。\n\n**为什么要这么折腾？** CANN 的说法是这些私有格式的引入「是为了满足 AI Core 中 Cube 计算单元的高性能计算需求」——Cube 是昇腾芯片里专做矩阵乘的硬件单元，它一次吃进去的是一小块方阵而不是一整行，数据按分形摆好，搬运和计算才不用来回跳地址。同源的还有卷积用的 `NC1HWC0`，官方说 **「C0 与微架构强相关，等于 AI Core 中矩阵计算单元的大小」**，float16 时 C0 = 16、int8 时 C0 = 32——这就是「16 对齐」这个数字的出处：它是硬件的分形边长，不是随便挑的。\n\n**一个容易踩的坑**：官方 API 文档给 `ACL_FORMAT_FRACTAL_NZ` 的备注是「内部格式，用户目前无需使用」——它本来是框架/算子内部的事，普通用户不该关心。所以你在业务代码里几乎见不到它；只有像 vllm-ascend 这种要直接按算子期望的排布去**分配** KV cache 的框架层代码，才会显式点名 NZ。",
+      "background": "昇腾的达芬奇（DaVinci）架构把 AI Core 拆成 Cube（矩阵）、Vector（向量）、Scalar（标量）三种计算单元，Cube 的最大配置是 16×16×16——据多篇中文架构解析文章，这个配置下一拍可完成 4096 次 FP16 乘加。矩阵单元既然按 16 的粒度吃数据，内存排布就被倒推成 16 对齐的分形，于是有了 NZ 这一族「私有格式」。这跟 GPU 世界的思路一脉相承（cuBLAS/Tensor Core 也偏爱特定 tile 与对齐），差别只在昇腾把它显式化成了一个可以查询、可以转换的 format 枚举。",
+      "example": "**（说明性示例，外部；数据与结论逐字取自 CANN 官方《数据排布格式》文档，非本仓源码）**\n\n拿一个 4×4 矩阵、分形大小取 2×2（真实 fp16 是 16×16，这里缩小便于手算）：\n\n```\n逻辑矩阵（行优先写出来）        切成 4 个 2×2 分形\n   0   1   2   3               A = [0,1,4,5]      B = [2,3,6,7]\n   4   5   6   7               C = [8,9,12,13]    D = [10,11,14,15]\n   8   9  10  11\n  12  13  14  15\n\nND  排布：0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15\nNZ  排布：0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15\n```\n\n逐段对一下 NZ 那行：`0,1,4,5` 是分形 A（块内行优先 = 小 z），接着 `8,9,12,13` 是 A **正下方**的 C——**先往下走完一列分形**，再回到第二列的 B `2,3,6,7`、D `10,11,14,15`。这就是「分形之间列优先（N 字）、分形内部行优先（z 字）」的全部含义。\n\n换成真实的 fp16：分形是 16×16，一个 `[H, W]` 矩阵先把 H、W 各自补到 16 的倍数，再变成 `[⌈W/16⌉, ⌈H/16⌉, 16, 16]` 这样的四维摆法（int8 更特别，据 CANN 算子接口文档是 m0=16、n0=32，输出 `[batch, ⌈n/n0⌉, ⌈m/m0⌉*m0, n0]`）。所以同一个张量在 NZ 下**占的字节可能比 ND 多**——补齐是要付代价的，这也是为什么小张量、非矩阵乘输入没必要转 NZ。",
+      "links": [
+        "https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/opdevg/Ascendcopdevg/atlas_ascendc_10_0099.html",
+        "https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1alpha003/opdevg/Ascendcopdevg/atlas_ascendc_10_0037.html",
+        "https://www.hiascend.com/document/detail/zh/canncommercial/800/apiref/appdevgapi/aclpythondevg_01_0914.html"
+      ],
+      "sources": [
+        {"url": "https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/opdevg/Ascendcopdevg/atlas_ascendc_10_0099.html", "note": "CANN 商用版 8.2.RC1《数据排布格式》官方页：取到 NZ 定义原句『(M，N)大小的矩阵被分为 M1 * N1 个分形，按照 column major（列优先）排布，形状如 N 字形；每个分形内部有 M0 * N0 个元素，按照 row major（行优先）排布，形状如 Z 字形』；NC1HWC0 的『C0 与微架构强相关，等于 AI Core 中矩阵计算单元的大小』（fp16 C0=16 / int8 C0=32）；以及私有格式『是为了满足 AI Core 中 Cube 计算单元的高性能计算需求』。访问于 2026-07-26。"},
+        {"url": "https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1alpha003/opdevg/Ascendcopdevg/atlas_ascendc_10_0037.html", "note": "CANN 社区版 8.3.RC1《矩阵编程（高阶 API）·基础知识》：取到 ND→NZ 的完整变换链 `(..., N, H, W)->pad->(..., N, H1*H0, W1*W0)->reshape->(..., N, H1, H0, W1, W0)->transpose->(..., N, W1, H1, H0, W0)`，以及 4×4 矩阵按 2×2 分形的 ND/NZ 两行内存序（ND: 0..15；NZ: 0,1,4,5,8,9,12,13,2,3,6,7,10,11,14,15），本条 example 即逐字引用该例并自行验算复现。访问于 2026-07-26。"},
+        {"url": "https://www.hiascend.com/document/detail/zh/canncommercial/800/apiref/appdevgapi/aclpythondevg_01_0914.html", "note": "CANN 商用版 8.0.0《aclFormat》API 参考：取到枚举取值表——ACL_FORMAT_UNDEFINED=-1、NCHW=0、NHWC=1、ND=2、NC1HWC0=3、FRACTAL_Z=4、NC1HWC0_C04=12、HWCN=16、NDHWC=27、**FRACTAL_NZ=29**、NCDHW=30 等；以及 FRACTAL_NZ 的备注『内部格式，用户目前无需使用』、ND 的备注『表示支持任意格式…』。这是正文 `ACL_FORMAT_FRACTAL_NZ` 值为 29 的官方出处。访问于 2026-07-26。"},
+        {"url": "https://www.hiascend.com/doc_center/source/zh/canncommercial/80RC3/apiref/ascendtbapi/ascendtb_01_0109.html", "note": "CANN 8.0.RC3 算子接口页（经搜索摘要读取，未逐页展开）：int8 场景 m0=16 / n0=32、输出 shape `[batch, ⌈n/n0⌉, ⌈m/m0⌉*m0, n0]`。int8 这一半细节标 medium。访问于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§18.4「约束二·格式」现在只有一句『把 [..., H, W] 重排成 16 对齐的分块』——读者读完仍不知道「重排成什么样」。建议把上面那个 4×4 / 2×2 的 ND-vs-NZ 两行内存序搬进正文（标明是 CANN 官方文档的说明性例子、非本仓源码），再点一句名字的由来「大 N 套小 z」，一眼就懂。16 这个数字可以引 CANN 原话『C0 等于 AI Core 中矩阵计算单元的大小』（fp16=16）落地，比说『匹配 cube 吞吐形状』扎实。`aclFormat=29` 有一手枚举表可放心写。完整变换链与 int8 的 16×32 留给链接。"
+    },
+    {
+      "id": "cube-unit-and-128x128-limit",
+      "term": "Cube 计算单元的尺寸 vs 那条 `block_size * head_size <= 128 * 128`（一处需要改口径的归因）",
+      "kind": "external_concept",
+      "one_line": "昇腾矩阵单元的分形边长是 16、不是 128；正文把 128×128 说成「硬件矩阵计算单元一次能吃下的分块形状」找不到出处，建议改口径。",
+      "what_it_is": "**可以放心写的部分（有官方出处）**：昇腾 AI Core 里做矩阵乘的硬件叫 **Cube 单元**；CANN 官方在讲数据排布时明确说 `NC1HWC0` 里的 **「C0 与微架构强相关，等于 AI Core 中矩阵计算单元的大小」**，float16 时 C0 = 16、int8 时 C0 = 32。多篇中文架构解析进一步说达芬奇 Cube 的最大配置是 **16×16×16**（一拍 4096 次 FP16 乘加；int8 是 16×32 与 32×16 一拍 8192）。**所以「硬件矩阵单元一次吃下的分块」这个量级是 16，不是 128。**\n\n**查不到出处的部分**：`block_size * head_size <= 128 * 128` 这条约束，除了 vllm-ascend 源码里那行注释（`Page attention operation on 310P limits block_size * head_size <= 128 * 128`）之外，我在 CANN 官方文档、HCCL/ATB 算子约束页、vllm-ascend 文档与 issue/PR 里都**没有**找到第二处出处（2026-07-26 多轮检索）。它更像是 310P 上那个页注意力算子实现自身的 tiling/片上缓冲上限（16384 个元素，fp16 恰好 32 KB），但这只是推测，**没有任何公开材料可引**。\n\n**结论**：128 与 16 是两个不同层级的数字——16 是内存排布/矩阵单元的分形边长（有官方定义），128×128 是某个具体算子的入参上限（只有源码注释一处出处）。把后者归因为前者，属于把两层混成一层。",
+      "background": "这类「算子级硬约束」在国产加速卡生态里很常见：算子的可用形状范围往往写在闭源实现或内部约束表里，框架层只能把它抄成一个常量（这里就是 `_ATTENTION_BLOCK_SIZE_LIMIT = 128 * 128`）并在分配时筛选。读者若追问「为什么偏偏是 128×128」，诚实的答案是「算子这么规定的，公开文档没解释」——这本身就是读受限硬件适配代码时的常态。",
+      "example": null,
+      "links": [
+        "https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/opdevg/Ascendcopdevg/atlas_ascendc_10_0099.html",
+        "https://www.eet-china.com/news/201908301019.html"
+      ],
+      "sources": [
+        {"url": "https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/opdevg/Ascendcopdevg/atlas_ascendc_10_0099.html", "note": "CANN 官方《数据排布格式》：『C0 与微架构强相关，等于 AI Core 中矩阵计算单元的大小』，fp16 C0=16、int8 C0=32；私有格式为满足 Cube 单元高性能计算需求。这是「矩阵单元的粒度是 16」的一手依据。访问于 2026-07-26。"},
+        {"url": "https://www.eet-china.com/news/201908301019.html", "note": "行业媒体《破解华为达芬奇架构的密码》：达芬奇 Cube 最大配置 16×16×16、一拍 4096 个 FP16 MAC，可缩小到 16×16×1（256 MAC）。二手来源（非厂商文档），仅用于给「Cube 的量级是 16」提供旁证，故本条整体标 medium。访问于 2026-07-26。"},
+        {"url": "https://docs.vllm.ai/projects/ascend/en/v0.18.0/tutorials/hardwares/310p.html", "note": "vllm-ascend 官方 310P 教程页：通篇讲 310P 的限制（triton、图模式、max-model-len、W8A8SC），**未出现** block_size*head_size 的任何约束说明——即该常量在项目文档层面也无解释。负结果，用于支持「查无出处」的判断。访问于 2026-07-26。"},
+        {"url": "https://github.com/vllm-project/vllm-ascend", "note": "另在 GitHub issue/PR 与中文技术文章两轮检索『310p block_size head_size 128 paged attention』，均未找到该约束的独立出处（仅命中 310P 教程页与无关的 MLA『每 KV head 的 query 数须为 32/64/128』约束）。负结果。检索于 2026-07-26。"}
+      ],
+      "confidence": "medium",
+      "writer_note": "**这是一条纠错项，请务必处理**：§18.4「约束一·对齐」现在写『这个 128×128 对应硬件矩阵计算单元一次能吃下的分块形状』，§18.4「约束二·格式」又写 cube『也正是上面那条 128×128 上限的来源』——两处归因都无出处，且与 CANN 官方口径（矩阵单元粒度是 16）打架。建议改成：『这条上限来自 310P 上那个页注意力算子本身——源码注释就是这么写的，公开文档没有更细的解释；注意别把它和 NZ 的 16 对齐混为一谈，后者才是矩阵计算单元的分形粒度。』这样既诚实又顺带把两个数字的层级讲清楚。cube 的 16×16×16 若要写，措辞用「据公开架构解析」，别当厂商口径。"
+    },
+    {
+      "id": "no-triton-on-310p",
+      "term": "为什么 310P「没有 Triton」",
+      "kind": "external_project",
+      "one_line": "Triton 要在昇腾上跑，得靠 triton-ascend 这个后端把 Triton 代码编成 NPU 机器码——而它的支持面里压根没有 310P，所以整条「Triton kernel」路线在这块卡上是不存在的，不是「慢」而是「无」。",
+      "what_it_is": "本章反复出现「310P 没有 Triton」，读者容易以为是某个开关没打开。实情是**编译链缺一环**：\n\n1. Triton 是一门写加速器 kernel 的 Python 风格语言（详见第 14 章），`@triton.jit` 修饰的函数在**运行时**被编译成目标硬件的机器码；\n2. 编译到昇腾要靠 **triton-ascend**（`triton-lang/triton-ascend`，官方定位 *Triton language and compiler for Ascend NPU*）；据其 README（2026-07-26 访问），支持的硬件写作 **Atlas A2/A3/950 系列**——**没有 310P**；\n3. 于是 vllm-ascend 官方文档在 310P 页里直接写死一句：**「Atlas 300I DUO does not support `triton` or `triton-ascend`.」**\n\n所以任何「上游 vLLM 用 Triton kernel 实现的东西」，到了 310P 都得换成别的写法——本章里就是两处：slot mapping（换成 CPU NumPy）与 KV block 清零（换成张量切片 `.zero_()`）。这也解释了为什么这些替代实现看起来「土」：不是作者不想用 kernel，是这条路根本不通。\n\n**顺带澄清一个常见混淆**：「没有 Triton」≠「没有图模式」。据 vllm-ascend 310P 文档，310P 上是支持 `FULL_DECODE_ONLY` 图模式的（ACL Graph 那条路：录制算子调用再重放），只是不支持「把算子重新编译成一份新 kernel」的 Triton/Inductor 那条路。两种「图」是两回事（第 14 章辨析过）。",
+      "background": "新硬件要接进 PyTorch 编译栈，必须先有一个 Triton 后端（TorchInductor 为 GPU 生成的正是 Triton 代码），所以各家都在做自己的 triton-* 后端。厂商做后端时通常**从主力训练卡开始**：triton-ascend 先覆盖 A2/A3、再到 950，推理系列的 310P 优先级最低——一款 2020 年代前期定位「性价比推理」的老卡，编译器后端的适配收益有限。结果就是 310P 在软件栈上被「时代」落下一截：不是硬件不能算，而是新工具链没为它准备。",
+      "example": null,
+      "links": [
+        "https://docs.vllm.ai/projects/ascend/en/latest/tutorials/hardwares/310p.html",
+        "https://github.com/triton-lang/triton-ascend"
+      ],
+      "sources": [
+        {"url": "https://docs.vllm.ai/projects/ascend/en/v0.18.0/tutorials/hardwares/310p.html", "note": "vllm-ascend 官方《Atlas 300I DUO / Atlas 200I Pro》教程页（v0.18.0 路径可正常抓取；latest 路径存在重定向环）：取到原句『Atlas 300I DUO does not support `triton` or `triton-ascend`.』、『The current release supports `FULL_DECODE_ONLY` graph mode on Atlas 300I DUO devices』及 TP>1 时可捕获图数量受限的说明。访问于 2026-07-26。"},
+        {"url": "https://github.com/triton-lang/triton-ascend", "note": "triton-ascend 官方仓库 README：定位『Triton language and compiler for Ascend NPU』、支持硬件『Atlas A2/A3/950 series』（不含 310P）、正式版 3.2.1（2026-04）。承第 14 章研究并于 2026-07-26 复核。"},
+        {"url": "https://docs.vllm.ai/projects/ascend/en/latest/tutorials/hardwares/310p.html", "note": "同一页的 latest 版本（经搜索结果摘要读取，直接抓取遇重定向环）：同样含『Atlas 300I DUO does not support triton or triton-ascend』与 FULL_DECODE_ONLY 表述，说明该结论在最新文档中仍然成立。访问于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文从头到尾把「310P 没有 Triton」当既定前提用了七八次，却没说这句话到底什么意思。建议在 §18.1 或 §18.3 第一次用到时补两句因果：Triton 要落到昇腾得靠 triton-ascend 编译后端，而它的支持面只到 Atlas A2/A3/950，vllm-ascend 官方文档因此直接写明『Atlas 300I DUO does not support triton or triton-ascend』。这句官方原话值得引，它把全章的「减法」立在一个硬事实上。再补一句「没有 Triton ≠ 没有图模式（310P 支持 FULL_DECODE_ONLY）」防混淆——正文 §18.3 提到 ACL graph replay 时读者正好会问。Triton 是什么留给第 14 章与链接。"
+    },
+    {
+      "id": "hccl-310p-collective-gaps",
+      "term": "310P 上 HCCL 的能力缺口（device broadcast 与 int64 all_reduce）",
+      "kind": "external_concept",
+      "one_line": "同一套集合通信接口，在不同代昇腾卡上支持的「数据类型 × 操作」并不一样——310P 这张表缺了 int64 的 all_reduce，broadcast 在这代卡上则干脆没被 HCCL 支持，这就是本章那段猴补的全部理由。",
+      "what_it_is": "读者看正文那句「310P 的 HCCL 对 device 上的 broadcast 和 int64 的 all_reduce 支持受限」时，多半会想：**受限是谁规定的？能查吗？** 能，而且两边都有出处：\n\n**① int64 的 all_reduce**：CANN 的《集合通信接口参考》给每个集合通信接口列了一张「按产品型号分列的支持数据类型」表。据该文档（8.0.0 版，2025-02-17；2026-07-26 经检索摘要读取），`HcclAllReduce` 在 **Atlas 300I Duo 推理卡** 这一列是 int8 / int16 / int32 / float16 / float32——**没有 int64**；而 Atlas 训练系列、A2 训练系列那几列是有 int64 的。所以这不是 bug，是这代芯片的通信库支持面本来如此。\n\n**② device 上的 broadcast**：vllm-ascend 那段猴补的作者在 PR #1478（2025-06-28 合入 main）里说得很直白：**「this is because hccl broadcast does not support 310p currently, so we have to patch it」**。同一个 PR 还修了一个有意思的 bug——最初的补丁把 CPU 通信组的 broadcast 也一起换掉了，导致带数据并行（DP）启动时挂掉；修法是加一层包装，**CPU 组走原生 torch broadcast、device 组才走 310P 模拟**。这正好解释了正文那段代码开头 `if tensor.device == torch.device(\"cpu\"): return fn(...)` 为什么必须存在——它不是顺手写的兜底，是踩过坑补上的。\n\n**为什么「用 all_gather 拼」是可行的替代？** 因为 all_gather 在这张表里是支持的，而 broadcast 与 all_reduce 的语义都能由「先让每张卡拿全所有 rank 的数据、再在本地挑一份 / 归约一次」复现——通信原语之间本就有这类等价关系（NCCL 文档里那条 *ReduceScatter + AllGather = AllReduce* 是同一族技巧，见第 16 章）。代价见下一条。",
+      "background": "集合通信库的「支持矩阵」随硬件代际变化，是国产加速卡适配里最常见的坑之一：接口签名一模一样，换张卡就少几种 dtype 或少几个 op。上游框架（vLLM）默认按 NVIDIA/NCCL 的完备支持面写代码，插件层就只能在运行期把缺的那几格补出来——本章那段 `torch.distributed.broadcast = ...` 的猴补就是典型样式（猴补本身见第 3 章）。",
+      "example": null,
+      "links": [
+        "https://github.com/vllm-project/vllm-ascend/pull/1478",
+        "https://www.hiascend.com/doc_center/source/zh/canncommercial/800/apiref/hcclapiref/CANN%E5%95%86%E7%94%A8%E7%89%88%208.0.0%20%E9%9B%86%E5%90%88%E9%80%9A%E4%BF%A1%E6%8E%A5%E5%8F%A3%E5%8F%82%E8%80%83%2001.pdf"
+      ],
+      "sources": [
+        {"url": "https://github.com/vllm-project/vllm-ascend/pull/1478", "note": "vllm-ascend PR #1478『[BugFix]Fix bugs when initializing communication groups with dp on 300I Duo』（作者 Angazenn，2025-06-28 合入 main）：取到作者原话『this is because hccl broadcast does not support 310p currently, so we have to patch it』，以及「补丁原先对 cpu_group 与 device group 一视同仁导致 DP 初始化出错，改为 CPU 组走原生 torch broadcast」的修法。这是 device-broadcast 缺口与代码里 CPU 分支的一手出处。访问于 2026-07-26。"},
+        {"url": "https://www.hiascend.com/doc_center/source/zh/canncommercial/800/apiref/hcclapiref/CANN%E5%95%86%E7%94%A8%E7%89%88%208.0.0%20%E9%9B%86%E5%90%88%E9%80%9A%E4%BF%A1%E6%8E%A5%E5%8F%A3%E5%8F%82%E8%80%83%2001.pdf", "note": "CANN 商用版 8.0.0《集合通信接口参考》（PDF，2025-02-17）：HcclAllReduce 的按产品支持数据类型表——Atlas 300I Duo 推理卡为 int8/int16/int32/float16/float32（**无 int64**），Atlas 训练系列含 int64，A2 训练系列另含 bfp16。**说明：该 PDF 未逐字打开，以上取自两轮站内检索的摘要（两次结果一致：300I Duo 一列均不含 int64）**，故本条 int64 部分标 medium。访问于 2026-07-26。"},
+        {"url": "https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html", "note": "NCCL 官方《Collective Operations》：ReduceScatter + AllGather ≡ AllReduce 的等价关系（承第 16 章研究），用于说明「用支持的原语拼出不支持的原语」这一思路的正当性。访问于 2026-07-26（第 16 章已引）。"}
+      ],
+      "confidence": "medium",
+      "writer_note": "§18.7「分布式域」现在只说『310P 的 HCCL 对 device 上的 broadcast 和 int64 的 all_reduce 支持受限』，读者无从判断这是猜的还是查的。建议加一句出处感极强的注脚：CANN《集合通信接口参考》里 HcclAllReduce 的按产品数据类型表，300I Duo 一列没有 int64（写「据 CANN 8.0.0 文档」，别写死成永久事实）；broadcast 则可直接引 vllm-ascend PR #1478 作者原话『hccl broadcast does not support 310p currently』。**特别推荐把 PR #1478 的那个 bug 讲一句**：最早的补丁连 CPU 组一起换、把 DP 启动搞挂了，才有了代码里那行 `if tensor.device == cpu: return fn(...)`——正文现在只把它解释成『因为受限的只是 device 上的 broadcast』，补上这段来历会更有血肉。"
+    },
+    {
+      "id": "allgather-vs-allreduce-traffic",
+      "term": "用 all_gather 模拟 all_reduce 到底贵多少（精确口径）",
+      "kind": "external_concept",
+      "one_line": "环形 all_reduce 每张卡收发约 2N（与卡数无关），all_gather 每张卡收发约 (P−1)·N（随卡数线性涨）——所以模拟的代价大致是 P/2 倍，不是 P 倍。",
+      "what_it_is": "正文在 §18.7 用 `O(N)` vs `O(P·N)` 比了一下代价，方向完全正确，但如果想给出**可核的系数**，公开材料是有的：\n\n**环形（ring）all_reduce**：把每张卡的 N 个元素切成 P 份，先做 P−1 轮 scatter-reduce、再做 P−1 轮 all-gather，每轮传 N/P 个元素。Baidu 那篇经典的 ring-allreduce 讲解写道：**「each of the N GPUs will send and receive values N−1 times for the scatter-reduce, and N−1 times for the allgather. Each time, the GPUs will send K/N values」**，于是 **「the total amount of data transferred to and from every GPU is 2(N−1)K/N which, crucially, is independent of the number of GPUs」**（原文 N=卡数、K=元素数；换成本章记号就是每卡收发 `2(P−1)/P · N`，**卡数再多也逼近 2N**）。它还点明这算法是 **bandwidth-optimal**——带宽意义上没有更快的做法。\n\n**all_gather**：结果是 P 份拼起来，每张卡必须把别人的 P−1 份都收进来，于是每卡收发约 `(P−1)·N`——**随卡数线性增长**。\n\n**两者相除**：`(P−1)N ÷ 2(P−1)N/P = P/2`。所以「用 all_gather 模拟 all_reduce」的代价是约 **P/2 倍**：P=8 时约 3.5 倍，P=16 时约 7.5 倍。数量级上确实是「多一个 P 的因子」，但系数是 1/2 而不是 1。\n\n**为什么这仍然可接受**：这条模拟路径只对 int64 张量生效，而 int64 在推理里基本只用来传计数、同步标量这类一两个元素的东西——N 本身就是个位数，乘 P/2 依旧微不足道。要是拿它去搬激活或 KV，那就是灾难。",
+      "background": "ring all-reduce 2016 年由百度硅谷实验室引入深度学习（后被 Horovod 等框架普及），核心卖点正是上面那句「与卡数无关」；在此之前常见做法是参数服务器或朴素的 gather-reduce-broadcast，通信量随卡数线性涨。这套成本模型更早可追到 MPI 集合通信算法的研究（Thakur 等对 MPICH 的优化：长消息用 ring、短消息用 recursive doubling）。理解它，就能一眼看出「用 all_gather 拼 all_reduce」为什么只在小张量上划算。",
+      "example": "**（说明性算例，外部；系数取自 Baidu ring-allreduce 讲解）**\n\n设 8 张卡（P=8），要 all_reduce 一个长度 N 的 int64 张量：\n\n```\n原生 ring all_reduce：每卡收发 2(P-1)/P · N = 2 × 7/8 × N = 1.75 N\nall_gather 模拟     ：每卡收发 (P-1) · N     = 7 N\n倍数                ：7N / 1.75N = 4 ≈ P/2\n```\n\n代入本章真实的用法（N = 1，一个同步标量）：原生约传 2 个元素、模拟传 7 个元素——绝对量都是几十字节，差别可以忽略。换成 N = 1e7（比如一层激活）：1750 万 vs 7000 万元素，一次通信就多出几百 MB，那就完全不能接受了。",
+      "links": [
+        "https://andrew.gibiansky.com/blog/machine-learning/baidu-allreduce/",
+        "https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html"
+      ],
+      "sources": [
+        {"url": "https://andrew.gibiansky.com/blog/machine-learning/baidu-allreduce/", "note": "Andrew Gibiansky（百度硅谷实验室 ring-allreduce 工作的作者之一）《Bringing HPC Techniques to Deep Learning》：取到原句『each of the N GPUs will send and receive values N-1 times for the scatter-reduce, and N-1 times for the allgather. Each time, the GPUs will send K / N values』、『the total amount of data transferred to and from every GPU is 2(N−1)K/N which, crucially, is independent of the number of GPUs』，以及该算法『bandwidth-optimal and is the fastest possible algorithm for doing an allreduce（假设延迟相对带宽可忽略）』。访问于 2026-07-26。"},
+        {"url": "https://web.cels.anl.gov/~thakur/papers/ijhpca-coll.pdf", "note": "Thakur, Rabenseifner, Gropp《Optimization of Collective Communication Operations in MPICH》(IJHPCA, 2005)：长消息 allgather/allreduce 用 ring、短消息用 recursive doubling 的经典成本分析。**PDF 抓取失败（socket closed），仅据检索摘要引用其结论走向**，故此条仅作背景旁证、不承载数字，本 concept 的系数全部以上一条 Gibiansky 原文为准。检索于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§18.7 末尾那段成本讨论已经写得很克制（明确了「单卡视角」口径），只有一处可精化：『单卡视角贵了约 P 倍』→ 更准是 **约 P/2 倍**（因为环形 all_reduce 每卡收发是 2(P−1)/P·N ≈ 2N，而不是 N）。要么直接改成「约 P/2 倍」并顺手给 P=8 → 约 4 倍的算例，要么保留 O() 记法但把『约 P 倍』删掉。若想加一句有分量的旁注，可用 Baidu 原文那句『与 GPU 数量无关』——它正是 ring all_reduce 值钱的原因，也反衬出 all_gather 模拟为什么随卡数变贵。公式推导与出处留给链接。"
+    },
+    {
+      "id": "vllm-sharded-state-load-format",
+      "term": "vLLM 的 `sharded_state` 加载格式（`ShardedStateLoader` / `save_sharded_state.py`）",
+      "kind": "external_concept",
+      "one_line": "把「已经按张量并行切好片的权重」原样存成每个 rank 一个文件，下次启动时每张卡只读自己那份——省掉「全量读进来再切」的启动开销。",
+      "what_it_is": "本章 §18.6 一上来就在改 `ShardedStateLoader.save_model`，但没交代**这个 loader 是干嘛的**、谁会去调它。补上：\n\n**默认加载流程**是：每个 worker 都去读 HuggingFace 那份完整 checkpoint，各自按张量并行（TP）规则切出自己该拿的那一片。模型一大、TP 一多，这就变成「每张卡都完整读一遍几十上百 GB」的重复劳动。\n\n**`sharded_state` 这条路**把这一步固化下来。vLLM 官方对 `ShardedStateLoader` 的描述是：**「Model loader that directly loads each worker's model state dict, which enables a fast load path for large tensor-parallel models where each worker only needs to read its own shard rather than the entire checkpoint.」**——直接加载每个 worker 的 state dict，每张卡只读自己那片。\n\n用法是**两步**：先用官方示例脚本 `examples/offline_inference/save_sharded_state.py` 起一次模型、按目标 TP 数把切好的分片落盘；之后启动加 `--load-format sharded_state`（TP 数要对得上）即可。落盘的文件名由类常量 `DEFAULT_PATTERN = \"model-rank-{rank}-part-{part}.safetensors\"` 决定——**rank 是第几张卡、part 是这张卡的第几个分片文件**，正文里 `DEFAULT_PATTERN.format(rank=rank, part=part_idx)` 填的就是这两个洞。\n\n**于是本章那处「减法」也就好懂了**：基类之所以有 `part` 这个概念、有 `max_size` 参数，是为了在单文件太大时切成多个 part；310P 版把 `part_idx` 钉死为 0、无视 `max_size`，就是把「一 rank 一文件」变成硬约定——加载侧的契约随之简化。",
+      "example": "**（说明性示例，外部；命令形态与文件名取自 vLLM 官方文档/示例脚本，非本仓源码）**\n\n```bash\n# 第一步：起一次模型，把 TP=2 切好的权重落盘\npython examples/offline_inference/save_sharded_state.py \\\n    --model /models/Qwen3-8B --tensor-parallel-size 2 --output /models/Qwen3-8B-sharded\n\n# 落盘后目录里长这样（文件名由 DEFAULT_PATTERN 决定）\n#   model-rank-0-part-0.safetensors    <- 第 0 张卡那一片\n#   model-rank-1-part-0.safetensors    <- 第 1 张卡那一片\n\n# 第二步：之后启动直接读分片，TP 数必须一致\nvllm serve /models/Qwen3-8B-sharded --load-format sharded_state --tensor-parallel-size 2\n```\n\n逐行看：`--tensor-parallel-size` 在两步里必须相同——分片是**按这个数切死的**，换个 TP 就得重存；`part-0` 里的 0 就是基类那个 `part_idx`，基类在超过 `max_size` 时会出现 `part-1`、`part-2`，而 310P 版永远只有 `part-0`。文件后缀 `.safetensors` 是 HuggingFace 生态通行的张量文件格式，vLLM 用它存每一片。",
+      "links": [
+        "https://docs.vllm.ai/en/v0.11.2/api/vllm/model_executor/model_loader/sharded_state_loader/",
+        "https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/save_sharded_state.py"
+      ],
+      "sources": [
+        {"url": "https://docs.vllm.ai/en/v0.11.2/api/vllm/model_executor/model_loader/sharded_state_loader/", "note": "vLLM 官方 API 文档（v0.11.2 页面，本书基座为 v0.21.0，该类描述与常量未见变化）：取到 ShardedStateLoader 类描述原句『Model loader that directly loads each worker's model state dict, which enables a fast load path for large tensor-parallel models where each worker only needs to read its own shard rather than the entire checkpoint.』、`DEFAULT_PATTERN = \"model-rank-{rank}-part-{part}.safetensors\"`、以及『See examples/offline_inference/save_sharded_state.py for creating a sharded checkpoint.』访问于 2026-07-26。"},
+        {"url": "https://docs.vllm.ai/en/stable/examples/offline_inference/load_sharded_state/", "note": "vLLM 官方示例页《Load Sharded State》：取到两步用法——先用 save_sharded_state.py 按 --tensor-parallel-size 存分片，再以 --load-format sharded_state（或 LLM(load_format=\"sharded_state\")）加载，且 TP 数需匹配。经检索摘要读取（页面直连返回 404 的是另一路径），故命令行细节标 medium、正文措辞宜给形态不给逐字参数。访问于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§18.6 建议在读 `save_model` 之前插一小段「这是什么」：sharded_state 是 vLLM 的一种加载格式，把按 TP 切好的权重每卡存一份、启动时各读各的（可引官方那句 fast load path 原话），`model-rank-{rank}-part-{part}.safetensors` 里的 rank/part 正好对上代码里的两个变量。这样后面「310 版永远 part_idx=0」的减法才有对照物——现在读者不知道 part 是什么，减法就没了对比锚点。两步命令行可压成一句话或整段省略，留给链接。"
+    },
+    {
+      "id": "ascend-quant-weight-description-json",
+      "term": "「权重旁边放一份 JSON 描述量化类型」——昇腾生态的加载惯例（以及 `parameters_type_map.json` 的出处存疑）",
+      "kind": "custom_pattern",
+      "one_line": "safetensors 只存数字、不存「这份权重是 int8 量化过的还是原始浮点」，昇腾生态的做法是在权重目录里另放一份 JSON 把每个参数的量化类型写清楚，加载侧照着这份清单决定怎么反量化。",
+      "what_it_is": "读者看到 §18.6 那个 `generate_quant_description` 会问：**权重不是已经存进 safetensors 了吗，为什么还要额外写一份 JSON？**\n\n因为 safetensors 里每个张量只带「形状 + dtype」这类基本信息，**不带「这块 int8 是量化权重、该配哪个 scale 反量化」这种语义**。昇腾生态的通行解法就是**在权重目录里放一份描述文件**：华为的模型压缩工具 **msModelSlim** 量化完模型后，`--save_path` 下除了 safetensors 权重，还会生成一份 `quant_model_description*.json` 元数据；下游推理框架（vllm-ascend、SGLang 的昇腾后端等）**读这份 JSON 来自动识别量化方案**，用户因此连 `--quantization` 都不用手动指定。\n\n本章 310P 版写出的 `parameters_type_map.json` 是**同一路数**：一个 `model_quant_type` 声明整模型的量化类型、一个 `version`、再逐参数一行「这个是量化类型 X / 这个是 FLOAT」。加载侧照单抓药。\n\n**需要如实说明的一点**：`parameters_type_map.json` 这个**具体文件名**，我在 CANN / msModelSlim / MindIE 的公开文档里**没有查到**（2026-07-26 多轮检索）。有出处的是「昇腾量化权重配一份 JSON 描述」这个**惯例**（msModelSlim 的 `quant_model_description.json`）。所以正文可以讲惯例、讲这份文件的作用，但别把它说成某个官方规范里的标准文件名。",
+      "example": "**（说明性示例，外部；文件名与字段取自本章源码所写内容，格式属惯例、非官方规范）**\n\n```json\n{\n  \"model_quant_type\": \"W8A8\",\n  \"version\": \"1.0.0\",\n  \"model.layers.0.self_attn.q_proj.weight\": \"W8A8\",\n  \"model.layers.0.self_attn.q_proj.bias\": \"FLOAT\",\n  \"model.layers.0.input_layernorm.weight\": \"FLOAT\"\n}\n```\n\n逐行读：第一行是整模型的量化方案（代码里从 `quant_config.quant_description[\"model_quant_type\"]` 取，取不到就退成 `\"FLOAT\"`）；`version` 是描述文件自身的格式版本，给加载侧做兼容判断；后面每一行是**一个参数名 → 它的类型**——`q_proj.weight` 存的是 int8，于是标成模型声明的量化类型；`q_proj.bias`、`layernorm.weight` 仍是浮点，标 `FLOAT`。加载侧扫一遍这张表，就知道哪些权重要走反量化路径、哪些直接当浮点用。",
+      "links": [
+        "https://gitcode.com/Ascend/msmodelslim",
+        "https://docs.vllm.ai/projects/ascend/en/main/user_guide/feature_guide/quantization.html"
+      ],
+      "sources": [
+        {"url": "https://github.com/vllm-project/vllm-ascend/pull/6645", "note": "vllm-ascend PR #6645『[Feature][Quant] Auto-detect quantization format from model files』（经检索摘要读取）：msmodelslim 导出的权重靠 `quant_model_description.json` 被自动识别量化方案，用户无需另加 --quantization 参数——「权重旁配 JSON 描述、加载侧照读」这一惯例的出处。访问于 2026-07-26。"},
+        {"url": "https://github.com/sgl-project/sglang/blob/main/docs/platforms/ascend/ascend_npu_quantization.md", "note": "SGLang 官方昇腾量化文档（经检索摘要读取）：msmodelslim 量化后 --save_path 下是「原始量化 safetensors + 一份 quant_model_description*.json 元数据」，且下游按 quant_model_description.json 逐层解析量化配置。用作第二处旁证。访问于 2026-07-26。"},
+        {"url": "https://www.hiascend.com/doc_center/source/zh/mindstudio/70RC3/T&ITools/msModelSlim/modelslim_0008.html", "note": "MindStudio msModelSlim《大模型量化》官方文档：确认 msModelSlim 是华为官方的模型压缩/量化工具，量化产物含权重与 JSON 描述。命中于站内检索，未逐字展开页面细节，故本条整体标 medium。访问于 2026-07-26。"},
+        {"url": "https://github.com/vllm-project/vllm-ascend", "note": "负结果（无可引页面）：以 `parameters_type_map.json` 为关键词做中英文两轮 Web 检索，未命中任何 CANN / msModelSlim / MindIE / vllm-ascend 的公开文档说明——该文件名目前只见于本仓源码，故此惯例条目整体标 medium、文件名本身按 low 对待。检索于 2026-07-26。"}
+      ],
+      "confidence": "medium",
+      "writer_note": "§18.6 现在只说『310P / CANN 的加载侧需要这张逐参数 dtype 描述才认得出哪些权重是量化过的』——判断方向对，但读者不知道这是**昇腾生态的通行做法**还是这个文件独有的怪癖。建议补半句：昇腾的量化工具 msModelSlim 产出的权重同样是「safetensors + 一份 quant_model_description.json 描述」，下游据此自动识别量化方案；310P 这份 `parameters_type_map.json` 是同一路数的产物。**注意口径**：`parameters_type_map.json` 这个文件名在公开文档里查不到，别写成官方规范（可写「这份文件的格式没有公开规范，字段含义只能从代码看」）。上面那段示例 JSON 可以直接用，但要标明是说明性构造。"
+    },
+    {
+      "id": "310p-support-envelope",
+      "term": "310P 在 vllm-ascend 里的官方支持面（这块卡到底能跑什么、有哪些坑）",
+      "kind": "external_concept",
+      "one_line": "官方把 310P 标为「实验性」支持：能跑 Qwen3 Dense 这类模型、支持 FULL_DECODE_ONLY 图模式、要用 W8A8SC 量化权重，但没有 Triton、必须手动指定 max-model-len，多卡 TP 下能捕获的图数量还受硬件资源限制。",
+      "what_it_is": "本章通篇在读「310P 缺什么」的源码，读者难免想知道**现实中这块卡到底能不能用、用起来什么样**。vllm-ascend 官方文档给了一份相当具体的画像（据 310P 教程页与 FAQ，2026-07-26 访问；页面对应版本比本书 pin 的 v0.21.0rc1 略新或略旧，结论宜当「大致坐标」而非逐条对号）：\n\n- **定位**：官方支持矩阵里写作 **`[Experimental] Atlas 300I Inference series (Atlas 300I Duo)`**——实验性支持；FAQ 里还有一句『Currently for 310I Duo the stable version is vllm-ascend v0.10.0rc1』，意思是**推荐用来跑生产的反而是某个更早的版本**。\n- **模型与量化**：310P 教程页当前给的是 **Qwen3 Dense 8B/14B/32B + W8A8SC 量化权重**的走法（`This guide requires W8A8SC quantized weights…`，并给了从 W8A8S 压缩过来的脚本）。也就是说这块卡上跑大模型基本要靠量化。\n- **图模式**：**支持 `FULL_DECODE_ONLY`**（不是只能 eager——早期「310I 只支持 eager 模式」的说法已经过时了）；但有个硬限制：**多 TP rank 时可捕获的图数量受硬件 event-id 资源限制、且与模型层数相关**，TP=1 时无此限制。\n- **不支持 Triton**：`Atlas 300I DUO does not support triton or triton-ascend.`（见本章另一条 concept）。\n- **必须显式设 `--max-model-len`**：官方明确说不要依赖自动推断，否则可能 OOM，建议保守取值如 `--max-model-len 16384`——原因是 310P 那条注意力路径要显式构造 mask 张量，显存开销随上下文长度平方增长。\n- **构建**：从源码装时若环境里没有 `npu-smi` 供推断芯片型号，需手动 `export SOC_VERSION=\"ascend310p1\"`。这正好呼应正文 §18.1 那条「SOC 版本字符串在构建期烧进 `_build_info`」——`Ascend310P1` / `Ascend310P3` 是同代的不同 SOC 版本名（源码里的 `SOC_VERSION_INFERENCE_SERIES = [\"Ascend310P3\"]` 就是其中一个），而分流只认字符串里有没有 `310P` 子串，正是为了把这一族型号一网打尽。",
+      "background": "310P 在 vllm-ascend 里的支持是**反复进出**的：社区曾一度移除、后来又「加回来」（release notes 里能看到 310P 支持被重新加入、先支持 dense 与 VL 模型的 eager 模式，之后才逐步补上图模式、MoE、W8A8SC 等）。这解释了为什么本章看到的 `_310p/` 目录是一整套「另起炉灶又处处继承」的结构——它是在主干快速演进的同时，用最小侵入把一代老卡续上命的产物。也解释了「实验性」这个标签：它的适配总是滞后于主力卡。",
+      "example": null,
+      "links": [
+        "https://docs.vllm.ai/projects/ascend/en/latest/tutorials/hardwares/310p.html",
+        "https://docs.vllm.ai/projects/ascend/en/latest/faqs.html",
+        "https://docs.vllm.ai/projects/ascend/en/latest/user_guide/release_notes.html"
+      ],
+      "sources": [
+        {"url": "https://docs.vllm.ai/projects/ascend/en/v0.18.0/tutorials/hardwares/310p.html", "note": "vllm-ascend 官方 310P 教程页（v0.18.0 路径，可直连抓取）：取到 Qwen3 Dense 8B/14B/32B + W8A8SC 要求、`FULL_DECODE_ONLY` 图模式支持与「多 TP rank 时可捕获图数量受 event-id 资源限制、取决于模型深度；TP=1 无此限制」、『Atlas 300I DUO does not support triton or triton-ascend.』、以及 `--max-model-len` 不可依赖自动推断（建议 16384）。访问于 2026-07-26。"},
+        {"url": "https://docs.vllm.ai/projects/ascend/en/v0.18.0/faqs.html", "note": "vllm-ascend 官方 FAQ（v0.18.0）：取到『[Experimental] Atlas 300I Inference series (Atlas 300I Duo)』的实验性标注、『Currently for 310I Duo the stable version is vllm-ascend v0.10.0rc1』、以及源码构建时 `export SOC_VERSION=\"ascend310p1\"` 的做法。访问于 2026-07-26。"},
+        {"url": "https://docs.vllm.ai/projects/ascend/en/latest/tutorials/hardwares/310p.html", "note": "同页 latest 版本（直连遇重定向环，经检索摘要读取）：同样含 triton 不支持、FULL_DECODE_ONLY、max-model-len 建议、W8A8SC 支持面（『W8A8SC is specialized quantization supported on 310P』），说明上述结论在最新文档中依然成立。另见旧口径『Currently, the 310I series only supports eager mode and the float16 data type』——该「只支持 eager」说法已被 FULL_DECODE_ONLY 支持取代，正文勿引用旧句。访问于 2026-07-26。"}
+      ],
+      "confidence": "medium",
+      "writer_note": "本章立意是「受限硬件上的全栈特化」，但正文全程只从源码侧看限制，缺一个「现实里这块卡怎么用」的落地坐标。建议在 §18.1 之后或 §18.9 小结前插三五句：官方标实验性、要靠 W8A8SC 量化跑 Qwen3 Dense、支持 FULL_DECODE_ONLY 图模式但多卡下可捕获图数受限、必须手动 `--max-model-len`。**顺带能补一个正文的小空白**：§18.1 说 SOC 字符串含 `310P` 就分流，读者会问「那 `Ascend310P3` 和 `Ascend310P1` 什么关系」——答案是同代不同 SOC 版本名（官方构建文档用的是 `ascend310p1`），子串判断正是为了一网打尽这一族。注意所有条目都写「据官方文档（2026-07 访问）」，别写成永久事实；『只支持 eager 模式』是过时说法，别用。"
+    }
+  ]
+}
