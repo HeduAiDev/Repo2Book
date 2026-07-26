@@ -87,6 +87,8 @@ class AsyncIntermediateTensors(IntermediateTensors):
 
 这就是无穷递归。绕过钩子直接走 `object.__getattribute__` 正是为了打破这个环：`object.__getattribute__` 是「不过钩子的原始属性访问」，从它读 `_comm_handles` 不会再触发拦截。所以钩子只对 `.tensors` 这一个名字做拦截，类内部读自己的状态全走 `object.__getattribute__` 直读，环就断了。
 
+顺带说破：这套拦截不是 vLLM 自造的黑魔法，而是 Python 数据模型（data model）里的标准钩子。语言规范规定，任何 `obj.xxx` 读取都会无条件先经过 `__getattribute__`；与它常被混淆的 `__getattr__` 则只在默认属性查找失败（抛 `AttributeError`）之后才兜底触发——而 `tensors` 是个真实存在的属性，默认查找不会失败，兜底钩子根本轮不到出场，所以这里必须重写前者。上面那个递归陷阱也在 [Python 官方参考手册的 Data model 一章](https://docs.python.org/3/reference/datamodel.html)里被专门点名，给出的标准解法正是 `object.__getattribute__(self, name)`。这类钩子在 Python 生态里常被用来做懒加载属性、属性访问日志、属性级权限控制——「首次访问才触发通信 wait」正是懒加载的一个变体。
+
 ### irecv 为什么能不阻塞
 
 句柄从哪来？来自 PP 通信组的 `irecv_tensor_dict`。它做的事是：先收一份**元数据**（每个张量的 shape/dtype），据此 `torch.empty` 预分配好接收缓冲区，然后对每个张量发一个 `torch.distributed.irecv`——非阻塞，立刻返回句柄。
@@ -501,13 +503,25 @@ def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdent
 
 请求 a 落到引擎 0，预增后引擎 0 的 score 变成 4；请求 b 进来一看引擎 0 已是 4 分、引擎 1 还是 0 分，于是去引擎 1。两个请求被打散到两个引擎，**没有羊群**。如果没有预增，请求 b 会看到和 a 一样的旧快照，也挤到引擎 0。
 
-循环从 `eng_start_index` 起轮询（而非永远从 0 开始）也是为打散——`eng_start_index` 在客户端初始化时按 `(num_engines * client_index) // client_count` 计算，将 client 们均匀地错开在引擎列表里，此后不再变动；多个前端实例的起点各不相同，空集群也能均匀铺开。源码里那句注释标了 `TODO use P2C alg`——更大 DP 规模下，会换成 power-of-two-choices（随机选两个比一下）的均衡算法，这是留给未来的优化。
+循环从 `eng_start_index` 起轮询（而非永远从 0 开始）也是为打散——`eng_start_index` 在客户端初始化时按 `(num_engines * client_index) // client_count` 计算，将 client 们均匀地错开在引擎列表里，此后不再变动；多个前端实例的起点各不相同，空集群也能均匀铺开。
 
-显式指定 `data_parallel_rank` 的请求会跳过整个评分（第一个 walrus 分支直接定 `eng_index`），路由固定。`get_late_interaction_engine_index` 是第二个短路：它专为 ColBERT 式 late-interaction 重排（一种检索重排范式——query 和 passage 的 token 级向量各自独立编码，之后再逐 token 比对相似度，因此同一个 query 的所有请求必须落在同一个引擎上才能拿到一致的比对语境；pooling_params 里带着 query/passage 标记）选定固定引擎，不涉及负载，返回 `None` 就退回到评分循环。`reqs_in_flight` 记下每个请求去了哪个引擎，是为了将来 abort 时能定向找到对的引擎。
+源码里那句注释 `TODO use P2C alg for larger DP sizes` 值得多说两句——先明确：这只是个路标，当前版本并没有实现，眼下用的就是上面「线性扫全部引擎挑最低分」的做法。P2C（power-of-two-choices，两随机选一）是负载均衡领域的一个经典结论：给请求挑服务器，「查遍全部挑最空」均衡最好但查询开销随引擎数线性涨，「纯随机扔一个」零查询但容易撞车；P2C 折中——每次只随机抽两个候选，比较这两个的负载，把请求给较空的那个。比如 8 个引擎，不比全部 8 个，随机抽出引擎 3 和引擎 6，只比这俩的 `[waiting, running]` 谁分低。Mitzenmacher 在 1996 年证明了这个「只多看一眼」的小改动威力惊人：最忙节点的期望负载从只看一个时的 $`\Theta(\log n/\log\log n)`$ 降到看两个时的 $`\Theta(\log\log n)`$ ，指数级改善；NGINX、HAProxy 里的 random-with-two-choices 类均衡算法都源于此（[原始论文 PDF](https://cs.colby.edu/courses/F09/cs231-labs/labs/lab07/Mitzenmacher-2Choices-TPDS2001.pdf)、[NGINX 官方博客的直觉版解释](https://www.f5.com/company/blog/nginx/nginx-power-of-two-choices-load-balancing-algorithm)）。对 vLLM 来说，DP 规模小时扫全量的开销可以忽略，等引擎数多到全量打分不划算，才轮到 P2C 出场——这正是注释里 `for larger DP sizes` 的意思。
+
+显式指定 `data_parallel_rank` 的请求会跳过整个评分（第一个 walrus 分支直接定 `eng_index`），路由固定。
+
+第二个短路 `get_late_interaction_engine_index` 服务的是 ColBERT 式 late-interaction（延迟交互）重排请求，这个词值得拆开讲。传统 bi-encoder 检索把整个 query、整个文档各压成一个向量，一次点积出相关性分——快，但词级的细粒度信息全被压扁；cross-encoder 把 query 和文档拼在一起整体过一遍模型——准，但每个查询对每个文档都要现算，没法离线建库。ColBERT（SIGIR 2020）取中间路线：query 和文档各自独立编码，但保留每个 token 各自的向量，打分时才做 token 对 token 的比对——对 query 的每个 token 向量，在文档全部 token 向量里取最大相似度，再把各 token 的最大值加总。「延迟」指的正是这场 token 级交互被推迟到打分那一刻才发生，好处是文档向量可以提前算好、离线存起来，查询时只需编码 query。放到 vLLM 的调度视角，它带来一个硬约束：一次重排会拆出多个子请求（对多个候选文档分别打分），它们必须访问同一份 query 的 token 级上下文，才能凑出一致的比对结果——所以同一个 query 的所有子请求要粘在同一个引擎上，不能被负载均衡打散。`get_late_interaction_engine_index` 就按 `pooling_params` 里带的 query/passage 标记做这种固定路由，不看负载；返回 `None` 说明不是这类请求，退回评分循环。想深入 ColBERT 本身可读[原始论文](https://arxiv.org/abs/2004.12832)。
+
+`reqs_in_flight` 记下每个请求去了哪个引擎，是为了将来 abort 时能定向找到对的引擎。
 
 ### 协调进程的 wave 状态机
 
-协调进程自己也维护一份 `(current_wave, engines_running)`，靠三个 ZMQ socket 轮询驱动。它处理引擎上报的事件：
+协调进程自己也维护一份 `(current_wave, engines_running)`，靠三个 ZMQ socket 轮询驱动。
+
+先把这里的 ZMQ 说清楚。ZMQ 即 ZeroMQ，一个无 broker 的消息传输库：它把「TCP 收发＋消息边界处理」这些脏活封装成几种现成的「连接形状」（socket 类型），程序按需拼装，不必像 RabbitMQ/Kafka 那样架设独立的 broker 服务进程——若真需要一个居中转发者，那也是应用自己进程里的一段转发逻辑，`DPCoordinator` 正是这样一段。本章用到的形状是发布/订阅家族：PUB/SUB 模式里发布者对外广播、订阅者按前缀过滤只收自己关心的消息，发布者不需要知道订阅者有几个、是谁——「新拉起一个 API server 进程就能立刻收到广播」靠的正是这一点。协调进程用的还是它的代理版 XPUB：普通 PUB 看不见谁订阅了什么，XPUB 则把「有人来订阅了」这个动作本身变成一条可读消息交给持有者，居中代理因此能感知订阅关系并做出反应；配对的 XSUB 除了收广播，还能反向朝上游发帧。落到源码，三个 socket 分别是：面向前端的 `publish_front`（XPUB，前端拿 XSUB 订阅它；前端的 `FIRST_REQ` 唤醒通知正是经这条 XSUB→XPUB 反向通道抵达）、面向引擎的 `publish_back`（XPUB，广播 `START_DP_WAVE`）、收引擎上报的 `output_back`（PULL——ZMQ 的多发一收「收线」形状，M 个引擎都往这儿推）。想深挖这套模式，[ZeroMQ 官方指南第 2 章](https://zguide.zeromq.org/docs/chapter2/)讲得最透。
+
+线上跑的消息体统一用 `msgspec.msgpack.encode` 打包。msgspec 是一个核心用 C 写的 Python 高速序列化库；MessagePack 是它采用的编码格式，可以理解成「二进制版 JSON」——同样表达字典、列表、字符串、数字，但不靠引号逗号做文本分隔，而是类型标记字节＋长度前缀，体积更小、解析也不用逐字符扫描。对「引擎每步都可能上报一次 stats」这种高频小消息，编解码开销和消息体积都省在刀刃上（具体快多少随场景浮动，官方基准见 [msgspec 仓库](https://github.com/jcrist/msgspec)）。
+
+它处理引擎上报的事件：
 
 ```python
 # vllm/v1/engine/coordinator.py:L368
@@ -585,7 +599,7 @@ async def add_request_async(self, request: EngineCoreRequest) -> None:
     self._ensure_output_queue_task()
 ```
 
-注意时序：`_send_input` 返回一个 `to_await`（请求实际发送的协程），但**先不 await**。如果 `engines_running` 是 `False`（全体暂停），就先经独立的 `first_req_send_socket` 发 `FIRST_REQ`，**再**回头 await 请求发送。唤醒信号抢在请求前头跑，最小化「请求到了却没人接」的延迟。
+注意时序：`_send_input` 返回一个 `to_await`（请求实际发送的协程），但**先不 await**。如果 `engines_running` 是 `False`（全体暂停），就先经独立的 `first_req_send_socket` 发 `FIRST_REQ`，**再**回头 await 请求发送。唤醒信号抢在请求前头跑，最小化「请求到了却没人接」的延迟。顺带交代这个 socket 的身份：它是前端进程内部的一段 PAIR 管道（ZMQ 的一对一直连形状，这里走 inproc 进程内传输），把消息递给前端持有 XSUB 的后台统计任务，由后者经上一节说的 XSUB→XPUB 反向通道转发给协调进程。
 
 请求还被盖上了 `current_wave`——这个章戳，正是协调进程判断「这是不是个 stale-wave 请求、要不要广播唤醒」的依据。协调进程收到 `FIRST_REQ` 后广播 `START_DP_WAVE`，各引擎的 `_handle_client_request` 接住它：先查 `ignore_start_dp_wave`（还记得两阶段暂停那道闸吗），没被忽略、且 wave 号够新、且自己不是已经直接收到请求的那个引擎（`exclude` 去重），才把自己拉回 running。
 

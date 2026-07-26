@@ -44,7 +44,7 @@ NODES = [
     ("badwords",  2, 2, 0, "apply_bad_words",          "前缀匹配,补全成禁词才屏蔽",        "§30.4"),
     ("penalties", 2, 2, 1, "apply_penalties",          "rep/freq/presence 扣分",           "§30.5"),
     ("topk",      3, 3, 0, "TopKTopPSampler",          "按 device/platform 绑后端",        "§30.7"),
-    ("trunc",     3, 4, 0, "apply_top_k_top_p",        "sort/triton 截断,Gumbel/拒绝采样", "§30.8–29.9"),
+    ("trunc",     3, 4, 0, "apply_top_k_top_p",        "sort/triton 截断,Gumbel/拒绝采样", "§30.8–30.9"),
 ]
 EDGES = [  # (src_id, dst_id) —— 调用边,统一主线蓝
     ("meta", "entry"),
@@ -59,7 +59,7 @@ EDGES = [  # (src_id, dst_id) —— 调用边,统一主线蓝
 # (路线名, [(列, §编号), ...] 按阅读顺序, 是否高亮:True=实线蓝/False=虚线灰)
 ROUTES = [
     ("主干速览(9 步全景)", [(0, "§30.2"), (1, "§30.3"), (2, "§30.6"), (4, "§30.10")], True),
-    ("深入:多后端分发与内核选择", [(2, "§30.6"), (3, "§30.7"), (4, "§30.8–29.9")], False),
+    ("深入:多后端分发与内核选择", [(2, "§30.6"), (3, "§30.7"), (4, "§30.8–30.9")], False),
 ]
 LEGEND = [("#22c55e", "入口:模型前向调用 Sampler"), ("#3b82f6", "章内主线调用/执行流"), ("#f97316", "出口:返回引擎核心")]
 TITLE = "第 30 章 · Sampler 九步采样流水线剖面(源码走线 + § 讲解站牌)"

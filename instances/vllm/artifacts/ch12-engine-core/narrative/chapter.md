@@ -38,7 +38,7 @@
 
 > *图注：上轨是深度 1（普通 `step`）——单批串行流过 3 个 stage，对角线之外全是气泡（虚线空格），任一时刻只有 1/3 硬件在干活。下轨是深度 3（`batch_queue`）——批 0/1/2 错位填进各 stage，稳态下每个 stage 都满载，气泡消失。下轨能成立的前提是：有人在批 0 还没算完时，就抢先把批 1、批 2 调度进来——这正是 `step_with_batch_queue` 的「填管道优先」。*
 
-要让「填满」发生，`EngineCore` 不能再傻等当前批走完全程。它得能**不阻塞地连续发批**：发了批 0 不等结果，立刻去发批 1，再发批 2，直到流水线灌满；然后才回头取最早那个批的结果。装这些「已发出、还没取结果」的在飞批的容器，就是 `batch_queue`——一个深度恰好等于「流水线要多少个并发批才填满」的 `deque`。
+要让「填满」发生，`EngineCore` 不能再傻等当前批走完全程。它得能**不阻塞地连续发批**：发了批 0 不等结果，立刻去发批 1，再发批 2，直到流水线灌满；然后才回头取最早那个批的结果。装这些「已发出、还没取结果」的在飞批的容器，就是 `batch_queue`——一个深度恰好等于「流水线要多少个并发批才填满」的 `deque`（Python 标准库的双端队列容器；为什么偏偏选它，§12.2 会专门讲清）。
 
 量化一下气泡。设流水线有 P 个 stage，每个 stage 一拍耗时相同。单批串行跑完全部 P 个 stage 要 P 拍，这段时间的总算力是「P 个 stage × P 拍」个 stage·拍，但真正干活的只有对角线上那 P 个。利用率就是这两者之比：
 
@@ -47,6 +47,8 @@
 ```
 
 人话：PP=8，单批串行只用上 1/8 的卡，剩下 7/8 是气泡。而把队列填到 $`P`$ 个并发批后，稳态每拍 P 个 stage 全在算，利用率趋近 1——吞吐近似 ×P 提升。上限受调度/采样的串行依赖、队列深度、以及后面要讲的 deferred 路径打断流水线的影响。
+
+顺带把「气泡」这个词的户口讲清楚——它和「多塞几个批把流水线填满」的思路都不是 vLLM 的发明，而是从分布式 **训练** 的流水线并行文献里继承来的。Google 的 GPipe（Huang et al., NeurIPS 2019）最早把这笔账系统算清：把一个 batch 切成 $`m`$ 个 micro-batch 依次灌入 $`P`$ 段流水线，气泡占比为 $`(P-1)/(m+P-1)`$——micro-batch 越多气泡越小，代价是要同时保存 $`m`$ 份中间激活。训练场景还多一层麻烦：前向之外还有反向传播要排进流水线，这一族调度算法于是越演越复杂——PipeDream 的 1F1B（one-forward-one-backward：流水线灌满后，每个 stage 做完一个前向立刻做一个积压的反向，显存峰值更低，但反向用的是稍旧一版权重）、再到把反向拆成「对输入求梯度」和「对参数求梯度」两个独立子步骤、让气泡在不牺牲同步训练语义的前提下理论趋零的 Zero Bubble。而 vLLM 面对的是 **推理**：只有前向、没有反向依赖要理，最朴素的「多批同时在飞」就足以消除气泡。本章的队列看上去简单，不是简陋，是推理场景天然用不上训练侧那些花活。想溯源这条谱系，原始论文在这里：[GPipe](https://arxiv.org/abs/1811.06965)、[PipeDream](https://dl.acm.org/doi/10.1145/3341301.3359646)、[Zero Bubble](https://arxiv.org/abs/2401.10241)。
 
 这就是 `batch_queue` 存在的全部理由。`__init__` 里那段注释把它说得明明白白：
 
@@ -96,7 +98,7 @@ self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]]
 ```
 
-队列里每个元素是一个**三元组**：`(采样结果 future, 这个批的 SchedulerOutput, execute_model 的 future)`。三个字段各司其职：采样 future 取结果、`SchedulerOutput` 对账、`exec_future` 在采样失败时供出真因——[§12.4](#124-下半段pop-队尾取出最旧那个批) 出队时逐一拆开说。
+队列里每个元素是一个**三元组**：`(采样结果 future, 这个批的 SchedulerOutput, execute_model 的 future)`。三个字段各司其职：采样 future 取结果、`SchedulerOutput` 对账、`exec_future` 在采样失败时供出真因——[§12.4](#124-下半段pop-队尾取出最旧那个批) 出队时逐一拆开说。`deque` 和 `Future` 这两个标准库类型到底是什么脾气，本节稍后有个两分钟速成。
 
 **第三，`step_fn` 二选一。** 一句话：`batch_queue is None` 就绑 `step`，否则绑 `step_with_batch_queue`。绑定**一次**，之后每拍直接调 `self.step_fn()`，不再判断分支——[第 11 章](../../ch11-engine-core/narrative/chapter.md#你在这里) 的忙循环对此完全透明，它不知道也不关心自己驱动的是哪个 step。
 
@@ -113,6 +115,39 @@ core = _MinimalEngineCore(FakeExecutor(max_concurrent_batches=2), FakeScheduler(
 assert core.batch_queue is not None and core.batch_queue.maxlen == 2
 assert core.step_fn == core.step_with_batch_queue
 ```
+
+### 两件标准库道具：deque 与 Future
+
+上面那几行代码里有两个 Python 标准库类型反复出现，全章的机制都搭在它们身上。花两分钟把它们看透，后面读控制流就不会卡壳。
+
+**`collections.deque`：双端队列。** 普通 `list` 在尾部追加/弹出很快，但在**头部**插入或弹出（`insert(0, v)` / `pop(0)`）要把后面所有元素整体挪一格，代价 O(n)；`deque`（double-ended queue，双端队列）专为「两端都要频繁进出」设计，`append`/`appendleft`/`pop`/`popleft` 四个方向全是 O(1)。构造时传 `maxlen` 就有了硬上限：塞满之后再从一端进新元素，另一端会自动挤掉最旧的一个。看一个最小用例：
+
+```python
+# 说明性示例（Python 标准库用法，非 vLLM 源码）
+from collections import deque
+
+q = deque(maxlen=2)      # 最多挂 2 个元素
+q.appendleft("batch_0")  # 左端进 -> deque(['batch_0'])
+q.appendleft("batch_1")  # 左端进 -> deque(['batch_1', 'batch_0'])
+q[-1]                    # 只看不弹，取最右端 -> 'batch_0'（最早进的）
+q.pop()                  # 右端出 -> 'batch_0'
+```
+
+`appendleft` 永远把新元素塞到最左边，于是队列里越靠右的元素越「老」；`pop` 永远从最右端弹，弹出的天然是最老的那个。**只用 `appendleft` 进、只用 `pop` 出，一个双端队列就被「降级」成了严格的左进右出 FIFO**——这正是 `batch_queue` 的用法；`batch_queue[-1]` 则用来偷看「最老的批算完了没」，只查看、不弹出（§12.3 的填管道判定靠它）。至于 `maxlen` 的自动挤出行为，本章其实永远触发不了——「填管道判定」会在队满之前就转去 `pop`（§12.4 末尾有归纳证明），`maxlen` 只是双保险。完整 API 见 [Python 官方文档](https://docs.python.org/3/library/collections.html#collections.deque)。
+
+**`concurrent.futures.Future`：异步结果的提货单。** 把一个任务交给别人（线程池、子进程、或 vLLM 的 worker）去跑，提交的一瞬间你拿到的不是结果，而是一张**提货单**——`Future` 对象。它有两个本章反复用到的方法：`.done()` 非阻塞地问一句「好了没」，立刻返回 `True`/`False`、绝不等待；`.result()` 则愿意排队等到货真的到手，而且若任务在执行中抛了异常，`.result()` 会把**同一个异常**在调用处原样重新抛出——不吞、不换。
+
+```python
+# 说明性示例（Python 标准库用法，非 vLLM 源码）
+from concurrent.futures import ThreadPoolExecutor
+
+with ThreadPoolExecutor() as pool:
+    fut = pool.submit(lambda: 1 + 1)  # 立刻返回提货单，不等任务跑完
+    fut.done()                        # 可能 False：只问不等
+    fut.result()                      # 阻塞到有结果 -> 2
+```
+
+「提交时立刻拿到占位符、之后再决定何时/是否等待」正是本章 `non_block=True` 这套写法的标准库原型：`execute_model(scheduler_output, non_block=True)` 立刻返回一个 `exec_future`，调用方不必在原地干等前向算完——不然「一拍里连发多个批」根本无从谈起。队列三元组里存的两个 future，就是两张这样的提货单。（vLLM 在此之上还有一条自己的约定：采样 future 的 `result()` 返回 `None` 代表前序 `execute_model` 失败——那是本仓的自定义信号，不是标准库语义，§12.4 拆它。）Future 的完整语义见 [Python 官方文档](https://docs.python.org/3/library/concurrent.futures.html#future-objects)。
 
 ### max_concurrent_batches：那条间接链
 
@@ -465,7 +500,7 @@ def has_work(self) -> bool:
 
 前面一直把 `pending_structured_output_tokens` 那条岔路按下不表。现在补上。它是 `step_with_batch_queue` 里最绕、也最能体现「异步发批」代价的一段：**结构化输出叠加投机解码时，采样没法在发批的同一拍完成，必须推迟。**
 
-简单交代背景：**投机解码**（speculative decoding）是一种加速策略——用一个轻量草稿模型（draft model）先猜测几个 token（称为**草稿 token**，draft tokens），再由主模型一次性验证；猜对的 token 免费得到，猜错的丢弃重算。草稿 token 由 worker 在 `execute_model` 结束时一并返回。
+简单交代背景：**投机解码**（speculative decoding）是一种不改变输出分布、纯靠工程手段加速自回归生成的策略——用一个又小又快的**草稿模型**（draft model）先猜出接下来的 K 个 token（称为**草稿 token**，draft tokens），再让主模型对这 K 个位置做**一次前向**并行验证：猜对的 token 白捡，从第一个猜错的位置起丢弃重采。它能赚到时间，是因为现代加速器上解码通常卡在显存带宽而非算力——一次前向验证 K 个位置，和采样 1 个位置的延迟相近。这套思路由两篇 2023 年论文几乎同时独立提出（Google 的 Leviathan 等，ICML 2023，[arXiv:2211.17192](https://arxiv.org/abs/2211.17192)；DeepMind 的 Chen 等，[arXiv:2302.01318](https://arxiv.org/abs/2302.01318)），两篇的共同贡献是严格证明了「采纳/拒绝规则不改变输出分布」——这也是 vLLM 这类生产引擎敢直接采用它、不担心输出质量下降的理论根基。拒绝采样的细账在 [第 34 章](../../ch34-spec-decode/narrative/chapter.md)；本章只用到一件事：草稿 token 由 worker 在 `execute_model` 结束时一并返回。
 
 ### 为什么会缺 token
 
@@ -493,7 +528,7 @@ has_structured_output_requests: bool = False
 pending_structured_output_tokens: bool = False
 ```
 
-要理解「缺什么 token」，得看 grammar 掩码是怎么算的。结构化输出（structured output，比如强制模型只吐合法 JSON）靠在采样那步往 logits 上盖一张语法掩码（grammar bitmask），把不合法的 token 概率压成负无穷。这张掩码不是凭空算的——它依赖**这一批将要在哪些位置采样**。看 `get_grammar_bitmask` 的尾段：
+要理解「缺什么 token」，得看 grammar 掩码是怎么算的。结构化输出（structured output，比如强制模型只吐合法 JSON）靠在采样那步往 logits 上盖一张语法掩码（grammar bitmask），把不合法的 token 概率压成负无穷。要做到这一点，得先把目标格式（JSON schema、正则、上下文无关文法）预编译成一个能逐 token 判合法的状态机：每生成一个 token 推进一步状态，再算出下一步的合法 token 集合。vLLM 默认把这部分脏活交给开源库 xgrammar——一个专注于给结构化生成做语法编译与掩码计算的库（本章锚定的 v0.21.0 钉版 `xgrammar>=0.2.0,<1.0.0`）；语法怎么编译、几个可替换后端怎么比、掩码最终怎么落到 logits，[第 31 章](../../ch31-structured-output/narrative/chapter.md) 与 [第 32 章](../../ch32-structured-output/narrative/chapter.md) 有整两章的细账。本章只需抓住一件事：这张掩码不是凭空算的——它依赖**这一批将要在哪些位置采样**。看 `get_grammar_bitmask` 的尾段：
 
 ```python
 # vllm/v1/core/sched/scheduler.py:L1224

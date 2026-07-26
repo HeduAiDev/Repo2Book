@@ -21,6 +21,8 @@
 
 但这里立刻冒出一个让人不安的问题：**纠错之后，输出还是原来那个分布吗？** 如果投机解码会悄悄改变生成结果，那它就是个错误的优化，再快也没用。本章的核心，就是看 vLLM 怎么用 **rejection sampling** 让"投机加速后的输出分布"与"老老实实一个一个采"**严格相等**——一个 token 都不偏。
 
+顺便交代这套思路的出身：它不是 vLLM 的发明，而是 2022 年底到 2023 年初被两组团队**几乎同时独立发现**的学界共识算法——Google 的 Leviathan 等人叫它 speculative decoding（[arXiv:2211.17192](https://arxiv.org/abs/2211.17192)，ICML 2023 口头报告），DeepMind 的 Chen 等人叫它 speculative sampling（[arXiv:2302.01318](https://arxiv.org/abs/2302.01318)）。两篇论文的核心数学——接受概率 $`\min(1, p/q)`$ 加残差重采样——完全等价，是这个领域公认的"平行发明"案例。它们证明了同一件事：不管草稿猜得准不准，最终输出在统计上与纯目标模型采样是同一个分布，所以这类加速被称作**无损**（lossless）——只买时间，不买近似。vLLM 的 `RejectionSampler` 类文档直接引用了前一篇，本章后面推导的每一步都能在它那里找到出处。
+
 整章沿着真实源码走一条完整的数据流：proposer（`vllm/v1/spec_decode/`）产草稿，模型运行器（`vllm/v1/worker/gpu_model_runner.py`）摊平建 index，最后由采样器（`vllm/v1/sample/rejection_sampler.py`）逐位接受/拒绝。如下图：
 
 ![投机解码一轮的数据流](../diagrams/01-spec-decode-pipeline.png)
@@ -30,7 +32,7 @@
 
 为了能在本地把这条流水线亲手跑一遍、打断点看数值，本章配了一份**只做减法**的精简版：和真实 vLLM 同名、同结构、同控制流，只删掉与主线正交的分支（tree attention、M-RoPE 位置编码、多模态、cudagraph padding、合成基准模式、logprobs 装配）。纯 CPU 跑 numpy 的索引算术与 ngram，GPU 跑三个 Triton 内核。它是"跑起来看数值"的交叉验证物；正文主线仍是真实源码。
 
-> **v0.21.0 更新**：树形草稿这条路子本身，思路可以追溯到 SpecInfer（arXiv:2305.09781）——把草稿组织成一棵 token 树、用一次并行的树形注意力同时验证多条候选序列。本章把 tree attention 当作与主线正交、可整条删掉的草稿路径——v0.21.0 把这件事变成了官方动向。该版本在主线**彻底移除**了树形草稿路径：`SpecDecodeBaseProposer.propose_tree` 及其 `tree_choices` / `cu_drafts_per_level` 预计算、以及 `propose` 里对 `TreeAttentionMetadata` 的分发分支全部删除（`vllm/v1/spec_decode/llm_base_proposer.py`）。于是 `propose` 退化为**纯链式（chain）草稿**——正是下文要讲的那条自回归循环。本书"减去 tree attention"从此与上游一致，不再是"真实存在但被我们删掉"的取舍。同版本还把多模态从"硬报错"放宽为"告警后降级"：原先草稿路径遇到多模态输入会直接抛 `NotImplementedError`，v0.21.0 改为打印告警并**降级为纯文本投机解码**继续运行（`_raise_if_multimodal` 改名为 `_warn_if_multimodal`），不再硬失败。
+> **v0.21.0 更新**：树形草稿这条路子本身，思路可以追溯到 SpecInfer（[arXiv:2305.09781](https://arxiv.org/abs/2305.09781)，ASPLOS'24）——与其赌一条草稿链，不如让草稿模型同时生成多条候选延续、组织成一棵 token 树，目标模型用一次特殊设计的注意力掩码（树形注意力）并行验证树上所有分支，取能匹配上的最长路径。论文把目标模型从"增量解码器"重新定位成"token 树验证器"，命中的期望 token 数比单链更高；代价是要维护树结构、每层候选数、以及专门的树形注意力掩码，比本章要讲的线性链复杂得多——这也是它后来被移除的实际背景之一。本章把 tree attention 当作与主线正交、可整条删掉的草稿路径——v0.21.0 把这件事变成了官方动向。该版本在主线**彻底移除**了树形草稿路径：`SpecDecodeBaseProposer.propose_tree` 及其 `tree_choices` / `cu_drafts_per_level` 预计算、以及 `propose` 里对 `TreeAttentionMetadata` 的分发分支全部删除（`vllm/v1/spec_decode/llm_base_proposer.py`）。于是 `propose` 退化为**纯链式（chain）草稿**——正是下文要讲的那条自回归循环。本书"减去 tree attention"从此与上游一致，不再是"真实存在但被我们删掉"的取舍。同版本还把多模态从"硬报错"放宽为"告警后降级"：原先草稿路径遇到多模态输入会直接抛 `NotImplementedError`，v0.21.0 改为打印告警并**降级为纯文本投机解码**继续运行（`_raise_if_multimodal` 改名为 `_warn_if_multimodal`），不再硬失败。
 
 ![本章地图：投机解码剖面——proposer→摊平 index→rejection sampling](../diagrams/chapter-map.png)
 
@@ -40,7 +42,7 @@
 
 ## 34.1 草稿从哪来：proposer 的统一契约
 
-投机解码的第一步是产草稿。vLLM 里有好几种 proposer——n-gram、EAGLE、EAGLE3、DFlash、还有 [第 29 章](../../ch29-model-architecture/narrative/chapter.md) 那个 DeepSeek-V4 的 MTP draft 头——但它们对外都遵守同一份契约：**吃当前上下文，吐每请求 k 个草稿 token**。本章不深挖各个 proposer 内部的模型结构（那是 ch28 的事），只看它们怎么把草稿交出来。
+投机解码的第一步是产草稿。vLLM 里有好几种 proposer——n-gram、EAGLE、EAGLE3、DFlash、还有 [第 29 章](../../ch29-model-architecture/narrative/chapter.md) 那个 DeepSeek-V4 的 MTP draft 头——但它们对外都遵守同一份契约：**吃当前上下文，吐每请求 k 个草稿 token**。本章不深挖各个 proposer 内部的模型结构，只看它们怎么把草稿交出来。
 
 我们从最简单的一种讲起，因为它根本不带神经网络。
 
@@ -48,7 +50,11 @@
 
 `NgramProposer`（`vllm/v1/spec_decode/ngram_proposer.py`）干的事像极了输入法的联想：看看当前序列的结尾这一小段，在前文里有没有出现过；如果出现过，就把它**上次出现时后面跟的那几个 token**直接抄过来当草稿。
 
-比如序列是 `... 我 爱 北 京 ... 我 爱`，结尾 `我 爱` 在前面出现过，后面跟着 `北`，那就猜下一个是 `北`。代码加速的部分（numba 多线程、JIT 预热）都是性能旁路，核心算法是一个 KMP 风格的最长匹配后缀搜索：
+比如序列是 `... 我 爱 北 京 ... 我 爱`，结尾 `我 爱` 在前面出现过，后面跟着 `北`，那就猜下一个是 `北`。
+
+这个招数在社区里俗称 **Prompt Lookup Decoding**（PLD，提示词查表解码），2023 年 11 月由 Apoorv Umang 提出并开源。它的核心洞察是：很多真实任务——摘要、检索增强问答、多轮对话、代码编辑——的输出会大段照抄或改写输入/前文，既然如此，与其训练一个草稿模型，不如直接做字符串匹配。因为简单到零训练、零额外模型，它很快被 Hugging Face Transformers 和 vLLM 都吸收进了主线；作者自报在摘要/文档问答类任务上平均 2.4 倍加速（原始动机与 benchmark 见[项目主页](https://github.com/apoorvumang/prompt-lookup-decoding)）。vLLM 的 `NgramProposer` 就是这一思路的工程实现，独特之处在实现手法：代码加速的部分（numba 多线程、JIT 预热）都是性能旁路，核心算法是一个 KMP 风格的最长匹配后缀搜索。
+
+先给 KMP 打个底。KMP（Knuth–Morris–Pratt）是计算机科学教材里字符串匹配的标准算法——Morris 构思、Knuth 独立发现，1970 年发技术报告、1977 年三人[联合发表](https://en.wikipedia.org/wiki/Knuth%E2%80%93Morris%E2%80%93Pratt_algorithm)。它的核心预处理产物就是下面代码里的 `lps` 数组（最长公共前后缀，也叫前缀函数/失配函数）：`lps[i]` = 前 `i+1` 个字符里"最长的、既是真前缀又是后缀"的子串长度——比如 `abcabcd` 的 lps 是 `[0, 0, 0, 1, 2, 3, 0]`（到 `abcabc` 为止前后都有 `abc`，重合长 3；加上 `d` 后归零）。有了它，失配时不用把指针退回开头重比，按 lps 直接跳到"次优候选"继续，匹配复杂度从 $`O(nm)`$ 降到 $`O(n+m)`$ 。直接读代码：
 
 ```python
 # vllm/v1/spec_decode/ngram_proposer.py:L199
@@ -178,6 +184,17 @@ return draft_token_ids
 > **proposer 契约**：吃当前上下文（n-gram 吃 token 历史，模型类吃目标 hidden states），吐每请求 0 到 k 个草稿 token。模型类 proposer 还可以附带 `draft_probs`（草稿的概率分布）；n-gram 没有概率，`draft_probs` 是 `None`。
 
 这个"有没有 `draft_probs`"的区别，到了 rejection sampling 那里会分出两条路。先记住：**n-gram 无概率**。
+
+同一个 `propose` 契约背后，其实是几条互相竞争的"猜草稿"路线——它们的成本和命中率各不相同，值得摆在一处看清取舍：
+
+| 草稿器 | 草稿怎么来 | 独特之处 | 什么时候选它 |
+|---|---|---|---|
+| n-gram（PLD） | 纯字符串匹配，零神经网络 | 零训练、几乎零显存；无 `draft_probs` | 摘要/检索问答/代码编辑这类"输出大量复用输入"的任务；纯创作类任务命中率低、收益有限 |
+| EAGLE 系（EAGLE/2/3） | 小草稿头在特征（hidden state）层自回归 | 命中率高（EAGLE-2 加动态草稿树、EAGLE-3 融合多层特征）；要为目标模型额外训练/下载配套草稿头，且要跑 k−1 步串行循环 | 追求高命中率、愿意准备草稿头的通用场景 |
+| DFlash | 轻量块扩散（block diffusion）模型一次并行吐出全部 k 个 | 免自回归串行（走上面的早退路径）；作者自报比 EAGLE-3 快至 2.5 倍（项目口径） | 2026 年的新方法（ICML 2026），想砍掉串行草稿开销时优先试；生态与调优经验比 EAGLE 系年轻 |
+| MTP | 目标模型自带的多 token 预测头 | 草稿能力内置在目标模型的训练里，无需外挂草稿模型 | 目标模型本身按 MTP 目标训练时（DeepSeek-V3/V4、Gemma4）部署最省事；模型没这能力就用不了 |
+
+想深挖各家的模型结构与 benchmark：[Prompt Lookup Decoding](https://github.com/apoorvumang/prompt-lookup-decoding)、[EAGLE](https://github.com/SafeAILab/EAGLE)、[DFlash](https://github.com/z-lab/dflash)。本章接下来对它们一视同仁——rejection sampling 和 index 摊平吃的只是"每请求 0 到 k 个草稿 token，可选带概率"。
 
 > **v0.21.0 更新**：proposer 家族在 v0.21.0 新添一名成员——Gemma4 的 MTP draft 头，通过 `Gemma4Proposer`（`vllm/v1/spec_decode/gemma4.py`，继承 `SpecDecodeBaseProposer`）接入**同一个** `propose` 入口，对外契约不变。它的特殊性恰好反衬出上面那条链式循环的默认假设：草稿模型与目标模型**跨模型共享 KV cache**，每一步草稿都从目标序列的同一个最后位置预测，于是基类新增 `constant_draft_positions` 字段（默认 `False`，Gemma4 置 `True`）。开启后，链式循环里那套"position +1、seq_lens +1、每步重建 metadata"的逐步推进被关掉：位置缓冲整轮恒定，`common_attn_metadata` 一次构建、整轮复用（守卫即 `propose` 中的 `if not self.constant_draft_positions or token_index == 0`）。换句话说，EAGLE 链式草稿的循环不变量是"位置逐拍 +1、metadata 每拍重建"，而 Gemma4 MTP 把这两个量都钉成常量——同一份 `propose` 骨架，靠一个布尔开关同时容纳了"位置递进"和"位置恒定"两种草稿语义。
 
@@ -667,7 +684,9 @@ def sample_recovered_tokens_kernel(
 
 `prob = tl.maximum(target_prob - draft_prob, 0.0)` 正是残差的分子 $`(p-q)_+`$ 。但注意：代码**没有**除以 $`\sum_y (p-q)_+`$ 来归一化，而是直接 `score = prob * inv_q`，再取 `argmax`。
 
-这用的是 **Gumbel-max 技巧**的一个等价形式。`inv_q` 是 $`1/q'`$ ，其中 $`q'`$ 取自指数分布 $`\mathrm{Exp}(1)`$ 。直觉：指数分布的 CDF 是 $`1 - e^{-\lambda t}`$ ，当用权重 $`w`$ 缩放参数时，两个 token 中权重更大的那个"等待时间更短"，赢得 argmax 的概率正比于其权重——本质是对指数随机变量取 argmax 就等价于按权重比例抽签。可以证明，对未归一化的权重 `prob`：
+这用的是机器学习里常说的 **Gumbel-max 技巧**的一个等价形式。先看它的标准形式：设候选的非负权重为 $`\pi_1, \dots, \pi_n`$ （不必预先归一化成概率），给每个候选的对数权重加一份独立的 Gumbel(0,1) 噪声 $`g_i`$ ，那么 $`\arg\max_i\,(g_i + \log \pi_i)`$ 取到 $`j`$ 的概率恰好是 $`\pi_j / \sum_i \pi_i`$ ——"按权重采样"被"加噪声比大小"替代了，而比大小（归约求 max）正是 GPU 最擅长的操作。这个结果的数学根源可以追到 Gumbel 1954 年关于极值分布的经典工作，但"Gumbel-max trick"这个叫法与它在机器学习里的流行，是深度学习需要可微采样/重参数化之后的事，常被归入 reparameterization trick 的特例（严格证明见 [Gumbel 分布](https://en.wikipedia.org/wiki/Gumbel_distribution)词条）。
+
+vLLM 代码用的是同一件事在权重采样文献里更常见的写法：`inv_q` 是 $`1/q'`$ ，其中 $`q'`$ 取自指数分布 $`\mathrm{Exp}(1)`$ 。两种写法在数学上等价——若 $`E \sim \mathrm{Exp}(1)`$ ，则 $`-\log E`$ 恰好服从 Gumbel(0,1)，于是"权重除以指数噪声再取 argmax"与"对数权重加 Gumbel 噪声再取 argmax"只是把 $`\log`$ 提进提出的两种记法。直觉：指数分布的 CDF 是 $`1 - e^{-\lambda t}`$ ，当用权重 $`w`$ 缩放参数时，两个 token 中权重更大的那个"等待时间更短"，赢得 argmax 的概率正比于其权重——本质是一场"指数竞速"，对指数随机变量取 argmax 就等价于按权重比例抽签。可以证明，对未归一化的权重 `prob`：
 
 ```math
 \arg\max_x\ \bigl(\mathrm{prob}(x) \cdot \mathrm{inv\_q}(x)\bigr)\ \sim\ \frac{\mathrm{prob}(x)}{\sum_y \mathrm{prob}(y)}

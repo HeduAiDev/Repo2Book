@@ -42,6 +42,8 @@
 
 关键认知有两层。第一层：vLLM 不为 TP、PP、DP 各写一套通信代码——它写**一个** `GroupCoordinator`，每个维度实例化一份。第二层：每个实例内部**同时**握着两个进程组，按数据类型分流——元数据和对象走 CPU 群组（gloo），张量集合走 device 群组（NCCL）。
 
+顺手把 gloo 交代清楚，它在本章会反复出现。Gloo 是 Meta 开源的集合通信库，`torch.distributed` 的三个内置后端之一（`nccl`/`gloo`/`mpi`，MPI 即 HPC 界通用的标准消息传递接口）。它的特点是不挑硬件：不需要 InfiniBand、NVLink 这类专用高速互联，普通以太网、共享内存就能跑，CPU 张量上的集合操作是它的主场；代价是 GPU 大张量的吞吐远不如专为 NVIDIA GPU 拓扑深度优化的 NCCL。于是业界形成了本章将看到的分工惯例：大张量通信交给 NCCL，「控制面」——传元数据、做同步点——交给 gloo。想深入其内部实现，入口在 [Gloo 仓库](https://github.com/facebookincubator/gloo)与 [PyTorch 分布式后端文档](https://docs.pytorch.org/docs/stable/distributed.html#backends)。
+
 来看构造函数，这是整章的地基：
 
 ```python
@@ -160,7 +162,7 @@ class GroupCoordinator:
 
 两个细节这张表才看得清，光记形状记不住：all_gather **按 rank 序拼接**（不是任意序），rank0 的段在前；reduce_scatter 是**先全和再切**，每个 rank 留的是「全和的自己那一段」而非「自己原值的一段」。reduce_scatter 接一个 all_gather，正好把 `[4]`/`[6]` 拼回 `[4, 6]`——这就是下面要说的「all_reduce = reduce_scatter + all_gather」在数值上的样子。
 
-通信量上，按 ring 算法（把张量切成 $`p`$ 等份、沿一个首尾相接的环形拓扑传 $`p-1`$ 轮，每轮每张卡只收发 $`1/p`$ 的数据量）计，设字节宽为 $`b`$ ，每张卡收发的字节数是：
+通信量上这三个原语各花多少钱？算这笔账的依据是经典的 **ring（环形）算法**。它不是 NCCL 的发明——环形规约本是高性能计算（HPC）集群做全局归约的老手艺，2017 年前后百度硅谷 AI 实验室的技术博客把它引入深度学习的多卡梯度同步，随后经 Uber 开源的分布式训练框架 Horovod 推广开来，如今是 NCCL 的默认算法之一（通俗图解至今首推那篇[百度博客](https://andrew.gibiansky.com/blog/machine-learning/baidu-allreduce/)）。思路：把 $`p`$ 张卡连成首尾相接的环，每张卡只和左右邻居通信，张量切成 $`p`$ 等份。all_reduce 分两阶段、各跑 $`p-1`$ 轮——第一阶段每轮把手里一份传给下家、同时收上家一份**累加**，跑完后每张卡恰好攒出「全局和的某一段」，这正是一次 reduce_scatter；第二阶段把这些算好的段沿环继续传，跑完人人集齐完整全和，这正是一次 all_gather。妙处在于每轮每卡只收发 $`1/p`$ 的数据量，没有任何一张卡成为流量汇聚点（对比「中心卡收集再分发」的朴素做法——中心卡要独自扛 $`p-1`$ 路流量，带宽必然被打爆），因此在纯带宽意义上它已被证明最优。设字节宽为 $`b`$ ，每张卡收发的字节数是：
 
 ```math
 \mathrm{all\_reduce} = \frac{2(p-1)}{p}\,Nb,
@@ -175,7 +177,7 @@ class GroupCoordinator:
 = \frac{p-1}{p}Nb + \frac{p-1}{p}Nb = \frac{2(p-1)}{p}Nb
 ```
 
-一个 all_reduce 的纯通信量，等于一个 reduce_scatter 接一个 all_gather（实测延迟上还差两次 kernel 的启动开销，纯字节数上则相等）。这个等式是序列并行（sequence parallel，把激活张量沿序列/token 维度切开、各卡只算自己那一段）的本钱——把一次 all_reduce 拆成「先 reduce_scatter、各算各的、再 all_gather」，能在不同位置摊销通信、还顺手把激活切小。本章不展开序列并行的完整机制，但记住这笔账：拆开不亏通信量。
+这个等式不是数字巧合——上面 ring all_reduce 的两阶段本身就是 reduce_scatter 接 all_gather，等式只是把算法结构念了出来。一个 all_reduce 的纯通信量，等于一个 reduce_scatter 接一个 all_gather（实测延迟上还差两次 kernel 的启动开销，纯字节数上则相等）。这个等式是序列并行（sequence parallel，把激活张量沿序列/token 维度切开、各卡只算自己那一段）的本钱——把一次 all_reduce 拆成「先 reduce_scatter、各算各的、再 all_gather」，能在不同位置摊销通信、还顺手把激活切小。本章不展开序列并行的完整机制，但记住这笔账：拆开不亏通信量。
 
 现在看 `all_reduce` 的代码。它的 docstring 道破了一个看似多此一举的迂回：
 
@@ -308,7 +310,13 @@ CUDA 平台上，`CudaCommunicator` 会覆写这几个方法，语义一致，�
         out = pynccl_comm.all_reduce(input_)
 ```
 
-这是一条**优先级回退链**：NCCL symmetric-mem → quick reduce（ROCm）→ flashinfer → `CustomAllreduce`（vLLM 自研的低延迟小张量 all-reduce）→ symm-mem → pynccl → 兜底 `torch.distributed`。对称内存（symmetric memory）：让参与通信的多张卡把各自显存映射进同一段虚拟地址空间，规约时可以直接互相读写，省掉一次「先拷进通信缓冲区」的开销，因此延迟更低。（注意链首的 `symmetric-mem` 和靠后的 `symm-mem` 是两个不同分支：前者是 NCCL 自带的对称内存 all-reduce，后者是 vLLM 自己实现的 `symm_mem` 路径，语义相近但走不同代码路径，别看混。）挑哪个，取决于张量大小、平台、各后端是否可用，而且**对调用方完全透明**。
+这是一条**优先级回退链**：NCCL symmetric-mem → quick reduce（ROCm）→ flashinfer → `CustomAllreduce`（vLLM 自研的低延迟小张量 all-reduce）→ symm-mem → pynccl → 兜底 `torch.distributed`。挑哪个，取决于张量大小、平台、各后端是否可用，而且**对调用方完全透明**。
+
+链里两个名字来自 vLLM 之外，各交代几句，免得读源码时卡住。
+
+先说 flashinfer。它不是 vLLM 自己的东西，而是一个独立的 LLM 推理核函数库：起源于华盛顿大学、CMU 等团队的协作研究项目，给 attention/GEMM/MoE 等常见推理算子提供统一 API、底层可切换多种具体实现，如今被 vLLM、SGLang（另一个主流开源 LLM 推理引擎）等都当作可选加速后端集成——这里出现的只是它顺带提供的 all-reduce 实现，主页在 [flashinfer-ai/flashinfer](https://github.com/flashinfer-ai/flashinfer)，本章主线不展开。
+
+再说**对称内存**（symmetric memory）——链里跟它有关的分支有两个，名字还极像。思路本身不难：每个 rank 预先分配一块等大的显存缓冲区，做一次「握手」（rendezvous）把彼此的缓冲区地址映射进自己的虚拟地址空间，之后规约可以直接读写对方显存——省掉传统路径里「先拷进通信库内部缓冲区再发送」那一步，对延迟敏感的小张量收益明显。有意思的是，这个思路目前有**两条独立实现**，出自两个团队、两套代码栈，vLLM 两条都接了：链首的 `symmetric-mem`（`should_nccl_symm_mem_allreduce` 把关的那个分支）走 **NCCL 原生**路径——NVIDIA 在 NCCL 库内部实现的用户缓冲区注册/对称窗口机制（[NCCL 官方文档](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html)）；靠后的 `symm_mem` 分支走 **PyTorch 自研**路径——PyTorch 团队完全绕开 NCCL、自己实现的 `torch.distributed._symmetric_memory` 模块（提供对称缓冲区的分配与 rendezvous 握手原语，通信逻辑可以直接用 CUDA/Triton kernel 写，[PyTorch 官方文档](https://docs.pytorch.org/docs/main/symmetric_memory.html)），vLLM 的 `SymmMemCommunicator` 只是对它的薄封装。两个名字读起来几乎一样，底下却是完全不同的两套实现——读这段源码最容易看混的就是这里。
 
 对本章读者，结论很干脆：`GroupCoordinator` 之下，`device_communicator` 才是真正挑选具体内核的地方。这个分层的好处是——新平台只要提供一个自己的 `DeviceCommunicatorBase` 子类，`GroupCoordinator` 和模型代码**零改动**。
 
@@ -325,6 +333,8 @@ CUDA 平台上，`CudaCommunicator` 会覆写这几个方法，语义一致，�
 `torch.compile` 的前端 Dynamo，是逐条追踪 Python 字节码来构图的。它一旦遇到**无法符号化的对象**或**带副作用的操作**，就只能「break」——把图断成多段，段与段之间回落到 eager 模式逐行跑。每一次 graph break，都丢掉了跨这个点做算子融合的机会。
 
 `torch.distributed.all_reduce` 恰好两条都犯：它有副作用（原地改张量、触发跨进程通信），还依赖一个 Dynamo 没法追踪的 `ProcessGroup` 对象。直接把它写进模型 forward，编译图就会在这里断开。
+
+顺带说明：graph break 不是 vLLM 的自造词，而是 PyTorch 官方文档里的正式术语，也是整个 `torch.compile` 生态公认的性能痛点——官方甚至提供了 `torch._dynamo.explain`（一个列出代码里每处 graph break 及其原因的诊断工具）专门帮开发者定位它，集合通信正是被点名的典型触发源之一；系统性梳理见 [PyTorch 官方的 graph break 索引](https://docs.pytorch.org/docs/stable/compile/programming_model.graph_breaks_index.html)。而 graph break 之所以存在，本身是 Dynamo 刻意保留的「安全阀」：与其让追不动的代码直接编译失败，不如断图退回 eager、之后接着追新图——`torch.compile` 靠它才能渐进式兼容任意 Python 代码，代价则由想吃满编译收益的开发者来付。vLLM 接下来做的，就是把这笔代价付掉。
 
 ### custom-op 三件套怎么修复
 
@@ -394,6 +404,8 @@ direct_register_custom_op(
 ```
 
 注册之后，这三个算子以 `torch.ops.vllm.all_reduce` 等形式存在。Dynamo 把它们当作**有确定形状语义的不透明节点**——编译期靠 fake 推断输出 shape、不真通信；运行期才执行真函数、查回 group、做真通信。图不被打断。
+
+把机制放回生态里看：这套「真实实现 + fake 实现」的配对也不是 vLLM 的独创，而是 PyTorch 官方为 `torch.compile` 生态定下的标准解法——`torch.library.custom_op` 装饰器定义自定义算子、`register_fake` 给它配 fake kernel（官方术语，也叫 meta kernel，因为它在只记录形状/dtype、不分配实际存储的 meta 设备上构造假输出；本章说的「fake（meta）实现」就是它），从此开发者不必碰 C++ 就能把任意有副作用、追不动的 Python 逻辑包成编译图认识的节点。vLLM 的 `direct_register_custom_op` 是对这套官方 API 的自家封装。想跳出 vLLM 看通用机制的最小示例，官方教程 [Custom Python Operators](https://docs.pytorch.org/tutorials/advanced/python_custom_ops.html) 用一个「图片裁剪」算子演示了一模一样的配对。
 
 还差最后一块拼图：custom op 不许原地改、也不许在同一个 op 里返回新张量——这正是 docstring 里第二段说的约束。但这条约束不是靠「把 [§20.2](#202-三大集合原语与后端选择的下沉) 里所有路径都改成 out-of-place」满足的：`base_device_communicator` 那份默认实现依然是原地的，它只在 `use_custom_op_call=False` 的平台上跑，压根不会被装进 custom op 里。真正对这条约束负责的，是 `use_custom_op_call=True` 的平台各自的 `device_communicator`——CUDA 路径在 `pynccl_comm` 缺位时显式 `out = input_.clone()` 再对 `out` 做 all-reduce；`custom_all_reduce`/`pynccl_comm.all_reduce` 则各自在内部 `torch.empty_like` 出新的输出缓冲区，都不碰输入张量。`_all_reduce_out_place` 这个名字标的是调用它的那几条 `GroupCoordinator` 分支，不是承诺「底下的每份实现都是 out-of-place」。
 

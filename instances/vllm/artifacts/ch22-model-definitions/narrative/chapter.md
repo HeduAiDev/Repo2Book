@@ -289,6 +289,8 @@ assert torch.equal(layer.weight.data, full[:, 4:8])
 
 严格说，这里指的是单次 `all_reduce` 需要交换的张量大小不随卡数变；ring 实现的跳数会随卡数缓增，但相对每卡省下的算力，通信占比仍随扩展下降。
 
+顺带交代这套模式的出身：「列并行接行并行、末尾一次 `all_reduce`」不是 vLLM 的发明，而是 NVIDIA 2019 年 Megatron-LM 论文（[arXiv:1909.08053](https://arxiv.org/abs/1909.08053)）提出的经典模板。当年的痛点是单层参数已经大到一张卡放不下，数据并行（整个模型复制、切 batch）帮不上忙，必须把「一层内部」的矩阵乘也切开；Megatron 的贡献在于找到了一种几乎不改上层代码的切法——只在每个 attention/MLP 子块末尾插一次 all-reduce，其余全是本地计算。`ColumnParallelLinear`/`RowParallelLinear` 这对类名与切分语义就直接沿用自那篇论文（及其[官方实现](https://github.com/NVIDIA/Megatron-LM)），后来 DeepSpeed、TensorRT-LLM 等框架的张量并行也都长这个样子——vLLM 只是把这套训练界的事实模板搬进了推理。
+
 ---
 
 ## 22.4 QKV fuse：把三次小 GEMM 合成一次
@@ -360,7 +362,11 @@ self.output_sizes = [
 
 ### GQA：KV 头比卡少时，复制而非切分
 
-`num_kv_head_replicas` 是这一节的主角。现代 Llama 用 GQA：query 头多（比如 32 个），KV 头少（比如 8 个），多个 query 头共享一组 K/V。问题来了——KV 头数（8）可能**小于** TP size（比如 16 卡）。8 个头切不进 16 张卡。
+`num_kv_head_replicas` 是这一节的主角。现代 Llama 用 GQA：query 头多（比如 32 个），KV 头少（比如 8 个），多个 query 头共享一组 K/V。
+
+先把 GQA 本身讲清楚——它是模型架构层面的既定设计，vLLM 只是要适配它。标准多头注意力（MHA，Multi-Head Attention）里 query 头和 KV 头数量相等、一一配对；自回归解码每生成一个 token 都要把**全部** KV cache 从显存搬进计算单元，头越多、缓存越大、带宽压力越大。Shazeer 2019 年提出的 MQA（Multi-Query Attention，[arXiv:1911.02150](https://arxiv.org/abs/1911.02150)）走到另一个极端：所有 query 头共用同一份 K/V，KV cache 缩到原来的「1/头数」，但业界发现质量损失偏大、训练也不稳。2023 年的 GQA 论文（Ainslie et al.，[arXiv:2305.13245](https://arxiv.org/abs/2305.13245)）取中间值：把 query 头分成若干组、组内共享一份 K/V，质量接近 MHA、KV cache 按组数（而非头数）增长，还给出了用约 5% 原始预训练算力把训练好的 MHA checkpoint「升训」（uptrain）成 GQA 的低成本路线。Llama 2/3、Mistral 随即采用，「KV 头数远小于 query 头数」从此成为开源模型的常态。
+
+于是问题来了——KV 头数（8）可能**小于** TP size（比如 16 卡）。8 个头切不进 16 张卡。
 
 vLLM 的应对：**复制**。为什么不是"把一个 KV 头的 `head_size` 维再切小"？因为 attention 是 q 与完整 K 做点积——如果某张卡只持有 K 的一半维度，点积结果就是无意义的残缺向量，无法与其他卡的结果简单 concat 还原。KV 头必须保持完整，超配的卡只能拿一份完整副本。
 
@@ -460,7 +466,23 @@ def load_weights(self, weights):
     return loaded_params
 ```
 
-这段的骨架是 Python 的 **for/else**——一个容易看漏的语法：
+这段的骨架是 Python 的 **for/else**——一个容易看漏的语法。`else` 挂在 `for` 上，**不是**「循环体一次都没跑才执行」（这是最常见的误读），而是「可迭代对象被完全耗尽、循环没被 `break` 中途打断」才执行；一旦 `break`，`else` 整块跳过（[Python 语言参考 §8.3](https://docs.python.org/3/reference/compound_stmts.html#the-for-statement)）。一个最小示例：
+
+```python
+# 说明性示例（非 vLLM 源码）：for/else 的两种走向
+for i in range(3):
+    if i == 1:
+        break          # 中途跳出 → else 被跳过
+else:
+    print("不会执行")
+
+for i in range(3):
+    pass               # 循环正常耗尽 → else 执行
+else:
+    print("会执行")
+```
+
+所以它天然适合表达「在一堆候选里找，找到就处理并跳出，遍历完都没找到就走兜底」。对应到这段装载代码：
 
 - **for 命中**：checkpoint 名里含 `.q_proj`，就把它 `.replace(".q_proj", ".qkv_proj")`，拿到 fused 参数，带着 `shard_id="q"` 调它的 `weight_loader`，然后 `break`。k/v、gate/up 同理。
 - **for 走完没 break（else）**：这个权重不属于任何 fused 层——embedding、norm、lm_head 这些。走 `default_weight_loader` 直接装。
@@ -614,7 +636,9 @@ def forward(
     return output
 ```
 
-五行：列并行出 fused qkv → split 成 q/k/v → 旋转位置编码（RoPE：按 token 的绝对位置对 q/k 做一次确定性旋转，使两者点积只依赖相对位置差；细节见[第 29 章「解耦 RoPE」](../../ch29-model-architecture/narrative/chapter.md)）→ `self.attn(q, k, v)` → 行并行 + all_reduce。整个注意力的**复杂度**——选哪个后端（FlashAttention？Triton？）、KV cache 怎么读写、要不要量化——全被那一行 `self.attn(q, k, v)` 吞掉了。
+五行：列并行出 fused qkv → split 成 q/k/v → 旋转位置编码（RoPE：按 token 的绝对位置对 q/k 做一次确定性旋转，使两者点积只依赖相对位置差——下一段细说）→ `self.attn(q, k, v)` → 行并行 + all_reduce。整个注意力的**复杂度**——选哪个后端（FlashAttention？Triton？）、KV cache 怎么读写、要不要量化——全被那一行 `self.attn(q, k, v)` 吞掉了。
+
+那步旋转值得多说两句来历。点积注意力本身对 token 顺序不敏感——把输入打乱，注意力分数只是跟着换位置——所以位置信息必须显式注入。原始 Transformer 的做法是把正弦位置编码**加**在 embedding 上，T5 一派改用可学习的相对位置偏置；RoPE（RoFormer 论文，[arXiv:2104.09864](https://arxiv.org/abs/2104.09864)）走了第三条路：不加任何东西，而是把 q/k 向量视为若干二维子空间，按 token 的绝对位置各转一个角度——旋转后的 q、k 做点积，位置信息会自动以「两个 token 的位置差」的形式出现在结果里。不增参数、对长序列外推友好，Llama、GPT-NeoX、PaLM 都用它，如今是开源 LLM 的事实标准。旋转矩阵的数学细节留给[第 29 章「解耦 RoPE」](../../ch29-model-architecture/narrative/chapter.md)。
 
 `self.attn` 是 `Attention` 实例。看它的类 docstring（`vllm/model_executor/layers/attention/attention.py:L177`），职责写得明明白白：
 
@@ -713,6 +737,8 @@ assert out2.shape == (seq, cfg.hidden_size)
 ```
 
 整个 `LlamaModel.forward` 就是把这套重复 N 遍（`vllm/model_executor/models/llama.py:L395`）：embedding → 逐层 decoder（`positions, hidden, residual` 三件套穿针）→ 末尾 RMSNorm。MLP 那边 `gate_up_proj`（列并行）→ `SiluAndMul` 门控（SiLU 激活门控：gate 分支过 SiLU 后与 up 分支逐元素相乘，即 SwiGLU 的实现）→ `down_proj`（行并行 + all_reduce），结构和 attention 子块同构，又是一对列并行接行并行。
+
+SwiGLU 也交代一句出身。原始 Transformer 的 FFN 是「两层线性夹一个 ReLU」的朴素结构；GLU（Gated Linear Unit，门控线性单元）的思路是把输入投影成两份——一份过激活函数当「门」、一份原样当「值」，逐元素相乘后再降维输出。Shazeer 2020 年系统比较了各种门控激活在 transformer FFN 里的效果（[arXiv:2002.05202](https://arxiv.org/abs/2002.05202)），门控用 SiLU 的 SwiGLU（和用 GELU 的 GEGLU）效果居前，随后被 PaLM、Llama 系列采用，几乎取代朴素 FFN 成为开源 LLM 的标配——这也是 vLLM 为它专门备好 fused `SiluAndMul` 算子、并把 gate/up 两个投影合进一个 `MergedColumnParallelLinear` 的原因。
 
 ---
 

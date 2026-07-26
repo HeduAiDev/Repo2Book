@@ -94,13 +94,20 @@ def get_class(vllm_config: VllmConfig) -> type["Executor"]:
 
 读这段，要看清两件事。
 
-**第一，分发的「键」只是个字符串**：`parallel_config.distributed_executor_backend`。它在 [第 3 章](../../ch03-config-and-wiring/narrative/chapter.md) 的配置组装期就定好了——单卡默认 `"uni"`，多卡默认 `"mp"`，要用 ray 集群才是 `"ray"`。把「单卡 / 多进程 / Ray / 外部启动器」这四种截然不同的进程编排，全收敛到这**一个分发点**。引擎别处不需要知道这件事。
+**第一，分发的「键」只是个字符串**：`parallel_config.distributed_executor_backend`。它在 [第 3 章](../../ch03-config-and-wiring/narrative/chapter.md) 的配置组装期就定好了——单卡默认 `"uni"`；多卡时，只要 `tp×pp` 不超过单机 GPU 数就默认 `"mp"`（能单机解决就不动用集群），超出单机才轮到 `"ray"`。把「单卡 / 多进程 / Ray / 外部启动器」这四种截然不同的进程编排，全收敛到这**一个分发点**。引擎别处不需要知道这件事。
 
 **第二，它留了扩展口**。注意第一个分支 `isinstance(..., type)` 和最后一个 `isinstance(..., str)`：你可以直接把一个自定义 `Executor` 子类传进来，或者传一个它的全限定名字符串（qualname，像 `"my_pkg.MyExecutor"`），工厂用 `resolve_obj_by_qualname` 把字符串解析成类。RLHF（人类反馈强化学习训练循环，训练侧要把新权重同步进推理 worker）训练框架、外部调度系统接管 vLLM 时，靠的就是这个口子。
 
 > 注意：`get_class` 只**返回类**，不实例化。实例化是下一步引擎自己做的事。把「挑哪个类」和「造它」分开，让工厂保持无副作用——一个纯函数，给配置还类。
 
-本章聚焦 `uni` 和 `mp` 两条主路；ray 自成一套编排（独立话题），external_launcher 是 torchrun 多引擎场景，都点到为止。
+四个内置后端对应四种截然不同的部署形态，但对上层引擎全都表现成同一个 `collective_rpc` 接口。值得花一分钟认清各自的位置，知道什么时候选谁：
+
+- **`uni`（UniProcExecutor）**：单进程，没有子进程、没有网络，worker 就是引擎进程里的一个普通对象。单卡推理和本地调试用它——[§17.4](#174-最简对照uniprocexecutor) 的「最简对照」就是它。
+- **`mp`（MultiprocExecutor）**：本章主角。一个执行器进程 spawn 出 N 个 worker 子进程，靠共享内存队列广播 RPC。单机多卡的默认选择。
+- **`ray`**：借助通用分布式计算框架 [Ray](https://docs.ray.io/en/latest/ray-core/walkthrough.html) 做跨机编排。Ray 的核心抽象是 actor——「有状态的远程对象」，定义方式就是给普通 Python 类加个装饰器，实例可以落在集群任何一台机器上、靠异步消息交互——天然适合托管「一个 worker 长期持有一份模型权重」这种带状态的角色。要跨多台机器部署、或想借 Ray 生态的弹性调度与容错时选它。值得一提：vLLM 社区 2025 年有 [RFC](https://github.com/vllm-project/vllm/issues/35848) 提议把 Ray 后端简化成只管「进程拉起 + 放置」，控制平面与数据平面和 mp 保持一致——换句话说，把本章的 mp 读透，ray 的核心也就懂了大半。
+- **`external_launcher`（ExecutorWithExternalLauncher）**：反过来，进程压根不由 vLLM 拉起——假定外部启动器（典型是 PyTorch 自带的多进程启动器 `torchrun`）已经把 `RANK` / `WORLD_SIZE` / `MASTER_ADDR`（进程序号 / 总进程数 / 会合地址）这些环境变量建好，vLLM 在每个进程里只起「自己那一个」worker；多个引擎实例各自独立跑同一批 prompt，靠调度确定性保证输出一致。这是社区应 RLHF 需求专门开的口子——[引入它的 PR](https://github.com/vllm-project/vllm/pull/12071) 写得很直白：训练进程和推理进程要共存（co-locate）于同一套 torchrun 编排。
+
+部署侧怎么选的更多细节见[官方并行扩展文档](https://docs.vllm.ai/en/stable/serving/parallelism_scaling/)。本章聚焦 `uni` 和 `mp` 两条主路，ray 与 external_launcher 点到为止。
 
 ---
 
@@ -230,7 +237,7 @@ def collective_rpc(
     return future
 ```
 
-没有广播，没有队列。`run_method(self.driver_worker, method, ...)` 就地把方法调了——`run_method` 内部按 `method` 的类型派发：字符串就 `getattr`、bytes 就 `cloudpickle.loads`、callable 就直接调。结果包成 `[result]` 返回（契约要求返回 list）。
+没有广播，没有队列。`run_method(self.driver_worker, method, ...)` 就地把方法调了——`run_method` 内部按 `method` 的类型派发：字符串就 `getattr`、bytes 就 `cloudpickle.loads`（cloudpickle：比标准库 pickle 更能装的序列化库，lambda、闭包都能序列化——为什么必须是它，[§17.6](#176-collective_rpc-的-mp-实现广播一次按需收回) 讲）、callable 就直接调。结果包成 `[result]` 返回（契约要求返回 list）。
 
 `non_block=True` 时也没真正「异步」：它**同步算完**，把结果塞进一个**已完成**的 `Future` 再返回。所以单卡下 `non_block` 是个空架子——但它让接口和 mp 版**对齐**：调用方拿到的都是 Future，不必区分后端。
 
@@ -304,9 +311,9 @@ finally:
 
 几个要点。
 
-**`world_size` 个 worker，每个一张卡。** `world_size = tensor_parallel × pipeline_parallel × prefill_context_parallel`（prefill context parallel，简称 pcp：按 prefill 阶段的上下文/序列维度切分，算法本身留待专门章节，这里只需知道它是 world_size 的第三个乘法因子，默认 `pcp_size=1`），构造一开始就 `assert` 过这个等式。单节点起 `local_world_size` 个子进程，循环里一个 `local_rank` 一个，各调 `make_worker_process` 拉起来。
+**`world_size` 个 worker，每个一张卡。** `world_size = tensor_parallel × pipeline_parallel × prefill_context_parallel`（prefill context parallel，简称 pcp：把长 prompt 的 prefill 计算按**序列长度**切开分给多张卡，缩短长上下文的首 token 延迟），构造一开始就 `assert` 过这个等式。pcp 值得一句身世交代：「把序列长度当作与张量/流水线正交的又一根可切分的轴」这一思路，在 ML 系统文献里归入 context parallelism / sequence parallelism 家族（Ring Attention、DeepSpeed Ulysses 是这个方向的知名代表）；vLLM 的这份实现是 2025 年 9 月才提出、仍在推进中的 [RFC](https://github.com/vllm-project/vllm/issues/25749)——**前沿在建** 而非成熟定局，本章只把它当 world_size 算式里的第三个乘法因子对待，默认 `pcp_size=1`。单节点起 `local_world_size` 个子进程，循环里一个 `local_rank` 一个，各调 `make_worker_process` 拉起来。
 
-**先全部拉起，再等就绪。** 注意那条注释——「Workers must be created before wait_for_ready to avoid deadlock」。为什么不能起一个等一个？因为 worker 的 `init_device()` 里有**设备同步**（NCCL——GPU 间做集合通信如 all-reduce 的库——建组握手要求所有参与 rank 同时到场）。要是父进程起完 rank 0 就阻塞等它 READY，rank 0 卡在设备同步上等 rank 1……而 rank 1 还没被起，死锁。所以必须**先把 N 个全 spawn 出去**，让它们彼此能在 init_device 里会合，父进程再统一 `wait_for_ready`。
+**先全部拉起，再等就绪。** 注意那条注释——「Workers must be created before wait_for_ready to avoid deadlock」。为什么不能起一个等一个？因为 worker 的 `init_device()` 里有**设备同步**：建立 NCCL 通信组时，所有参与 rank 必须**同时到场**握手。NCCL（NVIDIA Collective Communications Library，读作「nickel」）是 NVIDIA 出品的多 GPU 通信库，是 all-reduce、broadcast 这类「集合通信」原语的事实标准——PyTorch 的 `nccl` 分布式后端、张量并行层末把分片汇总回完整结果的 all-reduce，底层都是它；它对 NVLink（GPU 间直连的高速互联）、PCIe 的拓扑有感知，自动挑通信算法把带宽用满，细节可看[官方文档](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/overview.html)。对本节要紧的只有「建组须全员到场」这一条：要是父进程起完 rank 0 就阻塞等它 READY，rank 0 卡在设备同步上等 rank 1……而 rank 1 还没被起，死锁。所以必须**先把 N 个全 spawn 出去**，让它们彼此能在 init_device 里会合，父进程再统一 `wait_for_ready`。
 
 **广播队列只建一份。** `rpc_broadcast_mq` 是**一条**共享内存 `MessageQueue`，`export_handle()` 导出它的句柄，作为参数发给每个子进程——这样所有 worker 都连到**同一条**广播队列。这是「一次 enqueue、N 个 reader 都看到」的物理基础。
 
@@ -385,7 +392,22 @@ def collective_rpc(
 
 **发，只发一次。** 不管有几个 worker，就一句 `self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))`。一个四元组进广播队列，所有 worker 各读一份。这就是「下行一对多」的全部代码。
 
-注意 `send_method` 的两种形态。`method` 是字符串就原样发；是 callable 就 `cloudpickle.dumps` **把整个函数序列化**发出去。后者是个强能力：你可以在引擎侧写一个临时函数，让它在每个 worker 上跑——worker 侧反序列化后调用它（[§17.7](#177-worker-子进程出生服役死亡) 会看到 worker 怎么 `cloudpickle.loads` 接住）。collective_rpc 因此不只能调 worker 的**已有**方法，还能下发**任意**逻辑。RLHF 里在 worker 上同步权重、自定义诊断，靠的就是这条。
+注意 `send_method` 的两种形态。`method` 是字符串就原样发；是 callable 就 `cloudpickle.dumps` **把整个函数序列化**发出去。后者是个强能力：你可以在引擎侧写一个临时函数，让它在每个 worker 上跑——worker 侧反序列化后调用它（[§17.7](#177-worker-子进程出生服役死亡) 会看到 worker 怎么 `cloudpickle.loads` 接住）。collective_rpc 因此不只能调 worker 的**已有**方法，还能下发**任意**逻辑。
+
+停一下，想想为什么这里用的是 cloudpickle 而不是标准库 pickle——差的可不止一个名字。`pickle` 序列化函数是 **「按引用」** 的：只记下「这个函数在哪个模块、叫什么名字」，反序列化时按这个路径重新 `import`。这对 lambda、嵌套闭包、临时现写的函数完全无效——它们没有一条「能被 import 回来」的模块路径，`pickle.dumps` 直接抛 `PicklingError`。[cloudpickle](https://github.com/cloudpipe/cloudpickle) 换成 **「按值」** 序列化：把函数的字节码连同闭包变量整个打包带走，到哪儿都能复原。感受一下差别：
+
+```python
+# 说明性示例（外部库行为对比，非 vLLM 源码）
+import pickle, cloudpickle
+
+f = lambda x: x + 1
+pickle.dumps(f)       # 抛 PicklingError: Can't pickle local object
+cloudpickle.dumps(f)  # 成功：字节串可在别的进程 loads 回来接着调用
+```
+
+cloudpickle 当初就是为「把 Python 代码经网络发到远程主机执行」的集群计算场景而生，后来成了 Ray、PySpark、Dask 这些分布式框架发送任务闭包的事实标准。它有明确边界：只保证在**完全相同的 Python 版本**之间可用、不建议用于长期存储——而 collective_rpc 的场景恰好是「同一台机器、同一个解释器 spawn 出来的父子进程」，正中它的舒适区。
+
+这条「下发任意逻辑」通道最大的现实用户是 RLHF 训练。RLHF 的训练循环一边用当前模型大批量生成候选回答（术语叫 rollout），一边依据奖励信号更新参数，两者反复交替；据 [vLLM 官方博客](https://vllm.ai/blog/2025-04-23-openrlhf-vllm)引 OpenRLHF 的实测，长思维链场景下生成这一步能占到训练总时间的九成，所以业界普遍把 vLLM 这类高吞吐引擎接进训练循环专门做 rollout。代价是：每轮参数一更新，正在服役的 worker 手里的权重就过时了。训练框架的解法正是这条通道——把「接收权重分片、原地覆盖」这样一个函数 cloudpickle 序列化后广播给所有 worker 执行；权重本体则走 NCCL 或 CUDA IPC（CUDA 的跨进程显存共享机制）直传显存，不挤控制消息这条路。开源框架 [OpenRLHF](https://github.com/OpenRLHF/OpenRLHF) 是这套玩法的代表实践。
 
 > **v0.21.0 更新**：权重热更新正是这条「在 worker 上同步权重」路径上最具代表性的一例，且它的接口在 v0.21.0 里被显式拆开了。基线中 `vllm/v1/worker/gpu_worker.py` 的 `Worker` 用单方法 `update_weights()` 一把梭——内部自己串起 `initialize_layerwise_reload → receive_weights → finalize_layerwise_reload`。v0.21.0 把它拆成显式三段式：`start_weight_update(is_checkpoint_format)` 先开局（checkpoint 格式时建逐层重载状态、置守卫位 `_weight_update_active=True`）、`update_weights()` 此后可被 collective_rpc 调**一次或多次**接收权重分块（checkpoint 格式——原始权重分片需逐层处理——走 `receive_weights`，kernel 格式——已按算子打包、可直接覆盖显存——走就地 `param.copy_`）、`finish_weight_update()` 收尾跑 `finalize_layerwise_reload` 并复位守卫。它对应控制平面新增的 `/start_weight_update`、`/finish_weight_update` 端点，让训练侧能**分块流式**推权重，而非整批阻塞。形态变了，载体没变——还是这一句 `collective_rpc` 广播下去、N 个 worker 各执行一遍。
 
@@ -820,6 +842,8 @@ def register_failure_callback(self, callback: FailureCallback):
 ```
 
 机关是 `multiprocessing.connection.wait(sentinels)`。每个进程对象有个 `sentinel`——进程**还活着时不可读、一旦死掉就变可读**。`wait` 同时阻塞在所有 worker 的 sentinel 上；**任一**进程死，`wait` 立刻返回那个死掉的 sentinel。监控线程随即：置 `is_failed = True`（让后续 `collective_rpc` 直接抛错，不再傻等）、`shutdown()` 关停整个执行器、调 `failure_callback` 把噩耗通知引擎。
+
+顺带拆穿这个「魔法」的出处——它不是 vLLM 自创的黑科技，而是 Python 标准库的推荐手法。`Process.join(timeout)` 一次只能等一个进程，标准库又没有「join 一批进程、谁先退出就告诉我」的现成 API；官方文档给的方案就是把每个进程的 `.sentinel`（POSIX 上是个文件描述符，进程一退出——正常返回、异常、被 `kill -9` 都算——就变可读）喂给 [`multiprocessing.connection.wait`](https://docs.python.org/3/library/multiprocessing.html#multiprocessing.connection.wait)。本质是把「进程退出」这件事降维成一个可等待的 I/O 事件，接入和管道/socket 同一套 select/poll 多路复用原语——所以才做得到「N 选 1，谁先死谁先返回」，全程零轮询。
 
 `register_failure_callback` 是引擎注册「worker 死了请通知我」的口子。注意它**有竞态保护**：注册时若 `is_failed` 已经是 True（worker 在注册前就死了），立刻同步调一次回调——绝不漏报。
 

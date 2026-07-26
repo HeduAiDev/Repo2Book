@@ -21,7 +21,7 @@
 
 vLLM 把这一切收拢成一条 9 步流水线，全写在 `Sampler` 这一个 `nn.Module` 里。本章就沿着这 9 步走一遍，看真实源码怎么把"按概率抽一个"做成一个能跑满 GPU、参数全张量化、greedy 还能抄近道的工业级流水线。
 
-为了能在本地（无 GPU）把这条流水线亲手跑一遍、打断点看数值，本章配了一份**只做减法**的精简版：和真实 vLLM 同名、同结构、同控制流，只删掉与主线正交的分支（投机解码、thinking 预算、generative-scoring 旁路、920 行 Triton 内核、ROCm/CPU 后端、持久批状态机）。它在纯 CPU 上跑 PyTorch，是"跑起来看数值"的交叉验证物；正文主线仍是真实源码。
+为了能在本地（无 GPU）把这条流水线亲手跑一遍、打断点看数值，本章配了一份**只做减法**的精简版：和真实 vLLM 同名、同结构、同控制流，只删掉与主线正交的分支（投机解码、thinking 预算、generative-scoring 旁路、920 行 Triton 内核、ROCm（AMD 对标 CUDA 的 GPU 软件栈）/CPU 后端、持久批状态机）。它在纯 CPU 上跑 PyTorch，是"跑起来看数值"的交叉验证物；正文主线仍是真实源码。
 
 ![本章地图：Sampler 九步采样流水线源码剖面](../diagrams/chapter-map.png)
 
@@ -174,10 +174,12 @@ def apply_logits_processors(
 
 四道工序，顺序固定：
 
-1. **第 3 步：allowed token 白名单**。如果某请求限制了"只能从这些 token 里选"（比如结构化输出），`allowed_token_ids_mask` 就是一张 `[batch, vocab]` 的布尔表，把所有不在白名单里的位置 `masked_fill_` 成 `-inf`。一句话搞定，因为它本就是张量。这张白名单在结构化输出（如 JSON schema、正则约束）场景下由语法引擎逐步生成——vLLM 默认用 **XGrammar**（arXiv:2411.15100）把上下文无关文法压成快速状态机，每步吐出一张合法 token 掩码；本章只消费这张掩码，不展开文法编译本身。
+1. **第 3 步：allowed token 白名单**。如果某请求限制了"只能从这些 token 里选"（比如结构化输出），`allowed_token_ids_mask` 就是一张 `[batch, vocab]` 的布尔表，把所有不在白名单里的位置 `masked_fill_` 成 `-inf`。一句话搞定，因为它本就是张量——这张表从哪来，下面的补充框展开。
 2. **第 4 步：bad words 屏蔽**（下一节细讲）。
 3. **第 5 步：non-argmax-invariant 处理器**——`min_tokens` 和 `logit_bias`。它们能改 argmax，所以排在这里。
 4. **第 6 步：三种惩罚**——repetition / frequency / presence。
+
+> **白名单从哪来：语法引擎与 token 位掩码。** 结构化输出（"让模型只能吐合法 JSON"这类需求）早期的做法——Microsoft 的 guidance、outlines 走的路——是每生成一个 token 就现场跑一遍正则/文法匹配、逐个校验词表候选，词表动辄十几万，这一步本身就慢。**XGrammar**（mlc-ai 组织开源，[arXiv:2411.15100](https://arxiv.org/abs/2411.15100)）换了个思路：先把文法（JSON Schema、正则，或任意上下文无关文法 CFG）编译成一个维护下推自动机栈状态的"语法匹配器"（grammar matcher），并在编译期就把词表切成两类——"不看上下文就能判定合法性"的 token（占绝大多数，提前算死）和"必须结合当前栈状态才能判定"的少数边界 token（运行时才算，还与 GPU 前向重叠执行），论文报告相比逐 token 现场匹配的方案最高有 100 倍加速。举个说明性例子：schema 要求输出形如 `{"name": string, "age": integer}`，生成到前缀 `{"name": "Al` 时，匹配器判定下一个 token 只能是"继续字符串内容"或"闭合引号"这一小撮，词表里其余十几万个位置在掩码里全置 0。每步吐出的这张 `[vocab]` 位掩码送到 Sampler 手里，就是上面的 `allowed_token_ids_mask`——一句 `masked_fill_` 收工，编译文法、维护自动机这些重活全在上游做完。要注意后端并非写死 XGrammar：本章 pin 的版本里结构化输出后端默认是 `auto`（按请求特征自动挑选），XGrammar 与 guidance 都在候选之列（见 [vLLM 结构化输出文档](https://docs.vllm.ai/en/latest/features/structured_outputs.html)）。文法怎么编译、后端怎么选，是[第 31 章：约束解码 I](../../ch31-structured-output/narrative/chapter.md)的主角——本章只消费这张掩码。
 
 为什么这四道偏偏都在 greedy 之前？因为它们有个共同的危险能力：**改变"谁是最高分"**。白名单可能把原本的最高分 token 直接划掉；bad words 把某个 token 摁成 `-inf`；惩罚扣分扣多了也能让座次换人。greedy 采样只认最高分，所以任何能动最高分的工序，都必须赶在 greedy 之前生效——否则 greedy 取到的就是个没被处理过的错答案。这条"能改 argmax 就得前置"的原则，30.6 节会被 `is_argmax_invariant` 这个方法显式编码进代码。
 
@@ -484,7 +486,7 @@ def apply(self, logits: torch.Tensor) -> torch.Tensor:
 
 第 7d 步——top-k/top-p 截断——是采样里最吃算力的环节（要对整个词表动手），于是 vLLM 给它配了一整套后端分发。核心类是 `TopKTopPSampler`，它的精明之处在于：**后端绑定发生在 `__init__`，不是每次调用**。
 
-> **FlashInfer** 是 OccamLabs 开源的 GPU 采样/注意力算子库，专为 LLM 推理设计，提供 fused top-k/top-p 采样等高吞吐 CUDA 内核；vLLM 把它作为可选后端，在满足条件时替换掉 PyTorch 原生实现。
+> **FlashInfer** 是开源组织 flashinfer-ai 维护的 LLM 推理 GPU 算子库（同名论文被 MLSys 2025 接收，Zihao Ye 等，[arXiv:2501.01005](https://arxiv.org/abs/2501.01005)），能力覆盖 attention（支持 paged/ragged KV cache）、GEMM、MoE 与采样，已被 vLLM、SGLang、MLC-Engine 等框架集成为可选后端。本章用到的是它 README 里自称 "Sorting-Free Sampling" 的那部分——不排序整个词表也能做 top-k/top-p/min-p 截断采样（怎么做到的，30.9 节揭晓）；vLLM 在满足条件时用它替换 PyTorch 原生实现，不可用则回退、不崩溃。项目主页：[github.com/flashinfer-ai/flashinfer](https://github.com/flashinfer-ai/flashinfer)。
 
 ```python
 # vllm/v1/sample/ops/topk_topp_sampler.py:L30
@@ -518,12 +520,12 @@ def __init__(self, logprobs_mode: LogprobsMode = "raw_logprobs") -> None:
         self.forward = self.forward_native
 ```
 
-`device`、`platform`、`logprobs_mode` 在 `TopKTopPSampler` 的整个生命周期里都不变，所以何必每个 token 都重新判一遍走哪个后端？`__init__` 时一次性把 `self.forward` 绑成具体方法（`forward_cuda` / `forward_native` / `forward_cpu` / `forward_hip` 之一），之后每次调用直接命中，零分发开销。
+`device`、`platform`、`logprobs_mode` 在 `TopKTopPSampler` 的整个生命周期里都不变，所以何必每个 token 都重新判一遍走哪个后端？`__init__` 时一次性把 `self.forward` 绑成具体方法（`forward_cuda` / `forward_native` / `forward_cpu` / `forward_hip` 之一），之后每次调用直接命中，零分发开销。顺带解释 `rocm_aiter_ops` 这个名字：AITER（[github.com/ROCm/aiter](https://github.com/ROCm/aiter)）是 AMD 官方维护的 ROCm 高性能 AI 算子库，提供 attention / MoE / GEMM 等 kernel——CUDA 生态里 FlashInfer 扮演的加速角色，在 AMD GPU 上由它扮演，检测到可用时 `forward` 就绑到 `forward_hip` 这条路。同一套"硬件专属加速库、可选开启、不可用就回退通用实现"的模式，vLLM 对 NVIDIA / AMD 两条硬件线各复用了一遍。
 
 这段分发还藏着两条值得注意的设计：
 
 - **多级回退保证启动不崩**。flashinfer 默认开但硬件跑不动时，**静默回退** native（而不是崩溃）；只有用户**显式**设了 `VLLM_USE_FLASHINFER_SAMPLER` 还跑不动，才抛错——因为这是用户明确的意图，不该悄悄改。CPU 上 RISCV/POWERPC 这种小众架构也单独回退 native。
-- **logprobs_mode 是一道硬约束**。开头那个判断把 `processed_logits`/`processed_logprobs` 模式直接挡在 flashinfer 之外——flashinfer 用拒绝采样（反复从一个易采样的提议分布中抽样、按接受准则筛选，直到抽中落在目标截断分布内的样本，因此不必显式排序或归一化整个词表；完整的接受准则推导见[第 34 章](../../ch34-spec-decode/narrative/chapter.md)验证草稿 token 时的展开），根本不产出截断后的中间 logits，没法满足"返回处理后的 logprobs"这个要求，只能走 native。
+- **logprobs_mode 是一道硬约束**。开头那个判断把 `processed_logits`/`processed_logprobs` 模式直接挡在 flashinfer 之外——flashinfer 用拒绝采样（[rejection sampling](https://en.wikipedia.org/wiki/Rejection_sampling)，von Neumann 1951 年正式表述的蒙特卡洛经典技巧：反复从一个易采样的提议分布中抽样、按接受准则筛选，直到抽中落在目标截断分布内的样本，因此不必显式排序或归一化整个词表；完整的接受准则推导见[第 34 章](../../ch34-spec-decode/narrative/chapter.md)验证草稿 token 时的展开），根本不产出截断后的中间 logits，没法满足"返回处理后的 logprobs"这个要求，只能走 native。
 
 > **v0.21.0 更新**：派发链在 CUDA/CPU/ROCm 之外新增了一条 Intel GPU 分支——`elif current_platform.is_xpu():`（`vllm/v1/sample/ops/topk_topp_sampler.py`）。它受环境开关 `VLLM_XPU_USE_SAMPLER_KERNEL` 控制：开启时把 `self.forward` 绑成新的 `forward_xpu`，否则照旧回退 `forward_native`。`forward_xpu` 经 `torch.ops.vllm.xpu_topk_topp_sampler` 调用 XPU 原生 top-k/top-p kernel，并从 `torch.xpu.default_generators` 取 `(seed, offset)` 传入以复现随机性；与 `forward_cuda` 同理，它也不支持逐请求 generator（有则告警回退 native），且因 batch 侧 `top_k` 存为 int32 而 kernel 要 int64，调用前会先 `k.to(torch.int64)`。这条分支沿用了 native 这把"启动不崩"的兜底——XPU kernel 默认不开，且任何不满足的前置条件都退回 native。
 
@@ -635,7 +637,7 @@ def apply_top_k_top_p_triton(logits, k, p, mask_value=float("-inf")):
     # … 省略：fp32/2D 断言、按 SM 数定 NUM_PROGRAMS、缓存查找表、启动内核 …
 ```
 
-这个内核基于 Park 等人提出的 Qrita pivot-truncation 算法（*Qrita: High-performance Top-k and Top-p using Pivot-based Truncation and Selection*，arXiv:2602.01518——源码文件头注释直接点名了这篇论文）。思路是：**不排序整个词表**，而是用高斯分布近似 logits、做三分搜索逼近那个截断 pivot，多趟扫描把复杂度从 `O(V log V)` 压到约 `O(V)`。它先按 logit 值做 top-k、再对剩下的按概率做 top-p，in-place 写回——外部契约跟 pytorch sort 版完全等价，只是快得多。它内部那 900 多行的三分搜索/离群点处理是 GPU 工程的深水区，本章不逐行讲；记住一句就够：**`batch >= 8` 之所以另起内核，是为了避开整词表排序的 `O(V log V)`。**
+这个内核基于 Park、Kim、Cheung、Stoica 提出的 Qrita pivot-truncation 算法（*Qrita: High-performance Top-k and Top-p using Pivot-based Truncation and Selection*，[arXiv:2602.01518](https://arxiv.org/abs/2602.01518)——源码文件头注释直接点名了这篇论文，2026 年 2 月的新工作）。它的出发点是一个换视角的观察：top-k/top-p 截断本质上只是"**找一个阈值（pivot），砍掉阈值之外的元素**"——为了找这一个数就把整个词表排序（`O(V log V)`），纯属杀鸡用牛刀。于是 Qrita 分两步逼近这个 pivot：先用高斯分布近似 logits 的分布做一次粗略截断（sigma-truncation），把候选范围缩小；再在缩小后的范围里做**四元主元搜索**（quaternary pivot search，四分而非二分，每轮排除更多候选，并处理搜索中的重复值边界），用多趟 `O(V)` 扫描逼近同一个阈值——最终结果与"排序后取阈值"**确定性等价**，不是近似。论文报告相比 SGLang、FlashInfer 等现有实现最高有 1.4 倍吞吐、且只用一半显存（论文口径）。它先按 logit 值做 top-k、再对剩下的按概率做 top-p，in-place 写回——外部契约跟 pytorch sort 版完全等价，只是快得多。它内部那 900 多行的主元搜索/离群点处理是 GPU 工程的深水区，本章不逐行讲；记住一句就够：**`batch >= 8` 之所以另起内核，是为了避开整词表排序的 `O(V log V)`。**
 
 ## 30.9 第 7e 步：random_sample 与 flashinfer，两种避开同步的抽样
 
@@ -657,7 +659,7 @@ def random_sample(probs, generators):
     return probs.div_(q).argmax(dim=-1).view(-1)
 ```
 
-这里没用 `torch.multinomial`，而是用了 Gumbel-max（指数变体）技巧。原理：给每个 token 配一个独立的 `q ~ Exp(1)`，算 `probs / q` 取 argmax，结果在分布上等价于"按 probs 采样"——这是 Gumbel-max 的一个等价形式。直觉上，指数分布"谁先衰减到触发阈值"的胜出概率正比于其权重，等价于按权重做了一次带权抽签；完整的 CDF 推导见[第 34 章](../../ch34-spec-decode/narrative/chapter.md)投机解码验证草稿 token 时的展开。为什么不直接 `multinomial`？因为 `multinomial` 会触发 CPU-GPU 同步，打断流水线；而 `q.exponential_()` + `div_` + `argmax` 全在 GPU 上跑，零同步开销。
+这里没用 `torch.multinomial`，而是用了 Gumbel-max（指数变体）技巧。原理：给每个 token 配一个独立的指数分布随机数 $`q_i \sim \mathrm{Exp}(1)`$，算 `probs / q` 取 argmax，第 $`j`$ 项胜出的概率严格等于 $`\pi_j / \sum_i \pi_i`$——与直接按概率采样完全同分布。拿一组**示意**数字走一遍：3 个候选、概率 $`\pi = [0.5, 0.3, 0.2]`$，某一次抽到噪声 $`q = [1.2, 0.4, 3.0]`$，算 $`\pi/q = [0.417, 0.750, 0.067]`$，argmax 命中第 2 项。单看这一次像是"抽歪了"（概率 0.3 的候选赢了 0.5 的），但重复很多次统计频率，三项被选中的比例会严格逼近 0.5 / 0.3 / 0.2：噪声 $`q_i`$ 恰好衰减得快（值小）、权重 $`\pi_i`$ 又大的候选，越容易在这次比较里胜出。这套"用独立噪声把加权采样转成一次确定性 argmax"的思路在文献里有两个经典名字：统计学里的 [Gumbel-max 技巧](https://en.wikipedia.org/wiki/Gumbel_distribution)（对 $`g_i + \log \pi_i`$ 取 argmax，其中 $`g_i`$ 是 Gumbel(0,1) 噪声——代入 $`g = -\log q`$ 即化成这里的除法形式），和算法界 [Efraimidis–Spirakis (2006) 带权蓄水池抽样](https://en.wikipedia.org/wiki/Reservoir_sampling)（每个元素配 key = 权重/Exp(1) 取最大，只抽一个时就是同一件事的另一种写法）。完整的 CDF 推导见[第 34 章](../../ch34-spec-decode/narrative/chapter.md)投机解码验证草稿 token 时的展开。为什么不直接 `multinomial`？因为 `multinomial` 内部要做前缀和加二分查找，还会触发 CPU-GPU 同步，打断流水线；而 `q.exponential_()` + `div_` + `argmax` 是三个纯张量操作，全在 GPU 上跑，零同步开销。
 
 那个 `if len(generators) != probs.shape[0]` 的小手法也精巧：常见情况是大多数请求没设种子，于是先 `q.exponential_()` 把整批一次性填满随机数（最快的批量路径），再用 `for` 循环只覆写那几个设了种子的请求的行。无种子走批量、有种子单独覆写，两不耽误。
 
