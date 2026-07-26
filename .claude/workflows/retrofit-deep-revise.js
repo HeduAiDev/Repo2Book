@@ -11,11 +11,16 @@ export const meta = {
 // ⚠️ args 注入不可靠 → CFG 为准（换批改 CFG.chapters）。
 const CFG = {
   instance: 'vllm',
-  // vllm 批次2：批次1 因限额未完成的 3 章 + 次高 gap 5 章（批次1 的 7 章已提交完成）
+  // vllm 批次3(周限额 Jul 29 11am ET 重置后发车):剩余 24 章里 gap 最高的 8 章
   chapters: [
-    'ch29-model-architecture', 'ch35-pd-disaggregation', 'ch38-entrypoints',
-    'ch03-config-and-wiring', 'ch09-detokenization', 'ch12-engine-core',
-    'ch17-worker-and-executor', 'ch20-distributed-parallelism',
+    'ch12-engine-core',
+    'ch17-worker-and-executor',
+    'ch20-distributed-parallelism',
+    'ch30-sampling',
+    'ch33-primer-eagle',
+    'ch34-spec-decode',
+    'ch21-async-engine',
+    'ch22-model-definitions',
   ],
 }
 const A = (typeof args !== 'undefined' && args && args.chapters && args.chapters.length) ? args : CFG
