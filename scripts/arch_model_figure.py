@@ -140,7 +140,7 @@ def build(model, cid):
             L.append(f'<path d="M{ax:.1f},{y1 + h1 / 2} L{ax + gap - 2:.1f},{y1 + h1 / 2}" '
                      f'stroke="{C_MUTE}" stroke-width="1.2" marker-end="url(#a)"/>')
 
-    text(L, M, y1 - 14, '① 请求生命周期主线（全书固定 7 个，读者每章都见）', 11.5, C_MUTE, anchor='start')
+    text(L, M, y1 - 14, '① 请求生命周期主线（全书不变，读者每章都见）', 11.5, C_MUTE, anchor='start')
 
     # ---------- Tier 2: 当前阶段的组 ----------
     y2, h2 = 182, 44
@@ -175,7 +175,7 @@ def build(model, cid):
                      f'L{group_cx[cur_group[0]]:.1f},{y2}" fill="none" stroke="{C_CUR_S}" '
                      f'stroke-width="1.8" marker-end="url(#a2)"/>')
         text(L, M, y2 - 26, f'② 「{next(s["name"] for s in stages if s["id"] == cur_stage)}」内部分组'
-                            f'（>7 个子系统必须再抽一层，否则认知过载）', 11.5, C_MUTE, anchor='start')
+                            f'（子系统多到一眼看不过来时，先按这层认）', 11.5, C_MUTE, anchor='start')
 
     # ---------- Tier 3: 当前组的子系统芯片 ----------
     y3, h3 = 268, 40

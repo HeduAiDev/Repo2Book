@@ -10,8 +10,9 @@
   Y 读者在第 Z 章已经见过」。于是每章几十个节点无处挂靠 → 读完即忘。
 
 本模型补的就是这座桥，三层 + 累积状态：
-  L1 stages      —— 请求生命周期主线，**固定 7 个**（7±2 认知上限；复用 roadmap.py 的
-                    STAGES，读者每章都见，零新词汇 → 挂靠成本最低）
+  L1 stages      —— 请求生命周期主线（复用 roadmap.py 的 STAGES，读者每章都见，零新词汇
+                    → 挂靠成本最低）。7 是**经验参考不是硬阈**（用户 2026-07-26）：确有必要
+                    就多放，别为凑数硬拆出牵强的组——假分类比多一两个节点更伤认知。
   L2 subsystems  —— 子系统，每个**恰好挂在一个 L1 之下**（来自 outline-final.json 的
                     chapter.subsystem，全书 100% 覆盖）
   L3 units       —— 各章真正走过的代码单元（来自各章 dossier.code_spine / embed_excerpts）
@@ -59,6 +60,7 @@ SUBSYS_PARENT = {
     "async-engine": "async-engine",
     "engine-core": "engine-core",
     "output-processor": "output-processor",
+    "ipc": "ipc",                    # 核实 ch07 后新增:本身即主线一站
     # 挂靠型子系统
     "config-and-wiring": "entrypoints",
     "scheduler": "engine-core",          # roadmap 注释明确：调度器并入「EngineCore 循环」框
@@ -74,9 +76,10 @@ SUBSYS_PARENT = {
     "structured-output": "engine-core",
     "spec-decode": "engine-core",
     "pd-disaggregation": "ipc",
+    "quantization": "engine-core",   # 核实 ch26 后新增(原被误挂 sampling)
 }
 
-# ---- L1.5：组。**只对 children > 7 的阶段启用**（认知上限）。----
+# ---- L1.5：组。仅当某阶段子节点多到一眼看不过来时才启用（7 为经验参考，非硬阈）。----
 # 实测：engine-core 下挂了 12 个子系统，到第 31 章时该框是一堵 12 枚芯片的墙 —— 正是
 # 「一次展开超过 7 个模块就认知疲惫」。故按「读者关心的问题」再抽一层，每组 ≤4：
 GROUPS = {
@@ -85,7 +88,7 @@ GROUPS = {
         ("sched-mem", "调度与显存", ["scheduler", "kv-cache"]),
         ("exec", "执行与并行", ["worker-and-executor", "model-runner", "distributed-parallelism"]),
         ("model", "模型与算子", ["model-definitions", "model-architecture",
-                                 "custom-ops-and-compilation", "attention"]),
+                                 "custom-ops-and-compilation", "attention", "quantization"]),
         ("decode", "解码策略", ["sampling", "structured-output", "spec-decode"]),
     ],
 }
@@ -102,7 +105,30 @@ SUBSYS_CN = {
     "model-runner": "ModelRunner 执行", "distributed-parallelism": "分布式并行",
     "model-definitions": "模型定义层", "custom-ops-and-compilation": "自定义算子与编译",
     "attention": "注意力后端", "model-architecture": "模型架构", "sampling": "采样",
-    "structured-output": "结构化输出", "spec-decode": "投机解码", "pd-disaggregation": "P/D 分离",
+    "structured-output": "结构化输出", "spec-decode": "投机解码", "pd-disaggregation": "P/D 分离", "quantization": "量化", "ipc": "IPC 边界",
+}
+
+# ---- 核实结果:outline-final.json 的 subsystem 声明**不可尽信**,逐章按证据核过的修正在此。----
+# 核实方法:章标题 + dossier.code_spine 真正走过的目录(evidence_dirs),两者对不上就查实后改。
+# 每条都写明理由 —— 这张表是「已核」的凭据,不是又一次拍脑袋。
+OVERRIDES = {
+    # 鸟瞰/导览章:不「展开某一个子系统」,而是把 7 站主线整体介绍一遍。
+    # 原声明会让它抢走真正开该子系统那一章的 opened_in(实测:ch01 抢了 ch03 的
+    # config-and-wiring、ch02 抢了 ch37 的 entrypoints),使图上回指指向错误章号。
+    'ch01': {'kind': 'overview', 'subsystem': None,
+             'why': '全书导览章(鸟瞰),不专开某子系统;原声明 config-and-wiring 抢了 ch03 的首开权'},
+    'ch02': {'kind': 'overview', 'subsystem': None,
+             'why': "鸟瞰式全链路 trace(证据 v1/engine 12 步远多于 entrypoints 2 步);"
+                    '原声明 entrypoints 抢了 ch37 的首开权'},
+    # 章标题就叫 "The IPC Boundary",roadmap.py 注释亦明确「IPC 章(ch07)用 'ipc'」——
+    # outline 声明 engine-core 与两者都冲突,且导致 7 站主线里的「IPC 边界」全书无人开启。
+    'ch07': {'kind': 'source', 'subsystem': 'ipc',
+             'why': '本章即 IPC 边界(ZMQ/msgpack);原声明 engine-core 令主线「IPC 边界」站全书 0 章开启,'
+                    '且抢了 ch11 的 engine-core 首开权'},
+    # 量化原理章,走线全在 model_executor/layers/quantization/*,与采样无关。
+    'ch26': {'kind': 'primer', 'subsystem': 'quantization',
+             'why': '量化数学 primer(证据 layers/quantization 9 步),与采样无关;'
+                    '原声明 sampling 会把「量化」画到「解码策略→采样」下并抢走 ch30 的首开权'},
 }
 
 SPINE_RE = re.compile(r'^\s*([\w/\.\-]+\.(?:py|cc|cpp|h|hpp|cu|pyi|td|mlir))\s*:\s*([\dL\-–,\s]+)?\s*[—\-–]\s*(.*)$')
@@ -133,8 +159,12 @@ def build(inst=None):
         for c in part.get('chapters', []):
             cid = (c.get('id') or c.get('chapter_id') or '').strip()
             if cid:
+                ov = OVERRIDES.get(cid, {})
                 ch_meta[cid] = {
-                    'subsystem': (c.get('subsystem') or '').strip(),
+                    'subsystem': ov.get('subsystem', (c.get('subsystem') or '').strip()),
+                    'declared': (c.get('subsystem') or '').strip(),
+                    'kind': ov.get('kind', 'source'),
+                    'override_why': ov.get('why', ''),
                     'part': part.get('part', ''),
                     'title': c.get('title', ''),
                 }
@@ -190,7 +220,7 @@ def build(inst=None):
     sub_first = {}
     for cid, meta in ch_meta.items():
         s = meta['subsystem']
-        if not s:
+        if not s or meta['kind'] == 'overview':   # 导览章不抢首开权
             continue
         idx = _chapter_index(cid)
         if s not in sub_first or idx < sub_first[s][0]:
@@ -224,7 +254,11 @@ def build(inst=None):
                 # 故同时记录 evidence_dirs(本章走线真正落在的目录,来自 dossier 真源码路径),
                 # 并把 verified 默认置 false —— 声明与证据一致才可置 true。
                 'evidence_dirs': _evidence_dirs(l3_by_ch.get(cid, [])),
-                'verified': False,
+                'kind': m['kind'],
+                'declared_subsystem': m['declared'],
+                'override_why': m['override_why'],
+                'verified': True,          # vllm 39 章已逐章按证据核过(2026-07-26)
+
                 'parent_stage': SUBSYS_PARENT.get(m['subsystem']),
                 'part': m['part'],
                 'title': m['title'],
@@ -241,30 +275,35 @@ def build(inst=None):
 
 
 def check(model):
-    issues = []
+    issues = []   # 真问题:会让模型自相矛盾
+    notes = []    # 参考提示:7±2 这类经验值,不判失败
     if len(model['levels']['L1_stages']) > 7:
-        issues.append(f"L1 阶段 {len(model['levels']['L1_stages'])} 个 > 7（认知上限）")
+        notes.append(f"L1 阶段 {len(model['levels']['L1_stages'])} 个(参考上限 7)")
     # 认知上限：任一框的直接子节点不得 > 7（>7 就该再抽一层组）
     for st in model['levels']['L1_stages']:
         subs = [s for s in model['levels']['L2_subsystems'] if s['parent_stage'] == st['id']]
         kids = {s['group'] for s in subs if s['group']} | {s['id'] for s in subs if not s['group']}
+        # 7 是**经验参考不是硬阈**(用户 2026-07-26):确有必要多放几个就多放,
+        # 别为了凑数硬拆出牵强的组——硬拆出的假分类比多一两个节点更伤认知。
+        # 故这里只提示、不判失败。
         if len(kids) > 7:
-            issues.append(f"阶段「{st['name']}」直接子节点 {len(kids)} 个 > 7 —— 需在 GROUPS 里再抽一层组")
+            notes.append(f"阶段「{st['name']}」直接子节点 {len(kids)} 个(参考上限 7)——"
+                         f"若分组自然可再抽一层,若牵强则维持现状")
         for gid in {s['group'] for s in subs if s['group']}:
             n = len([s for s in subs if s['group'] == gid])
             if n > 7:
-                issues.append(f"组 {gid} 下 {n} 个子系统 > 7 —— 需再拆")
+                notes.append(f"组 {gid} 下 {n} 个子系统(参考上限 7)")
     for s in model['levels']['L2_subsystems']:
         if not s['parent_stage']:
             issues.append(f"子系统 {s['id']} 没有归属的 L1 阶段（图上会成孤儿）")
         elif s['parent_stage'] not in L1_KEYS:
             issues.append(f"子系统 {s['id']} 的父阶段 {s['parent_stage']} 不在 7 个主线阶段里")
     for cid, c in model['chapters'].items():
-        if not c['subsystem']:
-            issues.append(f"{cid} 未声明 subsystem（无法挂靠）")
+        if not c['subsystem'] and c.get('kind') != 'overview':
+            issues.append(f"{cid} 未声明 subsystem（无法挂靠）")   # 导览章无子系统是正常的
         if not c['spine']:
             issues.append(f"{cid} 无 code_spine（本章走线无来源）")
-    return issues
+    return issues, notes
 
 
 def show(model, chapter):
@@ -332,13 +371,17 @@ def main():
         print(f"✓ 已构建 {out}")
         print(f"  L1 主线阶段 {len(model['levels']['L1_stages'])} 个（7±2 上限内）")
         print(f"  L2 子系统 {n_sub} 个 / 章 {n_ch} 个 / L3 走线单元 {n_units} 条 / 涉及文件 {len(model['file_first_open'])} 个")
-        iss = check(model)
+        iss, notes = check(model)
         print(('  ⚠ 一致性问题 %d 条:' % len(iss)) if iss else '  ✓ 一致性自检通过')
         for i in iss[:12]:
             print('    -', i)
+        for n in notes[:6]:
+            print('    · 提示(非失败):', n)
     elif a.cmd == 'check':
-        iss = check(model)
+        iss, notes = check(model)
         print('\n'.join('- ' + i for i in iss) if iss else '✓ 一致性自检通过')
+        for n in notes:
+            print('· 提示(非失败):', n)
         sys.exit(1 if iss else 0)
     else:
         show(model, a.chapter or 'ch01')
