@@ -62,9 +62,9 @@ const results = await pipeline(
       '**纪律（硬）**：①只补读者定向背景，**不动 pin 源码解读的正确性**；新增背景与源码解读**自然分层**、别堆成信息倾倒。②说明性示例/外部记法用普通代码围栏 + 明标「说明性/外部」，**不标 `# SOURCE:`**。③**proportional**：讲透≠拉长凑字，补到「初学者能懂」为止。④版本敏感的锚定本章 pin 版本；立场性口径（如竞品博客数字）带出处立场；按各条 confidence 保守写。⑤**若 research 指出正文现有事实错**（如归属写错、默认值写错），**一并改正**并在返回 note 里说明。\n' +
       '**门禁**：改完自跑并确保无 BLOCKING：`lint_chapter_structure`（narrative/chapter.md）、`lint_formulas`（同）、`lint_source_grounding`（章目录）、`lint_fidelity`（章目录，primer 章跳过）、`lint_punct`（narrative/chapter.md）。公式规则：行内一律 `` $`…`$ ``、块级 ```math、公式内禁 CJK、**粗体**定界符外侧留半角空格。\n' +
       '返回：status / revised（补讲透处数）/ **new_h2（是否新增了 H2 主节——决定本章地图是否必须重生成，据实填）** / note。',
-      // 用户 2026-07-24 定:不是非常难的问题优先 opus5,不用 fable5。回修=按已备 research 定点补讲透,
-      // 属常规写作,用 opus;fable 只留给真正难的场景(如 primer 原理章的数学重设计)。
-      { schema: REVISE_SCHEMA, label: ch + ':revise', phase: 'Revise', agentType: 'writer', model: 'opus' }
+      // 用户 2026-07-25 明确指定:Revise 站的 writer 用 fable5(叙事写作交给 fable),
+      // 其余站(illustrator 判图/盲审、researcher 查证)保持 opus5。
+      { schema: REVISE_SCHEMA, label: ch + ':revise', phase: 'Revise', agentType: 'writer', model: 'fable' }
     )
     return { chapter: ch, revise: r }
   },
