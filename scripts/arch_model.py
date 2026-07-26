@@ -33,6 +33,7 @@ import argparse
 import json
 import re
 import sys
+from collections import OrderedDict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -131,6 +132,30 @@ OVERRIDES = {
                     '原声明 sampling 会把「量化」画到「解码策略→采样」下并抢走 ch30 的首开权'},
 }
 
+
+# ---- 架构分层（自顶向下）：本模型的**主结构**。----
+# 用户 2026-07-26 明确：本章「站点」图不是几个文件之间的临时调用关系，而是**全书统一的架构剖面**——
+# 先呈现前面章节已铺垫的结构，再在其上长出本章的新结构、标出本章站点挂在哪。形态参照读者给的
+# vLLM 架构图（Endpoints/Engine/Scheduler/Executor/Worker/Backend 分层 + 组件嵌套，**不是文件级调用图**）。
+# 层序取自 cartography/map.json 的 synth.layers（L0…L6，自底向上），这里**反转成自顶向下**渲染。
+LAYERS = [
+    ('serving',  'L6', '服务接口',     ['entrypoints']),
+    ('transform', 'L5', '请求变换',    ['input-processor', 'output-processor']),
+    ('engine',   'L4', '引擎与异步解耦', ['async-engine', 'engine-core', 'ipc']),
+    ('exec',     'L3', '执行核心',     ['scheduler', 'model-runner', 'spec-decode']),
+    ('compute',  'L2', '模型与计算',   ['model-definitions', 'model-architecture', 'attention',
+                                        'kv-cache', 'custom-ops-and-compilation', 'quantization',
+                                        'sampling', 'structured-output']),
+    ('dist',     'L1', '分布式基座',   ['distributed-parallelism', 'worker-and-executor',
+                                        'pd-disaggregation']),
+    ('config',   'L0', '配置与装配',   ['config-and-wiring']),
+]
+# cartography 的 synth.layers 只覆盖 15/21 个子系统；以下 6 个由本项目按语义定层（有据可查的归类）：
+#   ipc→L4(引擎间 ZMQ 边界)、structured-output/quantization/model-architecture/
+#   custom-ops-and-compilation→L2(模型与计算)、pd-disaggregation→L1(跨实例 KV 搬运,属分布式基座)
+LAYER_OF = {s: lid for lid, _, _, subs in LAYERS for s in subs}
+
+
 SPINE_RE = re.compile(r'^\s*([\w/\.\-]+\.(?:py|cc|cpp|h|hpp|cu|pyi|td|mlir))\s*:\s*([\dL\-–,\s]+)?\s*[—\-–]\s*(.*)$')
 
 
@@ -216,6 +241,30 @@ def build(inst=None):
                 file_first_open[path] = (idx, cid)
         l3_by_ch[cid] = units
 
+    # ---- 组件（类）注册表：架构图的**细粒度节点**。每章 dossier.key_classes 首次出现即登记，
+    # introduced_in = 首次讲它的那一章 → 这就是「前面章节铺垫的结构」的来源。----
+    classes = OrderedDict()
+    for cid in sorted(slug_by_cid, key=_chapter_index):
+        meta = ch_meta.get(cid)
+        if not meta or not meta['subsystem']:
+            continue
+        dp = ad / slug_by_cid[cid] / 'dossier' / 'dossier.json'
+        if not dp.exists():
+            continue
+        try:
+            d = json.load(open(dp, encoding='utf-8'))
+        except Exception:
+            continue
+        for kc in (d.get('key_classes') or []):
+            nm = (kc.get('name') or '').strip()
+            if not nm:
+                continue
+            f = (kc.get('file') or '').split(':')[0].strip()
+            if nm not in classes:
+                classes[nm] = {'name': nm, 'file': f, 'subsystem': meta['subsystem'],
+                               'introduced_in': cid,
+                               'responsibility': (kc.get('responsibility') or '')[:200]}
+
     # L2 累积：某子系统首次被哪一章展开
     sub_first = {}
     for cid, meta in ch_meta.items():
@@ -234,18 +283,45 @@ def build(inst=None):
             'id': s,
             'name_cn': SUBSYS_CN.get(s, s),
             'parent_stage': SUBSYS_PARENT.get(s),
+            'layer': LAYER_OF.get(s),
             'group': g[1] if g else None,
             'group_cn': g[2] if g else None,
             'opened_in': sub_first.get(s, (9999, ''))[1],
             'chapters': chs,
         })
 
+    # ---- 文件 → 子系统「归属」：画组件间关系箭头的依据。----
+    # ⚠️ 不能用「该文件里第一个被登记的类属于谁」——实测会把 vllm/v1/engine/core.py 判给
+    # config-and-wiring（因为 ch03 恰好先提到该文件里的某个类），据此画出的架构箭头是错的。
+    # 改用**全书证据多数票**：哪个子系统的章在这个文件上停的站最多就归谁；且只在票数有
+    # 决定性优势时才采信（>=3 站且占比 >=60%），否则视为「归当前章」——宁可不画箭头，
+    # 也不画一条错的架构关系。
+    from collections import Counter as _C
+    _votes = {}
+    for _cid, _u in ((c, u) for c, cc in l3_by_ch.items() for u in cc):
+        sub = ch_meta.get(_cid, {}).get('subsystem')
+        if sub:
+            _votes.setdefault(_u['path'], _C())[sub] += 1
+    file_owner = {}
+    for f, v in _votes.items():
+        mc = v.most_common(2)
+        (win, n), tot = mc[0], sum(v.values())
+        second = mc[1][1] if len(mc) > 1 else 0
+        # 判据用「对亚军的优势」而非绝对占比：vllm/v1/core/sched/scheduler.py 是 23:15:7 的
+        # 多数(非过半)，按 60% 占比会被判不决定性，但它显然就是调度器的文件。
+        file_owner[f] = {'subsystem': win, 'stations': n, 'share': round(n / tot, 2),
+                         'runner_up': second,
+                         'decisive': bool(n >= 3 and (second == 0 or n >= 1.4 * second))}
+
     model = {
         'instance': inst or instance.active_name(),
+        'file_owner': file_owner,
         'levels': {
             'L1_stages': [{'id': k, 'name': n, 'sub': s} for k, n, s in L1_STAGES],
             'L2_subsystems': subsystems,
+            'layers': [{'id': i, 'code': c, 'name': n, 'subsystems': subs} for i, c, n, subs in LAYERS],
         },
+        'classes': list(classes.values()),
         'chapters': {
             cid: {
                 'subsystem': m['subsystem'],
