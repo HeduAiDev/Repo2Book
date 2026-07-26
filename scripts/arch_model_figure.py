@@ -368,11 +368,12 @@ def build(model, cid):
             for g in cgroups:
                 ms = [s for s in g['subsystems'] if s in subs]
                 exp_here = in_core and cur_sub in ms
-                cols = max(1, min(4, len(ms)))
-                gr = (len(ms) + cols - 1) // cols
-                h = 20 + gr * (CH_ + 6) + 8 + (panel_h() + 8 if exp_here else 0)
-                gh.append((g, ms, h, exp_here, cols))
-            rh = 30 + CH_ + 10 + sum(h for _, _, h, _, _ in gh) + 8 * len(gh) + 6
+                grid = [s for s in ms if not (exp_here and s == cur_sub)]
+                cols = max(1, min(4, len(grid))) if grid else 1
+                gr = (len(grid) + cols - 1) // cols if grid else 0
+                h = 20 + gr * (CH_ + 6) + (8 if gr else 2) + (panel_h() + 8 if exp_here else 0)
+                gh.append((g, ms, h, exp_here, cols, grid))
+            rh = 30 + sum(h for _, _, h, _, _, _ in gh) + 8 * len(gh) + 4
         elif any(s == cur_sub for s in members):
             rh = CH_ + 22 + panel_h() + 8
 
@@ -383,13 +384,11 @@ def build(model, cid):
 
         if is_core:
             gy = y + 30
-            for g, ms, h, exp_here, cols in gh:
+            for g, ms, h, exp_here, cols, grid in gh:
                 box(L, M + 14, gy, W - 2 * M - 28, h, '#ffffff', '#e2e8f0', r=6, sw=1.1)
                 text(L, M + 24, gy + 14, g['name'], 10, C_MUTE, anchor='start')
                 gw = (W - 2 * M - 28 - 20 - (cols - 1) * 8) / cols
-                for i, sid in enumerate(ms):
-                    if sid == cur_sub and exp_here:
-                        continue
+                for i, sid in enumerate(grid):
                     r_, c_ = divmod(i, cols)
                     comp(M + 24 + c_ * (gw + 8), gy + 20 + r_ * (CH_ + 6), sid, gw)
                 if exp_here:
