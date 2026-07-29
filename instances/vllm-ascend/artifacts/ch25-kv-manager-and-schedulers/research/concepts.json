@@ -1,0 +1,229 @@
+{
+  "chapter": "ch25",
+  "title": "KV 管理与调度器的 NPU 特化：哪些原样复用，哪些必须特化",
+  "pin": "vllm-ascend v0.21.0rc1（commit 80610e44）+ 配套宿主 vLLM v0.21.0。本章绝大多数「外部背景」其实是**宿主 vLLM 一侧**的概念（调度器接口、抢占语义、前缀缓存块哈希、admission cap），凡涉及 vLLM 行为的说法一律锚定 v0.21.0（本地工作树逐字核对）；涉及上游 issue/PR/论文/模型的说法带日期。全部外链抓取于 2026-07-26。",
+  "scope_note": "已在别处查过、本文件不重复：PagedAttention 的基本盘与 MHA/MQA/GQA/MLA 的 KV 摆法（ch17）、MLA 低秩压缩与权重吸收（ch21/ch22）、FIA 算子族与 input_layout 记法（ch22 research 已查透 7.1.0/7.2.0 文档）、DSA/SFA 的 Lightning Indexer 与 top-k（ch24）、PD 分离与 KV 池化/remote KV（ch11/ch12）、两段式 monkey-patch 与 OOT 插件（ch03）。本文件只补 ch25 正文里**读者看了描述仍会卡住**的项：三条调度学的外部谱系（连续批处理 / chunked prefill / SLO 指标）、三处宿主 vLLM 机制的口径（可插拔 scheduler_cls / 抢占语义 / 异步调度）、两处「数字从哪来」（前缀缓存块哈希、DeepSeek-V4 的 compress_ratio）、一处上游事故背景（admission cap 的 issue #40863 → PR #40946），外加一个纯 Python 语言点（MRO/C3）。",
+  "concepts": [
+    {
+      "id": "continuous-batching-orca",
+      "term": "连续批处理（continuous batching）与「迭代级调度」",
+      "kind": "external_concept",
+      "one_line": "老式批处理要等一整批请求全部生成完才换下一批；连续批处理把调度粒度从「一整条请求」降到「一次前向迭代」——谁写完谁当场退场，空出的位子立刻补进新请求。",
+      "what_it_is": "本章三个昇腾调度器子类都站在 vLLM `Scheduler` 这台**连续批处理**调度器之上，所以先得知道这台机器是怎么转的。\n\n**它要解决什么问题**：LLM 生成是自回归的——一条请求要跑 N 次前向才吐完 N 个 token，而同一批里各条请求的长度天差地别。如果按传统深度学习的「静态批」做法（凑够一批 → 一起跑到全部结束 → 换下一批），那么短请求算完了也不能走，得干等最长那条；新来的请求也得等整批结束才能进场。据 Anyscale 官方博客（2023-06-22）的实测，这种浪费大到什么程度：同样是 A100-40GB 上的 OPT-13B，静态批约 7 请求/秒，换成连续批处理（早期 vLLM）约 165 请求/秒——**23 倍**。\n\n**它怎么转**：调度器维护两条队列——`WAITING`（还没开跑）和 `RUNNING`（在跑），每一步前向前重新决策一次，在一个 **token 预算**（vLLM 里就是 `max_num_batched_tokens`）之内决定「这一步谁算几个 token」。据 vLLM 官方博客《Inside vLLM》（2025-09-05），vLLM 的这一步是：先调度 `running` 队列里的请求（多为 decode），再从 `waiting` 队列拉 prefill 进来，每分出去一批 token 就从预算里扣掉。vLLM v0.21.0 的 `Scheduler.schedule()` 里那句注释写得很直白：`# First, schedule the RUNNING requests.`（`vllm/v1/core/sched/scheduler.py:L345`）——本章三个子类整段重抄的「RUNNING/WAITING 双循环」，抄的就是这个骨架。\n\n**一句提醒**：vLLM V1 的调度不再区分「prefill 步」和「decode 步」，一步之内既可以有正在分块预填充的请求、也可以有正在逐字生成的请求；调度输出本质就是一张 `{request_id: 这步算几个 token}` 的表。本章 `SchedulerDynamicBatch` 之所以要用 `num_computed_tokens >= num_prompt_tokens` 去**筛**出谁是 decode，正是因为两类请求混在同一条 `running` 队列里。",
+      "background": "这条线的源头是 **Orca**（《Orca: A Distributed Serving System for Transformer-Based Generative Models》，OSDI '22，Yu 等，首尔大学 + FriendliAI）——它首次提出 **iteration-level scheduling（迭代级调度）**，把调度粒度从请求降到迭代，并配套提出 **selective batching**（只对能批的算子做批处理）。Anyscale 2023 年那篇博客把这套东西的名字叫响成 **continuous batching**，并明确注明「据我们所知，Orca 是第一篇解决这个问题的论文」。\n\n所以同一件事在文献和工程圈里至少有四个名字：**continuous batching / dynamic batching / iteration-level scheduling / in-flight batching（TensorRT-LLM 的叫法）**。读不同框架的文档时看到哪个都别慌，说的是一回事。vLLM 在 Orca 的迭代级调度之上再叠了 PagedAttention（见本文件 `kv-block-and-prefix-hash` 条），才有了今天这台「调度 + 分页 KV」的引擎。",
+      "example": "**（说明性示例，外部；用于对比两种批处理的时间线，非本仓源码）**\n\n设 4 条请求，各自要生成的 token 数不同（R1=2, R2=8, R3=3, R4=6），批容量 = 4：\n\n```text\n静态批（等整批算完）：\n  step1..8 : [R1 R2 R3 R4]  <- R1 第 2 步就写完了，但槽位空转到第 8 步\n  step9    : 才能放新请求 R5 进来\n  有效利用 = (2+8+3+6) / (4 槽 x 8 步) = 19/32 ≈ 59%\n\n连续批处理（每步重新决策）：\n  step2 后 R1 完成 -> 立刻退场，R5 当场补位\n  step3 后 R3 完成 -> 立刻退场，R6 当场补位\n  槽位几乎不空转；新请求的等待时间从「整批时长」降到「一步」\n```\n\n关键差别只有一句：**决策点从「每批一次」变成「每步一次」**。",
+      "links": [
+        "https://www.usenix.org/conference/osdi22/presentation/yu",
+        "https://www.anyscale.com/blog/continuous-batching-llm-inference",
+        "https://vllm.ai/blog/2025-09-05-anatomy-of-vllm"
+      ],
+      "sources": [
+        {"url": "https://www.anyscale.com/blog/continuous-batching-llm-inference", "note": "Anyscale 官方博客《How continuous batching enables 23x throughput...》，发布于 2023-06-22。取到：静态批 vs 连续批的定义；明确把 Orca（OSDI '22）标为「据我们所知第一篇解决此问题的论文」并给出 USENIX 链接；别名清单「continuous batching / dynamic batching / iteration-level scheduling」；实测数字 OPT-13B on A100-40GB，静态 ~7 req/s vs 连续批 ~165 req/s（23x）。访问于 2026-07-26。"},
+        {"url": "https://www.usenix.org/conference/osdi22/presentation/yu", "note": "Orca 论文的 USENIX 页面。⚠️ WebFetch 返回 403，未能一手抓取正文；论文标题、OSDI '22 会议、iteration-level scheduling 与 selective batching 两项贡献，来自 Anyscale 官方博客的引用 + 搜索结果对 USENIX 摘要的转述（两处一致）。因此正文若要引数字（如「36.9x vs FasterTransformer」）请勿写——我未一手核实。访问尝试于 2026-07-26。"},
+        {"url": "https://vllm.ai/blog/2025-09-05-anatomy-of-vllm", "note": "vLLM 官方博客《Inside vLLM: Anatomy of a High-Throughput LLM Inference System》（2025-09-05）。取到：连续批处理下「每步新旧请求一起重新考虑」；调度器先处理 `running` 队列（decode 为主）再处理 `waiting` 队列的 prefill；每次调度都从 token 预算里扣减。访问于 2026-07-26。"},
+        {"url": "https://github.com/vllm-project/vllm/blob/v0.21.0/vllm/v1/core/sched/scheduler.py", "note": "vLLM v0.21.0 `Scheduler.schedule()`：L345 注释 `# First, schedule the RUNNING requests.`，随后 `while req_index < len(self.running) and token_budget > 0:`——「RUNNING 先于 WAITING + token 预算」的一手依据。⚠️ 未联网抓该 URL，是在本地 v0.21.0 源码树逐字核对（与本书 pin 同版本）。核对于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§25.4 现有那段引 Orca 的话方向是对的，建议保留并只补两点：① 别名括注（in-flight batching / 迭代级调度是同一件事），② 「running 队列里同时躺着 decode 和正在 chunked prefill 的请求」这一句——它是理解 decode-first 重排为什么必要的前提。23x 那个数字可用（Anyscale 一手），36.9x 别用（未一手核实）。历史与 selective batching 交给链接。"
+    },
+    {
+      "id": "chunked-prefill-and-decode-first",
+      "term": "chunked prefill（分块预填充）与「decode 优先」的两种含义",
+      "kind": "external_concept",
+      "one_line": "把一条长 prompt 的预填充切成几小块、分几步算，好让同批正在逐字生成的请求不被它卡住；「decode 优先」则是这套切法的配套排序策略——但它在队列之间和队列内部是两回事。",
+      "what_it_is": "**为什么要切**：prefill（把整段 prompt 一次性算出 KV）是算力密集的大活儿，一条 8000 token 的 prompt 一步算完，这一步前向就会很长；而同批那些正在 decode 的请求每步只出 1 个 token，它们会被这一大步**整整卡住一拍**——用户看到的就是输出流突然顿住（论文里叫 generation stall）。chunked prefill 的做法是：把这条 prompt 切成若干块（比如每块 2048 token），一步只算一块，剩下的块下几步再算；这样每一步的规模都可控，decode 就能稳定地跟着往前挪。\n\n**旋钮是谁**：vLLM 里就是 `max_num_batched_tokens`——一步最多算多少 token。据 vLLM v0.21.0 官方文档，chunked prefill「在可能时默认开启」，并给出取值权衡的原话：**较小的值（如 2048）换来更好的 inter-token latency，较大的值换来更好的 TTFT**。本章 `SchedulerDynamicBatch` 干的事，本质就是**把这个静态旋钮换成一张按负载查的表**（`refine_budget`）。\n\n**⚠️「decode 优先」有两层，别混**：\n- **队列之间的 decode 优先（vLLM 原生就有）**：调度器先扫 `running` 队列、再从 `waiting` 拉新请求，所以「已经在跑的（多为 decode）」天然排在「新进场的 prefill」前面。vLLM 文档的措辞是「调度策略优先 decode 请求……在 `max_num_batched_tokens` 还有余量时才调度待处理的 prefill」。\n- **队列内部的 decode 优先（昇腾这次加的）**：`running` 队列里**同时**躺着 decode 请求和正在分块预填充的请求（vLLM v0.21.0 源码里 `request.is_prefill_chunk` 这个判断就是为它们准备的），队列内部按插入顺序，所以一条早来的长 prompt 的后续 chunk 仍可能排在后来的 decode 前面吃预算。`SchedulerDynamicBatch` 那三行重排（`self.running = d_lst + p_lst`）解决的正是这一层，源码注释自称 **strict decode-first chunked prefills**——注意那个 **strict**。\n\n把这两层分开说，正文那句「严格的 decode-first」才立得住，也不会让读者误以为 vLLM 原版完全不管 decode 优先。",
+      "background": "chunked prefill 的正式出处是 **Sarathi-Serve**（《Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve》，arXiv:2403.02310，v1 于 2024-03-04，发表于 OSDI '24，Agrawal 等，Microsoft Research + Georgia Tech）。论文的两个关键词就是本节的骨架：**chunked-prefills**（「把一条 prefill 请求切成近似等大的块」）与 **stall-free scheduling**（「在不暂停正在进行的 decode 的前提下把新请求加进批里」）。它给出的收益是 Mistral-7B 单卡 A100 上 2.6x、Yi-34B 双卡 3.7x 的服务容量提升（对比当时的 vLLM）。\n\n论文点破的根因值得记住：prefill 与 decode 是**两种性质相反的负载**——prefill 并行度高、算力打满但延迟长；decode 每次只处理一个 token、算力利用极低但对延迟敏感。把两者混在一批里调度，必然要在「谁优先」上做取舍。这条张力后来又长出另一条路线——干脆把两者拆到不同机器上（PD 分离，见 ch11/ch12，代表作 DistServe），本章 `RecomputeScheduler` 就活在那条路线里。",
+      "example": "**（说明性示例，外部；数字为便于理解自设，非实测）**\n\n设 `max_num_batched_tokens = 2048`，当前 3 条请求在 decode（每条本步要 1 个 token），新来一条 8000 token 的 prompt：\n\n```text\n不切（无 chunked prefill）：\n  step k   : [8000 prefill]                 <- 预算被一条请求吃光，3 条 decode 全部停摆一拍\n  step k+1 : [d, d, d]\n\n切（chunked prefill, 块 <= 2048）：\n  step k   : [d, d, d] + prefill chunk 2045 <- 先给 3 个 decode 各 1 个 token，剩下的 2045 给 prefill\n  step k+1 : [d, d, d] + prefill chunk 2045\n  step k+2 : [d, d, d] + prefill chunk 2045\n  step k+3 : [d, d, d] + prefill chunk 1865 <- 第 4 块收尾\n  ——decode 每一步都在推进，代价是这条长 prompt 的 TTFT 变长\n```\n\n把 `max_num_batched_tokens` 调小（2048）→ 每步更快、decode 更顺（ITL 好）；调大（16384）→ prefill 更快吃完（TTFT 好）。这就是官方文档说的那个权衡，也是 `BudgetRefiner` 想按负载自动拨的那个旋钮。",
+      "links": [
+        "https://arxiv.org/abs/2403.02310",
+        "https://www.usenix.org/conference/osdi24/presentation/agrawal",
+        "https://docs.vllm.ai/en/v0.21.0/configuration/optimization/"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/abs/2403.02310", "note": "Sarathi-Serve 论文摘要页（v1 2024-03-04 / v3 2024-06-17），作者 Agrawal, Kedia, Panwar, Mohan, Kwatra, Gulavani, Tumanov, Ramjee。取到：chunked-prefills 定义「splits a prefill request into near equal sized chunks」、stall-free scheduling 定义「adds new requests in a batch without pausing ongoing decodes」、prefill 与 decode 性质相反导致的取舍、以及 2.6x（Mistral-7B/A100）与 3.7x（Yi-34B/2xA100）服务容量数字。访问于 2026-07-26。"},
+        {"url": "https://www.usenix.org/conference/osdi24/presentation/agrawal", "note": "USENIX OSDI '24 该论文的会议页（搜索结果确认标题与作者一致），用于确认发表场次为 OSDI 2024。访问于 2026-07-26。"},
+        {"url": "https://docs.vllm.ai/en/v0.21.0/configuration/optimization/", "note": "vLLM v0.21.0《Optimization and Tuning》文档页（页面标注 2026-05-07）。取到原话：chunked prefill「enabled by default whenever possible」；「the scheduling policy prioritizes decode requests... schedules all pending decode requests before scheduling any prefill operations」；「Smaller values (e.g., 2048) achieve better inter-token latency... Higher values achieve better time to first token (TTFT)」。访问于 2026-07-26。"},
+        {"url": "https://github.com/vllm-project/vllm/blob/v0.21.0/vllm/v1/core/sched/async_scheduler.py", "note": "vLLM v0.21.0 `AsyncScheduler._update_after_schedule` 里 `if request.is_prefill_chunk: continue`——证明「被调度的请求中确实混有正在分块预填充的请求」，即 running 队列里 decode 与 prefill chunk 并存。⚠️ 未联网抓该 URL，本地 v0.21.0 源码树核对。核对于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§25.4 现在把 chunked prefill 压成一个括注（「把一次长 prompt 的预填充拆成多步」），够但薄；建议扩成两句：一句「为什么切」（不切就把同批 decode 卡一拍，Sarathi-Serve OSDI'24 的 stall-free），一句**消歧**——vLLM 原版已有「队列之间」的 decode 优先，昇腾加的是「队列内部」的严格排序（源码注释里的 strict 正是这个意思）。这个消歧很值钱：没有它，读者会问「vLLM 不是本来就 decode 优先吗，那这三行改了个啥」。论文细节和 2.6x/3.7x 交给链接。"
+    },
+    {
+      "id": "serving-slo-ttft-tpot",
+      "term": "SLO / TTFT / TPOT（ITL）/ goodput：推理服务的四个基本指标",
+      "kind": "external_concept",
+      "one_line": "SLO 是你对服务许下的延迟承诺（「首字 1 秒内、之后每字 50ms 内」），TTFT 和 TPOT 分别量首字和后续每字，goodput 则只统计那些**真的兑现了承诺**的请求——`SLO_limits_for_dynamic_batch` 这个配置名里的 SLO 就是它。",
+      "what_it_is": "本章 §25.1 的开关表里有个 `SLO_limits_for_dynamic_batch`，§25.4 又反复说「decode 阶段对延迟最敏感」。这两句背后是一整套推理服务的指标语言，值得一次说清：\n\n- **SLO（Service Level Objective，服务级目标）**：运维圈的通用词，指你对外承诺的量化指标，通常带分位数，例如「P99 首字延迟 < 1s」。它不是 LLM 特有的，但 LLM 服务把它拆成了两半，因为一次请求有两个截然不同的阶段。\n- **TTFT（Time To First Token，首字延迟）**：从用户发出请求到收到第一个 token 的时间——**由 prefill 阶段主导**（还包含排队时间）。用户体感是「点了发送之后，多久开始出字」。\n- **TPOT（Time Per Output Token）/ ITL（Inter-Token Latency）**：第一个字之后，平均每个 token 要多久——**由 decode 阶段主导**。用户体感是「出字的速度快不快、卡不卡」。TPOT 通常指「总生成时间 / 生成 token 数」的平均值，ITL 指相邻两 token 的间隔；日常口语里常混用。\n- **goodput（有效吞吐）**：单位时间内**同时满足 TTFT 与 TPOT 约束**的完成请求数。为什么要它？因为纯 throughput 可以靠疯狂堆批次刷高，但堆到用户开始卡顿，那些请求即使算完了也「不算数」。DistServe（OSDI '24）正是把 goodput 提为一等优化目标的代表作。\n\n把这套话接回本章：`BudgetRefiner` 在 decode 请求多、上下文长的时候**调小** token 预算，牺牲的是 prefill 的 TTFT，保的是 decode 的 TPOT/ITL——这是一次明码标价的 SLO 取舍，不是「优化」而是「选边」。同理，vLLM 文档说 `max_num_batched_tokens` 调小换 ITL、调大换 TTFT，说的是同一枚硬币的两面。",
+      "background": "TTFT/TPOT/goodput 这套口径在 2024 年前后被 **DistServe**（《DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving》，arXiv:2401.09670，v1 于 2024-01-18，OSDI '24，Zhong 等，北大 + UCSD）系统性地立了起来：论文指出 prefill 与 decode 共处一卡会互相干扰（prefill-decoding interference），且两个阶段的延迟指标被迫共用一套资源与并行策略，于是干脆把两阶段拆到不同 GPU 上，按 goodput 优化——这就是 PD 分离（本章 `RecomputeScheduler` 的舞台，详见 ch11/ch12）。所以「SLO 指标语言」与「PD 分离」是同一篇论文里长出来的两件事，本章两个调度器分别踩在这两件事上，并不是巧合。",
+      "example": "**（说明性示例，外部；用于把三个指标串成一句可执行的承诺）**\n\n```text\nSLO 承诺： P99 TTFT < 1.0s  且  P99 TPOT < 50ms\n\n某条请求：发出 -> 0.8s 后出第一个字 -> 之后生成 200 个 token 共 8.0s\n  TTFT = 0.8s                      <= 1.0s   OK\n  TPOT = 8.0s / 200 = 40ms         <= 50ms   OK\n  -> 这条请求「达标」，计入 goodput\n\n换个跑法：批次开得更大，吞吐更高，但\n  TTFT = 0.6s  OK\n  TPOT = 70ms  超了！\n  -> 请求虽然完成了，但不计入 goodput —— throughput 涨了，goodput 反而掉了\n```\n\n最后那两行就是 goodput 存在的全部理由，也是 `SLO_limits_for_dynamic_batch` 要「按负载收紧预算」的动机。",
+      "links": [
+        "https://arxiv.org/abs/2401.09670",
+        "https://www.usenix.org/conference/osdi24/presentation/zhong-yinmin",
+        "https://docs.vllm.ai/en/v0.21.0/configuration/optimization/"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/abs/2401.09670", "note": "DistServe 论文摘要页（v1 2024-01-18，OSDI '24；作者 Zhong, Liu, Chen, Hu, Zhu, Liu, Jin, Zhang）。取到：TTFT 为 prefill 阶段的延迟指标、TPOT 为 decoding 阶段的延迟指标、goodput 定义为「同时满足 TTFT 与 TPOT 约束的请求服务能力」、以及 prefill-decoding interference 与「资源分配和并行策略被耦合」的论断。访问于 2026-07-26。"},
+        {"url": "https://docs.vllm.ai/en/v0.21.0/configuration/optimization/", "note": "vLLM v0.21.0 优化文档：取到 `max_num_batched_tokens` 小值换 inter-token latency、大值换 TTFT 的权衡原话——把 SLO 语言直接接到本章的 token 预算旋钮上。访问于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§25.1 的表格里 `SLO_limits_for_dynamic_batch` 是全章第一个出现却没解释的缩写；§25.4 又用了两次「decode 对延迟最敏感」。建议在 §25.4 那段（讲为什么偏袒 decode）里顺手补一句 TTFT/TPOT 的对照——用户体感是「多久开始出字」vs「出字卡不卡」，一句就够，不必展开 goodput 与 DistServe（交给链接与 ch11 回指）。别在正文写具体 SLO 数值（如 P99 1s/50ms），那是我编的说明性例子。"
+    },
+    {
+      "id": "vllm-scheduler-cls-pluggable",
+      "term": "`scheduler_cls`：vLLM 留给外部的「整类替换」口子（以及它自带的免责声明）",
+      "kind": "custom_pattern",
+      "one_line": "vLLM 允许你用一个配置项把整个调度器类换成自己的——但口子只开到「换整个类」这一粒度，方法内部没有任何钩子，而且官方明写「这个接口不是公开 API，不保证兼容」。",
+      "what_it_is": "§25.1 里昇腾做的事看着像魔法：改一个字符串，引擎就换了个调度器。其实这是 vLLM **主动留的口子**，而这个口子的形状恰恰解释了本章那个「改两处、抄四百行」的悖论。\n\nvLLM v0.21.0 的 `SchedulerConfig` 里有一个字段：\n\n```python\n# vllm/config/scheduler.py:L127（vLLM v0.21.0，宿主侧）\nscheduler_cls: str | type[object] | None = None\n\"\"\"The scheduler class to use. \"vllm.v1.core.sched.scheduler.Scheduler\" is\nthe default scheduler. Can be a class directly or the path to a class of\nform \"mod.custom_class\".\"\"\"\n```\n\n取用它的 `get_scheduler_cls()` 做三件事：① 没设就按 `async_scheduling` 返回 `Scheduler` 或 `AsyncScheduler`；② 设了就打一条 **warning**；③ 若是字符串则 `resolve_obj_by_qualname()` 按 `\"模块路径.类名\"` 动态导入。那条 warning 的原文很值得抄给读者看：\n\n> `\"Using custom scheduler class %s. This scheduler interface is not public and compatibility may not be maintained.\"`\n\n**这两点合起来的含义**：\n1. **粒度只到类**。你能换掉整个 `Scheduler`，但换不掉 `schedule()` 方法里的某十行。Python 也没法「热补方法体中段」。于是任何想在长方法中间插一脚的特化，都只能子类整段 override——`schedule()` 四百多行逐字复刻的**根因就在这里**，不是昇腾偷懒。\n2. **宿主不保证兼容**。vLLM 明说这个接口不是公开 API。这意味着每次 vLLM 改 `schedule()`，抄本都可能要跟着重抄一遍——这就是本章说的「复制税」的长期利息。\n\n顺带一提，同一份配置里还有 `policy`（默认 `\"fcfs\"`，可选 `\"priority\"`）——它决定 waiting 队列怎么排、抢占时挑谁下车，正是 §25.5 里 `else` 分支「常规 PRIORITY/FCFS preempt」那句话的出处。",
+      "background": "「留一个类名字符串当扩展点」是 Python 生态里很常见的插件形态（Django 的 `AUTH_USER_MODEL`、各种 `*_CLASS` 配置都是同一路数），好处是零依赖、进程启动时才解析；代价是接口边界模糊——宿主并不知道你覆写了什么，也就无从保证兼容。vLLM 对此的处理很诚实：口子照开，但把免责声明打进日志。这与本书 ch03 讲的 monkey-patch 纪律是一体两面——**能用官方口子就别打补丁；官方口子只开到类粒度时，整类重写就是唯一合法姿势**。",
+      "example": "**（说明性示例，外部；展示 vLLM 宿主侧这个扩展点怎么用、会打印什么，非本仓源码）**\n\n```python\n# 任何人都可以这样换掉调度器（这是 vLLM 的公开配置项、非公开接口）\nfrom vllm import LLM\nllm = LLM(\n    model=\"...\",\n    # 值是「模块路径.类名」的字符串，引擎启动时才 import 并解析\n    scheduler_cls=\"my_pkg.my_sched.MyScheduler\",\n)\n```\n\n启动日志里会出现（vLLM v0.21.0 `SchedulerConfig.get_scheduler_cls()` 的 `warning_once`）：\n\n```text\nWARNING Using custom scheduler class my_pkg.my_sched.MyScheduler.\n        This scheduler interface is not public and compatibility may not be maintained.\n```\n\n逐行读：字符串 `\"my_pkg.my_sched.MyScheduler\"` 会走 `resolve_obj_by_qualname()`——**点号左边是模块、右边是类名**，与本章 `\"vllm_ascend.core.scheduler_dynamic_batch.SchedulerDynamicBatch\"` 是同一个格式。而那句 warning 就是宿主在说：这道门给你留了，门后的路我随时会改。",
+      "links": [
+        "https://docs.vllm.ai/en/v0.21.0/api/vllm/config/scheduler/",
+        "https://github.com/vllm-project/vllm/blob/v0.21.0/vllm/config/scheduler.py"
+      ],
+      "sources": [
+        {"url": "https://docs.vllm.ai/en/v0.21.0/api/vllm/config/scheduler/", "note": "vLLM v0.21.0 `vllm.config.scheduler` API 文档：取到 `scheduler_cls` 的说明（可传类本身或 \"mod.custom_class\" 路径字符串，默认 `vllm.v1.core.sched.scheduler.Scheduler`）、`policy` 的两个取值（`fcfs` 按到达顺序 / `priority` 按优先级、到达时间破平）、`async_scheduling`、`enable_chunked_prefill` 默认开。访问于 2026-07-26。"},
+        {"url": "https://github.com/vllm-project/vllm/blob/v0.21.0/vllm/config/scheduler.py", "note": "vLLM v0.21.0 `vllm/config/scheduler.py`：L125-L130 的 `scheduler_cls` 字段与 docstring；L168-L188 的 `get_scheduler_cls()`——未设时按 `async_scheduling` 选 `AsyncScheduler`/`Scheduler`，设了则 `logger.warning_once(\"Using custom scheduler class %s. This scheduler interface is not public and compatibility may not be maintained.\")`，字符串走 `resolve_obj_by_qualname`。⚠️ 未联网抓该 URL，本地 v0.21.0 源码树逐字核对。核对于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "这条是本章 thesis 的**外部支点**，建议在 §25.1 末尾或 §25.4「为什么改两处却要重抄四百行」那节用一小段点透：vLLM 的口子只开到 `scheduler_cls`（换整个类），并且官方 warning 明写「接口非公开、不保证兼容」。有了这句，「复制税」就从「昇腾的选择」升级成「宿主接口形状决定的必然」，论证强度完全不同。warning 原文值得直引一句（英文原句即可）。`policy=fcfs/priority` 顺带一句接住 §25.5 的 else 分支。别展开 Django 之类的类比，那只是我给的背景。"
+    },
+    {
+      "id": "vllm-preemption-semantics",
+      "term": "vLLM 的「抢占」到底做了什么——顺便消歧：它自己也叫 recompute",
+      "kind": "external_concept",
+      "one_line": "vLLM 抢占一条请求 = 把它的 KV 全部还给 block 池、计数清零、塞回等待队列，下次从头重算；而本章 `RecomputeScheduler` 的「重算」是把请求丢回 PD proxy 让**别的节点**重算——两个 recompute 不是一回事。",
+      "what_it_is": "§25.5 的整个立意是「不做常规 preempt，改成丢弃重算」。要看懂这句，得先知道「常规 preempt」到底代价几何。vLLM v0.21.0 的 `Scheduler._preempt_request()` 只有十来行，做四件事：\n\n1. `self.kv_cache_manager.free(request)` —— **把这条请求已经算好的 KV block 全部还回 block 池**；\n2. `request.num_computed_tokens = 0` —— 已算 token 数**清零**；\n3. `request.status = RequestStatus.PREEMPTED`、`num_preemptions += 1`；\n4. `self.waiting.prepend_request(request)` —— **塞回等待队列的队头**，等资源宽裕了重新排队。\n\n方法自己的 docstring 就叫「Preempt a request and put it back to the waiting queue」。注意第 1、2 步合起来的含义：**KV 是被丢掉的，不是存起来的**——所以这条请求下次被调度时，要把 prompt 加上已生成的 token **从头 prefill 一遍**。这就是它被称作 recompute（重算）的原因。vLLM 官方文档里那条经典告警也是这么写的：`\"Sequence group 0 is preempted by PreemptionMode.RECOMPUTE mode because there is not enough KV cache space.\"`\n\n**⚠️ 命名撞车，正文务必消歧**：\n- vLLM 的 **recompute** = 在**本节点**丢 KV、回 waiting、待会儿本地重新算；\n- 昇腾 `RecomputeScheduler` 的 **recompute** = 在 **kv_consumer（decode）节点**丢 KV、把请求**吐回 PD proxy**，由 proxy 改投**另一个节点**从头走 prefill+decode。\n\n两者「丢 KV」这一步一模一样（都是 `kv_cache_manager.free`），分岔点在**第二步之后往哪走**：回本地 waiting，还是回 proxy 手里。正文现有那句「它不是在本节点重新计算」方向完全正确，配上 vLLM 原版四步的对照会更有说服力。\n\n**挑谁下车**：由 `SchedulerConfig.policy` 决定——`fcfs`（默认，按到达顺序）时抢的是 `self.running.pop()`（队尾，即最晚到达的那条）；`priority` 时抢的是优先级最低的那条。这正是 §25.5 那个 `else` 分支「常规 PRIORITY/FCFS preempt」的内容，也解释了为什么昇腾那支也用 `running.pop()`——它沿用了 FCFS 下「牺牲队尾」的约定。",
+      "background": "抢占在 vLLM V0 时代有两种模式：**RECOMPUTE**（丢 KV、之后重算）和 **SWAP**（把 KV 换出到 CPU 内存、之后换回）。到 V1 架构，调度侧只保留了「丢 KV 重算」这一条路——在本书 pin 的 vLLM v0.21.0 里，`vllm/v1/core/sched/` 下已经找不到 `PreemptionMode`/SWAP 相关代码，抢占就是 `_preempt_request` 这一种。理由也直白：V1 有 PagedAttention + 前缀缓存打底，重算的代价（尤其是命中前缀缓存后）往往低于把大块 KV 在 host 与 device 之间搬来搬去。\n\n值得对照的是：**「把 KV 挪到 CPU」这条路并没有消失，只是从「抢占模式」变成了独立的 KV offload 特性**（本章 §25.7 点名、ch13 展开）。同一个想法在不同抽象层重新出现，是这套系统演进里很典型的一幕。",
+      "example": "**（说明性示例，外部；对照两种「重算」，帮读者立刻分清）**\n\n```text\n场景：block 池告罄，某条请求 allocate_slots 失败\n\n[vLLM 原生 preempt]                      [昇腾 RecomputeScheduler，kv_consumer 侧]\n  free(req) 丢掉 KV                        free(req) 丢掉 KV\n  num_computed_tokens = 0                  记入 recomputed_reqs\n  status = PREEMPTED                       update_from_output 回吐\n  waiting.prepend(req)  <- 回本地队列        stop_reason=\"recomputed\"  <- 回 PD proxy\n  |                                        |\n  v                                        v\n  同一个节点，稍后从头 prefill              proxy 改投另一节点，从头 prefill+decode\n```\n\n一句话记住差别：**KV 都丢，区别在「谁来重算」**——本地，还是别人。",
+      "links": [
+        "https://github.com/vllm-project/vllm/blob/v0.21.0/vllm/v1/core/sched/scheduler.py",
+        "https://docs.vllm.ai/en/v0.21.0/configuration/optimization/"
+      ],
+      "sources": [
+        {"url": "https://github.com/vllm-project/vllm/blob/v0.21.0/vllm/v1/core/sched/scheduler.py", "note": "vLLM v0.21.0 `Scheduler._preempt_request()`（L910-L930）：docstring「Preempt a request and put it back to the waiting queue.」；四步 `kv_cache_manager.free` / `num_computed_tokens = 0` / `status = RequestStatus.PREEMPTED` / `waiting.prepend_request(request)`。同文件 L438-L466 显示 `policy` 为 priority 时用 `max(...)` 挑受害者、否则 `self.running.pop()` 取队尾，且 `if preempted_req == request: break`。⚠️ 未联网抓该 URL，本地 v0.21.0 源码树逐字核对。核对于 2026-07-26。"},
+        {"url": "https://docs.vllm.ai/en/v0.21.0/configuration/optimization/", "note": "vLLM v0.21.0 优化文档的抢占小节：取到告警原文「Sequence group 0 is preempted by PreemptionMode.RECOMPUTE mode because there is not enough KV cache space.」及「KV cache 耗尽时 vLLM 会抢占请求并稍后重算」的说法。访问于 2026-07-26。"},
+        {"url": "https://vllm.ai/blog/2025-09-05-anatomy-of-vllm", "note": "vLLM 官方博客（2025-09-05）：取到「recompute preemption……调用 kv_cache_manager.free 把 KV block 还回 block pool」的描述，与源码一致，作为第二处出处。访问于 2026-07-26。"},
+        {"url": "https://github.com/vllm-project/vllm/tree/v0.21.0/vllm/v1/core/sched", "note": "在本地 v0.21.0 源码树对 `vllm/v1/` 全目录 grep `PreemptionMode|SWAP`：`v1/core/sched/` 下零命中（命中项均为 input_batch 的 `swap_states` 等无关用法）——这是「V1 调度侧只剩 recompute 一种抢占」的依据。⚠️ 结论基于代码检索，非官方文档明文，措辞请留余地。核对于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§25.5 已经做了一次消歧（「不是在本节点重新计算」），建议再往前推半步：先花两三句讲清 vLLM 原版 preempt 的四步（丢 KV / 清零 / 回 waiting 队头 / 下次从头重算），再说昇腾在 consumer 侧换了最后一步——有了对照，「为什么本地重算无意义」才落地。⚠️ 「V1 只剩 recompute、没有 SWAP」这句我是靠源码 grep 得出的（官方文档未明文），若要写请用「在本书锁定的 v0.21.0 里，调度侧的抢占只有丢 KV 重算这一种」这种带版本的措辞。`policy=fcfs` 下抢队尾这点可以顺手解释昇腾为何也用 `running.pop()`。"
+    },
+    {
+      "id": "kv-block-and-prefix-hash",
+      "term": "KV block 与前缀缓存的「块哈希链」：为什么命中必须整块对齐",
+      "kind": "external_concept",
+      "one_line": "KV cache 被切成固定大小的 block（借自操作系统的分页），每个 block 用「上一块的哈希 + 本块 token」算出一个指纹；命中只能整块整块地、从头连续地匹配——所以边界一错位，后面全废。",
+      "what_it_is": "§25.2/§25.3 反复出现「block」「前缀命中」「逻辑块对齐」，这几个词背后是同一套机制，讲透它，`logical_block_size` 那段就不再是天书。\n\n**block 从哪来**：来自 PagedAttention（vLLM 的奠基论文，SOSP 2023）。它把操作系统的**虚拟内存分页**搬到 KV cache 上——不再为每条请求预留一整段连续显存（会浪费、会碎片化），而是切成固定大小的**块**（block/page，每块装 `block_size` 个 token 的 KV），用一张块表把逻辑位置映射到物理块。好处除了省显存，还有一条对本章至关重要：**块可以在请求之间共享**。\n\n**前缀缓存怎么命中**：两条请求若 prompt 前缀相同，那段 KV 算出来是一模一样的，没必要重算。vLLM 的做法是给每个**装满的** block 算一个哈希当指纹，存进一张全局哈希表（本章那个 `BlockPool`）。关键在于这个哈希是**链式**的——据 vLLM 官方博客（2025-09-05），哈希「结合了上一个 block 的哈希、当前这些 token、以及可选的元数据」。链式带来三条硬性质：\n\n1. **只有装满的块才有哈希**（半块不缓存）——所以命中永远是 `block_size` 的整数倍；\n2. **必须从第 0 块开始连续匹配**，一旦某块对不上，后面的块即便内容相同也不能用（因为它们的哈希里嵌了前面那块的哈希）。本章 `find_longest_cache_hit` 里那个 `else: break` 就是这条性质的字面表达；\n3. **对齐边界一变，整条链的指纹全变**——两个系统若对「一块装多少 token」的理解不一致，谁也命中不了谁。\n\n第 3 条正是 §25.3 的要害：压缩 MLA 下，一个物理 block 承载的**原生 token 位数**是 `block_size × compress_ratio`，所以求命中时必须按这个「逻辑块」大小去切哈希链，而不是物理 `block_size`。父类 `FullAttentionManager` 用物理块大小切，压缩场景下切出来的指纹自然对不上——不是「少命中几块」，而是**整条链从第一块起就错**。",
+      "background": "PagedAttention 出自《Efficient Memory Management for Large Language Model Serving with PagedAttention》（Kwon, Li, Zhuang, Sheng, Zheng, Yu, Gonzalez, Zhang, Stoica；arXiv:2309.06180，2023-09；SOSP 2023），摘要里的自我定位就是「受操作系统经典虚拟内存与分页技术启发的注意力算法」，收益是「KV cache 内存近乎零浪费」以及「在请求内部与请求之间灵活共享 KV cache」。前缀缓存（vLLM 里叫 Automatic Prefix Caching）就是「请求之间共享」这句话的产品化：把共享从「同一请求的多个采样分支」推广到「任意两条恰好前缀相同的请求」。\n\n本章 `BlockPool` 一行未改地被昇腾继承，根子也在这里——**分页与哈希都是纯计数与查表，跟是 GPU 还是 NPU 毫无关系**。这正是全章「设备无关的控制流就该原样复用」那条论断的最佳例证。",
+      "example": "**（说明性示例，外部；`block_size=16` 取自 vLLM 官方博客的举例，链式哈希为示意写法，非本仓源码）**\n\n```text\nprompt = [t0 ... t47]，block_size = 16\n\n块0: t0..t15    h0 = hash(None, [t0..t15])\n块1: t16..t31   h1 = hash(h0,   [t16..t31])     <- 注意：h0 被喂进来了\n块2: t32..t47   h2 = hash(h1,   [t32..t47])\n\n新请求 A：前 32 个 token 与上面完全相同，第 33 个起不同\n  查 h0 -> 命中，复用块0\n  查 h1 -> 命中，复用块1\n  查 h2'-> 不同（token 变了）-> break，后面一律重算\n  => 命中 32 个 token，正好 2 x 16，永远是整块的整数倍\n\n新请求 B：内容与 A 相同，但它以为一块装 32 个 token（对齐口径不一致）\n  它算出的第一个指纹 = hash(None, [t0..t31]) != h0\n  => 第 0 块就 miss，后面全废 —— 「错位半个 block 命中就废了」说的就是这个\n```",
+      "links": [
+        "https://arxiv.org/abs/2309.06180",
+        "https://vllm.ai/blog/2025-09-05-anatomy-of-vllm",
+        "https://docs.vllm.ai/en/v0.8.0/design/automatic_prefix_caching.html"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/abs/2309.06180", "note": "PagedAttention 论文摘要页（SOSP 2023，2023-09-12 提交）。取到：作者名单；「inspired by the classical virtual memory and paging techniques in operating systems」；「near-zero waste in KV cache memory」；「flexible sharing of KV cache within and across requests」；2-4x 吞吐提升。访问于 2026-07-26。"},
+        {"url": "https://vllm.ai/blog/2025-09-05-anatomy-of-vllm", "note": "vLLM 官方博客（2025-09-05）：取到前缀缓存的块哈希口径——对每个满 16 token 的块计算哈希，「哈希结合了上一个 block 的哈希、当前 token、以及可选的元数据」；哈希相同即可直接复用这些 KV block。这是「链式哈希 + 整块命中」的一手依据。访问于 2026-07-26。"},
+        {"url": "https://docs.vllm.ai/en/v0.8.0/design/automatic_prefix_caching.html", "note": "vLLM《Automatic Prefix Caching》设计文档（搜索结果转述，⚠️ 该页我未成功一手抓取，另一次 WebFetch 因 socket 关闭失败）：口径为「每个 KV block 可由 hash(前缀 token, 本块 token) 唯一标识」，与官方博客一致。作为佐证，非独立依据。访问尝试于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§25.2 现在用一句话解释了前缀缓存（「哈希表记内容指纹」），准确但不足以支撑 §25.3 的论证。建议在 §25.3「前缀命中：按逻辑块对齐」开头补两句**链式**性质：哈希把上一块的哈希也算进去 → 只能从头连续整块匹配、一 miss 即 break。有了这两句，「错位半个 block 命中就废了」就从断言变成推论。PagedAttention 的分页类比一句带过（ch17 已讲），SOSP 论文交给链接。"
+    },
+    {
+      "id": "deepseek-v4-compressed-kv",
+      "term": "`compress_ratio` 从哪来：DeepSeek-V4 的 c4a / c128a 压缩 KV",
+      "kind": "external_concept",
+      "one_line": "`compress_ratio` 不是昇腾发明的旋钮，是 DeepSeek-V4 一族模型的架构参数——把连续若干个 token 的 KV 加权合成一条，4:1 或 128:1，于是 KV cache 直接小一个数量级。",
+      "what_it_is": "§25.3 的一切都建立在「压缩 MLA 把每 `compress_ratio` 个逻辑 token 压成 1 个物理 KV slot」之上，但正文没交代**谁会让 `compress_ratio > 1`**。答案在模型侧。\n\n据 vLLM 官方博客《DeepSeek V4 in vLLM: Efficient Long-context Attention》（2026-04-24），DeepSeek-V4 系列（V4-Pro 1.6T / V4-Flash 285B）用两种压缩注意力：\n\n- **c4a**：一个压缩 token 是 **8 个原始 token 的加权和、步长 4**，因此压缩比约 **1/4**；其上再做 top-k 稀疏（默认 k=512）。\n- **c128a**：一个压缩 token 是 **128 个原始 token 的加权和、步长 128**，压缩比约 **1/128**；top-k 默认 k=8192。\n\n注意「步长」才是决定压缩比的量：c4a 每 4 个位置产出一条（窗口 8、有重叠），所以是 4:1。收益很直观——同样 1M token 上下文，V4-Pro 的 KV cache 相对 V3.2 小 **8.7 倍**（bf16 下 83.9 GiB → 9.62 GiB）。\n\n**这个参数怎么走到 KV manager 眼皮底下**：在宿主 vLLM v0.21.0 里，`MLAAttentionSpec` 有一组标着「DeepseekV4 only fields」的字段，其中就有 `compress_ratio: int = 1  # Default to 1 for no compression.`，并配了一个属性：\n\n```python\n@property\ndef storage_block_size(self) -> int:\n    return self.block_size // self.compress_ratio\n```\n\n一句话：**`block_size` 数的是原生 token 位，`storage_block_size` 数的是真正要存的槽位**。本章 `CompressAttentionManager` 里那些 `num_tokens //= compress_ratio` 与 `logical_block_size = block_size × compress_ratio`，算的就是同一笔账的两个方向（vLLM 博客里提到「单一逻辑块大小 = 256 个原生 token 位」，正是「逻辑块按原生 token 计」的口径）。也因此 `compress_ratio` 默认是 1——绝大多数模型走这条路时，`//= 1` 是恒等运算，整个 `CompressAttentionManager` 根本不会被选中。\n\n**⚠️ 一处极易混的同名概念**：ch24 讲 DSA 时出现过 `cmp_ratio=4`——那是 **Lightning Indexer 打分前**把 KV 压短、让索引更便宜的压缩，压出来的东西写进独立的 `compress_kv_cache`；本章的 `compress_ratio` 压的是**真正参与注意力、要占 block 的 KV 本身**。两者都叫「压缩比」，也都可能是 4，但一个管索引开销、一个管 KV 容量，别串。",
+      "background": "这条线是 DeepSeek 稀疏注意力的第二棒。V3.2 引入 DSA（DeepSeek Sparse Attention，ch24 讲过）——用一个轻量索引器选出 top-k 个 KV 参与注意力，把**计算**降下来，但 KV cache 本身还是全量存着。V4 更进一步：**先压再稀疏**——把 KV 沿序列方向压掉 4 倍或 128 倍，压完的条目上再做 top-k。于是省的不只是算力，还有显存。据 vLLM 博客，V4 每层都把「最近若干原始 token 的滑动窗口注意力」与「c4a 或 c128a」组合起来用——近处看原始 token、远处看压缩条目，这也是长上下文（1M）能算得动的原因。\n\n对本章的意义在于：**这是一个新的 KV「计量单位」**。一旦一个物理槽位不再对应一个 token，所有「要几个 block」「命中几个 block」的算式就都得换算——`CompressAttentionManager` 存在的全部理由就是这个换算，而不是什么昇腾专属的硬件适配。",
+      "example": "**（说明性示例，外部；换算规则取自 vLLM v0.21.0 的 `MLAAttentionSpec.storage_block_size` 与官方博客的压缩比，具体数字为便于理解自设）**\n\n```text\n设 block_size = 128（原生 token 位），一条 prompt 有 1024 个 token\n\ncompress_ratio = 1（普通 MLA）:\n  要存的槽位 = 1024 / 1   = 1024\n  物理 block = ceil(1024/128) = 8 块\n  前缀命中的对齐单位 = 128 个 token\n\ncompress_ratio = 4（c4a）:\n  要存的槽位 = 1024 // 4  = 256\n  物理 block = ceil(256/128)  = 2 块        <- 少了 4 倍\n  逻辑块 = 128 x 4 = 512 个原生 token       <- 命中必须按 512 对齐\n\ncompress_ratio = 128（c128a）:\n  要存的槽位 = 1024 // 128 = 8\n  物理 block = ceil(8/128) = 1 块\n  逻辑块 = 128 x 128 = 16384 个原生 token   <- 短 prompt 干脆凑不满一个逻辑块，命中数为 0\n```\n\n最后一行值得多看一眼：压缩比越大，前缀缓存的**命中粒度越粗**——省了显存，换来的是命中变「钝」。这是压缩 KV 一个不写在代码里但读得出来的取舍。",
+      "links": [
+        "https://vllm.ai/blog/2026-04-24-deepseek-v4",
+        "https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro",
+        "https://github.com/vllm-project/vllm/blob/v0.21.0/vllm/v1/kv_cache_interface.py"
+      ],
+      "sources": [
+        {"url": "https://vllm-project.github.io/2026/04/24/deepseek-v4.html", "note": "vLLM 官方博客《DeepSeek V4 in vLLM: Efficient Long-context Attention》（2026-04-24）。取到：c4a =「一个压缩 token 是 8 个未压缩 token 的加权和，步长 4」压缩比约 1/4、top-k 默认 512；c128a =「128 个的加权和，步长 128」压缩比约 1/128、top-k 默认 8192；1M 上下文下 KV cache 比 V3.2 小 8.7 倍（bf16 83.9 GiB → 9.62 GiB）；提到「单一逻辑块大小 = 256 个原生 token 位」与滑动窗口 KV cache；支持模型 DeepSeek-V4-Pro（1.6T）与 V4-Flash（285B）。⚠️ 搜索摘要里出现的 CSA/HCA 命名与「c4a 是 128 个 token 加权和」的说法与博客原文不符，已按博客口径纠正、不采用。访问于 2026-07-26。"},
+        {"url": "https://github.com/vllm-project/vllm/blob/v0.21.0/vllm/v1/kv_cache_interface.py", "note": "vLLM v0.21.0 `MLAAttentionSpec`（L323-L355）：注释「DeepseekV4 only fields. Non-DeepseekV4 MLA models leave these at defaults.」，字段 `compress_ratio: int = 1  # Default to 1 for no compression.`，属性 `storage_block_size = block_size // compress_ratio`，以及 `real_page_size_bytes` 里 `model_version == \"deepseek_v4\"` 的分支。同版本 `vllm/v1/attention/backends/mla/sparse_swa.py` 按 `compress_ratio` 取 1/4/128 分派 DeepseekV4 decode layer type。⚠️ 未联网抓该 URL，本地 v0.21.0 源码树逐字核对。核对于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§25.3 缺的正是这一句「谁会让 compress_ratio > 1」。建议在 `CompressAttentionManager` 登场处补两三句：compress_ratio 是 DeepSeek-V4 一族的 c4a/c128a 压缩比（4 或 128），vLLM 的 `MLAAttentionSpec` 默认 1（即不压缩，`//= 1` 恒等、这个 manager 压根不被选中）——顺带解释了为什么这条特化对绝大多数部署是零影响，正好呼应「默认一个都不拨」的主线。⚠️ **务必加一句与 ch24 的消歧**：ch24 那个 `cmp_ratio=4` 是索引器打分用的压缩，与这里压 KV 存储的 compress_ratio 不是一回事（读者刚读完 ch24，极易串）。8.7x/83.9GiB→9.62GiB 可引（官方博客一手），模型架构细节交给链接。别声称昇腾已支持 V4——我没查证。"
+    },
+    {
+      "id": "admission-control-cap",
+      "term": "准入门控（admission control）与 `max_admission_blocks_per_request`：两本账必须对齐",
+      "kind": "external_concept",
+      "one_line": "启动时按一套公式算「KV 池要开多大」，运行时按另一套公式判「这条请求最多要几块、放不放它进来」——两套账一旦对不上，长请求就会永远卡在等待队列里，看起来像死锁。",
+      "what_it_is": "**什么是 admission control**：系统学的老词，直译「准入控制」——在请求真正进入系统之前先判断「资源够不够养活它」，不够就先不放行，而不是放进来跑到一半崩掉。放到 KV 分配上：调度器在给一条请求分块之前，先估一个上界「这条请求整段跑完最多要几个 block」，若当前池子给不出这么多，就不让它开跑。这就是 `max_admission_blocks_per_request` 的角色。\n\n**为什么会出事**：这个上界必须与**启动期算池子大小的那套公式**同源。二者一旦漂移：\n- 门槛算得**太松** → 放进来了却中途分不到块，OOM 或反复抢占；\n- 门槛算得**太紧** → 池子明明装得下，门却不开，请求永远排在 waiting，GPU 利用率掉到 0——从外面看就是「卡死了」。\n\n**上游确实踩过**：vLLM issue **#40863**（2026-04-25 开）标题是「[Bug]: Using H200 to deploy DeepSeekV4, after sending a long text, all subsequent requests are blocked.」——发一条 64k token 的长请求后，后续请求全部「卡在 waiting 队列里不真正运行」、GPU 使用率掉到 0%。两天后合入的 PR **#40946**（2026-04-27）标题就是药方：**「[Bugfix] Cap SWA/chunked-local runtime admission to startup pool-sizing bound」**。PR 描述把原则讲得很干净：让「启动期的池子尺寸计算」与「运行期的准入门」**共用同一个真相源**（原文：`the startup pool sizer and the runtime admission gate share one source of truth`），否则漂移会重新引入旧 bug 甚至更糟的 mid-prefill OOM。做法是在 attention spec 上统一出一个 `max_admission_blocks_per_request` 方法，按「chunked prefill 期间块可回收」给出上界，例如 SWA 是 `cdiv(sliding_window - 1 + max_num_batched_tokens, block_size) + 1`。\n\n**这为什么是本章的事**：昇腾的 `get_manager_for_kv_cache_spec` **整个顶替**了 vLLM 的同名工厂，于是上游设置这个 cap 的那段代码变成永不到达的死代码——不在自己这边补回来，就等于把 #40863 请了回来。同一个道理也适用于压缩 MLA：它得有自己的上界公式 `ceil(max_model_len // compress_ratio / block_size) + 1`。",
+      "background": "「准入控制」在网络与操作系统里是标准手段（QoS 里的 admission control、数据库连接池的排队门），核心思想都是**宁可在门口拒绝，也不要放进来之后半路崩**。LLM 推理把它落到 KV block 这个具体资源上：一条请求的 KV 占用随生成不断增长，所以门口判断必须基于「最坏情况的峰值」而不是「当前需求」。\n\n有意思的是不同 attention 类型的峰值形状完全不同：全注意力的 KV 一路涨到 `max_model_len`；滑动窗口（SWA）与 chunked local attention 的老块会被回收，峰值只与窗口和单步预算有关（这正是 PR #40946 那个公式里为什么出现 `max_num_batched_tokens`）；压缩 MLA 则是「不回收、但整体被 `compress_ratio` 压扁」。三种形状要三套上界——这也解释了本章那个 `elif` 分支为什么看着突兀却非写不可。",
+      "example": "**（说明性示例，外部；公式取自 vLLM PR #40946 与本章正文，数字为便于理解自设）**\n\n```text\n设 block_size = 128, max_model_len = 32768, max_num_batched_tokens = 8192\n\n全注意力（不回收）：\n  峰值块 = ceil(32768 / 128) = 256 块        <- 门口就得按 256 判\n\nSWA，窗口 sliding_window = 4096（老块会被回收）：\n  PR #40946 的上界 = cdiv(4096 - 1 + 8192, 128) + 1 = cdiv(12287,128)+1 = 96+1 = 97 块\n  ——只有全注意力的 1/2.6：若错按 256 判，池子够却不放行，长请求卡死（#40863 的形状）\n\n压缩 MLA，compress_ratio = 4（不回收，但整体压扁）：\n  峰值块 = ceil((32768 // 4) / 128) + 1 = ceil(8192/128) + 1 = 64 + 1 = 65 块\n```\n\n三行对照就能看出「一套公式打天下」为什么行不通：**回收与否、压缩与否，决定了峰值的形状完全不同**。",
+      "links": [
+        "https://github.com/vllm-project/vllm/pull/40946",
+        "https://github.com/vllm-project/vllm/issues/40863"
+      ],
+      "sources": [
+        {"url": "https://github.com/vllm-project/vllm/pull/40946", "note": "vLLM PR #40946，标题「[Bugfix] Cap SWA/chunked-local runtime admission to startup pool-sizing bound」，合入于 2026-04-27。取到：修复的是「hybrid full + SWA 模型在 KV 池按启动期最小值开时的调度器死锁」，根因是「启动期池子尺寸公式与运行期准入门公式不一致」；引入统一的 `max_admission_blocks_per_request`；原句「the startup pool sizer and the runtime admission gate share one source of truth (drift would re-introduce #39734 or, worse, mid-prefill OOM)」；SWA 上界公式 `cdiv(sliding_window-1+max_num_batched_tokens, block_size) + 1`。访问于 2026-07-26。"},
+        {"url": "https://github.com/vllm-project/vllm/issues/40863", "note": "vLLM issue #40863，标题「[Bug]: Using H200 to deploy DeepSeekV4, after sending a long text, all subsequent requests are blocked.」，开于 2026-04-25，现已关闭。取到症状：H200 上部署 DeepSeek-V4-Pro，发一条 64k token 请求后后续请求全部挂起，「stuck in the waiting queue without actually running」、GPU 使用率 0%；配置涉及 block size 256、max model len 800k、fp8 KV。⚠️ 页面上未显示关联修复 PR，「#40863 由 #40946 修复」这层因果是我据两者时间（4/25 报、4/27 合）、症状与 PR 描述推断的，正文措辞建议保守（如「与 issue #40863 记录的同一类卡死」）。访问于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§25.2「覆盖了父工厂，就得自己补上死掉的代码」这一节已经引了 #40946 与 #40863，方向对，但读者不知道 **admission 是什么**。建议补一句直白定义（准入门控：进门前先按最坏情况估一遍资源，不够就先不放行），再补一句 PR 的那条原则（启动期池子与运行期准入必须共用一个真相源）——这句能把「为什么覆盖工厂就必须补 cap」讲成一条可迁移的工程经验，而不只是这个仓的历史包袱。⚠️ #40863 与 #40946 的因果关系请用「同一类问题」这种保守措辞（见 sources 说明）。SWA 公式和三种峰值形状的对照可留给链接，正文点到即止。"
+    },
+    {
+      "id": "vllm-async-scheduling",
+      "term": "异步调度（`async_scheduling`）与它的「占位 token」",
+      "kind": "external_concept",
+      "one_line": "让 CPU 在 GPU 还在算这一步时就把下一步排好，代价是排的时候上一步的 token 还没回来——于是先塞几个占位符顶着，等结果回来再回填。",
+      "what_it_is": "§25.5 里 `AsyncRecomputeScheduler` 是「异步调度 + 重算调度」的组合，但正文没说异步调度是什么。\n\n**它要解决什么**：一步推理的时间线是「CPU 调度 → GPU 前向 → CPU 处理输出 → CPU 调度下一步 → ……」。CPU 干活的那几毫秒里 GPU 是闲着的，步数一多就是可观的空转。异步调度就是把 CPU 侧的调度与 GPU 侧的前向**重叠**起来。vLLM v0.21.0 的配置注释一句话概括：\n\n> `\"Async scheduling helps to avoid gaps in GPU utilization, leading to better latency and throughput.\"`\n\n**代价与解法（占位 token）**：提前排下一步，就意味着排的时候**上一步生成的 token 还没算出来**——可调度器又必须知道「这条请求下一步有几个 token 要算」才能扣预算、分 block。vLLM 的解法是记账用的占位符：`AsyncScheduler._update_after_schedule()` 在调度后就给每条非 prefill-chunk 的请求做 `request.num_output_placeholders += 1 + 本步投机 token 数`，并把 `request.spec_token_ids` 填成一串 `-1` 占位；等真结果回来，`_update_request_with_output()` 再把 `num_output_placeholders` 扣回去，并把「已算但尚未确认」的部分从 `cache_blocks` 的位置里减掉（`num_computed_tokens - num_output_placeholders`）——**没确认的 token 不许进前缀缓存**，否则会把还不存在的内容当成命中素材。\n\n**接回本章**：这就是为什么 `AsyncRecomputeScheduler` 用多继承而不是复制——它需要的正是 `AsyncScheduler` 覆写的这两个小方法（`_update_after_schedule` / `_update_request_with_output`），而 `schedule()` 要走 `RecomputeScheduler` 的版本。两个类各改各的方法、互不重叠，MRO 一拼就完事。这是「接缝恰好对齐时，组合几乎零成本」的正面样本——与本章主旋律「接缝对不齐就得抄四百行」正好构成对照。",
+      "background": "「让 CPU 提前一步、与 GPU 重叠」在深度学习工程里是老配方（数据加载 prefetch、CUDA stream 上的 H2D 拷贝重叠都是同一思路），难点从来不在重叠本身，而在**依赖**：下一步的输入依赖上一步的输出。推理场景之所以能重叠，是因为调度器需要的其实只是「有几个 token」这个**数量**，而不是 token 的**内容**——数量可以提前确定，内容可以事后回填。占位 token 就是把这个观察写进了代码。vLLM 官方在此之后进一步把「异步优先」当成设计前提（2026-03 的 Model Runner V2 博客称其为 async-first、把 CPU/GPU 重叠视为设计约束而非补丁）。",
+      "example": "**（说明性示例，外部；机制取自 vLLM v0.21.0 `AsyncScheduler`，时间线为示意）**\n\n```text\n同步调度：\n  |--CPU排第k步--|=====GPU算第k步=====|--CPU收第k步--|--CPU排第k+1步--|=====GPU算第k+1步=====|\n                                                   ^ GPU 在这段空转\n\n异步调度：\n  |--CPU排第k步--|=====GPU算第k步=====|=====GPU算第k+1步=====|\n                 |--CPU排第k+1步--|                 ^ 重叠，GPU 不断流\n                  ↑ 此刻第 k 步的 token 还没出来：\n                    num_output_placeholders += 1   （先按「会多一个 token」记账）\n                    spec_token_ids = [-1, -1, ...] （投机 token 先用 -1 占位）\n                 结果回来后：placeholders 扣回去、真 token 回填、\n                            cache_blocks 只缓存已确认的那部分\n```",
+      "links": [
+        "https://docs.vllm.ai/en/v0.21.0/api/vllm/config/scheduler/",
+        "https://github.com/vllm-project/vllm/blob/v0.21.0/vllm/v1/core/sched/async_scheduler.py"
+      ],
+      "sources": [
+        {"url": "https://github.com/vllm-project/vllm/blob/v0.21.0/vllm/v1/core/sched/async_scheduler.py", "note": "vLLM v0.21.0 `AsyncScheduler` 全文（61 行）：`_spec_token_placeholders = [-1] * num_spec_tokens`；`_update_after_schedule` 里 `request.num_output_placeholders += 1 + cur_num_spec_tokens` 与 `request.spec_token_ids = self._spec_token_placeholders`；`_update_request_with_output` 里 `num_output_placeholders -= len(new_token_ids)` 与 `cache_blocks(request, request.num_computed_tokens - request.num_output_placeholders)`。这是「占位记账 + 只缓存已确认部分」的一手依据，也证明该类只覆写这两个方法（故与 RecomputeScheduler 的 schedule() 无冲突）。⚠️ 未联网抓该 URL，本地 v0.21.0 源码树逐字核对。核对于 2026-07-26。"},
+        {"url": "https://docs.vllm.ai/en/v0.21.0/api/vllm/config/scheduler/", "note": "vLLM v0.21.0 `SchedulerConfig.async_scheduling` 文档：原句「Async scheduling helps to avoid gaps in GPU utilization, leading to better latency and throughput.」访问于 2026-07-26。"},
+        {"url": "https://vllm.ai/blog/2026-03-24-mrv2", "note": "vLLM 官方博客《Model Runner V2》（2026-03-24，搜索结果转述，⚠️ 未一手抓页）：称 MRV2 为 async-first、把 CPU/GPU 重叠执行当作设计约束而非事后改造。仅用作「异步是官方长期方向」的背景，正文若引请标注为背景性说法。访问尝试于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§25.5 讲 `AsyncRecomputeScheduler` 时可以补两句：异步调度 = CPU 排下一步与 GPU 算这一步重叠，代价是「排的时候 token 还没出来」，所以 `AsyncScheduler` 只覆写两个记账方法（占位 + 回填）。这两句一加，「一行多继承就把两件事拼起来」就有了技术理由——因为两个父类改的是**不相交的方法集**。这正好是本章「接缝对齐 vs 对不齐」主题的正面注脚，很值钱。占位 token 的细节（-1、num_output_placeholders）点一句即可，别展开。"
+    },
+    {
+      "id": "python-mro-c3",
+      "term": "Python 的 MRO 与 C3 线性化：`class C(A, B)` 到底先找谁",
+      "kind": "notation",
+      "one_line": "MRO 是「查方法时按什么顺序翻类」的那张排好序的名单，Python 用 C3 算法算出来；`super()` 找的从来不是「父类」，而是**这张名单上的下一位**。",
+      "what_it_is": "§25.5 直接抛出一行记法：`MRO 是 AsyncRecomputeScheduler → AsyncScheduler → RecomputeScheduler → Scheduler`。这串箭头怎么来的、凭什么这么排，值得讲清——它是理解「一行多继承为何能白拿两套行为」的钥匙。\n\n**MRO 是什么**：Method Resolution Order，方法解析顺序。给一个类算出一张**从近到远的祖先名单**，查属性/方法时按名单顺序找，找到第一个就用。取法：`C.__mro__`（元组）或 `C.mro()`（列表）。\n\n**记法怎么读**：Python 官方文档用 `L[C]` 表示类 C 的线性化（名单），规则是\n\n```text\nL[C(B1 ... BN)] = C + merge(L[B1] ... L[BN], B1 ... BN)\n```\n\n读法：**C 自己排第一**，后面把各个基类的名单和「基类声明顺序」这张表合并（merge）。merge 的规则一句话：取第一张表的表头，若它**没有出现在任何其它表的尾部**（尾部 = 除表头外的部分），就收下它、从所有表里删掉；否则看下一张表的表头。反复直到取完；若取不出合法表头，Python 直接抛 `TypeError: MRO conflict`。\n\n**它保证两件事**（这才是 C3 的价值）：\n1. **局部优先顺序**：你写 `class C(A, B)`，那么 A 的方法就一定盖过 B 的——声明顺序被尊重；\n2. **单调性**：若在某个类的名单里 C1 排在 C2 前面，那么在它的**任何子类**的名单里 C1 也必须排在 C2 前面——不会出现「子类里顺序突然反了」这种隐蔽 bug。\n\n**`super()` 的真相**：它不是「调用父类」，而是「沿 MRO 走到当前类的下一位」。所以在多继承里，`super().__init__()` 可能跑到一个**跟你没有直接继承关系**的类上去——这叫协作式（cooperative）多继承。本章 `AsyncRecomputeScheduler.__init__` 里那句 `super().__init__(*args, **kwargs)` 之所以能把两条线的初始化都跑到，靠的就是这条链。",
+      "background": "C3 线性化在 **Python 2.3** 引入（替换 2.2 之前那套非单调的深度优先顺序），算法出自 Dylan 语言的论文《A Monotonic Superclass Linearization for Dylan》。Python 官方 HOWTO 文档 `docs.python.org/3/howto/mro.html` 至今仍是这套规则的权威出处，标题就叫《The Python 2.3 Method Resolution Order》。\n\n为什么需要它？经典的**菱形继承**问题：`D(B, C)`、`B` 和 `C` 都继承 `A`，那 `D` 查方法时该不该、该什么时候访问到 `A`？早期的深度优先会在访问 `B` 之后立刻钻到 `A`，把 `C` 的覆写跳过去——这既违反直觉也不安全。C3 的做法是**把共同祖先推迟到所有子孙都走完之后**，于是 `A` 一定排在 `B` 和 `C` 后面。",
+      "example": "**（说明性示例，外部；结构照着本章那个多继承摆的，类名用 A/B 抽象化，可在任意 Python 3 解释器里逐行验证）**\n\n```python\nclass Base:                     # 相当于 vLLM 的 Scheduler\n    def who(self): return \"Base\"\n\nclass A(Base):                  # 相当于 AsyncScheduler\n    def after(self): return \"A.after\"\n\nclass B(Base):                  # 相当于 RecomputeScheduler\n    def sched(self): return \"B.sched\"\n\nclass C(A, B):                  # 相当于 AsyncRecomputeScheduler\n    pass\n\n>>> [k.__name__ for k in C.__mro__]\n['C', 'A', 'B', 'Base', 'object']\n>>> C().after()   # 名单上 A 先命中\n'A.after'\n>>> C().sched()   # A 没有 sched，顺着名单走到 B\n'B.sched'\n```\n\n手算一遍（用官方那条公式）：\n\n```text\nL[A] = A Base object\nL[B] = B Base object\nL[C] = C + merge(L[A], L[B], (A, B))\n     = C + merge(A Base object, B Base object, A B)\n  取 A：A 没出现在其它表的尾部        -> 收下 A\n  取 Base：Base 出现在 (B Base object) 的尾部 -> 跳过，改看下一张表的表头 B\n  取 B：B 没出现在其它表的尾部        -> 收下 B\n  再取 Base：此时不在任何表尾         -> 收下 Base，然后 object\nL[C] = C A B Base object            <- 与 __mro__ 打印完全一致\n```\n\n对回本章：`AsyncRecomputeScheduler(AsyncScheduler, RecomputeScheduler)` 的名单就是 `[自己, AsyncScheduler, RecomputeScheduler, Scheduler, object]`——`_update_after_schedule` 在 `AsyncScheduler` 上先命中，`schedule` 在 `AsyncScheduler` 上没有、于是落到 `RecomputeScheduler`。**两个父类改的是不相交的方法集，所以一行声明就白拿两套行为，一行代码都不用复制。**",
+      "links": [
+        "https://docs.python.org/3/howto/mro.html",
+        "https://docs.python.org/3/library/functions.html#super"
+      ],
+      "sources": [
+        {"url": "https://docs.python.org/3/howto/mro.html", "note": "Python 官方 HOWTO《The Python 2.3 Method Resolution Order》（Python 3.14.6 文档树内）。取到：C3 于 Python 2.3 引入、替换 2.2 的非单调顺序；线性化公式 `L[C(B1 ... BN)] = C + merge(L[B1] ... L[BN], B1 ... BN)`；merge 规则（取第一张表的 head，若不出现在其它表的 tail 中就收下，否则看下一张表；取不出则 TypeError）；两条保证——local precedence ordering 与 monotonicity；官方给的 O/F/E/D/C/B/A 逐步计算示例与 `TypeError: MRO conflict among bases Y, X` 的例子。C3 出自 Dylan 论文《A Monotonic Superclass Linearization for Dylan》。访问于 2026-07-26。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§25.5 现在只给了结论式的箭头串。建议补 3-4 句把它讲成可自证的：① MRO 是查方法的名单、`C.__mro__` 可打印；② `super()` = 名单上的下一位，不是「父类」；③ 声明顺序决定谁先（`class C(A, B)` 里 A 盖过 B）。手算 merge 的过程**别搬进正文**（太重），交给链接；但那句「两个父类改的是不相交的方法集，所以零复制」一定要写——它是本章「接缝对齐则组合廉价」的点睛，和四百行复制税形成对照。"
+    },
+    {
+      "id": "fia-ascend-op",
+      "term": "FIA：`npu_fused_infer_attention_score`（昇腾的推理注意力总算子）",
+      "kind": "external_project",
+      "one_line": "昇腾把「长 prompt 的全量注意力」和「一次一个 token 的增量注意力」做成同一个融合算子，按 query 的序列长自动分流——§25.6 里那句「FIA 算子在多请求组同批时性能异常」说的就是它。",
+      "what_it_is": "本章只在一处提到 FIA：`ProfilingChunkScheduler` 把 `time_budget` 硬编码成 0.01、关掉按目标延迟记账的路径，注释给的理由是 FIA 算子在多请求组同批时性能异常。读者会卡在「FIA 是啥」。\n\n一句话：**FIA = Fused Infer Attention Score**，昇腾把推理侧的注意力做成的一个「总算子」，通过 `torch_npu.npu_fused_infer_attention_score` 调用。据 Ascend Extension for PyTorch 官方 API 文档，它的定位是「适配增量&全量推理场景的 FlashAttention 算子，既可以支持全量计算场景（PromptFlashAttention），也可支持增量计算场景（IncreFlashAttention）」——当 query 的 S 维等于 1 时走增量分支，否则走全量分支。它同时原生支持分页 KV（`block_table` + `block_size`）、GQA、多种量化与多种张量布局。\n\n**为什么这条注释值得读者留意**：它揭示了一层本章其它地方看不到的耦合——`ProfilingChunkScheduler` 想按「实测延迟」动态记账，前提是**延迟随长度的曲线是稳定可拟合的**；一旦底层算子在某些批组合下性能不线性、不稳定，上层这套二次模型的预测就不可信。所以这不是调度器写错了，而是**上层策略被下层算子的现状挡住了**。这也是把它如实标为「未完全启用」的原因。\n\n（这个算子族在 ch22 已经查透并展开过：v1/v2 两代接口的参数改名、`query_rope`/`key_rope` 为 MLA 预留的入口、`sparse_mode` 全表等，此处不重复。）",
+      "background": "昇腾推理注意力算子的演进是「专用 → 统一」的老路：先有训练侧的 `FlashAttentionScore`，再为推理拆出 PromptFlashAttention（全量/首 token）与 IncreFlashAttention（增量/逐 token）两个专用算子，最后合并成 `FusedInferAttentionScore` 这一个接口，并逐版本往里加分页 KV、量化、MLA rope 等入口。合并的好处是调用方不必为每种形态各挑一个 kernel；代价是这个大算子的性能特征变得依赖入参组合——本章遇到的「多请求组同批时性能异常」正是这类大算子的典型痛点。",
+      "example": null,
+      "links": [
+        "https://www.hiascend.com/document/detail/zh/Pytorch/600/apiref/apilist/ptaoplist_000144.html",
+        "https://www.hiascend.com/document/detail/zh/Pytorch/710/apiref/torchnpuCustomsapi/context/torch_npu-npu_fused_infer_attention_score.md"
+      ],
+      "sources": [
+        {"url": "https://www.hiascend.com/document/detail/zh/Pytorch/600/apiref/apilist/ptaoplist_000144.html", "note": "Ascend Extension for PyTorch 6.0.0《torch_npu.npu_fused_infer_attention_score》API 页。取到功能说明原句「既可以支持全量计算场景（PromptFlashAttention），也可支持增量计算场景（IncreFlashAttention）」、Q_S=1 时进入 IncreFlashAttention 分支的分流判据、融合内容（BMM1+softmax+BMM2 及量化）、PageAttention/GQA 支持与 BSH/BSND/BNSD/BNSD_BSND 布局。⚠️ 本仓未钉死 CANN/torch_npu 小版本，正文措辞请用「据 <版本> 文档」。访问于 2026-07-26。"},
+        {"url": "https://www.hiascend.com/document/detail/zh/Pytorch/710/apiref/torchnpuCustomsapi/context/torch_npu-npu_fused_infer_attention_score.md", "note": "同一算子 7.1.0 版文档，ch22 research 已一手抓取并逐条核对（本条只作交叉引用，避免与 ch22 重复展开）。"}
+      ],
+      "confidence": "high",
+      "writer_note": "§25.6 末尾那段「未完全启用」里，「FIA 算子」四个字目前是裸术语。建议只补一句括注：FIA = 昇腾的推理注意力融合算子 `npu_fused_infer_attention_score`（全量/增量通吃，ch22 讲透），并可顺势把那句「不是调度器写错，而是上层策略被下层算子挡住」点出来——这一句能让「诚实标注未启用」显得有分量。**别在这里展开算子细节**，ch22 已经讲过，重复会稀释本章主线。"
+    }
+  ]
+}
