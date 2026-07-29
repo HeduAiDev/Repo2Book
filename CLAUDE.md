@@ -62,6 +62,7 @@ python3 scripts/lint_diagram_scaffolding.py --all   # 图面脚手架泄漏（�
 #   ⚠️ 盲审必须**独立**：作图者自审天然看不见自己写的自证话术（ch09 就这么漏了一条泄漏）。
 python3 scripts/lint_chapter_map.py --all   # 全书章图徽标↔标题一致（重编号后必跑：exp-2026-07-20-02 曾 7 章图印旧节号而 --all 全绿）
 python3 scripts/lint_figures_registered.py   # 每章 manifest 图都登记进 bible/figures.json（archivist 反复漏登 chapter-map：ch23/25/26/27/32/33 六次；前缀容忍归一化比对，替掉 Lead 手工 grep）
+python3 scripts/lint_arch_model_stations.py {chapter_dir}   # 架构模型图：正文引用的站号不超本章 code_spine 总站数（防插章/走线变化导致站号漂移；图上刻意不标的"其他章组件"站不误报）
 ```
 机械问题让 writer 定点小修，不退整章。
 
