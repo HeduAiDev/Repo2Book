@@ -3,7 +3,7 @@
 import subprocess, sys
 from pathlib import Path
 
-CHAPTER = 'ch31'
+CHAPTER = 'ch16'
 INSTANCE = 'vllm'
 
 here = Path(__file__).resolve().parent
