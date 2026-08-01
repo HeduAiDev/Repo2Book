@@ -404,9 +404,19 @@ def build(model, cid):
             box(L, nx, ny, nw, h, f_, k_, r=5, sw=1.3)
         ids = comp_stations(nm)
         bd = f'第 {rng(ids)} 站' if ids else ''
-        fit(L, nx + 8, ny + 16, short(nm), nw - 18 - (tw(bd, 9, True) + 6 if bd else 0),
-            10 if kids else 9.6, C_TXT if not kids else C_CUR_S, bold=(isnew or bool(kids)),
-            anchor='start')
+        box_w = nw - 18 - (tw(bd, 9, True) + 6 if bd else 0)
+        base = 10 if kids else 9.6
+        # 深层子盒(叶子)类名很长(MultiHeadLatentAttentionWrapper/DeepseekV4MegaMoEExperts),
+        # 直接截到「Deepse…」读者认不出;先降字号到 7.2 再试完整名,仍超才截断。
+        if not kids and base > 7.2:
+            fs_try = max(7.2, base - 1.2)
+            if tw(short(nm), fs_try) <= box_w:
+                fit(L, nx + 8, ny + 16, short(nm), box_w, fs_try, C_TXT, bold=False, anchor='start')
+            else:
+                fit(L, nx + 8, ny + 16, short(nm), box_w, base, C_TXT, bold=False, anchor='start')
+        else:
+            fit(L, nx + 8, ny + 16, short(nm), box_w, base,
+                C_TXT if not kids else C_CUR_S, bold=(isnew or bool(kids)), anchor='start')
         if bd:
             text(L, nx + nw - 7, ny + 16, bd, 9, C_CUR_S, anchor='end', bold=True)
         if not kids:

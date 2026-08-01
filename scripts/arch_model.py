@@ -335,7 +335,10 @@ def build(inst=None):
                 skipped.append((cid, path))
                 continue
             sym = ''
-            sm = re.match(r'^([A-Za-z_][\w\.]*)\s*[:：]', what)
+            # ⚠️ what 可能以 'L1565' 这类残留行号打头(SPINE_RE 只吃进 lines 的前一段),
+            # 先剥掉再取符号,否则 symbol 全空、站号全并到该文件首个类(盲审抓出的 ch28 归错)
+            w2 = re.sub(r'^L?\d+(?:\s*[—\-–]\s*L?\d+)?\s*', '', what, count=1).lstrip()
+            sm = re.match(r'^([A-Za-z_][\w\.]*)\s*[:：]', w2)
             if sm:
                 sym = sm.group(1)
             units.append({'path': path, 'lines': lines, 'symbol': sym, 'what': what[:160]})
