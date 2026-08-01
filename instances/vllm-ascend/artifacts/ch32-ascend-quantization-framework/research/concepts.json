@@ -1,0 +1,87 @@
+{
+  "chapter_id": "ch32",
+  "generated_for": "昇腾量化框架：把 NPU 量化方案接进 vLLM",
+  "scope_note": "本章是『注册表 + 适配器』接入机制章，量化数学（scale/zero-point、GPTQ/AWQ/SmoothQuant）已明确归 ch31，不在此重复研究。以下只覆盖本章真正引入、且初学者看描述仍不懂的外部概念/工具。torch_npu/CANN/NZ(FRACTAL_NZ) 自 ch27 起反复使用、正文已给够用的内联 gloss，且公开权威文档稀疏，不为本章单独立项。",
+  "concepts": [
+    {
+      "id": "mxfp-microscaling",
+      "term": "MXFP / Microscaling（微缩放，OCP MX 规范 + E8M0）",
+      "kind": "external_concept",
+      "one_line": "一种『块浮点』量化格式：把 32 个相邻元素划成一组，整组共享一个『2 的幂』缩放因子（E8M0 纯指数，8 位指数 0 位尾数），每个元素自己只用极少位（如 FP4/FP8）存尾数。",
+      "what_it_is": "普通量化给每个张量（per-tensor）、每个输出通道（per-channel）或每个输入组（per-group）配一个 scale。Microscaling 把这个思路推到极端：组切到固定的 32 个元素一组，而且那 32 个值共享的 scale 不再是一个普通浮点数，而是一个纯指数——E8M0，8 位全用来表示指数、0 位尾数，所以它只能表示 2 的幂（2^-127 … 2^127）。直觉是：一个小组内的值动态范围很窄，给这一组乘一个合适的 2 的幂，就能把整组的幅度整体挪进元素那点可怜的尾数能表达的区间；因为 scale 是 2 的幂，反量化/缩放就退化成一次指数加减（硬件上的移位），几乎零成本。OCP MX 规范定了几个具体格式：MXFP8（元素 = FP8 的 E4M3 或 E5M2）、MXFP6（E2M3/E3M2）、MXFP4（E2M1）、MXINT8（元素 = INT8）——它们的共同点就是『32 元素一组 + 一个 E8M0 共享指数』。本章 §32.6 里 quant_parser.py 那张表的 scale_dtype=FLOAT8_E8M0FNU_DTYPE，正是这个 E8M0（FNU = _finite, no unsigned/特殊约定_ 的 PyTorch 命名变体）。",
+      "background": "MX 是 FP8 的下一代。FP8（见本文件 fp8-formats 条）让单个元素压到 8 位；但要再往下压到 4 位，单元素的指数位就不够表达足够动态范围了。Microscaling 的解法是把『表达动态范围』的责任从元素身上卸下来、上移到块级的共享指数：元素只留尾数（可少到 E2M1 的 1 位尾数），动态范围由块共享的 E8M0 兜住。学术阐述是 Rouhani et al.《Microscaling Data Formats for Deep Learning》(arXiv:2310.10537，2023 年 10 月，作者群来自 Microsoft、AMD、Meta、Intel 等多家)，论文把 MX 格式定位为『可直接替换 FP32 做训练+推理、用户摩擦低』的格式。随后 OCP（Open Compute Project）把它落成开放标准《OCP Microscaling Formats (MX) Specification v1.0》，由 AMD/Arm/Intel/Meta/Microsoft/NVIDIA/Qualcomm 等共同推动（公司名单据多方报道，本次未能一手打开规范 PDF 核实，见 confidence 说明）。NVIDIA Blackwell、AMD MI3xx 代起在硬件原生支持 MXFP8/6/4；昇腾 NPU 也把 MXFP 作为硬特化量化格式支持——这就是本章说『MXFP 是 NPU 硬特化』的由来。",
+      "example": "一个最小可核的块浮点例子。取一组 32 个元素，元素格式是 MXFP4 的 E2M1（1 符号 + 2 指数 + 1 尾数），它能直接表示的正值大约是 {0, 0.5, 1, 1.5, 2, 3, 4, 6} 这一小撮。现在这一组共享一个 E8M0 scale，假设 S = 2^3 = 8（E8M0 里只存指数 3，没有尾数）。那么某个元素 bit pattern 表示『1.5』时，它的真实值 = 1.5 × 8 = 12；另一个表示『0.5』的元素 = 0.5 × 8 = 4。关键在：32 个元素只花一份 8 位 scale，就把整组的量级抬到 8 倍，而每个元素自己只用 4 位。对比 per-channel——per-channel 是每行一个全精度 scale（如 fp16/fp32），Microscaling 是每 32 个元素一个『只有 2 的幂』的 scale。省位数的代价是 scale 只能是 2 的幂（粗），但 32 元素的小块把动态范围收窄，把这个『粗』兜住了。这正是 §32.6 图 27-3 里 per-group 面板的极端形态：每行 × 每组一个格，每个格存的是一个 e8m0 指数。",
+      "links": [
+        "https://arxiv.org/abs/2310.10537",
+        "https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf"
+      ],
+      "sources": [
+        "https://arxiv.org/abs/2310.10537 — arXiv 摘要页（2026-07-29 抓取）：确认标题《Microscaling Data Formats for Deep Learning》、作者 Bita Darvish Rouhani 等一长串（Microsoft/AMD/Meta/Intel 等背景）、提交 2023-10-16、核心贡献『per-block 缩放 + 窄位宽元素、可作 FP32 的 drop-in 替换』。",
+        "WebSearch『OCP Microscaling MXFP MX format E8M0 shared exponent specification』（2026-07-29）：给出 OCP MX Specification v1.0 的具体规格——块大小 32、scale 为 E8M0（8 位指数 0 位尾数、表 2 的幂 2^-127..2^127）、MXFP8/6/4 与 MXINT8 的元素编码表、以及规范文档 URL opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf；并提及 NVIDIA Blackwell/AMD 硬件原生支持。",
+        "https://www.emergentmind.com/topics/open-compute-project-mx-standard —（2026-07-29 抓取）：佐证 MX 块默认 k=32、MXFP 的共享 scale 典型编码为 E8M0、MXFP 元素格式含 E5M2/E4M3/E3M2/E2M3/E2M1、MXINT 含 INT8/5/4。"
+      ],
+      "confidence": "high",
+      "confidence_note": "格式机制（块 32 / E8M0 共享指数 / MXFP8/6/4/MXINT8 / 元素编码）经 arXiv 摘要 + 两个独立来源交叉核实，high。唯一未一手核实项：OCP 规范的推动公司完整名单（AMD/Arm/Intel/Meta/Microsoft/NVIDIA/Qualcomm）与规范 PDF 逐字内容——opencompute.org 的 PDF 本次返回 403 未能打开，名单据权威报道；正文若要点公司名，建议表述为『由多家芯片/云厂商共同推动』或只引规范名+版本，别逐个罗列公司。",
+      "writer_note": "正文 §32.6 已正确引用 OCP 规范 + arXiv:2310.10537 + E8M0，方向对。建议补的是『为什么用纯指数 scale』的直觉（块内动态范围窄 + 2 的幂 scale = 移位，硬件近乎免费）和一个 32 元素共享指数的微型数值例子，把 FLOAT8_E8M0FNU 这个 dtype 讲活。公司名单可淡化为『多家厂商共同推动』。深入交给 arXiv 与 OCP 规范链接即可，不必展开 NVFP4 等旁支。"
+    },
+    {
+      "id": "modelslim",
+      "term": "ModelSlim（华为昇腾模型压缩工具，本章入口 1 的量化来源）",
+      "kind": "external_project",
+      "one_line": "华为昇腾官方的模型压缩工具：把 LLM 离线量化成 W8A8 / W4A8 等，产出量化权重 + 一份逐层的 quant_model_description.json，vLLM-Ascend 用 --quantization ascend 直接加载。",
+      "what_it_is": "本章入口 1（AscendModelSlimConfig，@register_quantization_config('ascend')）服务的那个『上游量化工具』就是 ModelSlim。它挂在昇腾的 msIT（MindStudio Inference Tools）仓库里，包名 msmodelslim，定位为『昇腾原生的模型压缩工具』。它做的是离线 PTQ（post-training quantization）：喂校准数据、按配置把权重/激活压成目标位宽，支持的精度组合包括 W8A8、W4A8、W8A8S、W8A16 等。关键产物有两样——量化后的权重（safetensors），和一份 quant_model_description.json：后者逐层记录每一层被压成了哪种 quant_type（如把 model.layers.0.mlp.down_proj.weight 记成 W8A8_DYNAMIC）。本章 §32.3 反复出现的 self.quant_description 这个 dict，正是这份 json 在加载期解析出来的。所以 ModelSlim 是『量化决策真正发生的地方』，本章代码只是按它留下的描述去查表、选 scheme。",
+      "background": "ModelSlim 属华为昇腾（Ascend）软件栈，与 CANN、torch_npu、MindIE 同生态。它内部实现了多种量化算法（含 SmoothQuant、Flex Smooth Quant、AWQ、KVCache 量化、FA 量化等——这些算法的数学在 ch31 讲过），并提供一键量化入口（msmodelslim quant --config ...）。vLLM-Ascend 自 v0.9.0rc2 起实验性支持 --quantization ascend 来加载它的产物，官方量化指南（v0.11.0 版文档）演示了对 DeepSeek 用 quant_deepseek_w8a8.py 跑出 W8A8_DYNAMIC、生成 quant_model_description.json 再由 vLLM-Ascend 加载的全流程。这正是本章『逐层量化类型来自 ModelSlim 生成的 json』这条设计决策的外部出处。",
+      "example": "一次典型流程（据 vLLM-Ascend 量化指南 v0.11.0）：(1) 用 ModelSlim 对原始模型跑量化脚本，如 python3 quant_deepseek_w8a8.py --model_path <原始模型> --save_path <输出目录>；(2) 输出目录里得到量化权重 quant_model_weight_w8a8_dynamic.safetensors(.index.json) 和 quant_model_description.json——后者内容形如一串『层名.weight: 量化类型串』的键值对，例如 {\"model.layers.0.mlp.down_proj.weight\": \"W8A8_DYNAMIC\", ...}；(3) 起 vLLM-Ascend 时加 --quantization ascend，vLLM 实例化 AscendModelSlimConfig，maybe_update_config 把这份 json 读成 self.quant_description，之后 get_quant_method 就按它逐层查 quant_type、查注册表选 scheme。一句话：json 里那个字符串（如 'W8A8_DYNAMIC'）就是 §32.2 注册表的键的前一半。",
+      "links": [
+        "https://gitee.com/ascend/msit",
+        "https://docs.vllm.ai/projects/ascend/en/v0.11.0/user_guide/feature_guide/quantization.html"
+      ],
+      "sources": [
+        "WebSearch『Huawei ModelSlim Ascend quantization tool msit』（2026-07-29）：确认 ModelSlim=msmodelslim、属 Ascend/msit（MindStudio Inference Tools）、定位『Ascend 原生模型压缩工具』、支持 W4A8/W8A8/W8A8S/W8A16、产出 quant_model_description.json、可部署到 vLLM-Ascend(--quantization ascend) 与 MindIE、内含 SmoothQuant/AWQ/KVCache 量化等算法。",
+        "https://docs.vllm.ai/projects/ascend/en/v0.11.0/user_guide/feature_guide/quantization.html —（2026-07-29 抓取）：确认 --quantization ascend 自 v0.9.0rc2 实验支持、ModelSlim 转换产出 quant_model_description.json、DeepSeek 走 W8A8_DYNAMIC、量化需指定 ModelSlim 分支、加载即 --quantization ascend。"
+      ],
+      "confidence": "high",
+      "confidence_note": "项目定位、产物（quant_model_description.json）、与 --quantization ascend 的关系，经 vLLM-Ascend 官方文档（v0.11.0）+ 仓库搜索交叉核实。支持的算法清单来自搜索聚合，未逐个一手核，正文若列举算法建议只点 1-2 个（如 SmoothQuant/AWQ，正好呼应 ch31）。",
+      "writer_note": "正文已把 quant_description ↔ quant_model_description.json 的关系讲对，只需在首次提到 ModelSlim 处补一句『它是华为昇腾官方的离线量化工具，量化决策和那份逐层 json 都是它产出的』，让读者明白『这层用 W8A8 还是 W4A8』其实是 ModelSlim 在离线阶段定的、本章代码只负责按描述查表。深入交给 gitee/msit 与 vLLM-Ascend 量化指南。"
+    },
+    {
+      "id": "llm-compressor-compressed-tensors",
+      "term": "LLM-Compressor 与 compressed-tensors（vLLM 生态的量化工具 + 权重格式，本章入口 2）",
+      "kind": "external_project",
+      "one_line": "vLLM 生态自家的量化工具链：LLM-Compressor（原 Neural Magic 出品）对模型施加 GPTQ/AWQ/FP8 等压缩，把结果存成 compressed-tensors 格式，vLLM 原生能加载——本章入口 2 适配的正是这种格式。",
+      "what_it_is": "本章入口 2（AscendCompressedTensorsConfig）名字里的 compressed-tensors 是 vLLM 生态的一种量化权重格式。它由配套工具 LLM-Compressor 产出：你给 LLM-Compressor 一个压缩『配方』（recipe，比如把 Linear 层量化成 FP8 或 INT8），它对模型做一次性（oneshot）压缩，再把结果按 compressed-tensors 格式存盘。这个格式能表达 per-tensor / per-channel / per-token / per-group 各种量化策略，元素类型支持 INT8、FP8(E4M3)、4-bit 打包等。vLLM 内置了 CompressedTensorsConfig 来加载它——而昇腾的入口 2 正是『先删掉 vLLM 原版 compressed-tensors，再注册自己的昇腾版顶上去』（§32.1 的『先删后替换』手法），好让这种通用格式在 NPU 上走昇腾自己的 scheme。换句话说：compressed-tensors 是『跨硬件的通用量化格式』，入口 2 的工作是把它在昇腾上落地。",
+      "background": "LLM-Compressor 最初是 Neural Magic 公司的工具（Neural Magic 是被 Red Hat 收购、深度参与 vLLM 的公司），现已并入 vllm-project 组织、由 Red Hat AI 与 vLLM 项目共同维护。它支持的算法清单很广：简单 PTQ、GPTQ、AWQ、SmoothQuant、AutoRound、SpinQuant/QuIP 旋转量化等（这些算法的数学同样归 ch31）；支持的精度含 W8A8(int8/fp8)、W4A16、W8A16，乃至 MXFP4/MXFP8/NVFP4 这类 microscaling 格式。它的价值在于把『量化算法 → 一种 vLLM 直接能吃的统一格式』打通，让上游压缩和下游推理解耦。昇腾入口 2 复用这套格式，是不想为昇腾另造一套权重描述——直接站在 vLLM 生态的统一格式上，只替换底层计算。",
+      "example": "一段典型用法（据 llm-compressor 仓库 README）：from llmcompressor import oneshot; from llmcompressor.modifiers.quantization import QuantizationModifier; 然后 recipe = QuantizationModifier(targets=\"Linear\", scheme=\"FP8_BLOCK\", ignore=[\"lm_head\"])，oneshot(model=model, recipe=recipe) 跑一次性压缩，model.save_pretrained(\"output_dir\") 就把量化结果按 compressed-tensors 格式存盘。之后 vLLM 端 quantization=\"compressed-tensors\" 即可加载。对应到本章：当用户用这个格式、又想在昇腾 NPU 上跑，vLLM 命中的就是被昇腾『先删后替换』过的 AscendCompressedTensorsConfig，它再把各层分发到昇腾的 scheme。与入口 1 的差别在来源——入口 1 吃 ModelSlim 的 json，入口 2 吃 LLM-Compressor 的 compressed-tensors 格式，殊途同归都进同一张 scheme 注册表。",
+      "links": [
+        "https://github.com/vllm-project/llm-compressor",
+        "https://docs.vllm.ai/en/stable/api/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.html"
+      ],
+      "sources": [
+        "https://github.com/vllm-project/llm-compressor —（2026-07-29 抓取）：确认它是『Transformers 兼容、为 vLLM 优化部署』的压缩库、源自 Neural Magic、现归 vllm-project（引用致谢 Red Hat AI 与 vLLM Project）、产出 compressed-tensors 格式、支持 GPTQ/AWQ/SmoothQuant/AutoRound/SpinQuant/QuIP、精度含 W8A8(int8/fp8)/W4A16/MXFP4/MXFP8/NVFP4 等、给出 QuantizationModifier+oneshot+save_pretrained 示例。",
+        "WebSearch『compressed-tensors LLM-Compressor Neural Magic vLLM quantization format』（2026-07-29）：确认 vLLM 内置 CompressedTensorsConfig 原生支持该格式、格式支持 naive/int/float/pack_quantized 等方案、支持 per-tensor/per-channel/per-token/group 策略与 INT8/FP8(E4M3)/4-bit 类型、由 LLM-Compressor 产出。"
+      ],
+      "confidence": "high",
+      "confidence_note": "项目定位、与 Neural Magic/Red Hat/vllm-project 的沿革、compressed-tensors 格式能力、典型用法，经 GitHub 仓库一手抓取 + vLLM 文档搜索交叉核实。",
+      "writer_note": "正文入口 2 只讲了『先删后替换』的手法，建议在首次出现 compressed-tensors 处补一句外部背景：『这是 vLLM 生态的通用量化权重格式，由配套工具 LLM-Compressor（原 Neural Magic）产出，昇腾入口 2 把这种通用格式在 NPU 上落地』。别展开它的算法清单（归 ch31），点到『跨硬件通用格式 + 昇腾复用之』即可，深入交给 GitHub 与 vLLM 文档链接。"
+    },
+    {
+      "id": "fp8-formats",
+      "term": "FP8（E4M3 / E5M2 两种 8 位浮点编码，本章入口 3，也是 MXFP8 的元素格式）",
+      "kind": "external_concept",
+      "one_line": "8 位浮点，一套两种编码：E4M3（4 位指数 3 位尾数，精度较高、动态范围较窄，适合权重/激活）和 E5M2（5 位指数 2 位尾数，动态范围宽，适合梯度）。",
+      "what_it_is": "FP8 是把一个浮点数压进 8 位的格式。浮点数 = 符号 + 指数 + 尾数，8 位怎么在指数和尾数之间分，决定了它『能表示多大的范围』和『多细的分辨率』。E4M3 分 4 位给指数、3 位给尾数——尾数多一点所以精度高，但指数少所以能表的范围窄，正适合数值分布相对集中的权重和激活（本章 quant_parser.py 里的 torch.float8_e4m3fn 就是它，fn = 有限、无无穷的特殊约定）。E5M2 分 5 位指数、2 位尾数——范围宽、精度糙，适合梯度这种动态范围大的量。本章入口 3（AscendFp8Config，先删 vLLM 原版 fp8/deepseek_v4_fp8 再替换）处理的就是 FP8 量化模型。它还是理解 MXFP 的台阶：MXFP8 的元素格式正是 FP8 的 E4M3/E5M2，只是外面再套一层 32 元素共享的 E8M0 指数。",
+      "background": "FP8 由 NVIDIA、Arm、Intel 三家在论文《FP8 Formats for Deep Learning》(arXiv:2209.05433，2022 年 9 月) 联合提出，目的就是在几乎不掉精度的前提下把训练/推理的位宽从 16 位再砍半到 8 位。E4M3 为了能多表几个值，砍掉了无穷大、只留一种 NaN 编码；E5M2 则遵循 IEEE 754 的特殊值约定。这套格式很快被 NVIDIA Hopper 代起硬件原生支持，成为大模型低精度推理的主力。它往上接的正是 Microscaling——当 FP8 还想再压到 4 位时，单元素指数位不够，于是有了 MXFP（见 mxfp-microscaling 条）。所以 FP8 是『单元素窄浮点』的终点，MXFP 是『块浮点』的起点。",
+      "example": "两种编码的位布局对比。一个 8 位 FP8：最高位是符号 S。E4M3 = [S][eeee][mmm]，即 1 符号 + 4 指数 + 3 尾数，能表的最大值约 ±448，精度相对高——本章 torch.float8_e4m3fn 用于激活就取它。E5M2 = [S][eeeee][mm]，即 1 符号 + 5 指数 + 2 尾数，能表到 ±57344、动态范围接近 fp16，但只有 2 位尾数所以糙，多用于梯度。直觉：指数位管『数量级跨多大』、尾数位管『相邻两个数分多细』；权重/激活数量级集中、要分得细，用 E4M3；梯度数量级散、容忍糙，用 E5M2。放到本章语境：entry 3 的 FP8 模型，激活/权重多为 E4M3；而 §32.6 的 MXFP8 是把这些 E4M3 元素再 32 个一组、配一个共享 E8M0 指数。",
+      "links": [
+        "https://arxiv.org/abs/2209.05433"
+      ],
+      "sources": [
+        "https://arxiv.org/abs/2209.05433 — arXiv 摘要页（2026-07-29 抓取）：确认标题《FP8 Formats for Deep Learning》、作者 Paulius Micikevicius 等、提交 2022-09-12、核心『8 位浮点 FP8 含两种编码：E4M3（4 指数 3 尾数，不表无穷、单一 NaN）与 E5M2（5 指数 2 尾数，遵循 IEEE 754 特殊值）』。",
+        "WebSearch『FP8 E4M3 E5M2 8-bit floating point format deep learning OCP OFP8 specification』（2026-07-29）：佐证 E4M3/E5M2 为 FP8 两种编码及其指数/尾数分配；NVIDIA/Arm/Intel 联合提出为公认出处（摘要页未列单位，此据检索聚合）。"
+      ],
+      "confidence": "high",
+      "confidence_note": "E4M3/E5M2 的指数/尾数位分配、E4M3 不表无穷、E5M2 遵循 IEEE 754，均经 arXiv 摘要一手核实。『NVIDIA/Arm/Intel 联合』与『E4M3 用于权重激活、E5M2 用于梯度』是公认结论但摘要页未逐字列单位/用途，置信 high 但建议正文表述为『业界由 NVIDIA 等推动』而非绝对化；torch.float8_e4m3fn 与 MXFP8 用 E4M3/E5M2 元素这点与 pin 码一致。",
+      "writer_note": "正文入口 3 与 §32.6 都用到 FP8/E4M3。建议首次出现 torch.float8_e4m3fn 处用一句补背景：『FP8 是 8 位浮点，E4M3 是其中精度较高的编码（4 指数 3 尾数），由 NVIDIA/Arm/Intel 在 2022 年提出』，并点一句『E4M3 也是 MXFP8 的元素格式』把入口 3 和 §32.6 串起来。别展开训练细节，深入交给 arXiv:2209.05433。"
+    }
+  ]
+}

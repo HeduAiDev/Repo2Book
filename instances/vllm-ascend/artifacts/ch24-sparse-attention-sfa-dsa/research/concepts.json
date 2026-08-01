@@ -1,0 +1,148 @@
+{
+  "chapter": "ch24-sparse-attention-sfa-dsa",
+  "researched_at": "2026-08-01",
+  "scope_note": "读者定向的外部背景。本章是 SFA/DSA 实现章：论文级谱系（NSA/DSA/Lightning Indexer 打分函数/MQA-GQA/FlashAttention/KL/版本时间线）已由 ch23 primer 章研究清单建好，本清单只补「实现章字面上出现、但读者按描述仍不懂、且 ch20/ch22/ch23 未立过」的三处：① 昇腾稀疏注意力算子族（SFA 与 Lightning Indexer 两个 torch_npu 官方算子的功能与参数契约——正文 torch.ops._C_ascend.npu_* 调用的外部真身）；② PA_BSND/PA_ND 分页布局记法（TND 已在 ch20 立过，PA_* 是它的分页同族）；③ DSA 的 compressor 出处（DeepSeek-V3.2 论文里没有，是 CANN sparse_attn_sharedkv 融合内核的两档 KV 设计）。全部条目均不解读本仓 pin 源码；版本敏感锚定 pin（vllm-ascend v0.21.0rc1 / commit 80610e44）。",
+  "concepts": [
+    {
+      "id": "c1-sfa-op-family",
+      "term": "昇腾稀疏注意力算子族：SFA（npu_sparse_flash_attention）与 Lightning Indexer（npu_lightning_indexer / npu_quant_lightning_indexer）",
+      "kind": "external_project",
+      "one_line": "昇腾把两段式稀疏注意力的两段各做成一个官方融合算子——Lightning Indexer 负责低维打分选 top-k、Sparse Flash Attention 只对选中的位置算全精度注意力；正文里 `torch.ops._C_ascend.npu_lightning_indexer` / `npu_sparse_flash_attention` 那几行调用的官方真身，也是 ch20 的 `npu_fused_infer_attention_score` 在稀疏注意力这一脉上的表亲。",
+      "what_it_is": "昇腾 torch_npu 自定义 API 里的一族稀疏注意力算子，官方文档互相配套、专门为大序列推理而做：\n\n**npu_sparse_flash_attention（文档自己简称 SFA）**。官方原话：「sparse_flash_attention（SFA）是针对大序列长度推理场景的高效注意力计算模块，该模块通过『只计算关键部分』大幅减少计算量」；计算式 `softmax(Q@K̃ᵀ/√dₖ)@Ṽ`，其中 K̃/Ṽ 是「基于某种选择算法得到的重要性较高的 Key 和 Value」。文档还特意强调它是「面向 Sparse Attention 的全新算子，针对离散访存进行了指令缩减及搬运聚合的细致优化」——稀疏选择天然引入离散访存（KV 不再是连续的一段），算子内核把搬运聚合成块，这正是它区别于普通融合注意力算子的卖点。参数契约（官方文档）：`sparse_indices` =「代表离散取 kvCache 的索引」，TND 下形状 `[T, KV_N, sparse_size]`；`sparse_mode`：0=全部计算、3=rightDownCausal（「以右下顶点往左上为划分线的下三角场景」）——与 ch20 立过的 mask 语义（0 无 mask / 3 因果下三角 / 4 滑窗）是同一套约定；`sparse_block_size`：1=Token-wise 稀疏化（每个 token 独立评估），>1 且 ≤128=Block-wise（块内共享稀疏决策）；`attention_mode`：仅支持 2，即 MLA-absorb 模式——计算时把 query/key 的 nope 与 rope 沿头维拼接合并，「且 key 和 value 共享同一份底层张量数据」——这正是 ch22 MLA 的 KV 共享写法，SFA 能直接建在 MLA 之上的算子侧依据。\n\n**npu_lightning_indexer**。官方公式：`Indices = Top-k{ [1]_{1×g} @ [ (W @ [1]_{1×S_k}) ⊙ ReLU(Q_index @ K_index^T) ] }`——点积打分 → ReLU 过滤负相关 → 逐位置权重 W 加权 → 跨头求和 → top-k。这份数学与 ch23 论文精读里的 DSA 打分函数是同一份（文档没点名 DeepSeek，但算子名与功能即 Lightning Indexer 的昇腾落地）。`sparse_count`（topK 保留的块/位置数）取值 [1,2048] 及 3072/4096/5120/6144/7168/8192——SFA 用的 2048 在其中；`weights` 形如 `[T, N1]`，即每 token 每头的标量权重，正是论文打分里那个「加权求和」的 W。输出 `sparse_indices` 形状 `[T, KV_N, sparse_count]`，KV_N（key 的头数）只支持 1——MQA/MLA 风格、一份 KV 被所有 query 头共享。\n\n**npu_quant_lightning_indexer**。官方原话：「QuantLightningIndexer 是推理场景下，SparseFlashAttention（SFA）前处理的计算，选出关键的稀疏 token」；输入是已 INT8 量化的 query/key，配 per-token-head 反量化 scale（文档描述为「存8算8」）。这是 DSA indexer 名字里 quant 的来历，也是正文那句「量化只是让打分更快、挑出来的还是那批位置」的官方背书。sparse_count 上限 2048，DSA 用的 512 在其中。",
+      "background": "这套算子属于昇腾 torch_npu 自定义 API（CANN 生态），PyTorch 7.3.0 与 26.0.0 两代文档都已收录。2026-06-04，vllm-ascend 以 PR #9491「Add LightningIndexer and SparseFlashAttention ACLNN ops」把 CANN ACLNN 的 `attention/lightning_indexer` 与 `attention/sparse_flash_attention` 两个算子源文件移植进 vllm-ascend 的 custom-op 构建流程——正文 `torch.ops._C_ascend.npu_*` 命名空间就来自这条 custom-op 线（ch28 会再碰）。同族算子还有 `sparse_attn_sharedkv`（见 c3）与 `quant_lightning_indexer_v2_metadata`（CANN ops-transformer）。它们在昇腾侧扮演的角色，相当于 CUDA 侧 FlashMLA 稀疏核的对应物——DeepSeek DSA 生态落到昇腾的算子件。pin 为 vllm-ascend v0.21.0rc1（commit 80610e44，2026-08-01 核对）。",
+      "example": "拿 SFA 一节正文的调用对一下官方契约（形状取自 §24.5 的形状表，说明性）：设本次 forward 有 512 个 token（T=512）、SFA 的索引器 64 头 × 128 维、sparse_count=2048。\n- `npu_lightning_indexer(query=q_li, key=kv_cache[2], weights=..., block_table=..., layout_query=\"TND\", layout_key=\"PA_BSND\", sparse_count=2048, sparse_mode=3)`：query 按 TND 是 `[512, 64, 128]`（token 打平 × 64 头 × 128 维）；key 按 PA_BSND 分页存（形状见 c2）；输出 `sparse_indices` 为 `[512, 1, 2048]`——每个 query token 一行、每行 2048 个选中 KV 位置的索引。\n- `npu_sparse_flash_attention(query=ql_nope, key=kv, value=kv, sparse_indices=topk_indices, sparse_block_size=1, attention_mode=2, ...)`：`sparse_block_size=1` 即 token-wise 稀疏化（每 token 独立评估，不共享决策）；`attention_mode=2` 即 MLA-absorb（key/value 共享底层张量，nope/rope 沿 D 拼接）；`sparse_indices` 就是上一算子输出的 `[512, 1, 2048]`——内核只对选中的 2048 个位置取 KV、算注意力。\n- `sparse_mode=3` 在官方文档里的语义是 rightDownCausal 下三角 mask（与 ch20 的 0/3/4 mask 约定同一套），不是「按分页选择」——分页是 PA_ 布局 + block_table 的事（c2）。",
+      "links": [
+        "https://www.hiascend.com/document/detail/zh/Pytorch/730/apiref/torchnpuCustomsapi/docs/context/torch_npu-npu_sparse_flash_attention.md",
+        "https://www.hiascend.com/document/detail/zh/Pytorch/2600/apiref/torchnpuCustomsapi/docs/zh/custom_APIs/torch_npu/torch_npu-npu_lightning_indexer.md",
+        "https://www.hiascend.com/document/detail/zh/Pytorch/2600/apiref/torchnpuCustomsapi/docs/zh/custom_APIs/torch_npu/torch_npu-npu_quant_lightning_indexer.md"
+      ],
+      "sources": [
+        {
+          "url": "https://www.hiascend.com/document/detail/zh/Pytorch/730/apiref/torchnpuCustomsapi/docs/context/torch_npu-npu_sparse_flash_attention.md",
+          "took": "torch_npu.npu_sparse_flash_attention 官方文档（PyTorch 7.3.0 版）：算子自述「sparse_flash_attention（SFA）是针对大序列长度推理场景的高效注意力计算模块……通过『只计算关键部分』大幅减少计算量」「面向 Sparse Attention 的全新算子，针对离散访存进行了指令缩减及搬运聚合的细致优化」；sparse_indices=「代表离散取kvCache的索引」、TND 下 [Q_T, KV_N, sparse_size]；layout_kv 支持 TND/BSND/PA_BSND，PA_BSND 时 KV shape [block_num, block_size, KV_N, D]（block_size 16 的倍数、最大 1024）；sparse_mode 0=全部计算、3=rightDownCausal；sparse_block_size 1=Token-wise、>1 且 ≤128=Block-wise；attention_mode 仅支持 2（MLA-absorb，nope/rope 沿 D 拼接、key/value 共享底层张量）。访问 2026-08-01。"
+        },
+        {
+          "url": "https://www.hiascend.com/document/detail/zh/Pytorch/2600/apiref/torchnpuCustomsapi/docs/zh/custom_APIs/torch_npu/torch_npu-npu_lightning_indexer.md",
+          "took": "torch_npu.npu_lightning_indexer 官方文档（26.0.0 版）：官方公式 Indices = Top-k{ [1]_{1×g} @ [(W @ [1]_{1×S_k}) ⊙ ReLU(Q_index @ K_index^T)] }；weights 形状 [B,S1,N1] 或 [T,N1]；sparse_count 支持 [1,2048] 及 3072/4096/5120/6144/7168/8192；sparse_mode 0=defaultMask、3=rightDownCausal；key 的 PA_BSND shape [block_count, block_size, N2, D]（N2 仅支持 1）；输出 sparse_indices TND 下 [T1, N2, sparse_count]。访问 2026-08-01。"
+        },
+        {
+          "url": "https://www.hiascend.com/document/detail/zh/Pytorch/2600/apiref/torchnpuCustomsapi/docs/zh/custom_APIs/torch_npu/torch_npu-npu_quant_lightning_indexer.md",
+          "took": "torch_npu.npu_quant_lightning_indexer 官方文档（26.0.0 版）：官方原话「QuantLightningIndexer是推理场景下，SparseFlashAttention（SFA）前处理的计算，选出关键的稀疏token」；流程=INT8 Q/K 相乘→乘反量化 Scale_Q/Scale_Kᵀ→ReLU→乘权重 W→按 g 方向 Top-k；query_quant_mode/key_quant_mode 仅支持 0（Per-Token-Head）；sparse_count [1,2048]。访问 2026-08-01。"
+        },
+        {
+          "url": "https://github.com/vllm-project/vllm-ascend/pull/9491",
+          "took": "vllm-ascend PR #9491「Add LightningIndexer and SparseFlashAttention ACLNN ops」：2026-05-23 创建、2026-06-04 合并；把 CANN ACLNN 的 attention/lightning_indexer 与 attention/sparse_flash_attention 源移植进 build_aclnn.sh 自定义算子构建。注意：该 PR 与 pin（v0.21.0rc1 / 80610e44）的包含关系未逐一核实，正文不需要这个断言。访问 2026-08-01。"
+        },
+        {
+          "url": "https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp/raw/main/config.json",
+          "took": "公开 DeepSeek-V3.2-Exp config.json：index_topk=2048、index_n_heads=64、index_head_dim=128、kv_lora_rank=512、q_lora_rank=1536（用于核对『512 vs 2048』口径：公开配置是 2048，pin 读的 hf_config.index_topk=512 属昇腾适配版配置）。访问 2026-08-01。"
+        }
+      ],
+      "confidence": "high（算子功能与全部参数契约出自 torch_npu 官方文档一手核对；PR #9491 与 pin 的包含关系未核实，正文不依赖该断言）",
+      "writer_note": "正文该点的程度：① §24.5 那句「sparse_mode=3 是内核约定的稀疏模式（按分页 block_table 选择）」建议改口径——官方文档的 sparse_mode=3 是 rightDownCausal 下三角 mask（与 ch20 的 0/3/4 mask 约定同一套），「按分页选择」是 layout_key=PA_BSND + block_table 的事（c2），两者别混写；② 「SFA 的 2048 是内核常量」宜软化为「2048 是算子支持的稀疏档位（取值范围 [1,2048] 及 3072…8192）里的取值」；③ 若正文想给 attention_mode=2 / sparse_block_size=1 补一句，官方语义现成（MLA-absorb 的 key/value 共享、token-wise 稀疏化）；④ 「量化只是让打分更快」有官方背书（npu_quant_lightning_indexer 文档原话，INT8 存8算8）；⑤ 别把公开 config 的 index_topk=2048 与 pin 的 512 混写（ch23 c7 已立训练/推理口径，本清单已一手核对公开配置值）；⑥ pre_tokens/next_tokens=2^63-1、sparse_mode 的 0/3/4 全表等留给链接。"
+    },
+    {
+      "id": "c2-paged-layout-notation",
+      "term": "PA_BSND / PA_ND：注意力算子的分页布局记法",
+      "kind": "notation",
+      "one_line": "昇腾注意力算子的 layout_* 参数里，PA_ 前缀表示 KV cache 按固定大小块分页存储（Paged Attention）：PA_BSND 的物理形状是 [block_num, block_size, N, D]、PA_ND 是稀疏注意力内核一族唯一认的 layout_kv——与 ch20 立过的 TND（token 打平）同族，只是把「连续序列」换成了「分页序列」。",
+      "what_it_is": "昇腾算子的 `layout_query` / `layout_key` / `layout_kv` 参数用三四个字母标出张量的逻辑维度序，同族记法：\n- **TND** = Token-NumHeads-D：一批序列的 token 沿轴 0 打平（T=Σ 各序列长），配 `actual_seq_lengths`（前缀和）定位各序列边界——ch20 已立，本章沿用；\n- **BSND** = Batch-Seq-NumHeads-D：常规四维批张量；\n- **PA_BSND / PA_ND**：PA = Paged Attention（分页）。KV 不再是一整段连续序列，而是沿序列维切成固定大小的块（block_size 为 16 的倍数、最大 1024），物理形状 `[block_num, block_size, KV_N, D]`；配套 `block_table` 把每条序列的逻辑块号映射到物理块号（ch17/ch20 讲过的分页地址簿）。KV_N 只支持 1——MLA/MQA 风格、一份 KV 被所有 query 头共享。\n- **PA_ND** 出现在稀疏注意力内核 `npu_sparse_attn_sharedkv` 的 `layout_kv` 参数：CANN ops-transformer 官方 README 原话「layout_kv 仅支持输入 PA_ND（PageAttention）」——该内核一族的分页约定，官方文档只到「分页」这一层，物理形状未展开（ND 字面 = 每块内保留头维 N 与特征维 D，B/S 两维被分页取代）。\n背景：这套记法是昇腾 torch_npu / CANN 算子 API 的参数约定；vLLM-Ascend 把 vLLM 的分页 KV cache 按算子要求的物理形状喂进去（ch17 的 `_adjust_kv_layout` 用 as_strided 把 block 维 stride 钉成一页，就是为这类算子准备的）。正文里 indexer 的 key 用 PA_BSND、SFA/DSA 稀疏核的 KV 用 PA_ND——同族两档。",
+      "example": "设一条 512 token 的序列、KV_N=1、head_dim=128、block_size=128（说明性数值，直接代官方形状定义）：\n- **PA_BSND 下这条序列的 key**：512 ÷ 128 = 4 个物理块，物理形状 `[4, 128, 1, 128]`——4 块 × 每块 128 token × 1 个 KV 头 × 128 维。逻辑上仍是「这条序列的 512 个 KV 位置」，只是散在 4 个块里。`block_table` 形如 `[7, 3, 9, 1]`：逻辑块 0→物理块 7、逻辑块 1→物理块 3，以此类推（块号由 KV cache 分配时的空闲情况决定，不保证连续）。\n- **对比同序列 TND**：key 是 `[512, 1, 128]`，沿轴 0 连续打平，没有块的概念。\n- **sparse_indices（indexer 输出）在 TND 下**：`[512, 1, 2048]`——每 query token 一行、每行 2048 个选中位置的索引。\n- 逐行对应正文两处调用：`npu_lightning_indexer(... layout_query=\"TND\", layout_key=\"PA_BSND\", block_table=attn_metadata.block_table ...)`（device_op.py:L371 段）——query 是连续 token 流（TND）、KV 是分页 cache（PA_BSND），block_table 告诉算子每条序列的逻辑块在物理块哪里；`npu_sparse_attn_sharedkv(... layout_kv=\"PA_ND\", ori_block_table=..., cmp_block_table=... ...)`（dsa_v1.py:L2139 段）——该内核一族只用 PA_ND 约定。",
+      "background": "记法本身是昇腾算子 API 的既定约定，不是本仓发明；vLLM-Ascend 的角色是把 vLLM 引擎的 paged KV cache（block 分页、block_table 映射）按昇腾算子要求的物理形状对接过去——ch17 的「调整 KV 布局」与 ch20 的「slot_mapping / block_table 地址簿」已经把这个分页模型立过，本章是同一布局在稀疏算子 layout 参数里的字面形态（TND 打平 + PA_ 分页并存于一次调用：query 走 TND、KV 走 PA_）。",
+      "links": [
+        "https://www.hiascend.com/document/detail/zh/Pytorch/730/apiref/torchnpuCustomsapi/docs/context/torch_npu-npu_sparse_flash_attention.md",
+        "https://gitcode.com/cann/ops-transformer/tree/c730db2cede402882ba6a2262c438a0dd6c874a4/experimental/attention/sparse_attn_sharedkv"
+      ],
+      "sources": [
+        {
+          "url": "https://www.hiascend.com/document/detail/zh/Pytorch/730/apiref/torchnpuCustomsapi/docs/context/torch_npu-npu_sparse_flash_attention.md",
+          "took": "官方文档：layout_kv 为 PA_BSND 时 KV shape = [block_num, block_size, KV_N, D]，block_size 为 16 的倍数、最大 1024；block_table「PageAttention 的 block 映射表，仅 layout_kv 为 PA_BSND 时使用」；sparse_indices TND 下 [Q_T, KV_N, sparse_size]。访问 2026-08-01。"
+        },
+        {
+          "url": "https://www.hiascend.com/document/detail/zh/Pytorch/2600/apiref/torchnpuCustomsapi/docs/zh/custom_APIs/torch_npu/torch_npu-npu_lightning_indexer.md",
+          "took": "官方文档：key 在 layout_key=PA_BSND 时 shape [block_count, block_size, N2, D]（block_size 16 的整数倍、最大 1024），N2 仅支持 1；block_table「PageAttention 中 KV 存储的 block 映射表，二维，第一维 = B」。访问 2026-08-01。"
+        },
+        {
+          "url": "https://gitcode.com/cann/ops-transformer/tree/c730db2cede402882ba6a2262c438a0dd6c874a4/experimental/attention/sparse_attn_sharedkv",
+          "took": "CANN ops-transformer sparse_attn_sharedkv README：layout_kv「仅支持输入 PA_ND（PageAttention）」，此时 cu_seqlens 无效——PA_ND 语义只确认到「分页」，物理形状官方未展开。访问 2026-08-01。"
+        }
+      ],
+      "confidence": "high（PA_BSND / TND 的形状与 block_table 语义全部出自 torch_npu 官方文档一手核对）；PA_ND 官方只有「仅支持 PA_ND（PageAttention）」一句、物理形状未公开，凡涉及 PA_ND 的断言都停在「分页」语义上（正文只需这个粒度）",
+      "writer_note": "正文 §24.5/§24.7 两处 layout 参数目前只字未解——建议各补一句：PA_ 前缀 = 分页存储、物理形状 [block_num, block_size, N, D]、KV_N=1 共享 KV；「512 token ÷ 128 块长 = 4 块」这种小例子可作行内直觉，或只点形状不展开；PA_ND 与 PA_BSND 的家族关系（indexer 用 BSND 档、稀疏核用 ND 档）一句话点到，细的留给链接；不要把「分页选择」误安到 sparse_mode 头上（见 c1 writer_note）。"
+    },
+    {
+      "id": "c3-dsa-compressor-origin",
+      "term": "DSA 的 compressor（两档 KV：ori_kv + cmp_kv）：论文里没有的部件",
+      "kind": "external_concept",
+      "one_line": "正文里 DSA 那个按 cmp_ratio=4 把 KV 4:1 压短再打分的 compressor，在 DeepSeek-V3.2 论文（arXiv:2512.02556）里并不存在——它是昇腾 CANN 稀疏注意力融合内核 sparse_attn_sharedkv 自带的两档 KV 设计（原始 KV + 压缩 KV），同一内核还是 DeepSeek V4 稀疏结构（第 26 章）的算子底座。",
+      "what_it_is": "把三处一手材料对完，compressor 的出处就清楚了：\n1. **DeepSeek-V3.2 技术报告（arXiv:2512.02556）**：DSA = lightning indexer + 细粒度 token 选择两个部件，全文没有 compressor / compression（2026-08-01 抓 ar5iv 全文检索证实）；报告里 indexer 直接对前序 token 派生的 key 打分，没有「先压缩再打分」这一步。\n2. **DeepSeek 官方参考核 FlashMLA**（README 访问 2026-08-01）：稀疏核 `flash_mla_sparse_fwd` / `flash_mla_with_kvcache` 的输入只有 q / kv / indices / sm_scale 之类，也没有压缩 K/V 输入——「压缩」在 MLA 里是结构性的（低秩 latent），不是这份稀疏核的输入概念。\n3. **CANN ops-transformer 的 sparse_attn_sharedkv 算子**（官方 README，访问 2026-08-01）：计算式 `O=softmax(Q@K̃ᵀ·softmax_scale)@Ṽ`，支持三种场景——仅 ori_kv（滑窗注意力）/ ori_kv+cmp_kv（滑窗+压缩注意力）/ ori_kv+cmp_kv+cmp_sparse_indices（滑窗+稀疏压缩注意力）；`cmp_ratio`「对 ori_kv 的压缩率，仅支持输入 4 或 128」——与 pin 里 DSA 的 compress_ratio 三档（≤1 / 4 / 128）严丝合缝；另有 `sinks`（「注意力下沉 tensor」）、`metadata` 等参数；README 明言「该算子是为 DeepSeek V4 新网络结构新增的高效融合算子」。\n结论：compressor 是昇腾算子侧为稀疏注意力配的两级 KV 结构——压缩 KV（cmp_kv）供索引/稀疏打分用、原始 KV（ori_kv）供最终注意力用，vllm-ascend 的 DSA 把同一套内核接到 V3.2 系模型上（pin 里 `_C_ascend.npu_sparse_attn_sharedkv` 与 ops-transformer 同名算子参数契约一致：ori_kv/cmp_kv/cmp_sparse_indices/cmp_ratio=4 或 128）。它不在论文里，正文讲到它时别暗示论文出处；第 26 章 V4 CSA/HCA 会再遇同一家族。",
+      "background": "时间线（均据公开材料）：2025-12 DeepSeek-V3.2 技术报告发布（DSA 无压缩器）→ CANN ops-transformer 为 DeepSeek V4 预研 sparse_attn_sharedkv（README 自称「新增时间约 3 个月前」，2026-08 访问）→ pin（vllm-ascend v0.21.0rc1 / 80610e44）的 DSA 已用它跑 V3.2 系模型（compress_ratio=4 主路；128 档为 V4 变体旁支，ch26 再展开）。这佐证了昇腾「算子先行为模型铺路」的工作模式，也解释了为什么 ch26 要在 V4 章再讲一次两级压缩注意力。",
+      "example": null,
+      "links": [
+        "https://gitcode.com/cann/ops-transformer/tree/c730db2cede402882ba6a2262c438a0dd6c874a4/experimental/attention/sparse_attn_sharedkv",
+        "https://ar5iv.labs.arxiv.org/html/2512.02556",
+        "https://github.com/deepseek-ai/FlashMLA"
+      ],
+      "sources": [
+        {
+          "url": "https://ar5iv.labs.arxiv.org/html/2512.02556",
+          "took": "DeepSeek-V3.2 技术报告全文检索（ar5iv HTML）：DSA 由 lightning indexer + fine-grained token selection 构成；全文无 compressor / compression 字样，indexer 对前序 token 派生的 key 打分（k_s^I 由 h_s 派生）；报告未列 index_topk 等参数名（只写训练时每 query 选 2048 个 KV token）。访问 2026-08-01。"
+        },
+        {
+          "url": "https://github.com/deepseek-ai/FlashMLA",
+          "took": "FlashMLA README：稀疏核为「Token-level sparse attention for the prefill stage」/「…for the decoding stage, with FP8 KV cache」，接口 flash_mla_sparse_fwd(q, kv, indices, sm_scale) 与 flash_mla_with_kvcache(...indices...)，无压缩 K/V 输入；「压缩」由 MLA 的 MQA 模式结构性承担（head_dim_k=576 / head_dim_v=512）。访问 2026-08-01。"
+        },
+        {
+          "url": "https://gitcode.com/cann/ops-transformer/tree/c730db2cede402882ba6a2262c438a0dd6c874a4/experimental/attention/sparse_attn_sharedkv",
+          "took": "sparse_attn_sharedkv README：三场景（ori_kv 纯滑窗 / +cmp_kv 压缩注意力 / +cmp_sparse_indices 稀疏压缩注意力）；cmp_ratio「对ori_kv的压缩率，仅支持输入4或128」；sinks=「注意力下沉tensor」；layout_kv 仅支持 PA_ND；「该算子是为 DeepSeek V4 新网络结构新增的高效融合算子」。访问 2026-08-01。"
+        }
+      ],
+      "confidence": "high（论文缺席 = ar5iv 全文检索一手；sparse_attn_sharedkv 的参数契约与「为 DeepSeek V4 新增」= CANN 官方 README 一手；FlashMLA 无压缩 K/V = 官方 README 一手）。唯一没核实的：pin 的 _C_ascend 同名算子与 ops-transformer 是同一实现——正文只需断言两者参数契约一致（dossier 的调用片段 vs README 参数表可互相核对），不依赖该包含关系。",
+      "writer_note": "正文现有「按 compress_ratio=4 把 KV 做 4:1 压缩（每 4 个相邻位置归并成 1 个代表）」一句够用，建议补半句出处定位：「compressor 不在 V3.2 论文里，是昇腾稀疏内核的两档 KV 设计（同一内核为 V4 预研，ch26 再遇）」——防止读者按论文找不到而怀疑正文；「每 4 个位置归并成 1 个」的机制细节别再往细写（官方只公开压缩率档位，未公开归并方式，以形状级描述为限）；sinks / cmp_ratio=128 档留给 ch26 或链接。"
+    }
+  ],
+  "not_researched": [
+    {
+      "term": "sparse_mode 的 0/3/4 mask 语义",
+      "why": "ch20「Fused 算子：TND 变长布局 + sparse_mode」一节已立（0 无 mask / 3 因果下三角 / 4 滑窗）；本清单 c1 已一手核对 torch_npu 官方文档（sparse_mode=3 = rightDownCausal）与书内口径一致，本章沿用即可。"
+    },
+    {
+      "term": "TND 布局",
+      "why": "ch20 已立（token 打平 + actual_seq_lengths 前缀和 + 免 padding 的动机），本章沿用；本清单只补它的分页同族 PA_BSND/PA_ND（c2）。"
+    },
+    {
+      "term": "IndexCache / skip_topk / topk_indices_buffer",
+      "why": "pin 内部模式（implementation 职责），正文已压成一句旁注（「相邻层 query 相关性相近、跨层复用 top-k」），无需外部背景。"
+    },
+    {
+      "term": "DeviceOperator / BaseDeviceAdaptor / A5DeviceAdaptor 门面",
+      "why": "pin 内部模式，ch20/ch22 已立，正文 §24.8 就地讲清，无外部 gap。"
+    },
+    {
+      "term": "OOT 插件 / entry-point 后端注册 / model runner v2 名字断言",
+      "why": "ch02/ch08 已立；get_name() HACK 正文就地讲清，属 pin 细节。"
+    },
+    {
+      "term": "哈达玛变换（use_sparse_c8_indexer 旁支）",
+      "why": "正文一句带过的量化旋转技巧（INT8 量化加速变体），属量化章（ch31）范畴，本章点到为止即可，不展开。"
+    },
+    {
+      "term": "npu_quant_lightning_indexer_metadata 算子",
+      "why": "torch_npu 无公开文档（官方仅收录 npu_quant_lightning_indexer 本身）；CANN ops-transformer 有同名实现（quant_lightning_indexer_v2_metadata.py）但无参数文档。正文「形状级预建、前向期复用」的解释即全部，不再外挖。"
+    },
+    {
+      "term": "index_topk 2048（公开配置）vs 512（pin 的 hf_config）",
+      "why": "ch23 c7 已立「训练 2048 / 昇腾推理 512」口径；本清单 2026-08-01 一手核对公开 DeepSeek-V3.2-Exp config.json 确为 index_topk=2048（见 c1 sources），正文沿用既有口径即可，别把两个数混写。"
+    },
+    {
+      "term": "pre_tokens / next_tokens = 2^63-1",
+      "why": "算子契约默认值（官方文档「仅支持默认值 2^63-1」），正文省略即可。"
+    }
+  ],
+  "open_questions_for_lead": [
+    {
+      "term": "sparse_mode=3 的正文括注口径",
+      "why": "正文 §24.5 写「sparse_mode=3 是内核约定的稀疏模式（按分页 block_table 选择）」，而官方文档语义是 mask 模式（rightDownCausal 下三角，与 ch20 的 0/3/4 约定同一套）；「按分页选择」应归给 layout_key=PA_BSND + block_table。建议 writer 修订这句括注（沿用 ch20 口径），非阻断问题。"
+    }
+  ]
+}
