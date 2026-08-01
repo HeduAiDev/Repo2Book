@@ -123,7 +123,11 @@ def station_of_classes(classes, spine):
     """把本章站点落到**组件**上（不是落到文件上——用户 2026-07-26：不必给每个站点标具体文件、
     把每个站点做成独立模块，那太细、不适合架构图）。
 
-    匹配优先级：符号的类名部分精确命中 > 同文件且符号是该类的方法 > 同文件兜底。
+    匹配优先级：
+      1) 符号的类名部分精确命中；
+      2) 同文件且符号是该类的方法；
+      3) **无符号的站，落给它所在文件归属的类**（ch28 第 5–7 站是 MLA 注意力内部实现，
+        在 deepseek_v4_attention.py 里却没有符号，若不兜底就成了图上无主的盲区）。
     """
     out = {}
     by_file = {}
@@ -142,6 +146,8 @@ def station_of_classes(classes, spine):
             cands = by_file[u['path']]
             hit = next((c for c in cands
                         if base and base in c['name']), cands[0])
+        if not hit and u['path'] in by_file and not sym:   # 3) 无符号 → 该文件归属的类
+            hit = by_file[u['path']][0]
         if hit:
             out.setdefault(hit['name'], []).append(i)
     return out

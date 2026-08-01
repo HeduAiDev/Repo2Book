@@ -209,6 +209,9 @@ def extract_relations(src_root, key_classes):
     is_a, has_a, uses = [], [], []
     methods = {}      # 类 → 它自己的方法名(用于把「裸方法名」的站点精确归到某个类)
     cfiles = {}       # 类 → 它所在的文件(方法重名时必须靠文件区分:compile_grammar 四个后端都有)
+    real_file = {}    # 类 → **实际定义所在的文件**(AST 里 class X 出现的那个文件)。
+                      # ⚠️ key_classes 的 file 字段不可靠:DeepseekV4Attention 声明在 deepseek_v4.py,
+                      # 实际定义在 layers/deepseek_v4_attention.py —— 站点按声明文件兜底会归错类。
     import ast as _ast
     for f in files:
         fp = Path(src_root) / f
@@ -264,7 +267,9 @@ def extract_relations(src_root, key_classes):
             methods[node.name] = sorted({x.name for x in node.body
                                          if isinstance(x, (_ast.FunctionDef, _ast.AsyncFunctionDef))})
             cfiles[node.name] = f
-    return {'is_a': is_a, 'has_a': has_a, 'uses': uses, 'methods': methods, 'files': cfiles}
+            real_file[node.name] = f
+    return {'is_a': is_a, 'has_a': has_a, 'uses': uses, 'methods': methods, 'files': cfiles,
+            'real_files': real_file}
 
 
 def build(inst=None):
@@ -355,6 +360,13 @@ def build(inst=None):
         except Exception:
             continue
         rel_by_ch[cid] = extract_relations(src_root, d.get('key_classes') or [])
+        # 用真实定义文件修正 key_class 的 file 字段(declared 不可靠)
+        rfiles = rel_by_ch[cid].get('real_files') or {}
+        for kc in (d.get('key_classes') or []):
+            for _nm in _split_names(kc.get('name') or ''):
+                if _nm in rfiles:
+                    kc['file'] = rfiles[_nm]
+                    break
         for kc in (d.get('key_classes') or []):
             nm = (kc.get('name') or '').strip()
             if not nm:
