@@ -384,7 +384,7 @@ def build(model, cid):
         """
         kids = node['children']
         if not kids:
-            return 28
+            return 36
         two = len(kids) > 1
         colh = [24, 24]
         for i, k in enumerate(kids):
@@ -401,24 +401,22 @@ def build(model, cid):
         if kids:
             box(L, nx, ny, nw, h, '#fffaf3', C_CUR_S, r=6, sw=1.5)
         else:
-            box(L, nx, ny, nw, h, f_, k_, r=5, sw=1.3)
+            box(L, nx, ny, nw, 36, f_, k_, r=5, sw=1.3)
         ids = comp_stations(nm)
         bd = f'第 {rng(ids)} 站' if ids else ''
-        box_w = nw - 18 - (tw(bd, 9, True) + 6 if bd else 0)
-        base = 10 if kids else 9.6
-        # 深层子盒(叶子)类名很长(MultiHeadLatentAttentionWrapper/DeepseekV4MegaMoEExperts),
-        # 直接截到「Deepse…」读者认不出;先降字号到 7.2 再试完整名,仍超才截断。
-        if not kids and base > 7.2:
-            fs_try = max(7.2, base - 1.2)
-            if tw(short(nm), fs_try) <= box_w:
-                fit(L, nx + 8, ny + 16, short(nm), box_w, fs_try, C_TXT, bold=False, anchor='start')
-            else:
-                fit(L, nx + 8, ny + 16, short(nm), box_w, base, C_TXT, bold=False, anchor='start')
+        # **叶子盒标签与徽标分行**(名称一行、站号徽标一行):实测同挤一行,长类名截到
+        # 「Dee…」后徽标直接压上去(text-text 相撞,几何 linter 实锤)。分行后不再挤。
+        # 名称一行、站号徽标单独一行(无论容器还是叶子)：
+        # 实测名称与徽标同挤一行时,长类名截断后徽标直接压上去(几何 linter 实锤「Dee…×第 11 站」)
+        if kids:
+            fit(L, nx + 8, ny + 16, short(nm), nw - 16, 10, C_CUR_S, bold=True, anchor='start')
         else:
-            fit(L, nx + 8, ny + 16, short(nm), box_w, base,
-                C_TXT if not kids else C_CUR_S, bold=(isnew or bool(kids)), anchor='start')
+            fit(L, nx + 8, ny + 16, short(nm), nw - 16, 9.2, C_TXT, anchor='start')
         if bd:
-            text(L, nx + nw - 7, ny + 16, bd, 9, C_CUR_S, anchor='end', bold=True)
+            if kids:
+                fit(L, nx + nw - 8, ny + 30, bd, nw - 14, 8.6, C_CUR_S, bold=True, anchor='end')
+            else:
+                fit(L, nx + nw - 7, ny + 30, bd, nw - 14, 8.6, C_CUR_S, bold=True, anchor='end')
         if not kids:
             return h
         two = len(kids) > 1

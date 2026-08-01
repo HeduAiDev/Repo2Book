@@ -179,6 +179,37 @@ def _evidence_dirs(units, top=3):
     return [{'dir': d, 'steps': n} for d, n in c.most_common(top)]
 
 
+def _extract_symbol(what):
+    """从走线描述里抽出**首个类名**作为符号。实测遇到的形态(盲审逐条核过):
+      'L1565  DeepseekV4ForCausalLM: ...'
+      'L1338  DeepseekV4Model.__init__/forward: ...'          → DeepseekV4Model
+      'L914   DeepseekV4MoE.forward(mega 路径): ...'          → DeepseekV4MoE
+      'L914   DeepseekV4MoE._forward_fused_moe(TP 路径): ...' → DeepseekV4MoE
+      'L275   DeepSeekV4MultiTokenPredictor/DeepSeekV4MTP: ...' → DeepSeekV4MultiTokenPredictor
+      'L333   (基线对照) LlamaDecoderLayer.forward: ...'      → LlamaDecoderLayer
+    规则:剥掉行号前缀与括号括注(如(基线对照)),取第一个首字母大写的标识符,
+    再把后续 '.method'/'/别名' 剥掉 —— 只留类名本身。
+    """
+    w2 = re.sub(r'^L?\d+(?:\s*[—\-–]\s*L?\d+)?\s*', '', what, count=1)
+    w2 = re.sub(r'^[（(][^）)]*[）)]\s*', '', w2)          # 剥 (基线对照) 这类前置括注
+    # **优先取冒号前的第一个词元** —— 那才是真正的符号(hc_head: 多残差流 → RMSNorm …
+    # 的符号是 hc_head,不是描述里第一个大写词 RMSNorm)。仅当冒号前没有大写标识符时,
+    # 才回退到「全文第一个大写词」(对付 'L914 DeepseekV4MoE.forward(mega 路径):' 里
+    # 括号括注把词元挤到后面、以及 'ClassA/ClassB:' 并列的形态)。
+    pre = w2.split(':', 1)[0]
+    m = re.search(r'\b([A-Za-z_][\w]*)\b', pre)
+    if not m:
+        m = re.search(r'\b([A-Z][A-Za-z0-9_]*[A-Za-z0-9])', w2)
+        if not m:
+            return ''
+    name = m.group(1)
+    # 剥掉紧跟的 .method 或 /别名(如 DeepseekV4Model.__init__/forward → DeepseekV4Model)
+    name = re.split(r'[.\s/]', name)[0]
+    if name.startswith('L') and name[1:].isdigit():
+        return ''   # 残余行号当符号的防御
+    return name
+
+
 def _split_names(n):
     """key_classes 里常写成 'XgrammarBackend / XgrammarGrammar'、'StructuredOutputGrammar (ABC)'，
     拆成可与源码 ClassDef 对齐的裸类名。"""
@@ -334,13 +365,7 @@ def build(inst=None):
             if not any(path == pre or path.startswith(pre + '/') for pre in prefixes):
                 skipped.append((cid, path))
                 continue
-            sym = ''
-            # ⚠️ what 可能以 'L1565' 这类残留行号打头(SPINE_RE 只吃进 lines 的前一段),
-            # 先剥掉再取符号,否则 symbol 全空、站号全并到该文件首个类(盲审抓出的 ch28 归错)
-            w2 = re.sub(r'^L?\d+(?:\s*[—\-–]\s*L?\d+)?\s*', '', what, count=1).lstrip()
-            sm = re.match(r'^([A-Za-z_][\w\.]*)\s*[:：]', w2)
-            if sm:
-                sym = sm.group(1)
+            sym = _extract_symbol(what)
             units.append({'path': path, 'lines': lines, 'symbol': sym, 'what': what[:160]})
             idx = _chapter_index(cid)
             if path not in file_first_open or idx < file_first_open[path][0]:
