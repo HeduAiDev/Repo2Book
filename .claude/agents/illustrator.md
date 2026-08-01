@@ -34,12 +34,28 @@ color: purple
 5. 全 true → 把结果写进 `diagrams/figure-manifest.json` 该图条目
    (`blind_review` 初写为 `{"verdict": "PENDING", "notes": ""}`,由盲审回填)。
 
-## 开篇「你在这里」roadmap(每章一次,从 writer 契约移交给你——**窄长条横幅**:Part 单行面包屑+当前 Part 高亮,宽高比 6:1~8:1,勿方形)
-`python3 instances/<instance>/book/assets/roadmap/roadmap.py --highlight <键> --out
-{chapter_dir}/diagrams/roadmap.svg`,再 rsvg-convert 转 PNG。roadmap 不进 manifest。
+## 开篇「你在这里」= **架构模型图**(每章一次;2026-08-01 起**取代**原 roadmap 窄长条)
+```
+python3 scripts/arch_model.py build --instance <instance>          # 刷新全书模型(幂等)
+python3 scripts/arch_model_figure.py --chapter <chNN> --instance <instance> \
+        --out {chapter_dir}/diagrams/arch-model.svg                # 再 rsvg-convert -z 2 转 PNG
+```
+**它是什么**:第 1 章那张「一个请求的端到端旅程」长大后的样子——**整本书共用同一副骨架**
+(入口→Stage1→IPC 边界→EngineCore 大框→Stage3),蓝框=前面章节已读(带章号)、
+橙=本章新增、虚线=后续才讲;本章那个组件**就地展开**成源码里的真实组织关系
+(契约容器⊃实现 / 盒套盒的组合层级 / 确无层级则平铺并标「彼此独立」),本章站点标在组件上。
+**关系与站号全部由 `arch_model.py` 从源码 AST + dossier 抽取,你不许手改图上的类名/站号**——
+要改就去修抽取逻辑并说明理由。渲染后仍须走「Read PNG 亲眼看→自查」,几何问题(越界/相撞/
+截断/中文豆腐)改渲染器、不改数据。arch-model 进 manifest,须过独立盲审。
+
+⚠️ **roadmap 已退役**(2026-08-01 Lead 定):`book/assets/roadmap/roadmap.py` 不再调用,
+各章 `diagrams/roadmap.{svg,png}` 随章改造删除。原因:roadmap 与架构模型图顶层是同一条
+主线、同一个高亮位,一屏内两次是纯冗余;且生成侧不退役,任何批量重跑都会让已删的
+roadmap.png 复活成**孤儿图**、`lint_diagrams` 全线转红。`lint_chapter_structure` 只认开头
+60 行内有「roadmap|路线图|你在这里」**字样**,架构模型图放在 `## 你在这里` 段下即可满足。
 
 ## 详细全书地图 book-map(**只 ch01/鸟瞰章**一次,2026-07-16 用户定)
-与开篇 roadmap 窄长条**不同**:book-map 是一张**详细全书地图**——把**全部 Part × 全部章**铺开,
+与开篇架构模型图**不同**:book-map 是一张**详细全书地图**——把**全部 Part × 全部章**铺开,
 每 Part 一栏/一区(配 Part 主题色)、每章一行 `chNN + 短标题`、**primer 原理章加「原理」徽标**、
 底部图例(标出共几章 primer 及章号)。读者在开篇一眼看清全书骨架 + 哪些是原理章。
 范本 `instances/vllm-ascend/artifacts/ch01-birdseye-oot-plugin/diagrams/book-map.png`。

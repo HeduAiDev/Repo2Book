@@ -225,7 +225,10 @@ for (let b = 1; b <= 3; b++) {
   const ill = await agent(
     head('illustrator') +
     '任务：按 ' + CH + '/explainer/explainer.json 的全部 figure_specs 绘图到 ' + CH + '/diagrams/（gen_<figure_id>.py + svg + png + figure-manifest.json）。每张图强制流程：渲染 → 用 Read 打开 PNG **亲眼看** → 六项自查全真才登记 manifest（blind_review 初写 PENDING）。\n' +
-    '并生成本章架构模型图（**开篇「你在这里」**，已替代旧 roadmap 窄条，见下）：`python3 ' + REPO + '/scripts/arch_model.py build --instance ' + INST + '` 刷新模型，再 `python3 ' + REPO + '/scripts/arch_model_figure.py --chapter ' + A.chapter_id + ' --instance ' + INST + ' --out ' + CH + '/diagrams/arch-model.svg`，rsvg-convert -z 2 转 PNG（**勿用 ImageMagick convert**）。**不再生成 roadmap.png**。writer 的图注要点出「本章在全书架构里位于哪、新结构接在哪些前面章节已读的结构上」。\n' +
+    '并生成本章**架构模型图**（开篇「你在这里」，2026-08-01 起取代 roadmap 窄长条）：\n' +
+    '  `python3 ' + REPO + '/scripts/arch_model.py build --instance ' + INST + '`（刷新模型）\n' +
+    '  `python3 ' + REPO + '/scripts/arch_model_figure.py --chapter ' + A.chapter_id + ' --instance ' + INST + ' --out ' + CH + '/diagrams/arch-model.svg`，rsvg-convert -z 2 转 PNG（**勿用 ImageMagick convert**）。\n' +
+    '它是第 1 章那张端到端旅程长大后的样子：全书共用骨架，本章组件就地展开成源码里的真实组织关系（契约/组合/平铺），站点标在组件上。**不再生成 roadmap.svg/png**（已退役，见 illustrator 契约）。\n' +
     (blindLedger.length ? '上一轮盲审 FAIL，必须修复后重渲重看：\n' + blindLedger.join('\n') + '\n' : '') +
     '完成后自跑 `python3 ' + REPO + '/scripts/lint_diagram_geometry.py ' + CH + '/diagrams/*.svg` 确保无问题。返回 status/note。' + ESC,
     { schema: STATUS_SCHEMA, label: 'illustrate r' + b, phase: 'Illustrate', agentType: 'general-purpose', model: MODELS.illustrate }
