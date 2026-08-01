@@ -374,28 +374,18 @@ def build(model, cid):
     def comp_stations(real):
         return st_map.get(real, [])
 
-    def node_h(node):
-        """嵌套盒高度：与 draw_node 的列高跟踪（colh[col] += kh + 5）严格一致。
-
-        旧公式只按 krows*24 估算且只数第 0 列——较高的容器排在**第 1 列**时少算：
-        ch03 的 VllmConfig 容器（2 列 5 个叶子）按 26+3*24+6=104 画,末行叶子
-        实际戳到 463、容器底边 449,叶子压出容器 14px。这里逐子模拟两列累加,
-        取 max 列高减掉尾空隙再加底垫。
-        """
-        kids = node['children']
-        if not kids:
-            return 36
-        two = len(kids) > 1
-        colh = [24, 24]
-        for i, k in enumerate(kids):
-            colh[i % 2 if two else 0] += node_h(k) + 5
-        return max(colh) - 5 + 6
-
     def draw_node(node, nx, ny, nw):
-        """递归画组合盒：容器在外、被持有者嵌在内（参考图 SequenceGroup ⊃ Sequence ⊃ …）。"""
+        """递归画组合盒：容器在外、被持有者嵌在内（参考图 SequenceGroup ⊃ Sequence ⊃ …）。
+
+        ⚠️ 盲审第五轮修的两件事：
+         ① **绘制顺序**：容器徽标必须等子盒全部画完再画（否则被 rect 盖住不可见）；
+         ② **双子盒全宽竖排**：只要列宽放得下全名就不拆 2 窄列（54px 会把
+            DeepseekV4MegaMoEExperts 截到「Deepsee…」）。node_h 必须与这里的
+            kcols 判定完全一致，否则高度算错、兄弟子树叠压。
+        """
         nm = node['name']
         kids = node['children']
-        h = node_h(node)
+        h = node_h(node, nw)
         isnew = names_meta.get(nm, {}).get('introduced_in') == cid
         f_, k_ = (C_CUR_F, C_CUR_S) if isnew else (C_BUILT_F, C_BUILT_S)
         if kids:
@@ -404,47 +394,65 @@ def build(model, cid):
             box(L, nx, ny, nw, 36, f_, k_, r=5, sw=1.3)
         ids = comp_stations(nm)
         bd = f'第 {rng(ids)} 站' if ids else ''
-        # **叶子盒标签与徽标分行**(名称一行、站号徽标一行):实测同挤一行,长类名截到
-        # 「Dee…」后徽标直接压上去(text-text 相撞,几何 linter 实锤)。分行后不再挤。
-        # 名称一行、站号徽标单独一行(无论容器还是叶子)：
-        # 实测名称与徽标同挤一行时,长类名截断后徽标直接压上去(几何 linter 实锤「Dee…×第 11 站」)
+        # 名称一行、站号徽标单独一行(无论容器还是叶子)
         if kids:
             fit(L, nx + 8, ny + 16, short(nm), nw - 16, 10, C_CUR_S, bold=True, anchor='start')
         else:
             fit(L, nx + 8, ny + 16, short(nm), nw - 16, 9.2, C_TXT, anchor='start')
-        if bd:
-            if kids:
-                fit(L, nx + nw - 8, ny + 30, bd, nw - 14, 8.6, C_CUR_S, bold=True, anchor='end')
-            else:
-                fit(L, nx + nw - 7, ny + 30, bd, nw - 14, 8.6, C_CUR_S, bold=True, anchor='end')
+        if bd and not kids:
+            fit(L, nx + nw - 7, ny + 30, bd, nw - 14, 8.6, C_CUR_S, bold=True, anchor='end')
         if not kids:
             return h
-        two = len(kids) > 1
-        kcols = 2 if two else 1
+        # 双子盒：放得下全名就全宽竖排，否则 2 列
+        full_w = nw - 16
+        kcols = 1 if all(tw(short(kd['name']), 8.6) <= full_w for kd in kids) else 2
         kw = (nw - 16 - (kcols - 1) * 8) / kcols
         colh = [ny + 24, ny + 24]
         for i, kd in enumerate(kids):
-            col = i % kcols if two else 0
+            col = i % kcols if kcols > 1 else 0
             kx = nx + 8 + col * (kw + 8)
             kh = draw_node(kd, kx, colh[col], kw)
             colh[col] += kh + 5
+        # 容器徽标必须在子盒全部画完后才画
+        if bd:
+            fit(L, nx + nw - 8, ny + 30, bd, nw - 14, 8.6, C_CUR_S, bold=True, anchor='end')
         return h
 
+    def node_h(node, nw):
+        """嵌套盒高度：叶子两行(名+徽标)；有子节点则标题行+徽标行 + 子节点区。
+
+        ⚠️ 必须与 draw_node 的布局**完全一致**：放得下全名就全宽竖排(高度=各子盒之和+间距)，
+        放不下才 2 列(高度=列数×子盒高)。两处口径不一致会导致子节点区互相叠压
+        (盲审第五轮：MTP 与 MoE 的子树撞在一起)。
+        """
+        kids = node['children']
+        if not kids:
+            return 36
+        full_w = nw - 16
+        kcols = 1 if all(tw(short(kd['name']), 8.6) <= full_w for kd in kids) else 2
+        kw_guess = full_w if kcols == 1 else (nw - 16 - 8) / 2
+        khs = [node_h(kd, kw_guess) for kd in kids]
+        rows = (len(kids) + kcols - 1) // kcols if kcols > 1 else len(kids)
+        child_h = sum(khs[::kcols]) + rows * 5
+        return 40 + child_h
     names_meta = {c['name']: c for c in cls}
 
-    def panel_h():
+    def panel_h(pw):
         if not pan:
             return 0
         flat = not pan['contracts'] and not pan['roots']
         lcols = 2 if flat and len(pan['left']) > 4 else 1
         lh = ((len(pan['left']) + lcols - 1) // lcols) * 30
-        rh = sum(node_h({'name': r, 'children': pan['nested'][r]['children']}) + 8
+        has_r = bool(pan['contracts']) or bool(pan['roots'])
+        LW = (pw - 30) if not has_r else (pw - 34) * 0.40
+        RW = (pw - 30) - LW - (14 if has_r else 0)
+        rh = sum(node_h({'name': r, 'children': pan['nested'][r]['children']}, RW) + 8
                  for r in pan['roots'])
         rh += sum(24 + ((len(v) + 1) // 2) * 22 + 8 for v in pan['contracts'].values())
         return 30 + max(lh, rh) + 10
 
     def draw_panel(px, py, pw):
-        ph = panel_h()
+        ph = panel_h(pw)
         box(L, px, py, pw, ph, '#fff7ed', C_CUR_S, r=7, sw=2.0)
         boxpos[cur_sub] = (px, py, pw, ph)
         flat = not pan['contracts'] and not pan['roots']
@@ -515,11 +523,11 @@ def build(model, cid):
                 grid = [s for s in ms if not (exp_here and s == cur_sub)]
                 cols = max(1, min(4, len(grid))) if grid else 1
                 gr = (len(grid) + cols - 1) // cols if grid else 0
-                h = 20 + gr * (CH_ + 6) + (8 if gr else 2) + (panel_h() + 8 if exp_here else 0)
+                h = 20 + gr * (CH_ + 6) + (8 if gr else 2) + (panel_h(W - 2 * M - 48) + 8 if exp_here else 0)
                 gh.append((g, ms, h, exp_here, cols, grid))
             rh = 30 + sum(h for _, _, h, _, _, _ in gh) + 8 * len(gh) + 4
         elif any(s == cur_sub for s in members):
-            rh = CH_ + 22 + panel_h() + 8
+            rh = CH_ + 22 + panel_h(W - 2 * M - 28) + 8
 
         box(L, M, y, W - 2 * M, rh, '#f8fafc' if not is_core else '#fffdf7',
             '#e2e8f0' if not is_core else '#f5c98a', r=8, sw=1.0 if not is_core else 1.8)
@@ -536,7 +544,7 @@ def build(model, cid):
                     r_, c_ = divmod(i, cols)
                     comp(M + 24 + c_ * (gw + 8), gy + 20 + r_ * (CH_ + 6), sid, gw)
                 if exp_here:
-                    draw_panel(M + 24, gy + h - panel_h() - 6, W - 2 * M - 48)
+                    draw_panel(M + 24, gy + h - panel_h(W - 2 * M - 48) - 6, W - 2 * M - 48)
                 gy += h + 8
         else:
             x = M + 14
