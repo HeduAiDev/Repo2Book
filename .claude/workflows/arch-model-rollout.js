@@ -11,15 +11,24 @@ export const meta = {
 // ⚠️ args 注入不可靠 → CFG 为准（换批改 CFG.chapters）。
 const CFG = {
   instance: 'vllm',
-  // 批次1（验 workflow 本身）：三种形态各取样 —— ch28 深嵌套组合 / ch32 诚实平铺 /
-  // ch13,15,03,07 契约型。ch31 已试点定样，不重复。
+  // 批次2(vllm 剩 32 章的前 16 章)
   chapters: [
-    'ch28-model-architecture',
-    'ch32-structured-output',
-    'ch13-scheduler',
-    'ch15-kv-cache',
-    'ch03-config-and-wiring',
-    'ch07-engine-core',
+    'ch01-config-and-wiring',
+    'ch02-entrypoints',
+    'ch04-async-llm',
+    'ch05-input-processing',
+    'ch06-input-processor',
+    'ch08-output-processor',
+    'ch09-detokenization',
+    'ch10-logprobs',
+    'ch11-engine-core',
+    'ch12-engine-core',
+    'ch14-scheduler',
+    'ch16-kv-cache',
+    'ch17-worker-and-executor',
+    'ch18-model-runner',
+    'ch19-model-runner',
+    'ch20-distributed-parallelism',
   ],
 }
 const A = (typeof args !== 'undefined' && args && args.chapters && args.chapters.length) ? args : CFG
@@ -106,7 +115,7 @@ const results = await pipeline(
       '**门禁**（自跑，均不得有 BLOCKING）：lint_chapter_structure / lint_formulas / lint_source_grounding / '
       + 'lint_fidelity（primer 章跳过）/ lint_punct / lint_chapter_map --require / lint_diagrams。\n' +
       '返回：status / callbacks（回指处数）/ roadmap_removed / note。',
-      { schema: S_PROSE, label: ch + ':prose', phase: 'Prose', agentType: 'writer', model: 'fable' }
+      { schema: S_PROSE, label: ch + ':prose', phase: 'Prose', agentType: 'writer' }  // fable 曾不可用,暂继承主模型(opus);恢复后加 model:'fable'
     )
     return Object.assign({}, prev, { prose: p })
   },
