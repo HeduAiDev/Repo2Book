@@ -104,57 +104,106 @@ def pick_classes(model, cid, sub, spine, cap=12):
     """本章展开的组件：**前面章节已铺垫的结构** + **本章新增的结构**。
 
     取 (a) 本章首讲的类（新结构），(b) 早前章节已讲、但本章走线又停靠到的类（已铺垫、本章要用），
-    这样图上天然呈现「在旧结构之上长出新结构」。超 cap 时按「本章站数多寡」保留。
+    这样图上天然呈现「在旧结构之上长出新结构」。超 cap 时优先保留「结构锚点」——
+    本章站点停靠的类 + is_a/has_a 关系的参与者。ch03 的 CompilationConfig 曾被纯
+    「按站数多寡」的截断挤掉：它没有站点，却同时被 EngineArgs 与 VllmConfig 持有
+    （源码 arg_utils.py:627 / vllm.py:312 都有 `compilation_config: CompilationConfig`
+    注解），类被挤掉后 canon() 找不到它，图上两处 has_a 持有关系整个消失，架构是错的。
     """
     idx = _chapter_index(cid)
     mine = [c for c in model.get('classes', []) if c['subsystem'] == sub
             and _chapter_index(c['introduced_in']) <= idx]
-    st = station_of_classes(mine, spine)
+    st = station_of_classes(mine, spine, model['chapters'][cid].get('relations', {}))
     keep = [c for c in mine if c['introduced_in'] == cid or st.get(c['name'])]
     if len(keep) > cap:
-        keep.sort(key=lambda c: (-len(st.get(c['name'], [])),
+        rel = model['chapters'][cid].get('relations', {})
+        parts = set()
+        for a, b in (rel.get('is_a') or []) + (rel.get('has_a') or []):
+            parts.add(a)
+            parts.add(b)
+
+        def essential(c):
+            return bool(st.get(c['name'])) or c['name'] in parts
+
+        keep.sort(key=lambda c: (not essential(c), -len(st.get(c['name'], [])),
                                  _chapter_index(c['introduced_in'])))
-        keep = keep[:cap]
+        n_ess = sum(1 for c in keep if essential(c))
+        keep = keep[:max(cap, n_ess)]
     keep.sort(key=lambda c: (min(st.get(c['name'], [999])), _chapter_index(c['introduced_in'])))
     return keep, st
 
 
-def station_of_classes(classes, spine):
+def station_of_classes(classes, spine, relations=None):
     """把本章站点落到**组件**上（不是落到文件上——用户 2026-07-26：不必给每个站点标具体文件、
     把每个站点做成独立模块，那太细、不适合架构图）。
 
-    匹配优先级：
-      1) 符号的类名部分精确命中；
-      2) 同文件且符号是该类的方法；
-      3) **无符号的站，落给它所在文件归属的类**（ch28 第 5–7 站是 MLA 注意力内部实现，
+    匹配优先级（**全部按同文件判定**，杜绝跨文件张冠李戴——ch32 曾把
+    structured_outputs.py 里 `apply_grammar_bitmask` 的站挂到 utils.py 的
+    `apply_grammar_bitmask（旧 gpu_model_runner 路径）` 上，同名不同文件）：
+      1) 符号的类名部分精确命中（限定同文件）；
+      2) 符号是 relations.methods 里某类的自有方法，且站路径 == 该类文件
+         （arch_model.py 从 AST 抽出的「方法-文件」证据，比名字子串可靠）；
+      3) 同文件兜底：类名词元**精确**比对（允许点后缀，如
+         'StructuredOutputManager.should_fill_bitmask' ← 'should_fill_bitmask'）；
+         禁裸子串命中——'apply_grammar_bitmask' 不得挂到
+         '_apply_grammar_bitmask_kernel'；
+      4) **无符号的站，落给它所在文件归属的类**（ch28 第 5–7 站是 MLA 注意力内部实现，
         在 deepseek_v4_attention.py 里却没有符号，若不兜底就成了图上无主的盲区）。
     """
     out = {}
     by_file = {}
     for c in classes:
         by_file.setdefault(c['file'], []).append(c)
+    rel = relations or {}
+    mkeys = rel.get('methods') or {}
+    mfiles = rel.get('files') or {}
+    plain_to_entry = {}
+    for c in classes:
+        for n in [x.strip() for x in re.split(r'[/（(]', c['name']) if x.strip()]:
+            plain_to_entry.setdefault(n, c['name'])
     for i, u in enumerate(spine, 1):
         sym = u.get('symbol') or ''
         base = sym.split('.')[0] if sym else ''
         hit = None
-        for c in classes:                       # 1) 类名精确/包含命中
+        for c in classes:                       # 1) 类名精确/包含命中（限定同文件）
+            if c['file'] != u['path']:
+                continue
             names = [n.strip() for n in re.split(r'[/（(]', c['name']) if n.strip()]
             if base and any(base == n or base in n.split() for n in names):
                 hit = c
                 break
-        if not hit and u['path'] in by_file:    # 2) 同文件兜底
+        if not hit and base:                    # 2) 符号是某类的自有方法（AST 证据）
+            for rn, meths in mkeys.items():
+                if base not in meths:
+                    continue
+                rf = mfiles.get(rn)
+                if rf and rf == u['path'] and rn in plain_to_entry:
+                    hit = next((c for c in classes
+                                if c['name'] == plain_to_entry[rn]), None)
+                    if hit:
+                        break
+        if not hit and u['path'] in by_file:    # 3) 同文件词元精确命中
             cands = by_file[u['path']]
-            hit = next((c for c in cands
-                        if base and base in c['name']), cands[0])
-        if not hit and u['path'] in by_file and not sym:   # 3) 无符号 → 该文件归属的类
+            hit = next((c for c in cands if base and
+                        any(base == t or ('.' in t and base == t.rsplit('.', 1)[1])
+                            for t in [x.strip() for x in re.split(r'[/（(]', c['name'])
+                                      if x.strip()])),
+                       cands[0])
+        if not hit and u['path'] in by_file and not sym:   # 4) 无符号 → 该文件归属的类
             hit = by_file[u['path']][0]
         if hit:
             out.setdefault(hit['name'], []).append(i)
     return out
 
 
-def short(name, n=30):
-    """组件显示名：去掉 (ABC) 之类的括注，'A / B' 只留首个 + 省略号。"""
+def short(name, n=64):
+    """组件显示名：去掉 (ABC) 之类的括注，'A / B' 只留首个 + 省略号。
+
+    n=64（2026-08-01 起）：ch32 的 'StructuredOutputManager.should_fill_bitmask /
+    should_advance' 按 30 截断成了 'StructuredOutputManager.shoul…'，读者认不出
+    是哪个方法；实际盒宽放得下完整名。真正防溢出的是 fit()，short() 只负责
+    去掉括注/合条，不必提前截那么狠。
+    """
     s = re.sub(r'\s*\((ABC|旧[^)]*)\)', '', name).strip()
     if '/' in s:
         parts = [p.strip() for p in s.split('/')]
@@ -237,7 +286,7 @@ def plan_panel(cls, st_map, rel, width):
              if c['name'] not in in_contract and c['name'] not in parent
              and c['name'] in children]
     expanded = set()      # 已在某处展开过的节点 → 再次被持有时只作叶子引用,不重复整棵子树
-    nested = {r: _subtree(r, children, set(), expanded, depth=0, maxd=3) for r in roots}
+    nested = {r: _subtree(r, children, set(), expanded, depth=0, maxd=5) for r in roots}
     consumed = set()
     for r in roots:
         _collect(r, children, consumed)
@@ -318,30 +367,29 @@ def build(model, cid):
             w - 10, 8.8, C_MUTE)
         boxpos[sid] = (x, cy, w, CH_)
 
-    # ---- 组件站号：类名前缀命中 > 该类自有方法且同文件（两道坑：'A / B' 合条、方法重名）----
+    # ---- 组件站号：站归属的唯一真相 = station_of_classes（含类名前缀/方法证据/
+    # 同文件兜底四级判定）。曾有两套逻辑（comp_stations 精确匹配 + st_map 兜底），
+    # 两套结果对不上：无符号的站（如 ch32 第 5–7、11 站）在 badge 上消失、同一站号
+    # 挂到两个盒上。统一委托 st_map，badge 与「N 站落在下列组件上」的计数天然一致。
     def comp_stations(real):
-        _rel = ch.get('relations', {})
-        meth = set((_rel.get('methods') or {}).get(real, []))
-        rfile = (_rel.get('files') or {}).get(real)
-        out = []
-        for _i, _u in enumerate(spine, 1):
-            _sym = _u.get('symbol') or ''
-            if not _sym:
-                continue
-            if _sym.split('.')[0] == real:
-                out.append(_i)
-            elif _sym in meth and rfile and _u['path'] == rfile:
-                out.append(_i)
-        return out or st_map.get(real, [])
+        return st_map.get(real, [])
 
     def node_h(node):
-        """嵌套盒高度：叶子一行；有子节点则标题行 + 子节点两列堆叠。"""
+        """嵌套盒高度：与 draw_node 的列高跟踪（colh[col] += kh + 5）严格一致。
+
+        旧公式只按 krows*24 估算且只数第 0 列——较高的容器排在**第 1 列**时少算：
+        ch03 的 VllmConfig 容器（2 列 5 个叶子）按 26+3*24+6=104 画,末行叶子
+        实际戳到 463、容器底边 449,叶子压出容器 14px。这里逐子模拟两列累加,
+        取 max 列高减掉尾空隙再加底垫。
+        """
         kids = node['children']
         if not kids:
             return 28
-        krows = (len(kids) + 1) // 2 if len(kids) > 1 else 1
-        return 26 + sum(node_h(k) for k in kids[::2]) + (krows) * 4 + 6 \
-            if any(k['children'] for k in kids) else 26 + krows * 24 + 6
+        two = len(kids) > 1
+        colh = [24, 24]
+        for i, k in enumerate(kids):
+            colh[i % 2 if two else 0] += node_h(k) + 5
+        return max(colh) - 5 + 6
 
     def draw_node(node, nx, ny, nw):
         """递归画组合盒：容器在外、被持有者嵌在内（参考图 SequenceGroup ⊃ Sequence ⊃ …）。"""

@@ -151,6 +151,7 @@ SKELETON = [
 ]
 # EngineCore 这个**容器**里装的分组（ch01 图里已经画了调度器与 KV cache 两块，其余章节陆续加入）
 CORE_GROUPS = [
+    ('loop', '循环本体', ['engine-core']),
     ('sched-mem', '调度与显存', ['scheduler', 'kv-cache']),
     ('exec', '执行与并行', ['worker-and-executor', 'model-runner', 'distributed-parallelism']),
     ('model', '模型与算子', ['model-definitions', 'model-architecture',
