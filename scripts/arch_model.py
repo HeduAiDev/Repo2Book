@@ -231,8 +231,22 @@ def extract_relations(src_root, key_classes):
                 if bn in _SKIP_BASES:
                     continue
                 is_a.append([node.name, bn])
+            # 类属性别名:  model_cls = DeepseekV4Model  →  self.model_cls(...) 视同构造 DeepseekV4Model
+            # (vLLM 常见写法:ForCausalLM 里 model_cls=XxxModel; self.model=self.model_cls(...))
+            alias = {}
+            for x in node.body:
+                if isinstance(x, _ast.Assign) and isinstance(x.value, _ast.Name) and x.value.id in want:
+                    for t in x.targets:
+                        if isinstance(t, _ast.Name):
+                            alias[t.id] = x.value.id
             own, ref = set(), set()
             for x in _ast.walk(node):
+                # self.model_cls(...) / model_cls(...) —— 经别名解析
+                if isinstance(x, _ast.Call):
+                    fn = x.func
+                    aname = fn.attr if isinstance(fn, _ast.Attribute) else (fn.id if isinstance(fn, _ast.Name) else None)
+                    if aname in alias and alias[aname] != node.name:
+                        own.add(alias[aname])
                 if isinstance(x, _ast.AnnAssign) and x.annotation is not None:
                     ann = _ast.unparse(x.annotation)
                     for k in want:
