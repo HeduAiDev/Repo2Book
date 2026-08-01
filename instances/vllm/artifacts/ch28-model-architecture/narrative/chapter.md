@@ -2,11 +2,12 @@
 
 ## 你在这里
 
-![你在这里：模型架构，DeepSeek-V4 capstone](../diagrams/roadmap.png)
+![你在这里：全书架构模型已读 15 个组件，本章在「模型与算子」组里把「模型架构」就地摊开——DeepSeek-V4 不是新大陆，是 Llama 基线叠上的四摞 delta：MLA、MoE、hc 多流、MTP 草稿，外加 FP8 字节装载](../diagrams/arch-model.png)
 
-> *图注：地图还停在 EngineCore 循环这一格——模型只是循环里 `execute` 的那一步。*
-> *[上一章](../../ch27-primer-lightning-indexer/narrative/chapter.md)把 lightning indexer 和它专属的 IndexCache 从打分公式拆到源码；再往前，[量化数学](../../ch26-primer-quantization/narrative/chapter.md)（scale、zero-point、e8m0 块 scale）也已经推到了底。*
-> *本章读一整个真实大模型 DeepSeek-V4,看它在 Llama 骨架上叠了哪些花样——包括把刚拆开的索引器接回 MLA、把 FP8 语义真正铺进显存。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长的一块。*
+> *本章这块橙色在「模型与算子」组里就地摊开成源码里的真实组织：`DeepseekV4ForCausalLM`（第 1 站）是入口，框内套着 `DeepseekV4Model`（第 2、14 站）→ `DeepseekV4DecoderLayer`（第 3、13 站）→ `DeepseekV4Attention`（第 4 站）与 `DeepseekV4MoE`（第 8–10 站）两兄弟，`hc_head`（第 12 站）在旁收拢多流残差；下方 `DeepSeekV4MultiTokenPredictorLayer`（第 16–17 站）是旁挂的草稿头；左上 `DeepseekV4FP8Config` 管量化配置；最上面那行 `LlamaDecoderLayer 等`（第 18–20 站）是收尾对照回基线的落点。全章 20 站全部落在这块橙色上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *这块新结构接在哪？同组四块已读的蓝——「模型定义层」／「自定义算子与编译」／「注意力后端」／「量化」——都是它的地基：它长在「模型定义层」蓝框（[第 22 章](../../ch22-model-definitions/narrative/chapter.md)）的契约上，本章第一句话「它就是 Llama 叠了一摞 delta」说的就是这个；往里走，MLA 的算子边界伸进「注意力后端」蓝框（[第 24 章](../../ch24-primer-flash-attention/narrative/chapter.md)），FP8 字节装载是「量化」蓝框（[第 26 章](../../ch26-primer-quantization/narrative/chapter.md)）的语义在模型侧的落地。*
+> *[上一章](../../ch27-primer-lightning-indexer/narrative/chapter.md)把 lightning indexer 和它专属的 IndexCache 从打分公式拆到源码；再往前，[量化数学](../../ch26-primer-quantization/narrative/chapter.md)（scale、zero-point、e8m0 块 scale）也已经推到了底。下一章把这套「读模型」的手艺再抽象一层——从本章读过的 DeepSeek-V4 源码机械地读出一张架构图。*
 
 前面几章，我们把模型层一层层铺开了。[第 22 章](../../ch22-model-definitions/narrative/chapter.md)立了一份契约：所有 vLLM v1 模型都长成 embedding → N 层 decoder block → 末尾 norm，并以 Llama 作**最简基线**；之后几章接着把自定义算子、`torch.compile`、注意力后端、[量化数学](../../ch26-primer-quantization/narrative/chapter.md)一路拆开，[上一章](../../ch27-primer-lightning-indexer/narrative/chapter.md)又把 lightning indexer 与 IndexCache 从公式钉到源码。今天这些全要用上。
 
@@ -107,7 +108,7 @@ def forward(
 
 还有一个细节值得停一下：V4 的 `forward` 多收一个 `input_ids` 参数，一路传给 `ffn`。Llama 的 MLP 不需要知道是哪个 token——它对每个位置一视同仁。V4 的 MoE 却可能要拿 `input_ids` 去查路由表（后面 §28.3 会讲那个 hash-MoE 分支）。这是「dense 对每 token 同构、MoE 对每 token 异构」的第一个伏笔。
 
-骨架读完，开始拆四个 delta。从注意力开始。
+骨架读完，开始拆四个 delta。从注意力开始。按架构模型图的走线，站号已经过了 `DeepseekV4ForCausalLM` 的入口（第 1 站），现在走进它框内套着的解码器——这一站读的是 `DeepseekV4Attention`，`DeepseekV4DecoderLayer` 的注意力半段。
 
 ---
 
@@ -629,6 +630,8 @@ def hc_head(
 
 ### 28.5.1　_mtp_hidden_buffer：目标模型留给 draft 的隐状态
 
+按架构模型图的走线，这一站已经离开主干——图里把 `DeepSeekV4MultiTokenPredictorLayer`（第 16–17 站）单列成一块，因为它不在 `forward` 主线上，是旁挂的草稿头。
+
 Llama 末尾就一个 `lm_head`，`compute_logits` 出一个 token 的分布。V4 在这之外旁挂了一个 **MTP（Multi-Token Prediction，多 token 预测）** draft。MTP 是 DeepSeek-V3 技术报告（[arXiv:2412.19437](https://arxiv.org/abs/2412.19437)）提出的**训练目标**：标准语言模型每个位置只有「预测下一个 token」这一个监督信号，MTP 在此之外加几级链式预测模块，让模型在同一位置还要预测第 2、第 3……个未来 token——注意不是简单把窗口右移多滑几格，每一级都要把「已知的未来 token embedding」和「当前隐状态」融合之后再往前猜一步。报告说这既让模型学到更强的表征，也可以用于投机解码加速推理——后半句正是 vLLM 接住它的原因：训练出来的这些预测头，推理时原样当**投机解码的 draft 模型**用，一口气猜好几个 token，再由主模型批量验证（投机解码的协议是后面讲投机解码那章的主题，本章只交付 MTP 这个 draft 的接口）。下一小节读 draft 层时你会看到，「融合未来 token embedding 与当前隐状态」这句话，就是两行投影相加的代码。
 
 draft 要工作，得拿到主模型的隐状态。但拿哪个版本？回看 §28.4.1：主模型在 **`hc_head` 之前**（即多流还没压回单流时）就 `copy_` 了一份到 `_mtp_hidden_buffer`：
@@ -702,6 +705,8 @@ draft 融合**两路信号**：
 
 ## 28.6　收尾 delta：FP8 量化与 e8m0fnu 字节装载
 
+读到这里已经踩到「量化」那块已读蓝框（[第 26 章](../../ch26-primer-quantization/narrative/chapter.md)）的地盘——那一章把 e8m0 的数学推到了底，这一节看它在权重装载时怎么咬人。
+
 第 22 章把 Llama 当基线时，特意点了它「没有量化压缩」。V4 不一样——它的 checkpoint **永远是 FP8 块量化**的，连专家权重还可能是 MXFP4（4-bit）。这件事在权重装载时会咬人。
 
 看 `DeepseekV4Model.load_weights` 里专家权重那段，`vllm/model_executor/models/deepseek_v4.py`：
@@ -758,6 +763,8 @@ elif "attn_sink" in name:
 ---
 
 ## 28.7　把四摞 delta 合起来看
+
+走线的最后三站（第 18–20 站）标在 `LlamaDecoderLayer 等` 上——读的就是这张对照表：把 V4 的每个槽位放回[第 22 章](../../ch22-model-definitions/narrative/chapter.md)那条基线里看。
 
 读完一整个 DeepSeek-V4，回头看那张 delta-stack 图，应该有底气说出每个箭头背后是什么了：
 

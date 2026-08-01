@@ -2,9 +2,12 @@
 
 ## 你在这里
 
-![你在这里：IPC 边界](../diagrams/roadmap.png)
+![你在这里：全书架构模型已读 3 个组件，本章把「IPC 边界」就地摊开——三层 client、字节标签协议、msgpack 多帧编解码、EngineCoreProc 双 IO 线程、Tensor IPC 零拷贝旁路](../diagrams/arch-model.png)
 
-> *图注：全书地图高亮当前位置。前面 [第 4 章](../../ch04-async-llm/narrative/chapter.md) 把引擎拆成三段、在两个进程里重叠跑；本章钻进那条把前端和 EngineCore 分开的虚线，看清跨进程到底怎么通信；再往后 EngineCore 进程内部的调度→执行→采样循环，是后续章节的事。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长的一块。*
+> *本章这块橙色就是主线里那条「IPC 边界」本身，在「异步引擎」蓝框与 `EngineCore` 大框之间就地摊开成源码里的真实组织：`InprocClient`（第 1–3、5–6 站）与它下面的 `MPClient`（契约）挂着 `SyncMPClient` / `AsyncMPClient` 两兄弟，`EngineCoreRequestType`（第 4 站）是字节标签协议，`EngineCoreProc`（第 7–11 站）是引擎侧的收与发，`MsgpackEncoder`（第 12–13 站）与 `MsgpackDecoder` 管编解码，`TensorIpcData`（第 14 站）与 `TensorIpcSender` / `TensorIpcReceiver` 是大张量旁路。全章 14 站全部落在这块橙色上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *这块新结构接在哪？上沿是已读的「异步引擎」蓝框（[第 4 章](../../ch04-async-llm/narrative/chapter.md)）——第 4 章把引擎拆成三段、在两个进程里重叠跑，本章钻进的就是它画的那条虚线；再往上，「配置与装配」蓝框（[第 3 章](../../ch03-config-and-wiring/narrative/chapter.md)）的工厂早就把这一块要用的客户端类选好了，本章把选出的类逐行拆开。*
+> *前面 [第 4 章](../../ch04-async-llm/narrative/chapter.md) 把引擎拆成三段、在两个进程里重叠跑；本章钻进那条把前端和 EngineCore 分开的虚线，看清跨进程到底怎么通信；再往后 EngineCore 进程内部的调度→执行→采样循环，是后续章节的事。*
 
 本章的代码主线集中在四个文件：`vllm/v1/engine/core_client.py`（前端三层 client）、`vllm/v1/engine/core.py`（engine 侧 `EngineCoreProc` 的两个 IO 线程与 busy loop）、`vllm/v1/serial_utils.py`（msgpack——一种"二进制版 JSON"的通用序列化格式，[§7.11](#711-msgpack-多帧零拷贝小张量内联大张量旁路) 会正式介绍——的多帧编解码）、`vllm/v1/engine/tensor_ipc.py`（多模态张量旁路）。
 
@@ -448,7 +451,7 @@ def _send_input_message(
 
 ### 7.6.3 engine 落地：字节标签选 decoder，投 input_queue
 
-消息到了 engine 侧。接上 [§7.4](#74-ready-握手dealer-为什么必须先开口) 那个 `process_input_sockets` 线程的主循环：
+消息到了 engine 侧。按架构模型图的走线，这里从 socket 口跨进了 `EngineCoreProc`——图上第 7–11 站都落在它身上。接上 [§7.4](#74-ready-握手dealer-为什么必须先开口) 那个 `process_input_sockets` 线程的主循环：
 
 ```python
 # vllm/v1/engine/core.py:L1437
@@ -809,7 +812,7 @@ def validate_alive(self, frames: Sequence[zmq.Frame]):
 
 ## 7.10 输出热路径：编码复用与零拷贝回收
 
-输出方向是**热路径**——每步生成都要把一批 `EngineCoreOutputs` 编码、发回前端，频率极高。vLLM 在这里做了精细的内存复用，值得单独看。
+输出方向是**热路径**——每步生成都要把一批 `EngineCoreOutputs` 编码、发回前端，频率极高。这是这条 IPC 线的回程：产出在架构模型图上流向 `Stage 3 输出处理`（虚线框，[第 8 章](../../ch08-output-processor/narrative/chapter.md)才讲），本章只负责把它编成帧送过 socket。vLLM 在这里做了精细的内存复用，值得单独看。
 
 ```python
 # vllm/v1/engine/core.py:L1470
@@ -1011,7 +1014,7 @@ def _decode_tensor(self, arr: Any) -> torch.Tensor:
 
 ## 7.12 多模态张量共享内存旁路
 
-最后一条路：OOB（out-of-band，带外）旁路。它专为**超大多模态张量**而生——图像/视频特征可能几十 MB，甚至已经在 GPU 上。这种张量，连"零拷贝塞进 ZMQ 帧"都嫌重（ZMQ 内核态还是要搬一次）,vLLM 给它开了条完全独立的通道：`torch.multiprocessing.Queue` 的共享内存。
+最后一条路：OOB（out-of-band，带外）旁路。这一站是「Stage 1 输入处理」蓝框（[第 5 章](../../ch05-input-processing/narrative/chapter.md)）产出的多模态数据在 IPC 上的专属通道——图上 `TensorIpcSender` / `TensorIpcReceiver` 两行就画在这块橙里。它专为**超大多模态张量**而生——图像/视频特征可能几十 MB，甚至已经在 GPU 上。这种张量，连"零拷贝塞进 ZMQ 帧"都嫌重（ZMQ 内核态还是要搬一次）,vLLM 给它开了条完全独立的通道：`torch.multiprocessing.Queue` 的共享内存。
 
 ![张量 IPC 零拷贝旁路](../diagrams/04-tensor-ipc-zerocopy.png)
 

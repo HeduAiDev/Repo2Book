@@ -2,12 +2,12 @@
 
 ## 你在这里
 
-![你在这里：调度器背后的分页 KV 缓存](../diagrams/roadmap.png)
+![你在这里：全书架构模型已读 7 个组件，本章在 EngineCore 的「调度与显存」组里把「分页 KV 缓存」就地摊开成七行源码里的真实组织——从 KVCacheBlock 元数据自底向上盖到对调度器的门面 KVCacheManager](../diagrams/arch-model.png)
 
-> *图注：全书地图高亮主线阶段「EngineCore 循环」，本章深入它背后的 KV 缓存子系统。*
-> *[第 14 章](../../ch14-scheduler/narrative/chapter.md) 讲了抢占——要不到块就丢弃重算。*
-> *本章解决「块」本身：物理显存怎么切、怎么分配、怎么靠前缀缓存复用。*
-> *下一章拆开 `self.coordinator` 本身——它怎么在多种注意力类型间协调分配决策。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长的一块。*
+> *本章这块橙色不是长在空白处——当年那张旅程图里，`EngineCore` 框内原本只画了两个组件：调度器与分页 KV 缓存；[第 13 章](../../ch13-scheduler/narrative/chapter.md)已经把调度器读成蓝框，本章就地把第二个摊开。摊开的七行是源码里的真实组织，按持有关系自底向上叠：`KVCacheBlock`（块元数据）与 `FreeKVCacheBlockQueue`（空闲块队列）是地基；`BlockHashToBlockMap`（哈希查找表）与 `BlockPool`（块池）持有它们，管分配与回收；`SingleTypeKVCacheManager` 等（按注意力类型分工的管理器）再持有块池，`UnitaryKVCacheCoordinator`（单组协调器）逐组转发；塔尖 `KVCacheManager` 等是对调度器的门面。它紧贴在蓝框调度器下方也不是排版巧合——调度器正是握着这个门面跨进橙框的：请求进入调度时先调 `get_computed_blocks` 问「这段前缀有没有现成的」，每拍分配再调 `allocate_slots` 说「给我装下这些 token 的块」。*
+> *本章走线共 18 站，全部落在这些橙色部件上。站号是本章自底向上读源码的行进次序——从第 1 站的 `KVCacheBlock` 一路盖到第 17–18 站的门面——正文大体按它走，只有哈希那三站（第 3–5 站）为配合叙事挪到了引用计数之后，不必照站号顺序读；跨文件的几个接缝处，正文会随手报一句「现在走到哪一段」。*
+> *[第 14 章](../../ch14-scheduler/narrative/chapter.md)讲了抢占——要不到块就丢弃重算，那一章把这个门面当黑盒；本章掀开它：物理显存怎么切、怎么分配、怎么靠前缀缓存复用。下一章拆开橙框里那行协调器的完全体——`KVCacheCoordinator` 怎么在多种注意力类型间协调分配决策。*
 
 [第 14 章](../../ch14-scheduler/narrative/chapter.md) 反复提到一个动词：`allocate_slots`。调度器给请求算 token 之前，先向它要显存块；要不到，就抢占。但那一章把 `kv_cache_manager` 当黑盒——「要块」「还块」「命中」三个动作只说了名字，没说里面发生了什么。
 
@@ -230,7 +230,7 @@ def remove(self, block: KVCacheBlock) -> None:
 
 注意第三条的微妙之处：`ref_cnt == 0` 的块**没有立刻被销毁**。它还留在 free queue 里当驱逐候选，而且——只要还没被真正取走复用——它的 `_block_hash` 还在，仍然可以被前缀命中捞回来。这正是前缀缓存能跨请求复用的物理基础，也是 §15.7 回收第 14 章那笔账的关键。
 
-所有块都由 `BlockPool` 这个全局管家持有：
+所有块都由 `BlockPool` 这个全局管家持有。先报坐标：走线在这里跨出 `kv_cache_utils.py`、进入同目录的 `block_pool.py`——开篇那张架构模型图上标着「第 6–12 站」的一整摞，7 站全落在这一个文件里。本节先读管引用计数的四站（第 7、10–12 站），按哈希查块的两站与满块登记的一站（第 6、8–9 站）留到 §15.6、§15.7 它们真正上岗时再读。先看它的构造：
 
 ```python
 # vllm/v1/core/block_pool.py:L149
@@ -363,7 +363,7 @@ def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
 
 ## 15.5 块哈希：前缀缓存的钥匙
 
-前缀缓存的核心诉求是：两个请求，如果**前缀的 token 完全一样**，那这段前缀的 KV 也一样，第二个请求应当能复用第一个算好的块。要实现它，得给每个满块算一个哈希，用哈希当钥匙去查「有没有内容相同的现成块」。
+前缀缓存的核心诉求是：两个请求，如果**前缀的 token 完全一样**，那这段前缀的 KV 也一样，第二个请求应当能复用第一个算好的块。要实现它，得给每个满块算一个哈希，用哈希当钥匙去查「有没有内容相同的现成块」。坐标也报一句：这一节回到 `kv_cache_utils.py`——走线的第 3–5 站其实排在 BlockPool 那一摞之前，正文故意押后，是因为「为什么要给块算哈希」得配着前缀缓存的动机才讲得清。
 
 但有个陷阱：光哈希「这一块的 token」不够。考虑两个请求，都有一块 token 是 `[5,6,7,8]`，但一个的前缀是 `[1,2,3,4]`、另一个是 `[9,9,9,9]`。这两块的 token 内容一样，可它们的 **KV 不一样**——因为注意力是因果的，`[5,6,7,8]` 的 KV 依赖前面所有 token。如果只按本块 token 算哈希，它俩会撞到同一个哈希，第二个请求就会错误复用第一个的 KV。
 
@@ -553,7 +553,7 @@ def get_cached_block(
 
 注意查表的键不是裸的 `block_hash`，而是 `make_block_hash_with_group_id` 打包出来的 `BlockHashWithGroupId`——块哈希后面拼上 4 字节大端的 group id。混合模型里同一段 token 前缀在不同 KV cache group 要分开缓存，靠这个 group id 区分。用纯 bytes 拼接而非元组，又是为了省 GC、查表更快。本章单组路径下 group id 恒为 0，但这个打包步骤还在。
 
-命中查询本身——沿哈希链逐块查，一断即停——在 `FullAttentionManager.find_longest_cache_hit`：
+命中查询本身——沿哈希链逐块查，一断即停——在 `FullAttentionManager.find_longest_cache_hit`。走线在这里跨进本章第三个文件 `single_type_kv_cache_manager.py`（第 13 站，架构模型图上「SingleTypeKVCacheManager 等」那一行）：`SingleTypeKVCacheManager` 是按注意力类型分工的管理器基类，`FullAttentionManager` 是它的全注意力实现，本章单组主路径上干活的正是它。来看这个方法：
 
 ```python
 # vllm/v1/core/single_type_kv_cache_manager.py:L447
@@ -616,7 +616,7 @@ def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
 
 第一行就是 [第 3 章](../../ch03-config-and-wiring/narrative/chapter.md) 那个 `enable_prefix_caching` 的总闸：关了直接返回空命中、0 个 token，整套查表机制被旁路。`request.skip_reading_prefix_cache` 是与它并列的第二道闸，但作用域是单个请求——某些场景（比如已知这个请求的前缀不该被复用、或调用方显式要求跳过读缓存）需要单独绕开查表，又不想动全局的 `enable_caching` 开关，这个请求级字段就是留给它们的口子。两道闸只要有一道合上，就直接空手而归、不进查表。
 
-这一行也是 `self.coordinator` 在全章的第一次登场——它是 `KVCacheCoordinator`，在混合模型（多种注意力类型并存）下按 KV cache group 把调用分派给各自的单类型管理器。本章锁定单组全注意力的主路径，`self.coordinator` 上的每一次调用（这里的 `find_longest_cache_hit`，以及 §15.7 里的另外四个）都几乎原样转发给下面要看到的 `FullAttentionManager` 实例——后文看到的同名方法，就是它的落地。协调层本身怎么在多类型之间做取舍，下一章拆开。
+这一行也是 `self.coordinator` 在全章的第一次登场——它是 `KVCacheCoordinator`，单组路径下的化身就是架构模型图上那行 `UnitaryKVCacheCoordinator`（第 16 站），在混合模型（多种注意力类型并存）下按 KV cache group 把调用分派给各自的单类型管理器。本章锁定单组全注意力的主路径，`self.coordinator` 上的每一次调用（这里的 `find_longest_cache_hit`，以及 §15.7 里的另外四个）都几乎原样转发给下面要看到的 `FullAttentionManager` 实例——后文看到的同名方法，就是它的落地。协调层本身怎么在多类型之间做取舍，下一章拆开。
 
 `max_cache_hit_length = request.num_tokens - 1` 这个 `-1` 值得停一下。哪怕一个请求的所有 token 都命中了缓存，也**必须重算最后一个 token**——因为要拿它的 logits 来采样下一个 token，而缓存里只有 KV、没有 logits。所以最多命中到「倒数第二个 token 所在的块」。又因为分配要求 `num_computed_tokens` 按块对齐，这个 `-1` 实际可能让最后一整块退回重算。
 
@@ -628,7 +628,7 @@ def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
 
 ## 15.7 三段式分配：allocate_slots
 
-`allocate_slots` 是这一整章所有零件的总装现场。第 14 章调的就是它。它干三件事：检查容量、挂前缀命中块、分配新块。来看主干：
+`allocate_slots` 是这一整章所有零件的总装现场，也是本章走线的终点站（第 18 站）——调度器从蓝框跨进橙框，落点就是它和上一节的 `get_computed_blocks`（第 17 站），第 14 章调的就是它。它干三件事：检查容量、挂前缀命中块、分配新块——三段分别调回下面两层：容量检查 `get_num_blocks_to_allocate`（第 14 站）与挂命中块、分新块（第 15 站）在 `single_type_kv_cache_manager.py`，满块登记 `cache_full_blocks`（第 9 站）在 `block_pool.py`，这一节就在这三个文件之间往返。来看主干：
 
 ```python
 # vllm/v1/core/kv_cache_manager.py:L225

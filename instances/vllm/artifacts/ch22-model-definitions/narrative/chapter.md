@@ -2,12 +2,12 @@
 
 ## 你在这里
 
-![你在这里：Part VI 模型层开篇](../diagrams/roadmap.png)
+![你在这里：全书架构模型已读 11 个组件，本章在 EngineCore 的「模型与算子」组里展开该组第一个被打开的组件——模型定义层：左列是 Llama 的四级嵌套与装载器，右列是 LinearBase 与 ColumnParallelLinear 两份契约各嵌实现，站号标在组件上](../diagrams/arch-model.png)
 
-> *图注：全书地图走到模型定义层。*
-> *[上一章](../../ch21-async-engine/narrative/chapter.md)把多卡之间的集合通信讲透了——那行 `all_reduce` 背后的群组怎么建、怎么进 `torch.compile` 图。*
-> *本章往里走一层：模型代码本身长什么样。`(vllm_config, prefix)` 怎么构造、TP 线性层怎么切、Attention 怎么收口后端、权重怎么从磁盘装进切好的参数。*
-> *[下一章](../../ch23-custom-ops-and-compilation/narrative/chapter.md)接着把 Attention 里那个「自定义算子」和 `torch.compile` 拆开看。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向；当年 `EngineCore` 框里只画了调度器与分页 KV 缓存，如今已按「调度与显存／执行与并行／模型与算子／解码策略」四组排开，一路读过来的组件各就各位。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
+> *橙色这块长在「模型与算子」组——它是该组第一个被打开的组件，同组的自定义算子与编译、注意力后端、量化、模型架构还都是虚线，正是接下来几章要去的地方。它也不是凭空长出来的，而是接在三块已读结构上：构造模型的 `vllm_config` 就是「配置与装配」蓝框（[第 3 章](../../ch03-config-and-wiring/narrative/chapter.md)）装出来的那只总配置；TP 线性层末尾那次 `all_reduce` 跑在「分布式并行」蓝框（[第 20 章](../../ch20-distributed-parallelism/narrative/chapter.md)）建好的通信组上；装好后的模型交给「ModelRunner 执行」蓝框（[第 18 章](../../ch18-model-runner/narrative/chapter.md)）持有，每拍前向都调它。橙色块里摊开的也不是一列类名，而是源码里真实的组织关系：左列是 `LlamaForCausalLM` 的四级嵌套与装载器，右列是 `LinearBase`、`ColumnParallelLinear` 两份契约，各自嵌着自己的实现类——「契约＋实现＋持有」正是本章主线。本章走线共 18 站，13 站落在这些橙色部件上（左列 10 站、右列 3 站）；其余 5 站是装载骨架的进出点——选装载器、建空壳、收尾重排——正文走到时会交代。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *[上一章](../../ch21-async-engine/narrative/chapter.md)把多卡之间的集合通信讲透了——那行 `all_reduce` 背后的群组怎么建、怎么进 `torch.compile` 图；本章的 TP 线性层正是架在「分布式并行」那只蓝框上的一层。*
+> *本章往里走一层：模型代码本身长什么样。`(vllm_config, prefix)` 怎么构造、TP 线性层怎么切、Attention 怎么收口后端、权重怎么从磁盘装进切好的参数。[下一章](../../ch23-custom-ops-and-compilation/narrative/chapter.md)接着把 Attention 里那个「自定义算子」和 `torch.compile` 拆开看——就是「模型与算子」组里紧邻本章的那只虚线框。*
 
 前面二十多章，我们一直把「模型」当黑盒。model runner 把 `input_ids`、`positions`、`inputs_embeds` 喂进去（[第 18 章](../../ch18-model-runner/narrative/chapter.md)讲过怎么准备这些张量），黑盒吐出 `hidden_states`，采样器接着抽 token。这一章，我们把黑盒打开。
 
@@ -28,7 +28,7 @@
 
 ![本章地图：模型契约剖面——构造 → TP 切分 → 权重装载 → 前向](../diagrams/chapter-map.png)
 
-只想搞清楚 fused 参数（QKV 合一）怎么从磁盘装进切好的分片，跟着实线路径 §22.2→§22.4→§22.5→§22.6→§22.7 走；只关心 o_proj、down_proj 这类不做 fuse 的朴素参数，换到虚线路径的 §22.3 起步，其余站点两条路线一一对应；从头顺序读下去同样成立。
+> 上面的架构模型图回答「本章位于整棵架构的哪里」，这张地图回答「本章内部怎么读」。只想搞清楚 fused 参数（QKV 合一）怎么从磁盘装进切好的分片，跟着实线路径 §22.2→§22.4→§22.5→§22.6→§22.7 走；只关心 o_proj、down_proj 这类不做 fuse 的朴素参数，换到虚线路径的 §22.3 起步，其余站点两条路线一一对应；从头顺序读下去同样成立。
 
 ---
 
@@ -101,7 +101,7 @@ class LlamaForCausalLM(
 
 为什么收口成单一对象？想象一下另一种世界：每个模型类的 `__init__` 列一长串 `config, cache_config, quant_config, lora_config, scheduler_config, ...`。每加一个全局配置，所有模型类的签名都得改。收口成 `vllm_config` 后，新增配置只动 `VllmConfig` 一处，模型从中按需自取。
 
-这份契约不是「君子约定」——装载器会**显式校验**它。看 `initialize_model`（`vllm/model_executor/model_loader/utils.py:L40`）：
+这份契约不是「君子约定」——装载器会**显式校验**它。走线也在这里第一次踏进 `vllm/model_executor/model_loader/`：装载骨架住在那个目录，第 1–3 站（按 `load_format` 选装载器、`load_model` 总控三段式、`initialize_model` 校验契约）都落在里面——模型类不是被自己、而是被它们造出来的。看第 3 站 `initialize_model`（`vllm/model_executor/model_loader/utils.py:L40`）：
 
 ```python
 # vllm/model_executor/model_loader/utils.py:L56
@@ -394,7 +394,7 @@ assert qkv.num_kv_head_replicas == 2   # 4 / 2
 
 ## 22.5 权重装载三段式：建空壳 → 流式切填 → 后处理
 
-模型结构建好了，但参数还是空的。把磁盘上的 checkpoint 装进去，是三段式。看 `BaseModelLoader.load_model`（`vllm/model_executor/model_loader/base_loader.py:L43`）：
+模型结构建好了，但参数还是空的。把磁盘上的 checkpoint 装进去，是三段式——走线在这里回到装载骨架：第 9 站 `DefaultModelLoader.load_weights` 把磁盘上的 checkpoint 张量流读出来喂给模型，而三段式的总控是第 2 站的 `BaseModelLoader.load_model`（`vllm/model_executor/model_loader/base_loader.py:L43`）：
 
 ```python
 # vllm/model_executor/model_loader/base_loader.py:L53
@@ -682,7 +682,7 @@ self.attn = attn_cls(
 
 传的参数比想象中多：形状/数值参数（`num_heads`、`head_dim`、`scaling`、`num_kv_heads`）之外，还原样透传了 `cache_config`、`quant_config`、`per_layer_sliding_window`、`attn_type`、`prefix` 这些配置对象。但注意——模型这里只是**转手**，没有拆开这些对象做任何判断。选哪个后端（`get_attn_backend`）、KV cache 怎么分配和读写、量化 scale 怎么算，`LlamaAttention` 自己一行都没写；把 `cache_config`/`quant_config` 递给 `Attention.__init__` 之后，剩下的逻辑全在 `Attention` 内部完成，模型定义碰都不碰。
 
-这就是 vLLM 支持「多模型 × 多后端」的解耦点。换一个注意力后端，不用改任何一行模型代码——`Attention` 内部换 `self.impl` 就行。它的 `forward` 经两个自定义算子（`unified_kv_cache_update` + `unified_attention_with_output`），从 `forward_context` 按 `layer_name`（还记得吗，就是 `prefix`）取回本层的 `kv_cache` 和 `attn_metadata`。这两个算子怎么进 `torch.compile` 图、后端怎么选，是[第 23 章](../../ch23-custom-ops-and-compilation/narrative/chapter.md)和[第 25 章](../../ch25-attention/narrative/chapter.md)的主题。
+这就是 vLLM 支持「多模型 × 多后端」的解耦点。换一个注意力后端，不用改任何一行模型代码——`Attention` 内部换 `self.impl` 就行。它的 `forward` 经两个自定义算子（`unified_kv_cache_update` + `unified_attention_with_output`），从 `forward_context` 按 `layer_name`（还记得吗，就是 `prefix`）取回本层的 `kv_cache` 和 `attn_metadata`。第 18 站 `Attention.forward` 是本章走线的终点站——再往下就踏进「自定义算子与编译」那只虚线框的地界：这两个算子怎么进 `torch.compile` 图、后端怎么选，是[第 23 章](../../ch23-custom-ops-and-compilation/narrative/chapter.md)和[第 25 章](../../ch25-attention/narrative/chapter.md)的主题。
 
 精简版在 host 上没有 CUDA、没有分页 KV cache，所以用一个 eager 的全因果 SDPA（含 GQA 的 KV 头复制）替身复现 decoder-only 注意力的可观察输出。它能跑通 GQA（8 query 头 / 2 KV 头）的形状：
 
@@ -698,7 +698,7 @@ assert attn.num_heads == 8 and attn.num_kv_heads == 2
 
 ## 22.7 把它串起来：一层 block 的前向
 
-最后，把 attention 和 MLP 拼回一个 decoder layer，看数据怎么流。`LlamaDecoderLayer.forward`（`vllm/model_executor/models/llama.py:L316`）：
+装载走完，走线进入前向段——第 16–18 站正是「ModelRunner 执行」那只蓝框每拍 `execute_model` 调进模型后跑的路径。最后，把 attention 和 MLP 拼回一个 decoder layer，看数据怎么流。`LlamaDecoderLayer.forward`（`vllm/model_executor/models/llama.py:L316`）：
 
 ```python
 # vllm/model_executor/models/llama.py:L316

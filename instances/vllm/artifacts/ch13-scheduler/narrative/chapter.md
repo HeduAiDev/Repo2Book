@@ -2,9 +2,12 @@
 
 ## 你在这里
 
-![你在这里：EngineCore 循环里的调度器](../diagrams/roadmap.png)
+![你在这里：全书架构模型已读 6 个组件，本章在 EngineCore 的「调度与显存」组里把「调度器」就地摊开——SchedulerInterface 契约、Scheduler 不分相的两阶段、SchedulerOutput 全量/增量二分、AsyncScheduler 占位机制](../diagrams/arch-model.png)
 
-> *图注：全书地图高亮当前阶段「EngineCore 循环」。[第 11 章](../../ch11-engine-core/narrative/chapter.md) 把 `EngineCore.step()` 一拍拆到底，那一拍的第一个动作就是 `scheduler_output = self.scheduler.schedule()`——当时我们把它当黑盒，只说它「产出这一批要算什么的清单」。[第 12 章](../../ch12-engine-core/narrative/chapter.md) 又把流水线变体讲透，结尾留下一句话：`schedule()` 凭什么决定这一拍推哪些请求、各推多少 token，是下一章的主场。本章就钻进这个黑盒。下一章接着讲调度器背后的 KV 块分配器——`allocate_slots` 怎么把 token 落到分页显存上。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长的一块。*
+> *本章这块橙色在 `EngineCore` 大框的「调度与显存」组里就地摊开，摊开的正是逐拍循环里 `schedule` 这一步的真实组织：`SchedulerInterface`（第 1 站）是契约，`Scheduler`（第 2–10 站）是主体，`AsyncScheduler`（第 11 站）是异步变体，旁边 `NewRequestData` / `CachedRequestData` / `SchedulerOutput` 是它两头的产物。全章 11 站全部落在这块橙色上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *这块新结构接在哪？它的上沿就是已读的「IPC 边界」蓝框（[第 7 章](../../ch07-engine-core/narrative/chapter.md)）——请求过完那条线，第一脚就踩进 `EngineCore` 大框、踩到调度器；同组的「分页 KV 缓存」还是虚线框（[第 15 章](../../ch15-kv-cache/narrative/chapter.md)才讲），本章调度器手里只握着它的门面 `allocate_slots`，从这一侧喊话。*
+> *[第 11 章](../../ch11-engine-core/narrative/chapter.md) 把 `EngineCore.step()` 一拍拆到底，那一拍的第一个动作就是 `scheduler_output = self.scheduler.schedule()`——当时我们把它当黑盒，只说它「产出这一批要算什么的清单」。[第 12 章](../../ch12-engine-core/narrative/chapter.md) 又把流水线变体讲透，结尾留下一句话：`schedule()` 凭什么决定这一拍推哪些请求、各推多少 token，是下一章的主场。本章就钻进这个黑盒。下一章停在 `allocate_slots` 要不到块的那一刻——[第 14 章](../../ch14-scheduler/narrative/chapter.md) 把抢占与请求生命周期回流补完。*
 
 [第 11 章](../../ch11-engine-core/narrative/chapter.md) 立下的事是：`EngineCore` 每一拍调一次 `schedule()`，拿回一个 `SchedulerOutput`，喂给模型跑前向；前向出了 token，再调 `update_from_output()` 收口。那一章把循环的骨架讲清了，唯独把 `schedule()` 和 `update_from_output()` 这两个方法当作黑盒——「这一批要算什么」由它们说了算，但「凭什么这么算」没展开。本章的代码主线集中在 `vllm/v1/core/sched/` 这一个目录：调度器主体 `vllm/v1/core/sched/scheduler.py`、异步变体 `vllm/v1/core/sched/async_scheduler.py`、产物结构 `vllm/v1/core/sched/output.py`。
 
@@ -154,6 +157,8 @@ v1 这套「token 为中心、不分相」的调度，把两条来自论文的�
 ## 13.3 阶段一：先伺候在途请求（RUNNING）
 
 第一阶段遍历 `self.running`——已经在跑的请求。**RUNNING 优先于 WAITING**，这是个刻意的策略：先保证在途请求往前推进（低延迟、避免吐到一半的请求被新来的饿死）。
+
+按架构模型图的走线，这一段落在 `Scheduler` 主体（第 2–10 站）上；`allocate_slots` 是它与同组那块虚线框「分页 KV 缓存」（[第 15 章](../../ch15-kv-cache/narrative/chapter.md)）的接缝——调度器不碰物理块，只握着它的门面喊话，要得到就继续，要不到就抢占。
 
 ```python
 # vllm/v1/core/sched/scheduler.py:L345
@@ -683,6 +688,8 @@ def test_second_schedule_emits_cached_request_data():
 
 `schedule()` 是「发出去」，`update_from_output()` 是「收回来」。模型跑完前向、采样出 token，[EngineCore](../../ch11-engine-core/narrative/chapter.md) 把 `ModelRunnerOutput` 交给它，它负责把 token 追加到请求上、判断该不该停、停了就释放：
 
+在逐拍循环（`schedule → execute_model → update`）里，这一站是收口的那一拍 `update`——它的产出正是下一拍 `schedule` 的输入，循环箭头转回起点。
+
 ```python
 # vllm/v1/core/sched/scheduler.py:L1248（精简：剥去 connector/encoder/structured/pooling/logprobs/stats）
     def update_from_output(self, scheduler_output, model_runner_output):
@@ -775,7 +782,7 @@ def test_request_stops_at_max_tokens():
 
 ## 13.7 AsyncScheduler：让调度和执行重叠
 
-最后一块拼图，是 vLLM 默认会启用的**异步调度**。[第 3 章 §3.5](../../ch03-config-and-wiring/narrative/chapter.md#35-async_scheduling-三态决策默认开但会自动退化) 讲配置时埋了一笔账：`async_scheduling` 是个三态开关（True / False / None），它的最终值会影响 `EngineCore` 实例化哪个调度器——`async_scheduling=True` 时实例化 `AsyncScheduler`，否则是普通 `Scheduler`。当时只说「记住这条线」，现在到了它兑现的地方：这个 `AsyncScheduler` 实例，**到底怎么驱动连续批处理？**
+最后一块拼图，是 vLLM 默认会启用的**异步调度**。架构模型图上 `Scheduler` 下面那行 `AsyncScheduler`（第 11 站）就是它——[第 3 章 §3.5](../../ch03-config-and-wiring/narrative/chapter.md#35-async_scheduling-三态决策默认开但会自动退化) 讲配置时埋了一笔账：`async_scheduling` 是个三态开关（True / False / None），它的最终值会影响 `EngineCore` 实例化哪个调度器——`async_scheduling=True` 时实例化 `AsyncScheduler`，否则是普通 `Scheduler`。当时只说「记住这条线」，现在到了它兑现的地方：这个 `AsyncScheduler` 实例，**到底怎么驱动连续批处理？**
 
 先看它解决什么问题。回到同步 `Scheduler`：第 N 拍调度时，追赶公式要读 `num_computed_tokens`。但这个值，要等第 N−1 拍的前向**跑完、采样出 token**，才能正确更新。于是同步调度被卡死成一条直线——调度，等前向，调度，等前向。前向在 GPU 上跑的时候，CPU 上的调度器在干等；调度器在算的时候，GPU 在干等。两边轮流闲着。
 

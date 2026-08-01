@@ -393,6 +393,11 @@ def build(model, cid):
         else:
             box(L, nx, ny, nw, 36, f_, k_, r=5, sw=1.3)
         ids = comp_stations(nm)
+        is_ref = node.get('ref')
+        # 引用节点(已在别处展开过的持有,如 MTP 里的 DecoderLayer)不再重复挂站号——
+        # 否则同一站号出现在两个盒上(盲审第五轮:可见槽 22 ≠ 20 站)
+        if is_ref:
+            ids = []
         bd = f'第 {rng(ids)} 站' if ids else ''
         # 名称一行、站号徽标单独一行(无论容器还是叶子)
         if kids:
