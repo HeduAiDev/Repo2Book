@@ -374,6 +374,24 @@ def build(inst=None):
 
     src_root = Path(instance.source_dir(inst))
     rel_by_ch = {}
+    # ---- 文件站数统计：某文件被各章 spine 读了几站 —— 类归属章的**证据**。----
+    # 盲审批次2 抓到：introduced_in(首次提及章)与真实阅读章冲突——
+    #   InputProcessor 在 ch04 被提及一次就被登记为 async-engine，但 ch05 读了它 7 站；
+    #   OutputProcessor/RequestOutputCollector 被 ch04 登记，ch08 才是主场；
+    #   EngineCore/EngineCoreProc 被 ch03/ch07 登记，ch11 才是主场(15 站)。
+    # 归属一律改看「哪个章的 spine 读了这个文件最多站」。
+    file_stations = {}
+    for cid in sorted(slug_by_cid, key=_chapter_index):
+        for u in l3_by_ch.get(cid, []):
+            file_stations.setdefault(u['path'], {})[cid] = file_stations.setdefault(u['path'], {}).get(cid, 0) + 1
+
+    def owner_of(f):
+        votes = file_stations.get(f)
+        if not votes:
+            return None
+        best = max(votes.items(), key=lambda kv: kv[1])
+        return best[0] if best[1] > 0 else None
+
     # ---- 组件（类）注册表：架构图的**细粒度节点**。每章 dossier.key_classes 首次出现即登记，
     # introduced_in = 首次讲它的那一章 → 这就是「前面章节铺垫的结构」的来源。----
     classes = OrderedDict()
@@ -401,10 +419,14 @@ def build(inst=None):
             if not nm:
                 continue
             f = (kc.get('file') or '').split(':')[0].strip()
-            if nm not in classes:
-                classes[nm] = {'name': nm, 'file': f, 'subsystem': meta['subsystem'],
-                               'introduced_in': cid,
-                               'responsibility': (kc.get('responsibility') or '')[:200]}
+            if nm in classes:
+                continue
+            own = owner_of(f)
+            own_meta = ch_meta.get(own) if own else None
+            classes[nm] = {'name': nm, 'file': f,
+                           'subsystem': (own_meta['subsystem'] if own_meta else meta['subsystem']),
+                           'introduced_in': (own if own else cid),
+                           'responsibility': (kc.get('responsibility') or '')[:200]}
 
     # L2 累积：某子系统首次被哪一章展开
     sub_first = {}
