@@ -188,11 +188,13 @@ def plan_panel(cls, st_map, rel, width):
     """把本章组件排成**有组织关系的架构**，而不是一列类名。
 
     用户 2026-07-26：参考图表达的是「各模块的相互作用与组织关系」，靠列举类名表现不出来。
-    于是按源码抽到的真实关系分三种角色排版：
-      · 契约(contract)：被 >=2 个类继承的基类 → 画成**容器盒**，实现类嵌在里面
-        （对应参考图里 Backend 底下并排挂 Flash/Blocksparse/Ipex/Rocm 那种结构）
-      · 持有者(owner) ：有 has-a 指向别人的类 → 左列，画箭头指向被持有者
-      · 其余          ：左列普通盒
+    从源码抽到的真实关系里认出两种结构，分别对应参考图里的两种画法：
+      · 契约(contract)：被 >=2 个类继承的基类 → **容器盒**，实现类并排嵌在里面
+        （参考图里 Backend 底下并排挂 Flash/Blocksparse/Ipex/Rocm）
+      · 组合(containment)：X 持有 Y（has_a）→ **盒套盒**，Y 嵌进 X
+        （参考图里 SequenceGroup ⊃ Sequence ⊃ SequenceData；ch28 的
+         ForCausalLM ⊃ Model ⊃ DecoderLayer ⊃ {Attention, MoE} ⊃ {MLP, Experts}）
+    两者都没有 → 诚实地并列平铺，并在标题标「这几块彼此独立」（ch32 那种确实无层级的章）。
     """
     is_a, has_a = rel.get('is_a', []), rel.get('has_a', [])
     names = {c['name']: c for c in cls}
@@ -203,24 +205,68 @@ def plan_panel(cls, st_map, rel, width):
                 return k
         return None
 
+    # ---- 契约：>=2 个实现的基类 ----
     kids = OrderedDict()
     for a, b in is_a:
         ca, cb = canon(a), canon(b)
         if ca and cb and ca != cb:
             kids.setdefault(cb, [])
             if not any(x[0] == a for x in kids[cb]):
-                kids[cb].append((a, ca))      # (源码真实类名, 所属 key_class 条目)
+                kids[cb].append((a, ca))
     contracts = OrderedDict((k, v) for k, v in kids.items() if len(v) >= 2)
-    inside = {ck for v in contracts.values() for _, ck in v} | set(contracts)
-    left = [c for c in cls if c['name'] not in inside]
-    owns = OrderedDict()
+    in_contract = {ck for v in contracts.values() for _, ck in v} | set(contracts)
+
+    # ---- 组合森林：X has-a Y（只在 key_classes 集合内，且不与契约成员重叠）----
+    children = OrderedDict()
+    parent = {}
     for a, b in has_a:
         ca, cb = canon(a), canon(b)
-        if ca and cb and ca != cb and cb in contracts:
-            owns.setdefault(ca, [])
-            if cb not in owns[ca]:
-                owns[ca].append(cb)
-    return {'left': left, 'contracts': contracts, 'owns': owns, 'inside': inside}
+        if not (ca and cb) or ca == cb or ca in in_contract or cb in in_contract:
+            continue
+        children.setdefault(ca, [])
+        if cb not in children[ca] and cb not in _ancestors(ca, parent):   # 防环
+            children[ca].append(cb)
+            parent[cb] = ca
+    roots = [c['name'] for c in cls
+             if c['name'] not in in_contract and c['name'] not in parent
+             and c['name'] in children]
+    expanded = set()      # 已在某处展开过的节点 → 再次被持有时只作叶子引用,不重复整棵子树
+    nested = {r: _subtree(r, children, set(), expanded, depth=0, maxd=3) for r in roots}
+    consumed = set()
+    for r in roots:
+        _collect(r, children, consumed)
+
+    left = [c for c in cls if c['name'] not in in_contract and c['name'] not in consumed]
+    return {'left': left, 'contracts': contracts, 'nested': nested, 'roots': roots,
+            'in_contract': in_contract}
+
+
+def _ancestors(n, parent):
+    out, cur = set(), parent.get(n)
+    while cur:
+        if cur in out:
+            break
+        out.add(cur)
+        cur = parent.get(cur)
+    return out
+
+
+def _subtree(n, children, seen, expanded, depth, maxd):
+    # 环、超深、或已在别处展开过 → 收成叶子(只画盒名,不再往里钻)
+    if n in seen or depth >= maxd or n in expanded:
+        return {'name': n, 'children': [], 'ref': n in expanded}
+    seen = seen | {n}
+    expanded.add(n)
+    return {'name': n, 'ref': False,
+            'children': [_subtree(c, children, seen, expanded, depth + 1, maxd)
+                         for c in children.get(n, [])]}
+
+
+def _collect(n, children, acc):
+    acc.add(n)
+    for c in children.get(n, []):
+        if c not in acc:
+            _collect(c, children, acc)
 
 
 def build(model, cid):
@@ -266,95 +312,131 @@ def build(model, cid):
             w - 10, 8.8, C_MUTE)
         boxpos[sid] = (x, cy, w, CH_)
 
+    # ---- 组件站号：类名前缀命中 > 该类自有方法且同文件（两道坑：'A / B' 合条、方法重名）----
+    def comp_stations(real):
+        _rel = ch.get('relations', {})
+        meth = set((_rel.get('methods') or {}).get(real, []))
+        rfile = (_rel.get('files') or {}).get(real)
+        out = []
+        for _i, _u in enumerate(spine, 1):
+            _sym = _u.get('symbol') or ''
+            if not _sym:
+                continue
+            if _sym.split('.')[0] == real:
+                out.append(_i)
+            elif _sym in meth and rfile and _u['path'] == rfile:
+                out.append(_i)
+        return out or st_map.get(real, [])
+
+    def node_h(node):
+        """嵌套盒高度：叶子一行；有子节点则标题行 + 子节点两列堆叠。"""
+        kids = node['children']
+        if not kids:
+            return 28
+        krows = (len(kids) + 1) // 2 if len(kids) > 1 else 1
+        return 26 + sum(node_h(k) for k in kids[::2]) + (krows) * 4 + 6 \
+            if any(k['children'] for k in kids) else 26 + krows * 24 + 6
+
+    def draw_node(node, nx, ny, nw):
+        """递归画组合盒：容器在外、被持有者嵌在内（参考图 SequenceGroup ⊃ Sequence ⊃ …）。"""
+        nm = node['name']
+        kids = node['children']
+        h = node_h(node)
+        isnew = names_meta.get(nm, {}).get('introduced_in') == cid
+        f_, k_ = (C_CUR_F, C_CUR_S) if isnew else (C_BUILT_F, C_BUILT_S)
+        if kids:
+            box(L, nx, ny, nw, h, '#fffaf3', C_CUR_S, r=6, sw=1.5)
+        else:
+            box(L, nx, ny, nw, h, f_, k_, r=5, sw=1.3)
+        ids = comp_stations(nm)
+        bd = f'第 {rng(ids)} 站' if ids else ''
+        fit(L, nx + 8, ny + 16, short(nm), nw - 18 - (tw(bd, 9, True) + 6 if bd else 0),
+            10 if kids else 9.6, C_TXT if not kids else C_CUR_S, bold=(isnew or bool(kids)),
+            anchor='start')
+        if bd:
+            text(L, nx + nw - 7, ny + 16, bd, 9, C_CUR_S, anchor='end', bold=True)
+        if not kids:
+            return h
+        two = len(kids) > 1
+        kcols = 2 if two else 1
+        kw = (nw - 16 - (kcols - 1) * 8) / kcols
+        colh = [ny + 24, ny + 24]
+        for i, kd in enumerate(kids):
+            col = i % kcols if two else 0
+            kx = nx + 8 + col * (kw + 8)
+            kh = draw_node(kd, kx, colh[col], kw)
+            colh[col] += kh + 5
+        return h
+
+    names_meta = {c['name']: c for c in cls}
+
     def panel_h():
         if not pan:
             return 0
-        lh = 30 + len(pan['left']) * 30
-        rh = 30 + sum(24 + ((len(v) + 1) // 2) * 22 + 8 for v in pan['contracts'].values())
-        return max(lh, rh) + 10
+        flat = not pan['contracts'] and not pan['roots']
+        lcols = 2 if flat and len(pan['left']) > 4 else 1
+        lh = ((len(pan['left']) + lcols - 1) // lcols) * 30
+        rh = sum(node_h({'name': r, 'children': pan['nested'][r]['children']}) + 8
+                 for r in pan['roots'])
+        rh += sum(24 + ((len(v) + 1) // 2) * 22 + 8 for v in pan['contracts'].values())
+        return 30 + max(lh, rh) + 10
 
     def draw_panel(px, py, pw):
-        box(L, px, py, pw, panel_h(), '#fff7ed', C_CUR_S, r=7, sw=2.0)
-        boxpos[cur_sub] = (px, py, pw, panel_h())
-        text(L, px + 12, py + 18, f"{subs[cur_sub]['name_cn']}　← 本章展开", 11.5, C_CUR_S,
+        ph = panel_h()
+        box(L, px, py, pw, ph, '#fff7ed', C_CUR_S, r=7, sw=2.0)
+        boxpos[cur_sub] = (px, py, pw, ph)
+        flat = not pan['contracts'] and not pan['roots']
+        tag = '（这几块彼此独立，按功能并列）' if flat else ''
+        text(L, px + 12, py + 18, f"{subs[cur_sub]['name_cn']}　← 本章展开{tag}", 11.5, C_CUR_S,
              anchor='start', bold=True)
         text(L, px + pw - 12, py + 18,
              f'本章 {len(spine)} 站，其中 {len(covered)} 站落在下列组件上', 9.3, C_MUTE, anchor='end')
-        has_r = bool(pan['contracts'])
-        LW = (pw - 30) * (0.42 if has_r else 1.0)
-        RW = (pw - 30) - LW - (10 if has_r else 0)
-        lx0, rx0 = px + 10, px + 10 + LW + 20
-        lpos, rpos = {}, {}
+        has_r = bool(pan['contracts']) or bool(pan['roots'])
+        lcols = 2 if flat and len(pan['left']) > 4 else 1
+        LW = (pw - 30) if not has_r else (pw - 34) * 0.40
+        RW = (pw - 30) - LW - (14 if has_r else 0)
+        lx0, rx0 = px + 12, px + 12 + LW + 14
+        lcw = (LW - (lcols - 1) * 10) / lcols
         for i, c in enumerate(pan['left']):
-            cy2 = py + 29 + i * 30
+            lc, lr = (i % lcols, i // lcols) if lcols > 1 else (0, i)
+            cx_l = lx0 + lc * (lcw + 10)
+            cy2 = py + 30 + lr * 30
             isnew = c['introduced_in'] == cid
             f_, k_ = (C_CUR_F, C_CUR_S) if isnew else (C_BUILT_F, C_BUILT_S)
-            box(L, lx0, cy2, LW, 26, f_, k_, r=5, sw=1.3)
-            ids = st_map.get(c['name'], [])
+            box(L, cx_l, cy2, lcw, 26, f_, k_, r=5, sw=1.3)
+            ids = comp_stations(c['name'])
             bd = f'第 {rng(ids)} 站' if ids else ''
-            fit(L, lx0 + 8, cy2 + 17, short(c['name']),
-                LW - 20 - (tw(bd, 9, True) + 8 if bd else 0), 10, C_TXT, bold=isnew, anchor='start')
+            fit(L, cx_l + 8, cy2 + 17, short(c['name']),
+                lcw - 20 - (tw(bd, 9, True) + 8 if bd else 0), 10, C_TXT, bold=isnew, anchor='start')
             if bd:
-                text(L, lx0 + LW - 8, cy2 + 17, bd, 9, C_CUR_S, anchor='end', bold=True)
-            lpos[c['name']] = (lx0, cy2, LW, 26)
-        ry = py + 29
+                text(L, cx_l + lcw - 8, cy2 + 17, bd, 9, C_CUR_S, anchor='end', bold=True)
+        ry = py + 30
+        # 组合森林（盒套盒）
+        for r in pan['roots']:
+            hh = draw_node({'name': r, 'children': pan['nested'][r]['children']}, rx0, ry, RW)
+            ry += hh + 8
+        # 契约容器（并排实现）
         for ct, members in pan['contracts'].items():
             mrows = (len(members) + 1) // 2
             hh = 24 + mrows * 22 + 8
             box(L, rx0, ry, RW, hh, '#ffffff', C_CUR_S, r=6, sw=1.5)
-            ids = st_map.get(ct, [])
+            ids = comp_stations(ct)
             fit(L, rx0 + 8, ry + 16, short(ct) + '（契约）', RW - 96, 10, C_CUR_S, bold=True,
                 anchor='start')
             if ids:
-                text(L, rx0 + RW - 8, ry + 16, f'第 {rng(ids)} 站', 9, C_CUR_S, anchor='end',
-                     bold=True)
+                text(L, rx0 + RW - 8, ry + 16, f'第 {rng(ids)} 站', 9, C_CUR_S, anchor='end', bold=True)
             mw = (RW - 24) / 2
             for j, (real, key) in enumerate(members):
                 mx = rx0 + 8 + (j % 2) * (mw + 8)
                 my = ry + 24 + (j // 2) * 22
                 box(L, mx, my, mw, 19, '#fff7ed', '#fdba74', r=4, sw=1.1)
-                # 站号只标在**真正对应该实现**的那一站上：key_classes 常把
-                # 'XgrammarBackend / XgrammarGrammar' 并成一条，直接套用会让两个实现都印同样的站号。
-                # ⚠️ key_classes 常把 'XgrammarBackend / XgrammarGrammar' 并成一条,
-                # 直接套用会让两个实现都印上同一串站号(实测 XgrammarGrammar 被误标 9-10 站,
-                # 而 9-10 其实属于 Backend)。改为按源码精确归属:显式类名前缀 > 该类自有方法名。
-                # ⚠️ 两道坑都踩过,故归属规则必须同时看**类名前缀**和**文件**:
-                #   ① key_classes 把 'XgrammarBackend / XgrammarGrammar' 并成一条 →
-                #      直接套用会让两个实现都印同一串站号(XgrammarGrammar 被误标 9-10 站)。
-                #   ② 只按方法名归属又会误伤:compile_grammar 四个后端各有一份 →
-                #      站 10 会同时印到 Guidance/Outlines/LMFormatEnforcer 上,而它其实在 backend_xgrammar.py。
-                _rel = ch.get('relations', {})
-                meth = set((_rel.get('methods') or {}).get(real, []))
-                rfile = (_rel.get('files') or {}).get(real)
-                mids = []
-                for _i, _u in enumerate(spine, 1):
-                    _sym = _u.get('symbol') or ''
-                    if not _sym:
-                        continue
-                    if _sym.split('.')[0] == real:
-                        mids.append(_i)
-                    elif _sym in meth and rfile and _u['path'] == rfile:
-                        mids.append(_i)
+                mids = comp_stations(real)
                 mb = f'第 {rng(mids)} 站' if mids else ''
                 fit(L, mx + 6, my + 13, real,
                     mw - 14 - (tw(mb, 8.2, True) + 6 if mb else 0), 9, C_TXT, anchor='start')
                 if mb:
                     text(L, mx + mw - 5, my + 13, mb, 8.2, C_CUR_S, anchor='end', bold=True)
-            rpos[ct] = (rx0, ry, RW, hh)
             ry += hh + 8
-        for owner, targets in pan['owns'].items():
-            if owner not in lpos:
-                continue
-            ox, oy, ow, oh = lpos[owner]
-            for t in targets:
-                if t not in rpos:
-                    continue
-                tx2, ty2, tw2, th2 = rpos[t]
-                sy2, ey3 = oy + oh / 2, ty2 + th2 / 2
-                mx = ox + ow + 9
-                L.append(f'<path d="M{ox + ow:.1f},{sy2:.1f} L{mx:.1f},{sy2:.1f} L{mx:.1f},{ey3:.1f} '
-                         f'L{tx2:.1f},{ey3:.1f}" fill="none" stroke="{C_CUR_S}" stroke-width="1.4" '
-                         f'marker-end="url(#a2)"/>')
 
     text(L, M, y - 16, '这张图是第 1 章那张「一个请求的端到端旅程」长大后的样子：'
                        '蓝＝前面章节已读，橙＝本章新增，虚线＝后续章节才讲', 11.2, C_MUTE, anchor='start')

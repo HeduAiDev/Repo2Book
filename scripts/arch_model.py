@@ -186,6 +186,11 @@ def _split_names(n):
     return [x.strip() for x in n.split('/') if x.strip() and re.match(r'^[A-Za-z_]\w*$', x.strip())]
 
 
+_SKIP_BASES = {'object', 'ABC', 'Enum', 'IntEnum', 'str', 'Exception', 'Generic', 'Protocol',
+               'NamedTuple', 'TypedDict', 'Struct', 'BaseModel', 'Module', 'MutableSequence',
+               'Sequence', 'dict', 'list', 'tuple', 'Mapping'}
+
+
 def extract_relations(src_root, key_classes):
     """从**真实源码**抽取组件之间的组织关系 —— 架构图要表达的是相互作用与组织关系，
     这些关系必须来自源码，不能靠列类名或凭印象编。
@@ -217,9 +222,15 @@ def extract_relations(src_root, key_classes):
             if not isinstance(node, _ast.ClassDef) or node.name not in want:
                 continue
             for b in node.bases:
-                bn = _ast.unparse(b).split('[')[0].strip()
-                if bn in want and bn != node.name:
-                    is_a.append([node.name, bn])
+                bn = _ast.unparse(b).split('[')[0].strip().rsplit('.', 1)[-1]
+                if bn == node.name:
+                    continue
+                # 子类必在本章 key_classes;基类在集合内→内部契约,不在→**具名外部契约**(如
+                # Fp8Config/SupportsPP/KVConnectorBase_V1),也保留——它正是「本章新结构接到哪个已有抽象上」。
+                # 只滤掉纯语言/框架基类,它们不是架构信息。
+                if bn in _SKIP_BASES:
+                    continue
+                is_a.append([node.name, bn])
             own, ref = set(), set()
             for x in _ast.walk(node):
                 if isinstance(x, _ast.AnnAssign) and x.annotation is not None:
@@ -227,6 +238,9 @@ def extract_relations(src_root, key_classes):
                     for k in want:
                         if k != node.name and re.search(r'\b' + re.escape(k) + r'\b', ann):
                             own.add(k)
+                elif isinstance(x, _ast.Call) and isinstance(x.func, _ast.Name) \
+                        and x.func.id in want and x.func.id != node.name:
+                    own.add(x.func.id)          # 类体内构造另一个组件 = 组合/持有(ch10 的 LogprobsTensors)
                 elif isinstance(x, _ast.Name) and x.id in want and x.id != node.name:
                     ref.add(x.id)
             for k in sorted(own):
