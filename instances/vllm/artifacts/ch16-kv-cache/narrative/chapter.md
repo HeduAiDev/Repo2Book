@@ -2,12 +2,11 @@
 
 ## 你在这里
 
-![你在这里：分页 KV 缓存的分配决策层](../diagrams/roadmap.png)
+![你在这里：全书架构已读 8 个组件，本章在 EngineCore「调度与显存」组里就地展开分页 KV 缓存的分配决策层——左列是 KVCacheManager 入口类，右列是 KVCacheCoordinator 与 SingleTypeKVCacheManager 两层契约，各嵌三类实现](../diagrams/arch-model.png)
 
-> *图注：全书地图仍停在主线阶段「EngineCore 循环」，本章继续深入它背后的分页 KV 缓存。*
-> *[第 15 章](../../ch15-kv-cache/narrative/chapter.md) 立了块池、LRU、块哈希、前缀命中这些零件。*
-> *本章解决「拿到这些零件后怎么决策」：一次分配里哪些块该释放、哪些该挂、哪些该新建。*
-> *下一章离开 KV 缓存，转向 Executor 与 Worker 的生命周期。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线自上而下：入口→输入处理（Stage 1）→IPC（进程间通信）边界→装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框→输出处理（Stage 3），行间箭头还是请求的流向。EngineCore 框里已按「循环本体／调度与显存／执行与并行／模型与算子／解码策略」四组装着前面章节读过的部件。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
+> *本章新长的这块在「调度与显存」组里就地展开——不是一列类名，而是源码里真实的组织关系：左列是 KVCacheManager 等入口类（第 1\~6 站），右列是 KVCacheCoordinator 与 SingleTypeKVCacheManager 两份契约，各自嵌着三类实现——KVCacheCoordinator 契约下是 NoPrefixCache / Unitary / Hybrid 三个协调器，SingleTypeKVCacheManager 契约下是全注意力 / SlidingWindow / ChunkedLocalAttention 三种管理器变体。这块就长在蓝色的「调度器」正下方：[第 13 章](../../ch13-scheduler/narrative/chapter.md) / [第 14 章](../../ch14-scheduler/narrative/chapter.md) 里，调度器每拍调 `allocate_slots` 分配 KV 块，而这个函数正是左列 KVCacheManager 的入口；右列 KVCacheCoordinator 往下管着 [第 15 章](../../ch15-kv-cache/narrative/chapter.md) 铺好的 BlockPool 和块哈希。左列 `get_kv_cache_coordinator`（第 7 站）在构造期一次判定，把调用分发给右列三个协调器之一——这就是本章主线「分配决策」与「多注意力协调」的组织关系。本章走线共 23 站，全部落在这些橙色部件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *[第 15 章](../../ch15-kv-cache/narrative/chapter.md) 立了块池、LRU、块哈希、前缀命中这些底层零件。本章把这套零件装上决策层：一次分配里窗外块释放、命中块挂接、新建槽位，以及多种注意力类型的 KV 管理器怎么协调收敛。下一章离开 KV 缓存，转向 [第 17 章](../../ch17-worker-and-executor/narrative/chapter.md) Executor 与 Worker 的生命周期——也就是图上「执行与并行」组里那些虚线框。*
 
 [第 15 章](../../ch15-kv-cache/narrative/chapter.md) 把 `allocate_slots` 的三段式过了一遍——但走的是一条**最顺**的路：单一注意力类型、全注意力、开着前缀缓存。那条路上，「释放窗外块」这一步直接被跳过了（全注意力从不释放），「混合模型怎么协调多种注意力」更是连碰都没碰。
 
@@ -522,7 +521,7 @@ return self.create_kv_cache_blocks(new_blocks)
 
 那个 `delay_cache_blocks` 早退分支是 P/D 分离用的——KV 要从远端收，先别急着缓存，等收到再说。和 `enable_caching=False` 共用一条早退路径，点到为止。
 
-至此 `allocate_slots` 三阶段全部走完。但你可能注意到，上面所有动作都经过一个 `self.coordinator.xxx`——这个 coordinator 是谁？它怎么知道该转发给哪个管理器？这就是本章的第二个主角。
+至此 `allocate_slots` 三阶段全部走完。但你可能注意到，上面所有动作都经过一个 `self.coordinator.xxx`——这个 coordinator 是谁？它怎么知道该转发给哪个管理器？这就是本章的第二个主角。 **在架构模型图上，我们现在从 `allocate_slots` 内部跨到了右列橙色契约框——KVCacheCoordinator 就是这个 `self.coordinator`，框里三个实现对应下面要展开的三态。**
 
 ---
 
@@ -601,7 +600,7 @@ def find_longest_cache_hit(
 
 命中长度 = 命中块数 × `block_size`，没有任何协调逻辑，因为只有一种注意力。它构造时断言 `hash_block_size == block_size` 且组数 == 1。[第 15 章](../../ch15-kv-cache/narrative/chapter.md#156-查表与命中从-block_hashes-到物理块) 讲的 `FullAttentionManager.find_longest_cache_hit`，走的就是 Unitary 这条委托。精简版 `test_unitary_find_longest_cache_hit_delegates` 验证它确实把调用透传给了唯一 manager。
 
-真正烧脑的是 **Hybrid**——多种注意力，命中长度要让**所有类型同时成立**。下一节专门拆它。
+真正烧脑的是 **Hybrid**——多种注意力，命中长度要让**所有类型同时成立**。下一节专门拆它。 **在架构模型图上，这是右列 KVCacheCoordinator 契约框里的第三个实现 `HybridKVCacheCoordinator`。**
 
 ---
 

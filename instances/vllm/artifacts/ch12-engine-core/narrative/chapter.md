@@ -2,9 +2,12 @@
 
 ## 你在这里
 
-![你在这里：EngineCore 的流水线变体](../diagrams/roadmap.png)
+![你在这里：全书架构模型在「引擎核心」子系统展开 6 个组件，本章橙色块是 step_with_batch_queue 及其批队列机制](../diagrams/arch-model.png)
 
-> *图注：全书地图高亮当前阶段。[第 11 章](../../ch11-engine-core/narrative/chapter.md) 把 `EngineCore` 的「心跳」`step()` 一拍拆到底，并在结尾留了一笔账：忙循环里那个 `step_fn()`，普通情况是 `step`，开了流水线并行就换成 `step_with_batch_queue`——「batch queue 的完整时间轴、各 stage 怎么重叠、那条投机解码叠结构化输出的小众路径，是第 12 章的主场」。本章就是那一场。我们把 `step_with_batch_queue` 这一个方法拆到底，看清那个 `deque` 怎么靠 `appendleft`/`pop` 把多个批同时挂在流水线的不同 stage 上，让 PP 气泡消失。往后 [第 13 章](../../ch13-scheduler/narrative/chapter.md) 会钻进 `schedule()`，看连续批处理每一拍到底决定推什么。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、Stage 1 输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 EngineCore 大框、Stage 3 输出处理，行间箭头还是请求的流向。三色是全书通用约定：蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的结构。*
+> *本章新长的这块在 EngineCore 大框最上层的「引擎核心」组里就地展开，摊开的不是一列类名，而是源码里真实的并列关系——这几块彼此独立、按功能排开：`EngineCore.step_with_batch_queue` 是本章要拆到底的方法，`EngineCore.batch_queue` 与 `batch_queue_size` 是它赖以工作的队列本体和深度，`Executor.max_concurrent_batches` 是那个深度的唯一来源，`SchedulerOutput.has_structured_output_requests` 一族标志与 `Scheduler.get_grammar_bitmask` 则是它与结构化输出交界处那条支线。**最该记住的是这堆橙色接在哪**：图上同一个展开框里唯一的蓝块，是[第 11 章](../../ch11-engine-core/narrative/chapter.md)已经读过的引擎子进程外壳（忙循环每拍调一次 `self.step_fn()` 的那层壳）——本章第 1 站和第 9 站正落在它身上，一头是它把这一拍交给谁，一头是这一拍的输出交回给它；再往外，队列深度那条链要一路问到[第 3 章](../../ch03-config-and-wiring/narrative/chapter.md)装配好的执行器配置，而灌进这个大框的请求仍是从[第 7 章](../../ch07-engine-core/narrative/chapter.md)那条 IPC 边界进来的。本章共 9 站，6 站落在上面这些橙色部件上，另有 3 站落在其他章已讲的组件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+
+[第 11 章](../../ch11-engine-core/narrative/chapter.md) 立下的事是：`EngineCore` 每一拍调 `self.step_fn()`，而这个 `step_fn` 在 `vllm/v1/engine/core.py` 的 `__init__` 时就**静态绑定**好了——绑 `step` 还是绑 `step_with_batch_queue`，取决于一个开关。那一章把 `step` 讲透了：一次迭代里 `schedule → execute_model(non_block) → 算掩码 → 等前向 → 采样 → 收口`，最精巧的一手是让 CPU 算掩码和 GPU 跑前向重叠。
 
 [第 11 章](../../ch11-engine-core/narrative/chapter.md) 立下的事是：`EngineCore` 每一拍调 `self.step_fn()`，而这个 `step_fn` 在 `vllm/v1/engine/core.py` 的 `__init__` 时就**静态绑定**好了——绑 `step` 还是绑 `step_with_batch_queue`，取决于一个开关。那一章把 `step` 讲透了：一次迭代里 `schedule → execute_model(non_block) → 算掩码 → 等前向 → 采样 → 收口`，最精巧的一手是让 CPU 算掩码和 GPU 跑前向重叠。
 
@@ -151,7 +154,7 @@ with ThreadPoolExecutor() as pool:
 
 ### max_concurrent_batches：那条间接链
 
-`EngineCore` 自己**不看** `async_scheduling` 来选 step——它只看 `batch_queue` 是不是 `None`。那 `async_scheduling` 又怎么参与决策的？答案藏在 `max_concurrent_batches` 里。这个属性在每种执行器上有不同定义，正是它把「PP size」和「async_scheduling」两个看似无关的开关，统一翻译成一个数字。
+`EngineCore` 自己**不看** `async_scheduling` 来选 step——它只看 `batch_queue` 是不是 `None`。那 `async_scheduling` 又怎么参与决策的？答案藏在 `max_concurrent_batches` 里。这个属性在每种执行器上有不同定义，正是它把「PP size」和「async_scheduling」两个看似无关的开关，统一翻译成一个数字。**这条配置链现在要向上游回溯了**——从引擎核心这里，一路问到[第 3 章](../../ch03-config-and-wiring/narrative/chapter.md)装配好的执行器。
 
 基类默认最保守：
 
@@ -210,7 +213,7 @@ assert MultiprocExecutor(_ParallelConfig(pipeline_parallel_size=1),
 
 ## 12.3 上半段：填管道优先于取结果
 
-`step_with_batch_queue` 的 docstring 把整个执行流写在了最前面，值得一字不漏读：
+**回到引擎核心的主循环**——[第 11 章](../../ch11-engine-core/narrative/chapter.md)那个忙循环每一拍敲 `self.step_fn()`，本章讲的就是 `step_fn` 绑到 `step_with_batch_queue` 之后这一拍到底干了什么。`step_with_batch_queue` 的 docstring 把整个执行流写在了最前面，值得一字不漏读：
 
 ```python
 # vllm/v1/engine/core.py:L447
@@ -316,7 +319,7 @@ else:
         deferred_scheduler_output = scheduler_output
 ```
 
-这里决定 `future` 是什么：
+**这里碰到结构化输出的边界了**——`pending_structured_output_tokens` 和 `get_grammar_bitmask` 这条支线，是本章与[第 31 章](../../ch31-structured-output/narrative/chapter.md) / [第 32 章](../../ch32-structured-output/narrative/chapter.md)约束解码子系统的唯一接口。这里决定 `future` 是什么：
 
 - 没真调度到 token（`not model_executed`，pooling/embedding 模型的快路也并在这支）：无需采样，`exec_future` 直接当最终 `future`。
 - 调度到了，且**不缺**算掩码所需的 token（`not pending_structured_output_tokens`）：算 `grammar_output`、`sample_tokens(non_block=True)` 立即非阻塞采样，拿到 `future`。这是绝大多数批走的路。

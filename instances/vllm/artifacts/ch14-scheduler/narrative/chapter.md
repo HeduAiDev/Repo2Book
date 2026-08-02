@@ -2,9 +2,11 @@
 
 ## 你在这里
 
-![你在这里：EngineCore 循环里的调度器](../diagrams/roadmap.png)
+![你在这里：全书架构模型已读 7 个组件，本章在 EngineCore 调度器里展开抢占循环与请求生命周期回流——双队列、状态回退、资源释放的完整闭环](../diagrams/arch-model.png)
 
-> *图注：全书地图高亮当前阶段「EngineCore 循环」。[第 13 章](../../ch13-scheduler/narrative/chapter.md) 把 `schedule()` 的主线讲透了——「不分相」的连续批处理、token 预算怎么跨 RUNNING/WAITING 两阶段递减。但那一章在两个地方踩了刹车：RUNNING 阶段 `allocate_slots` 失败时会进一个抢占循环，当时只说「会抢占」没展开；`update_from_output()` 把它当反馈环的另一半，只说「追加 token、判 stop、释放」没钻进去。本章把这两个被刹住的分支补完。下一章 **第 15 章** 接着讲调度器背后的分页 KV 缓存——块池怎么分配、前缀缓存怎么命中。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向；当年 `EngineCore` 框里只画了调度器与分页 KV 缓存，如今已按「调度与显存／执行与并行／模型与算子／解码策略」四组装满一路读过来的组件。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章焦点——就在调度器这个已读的蓝色盒子内部，展开它的抢占与回流机制。*
+> *本章的焦点接在[第 13 章](../../ch13-scheduler/narrative/chapter.md)那个调度器主循环上：上一章讲了 `schedule()` 怎么跨 RUNNING/WAITING 两阶段递减 token 预算、连续批处理不分相，但在两处踩了刹车——RUNNING 阶段 `allocate_slots` 失败进抢占循环时只说「会抢占」没展开，`update_from_output()` 反馈环只说「追加 token、判 stop、释放」没钻进去。本章就是把这两个被刹住的分支补完：抢占循环怎么 LIFO 回收显存、被抢请求怎么回流到等待队列、双队列怎么防队头阻塞、生命周期怎么从运行态迁移到完成态并释放资源。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *下一章 **第 15 章** 接着讲调度器背后的分页 KV 缓存——块池怎么分配、前缀缓存怎么命中。*
 
 [第 13 章](../../ch13-scheduler/narrative/chapter.md) 立下的事是：调度器每一拍干两件事。先扫 `running` 队列，让每个在跑的请求继续往前算几个 token；再扫 `waiting` 队列，把新请求拉进来。两阶段共用一个 `token_budget`，谁先用谁先得。
 
@@ -30,7 +32,7 @@
 
 ## 14.1 要不到块：抢占循环
 
-先把场景摆清楚。RUNNING 阶段，调度器遍历 `self.running`，轮到某个请求 `request`，它这一拍要算 `num_new_tokens` 个 token。算之前得先有地方放这些 token 的 KV——向 `kv_cache_manager` 要块：
+先把场景摆清楚。RUNNING 阶段，调度器遍历 `self.running`，轮到某个请求 `request`，它这一拍要算 `num_new_tokens` 个 token。算之前得先有地方放这些 token 的 KV——现在从调度器主循环走到它依赖的**分页 KV 缓存管理器**（架构模型图里「调度与显存」组的另一块），向 `kv_cache_manager` 要块：
 
 ```python
 # vllm/v1/core/sched/scheduler.py:L422
@@ -111,7 +113,7 @@ if preempted_req == request:
 
 为什么宁可重算也不换出？换出换入要走 PCIe，KV 缓存动辄几 GB，I/O 开销大、还得管理 CPU 侧的缓冲区。而 vLLM 有一张底牌：前缀缓存。被抢请求回 `waiting` 重新调度时，它之前算过的那些 token 的前缀块，只要还没被别的请求挤掉，就能直接命中、跳过重算。
 
-把成本量级写明白：记被抢请求已生成长度为 $`L`$ 、前缀缓存未命中的部分为 $`L_{\mathrm{miss}}`$ 。朴素的「丢弃重算」要重新 prefill 整段，但前缀缓存命中后只需重算没命中的那部分：
+把成本量级写明白：记被抢请求已生成长度为 $`L`$ 、前缀缓存未命中的部分为 $`L_{\mathrm{miss}}`$ 。朴素的「丢弃重算」要重新 prefill 整段，但前缀缓存命中后只需重算没命中的那部分——这里调度器依赖的是架构模型图里「调度与显存」组的另一块：**分页 KV 缓存管理器的前缀匹配能力**：
 
 ```math
 O(L) \;\longrightarrow\; O(L_{\mathrm{miss}})
@@ -340,7 +342,7 @@ assert sched.skipped_waiting.peek_request() is blocked  # 阻塞请求被跳过�
 
 ## 14.5 回流闭环：update_from_output
 
-到这里，`schedule()` 这一侧讲完了。但调度只是「派活」，还没拿到「干活的结果」。模型跑完前向、采样出新 token 之后，结果要喂回调度器，由它来：追加 token、判断该不该停、迁移完成态、释放资源。这是反馈环的另一半——`update_from_output()`。第 13 章把它当黑盒，本章拆开。
+到这里，`schedule()` 这一侧讲完了。但调度只是「派活」，还没拿到「干活的结果」。**现在走到 `EngineCore` 逐拍循环 `schedule → execute_model → update` 的最后一段**：中间那个 `execute_model` 属于架构模型图里「执行与并行」组、要到后面的章节才讲，我们只借用它的产物——模型跑完前向、采样出新 token 之后，结果要喂回调度器，由它来：追加 token、判断该不该停、迁移完成态、释放资源。这是反馈环的另一半——`update_from_output()`。第 13 章把它当黑盒，本章拆开。
 
 先看抢占请求是怎么「回流」复活的，把上半章的环闭上。WAITING 阶段成功调度一个请求时，按它**进来时的状态**分两类落点：
 
@@ -574,7 +576,7 @@ def check_stop(request: Request, max_model_len: int) -> bool:
 - **token 级**，在调度器侧的 `check_stop`：判 EOS、判 `stop_token_ids`（整数 id）、判长度、判重复。它工作在 **token 空间**——只看 token id，不看文本。
 - **字符串级**，在前端 detokenizer 的 `check_stop_strings`：判用户给的 stop **字符串**（比如 `"\n\n"` 或 `"</answer>"`）是不是出现在生成的文本里。它工作在**文本空间**——得先把 token 解码成字符串才能做子串匹配。
 
-为什么分两层？因为一个 stop 字符串可能跨好几个 token，甚至和某个 token 的解码结果只部分重叠——这种子串匹配在 token 空间根本做不了，必须解码到文本再匹配。这套文本空间的 stop string 逻辑，[第 9 章：增量去 token 化与 stop string](../../ch09-detokenization/narrative/chapter.md) 已经讲透了。
+为什么分两层？因为一个 stop 字符串可能跨好几个 token，甚至和某个 token 的解码结果只部分重叠——这种子串匹配在 token 空间根本做不了，必须解码到文本再匹配。注意这已经跨出了 `EngineCore` 大框：字符串级判定发生在 IPC 边界另一侧的输出处理里，也就是架构模型图最下方那块「输出处理」，[第 9 章：增量去 token 化与 stop string](../../ch09-detokenization/narrative/chapter.md) 已经讲透了。
 
 所以：**调度器侧的 `check_stop` 只管 token 级停止，stop string 子串匹配不在这里。** 别把字符串匹配画进调度器——那是 vLLM 没有的逻辑。两层甚至可能给出不同的截断点：token 级在 EOS 处停，字符串级在某个子串处停，谁先触发看具体情况。
 

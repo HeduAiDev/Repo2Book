@@ -2,9 +2,11 @@
 
 ## 你在这里
 
-![本章在全书地图中的位置](../diagrams/roadmap.png)
+![你在这里：全书架构模型已读 1 个组件，本章在「IPC 边界」层带里展开「异步引擎」——右侧 AsyncLLM 容器盒套盒摊开真实组织关系，11 站中 7 站落在橙色部件上](../diagrams/arch-model.png)
 
-> *图注：全书 15 个子系统的路线图。本章点亮 `async-engine`——也就是 `AsyncLLM` 这层异步前端。它的左右两侧（`input-processor` / `engine-core` / `output-processor`）是三段式的三个去处，分别留给后面的章节展开。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
+> *本章新长的这块叫「异步引擎」，在「IPC 边界」这一层带里就地展开——摊开的不是概念图，而是源码里的真实组织关系：右侧 `AsyncLLM` 是容器（盒子里嵌着 `EngineCoreRequest` 等它装的东西），左侧五块是本章要逐一读到的组件。本章走线共 11 站，7 站落在这些橙色部件上（`AsyncLLM` 盒上标着第 1–6 站，内嵌的 `EngineCoreRequest` 等标着第 11 站），另有 4 站落在第 7、8 章才讲的组件上（`OutputProcessor`、`RequestOutputCollector`、`EngineCoreClient`）。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *整幅图里读者已经读过的只有左上角那块蓝色的「配置与装配」——本章的新块就长在它上面：`AsyncLLM` 构造三段时用的 `VllmConfig`，正是[第 3 章](../../ch03-config-and-wiring/narrative/chapter.md)从 `EngineArgs` 拼出来的那份。它躺的位置也把一句话画在了图上：这块新结构嵌在「IPC 边界」这一层带里，因为它自己就是这条边界的前端这一侧——跨过边界去的那一侧（`EngineCoreClient`）要等[第 7 章](../../ch07-engine-core/narrative/chapter.md)才讲。*
 
 前面几章，我们已经有了纵览全局的底子：[vLLM v1 的整体心智模型](../../ch01-config-and-wiring/narrative/chapter.md)、[一个请求端到端的鸟瞰路径](../../ch02-entrypoints/narrative/chapter.md)，以及[从 `EngineArgs` 怎么组装出 `VllmConfig`](../../ch03-config-and-wiring/narrative/chapter.md)——本章构造三段所依赖的那套配置，正是上一章拼出来的。但有个问题一直没回答：**一个请求从 HTTP 进来、到 token 一个一个吐回客户端，中间到底经过几只手？**
 
@@ -329,7 +331,7 @@ data: [DONE]
 
 **同一个请求，同时往两个方向登记**：一路留在本进程等着接收结果（OutputProcessor 那条），一路送出进程去真正干活（EngineCore 那条）。这就是"扇出"。注意这两路是不对称的——本进程那路只是建个映射表项，跨进程那路才是把 tokenize 好的请求真正送进引擎。
 
-`add_request_async` 是 Stage2 的 IPC 接缝：它 encode 后经 ZMQ 把 `EngineCoreRequest` 发到 EngineCore 进程。`AsyncLLM` 只看到这一个 `await`，进程/ZMQ/序列化全在幕后——这些是 [第 7 章：IPC 边界](../../ch07-engine-core/narrative/chapter.md) 的主题。
+`add_request_async` 是 Stage2 的 IPC 接缝：它 encode 后经 ZMQ 把 `EngineCoreRequest` 发到 EngineCore 进程。`AsyncLLM` 只看到这一个 `await`，进程/ZMQ/序列化全在幕后——这些是 [第 7 章：IPC 边界](../../ch07-engine-core/narrative/chapter.md) 的主题。（现在走到架构模型图上的第 10 站：这一句踩进的是 `core_client.py` 里的 `EngineCoreClient`——图上归在第 7 章才讲的虚线组件，正文只站在这扇门的前端这一侧，门后面的进程编排留给那一章。）
 
 ---
 
@@ -438,6 +440,8 @@ data: [DONE]
 ## 4.6 队列的真身：`RequestOutputCollector`
 
 来源：`vllm/v1/engine/output_processor.py:L48-L109`。
+
+（现在走到第 7–9 站：走线从这里跨出 `async_llm.py`、踩进 `output_processor.py`——`OutputProcessor` 与 `RequestOutputCollector` 都是架构模型图上归在第 8 章才讲的虚线组件；本小节只拆队列这一件东西，文件全貌留给 [第 8 章：输出处理](../../ch08-output-processor/narrative/chapter.md)。）
 
 前面反复提到"每请求一个队列"，现在拆开看它到底是什么。它的名字叫 `RequestOutputCollector`，但**它不是 `asyncio.Queue`**——而是一个更轻的东西：**一个单槽 + 一个 `asyncio.Event`**。
 
@@ -668,6 +672,8 @@ T_{\mathrm{dispatch}} \approx T_{\mathrm{put}} + T_{\mathrm{resume}}
 ## 4.8 IPC 上流动的是什么：两种跨进程消息
 
 来源：`vllm/v1/engine/__init__.py:L80-L137`（`EngineCoreRequest`）、`L161-L191`（`EngineCoreOutput`）。
+
+（现在走到第 11 站——本章走线的最后一站：`v1/engine/__init__.py`，架构模型图里嵌在 `AsyncLLM` 容器内的那两块「货」的定义处。前面 4.4 节 `_add_request` 送出去的、4.5 节 `output_handler` 收回来的，都是这两种消息。）
 
 进程边界的机制留 [第 7 章：IPC 边界](../../ch07-engine-core/narrative/chapter.md)，但有一点本章必须交代清楚：**那条虚线上流过去、流回来的，到底是什么对象？** 看清这个，三段式的数据流就闭合了。
 

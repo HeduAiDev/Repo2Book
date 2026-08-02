@@ -2,12 +2,12 @@
 
 ## 你在这里
 
-![你在这里：Part V 执行层开篇](../diagrams/roadmap.png)
+![你在这里：全书架构模型，本章在 EngineCore 的「执行与并行」组里展开新的一块——Worker 与执行器：左侧平铺 Executor/Worker 核心类，右侧盒套盒展示 MultiprocExecutor/WorkerProc/WorkerWrapperBase 的源码嵌套关系](../diagrams/arch-model.png)
 
-> *图注：全书地图从 KV 缓存转入执行层。本章是 Part V 的第一站。*
-> *[第 16 章](../../ch16-kv-cache/narrative/chapter.md) 讲完了 KV 块怎么分配、多注意力怎么协调。*
-> *本章解决「调度器算好的指令，怎么送到真正跑模型的 worker 上去」。*
-> *下一章起进入 worker 内部，看持久 batch 与前向计算本身。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理；当年 `EngineCore` 框里只画了调度器与 KV 缓存，如今已按「调度与显存／执行与并行／模型与算子／解码策略」四组装满一路读过来的组件。蓝框是前面章节已读的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
+> *本章新长的这块——Worker 与执行器——落在「执行与并行」组里，紧挨着已经读过的 `EngineCore` 蓝框（[第 11 章](../../ch11-engine-core/narrative/chapter.md)）。往上，是调度器（[第 13 章](../../ch13-scheduler/narrative/chapter.md)）和 KV 缓存（[第 15 章](../../ch15-kv-cache/narrative/chapter.md)）所在的「调度与显存」组——本章 `execute_model(scheduler_output)` 接的正是它俩拍下来的工单；往下，是留给模型前向与解码策略的虚线区。橙色区内左侧四个核心类平铺展开，右侧三组盒套盒把源码里真实的持有关系直接画了出来（`MultiprocExecutor` ⊃ `FutureWrapper` 等，`WorkerProc` ⊃ 应答队列与就绪/死亡管道，`WorkerWrapperBase` ⊃ `WorkerBase`）。本章共 18 站，17 站标在这些橙色组件上，1 站落在 ch11 组件。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *[第 16 章](../../ch16-kv-cache/narrative/chapter.md) 把 KV 块分配与多注意力协调讲清了——工单 `SchedulerOutput` 已经攥在手里。*
+> *本章解决「这张工单怎么可靠地送达 N 个 worker、结果怎么收回来」；下一章推开 worker 的门，看模型前向的内部——持久 batch 与 `_prepare_inputs`。*
 
 到这里，引擎的「大脑」已经齐活了。调度器（[第 13–14 章](../../ch13-scheduler/narrative/chapter.md)）每一拍决定跑哪些请求、KV 缓存（[第 15–16 章](../../ch15-kv-cache/narrative/chapter.md)）决定它们的显存落在哪。一拍调度的产物是一个 `SchedulerOutput`——一张「这批 token 该怎么算」的工单。
 
@@ -246,6 +246,8 @@ def collective_rpc(
 ---
 
 ## 17.5 MultiprocExecutor：把 N 个 worker 拉起来
+
+UniProcExecutor 是控制平面的退化基线（架构模型图站 5，落在已读的 [EngineCore 组件](../../ch11-engine-core/narrative/chapter.md) 上）。现在走到橙色区右侧的 MultiprocExecutor 盒——站 6（`_init_executor`）到站 9（`start_worker_monitor`），广播队列、子进程拉起、FutureWrapper 配对、sentinel 监控，全在这一块。
 
 `_init_executor` 是整个多进程拓扑的**诞生现场**。它干三件事：建一条广播队列、逐 rank 拉起子进程、等所有 worker 就绪。
 
@@ -541,7 +543,7 @@ def _get_output_rank(self) -> int:
 
 ## 17.7 worker 子进程：出生、服役、死亡
 
-现在钻进子进程内部。一个 worker 的一生，从父进程 `make_worker_process` 起，到自己 `shutdown` 止。先看整条时间线：
+`collective_rpc`（站 7）把指令写进了广播队列。现在跨过执行器与 worker 的边界，往下走进 WorkerProc 盒（站 10-13）：子进程怎么从 `make_worker_process` 出生、怎么接住广播指令服役、怎么报告死活。先看整条时间线：
 
 ![worker 子进程生命周期时序](../diagrams/ch17-worker-lifecycle-timeline.png)
 
@@ -735,6 +737,8 @@ def worker_busy_loop(self):
 ---
 
 ## 17.8 WorkerWrapperBase：延迟出生
+
+WorkerProc（站 10-13）管进程生死。往下走到 Worker 盒的站 14-18：`WorkerWrapperBase` 延迟出生、`WorkerBase` 定义接口、`__getattr__` 透传——这三样让 RPC 能一句 `getattr` 命中任意 worker 方法。
 
 前面反复出现一个 `WorkerWrapperBase`——单卡的 `driver_worker` 是它，mp 子进程里 `self.worker` 也是它。它不是真正的 GPU `Worker`，而是一层**延迟初始化**的包装。为什么要这层包装？
 

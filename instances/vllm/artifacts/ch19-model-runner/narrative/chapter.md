@@ -1,14 +1,18 @@
 # 第19章　前向与采样解耦：execute_model() 两阶段、写回持久批次、CUDA graph 分派
 
-![本章在全书地图中的位置](../diagrams/roadmap.png)
+## 你在这里
 
-> 上一章把一张调度工单翻译成了 GPU 张量，持久批次原地待命。
-> 本章让模型真的跑起来：发起前向、采样、把新 token 写回批次。
-> 下一章起深入 attention 后端，接住这里产出的 `slot_mapping`。
+![你在这里：全书架构模型读到第 19 章——EngineCore「执行与并行」组内展开 ModelRunner 执行：GPUModelRunner 持有 CudagraphDispatcher、ExecuteModelState、InputBatch，InputBatch 内嵌 MultiGroupBlockTable 等](../diagrams/arch-model.png)
+
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。自上而下依次是入口、输入处理、IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理；当年 `EngineCore` 框里只画了调度器与分页 KV 缓存，如今已按「调度与显存／执行与并行／模型与算子／解码策略」四组装满一路读过来的组件。蓝框是前面章节已读的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
+> *本章新长的这块在「执行与并行」组里就地展开，摊开的不是一列类名，而是源码里真实的嵌套组合关系。最外层是 `GPUModelRunner`（橙色主盒，容纳本章 17 站中的 15 站），它持有三个子部件——`CudagraphDispatcher`（橙，站点 16，CUDA graph 分派器）、`ExecuteModelState`（橙，站点 1 与 7，两阶段间的单槽载荷）、以及 `InputBatch`（橙，站点 14–15，持久批次的张量容器）。`InputBatch` 内部再嵌了一个**蓝色**的 `MultiGroupBlockTable 等`（站点 17）——它是[第 18 章](../../ch18-model-runner/narrative/chapter.md)讲过的块表，本章直接复用。站点 2–6 与 8–13 全散在 `GPUModelRunner` 主盒的循环体上，本章会逐段拆开讲。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *这张图最值钱的一条信息是**本章的新结构接在哪里**——认出了它，全局地图就能立住。[第 18 章](../../ch18-model-runner/narrative/chapter.md)首次打开了 `GPUModelRunner` 这个类，讲清了它持有的 `InputBatch`、`MultiGroupBlockTable`、`BlockTable` 等持久结构；本章在这些已有骨架上长出两块新肉——`CudagraphDispatcher`（决定前向走哪条 CUDA graph）和 `ExecuteModelState`（两阶段间的桥），三者拼出了「一拍推理切两半」的全部物理画面。再往外看，`execute_model()` 是由 [第 11 章](../../ch11-engine-core/narrative/chapter.md)的 EngineCore 逐拍循环驱动的，`_prepare_inputs()` 吃的 `SchedulerOutput` 来自 [第 13 章](../../ch13-scheduler/narrative/chapter.md)的调度器——顺着 EngineCore 大框里的箭头就能连上。上一章把调度工单翻译成 GPU 张量、持久批次原地待命；本章让模型跑起来：发起前向、采样、token 写回批次。下一章起深入 attention 后端，接住这里产出的 `slot_mapping`。*
 
 ![本章地图：execute_model()/sample_tokens() 两阶段剖面](../diagrams/chapter-map.png)
 
-只想看 CUDA graph 怎么分级取舍，直接跳 §19.6；只想看新 token 怎么写回、怎么整理返回给上层，跳 §19.5 接 §19.4；想跟着两阶段主线从头走到尾，按顺序往下读就好。
+> 上面的架构模型图回答「本章位于整棵架构的哪里」，这张地图回答「本章内部怎么读」。三条读法：只想看 CUDA graph 怎么分级取舍，直接跳 §19.6；只想看新 token 怎么写回、怎么整理返回给上层，跳 §19.5 接 §19.4；想跟着两阶段主线从头走到尾，按顺序往下读就好。
+
+本章解读 `vllm/v1/worker/gpu_model_runner.py` 里 `execute_model()` 与 `sample_tokens()` 两条主线，外加 `vllm/v1/cudagraph_dispatcher.py` 的 CUDA graph 分派。
 
 ## 19.1 一个反直觉的方法：发起前向，却不等结果
 
@@ -157,7 +161,7 @@ assert runner.execute_model_state is None        # 桥已清空，下一拍可�
             model_output = self.model_executor.sample_tokens(grammar_output)
 ```
 
-`non_block=True` 就是「发起完别等」的明示。注意末尾那个守卫：executor 先 `future.result()` 取回 `execute_model` 的返回，正因为它返回 `None`，EngineCore 才接着调 `sample_tokens()` 收尾——这就是「`return None` 触发采样」这条主线在调用方的配对形态。开启批次队列（batch queue）后，EngineCore 还会把多拍的 `execute_model` future 攒进一个 deque，让「发起第 n+1 拍前向」和「采样第 n 拍」在时间上叠起来跑。下面这张泳道图就是这套重叠在 worker 层的样子：
+`non_block=True` 就是「发起完别等」的明示。注意末尾那个守卫：executor 先 `future.result()` 取回 `execute_model` 的返回，正因为它返回 `None`，EngineCore 才接着调 `sample_tokens()` 收尾——这就是「`return None` 触发采样」这条主线在调用方的配对形态。在架构模型图上，这段调用正是从 EngineCore「引擎核心」蓝框（[第 11 章](../../ch11-engine-core/narrative/chapter.md)已读站点）跨进本章「执行与并行」组 `ModelRunner 执行` 橙框的入口——`execute_model()` 在站点 2，`sample_tokens()` 在站点 8，两站分据一拍推理的首尾。开启批次队列（batch queue）后，EngineCore 还会把多拍的 `execute_model` future 攒进一个 deque，让「发起第 n+1 拍前向」和「采样第 n 拍」在时间上叠起来跑。下面这张泳道图就是这套重叠在 worker 层的样子：
 
 ![两阶段时间线](../diagrams/two-phase-timeline.png)
 
@@ -218,7 +222,7 @@ T_\mathrm{fwd} \approx 8\,\mathrm{ms}, \qquad T_\mathrm{samp} + T_\mathrm{sched}
             )
 ```
 
-第二步，`_prepare_inputs()` 把持久批次里的 token 取出来，拼成本拍的 `input_ids`、`positions`、`slot_mapping`。这一步藏着 f13 闭环的「读回侧」，我们留到 [§19.5](#195-f13-闭环新-token-怎么活到下一拍) 细讲。它返回 `logits_indices`——每个请求最后一个 token 在扁平张量里的下标，用来从一大片 `hidden_states` 里挑出真正要算 logits 的那几行。`hidden_states` 的形状是 `[total_tokens, hidden_dim]`，第一维把本拍所有请求的所有 token 按请求顺序拼扁，`logits_indices` 是一个长度等于批次请求数的一维整数数组，每个元素是对应请求最后一个 token 在这条 `total_tokens` 轴上的行号。
+第二步，`_prepare_inputs()` 把持久批次里的 token 取出来，拼成本拍的 `input_ids`、`positions`、`slot_mapping`。在架构模型图上，这里对应站点 13——`_prepare_inputs` 正从左侧的 `InputBatch` 橙框（站点 14–15）里往外捞 token，而 `InputBatch` 内部那个蓝色的 `MultiGroupBlockTable`（站点 17，[第 18 章](../../ch18-model-runner/narrative/chapter.md)已读）则是 `slot_mapping` 的计算者。这一步藏着 f13 闭环的「读回侧」，我们留到 [§19.5](#195-f13-闭环新-token-怎么活到下一拍) 细讲。它返回 `logits_indices`——每个请求最后一个 token 在扁平张量里的下标，用来从一大片 `hidden_states` 里挑出真正要算 logits 的那几行。`hidden_states` 的形状是 `[total_tokens, hidden_dim]`，第一维把本拍所有请求的所有 token 按请求顺序拼扁，`logits_indices` 是一个长度等于批次请求数的一维整数数组，每个元素是对应请求最后一个 token 在这条 `total_tokens` 轴上的行号。
 
 第三步，决定这一拍走哪条 CUDA graph：
 
@@ -444,6 +448,8 @@ T_\mathrm{fwd} \approx 8\,\mathrm{ms}, \qquad T_\mathrm{samp} + T_\mathrm{sched}
 
 > *图注：第 n 拍写回（红格）把新 token 追加到 slot 行尾、计数右移；`req_output_token_ids[r]` 与 `output_token_ids` 是同一对象，一处 extend 两边同步；下一拍读回（绿）用 `positions + r·max_model_len` 索引到同一格当输入。*
 
+在架构模型图上，这个 f13 闭环是 `GPUModelRunner` 主盒里一对互为镜像的橙色站点——站点 10（`_bookkeeping_sync` 调用点）与站点 11（写回循环体）把新 token 就地推进 `InputBatch` 的持久张量，下一拍站点 13（`_prepare_inputs` 读回）用 `index_select` 把它们原样捞回来。两站隔着 `execute_model` 的主体流程，却靠同一个计数不变式遥遥咬合。
+
 ### 一句话说清这个不变式
 
 写回与读回为什么严丝合缝？因为有一个单调推进的计数撑着它。
@@ -485,7 +491,7 @@ assert runner.input_ids.cpu[0] == Z                       # 上拍写回的 Z，
 
 ## 19.6 CUDA graph 分派：FULL/PIECEWISE/NONE 的分级取舍
 
-回到 [§19.3 阶段一](#193-阶段一全景从工单到一份缓存的-state) 第三步留下的悬念：前向走哪条 CUDA graph，是谁决定的？是 `CudagraphDispatcher.dispatch()`。
+回到 [§19.3 阶段一](#193-阶段一全景从工单到一份缓存的-state) 第三步留下的悬念：前向走哪条 CUDA graph，是谁决定的？是 `CudagraphDispatcher.dispatch()`。在架构模型图上，它就是 `GPUModelRunner` 主盒最顶上那个独立橙框——站点 16；而它的调用点藏在 `execute_model()` 的第三步（站点 4），在 `GPUModelRunner` 主盒的更深处。
 
 先说清楚三态各自是什么、贵在哪：
 

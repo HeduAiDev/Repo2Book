@@ -2,9 +2,11 @@
 
 ## 你在这里
 
-![你在这里：Stage 3 输出处理](../diagrams/roadmap.png)
+![你在这里：全书架构模型已读 4 个组件，本章在 IPC 边界下游展开「Stage 3 输出处理」——左侧单槽邮箱 RequestOutputCollector 与 add_request 入口，右侧 OutputProcessor 大框嵌着 OutputProcessorOutput 与 RequestState](../diagrams/arch-model.png)
 
-> *图注：全书地图高亮当前位置。前面 [第 4 章](../../ch04-async-llm/narrative/chapter.md) 把引擎拆成三段、在两个进程里重叠跑，并在图里反复标出三块骨架；[第 7 章](../../ch07-engine-core/narrative/chapter.md) 钻进那条进程虚线，把 IPC 协议逐帧拆开。本章是请求生命周期的最后一棒——结果从 EngineCore 回到前端之后，怎么被去 token、检测停止串、攒成 `RequestOutput`，再分发回 N 个客户端流。再往后就是流式返回给调用者，那已经是 `generate()` 吐出去的事。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向；当年 `EngineCore` 框里只有调度器与分页 KV 缓存两块，如今已按「循环本体／调度与显存／执行与并行／模型与算子／解码策略」五组装满。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
+> *本章新长的这块不在 EngineCore 里，而是长在它下游、正接在两块已读结构上：上游隔着 `EngineCore` 大框，是[第 7 章](../../ch07-engine-core/narrative/chapter.md)拆开的那条 IPC 边界——本章开场的 `EngineCoreOutput` 整批就是从那条进程虚线上流回来的；而承载它的整个前端，是[第 4 章](../../ch04-async-llm/narrative/chapter.md)的异步引擎——`output_handler` 生产者循环与 `generate()` 消费者循环，本来就是那个蓝框自己的循环。橙框摊开的是源码里真实的组织关系：左侧是单槽邮箱 `RequestOutputCollector` 与 `add_request` 入口，右侧 `OutputProcessor` 大框里嵌着 `OutputProcessorOutput` 与 `RequestState` 两份贯穿全章的结构。本章走线共 14 站，9 站落在这些橙色部件上，另有 3 站落在第 4、5 章已讲的组件上、2 站落在本子系统内未展开成组件的文件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *本章就是第 4 章那两笔欠账（后台生产者-消费者、每请求一条队列）的结清处，也是请求生命周期的最后一棒：整批结果回到前端后，怎么被去 token、检测停止串、攒成 `RequestOutput`，再分发回 N 个客户端流。*
 
 [第 4 章](../../ch04-async-llm/narrative/chapter.md) 拆三段式时，在那张泳道图里圈了三块骨架，并对其中两块打了欠条：
 
@@ -108,7 +110,7 @@ async def output_handler():
 
 ## 8.3 主轴：`process_outputs()` 的单循环
 
-现在进主轴。这是全书你会反复回来看的一个函数。先看它的源码（`vllm/v1/engine/output_processor.py`），它的 docstring 把自己的定位写得毫不含糊：
+现在走到第 2 站——第 1 站 `output_handler` 还在异步引擎那个蓝框（第 4 章）里，从第 2 站起才真正进入本章橙块。这是全书你会反复回来看的一个函数。先看它的源码（`vllm/v1/engine/output_processor.py`），它的 docstring 把自己的定位写得毫不含糊：
 
 ```python
 # vllm/v1/engine/output_processor.py:L597
@@ -227,7 +229,7 @@ else:
 
 ## 8.4 第一个子系统：增量去 token 与停止串
 
-单循环第 ③ 步只有一行 `detokenizer.update(...)`，但这一行背后是 V1 去 token 的全部精华。先讲清"为什么不能简单地一个 token 一个 token 各自解码再拼起来"。
+现在走到第 5 站：离开主轴单循环，钻进本章第一个独立子系统——detokenizer.py 在架构图上没有展开成组件，正文这一节把它讲全。单循环第 ③ 步只有一行 `detokenizer.update(...)`，但这一行背后是 V1 去 token 的全部精华。先讲清"为什么不能简单地一个 token 一个 token 各自解码再拼起来"。
 
 **为什么去 token 必须增量。** BPE/byte-fallback 分词下，相邻 token 的文本边界是**相互依赖**的：一个多字节 UTF-8 字符（比如一个中文字、一个 emoji）可能被切成两个 token，单独解码任何一个都得不到完整字符。所以不能 `decode(单 token)` 再拼接——必须维护跨 token 的解码状态。真实 vLLM 为此有两套 `decode_next` 实现：Fast 走 `tokenizers` 库的 `DecodeStream`（库内部维护状态），Slow 走 Python 的 `detokenize_incrementally`（用 `prefix_offset`/`read_offset` 滑窗）。这两套都属 tokenizer 库内部，本章把它抽象成"给一个 token、吐出它新增的那段文字"这个接口，不展开 byte-fallback 细节。
 
@@ -362,7 +364,7 @@ sample logprobs 这边每步把采样 token 的 logprob 累加进 `cumulative_lo
 
 ## 8.5 三道闸门：`make_request_output` 与 DELTA 归并
 
-单循环第 ⑤ 步那个 `make_request_output(...)`，是"本步增量到底发不发、发多少"的总闸门。看真实源码（`vllm/v1/engine/output_processor.py`）：
+现在走到第 7 站，回到橙块中央的 `RequestState`——`make_request_output(...)` 是它身上"本步增量到底发不发、发多少"的总闸门。看真实源码（`vllm/v1/engine/output_processor.py`）：
 
 ```python
 # vllm/v1/engine/output_processor.py:L272
@@ -626,7 +628,7 @@ def get_outputs(
 
 ### 完成清理：`_finish_request` 注销三张表
 
-请求收尾时，单循环调 `_finish_request` 把它从 `OutputProcessor` 的账本里彻底抹掉：
+请求收尾时，单循环调 `_finish_request` 把它从 `OutputProcessor` 的账本里彻底抹掉——收尾两站（13–14）正标在橙块里的 `OutputProcessorOutput` 上：
 
 ```python
 # vllm/v1/engine/output_processor.py:L714
@@ -655,7 +657,7 @@ def _finish_request(self, req_state: RequestState) -> None:
 
 ### 消费者：`generate()` 围着邮箱转
 
-最后补上第 4 章那笔关于生产者-消费者的欠账的消费者侧。`generate()` 的拉取循环（`vllm/v1/engine/async_llm.py`）：
+第 12 站折回第 4 章那个蓝框——`generate()` 消费循环就住在异步引擎自己的文件里。最后补上第 4 章那笔关于生产者-消费者的欠账的消费者侧。`generate()` 的拉取循环（`vllm/v1/engine/async_llm.py`）：
 
 ```python
 # vllm/v1/engine/async_llm.py:L576

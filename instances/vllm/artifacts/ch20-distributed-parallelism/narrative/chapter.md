@@ -2,12 +2,12 @@
 
 ## 你在这里
 
-![你在这里：Part V 执行层并行收官](../diagrams/roadmap.png)
+![你在这里：全书架构模型读到第 20 章——10 个组件已读，本章在 EngineCore「执行与并行」组展开分布式并行：16 站源码走线，11 站落在 GroupCoordinator / DeviceCommunicatorBase / CudaCommunicator 新组件上，4 站落在第 17 章已讲的 executor 蓝框上](../diagrams/arch-model.png)
 
-> *图注：全书地图走到执行层的并行收官。*
-> *[上一章](../../ch19-model-runner/narrative/chapter.md)把一拍前向切成「发起」与「采样」两半，前向里那一行 `all_reduce` 当时一笔带过。*
-> *本章解决「多张卡之间到底怎么通信」——把 TP/PP/DP/EP 各并行维度统一成一个抽象，讲透三大集合原语、双群组分工、和让通信能进 `torch.compile` 图的 custom-op。*
-> *[下一章](../../ch21-async-engine/narrative/chapter.md)接着讲异步通信与数据并行，把这套群组用到 DP 调度上。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线自上而下：入口→输入处理→IPC 边界→EngineCore 大框→输出处理，行间箭头还是请求的流向；EngineCore 框里按「调度与显存／执行与并行／模型与算子／解码策略」四组装满一路读过来的组件。蓝框是前面章节已读的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
+> *本章新长的这块在「执行与并行」组里就地展开：`GroupCoordinator` 占第 1–9 站，组合持有 `DeviceCommunicatorBase`（第 10 站），平铺 `CudaCommunicator`（第 11 站）；另有 4 站（第 13–16 站）落在[第 17 章](../../ch17-worker-and-executor/narrative/chapter.md)已讲的 worker executor 蓝框上，1 站（第 12 站）落在一个薄封装文件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *这组新结构往上接[第 17 章](../../ch17-worker-and-executor/narrative/chapter.md)的 executor 控制面（§20.7 `MultiprocExecutor` 用共享内存队列把 RPC 广播到每个 worker，群组在每个 worker 进程里真正拉起来），往下接[第 19 章](../../ch19-model-runner/narrative/chapter.md)的 `ModelRunner`（前向里 `all_reduce` / `all_gather` 调的就是本章这群组）。*
+> *[上一章](../../ch19-model-runner/narrative/chapter.md)讲到 `ModelRunner` 前向时，那行 `all_reduce` 一笔带过——本章把它拆开。[下一章](../../ch21-async-engine/narrative/chapter.md)接着把这群组用到 DP 的异步调度上。*
 
 前面十几章，我们一直默认模型跑在「一张卡」上。可真实的 vLLM 部署，动辄 8 卡张量并行、再叠几段流水线。[第 17 章](../../ch17-worker-and-executor/narrative/chapter.md)讲过：一张卡一个 worker，八卡就是八个 worker 同时收到同一张工单、各算各的分片。
 
@@ -320,6 +320,8 @@ CUDA 平台上，`CudaCommunicator` 会覆写这几个方法，语义一致，�
 
 对本章读者，结论很干脆：`GroupCoordinator` 之下，`device_communicator` 才是真正挑选具体内核的地方。这个分层的好处是——新平台只要提供一个自己的 `DeviceCommunicatorBase` 子类，`GroupCoordinator` 和模型代码**零改动**。
 
+架构模型图里，`DeviceCommunicatorBase`（第 10 站）被 `GroupCoordinator` 组合持有，`CudaCommunicator`（第 11 站）平铺在旁——它们和 `GroupCoordinator`（第 1–9 站）合起来，就是本章在「执行与并行」组下新展开的这块橙色区域。
+
 ---
 
 ## 20.3 让集合通信进 torch.compile 图：custom-op
@@ -591,6 +593,8 @@ direct_register_custom_op(
 
 前面所有 `GroupCoordinator` 实例，都是从一份 `group_ranks` 建起来的。可这份「谁和谁一组」的列表，是怎么从 N 个 rank 算出来的？
 
+架构模型图上没有给这个切分逻辑单独立站——它是 `GroupCoordinator`（第 1–9 站）构造前的前置步骤，也是 §20.7 `MultiprocExecutor` 拉群组的依据。
+
 这是本章最巧的一段代码。先看入口的分工：
 
 ```python
@@ -735,6 +739,8 @@ def tensor_model_parallel_reduce_scatter(
 ## 20.7 谁把群组拉起来：MultiprocExecutor
 
 前面讲的群组，得在**每个 worker 进程里**真正建起来。这是 `MultiprocExecutor` 的活——[第 17 章](../../ch17-worker-and-executor/narrative/chapter.md)讲过它是引擎大脑和 GPU 之间的控制平面，这里补上它和分布式群组的接口。
+
+架构模型图上，第 13–16 站落在第 17 章已讲的 worker executor 蓝框上——现在要看的，就是 `MultiprocExecutor` 怎么用共享内存队列把本章前半的群组接到那些已读组件上。
 
 启动期的编排骨架：
 

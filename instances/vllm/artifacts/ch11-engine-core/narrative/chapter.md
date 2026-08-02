@@ -2,9 +2,11 @@
 
 ## 你在这里
 
-![你在这里：EngineCore 循环](../diagrams/roadmap.png)
+![你在这里：全书架构模型已读 5 个组件，本章在 EngineCore 大框里展开「引擎核心」组——EngineCore（内循环）与 EngineCoreProc（子进程外壳）的源码组织关系](../diagrams/arch-model.png)
 
-> *图注：全书地图高亮当前阶段。[第 7 章](../../ch07-engine-core/narrative/chapter.md) 把前端与 EngineCore 之间那条虚线拆成了一套 ZMQ 协议，但它在结尾留了一笔账：「边界那一头——EngineCore 进程内的调度、执行、采样循环——细节是后续章节的主场。」本章就是那一头。我们钻进 EngineCore 进程，看清 `run_busy_loop` 如何一圈圈转、`step()` 一次迭代到底干了什么；再往后 [第 12 章](../../ch12-engine-core/narrative/chapter.md) 会把本章点到的 batch queue 展开成完整的流水线并行机制。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。蓝框是前面章节已读的（框里带章号），虚线框留给后续章节，橙色是本章新长出来的一块。*
+> *本章这块新结构接在哪？读到这里，[第 7 章](../../ch07-engine-core/narrative/chapter.md)的 IPC 边界是蓝框——请求穿过 `input_queue` 走 ZMQ 协议进入 EngineCore 进程，这一头已经亮了。[第 8 章](../../ch08-output-processor/narrative/chapter.md)的输出处理也是蓝框——`output_queue` 那一头同样是亮的。**中间那个 EngineCore 大框，正是本章要亮的**：框内「引擎核心」组（橙色展开）是全书第一次把 EngineCore 内部的源码组织关系摊开——`EngineCore`（内循环，持有 `step()` 的编排逻辑，站 1–8）与 `EngineCoreProc`（外壳，包含 `run_busy_loop` 忙循环、关停状态机、生命周期管理，站 9–15）是内外嵌套关系；它们往下接着调度与显存、执行与并行、模型与算子、解码策略四组（均为虚线，第 13 章起逐一展开），本章只讲内循环怎么把四组串成一拍、外壳怎么把循环装进独立进程。*
+> *站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读。跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。本章点亮的这块结构是全书 EngineCore 之旅的起点——后面每一章往框里添一块、虚线变蓝框时，都回到这张图来认路。*
 
 [第 4 章](../../ch04-async-llm/narrative/chapter.md) 把引擎拆成三段，反复强调中间那段 `EngineCore` 在另一个进程里独立转动。它对外只暴露三个方法——`add_request_async` / `get_output_async` / `abort_requests_async`——然后说：这台引擎自己怎么一步步推理，留到后面。
 
@@ -228,7 +230,7 @@ def test_aborts_queue_batched_into_single_finish():
     assert sorted(finish_calls[0][1]) == ["a", "b", "c"]
 ```
 
-到这里 `step()` 这一拍就讲完了。下面把镜头拉远，看是谁在一拍接一拍地敲这个节拍器。
+到这里 `step()` 这一拍就讲完了——架构模型图上，我们刚走完 `EngineCore` 内循环（橙色展开组，站 1–8）。下面把镜头拉远到 `EngineCoreProc` 外壳（站 9–15），看是谁在一拍接一拍地敲这个节拍器。
 
 ![EngineCore.step() 一次迭代的纵向时序：CPU 算掩码与 GPU 跑前向重叠](../diagrams/ch11-step-orchestration.png)
 
@@ -750,7 +752,7 @@ def test_wake_up_scheduling_tag_skips_executor():
 
 ## 11.7 两条尾线：batch queue 接入点与进程内对照
 
-最后收两条线：§11.4 提过的 `step_fn` 那个开关，以及「没有忙循环时 `step()` 怎么被驱动」。
+最后收两条线：§11.4 提过的 `step_fn` 那个开关，以及「没有忙循环时 `step()` 怎么被驱动」——架构模型图上，这两条支线落在 `EngineCore` 橙色框的 `step_with_batch_queue` / `batch_queue` 属性，以及 `EngineCoreProc` 橙色框的 `DPEngineCoreProc` 子类上。
 
 ### batch queue：step_fn 的另一种绑定
 

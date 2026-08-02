@@ -2,9 +2,11 @@
 
 ## 你在这里
 
-![你在这里：Stage 3 输出处理里的 logprobs 装配](../diagrams/roadmap.png)
+![你在这里：Stage 3 输出处理里的 logprobs 装配——本章把「输出处理」就地展开成源码真实组织：左列 RequestOutputCollector、RequestState、LogprobsProcessor 三类，右列 FlatLogprobs 与 LogprobsTensors 两容器，13 个走线站全落在这块](../diagrams/arch-model.png)
 
-> *图注：全书地图高亮当前位置。[第 8 章](../../ch08-output-processor/narrative/chapter.md) 拆开了 Stage 3 那条单循环 `process_outputs()`——一整批混着 N 个请求的输出，怎么被解多路复用、扇出回 N 个客户端流。[第 9 章](../../ch09-detokenization/narrative/chapter.md) 钻进那循环里的 `detokenizer.update()`，讲了把 token id 增量解成会停的文字流。本章接着讲同一循环里被一笔带过的另一笔账：`logprobs_processor.update_from_output()`——把 EngineCore 吐回来的一堆 logprobs 张量，装配成 OpenAI 兼容的 sample / prompt logprobs 容器。再往后，这些容器随 `RequestOutput` 一起返回给调用者，请求生命周期就走完了。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
+> *本章新长的这块就在 Stage 3「输出处理」——把这个在前面章节里还只是一条线的部分就地展开成源码里的真实组织：左列三个类，`RequestOutputCollector`（第 1 站）与 `RequestState`（第 12–13 站）是第 8 章已读的旧类（蓝框），`RequestState` 持有的 `LogprobsProcessor`（第 2–3、5–9、11 站）才是本章新增的主轴（橙框）；后者按形态分派到两种容器——扁平存储 `FlatLogprobs`（`vllm/logprobs.py`，第 4、10 站）与张量版 `LogprobsTensors`（容器本身无独立站，不被走线访问，只是被 `LogprobsProcessor` 分派使用），其中 `FlatLogprobs` 由一个个 `Logprob` 组成、`LogprobsTensors` 内嵌 `LogprobsLists`，两类容器彼此独立。本章 13 个走线站全落在这块就地展开的组件上，其中 3 站（第 1、12–13 站）踩在蓝框旧类上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *这块新展开的结构接在[第 8 章](../../ch08-output-processor/narrative/chapter.md)那条 `process_outputs` 单循环上——那一章拆开了 Stage 3 的多路复用与扇出，本章钻进循环里被一笔带过的另一笔账：从 EngineCore 吐回的张量装配成 OpenAI 兼容容器。到本章为止已读过 5 个组件（第 3、4、5、7、8 章），本章是 Stage 3 的第二次深入。*
 
 第 8 章那条单循环里，每个请求都会走到这么一行（`vllm/v1/engine/output_processor.py:L664-L666`）：
 
@@ -111,7 +113,7 @@ class LogprobsProcessor:
 - `num_prompt_logprobs is None` ⇒ 用户没要 prompt logprobs，`prompt_logprobs` 容器是 `None`。
 - 要的话，就调 `create_sample_logprobs` / `create_prompt_logprobs` 造容器；`cumulative_logprob` 初值给 `0.0`（准备往上累加）。
 
-容器长什么样，取决于 `flat_logprobs` 这个布尔开关，这正是 §10.6 要讲的 flat vs nested。先看构造函数本身（`vllm/logprobs.py:L162-L172`）：
+容器长什么样，取决于 `flat_logprobs` 这个布尔开关，这正是 §10.6 要讲的 flat vs nested。先看构造函数本身——这里第一次跨出装配器、走进底层容器文件（架构模型上的第 4 站落在这块）（`vllm/logprobs.py:L162-L172`）：
 
 ```python
 # vllm/logprobs.py:L162
@@ -608,7 +610,7 @@ assert p.logprobs[2][ad].decoded_token == "中"  # 第3字节：收尾，补出�
 
 ## 10.6 两种存储格式：FlatLogprobs 怎么降 GC
 
-现在回头补上那个一直悬着的开关：`flat_logprobs`。同样一份 logprobs，朴素存法是 `list[dict[int, Logprob]]`——每个位置一个 dict，dict 里每个候选一个 `Logprob` 对象。长序列配大 `top_logprobs` 时，对象数量会爆炸。
+现在回头补上那个一直悬着的开关：`flat_logprobs`。这里走到架构模型图右侧那个扁平存储容器（第 4、10 站）——同样一份 logprobs，朴素存法是 `list[dict[int, Logprob]]`，每个位置一个 dict、dict 里每个候选一个 `Logprob` 对象。长序列配大 `top_logprobs` 时，对象数量会爆炸。
 
 `Logprob` 就是那个叶子（`vllm/logprobs.py:L12-L24`）：
 
@@ -771,7 +773,7 @@ assert flat.token_ids[flat.start_indices[0]] == 1065
 
 ## 10.8 下游取用：DELTA 切尾、prompt 一次性发完
 
-装配完的容器，怎么被 Stage 3 取走？回到 `output_processor.py`。先看 sample 路进 `CompletionOutput`（`vllm/v1/engine/output_processor.py:L401-L432`）：
+两条泳道装配完的容器，最后怎么被下游拿走？现在回到 `RequestState`（架构模型左下，第 12–13 站）——`OutputProcessor._new_completion_output` 在构造 `CompletionOutput` 时按 DELTA / FINAL 模式决定给多少（`vllm/v1/engine/output_processor.py:L401-L432`）：
 
 ```python
 # vllm/v1/engine/output_processor.py:L401

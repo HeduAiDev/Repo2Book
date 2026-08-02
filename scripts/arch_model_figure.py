@@ -461,7 +461,9 @@ def build(model, cid):
         box(L, px, py, pw, ph, '#fff7ed', C_CUR_S, r=7, sw=2.0)
         boxpos[cur_sub] = (px, py, pw, ph)
         flat = not pan['contracts'] and not pan['roots']
-        tag = '（这几块彼此独立，按功能并列）' if flat else ''
+        # 平铺标语的复数指代要有实指:仅 1 块时(24994acb 类归属修复后 ch06 只剩
+        # ParentRequest)写「这几块彼此独立」没有指代对象,去掉标语
+        tag = '（这几块彼此独立，按功能并列）' if flat and len(pan['left']) > 1 else ''
         text(L, px + 12, py + 18, f"{subs[cur_sub]['name_cn']}　← 本章展开{tag}", 11.5, C_CUR_S,
              anchor='start', bold=True)
         text(L, px + pw - 12, py + 18,
@@ -532,7 +534,9 @@ def build(model, cid):
                 gh.append((g, ms, h, exp_here, cols, grid))
             rh = 30 + sum(h for _, _, h, _, _, _ in gh) + 8 * len(gh) + 4
         elif any(s == cur_sub for s in members):
-            rh = CH_ + 22 + panel_h(W - 2 * M - 28) + 8
+            # 面板(展开组件)从 y+26+CH_+8 画起:带高度须 ≥ 26+CH_+8+panel_h+8,
+            # 否则面板底边戳出带边界(ch03/ch04/ch05 均实测溢出 4px,exp-2026-08-01)。
+            rh = 26 + CH_ + 8 + panel_h(W - 2 * M - 28) + 8
 
         box(L, M, y, W - 2 * M, rh, '#f8fafc' if not is_core else '#fffdf7',
             '#e2e8f0' if not is_core else '#f5c98a', r=8, sw=1.0 if not is_core else 1.8)
@@ -579,8 +583,51 @@ def build(model, cid):
         text(L, lx + 22, ly, lab, 10.2, C_MUTE, anchor='start')
         lx += 28 + tw(lab, 10.2)
     if cur_sub and len(covered) < len(spine):
-        text(L, W - M, ly, f'（另有 {len(spine) - len(covered)} 站落在其他章已讲的组件上）',
-             9.5, C_MUTE, anchor='end')
+        # 未覆盖的站：逐站看它所在文件归属的子系统——是别的子系统（其他章的
+        # 组件），还是本子系统内没有提取出类的文件（辅助函数，未展开成组件）。
+        # 时间措辞按 exp-2026-07-18-04（目标章号>本章用「才讲」预告、<本章用
+        # 「已讲」回指）：旧文案一律写「其他章已讲」，ch04 的 4 站落在 ch07(ipc)/
+        # ch08(output-processor) 才讲的组件上，「已讲」与图上「第 08 章才讲」
+        # 自相矛盾（ch04 自查抓，exp-2026-08-01；ch09 站7「本子系统无类文件」
+        # 的失实此前已修，同一函数）。
+        def _rest_bucket(i):
+            u = ch['spine'][i - 1]
+            subs_here = {c['subsystem'] for c in model['classes'] if c['file'] == u['path']}
+            others = {s for s in subs_here if s != cur_sub}
+            if others:
+                chs = sorted({subs[s]['opened_in'] for s in others},
+                             key=lambda c: int(c[2:]))
+                op = _chapter_index(chs[0])
+                return ('past' if op < idx else 'future'), chs
+            if subs_here:
+                return 'own', []
+            fo = model['file_owner'].get(u['path'])
+            if fo:
+                if fo['subsystem'] == cur_sub:
+                    return 'own', []
+                op = _chapter_index(subs[fo['subsystem']]['opened_in'])
+                return (('past' if op < idx else 'future'),
+                        [subs[fo['subsystem']]['opened_in']])
+            return 'future', []
+        rest = [i for i in range(1, len(ch['spine']) + 1) if i not in covered]
+        buckets = [_rest_bucket(i) for i in rest]
+        n_own = sum(1 for b, _ in buckets if b == 'own')
+        past_n = sum(1 for b, _ in buckets if b == 'past')
+        fut_n = sum(1 for b, _ in buckets if b == 'future')
+        past_chs = sorted({c for b, cs in buckets if b == 'past' for c in cs},
+                          key=lambda c: int(c[2:]))
+        fut_chs = sorted({c for b, cs in buckets if b == 'future' for c in cs},
+                         key=lambda c: int(c[2:]))
+        parts = []
+        if past_n:
+            parts.append(f'{past_n} 站落在第 {"、".join(c[2:] for c in past_chs)} 章已讲的组件上')
+        if fut_n:
+            parts.append(f'{fut_n} 站落在第 {"、".join(c[2:] for c in fut_chs)} 章才讲的组件上')
+        if n_own:
+            parts.append(f'{n_own} 站落在本子系统内、未展开成组件的文件上')
+        if parts:
+            msg = '（另有 ' + '、'.join(parts) + '）'
+            text(L, W - M, ly, msg, 9.5, C_MUTE, anchor='end')
 
     n_built = len([s for s in model['levels']['L2_subsystems']
                    if _chapter_index(s['opened_in']) < idx])

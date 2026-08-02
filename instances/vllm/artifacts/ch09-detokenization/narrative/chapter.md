@@ -2,9 +2,11 @@
 
 ## 你在这里
 
-![你在这里：Stage 3 输出处理里的去 token 化](../diagrams/roadmap.png)
+![你在这里：全书架构模型已读 5 个组件，本章在 Stage 3 输出处理上展开去 token 化子系统——左列工厂与请求状态并列，右列契约容器嵌两个后端实现](../diagrams/arch-model.png)
 
-> *图注：全书地图高亮当前位置。[第 8 章](../../ch08-output-processor/narrative/chapter.md) 拆开了 Stage 3 的那条单循环 `process_outputs()`——一整批混着 N 个请求的 token，怎么被解多路复用、扇出回 N 个客户端流。本章钻进那条单循环里被一笔带过的一个调用：`detokenizer.update()`。它负责把 token id 增量地变成文字、检测 stop string、按 `min_tokens` 守住下限，还要在 UTF-8 多字节字符被拆到多个 token 上时不吐半个乱码。再往后，[第 10 章](../../ch10-logprobs/narrative/chapter.md) 接着讲同一循环里的另一笔账——logprobs 的组装。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理（Stage 1）、跨进程的 IPC 边界、装着逐拍循环的 EngineCore 大框、输出处理（Stage 3），行间箭头还是请求的流向；蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
+> *本章新长的这块在 Stage 3 输出处理组件上就地展开——接在[第 8 章](../../ch08-output-processor/narrative/chapter.md)那个 `OutputProcessor` 与 `RequestState` 蓝框上，摊开的是去 token 化子系统的真实组织关系：左列 `IncrementalDetokenizer` 工厂（第 2、8 站）与 `RequestState`（第 1 站）并列，右列是契约容器 `BaseIncrementalDetokenizer`（第 3-4、9 站）嵌着快慢两个后端实现——`FastIncrementalDetokenizer`（第 5 站）与 `SlowIncrementalDetokenizer`（第 6 站）。本章走线共 9 站，8 站落在这些橙色组件上，另有 1 站落在本子系统内、未展开成组件的文件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *[第 8 章](../../ch08-output-processor/narrative/chapter.md)把 `process_outputs` 单循环里那个 `detokenizer.update()` 一笔带过，本章就是这一行的全部内幕——把 token id 增量地变成文字、检测 stop string、按 `min_tokens` 守住下限，还要在 UTF-8 多字节字符被拆到多个 token 上时不吐半个乱码。[第 10 章](../../ch10-logprobs/narrative/chapter.md) 接着讲同一循环里的另一笔账——logprobs 的组装。*
 
 第 8 章那条单循环里有一行，当时我们故意没展开：
 
@@ -102,7 +104,9 @@ INVALID_PREFIX_ERR_MSG = "Invalid prefix encountered"
 
 ## 9.2 主流程：update 一次做完解码、min_tokens、查 stop
 
-`BaseIncrementalDetokenizer.update` 是本章的心脏。它在第 8 章那条单循环里每步被调一次，吃进"这步新生成的 token id"，吐出"是否命中 stop string"。整个函数（`vllm/v1/engine/detokenizer.py`）：
+上一节都在工厂里挑路，现在跨过一道接缝：从开篇那张架构模型图的左列工厂，走到右列那个契约容器 `BaseIncrementalDetokenizer`（第 3-4、9 站）——接下来三节讲的公共逻辑，全写在这一个类里。
+
+`BaseIncrementalDetokenizer.update` 是本章的心脏。它在[第 8 章](../../ch08-output-processor/narrative/chapter.md)那条单循环 `process_outputs` 里每步被调一次，吃进"这步新生成的 token id"，吐出"是否命中 stop string"。整个函数（`vllm/v1/engine/detokenizer.py`）：
 
 ```python
 # vllm/v1/engine/detokenizer.py:L95
@@ -342,7 +346,7 @@ O(\mathrm{new\_char\_count} + L)
 
 ## 9.5 慢路径：双 offset 窗口怎么对抗空格清理
 
-现在轮到 `decode_next` 的两种后端。先看慢路径——它把"逐 token 解码为什么难"讲得最透。
+公共逻辑讲完，现在从契约容器 `BaseIncrementalDetokenizer` 分叉到两个后端实现——先看慢路径 `SlowIncrementalDetokenizer`（第 6 站）怎么实现那个 `decode_next`。它把"逐 token 解码为什么难"讲得最透。
 
 难点在开篇提过的坑 1：**tokenizer 的 `convert_tokens_to_string` 会按相邻 token 决定加不加空格**（这叫 cleanup 算法——HuggingFace tokenizer 在把 token 列表转为字符串时，用前后邻居判断要不要在 `"▁world"` 这类以下划线/空格标记开头的 token 前补一个空格）。你要是只把单个新 token 拿去解码，就丢了它和左邻右舍的关系，空格全错。
 
@@ -531,7 +535,7 @@ byte-fallback 编成    <0xE4> <0xBD> <0xA0> 三个 token
 
 ## 9.6 快路径：DecodeStream 与 UTF-8 错误恢复
 
-快路径不用纯 Python 算双窗口——它把这套苦活交给 `tokenizers` 库的 Rust 实现 `DecodeStream`。`DecodeStream` 内部自己维护增量状态，逐 token `step` 就行。
+另一条路径：快路径子类 `FastIncrementalDetokenizer`（第 5 站）不用纯 Python 算双窗口——它把这套苦活交给 `tokenizers` 库的 Rust 实现 `DecodeStream`。`DecodeStream` 内部自己维护增量状态，逐 token `step` 就行。
 
 构造期就和慢路径分道扬镳——它用 `DecodeStream` 的 `ids` 参数做 **native prefill**（`vllm/v1/engine/detokenizer.py`）：
 
@@ -609,7 +613,7 @@ def _protected_step(self, next_token_id: int) -> str | None:
 
 ## 9.7 闭环：stop_string 怎么反向通知 EngineCore
 
-最后回到起点。`update` 吐出 stop_string 之后，第 8 章那条单循环怎么处置它？看那一小段（`vllm/v1/engine/output_processor.py`）：
+去 token 化子系统内部走完，最后一道接缝跨回[第 8 章](../../ch08-output-processor/narrative/chapter.md)读过的 `RequestState`（架构模型图里那个蓝框，第 1 站）——`update` 吐出 stop_string 之后，那条单循环 `process_outputs` 怎么处置它？看那一小段（`vllm/v1/engine/output_processor.py`）：
 
 ```python
 # vllm/v1/engine/output_processor.py:L653

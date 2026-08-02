@@ -2,13 +2,16 @@
 
 ## 你在这里
 
-![你在这里：model-runner](../diagrams/roadmap.png)
+![你在这里：全书架构模型已读 9 个组件，本章在 EngineCore 的「执行与并行」组里展开新的一块——ModelRunner 执行：InputBatch 与 slot 映射的内部结构就地展开](../diagrams/arch-model.png)
 
-> 上一章把「指令送达 worker」讲透了。
-> 本章推开 worker 的门：一张 `SchedulerOutput` 怎样变成喂给模型的 `input_ids`、`positions`、`slot_mapping`。
-> 下一章接着讲前向之后——采样、把新 token 写回、跨拍续跑。
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理；行间箭头还是请求的流向。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
+> *本章新长的这块直接在 EngineCore 的「执行与并行」组里就地展开——它紧挨着[第 17 章](../../ch17-worker-and-executor/narrative/chapter.md)刚读过的 Worker 与执行器，`execute_model` 就是进这块的门。往上接[第 13 章](../../ch13-scheduler/narrative/chapter.md)调度器吐出的 `SchedulerOutput`、往下借[第 15 章](../../ch15-kv-cache/narrative/chapter.md)分页 KV 缓存吐出的 `block_table` 做 slot 映射；右边虚线标注的分布式并行是[第 20 章](../../ch20-distributed-parallelism/narrative/chapter.md)的事。摊开的是源码里真实的组织关系：外框是 `GPUModelRunner` 每拍的 `_update_states` + `_prepare_inputs` 两段式，里面展开 `InputBatch`（持久批次的容器）、`CachedRequestState`（每请求快照）、`BlockTable`（双镜像块表），底部是 Triton kernel `_compute_slot_mapping_kernel`。*
+> *本章走线共 11 站，6 站落在这些橙色组件上——图上标注了 `CachedRequestState`（第 3–6 站）、InputBatch 内的 `MultiGroupBlockTable` 等（第 9 站）、以及 `_compute_slot_mapping_kernel`（第 10 站）；另 5 站落在本子系统内未展开成组件的文件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *上一章把指令送到 worker 门口，本章推门进去、把工单翻译成张量。下一章接着讲前向之后——采样、把新 token 写回、跨拍续跑。*
 
 [上一章](../../ch17-worker-and-executor/narrative/chapter.md)里，引擎大脑对着 N 个 worker 说话，就像对着一个函数说话。`collective_rpc` 把 `SchedulerOutput` 广播下去，每个 worker 的 `execute_model` 被调起。
+
+架构模型图上，此刻踏进了 EngineCore「执行与并行」组里那个橙色框——**ModelRunner 执行**——它在[第 17 章](../../ch17-worker-and-executor/narrative/chapter.md)刚读过的 Worker 与执行器正下方，`execute_model` 就是进这块的门。
 
 可工单送到之后呢？`SchedulerOutput` 是一张**调度决策清单**：哪些请求本拍要算、各算几个 token、新分了哪些 KV 块。它不是张量。模型要的是连续的 `input_ids`、每个 token 的绝对 `positions`、每个 token 该往哪个物理 KV 槽写的 `slot_mapping`。
 
@@ -259,6 +262,8 @@ self.input_batch.refresh_metadata()
 
 ## 18.5 slot 的回收与复用：打洞、复用、压实
 
+架构模型图上，这套两段式回收是 InputBatch 橙色展开框的核心机制——`BatchUpdateBuilder`，就是图上 InputBatch 块里第一个子条目，管着「哪个 slot 空出来了、新请求该往哪填」的账本。
+
 把上一节的 `remove_request` / `add_request` / `condense` 三件事连起来看，会发现它们构成一套**两段式的 slot 回收**：移除时只「打洞」不搬数据，新增时优先「填洞」，实在填不满才统一「压实」。
 
 先看 `remove_request` 为什么不搬数据：
@@ -395,6 +400,8 @@ def condense(self) -> None:
 ---
 
 ## 18.6 _prepare_inputs：二维坐标拍扁成一维收集
+
+架构模型图上，`_prepare_inputs` 是 ModelRunner 橙色框里的第二大步——从 CachedRequestState / InputBatch 这些持久容器，走向底部的 `_compute_slot_mapping_kernel`（第 10 站），把二维坐标拍扁、收集张量。
 
 批次状态对齐了，该把数据捞出来拼张量了。`_prepare_inputs` 的核心是一个漂亮的索引技巧：把「请求 r 的第 p 个 token」这个二维坐标，拍扁成一维偏移，然后用一次 `index_select` 把本拍要算的所有 token 收集成连续的 `input_ids`。
 
@@ -538,6 +545,8 @@ cm_base = CommonAttentionMetadata(
 ---
 
 ## 18.8 block_table 的 CPU/GPU 双镜像与 position→slot 映射
+
+架构模型图上，这里踏进了标着「第 10 站」的 `_compute_slot_mapping_kernel`——InputBatch 橙色展开框的最底部。它站在 ModelRunner 和[第 15 章](../../ch15-kv-cache/narrative/chapter.md)分页 KV 缓存的交界面：一手接 `block_table`（块号→物理槽的映射表，由调度器填写、经 CPU/GPU 双镜像同步到显存），一手交出每个 token 的物理 `slot_mapping`。
 
 `slot_mapping` 是把逻辑位置接到物理 KV 显存的最后一公里。要讲清它，得先看 `block_table` 为什么维护 CPU、GPU 两份镜像。
 

@@ -2,11 +2,13 @@
 
 ## 你在这里
 
-![本章在全书地图中的位置](../diagrams/roadmap.png)
+![你在这里：全书架构模型已读 2 个组件，本章在 Stage 1 就地展开「输入处理」——InputProcessor 壳下摊开 EngineInput 等、InputPreprocessor、MultiModalFeatureSpec（含 PlaceholderRange），本章 12 站中 9 站落在这些橙色组件上](../diagrams/arch-model.png)
 
-> *图注：全书子系统路线图，本章点亮 `input-processor`——三段式里最靠前的那一段。它左边接的是 `entrypoints`/`async-engine`（上一章的 `AsyncLLM`），右边把成品交给 `engine-core`。本章只管「请求进引擎之前」的最后一道工序。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向。第 1 章那张图里，`EngineCore` 框中只有逐拍循环和调度器、分页 KV 缓存两个名字；如今框内已按「调度与显存／执行与并行／模型与算子／解码策略」四组排好全部位置，每个虚线框标着它由哪一章开讲。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
+> *本章新长的这块就在 Stage 1 里就地展开——摊开的不是概念图，而是源码里真实的组织关系：`InputProcessor`（本章主角，`process_inputs` 所在）是容器壳，壳内依次嵌着 `EngineInput` 等（渲染好的输入载体）、`InputPreprocessor`（兜底 tokenize 的老路径总入口）、`MultiModalFeatureSpec`（多模态 item 的信息包，内嵌 `PlaceholderRange`——记录 item 在 token 序列里位置的区间）。本章走线共 12 站，其中 9 站落在这些橙色组件上（徽标拆成「第 2–3、6–10 站」与「第 4–5 站」两档）；另有 1 站落在已读的「异步引擎」上、2 站落在本子系统还没展开成组件的文件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *这块新结构接在哪？它正好夹在两枚蓝框之间：一枚是入口条带里的「配置与装配」（[第 3 章](../../ch03-config-and-wiring/narrative/chapter.md)）——`InputProcessor` 身上挂的 `VllmConfig`（引擎的整套装配配置，`model_config`、`tokenizer`、`parallel_config` 都从它取）正是那一章从 `EngineArgs`（扁平参数袋）拼出来的，本章的橙块就长在这份配置之上；另一枚是「IPC 边界」层带里的「异步引擎」（[第 4 章](../../ch04-async-llm/narrative/chapter.md)）——本章 12 站里落在已读组件上的那 1 站就是它的 `add_request`：请求从那里起脚，调起 `process_inputs`，走进橙色面板被校验、补料、组装。*
 
-上一章 [AsyncLLM 三段式异步解耦](../../ch04-async-llm/narrative/chapter.md) 把整条流水线拆成了三段，并且明确说过：Stage 1 的输入处理当时**被当成黑盒**——`add_request` 拿到一个 prompt，转手就喊一声 `process_inputs`，黑盒里吐出一个 `EngineCoreRequest`，然后这个结构体被扔过进程边界送进 EngineCore。
+上一章 [AsyncLLM 三段式异步解耦](../../ch04-async-llm/narrative/chapter.md) 把整条流水线拆成了三段，并且明确说过：Stage 1 的输入处理当时**被当成黑盒**——`add_request` 拿到一个 prompt，转手就喊一声 `process_inputs`，黑盒里吐出一个 `EngineCoreRequest`，然后这个结构体被扔过进程边界送进 EngineCore。（架构模型图上，本章 12 站里落在已读组件上的那 1 站正是这里：`add_request` 属于上一章读过的「异步引擎」蓝框——请求从它起脚，才走进 Stage 1 的橙色面板。）
 
 这章我们就掀开这个黑盒。问题很具体：
 
@@ -154,7 +156,7 @@ def _validate_lora(self, lora_request):
 
 ## 5.3 归一化：透传还是兜底 tokenize
 
-[§5.1](#51-一句话钩子tokenize-已经不在这里了) 已经把这个分流讲透了——主路径透传 `EngineInput`，兜底路径走 `InputPreprocessor.preprocess()`。这里补一句兜底路径里发生了什么。
+[§5.1](#51-一句话钩子tokenize-已经不在这里了) 已经把这个分流讲透了——主路径透传 `EngineInput`，兜底路径走 `InputPreprocessor.preprocess()`。这里补一句兜底路径里发生了什么（图里「第 4–5 站」的徽标就挂在 `InputPreprocessor` 这格上）。
 
 `InputPreprocessor.preprocess()` 是老路径的预处理总入口：它先按是否 encoder-decoder 架构分流，decoder-only 的文本会走到 `_process_text()`，在那里调 `_tokenize_prompt()` 真正切词，再包成统一的 `TokensInput`。多模态、纯嵌入也各有委托。它的产物和主路径透传的 `EngineInput` 是**同一种 TypedDict 家族**（TypedDict：一种带静态字段约束的字典——用法和普通 dict 一样，但类型检查器知道每个 key 该是什么类型；`vllm/inputs/engine.py` 里以 `type` 字面量判别的三种变体：`TokensInput`、`EmbedsInput`、`MultiModalInput`，统一别名为 `DecoderOnlyEngineInput`）——这正是设计的巧妙处：不管走哪条路，出来的 `processed_inputs` 形状一致，后面的代码只靠 `type` 字段区分内容，不用区分来源。
 
@@ -490,7 +492,7 @@ class EngineCoreRequest(
         return self.pooling_params
 ```
 
-那三个 `msgspec.Struct` 的参数全是为序列化体积和速度服务的：`array_like` 让结构体序列化成数组（不带字段名）、`omit_defaults` 跳过默认值字段、`gc=False` 省掉 GC 开销。原因很简单——这个结构体马上要被 [Stage 2 序列化送过进程边界](../../ch07-engine-core/narrative/chapter.md) 进 EngineCore，体积越小、序列化越快越好。
+那三个 `msgspec.Struct` 的参数全是为序列化体积和速度服务的：`array_like` 让结构体序列化成数组（不带字段名）、`omit_defaults` 跳过默认值字段、`gc=False` 省掉 GC 开销。原因很简单——这个结构体马上要被 [Stage 2 序列化送过进程边界](../../ch07-engine-core/narrative/chapter.md) 进 EngineCore，体积越小、序列化越快越好。（画到架构模型图上：组装 `EngineCoreRequest` 是第 9 站，下一节的 id 唯一化（第 10 站）也还在橙色面板里；跨过图里那道 IPC 边界，是下一段的事。）
 
 那个 `params` 属性是个贴心的统一访问器：不管请求是采样还是池化，调用方都用 `request.params` 拿参数，不必自己判断哪个非空。`external_req_id` 字段先记在这——下一节它就是主角。
 
@@ -554,7 +556,7 @@ def random_uuid() -> str:
 
 先建立直觉。用户点一份 `n=4`，就像下单要 4 杯同款咖啡：柜台不会让一个杯子接 4 次，而是撕出 4 张一模一样的小票，每张只做 1 杯（子请求 `n=1`），杯身编号 0/1/2/3 好对号取餐（子 id 前缀）；要「4 杯可复现」就给每张小票一个连号配方（`seed+idx`），否则 4 张共用同一张配方模板省纸（缓存复用）。全部做齐了才一起端出（`FINAL_ONLY` 聚合）。下面看这套「撕小票—做咖啡—端出」在真实源码里怎么落地。
 
-答案是：**不在 `InputProcessor` 里。** `process_inputs` 永远只产出**一个**父 `EngineCoreRequest`。裂分发生在更上层的 `add_request`，由 `ParentRequest` 协调：
+答案是：**不在 `InputProcessor` 里。** `process_inputs` 永远只产出**一个**父 `EngineCoreRequest`。裂分发生在更上层的 `add_request`，由 `ParentRequest` 协调（站号上我们已经走出橙色面板——`ParentRequest` 所在的 `parallel_sampling.py` 正是图上那「2 站落在本子系统未展开成组件的文件上」，它要等[下一章](../../ch06-input-processor/narrative/chapter.md)才摊开成组件）：
 
 ```python
 # vllm/v1/engine/async_llm.py:L381-L398

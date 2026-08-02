@@ -11,19 +11,9 @@ export const meta = {
 // ⚠️ args 注入不可靠 → CFG 为准（换批改 CFG.chapters）。
 const CFG = {
   instance: 'vllm',
-  // 批次2(vllm 剩 32 章的前 16 章)
+  // 批次2 补跑(retry #2):只剩 prose 因 fable 失败的 6 章(图已全部就绪, prose 现已走主模型)
   chapters: [
-    'ch01-config-and-wiring',
-    'ch02-entrypoints',
-    'ch04-async-llm',
-    'ch05-input-processing',
-    'ch06-input-processor',
-    'ch08-output-processor',
-    'ch09-detokenization',
-    'ch10-logprobs',
     'ch11-engine-core',
-    'ch12-engine-core',
-    'ch14-scheduler',
     'ch16-kv-cache',
     'ch17-worker-and-executor',
     'ch18-model-runner',
