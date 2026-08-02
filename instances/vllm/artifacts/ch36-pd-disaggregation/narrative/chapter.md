@@ -1,13 +1,15 @@
 # 第 36 章　PD 分离 II：worker 侧执行与可插拔传输后端
 
+> 本章主线是 `vllm/v1/worker/kv_connector_model_runner_mixin.py` 里的 context manager 生命周期与 `vllm/distributed/kv_transfer/kv_connector/v1/base.py` 的 worker 契约——三类可插拔后端在同一套接口上各填一张表。
+
 ## 你在这里
 
-![你在这里：PD 分离的 worker 侧](../diagrams/roadmap.png)
+![你在这里：全书架构模型共 18 站，本章在 IPC 边界就地把 KV 传输层展开成 worker 侧生命周期与三类可插拔后端——左边是 connector mixin 夹住 forward 的 enter/finally，右边是 P2P/NIXL/Offloading 三列各填同一套契约](../diagrams/arch-model.png)
 
-> *图注：全书地图高亮当前位置。*
-> *上一章在 scheduler 进程里立好了契约：查命中、隔离阻塞态、KV 到位后提升。*
-> *本章下沉到 worker 进程：KV 到底怎么在 GPU 之间搬，又怎么不拖慢计算。*
-> *下一章离开 PD 分离，回到引擎的其它横切面。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
+> *本章新长的这块在 **IPC 边界** 上就地展开。IPC 边界是全书最关键的结构线之一：调度进程和 worker 进程被它隔在两边，KV cache 从 prefill 侧跨过这条线落到 decode 侧。[第 35 章](../../ch35-pd-disaggregation/narrative/chapter.md)已经在 IPC 边界的 scheduler 侧立好了决策链路——查命中、隔离阻塞态、KV 到位后提升；本章补上对端的 worker 侧：`KVConnectorModelRunnerMixin` 用一个 context manager 的 `enter`/`finally` 把整条 KV 搬运线夹在 model forward 两侧，底下三类可插拔后端（P2P NCCL 直发、NIXL RDMA 单边读、Offloading 分级缓存）填同一套 `KVConnectorBase_V1` 契约。展开的形状就是源码里的真实组织关系——生命周期夹层在中间，契约接口向右发散到三列具体实现。*
+> *本章走线共 18 站，10 站落在这些橙色部件上，另有 8 站落在其他章已讲的组件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *本章新结构接在两块读者已经读过的结构上：上面是上一章在同一个 IPC 边界立下的 scheduler 侧决策链路（`KVConnectorRole.SCHEDULER`），下面是 `EngineCore` 框里那个 `execute_model` 前向循环——本章的 `KVConnectorModelRunnerMixin` 就是塞在这两层之间的夹心。下一章离开 PD 分离，回到引擎的其它横切面。*
 
 [上一章](../../ch35-pd-disaggregation/narrative/chapter.md)我们站在 scheduler 进程里，看一个 connector 如何长出"两副面孔"：决策侧查命中、做隔离，把一个请求挂进 `WAITING_FOR_REMOTE_KVS`，等 KV 到位再提升回 `WAITING` 重新调度。但那一章始终没回答一个最实在的问题——**KV 到底是怎么搬过来的？**
 
@@ -83,6 +85,8 @@ def maybe_get_kv_connector_output(
 逻辑一句话：**只有配置了 KV 传输组，才进真正的生命周期 context；否则返回 `nullcontext()`，零开销。** 没开 PD 分离的普通部署，这里就是个空壳，`with` 块退化成只跑 forward。这是把一个可选子系统接进热路径的标准做法——不付费就不掏钱。
 
 这些方法都挂在 `KVConnectorModelRunnerMixin` 上。它是一个纯静态的 mixin，混进 GPU/TPU 的 ModelRunner，给它们加上"会搬 KV"的能力，本身不持有状态。真正的 connector 对象藏在一个进程级全局里，靠 `get_kv_transfer_group()` 取——这正是上一章那个 `WORKER` 角色的 connector 实体。
+
+在架构模型图上，从站 2 走到这里：跨过 IPC 边界、`execute_model` 的 `with` 块闸门之后，下面进入 mixin 包住的那段生命周期。
 
 ---
 
@@ -332,7 +336,7 @@ def finalize_kv_connector() -> None:
 
 ## 36.6 同一套 worker 契约
 
-到这里，生命周期已经清楚了：worker 在 forward 两侧依次调 `bind` → `start_load_kv` → 逐层 `wait_for_layer_load` / `save_kv_layer` → `wait_for_save` → `get_finished`。但这些调用最终落到谁身上？落到具体的 connector 后端。它们都实现同一份抽象契约 `KVConnectorBase_V1`：
+到这里，生命周期已经清楚了：worker 在 forward 两侧依次调 `bind` → `start_load_kv` → 逐层 `wait_for_layer_load` / `save_kv_layer` → `wait_for_save` → `get_finished`。在架构模型图上，站 7-8 的 `KVConnectorRole` 已经把角色分好了——同一个连接器，`WORKER` 侧实现搬运动作，`SCHEDULER` 侧只管决策与握手。但这些调用最终落到谁身上？落到具体的 connector 后端。它们都实现同一份抽象契约 `KVConnectorBase_V1`：
 
 ```python
 # vllm/distributed/kv_transfer/kv_connector/v1/base.py:L291-L348
@@ -399,7 +403,7 @@ def get_finished(
 
 ## 36.7 P2P NCCL：点对点直发
 
-最直白的后端是 P2P NCCL：prefill worker 和 decode worker 之间，直接用 NCCL 点对点 send/recv 把 KV 搬过去。它是**单类自包含**的——不像后面两个后端要拆成 scheduler/worker 两个子对象，`P2pNcclConnector` 一个类里用 `is_producer` 区分 P 和 D 两种角色。
+架构模型图上的站 9-11——`P2pNcclConnector` 与它的 `P2pNcclEngine`——填出第一张表：prefill worker 和 decode worker 之间，直接用 NCCL 点对点 send/recv 把 KV 搬过去。它是 **「单类自包含」** 的——不像后面两个后端要拆成 scheduler/worker 两个子对象，`P2pNcclConnector` 一个类里用 `is_producer` 区分 P 和 D 两种角色。
 
 **消费端（decode）在 `start_load_kv` 里收。** producer 直接返回，只有 consumer 干活：
 
@@ -835,4 +839,4 @@ bind_connector_metadata → start_load_kv → [forward 内：层级 hook] → wa
 
 **抽象的价值在差异里。** 三种传输南辕北辙，但生命周期骨架一个字不改就都接进来了——因为契约约束的是接口形状，不是实现语义。
 
-最后那个回传 scheduler 的 `KVConnectorOutput`，`finished_recving` 驱动[上一章](../../ch36-pd-disaggregation/narrative/chapter.md)的请求提升、`finished_sending` 驱动块释放。两章合起来，PD 分离从决策到搬运的整个闭环就闭上了。下一章离开 PD 分离，回到引擎的其它横切面。
+最后那个回传 scheduler 的 `KVConnectorOutput`，`finished_recving` 驱动[上一章](../../ch35-pd-disaggregation/narrative/chapter.md)的请求提升、`finished_sending` 驱动块释放。两章合起来，PD 分离从决策到搬运的整个闭环就闭上了。下一章离开 PD 分离，回到引擎的其它横切面。

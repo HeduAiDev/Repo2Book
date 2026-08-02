@@ -1,10 +1,16 @@
 # 第 35 章　PD 分离 I：KV Connector 契约与调度器集成
 
-![你在这里：PD 分离子系统在全书地图中的位置](../diagrams/roadmap.png)
+## 你在这里
 
-> *上一章讲投机解码：一个 engine 内部怎么用小模型猜、大模型验。*
-> *本章把视野放大到 engine 之间——为什么要把 prefill 和 decode 拆到不同 engine，KV 缓存怎么跨进程搬过去。*
-> *下一章接着讲 worker 侧真正的搬运执行与可插拔后端（P2P / NIXL / Offloading）。*
+![你在这里：全书架构已读 19 个组件，本章在 IPC 边界层展开「P/D 分离」——左侧平铺四个端到端角色（枚举/工厂/调度集成/worker 契约），右侧两个 has_a 容器（KVConnectorBase_V1 与 ExampleConnector 各嵌 KVConnectorMetadata），21 站全部落地](../diagrams/arch-model.png)
+
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向。蓝框是前面章节已经读过的（框里带章号），虚线框是留给后续章节的，橙色是本章新长出的一块。*
+>
+> *本章新长的这块在 IPC 边界层就地展开——prefill 端把 KV 交给 decode 端，天然就是跨进程的事。展开的形状不是一棵调用树，而是「平铺 + 组合」：左侧四个端到端角色——`KVConnectorRole` 定义角色枚举（第 1–4 站）、`KVConnectorFactory` 按 SCHEDULER/WORKER 各造一份实例并强制进程隔离（第 5–6 站）、调度器里的 `Scheduler`（KV-connector 集成部分）管查命中/隔离/提升的决策闭环（第 7–21 站）、`KVConnectorBase_V1` 写定 worker 侧的搬运契约；右侧两个 has_a 容器——`KVConnectorBase_V1` 和 `ExampleConnector` 各嵌一份 `KVConnectorMetadata`——把「基类与它的参考实现都持有元数据」这一组合关系直接画了出来。本章 21 站全数落在这六个组件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+>
+> *最值得停一下的是这六个组件接在读者已经读过的三块结构上。向上，请求经过[第 5 章](../../ch05-input-processing/narrative/chapter.md)的输入处理后到达这里，正是 IPC 边界层。同层，[第 7 章：IPC 边界](../../ch07-engine-core/narrative/chapter.md)搭建的跨进程通道是它的物理根基——决策侧 connector 跑在调度器进程、搬运侧 connector 跑在 worker 进程，两边的内存和上下文完全隔离，这不是约定俗成，是进程边界本身。向下，决策侧的调度集成伸进 EngineCore 大框里[第 13 章](../../ch13-scheduler/narrative/chapter.md)和[第 14 章](../../ch14-scheduler/narrative/chapter.md)铺好的调度循环，搬运侧则交给[第 17 章](../../ch17-worker-and-executor/narrative/chapter.md)的 worker 执行——KV 的进出都要靠它。*
+>
+> *上一章（[第 34 章：投机解码](../../ch34-spec-decode/narrative/chapter.md)）讲一个 engine 内部怎么用小模型猜、大模型验，这一章把视野放大到 engine 之间——为什么要把 prefill 和 decode 拆到不同 engine、KV 缓存怎么跨进程搬过去。下一章（[第 36 章：PD 分离 II](../../ch36-pd-disaggregation/narrative/chapter.md)）接着本章的 worker 侧搬运契约，讲各后端（P2P / NIXL / Offloading）怎么把 KV 真正搬过去。*
 
 本章的两条源码主线：契约定义在 `vllm/distributed/kv_transfer/kv_connector/v1/base.py`，调度集成在 `vllm/v1/core/sched/scheduler.py`。工厂在 `vllm/distributed/kv_transfer/kv_connector/factory.py`，参考实现在 `vllm/distributed/kv_transfer/kv_connector/v1/example_connector.py`。
 
@@ -257,7 +263,7 @@ The class provides the following primitives:
 
 ## 35.3 KVConnectorFactory：按 role 各造一份
 
-契约定义好了，谁来实例化？`KVConnectorFactory`。它干两件事：维护一张**懒加载注册表**，以及按 role **分别构造**两份实例。
+契约定义好了，谁来实例化？`KVConnectorFactory`。我们还在 IPC 边界层——工厂负责把同一份契约在调度器进程和 worker 进程里各实例化一份。它干两件事：维护一张**懒加载注册表**，以及按 role **分别构造**两份实例。
 
 先看注册：
 
@@ -378,7 +384,7 @@ safetensors 是 Hugging Face 出的一种**张量存盘格式**（[官方文档]
 
 ## 35.4 调度器集成：查命中、隔离、不堵队头
 
-契约清楚了，现在看**调度器怎么把它编织进 WAITING 调度循环**。这是本章最硬的一段，也是第 14 章那笔账的正主。
+契约清楚了，现在看**调度器怎么把它编织进 WAITING 调度循环**。这是本章最硬的一段，也是第 14 章那笔账的正主。§35.2–§35.3 站在 IPC 边界层定义契约；现在跨进 EngineCore 大框里的调度器——架构模型图上一条线从橙色 P/D 分离块直插进蓝色调度器框，就是接下来要走的路。契约里那几个方法，该被调度循环调起来了。
 
 第 14 章讲过，`waiting` 不是一个队列而是两个：
 
@@ -604,7 +610,7 @@ FCFS 下先看 `skipped_waiting`（让被隔离的请求有机会被复查）；
 
 ## 35.5 KV 到位：提升回 WAITING，重新调度
 
-现在补上 §35.4 按下的那块：请求进了 `WAITING_FOR_REMOTE_KVS`，KV 在 worker 侧异步传输。**传完之后**，它怎么被唤醒、重新进入调度？这是第 14 章那笔账的最后一笔。
+现在补上 §35.4 按下的那块：请求进了 `WAITING_FOR_REMOTE_KVS`，KV 在 worker 侧异步传输——就是同大框「执行与并行」组里蓝色那位 `Worker 与执行器`。**传完之后**，它怎么被唤醒、重新进入调度？这是第 14 章那笔账的最后一笔。我们还在 EngineCore 大框里——KV 在 worker 侧搬完，信号经 connector 跨回调度器侧，正是架构模型图橙色块下方那条回传箭头。
 
 下面这张状态机图，是整条提升路径的全貌：
 

@@ -2,9 +2,11 @@
 
 ## 你在这里
 
-![全书地图：本章深入模型定义层的量化底座](../diagrams/roadmap.png)
+![你在这里：全书架构模型已读 14 个组件，本章在 EngineCore「模型与算子」组展开量化底座——六个橙框彼此独立、按功能并列，本章 9 站中 6 站落在上面](../diagrams/arch-model.png)
 
-*图 0：从请求进入引擎，到 EngineCore 循环里真正执行的模型定义层。本章往下钻一层，看权重被压成 INT4/FP8 之后，那把「尺子」是怎么造出来的。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理；蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
+> *本章新长的这块在「模型与算子」组里就地展开——六个橙框是量化底座的真实组件：`QuantizeMethodBase`（量化方法基类契约，第 4 站）、`GPTQLinearMethod`（GPTQ 推理端实现，第 5 站）、`AWQLinearMethod`（AWQ 推理端实现，第 6 站）、`Fp8LinearMethod`（FP8 块量化推理端，第 7 与 9 站）、`QuantFP8`（在线激活量化的核心函数 `_quantize_group_native`，第 8 站）以及 `QuantizationConfig`（量化配置入口，不单独设站）——彼此独立、按功能并列，没有层级包裹。本章 9 站，6 站落在这些组件上，另有 3 站落在本子系统内未展开成组件的文件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *[第 22 章](../../ch22-model-definitions/narrative/chapter.md)的「模型定义层」蓝框就在这块橙色正上方同一个「模型与算子」组里、已经读过了——量化底座是它的底层依赖，`quant_method.apply` 这个统一调用入口就坐在这块底座上。左邻「自定义算子与编译」（[第 23 章](../../ch23-custom-ops-and-compilation/narrative/chapter.md)）与右邻「注意力后端」（[第 24 章](../../ch24-primer-flash-attention/narrative/chapter.md)）也都已读过，下方「模型架构」留着虚线、等[第 28 章](../../ch28-model-architecture/narrative/chapter.md)才展开。*
 
 上一章我们站在注意力后端这头，看 kernel 怎么照 `block_table` 读写 KV；这一章把镜头移到模型定义层脚下。前面几章，模型的每个 Linear（线性层）都假设权重是老老实实的 BF16（16 位脑浮点）。真实部署里几乎从不这样：显存装不下、带宽喂不饱，于是权重被压成 4 位或 8 位整数、激活被压成 8 位浮点。这就是**量化**（quantization，把连续实数映射到有限个整数/低精度格点）。
 
@@ -115,7 +117,7 @@ Q(w) = \Delta \cdot \mathrm{round}(w/\Delta),\qquad \Delta = \frac{\max(|w|)}{2^
 
 ### 源码：vllm 的参考量化算子
 
-这套数学在 vllm 里有一段直接对应的实现，量化实验里用它算参考值。它先按 zero_points 分支决定对称还是非对称：
+现在跨进了架构模型图「模型与算子」组里橙色展开的量化底座——`quant_utils.py` 是上图 `QuantizeMethodBase`（第 4 站）及其下游子类共用的参考实现工具层。这套数学在 vllm 里有一段直接对应的实现，量化实验里用它算参考值。它先按 zero_points 分支决定对称还是非对称：
 
 ```python
 # vllm/model_executor/layers/quantization/utils/quant_utils.py:L586-L613
@@ -459,7 +461,7 @@ s_{\mathrm{raw}} = \frac{\mathrm{absmax}}{\mathrm{FP8_{max}}},\qquad
 s = 2^{\lceil \log_2 s_{\mathrm{raw}} \rceil}
 ```
 
-$`s_{\mathrm{raw}}`$ 就是 §二对称思想给出的连续 scale（ $`\mathrm{FP8_{max}}`$ 对 e4m3 是 $`448.0`$ ）， $`\lceil\cdot\rceil`$ 把它抬到最近的 2 的幂。这套复合函数在 vllm 激活侧的在线量化里逐字就是一行。代码里那个开关 `use_ue8m0`（名字即 unsigned e8m0，无符号 e8m0）管的正是「scale 要不要取整到 2 的幂」这一件事，与决定块大小的 `group_size` 是彼此独立的两个参数：
+$`s_{\mathrm{raw}}`$ 就是 §二对称思想给出的连续 scale（ $`\mathrm{FP8_{max}}`$ 对 e4m3 是 $`448.0`$ ）， $`\lceil\cdot\rceil`$ 把它抬到最近的 2 的幂。这套复合函数在 vllm 激活侧的在线量化里——架构模型图里 `QuantFP8`（第 8 站）所在的路径，被 `Fp8LinearMethod`（第 7、9 站）在推理期调用——逐字就是一行。代码里那个开关 `use_ue8m0`（名字即 unsigned e8m0，无符号 e8m0）管的正是「scale 要不要取整到 2 的幂」这一件事，与决定块大小的 `group_size` 是彼此独立的两个参数：
 
 ```python
 # vllm/model_executor/layers/quantization/input_quant_fp8.py:L240-L248

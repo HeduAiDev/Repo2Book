@@ -1,12 +1,12 @@
 # 第 38 章　OpenAI 兼容服务器：从 HTTP 请求到 AsyncLLM 的异步桥
 
-## 38.1 你在这里
+## 你在这里
 
-![本章在全书地图中的位置](../diagrams/roadmap.png)
+![你在这里：全书架构模型 21 个组件已读，本章在「入口层」就地展开——build_async_engine_client 框住引擎生命、OpenAIServingChat 扛起请求主线、serve_http 套上 uvicorn 进程壳](../diagrams/arch-model.png)
 
-> 上一章我们用离线的 `LLM` 把一批 prompt 喂进引擎、同步拿回全部结果。
-> 这一章把同一台引擎搬到网线另一头：一条 HTTP 请求怎么变成 `AsyncLLM.generate` 的异步流。
-> 下一章起进入更底层的执行细节，本章是 entrypoints 子系统的收尾。
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线自上而下：请求入口 → Stage 1 输入处理 → IPC（进程间通信）边界 → EngineCore 大框（调度与显存／执行与并行／模型与算子／解码策略四组）→ Stage 3 输出处理 → 响应出口。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
+> *本章新长的这块在全书最顶层的「入口层」就地展开——八个组件按源码里的真实组织关系画出：`build_async_engine_client` 框住引擎的一生（站 1–7），`lifespan` 管后台日志与堆冻结（站 8），POST handler 落在路由文件上（站 9），`OpenAIServingChat` 扛着渲染→引擎调用→分叉全程（站 10/15/16），`OpenAIServingRender` 专做 chat template 展开与 tokenize（站 11–12），基类 `OpenAIServing` 统一兜错（站 13–14），`serve_http` 起 uvicorn + watchdog + 信号关停（站 17–18），`AuthenticationMiddleware` 与 `EngineClient` 协议分立两侧。整个入口层就长在[第 4 章](../../ch04-async-llm/narrative/chapter.md)那台 `AsyncLLM` 引擎的头顶，往下依次是[第 5 章](../../ch05-input-processing/narrative/chapter.md)的输入处理和[第 7 章](../../ch07-engine-core/narrative/chapter.md)的 IPC 边界——它就是同一台引擎搬上网线的壳。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *[第 37 章](../../ch37-entrypoints/narrative/chapter.md)讲了同一层里离线 `LLM` 的同步调用——本章把它搬上线：uvicorn 常驻、SSE 推逐 token 流、`[DONE]` 收尾。*
 
 第 37 章的离线 `LLM` 很省心：你给它一个列表，它阻塞着算完，一次性还给你。但生产环境不长这样。生产环境是一台常驻服务器，前面挂着负载均衡，后面是一颗滚烫的 GPU，成百上千条请求同时涌进来，每条都想要"打字机"式的逐字回显。
 
@@ -103,7 +103,7 @@ def setup_server(args):
 
 这里还顺手装了个 `SIGTERM` handler：初始化阶段收到 SIGTERM，就抛 `KeyboardInterrupt` 把启动打断。注意这只是**初始化期**的兜底；等服务器真正跑起来，关停信号会被 launcher 里另一套机制接管（见 [§38.7](#387-优雅关停信号watchdog与那个晚-await-的-shutdown_task)）。
 
-**第二，`async with build_async_engine_client(...)` 把引擎的整个生命周期框成了一个上下文。** 这是本章和第 4 章的接缝。进入这个 `with`，`AsyncLLM` 就起来了；离开它（无论正常退出还是抛异常），引擎一定被 shutdown。我们来看框子里装的是什么：
+**第二，`async with build_async_engine_client(...)` 把引擎的整个生命周期框成了一个上下文。** 这是本章和第 4 章的接缝。（架构模型图里，`build_async_engine_client` 上的站 1–7 就是这段——入口层最左的组件，`AsyncLLM` 的一生都框在它里面。）进入这个 `with`，`AsyncLLM` 就起来了；离开它（无论正常退出还是抛异常），引擎一定被 shutdown。我们来看框子里装的是什么：
 
 ```python
 # vllm/entrypoints/openai/api_server.py:L77-L106
@@ -526,7 +526,7 @@ def _base_request_id(
         )
 ```
 
-**这就是第 4 章的接缝。** `engine_client.generate(...)` 不阻塞、不立刻返回结果——它返回一个 `AsyncGenerator[RequestOutput]`。每当引擎那边算出新 token、`output_handler` 通过 per-request 队列把 `RequestOutput` 推过来，这个生成器就 yield 一次。`EngineClient` 协议把这个契约写得很明白：
+**这就是第 4 章的接缝。**（架构上，这一行就是入口层往下的出口——过了它，请求跌进 Stage 1、穿过 IPC 边界、进入 EngineCore 逐拍循环；返回时带着 `RequestOutput` 沿 Stage 3 原路回来。）`engine_client.generate(...)` 不阻塞、不立刻返回结果——它返回一个 `AsyncGenerator[RequestOutput]`。每当引擎那边算出新 token、`output_handler` 通过 per-request 队列把 `RequestOutput` 推过来，这个生成器就 yield 一次。`EngineClient` 协议把这个契约写得很明白：
 
 ```python
 # vllm/engine/protocol.py:L44-L84
@@ -564,7 +564,7 @@ handler 只认这个协议——它不知道、也不需要知道背后是 `Asyn
 
 ## 38.5 请求的一生（下）：同一个生成器，两种姿态
 
-这里是本章的概念核心，所以慢一点。
+这里是本章的概念核心，所以慢一点。（架构模型图里，`OpenAIServingChat` 的站 15–16 就是下面要展开的两条分岔——同一个生成器，流式逐帧推 SSE、非流式攒到头聚合成 JSON，最后都从响应出口回到客户端。）
 
 流式和非流式，听起来像两套不同的机制，其实它们消费的是**同一个 `engine_client.generate` 异步生成器**。差别只在于：拿到每个 `RequestOutput` 之后，是立刻往外推，还是攒到最后再一次性还。
 
@@ -940,7 +940,7 @@ async def lifespan(app: FastAPI):
 
 ## 38.7 优雅关停：信号、watchdog，与那个晚 await 的 `shutdown_task`
 
-`serve_http`（`vllm/entrypoints/launcher.py`）是启动的最后一环，也是关停的中枢。它把 app 交给 uvicorn，同时布下两套关停机制：
+`serve_http`（`vllm/entrypoints/launcher.py`）是启动的最后一环，也是关停的中枢。（架构模型图上，`serve_http` 的站 17–18 就是入口层最末的组件——uvicorn 包住整台服务器，watchdog 和信号关停在它内部并联兜底。）它把 app 交给 uvicorn，同时布下两套关停机制：
 
 ```python
 # vllm/entrypoints/launcher.py:L71-L142

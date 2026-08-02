@@ -2,9 +2,12 @@
 
 ## 你在这里
 
-![全书地图：本章深入注意力后端的内部算法](../diagrams/roadmap.png)
+![你在这里：全书架构模型已读 13 个组件，本章在 EngineCore 的「模型与算子」组里展开「注意力后端」——两个独立组件 flash_attn_varlen_func 与 merge_attn_states，按功能并列](../diagrams/arch-model.png)
 
-*图 34-0　全书请求生命周期地图。上一章停在 attention 算子被切出来、保持 eager;本章纵向切进这一格，掀开它内部一直当黑盒的 FlashAttention kernel。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线自上而下依次是入口、输入处理、跨进程的 IPC 边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理；蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
+> *本章新长的这块在 EngineCore 的「模型与算子」组里就地展开，两个橙色组件——`flash_attn_varlen_func`（第 2 站）和 `merge_attn_states 等`（第 6 站）——标注「彼此独立，按功能并列」。整章 6 站，这两个是源码锚点；其余 4 站是 §一 到 §八 的数学推导主线。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *这块「注意力后端」左右紧邻两块读者已经读过的蓝框：**「模型定义层」（第 22 章）** 和 **「自定义算子与编译」（第 23 章）** 。模型定义层把模型搭好、`self.attn(q,k,v)` 那行调用摆到位，自定义算子层用 `torch.compile` 把它当切点切出来保持 eager——轮到本章，掀开 `self.attn` 内部那个一直当黑盒的 FlashAttention kernel。左邻右舍是已读的，本章纵深往里扎。*
+> *本章只讲 kernel 内部的数学——为什么不用物化 $`N\times N`$ 矩阵、⊕ 算子怎么保证拆开还能精确拼回。这些数学在 vLLM 里的工程落地（后端选择、调用面、分页 KV）归[第 25 章：注意力后端](../../ch25-attention/narrative/chapter.md)。*
 
 上一章拆到 `self.attn(q, k, v)` 那行调用的底下——attention 算子被 `torch.compile` 当切点切出来、夹在两侧规整段之间保持 eager。但那个算子**内部**真正干活的 FlashAttention kernel,始终是当黑盒 `import` 进来的：调用一行 `flash_attn_varlen_func`,注意力就算完了，可里面到底发生了什么，全书至今没打开过。
 
@@ -70,6 +73,8 @@ flash_attn_varlen_func(
 ```
 
 `softmax_scale=self.scale` 就是打分公式里的 $`1/\sqrt{d}`$ 缩放，`causal` 控制因果掩码——这两个形参直接对上数学，其余整套调用面(变长打平、分页 KV 寻址)是[第 25 章：注意力后端](../../ch25-attention/narrative/chapter.md)的本职，这里不展开。本章要回答的是：这一行背后，为什么敢不物化 $`N\times N`$ 还能算对？答案藏在一个叫 online-softmax 的老技巧里。
+
+（现在走在架构模型图的第 2 站——请求穿过「模型定义层」与「自定义算子与编译」两个蓝框后，踏进本章新长出的橙色组件 `flash_attn_varlen_func`。）
 
 ---
 
@@ -355,6 +360,8 @@ out = p_out * p_scale + s_out * s_scale    # O = w_a·O_a + w_b·O_b
 ```
 
 `max_lse` 就是稳定化基准 $`M`$;两个 `tl.exp` 保证底数 $`\le 1`$ 、绝不上溢(和 safe-softmax 减 max 同一个道理);`p_scale`、`s_scale` 就是权重 $`w_a`$ 、 $`w_b`$;最后一行就是合并公式 $`O=w_aO_a+w_bO_b`$ 本身。kernel 的其余部分(空序列归一、地址算术)是工程琐节，见[第 25 章](../../ch25-attention/narrative/chapter.md)。
+
+（现在走在架构模型图的第 6 站——橙色组件 `merge_attn_states 等`，两段注意力在这里合流。）
 
 **这就是 ⊕ 的第三副面孔**:第一副是 online-softmax 的单遍递推，第二副是 FlashAttention 分块更新 $`(m,\ell,O)`$,这一副是合并两段注意力——状态记成 $`\mathrm{lse}=\log d`$,max 和加权都搬到了对数域，代数没变。它也是**第四副面孔 split-KV** 的地基：decode 阶段 batch×heads 太小、SM(streaming multiprocessor,流多处理器)吃不满时，把长 KV 单纯按长度切给多个 thread block 并行算(不按语义分段)，各 block 各出一份 $`(O,\mathrm{lse})`$ ，同样用 `merge_attn_states` 归并——结合律保证怎么切、怎么并都是同一个答案，本章不展开其调度细节。
 

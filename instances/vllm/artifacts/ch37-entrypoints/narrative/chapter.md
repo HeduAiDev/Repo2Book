@@ -2,13 +2,11 @@
 
 ## 你在这里
 
-![你在这里：全书地图高亮"入口"阶段](../diagrams/roadmap.png)
+![你在这里：全书架构模型已读多个组件，本章在入口层就地展开离线门面——LLM 的四个公开方法 generate/chat/embed/encode，经 LLMEngine 的 SyncMPClient 硬分叉，跨 IPC 边界接入后台 EngineCore，再由 while step() 同步拉到底](../diagrams/arch-model.png)
 
-> *图注：全书地图高亮当前位置。*
-> *上一章合上了分布式部署那条线（PD 分离的跨进程 KV 搬运）;从这里起，视野收回到单机入口这一头。*
-> *[第 4 章](../../ch04-async-llm/narrative/chapter.md) 讲过在线侧的入口 `AsyncLLM`——异步三段式、背景协程、流式吐 token。*
-> *本章换到离线侧：`vllm.LLM` 这个门面，怎么把一批 prompt 同步跑完、一次性收齐。*
-> *下一章接着往服务化走，把这条离线脊和在线 OpenAI server 并到一起看。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线自上而下：入口→输入处理→IPC（进程间通信）边界→EngineCore 大框（schedule→execute_model→update 逐拍循环）→输出处理，行间箭头还是请求的流向。蓝框是前面章节已读的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
+> *本章新块在入口层就地展开——摊开的不是一列类名，而是源码里真实的组织关系：上面是 `LLM` 类的四个公开方法 `generate`/`chat`/`embed`/`encode`，中间是 `LLMEngine` 构造期的硬分叉点——`SyncMPClient`（默认，后台进程 + ZMQ + 阻塞队列）与 `InprocClient`（仅在显式关掉多进程时回退），下面接 `_run_engine` 那条 `while has_unfinished_requests(): step()` 同步驱动脊。这块新结构接在[第 7 章 IPC 边界](../../ch07-engine-core/narrative/chapter.md)的头顶上、[第 4 章 AsyncLLM](../../ch04-async-llm/narrative/chapter.md)在线入口的旁边——离线门面（本章）与在线门面（前面已读）共享同一套后台 EngineCore，全部差别只在主进程侧：一边是 `queue.Queue.get()` 堵着等，一边是 `await asyncio.Queue` 让出事件循环。本章走线站号标在各组件上——站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读。跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *上一章合上了 PD 分离那条分布式线；从这里起视野收回到单机入口。[第 4 章：异步入口](../../ch04-async-llm/narrative/chapter.md)的 `AsyncLLM` 已读——与本条离线脊共享同一套后台 EngineCore，分岔只在主进程侧的驱动方式。下一章把这条离线脊和在线 OpenAI server 并到一起看。*
 
 写过 vLLM 离线推理的人，第一行代码几乎都长这样：
 
@@ -142,6 +140,8 @@ for out in outputs:
 > 用精简版亲手验证这一点很简单：构造一个 `LLM`，看它内部的引擎客户端是哪个类。默认下你会拿到 `SyncMPClient`；只有把 `VLLM_ENABLE_V1_MULTIPROCESSING=0` 显式关掉，才会回退到 `InprocClient`。
 
 记住这个结论，我们去看 `multiprocess_mode=True` 接下来怎么被消费。
+
+架构模型图上，入口层橙色区就走到这儿——下面要看的 `EngineCoreClient.make_client`，站在 IPC 边界的门槛上，决定离线端用哪种客户端跟后台 EngineCore 打交道。
 
 ---
 
@@ -455,6 +455,8 @@ class InprocClient(EngineCoreClient):
 
 **双注册**是核心：每条请求同时注册到两处。`output_processor.add_request` 建一个 `RequestState`，等输出回来时拿它去做去 token 化、装配 `RequestOutput`（第 8、9、10 章的活）。`engine_core.add_request` 才是真把请求送进后台 EngineCore 调度——离线默认下，这一步就是经 `SyncMPClient` 走 ZMQ 送达另一个进程。一个管"出"，一个管"算"，缺一不可。
 
+架构模型图上，双注册是一个岔路口：`output_processor` 往下通往输出处理链（第 8–10 章），`engine_core` 跨 IPC 边界进入后台 EngineCore。
+
 `n>1`（并行采样，一个 prompt 要 n 个不同续写）走 `ParentRequest` 扇出：一个父请求拆成 n 个子请求，各自双注册。这套并行采样机制第 4、6 章已经细讲，这里只点明它在离线侧的复用位置——扇出发生在 `add_request` 内部，`generate` 入口完全无感。
 
 整个单请求的生命周期，连同后面的驱动循环，画成一张泳道图：
@@ -534,7 +536,9 @@ class InprocClient(EngineCoreClient):
 
 ## 37.5 同步驱动的灵魂：_run_engine 与 step()
 
-提交完成，请求都在后台 EngineCore 里排着。现在到了本章最核心的几行——主线程怎么把它们一拍一拍拉到完成：
+提交完成，请求都在后台 EngineCore 里排着。现在到了本章最核心的几行——主线程怎么把它们一拍一拍拉到完成。
+
+架构模型图上，这就是入口层橙色区的主驱动段：`_run_engine` 一个 `while` 循环，每拍穿 IPC 边界、调 `engine_core.get_output()`，从后台 EngineCore 拉回一批输出，再路由给下游输出处理链装配。
 
 ```python
 # vllm/entrypoints/llm.py:L1839

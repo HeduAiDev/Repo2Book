@@ -2,12 +2,11 @@
 
 ## 你在这里
 
-![你在这里：投机解码](../diagrams/roadmap.png)
+![你在这里：全书架构模型已读 19 个组件，本章在 EngineCore 的「解码策略」组里展开新的一块——投机解码：proposer→Metadata 摊平→RejectionSampler 三阶段扁平并列](../diagrams/arch-model.png)
 
-> *图注：全书地图高亮当前位置。*
-> *上一章推导了 EAGLE 草稿器：在特征层自回归、剧透超前一步 token，又快又准地猜草稿。*
-> *本章看 vLLM 的投机执行面——怎么把草稿摊平、验证，让一次目标前向吐出好几个 token。*
-> *下一章把视野放大到 engine 之间：prefill/decode 拆分与跨进程 KV 搬运。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是 [第 1 章](../../ch01-config-and-wiring/narrative/chapter.md) 那张「一个请求的端到端旅程」长大后的样子。主线自上而下：入口→输入处理→IPC（进程间通信）边界→装着 `schedule → execute_model → update` 逐拍循环的 `EngineCore` 大框→输出处理，箭头仍是请求的流向；当年 `EngineCore` 框里只画了调度器与分页 KV 缓存，如今已按「调度与显存／执行与并行／模型与算子／解码策略」四组装满一路读过来的组件。蓝框是前面章节已读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
+> *本章新长的这块在「解码策略」组里就地展开成源码里的真实组织关系：左边 proposer 出草稿（NgramProposer 与 SpecDecodeBaseProposer 两种来源）→中间 SpecDecodeMetadata 摊平建 index→右边 RejectionSampler 逐位接受/拒绝（内含 greedy 与 random 两条内核），三阶段彼此独立、按功能并列。关键就位在读者已经读过的两块结构旁边：草稿验证要走目标模型前向，借道 [第 18 章 ModelRunner](../../ch18-model-runner/narrative/chapter.md) 的 `_calc_spec_decode_metadata` 算 index、再由同一套 `gpu_model_runner.py` 跑前向；bonus token 的采样则交棒给 [第 30 章](../../ch30-sampling/narrative/chapter.md) 的标准 `Sampler`——投机解码不是另起炉灶，是插在这两个已熟组件之间的一层加速。本章共 10 站，9 站在橙色展开组件上，另有 1 站在 ModelRunner。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *上一章推导了 EAGLE 草稿器的数学原理；下一章看 [PD 分离](../../ch35-pd-disaggregation/narrative/chapter.md)：prefill/decode 拆分与跨进程 KV 搬运。*
 
 自回归解码有个改不掉的毛病：一次前向只产一个 token。要写 100 个 token，就得把整个大模型跑 100 遍。而每跑一遍，GPU 的算力其实大半闲着——decode 阶段是**访存瓶颈**，矩阵又瘦又长，算术单元喂不饱。
 
@@ -233,7 +232,7 @@ class SpecDecodeMetadata:
 
 ### 三组 index 是怎么算出来的
 
-真正把这套 index 造出来的，是模型运行器里的 `_calc_spec_decode_metadata`（`vllm/v1/worker/gpu_model_runner.py`）。它的源码注释里带了一组**具体数字**，是理解整套间接寻址最好的脚手架。直接读它：
+真正把这套 index 造出来的，是模型运行器里的 `_calc_spec_decode_metadata`（`vllm/v1/worker/gpu_model_runner.py`）。现在走到了 [第 18 章 ModelRunner](../../ch18-model-runner/narrative/chapter.md) 的地盘——我们跨出了 `spec_decode/` 目录，回到 `gpu_model_runner.py`，index 算术在这里完成而非在投机解码模块里，因为只有模型运行器掌握全批的调度布局（`cu_num_scheduled_tokens`）。它的源码注释里带了一组**具体数字**，是理解整套间接寻址最好的脚手架。直接读它：
 
 ```python
 # vllm/v1/worker/gpu_model_runner.py:L2627
@@ -395,7 +394,7 @@ output_token_ids = rejection_sample(
 )
 ```
 
-`bonus_logits = logits[bonus_logits_indices]` 切出那 5 个 bonus 位（行 3/4/7/8/10），扔给普通 sampler 采出 `bonus_token_ids`。`target_logits = logits[target_logits_indices]` 切出 6 个草稿位（行 0/1/2/5/6/9），先升到 float32（接受准则要算概率比，精度敏感），再过 logits processor 和温度/top-k/top-p 约束。两组切片各自有独立存储，原地改不会互相污染。
+`bonus_logits = logits[bonus_logits_indices]` 切出那 5 个 bonus 位（行 3/4/7/8/10），扔给普通 sampler 采出 `bonus_token_ids`——这行 `self.sampler(...)` 正是向 [第 30 章](../../ch30-sampling/narrative/chapter.md) 标准 Sampler 交棒：RejectionSampler 只负责草稿位的接受/拒绝判定，bonus token 不归投机逻辑管，原样交给标准采样流水线。`target_logits = logits[target_logits_indices]` 切出 6 个草稿位（行 0/1/2/5/6/9），先升到 float32（接受准则要算概率比，精度敏感），再过 logits processor 和温度/top-k/top-p 约束。两组切片各自有独立存储，原地改不会互相污染。
 
 收拾停当，把草稿、目标 logits、bonus token 一起交给 `rejection_sample`——算法的心脏。
 
@@ -403,7 +402,7 @@ output_token_ids = rejection_sample(
 
 ## 34.4 接受还是拒绝：rejection sampling 的两条 kernel
 
-`rejection_sample`（`vllm/v1/sample/rejection_sampler.py`）是调度核心。它先开一块输出 buffer，然后根据请求是 greedy 还是 random，分派到两个 Triton 内核：
+`rejection_sample`（`vllm/v1/sample/rejection_sampler.py`）是调度核心——在架构模型图上，站 5 到站 10 全落在这个橙色组件里，greedy 与 random 两条内核从此分叉。它先开一块输出 buffer，然后根据请求是 greedy 还是 random，分派到两个 Triton 内核：
 
 ```python
 # vllm/v1/sample/rejection_sampler.py:L424

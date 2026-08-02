@@ -423,10 +423,22 @@ def build(inst=None):
                 continue
             own = owner_of(f)
             own_meta = ch_meta.get(own) if own else None
-            classes[nm] = {'name': nm, 'file': f,
-                           'subsystem': (own_meta['subsystem'] if own_meta else meta['subsystem']),
-                           'introduced_in': (own if own else cid),
-                           'responsibility': (kc.get('responsibility') or '')[:200]}
+            # 2026-08-02 修复(illustrator 自检):当 owner_of(文件级站数投票)判出的归属章
+            # 与**声明章**(首次登记该类的章)的 subsystem 不同时,说明该类是 cross-cutting
+            # 的货——如 Scheduler.get_grammar_bitmask 是 ch12(engine-core)登记的,但
+            # owner_of 因 ch35 读 scheduler.py 站数最多把它重判给 pd-disaggregation,
+            # 导致 ch35 图上印出 ch31 主题的方法名、读者不可理解。
+            # 修复:subsystem 穿越时,保留声明章的 subsystem 与 introduced_in。
+            if own and own_meta and own_meta.get('subsystem') != meta.get('subsystem'):
+                # owner_of 把文件判给另一个 subsystem → 该类是 cross-cutting 的，保留声明章的身份
+                classes[nm] = {'name': nm, 'file': f,
+                               'subsystem': meta['subsystem'],
+                               'introduced_in': cid}
+            else:
+                classes[nm] = {'name': nm, 'file': f,
+                               'subsystem': (own_meta['subsystem'] if own_meta else meta['subsystem']),
+                               'introduced_in': (own if own else cid),
+                               'responsibility': (kc.get('responsibility') or '')[:200]}
 
     # L2 累积：某子系统首次被哪一章展开
     sub_first = {}

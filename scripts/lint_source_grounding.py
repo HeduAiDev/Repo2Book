@@ -81,7 +81,7 @@ def lint_source_grounding(chapter_dir: str) -> dict:
         # 唯一标识开篇块。原写法 `^#\s*第\d+章` 要求「第」后紧跟数字,而全书 H1 实际是
         # `# 第 39 章　标题`(带空格)、triton-ascend 更是自然标题,从来匹配不上 →
         # 开篇 hook 只要没碰巧提到某个源码文件就吃假 BLOCKING(9/39 章中招,exp-2026-07-20-05)。
-        meta_patterns = [r'验证', r'总结', r'这章要做什么', r'^#\s']
+        meta_patterns = [r'验证', r'总结', r'这章要做什么', r'你在这里', r'^#\s']
         sections_without_refs = [
             t for t, n in refs_per_section.items()
             if n == 0 and not any(re.search(p, t) for p in meta_patterns)

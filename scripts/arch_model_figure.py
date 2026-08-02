@@ -111,8 +111,10 @@ def pick_classes(model, cid, sub, spine, cap=12):
     注解），类被挤掉后 canon() 找不到它，图上两处 has_a 持有关系整个消失，架构是错的。
     """
     idx = _chapter_index(cid)
+    # 仅保留 vLLM 源码文件——工具/外部/项目基础设施不属于架构模型（ch29 曾漏印 .claude/ 与 instances/ 路径）
     mine = [c for c in model.get('classes', []) if c['subsystem'] == sub
-            and _chapter_index(c['introduced_in']) <= idx]
+            and _chapter_index(c['introduced_in']) <= idx
+            and c.get('file', '').startswith('vllm/')]
     st = station_of_classes(mine, spine, model['chapters'][cid].get('relations', {}))
     keep = [c for c in mine if c['introduced_in'] == cid or st.get(c['name'])]
     if len(keep) > cap:
@@ -593,7 +595,7 @@ def build(model, cid):
         def _rest_bucket(i):
             u = ch['spine'][i - 1]
             subs_here = {c['subsystem'] for c in model['classes'] if c['file'] == u['path']}
-            others = {s for s in subs_here if s != cur_sub}
+            others = {s for s in subs_here if s != cur_sub and s is not None}
             if others:
                 chs = sorted({subs[s]['opened_in'] for s in others},
                              key=lambda c: int(c[2:]))

@@ -12,5 +12,9 @@ svg = here / 'arch-model.svg'
 png = here / 'arch-model.png'
 subprocess.run([sys.executable, str(repo / 'scripts' / 'arch_model_figure.py'),
                 '--chapter', CHAPTER, '--instance', INSTANCE, '--out', str(svg)], check=True)
-subprocess.run(['rsvg-convert', '-z', '2', str(svg), '-o', str(png)], check=True)
+try:
+    subprocess.run(['rsvg-convert', '-z', '2', str(svg), '-o', str(png)], check=True)
+except FileNotFoundError:
+    import cairosvg
+    cairosvg.svg2png(url=str(svg), write_to=str(png), scale=2)
 print(f'✓ {svg.name} / {png.name}')

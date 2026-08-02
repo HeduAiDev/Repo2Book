@@ -2,9 +2,11 @@
 
 ## 你在这里
 
-![vLLM v1 请求生命周期全书地图，高亮 EngineCore 循环下深入的投机解码](../diagrams/roadmap.png)
+![你在这里：全书架构模型已读 18 个组件，本章在 EngineCore 的「解码策略」组里展开新的一块——投机解码：契约容器 SpecDecodeBaseProposer 嵌着两个草稿器实现 EagleProposer 与 DraftModelProposer，外加模型扩展 EagleLlamaForCausalLM](../diagrams/arch-model.png)
 
-*上一章把采样从 logits 讲到下一个 token，一次前向只出一个。本章往下钻一层，读投机解码里那个草稿器 EAGLE——它怎么又快又准地一口气猜出未来好几个 token。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向；当年 `EngineCore` 框里只画了调度器与分页 KV 缓存，如今已按「调度与显存／执行与并行／模型与算子／解码策略」四组装满一路读过来的组件。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
+> *本章新长的这块在「解码策略」组里就地展开——摊开的不是一列类名，而是源码里真实的组织关系：SpecDecodeBaseProposer（抽象基类，定义草稿契约）是容器，EagleProposer 与 DraftModelProposer 各自实现它，EagleLlamaForCausalLM 在模型层顶着 LlamaForCausalLM 的继承链；这个「契约容器 ⊃ 实现」的嵌套形状直接从图上读得出来。本章共 6 站，5 站落在这些橙色部件上，另有 1 站落在[第 18 章](../../ch18-model-runner/narrative/chapter.md)已讲的 ModelRunner 执行组件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *本章这块新结构接在「解码策略」组里已经读过的两块组件旁边——[第 30 章](../../ch30-sampling/narrative/chapter.md)的采样（一张 logits 变一个 token）和[第 31 章](../../ch31-structured-output/narrative/chapter.md)的约束解码（语法掩码在采样前锁路）。投机解码比它们多一步：先猜后验，猜错了红线兜底。从执行面看，草稿头的特征原料是目标模型前向白送的，草稿器本身跑在[第 18 章](../../ch18-model-runner/narrative/chapter.md)铺好的 ModelRunner 里。[下一章](../../ch34-spec-decode/narrative/chapter.md)把这层算法装进执行面、把草稿器从入参到返回走通——EAGLE 在那里只是统一草稿契约下的一个实现。*
 
 投机解码（speculative decoding，用一个便宜的草稿器猜出未来若干 token、再由大模型一次前向批量验证的加速技术）的骨架是这样：草稿器（proposer，负责一次性猜出未来若干个 token 的模块）先提出 γ 个草稿 token（γ 即投机步长），目标模型（target LLM，我们真正想加速的那个大模型）用一次前向验证它们，再由 rejection sampling（拒绝采样）挑出能接受的前缀，最后补一个 bonus token（验证通过时白送的一个额外 token）。这套机器有一条红线和一本账，本章全部内容都挂在它们上面。
 
@@ -404,7 +406,7 @@ V_{\mathrm{child}} = V_{\mathrm{parent}} \cdot c_{\mathrm{child}} \le V_{\mathrm
 
 ## 33.8 落地：vLLM v1 的 EAGLE 是一条链
 
-讲完论文那棵漂亮的动态树，落差必须说破：**vLLM v1 默认的 EAGLE 路径是链式，是 §33.7 全部树机制的 k=1 退化特例**。草稿循环（下一章的 `propose()` ）第一遍前向采出第 1 个草稿 token，随后跑 γ−1 步，每步把上一步采出的 token 和上一步产出的特征回喂、只保留 1 个 argmax token——没有兄弟候选、没有树注意力、没有多轮投机采样，正是 §33.2 那条链的字面执行。§33.7 提到的那行 FIXME 就是这条落差的路标：树是规划，链是现实。
+讲完论文那棵漂亮的动态树，落差必须说破：**vLLM v1 默认的 EAGLE 路径是链式，是 §33.7 全部树机制的 k=1 退化特例**。草稿循环（下一章的 `propose()` ）第一遍前向采出第 1 个草稿 token，随后跑 γ−1 步，每步把上一步采出的 token 和上一步产出的特征回喂、只保留 1 个 argmax token——没有兄弟候选、没有树注意力、没有多轮投机采样，正是 §33.2 那条链的字面执行。§33.7 提到的那行 FIXME 就是这条落差的路标：树是规划，链是现实。在架构模型图里，这条链坐在 EngineCore 的解码策略层——和[第 30 章](../../ch30-sampling/narrative/chapter.md)的采样、[第 31 章](../../ch31-structured-output/narrative/chapter.md)的约束解码并排在同一组，草稿头的前向复用[第 18 章](../../ch18-model-runner/narrative/chapter.md)铺好的 ModelRunner 执行管线。
 
 ![vLLM v1 EAGLE 的链式草稿泳道图，逐步回喂产出 token](../diagrams/fig36-7-vllm-chain.png)
 
@@ -414,7 +416,7 @@ V_{\mathrm{child}} = V_{\mathrm{parent}} \cdot c_{\mathrm{child}} \le V_{\mathrm
 
 为什么草稿敢一律 greedy argmax，连温度、top-p 这些采样参数都不管？红线兜底：**草稿分布只影响接受率、不影响最终输出分布**。草稿猜得糙，顶多 $`\alpha`$ 低一点、慢一点，最终吐出来的文字分布分毫不差。落到账本上，链式形态就是 $`\mathbb{E}[\tau]=\sum\prod\alpha`$ 的求和只剩一条路径；EAGLE-2 的树是把求和范围扩到整棵连通子树——差距就是 §33.7 那 +0.6~0.8 的 τ。
 
-执行面的其余一切——变长草稿怎么摊平进一批、目标特征与起点 token 怎么备料、验证时怎么逐位接受、被拒后怎么从残差重采——是[下一章](../../ch34-spec-decode/narrative/chapter.md)的主线，那里会把草稿器从入参到返回走通。在那套执行面里，EAGLE 只是一个实现了统一契约的草稿器：本章的全部数学，浓缩成它每步回喂的那一对 (token, 特征)。
+执行面的其余一切——变长草稿怎么摊平进一批、目标特征与起点 token 怎么备料、验证时怎么逐位接受、被拒后怎么从残差重采——是[下一章](../../ch34-spec-decode/narrative/chapter.md)的主线，那里会把草稿器从入参到返回走通。在那套执行面里，EAGLE 只是一个实现了统一契约的草稿器：本章的全部数学，浓缩成它每步回喂的那一对 (token, 特征)。在架构模型图里，下一章沿着 EngineCore「执行与并行」组的 ModelRunner 更深处走——本章停在草稿契约与算法，下一章接上执行面。
 
 ---
 

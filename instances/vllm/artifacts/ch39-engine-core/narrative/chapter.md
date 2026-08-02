@@ -2,7 +2,10 @@
 
 ## 39.1 你在这里
 
-![本章在全书地图中的位置](../diagrams/roadmap.png)
+![你在这里：全书 21 个组件已读，本章在 EngineCore 骨架展开后长出最后两块——弹性 EP 扩缩与多轮会话，18 站分落在 7 个组件标签上](../diagrams/arch-model.png)
+
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。自上而下依次是入口、输入处理、跨进程 IPC 边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理；EngineCore 框内已按「调度与显存／执行与并行／模型与算子／解码策略」四组装满。蓝框是前面章节已读的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
+> *本章新长的两块分居两处。一块在「执行与并行」组里——**弹性 EP 扩缩（ElasticEPScalingState）**，一台每轮只走一步的确定性状态机，四种角色各挂一串状态；它直接插在[第 7 章](../../ch07-engine-core/narrative/chapter.md)已读的 `run_busy_loop` 钩子里，切换时用 `all_reduce(MAX)` 骑在[第 21 章](../../ch21-async-engine/narrative/chapter.md)的 DP wave 节律上对齐全组步调。另一块在输出处理区——**OpenAIServingResponses**，装着 `response_store` 和 `msg_store` 两个进程内字典加一根共享 list，撑起有状态多轮；它的历史拼接正是[第 15 章](../../ch15-kv-cache/narrative/chapter.md)前缀缓存价值最大的场景。本章走线共 18 站，分布在 7 个组件标签上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
 
 > 上一章我们把 OpenAI 兼容服务器接到了异步引擎上，请求的一生就此走通。
 > 这一章给那台已经在跑的引擎装上两件"运维级"能力：不停机增删 DP 引擎，以及跨轮记住对话。
@@ -22,7 +25,7 @@
 
 ![本章地图：弹性 EP 扩缩状态机与 Responses 多轮会话的源码剖面](../diagrams/chapter-map.png)
 
-只想弄清引擎怎么不停机扩缩容，跳读 §39.4 到 §39.9（新引擎扩入看 §39.8，缩容看 §39.9）；只想看跨轮对话怎么接上文，直接跳 §39.10 到 §39.12；想跟完整两条主线，就按 37.1 到 37.14 顺序通读。
+只想弄清引擎怎么不停机扩缩容，跳读 §39.4 到 §39.9（新引擎扩入看 §39.8，缩容看 §39.9）；只想看跨轮对话怎么接上文，直接跳 §39.10 到 §39.12；想跟完整两条主线，就按 39.1 到 39.14 顺序通读。
 
 ---
 
@@ -143,6 +146,8 @@ def run_busy_loop(self):
 ```
 
 一句话读懂这个钩子的精妙：**`progress()` 只是这轮 busy loop 里的一个"小动作"，做完它，循环照样往下走 `_process_engine_step()` 跑模型 forward**。也就是说，扩缩的每一步都和正常的推理步**交织**在一起——这就是"不停机"四个字的全部秘密。没有哪一刻引擎是"专门停下来做重配"的。
+
+（架构模型图上，`progress()` 四路分派与 `run_busy_loop` 钩子全落在 EngineCore 大框「执行与并行」组里新长的橙色块 ElasticEPScalingState 上——站号 3–9，本章前半的每一行都在这块里。）
 
 钩子还藏了两个收尾细节：
 
@@ -691,6 +696,8 @@ def _progress_removing_engine(self) -> bool:
 
 放下分布式，来看本章第二条线——它清爽得像换了本书。
 
+（架构模型图上，我们从 EngineCore 大框「执行与并行」组里出来，拐进输出处理区——OpenAIServingResponses 及它腹地里的 `construct_input_messages` 与 `HarmonyContext`，站号 13–18。）
+
 Responses API 的卖点是**有状态会话**：客户端第一轮发"我叫 Bob"，拿到一个 `response.id`；第二轮只发"我叫什么？"外加 `previous_response_id` 指向上一轮，服务器就能答出"Bob"。客户端不必自己背着全部历史。这意味着服务器侧得替它记住前文。
 
 入口是 `OpenAIServingResponses.create_responses`。多轮的故事从取回上一轮开始：
@@ -881,6 +888,8 @@ harmony 是另一种消息格式，拼接走 `_construct_input_messages_with_har
 ```
 
 末行 `self._messages.extend(output_msgs)` 就是整个有状态会话的"自动留存"机制：harmony parser 把输出 token 解析成消息，`extend` 进 `_messages`——而 `_messages` 就是 `msg_store` 里那条 list。**写一处，两处都有。**
+
+（架构模型图上，这个共享 object 落在 `HarmonyContext`——站号 17；它持有的 `_messages` 和 `msg_store` 指向同一个 list，写一端就存在了两端。）
 
 最后生成收尾时，`response_store` 也落库本轮 response：
 

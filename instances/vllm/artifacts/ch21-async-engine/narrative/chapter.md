@@ -1,10 +1,13 @@
 # 第 21 章 异步通信与数据并行：惰性 PP 同步、wave 共识、负载均衡
 
-![你在这里](../diagrams/roadmap.png)
+## 你在这里
 
-> *上一章把分布式集合通信原语铺到了桌面上：all-reduce、isend、irecv。*
-> *本章把这些原语用到两件真正难的事上——让流水线并行的 wait 推迟到最后一刻，让多个数据并行引擎对「全体是否继续」达成共识。*
-> *再往后，MoE 与专家并行会把「全员必须同步」这条铁律推到极致。*
+![你在这里：全书架构模型已读 11 个组件，本章在 IPC 边界层展开一个新的橙色组件——DPCoordinator，居中收引擎 stats 与 wave 信号、广播给前端做负载均衡](../diagrams/arch-model.png)
+
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是 [第 1 章](../../ch01-config-and-wiring/narrative/chapter.md) 那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、IPC 边界（进程间通信层）、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
+> *本章新长的是 **IPC 边界**层里一个单独橙色组件：`DPCoordinator`（协调进程），居中收所有引擎上报的 stats 与 wave 信号、聚合后广播给所有前端做负载均衡、再在全体暂停时发 `START_DP_WAVE` 唤醒。本章 11 站只有站 8 落在这个新组件上；走线的主体——从入口配置、输入处理、IPC 通道，到 EngineCore 循环、KV 缓存、Worker 执行器——全是前面已讲的蓝色组件。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *[第 20 章](../../ch20-worker-and-model-runner/narrative/chapter.md) 的 Worker 执行模型给本章铺了 `execute_model` 这条线——惰性 PP 收发就插在这条线的中间；DP wave 共识退到 EngineCore 忙循环里对齐所有 DP 引擎的步调；DP 协调进程再回到 IPC 边界层，把负载均衡和唤醒链路补上。三块地理上分属 EngineCore 的执行与并行组、循环本体组、IPC 边界层，但串成一条依赖链：惰性收发靠 Worker、wave 靠忙循环、协调靠 IPC。*
+> *往后 MoE 与专家并行会把「全员必须同步」这条铁律推到极致——本章的 wave 共识与 dummy batch 凑数，正是在那里被依赖。*
 
 本章的源码主线落在四个文件上：`vllm/v1/worker/gpu_worker.py`（惰性 PP 收发）、`vllm/v1/engine/core.py`（DP wave 忙循环）、`vllm/v1/engine/coordinator.py`（协调进程）、`vllm/v1/engine/core_client.py`（负载均衡客户端）。
 
@@ -216,7 +219,7 @@ GPU、NCCL 都在容器里，但这套控制流是纯 Python，可以在普通�
 
 ## DP wave 共识：让多个引擎齐步走
 
-切换到第二个机制。数据并行下，整个引擎被复制成 $`N`$ 份（DP rank 0 到 $`N-1`$ ），每份独立吃请求。问题来了：**为什么这些独立的引擎还需要互相同步？**
+切换到第二个机制。从架构模型图上看，现在退出 Worker 的 `execute_model`，进入 EngineCore 框左上角「循环本体」的 `run_busy_loop`——惰性收发优化单 Worker 内的通信，wave 共识则要对齐全体 DP 引擎的步调。数据并行下，整个引擎被复制成 $`N`$ 份（DP rank 0 到 $`N-1`$ ），每份独立吃请求。问题来了：**为什么这些独立的引擎还需要互相同步？**
 
 答案藏在 MoE（mixture of experts）里。MoE 层每个 token 只激活一小批专家，路由函数决定送给哪个；而专家切到多个 DP rank 上时，token 不可本地路由（token 在 rank 0、目标专家在 rank 2），只能**跨 rank 收发激活值**——这正是 all-to-all：每个 rank 把自己要发给别人的 token 切片打包，同时收取别的 rank 发来的。all-to-all 是集合操作，**要求全员到场**——如果 rank 0 还在跑第 100 步、rank 1 因为没请求提前退出了，rank 0 的 all-to-all 就会永远等不到 rank 1，整个集群 **hang 死**。
 
@@ -397,7 +400,7 @@ def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
 
 ## DP 协调进程与负载均衡
 
-最后一个机制。DP 部署是 **N 个前端 API server × M 个引擎** 的拓扑。前端要把请求分给最空的引擎，引擎要把 wave 状态同步给前端。如果让每个前端各自去和每个引擎 all-reduce、各自广播， $`N \times M`$ 条通路会乱成一团。
+从架构模型图上看，现在离开 EngineCore 框，退一层到 IPC 边界——那个橙色的 `DPCoordinator` 组件，正是本节要拆开的内容。最后一个机制。DP 部署是 **N 个前端 API server × M 个引擎** 的拓扑。前端要把请求分给最空的引擎，引擎要把 wave 状态同步给前端。如果让每个前端各自去和每个引擎 all-reduce、各自广播， $`N \times M`$ 条通路会乱成一团。
 
 vLLM 的做法是塞一个**独立的协调进程** `DPCoordinator` 居中：所有引擎把负载和 wave 信号汇报给它，它聚合后单点广播给所有前端。前端之间、引擎之间不直接对话，全走协调进程这个枢纽。
 

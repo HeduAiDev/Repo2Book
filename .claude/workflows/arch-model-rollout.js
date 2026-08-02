@@ -11,14 +11,11 @@ export const meta = {
 // ⚠️ args 注入不可靠 → CFG 为准（换批改 CFG.chapters）。
 const CFG = {
   instance: 'vllm',
-  // 批次2 补跑(retry #2):只剩 prose 因 fable 失败的 6 章(图已全部就绪, prose 现已走主模型)
+  // 批次3 补修:ch29+ch35 图数据修正后重渲重盲审, ch30 arch-model 已就绪仍缺 prose
   chapters: [
-    'ch11-engine-core',
-    'ch16-kv-cache',
-    'ch17-worker-and-executor',
-    'ch18-model-runner',
-    'ch19-model-runner',
-    'ch20-distributed-parallelism',
+    'ch29-model-architecture',
+    'ch30-sampling',
+    'ch35-pd-disaggregation',
   ],
 }
 const A = (typeof args !== 'undefined' && args && args.chapters && args.chapters.length) ? args : CFG
