@@ -29,6 +29,8 @@ req_state.logprobs_processor.update_from_output(engine_core_output)
 
 末尾我们还会回到 `output_processor.py`，看这些容器怎么被 `_new_completion_output` 在 DELTA / FINAL 模式下取走，装进 `CompletionOutput`。
 
+这里有必要先交代一句本章反复说的"OpenAI 兼容"到底指什么。OpenAI 的 Chat Completions API（`/v1/chat/completions`）支持 `logprobs` 参数（布尔，打开后每个输出 token 位置附带 `token`（文本）、`logprob`（对数概率）和 `bytes`（原始 UTF-8 字节数组）三个字段）和 `top_logprobs` 参数（整数，每位置额外返回 top-N 候选及其对数概率/bytes）。本章装配的 `logprobs` / `prompt_logprobs` 最终通过 `CompletionOutput` 返回出去——vLLM 做的不是照抄 OpenAI 的实现，而是对齐这份接口的 **形状**。值得留意的是，OpenAI 自家规范里也保留了 `bytes` 字段，官方理由是"对复现 emoji 和特殊字符有用"——这正好印证了多字节字符被 tokenizer 拆开后单 token 文本不可靠，是整个 OpenAI 兼容生态的通用问题，不是 vLLM 独有的怪癖。接口规范详见 [OpenAI 官方 Cookbook](https://cookbook.openai.com/examples/using_logprobs)。
+
 为了能在本地（无 GPU）把这套逻辑亲手跑一遍、打断点看数值，本章配了一份**只做减法**的精简版：和真实 vLLM 同名、同结构、同控制流，只删掉与 logprobs 正交的编排逻辑（队列归并、统计、并行采样合并等），装配主流程、字节回退算法、累计跟踪、flat/nested 分叉一字不差。它是"跑起来看数值"的交叉验证物，正文主线仍是真实源码。
 
 ![本章地图：双路分派→字节回退修正→下游取用的源码剖面](../diagrams/chapter-map.png)
@@ -368,7 +370,7 @@ assert p.cumulative_logprob is None            # prompt 不维护累计
 
 ### 10.5.1 坑从哪来
 
-BPE / SentencePiece 这类 tokenizer 有个 **byte-fallback** 机制：碰到词表里没有的罕见字符，就退化成按字节编码。一个中文字"中"的 UTF-8 是三个字节 `E4 B8 AD`，byte-fallback 会把它拆成三个 byte 级 token。
+现代 LLM 常用的子词分词器——BPE（Byte Pair Encoding，字节对编码）算法和 SentencePiece（Google 开源的多算法分词库）这类工具——有一个 **byte-fallback** 机制：碰到词表里没有的罕见字符，不映射成丢失信息的通用 `<unk>` token，而是退化成按该字符的 UTF-8 字节编码、每个字节各当作一个 token。（早期分词器的做法正是直接扔 `<unk>`——多个不同的罕见字符解码后全变成同一个无意义占位符，模型分不清它们、logprobs 也无法还原原文本；byte-fallback 的设计取舍是"宁拆字节，不扔信息"。）一个中文字"中"的 UTF-8 是三个字节 `E4 B8 AD`，byte-fallback 会把它拆成三个 byte 级 token。
 
 平时这没问题——增量去 token 会攒齐字节再吐字（第 9 章）。但 logprobs 这里走的是**孤立逐 token 解码**（§10.3 的 `convert_ids_list_to_tokens`）。你单独 `tokenizer.decode([0xE4])`，只有一个字节、凑不齐一个 UTF-8 字符，Python 只能给你一个替换字符 `�`（U+FFFD）。
 
@@ -416,7 +418,7 @@ def _get_sampled_context_ids(
 
 三个要点：
 
-- **只取最近 ≤4 个**。`start = max(0, n - max_context)`，`max_context=4`。为什么是 4？因为 UTF-8 单个字符最多 4 字节，所以任何一个没拼完的多字节序列，至多跨 4 个 byte-fallback token。4 个上下文 token 一定够把它拼全——这是个数学上界，不是拍脑袋。
+- **只取最近 ≤4 个**。`start = max(0, n - max_context)`，`max_context=4`。为什么是 4？因为 UTF-8 单个字符最多 4 字节（RFC 3629 规定的硬上界，2003 年从早期 6 字节收紧为 4，对齐 Unicode 约 100 万码位的上限），所以任何一个没拼完的多字节序列，至多跨 4 个 byte-fallback token。4 个上下文 token 一定够把它拼全——这是个数学上界，不是拍脑袋。
 - **每位置取"第一个 entry"**。无论 flat 还是 nested，取的都是每个位置的第一个 token id。这正是 §10.3 立下的不变式：`append_logprobs_for_next_position` 总把被采样/被选中的 token 第一个写入。所以 FlatLogprobs 直接走 `token_ids[start_indices[i]]`（`start_indices[i]` 是位置 `i` 在扁平 `token_ids` 列表里的起始下标，§10.6 详述该结构，这里只需知道它指向该位置的第一个候选），nested 走 `next(iter(entry))`（dict 的第一个 key）。两条路殊途同归。
 - **flat 路径跳过空位置**。`if start_indices[i] < end_indices[i]`——prompt 首位那个 `append(None)` 写出的是个零长度区间（start == end），它没有真实 token，得跳过。
 

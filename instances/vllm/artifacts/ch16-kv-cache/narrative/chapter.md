@@ -175,6 +175,8 @@ def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
 
 `chunk=8`、`num_computed=13`：`13 // 8 * 8 = 8`——跳过前 8 个（整整一个 chunk），当前 chunk 内的 8\~12 保留。`num_computed=7`（还没跨过第一个 chunk 边界）：`7 // 8 * 8 = 0`，一个不跳。
 
+顺带背景：滑动窗口注意力在生产级 LLM 中的里程碑是 [Mistral 7B](https://arxiv.org/abs/2310.06825)（2023，窗口 4096），它证明 SWA 可以真正省显存而非学术玩具；分块本地注意力被 [Llama 4 的 iRoPE 架构](https://blog.vllm.ai/2025/04/05/llama4.html)（2025）推入主流——chunk=8192，搭配一层无位置编码的全注意力层兜底全局上下文。两者目标一致（把 KV cache 从线性增长压成常数），分歧全在「附近」怎么定义——而这恰好是上面两条公式长得不一样的根本原因。
+
 三种注意力，三种 `get_num_skipped_tokens`，这就是本章「各注意力类型差异」的第一个落点。精简版 `test_full_attention_never_skips`、`test_sliding_window_skipped_tokens`、`test_chunked_local_skipped_tokens_rounds_to_chunk` 把三条公式各钉了几个数值点。
 
 ### 释放：换 null，不删除
@@ -346,6 +348,8 @@ if apply_admission_cap and self._max_admission_blocks_per_request is not None:
 # Drift between the two would re-introduce the deadlock from
 # issue #39734 or, worse, mid-prefill OOM.
 ```
+
+（注：issue #39734 是调度器整体准入闸 `can_fit_full_sequence` 级的死锁，本章的准入上限修的不是同一段代码，而是汲取了**同类教训**——任何时候估算口径与实际执行不一致，都可能在另一处触发死锁或 OOM。）
 
 解法是**单一真相源**：准入上限和启动池估算用**同一个** spec 方法算出来。看 `get_manager_for_kv_cache_spec` 怎么注入这个上限：
 
@@ -791,6 +795,8 @@ L \in \{0,\ \mathrm{lcm},\ 2\cdot\mathrm{lcm},\ \dots\}
 
 这是单调量 + 离散下界保证终止性的标准论证。
 
+这个「单调有界保证收敛到不动点」的论证骨架，在计算机科学里最经典的落地是编译器的数据流分析（Kildall 1973）：程序点的分析信息随传递函数反复收紧直至不动——和本章候选命中长度逐个注意力类型收紧到共识，同一套模式（CMU 编译原理课有[一份讲义](https://www.cs.cmu.edu/afs/cs/academic/class/15745-s13/public/lectures/L5-Foundations-of-Dataflow-1up.pdf)把这种「迭代到不动点」的 worklist 算法讲得很清楚）。
+
 simple hybrid 为什么一轮足够？full 排首给出上界，唯一的 other 类型在这个上界处至多缩短一次。下一轮 full 走 `continue` 不会再缩；other 在新的更短长度处——它在更长的上界已经命中了这个长度，在更短处必然还命中（同样是下闭包），接受。第二轮谁都不缩，本就该退。所以代码直接 `break` 省掉这必然空转的第二轮。精简版 `test_hybrid_simple_hybrid_flag` 验证「1 full + 1 other」时 `is_simple_hybrid` 为真。
 
 ### 复杂度：贵在哪、省在哪
@@ -815,5 +821,7 @@ simple hybrid 为什么一轮足够？full 排首给出上界，唯一的 other 
 - **Hybrid 不动点迭代**：每类型对候选长度「接受或缩短」，缩短即重启；单调递减 + lcm 倍数离散下界 0 保证至多 $`L/\mathrm{lcm}`$ 轮收敛；full 排首给紧上界 + 下闭包早停 + simple hybrid 一轮，把常见情形压回 Unitary 量级。
 
 这一章也是 KV 缓存子系统的收尾。从 [第 15 章](../../ch15-kv-cache/narrative/chapter.md) 的块、队列、哈希、命中，到这一章的三阶段分配与多注意力协调，分页 KV 缓存的「显存怎么切、怎么分、怎么省」算讲透了。
+
+vLLM 官方也有一篇 [Hybrid KV Cache Manager 设计文档](https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager.html)，用另一套语言复述了不动点迭代的等价直觉（全注意力左到右扫、滑窗右到左扫、取交集），与本章的代码级推演互为补充——不过文档标注该功能「仍处早期阶段，设计可能会变」。
 
 但有一个前提一直被我们当作给定：那个 `num_gpu_blocks`——块池到底有多少块——是哪来的？它不是拍脑袋定的，而是 Worker 在启动时**实测**显存、profiling 出来的。下一章离开 KV 缓存的核心，转向 Executor 与 Worker 的生命周期，看这些块在被分配之前，是怎么被「数」出来的。

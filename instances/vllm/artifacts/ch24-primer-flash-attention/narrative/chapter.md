@@ -272,11 +272,11 @@ vLLM 侧对这套访存优化的落地面，体现在它怎么给 kernel 喂数�
 
 *图 34-5　外层循环 KV→Q 行块(序列并行);中间 O 不每步归一、收尾除一次(省 non-matmul FLOP);只存 L=m+log(l);warp 分工 split-K→split-Q。*
 
-1. **循环序对调**(arXiv:2307.08691 §3.1 Algorithm 1；并行动机见 §3.2 Parallelism):初版外层遍历 $`K,V`$ 块，FA-2 改成**外层遍历 $`Q`$ 行块**。这样不同 $`Q`$ 行块能分给不同的 thread block(线程块，GPU 上被整体调度到一个 SM 的一批线程),沿序列长度并行，长序列时 GPU 的 occupancy(占用率，SM 上活跃 warp 的比例)更高。
+1. **循环序对调**(arXiv:2307.08691 §3.1 Algorithm 1；并行动机见 §3.2 Parallelism):初版外层遍历 $`K,V`$ 块，FA-2 改成**外层遍历 $`Q`$ 行块**。这样不同 $`Q`$ 行块能分给不同的 thread block(线程块，GPU 上被整体调度到一个 SM 的一批线程),沿序列长度并行，长序列时 GPU 的 occupancy(占用率，SM 上活跃 warp——GPU 里 32 个线程一组的调度单位——的比例)更高。
 
-2. **推迟归一化**(arXiv:2307.08691 §3.1.1):初版每处理一个 KV 块都要除一次 $`\ell`$;FA-2 让中间 $`O`$ 保持未归一化，**只在收尾除一次**。这削减了昂贵的 non-matmul FLOP(非矩阵乘浮点运算，指 softmax、除法、exp/log 这类逐元素与归约运算——它们跑在通用计算单元上，而矩阵乘跑在专用的 Tensor Core 上)——在 A100 上，Tensor Core 的 matmul 吞吐比 non-matmul 高约 16×(arXiv:2307.08691 §3.1),于是每一条非矩阵乘指令都相对昂贵，能省则省。
+2. **推迟归一化**(arXiv:2307.08691 §3.1.1):初版每处理一个 KV 块都要除一次 $`\ell`$;FA-2 让中间 $`O`$ 保持未归一化，**只在收尾除一次**。这削减了昂贵的 non-matmul FLOP(非矩阵乘浮点运算，指 softmax、除法、exp/log 这类逐元素与归约运算——它们跑在通用计算单元上，而矩阵乘跑在专用的 Tensor Core 上)——在 A100 上，Tensor Core(GPU 上专用于矩阵乘加的硬件单元，单条指令并行处理多个小矩阵的乘累加)的 matmul 吞吐比 non-matmul 高约 16×(arXiv:2307.08691 §3.1),于是每一条非矩阵乘指令都相对昂贵，能省则省。
 
-3. **只存一个标量**(arXiv:2307.08691 §3.1.1):初版存 $`(m,\ell)`$ 两个量，FA-2 只存 logsumexp $`L=m+\log(\ell)`$ 一个。backward 和合并都只需要它。warp(GPU 里 32 个线程一组的调度单位)分工也从 split-K 改为 **split-Q**(arXiv:2307.08691 §3.3 Work Partitioning):split-K 让每个 warp 各算 $`K`$ 维的一段、再跨 warp 把各自的部分结果加起来，逼着 warp 之间反复读写 shared memory 做同步；split-Q 改成每个 warp 认领一段 $`Q`$ 行、各自独立算完自己那几行的完整输出，warp 间不必再通信——省掉的正是这笔 shared-memory 往返。
+3. **只存一个标量**(arXiv:2307.08691 §3.1.1):初版存 $`(m,\ell)`$ 两个量，FA-2 只存 logsumexp $`L=m+\log(\ell)`$ 一个。backward 和合并都只需要它。warp 分工也从 split-K 改为 **split-Q**(arXiv:2307.08691 §3.3 Work Partitioning):split-K 让每个 warp 各算 $`K`$ 维的一段、再跨 warp 把各自的部分结果加起来，逼着 warp 之间反复读写 shared memory 做同步；split-Q 改成每个 warp 认领一段 $`Q`$ 行、各自独立算完自己那几行的完整输出，warp 间不必再通信——省掉的正是这笔 shared-memory 往返。
 
 ![重绘自 arXiv:2307.08691 Fig.3：warp 间工作划分：split-K(FlashAttention) vs split-Q(FlashAttention-2)](../diagrams/paper-fig-3.png)
 

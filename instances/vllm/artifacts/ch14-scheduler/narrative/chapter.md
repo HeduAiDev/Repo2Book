@@ -109,7 +109,9 @@ if preempted_req == request:
 
 > *图注：`allocate_slots` 失败（红箭头）就 LIFO 抢 RUNNING 末尾、执行 `_preempt_request`，然后回到分配重试（左侧灰色回环）；直到要到块（绿箭头 break 调度）或连自己都抢了（底部 break 放弃）。注意抢占是「丢弃重算」——`_preempt_request` 里 free 掉 KV 块、把 `num_computed_tokens` 清零，不做任何 CPU 换出。*
 
-这里值得停一下，对比一下别的引擎的做法。很多推理系统遇到内存压力，会把被抢请求的 KV 缓存**换出（swap）到 CPU 内存**，等内存松了再换回来。这样被抢请求不用重算。vLLM v1 **不这么做**——它直接把 KV 块还给块池，被抢请求回头从 0 重新 prefill。
+这里值得停一下，对比一下这个设计选择的背景。换出（swap）和重算（recomputation）这两条路，最早正是在 vLLM 自己的奠基论文《Efficient Memory Management for Large Language Model Serving with PagedAttention》（Kwon et al., SOSP 2023）里**并列提出**的[^pagedattention]：论文原话讲 swapping 是把驱逐的 KV 块拷贝到 CPU 内存，讲 recomputation 是被抢占后把已生成 token 与原始 prompt 拼成一个新 prompt、用一次 prefill 迭代批量重算所有位置的 KV——重算延迟可显著低于原始逐个 decode 的延迟。论文提出了两条路；到 vLLM v1（本书 pin 的版本）选择了只留后者——直接把 KV 块还给块池，被抢请求回头从 0 重新 prefill。
+
+[^pagedattention]: Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention," SOSP 2023, [arXiv:2309.06180](https://arxiv.org/abs/2309.06180). 官方文档也确认 V1 默认抢占模式为 recomputation 而非 swap（[Optimization and Tuning](https://docs.vllm.ai/en/stable/configuration/optimization/)）。
 
 为什么宁可重算也不换出？换出换入要走 PCIe，KV 缓存动辄几 GB，I/O 开销大、还得管理 CPU 侧的缓冲区。而 vLLM 有一张底牌：前缀缓存。被抢请求回 `waiting` 重新调度时，它之前算过的那些 token 的前缀块，只要还没被别的请求挤掉，就能直接命中、跳过重算。
 
@@ -237,7 +239,9 @@ if not preempted_reqs:
 - 等结构化输出的语法对象编译好（约束解码，`WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR`）；
 - 等流式输入的下一段（多轮会话，`WAITING_FOR_STREAMING_REQ`）。
 
-这些叫**阻塞态**。问题来了：如果一个阻塞态请求恰好排在 FCFS 队头，而 FCFS 必须按顺序来——它没准备好，就轮不到后面的人。哪怕队头后面排着 $`N`$ 个「完全可以跑」的请求，全被这一个堵在身后**饿死**——单队列下队头阻塞的代价是 $`O(N)`$ 个本可调度的请求被白白拖住，吞吐塌缩到 0。
+这些叫**阻塞态**。问题来了：如果一个阻塞态请求恰好排在 FCFS 队头，而 FCFS 必须按顺序来——它没准备好，就轮不到后面的人。哪怕队头后面排着 $`N`$ 个「完全可以跑」的请求，全被这一个堵在身后**饿死**——这就是经典的**队头阻塞**（Head-of-Line Blocking, HOL blocking），它在网络交换机、HTTP/2 等系统里也是反复出现的标准问题，解法都是「分开排队」（虚拟输出队列 / VOQ）[^hol]；在这里单队列下的代价是 $`O(N)`$ 个本可调度的请求被白白拖住，吞吐塌缩到 0。
+
+[^hol]: 1980-90 年代输入缓冲交换机研究就揭示了单 FIFO 队列的 HOL blocking 导致吞吐上限仅约 58.6%（Karol et al.），业界的标准解法是给不同目的端口各自排一队（虚拟输出队列）。随后 HTTP/1.1（同一连接串行响应）到 HTTP/2（应用层复用但底层 TCP 丢包仍阻塞）再到 HTTP/3（换用 QUIC/UDP，在传输层不阻塞不相关流）的演进，本质上都是不断解决更高层的 HOL blocking。深入读者可参阅 [Head-of-Line Blocking 词条](https://en.wikipedia.org/wiki/Head-of-line_blocking)。
 
 vLLM 的解法：把阻塞态请求**隔离**到第二个队列 `skipped_waiting`，让可调度的请求在 `waiting` 里畅通无阻。隔离后，每个阻塞请求只是被 $`O(1)`$ 地 `pop` + `prepend` 跳过一次，后面 $`N`$ 个可调度请求照常前进；单拍的额外代价不过是最多遍历两队总长一遍，即每拍 `peek`/`pop` 次数满足：
 
@@ -414,7 +418,7 @@ for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
 
 这段信息密度高，拆成几块看。
 
-**投机解码回退。** 投机解码（speculative decoding）会先用一个小模型猜几个「草稿 token」，再用大模型一次性验证。验证时可能拒掉一部分。`num_draft_tokens` 是猜了几个，`num_accepted = len(generated_token_ids) - 1`（接受的数量，减 1 是因为总有一个「bonus token」是大模型自己出的、不算草稿），`num_rejected` 是被拒的。
+**投机解码回退。** 投机解码（speculative decoding）会先用一个小模型猜几个「草稿 token」，再用大模型一次性验证。验证时可能拒掉一部分。这套「先猜后验」的机制由两个研究组在 2023 年初几乎同时独立提出——Leviathan 等人（Google Research, [arXiv:2211.17192](https://arxiv.org/abs/2211.17192)）与 Chen 等人（DeepMind, [arXiv:2302.01318](https://arxiv.org/abs/2302.01318)）——核心贡献是证明了带拒绝采样的验证过程产出的 token 序列，在分布上与直接从目标模型逐个采样完全等价：不是近似加速，是**无损加速**。`num_draft_tokens` 是猜了几个，`num_accepted = len(generated_token_ids) - 1`（接受的数量，减 1 是因为总有一个「bonus token」是大模型自己出的、不算草稿），`num_rejected` 是被拒的。
 
 为什么要回扣计数？因为调度这些草稿 token 时，调度器**乐观地**把它们算进了 `num_computed_tokens`——假设全被接受。一旦有草稿被拒，这部分计数就是虚的，必须回退：
 

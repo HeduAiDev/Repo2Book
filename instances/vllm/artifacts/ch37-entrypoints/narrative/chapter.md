@@ -135,7 +135,7 @@ for out in outputs:
 
 `getenv(..., "1")`——你不设它，它就是 `1`，就是 `True`。
 
-所以默认情况下，那个 `if` 必然进，`enable_multiprocessing` 必然变 `True`，`multiprocess_mode=True` 必然传给 `LLMEngine.__init__`。形参默认值 `False` 在实践中**从来不会生效**。这就是为什么"离线 = 进程内"是错的：决定权根本不在那个形参手里，而在这个默认开启的环境变量手里。默认开启多进程的理由也很直接：把 EngineCore 隔离在独立进程里，既避开了 Python GIL 对主进程 CPU 端（tokenize、输出装配）的争抢，也让 GPU 侧崩溃不会把整个应用进程带死。
+所以默认情况下，那个 `if` 必然进，`enable_multiprocessing` 必然变 `True`，`multiprocess_mode=True` 必然传给 `LLMEngine.__init__`。形参默认值 `False` 在实践中**从来不会生效**。这就是为什么"离线 = 进程内"是错的：决定权根本不在那个形参手里，而在这个默认开启的环境变量手里。默认开启多进程的理由也很直接：把 EngineCore 隔离在独立进程里，既避开了 Python GIL（Global Interpreter Lock，全局解释器锁——单个 Python 进程内同一时刻只允许一个线程执行 Python 字节码，独立进程各持一把 GIL、互不阻塞）对主进程 CPU 端（tokenize、输出装配）的争抢，也让 GPU 侧崩溃不会把整个应用进程带死。
 
 > 用精简版亲手验证这一点很简单：构造一个 `LLM`，看它内部的引擎客户端是哪个类。默认下你会拿到 `SyncMPClient`；只有把 `VLLM_ENABLE_V1_MULTIPROCESSING=0` 显式关掉，才会回退到 `InprocClient`。
 
@@ -217,7 +217,7 @@ class EngineCoreClient(ABC):
     """
 ```
 
-注意这行注释——`SyncMPClient: ... (for LLM)`。vLLM 自己的代码注释就直说了：离线 `LLM` 用的是 `SyncMPClient`。而 `InprocClient` 标的是 `(for V0-style LLMEngine use)`——V0 风格的进程内用法。这是源码级的盖章：离线默认不是进程内。
+注意这行注释——`SyncMPClient: ... (for LLM)`。vLLM 自己的代码注释就直说了：离线 `LLM` 用的是 `SyncMPClient`。而 `InprocClient` 标的是 `(for V0-style LLMEngine use)`——V0（vLLM 旧版引擎架构，单进程内直接调度、无独立 EngineCore 进程）风格的进程内用法。这是源码级的盖章：离线默认不是进程内。
 
 下面分别看这两个客户端长什么样，对照着看最清楚。
 
@@ -520,7 +520,7 @@ class InprocClient(EngineCoreClient):
 
 `embed` = `encode(pooling_task="embed")` + 逐个 `EmbeddingRequestOutput.from_base` 包一层。它代表整个 pooling 家族——`classify`、`score` 等也是类似的"换守卫 + 换预/后处理 + 复用中间脊"的套路，本章不逐一展开。要点是：**四个入口的形态差异都在两头，中间那条同步驱动的脊是共享的。**
 
-> **v0.21.0 更新**：除了上面这些"喂数据—取结果"的任务方法，`LLM` 的公共面还新增了一对**权重热更新**控制方法，把一轮权重回灌显式括成事务——服务于训练—推理同进程（如 RL）下"用新权重原地换掉旧权重"的场景：
+> **v0.21.0 更新**：除了上面这些"喂数据—取结果"的任务方法，`LLM` 的公共面还新增了一对**权重热更新**控制方法，把一轮权重回灌显式括成事务——服务于训练—推理同进程（如 RL——Reinforcement Learning 强化学习，训练循环中需要频繁换权重来做推理采样）下"用新权重原地换掉旧权重"的场景：
 >
 > ```python
 > # vllm/entrypoints/llm.py:L1925 (start_weight_update)
@@ -530,7 +530,7 @@ class InprocClient(EngineCoreClient):
 > #   self.llm_engine.collective_rpc("finish_weight_update")
 > ```
 >
-> `start_weight_update(is_checkpoint_format=True)` 经 `collective_rpc` 向所有 worker 广播"开窗"（`is_checkpoint_format=True` 表示来料是 checkpoint 格式、需逐层处理，否则是可直拷的 kernel 格式），中间批量灌入新权重，最后 `finish_weight_update()` 广播"闭窗"收尾。这与第 4 章在线 `AsyncLLM` 的 `start_weight_update`/`finish_weight_update` 完全对称——同一套事务语义，一个走同步 `collective_rpc`、一个走异步。这里只是用户面的"开窗—闭窗"两段；窗口内每个 worker 究竟如何分阶段接收并就地替换权重，是[第 17 章：Worker 与 Executor](../../ch17-worker-and-executor/narrative/chapter.md) 的话题。
+> `start_weight_update(is_checkpoint_format=True)` 经 `collective_rpc` 向所有 worker 广播"开窗"（`is_checkpoint_format=True` 表示来料是 checkpoint 格式（如 `model.safetensors`，需逐层解析键名映射到模型参数名）、需逐层处理；`False` 表示来料已对齐成可直接 `copy_` 写入的 kernel 格式（张量已在 GPU 上、形状/精度与模型参数一致）），中间批量灌入新权重，最后 `finish_weight_update()` 广播"闭窗"收尾。这与第 4 章在线 `AsyncLLM` 的 `start_weight_update`/`finish_weight_update` 完全对称——同一套事务语义，一个走同步 `collective_rpc`、一个走异步。这里只是用户面的"开窗—闭窗"两段；窗口内每个 worker 究竟如何分阶段接收并就地替换权重，是[第 17 章：Worker 与 Executor](../../ch17-worker-and-executor/narrative/chapter.md) 的话题。
 
 ---
 
@@ -578,7 +578,7 @@ class InprocClient(EngineCoreClient):
 
 **只要还有未完成的请求，就 `step()` 一拍。** 单线程、阻塞、串行。没有事件循环、没有背景协程、没有 `await`。主线程亲自堵在 `step()` 上，一拍一拍把后台 EngineCore 往前推。
 
-每拍 `step()` 返回若干输出。`assert isinstance(output, output_type)` 校验类型（前面 `generate` 钉的 `RequestOutput`、`encode` 钉的 `PoolingRequestOutput` 在这儿兑现）。只收 `output.finished` 的——因为 `FINAL_ONLY`，一个请求只会在完成那一拍 `finished=True`、产出一次。开着 `use_tqdm` 时还顺手更新进度条、估算 toks/s（那段细节与主线无关，省略）。
+每拍 `step()` 返回若干输出。`assert isinstance(output, output_type)` 校验类型（前面 `generate` 钉的 `RequestOutput`、`encode` 钉的 `PoolingRequestOutput` 在这儿兑现）。只收 `output.finished` 的——因为 `FINAL_ONLY`，一个请求只会在完成那一拍 `finished=True`、产出一次。开着 `use_tqdm`（Python 生态最通用的终端进度条库，`_run_engine` 用它实时刷新已完成请求数并估算吞吐）时还顺手更新进度条、估算 toks/s（那段细节与主线无关，省略）。
 
 `step()` 一拍内部干什么，进 `LLMEngine.step` 看：
 
@@ -624,7 +624,7 @@ class InprocClient(EngineCoreClient):
 终止性来自一个**单调递减的非负量**：未完成请求数。设进入循环时有 `N` 个未完成请求。
 
 - **基例**：初始 `N` 是有限的（就是你提交的那批，外加 `n>1` 扇出的子请求，仍是有限）。
-- **归纳步**：每拍 `step()` 后，已 `finished` 的请求被移出未完成集合，故 `N` **单调不增**（某些拍可能 0 个完成、某些拍多个完成，并非每拍恰好减 1）。又因每个请求的生成长度有上界——要么撞上 `max_tokens`、要么生成 EOS、要么命中 stop string——它必在**有限拍**内被移出，故 `N` 不会永远停滞。
+- **归纳步**：每拍 `step()` 后，已 `finished` 的请求被移出未完成集合，故 `N` **单调不增**（某些拍可能 0 个完成、某些拍多个完成，并非每拍恰好减 1）。又因每个请求的生成长度有上界——要么撞上 `max_tokens`、要么模型自己生成 EOS（End of Sequence token，模型的「说完了」终止符）、要么命中 stop string——它必在**有限拍**内被移出，故 `N` 不会永远停滞。
 - **收敛**：`N` 是单调不增的非负整数，且每个请求最终必减出去，因此有限拍后 `N` 归零，`has_unfinished_requests()` 返回 `False`，循环 break。
 
 换句话说：每个请求的生成长度有上界 → 它必在有限拍内被移出未完成集合 → 非负整数 `N` 单调不增且终将归零 → 循环必然终止。

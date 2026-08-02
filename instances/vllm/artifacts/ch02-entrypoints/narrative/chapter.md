@@ -30,10 +30,10 @@
 这张图的核心是 vLLM v1 的**三段式异步解耦**——它在 `vllm/v1/engine/async_llm.py` 里被装配起来，整本书反复会用到这个词，这里先讲清它是哪三段：
 
 1. **输入段（API 进程内）**：把用户给的 prompt 校验、分词、组装成一个能跨进程传的 `EngineCoreRequest`。
-2. **引擎段（独立 OS 进程）**：一个叫 `run_busy_loop` 的同步循环不停地「取请求 → 算一拍 → 吐结果」，跑模型前向、采样。它和 API 进程经 ZMQ 通信。
+2. **引擎段（独立 OS 进程）**：一个叫 `run_busy_loop` 的同步循环不停地「取请求 → 算一拍 → 吐结果」，跑模型前向、采样。它和 API 进程经 ZMQ（ZeroMQ，一种无需代理服务器的异步消息库——两端各建一个 socket 就能直接收发消息，不需要像传统消息队列那样先起一个中间人进程；跨进程管线的搭建细节见[第 7 章](../../ch07-engine-core/narrative/chapter.md)）通信。
 3. **输出段（回到 API 进程）**：一个后台协程把引擎吐出来的 token 拉回来，去 token 化、判停止、组装成面向用户的 `RequestOutput`，再交还给等在那里的请求。
 
-为什么要拆成三段、还要把引擎单拎到另一个进程？一句话：**别让模型执行堵死 API 服务器**。模型前向是个被 GIL（全局解释器锁——同一进程内同一时刻只有一个线程能执行 Python 字节码）绑死的重活，如果它和 HTTP 处理挤在同一个 Python 进程，一跑前向，整个事件循环就卡住，别的请求全得排队。把引擎拎进独立进程，API 进程就只剩下轻活——分词、组装、收结果、回 SSE（Server-Sent Events，一种基于 HTTP 长连接的服务器单向推送协议，客户端只需 `GET` 一次就能持续收到增量片段）——一个事件循环能轻松扛住大量并发连接。这条设计主线，[第 4 章](../../ch04-async-llm/narrative/chapter.md) 会从 `AsyncLLM` 的搭建过程整章展开。
+为什么要拆成三段、还要把引擎单拎到另一个进程？一句话：**别让模型执行堵死 API 服务器**。模型前向是个被 GIL（全局解释器锁——同一进程内同一时刻只有一个线程能执行 Python 字节码）绑死的重活，如果它和 HTTP 处理挤在同一个 Python 进程，一跑前向，整个事件循环就卡住，别的请求全得排队。把引擎拎进独立进程，API 进程就只剩下轻活——分词、组装、收结果、回 SSE（Server-Sent Events，一种基于 HTTP 长连接的服务器单向推送协议，客户端只需 `GET` 一次就能持续收到增量片段；它比 WebSocket 更适合 token 流式这种单向推送场景，而且走普通 HTTP、天然穿透代理与负载均衡器，OpenAI 等主流 LLM API 的流式接口也清一色是这个选择）——一个事件循环能轻松扛住大量并发连接。这条设计主线，[第 4 章](../../ch04-async-llm/narrative/chapter.md) 会从 `AsyncLLM` 的搭建过程整章展开。
 
 下面我们就顺着这张图，从入口走到出口。
 
@@ -197,7 +197,7 @@ async def add_request_async(self, request: EngineCoreRequest) -> None:
     self._ensure_output_queue_task()
 ```
 
-`_send_input` 就是把请求用 msgpack 序列化、经 ZMQ socket 发到引擎进程。ZMQ + msgpack + 零拷贝张量这套 IPC 机制是怎么搭的，[第 7 章](../../ch07-engine-core/narrative/chapter.md) 会专门讲。本章只需记住：**这条线是进程边界，过了它请求就离开了 API 进程的地盘**。
+`_send_input` 就是把请求用 msgpack 序列化（msgpack 是一种二进制对象序列化格式，等于「更快更小的二进制 JSON」——不要求先定义 schema，直接把 Python 对象打包成紧凑字节流，对端解码回来即可）再经 ZMQ socket 发到引擎进程。ZMQ + msgpack + 零拷贝张量这套 IPC 机制是怎么搭的，[第 7 章](../../ch07-engine-core/narrative/chapter.md) 会专门讲。本章只需记住：**这条线是进程边界，过了它请求就离开了 API 进程的地盘**。
 
 ---
 
@@ -248,7 +248,7 @@ def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
 3. **`sample_tokens()`**——从 logits 采出这一拍每个请求的下一个 token。采样管线见 [第 30 章](../../ch30-sampling/narrative/chapter.md)。
 4. **`update_from_output()`**——把采出的 token 写回各请求状态、判断谁结束了，组装成 `EngineCoreOutputs` 返回。它的内部簿记 [第 14 章](../../ch14-scheduler/narrative/chapter.md) 一并讲。
 
-这里要建立一个关键直觉：**一拍处理的是「一批」请求，不是一个**。同一拍里，可能有刚进来、正在 prefill（吃 prompt）的请求，也有跑了很久、正在 decode（逐 token 吐）的请求，它们被混在一个连续批里一起算——这就是连续批处理（continuous batching）。所以一个用户请求的「一生」会**横跨很多拍**，每拍只往前挪几个 token。[第 11 章](../../ch11-engine-core/narrative/chapter.md) 会从引擎核心和这个 busy loop 整章讲起。
+这里要建立一个关键直觉：**一拍处理的是「一批」请求，不是一个**。同一拍里，可能有刚进来、正在 prefill（吃 prompt）的请求，也有跑了很久、正在 decode（逐 token 吐）的请求，它们被混在一个连续批里一起算——这就是连续批处理（continuous batching），最早由 Orca 论文（Yu 等，OSDI 2022）以 iteration-level scheduling 的形式提出，后来由行业博客以 continuous batching 的名字推广普及。所以一个用户请求的「一生」会**横跨很多拍**，每拍只往前挪几个 token。[第 11 章](../../ch11-engine-core/narrative/chapter.md) 会从引擎核心和这个 busy loop 整章讲起。
 
 ![连续批处理时间线：每拍混跑多个不同阶段的请求](../diagrams/03-continuous-batching.png)
 

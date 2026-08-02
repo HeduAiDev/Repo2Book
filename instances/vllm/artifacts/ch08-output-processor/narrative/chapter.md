@@ -231,7 +231,18 @@ else:
 
 现在走到第 5 站：离开主轴单循环，钻进本章第一个独立子系统——detokenizer.py 在架构图上没有展开成组件，正文这一节把它讲全。单循环第 ③ 步只有一行 `detokenizer.update(...)`，但这一行背后是 V1 去 token 的全部精华。先讲清"为什么不能简单地一个 token 一个 token 各自解码再拼起来"。
 
-**为什么去 token 必须增量。** BPE/byte-fallback 分词下，相邻 token 的文本边界是**相互依赖**的：一个多字节 UTF-8 字符（比如一个中文字、一个 emoji）可能被切成两个 token，单独解码任何一个都得不到完整字符。所以不能 `decode(单 token)` 再拼接——必须维护跨 token 的解码状态。真实 vLLM 为此有两套 `decode_next` 实现：Fast 走 `tokenizers` 库的 `DecodeStream`（库内部维护状态），Slow 走 Python 的 `detokenize_incrementally`（用 `prefix_offset`/`read_offset` 滑窗）。这两套都属 tokenizer 库内部，本章把它抽象成"给一个 token、吐出它新增的那段文字"这个接口，不展开 byte-fallback 细节。
+**为什么去 token 必须增量。** 现代 LLM 的分词器（Tokenizer）几乎都基于 BPE（Byte Pair Encoding，字节对编码）或其变体。BPE 的核心思路是：把文本切到基础符号（字符或字节），反复把出现频率最高的相邻符号对合并成新词表项，直到词表大小达到预设值。常见词保留整词、罕见词拆成子词——用"子词"折中词表大小（太大则内存爆炸）与序列长度（太长则注意力平方级变慢）。
+
+GPT-2（2019）之后，主流模型大多走 byte-level BPE：把基础符号从 Unicode 字符换成 **256 个原始字节值**。好处是任何文本经 UTF-8 编码后都能落进这 256 个字节，词表从此**消灭未登录词**（`<unk>`，即"词表里没有这个字"的兜底 token）。代价是：训练语料中罕见的字符——如 emoji、非拉丁文字——很可能没能合并成整词 token，推理时被切成好几个"字节 token"。
+
+举个可核实的例子。emoji `✨`（U+2728）的 UTF-8 编码是 3 个字节 `0xE2 0x9C 0xA8`。若分词器没有为这三个字节组合专门保留一个词表项，模型就会把**一个字符**预测成 3 个独立 token（整数 226、156、168）。逐点拆看：
+(1) 单独解码 token `226` 只得到不完整、非法的 UTF-8 片段，**不是任何可显示字符**；
+(2) 必须等 3 个 token 到齐，拼起 `0xE2 0x9C 0xA8`，才能解码出 `✨` 这一个完整字符；
+(3) 所以不能 `decode(单 token)` 再拼接——一个字符可能横跨好几个 token 的边界。这就是为什么去 token 必须**增量**：维护跨 token 的解码状态，攒够一个合法 UTF-8 片段的全部字节才吐出文字。
+
+另一条技术路径——SentencePiece 的 `byte_fallback` 选项（Llama 系模型常用）——殊途同归：对训练时没见过的字符，退化成其 UTF-8 字节序列编码。不管哪条路，结论相同：去 token 必须增量。
+
+真实 vLLM 为此准备了两套 `decode_next` 实现。**Fast 路径**直接调 HuggingFace `tokenizers` 库（Rust 核心 + `tokenizers` Python 包）里的 `DecodeStream`：先建流式解码器 `stream = DecodeStream()`，每来一个新 token 调 `stream.step(tokenizer, token_id)`——它内部缓冲着"还不能确定是不是完整字符"的待决字节，返回这一步新增的文字（`str`），或 `None`（表示当前 token 还凑不出一个合法字符，得接着喂）。这套接口把增量解码状态机完全封装在库内，调用方只管"喂 id、拿文字或 None"。**Slow 路径**是纯 Python 降级实现 `detokenize_incrementally`，用 `prefix_offset`/`read_offset` 滑窗达到等价效果，在 tokenizer 不支持 Fast 路径时兜底。两套解决同一个问题，本章把它们统一抽象成"给一个 token、吐出它新增的那段文字"这个接口。[想深挖 BPE 细节的读者，HuggingFace 官方教程](https://huggingface.co/docs/transformers/tokenizer_summary) 是很好的入口。
 
 来看 `update` 本身的算法（`vllm/v1/engine/detokenizer.py`）——这部分 V1 是自己写的，是本章要讲清的：
 
@@ -466,7 +477,7 @@ def _new_completion_output(
 
 DELTA 与全量的三处分叉对照清楚：`text` 由 `get_next_output_text(finished, delta)` 给出，delta 模式只给新增那段（§8.4）；`token_ids` 在非 delta 下整体取 `output_token_ids`（全量），delta 下用传进来的增量切片；`logprobs` 在 delta 下只切最后 `len(token_ids)` 个，对齐本次发的 token。`index=self.request_index` 是 `n>1` 时区分各子序列的关键，下一节会看到它撑起整个父聚合。
 
-> **v0.21.0 更新**：上面那个 `routed_experts` 形参（MoE 路由捕获）现在会被拆成两段挂到不同层级。`RequestState` 调 `split_routed_experts(routed_experts, prompt_len, num_gen)`（`vllm/v1/engine/output_processor.py:L342`，`prompt_len` 取自 `self.prompt_token_ids`、`num_gen` 取自 `self.detokenizer.num_output_tokens()`）把路由数据切开：**prompt 段**回填到请求级 `RequestOutput.prompt_routed_experts`（`n>1` 时被多个 `CompletionOutput` 共享，故挂在请求级而非每个 completion 上），**generation 段**挂到每个 `CompletionOutput`。这与本节 `index`/父聚合的层级划分同构——"共享的提示路由"与"各自的生成路由"在数据结构上也就此分离。
+> **v0.21.0 更新**：上面那个 `routed_experts` 形参（MoE，Mixture of Experts 混合专家模型，的路由捕获数据）现在会被拆成两段挂到不同层级。`RequestState` 调 `split_routed_experts(routed_experts, prompt_len, num_gen)`（`vllm/v1/engine/output_processor.py:L342`，`prompt_len` 取自 `self.prompt_token_ids`、`num_gen` 取自 `self.detokenizer.num_output_tokens()`）把路由数据切开：**prompt 段**回填到请求级 `RequestOutput.prompt_routed_experts`（`n>1` 时被多个 `CompletionOutput` 共享，故挂在请求级而非每个 completion 上），**generation 段**挂到每个 `CompletionOutput`。这与本节 `index`/父聚合的层级划分同构——"共享的提示路由"与"各自的生成路由"在数据结构上也就此分离。
 
 ### 8.5.1 队列的真身：`RequestOutputCollector`
 

@@ -98,7 +98,7 @@ def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
 
 `execute_model` 返回的 `future`，`result()` 出来可能是 `None`。这不是出错——它是一个**约定信号**：「前向我跑完了，但 token 我没采，因为采样要用语法掩码，而掩码这会儿还没算好，你（主进程）拿着掩码自己采。」
 
-为什么要这样拆？因为结构化输出（structured output，比如强制模型只输出合法 JSON）的工作方式是：在采样那一步，往 logits 上盖一张语法掩码，把不合法的 token 概率压成负无穷。而这张掩码依赖**这一拍调度了哪些请求、各自的语法状态走到哪了**——也就是说，它依赖 `scheduler_output`，必须在 `schedule()` 之后才能算。
+为什么要这样拆？因为结构化输出（structured output，比如强制模型只输出合法 JSON）的工作方式是：在采样那一步，往 logits（模型最后一层输出的原始未归一化分数，尚未经 softmax 转成概率分布）上盖一张语法掩码，把不合法的 token 概率压成负无穷。而这张掩码依赖**这一拍调度了哪些请求、各自的语法状态走到哪了**——也就是说，它依赖 `scheduler_output`，必须在 `schedule()` 之后才能算。
 
 如果把采样焊死在前向里（worker 一口气算完前向就采样），那掩码就得在发起前向**之前**算好。可那样一来，CPU 算掩码的时间和 GPU 跑前向的时间就**串行**了，谁也盖不住谁。
 
@@ -347,9 +347,9 @@ def _process_engine_step(self) -> bool:
 
 **`self.step_fn()` 不是写死的 `self.step`**。它在 `__init__` 时就静态绑定好了——绑 `step` 还是绑 `step_with_batch_queue`，取决于一个开关。这是 §11.7 batch queue 接入点的引子。
 
-**输出塞进 `output_queue`**。`outputs.items()` 是 `{client_index: EngineCoreOutputs}`，逐个 `put_nowait` 进去。然后第 7 章那个 `process_output_sockets` IO 线程会把它们抽走、编码、经 ZMQ 推回客户端。忙循环只管往内存队列里塞，不碰网络——网络 IO 交给独立线程，互不阻塞。这是 `input_queue` / `output_queue` 这对内存队列存在的全部理由：**用一对线程安全队列，把「跑模型的循环」和「读写 socket 的 IO」彻底解耦**。忙循环只跟内存打交道，逻辑简单且不会被网络卡住；IO 线程的序列化和 socket 操作释放 GIL，能和 GPU 前向真正并行。
+**输出塞进 `output_queue`**。`outputs.items()` 是 `{client_index: EngineCoreOutputs}`，逐个 `put_nowait` 进去。然后第 7 章那个 `process_output_sockets` IO 线程会把它们抽走、编码、经 ZMQ 推回客户端。忙循环只管往内存队列里塞，不碰网络——网络 IO 交给独立线程，互不阻塞。这是 `input_queue` / `output_queue` 这对内存队列存在的全部理由：**用一对线程安全队列，把「跑模型的循环」和「读写 socket 的 IO」彻底解耦**。忙循环只跟内存打交道，逻辑简单且不会被网络卡住；IO 线程的序列化和 socket 操作释放 GIL（Global Interpreter Lock，Python 全局解释器锁——同一时刻只允许一个线程执行 Python 字节码；IO 线程主动释放后 GPU 前向可在后台推进），能和 GPU 前向真正并行。
 
-**那 1 毫秒的 `time.sleep`**。看注释：有些请求会卡在 `WAITING_FOR_REMOTE_KVS`——等另一台机器把 KV cache 通过 NIXL（一种基于 RDMA 单边读的跨机器 KV 传输后端，[第 36 章 §36.8](../../ch36-pd-disaggregation/narrative/chapter.md) 细讲）握手传过来。这种请求没法 step（数据还没到），但又确实「没完成」。如果忙循环为它疯狂空转，会把 CPU 时间片全占了，做握手的后台线程反而饿死、永远握不上手。短睡 1 ms 把轮询频率压到约 1000 Hz，给后台线程让出时间片。这是一个「紧轮询会饿死协作线程」的经典折中。
+**那 1 毫秒的 `time.sleep`**。看注释：有些请求会卡在 `WAITING_FOR_REMOTE_KVS`——等另一台机器把 KV cache 通过 NIXL（NVIDIA 开源的跨节点内存传输库，ai-dynamo/nixl；底层基于 RDMA——远程直接内存访问，允许一台机器直接读写另一台机器内存而不经对方 CPU，延迟远低于传统网络收发。本仓 pin 要求 nixl>=1.1.0。[第 36 章 §36.8](../../ch36-pd-disaggregation/narrative/chapter.md) 细讲分离式预填充下 NIXL 的完整用法）握手传过来。这种请求没法 step（数据还没到），但又确实「没完成」。如果忙循环为它疯狂空转，会把 CPU 时间片全占了，做握手的后台线程反而饿死、永远握不上手。短睡 1 ms 把轮询频率压到约 1000 Hz，给后台线程让出时间片。这是一个「紧轮询会饿死协作线程」的经典折中。
 
 精简版把这一圈也跑通了：输出确实进了 `output_queue`，请求消费完加关停信号后循环干净退出。
 
@@ -424,7 +424,7 @@ def _handle_client_request(
 - **`WAKEUP`**——直接 `return`，什么都不做。它是个哨兵，§11.5 揭晓它的用途。
 - **`ADD`**——拆出 `(req, request_wave)`，交给 `add_request`（校验后转给调度器）。`request_wave` 是这批请求所属的调度波次编号，单引擎下可以先不管它；数据并行场景下多个引擎靠它对齐"全体运行/全体暂停"的节拍，[第 21 章](../../ch21-async-engine/narrative/chapter.md) 会展开这套 wave 共识机制。
 - **`ABORT`**——交给 `abort_requests`（让调度器把这些请求标成 `FINISHED_ABORTED`）。
-- **`UTILITY`**——这是个**通用 RPC 通道**。客户端想调引擎上某个方法（比如查询是否在睡、重置缓存、甚至触发 sleep），不必为每个方法单设一种消息类型，统一打包成 UTILITY：`(client_idx, call_id, method_name, args)`。引擎用 `getattr(self, method_name)` 懒查到方法、调用、把返回值连同 `call_id` 塞回 `output_queue`。那个 `call_id` 是第 7 章讲的[关联标识](../../ch07-engine-core/narrative/chapter.md)（correlation-id）——客户端凭它把异步回来的结果对上当初的调用。**§11.6 那些生命周期方法，大多就是经这条 UTILITY 路径被调用的。**
+- **`UTILITY`**——这是个**通用 RPC 通道**。客户端想调引擎上某个方法（比如查询是否在睡、重置缓存、甚至触发 sleep），不必为每个方法单设一种消息类型，统一打包成 UTILITY：`(client_idx, call_id, method_name, args)`。引擎用 `getattr(self, method_name)` 懒查到方法、调用（`_convert_msgspec_args` 先把参数从 msgspec——一个比标准库 json 快数倍的高性能序列化库，vLLM 用它做进程间消息编解码——编码还原为 Python 对象）、把返回值连同 `call_id` 塞回 `output_queue`。那个 `call_id` 是第 7 章讲的[关联标识](../../ch07-engine-core/narrative/chapter.md)（correlation-id）——客户端凭它把异步回来的结果对上当初的调用。**§11.6 那些生命周期方法，大多就是经这条 UTILITY 路径被调用的。**
 
 精简版把这套分派逐条验证了——ADD 走 add_request、ABORT 走 finish_requests、WAKEUP 是空操作、UTILITY 真的调到了方法并把结果带 call_id 塞回队列：
 
@@ -479,6 +479,8 @@ def _run(self):                  # 专用后台线程
 def trigger(self):               # 信号处理器只调这个
     self._event.set()            # 唯一动作：放行线程
 ```
+
+这一手是 Unix 世界「信号处理器不能拿锁」这条铁律的标准解法——**self-pipe trick**（自管道技巧，由 D. J. Bernstein 推广）——的一个变体：处理器只做最小动作（`Event.set()`），真正的活（`put_nowait`）交给另一条线程在信号上下文之外执行。Python 官方文档对此有[明确警告](https://docs.python.org/3/library/signal.html)并给出了推荐范式。
 
 这下 §11.4 那个 `WAKEUP` → `return` 的空分支就有意义了：它**不为了做事，只为了把阻塞的 `input_queue.get` 唤醒**。哨兵一进队列，睡着的 `get` 立刻返回，`_handle_client_request` 拿到 `WAKEUP` 啥也不干就 `return`，控制权交回忙循环。忙循环转下一圈，去检查 `_handle_shutdown()`——这次它会看到 `shutdown_state` 已经是 `REQUESTED` 了。
 

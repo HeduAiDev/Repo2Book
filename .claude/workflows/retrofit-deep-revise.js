@@ -11,16 +11,25 @@ export const meta = {
 // ⚠️ args 注入不可靠 → CFG 为准（换批改 CFG.chapters）。
 const CFG = {
   instance: 'vllm',
-  // vllm 批次3(周限额 Jul 29 11am ET 重置后发车):剩余 24 章里 gap 最高的 8 章
+  // vllm 批次4:剩余 17 章收尾——全书 39 章 concepts.json 全覆、正文全讲透
   chapters: [
-    'ch12-engine-core',
-    'ch17-worker-and-executor',
-    'ch20-distributed-parallelism',
-    'ch30-sampling',
-    'ch33-primer-eagle',
-    'ch34-spec-decode',
-    'ch21-async-engine',
-    'ch22-model-definitions',
+    'ch02-entrypoints',
+    'ch05-input-processing',
+    'ch06-input-processor',
+    'ch08-output-processor',
+    'ch10-logprobs',
+    'ch11-engine-core',
+    'ch13-scheduler',
+    'ch14-scheduler',
+    'ch15-kv-cache',
+    'ch16-kv-cache',
+    'ch18-model-runner',
+    'ch19-model-runner',
+    'ch24-primer-flash-attention',
+    'ch27-primer-lightning-indexer',
+    'ch36-pd-disaggregation',
+    'ch37-entrypoints',
+    'ch39-engine-core',
   ],
 }
 const A = (typeof args !== 'undefined' && args && args.chapters && args.chapters.length) ? args : CFG
@@ -67,9 +76,8 @@ const results = await pipeline(
       '**纪律（硬）**：①只补读者定向背景，**不动 pin 源码解读的正确性**；新增背景与源码解读**自然分层**、别堆成信息倾倒。②说明性示例/外部记法用普通代码围栏 + 明标「说明性/外部」，**不标 `# SOURCE:`**。③**proportional**：讲透≠拉长凑字，补到「初学者能懂」为止。④版本敏感的锚定本章 pin 版本；立场性口径（如竞品博客数字）带出处立场；按各条 confidence 保守写。⑤**若 research 指出正文现有事实错**（如归属写错、默认值写错），**一并改正**并在返回 note 里说明。\n' +
       '**门禁**：改完自跑并确保无 BLOCKING：`lint_chapter_structure`（narrative/chapter.md）、`lint_formulas`（同）、`lint_source_grounding`（章目录）、`lint_fidelity`（章目录，primer 章跳过）、`lint_punct`（narrative/chapter.md）。公式规则：行内一律 `` $`…`$ ``、块级 ```math、公式内禁 CJK、**粗体**定界符外侧留半角空格。\n' +
       '返回：status / revised（补讲透处数）/ **new_h2（是否新增了 H2 主节——决定本章地图是否必须重生成，据实填）** / note。',
-      // 用户 2026-07-25 明确指定:Revise 站的 writer 用 fable5(叙事写作交给 fable),
-      // 其余站(illustrator 判图/盲审、researcher 查证)保持 opus5。
-      { schema: REVISE_SCHEMA, label: ch + ':revise', phase: 'Revise', agentType: 'writer', model: 'fable' }
+      // fable 暂不可用(2026-08-02), Revise 站继承主模型(opus)
+      { schema: REVISE_SCHEMA, label: ch + ':revise', phase: 'Revise', agentType: 'writer' }
     )
     return { chapter: ch, revise: r }
   },

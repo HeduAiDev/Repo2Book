@@ -493,6 +493,10 @@ assert runner.input_ids.cpu[0] == Z                       # 上拍写回的 Z，
 
 回到 [§19.3 阶段一](#193-阶段一全景从工单到一份缓存的-state) 第三步留下的悬念：前向走哪条 CUDA graph，是谁决定的？是 `CudagraphDispatcher.dispatch()`。在架构模型图上，它就是 `GPUModelRunner` 主盒最顶上那个独立橙框——站点 16；而它的调用点藏在 `execute_model()` 的第三步（站点 4），在 `GPUModelRunner` 主盒的更深处。
 
+在拆 dispatch 逻辑之前，先交代一句这些图的来历。CUDA Graph 是 NVIDIA CUDA 运行时自 CUDA 10 起提供的通用图捕获/回放机制——不是 vLLM 自创：把一串要提交给 GPU 的 kernel 启动及依赖关系录成一张有向无环图，之后只需一次 `cudaGraphLaunch` 就能把整张图重放，省去每个算子逐个发射的调度开销。代价是形状在捕获时就被定死：图的节点里记下的张量地址和维度 replay 时必须完全一致；这正是 FULL 模式要求批次形状精确匹配的根因。PyTorch 通过 `torch.cuda.CUDAGraph`（基于流捕获 stream capture）把这套能力暴露给用户，LLM 推理正是教科书级场景——同一段前向每拍反复执行、形状在稳态后趋于不变。深入可读 [PyTorch CUDA Graphs 博客](https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/) 和 [NVIDIA CUDA 编程指南](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#cuda-graphs)。
+
+这套分级设计也不是本仓临时拼出来的——vLLM 编译框架对 CUDA graph 的使用有正式设计文档 [vllm/docs/design/cuda_graphs.md](https://github.com/vllm-project/vllm/blob/main/docs/design/cuda_graphs.md)，核心思想正是区分 prefill/mixed 批次与 uniform decode 批次、分别捕获。另外配置层还有 `FULL_DECODE_ONLY` 和 `FULL_AND_PIECEWISE` 两个面向用户的组合选项（如 P/D 分离部署中 decode 实例常用前者），但它们 dispatch 时最终落到的仍是 `NONE`/`PIECEWISE`/`FULL` 三个具体值——和本章分派逻辑一致。
+
 先说清楚三态各自是什么、贵在哪：
 
 - **NONE（eager）**：不录图，每拍重走一遍 Python 算子派发。launch 开销是算子数级别——每个算子都得 Python 这边发起一次 kernel launch，几百上千次。

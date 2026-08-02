@@ -94,7 +94,7 @@ self.token_ids_cpu_tensor = torch.zeros(
 self.token_ids_cpu = self.token_ids_cpu_tensor.numpy()
 ```
 
-（`pin_memory=True` 让这块 CPU 缓冲驻留在页锁定内存里，CUDA 才能对它发起真正的异步 DMA——后面 `commit_block_table` 能把块表拷贝和 CPU 计算重叠，前提就在这里。）
+（`pin_memory=True` 让这块 CPU 缓冲驻留在页锁定内存（pinned memory）里。普通内存页可能被操作系统换出到磁盘，GPU 的 DMA（直接内存访问）不能直接对着它操作——CUDA 驱动会先悄悄把数据拷进一块临时 pinned 缓冲再搬去显卡，多了一次隐藏且同步的拷贝。显式分配 pinned memory 跳过这一步，CUDA 才能发起真正的异步 DMA——后面 `commit_block_table` 能把块表拷贝和 CPU 计算重叠，前提就在这里。）
 
 核心就是这块 `token_ids_cpu`：一个 `max_num_reqs × max_model_len` 的二维 int32 缓冲，**一行存一个请求的全长 token 序列**。除它之外，`InputBatch` 还并排维护一组同样按行索引的 CPU 镜像——`num_computed_tokens_cpu`（每请求已算多少 token）、`num_prompt_tokens`、`num_tokens_no_spec`、块表、整套采样参数列、以及 `req_id_to_index`（请求 ID → 行号映射）。
 
@@ -579,7 +579,7 @@ def commit_block_table(self, num_reqs: int) -> None:
 
 `append_row` / `add_row` / `move_row` 全改 CPU 镜像 `block_table.np`——`append_row` 追加块号，`add_row` 重置后写（新请求）,`move_row` 是 `condense` 搬行时同步搬块表。它们都廉价，因为只动 numpy。
 
-> **v0.21.0 更新**：这张表的列数由每组 `max_num_blocks` 定。v0.21.0 起，构造 `MultiGroupBlockTable` 时会把每个 KV cache group 的 `max_num_blocks` 向上对齐到 `128 / block_size` 的整数倍（`block_size ≤ 128` 时 `cdiv(n, 128//bs) * (128//bs)`，否则原样，#39324）——因为 TRTLLM MLA（一种对 block table 列数有特殊对齐要求的 attention 后端，[第 25 章](../../ch25-attention/narrative/chapter.md)还会遇到）等部分 attention 后端对 block table 的列数有 128 元素对齐的边角要求。对常规 `block_size` 这只会略微抬高列数，双镜像的语义与上面这套增量写法都不受影响。
+> **v0.21.0 更新**：这张表的列数由每组 `max_num_blocks` 定。v0.21.0 起，构造 `MultiGroupBlockTable` 时会把每个 KV cache group 的 `max_num_blocks` 向上对齐到 `128 / block_size` 的整数倍（`block_size ≤ 128` 时 `cdiv(n, 128//bs) * (128//bs)`，否则原样，#39324）——因为 TRTLLM MLA（TensorRT-LLM——一款 NVIDIA 开源的 LLM 推理加速库——为 MLA 提供的一种 attention 后端，对 block table 列数有特殊对齐要求，[第 25 章](../../ch25-attention/narrative/chapter.md)还会遇到）等部分 attention 后端对 block table 的列数有 128 元素对齐的边角要求。对常规 `block_size` 这只会略微抬高列数，双镜像的语义与上面这套增量写法都不受影响。
 
 但前向要的是 GPU 上的块表。于是 `commit_block_table` 把整个 CPU 镜像**批量**拷到 GPU。这就是上一节 `_prepare_inputs` 开头那个 `commit_block_table`——所有块号在 `_update_states` 里以最廉价的 CPU 增量写好，到 `_prepare_inputs` 一次性刷到 GPU，还故意放在最前面与后续 CPU 工作重叠。**CPU 改、批量 commit、GPU 用**，职责清清楚楚。
 
@@ -603,6 +603,8 @@ def compute_slot_mapping(self, num_reqs, query_start_loc, positions) -> None:
 ```
 
 注意 grid 是 `(num_reqs + 1,)`——`num_reqs` 个 program 各管一个请求，**外加一个**专门收尾。kernel 本体：
+
+（在读这段 kernel 之前先停一下：这里顶着 `tl.program_id`/`tl.load`/`tl.store` 的代码不是 vLLM 自造的 DSL，而是 **Triton** ——OpenAI 发布的一种 Python 嵌入式 GPU 编程语言。Triton 把编程模型抬高一层：开发者只写「每个并行实例处理哪块数据」的 tile 级函数，编译器自动把线程分组、内存合并这些手写 CUDA 才操心的细节包办掉，换来接近手写 CUDA 的性能。这里 `tl.program_id(0)` 认领「这次是第几个并行实例」，`tl.load`/`tl.store` 配 `mask=` 参数读写数据并自动挡住越界位置。后面章节还会更深入地走读一个完整的 Triton kernel，本章只需知道这些 API 的语义就能跟上主线。）
 
 ```python
 # vllm/v1/worker/block_table.py:L341

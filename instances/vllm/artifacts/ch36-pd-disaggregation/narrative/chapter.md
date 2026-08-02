@@ -136,6 +136,8 @@ def _get_kv_connector_output(
             kv_connector.clear_connector_metadata()
 ```
 
+这段代码上的 `@contextmanager` 装饰器来自 Python 标准库 `contextlib`——它把一个只 `yield` 一次的生成器函数自动变成 context manager：`yield` 之前的代码等价于 `__enter__`（进入 `with` 块时执行），`yield` 之后的代码等价于 `__exit__`（退出 `with` 块时执行；哪怕块里抛了异常，`finally` 里的代码也保证跑）。本章接下来的 enter/yield/finally 三段式解读，就是在拆这个标准惯用法的结构。
+
 把它按 `yield` 切成三段读：
 
 **enter 段（`yield` 之前）——发起。** 两步。第一步 `bind_connector_metadata`：worker 吃下 scheduler 进程打包下发的那份不透明 metadata。这正是上一章决策侧 `build_connector_meta` 的产物——里面写着"这一步该收哪些请求的 KV、该发哪些"。worker 不解读它的内容，只把它绑给 connector，由具体后端自己拆。第二步 `start_load_kv`：**异步发起**本步所有的 KV load，立即返回，不阻塞。这一行是 load/compute 重叠的起点。
@@ -273,7 +275,7 @@ def wait_for_save(self):
 
 docstring 把意图写得很白：在 forward context 退出前阻塞，确保 `save_kv_layer` 的异步保存全部完成，**防止 paged KV buffer 在保存完成前被覆盖**。
 
-用一句不变量来归纳它的正确性：**"所有 save 完成"是 forward 退出的前置条件**。这等价于在"buffer 复用"和"异步读"之间插了一道 happens-before——任何对某物理块的复用写入，都发生在该块上一次 save 读取完成之后。少了这道围栏，PD 分离下的数据一致性就破了。所以 `wait_for_save` 不是性能旋钮，是**正确性硬约束**，不能为了快而省掉。
+用一句不变量来归纳它的正确性：**"所有 save 完成"是 forward 退出的前置条件**。这等价于在"buffer 复用"和"异步读"之间插了一道 happens-before（**先行发生**——并发理论里的经典概念，出自 Lamport 1978 年那篇《Time, Clocks, and the Ordering of Events in a Distributed System》，后来被 Java/C++ 内存模型采纳为定义"一个线程的写对另一个线程何时可见"的核心规则：若 A happens-before B，则 A 造成的所有效果对 B 可见）。这里就是人为插入这条边——任何对某物理块的复用写入，都发生在该块上一次 save 读取完成之后。少了这道围栏，PD 分离下的数据一致性就破了。所以 `wait_for_save` 不是性能旋钮，是**正确性硬约束**，不能为了快而省掉。
 
 它落在 `_get_kv_connector_output` 的 `finally` 段里（§36.2），保证哪怕 forward 抛异常也会执行。后面会看到，三类后端各自给 `wait_for_save` 填了不同的实现，但都满足同一个语义。
 
@@ -546,7 +548,7 @@ P2P 的 `get_finished` 委托给引擎，引擎在本进程内同时记着发和
 
 NIXL 是高性能 RDMA 后端。它和 P2P 有两个结构性的不同，都很能说明问题。
 
-**第一个不同：facade 模式。** NIXL 的 scheduler 侧和 worker 侧逻辑都很重（一边管握手拓扑、内存注册，一边管命中查询），于是顶层 `NixlConnector` 按 role 只建半边子对象：
+**第一个不同：Facade（外观）模式。** Facade 是 GoF《设计模式：可复用面向对象软件的基础》收录的 23 个经典结构型模式之一——本意是给一组复杂子系统对象包一层简化统一入口，让调用方不必了解内部各对象的初始化顺序和依赖关系。NIXL 把它用出了变体：顶层 `NixlConnector` 按 role 只建半边子对象，把 scheduler 侧和 worker 侧的代码物理隔开，确保某个进程角色永远碰不到另一半——不是简化调用，而是用同一层 facade 做物理隔离。NIXL 的 scheduler 侧和 worker 侧逻辑都很重（一边管握手拓扑、内存注册，一边管命中查询），于是顶层 `NixlConnector` 按 role 只建半边子对象：
 
 ```python
 # vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py:L87-L108
@@ -593,7 +595,7 @@ def wait_for_save(self):
 
 这就印证了 §36.3 提前打的预防针：`wait_for_layer_load` 和 `save_kv_layer` 都是 **no-op**。这不是偷懒，是 NIXL 的传输模型决定的——这是第二个、也是更深的不同。
 
-**第二个不同：RDMA 单边 READ。** P2P 是 producer 主动"推"（send）KV。NIXL 反过来——**decode worker 主动从 prefill worker 的显存里"读"（READ）KV**，而 prefill 端的 CPU/GPU 完全不参与这次传输。这是 RDMA 单边操作的本质：发起方给网卡一组地址，网卡直接搬对端内存，对端 CPU 无感。
+**第二个不同：RDMA 单边 READ。** P2P 是 producer 主动"推"（send）KV。NIXL 反过来——**decode worker 主动从 prefill worker 的显存里"读"（READ）KV**，而 prefill 端的 CPU/GPU 完全不参与这次传输。这是 RDMA 单边操作的本质：发起方给网卡一组地址，网卡直接搬对端内存，对端 CPU 无感。这不是 vLLM 自造的机制——InfiniBand 及 RoCE（RDMA over Converged Ethernet，以太网承载的 RDMA）的 verbs 规范从根上就区分两类语义：单边 READ/WRITE（发起方指定远端地址，对端 CPU 不参与）与双边 SEND/RECEIVE（两端软件都要主动参与握手收发）。NIXL 用的是前者——`make_prepped_xfer("READ", ...)` 那一行就是在拼一次标准的 RDMA 单边读。
 
 正因为是 D 主动读、整请求一把读，所以：不需要逐层 pipeline（`wait_for_layer_load` 空）；P 端不存在"主动 save"这个动作（`save_kv_layer` 空，"保存"就等于"把 KV 留在那让 D 来读")。两个 no-op 是 RDMA READ 模型的直接推论。
 

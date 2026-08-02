@@ -244,6 +244,8 @@ else:
 
 二是 **`old_dp_group` 与 `new_dp_group` 按角色取值**：对存在引擎，`dp_group` 现在指向的是旧组，所以塞进 `old_dp_group`；对新引擎，它手里的 `dp_group` 一开始就是为新组建的，塞进 `new_dp_group`。这个"old/new 各指一边"的设计，后面切换时（§39.6 的 `_switch_and_prepare`）会让"销毁旧的、切到新的"读起来格外顺。
 
+顺带点一句：上面出现的 `dp_store`（实际是 `torch.distributed` 的 TCPStore——一个基于 TCP 的键值存储服务，让分布式进程间低成本地对暗号），以及后文 §39.6–§39.7 将用到的 `all_reduce`（集合通信：全组按指定操作归约、再把结果广播回每个成员）和 `barrier`（全员同步点：调用的进程阻塞直到组内所有进程都到达同一行），都是 PyTorch `torch.distributed` 的标准原语；本章只是用它们搭自定义的扩缩协议，不必担心这些基础件本身是本仓自造的魔法。
+
 ---
 
 ## 39.6 scale_up 全程：存在引擎的 9 步与跨进程握手
@@ -698,7 +700,7 @@ def _progress_removing_engine(self) -> bool:
 
 （架构模型图上，我们从 EngineCore 大框「执行与并行」组里出来，拐进输出处理区——OpenAIServingResponses 及它腹地里的 `construct_input_messages` 与 `HarmonyContext`，站号 13–18。）
 
-Responses API 的卖点是**有状态会话**：客户端第一轮发"我叫 Bob"，拿到一个 `response.id`；第二轮只发"我叫什么？"外加 `previous_response_id` 指向上一轮，服务器就能答出"Bob"。客户端不必自己背着全部历史。这意味着服务器侧得替它记住前文。
+Responses API 的卖点是**有状态会话**：客户端第一轮发"我叫 Bob"，拿到一个 `response.id`；第二轮只发"我叫什么？"外加 `previous_response_id` 指向上一轮，服务器就能答出"Bob"。客户端不必自己背着全部历史。这意味着服务器侧得替它记住前文。（vLLM 的 `OpenAIServingResponses` 正是在[实现这套 OpenAI 官方 API 规范](https://platform.openai.com/docs/api-reference/responses)——`store=true` 触发服务器保存、`previous_response_id` 自动接续历史，都是官方定义的语义，不是本仓自造的协议。）
 
 入口是 `OpenAIServingResponses.create_responses`。多轮的故事从取回上一轮开始：
 
@@ -725,7 +727,15 @@ Responses API 的卖点是**有状态会话**：客户端第一轮发"我叫 Bob
             messages, engine_inputs = await self._make_request(request, prev_response)
 ```
 
-逻辑直白：有 `previous_response_id` 就去 `response_store` 把上一轮的 `ResponsesResponse` 捞出来（捞不到就 404）；没有就是新会话。然后按 `use_harmony` 分两条拼接路径——普通路径和 harmony 路径。Harmony 是 vLLM 内部的一种增强消息格式，在标准 `role/content` 之外还带 `channel` 字段（如 `"final"` / `"analysis"`），用于区分思维链与正式输出，§39.12 会细看。
+逻辑直白：有 `previous_response_id` 就去 `response_store` 把上一轮的 `ResponsesResponse` 捞出来（捞不到就 404）；没有就是新会话。然后按 `use_harmony` 分两条拼接路径——普通路径和 harmony 路径。Harmony 不是 vLLM 自造的格式——它是 OpenAI 为 gpt-oss 系列开源模型设计的一套消息规范（GitHub `openai/harmony`），vLLM 在此实现它的解析与拼接。它在标准 `role/content` 之外给 assistant 消息加了一个 `channel` 字段：`"final"`（正式回复，展示给用户）、`"analysis"`（内部推理草稿/思维链，不展示）、`"commentary"`（工具调用旁白）。三者用特殊 token 区隔，一段简化序列长这样：
+
+```text
+（说明性/外部示例：Harmony channel 记法，摘自 OpenAI harmony 规范）
+<|start|>assistant<|channel|>analysis<|message|>逐步推理…<|end|>
+<|start|>assistant<|channel|>final<|message|>最终答案。<|end|>
+```
+
+第一条带 `<|channel|>analysis` 是内部推理，正常不返回给终端用户；第二条带 `<|channel|>final` 才是正式回答。§39.12 里 `HarmonyContext.append_output` 解析的就是这样一串 token，更完整的语法见 [OpenAI harmony 仓库](https://github.com/openai/harmony)。
 
 这里出现了两个"店"：`response_store` 和（下面会见到的）`msg_store`。它们是什么来头？看构造：
 

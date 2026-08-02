@@ -80,7 +80,7 @@ class KVCacheBlock:
 
 - **`block_id`**：物理块号，0 到 `num_gpu_blocks - 1`，worker 侧按它寻址真正的 KV 张量。这是块的身份证，一经分配**永不改变**——后面会看到这个不变量约束了好几处设计。
 - **`ref_cnt`**：引用计数。有多少个活跃请求或缓存正引用这块。`ref_cnt > 0` 说明有人在用，不能动它；归零才可被回收。§15.4 整节讲它。
-- **`_block_hash`**：块哈希（带 group id）。**只有当块满了且被缓存时才有值**。它是前缀缓存的钥匙——拿这个哈希去查表，就能找到「内容和这一块相同的已缓存块」。
+- **`_block_hash`**：块哈希，类型为 `BlockHashWithGroupId`（`BlockHash` 后缀 4 字节大端 group id 的复合键——group id 用于在多 KV 缓存组间隔离同名前缀，本章单组路径下恒为 0）。**只有当块满了且被缓存时才有值**。它是前缀缓存的钥匙——拿这个哈希去查表，就能找到「内容和这一块相同的已缓存块」。
 - **`prev_free_block` / `next_free_block`**：两个指针，把空闲块串成一条双向链表。注释特意写了「只应由 `FreeKVCacheBlockQueue` 操作」——下一节就是它。
 - **`is_null`**：占位块标记。配合上节图里那个 `blk 0`。
 
@@ -110,7 +110,7 @@ def reset_hash(self):
 
 块分两种状态：**被占用**（`ref_cnt > 0`，某请求正用着）和**空闲**（`ref_cnt == 0`，可被分配）。空闲块需要一个队列管起来，回答两个问题：分配时取哪一块？显存紧张要驱逐时，先丢哪一块？
 
-答案都是 **LRU**——最久没用的块排在最前，优先被取走、优先被驱逐。但 vLLM 没有直接用 Python 的 `deque`，而是自己实现了一条双向链表。类注释把原因写得很直白：
+答案都是 **LRU**（Least Recently Used，最近最少使用）——最久没用的块排在最前，优先被取走、优先被驱逐。但 vLLM 没有直接用 Python 的 `deque`，而是自己实现了一条双向链表。类注释把原因写得很直白：
 
 ```python
 # vllm/v1/core/kv_cache_utils.py:L162
@@ -389,9 +389,13 @@ def hash_block_tokens(
     )
 ```
 
-哈希的输入是个三元组——父块哈希、本块 token、extra_keys。第一块没有父块，用一个随机种子 `NONE_HASH` 兜底——随机是为了避免跨进程的哈希碰撞，对齐了 Python `hash()` 的做法。
+函数返回一个 `BlockHash`（`NewType("BlockHash", bytes)`——带类型标签的字节型哈希摘要，防与普通 `bytes` 混用），其输入是个三元组——父块哈希、本块 token、extra_keys。第一块没有父块，用一个随机种子 `NONE_HASH` 兜底——随机是为了避免跨进程的哈希碰撞，对齐了 Python `hash()` 的做法。
 
-哈希宽度决定了「哈希相等 ⇒ 内容相等」这条假设有多可靠。默认哈希算法是 sha256（`prefix_caching_hash_algo` 配置项，`vllm/config/cache.py`），摘要宽度 256 bit；两个不同内容的块恰好撞到同一个哈希、被误判成命中的概率量级，按生日悖论估算约是已缓存块总数的平方除以 $`2^{257}`$ ——就算集群同时缓存几十亿个块，这个数字依然小到可以当作零，这也是源码注释里"SHA256 是避免哈希碰撞最安全的选择"这句话的由来。配置也留了一条更快但风险更高的路：可选的 xxhash 只有 128 bit，源码文档字符串明确点破了这笔权衡——非加密哈希在理论上提高碰撞风险，多租户场景下甚至可能造成隐私泄露，因此默认没有打开。给内容相同的前缀找钥匙不是 vLLM 一家的做法：SGLang 的 RadixAttention（arXiv:2312.07104）走的是另一条谱系——不建哈希表，而是把所有请求的前缀直接组织成一棵 radix 树，靠树上的字符匹配定位共享前缀，用结构替代了哈希碰撞概率这道保险。
+哈希宽度决定了「哈希相等 ⇒ 内容相等」这条假设有多可靠。默认哈希算法是 SHA-256（`prefix_caching_hash_algo` 配置项，`vllm/config/cache.py`），属于**密码学哈希**（cryptographic hash）——设计目标包含抗碰撞与抗原像性，很难人为构造出两个不同内容产生相同摘要。SHA-256 摘要宽度 256 bit；两个不同内容的块恰好撞到同一个哈希、被误判成命中的概率量级，按生日悖论估算约是已缓存块总数的平方除以 $`2^{257}`$ ——就算集群同时缓存几十亿个块，这个数字依然小到可以当作零，这也是源码注释里"SHA256 是避免哈希碰撞最安全的选择"这句话的由来。安全性有对应的性能代价：SHA-256 带宽约 1 GB/s 量级。
+
+配置也留了一条更快但碰撞风险更高的路：可选的 xxHash（`xxhash`）是一种**非密码学哈希**（non-cryptographic hash）——只追求速度与低碰撞率，不追求抗人为构造碰撞。vLLM 使用的是其 XXH3 128 bit 变体，官方基准带宽可达 30+ GB/s（比 SHA-256 快一个数量级以上），但摘要宽度只有 128 bit——按同样公式，碰撞概率比 SHA-256 情形大了 $`2^{128}`$ 倍量级。虽然这个概率对于正常工作负载仍极低，源码文档字符串明确点破了安全考量：多租户共享缓存池、输入间接受外部用户影响时，非密码学哈希的碰撞风险是安全取舍而非纯性能选择，因此默认没有打开 xxHash。详见 [xxHash 官网](https://xxhash.com/)。
+
+给内容相同的前缀找钥匙不是 vLLM 一家的做法。SGLang 的 RadixAttention（arXiv:2312.07104）走的是另一条谱系——不建哈希表，而是把所有请求的前缀组织成一棵 radix 树（压缩前缀树），靠树上的字符匹配定位共享前缀。同一个问题（前缀缓存），vLLM 用「固定块 + 哈希查找表」、SGLang 用「树结构 + 自动前缀匹配」——两种不同权衡，且并不互斥：SGLang 内部也同时使用分页管理物理显存，只是把「如何发现可共享前缀」这件事从哈希表换成了 radix 树。详见 [SGLang 官方文档](https://docs.sglang.io/) 与 [LMSYS 博客](https://lmsys.org/blog/2024-01-17-sglang/)。
 
 链式的妙处用一句话归纳：**相同 token 序列，当且仅当前缀完全一致时才得到相同哈希**。归纳地看——第一块的哈希由 `(NONE_HASH, tok[0:B])` 决定，前缀一致 ⇒ 它们相同；假设第 k 块前所有块哈希都相同，那第 k 块的哈希由前块哈希与 `tok[kB:(k+1)B]` 共同决定，两项都相同 ⇒ 它也相同；反之任何一块的前缀出现差异，差异会顺着链一路「染」到它之后的所有块哈希。于是「沿哈希链查命中、一断即停」天然就是正确的——断点之后的块前缀必然已经不同。
 
@@ -553,7 +557,7 @@ def get_cached_block(
 
 注意查表的键不是裸的 `block_hash`，而是 `make_block_hash_with_group_id` 打包出来的 `BlockHashWithGroupId`——块哈希后面拼上 4 字节大端的 group id。混合模型里同一段 token 前缀在不同 KV cache group 要分开缓存，靠这个 group id 区分。用纯 bytes 拼接而非元组，又是为了省 GC、查表更快。本章单组路径下 group id 恒为 0，但这个打包步骤还在。
 
-命中查询本身——沿哈希链逐块查，一断即停——在 `FullAttentionManager.find_longest_cache_hit`。走线在这里跨进本章第三个文件 `single_type_kv_cache_manager.py`（第 13 站，架构模型图上「SingleTypeKVCacheManager 等」那一行）：`SingleTypeKVCacheManager` 是按注意力类型分工的管理器基类，`FullAttentionManager` 是它的全注意力实现，本章单组主路径上干活的正是它。来看这个方法：
+命中查询本身——沿哈希链逐块查，一断即停——在 `FullAttentionManager.find_longest_cache_hit`。走线在这里跨进本章第三个文件 `single_type_kv_cache_manager.py`（第 13 站，架构模型图上「SingleTypeKVCacheManager 等」那一行）：`SingleTypeKVCacheManager` 是按注意力类型分工的管理器基类，`FullAttentionManager` 是它的全注意力实现，本章单组主路径上干活的正是它。来看这个方法（`KVCacheSpec` 是 KV 缓存的规格配置对象，持有 `block_size` 等字段，本章由 `KVCacheConfig` 传递进来）：
 
 ```python
 # vllm/v1/core/single_type_kv_cache_manager.py:L447
@@ -613,6 +617,8 @@ def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
 
     return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
 ```
+
+返回的 `KVCacheBlocks` 是分配结果的包装（`@dataclass`，持有 `tuple[list[KVCacheBlock], ...]` 即各 KV 缓存组的命中块列表——本章单组路径下就是一个列表的元组，每个 KV 缓存组一个列表）。它用 `.blocks` 属性取出内层列表，§15.7 的 `allocate_slots` 会大量用到这个访问模式。
 
 第一行就是 [第 3 章](../../ch03-config-and-wiring/narrative/chapter.md) 那个 `enable_prefix_caching` 的总闸：关了直接返回空命中、0 个 token，整套查表机制被旁路。`request.skip_reading_prefix_cache` 是与它并列的第二道闸，但作用域是单个请求——某些场景（比如已知这个请求的前缀不该被复用、或调用方显式要求跳过读缓存）需要单独绕开查表，又不想动全局的 `enable_caching` 开关，这个请求级字段就是留给它们的口子。两道闸只要有一道合上，就直接空手而归、不进查表。
 

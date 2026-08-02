@@ -135,7 +135,11 @@ child_sampling_params.n = 1
 \mathrm{KV}_\mathrm{total} \approx \mathrm{KV}_\mathrm{prompt} + n \times \mathrm{KV}_\mathrm{output}
 ```
 
-人话：prompt 那段 KV 只存一份（n 路共享），只有各自生成出来的 output token 才各占一份。对「长 prompt、短输出、大 n」的场景（典型如 best-of-n 重排——对同一 prompt 采 n 个候选，事后按打分挑/排出最优结果），这笔账非常划算。
+人话：prompt 那段 KV 只存一份（n 路共享），只有各自生成出来的 output token 才各占一份。对「长 prompt、短输出、大 n」的场景，这笔账非常划算。
+
+这里正好把 best-of-n 重排讲透——书中常见这个名字，但一句话带过的居多。best-of-n（又称 rejection sampling、BoN）是推理时**不碰模型参数**、靠「多采几个再挑」提升输出质量的策略：同一 prompt 独立采样 n 个完整候选，再按某种打分标准挑最优的一条返回。它和 beam search 的关键区别在于 n 条候选**各自独立生成到底**才一次性比较——这个「各自独立」正好就是本章「n 个独立请求」能承载的形状。名字随 OpenAI 早期 Completions API 的 `best_of` 参数普及，后来在对齐研究中常被用做 baseline。
+
+关键边界：vLLM 只负责生成这 n 个候选（即本章的扇出与归并），打分与挑选是调用方拿到 n 路结果之后自己的事，不在引擎职责内。深入者可看 [vLLM SamplingParams 文档](https://docs.vllm.ai/en/v0.6.4/dev/sampling_params.html)。
 
 ---
 

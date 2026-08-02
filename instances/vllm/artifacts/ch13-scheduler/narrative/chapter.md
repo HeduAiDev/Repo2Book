@@ -142,7 +142,7 @@ v1 这套「token 为中心、不分相」的调度，把两条来自论文的�
 
 **chunked prefill 源自 Sarathi**（arXiv:2308.16369）。一段长 prompt 的 prefill 是算力密集的大块，一旦独占一拍，正在 decode 的请求就被顶得卡顿。Sarathi 的办法是把长 prefill **切成固定大小的 chunk** 分几拍算，每拍的预算余量再**捎带**（piggyback）若干 decode token，让算力密集的 prefill 和访存密集的 decode 混在一拍里互补。§13.4 那个「50 token prompt、预算 16、分几拍算完」的截断，就是这套思想的直接落地。
 
-两篇论文各解一半：Orca 让批连续流转，Sarathi 让长 prefill 不再阻塞 decode。v1 的 `num_computed_tokens` 追赶公式，正是把两者统一成了一条数轴上的追赶。
+两篇论文各解一半：Orca 让批连续流转，Sarathi 让长 prefill 不再阻塞 decode。v1 的 `num_computed_tokens` 追赶公式，正是把两者统一成了一条数轴上的追赶。（同一团队后续将这套思想打磨为生产级系统 Sarathi-Serve（OSDI'24，arXiv:2403.02310），在开源 vLLM 之上实现了基于 FlashAttention v2 / FlashInfer 的分页 chunked-prefill，感兴趣的读者可顺藤看。）
 
 顺带交代一句：把长 prefill 拆成几拍算，之所以**不损一分精度**，靠的是注意力层一条更底层的性质——因果注意力逐行独立。这条性质与它换来的"拆块零代价、连合并都不需要"，见[第 24 章：FlashAttention 原理](../../ch24-primer-flash-attention/narrative/chapter.md)。
 
@@ -273,7 +273,7 @@ v1 这套「token 为中心、不分相」的调度，把两条来自论文的�
         self.waiting.prepend_request(request)
 ```
 
-三个动作：`free` 释放它占的 KV 块（腾出显存）、状态置 `PREEMPTED`、**`num_computed_tokens = 0`**。最后一个最狠——被抢占的请求，之前算过的 KV 全丢了，将来恢复时得**从头 prefill**。这是 vLLM 的「recompute」式抢占（不落盘、靠重算），代价是重算，好处是实现简单、不占额外内存。最后 `prepend_request` 把它放回 waiting 队列**最前面**（它资历老，优先恢复）。
+三个动作：`free` 释放它占的 KV 块（腾出显存）、状态置 `PREEMPTED`、**`num_computed_tokens = 0`**。最后一个最狠——被抢占的请求，之前算过的 KV 全丢了，将来恢复时得**从头 prefill**。这是 vLLM 的「recompute」式抢占（不落盘、靠重算），代价是重算，好处是实现简单、不占额外内存。vLLM 的奠基论文（SOSP'23）还讨论过另一条恢复路径——把被占请求的 KV 块整体换出到 CPU 内存（swap），恢复时再原样搬回来，上下文越长越划算；v1 调度器只保留了 recompute 这一条，把 swap 的复杂性让位给了别的机制（如跨节点 KV 传输 connector）。最后 `prepend_request` 把它放回 waiting 队列**最前面**（它资历老，优先恢复）。
 
 分配成功后是四行记账，每一行都重要：
 
@@ -365,7 +365,7 @@ RUNNING 都伺候完、预算还有剩，才轮到 WAITING 队列里的新请求
                     assert num_new_tokens > 0
 ```
 
-`num_new_tokens = request.num_tokens - num_computed_tokens`——还是那条减法。注释特意说明用 `num_tokens`（含已生成的输出）而非 `num_prompt_tokens`，因为这条路径也走「被抢占后恢复」的请求（它们有输出 token）。
+`num_new_tokens = request.num_tokens - num_computed_tokens`——还是那条减法。注释特意说明用 `num_tokens`（含已生成的输出）而非 `num_prompt_tokens`，因为这条路径也走「被抢占后恢复」的请求（它们有输出 token）。与 §13.1 那条 `num_tokens_with_spec − num_computed_tokens` 的关系是：`num_tokens_with_spec = num_tokens + len(spec_token_ids)`——即 prompt 和已生成输出之外，再把草稿 token（投机解码的候选序列）计入总数；WAITING 阶段的请求尚未被调度过、spec_token_ids 为空，所以这里两条公式等价。
 
 这里出现了一个重要分叉：**chunked prefill 开没开**。`enable_chunked_prefill` 控制「prompt 能不能拆成几拍算」。如果**关了**，而这个请求要算的 token 超过了剩余预算，直接 `break`——整个 prompt 要么一拍装下，要么这一拍干脆不调度它。注意这里 `break` 退出的是整个 WAITING 循环，不只是跳过当前请求：关掉 chunked prefill 的场景下，同一应用提交的 prompt 长度往往相近，队首装不下意味着后面的大概率也装不下，与其逐一试探浪费，不如直接截断本轮 WAITING 调度。如果**开了**（默认），下面 `min(num_new_tokens, token_budget)` 会把它截到预算大小，prompt 分几拍算完。
 

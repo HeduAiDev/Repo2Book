@@ -131,7 +131,7 @@ def _validate_params(self, params, supported_tasks):
 
 ### 5.2.2 `_validate_lora`：没开 LoRA 就别传 LoRA
 
-（LoRA，Low-Rank Adaptation：给基座模型外挂的一小撮低秩权重增量，训练时只调这一小撮参数，同一份基座就能插拔出多个微调变体，推理时按请求指定加载哪个变体——下文的 `lora_request` 就是「这次请求要用哪个 LoRA 变体」的句柄。）
+（LoRA，Low-Rank Adaptation：微软 Hu 等人 2021 年提出的高效微调方法。核心直觉来自一个观察——预训练模型收敛后的权重更新量具有较低的内在维度，因此不必更新全部参数：冻结原始权重、仅在旁路训练一小撮低秩参数，可训练量就能从千亿级压到百万级。论文报告相对全参数微调 GPT-3 175B，LoRA 将可训练参数量降低约 1 万倍、GPU 显存降低约 3 倍。推理时旁路参数既可以合并回原始权重（不引入额外延迟），也可以保持独立、按请求动态切换——vLLM 正是利用后者实现「一次部署、多 LoRA 变体按请求加载」，下文的 `lora_request` 就是句柄。进阶阅读：[原论文 arXiv:2106.09685](https://arxiv.org/abs/2106.09685)；vLLM 多 LoRA 部署：[官方文档](https://docs.vllm.ai/en/stable/features/lora/)。）
 
 ```python
 # vllm/v1/engine/input_processor.py:L138-L155
@@ -158,7 +158,7 @@ def _validate_lora(self, lora_request):
 
 [§5.1](#51-一句话钩子tokenize-已经不在这里了) 已经把这个分流讲透了——主路径透传 `EngineInput`，兜底路径走 `InputPreprocessor.preprocess()`。这里补一句兜底路径里发生了什么（图里「第 4–5 站」的徽标就挂在 `InputPreprocessor` 这格上）。
 
-`InputPreprocessor.preprocess()` 是老路径的预处理总入口：它先按是否 encoder-decoder 架构分流，decoder-only 的文本会走到 `_process_text()`，在那里调 `_tokenize_prompt()` 真正切词，再包成统一的 `TokensInput`。多模态、纯嵌入也各有委托。它的产物和主路径透传的 `EngineInput` 是**同一种 TypedDict 家族**（TypedDict：一种带静态字段约束的字典——用法和普通 dict 一样，但类型检查器知道每个 key 该是什么类型；`vllm/inputs/engine.py` 里以 `type` 字面量判别的三种变体：`TokensInput`、`EmbedsInput`、`MultiModalInput`，统一别名为 `DecoderOnlyEngineInput`）——这正是设计的巧妙处：不管走哪条路，出来的 `processed_inputs` 形状一致，后面的代码只靠 `type` 字段区分内容，不用区分来源。
+`InputPreprocessor.preprocess()` 是老路径的预处理总入口：它先按是否 encoder-decoder 架构分流，decoder-only 的文本会走到 `_process_text()`，在那里调 `_tokenize_prompt()` 真正切词，再包成统一的 `TokensInput`。多模态、纯嵌入也各有委托。它的产物和主路径透传的 `EngineInput` 是**同一种 TypedDict 家族**（TypedDict：Python 经 [PEP 589](https://peps.python.org/pep-0589/)（2019）引入的标准记法——给固定字段的 dict 加类型标注，用法和普通 dict 完全一样，但类型检查器知道每个 key 该是什么类型。`vllm/inputs/engine.py` 里以 `type` 字面量判别的三种变体——`TokensInput`、`EmbedsInput`、`MultiModalInput`——统一别名为 `DecoderOnlyEngineInput`，就是这种模式）——这正是设计的巧妙处：不管走哪条路，出来的 `processed_inputs` 形状一致，后面的代码只靠 `type` 字段区分内容，不用区分来源。
 
 两条路汇合后，立刻是一道平台级校验和一次结构拆分：
 
@@ -459,7 +459,7 @@ return EngineCoreRequest(
 
 注意 `cache_salt` 是从 `decoder_inputs.get("cache_salt")` 透传的——这个字段用来给前缀缓存分桶（让相同前缀但不该共享缓存的请求隔离开），在前缀缓存章节会用到，本章只管原样传下去。`sampling_params` 和 `pooling_params` 一定有且只有一个非空，对应生成 / 池化两类请求。
 
-`EngineCoreRequest` 不是普通 dataclass，它是个为**跨进程 IPC** 量身定做的 msgspec 结构体：
+`EngineCoreRequest` 不是普通 Python dataclass——它是一个 msgspec 结构体。msgspec 由 Jim Crist-Harif 开发，是用 C 扩展实现的 Python 序列化库，JSON/MessagePack 编解码比标准库 `json` 快得多（官方基准中 array_like 模式解码约 2 倍提速、编码约 1.5 倍提速），定位是「比 dataclass 多了快速序列化，比 pydantic 更快但更聚焦于序列化而非通用校验」。vLLM 选它而非 dataclass + pickle，正因请求须频繁跨进程传输（API 进程到 EngineCore 进程）——序列化开销是真实的性能预算。深入了解：[msgspec 官方文档](https://msgspec.dev/structs)。它的定义如下：
 
 ```python
 # vllm/v1/engine/__init__.py:L80-L137
@@ -544,7 +544,7 @@ def random_uuid() -> str:
     return f"{uuid.uuid4().int & MASK_64_BITS:016x}"  # 16 hex chars
 ```
 
-先把 uuid4 生成的 128 bit 整数掩码到低 64 bit，再格式化成 16 个十六进制字符——也就是说这串字符串本身只携带 64 bit 随机性，不是「uuid4 的完整 128 bit hex」。`:.8` 截取的是这 64 bit 空间里最高的 32 bit。注意目标不是「全局密码学唯一」——只是「在单实例内消歧外部重复的 id」。即便两个请求恰好都叫 `"req-abc"`，它们再撞上同一个 8 字符后缀的概率，按生日界（生日悖论的近似结论：n 个物件随机落入 s 个桶，任两个碰撞的概率约为 n²/2s，这里桶数 s 是 32 bit 空间 2³²）约为 $`n^2 / 2^{33}`$ ，小到可以忽略。这是个务实的工程取舍：不追求绝对唯一，只追求「实际上不会撞」。
+先把 uuid4 生成的 128 bit 整数掩码到低 64 bit，再格式化成 16 个十六进制字符——也就是说这串字符串本身只携带 64 bit 随机性，不是「uuid4 的完整 128 bit hex」。`:.8` 截取的是这 64 bit 空间里最高的 32 bit。注意目标不是「全局密码学唯一」——只是「在单实例内消歧外部重复的 id」。即便两个请求恰好都叫 `"req-abc"`，它们再撞上同一个 8 字符后缀的概率，按生日界（birthday bound，组合数学中「生日悖论」的近似结论：$`n`$ 个物件随机落入 $`s`$ 个等概率桶，任两个碰撞的概率约 $`n^2/(2s)`$——碰撞概率随 $`n`$ 的平方增长，因此仅 23 人的房间就有超 50% 概率出现两人同一天生日，远非直觉以为的 23/365≈6%。这里 $`s`$ 就是 32 bit 空间 $`2^{32}`$）约为 $`n^2 / 2^{33}`$ ，小到可以忽略。想深入数学细节：[生日问题维基百科](https://en.wikipedia.org/wiki/Birthday_problem)。这是个务实的工程取舍：不追求绝对唯一，只追求「实际上不会撞」。
 
 开头那个 `if request.external_req_id is not None: raise` 是道防呆——`external_req_id` 是内部字段，调用方本不该设它；设了说明用法错了，早报早好。
 
