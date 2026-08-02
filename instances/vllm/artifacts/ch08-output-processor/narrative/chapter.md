@@ -231,18 +231,18 @@ else:
 
 现在走到第 5 站：离开主轴单循环，钻进本章第一个独立子系统——detokenizer.py 在架构图上没有展开成组件，正文这一节把它讲全。单循环第 ③ 步只有一行 `detokenizer.update(...)`，但这一行背后是 V1 去 token 的全部精华。先讲清"为什么不能简单地一个 token 一个 token 各自解码再拼起来"。
 
-**为什么去 token 必须增量。** 现代 LLM 的分词器（Tokenizer）几乎都基于 BPE（Byte Pair Encoding，字节对编码）或其变体。BPE 的核心思路是：把文本切到基础符号（字符或字节），反复把出现频率最高的相邻符号对合并成新词表项，直到词表大小达到预设值。常见词保留整词、罕见词拆成子词——用"子词"折中词表大小（太大则内存爆炸）与序列长度（太长则注意力平方级变慢）。
+**为什么去 token 必须增量。** 现代 LLM 的分词器（Tokenizer）几乎都基于 BPE（Byte Pair Encoding，字节对编码）或其变体。BPE 本身比深度学习年长：它 1994 年诞生时是通用的数据压缩算法——反复合并最高频的相邻符号对来压缩数据；2015 年 Sennrich 等人把它借来当神经机器翻译的分词器（[arXiv:1508.07909](https://arxiv.org/abs/1508.07909)），从此成了主流 LLM 分词的事实标准。核心思路就一句话：把文本切到基础符号（字符或字节），反复把出现频率最高的相邻符号对合并成新词表项，直到词表大小达到预设值。常见词保留整词、罕见词拆成子词——用"子词"折中词表大小（太大则内存爆炸）与序列长度（太长则注意力平方级变慢）。
 
-GPT-2（2019）之后，主流模型大多走 byte-level BPE：把基础符号从 Unicode 字符换成 **256 个原始字节值**。好处是任何文本经 UTF-8 编码后都能落进这 256 个字节，词表从此**消灭未登录词**（`<unk>`，即"词表里没有这个字"的兜底 token）。代价是：训练语料中罕见的字符——如 emoji、非拉丁文字——很可能没能合并成整词 token，推理时被切成好几个"字节 token"。
+GPT-2（2019）之后，主流模型大多走 byte-level BPE：把基础符号从 Unicode 字符换成 **256 个原始字节值**。好处是任何文本经 UTF-8 编码后都能落进这 256 个字节，词表从此**消灭未登录词**（`<unk>`，即"词表里没有这个字"的兜底 token）。代价是：训练语料中罕见的字符——如 emoji、非拉丁文字——很可能没能合并成整词 token，推理时被切成好几个"字节 token"。GPT-2 自己的词表就是这份设计的具体模样：256 个字节 token、5 万条合并出来的子词、1 个特殊 token，凑出整整 50257 个词条。
 
 举个可核实的例子。emoji `✨`（U+2728）的 UTF-8 编码是 3 个字节 `0xE2 0x9C 0xA8`。若分词器没有为这三个字节组合专门保留一个词表项，模型就会把**一个字符**预测成 3 个独立 token（整数 226、156、168）。逐点拆看：
 (1) 单独解码 token `226` 只得到不完整、非法的 UTF-8 片段，**不是任何可显示字符**；
 (2) 必须等 3 个 token 到齐，拼起 `0xE2 0x9C 0xA8`，才能解码出 `✨` 这一个完整字符；
 (3) 所以不能 `decode(单 token)` 再拼接——一个字符可能横跨好几个 token 的边界。这就是为什么去 token 必须**增量**：维护跨 token 的解码状态，攒够一个合法 UTF-8 片段的全部字节才吐出文字。
 
-另一条技术路径——SentencePiece 的 `byte_fallback` 选项（Llama 系模型常用）——殊途同归：对训练时没见过的字符，退化成其 UTF-8 字节序列编码。不管哪条路，结论相同：去 token 必须增量。
+另一条技术路径来自 Google 2018 年的分词工具 SentencePiece：它不预设按空格分词（这对中日文这类没有天然词边界的语言很关键），正常按字符/子词训练词表，但对训练时没见过的字符，靠 `byte_fallback` 选项退化成其 UTF-8 字节序列编码——Llama 系模型常用这个组合。效果与 byte-level BPE 殊途同归：一个罕见字符仍会被拆成好几个字节 token。不管哪条路，结论相同：去 token 必须增量——这不是 vLLM 独有的设计选择，而是分词器本身逼出来的、所有 LLM 服务框架的共同刚需。
 
-真实 vLLM 为此准备了两套 `decode_next` 实现。**Fast 路径**直接调 HuggingFace `tokenizers` 库（Rust 核心 + `tokenizers` Python 包）里的 `DecodeStream`：先建流式解码器 `stream = DecodeStream()`，每来一个新 token 调 `stream.step(tokenizer, token_id)`——它内部缓冲着"还不能确定是不是完整字符"的待决字节，返回这一步新增的文字（`str`），或 `None`（表示当前 token 还凑不出一个合法字符，得接着喂）。这套接口把增量解码状态机完全封装在库内，调用方只管"喂 id、拿文字或 None"。**Slow 路径**是纯 Python 降级实现 `detokenize_incrementally`，用 `prefix_offset`/`read_offset` 滑窗达到等价效果，在 tokenizer 不支持 Fast 路径时兜底。两套解决同一个问题，本章把它们统一抽象成"给一个 token、吐出它新增的那段文字"这个接口。[想深挖 BPE 细节的读者，HuggingFace 官方教程](https://huggingface.co/docs/transformers/tokenizer_summary) 是很好的入口。
+真实 vLLM 为此准备了两套 `decode_next` 实现。**Fast 路径**直接调 HuggingFace `tokenizers` 库（Rust 核心 + `tokenizers` Python 包）里的 `DecodeStream`——这个类就是为流式生成场景而生的：在它出现之前，流式场景下想做增量解码，常见做法是每步把**全部**已生成的 token 重新 `decode` 一遍，再和上一次的结果做字符串 diff 取新增部分——正确但浪费，每步成本随生成长度线性增长，累计起来是平方级。`DecodeStream` 把这套增量逻辑下沉进 Rust 实现的分词器本身：先建流式解码器 `stream = DecodeStream(...)`，每来一个新 token 调 `stream.step(tokenizer, token_id)`——它内部缓冲着"还不能确定是不是完整字符"的待决字节，返回这一步新增的文字（`str`），或 `None`（表示当前 token 还凑不出一个合法字符，得接着喂）。把上一条的 emoji 例子落到这套接口上（示意）：依次喂 226、156、168 三个字节 token，前两次大概率返回 `None`——三个字节没凑齐，拼不出合法字符；第三次才返回 `"✨"`。调用方不需要知道字符背后是几个字节，只管循环"喂 id、拿文字或 None"。在 vLLM 的 Fast 实现里，`decode_next` 就是包着 `stream.step`、再把它返回的 `None` 归一成空字符串——单循环第 ③ 步调用的 `update` 里那句 `self.output_text += self.decode_next(new_token_id)` 追加的，正是这个"要么新文字、要么空串"的返回值。**Slow 路径**是纯 Python 降级实现 `detokenize_incrementally`，用 `prefix_offset`/`read_offset` 滑窗达到等价效果，在 tokenizer 不支持 Fast 路径时兜底。两套解决同一个问题，本章把它们统一抽象成"给一个 token、吐出它新增的那段文字"这个接口。[想深挖 BPE 细节的读者，HuggingFace 官方教程](https://huggingface.co/docs/transformers/tokenizer_summary) 是很好的入口；[`DecodeStream` 的 API 文档](https://huggingface.co/docs/tokenizers/api/decoders) 留给想跟它内部缓冲逻辑的读者。
 
 来看 `update` 本身的算法（`vllm/v1/engine/detokenizer.py`）——这部分 V1 是自己写的，是本章要讲清的：
 

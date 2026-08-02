@@ -18,7 +18,7 @@
 
 这一章就把这三个深水区填平。主角有两个：`allocate_slots` 的**完整**三阶段（[第 15 章](../../ch15-kv-cache/narrative/chapter.md#157-三段式分配allocate_slots) 只展开了中段），和它背后那个决定「有几种注意力类型、该怎么协调」的 `KVCacheCoordinator`。
 
-照例配一份**只做减法**的精简版：和真实 `vllm/v1/core/` 下的 `kv_cache_manager.py`、`kv_cache_coordinator.py`、`single_type_kv_cache_manager.py` 同名、同结构、同控制流。它复用 [第 15 章](../../ch15-kv-cache/narrative/chapter.md) 的块池与哈希基础设施，只补回那三个被跳过的分支；删掉的（Mamba 状态块、cross-attention 编码器、投机解码草稿头、上下文并行）都原样标注。它不 import vllm、不要 GPU，`pytest` 直接跑——用来在本地亲眼看不动点怎么收敛、窗外块怎么变成 null。正文的主线，始终是真实源码。
+照例配一份**只做减法**的精简版：和真实 `vllm/v1/core/` 下的 `kv_cache_manager.py`、`kv_cache_coordinator.py`、`single_type_kv_cache_manager.py` 同名、同结构、同控制流。它复用 [第 15 章](../../ch15-kv-cache/narrative/chapter.md) 的块池与哈希基础设施，只补回那三个被跳过的分支；删掉的（Mamba 状态块——状态空间模型的记忆单元，固定大小、不随序列变长，语义和注意力 KV 完全不同；cross-attention 编码器——Whisper 类编码器-解码器模型里，解码层对编码器输出做的注意力；投机解码草稿头；上下文并行——把序列长度切到多张卡上并行计算）都原样标注。它不 import vllm、不要 GPU，`pytest` 直接跑——用来在本地亲眼看不动点怎么收敛、窗外块怎么变成 null。正文的主线，始终是真实源码。
 
 我们先把 `allocate_slots` 的全貌摊开，再逐阶段下钻，最后上到协调层看 Unitary 与 Hybrid 的分野。
 
@@ -71,6 +71,8 @@ def allocate_slots(
 - **ext_comp**：`num_external_computed_tokens`，外部 connector 算好的 token——KV 在外面，但 vLLM 这边得分配真实块去**接收**它们。
 - **new**：`num_new_tokens`，本次真正要前向计算的 token（可能含未定稿的草稿 token）。
 - **lookahead**：`num_lookahead_tokens`，投机解码额外预留的草稿槽位。
+
+签名里还有一个 `num_encoder_tokens` 不在这张布局图上：编码器-解码器模型（如 Whisper 语音识别）里编码器输出的 token 数，cross-attention 层要按它做一次**静态**分配（一次性把编码器全部 token 的块预留好）；decoder-only 模型恒为 0，本章主线就当它不存在。剩下两个参数 `full_sequence_must_fit`（准入闸开关）和 `delay_cache_blocks`（P/D 延迟缓存标志）各在 §16.3、§16.4 展开。
 
 下面这张图把五段布局和三阶段的处理串了起来，先看全局，再逐段下钻：
 
@@ -175,7 +177,7 @@ def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
 
 `chunk=8`、`num_computed=13`：`13 // 8 * 8 = 8`——跳过前 8 个（整整一个 chunk），当前 chunk 内的 8\~12 保留。`num_computed=7`（还没跨过第一个 chunk 边界）：`7 // 8 * 8 = 0`，一个不跳。
 
-顺带背景：滑动窗口注意力在生产级 LLM 中的里程碑是 [Mistral 7B](https://arxiv.org/abs/2310.06825)（2023，窗口 4096），它证明 SWA 可以真正省显存而非学术玩具；分块本地注意力被 [Llama 4 的 iRoPE 架构](https://blog.vllm.ai/2025/04/05/llama4.html)（2025）推入主流——chunk=8192，搭配一层无位置编码的全注意力层兜底全局上下文。两者目标一致（把 KV cache 从线性增长压成常数），分歧全在「附近」怎么定义——而这恰好是上面两条公式长得不一样的根本原因。
+顺带背景：这两种局部注意力来路不同。滑动窗口的思路最早能追溯到 2020 年的 [Longformer](https://arxiv.org/abs/2004.05150)——局部窗口 + 少量全局 token，把长文档注意力从 $`O(n^2)`$ 压到 $`O(n\cdot w)`$；把它带进生产级 LLM 的里程碑是 [Mistral 7B](https://arxiv.org/abs/2310.06825)（2023，窗口 4096），它证明 SWA 可以真正省显存而非学术玩具。分块本地注意力是更晚近的选择，被 [Llama 4 的 iRoPE 架构](https://blog.vllm.ai/2025/04/05/llama4.html)（2025）推入主流：iRoPE（interleaved RoPE，交错旋转位置编码）下，分块层用带 RoPE 的注意力、另留一层不带位置编码的全注意力兜底全局上下文，分块取 chunk=8192。两者目标一致（把 KV cache 从线性增长压成常数），分歧全在「附近」怎么定义——而这恰好是上面两条公式长得不一样的根本原因。
 
 三种注意力，三种 `get_num_skipped_tokens`，这就是本章「各注意力类型差异」的第一个落点。精简版 `test_full_attention_never_skips`、`test_sliding_window_skipped_tokens`、`test_chunked_local_skipped_tokens_rounds_to_chunk` 把三条公式各钉了几个数值点。
 
@@ -294,7 +296,7 @@ def get_num_blocks_to_allocate(
     return num_new_blocks + num_evictable_blocks
 ```
 
-拆成两项相加：
+先认识一个记号：`cdiv`（向上取整除法，ceiling division）把 token 数按块大小进位成块数——17 个 token、块大小 16，就算 2 块。拆成两项相加：
 
 **第一项 `num_new_blocks`：要新建几块。** 核心是这个 `max`：
 
@@ -349,7 +351,7 @@ if apply_admission_cap and self._max_admission_blocks_per_request is not None:
 # issue #39734 or, worse, mid-prefill OOM.
 ```
 
-（注：issue #39734 是调度器整体准入闸 `can_fit_full_sequence` 级的死锁，本章的准入上限修的不是同一段代码，而是汲取了**同类教训**——任何时候估算口径与实际执行不一致，都可能在另一处触发死锁或 OOM。）
+（注：[issue #39734](https://github.com/vllm-project/vllm/issues/39734) 是调度器整体准入闸 `can_fit_full_sequence` 级的死锁——整条序列放不下的请求卡在队头反复重试，堵死后面所有请求。本章的准入上限修的不是同一段代码，而是汲取了**同类教训**：任何时候估算口径与实际执行不一致，都可能以另一种形态触发死锁或 OOM。）
 
 解法是**单一真相源**：准入上限和启动池估算用**同一个** spec 方法算出来。看 `get_manager_for_kv_cache_spec` 怎么注入这个上限：
 
@@ -549,6 +551,8 @@ def get_kv_cache_coordinator(
     return HybridKVCacheCoordinator(...)
 ```
 
+签名里还有两组与本章主线正交的参数，先认个名字：`use_eagle`（连同后面代码里的 `eagle_group_ids`）属于 EAGLE 投机解码——一种草稿模型，它自己的注意力层也占独立的 KV cache group，命中查找时要连带处理草稿层的块；非投机路径恒为 False/空。`dcp_world_size` / `pcp_world_size` 是解码/预填上下文并行的规模，默认 1 即不并行。
+
 三条岔路，对应三种拓扑：
 
 ![协调器三态工厂](../diagrams/02-coordinator-three-states.png)
@@ -602,7 +606,7 @@ def find_longest_cache_hit(
     return hit_blocks, len(hit_blocks[0]) * self.block_size
 ```
 
-命中长度 = 命中块数 × `block_size`，没有任何协调逻辑，因为只有一种注意力。它构造时断言 `hash_block_size == block_size` 且组数 == 1。[第 15 章](../../ch15-kv-cache/narrative/chapter.md#156-查表与命中从-block_hashes-到物理块) 讲的 `FullAttentionManager.find_longest_cache_hit`，走的就是 Unitary 这条委托。精简版 `test_unitary_find_longest_cache_hit_delegates` 验证它确实把调用透传给了唯一 manager。
+命中长度 = 命中块数 × `block_size`，没有任何协调逻辑，因为只有一种注意力——调用里的 `alignment_tokens=self.block_size` 就是让命中长度对齐到整块边界，单组下对齐粒度就是块大小。它构造时断言 `hash_block_size == block_size` 且组数 == 1。[第 15 章](../../ch15-kv-cache/narrative/chapter.md#156-查表与命中从-block_hashes-到物理块) 讲的 `FullAttentionManager.find_longest_cache_hit`，走的就是 Unitary 这条委托。精简版 `test_unitary_find_longest_cache_hit_delegates` 验证它确实把调用透传给了唯一 manager。
 
 真正烧脑的是 **Hybrid**——多种注意力，命中长度要让**所有类型同时成立**。下一节专门拆它。 **在架构模型图上，这是右列 KVCacheCoordinator 契约框里的第三个实现 `HybridKVCacheCoordinator`。**
 

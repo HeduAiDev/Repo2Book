@@ -15,9 +15,9 @@
 
 生产环境会立刻撞上这两个假设的墙。
 
-第一，**负载是潮汐式的**。白天峰值要 16 台 DP 引擎，凌晨两台就够。如果扩缩容必须"整个集群停下来重启"，那每次伸缩都是一次服务中断——这在 SLA 面前不可接受。我们想要的是：在引擎继续吐 token 的同时，悄悄把第 9 台引擎接进来，或者把第 16 台请下去。
+第一，**负载是潮汐式的**。白天峰值要 16 台 DP 引擎，凌晨两台就够。如果扩缩容必须"整个集群停下来重启"，那每次伸缩都是一次服务中断——这在 SLA（服务等级协议）面前不可接受。我们想要的是：在引擎继续吐 token 的同时，悄悄把第 9 台引擎接进来，或者把第 16 台请下去。
 
-第二，**对话是有状态的**。Responses API 不像 chat completions 那样要求客户端每轮自己把全部历史回传；它给你一个 `previous_response_id`，下一轮只发新的一句话，服务器负责把前文接上。这意味着引擎前面那层得有个"会话记忆"。
+第二，**对话是有状态的**。Responses API 不像 chat completions（OpenAI 早先的对话接口：无状态，客户端每轮都得把完整的历史消息数组原样回传，历史越长、每轮传得越多）那样要求客户端每轮自己把全部历史回传；它给你一个 `previous_response_id`（上一轮响应的 id），下一轮只发新的一句话，服务器负责把前文接上。这意味着引擎前面那层得有个"会话记忆"。
 
 这两件事看起来八竿子打不着，却都属于同一个主题——**让一台已经在运行的引擎，在不重启的前提下改变自己的行为**。一个改的是分布式拓扑，一个改的是会话状态。本章就拆开看它们各自怎么做到"原地变身"。前者的代码集中在 `vllm/distributed/elastic_ep/elastic_state.py` 与 `vllm/v1/engine/core.py`，后者在 `vllm/entrypoints/openai/responses/serving.py` 一带。
 
@@ -33,7 +33,7 @@
 
 先把问题摆正。
 
-一台 DP EngineCore 进程的核心是 `vllm/v1/engine/core.py` 里的 `run_busy_loop`：一个 `while` 循环，每轮 poll 输入队列、跑一步模型 forward、和组里其它 rank 用集合通信对齐 DP wave 状态。这个循环不能停——更准确地说，**组里的 rank 必须步调一致地进出集合通信**。第 7 台引擎如果卡在某个 `all_reduce` 上，其余引擎就全被它拖死。
+一台 DP EngineCore 进程的核心是 `vllm/v1/engine/core.py` 里的 `run_busy_loop`：一个 `while` 循环，每轮 poll 输入队列、跑一步模型 forward、和组里其它 rank 用集合通信对齐 DP wave 状态。这个循环不能停——更准确地说，**组里的 rank 必须步调一致地进出集合通信**。第 7 台引擎如果卡在某个 `all_reduce`（torch.distributed 的集合通信操作：组内每个进程各贡献一份数据，按指定规则归约成同一个结果、再广播回每个成员）上，其余引擎就全被它拖死。
 
 现在你要往这个组里加一台引擎。"加一台"意味着什么？
 
@@ -43,7 +43,7 @@
 - 要把所有引擎从"用旧组通信"切到"用新组通信"；
 - 全程**不能让正在服务的请求停下来**。
 
-天真的做法是写一个 `reconfigure()` 函数，里面顺序地建组、传权重、切换、销毁旧组。问题是这个函数会**阻塞**——它一执行就是几秒，而这几秒里 busy loop 停转，正在 decode 的请求全部僵住。更糟的是，DP 各 rank 收到"该重配了"这条通知的时刻**有先后**：rank 0 可能已经进了 `reconfigure()` 在等 barrier，rank 3 还蒙在鼓里继续 forward——经典的分布式竞态。
+天真的做法是写一个 `reconfigure()` 函数，里面顺序地建组、传权重、切换、销毁旧组。问题是这个函数会**阻塞**——它一执行就是几秒，而这几秒里 busy loop 停转，正在 decode 的请求全部僵住。更糟的是，DP 各 rank 收到"该重配了"这条通知的时刻**有先后**：rank 0 可能已经进了 `reconfigure()` 在等 barrier（torch.distributed 的全员同步点：调用它的进程阻塞住，直到组内所有进程都执行到同一处才一起放行），rank 3 还蒙在鼓里继续 forward——经典的分布式竞态。
 
 vLLM 的答案是把"重建"拆成一台**确定性状态机**，每轮 busy loop 只推进**一步**，绝不阻塞。落后的 rank 多 forward 一步追上来即可。这就是 `ElasticEPScalingState`。
 
@@ -160,7 +160,7 @@ def run_busy_loop(self):
 
 ## 39.5 触发扩缩：reinitialize_distributed 与"转非阻塞"
 
-对**已经在跑**的引擎，扩缩由一条 `ReconfigureDistributedRequest` 触发。外部的扩缩工具经 `EngineCoreClient` 把这条指令下发给每台存在引擎，引擎在 `reinitialize_distributed` 里接住它：
+对**已经在跑**的引擎，扩缩由一条 `ReconfigureDistributedRequest`（携带新 DP 规模、新 rank 与新的 master 地址等字段的扩缩指令）触发。外部的扩缩工具经 `EngineCoreClient`（[第 7 章](../../ch07-engine-core/narrative/chapter.md)读过的客户端代理：前端跨进程调用 EngineCore 的统一通道）把这条指令下发给每台存在引擎，引擎在 `reinitialize_distributed` 里接住它：
 
 ```python
 # vllm/v1/engine/core.py:L1869-L1915
@@ -244,7 +244,7 @@ else:
 
 二是 **`old_dp_group` 与 `new_dp_group` 按角色取值**：对存在引擎，`dp_group` 现在指向的是旧组，所以塞进 `old_dp_group`；对新引擎，它手里的 `dp_group` 一开始就是为新组建的，塞进 `new_dp_group`。这个"old/new 各指一边"的设计，后面切换时（§39.6 的 `_switch_and_prepare`）会让"销毁旧的、切到新的"读起来格外顺。
 
-顺带点一句：上面出现的 `dp_store`（实际是 `torch.distributed` 的 TCPStore——一个基于 TCP 的键值存储服务，让分布式进程间低成本地对暗号），以及后文 §39.6–§39.7 将用到的 `all_reduce`（集合通信：全组按指定操作归约、再把结果广播回每个成员）和 `barrier`（全员同步点：调用的进程阻塞直到组内所有进程都到达同一行），都是 PyTorch `torch.distributed` 的标准原语；本章只是用它们搭自定义的扩缩协议，不必担心这些基础件本身是本仓自造的魔法。
+顺带点一句：上面出现的 `dp_store` 实际是 PyTorch `torch.distributed` 的 TCPStore——一个基于 TCP 的键值存储服务，一般由组内一个 leader 进程起一个小 server、其余 rank 当 client 连过去，提供 `get`/`add`/`check`/`delete_key` 这类键值操作，让分布式进程间低成本地对暗号（比如"计数器到没到齐"）。它和 §39.2 已介绍过的 `all_reduce`、`barrier` 一样，都是 `torch.distributed` 的标准原语；本章只是拿它们搭自定义的扩缩协议——这些基础件不是本仓自造的魔法。
 
 ---
 
@@ -367,7 +367,7 @@ def _switch_and_prepare(self):
 
 三件事，环环相扣：
 
-- **销毁旧组、把 `engine_core` 的 `dp_group`/`dp_rank`/`dp_store` 整体切到新组。** 切换完成后，busy loop 里那些"和组里对齐 wave"的集合通信，自动就走新组了——`engine_core` 根本不知道脚下换了组，它只认 `self.dp_group` 这个引用。
+- **`collective_rpc`（[第 17 章](../../ch17-worker-and-executor/narrative/chapter.md)的核心原语：把一次方法调用广播给组内每个 worker 执行并收齐结果）把 `switch_and_prepare` 这个动作广播出去，随后 `stateless_destroy_torch_distributed_process_group`（vLLM 的免全局协调销毁：只对这个进程组对象调 `shutdown`、再把它从注册表摘除，不碰 torch 全局的组管理状态，销毁旧组不会波及刚建好的新组）销毁旧组，`engine_core` 的 `dp_group`/`dp_rank`/`dp_store` 整体切到新组。** 切换完成后，busy loop 里那些"和组里对齐 wave"的集合通信，自动就走新组了——`engine_core` 根本不知道脚下换了组，它只认 `self.dp_group` 这个引用。
 - **跨新组 `all_reduce(MAX)` 对齐 DP wave 三元组 `[engines_running, current_wave, step_counter]`。** 这是和[第 21 章 DP wave 协议](../../ch21-async-engine/narrative/chapter.md)的接缝。新组里既有老引擎（带着自己的 `current_wave`）也有新引擎（wave 还是 0），取 MAX 就让全组采纳"跑得最远的那个 wave"——避免有谁重放旧 wave 或拖慢全组。这个不变量，§39.8 还会再遇到。
 
 把"跑得最远的 wave"从口号落成一次可手算的逐分量取最大。假设切换时新组里两台老引擎与一台刚入组的新引擎各持这样三个三元组：
@@ -688,7 +688,7 @@ def _progress_removing_engine(self) -> bool:
         return True
 ```
 
-它和余留引擎的差别在动词：余留引擎调 `_switch_and_prepare`（切到新组**准备继续干活**），被裁引擎调 `_switch_and_remove`（切完就**准备退场**），并在 `COMPLETE` 前发出 `SHUTDOWN_COMPLETE` 通知——让 `EngineCoreClient` 知道这台可以释放它的 ray placement group（Ray 预留给这批 worker 的那组节点资源）了。然后呢？回到 §39.4 那段 busy loop 钩子：`is_complete()` 为真 + `worker_type == "removing"` → `raise SystemExit`，进程干净下线。
+它和余留引擎的差别在动词：余留引擎调 `_switch_and_prepare`（切到新组**准备继续干活**），被裁引擎调 `_switch_and_remove`（切完就**准备退场**），并在 `COMPLETE` 前发出 `SHUTDOWN_COMPLETE` 通知——让 `EngineCoreClient` 知道这台可以释放它的 ray placement group（Ray 的"资源预订单"，[第 3 章](../../ch03-config-and-wiring/narrative/chapter.md)已见过：把一批 worker 要的 GPU 等资源在集群里打包成一次原子预留，要么整批占成功、要么整批失败，避免"有的 worker 拿到 GPU、有的还在排队"的成组调度死锁；这里释放的就是这单预留给这批 worker 的资源）了。然后呢？回到 §39.4 那段 busy loop 钩子：`is_complete()` 为真 + `worker_type == "removing"` → `raise SystemExit`，进程干净下线。
 
 至此，弹性 EP 的四种角色全部走完。一句话总结：**把"重建分布式组"这件本质阻塞的事，拆成一台每轮只走一步的状态机，让它和正常推理交织进行；用 TCPStore 计数 + 两阶段 barrier 容忍各 rank 的时间偏序；用 all_reduce(MAX) 把变动后的成员收敛回同一条 DP wave。** 不停机，靠的就是这三招。
 
@@ -727,7 +727,7 @@ Responses API 的卖点是**有状态会话**：客户端第一轮发"我叫 Bob
             messages, engine_inputs = await self._make_request(request, prev_response)
 ```
 
-逻辑直白：有 `previous_response_id` 就去 `response_store` 把上一轮的 `ResponsesResponse` 捞出来（捞不到就 404）；没有就是新会话。然后按 `use_harmony` 分两条拼接路径——普通路径和 harmony 路径。Harmony 不是 vLLM 自造的格式——它是 OpenAI 为 gpt-oss 系列开源模型设计的一套消息规范（GitHub `openai/harmony`），vLLM 在此实现它的解析与拼接。它在标准 `role/content` 之外给 assistant 消息加了一个 `channel` 字段：`"final"`（正式回复，展示给用户）、`"analysis"`（内部推理草稿/思维链，不展示）、`"commentary"`（工具调用旁白）。三者用特殊 token 区隔，一段简化序列长这样：
+逻辑直白：有 `previous_response_id` 就去 `response_store` 把上一轮的 `ResponsesResponse` 捞出来（捞不到就 404）；没有就是新会话。然后按 `use_harmony`（模型是 gpt-oss 系列时为真——它的对话文本就长在 Harmony 记法上）分两条拼接路径——普通路径和 harmony 路径。Harmony 不是 vLLM 自造的格式——它是 OpenAI 为 gpt-oss 系列（它的开放权重模型家族：gpt-oss-20b/120b 等）开源模型设计的一套消息规范（GitHub `openai/harmony`），vLLM 在此实现它的解析与拼接。它要解决的是普通 chat 格式的痛点：输出是一整段文本，模型若把思维链也吐出来，前端要么全展示（把不该给用户看的中间推理暴露出去）、要么全隐藏（连最终回答的解释也一起藏掉）；`channel` 把输出按"性质"分流，下游就能决定哪些展示、哪些隐藏、哪些转发给工具执行器。它在标准 `role/content` 之外给 assistant 消息加了一个 `channel` 字段：`"final"`（正式回复，展示给用户）、`"analysis"`（内部推理草稿/思维链，不展示）、`"commentary"`（工具调用旁白）。三者用特殊 token 区隔，一段简化序列长这样：
 
 ```text
 （说明性/外部示例：Harmony channel 记法，摘自 OpenAI harmony 规范）
@@ -750,13 +750,13 @@ Responses API 的卖点是**有状态会话**：客户端第一轮发"我叫 Bob
         # HACK(woosuk): This is a hack. We should use a better store.
 ```
 
-就是两个**进程内的普通字典**：`response_store` 是 `id → ResponsesResponse`，`msg_store` 是 `id → 消息序列`。源码自己挂了 `HACK` 和 `FIXME`——它从不清理，长跑会内存泄漏。这是务实的折中：实现"有状态会话"的最小代价，先用字典顶着。读源码时把这种自承认的临时方案如实看待，比脑补一个"优雅的会话存储"更接近真相。
+就是两个**进程内的普通字典**：`response_store` 是 `id → ResponsesResponse`（vLLM 对一次响应的内部表示：id、输出条目、状态等），`msg_store` 是 `id → 消息序列`。源码自己挂了 `HACK` 和 `FIXME`——它从不清理，长跑会内存泄漏。这是务实的折中：实现"有状态会话"的最小代价，先用字典顶着。读源码时把这种自承认的临时方案如实看待，比脑补一个"优雅的会话存储"更接近真相。
 
 ---
 
 ## 39.11 非 harmony 拼接：把上一轮织进这一轮
 
-普通路径的拼接在 `construct_input_messages`，一个纯函数，把"上轮历史 + 上轮输出 + 本轮输入"织成一串 chat 消息：
+普通路径的拼接在 `construct_input_messages`，一个纯函数，把"上轮历史 + 上轮输出 + 本轮输入"织成一串 chat 消息（签名里的 `ChatCompletionMessageParam`、`ResponseInputOutputItem`、`ResponseOutputItem` 都是 OpenAI Python SDK 的类型，分别表示一条 chat 消息、请求的一个输入条目、响应的一个输出条目）：
 
 ```python
 # vllm/entrypoints/openai/responses/utils.py:L79-L121
@@ -798,7 +798,7 @@ def construct_input_messages(
 1. **本轮的 `instructions`** 作为 `system` 消息打头（如果有）。
 2. **上一轮的历史消息**前置进来——但**滤掉其中的 `system` 消息**。这条注释点出 OpenAI 规范的一个讲究：instructions（系统提示）**不跨轮携带**，每轮的 system 由当轮请求决定。所以上轮的 system 要扔掉，只留对话本身。
 3. **上一轮的输出**转成 `assistant` 消息接上——但只取 `ResponseOutputMessage`，**跳过 reasoning**（思维链不回灌）。
-4. **本轮的新输入**作为 `user` 消息收尾。
+4. **本轮的新输入**作为 `user` 消息收尾（若输入是工具调用列表，先经 `construct_chat_messages_with_tool_call` 转成带工具调用的消息）。
 
 织完这一串，喂给引擎，模型就"看见"了完整上下文。下一轮再来，这一轮的输出又会变成它的 `prev_response_output`，循环往复。
 
@@ -808,7 +808,7 @@ def construct_input_messages(
 
 ## 39.12 harmony 路径与那个共享的 list
 
-harmony 是另一种消息格式，拼接走 `_construct_input_messages_with_harmony`。新会话和续轮分两支：
+harmony 是另一种消息格式（消息类型 `OpenAIHarmonyMessage`：harmony 格式的一条消息，带 role/channel/content），拼接走 `_construct_input_messages_with_harmony`。新会话和续轮分两支：
 
 ```python
 # vllm/entrypoints/openai/responses/serving.py:L1150-L1177
@@ -879,7 +879,7 @@ harmony 是另一种消息格式，拼接走 `_construct_input_messages_with_har
             self.msg_store[request.request_id] = messages
 ```
 
-平平无奇一行赋值。玄机在于：**这个 `messages` list，同时也被传进了生成时用的 `HarmonyContext`，成为它的 `_messages`——两者是同一个 list 对象。** 于是生成过程中，`HarmonyContext.append_output` 一旦把模型输出追加进 `_messages`，`msg_store` 里这条 list 就**自动**含上了本轮输出，无需任何显式写回：
+平平无奇一行赋值。玄机在于：**这个 `messages` list，同时也被传进了生成时用的 `HarmonyContext`，成为它的 `_messages`——两者是同一个 list 对象。** 于是生成过程中，`HarmonyContext.append_output`（用 `get_streamable_parser_for_assistant`——harmony 流式解析器的工厂：逐 token 吞入、攒出结构化的完整消息——把输出 token 流解析成消息）一旦把模型输出追加进 `_messages`，`msg_store` 里这条 list 就**自动**含上了本轮输出，无需任何显式写回：
 
 ```python
 # vllm/entrypoints/openai/responses/context.py:L559-L583
@@ -889,7 +889,7 @@ harmony 是另一种消息格式，拼接走 `_construct_input_messages_with_har
         for token_id in output_token_ids:
             self.parser.process(token_id)
             self._update_num_reasoning_tokens()
-        # … 省略：prefill/decode 的 token 计数与 TurnMetrics 统计（旁路） …
+        # … 省略：prefill/decode 的 token 计数与每轮统计（旁路） …
         # append_output is called only once before tool calling
         # in non-streaming case so we can append all parser messages
         output_msgs = self.parser.messages

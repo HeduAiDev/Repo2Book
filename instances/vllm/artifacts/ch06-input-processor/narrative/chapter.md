@@ -279,7 +279,7 @@ def add_request(
     self.external_req_ids[req_state.external_req_id].append(request_id)
 ```
 
-每个 child 在这里拿到一份**独立的** `RequestState`。这点很要紧：n 路各有各的 detokenizer、各有各的 logprobs 累积状态，互不干扰——它们在输出处理眼里就是 n 个独立请求（输出处理的全部细节留 [第 8 章](../../ch08-output-processor/narrative/chapter.md)）。注意传进去的 `request_index` 正是扇出时的 `idx`，它后面会变成 `CompletionOutput.index`，是归并时归位的依据。
+每个 child 在这里拿到一份**独立的** `RequestState`。这点很要紧：n 路各有各的 detokenizer、各有各的 logprobs 累积状态，互不干扰——它们在输出处理眼里就是 n 个独立请求（输出处理的全部细节留 [第 8 章](../../ch08-output-processor/narrative/chapter.md)）。注意传进去的 `request_index` 正是扇出时的 `idx`，它后面会变成 `CompletionOutput.index`——`CompletionOutput`（vLLM 的标准输出结构，装一路生成的结果：文本、token 序列与 logprobs）的 `index` 字段，是归并时归位的依据。
 
 这段还顺手织了两张表，正是 n>1 归并与取消的两条命脉：
 
@@ -390,7 +390,7 @@ for request_id in internal_req_ids:
     req_state = self.request_states.pop(request_id, None)
     if req_state is not None:
         request_ids_to_abort.append(request_id)
-        # … 省略：产出 abort 终态 output、清理 lora 状态 …
+        # … 省略：产出 abort 终态 output、清理 lora（低秩适配权重）状态 …
     elif parent := self.parent_requests.get(request_id):
         # Abort children prior to removing the parent.
         if parent.child_requests:

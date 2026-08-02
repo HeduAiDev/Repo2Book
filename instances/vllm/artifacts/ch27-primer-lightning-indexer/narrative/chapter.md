@@ -2,11 +2,11 @@
 
 ## 你在这里
 
-![你在这里：全书架构模型已读 15 个组件，本章在 EngineCore「模型与算子」组的「注意力后端」子系统里展开——Indexer 容器内含 DeepseekV32IndexerCache 与 SparseAttnIndexer，平级还有 DeepseekV32IndexerMetadataBuilder、DeepseekV32IndexerBackend、DeepseekCompressor 三个组件；本章 8 站中 6 站在这些橙色组件上，另有 1 站经过第 28 章才讲的组件、1 站经过本子系统未展开的文件。](../diagrams/arch-model.png)
+![你在这里：全书架构模型已读 15 个组件，本章在 EngineCore「模型与算子」组的「注意力后端」子系统里展开——Indexer 容器内含 DeepseekV32IndexerCache 与 SparseAttnIndexer，平级还有 DeepseekV32IndexerMetadataBuilder、DeepseekV32IndexerBackend、DeepseekCompressor 三个组件；本章 8 站中 6 站在这些橙色组件上，另有 1 站经过下一章才讲的组件、1 站经过本子系统未展开的文件。](../diagrams/arch-model.png)
 
 > *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向；当年 `EngineCore` 框里只画了调度器与分页 KV 缓存，如今已按「调度与显存／执行与并行／模型与算子／解码策略」四组装满一路读过来的组件。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
 > *本章新长的这块在「模型与算子」组的「注意力后端」子系统里就地展开——摊开的不是一列类名，而是源码里真实的组织关系。容器 `Indexer` 包着本章最核心的两个类：`DeepseekV32IndexerCache`（索引器专属缓存，每条 132 字节、跨头存一份）和 `SparseAttnIndexer`（封装打分与 top-k 选择内核）。平级还有 `DeepseekV32IndexerMetadataBuilder`（在调度阶段装配索引器元数据）、`DeepseekV32IndexerBackend`（声明索引器缓存 shape，继承自 `AttentionBackend`）和 `DeepseekCompressor`（V4 每 m 个 token 压一块的压缩算子）。本章走线共 8 站，6 站在这些橙色组件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
-> *这块新结构接在读者已经走过的两段路上。「注意力后端」这个子系统本身由[第 24 章](../../ch24-prefix-caching/narrative/chapter.md)打开大门、[第 25 章](../../ch25-attention/narrative/chapter.md)把元数据抽象讲透——本章的 `DeepseekV32IndexerMetadataBuilder` 产出的就是同一套元数据管道的下游消费者，`DeepseekV32IndexerBackend` 继承的 `AttentionBackend` 也是第 25 章建立的那份契约。旁边的「量化」子系统（[第 26 章](../../ch26-primer-quantization/narrative/chapter.md)）把 FP8/MXFP4 精度账推完了，本章直接拿它去核算打分器为什么便宜到敢扫全历史。*
+> *这块新结构接在读者已经走过的两段路上。「注意力后端」这个子系统本身由[第 24 章](../../ch24-primer-flash-attention/narrative/chapter.md)打开大门、[第 25 章](../../ch25-attention/narrative/chapter.md)把元数据抽象讲透——本章的 `DeepseekV32IndexerMetadataBuilder` 产出的就是同一套元数据管道的下游消费者，`DeepseekV32IndexerBackend` 继承的 `AttentionBackend` 也是[第 25 章](../../ch25-attention/narrative/chapter.md)建立的那份契约。旁边的「量化」子系统（[第 26 章](../../ch26-primer-quantization/narrative/chapter.md)）把 FP8/MXFP4 精度账推完了，本章直接拿它去核算打分器为什么便宜到敢扫全历史。*
 > *本章把打分器的数学原理全部推完，然后交棒给[模型架构章](../../ch28-model-architecture/narrative/chapter.md)——那章是原理落地的第一站，indexer 的缓存布局与调用链在真实 vLLM 源码里接回整棵模型树。*
 
 上一章把[量化数学](../../ch26-primer-quantization/narrative/chapter.md)从 scale/zero-point 一路推到了 e8m0 块 scale——FP8/FP4 怎么用更少的比特装下同一个张量，是这一章要直接借用的底座。再往前，[注意力后端](../../ch25-attention/narrative/chapter.md)那一章把元数据抽象讲透了：一份 metadata 喂饱所有 kernel，稠密因果注意力照着 slot mapping 在 KV cache 上取数、算数。这两条线在本章交汇：DeepSeek-V3.2/V4 的稀疏注意力（DeepSeek Sparse Attention，简称 DSA）在主注意力之前塞进一个**独立的小打分器**——lightning indexer（闪电索引器）——它替每个 query 把「该看历史里的谁」先挑出来，主注意力只在被挑中的少数条目上算。
@@ -23,11 +23,11 @@
 
 ### 先修：不懂这三样也能跟上
 
-> **MLA（Multi-head Latent Attention，多头潜在注意力）**：DeepSeek 把每个历史 token 的 KV 压成一个低秩「latent 向量」存起来，主注意力在这些 latent 上算。你只需要接受一件事：主注意力真正消费的 KV 条目是这些压缩过的 latent，而不是原始的 K/V。本章的索引器就是在这些 latent 上打分选块。MLA 首次提出于 DeepSeek-V2（arXiv:2405.04434，2024），比本章 DSA 的出处早两代——它把 KV cache 压到前代的 6.7%，为 indexer 运行在压缩 latent 之上提供了物理前提。
+> **MLA（Multi-head Latent Attention，多头潜在注意力）**：DeepSeek 把每个历史 token 的 KV 压成一个低秩「latent 向量」存起来，主注意力在这些 latent 上算。你只需要接受一件事：主注意力真正消费的 KV 条目是这些压缩过的 latent，而不是原始的 K/V。本章的索引器就是在这些 latent 上打分选块。MLA 首次提出于 DeepSeek-V2（[arXiv:2405.04434](https://arxiv.org/abs/2405.04434)，2024），比本章 DSA 的出处早两代——它把 KV cache 压到前代的 6.7%，为 indexer 运行在压缩 latent 之上提供了物理前提。
 
-> **稀疏注意力谱系（NSA，Native Sparse Attention，arXiv:2502.11089）**：削减 $`O(L^2)`$ 注意力税的思路最早由 NSA 系统化——用「压缩 + 选择 + 滑窗」三条支路并行打分，训练推理共用一套稀疏模式。你不需要看它的三支路设计，只要接受「先给历史 token 打分、再按分选一小撮」这个套路是成立且可训练的。DSA 是这条谱系在生产模型上的一支落地，只保留「打分 + top-k」这一路。
+> **稀疏注意力谱系（NSA，Native Sparse Attention，[arXiv:2502.11089](https://arxiv.org/abs/2502.11089)）**：削减 $`O(L^2)`$ 注意力税的思路最早由 NSA 系统化（DeepSeek 团队，2025 年初发表）——用「压缩 + 选择 + 滑窗」三条支路并行打分，训练推理共用一套稀疏模式。你不需要看它的三支路设计，只要接受「先给历史 token 打分、再按分选一小撮」这个套路是成立且可训练的。DSA 是这条谱系在生产模型上的一支落地，只保留「打分 + top-k」这一路。
 
-> **FP8 / MXFP4（低精度定点）**：把一个浮点值用 8 bit（甚至 4 bit）近似存储，配一个共享的缩放因子 scale 还原量级。你只需要接受「精度换吞吐」这个交易存在、且量化会带来有界误差——具体的位模式与 scale 数学见量化数学那一章，本章直接用结论。
+> **FP8 / MXFP4（低精度定点）**：把一个浮点值用 8 bit（甚至 4 bit）近似存储，配一个共享的缩放因子 scale 还原量级。你只需要接受「精度换吞吐」这个交易存在、且量化会带来有界误差——具体的位模式与 scale 数学见[量化数学那一章](../../ch26-primer-quantization/narrative/chapter.md)，本章直接用结论。
 
 ### 符号速查表
 
@@ -51,7 +51,7 @@
 
 ## 一、打分函数：一个被削到只剩「该看谁」的注意力
 
-先亮洞见：**lightning indexer 就是一个被削到只剩打分的注意力**。拿标准注意力算子来削三刀——softmax 换成 ReLU（免掉指数与归一化）、value 与输出投影整个砍掉（它不产出内容，只产出「该看谁」）、多头的意见折叠成一个可学习的标量话语权——削完剩下的最小算子，就是 DSA 的打分函数。三刀刀刀砍在成本上，砍出来的正是主线需要的那个「便宜账户」：便宜到敢给每个 query 对**全部**历史 token 都打一遍分，而真正贵的主注意力只在被点名的少数条目上算。一句比喻就够：这是一个只打分、不答题的小评委会。这个打分器来自 DeepSeek-V3.2 技术报告（arXiv:2512.02556，2025 年 12 月）——论文同时覆盖了 RL 训练框架与 agentic 数据合成，本章只取其中 DSA 打分器的部分。
+先亮洞见：**lightning indexer 就是一个被削到只剩打分的注意力**。拿标准注意力算子来削三刀——softmax 换成 ReLU（免掉指数与归一化）、value 与输出投影整个砍掉（它不产出内容，只产出「该看谁」）、多头的意见折叠成一个可学习的标量话语权——削完剩下的最小算子，就是 DSA 的打分函数。三刀刀刀砍在成本上，砍出来的正是主线需要的那个「便宜账户」：便宜到敢给每个 query 对**全部**历史 token 都打一遍分，而真正贵的主注意力只在被点名的少数条目上算。一句比喻就够：这是一个只打分、不答题的小评委会。这个打分器来自 DeepSeek-AI 的开源大模型 DeepSeek-V3.2 的技术报告（[arXiv:2512.02556](https://arxiv.org/abs/2512.02556)，2025 年 12 月发布）——论文同时覆盖了 RL（强化学习）训练框架与 agentic（智能体式）数据合成等其余创新，本章只取其中 DSA 打分器的部分。
 
 ### 打分函数 Eq.(1)：三步装配一个分数
 
@@ -90,7 +90,7 @@ I_{t,s} = \sum_{j=1}^{H^I} w_{t,j}^I \cdot \mathrm{ReLU}\left(\mathbf{q}_{t,j}^I
 
 > **严谨（单调性与它的前提）**： $`\mathrm{ReLU}(x)=\max(x,0)\ge 0`$ ，故 $`w_{t,j}^I>0`$ 时每头贡献项 $`w_{t,j}^I \cdot \mathrm{ReLU}(\cdot)`$ 非负，加权和非负、下界为 $`0`$ ；且对固定的 $`s`$ ，任一头的正相关点积增大时，它对总分的贡献系数就是 $`w_{t,j}^I > 0`$ ，总分只增不减——打分对「正相关证据」单调。注意两条都以 $`w>0`$ 为前提：一般情形 $`w`$ 由 $`\mathbf{h}_t`$ 投影而来、可以为负，届时下界与单调性都不再保证，本例只是 $`w>0`$ 的特例。
 
-放大到真实 config，这个小评委会有 $`H^I = 64`$ 个头、每头 $`128`$ 维，每个 $`(t,s)`$ 对是 $`64`$ 次长度-$`128`$ 的点积再加权。但全程 FP8、无 softmax、无反向——单个分数即便要扫全部历史，也远比一次主 MLA 全头计算便宜。「便宜账户」三个字的着落就在这里。
+放大到真实 config，这个小评委会有 $`H^I = 64`$ 个头、每头 $`128`$ 维，每个 $`(t,s)`$ 对是 $`64`$ 次长度-$`128`$ 的点积再加权。但全程 FP8、无 softmax、无反向（反向传播：训练时让梯度流回参数的阶段，推理前向用不到它）——单个分数即便要扫全部历史，也远比一次主 MLA 全头计算便宜。「便宜账户」三个字的着落就在这里。
 
 ### top-k 闸门 Eq.(2)：主注意力只见名单，不见分数
 
@@ -152,7 +152,7 @@ $`t_0`$ 的分数 `3, 4, 2, 0` 降序索引是 `1, 0, 2, 3`（ $`s_1`$ 分最高
 
 对每个 query $`t`$ ，稀疏核算数 $`\min(t+1, k) \le`$ 稠密核算数 $`t+1`$ 逐 $`t`$ 成立，求和后 sparse ≤ dense、加速比 ≥ 1 **恒成立**。当 $`t+1 \le k`$ （因果早期、历史还不够 $`k`$ 个）时两者相等，收益为零。所以 $`L \gg k`$ 时稠密总量 $`\approx L^2/2`$ 、稀疏总量 $`\approx Lk`$ ，比值 $`\approx L/(2k)`$ 随 $`L`$ 线性放大——这解释了为何 DSA 是**长上下文**优化，短序列几乎不省。
 
-代入真实长上下文 $`L = 131072`$ （128k）、 $`k = 2048`$ ：主注意力核算对数从稠密 $`8590000128`$ 降到稀疏 $`266339328`$ ，加速约 $`32\times`$ （精确 $`32.252090566211834`$ ）；而 indexer 自身照样真实扫描全部 $`8590000128`$ 对——与稠密主注意力同数、 $`O(L^2)`$ 原封不动，按 $`0.25\times`$ 单价折算成本为 $`2147500032`$ （仍与 $`L^2`$ 同阶）。 $`O(L^2)`$ 项没被消灭，只是换成了便宜账户——这笔换不掉的平方项还会以**内存**形态再现（prefill 时打分矩阵本身就是 $`O(L^2)`$ 大小，工程上只能分块直面），落地见[模型架构章](../../ch28-model-architecture/narrative/chapter.md)。
+代入真实长上下文 $`L = 131072`$ （128k）、 $`k = 2048`$ ：主注意力核算对数从稠密 $`8590000128`$ 降到稀疏 $`266339328`$ ，加速约 $`32\times`$ （精确 $`32.252090566211834`$ ）；而 indexer 自身照样真实扫描全部 $`8590000128`$ 对——与稠密主注意力同数、 $`O(L^2)`$ 原封不动，按 $`0.25\times`$ 单价折算成本为 $`2147500032`$ （仍与 $`L^2`$ 同阶）。 $`O(L^2)`$ 项没被消灭，只是换成了便宜账户——这笔换不掉的平方项还会以**内存**形态再现（prefill 时——预填充，一次性并行处理整段输入提示的阶段——打分矩阵本身就是 $`O(L^2)`$ 大小，工程上只能分块直面），落地见[模型架构章](../../ch28-model-architecture/narrative/chapter.md)。
 
 ---
 
@@ -202,9 +202,9 @@ $`\mathbb{D}_{KL}`$ 是 KL 散度，衡量「indexer 打的分 softmax 后」离
 
 ### 独立缓存：谁扫全历史，谁就得有自己的柜子
 
-不变量先行：**谁每步都要扫全历史，谁就必须有自己的缓存**。decode 每生成一个 token，indexer 都要对全部历史 key 打一遍分——不缓存，就得每步对整个历史重新投影一遍 key，打分器再便宜也会被这笔重算拖垮。而这份缓存天然是独立的：它存的是 indexer 专属头维 $`d^I`$ 下的 key，每条 132 字节（128 个 FP8 值 + 4 字节 FP32 缩放因子）、跨所有头只存一份，宽度与精度都与主 KV cache 无关。一句直觉：indexer 与主注意力是两排分开的储物柜，各存各的、互不引用。在架构模型图上，此刻我们站在 EngineCore「模型与算子」组「注意力后端」子系统里——正对着 `Indexer` 容器内的 `DeepseekV32IndexerCache` 这个橙色组件，它旁边就是第 7 章引入的、管着主 KV cache 的分页显存管理器。
+不变量先行：**谁每步都要扫全历史，谁就必须有自己的缓存**。decode（逐 token 生成阶段）每生成一个 token，indexer 都要对全部历史 key 打一遍分——不缓存，就得每步对整个历史重新投影一遍 key，打分器再便宜也会被这笔重算拖垮。而这份缓存天然是独立的：它存的是 indexer 专属头维 $`d^I`$ 下的 key，每条 132 字节（128 个 FP8 值 + 4 字节 FP32 缩放因子）、跨所有头只存一份，宽度与精度都与主 KV cache 无关。一句直觉：indexer 与主注意力是两排分开的储物柜，各存各的、互不引用。在架构模型图上，此刻我们站在 EngineCore「模型与算子」组「注意力后端」子系统里——正对着 `Indexer` 容器内的 `DeepseekV32IndexerCache` 这个橙色组件，它旁边就是[第 7 章](../../ch07-engine-core/narrative/chapter.md)引入的、管着主 KV cache 的分页显存管理器。
 
-V4 是 V3.2 的后继模型，其技术报告（arXiv:2606.19348）把 DSA 升级为 CSA（Compressed Sparse Attention，压缩稀疏注意力）并引入 FP4 量化感知训练；其中 §2.3.1（Eq.(13)-(17)）把这份独立讲得最清楚。indexer query 与主 query 共享同一个低秩压缩 latent $`c_t^Q`$ （query 侧先压到低秩、再各走各的上投影），打分则在**压缩后的** key 上做（Eq.(16)）：
+V4 是 V3.2 的后继模型（面向百万 token 上下文的新一代），其技术报告（[arXiv:2606.19348](https://arxiv.org/abs/2606.19348)）把 DSA 升级为 CSA（Compressed Sparse Attention，压缩稀疏注意力），并引入 FP4 量化感知训练（QAT——训练时就模拟量化误差，下文 MXFP4 一段详述）；其中 §2.3.1（Eq.(13)-(17)）把这份独立讲得最清楚。indexer query 与主 query 共享同一个低秩压缩 latent $`c_t^Q`$ （query 侧先压到低秩、再各走各的上投影），打分则在**压缩后的** key 上做（Eq.(16)）：
 
 ```math
 I_{t,s} = \sum_{h=1}^{n_h^I} w_{t,h}^I \cdot \mathrm{ReLU}\left(\mathbf{q}_{t,h}^I \cdot K^{IComp}_s\right)
@@ -226,11 +226,11 @@ C_t^{SprsComp} = \left\{ C^{Comp}_s \mid I_{t,s} \in \operatorname{Top-k}(I_{t,:
 
 ### MXFP4：量化是主线的续命条件，不是锦上添花
 
-$`L`$ 涨到百万，便宜账户重新吃紧——平方项还躺在账上， $`L`$ 每翻一倍打分开销翻四倍，唯一的出路是把单价再砍。MXFP4 变体把 indexer 的 QK 路径压到更狠的精度：每个值只用 4 bit（2 个值挤进 1 字节），每 32 个值共享一个 1 字节的 ue8m0 缩放因子；index 分数也从 FP32 截成 BF16。论文的原话（arXiv:2606.19348 §5.2.1）是把 CSA indexer 的 QK 路径「cached, loaded, and multiplied entirely in FP4」，配合 QAT（Quantization-Aware Training，量化感知训练——训练时就模拟量化误差，让模型学会带着误差工作），`achieves a 2× speedup for the top-k selector, while preserving a 99.7% recall rate of KV entries`——top-k 选择器 $`2\times`$ 加速、KV 条目 99.7% 召回，几乎不丢准。下图把局部量化优化换算成整机收益：
+$`L`$ 涨到百万，便宜账户重新吃紧——平方项还躺在账上， $`L`$ 每翻一倍打分开销翻四倍，唯一的出路是把单价再砍。MXFP4 变体把 indexer 的 QK 路径（query 与 key 打点积的那一路计算）压到更狠的精度：每个值只用 4 bit（2 个值挤进 1 字节），每 32 个值共享一个 1 字节的 ue8m0 缩放因子（无符号 e8m0——上一章讲透的「块 scale 只能取 2 的幂」格式）；index 分数也从 FP32 截成 BF16（16 位脑浮点）。论文的原话（arXiv:2606.19348 §5.2.1）是把 CSA indexer 的 QK 路径「cached, loaded, and multiplied entirely in FP4」，配合 QAT（Quantization-Aware Training，量化感知训练——训练时就模拟量化误差，让模型学会带着误差工作），`achieves a 2× speedup for the top-k selector, while preserving a 99.7% recall rate of KV entries`——top-k 选择器 $`2\times`$ 加速、KV 条目 99.7% 召回，几乎不丢准。下图把局部量化优化换算成整机收益：
 
 ![重绘自 arXiv:2606.19348 Fig.1(右)：MXFP4 QK 路径 + QAT 换来 top-k 2× / 99.7% 召回 / 整机 27% FLOPs](../diagrams/fig-mxfp4-before-after.png)
 
-左边 FP8 路径每条 = $`d^I`$ 字节的值 + 4 字节 FP32 缩放因子（正是上文那 132 字节）；右边 MXFP4 每条 = $`d^I/2`$ 字节（2 值打包一字节）+ $`d^I/32`$ 字节 ue8m0 缩放因子。整机上，V4-Pro 在百万 token 只需 V3.2 的 27% FLOPs、10% KV cache——回到主线：量化技巧在这里不是锦上添花，而是让「indexer 廉价」这个假设在百万 token 继续成立的**必要条件**。FP8/FP4 的位模式与缩放因子数学，[量化数学那一章](../../ch26-primer-quantization/narrative/chapter.md)已经讲透；MXFP4 缓存布局与开关的实现，同样见[模型架构章](../../ch28-model-architecture/narrative/chapter.md)。
+左边 FP8 路径每条 = $`d^I`$ 字节的值 + 4 字节 FP32 缩放因子（正是上文那 132 字节）；右边 MXFP4 每条 = $`d^I/2`$ 字节（2 值打包一字节）+ $`d^I/32`$ 字节 ue8m0 缩放因子。整机上，据该技术报告，V4-Pro 在百万 token 只需 V3.2 的 27% FLOPs、10% KV cache——回到主线：量化技巧在这里不是锦上添花，而是让「indexer 廉价」这个假设在百万 token 继续成立的**必要条件**。FP8/FP4 的位模式与缩放因子数学，[量化数学那一章](../../ch26-primer-quantization/narrative/chapter.md)已经讲透；MXFP4 缓存布局与开关的实现，同样见[模型架构章](../../ch28-model-architecture/narrative/chapter.md)。
 
 ### 接线：全部接口只是一张名单
 
@@ -242,4 +242,4 @@ $`L`$ 涨到百万，便宜账户重新吃紧——平方项还躺在账上， $
 
 回到主线：**$`O(L^2)`$ 没被消灭，只是换到便宜账户**。四个设计各就各位。**便宜**（§一）：把注意力削到只剩打分——ReLU 换掉 softmax、value 与输出投影整个砍掉、多头折叠成标量话语权， $`H^I=64`$ 个 $`128`$ 维小头全程可低精度，便宜到敢给每个 query 扫全历史。**代价**（§二）：诚实账——主注意力从 $`O(L^2)`$ 降到 $`O(Lk)`$ ，128k 下省约 $`32\times`$ 且随 $`L`$ 线性放大；indexer 自己仍扫全场，一对没少，只是单价低。**可信**（§三）：一条 KL 把主注意力自己的注意力分布蒸馏进打分器，detach 让两条梯度互不串味——它是被教出来的语义对齐路由器，不是启发式。**可持续**（§四）：每步扫全历史，所以必须有自己的独立缓存（每条 132 字节、跨头一份、与主 KV cache 互不引用）；百万 token 下再用 MXFP4 把单价再砍（top-k $`2\times`$ 、召回 99.7%、整机 27% FLOPs / 10% KV cache）。
 
-一句话收束：lightning indexer 把「决定看哪里」和「看完怎么算」彻底拆开，两者之间的全部接口只是一张 top-k 名单——用一个又小又低精度、却被专门教过的打分器做前者，让昂贵的主注意力只在被点名的 $`k`$ 个条目上做后者。这套机制怎么接回 DeepSeek 的完整前向、落成真实的类与调用链——在架构模型图上，就是第 28 章要展开的那些蓝色组件，从 `DeepseekV4ForCausalLM` 顶层入口到 `DeepseekV4DecoderLayer` 逐层调用——是[模型架构那一章](../../ch28-model-architecture/narrative/chapter.md)的事。
+一句话收束：lightning indexer 把「决定看哪里」和「看完怎么算」彻底拆开，两者之间的全部接口只是一张 top-k 名单——用一个又小又低精度、却被专门教过的打分器做前者，让昂贵的主注意力只在被点名的 $`k`$ 个条目上做后者。这套机制怎么接回 DeepSeek 的完整前向、落成真实的类与调用链——在架构模型图上，就是下一章要展开的那些蓝色组件，从 `DeepseekV4ForCausalLM` 顶层入口到 `DeepseekV4DecoderLayer` 逐层调用——是[模型架构那一章](../../ch28-model-architecture/narrative/chapter.md)的事。

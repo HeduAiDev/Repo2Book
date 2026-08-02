@@ -327,6 +327,8 @@ class InprocClient(EngineCoreClient):
 
 回到 `LLM` 这一层。用户能调的任务方法有好几个，本章聚焦四个核心入口：`generate`、`chat`、`embed`、`encode`。它们入口形态各异，但很快就汇流到同一条提交+驱动的脊上。先看最常用的 `generate`。
 
+先说透 `generate` 的输入类型 `PromptType`——它是 `vllm/inputs/llm.py` 里给「任意 prompt」定义的类型别名：`PromptType: TypeAlias = DecoderOnlyPrompt | EncoderDecoderPrompt`，其中 `DecoderOnlyPrompt` 展开成 `str | TextPrompt | list[int] | TokensPrompt`。看不懂不要紧，逐个拆开：`str` 是裸字符串，最常见——`"你好"` 直接传；`TextPrompt` 是带元数据的文本包装（`{"prompt": "你好", "extra": ...}` 之类的字典，供多模态等场景挂额外信息）；`list[int]` 是已经 tokenize 好的 token id 序列；`TokensPrompt` 是把 token id 和偏移信息一起包装的结构化形式。一句话：**你给的 prompt 可以是原始文本、也可以是已编好的 token 序列**，引擎内部由输入处理器（第 5 章的活）把它们统一转成 token id 喂给模型。
+
 ### 37.4.1 generate：守卫 + 默认参数 + 汇流
 
 ```python

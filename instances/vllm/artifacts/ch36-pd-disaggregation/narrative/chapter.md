@@ -21,7 +21,7 @@
 - **同一套契约**：vLLM 把 worker 侧的传输能力抽象成 `KVConnectorBase_V1` 的几个方法。无论底层是 NCCL、RDMA 还是磁盘，都来填同一张表。
 - **三类填法的对照**：P2P NCCL（点对点直连）、NIXL（RDMA 单边读）、Offloading（CPU/磁盘卸载）——它们填同一套契约，但因为传输介质天差地别，填出来的形状各不相同。看懂这三种差异，才算真懂这套抽象为什么这么设计。
 
-为了能在本地把这条生命周期亲手跑一遍、打断点看数值，本章配了一份**只做减法**的精简版：和真实 vLLM 同名、同结构、同控制流，只把与主线正交的分支剥掉（跨层统一 layout、异构 TP、MLA/SSM 分支、host buffer、底层 NCCL/RDMA/磁盘的网络细节换成形状一致的 loopback）。它纯 CPU 可跑，让三类后端都能跑出"发→收→完成"的闭环。正文主线仍是真实源码；精简版只是"跑起来看数值"的交叉验证物。
+为了能在本地把这条生命周期亲手跑一遍、打断点看数值，本章配了一份**只做减法**的精简版：和真实 vLLM 同名、同结构、同控制流，只把与主线正交的分支剥掉（跨层统一 layout、异构 TP、MLA/SSM 分支、host buffer（把 KV 中转缓冲放在 CPU 内存的可选路径）、底层 NCCL/RDMA/磁盘的网络细节换成形状一致的 loopback（回环——不真过网卡，数据在同一进程内直接投递给对端引擎））。它纯 CPU 可跑，让三类后端都能跑出"发→收→完成"的闭环。正文主线仍是真实源码；精简版只是"跑起来看数值"的交叉验证物。
 
 ![本章地图：worker 侧 KV 生命周期与三类传输后端剖面](../diagrams/chapter-map.png)
 
@@ -60,7 +60,7 @@ with (
     )
 ```
 
-这段代码的关键不在 `_model_forward` 本身，而在它**被谁夹住了**。`with` 块里并排站着两个 context manager：`set_forward_context` 设置本次前向的上下文，而 `maybe_get_kv_connector_output(...)` 就是本章主角——它把整个 model forward 夹在自己的 enter 和 exit 之间。
+这段代码的关键不在 `_model_forward` 本身，而在它**被谁夹住了**。`with` 块里并排站着两个 context manager（上下文管理器——`with` 语句要求的那种对象，进入/退出 `with` 块时自动执行它身上定义的 enter/exit 代码）：`set_forward_context` 设置本次前向的上下文，而 `maybe_get_kv_connector_output(...)` 就是本章主角——它把整个 model forward 夹在自己的 enter 和 exit 之间。
 
 这是一个深思熟虑的结构。KV 的 load 必须在 forward **开始前**发起，才能和计算重叠；save 必须在 forward **结束后**、buffer 被覆盖前收齐。一个 context manager 的 `enter`/`finally` 恰好天然表达"前发起、后收尾"这对边界。先记住这个画面，下面拆开看。
 
@@ -82,7 +82,7 @@ def maybe_get_kv_connector_output(
     )
 ```
 
-逻辑一句话：**只有配置了 KV 传输组，才进真正的生命周期 context；否则返回 `nullcontext()`，零开销。** 没开 PD 分离的普通部署，这里就是个空壳，`with` 块退化成只跑 forward。这是把一个可选子系统接进热路径的标准做法——不付费就不掏钱。
+逻辑一句话：**只有配置了 KV 传输组，才进真正的生命周期 context；否则返回 `nullcontext()`（标准库的空 context manager，`with` 块原样穿透、什么都不做），零开销。** 没开 PD 分离的普通部署，这里就是个空壳，`with` 块退化成只跑 forward。这是把一个可选子系统接进热路径的标准做法——不付费就不掏钱。
 
 这些方法都挂在 `KVConnectorModelRunnerMixin` 上。它是一个纯静态的 mixin，混进 GPU/TPU 的 ModelRunner，给它们加上"会搬 KV"的能力，本身不持有状态。真正的 connector 对象藏在一个进程级全局里，靠 `get_kv_transfer_group()` 取——这正是上一章那个 `WORKER` 角色的 connector 实体。
 
@@ -136,7 +136,7 @@ def _get_kv_connector_output(
             kv_connector.clear_connector_metadata()
 ```
 
-这段代码上的 `@contextmanager` 装饰器来自 Python 标准库 `contextlib`——它把一个只 `yield` 一次的生成器函数自动变成 context manager：`yield` 之前的代码等价于 `__enter__`（进入 `with` 块时执行），`yield` 之后的代码等价于 `__exit__`（退出 `with` 块时执行；哪怕块里抛了异常，`finally` 里的代码也保证跑）。本章接下来的 enter/yield/finally 三段式解读，就是在拆这个标准惯用法的结构。
+这段代码上的 `@contextmanager` 装饰器来自 Python 标准库 `contextlib`——它把一个只 `yield` 一次的生成器函数自动变成 context manager：`yield` 之前的代码等价于 `__enter__`（进入 `with` 块时执行），`yield` 之后的代码等价于 `__exit__`（退出 `with` 块时执行；哪怕块里抛了异常，`finally` 里的代码也保证跑）。本章接下来的 enter/yield/finally 三段式解读，就是在拆这个标准惯用法的结构（想温习 `with` 协议本身，官方文档：[contextlib.contextmanager](https://docs.python.org/3/library/contextlib.html#contextlib.contextmanager)）。
 
 把它按 `yield` 切成三段读：
 
@@ -275,7 +275,7 @@ def wait_for_save(self):
 
 docstring 把意图写得很白：在 forward context 退出前阻塞，确保 `save_kv_layer` 的异步保存全部完成，**防止 paged KV buffer 在保存完成前被覆盖**。
 
-用一句不变量来归纳它的正确性：**"所有 save 完成"是 forward 退出的前置条件**。这等价于在"buffer 复用"和"异步读"之间插了一道 happens-before（**先行发生**——并发理论里的经典概念，出自 Lamport 1978 年那篇《Time, Clocks, and the Ordering of Events in a Distributed System》，后来被 Java/C++ 内存模型采纳为定义"一个线程的写对另一个线程何时可见"的核心规则：若 A happens-before B，则 A 造成的所有效果对 B 可见）。这里就是人为插入这条边——任何对某物理块的复用写入，都发生在该块上一次 save 读取完成之后。少了这道围栏，PD 分离下的数据一致性就破了。所以 `wait_for_save` 不是性能旋钮，是**正确性硬约束**，不能为了快而省掉。
+用一句不变量来归纳它的正确性：**"所有 save 完成"是 forward 退出的前置条件**。这等价于在"buffer 复用"和"异步读"之间插了一道 happens-before（**先行发生**——并发理论里的经典概念，出自 Lamport 1978 年那篇《Time, Clocks, and the Ordering of Events in a Distributed System》，后来被 Java/C++ 内存模型采纳为定义"一个线程的写对另一个线程何时可见"的核心规则：若 A happens-before B，则 A 造成的所有效果对 B 可见；想深入可读[原始论文](https://lamport.azurewebsites.net/pubs/time-clocks.pdf)）。这里就是人为插入这条边——任何对某物理块的复用写入，都发生在该块上一次 save 读取完成之后。少了这道围栏，PD 分离下的数据一致性就破了。所以 `wait_for_save` 不是性能旋钮，是**正确性硬约束**，不能为了快而省掉。
 
 它落在 `_get_kv_connector_output` 的 `finally` 段里（§36.2），保证哪怕 forward 抛异常也会执行。后面会看到，三类后端各自给 `wait_for_save` 填了不同的实现，但都满足同一个语义。
 
@@ -548,7 +548,7 @@ P2P 的 `get_finished` 委托给引擎，引擎在本进程内同时记着发和
 
 NIXL 是高性能 RDMA 后端。它和 P2P 有两个结构性的不同，都很能说明问题。
 
-**第一个不同：Facade（外观）模式。** Facade 是 GoF《设计模式：可复用面向对象软件的基础》收录的 23 个经典结构型模式之一——本意是给一组复杂子系统对象包一层简化统一入口，让调用方不必了解内部各对象的初始化顺序和依赖关系。NIXL 把它用出了变体：顶层 `NixlConnector` 按 role 只建半边子对象，把 scheduler 侧和 worker 侧的代码物理隔开，确保某个进程角色永远碰不到另一半——不是简化调用，而是用同一层 facade 做物理隔离。NIXL 的 scheduler 侧和 worker 侧逻辑都很重（一边管握手拓扑、内存注册，一边管命中查询），于是顶层 `NixlConnector` 按 role 只建半边子对象：
+**第一个不同：Facade（外观）模式。** Facade 是 GoF《设计模式：可复用面向对象软件的基础》收录的 23 个经典结构型模式之一——本意是给一组复杂子系统对象包一层简化统一入口，让调用方不必了解内部各对象的初始化顺序和依赖关系（想系统了解这个模式，可看 [refactoring.guru 的 Facade 条目](https://refactoring.guru/design-patterns/facade)）。NIXL 把它用出了变体：顶层 `NixlConnector` 按 role 只建半边子对象，把 scheduler 侧和 worker 侧的代码物理隔开，确保某个进程角色永远碰不到另一半——不是简化调用，而是用同一层 facade 做物理隔离。NIXL 的 scheduler 侧和 worker 侧逻辑都很重（一边管握手拓扑、内存注册，一边管命中查询），于是顶层 `NixlConnector` 按 role 只建半边子对象：
 
 ```python
 # vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py:L87-L108
@@ -595,7 +595,7 @@ def wait_for_save(self):
 
 这就印证了 §36.3 提前打的预防针：`wait_for_layer_load` 和 `save_kv_layer` 都是 **no-op**。这不是偷懒，是 NIXL 的传输模型决定的——这是第二个、也是更深的不同。
 
-**第二个不同：RDMA 单边 READ。** P2P 是 producer 主动"推"（send）KV。NIXL 反过来——**decode worker 主动从 prefill worker 的显存里"读"（READ）KV**，而 prefill 端的 CPU/GPU 完全不参与这次传输。这是 RDMA 单边操作的本质：发起方给网卡一组地址，网卡直接搬对端内存，对端 CPU 无感。这不是 vLLM 自造的机制——InfiniBand 及 RoCE（RDMA over Converged Ethernet，以太网承载的 RDMA）的 verbs 规范从根上就区分两类语义：单边 READ/WRITE（发起方指定远端地址，对端 CPU 不参与）与双边 SEND/RECEIVE（两端软件都要主动参与握手收发）。NIXL 用的是前者——`make_prepped_xfer("READ", ...)` 那一行就是在拼一次标准的 RDMA 单边读。
+**第二个不同：RDMA 单边 READ。** P2P 是 producer 主动"推"（send）KV。NIXL 反过来——**decode worker 主动从 prefill worker 的显存里"读"（READ）KV**，而 prefill 端的 CPU/GPU 完全不参与这次传输。这是 RDMA 单边操作的本质：发起方给网卡一组地址，网卡直接搬对端内存，对端 CPU 无感。这不是 vLLM 自造的机制——InfiniBand 及 RoCE（RDMA over Converged Ethernet，以太网承载的 RDMA）的 verbs 规范（InfiniBand 官方组织 IBTA 定义的 RDMA 编程接口规范）从根上就区分两类语义：单边 READ/WRITE（发起方指定远端地址，对端 CPU 不参与）与双边 SEND/RECEIVE（两端软件都要主动参与握手收发）。NIXL 用的是前者——`make_prepped_xfer("READ", ...)` 那一行就是在拼一次标准的 RDMA 单边读（想了解单边/双边语义的规范出处，可从[维基百科的 RDMA 词条](https://en.wikipedia.org/wiki/Remote_direct_memory_access)读起）。
 
 正因为是 D 主动读、整请求一把读，所以：不需要逐层 pipeline（`wait_for_layer_load` 空）；P 端不存在"主动 save"这个动作（`save_kv_layer` 空，"保存"就等于"把 KV 留在那让 D 来读")。两个 no-op 是 RDMA READ 模型的直接推论。
 

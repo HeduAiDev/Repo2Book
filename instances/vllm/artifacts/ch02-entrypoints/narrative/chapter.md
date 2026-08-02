@@ -33,7 +33,11 @@
 2. **引擎段（独立 OS 进程）**：一个叫 `run_busy_loop` 的同步循环不停地「取请求 → 算一拍 → 吐结果」，跑模型前向、采样。它和 API 进程经 ZMQ（ZeroMQ，一种无需代理服务器的异步消息库——两端各建一个 socket 就能直接收发消息，不需要像传统消息队列那样先起一个中间人进程；跨进程管线的搭建细节见[第 7 章](../../ch07-engine-core/narrative/chapter.md)）通信。
 3. **输出段（回到 API 进程）**：一个后台协程把引擎吐出来的 token 拉回来，去 token 化、判停止、组装成面向用户的 `RequestOutput`，再交还给等在那里的请求。
 
-为什么要拆成三段、还要把引擎单拎到另一个进程？一句话：**别让模型执行堵死 API 服务器**。模型前向是个被 GIL（全局解释器锁——同一进程内同一时刻只有一个线程能执行 Python 字节码）绑死的重活，如果它和 HTTP 处理挤在同一个 Python 进程，一跑前向，整个事件循环就卡住，别的请求全得排队。把引擎拎进独立进程，API 进程就只剩下轻活——分词、组装、收结果、回 SSE（Server-Sent Events，一种基于 HTTP 长连接的服务器单向推送协议，客户端只需 `GET` 一次就能持续收到增量片段；它比 WebSocket 更适合 token 流式这种单向推送场景，而且走普通 HTTP、天然穿透代理与负载均衡器，OpenAI 等主流 LLM API 的流式接口也清一色是这个选择）——一个事件循环能轻松扛住大量并发连接。这条设计主线，[第 4 章](../../ch04-async-llm/narrative/chapter.md) 会从 `AsyncLLM` 的搭建过程整章展开。
+为什么要拆成三段、还要把引擎单拎到另一个进程？一句话：**别让模型执行堵死 API 服务器**。模型前向是个被 GIL（全局解释器锁——同一进程内同一时刻只有一个线程能执行 Python 字节码）绑死的重活，如果它和 HTTP 处理挤在同一个 Python 进程，一跑前向，整个事件循环就卡住，别的请求全得排队。把引擎拎进独立进程，API 进程就只剩下轻活——分词、组装、收结果、回 SSE（Server-Sent Events，一种基于 HTTP 长连接的服务器单向推送协议，客户端只需 `GET` 一次就能持续收到增量片段）——一个事件循环能轻松扛住大量并发连接。这条设计主线，[第 4 章](../../ch04-async-llm/narrative/chapter.md) 会从 `AsyncLLM` 的搭建过程整章展开。
+
+为什么流式接口选 SSE 而不是更出名的 WebSocket？WebSocket 是全双工协议——客户端也能随时往服务器发消息——但要求先做一次协议升级握手、连接管理也更复杂；token 流式是纯单向「服务器推、客户端收」，生成过程中客户端不需要插话，全双工能力根本用不上。SSE 走普通 HTTP，所有代理、负载均衡器、内容分发网络（CDN）天然认得，还自带断线重连，所以 OpenAI、Anthropic、Gemini 的流式接口也清一色是它，vLLM 的 OpenAI 兼容服务器跟着行业选型走（浏览器端对应的标准 API 叫 `EventSource`）。反过来，客户端需要在流式过程中主动发消息的场景——比如带打断检测的语音交互——才轮得到 WebSocket 出场。想深入对比两者的取舍，可看 getstream 的 [WebSocket vs SSE](https://getstream.io/blog/websocket-sse/)。
+
+这一路更常出现的另一个名词是 **ZMQ**。它是 iMatix 公司在 2007 年前后发起的开源消息库（底层 C++ 的 libzmq，Python 绑定叫 PyZMQ），口号是「分布式计算的套接字」：API 长得像普通 socket 编程，用起来却像一套完整的消息中间件，支持请求/应答、发布/订阅、推/拉等多种消息模式，可跑在进程间、TCP 网络等不同传输上。它和 RabbitMQ 那类「代理式」消息队列最本质的区别在要不要 broker（中转服务器）：传统队列要先起一个专门接收、路由、暂存消息的 broker 进程，功能全（持久化、复杂路由），但多一个要运维的中间件、延迟也高；ZMQ 砍掉 broker，两端各建一个 socket 连上就能可靠收发——换来更低延迟和更轻的部署，代价是没有那类重型特性。vLLM 要的恰好是「两个固定端点之间高频传小消息」，犯不上背一整套消息中间件，于是选中了它。官方快速入门：[Get started](https://zeromq.org/get-started/)；完整的背景与 socket 类型语义，[第 7 章](../../ch07-engine-core/narrative/chapter.md) 会展开。
 
 下面我们就顺着这张图，从入口走到出口。
 
@@ -197,7 +201,7 @@ async def add_request_async(self, request: EngineCoreRequest) -> None:
     self._ensure_output_queue_task()
 ```
 
-`_send_input` 就是把请求用 msgpack 序列化（msgpack 是一种二进制对象序列化格式，等于「更快更小的二进制 JSON」——不要求先定义 schema，直接把 Python 对象打包成紧凑字节流，对端解码回来即可）再经 ZMQ socket 发到引擎进程。ZMQ + msgpack + 零拷贝张量这套 IPC 机制是怎么搭的，[第 7 章](../../ch07-engine-core/narrative/chapter.md) 会专门讲。本章只需记住：**这条线是进程边界，过了它请求就离开了 API 进程的地盘**。
+`_send_input` 就是把请求用 msgpack 序列化，再经 ZMQ socket 发到引擎进程。msgpack（MessagePack）是「二进制版的 JSON」：能表达的数据结构和 JSON 一样（字典、列表、数字、字符串），只是把文本编码换成了紧凑的二进制——不要求先定义 schema，直接把 Python 对象打包成字节流，对端解码回来即可，同样内容比 JSON 更小、编解码更快。举个例子感受一下（这是 msgpack 库本身的用法，不是 vLLM 源码）：`{"request_id": "abc", "prompt_token_ids": [1, 2, 3]}` 这样一个字典，`msgpack.packb()` 一下就变成一长串紧凑二进制，对端 `unpackb()` 原样还原成同一个字典——中间谁都不用先声明「消息长什么样」，这点和 Protocol Buffers、Thrift 那种「先写 schema、再生成代码」的方案正相反。它由 Sadayuki Furuhashi 在 2008 年前后创建，官方定位就是「It's like JSON, but fast and small」（[msgpack.org](https://msgpack.org/)）。ZMQ + msgpack + 零拷贝张量这套 IPC 机制是怎么搭的、msgpack 格式本身怎么设计的，[第 7 章](../../ch07-engine-core/narrative/chapter.md) 会完整展开。本章只需记住：**这条线是进程边界，过了它请求就离开了 API 进程的地盘**。
 
 ---
 
@@ -248,7 +252,7 @@ def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
 3. **`sample_tokens()`**——从 logits 采出这一拍每个请求的下一个 token。采样管线见 [第 30 章](../../ch30-sampling/narrative/chapter.md)。
 4. **`update_from_output()`**——把采出的 token 写回各请求状态、判断谁结束了，组装成 `EngineCoreOutputs` 返回。它的内部簿记 [第 14 章](../../ch14-scheduler/narrative/chapter.md) 一并讲。
 
-这里要建立一个关键直觉：**一拍处理的是「一批」请求，不是一个**。同一拍里，可能有刚进来、正在 prefill（吃 prompt）的请求，也有跑了很久、正在 decode（逐 token 吐）的请求，它们被混在一个连续批里一起算——这就是连续批处理（continuous batching），最早由 Orca 论文（Yu 等，OSDI 2022）以 iteration-level scheduling 的形式提出，后来由行业博客以 continuous batching 的名字推广普及。所以一个用户请求的「一生」会**横跨很多拍**，每拍只往前挪几个 token。[第 11 章](../../ch11-engine-core/narrative/chapter.md) 会从引擎核心和这个 busy loop 整章讲起。
+这里要建立一个关键直觉：**一拍处理的是「一批」请求，不是一个**。同一拍里，可能有刚进来、正在 prefill（吃 prompt）的请求，也有跑了很久、正在 decode（逐 token 吐）的请求，它们被混在一个连续批里一起算——这就是连续批处理（continuous batching）。「连续」是相对早期推理服务的「静态批处理」说的：静态批处理要等整批请求全部生成完才放行，批里先跑完的请求只能陪着空等，GPU 利用率很差；连续批处理把调度粒度从「一整批」细到「模型的一次迭代」——每算完一拍就重新看谁该进来、谁该走，新请求随时插进来、结束的请求立刻让位。这个词最早由 Orca 论文（Yu 等，OSDI 2022）以 iteration-level scheduling 的形式提出（[论文页](https://www.usenix.org/conference/osdi22/presentation/yu)），后来由 Anyscale 等行业博客以 continuous batching 的名字推广普及（[博客原文](https://www.anyscale.com/blog/continuous-batching-llm-inference)）。所以一个用户请求的「一生」会**横跨很多拍**，每拍只往前挪几个 token。[第 11 章](../../ch11-engine-core/narrative/chapter.md) 会从引擎核心和这个 busy loop 整章讲起。
 
 ![连续批处理时间线：每拍混跑多个不同阶段的请求](../diagrams/03-continuous-batching.png)
 

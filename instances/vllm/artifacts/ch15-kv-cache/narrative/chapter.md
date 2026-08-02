@@ -17,7 +17,7 @@
 - 两个请求共享同一段 prompt 前缀时，第二个能不能直接捡现成的 KV、跳过重算？这是**前缀缓存**。
 - 一个被抢占的请求重排回来、从头 prefill，它之前算过的 KV 块如果还在，能不能直接复用？这是第 14 章欠下的一笔账。
 
-照例，本章配一份**只做减法**的精简版：和真实 `vllm/v1/core/` 下的 `block_pool.py`、`kv_cache_utils.py`、`kv_cache_manager.py` 同名、同结构、同控制流。它锁定**单 KV cache group + 全注意力 + 开启前缀缓存**的主路径，删掉混合模型（滑窗 / Mamba / 多组协调）、投机解码草稿头、上下文并行、KV connector 这些正交维度，删除点原样标注。它不 import vllm、不需要 GPU，`pytest` 直接能跑——用来在本地打断点、亲眼看引用计数怎么变、命中长度算成几块。但正文的主线，始终是真实源码。
+照例，本章配一份**只做减法**的精简版：和真实 `vllm/v1/core/` 下的 `block_pool.py`、`kv_cache_utils.py`、`kv_cache_manager.py` 同名、同结构、同控制流。它锁定**单 KV cache group + 全注意力 + 开启前缀缓存**的主路径，删掉混合模型（滑窗注意力——每个 token 只看近处若干 token 的注意力变体；Mamba——不依赖注意力的状态空间模型架构；多组协调）、投机解码草稿头、上下文并行、KV connector（跨节点搬运 KV 缓存的插件接口）这些正交维度，删除点原样标注。它不 import vllm、不需要 GPU，`pytest` 直接能跑——用来在本地打断点、亲眼看引用计数怎么变、命中长度算成几块。但正文的主线，始终是真实源码。
 
 我们自底向上：先看一个「块」长什么样，再看空闲块怎么排队，然后是块的哈希怎么算、命中怎么查，最后把它们串成 `allocate_slots` 的三段式分配。
 
@@ -33,7 +33,7 @@
 
 如果给每个请求预留一整段连续显存，就得按**最大可能长度**预留。一个 max_model_len=8192 的模型，哪怕请求只生成了 10 个 token，也得占着 8192 个 token 的位置。这是巨大的内部浪费。退一步，按需扩张连续段呢？那又会把显存切成无数大小不一的碎片，新请求来了凑不出一段连续的——外部碎片。
 
-vLLM 的解法是借操作系统的分页思想：把物理 KV 显存切成 `num_gpu_blocks` 个**等长**的块，每块固定装 `block_size` 个 token 的 KV。这套机制的代码都在 `vllm/v1/core/` 下——`block_pool.py` 管物理块、`kv_cache_utils.py` 管块的元数据与哈希、`kv_cache_manager.py` 是对调度器的门面。请求的逻辑 token 序列也按 `block_size` 切块，每个逻辑块通过一张 **block table** 映射到任意一个物理块。逻辑上连续、物理上可以散落。这套「分页 + 块表间接寻址」的注意力机制，正是 vLLM 原始论文提出的 **PagedAttention**（arXiv:2309.06180）。
+vLLM 的解法是借操作系统的分页思想：把物理 KV 显存切成 `num_gpu_blocks` 个**等长**的块，每块固定装 `block_size` 个 token 的 KV。这套机制的代码都在 `vllm/v1/core/` 下——`block_pool.py` 管物理块、`kv_cache_utils.py` 管块的元数据与哈希、`kv_cache_manager.py` 是对调度器的门面。请求的逻辑 token 序列也按 `block_size` 切块，每个逻辑块通过一张 **block table** 映射到任意一个物理块。逻辑上连续、物理上可以散落。这套「分页 + 块表间接寻址」的注意力机制，正是 vLLM 原始论文提出的 **PagedAttention**——vLLM 团队 2023 年发表在系统领域顶会 SOSP 上的论文《Efficient Memory Management for Large Language Model Serving with PagedAttention》（[arXiv:2309.06180](https://arxiv.org/abs/2309.06180)）的核心贡献。论文作者实测过更早的连续显存方案（FasterTransformer、Orca 等服务框架），KV 缓存浪费高达 60%–80%——分页正是冲着这个痛点去的。想读比论文更通俗的版本，[vLLM 官方博客](https://blog.vllm.ai/2023/06/20/vllm.html) 有篇很好的入门。
 
 ![分页总览](../diagrams/paging-overview.png)
 
@@ -391,11 +391,11 @@ def hash_block_tokens(
 
 函数返回一个 `BlockHash`（`NewType("BlockHash", bytes)`——带类型标签的字节型哈希摘要，防与普通 `bytes` 混用），其输入是个三元组——父块哈希、本块 token、extra_keys。第一块没有父块，用一个随机种子 `NONE_HASH` 兜底——随机是为了避免跨进程的哈希碰撞，对齐了 Python `hash()` 的做法。
 
-哈希宽度决定了「哈希相等 ⇒ 内容相等」这条假设有多可靠。默认哈希算法是 SHA-256（`prefix_caching_hash_algo` 配置项，`vllm/config/cache.py`），属于**密码学哈希**（cryptographic hash）——设计目标包含抗碰撞与抗原像性，很难人为构造出两个不同内容产生相同摘要。SHA-256 摘要宽度 256 bit；两个不同内容的块恰好撞到同一个哈希、被误判成命中的概率量级，按生日悖论估算约是已缓存块总数的平方除以 $`2^{257}`$ ——就算集群同时缓存几十亿个块，这个数字依然小到可以当作零，这也是源码注释里"SHA256 是避免哈希碰撞最安全的选择"这句话的由来。安全性有对应的性能代价：SHA-256 带宽约 1 GB/s 量级。
+哈希宽度决定了「哈希相等 ⇒ 内容相等」这条假设有多可靠。默认哈希算法是 SHA-256（`prefix_caching_hash_algo` 配置项，`vllm/config/cache.py`），属于**密码学哈希**（cryptographic hash）——设计目标包含抗碰撞与抗原像性，很难人为构造出两个不同内容产生相同摘要。SHA-256 摘要宽度 256 bit；两个不同内容的块恰好撞到同一个哈希、被误判成命中的概率量级，按生日悖论估算约是已缓存块总数的平方除以 $`2^{257}`$ ——「生日悖论」的直觉是：碰撞不是单挑而是配对的事，n 个值要两两互相对比，任一对撞进 b bit 哈希空间里同一个值的概率就是约 $`n^2/2^{b+1}`$；位宽差一点，概率就差一个指数级（推导见 [Wikipedia: Birthday attack](https://en.wikipedia.org/wiki/Birthday_attack)）。就算集群同时缓存几十亿个块，这个数字依然小到可以当作零，这也是源码注释里"SHA256 是避免哈希碰撞最安全的选择"这句话的由来。安全性有对应的性能代价：SHA-256 带宽约 1 GB/s 量级。
 
 配置也留了一条更快但碰撞风险更高的路：可选的 xxHash（`xxhash`）是一种**非密码学哈希**（non-cryptographic hash）——只追求速度与低碰撞率，不追求抗人为构造碰撞。vLLM 使用的是其 XXH3 128 bit 变体，官方基准带宽可达 30+ GB/s（比 SHA-256 快一个数量级以上），但摘要宽度只有 128 bit——按同样公式，碰撞概率比 SHA-256 情形大了 $`2^{128}`$ 倍量级。虽然这个概率对于正常工作负载仍极低，源码文档字符串明确点破了安全考量：多租户共享缓存池、输入间接受外部用户影响时，非密码学哈希的碰撞风险是安全取舍而非纯性能选择，因此默认没有打开 xxHash。详见 [xxHash 官网](https://xxhash.com/)。
 
-给内容相同的前缀找钥匙不是 vLLM 一家的做法。SGLang 的 RadixAttention（arXiv:2312.07104）走的是另一条谱系——不建哈希表，而是把所有请求的前缀组织成一棵 radix 树（压缩前缀树），靠树上的字符匹配定位共享前缀。同一个问题（前缀缓存），vLLM 用「固定块 + 哈希查找表」、SGLang 用「树结构 + 自动前缀匹配」——两种不同权衡，且并不互斥：SGLang 内部也同时使用分页管理物理显存，只是把「如何发现可共享前缀」这件事从哈希表换成了 radix 树。详见 [SGLang 官方文档](https://docs.sglang.io/) 与 [LMSYS 博客](https://lmsys.org/blog/2024-01-17-sglang/)。
+给内容相同的前缀找钥匙不是 vLLM 一家的做法。SGLang（LMSYS 团队的开源 LLM 服务框架）的 **RadixAttention**（[arXiv:2312.07104](https://arxiv.org/abs/2312.07104)）走的是另一条谱系——不建哈希表，而是把所有请求的前缀组织成一棵 **radix 树**（压缩前缀树）来定位共享前缀。怎么把「压缩前缀树」想具体：树上的每条边标记的不是单个 token 而是**一整段 token 序列**——比如多轮对话里固定不变的那段 system prompt，整体就落在一条边上；新请求的 token 序列从树根一路往下走，走到匹配失败处停下的那条路径，就是它能共享的最长前缀。匹配不需要按固定块大小对齐，也不需要预先算好的哈希表。同一个问题（前缀缓存），vLLM 用「固定块 + 哈希查找表」、SGLang 用「树结构 + 自动前缀匹配」——两种不同权衡，且并不互斥：SGLang 内部也同时使用分页管理物理显存，只是把「如何发现可共享前缀」这件事从哈希表换成了 radix 树。详见 [SGLang 官方文档](https://docs.sglang.io/) 与 [LMSYS 博客](https://lmsys.org/blog/2024-01-17-sglang/)。
 
 链式的妙处用一句话归纳：**相同 token 序列，当且仅当前缀完全一致时才得到相同哈希**。归纳地看——第一块的哈希由 `(NONE_HASH, tok[0:B])` 决定，前缀一致 ⇒ 它们相同；假设第 k 块前所有块哈希都相同，那第 k 块的哈希由前块哈希与 `tok[kB:(k+1)B]` 共同决定，两项都相同 ⇒ 它也相同；反之任何一块的前缀出现差异，差异会顺着链一路「染」到它之后的所有块哈希。于是「沿哈希链查命中、一断即停」天然就是正确的——断点之后的块前缀必然已经不同。
 
@@ -592,7 +592,7 @@ def find_longest_cache_hit(
 
 `max_num_blocks = max_length // block_size`——又见 `block_size` 当粒度，它把「最多查多长前缀」换算成「最多查几块」。然后顺着 `block_hashes` 链逐块 `get_cached_block`，命中就收进 `computed_blocks`，一旦 miss 立刻 `break`。这个 break 之所以正确，全靠上节那条链式哈希的归纳性质——一块没命中，它之后的块前缀必然已不同，再查也是白查。
 
-`itertools.islice` 限制了最多查 `max_num_blocks` 个，并不遍历整条链；命中 k 块就是 O(k) 次哈希查表，与请求总长无关。这是前缀命中的复杂度——和命中长度线性，不和请求长度线性。
+`itertools.islice` 是 Python 标准库的迭代器切片——取序列前 `max_num_blocks` 个元素、不拷贝剩余部分，这里用它把查找范围卡在最多 `max_num_blocks` 块内，并不遍历整条链；命中 k 块就是 O(k) 次哈希查表，与请求总长无关。这是前缀命中的复杂度——和命中长度线性，不和请求长度线性。
 
 对外的门面把这一切包起来，就是 `KVCacheManager.get_computed_blocks`：
 
@@ -723,7 +723,7 @@ def get_num_blocks_to_allocate(
     return num_new_blocks + num_evictable_blocks
 ```
 
-`req_to_blocks` 是 `FullAttentionManager` 持有的一个 `defaultdict(list)`，键是 `request_id`，值是该请求当前已分配的块列表——全新请求为空 `()`，`get` 配默认值即可安全读空。这就是 §15.1 图里那张 block table 在代码里的样子：键是请求、值是它逻辑块对应的物理块列表，「逻辑块 → 物理块」的映射就落在这份列表的下标上。`num_new_blocks` 是「装下所有 token 需要的块数，减去已有的和命中的」，再加上 `num_evictable_blocks`（命中块里 `ref_cnt == 0` 的那些）。注释把理由写得清清楚楚。
+`req_to_blocks` 是 `FullAttentionManager` 持有的一个 `defaultdict(list)`，键是 `request_id`，值是该请求当前已分配的块列表——全新请求为空 `()`，`get` 配默认值即可安全读空。这就是 §15.1 图里那张 block table 在代码里的样子：键是请求、值是它逻辑块对应的物理块列表，「逻辑块 → 物理块」的映射就落在这份列表的下标上。块数是**向上取整**的——代码里的 `cdiv`（vLLM 的 ceiling division 工具，`vllm/utils/math_utils.py`，实现是 `-(a // -b)`）：一个不满块的尾巴 token 也得占一整块。`num_new_blocks` 是「装下所有 token 需要的块数，减去已有的和命中的」，再加上 `num_evictable_blocks`（命中块里 `ref_cnt == 0` 的那些）。注释把理由写得清清楚楚。
 
 **段二：挂前缀命中块。** 如果有命中块，`allocate_new_computed_blocks` 把它们 `touch` 一下（`ref_cnt += 1`、必要时从 free queue 救回），挂进请求的块账本 `req_to_blocks`：
 

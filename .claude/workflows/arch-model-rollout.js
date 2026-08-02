@@ -11,11 +11,29 @@ export const meta = {
 // ⚠️ args 注入不可靠 → CFG 为准（换批改 CFG.chapters）。
 const CFG = {
   instance: 'vllm',
-  // 批次3 补修:ch29+ch35 图数据修正后重渲重盲审, ch30 arch-model 已就绪仍缺 prose
+  // 重跑:此前 Prose 站因 fable 不可用继承主模型跑过的 21 章(用户要求用正确模型重跑)
   chapters: [
+    'ch11-engine-core',
+    'ch16-kv-cache',
+    'ch17-worker-and-executor',
+    'ch18-model-runner',
+    'ch19-model-runner',
+    'ch20-distributed-parallelism',
+    'ch21-async-engine',
+    'ch23-custom-ops-and-compilation',
+    'ch24-primer-flash-attention',
+    'ch25-attention',
+    'ch26-primer-quantization',
+    'ch27-primer-lightning-indexer',
     'ch29-model-architecture',
     'ch30-sampling',
+    'ch33-primer-eagle',
+    'ch34-spec-decode',
     'ch35-pd-disaggregation',
+    'ch36-pd-disaggregation',
+    'ch37-entrypoints',
+    'ch38-entrypoints',
+    'ch39-engine-core',
   ],
 }
 const A = (typeof args !== 'undefined' && args && args.chapters && args.chapters.length) ? args : CFG

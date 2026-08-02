@@ -349,7 +349,7 @@ def _process_engine_step(self) -> bool:
 
 **输出塞进 `output_queue`**。`outputs.items()` 是 `{client_index: EngineCoreOutputs}`，逐个 `put_nowait` 进去。然后第 7 章那个 `process_output_sockets` IO 线程会把它们抽走、编码、经 ZMQ 推回客户端。忙循环只管往内存队列里塞，不碰网络——网络 IO 交给独立线程，互不阻塞。这是 `input_queue` / `output_queue` 这对内存队列存在的全部理由：**用一对线程安全队列，把「跑模型的循环」和「读写 socket 的 IO」彻底解耦**。忙循环只跟内存打交道，逻辑简单且不会被网络卡住；IO 线程的序列化和 socket 操作释放 GIL（Global Interpreter Lock，Python 全局解释器锁——同一时刻只允许一个线程执行 Python 字节码；IO 线程主动释放后 GPU 前向可在后台推进），能和 GPU 前向真正并行。
 
-**那 1 毫秒的 `time.sleep`**。看注释：有些请求会卡在 `WAITING_FOR_REMOTE_KVS`——等另一台机器把 KV cache 通过 NIXL（NVIDIA 开源的跨节点内存传输库，ai-dynamo/nixl；底层基于 RDMA——远程直接内存访问，允许一台机器直接读写另一台机器内存而不经对方 CPU，延迟远低于传统网络收发。本仓 pin 要求 nixl>=1.1.0。[第 36 章 §36.8](../../ch36-pd-disaggregation/narrative/chapter.md) 细讲分离式预填充下 NIXL 的完整用法）握手传过来。这种请求没法 step（数据还没到），但又确实「没完成」。如果忙循环为它疯狂空转，会把 CPU 时间片全占了，做握手的后台线程反而饿死、永远握不上手。短睡 1 ms 把轮询频率压到约 1000 Hz，给后台线程让出时间片。这是一个「紧轮询会饿死协作线程」的经典折中。
+**那 1 毫秒的 `time.sleep`**。看注释：有些请求会卡在 `WAITING_FOR_REMOTE_KVS`——等另一台机器把 KV cache 通过 NIXL 握手传过来。NIXL（NVIDIA Inference Xfer Library，NVIDIA 开源的跨节点内存传输库，[官方仓库](https://github.com/ai-dynamo/nixl)）存在的理由，是分离式预填充这类部署把一次推理拆成两段：先在一台机器上算好 prompt 的 KV cache，再整块搬到另一台机器上逐 token 生成——这段跨机搬运就是它的活。底层多数走 RDMA（远程直接内存访问，一种「单边」传输：发起方直接读写对端内存地址，对端 CPU 全程不参与，延迟远低于传统网络收发），本仓 pin 要求 nixl>=1.1.0。[第 36 章 §36.8](../../ch36-pd-disaggregation/narrative/chapter.md) 细讲分离式预填充下 NIXL 的完整用法。这种请求没法 step（数据还没到），但又确实「没完成」。如果忙循环为它疯狂空转，会把 CPU 时间片全占了，做握手的后台线程反而饿死、永远握不上手。短睡 1 ms 把轮询频率压到约 1000 Hz，给后台线程让出时间片。这是一个「紧轮询会饿死协作线程」的经典折中。
 
 精简版把这一圈也跑通了：输出确实进了 `output_queue`，请求消费完加关停信号后循环干净退出。
 
@@ -480,7 +480,7 @@ def trigger(self):               # 信号处理器只调这个
     self._event.set()            # 唯一动作：放行线程
 ```
 
-这一手是 Unix 世界「信号处理器不能拿锁」这条铁律的标准解法——**self-pipe trick**（自管道技巧，由 D. J. Bernstein 推广）——的一个变体：处理器只做最小动作（`Event.set()`），真正的活（`put_nowait`）交给另一条线程在信号上下文之外执行。Python 官方文档对此有[明确警告](https://docs.python.org/3/library/signal.html)并给出了推荐范式。
+这一手是 Unix 世界「信号处理器不能拿锁」这条铁律的标准解法——**self-pipe trick**（自管道技巧，由 D. J. Bernstein 推广）——的一个变体。经典做法是预先建一根管道：信号处理器只做一件不碰锁的事——往管道写一个字节（`write()` 是 POSIX「异步信号安全」操作白名单里的少数函数之一，加锁、内存分配都不在名单上）；主循环 select 在管道的读端，字节一到就被唤醒，再回正常上下文把真活干完。vLLM 把「写字节 + select」换成了「`Event.set()` + 专用线程」，但核心不变——处理器只做最小动作，真正的 `put_nowait` 在信号上下文之外执行。Python 官方文档对在信号处理器里使用同步原语有[明确警告](https://docs.python.org/3/library/signal.html)，并给出了 socketpair + selector 的推荐范式。
 
 这下 §11.4 那个 `WAKEUP` → `return` 的空分支就有意义了：它**不为了做事，只为了把阻塞的 `input_queue.get` 唤醒**。哨兵一进队列，睡着的 `get` 立刻返回，`_handle_client_request` 拿到 `WAKEUP` 啥也不干就 `return`，控制权交回忙循环。忙循环转下一圈，去检查 `_handle_shutdown()`——这次它会看到 `shutdown_state` 已经是 `REQUESTED` 了。
 
@@ -534,7 +534,7 @@ def _handle_shutdown(self) -> bool:
 | 3 | `SHUTTING_DOWN` | 跑一拍，假设完成 1 个 | 2→1 | True | True |
 | 4 | `SHUTTING_DOWN` | 跑一拍，假设完成 1 个 | 1→0 | False | **False（退出）** |
 
-真正撑起「排空一定会结束」这句话的，不是「每拍至少完成一个」这么强的假设，而是两条更弱、也确实由代码/设计保证的性质叠加：①进入 `SHUTTING_DOWN` 后不再接收新请求（`_reject_add_in_shutdown` 挡掉 ADD），未完成请求的集合只减不增，不会有新成员补进来；②每个未完成请求的剩余生成本身有限——要么撞上长度上限，要么提前遇到 EOS（`stop_terminated`，见 §9），两者都会让调度器把它标记为完成、移出未完成集合。①保证了这堆请求不会被源源不断的新请求续命，②保证了这堆请求里的每一个终归会退场；两条一起，就把「未完成请求数」摁死成一个**总有一天会耗尽**的有限量，而不需要假设某个具体的每拍进度。上面那张表，就是这个论证在「凑巧一拍完成一个」这个特例下的样子——真实场景里可能要转很多拍才排空这 3 个请求，但排空这件事本身不会不结束。
+真正撑起「排空一定会结束」这句话的，不是「每拍至少完成一个」这么强的假设，而是两条更弱、也确实由代码/设计保证的性质叠加：①进入 `SHUTTING_DOWN` 后不再接收新请求（`_reject_add_in_shutdown` 挡掉 ADD），未完成请求的集合只减不增，不会有新成员补进来；②每个未完成请求的剩余生成本身有限——要么撞上长度上限，要么提前遇到 EOS（`stop_terminated`——停止条件被触发时置位的标志，[第 9 章](../../ch09-detokenization/narrative/chapter.md) 讲 detokenizer 怎么消费它），两者都会让调度器把它标记为完成、移出未完成集合。①保证了这堆请求不会被源源不断的新请求续命，②保证了这堆请求里的每一个终归会退场；两条一起，就把「未完成请求数」摁死成一个**总有一天会耗尽**的有限量，而不需要假设某个具体的每拍进度。上面那张表，就是这个论证在「凑巧一拍完成一个」这个特例下的样子——真实场景里可能要转很多拍才排空这 3 个请求，但排空这件事本身不会不结束。
 
 把整条链连起来看，关停其实是一次精心编排的握手：信号处理器不敢碰队列锁 → 只调 `trigger()` 放行专用线程 → 该线程在信号上下文之外投 `WAKEUP` 哨兵 → 叫醒阻塞的 `get` → 忙循环转一圈撞上 `_handle_shutdown` → 三态机排空 → 退出。每一环都绕开了「在信号上下文里做危险操作」这个雷区。
 
@@ -772,7 +772,7 @@ self.step_fn = (
 )
 ```
 
-逻辑很简单：executor 的 `max_concurrent_batches > 1` 时（也就是开了流水线并行 PP），启用 `batch_queue` 并把 `step_fn` 绑到 `step_with_batch_queue`；否则零开销走普通 `step`。绑定一次，之后每拍不再判断分支。
+逻辑很简单：executor 的 `max_concurrent_batches > 1` 时（也就是开了流水线并行 PP），启用 `batch_queue` 并把 `step_fn` 绑到 `step_with_batch_queue`；否则零开销走普通 `step`。绑定一次，之后每拍不再判断分支。`deque(maxlen=N)` 是 Python 标准库的固定容量双端队列：满了再往一端塞，会自动挤掉另一端最旧的一项，所以队列长度天然封顶在 N。
 
 `step_with_batch_queue` 是 PP 的核心——它允许同时有多个批在流水线的不同 stage 上飞，靠「先填满流水线优先于取结果」消除 PP 气泡。把收益量化一下：流水线并行（Pipeline Parallelism，PP）把模型的 Transformer 层**按层切割**分配到多个 GPU（或 GPU 组）上，每个 GPU 负责若干层，称为一个 stage——batch 先经 stage 0 的前几层、再传 stage 1、……、最终从末级 stage 出来。整体切成 $`P`$ 个 stage，一个批串行穿过这些 stage。若同一时刻只有一个批在飞，那么任一时刻只有一个 stage 在干活、其余的全空着——硬件利用率只有
 

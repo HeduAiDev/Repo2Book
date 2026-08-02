@@ -5,10 +5,10 @@
 ![你在这里：Stage 3 输出处理里的 logprobs 装配——本章把「输出处理」就地展开成源码真实组织：左列 RequestOutputCollector、RequestState、LogprobsProcessor 三类，右列 FlatLogprobs 与 LogprobsTensors 两容器，13 个走线站全落在这块](../diagrams/arch-model.png)
 
 > *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
-> *本章新长的这块就在 Stage 3「输出处理」——把这个在前面章节里还只是一条线的部分就地展开成源码里的真实组织：左列三个类，`RequestOutputCollector`（第 1 站）与 `RequestState`（第 12–13 站）是第 8 章已读的旧类（蓝框），`RequestState` 持有的 `LogprobsProcessor`（第 2–3、5–9、11 站）才是本章新增的主轴（橙框）；后者按形态分派到两种容器——扁平存储 `FlatLogprobs`（`vllm/logprobs.py`，第 4、10 站）与张量版 `LogprobsTensors`（容器本身无独立站，不被走线访问，只是被 `LogprobsProcessor` 分派使用），其中 `FlatLogprobs` 由一个个 `Logprob` 组成、`LogprobsTensors` 内嵌 `LogprobsLists`，两类容器彼此独立。本章 13 个走线站全落在这块就地展开的组件上，其中 3 站（第 1、12–13 站）踩在蓝框旧类上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *本章新长的这块就在 Stage 3「输出处理」——把这个在前面章节里还只是一条线的部分就地展开成源码里的真实组织：左列三个类，`RequestOutputCollector`（第 1 站）与 `RequestState`（第 12–13 站）是[第 8 章](../../ch08-output-processor/narrative/chapter.md)已读的旧类（蓝框），`RequestState` 持有的 `LogprobsProcessor`（第 2–3、5–9、11 站）才是本章新增的主轴（橙框）；后者按形态分派到两种容器——扁平存储 `FlatLogprobs`（`vllm/logprobs.py`，第 4、10 站）与张量版 `LogprobsTensors`（容器本身无独立站，不被走线访问，只是被 `LogprobsProcessor` 分派使用），其中 `FlatLogprobs` 由一个个 `Logprob` 组成、`LogprobsTensors` 内嵌 `LogprobsLists`，两类容器彼此独立。本章 13 个走线站全落在这块就地展开的组件上，其中 3 站（第 1、12–13 站）踩在蓝框旧类上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
 > *这块新展开的结构接在[第 8 章](../../ch08-output-processor/narrative/chapter.md)那条 `process_outputs` 单循环上——那一章拆开了 Stage 3 的多路复用与扇出，本章钻进循环里被一笔带过的另一笔账：从 EngineCore 吐回的张量装配成 OpenAI 兼容容器。到本章为止已读过 5 个组件（第 3、4、5、7、8 章），本章是 Stage 3 的第二次深入。*
 
-第 8 章那条单循环里，每个请求都会走到这么一行（`vllm/v1/engine/output_processor.py:L664-L666`）：
+[第 8 章](../../ch08-output-processor/narrative/chapter.md) 那条单循环里，每个请求都会走到这么一行（`vllm/v1/engine/output_processor.py:L664-L666`）：
 
 ```python
 # vllm/v1/engine/output_processor.py:L664
@@ -19,8 +19,8 @@ req_state.logprobs_processor.update_from_output(engine_core_output)
 
 1. **两条形态不同的输入**。sample logprobs（生成 token 的）和 prompt logprobs（prompt token 的）从 EngineCore 出来时长得不一样——一个是已经搬到 CPU 的 numpy 列表，一个是还带着 torch 张量的二维数组。两条路装配代码看着像重复，其实必须分开。
 2. **一个累计概率**。生成序列要维护 `cumulative_logprob = Σ log P`，用于打分；prompt 不参与。
-3. **一个字节回退的坑**。logprobs 里每个候选 token 都要解成可读字符串。可一个中文字、一个 emoji 在 byte-fallback tokenizer 里会被拆到好几个 token 上，单独解一个 token 只能得到半截字节、显示成乱码 `�`。怎么把它修回完整字符——这是本章的技术核心。
-4. **两种存储格式**。同样一份 logprobs，可以存成朴素的 `list[dict]`，也可以存成省内存、降 GC 的 `FlatLogprobs`。由 `sampling_params.flat_logprobs` 选。
+3. **一个字节回退的坑**。logprobs 里每个候选 token 都要解成可读字符串。可一个中文字、一个 emoji 在 byte-fallback tokenizer（把词表外的罕见字符按 UTF-8 字节拆成多个 token 的分词机制，§10.5.1 细讲）里会被拆到好几个 token 上，单独解一个 token 只能得到半截字节、显示成乱码 `�`。怎么把它修回完整字符——这是本章的技术核心。
+4. **两种存储格式**。同样一份 logprobs，可以存成朴素的 `list[dict]`，也可以存成省内存、降 GC（垃圾回收扫描开销）的 `FlatLogprobs`。由 `sampling_params.flat_logprobs` 选。
 
 本章的代码主线集中在两个文件：
 
@@ -239,7 +239,7 @@ def convert_ids_list_to_tokens(
     return token_str_lst
 ```
 
-这里的关键词是**逐个**——`tokenizer.decode([token_id])` 一次只喂一个 id。这和第 9 章的"增量去 token"是两条完全不同的路：增量去 token 会带着上下文窗口、保证空格和多字节边界正确；这里是把每个候选 token **孤立**解码。孤立解码罕见多字节字符，必然踩到 `�` 那个坑——这正是 `_verify_tokens` 要收拾的烂摊子，下一节专门讲。
+这里的关键词是**逐个**——`tokenizer.decode([token_id])` 一次只喂一个 id。这和[第 9 章](../../ch09-detokenization/narrative/chapter.md)的"增量去 token"是两条完全不同的路：增量去 token 会带着上下文窗口、保证空格和多字节边界正确；这里是把每个候选 token **孤立**解码。孤立解码罕见多字节字符，必然踩到 `�` 那个坑——这正是 `_verify_tokens` 要收拾的烂摊子，下一节专门讲。
 
 **累计概率**。`sampled_token_logprob = logprobs[0]`，然后 `cumulative_logprob += sampled_token_logprob`。为什么取第 0 个？因为 sampler 约定把**被采样的那个 token** 放在每行第一个。所以 `logprobs[0]` 就是"在前文条件下、模型给被采样 token 的对数概率"，累计起来就是整段生成序列的对数概率：
 
@@ -370,9 +370,11 @@ assert p.cumulative_logprob is None            # prompt 不维护累计
 
 ### 10.5.1 坑从哪来
 
-现代 LLM 常用的子词分词器——BPE（Byte Pair Encoding，字节对编码）算法和 SentencePiece（Google 开源的多算法分词库）这类工具——有一个 **byte-fallback** 机制：碰到词表里没有的罕见字符，不映射成丢失信息的通用 `<unk>` token，而是退化成按该字符的 UTF-8 字节编码、每个字节各当作一个 token。（早期分词器的做法正是直接扔 `<unk>`——多个不同的罕见字符解码后全变成同一个无意义占位符，模型分不清它们、logprobs 也无法还原原文本；byte-fallback 的设计取舍是"宁拆字节，不扔信息"。）一个中文字"中"的 UTF-8 是三个字节 `E4 B8 AD`，byte-fallback 会把它拆成三个 byte 级 token。
+现代 LLM 常用的子词分词器大多是 SentencePiece（Google 开源的子词分词库，LLaMA、Gemma 等模型都在用，内部可跑 BPE（Byte Pair Encoding，字节对编码）等子词算法）——所谓子词，就是比整词小、比字符大的文本单元：常见词整词一个 token，生僻词拆成更小的词根词缀。它的词表是从训练语料里统计出来的：一个叫 character coverage 的超参数（常见取值约 0.9995）决定只把语料里出现频率足够高的字符/子词收进词表，训练语料里没出现过的生僻汉字、稀有 emoji，词表里自然没有对应条目。传统做法是把这类未登录字符整体映射成一个通用 `<unk>` token，代价是信息不可逆：多个不同的罕见字符解码后全变成同一个无意义占位符，模型分不清它们、logprobs 也无法还原原文本。SentencePiece 于是提供 **byte-fallback** 开关（官方文档标注"强烈推荐现代 LLM 开启"）：打开后不再吐 `<unk>`，而是把未登录字符按 UTF-8 字节拆开、每个字节各当作一个 token——词表里预留 256 个形如 `<0xE3>` 的字节 token，覆盖 0x00 到 0xFF 全部字节值。设计取舍一句话：宁拆字节，不扔信息。一个中文字"中"的 UTF-8 是三个字节 `E4 B8 AD`，byte-fallback 会把它拆成三个 byte 级 token。
 
-平时这没问题——增量去 token 会攒齐字节再吐字（第 9 章）。但 logprobs 这里走的是**孤立逐 token 解码**（§10.3 的 `convert_ids_list_to_tokens`）。你单独 `tokenizer.decode([0xE4])`，只有一个字节、凑不齐一个 UTF-8 字符，Python 只能给你一个替换字符 `�`（U+FFFD）。
+对照 GPT-2 那类 byte-level BPE 分词器，就看得出这条折中路线为什么偏偏会踩坑：byte-level BPE 从根上不在字符层面分词——先把文本转成 UTF-8 字节序列、再对字节跑 BPE，基础词表覆盖全部 256 个字节值，任何输入都表示得了、天生没有未登录字符，代价是常见字符也可能被切碎、token 效率低。byte-fallback 则是"字符级为主、字节级兜底"：绝大多数常见字符仍是完整的一个 token，只有罕见字符被拆成 2–4 个字节 token——所以孤立解其中一个字节 token，才拼不出完整字符。分词路线综述见 [HuggingFace 文档](https://huggingface.co/docs/transformers/tokenizer_summary)，byte_fallback 的官方定义见 [SentencePiece 选项文档](https://github.com/google/sentencepiece/blob/master/doc/options.md)。
+
+平时这没问题——增量去 token 会攒齐字节再吐字（[第 9 章](../../ch09-detokenization/narrative/chapter.md)）。但 logprobs 这里走的是**孤立逐 token 解码**（§10.3 的 `convert_ids_list_to_tokens`）。你单独 `tokenizer.decode([0xE4])`，只有一个字节、凑不齐一个 UTF-8 字符，Python 只能给你一个替换字符 `�`（U+FFFD——Unicode 标准专门为"解码不出合法字符"的坏字节规定的占位符，解码器按标准做替代，而不是崩溃或悄悄吞掉）。
 
 所以每个以 `�` 结尾的 decoded token，都是一个"字节序列没拼完"的信号。得想办法把它拼回去。怎么拼？**借前文**。
 
@@ -418,7 +420,7 @@ def _get_sampled_context_ids(
 
 三个要点：
 
-- **只取最近 ≤4 个**。`start = max(0, n - max_context)`，`max_context=4`。为什么是 4？因为 UTF-8 单个字符最多 4 字节（RFC 3629 规定的硬上界，2003 年从早期 6 字节收紧为 4，对齐 Unicode 约 100 万码位的上限），所以任何一个没拼完的多字节序列，至多跨 4 个 byte-fallback token。4 个上下文 token 一定够把它拼全——这是个数学上界，不是拍脑袋。
+- **只取最近 ≤4 个**。`start = max(0, n - max_context)`，`max_context=4`。为什么是 4？因为 UTF-8 单个字符最多 4 字节（[RFC 3629](https://www.rfc-editor.org/rfc/rfc3629.html) 规定的硬上界，2003 年从早期 6 字节收紧为 4，对齐 Unicode 约 100 万码位的上限），所以任何一个没拼完的多字节序列，至多跨 4 个 byte-fallback token。4 个上下文 token 一定够把它拼全——这是个数学上界，不是拍脑袋。
 - **每位置取"第一个 entry"**。无论 flat 还是 nested，取的都是每个位置的第一个 token id。这正是 §10.3 立下的不变式：`append_logprobs_for_next_position` 总把被采样/被选中的 token 第一个写入。所以 FlatLogprobs 直接走 `token_ids[start_indices[i]]`（`start_indices[i]` 是位置 `i` 在扁平 `token_ids` 列表里的起始下标，§10.6 详述该结构，这里只需知道它指向该位置的第一个候选），nested 走 `next(iter(entry))`（dict 的第一个 key）。两条路殊途同归。
 - **flat 路径跳过空位置**。`if start_indices[i] < end_indices[i]`——prompt 首位那个 `append(None)` 写出的是个零长度区间（start == end），它没有真实 token，得跳过。
 
@@ -689,7 +691,7 @@ class FlatLogprobs(MutableSequence[LogprobsOnePosition | None]):
 
 > *图注：左边 nested——3 个位置造 3 个 dict + 6 个 Logprob 对象，被循环 GC 追踪的容器对象数随 L×K 增长。右边 flat——4 条值列表（token_ids / logprobs / ranks / decoded）+ 2 条索引列表（start / end），元素是 int/float/str（这些不被循环 GC 追踪），被追踪的容器只剩这 6 条 list，数量恒定。位置 i 的候选用 `token_ids[start_indices[i] : end_indices[i]]` 这个区间取回。*
 
-核心就一句话：**把"每位置一个 dict、每候选一个对象"摊平成 6 条原生列表，再用每位置的 `[start_indices[i], end_indices[i])` 区间索引切回去**。降 GC 的关键在于 CPython 的循环垃圾回收只追踪可能构成引用环的容器对象——nested 布局里那 L 个 dict 和 L×K 个 `Logprob` 实例都会被它扫描，数量随 L×K 增长；摊平后被追踪的容器只剩 `FlatLogprobs` 本身加那 6 条 list，无论序列多长、`top_logprobs` 多大都恒定。列表里装的 int/float/str 仍是 Python 对象，但它们不含引用、不参与循环 GC，故不被扫描——于是 GC 扫描成本不再随规模增长。
+核心就一句话：**把"每位置一个 dict、每候选一个对象"摊平成 6 条原生列表，再用每位置的 `[start_indices[i], end_indices[i])` 区间索引切回去**。先把"循环垃圾回收"说清楚：Python 内存回收的主力是引用计数——对象每被引用一次计数 +1、失效一次 -1、归零立即释放；但它对"A 引用 B、B 又引用 A"这种循环引用无能为力，计数永远降不到零、内存永远不释放。于是 CPython 额外配了一个分代垃圾回收器（`gc` 模块）专门扫描并打破这类环。关键在它的追踪范围：只追踪 list/dict/自定义类实例这类"可能持有别的对象的引用、因而可能成环"的容器；int/float/str 不含指向其他对象的引用、天生成不了环，从不被追踪——`gc.is_tracked([])` 为 True、`gc.is_tracked(0)` 为 False，这是 [CPython 官方文档](https://docs.python.org/3/library/gc.html) 记载的官方行为，不是 vLLM 的特殊假设。降 GC 的关键就在这：nested 布局里那 L 个 dict 和 L×K 个 `Logprob` 实例都会被它扫描，数量随 L×K 增长；摊平后被追踪的容器只剩 `FlatLogprobs` 本身加那 6 条 list，无论序列多长、`top_logprobs` 多大都恒定。列表里装的 int/float/str 仍是 Python 对象，但它们不含引用、不参与循环 GC，故不被扫描——于是 GC 扫描成本不再随规模增长。
 
 两个写入方法的差别：`append` 吃一个现成的 dict（`{token_id: Logprob}`），拆开摊进列表；`append_fast` 直接吃几条平行数据，连那个中间 dict 都不造——这是热路径，省一次建 dict 的开销。还有个细节：`append(None)`（prompt 首位那个占位）会写出一个 `start == end` 的零长度区间，对应 §10.5.2 里"flat 路径跳过空位置"那个判断。
 

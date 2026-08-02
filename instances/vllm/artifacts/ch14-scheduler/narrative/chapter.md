@@ -6,11 +6,11 @@
 
 > *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向；当年 `EngineCore` 框里只画了调度器与分页 KV 缓存，如今已按「调度与显存／执行与并行／模型与算子／解码策略」四组装满一路读过来的组件。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章焦点——就在调度器这个已读的蓝色盒子内部，展开它的抢占与回流机制。*
 > *本章的焦点接在[第 13 章](../../ch13-scheduler/narrative/chapter.md)那个调度器主循环上：上一章讲了 `schedule()` 怎么跨 RUNNING/WAITING 两阶段递减 token 预算、连续批处理不分相，但在两处踩了刹车——RUNNING 阶段 `allocate_slots` 失败进抢占循环时只说「会抢占」没展开，`update_from_output()` 反馈环只说「追加 token、判 stop、释放」没钻进去。本章就是把这两个被刹住的分支补完：抢占循环怎么 LIFO 回收显存、被抢请求怎么回流到等待队列、双队列怎么防队头阻塞、生命周期怎么从运行态迁移到完成态并释放资源。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
-> *下一章 **第 15 章** 接着讲调度器背后的分页 KV 缓存——块池怎么分配、前缀缓存怎么命中。*
+> *下一章 [第 15 章：分页 KV 缓存](../../ch15-kv-cache/narrative/chapter.md) 接着讲调度器背后的分页 KV 缓存——块池怎么分配、前缀缓存怎么命中。*
 
 [第 13 章](../../ch13-scheduler/narrative/chapter.md) 立下的事是：调度器每一拍干两件事。先扫 `running` 队列，让每个在跑的请求继续往前算几个 token；再扫 `waiting` 队列，把新请求拉进来。两阶段共用一个 `token_budget`，谁先用谁先得。
 
-但有一句话当时被我们快速带过了。RUNNING 阶段给一个请求算 token，得先问 KV 缓存管理器要显存块——`allocate_slots()`。**如果显存满了，要不到块呢？** 第 13 章只说「会触发抢占」，然后就跳走了。
+但有一句话当时被我们快速带过了。RUNNING 阶段给一个请求算 token，得先问 KV 缓存管理器要显存块——`allocate_slots()`。**如果显存满了，要不到块呢？** [第 13 章](../../ch13-scheduler/narrative/chapter.md)只说「会触发抢占」，然后就跳走了。
 
 这一章就停在这个「要不到块」的瞬间。你会看到 vLLM v1 在内存压力下的一整套动作：
 
@@ -22,7 +22,7 @@
 - **§14.6** `check_stop`：token 级停止判定（EOS / `stop_token_ids` / 长度 / 重复）——以及它和你以为的「stop string」其实**不是一回事**。
 - **§14.7** `RequestStatus` 状态机：用一个 `IntEnum` 的排布技巧，把「是否完成」压缩成一次整型比较。
 
-照例，本章配一份**只做减法**的精简版：和真实 `vllm/v1/core/sched/scheduler.py` 同名、同结构、同控制流，只删掉与抢占·回流主线无关的子系统（多模态 encoder、远程 KV connector、结构化输出、流式输入、PRIORITY 策略、统计日志），删除点原样标注。它不 import vllm、不需要 GPU，`pytest` 直接能跑——用来在本地打断点、亲眼看 `num_computed_tokens` 怎么被清零、被抢请求怎么排回队头。但正文的主线，始终是真实源码。
+照例，本章配一份**只做减法**的精简版：和真实 `vllm/v1/core/sched/scheduler.py` 同名、同结构、同控制流，只删掉与抢占·回流主线无关的子系统（多模态 encoder、远程 KV connector（跨节点搬运 KV 的连接组件）、结构化输出、流式输入、PRIORITY 策略、统计日志），删除点原样标注。它不 import vllm、不需要 GPU，`pytest` 直接能跑——用来在本地打断点、亲眼看 `num_computed_tokens` 怎么被清零、被抢请求怎么排回队头。但正文的主线，始终是真实源码。
 
 ![本章地图：抢占循环与请求生命周期回流的源码剖面](../diagrams/chapter-map.png)
 
@@ -121,7 +121,7 @@ if preempted_req == request:
 O(L) \;\longrightarrow\; O(L_{\mathrm{miss}})
 ```
 
-命中率越高， $`L_{\mathrm{miss}}`$ 越接近 0，重算成本越低。这就是 v1 敢用「丢弃」替「换出」的底气——这套前缀缓存的机制，**第 15 章** 会拆开讲。v1 用「简单的内存模型 + 前缀缓存兜底」换掉了「复杂的 swap 管理」。
+命中率越高， $`L_{\mathrm{miss}}`$ 越接近 0，重算成本越低。这就是 v1 敢用「丢弃」替「换出」的底气——这套前缀缓存的机制，[第 15 章：分页 KV 缓存](../../ch15-kv-cache/narrative/chapter.md) 会拆开讲。v1 用「简单的内存模型 + 前缀缓存兜底」换掉了「复杂的 swap 管理」。
 
 ---
 
@@ -167,7 +167,7 @@ def _preempt_request(self, request: Request, timestamp: float) -> None:
 self.waiting.prepend_request(request)
 ```
 
-注意是 `prepend`——插到 `waiting` **队头**，不是队尾。`FCFSRequestQueue` 底层是个 `deque`，`prepend_request` 就是 `appendleft`：
+注意是 `prepend`——插到 `waiting` **队头**，不是队尾。`FCFSRequestQueue` 底层是个 `deque`（Python 双端队列，队头队尾增删都是 O(1)），`prepend_request` 就是 `appendleft`：
 
 ```python
 # vllm/v1/core/sched/request_queue.py:L92
@@ -199,7 +199,7 @@ assert sched.waiting.peek_request() is req     # 回到了 waiting 队头
 
 ## 14.3 抢占之后，本拍不再放新请求
 
-RUNNING 阶段结束，按第 13 章的主线，接下来该进 WAITING 阶段拉新请求了。但这里有一个一眼容易看漏、却很关键的守卫：
+RUNNING 阶段结束，按[第 13 章](../../ch13-scheduler/narrative/chapter.md)的主线，接下来该进 WAITING 阶段拉新请求了。但这里有一个一眼容易看漏、却很关键的守卫：
 
 ```python
 # vllm/v1/core/sched/scheduler.py:L525
@@ -229,13 +229,13 @@ if not preempted_reqs:
 
 ## 14.4 双队列：别让一个阻塞请求饿死整队
 
-现在假设本拍**没有**发生抢占，顺利进入 WAITING 阶段。这里 vLLM v1 有一个第 13 章没提的结构：`waiting` 不是一个队列，而是**两个**——`waiting` 和 `skipped_waiting`。
+现在假设本拍**没有**发生抢占，顺利进入 WAITING 阶段。这里 vLLM v1 有一个[第 13 章](../../ch13-scheduler/narrative/chapter.md)没提的结构：`waiting` 不是一个队列，而是**两个**——`waiting` 和 `skipped_waiting`。
 
 为什么要两个？先看一个会出问题的场景。
 
 `waiting` 队列里的请求，不全都「准备好了可以跑」。有些在等外部条件：
 
-- 等远程节点把 KV 缓存传过来（P/D 分离场景，状态 `WAITING_FOR_REMOTE_KVS`）；
+- 等远程节点把 KV 缓存传过来（P/D 分离，prefill 与 decode 跑在不同节点——状态 `WAITING_FOR_REMOTE_KVS`）；
 - 等结构化输出的语法对象编译好（约束解码，`WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR`）；
 - 等流式输入的下一段（多轮会话，`WAITING_FOR_STREAMING_REQ`）。
 
@@ -258,7 +258,7 @@ C_{\mathrm{step}} \le |waiting| + |skipped\_waiting|
 请求进队时就按状态分流。归类规则和入队入口：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L1516
+# vllm/v1/core/sched/scheduler.py:L1515
 @staticmethod
 def _is_blocked_waiting_status(status: RequestStatus) -> bool:
     return status in (
@@ -340,13 +340,13 @@ assert "R1" in out.scheduled_new_reqs       # 可调度请求照常被拉起
 assert sched.skipped_waiting.peek_request() is blocked  # 阻塞请求被跳过、留在 skipped
 ```
 
-至于这些阻塞态究竟在等什么、`_try_promote_blocked_waiting_request` 在真实 vLLM 里凭什么条件提升——`WAITING_FOR_REMOTE_KVS` 的来龙去脉属于 P/D 分离的范畴，**第 35 章** 会把远程 KV 加载、提升回 `WAITING` 的完整路径接上。本章只需记住：**双队列是为了避免队头阻塞，被跳过的请求会被公平地重排回去等下拍。**
+至于这些阻塞态究竟在等什么、`_try_promote_blocked_waiting_request` 在真实 vLLM 里凭什么条件提升——`WAITING_FOR_REMOTE_KVS` 的来龙去脉属于 P/D 分离的范畴，[第 35 章：PD 分离 I](../../ch35-pd-disaggregation/narrative/chapter.md) 会把远程 KV 加载、提升回 `WAITING` 的完整路径接上。本章只需记住：**双队列是为了避免队头阻塞，被跳过的请求会被公平地重排回去等下拍。**
 
 ---
 
 ## 14.5 回流闭环：update_from_output
 
-到这里，`schedule()` 这一侧讲完了。但调度只是「派活」，还没拿到「干活的结果」。**现在走到 `EngineCore` 逐拍循环 `schedule → execute_model → update` 的最后一段**：中间那个 `execute_model` 属于架构模型图里「执行与并行」组、要到后面的章节才讲，我们只借用它的产物——模型跑完前向、采样出新 token 之后，结果要喂回调度器，由它来：追加 token、判断该不该停、迁移完成态、释放资源。这是反馈环的另一半——`update_from_output()`。第 13 章把它当黑盒，本章拆开。
+到这里，`schedule()` 这一侧讲完了。但调度只是「派活」，还没拿到「干活的结果」。**现在走到 `EngineCore` 逐拍循环 `schedule → execute_model → update` 的最后一段**：中间那个 `execute_model` 属于架构模型图里「执行与并行」组、要到后面的章节才讲，我们只借用它的产物——模型跑完前向、采样出新 token 之后，结果要喂回调度器，由它来：追加 token、判断该不该停、迁移完成态、释放资源。这是反馈环的另一半——`update_from_output()`。[第 13 章](../../ch13-scheduler/narrative/chapter.md)把它当黑盒，本章拆开。
 
 先看抢占请求是怎么「回流」复活的，把上半章的环闭上。WAITING 阶段成功调度一个请求时，按它**进来时的状态**分两类落点：
 
@@ -418,7 +418,7 @@ for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
 
 这段信息密度高，拆成几块看。
 
-**投机解码回退。** 投机解码（speculative decoding）会先用一个小模型猜几个「草稿 token」，再用大模型一次性验证。验证时可能拒掉一部分。这套「先猜后验」的机制由两个研究组在 2023 年初几乎同时独立提出——Leviathan 等人（Google Research, [arXiv:2211.17192](https://arxiv.org/abs/2211.17192)）与 Chen 等人（DeepMind, [arXiv:2302.01318](https://arxiv.org/abs/2302.01318)）——核心贡献是证明了带拒绝采样的验证过程产出的 token 序列，在分布上与直接从目标模型逐个采样完全等价：不是近似加速，是**无损加速**。`num_draft_tokens` 是猜了几个，`num_accepted = len(generated_token_ids) - 1`（接受的数量，减 1 是因为总有一个「bonus token」是大模型自己出的、不算草稿），`num_rejected` 是被拒的。
+**投机解码回退。** 投机解码（speculative decoding）会先用一个小模型猜几个「草稿 token」，再用大模型一次性验证。验证时可能拒掉一部分。这套「先猜后验」的机制由两个研究组在 2023 年初几乎同时独立提出——Leviathan 等人（Google Research, [arXiv:2211.17192](https://arxiv.org/abs/2211.17192)）与 Chen 等人（DeepMind, [arXiv:2302.01318](https://arxiv.org/abs/2302.01318)）——核心贡献是证明了带拒绝采样的验证过程产出的 token 序列，在分布上与直接从目标模型逐个采样完全等价：不是近似加速，是**无损加速**（算法细节的完整拆解见[第 34 章：投机解码](../../ch34-spec-decode/narrative/chapter.md)）。`num_draft_tokens` 是猜了几个，`num_accepted = len(generated_token_ids) - 1`（接受的数量，减 1 是因为总有一个「bonus token」是大模型自己出的、不算草稿），`num_rejected` 是被拒的。
 
 为什么要回扣计数？因为调度这些草稿 token 时，调度器**乐观地**把它们算进了 `num_computed_tokens`——假设全被接受。一旦有草稿被拒，这部分计数就是虚的，必须回退：
 
@@ -528,7 +528,7 @@ def _update_request_with_output(
 
 逐个 token 来：`append_output_token_ids` 把它追加进请求的输出序列，然后立刻 `check_stop` 看停没停。一旦某个 token 触发停止，`del new_token_ids[num_new:]` 把**它之后**的 token 全截掉——停止 token 之后生成的不该返回给用户——然后 `break`。
 
-为什么要逐 token 判、而不是一批算完再判？因为停止可能发生在批的中间。比如本拍采样出 5 个 token，第 3 个是 EOS，那第 4、5 个就不该存在。逐 token 判才能精确地在 EOS 处截断。
+为什么要逐 token 判、而不是一批算完再判？因为停止可能发生在批的中间。比如本拍采样出 5 个 token，第 3 个是 EOS（end-of-sequence，序列结束符），那第 4、5 个就不该存在。逐 token 判才能精确地在 EOS 处截断。
 
 停止的判据在 `check_stop`：
 
@@ -659,7 +659,7 @@ _FINISHED_REASON_MAP = {
 
 ### 异步调度下的占位簿记
 
-最后补一个 `AsyncScheduler` 的覆写。第 13 章末讲过，异步调度让「调度下一拍」和「执行当前拍」重叠起来跑——调度器不等模型出结果就先排下一拍。这带来一个簿记问题：下一拍排的时候，当前拍的 token 还没真的生成，但又得给它**占个位**，否则下一拍会重复调度同一个位置。这个占位就是 `num_output_placeholders`。
+最后补一个 `AsyncScheduler` 的覆写。[第 13 章](../../ch13-scheduler/narrative/chapter.md)末讲过，异步调度让「调度下一拍」和「执行当前拍」重叠起来跑——调度器不等模型出结果就先排下一拍。这带来一个簿记问题：下一拍排的时候，当前拍的 token 还没真的生成，但又得给它**占个位**，否则下一拍会重复调度同一个位置。这个占位就是 `num_output_placeholders`。
 
 `AsyncScheduler` 覆写 `_update_request_with_output` 来维护这个占位：
 
@@ -705,13 +705,13 @@ def _update_request_with_output(
 
 ## 小结
 
-这一章把第 13 章在 `allocate_slots` 失败处踩的那脚刹车松开，看清了 vLLM v1 在内存压力下的全套动作：
+这一章把[第 13 章](../../ch13-scheduler/narrative/chapter.md)在 `allocate_slots` 失败处踩的那脚刹车松开，看清了 vLLM v1 在内存压力下的全套动作：
 
-- **抢占是丢弃重算，不是换出。** FCFS LIFO 抢 `running` 末尾（`vllm/v1/core/sched/scheduler.py:L462`），`_preempt_request`（`scheduler.py:L952`）把 KV free 掉、`num_computed_tokens` 清零、塞回 `waiting` 队头。重算成本靠前缀缓存兜底——这是 v1 用「简单内存模型」换掉「复杂 swap 管理」的取舍。
-- **检测到抢占就收缩。** `if not preempted_reqs` 一行守卫（`scheduler.py:L567`），本拍发生过抢占就完全跳过 WAITING，不在内存紧张时火上浇油。
-- **双队列破队头阻塞。** 阻塞态请求隔离到 `skipped_waiting`（`scheduler.py:L1554`、`L1567`），可调度请求在 `waiting` 里畅通；被跳过的请求公平重排回去等下拍重试。
-- **`update_from_output` 是反馈环的另一半（`scheduler.py:L1331`）。** 投机解码回退（回扣 `num_computed_tokens`）、逐 token 追加 + `check_stop`、先抓 `finish_reason` 再处理停止、按抢占前状态分流摘除、真完成才 `_free_request`。
+- **抢占是丢弃重算，不是换出。** FCFS LIFO 抢 `running` 末尾（`vllm/v1/core/sched/scheduler.py:L462`），`_preempt_request`（`scheduler.py:L910`）把 KV free 掉、`num_computed_tokens` 清零、塞回 `waiting` 队头。重算成本靠前缀缓存兜底——这是 v1 用「简单内存模型」换掉「复杂 swap 管理」的取舍。
+- **检测到抢占就收缩。** `if not preempted_reqs` 一行守卫（`scheduler.py:L526`），本拍发生过抢占就完全跳过 WAITING，不在内存紧张时火上浇油。
+- **双队列破队头阻塞。** 阻塞态请求隔离到 `skipped_waiting`（`scheduler.py:L1516`、`L1523`），可调度请求在 `waiting` 里畅通；被跳过的请求公平重排回去等下拍重试。
+- **`update_from_output` 是反馈环的另一半（`scheduler.py:L1248`）。** 投机解码回退（回扣 `num_computed_tokens`）、逐 token 追加 + `check_stop`、先抓 `finish_reason` 再处理停止、按抢占前状态分流摘除、真完成才 `_free_request`。
 - **`check_stop`（`vllm/v1/core/sched/utils.py:L94`）只管 token 级停止**——EOS / `stop_token_ids` / 长度 / 重复，有固定优先级。stop **string** 子串匹配在 [前端 detokenizer](../../ch09-detokenization/narrative/chapter.md)，不在这里。
 - **`RequestStatus` 用 `IntEnum` 顺序排布**（`vllm/v1/request.py:L316`），把「是否完成」压成一次 `status > PREEMPTED` 的整型比较。
 
-调度器这一侧，到此讲完了它「派活」和「收活」的完整逻辑。但有一个黑盒还没开：`allocate_slots` 究竟怎么把 token 落到分页显存上、前缀缓存又凭什么能命中、被抢请求复活时怎么把成本降下来——**第 15 章：分页 KV 缓存** 钻进块池和前缀缓存，把本章一直在调用的那个 `kv_cache_manager` 拆开。
+调度器这一侧，到此讲完了它「派活」和「收活」的完整逻辑。但有一个黑盒还没开：`allocate_slots` 究竟怎么把 token 落到分页显存上、前缀缓存又凭什么能命中、被抢请求复活时怎么把成本降下来——[第 15 章：分页 KV 缓存](../../ch15-kv-cache/narrative/chapter.md) 钻进块池和前缀缓存，把本章一直在调用的那个 `kv_cache_manager` 拆开。

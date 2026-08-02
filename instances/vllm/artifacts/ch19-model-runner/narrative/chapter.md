@@ -495,7 +495,7 @@ assert runner.input_ids.cpu[0] == Z                       # 上拍写回的 Z，
 
 在拆 dispatch 逻辑之前，先交代一句这些图的来历。CUDA Graph 是 NVIDIA CUDA 运行时自 CUDA 10 起提供的通用图捕获/回放机制——不是 vLLM 自创：把一串要提交给 GPU 的 kernel 启动及依赖关系录成一张有向无环图，之后只需一次 `cudaGraphLaunch` 就能把整张图重放，省去每个算子逐个发射的调度开销。代价是形状在捕获时就被定死：图的节点里记下的张量地址和维度 replay 时必须完全一致；这正是 FULL 模式要求批次形状精确匹配的根因。PyTorch 通过 `torch.cuda.CUDAGraph`（基于流捕获 stream capture）把这套能力暴露给用户，LLM 推理正是教科书级场景——同一段前向每拍反复执行、形状在稳态后趋于不变。深入可读 [PyTorch CUDA Graphs 博客](https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/) 和 [NVIDIA CUDA 编程指南](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#cuda-graphs)。
 
-这套分级设计也不是本仓临时拼出来的——vLLM 编译框架对 CUDA graph 的使用有正式设计文档 [vllm/docs/design/cuda_graphs.md](https://github.com/vllm-project/vllm/blob/main/docs/design/cuda_graphs.md)，核心思想正是区分 prefill/mixed 批次与 uniform decode 批次、分别捕获。另外配置层还有 `FULL_DECODE_ONLY` 和 `FULL_AND_PIECEWISE` 两个面向用户的组合选项（如 P/D 分离部署中 decode 实例常用前者），但它们 dispatch 时最终落到的仍是 `NONE`/`PIECEWISE`/`FULL` 三个具体值——和本章分派逻辑一致。
+这套分级设计也不是本仓临时拼出来的——vLLM 编译框架对 CUDA graph 的使用有正式设计文档 [vllm/docs/design/cuda_graphs.md](https://github.com/vllm-project/vllm/blob/main/docs/design/cuda_graphs.md)，核心思想正是区分 prefill/mixed 批次与 uniform decode 批次、分别捕获。所谓 uniform decode，指批次里每个请求恰好贡献相同数量的 token——解码稳态下每个请求各出一个 token，正是这种「均匀」批次（开投机解码时则是每请求各出 1+草稿数）。这条门槛不是装饰：像 FlashInfer、FlashMLA 这类高性能注意力算子库，只在批次内查询长度一致时才支持把 attention 一起录进整图——FULL 模式的图因此只会为 uniform decode 批次录制。另外配置层还有 `FULL_DECODE_ONLY` 和 `FULL_AND_PIECEWISE` 两个面向用户的组合选项（如 P/D 分离部署中 decode 实例常用前者），但它们 dispatch 时最终落到的仍是 `NONE`/`PIECEWISE`/`FULL` 三个具体值——和本章分派逻辑一致。
 
 先说清楚三态各自是什么、贵在哪：
 
@@ -547,7 +547,7 @@ key 还没初始化、模式本就是 NONE、或者这一批 token 数超过了�
         return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
 ```
 
-先查 FULL：拿精确的 `batch_desc`（带 `num_reqs`）去 FULL 的 key 集合里找，命中就用 FULL——最省。找不到，把描述符**放宽**——`replace(batch_desc, num_reqs=None, uniform=False)`，把 `num_reqs` 抹成 `None`——再去 PIECEWISE 集合里找。这个放宽正是 PIECEWISE「对请求数宽容」的体现：同一张 PIECEWISE 图能服务任意请求数的批次，所以查 key 时不计较 `num_reqs`。两套都没命中，回退 NONE。
+先查 FULL：拿精确的 `batch_desc`（带 `num_reqs`）去 FULL 的 key 集合里找，命中就用 FULL——最省。找不到，把描述符**放宽**——`replace(batch_desc, num_reqs=None, uniform=False)`，把 `num_reqs` 抹成 `None`——再去 PIECEWISE 集合里找。这个放宽正是 PIECEWISE「对请求数宽容」的体现：同一张 PIECEWISE 图能服务任意请求数的批次，所以查 key 时不计较 `num_reqs`。`uniform` 也被一并抹掉——PIECEWISE 的 key 在录制时就不带均匀性（源码注释点明：只有 FULL 需要精确的 `num_reqs`，因为注意力后端的调度元数据计算依赖它）。两套都没命中，回退 NONE。
 
 这个 FULL → PIECEWISE → NONE 的顺序，就是按 launch 开销升序优先：先试最省的整图 replay，命不中退而求其次用算子段图，再不行才老老实实 eager。下面这张决策树把它画全：
 

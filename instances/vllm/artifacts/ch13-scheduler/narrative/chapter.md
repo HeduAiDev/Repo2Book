@@ -90,7 +90,7 @@ def schedule(self) -> SchedulerOutput:
 - **一个刚进来的请求**，prompt 100 个 token，还没算过任何东西。`num_computed_tokens = 0`，`num_tokens_with_spec = 100`。差 100。这就是 prefill——「差得多」。
 - **一个已经吐了 50 个字的请求**，prompt 100 + 输出 50，套进上面那条公式：`num_tokens_with_spec = 100 + 50 + 0 = 150`。但最后那第 50 个输出 token 是这一拍刚采样出来的，它的 KV 还没算进 cache，所以 `num_computed_tokens = 149`。差 1——差的正是这个刚采样、尚未算 KV 的末尾 token。这就是 decode——「差 1 个」。
 
-同一条减法 `num_tokens_with_spec − num_computed_tokens`，prefill 时它等于剩余 prompt 长度，decode 时它等于 1。**这条追赶公式本身不区分 prefill 还是 decode**——它只看这个差值，给请求分配「这一拍补多少」（§13.5 你会看到调度器另外维护了一个 `is_prefill_chunk` 标志位，那是给异步调度记账用的派生量，不是这条调度公式本身分了相——公式照样是同一条减法）。注释最后那行点破了威力来源：这套逻辑「general enough」——足够通用，天然覆盖 chunked prefill（差值被预算截断，分几拍补）、prefix caching（命中的前缀直接计进 `num_computed_tokens`，差值变小）、投机解码（差值里含草稿 token），甚至将来的 jump decoding。一条公式，吃下所有特性。这是 v1 相对 v0 最核心的简化——v0 要为 prefill 和 decode 维护两套队列、两条调度路径，v1 把它们抹平成了一条数轴上的追赶。
+同一条减法 `num_tokens_with_spec − num_computed_tokens`，prefill 时它等于剩余 prompt 长度，decode 时它等于 1。**这条追赶公式本身不区分 prefill 还是 decode**——它只看这个差值，给请求分配「这一拍补多少」（§13.5 你会看到调度器另外维护了一个 `is_prefill_chunk` 标志位，那是给异步调度记账用的派生量，不是这条调度公式本身分了相——公式照样是同一条减法）。注释最后那行点破了威力来源：这套逻辑「general enough」——足够通用，天然覆盖 chunked prefill（差值被预算截断，分几拍补）、prefix caching（命中的前缀直接计进 `num_computed_tokens`，差值变小）、投机解码（差值里含草稿 token），甚至将来的 jump decoding（跳步解码，一种研究中的解码加速方向）。一条公式，吃下所有特性。这是 v1 相对 v0 最核心的简化——v0 要为 prefill 和 decode 维护两套队列、两条调度路径，v1 把它们抹平成了一条数轴上的追赶。
 
 > 后面 §13.3 你会看到这条减法在 RUNNING 阶段的真身（还多了个 `num_output_placeholders` 项，那是 §13.7 异步调度的伏笔）；§13.4 看它在 WAITING 阶段的变体。
 
@@ -138,11 +138,11 @@ def schedule(self) -> SchedulerOutput:
 
 v1 这套「token 为中心、不分相」的调度，把两条来自论文的思想缝进了同一条数轴，值得点名。
 
-**连续批处理源自 Orca**（OSDI'22）。传统静态批处理要等一整批请求全部生成完才换人，长短不一的请求互相拖累。Orca 提出**迭代级调度**（iteration-level scheduling）：以「一次前向」而非「一整条请求」为调度粒度，每跑完一拍就重新决定谁进批、谁出批。这正是 §13.1 那句「批的成员随时进出」的思想出处——vLLM v1 把它推到极致，连 prefill 和 decode 都不再分两条队列。
+**连续批处理源自 Orca**（[OSDI'22](https://www.usenix.org/conference/osdi22/presentation/yu)）。在 Orca 之前，主流推理服务（典型如 NVIDIA 当时的 Transformer 推理引擎 FasterTransformer）以「一整批请求」为调度单位：一批请求要等**全部**生成完才能换下一批，批里长短不一的请求就此互相拖累——最长的那条没吐完，整批都不能换人，先吐完的请求干等着、不能提前返回给客户端，新来的请求也进不了正在跑的批。Orca 提出**迭代级调度**（iteration-level scheduling）：以「一次前向」而非「一整条请求」为调度粒度，每跑完一拍就重新决定谁进批、谁出批。这正是 §13.1 那句「批的成员随时进出」的思想出处，也是「连续批处理」（continuous batching）这个词的源头——vLLM v1 把它推到极致，连 prefill 和 decode 都不再分两条队列。论文自报在同等延迟下吞吐较 FasterTransformer 提升达 36.9 倍（论文自报口径）。
 
-**chunked prefill 源自 Sarathi**（arXiv:2308.16369）。一段长 prompt 的 prefill 是算力密集的大块，一旦独占一拍，正在 decode 的请求就被顶得卡顿。Sarathi 的办法是把长 prefill **切成固定大小的 chunk** 分几拍算，每拍的预算余量再**捎带**（piggyback）若干 decode token，让算力密集的 prefill 和访存密集的 decode 混在一拍里互补。§13.4 那个「50 token prompt、预算 16、分几拍算完」的截断，就是这套思想的直接落地。
+**chunked prefill 源自 Sarathi**（[arXiv:2308.16369](https://arxiv.org/abs/2308.16369)）。一段长 prompt 的 prefill 是算力密集的大块，一旦独占一拍，正在 decode 的请求就被顶得卡顿。Sarathi 的办法是把长 prefill **切成固定大小的 chunk** 分几拍算，每拍的预算余量再**捎带**（piggyback）若干 decode token，让算力密集的 prefill 和访存密集的 decode 混在一拍里互补。§13.4 那个「50 token prompt、预算 16、分几拍算完」的截断，就是这套思想的直接落地。
 
-两篇论文各解一半：Orca 让批连续流转，Sarathi 让长 prefill 不再阻塞 decode。v1 的 `num_computed_tokens` 追赶公式，正是把两者统一成了一条数轴上的追赶。（同一团队后续将这套思想打磨为生产级系统 Sarathi-Serve（OSDI'24，arXiv:2403.02310），在开源 vLLM 之上实现了基于 FlashAttention v2 / FlashInfer 的分页 chunked-prefill，感兴趣的读者可顺藤看。）
+两篇论文各解一半：Orca 让批连续流转，Sarathi 让长 prefill 不再阻塞 decode。v1 的 `num_computed_tokens` 追赶公式，正是把两者统一成了一条数轴上的追赶。（同一团队后续将这套思想打磨为生产级系统 Sarathi-Serve（OSDI'24，[arXiv:2403.02310](https://arxiv.org/abs/2403.02310)），在开源 vLLM 之上实现了基于 FlashAttention v2 / FlashInfer 的分页 chunked-prefill，感兴趣的读者可顺藤看。）
 
 顺带交代一句：把长 prefill 拆成几拍算，之所以**不损一分精度**，靠的是注意力层一条更底层的性质——因果注意力逐行独立。这条性质与它换来的"拆块零代价、连合并都不需要"，见[第 24 章：FlashAttention 原理](../../ch24-primer-flash-attention/narrative/chapter.md)。
 
@@ -249,7 +249,7 @@ v1 这套「token 为中心、不分相」的调度，把两条来自论文的�
 
 `num_new_tokens == 0` 的处理藏着一个细节：它用 `continue` 而不是 `break`。woosuk 在注释里说清了——这**不严格遵守 FCFS**。如果某个请求因为某种原因（编码预算耗尽、缓存满等）这一拍分不到 token，不是停下整个调度，而是跳过它、继续看后面的请求。一个卡住的请求不该阻塞整批。
 
-接下来 `allocate_slots` 是关键。它向 KV cache 管理器申请放这 `num_new_tokens` 个 token 的 KV 块。**返回非 None = 分配成功；返回 None = 显存满了。**
+接下来 `allocate_slots` 是关键。它向 KV cache 管理器申请放这 `num_new_tokens` 个 token 的 KV 块——传参里的 `num_lookahead_tokens`（「前瞻」名额：投机解码启用时等于每拍草稿 token 数，否则为 0）会让申请量额外多算草稿 token 的 KV 空间。**返回非 None = 分配成功；返回 None = 显存满了。**（调用外层的 `record_function_or_nullcontext` 是性能打点器：profiler 开启时记录这段代码的耗时，关闭时退化为零开销的空操作。）
 
 显存满了怎么办？看那个 `while True` 循环——它在**抢占**。`self.running.pop()` 弹出队列**最后一个**请求（FCFS 下，最后一个 = 最晚到达的，最该让位），调 `_preempt_request` 把它踢回 waiting 队列，然后回到循环顶部**重试** `allocate_slots`。抢一个不够就再抢一个，直到分配成功，或者抢到把自己都抢了（`preempted_req == request`，说明队列里只剩它自己还分不到，彻底没救，`break`）。
 
@@ -273,7 +273,7 @@ v1 这套「token 为中心、不分相」的调度，把两条来自论文的�
         self.waiting.prepend_request(request)
 ```
 
-三个动作：`free` 释放它占的 KV 块（腾出显存）、状态置 `PREEMPTED`、**`num_computed_tokens = 0`**。最后一个最狠——被抢占的请求，之前算过的 KV 全丢了，将来恢复时得**从头 prefill**。这是 vLLM 的「recompute」式抢占（不落盘、靠重算），代价是重算，好处是实现简单、不占额外内存。vLLM 的奠基论文（SOSP'23）还讨论过另一条恢复路径——把被占请求的 KV 块整体换出到 CPU 内存（swap），恢复时再原样搬回来，上下文越长越划算；v1 调度器只保留了 recompute 这一条，把 swap 的复杂性让位给了别的机制（如跨节点 KV 传输 connector）。最后 `prepend_request` 把它放回 waiting 队列**最前面**（它资历老，优先恢复）。
+三个动作：`free` 释放它占的 KV 块（腾出显存）、状态置 `PREEMPTED`、**`num_computed_tokens = 0`**。最后一个最狠——被抢占的请求，之前算过的 KV 全丢了，将来恢复时得**从头 prefill**。这是 vLLM 的「recompute」式抢占（不落盘、靠重算），代价是重算，好处是实现简单、不占额外内存。vLLM 的奠基论文《Efficient Memory Management for Large Language Model Serving with PagedAttention》（[SOSP'23，arXiv:2309.06180](https://arxiv.org/abs/2309.06180)）还讨论过另一条恢复路径——把被占请求的 KV 块整体换出到 CPU 内存（swap），恢复时再原样搬回来，上下文越长越划算；v1 调度器只保留了 recompute 这一条，把 swap 的复杂性让位给了别的机制（如跨节点 KV 传输 connector）。最后 `prepend_request` 把它放回 waiting 队列**最前面**（它资历老，优先恢复）。
 
 分配成功后是四行记账，每一行都重要：
 
@@ -815,7 +815,7 @@ class AsyncScheduler(Scheduler):
             request.spec_token_ids = self._spec_token_placeholders
 ```
 
-它覆写 §13.5 那个乐观推进的 `_update_after_schedule`：先调父类把 `num_computed_tokens` 推进，然后对每个**不在 prefill 中途**（`is_prefill_chunk` 为假，即将吐字）的请求，把 `num_output_placeholders += 1 + cur_num_spec_tokens`。这里的 `if request.is_prefill_chunk: continue` 确实是字面意义上的「if prefill」分支——但它出现在异步调度**记账**要不要给这个请求记「下一拍将产出的输出占位」这一步，而不是出现在决定「这一拍给它分多少 token」的调度公式里；后者（§13.1／§13.3 的 `num_new_tokens` 减法）从头到尾没有按 prefill/decode 分支。
+它覆写 §13.5 那个乐观推进的 `_update_after_schedule`：先调父类把 `num_computed_tokens` 推进，然后对每个**不在 prefill 中途**（`is_prefill_chunk` 为假，即将吐字）的请求，把 `num_output_placeholders += 1 + cur_num_spec_tokens`（`num_spec_tokens` 是配置的每拍草稿 token 数；`cur_num_spec_tokens` 是这一拍实际排给该请求的草稿数，投机解码关闭时恒为 0，此时就只加 1）。这里的 `if request.is_prefill_chunk: continue` 确实是字面意义上的「if prefill」分支——但它出现在异步调度**记账**要不要给这个请求记「下一拍将产出的输出占位」这一步，而不是出现在决定「这一拍给它分多少 token」的调度公式里；后者（§13.1／§13.3 的 `num_new_tokens` 减法）从头到尾没有按 prefill/decode 分支。
 
 这一句是异步调度的全部魔法。意思是：「我知道这一拍的前向**将会**给这个请求产出 1 个真 token（再加 `num_spec_tokens` 个草稿 token），虽然现在还没算出来，但我**先记上**。」于是下一拍调度时，追赶公式里的 `+ request.num_output_placeholders`（§13.3 我们当时跳过的那一项）就生效了——它告诉调度器「这个请求其实还差 1 个 token 要算」，于是 §13.3 那个 async 提前剪枝和追赶公式能为它预留下一拍的 decode 槽位，**不必等前向真的回来**。这就是 §13.5 那个 `AsyncScheduler` 实例驱动连续批处理的方式：靠占位，让 `schedule(N)` 和 `forward(N−1)` 在同一段墙钟时间里重叠，GPU 不再有调度间隙的气泡。
 
@@ -869,7 +869,7 @@ def test_async_placeholder_redeemed_on_output():
     assert a.num_output_tokens == 1
 ```
 
-第一个测试：prefill 一拍读完 4 个 prompt token，请求进入「将吐字」状态，记 1 个占位；下一拍**上一拍的 token 还没回来**，但靠这个占位，调度器照样为它排了 1 个 decode 槽，占位累加到 2。第二个测试：真 token 回流，占位减回 0，账平了。占位的加减始终配平——这是异步调度正确性的基石，也是 [第 3 章](../../ch03-config-and-wiring/narrative/chapter.md) 那个 `async_scheduling` 开关最终落到实处的地方。
+（测试里的 `max_num_seqs=8` 是并发请求数上限的配置名——它就是 §13.4 那个 `max_num_running_reqs` 的幕后字段。）第一个测试：prefill 一拍读完 4 个 prompt token，请求进入「将吐字」状态，记 1 个占位；下一拍**上一拍的 token 还没回来**，但靠这个占位，调度器照样为它排了 1 个 decode 槽，占位累加到 2。第二个测试：真 token 回流，占位减回 0，账平了。占位的加减始终配平——这是异步调度正确性的基石，也是 [第 3 章](../../ch03-config-and-wiring/narrative/chapter.md) 那个 `async_scheduling` 开关最终落到实处的地方。
 
 ---
 

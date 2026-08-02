@@ -12,11 +12,11 @@
 
 这章我们就掀开这个黑盒。问题很具体：
 
-> 用户给的是一段文本、一串 token、一张图、还是一个嵌入向量；要的是采样还是池化；带不带 LoRA——这些五花八门的输入，怎么统一收敛成**一个**干净、可序列化、字段齐全的 `EngineCoreRequest`？
+> 用户给的是一段文本、一串 token、一张图、还是一个嵌入向量；要的是采样还是池化；带不带 LoRA（一种给大模型做微调的技术，§5.2.2 详解）——这些五花八门的输入，怎么统一收敛成**一个**干净、可序列化、字段齐全的 `EngineCoreRequest`？
 
 主角是 `vllm/v1/engine/input_processor.py` 里的 `InputProcessor` 类，核心方法叫 `process_inputs`。它干的活可以概括成一句话：
 
-> **校验 + 归一化 + 组装**——把杂乱的用户输入校验一遍、补全采样参数、把多模态数据排好序，最后塞进一个 msgspec 结构体。
+> **校验 + 归一化 + 组装**——把杂乱的用户输入校验一遍、补全采样参数、把多模态数据排好序，最后塞进一个 msgspec 结构体（一种高性能的 Python 序列化结构，§5.8 细看）。
 
 读完这章，你会知道：一个请求在「进引擎」之前到底被检查了多少遍、`max_tokens` 没填时引擎替你填了什么、`n=4` 的并行采样是在哪一层裂成 4 个子请求的、以及为什么每个请求的 id 后面都挂着一串随机字符。下一段 [EngineCore 跨进程 IPC](../../ch07-engine-core/narrative/chapter.md) 会接手本章产出的 `EngineCoreRequest`，把它真正送过进程边界。
 
@@ -56,7 +56,7 @@ else:
 看清这个 `if`：
 
 - **主路径**——`prompt` 是一个带 `"type"` 键的 dict，那就是 Renderer 已经渲染好的 `EngineInput`，`InputProcessor` **原封不动透传**，一个 token 都不切。
-- **兜底路径**——你直接塞了个裸 prompt（文本/PIL 图片之类），这条路打着 deprecation 警告，临时调 `InputPreprocessor.preprocess()` 现场 tokenize。这条路 v0.18 就要删。
+- **兜底路径**——你直接塞了个裸 prompt（文本/PIL 图片之类；PIL 是 Python 图像库 Pillow，图片以它的 `Image` 对象传入），这条路打着 deprecation 警告，临时调 `InputPreprocessor.preprocess()` 现场 tokenize。这条路 v0.18 就要删。
 
 所以这章的定位要摆正：**`InputProcessor` 主要是个校验器和组装器，不是 tokenizer。** 它真正的价值在「把好关」和「补齐料」，而不是切词。下面我们顺着 `process_inputs` 的控制流，一道工序一道工序地走。整条流水线长这样：
 
@@ -87,7 +87,7 @@ def process_inputs(self, request_id, prompt, params, supported_tasks, ...):
         )
 ```
 
-第三道（`data_parallel_rank` 范围）很直白：你指定让请求去第几个 DP rank，那这个编号必须落在 `[0, num_ranks)` 里。前两道值得拆开看。
+第三道（`data_parallel_rank` 范围）很直白：你指定让请求去第几个 DP rank（DP，数据并行——多份模型副本各处理一批请求，rank 是副本编号），那这个编号必须落在 `[0, num_ranks)` 里。前两道值得拆开看。
 
 ### 5.2.1 `_validate_params`：先问「这模型干得了这活吗」
 
@@ -159,6 +159,22 @@ def _validate_lora(self, lora_request):
 [§5.1](#51-一句话钩子tokenize-已经不在这里了) 已经把这个分流讲透了——主路径透传 `EngineInput`，兜底路径走 `InputPreprocessor.preprocess()`。这里补一句兜底路径里发生了什么（图里「第 4–5 站」的徽标就挂在 `InputPreprocessor` 这格上）。
 
 `InputPreprocessor.preprocess()` 是老路径的预处理总入口：它先按是否 encoder-decoder 架构分流，decoder-only 的文本会走到 `_process_text()`，在那里调 `_tokenize_prompt()` 真正切词，再包成统一的 `TokensInput`。多模态、纯嵌入也各有委托。它的产物和主路径透传的 `EngineInput` 是**同一种 TypedDict 家族**（TypedDict：Python 经 [PEP 589](https://peps.python.org/pep-0589/)（2019）引入的标准记法——给固定字段的 dict 加类型标注，用法和普通 dict 完全一样，但类型检查器知道每个 key 该是什么类型。`vllm/inputs/engine.py` 里以 `type` 字面量判别的三种变体——`TokensInput`、`EmbedsInput`、`MultiModalInput`——统一别名为 `DecoderOnlyEngineInput`，就是这种模式）——这正是设计的巧妙处：不管走哪条路，出来的 `processed_inputs` 形状一致，后面的代码只靠 `type` 字段区分内容，不用区分来源。
+
+「type 字面量判别」具体长什么样，看个小例子（说明性/外部示例，简化自 `vllm/inputs/engine.py` 的真实定义、略去可选字段）：
+
+```python
+from typing import Literal, TypedDict
+
+class TokensInput(TypedDict):
+    type: Literal["token"]        # 字面量类型：只允许这一个值
+    prompt_token_ids: list[int]
+
+class EmbedsInput(TypedDict):
+    type: Literal["embeds"]
+    prompt_embeds: torch.Tensor
+```
+
+`Literal["token"]` 是 Python 3.8+ 的字面量类型（literal type）记法——字段只允许取引号里那一个值。类型检查器看到某支 dict 的 `type` 是 `"token"`，就知道它是 `TokensInput`、该有 `prompt_token_ids`；看到 `"embeds"`，就知道该读 `prompt_embeds`。这些实例运行时仍是货真价实的普通 dict、零校验开销——把关发生在开发期，交给 mypy/pyright 这类静态检查器在运行前完成。后面源码里反复出现的 `decoder_inputs["type"] == "embeds"`，判的就是这个标签。
 
 两条路汇合后，立刻是一道平台级校验和一次结构拆分：
 
@@ -254,7 +270,7 @@ def _validate_prompt_len(self, prompt_len, prompt_type):
 if max_input_id > max(tokenizer.max_token_id, model_vocab_size - 1):
 ```
 
-为什么是 `max(tokenizer.max_token_id, model_vocab_size - 1)` 取**较大者**，而不是简单地拿模型词表大小判？因为像 Qwen3 这类模型，**语言模型侧的词表**和 **tokenizer 侧的 token 上限**对不齐：模型可能多出一批保留 token，tokenizer 可能多出一批多模态占位 token。只看其中一侧都会误判——把合法 token 当成 OOV 拒掉。取两侧的较大者，是个朴素但必要的兼容性补丁。
+为什么是 `max(tokenizer.max_token_id, model_vocab_size - 1)` 取**较大者**，而不是简单地拿模型词表大小判？因为像 Qwen3 这类模型，**语言模型侧的词表**和 **tokenizer 侧的 token 上限**对不齐：模型可能多出一批保留 token，tokenizer 可能多出一批多模态占位 token。只看其中一侧都会误判——把合法 token 当成 OOV（out-of-vocabulary，词表外）拒掉。取两侧的较大者，是个朴素但必要的兼容性补丁。
 
 这三类校验全过，prompt 才被认定「干净」。下面开始取料、补料。
 
@@ -311,7 +327,7 @@ else:
 
 ### 5.6.1 为什么先 `clone()`
 
-第一行就 `params.clone()`。这不是洁癖。`process_inputs` 接下来要**就地改**这个参数对象——补 `max_tokens`、注入 eos/stop、补 bad_words。如果直接改调用方传进来的那个对象，就会污染它：调用方拿同一个 `SamplingParams` 复用给下一个请求时，会莫名其妙带上上一个请求被补全的字段。克隆一份再改，调用方的原对象永远干净。
+第一行就 `params.clone()`。这不是洁癖。`process_inputs` 接下来要**就地改**这个参数对象——补 `max_tokens`、注入 eos（end-of-sequence，序列结束标记）/stop、补 bad_words。如果直接改调用方传进来的那个对象，就会污染它：调用方拿同一个 `SamplingParams` 复用给下一个请求时，会莫名其妙带上上一个请求被补全的字段。克隆一份再改，调用方的原对象永远干净。
 
 [后面 n>1 的 fan-out](#510-fan-outn1-的并行采样在哪一层裂开) 还会基于这个克隆再派生子参数，clone 是整条链路不互相污染的地基。
 
@@ -425,7 +441,7 @@ def _get_mm_identifier(self, mm_hash, lora_request):
     return f"{lora_request.lora_name}:{mm_hash}"
 ```
 
-`mm_hash` 是多模态数据的内容哈希，用作缓存键。一般情况下，同一张图无论哪个请求来都该命中同一份缓存——直接用 `mm_hash` 即可。但当 `enable_tower_connector_lora` 打开时，**同一张图在不同 LoRA 下算出的嵌入是不一样的**。这时如果还用纯 `mm_hash` 做键，就会错误命中——拿 LoRA A 算出的嵌入去喂 LoRA B 的请求。修法很直接：在键前面拼上 LoRA 名字，`{lora_name}:{mm_hash}`，把 LoRA 维度纳入缓存键。
+`mm_hash` 是多模态数据的内容哈希，用作缓存键。一般情况下，同一张图无论哪个请求来都该命中同一份缓存——直接用 `mm_hash` 即可。但当 `enable_tower_connector_lora`（tower 指多模态模型里的视觉编码器，connector 是把它与语言模型接起来的桥接层——这个开关让 LoRA 也可以只作用于这一小段，官方标注为实验特性、目前只支持 Qwen-VL 等部分多模态模型）打开时，**同一张图在不同 LoRA 下算出的嵌入是不一样的**。这时如果还用纯 `mm_hash` 做键，就会错误命中——拿 LoRA A 算出的嵌入去喂 LoRA B 的请求。修法很直接：在键前面拼上 LoRA 名字，`{lora_name}:{mm_hash}`，把 LoRA 维度纳入缓存键。
 
 开头那句 `mm_hashes must contain only strings` 的校验也是同理——缓存键必须是字符串，混进非字符串说明上游的 `MultiModalProcessor` 实现有 bug，得早点拦。
 
@@ -492,7 +508,7 @@ class EngineCoreRequest(
         return self.pooling_params
 ```
 
-那三个 `msgspec.Struct` 的参数全是为序列化体积和速度服务的：`array_like` 让结构体序列化成数组（不带字段名）、`omit_defaults` 跳过默认值字段、`gc=False` 省掉 GC 开销。原因很简单——这个结构体马上要被 [Stage 2 序列化送过进程边界](../../ch07-engine-core/narrative/chapter.md) 进 EngineCore，体积越小、序列化越快越好。（画到架构模型图上：组装 `EngineCoreRequest` 是第 9 站，下一节的 id 唯一化（第 10 站）也还在橙色面板里；跨过图里那道 IPC 边界，是下一段的事。）
+那三个 `msgspec.Struct` 的参数全是为序列化体积和速度服务的：`array_like` 让结构体序列化成数组（不带字段名）、`omit_defaults` 跳过默认值字段、`gc=False` 省掉 GC 开销。原因很简单——这个结构体马上要被 [Stage 2 序列化送过进程边界](../../ch07-engine-core/narrative/chapter.md) 进 EngineCore，体积越小、序列化越快越好。`array_like` 和 `omit_defaults` 叠加是什么效果，看个具体例子（说明性/外部示例，假想一个只有 `request_id` 和 `priority` 两个字段的结构体）：普通 dict 序列化出 `{"request_id": "abc", "priority": 0}`——字段名一个不落、连等于默认值的 `priority` 也照写；开了两个开关的 `Struct` 只产出 `["abc"]`——字段名退化成数组下标（按声明顺序一一对应），`priority=0` 这个默认值字段直接被省略。`gc=False` 也有代价：这类对象若彼此形成循环引用，Python 的垃圾回收器发现不了、会泄漏——`EngineCoreRequest` 用完即弃、生命周期短，不构成这个风险。（画到架构模型图上：组装 `EngineCoreRequest` 是第 9 站，下一节的 id 唯一化（第 10 站）也还在橙色面板里；跨过图里那道 IPC 边界，是下一段的事。）
 
 那个 `params` 属性是个贴心的统一访问器：不管请求是采样还是池化，调用方都用 `request.params` 拿参数，不必自己判断哪个非空。`external_req_id` 字段先记在这——下一节它就是主角。
 
@@ -616,7 +632,7 @@ def get_child_info(self, index):
 
 **子参数**的派生有个漂亮的分叉，全看有没有设 `seed`：
 
-- **没设 seed**：四个子请求采样本就相互独立（各自的随机性来自全局 RNG），所以可以**共享同一份** `n=1` 的克隆——第一次造好就缓存进 `cached_child_sampling_params`，后面三次直接复用。省内存。
+- **没设 seed**：四个子请求采样本就相互独立（各自的随机性来自全局 RNG（随机数发生器）），所以可以**共享同一份** `n=1` 的克隆——第一次造好就缓存进 `cached_child_sampling_params`，后面三次直接复用。省内存。
 - **设了 seed**：要保证四个结果**既各不相同、又可复现**。于是每个子请求拿 `seed + index`——子 0 用 `seed`、子 1 用 `seed+1`……确定且互不相同。
 
 注意这里 `n` 被改成 1——每个子请求只采 1 个结果，4 个子请求合起来才是用户要的 `n=4`。

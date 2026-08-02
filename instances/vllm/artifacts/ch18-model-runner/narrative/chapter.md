@@ -94,7 +94,7 @@ self.token_ids_cpu_tensor = torch.zeros(
 self.token_ids_cpu = self.token_ids_cpu_tensor.numpy()
 ```
 
-（`pin_memory=True` 让这块 CPU 缓冲驻留在页锁定内存（pinned memory）里。普通内存页可能被操作系统换出到磁盘，GPU 的 DMA（直接内存访问）不能直接对着它操作——CUDA 驱动会先悄悄把数据拷进一块临时 pinned 缓冲再搬去显卡，多了一次隐藏且同步的拷贝。显式分配 pinned memory 跳过这一步，CUDA 才能发起真正的异步 DMA——后面 `commit_block_table` 能把块表拷贝和 CPU 计算重叠，前提就在这里。）
+（`pin_memory=True` 让这块 CPU 缓冲驻留在页锁定内存（pinned memory）里。普通内存页可能被操作系统换出到磁盘，GPU 的 DMA（直接内存访问）不能直接对着它操作——CUDA 驱动会先悄悄把数据拷进一块临时 pinned 缓冲再搬去显卡，多了一次隐藏且同步的拷贝。显式分配 pinned memory 跳过这一步，CUDA 才能发起真正的异步 DMA——后面 `commit_block_table` 能把块表拷贝和 CPU 计算重叠，前提就在这里。代价是页锁定内存不能被换出、会一直占着物理内存，所以实践里只对确实要反复异步搬运的缓冲开；想深挖的读者可看 NVIDIA 官方博客 [How to Optimize Data Transfers in CUDA C/C++](https://developer.nvidia.com/blog/how-optimize-data-transfers-cuda-cc/)。）
 
 核心就是这块 `token_ids_cpu`：一个 `max_num_reqs × max_model_len` 的二维 int32 缓冲，**一行存一个请求的全长 token 序列**。除它之外，`InputBatch` 还并排维护一组同样按行索引的 CPU 镜像——`num_computed_tokens_cpu`（每请求已算多少 token）、`num_prompt_tokens`、`num_tokens_no_spec`、块表、整套采样参数列、以及 `req_id_to_index`（请求 ID → 行号映射）。
 
@@ -579,7 +579,7 @@ def commit_block_table(self, num_reqs: int) -> None:
 
 `append_row` / `add_row` / `move_row` 全改 CPU 镜像 `block_table.np`——`append_row` 追加块号，`add_row` 重置后写（新请求）,`move_row` 是 `condense` 搬行时同步搬块表。它们都廉价，因为只动 numpy。
 
-> **v0.21.0 更新**：这张表的列数由每组 `max_num_blocks` 定。v0.21.0 起，构造 `MultiGroupBlockTable` 时会把每个 KV cache group 的 `max_num_blocks` 向上对齐到 `128 / block_size` 的整数倍（`block_size ≤ 128` 时 `cdiv(n, 128//bs) * (128//bs)`，否则原样，#39324）——因为 TRTLLM MLA（TensorRT-LLM——一款 NVIDIA 开源的 LLM 推理加速库——为 MLA 提供的一种 attention 后端，对 block table 列数有特殊对齐要求，[第 25 章](../../ch25-attention/narrative/chapter.md)还会遇到）等部分 attention 后端对 block table 的列数有 128 元素对齐的边角要求。对常规 `block_size` 这只会略微抬高列数，双镜像的语义与上面这套增量写法都不受影响。
+> **v0.21.0 更新**：这张表的列数由每组 `max_num_blocks` 定。v0.21.0 起，构造 `MultiGroupBlockTable`（按 KV cache group 各持一张块表的复合容器）时会把每个 KV cache group 的 `max_num_blocks` 向上对齐到 `128 / block_size` 的整数倍（`block_size ≤ 128` 时 `cdiv(n, 128//bs) * (128//bs)`，否则原样，#39324）——因为 TRTLLM MLA（TensorRT-LLM——NVIDIA 官方的 LLM 推理加速库，vLLM 的同类竞品之一——为 MLA 提供的一种 attention 后端）这类外部后端要求 block table 列数按 128 元素对齐，vLLM 在源码里为兼容它们做了这个适配（注释原话："as required by some attention backends such as TRTLLM"，[第 25 章](../../ch25-attention/narrative/chapter.md)还会遇到）。MLA 是 Multi-head Latent Attention（多头潜在注意力）——DeepSeek 系模型用的注意力变体，[第 28 章](../../ch28-model-architecture/narrative/chapter.md)有完整解读。对常规 `block_size` 这只会略微抬高列数，双镜像的语义与上面这套增量写法都不受影响。
 
 但前向要的是 GPU 上的块表。于是 `commit_block_table` 把整个 CPU 镜像**批量**拷到 GPU。这就是上一节 `_prepare_inputs` 开头那个 `commit_block_table`——所有块号在 `_update_states` 里以最廉价的 CPU 增量写好，到 `_prepare_inputs` 一次性刷到 GPU，还故意放在最前面与后续 CPU 工作重叠。**CPU 改、批量 commit、GPU 用**，职责清清楚楚。
 
@@ -604,7 +604,27 @@ def compute_slot_mapping(self, num_reqs, query_start_loc, positions) -> None:
 
 注意 grid 是 `(num_reqs + 1,)`——`num_reqs` 个 program 各管一个请求，**外加一个**专门收尾。kernel 本体：
 
-（在读这段 kernel 之前先停一下：这里顶着 `tl.program_id`/`tl.load`/`tl.store` 的代码不是 vLLM 自造的 DSL，而是 **Triton** ——OpenAI 发布的一种 Python 嵌入式 GPU 编程语言。Triton 把编程模型抬高一层：开发者只写「每个并行实例处理哪块数据」的 tile 级函数，编译器自动把线程分组、内存合并这些手写 CUDA 才操心的细节包办掉，换来接近手写 CUDA 的性能。这里 `tl.program_id(0)` 认领「这次是第几个并行实例」，`tl.load`/`tl.store` 配 `mask=` 参数读写数据并自动挡住越界位置。后面章节还会更深入地走读一个完整的 Triton kernel，本章只需知道这些 API 的语义就能跟上主线。）
+在读 kernel 之前先停一下，认识一下 Triton 这门语言。这段代码不是 vLLM 自造的 DSL，而是 **Triton**（OpenAI 开源的一种 Python 嵌入式 GPU 编程语言，源自 2019 年的一篇学术论文，2021 年由 OpenAI 重实现后以 MIT 协议开源）。它存在的理由，得从写 GPU 代码原本只有的两条路说起：要么调现成算子——可「按位置算 slot」这种活没有现成库；要么手写 CUDA C++——那得自己管理成千上万个线程怎么分组、数据怎么从显存搬进片上内存、线程间怎么同步，门槛极高。Triton 站在中间：你只写「每个并行实例处理哪块数据」这种 tile（数据块）级逻辑，线程分组、内存合并这些细节全交给编译器，换来接近手写 CUDA 的性能。
+
+官方入门教程的向量加法 kernel 压缩到只剩主线（说明性/外部示例，非本仓代码）：
+
+```python
+@triton.jit
+def add_kernel(x_ptr, y_ptr, output_ptr, n_elements,
+               BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(axis=0)                       # 我是第几个并行实例
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)  # 我这块负责哪些下标
+    mask = offsets < n_elements                       # 挡住越界
+    x = tl.load(x_ptr + offsets, mask=mask)
+    y = tl.load(y_ptr + offsets, mask=mask)
+    tl.store(output_ptr + offsets, x + y, mask=mask)
+
+grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )
+add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)
+```
+
+逐行对照本章的 kernel，每个 API 都能对上号：`@triton.jit` 装饰器把下面的函数编译成 GPU kernel（kernel 指一次在 GPU 上并行执行的函数体）；`grid` 指定开几个并行实例，Triton 管每个实例叫一个 program，本章的 `(num_reqs + 1,)` 就是每个请求一个 program、外加一个收尾；`tl.program_id(0)` 让实例认领「我是第几个」，`tl.num_programs(0)` 问「一共开了几个」——kernel 里正是靠这二者判出「最后一个」专门收尾的 program；`BLOCK_SIZE: tl.constexpr` 声明这个参数编译期已知、编译器据此做向量化优化，启动时以关键字传入 `BLOCK_SIZE=1024`；`tl.load`/`tl.store` 读写显存指针，`mask=` 一次挡住越界位置——本章 kernel 里 `mask = offsets < end_idx`、尾填时 `mask = offsets < max_num_tokens`，都是同一个用途。[第 32 章](../../ch32-structured-output/narrative/chapter.md)会完整走读另一个 Triton kernel，编译细节到那里再展开；本章知道这些就够跟上主线。
 
 ```python
 # vllm/v1/worker/block_table.py:L341
@@ -649,7 +669,7 @@ for i in range(start_idx, end_idx, BLOCK_SIZE):
 
 > *图注：上半 `block_table[req]` 把逻辑块号映射到物理块号，`commit_block_table` 把这张表从 CPU 镜像拷到 GPU 镜像。中间一例 `pos=33` 走完四步算出 `slot_id=145`。下半一行 token 各自映射到物理槽，尾部由最后一个 program 填 `PAD_SLOT_ID`——给 CUDA graph 留固定形状。*
 
-最后那个「外加的 program」（`req_idx == num_programs - 1`）只干一件事：把 `[num_tokens, max_num_batched_tokens)` 这段尾部全填 `PAD_SLOT_ID`。为什么？CUDA graph 要求每拍的张量形状固定才能捕获重放。真实 token 数每拍不同，于是把尾部 padding 成定长、填上无害的 PAD 槽，让 batch 形状恒定可捕获。slot 映射对每个 token 独立、天然并行，放 GPU 算正合适——这也是它用 Triton kernel 而非 CPU 循环的原因。
+最后那个「外加的 program」（`req_idx == num_programs - 1`）只干一件事：把 `[num_tokens, max_num_batched_tokens)` 这段尾部全填 `PAD_SLOT_ID`。为什么？因为 `slot_mapping` 是 CUDA Graph 的入口张量。CUDA Graph（工程里常写作 CUDA graph）是 NVIDIA 提供的机制：把一串 GPU 内核调用连同它们的依赖关系一次性「录制」成一个图对象，之后一次 API 调用整段「回放」，省掉逐个内核单独启动的 CPU 调度开销——decode 阶段内核又多又小，这笔开销相当可观。但图是按录制时的内存地址和张量形状生成的，回放时形状若变了，要么报错、要么得重新捕获，录图的收益全赔回去。真实 token 数每拍不同，于是把尾部 padding 成定长、填上无害的 PAD 槽，让 batch 形状恒定可捕获（想深挖的读者可看 [CUDA 官方编程指南的 CUDA Graphs 一节](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html)）。slot 映射对每个 token 独立、天然并行，放 GPU 算正合适——这也是它用 Triton kernel 而非 CPU 循环的原因。
 
 ---
 
