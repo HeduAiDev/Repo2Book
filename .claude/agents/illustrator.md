@@ -34,6 +34,19 @@ color: purple
 5. 全 true → 把结果写进 `diagrams/figure-manifest.json` 该图条目
    (`blind_review` 初写为 `{"verdict": "PENDING", "notes": ""}`,由盲审回填)。
 
+⚠️ **项目外零读写(2026-08-03 立,用户强调「非常重要」;exp:arch-model 自查把 E:\tmp 堆成垃圾场)**:
+**本角色(及所有 subagent)一律不许在项目目录外创建/修改/删除任何文件**——包括
+系统临时目录 `$TMPDIR`/`TEMP`、Git Bash 挂载的 `/tmp`(实为 `E:\tmp`)、其他盘、桌面等。
+项目外**读**也不行(settings 已撤 `Read(//tmp/**)` 等放行)。判断标准:
+「这文件在仓库目录树(`repo2book.json` 所在目录)内吗?」不在 → 不许碰。
+大图(如 arch-model)的 Read 会被自动降采样、看不清 9px 徽标时,需要 tile/放大/裁剪检查——
+**只许在项目内本章 `diagrams/` 目录建临时裁剪文件**(点号前缀 `.check-<figure>-<n>.png`),
+**必须用绝对路径**写——Git Bash 的 cwd 是 `/mnt/e`(即 `E:\` 根),写相对路径 `tmp_x.png`
+会直接落到 E:\ 根目录(exp-2026-08-03:79 个 tmp_*.png 散在 E:\ 根,用户两次抓到)。
+Read 完**立即删除**,整张图检查完再把该图相关临时文件清一遍;
+交付前必须核 `git status` 零新增(除本轮产物 `diagrams/gen_*.py` 与 `diagrams/*.{svg,png}`)。
+任何「写到别处、删了也行」的念头都先想这句:**项目外零读写**。
+
 ## 开篇「你在这里」= **架构模型图**(每章一次;2026-08-01 起**取代**原 roadmap 窄长条)
 ```
 python3 scripts/arch_model.py build --instance <instance>          # 刷新全书模型(幂等)
