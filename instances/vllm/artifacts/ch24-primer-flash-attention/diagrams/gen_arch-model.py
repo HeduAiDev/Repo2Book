@@ -21,8 +21,11 @@ png = here / 'arch-model.png'
 
 subprocess.run([sys.executable, str(repo / 'scripts' / 'arch_model_figure.py'),
                 '--chapter', CHAPTER, '--instance', INSTANCE, '--out', str(svg)], check=True)
-subprocess.run([sys.executable, '-c', f'''
-import cairosvg
-cairosvg.svg2png(url=r"{svg}", write_to=r"{png}")
-'''], check=True)
-print(f'[OK] {svg.name} / {png.name}')
+# Windows 环境 rsvg-convert 仅为 cairosvg shim 且不认 -z 参数 → 直接走 cairosvg（scale=2 等价 -z 2）。
+# 有真 librsvg 的机器会优先用 rsvg-convert（Pango 逐字 CJK 回退）。
+try:
+    subprocess.run(['rsvg-convert', '-z', '2', str(svg), '-o', str(png)], check=True)
+except (FileNotFoundError, subprocess.CalledProcessError):
+    import cairosvg
+    cairosvg.svg2png(url=str(svg), write_to=str(png), scale=2)
+print(f'✓ {svg.name} / {png.name}')

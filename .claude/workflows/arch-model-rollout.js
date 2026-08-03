@@ -11,29 +11,13 @@ export const meta = {
 // ⚠️ args 注入不可靠 → CFG 为准（换批改 CFG.chapters）。
 const CFG = {
   instance: 'vllm',
-  // 重跑:此前 Prose 站因 fable 不可用继承主模型跑过的 21 章(用户要求用正确模型重跑)
+  // 重跑收尾:上轮进程中断未完成的 5 章(盲审 PENDING)——Render 已就绪,主要走 Prose+Blind
   chapters: [
     'ch11-engine-core',
-    'ch16-kv-cache',
-    'ch17-worker-and-executor',
-    'ch18-model-runner',
-    'ch19-model-runner',
-    'ch20-distributed-parallelism',
     'ch21-async-engine',
     'ch23-custom-ops-and-compilation',
     'ch24-primer-flash-attention',
-    'ch25-attention',
-    'ch26-primer-quantization',
-    'ch27-primer-lightning-indexer',
     'ch29-model-architecture',
-    'ch30-sampling',
-    'ch33-primer-eagle',
-    'ch34-spec-decode',
-    'ch35-pd-disaggregation',
-    'ch36-pd-disaggregation',
-    'ch37-entrypoints',
-    'ch38-entrypoints',
-    'ch39-engine-core',
   ],
 }
 const A = (typeof args !== 'undefined' && args && args.chapters && args.chapters.length) ? args : CFG
@@ -86,6 +70,8 @@ const results = await pipeline(
       '**纪律**：图上的层/组件/类名/站号/关系全部由 arch_model.py 从源码 AST 与档案抽取——**你不许手改图上的任何名字或站号**。'
       + '几何问题（文字越界/相撞/截断/中文豆腐/箭头悬空）是**渲染器**的问题：改 ' + REPO + '/scripts/arch_model_figure.py 并在 note 里说明改了什么；'
       + '若发现的是**数据**问题（关系抽错/站号归错），返回 BLOCKED 说清，别在图上打补丁。\n' +
+      '**项目外零读写**：自查用的 tile/裁剪/放大文件只许建在本章 diagrams/ 内、点号前缀 `.check-*.png`、绝对路径；'
+      + '**返回前（含 BLOCKED/失败路径）必须删光本章所有 `.check-*.png`**——崩溃遗留由 Lead 核 git status 抓。\n' +
       '参考已定样的 ch31：' + REPO + '/instances/vllm/artifacts/ch31-structured-output/diagrams/（三种形态：契约容器/盒套盒组合/诚实平铺）。\n' +
       '返回：status / shape（contract|containment|flat）/ selfcheck_pass / note。',
       { schema: S_RENDER, label: ch + ':render', phase: 'Render', agentType: 'illustrator' }

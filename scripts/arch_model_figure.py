@@ -414,7 +414,11 @@ def build(model, cid):
         full_w = nw - 16
         kcols = 1 if all(tw(short(kd['name']), 8.6) <= full_w for kd in kids) else 2
         kw = (nw - 16 - (kcols - 1) * 8) / kcols
-        colh = [ny + 24, ny + 24]
+        # 子盒顶边必须低于容器徽标字形下缘：徽标 baseline 在 ny+30（fs 8.6，
+        # 字形底缘约 ny+31.7），旧起算 ny+24 被字形上升段切过顶边——盲审
+        # 2026-08-03 ch29 FAIL（ForCausalLM/Model/DecoderLayer 三处徽标像素级
+        # 覆盖子盒边框）。改 ny+34（留 2px 余量），node_h 同步 40→50。
+        colh = [ny + 34, ny + 34]
         for i, kd in enumerate(kids):
             col = i % kcols if kcols > 1 else 0
             kx = nx + 8 + col * (kw + 8)
@@ -441,7 +445,7 @@ def build(model, cid):
         khs = [node_h(kd, kw_guess) for kd in kids]
         rows = (len(kids) + kcols - 1) // kcols if kcols > 1 else len(kids)
         child_h = sum(khs[::kcols]) + rows * 5
-        return 40 + child_h
+        return 50 + child_h
     names_meta = {c['name']: c for c in cls}
 
     def panel_h(pw):
@@ -523,7 +527,9 @@ def build(model, cid):
     for row in rows:
         members = [s for s in row['subsystems'] if s in subs]
         is_core = row['id'] == 'core'
-        rh = CH_ + 22
+        # 普通带高度须 = 子盒顶偏移(26) + 子盒高(CH_) + 底留白(8)，否则子盒底边
+        # 戳出带下边界 4px（ch01 首图即现形，全书 39 章同病，2026-08-03 用户抓到）。
+        rh = 26 + CH_ + 8
         if is_core:
             gh = []
             for g in cgroups:

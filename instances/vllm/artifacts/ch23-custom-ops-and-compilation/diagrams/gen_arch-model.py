@@ -7,7 +7,6 @@ book/cartography/arch-model.json(← outline-final.json 的章-子系统归属 +
 
 改图请改 scripts/arch_model_figure.py;改数据请改 scripts/arch_model.py 后重新 build。
 """
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -22,16 +21,5 @@ png = here / 'arch-model.png'
 
 subprocess.run([sys.executable, str(repo / 'scripts' / 'arch_model_figure.py'),
                 '--chapter', CHAPTER, '--instance', INSTANCE, '--out', str(svg)], check=True)
-
-rsvg = shutil.which('rsvg-convert')
-if rsvg:
-    subprocess.run([rsvg, '-z', '2', str(svg), '-o', str(png)], check=True)
-else:
-    # Fallback to cairosvg (same Cairo backend as librsvg)
-    cairosvg = shutil.which('cairosvg')
-    if cairosvg:
-        subprocess.run([cairosvg, '-s', '2', '-o', str(png), str(svg)], check=True)
-    else:
-        raise RuntimeError('Neither rsvg-convert nor cairosvg found')
-
+subprocess.run(['rsvg-convert', '-z', '2', str(svg), '-o', str(png)], check=True)
 print(f'✓ {svg.name} / {png.name}')
