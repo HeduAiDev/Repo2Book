@@ -2,10 +2,10 @@
 
 ## 你在这里
 
-![你在这里：全书架构模型读到第 19 章——EngineCore「执行与并行」组内展开 ModelRunner 执行：GPUModelRunner 持有 CudagraphDispatcher、ExecuteModelState、InputBatch，InputBatch 内嵌 MultiGroupBlockTable 等](../diagrams/arch-model.png)
+![你在这里：全书架构模型已读 10 个组件，本章在 EngineCore 的「执行与并行」组里展开新的一块——ModelRunner 执行：GPUModelRunner 持有 CudagraphDispatcher、ExecuteModelState、InputBatch，InputBatch 内嵌 MultiGroupBlockTable 等](../diagrams/arch-model.png)
 
 > *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。自上而下依次是入口、输入处理、IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理；当年 `EngineCore` 框里只画了调度器与分页 KV 缓存，如今已按「调度与显存／执行与并行／模型与算子／解码策略」四组装满一路读过来的组件。蓝框是前面章节已读的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
-> *本章新长的这块在「执行与并行」组里就地展开，摊开的不是一列类名，而是源码里真实的嵌套组合关系。最外层是 `GPUModelRunner`（橙色主盒，容纳本章 17 站中的 15 站），它持有三个子部件——`CudagraphDispatcher`（橙，站点 16，CUDA graph 分派器）、`ExecuteModelState`（橙，站点 1 与 7，两阶段间的单槽载荷）、以及 `InputBatch`（橙，站点 14–15，持久批次的张量容器）。`InputBatch` 内部再嵌了一个**蓝色**的 `MultiGroupBlockTable 等`（站点 17）——它是[第 18 章](../../ch18-model-runner/narrative/chapter.md)讲过的块表，本章直接复用。站点 2–6 与 8–13 全散在 `GPUModelRunner` 主盒的循环体上，本章会逐段拆开讲。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *本章新长的这块在「执行与并行」组里就地展开，摊开的不是一列类名，而是源码里真实的嵌套组合关系。最外层是 `GPUModelRunner`（橙色主盒），它持有三个子部件——`CudagraphDispatcher`（橙，站点 16，CUDA graph 分派器）、`ExecuteModelState`（橙，站点 1 与 7，两阶段间的单槽载荷）、以及 `InputBatch`（橙，站点 14–15，持久批次的张量容器）。`InputBatch` 内部再嵌了一个**蓝色**的 `MultiGroupBlockTable 等`（站点 17）——它是[第 18 章](../../ch18-model-runner/narrative/chapter.md)讲过的块表，本章直接复用。站点 2–6 与 8–13 两组徽标散在 `GPUModelRunner` 主盒的循环体上，与三个子部件各自的站点（16／1 与 7／14–15）及内嵌 `MultiGroupBlockTable 等` 的 17 合起来，正是图题自述的「本章 17 站，其中 17 站落在下列组件上」——本章会逐段拆开讲。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
 > *这张图最值钱的一条信息是**本章的新结构接在哪里**——认出了它，全局地图就能立住。[第 18 章](../../ch18-model-runner/narrative/chapter.md)首次打开了 `GPUModelRunner` 这个类，讲清了它持有的 `InputBatch`、`MultiGroupBlockTable`、`BlockTable` 等持久结构；本章在这些已有骨架上长出两块新肉——`CudagraphDispatcher`（决定前向走哪条 CUDA graph）和 `ExecuteModelState`（两阶段间的桥），三者拼出了「一拍推理切两半」的全部物理画面。再往外看，`execute_model()` 是由 [第 11 章](../../ch11-engine-core/narrative/chapter.md)的 EngineCore 逐拍循环驱动的，`_prepare_inputs()` 吃的 `SchedulerOutput` 来自 [第 13 章](../../ch13-scheduler/narrative/chapter.md)的调度器——顺着 EngineCore 大框里的箭头就能连上。上一章把调度工单翻译成 GPU 张量、持久批次原地待命；本章让模型跑起来：发起前向、采样、token 写回批次。下一章起深入 attention 后端，接住这里产出的 `slot_mapping`。*
 
 ![本章地图：execute_model()/sample_tokens() 两阶段剖面](../diagrams/chapter-map.png)
@@ -244,7 +244,7 @@ T_\mathrm{fwd} \approx 8\,\mathrm{ms}, \qquad T_\mathrm{samp} + T_\mathrm{sched}
             )
 ```
 
-它产出两样东西：`cudagraph_mode`（FULL / PIECEWISE / NONE 之一）和 `batch_desc`（描述这个批次形状的 key）。怎么选的，留到 [§19.6](#196-cuda-graph-分派fullpiecewisenone-的分级取舍)。（另外还搭出 `should_ubatch`、`num_tokens_across_dp` 两个值，服务于数据并行场景下的微批切分与跨 DP rank 的 token 数对齐，本章不展开。）
+它产出两样东西：`cudagraph_mode`（FULL / PIECEWISE / NONE 之一）和 `batch_desc`（描述这个批次形状的 key）。怎么选的，留到 [§19.6](#196-cuda-graph-分派fullpiecewisenone-的分级取舍)。（另外还搭出 `should_ubatch`、`num_tokens_across_dp` 两个值，服务于数据并行场景下的微批切分与跨 DP rank 的 token 数对齐，本章不展开——它们属于「执行与并行」组里虚线框「分布式并行」的故事，[第 20 章](../../ch20-distributed-parallelism/narrative/chapter.md)才讲。）
 
 第四步，发起前向。这是整章最关键的一行的所在地：
 
@@ -312,7 +312,7 @@ T_\mathrm{fwd} \approx 8\,\mathrm{ms}, \qquad T_\mathrm{samp} + T_\mathrm{sched}
         )
 ```
 
-`apply_grammar_bitmask()` 是结构化输出的活——如果这一拍带了语法约束，先在 logits 上盖掩码，把不合法的 token 压成负无穷。然后 `_sample()` 把 logits 交给采样器，吐出 `sampler_output.sampled_token_ids`。`_update_states_after_model_execute()` 是给 Mamba/投机解码这类 hybrid 模型记账用的，纯 Transformer 路径它什么也不做，但调用点保留着，标出它在流程里的位置。
+`apply_grammar_bitmask()` 是结构化输出的活——如果这一拍带了语法约束，先在 logits 上盖掩码，把不合法的 token 压成负无穷（这一下已经走到 EngineCore「解码策略」组的边——图里那个虚线框「结构化输出」，[第 31 章](../../ch31-structured-output/narrative/chapter.md)才展开）。然后 `_sample()` 把 logits 交给采样器，吐出 `sampler_output.sampled_token_ids`。`_update_states_after_model_execute()` 是给 Mamba/投机解码这类 hybrid 模型记账用的，纯 Transformer 路径它什么也不做，但调用点保留着，标出它在流程里的位置。
 
 接下来是本章的重头戏——簿记同步：
 

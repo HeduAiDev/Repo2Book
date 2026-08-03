@@ -22,10 +22,17 @@ png = here / 'arch-model.png'
 subprocess.run([sys.executable, str(repo / 'scripts' / 'arch_model_figure.py'),
                 '--chapter', CHAPTER, '--instance', INSTANCE, '--out', str(svg)], check=True)
 
-# rsvg-convert 优先，不可用时回退 cairosvg（Windows 环境常见）
+# rsvg-convert 优先，不可用时回退 cairosvg（Windows 环境常见：
+# WindowsApps 存根的 python3 挡在 PATH 前面时 rsvg-convert.bat 无法执行）
+ok = False
 if shutil.which('rsvg-convert'):
-    subprocess.run(['rsvg-convert', '-z', '2', str(svg), '-o', str(png)], check=True)
-else:
+    try:
+        subprocess.run(['rsvg-convert', '-z', '2', str(svg), '-o', str(png)],
+                       check=True, capture_output=True)
+        ok = True
+    except (subprocess.CalledProcessError, OSError):
+        ok = False
+if not ok:
     import cairosvg
     cairosvg.svg2png(url=str(svg), write_to=str(png), scale=2)
 

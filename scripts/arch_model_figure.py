@@ -616,10 +616,18 @@ def build(model, cid):
         n_own = sum(1 for b, _ in buckets if b == 'own')
         past_n = sum(1 for b, _ in buckets if b == 'past')
         fut_n = sum(1 for b, _ in buckets if b == 'future')
-        past_chs = sorted({c for b, cs in buckets if b == 'past' for c in cs},
-                          key=lambda c: int(c[2:]))
-        fut_chs = sorted({c for b, cs in buckets if b == 'future' for c in cs},
-                         key=lambda c: int(c[2:]))
+        # 混合桶（exp-2026-08-03，ch11 自查抓）：一站所在文件若同时含早前与后续
+        # 章节子系统的类（ch11 站16-18 落 core_client.py，除 ch03/04/07 的客户端类
+        # 外还有 make_client 工厂被归入 entrypoints/ch37），旧逻辑把该站按最早章
+        # 归 'past' 后、把 chs 里的**全部**章节（含 ch37）都印进「已讲」——与同图
+        # 「入口层 第 37 章才讲」自相矛盾（与 exp-2026-08-01 ch04 同族，那次的修复
+        # 只覆盖全未来集合，混合集合漏了）。修法：措辞按时间方向过滤——「已讲」
+        # 只列 < 本章的章、「才讲」只列 > 本章的章；站本身仍按最早章分桶（站的内容
+        # 以最早覆盖它的章为实质，同文件里后续章的符号不是该站的主题，不冒充已讲）。
+        past_chs = sorted({c for b, cs in buckets if b == 'past' for c in cs
+                           if _chapter_index(c) < idx}, key=lambda c: int(c[2:]))
+        fut_chs = sorted({c for b, cs in buckets if b == 'future' for c in cs
+                          if _chapter_index(c) > idx}, key=lambda c: int(c[2:]))
         parts = []
         if past_n:
             parts.append(f'{past_n} 站落在第 {"、".join(c[2:] for c in past_chs)} 章已讲的组件上')

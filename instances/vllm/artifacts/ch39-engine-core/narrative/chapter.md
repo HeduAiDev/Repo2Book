@@ -2,10 +2,11 @@
 
 ## 39.1 你在这里
 
-![你在这里：全书 21 个组件已读，本章在 EngineCore 骨架展开后长出最后两块——弹性 EP 扩缩与多轮会话，18 站分落在 7 个组件标签上](../diagrams/arch-model.png)
+![你在这里：全书 21 个组件已读，本章在 EngineCore 大框的「循环本体」里就地展开「引擎核心」——DPEngineCoreProc 与 OpenAIServingResponses 两个容器盒套盒摊开真实组织关系，18 站全部落在展开面板上](../diagrams/arch-model.png)
 
-> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。自上而下依次是入口、输入处理、跨进程 IPC 边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理；EngineCore 框内已按「调度与显存／执行与并行／模型与算子／解码策略」四组装满。蓝框是前面章节已读的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
-> *本章新长的两块分居两处。一块在「执行与并行」组里——**弹性 EP 扩缩（ElasticEPScalingState）**，一台每轮只走一步的确定性状态机，四种角色各挂一串状态；它直接插在[第 7 章](../../ch07-engine-core/narrative/chapter.md)已读的 `run_busy_loop` 钩子里，切换时用 `all_reduce(MAX)` 骑在[第 21 章](../../ch21-async-engine/narrative/chapter.md)的 DP wave 节律上对齐全组步调。另一块在输出处理区——**OpenAIServingResponses**，装着 `response_store` 和 `msg_store` 两个进程内字典加一根共享 list，撑起有状态多轮；它的历史拼接正是[第 15 章](../../ch15-kv-cache/narrative/chapter.md)前缀缓存价值最大的场景。本章走线共 18 站，分布在 7 个组件标签上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子：自上而下依次是入口、输入处理、跨进程的 IPC 边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向；`EngineCore` 框内已按「调度与显存／执行与并行／模型与算子／解码策略」四组装满一路读过来的组件。蓝框是前面章节已读的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
+> *本章在 `EngineCore` 大框的「循环本体」里 **就地展开「引擎核心」** ——摊开的不是概念图，而是源码里真实的组织关系：右侧 `DPEngineCoreProc` 与 `OpenAIServingResponses` 两个容器各自盒套盒（前者嵌着通知枚举 `EEPNotificationType` 与状态机 `ElasticEPScalingState`，后者嵌着 `HarmonyContext` 等与 `construct_input_messages`），左侧平铺不嵌盒的三块（`_construct_input_messages_with_harmony`、`ScaleUpExistingEngineState` 等、`ReconfigureDistributedRequest`）。本章 18 站全部落在这些橙色部件上，状态机 `ElasticEPScalingState` 独占 7 站（3–9），是本章前半的主角。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *这块新结构长在读者已经走过的几块结构上：`DPEngineCoreProc` 正是[第 7 章](../../ch07-engine-core/narrative/chapter.md)那条 IPC 边界另一头、装着 `run_busy_loop` 的引擎核心进程本体，状态机的每一步推进都挂在已读的 busy loop 钩子里；切换时用 `all_reduce(MAX)` 对齐的，是[第 21 章](../../ch21-async-engine/narrative/chapter.md)的 DP wave 节律；`OpenAIServingResponses` 则把[第 15 章](../../ch15-kv-cache/narrative/chapter.md)的前缀缓存复用，推到了它价值最大的场景。*
 
 > 上一章我们把 OpenAI 兼容服务器接到了异步引擎上，请求的一生就此走通。
 > 这一章给那台已经在跑的引擎装上两件"运维级"能力：不停机增删 DP 引擎，以及跨轮记住对话。
@@ -147,14 +148,14 @@ def run_busy_loop(self):
 
 一句话读懂这个钩子的精妙：**`progress()` 只是这轮 busy loop 里的一个"小动作"，做完它，循环照样往下走 `_process_engine_step()` 跑模型 forward**。也就是说，扩缩的每一步都和正常的推理步**交织**在一起——这就是"不停机"四个字的全部秘密。没有哪一刻引擎是"专门停下来做重配"的。
 
-（架构模型图上，`progress()` 四路分派与 `run_busy_loop` 钩子全落在 EngineCore 大框「执行与并行」组里新长的橙色块 ElasticEPScalingState 上——站号 3–9，本章前半的每一行都在这块里。）
+（架构模型图上，`progress()` 四路分派与 `run_busy_loop` 钩子都在「引擎核心」橙色面板里——钩子属于 `DPEngineCoreProc`，状态机嵌在它盒内、标着第 3–9 站；本章前半的每一行都在这个面板里。）
 
 钩子还藏了两个收尾细节：
 
 - `is_complete()` 为真且角色是 `"removing"`（被裁引擎）→ 直接 `raise SystemExit`，进程干净退出。
 - 否则（存在/新/余留引擎）→ 把 `process_input_queue_block` 设回 `True`、清空 `eep_scaling_state`。注意这个标志：扩缩期间它是 `False`，意思是"输入队列别阻塞地等，poll 一下就走"，好让 busy loop 能高频转起来推进状态机；扩缩结束又调回 `True`，恢复平时"没活就阻塞着省 CPU"的常态。
 
-那 `eep_scaling_state` 是谁挂上去的？两条触发路径，下面分别看。
+那 `eep_scaling_state` 是谁挂上去的？两条触发路径，下面分别看。（架构模型图上，它就是左侧平铺的那块 `ReconfigureDistributedRequest`——不带独立站号，站号都标在右侧接收它的 `DPEngineCoreProc` 盒上。）
 
 ---
 
@@ -698,7 +699,7 @@ def _progress_removing_engine(self) -> bool:
 
 放下分布式，来看本章第二条线——它清爽得像换了本书。
 
-（架构模型图上，我们从 EngineCore 大框「执行与并行」组里出来，拐进输出处理区——OpenAIServingResponses 及它腹地里的 `construct_input_messages` 与 `HarmonyContext`，站号 13–18。）
+（架构模型图上，我们还停在「引擎核心」橙色面板里，只是从 `DPEngineCoreProc` 盒挪进了 `OpenAIServingResponses` 盒——它挂第 13、16、18 站，内嵌的 `construct_input_messages`、`HarmonyContext` 等标第 14、17 站，左列平铺的 `_construct_input_messages_with_harmony` 标第 15 站。）
 
 Responses API 的卖点是**有状态会话**：客户端第一轮发"我叫 Bob"，拿到一个 `response.id`；第二轮只发"我叫什么？"外加 `previous_response_id` 指向上一轮，服务器就能答出"Bob"。客户端不必自己背着全部历史。这意味着服务器侧得替它记住前文。（vLLM 的 `OpenAIServingResponses` 正是在[实现这套 OpenAI 官方 API 规范](https://platform.openai.com/docs/api-reference/responses)——`store=true` 触发服务器保存、`previous_response_id` 自动接续历史，都是官方定义的语义，不是本仓自造的协议。）
 

@@ -30,7 +30,7 @@
 
 ## 16.1 三阶段的全貌：allocate_slots 摊开看
 
-先看入口。调度器要给一个请求安排显存时，调的就是这个函数。它的签名比 [第 15 章](../../ch15-kv-cache/narrative/chapter.md) 见到的多了一串参数——那些正是本章的主角：
+先看入口。调度器要给一个请求安排显存时，调的就是这个函数。 **在架构模型图上，这一步就是从蓝色「调度器」框（[第 13 章](../../ch13-scheduler/narrative/chapter.md) / [第 14 章](../../ch14-scheduler/narrative/chapter.md) 刚读过）走进它正下方的橙色块——左列标着第 1～6 站的入口类，就是 `KVCacheManager` 这一层。** 它的签名比 [第 15 章](../../ch15-kv-cache/narrative/chapter.md) 见到的多了一串参数——那些正是本章的主角：
 
 ```python
 # vllm/v1/core/kv_cache_manager.py:L225
@@ -828,4 +828,4 @@ simple hybrid 为什么一轮足够？full 排首给出上界，唯一的 other 
 
 vLLM 官方也有一篇 [Hybrid KV Cache Manager 设计文档](https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager.html)，用另一套语言复述了不动点迭代的等价直觉（全注意力左到右扫、滑窗右到左扫、取交集），与本章的代码级推演互为补充——不过文档标注该功能「仍处早期阶段，设计可能会变」。
 
-但有一个前提一直被我们当作给定：那个 `num_gpu_blocks`——块池到底有多少块——是哪来的？它不是拍脑袋定的，而是 Worker 在启动时**实测**显存、profiling 出来的。下一章离开 KV 缓存的核心，转向 Executor 与 Worker 的生命周期，看这些块在被分配之前，是怎么被「数」出来的。
+但有一个前提一直被我们当作给定：那个 `num_gpu_blocks`——块池到底有多少块——是哪来的？它不是拍脑袋定的，而是 Worker 在启动时**实测**显存、profiling 出来的。 **在架构模型图上，本章 23 站从头到尾都待在「调度与显存」组的橙色块里，到此正好走完；下一站跨进「执行与并行」组——那一排虚线框的第一个（[第 17 章](../../ch17-worker-and-executor/narrative/chapter.md) 的 Worker 与执行器），`num_gpu_blocks` 就是在那里被数出来的。**

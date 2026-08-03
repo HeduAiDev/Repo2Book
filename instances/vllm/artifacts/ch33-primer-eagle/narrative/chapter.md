@@ -406,17 +406,17 @@ V_{\mathrm{child}} = V_{\mathrm{parent}} \cdot c_{\mathrm{child}} \le V_{\mathrm
 
 ## 33.8 落地：vLLM v1 的 EAGLE 是一条链
 
-讲完论文那棵漂亮的动态树，落差必须说破：**vLLM v1 默认的 EAGLE 路径是链式，是 §33.7 全部树机制的 k=1 退化特例**。草稿循环（下一章的 `propose()` ）第一遍前向采出第 1 个草稿 token，随后跑 γ−1 步，每步把上一步采出的 token 和上一步产出的特征回喂、只保留 1 个 argmax token——没有兄弟候选、没有树注意力、没有多轮投机采样，正是 §33.2 那条链的字面执行。§33.7 提到的那行 FIXME 就是这条落差的路标：树是规划，链是现实。在架构模型图里，这条链坐在 EngineCore 的解码策略层——和[第 30 章](../../ch30-sampling/narrative/chapter.md)的采样、[第 31 章](../../ch31-structured-output/narrative/chapter.md)的约束解码并排在同一组，草稿头的前向复用[第 18 章](../../ch18-model-runner/narrative/chapter.md)铺好的 ModelRunner 执行管线。
+讲完论文那棵漂亮的动态树，落差必须说破：**vLLM v1 默认的 EAGLE 路径是链式，是 §33.7 全部树机制的 k=1 退化特例**。草稿循环（下一章的 `propose()` ）第一遍前向采出第 1 个草稿 token，随后跑 γ−1 步，每步把上一步采出的 token 和上一步产出的特征回喂、只保留 1 个 argmax token——没有兄弟候选、没有树注意力、没有多轮投机采样，正是 §33.2 那条链的字面执行。按架构模型图的站号，这条链从第 1 站发起：解码策略组里新展开的 EagleProposer（EAGLE 的草稿器实现）。§33.7 提到的那行 FIXME 就是这条落差的路标：树是规划，链是现实。在架构模型图里，这条链坐在 EngineCore 的解码策略层——和[第 30 章](../../ch30-sampling/narrative/chapter.md)的采样、[第 31 章](../../ch31-structured-output/narrative/chapter.md)的约束解码并排在同一组，草稿头的前向复用[第 18 章](../../ch18-model-runner/narrative/chapter.md)铺好的 ModelRunner 执行管线。
 
 ![vLLM v1 EAGLE 的链式草稿泳道图，逐步回喂产出 token](../diagrams/fig36-7-vllm-chain.png)
 
 *首遍输入 [3,2,4](左移+塞 next_token=4)。随后四步回喂，产出 3→1→3→0。每步仅 1 个 argmax,无树。*
 
-这张泳道图正好复现了 §33.2 那条 γ=4 的链：首遍对左移后的序列前向、采出草稿 token 3(c=0.354),随后逐步回喂产 1(0.304)→3(0.592)→0(0.259)——和那张逐步表一模一样，只是换成了「谁调用谁」的视角。
+这张泳道图正好复现了 §33.2 那条 γ=4 的链：首遍对左移后的序列前向、采出草稿 token 3(c=0.354),随后逐步回喂产 1(0.304)→3(0.592)→0(0.259)——和那张逐步表一模一样，只是换成了「谁调用谁」的视角。按站号走，「猜」的部分（首遍前向＋逐步回喂）落在第 1 站的 EagleProposer 上；「左移＋塞 next_token」的装批，则是本章 6 站里落在第 18 章已讲执行组件上的那一站，由 ModelRunner 接手。
 
 为什么草稿敢一律 greedy argmax，连温度、top-p 这些采样参数都不管？红线兜底：**草稿分布只影响接受率、不影响最终输出分布**。草稿猜得糙，顶多 $`\alpha`$ 低一点、慢一点，最终吐出来的文字分布分毫不差。落到账本上，链式形态就是 $`\mathbb{E}[\tau]=\sum\prod\alpha`$ 的求和只剩一条路径；EAGLE-2 的树是把求和范围扩到整棵连通子树——差距就是 §33.7 那 +0.6~0.8 的 τ。
 
-执行面的其余一切——变长草稿怎么摊平进一批、目标特征与起点 token 怎么备料、验证时怎么逐位接受、被拒后怎么从残差重采——是[下一章](../../ch34-spec-decode/narrative/chapter.md)的主线，那里会把草稿器从入参到返回走通。在那套执行面里，EAGLE 只是一个实现了统一契约的草稿器：本章的全部数学，浓缩成它每步回喂的那一对 (token, 特征)。在架构模型图里，下一章沿着 EngineCore「执行与并行」组的 ModelRunner 更深处走——本章停在草稿契约与算法，下一章接上执行面。
+执行面的其余一切——变长草稿怎么摊平进一批、目标特征与起点 token 怎么备料、验证时怎么逐位接受、被拒后怎么从残差重采——是[下一章](../../ch34-spec-decode/narrative/chapter.md)的主线，那里会把草稿器从入参到返回走通。在那套执行面里，EAGLE 只是一个实现了统一契约的草稿器：本章的全部数学，浓缩成它每步回喂的那一对 (token, 特征)。架构模型图里本章的 6 站，5 站落在解码策略组就地展开的橙色部件上——第 1 站 EagleProposer、第 3–4 与第 6 站 SpecDecodeBaseProposer（草稿契约容器）、第 5 站 EagleLlamaForCausalLM（顶着 LlamaForCausalLM 继承链的模型扩展）——另 1 站在第 18 章已讲的执行组件上。下一章沿着 EngineCore「执行与并行」组的 ModelRunner 更深处走，把这 6 站从入参到返回接完——本章停在草稿契约与算法，下一章接上执行面。
 
 ---
 

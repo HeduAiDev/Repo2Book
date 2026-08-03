@@ -23,10 +23,19 @@ png = here / 'arch-model.png'
 subprocess.run([sys.executable, str(repo / 'scripts' / 'arch_model_figure.py'),
                 '--chapter', CHAPTER, '--instance', INSTANCE, '--out', str(svg)], check=True)
 
-# rsvg-convert 优先（保留中文渲染精度）；不可用时降级为 cairosvg
-if shutil.which('rsvg-convert'):
-    subprocess.run(['rsvg-convert', '-z', '2', str(svg), '-o', str(png)], check=True)
-else:
+# rsvg-convert 优先（保留中文渲染精度）；找不到或运行失败时降级为 cairosvg。
+# 实测本机 rsvg-convert 是 .BAT shim（CreateProcess 直接炸、本体也崩），
+# 故 fallback 必须同时覆盖「找不到」与「运行失败」两种情形。
+def _rsvg(svg_path, png_path):
+    if not shutil.which('rsvg-convert'):
+        return False
+    try:
+        r = subprocess.run(['rsvg-convert', '-z', '2', str(svg_path), '-o', str(png_path)])
+        return r.returncode == 0
+    except OSError:      # .BAT shim 无法被 CreateProcess 直接执行
+        return False
+
+if not _rsvg(svg, png):
     import cairosvg
     cairosvg.svg2png(url=str(svg), write_to=str(png), scale=2)
 print(f'√ {svg.name} / {png.name}')

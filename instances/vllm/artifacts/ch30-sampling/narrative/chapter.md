@@ -2,10 +2,10 @@
 
 ## 你在这里
 
-![你在这里：全书架构模型读到第 30 章，16 个组件已读，本章在 EngineCore 的「解码策略」组展开 Sampler 采样子系统——17 站分布在 forward 入口、apply_logits_processors、sample 分叉、gather_logprobs 收尾四段上，下方接 Stage 3 输出处理](../diagrams/arch-model.png)
+![你在这里：全书架构模型读到第 30 章，16 个组件已读，本章在 EngineCore 的「解码策略」组就地展开采样子系统——Sampler 容器套着 TopKTopPSampler、SamplingMetadata 容器套着 LogitsProcessors，三个内置处理器共享 LogitsProcessor 契约，17 站中 13 站落在这三块组件上，下方接 Stage 3 输出处理](../diagrams/arch-model.png)
 
 > *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 EngineCore 大框、输出处理，行间箭头还是请求的流向；当年 EngineCore 框里只画了调度器与分页 KV 缓存，如今已按「调度与显存／执行与并行／模型与算子／解码策略」四组装满一路读过来的组件。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
-> *本章新长的这块接在「模型与算子」组（第 14–28 章）的正下方——那些逐层前向的最后一步吐出 logits，本章的 Sampler 橙框就地接住，开始走这条 9 步流水线。旁边还有同处「解码策略」组、虚线框留待后续的结构化输出（[第 31 章](../../ch31-structured-output/narrative/chapter.md)）与语法后端（第 32 章）。采完的 token 往下走，进入 EngineCore 下方 Stage 3 的输出处理（虚线，后续章节）。站号是请求流经源码的先后次序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *本章新长的这块，上下两头都接在读者已经读过的结构上：上游是正上方的「模型与算子」组——模型架构（蓝框、第 28 章已读）那一层前向的最后一步吐出 logits，Sampler 橙盒就地接住；下游是 Stage 3 的输出处理（蓝框、第 08 章已读），等着收下抽好的 token。橙盒就地展开成源码里的真实组织：Sampler（采样层的入口类）是容器，里面套着 TopKTopPSampler（top-k/top-p 截断采样器）——盒套盒；SamplingMetadata（逐请求采样参数的载体）容器套着 LogitsProcessors（处理器容器，按能否改 argmax 分两袋）；三个内置处理器（MinP／LogitBias／MinTokens）共享 LogitsProcessor 契约（所有 logits 处理器的统一接口）。本章 17 站里 13 站落在这三块组件上，另有 4 站落在本子系统内、未展开成组件的文件上。旁边同处「解码策略」组的虚线框留给后续：结构化输出（[第 31 章](../../ch31-structured-output/narrative/chapter.md)）与投机解码（第 33 章才讲）。站号是请求流经源码的先后次序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
 
 模型前向的终点，是一张 `[batch, vocab]` 的 logits 张量——每一行是一个请求、每一列是词表里一个 token 的"原始分数"。可用户要的不是分数，是一个具体的 token id。从分数到 token 这一跳，就是采样层干的活，全收拢在 `vllm/v1/sample/sampler.py` 这一个文件里。
 
@@ -77,7 +77,7 @@ class Sampler(nn.Module):
 - **第 7 步内部又分两路**。一条是 greedy 快路（直接 argmax 就走人），一条是随机路（温度→截断→抽样）。
 - **argmax-invariant 这个词，是整条流水线的分水岭**。第 5 步和第 7c 步看着都是"logits processor"，凭什么一个在 greedy 前、一个在 greedy 后？答案就藏在这个词里，30.4 节专门讲。
 
-在架构模型图上，我们正站在 EngineCore「解码策略」组的入口——上一组「模型与算子」（图上标第 14–28 章，涵盖逐层前向、注意力、量化、LoRA 那一大块）的最后一步吐出 logits，本章的 Sampler 橙色展开区就地接住，开始这条 9 步流水线。采完的 token 会在本站末端离开「解码策略」组，往下进入 Stage 3 的输出处理。
+在架构模型图上，我们正站在 EngineCore「解码策略」组的入口——上一组「模型与算子」的最后一步：模型架构（蓝框、第 28 章已读）那一层前向算完，吐出 logits，本章的 Sampler 橙色展开区就地接住，开始这条 9 步流水线。采完的 token 会在本站末端离开「解码策略」组，往下进入 Stage 3 的输出处理（蓝框、第 08 章已读）。
 
 把这 9 步画成一张图，分叉与汇合一目了然：
 
@@ -314,7 +314,7 @@ def apply_all_penalties(
 
 ## 30.6 第 7 步：greedy 快路与随机路的分叉
 
-在架构模型图上，这里是 Sampler 橙色展开区的正中——第 3–6 步（站 4–7）在 `apply_logits_processors` 里已串完，第 8–9 步（站 15–16）在 `gather_logprobs` 与组装返回里等着收尾，`sample` 恰好在中间分叉出 greedy 快路（站 8–9）与随机路（站 11–14）。
+在架构模型图上，这里是 Sampler 橙色展开区的正中——第 3–6 步（站 4–7）在 `apply_logits_processors` 里已串完，第 8–9 步（站 16）在 `gather_logprobs` 与组装返回里等着收尾，`sample` 恰好在中间分叉出 greedy 快路（站 8–9）与随机路（站 11–14）。
 
 第 3–6 步处理完，`logits` 进入 `sample`，这是整条流水线最精巧的一段。它要同时伺候三种请求——纯贪心、纯随机、以及一个 batch 里两者混着来——还要让贪心请求别白跑随机路那一堆计算。
 
@@ -486,7 +486,7 @@ def apply(self, logits: torch.Tensor) -> torch.Tensor:
 
 ## 30.7 第 7d 步：top-k/top-p 截断的多后端分发
 
-第 7d 步——top-k/top-p 截断——是采样里最吃算力的环节（要对整个词表动手），于是 vLLM 给它配了一整套后端分发。核心类是 `TopKTopPSampler`，它的精明之处在于：**后端绑定发生在 `__init__`，不是每次调用**。
+第 7d 步——top-k/top-p 截断——是采样里最吃算力的环节（要对整个词表动手），于是 vLLM 给它配了一整套后端分发。核心类是 `TopKTopPSampler`，它的精明之处在于：**后端绑定发生在 `__init__`，不是每次调用**。在架构模型图上，`TopKTopPSampler` 正是 Sampler 橙盒里套着的那层子盒——本章 17 站里 11–14 站整簇落在它身上。
 
 > **FlashInfer** 是开源组织 flashinfer-ai 维护的 LLM 推理 GPU 算子库（同名论文被 MLSys 2025 接收，Zihao Ye 等，[arXiv:2501.01005](https://arxiv.org/abs/2501.01005)），能力覆盖 attention（支持 paged/ragged KV cache）、GEMM、MoE 与采样，已被 vLLM、SGLang、MLC-Engine 等框架集成为可选后端。本章用到的是它 README 里自称 "Sorting-Free Sampling" 的那部分——不排序整个词表也能做 top-k/top-p/min-p 截断采样（怎么做到的，30.9 节揭晓）；vLLM 在满足条件时用它替换 PyTorch 原生实现，不可用则回退、不崩溃。项目主页：[github.com/flashinfer-ai/flashinfer](https://github.com/flashinfer-ai/flashinfer)。
 
@@ -736,7 +736,7 @@ def gather_logprobs(logprobs, num_logprobs, token_ids):
 
 ## 30.11 贯穿全章的载体：SamplingMetadata
 
-走完 9 步，回头看一个一直在场却没正面讲的角色：`SamplingMetadata`。前面每一步取参数——`temperature`、`top_p`、`top_k`、三种 penalty、`generators`、`output_token_ids`、`bad_words`、`logitsprocs`——全是从它身上取的。它就是把"整批逐请求的采样参数"打包成一份的载体（`vllm/v1/sample/metadata.py:L14`）：
+走完 9 步，回头看一个一直在场却没正面讲的角色：`SamplingMetadata`。在架构模型图上，它是橙盒里第二个盒套盒——本章 17 站里第 17 站整站落在它身上：前面 16 站全在消费它，只有这一站是定义它。前面每一步取参数——`temperature`、`top_p`、`top_k`、三种 penalty、`generators`、`output_token_ids`、`bad_words`、`logitsprocs`——全是从它身上取的。它就是把"整批逐请求的采样参数"打包成一份的载体（`vllm/v1/sample/metadata.py:L14`）：
 
 ```python
 # vllm/v1/sample/metadata.py:L14

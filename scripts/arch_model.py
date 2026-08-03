@@ -179,6 +179,34 @@ def _evidence_dirs(units, top=3):
     return [{'dir': d, 'steps': n} for d, n in c.most_common(top)]
 
 
+def _class_def_files(src_root, dirs):
+    """扫证据目录下的 .py 文件，返回 {类名: [定义它的文件路径]} —— 契约基类补登用。
+
+    只扫证据目录（本章真正走到的目录族），不扫全树：补登的基类必须属于本章自己的
+    子系统代码族，跨子系统的具名外部契约（SupportsPP/Fp8Config 等）不进组件表。
+    """
+    import ast as _ast
+    out = {}
+    seen = set()
+    for d in dirs:
+        base = Path(src_root) / d
+        if not base.is_dir():
+            continue
+        for fp in sorted(base.rglob('*.py')):
+            key = fp.resolve()
+            if key in seen:      # 父目录证据会连带扫到子目录文件（ch30 的 vllm/v1/sample
+                continue         # ⊃ …/logits_processor），去重防同一文件计 2 次
+            seen.add(key)
+            try:
+                tree = _ast.parse(fp.read_text(encoding='utf-8'))
+            except Exception:
+                continue
+            for node in _ast.walk(tree):
+                if isinstance(node, _ast.ClassDef):
+                    out.setdefault(node.name, []).append(fp)
+    return out
+
+
 def _extract_symbol(what):
     """从走线描述里抽出**首个类名**作为符号。实测遇到的形态(盲审逐条核过):
       'L1565  DeepseekV4ForCausalLM: ...'
@@ -439,6 +467,51 @@ def build(inst=None):
                                'subsystem': (own_meta['subsystem'] if own_meta else meta['subsystem']),
                                'introduced_in': (own if own else cid),
                                'responsibility': (kc.get('responsibility') or '')[:200]}
+
+        # ---- 契约基类补登（2026-08-03，illustrator 出图自检发现）----
+        # dossier.key_classes 通常只登记实现类、漏登记契约基类：ch30 的 LogitsProcessor
+        # ABC 定义在 vllm/v1/sample/logits_processor/interface.py:60，而 ch31 的 dossier
+        # 登记了 'StructuredOutputBackend (ABC)' 所以能画出契约容器。基类缺失 →
+        # arch_model_figure.plan_panel 的 canon() 找不到它 → 契约容器渲染不出来，
+        # 多个实现类被画成互不相干的平铺盒，与源码真实组织不符（exp：ch30 三个
+        # builtin 处理器本共享 LogitsProcessor 契约，图上却是三块孤立的平铺盒）。
+        # 补登条件（全部满足才登记，宁缺毋滥）：
+        #   1) 基类尚未以任何形态登记（裸名或 '(ABC)' 括注名都算已登记）；
+        #   2) 本章 is_a 关系里至少有 2 个不同实现类 —— 否则 plan_panel 渲染不出
+        #      契约容器，登记了只是多一个无谓的平铺盒；SupportsPP/Fp8Config 这类
+        #      1 实现类的具名外部契约因此天然被滤掉，仍只留在 relations 里；
+        #   3) 基类的真实定义文件能在本章 evidence_dirs 内唯一命中（同子系统契约；
+        #      跨子系统契约不补登，且多处定义无法判定也不补登）。
+        rel_is_a = rel_by_ch[cid].get('is_a') or []
+        if rel_is_a:
+            impls_of = {}
+            for _a, _b in rel_is_a:
+                if _b not in _SKIP_BASES:
+                    impls_of.setdefault(_b, set()).add(_a)
+            if impls_of:
+                registered_bare = {nm for k in classes for nm in _split_names(k)}
+                need = {b for b, impls in impls_of.items()
+                        if b not in registered_bare and len(impls) >= 2}
+                if need:
+                    # 与模型自身的 evidence_dirs 同口径（站数 top-3 目录）：ch30 的
+                    # model_executor/layers 因此不进扫描范围，避免把同名异义的另一处
+                    # LogitsProcessor（model_executor/layers/logits_processor.py 的
+                    # nn.Module 版）误判为命中而整个跳过补登。
+                    ev = [e['dir'] for e in _evidence_dirs(l3_by_ch.get(cid, []))]
+                    for b, files_ in _class_def_files(src_root, ev).items():
+                        if b not in need or len(files_) != 1:
+                            continue
+                        try:
+                            bf = str(files_[0].resolve()
+                                     .relative_to(src_root.resolve())).replace('\\', '/')
+                        except ValueError:
+                            continue
+                        if not bf.startswith('vllm/'):
+                            continue
+                        classes[b] = {'name': b, 'file': bf,
+                                      'subsystem': meta['subsystem'],
+                                      'introduced_in': cid,
+                                      'responsibility': ''}
 
     # L2 累积：某子系统首次被哪一章展开
     sub_first = {}

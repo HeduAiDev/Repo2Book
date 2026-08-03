@@ -22,4 +22,4 @@ png = here / 'arch-model.png'
 subprocess.run([sys.executable, str(repo / 'scripts' / 'arch_model_figure.py'),
                 '--chapter', CHAPTER, '--instance', INSTANCE, '--out', str(svg)], check=True)
 subprocess.run(['rsvg-convert', '-z', '2', str(svg), '-o', str(png)], check=True)
-print(f'OK {svg.name} / {png.name}')
+print(f'✓ {svg.name} / {png.name}')

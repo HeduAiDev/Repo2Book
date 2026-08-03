@@ -2,10 +2,10 @@
 
 ## 你在这里
 
-![你在这里：全书架构模型已读多个组件，本章在入口层就地展开离线门面——LLM 的四个公开方法 generate/chat/embed/encode，经 LLMEngine 的 SyncMPClient 硬分叉，跨 IPC 边界接入后台 EngineCore，再由 while step() 同步拉到底](../diagrams/arch-model.png)
+![你在这里：全书架构模型读到第 37 章（20 个组件已读），本章在「入口」层就地展开离线门面——LLM 与 EngineCoreClient (make_client 工厂) 两块橙色部件按功能并列，18 站走线：generate/chat/embed/encode 四入口汇流，经 SyncMPClient 硬分叉跨 IPC 边界接入后台 EngineCore，由 while step() 同步拉到底](../diagrams/arch-model.png)
 
 > *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线自上而下：入口→输入处理→IPC（进程间通信）边界→EngineCore 大框（schedule→execute_model→update 逐拍循环）→输出处理，行间箭头还是请求的流向。蓝框是前面章节已读的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
-> *本章新块在入口层就地展开——摊开的不是一列类名，而是源码里真实的组织关系：上面是 `LLM` 类的四个公开方法 `generate`/`chat`/`embed`/`encode`，中间是 `LLMEngine` 构造期的硬分叉点——`SyncMPClient`（默认，后台进程 + ZMQ + 阻塞队列）与 `InprocClient`（仅在显式关掉多进程时回退），下面接 `_run_engine` 那条 `while has_unfinished_requests(): step()` 同步驱动脊。这块新结构接在[第 7 章 IPC 边界](../../ch07-engine-core/narrative/chapter.md)的头顶上、[第 4 章 AsyncLLM](../../ch04-async-llm/narrative/chapter.md)在线入口的旁边——离线门面（本章）与在线门面（前面已读）共享同一套后台 EngineCore，全部差别只在主进程侧：一边是 `queue.Queue.get()` 堵着等，一边是 `await asyncio.Queue` 让出事件循环。本章走线站号标在各组件上——站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读。跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *本章新块在「入口」层里就地展开——面板标题自己写明了「这几块彼此独立，按功能并列」：一块是 `LLM` 门面（第 1–2、8–15、17 站，`generate`/`chat`/`embed`/`encode` 四个公开方法与 `_run_engine` 驱动脊都在这块里），另一块是 `EngineCoreClient (make_client 工厂)`（第 5–7 站，离线默认 `SyncMPClient` 与进程内回退 `InprocClient` 的硬分叉就发生在这三站里）。全章 18 站，14 站落在这两块橙色部件上，另有 4 站落在同层蓝框「配置与装配」里的 `LLMEngine` 上——那是[第 3 章](../../ch03-config-and-wiring/narrative/chapter.md)已读的组件，图最下面一行注记点的就是它。这块新结构长在读者已经读过的结构上：`LLM` 门面站在 `LLMEngine` 的肩膀上（构造期那一行 `self.llm_engine = LLMEngine.from_engine_args(...)` 就是接缝），请求再从入口层出发，跨过「IPC 边界」带（[第 7 章](../../ch07-engine-core/narrative/chapter.md)已读）钻进 EngineCore 大框。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读。跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
 > *上一章合上了 PD 分离那条分布式线；从这里起视野收回到单机入口。[第 4 章：异步入口](../../ch04-async-llm/narrative/chapter.md)的 `AsyncLLM` 已读——与本条离线脊共享同一套后台 EngineCore，分岔只在主进程侧的驱动方式。下一章把这条离线脊和在线 OpenAI server 并到一起看。*
 
 写过 vLLM 离线推理的人，第一行代码几乎都长这样：
@@ -325,7 +325,7 @@ class InprocClient(EngineCoreClient):
 
 ## 37.4 四个入口，一条脊
 
-回到 `LLM` 这一层。用户能调的任务方法有好几个，本章聚焦四个核心入口：`generate`、`chat`、`embed`、`encode`。它们入口形态各异，但很快就汇流到同一条提交+驱动的脊上。先看最常用的 `generate`。
+回到 `LLM` 这一层——架构模型图上，走线从 `EngineCoreClient` 橙色块跳回 `LLM` 门面盒子里，第 8 站起的四个入口就是本站的主题。用户能调的任务方法有好几个，本章聚焦四个核心入口：`generate`、`chat`、`embed`、`encode`。它们入口形态各异，但很快就汇流到同一条提交+驱动的脊上。先看最常用的 `generate`。
 
 先说透 `generate` 的输入类型 `PromptType`——它是 `vllm/inputs/llm.py` 里给「任意 prompt」定义的类型别名：`PromptType: TypeAlias = DecoderOnlyPrompt | EncoderDecoderPrompt`，其中 `DecoderOnlyPrompt` 展开成 `str | TextPrompt | list[int] | TokensPrompt`。看不懂不要紧，逐个拆开：`str` 是裸字符串，最常见——`"你好"` 直接传；`TextPrompt` 是带元数据的文本包装（`{"prompt": "你好", "extra": ...}` 之类的字典，供多模态等场景挂额外信息）；`list[int]` 是已经 tokenize 好的 token id 序列；`TokensPrompt` 是把 token id 和偏移信息一起包装的结构化形式。一句话：**你给的 prompt 可以是原始文本、也可以是已编好的 token 序列**，引擎内部由输入处理器（第 5 章的活）把它们统一转成 token id 喂给模型。
 
@@ -675,4 +675,4 @@ class InprocClient(EngineCoreClient):
 
 这也正是离线 `LLM` 和第 4 章在线 `AsyncLLM` 的应用分野：在线要的是低延迟、逐 token 流式吐给每个并发用户，所以用事件循环 + DELTA；离线要的是高吞吐、把一大批 prompt 整体跑完一次性收齐，所以用阻塞 `while` + FINAL_ONLY + 末尾排序。同一个后台 EngineCore，两套主进程侧的驱动哲学，各自服务各自的场景。
 
-至此，本章开头那四行朴素代码背后的全部机关——`EngineArgs` 拼装、`SyncMPClient` 的跨进程同步、四入口汇流、`while step()` 驱动、乱序完成的排序还原——都摊开了。下一章我们把这条离线脊和在线 OpenAI server 并到一起，看 vLLM 怎么用同一套引擎同时撑起这两个面向用户的入口。
+至此，本章开头那四行朴素代码背后的全部机关——`EngineArgs` 拼装、`SyncMPClient` 的跨进程同步、四入口汇流、`while step()` 驱动、乱序完成的排序还原——都摊开了；架构模型图上入口层那 18 站也全部走完——请求从 `LLM` 门面出发，穿过 IPC 边界钻进后台 EngineCore 大框，逐拍转完又跨回来，在 `LLM` 门面的排序还原里按提交顺序收尾。下一章我们把这条离线脊和在线 OpenAI server 并到一起，看 vLLM 怎么用同一套引擎同时撑起这两个面向用户的入口。

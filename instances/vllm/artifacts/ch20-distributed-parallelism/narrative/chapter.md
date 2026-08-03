@@ -709,7 +709,7 @@ def get_ep_group() -> GroupCoordinator:
 
 单例的好处是模型 forward 在**任意深度**都能零参数拿到当前维度的通信组，不用把 group 对象沿调用链一层层透传。这就是 [§20.2](#202-三大集合原语与后端选择的下沉) 里 `all_reduce` 能被随手调用的底气。`get_ep_group` 的 assert 还顺带点了一个设计决策：专家并行 EP（Expert Parallel，把 MoE 层里不同的专家分摊到不同卡上，通信只发生在路由/聚合那一刻，故比 TP 稀疏得多）群组**只对 MoE 模型创建**，dense 模型不浪费进程组。
 
-模型代码实际碰到的，是 `communication_op.py` 里薄薄一层封装——薄到只是 `get_tp_group().<op>`：
+模型代码实际碰到的，是架构模型图上那「未展开成组件的文件」——第 12 站 `communication_op.py` 里薄薄一层封装，薄到只是 `get_tp_group().<op>`：
 
 ```python
 # vllm/distributed/communication_op.py:L14

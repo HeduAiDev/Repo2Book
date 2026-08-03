@@ -2,11 +2,11 @@
 
 ## 你在这里
 
-![你在这里：全书架构模型已读 19 个组件，本章在 EngineCore 的「解码策略」组里展开新的一块——投机解码：proposer→Metadata 摊平→RejectionSampler 三阶段扁平并列](../diagrams/arch-model.png)
+![你在这里：全书架构已读 19 个组件，本章在 EngineCore 的「解码策略」组里展开投机解码——SpecDecodeMetadata、NgramProposer、SpecDecodeBaseProposer、RejectionSampler 与 NgramGPUKernel 五块按功能并列](../diagrams/arch-model.png)
 
 > *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是 [第 1 章](../../ch01-config-and-wiring/narrative/chapter.md) 那张「一个请求的端到端旅程」长大后的样子。主线自上而下：入口→输入处理→IPC（进程间通信）边界→装着 `schedule → execute_model → update` 逐拍循环的 `EngineCore` 大框→输出处理，箭头仍是请求的流向；当年 `EngineCore` 框里只画了调度器与分页 KV 缓存，如今已按「调度与显存／执行与并行／模型与算子／解码策略」四组装满一路读过来的组件。蓝框是前面章节已读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
-> *本章新长的这块在「解码策略」组里就地展开成源码里的真实组织关系：左边 proposer 出草稿（NgramProposer 与 SpecDecodeBaseProposer 两种来源）→中间 SpecDecodeMetadata 摊平建 index→右边 RejectionSampler 逐位接受/拒绝（内含 greedy 与 random 两条内核），三阶段彼此独立、按功能并列。关键就位在读者已经读过的两块结构旁边：草稿验证要走目标模型前向，借道 [第 18 章 ModelRunner](../../ch18-model-runner/narrative/chapter.md) 的 `_calc_spec_decode_metadata` 算 index、再由同一套 `gpu_model_runner.py` 跑前向；bonus token 的采样则交棒给 [第 30 章](../../ch30-sampling/narrative/chapter.md) 的标准 `Sampler`——投机解码不是另起炉灶，是插在这两个已熟组件之间的一层加速。本章共 10 站，9 站在橙色展开组件上，另有 1 站在 ModelRunner。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
-> *上一章推导了 EAGLE 草稿器的数学原理；下一章看 [PD 分离](../../ch35-pd-disaggregation/narrative/chapter.md)：prefill/decode 拆分与跨进程 KV 搬运。*
+> *本章新长的这块在「解码策略」组里就地展开成源码里的真实组织关系——展开形态是平铺，不是流程：SpecDecodeMetadata（第 2 站，摊平草稿的容器）、NgramProposer（第 3 站，字符串匹配从历史抄答案）、SpecDecodeBaseProposer（第 4 站，上一章 EAGLE 已读的蓝框基类，本章回它身上只钉 propose 契约）、RejectionSampler（第 5–10 站——接受/拒绝、残差重采、还原输出全在它一家），外加一个与 NgramProposer 同算法对照、没有独立站号的 NgramGPUKernel。关键就位在读者已经读过的两块结构旁边：草稿验证要走目标模型前向，借道 [第 18 章 ModelRunner](../../ch18-model-runner/narrative/chapter.md) 的 `_calc_spec_decode_metadata` 算 index、再由同一套 `gpu_model_runner.py` 跑前向；bonus token 的采样则交棒给 [第 30 章](../../ch30-sampling/narrative/chapter.md) 的标准 `Sampler`——投机解码不是另起炉灶，是插在这两个已熟组件之间的一层加速。本章共 10 站：9 站落在这个展开块上，另有 1 站在 ModelRunner。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *上一章 [EAGLE](../../ch33-primer-eagle/narrative/chapter.md) 推导了草稿器的数学原理；下一章看 [PD 分离](../../ch35-pd-disaggregation/narrative/chapter.md)：prefill/decode 拆分与跨进程 KV 搬运。*
 
 自回归解码有个改不掉的毛病：一次前向只产一个 token。要写 100 个 token，就得把整个大模型跑 100 遍。而每跑一遍，GPU 的算力其实大半闲着——decode 阶段是**访存瓶颈**，矩阵又瘦又长，算术单元喂不饱。
 
@@ -116,7 +116,7 @@ n-gram 还有一个全张量的 GPU 版本（`vllm/v1/spec_decode/ngram_proposer
 
 ### 模型类 proposer：EAGLE 的统一入口
 
-n-gram 是确定性复制，没有"概率"可言。真正的草稿模型——EAGLE/EAGLE3/DFlash/MTP——是一个小神经网络，吃目标模型的 hidden states，自己跑前向采草稿。它们全部走 `SpecDecodeBaseProposer.propose`（`vllm/v1/spec_decode/llm_base_proposer.py`）这条统一入口：
+n-gram 是确定性复制，没有"概率"可言。真正的草稿模型——EAGLE/EAGLE3/DFlash/MTP——是一个小神经网络，吃目标模型的 hidden states，自己跑前向采草稿。它们全部走 `SpecDecodeBaseProposer.propose`（`vllm/v1/spec_decode/llm_base_proposer.py`）这条统一入口——也就是图上的第 4 站：这块基类上一章 EAGLE 已经读过、图上画成蓝框，本章回来只认它对外交草稿的契约：
 
 ```python
 # vllm/v1/spec_decode/llm_base_proposer.py:L392
@@ -232,7 +232,7 @@ class SpecDecodeMetadata:
 
 ### 三组 index 是怎么算出来的
 
-真正把这套 index 造出来的，是模型运行器里的 `_calc_spec_decode_metadata`（`vllm/v1/worker/gpu_model_runner.py`）。现在走到了 [第 18 章 ModelRunner](../../ch18-model-runner/narrative/chapter.md) 的地盘——我们跨出了 `spec_decode/` 目录，回到 `gpu_model_runner.py`，index 算术在这里完成而非在投机解码模块里，因为只有模型运行器掌握全批的调度布局（`cu_num_scheduled_tokens`）。它的源码注释里带了一组**具体数字**，是理解整套间接寻址最好的脚手架。直接读它：
+真正把这套 index 造出来的，是模型运行器里的 `_calc_spec_decode_metadata`（`vllm/v1/worker/gpu_model_runner.py`）。现在走到了 [第 18 章 ModelRunner](../../ch18-model-runner/narrative/chapter.md) 的地盘（图上的第 1 站）——我们跨出了 `spec_decode/` 目录，回到 `gpu_model_runner.py`，index 算术在这里完成而非在投机解码模块里，因为只有模型运行器掌握全批的调度布局（`cu_num_scheduled_tokens`）。它的源码注释里带了一组**具体数字**，是理解整套间接寻址最好的脚手架。直接读它：
 
 ```python
 # vllm/v1/worker/gpu_model_runner.py:L2627
@@ -328,7 +328,7 @@ calc_spec_decode_metadata(num_draft=[3,0,2,0,1], cu_sched=[4,104,107,207,209]):
 
 ## 34.3 一次前向之后：切 logits、采 bonus
 
-目标模型拿到这套 index，对"草稿被填进的输入流"跑一遍前向，吐出形状 `[num_tokens + batch_size, vocab]` 的扁平 logits——每个草稿位一行、每个 bonus 位一行，共 11 行。现在轮到 `RejectionSampler.forward`（`vllm/v1/sample/rejection_sampler.py`）把这堆 logits 分门别类。
+目标模型拿到这套 index，对"草稿被填进的输入流"跑一遍前向，吐出形状 `[num_tokens + batch_size, vocab]` 的扁平 logits——每个草稿位一行、每个 bonus 位一行，共 11 行。现在轮到 `RejectionSampler.forward`（图上的第 5 站，`vllm/v1/sample/rejection_sampler.py`）把这堆 logits 分门别类。
 
 在读代码前，先把术语钉死。这个类的 docstring 本身就是四类 token 的权威定义：
 
@@ -708,7 +708,7 @@ float32 下均匀采样有非可忽略的概率精确得到 0.0，会让接受�
 
 ## 34.6 收尾：把紧凑输出还原成变长
 
-三个内核跑完，输出是一块紧凑的 `[batch_size, max_spec_len + 1]` 张量，里面混着接受的草稿、recovered token、bonus token，以及一堆 −1。最后一步把它还原成每请求变长的 `list[list[int]]`，交回引擎。这是 `parse_output`（`vllm/v1/sample/rejection_sampler.py`），也是 §34.2 那个"摊平"的对偶操作：
+三个内核跑完，输出是一块紧凑的 `[batch_size, max_spec_len + 1]` 张量，里面混着接受的草稿、recovered token、bonus token，以及一堆 −1。最后一步把它还原成每请求变长的 `list[list[int]]`，交回引擎。这是 `parse_output`（图上的第 10 站，`vllm/v1/sample/rejection_sampler.py`），也是 §34.2 那个"摊平"的对偶操作：
 
 ```python
 # vllm/v1/sample/rejection_sampler.py:L247

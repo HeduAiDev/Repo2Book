@@ -2,10 +2,10 @@
 
 ## 你在这里
 
-![你在这里：全书架构模型已读 15 个组件，本章在 EngineCore「模型与算子」组的「注意力后端」子系统里展开——Indexer 容器内含 DeepseekV32IndexerCache 与 SparseAttnIndexer，平级还有 DeepseekV32IndexerMetadataBuilder、DeepseekV32IndexerBackend、DeepseekCompressor 三个组件；本章 8 站中 6 站在这些橙色组件上，另有 1 站经过下一章才讲的组件、1 站经过本子系统未展开的文件。](../diagrams/arch-model.png)
+![你在这里：全书架构模型已读 15 个组件，本章在 EngineCore「模型与算子」组的「注意力后端」子系统里展开——Indexer 容器内含 SparseAttnIndexer（第 1–2、4、5 站），DeepseekV4Indexer 容器内含 DeepseekCompressor 与 SparseAttnIndexer（第 7 站），AttentionLayerBase（契约）容器内含 DeepseekV4IndexerCache 与 DeepseekV32IndexerCache 两个缓存实现（第 6 站），另有 DeepseekV32IndexerMetadataBuilder（第 8 站）与 DeepseekV32IndexerBackend 等两个独立组件；本章 8 站中 7 站落在这些橙色组件上，另有 1 站落在本子系统内未展开成组件的文件上。](../diagrams/arch-model.png)
 
 > *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向；当年 `EngineCore` 框里只画了调度器与分页 KV 缓存，如今已按「调度与显存／执行与并行／模型与算子／解码策略」四组装满一路读过来的组件。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
-> *本章新长的这块在「模型与算子」组的「注意力后端」子系统里就地展开——摊开的不是一列类名，而是源码里真实的组织关系。容器 `Indexer` 包着本章最核心的两个类：`DeepseekV32IndexerCache`（索引器专属缓存，每条 132 字节、跨头存一份）和 `SparseAttnIndexer`（封装打分与 top-k 选择内核）。平级还有 `DeepseekV32IndexerMetadataBuilder`（在调度阶段装配索引器元数据）、`DeepseekV32IndexerBackend`（声明索引器缓存 shape，继承自 `AttentionBackend`）和 `DeepseekCompressor`（V4 每 m 个 token 压一块的压缩算子）。本章走线共 8 站，6 站在这些橙色组件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *本章新长的这块在「模型与算子」组的「注意力后端」子系统里就地展开——摊开的不是一列类名，而是源码里真实的组织关系。三只容器里，`Indexer` 包着 `SparseAttnIndexer`（封装打分与 top-k 选择内核）；`DeepseekV4Indexer`（V4 的索引器容器）包着 `DeepseekCompressor`（V4 每 m 个 token 压一块的压缩算子）与又一个 `SparseAttnIndexer`；`AttentionLayerBase`（注意力层契约基类）容器里则是 `DeepseekV4IndexerCache` 与 `DeepseekV32IndexerCache` 两个缓存实现——同一份契约的两个实现。容器外另有两个独立组件：`DeepseekV32IndexerMetadataBuilder`（在调度阶段装配索引器元数据）和 `DeepseekV32IndexerBackend` 等（声明索引器缓存 shape，继承自 `AttentionBackend`）。本章走线共 8 站，7 站落在这些橙色组件上，另有 1 站落在本子系统内、未展开成组件的文件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
 > *这块新结构接在读者已经走过的两段路上。「注意力后端」这个子系统本身由[第 24 章](../../ch24-primer-flash-attention/narrative/chapter.md)打开大门、[第 25 章](../../ch25-attention/narrative/chapter.md)把元数据抽象讲透——本章的 `DeepseekV32IndexerMetadataBuilder` 产出的就是同一套元数据管道的下游消费者，`DeepseekV32IndexerBackend` 继承的 `AttentionBackend` 也是[第 25 章](../../ch25-attention/narrative/chapter.md)建立的那份契约。旁边的「量化」子系统（[第 26 章](../../ch26-primer-quantization/narrative/chapter.md)）把 FP8/MXFP4 精度账推完了，本章直接拿它去核算打分器为什么便宜到敢扫全历史。*
 > *本章把打分器的数学原理全部推完，然后交棒给[模型架构章](../../ch28-model-architecture/narrative/chapter.md)——那章是原理落地的第一站，indexer 的缓存布局与调用链在真实 vLLM 源码里接回整棵模型树。*
 
@@ -117,7 +117,7 @@ $`t_0`$ 的分数 `3, 4, 2, 0` 降序索引是 `1, 0, 2, 3`（ $`s_1`$ 分最高
 
 > **严谨（选择正确性、确定性与空槽）**：argsort 给出分数的一个全序，取前 $`k`$ 个即「被选集合里最小的分数 ≥ 落选集合里最大的分数」——选择的正确性；并列分数时按稳定排序**索引小者优先**，同一组分数恒得同一集合——确定性（本例两行恰好无并列，该性质与例无关）；名单未写满的位**恒为 $`-1`$**，下游据此丢弃，绝不会把空槽当成真索引。
 
-本例每行从 $`S=4`$ 个里选 $`2`$ 个，保留 50%。放大到真实场景， $`k = 2048`$ （DeepSeek-V3.2 的 top-k 预算）、 $`L = 131072`$ （128k），只有 $`2048/131072 \approx 1.56\%`$ 的历史条目进主注意力——其余约 $`98\%`$ 被 top-k 当场筛掉。这 1.56% 就是主注意力从 $`O(L^2)`$ 掉到 $`O(Lk)`$ 的开关。
+本例每行从 $`S=4`$ 个里选 $`2`$ 个，保留 50%。放大到真实场景， $`k = 2048`$ （DeepSeek-V3.2 的 top-k 预算）、 $`L = 131072`$ （128k），只有 $`2048/131072 \approx 1.56\%`$ 的历史条目进主注意力——其余约 $`98\%`$ 被 top-k 当场筛掉。这 1.56% 就是主注意力从 $`O(L^2)`$ 掉到 $`O(Lk)`$ 的开关。在架构模型图上，这一节的打分与选块正落在 `Indexer` 容器里的 `SparseAttnIndexer` 上（第 5 站）——便宜账户的本体就是它。
 
 ---
 
@@ -202,7 +202,7 @@ $`\mathbb{D}_{KL}`$ 是 KL 散度，衡量「indexer 打的分 softmax 后」离
 
 ### 独立缓存：谁扫全历史，谁就得有自己的柜子
 
-不变量先行：**谁每步都要扫全历史，谁就必须有自己的缓存**。decode（逐 token 生成阶段）每生成一个 token，indexer 都要对全部历史 key 打一遍分——不缓存，就得每步对整个历史重新投影一遍 key，打分器再便宜也会被这笔重算拖垮。而这份缓存天然是独立的：它存的是 indexer 专属头维 $`d^I`$ 下的 key，每条 132 字节（128 个 FP8 值 + 4 字节 FP32 缩放因子）、跨所有头只存一份，宽度与精度都与主 KV cache 无关。一句直觉：indexer 与主注意力是两排分开的储物柜，各存各的、互不引用。在架构模型图上，此刻我们站在 EngineCore「模型与算子」组「注意力后端」子系统里——正对着 `Indexer` 容器内的 `DeepseekV32IndexerCache` 这个橙色组件，它旁边就是[第 7 章](../../ch07-engine-core/narrative/chapter.md)引入的、管着主 KV cache 的分页显存管理器。
+不变量先行：**谁每步都要扫全历史，谁就必须有自己的缓存**。decode（逐 token 生成阶段）每生成一个 token，indexer 都要对全部历史 key 打一遍分——不缓存，就得每步对整个历史重新投影一遍 key，打分器再便宜也会被这笔重算拖垮。而这份缓存天然是独立的：它存的是 indexer 专属头维 $`d^I`$ 下的 key，每条 132 字节（128 个 FP8 值 + 4 字节 FP32 缩放因子）、跨所有头只存一份，宽度与精度都与主 KV cache 无关。一句直觉：indexer 与主注意力是两排分开的储物柜，各存各的、互不引用。在架构模型图上，此刻我们站在 EngineCore「模型与算子」组「注意力后端」子系统里——正对着 `AttentionLayerBase`（契约）容器内的 `DeepseekV32IndexerCache` 这个橙色组件（图上第 6 站，就是这 132 字节布局的分配处），它旁边是「分页 KV 缓存」那块蓝色组件——[第 15 章](../../ch15-kv-cache/narrative/chapter.md)已读的、管着主 KV cache 的分页显存管理器。
 
 V4 是 V3.2 的后继模型（面向百万 token 上下文的新一代），其技术报告（[arXiv:2606.19348](https://arxiv.org/abs/2606.19348)）把 DSA 升级为 CSA（Compressed Sparse Attention，压缩稀疏注意力），并引入 FP4 量化感知训练（QAT——训练时就模拟量化误差，下文 MXFP4 一段详述）；其中 §2.3.1（Eq.(13)-(17)）把这份独立讲得最清楚。indexer query 与主 query 共享同一个低秩压缩 latent $`c_t^Q`$ （query 侧先压到低秩、再各走各的上投影），打分则在**压缩后的** key 上做（Eq.(16)）：
 
@@ -242,4 +242,4 @@ $`L`$ 涨到百万，便宜账户重新吃紧——平方项还躺在账上， $
 
 回到主线：**$`O(L^2)`$ 没被消灭，只是换到便宜账户**。四个设计各就各位。**便宜**（§一）：把注意力削到只剩打分——ReLU 换掉 softmax、value 与输出投影整个砍掉、多头折叠成标量话语权， $`H^I=64`$ 个 $`128`$ 维小头全程可低精度，便宜到敢给每个 query 扫全历史。**代价**（§二）：诚实账——主注意力从 $`O(L^2)`$ 降到 $`O(Lk)`$ ，128k 下省约 $`32\times`$ 且随 $`L`$ 线性放大；indexer 自己仍扫全场，一对没少，只是单价低。**可信**（§三）：一条 KL 把主注意力自己的注意力分布蒸馏进打分器，detach 让两条梯度互不串味——它是被教出来的语义对齐路由器，不是启发式。**可持续**（§四）：每步扫全历史，所以必须有自己的独立缓存（每条 132 字节、跨头一份、与主 KV cache 互不引用）；百万 token 下再用 MXFP4 把单价再砍（top-k $`2\times`$ 、召回 99.7%、整机 27% FLOPs / 10% KV cache）。
 
-一句话收束：lightning indexer 把「决定看哪里」和「看完怎么算」彻底拆开，两者之间的全部接口只是一张 top-k 名单——用一个又小又低精度、却被专门教过的打分器做前者，让昂贵的主注意力只在被点名的 $`k`$ 个条目上做后者。这套机制怎么接回 DeepSeek 的完整前向、落成真实的类与调用链——在架构模型图上，就是下一章要展开的那些蓝色组件，从 `DeepseekV4ForCausalLM` 顶层入口到 `DeepseekV4DecoderLayer` 逐层调用——是[模型架构那一章](../../ch28-model-architecture/narrative/chapter.md)的事。
+一句话收束：lightning indexer 把「决定看哪里」和「看完怎么算」彻底拆开，两者之间的全部接口只是一张 top-k 名单——用一个又小又低精度、却被专门教过的打分器做前者，让昂贵的主注意力只在被点名的 $`k`$ 个条目上做后者。这套机制怎么接回 DeepSeek 的完整前向、落成真实的类与调用链——在架构模型图上，就是下一章要展开的那块虚线组件，从 `DeepseekV4ForCausalLM` 顶层入口到 `DeepseekV4DecoderLayer` 逐层调用——是[模型架构那一章](../../ch28-model-architecture/narrative/chapter.md)的事。
