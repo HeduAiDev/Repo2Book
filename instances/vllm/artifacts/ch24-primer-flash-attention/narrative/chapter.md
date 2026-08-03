@@ -5,8 +5,8 @@
 ![你在这里：全书架构模型已读 13 个组件，本章在 EngineCore 的「模型与算子」组里展开「注意力后端」——两个独立组件 flash_attn_varlen_func 与 merge_attn_states，按功能并列](../diagrams/arch-model.png)
 
 > *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线自上而下依次是入口、输入处理、跨进程的 IPC 边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理；蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
-> *本章新长的这块在 EngineCore 的「模型与算子」组里就地展开，两个橙色组件——`flash_attn_varlen_func`（第 2 站）和 `merge_attn_states 等`（第 6 站）——标注「彼此独立，按功能并列」。整章 6 站，这两个是源码锚点；其余 4 站是 §一 到 §八 的数学推导主线。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
-> *这块「注意力后端」左右紧邻两块读者已经读过的蓝框：**「模型定义层」（第 22 章）** 和 **「自定义算子与编译」（第 23 章）** 。模型定义层把模型搭好、`self.attn(q,k,v)` 那行调用摆到位，自定义算子层用 `torch.compile` 把它当切点切出来保持 eager——轮到本章，掀开 `self.attn` 内部那个一直当黑盒的 FlashAttention kernel。左邻右舍是已读的，本章纵深往里扎。*
+> *本章新长的这块在 EngineCore 的「模型与算子」组里就地展开，两个橙色组件——`flash_attn_varlen_func`（第 2 站）和 `merge_attn_states 等`（第 6 站）——标注「彼此独立，按功能并列」。整章 6 站：这两站钉在橙色组件上，其余 4 站落在本子系统内图没有展开成组件的文件上——kernel 的 import 层、两处调用点、合并封装层——正文沿推导逐一带到，图右下角一句话作了交代。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *同一「模型与算子」组里，这块「注意力后端」的正上方一行，是两块读者已经读过的蓝框：「模型定义层」([第 22 章](../../ch22-model-definitions/narrative/chapter.md)) 和「自定义算子与编译」([第 23 章](../../ch23-custom-ops-and-compilation/narrative/chapter.md))。模型定义层把模型搭好、`self.attn(q,k,v)` 那行调用摆到位，自定义算子层用 `torch.compile` 把它当切点切出来保持 eager——轮到本章，掀开 `self.attn` 内部那个一直当黑盒的 FlashAttention kernel。上面一行是已读的，本章纵深往里扎。*
 > *本章只讲 kernel 内部的数学——为什么不用物化 $`N\times N`$ 矩阵、⊕ 算子怎么保证拆开还能精确拼回。这些数学在 vLLM 里的工程落地（后端选择、调用面、分页 KV）归[第 25 章：注意力后端](../../ch25-attention/narrative/chapter.md)。*
 
 上一章拆到 `self.attn(q, k, v)` 那行调用的底下——attention 算子被 `torch.compile` 当切点切出来、夹在两侧规整段之间保持 eager。但那个算子**内部**真正干活的 FlashAttention kernel,始终是当黑盒 `import` 进来的：调用一行 `flash_attn_varlen_func`,注意力就算完了，可里面到底发生了什么，全书至今没打开过。
@@ -266,7 +266,7 @@ vLLM 侧对这套访存优化的落地面，体现在它怎么给 kernel 喂数�
 
 ## 五、FlashAttention-2:同一份数学，榨得更快(一节带过)
 
-现代 kernel(包括 vLLM 依赖的这个)其实是 **FlashAttention-2**(arXiv:2307.08691)。它没换数学，只在工程上做了三处调优，综合比初版快约 2×。vLLM 实际会按硬件代际在这一族里挑版本——Hopper(NVIDIA 上一代数据中心 GPU 架构)优先 **FA3**(FlashAttention-3,为 Hopper 定制)、Blackwell(更新一代)优先 **FA4**,其余回退 FA-2——换代动机是新一代 GPU 新增的硬件能力:FA-3 吃透 Hopper 的异步执行能力,FA-4 专啃 Blackwell 的"Tensor Core 吞吐翻倍、其余单元没跟上"非对称算力配比(FA-3 论文 arXiv:2407.08608、FA-4 论文 arXiv:2603.05451,代码全家桶见 [Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention))。dispatch 逻辑落地见[第 25 章](../../ch25-attention/narrative/chapter.md)——三代数学内核一脉相承，讲透 FA-2 就理解了这一族 kernel 的公共骨架。一节带过，记住三点就够：
+现代 kernel(包括 vLLM 依赖的这个)其实是 **FlashAttention-2**(arXiv:2307.08691)。它没换数学，只在工程上做了三处调优，综合比初版快约 2×。vLLM 实际会按硬件代际在这一族里挑版本——Hopper(NVIDIA 上一代数据中心 GPU 架构)优先 **FA3**(FlashAttention-3,为 Hopper 定制)、Blackwell(更新一代)优先 **FA4**,其余回退 FA-2——换代动机是新一代 GPU 新增的硬件能力：FA-3 吃透 Hopper 的异步执行能力，FA-4 专啃 Blackwell 的"Tensor Core 吞吐翻倍、其余单元没跟上"非对称算力配比(FA-3 论文 arXiv:2407.08608、FA-4 论文 arXiv:2603.05451,代码全家桶见 [Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention))。dispatch 逻辑落地见[第 25 章](../../ch25-attention/narrative/chapter.md)——三代数学内核一脉相承，讲透 FA-2 就理解了这一族 kernel 的公共骨架。一节带过，记住三点就够：
 
 ![FlashAttention → FlashAttention-2 三处工程改进](../diagrams/fig34-5-fa1-vs-fa2.png)
 
@@ -448,11 +448,11 @@ O_i=\mathrm{softmax}\!\left(\frac{Q_iK_{\le i}^{\top}}{\sqrt{d}}\right)V_{\le i}
 
 把前两步合起来：每一行的输出只认自己能看到的历史(第一步),而这些历史无论分几批写、都逐字节稳定(第二步)。于是拆 query 轴就成了纯粹的"分头算、直接拼":第 $`c`$ 块就是一次 `flash_attn_varlen_func(causal=True)` 调用，吃"累积到本块末尾的全量 KV",一次算出本块 query 行的**最终**输出——**不带 lse、不做加权**。逐块输出落在各自不相交的 query 行，拼接就是拼接。对比 cascade / split-KV 非得 `merge_attn_states` 把碎片按 $`(O,\mathrm{lse})`$ 合回来，chunked prefill 的合并成本是 0。
 
-工程上，这条定理长什么样？**长成"没有代码"。** 翻遍 `flash_attn.py` 的前向路径，你找不到任何一处针对 chunked prefill 的特判分支——一段被切成三拍的 prefill,和一次算完的整段 prefill,走的是**同一条 varlen 代码路径**(就是 §一 那次 `flash_attn_varlen_func`)。区别只在传进来的 query 有多长、`cu_seqlens_q`(变长约定的累积序列边界,标出每条序列在打平 batch 里的起点)怎么切，kernel 全然不知道、也不需要知道自己吃的是"一整段"还是"一段里的第二块"。零特判，正是"因果逐行独立"这条定理最干净的工程形态：定理成立，代码里就腾出一整类本该有的分支。
+工程上，这条定理长什么样？**长成"没有代码"。** 翻遍 `flash_attn.py` 的前向路径，你找不到任何一处针对 chunked prefill 的特判分支——一段被切成三拍的 prefill,和一次算完的整段 prefill,走的是**同一条 varlen 代码路径**(就是 §一 那次 `flash_attn_varlen_func`)。区别只在传进来的 query 有多长、`cu_seqlens_q`(变长约定的累积序列边界，标出每条序列在打平 batch 里的起点)怎么切，kernel 全然不知道、也不需要知道自己吃的是"一整段"还是"一段里的第二块"。零特判，正是"因果逐行独立"这条定理最干净的工程形态：定理成立，代码里就腾出一整类本该有的分支。
 
 ### 为什么要主动去拆：调度动机
 
-既然拆了零代价，那**为什么**要拆？动机不在注意力这一层，在调度那一层。一段几千 token 的长 prompt,它的 prefill 是算力密集的大块；一旦独占一拍，正在 decode(逐 token 生成)的请求就被顶得卡顿。**Sarathi**([arXiv:2308.16369](https://arxiv.org/abs/2308.16369))提出把长 prefill 切成固定大小的 chunk 分几拍算，每拍的算力余量再**捎带**(piggyback,搭便车)若干 decode token——算力密集的 prefill 与访存密集的 decode 混在一拍里互补。它的后续 **Sarathi-Serve**([arXiv:2403.02310](https://arxiv.org/abs/2403.02310))把这套做成 **stall-free**(无停顿)调度：先给每一拍定一个 **token 预算**(token budget,一拍最多算多少 token,由延迟 SLO(service level objective,服务水平目标,用户能接受的延迟上界)反推),预算先塞满在途 decode、再塞一块 prefill;新请求的长 prefill 于是被自动切成"刚好填进预算余量"的 chunk,永不打断在途 decode。这正是[第 13 章：调度器](../../ch13-scheduler/narrative/chapter.md)那条"token 为中心、不分相"数轴的论文根之一。
+既然拆了零代价，那**为什么**要拆？动机不在注意力这一层，在调度那一层。一段几千 token 的长 prompt,它的 prefill 是算力密集的大块；一旦独占一拍，正在 decode(逐 token 生成)的请求就被顶得卡顿。**Sarathi**([arXiv:2308.16369](https://arxiv.org/abs/2308.16369))提出把长 prefill 切成固定大小的 chunk 分几拍算，每拍的算力余量再**捎带**(piggyback,搭便车)若干 decode token——算力密集的 prefill 与访存密集的 decode 混在一拍里互补。它的后续 **Sarathi-Serve**([arXiv:2403.02310](https://arxiv.org/abs/2403.02310))把这套做成 **stall-free**(无停顿)调度：先给每一拍定一个 **token 预算**(token budget,一拍最多算多少 token,由延迟 SLO(service level objective,服务水平目标，用户能接受的延迟上界)反推),预算先塞满在途 decode、再塞一块 prefill;新请求的长 prefill 于是被自动切成"刚好填进预算余量"的 chunk,永不打断在途 decode。这正是[第 13 章：调度器](../../ch13-scheduler/narrative/chapter.md)那条"token 为中心、不分相"数轴的论文根之一。
 
 几乎同一时间，**DeepSpeed-FastGen** 用 **Dynamic SplitFuse**(动态拆分-融合，[arXiv:2401.08671](https://arxiv.org/abs/2401.08671))独立发明了同一个主意：把长 prompt 拆成小块、与 decode 融进同一批算，论文报告相对当时的 vLLM 最高 2.3× 吞吐。两条线殊途同归，底层踩的是同一块地基——因果注意力逐行独立，拆 query 轴不损一分精度。这也是本章那个 ⊕ 算子的**反面注脚**:凡是拆 KV 轴的(cascade、split-KV)都得请 ⊕ 出场合并，唯独拆 query 轴的 chunked prefill 用不上它——因为要合并的东西根本没被拆开。
 

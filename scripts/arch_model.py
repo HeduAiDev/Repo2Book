@@ -238,6 +238,59 @@ def _extract_symbol(what):
     return name
 
 
+_METHOD_RE = re.compile(r'^[A-Za-z_]\w*\.[A-Za-z_]\w*$')
+
+
+def _unit_range(u):
+    """走线站的行号范围 (lo, hi)。优先 lines 字段；lines 为空或歧义解析只剩半截时，
+    退回 what 开头的 'L123'/'L123-456' 前缀（SPINE_RE 对 'py:L772-861  描述' 这种
+    无破折号分隔的形态会把 '861' 挤进 what，前缀仍在 what 头部可回收）。"""
+    nums = [int(x) for x in re.findall(r'\d+', u.get('lines') or '')]
+    if not nums:
+        m = re.match(r'\s*L?(\d+)(?:\s*[-–—]\s*L?(\d+))?', u.get('what') or '')
+        if m:
+            nums = [int(m.group(1))] + ([int(m.group(2))] if m.group(2) else [])
+    if not nums:
+        return None
+    return (min(nums), max(nums))
+
+
+def _earlier_method_read(nm, f, cid, ch_meta, l3_by_ch):
+    """方法级条目（'Cls.meth'）的**首读章**判定：若更早某章的 spine 已经走过这个方法
+    （同文件 + 站点描述提到方法名 + 行范围与本章站点**相交**），返回 (该章, 该章 subsystem)；
+    否则 None。
+
+    为什么：方法不会比读者读到它的那一站更新。ch17 站 18 已整段讲过
+    gpu_worker.py:L772-L861 的 Worker.execute_model，ch21 惰性 PP 收发再停在同一段代码上
+    时它是「已读复用」而非 ch21 新组件——否则图上橙色与正文图注「两块已读的蓝色复用」
+    冲突（ch21 盲审 2026-08-03 FAIL 即此）。行范围相交是硬门槛：只拦「同一段代码被再读」，
+    不拦「同文件里确为新授的方法」（ch21 的 GroupCoordinator.irecv_tensor_dict 在 ch20 走线
+    里无对应站，仍是本章新组件）。归属章的 subsystem 保留**声明章**的（面板成员资格跟
+    叙事走，首读时间跟证据走）。仅对单 'Cls.meth' 形态生效，'A.m1 / m2' 合条不走此判定。
+    """
+    if not _METHOD_RE.match(nm) or not f:
+        return None
+    meth = nm.split('.', 1)[1]
+    pat = re.compile(r'\b' + re.escape(meth) + r'\b')
+    decl = [u for u in l3_by_ch.get(cid, []) if u['path'] == f and pat.search(u['what'])]
+    dranges = [r for r in (_unit_range(u) for u in decl) if r]
+    if not decl or not dranges:
+        return None
+    for ecid in sorted(l3_by_ch, key=_chapter_index):
+        if _chapter_index(ecid) >= _chapter_index(cid):
+            break
+        esub = ch_meta.get(ecid, {}).get('subsystem')
+        if not esub:
+            continue          # 导览章无子系统归属，不能当首读章
+        for u in l3_by_ch[ecid]:
+            if u['path'] != f or not pat.search(u['what']):
+                continue
+            r = _unit_range(u)
+            if r and any(r[0] <= d[1] and d[0] <= r[1] for d in dranges):
+                return ecid, esub
+    return None
+
+
 def _split_names(n):
     """key_classes 里常写成 'XgrammarBackend / XgrammarGrammar'、'StructuredOutputGrammar (ABC)'，
     拆成可与源码 ClassDef 对齐的裸类名。"""
@@ -420,6 +473,20 @@ def build(inst=None):
         best = max(votes.items(), key=lambda kv: kv[1])
         return best[0] if best[1] > 0 else None
 
+    def home_subsystem(f):
+        """文件的全书**聚合主场 subsystem**：把各章对该文件的站数按章 subsystem 求和，
+        取和最大的 subsystem。这是「这个文件真正属于哪个子系统」的全书证据——跨章
+        cross-cutting 使用（如 ch35 读 scheduler.py 15 站做 KV-connector 集成）摊不平
+        主场章（scheduler 的 ch13/ch14 合计 23 站）。"""
+        votes = file_stations.get(f) or {}
+        sub_votes = {}
+        for cid, n in votes.items():
+            m = ch_meta.get(cid)
+            sub = m['subsystem'] if m else None
+            if sub:
+                sub_votes[sub] = sub_votes.get(sub, 0) + n
+        return max(sub_votes, key=sub_votes.get) if sub_votes else None
+
     # ---- 组件（类）注册表：架构图的**细粒度节点**。每章 dossier.key_classes 首次出现即登记，
     # introduced_in = 首次讲它的那一章 → 这就是「前面章节铺垫的结构」的来源。----
     classes = OrderedDict()
@@ -449,19 +516,37 @@ def build(inst=None):
             f = (kc.get('file') or '').split(':')[0].strip()
             if nm in classes:
                 continue
-            own = owner_of(f)
-            own_meta = ch_meta.get(own) if own else None
-            # 2026-08-02 修复(illustrator 自检):当 owner_of(文件级站数投票)判出的归属章
-            # 与**声明章**(首次登记该类的章)的 subsystem 不同时,说明该类是 cross-cutting
-            # 的货——如 Scheduler.get_grammar_bitmask 是 ch12(engine-core)登记的,但
-            # owner_of 因 ch35 读 scheduler.py 站数最多把它重判给 pd-disaggregation,
-            # 导致 ch35 图上印出 ch31 主题的方法名、读者不可理解。
-            # 修复:subsystem 穿越时,保留声明章的 subsystem 与 introduced_in。
-            if own and own_meta and own_meta.get('subsystem') != meta.get('subsystem'):
-                # owner_of 把文件判给另一个 subsystem → 该类是 cross-cutting 的，保留声明章的身份
+            # 方法级「更早已读」判定（见 _earlier_method_read 文档）：命中则首读章跟证据、
+            # subsystem 留声明章（面板成员资格跟叙事走）。
+            earlier = _earlier_method_read(nm, f, cid, ch_meta, l3_by_ch)
+            if earlier:
+                ecid, _esub = earlier
                 classes[nm] = {'name': nm, 'file': f,
                                'subsystem': meta['subsystem'],
-                               'introduced_in': cid}
+                               'introduced_in': ecid,
+                               'responsibility': (kc.get('responsibility') or '')[:200]}
+                continue
+            own = owner_of(f)
+            own_meta = ch_meta.get(own) if own else None
+            # cross-cutting 判定(2026-08-03 修订,修 ch11 回归):
+            # 2026-08-02 原规则「owner 与声明章 subsystem 不同就保留声明章」把
+            # EngineCore/EngineCoreProc 又拉回 ch03/ch07——ch03 只读 core.py 1 站
+            # (__init__ 装配)、ch07 5 站(ZMQ 机制),而 ch11 是主场(15 站),主角类
+            # 被挤出本章面板,15 个站号只能落到残余方法盒上(ch11 盲审 BLOCKED)。
+            # 新规则看**全书聚合主场**:owner 章 subsystem == 文件聚合主场 → 跟 owner
+            # (站数证据胜出,24994acb 原意);否则 owner 只是 cross-cutting 使用方
+            # (如 ch35 读 scheduler.py 15 站做 KV-connector 集成,主场仍是 scheduler
+            # 的 ch13/ch14)→ 保留声明章身份,防 ch35 图印出他章主题的新组件。
+            if own and own_meta and own_meta.get('subsystem') != meta.get('subsystem'):
+                if own_meta.get('subsystem') == home_subsystem(f):
+                    classes[nm] = {'name': nm, 'file': f,
+                                   'subsystem': own_meta['subsystem'],
+                                   'introduced_in': own,
+                                   'responsibility': (kc.get('responsibility') or '')[:200]}
+                else:
+                    classes[nm] = {'name': nm, 'file': f,
+                                   'subsystem': meta['subsystem'],
+                                   'introduced_in': cid}
             else:
                 classes[nm] = {'name': nm, 'file': f,
                                'subsystem': (own_meta['subsystem'] if own_meta else meta['subsystem']),

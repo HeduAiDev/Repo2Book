@@ -52,6 +52,11 @@ C_CUR_F, C_CUR_S = '#ffedd5', '#f97316'          # 本章展开
 C_TODO_F, C_TODO_S = '#f8fafc', '#cbd5e1'        # 未读
 C_TXT, C_MUTE = '#0f172a', '#64748b'
 
+# 字体栈：本机无 librsvg 时走 cairosvg shim，generic 'sans-serif' 会解析到无 CJK 字形
+# 的字体 → 中文全成豆腐（exp-2026-08-03 ch24 自查抓到）。显式给 CJK 字体族，
+# Windows 落 YaHei/SimHei、Linux 落 Noto CJK，末位保留 sans-serif 兜底。
+FONT = 'Microsoft YaHei, SimHei, Noto Sans CJK SC, PingFang SC, sans-serif'
+
 
 def box(L, x, y, w, h, fill, stroke, dash=False, r=7, sw=1.6):
     d = ' stroke-dasharray="5,4"' if dash else ''
@@ -61,7 +66,7 @@ def box(L, x, y, w, h, fill, stroke, dash=False, r=7, sw=1.6):
 
 def text(L, x, y, s, fs=12, fill=C_TXT, anchor='middle', bold=False):
     b = ' font-weight="bold"' if bold else ''
-    L.append(f'<text x="{x:.1f}" y="{y:.1f}" font-family="sans-serif" font-size="{fs}" '
+    L.append(f'<text x="{x:.1f}" y="{y:.1f}" font-family="{FONT}" font-size="{fs}" '
              f'fill="{fill}" text-anchor="{anchor}"{b}>{esc(s)}</text>')
 
 
@@ -186,8 +191,14 @@ def station_of_classes(classes, spine, relations=None):
                         break
         if not hit and u['path'] in by_file:    # 3) 同文件词元精确命中
             cands = by_file[u['path']]
+            # '.' in t 的两个分支：base 是词元的方法部分（'execute_model' ←
+            # 'Worker.execute_model'）或**类部分**（'Worker' ← 'Worker.execute_model'）。
+            # 后者修复：文件里只登记了方法级词元时，类名站被 cands[0] 兜底张冠李戴——
+            # ch21 站 1（what 即 'Worker.execute_model：…'）曾被兜底挂到
+            # AsyncIntermediateTensors 上，导致该方法级盒拿不到站号、被 keep 滤出面板。
             hit = next((c for c in cands if base and
-                        any(base == t or ('.' in t and base == t.rsplit('.', 1)[1])
+                        any(base == t
+                            or ('.' in t and base in (t.rsplit('.', 1)[1], t.split('.', 1)[0]))
                             for t in [x.strip() for x in re.split(r'[/（(]', c['name'])
                                       if x.strip()])),
                        cands[0])
@@ -657,7 +668,7 @@ def build(model, cid):
             f'orient="auto"><path d="M0,0 L10,3 L0,6 Z" fill="{C_CUR_S}"/></marker>'
             '</defs>',
             f'<rect width="{W}" height="{H:.0f}" fill="white"/>']
-    head.append(f'<text x="{M}" y="34" font-family="sans-serif" font-size="16" fill="{C_TXT}" '
+    head.append(f'<text x="{M}" y="34" font-family="{FONT}" font-size="16" fill="{C_TXT}" '
                 f'font-weight="bold">{esc(title)}</text>')
     return '\n'.join(head + L + ['</svg>'])
 
