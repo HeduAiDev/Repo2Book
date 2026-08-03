@@ -473,6 +473,31 @@ def build(inst=None):
         best = max(votes.items(), key=lambda kv: kv[1])
         return best[0] if best[1] > 0 else None
 
+    def exact_class_read(nm, f):
+        """找「符号类侧词元 **精确 == 类名** 且同文件」的站，按章投票（多数胜、平局取早）。
+
+        这是比文件多数票更强的**类级证据**：文件多数票会被「读了文件里其他类」的站灌水
+        ——ch14 的 RequestStatus 声明于 ch14(§14.7 状态机主体,站16 符号=RequestStatus),
+        但 ch31 读 request.py 2 站(Request 类 + WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
+        状态位)把文件多数票灌成 2:1,home_subsystem 也随之判成 structured-output,
+        RequestStatus 被拉去 ch31,图面 footer 误印「1 站落在第 31 章才讲的组件上」。
+        站符号精确就是类名(含类名.方法)才是该类被主体读的证据;读同文件其他符号不算。
+        """
+        base = nm.split('.')[0].strip()
+        if not base:
+            return None
+        votes = {}
+        for cid, units in l3_by_ch.items():
+            n = sum(1 for u in units
+                    if u.get('path') == f and (u.get('symbol') or '').split('.')[0] == base)
+            if n:
+                votes[cid] = n
+        if not votes:
+            return None
+        best_n = max(votes.values())
+        best = [c for c, n in votes.items() if n == best_n]
+        return min(best, key=_chapter_index)
+
     def home_subsystem(f):
         """文件的全书**聚合主场 subsystem**：把各章对该文件的站数按章 subsystem 求和，
         取和最大的 subsystem。这是「这个文件真正属于哪个子系统」的全书证据——跨章
@@ -528,6 +553,27 @@ def build(inst=None):
                 continue
             own = owner_of(f)
             own_meta = ch_meta.get(own) if own else None
+            # 类主体章守卫（2026-08-04 立，ch14 RequestStatus 盲审 BLOCKED）：
+            # 声明章自己就有「符号精确 == 类名」的主体站（exact==cid），但文件多数票章
+            # 对该类 **0 精确命中** → 多数票是被同文件他类的站灌水的（ch31 读 request.py
+            # 的 Request 类与状态位 2 站 > ch14 的 RequestStatus 站 1 站，home_subsystem
+            # 也随之判成 structured-output）。此时保留声明章身份，文件多数票让路。
+            # 注意条件收紧：exact 命中**第三方章**（ch21 读 DPEngineCoreProc 启动、ch12
+            # 读 Scheduler 集成、ch02 建 AsyncLLM）不是主体证据，不采信——只有「声明章
+            # 自己精确命中」才可信。
+            if cid and exact_class_read(nm, f) == cid:
+                base = nm.split('.')[0].strip()
+                own_hits = 0
+                if own:
+                    own_hits = sum(1 for u in l3_by_ch.get(own, [])
+                                   if u.get('path') == f
+                                   and (u.get('symbol') or '').split('.')[0] == base)
+                if own and own != cid and own_hits == 0:
+                    classes[nm] = {'name': nm, 'file': f,
+                                   'subsystem': meta['subsystem'],
+                                   'introduced_in': cid,
+                                   'responsibility': (kc.get('responsibility') or '')[:200]}
+                    continue
             # cross-cutting 判定(2026-08-03 修订,修 ch11 回归):
             # 2026-08-02 原规则「owner 与声明章 subsystem 不同就保留声明章」把
             # EngineCore/EngineCoreProc 又拉回 ch03/ch07——ch03 只读 core.py 1 站
