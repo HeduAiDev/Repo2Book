@@ -5,7 +5,7 @@
 ![你在这里：全书架构模型已读 6 个组件，本章在 EngineCore 的「调度与显存」组里把「调度器」就地摊开——SchedulerInterface 契约、Scheduler 不分相的两阶段、SchedulerOutput 全量/增量二分、AsyncScheduler 占位机制](../diagrams/arch-model.png)
 
 > *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长的一块。*
-> *本章这块橙色在 `EngineCore` 大框的「调度与显存」组里就地摊开，摊开的正是逐拍循环里 `schedule` 这一步的真实组织：`SchedulerInterface`（第 1 站）是契约，`Scheduler`（第 2–10 站）是主体，`AsyncScheduler`（第 11 站）是异步变体，旁边 `NewRequestData` / `CachedRequestData` / `SchedulerOutput` 是它两头的产物。全章 11 站全部落在这块橙色上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *本章这块橙色在 `EngineCore` 大框的「调度与显存」组里就地摊开，摊开的正是逐拍循环里 `schedule` 这一步的真实组织——按功能并列的五块：`SchedulerInterface`（第 1 站）是契约，`Scheduler`（第 2–6、8–10 站）是主体，`AsyncScheduler`（第 11 站）是异步变体，`PauseState` 与 `AsyncScheduler._update_after_schedule` 是支撑前者的两个部件。本章 11 站中 10 站落在这块橙色上，另有 1 站（第 7 站 `SchedulerOutput`）落在第 11 章已读的引擎核心组件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
 > *这块新结构接在哪？它的上沿就是已读的「IPC 边界」蓝框（[第 7 章](../../ch07-engine-core/narrative/chapter.md)）——请求过完那条线，第一脚就踩进 `EngineCore` 大框、踩到调度器；同组的「分页 KV 缓存」还是虚线框（[第 15 章](../../ch15-kv-cache/narrative/chapter.md)才讲），本章调度器手里只握着它的门面 `allocate_slots`，从这一侧喊话。*
 > *[第 11 章](../../ch11-engine-core/narrative/chapter.md) 把 `EngineCore.step()` 一拍拆到底，那一拍的第一个动作就是 `scheduler_output = self.scheduler.schedule()`——当时我们把它当黑盒，只说它「产出这一批要算什么的清单」。[第 12 章](../../ch12-engine-core/narrative/chapter.md) 又把流水线变体讲透，结尾留下一句话：`schedule()` 凭什么决定这一拍推哪些请求、各推多少 token，是下一章的主场。本章就钻进这个黑盒。下一章停在 `allocate_slots` 要不到块的那一刻——[第 14 章](../../ch14-scheduler/narrative/chapter.md) 把抢占与请求生命周期回流补完。*
 
@@ -158,7 +158,7 @@ v1 这套「token 为中心、不分相」的调度，把两条来自论文的�
 
 第一阶段遍历 `self.running`——已经在跑的请求。**RUNNING 优先于 WAITING**，这是个刻意的策略：先保证在途请求往前推进（低延迟、避免吐到一半的请求被新来的饿死）。
 
-按架构模型图的走线，这一段落在 `Scheduler` 主体（第 2–10 站）上；`allocate_slots` 是它与同组那块虚线框「分页 KV 缓存」（[第 15 章](../../ch15-kv-cache/narrative/chapter.md)）的接缝——调度器不碰物理块，只握着它的门面喊话，要得到就继续，要不到就抢占。
+按架构模型图的走线，这一段落在 `Scheduler` 主体（第 2–6、8–10 站）上；`allocate_slots` 是它与同组那块虚线框「分页 KV 缓存」（[第 15 章](../../ch15-kv-cache/narrative/chapter.md)）的接缝——调度器不碰物理块，只握着它的门面喊话，要得到就继续，要不到就抢占。
 
 ```python
 # vllm/v1/core/sched/scheduler.py:L345
@@ -463,7 +463,7 @@ def test_continuous_batch_mixes_prefill_and_decode():
 
 ## 13.5 SchedulerOutput：全量发一次，之后只发 diff
 
-调度决策做完了，现在要把它打包成 `SchedulerOutput`，送给（可能在另一个进程里的）model runner。这里有个通信成本的设计：**首次调度的请求发全量数据，之后只发增量。**
+调度决策做完了，现在要把它打包成 `SchedulerOutput`，送给（可能在另一个进程里的）model runner——按架构模型图的走线，现在走到调度器的出口：产出从这里跨进程送出，worker 那一侧（「执行与并行」组里的「Worker 与执行器」「ModelRunner 执行」两个虚线框）是 [第 17 章](../../ch17-worker-and-executor/narrative/chapter.md) 和 [第 18 章](../../ch18-model-runner/narrative/chapter.md) 才展开的事，本章只送到出口为止。这里有个通信成本的设计：**首次调度的请求发全量数据，之后只发增量。**
 
 为什么？model runner 跑在 worker 进程里，调度器每拍都要把「这一批算什么」通过 IPC 发过去。一个请求的静态数据——prompt token、采样参数、多模态特征——一旦发过一次，worker 缓存住就行，没必要每拍重发。每拍真正变化的，只有「又算了几个 token、新分了哪些块」这点 diff。
 
@@ -817,7 +817,7 @@ class AsyncScheduler(Scheduler):
 
 它覆写 §13.5 那个乐观推进的 `_update_after_schedule`：先调父类把 `num_computed_tokens` 推进，然后对每个**不在 prefill 中途**（`is_prefill_chunk` 为假，即将吐字）的请求，把 `num_output_placeholders += 1 + cur_num_spec_tokens`（`num_spec_tokens` 是配置的每拍草稿 token 数；`cur_num_spec_tokens` 是这一拍实际排给该请求的草稿数，投机解码关闭时恒为 0，此时就只加 1）。这里的 `if request.is_prefill_chunk: continue` 确实是字面意义上的「if prefill」分支——但它出现在异步调度**记账**要不要给这个请求记「下一拍将产出的输出占位」这一步，而不是出现在决定「这一拍给它分多少 token」的调度公式里；后者（§13.1／§13.3 的 `num_new_tokens` 减法）从头到尾没有按 prefill/decode 分支。
 
-这一句是异步调度的全部魔法。意思是：「我知道这一拍的前向**将会**给这个请求产出 1 个真 token（再加 `num_spec_tokens` 个草稿 token），虽然现在还没算出来，但我**先记上**。」于是下一拍调度时，追赶公式里的 `+ request.num_output_placeholders`（§13.3 我们当时跳过的那一项）就生效了——它告诉调度器「这个请求其实还差 1 个 token 要算」，于是 §13.3 那个 async 提前剪枝和追赶公式能为它预留下一拍的 decode 槽位，**不必等前向真的回来**。这就是 §13.5 那个 `AsyncScheduler` 实例驱动连续批处理的方式：靠占位，让 `schedule(N)` 和 `forward(N−1)` 在同一段墙钟时间里重叠，GPU 不再有调度间隙的气泡。
+这一句是异步调度的全部魔法。意思是：「我知道这一拍的前向**将会**给这个请求产出 1 个真 token（再加 `num_spec_tokens` 个草稿 token），虽然现在还没算出来，但我**先记上**。」于是下一拍调度时，追赶公式里的 `+ request.num_output_placeholders`（§13.3 我们当时跳过的那一项）就生效了——它告诉调度器「这个请求其实还差 1 个 token 要算」，于是 §13.3 那个 async 提前剪枝和追赶公式能为它预留下一拍的 decode 槽位，**不必等前向真的回来**。这就是 `AsyncScheduler` 实例驱动连续批处理的方式：靠占位，让 `schedule(N)` 和 `forward(N−1)` 在同一段墙钟时间里重叠，GPU 不再有调度间隙的气泡。
 
 这张图把同步和异步的时间线并排：
 

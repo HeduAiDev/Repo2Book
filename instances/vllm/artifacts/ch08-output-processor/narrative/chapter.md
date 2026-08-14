@@ -2,10 +2,10 @@
 
 ## 你在这里
 
-![你在这里：全书架构模型已读 4 个组件，本章在 IPC 边界下游展开「Stage 3 输出处理」——左侧单槽邮箱 RequestOutputCollector 与 add_request 入口，右侧 OutputProcessor 大框嵌着 OutputProcessorOutput 与 RequestState](../diagrams/arch-model.png)
+![你在这里：全书架构模型已读 4 个组件，本章在请求旅程末端的「Stage 3 输出处理」就地展开——左侧 RequestOutputCollector 单槽邮箱，右侧 OutputProcessor 大框嵌着 OutputProcessorOutput 与 RequestState](../diagrams/arch-model.png)
 
-> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向；当年 `EngineCore` 框里只有调度器与分页 KV 缓存两块，如今已按「循环本体／调度与显存／执行与并行／模型与算子／解码策略」五组装满。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
-> *本章新长的这块不在 EngineCore 里，而是长在它下游、正接在两块已读结构上：上游隔着 `EngineCore` 大框，是[第 7 章](../../ch07-engine-core/narrative/chapter.md)拆开的那条 IPC 边界——本章开场的 `EngineCoreOutput` 整批就是从那条进程虚线上流回来的；而承载它的整个前端，是[第 4 章](../../ch04-async-llm/narrative/chapter.md)的异步引擎——`output_handler` 生产者循环与 `generate()` 消费者循环，本来就是那个蓝框自己的循环。橙框摊开的是源码里真实的组织关系：左侧是单槽邮箱 `RequestOutputCollector` 与 `add_request` 入口，右侧 `OutputProcessor` 大框里嵌着 `OutputProcessorOutput` 与 `RequestState` 两份贯穿全章的结构。本章走线共 14 站，9 站落在这些橙色部件上，另有 3 站落在第 4、5 章已讲的组件上、2 站落在本子系统内未展开成组件的文件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向。骨架从第 1 章起就定死了——`EngineCore` 里始终按「循环本体／调度与显存／执行与并行／模型与算子／解码策略」五组铺着后续章节的虚线空位，调度器、分页 KV 缓存都在其中；长大的是颜色：每读完一章，就把那一块从虚线点亮成带章号的蓝框，本章则把自己的那一块就地摊开成橙框。三色各司其职——蓝框是前面章节已经读过的，虚线框是后续章节才讲的，橙色是本章新长出的一块。*
+> *本章新长的这块不在 EngineCore 里，而是长在它下游、正接在两块已读结构上：上游隔着 `EngineCore` 大框，是[第 7 章](../../ch07-engine-core/narrative/chapter.md)拆开的那条 IPC 边界——本章开场的 `EngineCoreOutput` 整批就是从那条进程虚线上流回来的；而承载它的整个前端，是[第 4 章](../../ch04-async-llm/narrative/chapter.md)的异步引擎——`output_handler` 生产者循环与 `generate()` 消费者循环，本来就是那个蓝框自己的循环。橙框摊开的是源码里真实的组织关系：左侧是单槽邮箱 `RequestOutputCollector`，右侧 `OutputProcessor` 大框里嵌着 `OutputProcessorOutput` 与 `RequestState` 两份贯穿全章的结构。本章走线共 14 站，9 站落在这些橙色部件上，另有 3 站落在第 4、5 章已讲的组件上、2 站落在本子系统内未展开成组件的文件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
 > *本章就是第 4 章那两笔欠账（后台生产者-消费者、每请求一条队列）的结清处，也是请求生命周期的最后一棒：整批结果回到前端后，怎么被去 token、检测停止串、攒成 `RequestOutput`，再分发回 N 个客户端流。*
 
 [第 4 章](../../ch04-async-llm/narrative/chapter.md) 拆三段式时，在那张泳道图里圈了三块骨架，并对其中两块打了欠条：

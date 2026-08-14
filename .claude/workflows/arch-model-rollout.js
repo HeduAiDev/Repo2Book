@@ -11,13 +11,16 @@ export const meta = {
 // ⚠️ args 注入不可靠 → CFG 为准（换批改 CFG.chapters）。
 const CFG = {
   instance: 'vllm',
-  // 重跑收尾:上轮进程中断未完成的 5 章(盲审 PENDING)——Render 已就绪,主要走 Prose+Blind
+  // 终审收尾:5 章内容变化重审 + ch03 重盲审(过期产物) + ch07/29 环境/API 重跑
   chapters: [
-    'ch11-engine-core',
+    'ch03-config-and-wiring',
+    'ch04-async-llm',
+    'ch07-engine-core',
+    'ch14-scheduler',
     'ch21-async-engine',
-    'ch23-custom-ops-and-compilation',
-    'ch24-primer-flash-attention',
+    'ch27-primer-lightning-indexer',
     'ch29-model-architecture',
+    'ch39-engine-core',
   ],
 }
 const A = (typeof args !== 'undefined' && args && args.chapters && args.chapters.length) ? args : CFG

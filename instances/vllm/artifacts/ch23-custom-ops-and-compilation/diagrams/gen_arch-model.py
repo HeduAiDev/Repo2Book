@@ -21,5 +21,17 @@ png = here / 'arch-model.png'
 
 subprocess.run([sys.executable, str(repo / 'scripts' / 'arch_model_figure.py'),
                 '--chapter', CHAPTER, '--instance', INSTANCE, '--out', str(svg)], check=True)
-subprocess.run(['rsvg-convert', '-z', '2', str(svg), '-o', str(png)], check=True)
+# PNG 转换：优先真实 librsvg（rsvg-convert，2x 高清）；本机无 librsvg 时按渲染器
+# 既定的 cairosvg shim 兜底（renderer 注释已声明此路径，字体栈显式走 Microsoft YaHei
+# 保证中文不豆腐）。cairosvg 无 -z 参数，scale=2 等价于 rsvg-convert -z 2。
+import shutil
+rsvg = shutil.which('rsvg-convert')
+if rsvg is not None:
+    conv = subprocess.run([rsvg, '-z', '2', str(svg), '-o', str(png)],
+                          capture_output=True, text=True)
+else:
+    conv = None
+if conv is None or conv.returncode != 0:
+    import cairosvg
+    cairosvg.svg2png(url=str(svg), write_to=str(png), scale=2.0)
 print(f'✓ {svg.name} / {png.name}')

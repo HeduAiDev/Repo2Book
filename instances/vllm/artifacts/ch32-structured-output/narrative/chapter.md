@@ -4,10 +4,10 @@
 
 ## 你在这里
 
-![你在这里：全书架构模型已读 18 个组件，本章在「解码策略」组里接着把「结构化输出」就地摊开——调度器门控与批量装配、草稿安检、worker 侧两条并存的落地路径，8 站落在橙上、6 站落在其他章已讲的组件上](../diagrams/arch-model.png)
+![你在这里：全书架构模型已读 17 个组件，本章在「解码策略」组里接着把「结构化输出」就地摊开——调度器门控与批量装配、草稿安检、worker 侧两条并存的落地路径：14 站中 8 站落在橙上（图上标着第 4–8、10–12 站），另有 5 站落在第 11、13 章已讲的组件上、1 站落在本子系统内未展开成组件的文件上](../diagrams/arch-model.png)
 
 > *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长的一块。*
-> *本章这块橙色在「解码策略」组里就地展开，图里注明「这几块彼此独立，按功能并列」——不是一条调用链，而是同一趟旅程的几处落点：`StructuredOutputManager` 的批量装配与产物 `GrammarOutput`、`DraftTokensHandler` 草稿安检、worker 侧的 `StructuredOutputsWorker` 与 `_apply_grammar_bitmask_kernel` 那条自写 kernel 岔路，连调度器里的门控 `AsyncScheduler._update_after_…` 也画了进来。本章 14 站，8 站落在这些橙色部件上，另有 6 站落在其他章已讲的组件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *本章这块橙色在「解码策略」组里就地展开，图里注明「这几块彼此独立，按功能并列」——不是一条调用链，而是同一趟旅程的几处落点：`StructuredOutputManager` 连同它的三个方法（装配入口 `grammar_bitmask`、批量填充 `_fill_bitmasks`、推理门 `should_fill_bitmask` 等）、`DraftTokensHandler` 草稿安检、worker 侧的 `StructuredOutputsWorker` 与 `apply_grammar_bitmask`，还有 `_apply_grammar_bitmask_kernel` 那条自写 kernel 岔路。本章 14 站，8 站落在这些橙色部件上（图上标着第 4–8、10–12 站），另有 5 站落在第 11、13 章已讲的组件上、1 站落在本子系统内、未展开成组件的文件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
 > *这块新结构接在哪？上一章已经把同一个「结构化输出」框长出一半——语法对象与两层后端契约；本章在同一块橙上长另一半。框的上方就是同组已读的「采样」蓝框（[第 30 章](../../ch30-sampling/narrative/chapter.md)）——掩码正好插在它之前；往上是「调度与显存」组已读的调度器蓝框（[第 13 章](../../ch13-scheduler/narrative/chapter.md)），门控与投机耦合都从那里长出来；最底下那条 Triton kernel 岔路，落在「自定义算子与编译」（[第 23 章](../../ch23-custom-ops-and-compilation/narrative/chapter.md)）那片已读领地。*
 > *[第 31 章](../../ch31-structured-output/narrative/chapter.md)把一份 JSON schema 编译成了语法对象，并交出了六方法契约（`fill_bitmask` / `accept_tokens` / `rollback` / `validate_tokens` / `is_terminated` / `find_token_divergence`）。本章接着讲：这些语法对象每一步怎么被批量榨出一张位掩码表，这张表又怎么走完跨进程、跨设备的路，最后把非法 token 的分数打成负无穷。[第 34 章](../../ch34-spec-decode/narrative/chapter.md)会从投机解码那一侧重看本章埋下的草稿耦合。*
 
@@ -31,7 +31,7 @@
 
 先给直觉：**点名之后才发卷子** 。一整批被调度的请求里，只有「这一步真的要吐出下一个 token」的那些人需要一张答题限制单；还在分段抄题干的人这一步根本不作答，发给他既浪费，又会把「几张单子对几张答卷」的账算乱。
 
-「还在分段抄题干」说的是分块预填充（chunked prefill，把一个长 prompt 拆成几步喂进模型，见[第 13 章](../../ch13-scheduler/narrative/chapter.md)）。按架构模型图的走线，这一站还在「调度与显存」组已读的调度器蓝框里——图上橙色块里单列的那行 `AsyncScheduler._update_after_…` 就是这段代码，它是本章从已读结构上长出来的第一站。判据就写在调度收尾处：
+「还在分段抄题干」说的是分块预填充（chunked prefill，把一个长 prompt 拆成几步喂进模型，见[第 13 章](../../ch13-scheduler/narrative/chapter.md)）。按架构模型图的走线，这一站（图上第 1 站）还在「调度与显存」组已读的调度器蓝框里——正是图底那句「另有 5 站落在第 11、13 章已讲的组件上」所指的一站，是本章从已读结构上长出来的第一站。判据就写在调度收尾处：
 
 ```python
 # vllm/v1/core/sched/scheduler.py:L942-L951
@@ -362,7 +362,7 @@ class GrammarOutput:
 
 ## 32.4 并行填充：三道门，第一道就可能封死
 
-装配的入口分成两条填充路径，先看并行那条。
+装配本体（本节到 §32.6）都在图上那块橙的 `StructuredOutputManager` 盒子里，第 5–8 站一站不落；上一节那道草稿安检（第 13 站）还在已读的调度器蓝框里，正是图底那句「另有 5 站落在第 11、13 章已讲的组件上」说的那批站。装配的入口分成两条填充路径，先看并行那条。
 
 直觉：**每个人填自己那张快递单，互不干扰，所以人多时开几个窗口分着填是安全的** 。但窗口是开门时就按「这家店最多同时接多少单」决定要不要建的——店面上限只有 128 单的门店，压根不会建这些窗口。
 
@@ -666,7 +666,7 @@ vLLM 用**两道独立的门** 管两件事。第一道管「这一步填不填�
 
 ## 32.7 掩码上路：先搭前向的车，再面对两条岔路
 
-装配到此结束，`GrammarOutput` 已经在手。接下来看它怎么被用掉。走线到这里跨出「结构化输出」这块橙、回到 `EngineCore` 大框的逐拍循环——`vllm/v1/engine/core.py` 里那三步 `schedule → execute_model → update` 的中间（[第 11 章](../../ch11-engine-core/narrative/chapter.md)读过的循环骨架），再往下落到 worker 侧的 `sample`，也就是「执行与并行」组已读的 ModelRunner（[第 18 章](../../ch18-model-runner/narrative/chapter.md)）。
+装配到此结束，`GrammarOutput` 已经在手。接下来看它怎么被用掉。走线到这里跨出「结构化输出」这块橙、回到 `EngineCore` 大框的逐拍循环（图上第 2 站）——`vllm/v1/engine/core.py` 里那三步 `schedule → execute_model → update` 的中间（[第 11 章](../../ch11-engine-core/narrative/chapter.md)读过的循环骨架）；再往下落到 worker 侧的 `sample`（图上第 9 站，正是图底那句「1 站落在本子系统内、未展开成组件的文件上」所指），也就是「执行与并行」组已读的 ModelRunner（[第 18 章](../../ch18-model-runner/narrative/chapter.md)）。
 
 第一件值得注意的事是**调用时机** 。engine core 的一步是这样排的：
 
@@ -862,7 +862,7 @@ vLLM 用**两道独立的门** 管两件事。第一道管「这一步填不填�
 
 ## 32.9 V2 路径之一：掩码怎么搬上卡
 
-从这里开始的三节讲 opt-in 那条路。它把「重排」换成了「索引」，代价是要自己管搬运和同步。这三节的代码落在「执行与并行」组已读的 ModelRunner 蓝框（[第 18 章](../../ch18-model-runner/narrative/chapter.md)）里——`StructuredOutputsWorker` 就挂在它的 `sample` 路径上；而那条自写 Triton kernel 的岔路，往深里是「自定义算子与编译」（[第 23 章](../../ch23-custom-ops-and-compilation/narrative/chapter.md)）那片已读领地。
+从这里开始的三节讲 opt-in 那条路。它把「重排」换成了「索引」，代价是要自己管搬运和同步。这三节的代码落在「执行与并行」组已读的 ModelRunner 蓝框（[第 18 章](../../ch18-model-runner/narrative/chapter.md)）里——`StructuredOutputsWorker`（图上第 10–11 站）就挂在它的 `sample` 路径上；而那条自写 Triton kernel 的岔路（图上第 12 站），往深里是「自定义算子与编译」（[第 23 章](../../ch23-custom-ops-and-compilation/narrative/chapter.md)）那片已读领地。
 
 先看这个 worker 的家底：
 

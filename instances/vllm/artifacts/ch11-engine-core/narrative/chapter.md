@@ -83,7 +83,7 @@ def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
 剩下的是一条直线，七步：
 
 1. **`has_requests()` 守门**——调度器手上一个请求都没有，直接返回 `({}, False)`，这一拍空转都不空转。注意注释：这里的「有请求」既包括没跑完的，也包括跑完了但还没从批次里清走的。
-2. **`schedule()`**——调度器决定这一拍要推哪些请求、各推多少 token，产出一个 `scheduler_output`。它是连续批处理的大脑，细节是 [第 13 章](../../ch13-scheduler/narrative/chapter.md) 的主场，这里我们只把它当作「这一批要算什么」的清单。
+2. **`schedule()`**——调度器决定这一拍要推哪些请求、各推多少 token，产出一个 `scheduler_output`。它是连续批处理的大脑——架构模型图上，这一步落在虚线预告的『调度与显存』组，细节是 [第 13 章](../../ch13-scheduler/narrative/chapter.md) 的主场；这里我们只把它当作「这一批要算什么」的清单。
 3. **`execute_model(..., non_block=True)`**——发起 GPU 前向。注意 `non_block=True`：它**不等前向跑完**，立刻返回一个 `future`。
 4. **`get_grammar_bitmask()`**——算结构化输出的语法掩码（下一节细讲它为什么夹在这）。
 5. **`future.result()`**——到这里才真正等前向结束。
@@ -240,7 +240,7 @@ def test_aborts_queue_batched_into_single_finish():
 
 ## 11.4 run_busy_loop：引擎的心跳
 
-`step()` 是一拍。是谁在一拍接一拍地敲？是 `run_busy_loop`——EngineCore 子进程的主循环。第 7 章讲完 IO 线程后把请求送到了 `input_queue` 门口，本节就是门内那个永不停歇的循环。
+`step()` 是一拍。是谁在一拍接一拍地敲？是 `run_busy_loop`——EngineCore 子进程的主循环。架构模型图上，我们正从蓝框的跨进程 IPC 边界跨进本章橙色的 `EngineCoreProc` 外壳（站 9–15）：第 7 章讲完 IO 线程后把请求送到了 `input_queue` 门口，本节就是门内那个永不停歇的循环。
 
 它短得惊人：
 

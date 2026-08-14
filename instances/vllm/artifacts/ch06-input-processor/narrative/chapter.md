@@ -2,11 +2,11 @@
 
 ## 你在这里
 
-![你在这里：全书架构已读到第 6 章、3 个组件已读，本章在 Stage 1 输入处理就地展开橙色新块 ParentRequest（第 4–6、10–11 站），走线另跨第 4 章已读的异步引擎与第 8 章才讲的输出处理](../diagrams/arch-model.png)
+![你在这里：全书架构已读到第 6 章、3 个组件已读，本章在 Stage 1「输入处理」就地展开——左边橙色新块 ParentRequest（第 4–6、10–11 站），右边蓝色旧块 OutputProcessor.add_request（第 8–9、12 站），其余 4 站落在第 4 章已读的异步引擎上](../diagrams/arch-model.png)
 
 > *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、Stage 1 输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、Stage 3 输出处理；蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
-> *本章新长的这块在 Stage 1 输入处理里就地展开——摊开的不是一列抽象流程，而是一个类：`ParentRequest`（`vllm/v1/engine/parallel_sampling.py` 里那个负责扇出与归并的类），框里徽标「第 4–6、10–11 站」的就是它。本章走线共 12 站，5 站落在它身上；其余 7 站不在这块新结构上——4 站落在[第 4 章](../../ch04-async-llm/narrative/chapter.md)已读的「异步引擎」蓝框上（`AsyncLLM.add_request`，请求接入的总闸门），3 站落在[第 8 章](../../ch08-output-processor/narrative/chapter.md)才讲的「输出处理」虚线框上（`OutputProcessor.add_request`，给每个 child 登记独立 `RequestState` 的动作）。*
-> *值得单独记一句的是这块新结构**接在哪几块你已经读过的结构上**：它上游连着「入口」组里[第 3 章](../../ch03-config-and-wiring/narrative/chapter.md)那个已读的「配置与装配」蓝框（`EngineArgs → VllmConfig` 把整套引擎装配起来），下游的箭头落进「IPC 边界」那一组——那组里[第 4 章](../../ch04-async-llm/narrative/chapter.md)已读的「异步引擎」（`AsyncLLM` 的三段式接入）同样是蓝的；而且本章走线本身就从那个蓝框里出发（`add_request` 的岔路口是扇出的总闸门），在本章的橙色组件上打转，再借道「输出处理」那个虚线框完成登记与归并。两侧都是走过的路，本章这块正好嵌在中间；再往下的 `EngineCore` 大框和 Stage 3 输出处理还是虚线，留给后面的章节。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *本章新长的这块在 Stage 1 输入处理里就地展开——摊开的不是一列抽象流程，而是源码里真实的组织关系：左边是 `ParentRequest`（`vllm/v1/engine/parallel_sampling.py` 里那个负责扇出与归并的类，本章首讲，橙），框里徽标「第 4–6、10–11 站」的就是它；右边是 `OutputProcessor.add_request`（给每个 child 登记独立 `RequestState` 的动作）——它在[第 4 章](../../ch04-async-llm/narrative/chapter.md)那个三段式接入里已经露过脸（`_add_request` 那 16 行里就有它），所以图上是蓝框、却按「面板成员资格跟叙事走」摆进了本章的输入处理面板，徽标「第 8–9、12 站」。两框之间没有从属箭头，因为输入处理这块的几件东西彼此独立、按功能并列。本章走线共 12 站，8 站落在面板这两个组件上，另有 4 站落在[第 4 章](../../ch04-async-llm/narrative/chapter.md)已读的「异步引擎」蓝框上（`AsyncLLM.add_request`，请求接入的总闸门）。*
+> *值得单独记一句的是这块新结构**接在哪几块你已经读过的结构上**：它上游连着「入口」组里[第 3 章](../../ch03-config-and-wiring/narrative/chapter.md)那个已读的「配置与装配」蓝框（`EngineArgs → VllmConfig` 把整套引擎装配起来）；下游，在面板底下那条 IPC 行上，[第 4 章](../../ch04-async-llm/narrative/chapter.md)已读的「异步引擎」（`AsyncLLM` 的三段式接入）同样是蓝的——本章走线正是从那个蓝框里出发（`add_request` 的岔路口是扇出的总闸门），在面板这两个组件上打转完成扇出与登记，又折回那个蓝框、经 IPC 边界下到 `EngineCore`。两侧都是走过的路，本章这块正好嵌在中间；再往下的 `EngineCore` 大框和 Stage 3 输出处理还是虚线，留给后面的章节。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
 
 [第 4 章](../../ch04-async-llm/narrative/chapter.md) 拆三段式时，`add_request` 那段代码里有一行注释被我们一笔带过：
 
@@ -145,7 +145,7 @@ child_sampling_params.n = 1
 
 ## 6.4 子请求的身份：唯一 id 与确定性种子
 
-扇出的每一步，都由 `ParentRequest` 经手——走线到这里已经跨进本章新长的橙色组件，图上徽标「第 4–6 站」就是这一段的落点。先看它的构造与派生逻辑：
+扇出的每一步，都由 `ParentRequest` 经手——走线到这里已经跨出[第 4 章](../../ch04-async-llm/narrative/chapter.md)那个「异步引擎」蓝框（`add_request` 的岔路口），进到本章新长的橙色组件，图上徽标「第 4–6 站」就是这一段的落点。先看它的构造与派生逻辑：
 
 ```python
 # vllm/v1/engine/parallel_sampling.py:L36-L94
@@ -243,7 +243,7 @@ def assign_request_id(request: EngineCoreRequest):
 
 ## 6.5 双进程登记：本进程一份 RequestState，跨进程一个独立请求
 
-每派生一个 child，`add_request` 都调一次 `_add_request` 把它下发。这个方法第 4 章讲过，它把同一个 child 同时挂到两个地方——本进程的 `OutputProcessor`、和独立进程的 `EngineCore`。这里有个跨模块的接缝：`_add_request` 还在第 4 章的蓝框里，而它调到的 `OutputProcessor.add_request` 属于[第 8 章](../../ch08-output-processor/narrative/chapter.md)才讲的「输出处理」虚线组件——本章 12 站里有 3 站挂在那个组件上。我们重点看本进程这一侧的登记，因为归并就靠它：
+每派生一个 child，`add_request` 都调一次 `_add_request` 把它下发。这个方法第 4 章讲过，它把同一个 child 同时挂到两个地方——本进程的 `OutputProcessor`、和独立进程的 `EngineCore`。这里有个跨模块的接缝：走线从「异步引擎」蓝框出来，第一次敲到图上右侧那块「输出处理」的旧块 `OutputProcessor.add_request`（[第 4 章](../../ch04-async-llm/narrative/chapter.md)的三段式接入里露过面，所以是蓝的；只是它的全貌要等读完 `RequestState` 才能讲透）。我们重点看本进程这一侧的登记，因为归并就靠它：
 
 ```python
 # vllm/v1/engine/output_processor.py:L533-L562
@@ -318,7 +318,7 @@ return self._new_request_output(
 1. **有父就走归并**：`parent_req is None`（普通单请求）直接把这一路输出原样吐出；有父则交给 `parent_req.get_outputs` 决定这一批到底向客户端吐什么。`get_outputs` 返回空列表时直接 `return None`——表示这一批 child 暂时没有该展示给客户端的内容。
 2. **id 改回 external**：归并后用 `external_req_id`（而不是内部 child id）去组装最终的 `RequestOutput`。这是「对外是一个请求」最后的临门一脚——调用方看到的 `RequestOutput.request_id` 永远是它当初发的那个 `R`，内部那串 `0_R-ab12cd34` 它一无所知。
 
-走线到这里又从「输出处理」的虚线组件折回本章的橙色组件（徽标上的第 10–11 站就落在这段）。归并的核心逻辑全在 `get_outputs` 里。它分流式和非流式两套，差别很大：
+走线到这里从右侧那块蓝的 `OutputProcessor.add_request` 登记完、又折回本章的橙色组件 `ParentRequest`（徽标上的第 10–11 站就落在这段）。归并的核心逻辑全在 `get_outputs` 里。它分流式和非流式两套，差别很大：
 
 ```python
 # vllm/v1/engine/parallel_sampling.py:L100-L126
@@ -371,7 +371,7 @@ def get_outputs(
 
 ## 6.7 取消：一个对外 id 牵出 n 个内部 child
 
-并行采样还有一个收尾动作：取消。用户取消「那一个请求」，引擎得把底下 n 个 child 全停掉。这件事靠的就是 [§6.5](#65-双进程登记本进程一份-requeststate跨进程一个独立请求) 织的那两张表。
+并行采样还有一个收尾动作：取消。用户取消「那一个请求」，引擎得把底下 n 个 child 全停掉。这件事靠的就是 [§6.5](#65-双进程登记本进程一份-requeststate跨进程一个独立请求) 织的那两张表——走线又一次回到「输出处理」那块蓝的 `OutputProcessor`（图上第 12 站）：
 
 ```python
 # vllm/v1/engine/output_processor.py:L491-L531（节选）
@@ -446,4 +446,4 @@ return request_ids_to_abort
 
 这套设计的精髓，是把「采 n 个候选」彻底翻译成引擎熟悉的「n 个普通请求」——引擎侧零特判、调度上零偏袒，所有 `n>1` 的脏活累活都被关在 `ParentRequest` 这一个类里。第 4 章那行「`n>1` 本章不展开」的注释，到这里就兑现完了。
 
-这章我们多次提到，归并的状态机虽然定义在 `ParentRequest` 里，但真正**驱动**它转起来的——把引擎吐回的 `EngineCoreOutput` 喂给每个 child 的 `RequestState`、再 `put` 进那个共享队列——是输出处理这一段的活。下一段我们就去 [Stage 3 输出处理](../../ch08-output-processor/narrative/chapter.md)，看一个 token 从引擎回到客户端的最后一程。
+这章我们多次提到，归并的状态机虽然定义在 `ParentRequest` 里，但真正**驱动**它转起来的——把引擎吐回的 `EngineCoreOutput` 喂给每个 child 的 `RequestState`、再 `put` 进那个共享队列——是输出处理这一段的活（图上第 8–9 站那块）。走线到这章就停在这个 Stage 1 面板里：往下的 IPC 边界、`EngineCore` 大框、Stage 3 输出处理都还是虚线。下一段我们就去 [Stage 3 输出处理](../../ch08-output-processor/narrative/chapter.md)，看一个 token 从引擎回到客户端的最后一程。

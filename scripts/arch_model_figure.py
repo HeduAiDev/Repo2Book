@@ -105,6 +105,21 @@ def rng(ids):
     return ', '.join(out)
 
 
+def _name_tokens(nm):
+    """类名登记词元：'A / B' → {A, B}；点号名补类侧（'Worker.execute_model' → 'Worker'）。
+
+    类侧词元用于「站符号是否命中真实类」的判定（跨文件精确类名匹配 3.5 与
+    cands[0] 兜底的守门）；方法侧（'execute_model'）不参与——同名方法跨文件
+    常见（ch32 的 apply_grammar_bitmask 教训），类名才是全书唯一的。
+    """
+    out = []
+    for t in [x.strip() for x in re.split(r'[/（(]', nm) if x.strip()]:
+        out.append(t)
+        if '.' in t:
+            out.append(t.split('.', 1)[0])
+    return out
+
+
 def pick_classes(model, cid, sub, spine, cap=12):
     """本章展开的组件：**前面章节已铺垫的结构** + **本章新增的结构**。
 
@@ -120,7 +135,13 @@ def pick_classes(model, cid, sub, spine, cap=12):
     mine = [c for c in model.get('classes', []) if c['subsystem'] == sub
             and _chapter_index(c['introduced_in']) <= idx
             and c.get('file', '').startswith('vllm/')]
-    st = station_of_classes(mine, spine, model['chapters'][cid].get('relations', {}))
+    # 全书真实类名词元集（供 station_of_classes 3.6 兜底守门：站符号命中别子系统
+    # 真实类时不作同文件兜底，交 footer 按真实类归桶）
+    all_names = set()
+    for c in model.get('classes', []):
+        all_names.update(_name_tokens(c.get('name') or ''))
+    st = station_of_classes(mine, spine, model['chapters'][cid].get('relations', {}),
+                            all_names)
     keep = [c for c in mine if c['introduced_in'] == cid or st.get(c['name'])]
     if len(keep) > cap:
         rel = model['chapters'][cid].get('relations', {})
@@ -140,7 +161,7 @@ def pick_classes(model, cid, sub, spine, cap=12):
     return keep, st
 
 
-def station_of_classes(classes, spine, relations=None):
+def station_of_classes(classes, spine, relations=None, all_names=None):
     """把本章站点落到**组件**上（不是落到文件上——用户 2026-07-26：不必给每个站点标具体文件、
     把每个站点做成独立模块，那太细、不适合架构图）。
 
@@ -154,8 +175,22 @@ def station_of_classes(classes, spine, relations=None):
          'StructuredOutputManager.should_fill_bitmask' ← 'should_fill_bitmask'）；
          禁裸子串命中——'apply_grammar_bitmask' 不得挂到
          '_apply_grammar_bitmask_kernel'；
+      3.5) 同文件全空后、兜底前：**跨文件精确类名**（同一子系统内，只认类侧词元）
+         ——ch03 在 arg_utils.py 装配 ParallelConfig/SchedulerConfig/
+         CompilationConfig/VllmConfig，站 6–9 的符号就是这些类本身，此前被
+         cands[0] 兜底错挂到 EngineArgs 上；类名全书唯一（每个类一条登记），
+         跨文件匹配不重蹈 ch32 方法名跨文件误配；
+      3.6) **cands[0] 兜底守门**：符号命中**别子系统**真实类时（ch21 站 2 的
+         AsyncIntermediateTensors 属 worker-and-executor），兜底会把站张冠李戴
+         到同文件首个面板类上（此前「第 1–2 站」印到了 Worker.execute_model 的
+         徽标上，exp-2026-08-03 自查抓）——这类站应交由 _rest_bucket 按符号的
+         真实类归桶（「已讲/才讲」）；兜底只许用于符号不是任何已登记类的站
+         （同文件辅助函数/工厂，如 make_async_mp_client）。
       4) **无符号的站，落给它所在文件归属的类**（ch28 第 5–7 站是 MLA 注意力内部实现，
         在 deepseek_v4_attention.py 里却没有符号，若不兜底就成了图上无主的盲区）。
+
+    all_names：全书真实类名词元集（含类侧），用于 3.6 的守门判定；None 时保持
+    旧的 cands[0] 无守门行为（向后兼容）。
     """
     out = {}
     by_file = {}
@@ -168,6 +203,7 @@ def station_of_classes(classes, spine, relations=None):
     for c in classes:
         for n in [x.strip() for x in re.split(r'[/（(]', c['name']) if x.strip()]:
             plain_to_entry.setdefault(n, c['name'])
+    toks = _name_tokens
     for i, u in enumerate(spine, 1):
         sym = u.get('symbol') or ''
         base = sym.split('.')[0] if sym else ''
@@ -201,7 +237,15 @@ def station_of_classes(classes, spine, relations=None):
                             or ('.' in t and base in (t.rsplit('.', 1)[1], t.split('.', 1)[0]))
                             for t in [x.strip() for x in re.split(r'[/（(]', c['name'])
                                       if x.strip()])),
-                       cands[0])
+                       None)
+            if not hit:
+                # 3.5) 跨文件**精确类名**（同子系统内，见函数 docstring）
+                if base:
+                    hit = next((c for c in classes if base in toks(c['name'])), None)
+                # 3.6) cands[0] 兜底守门：符号命中别子系统真实类 → 不兜底，
+                # 交 _rest_bucket 按符号真实类归桶（见函数 docstring）
+                if not hit and not (base and all_names and base in all_names):
+                    hit = cands[0]
         if not hit and u['path'] in by_file and not sym:   # 4) 无符号 → 该文件归属的类
             hit = by_file[u['path']][0]
         if hit:
@@ -611,6 +655,20 @@ def build(model, cid):
         # 的失实此前已修，同一函数）。
         def _rest_bucket(i):
             u = ch['spine'][i - 1]
+            # 符号命中真实类（任何子系统）→ 按该类的子系统/首读章归桶，比按文件
+            # 归桶更准：ch21 站 2 的 AsyncIntermediateTensors（worker-and-executor/
+            # ch17）、ch13 站 7 的 SchedulerOutput（engine-core/ch12）都曾被
+            # cands[0] 兜底挂到同文件面板类上，或按文件归成误导的「本子系统内
+            # 未展开」——读者只知道「这站的主体在第 17/12 章读过」即可。
+            sym = u.get('symbol') or ''
+            base = sym.split('.')[0] if sym else ''
+            if base:
+                rc = next((c for c in model['classes']
+                           if base in _name_tokens(c.get('name') or '')), None)
+                if rc and rc['subsystem'] != cur_sub:
+                    op = _chapter_index(rc['introduced_in'])
+                    return (('past' if op < idx else 'future'),
+                            [subs[rc['subsystem']]['opened_in']])
             subs_here = {c['subsystem'] for c in model['classes'] if c['file'] == u['path']}
             others = {s for s in subs_here if s != cur_sub and s is not None}
             if others:
@@ -656,8 +714,14 @@ def build(model, cid):
             msg = '（另有 ' + '、'.join(parts) + '）'
             text(L, W - M, ly, msg, 9.5, C_MUTE, anchor='end')
 
+    # 「N 个组件已读」= 读者一眼能数的**蓝框**数（exp-2026-08-03 ch32 自查抓）：
+    # 原口径数「opened_in < 本章 的子系统」，把**上一章已首开、本章续讲**的
+    # cur_sub（如 ch32 的 structured-output，首开 ch31）也算进「已读」，但图上它
+    # 整块画橙（本章展开对象、无蓝框）——标题 18 与可见蓝框 17 对不上。排除
+    # cur_sub 后首开章（opened_in==idx 本就不计）不受影响，续章（ch19/32/34/36/38）
+    # 标题与蓝框数一致。
     n_built = len([s for s in model['levels']['L2_subsystems']
-                   if _chapter_index(s['opened_in']) < idx])
+                   if s['id'] != cur_sub and _chapter_index(s['opened_in']) < idx])
     title = (f"你的架构模型读到第 {idx} 章：{n_built} 个组件已读，本章展开「{subs[cur_sub]['name_cn']}」"
              if cur_sub else f"你的架构模型读到第 {idx} 章：全景导览")
     head = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H:.0f}">',

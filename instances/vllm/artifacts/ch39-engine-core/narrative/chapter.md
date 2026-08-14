@@ -2,10 +2,10 @@
 
 ## 39.1 你在这里
 
-![你在这里：全书 21 个组件已读，本章在 EngineCore 大框的「循环本体」里就地展开「引擎核心」——DPEngineCoreProc 与 OpenAIServingResponses 两个容器盒套盒摊开真实组织关系，18 站全部落在展开面板上](../diagrams/arch-model.png)
+![你在这里：全书 20 个组件已读，本章在 EngineCore 大框内就地展开「引擎核心」——DPEngineCoreProc 与 OpenAIServingResponses 两个容器盒套盒摊开真实组织关系，18 站全部落在展开面板上](../diagrams/arch-model.png)
 
-> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子：自上而下依次是入口、输入处理、跨进程的 IPC 边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向；`EngineCore` 框内已按「调度与显存／执行与并行／模型与算子／解码策略」四组装满一路读过来的组件。蓝框是前面章节已读的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
-> *本章在 `EngineCore` 大框的「循环本体」里 **就地展开「引擎核心」** ——摊开的不是概念图，而是源码里真实的组织关系：右侧 `DPEngineCoreProc` 与 `OpenAIServingResponses` 两个容器各自盒套盒（前者嵌着通知枚举 `EEPNotificationType` 与状态机 `ElasticEPScalingState`，后者嵌着 `HarmonyContext` 等与 `construct_input_messages`），左侧平铺不嵌盒的三块（`_construct_input_messages_with_harmony`、`ScaleUpExistingEngineState` 等、`ReconfigureDistributedRequest`）。本章 18 站全部落在这些橙色部件上，状态机 `ElasticEPScalingState` 独占 7 站（3–9），是本章前半的主角。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子：自上而下依次是入口、输入处理、跨进程的 IPC 边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向；`EngineCore` 框内已按「调度与显存／执行与并行／模型与算子／解码策略」四组装满一路读过来的组件。蓝框是前面章节已读的（框里带章号），橙色是本章新长出的一块，虚线框留给后续章节——而到本章为止，全书 20 个组件已全部读完，图里已经找不到虚线框，图例那一格还留在原地。*
+> *本章在 `EngineCore` 大框里 **就地展开「引擎核心」** ——摊开的不是概念图，而是源码里真实的组织关系：右侧 `DPEngineCoreProc`（第 1–2、10 站）与 `OpenAIServingResponses`（第 13、16、18 站）两个容器各自盒套盒——前者嵌着状态机 `ElasticEPScalingState`（第 3–9、12 站），后者嵌着 `HarmonyContext` 等（第 17 站）与 `construct_input_messages`（第 14 站）；左侧平铺不嵌盒的三块，是已读的 `EngineCore`（第 11 站，蓝框）、`_construct_input_messages_with_harmony`（第 15 站）与 `ScaleUpExistingEngineState` 等（无独立站号）。本章 18 站全部落在展开面板上——其中 17 站在橙色新增件上，1 站落在蓝框已读的 `EngineCore` 上；状态机 `ElasticEPScalingState` 独占 8 站（3–9、12），是本章前半的主角。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
 > *这块新结构长在读者已经走过的几块结构上：`DPEngineCoreProc` 正是[第 7 章](../../ch07-engine-core/narrative/chapter.md)那条 IPC 边界另一头、装着 `run_busy_loop` 的引擎核心进程本体，状态机的每一步推进都挂在已读的 busy loop 钩子里；切换时用 `all_reduce(MAX)` 对齐的，是[第 21 章](../../ch21-async-engine/narrative/chapter.md)的 DP wave 节律；`OpenAIServingResponses` 则把[第 15 章](../../ch15-kv-cache/narrative/chapter.md)的前缀缓存复用，推到了它价值最大的场景。*
 
 > 上一章我们把 OpenAI 兼容服务器接到了异步引擎上，请求的一生就此走通。
@@ -95,6 +95,8 @@ class ScaleDownRemovingEngineState(enum.IntEnum):
 | **本来就在的引擎** | `ScaleUpExistingEngineState`（9 态） | `ScaleDownRemainingEngineState`（余留，4 态） |
 | **本次变动的引擎** | `ScaleUpNewEngineState`（新引擎，4 态） | `ScaleDownRemovingEngineState`（被裁，3 态） |
 
+（架构模型图上，我们正走进「引擎核心」面板——这四个枚举就是右列 `ElasticEPScalingState` 盒里的内容，盒上标着第 3–9 站。）
+
 为什么扩入的存在引擎要 9 个状态，减引擎的余留引擎只要 4 个？因为**扩入要和一台正在初始化的新引擎跨进程握手**——存在引擎得停下来等新引擎"我权重收好了"，握手点多，状态自然多。而减引擎的余留引擎不用等任何外部的人，一气呵成就行。后面 §39.7 会看到这种"紧凑"。
 
 状态用 `IntEnum`（带数值序）不是随意的——它天然表达"单调推进"：状态值只增不减，到 `COMPLETE` 为止。这正是我们证明状态机会终止的抓手（§39.6）。
@@ -155,7 +157,7 @@ def run_busy_loop(self):
 - `is_complete()` 为真且角色是 `"removing"`（被裁引擎）→ 直接 `raise SystemExit`，进程干净退出。
 - 否则（存在/新/余留引擎）→ 把 `process_input_queue_block` 设回 `True`、清空 `eep_scaling_state`。注意这个标志：扩缩期间它是 `False`，意思是"输入队列别阻塞地等，poll 一下就走"，好让 busy loop 能高频转起来推进状态机；扩缩结束又调回 `True`，恢复平时"没活就阻塞着省 CPU"的常态。
 
-那 `eep_scaling_state` 是谁挂上去的？两条触发路径，下面分别看。（架构模型图上，它就是左侧平铺的那块 `ReconfigureDistributedRequest`——不带独立站号，站号都标在右侧接收它的 `DPEngineCoreProc` 盒上。）
+那 `eep_scaling_state` 是谁挂上去的？两条触发路径，下面分别看。（架构模型图上，这两条触发路径都落在右侧 `DPEngineCoreProc` 盒上——它标着第 1–2、10 站；`ReconfigureDistributedRequest` 指令本身没在图上占一块，它是经 `EngineCoreClient` 从外面跨进程递进来的。）
 
 ---
 
@@ -612,7 +614,7 @@ def _progress_new_engine(self) -> bool:
 
 `PRE_KV_INIT` 这一步串起三件事：发 `WEIGHTS_INIT_READY` 通知（叫醒存在引擎的第二个 WAIT 态）→ 收权重 → **`sync_kv_cache_memory_size` 从全组拿统一额度写进 `available_gpu_memory_for_kv_cache`**。最后这步正是上面那个 `assert > 0` 所依赖的源头。
 
-`PREPARE` 那一步则是另一个和 DP wave 的接缝：用 `all_reduce(MAX)` 从全 DP 组拉来 `[engines_running, current_wave, step_counter]`，新引擎采纳全组最大的 wave 状态，无缝并入第 21 章的 wave 节律。和 §39.6 的 `_switch_and_prepare` 是同一个 MAX 不变量，只是一个发生在新引擎入组前的对齐，一个发生在存在引擎切组时的对齐——两端都用 MAX 收敛到同一个 wave，是把 wave 协议延展到"成员数会变"的关键。
+`PREPARE` 那一步则是另一个和 DP wave 的接缝：用 `all_reduce(MAX)` 从全 DP 组拉来 `[engines_running, current_wave, step_counter]`，新引擎采纳全组最大的 wave 状态，无缝并入[第 21 章](../../ch21-async-engine/narrative/chapter.md)的 wave 节律。和 §39.6 的 `_switch_and_prepare` 是同一个 MAX 不变量，只是一个发生在新引擎入组前的对齐，一个发生在存在引擎切组时的对齐——两端都用 MAX 收敛到同一个 wave，是把 wave 协议延展到"成员数会变"的关键。
 
 ---
 

@@ -2,11 +2,12 @@
 
 ## 你在这里
 
-![你在这里：全书架构模型已读 7 个组件，本章在 EngineCore 调度器里展开抢占循环与请求生命周期回流——双队列、状态回退、资源释放的完整闭环](../diagrams/arch-model.png)
+![你在这里：全书架构模型已读 6 个组件，本章在 EngineCore「调度与显存」组里就地展开「调度器」子系统——抢占循环、双队列、生命周期回流与状态机](../diagrams/arch-model.png)
 
-> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向；当年 `EngineCore` 框里只画了调度器与分页 KV 缓存，如今已按「调度与显存／执行与并行／模型与算子／解码策略」四组装满一路读过来的组件。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章焦点——就在调度器这个已读的蓝色盒子内部，展开它的抢占与回流机制。*
-> *本章的焦点接在[第 13 章](../../ch13-scheduler/narrative/chapter.md)那个调度器主循环上：上一章讲了 `schedule()` 怎么跨 RUNNING/WAITING 两阶段递减 token 预算、连续批处理不分相，但在两处踩了刹车——RUNNING 阶段 `allocate_slots` 失败进抢占循环时只说「会抢占」没展开，`update_from_output()` 反馈环只说「追加 token、判 stop、释放」没钻进去。本章就是把这两个被刹住的分支补完：抢占循环怎么 LIFO 回收显存、被抢请求怎么回流到等待队列、双队列怎么防队头阻塞、生命周期怎么从运行态迁移到完成态并释放资源。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
-> *下一章 [第 15 章：分页 KV 缓存](../../ch15-kv-cache/narrative/chapter.md) 接着讲调度器背后的分页 KV 缓存——块池怎么分配、前缀缓存怎么命中。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向；当年 `EngineCore` 框里只画了调度器与分页 KV 缓存，如今已按「调度与显存／执行与并行／模型与算子／解码策略」四组装满一路读过来的组件。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
+> *本章新长的这块在「调度与显存」组里就地展开——摊开的不是一张概念图，而是源码里真实的组织关系：面板里躺着 `Scheduler`（第 1–12、14–15 站）、`RequestStatus`（第 16 站）、`AsyncScheduler`（第 17 站）三个类，旁边是 `RequestQueue` 这个契约容器，装着 `FCFSRequestQueue` / `PriorityRequestQueue` 两个并排实现；本章 17 站，其中 16 站落在这些组件上，另有 1 站（`check_stop` 停止判定）落在本子系统内、未展开成组件的文件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *它接在哪几块已经读过的结构上？面板正上方就是「循环本体」里的引擎核心蓝框——[第 11 章](../../ch11-engine-core/narrative/chapter.md)读过的 `EngineCore` 内循环每拍都要从这里调进调度器，[第 13 章](../../ch13-scheduler/narrative/chapter.md)读过的 `schedule()` 主干正是它的第一段；而面板头顶紧挨着的虚线框「分页 KV 缓存」（第 15 章才讲）就是它每拍要块的地方，§14.1 第一段代码就会撞上这条依赖。*
+> *内容上，[第 13 章](../../ch13-scheduler/narrative/chapter.md) 在 `allocate_slots` 失败处踩下的刹车在这里松开：抢占循环怎么 LIFO 回收显存、被抢请求怎么回流到等待队列队头、双队列怎么防队头阻塞、生命周期怎么从运行态迁移到完成态并释放资源。下一章 [第 15 章：分页 KV 缓存](../../ch15-kv-cache/narrative/chapter.md) 钻进块池与前缀缓存，把本章每拍都在调用的 `kv_cache_manager` 拆开。*
 
 [第 13 章](../../ch13-scheduler/narrative/chapter.md) 立下的事是：调度器每一拍干两件事。先扫 `running` 队列，让每个在跑的请求继续往前算几个 token；再扫 `waiting` 队列，把新请求拉进来。两阶段共用一个 `token_budget`，谁先用谁先得。
 
@@ -32,7 +33,7 @@
 
 ## 14.1 要不到块：抢占循环
 
-先把场景摆清楚。RUNNING 阶段，调度器遍历 `self.running`，轮到某个请求 `request`，它这一拍要算 `num_new_tokens` 个 token。算之前得先有地方放这些 token 的 KV——现在从调度器主循环走到它依赖的**分页 KV 缓存管理器**（架构模型图里「调度与显存」组的另一块），向 `kv_cache_manager` 要块：
+现在走到 `EngineCore` 逐拍循环 `schedule → execute_model → update` 的第一段 `schedule`——[第 11 章](../../ch11-engine-core/narrative/chapter.md)读过的引擎核心（架构模型图「循环本体」里的蓝框）每拍都要从这里调进调度器。先把场景摆清楚。RUNNING 阶段，调度器遍历 `self.running`，轮到某个请求 `request`，它这一拍要算 `num_new_tokens` 个 token。算之前得先有地方放这些 token 的 KV——现在从调度器主循环走到它依赖的**分页 KV 缓存管理器**（架构模型图里「调度与显存」组的另一块），向 `kv_cache_manager` 要块：
 
 ```python
 # vllm/v1/core/sched/scheduler.py:L422

@@ -2,10 +2,10 @@
 
 ## 你在这里
 
-![你在这里：全书架构模型已读 8 个组件，本章在 EngineCore 的「执行与并行」组里展开新的一块——Worker 与执行器：左侧一个 Worker 盒，右侧三组盒套盒（UniProcExecutor ⊃ WorkerWrapperBase ⊃ WorkerBase，MultiprocExecutor ⊃ FutureWrapper 等，WorkerProc ⊃ UnreadyWorkerProcHandle 等）](../diagrams/arch-model.png)
+![你在这里：全书架构模型已读 8 个组件，本章在 EngineCore 的「执行与并行」组里就地展开新的一块——Worker 与执行器：左侧平铺 Executor（站 1–4）、Worker（站 16–18）与 AsyncIntermediateTensors；右侧盒套盒是源码里的真实持有关系——MultiprocExecutor ⊃ FutureWrapper 等句柄，WorkerProc ⊃ WorkerWrapperBase ⊃ WorkerBase](../diagrams/arch-model.png)
 
-> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理；当年 `EngineCore` 框里只画了调度器与 KV 缓存，如今已按「调度与显存／执行与并行／模型与算子／解码策略」四组装满一路读过来的组件。蓝框是前面章节已读的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
-> *本章新长的这块——Worker 与执行器——嵌在 EngineCore 大框内的「执行与并行」组：大框顶上是已读的逐拍循环（[第 11 章](../../ch11-engine-core/narrative/chapter.md)），上方「调度与显存」组是调度器（[第 13 章](../../ch13-scheduler/narrative/chapter.md)）与分页 KV 缓存（[第 15 章](../../ch15-kv-cache/narrative/chapter.md)）——本章 `execute_model(scheduler_output)` 接的正是它俩拍下来的工单；往下，是留给模型前向与解码策略的虚线区。这块不是凭空长出来的：站 1–4（工厂 `get_class`、基类构造、`collective_rpc`、`execute_model`，全在 `Executor` 基类上）落在第 03 章已读的组件上——[第 3 章](../../ch03-config-and-wiring/narrative/chapter.md) 读执行器工厂时已经打过照面，本章从这条已读的线上把两个子类就地展开。橙色区里，左侧是一个 `Worker` 盒（站 16–18）；右侧三组盒套盒，把源码里真实的持有关系直接画了出来：`UniProcExecutor`（站 5）⊃ `WorkerWrapperBase`（站 14）⊃ `WorkerBase`（站 15），`MultiprocExecutor` ⊃ `FutureWrapper`（站 8）与 `UnreadyWorkerProcHandle`（未就绪 worker 的进程句柄）等（站 6–7、9、13），`WorkerProc` ⊃ 同样的句柄与包装（站 10–12）。本章共 18 站，14 站标在这些橙色部件上，4 站落在第 03 章已读的组件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理；当年 `EngineCore` 框里只画了调度器与 KV 缓存，如今已按「循环本体／调度与显存／执行与并行／模型与算子／解码策略」五组装满一路读过来的组件。蓝框是前面章节已读的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
+> *本章新长的这块——Worker 与执行器——嵌在 EngineCore 大框内的「执行与并行」组。最值得先看的是它接在哪几块已经读过的结构上：头顶「循环本体」组的引擎核心（[第 11 章](../../ch11-engine-core/narrative/chapter.md) 已读）就是逐拍调 `execute_model(scheduler_output)` 的拍主；再往上，「调度与显存」组的调度器（[第 13 章](../../ch13-scheduler/narrative/chapter.md)）与分页 KV 缓存（[第 15 章](../../ch15-kv-cache/narrative/chapter.md)）拍出来的正是这张工单；站 1 的 `Executor.get_class` 工厂，[第 3 章](../../ch03-config-and-wiring/narrative/chapter.md) 读配置装配时已经打过照面。面板把源码里的真实组织关系直接画了出来：左侧平铺 `Executor`（站 1–4）、`Worker`（站 16–18）与 `AsyncIntermediateTensors`（worker 间传递前向结果的中间张量容器）；右侧盒套盒——`MultiprocExecutor`（站 6–7、9、13）⊃ `FutureWrapper`（站 8）与 `UnreadyWorkerProcHandle`（未就绪 worker 的进程句柄）等，`WorkerProc`（站 10–12）⊃ 同样的句柄与 `WorkerWrapperBase`（站 14）⊃ `WorkerBase`（站 15）。本章共 18 站，17 站标在这些橙色部件上；另 1 站（站 5，单进程对照 `UniProcExecutor`）按归属落在[第 11 章](../../ch11-engine-core/narrative/chapter.md)已读的引擎核心组件上，图底那行小字就是它。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
 > *[第 16 章](../../ch16-kv-cache/narrative/chapter.md) 把 KV 块分配与多注意力协调讲清了——工单 `SchedulerOutput` 已经攥在手里。*
 > *本章解决「这张工单怎么可靠地送达 N 个 worker、结果怎么收回来」；下一章推开 worker 的门，看模型前向的内部——持久 batch 与 `_prepare_inputs`。*
 
@@ -181,7 +181,7 @@ def execute_model(
 
 ## 17.4 最简对照：UniProcExecutor
 
-单卡情形没有子进程。worker 就活在引擎进程里，叫 `driver_worker`：
+现在从 `Executor` 基类契约（站 1–4）走到退化基线 `UniProcExecutor`（站 5）——这也是图上唯一没进橙色面板的一站：按归属落在[第 11 章](../../ch11-engine-core/narrative/chapter.md)已读的引擎核心组件上。单卡情形没有子进程。worker 就活在引擎进程里，叫 `driver_worker`：
 
 ```python
 # vllm/v1/executor/uniproc_executor.py:L45
@@ -247,7 +247,7 @@ def collective_rpc(
 
 ## 17.5 MultiprocExecutor：把 N 个 worker 拉起来
 
-UniProcExecutor 是控制平面的退化基线——本章橙色块的第一站（站 5）：这个类在 [第 3 章](../../ch03-config-and-wiring/narrative/chapter.md) 读执行器工厂 `Executor.get_class` 时已经照过面，本章从它开始往深处走。现在走到橙色区右侧的 MultiprocExecutor 盒——站 6（`_init_executor`）到站 9（`start_worker_monitor`），广播队列、子进程拉起、FutureWrapper 配对、sentinel 监控，全在这一块。
+UniProcExecutor 是控制平面的退化基线（站 5）：这个类在 [第 3 章](../../ch03-config-and-wiring/narrative/chapter.md) 读执行器工厂 `Executor.get_class` 时已经照过面，本章从它开始往深处走。现在走到橙色区右侧的 MultiprocExecutor 盒——站 6（`_init_executor`）、站 7（`collective_rpc`）、站 9（`start_worker_monitor`）标在盒上，站 8 的 `FutureWrapper` 嵌在盒里；广播队列、子进程拉起、FutureWrapper 配对、sentinel 监控，全在这一块。
 
 `_init_executor` 是整个多进程拓扑的**诞生现场**。它干三件事：建一条广播队列、逐 rank 拉起子进程、等所有 worker 就绪。
 

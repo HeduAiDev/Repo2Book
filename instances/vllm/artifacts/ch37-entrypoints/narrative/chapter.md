@@ -2,10 +2,10 @@
 
 ## 你在这里
 
-![你在这里：全书架构模型读到第 37 章（20 个组件已读），本章在「入口」层就地展开离线门面——LLM 与 EngineCoreClient (make_client 工厂) 两块橙色部件按功能并列，18 站走线：generate/chat/embed/encode 四入口汇流，经 SyncMPClient 硬分叉跨 IPC 边界接入后台 EngineCore，由 while step() 同步拉到底](../diagrams/arch-model.png)
+![你在这里：全书架构模型读到第 37 章（20 个组件已读），本章在「入口」层就地展开离线门面——LLM、LLMEngine、EngineCoreClient (make_client 工厂) 三块橙色部件按功能并列，18 站全部落在其上：generate/chat/embed/encode 四入口汇流，经 SyncMPClient 硬分叉跨 IPC 边界接入后台 EngineCore，由 while step() 同步拉到底](../diagrams/arch-model.png)
 
 > *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线自上而下：入口→输入处理→IPC（进程间通信）边界→EngineCore 大框（schedule→execute_model→update 逐拍循环）→输出处理，行间箭头还是请求的流向。蓝框是前面章节已读的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
-> *本章新块在「入口」层里就地展开——面板标题自己写明了「这几块彼此独立，按功能并列」：一块是 `LLM` 门面（第 1–2、8–15、17 站，`generate`/`chat`/`embed`/`encode` 四个公开方法与 `_run_engine` 驱动脊都在这块里），另一块是 `EngineCoreClient (make_client 工厂)`（第 5–7 站，离线默认 `SyncMPClient` 与进程内回退 `InprocClient` 的硬分叉就发生在这三站里）。全章 18 站，14 站落在这两块橙色部件上，另有 4 站落在同层蓝框「配置与装配」里的 `LLMEngine` 上——那是[第 3 章](../../ch03-config-and-wiring/narrative/chapter.md)已读的组件，图最下面一行注记点的就是它。这块新结构长在读者已经读过的结构上：`LLM` 门面站在 `LLMEngine` 的肩膀上（构造期那一行 `self.llm_engine = LLMEngine.from_engine_args(...)` 就是接缝），请求再从入口层出发，跨过「IPC 边界」带（[第 7 章](../../ch07-engine-core/narrative/chapter.md)已读）钻进 EngineCore 大框。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读。跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *本章新块在「入口」层里就地展开——面板标题自己写明了「这几块彼此独立，按功能并列」：一块是 `LLM` 门面（第 1–2、8–15、17 站，`generate`/`chat`/`embed`/`encode` 四个公开方法与 `_run_engine` 驱动脊都在这块里），一块是 `LLMEngine`（第 3–4、16、18 站，构造期的 `from_engine_args` 与请求期的 `add_request`/`step` 都在这里），再一块是 `EngineCoreClient (make_client 工厂)`（第 5–7 站，离线默认 `SyncMPClient` 与进程内回退 `InprocClient` 的硬分叉就发生在这三站里）。全章 18 站全部落在这三块橙色部件上：LLM 门面 11 站、LLMEngine 4 站、EngineCoreClient 3 站。这块新结构长在读者已经读过的结构上：`LLMEngine` 从同层蓝框「配置与装配」（[第 3 章](../../ch03-config-and-wiring/narrative/chapter.md)已读，`EngineArgs` 的拼装地）手里接过参数——构造期那一行 `self.llm_engine = LLMEngine.from_engine_args(...)` 就是接缝；请求再从入口层出发，经[第 5 章：输入处理](../../ch05-input-processing/narrative/chapter.md)归一成 token 序列，跨过「IPC 边界」带（[第 7 章](../../ch07-engine-core/narrative/chapter.md)已读）钻进 EngineCore 大框，`while step()` 逐拍拉动的正是[第 11 章：引擎核心](../../ch11-engine-core/narrative/chapter.md)里那圈 schedule→execute_model→update 循环。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读。跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
 > *上一章合上了 PD 分离那条分布式线；从这里起视野收回到单机入口。[第 4 章：异步入口](../../ch04-async-llm/narrative/chapter.md)的 `AsyncLLM` 已读——与本条离线脊共享同一套后台 EngineCore，分岔只在主进程侧的驱动方式。下一章把这条离线脊和在线 OpenAI server 并到一起看。*
 
 写过 vLLM 离线推理的人，第一行代码几乎都长这样：

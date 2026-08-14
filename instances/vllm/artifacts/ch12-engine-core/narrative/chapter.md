@@ -2,10 +2,11 @@
 
 ## 你在这里
 
-![你在这里：全书架构模型在「引擎核心」子系统展开 6 个组件，本章橙色块是 step_with_batch_queue 及其批队列机制](../diagrams/arch-model.png)
+![你在这里：全书架构模型已读 6 个组件，本章在「引擎核心」组就地展开——step_with_batch_queue 的批队列机制，第 5–6 站落在方法本体上](../diagrams/arch-model.png)
 
 > *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、Stage 1 输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 EngineCore 大框、Stage 3 输出处理，行间箭头还是请求的流向。三色是全书通用约定：蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的结构。*
-> *本章新长的这块在 EngineCore 大框最上层的「引擎核心」组里就地展开，摊开的不是一列类名，而是源码里真实的并列关系——这几块彼此独立、按功能排开：`EngineCore.step_with_batch_queue` 是本章要拆到底的方法，`EngineCore.batch_queue` 与 `batch_queue_size` 是它赖以工作的队列本体和深度，`Executor.max_concurrent_batches` 是那个深度的唯一来源，`SchedulerOutput.has_structured_output_requests` 一族标志与 `Scheduler.get_grammar_bitmask` 则是它与结构化输出交界处那条支线。**最该记住的是这堆橙色接在哪**：图上同一个展开框里唯一的蓝块，是[第 11 章](../../ch11-engine-core/narrative/chapter.md)已经读过的引擎子进程外壳（忙循环每拍调一次 `self.step_fn()` 的那层壳）——本章第 1 站和第 9 站正落在它身上，一头是它把这一拍交给谁，一头是这一拍的输出交回给它；再往外，队列深度那条链要一路问到[第 3 章](../../ch03-config-and-wiring/narrative/chapter.md)装配好的执行器配置，而灌进这个大框的请求仍是从[第 7 章](../../ch07-engine-core/narrative/chapter.md)那条 IPC 边界进来的。本章共 9 站，6 站落在上面这些橙色部件上，另有 3 站落在其他章已讲的组件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *本章新长的这块在 EngineCore 大框最上层的「引擎核心」组里就地展开，摊开的不是一列类名，而是源码里真实的并列关系——10 个组件按功能平铺，其中 5 个直接承载本章走线。**最该记住的是这堆橙块接在哪**：面板里两块蓝框同属第 11 章已立的引擎核心壳——`EngineCore`（忙循环每拍调一次 `self.step_fn()` 的那层壳）与它名下的 `step_with_batch_queue`（第 11 章立 `step_fn` 静态绑定开关时指名的那个方法，本章把它拆开）。本章第 1、9 站正落在壳上：一头是忙循环把这一拍交给 `step_fn`，一头是收口后经 `has_work()` 让壳知道队列里还有在飞批、不能停；第 5–6 站落在方法本体上，是本章主线。环绕它们的橙块是本章新长的：`UniProcExecutor`（第 3 站，单卡执行器）、`SchedulerOutput`（第 7 站，出队对账的调度清单）、`Scheduler.get_grammar_bitmask`（第 8 站，结构化输出支线），外加两个未标站点的橙块——`Executor.max_concurrent_batches`（队列深度的来源）与 `SchedulerOutput.has_structured_output_requests` 一族标志。再往外，队列深度那条链要一路问到[第 3 章](../../ch03-config-and-wiring/narrative/chapter.md)装配好的执行器配置，而灌进这个大框的请求仍是从[第 7 章](../../ch07-engine-core/narrative/chapter.md)那条 IPC 边界进来的。本章 9 站，其中 7 站落在上面这 5 块组件上；另 2 站（`MultiprocExecutor`、`Executor` 基类默认值）落在第 17 章才讲的执行与并行组件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *上一章把 `step` 讲透、立下 `step_fn` 的绑定开关；本章拆的是开关另一头的 `step_with_batch_queue`——把「发批」和「取结果」解耦，中间垫一个深度由执行器决定的队列。队列里那份 `SchedulerOutput` 清单出自 `schedule()`——调度器怎么排每一拍，是[第 13 章](../../ch13-scheduler/narrative/chapter.md)的主场。*
 
 [第 11 章](../../ch11-engine-core/narrative/chapter.md) 立下的事是：`EngineCore` 每一拍调 `self.step_fn()`，而这个 `step_fn` 在 `vllm/v1/engine/core.py` 的 `__init__` 时就**静态绑定**好了——绑 `step` 还是绑 `step_with_batch_queue`，取决于一个开关。那一章把 `step` 讲透了：一次迭代里 `schedule → execute_model(non_block) → 算掩码 → 等前向 → 采样 → 收口`，最精巧的一手是让 CPU 算掩码和 GPU 跑前向重叠。
 
@@ -154,7 +155,7 @@ with ThreadPoolExecutor() as pool:
 
 ### max_concurrent_batches：那条间接链
 
-`EngineCore` 自己**不看** `async_scheduling` 来选 step——它只看 `batch_queue` 是不是 `None`。那 `async_scheduling` 又怎么参与决策的？答案藏在 `max_concurrent_batches` 里。这个属性在每种执行器上有不同定义，正是它把「PP size」和「async_scheduling」两个看似无关的开关，统一翻译成一个数字。**这条配置链现在要向上游回溯了**——从引擎核心这里，一路问到[第 3 章](../../ch03-config-and-wiring/narrative/chapter.md)装配好的执行器。
+`EngineCore` 自己**不看** `async_scheduling` 来选 step——它只看 `batch_queue` 是不是 `None`。那 `async_scheduling` 又怎么参与决策的？答案藏在 `max_concurrent_batches` 里。这个属性在每种执行器上有不同定义，正是它把「PP size」和「async_scheduling」两个看似无关的开关，统一翻译成一个数字。**这条配置链现在要向上游回溯了**——从引擎核心这里，一路问到[第 3 章](../../ch03-config-and-wiring/narrative/chapter.md)装配好的执行器。 **现在走到哪一段：** 图上的走线此刻从引擎核心组（蓝框 `EngineCore`，第 1 站）跨到执行与并行组——`MultiprocExecutor`（多进程执行器，多卡部署走它）与 `Executor` 基类占着另 2 站、以虚线预告第 17 章才讲；第 3 站的 `UniProcExecutor` 则是本章橙块。正文按讲解从基类默认值读起，不必照站号顺序走。
 
 基类默认最保守：
 
@@ -207,7 +208,7 @@ assert MultiprocExecutor(_ParallelConfig(pipeline_parallel_size=1),
 
 那为什么单卡 `async_scheduling` 只要深度 2、不是 P？因为这里没有 P 级流水线要填。深度 2 是为了重叠**另外两段**：CPU 端的 `schedule()` 和 GPU 端的 `execute_model()`。批 i 在 GPU 上跑前向时，让批 i+1 在 CPU 上做调度——两段流水化，把调度开销藏进 GPU 计算时间里。深度 2 就够形成这种「双缓冲」。所以同一个 `step_with_batch_queue`，对 PP 是「填满 P 级硬件流水线」，对单卡 `async_scheduling` 是「重叠 CPU 调度与 GPU 执行」——一套机制，两种受益。
 
-绑定讲完了。下面进入方法本体，先看上半段——它怎么「填管道」。
+绑定讲完了。 **现在走到哪一段：** 第 1 站在蓝框 `EngineCore` 外壳上交棒，第 5–6 站走进面板里标着「第 5–6 站」的方法本体。先看上半段——它怎么「填管道」。
 
 ---
 
@@ -319,7 +320,7 @@ else:
         deferred_scheduler_output = scheduler_output
 ```
 
-**这里碰到结构化输出的边界了**——`pending_structured_output_tokens` 和 `get_grammar_bitmask` 这条支线，是本章与[第 31 章](../../ch31-structured-output/narrative/chapter.md) / [第 32 章](../../ch32-structured-output/narrative/chapter.md)约束解码子系统的唯一接口。这里决定 `future` 是什么：
+**这里碰到结构化输出的边界了**——`pending_structured_output_tokens` 和 `get_grammar_bitmask` 这条支线，是本章与[第 31 章](../../ch31-structured-output/narrative/chapter.md) / [第 32 章](../../ch32-structured-output/narrative/chapter.md)约束解码子系统的唯一接口。（图上第 8 站标在面板的 `Scheduler.get_grammar_bitmask` 橙块上；调度器类本体仍挂在第 13 章才讲的虚线框里。）这里决定 `future` 是什么：
 
 - 没真调度到 token（`not model_executed`，pooling/embedding 模型的快路也并在这支）：无需采样，`exec_future` 直接当最终 `future`。
 - 调度到了，且**不缺**算掩码所需的 token（`not pending_structured_output_tokens`）：算 `grammar_output`、`sample_tokens(non_block=True)` 立即非阻塞采样，拿到 `future`。这是绝大多数批走的路。
@@ -482,7 +483,7 @@ assert collected == [1, 2]                       # 先调度的批先收口
 
 把这件事写成一句归纳骨架就是：**基例**——方法第一次被调用时 `len(batch_queue) == 0 < size`；**归纳步**——假设某拍进入时 `len < size`，这一拍至多 `appendleft` 一次（`+1`），且只有在 `appendleft` 前 `len < size`（即填后 `len ≤ size`）的前提下才执行，凡填到 `len == size` 就不再走 `return`、必落到下半段 `pop`（`−1`）。两个方向都被夹住，于是「进入方法时 `len < size`」这个不变量逐拍保持，`len(batch_queue)` 这个非负整数被牢牢锁在 `[0, size]` 内——上半段开头那个 `assert len(batch_queue) < self.batch_queue_size` 永不触发。
 
-最后看一眼队列对忙循环的影响。[第 11 章](../../ch11-engine-core/narrative/chapter.md) 提过 `has_work()`：
+最后看一眼队列对忙循环的影响。[第 11 章](../../ch11-engine-core/narrative/chapter.md) 提过 `has_work()`——图上第 9 站标在它身上：
 
 ```python
 # vllm/v1/engine/core.py:L1156
@@ -518,7 +519,7 @@ else:
     deferred_scheduler_output = scheduler_output
 ```
 
-`pending_structured_output_tokens` 这个标志（和它的同伴 `has_structured_output_requests`）定义在 `SchedulerOutput` 上，注释点明了它们只在异步调度下置位：
+`pending_structured_output_tokens` 这个标志（和它的同伴 `has_structured_output_requests`）定义在 `SchedulerOutput` 上——就是图上标着第 7 站的那块橙块。注释点明了它们只在异步调度下置位：
 
 ```python
 # vllm/v1/core/sched/output.py:L221

@@ -6,11 +6,11 @@
 
 ## 你在这里
 
-![你在这里：全书架构模型已读 16 个组件，本章在 EngineCore「模型与算子」组里就地展开——DeepSeek-V4 三层盒套盒模块树，共 12 站走线](../diagrams/arch-model.png)
+![你在这里：全书架构模型已读 15 个组件，本章在 EngineCore「模型与算子」组里就地展开——DeepSeek-V4 三层盒套盒模块树，本章 12 站中 11 站落在这些组件上](../diagrams/arch-model.png)
 
-> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 EngineCore 大框、输出处理。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。至今 16 个组件已读，按「调度与显存／执行与并行／模型与算子／解码策略」四组填进 EngineCore。*
-> *本章在「模型与算子」组里就地展开——DeepseekV4ForCausalLM ⊃ DeepseekV4Model ⊃ DeepseekV4DecoderLayer（× num_hidden_layers）⊃ {DeepseekV4Attention, DeepseekV4MoE}，三层盒套盒，外加 hc_pre / hc_head / make_layers 三个平铺的辅助函数。本章走线共 12 站——11 站落在这片橙色展开区，1 站落在[第 22 章](../../ch22-model-definitions/narrative/chapter.md)读过的 LlamaDecoderLayer 基线对照上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
-> *这片橙色新结构不是孤立长出来的——左边接着[第 22 章](../../ch22-model-definitions/narrative/chapter.md)的 LlamaDecoderLayer（用它当 P1/P2 的验证场），上边接着[第 28 章](../../ch28-model-architecture/narrative/chapter.md)逐行读完的 DeepSeek-V4 源码，下边另有一张椅子留给[第 23 章](../../ch23-custom-ops-and-compilation/narrative/chapter.md)读过的 torch.ops 自定义算子——本章 P3 的三条着色判据，每一条都能指回前面某一章已经走过的路。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 EngineCore 大框、输出处理。蓝框是前面章节已经读过的（框里带章号），橙色是本章新长出的一块，虚线框是后续章节才讲的——入口层（第 37 章）、P/D 分离（第 35 章）、解码策略那三个（采样／结构化输出／投机解码，第 30/31/33 章）都还虚着。至今 15 个组件已读，读过的按「调度与显存／执行与并行／模型与算子」三组填进 EngineCore。*
+> *本章在「模型与算子」组里就地展开——右列三层盒套盒：DeepseekV4ForCausalLM（第 1–2 站）⊃ DeepseekV4Model（第 3–4 站）⊃ DeepseekV4DecoderLayer（第 5–6 站）⊃ {DeepseekV4Attention（第 8 站）、DeepseekV4MoE（第 9–10 站）}，Model 盒内另挂 hc_head（第 11 站）与 make_layers 两片叶子；左列蓝框是 hc_pre 等（第 7 站）。本章走线共 12 站，其中 11 站落在这些组件上；底注那句「另有 1 站落在第 22 章已讲的组件上」指 LlamaDecoderLayer 基线（§29.2 就在那儿跑的）。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *这块新结构不是孤立长出来的，接它的每一头读者都读过：四枚蓝叶（hc_pre 等、DeepseekV4Attention、DeepseekV4MoE、hc_head）正是[第 28 章](../../ch28-model-architecture/narrative/chapter.md)逐行读过的 V4 组件，本章给它们套上三层盒套盒的骨架（连 `make_layers` 这只橙叶，也是 `DeepseekV4Model.__init__` 里 `make_layers(...)` 那行读出来的）；第 12 站回指[第 22 章](../../ch22-model-definitions/narrative/chapter.md)立下的 Llama 模型基线；引擎侧的直接上游是「执行与并行」组里的 ModelRunner（第 18 章已读）——逐拍循环每次 `execute_model` 落进模型，走的就是这块区域；P3 的着色判据也各回指一章：torch.ops 自定义算子（[第 23 章](../../ch23-custom-ops-and-compilation/narrative/chapter.md)）、@torch.compile 编译区、并行类名（[第 20 章](../../ch20-distributed-parallelism/narrative/chapter.md)）。*
 > *上一章逐行读完了 V4 的源码本体；本章不追加新算法知识，而是把那次逐行阅读的路径抽成一套可迁移的四步程序。下一章进入 EngineCore 第四条腿「解码策略」的第一站——[第 30 章：采样](../../ch30-sampling/narrative/chapter.md)。*
 
 ## 这章要做什么
@@ -128,11 +128,11 @@ vLLM 的每个模型都是一个标准的 PyTorch `nn.Module`。`nn.Module` 有�
 
 > *图注：左边是 `__init__` 的四条 `self.X` 赋值，虚线连到中间的四个模块树框（模块树表达「拥有」，是静态的）。右边是 `forward` 读出的数据流链，外加那条 add-norm 残差回边（数据流表达「调用」，是动态的）。同一个框，在模块树里讲「谁拥有它」，在数据流里讲「什么时候调它」——`forward` 决定调用次序。底下那句话是本章的赌注：同样四步，DeepSeek-V4 只是框更多、判据不变。*
 
-到这里，四步程序里的 P1、P2 已经在一个真实模型上跑通了。它没用到任何 DeepSeek-V4 特有的东西——`self.X =` 数框、`forward` 连边，对所有 `nn.Module` 都成立。接下来上 DeepSeek-V4，你会看到完全相同的两步，只是要数的框更多、要连的边更绕。在架构模型图上，这趟 Llama 基线之旅落在「模型与算子」组里 ch22 的蓝框——12 站它只占一站，使命是验证四步程序不挑模型。现在往前，同一套程序跑在图上那片橙色展开区。
+到这里，四步程序里的 P1、P2 已经在一个真实模型上跑通了。它没用到任何 DeepSeek-V4 特有的东西——`self.X =` 数框、`forward` 连边，对所有 `nn.Module` 都成立。接下来上 DeepSeek-V4，你会看到完全相同的两步，只是要数的框更多、要连的边更绕。在架构模型图上，这趟 Llama 基线之旅就是底注那句「另有 1 站落在第 22 章已讲的组件上」——第 12 站落在[第 22 章](../../ch22-model-definitions/narrative/chapter.md)「模型定义层」蓝框（`LlamaDecoderLayer` 归属的子系统）上：12 站它只占一站，使命是验证四步程序不挑模型。现在往前，同一套程序跑在图上那片橙色新增结构上。
 
 ## 29.3 P1 实战：从 `__init__` 读出 DeepSeek-V4 的模块树
 
-画一个完整模型的图，从哪个类开始读？答案永远一样：**从 `*ForCausalLM` 的 `__init__` 开读。** 它是整个模型对外的入口类，图最外层那几个框就在它的 `__init__` 里。
+画一个完整模型的图，从哪个类开始读？答案永远一样：**从 `*ForCausalLM` 的 `__init__` 开读。** 它是整个模型对外的入口类（架构模型图上第 1–2 站那只最外层的橙盒），图最外层那几个框就在它的 `__init__` 里。
 
 看 `vllm/model_executor/models/deepseek_v4.py:L1627-L1659` 的 `DeepseekV4ForCausalLM`：
 
@@ -167,7 +167,7 @@ vLLM 的每个模型都是一个标准的 PyTorch `nn.Module`。`nn.Module` 有�
 
 P1 照搬：数 `self.X =`。这里三条——`self.model`、`self.lm_head`、`self.logits_processor`。所以图最外层就是三个框，主干是中间那个 `model`（`ParallelLMHead` 是输出头、`LogitsProcessor` 算 logits）。`forward` 里 `hidden_states = self.model(...)` 一句就把顶层数据流交代清楚了：数据进 `model`，出来就是 `hidden_states`。其余方法（`compute_logits`、`load_weights` 等）不在这条前向主干上，画数据流图时不画。
 
-接着**下钻一层**：`model` 是 `DeepseekV4Model`，读它的 `__init__`（`vllm/model_executor/models/deepseek_v4.py:L1299-L1320`）：
+接着**下钻一层**（第 3–4 站）：`model` 是 `DeepseekV4Model`，读它的 `__init__`（`vllm/model_executor/models/deepseek_v4.py:L1299-L1320`）：
 
 ```python
 # vllm/model_executor/models/deepseek_v4.py:L1299
@@ -200,7 +200,7 @@ P1 照搬：数 `self.X =`。这里三条——`self.model`、`self.lm_head`、`
 
 还有一个容易踩的坑。`DeepseekV4Model.__init__` 里其实还定义了 `topk_indices_buffer`、`_mtp_hidden_buffer`、`hc_head_*` 这些。它们是 `nn.Parameter` 或 buffer，**不是 `nn.Module` 子模块**。所以它们**不进模块树框**——把它们画成框会让图失真。它们要等到 P2 画数据流时，作为参数或数据端点出现在边上的标注里。**画图时必须分清：子模块（进树）vs 参数/buffer（进数据流标注）。**
 
-继续下钻到单层 `DeepseekV4DecoderLayer.__init__`（`vllm/model_executor/models/deepseek_v4.py:L1105-L1122`）：
+继续下钻到单层 `DeepseekV4DecoderLayer.__init__`（第 5–6 站，`vllm/model_executor/models/deepseek_v4.py:L1105-L1122`）：
 
 ```python
 # vllm/model_executor/models/deepseek_v4.py:L1105
@@ -224,7 +224,7 @@ P1 照搬：数 `self.X =`。这里三条——`self.model`、`self.lm_head`、`
 
 但顶上那行 `import vllm.model_executor.layers.mhc` 不是普通 import——注释写得很清楚，它的**副作用**是注册 `torch.ops.vllm.mhc_pre` 和 `mhc_post` 两个自定义算子。这是 P3 识别「自定义算子子系统」的源码线索：算子不是 `self.X` 子模块，它靠 import 注册、靠 `torch.ops` 调用。这条线索我们 §29.5 再展开。
 
-最后下钻到叶子层 `DeepseekV4Attention.__init__`（`vllm/model_executor/models/deepseek_v4.py:L973-L1009`），看 MLA 的投影子树怎么读出来：
+最后下钻到叶子层 `DeepseekV4Attention.__init__`（第 8 站，`vllm/model_executor/models/deepseek_v4.py:L973-L1009`），看 MLA 的投影子树怎么读出来：
 
 ```python
 # vllm/model_executor/models/deepseek_v4.py:L973
@@ -500,7 +500,7 @@ def hc_head(
 
 ## 29.6 配置开关怎么读：可选框与双后端分叉
 
-DeepSeek-V4 的 MoE 比 Llama 的 MLP 多了一层复杂度：它的结构不是固定的，而是**被配置开关决定**的。P1 和 P2 都要处理这种「条件存在」的框。先看 `DeepseekV4MoE.__init__`（`vllm/model_executor/models/deepseek_v4.py:L752-L801`）：
+DeepSeek-V4 的 MoE 比 Llama 的 MLP 多了一层复杂度：它的结构不是固定的，而是**被配置开关决定**的。P1 和 P2 都要处理这种「条件存在」的框。先看 `DeepseekV4MoE.__init__`（第 9–10 站，`vllm/model_executor/models/deepseek_v4.py:L752-L801`）：
 
 ```python
 # vllm/model_executor/models/deepseek_v4.py:L752

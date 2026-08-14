@@ -2,12 +2,12 @@
 
 ## 你在这里
 
-![你在这里：全书架构模型读到第 23 章，本章在 EngineCore 的「模型与算子」区域里展开一块新的内容——自定义算子与编译：左列是构造期 dispatch 的那排 CustomOp 子类（RMSNorm 为首），右列是首次前向触发的 VllmBackend 内嵌 PiecewiseCompileInterpreter，两列在 default_on() 那句 docstring 处咬合](../diagrams/arch-model.png)
+![你在这里：全书架构模型读到第 23 章，12 个组件已读，本章在 EngineCore 的「模型与算子」区里展开「自定义算子与编译」——左列自上而下五块，CustomOp、RMSNorm、support_torch_compile 等、should_split 等、unified_attention_with_output + direct_register_custom_op；右侧 VllmBackend 画成一只嵌套框，PiecewiseCompileInterpreter 装在它肚子里](../diagrams/arch-model.png)
 
-> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。自上而下还是那条主线：入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍 `schedule → execute_model → update` 循环的 `EngineCore` 大框、输出处理。EngineCore 框里当年只画了调度器与分页 KV 缓存，如今已按「调度与显存／执行与并行／模型与算子／解码策略」四组装满一路读过来的组件。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
-> *本章新长的这块在「模型与算子」组里就地展开——摊开的不是一列类名，而是源码里真实的组织关系：左列 CustomOp / RMSNorm 把单个算子的 forward 在构造期定死，右列 support_torch_compile / should_split / VllmBackend / PiecewiseCompileInterpreter 在首次前向把整图切成融合 + 图捕获的段，unified_attention_with_output 是两级的交汇点。本章 12 站，其中 9 站落在这些橙色组件上：CustomOp（第 1–2 站）、RMSNorm（第 3 站）、support_torch_compile 等（第 4–6 站）、VllmBackend 内嵌 PiecewiseCompileInterpreter（第 7–9 站）。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
-> *这块新结构接在两块已经读过的版图上。左半边 CustomOp 是嵌在[第 22 章](../../ch22-model-definitions/narrative/chapter.md)搭好的那棵 `nn.Module` 模型树里的——每层 `nn.Module.__init__` 触发 `dispatch_forward` 时，选择就是从这棵树上长出来的。右半边 VllmBackend 编译流水线的输入端，接在[第 13 章](../../ch13-scheduler/narrative/chapter.md)调度器唤起模型前向、Dynamo 追踪出 FX 图的那一刻（调度器在「调度与显存」组）；输出端则在 attention 处交棒给[第 24 章](../../ch24-primer-flash-attention/narrative/chapter.md)掀开的 FlashAttention 内核。*
-> *上一章把模型搭成了一棵嵌套的 `nn.Module` 树。本章拆开两件事：单个算子怎么选实现，整张图怎么被切成融合 + 图捕获的段。下一章接着进 `self.attn` 内部那个被切出来保持 eager 的 attention 段，掀开它背后从 online-softmax 推到 IO-aware 注意力的原理。*
+> *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、输出处理，行间箭头还是请求的流向；当年 `EngineCore` 框里只画了调度器与分页 KV 缓存，如今已按「调度与显存／执行与并行／模型与算子／解码策略」四组装满一路读过来的组件。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
+> *本章新长的这块在「模型与算子」组里就地展开——摊开的不是一列类名，而是源码里真实的组织关系：左列自上而下五个橙色框（CustomOp、RMSNorm、support_torch_compile 等、should_split 等、unified_attention_with_output + direct_register_custom_op），右列是 VllmBackend 这只嵌套框、PiecewiseCompileInterpreter 装在它肚子里。本章走线共 12 站，8 站标在这些橙色部件上（第 1 站 CustomOp、第 3 站 RMSNorm、第 4–6 站 support_torch_compile 等、第 7–9 站 VllmBackend 连同肚里的 PiecewiseCompileInterpreter）；另有 2 站落在已读的「配置与装配」蓝框上、1 站落在后续才讲的「注意力后端」虚线框上、1 站落在本子系统内、未展开成组件的文件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *这块新结构接在两块已经读过的版图上。CustomOp 是嵌在[第 22 章](../../ch22-model-definitions/narrative/chapter.md)搭好的那棵 `nn.Module` 模型树里的——每层 `nn.Module.__init__` 触发 `dispatch_forward` 时，选择就是从这棵树上长出来的；而下面 §23.2 那个 `default_on()` 要读的 `CompilationConfig`（编译相关配置的集合体，`custom_ops` 清单与编译 `mode` 都住在里面），是[第 3 章](../../ch03-config-and-wiring/narrative/chapter.md)那套 `VllmConfig` 装配流程在「配置与装配」框里就填好的——本章只是取用。VllmBackend 编译流水线的输入端，接在[第 13 章](../../ch13-scheduler/narrative/chapter.md)调度器唤起模型前向、Dynamo 追踪出 FX 图的那一刻；输出端则在 attention 处交棒给[第 24 章](../../ch24-primer-flash-attention/narrative/chapter.md)掀开的 FlashAttention 内核（注意力后端虚线框，后续才讲）。*
+> *[上一章](../../ch22-model-definitions/narrative/chapter.md)把模型搭成了一棵嵌套的 `nn.Module` 树。本章拆开两件事：单个算子怎么选实现，整张图怎么被切成融合 + 图捕获的段。下一章接着进 `self.attn` 内部那个被切出来保持 eager 的 attention 段，掀开它背后从 online-softmax 推到 IO-aware 注意力的原理。*
 
 [上一章](../../ch22-model-definitions/narrative/chapter.md)结尾留了个钩子。`LlamaAttention.forward` 里那行 `self.attn(q, k, v)`，把后端选择、KV cache 读写、量化统统吞了进去。而让这个算子能进 `torch.compile`（PyTorch 2.x 的模型即时编译入口，本章第 2 级的主角）的图、又不把整张图撕碎的机制，被推给了本章。本章的两条主线分别落在 `vllm/model_executor/custom_op.py` 和 `vllm/compilation/decorators.py`。
 
@@ -344,7 +344,7 @@ assert torch.allclose(yn, yc, atol=1e-5) and torch.allclose(rn, rc, atol=1e-5)
 
 > **v0.21.0 更新**：上面这组「`forward_cuda` 自己持有手写融合 kernel、`forward_native` 摊成纯 torch」的二元对立，在 v0.21.0 被改写——但**两级 dispatch 的主线（23.1/23.2 的 `enabled()`/`default_on()`/`custom_ops`）完全不变**，变的只是这个落地实例的下半身。新版的 `RMSNorm.forward_cuda` 不再自己调 `fused_add_rms_norm` 这个 C++/CUDA 融合 kernel：除一条 `VLLM_BATCH_INVARIANT and residual is None` 的特例走 `rms_norm_batch_invariant` 外，**一律 `return self.forward_native(x, residual)`**。而 `forward_native` 把两路都交给 `vllm.ir` 这一**中间算子层**的句柄——`residual is None` 时 `ir.ops.rms_norm(...)`，否则 `ir.ops.fused_add_rms_norm.maybe_inplace(...)`（`maybe_inplace` overload 定义在 `vllm/ir/op.py`）。换句话说，「手写 kernel vs 纯 torch」的取舍**从 `forward_*` 方法体下沉到了 `vllm.ir`**，由 `KernelConfig.ir_op_priority`（`vllm/config/kernel.py`，每个 IR 算子一份优先级列表，表头可为 `"native"`）在更靠后的阶段裁决——`forward_native` 里据这份优先级「预判会不会派发到 native」来决定是否把全 1 权重一并传下去，正是这一下沉的副产物。与之配套，旧版的 `forward_static`、`forward_hip`、ROCm `dispatch_rocm_rmsnorm_func` 一并被删。所以请把上面 `f3fef123` 的 `forward_cuda`/`forward_static` 当成**讲清 dispatch 思想的标准样本**来读，它仍然准确；只是到 v0.21.0，这份取舍的「执行权」交给了 `vllm.ir` 那层间接。
 
-到这里，第 1 级讲完了。单个算子在构造期就被定到了 cuda 或 native。接下来轮到第 2 级——整张图。在架构模型上，我们正从「模型与算子」组的左半边跨到右半边：左边那排橙色的 CustomOp 在单个模型层的 `__init__` 里就已全部收工，右边 VllmBackend 编译流水线要等到调度器第一次唤起模型前向时才出发。
+到这里，第 1 级讲完了。单个算子在构造期就被定到了 cuda 或 native。接下来轮到第 2 级——整张图。在架构模型图上，我们正从橙色区域左列靠上的 CustomOp / RMSNorm 两块，跨向右侧那只嵌套框 VllmBackend（PiecewiseCompileInterpreter 在它肚子里）：左边这两块在单个模型层的 `__init__` 里就已全部收工，右边 VllmBackend 编译流水线要等到调度器第一次唤起模型前向时才出发。
 
 ## 23.4 @support_torch_compile：给模型套上可编译的外壳
 
@@ -480,7 +480,7 @@ def _mark_dynamic_inputs(mod, *args, **kwargs):
             torch._dynamo.mark_dynamic(arg, real_d)
 ```
 
-那进了 wrapper 之后呢？wrapper 把模型的 `forward` 交给 `torch.compile`，并指定**后端是 `VllmBackend`**。这一步是第 2 级真正的分水岭：`torch.compile` 先用 Dynamo 把 `forward` 追踪成一张 FX 图，然后把这张图整个交给 `VllmBackend` 处理。下一节就看 `VllmBackend` 怎么处理。
+那进了 wrapper 之后呢？wrapper 把模型的 `forward` 交给 `torch.compile`，并指定**后端是 `VllmBackend`**。这一步是第 2 级真正的分水岭：`torch.compile` 先用 Dynamo 把 `forward` 追踪成一张 FX 图，然后把这张图整个交给 `VllmBackend` 处理。在架构模型图上，这正是从左侧 `support_torch_compile` 等那块（第 4–6 站）跨进右侧 VllmBackend 这只嵌套框（第 7–9 站）的地方——装饰器的活儿到此全部收工，剩下的整图切分与逐段编译都在 VllmBackend 里。下一节就看 `VllmBackend` 怎么处理。
 
 ## 23.6 split_graph：在 attention 处把图切开
 
@@ -703,7 +703,7 @@ for name, mod in split_gm.named_children():
 
 ## 23.8 还债：attention 算子怎么进 torch.compile 图
 
-现在回到开头欠下的债。第 2 级反复在一个名字上打转：`unified_attention_with_output`。它是默认切点、是 Dynamo 图里的一个节点、是上一章 `self.attn(q, k, v)` 背后的算子。在架构模型上它站在「模型与算子」组橙色区域的最右端——一头接在上一章搭好的模型树上（`self.attn` 的调用点），一头搭着 VllmBackend 的默认切点（`split_graph` 就靠它认切点），再往下通往[第 24 章](../../ch24-primer-flash-attention/narrative/chapter.md)掀开的 attention 后端——一条线串起三章。但有个问题始终没回答：
+现在回到开头欠下的债。第 2 级反复在一个名字上打转：`unified_attention_with_output`。它是默认切点、是 Dynamo 图里的一个节点、是上一章 `self.attn(q, k, v)` 背后的算子。在架构模型图上它是橙色区域左列最底下那块（`unified_attention_with_output + direct_register_custom_op`），位置很说明问题——一头接在上一章搭好的模型树上（`self.attn` 的调用点），一头搭着右侧 VllmBackend 的默认切点（`split_graph` 就靠它认切点），再往下通往[第 24 章](../../ch24-primer-flash-attention/narrative/chapter.md)掀开的 attention 后端（图上还是虚线框）——一条线串起三章。但有个问题始终没回答：
 
 > Dynamo 在追踪模型 `forward` 时，碰到 attention 这么一坨变长、数据依赖、原地写 output 的逻辑，为什么**没有 graph break**、也没有被内联拆碎，反而稳稳地变成图里的一个干净节点？
 
@@ -788,7 +788,7 @@ assert should_split(attn_node, ["vllm::unified_attention_with_output"])
 
 ## 23.9 两级合一
 
-现在回望架构模型图，本章走过的路一清二楚：左半边橙色的 CustomOp / RMSNorm 是第 1 级（§23.1–§23.3），右半边橙色的 VllmBackend / PiecewiseCompileInterpreter 是第 2 级（§23.4–§23.8），unified_attention_with_output 站在两列之间把两级锁在一起。把两级 dispatch 并排放，本章就收束了。
+现在回望架构模型图，本章走过的路一清二楚：左列自上而下五块橙色框是第 1 级（CustomOp / RMSNorm，§23.1–§23.3）与第 2 级的前半场（support_torch_compile 等、should_split 等，§23.4–§23.6 的工具函数），右侧那只嵌套框 VllmBackend（里头装着 PiecewiseCompileInterpreter）是第 2 级的后半场（§23.7）；左列最底下那块 unified_attention_with_output（§23.8）站在两级之间把它们锁在一起。把两级 dispatch 并排放，本章就收束了。
 
 **第 1 级，单算子，构造期。** `CustomOp.__init__` 调 `dispatch_forward`，按 `enabled()`/`default_on()` 和平台，把 `self._forward_method` 定到 `forward_cuda`（融合 kernel，对编译器不透明）或 `forward_native`（纯 torch，可被编译器融合）——全在 `vllm/model_executor/custom_op.py:L174` 一处完成。一次定死，运行期零开销转发。RMSNorm（`vllm/model_executor/layers/layernorm.py:L38`）是它的标准范例：两份实现数值等价，差别只在「快」和「可不可融合」。
 

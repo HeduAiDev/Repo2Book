@@ -5,8 +5,8 @@
 ![你在这里：全书架构模型已读 14 个组件，本章在 EngineCore 的「模型与算子」组里展开新的一块——注意力后端：抽象、注册、选择、metadata 翻译、PagedAttention 读写、按 layer_name 分发](../diagrams/arch-model.png)
 
 > *图注：这张架构模型图整本书共用，从开篇起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子，而今沿主轴自上而下：入口 → 输入处理 → IPC 边界 → 装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框 → 输出处理。蓝框是前面章节已经读过的（框里带章号），虚线框留给后续章节，橙色是本章新长出的一块。*
-> *本章新长的这块在 EngineCore「模型与算子」组里就地展开——它不是一串线性的流水线，而是一个平铺并列结构：左上是抽象基类（AttentionBackend / CommonAttentionMetadata / Builder / Impl），右上是注册与选择（枚举注册表 + 平台优先级），下方是 FlashAttention 四件套样板与统一的 `Attention` 层。这几块功能独立——选后端发生在建图时、metadata 翻译和 KV 读写发生在运行时的每次前向、按 `layer_name` 分发贯穿始终——正文按讲解逻辑编排，不必照站号顺序读。本章走线共 18 站，15 站落在这些橙色部件上，另有 3 站落在子系统内未展开成独立组件的文件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
-> *本章这块新结构接在三块读者已经读过的结构上。在图上，向左连着「执行与并行」组的 [ModelRunner](../../ch18-model-runner/narrative/chapter.md)——每步算出的 `CommonAttentionMetadata` 与 `forward_context` 从这里递进注意力后端；向右连着同组内[模型定义层](../../ch22-model-definitions/narrative/chapter.md)建好的 `Attention` 对象——本章 §25.10 按 `layer_name` 把它接住；斜上连着「调度与显存」组里[分页 KV 缓存](../../ch15-kv-cache/narrative/chapter.md)的两张表——`block_table` 与 `slot_mapping` 在本章 PagedAttention 读写里落地成真实 kernel 调用。三个方向，三组已经读过的结构，本章一次接住。*
+> *本章新长的这块在 EngineCore「模型与算子」组里就地展开——它不是一串线性的流水线，而是一个平铺并列结构：带站号的组件左右两列、自上而下按功能分层——上面是抽象与共享层（AttentionBackend / CommonAttentionMetadata / Builder / Impl，第 1–4 站），中间是注册与选择（枚举注册表 AttentionBackendEnum 与选择器配置 AttentionSelectorConfig，第 5–6 站），再往下是 FlashAttention 样板（FlashAttentionBackend 等，第 9–13 站）与统一的 `Attention` 层（第 14–17 站），底部还有三个不带站号的引用块（FlashAttentionImpl.forward、cascade_attention、Attention）。这几块功能独立——选后端发生在建图时、metadata 翻译和 KV 读写发生在运行时的每次前向、按 `layer_name` 分发贯穿始终。本章走线共 18 站，15 站落在这些橙色部件上，另有 3 站落在子系统内未展开成独立组件的文件上。站号是请求流经代码的顺序；正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *本章这块新结构接在三块读者已经读过的结构上。在图上，上方「执行与并行」组的 [ModelRunner](../../ch18-model-runner/narrative/chapter.md)——每步算出的 `CommonAttentionMetadata` 与 `forward_context` 从这里递进注意力后端；同组上排左首的[模型定义层](../../ch22-model-definitions/narrative/chapter.md)建好的 `Attention` 对象——本章 §25.10 按 `layer_name` 把它接住；再往上是「调度与显存」组里[分页 KV 缓存](../../ch15-kv-cache/narrative/chapter.md)的两张表——`block_table` 与 `slot_mapping` 在本章 PagedAttention 读写里落地成真实 kernel 调用。三个来路，三组已经读过的结构，本章一次接住。*
 > *[上一章](../../ch24-primer-flash-attention/narrative/chapter.md)已经把 FlashAttention 这台 kernel 从里到外掀开过；本章反过来，只站在「调用边界」这头，看后端怎么选它、又怎么把 metadata 喂给它。*
 
 前面铺了很长的路。[KV cache 那章](../../ch15-kv-cache/narrative/chapter.md) 把显存切成定长块、用 `block_table` 和 `slot_mapping` 两张表管页；[模型运行器那章](../../ch18-model-runner/narrative/chapter.md) 在每步前把这两张表算好，塞进一份叫 `CommonAttentionMetadata` 的结构。但那两章都停在"算好了、放那儿了"。
@@ -534,7 +534,7 @@ assert backend is FlashAttentionBackend
 
 到这里，"选谁"这条线走完了。后端选定、impl 实例化好。下面进运行时——这份后端怎么消费 metadata。
 
-在架构模型图上，选后端走的是「模型与算子」组上半截的抽象基类 → 注册表 → 平台选择；下面要走的 metadata 翻译走下半截，数据源从隔壁「执行与并行」组的 ModelRunner 跨组递进来。
+在架构模型图上，选后端走的是本章橙块上半截的抽象基类 → 注册表 → 平台选择；下面要走的 metadata 翻译走橙块下半截，数据源从上方「执行与并行」组的 ModelRunner 跨组递进来。
 
 ## 25.8 两层 metadata：一份共享，各自翻译
 
@@ -713,6 +713,8 @@ metadata 翻译好了，`block_table` 和 `slot_mapping` 都到了后端手里�
 > *图注：中心是 KV cache 张量，画成若干物理块。左侧"写"——当前 step 的 key/value[i] 经 slot_mapping[i] 算出 block_idx/offset，由 reshape_and_cache_flash 散写进对应格子。右侧"读"——某请求的 block_table=[逻辑块号...] 由 flash_attn_varlen_func 顺着块号把历史 KV 读出来与 query 算注意力。*
 
 ### 写：reshape_and_cache_flash 照 slot_mapping 散写
+
+在架构模型图上，这一节走到 FlashAttention 样板（第 9–13 站的 `FlashAttentionBackend` 等）的最里层；写 KV 这条路径的最深处，是图上未展开成组件的第 18 站——`vllm/_custom_ops.py` 里的 `reshape_and_cache_flash`。
 
 回到那个 `forward_includes_kv_cache_update` 标志。FlashAttention 把它设成 `False`，意味着"写 KV"不在 `forward` 里，而是独立一步 `do_kv_cache_update`（`vllm/v1/attention/backends/flash_attn.py:L863`）：
 
@@ -896,7 +898,7 @@ assert torch.allclose(out, ref, atol=1e-5)
 
 最后一块拼图：一次前向里有几十个注意力层，每层有各自的 KV cache 张量、各自的 metadata。运行时怎么让"写算子"和"算算子"精确取到**本层**的料，而不是把这些当参数层层透传？
 
-在架构模型图上，我们走到「模型与算子」组里最靠近调用方的那块——第 14–17 站的 `Attention` 组件。它向左从「执行与并行」组的 `forward_context` 取本层料，向后连到同组左侧的模型定义层；下面两条展开路径，就各走一边。
+在架构模型图上，我们走到「模型与算子」组里最靠近调用方的那块——第 14–17 站的 `Attention` 组件。它从上方「执行与并行」组的 `forward_context` 取本层料，又连回同组上排左首的模型定义层；下面两条展开路径，就各走一边。
 
 答案是 `layer_name` 当键。这条线分两头——一头是 [模型定义那章](../../ch22-model-definitions/narrative/chapter.md) 埋下的"后端选择"，另一头是这里要接住的"按 layer_name 取数"。先看选择那头，在 `Attention.__init__` 里（`vllm/model_executor/layers/attention/attention.py:L298`）：
 
@@ -1034,7 +1036,7 @@ def unified_attention_with_output(
 
 最后说那个 `kv_cache_dummy_dep`。它没有任何计算用途——`unified_attention_with_output` 一进来就 `del` 掉它。它存在的唯一目的，是制造一条**假数据依赖**：写算子的返回值喂给算算子当参数，于是 `torch.compile` 和 CUDA graph 看到"算算子用了写算子的输出"，就不敢把两者乱序。没有它，编译器可能把"读 cache"排到"写 cache"前面，读到上一步的陈旧 KV。一条假依赖，保住了"先写后读"的铁律。
 
-精简版把这条 f18 端到端链跑通了——从 `__init__` 选后端，到 `forward` 按 `layer_name` 分发写+读：
+精简版把这条端到端链跑通了——从 `__init__` 选后端，到 `forward` 按 `layer_name` 分发写+读：
 
 ```python
 layer = Attention(num_heads=2, head_size=8, scale=..., num_kv_heads=2,

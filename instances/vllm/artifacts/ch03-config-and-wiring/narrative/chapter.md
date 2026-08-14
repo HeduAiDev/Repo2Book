@@ -5,7 +5,7 @@
 ![你在这里：全书架构模型第一次长出组件——本章展开「配置与装配」：`EngineArgs` 扁平参数袋经 `create_engine_config` 打包成 `VllmConfig`，三个工厂选出实现类，终点在 `EngineCore.__init__` 汇合实例化](../diagrams/arch-model.png)
 
 > *图注：这张架构模型图整本书共用，从本章起逐章生长——它就是[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)那张「一个请求的端到端旅程」长大后的样子。主线一眼就能认出来：自上而下依次是入口、Stage 1 输入处理、跨进程的 IPC（进程间通信）边界、装着逐拍循环 `schedule → execute_model → update` 的 `EngineCore` 大框、Stage 3 输出处理，行间箭头还是请求的流向。第 1 章那张图里，`EngineCore` 框中只有逐拍循环和 Scheduler、分页 KV cache 两个名字；如今框内已按「调度与显存／执行与并行／模型与算子／解码策略」四组排好全部位置，每个虚线框标着它由哪一章开讲。橙色是本章新长出的一块，虚线留给后续章节，蓝框是前面章节已经读过的（框里会带章号）——前两章只画地图、指认形状，没有逐行精读任何组件，所以此刻图里还看不到蓝：组件从本章才开始被读，这张图的「由橙变蓝」也从本章开始。*
-> *本章新长的这块叫「配置与装配」，画在入口与 Stage 1 之间——它是比第一个请求还早一拍发生的事：引擎被构造出来的那一瞬间。块内就地展开成源码里的真实组织关系：最上面的 `EngineArgs` 是扁平参数袋，全章 19 站有 8 站落在它身上，是停站最多的组件；`LLMEngine` 一行是统一入口 `from_engine_args`（第 3 站）；`VllmConfig` 一行收编第 10–14 站——聚合、跨配置推导、优化级落地、指纹计算都在它身上；再往下 `Executor`、`SchedulerConfig`、`EngineCoreClient` 三行是三个工厂的所在，`ParallelConfig` 那一站（第 16 站）是给执行器工厂推导默认 backend 的；最底下的 `EngineCore` 是终点（第 19 站），三个工厂的产物在那里汇合、实例化。这条从参数袋到引擎核心的装配路径就是本章的走线，共 19 站；站号是装配流程经代码的先后顺序——这一章还没有请求出场，引擎得先被造出来。正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
+> *本章新长的这块叫「配置与装配」，画在入口与 Stage 1 之间——它是比第一个请求还早一拍发生的事：引擎被构造出来的那一瞬间。块内就地展开成源码里的真实组织关系，一眼看到的是两列：右列最上面是 `EngineArgs` 扁平参数袋，全章 19 站有 8 站落在它身上（第 1–2、4–9 站），是停站最多的组件；袋子里装的七个子配置——`CacheConfig`、`CompilationConfig`、`ModelConfig`、`OptimizationLevel`、`ParallelConfig`（第 16 站）、`SchedulerConfig`（第 17 站）、`VllmConfig`（第 10–14 站）——是打包前后的两代容器，聚合、跨配置推导、优化级落地、指纹计算都发生在 `VllmConfig` 身上；左列三行是装配的外围：`EngineCoreClient`（第 18 站，第三个工厂 `make_client` 的产物）、`AsyncEngineArgs`、`ParallelConfig.sync_dp_state`。16 站落在这两列上；另外 3 站——`from_engine_args` 入口所在的 `LLMEngine`、执行器工厂 `Executor.get_class`、终点 `EngineCore.__init__`——分别落在第 37、17、11 章才讲的组件上，图底脚注替它们报了坐标。这条从参数袋到引擎核心的装配路径就是本章的走线，共 19 站；站号是装配流程经代码的先后顺序——这一章还没有请求出场，引擎得先被造出来。正文按讲解需要编排，不必照站号顺序读——跨模块的几个大接缝处，正文会随手报一句「现在走到哪一段」。*
 > *这块新结构接在哪？就接在前两章已经画好的这条主线本身上——[第 1 章](../../ch01-config-and-wiring/narrative/chapter.md)画出它，[第 2 章](../../ch02-entrypoints/narrative/chapter.md)领着一个请求把它鸟瞰了一遍；本章的橙色块插在线的最前端，补的是那两章每次都默认「已经存在」的东西。它装配出的 `VllmConfig`、执行器、调度器和 `EngineCore`，正是下方 IPC 边界与 `EngineCore` 大框里那些虚线组件的本体——这张图后面每一章要填的蓝，都从这一块开始。*
 
 前两章我们已经有了底子：[vLLM v1 的整体心智模型](../../ch01-config-and-wiring/narrative/chapter.md)，以及[一个请求端到端的鸟瞰路径](../../ch02-entrypoints/narrative/chapter.md)。鸟瞰那一章里，每个环节我们都假设「引擎已经建好了」——`AsyncLLM` 也好、`EngineCore` 也好、调度器也好，都是现成的。
@@ -390,7 +390,7 @@ class EngineArgs:
 
 ## 3.6 第二级映射之一：执行器工厂 Executor.get_class
 
-讲完推导，回到工厂。走线也挪了目录：从 `vllm/config` 踏进 `vllm/v1/executor`——`Executor.get_class` 是第 15 站，在图上独占 `Executor` 一行；本节后半回到 `vllm/config/parallel.py`，`ParallelConfig.__post_init__` 推导默认 backend 的那段是第 16 站，图上紧挨着的另一行。三个工厂里最直白的是执行器工厂。先看它怎么选类：
+讲完推导，回到工厂。走线也挪了目录：从 `vllm/config` 踏进 `vllm/v1/executor`——`Executor.get_class` 是第 15 站；执行器本体还没画进本章的橙色块，它在图上属于下方「执行与并行」组里第 17 章才讲的「Worker 与执行器」虚线框（图底脚注那 3 站之一）。本节后半回到 `vllm/config/parallel.py`，`ParallelConfig.__post_init__` 推导默认 backend 的那段是第 16 站，落在图上 `EngineArgs` 容器里带「第 16 站」徽标的那一行。三个工厂里最直白的是执行器工厂。先看它怎么选类：
 
 ```python
 # vllm/v1/executor/abstract.py:L47
@@ -883,7 +883,7 @@ OPTIMIZATION_LEVEL_TO_CONFIG = {
 
 走到这里，配置组装完了（第一级），三个工厂也讲完了（第二级）。但 [3.1 节](#31-一句话钩子扁平进去结构化出来) 留了个悬念：执行器工厂只「选了类」，没「实例化」。实例化在哪发生？
 
-答案是本章的终点——`EngineCore.__init__`。它就是走线的第 19 站、最后一站，落在图上橙色块最底下那行；装配到此完成，再往下（调度器怎么排、执行器怎么跑）就是大框里那些虚线组件的主场了：
+答案是本章的终点——`EngineCore.__init__`。它就是走线的第 19 站、最后一站——引擎核心本体归第 11 章才讲，图上没画它（正是脚注那 3 站之一），本章的走线到它门口收尾。装配到此完成，再往下（调度器怎么排、执行器怎么跑）就是大框里那些虚线组件的主场了：
 
 ```python
 # vllm/v1/engine/core.py:L116
