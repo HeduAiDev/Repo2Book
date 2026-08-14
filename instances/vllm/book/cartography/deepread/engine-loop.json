@@ -1,0 +1,120 @@
+{
+  "domain": "引擎心跳：调度循环（EngineCore.step + Scheduler）",
+  "pin": "vLLM v0.21.0 (ad7125a4)，锚点全部对当前 pin 逐一核验（2026-08-15 深读）",
+  "code_spine": [
+    "vllm/v1/engine/core.py:L1168-L1176  run_busy_loop：忙循环骨架（poll input queue → step）",
+    "vllm/v1/engine/core.py:L406-L435  step()：schedule→execute(non_block)→bitmask 重叠→future.result→sample→aborts→update_from_output",
+    "vllm/v1/core/sched/scheduler.py:L310-L903  schedule()：RUNNING 先行（L345-L514）→ 抢占重试（L424-L471）→ WAITING 收新（L525-L804）→ 组装 SchedulerOutput（L868-L884）",
+    "vllm/v1/core/sched/scheduler.py:L932-L956  _update_after_schedule：乐观推进 num_computed_tokens",
+    "vllm/v1/core/sched/scheduler.py:L1248-L1513  update_from_output：热循环，token 追加/stop 判定/资源回收/EngineCoreOutputs 组装",
+    "vllm/v1/core/sched/scheduler.py:L910-L930  _preempt_request：recompute-only 抢占",
+    "vllm/v1/request.py:L316-L339  RequestStatus IntEnum + is_finished = status > PREEMPTED",
+    "vllm/v1/core/sched/async_scheduler.py:L18-L60  AsyncScheduler：num_output_placeholders 占位调度",
+    "vllm/v1/worker/gpu_model_runner.py:L4184-L4250  ExecuteModelState 暂存 + sample_tokens 两段式（跨界引用，worker 域拥有实现细节）"
+  ],
+  "why_chains": [
+    {
+      "decision": "迭代级调度：每次 forward 前重新组批（continuous batching 的引擎侧形态）",
+      "old_design": "请求级批处理（request-level batching）：vLLM 之前的主流做法（FasterTransformer/Triton 类服务）攒一批请求、pad 到最长序列、整批全部生成完才整批换血。外证：Orca 论文（arXiv:2103.00071 §2.2）对 request-level batching 的批评是 v1 设计的直系思想来源。v0 已实现 iteration-level scheduling，但 v1 把它收敛为单一循环：一拍 = 一次 schedule() = 一次 forward（vllm/v1/core/sched/interface.py:L52-L57 docstring 原话 'Each scheduling step corresponds to a single forward pass of the model'）。",
+      "pain": "GPU 利用率与内存：短请求陪长请求空转到整批结束，Orca 实测与 request-level 系统的吞吐差距最高达 36.9x（FasterTransformer 对比，外证）；padding 浪费显存；新请求必须等整批腾位，TTOT/排队延迟高。",
+      "solution": "vllm/v1/core/sched/scheduler.py:L310 schedule() 每拍产出 {req_id: num_tokens} 的调度决定；完成的请求当拍退出并释放块（update_from_output → _free_request，scheduler.py:L1750-L1771），新请求同拍可入（L525-L804 WAITING 阶段）；EngineCore.step()（core.py:L406-L435）把这个决定交给 executor 执行一次 forward。",
+      "cost": "每生成一个 token 都要过一遍 CPU 调度：调度逻辑本身成为吞吐上限——源码自己承认这条成本（scheduler.py:L1286-L1288 注释 'len(num_scheduled_tokens) can be up to 1K or more, the below loop can be a performance bottleneck'）；且要求 KV 存储必须支持任意请求任意拍进出（没有 PagedAttention 式分块 KV 就没有安全的逐拍进出，这是本域与 KV cache 域的强耦合）。"
+    },
+    {
+      "decision": "调度只认 token 数不认请求数：单一 token 预算，无 prefill/decode 相位",
+      "old_design": "v0 scheduler（git 历史 c99db8c8d^:vllm/core/scheduler.py，2025-09-20 被移除）是双相位调度：_schedule_default（decode 批）/ _schedule_chunked_prefill（prefill 批）两条路径 + waiting/running/swapped 三队列 + SequenceGroup/Sequence 两层结构；朴素做法更直接：批次上限 = 请求数，prefill 和 decode 分开跑。",
+      "pain": "请求数无法预测一步计算量：256 个 decode 请求各 1 token = 256 token，1 个 8K prompt = 8192 token——同样算 1 个请求，工作量差 30 倍。按请求数限批要么 GPU 饿死（全 decode 小批）要么单步延迟爆炸（混入大 prefill，所有在场请求的下一个 token 都被拖住）。Sarathi-Serve（arXiv:2308.16369，外证）证明把 prefill 切块混进每一步才能同时保 GPU 利用率与 TPOT 上界；v0 双相位实现里 chunked prefill 是后补特例，路径复杂易错。",
+      "solution": "scheduler.py:L311-L320（woosuk 注释，自 v1 首提交 #9289 2024-10-22 即存在，逐字沿用至今）：'There is no decoding phase nor prefill phase in the scheduler. Each request just has the num_computed_tokens and num_tokens_with_spec... the scheduler tries to assign tokens to the requests so that each request's num_computed_tokens can catch up its num_tokens_with_spec. This is general enough to cover chunked prefills, prefix caching, speculative decoding'。每拍只有一个 token_budget = max_num_scheduled_tokens（L329，clamp 在 L373/L479/L783），RUNNING 与 WAITING 共用这一个预算分账。预算默认值分层：SchedulerConfig 常量 2048（vllm/config/scheduler.py:L42-L44），再按硬件与使用场景上调（vllm/engine/arg_utils.py:L2244-L2295：H100 级 ≥70GiB 显存时 LLM=16384/API server=8192 token、max_num_seqs=1024）。",
+      "cost": "①长 prompt 被切成多拍，TTFT 换 TPOT（chunked prefill 的本质交易）；②混相批削弱纯 decode 优化——源码侧面承认：async 调度下拒绝调度 partial draft tokens，因为 'that prevents uniform decode optimizations'（scheduler.py:L360-L364 注释），CUDA graph 只对形状稳定的批友好；③一切特性必须能表达为『token 差距』这单一模型——spec decode 的草稿 token 只好用 num_output_placeholders 占位数表达（async_scheduler.py:L32），复杂度被转嫁到状态机。"
+    },
+    {
+      "decision": "RUNNING 先于 WAITING + 本拍抢占过就整拍不收新请求",
+      "old_design": "朴素 FCFS 一条队：新 prompt 到了直接插队跑 prefill，把正在 decode 的请求挤出内存。v0 的版本：swapped 队列优先于 waiting 队列，woosuk 在 v0 源码里自己标注 FIXME 'This makes our scheduling policy a bit bizarre'（git c99db8c8d^:vllm/core/scheduler.py，preemption 选择逻辑旁）。",
+      "pain": "在途请求的 TPOT 与抖动：若无反压，内存紧张时『先收新再抢老』会让请求刚恢复又被抢占（thrash）；decode 中的请求被新 prefill 反复打断，单个请求的 token 间隔方差失控。",
+      "solution": "schedule() 固定两阶段：L345 'First, schedule the RUNNING requests'（循环体 L347-L514，含 allocate_slots 失败→抢占最不应保留者→重试，L424-L471）；L525 'Next, schedule the WAITING requests'，且入口守卫 L526 `if not preempted_reqs and self._pause_state == PauseState.UNPAUSED`——本拍发生过抢占（= 内存紧张的信号）就整个跳过收新阶段；WAITING 阶段 allocate_slots 失败直接 break（L714-L715），不触发抢占。",
+      "cost": "老请求绝对优先 → 高负载下 TTFT 无上界（到达率超服务能力时 waiting 队列线性增长，无 admission control 拒绝）；『抢占过就不收新』让突发新请求至少多等一拍。这是把延迟压力显式从 TPOT 转嫁给 TTFT 的取舍，源码无一处文字粉饰这一点。"
+    },
+    {
+      "decision": "抢占 = 丢弃重算（recompute-only），彻底删除 swap 模式",
+      "old_design": "v0 双模式 PreemptionMode（git c99db8c8d^:vllm/core/scheduler.py L35-L46 docstring）：SWAP = 把被抢请求的 KV 块换出到 CPU 内存、恢复时换回；RECOMPUTE = 丢弃当新 prompt 重算。v0 自动选择：单序列请求用 recompute、多序列（beam search）用 swap；配套 swapped 第三队列与 blocks_to_swap_out/in 的 executor 消息。v0 的死法也很出名：swap 空间不足直接 RuntimeError 'Aborted due to the lack of CPU swap space. Please increase the swap space to avoid this error.'（整个引擎崩，不是降级）。",
+      "pain": "①swap 需要 CPU 内存 1:1 镜像 KV + 抢占瞬间占满 PCIe 带宽；②swap 耗尽是致命故障模式（全引擎死）而非优雅降级；③双模式+三队列是 v0 调度器最难维护的部分，作者自认 'bizarre'；④v1 取消 SequenceGroup/beam search 多序列，swap 存在的最大理由消失。",
+      "solution": "v1 自首提交起只有一条抢占路径：scheduler.py:L910-L930 _preempt_request —— kv_cache_manager.free(request)（L919，块归还池）、encoder_cache_manager.free、status = PREEMPTED、num_computed_tokens = 0（L922）、清 spec_token_ids、num_preemptions += 1、waiting.prepend_request(request)（L930，回队头，下拍内存富余时优先恢复）。抢谁：FCFS 时 self.running.pop()（L462，队尾 = 最年轻/最晚加入者，重算损失最小）；PRIORITY 时 max(running, key=(priority, arrival_time))（L437-L441，最低优先级+最晚到达）。与 prefix caching 联动是隐性补偿：被抢请求的块 free 后成为 cached 块（未逐出前），重算时前缀大概率命中 get_computed_blocks（kv_cache_manager.py:L183），『重算』实际常是『部分重算』。",
+      "cost": "被抢请求恢复 = 一次（可能全量的）prefill 重算：该请求 TPOT 出现尖刺、系统总吞吐净损失（烧掉的 forward 不产出新 token）；无缓存命中时成本 = O(prompt 长度) 的 GPU 重算，远贵于 v0 swap 的确定性 PCIe 搬运；极端反复抢占时 thrash 纯浪费。诚实记录：对单请求延迟极敏感且 KV 恰好放得进 CPU 的场景，swap 理论上仍可更优——v1 用『重算换简洁 + 依赖前缀缓存兜底』的赌注删掉了它。"
+    },
+    {
+      "decision": "循环四段顺序 schedule→execute→sample→update，慢操作全部挪出循环体",
+      "old_design": "朴素单线程引擎（v0 LLMEngine.step 的形态）：tokenize/detokenize/调度/前向/采样全在一个同步循环里，做一步等一步；v1 早期 step 也是 execute_model 同步等完再采样。",
+      "pain": "忙循环是单线程（core.py:L1168 run_busy_loop），任何阻塞都让 GPU 空转：一步 forward 只有几十毫秒（2048-8192 token 预算），10ms 串行 CPU 杂务 ≈ 20%+ 吞吐损失；结构化输出的 grammar bitmask 若在采样前串行算，每拍白加一段 CPU 时间。",
+      "solution": "core.py:L406-L435 step() 精确排布：L415 has_requests 空转守卫 → L417 schedule()（把所有可能慢/可能触发抢占的决策放在 GPU 启动前，保证交给 executor 的批必然可执行）→ L418 execute_model(scheduler_output, non_block=True) 发起前向立即返回 Future → L419 趁 GPU 在算，CPU 算 get_grammar_bitmask → L424 future.result() 收 logits → L425-L426 若 worker 未就地采样（execute_model 返回 None、logits 暂存在 ExecuteModelState，gpu_model_runner.py:L4184-L4203）则 sample_tokens(grammar_output)：先应用掩码再采样（L4243-L4250）→ L430 批量处理执行期间到达的 abort → L431 update_from_output 推进状态机。同类设计贯穿循环外缘：Request 构造+grammar 编译在 input socket 线程完成（core.py:L769-L791 注释 'allow request initialization running in parallel with Model forward'）；ZMQ 收发在守护 IO 线程（L893-L915）；detokenize 在前端进程（OutputProcessor 域）；空闲时阻塞在 input_queue.get(block=True) 而非空转（L1178-L1207）。",
+      "cost": "①execute/sample 两段式引入跨调用暂存态 ExecuteModelState——中间态出错归属变模糊，需要 dump_engine_exception 专门兜底（core.py:L360-L374）；②abort 必须双投递（input_queue 保序 + aborts_queue 及时，L1460-L1465），依赖『scheduler 侧 abort 幂等』这一隐式前提；③重叠的边界情形多：结构化输出 + async scheduling 时 bitmask 缺 token 必须推迟采样（step_with_batch_queue L496-L499 deferred 分支 + L542-L561 补采），代码路径近乎翻倍。"
+    },
+    {
+      "decision": "异步调度：num_output_placeholders 让第 N+1 步的调度发生在第 N 步执行期间",
+      "old_design": "同步 step()：必须等 update_from_output 拿到采样 token 才能算出下一步 num_new_tokens=1、才能 schedule 下一拍——CPU 调度时间完全串行叠加在 GPU 执行时间之后。",
+      "pain": "单拍延迟 = GPU forward + CPU 调度 + IPC 三段相加。千级并发下 schedule()/update_from_output 的 Python 循环达毫秒级（L1286-L1288 自认瓶颈），GPU 每 10-20ms 空转一次等 CPU，稳态吞吐直接被打折。",
+      "solution": "开关链：SchedulerConfig.async_scheduling（vllm/config/scheduler.py:L146）→ get_scheduler_cls 选 AsyncScheduler（L168-L176）→ executor.max_concurrent_batches 变 2（uniproc_executor.py:L76-L78；multiproc_executor.py:L474-L479 单 PP 时同为 2，PP>1 时 = pp_size）→ EngineCore.step_fn 静态绑定 step_with_batch_queue（core.py:L213-L215）——批 A 在 GPU 跑时同时调度批 B。核心机制：AsyncScheduler._update_after_schedule 给每个 decode 请求 num_output_placeholders += 1 + spec 数（async_scheduler.py:L32），调度 num_new_tokens 时把占位算进去（scheduler.py:L366-L370 的 num_tokens_with_spec + num_output_placeholders - num_computed_tokens）；真 token 到达时 _update_request_with_output 扣减占位（async_scheduler.py:L52）并把已算块真缓存（L55-L59）。spec 草稿的具体 token id 甚至在 worker 侧原地替换（L34-L35 注释）。",
+      "cost": "①调度器状态短暂领先真实进度（乐观推进），spec 拒绝时必须回扣 num_computed_tokens/num_output_placeholders（scheduler.py:L1312-L1329）；②强制抢占时占位 token 成脏数据，需要 discard_latest_async_tokens 补丁路径（async_scheduler.py:L40-L44）；③early-stop 判定变成算术谜题：scheduler.py:L350-L364 那坨 num_computed_tokens + 2 - num_output_placeholders >= num_prompt_tokens + max_tokens 就是为了别多调度一步。同步版无任何此类复杂度——这是纯用状态机复杂度换 GPU 利用率。"
+    },
+    {
+      "decision": "请求生命周期状态机：单 IntEnum 贯穿一生，一次整数比较判 finished",
+      "old_design": "v0 两层状态机：SequenceGroup 状态 + 每条 Sequence 各自的 SequenceStatus，配 waiting/running/swapped 三队列标志位，判 finished 要跨两层查；流式/beam 场景状态组合爆炸。",
+      "pain": "update_from_output 热循环里每请求每拍判 finished（scheduler.py:L1297），千级请求 × 每秒上百拍 = 每秒十万次级判断；属性链/集合查找都嫌贵，且两层状态容易漏改导致悬挂请求（v0 时代 leaked request bug 的温床）。",
+      "solution": "vllm/v1/request.py:L316-L339：一个 RequestStatus IntEnum 全程跟随——WAITING →（三个阻塞子态 WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR / WAITING_FOR_REMOTE_KVS / WAITING_FOR_STREAMING_REQ）→ RUNNING ↔ PREEMPTED → 6 个 FINISHED_*；注释 L325-L326 'anything after PREEMPTED will be considered as a finished status'，于是 L338-L339 is_finished = status > RequestStatus.PREEMPTED 一次比较搞定。全部转移点集中在调度器：WAITING→RUNNING（scheduler.py:L770-L784）、RUNNING→PREEMPTED（L921）、RUNNING→FINISHED_*（sched/utils.py:L94-L130 check_stop：EOS/stop_token/长度上限/重复检测）、外部 abort→FINISHED_ABORTED（finish_requests L1687-L1748）。生命周期事件埋点 QUEUED/SCHEDULED/PREEMPTED（vllm/v1/engine/__init__.py:L140-L145 + Request.record_event）随输出回传，前端用于算排队/首 token 延迟。",
+      "cost": "①枚举数值顺序成为隐式 API：在中间插状态会静默改变 is_finished 语义，新状态必须永远插在 PREEMPTED 的正确一侧；②转移逻辑分散在 check_stop/_update_request_with_output/_handle_stopped_request 三处而非一处集中；③状态图不是单向 DAG——流式会话会『stop → 又回 WAITING 续跑』（L1541-L1557 _handle_stopped_request），这也逼出 finish_reason 必须在状态被改回前抓取的时序约束（L1384-L1388 注释自证）。"
+    },
+    {
+      "decision": "增量下发协议（persistent batch）：worker 缓存请求全量数据，调度器每拍只发 diff",
+      "old_design": "v0 每步把全批 SequenceGroupMetadata（全量 token ids、完整 block 表、采样参数）序列化发给 worker；更朴素的做法是每步从零重建整个批次对象树。",
+      "pain": "IPC 序列化带宽与 CPU 时间随『请求数 × prompt 长度』爆炸：decode 稳态下每拍 99% 的下发内容与上一拍相同，全量重发是纯浪费；千级并发时这一项足以吃掉调度预算。",
+      "solution": "vllm/v1/core/sched/output.py:L180-L241 SchedulerOutput 二分：scheduled_new_reqs = NewRequestData（首次全量：prompt_token_ids、sampling_params、block_ids，注释 L182-L184 'We cache the request's data in each worker process, so that we don't need to re-send it every scheduling step'）与 scheduled_cached_reqs = CachedRequestData（增量：new_block_ids、num_computed_tokens；注释 L185-L189 'we only send the diff to minimize the communication cost'）。prev_step_scheduled_req_ids（scheduler.py:L858-L860）标记上拍已调度者——连 all_token_ids 都省（L1037-L1042）；finished_req_ids 随下拍下发让 worker 清缓存（L877-L881 注释）。GPU 侧对应物是持久存活的 InputBatch 与槽位复用（model runner 域）。",
+      "cost": "①worker 必须维护匹配的缓存与失效逻辑——两进程请求视图可能漂移，PP 模式还得专门回传 new_token_ids（L1021-L1036 use_pp 分支）；②协议状态语义分叉：resumed（抢占恢复）请求的 block_ids 是整体替换而非追加（output.py:L114-L117 注释），理解成本高；③finished 集合的清空时点成为跨拍不变量（L953-L956 注释解释为何不能就地 clear）。"
+    }
+  ],
+  "contracts": [
+    {
+      "direction": "输入（上游 = 前端进程 InputProcessor/EngineCoreClient）",
+      "detail": "EngineCoreRequest（msgspec Struct，vllm/v1/engine/__init__.py:L80）经 ZMQ（前端 ROUTER/DEALER 多对多拓扑）到 EngineCoreProc.process_input_sockets（core.py:L1376-L1468，守护 IO 线程）→ 该线程内完成 preprocess_add_request（core.py:L769-L791）：Request.from_engine_core_request 构造 + StructuredOutputManager.grammar_init 异步启动——都不占忙循环 → input_queue（线程安全 queue.Queue）→ 忙循环 _handle_client_request（L1270-L1303）→ Scheduler.add_request（scheduler.py:L1665-L1685：requests[req_id] 登记 + 入 waiting/skipped_waiting）。数据所有权：tokenize 之后的 prompt_token_ids 列表归引擎进程独占写；前端从此只按 request_id 追踪。重复 request_id 不报错而走 streaming 续跑分支（L1666-L1678）。"
+    },
+    {
+      "direction": "输出（下游 = 前端 OutputProcessor）",
+      "detail": "update_from_output 返回 dict[client_index → EngineCoreOutputs]（scheduler.py:L1482-L1485；EngineCoreOutput 含 new_token_ids/finish_reason/events，vllm/v1/engine/__init__.py:L167-L197）→ output_queue.put_nowait（core.py:L1215-L1216）→ process_output_sockets 线程（L1470-L1535）msgpack 编码 + ZMQ PUSH（zero-copy buffer 复用 + pending deque 保引用）→ 前端 _run_output_handler → OutputProcessor.process_outputs 解码/detokenize/按 req_id 扇出到各请求队列。所有权：EngineCoreOutput 组装完成后即归 IPC 管线，调度器不再触碰；stop 判定（check_stop）留在引擎侧，stop string 判定在前端侧（interface.py:L143-L148 finish_requests docstring 列明第 2 种调用情形——detokenize 后前端发现 stop string 会调回来 finish）。"
+    },
+    {
+      "direction": "向 GPU（下游 = Executor/Worker）",
+      "detail": "schedule() 产出不可变 SchedulerOutput → executor.execute_model(scheduler_output, non_block=True) 返回 Future（uniproc_executor.py:L107-L120；AsyncOutputFuture L26-L42 惰性等 D2H 拷贝）。所有权分界线 = block_id：调度器进程持有逻辑块表（KVCacheManager，kv_cache_manager.py:L106 类定义），worker 进程持有物理 KV 显存；block_id 列表是唯一共享句柄，调度器从不直接碰 GPU 显存。execute_model 契约：返回 None 表示『前向已完成、logits 暂存于 worker 的 ExecuteModelState（gpu_model_runner.py:L4184-L4195），等待 sample_tokens(grammar_output) 来完成采样』（L4203 return None；L4206-L4250 sample_tokens 解包暂存态→apply_grammar_bitmask→_sample）。sampled_token_ids 经 ModelRunnerOutput（含 req_id_to_index）归还调度器进程推进状态机。"
+    },
+    {
+      "direction": "被调用（KV cache 域，内存仲裁的另一半）",
+      "detail": "KVCacheManager.allocate_slots（kv_cache_manager.py:L225-L416）返回 None = 『空闲块不足』——这是调度器触发抢占的唯一信号（scheduler.py:L424-L471 的 while True 重试环完全围绕这个 None）；get_computed_blocks（L183-L223）返回前缀命中块数，含一条关键约定：max_cache_hit_length = num_tokens - 1（L202-L208 注释——全命中也必须重算最后一个 token 以产生 logits，且会连带整块重算，因为 num_computed_tokens 必须块对齐）；free(request)（L418-L426）按逆序归还、尾块先逐出。调度器视角只有 token 数与块数两个账本。"
+    },
+    {
+      "direction": "结构化输出域（引擎进程内邻居）",
+      "detail": "StructuredOutputManager 在 EngineCore.__init__ 构造（core.py:L129）并注入 Scheduler。grammar 编译异步：请求以 WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR 进 skipped_waiting（request.py:L111-L112；scheduler.py:L1516-L1527 _enqueue_waiting_request 分流），编译完成前不可调度（_is_blocked_waiting_status L1515-L1521 + _try_promote）。每拍时序契约：get_grammar_bitmask（scheduler.py:L1224-L1246）必须在 execute_model 发起之后、sample_tokens 之前调用（core.py:L418-L426），bitmask 在采样前应用到 logits（gpu_model_runner.py:L4243-L4247 apply_grammar_bitmask）——这个夹缝时序是两域之间最精细的耦合点。"
+    },
+    {
+      "direction": "abort 双通道（前端 → 引擎）",
+      "detail": "ABORT 消息同时投 input_queue 与 aborts_queue（core.py:L1460-L1465 注释：双投允许『及时处理执行期间的 abort』+『保序防泄漏请求』，成立前提是 scheduler 侧 abort 幂等）；aborts_queue 在每次 update_from_output 之前批量落地（L430 → _process_aborts_queue L565-L573 → abort_requests → scheduler.finish_requests(FINISHED_ABORTED)）。引擎空闲时 aborts_queue 会被清空（L1186-L1188，因为 input_queue 里的副本仍保序）。"
+    }
+  ],
+  "data_flow": "一个 256-token prompt 的请求，首次被调度的一拍（行号全部对 pin v0.21.0 核验）：\n1. 前置：Scheduler.add_request（scheduler.py:L1665-L1685）登记 requests[req_id]，status=WAITING，入 waiting 队尾；record_event(QUEUED)。\n2. schedule()（scheduler.py:L310）：RUNNING 阶段（L347-L514）消耗预算后进入 WAITING 阶段（L526 守卫通过）；L572 首调度 num_computed_tokens==0 → get_computed_blocks 查前缀缓存（kv_cache_manager.py:L183）；L635 num_new_tokens = num_tokens - num_computed_tokens，受 token_budget 与 long_prefill_token_threshold 钳制（L636-L650）；L702 allocate_slots 拿块；L743-L784 出队入 running，status: WAITING→RUNNING（L784）、num_computed_tokens 记入命中数（L785）。\n3. L868-L884 组装 SchedulerOutput（NewRequestData 全量 + num_scheduled_tokens）；L901-L902 _update_after_schedule 乐观推进 num_computed_tokens += num_new_tokens（L943-L948）——注意此刻 GPU 还没算。\n4. core.py:L417 schedule 返回 → L418 execute_model(non_block=True) → worker 侧 _update_states 把请求落进持久 InputBatch → 前向算出 logits → 暂存 ExecuteModelState、返回 None（gpu_model_runner.py:L4184-L4203）。\n5. core.py:L419 CPU 侧 get_grammar_bitmask（无结构化输出则 None）；L424 future.result() 等前向；L425-L426 sample_tokens → gpu_model_runner.py:L4243-L4250 应用 grammar 掩码 → _sample 产出 sampled_token_ids（prefill 尾 token 出首个 logits；此后每拍 decode 恰 1 token）。\n6. core.py:L430 处理执行期到达的 abort；L431 update_from_output（scheduler.py:L1248）：L1307 用 model_runner_output.req_id_to_index[req_id] 定位本请求的采样行；L1350-L1353 _update_request_with_output 逐 token append_output_token_ids + check_stop（sched/utils.py:L94-L130：EOS/stop_token_ids/num_tokens>=max_model_len/num_output_tokens>=max_tokens/重复检测）；未停 → finish_reason=None，L1417-L1433 攒 EngineCoreOutput。\n7. 输出经 output_queue → IO 线程 ZMQ → 前端 detokenize 流给用户。\n8. 后续每拍：请求在 running 里走 L347 RUNNING 循环，num_new_tokens = num_tokens_with_spec - num_computed_tokens = 1（scheduler.py:L366-L370），直到 check_stop 置 FINISHED_* → L1384-L1395 分流摘除 → _free_request（L1750-L1771）：free 块 + del requests[req_id] + 记入 finished_req_ids → 下一拍 SchedulerOutput.finished_req_ids 通知 worker 清缓存（L877-L881）。若中途内存不足：L424-L471 allocate_slots 返回 None → 抢占队尾请求（L462）→ 本请求重试成功；被抢者经 _preempt_request（L910-L930）回 waiting 队头、num_computed_tokens=0，本拍不再收新（L526）。",
+  "first_read_suggestion": "本域是全书第二认知台阶（第一台阶 = 三段式进程解耦：API 进程/EngineCore 进程/GPU worker 的地图）。前置必须已立的概念只有两个，都很物理：『一次 forward 的计算量 ≈ 本拍 token 数』与『KV cache 显存有限、以块为单位借还』——其余（批调度、抢占、状态机）都可以在本域内自建。给不懂 AI 的后端工程师的最优进入顺序：(1) 先用『256 个请求各 1 token vs 1 个请求 8192 token』的算术立住『调度器只认 token 数』——这是本域天然的开篇 hook，比模块解读体强得多；(2) 循环四段顺序建议配一张 CPU/GPU 双轨泳道时间轴图（本域唯一必需的图），同步版先讲，async 占位符版后讲；(3) 抢占放在 KV 块分配讲完之后（依赖 block 概念），用 v0 的 swap 死法（'Aborted due to the lack of CPU swap space' 全引擎崩）做反例开场，再引出『recompute + 前缀缓存兜底』的赌注；(4) 请求状态机（RequestStatus IntEnum）可以提前到第一台阶末尾当『贯穿全书的账本』讲——它便宜、自包含、且后续每域都要查它；(5) num_output_placeholders/async scheduling 与 spec 回扣是本域最深层，建议收在本 Part 尾部并给 spec decode 章埋伏笔，不要在读者还没见过『一拍只出一个 token』的节奏感之前讲；(6) update_from_output 热循环性能（L1286-L1288 注释）适合作为『为什么 Python 热路径连一次多余函数调用都要省』的教学案例，但宜作为尾注而非主线。与 v2 组织的差异提示：v2 把这块拆成 ch11/ch12/ch13/ch14 四章按模块平铺；本域更适合按『一拍的四段 → 账本（token 预算）→ 抢占 → 状态机 → 异步重叠』的问题链推进。",
+  "key_files": [
+    "vllm/v1/engine/core.py（step L406、step_with_batch_queue L447、run_busy_loop L1168、IO 线程 L1376/L1470）",
+    "vllm/v1/core/sched/scheduler.py（schedule L310、_preempt_request L910、_update_after_schedule L932、update_from_output L1248、finish_requests L1687）",
+    "vllm/v1/core/sched/output.py（SchedulerOutput/NewRequestData/CachedRequestData L30-L255）",
+    "vllm/v1/core/sched/interface.py（SchedulerInterface 契约 docstring L51-L101）",
+    "vllm/v1/core/sched/request_queue.py（FCFS L75/Priority L131/工厂 L201）",
+    "vllm/v1/core/sched/async_scheduler.py（占位符调度 L18-L60）",
+    "vllm/v1/core/sched/utils.py（check_stop L94-L130）",
+    "vllm/v1/request.py（Request L59、RequestStatus L316-L358）",
+    "vllm/v1/core/kv_cache_manager.py（契约面：allocate_slots L225、get_computed_blocks L183、free L418）",
+    "vllm/v1/worker/gpu_model_runner.py（跨界引用：ExecuteModelState L4184、sample_tokens L4206）",
+    "vllm/config/scheduler.py（预算默认值 L42-L44、get_scheduler_cls L168-L176）+ vllm/engine/arg_utils.py（按硬件/场景的默认值上调 L2244-L2295）"
+  ],
+  "history_evidence": [
+    "v1 首提交 6c5af09b3 '[V1] Implement vLLM V1 [1/N]' (#9289, 2024-10-22)：vllm/v1/core/scheduler.py 自诞生即含 'no decoding phase nor prefill phase' 注释与 num_computed_tokens=0 的 recompute-only 抢占——swap 在 v1 从未存在过，不是后来删的。",
+    "v0 移除提交 c99db8c8d '[V0 Deprecation] Remove V0 core' (#25321, 2025-09-20)：v0 的 vllm/core/scheduler.py（含 PreemptionMode SWAP/RECOMPUTE、swapped 队列、'Aborted due to the lack of CPU swap space' RuntimeError、woosuk 的 'bizarre' FIXME）在此删除，是 v0↔v1 对比的取材地（git cat-file c99db8c8d^:vllm/core/scheduler.py）。",
+    "外部论文（背景，非源码）：Orca arXiv:2103.00071（迭代级调度/选择性批处理，吞吐差距最高 36.9x 的出处）；Sarathi-Serve arXiv:2308.16369（chunked prefill，token 预算混相批的理论依据）。",
+    "v2 dossier 行号失准警示：artifacts/ch13、ch14 的 dossier 锚点（如 schedule() L352）是重基前写的，与当前 pin（schedule() L310）差约 40 行；ch11/ch12 dossier 锚点大体吻合。v3 引用一律以本次深读的锚点为准。"
+  ]
+}

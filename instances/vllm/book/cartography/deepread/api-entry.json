@@ -1,0 +1,102 @@
+{
+  "domain": "API 进程与两个使用面（LLM 离线同步面 / AsyncLLM 在线异步面 / OpenAI server / add_request 之后的回程分发 / RequestOutputCollector）",
+  "_meta": {
+    "pin": "vLLM v0.21.0 (ad7125a4)",
+    "kind": "v3-phase0-deepread",
+    "scope_note": "焦点=两个使用面如何共享同一套三件套、一个请求进 AsyncLLM 之后在 API 进程内发生什么、回程多路分发与 RequestOutputCollector 的存在理由、断连→abort、API 进程为何零 GPU。不含：ZMQ 拓扑/msgpack/零拷贝/握手时序（见 ipc-stage.json）、EngineCore busy loop 与 Scheduler 内部（见 engine-loop.json）、detokenizer 增量算法与 logprobs 细节（后续域）。三段式进程解耦的总 why 链在 ipc-stage.json 已展开（含官方博客 ~5ms 数字），本卡只在「双使用面」与「API 进程职责」视角引用其结论。",
+    "why_evidence_sources": "源码 pin + git 历史（v0 旧设计取自 commit e19bce40a~1 = PR #25025 删除前的 vllm/engine/async_llm_engine.py，行号经 git show 核对；演进 PR：#9826 AsyncLLM 初版、#12287 分块让出、#12298 合并输出、#15156 RequestOutputCollector）+ docs/design/arch_overview.md（pin 内）"
+  },
+  "why_chains": [
+    {
+      "decision": "双使用面共享同一套三件套（InputProcessor / EngineCore / OutputProcessor），不是两套引擎——LLM 同步面 = while step() 拉取循环，AsyncLLM 异步面 = 事件循环 + 单个 output_handler 后台任务",
+      "old_design": "v0 是两条并行类谱系：LLMEngine（同步）+ _AsyncLLMEngine(LLMEngine) 子类化 + AsyncLLMEngine 包装（历史 e19bce40a~1:vllm/engine/async_llm_engine.py:L254 `class _AsyncLLMEngine(LLMEngine)`），输出处理逻辑两处维护；同步面用户被劝去包一层 asyncio（源码注释至今残留：llm.py:L208-209 'For online serving, use the AsyncLLMEngine class instead'）。",
+      "pain": "同一套 detokenize/输出组装/请求生命周期逻辑要在 v0 的 LLMEngine.step 与 AsyncLLMEngine.engine_step 两条路径重复维护，行为漂移（离线与在线结果不一致的 bug 面）。双使用面是 vLLM 的产品形态（离线批处理库 + 在线 serving），任何割裂都是双倍成本。",
+      "solution": "v1 收敛为「三件套 + 两种驱动方式 + 两种 client」：LLMEngine（v1）与 AsyncLLM 的 __init__ 都构造同样的 InputProcessor/OutputProcessor/EngineCoreClient（vllm/v1/engine/llm_engine.py:L90-110 vs vllm/v1/engine/async_llm.py:L132-153）；差异只在 EngineCoreClient.make_client 的 asyncio_mode/multiprocess_mode 两轴（core_client.py:L81-103：SyncMPClient vs AsyncMPClient）与驱动方式——同步面 `_run_engine`: `while self.llm_engine.has_unfinished_requests(): self.llm_engine.step()`（vllm/entrypoints/llm.py:L1860-1861，step 内部 get_output→process_outputs→abort，llm_engine.py:L287-325）；异步面 output_handler 单任务（async_llm.py:L637-707）。OutputProcessor 用同一个 `req_state.queue is not None` 分支同时服务两种面：有 queue（AsyncLLM）→ put 进该请求的 collector；无 queue（LLMEngine）→ 收进 list 返回（output_processor.py:L680-685）。",
+      "cost": "一条代码路径两种模式：每次改动要同时推演两分支（queue 有/无）；同步面默认也付进程解耦的代价——VLLM_ENABLE_V1_MULTIPROCESSING 默认 True（envs.py:L129），离线 LLM 也 spawn 独立 EngineCore 进程（llm_engine.py:L148,L165-167），每步输出过一次 IPC，除非用户显式 =0 走 InprocClient；同步面的 detokenize 串行发生在调用者线程（无 asyncio 重叠），且 step() 阻塞在 outputs_queue.get()（core_client.py:L786-796）。"
+    },
+    {
+      "decision": "add_request 双登记：同一信息写两处——本进程 OutputProcessor.request_states 建表 + 跨进程发给 EngineCore",
+      "old_design": "v0 把请求交给单一 RequestTracker 缓冲，等下一次引擎循环迭代才真正进引擎（历史 e19bce40a~1:llm_engine.py 命名空间下 async_llm_engine.py:L182-204 add_request 先 put 进 _new_requests 队列、L222-243 get_new_and_aborted_requests 在 engine_step 开头一次性取出）。",
+      "pain": "请求要等后台循环下一 tick 才被引擎看到（入队延迟随负载抖动）；且 v0 的 demux 表和引擎状态在同一进程同一对象里，不存在「回程对账」问题——但 v1 拆进程后回程消息只有 request_id，没有本进程侧表就无法把 EngineCoreOutput 还原成有上下文（prompt、detokenizer 状态、输出模式）的 RequestOutput。",
+      "solution": "AsyncLLM._add_request 一次写两处，源码注释直接点名两侧：L408-409 `# Add the request to the OutputProcessor (this process).` → output_processor.add_request 建 RequestState（含 detokenizer/logprobs_processor/queue，output_processor.py:L533-562）；L411-412 `# Add the request to EngineCore (separate process).` → await engine_core.add_request_async(request)（async_llm.py:L400-415）。发送不等循环 tick——立刻经 ZMQ 出去（core_client.py:L1058-1061）。回程对账 = process_outputs 按 EngineCoreOutput.request_id（内部 id）查 request_states，查不到 = 已 abort，跳过（output_processor.py:L628-632）。",
+      "cost": "同一请求的状态在两个进程各有一份（本进程 RequestState vs 引擎进程 Request），生命周期要两边同步清理（本进程 _finish_request L714-726 / 引擎侧各自按 finished 清），对账错位就是泄漏或 KeyError——因此才有「查不到就跳过」的防御分支；登记顺序有讲究（先本进程后跨进程，保证回程消息到达时表已存在）。"
+    },
+    {
+      "decision": "RequestOutputCollector = 单槽 + asyncio.Event + 生产侧合并——刻意不用 asyncio.Queue",
+      "old_design": "v0 AsyncStream 每请求一条无界 asyncio.Queue：`self._queue: asyncio.Queue = asyncio.Queue()`，每条 RequestOutput put_nowait 排队（历史 e19bce40a~1:async_llm_engine.py:L74-99）。v1 初版（PR #9826, 2024-11）仍沿用 asyncio.Queue；#12298（2025-01）先在 generate() 消费侧加合并；#15156（2025-03，'[V1][Perf] Simpler request output queues'）才落成今天的单槽 collector（git show 9d72daf4c 已核对：diff 里 `queue: Optional[asyncio.Queue[RequestOutput]]` → `queue: Optional[RequestOutputCollector]`）。",
+      "pain": "SSE 消费者会滞后（TCP 背压、慢客户端、事件循环忙）——无界队列把每一条中间 RequestOutput 都留在内存：几百并发 × 长生成的中间态全部滞留；CUMULATIVE 模式下每条快照持有全量已生成文本，滞留代价是 O(len²) 级；asyncio.Queue 的 put/get 每次还有锁与 future 的固定开销。",
+      "solution": "RequestOutputCollector（output_processor.py:L48-109）：单槽 self.output + self.ready(Event)；put() 槽空则占槽置位（L67-69）；槽非空时 RequestOutput.add(aggregate=DELTA?) 就地合并——DELTA 把增量 text/token_ids/logprobs 拼进滞留对象、CUMULATIVE 直接替换成最新快照（L70-75 + outputs.py:L147-177 add()）；Exception 无条件抢槽（L67-69，错误优先于数据）；消费侧 get() 等事件、get_nowait() 非阻塞快路径（L81-99）；generate() 里 `out = q.get_nowait() or await q.get()`——先非阻塞取，空了才让出（async_llm.py:L576-579，注释 'avoids task switching under load which helps performance'）。消费者无论滞后多久，每请求驻留内存 O(1)。",
+      "cost": "单槽 = 慢消费者在 CUMULATIVE 模式下永远看不到中间快照（只有最新态幸存，语义上正确但失去逐步视图）；DELTA 合并让消费者收到的是融合大块而非逐 step 小块（省内存但失去节拍粒度）；错误抢槽会覆盖未取走的正常输出（设计取舍：错误优先）；`get_nowait() or await get()` 依赖 RequestOutput 恒真值——outputs.py 的 RequestOutput 未定义 __bool__/__len__（已核 grep 无匹配），将来若加 __len__ 空输出变假值，此行会静默错乱，是一个埋着的地雷；collector 的 close/__del__ 还要收拾流式输入的 _input_stream_task（L101-109）。"
+    },
+    {
+      "decision": "回程分发 = 单个长驻 output_handler 任务做 1→N 多路分发，按 VLLM_V1_OUTPUT_PROC_CHUNK_SIZE 分块并让出事件循环",
+      "old_design": "v0 的输出分发内嵌在引擎循环里同步做（同进程，RequestTracker.process_request_output 逐条 put，历史 e19bce40a~1:L150-167）；v1 初版 output_handler 一口气处理整批 EngineCoreOutputs（PR #12287 diff 已核对：原代码单次 process_outputs(outputs.outputs) 无分块）。",
+      "pain": "v1 里 API 进程只有一条 ZMQ 输出流，每步带回整批所有被调度请求的 EngineCoreOutputs；process_outputs 是纯 Python CPU 活（逐请求 detokenize + logprobs + 组装 RequestOutput），一批 256 请求一口气做完会长时间独占事件循环——期间不能 accept 新 HTTP、不能写任何 SSE、不能跑 add_request，所有请求一起被这一批拖住（事件循环头阻塞，直接伤 P99 延迟）。",
+      "solution": "output_handler（async_llm.py:L656-707）：单任务循环 `await engine_core.get_output_async()`（L660）→ 按 chunk_size 切片（默认 128，envs.py:L137）逐片 `output_processor.process_outputs(...)`（L671-677），片间 `await asyncio.sleep(0)`（L682-683）让事件循环喘气；process_outputs 内部按内部 req_id demux 到每请求自己的 collector（output_processor.py:L627-685，源码注释 'NOTE FOR DEVELOPERS ... This is the only function that should loop over EngineCoreOutputs' L615-622——全批遍历只许这一处）；stop-string 触发的收尾再回发 abort（L686-689）。任务捕获局部变量避免闭包反向引用 self 挡 GC（L643-654）；eager/lazy 双启动：__init__ 在事件循环内就启动（L170-176），否则首个 add_request 懒启动（L370-373）——为了让 OpenAI server 能在事件循环建好前构造 AsyncLLM 并优雅处理启动失败（L370-372 注释原话）。",
+      "cost": "每个输出多一跳异步（ZMQ 收 → queue → output_handler → collector → SSE，比 v0 多两级中转）；分块 + sleep(0) 在高负载下增加任务切换次数（用切换换公平）；单任务分发意味着 detokenize 仍是单核瓶颈（吞吐上限 = 一个 CPU 核的解码速度，靠 chunk 化摊薄延迟而非扩容）；eager/lazy 双启动 + is_running 在 handler 为 None 时返回 True（L1040-1043）这类生命周期特例是理解成本。"
+    },
+    {
+      "decision": "RequestOutputKind 三态契约（DELTA / CUMULATIVE / FINAL_ONLY）：使用面在入口声明消费方式，引擎照单裁剪输出流量",
+      "old_design": "v0 没有这个维度——引擎对每个请求每步都产完整输出，流式与否的差异全靠 API 层消化；v1 初版的 SamplingParams 也没有 output_kind（PR 历史中后补）。",
+      "pain": "离线批处理与非流式 HTTP 根本不需要每 token 的中间输出——照样生产、照样跨进程传、照样排队，是每 token 每请求的纯浪费（CPU + IPC + 内存）；流式 SSE 恰恰相反，要的就是增量。",
+      "solution": "SamplingParams.output_kind 三态枚举（vllm/sampling_params.py:L151-157），使用面在入口设定：OpenAI chat/completion stream=True→DELTA、stream=False→FINAL_ONLY（chat_completion/protocol.py:L605-607、completion/protocol.py:L316-318）；离线 LLM 强制 FINAL_ONLY（llm.py:L1825-1827 注释 'We only care about the final output'）。OutputProcessor 按单裁剪：FINAL_ONLY 且未结束 → make_request_output 直接返回 None，中间输出根本不构造（output_processor.py:L281-286）；DELTA 只发增量（L411-421 用 detokenizer.output_token_ids 偏移切）；collector 的合并模式也由它决定（L58 aggregate = DELTA）。另有 stream_interval 节流（>1 时每 N token 才发一次，L288-309）。",
+      "cost": "所有下游（logprobs 切片、routed_experts 拆分、metrics）都要感知这个第三轴；与 n>1 并行采样（ParentRequest 扇出/汇合，async_llm.py:L385-397、output_processor.py:L340-346）和流式输入叠加时分支组合爆炸；CUMULATIVE 这个中间态实际使用面很窄（库用户同步迭代），却是读者必须懂的三态之一。"
+    },
+    {
+      "decision": "request_id 双轨：用户给的外部 id + 随机后缀的内部 id，OutputProcessor 维护双向映射",
+      "old_design": "v0 一切以用户提供的 request_id 为键（RequestTracker._request_streams dict，历史 e19bce40a~1:L125），重复 id 直接 KeyError 或错路由。",
+      "pain": "真实世界用户会重试/复用 id（浏览器、SDK 重连）；流式输入会话要用同一外部 id 反复发多个引擎子请求；n>1 扇出的 n 个子请求要能汇回一条流——单轨 id 一撞就污染 demux 表。",
+      "solution": "InputProcessor.assign_request_id：外部 id 存入 external_req_id，内部 id = `{外部id}-{8位随机hex}`（input_processor.py:L214-232）；OutputProcessor 持 external_req_ids: defaultdict[str, list[str]] 外→内映射（L454,L562），输出组装时把外部 id 写回 RequestOutput（L311,L388 注释 'request_id is what was provided externally'）；abort 双轨皆可（abort_requests docstring L471-485：外部 id 一律展开为其全部内部 id，内部 id 单删）。",
+      "cost": "每个请求两套 id，日志与调试都要过一遍映射脑内换算；留 VLLM_DISABLE_REQUEST_ID_RANDOMIZATION 逃生舱（L225-230，警告重复外部 id 会出微妙错误）说明确有工具链假定两 id 相等；映射表本身的增删要精确跟随请求生命周期（_finish_request L714-726），错位即泄漏。"
+    },
+    {
+      "decision": "客户端断连 = 取消 generate 协程 = 反向 abort：把「没人看的请求」从引擎里抠掉",
+      "old_design": "v0 AsyncStream.generator 在 GeneratorExit 时 cancel（历史 e19bce40a~1:L110-112）——依赖生成器被关闭才触发；HTTP 层没有主动监听断连的统一机制。",
+      "pain": "HTTP 客户端中途断开（用户关页面、超时、重试换路）后，若不显式 abort，引擎会继续为幽灵请求逐 token 烧 GPU——batch 场景下这是真实吞吐损失：每个断连请求白白占一个 batch 位直到 max_tokens。",
+      "solution": "三层接力：① 路由层 with_cancellation 让 handler 任务与 listen_for_disconnect 竞速，断连则 cancel handler（vllm/entrypoints/utils.py:L41-98）；② StreamingResponse 取消传导为 generate() 的 CancelledError/GeneratorExit → `await self.abort(q.request_id, internal=True)`（async_llm.py:L591-596）；③ abort 两跳落地——本进程 OutputProcessor.abort_requests 移状态并给 collector 放一条 finish_reason=ABORT 的终态输出（防止还在等的消费者卡死，output_processor.py:L503-523），再 engine_core.abort_requests_async 跨进程通知引擎停算（async_llm.py:L709-721 → core_client.py:L1063-1065）。非流式全量路径同样接 CancelledError→'Client disconnected'（chat_completion/serving.py:L1020-1021）。",
+      "cost": "每请求多一个竞速任务（listen_for_disconnect 持续读 receive 通道）；abort 是异步的——断连到引擎真停之间还差一次 IPC + 引擎当前 step，期间仍会算出若干废 token（浪费有界但不为零）；abort 的终态输出依赖 collector 还活着（generate 的 finally q.close() 与 abort 的时序竞争由 internal id 与 put 的幂等性兜住）。"
+    },
+    {
+      "decision": "API 进程零 GPU：tokenize/detokenize/SSE/协议适配全部留在前端进程，GPU 上下文只存在于 EngineCore 及其 worker",
+      "old_design": "反事实：若 API 进程持有 CUDA 上下文（v0 的引擎在同进程时代接近这种形态）——调度与 HTTP 同进程同 GIL，fork 生成引擎进程会撞 CUDA-fork 不兼容（pin 内文档：docs/design/multiprocessing.md:L57 'Known issues exist when using fork after initializing these dependencies'，cli_env_setup 注释 utils.py:L153-171）。朴素做法也可能是「为了省 IPC，把 detokenize 挪去引擎进程」。",
+      "pain": "三个指标同时被卡：① 并发——HTTP/JSON/SSE 的 CPU 活与引擎调度抢同一 GIL，越忙越互相拖；② 部署弹性——API 进程数应可独立于 GPU 数水平扩展（arch_overview.md:L87-89：API server 进程 'handles HTTP requests, performs input processing (tokenization, multi-modal data loading), and streams results back'，且 --api-server-count 可与 DP 规模解耦、多对多连引擎）；③ 存活——引擎崩溃若同进程即整站死，拆开后 monitor 线程把死讯转成每请求的 EngineDeadError（core_client.py:L641-665 validate_alive L447-450 → async_llm.py:L599-602），服务器还能优雅收尾。把 detokenize 留在前端的另一面收益：CPU 重的解码贴近消费端、可随 API 进程扩展，GPU 循环不为它停。",
+      "solution": "职责清单钉死在代码里：API 进程 = InputProcessor（tokenize/校验，input_processor.py:L36+）+ OutputProcessor（detokenize/logprobs/组装，output_processor.py:L438+）+ serving 层（SSE 组装）；API 进程内的 torch 仅限 CPU profiler（async_llm.py:L186-198，activities=[ProfilerActivity.CPU]）与 CPU 占位张量（output_processor.py:L45 EMPTY_CPU_TENSOR = torch.empty(0, device='cpu')）；GPU 一切在 EngineCore 进程的 busy loop 与其 worker（core.py:L1168-1176；见 engine-loop.json）。spawn 引擎进程时甚至预加载 async_llm 进 forkserver 避免重复 import（openai/api_server.py:L84-90）。",
+      "cost": "边界两侧各持一份请求状态、靠 msgpack 消息对账（代价详见本卡双登记链 + ipc-stage.json）；stop-string 在前端 detokenizer 里才能判定，引擎看不见——命中后要反向再发一次 ABORT 让引擎停（output_processor.py:L655-662 判定 → L697-700 reqs_to_abort → async_llm.py:L686-689），期间引擎白算几个 token；纯 CPU 玩具模型场景下进程拆分纯属开销（InprocClient 逃生舱 core_client.py:L274）。"
+    }
+  ],
+  "contracts": [
+    "HTTP → 使用面：POST /v1/chat/completions 进 FastAPI 路由 create_chat_completion（vllm/entrypoints/openai/chat_completion/api_router.py:L40-53，@with_cancellation L51），pydantic ChatCompletionRequest 被 to_sampling_params 转成 SamplingParams 且 output_kind 由 stream 决定（chat_completion/protocol.py:L605-607）。数据所有权：请求体对象归 API 进程堆，FastAPI handler 私有。",
+    "使用面 → 引擎门面：serving 层调 engine_client.generate(prompt, sampling_params, request_id, ...) 拿 AsyncGenerator[RequestOutput]（chat_completion/serving.py:L347-361）；接口契约 = EngineClient 抽象基类（vllm/engine/protocol.py:L40+，generate L64-84）——LLMEngine(异步包装的 AsyncLLM) 是仅有的两个实现面，OpenAI 层只面向此协议编程。",
+    "AsyncLLM 内部 → InputProcessor：add_request 把 PromptType 交给 input_processor.process_inputs 校验+tokenize 产 EngineCoreRequest（async_llm.py:L349-360 → input_processor.py:L234+）；assign_request_id 盖内部 id（L215-232）。纯 API 进程内调用，GPU 零接触。",
+    "AsyncLLM → EngineCore（跨进程出向）：await engine_core.add_request_async(request)（async_llm.py:L412 → core_client.py:L1058-1061）——AsyncMPClient 唯二常用来 await 之一；线格式 EngineCoreRequest msgspec.Struct array_like/omit_defaults（v1/engine/__init__.py:L80-137），首帧 EngineCoreRequestType.ADD=b'\\x00'（L249）。所有权：发送方保活底层缓冲直至 ZMQ 发完（pending_messages core_client.py:L630-636, L1028-1036）；接收方解码出自己那份副本——除多模态 torch_shm 旁路外无共享内存（core_client.py:L548-553，详见 ipc-stage.json）。",
+    "EngineCore → API 进程（跨进程回向）：引擎输出线程 PUSH EngineCoreOutputs（core.py:L1470-1504）；AsyncMPClient 的 process_outputs_socket 任务 PULL+解码进 outputs_queue（core_client.py:L942-988，任务名 'EngineCoreOutputQueueTask'）；AsyncLLM.output_handler await get_output_async 取（async_llm.py:L660 → core_client.py:L990-999）。EngineCoreOutputs = 每步一条、整批打包（__init__.py:L212-240）。",
+    "OutputProcessor → 使用面（demux 契约）：process_outputs 以 EngineCoreOutput.request_id（内部 id）查 request_states（output_processor.py:L628-632，查不到=已 abort 跳过），RequestState.queue.put(RequestOutput) 分发（L680-682）；queue is None 则走同步面收集 list（L683-685）。RequestOutputCollector 对象由 AsyncLLM.add_request 创建（async_llm.py:L376）、注册进 RequestState（output_processor.py:L553）、返回给 generate() 调用者（async_llm.py:L381-398）——生产者=output_handler 任务，消费者=该请求自己的 generate 协程，生命周期归 generate 的 finally q.close()（L633-635）。",
+    "同步面（LLMEngine）回程：step() 经 SyncMPClient.get_output 阻塞取（后台 EngineCoreOutputQueueThread 喂 queue.Queue，core_client.py:L745-796），process_outputs 返回 RequestOutput 列表，_run_engine 只收 finished 且按 int(request_id) 排序还原输入序（llm.py:L1860-1892）。",
+    "GPU 所有权边界：API 进程持有 tokenizer/detokenizer/RequestOutput/ZMQ sockets，GPU 上下文与 KV cache 全在 EngineCore 及 worker（core.py:L1168-1176 的 busy loop 与 API 进程 GIL 无关，core.py:L888-892 注释：ZMQ IO 线程释放 GIL 与 GPU 重叠）。引擎侧任何结果到 API 进程都必须先变成 msgpack 字节——没有跨边界的活对象引用。",
+    "死亡传播：引擎进程死 → monitor 线程置 engine_dead（core_client.py:L641-665）→ 后续调用 validate_alive 抛 EngineDeadError（L447-450）→ generate() 上抛（async_llm.py:L599-602）；output_handler 自身异常 → propagate_error 给全部在飞请求的 collector（async_llm.py:L703-705 → output_processor.py:L464-469）——每个等待中的消费者都能收到异常退出而非挂死。"
+  ],
+  "data_flow": "一个流式 chat 请求的一生（file:line，pin v0.21.0）：\n1. uvicorn 收 POST /v1/chat/completions → create_chat_completion（chat_completion/api_router.py:L53，with_cancellation 已挂断连监听）。\n2. 校验+渲染 prompt+建 SamplingParams（output_kind=DELTA，chat_completion/protocol.py:L605-607）。\n3. generator = engine_client.generate(...)（chat_completion/serving.py:L347-361）——只建协程不驱动；stream=True 进 chat_completion_stream_generator（L368-379）。\n4. SSE 循环首个 async for 驱动 AsyncLLM.generate → q = await self.add_request(...)（async_llm.py:L559-571）。\n5. InputProcessor.process_inputs 校验+tokenize 产 EngineCoreRequest（input_processor.py:L234+）；assign_request_id 加随机后缀（L215-232）。\n6. _add_request 双登记：output_processor.add_request 本进程建 RequestState（async_llm.py:L409）+ await engine_core.add_request_async 跨进程发送（L412；core_client.py:L1058-1061 msgpack→ZMQ ROUTER）。\n7. 引擎进程：DEALER 收→input 线程解码入 input_queue（core.py:L829,L1376+）→ busy loop _process_input_queue 入 scheduler（L1172,L1194-1195）→ _process_engine_step 调度+执行，EngineCoreOutputs 由输出线程 PUSH 回（L1213-1216,L1489）。\n8. API 进程：process_outputs_socket 任务 PULL+解码→outputs_queue（core_client.py:L942-988）。\n9. output_handler 任务 await get_output_async（async_llm.py:L660；core_client.py:L990-999）。\n10. 按 chunk_size 分片 process_outputs（async_llm.py:L671-677，片间 sleep(0) L682-683）：内部 req_id 查 RequestState（output_processor.py:L628-632）→ IncrementalDetokenizer.update 增量解码+stop-string 判定（L655-662）→ make_request_output 按 DELTA 产增量（L669; L281-309 FINAL_ONLY 在此被吞）→ req_state.queue.put(request_output)（L680-682）。\n11. generate() 消费循环 out = q.get_nowait() or await q.get()（async_llm.py:L579），yield RequestOutput；out.finished 为真时结束（L584）。\n12. SSE generator 把 delta 组装成 chat.completion.chunk JSON 行写出（serving.py:L496+）。\n13. 客户端断连：listen_for_disconnect 胜出→cancel handler（utils.py:L41-98）→ generate 捕获 CancelledError → await self.abort(q.request_id, internal=True)（async_llm.py:L591-596）→ OutputProcessor 移状态+投 ABORT 终态解阻塞（output_processor.py:L503-523）+ engine_core.abort_requests_async 通知引擎（async_llm.py:L717-718）；finally q.close()（L633-635）。",
+  "first_read_suggestion": "本域是全书第一 Part 的自然入口——读者从前门走进系统，而前门的一切（HTTP/SSE/asyncio/进程/队列）恰好是不懂 AI 的后端工程师已经会的：把「推理服务」讲成「一个反向代理 + 一个独占 GPU 的 worker 池」，认知负担最小。建议：(1) 首章讲两个使用面与三段式鸟瞰（LLM vs AsyncLLM vs OpenAI server 的关系），唯一 AI 前置只需一句黑盒话——「prompt 是一串 token id，生成是逐 token 迭代」；tokenize/detokenize 细节留给后续输入/输出处理章。(2) 第二个 zoom = add_request 双登记（async_llm.py:L400-415 一个函数写两处）+ 边界上的数据形状（EngineCoreRequest/EngineCoreOutput 的 msgspec 结构），依赖前置=进程/线程/GIL（后端读者的复习内容）。(3) 第三个 zoom = 回程链（output_handler → demux → RequestOutputCollector → SSE）——这是本域最精彩一课，「为什么它不是 asyncio.Queue」是给后端读者的完美 quiz：他们必然猜 Queue，用 v0 无界 Queue 的痛点（SSE 背压→内存滞留）引出单槽+合并，顿悟点极强。必须晚讲的：EngineCore 内部（scheduler/KV cache，见 engine-loop）、detokenizer 增量算法、logprobs、ParentRequest n>1 细节——本域一律当对面黑盒引用，否则开篇即淹没（v2 病根 3）。概念首现依赖：RequestOutputKind/FINAL_ONLY 应与 LLM 同步面同章首现（它是「离线为什么便宜」的答案）；external/internal request_id 双轨必须在讲 abort/断连之前立好；STREAM_FINISHED 哨兵推迟到流式输入场景章。相邻卡衔接：本卡止步于 ZMQ 帧，线格式/拓扑细节引 ipc-stage.json；引擎侧 busy loop 引 engine-loop.json。",
+  "key_files": [
+    "vllm/v1/engine/async_llm.py",
+    "vllm/v1/engine/output_processor.py",
+    "vllm/v1/engine/llm_engine.py",
+    "vllm/v1/engine/input_processor.py",
+    "vllm/v1/engine/core_client.py",
+    "vllm/v1/engine/__init__.py",
+    "vllm/v1/engine/core.py",
+    "vllm/entrypoints/llm.py",
+    "vllm/entrypoints/openai/api_server.py",
+    "vllm/entrypoints/openai/chat_completion/serving.py",
+    "vllm/entrypoints/openai/chat_completion/protocol.py",
+    "vllm/entrypoints/openai/chat_completion/api_router.py",
+    "vllm/entrypoints/utils.py",
+    "vllm/entrypoints/api_server.py",
+    "vllm/engine/protocol.py",
+    "vllm/outputs.py",
+    "vllm/sampling_params.py",
+    "vllm/envs.py",
+    "docs/design/arch_overview.md",
+    "docs/design/multiprocessing.md"
+  ]
+}

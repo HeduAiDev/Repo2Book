@@ -1,0 +1,113 @@
+{
+  "domain": "三段式与 IPC 边界（frontend 进程 / EngineCore 进程 / ZMQ+msgpack 消息层）",
+  "_meta": {
+    "pin": "vLLM v0.21.0 (ad7125a4)",
+    "kind": "v3-phase0-deepread",
+    "scope_note": "焦点=EngineCoreRequest 的诞生、socket 拓扑选择、msgpack+零拷贝 tensor、EngineCoreOutput 回程、v0→v1 完整 why 链。不含：调度器内部、detokenize 算法细节（相邻域）、DP 负载均衡策略（DP 域，本卡只讲它对 socket 拓扑的塑造）。",
+    "why_evidence_sources": "源码 pin + git 历史（blobless clone 的 commit/PR body 经 GitHub API 核对：#9826/#10245/#11074/#11963/#12287/#12918/#13790/#15906/#32104）+ vLLM 官方 V1 alpha 博客（blog.vllm.ai 2025-01-27，'GPU execution time on the GPU is as low as ~5ms' 与 'isolated EngineCore execution loop' 原话均已核对）"
+  },
+  "why_chains": [
+    {
+      "decision": "三段式进程解耦：前端进程（InputProcessor + OutputProcessor，与 API server 同进程）+ EngineCore 独立进程（只留 scheduler + model executor）",
+      "old_design": "V0 AsyncLLMEngine：引擎步进（engine_step/run_engine_loop）就是 API server 进程 asyncio 事件循环里的一个后台 task（历史版本 e19bce40a~1:vllm/engine/async_llm_engine.py L615-681 已从 git 核对）；tokenize/detokenize 也在同进程——V0 LLMEngine 内置 Detokenizer + SequenceGroupOutputProcessor（历史 e19bce40a~1:vllm/engine/llm_engine.py L232-235,L376）。为了避免阻塞事件循环，V0 被迫把整条引擎链路 async 化（step_async/add_request_async 遍布代码）。",
+      "pain": "GPU 变快后 CPU 开销成为瓶颈：Llama-8B@H100 单 step 低至 ~5ms，API server/调度/输入准备/detokenize/流式输出这些 CPU 活与 GPU 循环同进程串行、互抢 GIL（官方 V1 alpha 博客原话：'the CPU overhead ... becomes increasingly pronounced'）。PR #9826 的 SUMMARY 一句话：'better overlapping of GPU and CPU'。",
+      "solution": "PR #9826（2024-11，AsyncLLM/EngineCoreProc 首次落地）：EngineCore 搬进后台进程 busy loop；tokenization/多模态处理/detokenize/流式留在前端。v0.21.0 落点：AsyncLLM.__init__ 一次性构造三段（vllm/v1/engine/async_llm.py:L135-L153，源码注释 'Convert EngineInput --> EngineCoreRequest' / 'Converts EngineCoreOutputs --> RequestOutput' / '(starts the engine in background process)'）；EngineCoreProc.run_busy_loop（vllm/v1/engine/core.py:L1168-L1176）；引擎进程内再分两个 IO 线程 + 两个 queue.Queue，把 ZMQ IO 与 busy loop 解耦（core.py:L888-L915，注释原话 'overlap ZMQ socket IO with GPU since they release the GIL, and to overlap some serialization/deserialization with the model forward pass'）。",
+      "cost": "每请求生命周期至少 2 次跨进程消息（请求进 1 条 EngineCoreRequest、输出出 N 条打包在每 step 1 条的 EngineCoreOutputs 里）；两侧各付一次序列化 CPU；启动从'调构造函数'变成协议（HELLO→init→READY→EngineCoreReadyResponse 四步，见 data_flow，超时 VLLM_ENGINE_READY_TIMEOUT_S 默认 600s，vllm/envs.py:L26——给大模型慢加载留量）；故障域分裂：引擎进程崩溃要靠单帧哨兵 ENGINE_CORE_DEAD（core.py:L813,L1362-L1374，linger=4000 保证死讯先于关 socket 发出）+ 前端 monitor 线程（core_client.py:L641-L665）转成 EngineDeadError；跨界对象必须 msgpack 可序列化（默认拒绝任意 Python 对象，逃生舱 VLLM_ALLOW_INSECURE_SERIALIZATION 走 pickle 但有注入风险，vllm/v1/serial_utils.py:L221-L226）；调试要跨进程看两份日志。"
+    },
+    {
+      "decision": "多进程默认开启（连离线同步 LLM 也默认走 ZMQ SyncMPClient）",
+      "old_design": "初版 V1 多进程默认关（PR #9826 TODO 原话 'need to figure out a way around fork'——fork 与已初始化的 CUDA 冲突），只有显式设 env 才开；离线 LLM 走 InprocClient。",
+      "pain": "inproc 与 mp 两套路径行为分叉、双份测试矩阵；sync/async 差异无法收敛到一处。",
+      "solution": "PR #11074（2024-12，附设计文档 docs/design/multiprocessing.md）：VLLM_ENABLE_V1_MULTIPROCESSING 默认 true（vllm/envs.py:L129），fork/spawn 按环境自动选择。v0.21.0 落点：LLMEngine.from_vllm_config 默认 multiprocess_mode=envs.VLLM_ENABLE_V1_MULTIPROCESSING（vllm/v1/engine/llm_engine.py:L148,L165-L167）；InprocClient 保留为 V0 兼容/测试路径（core_client.py:L274-L290，注释 'no busy loop'——同步逐个 step，不存在忙等）。",
+      "cost": "离线推理也要付 IPC + 序列化税；spawn 语义要求一切可 pickle；fork 默认值依赖'使用者没先碰 CUDA'的脆弱假设（文档明言）。"
+    },
+    {
+      "decision": "输入通道：client ROUTER(bind) / engine DEALER(connect, identity=dp_rank 两字节小端)",
+      "old_design": "初版（PR #9826，git show 6ace6fba2 已核对）：client PUSH bind / engine PULL connect，另开第三条一次性 PUSH/PULL socket 传 'READY' 字符串。",
+      "pain": "PR #15906（2025-04）作者原话：① 'So that a single queue / socket address can be used for all engines'——DP 下 client 要能定向发给 N 个引擎中的某一个，PUSH 无寻址能力，就得每引擎一条 socket；② ready 走独立 socket 有竞态 'the front-end could start sending messages before the engine has finished connecting'；③ 远程引擎（多节点）需要 client 侧 bind。",
+      "solution": "PR #15906 改拓扑：client 输入 socket = ROUTER bind（core_client.py:L511-L517 外部管理 / L524-L530 自管两种构造路径）；engine = DEALER connect 且 ZMQ IDENTITY = engine_index.to_bytes(2,'little')（core.py:L836,L1392-L1399）；ready 信号改走同一 socket 的首条消息——DEALER 必须先说话 ROUTER 才认识它（core.py:L1423-L1427 注释原话 'this is required before the front-end ROUTER socket can send input messages back to us'）；client 每条消息首帧带目标引擎 identity（core_client.py:L802 同步 / L1023 异步，消息布局 (Identity, RequestType, *Payload帧)）。engine identity 列表 core_client.py:L573-L575。",
+      "cost": "ROUTER 信封让每条消息多一个帧；'对端必须先发言'成为硬约束（于是 ready-first 协议写死进启动时序）；同 identity 重连需要 ROUTER_HANDOVER（elastic EP 场景，core_client.py:L498-L500 + network_utils.py:L318-L320）——复杂度又长了一层。DP=1 的普通部署也要为它用不上的寻址能力付信封开销。"
+    },
+    {
+      "decision": "输出通道：保持最廉价的 engine PUSH(connect) / client PULL(bind)；多前端时引擎按 client_index 选 PUSH socket",
+      "old_design": "初版输出也是 PUSH/PULL（engine PUSH bind / client PULL connect，单前端）；朴素替代方案是请求-应答式 socket（REQ/REP 或 ROUTER/DEALER 双向）。",
+      "pain": "输出是纯单向扇入（N 引擎 → 1 前端），应答式每条消息都要配对等待、engine 会被慢前端反压卡住 GPU；PUSH/PULL 是 ZMQ 里最便宜的单向管道。",
+      "solution": "engine 侧为每个前端 client 建一条 PUSH connect（core.py:L1487-L1492，output_paths 每前端一个地址），输出消息按 scheduler.update_from_output 给出的 client_index 选 socket（core.py:L1511-L1527，`sockets[client_index].send_multipart`）；client 侧单条 PULL bind 收所有引擎输出（core_client.py:L518-L520,L531-L533）；所有相关 socket 置 HWM=0（无高水位限制）+ 大内存机器上 0.5GB 内核缓冲（vllm/utils/network_utils.py:L299-L316，函数头注释注明改编自 SGLang）。",
+      "cost": "无反压：HWM=0 + 0.5GB 缓冲意味着前端卡死时消息持续堆积、内存风险自担（换取 engine 永不因前端慢而阻塞 GPU 的决定）；fire-and-forget 无送达确认，死讯靠 ENGINE_CORE_DEAD 哨兵 + linger 兜底；client_index 寻址发生在消息内容层（scheduler 算好）而非 ZMQ 层——多了一处必须两边一致的字段契约。"
+    },
+    {
+      "decision": "序列化格式：msgpack + 自定义 tensor/ndarray 扩展（而非 pickle、而非裸 msgpack）",
+      "old_design": "三段演变（git 核对）：① PR #9826 初版就用 msgspec.msgpack（只认原生类型）；② PR #10245（2025-01）因多模态输入带 PIL image 等类型，整体退回 pickle（作者原话 'Since the multimodal inputs include types incompatible with msgspec (e.g., PIL images), we use pickle'）；③ PR #12918（2025-03）回到 msgpack。",
+      "pain": "pickle 慢且有安全面（对象反序列化可执行代码）；PR #12918 原话 'This should mean more efficient serialization'。",
+      "solution": "MsgpackEncoder/MsgpackDecoder 带 enc_hook/dec_hook 处理 torch.Tensor/np.ndarray/多模态结构/slice（serial_utils.py:L136-L311 编码侧、L313-L483 解码侧）；消息 Struct 用 msgspec 的 array_like=True（按位置数组编码而非键值映射，载荷更小）+ omit_defaults=True + gc=False（vllm/v1/engine/__init__.py:L80-L85,L167-L172,L212-L217）；FinishReason 用 IntEnum 而字符串，注释原话 'Int rather than Str for more compact serialization'（__init__.py:L42-L47）。pickle 仅在 VLLM_ALLOW_INSECURE_SERIALIZATION=1 时作为回退（serial_utils.py:L221-L226）。",
+      "cost": "自定义编解码器代码复杂度高；schema 演进要求两端同步（Struct 字段增删需兼容）；不认识的类型默认直接 TypeError 拒发（调试期友好、运行期是硬错误）。"
+    },
+    {
+      "decision": "msgpack 多帧零拷贝：大 tensor 的后备缓冲作为独立 ZMQ 帧直传，不拷进主 buffer",
+      "old_design": "张量先转 bytes 再整体 encode 进单一 msgpack buffer → 每次发送至少两次内存拷贝（encode 一次 + zmq send 一次）。",
+      "pain": "多模态大图/视频张量 MB~百 MB 级，逐请求重复拷贝直接吃 TTFT 与内存带宽。PR #13790（2025-04）作者原话 'the backing data of tensors/numpy arrays contained in messages is sent directly by zmq without copying'。",
+      "solution": "PR #13790：MsgpackEncoder.encode 返回 buffer 序列（serial_utils.py:L166-L178，aux_buffers 隐藏传参技巧的注释在 L157-L160）；tensor 字段编码为 (dtype, shape, index) 三元组，index 指向 aux buffer（L257-L273）；tensor_data() 取 uint8 memoryview 视图而非拷贝（vllm/v1/utils.py:L443-L453）；send_multipart(copy=False) 分帧直传（core_client.py:L806-L810 同步 / L1026-L1029 异步）；解码端 torch.frombuffer 建零拷贝视图、按需 pin_memory/clone 以保证安全异步 CPU→GPU 拷贝（serial_utils.py:L399-L425）；阈值 VLLM_MSGPACK_ZERO_COPY_THRESHOLD 默认 256B（envs.py:L186），小于它的 CPU 张量走 CUSTOM_TYPE_RAW_VIEW 内联（serial_utils.py:L243-L246,L262-L264）。引擎输出侧还复用 bytearray（encode_into，core.py:L1521-L1526）摊销分配。",
+      "cost": "发送侧必须保活底层对象直到 ZMQ 发完——MessageTracker + pending_messages deque 两端各一套（core_client.py:L603,L630-L636,L1028-L1036；core.py:L1479-L1532）；接收侧零拷贝视图会锁住整条消息缓冲（serial_utils.py:L390-L393 注释原话警告）；MsgpackEncoder 显式非线程安全（L139-L141 注释）。"
+    },
+    {
+      "decision": "多模态超大/CUDA 张量走 OOB 共享内存旁路（torch.multiprocessing.Queue），msgpack 里只放句柄",
+      "old_design": "所有张量数据都进 ZMQ 帧——即使有上一条链的零拷贝，跨进程仍要过一遍 socket；CUDA 张量还得先 GPU→CPU。",
+      "pain": "PR #32104（2025-08）原话：视频解码重负载里 HW 解码结果在 API server 进程的 VRAM，经 ZMQ 要 'GPU->CPU->GPU copies' 两跳。",
+      "solution": "MsgpackEncoder 增加 oob_tensor_consumer 钩子（serial_utils.py:L57-L71 接口、L260-L265 接线）：TensorIpcSender 把 tensor share_memory_() 后 put 进 torch.mp Queue、msgpack 主 buffer 里只放 {sender_id, message_id, tensor_id} 句柄（vllm/v1/engine/tensor_ipc.py:L69-L105）；engine 侧 TensorIpcReceiver 以 drain-and-buffer 模式从队列取回共享张量（tensor_ipc.py:L124-L178）；仅 multimodal_config.mm_tensor_ipc=='torch_shm' 时启用（core_client.py:L548-L553 / core.py:L841-L844 / engine/utils.py:L1018-L1021 三处接线）。",
+      "cost": "单队列只打 rank 0、DP>1 不支持（tensor_ipc.py:L48-L50 类注释明言）；句柄走 ZMQ、数据走队列两条通道 → 可能乱序，接收端要做缓冲重排 + 过期清理（L141-L178）；发送失败要能优雅回退普通序列化（L99-L105）；mm processor cache 开启时此路径失效（PR 自述 known limitation）——这是为视频这类'单次大块、cache 不命中'负载特化的通道。"
+    },
+    {
+      "decision": "输出按步聚合：每个 forward step 只发一条 EngineCoreOutputs（整批所有请求的新 token 打包）",
+      "old_design": "朴素做法（也是多数自研推理服务的第一版）：逐请求、逐 token 发事件/回调。",
+      "pain": "每条消息有固定开销（ZMQ 帧 + msgpack 头 + 解码出的对象）；小模型 5ms/step、批内几十上百请求时，逐 token 发消息的 IPC 次数和前端唤醒次数爆炸。",
+      "solution": "EngineCoreOutputs = outputs: list[EngineCoreOutput]（每请求一条：request_id + new_token_ids + finish_reason 等，__init__.py:L167-L197,L212-L240；代码里还留着 NOTE(Nick) 'We could consider ways to make this more compact, e.g. columnwise layout'——行式布局尚未榨干）；step() 返回 dict[client_index → EngineCoreOutputs]（core.py:L406-L435，update_from_output 产出；L1213-L1216 逐 client 入 output_queue）；前端 output_handler 整取后再按 VLLM_V1_OUTPUT_PROC_CHUNK_SIZE=128 切片喂 OutputProcessor、块间 await asyncio.sleep(0) 让出事件循环（async_llm.py:L656-L691，envs.py:L137）。",
+      "cost": "单条消息变大 → 解码与 detokenize 若一口气做完会长时间独占前端事件循环，逼出 chunk+sleep(0) 机制（这正是 PR #12287 的动机之一，其 A100/Llama-3.2-1B/6000 请求基准：req/s 63.62→67.72（+6.4%），mean TTFT 229.23→197.34ms（−14%），mean TPOT 30.02→28.30ms，p99 TPOT 68.90→47.38ms（−31%））；行式序列化密度低于列式（NOTE 承认）。"
+    },
+    {
+      "decision": "EngineCoreRequest 诞生即 tokenized：跨界只传 token ids，不传文本；tokenization 属前端进程",
+      "old_design": "V0 同进程，引擎自己拿文本 tokenize（LLMEngine 内 input_preprocessor）；V1 早期 EngineCoreRequest 也带 prompt 文本字段（git 核对：b25cfab9a~1:vllm/v1/engine/__init__.py L24 `prompt: Optional[str]`），直到 PR #11963（2025-01）'Avoid sending text prompt to core engine' 删掉。",
+      "pain": "文本字符串白白过 IPC（同一段 prompt 既占字节又要在引擎侧解码）；tokenizer 是 CPU 大户，留在引擎进程会挤占'只做调度+执行'的核心循环（三段式设计目标）。",
+      "solution": "v0.21.0 完整链：API 层 → Renderer.render_cmpl/render_chat → BaseRenderer._tokenize_prompt 里 tokenizer.encode 产出 TokensPrompt（vllm/renderers/base.py:L401-L412，含 async 版 L414-L425）→ InputProcessor.process_inputs 校验/克隆 params/整理 mm_features 后构造 EngineCoreRequest（vllm/v1/engine/input_processor.py:L234-L377，构造点 L362-L377）；EngineCoreRequest 字段表里没有 prompt 字符串、只有 prompt_token_ids/prompt_embeds/mm_features（__init__.py:L80-L137）。",
+      "cost": "前端进程必须加载并持有 tokenizer（内存 + 冷启动成本）；token 列表跨界后两边各持一份副本（引擎解码出自己的 list，随生成 append 独占可变）；vocab 越界等输入错误只能在提前报——错误位置被搬到前端（input_processor.py:L461-L476），与引擎侧错误（走 ERROR finish_reason 回程）形成两条不同的报错通路，读者容易混。"
+    },
+    {
+      "decision": "客户端抽象：InprocClient/SyncMPClient/AsyncMPClient 三实现共享一个 ABC + make_client 工厂",
+      "old_design": "V0 是两台平行引擎：LLMEngine（同步）与 AsyncLLMEngine（异步，1032 行适配层，历史 e19bce40a~1 已核对）——sync/async 差异浸透整个引擎代码。",
+      "pain": "双引擎代码分叉是 V0 公认的最大维护负担之一（v1_guide.md 的 V0/V1 差异表即为此而设）；同一 bug 要修两处。",
+      "solution": "三段式把 sync/async 差异压进 client 一层（core_client.py:L69-L103 make_client 工厂、L74-L78 docstring 列三实现；ABC 方法面 L135-L271）：AsyncLLM 与 LLMEngine 共享 InputProcessor/OutputProcessor/EngineCore 全部主体；同步路径的差异只剩『谁来 pump 输出』——SyncMPClient 用一条守护线程收 PULL 塞 queue.Queue（L745-L784），AsyncMPClient 用 asyncio task 塞 asyncio.Queue（L942-L988）。",
+      "cost": "ABC 方法面宽（sync/async 成对翻倍约 40 个方法，大部分是 raise NotImplementedError 的占位）；Inproc 与 MP 的行为差异（如 pause 'wait' 模式 inproc 不支持，core.py:L656-L657 / core_client.py:L322-L326）仍需测试矩阵兜住。"
+    }
+  ],
+  "contracts": [
+    "【输入·上游→本域】API 层（entrypoints/openai serving）调 AsyncLLM.generate/add_request，传 PromptType|EngineInput（或已 tokenized 的 EngineCoreRequest）+ SamplingParams/PoolingParams。tokenization 发生在前端进程的 Renderer（vllm/renderers/base.py:L401-L412），InputProcessor.process_inputs 是 EngineCoreRequest 的唯一诞生地（input_processor.py:L362-L377）。EngineCoreRequest 是『前端→引擎』唯一请求载体，schema=msgspec.Struct（__init__.py:L80-L137），两端必须同步演进。",
+    "【输入·本域→引擎域】引擎进程 input IO 线程收到 ADD(b'\\x00') 后，由 EngineCore.preprocess_add_request 做 EngineCoreRequest→Request 的转换（core.py:L769-L791；Request.from_engine_core_request 在 vllm/v1/request.py:L191-L215）再交 scheduler.add_request（core.py:L346）。Request 及其 _all_token_ids 从此归引擎进程独占、可变（request.py:L133-L138 append_output_token_ids L217-L226）——前端不再触碰。",
+    "【输出·引擎域→本域】scheduler.update_from_output 产出 dict[client_index → EngineCoreOutputs]（core.py:L431-L435），经引擎 output IO 线程按 client_index 选 PUSH socket 送出（core.py:L1511-L1527）。EngineCoreOutput.new_token_ids/finish_reason 是引擎写给前端的最终结论；引擎侧不 detokenize。",
+    "【输出·本域→API 层】OutputProcessor.process_outputs 按 req_id 查 RequestState、detokenize、组装 RequestOutput，put 进该请求自己的 RequestOutputCollector（output_processor.py:L48-L109 单槽+Event，put 合并语义 L65-L79；demux 在 process_outputs L597 起）；generate() 用 q.get_nowait() or await q.get() 消费（async_llm.py:L576-L586）。一批 EngineCoreOutputs 可扇出到 N 个请求的 collector。",
+    "【数据所有权·token ids】前端 InputProcessor 写（构造 EngineCoreRequest 时）→ msgpack 复制过线 → 引擎解码出独立副本 → Request._all_token_ids 引擎独占可变。采样参数同理：前端 params.clone() 后送线（input_processor.py:L307,L322），两端各持独立副本、互不影响。",
+    "【数据所有权·张量】普通模式：字节躺在 ZMQ 消息缓冲里，解码端按需 clone/pin 成 PyTorch 自有内存（serial_utils.py:L416-L423，注释明言 clone 是为安全的异步 CPU→GPU 传输）。torch_shm 模式：所有权跨进程共享（share_memory_ 的 refcount 由 torch shm 文件管理），TensorIpcReceiver 缓冲持有直到对应消息被解码取走（tensor_ipc.py:L141-L178）。",
+    "【数据所有权·request_id】前端 assign_request_id 把用户 id 存进 external_req_id、request_id 换成『用户id-8位随机串』（input_processor.py:L215-L232）——防用户重复 id 撞掉引擎里的在途请求。引擎只见内部 id；OutputProcessor 出口前用 internal id 反查回 external 给 API 层。abort 默认按 internal id，internal=True 语义挂在 AsyncLLM.abort（async_llm.py:L709-L718）。",
+    "【死活契约】引擎死 = 单帧 b'ENGINE_CORE_DEAD'（core.py:L813 定义、L1362-L1374 发送并等 output 线程 join）；前端 BackgroundResources.validate_alive 消费并置 engine_dead（core_client.py:L447-L450），此后一切调用抛 EngineDeadError（L620-L628）。另有 proc sentinel monitor 线程兜底（L641-L665）。跨进程健康就这两个机制，没有心跳。",
+    "【控制面·utility RPC】非数据面操作（profile/sleep/LoRA/collective_rpc…）走 UTILITY(b'\\x03') 消息：(client_index, call_id, method_name, args)（core.py:L1284-L1297 引擎侧反射调用 getattr(self, method_name)；core_client.py:L1038-L1053 前端 uuid1 高 64 位做 call_id + Future 表）。返回走同一输出通道的 UtilityOutput 帧、按 call_id 唤醒 Future。这是一套把任意方法调用折进 ADD/ABORT 同一 socket 的薄 RPC。",
+    "【abort 语义】abort 是独立消息类型 ABORT(b'\\x01')（core_client.py:L1063-L1065）；引擎侧进 *两个* 队列——aborts_queue 让 busy loop 在模型执行的间隙急切处理、input_queue 保证排序不漏请求（core.py:L1460-L1465 注释原话，scheduler 幂等 abort 使双队列安全）。",
+    "【启动契约】三阶段：① 引擎 DEALER 连前端 handshake ROUTER 发 HELLO，前端回 EngineHandshakeMetadata（ZMQ 地址 + DP 配置，core.py:L1037-L1065 / engine/utils.py:L1105-L1107,L1226-L1244）；② 引擎初始化完成后同 socket 发 READY（core.py:L1015-L1027，前端 wait_for_engine_startup 校验，utils.py:L1248-L1273）；③ 引擎 input IO 线程在数据 ROUTER 上的首条消息是 EngineCoreReadyResponse——把引擎侧才能确定的 post-init 配置（auto-fit 后 max_model_len、num_gpu_blocks、dp_stats_address）带回前端（core.py:L1417-L1427 / core_client.py:L577-L595,_apply_ready_response L667-L691）。"
+  ],
+  "data_flow": "一个请求的完整跨界旅程（pin v0.21.0 行号）：\n1. HTTP 进前端进程：Renderer.render_chat/render_cmpl → _tokenize_prompt：tokenizer.encode 产出 TokensPrompt（vllm/renderers/base.py:L401-L412）——tokenization 在前端、在过线之前。\n2. AsyncLLM.add_request → InputProcessor.process_inputs：校验 params、params.clone()、整理 mm_features → 构造 EngineCoreRequest（vllm/v1/engine/input_processor.py:L362-L377）；assign_request_id 随机化内部 id（L214-L232）。\n3. AsyncLLM._add_request 双扇出（async_llm.py:L400-L415）：output_processor.add_request 本进程登记 RequestState+RequestOutputCollector（L409）‖ await engine_core.add_request_async(request)（L412）。\n4. AsyncMPClient.add_request_async（core_client.py:L1058-L1061）→ _send_input：encoder.encode(EngineCoreRequest) 得多帧 buffer（L1001-L1011）；msg=(engine_identity, b'\\x00', *bufs) → input ROUTER send_multipart(copy=False)（L1013-L1026）；若含张量则 track=True，MessageTracker+pending 保活引用（L1028-L1036）。[torch_shm 时：TensorIpcSender.__call__ 把 mm 张量 share_memory_ 后 put 进 mp Queue、帧里只有句柄（tensor_ipc.py:L69-L105）]\n5. 引擎进程 input IO 线程：DEALER recv_multipart（core.py:L1440）→ 首帧判型 b'\\x00' → add_request_decoder.decode（零拷贝视图/OOB 取回，core.py:L1386-L1389,L1450-L1451）→ preprocess_add_request：Request.from_engine_core_request + grammar_init（L1453 / L769-L791）→ input_queue.put（L1468）。\n6. busy loop：_process_input_queue 拿到 → add_request → scheduler.add_request（core.py:L1172→L1277-L1281→L346）；有活后 _process_engine_step → step_fn：scheduler.schedule → executor.execute_model（异步 future）→ scheduler.update_from_output 产出 dict[client_index, EngineCoreOutputs]（L1209-L1216→L406-L435）→ output_queue。\n7. 引擎进程 output IO 线程 process_output_sockets：取 (client_index, outputs) → encode_into 复用 bytearray → sockets[client_index].send_multipart(copy=False, track=True)（core.py:L1504-L1532，PUSH socket 集 L1487-L1492）。\n8. 前端 output_handler task：PULL recv → validate_alive（单帧死讯→EngineDeadError）→ decoder.decode(EngineCoreOutputs)（core_client.py:L942-L988）→ get_output_async 返回（L990-L999）→ async_llm.py:L660；按 128 切片 → OutputProcessor.process_outputs：按 req_id 查 RequestState → 增量 detokenize → RequestOutput → req_state.queue.put（output_processor.py:L597 起）；若检出 stop-string 触发回程 abort（async_llm.py:L686-L689）。\n9. generate() 协程 q.get_nowait() or await q.get() 逐条 yield RequestOutput → SSE（async_llm.py:L576-L586）；客户端断连 → CancelledError → abort：ABORT(b'\\x01') 消息回引擎 + 引擎双队列急切处理（async_llm.py:L591-L593 → core_client.py:L1063-L1065 → core.py:L1460-L1465）。",
+  "first_read_suggestion": "本域是全书的『进门大厅』，建议 v3 在第一个引擎 Part 的第一章就以它为主轴引入（大致对应 v2 ch04 的时位，但必须从『模块介绍』改成『问题驱动』：为什么两个词要跑两趟跨进程快递）。理由：(1) 对『懂后端不懂 AI』的读者，进程边界/消息队列/socket 语义是全书里唯一不需要 ML 知识就能完全读懂的部分——先给一个『我已经懂了一块』的立足点，再往 GPU 里走；(2) 之后每个子系统都住在两进程之一里，不懂边界就不知道类活在哪个进程、数据何时被复制——L0 图必须先立这张边界。首读前需立的前置（各半页到一页的 sidebar 即可）：a) 进程 vs 线程 vs GIL（为什么 CPU 活要搬去另一个进程而不是开线程）；b) ZMQ 四种 socket 的最小语义（PUSH/PULL/ROUTER/DEALER + bind/connect + HWM 概念）——这是全卡最陌生的词汇表；c) msgpack 是什么（类比 JSON 但二进制更小）。tokenization 此处可黑盒为『文本变成整数列表』，tokenizer 内幕后置到输入处理章。明确不要在首读引入、留到后文回收的：DP/wave/coordinator（等 DP Part 出现后回讲 why-chain 3——PUSH→ROUTER 是『设计随需求长出来』的最佳教材，提前讲就是无动机的 trivia）；torch_shm OOB 旁路（多模态 Part）；utility RPC 与启动握手协议（附录级工程细节，正文提一句即可）。注意 v2 叙事惯性陷阱：v2 讲的 socket 拓扑停留在旧版 PUSH(输入)/PULL(输出)，pin v0.21.0 的真实拓扑是输入 ROUTER/DEALER、输出按 client_index 多 PUSH → 单 PULL——重写时必须按本卡拓扑讲，并把『为什么改』当作叙事资产而不是麻烦。",
+  "key_files": [
+    "vllm/v1/engine/async_llm.py",
+    "vllm/v1/engine/core_client.py",
+    "vllm/v1/engine/core.py",
+    "vllm/v1/engine/__init__.py",
+    "vllm/v1/engine/input_processor.py",
+    "vllm/v1/engine/output_processor.py",
+    "vllm/v1/request.py",
+    "vllm/v1/serial_utils.py",
+    "vllm/v1/engine/tensor_ipc.py",
+    "vllm/v1/engine/utils.py",
+    "vllm/v1/engine/llm_engine.py",
+    "vllm/v1/utils.py",
+    "vllm/utils/network_utils.py",
+    "vllm/renderers/base.py",
+    "vllm/envs.py"
+  ]
+}

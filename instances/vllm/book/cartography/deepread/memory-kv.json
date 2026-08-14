@@ -1,0 +1,116 @@
+{
+  "domain": "显存主角：分页 KV 与前缀缓存（vLLM v1 core/kv_cache_* + 调度器抢占 + KVConnector P/D 契约）",
+  "generated": "2026-08-15",
+  "pin": "vLLM v0.21.0 (ad7125a4)，行号基线 = instances/vllm/source 工作树",
+  "one_liner": "调度器进程持有一份纯 CPU 元数据账本（块号/引用计数/哈希），把整块 GPU 显存切成固定大小 block 的池；请求按需拿块、满块入链式哈希表实现前缀复用、拿不到块就抢占比它优先级低的请求重算；GPU 侧只认 block_id→页表式寻址。P/D 与 offload 通过 KVConnector 双面契约把外部 KV 世界接到同一个池上。",
+  "why_chains": [
+    {
+      "decision": "分页 KV：固定大小 block 池 + 每请求一张逻辑块表（PagedAttention 的虚拟内存类比）",
+      "old_design": "vLLM 之前的服务系统（FasterTransformer/Orca）按请求最大长度一次性预分配连续显存：论文原话「they pre-allocate a contiguous chunk of memory with the request's maximum length (e.g., 2048 tokens)」（arXiv:2309.06180 §2.2，ar5iv 全文核对）。浪费有三类：内部碎片（实际输出远短于 max_len，块尾闲置）、外部碎片（要求连续，释放后留洞无法复用）、冗余复制（beam/parallel sampling 的共享前缀各存一份）。",
+      "pain": "有效 KV 显存利用率被卡死：论文实测「only 20.4% - 38.2% of the KV cache memory is used to store the actual token states in the existing systems」（§5.2，Alpaca/ShareGPT 真实 trace，ar5iv 逐字核对）。显存浪费直接压 batch size → 吞吐被卡；论文报告分页后同延迟下吞吐 2-4×。",
+      "solution": "整块 KV 显存切成 num_gpu_blocks 个等大 block 的池；每个请求持一张逻辑块表 req_to_blocks（vllm/v1/core/single_type_kv_cache_manager.py:L73），物理地址由 token 位置在 GPU 上按需换算：block_number = block_table[req][pos // block_size]，slot = block_number * block_size + pos % block_size（vllm/v1/worker/block_table.py:L326-L356 _compute_slot_mapping_kernel，Triton kernel；由 vllm/v1/worker/gpu_model_runner.py:L2036 每步调用）。论文类比原话「blocks as pages, tokens as bytes, requests as processes」。块只在需要时才分配（on-demand），单请求浪费被压到 < 1 个 block（论文：「vLLM limits all the memory wastes for a request within one block」）。",
+      "cost": "① 注意力 kernel 必须穿过块表间接寻址——PagedAttention kernel 比连续读复杂得多，标准 FA2 不能直接用；② 每请求尾部最多浪费 block_size-1 个 token 位（block_size 默认 16）；③ 调度器与 GPU 各持一份真相（block_id 是唯一共享键），两侧必须严格同步（见契约链）。"
+    },
+    {
+      "decision": "显存账本：启动时 profile 一次，倒推 num_blocks，配准入检查与 auto-fit",
+      "old_design": "无系统内账本：直觉做法是「权重之外全给缓存」，但没有公式回答「到底能开多大 batch、几条并发」；过量分配→服务中途 OOM，不足→浪费容量压低吞吐。",
+      "pain": "被卡的指标是并发容量与稳定性：KV 池是全部 batch 的共享预算，预算错 = OOM 或空转。量化感受（计算例，非源码断言）：Llama-2-7B FP16 每 token KV = 2(K,V)×32 层×32 kv_head×128 head_dim×2B ≈ 0.5 MB/token，2048-token 请求 ≈ 1 GB——24GB 卡上权重吃 14GB 后池只有 ~8GB。",
+      "solution": "启动期三步定账（vllm/v1/worker/gpu_worker.py:L354-L506 determine_available_memory）：requested = 总显存×gpu_memory_utilization；跑一次 dummy forward 记录峰值；available_kv = requested −（权重+torch 峰值增量+非 torch 增量）− cudagraph 估计（L443-L447）。然后 get_kv_cache_configs（vllm/v1/core/kv_cache_utils.py:L1922-L2053）把字节数换算成块数：num_blocks = available // page_size // num_layers（L930-L947 get_num_blocks），page_size_bytes/block/层 = 2×block_size×num_kv_heads×head_size×dtype（vllm/v1/kv_cache_interface.py:L131-L160 AttentionSpec）。护栏：check_enough_kv_cache_memory 保证至少装下一条 max_model_len 请求（L789-L814）；max_model_len=-1 时二分搜索 auto-fit（L1816-L1877）；PP 各 rank 取最小 num_blocks 收齐（L2035-L2048）。",
+      "cost": "profile 是快照不是保证——真实负载激活峰值可能超过 dummy run，只能靠 gpu_memory_utilization<1 留头寸；CUDA graph 显存估计默认从账本里扣（v0.21.0 新默认，gpu_worker.py:L467-L504 专门打日志提示等价 util 换算）；num_gpu_blocks_override 可让人工值凌驾 profile（kv_cache_utils.py:L893-L900），配置错=OOM。"
+    },
+    {
+      "decision": "前缀缓存 = 链式块哈希 + 平面哈希表（重要澄清：vLLM v1 从来不是 radix 树）",
+      "old_design": "两条旧路线。其一 v0 自己的 APC：hash + Evictor（2024-03-02 commit ce4f5a29f \"Add Automatic Prefix Caching (#2762)\"，vllm/core/evictor.py，v0.6.6 可见）。其二是 SGLang 的 RadixAttention radix 树（arXiv:2312.07104）——很多读者会带着「vLLM=vLLM 论文+SGLang radix」的混合印象来。V1 alpha（2024-10-22 commit 6c5af09b3 \"[V1] Implement vLLM V1 [1/N] (#9289)\"）先不带前缀缓存落地，get_computed_blocks 是存根，源码注释原话「# TODO(woosuk): Implement hash-based caching.」——注意 TODO 里写的就是 hash-based。",
+      "pain": "共享前缀（system prompt、few-shot、多轮对话历史）重复 prefill 烧算力，是 TBT/吞吐的双卡点。radix 树方案在 Python 侧指针密集：树节点对象分配给 GC 压力大、match/insert/evict 不变量复杂、与 chunked prefill/sliding window 的块对齐语义难做到严丝合缝（这些正是 v1 高并发调度循环最付不起的 CPU 成本）。",
+      "solution": "Merkle 式链式哈希：hash_i = H(parent_hash_{i-1}, tokens_i, extra_keys)（vllm/v1/core/kv_cache_utils.py:L539-L566 hash_block_tokens），请求侧随 token 到达增量计算（vllm/v1/request.py:L172-L177, L230-L233 update_block_hashes；hasher 只在 enable_prefix_caching 或有 connector 时装配，vllm/v1/engine/core.py:L202-L211，默认 sha256，vllm/config/cache.py:L93）。查找 = 沿哈希链顺序走到第一个 miss 即停（vllm/v1/core/single_type_kv_cache_manager.py:L448-L494 FullAttentionManager.find_longest_cache_hit，注释原话「If a block hash is not in the cached_block_hash_to_id, the following block hashes are not computed yet for sure」）。存储 = 平面 dict BlockHashToBlockMap（vllm/v1/core/block_pool.py:L34-L127）。满块才缓存（cache_full_blocks，block_pool.py:L211-L320）。历史上 2024-11-07 commit 201fc0773 \"[V1] Prefix caching (take 2) (#9972)\" 落地，标题本身就说明是第二次尝试。extra_keys 把 LoRA 名/MM 哈希/cache_salt 织进哈希防跨请求污染（kv_cache_utils.py:L501-L536）。",
+      "cost": "① 只缓存满块：尾部 ≤ block_size-1 个 token 永远不缓存；全命中时必须重算最后一个 token 才有 logits（kv_cache_manager.py:L202-L207 NOTE 原话）；② 故意不去重——同一哈希允许多块并存，为的是块表 append-only（BlockHashToBlockMap NOTE #1，block_pool.py:L46-L53），代价是相同前缀的显存冗余；③ 链式哈希意味着前缀任何一处改动后面全部失效（语义正确但无部分功劳）；④ 驱逐是惰性隐式的：块被重新分配时才从哈希表摘除（get_new_blocks→_maybe_evict_cached_block，block_pool.py:L322-L352, L354-L389）。"
+    },
+    {
+      "decision": "LRU 驱逐顺序的隐藏不变量：free 必须逆序，free-queue 尾部=最新",
+      "old_design": "朴素做法：free 按分配顺序把块挂回空闲表——这样 LRU 头部会是一条缓存链的前几个块，驱逐从「前缀的头」开始，把最长可复用前缀拦腰斩断。",
+      "pain": "被卡的指标是前缀命中率（尤其共享 system prompt 场景）：驱逐顺序错=命中率的静默劣化，不炸不错只是慢。",
+      "solution": "free 时逆序遍历请求块表，让「同批释放中更靠近尾部（哈希链更深、作为前缀价值越低）的块」排在 free 队列头部先被驱逐（vllm/v1/core/single_type_kv_cache_manager.py:L313-L317 ordered_blocks = reversed(req_blocks)；FreeKVCacheBlockQueue 类文档写明次序规则 L171-L179「the one with more hash tokens (the tail of a block chain) is at the front」；vllm/v1/core/kv_cache_manager.py:L418-L426 free 的 docstring 重申）。空闲队列本身是侵入式双向链表（块的 prev/next 指针长在 KVCacheBlock 元数据上），不用 deque 的理由写在类文档 L162-L182：要在 O(1) 从队中摘块且「does not allocate any Python objects」。",
+      "cost": "这是一个靠约定维持的正确性：任何新的 free 路径不遵守逆序就会静默劣化命中率，无断言保护——教学上适合当「顺序即策略」的例子；侵入式链表牺牲了 deque 的 C 实现，用手工指针换来零对象分配。"
+    },
+    {
+      "decision": "分配失败→抢占：只重算（recompute-only），且前缀缓存让重算变便宜",
+      "old_design": "v0 双模抢占：PreemptionMode.SWAP（KV 换出到 CPU pinned 内存再换回）/ RECOMPUTE（丢弃重算），两条路径都要维护（v0.6.6 vllm/core/scheduler.py:L40-41 enum 可考）。swap 需要 CPU 内存+PCIe 传输+pinned buffer 管理。",
+      "pain": "池被 running 请求占满时新 token 无处写——要么付 PCIe 带宽（swap）要么付 GPU 重算（recompute），v0 两条都背着=代码复杂度+调参负担。v0.21.0 已把 swap 彻底埋葬：vllm/entrypoints/llm.py:L259-L264 对用户参数直接回「The 'swap_space' parameter is deprecated and ignored.」。",
+      "solution": "v1 只留 recompute：调度循环里 allocate_slots 返回 None 即触发抢占（vllm/v1/core/sched/scheduler.py:L424-L472）——FCFS 弹 running 队尾（PRIORITY 策略则选 priority 最大者，L437-L460）；_preempt_request（scheduler.py:L910-L930）释放全部块、num_computed_tokens=0、塞回 waiting 队头。可行性的关键机制：free 掉的满块不清哈希（block_pool.py:L408-L422 free_blocks 不动 block_hash），仍留在哈希表里当驱逐候选——被抢占的请求重新调度时 get_computed_blocks（scheduler.py:L572-L576）会重新命中自己的前缀，把「重算」变成「重加载元数据+少量补算」。请求级 num_preemptions 计数进前缀缓存统计（vllm/v1/core/kv_cache_manager.py:L215-L221 record(preempted=...)）。",
+      "cost": "① 最坏情况无界：若被抢占期间这些块已被挤出哈希表，重算就是完整 prefill 重来——抢占代价由当时的显存压力决定；② 被抢占请求的 TTBT 直接受损（公平性换活性）；③ 正确性依赖「块表 append-only + 哈希保留」这条隐式链路，中间任何一环清哈希都会退化成全量重算。"
+    },
+    {
+      "decision": "调度器侧纯 CPU 元数据账本 + 引用计数共享（KVCacheBlock/ref_cnt/touch）",
+      "old_design": "v0 的 BlockSpaceManager：watermark 启发式（默认留 1% 块当安全垫，v0.6.6 vllm/core/block_manager.py:watermark_blocks 可考）、per-SequenceGroup 的块核算、Python 对象（PhysicalTokenBlock）反复分配。",
+      "pain": "v1 的主战场是调度器 CPU 时间：高并发下每步要为几百个请求算块需求，dict/对象分配/GC 把调度循环压垮；watermark 这类保守垫片则直接浪费容量。",
+      "solution": "整个账本是纯 CPU 元数据：KVCacheBlock 只有 block_id/ref_cnt/_block_hash/prev/next/is_null 七个字段（vllm/v1/core/kv_cache_utils.py:L114-L160）；共享靠引用计数——新请求命中同哈希前缀时 touch 使 ref_cnt+1 并把块从 free 队列摘出（block_pool.py:L391-L406），请求结束 free 使 ref_cnt-1、归零才回 free 队列（L408-L422）。需求预测与实际分配共用同一套数学（get_num_blocks_to_allocate single_type_kv_cache_manager.py:L88-L167，把「可驱逐的命中块也要占容量」数进去 L161-L167），先预测后分配，不够就 None→抢占，不再需要 watermark。对外只暴露 KVCacheBlocks 包装（kv_cache_manager.py:L21-L27，docstring 原话「to hide KVCacheManager's internal data structure from the Scheduler」）。",
+      "cost": "① 预测器必须与分配器严格同构——注释明言两者漂移会重新引入死锁（single_type_kv_cache_manager.py:L104-L127 引 issue #39734）；② 每请求每步的 O(块数) Python 循环仍在，靠侵入式链表+预构空对象（empty_kv_cache_blocks kv_cache_manager.py:L153-L160）压 GC，是持续的性能战场；③ 元数据与 GPU 真相分离需要跨进程契约（block_id 传递）兜底。"
+    },
+    {
+      "decision": "混合注意力模型：一个 BlockPool、每组一张块表、null_block 占位、不动点收敛的最长命中",
+      "old_design": "早期 v1 只有单张块表；混合模型（Gemma3 5:1 SWA:full、LLaMA4 3:1 local:full、Mamba 混合）要么不支持，要么退化为「全部按 full attention 分配」——今天仍保留这条退路：unify_hybrid_kv_cache_specs（kv_cache_utils.py:L1319-L1412）会打 warning 原话「we do not enable any optimizations for saving KV cache memory (e.g., dropping the KV cache outside the sliding window)」。",
+      "pain": "SWA 层只需要窗口内的 token，按 full 分配时窗口外的块全在白占显存——混合模型的可用并发被显存虚耗直接卡死。",
+      "solution": "按 KVCacheSpec 把层分成 kv_cache_groups，每组一个 SingleTypeKVCacheManager（spec→manager 映射 single_type_kv_cache_manager.py:L1142-L1152：Full/SlidingWindow/ChunkedLocal/Mamba/Cross/Sink），各组共用一个 BlockPool（硬约束：每组每块的物理字节数必须相等，理由=碎片，假设清单 kv_cache_utils.py:L1081-L1106）。SWA 窗口外的块被释放并原地换成 null_block 占位以保持块表与 token 位置对齐（remove_skipped_blocks single_type_kv_cache_manager.py:L385-L426；find_longest_cache_hit 返回形如 [NULL, NULL, block7, block8] 的表，docstring L373-L380）。跨类型最长命中用迭代不动点：每种注意力类型要么接受当前候选长度要么收缩之，full attention 排最前因其向下封闭（HybridKVCacheCoordinator.find_longest_cache_hit kv_cache_coordinator.py:L487-L591），命中长度必须是各组 block_size 的 LCM 的倍数（L471-L477）。多组不同块大小下哈希粒度取 GCD、惰性重串（resolve_kv_cache_block_sizes kv_cache_utils.py:L569-L632 + BlockHashListWithBlockSize L2056-L2126）。",
+      "cost": "① 等量化组要加 padding 层——12 SW+13 full 补成 13/13，warning 明说「may waste at most N% KV cache memory」（kv_cache_utils.py:L1139-L1156）；② 不动点循环最坏多轮往返；③ 官方承认只干净支持「full + 恰好一种其它类型」（假设 6，L1101-L1106），更复杂模式待解；④ null_block 的 ref_cnt 不维护需处处特判（block_pool.py:L173-L177）。"
+    },
+    {
+      "decision": "KVConnector 双面契约：把外部 KV 世界（P/D 分离、CPU/NVMe offload）接到同一个池",
+      "old_design": "KV 困在单引擎进程的 GPU 池里；P/D 分离早期靠定制传输（v0 kv_transfer 只有 NIXL 一条路），offloading 与 P/D 各写各的，无法组合。",
+      "pain": "prefill 算力密集、decode 带宽密集，同卡混跑互相拖累；decode 实例拿不到 prompt KV 就无法开工；offload 需要「把块搬出去再搬回来」的通用通道。",
+      "solution": "KVConnectorBase_V1 把契约劈成两半（vllm/distributed/kv_transfer/kv_connector/v1/base.py:L7-L41 docstring 逐条列原语）。调度器侧（跑在调度进程）：get_num_new_matched_tokens 把外部缓存当成第二个前缀缓存来查（scheduler.py:L579-L604，允许返回 None=「稍后再问我」，L586-L592）、update_state_after_alloc、build_connector_meta、request_finished（L523-L542：返回 True 即接管块的异步释放）。worker 侧（跑在每个 worker）：start_load_kv/wait_for_layer_load 逐层异步加载与计算重叠（L292-L321）、save_kv_layer/wait_for_save（L324-L354，wait_for_save 的存在理由原话「This prevents overwrites of paged KV buffer before saving done」）。异步加载路径：请求先占块但延迟入缓存（allocate_slots 的 delay_cache_blocks，kv_cache_manager.py:L400-L403 注释原话「P/D: delay caching blocks if we have to recv from remote」），状态置 WAITING_FOR_REMOTE_KS 停在跳过队列（scheduler.py:L744-L763），传输完成后 _update_waiting_for_remote_kv 补缓存并对全命中回退一个 token 重算（L1964-L1994）。加载失败的块按第一个坏块截断 num_computed_tokens（L2110-L2145）。数据所有权两处显式转移：异步加载期「块已分配未缓存」；请求结束且 request_finished→True 时块不释放直到 get_finished 报完成（_free_request scheduler.py:L1750-L1766）。",
+      "cost": "① 一条并行查找路径：本地前缀缓存与 connector 缓存都要查再合并，慢一拍（None）的请求要在跳过队列里多等；② 异步加载期占着池块却不可用（容量空转窗口）；③ worker 在异步 save 完成前不能覆盖块（wait_for_save 强制同步点）；④ 调度器侧/worker 侧必须分开构建、不许共享状态（factory 显式双角色构建，ch35 dossier 引 factory.py:L69-L82 NOTE）；⑤ invalid-block 回滚链路（截断+逐块逐请求去重标记）复杂且是正确性敏感区。"
+    },
+    {
+      "decision": "v0.21.0 时代护栏：整序列准入门、新块清零、采样式驻留指标",
+      "old_design": "chunked prefill 只检查第一个 chunk 的块需求——一条比池还长的请求可能被放进来，prefill 中途才发现装不下（死锁或中途 OOM 的温床，issue #39734）。",
+      "pain": "被卡的指标是活性（不崩溃）而非吞吐：admission 错=卡死整条 RUNNING 队列。",
+      "solution": "① full_sequence_must_fit 准入门：allocate_slots 先按整序列算块数对比空闲块，不够直接 None 拒之门外（kv_cache_manager.py:L335-L349 + scheduler.py:L711 传入；SWA/chunked-local 这类会回收块的 spec 用 max_admission_blocks_per_request 封顶，single_type_kv_cache_manager.py:L104-L132 注释明言「Drift between the two would re-introduce the deadlock」）。② 新分配块先清零：调度器把本步新块 id 带过来（take_new_block_ids kv_cache_manager.py:L532-L537 → scheduler.py:L862），worker 用 Triton kernel 清零，理由原话「to prevent stale NaN/data from corrupting attention or SSM computation」（gpu_model_runner.py:L1105-L1108；被驱逐块的残留内容会毒害下一个使用者）。③ 1% 采样驻留指标（vllm/v1/core/kv_cache_metrics.py:L46-L96：块生命周期/空闲时长/复用间隔，驱逐时落账）。",
+      "cost": "① 准入门更保守=batch 可能装不满（吞吐换活性）；② 清零 kernel 每步一次，且即将被 prefill 全量覆写的块也被清=浪费带宽；③ 指标是统计抽样非全量，只够调参用。"
+    }
+  ],
+  "contracts": [
+    "上游（Scheduler）：KVCacheManager 是调度器看到的全部——KVCacheBlocks 包装类专门用来隐藏内部结构（kv_cache_manager.py:L21-L27 docstring）。调度器只调 7 个入口：get_computed_blocks / allocate_slots / free / cache_blocks / get_block_ids / take_new_block_ids / new_step_starts（kv_cache_manager.py:L183, L225, L418, L515, L511, L532, L539）。输入是 Request 对象（block_hashes 已在 Request 上算好）；输出是 KVCacheBlocks（外层 tuple=kv_cache_group，内层 list=按 token 序的块）。",
+    "下游（GPU/worker，跨进程）：块号是唯一共享键。SchedulerOutput.new_block_ids（scheduler.py:L1043 get_block_ids(allow_none=True)，resumed 请求给全量、否则给增量）跨进程到 worker；gpu_model_runner._update_states 增量 append 到 req_state.block_ids（gpu_model_runner.py:L1324-L1335）再进 input_batch.block_table（MultiGroupBlockTable，vllm/v1/worker/gpu_input_batch.py:L378 add_row）。所有权：调度器进程独占元数据（谁用哪块/ref_cnt/哈希），worker 独占 GPU 张量；调度器绝不碰 GPU 内存，worker 绝不做分配决策。",
+    "GPU 张量布局：KVCacheConfig.kv_cache_tensors 描述哪几层共享哪块张量（混合模型 group_size 个池、每池每组出一层共享；kv_cache_utils.py:L1284-L1310 注释带图例），model runner 据此 allocate。同一份 KVCacheConfig 同时喂调度器（建 KVCacheManager）与全部 worker（gpu_worker.py:L539-L551 initialize_from_config 先建 connector 再 initialize_kv_cache）——两侧 num_blocks 必须一致，单一事实源是 get_kv_cache_configs（engine/core.py:L261 调用）。",
+    "与 Request：block_hashes 归 Request 持有、随 token 追加增量计算（request.py:L172-L177, L230-L233），KVCacheManager 只读不写；skip_reading_prefix_cache 旗标由请求带入（prompt logprobs/pooling 场景关闭前缀读，kv_cache_manager.py:L199-L200）。",
+    "与 KVConnector（双向）：调度器在 waiting 循环并行查外部缓存（scheduler.py:L579-L604），connector 的命中作为 num_external_computed_tokens 进入 allocate_slots（kv_cache_manager.py:L225-L235 布局注释里 < ext_comp > 段）；worker 侧 connector 通过 block_ids + KVTransferSpec 直接读写池内 GPU 内存。所有权转移点两处：异步加载期「已分配未缓存」（delay_cache_blocks），请求结束 request_finished→True 时块归 connector 管直到 get_finished（base.py:L523-L542 + scheduler.py:L1750-L1766）。",
+    "与指标/可观测：BlockPool.get_usage（block_pool.py:L486-L497，除掉 null_block 计分子）→ 调度器 make_stats；PrefixCacheStats 每 make_prefix_cache_stats 取走并清零（kv_cache_manager.py:L171-L181）；KVCacheMetricsCollector 挂在 BlockPool 的 alloc/access/evict 钩子上（block_pool.py:L344-L345, L366-L367, L405-L406）。"
+  ],
+  "data_flow": "一条请求的显存一生（含启动铺垫）：[启动] gpu_worker.py:L354 determine_available_memory profile 出可用字节 → kv_cache_utils.py:L1922 get_kv_cache_configs 切成 num_blocks + 分组 → engine/core.py:L261 把同一份 config 喂两侧：调度器建 KVCacheManager（kv_cache_manager.py:L107 → coordinator → block_pool.py:L149 BlockPool：块数组+free 队列+null_block）。\n[入场] Request 构造时增量算好 block_hashes（request.py:L177）。\n[调度] schedule() waiting 循环（scheduler.py:L572-L576）调 get_computed_blocks（kv_cache_manager.py:L183 → coordinator.find_longest_cache_hit → single_type_kv_cache_manager.py:L448 沿哈希链走到首个 miss）得本地命中；有 connector 再查外部命中（scheduler.py:L580-L584）。\n[分配] allocate_slots（scheduler.py:L702 → kv_cache_manager.py:L225）：先 remove_skipped_blocks（窗口外块换 null_block 归还），get_num_blocks_to_allocate 预测 vs get_num_free_blocks 不够则 None（→抢占，scheduler.py:L424-L472 → _preempt_request L910：free+num_computed_tokens=0+回 waiting 队头）；够了则 allocate_new_computed_blocks（block_pool.py:L391 touch：命中块 ref_cnt+1 出队）+ allocate_new_blocks（block_pool.py:L322 get_new_blocks：popleft_n+惰性驱逐）。\n[入缓存] cache_blocks 把满块写哈希入表（kv_cache_manager.py:L410-L414 → block_pool.py:L211-L320）。\n[过进程] 新块 id 经 get_block_ids 进 SchedulerOutput（scheduler.py:L1043），新分配块另走 take_new_block_ids 供清零（scheduler.py:L862 → gpu_model_runner.py:L1107 Triton 清零防脏数据）。\n[GPU] worker 把块号 append 进块表（gpu_model_runner.py:L1324-L1335 → gpu_input_batch.py:L378），每步 compute_slot_mapping 按块表换算每个 token 的物理槽位（gpu_model_runner.py:L2036 → block_table.py:L326 Triton kernel：slot = block_table[req][pos//block_size]*block_size + pos%block_size），注意力 kernel 照 slot_mapping 写 KV、照块表读 KV。\n[终局] 请求完成 _free_request（scheduler.py:L1750；connector 接管则延迟）→ kv_cache_manager.free（L418）→ 逆序 free_blocks（single_type_kv_cache_manager.py:L313 → block_pool.py:L408 ref_cnt-1 归零回 free 队列尾、哈希保留）——前缀留在缓存里等下一个请求命中。",
+  "first_read_suggestion": "面向「懂后端不懂 AI」的读者，本域是全书最舒适的一块跳板——虚拟内存类比是现成的认知脚手架（block=页、token=字节、请求=进程、req_to_blocks=页表、free 队列+LRU=OS 页缓存驱逐、抢占=OOM kill/挂起进程），应在读者刚建立「引擎=一个永动 step 循环（schedule+execute）」之后就尽早引入（建议放在第一个大台阶 Part 的中段：比三段式进程解耦晚一章、比 attention kernel 早——因为 FlashAttention 章需要『KV 已经在池里、按块表寻址』作为前提）。前置依赖只有三样：① 注意力为什么需要历史 K/V（用 10 行直觉+每 token 显存公式 2·L·kv_heads·head_dim·dtype_bytes 建立『显存是主角』的 hook，配 0.5MB/token 的 Llama-7B 数字例）；② 上一章调度器建立的 num_computed_tokens 通货概念；③ cdiv/块对齐算术的舒适感。阶梯内部顺序建议：账本（profile→num_blocks，先回答『这块饼多大』）→ 分页与块表恒等式（『饼怎么切』）→ 链式哈希前缀缓存+LRU 逆序 free（『怎么复用』）→ 分配失败与抢占（『不够了怎么办』）；混合模型（一池多表/不动点）与 KVConnector P/D 明确后置到分布式/进阶 Part——它们各自需要「模型结构多样性」与「调度器/worker 进程分工」两块前置。两个反模式警告：① 别用类名分类学开场（Manager/Coordinator/SingleTypeManager 三层是为混合模型付出的实现税，单组路径读者根本不需要先见它——先讲账本与恒等式，类结构作为『为了混合模型而付的形状』再收拢）；② 必须主动澄清『radix 树』迷思——从 SGLang 文献来的读者会预期 radix 树，而 v1 从 day one（PR #9972，甚至 V1 alpha 的 TODO 注释）就选了链式哈希，这个对比本身（dict O(1) vs 树节点 GC、块对齐 by construction）就是绝佳的教学素材。",
+  "key_files": [
+    "vllm/v1/core/kv_cache_manager.py — KVCacheManager 门面 + KVCacheBlocks 接口包装（对外唯一 API）",
+    "vllm/v1/core/block_pool.py — BlockPool 物理块池 + BlockHashToBlockMap 哈希索引 + touch/free/evict",
+    "vllm/v1/core/kv_cache_utils.py — KVCacheBlock 元数据 / FreeKVCacheBlockQueue 侵入式 LRU / 链式哈希 / KVCacheConfig 生成（分组+auto-fit）",
+    "vllm/v1/core/kv_cache_coordinator.py — Unitary/Hybrid/NoPrefixCache 三态协调器 + 混合不动点命中",
+    "vllm/v1/core/single_type_kv_cache_manager.py — 各注意力类型的块管理器（req_to_blocks/null_block/窗口回收）",
+    "vllm/v1/core/kv_cache_metrics.py — 1% 采样块驻留指标",
+    "vllm/v1/core/sched/scheduler.py — schedule() 分配/抢占循环 + connector 查询 + WAITING_FOR_REMOTE_KS",
+    "vllm/v1/worker/gpu_worker.py — determine_available_memory 显存账本",
+    "vllm/v1/engine/core.py — 启动装配：hasher 装配 + get_kv_cache_configs 单一事实源",
+    "vllm/v1/worker/block_table.py — MultiGroupBlockTable + Triton slot_mapping kernel（页表寻址恒等式所在）",
+    "vllm/v1/worker/gpu_model_runner.py — 块表增量 append + 新块清零",
+    "vllm/v1/kv_cache_interface.py — KVCacheSpec 家族 + page_size_bytes 公式",
+    "vllm/distributed/kv_transfer/kv_connector/v1/base.py — KVConnectorBase_V1 双面契约（调度器侧/worker 侧原语清单）",
+    "vllm/v1/request.py — block_hashes 的归属与增量计算"
+  ],
+  "git_history_evidence": [
+    "ce4f5a29f 2024-03-02 \"Add Automatic Prefix Caching (#2762)\" — v0 APC（hash+Evictor）起点",
+    "6c5af09b3 2024-10-22 \"[V1] Implement vLLM V1 [1/N] (#9289)\" — V1 alpha 落地；get_computed_blocks 是存根，注释「# TODO(woosuk): Implement hash-based caching.」",
+    "201fc0773 2024-11-07 \"[V1] Prefix caching (take 2) (#9972)\" — v1 链式哈希前缀缓存落地（标题自带 take 2）",
+    "c99db8c8d 2025-09-20 \"[V0 Deprecation] Remove V0 core (#25321)\" — v0 core 删除",
+    "v0.6.6 tag 证据：vllm/core/block_manager.py 有 watermark_blocks；vllm/core/scheduler.py 有 PreemptionMode.SWAP/RECOMPUTE",
+    "v0.7.0 tag 证据：v1 kv_cache_utils.py 已是 hash 设计（BlockHashType/KVCacheBlock/FreeKVCacheBlockQueue），从无 RadixCache 类（全仓 grep 'radix' 零命中，commit 消息亦然）"
+  ],
+  "paper_evidence": [
+    "arXiv:2309.06180 摘要（arXiv API 拉取核对）：「fragmentation and redundant duplication」「inspired by the classical virtual memory and paging techniques」「2-4× throughput」",
+    "arXiv:2309.06180 §5.2（ar5iv 全文核对）：「only 20.4% - 38.2% of the KV cache memory is used to store the actual token states in the existing systems」——注意是 38.2 不是流传的 38.3",
+    "arXiv:2309.06180 §2.2：「pre-allocate a contiguous chunk of memory with the request's maximum length」——旧设计的连续分配描述",
+    "arXiv:2309.06180：「blocks as pages, tokens as bytes, requests as processes」虚拟内存类比原话",
+    "arXiv:2312.07104（SGLang RadixAttention）— radix 树是竞争设计，vLLM v1 未采用（用于对比教学）"
+  ],
+  "v2_corrections": [
+    "焦点命题「前缀缓存 radix 树」与本仓源码不符：vLLM v0/v1 主线从未用 radix 树实现前缀缓存（v0=hash+evictor，v1=链式块哈希+平面哈希表，git 历史与全仓 grep 双重证实）。v3 写作若沿用『radix 树』即引入事实错误；正确做法是把 radix 树作为 SGLang 对比项讲。",
+    "v2 ch15/ch16 的机制与行号经抽查与 v0.21.0 pin 一致，可继续作源码事实参考；但其组织（自底向上元数据→链表→哈希）与 v3 的『先账本后分页后缓存』阶梯不同，不必继承。"
+  ]
+}

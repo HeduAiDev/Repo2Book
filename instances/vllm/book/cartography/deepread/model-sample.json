@@ -1,0 +1,138 @@
+{
+  "domain": "模型层与采样出口（model_executor 模型定义层 + v1/sample 采样管线 + v1/structured_output 结构化输出 + spec_decode 投机解码）",
+  "pin": "vLLM v0.21.0 (ad7125a43)，路径前缀 vllm/...，行号以 instances/vllm/source 工作树为准",
+  "mission": "从设计者视角回答：模型前向的输出为什么是 hidden_states 而不是 token；13 万维 logits 到 1 个 token 之间发生了什么；为什么这段不融进 GPU kernel；JSON schema 怎么变成对采样的硬约束；draft/verify 为什么能用小模型白嫖大模型速度；一个新架构（DeepSeek-V4）进来要付多少接入税。",
+  "why_chains": [
+    {
+      "decision": "forward 与 compute_logits 拆分：模型前向只出 hidden_states，lm_head 由 runner 在采样位切片后另调（「logits 只在需要的位置物化」）",
+      "old_design": "HF transformers 的 ForCausalLM.forward（llama.py:L5 文件头注明 Adapted from modeling_llama.py）在 forward 内部一口气跑 lm_head、返回全部 token 的 logits——训练语义（每个位置都要算 loss）。v0 早期推理沿用此形状。",
+      "pain": "decode 批次每请求只有最后 1 个 token 需要下一词分布；vocab ≈13 万（DeepSeek），4096-token 的 prefill chunk 全量物化 fp32 logits ≈ 4096×129280×4B ≈ 2GB，纯属浪费；且 TP 下 lm_head 按词表分片，全量 gather 通信量同倍放大。",
+      "solution": "约定模型契约两方法：LlamaForCausalLM.forward 返回 hidden_states（vllm/model_executor/models/llama.py:L565-L575），compute_logits(hidden_states) 独立（llama.py:L577-L582，内部走 layers/logits_processor.py:L54-L104：lm_head GEMM → TP gather/all-gather L75-L87 → 裁掉词表 padding L101-L103）。runner 持有「哪些位置要 logits」的策略：无 spec decode 时 logits_indices = query_start_loc[1:]-1（vllm/v1/worker/gpu_model_runner.py:L2078），spec decode 时用 metadata.logits_indices（L2104）；切片+调用在 L4152-L4153（sample_hidden_states = hidden_states[logits_indices]; logits = self.model.compute_logits(sample_hidden_states)）。",
+      "cost": "① 模型类必须同时实现两个方法 + make_empty_intermediate_tensors，接入面变大；② 「哪些位置要 logits」策略分散在 runner（prompt logprobs / spec decode / pooling 各不同），模型层无法自洽；③ PP 场景 forward 与 logits 的拆分迫使跨 rank 广播 logits dict（gpu_model_runner.py:L4174-L4182）。"
+    },
+    {
+      "decision": "采样是独立 nn.Module 上的 9 步管线（Sampler），纯张量数学才下沉 kernel——不是「GPU kernel 里一步做完」",
+      "old_design": "教学式一行：next_token = torch.multinomial(softmax(logits/T), 1) 或直接 argmax。v0 采样器也是逐请求 python 循环构造上下文。",
+      "pain": "① 批内请求异构：greedy(temp=0) 与随机、有无 penalty、有无 top_k/top_p 混在一个批里，一行式无法按行分派；② torch.multinomial 强制 CPU-GPU 同步（topk_topp_sampler.py:L391-L393 注释原话 'torch.multinomial causes CPU-GPU synchronization'）；③ 约束源在 CPU：惩罚需要 prompt+output token 历史（python list）、结构化输出语法 FSM 活在调度器进程、logit_bias/min_tokens 稀疏可数；④ API 契约要求返回 top-k logprobs 与采样共享同一份 logits 变换；⑤ 跨平台（CUDA/ROCm/XPU/CPU）后端不同。",
+      "solution": "Sampler.forward（vllm/v1/sample/sampler.py:L68-L143，9 步 docstring L22-L59）：fp32 化 → allowed_token_ids 掩码（L382-L383）→ bad_words 前缀匹配（ops/bad_words.py:L9-L35）→ 非 argmax 不变处理器 min_tokens/logit_bias（L390-L391）→ 惩罚（L394，Triton 核 vllm/model_executor/layers/utils.py apply_penalties）→ 采样（L232-L288：greedy 快路径/温度/min_p/top-k/top-p/Gumbel 式 random_sample）→ top-k logprobs gather（L294-L342）→ SamplerOutput。真正计算密集的 top-k/top-p 有 Triton pivot 核（ops/topk_topp_triton.py）与 FlashInfer 采样核（ops/topk_topp_sampler.py:L132-L157），平台后端在 __init__ 一次性绑定 self.forward（L30-L109）。",
+      "cost": "① 逐元素 kernel 多次 launch（靠 in-place div_/masked_fill_/scatter_ 缓解，sampler 全程原地改写 logits——调用方想保留 raw 必须自己 clone）；② 每个处理器必须正确声明 is_argmax_invariant()，这是语义承诺不是优化提示；③ spec decode 时普通管线大半作废，RejectionSampler 另起一套并与 Sampler 有重复逻辑（两处 _combine_outputs_with_spec_tokens：sampler.py:L344-L355 与 rejection_sampler.py:L374-L389）。"
+    },
+    {
+      "decision": "argmax 不变性二分 + raw logprobs 先行：greedy 快路径跳过温度/min_p/top-k/top-p；top-k logprobs 用变换前的原始 logits 算",
+      "old_design": "v0 采样器对每请求统一走温度+截断，greedy 请求也在做无意义的 softmax/排序；且 v0 用「惩罚+温度之后」的 logits 算 top-k logprobs（sampler.py:L76-L79 NOTE(woosuk) 注明与 V0 的差异）。",
+      "pain": "temperature=0 的贪心请求是生产 API 常态；对它做 top-p 排序是 O(V log V) 纯浪费；用户拿到的 logprobs 应反映模型原始分布，而不是被惩罚扭曲后的分布（惩罚是采样干预不是模型意见）。",
+      "solution": "LogitsProcessors 容器按 is_argmax_invariant() 把处理器分两列（vllm/v1/sample/logits_processor/state.py:L148-L160）；非不变列（min_tokens 封 EOS builtin.py:L186-L189、logit_bias 改值 L130-L133）在温度前对全体执行（sampler.py:L390-L391），不变列（min_p builtin.py:L46-L48）只在随机路径执行（L268-L269）；all_greedy 直接 argmax 提前返回（L250-L257）；混合批 torch.where(temp<eps, greedy, random) 一次合并（L282-L288）；raw logprobs 在一切变换之前先算好（L80-L88）。",
+      "cost": "处理器作者负担：分类错会静默破坏 greedy 语义；raw/processed 两个视角共享同一 tensor，spec decode 分支需要显式 clone 保 raw（rejection_sampler.py:L151-L155）；额外一份 [B,V] fp32 raw logprobs 峰值显存。"
+    },
+    {
+      "decision": "采样元数据一次快照（SamplingMetadata）+ 常驻批 BatchUpdate 增量维护处理器状态",
+      "old_design": "v0：每步遍历请求列表，从各请求 SamplingParams 重建采样上下文（python 逐请求、无持久槽位概念）。",
+      "pain": "v1 持久批里请求槽位跨步复用（preempt 回填、批内换位），每步重建 [batch] 张量是 CPU 瓶颈；且 logits 处理器需要随批组成变化维护稀疏状态（哪些请求有 min_p、哪些有 logit_bias）。",
+      "solution": "InputBatch 持有 CPU 常驻张量（temperature/penalties/top_p/top_k/allowed mask），_make_sampling_metadata()（vllm/v1/worker/gpu_input_batch.py:L831-L934）每步做切片 + pin-memory 非阻塞 H2D，产出冻结的 SamplingMetadata（vllm/v1/sample/metadata.py:L15-L55）；批组成变化用 BatchUpdate(added/removed/moved) 三事件描述（logits_processor/interface.py:L36-L57），处理器经 process_dict_updates 增量更新（builtin.py:L294-L332），moved 区分 UNIDIRECTIONAL 与 SWAP 两种换位语义（interface.py:L17-L21）。",
+      "cost": "处理器实现必须正确处理三种批事件（MinPLogitsProcessor.update_state 90 行，builtin.py:L53-L99）；output_token_ids 以 python list 引用共享（注释明示不变量：引用始终看到最新列表，interface.py:L41-L48）——共享可变状态靠约定不靠类型系统。"
+    },
+    {
+      "decision": "结构化输出 = 语法编译成 FSM + 位掩码预过滤（采样前把非法 token 的 logits 打成 -inf），而不是采样后重试或逐请求 CPU 枚举",
+      "old_design": "朴素做法：a) 生成→校验→重采样循环（每步多轮 GPU 前向，延迟成倍）；b) 每步在 CPU 枚举合法 token id 列表传给采样器（v0 早期 outlines 集成形态，合法集是 list[int]）。",
+      "pain": "vocab 13 万，枚举/序列化合法 token 集合本身就有 O(V) 开销且无法与批处理 GPU 管线拼合；逐请求 CPU masking 逐 token 串行。",
+      "solution": "xgrammar 把 JSON Schema/regex/EBNF/structural_tag 编译成语法 FSM（vllm/v1/structured_output/backend_xgrammar.py:L77-L122，GrammarCompiler 带缓存 L64-L69）；每步 matcher.fill_next_token_bitmask 在预分配 [batch, ceil(V/32)] int32 位掩码上标记下一步不合法 token（L191-L192；填充逻辑 vllm/v1/structured_output/__init__.py:L185-L196），掩码以 numpy 跨进程传给 worker（L292-L299 注释：ndarray 序列化比 tensor 高效），在 logits 上原位置 -inf：V1 主路径 xgr.apply_token_bitmask_inplace（vllm/v1/structured_output/utils.py:L44-L135，先按 runner 批序+spec 位重排 L84-L97），V2 实验路径自有 Triton 核 _apply_grammar_bitmask_kernel（vllm/v1/worker/gpu/structured_outputs.py:L86-L115，位运算解包 L100-L107）。非语法请求的掩码行填 -1（全 1=全禁，正常不会被采到，__init__.py:L58, L196）。",
+      "cost": "① 引擎级单后端，不支持逐请求选后端（__init__.py:L125-L127 注释明说）；② FSM 活在调度器进程，每步多一次 CPU FSM walk + H2D 传输（批>128 时并行填充，L61-L68, L238-L264）；③ 位掩码随 max_num_seqs×(1+num_spec) 预算常驻（L219-L228）；④ xgrammar 不支持的 JSON 特性（multipleOf/uniqueItems/非标准 format 等）直接拒单（backend_xgrammar.py:L221-L265）。"
+    },
+    {
+      "decision": "语法编译异步化 + 调度状态门：grammar 没编译完的请求不进批、不挡别人",
+      "old_design": "同步编译：请求带 schema 到达 → 阻塞编译完 → 才能调度；编译期间引擎空转。",
+      "pain": "复杂 schema 编译是 CPU 密集（毫秒到百毫秒级，随嵌套深度），阻塞在关键路径直接打爆 TTFT，且一个慢 schema 请求拖住整个引擎循环。",
+      "solution": "grammar_init 在输入处理线程把编译提交 ThreadPool（__init__.py:L166-L170；线程数=半数 CPU L70-L77）；StructuredOutputRequest._grammar 存 Future，_check_grammar_completion 用 result(timeout=0.0001) 非阻塞探测（vllm/v1/structured_output/request.py:L46-L53）；未就绪请求置 WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR 进 skipped_waiting 侧队（scheduler.py:L1515-L1531），就绪后 _promote_waiting_request 恢复 WAITING（L2015-L2020）。采完样由调度器推进 FSM：update_from_output 里 should_advance 检查后 grammar.accept_tokens（scheduler.py:L1359-L1374）——FSM 状态的唯一写者是调度器线程。",
+      "cost": "100µs 轮询是忙等变体（每步每请求一次）；external_launcher（torchrun 每 rank 一个调度器）下各 rank 的门迁移时间会漂移、破坏确定性假设 → 该模式回退同步编译（__init__.py:L46-L58 注释）；thinking 模型还要 ReasoningParser 判「思考段结束后语法才生效」（should_fill_bitmask/should_advance L301-L357）。"
+    },
+    {
+      "decision": "spec decode：proposer 出 draft（EAGLE 恒 argmax / MTP / ngram 零模型）→ 调度器把 draft 当预填排进下一步 → target 一次前向验证 → Triton 拒绝采样保分布不变",
+      "old_design": "无投机：每步 1 token，decode 是访存受限（每 token 读全 KV cache），小 batch 下算力大量闲置；朴素加速（beam、并行多序列）不改善单序列延迟。",
+      "pain": "端到端延迟 ∝ 串行步数 × 每步延迟；每步 GPU 大部分时间在等 HBM 而不是算。",
+      "solution": "draft 侧：EAGLE/MTP 复用 target 最后层 hidden_states 自回归贪心 k 步（vllm/v1/spec_decode/llm_base_proposer.py:propose L392-L592；第一遍 shift 输入 L663-L669；贪心采样 _greedy_sample L386-L390；L1595-L1600 注释明示 draft 恒用 argmax，分布正确性由拒绝采样兜底）；ngram 完全无模型，numba 在 CPU 历史里找最长 n-gram 匹配（ngram_proposer.py:L63-L105）。verify 侧：调度器把 draft 作为 scheduled_spec_decode_tokens 排进下一步，target 一次前向同时验证所有位（logits_indices 覆盖 draft 位+bonus 位，gpu_model_runner.py:_calc_spec_decode_metadata L2627-L2705）；RejectionSampler（vllm/v1/sample/rejection_sampler.py:L37-L195，严格按 arXiv:2211.17192）：bonus 位先用普通 Sampler 采（L128-L142，注释：让 bonus 保留 top_p/top_k 能力）、target 位 min(1, p_t/p_d) 拒绝采样（rejection_random_sample_kernel L762-L826）、拒绝位从 (p_t-p_d)+ 残差分布恢复一个 token（sample_recovered_tokens_kernel Gumbel-max L854-L921），输出 [batch, max_spec_len+1] 用 PLACEHOLDER_TOKEN_ID=-1 标记截断（parse_output L246-L281）。普通批混 greedy/随机由 is_greedy 掩码 + 两个 kernel 各自早退处理（L723-L726, L779-L782）。",
+      "cost": "① 接受率低时纯亏：draft 前向 + target 序列变长白算；② 采样语义收窄：min_p/logit_bias/自定义 logits processor 与 spec decode 互斥（logits_processor/__init__.py:L200-L209，只剩 MinTokens 以 apply_with_spec_decode 特化版存活 builtin.py:L240-L291）；③ 显存：draft 模型常驻（embed/lm_head 与 target 共享省大头，llm_base_proposer.py:L1220-L1338）；④ 结构化输出要为每个 spec 位预填 k+1 个掩码、接受后 rollback（__init__.py:L277-L290；GrammarMatcher max_rollback_tokens=num_speculative_tokens，backend_xgrammar.py:L115-L119）；⑤ 逐 token draft 循环与 full CUDA graph 不兼容，drafter 只许 PIECEWISE（llm_base_proposer.py:L369-L384）。"
+    },
+    {
+      "decision": "随机采样用 Gumbel/exp 技巧（probs/q 取 argmax, q~Exp(1)），spec decode 的 uniform 用 float64",
+      "old_design": "torch.multinomial 按概率抽。",
+      "pain": "multinomial 引发 CPU-GPU 同步（阻断异步调度流水线）；float32 uniform 有非平凡概率采到精确 0.0（pytorch#16706），会让拒绝采样的接受判等边界出错（rejection_sampler.py:L635-L644 注释原话）。",
+      "solution": "random_sample：q.exponential_() 后 probs.div_(q).argmax——与按概率抽样统计等价且全程 GPU 无同步（topk_topp_sampler.py:L385-L406）；有 seed 的请求先无 seed 批量生成再逐请求用 generator 覆盖（L399-L405）；spec decode 的 uniform_probs 用 float64（rejection_sampler.py:L640-L644）。",
+      "cost": "有 per-request seed 时退化为逐请求循环（L402-L404 TODO 自认 'This can be slow'）；FlashInfer 采样核与逐请求 generator 不兼容也要回退（topk_topp_sampler.py:L143-L150）。"
+    },
+    {
+      "decision": "模型定义层 = 平台无关层的纯拼装（模型文件只做层组装 + 权重名映射，attention 是插座不是实现）；新架构接入走 registry 清单",
+      "old_design": "HF modeling_*.py 每个模型自带注意力实现与 KV 管理；各模型一份 kernel 胶水，无法跨模型复用 kernel/并行/量化。",
+      "pain": "新架构 = 重写一遍 attention+TP+量化胶水；同一 FlashAttention kernel 要为几十个模型各改一遍。",
+      "solution": "模型文件只拼层：LlamaDecoderLayer = RMSNorm + QKVParallelLinear + Attention + SiluAndMul + RowParallelLinear（llama.py:L253-L333）；Attention 层不知道具体 kernel，unified_attention_with_output 自定义算子从 ForwardContext 取 attn_metadata/kv_cache（vllm/model_executor/layers/attention/attention.py:L409-L501，L420-L427 docstring 写明 metadata 由 runner 的 set_forward_context 挂入）；权重加载用 stacked_params_mapping 把 HF 的 q/k/v/gate/up 映射进融合层（llama.py:L436-L498）；registry 把 HF architectures 字符串映射到 (模块, 类)（registry.py:L100 'DeepseekV4ForCausalLM': ('deepseek_v4', 'DeepseekV4ForCausalLM')）。DeepSeek-V4 的接入清单实证：模型文件（deepseek_v4.py:L1620-L1688：forward/compute_logits/load_weights/make_empty_intermediate_tensors 四件套 + get_mtp_target_hidden_states 给 MTP draft 的新钩子 L1674-L1678）+ registry 条目 + 新 MLA 层报自己的 KVCacheSpec（MLAAttentionSpec，mla_attention.py:L951-L961；DeepSeek-V4 独有 DeepseekV4MLAModules+稀疏 SWA，layers/deepseek_v4_attention.py:L92-L160）+ 量化分发 override（DeepseekV4FP8Config.override_quantization_method，deepseek_v4.py:L179-L209）。",
+      "cost": "接入税重：新架构作者要同时懂模型层契约（PP 缺层 PPMissingLayer、TP 头数整除断言 llama.py:L144-L155、static_forward_context 注册——普通 Attention 在 __init__ 里自动做，MoE 手动做 deepseek_v4.py:L471-L476）+ KV cache 规格体系 + 量化分发 + 编译装饰器（@support_torch_compile llama.py:L340）；PluggableLayer 注册点（mla.py:L33）是 OOT 平台的后门，也让「一层到底谁实现」更难一眼看清。"
+    },
+    {
+      "decision": "MLA：KV cache 只存压缩潜向量（kv_c+k_pe 共 576 元素/token/layer），prefill/decode 用两种相反的展开策略（MHA 展开 vs MQA 吸收）",
+      "old_design": "MHA/GQA：每 token 缓存 K、V 各 num_kv_heads×head_dim。DSV3 若 128 头 MHA，每 token 每 layer 需 128×(192+128)=40960 元素；Llama-70B GQA（8 KV 头×128 维）也要 2048。KV cache 总量是长上下文并发的第一瓶颈——PagedAttention（分页）只解决碎片与共享，不降低每 token 总量。",
+      "pain": "长上下文批量并发的显存天花板：KV cache 装不下 → 要么砍 batch 要么砍上下文。DSV2 论文（arXiv:2405.04434，mla_attention.py:L23 引用）把 KV 低秩压缩进潜空间。",
+      "solution": "cache 只存 kv_lora_rank(512)+qk_rope_head_dim(64)=576（mla_attention.py:L26-L63 顶部文档 + L361 + MLAAttentionSpec L951-L961；支持 head size 仅 320/576，L1210-L1212）。两种展开（L13-L21 文档明示动机）：prefill（Sq/Skv≈1）用 compute-friendly MHA 路径——kv_b_proj 把潜向量上投影成完整 K/V 再标准 attention（forward_mha L2256-L2326）；decode（Sq/Skv 大）用 data-movement-friendly MQA 路径——q 侧先乘 W_UK 吸收进潜空间、attention 在 576 维当 MQA 做、输出再 W_UV 上投影（forward_impl L692-L785）；过程权重存重排副本 W_UK_T/W_UV（process_weights_after_loading L826-L913）。模型侧包装器 MultiHeadLatentAttentionWrapper 统一预处理（mla.py:L34-L181），DSV3.2 稀疏注意力另有 indexer 先选 top-k 上下文（deepseek_v2.py:L986-L1009）。",
+      "cost": "① prefill 上投影要物化 [Skv, N, P+V] 大张量 → chunked prefill workspace 分块 + LSE merge 拼接（L121-L187 文档 + determine_chunked_prefill_workspace_size L1395-L1424，64K token 上限 ≈144MB workspace/≈3GB 上投影）；② 两条数值路径（prefill MHA/decode MQA）意味着同一层两种算法，正确性靠 merge_attn_states 对齐；③ 576 维特形 KV 与所有通用后端不兼容 → MLA 需要独立 backend 家族（get_attn_backend(use_mla=True) L377-L384）+ 独立 prefill backend 插件（L463-L472）；④ 记法漂移：DeepSeek-V4 改用统一 head_dim+compress_ratios，get_mla_dims 双格式兼容（L1319-L1342）——架构演进的税由框架侧吃。"
+    },
+    {
+      "decision": "worker 侧 forward 与采样拆成两次 RPC（execute_model 返回 None 存状态 → sample_tokens(grammar_output)），让 CPU 侧位掩码计算与 GPU 前向重叠",
+      "old_design": "单次 execute_model 内联完成前向+采样（v0/v1 早期形态）；语法掩码要么在提交前算（阻塞调度循环）要么融进 worker 调用内（掩盖重叠机会）。",
+      "pain": "结构化输出的 CPU FSM walk + 位掩码填充在关键路径上：若串行在「调度完成→GPU 提交→采样」之间，每步白白加一段 CPU 时间；批越大越明显。",
+      "solution": "GPUModelRunner.execute_model 启动前向后把 (scheduler_output, logits, hidden_states...) 存进 execute_model_state 即返回 None（gpu_model_runner.py:L4184-L4203；worker_base.py:L134-L148 注释定义两次调用的契约）；EngineCore.step 先 non_block=True 提交 execute_model，紧接在主线程算 scheduler.get_grammar_bitmask（vllm/v1/engine/core.py:L417-L419），future.result() 为 None 再调 model_executor.sample_tokens(grammar_output)（L424-L426 → uniproc_executor.py:L122-L130），worker 在 sample_tokens 里 apply_grammar_bitmask 于 logits（gpu_model_runner.py:L4243-L4247）后才跑 Sampler——掩码计算与 GPU 前向在多线程/多进程下真实并行。",
+      "cost": "① worker 有状态化（execute_model_state），调用顺序错误直接 RuntimeError（L3860-L3863 防御）；② 两段式使调用链更难追（sample_tokens 是隐藏的第二幕）；③ PP/DP 各 rank 都要遵守同一两段协议。"
+    }
+  ],
+  "contracts": [
+    "【runner→模型层】GPUModelRunner.execute_model（vllm/v1/worker/gpu_model_runner.py:L3855）调 model.forward(input_ids, positions, intermediate_tensors, inputs_embeds)（llama.py:L565）。输入 GPU 张量归 runner 常驻缓冲所有并写入（InputBatch + _prepare_inputs），模型只读不拥有；hidden_states 输出张量归模型分配、runner 消费。",
+    "【模型内 attention 的隐式契约】attn_metadata/kv_cache/slot_mapping 不走参数：runner 用 set_forward_context（gpu_model_runner.py:L4099-L4110）挂进 ForwardContext；Attention.forward 内 get_forward_context() 取（attention.py:L423-L427）。KV cache 写者=unified_kv_cache_update 路径的后端 kernel（attention.py:L470-L492），读者=同一 layer 的 attention kernel；模型层代码永远拿不到 KV cache 指针。",
+    "【模型层→采样】runner 只切采样位 hidden_states[logits_indices]（gpu_model_runner.py:L4152）调 model.compute_logits（L4153→llama.py:L577→layers/logits_processor.py:L54-L104）。logits [num_sample_positions, org_vocab] 写者=lm_head GEMM+TP gather（TP>1 时 gather 语义、rank>0 返回 None，logits_processor.py:L75-L87）；读者=Sampler（或先被语法位掩码原位改写）。所有权：logits tensor 在整个采样管线中被原位修改（in-place 是契约的一部分），想保留 raw 必须调用方 clone。",
+    "【采样元数据契约】Sampler 只吃冻结快照 SamplingMetadata（vllm/v1/sample/metadata.py:L15-L55），由 InputBatch._make_sampling_metadata（gpu_input_batch.py:L831-L934）每步产出：CPU 常驻张量归 InputBatch（写者=调度器经 runner 的 update_states/condense 换位），GPU slice 对 Sampler 只读；output_token_ids 是 python list 引用、与调度器共享可变状态（interface.py:L41-L48 注释约定）。批组成变化经 BatchUpdate（added/removed/moved）单向推给 logitsprocs.update_state。",
+    "【采样→调度器回程】SamplerOutput.sampled_token_ids [num_reqs,1] int32 GPU 张量 → _bookkeeping_sync D2H（gpu_model_runner.py:L3427-L3485）→ ModelRunnerOutput（L4416-L4429）→ Scheduler.update_from_output（scheduler.py:L1248）写 Request.output_token_ids、判停止、推进语法 FSM（L1359-L1374）。采样结果的所有权在 D2H 拷贝时移交给调度器进程。",
+    "【结构化输出三段契约】① 输入处理线程独占调 StructuredOutputManager.grammar_init（core.py:L783-L790，线程安全性靠该注释约定），产物 StructuredOutputGrammar 以 Future 挂在 Request.structured_output_request（写者=编译线程池，读者=调度器）。② 每步 Scheduler.get_grammar_bitmask（scheduler.py:L1224）产 GrammarOutput(req_ids, np.ndarray[int32])（sched/output.py:L259-L263）经 executor 传 worker；位掩码 ndarray 单向流（调度器进程写→序列化→worker 读），行序以 structured_output_request_ids 为准、worker 侧重排对齐自己的批序（structured_output/utils.py:L84-L97）。③ 采样后 FSM 推进归调度器：grammar.accept_tokens（scheduler.py:L1359-L1374），失败即 FINISHED_ERROR 终止请求。",
+    "【spec decode draft 的所有权环】worker 内 drafter.propose 产 GPU draft 张量（llm_base_proposer.py:L392）→ _copy_draft_token_ids_to_cpu（gpu_model_runner.py:L4507）→ take_draft_token_ids（L4501）→ EngineCore.post_step（core.py:L441-L445）→ Scheduler.update_draft_token_ids → 下一步以 SchedulerOutput.scheduled_spec_decode_tokens 回流 runner。draft 层与 target 共用同一 KV cache 池，draft 注意力层报自己的 KVCacheSpec 且必须同组（llm_base_proposer.initialize_attn_backend:L1465-L1548 校验 validate_same_kv_cache_group）。",
+    "【普通采样 vs 拒绝采样是替换不是叠加】GPUModelRunner._sample（gpu_model_runner.py:L3397-L3425）：spec_decode_metadata 为 None 走 self.sampler，非 None 整体换 RejectionSampler(spec_decode_metadata, draft_probs=None, logits, sampling_metadata)。两条管线各自维护 min_tokens/penalties/bad_words 的 spec 变体（rejection_sampler.py:L283-L344）。"
+  ],
+  "data_flow": "一个 decode 步、带 JSON schema 约束、无 spec decode 的请求，从调度到 FSM 推进：\n1. EngineCore.step（vllm/v1/engine/core.py:L406）→ scheduler.schedule() 产 SchedulerOutput（has_structured_output_requests=True）。\n2. execute_model(scheduler_output, non_block=True) 提交 worker（core.py:L418）：GPUModelRunner.execute_model（gpu_model_runner.py:L3855）——_prepare_inputs 算 logits_indices=query_start_loc[1:]-1（L2078），组注意力元数据后 set_forward_context（L4099-L4110）跑 model.forward（L4117→llama.py:L565-L575，逐层 LlamaDecoderLayer.forward llama.py:L316-L333：RMSNorm→LlamaAttention（qkv_proj→split→rotary_emb→Attention 插座→o_proj，L228-L233）→RMSNorm→MLP）。\n3. 与 GPU 前向并行：主线程 scheduler.get_grammar_bitmask（core.py:L419→scheduler.py:L1224→structured_output/__init__.py:L203-L299）：matcher.fill_next_token_bitmask 填 [1, ceil(V/32)] 掩码，返回 GrammarOutput。\n4. worker 完成前向后：sample_hidden_states = hidden_states[logits_indices]（L4152）→ logits = model.compute_logits（L4153→llama.py:L577-L582→layers/logits_processor.py:L54-L104：lm_head GEMM→TP gather→裁 padding），execute_model 存状态返回 None（L4184-L4203）。\n5. EngineCore 见 future.result() 为 None → sample_tokens(grammar_output)（core.py:L424-L426→uniproc_executor.py:L122）→ worker：apply_grammar_bitmask（gpu_model_runner.py:L4244-L4247→structured_output/utils.py:L44-L121：批序重排→H2D→xgr.apply_token_bitmask_inplace 把非法位写 -inf）。\n6. _sample（L3397-L3411）→ Sampler.forward（sampler.py:L68-L143）：raw logprobs（L80-L88）→ fp32（L91）→ allowed/bad_words/min_tokens/logit_bias/penalties/thinking_budget（apply_logits_processors L357-L406）→ sample（L232-L288：greedy argmax 或 temperature→min_p→top-k/top-p（topk_topp_sampler.py:L305-L359）→random_sample Gumbel（L385-L406）→torch.where 合并）→ gather_logprobs（L294-L342）→ SamplerOutput（L136-L142）。\n7. D2H：_bookkeeping_sync（L3427-L3485）→ ModelRunnerOutput（L4416-L4429）。\n8. Scheduler.update_from_output（scheduler.py:L1248）：写 Request.output_token_ids、停止判定（L1350-L1353）、grammar.accept_tokens 推进 FSM（L1359-L1374，should_advance 含 reasoning 门 L321-L357）→ EngineCoreOutputs 出 EngineCore 进程回 OutputProcessor。",
+  "first_read_suggestion": "面向「懂后端不懂 AI」读者的阶梯：\n①【最早、第 1 Part 讲『一个请求的一生』时】只需两句话立住 logits 概念：GPU 出来的不是文字，是一个 13 万维的分数向量；采样=把这个向量变成 1 个 token id 的确定性规则+随机掷骰。这两个概念是 L0 数据流主轴的终点站，必须首 Part 出现，但只停在「分数→选择」层面，不展开 9 步。\n②【结构化输出可以比采样管线更早当 hook】语法 FSM/编译缓存/位掩码本质是编译器前端+位图过滤，后端读者完全comfortable；建议在调度器状态机（WAITING 状态族）之后、采样细节章之前，用『怎么保证 LLM 只输出合法 JSON』作 hook 引出——但完整跨进程数据流（调度器 FSM↔worker logits）必须已讲过三段式进程边界。\n③【采样管线 9 步】放在调度器/持久批之后：SamplingMetadata 是持久批状态的快照、BatchUpdate 的 added/removed/moved 只有见过 preempt/condense 换位才懂为何存在；top-p 的『概率质量截断』必须配 5-token 玩具 vocab 的 worked example（数值表走一遍 softmax→排序→cumsum→截断）。\n④【模型定义层】放在注意力 backend 章之后、依赖张量并行章：LlamaAttention.__init__ 前半段全是 TP 头数切分（llama.py:L142-L155），Attention 插座（unified_attention_with_output）不懂 backend 选择就读不懂它在等谁。ForCausalLM 契约（forward/compute_logits/load_weights）用『接入清单』体讲，DeepSeek-V4 作 end-to-end 实例。\n⑤【MLA】放 KV cache 篇作第二幕：第一幕 PagedAttention 解决碎片/共享，第二幕 MLA 解决每 token 总量（40960→576 的数字对比即 hook）；依赖 KV cache 布局与 backend 家族概念。prefill/decode 双路径是『同一数学、两种算法』的最佳教学案例。\n⑥【spec decode 最后】依赖：采样（拒绝采样的分布不变性需要 primer，v2 ch33 EAGLE primer 可复用其数学骨架）、调度器（draft 进下一步批次）、KV cache（slot 扩展）、结构化输出（rollback 联动）。顺序建议：ngram（零模型，纯算法）先立『draft+verify+拒绝采样』骨架，再上 EAGLE/MTP（hidden_states 复用）。\n⑦ 概念依赖红线：softmax/概率分布 是本域一切的前置，必须首 Part；argmax 不变性 是 9 步顺序的钥匙，在采样章内部先行；『in-place 修改 logits』的数据所有权约定是跨 runner/sampler/语法掩码三段的共同暗线，值得在采样章显式点破。另注：worker/gpu/ 是 v0.21.0 的实验性 Model Runner V2（README.md 自标 Experimental），书应教 vllm/v1/worker/gpu_model_runner.py 主路径并一句话预告迁移。",
+  "key_files": [
+    "vllm/v1/sample/sampler.py",
+    "vllm/v1/sample/metadata.py",
+    "vllm/v1/sample/ops/topk_topp_sampler.py",
+    "vllm/v1/sample/ops/topk_topp_triton.py",
+    "vllm/v1/sample/ops/penalties.py",
+    "vllm/v1/sample/ops/bad_words.py",
+    "vllm/v1/sample/logits_processor/interface.py",
+    "vllm/v1/sample/logits_processor/builtin.py",
+    "vllm/v1/sample/logits_processor/state.py",
+    "vllm/v1/sample/logits_processor/__init__.py",
+    "vllm/v1/sample/rejection_sampler.py",
+    "vllm/v1/sample/thinking_budget_state.py",
+    "vllm/model_executor/layers/logits_processor.py",
+    "vllm/model_executor/models/llama.py",
+    "vllm/model_executor/layers/mla.py",
+    "vllm/model_executor/layers/attention/mla_attention.py",
+    "vllm/model_executor/layers/attention/attention.py",
+    "vllm/model_executor/models/deepseek_v2.py",
+    "vllm/model_executor/models/deepseek_v4.py",
+    "vllm/model_executor/layers/deepseek_v4_attention.py",
+    "vllm/model_executor/models/registry.py",
+    "vllm/v1/structured_output/__init__.py",
+    "vllm/v1/structured_output/request.py",
+    "vllm/v1/structured_output/backend_xgrammar.py",
+    "vllm/v1/structured_output/backend_types.py",
+    "vllm/v1/structured_output/utils.py",
+    "vllm/v1/worker/gpu/structured_outputs.py",
+    "vllm/v1/worker/gpu_model_runner.py",
+    "vllm/v1/worker/gpu_input_batch.py",
+    "vllm/v1/spec_decode/llm_base_proposer.py",
+    "vllm/v1/spec_decode/ngram_proposer.py",
+    "vllm/v1/spec_decode/metadata.py",
+    "vllm/v1/core/sched/scheduler.py",
+    "vllm/v1/core/sched/output.py",
+    "vllm/v1/engine/core.py"
+  ],
+  "open_questions": [
+    "V2 实验路径（vllm/v1/worker/gpu/{model_runner,structured_outputs}.py）与 V1 主路径（gpu_model_runner.py + structured_output/utils.py）的双轨由 use_v2_model_runner 门控（gpu_worker.py:L316-L330）：V2 走自研 Triton 位掩码核 + cu_num_logits 映射，V1 走 xgr.apply_token_bitmask_inplace。书里教哪条、怎么提另一条，待 Phase 1 定。",
+    "MTP（DeepSeek 官方 multi-token prediction draft，deepseek_v4_mtp.py + get_mtp_target_hidden_states 钩子）在 v0.21.0 已是 first-class：draft 吃 target 的 pre-hc_head 残差流（llm_base_proposer.py:L82-L89）。EAGLE vs MTP 的叙事主次值得 Phase 1 决定（v2 只有 EAGLE primer）。",
+    "num_logprobs==-1 的全词表 logprobs 路径与 logprob_token_ids 稀疏路径（sampler.py:L106-L130）是 API 侧新契约，v2 未覆盖，v3 是否入章待定。"
+  ]
+}
