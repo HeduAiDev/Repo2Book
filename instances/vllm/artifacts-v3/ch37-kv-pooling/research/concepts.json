@@ -1,0 +1,192 @@
+{
+  "chapter_id": "ch37",
+  "chapter_title": "KV 池化：把 cache 搬出 GPU——DRAM 上的分布式 KV 管理",
+  "pin": "vLLM v0.27.1 (6e448d0ea)",
+  "generated_by": "researcher",
+  "generated_date": "2026-08-16",
+  "note": "本章为 v3 新增方向（v2 未覆盖），dossier/chapter.md 尚未产出——本包按 Lead 派单 6 项 + 大纲/pedagogy-plan 条目（Mooncake 架构 / LMCache / HBM-DRAM-SSD 分层 / 回收 KVConnector 契约伏笔）先行研究。pin 侦察仅供框架定位：v0.27.1 的 connector 注册表（factory.py，一手核）里有 MooncakeConnector+MooncakeStoreConnector、LMCacheConnectorV1+LMCacheMPConnector、OffloadingConnector+SimpleCPUOffloadConnector、Nixl 三型、ExampleConnector（shared_storage_path）——**没有**叫 SharedStorageConnector 的注册名（该名只见于 2025 年上半年的 vLLM issue）。接入源码的行级解读是 dossier 主场，本文件只做读者定向外部背景。全部数字带出处与访问日期；外部生态变化快（Mooncake 2024-11 才开源 TE、2025-03 开源 Store、LMCache 2026-04 才发 MP 架构），正文转述务必保留时间限定。与相邻章分工：ch16 讲过 KVConnector 双面契约（本章回收其二）、ch36 刚讲过 P/D 分离与 NIXL——NIXL 本体不重讲，本包只做它与 Mooncake Transfer Engine 的关系对比。",
+  "concepts": [
+    {
+      "id": "mooncake",
+      "term": "Mooncake（FAST'25 最佳论文：以 KVCache 为中心的分离式架构，Kimi 的生产底座）",
+      "kind": "external_project",
+      "one_line": "月之暗面（Moonshot AI）为 Kimi 打造的推理服务平台——把 prefill/decode 集群拆开只是第一步，真正的主张是把全集群闲置的 CPU/DRAM/SSD 攒成一个可调度的分布式 KVCache 池，用「便宜的存储换昂贵的计算」。",
+      "what_it_is": "论文（arXiv:2407.00079，FAST'25 最佳论文，正式发表标题为《Mooncake: Trading More Storage for Less Computation: A KVCache-centric Architecture for Serving LLM Chatbot》）描述的架构有三块骨架：**分离的 prefill/decode 集群**（用推理集群闲置的 CPU、DRAM、SSD 资源构成 KVCache 池）；**全局调度器 Conductor**（KVCache-centric scheduler）——按「当前 KVCache 分布 + 负载」派发请求：先做前缀哈希匹配找缓存最多的实例，再估 TTFT（排队 + prefill 计算 + KV 传输三段），选期望 TTFT 最短的实例；过载时在 prefill 之前就**预测性早拒绝**（Early Rejection，直接回 HTTP 429，省掉注定超 SLO 的 prefill 算力）；后台按块热度复制最热块、换出最冷块；**传输组件**——论文 v4（2025-09）里它叫 Messenger，「一个独立的（GPUDirect）RDMA 组件，在每个推理实例内以独立进程形态跑」，逐层与 prefill 计算重叠。开源世界的对应物叫 **Transfer Engine**（TE）+ **Mooncake Store**：TE 只管「把这段字节从 A 机零拷贝搬到 B 机」（多网卡 RDMA 带宽聚合、拓扑感知选路、故障切换），Store 是其上的对象级分布式 KV 池（master 管元数据/近似 LRU 淘汰，客户端各捐一段连续内存进池子）。**关键防错点**：开源出来的只有 TE（2024-11）与 Store（2025-03）等数据面组件；**Conductor 只存在于论文与后续 RFC（GitHub issue #977，2025-10 提出，已关闭未实现）里，README 里根本不提它**——「全局调度器」至今不是你能 pip install 到的东西。\n\n**收益数字（两套口径，引用时别混）**：①论文口径——模拟场景（16k-128k 输入、50% 缓存占比）下吞吐最多 +525%（对照物是 4 个共置 vLLM 实例）；Kimi 真实线上 trace 重放下多处理 75% 请求（10P+10D 对照 20 个共置 vLLM；后者只有 57% 请求满足 TBT SLO，Mooncake≈100%）。②vLLM 官方博客口径（2026-05-06，MooncakeStoreConnector 集成实测）——agentic 负载（SWE-bench Pro 上重放 Codex trace，610 条、中位 33 轮、输入:输出=131:1、上下文 12K→80K 增长、理论可命中率 94.2%），Kimi-2.5 NVFP4 @ GB200，1P1D 共 12 卡：吞吐 3.8x、P50 TTFT 降 46x、E2E 延迟降 8.6x、命中率 1.7%→92.2%；12→60 卡近线性扩展且命中率保持 >95%。",
+      "background": "谱系：DistServe（arXiv:2401.09670）等 2024 年初的工作先论证「prefill/decode 拆开各自调优」更优；Mooncake 在此之上多走一步——KVCache 本身从「两台引擎之间传一下的数据」升格为「独立分层的资源池 + 配套全局调度」，并真金白银跑在 Kimi 亿级请求量上（论文自称「the serving platform for Kimi」）。开源节奏：2024-11 TE 开源 → 2025-03 Store 开源 → 此后被 vLLM（MooncakeStoreConnector）、SGLang（HiCache）、LMCache（远端后端之一）、LMDeploy 等多家引擎共用，2026-02 加入 PyTorch 生态。演进中的下一代叫 TENT（Transfer Engine NEXT，路线图 issue #1058 + 论文 arXiv:2604.00368）。注意命名漂移：早期材料与部分文档把传输组件就叫 Transfer Engine，论文 v4 正文改称 Messenger，开源 README 仍用 TE——读者若对照论文与源码需知道这是同一件事的两个名字。vLLM 侧的接法：每个 vLLM 实例内嵌 Mooncake 客户端，集群级 master 管块哈希元数据与服务发现；调度器侧把 prompt 块哈希拿去查 master 引导调度，worker 侧把 GPU HBM 注册成 RDMA buffer、后台 IO 线程异步搬——GPUDirect RDMA 直达显存「无中转 buffer、不占 SM」；P/D 与池化可经 MultiConnector 叠加（decode 写入的块对 prefill 实例立即可见）。",
+      "example": {
+        "input": "（vLLM 官方文档 MooncakeStoreConnector 用法页的真实配置，2026-08-16 抓）单机 CPU offload 起法——先起 master：`mooncake_master --port 50051`（多个 vLLM 实例可共用一个 master），再写 mooncake_config.json（`mode: \"embedded\"` 每个 rank 进程内捐内存 / `\"standalone-store\"` 由外部 `mooncake_client` 独占 CPU/SSD 池；`protocol: \"rdma\"` 优先、`\"tcp\"` 兜底；`enable_offload: true` 打开 DirectIO 分级缓冲以便落盘），然后：\n\n```bash\nPYTHONHASHSEED=0 MOONCAKE_CONFIG_PATH=mooncake_config.json \\\n  vllm serve <model> --kv-transfer-config \\\n  '{\"kv_connector\":\"MooncakeStoreConnector\",\"kv_role\":\"kv_both\"}'\n```",
+        "result": "该实例从此把写满的 KV 块按内容哈希放进集群共享池、调度前先查池命中——跨实例前缀复用成立的前提是**每个进程的 PYTHONHASHSEED 一致**（官方文档专门警告：Python 每进程随机化 hash 种子，不固定则同 prompt 在不同进程算出不同块哈希，跨进程命中直接失效）。",
+        "line_by_line": "逐行看点：`kv_role: kv_both` 表示单机 offload 场景既存又取（P/D 分离时 prefill 侧 `kv_producer`、decode 侧 `kv_consumer`）；`PYTHONHASHSEED=0` 是「内容寻址要跨进程可复现」的工程前提，与 ch15 前缀缓存的链式哈希一脉相承；`mode` 两态对应「捐内存进池」与「独立存储进程」两种池化形态。"
+      },
+      "links": [
+        "https://arxiv.org/abs/2407.00079",
+        "https://madsys.cs.tsinghua.edu.cn/publication/mooncake-trading-more-storage-for-less-computation-a-kvcache-centric-architecture-for-serving-llm-chatbot/FAST25-qin.pdf",
+        "https://kvcache-ai.github.io/Mooncake/"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/abs/2407.00079", "note": "一手抓取摘要页：v1 2024-06-24 → v4 2025-09-03；525% 为「certain simulated scenarios」、75% 为 Kimi 真实负载；利用 underutilized CPU/DRAM/SSD。访问 2026-08-16。"},
+        {"url": "https://arxiv.org/html/2407.00079v4", "note": "一手抓取 v4 全文：Conductor 职责（前缀哈希匹配/TTFT 三段估算/早拒绝/冷热复制）；传输组件名为 Messenger（GPUDirect RDMA、逐层重叠）；缓存统计——生产负载复用上限约 50%（个别服务 90%）、超 50% 缓存块从未复用、数据集缓存占比 ArXiv≈0% / L-Eval>80% / 真实≈50%、命中率随容量 1k 块 0.30→∞ 容量平台 0.51（LRU 优于 LFU）；525% 基线为 vLLM-[4M]、75% 基线为 vLLM-[20M]（其 TBT SLO 达成率仅 57%）；§10 定性指出 GDDR/LPDDR 每美元带宽比旗舰加速器好一个数量级。访问 2026-08-16。"},
+        {"url": "https://github.com/kvcache-ai/Mooncake", "note": "一手抓取 README：FAST'25 Best Paper；TE 带宽 87 GB/s（4×200Gbps）/ 190 GB/s（8×400Gbps RoCE），较 TCP 快 2.4x/4.6x；传输栈 TCP/RDMA/EFA/NVMe-oF/NVLink/HIP/Barex/CXL/昇腾系；集成清单 vLLM/SGLang/LMCache/LMDeploy；6.3k star；Conductor 全文未提及。访问 2026-08-16。"},
+        {"url": "https://github.com/kvcache-ai/Mooncake/issues/977", "note": "一手抓取 Conductor RFC（2025-10-28 提出）：三层三明治（Conductor→vLLM/SGLang→Store+TE）、缓存感知 prefill 调度（全局 Block Radix Tree 索引）、负载均衡 decode 调度、KVCache 冷热分层后台守护；状态 Closed as not planned——未实现未开源。访问 2026-08-16。"},
+        {"url": "https://vllm.ai/blog/2026-05-06-mooncake-store", "note": "一手抓取 vLLM 官方博客《Serving Agentic Workloads at Scale with vLLM x Mooncake》：agentic 负载参数（131:1、33 轮中位、94.2% 理论命中率、上下文 12K→80K）；3.8x/46x/8.6x、命中 1.7%→92.2%、12→60 卡近线性且 >95% 命中；基线是 NIXL P/D（只缓存系统提示词故 1.7%）；100K token 上下文≈3.8GB KV（Kimi-2.5 FP8）；GPUDirect RDMA 无中转 buffer 不占 SM；NVMe 层当时列为 future work；P/D+池化经 MultiConnector 叠加。访问 2026-08-16。"},
+        {"url": "https://docs.vllm.ai/en/latest/features/mooncake_store_connector_usage/", "note": "一手抓取 vLLM 官方 MooncakeStoreConnector 用法页：mooncake_master 端口 50051、embedded/standalone-store 两模式、rdma/tcp、enable_offload 三处对齐、tenant_id 隔离、load_async/lookup_async、cache_prefix 命名空间、PYTHONHASHSEED 必须全进程一致。访问 2026-08-16。"},
+        {"url": "https://kvcache-ai.github.io/Mooncake/", "note": "一手抓取文档站首页：设计文档清单（TE/TENT/Store/Conductor/P2P Store 等）；「Now both the Transfer Engine and Mooncake Store are open-sourced!」——Conductor 与 TENT 无开源声明；Kimi K2 @128×H200 prefill 224k tok/s、decode 288k tok/s。访问 2026-08-16。"}
+      ],
+      "confidence": "high",
+      "writer_note": "Mooncake 是本章外部主叙事，值得一小节。正文立三层：①「以 KV 为中心」与 ch36 P/D 的本质差异——P/D 解决「KV 从 A 搬到 B」，Mooncake 把 KV 升格为可调度的独立资源池（便宜的存储换昂贵的计算，正是 FAST'25 发表标题里的 trading more storage for less computation）；②架构三件：Conductor（全局调度）/ TE 或 Messenger（零拷贝 RDMA 传输）/ Store（对象级池）——**务必点破 Conductor 只有论文与 RFC、未开源**（README 都不提），防止读者以为装个 mooncake 包就有全局调度器；③数字引用规范：论文口径（+525% 模拟、+75% 真实 trace，注明基线是共置 vLLM）与 vLLM 博客口径（3.8x/46x/命中率 1.7%→92.2%，注明基线是只缓存系统提示词的 NIXL P/D、agentic 负载）分开标注、各带出处，绝不混写。example 里的配置片段可用（明标 vLLM 官方文档、外部示例），PYTHONHASHSEED 一句与 ch15 链式哈希呼应成「内容寻址要可复现」的伏笔回收。TENT/Messenger 命名漂移一句脚注即可；Store 的近似 LRU/soft-pin 细节留给 Mooncake 文档链接。"
+    },
+    {
+      "id": "lmcache",
+      "term": "LMCache（引擎之外的 KV cache 管理层：卸载、跨实例共享、非前缀复用）",
+      "kind": "external_project",
+      "one_line": "一个独立于推理引擎的「KV cache 管理层」——把 KV 当成可跨请求、跨会话、跨引擎实例复用的持久资产，从 GPU 卸到 CPU/磁盘/远端多级存储，引擎崩了缓存还在（官方说法：no fate-sharing with engines）。",
+      "what_it_is": "LMCache（Apache-2.0，2026-08 时 11.2k star，2025-10 加入 PyTorch 基金会）自我定位是「LLM 推理的 KV cache 管理层」。它管三件事：**卸载（offloading）**——KV 从 GPU 显存逐级下沉到 CPU RAM、本地 SSD、远端（Redis/Valkey、S3 兼容对象存储、InfiniStore，甚至 Mooncake Store 和 NIXL 都是它可选的后端），缓解长上下文下「显存装不下热缓存」的压力；**复用**——不止传统前缀缓存，还有基于 CacheBlend（EuroSys'25）的**非前缀复用**（任意位置的缓存块选择性重算拼装）与 CacheGen（SIGCOMM'24）的 KV 压缩（SERDE 接口可插自定义变换）；**可观测**——请求/token 级前缀命中率等指标。部署形态两种（与 vLLM 集成时正好对应 pin 里两个注册名）：**in-process**——LMCache 跑在 vLLM 进程内，`kv-transfer-config` 指到 `LMCacheConnectorV1`；**MP 模式**（2026-04 发布，官方推荐）——独立 `lmcache server` 守护进程（ZMQ 5555 端口通信、HTTP 8080 管理/指标），vLLM 经 `LMCacheMPConnector` 接入，一个 server 可被多个引擎实例共享即天然跨实例缓存。vLLM ≥ 0.20.0 还可用 `kv_connector_module_path` 指到 LMCache 自带 connector（比 vLLM 内置版提前携带修复）。论文（arXiv:2510.09665《LMCache: An Efficient KV Cache Layer for Enterprise-Scale LLM Inference》）摘要称配合 vLLM 在多轮 QA/文档分析等负载吞吐最高提升 15x，并指出上下文截断会把前缀命中率砍半——这正是「把 KV 搬出去存着」的动机。\n\n**收益数字（各带 workload 限定）**：官方博客（2026-05-12）AMD MI300X 多轮 agentic 基准：平均 TTFT 降 3.0x、每会话缓存命中率 96.9%；第三方 GPUStack 实测高命中场景 input TPS +355.3%、TTFT -58.8%。另有一个对初学者很有说服力的官方 quickstart 实录：第二请求命中 24/31 token（chunk 哈希按 8-token 对齐，末尾不满块不计），CPU 侧存储吞吐日志 1.98 GB/s。",
+      "background": "LMCache 出身学术（芝加哥大学 Junchen Jiang 组等，CacheGen/CacheBlend 两篇先行论文分别进 SIGCOMM'24 与 EuroSys'25），2025 年起与 vLLM/SGLang 深度共建：vLLM 官方文档如今直接给了 `--kv-offloading-backend lmcache --kv-offloading-size <GB>` 的快捷开关（pin v0.27.1 的 config 里 lmcache 分支默认落 LMCacheMPConnector），NVIDIA Dynamo 2025-09 起也集成它。它与 Mooncake 不是纯竞品：Mooncake README 把 LMCache 列为伙伴（Mooncake Store 可当 LMCache 的远端后端，joint KVCache-centric serving），分工可以记成「LMCache 管缓存策略层（多级卸载/复用/压缩），Mooncake 管数据面底座（RDMA 传输+分布式池）」。MP 架构（独立 server）是它 2026 年的主推方向——动机正是本章主题：缓存要跨引擎实例、跨进程生命周期共享，就不能长在任何一个引擎进程里。",
+      "example": {
+        "input": "（LMCache 官方 quickstart 的 MP 模式真实命令，2026-08-16 抓）起独立 server：\n\n```bash\nlmcache server --host localhost --port 5555 --l1-size-gb 20 \\\n  --eviction-policy LRU --chunk-size 16   # 16 是演示值，生产用默认 256\n```\n\nvLLM 侧接入：\n\n```json\n{\"kv_connector\":\"LMCacheMPConnector\", \"kv_role\":\"kv_both\",\n \"kv_connector_extra_config\": {\"lmcache.mp.host\": \"localhost\", \"lmcache.mp.port\": 5555}}\n```\n\n或最短路径（in-process）：`vllm serve <MODEL> --kv-offloading-backend lmcache --kv-offloading-size <GB> --disable-hybrid-kv-cache-manager`。",
+        "result": "官方 quickstart 实测日志：第一个请求「Stored 31 out of total 31 tokens, cost 1.95 ms, throughput 1.98 GB/s」；第二个同前缀请求命中 24 个 token、加载 8 个——24 而非 31，因为 chunk 哈希按 8-token 页对齐，末尾 7 个不满块不构成可命中单元；其中 16 个又被 vLLM 本地 GPU 前缀缓存接住，真正从 LMCache 加载 8 个。",
+        "line_by_line": "逐行看点：`--l1-size-gb 20` 划 CPU RAM 池大小（L1=本地内存层，对照远端为 L2/L3——分层词汇见分层条目）；`--chunk-size` 是复用粒度；MP 模式下 `lmcache server` 独立于 vLLM 进程存活——引擎重启缓存不丢，多实例连同一 server 即跨实例共享；quickstart 的 24/31 逐层分解（LMCache 命中 24 → GPU 本地接 16 → 远端加载 8）是「多层缓存各管一段」的活教材。"
+      },
+      "links": [
+        "https://github.com/LMCache/LMCache",
+        "https://docs.lmcache.ai/getting_started/quickstart.html",
+        "https://arxiv.org/abs/2510.09665"
+      ],
+      "sources": [
+        {"url": "https://github.com/LMCache/LMCache", "note": "一手抓取 README：定位「KV cache management layer」、独立守护进程 no fate-sharing、非前缀复用（CacheBlend）、多级存储后端（CPU RAM/本地盘/Redis/Valkey/Mooncake/InfiniStore/S3/NIXL/GDS）、MP 架构 2026-04 发布（MoE 推理 10x 博客标题）、11.2k star、PyTorch 基金会（2025-10）、arXiv:2510.09665。访问 2026-08-16。"},
+        {"url": "https://docs.lmcache.ai/getting_started/quickstart.html", "note": "一手抓取官方 quickstart：MP 模式命令（lmcache server，ZMQ 5555/HTTP 8080、--l1-size-gb/--eviction-policy/--chunk-size）、LMCacheMPConnector 配置 JSON、vLLM≥0.20 的 module_path 机制、in-process LMCacheConnectorV1 与 --kv-offloading-backend lmcache 快捷路径、--disable-hybrid-kv-cache-manager 要求、CPU server 走 POSIX 共享内存零拷贝、quickstart 实录数字（31 token 1.95ms 1.98GB/s、二请求 24 命中/8 加载、8-token 页对齐）。访问 2026-08-16。"},
+        {"url": "https://arxiv.org/abs/2510.09665", "note": "一手抓取摘要页：《LMCache: An Efficient KV Cache Layer for Enterprise-Scale LLM Inference》，v1 2025-10-08；配合 vLLM 多轮 QA/文档分析最高 15x 吞吐；上下文截断使前缀命中率减半；GPU/CPU/存储/网络多 tier 的 control API。访问 2026-08-16。"},
+        {"url": "https://blog.lmcache.ai/en/2026/05/12/benchmarking-lmcache-for-multi-turn-agentic-workloads-on-amd-mi300x/", "note": "官方博客（标题与要点经搜索结果摘要取得，页面未直接抓取）：MI300X 多轮 agentic 基准 3.0x 平均 TTFT、96.9% 会话命中率；漏配则 0% 命中。取得 2026-08-16。"},
+        {"url": "https://docs.gpustack.ai/2.0/performance-lab/references/evaluating-lmcache-prefill-acceleration-in-vllm/", "note": "第三方 GPUStack 评测（标题与数字经搜索结果摘要取得）：高命中场景 input TPS +355.3%、TTFT -58.8%。取得 2026-08-16。"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文在「LMCache 与 CPU offload」处给一小段即可（比 Mooncake 短）：立三个点——①它是引擎之外的缓存管理层（MP 模式=独立 server，跨实例共享、引擎崩溃缓存不丢），②两种 vLLM 集成形态正好对上 pin 里两个注册名（LMCacheConnectorV1 in-process / LMCacheMPConnector 连独立 server，还有 --kv-offloading-backend lmcache 快捷开关），③它的差异化在「策略层」：非前缀复用（CacheBlend）与 KV 压缩（CacheGen）是 Mooncake Store 没有的。quickstart 的 24/31 分解例子非常好用（8-token 页对齐、多层各接一段），可作说明性示例；15x/3.0x 数字引用时必须带 workload 限定词（论文口径 vs MI300X agentic 博客口径）。Mooncake 是 LMCache 可选后端这个「竞合」事实值得一句，直接引 Mooncake README。SGLang 集成细节不展开，留链接。"
+    },
+    {
+      "id": "hbm-dram-ssd-tiering",
+      "term": "分层 KV 存储（HBM / DRAM / SSD 三级：带宽、容量、延迟的金字塔）",
+      "kind": "external_concept",
+      "one_line": "把 KV cache 想成数据中心的存储层级问题：HBM 快而小、DRAM 慢一个数量级但大几倍、SSD 再慢一个数量级但大几十倍——池化的本质就是让「放哪一层」变成一个可调度的决策。",
+      "what_it_is": "同一台机器里三级内存介质的量级对比（全部一手官方数字，2026-08-16 核）：\n\n| 层 | 代表硬件 | 带宽 | 容量（每节点量级） | 延迟量级 |\n|---|---|---|---|---|
+| HBM | H100 SXM：80GB @ 3.35TB/s；GB200 每 GPU ~186GB HBM3e @ 8TB/s | 3.35–8 TB/s | 百 GB 级 | 亚百 ns |
+| DRAM | GB200 Grace：至多 480GB LPDDR5X @ 512GB/s；DDR5 RDIMM 至 8000Mbps/引脚、单条 256GB | 数百 GB/s | 0.5–2+ TB | ~100 ns |
+| SSD | PCIe Gen5 NVMe（三星 9100 PRO）：顺序读 14.8GB/s、单盘至 8TB | ~15 GB/s | 数十 TB | 数十 μs |\n\n三条规律：**带宽每下一层掉一个数量级（8TB/s → 0.5TB/s → 0.015TB/s），容量每下一层涨一个数量级**（GB200 整机架 13.4TB HBM@576TB/s 对 17TB LPDDR5X@14TB/s，是最直观的同机架对照）；**延迟从 ~100ns 到数十 μs 再往上**（DRAM ~100ns 是经典数，NVMe 比它慢两三个数量级但比重算 prefill 快得多——100K token 的 KV 约 3.8GB（Kimi-2.5 FP8，vLLM 博客口径），从 50GB/s 的 DRAM 拉回约 76ms、从 15GB/s 的 NVMe 约 250ms，而重算这段 prefill 在单卡上通常是秒级——这就是「换存储省计算」的物理根基，注意这两笔是说明性推算）；**热度的时空局部性决定该放哪层**。分层策略的三个经典抓手（各有出处）：①**淘汰算法**——Mooncake 论文实测 LRU 优于 LFU/LengthAware，命中率随容量先升后平台（1k 块 0.30 → ∞ 容量 0.51），说明加容量的边际收益递减；②**冷热分层/复制**——Conductor RFC 设计热块升 HBM、冷块沉 SSD 并多副本；Mooncake Store 的 master 做近似 LRU 加 lease/soft-pin/hard-pin 保护；③**写路径分层**——LMCache 的 L1（本地 CPU）/L2/L3 分层词汇与 write-through/write-back 语义。取舍的核心张力：层级越深容量越大命中率越高，但加载带宽越低 TTFT 越差——「命中一段冷 KV 再加载」可能比「干脆重算」还慢，所以池化系统的调度必须把**传输时间计入 TTFT 估算**（Conductor 的三段估算里专门有 transfer time 一项）。",
+      "background": "「存储层级」是体系结构的老命题——寄存器/缓存/主存/磁盘的金字塔在单机上成立了几十年；LLM 推理把它的最新两层（HBM、NVMe）推到了新位置：KV cache 是至今第一个**大到必须认真分层**的推理期数据结构（权重是只读的、放 HBM 就完事；KV 是增长的、与上下文长度和并发数成正比）。Mooncake 论文的动机原话就是利用 GPU 集群「underutilized CPU, DRAM, and SSD resources」；其 §10 还从硬件角度补了一刀：论每美元带宽、每瓦带宽，「现在的 GDDR 甚至 LPDDR 方案能比旗舰加速器好一个数量级」——这句话是「为什么敢用慢介质换快介质」的论文级背书。工程谱系上，vLLM×Mooncake 博客（2026-05）的池子还只做 DRAM 层（NVMe 列为 future work），而 Mooncake Store 的 standalone-store 模式已支持 DirectIO 落盘（enable_offload 三处对齐）、LMCache 的多级后端（CPU/盘/Redis/S3）是策略层最全的——同一金字塔，不同项目爬到不同高度。",
+      "example": {
+        "input": "（说明性推算，数字全部有出处、算术为本包所做）agentic 多轮会话，上下文 100K token、Kimi-2.5 FP8 的 KV ≈ 3.8GB（vLLM 博客口径）。第 33 轮请求到来，比较三条路：\n\n```text\nA. GPU 前缀缓存全命中（都在 HBM）：注意力直接读，0 次 prefill 计算\nB. 池化命中、落在 DRAM 池（50GB/s 有效拉取）：3.8GB ÷ 50GB/s ≈ 76ms 传输，0 次计算\nC. 池化命中、落在 NVMe（14.8GB/s）：3.8GB ÷ 14.8GB/s ≈ 257ms 传输，0 次计算\nD. 未命中重算：整段 100K token prefill（单卡秒级，GB200 prefill 224k tok/s 集群口径的倒数不在单卡直接比）\n```",
+        "result": "B/C 与 D 的差就是池化的全部收益来源：传输永远比重算便宜一到两个数量级；而 B 与 C 的差（76ms vs 257ms）就是「DRAM 层还是 SSD 层」的取舍——所以热块要往 DRAM 升、冷块才沉盘。真实系统里再叠一层：vLLM×Mooncake 博客里那 92.2% 的命中块走的就是 B 路加上 GPUDirect RDMA（无中转 buffer 不占 SM），换来 P50 TTFT 降 46x。",
+        "line_by_line": "逐行看点：A 是 ch15 前缀缓存的既有世界（单实例、HBM 内）；B/C 是本章新世界（跨实例、池在慢介质）；D 是没有池化时多轮会话每一轮的账。三个量级台阶（0 计算-传输百 ms / 传输数十 ms / 重算秒级）就是分层策略全部决策的依据。"
+      },
+      "links": [
+        "https://www.nvidia.com/en-us/data-center/gb200-nvl72/",
+        "https://www.nvidia.com/en-us/data-center/h100/"
+      ],
+      "sources": [
+        {"url": "https://www.nvidia.com/en-us/data-center/gb200-nvl72/", "note": "一手抓取 NVIDIA 官方 GB200 NVL72 页：每 superchip（1 Grace+2 Blackwell）372GB HBM3e@16TB/s（即每 GPU ~186GB@8TB/s）、Grace 至多 480GB LPDDR5X@512GB/s、整机架 13.4TB HBM@576TB/s 对 17TB LPDDR5X@14TB/s、NVLink 3.6TB/s。访问 2026-08-16。"},
+        {"url": "https://www.nvidia.com/en-us/data-center/h100/", "note": "一手抓取 NVIDIA 官方 H100 页：SXM 80GB@3.35TB/s、NVL 94GB@3.9TB/s。访问 2026-08-16。"},
+        {"url": "https://semiconductor.samsung.com/dram/ddr/", "note": "一手抓取三星半导体 DDR 页：RDIMM 每引脚至 8000Mbps、单条容量至 256GB、dual 32-bit sub-channel 架构——按 64 位总线宽换算单条至 ~64GB/s、8-12 通道服务器每路数百 GB/s（后两笔为本包按官方引脚速率×总线宽推算）。访问 2026-08-16。"},
+        {"url": "https://news.samsung.com/us/samsung-announces-9100-pro-series-ssds-with-breakthrough-pcie-5-0-performance", "note": "三星官方新闻稿（两次直接抓取均超时，14.8GB/s 顺序读/13.4GB/s 写/至 8TB/PCIe 5.0 x4 取自该官方页的搜索摘要，StorageReview 等第三方评测同数）——Gen5 消费级 NVMe 带宽锚点。检索 2026-08-16。"},
+        {"url": "https://norvig.com/21-days.html", "note": "一手抓取 Norvig《Teach Yourself Programming in Ten Years》附表：主存（DRAM）引用 ~100ns、L1 0.5ns/L2 7ns（页表为机械盘时代，SSD 未列——延迟量级仅取 DRAM 锚点）。访问 2026-08-16。"},
+        {"url": "https://arxiv.org/html/2407.00079v4", "note": "论文一手：LRU 优于 LFU/LengthAware；命中率-容量曲线（1k 块 0.30→∞ 0.51 平台）；§10「GDDR/LPDDR 每美元带宽好一个数量级」；利用 underutilized CPU/DRAM/SSD。访问 2026-08-16。"}
+      ],
+      "confidence": "high",
+      "writer_note": "这是本章的「为什么池化成立」的物理课，建议正文给一张三行量级表（HBM/DRAM/SSD 各一行：带宽、容量、延迟、谁在用），数字直接用本条 what_it_is 的表（全部一手官方：NVIDIA GB200/H100、三星 DDR5/NVMe；Norvig 只借 DRAM~100ns 一个锚点）。76ms/257ms 的三路对比例子值得进正文，但必须明标「说明性推算：3.8GB/100K token 与各层带宽均各有出处、除法为本章所做」。两个进阶点各一句就够：命中率-容量平台曲线（论文 Table 1：容量加到 50k 块后命中率停在 0.51——加容量有边际递减）；调度必须把传输时间算进 TTFT（Conductor 三段估算）。淘汰算法细节（LFU/soft-pin）留给链接。写正文时严防把 2026-05 博客时点的「NVMe 是 future work」写成永远——加「截至该博客」限定。"
+    },
+    {
+      "id": "nixl-vs-mooncake-te",
+      "term": "NIXL 与 Mooncake Transfer Engine：两条传输底座路线（抽象统一 vs 拓扑极致）",
+      "kind": "competing_set",
+      "one_line": "同样解决「把 KV 高速搬过网络」，NVIDIA 的 NIXL 走「统一抽象+插件后端」路线，Moonshot 的 Transfer Engine 走「为 KV/大块传输做到拓扑感知极致」路线——而在 vLLM 里，前者是 P/D 默认底座（ch36 刚讲过），后者撑着 Store 池化（本章主场）。",
+      "what_it_is": "两个都是「点对点数据搬运库」，都开源（Apache-2.0），都被 vLLM 的 KVConnector 生态使用，但出身与哲学不同。**NIXL**（NVIDIA Inference Xfer Library，ai-dynamo 组织，2026-08 时 1.2k star）：给 AI 推理框架加速点对点通信，核心价值是**抽象**——统一接口盖住各种内存（CPU/GPU）与存储（文件/块/对象存储），后端插件化：UCX（主力，RDMA/TCP 经 verbs）、POSIX、GDS/GDS_MT（GPUDirect Storage）、GPUNETIO，以及 OBJ/AZURE_BLOB/HF3FS/GUSLI/UCCL/LIBFABRIC——**插件清单里就有 Mooncake 本尊**。架构上用「agent + ETCD 元数据交换」做两端握手，C++ 核心（C++20）+ Python/Rust 绑定，NVIDIA 自家 Dynamo 推理框架拿它当底层搬运层。**Mooncake Transfer Engine**（kvcache-ai）：为 Mooncake 生产系统而生的数据面，核心价值是**极致**——多网卡 RDMA 带宽聚合、拓扑感知选路、自动故障切换，官方口径 4×200Gbps 聚合到 87GB/s、8×400Gbps RoCE 到 190GB/s（比 TCP 快 2.4x/4.6x）；传输栈覆盖 TCP/RDMA/AWS EFA/NVMe-oF/NVLink/HIP/Barex/CXL/昇腾系。**关系不是二选一的纯竞争而是分层竞合**：NIXL 把 Mooncake 列为后端插件（要 Mooncake 的拓扑优化能力时在 NIXL 抽象下用它）；vLLM 的 P/D 文档默认走 NIXL，而 Mooncake Store 池化场景整栈用 TE。选型直觉：贴近 NVIDIA 生态/要多存储后端统一抽象 → NIXL；要 Mooncake Store 全家桶/多网卡拓扑极致带宽 → TE。",
+      "background": "谱系：P/D 分离落地后「跨节点搬 KV」从工程细节变成核心路径，2024 年起两条线并行——NVIDIA 为 Dynamo 生态造通用传输抽象（NIXL），Moonshot 为 Kimi 生产造专用传输引擎（TE，2024-11 开源）。vLLM 两边都接：NixlConnector 是 P/D disaggregation 的默认传输（ch36 主角），MooncakeConnector/MooncakeStoreConnector 用 TE 做点对点与池化。有趣的是生态在合流：NIXL 的插件列表收录 Mooncake，Mooncake 文档也把 NIXL 列在集成生态里——「抽象层」与「极致引擎」正在互相嵌入。TE 自己也在换代（TENT，Transfer Engine NEXT），方向是把拓扑发现/链路选择/多传输统一做成工具集。",
+      "alternatives": [
+        {
+          "name": "NIXL（NVIDIA Inference Xfer Library）",
+          "unique": "统一抽象 + 插件化后端（UCX/GDS/GPUNETIO/Mooncake/HF3FS/对象存储…），agent+ETCD 握手，C++/Python/Rust 多语言绑定，Dynamo 官方底座。",
+          "when": "vLLM P/D 默认路线（ch36 已讲）；要在一个抽象下混用多种存储/内存后端、或绑定 NVIDIA 生态时选它。"
+        },
+        {
+          "name": "Mooncake Transfer Engine（kvcache-ai）",
+          "unique": "为 KV/大块传输做拓扑感知极致：多网卡 RDMA 聚合（87/190GB/s 官方口径）、故障切换、传输栈横跨 TCP/RDMA/EFA/NVMe-oF/NVLink/CXL/昇腾。",
+          "when": "用 Mooncake Store 做集群级池化（本章主场）或要多网卡拓扑带宽吃满时选它；同时它可作为 NIXL 的一个后端插件被组合使用。"
+        }
+      ],
+      "links": [
+        "https://github.com/ai-dynamo/nixl",
+        "https://github.com/kvcache-ai/Mooncake"
+      ],
+      "sources": [
+        {"url": "https://github.com/ai-dynamo/nixl", "note": "一手抓取 README：定位（accelerating point to point communications in AI inference frameworks such as NVIDIA Dynamo）、内存/存储统一抽象、后端插件全清单（UCX/POSIX/GDS/GDS_MT/GPUNETIO/Mooncake/OBJ/AZURE_BLOB/HF3FS/GUSLI/UCCL/LIBFABRIC）、C++20 核心+pybind11/Rust 绑定、Linux-only、1.2k star。访问 2026-08-16。"},
+        {"url": "https://github.com/kvcache-ai/Mooncake", "note": "一手抓取 README：TE「multi-NIC RDMA bandwidth aggregation, topology-aware routing, automatic failover」；87GB/s（4×200Gbps）/190GB/s（8×400Gbps RoCE）、较 TCP 2.4x/4.6x；传输栈清单；NIXL 列于集成生态。访问 2026-08-16。"}
+      ],
+      "confidence": "high",
+      "writer_note": "ch36 刚讲完 NIXL 本体（P/D 底座），本章**不要重讲 NIXL**——这一条只做「关系」：一两个自然段讲「抽象统一 vs 拓扑极致」两条路线 + 竞合事实（NIXL 插件列表里有 Mooncake、Mooncake 生态页也列 NIXL），87/190GB/s 两个带宽数字可引用（注明官方 README 口径、4×200G/8×400G 条件）。vLLM 里的落点一句带过：P/D 默认 NixlConnector（ch36），池化走 MooncakeStoreConnector 整栈 TE——正文点到即可，connector 源码细节是 dossier 主场。TENT 一句脚注都不必给，留链接。"
+    },
+    {
+      "id": "kv-pool-ecosystem",
+      "term": "KV 池化生态三方：Mooncake Store / LMCache / vLLM 原生 offload 与共享存储",
+      "kind": "competing_set",
+      "one_line": "「把 KV 搬出 GPU 攒成池」现在有三条可选路线：整套生产架构出身的分布式池（Mooncake Store）、引擎外缓存策略层（LMCache）、以及 vLLM 自带的朴素 offload/共享盘（OffloadingConnector 一族与 ExampleConnector）——分别代表「底座、管家、开箱即用」三个层次。",
+      "what_it_is": "本章读者最容易混淆的就是这几个名字的层次关系。按 v0.27.1 的 pin 注册表（factory.py，一手核）与各官方文档对齐：**vLLM 原生一族**——`OffloadingConnector`（原生 CPU offload，配 `--kv-offloading-size` 与 `kv_offloading_backend: native`，默认走它；`VLLM_USE_SIMPLE_KV_OFFLOAD` 可切到更朴素的 `SimpleCPUOffloadConnector`）解决「单实例显存不够、卸到本机 DRAM」；`ExampleConnector`（把 KV 写成本地 safetensors 文件、配 `shared_storage_path`，官方 disagg 文档里经 MultiConnector 与 NIXL 组合当「共享存储」用）解决「最朴素的可共享」——它是教学/调试参考实现，不是生产池。**命名史注意**：2025 年上半年的 vLLM issue（#18489、#20008 等）里这个「往共享盘写 safetensors」的角色叫 SharedStorageConnector，本仓 pin v0.27.1 的注册名已是 ExampleConnector——老名字仍散见于社区教程，正文提「SharedStorageConnector 类方案」时宜注明这层更名（据 pin 注册表与 issue 标题，命名连续性的确切 PR 未逐条核，标 medium）。**LMCache**——引擎外的缓存策略层：多级后端（CPU/盘/Redis/S3/Mooncake/NIXL）、非前缀复用（CacheBlend）、压缩（CacheGen）、MP 独立 server 跨实例共享。**Mooncake Store**——数据面底座：master 元数据 + 各节点捐内存、内容寻址对象级 KV、近似 LRU/软硬 pin、RDMA 零拷贝、强一致读，来自 Kimi 生产验证并配 FAST'25 最佳论文。三方的真实关系更像协议栈：vLLM 原生在「能用」层，LMCache 在「会管」层（策略），Mooncake Store 在「能扛」层（底座）——且 LMCache 可把 Mooncake 当远端后端（Mooncake README 官方列名），层次可以叠着用而非三选一。共同前提：跨实例复用都建立在 vLLM 的块内容哈希上（ch15 链式哈希），故 PYTHONHASHSEED 全进程一致是所有方案的通用前提（vLLM MooncakeStoreConnector 文档明文；LMCache/SGLang 同理）。",
+      "background": "时间线把三个项目排成了演进史：2024-06 Mooncake 论文提出「以 KV 为中心的分离」→ 2024-11 TE 开源 → 2025-03 Store 开源（生产架构下沉为开源底座）；LMCache 从学术起步（CacheGen SIGCOMM'24 / CacheBlend EuroSys'25 / LMCache 论文 arXiv:2510.09665），2025-10 进 PyTorch 基金会、2026-04 发 MP 独立 server 架构（跨实例共享成为一等公民）；vLLM 自己则在 V1 里长出 KVConnector 抽象（ch16 契约）+ 原生 OffloadingConnector 与「共享盘」参考实现，把「要不要外部池、用谁家的池」留成配置项。生态合流迹象：Mooncake README 把 vLLM/SGLang/LMCache/LMDeploy 全列为集成方，LMCache 反过来把 Mooncake/NIXL 收进后端清单——「池化」正在从各家私有 trick 变成推理栈的标准一层。",
+      "alternatives": [
+        {
+          "name": "Mooncake Store（kvcache-ai）",
+          "unique": "生产架构出身的分布式池底座：master 元数据 + 节点捐内存、内容寻址（key=value 哈希、写入不可变）、近似 LRU/软硬 pin、RDMA 零拷贝强一致读、RAM+SSD 多级；FAST'25 最佳论文背书，vLLM 官方博客 3.8x/46x 实测。",
+          "when": "要跨实例/跨节点的集群级池、有多网卡 RDMA、想要生产验证过的整栈时选它（vLLM 侧 MooncakeStoreConnector）。"
+        },
+        {
+          "name": "LMCache",
+          "unique": "引擎外缓存策略层：多级后端（CPU/盘/Redis/S3/…/Mooncake/NIXL）、非前缀复用（CacheBlend）与 KV 压缩（CacheGen）、独立 server（MP 模式）跨实例跨引擎共享、请求级命中率可观测。",
+          "when": "单机 offload 起步但想渐进长成跨实例共享、要非前缀复用/压缩这类「策略」能力、或想要缓存独立于引擎进程存活（no fate-sharing）时选它（vLLM 侧 LMCacheConnectorV1/LMCacheMPConnector，或 --kv-offloading-backend lmcache）。"
+        },
+        {
+          "name": "vLLM 原生（OffloadingConnector / SimpleCPUOffloadConnector / ExampleConnector 共享盘）",
+          "unique": "零外部依赖、一条 CLI 开关即用（--kv-offloading-size）；ExampleConnector 的 shared_storage_path 是「共享存储」的最小参考实现（safetensors 落盘）；代码在树内、可读可改，正是本章源码解读的对象。",
+          "when": "单实例显存吃紧先卸本机 DRAM（native）、本地调试/理解契约/教学（ExampleConnector）时用；集群级生产池化不是它的定位。"
+        }
+      ],
+      "links": [
+        "https://docs.vllm.ai/en/latest/features/mooncake_store_connector_usage/",
+        "https://github.com/LMCache/LMCache",
+        "https://github.com/kvcache-ai/Mooncake"
+      ],
+      "sources": [
+        {"url": "instances/vllm/source/vllm/distributed/kv_transfer/kv_connector/factory.py", "note": "pin v0.27.1 一手核对注册表：ExampleConnector/LMCacheConnectorV1/LMCacheMPConnector/Nixl 三型/MultiConnector/MoRIIOConnector/OffloadingConnector/DecodeBenchConnector/MooncakeConnector/MooncakeStoreConnector/FlexKVConnectorV1/SimpleCPUOffloadConnector/HF3FSKVConnector——无 SharedStorageConnector 注册名。核对 2026-08-16。"},
+        {"url": "instances/vllm/source/vllm/config/vllm.py", "note": "pin 一手核对 _post_init_kv_transfer_config：kv_offloading_size 激活；backend=native → OffloadingConnector（VLLM_USE_SIMPLE_KV_OFFLOAD 切 SimpleCPUOffloadConnector，cpu_bytes_to_use=GiB 换算）；backend=lmcache → LMCacheMPConnector（容量由独立 server 管，不透传 size）。核对 2026-08-16。"},
+        {"url": "https://github.com/vllm-project/vllm/issues/18489", "note": "2025 年 issue 标题「SharedStorageConnector does not load KV cache」——该名在 vLLM 历史上存在过（经搜索结果摘要取得标题，未逐条读全文）。检索 2026-08-16。"},
+        {"url": "https://docs.vllm.ai/en/latest/features/mooncake_store_connector_usage/", "note": "一手：MooncakeStoreConnector 单机 offload/跨实例池化/P/D 叠加三用法、PYTHONHASHSEED 全进程一致警告。访问 2026-08-16。"},
+        {"url": "https://github.com/LMCache/LMCache", "note": "一手：后端清单含 Mooncake 与 NIXL；no fate-sharing；MP 架构。访问 2026-08-16。"},
+        {"url": "https://github.com/kvcache-ai/Mooncake", "note": "一手：集成方清单（vLLM/SGLang/LMCache/LMDeploy）；LMCache 描述为「Mooncake Store as remote connector; joint KVCache-centric serving effort」。访问 2026-08-16。"}
+      ],
+      "confidence": "medium",
+      "writer_note": "这一条是本章「生态地图」的骨架，建议正文给一个小对比表（三方各一行：出身/管什么/vLLM 侧注册名/何时选），三方定位一句话化：底座（Mooncake Store）/管家（LMCache）/开箱即用（vLLM 原生）。两个防混点必须写：①「SharedStorageConnector 类方案」的命名史——2025 年 issue 里的老名，pin v0.27.1 里该角色由 ExampleConnector+shared_storage_path 承担（措辞用「据 pin 注册表与 issue 标题」，别断言具体更名 PR）；②LMCache 与 Mooncake 不是三选一的死对头——LMCache 可把 Mooncake 当远端后端（Mooncake README 官方列名），「层次可叠」。pin 里三个注册名（OffloadingConnector/LMCacheMPConnector/MooncakeStoreConnector）与 --kv-offloading-backend 的映射是 dossier 主场，正文点到名字即可。选择建议用「何时选谁」的情境句（单机卸载/策略复用/集群池），别写成排名。"
+    },
+    {
+      "id": "kv-pooling-economics",
+      "term": "KV 池化的经济账：容量阶梯、$每GB 的波动、跨实例复用的命中收益",
+      "kind": "external_concept",
+      "one_line": "两条账：物理账稳健（每下一层介质容量涨一个数量级、KV 传输永远比重算便宜一两个数量级）；价格账 volatile（2026 年记忆体超级周期里 HBM 与 DDR5 的利润率甚至历史性倒挂）——所以正文算容量与收益、把 $/GB 当波动指标讲。",
+      "what_it_is": "**容量与收益账（稳健，全部可溯源）**：①同节点容量阶梯——GB200 上 GPU HBM 每 GPU ~186GB 对 Grace LPDDR5X 至多 480GB（2.6x），整机架 13.4TB HBM 对 17TB LPDDR5X；H100 是 80GB；NVMe 单盘就 8TB（三星 9100 PRO）——「上下文越长、并发越多，KV 迟早溢出 HBM」是算术必然。②每请求的 KV 体量——100K token 上下文 ≈ 3.8GB（Kimi-2.5 FP8，vLLM 博客口径），意味着一张 80GB HBM 扣掉权重后能驻留的长上下文 KV 不到二十个，而 DRAM 池按 TB 计。③复用收益——agentic 负载天然高重复（输入:输出=131:1、33 轮中位、理论可命中率 94.2%），vLLM×Mooncake 实测命中率 1.7%→92.2%、吞吐 3.8x、P50 TTFT 降 46x；Mooncake 论文侧的生产口径是复用上限约 50%（个别服务 90%）、超 50% 缓存块从未复用——**不同负载命中率天差地别**（ArXiv 类几乎 0%，L-Eval 类 >80%），池化不是免费午餐，是负载画像的函数。④跨实例的意义——本地缓存在轮询路由下必然 miss（请求落到没缓存的那台），共享池把「谁服务这个请求」与「谁的内存里有这份前缀」解耦，这是 1.7%→92.2% 里大部分增益的来源。\n\n**价格账（volatile，引用必须带日期）**：历史上 HBM 每 GB 单价数倍于 DDR5 是共识，但 2026 年记忆体超级周期把这笔账搅乱了——TrendForce（2026-06-02 新闻稿，一手）：HBM 年度定价机制使合同价滞后于季度市场价，**1Q26 起 DDR5 64GB RDIMM 的晶圆收入/盈利能力已反超 HBM**（史上首次）；HBM 晶圆投入占前三大供应商总 DRAM 晶圆的份额从 2025 底 ~18% 走向 2027 底 ~30%，挤出效应加剧；2027 年 HBM 合同价预计「倍数级上涨」。论文侧的稳健背书是 Mooncake §10 的定性结论：论每美元带宽/每瓦带宽，GDDR 与 LPDDR 方案比旗舰加速器**好一个数量级**。给 writer 的结论：用「容量阶梯 + 带宽每美元」这两笔稳健账立论，$/GB 的绝对值别写死——要写就写「2026-06 时点：DDR5 合同价暴涨后利润率一度反超 HBM（TrendForce），波动极大」。",
+      "background": "经济叙事的两条源头：论文线——Mooncake 用「trading more storage for less computation」直接把标题写成了经济学命题（FAST'25 发表版），并以「GDDR/LPDDR 每美元带宽好一个数量级」为慢介质正名；市场线——2025 下半年起 AI 需求引爆记忆体超级周期，DDR5 合同价两季度近乎翻倍再翻，把「HBM 贵、DRAM 便宜」的静态常识作废（TrendForce 2026-06：DDR5 盈利反超 HBM、2027 HBM 价将倍数上涨）。对工程读者的正确心智模型：**分层的物理账（带宽/容量/传输 vs 重算）不随价格波动，价格只改变「加一层 DRAM/SSD 划不划算」的阈值**——这也是为什么本章把容量阶梯与命中收益当主叙事、把 $/GB 当波动脚注。",
+      "example": {
+        "input": "（说明性推算，锚点数字均有出处）一个 agentic 服务，峰值并發 100 个会话、每会话上下文 100K token（≈3.8GB KV）：全驻留 HBM 需 ~380GB——单卡 80GB 的 H100 装不下（还得扣权重）；驻留 DRAM 池：380GB 是一台 2TB 内存服务器的零头；若命中 90%，每轮只有 ~2,242 新 token 需要计算（博客口径的每轮增量）。",
+        "result": "三条结论一眼可见：HBM 池化前 KV 根本驻留不下（容量账）；DRAM 池轻松装下还有冗余（容量账的解）；命中后每轮的计算量降到增量级（收益账）。把 380GB 换成 3.8GB×N 的任意 N，就是「为什么每个严肃的 agentic 部署最后都要谈池化」的通用算式。",
+        "line_by_line": "逐行看点：380GB=3.8GB×100 是容量账的最小算例；「2TB 内存的零头」对应 GB200/常规服务器 DRAM 量级（官方页一手）；「每轮只算增量」正是 92.2% 命中率的另一面——剩下的 7.8% 才进 prefill。"
+      },
+      "links": [
+        "https://vllm.ai/blog/2026-05-06-mooncake-store",
+        "https://www.trendforce.com/presscenter/news/20260602-13074.html",
+        "https://arxiv.org/abs/2407.00079"
+      ],
+      "sources": [
+        {"url": "https://vllm.ai/blog/2026-05-06-mooncake-store", "note": "一手：3.8GB/100K token（Kimi-2.5 FP8）；131:1 输入输出比、每轮新增 ~2,242 token、理论命中 94.2%；实测 1.7%→92.2%、3.8x、46x、8.6x；12→60 卡近线性。访问 2026-08-16。"},
+        {"url": "https://arxiv.org/html/2407.00079v4", "note": "一手：生产复用上限 ~50%（个别服务 90%）；数据集缓存占比 ArXiv≈0%/L-Eval>80%/真实≈50%；超 50% 块从未复用；§10 GDDR/LPDDR 每美元带宽好一个数量级。访问 2026-08-16。"},
+        {"url": "https://www.trendforce.com/presscenter/news/20260602-13074.html", "note": "一手抓取 TrendForce 新闻稿（2026-06-02）：1Q26 起 DDR5 64GB RDIMM 晶圆收入反超 HBM（HBM 盈利能力自 1Q26 落于其下）；HBM 晶圆份额 2025 底 ~18%/2026 底 ~22%/2027 底 ~30%，位元供给份额 ~8%/9%/13%；2027 HBM 合同价预计 multiples higher；无绝对 $/GB 数字。访问 2026-08-16。"},
+        {"url": "https://www.nvidia.com/en-us/data-center/gb200-nvl72/", "note": "一手：GB200/机架容量量级（186GB/GPU HBM、480GB LPDDR5X、机架 13.4TB vs 17TB）。访问 2026-08-16。"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文「为什么池化」的开节经济账就用这条：先算容量账（380GB=3.8GB×100 的算例可直接进正文，明标说明性推算、3.8GB 出处 vLLM 博客），再给收益账（1.7%→92.2%/3.8x/46x 一组数字，注明 agentic 负载与 NIXL-只缓存系统提示词基线），然后必须诚实一句「命中率是负载画像的函数」（论文口径：ArXiv≈0%、L-Eval>80%、生产上限 ~50%）——不写这句读者会把池化当万灵药。$/GB 一段控制在两三句：物理账（带宽每美元差一个数量级，Mooncake §10）稳健可写；绝对单价别写死，引用 TrendForce 2026-06 的「1Q26 DDR5 利润率反超 HBM、2027 HBM 将倍数上涨」说明价格剧烈波动、正文以日期限定。2026 记忆体超级周期背景一句即可，不展开市场分析。"
+    }
+  ]
+}
