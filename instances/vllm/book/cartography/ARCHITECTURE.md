@@ -2,10 +2,8 @@
 
 > 本文 = v3 重写的**架构底座**：六域深读卡片（`deepread/*.json`）+ 8 处交叉核对裁决的综合。
 > 读者假设：懂后端、不懂 AI 推理的工程师。每个设计决策都回答「旧设计→痛点→方案→代价」。
-> 源码 pin：**v0.27.1（6e448d0ea，2026-08-15 用户定最新 release）**。⚠️ 本文与 deepread/ 卡的行号锚点在
-> 深读时（2026-08-15 前）核于旧 pin v0.21.0（ad7125a4）——跨 6 minor 行号大面积漂移、个别机制已重构
-> （elastic EP、xgrammar 调用面等）。why 链与架构判断大体有效；**行号/符号引用前须对 v0.27.1 现核**，
-> 重构域另出增量深读补丁。
+> 源码 pin：**v0.27.1（6e448d0ea，2026-08-15 用户定最新 release）**。本文全部锚点已按 v0.27.1 **全量重核**
+> （六域深读重跑 6/6 OK + 交叉核对 6/6 面零冲突）；旧 pin v0.21.0 深读卡归档 `deepread-v021/` 仅供演进对照。
 > 配套：L0 架构图 `L0-architecture.svg/png`（全书唯一权威图，见 §1）。
 > （v2 的素材收集式地图归档于 `ARCHITECTURE.v2.md`，仅供对照。）
 
@@ -13,7 +11,25 @@
 
 **一个请求的一生**：用户发来文本 → API 进程切成 token（`Renderer`）→ 跨进程扔给 EngineCore（ZMQ）→ 引擎逐拍循环「调度→前向→采样→回收」，每拍只问「这批 GPU 能吃多少 token」→ 新 token 跨进程回 API 进程 → 拼回汉字 → SSE 流给用户。
 
-**全系统的第一设计原则：GPU 是最贵的员工，一切 CPU 活都不能让它等。** 三段式进程解耦、异步调度、两段式 execute_model、CUDA Graph、采样留 GPU——全部服务于这一句。第二原则：**显存是共享账本，一切调度都先对账**（token 预算 + KV 块池）。
+**全系统的第一设计原则：GPU 是最贵的员工，一切 CPU 活都不能让它等。** 三段式进程解耦、异步调度（v0.27.1 起默认开启）、两段式 execute_model、CUDA Graph、采样留 GPU——全部服务于这一句。第二原则：**显存是共享账本，一切调度都先对账**（token 预算 + KV 块池 + 水位护栏）。
+
+### 0.5 v0.22→0.27.1 演进速览（相对本书 v2 所写 v0.21.0 的重大变化，写作必读）
+
+| # | 新事实 | 落点 | 影响 v3 章 |
+|---|--------|------|-----------|
+| 1 | **Renderer 正式入三件套**：前端三件套 = Renderer+InputProcessor / EngineCore / OutputProcessor；raw prompt 的 tokenize/多模态跑 Renderer **线程池**不下事件循环（PR #49608, input_processor.py:L77-82） | ch3/ch5 | 三件套口径全面更新 |
+| 2 | **异步调度默认开启**（#27614, 2025-12-29 翻转默认；async+PP 全支持 #3e440786a）：v0.27.1 的心跳就是重叠版 | config/vllm.py:L1095-1143 | ch11 叙事从「可选优化」改为「默认心跳+如何关」 |
+| 3 | **水位（watermark）回归**：watermark_blocks 留 headroom 抑制抢占抖动（默认关，用户按负载开）——v1 曾删 v0 的 watermark，如今以新形态复活 | memory-kv 卡 | ch13 显存账本 |
+| 4 | **partial prefix cache + 块内 CoW**（#45939/#46384, 2026-06/07）：cache_partial_block 在块内前缀边界注册哈希不分配新块、部分命中 CoW 拷贝——「只缓存满块」的旧口径已破 | block_pool.py:L445-544 | ch14 前缀缓存 |
+| 5 | **Marconi 式共享前缀钉住 + 稀疏驻留**（#37898/#45845/#47782）：hybrid 场景 junction 检测+跨请求复用不被稀疏缓存杀死 | kv_cache_coordinator | ch14/ch24 hybrid |
+| 6 | **LRU 双不变量**：free 逆序 + **无哈希块先于缓存块驱逐**（第二条为新增澄清） | kv_cache_manager.py:L567-574 | ch14 |
+| 7 | **DPCoordinator 独立进程**（XPUB/XSUB+PULL 三 socket）：数据面/控制面彻底分离，请求输出完全不经过它；统计 100ms 快照、wave 只服务 MoE lockstep | coordinator.py:L23-256 | ch33 分布式 |
+| 8 | **多 API server 水平扩展**（--api-server-count）：client_index 由前端盖章进 EngineCoreRequest、引擎按它选 PUSH socket 回发 | core_client.py:L1145-48 | ch3/ch36 服务面 |
+| 9 | **vllm/models/<name>/ 硬件隔离新布局**：旗舰架构（DSV4 等）走目录级隔离，平台实现与模型定义分层 | vllm/models/ | ch21/ch27 模型层 |
+| 10 | **MLA 三代演化**：DSV2/V3 潜向量 576 维 → DSV4 上下文压缩 + fp8_ds_mla 自定义布局 | mla_attention.py | ch23/ch24 primer |
+| 11 | msgpack 零拷贝工程化：小张量（<256B）内联免拷、引擎输出侧「复用 bytearray+首帧 tracker」替客户端保活 | serial_utils.py | ch4 |
+| 12 | 注意力后端**逐 KV 组混布**、新后端入表（TOKENSPEED_MLA R1 dims+FP8 KV、FLASHINFER_MLA 等） | selector.py/platforms | ch20 |
+| 13 | AsyncMPClient 派生 **DP/LB 子类**（current_wave 盖章） | core_client.py:L1413 | ch33 |
 
 ## 1. L0 总图（唯一权威图）
 
@@ -62,29 +78,29 @@
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-## 2. 一个请求的一生（file:line 级走读）
+## 2. 一个请求的一生（file:line 级走读，全部对 v0.27.1 核验）
 
 **前端进程段**：
-1. `AsyncLLM.add_request`（async_llm.py）→ **双登记**：本进程 `OutputProcessor.request_states` 建表（含 detokenizer 状态）+ 跨进程发 EngineCoreRequest。先本进程后跨进程——保证回程消息到达时表已存在。
-2. `Renderer.render → _tokenize_prompt`（renderers/base.py:L401-412）：**tokenization 在前端进程**（EngineCoreRequest 诞生即 tokenized，文本不过 IPC——PR #11963 删掉了 prompt 文本字段）。input_processor.py:L273-286 的裸 prompt 回退路径已弃用（v0.18 移除警告）。
-3. `InputProcessor.process_inputs`：校验/克隆 params/整理 mm 特征/**双轨 request_id**（外部 id + `{id}-{8位hex}` 内部 id）→ `AsyncMPClient.send_multipart`。
-4. ZMQ 下行帧序（**裁决 #1**）：`(engine_identity, type_byte, *msgpack载荷帧)`——identity 第 0 帧（ROUTER 信封）、`ADD=b'\x00'` 第 1 帧；引擎收端 DEALER 剥掉信封后看到的"首帧"才是类型字节。
+1. `POST /v1/chat/completions` → `create_chat_completion`（entrypoints/openai/api_router/chat_completion.py:L51-53，`@with_cancellation` 挂断连监听竞速）→ 建 `SamplingParams`（output_kind=DELTA，protocol.py:L722-724）。
+2. `Renderer.render_chat`（online_renderer.py:L117）→ `_tokenize_prompt`（renderers/base.py:L472-487）——**tokenization 在前端、在过线之前**，async 跑在 renderer 线程池（base.py:L96-98，PR #49608：原始 prompt 的阻塞预处理不下事件循环）。
+3. `AsyncLLM.add_request`（async_llm.py:L283-418）：已渲染 EngineInput 走同步快路径（L352-365「no blocking preprocessing needed」）；`InputProcessor.process_inputs`（input_processor.py:L323-394）校验/克隆 params/整理 mm 特征/**双轨 request_id**（assign_request_id 随机后缀，L231-249）→ 构造 EngineCoreRequest。
+4. `_add_request` 双登记（async_llm.py:L420-435）：先本进程 `output_processor.add_request`（L429，回程消息到达时表已存在）‖ 后 `add_request_async` 过线。
+5. `AsyncMPClient.add_request_async`：**盖章 client_index**（core_client.py:L1145-1147，DP 内部 LB 子类再盖 current_wave 按负载分选引擎 L1410-1423）→ `_send_input`：msgpack 多帧 → `(engine_identity, b' ', *bufs)` → ROUTER `send_multipart(copy=False)`（L1104-1123，零拷贝帧由 zmq 引用链保活）。
 
 **引擎进程段**：
-5. `EngineCoreProc` 循环取消息 → input_queue → `EngineCore.step()`（core.py:L406-435）四段+bitmask 窗口（见总图）。
-6. `Scheduler.schedule()`：RUNNING 先于 WAITING；本拍抢占过就整拍不收新（延迟压力显式从 TPOT 转嫁给 TTFT）。
-7. KV 对账：`get_computed_blocks` 返回 `(KVCacheBlocks, num_new_computed_tokens)`（**裁决 #4**：二元组，第二个是 **token 计数**非块计数）→ `allocate_slots` 失败 → 抢占（recompute-only：free 块**不清哈希**，回 waiting 队头，恢复时先撞前缀缓存）。
-8. 组装 `SchedulerOutput`（差量协议）：`scheduled_new_reqs`（首次全量）/`scheduled_cached_reqs`（仅 diff）/`finished`。**裁决 #6/#7**：`new_token_ids` **仅 PP 且非 async 调度时携带**（其余空表——runner 自己缓存）；resumed（抢占恢复）请求的 `new_block_ids` 是**整体替换**而非追加（output.py:L114-117；worker 侧 L1330-1333 同款替换分支）。**裁决 #5**：WAITING 新请求进批的块号并非 allocate_slots 返回值，而是 `get_blocks(request_id)` 全量重读；RUNNING 才用 allocate_slots 的「仅新增块」。
-   ⚠ **裁决 #6（可变性）**：SchedulerOutput **不是不可变**——ngram-GPU spec decode 路径 worker 会就地裁剪它（ngram_proposer_gpu.py:L499-503），调度器 update_from_output 回读同一对象。常规路径 worker 只读。
-9. `Executor → Worker → GPUModelRunner`：InputBatch 差量调和 → CpuGpuBuffer 固定地址 → slot_mapping 用 **Triton kernel 在 GPU 算**（CPU 算要先 D2H 拉回 positions，会斩断异步调度）→ piecewise 编译图内前向（注意力=不透明自定义算子）→ CUDA Graph 按形状查表回放。
-10. `compute_logits`（只在需要位置物化：decode 批每请求 1 个；4096-token prefill 全量物化 fp32 logits ≈2GB 是反例）→ `Sampler.forward` 9 步管线（见 §4 模型域）。
-11. `update_from_output`：请求状态推进（单 IntEnum，`>PREEMPTED 即 finished` 一次整数比较）、free 块（**逆序 free**——LRU 隐藏不变量）、finished 请求当拍退出。
+6. IO 线程 `preprocess_add_request`（core.py:L1718）→ 忙循环 `add_request`（L1514-1518）→ `Scheduler.add_request`（scheduler.py:L2213-2235）status=WAITING 入队尾。
+7. `EngineCore.step()`（core.py:L584-614，v0.27.1 默认重叠版）→ `schedule()`（scheduler.py:L439）：RUNNING 先行（L484-671）→ WAITING（L684 守卫：本拍抢占过不收新）→ `get_computed_blocks` 查前缀缓存（kv_cache_manager.py:L229；混合模型走不动点+**块内细粒度 phase 2** single_type:L741-762）→ `allocate_slots`（scheduler.py:L973-985）：全序列准入门（kv_cache_manager.py:L472-488）+ **free−reserved−watermark 三重预算**（L510-527，水位抑制抢占抖动）→ 不够则抢占 `_preempt_request`（scheduler.py:L1274-1315，recompute-only：块不清哈希回 waiting 队头，恢复时重撞缓存）。
+8. 组装 `SchedulerOutput`（scheduler.py:L1208-1229，差量协议）→ `_update_after_schedule` 乐观推进（L1317，num_in_flight_tokens L1327-1331——GPU 还没算，账先记上）。
+9. `executor.execute_model(scheduler_output, non_block=True)`（core.py:L596）：mp 走 SHM 广播（multiproc_executor.py:L388）→ `Worker.execute_model`（gpu_worker.py:L1017-1081）→ `GPUModelRunner.execute_model`（gpu_model_runner.py:L4166）：`_update_states` 差量调和（L1192-1520：新块 GPU 置零/finished 移除/老请求 append 块/压实）→ `_prepare_inputs`（L1960：**第一句 commit_block_table 让 H2D 与 CPU 重叠** L1977-1979）→ logits_indices=query_start_loc[1:]-1 → 组注意力元数据 → `set_forward_context` → piecewise 图内前向（Attention 插座：`unified_kv_cache_update` 写 KV L775-798 → `unified_attention_with_output` L819-846，attention.py）→ CUDA Graph 按 BatchDescriptor 查表回放。
+10. **与 GPU 前向并行**：主线程 `get_grammar_bitmask`（core.py:L597 → scheduler.py:L1646-1666 → structured_output/__init__.py:L212-359）`fill_next_token_bitmask` 填位掩码——CPU 活藏在 GPU 算的窗口里。
+11. 前向完成 → `sample_tokens(bitmask)`（两段式契约，worker_base.py:134-149 一带）→ `compute_logits` 只在采样位物化 → `Sampler.forward` 9 步管线（GPU 全程）→ `ModelRunnerOutput`。
+12. `update_from_output`（core.py:L605-614 → scheduler.py:L1924）：请求状态推进（单 IntEnum，`>PREEMPTED 即 finished`）、**按 request.client_index 分桶**产出 `dict[client_index, EngineCoreOutputs]`（scheduler.py:L1924, L2015-2016）、free 块（**逆序 + 无哈希块先驱逐**双不变量，kv_cache_manager.py:L567-574）。
 
 **回程段**：
-12. 每步**整批聚合**成一条 EngineCoreOutputs（不逐 token 发——IPC 次数爆炸）；按 client_index 选 PUSH socket（多前端）。
-13. API 进程单任务 `output_handler`：按 chunk_size 切片逐片 process_outputs + `await asyncio.sleep(0)` 让事件循环喘气（防一批 256 请求的 detokenize 独占循环、伤 P99）。
-14. demux 到每请求 `RequestOutputCollector`（单槽+Event+生产侧合并，**刻意不用 asyncio.Queue**——慢消费者下无界队列滞留 O(len²) 内存）→ RequestOutputKind 三态契约（DELTA/CUMULATIVE/FINAL_ONLY，使用面入口声明，非流式=FINAL_ONLY 每 token 白传的浪费归零）→ SSE。
-15. 客户端断连 → 取消 generate 协程 → **反向 abort**（外部 id 展开为全部内部 id；发引擎的 abort 只带内部 id——**裁决 #3**）→ 引擎抠掉幽灵请求（否则烧 GPU 到 max_tokens）。
+13. 每步每客户端**一条** EngineCoreOutputs（整批聚合；engine 输出侧「复用 bytearray+首帧 tracker」管理零拷贝缓冲）→ 输出线程 `sockets[client_index].send_multipart`（core.py:L1785-1793，DP 统计走 client_index=-1 哨兵路给 DPCoordinator）。
+14. API 进程 `output_handler` 单任务分发：按 `VLLM_V1_OUTPUT_PROC_CHUNK_SIZE`（默认 128）切片 + 片间 `await asyncio.sleep(0)`（async_llm.py 一带；防一批的 detokenize 独占事件循环伤 P99）。
+15. demux 到每请求 `RequestOutputCollector`（单槽+Event+生产侧合并）→ RequestOutputKind 三态裁剪 → SSE。
+16. 客户端断连 → 取消 generate → **反向 abort**（外部 id 展开为内部 id；引擎侧 abort 双队列投递保序+及时）→ 引擎抠掉幽灵请求。
 
 ## 3. 设计决策总纲（why 链精华，全链见 deepread/）
 
@@ -109,6 +125,9 @@
 | 前缀缓存=链式哈希**非 radix 树**（澄清常见误解） | radix 树 Python 指针密集，GC/不变量成本调度循环付不起 | 只缓存满块；故意不去重（append-only 换简单） |
 | LRU 逆序 free（隐藏不变量） | 顺序错=驱逐拦腰斩断最长前缀，命中率静默劣化 | 靠约定维持，无断言保护 |
 | KVConnector 双面契约 | P/D 分离、offload 各写各的无法组合 | 本地+外部双查找路径慢一拍；异步加载期占块空转 |
+| **水位回归（v0.27.1）** | 抢占抖动：边界负载下反复抢占-恢复 thrash | headroom 空闲不接客=吞吐换稳定，默认关 |
+| **块内 CoW 部分命中（v0.27.1，#45939/#46384）** | 「只缓存满块」浪费块内前缀（hybrid 尤甚） | 每次部分命中 +1 块+GPU 拷贝带宽；三套簿记叠加 |
+| **Marconi 式钉住+稀疏驻留** | 稀疏缓存杀死跨请求共享前缀复用 | chunk 被截断在 junction=prefill 变碎；跨模块隐式协议 |
 
 ### 执行与采样
 | 决策 | 痛点 | 代价 |
@@ -123,6 +142,9 @@
 | Sampler 9 步管线 + argmax 不变性二分 | multinomial 强制 CPU-GPU 同步；greedy 常态不该付 softmax 税 | 处理器分类错=静默破坏 greedy 语义 |
 | 位掩码结构化输出（非重试非枚举） | vocab 13 万，枚举合法集 O(V) 无法批处理 | 引擎级单后端；每步 CPU FSM walk + H2D |
 | spec decode（draft→排批→验证→拒绝采样） | decode 访存受限，小 batch 算力闲置 | 接受率低纯亏；采样语义收窄（min_p 等互斥） |
+| **异步调度默认开（v0.27.1，#27614）** | GPU 每 10-20ms 空转等 CPU 调度 | 乐观推进的补偿机制全套（拒绝回扣/脏占位清理） |
+| **DPCoordinator 独立进程（XPUB/XSUB+PULL）** | DP 控制指令与数据面混流 | 多一进程三 socket；统计 100ms 快照有 race |
+| **vllm/models/<name>/ 硬件隔离布局（v0.27 新政）** | 平台胶水与模型定义耦合、互相拖累 | 新架构两处维护（旧 model_executor 并存） |
 
 ## 4. 数据所有权地图（谁写谁读——8 处交叉裁决沉淀）
 
@@ -138,6 +160,8 @@
 | KVCacheBlock | BlockPool（ref_cnt 共享） | 调度器纯 CPU 账本 | free 逆序=LRU 策略 |
 | logits（采样前） | compute_logits | Sampler | raw logprobs 用变换前 logits（惩罚不扭曲模型意见） |
 | grammar bitmask | 调度器侧 FSM（GPU 窗口期算） | Sampler（H2D 后 mask） | 编译异步化，未就绪请求不进批 |
+| client_index | 前端 add_request_async 盖章进请求 | 引擎输出线程选 PUSH socket | 「谁发的」随请求过线的跨进程契约 |
+| DP 统计（request counts） | 引擎 _maybe_publish（client_index=-1 哨兵） | DPCoordinator 聚合→前端 LB | 100ms 快照，LB 需本地 in-flight 兜底 |
 
 ## 5. v1 设计哲学（给 Phase 1 的输入）
 
