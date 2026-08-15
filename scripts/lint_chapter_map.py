@@ -115,6 +115,11 @@ def lint_chapter_map(chapter_dir: str, require: bool = False) -> dict:
     md_text = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
 
     if not svg_path.exists():
+        # v3 图系豁免（exp-2026-08-16，ch01 评审立案）：v3 章（artifacts-v3/ 下）开篇图
+        # 已换 L0/L1/L2 三层体系（FIGURE-SYSTEM.md），chapter-map 是 v2 遗留图制、明令退役。
+        # v3 章以 figure-manifest 里登记 L 系图为准；无 chapter-map 属设计而非缺失。
+        if "artifacts-v3" in str(cd).replace("\\", "/"):
+            return res  # v3 章：chapter-map 退役，无图=正常
         if require:
             res["missing_map"].append(
                 f"  {svg_path} 不存在——本章缺「本章地图」SVG（--require 已启用，试点豁免期已过）"
