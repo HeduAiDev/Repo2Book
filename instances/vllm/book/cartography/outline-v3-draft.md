@@ -85,7 +85,7 @@
 | 27 | 约束解码 II：bitmask 如何落到 logits | 采样列+bitmask | 位掩码（非重试非枚举的 why）、两段式 execute 的 GPU 窗口、fill_next_token_bitmask→apply 的 H2D 链 | ch32 重做 |
 | 28 | 投机解码：draft、验证、拒绝采样 | 采样列+spec | （融入式 primer：EAGLE/MTP 思想）draft 当 prefill 排批、一次前向验证、拒绝采样保分布、接受率低纯亏的诚实账 | ch33+ch34 合并 |
 
-## Part VIII — 走向生产（5 章）
+## Part VIII — 走向生产（6 章）
 **hook：真实服务不止一个引擎——规模、容错与接口的最后一公里**
 **呼应哲学：全部五条的合流**
 
@@ -93,9 +93,10 @@
 |---|---|---|---|---|
 | 29 | 分布式：TP/PP/DP 在三段式里的位置 | L0 多实例视角 | TP 的算子级切分、PP 与循环的两拍协议、DP 与多引擎拓扑（回收 Part II 的 ROUTER 寻址） | ch20+ch21 重组 |
 | 30 | P/D 分离：把 prefill 和 decode 拆到两台机器 | L0 双实例+KV 边界 | 为什么拆（算力/带宽错配）、prefill 侧 save/decode 侧 load 的完整生命周期、等待远端 KV 的调度集成、NIXL 传输、disaggregator | ch35+ch36 重做 |
-| 31 | 服务面：OpenAI 协议与多轮会话 | API 进程+入口 | serving 层结构、chat/completion 的流式协议、harmony 三通道多轮（final/analysis/commentary）、断连处理（回收 Part II 的 abort） | ch37+ch38 合并 |
-| 32 | 弹性与自愈：引擎运维的最后一课 | EngineCore 带（弹性区） | EEP 弹性扩缩状态机、scale_up 的 KV 迁移握手、通知驱动的状态推进、多引擎负载（DP coordinator） | ch39 重做 |
-| 33 | 终章：站在整张 L0 图上回望 | L0 全图（点亮版） | 全书走完后的 L0 图完整复盘（每块都读过了）、设计哲学五条的印证、延伸阅读路线（vllm-ascend/编译器方向） | 新写 |
+| 31 | KV 池化：把 cache 搬出 GPU——DRAM 上的分布式 KV 管理 | KV 边界+外部池 | 为什么池化（KV 是显存大头，DRAM 便宜 N 倍容量大 N 倍；前缀复用跨实例=全局缓存池）；Mooncake 架构（transfer engine/conductor/以 KV 为中心的分离存储）；LMCache 与 CPU offload；HBM/DRAM/SSD 分层策略；vLLM 侧怎么接（KVConnector 的 offload/共享实现，回收 ch15 契约） | 新增（v2 未覆盖的方向；researcher 深挖 Mooncake 论文+生态） |
+| 32 | 服务面：OpenAI 协议与多轮会话 | API 进程+入口 | serving 层结构、chat/completion 的流式协议、harmony 三通道多轮（final/analysis/commentary）、断连处理（回收 Part II 的 abort） | ch37+ch38 合并 |
+| 33 | 弹性与自愈：引擎运维的最后一课 | EngineCore 带（弹性区） | EEP 弹性扩缩状态机、scale_up 的 KV 迁移握手、通知驱动的状态推进、多引擎负载（DP coordinator） | ch39 重做 |
+| 34 | 终章：站在整张 L0 图上回望 | L0 全图（点亮版） | 全书走完后的 L0 图完整复盘（每块都读过了）、设计哲学五条的印证、延伸阅读路线（vllm-ascend/编译器方向） | 新写 |
 
 ---
 
@@ -108,10 +109,10 @@
 
 ## 与 v2 的章数对比
 
-v2 39 章 → v3 **33 章**（8 Part）。初版 28 章被用户抓到容量问题（P/D 分离/约束解码/DeepSeek-V4/服务面四块压缩过头），修正为 33 章：P/D 独立成章（v2 2→2）、约束解码拆回 2 章（v2 2→2）、DSA indexer 独立（v2 3→2+拼装重做）、服务面拆 2+弹性独立（v2 3→2+1）。其余合并仍成立：重复意图章（ch01+02→2 章做实分工）、同机制章（ch05+06、ch08+09 前半）、primer 融入主场（flash-attention→注意力后端章、量化→编译/MLA/V4 三处融入、eagle→投机解码章、NSA→indexer 章）。v2 全部 39 章的源码解读段均有映射去向（见各表末列），择优迁移；量化如需专席可加 1 章（见待裁决）。
+v2 39 章 → v3 **34 章**（8 Part）。初版 28 章被用户抓到容量问题（P/D 分离/约束解码/DeepSeek-V4/服务面四块压缩过头）修正为 33 章；再补 KV 池化章（用户点名 Mooncake 类 DRAM 分布式 KV 管理，v2 未覆盖的新方向）：P/D 独立成章（v2 2→2）、约束解码拆回 2 章（v2 2→2）、DSA indexer 独立（v2 3→2+拼装重做）、服务面拆 2+弹性独立（v2 3→2+1）。其余合并仍成立：重复意图章（ch01+02→2 章做实分工）、同机制章（ch05+06、ch08+09 前半）、primer 融入主场（flash-attention→注意力后端章、量化→编译/MLA/V4 三处融入、eagle→投机解码章、NSA→indexer 章）。v2 全部 39 章的源码解读段均有映射去向（见各表末列），择优迁移；量化如需专席可加 1 章（见待裁决）。
 
 ## 待用户裁决的点
 
-1. **章数 33**（28 章版被用户容量质疑后修正）：每 Part 4-5 章节奏均匀；如仍觉得某块挤/松，指出来我调。
+1. **章数 34**（28→33 容量修正+KV 池化新章）：Part VIII 6 章为全书最重收尾；如仍觉得某块挤/松，指出来我调。
 2. **融入式 primer**：v2 的 4 个独立原理章（flash-attention/量化/lightning-indexer/eagle）并入主场章讲透——认不认这个方向？量化在 v3 草案里暂无专章（散入 17/21），要不要保留一席？
 3. **Part 顺序**：调度（III）在显存（IV）前——播客同序；但也可以先显存后调度（块账本是调度的前置）。我选了「先调度后显存」因为调度是读者已见过的循环骨架的自然深入。
