@@ -71,7 +71,7 @@
 |---|---|---|---|---|
 | 21 | 模型定义层拼装术 | 模型层框 | DecoderLayer=积木清单、forward/compute_logits 两方法契约（logits 只在需要处物化的 2GB 反例）、接入 registry 清单 | ch22+ch28 合并 |
 | 22 | 注意力变体：MLA 的压缩与两种展开 | 模型层框（MLA） | （融入式 primer：MHA/GQA→MLA 为什么压缩）576 维潜向量、prefill MHA 展开 vs decode MQA 吸收、hybrid KV 的组化（回收 Part IV） | ch26 深化 |
-| 23 | DeepSeek 的索引器：从 NSA 到 DSA | 模型层框（indexer） | （融入式 primer：NSA 三支路谱系）DSA 打分器、KV 挑选如何进入块表、与 MLA 的配合 | ch27+ch29 合并 |
+| 23 | DeepSeek 的索引器：从 NSA 到 DSA | 模型层框（indexer） | （融入式 primer：NSA 三支路谱系）DSA 打分器、KV 挑选如何进入块表、与 MLA 的配合、**IndexCache**（indexer 打分结果的缓存与多轮复用——每轮只对新增 token 算 index，`DeepseekV4IndexerCache` 的生命周期与失效） | ch27+ch29 合并 |
 | 24 | 实战：DeepSeek-V4 是怎么拼出来的 | 模型层全景 | capstone：MoE+MLA+DSA indexer+FP4，从接入清单走一遍真实新架构落地的每一步 | ch28 重做 |
 
 ## Part VII — 选一个 token 出门（4 章）
@@ -83,7 +83,7 @@
 | 25 | Sampler 的 9 步管线 | 采样出口列 | 逐步解剖、argmax 不变性二分（greedy 免税）、惩罚/温度/截断、Gumbel 技巧杀同步、raw logprobs 的语义 | ch30 重做 |
 | 26 | 约束解码 I：语法编译与后端契约 | 采样列（结构化输出组） | 语法→FSM、xgrammar/guidance/outlines 生态对比与取舍、GrammarCompiler 缓存、异步编译+调度状态门（不挡批） | ch31 重做 |
 | 27 | 约束解码 II：bitmask 如何落到 logits | 采样列+bitmask | 位掩码（非重试非枚举的 why）、两段式 execute 的 GPU 窗口、fill_next_token_bitmask→apply 的 H2D 链 | ch32 重做 |
-| 28 | 投机解码：draft、验证、拒绝采样 | 采样列+spec | （融入式 primer：EAGLE/MTP 思想）draft 当 prefill 排批、一次前向验证、拒绝采样保分布、接受率低纯亏的诚实账 | ch33+ch34 合并 |
+| 28 | 投机解码：draft、验证、拒绝采样——从 EAGLE 到 DSpark | 采样列+spec | （融入式 primer：EAGLE/MTP/DFlash 思想谱系）draft 当 prefill 排批、一次前向验证、拒绝采样保分布、接受率低纯亏的诚实账；**DSpark**（DeepSeek 生产方案：半自回归架构=并行骨干+序列 Markov 头注入块内依赖、置信度头估计前缀存活概率+硬件感知调度动态定验证长度、DeepSeek-V4 线上提速 60-85% 的 Pareto 前移、vLLM speculator 落地） | ch33+ch34 合并+ch41 素材（papers/ch41-primer-dspark 论文已深研） |
 
 ## Part VIII — 走向生产（6 章）
 **hook：真实服务不止一个引擎——规模、容错与接口的最后一公里**
