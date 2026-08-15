@@ -46,11 +46,10 @@ def parse_vb(root):
     return 0.0, 0.0, float(root.get('width', 0) or 0), float(root.get('height', 0) or 0)
 
 
-def path_endpoints(d):
-    # 取 path 的首末坐标点(粗略): 抓所有数字对
+def path_points(d):
+    """抓 path 的全部坐标点(粗略): 抓所有数字对（折线箭头的每个拐点都要）。"""
     nums = re.findall(r'-?\d+\.?\d*', d)
-    pts = [(float(nums[i]), float(nums[i + 1])) for i in range(0, len(nums) - 1, 2)]
-    return (pts[0], pts[-1]) if len(pts) >= 2 else None
+    return [(float(nums[i]), float(nums[i + 1])) for i in range(0, len(nums) - 1, 2)]
 
 
 def collect(root):
@@ -84,11 +83,12 @@ def collect(root):
                      (float(el.get('x2', 0)), float(el.get('y2', 0))))
             except ValueError:
                 continue
-            arrows.append({'pts': p, 'marker': bool(el.get('marker-end') or el.get('marker-start'))})
+            arrows.append({'pts': p, 'all': list(p), 'marker': bool(el.get('marker-end') or el.get('marker-start'))})
         elif tag == 'path':
-            ep = path_endpoints(el.get('d', ''))
-            if ep:
-                arrows.append({'pts': ep, 'marker': bool(el.get('marker-end') or el.get('marker-start'))})
+            pts = path_points(el.get('d', ''))
+            if len(pts) >= 2:
+                arrows.append({'pts': (pts[0], pts[-1]), 'all': pts,
+                               'marker': bool(el.get('marker-end') or el.get('marker-start'))})
     return texts, rects, arrows
 
 
@@ -106,6 +106,31 @@ def near_rect_edge(pt, rects, tol):
 def near_point(pt, others, tol):
     for o in others:
         if math.hypot(pt[0] - o[0], pt[1] - o[1]) <= tol:
+            return True
+    return False
+
+
+def on_rect_edge(pt, rects, tol):
+    """端点是否落在任一框的边线上（仅 on_v/on_h，不含 inside）——
+    落在边上 = 已连接，即便该边在容器框内部（exp-2026-08-15 L0：
+    贴边画法的端点常在进程带/循环框容器内，inside 不算未连接）。"""
+    x, y = pt
+    for r in rects:
+        on_v = (abs(x - r['x0']) <= tol or abs(x - r['x1']) <= tol) and (r['y0'] - tol <= y <= r['y1'] + tol)
+        on_h = (abs(y - r['y0']) <= tol or abs(y - r['y1']) <= tol) and (r['x0'] - tol <= x <= r['x1'] + tol)
+        if on_v or on_h:
+            return True
+    return False
+
+
+def is_container(r, rects):
+    """该框是否完整装着另一个框（=容器：进程带/泳道/循环框/背景）。
+    容器不「截断」线——线穿越容器内部去连接其子组件是合法的（exp-2026-08-15：
+    ZMQ 边界带面积不到画布 30%，面积豁免漏掉它，abort 纵穿带体被误报截断）。"""
+    for o in rects:
+        if o is r:
+            continue
+        if r['x0'] <= o['x0'] and r['y0'] <= o['y0'] and r['x1'] >= o['x1'] and r['y1'] >= o['y1']:
             return True
     return False
 
@@ -249,16 +274,21 @@ def check(path, strict=False):
         if strict:
             for end, label in ((p1, '起点'), (p2, '末端')):
                 d, hr = inside_depth(end, rects, vw or 1, vh or 1)
-                if d > 10:
+                if d > 10 and not on_rect_edge(end, rects, EDGE_TOL):
                     issues.append(f"arrow-inside: 一条箭头{label}({round(end[0])},{round(end[1])})戳进框内部 {round(d)}px, 未落在框边上")
-            # (4c) arrow-crossed: 线段中段穿越无关框 = 被截断（容器豁免: 含端点的框不算）。
+            # (4c) arrow-crossed: 线段中段穿越无关框 = 被截断（容器豁免: 含端点的框不算;
+            # 装着其他框的容器也不算）。折线箭头按**逐段**检查——首末拉直会对
+            # 肘形总线误报（exp-2026-08-15 L0 回程总线被对角线误判穿 Executor 框）。
             ep_rects = endpoint_rects(p1, rects, ARROW_TOL) + endpoint_rects(p2, rects, ARROW_TOL)
+            segs = list(zip(a['all'], a['all'][1:]))
             for r in rects:
                 if r in ep_rects:
                     continue
                 if r['w'] < 40 or r['h'] < 18:
                     continue  # 图例色块/小徽标不拦线
-                if seg_cross_rect(p1, p2, r):
+                if is_container(r, rects):
+                    continue  # 容器（进程带/泳道/循环框）不截断线
+                if any(seg_cross_rect(s1, s2, r) for s1, s2 in segs):
                     issues.append(f"arrow-crossed: 一条箭头({round(p1[0])},{round(p1[1])})→({round(p2[0])},{round(p2[1])})中途穿过一个 {round(r['w'])}×{round(r['h'])} 框(被截断)")
                     break
     seen = set(); out = []

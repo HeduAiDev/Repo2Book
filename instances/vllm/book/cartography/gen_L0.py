@@ -132,7 +132,7 @@ LCX, RCX = 560, 1770                       # 左泳道(上行) / 右泳道(下�
 DIVX = (LCX + RCX) // 2                    # 泳道虚线分隔 1165
 ENT_Y, ENT_H = AY + 40, 58                 # 入口条
 LY0 = AY + 116                             # 泳道首框 y = 308
-PITCH, BOX_H = 168, 128
+PITCH = 168                                # 泳道框间距（框高取 comp() 实际返回，不用常量）
 AH = 596
 
 rect(MX, AY, CW, AH, C_API_F, C_API_S, rx=12, sw=2.4)
@@ -159,54 +159,56 @@ seg(DIVX, LY0 - 6, DIVX, AY + AH - 20, C_FAINT, 1.2, dash=True)
 
 # ---- 右泳道（下行：tokenize → 组包） ----
 rx = RCX - LANE_W / 2
-comp(rx, LY0, LANE_W, 'Renderer.render',
+_, r1h = comp(rx, LY0, LANE_W, 'Renderer.render',
      ['· render_chat / render_cmpl 两个入口',
       '· _tokenize_prompt: tokenizer.encode → TokensPrompt',
       '· tokenize 在前端进程，文本不过 IPC'],
      'vllm/renderers/base.py', C_API_S)
-comp(rx, LY0 + PITCH, LANE_W, 'InputProcessor',
+_, r2h = comp(rx, LY0 + PITCH, LANE_W, 'InputProcessor',
      ['· process_inputs: 校验 + params.clone() + 整理 mm_features',
       '· assign_request_id 双轨：外部 id + 内部「id-8位hex」',
       '· 组装 EngineCoreRequest（只有 token ids）'],
      'vllm/v1/engine/input_processor.py', C_API_S)
-comp(rx, LY0 + 2 * PITCH, LANE_W, 'EngineCoreRequest（msgspec Struct）',
+_, r3h = comp(rx, LY0 + 2 * PITCH, LANE_W, 'EngineCoreRequest（msgspec Struct）',
      ['· prompt_token_ids + sampling_params + mm_features',
       '· array_like 按位置编码 · omit_defaults 省字节',
       '· 大 tensor 走零拷贝独立帧 / OOB 共享内存旁路'],
      'vllm/v1/engine/__init__.py', C_API_S)
+rbox_h = [r1h, r2h, r3h]
 # 下行箭头
 seg(RCX, ENT_Y + ENT_H, RCX, LY0, C_API_S, 2.0, 'dn')
 alabel(RCX + 7, ENT_Y + ENT_H + 13, 'add_request(prompt, sampling_params)', 9, C_API_S)
 for k, lab in [(0, 'TokensPrompt（只有 token ids）'), (1, 'process_inputs 产出')]:
-    seg(RCX, LY0 + k * PITCH + BOX_H, RCX, LY0 + (k + 1) * PITCH, C_API_S, 2.0, 'dn')
-    alabel(RCX + 7, LY0 + k * PITCH + BOX_H + 26, lab, 9, C_API_S)
+    seg(RCX, LY0 + k * PITCH + rbox_h[k], RCX, LY0 + (k + 1) * PITCH, C_API_S, 2.0, 'dn')
+    alabel(RCX + 7, LY0 + k * PITCH + rbox_h[k] + 26, lab, 9, C_API_S)
 
 # ---- 左泳道（上行：拆包 → 拼字 → 流式） ----
 lx = LCX - LANE_W / 2
-comp(lx, LY0, LANE_W, 'RequestOutputCollector ×3（每请求一个）',
+_, l1h = comp(lx, LY0, LANE_W, 'RequestOutputCollector ×3（每请求一个）',
      ['· 单槽 + Event + 生产侧合并',
       '· 刻意不用 asyncio.Queue（慢消费者防堆积）',
       '· 三态契约：DELTA / CUMULATIVE / FINAL_ONLY'],
      'vllm/v1/engine/output_processor.py', C_API_S)
-comp(lx, LY0 + PITCH, LANE_W, 'OutputProcessor',
+_, l2h = comp(lx, LY0 + PITCH, LANE_W, 'OutputProcessor',
      ['· process_outputs: 按 request_id demux 到各 Collector',
       '· 增量 detokenize + logprobs，组装 RequestOutput',
       '· 内部 id 反查外部 id · stop-string 判定在这里'],
      'vllm/v1/engine/output_processor.py', C_API_S)
-comp(lx, LY0 + 2 * PITCH, LANE_W, 'output_handler（单任务）',
+_, l3h = comp(lx, LY0 + 2 * PITCH, LANE_W, 'output_handler（单任务）',
      ['· await get_output_async() 整批取回',
       '· 按 chunk_size=128 切片逐片 process_outputs',
       '· 片间 await asyncio.sleep(0) 让事件循环喘气'],
      'vllm/v1/engine/async_llm.py', C_API_S)
+lbox_h = [l1h, l2h, l3h]
 # 上行箭头（朝上）
 seg(LCX, LY0, LCX, ENT_Y + ENT_H, C_ENG_S, 2.0, 'up')
 alabel(LCX + 7, ENT_Y + ENT_H + 13, 'yield RequestOutput → SSE', 9, C_ENG_S)
 for k, lab in [(0, 'RequestOutput · 按 request_id 扇出'), (1, 'EngineCoreOutputs 分片喂入')]:
-    seg(LCX, LY0 + (k + 1) * PITCH, LCX, LY0 + k * PITCH + BOX_H, C_ENG_S, 2.0, 'up')
-    alabel(LCX + 7, LY0 + k * PITCH + BOX_H + 26, lab, 9, C_ENG_S)
+    seg(LCX, LY0 + (k + 1) * PITCH, LCX, LY0 + k * PITCH + lbox_h[k], C_ENG_S, 2.0, 'up')
+    alabel(LCX + 7, LY0 + k * PITCH + lbox_h[k] + 26, lab, 9, C_ENG_S)
 
 # 双登记虚线（入口条 → OutputProcessor，本进程建表先于跨进程）
-parrow([(1010, ENT_Y + ENT_H), (1010, LY0 + PITCH + BOX_H / 2), (lx + LANE_W, LY0 + PITCH + BOX_H / 2)],
+parrow([(1010, ENT_Y + ENT_H), (1010, LY0 + PITCH + lbox_h[1] / 2), (lx + LANE_W, LY0 + PITCH + lbox_h[1] / 2)],
        C_API_S, 1.5, 'std', dash=True)
 alabel(1017, LY0 + PITCH + 30, '① 本进程建表 OutputProcessor.request_states', 9, C_API_S)
 alabel(1017, LY0 + PITCH + 44, '（先于跨进程发送，保证回程到达时表已存在）', 9, C_MUTE)
@@ -223,31 +225,23 @@ text(MX + 16, ZY + 90, '大 tensor → OOB 共享内存旁路', 9, C_MUTE, 'star
 text(MX + 16, ZY + 112, '无反压 HWM=0 · fire-and-forget', 9, C_MUTE, 'start', maxw=200, tag='zmq:l5')
 
 BAND_W = 600
-comp(RCX - BAND_W / 2, ZY + 30, BAND_W, 'AsyncMPClient.add_request_async',
+_, zrh = comp(RCX - BAND_W / 2, ZY + 30, BAND_W, 'AsyncMPClient.add_request_async',
      ['· ROUTER(bind) → 引擎 DEALER(connect, identity=rank)',
       '· 帧序 (identity, type_byte, *payload) · 首帧寻址',
       '· send_multipart(copy=False) 零拷贝直传'],
      'vllm/v1/engine/core_client.py', C_ZMQ_S)
-comp(LCX - BAND_W / 2, ZY + 30, BAND_W, 'AsyncMPClient.get_output_async',
+_, zlh = comp(LCX - BAND_W / 2, ZY + 30, BAND_W, 'AsyncMPClient.get_output_async',
      ['· PULL(bind) 收全部引擎输出 ← 引擎 PUSH(connect)',
       '· HWM=0 无反压 · 大内存机 0.5GB 内核缓冲',
       '· 多前端时引擎按 client_index 选 PUSH socket'],
      'vllm/v1/engine/core_client.py', C_ZMQ_S)
 
 # 右：下行穿越（EngineCoreRequest → add_request_async）
-seg(RCX, LY0 + 2 * PITCH + BOX_H, RCX, ZY + 30, C_API_S, 2.2, 'dn')
+seg(RCX, LY0 + 2 * PITCH + rbox_h[2], RCX, ZY + 30, C_API_S, 2.2, 'dn')
 alabel(RCX + 7, ZY + 22, 'encoder.encode → 多帧', 9, C_API_S)
 # 左：上行穿越（get_output_async → output_handler）
-seg(LCX, ZY + 30, LCX, LY0 + 2 * PITCH + BOX_H, C_ENG_S, 2.2, 'up')
+seg(LCX, ZY + 30, LCX, LY0 + 2 * PITCH + lbox_h[2], C_ENG_S, 2.2, 'up')
 alabel(LCX + 7, ZY + 22, 'await 取回整批', 9, C_ENG_S)
-
-# ABORT 红虚线（下行，两框之间）
-ABX = (LCX + RCX) // 2                     # 1165
-seg(ABX, ZY + 6, ABX, ZY + ZH - 6, C_ABORT, 1.6, 'ab', dash=True)
-alabel(ABX + 8, ZY + 40, "ABORT b'\\x01'", 9.5, C_ABORT, 'start')
-alabel(ABX + 8, ZY + 56, '断连 / stop-string → 反向 abort', 9, C_MUTE)
-alabel(ABX + 8, ZY + 72, '只带内部 id · 与 ADD 同一条 socket', 9, C_MUTE)
-alabel(ABX + 8, ZY + 88, '引擎侧双投递 input_queue + aborts_queue', 9, C_MUTE)
 
 # ========== EngineCore 进程 ==========
 EY = ZY + ZH + 16                            # 988
@@ -258,12 +252,6 @@ OQ_X, OQ_W = 670, 120
 IQ_X, IQ_W = 1522, 130
 DLR_X, DLR_W = 1668, 260
 EH = 792
-
-# 先画穿越边界的箭头（压在引擎框下）
-seg(RCX, ZY + ZH, RCX, ROW1_Y, C_API_S, 2.4, 'dn')
-alabel(RCX + 8, ZY + ZH + 26, "EngineCoreRequest · type=ADD b'\\x00'", 9.5, C_API_S)
-seg(LCX, ROW1_Y, LCX, ZY + ZH, C_ENG_S, 2.4, 'up')
-alabel(LCX + 8, ZY + ZH + 26, 'EngineCoreOutputs · 每步整批聚合 1 条', 9.5, C_ENG_S)
 
 rect(MX, EY, CW, EH, C_ENG_F, C_ENG_S, rx=12, sw=2.4)
 text(MX + 16, EY + 24, 'EngineCore 进程（busy loop · 只做调度 + 执行）', 13.5, C_ENG_S, 'start', True)
@@ -300,6 +288,21 @@ text(PUSH_X + 12, ROW1_Y + 20, 'PUSH(connect) 发端', 10.5, C_TXT, 'start', Tru
 text(PUSH_X + 12, ROW1_Y + 42, '· 输出 IO 线程', 9, '#334155', 'start')
 text(PUSH_X + 12, ROW1_Y + 60, '· 按 client_index 选 socket', 9, '#334155', 'start', maxw=PUSH_W - 22, tag='push:l2')
 text(PUSH_X + 12, ROW1_Y + 78, '· encode_into 复用 bytearray', 9, '#334155', 'start', maxw=PUSH_W - 22, tag='push:l3')
+
+# ---- 穿越进程边界的箭头（在引擎带与 socket 框之后画：全程可见，端到端贴框边） ----
+# 右：add_request_async 框底 → DEALER 框顶（请求进引擎）
+seg(RCX, ZY + 30 + zrh, RCX, ROW1_Y, C_API_S, 2.4, 'dn')
+alabel(RCX + 8, ZY + ZH + 26, "EngineCoreRequest · type=ADD b'\\x00'", 9.5, C_API_S)
+# 左：PUSH 框顶 → get_output_async 框底（输出回 API 进程）
+seg(LCX, ROW1_Y, LCX, ZY + 30 + zlh, C_ENG_S, 2.4, 'up')
+alabel(LCX + 8, ZY + ZH + 26, 'EngineCoreOutputs · 每步整批聚合 1 条', 9.5, C_ENG_S)
+# ABORT 红虚线（下行，两泳道之间：API 带底边 → EngineCore 带顶边）
+ABX = (LCX + RCX) // 2                     # 1165
+seg(ABX, AY + AH, ABX, EY, C_ABORT, 1.6, 'ab', dash=True)
+alabel(ABX + 8, ZY + 40, "ABORT b'\\x01'", 9.5, C_ABORT, 'start')
+alabel(ABX + 8, ZY + 56, '断连 / stop-string → 反向 abort', 9, C_MUTE)
+alabel(ABX + 8, ZY + 72, '只带内部 id · 与 ADD 同一条 socket', 9, C_MUTE)
+alabel(ABX + 8, ZY + 88, '引擎侧双投递 input_queue + aborts_queue', 9, C_MUTE)
 
 # 行内小箭头：DEALER→iq→loop→oq→PUSH（语义链统一标注在循环框下方）
 seg(DLR_X - 2, ROW1_Y + 48, IQ_X + IQ_W + 2, ROW1_Y + 48, C_MUTE, 1.6, 'std')
