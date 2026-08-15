@@ -6,7 +6,7 @@
   每条数据箭头带消息名/方法名；进程边界显式（ROUTER/DEALER、PUSH/PULL、帧序）。
 覆盖全系统：API 进程双泳道 → ZMQ 边界 → EngineCore 进程
   （五拍循环 + 调度·显存账本 + GPU 执行臂 + 采样与出口）。
-所有内容（类名/方法名/数字/契约）取自 ARCHITECTURE.md 与 deepread/*.json（pin v0.21.0）。
+所有内容（类名/方法名/数字/契约）取自 ARCHITECTURE.md 与 deepread/*.json（pin v0.27.1）。
 """
 import sys
 from pathlib import Path
@@ -113,7 +113,7 @@ BXR = MX + CW                  # 内容右缘 2164
 
 # ---------- 标题 ----------
 text(MX, 38, 'vLLM v1 全书架构图（L0 · 唯一权威图）：一个请求的一生', 20, C_TXT, 'start', True)
-text(MX, 64, '源码 pin vLLM v0.21.0 · 三段式进程解耦 · 引擎逐拍循环「调度 → 执行 → 采样 → 回收」 · 显存共享账本',
+text(MX, 64, '源码 pin vLLM v0.27.1 · 三段式进程解耦 · 引擎逐拍循环「调度 → 执行 → 采样 → 回收」 · 显存共享账本',
      10.5, C_MUTE, 'start')
 
 # ---------- 用户行 ----------
@@ -162,7 +162,8 @@ rx = RCX - LANE_W / 2
 _, r1h = comp(rx, LY0, LANE_W, 'Renderer.render',
      ['· render_chat / render_cmpl 两个入口',
       '· _tokenize_prompt: tokenizer.encode → TokensPrompt',
-      '· tokenize 在前端进程，文本不过 IPC'],
+      '· tokenize 在前端进程，文本不过 IPC',
+      '· 原始 prompt 的阻塞 tokenize 跑线程池，不下事件循环'],
      'vllm/renderers/base.py', C_API_S)
 _, r2h = comp(rx, LY0 + PITCH, LANE_W, 'InputProcessor',
      ['· process_inputs: 校验 + params.clone() + 整理 mm_features',
@@ -223,6 +224,8 @@ text(MX + 16, ZY + 50, 'ZMQ + msgpack', 10.5, C_ZMQ_S, 'start', True)
 text(MX + 16, ZY + 72, '序列化：array_like · 零拷贝帧', 9, C_MUTE, 'start', maxw=200, tag='zmq:l3')
 text(MX + 16, ZY + 90, '大 tensor → OOB 共享内存旁路', 9, C_MUTE, 'start', maxw=200, tag='zmq:l4')
 text(MX + 16, ZY + 112, '无反压 HWM=0 · fire-and-forget', 9, C_MUTE, 'start', maxw=200, tag='zmq:l5')
+text(MX + 16, ZY + 132, '· DP 部署另起 DPCoordinator（控制面）', 9, C_MUTE, 'start', maxw=200, tag='zmq:l6')
+text(MX + 16, ZY + 148, '  → 详见分布式章', 9, C_MUTE, 'start', maxw=200, tag='zmq:l7')
 
 BAND_W = 600
 _, zrh = comp(RCX - BAND_W / 2, ZY + 30, BAND_W, 'AsyncMPClient.add_request_async',
@@ -292,10 +295,10 @@ text(PUSH_X + 12, ROW1_Y + 78, '· encode_into 复用 bytearray', 9, '#334155', 
 # ---- 穿越进程边界的箭头（在引擎带与 socket 框之后画：全程可见，端到端贴框边） ----
 # 右：add_request_async 框底 → DEALER 框顶（请求进引擎）
 seg(RCX, ZY + 30 + zrh, RCX, ROW1_Y, C_API_S, 2.4, 'dn')
-alabel(RCX + 8, ZY + ZH + 26, "EngineCoreRequest · type=ADD b'\\x00'", 9.5, C_API_S)
+alabel(RCX + 8, ZY + ZH + 26, "EngineCoreRequest · type=ADD b'\\x00' · client_index 随请求过线", 9.5, C_API_S)
 # 左：PUSH 框顶 → get_output_async 框底（输出回 API 进程）
 seg(LCX, ROW1_Y, LCX, ZY + 30 + zlh, C_ENG_S, 2.4, 'up')
-alabel(LCX + 8, ZY + ZH + 26, 'EngineCoreOutputs · 每步整批聚合 1 条', 9.5, C_ENG_S)
+alabel(LCX + 8, ZY + ZH + 26, 'EngineCoreOutputs · 每步整批聚合 1 条 · 引擎按 client_index 选 PUSH 回发', 9.5, C_ENG_S)
 # ABORT 红虚线（下行，两泳道之间：API 带底边 → EngineCore 带顶边）
 ABX = (LCX + RCX) // 2                     # 1165
 seg(ABX, AY + AH, ABX, EY, C_ABORT, 1.6, 'ab', dash=True)
@@ -341,7 +344,7 @@ for i, (t, s1, s2) in enumerate(chips):
 fb_y = LOOP_Y + 34 + CHIP_H + 14
 parrow([(chip_cx[4], LOOP_Y + 34 + CHIP_H), (chip_cx[4], fb_y), (chip_cx[0], fb_y),
         (chip_cx[0], LOOP_Y + 34 + CHIP_H)], C_MUTE, 1.4, 'std')
-text((chip_cx[0] + chip_cx[4]) / 2, fb_y + 14, '下一拍', 9, C_MUTE, 'middle')
+text((chip_cx[0] + chip_cx[4]) / 2, fb_y + 14, '下一拍 · v0.27.1 起默认开启异步调度（本循环即重叠版）', 9, C_MUTE, 'middle')
 
 # ========== 三列：调度·显存 / GPU 执行臂 / 采样出口 ==========
 CY0 = EY + 232
@@ -374,12 +377,13 @@ A2Y = CY0 + 30 + a1h + 16
 _, a2h = comp(AX, A2Y, COL_W, 'KVCacheManager',
      ['· get_computed_blocks → 前缀命中（返回 token 计数）',
       '· allocate_slots → None = 触发抢占的唯一信号',
+      '· 分配三重预算 free−reserved−watermark（水位抑制抢占抖动）',
       '· free 逆序归还 = LRU 隐藏不变量'],
      'vllm/v1/core/kv_cache_manager.py', C_KV_S)
 A3Y = A2Y + a2h + 16
 _, a3h = comp(AX, A3Y, COL_W, 'BlockPool + 前缀缓存',
      ['· KVCacheBlock 固定块池 · ref_cnt 共享前缀',
-      '· 链式哈希（非 radix 树）· 只缓存满块',
+      '· 链式哈希（非 radix 树）· 满块 + 块内 CoW 部分命中（partial prefix cache）',
       '· 抢占 = recompute-only：不清哈希，回 waiting 队头',
       '· block_id 是调度器 ↔ worker 的唯一共享键'],
      'vllm/v1/core/block_pool.py', C_KV_S)
@@ -408,7 +412,8 @@ _, b3h = comp(BX, B3Y, COL_W, '模型层 forward + 编译',
      ['· DecoderLayer 拼装 · Attention = 插座（MLA / GQA 变体）',
       '· piecewise torch.compile：注意力处切图',
       '· CUDA Graph 按形状查表回放',
-      '· slot_mapping 由 Triton kernel 在 GPU 上算'],
+      '· slot_mapping 由 Triton kernel 在 GPU 上算',
+      '· 新布局 vllm/models/<name>/：硬件隔离（旗舰架构）'],
      'vllm/model_executor/models · vllm/compilation', C_GPU_S)
 seg(BCX, CY0 + 30 + b1h, BCX, B2Y, C_GPU_S, 1.6, 'std')
 alabel(BCX + 7, B2Y - 4, 'execute_model 穿三层', 9, C_GPU_S)
