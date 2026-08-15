@@ -102,3 +102,4 @@ python3 scripts/lint_figures_registered.py   # 每章 manifest 图都登记进 b
 4. 别赌自己的上下文——决策/状态写进 trace、Bible、本文档 / `INSTANCE.md`。
 5. **提交后自动推送**（2026-07-14 用户定）：任务节点照常提交，提交完即推送、不必等用户指示。推送**须前台**跑且走 **gh HTTPS**（`git push https://github.com/HeduAiDev/Repo2Book.git <branch>`——SSH 22 端口被墙必超时，`gh auth setup-git` 已配好凭据）。
 6. **项目外零读写**（2026-08-03 用户定，强调「非常重要」）：所有 subagent 一律不许在仓库目录树外创建/修改/删除/读取任何文件——含系统临时目录 `$TMPDIR`/`TEMP`、Git Bash 挂载的 `/tmp`（实为 `E:\tmp`）、其他盘、桌面等；settings.local.json 已撤 `Read(//tmp/**)` 等放行。必须的临时检查文件（如图自查裁剪/放大）只许在项目内以点号前缀建、**用完立即删**、交付前核 `git status` 零新增。判断标准：「这文件在 `repo2book.json` 所在目录树内吗？」不在 → 不许碰。
+7. **模型分工**（2026-08-15 用户定）：**只有画图/读图（视觉作业）用 fable5**，其余一切（写作/分析/评审/研究/编排）不用 fable——一律主模型（Opus）。用户明言「除了画图以外不要使用 fable5」；此前 07-25「Revise 站 writer 用 fable5」的指定即此作废。
