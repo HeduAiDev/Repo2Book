@@ -1,6 +1,24 @@
 # 实例：vLLM（vLLM v1 源码解读：从真实源码读懂推理引擎）
 
 > 本文件 = 当前实例的「源码版本 + 当前状态 + 实例专属规则」。**通用方法论/工厂运转见仓库根 `CLAUDE.md`**；本实例配置见 `instances/vllm/repo2book.json`。
+
+## 🔖 v3 重写进行中（2026-08-15 起，分支 `vllm-book-v3-rewrite`）
+
+> 以下 v2 历史记录见后文；v3 期间状态与规则以本节为准。
+
+- **源码 pin 已切换：v0.27.1（`6e448d0ea`）**——用户 2026-08-15 定「用最新 release」。
+  旧基线 v0.21.0（`ad7125a4`）仅作历史 diff；**v2 全书行号引用仍指 v0.21.0**（v2 已封版不改）。
+- ⚠️ v0.21.0→v0.27.1 跨 6 个 minor、**实质架构演进**（核心子系统 diff 144 文件 +20k/-6k 行；
+  gpu_model_runner +1901 / scheduler +1045 / elastic EP 与 xgrammar 调用面已重构）。
+- **🔄 待发车（2026-08-15，session 权限组件故障中断）**：Phase 0 深读按 v0.27.1 **全量重跑**（用户裁决：
+  地基出错后面只会更麻烦）。workflow 已就绪——重启 session 后执行
+  `Workflow({scriptPath: ".claude/workflows/v3-arch-deepread.js"})` 即可。
+  旧卡（v0.21.0 基线）已归档 `deepread-v021/` 仅作对照；新卡落 `deepread/`。
+  完成后 Lead 重新综合 ARCHITECTURE.md + 校订 L0 图（fable 画图）。
+- v3 方法论/大纲：`docs/superpowers/specs/2026-08-15-v3-pedagogy-rewrite.md` +
+  `book/cartography/outline-v3-draft.md`（**38 章 8 Part、4 primer 混合制**，用户多轮裁决已吸收：
+  容量修正/KV 池化/DSpark/IndexCache/先原理后代码）。
+- 模型分工（CLAUDE.md #7）：**只有画图/读图用 fable5，其余一律主模型**。
 > 中文、高级读者，解读 vLLM v1 推理引擎；异步三段式解耦为旗舰。
 
 > **2026-06-21 重大转向**：旧的"从零简化重写 + 理论推导"产出太抽象、脱离代码，**全部废弃**。新书 = **直接解读真实 vLLM v1 源码**，按真实模块组织。旧 agent 提示词/经验仅作批判参考。
