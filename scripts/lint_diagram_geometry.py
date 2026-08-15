@@ -195,22 +195,34 @@ def check(path, strict=False):
         root = ET.parse(path).getroot()
     except ET.ParseError as e:
         return [f'SVG 解析失败: {e}']
+    # clipPath 内的形状是裁剪区域定义、不是绘制内容（v3 L1 的显式画布裁剪矩形），
+    # 不参与文字/框/箭头的几何判定（否则边缘文字会「侵入」裁剪矩形）。
+    for cp in root.iter(f'{NS}clipPath'):
+        for child in list(cp):
+            cp.remove(child)
     vx, vy, vw, vh = parse_vb(root)
     texts, rects, arrows = collect(root)
     issues = []
     PAD = 2.0
+    # v3 缩放层豁免（exp-2026-08-15，L1 落地）：根元素带 data-zoom 的图 = L0 的 viewBox
+    # 裁切放大层（gen_L1.py）。视口外**按设计**留有淡出上下文（<g opacity=0.15>）与
+    # 跨视口大框（进程带/总线），越界是被裁切层的常态而非事故——overflow/rect-overflow
+    # 对其无意义，跳过；text-text / text-rect / tag-on-title / 箭头连通检查照常全量生效
+    # （同一坐标系，碰撞即真碰撞）。普通图（含 L0 自身）不受影响。
+    zoom_layer = bool(root.get('data-zoom'))
     # (1) overflow — 文字盒越出画布
-    for t in texts:
-        if t['x1'] > vx + vw + PAD or t['x0'] < vx - PAD or t['yb'] > vy + vh + PAD or t['yt'] < vy - PAD:
-            over = round(max(t['x1'] - (vx + vw), vx - t['x0'], t['yb'] - (vy + vh), vy - t['yt']))
-            if over > 4:
-                issues.append(f"overflow: 「{t['s'][:24]}」越出画布约 {over}px")
-    # (1b) rect-overflow — 框越出画布(被裁切)。文字居中时字不越界但框边被切, 故单独查。
-    for r in rects:
-        if r['x1'] > vx + vw + PAD or r['x0'] < vx - PAD or r['y1'] > vy + vh + PAD or r['y0'] < vy - PAD:
-            over = round(max(r['x1'] - (vx + vw), vx - r['x0'], r['y1'] - (vy + vh), vy - r['y0']))
-            if over > 4:
-                issues.append(f"rect-overflow: 一个 {round(r['w'])}×{round(r['h'])} 框越出画布约 {over}px(被裁切)")
+    if not zoom_layer:
+        for t in texts:
+            if t['x1'] > vx + vw + PAD or t['x0'] < vx - PAD or t['yb'] > vy + vh + PAD or t['yt'] < vy - PAD:
+                over = round(max(t['x1'] - (vx + vw), vx - t['x0'], t['yb'] - (vy + vh), vy - t['yt']))
+                if over > 4:
+                    issues.append(f"overflow: 「{t['s'][:24]}」越出画布约 {over}px")
+        # (1b) rect-overflow — 框越出画布(被裁切)。文字居中时字不越界但框边被切, 故单独查。
+        for r in rects:
+            if r['x1'] > vx + vw + PAD or r['x0'] < vx - PAD or r['y1'] > vy + vh + PAD or r['y0'] < vy - PAD:
+                over = round(max(r['x1'] - (vx + vw), vx - r['x0'], r['y1'] - (vy + vh), vy - r['y0']))
+                if over > 4:
+                    issues.append(f"rect-overflow: 一个 {round(r['w'])}×{round(r['h'])} 框越出画布约 {over}px(被裁切)")
     # (2) text-text
     for i in range(len(texts)):
         for j in range(i + 1, len(texts)):
