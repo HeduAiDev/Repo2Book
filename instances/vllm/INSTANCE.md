@@ -10,11 +10,14 @@
   旧基线 v0.21.0（`ad7125a4`）仅作历史 diff；**v2 全书行号引用仍指 v0.21.0**（v2 已封版不改）。
 - ⚠️ v0.21.0→v0.27.1 跨 6 个 minor、**实质架构演进**（核心子系统 diff 144 文件 +20k/-6k 行；
   gpu_model_runner +1901 / scheduler +1045 / elastic EP 与 xgrammar 调用面已重构）。
-- **🔄 待发车（2026-08-15，session 权限组件故障中断）**：Phase 0 深读按 v0.27.1 **全量重跑**（用户裁决：
-  地基出错后面只会更麻烦）。workflow 已就绪——重启 session 后执行
-  `Workflow({scriptPath: ".claude/workflows/v3-arch-deepread.js"})` 即可。
-  旧卡（v0.21.0 基线）已归档 `deepread-v021/` 仅作对照；新卡落 `deepread/`。
-  完成后 Lead 重新综合 ARCHITECTURE.md + 校订 L0 图（fable 画图）。
+- ✅ **Phase 0 已收官**（2026-08-15，对 v0.27.1）：deepread/ 六卡全量重核 + ARCHITECTURE.md（13 条演进速览）
+  + L0 图校订（fable，strict 门禁绿）。
+- ✅ **Phase 1 已收官**（2026-08-15）：大纲 40 章 8 Part 4 primer **用户批准**（含覆盖自查补 7 处：
+  chunked prefill/配置装配/n>1 扇出/权重加载/EP/code→diagram/部署实战）；
+  `pedagogy-plan.json` 已产出（hook/依赖/10 组伏笔/概念首现/L0 缩放路径）。
+- **🔄 Phase 2 图系三层缩放**（下一步）：L0 唯一 → L1 Part 图（L0 局部放大）→ L2 章图；
+  同一数据源分层渲染；改造 v2 arch-model 渲染器。
+- Phase 3 逐章重写：pipeline 复用 + 新写作契约（hook 开篇/先地图后细节/阶梯展开）。
 - v3 方法论/大纲：`docs/superpowers/specs/2026-08-15-v3-pedagogy-rewrite.md` +
   `book/cartography/outline-v3-draft.md`（**38 章 8 Part、4 primer 混合制**，用户多轮裁决已吸收：
   容量修正/KV 池化/DSpark/IndexCache/先原理后代码）。
