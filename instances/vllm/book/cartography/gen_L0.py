@@ -3,7 +3,7 @@
 
 绘制主体在 l0_common.build_l0()（与 fable 执笔版逐行同源，坐标零改动）；
 本文件只做装配：svg 头 + 白底 + defs + 元素流。gen_L1.py 复用同一 build_l0()
-做「viewBox 裁切 + 区域外淡出 + Part 标题带」——同源强制（FIGURE-SYSTEM.md §0）。
+做「L0 minimap 高亮框 + Part 区域裁切放大 + Part 标题带」——同源强制（FIGURE-SYSTEM.md §0）。
 
 对标用户手绘参照（画布9.png）的信息密度：
   每个组件框 = 类名 + 2~4 个真实方法/契约行 + 规范源码路径；

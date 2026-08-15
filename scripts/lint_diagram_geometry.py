@@ -52,43 +52,61 @@ def path_points(d):
     return [(float(nums[i]), float(nums[i + 1])) for i in range(0, len(nums) - 1, 2)]
 
 
+# 坐标域标记：组内元素保留**变换前**的原始坐标（linter 不解 transform），
+# 只在 同 ctx（或都是 None=画布原生坐标）之间做碰撞/连通判定才有意义
+# （v3 L1 minimap 模式，exp-2026-08-15 落地：minimap 缩小全局 + detail 放大局部
+#  同文件并存，两组 x/y 同为 L0 原始坐标，跨组检查=全部误报）。
+CTX_MARKS = ('data-minimap', 'data-detail')
+
+
 def collect(root):
     texts, rects, arrows = [], [], []
-    for el in root.iter():
+    stack = [(root, None)]
+    while stack:
+        el, ctx = stack.pop()
         tag = el.tag.replace(NS, '')
+        if tag == 'g':
+            for m in CTX_MARKS:
+                if el.get(m):
+                    ctx = m[len('data-'):]
+                    break
         if tag == 'text':
             try:
                 x = float(el.get('x', 0)); y = float(el.get('y', 0))
             except ValueError:
-                continue
-            size = float(el.get('font-size', 14) or 14)
-            anchor = el.get('text-anchor', 'start')
-            s = ''.join(el.itertext()).strip()
-            if not s:
-                continue
-            w = text_w(s, size)
-            x0 = x - w / 2 if anchor == 'middle' else (x - w if anchor == 'end' else x)
-            texts.append({'s': s, 'x0': x0, 'x1': x0 + w, 'yt': y - 0.78 * size, 'yb': y + 0.20 * size})
+                x = y = None
+            if x is not None:
+                size = float(el.get('font-size', 14) or 14)
+                anchor = el.get('text-anchor', 'start')
+                s = ''.join(el.itertext()).strip()
+                if s:
+                    w = text_w(s, size)
+                    x0 = x - w / 2 if anchor == 'middle' else (x - w if anchor == 'end' else x)
+                    texts.append({'s': s, 'x0': x0, 'x1': x0 + w, 'yt': y - 0.78 * size,
+                                  'yb': y + 0.20 * size, 'ctx': ctx})
         elif tag == 'rect':
             try:
                 x = float(el.get('x', 0)); y = float(el.get('y', 0))
                 w = float(el.get('width', 0)); h = float(el.get('height', 0))
             except ValueError:
-                continue
-            if w > 0 and h > 0:
-                rects.append({'x0': x, 'y0': y, 'x1': x + w, 'y1': y + h, 'w': w, 'h': h})
+                x = None
+            if x is not None and w > 0 and h > 0:
+                rects.append({'x0': x, 'y0': y, 'x1': x + w, 'y1': y + h, 'w': w, 'h': h, 'ctx': ctx})
         elif tag == 'line':
             try:
                 p = ((float(el.get('x1', 0)), float(el.get('y1', 0))),
                      (float(el.get('x2', 0)), float(el.get('y2', 0))))
             except ValueError:
-                continue
-            arrows.append({'pts': p, 'all': list(p), 'marker': bool(el.get('marker-end') or el.get('marker-start'))})
+                p = None
+            if p is not None:
+                arrows.append({'pts': p, 'all': list(p), 'ctx': ctx,
+                               'marker': bool(el.get('marker-end') or el.get('marker-start'))})
         elif tag == 'path':
             pts = path_points(el.get('d', ''))
             if len(pts) >= 2:
-                arrows.append({'pts': (pts[0], pts[-1]), 'all': pts,
+                arrows.append({'pts': (pts[0], pts[-1]), 'all': pts, 'ctx': ctx,
                                'marker': bool(el.get('marker-end') or el.get('marker-start'))})
+        stack.extend((ch, ctx) for ch in el)
     return texts, rects, arrows
 
 
@@ -205,28 +223,36 @@ def check(path, strict=False):
     issues = []
     PAD = 2.0
     # v3 缩放层豁免（exp-2026-08-15，L1 落地）：根元素带 data-zoom 的图 = L0 的 viewBox
-    # 裁切放大层（gen_L1.py）。视口外**按设计**留有淡出上下文（<g opacity=0.15>）与
-    # 跨视口大框（进程带/总线），越界是被裁切层的常态而非事故——overflow/rect-overflow
-    # 对其无意义，跳过；text-text / text-rect / tag-on-title / 箭头连通检查照常全量生效
-    # （同一坐标系，碰撞即真碰撞）。普通图（含 L0 自身）不受影响。
+    # 裁切放大层（gen_L1.py）。组内（data-minimap/data-detail，见 CTX_MARKS）元素的
+    # x/y 是变换前原始坐标，越界是被裁切/缩放层的常态而非事故——overflow/rect-overflow
+    # 只对画布原生坐标（ctx=None，标题带/小标/外框）做；text-text / text-rect /
+    # tag-on-title / 箭头连通检查按 ctx 分域照常全量生效（组内坐标系自洽，碰撞即真碰撞，
+    # 每组各含完整 L0 元素流+白底，判定真值与 L0 自身一致）。普通图（含 L0 自身）不受影响。
     zoom_layer = bool(root.get('data-zoom'))
     # (1) overflow — 文字盒越出画布
     if not zoom_layer:
-        for t in texts:
-            if t['x1'] > vx + vw + PAD or t['x0'] < vx - PAD or t['yb'] > vy + vh + PAD or t['yt'] < vy - PAD:
-                over = round(max(t['x1'] - (vx + vw), vx - t['x0'], t['yb'] - (vy + vh), vy - t['yt']))
-                if over > 4:
-                    issues.append(f"overflow: 「{t['s'][:24]}」越出画布约 {over}px")
-        # (1b) rect-overflow — 框越出画布(被裁切)。文字居中时字不越界但框边被切, 故单独查。
-        for r in rects:
-            if r['x1'] > vx + vw + PAD or r['x0'] < vx - PAD or r['y1'] > vy + vh + PAD or r['y0'] < vy - PAD:
-                over = round(max(r['x1'] - (vx + vw), vx - r['x0'], r['y1'] - (vy + vh), vy - r['y0']))
-                if over > 4:
-                    issues.append(f"rect-overflow: 一个 {round(r['w'])}×{round(r['h'])} 框越出画布约 {over}px(被裁切)")
+        texts_ov = texts
+        rects_ov = rects
+    else:
+        texts_ov = [t for t in texts if t['ctx'] is None]
+        rects_ov = [r for r in rects if r['ctx'] is None]
+    for t in texts_ov:
+        if t['x1'] > vx + vw + PAD or t['x0'] < vx - PAD or t['yb'] > vy + vh + PAD or t['yt'] < vy - PAD:
+            over = round(max(t['x1'] - (vx + vw), vx - t['x0'], t['yb'] - (vy + vh), vy - t['yt']))
+            if over > 4:
+                issues.append(f"overflow: 「{t['s'][:24]}」越出画布约 {over}px")
+    # (1b) rect-overflow — 框越出画布(被裁切)。文字居中时字不越界但框边被切, 故单独查。
+    for r in rects_ov:
+        if r['x1'] > vx + vw + PAD or r['x0'] < vx - PAD or r['y1'] > vy + vh + PAD or r['y0'] < vy - PAD:
+            over = round(max(r['x1'] - (vx + vw), vx - r['x0'], r['y1'] - (vy + vh), vy - r['y0']))
+            if over > 4:
+                issues.append(f"rect-overflow: 一个 {round(r['w'])}×{round(r['h'])} 框越出画布约 {over}px(被裁切)")
     # (2) text-text
     for i in range(len(texts)):
         for j in range(i + 1, len(texts)):
             a, b = texts[i], texts[j]
+            if a['ctx'] != b['ctx']:
+                continue   # 跨坐标域（画布↔minimap↔detail）：坐标不同基，碰撞判定无意义
             ox = min(a['x1'], b['x1']) - max(a['x0'], b['x0'])
             oy = min(a['yb'], b['yb']) - max(a['yt'], b['yt'])
             if ox > 0 and oy > 0:
@@ -238,6 +264,8 @@ def check(path, strict=False):
     for t in texts:
         tw = t['x1'] - t['x0']; cx = (t['x0'] + t['x1']) / 2; cy = (t['yt'] + t['yb']) / 2
         for r in rects:
+            if r['ctx'] != t['ctx']:
+                continue   # 跨坐标域同上
             if r['w'] < 55 or r['h'] < 26:   # 跳过图例小色块
                 continue
             if r['x0'] <= cx <= r['x1'] and r['y0'] <= cy <= r['y1']:
@@ -253,7 +281,8 @@ def check(path, strict=False):
         if r['w'] < 55 or r['h'] < 26:
             continue
         inside = [t for t in texts
-                  if r['x0'] <= (t['x0'] + t['x1']) / 2 <= r['x1']
+                  if t['ctx'] == r['ctx']
+                  and r['x0'] <= (t['x0'] + t['x1']) / 2 <= r['x1']
                   and r['y0'] <= (t['yt'] + t['yb']) / 2 <= r['y1']]
         flagged = False
         for i in range(len(inside)):
@@ -267,17 +296,18 @@ def check(path, strict=False):
                     break
             if flagged:
                 break
-    # (4) arrow-loose: 带 marker 的连线端点悬空
-    all_ep = [p for a in arrows for p in a['pts']]
+    # (4) arrow-loose: 带 marker 的连线端点悬空（全部按 ctx 分域：箭头只对同域框/端点判连通）
     for a in arrows:
         if not a['marker']:
             continue
+        crects = [r for r in rects if r['ctx'] == a['ctx']]
+        ceps = [q for b in arrows if b['ctx'] == a['ctx'] for q in b['pts']]
         (p1, p2) = a['pts']
         if math.hypot(p1[0] - p2[0], p1[1] - p2[1]) < 6:
             continue
         for end, label in ((p1, '起点'), (p2, '末端')):
-            others = [q for q in all_ep if q is not end]
-            if not near_rect_edge(end, rects, ARROW_TOL) and not near_point(end, others, ARROW_TOL):
+            others = [q for q in ceps if q is not end]
+            if not near_rect_edge(end, crects, ARROW_TOL) and not near_point(end, others, ARROW_TOL):
                 issues.append(f"arrow-loose: 一条箭头{label}({round(end[0])},{round(end[1])})悬空, 未接到任何框边/端点")
         # (4b) arrow-inside: 端点戳进叶子框内部深处、没落在边上（L0 盲区 exp-2026-08-15：
         # near_rect_edge 的 inside 分支把"戳进框里"也判连接, 断箭头全部漏检）。
@@ -285,20 +315,20 @@ def check(path, strict=False):
         # 仅 strict 模式（v3 贴边画法）；v2 历史图的「扎进框内」画法合法。
         if strict:
             for end, label in ((p1, '起点'), (p2, '末端')):
-                d, hr = inside_depth(end, rects, vw or 1, vh or 1)
-                if d > 10 and not on_rect_edge(end, rects, EDGE_TOL):
+                d, hr = inside_depth(end, crects, vw or 1, vh or 1)
+                if d > 10 and not on_rect_edge(end, crects, EDGE_TOL):
                     issues.append(f"arrow-inside: 一条箭头{label}({round(end[0])},{round(end[1])})戳进框内部 {round(d)}px, 未落在框边上")
             # (4c) arrow-crossed: 线段中段穿越无关框 = 被截断（容器豁免: 含端点的框不算;
             # 装着其他框的容器也不算）。折线箭头按**逐段**检查——首末拉直会对
             # 肘形总线误报（exp-2026-08-15 L0 回程总线被对角线误判穿 Executor 框）。
-            ep_rects = endpoint_rects(p1, rects, ARROW_TOL) + endpoint_rects(p2, rects, ARROW_TOL)
+            ep_rects = endpoint_rects(p1, crects, ARROW_TOL) + endpoint_rects(p2, crects, ARROW_TOL)
             segs = list(zip(a['all'], a['all'][1:]))
-            for r in rects:
+            for r in crects:
                 if r in ep_rects:
                     continue
                 if r['w'] < 40 or r['h'] < 18:
                     continue  # 图例色块/小徽标不拦线
-                if is_container(r, rects):
+                if is_container(r, crects):
                     continue  # 容器（进程带/泳道/循环框）不截断线
                 if any(seg_cross_rect(s1, s2, r) for s1, s2 in segs):
                     issues.append(f"arrow-crossed: 一条箭头({round(p1[0])},{round(p1[1])})→({round(p2[0])},{round(p2[1])})中途穿过一个 {round(r['w'])}×{round(r['h'])} 框(被截断)")
