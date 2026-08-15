@@ -110,7 +110,62 @@ def near_point(pt, others, tol):
     return False
 
 
-def check(path):
+def inside_depth(pt, rects, vb_w=1e9, vb_h=1e9):
+    """端点戳进某框**内部深处**的深度（距最近边的距离）与该框。
+
+    容器豁免：面积超过画布 30% 的大框（进程框/泳道容器）不算——线在容器内部
+    连接两个子组件是合法的,端点自然在容器深处。只对**叶子级框**（组件框）
+    报"戳进内部"。"""
+    x, y = pt
+    worst, worst_r = 0.0, None
+    for r in rects:
+        if r['w'] * r['h'] > 0.30 * vb_w * vb_h:
+            continue
+        if r['x0'] < x < r['x1'] and r['y0'] < y < r['y1']:
+            d = min(x - r['x0'], r['x1'] - x, y - r['y0'], r['y1'] - y)
+            if d > worst:
+                worst, worst_r = d, r
+    return worst, worst_r
+
+
+def seg_cross_rect(p1, p2, r, core_only=True):
+    """线段是否穿越框内部（采样法）。
+
+    容器豁免：core_only=True 时忽略线段两端各 12% 的贴端段——箭头端点落在
+    目标框边上（合法连接）时,采样点刚进框边的部分不算穿越;只有线段**中段**
+    深入框内才算被截断。"""
+    (x0, y0, x1, y1) = r['x0'], r['y0'], r['x1'], r['y1']
+    n = 50
+    lo, hi = (0.12, 0.88) if core_only else (0.0, 1.0)
+    inside = 0
+    for i in range(n + 1):
+        t = i / n
+        if t < lo or t > hi:
+            continue
+        x = p1[0] + (p2[0] - p1[0]) * t
+        y = p1[1] + (p2[1] - p1[1]) * t
+        if x0 + 3 < x < x1 - 3 and y0 + 3 < y < y1 - 3:
+            inside += 1
+    return inside >= 3
+
+
+def endpoint_rects(pt, rects, tol):
+    """端点所贴/所在的框（连接目标候选）。"""
+    x, y = pt
+    out = []
+    for r in rects:
+        if r['x0'] - tol <= x <= r['x1'] + tol and r['y0'] - tol <= y <= r['y1'] + tol:
+            out.append(r)
+    return out
+
+
+def check(path, strict=False):
+    """strict=True 启用 arrow-inside / arrow-crossed（v3 图系贴边画法强制）。
+
+    画法分歧（exp-2026-08-15，L0 断箭头事故）：v2 chapter-map 等历史图的既定画法是
+    「箭头扎进目标框内部」——视觉上是连着的，按 strict 检测全是误报（实测 882 处）；
+    v3 图系（L0/L1/L2）设计画法是「端点贴框边」——没贴到边=断线。故分模式：
+    book/cartography/ 下的图自动 strict，artifacts/ 历史图默认宽松。"""
     try:
         root = ET.parse(path).getroot()
     except ET.ParseError as e:
@@ -187,6 +242,25 @@ def check(path):
             others = [q for q in all_ep if q is not end]
             if not near_rect_edge(end, rects, ARROW_TOL) and not near_point(end, others, ARROW_TOL):
                 issues.append(f"arrow-loose: 一条箭头{label}({round(end[0])},{round(end[1])})悬空, 未接到任何框边/端点")
+        # (4b) arrow-inside: 端点戳进叶子框内部深处、没落在边上（L0 盲区 exp-2026-08-15：
+        # near_rect_edge 的 inside 分支把"戳进框里"也判连接, 断箭头全部漏检）。
+        # 容器豁免见 inside_depth——大框(进程/泳道)内的端点不在此列。
+        # 仅 strict 模式（v3 贴边画法）；v2 历史图的「扎进框内」画法合法。
+        if strict:
+            for end, label in ((p1, '起点'), (p2, '末端')):
+                d, hr = inside_depth(end, rects, vw or 1, vh or 1)
+                if d > 10:
+                    issues.append(f"arrow-inside: 一条箭头{label}({round(end[0])},{round(end[1])})戳进框内部 {round(d)}px, 未落在框边上")
+            # (4c) arrow-crossed: 线段中段穿越无关框 = 被截断（容器豁免: 含端点的框不算）。
+            ep_rects = endpoint_rects(p1, rects, ARROW_TOL) + endpoint_rects(p2, rects, ARROW_TOL)
+            for r in rects:
+                if r in ep_rects:
+                    continue
+                if r['w'] < 40 or r['h'] < 18:
+                    continue  # 图例色块/小徽标不拦线
+                if seg_cross_rect(p1, p2, r):
+                    issues.append(f"arrow-crossed: 一条箭头({round(p1[0])},{round(p1[1])})→({round(p2[0])},{round(p2[1])})中途穿过一个 {round(r['w'])}×{round(r['h'])} 框(被截断)")
+                    break
     seen = set(); out = []
     for it in issues:
         if it not in seen:
@@ -200,7 +274,8 @@ def main():
         if (args == ['--all'] or not args) else args
     total = 0; perch = {}
     for f in files:
-        iss = check(f)
+        strict = ('book/cartography' in f.replace('\\', '/')) or ('--strict-arrows' in args)
+        iss = check(f, strict=strict)
         if iss:
             ch = f.split('/')[-3] if '/artifacts/' in f else f
             perch.setdefault(ch, []).append((f.split('/')[-1], iss)); total += len(iss)
