@@ -111,7 +111,7 @@ const cards = await parallel(DOMAINS.map((d) => () =>
     '3. data_flow：file:line 级的一个请求数据流。\n' +
     '4. first_read_suggestion：站在「不懂 AI 的后端工程师」读者视角，本域概念最早何时引入合适、依赖什么前置。\n\n' +
     '**纪律**：每条断言带源码锚点（file:line）；读不懂的就标 BLOCKED 别编；**特别警惕 v2 叙事的惯性**——你是在重新理解，不是在复述 v2 的讲法。\n' +
-    '参考素材（可用可挑战）：v2 各章 dossier（' + ART + '/ch*/dossier/dossier.json）里的机制与行号——dossier 的源码事实可信，但它**没有 why 链**，why 链要你自己从源码+设计文档+commit history 里挖。\n' +
+    '参考素材（可用可挑战）：旧 pin 深读卡（' + ART + '/../book/cartography/deepread-v021/）与 v2 各章 dossier（' + ART + '/ch*/dossier/dossier.json，行号属 v0.21.0 仅作历史线索）里的机制与行号——dossier 的源码事实可信，但它**没有 why 链**，why 链要你自己从源码+设计文档+commit history 里挖。\n' +
     '深读产物写到 ' + ART + '/../book/cartography/deepread/' + d.id + '.json（目录不存在则建）。',
     { schema: S_CARD, label: 'deepread:' + d.id, phase: 'DeepRead', agentType: 'analyst' }
   )
