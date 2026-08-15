@@ -19,22 +19,50 @@
 | L1 | 8 | Part 区域放大 + hook 标题带 + 本 Part 章目录 + 左侧 L0 minimap 高亮框（2026-08-15 用户裁决：IDE 概览图模式取代区域外淡出） | 每 Part 首章开篇 |
 | L2 | 40 | 章图：本章块的组件 + **方法级展开** + 本章站号 | 每章开篇（正文前） |
 
-## 2. L2 章图契约（渲染器 gen_L2.py，随章 dossier 滚动产出）
+## 2. L2 章图契约（渲染器 gen_L2.py + L2-spec 数据契约，随章 dossier 滚动产出）
 
 **数据源（与 v2 的关键区别）**：
 - 组件/方法清单吃 **deepread 卡 + 本章 dossier**（curated，深读过）——**不走 v2 的 arch-model.json 自动抽取**（v2 归属 bug 修了三轮的教训：自动抽取的「多数票/兜底」必然出错）。
 - 站号吃本章 dossier 的 code_spine（每站 file:line）。
 - L0 缩放路径吃 pedagogy-plan.json 的 `l0_zoom` 字段。
 
-**版式**：
-- 画布 1600×1200 一带（章图可比 L0 局部更宽——站号与方法名需要空间）。
-- 顶部窄条：`ch{N} {标题}` + hook 一句 + 「L0 位置：{l0_zoom}」。
-- 主体：本章组件框（风格/配色沿 l0_common），框内方法签名（真实名，file:line 在 dossier 核验）。
-- 站号徽标：`第 N 站` 挂在对应组件上（请求流经顺序）。
-- 底部：读图一行 + 前置依赖章链接（pedagogy-plan 的 depends_on）。
-- primer 章（4 张）：无站号（原理章无源码走线），主体改为推导链图（顿悟图头图风格沿 v2 ch21 样板）。
+**L2-spec/1 数据契约（定型 2026-08-15，样板 = `l2-specs/ch9.json`）**——gen_L2.py 的唯一输入，
+Phase 3 起每章 dossier 顺产一份，渲染器零改代码出图：
 
-**验收链**：渲染 → Read PNG 亲眼看自查（六项）→ strict 几何门禁 → 独立盲审（插画者≠审图者）→ manifest 登记。
+```
+chapter / part / title / hook / l0_zoom / depends_on / reading     # 单值字段（hook·l0_zoom·depends_on 直拷 pedagogy-plan）
+l0_region     {anchors: [名]} 或 {rects: [[x0,y0,x1,y1],…]}        # minimap 高亮区域
+              # 锚名词表（GEO 派生，L0 改版自动联动）：
+              #   full / api_band / zmq_band / engine_band / loop_box
+              #   / kv_column / gpu_column / sample_column
+frame         {title, file}          # 本章舞台外框（进程/系统边界，橙系进程框风格）
+center        {name, title, where}   # 核心机制区外框（可选；其 zone=center 组件按序成拍片+回环）
+components    [{name, role, zone, kind, file, methods[], stations[], note[]}]
+              # zone ∈ north|center|south   north=请求进出条（左→右）· center=主角拍片 · south=支撑/why 注
+              # role ∈ engine|gpu|kv|api|zmq|sample|io|plain|beat —— 只映射 l0_common 配色常量（同源强制，spec 不带色值）
+              # kind ∈ comp|queue|note
+              # note = 挂在该组件旁的 why 小注（虚线框）
+flows         [{from, to, label, up, dash, color_role}]   # from/to 填组件名 / frame / center.name；同行横向、跨行纵向自动锚边
+loop          {label}                # center 末拍片 → 首拍片 回环（可选）
+stations      [{n, where, what}]     # 本章站号账本（左下「站号轨道」逐行渲染）
+```
+
+渲染器内置校验（渲染前置闸）：zone/role/kind 合法、flows 引用可解析、**站号徽标 ⊆ 账本且账本每站有挂点**。
+
+**版式**（画布 2200 = L0/L1 家族宽；detail 可比 L0 局部更宽——站号与方法名需要空间）：
+- 顶部窄条（96px）：`ch{N} · {标题}` + hook 一句 + 右上「L2 · L0 位置：{l0_zoom}」。
+- 左栏：minimap（L0 全图 ×0.2，高亮框=本章 L0 区域，框外 opacity 0.45 退后——沿 L1 IDE 概览图模式）
+  + 其下「站号轨道」（第 N 站徽标 + where · what 逐行）。
+- 右区 detail **不裁切 L0**（L0 无方法级/站号级密度）——用 l0_common 原语/配色**新画**：
+  frame 外框 → north 行 → center 拍片行（框内方法签名+file:line+站号徽标，拍间箭头、标签下沉说明行、回环）
+  → south 行；flows 全部端点贴框边（strict 几何门禁）。
+- 底部：读图一行 + 前置依赖章（pedagogy-plan depends_on）+ 本章埋/收伏笔（pedagogy-plan foreshadows 自动带出）。
+- primer 章（4 张）：无站号（原理章无源码走线），主体改为推导链图（顿悟图头图风格沿 v2 ch21 样板）——
+  此类 spec 走独立 kind，Phase 3 到 primer 章时再定。
+
+**验收链**：渲染 → Read PNG 亲眼看自查（六项：越界/相撞/压框/箭头悬空/同源/断言溯源）→ strict 几何门禁
+（cartography 路径自动 strict；minimap/detail 组各带 data-minimap/data-detail ctx 标记，沿 gen_L1 模式）
+→ 独立盲审（插画者≠审图者）→ manifest 登记。
 
 ## 3. 正文插图规则（writer 契约用）
 

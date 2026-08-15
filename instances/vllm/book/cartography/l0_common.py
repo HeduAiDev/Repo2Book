@@ -23,6 +23,12 @@ C_GPU_S, C_GPU_F = '#16a34a', '#f0fdf4'      # GPU 执行臂 = 绿
 C_KV_S, C_KV_F = '#0891b2', '#ecfeff'        # 显存账本 = 青
 C_SAM_S, C_SAM_F = '#be185d', '#fdf2f8'      # 采样出口 = 品红
 C_ABORT = '#dc2626'                          # abort = 红虚线
+C_BEAT_S, C_BEAT_F, C_BEAT_T = '#fdba74', '#fff7ed', '#9a3412'   # 循环拍片（L0 五拍 chips / L2 beat 拍片）
+C_BADGE_F = '#ffedd5'                        # 拍号/站号徽标底色（comp 徽标 + 图例）
+
+# Part 主题色（L1 标题带 / L2 章图带 / minimap 高亮框共用；gen_L1 曾持本地副本，收拢至此）
+PART_COLOR = {'I': C_TXT, 'II': C_API_S, 'III': C_ENG_S, 'IV': C_KV_S,
+              'V': C_GPU_S, 'VI': C_GPU_S, 'VII': C_SAM_S, 'VIII': C_TXT}
 
 W = 2200
 
@@ -121,7 +127,7 @@ def comp(x, y, w, title, lines, file, stroke, fill='#ffffff', badge='', lh=17, t
     text(tx, y + 22, title, tfs, C_TXT, 'start', True, maxw=w - 28 - (46 if badge else 0), tag=title)
     if badge:
         bw = 16 + 11 * len(badge)
-        rect(x + w - bw - 8, y + 6, bw, 20, '#ffedd5', C_ENG_S, rx=9, sw=1.1)
+        rect(x + w - bw - 8, y + 6, bw, 20, C_BADGE_F, C_ENG_S, rx=9, sw=1.1)
         text(x + w - bw / 2 - 8, y + 20, badge, 9.5, C_ENG_S, 'middle', True)
     for i, ln in enumerate(lines):
         text(tx, y + 40 + i * lh, ln, lfs, '#334155', 'start', maxw=w - 26, tag=title + ':' + ln[:12])
@@ -372,8 +378,8 @@ def build_l0():
     for i, (t, s1, s2) in enumerate(chips):
         cx0 = LOOP_X + 10 + i * (CHIP_W + CHIP_GAP)
         chip_cx.append(cx0 + CHIP_W / 2)
-        rect(cx0, LOOP_Y + 34, CHIP_W, CHIP_H, '#fff7ed', '#fdba74', rx=6, sw=1.2)
-        text(cx0 + CHIP_W / 2, LOOP_Y + 51, t, 9, '#9a3412', 'middle', True, maxw=CHIP_W - 8, tag='chip:' + t)
+        rect(cx0, LOOP_Y + 34, CHIP_W, CHIP_H, C_BEAT_F, C_BEAT_S, rx=6, sw=1.2)
+        text(cx0 + CHIP_W / 2, LOOP_Y + 51, t, 9, C_BEAT_T, 'middle', True, maxw=CHIP_W - 8, tag='chip:' + t)
         text(cx0 + CHIP_W / 2, LOOP_Y + 69, s1, 9, '#334155', 'middle', maxw=CHIP_W - 8, tag='chip:' + s1)
         text(cx0 + CHIP_W / 2, LOOP_Y + 87, s2, 9, C_MUTE, 'middle', maxw=CHIP_W - 8, tag='chip:' + s2)
         if i < 4:
@@ -543,7 +549,7 @@ def build_l0():
     seg(lx0 + 4, ly - 3, lx0 + 34, ly - 3, C_ABORT, 1.6, 'ab', dash=True)
     text(lx0 + 40, ly + 1, 'abort', 9.5, C_TXT, 'start')
     lx0 += 40 + tw('abort', 9.5) + 18
-    rect(lx0 + 4, ly - 11, 22, 15, '#ffedd5', C_ENG_S, rx=7, sw=1.1)
+    rect(lx0 + 4, ly - 11, 22, 15, C_BADGE_F, C_ENG_S, rx=7, sw=1.1)
     text(lx0 + 15, ly + 1, '①', 9, C_ENG_S, 'middle', True)
     text(lx0 + 32, ly + 1, '= EngineCore.step() 第几拍', 9.5, C_TXT, 'start')
     lx0 += 32 + tw('= EngineCore.step() 第几拍', 9.5) + 18
