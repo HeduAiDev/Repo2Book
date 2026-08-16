@@ -22,6 +22,9 @@
   `book/cartography/outline-v3-draft.md`（**38 章 8 Part、4 primer 混合制**，用户多轮裁决已吸收：
   容量修正/KV 池化/DSpark/IndexCache/先原理后代码）。
 - 模型分工（CLAUDE.md #7）：**只有画图/读图用 fable5，其余一律主模型**。
+- ⚠️ **本 Windows 宿主 `python3` 是 WindowsApps 坏桩**（静默 exit 49、零输出）——一切 `scripts/` 命令
+  （linter/生成器）**必须用 `python`**（Miniconda）+ `PYTHONIOENCODING=utf-8` 跑；按文档写 python3 跑会
+  得到「看似跑了实则什么都没做」的假阴性（ch4 评审 exp）。
 > 中文、高级读者，解读 vLLM v1 推理引擎；异步三段式解耦为旗舰。
 
 > **2026-06-21 重大转向**：旧的"从零简化重写 + 理论推导"产出太抽象、脱离代码，**全部废弃**。新书 = **直接解读真实 vLLM v1 源码**，按真实模块组织。旧 agent 提示词/经验仅作批判参考。
@@ -32,6 +35,7 @@
 - `f3fef123`（v0.20.1 线、v0.21.0 前 245 提交）= 升级前基线，仅作历史 diff（remapper 据此工作，可复用于未来升级）。少数被 v0.21.0 删除的代码示例（如 RMSNorm `forward_static`）显式标注为 `(基线 f3fef123)`。
 
 ## 实例专属硬规则
+- **本 Windows 宿主上 `python3` 是 WindowsApps 坏桩**（`python3 -c "print(1)"` 静默 exit 49、零输出；2026-08-16 实证）——CLAUDE.md/RUNBOOK 里的 `python3 scripts/lint_*.py` 在本机照抄会得到零输出的假阴性。一切 `scripts/` 命令用 `python`（Miniconda，`D:\Env\Miniconda\python.exe`）跑。
 - **vLLM 相关代码调试一律进 Docker 容器**（host 无 CUDA/vLLM）：`scripts/vllm_docker.sh ...`，镜像 `vllm/vllm-openai:latest`。容器内 vLLM 版本可能与 v0.21.0 有行号差，仅用于观察行为。
   - **跑测试用 `repo2book/vllm-test:latest`**（= vllm-openai + pytest + pytest-asyncio，见 `scripts/vllm-test.Dockerfile`）：
     官方镜像不带 pytest，`vllm_docker.sh` 又是 `docker run --rm`，故固化成薄镜像。用法
