@@ -202,7 +202,7 @@ def _cite_dedent(lines):
 
 def _cite_source_root(chapter_dir: Path):
     for q in Path(chapter_dir).resolve().parents:
-        if q.name == "artifacts":
+        if q.name.startswith("artifacts"):
             return q.parent / "source"
     return None
 

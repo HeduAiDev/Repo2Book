@@ -28,7 +28,7 @@ NOTE_LINE = re.compile(r'^\s*(?:#|//)\s*(?:…|\.{3})?\s*(?:省略|SOURCE:|PAPER
 
 def _source_root(chapter_dir: Path):
     for p in chapter_dir.resolve().parents:
-        if p.name == "artifacts":
+        if p.name.startswith("artifacts"):
             return p.parent / "source"
     return None
 
@@ -238,7 +238,7 @@ def lint_dossier(chapter_dir: str) -> dict:
         pr = m.get("prereq")
         if pr:
             arts = d.resolve()
-            arts = next((p for p in arts.parents if p.name == "artifacts"), None)
+            arts = next((p for p in arts.parents if p.name.startswith("artifacts")), None)
             if arts is None or not list(arts.glob(pr + "-*")):
                 res["warn"].append(f"  {mid}: prereq={pr} 对应章目录尚不存在(原理章未建则属正常)")
         for a in m.get("source_anchors") or []:
