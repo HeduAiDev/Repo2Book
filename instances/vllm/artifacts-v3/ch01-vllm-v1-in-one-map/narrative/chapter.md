@@ -12,7 +12,7 @@
 
 ![L0 全局架构图：三段式进程解耦全景](../diagrams/L0-architecture.png)
 
-> *图注：这张图叫 **L0**，是全书唯一权威架构图，本章是它的首次亮相——之后每一章开篇都会回到它，把本章要打开的那一块放大。图上从上到下三条横向进程带：**API 进程**（前端，零 GPU）、紫色 **ZMQ 消息边界**、**EngineCore 进程**（引擎内核，GPU 在这里）；带 ① 到 ⑤ 的圆圈是引擎一拍内的五步编号（图例明示「① = EngineCore.step() 第几拍」）——① schedule → ② execute → ④ sample → ⑤ update 是时序主干，③ 语法位掩码塞在 ② 的 GPU 执行窗口里并行、不占时序位，图数五拍、时序位四段（「心跳」一节对这笔账）；一个请求的一生看整图自上而下的走向，图底「读图」行就是走法。每块上的虚线标注「第几 Part 打开」是本书的行程表——本章把每块只开一条门缝：指认骨架在哪、形状是什么，不做逐行精读，深挖全部留给后续 Part。图上没有站号：站号账本（请求流经代码的逐站顺序）从下一章起建立，拍号不是站号。*
+> *图注：这张图叫 **L0**，是全书唯一权威架构图，本章第一次用到它——之后每一章开篇都会回到它，把本章要打开的那一块放大。图上从上到下三条横向进程带：**API 进程**（前端，零 GPU）、紫色 **ZMQ 消息边界**、**EngineCore 进程**（引擎内核，GPU 在这里）；带 ① 到 ⑤ 的圆圈是引擎一拍内的五步编号（图例明示「① = EngineCore.step() 第几拍」）——① schedule → ② execute → ④ sample → ⑤ update 是时序主干，③ 语法位掩码塞在 ② 的 GPU 执行窗口里并行、不占时序位，图数五拍、时序位四段（「心跳」一节对这笔账）；一个请求的一生看整图自上而下的走向，图底「读图」行就是走法。每块上的虚线标注「第几 Part 打开」是本书的行程表——本章把每块只开一条门缝：指认骨架在哪、形状是什么，不做逐行精读，深挖全部留给后续 Part。图上没有站号：站号账本（请求流经代码的逐站顺序）从下一章起建立，拍号不是站号。*
 
 Part I 一共三站，都站在这张图的不同视角上：
 
@@ -30,13 +30,13 @@ Part I 一共三站，都站在这张图的不同视角上：
 
 ## 图上最粗的三条线：三段式解耦
 
-现在把镜头拉回 L0 图顶端。一个 chat 请求从 `POST /v1/chat/completions` 进门（`vllm/entrypoints/openai/chat_completion/api_router.py:L51` 起），第一站落在 API 进程的双泳道上：**Renderer** 负责把 HTTP 里的 JSON 变成 token——聊天模板展开（把多轮对话按模型约定的格式拼成一段输入文本）、分词（tokenize，文本变 token id）、多模态预处理（图片等非文本输入的预处理）全在这里；**InputProcessor** 接过 token 做校验和参数整理，产出跨进程请求。回程相反：**OutputProcessor** 把引擎吐回的 token id 增量地变回文字（detokenize），**RequestOutputCollector**——每请求一个的单槽「信箱」——攒着增量等流式接口来取，最后由 SSE（Server-Sent Events，HTTP 长连接上逐段推送的流式协议）送给用户。
+现在回到 L0 图顶端。一个 chat 请求从 `POST /v1/chat/completions` 进门（`vllm/entrypoints/openai/chat_completion/api_router.py:L51` 起），第一站落在 API 进程的双泳道上：**Renderer** 负责把 HTTP 里的 JSON 变成 token——聊天模板展开（把多轮对话按模型约定的格式拼成一段输入文本）、分词（tokenize，文本变 token id）、多模态预处理（图片等非文本输入的预处理）全在这里；**InputProcessor** 接过 token 做校验和参数整理，产出跨进程请求。回程相反：**OutputProcessor** 把引擎吐回的 token id 增量地变回文字（detokenize），**RequestOutputCollector**——每请求一个的单槽「信箱」——攒着增量等流式接口来取，最后由 SSE（Server-Sent Events，HTTP 长连接上逐段推送的流式协议）送给用户。
 
 中间那条紫带是两组进程之间唯一的通道。它背后是一个叫 **ZMQ**（ZeroMQ）的库——一个不需要独立 broker（常驻的消息代理进程，如 RabbitMQ 那类）的轻量消息库，两端像用 socket 一样直接互发消息，收发时还会释放 GIL（全局解释器锁——这个性质马上会变得很重要，下一节专门讲；[ZeroMQ 官方指南](https://zguide.zeromq.org/docs/chapter2/)）。下行一条通道送请求、上行一条通道送输出，跨界消息在发送前要打包成字节流——线格式与拓扑的细节是 Part II 的主场，本章只要知道「这条带上跑的是打包好的消息，不是活的 Python 对象」。
 
 下带是 **EngineCore 进程**——引擎内核。它独占 GPU：图左下的调度账本列（Scheduler 与 KV cache 账本——KV cache 是注意力机制为每个已算 token 保存的键值缓存、推理显存的大头，Part IV 打开）、中间的逐拍循环框（引擎的心跳，五拍转一圈）、右下的 GPU 执行臂、模型层、采样出口，全部住在这一个进程带里。它们每一块都会在后面的 Part 里被逐个拆开。
 
-这就是 v1 的地基，本书称之为 **三段式解耦**：API 前端进程 / ZMQ 消息边界 / EngineCore 引擎进程。把「解耦」数出来最直观：`tp=4`（张量并行，把模型切片摊到 4 张卡上）单机是 **6 个进程**——1 个 API server + 1 个 EngineCore + 4 个 GPU worker，每个 worker 也是独立进程（官方架构文档的算例，说明性）；单卡部署按源码数是 **2 个进程**——1 个 API server + 1 个 EngineCore：TP=1 时执行臂的 worker 就住在 EngineCore 进程内（`UniProcExecutor` 直接在本进程构造 worker，`vllm/v1/executor/uniproc_executor.py:L45-L48`），官方文档「每 GPU 一个 worker 进程」的通式没有特判这一点、照它数单卡会数出 3。顺带钉死一个口径：L0 图按单卡画；`tp>1` 才把 worker 派生成独立子进程，就是算例里多出来的那 4 个。GPU 上下文（GPU 在一个进程里的运行时状态——有了它，这个进程才摸得到显卡）与 KV cache 显存只存在于引擎一侧，API 进程里连一把「螺丝刀」都没有。
+这就是 v1 的地基，本书称之为 **三段式解耦**：API 前端进程 / ZMQ 消息边界 / EngineCore 引擎进程。把「解耦」数出来最直观：`tp=4`（张量并行，把模型切片摊到 4 张卡上）单机是 **6 个进程**——1 个 API server + 1 个 EngineCore + 4 个 GPU worker，每个 worker 也是独立进程（官方架构文档的算例，说明性）；单卡部署按源码数是 **2 个进程**——1 个 API server + 1 个 EngineCore：TP=1 时执行臂的 worker 就住在 EngineCore 进程内（`UniProcExecutor` 直接在本进程构造 worker，`vllm/v1/executor/uniproc_executor.py:L45-L48`），官方文档「每 GPU 一个 worker 进程」的通式没有特判这一点、照它数单卡会数出 3。顺带钉死一个口径：L0 图按单卡画；`tp>1` 才把 worker 派生成独立子进程，就是算例里多出来的那 4 个。GPU 上下文（GPU 在一个进程里的运行时状态——有了它，这个进程才摸得到显卡）与 KV cache 显存只存在于引擎一侧，API 进程里两样都没有。
 
 这么拆的代价同样真实：每请求生命周期**至少 2 次跨进程消息**——进 1 条请求、出每步 1 批输出——两侧各付一次序列化 CPU 税。这正是「俩字凭啥跑两趟跨进程快递」的答案的一半；另一半，要看 v1 是被什么逼出来的。
 
@@ -44,7 +44,7 @@ Part I 一共三站，都站在这张图的不同视角上：
 
 每个设计都是被痛点逼出来的，三段式解耦也不例外。先看旧设计。
 
-**v0 是单进程的。** 早期 vLLM 里，从 tokenize、调度、GPU 执行到 detokenize，全在一个 Python 进程里；「异步」只是 asyncio 事件循环上的一层包装，不是并行。彼时有两台平行的引擎类——同步的 `LLMEngine` 和异步的 `AsyncLLMEngine`，后者是把前者子类化再包一层：
+**v0 是单进程的。** 早期 vLLM 里，从 tokenize、调度、GPU 执行到 detokenize，全在一个 Python 进程里；「异步」只是 asyncio 事件循环上的一层包装，不是并行。彼时有两个平行的引擎类——同步的 `LLMEngine` 和异步的 `AsyncLLMEngine`，后者是把前者子类化再包一层：
 
 ```python
 # 外部历史版本：v0.8.5 tag 的 vllm/engine/async_llm_engine.py（说明性骨架，非本书 pin 源码）
@@ -71,7 +71,7 @@ class AsyncLLMEngine(EngineClient):
 
 v0 的困境正是第 2 层的反面教材：API server 的 HTTP/SSE、tokenize、detokenize、引擎调度循环，全是同进程的 Python 活，共用一把 GIL；GPU 快到 5ms 一拍时，任何一段 CPU 活都在跟 GPU 心跳抢这把锁。顺带一句现状（外部链接：[PEP 703](https://peps.python.org/pep-0703/)、[PEP 779](https://peps.python.org/pep-0779/)；PEP 即 Python 官方的演进提案文档）：free-threaded（去 GIL 构建）的 Python 已在 3.14 进入「官方支持但独立构建」阶段——vLLM 没等它，选了拆进程。
 
-v1 源码里有一段注释，恰好是「线程够不够用」这条判断线的活证据——引擎进程内部，ZMQ 收发被放进两个守护线程：
+v1 源码里有一段注释，恰好是「线程够不够用」这条判断线的现成证据——引擎进程内部，ZMQ 收发被放进两个守护线程：
 
 ```python
 # vllm/v1/engine/core.py:L1092-L1096
@@ -119,9 +119,9 @@ self.engine_core = EngineCoreClient.make_async_mp_client(
 
 ## 三件套：两个使用面，一套结构，两种驱动
 
-回到 L0 图顶端。API 进程带的标题行同时点名两个使用面——OpenAI server / `LLM`（离线）/ `AsyncLLM`（在线）；带的左右两条泳道分的是下行与上行（右边 Renderer、InputProcessor 送请求出去，左边 RequestOutputCollector、OutputProcessor 收结果回来），不是离线与在线。vLLM 的产品形态就这两半——离线批处理跑吞吐，在线服务要低延迟。它们共享的那套前端结构，本书简称 **三件套**：**Renderer+InputProcessor（下行）/ EngineCore（引擎）/ OutputProcessor（上行）**——注意这是本书的自造简称，对应 L0 图上 API 进程里的组件块加引擎本体——上行那条单槽信箱 `RequestOutputCollector` 是 `OutputProcessor` 的收件搭档，图上虽然单独画成一块，但不算独立的第四件——数「三件」时它跟着 `OutputProcessor` 一起算；官方文档按职责描述、并无这个词。
+回到 L0 图顶端。API 进程带的标题行同时列出两个使用面——OpenAI server / `LLM`（离线）/ `AsyncLLM`（在线）；带的左右两条泳道分的是下行与上行（右边 Renderer、InputProcessor 送请求出去，左边 RequestOutputCollector、OutputProcessor 收结果回来），不是离线与在线。vLLM 的产品形态就这两半——离线批处理跑吞吐，在线服务要低延迟。它们共享的那套前端结构，本书简称 **三件套**：**Renderer+InputProcessor（下行）/ EngineCore（引擎）/ OutputProcessor（上行）**——注意这是本书的自造简称，对应 L0 图上 API 进程里的组件块加引擎本体——上行那条单槽信箱 `RequestOutputCollector` 是 `OutputProcessor` 的收件搭档，图上虽然单独画成一块，但不算独立的第四件——数「三件」时它跟着 `OutputProcessor` 一起算；官方文档按职责描述、并无这个词。
 
-v0 时代这两半是两台引擎（上一节骨架里的同步/异步双类谱系），输出处理逻辑两处维护，行为漂移就是「离线与在线结果不一致」的 bug 面。v1 收敛成一套结构，证据可以并排读——离线面 `LLMEngine` 的构造：
+v0 时代这两半是两个引擎类（上一节骨架里的同步/异步双类），输出处理逻辑两处维护，行为漂移就是「离线与在线结果不一致」的 bug 面。v1 收敛成一套结构，证据可以并排读——离线面 `LLMEngine` 的构造：
 
 ```python
 # vllm/v1/engine/llm_engine.py:L91-L111
@@ -178,9 +178,9 @@ def make_client(
     return InprocClient(vllm_config, executor_class, log_stats)
 ```
 
-两轴四格，三格有主：同步多进程给离线面、异步多进程给在线面、同进程兜底留作逃生舱（`InprocClient`，`vllm/v1/engine/core_client.py:L306`，后面还会提到它）；第四格「同进程 × 异步」没有产品形态——工厂入口对它直接 `raise NotImplementedError`，只留一句 TODO 说将来仅供调试。缺席不必听转述，它就印在工厂的第一段里。
+两轴四格，三格有主：同步多进程给离线面、异步多进程给在线面、同进程兜底留作逃生舱（`InprocClient`，`vllm/v1/engine/core_client.py:L306`，后面还会提到它）；第四格「同进程 × 异步」没有产品形态——工厂入口对它直接 `raise NotImplementedError`，只留一句 TODO 说将来仅供调试。为什么缺席不用听转述——上面工厂代码的第一段就写着。
 
-结构相同，两半真正的区别是**怎么驱动**。离线面是「拉取」——调用方线程亲自一脚一脚踩：
+结构相同，两半真正的区别是**怎么驱动**。离线面是「拉取」——调用方线程亲自一拍一拍地调 `step()`：
 
 ```python
 # vllm/entrypoints/offline_utils.py:L590-L595
@@ -193,7 +193,7 @@ while self.llm_engine.has_unfinished_requests():
 # … 省略：finished 输出收集、tqdm 进度、吞吐统计 …
 ```
 
-在线面是「自转」——EngineCore 在独立进程里永不停步地跑忙循环（busy loop）：
+在线面是「自转」——EngineCore 在独立进程里跑忙循环（busy loop），不需要谁来调它：
 
 ```python
 # vllm/v1/engine/core.py:L1378-L1389
@@ -211,7 +211,7 @@ def run_busy_loop(self):
     raise SystemExit
 ```
 
-同一个引擎内核：离线是外面的人摇手柄、在线是自己转——「同一台发动机，两种变速箱」。这套收敛的墓碑兼纪念碑，是 v0 双引擎的故居：
+同一个引擎内核，两种驱动方式：离线是调用方拉、在线是自己转。v0 的双引擎类则在这次收敛中被整个删掉——看 `vllm/engine/async_llm_engine.py` 这个文件就知道：
 
 ```python
 # vllm/engine/async_llm_engine.py:L1-L7
@@ -224,15 +224,15 @@ AsyncLLMEngine = AsyncLLM  # type: ignore
 """The `AsyncLLMEngine` class is an alias of [vllm.v1.engine.async_llm.AsyncLLM][]."""
 ```
 
-这个文件曾经是 1032 行的双引擎适配层（v0 删除前最后版本口径——2025 年 9 月 PR #25025 把它收编成别名垫片之前，外部历史版本口径），今天只剩 7 行别名垫片——老用户代码零改动存活，「两台引擎」在源码里已不存在。读官方文档时留意：文档里仍沿用 `AsyncLLMEngine` 旧名，它如今只是 `AsyncLLM` 的别名。
+这个文件曾经是 1032 行的双引擎适配层（1032 行是 v0 删除前最后版本的外部历史口径），2025 年 9 月 PR #25025 把它改写成别名垫片，今天只剩 7 行——版权头之外，就是一行 import、一行别名赋值和一条 docstring。老用户代码零改动就能继续跑，「双引擎」在源码里已不存在。读官方文档时留意：文档里仍沿用 `AsyncLLMEngine` 旧名，它如今只是 `AsyncLLM` 的别名。
 
 **代价**：一套结构、一条代码路径、两种模式，意味着每次改动都要同时推演两种驱动的分支；更实在的一笔是——**同步面默认也付进程税**：`VLLM_ENABLE_V1_MULTIPROCESSING` 默认 `True`（`vllm/envs.py:L149`），离线 `LLM` 默认也 spawn 独立引擎进程、每步输出过一次 IPC。为什么？同进程与多进程两套路径行为分叉、测试矩阵翻倍的旧痛，v1 宁可让离线用户也付这笔税；纯 CPU 玩具模型场景想省掉，显式走 `InprocClient` 逃生舱即可（`vllm/v1/engine/core_client.py:L306`）。
 
 ## 心跳：EngineCore 的五拍
 
-现在走进 L0 图下带的循环框——整个系统的心脏。直觉先立住：**生成不是一次调用，是数百次心跳。** 模型每「想」一个字，引擎就要完整地跑一轮循环：点名分活、把这拍的工作发射给 GPU、收卷子、按分数挑答案、记账发通知。一个 token 一拍，一百个 token 一百拍。
+现在走进 L0 图下带的循环框——整个系统的心脏。直觉先立住：**生成不是一次调用，是数百次心跳。** 每生成一个 token，引擎都要完整地跑一轮循环：组批、把这拍的工作发给 GPU、取回结果、采样出下一个 token、更新账本并发通知。一个 token 一拍，一百个 token 一百拍。
 
-五拍的真身（`vllm/v1/engine/core.py:L584-L614`）：
+五拍对应的源码就是 `step()`（`vllm/v1/engine/core.py:L584-L614`）：
 
 ```python
 # vllm/v1/engine/core.py:L584-L614
@@ -269,7 +269,7 @@ def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
     return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 ```
 
-逐拍点名（行号即上段里的位置）：
+逐拍解读（行号即上段源码里的位置）：
 
 1. **schedule**（`L595`）：问账本这拍组什么批——所有可能慢、可能触发抢占（preemption：显存吃紧时把在跑的请求踢出去腾地方）的决策，全部放在 GPU 启动之前做完；
 2. **execute_model**（`L596`）：发起前向。注意 `non_block=True`——发射后立即返回一个 Future（先拿到手的「取货凭证」，结果稍后凭它取），**不等 GPU 算完**；
@@ -277,9 +277,9 @@ def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
 4. **future.result() → sample_tokens**（`L602-L604`）：等前向完成（CPU 只在一个极轻量的 GPU 同步点上、等结果拷回来），从分数向量里选出 token；
 5. **update_from_output**（`L609`）：推进请求状态机、组装回程消息、回收显存块。
 
-五拍走完看一眼返回值，两个成员各有归宿：第一项是按前端索引的输出包裹——字典每个键对应一个前端进程、每个前端一条包裹（为什么按前端打包，[「下行与上行」](#下行与上行文本不过线)一节拆开）；第二项布尔位标记这拍模型有没有真的执行（`total_num_scheduled_tokens > 0`，docstring 里那个 flag），上层的事后检查只在真执行过的拍上做。
+五拍走完看一眼返回值，两个成员各有用途：第一项是按前端索引的输出包裹——字典每个键对应一个前端进程、每个前端一条包裹（为什么按前端打包，[「下行与上行」](#下行与上行文本不过线)一节拆开）；第二项布尔位标记这拍模型有没有真的执行（`total_num_scheduled_tokens > 0`，docstring 里那个 flag），上层的事后检查只在真执行过的拍上做。
 
-排布本身就是性能哲学。它的反面——旧形态——是「做一步等一步」：v0 的 `LLMEngine.step` 就是这样一个同步循环，tokenize、调度、前向、采样、后处理串在一条时间线上、做一步等一步；更早的 v1 `step()` 也曾是 `execute_model` 同步等完再采样。而忙循环是单线程的（`run_busy_loop` 只有一个 Python 线程驱动一切），任何阻塞都让 GPU 空转——一拍只有几十毫秒（每拍数千 token 的计算量级；钉住这个数的「预算」旋钮，下一节才正式立起来），10ms 串行杂务就是约 20% 的吞吐损失（分析性估算）。于是你看到：第 3 拍被**塞进 GPU 计算的窗口里**，与第 2 拍的执行真并行——顺带对上 L0 图的账：图把五拍各画一格、编号 ① 到 ⑤，但 ③ 那格的注释字自己招了：「CPU 活藏进 GPU 前向的窗口期」。墙上时钟的账只有四段：schedule → execute → sample → update 是时序主干，第 3 拍塞在第 2 拍的执行窗口里并行、不占独立时序位——图数五拍、时序位四段；慢决策全部前置；连「执行」都被劈成两段——execute 只出中间结果、sample 紧随其后，两段之间隔着那个 GPU 窗口。这个两段式契约写在执行臂的基类里：「If this method returns None, sample_tokens should be called immediately after」（`vllm/v1/worker/worker_base.py:L142-L158`）。
+这个执行顺序本身就是一套性能设计。它的反面——旧形态——是「做一步等一步」：v0 的 `LLMEngine.step` 就是这样一个同步循环，tokenize、调度、前向、采样、后处理串在一条时间线上、做一步等一步；更早的 v1 `step()` 也曾是 `execute_model` 同步等完再采样。而忙循环是单线程的（`run_busy_loop` 只有一个 Python 线程驱动一切），任何阻塞都让 GPU 空转——一拍只有几十毫秒（每拍数千 token 的计算量级；钉住这个数的「预算」旋钮，下一节才正式立起来），10ms 串行杂务就是约 20% 的吞吐损失（分析性估算）。于是你看到：第 3 拍被**塞进 GPU 计算的窗口里**，与第 2 拍的执行真并行——顺带对上 L0 图的账：图把五拍各画一格、编号 ① 到 ⑤，但 ③ 那格的注释自己就写着：「CPU 活藏进 GPU 前向的窗口期」。墙上时钟的账只有四段：schedule → execute → sample → update 是时序主干，第 3 拍塞在第 2 拍的执行窗口里并行、不占独立时序位——图数五拍、时序位四段；慢决策全部前置；连「执行」都被劈成两段——execute 只出中间结果、sample 紧随其后，两段之间隔着那个 GPU 窗口。这个两段式契约写在执行臂的基类里：「If this method returns None, sample_tokens should be called immediately after」（`vllm/v1/worker/worker_base.py:L142-L158`）。
 
 还有一句诚实的注脚：v0.27.1 的服务态默认心跳已经是**重叠版**——异步调度默认开启（调度下一拍与上一拍执行重叠，`vllm/config/vllm.py:L1095-L1143` 一带），上面这个同步 `step()` 是理解重叠版的唯一地基。代价也诚实：两段式让执行器带上跨调用暂存态，中间态出错的归属变模糊；执行期间的取消请求必须双投递（保序队列一条、及时通道一条）才不丢。
 
@@ -305,7 +305,7 @@ def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
 # and the "jump decoding" optimization in the future.
 ```
 
-翻译成人话：每个请求只带两个数——「已经算了多少 token」（`num_computed_tokens`）和「总共要算多少 token」；每拍调度就是给各请求分 token 配额，让前者追赶后者（本书称之为「追赶公式」）。没有 prefill 批、没有 decode 批，**一个循环、一种账**。注意最后那句预言：chunked prefill（长输入切块分拍消化）、前缀缓存（记住相同开头请求已算过的部分，来一个共享一个）、投机解码（让小模型先猜、大模型一次验证多个的加速法）——这句注释提前点到的每个特性，全都只是「token 差距」这单一模型上的推论。注释自己的历史就是第一份证词：首提交的清单里还没有投机解码，它落地那天，这个单一模型只是多收了一项 spec token、特性清单里多了一个词——预言每兑现一次，都靠一次扩写给自己作证。
+翻译成人话：每个请求只带两个数——「已经算了多少 token」（`num_computed_tokens`）和「总共要算多少 token」；每拍调度就是给各请求分 token 配额，让前者追赶后者（本书称之为「追赶公式」）。没有 prefill 批、没有 decode 批，**一个循环、一种账**。注意最后那句预告：chunked prefill（长输入切块分拍消化）、前缀缓存（记住相同开头请求已算过的部分，来一个共享一个）、投机解码（让小模型先猜、大模型一次验证多个的加速法）——这句注释提前点到的每个特性，全都只是「token 差距」这单一模型上的推论。注释自己的修改史就是第一份证据：首提交的清单里还没有投机解码，它落地那天，这个单一模型只是多收了一项 spec token、特性清单里多了一个词。新特性每来一个，这套模型都只需小改扩写一次就能接住——这就是它足够通用的直接证据。
 
 这笔账算出来有多悬殊，用默认预算走一遍（预算取 `SchedulerConfig` 的类默认 2048，`vllm/config/scheduler.py:L42`；两场景为说明性构造）：
 
@@ -319,13 +319,13 @@ def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
 
 同样「1 个请求」，工作量差 32 倍——这就是不能按请求数限批的全部理由：按请求数限批，要么全 decode 小批让 GPU 饿死，要么混进一个大 prompt 把在场所有请求的下一个 token 都拖住。
 
-这张表还藏着一个不变量，值得说破（只看 token 账本的简化口径——显存准入与抢占是 Part III 的戏，在那里，一个没算完的请求也可能当拍一个 token 都分不到）：只要还有没算完且可调度的请求，每拍被调度的 token 总数就落在 1 与预算之间。终止性由两头保证：prefill 的账面差额（prompt 还剩多少没算）是有限非负整数，每拍严格减去本拍调度量，减到 0 该请求转进 decode；decode 的追赶目标每拍长 1——上表 A 场景每拍 256 → 256，正是这笔账不降的原因——但它被 max_tokens（单请求输出长度上限）或提前命中的停止条件封顶，到头即完成离场。两头都有限，调度循环必然终止；无请求可调度时，循环空转守卫直接返回（`vllm/v1/engine/core.py:L593`）。单个请求的 prefill 至多「prompt 长度除以预算」向上取整这么多拍完成，本例是 4 拍。
+这张表还体现出一个不变量，值得点明（只看 token 账本的简化口径——显存准入与抢占要到 Part III 才讲，在那里，一个没算完的请求也可能当拍一个 token 都分不到）：只要还有没算完且可调度的请求，每拍被调度的 token 总数就落在 1 与预算之间。终止性由两头保证：prefill 的账面差额（prompt 还剩多少没算）是有限非负整数，每拍严格减去本拍调度量，减到 0 该请求转进 decode；decode 的追赶目标每拍长 1——上表 A 场景每拍 256 → 256，正是这笔账不降的原因——但它被 max_tokens（单请求输出长度上限）或提前命中的停止条件封顶，到头请求即完成退出。两头都有限，调度循环必然终止；无请求可调度时，循环空转守卫直接返回（`vllm/v1/engine/core.py:L593`）。单个请求的 prefill 至多「prompt 长度除以预算」向上取整这么多拍完成，本例是 4 拍。
 
-预算本身是个按硬件拨的旋钮：类默认 2048 的注释自述「主要为测试便利」；实际部署由 `EngineArgs` 按硬件与使用面拨大——怎么分档、每个旋钮拨下去系统哪里变，Part I 最后一站的启动视角展开。**代价**：长 prompt 被切成多拍，意味着首个 token 的延迟（TTFT，Time To First Token）去换在场请求每拍节奏的稳定（TPOT，Time Per Output Token）——这笔交易是 chunked prefill 的本质，Part III 连同连续批处理（每拍重组批次、新请求随到随进，不必等整批完成）的学术血统（Orca 与 Sarathi-Serve 两篇系统工作的对照实验）一起展开；抢占、水位（留出的显存余量）、RUNNING（在跑）先于 WAITING（排队）的组批次序，也都在那里。
+预算本身是个按硬件拨的旋钮：类默认 2048 的注释自述「主要为测试便利」；实际部署由 `EngineArgs` 按硬件与使用面拨大——怎么分档、每个旋钮拨下去系统哪里变，Part I 最后一站的启动视角展开。**代价**：长 prompt 被切成多拍，意味着首个 token 的延迟（TTFT，Time To First Token）去换在场请求每拍节奏的稳定（TPOT，Time Per Output Token）——这笔交易是 chunked prefill 的本质，Part III 连同连续批处理（每拍重组批次、新请求随到随进，不必等整批完成）的学术出处（Orca 与 Sarathi-Serve 两篇系统工作的对照实验）一起展开；抢占、水位（留出的显存余量）、RUNNING（在跑）先于 WAITING（排队）的组批次序，也都在那里。
 
 ## 下行与上行：文本不过线
 
-再回到那条紫带，把「两趟快递」的货物清单看清楚——这是 L0 图上下两条数据泳道的形状约束。顺带把开篇的另一问也结了：「换两次数据形状」就是这两次——下行把文本变成 token、上行把 token 变回文本，两次都发生在 API 进程内。
+再回到那条紫带，把「两趟快递」的货物清单看清楚——这是 L0 图上下两条数据泳道的形状约束。顺带把开篇的另一问也一并回答：「换两次数据形状」就是这两次——下行把文本变成 token、上行把 token 变回文本，两次都发生在 API 进程内。
 
 **下行：请求以 token 数组过线。** 看跨界请求的字段表：
 
@@ -352,7 +352,7 @@ class EngineCoreRequest(
 
 字段表里没有 prompt 字符串，只有 `prompt_token_ids`——「文本不过线、token 过线」的物证：tokenize 在 API 进程的 Renderer 线程池里就完成了（`vllm/renderers/base.py:L84-L111`，阻塞的分词被挪进线程池、不卡事件循环）。其余字段各一句话：`mm_features` 装多模态特征、`pooling_params` 服务嵌入/打分类模型（这类模型不逐 token 生成，只把整个输入编码成一个向量，与 `sampling_params` 二选一）、`lora_request` 可指定一个 LoRA 适配器（低秩适配，一种省显存的微调方案）、`cache_salt` 是缓存隔离的盐值、`data_parallel_rank` 标记多引擎部署时的目的地、`prompt_embeds` 允许跳过分词、直接以嵌入向量（本该由 token id 查表得到的数值向量）作输入——各自主场再讲。顺带认识 `msgspec.Struct`：一个高性能序列化结构体库的声明方式，那三个开关是为了压序列化体积——编码细节 Part II 拆。为什么这么设计？token 化是纯 CPU 活，放在零 GPU 的前端做，引擎进程一个字节都不用为「文字长什么样」操心。
 
-**上行：token 以整批包裹回程。** 引擎不是给每个请求单独发消息，而是每拍、每个前端各发一条 `EngineCoreOutputs`，把该前端所有请求这一拍的新 token 打成一个包裹（`vllm/v1/engine/__init__.py:L230-L258`）。为什么整批打包？摊薄每条消息的固定开销。为什么按前端分装？因为每个 API 前端是一条独立的进程与连接，包裹只能按收件人分装——引擎把各家的 token 发给各家（多开 API server 对着同一引擎的水平扩展，靠的正是这条按址投递的规矩，下一段会再见到它）。前端收到大包裹后按 128 条一片分片消化、片间让出事件循环（`VLLM_V1_OUTPUT_PROC_CHUNK_SIZE = 128`，`vllm/envs.py:L160`），防止一批 detokenize 独占事件循环伤了其他连接的延迟。
+**上行：token 以整批包裹回程。** 引擎不是给每个请求单独发消息，而是每拍、每个前端各发一条 `EngineCoreOutputs`，把该前端所有请求这一拍的新 token 打成一个包裹（`vllm/v1/engine/__init__.py:L230-L258`）。为什么整批打包？摊薄每条消息的固定开销。为什么按前端分装？因为每个 API 前端是一条独立的进程与连接，包裹只能按收件人分装——引擎把各家的 token 发给各家（多开 API server 对着同一引擎的水平扩展，靠的正是这条按址投递的规矩，下一段会再见到它）。前端收到大包裹后按 128 条一片分片消化、片间让出事件循环（`VLLM_V1_OUTPUT_PROC_CHUNK_SIZE = 128`，`vllm/envs.py:L160`），防止一批 detokenize 独占事件循环、拖慢其他连接的响应。
 
 **API 进程零 GPU，是一份钉死的职责清单**：图上前端带里做的一切——tokenize、校验、detokenize、logprobs（每个候选 token 的对数概率，API 的一类可选返回值）组装、SSE——全是普通 CPU 活；进程内的 torch 仅限 CPU 侧用途（CPU 侧 profiler 只开 `ProfilerActivity.CPU`，`vllm/v1/engine/async_llm.py:L191-L195`；占位张量显式 `device="cpu"`，`vllm/v1/engine/output_processor.py:L42`）。收益有三：并发上，HTTP/JSON/SSE 的 CPU 活与引擎调度彻底不抢锁；部署上，前端可以独立于 GPU 数水平扩展（多开 API server 对着同一引擎）；存活上，引擎崩了前端还能体面收尾。**代价**：边界两侧各持一份请求状态、全靠消息对账；一个具体例子是 stop-string（用户指定的停止词）只有在前端 detokenizer 里才看得见——命中后要反向再发一次取消消息让引擎停手（Part II 展开）。纯 CPU 场景嫌进程税冤枉，还是那个 `InprocClient` 逃生舱（`vllm/v1/engine/core_client.py:L306`）。
 
@@ -364,11 +364,11 @@ L0 图还剩几块，本节只给每块一句「它是什么、为什么需要�
 
 **显存账本列（Part IV）**：推理的显存大头是 KV cache——生成越长攒得越多。v1 把它做成**虚拟内存的显存版**——vLLM 论文的原话类比是「块当页、token 当字节、请求当进程」（arXiv:2309.06180，外部论文）：整块显存切成等大的块池（默认块大小 16，`vllm/config/cache.py:L47`），每个请求按需领块、不必预占一整条连续显存；注意力算子通过每请求的逻辑块表（页表的显存版）找到每个 token 的物理位置（`vllm/v1/core/block_pool.py:L175-L181` 一次预构全部块）。说明性小账：一个 100 token 的请求领 7 块共 112 个槽（每块 16 个 token 位），尾部浪费 12 个、永远小于一整块——对比「每个请求按最大长度预留一整条显存」的老办法，这是 vLLM 赖以成名的分页 KV。前缀缓存、显存对账、抢占恢复，Part IV 四章。
 
-**GPU 执行臂（Part V）**：循环框往下走，执行侧是三层各答一问的结构——**Executor** 只答「在哪跑」（按并行后端分发单机直调/多进程/Ray，Ray 是一个分布式计算框架；`vllm/v1/executor/abstract.py:L48-L92`）；**Worker** 只答「设备归谁管」（GPU 初始化、显存盘点、模型装载）；**GPUModelRunner** 只答「这一拍怎么算」（每拍只改批次张量的差异——差量调和，再发起前向、采样，`vllm/v1/worker/gpu_model_runner.py:L4166` 起）。三层各管一根独立变化的轴：换硬件不动进程编排、换编排不动设备管理。臂上还有两个本书重头戏的名词先混个脸熟：**持久批次**（批次张量常驻，每拍只做上面那句差量调和、不再从零重建）与 **CUDA Graph**（把一整段 GPU 调用序列录下来、之后同形状直接重播的机制）——它们共同回答「Python 为什么追不上 GPU、怎么追」，Part V 六章。
+**GPU 执行臂（Part V）**：循环框往下走，执行侧是三层各答一问的结构——**Executor** 只答「在哪跑」（按并行后端分发单机直调/多进程/Ray，Ray 是一个分布式计算框架；`vllm/v1/executor/abstract.py:L48-L92`）；**Worker** 只答「设备归谁管」（GPU 初始化、显存盘点、模型装载）；**GPUModelRunner** 只答「这一拍怎么算」（每拍只改批次张量的差异——差量调和，再发起前向、采样，`vllm/v1/worker/gpu_model_runner.py:L4166` 起）。三层各管一根独立变化的轴：换硬件不动进程编排、换编排不动设备管理。臂上还有两个后面要重点展开的机制，先在这里记下名字：**持久批次**（批次张量常驻，每拍只做上面那句差量调和、不再从零重建）与 **CUDA Graph**（把一整段 GPU 调用序列录下来、之后同形状直接重播的机制）——它们共同回答「Python 为什么追不上 GPU、怎么追」，Part V 六章。
 
 **模型层（Part VI）**：Executor 臂的末端是模型定义层，v1 的接法是「Attention 当插座、实现另插」——模型定义只声明「这里要一次注意力」，MLA（DeepSeek 系的多头潜在注意力）、GQA（分组查询注意力）这类注意力变体作为后端插进来。接一个新架构主要是「拼层」而不是改引擎，Part VI 从拼装术讲到 DeepSeek 系的实战。
 
-**采样出口列（Part VII）**：GPU 出门的不是文字，是**记分板**——对全词表每个候选 token 打的分数向量（logits；词表约 13 万，DeepSeek 为 129280 维，说明性量级）。两个关键形状约束：其一，forward 只算出每个位置的「意见向量」（hidden_states），**只在需要打分的位置**——每请求最后一个 token——才投影成记分板（`vllm/model_executor/models/llama.py:L516-L533` 的 forward/compute_logits 两方法分工；`vllm/v1/worker/gpu_model_runner.py:L4484-L4485` 先切出采样位再投影）。为什么？同卡数字例（说明性）：若像训练那样全位置物化 fp32（32 位浮点）分数，一个 4096 token 的 prefill 块要 4096 × 129280 × 4B ≈ 2GB——纯浪费。其二，把分数向量变成 1 个 token id 的采样，是一条 9 步管线（`vllm/v1/sample/sampler.py:L20-L59` 的 docstring 逐步列着）——惩罚、温度、截断、约束掩码、argmax（取分数最高者）的不变性，Part VII 五章。
+**采样出口列（Part VII）**：GPU 出门的不是文字，是**记分板**——对全词表每个候选 token 打的分数向量（logits；词表约 13 万，DeepSeek 为 129280 维，说明性量级）。两个关键形状约束：其一，forward 只算出每个位置的隐藏状态向量（hidden_states），**只在需要打分的位置**——每请求最后一个 token——才投影成记分板（`vllm/model_executor/models/llama.py:L516-L533` 的 forward/compute_logits 两方法分工；`vllm/v1/worker/gpu_model_runner.py:L4484-L4485` 先切出采样位再投影）。为什么？同卡数字例（说明性）：若像训练那样全位置物化 fp32（32 位浮点）分数，一个 4096 token 的 prefill 块要 4096 × 129280 × 4B ≈ 2GB——纯浪费。其二，把分数向量变成 1 个 token id 的采样，是一条 9 步管线（`vllm/v1/sample/sampler.py:L20-L59` 的 docstring 逐步列着）——惩罚、温度、截断、约束掩码、argmax（取分数最高者）的不变性，Part VII 五章。
 
 **图的底部两块**：左下「启动视角」回答「每个旋钮拨下去系统哪里变」——`EngineArgs`（把上百个启动参数归拢）装配成 `VllmConfig`（一份系统全量配置）是 Part I 的最后一站（下一章之后就到）；右下「多实例视角」是 L0 图外的放大镜（图上带放大镜挂角的那块虚线块自述「这块是 L0 图外的放大镜」）——数据并行、P/D 分离（prefill 消化与 decode 生成拆到不同机器）、弹性扩缩，真实服务不止一个引擎，Part VIII。
 
@@ -388,10 +388,10 @@ L0 图还剩几块，本节只给每块一句「它是什么、为什么需要�
 
 （Part I 就是脚下这三章：本章的静态全景、下一章的动态走读、之后的启动视角。）
 
-这张图背后还站着五句话——全书的设计哲学，本章你已经全部见过雏形，这里立此存照、后面的每一章都会来印证：
+这张图背后还有五句话——全书的设计哲学，本章你已经全部见过雏形，这里正式记下、后面的每一章都会来印证：
 
-1. **GPU 不等 CPU**：一切 CPU 活或挪出循环（tokenize/detokenize 过进程）、或藏进 GPU 窗口（位掩码）、或固化（CUDA Graph）——本节的五拍排布是它第一次现身；
-2. **账本先行**：显存与 token 都先记账、再行动——调度只认 token 数是它的第一次现身；
+1. **GPU 不等 CPU**：一切 CPU 活或挪出循环（tokenize/detokenize 过进程）、或藏进 GPU 窗口（位掩码）、或固化（CUDA Graph）——本节的五拍排布是它第一次出现；
+2. **账本先行**：显存与 token 都先记账、再行动——调度只认 token 数是它的第一次出现；
 3. **单循环单真相**：一个忙循环、一套三件套双驱动，消掉 v0 的双引擎双路径；
 4. **每个设计都有代价**：IPC 税、序列化税、TTFT 换 TPOT——每个「为什么」都配一个「付出了什么」；
 5. **演进是被逼出来的**：v0 的每个痛点，都变成了 v1 里一块你刚认过的框。
@@ -400,7 +400,7 @@ L0 图还剩几块，本节只给每块一句「它是什么、为什么需要�
 
 ## 总结：整图在手，一块未开
 
-本章点亮的是 L0 图本身——所有块都有了名字、位置和归属的 Part，但没有一块被打开。这是设计好的节奏：先有地图，再谈细节；你此刻应该能在脑内重画这张图的骨架（三条横带、一条紫线、循环框、账本列与执行臂），并能回答三个问题——为什么拆进程（GIL 与 5ms 的账）、为什么两个使用面共享一套结构（v0 双引擎之死）、为什么调度只认 token 数（32 倍的工作量差）。
+本章点亮的是 L0 图本身——所有块都有了名字、位置和归属的 Part，但没有一块被打开。这是设计好的节奏：先有地图，再谈细节；你此刻应该能在脑内重画这张图的骨架（三条横带、一条紫线、循环框、账本列与执行臂），并能回答三个问题——为什么拆进程（GIL 与 5ms 的账）、为什么两个使用面共享一套结构（v0 双引擎的下场）、为什么调度只认 token 数（32 倍的工作量差）。
 
 图上的虚线标注，从下一章开始逐一转实：**下一章我们让这张图动起来**——跟一个真实请求从 HTTP 进门到 SSE 出门走完全程，每一跳落到具体的文件与行号，把「16 站」的站号账本立起来。静态的图是地图，跑起来的图才是行程表。
 
