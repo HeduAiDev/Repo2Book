@@ -119,7 +119,7 @@ self.engine_core = EngineCoreClient.make_async_mp_client(
 
 ## 三件套：两个使用面，一套结构，两种驱动
 
-回到 L0 图顶端。API 进程带的标题行同时点名两个使用面——OpenAI server / `LLM`（离线）/ `AsyncLLM`（在线）；带的左右两条泳道分的是下行与上行（左边 Renderer、InputProcessor 送请求出去，右边 RequestOutputCollector、OutputProcessor 收结果回来），不是离线与在线。vLLM 的产品形态就这两半——离线批处理跑吞吐，在线服务要低延迟。它们共享的那套前端结构，本书简称 **三件套**：**Renderer+InputProcessor（下行）/ EngineCore（引擎）/ OutputProcessor（上行）**——注意这是本书的自造简称，对应 L0 图上 API 进程里的组件块加引擎本体——上行那条单槽信箱 `RequestOutputCollector` 是 `OutputProcessor` 的收件搭档，随它一件记、不单占一件；官方文档按职责描述、并无这个词。
+回到 L0 图顶端。API 进程带的标题行同时点名两个使用面——OpenAI server / `LLM`（离线）/ `AsyncLLM`（在线）；带的左右两条泳道分的是下行与上行（右边 Renderer、InputProcessor 送请求出去，左边 RequestOutputCollector、OutputProcessor 收结果回来），不是离线与在线。vLLM 的产品形态就这两半——离线批处理跑吞吐，在线服务要低延迟。它们共享的那套前端结构，本书简称 **三件套**：**Renderer+InputProcessor（下行）/ EngineCore（引擎）/ OutputProcessor（上行）**——注意这是本书的自造简称，对应 L0 图上 API 进程里的组件块加引擎本体——上行那条单槽信箱 `RequestOutputCollector` 是 `OutputProcessor` 的收件搭档，图上虽然单独画成一块，但不算独立的第四件——数「三件」时它跟着 `OutputProcessor` 一起算；官方文档按职责描述、并无这个词。
 
 v0 时代这两半是两台引擎（上一节骨架里的同步/异步双类谱系），输出处理逻辑两处维护，行为漂移就是「离线与在线结果不一致」的 bug 面。v1 收敛成一套结构，证据可以并排读——离线面 `LLMEngine` 的构造：
 
@@ -180,7 +180,7 @@ def make_client(
 
 两轴四格，三格有主：同步多进程给离线面、异步多进程给在线面、同进程兜底留作逃生舱（`InprocClient`，`vllm/v1/engine/core_client.py:L306`，后面还会提到它）；第四格「同进程 × 异步」没有产品形态——工厂入口对它直接 `raise NotImplementedError`，只留一句 TODO 说将来仅供调试。缺席不必听转述，它就印在工厂的第一段里。
 
-结构相同，**驱动方式**是两半真正的分野。离线面是「拉取」——调用方线程亲自一脚一脚踩：
+结构相同，两半真正的区别是**怎么驱动**。离线面是「拉取」——调用方线程亲自一脚一脚踩：
 
 ```python
 # vllm/entrypoints/offline_utils.py:L590-L595
@@ -358,7 +358,7 @@ class EngineCoreRequest(
 
 双登记（前端与引擎各记一份请求状态）、请求 id 双轨（对外一套 id、引擎内部一套）、断连反向取消——下行上行的全部细节，Part II 五章都在这条带与两条泳道上。
 
-## 图的右列与底部：账本、执行臂与出口
+## 图的下带与底部：账本、执行臂与出口
 
 L0 图还剩几块，本节只给每块一句「它是什么、为什么需要它」的直觉加一个 Part 指针——它们各自的主场都在后面。
 
