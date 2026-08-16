@@ -148,6 +148,28 @@ def queue_glyph(x, y, w, name, sub):
     return h
 
 
+def part_chip(x, y, label, color):
+    """「第几 Part 打开」虚线小标——块角上的全书行程表（FIGURE-SYSTEM.md §0 硬规则 5；
+    映射出处 = 本章 dossier 的 l0_part_map，章号区间取 pedagogy-plan parts）。
+    x=左缘 y=顶缘，高 20，宽随文字实测；描边统一灰虚线、文字用 Part 主题色。返回宽。"""
+    w = tw(label, 9.5, True) + 14
+    rect(x, y, w, 20, '#ffffff', C_MUTE, rx=9, sw=1.1, dash=True)
+    text(x + w / 2, y + 14.5, label, 9.5, color, 'middle', True, maxw=w - 4, tag='part:' + label[:12])
+    return w
+
+
+def chip_w(label):
+    """part_chip 的宽度（供右对齐先算 x 用）。"""
+    return tw(label, 9.5, True) + 14
+
+
+def circle(cx, cy, r, stroke, sw=1.6, dash=True):
+    d = ' stroke-dasharray="6,4"' if dash else ''
+    s = (f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r:.1f}" fill="none" '
+         f'stroke="{stroke}" stroke-width="{sw}"{d}/>')
+    ELEMS.append(((cx - r - 2, cy - r - 2, cx + r + 2, cy + r + 2), s))
+
+
 def build_l0():
     """L0 全部绘制主体（与 fable 执笔版逐行同源）。返回 (ELEMS, GEO, WARN)。"""
     reset()
@@ -182,6 +204,8 @@ def build_l0():
     rect(MX, AY, CW, AH, C_API_F, C_API_S, rx=12, sw=2.4)
     text(MX + 16, AY + 24, 'API 进程（frontend · 零 GPU）', 13.5, C_API_S, 'start', True)
     text(BXR - 16, AY + 24, 'tokenize / detokenize / HTTP / SSE 的 CPU 活全在此进程', 9.5, C_MUTE, 'end')
+    # 「第几 Part 打开」行程表：API 进程双泳道 → Part II（ch4-8，l0_part_map #1）
+    part_chip(330, AY + 9, 'Part II 打开 · ch4-8', PART_COLOR['II'])
 
     # 入口条（两个使用面）
     rect(MX + 20, ENT_Y, CW - 40, ENT_H, '#ffffff', C_API_S, rx=8, sw=1.5)
@@ -198,8 +222,11 @@ def build_l0():
         alabel(cx + 21, UY + UH + 18, 'sse', 9, C_MUTE)
     alabel(user_cx[1] - 20, UY + UH + 18, 'HTTP 请求', 9, C_API_S, 'end')
 
-    # 泳道分隔虚线
-    seg(DIVX, LY0 - 6, DIVX, AY + AH - 20, C_FAINT, 1.2, dash=True)
+    # 双登记标签两行基线（① 号蓝虚线的标注；abort 线已右移至 x=1420 让开本标注块）
+    REG_Y0, REG_Y1 = LY0 + PITCH + 30, LY0 + PITCH + 44
+    # 泳道分隔灰虚线退役（2026-08-16）：初版它与 abort 线同 x（DIVX=ABX=1165）且上下近乎相接，
+    #   必然被读成「一条线中途灰变红」——灰段无图例可依、上端悬空（盲审双抓）。
+    #   泳道间的视觉分隔由 ① 标注块 + abort 红虚线（x=1420）共同承担。
 
     # ---- 右泳道（下行：tokenize → 组包） ----
     rx = RCX - LANE_W / 2
@@ -255,8 +282,13 @@ def build_l0():
     # 双登记虚线（入口条 → OutputProcessor，本进程建表先于跨进程）
     parrow([(1010, ENT_Y + ENT_H), (1010, LY0 + PITCH + lbox_h[1] / 2), (lx + LANE_W, LY0 + PITCH + lbox_h[1] / 2)],
            C_API_S, 1.5, 'std', dash=True)
-    alabel(1017, LY0 + PITCH + 30, '① 本进程建表 OutputProcessor.request_states', 9, C_API_S)
-    alabel(1017, LY0 + PITCH + 44, '（先于跨进程发送，保证回程到达时表已存在）', 9, C_MUTE)
+    alabel(1018, REG_Y0, '① 本进程建表 OutputProcessor.request_states', 9, C_API_S)   # 蓝虚线(1010)右侧净距 8px
+    alabel(1018, REG_Y1, '（先于跨进程发送，保证回程到达时表已存在）', 9, C_MUTE)    # abort 线已右移让开本标注块
+
+    # 文本↔token 变换点标注（两箭头出/入 API 带处）：文字永远留在 API 进程、跨线的只有
+    #   token id——下行进紫带前已在 Renderer 变完，上行回到前端后才变回文字。
+    alabel(RCX + 8, LY0 + 2 * PITCH + r3h + 23, '文本→token（进引擎前已在 Renderer 完成）', 9.5, C_API_S)
+    alabel(LCX + 8, LY0 + 2 * PITCH + l3h + 23, 'token→文本（回到前端后才变回文字）', 9.5, C_ENG_S)
 
     # ========== ZMQ 边界带（AsyncMPClient） ==========
     ZY = AY + AH + 16                            # 804
@@ -270,6 +302,9 @@ def build_l0():
     text(MX + 16, ZY + 112, '无反压 HWM=0 · fire-and-forget', 9, C_MUTE, 'start', maxw=200, tag='zmq:l5')
     text(MX + 16, ZY + 132, '· DP 部署另起 DPCoordinator（控制面）', 9, C_MUTE, 'start', maxw=200, tag='zmq:l6')
     text(MX + 16, ZY + 148, '  → 详见分布式章', 9, C_MUTE, 'start', maxw=200, tag='zmq:l7')
+    # 「第几 Part 打开」行程表：ZMQ 边界（线格式与拓扑）→ Part II（ch5，l0_part_map #2）
+    _zlbl = 'Part II 打开 · ch5'
+    part_chip(BXR - 16 - chip_w(_zlbl), ZY + 5, _zlbl, PART_COLOR['II'])
 
     BAND_W = 600
     _, zrh = comp(RCX - BAND_W / 2, ZY + 30, BAND_W, 'AsyncMPClient.add_request_async',
@@ -343,13 +378,22 @@ def build_l0():
     # 左：PUSH 框顶 → get_output_async 框底（输出回 API 进程）
     seg(LCX, ROW1_Y, LCX, ZY + 30 + zlh, C_ENG_S, 2.4, 'up')
     alabel(LCX + 8, ZY + ZH + 26, 'EngineCoreOutputs · 每步整批聚合 1 条 · 引擎按 client_index 选 PUSH 回发', 9.5, C_ENG_S)
-    # ABORT 红虚线（下行，两泳道之间：API 带底边 → EngineCore 带顶边）
-    ABX = (LCX + RCX) // 2                     # 1165
-    seg(ABX, AY + AH, ABX, EY, C_ABORT, 1.6, 'ab', dash=True)
-    alabel(ABX + 8, ZY + 40, "ABORT b'\\x01'", 9.5, C_ABORT, 'start')
-    alabel(ABX + 8, ZY + 56, '断连 / stop-string → 反向 abort', 9, C_MUTE)
-    alabel(ABX + 8, ZY + 72, '只带内部 id · 与 ADD 同一条 socket', 9, C_MUTE)
-    alabel(ABX + 8, ZY + 88, '引擎侧双投递 input_queue + aborts_queue', 9, C_MUTE)
+    # ABORT 红虚线（下行，全程图例款一色、单段无断口，端到端贴框——2026-08-16 盲审三抓
+    #   「上端悬空 / 箭头止于带边不贴目标 / 灰红两段无图例」后重画）：
+    #   上端 = 入口条底边（AsyncLLM.abort——断连 / stop-string 都自 API 层发起，与 ① 号蓝虚线同款 T 接），
+    #   下端 = EngineCoreProc.run_busy_loop 容器顶边（IO 线程双投递的 input_queue + aborts_queue
+    #   在忙循环侧被 _process_aborts_queue 消费——vllm/v1/engine/core.py）。
+    #   线位 x=1420：让开 ① 号双登记标注块（1018..1235）——初版走中缝 1165 必须为让字断成两段，
+    #   断口起点悬在 API 带内部（strict 几何门禁在 L1 画布上即抓 arrow-inside）；右移后
+    #   单段贯通，标注块与 abort 线各占其位、互不相扰。泳道中缝分隔职能由此线兼任
+    #   （原灰泳道分隔线与 abort 同 x，读成一条线中途变色，已退役）。
+    ABX = 1420
+    seg(ABX, ENT_Y + ENT_H, ABX, LOOP_Y, C_ABORT, 1.6, 'ab', dash=True)
+    # ABORT 标注四行：线左 end 锚（线右 50px 即右带 AsyncMPClient 框，放不下）
+    alabel(ABX - 8, ZY + 40, "ABORT b'\\x01'", 9.5, C_ABORT, 'end')
+    alabel(ABX - 8, ZY + 56, '断连 / stop-string → 反向 abort', 9, C_MUTE, 'end')
+    alabel(ABX - 8, ZY + 72, '只带内部 id · 与 ADD 同一条 socket', 9, C_MUTE, 'end')
+    alabel(ABX - 8, ZY + 88, '引擎侧双投递 input_queue + aborts_queue', 9, C_MUTE, 'end')
 
     # 行内小箭头：DEALER→iq→loop→oq→PUSH（语义链统一标注在循环框下方）
     seg(DLR_X - 2, ROW1_Y + 48, IQ_X + IQ_W + 2, ROW1_Y + 48, C_MUTE, 1.6, 'std')
@@ -365,6 +409,9 @@ def build_l0():
     text(LOOP_X + 12, LOOP_Y + 20, 'EngineCoreProc.run_busy_loop → EngineCore.step() 逐拍循环',
          11.5, C_ENG_S, 'start', True, maxw=LOOP_W - 140, tag='loop')
     text(LOOP_X + LOOP_W - 12, LOOP_Y + 20, 'vllm/v1/engine/core.py', 9, C_FAINT, 'end')
+    # 「第几 Part 打开」行程表：五拍循环 → Part III（ch9 逐拍拆开，l0_part_map #3）。
+    #   角标骑在循环框顶边上（y=LOOP_Y-15，跨边 5px）——标题行已被框名+源码路径占满。
+    part_chip(1280, LOOP_Y - 15, 'Part III 打开 · ch9', PART_COLOR['III'])
 
     CHIP_W, CHIP_H, CHIP_GAP = 131, 72, 6
     chip_cx = []
@@ -438,6 +485,13 @@ def build_l0():
     alabel(ACX + 12, A2Y - 4, '每拍对账', 9, C_KV_S)
     seg(ACX, A2Y + a2h, ACX, A3Y, C_KV_S, 1.5, 'std')
     alabel(ACX + 7, A3Y - 4, 'touch / free 块', 9, C_KV_S)
+    # 「第几 Part 打开」行程表：调度账本 → Part III（ch10-12，l0_part_map #4）；
+    #   右界让开 ①⑤ 拍号徽标（badge 左缘 = AX+COL_W-38-8）
+    _a1lbl = 'Part III 打开 · ch10-12'
+    part_chip(AX + COL_W - 46 - 10 - chip_w(_a1lbl), A1Y + 8, _a1lbl, PART_COLOR['III'])
+    # 显存账本（KVCacheManager/BlockPool）→ Part IV（ch13-16，l0_part_map #5）
+    _a2lbl = 'Part IV 打开 · ch13-16'
+    part_chip(AX + COL_W - 12 - chip_w(_a2lbl), A2Y + 8, _a2lbl, PART_COLOR['IV'])
 
     # ---- B 列（绿） ----
     _, b1h = comp(BX, CY0 + 30, COL_W, 'Executor → Worker',
@@ -465,6 +519,13 @@ def build_l0():
     alabel(BCX + 7, B2Y - 4, 'execute_model 穿三层', 9, C_GPU_S)
     seg(BCX, B2Y + b2h, BCX, B3Y, C_GPU_S, 1.6, 'std')
     alabel(BCX + 7, B3Y - 4, 'set_forward_context → model.forward', 9, C_GPU_S)
+    # 「第几 Part 打开」行程表：GPU 执行臂 → Part V（ch17-22，l0_part_map #6）；
+    #   右界让开 ② 拍号徽标（badge 左缘 = BX+COL_W-27-8）
+    _b1lbl = 'Part V 打开 · ch17-22'
+    part_chip(BX + COL_W - 35 - 10 - chip_w(_b1lbl), B1Y + 8, _b1lbl, PART_COLOR['V'])
+    # 模型层 → Part VI（ch23-28，l0_part_map #7）
+    _b3lbl = 'Part VI 打开 · ch23-28'
+    part_chip(BX + COL_W - 12 - chip_w(_b3lbl), B3Y + 8, _b3lbl, PART_COLOR['VI'])
 
     # ---- C 列（品红） ----
     _, c1h = comp(CX, CY0 + 30, COL_W, 'compute_logits',
@@ -494,6 +555,9 @@ def build_l0():
     alabel(CCX + 7, C2Y - 4, 'logits [采样位, vocab]', 9, C_SAM_S)
     seg(CCX, C3Y, CCX, C2Y + c2h, C_SAM_S, 1.6, 'std')
     alabel(CCX + 7, C3Y - 4, 'bitmask H2D → -inf', 9, C_SAM_S)
+    # 「第几 Part 打开」行程表：采样出口列 → Part VII（ch29-33，l0_part_map #8）
+    _c1lbl = 'Part VII 打开 · ch29-33'
+    part_chip(CX + COL_W - 12 - chip_w(_c1lbl), C1Y + 8, _c1lbl, PART_COLOR['VII'])
 
     # ---- 跨列箭头 ----
     # SchedulerOutput：A1 → B1（差量协议）
@@ -531,8 +595,45 @@ def build_l0():
     text(MX, FY + 20, '第一原则：GPU 是最贵的员工，一切 CPU 活不让它等（tokenize / detokenize 挪出进程 · bitmask 藏进 GPU 窗口 · 固定地址 + CUDA Graph · 异步调度）；'
                       '第二原则：显存是共享账本，一切调度先对账（token 预算 + 块池）。',
          10, C_MUTE, 'start', maxw=CW, tag='ft:principle')
+
+    # ========== 底部两块：启动视角（图内左下） + 多实例视角（图外放大镜，右下） ==========
+    # l0_part_map #9/#10：两个「视角」不是进程块，是回望整图的两副眼镜——虚线框待遇。
+    VY, VH = FY + 40, 96
+    BOOT_W = 760
+    rect(MX, VY, BOOT_W, VH, '#ffffff', C_MUTE, rx=8, sw=1.2, dash=True)
+    text(MX + 16, VY + 24, '启动视角：EngineArgs → VllmConfig', 11.5, C_TXT, 'start', True,
+         maxw=BOOT_W - 160, tag='boot:t')
+    _bl = 'Part I 打开 · ch3'
+    part_chip(MX + BOOT_W - 12 - chip_w(_bl), VY + 7, _bl, PART_COLOR['I'])
+    text(MX + 16, VY + 46, '· EngineArgs 把上百个启动参数归拢，装配成一份 VllmConfig（系统全量配置）',
+         9, '#334155', 'start', maxw=BOOT_W - 32, tag='boot:l1')
+    text(MX + 16, VY + 64, '· 每个旋钮拨下去，图上哪一块跟着变——装配之旅一站讲完',
+         9, '#334155', 'start', maxw=BOOT_W - 32, tag='boot:l2')
+    text(MX + 16, VY + VH - 9, 'vllm/engine/arg_utils.py → vllm/config/vllm.py', 9, C_FAINT, 'start',
+         maxw=BOOT_W - 32, tag='boot:file')
+
+    MI_X, MI_W = 1000, 940
+    rect(MI_X, VY, MI_W, VH, '#ffffff', C_MUTE, rx=8, sw=1.2, dash=True)
+    text(MI_X + 16, VY + 24, '多实例视角：DP / P-D 分离 / 弹性扩缩', 11.5, C_TXT, 'start', True,
+         maxw=MI_W - 200, tag='multi:t')
+    _ml = 'Part VIII 打开 · ch34-40'
+    part_chip(MI_X + MI_W - 12 - chip_w(_ml), VY + 7, _ml, PART_COLOR['VIII'])
+    text(MI_X + 16, VY + 46, '· 数据并行（DP）、P/D 分离（生成与消化拆到不同机器）、弹性扩缩自愈',
+         9, '#334155', 'start', maxw=MI_W - 32, tag='multi:l1')
+    text(MI_X + 16, VY + 64, '· 真实服务不止一个引擎——这块是 L0 图外的放大镜',
+         9, '#334155', 'start', maxw=MI_W - 32, tag='multi:l2')
+    text(MI_X + 16, VY + VH - 9, 'vllm/v1/executor · vllm/distributed', 9, C_FAINT, 'start',
+         maxw=MI_W - 32, tag='multi:file')
+    # 图外放大镜挂角（呼应「L0 图外的放大镜」）：虚线镜头 + 柄，虚线挂线回望整图，
+    #   锚在 EngineCore 带底边（多实例改造的正是引擎侧拓扑）。
+    LENS_CX, LENS_CY, LENS_R = MI_X + MI_W + 90, VY + 48, 30
+    circle(LENS_CX, LENS_CY, LENS_R, C_MUTE, 1.6, dash=True)
+    seg(LENS_CX + LENS_R * 0.707, LENS_CY + LENS_R * 0.707,
+        LENS_CX + LENS_R * 0.707 + 24, LENS_CY + LENS_R * 0.707 + 24, C_MUTE, 3.0)
+    seg(LENS_CX, LENS_CY - LENS_R - 2, LENS_CX, EY + EH, C_FAINT, 1.4, dash=True)
+
     # 图例行
-    ly = FY + 44
+    ly = VY + VH + 26
     swatches = [(C_API_S, 'API 进程'), (C_ZMQ_S, 'ZMQ 边界'), (C_ENG_S, 'EngineCore 进程'),
                 (C_GPU_S, 'GPU 执行臂'), (C_KV_S, '显存账本'), (C_SAM_S, '采样出口')]
     lx0 = MX
@@ -555,7 +656,7 @@ def build_l0():
     lx0 += 32 + tw('= EngineCore.step() 第几拍', 9.5) + 18
     text(lx0, ly + 1, '框内灰字 = 规范源码路径', 9.5, C_MUTE, 'start')
 
-    H = FY + 76
+    H = ly + 32
     GEO = dict(W=W, H=H, MX=MX, CW=CW, BXR=BXR, UY=UY, UH=UH, UW=UW, UX0=UX0,
                AY=AY, AH=AH, ENT_Y=ENT_Y, ENT_H=ENT_H, LY0=LY0, PITCH=PITCH,
                LCX=LCX, RCX=RCX, DIVX=DIVX, ZY=ZY, ZH=ZH, EY=EY, EH=EH,
@@ -568,5 +669,8 @@ def build_l0():
                GAP_AB=GAP_AB, GAP_BC=GAP_BC, BUS_Y=BUS_Y, FY=FY,
                A1Y=A1Y, a1h=a1h, A2Y=A2Y, a2h=a2h, A3Y=A3Y, a3h=a3h,
                B1Y=B1Y, b1h=b1h, B2Y=B2Y, b2h=b2h, B3Y=B3Y, b3h=b3h,
-               C1Y=C1Y, c1h=c1h, C2Y=C2Y, c2h=c2h, C3Y=C3Y, c3h=c3h, C4Y=C4Y, c4h=c4h)
+               C1Y=C1Y, c1h=c1h, C2Y=C2Y, c2h=c2h, C3Y=C3Y, c3h=c3h, C4Y=C4Y, c4h=c4h,
+               VY=VY, VH=VH,
+               BOOT_R=(MX, VY, MX + BOOT_W, VY + VH),           # 启动视角块（ch3 的 L0 锚）
+               MULTI_R=(MI_X, VY, MI_X + MI_W, VY + VH))       # 多实例视角块（ch34-40 的 L0 锚）
     return ELEMS, GEO, WARN
