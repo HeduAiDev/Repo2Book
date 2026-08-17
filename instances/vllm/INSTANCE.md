@@ -15,7 +15,13 @@
 - ✅ **Phase 1 已收官**（2026-08-15）：大纲 40 章 8 Part 4 primer **用户批准**（含覆盖自查补 7 处：
   chunked prefill/配置装配/n>1 扇出/权重加载/EP/code→diagram/部署实战）；
   `pedagogy-plan.json` 已产出（hook/依赖/10 组伏笔/概念首现/L0 缩放路径）。
-- **🔄 Phase 2 图系三层缩放**（下一步）：L0 唯一 → L1 Part 图（L0 局部放大）→ L2 章图；
+- **⏸ 网关故障挂起（2026-08-17 凌晨，subagent 池 503 No available accounts）**：主对话通、全部 subagent 被拒。
+  挂起三线（网关恢复后按此续）：
+  ① ch6 Review 六维：`Workflow({scriptPath: ".claude/workflows/chapter-pipeline-v3.js", resumeFromRunId: "wf_f41848a5-46e", args: {chapter_no:6, instance:"vllm"}})`
+  ② ch5 正文修复 writer（linger blocking 等 12 处，工单已派未回报）——重派即可，图记账行已修好
+  ③ ch3 workflow（w6p77fo55）状态未知——查其通知或重发
+  已定稿：ch1/2/4（已推送）。
+- **🔄 Phase 2 图系三层缩放**（已完成：L0+L1×8 minimap 模式+L2 渲染器样板）：L0 唯一 → L1 Part 图（L0 局部放大）→ L2 章图；
   同一数据源分层渲染；改造 v2 arch-model 渲染器。
 - Phase 3 逐章重写：pipeline 复用 + 新写作契约（hook 开篇/先地图后细节/阶梯展开）。
 - v3 方法论/大纲：`docs/superpowers/specs/2026-08-15-v3-pedagogy-rewrite.md` +
