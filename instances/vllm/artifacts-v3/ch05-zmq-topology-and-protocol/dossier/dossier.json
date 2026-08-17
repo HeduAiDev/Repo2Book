@@ -1,0 +1,596 @@
+{
+ "chapter_id": "ch05",
+ "part": "II",
+ "title": "ZMQ 拓扑与消息协议",
+ "pin": "vLLM v0.27.1 (6e448d0ea9bf3d88d898b65449ca6dc2aec170ac)——全部锚点与 embed 已对当前 pin 逐行 sed 现核（2026-08-16）；v2 artifacts/ch07-engine-core 的行号是 v0.21.0 的，只作讲法参考、未照抄任何行号。v0.21.0→v0.27.1 三处关键演进（deepread ipc-stage 卡 changes_vs_v021）：① 客户端 MessageTracker/pending_messages 已被 #50053(2026-07-28) 整体删除——零拷贝帧改由 zmq 自身引用链保活；② socket 拓扑从单前端假设变为「每前端一条」的 many-to-many（#17546）；③ client_index 由前端直接写进 EngineCoreRequest 字段（不再是引擎侧另算的隐性契约）",
+ "chapter_kind": "code",
+ "note_on_kind": "标准代码章（非 primer）：走 implementer 精简版 + lint_fidelity 全链。本章把 L0 紫色 ZMQ 边界带放大：两个进程之间到底怎么对话——socket 拓扑（输入 ROUTER/DEALER、输出 PUSH/PULL 的不对称 + 演进史）、线格式（字节标签首帧 + msgpack 多帧 + 零拷贝）、无反压（HWM=0）、OOB 共享内存旁路、死讯哨兵。主线 = 一条消息的跨界往返（10 站）。边界：Renderer/InputProcessor 内部（ch6）、detokenize/Collector（ch7）、busy loop 五拍内部（ch9，只到 queue 为止）、DP 控制面 coordinator/wave/XSUB（ch34 只标 -1 哨兵不进门）、elastic EP/ROUTER_HANDOVER 与 fault tolerance 保留 call_id（ch39）。前置侧记（first_read 建议）：进程 vs 线程 vs GIL、ZMQ socket 最小语义表、msgpack=二进制 JSON——各半页 sidebar。",
+ "hook_suggestion": "「同一个请求，进门的路带地址信封（ROUTER）、出门却是匿名单向管道（PUSH/PULL）——进出为什么不对称？把输入改成 ROUTER 的第一版 PR 次日就被 revert，整整一年后才真正立住，它在等什么？」（从 Part II hook「一千个并发，怎么让 GPU 永不等 CPU？」+ 本章主题 + deepread ipc-stage why_chains[2] 的 #15906→revert→#17546 演进史提炼；writer 可润色，不许降格成陈述句）",
+ "code_spine": [
+  "vllm/v1/engine/core_client.py:L516-L528 — MPClient.__init__：zmq.Context(io_threads=2)，asyncio 版包 zmq.asyncio.Context（ZMQ 装配起点）",
+  "vllm/v1/engine/core_client.py:L586-L607 — 自管路径：input=ROUTER bind / output=PULL bind；tcp://host:0 占位 bind 后 getsockopt(LAST_ENDPOINT) 回填真实端口（#42585 修的 port-0 TOCTOU）",
+  "vllm/v1/engine/core_client.py:L645-L671 — core_engines identity 表（rank.to_bytes(2,'little')）+ 在 input socket 上轮询收齐每引擎 ready 帧 → _apply_ready_response 配置回填",
+  "vllm/v1/engine/utils.py:L1054-L1191 — launch_core_engines：起 EngineCoreProc 子进程；专用握手 ROUTER（L1171-L1173）收 HELLO → 回 EngineZmqAddresses 地址集 → READY 校验",
+  "vllm/v1/engine/core.py:L1027-L1042 — EngineCoreProc.__init__：input_queue/output_queue 两条 queue.Queue + identity=engine_index.to_bytes(2,'little') + EXECUTOR_FAILED 哨兵注入 + TensorIpcReceiver 装配",
+  "vllm/v1/engine/core.py:L1092-L1119 — 起两个 IO 线程（process_input_sockets/process_output_sockets），注释原话 'overlap ZMQ socket IO with GPU since they release the GIL'",
+  "vllm/v1/engine/core.py:L1660-L1693 — 输入 IO 线程装配：每前端一条 DEALER connect（同一 identity）；每条 socket 首条消息 = EngineCoreReadyResponse（'required before the front-end ROUTER socket can send input messages back to us'）",
+  "vllm/v1/engine/core.py:L1702-L1741 — 输入主循环：recv_multipart → 字节标签判型 → 按型选 decoder 解码 → ABORT 双投两队列 → input_queue.put",
+  "vllm/v1/engine/core.py:L1378-L1389 — run_busy_loop：poll input queue → step 引擎 → 产出进 output_queue（IPC 另一端消费者/生产者；五拍细节 ch9）",
+  "vllm/v1/engine/core.py:L1435-L1442 — _process_engine_step：step() 返回 dict[client_index→EngineCoreOutputs]，逐条 output_queue.put_nowait",
+  "vllm/v1/engine/core.py:L1743-L1810 — 输出 IO 线程：engine_index 盖章 → client_index 选 PUSH socket（-1 哨兵走 coordinator → ch34）→ encode_into 复用 bytearray → _send_msg_tracking_payload 首帧 tracker 发送",
+  "vllm/v1/engine/core.py:L1812-L1827 — _send_msg_tracking_payload：手工分帧保活首帧主 buffer（send_multipart 的 tracker 只跟最后一帧）",
+  "vllm/v1/engine/core_client.py:L1104-L1123 — 客户端发送：_send_input → encode 多帧 → _send_input_message 拼 (engine_identity, type, *bufs) send_multipart(copy=False)",
+  "vllm/v1/engine/core_client.py:L1145-L1148 — add_request_async：盖 client_index → ADD 过线（ch4 第 9 站的真身展开）",
+  "vllm/v1/engine/core_client.py:L1016-L1091 — 异步输出任务：PULL recv_multipart → validate_alive（单帧死讯→EngineDeadError）→ decode → utility 分支/outputs_queue",
+  "vllm/v1/engine/core_client.py:L831-L870 — 同步对照：SyncMPClient 守护线程跑同一循环 + PAIR shutdown socket 干净停机",
+  "vllm/v1/engine/__init__.py:L261-L274 — EngineCoreRequestType：单字节 hex enum（'sent over sockets without separate encoding step'）",
+  "vllm/v1/engine/__init__.py:L97-L146 — EngineCoreRequest Struct（array_like/omit_defaults/gc=False；client_index 字段注释 'outputs are sent back to the same client'）",
+  "vllm/v1/serial_utils.py:L136-L189 — MsgpackEncoder：encode 返回主帧+aux_buffers 多帧；encode_into 复用调用方 buffer",
+  "vllm/v1/serial_utils.py:L257-L273 — _encode_tensor 三分支：内联 RAW_VIEW / OOB 句柄 / aux_buffers 索引",
+  "vllm/v1/serial_utils.py:L399-L425 — _decode_tensor：OOB dict 走 provider / frombuffer 零拷贝视图 + 按需 clone/pin",
+  "vllm/utils/network_utils.py:L283-L326 — make_zmq_socket：HWM=0 + 0.5GB 内核缓冲（改编自 SGLang）+ bind 默认规则",
+  "vllm/v1/engine/tensor_ipc.py:L45-L178 — TensorIpcSender/TensorIpcReceiver：OOB 共享内存旁路 + drain-and-buffer 乱序重组",
+  "vllm/v1/engine/coordinator.py:L23-L137 — DP coordinator（只标存在：统计/wave 控制面 → ch34 回讲）"
+ ],
+ "stations": [
+  {
+   "n": 1,
+   "where": "core_client.py:L527-L528, L589-L607",
+   "what": "装配 client 半边：zmq.Context(io_threads=2)；input=ROUTER bind、output=PULL bind；tcp:0 占位 bind 后 LAST_ENDPOINT 回填真实端口"
+  },
+  {
+   "n": 2,
+   "where": "vllm/v1/engine/utils.py:L1171-L1173, L1292-L1313",
+   "what": "拓扑发现：专用握手 ROUTER 收 HELLO → 回 EngineZmqAddresses 地址集（每前端一条 input/output 地址）→ READY 校验配置一致"
+  },
+  {
+   "n": 3,
+   "where": "core.py:L1034, L1660-L1693",
+   "what": "引擎半边认亲：identity=engine_index.to_bytes(2,'little')；每前端一条 DEALER connect，首条消息 EngineCoreReadyResponse——'required before the front-end ROUTER can send input back'"
+  },
+  {
+   "n": 4,
+   "where": "serial_utils.py:L166-L178",
+   "what": "① 编码：encoder.encode(EngineCoreRequest) → 主帧 + aux_buffers 多帧（<256B CPU 张量内联）"
+  },
+  {
+   "n": 5,
+   "where": "core_client.py:L1113-L1123",
+   "what": "② 过线：(engine_identity, b'\\x00', *bufs) send_multipart(copy=False)；零拷贝帧由 zmq 引用链保活（#50053 后无显式 tracker）"
+  },
+  {
+   "n": 6,
+   "where": "core.py:L1705-L1716",
+   "what": "③ 抵达：DEALER recv_multipart → 字节标签判型（EngineCoreRequestType(bytes(type_frame.buffer))）→ add_request_decoder.decode 零拷贝视图"
+  },
+  {
+   "n": 7,
+   "where": "core.py:L1717-L1721, L1741",
+   "what": "④ 卸货：preprocess_add_request 构造 Request（grammar_init 不占忙循环）→ input_queue.put——从此归引擎进程独占可变"
+  },
+  {
+   "n": 8,
+   "where": "core.py:L1441-L1442",
+   "what": "⑤ 产出：step() 每 step 产出 (client_index, EngineCoreOutputs) → output_queue（scheduler 按 request.client_index 分桶 scheduler.py:L2015-L2016；五拍内部 ch9）"
+  },
+  {
+   "n": 9,
+   "where": "core.py:L1785-L1810",
+   "what": "⑥ 回程：输出线程 outputs.engine_index 盖章 → sockets[client_index] → encode_into 复用 bytearray → 首帧 tracker PUSH 过线（linger=4000）"
+  },
+  {
+   "n": 10,
+   "where": "core_client.py:L1037-L1042, L1093-L1102",
+   "what": "⑦ 到家：PULL 收帧 → validate_alive（ENGINE_CORE_DEAD 单帧哨兵）→ decoder.decode → get_output_async 交回 output_handler（→ ch7 上行主线）"
+  }
+ ],
+ "stations_note": "站号 = 一条消息的跨界往返顺序：1-3 站装配边界（谁 bind 谁 connect、DEALER 为什么必须先发言），4-7 站下行进引擎，8 站引擎内部一拍（只到 queue 为止，ch9 展开），9-10 站上行回前端。与 ch4 衔接：ch4 第 9 站『盖 client_index 过线』是本章第 4-5 站的预览；与 ch7 衔接：本章第 10 站把 EngineCoreOutputs 交回 output_handler。",
+ "key_classes": [
+  {"name": "EngineCoreClient", "file": "vllm/v1/engine/core_client.py:L78-L139", "responsibility": "抽象基类 + make_client 工厂：定义前端向 EngineCore 推请求/拉输出的统一接口（同步与 async 两套方法签名）。三种传输策略子类可替换——ch4 已讲工厂二轴，本章讲它们共同坐落的 ZMQ 拓扑。"},
+  {"name": "MPClient", "file": "vllm/v1/engine/core_client.py:L503-L800", "responsibility": "多进程 client 基类（本章主角宿主）：建 zmq.Context(io_threads=2)、ROUTER bind + PULL bind、launch_core_engines 起引擎子进程、收齐每引擎 ready 帧、装配 MsgpackEncoder/Decoder 与可选 TensorIpcSender、起进程存活监控线程、BackgroundResources 无环终结清理。"},
+  {"name": "SyncMPClient", "file": "vllm/v1/engine/core_client.py:L802-L972", "responsibility": "同步子类（离线 LLM 默认）：守护线程跑 process_outputs_socket 把输出投 queue.Queue；call_utility 用 concurrent Future 配对；含 PAIR shutdown socket + poller 的干净停机。"},
+  {"name": "AsyncMPClient", "file": "vllm/v1/engine/core_client.py:L974-L1247", "responsibility": "asyncio 子类（在线服务生产路径）：asyncio task 跑输出循环投 asyncio.Queue；_send_input/_send_input_message 多帧发送；call_utility_async 用 asyncio.Future 配对。DP 子类 DPAsyncMPClient/DPLBAsyncMPClient → ch34。"},
+  {"name": "InprocClient", "file": "vllm/v1/engine/core_client.py:L306-L404", "responsibility": "进程内对照组：直接持 EngineCore 实例，无 ZMQ、无序列化、无 busy loop——凸显『有 IPC』与『无 IPC』的差异，也是 V0 兼容/测试逃生舱。"},
+  {"name": "BackgroundResources", "file": "vllm/v1/engine/core_client.py:L406-L501", "responsibility": "weakref.finalize 持有的资源包（ctx/sockets/tasks/engine_manager）：client 被 GC 或构造中途异常时干净关闭；validate_alive 在此——单帧 ENGINE_CORE_DEAD → engine_dead=True + EngineDeadError。"},
+  {"name": "EngineCoreProc", "file": "vllm/v1/engine/core.py:L1008-L1916", "responsibility": "EngineCore 的 ZMQ 包装子类（引擎进程侧主角）：两条 queue.Queue + 两个 IO 线程（process_input_sockets/process_output_sockets）+ 主线程 busy loop；DEALER identity=engine_index 2 字节小端；ENGINE_CORE_DEAD 哨兵常量。"},
+  {"name": "EngineCoreRequestType", "file": "vllm/v1/engine/__init__.py:L261-L275", "responsibility": "单字节 hex enum（ADD=b'\\x00'…WAKEUP=b'\\x05'）：值本身是 bytes，直接作 ZMQ 多帧消息首帧，'sent over sockets without separate encoding step'——免一次编码，且类型与负载分帧便于按型选 decoder。"},
+  {"name": "EngineCoreRequest", "file": "vllm/v1/engine/__init__.py:L97-L182", "responsibility": "『前端→引擎』唯一请求载体（msgspec.Struct，array_like+omit_defaults+gc=False）：只有 token ids/embeds/mm_features，没有 prompt 文本（tokenization 在前端，ch6）；client_index 字段是回程路由键（F3/F4）。"},
+  {"name": "EngineCoreOutputs / EngineCoreOutput", "file": "vllm/v1/engine/__init__.py:L184-L258", "responsibility": "回程聚合消息：每 step 每前端一条 EngineCoreOutputs，内含 outputs: list[EngineCoreOutput]（每请求一条：new_token_ids/finish_reason…）+ 可选 utility_output/finished_requests/wave_complete；NOTE(Nick) 承认行式布局未榨干。"},
+  {"name": "EngineCoreReadyResponse", "file": "vllm/v1/engine/__init__.py:L69-L95", "responsibility": "数据 socket 上的首条消息（认亲帧）：既让 ROUTER 学会对端 identity，又把 post-init 配置带回前端（auto-fit 后 max_model_len、num_gpu_blocks、block_size、dp_stats_address，另带 version/world_size 等服务 Rust 前端 #40848）。"},
+  {"name": "MsgpackEncoder", "file": "vllm/v1/serial_utils.py:L136-L311", "responsibility": "自定义 msgpack 编码器：encode/encode_into 返回多帧序列（主帧 + aux_buffers 零拷贝张量 backing 帧）；enc_hook 处理 Tensor/ndarray/slice/mm/UtilityResult；OOB consumer 钩子；小于阈值内联；未知类型默认 TypeError 拒发（pickle 需 VLLM_ALLOW_INSECURE_SERIALIZATION）。"},
+  {"name": "MsgpackDecoder", "file": "vllm/v1/serial_utils.py:L313-L483", "responsibility": "对应解码器：decode(bufs) 用 bufs[0] 解主结构；aux_buffers[idx] 零拷贝还原张量（torch.frombuffer + 按需 pin/clone）；OOB dict 走 oob_tensor_provider（TensorIpcReceiver）。"},
+  {"name": "OOBTensorConsumer / OOBTensorProvider", "file": "vllm/v1/serial_utils.py:L57-L75", "responsibility": "带外张量协议抽象：consumer 编码时被调用，返回 dict 占位（张量走带外通道）或 None（回退普通序列化）；provider 解码时按 (dtype, shape, meta) 取回真张量。TensorIpcSender/Receiver 分别实现两端。"},
+  {"name": "TensorIpcSender", "file": "vllm/v1/engine/tensor_ipc.py:L45-L105", "responsibility": "OOB 发送端：多模态张量 share_memory_() 后 put 进 torch.multiprocessing.Queue，返回 {sender_id,message_id,tensor_id} 句柄嵌进 msgpack 主帧；失败回退普通序列化。仅 mm_tensor_ipc='torch_shm' 启用；单队列只打 rank 0、DP>1 不支持（类注释明言）。"},
+  {"name": "TensorIpcReceiver", "file": "vllm/v1/engine/tensor_ipc.py:L114-L178", "responsibility": "OOB 接收端：drain-and-buffer 模式排空队列、按 (sender_id,message_id,tensor_id) 缓冲，处理多生产者乱序到达；推进 current_message_id 时丢弃过期张量防泄漏。"},
+  {"name": "make_zmq_socket", "file": "vllm/utils/network_utils.py:L283-L326", "responsibility": "全仓 ZMQ socket 统一工厂（改编自 SGLang）：HWM=0（RCVHWM/SNDHWM）+ 大内存机器 0.5GB 内核缓冲；bind 默认规则（PUSH/SUB/XSUB 默认 connect，其余默认 bind）；identity/linger/router_handover 透传。"},
+  {"name": "EngineZmqAddresses / EngineHandshakeMetadata", "file": "vllm/v1/engine/utils.py:L62-L85", "responsibility": "握手协议载荷：地址集（每前端一条 inputs/outputs + coordinator 两址）+ parallel_config 摘要——拓扑发现的唯一真相载体，由握手 ROUTER 从前端发给每个引擎。"},
+  {"name": "launch_core_engines / CoreEngineProcManager", "file": "vllm/v1/engine/utils.py:L120-L215, L1054-L1340", "responsibility": "进程编排：mp context.Process(target=EngineCoreProc.run_engine_core) 起引擎子进程；持专用握手 ROUTER 完成 HELLO→地址集→READY 两层握手；torch_shm 时创建 tensor_queue。"}
+ ],
+ "data_flow": [
+  "（依 deepread/ipc-stage.json data_flow 段引用，行号已对 v0.27.1 现核）1. ch4 第 9 站续：AsyncMPClient.add_request_async 盖 request.client_index = self.client_index（core_client.py:L1145-L1147）→ _send_input：encoder.encode(EngineCoreRequest) 得多帧 buffer（L1104-L1114）→ _send_input_message 拼 msg=(engine_identity, b'\\x00', *bufs) → input ROUTER send_multipart(copy=False)（L1116-L1123）——零拷贝帧由 zmq 引用链保活，无需显式 tracker（注释 L1120-L1122）。[torch_shm 时：TensorIpcSender.__call__ 把 mm 张量 share_memory_ 后 put 进 mp Queue、帧里只有句柄（tensor_ipc.py:L69-L105）]",
+  "2. 引擎进程输入 IO 线程：DEALER recv_multipart（core.py:L1705）→ 首帧判型 b'\\x00' → add_request_decoder.decode（零拷贝视图/OOB 取回，core.py:L1715-L1716）→ preprocess_add_request：Request.from_engine_core_request + grammar_init（core.py:L1717-L1721 → L969-L991）→ input_queue.put（L1741）。预处理抛错 → _handle_request_preproc_error 回送该请求自己的 ERROR 输出（L1829-L1836），不炸引擎。",
+  "3. busy loop（ch9 主场，本章到 queue 为止）：_process_input_queue 拿到 → _handle_client_request 按字节标签分派（core.py:L1507-L1534；ABORT 双队列 L1733-L1741）→ step_fn() 产出 dict[client_index, EngineCoreOutputs] → 逐条 output_queue.put_nowait（L1441-L1442）。",
+  "4. 引擎输出 IO 线程 process_output_sockets：取 (client_index, outputs) → outputs.engine_index = engine_index（core.py:L1785-L1786）→ client_index=-1 走 coordinator PUSH（L1788-L1793，ch34）；否则 reuse_buffers 取回收 bytearray → encode_into 复用编码（L1795-L1802）→ _send_msg_tracking_payload 首帧 send(track=True)+其余 send_multipart(copy=False)（L1803-L1805 → L1812-L1827）→ tracker 未完成则 (tracker, buffer) 入 pending 等回收（L1806-L1810）。",
+  "5. 前端输出任务（async 版）：PULL recv → validate_alive（单帧死讯→EngineDeadError；core_client.py:L1037-L1041 → L490-L493）→ decoder.decode(EngineCoreOutputs)（L1041）→ utility_output 则按 call_id 唤醒 Future（L780-L799），否则 outputs_queue（L1081-L1083）→ get_output_async 返回（L1093-L1102）→ async_llm output_handler 按 VLLM_V1_OUTPUT_PROC_CHUNK_SIZE=128 切片喂 OutputProcessor、块间 await asyncio.sleep(0)（async_llm.py:L676-L703）——交回 ch7 上行主线。",
+  "6. 反向控制（同一条 socket）：ABORT(b'\\x01') 双投 aborts_queue+input_queue（ch7 断连场景）；UTILITY(b'\\x03')=(client_index, call_id, method, args) 薄 RPC（client 发起 core_client.py:L1128-L1140 / 引擎反射调用 core.py:L1521-L1534 / 结果按 call_id 配对 Future 回程）；EXECUTOR_FAILED/WAKEUP 是引擎进程内部哨兵，不过线。",
+  "7. 死讯：引擎异常 → _send_engine_dead 把 b'ENGINE_CORE_DEAD' 投 output_queue（core.py:L1605-L1617，输出 PUSH linger=4000 L1759-L1760 保证死讯先于关 socket 发出）→ 前端 validate_alive 抛 EngineDeadError + 进程 sentinel 监控线程兜底（core_client.py:L708-L735）。跨进程健康就这三个机制，没有心跳。"
+ ],
+ "why_chains": [
+  {
+   "id": "WC1",
+   "card": "deepread/ipc-stage.json why_chains[0]",
+   "decision": "三段式进程解耦：前端进程（Renderer+InputProcessor+OutputProcessor，与 API server 同进程）+ EngineCore 独立进程（只留 scheduler + model executor）",
+   "old_design": "V0 AsyncLLMEngine：引擎步进就是 API server 进程 asyncio 事件循环里的后台 task；tokenize/detokenize 同进程、整条链路 async 化（历史 e19bce40a~1:vllm/engine/async_llm_engine.py，上一轮深读经 git 核对所录）。v1 首次落地=PR #9826（6ace6fba2，2024-11，AsyncLLM/EngineCoreProc 诞生）。",
+   "pain": "GPU 变快后 CPU 开销成为瓶颈：Llama-8B@H100 单 step 低至 ~5ms（官方 V1 alpha 博客，blog.vllm.ai 2025-01-27），API server/输入准备/detokenize/流式这些 CPU 活与 GPU 循环同进程串行、互抢 GIL——'the CPU overhead becomes increasingly pronounced'。",
+   "solution": "v0.27.1 落点：AsyncLLM.__init__ 一次构好三段——源码注释原话 'Convert EngineInput --> EngineCoreRequest'（InputProcessor）/ 'Converts EngineCoreOutputs --> RequestOutput'（OutputProcessor）/ 'EngineCore (starts the engine in background process)'（vllm/v1/engine/async_llm.py:L135-L156）；引擎进程内再分两个 IO 线程 + 两个 queue.Queue，把 ZMQ IO 与 busy loop 解耦——注释原话 'overlap ZMQ socket IO with GPU since they release the GIL, and to overlap some serialization/deserialization with the model forward pass'（vllm/v1/engine/core.py:L1092-L1119）；核心循环 run_busy_loop（core.py:L1378-L1389：poll input queue → publish counts → engine step）。进程生成由 CoreEngineProcManager 用 mp context.Process(target=EngineCoreProc.run_engine_core)（vllm/v1/engine/utils.py:L120-L210）。",
+   "cost": "每请求生命周期至少 2 次跨进程消息（进 1 条 EngineCoreRequest、出 N 条打包在每 step 每前端 1 条的 EngineCoreOutputs 里），两侧各付一次序列化 CPU；启动从『调构造函数』变成多层协议（见 contracts 启动契约，超时 VLLM_ENGINE_READY_TIMEOUT_S=600s，vllm/envs.py:L27，给大模型慢加载留量）；故障域分裂：引擎死要靠单帧哨兵 ENGINE_CORE_DEAD（core.py:L1011 定义、L1605-L1617 发送并 join 输出线程、输出 PUSH linger=4000 保证死讯先于关 socket 发出 core.py:L1758-L1766）+ 前端 validate_alive（core_client.py:L490-L493）+ 进程 sentinel 监控线程（core_client.py:L708-L735）三重机制转成 EngineDeadError；跨界对象必须 msgpack 可序列化（默认拒绝任意 Python 对象，逃生舱 VLLM_ALLOW_INSECURE_SERIALIZATION 走 pickle 但有注入风险，vllm/v1/serial_utils.py:L221-L226）；调试要跨进程看两份日志。"
+  },
+  {
+   "id": "WC2",
+   "card": "deepread/ipc-stage.json why_chains[1]",
+   "decision": "多进程默认开启（连离线同步 LLM 也默认走 ZMQ SyncMPClient）",
+   "old_design": "v1 初期多进程默认关——设计文档原话见随 pin 的 docs/design/multiprocessing.md:L83-L98（'Prior State in v1'：VLLM_ENABLE_V1_MULTIPROCESSING 'defaulted to off ... for all the reasons mentioned above - compatibility with dependencies and code using vLLM as a library'，fork 与已初始化 CUDA 冲突是主因）；只有显式设 env 才开，离线 LLM 走 InprocClient。",
+   "pain": "inproc 与 mp 两套路径行为分叉、双份测试矩阵；fork 后 CUDA 崩、spawn 后用户代码无 __main__ guard 无限递归（文档 L100-L146 给了两段真实报错日志）——没有一条万能 start method。",
+   "solution": "PR #11074（4863e5fba，2024-12，附上引设计文档）默认开启并做 best-effort 选择：默认 fork、vllm CLI 控制时用 spawn、检测到 CUDA 已初始化强制 spawn+警告（文档 L100-L113）。v0.27.1 落点：VLLM_ENABLE_V1_MULTIPROCESSING 默认 True（vllm/envs.py:L149）；LLMEngine.from_vllm_config 传 multiprocess_mode=envs.VLLM_ENABLE_V1_MULTIPROCESSING（vllm/v1/engine/llm_engine.py:L157，from_engine_args 同 L174-L185）；工厂 make_client 按 (multiprocess, asyncio) 二维分发三实现（vllm/v1/engine/core_client.py:L90-L112）；InprocClient 保留为 V0 兼容/测试路径（core_client.py:L306-L402，docstring 'no busy loop'——同步逐个 step，不存在忙等）。",
+   "cost": "离线推理也要付 IPC + 序列化税；spawn 语义要求一切可 pickle；fork 默认值依赖『使用者没先碰 CUDA』的脆弱假设（文档明言该 case 仍会坏，只能警告）；asyncio+inproc 组合直接 NotImplementedError（core_client.py:L98-L102）。"
+  },
+  {
+   "id": "WC3",
+   "card": "deepread/ipc-stage.json why_chains[2]",
+   "decision": "输入通道：client ROUTER(bind) / engine DEALER(connect, identity=engine_index 两字节小端)，且每前端一条",
+   "old_design": "初版（#9826，6ace6fba2 已核对）：client PUSH bind / engine PULL connect，另开一次性 socket 传 READY 字符串。#15906（651cf0fec1，2025-04-04）首次改 ROUTER/DEALER——次日即被 revert（296c6572d，2025-04-05，revert commit 留在历史里）；真正立住的是 #17546（2dbe8c0774，2025-05-30），commit 标题即动机：'[Perf] API-server scaleout with many-to-many server-engine comms'——多 API server 前端 ↔ 多引擎的 many-to-many。#15906 的三条原始动机（上一轮深读经 GitHub API 核对 PR body）：① 'a single queue / socket address can be used for all engines'（DP 下 client 要定向发给 N 个引擎之一，PUSH 无寻址能力）；② ready 走独立 socket 有竞态 'the front-end could start sending messages before the engine has finished connecting'；③ 远程引擎（多节点）需要 client 侧 bind。",
+   "pain": "PUSH/PULL 是匿名管道：多引擎共享一条地址时无法定向；单前端假设被 API-server 水平扩展打破（N 前端 × M 引擎的 fan-out/fan-in 无解）。首次改造因回归被 revert 也说明：拓扑改造的收益要等 motivating 用例（many-to-many）成熟才兑现。",
+   "solution": "v0.27.1 落点：client 输入 socket = ROUTER bind（core_client.py:L589-L595 自管路径 / L554-L560 外部管理路径，elastic EP 时加 router_handover=L543 注释 'allow the new engine to replace the dead connection'）；engine = DEALER connect 且 ZMQ IDENTITY = engine_index.to_bytes(2,'little')（core.py:L1034；每个前端地址一条 DEALER、同一 identity，core.py:L1661-L1667）；DEALER 必须先发言 ROUTER 才认识它——引擎输入线程在每条数据 socket 上的首条消息就是 EngineCoreReadyResponse，注释原话 'this is required before the front-end ROUTER socket can send input messages back to us'（core.py:L1686-L1693）；client 每条消息首帧带目标引擎 identity，消息布局 (Identity, RequestType, *Payload帧)（core_client.py:L887 同步 / L1113+L1123 异步）；client 侧 ready 收集循环 core_client.py:L652-L669（poll 同步 shadow socket，逐引擎消 identity）。",
+   "cost": "ROUTER 信封让每条消息多一个帧；『对端必须先发言』成为硬约束（写死进启动时序，谁先谁后有讲究）；同 identity 重连需要 ROUTER_HANDOVER（elastic EP 场景，core_client.py:L540-L544 + network_utils.py:L318-L320）——复杂度又长了一层；DP=1 的普通部署也要为它用不上的寻址能力付信封开销。"
+  },
+  {
+   "id": "WC4",
+   "card": "deepread/ipc-stage.json why_chains[3]",
+   "decision": "输出通道：保持最廉价的 engine PUSH(connect, 每前端一条) / client PULL(bind)；引擎按 client_index 选 PUSH socket，client_index 由前端写进请求本身",
+   "old_design": "初版输出即 PUSH/PULL（engine PUSH / client PULL，单前端单条）；朴素替代方案是请求-应答式 socket（REQ/REP 或双向 ROUTER/DEALER）。",
+   "pain": "输出是纯单向扇入（M 引擎 → N 前端），应答式每条消息都要配对等待、engine 会被慢前端反压卡住 GPU；many-to-many 扩展后还要回答『这条输出该回给哪个前端』。",
+   "solution": "v0.27.1 落点：engine 侧为每个前端建一条 PUSH connect（core.py:L1761-L1766，output_paths 每前端一个地址）；路由键 client_index 由前端在 add_request_async 里直接盖章进 EngineCoreRequest（core_client.py:L1146，DP 版再盖 current_wave L1413-L1414）→ Request 携带（vllm/v1/request.py:L230）→ scheduler.update_from_output 按 request.client_index 分桶产出 dict[client_index, EngineCoreOutputs]（vllm/v1/core/sched/scheduler.py:L1670-L1674 签名、L1924 按请求 client_index 分桶、L2015-L2016 组装；finished_requests 集合也按 client_index 分桶 L2023-L2028）→ 输出线程 sockets[client_index] 发送（core.py:L1785-L1805）；client 侧单条 PULL bind 收本前端所有引擎输出（core_client.py:L596-L598）；所有相关 socket 置 HWM=0 + 大内存机器 0.5GB 内核缓冲（vllm/utils/network_utils.py:L310-L316，函数头注明改编自 SGLang L283）。",
+   "cost": "无反压：HWM=0 + 0.5GB 缓冲意味着前端卡死时消息持续堆积、内存风险自担（换取 engine 永不因前端慢而阻塞 GPU 的决定）；fire-and-forget 无送达确认，死讯靠 ENGINE_CORE_DEAD 哨兵 + linger 兜底；client_index 契约必须两端一致——好在 v0.27.1 已把它收进消息本身（请求字段），不再依赖两侧各自推算（v0.21.0 的隐性契约）。"
+  },
+  {
+   "id": "WC5",
+   "card": "deepread/ipc-stage.json why_chains[4]",
+   "decision": "序列化格式：msgpack（msgspec）+ 自定义 tensor/ndarray 编解码钩子（而非 pickle、而非裸 msgpack）",
+   "old_design": "三段演变（本仓 git 逐一核对）：① #9826 初版用 msgspec.msgpack（只认原生类型）；② #10245 因多模态输入带 PIL image 等类型整体退回 pickle（上一轮深读核对 PR body：'Since the multimodal inputs include types incompatible with msgspec (e.g., PIL images), we use pickle'）；③ #12918（67c4637cc，2025-03）回到 msgpack。",
+   "pain": "pickle 慢且有安全面（对象反序列化可执行代码）；裸 msgpack 不认 torch.Tensor/np.ndarray/多模态结构。",
+   "solution": "v0.27.1 落点：MsgpackEncoder/MsgpackDecoder 以 enc_hook/dec_hook 处理 Tensor/ndarray/slice/MultiModalKwargsItem/UtilityResult（vllm/v1/serial_utils.py:L136-L310 编码侧、L313-L483 解码侧）；消息 Struct 用 msgspec 的 array_like=True（按位置数组编码而非键值映射，载荷更小）+ omit_defaults=True + gc=False（vllm/v1/engine/__init__.py:L97-L102,L184-L189,L230-L235）；FinishReason 用 IntEnum，注释原话 'Int rather than Str for more compact serialization'（__init__.py:L43-L65）；pickle 仅在 VLLM_ALLOW_INSECURE_SERIALIZATION=1 时作为回退（serial_utils.py:L221-L226），默认未知类型直接 TypeError 拒发。",
+   "cost": "自定义编解码器代码复杂度高（mm 字段要手写 factory 重建逻辑 serial_utils.py:L275-L310/L427-L454）；schema 演进要求两端同步（Struct 字段增删需兼容）；不认识的类型默认硬错误（调试期友好、运行期是故障）；encoder 显式非线程安全（serial_utils.py:L139-L140 注释）。"
+  },
+  {
+   "id": "WC6",
+   "card": "deepread/ipc-stage.json why_chains[5]",
+   "decision": "msgpack 多帧零拷贝：大 tensor 的后备缓冲作为独立 ZMQ 帧直传不拷进主 buffer；客户端不再自建保活机制，引擎输出侧改为『复用 bytearray + 首帧 tracker』",
+   "old_design": "#13790（dd143ef54）之前：张量转 bytes 整体 encode 进单一 buffer → 每次发送至少两次拷贝（encode 一次 + zmq send 一次）。#13790 引入 aux_buffers 多帧 + 两端各一套 MessageTracker/pending_messages 显式保活。v0.27.1 又进化：#50053（6453fc0b8，2026-07-28）把客户端侧 MessageTracker 整体删除——diff 可见 pending_messages/add_pending_message/free_pending_messages 被移除，send 不再 track。",
+   "pain": "多模态大图/视频张量 MB~百 MB 级，逐请求重复拷贝直接吃 TTFT 与内存带宽（#13790 PR 原话：'the backing data of tensors/numpy arrays contained in messages is sent directly by zmq without copying'）。而显式 tracker 的痛点是客户端要在每条发送路径上手动维护对象生命周期（#50053 修的正是一类『zmq 还没发完就复用 buffer』的正确性 bug——标题 'Don't reuse engine core payload buffer while zmq is sending it'）。",
+   "solution": "v0.27.1 落点：MsgpackEncoder.encode 返回 buffer 序列——主 buffer + aux_buffers，隐藏传参技巧注释在 vllm/v1/serial_utils.py:L157-L160，encode 本体 L166-L178；tensor 编码为 (dtype, shape, index|memoryview|dict) 三元组，index 指向 aux buffer（L257-L274）；小于阈值（VLLM_MSGPACK_ZERO_COPY_THRESHOLD 默认 256B，envs.py:L208）的 CPU 张量走 CUSTOM_TYPE_RAW_VIEW 内联免拷（L263-L265）；tensor_data() 取 uint8 memoryview 视图而非拷贝（vllm/v1/utils.py:L777-L787）；发送 send_multipart(copy=False)（core_client.py:L891 同步 / L1123 异步）——客户端注释原话 'Any zero-copy tensor/ndarray frames are kept alive by zmq itself until it's finished sending them (there is a ref chain from the underlying memoryview back to the original owning tensor/ndarray)'（core_client.py:L888-L890,L1120-L1122）；解码端 torch.frombuffer 建零拷贝视图、按需 pin_memory/clone 保证安全异步 CPU→GPU 拷贝（serial_utils.py:L399-L425）。引擎输出侧保留 tracker 但换了对象：encode_into 复用 bytearray（core.py:L1801-L1802），pending deque 存 (MessageTracker, bytearray) 待 zmq 发完再回收（core.py:L1756,L1795-L1810）；因 send_multipart 的 tracker 只跟最后一帧、而要保活的是第一帧的主 buffer，专门写了 _send_msg_tracking_payload 手工分帧发送并返回首帧 tracker（core.py:L1812-L1827，docstring 讲明缘由）。",
+   "cost": "引擎输出侧的 buffer 回收逻辑精细（首帧 tracker 技巧、max_reuse_bufs 限额）；接收侧零拷贝视图会锁住整条消息缓冲（serial_utils.py:L389-L392 注释警告 'it now locks the whole received message buffer in memory'）；客户端『zmq 自动保活』依赖调用方作用域持有原对象直到 await 完成——这是隐式约定而非类型系统保证。"
+  },
+  {
+   "id": "WC7",
+   "card": "deepread/ipc-stage.json why_chains[6]",
+   "decision": "多模态超大/CUDA 张量走 OOB 共享内存旁路（torch.multiprocessing.Queue），msgpack 主 buffer 里只放句柄",
+   "old_design": "所有张量数据都进 ZMQ 帧——即使有上一条链的多帧零拷贝，跨进程仍要过一遍 socket；CUDA 张量还得先 GPU→CPU。",
+   "pain": "#32104（80b70884e，2025-08）针对视频解码重负载：HW 解码结果在 API server 进程的 VRAM，经 ZMQ 要 'GPU->CPU->GPU copies' 两跳（上一轮深读核对 PR 原话）。",
+   "solution": "v0.27.1 落点：MsgpackEncoder 构造参数 oob_tensor_consumer（serial_utils.py:L150-L162，接口 OOBTensorConsumer L57-L71）；TensorIpcSender 把 tensor share_memory_() 后 put 进 torch.mp Queue、msgpack 主 buffer 里只放 {sender_id, message_id, tensor_id} 句柄（vllm/v1/engine/tensor_ipc.py:L45-L105）；engine 侧 TensorIpcReceiver 以 drain-and-buffer 模式从队列取回共享张量（tensor_ipc.py:L114-L178）；仅 multimodal_config.mm_tensor_ipc=='torch_shm' 时启用：队列在 launch_core_engines 创建（vllm/v1/engine/utils.py:L1078-L1085）、client 侧接 TensorIpcSender（core_client.py:L622-L629）、engine 侧接 TensorIpcReceiver（core.py:L1038-L1042）。",
+   "cost": "单队列只打 rank 0、DP>1 不支持（tensor_ipc.py:L46-L49 类注释明言 'Note: DP>1 not supported'）；句柄走 ZMQ、数据走队列两条通道可能乱序，接收端要做缓冲重排 + 过期清理（L139-L178）；发送失败要能优雅回退普通序列化（L99-L105）；mm processor cache 开启时此路径失效（PR 自述 known limitation）——这是为视频这类『单次大块、cache 不命中』负载特化的通道。"
+  },
+  {
+   "id": "WC8",
+   "card": "deepread/ipc-stage.json why_chains[7]",
+   "decision": "输出按步聚合：每个 forward step 每客户端只发一条 EngineCoreOutputs（整批所有请求的新 token 打包）",
+   "old_design": "朴素做法（多数自研推理服务第一版）：逐请求、逐 token 发事件/回调。",
+   "pain": "每条消息有固定开销（ZMQ 帧 + msgpack 头 + 解码出的对象 + 前端事件循环唤醒）；小模型 5ms/step、批内几十上百请求时逐 token 发消息的 IPC 次数爆炸。",
+   "solution": "EngineCoreOutputs = outputs: list[EngineCoreOutput]（每请求一条：request_id + new_token_ids + finish_reason 等，vllm/v1/engine/__init__.py:L184-L215 单条、L230-L258 聚合；代码里留着 NOTE(Nick) 'We could consider ways to make this more compact, e.g. columnwise layout'——行式布局尚未榨干）；step() 返回 dict[client_index → EngineCoreOutputs]（core.py:L584-L614，scheduler.update_from_output 产出）；busy loop 逐 (client_index, outputs) 入 output_queue（core.py:L1441-L1442）；前端 output_handler 整取后按 VLLM_V1_OUTPUT_PROC_CHUNK_SIZE=128 切片喂 OutputProcessor、块间 await asyncio.sleep(0) 让出事件循环（async_llm.py:L676-L703，envs.py:L160）。",
+   "cost": "单条消息变大 → 解码与 detokenize 若一口气做完会长时间独占前端事件循环，逼出 chunk+sleep(0) 机制（这正是 #12287 的动机之一；其 A100/Llama-3.2-1B/6000 请求基准，上一轮深读经 GitHub API 核对：req/s 63.62→67.72（+6.4%），mean TTFT 229.23→197.34ms（−14%），mean TPOT 30.02→28.30ms，p99 TPOT 68.90→47.38ms（−31%））；行式序列化密度低于列式（NOTE 承认）。"
+  }
+ ],
+ "embed_excerpts": [
+  {
+   "path": "vllm/v1/engine/__init__.py",
+   "lines": "L261-L274",
+   "code": "class EngineCoreRequestType(enum.Enum):\n    \"\"\"\n    Request types defined as hex byte strings, so it can be sent over sockets\n    without separate encoding step.\n    \"\"\"\n\n    ADD = b\"\\x00\"\n    ABORT = b\"\\x01\"\n    START_DP_WAVE = b\"\\x02\"\n    UTILITY = b\"\\x03\"\n    # Sentinel used within EngineCoreProc.\n    EXECUTOR_FAILED = b\"\\x04\"\n    # Sentinel to wake up input_queue.get() during shutdown.\n    WAKEUP = b\"\\x05\"",
+   "elide": ["START_DP_WAVE（b'\\x02'）是 DP wave 控制面信令 → ch34；EXECUTOR_FAILED/WAKEUP 是引擎进程内部哨兵（executor_fail_callback 注入、shutdown 唤醒），不过线——初读只需盯 ADD/ABORT/UTILITY 三个真过线的"]
+  },
+  {
+   "path": "vllm/v1/engine/__init__.py",
+   "lines": "L97-L130",
+   "code": "class EngineCoreRequest(\n    msgspec.Struct,\n    array_like=True,  # type: ignore[call-arg]\n    omit_defaults=True,  # type: ignore[call-arg]\n    gc=False,\n):  # type: ignore[call-arg]\n    request_id: str\n    prompt_token_ids: list[int] | None\n    mm_features: list[MultiModalFeatureSpec] | None\n    sampling_params: SamplingParams | None\n    pooling_params: PoolingParams | None\n    arrival_time: float\n    lora_request: LoRARequest | None\n    cache_salt: str | None\n    data_parallel_rank: int | None\n    prompt_embeds: torch.Tensor | None = None\n\n    # Per-position mask for mixed-mode inputs (e.g chat completion with\n    # prompt_embeds content parts). `True` means the position is a real\n    # token ID; `False` means the position uses a pre-computed entry from\n    # `prompt_embeds`. `None` for pure-tokens and pure-embeds requests.\n    prompt_is_token_ids: list[bool] | None = None\n\n    # Index of the client, used to ensure outputs are sent back to the same\n    # client for this request when scaling out the front-end.\n    client_index: int = 0\n\n    # Used in DP case to indicate which wave of requests this is expected to\n    # belong to, to cover a race condition where the request is sent before\n    # a wave finished notification is received.\n    current_wave: int = 0\n    priority: int = 0\n\n    trace_headers: Mapping[str, str] | None = None",
+   "elide": ["L131 之后的 resumable/external_req_id/reasoning_ended/reasoning_parser_kwargs/abort_immediately 字段——external_req_id 双轨 id 在 ch4 已讲、abort_immediately 是 KV 迁移拒绝场景（ch36 邻域），本章讲『字段表里没有 prompt 文本、只有 token ids/embeds』即可"]
+  },
+  {
+   "path": "vllm/v1/engine/__init__.py",
+   "lines": "L230-L246",
+   "code": "class EngineCoreOutputs(\n    msgspec.Struct,\n    array_like=True,  # type: ignore[call-arg]\n    omit_defaults=True,  # type: ignore[call-arg]\n    gc=False,\n):  # type: ignore[call-arg]\n    # NOTE(Nick): We could consider ways to make this more compact,\n    # e.g. columnwise layout\n\n    engine_index: int = 0\n\n    # [num_reqs]\n    outputs: list[EngineCoreOutput] = []\n    scheduler_stats: SchedulerStats | None = None\n    timestamp: float = 0.0\n\n    utility_output: UtilityOutput | None = None",
+   "elide": ["L247 之后的 finished_requests/wave_complete/start_wave 字段——wave 是 DP 控制面（ch34）；本章讲『每 step 每前端一条、行式布局 NOTE 承认未榨干』"]
+  },
+  {
+   "path": "vllm/v1/engine/core_client.py",
+   "lines": "L586-L607",
+   "code": "            else:\n                # Engines are managed by this client.\n                addresses = get_engine_zmq_addresses(vllm_config)\n                self.input_socket = self.resources.input_socket = make_zmq_socket(\n                    self.ctx,\n                    addresses.inputs[0],\n                    zmq.ROUTER,\n                    bind=True,\n                    router_handover=enable_input_socket_handover,\n                )\n                self.resources.output_socket = make_zmq_socket(\n                    self.ctx, addresses.outputs[0], zmq.PULL\n                )\n\n                # Resolve ``tcp://host:0`` placeholders to bound endpoints\n                # before engines DEALER-connect. No-op for IPC.\n                addresses.inputs[0] = self.input_socket.getsockopt(\n                    zmq.LAST_ENDPOINT\n                ).decode()\n                addresses.outputs[0] = self.resources.output_socket.getsockopt(\n                    zmq.LAST_ENDPOINT\n                ).decode()",
+   "elide": ["router_handover=enable_input_socket_handover 是 elastic EP 重连接管（ch39），初读可无视这一参数；PULL 未传 bind=——make_zmq_socket 的默认规则替它 bind（见 network_utils 摘录）"]
+  },
+  {
+   "path": "vllm/v1/engine/core_client.py",
+   "lines": "L645-L671",
+   "code": "\n            # ZMQ identity of each engine that this client will talk to.\n            self.core_engines: list[EngineIdentity] = [\n                rank.to_bytes(2, \"little\") for rank in self.engine_ranks_managed\n            ]\n\n            # Wait for ready messages from each engine on the input socket.\n            identities = set(self.core_engines)\n            sync_input_socket = zmq.Socket.shadow(self.input_socket)\n            while identities:\n                if not sync_input_socket.poll(\n                    timeout=VLLM_ENGINE_READY_TIMEOUT_S * 1000  # convert to ms\n                ):\n                    raise TimeoutError(\n                        f\"Timed out waiting for engine core processes to \"\n                        f\"start. This is often caused by slow weight loading \"\n                        f\"for large models. Waited \"\n                        f\"{VLLM_ENGINE_READY_TIMEOUT_S}s (configured by \"\n                        f\"VLLM_ENGINE_READY_TIMEOUT_S). To increase the \"\n                        f\"timeout, set the environment variable: \"\n                        f\"VLLM_ENGINE_READY_TIMEOUT_S=<seconds>\"\n                    )\n                identity, payload = sync_input_socket.recv_multipart()\n                identities.remove(identity)\n                self._apply_ready_response(payload)\n\n            self.core_engine: EngineIdentity = self.core_engines[0]",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/engine/core.py",
+   "lines": "L1660-L1693",
+   "code": "        with ExitStack() as stack, zmq.Context() as ctx:\n            input_sockets = [\n                stack.enter_context(\n                    make_zmq_socket(\n                        ctx, input_address, zmq.DEALER, identity=identity, bind=False\n                    )\n                )\n                for input_address in input_addresses\n            ]\n            if coord_input_address is None:\n                coord_socket = None\n            else:\n                coord_socket = stack.enter_context(\n                    make_zmq_socket(\n                        ctx,\n                        coord_input_address,\n                        zmq.XSUB,\n                        identity=identity,\n                        bind=False,\n                    )\n                )\n                # Send subscription message to coordinator.\n                coord_socket.send(b\"\\x01\")\n\n            # Register sockets with poller.\n            poller = zmq.Poller()\n            ready_response = self._make_ready_response()\n            ready_payload = msgspec.msgpack.encode(ready_response)\n            for input_socket in input_sockets:\n                # Send initial message to each input socket - this is required\n                # before the front-end ROUTER socket can send input messages\n                # back to us.\n                input_socket.send(ready_payload)\n                poller.register(input_socket, zmq.POLLIN)",
+   "elide": ["L1671-L1682 的 coord_socket/XSUB 分支是 DP 控制面（ch34 回讲）——单机部署 coord_input_address=None 时整支不进"]
+  },
+  {
+   "path": "vllm/v1/engine/core.py",
+   "lines": "L1702-L1741",
+   "code": "            while True:\n                for input_socket, _ in poller.poll():\n                    # (RequestType, RequestData)\n                    type_frame, *data_frames = input_socket.recv_multipart(copy=False)\n                    # NOTE(yongji): ignore READY message sent by DP coordinator\n                    # that is used to notify newly started engines\n                    if type_frame.buffer == b\"READY\":\n                        assert input_socket == coord_socket\n                        continue\n                    request_type = EngineCoreRequestType(bytes(type_frame.buffer))\n\n                    # Deserialize the request data.\n                    request: Any\n                    if request_type == EngineCoreRequestType.ADD:\n                        req: EngineCoreRequest = add_request_decoder.decode(data_frames)\n                        try:\n                            request = self.preprocess_add_request(req)\n                        except Exception:\n                            self._handle_request_preproc_error(req)\n                            continue\n                    elif request_type == EngineCoreRequestType.UTILITY:\n                        request = generic_decoder.decode(data_frames)\n                        client_idx, call_id, method, args = request\n                        if method == FT_UTILITY_METHOD:\n                            self.ft_sentinel.handle_command(\n                                client_idx, call_id, args[0]\n                            )\n                            continue\n                    else:\n                        request = generic_decoder.decode(data_frames)\n\n                        if request_type == EngineCoreRequestType.ABORT:\n                            # Aborts are added to *both* queues, allows us to eagerly\n                            # process aborts while also ensuring ordering in the input\n                            # queue to avoid leaking requests. This is ok because\n                            # aborting in the scheduler is idempotent.\n                            self.aborts_queue.put_nowait(request)\n\n                    # Push to input queue for core busy loop.\n                    self.input_queue.put_nowait((request_type, request))",
+   "elide": ["L1725-L1729 的 FT_UTILITY_METHOD 拦截是 fault tolerance 控制面（ch39）；L1708-L1711 的 b'READY' 分支属 DP coordinator 通知（ch34）——两支都是『同一 socket 上折进的控制信令』的例证，初读可略"]
+  },
+  {
+   "path": "vllm/v1/engine/core_client.py",
+   "lines": "L1104-L1148",
+   "code": "    def _send_input(\n        self,\n        request_type: EngineCoreRequestType,\n        request: Any,\n        engine: EngineIdentity | None = None,\n    ) -> Awaitable[Any]:\n        if engine is None:\n            engine = self.core_engine\n\n        message = (request_type.value, *self.encoder.encode(request))\n        return self._send_input_message(message, engine)\n\n    def _send_input_message(\n        self, message: tuple[bytestr, ...], engine: EngineIdentity\n    ) -> Awaitable[Any]:\n        self.ensure_alive()\n        # Any zero-copy tensor/ndarray frames are kept alive by zmq itself\n        # until it's finished sending them (there is a ref chain from the underlying\n        # memoryview back to the original owning tensor/ndarray).\n        return self.input_socket.send_multipart((engine,) + message, copy=False)\n\n    async def call_utility_async(self, method: str, *args) -> Any:\n        return await self._call_utility_async(method, *args, engine=self.core_engine)\n\n    async def _call_utility_async(\n        self, method: str, *args, engine: EngineIdentity\n    ) -> Any:\n        call_id = uuid.uuid1().int >> 64\n        future = asyncio.get_running_loop().create_future()\n        self.utility_results[call_id] = future\n        message = (\n            EngineCoreRequestType.UTILITY.value,\n            *self.encoder.encode((self.client_index, call_id, method, args)),\n        )\n        await self._send_input_message(message, engine)\n        self._ensure_output_queue_task()\n        return await future\n\n    async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:\n        return await self.call_utility_async(\"get_supported_tasks\")\n\n    async def add_request_async(self, request: EngineCoreRequest) -> None:\n        request.client_index = self.client_index\n        await self._send_input(EngineCoreRequestType.ADD, request)\n        self._ensure_output_queue_task()",
+   "elide": ["L1124-L1143 的 utility RPC 块走同一发送路径——讲薄 RPC（m12）时回看，初读可略；注意 send_multipart((engine,) + message)：engine identity 永远是第 0 帧"]
+  },
+  {
+   "path": "vllm/v1/engine/core_client.py",
+   "lines": "L884-L899",
+   "code": "    def _send_input(self, request_type: EngineCoreRequestType, request: Any):\n        self.ensure_alive()\n        # (Identity, RequestType, SerializedRequest)\n        msg = (self.core_engine, request_type.value, *self.encoder.encode(request))\n        # Any zero-copy tensor/ndarray frames are kept alive by zmq itself\n        # until it's finished sending them (there is a ref chain from the underlying\n        # memoryview back to the original owning tensor/ndarray).\n        self.input_socket.send_multipart(msg, copy=False)\n\n    def call_utility(self, method: str, *args) -> Any:\n        call_id = uuid.uuid1().int >> 64\n        future: Future[Any] = Future()\n        self.utility_results[call_id] = future\n        self._send_input(EngineCoreRequestType.UTILITY, (0, call_id, method, args))\n\n        return future.result()",
+   "elide": ["同步版与异步版逐行同构——sync/async 差异被压进 client 一层（ch4 WC；Utility 元组第 0 位是 client_index 占位 0）"]
+  },
+  {
+   "path": "vllm/v1/engine/core.py",
+   "lines": "L1749-L1810",
+   "code": "        encoder = MsgpackEncoder()\n        # Send buffers to reuse.\n        reuse_buffers: list[bytearray] = []\n        # Payload buffers that can't be reused yet because zmq may still be\n        # sending them.\n        # Buffers of the zero-copy tensor/ndarray frames don't need tracking\n        # here: zmq itself holds a reference to each until it's done with it.\n        pending = deque[tuple[zmq.MessageTracker, bytearray]]()\n\n        # We must set linger to ensure the ENGINE_CORE_DEAD\n        # message is sent prior to closing the socket.\n        with ExitStack() as stack, zmq.Context() as ctx:\n            sockets = [\n                stack.enter_context(\n                    make_zmq_socket(ctx, output_path, zmq.PUSH, linger=4000)\n                )\n                for output_path in output_paths\n            ]\n            coord_socket = (\n                stack.enter_context(\n                    make_zmq_socket(\n                        ctx, coord_output_path, zmq.PUSH, bind=False, linger=4000\n                    )\n                )\n                if coord_output_path is not None\n                else None\n            )\n            max_reuse_bufs = len(sockets) + 1\n\n            while True:\n                output = self.output_queue.get()\n                if output == EngineCoreProc.ENGINE_CORE_DEAD:\n                    for socket in sockets:\n                        socket.send(output)\n                    break\n                assert not isinstance(output, bytes)\n                client_index, outputs = output\n                outputs.engine_index = engine_index\n\n                if client_index == -1:\n                    # Don't reuse buffer for coordinator message\n                    # which will be very small.\n                    assert coord_socket is not None\n                    coord_socket.send_multipart(encoder.encode(outputs))\n                    continue\n\n                # Reclaim buffers that zmq is finished with.\n                while pending and pending[-1][0].done:\n                    reclaimed = pending.pop()[1]\n                    if len(reuse_buffers) < max_reuse_bufs:\n                        reuse_buffers.append(reclaimed)\n\n                buffer = reuse_buffers.pop() if reuse_buffers else bytearray()\n                buffers = encoder.encode_into(outputs, buffer)\n                tracker = self._send_msg_tracking_payload(\n                    sockets[client_index], buffers\n                )\n                if not tracker.done:\n                    pending.appendleft((tracker, buffer))\n                elif len(reuse_buffers) < max_reuse_bufs:\n                    # Limit the number of buffers to reuse.\n                    reuse_buffers.append(buffer)",
+   "elide": ["L1767-L1775 的 coord_socket 与 L1788-L1793 的 client_index==-1 哨兵是 DP 控制面统计通道（ch34）——注意它们复用同一条输出线程与 PUSH 语义"]
+  },
+  {
+   "path": "vllm/v1/engine/core.py",
+   "lines": "L1812-L1827",
+   "code": "    @staticmethod\n    def _send_msg_tracking_payload(\n        socket: zmq.Socket, buffers: Sequence[bytestr]\n    ) -> zmq.MessageTracker:\n        \"\"\"Send `buffers` as a zero-copy multipart message, returning a tracker\n        for the *first* frame.\n\n        Used instead of `Socket.send_multipart()` because we reuse the buffer\n        passed to `MsgpackEncoder.encode_into()`: `send_multipart()` returns a\n        tracker for the last frame only.\n        \"\"\"\n        more_flag = zmq.SNDMORE if len(buffers) > 1 else 0\n        tracker = socket.send(buffers[0], more_flag, copy=False, track=True)\n        if more_flag:\n            socket.send_multipart(buffers[1:], copy=False)\n        return tracker",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/serial_utils.py",
+   "lines": "L166-L189",
+   "code": "    def encode(self, obj: Any) -> Sequence[bytestr]:\n        try:\n            if self.oob_tensor_consumer is not None:\n                self.oob_tensor_consumer.new_message()\n            self.aux_buffers = bufs = [b\"\"]\n            bufs[0] = self.encoder.encode(obj)\n            # This `bufs` list allows us to collect direct pointers to backing\n            # buffers of tensors and np arrays, and return them along with the\n            # top-level encoded buffer instead of copying their data into the\n            # new buffer.\n            return bufs\n        finally:\n            self.aux_buffers = None\n\n    def encode_into(self, obj: Any, buf: bytearray) -> Sequence[bytestr]:\n        try:\n            if self.oob_tensor_consumer is not None:\n                self.oob_tensor_consumer.new_message()\n            self.aux_buffers = [buf]\n            bufs = self.aux_buffers\n            self.encoder.encode_into(obj, buf)\n            return bufs\n        finally:\n            self.aux_buffers = None",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/serial_utils.py",
+   "lines": "L257-L273",
+   "code": "    def _encode_tensor(\n        self, obj: torch.Tensor\n    ) -> tuple[str, tuple[int, ...], int | dict | memoryview]:\n        oob_consumer = self.oob_tensor_consumer\n        # view the tensor as a contiguous 1D array of bytes\n        if obj.nbytes < self.size_threshold and obj.is_cpu:\n            # Smaller tensors are encoded inline, just like ndarrays.\n            data = msgpack.Ext(CUSTOM_TYPE_RAW_VIEW, tensor_data(obj))\n        elif oob_consumer is not None and (data := oob_consumer(obj)) is not None:\n            assert isinstance(data, dict)\n        else:\n            # Otherwise encode index of backing buffer to avoid copy.\n            assert self.aux_buffers is not None\n            data = len(self.aux_buffers)\n            self.aux_buffers.append(tensor_data(obj))\n        dtype = str(obj.dtype).removeprefix(\"torch.\")\n        return dtype, obj.shape, data",
+   "elide": ["三分支是本章一图一例的好素材：内联（小 CPU 张量）/ OOB 句柄 dict / aux_buffers 索引 int"]
+  },
+  {
+   "path": "vllm/v1/serial_utils.py",
+   "lines": "L399-L425",
+   "code": "    def _decode_tensor(self, arr: Any) -> torch.Tensor:\n        dtype, shape, data = arr\n        if isinstance(data, dict):\n            assert self.oob_tensor_provider, (\n                \"Received OOB tensor but tensor provider is not set\"\n            )\n            return self.oob_tensor_provider(dtype, shape, data)\n\n        is_aux = isinstance(data, int)\n        buffer = self.aux_buffers[data] if is_aux else data\n        buffer = buffer if isinstance(buffer, memoryview) else memoryview(buffer)\n        torch_dtype = getattr(torch, dtype)\n        assert isinstance(torch_dtype, torch.dtype)\n        if not buffer.nbytes:  # torch.frombuffer doesn't like empty buffers\n            assert 0 in shape\n            return torch.empty(shape, dtype=torch_dtype)\n        # Create uint8 array\n        arr = torch.frombuffer(buffer, dtype=torch.uint8)\n        # Clone ensures tensor is backed by pytorch-owned memory for safe\n        # future async CPU->GPU transfer.\n        # Pin larger tensors for more efficient CPU->GPU transfer.\n        if not is_aux:\n            arr = arr.clone()\n        elif not self.share_mem:\n            arr = arr.pin_memory() if self.pin_tensors else arr.clone()\n        # Convert back to proper shape & type\n        return arr.view(torch_dtype).view(shape)",
+   "elide": ["与 _encode_tensor 三分支严格对偶：dict→OOB provider / int→aux_buffers 零拷贝视图 / memoryview→内联帧"]
+  },
+  {
+   "path": "vllm/utils/network_utils.py",
+   "lines": "L283-L326",
+   "code": "# Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.1/python/sglang/srt/utils.py#L783 # noqa: E501\ndef make_zmq_socket(\n    ctx: zmq.asyncio.Context | zmq.Context,  # type: ignore[name-defined]\n    path: str,\n    socket_type: Any,\n    bind: bool | None = None,\n    identity: bytes | None = None,\n    linger: int | None = None,\n    router_handover: bool = False,\n) -> zmq.Socket | zmq.asyncio.Socket:  # type: ignore[name-defined]\n    \"\"\"Make a ZMQ socket with the proper bind/connect semantics.\"\"\"\n\n    mem = psutil.virtual_memory()\n    socket = ctx.socket(socket_type)\n\n    # Calculate buffer size based on system memory\n    total_mem = mem.total / 1024**3\n    available_mem = mem.available / 1024**3\n    # For systems with substantial memory (>32GB total, >16GB available):\n    # - Set a large 0.5GB buffer to improve throughput\n    # For systems with less memory:\n    # - Use system default (-1) to avoid excessive memory consumption\n    buf_size = int(0.5 * 1024**3) if total_mem > 32 and available_mem > 16 else -1\n\n    if bind is None:\n        bind = socket_type not in (zmq.PUSH, zmq.SUB, zmq.XSUB)\n\n    if socket_type in (zmq.PULL, zmq.DEALER, zmq.ROUTER):\n        socket.setsockopt(zmq.RCVHWM, 0)\n        socket.setsockopt(zmq.RCVBUF, buf_size)\n\n    if socket_type in (zmq.PUSH, zmq.DEALER, zmq.ROUTER):\n        socket.setsockopt(zmq.SNDHWM, 0)\n        socket.setsockopt(zmq.SNDBUF, buf_size)\n\n    if socket_type == zmq.ROUTER and router_handover:\n        # Let a new connection take over an identity left behind by a dead one.\n        socket.setsockopt(zmq.ROUTER_HANDOVER, 1)\n\n    if identity is not None:\n        socket.setsockopt(zmq.IDENTITY, identity)\n\n    if linger is not None:\n        socket.setsockopt(zmq.LINGER, linger)",
+   "elide": ["L313-L315 的 ROUTER_HANDOVER 是 elastic EP 重连（ch39）——注意 L308 的 bind 默认规则：PUSH/SUB/XSUB 默认 connect，其余默认 bind（这解释了 client PULL 不传 bind 也 bind、engine PUSH 不传 bind 也 connect）"]
+  },
+  {
+   "path": "vllm/v1/engine/core.py",
+   "lines": "L1027-L1042",
+   "code": "        self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()\n        self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()\n        executor_fail_callback = lambda: self.input_queue.put_nowait(\n            (EngineCoreRequestType.EXECUTOR_FAILED, b\"\")\n        )\n\n        self.engine_index = engine_index\n        identity = self.engine_index.to_bytes(length=2, byteorder=\"little\")\n        self.engines_running = False\n        self.shutdown_state = EngineShutdownState.RUNNING\n\n        # Receiver for tensor IPC\n        self.tensor_ipc_receiver: TensorIpcReceiver | None = None\n        if tensor_queue is not None:\n            self.tensor_ipc_receiver = TensorIpcReceiver(tensor_queue)\n            logger.info(\"Using tensor IPC queue for multimodal tensor sharing\")",
+   "elide": ["output_queue 的元素类型是两态：正常 (client_index, EngineCoreOutputs) 或 bytes（死讯/哨兵）——L1780 的 == 比较正是吃这个两态"]
+  },
+  {
+   "path": "vllm/v1/engine/core.py",
+   "lines": "L1092-L1119",
+   "code": "            # Background Threads and Queues for IO. These enable us to\n            # overlap ZMQ socket IO with GPU since they release the GIL,\n            # and to overlap some serialization/deserialization with the\n            # model forward pass.\n            # Threads handle Socket <-> Queues and core_busy_loop uses Queue.\n            ready_event = threading.Event()\n            input_thread = threading.Thread(\n                target=self.process_input_sockets,\n                args=(\n                    addresses.inputs,\n                    addresses.coordinator_input,\n                    identity,\n                    ready_event,\n                ),\n                daemon=True,\n            )\n            input_thread.start()\n\n            self.output_thread = threading.Thread(\n                target=self.process_output_sockets,\n                args=(\n                    addresses.outputs,\n                    addresses.coordinator_output,\n                    self.engine_index,\n                ),\n                daemon=True,\n            )\n            self.output_thread.start()",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/engine/core_client.py",
+   "lines": "L490-L493",
+   "code": "    def validate_alive(self, frames: Sequence[zmq.Frame]):\n        if len(frames) == 1 and (frames[0].buffer == EngineCoreProc.ENGINE_CORE_DEAD):\n            self.engine_dead = True\n            raise EngineDeadError()",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/engine/core_client.py",
+   "lines": "L1037-L1044",
+   "code": "        async def process_outputs_socket():\n            try:\n                while True:\n                    frames = await output_socket.recv_multipart(copy=False)\n                    resources.validate_alive(frames)\n                    outputs: EngineCoreOutputs = decoder.decode(frames)\n                    if outputs.utility_output:\n                        if (",
+   "elide": ["L1044 起的 utility/EEP/FT 分支（ch34/ch39）——主线就这四行：收帧、验活、解码、分流"]
+  },
+  {
+   "path": "vllm/v1/engine/core.py",
+   "lines": "L1605-L1617",
+   "code": "    def _send_engine_dead(self):\n        \"\"\"Send EngineDead status to the EngineCoreClient.\"\"\"\n\n        # Put ENGINE_CORE_DEAD in the queue.\n        self.output_queue.put_nowait(EngineCoreProc.ENGINE_CORE_DEAD)\n\n        # Wait until msg sent by the daemon before shutdown.\n        self.output_thread.join(timeout=5.0)\n        if self.output_thread.is_alive():\n            logger.fatal(\n                \"vLLM shutdown signal from EngineCore failed \"\n                \"to send. Please report this issue.\"\n            )",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/engine/tensor_ipc.py",
+   "lines": "L69-L105",
+   "code": "    def __call__(self, tensor: torch.Tensor) -> dict[str, Any] | None:\n        \"\"\"Send tensor via queue, return its handle. Returns None if failed.\"\"\"\n        try:\n            # Move tensor to shared memory for IPC\n            # This is required for proper inter-process communication\n            if not tensor.is_shared():\n                tensor = tensor.share_memory_()\n\n            metadata = {\n                \"sender_id\": self._sender_id,\n                \"message_id\": self._message_counter,\n                \"tensor_id\": self._tensor_id_counter,\n            }\n\n            self._tensor_id_counter += 1\n\n            ipc_data = TensorIpcData(**metadata, tensor=tensor)  # type: ignore[arg-type]\n\n            # Use a timeout to avoid blocking indefinitely\n            self.queue.put(ipc_data, timeout=10.0)\n\n            logger.debug(\n                \"Sent tensor %s for (shape=%s, device=%s) \"\n                \"via IPC queue (shared memory)\",\n                metadata,\n                tensor.shape,\n                tensor.device,\n            )\n\n            return metadata\n        except Exception as e:\n            logger.warning(\n                \"Failed to send tensor via IPC queue: %s. \"\n                \"Falling back to standard serialization.\",\n                e,\n            )\n            return None",
+   "elide": ["L87-L96 的 logger.debug 块可略；注意 except 兜底返回 None = 优雅回退普通序列化（enc_hook 的 elif 分支）"]
+  },
+  {
+   "path": "vllm/v1/core/sched/scheduler.py",
+   "lines": "L2012-L2017",
+   "code": "        # Create EngineCoreOutputs for all clients that have requests with\n        # outputs in this step.\n        engine_core_outputs = {\n            client_index: EngineCoreOutputs(outputs=outs)\n            for client_index, outs in outputs.items()\n        }",
+   "elide": ["outputs 这个 dict 的分桶发生在 L1924（outputs[request.client_index].append）——路由键从请求字段一路带到引擎出口"]
+  }
+ ],
+ "theory": [
+  "ZMQ socket 最小语义（本章前置 sidebar）：① PUSH/PULL = 匿名单向管道（无 identity、无定向、入队即忘）；② ROUTER/DEALER = 带 identity 信封的异步双向对——ROUTER 收到的每条消息首帧是对端 identity、要回发也必须把这个信封帧放回首帧；③ DEALER 可自带 identity（本仓 = engine_index 两字节小端）；④ bind 持地址、connect 找地址——谁 bind 谁就『坐等被连接』，远程引擎场景必须 client 侧 bind。需讲清『DEALER 必须先发言』：ROUTER 只有见过某 identity 才能向其回发，这解释了启动时序里 EngineCoreReadyResponse 为什么是每条数据 socket 的第一条消息。",
+  "HWM（高水位标记）与 0 的含义：ZMQ 默认在内存排队若干条消息后阻塞发送者（反压）。HWM=0 = 无限队列不反压 + 0.5GB 内核缓冲（大内存机器）——vLLM 的决定是『引擎永不被慢前端阻塞 GPU』，代价是前端卡死时消息持续堆积、内存风险自担。这是吞吐优先的经典 trade-off，可对比 TCP receive window 的反压语义。",
+  "零拷贝代价/收益量化：① 朴素路径 = encode 拷一次 + zmq send 拷一次；② aux_buffers 多帧 + send_multipart(copy=False) = backing buffer 直接给 zmq 指针，零拷贝，但发送完成前不许复用（客户端靠 zmq 引用链自动保活，引擎侧因复用 bytearray 必须首帧 tracker 手工保活）；③ 内联阈值 VLLM_MSGPACK_ZERO_COPY_THRESHOLD=256B——小于它的 CPU 张量/数组走 CUSTOM_TYPE_RAW_VIEW 内联（一次拷贝，省多帧管理开销）；④ 接收侧 torch.frombuffer 零拷贝视图会锁住整条消息缓冲（msgspec 解码完前不许丢帧），按需 pin_memory/clone 才安全做异步 CPU→GPU。worked example 建议：对一个 4×float32 张量与一个 100MB 视频特征张量分别数每条路径的拷贝次数。",
+  "IPC 消息次数模型：每请求生命周期 = 进 1 条 EngineCoreRequest + 出 ceil(生成 token 数 / 每 step 聚合) 打包在每 step 每前端 1 条 EngineCoreOutputs 里。小模型 5ms/step、批内 B 个请求时，朴素逐请求逐 token 发消息 = B × (1/0.005) 条/秒；按步聚合后 = 200 条/秒（与 B 无关）——量级差三个数量级，这是 WC8 的量化根据，也是前端 128 切片 + sleep(0) 的由来（大消息解码不能一口气独占事件循环）。",
+  "进程 vs 线程 vs GIL（本章前置 sidebar 的『为什么是两个进程不是两个线程』）：纯 Python 线程逃不出 GIL，但 ZMQ 的 C 扩展在 IO 时释放 GIL——所以引擎进程内部还能再分两个 IO 线程与 busy loop 并行（core.py:L1092-L1119 注释）；而 tokenize/detokenize 这类 CPU 大户必须搬到另一个进程（前端），因为它们是纯 Python/重 CPU，线程并行救不了。两句话分别解释『为什么分进程』与『进程内为什么还能分线程』。",
+  "msgpack vs JSON vs pickle（前置 sidebar）：msgpack = 二进制 JSON（键可省、整数变长编码），配 msgspec.Struct 还有 schema（array_like 按位置编码、omit_defaults 跳默认值、gc=False 免 GC 追踪）——载荷远小于 JSON；pickle 能带任意 Python 对象但慢且反序列化可执行任意代码（安全面），vLLM 默认 TypeError 拒发未知类型、只在 VLLM_ALLOW_INSECURE_SERIALIZATION=1 时回退 pickle。correlation-id RPC 模式：ZMQ 单向流没有内建 request-response，UTILITY 薄 RPC 用 uuid call_id 把 Future 与回程 UtilityOutput 配对——分布式系统通用模式（HTTP 幂等键/X-Request-ID 同款）。"
+ ],
+ "mechanisms": [
+  {
+   "id": "m1",
+   "name": "ZMQ socket 拓扑：输入 client ROUTER(bind)↔engine DEALER(connect×每前端一条)，输出 engine PUSH(connect×每前端一条)→client PULL(bind)，全对 HWM=0",
+   "kind": "layout",
+   "source_anchors": ["vllm/v1/engine/core_client.py:L589-L598", "vllm/v1/engine/core.py:L1661-L1667", "vllm/v1/engine/core.py:L1761-L1766", "vllm/utils/network_utils.py:L310-L316"],
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "difficulty": "core",
+   "note": "WC3+WC4。本章头图素材：双进程框 + 四类 socket + 方向箭头（请求→、ready 先行虚线、输出←）。进出不对称是核心考点：输入要定向（多引擎选一）→ ROUTER 信封；输出纯扇入 → 最廉价 PUSH/PULL。many-to-many（#17546）：每前端一条 DEALER/PUSH。"
+  },
+  {
+   "id": "m2",
+   "name": "DEALER 先发言认亲：每条数据 socket 首条消息 = EngineCoreReadyResponse（'required before the front-end ROUTER socket can send input messages back to us'），兼带回 post-init 配置",
+   "kind": "protocol",
+   "source_anchors": ["vllm/v1/engine/core.py:L1688-L1693", "vllm/v1/engine/core.py:L1619-L1643", "vllm/v1/engine/core_client.py:L652-L669", "vllm/v1/engine/core_client.py:L737-L777", "vllm/v1/engine/__init__.py:L69-L95"],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "core",
+   "note": "WC3。ROUTER 语义的硬约束写死进启动时序；EngineCoreReadyResponse 双重职责（认亲+配置回传 max_model_len/num_gpu_blocks/block_size）在 _apply_ready_response 落地。可并入 m1 图的虚线 ready 箭头。"
+  },
+  {
+   "id": "m3",
+   "name": "字节标签线格式：EngineCoreRequestType 单字节 enum 作 ZMQ 首帧（免编码），消息布局 = (Identity, Type, *Payload帧)，engine 侧按型选 decoder",
+   "kind": "protocol",
+   "source_anchors": ["vllm/v1/engine/__init__.py:L261-L274", "vllm/v1/engine/core_client.py:L887", "vllm/v1/engine/core_client.py:L1113-L1123", "vllm/v1/engine/core.py:L1705-L1716"],
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "difficulty": "core",
+   "note": "WC3 线格式面。worked example：一条带 1 个大张量的 ADD 消息逐帧拆解（帧0 identity 2B / 帧1 b'\\x00' 1B / 帧2 msgpack 主帧 / 帧3 aux backing buffer）对照无张量请求（=3 帧）。"
+  },
+  {
+   "id": "m4",
+   "name": "msgpack Struct 协议：array_like=True + omit_defaults=True + gc=False + FinishReason IntEnum（'Int rather than Str for more compact serialization'）；enc_hook/dec_hook 自定义类型编解码；未知类型默认 TypeError 拒发",
+   "kind": "protocol",
+   "source_anchors": ["vllm/v1/engine/__init__.py:L97-L102", "vllm/v1/engine/__init__.py:L43-L65", "vllm/v1/engine/__init__.py:L230-L235", "vllm/v1/serial_utils.py:L136-L164", "vllm/v1/serial_utils.py:L221-L226"],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "core",
+   "note": "WC5。schema 两端同步演进是隐性契约；VLLM_ALLOW_INSECURE_SERIALIZATION 逃生舱讲清安全面（pickle 反序列化可执行代码）。"
+  },
+  {
+   "id": "m5",
+   "name": "多帧零拷贝与两侧两种保活：aux_buffers 独立帧 + send_multipart(copy=False)；客户端 zmq 引用链自动保活（#50053 删显式 tracker）vs 引擎输出侧 encode_into 复用 bytearray + _send_msg_tracking_payload 首帧 tracker",
+   "kind": "dataflow",
+   "source_anchors": ["vllm/v1/serial_utils.py:L166-L189", "vllm/v1/serial_utils.py:L257-L273", "vllm/v1/serial_utils.py:L399-L425", "vllm/v1/engine/core_client.py:L1116-L1123", "vllm/v1/engine/core.py:L1795-L1810", "vllm/v1/engine/core.py:L1812-L1827", "vllm/v1/utils.py:L777-L787", "vllm/envs.py:L208"],
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "difficulty": "core",
+   "note": "WC6。同一问题（copy=False 的 buffer 生命周期）在收发两侧因 buffer 归属不同而有不同答案——客户端 buffer 归调用方（zmq 引用链兜）、引擎侧 buffer 是自己复用的（必须 tracker）——这是 v0.27.1 新教学对比点（v2 旧档案讲的客户端 MessageTracker 已删除，勿照抄 v2）。内联阈值 256B（VLLM_MSGPACK_ZERO_COPY_THRESHOLD）在此讲。worked example：数拷贝次数。"
+  },
+  {
+   "id": "m6",
+   "name": "OOB 共享内存旁路（torch_shm）：多模态大/CUDA 张量 share_memory_ 后走 torch.mp.Queue，msgpack 主帧只放 {sender_id,message_id,tensor_id} 句柄；接收端 drain-and-buffer 乱序重组",
+   "kind": "dataflow",
+   "source_anchors": ["vllm/v1/engine/tensor_ipc.py:L45-L105", "vllm/v1/engine/tensor_ipc.py:L114-L178", "vllm/v1/serial_utils.py:L57-L75", "vllm/v1/engine/utils.py:L1078-L1085", "vllm/v1/engine/core_client.py:L622-L629", "vllm/v1/engine/core.py:L1038-L1042"],
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "difficulty": "core",
+   "note": "WC7。仅 mm_tensor_ipc='torch_shm' 启用；为视频类负载特化（GPU→CPU→GPU 两跳变零跳）；限制：单队列打 rank 0、DP>1 不支持、mm cache 开启时失效。多模态正文在 ch6，此处讲通道本身。"
+  },
+  {
+   "id": "m7",
+   "name": "HWM=0 无反压：所有相关 socket RCVHWM/SNDHWM=0 + 大内存机器 0.5GB 内核缓冲（make_zmq_socket，改编自 SGLang）——引擎永不被慢前端阻塞 GPU",
+   "kind": "config",
+   "source_anchors": ["vllm/utils/network_utils.py:L283-L326", "vllm/utils/network_utils.py:L310-L316"],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "core",
+   "note": "WC4 代价面。讲清 HWM 默认语义（反压）与 0（无限堆）的差别、以及这是一次明确的取舍决定（内存风险自担换 GPU 不等）。"
+  },
+  {
+   "id": "m8",
+   "name": "输出按步聚合：每 forward step 每前端一条 EngineCoreOutputs（整批新 token 打包）；前端按 VLLM_V1_OUTPUT_PROC_CHUNK_SIZE=128 切片 + await asyncio.sleep(0) 让出事件循环",
+   "kind": "protocol",
+   "source_anchors": ["vllm/v1/engine/__init__.py:L230-L258", "vllm/v1/engine/core.py:L584-L614", "vllm/v1/engine/core.py:L1441-L1442", "vllm/v1/engine/async_llm.py:L676-L703", "vllm/envs.py:L160"],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "core",
+   "note": "WC8。#12287 基准数字（p99 TPOT −31%）可引用（deepread 卡已核对 GitHub API）；NOTE(Nick) 行式布局未榨干是诚实的设计债注脚。"
+  },
+  {
+   "id": "m9",
+   "name": "client_index 端到端路由键：前端盖章进 EngineCoreRequest → Request 携带 → scheduler 按 request.client_index 分桶 → 输出线程 sockets[client_index] 回发；client_index=-1 哨兵走 DP coordinator",
+   "kind": "dataflow",
+   "source_anchors": ["vllm/v1/engine/core_client.py:L1145-L1148", "vllm/v1/engine/__init__.py:L120-L122", "vllm/v1/request.py:L230", "vllm/v1/core/sched/scheduler.py:L1670-L1674", "vllm/v1/core/sched/scheduler.py:L1924", "vllm/v1/core/sched/scheduler.py:L2015-L2016", "vllm/v1/engine/core.py:L1785-L1805"],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "core",
+   "note": "WC4 路由面。F4 伏笔（ROUTER 寻址能力）的载体：v0.27.1 已把契约收进消息本身（请求字段），不再依赖两侧各自推算。字段注释原话 'outputs are sent back to the same client'。"
+  },
+  {
+   "id": "m10",
+   "name": "引擎进程内两 IO 线程 + 两 queue.Queue：process_input_sockets/process_output_sockets 与 busy loop 解耦——'overlap ZMQ socket IO with GPU since they release the GIL'",
+   "kind": "layout",
+   "source_anchors": ["vllm/v1/engine/core.py:L1027-L1028", "vllm/v1/engine/core.py:L1092-L1119", "vllm/v1/engine/core.py:L1378-L1389"],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "core",
+   "note": "WC1 落地件。busy loop 永不直接碰 socket；queue 是进程内第二层解耦（第一层是进程边界）。五拍细节 ch9，本章只到 queue 为止。"
+  },
+  {
+   "id": "m11",
+   "name": "ABORT 双队列：输入线程把 ABORT 同时投 aborts_queue（busy loop 急切处理）+ input_queue（保序防漏）——'aborting in the scheduler is idempotent'",
+   "kind": "protocol",
+   "source_anchors": ["vllm/v1/engine/core.py:L1733-L1741", "vllm/v1/engine/core.py:L1411-L1414", "vllm/v1/engine/core.py:L741-L748"],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "supporting",
+   "note": "幂等性换双投的正确性设计；断连触发场景在 ch7（abort 两跳），ch9 图亦有此注——本章讲消息类型侧（ABORT=b'\\x01' 到达后去哪）。"
+  },
+  {
+   "id": "m12",
+   "name": "UTILITY 薄 RPC：(client_index, call_id, method, args) 折进同一 socket；call_id=uuid1 高 64 位配对 Future；引擎反射调用 getattr(self, method_name) + msgspec.convert 还原 Struct 参数；结果按 call_id 回程唤醒",
+   "kind": "protocol",
+   "source_anchors": ["vllm/v1/engine/core_client.py:L893-L899", "vllm/v1/engine/core_client.py:L1128-L1140", "vllm/v1/engine/core_client.py:L780-L799", "vllm/v1/engine/core.py:L1521-L1534", "vllm/v1/engine/core.py:L1570-L1586", "vllm/v1/engine/core.py:L1589-L1603"],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "supporting",
+   "note": "correlation-id 模式在单向流上模拟 request-response；两个保留 call_id（-1 EEP / -2 FT，__init__.py:L33,L35）只点名 → ch34/ch39。"
+  },
+  {
+   "id": "m13",
+   "name": "死讯契约三重机制：引擎侧单帧 b'ENGINE_CORE_DEAD' 投 output_queue + 输出 PUSH linger=4000 保证先于关 socket 发出 + join 输出线程；前端 validate_alive 消费抛 EngineDeadError + 进程 sentinel 监控线程兜底——没有心跳",
+   "kind": "protocol",
+   "source_anchors": ["vllm/v1/engine/core.py:L1011", "vllm/v1/engine/core.py:L1605-L1617", "vllm/v1/engine/core.py:L1758-L1763", "vllm/v1/engine/core.py:L1780-L1784", "vllm/v1/engine/core_client.py:L490-L493", "vllm/v1/engine/core_client.py:L708-L735"],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "supporting",
+   "note": "fire-and-forget（HWM=0 无确认）的兜底设计；三机制各管一段（发出保证/消费/进程级兜底）。"
+  },
+  {
+   "id": "m14",
+   "name": "两层启动握手：① 专用 handshake ROUTER 收 HELLO → 回 EngineHandshakeMetadata(EngineZmqAddresses 地址集) → READY 校验（MoE DP 附 config hash）；② 数据 socket 认亲（EngineCoreReadyResponse）；tcp://host:0 占位 bind 后 LAST_ENDPOINT 回填（#42585 修 port-0 TOCTOU）",
+   "kind": "protocol",
+   "source_anchors": ["vllm/v1/engine/utils.py:L1171-L1173", "vllm/v1/engine/core.py:L1241-L1248", "vllm/v1/engine/utils.py:L1292-L1330", "vllm/v1/engine/utils.py:L1005-L1050", "vllm/v1/engine/core.py:L1205-L1231", "vllm/v1/engine/utils.py:L62-L85"],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "supporting",
+   "note": "deepread first_read 建议：握手协议属工程细节，正文给时序即可、不必逐字段；VLLM_ENGINE_READY_TIMEOUT_S=600s（envs.py:L27）给大模型慢加载留量。"
+  },
+  {
+   "id": "m15",
+   "name": "多进程默认开启 + start method best-effort：VLLM_ENABLE_V1_MULTIPROCESSING 默认 True（离线也走 SyncMPClient）；默认 fork、CLI 控制时 spawn、CUDA 已初始化强制 spawn+警告；asyncio+inproc 直接 NotImplementedError",
+   "kind": "config",
+   "source_anchors": ["vllm/envs.py:L149", "vllm/v1/engine/llm_engine.py:L157", "vllm/v1/engine/llm_engine.py:L174-L185", "vllm/v1/engine/core_client.py:L90-L112", "vllm/v1/engine/core_client.py:L306-L404"],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "supporting",
+   "note": "WC2。ch4 已展示工厂二轴（m2 of ch4），本章补『为什么默认付 IPC 税』的 why：fork×CUDA 冲突、spawn×__main__ guard、双路径分叉。docs/design/multiprocessing.md 随 pin 可引。"
+  }
+ ],
+ "subtraction_plan": {
+  "delete": [
+   {"what": "DP 子类与控制面：DPAsyncMPClient/DPLBAsyncMPClient 全部（stats XSUB 订阅任务、reqs_in_flight 表、get_core_engine_for_request/lb 负载分选、wave 逻辑，core_client.py:L1249-L1696 区域）；DPEngineCoreProc/DPMoEEngineCoreActor/EngineCoreActor*（core.py:L1918-L2488）；coordinator.py 整文件；core.py 输入线程 XSUB 分支（L1673-L1682）与输出线程 coord_socket/client_index==-1 哨兵分支（L1768-L1775,L1788-L1793）", "why_safe": "数据并行编排与控制面是独立主题（ch34 回讲），与本章 IPC 边界主线无关；删后单前端单引擎的收发路径完整自洽（coord_input_address/coord_output_path=None 时这些分支本就不进）。"},
+   {"what": "弹性 EP 扩缩容：scale_elastic_ep/_scale_up_elastic_ep/_scale_down_elastic_ep/ElasticScalingCache/eep_process_engine_core_notification/ReconfigureDistributedRequest 及 router_handover 参数链（core_client.py:L540-L544,L559,L594 + __init__.py EEP 相关 + network_utils.py:L313-L315 + utils.py elastic 分支）", "why_safe": "运行时增减 DP rank 是高级特性（ch39）；精简版聚焦稳态收发。router_handover 删除后 make_zmq_socket 调用少一个 kwarg，不改变正常路径行为。"},
+   {"what": "fault tolerance：FT_UTILITY_METHOD 拦截分支（core.py:L1725-L1729）、ft_sentinel、FT_STATUS_CALL_ID 消费分支（core_client.py:L1050-L1059 区域）", "why_safe": "容错状态推送是 ch39 邻域；UTILITY 主路径（call_id 配对 Future）不依赖它。"},
+   {"what": "shutdown 优雅排空状态机细节：EngineShutdownState 的 draining/timeout 分支、_handle_shutdown 的 pause/wait/keep 模式差异、_reject_add_in_shutdown/_reject_utility_in_shutdown（core.py 相关段）；WAKEUP 保留枚举与 no-op 分派、删唤醒编排", "why_safe": "关闭语义保留最小路径（ENGINE_CORE_DEAD 哨兵 + BackgroundResources 清理足以讲清故障传播与干净停机）；复杂排空不影响正常收发协议理解。"},
+   {"what": "具体 utility 方法体（profile/reset_prefix_cache/reset_encoder_cache/add_lora/sleep/wake_up/collective_rpc/pause_scheduler 等，core_client.py 调用面与 core.py 实现面）——仅保留 get_supported_tasks 一个作 RPC 示例", "why_safe": "这些只是 call_utility 反射 RPC 的不同实参，机制讲清后逐个保留属冗余；一个示例足以演示 call_id→Future 协议闭环。"},
+   {"what": "运维旁支：instrument/tracing 装饰器、decorate_logs/set_process_title/numa_bind 日志、maybe_init_worker_tracer（core.py run_engine_core 与类定义处的非协议代码）", "why_safe": "可观测性与进程命名不参与 IPC 数据通路，删除不改变控制流。"},
+   {"what": "serial_utils 的不安全回退与多模态工厂：pickle/cloudpickle 回退分支与 _encode_type_info_recursive/_decode_type_info_recursive（serial_utils.py:L205-L235,L360-L387 区域）；_encode_mm_items/_encode_mm_item/_encode_mm_field/_encode_mm_field_elem/_encode_nested_tensors 与解码侧 _decode_mm_*（L275-L310,L427-L454）", "why_safe": "本章只需讲清 tensor/ndarray 多帧零拷贝与 OOB 旁路两条主线；多模态嵌套字段工厂在多模态正文（ch6 邻域）回讲，精简版只跑文本请求（v2 同款裁决）。注意：enc_hook/dec_hook 的分派骨架与 MultiModalKwargsItem 的 isinstance 行保留一行即可维持结构可读。"},
+   {"what": "Rust 前端服务字段消费逻辑（若精简版含 utils.py 握手段）：world_size/max_num_seqs 等 #40848 扩展字段的下游消费注释", "why_safe": "字段本身保留（Struct 定义不许动——两端 schema 契约），只删与之配套的说明性消费代码路径。"}
+  ],
+  "must_keep": [
+   {"symbol": "EngineCoreRequestType", "why": "字节标签协议的定义，全章核心概念。"},
+   {"symbol": "ADD", "why": "ADD=b'\\x00'，最主要的请求标签。"},
+   {"symbol": "ABORT", "why": "abort 双队列设计的标签。"},
+   {"symbol": "UTILITY", "why": "跨进程薄 RPC 的标签。"},
+   {"symbol": "WAKEUP", "why": "shutdown 唤醒哨兵（枚举面保留）。"},
+   {"symbol": "EXECUTOR_FAILED", "why": "executor 失败注入 input_queue 的内部哨兵（L1029-L1031）。"},
+   {"symbol": "EngineCoreRequest", "why": "前端→引擎唯一请求载体 Struct。"},
+   {"symbol": "EngineCoreOutput", "why": "单请求回程条目。"},
+   {"symbol": "EngineCoreOutputs", "why": "按步聚合回程消息。"},
+   {"symbol": "EngineCoreReadyResponse", "why": "认亲帧 + post-init 配置回传。"},
+   {"symbol": "FinishReason", "why": "IntEnum 紧凑序列化的例子。"},
+   {"symbol": "UtilityOutput", "why": "RPC 回程信封。"},
+   {"symbol": "client_index", "why": "端到端路由键（F3/F4）。"},
+   {"symbol": "engine_index", "why": "回程盖章 + DEALER identity 来源。"},
+   {"symbol": "EngineCoreClient", "why": "三层 client 抽象的根。"},
+   {"symbol": "make_client", "why": "(multiprocess,asyncio) 二轴工厂。"},
+   {"symbol": "make_async_mp_client", "why": "在线面工厂入口。"},
+   {"symbol": "InprocClient", "why": "进程内对照组，凸显有无 IPC 差异。"},
+   {"symbol": "MPClient", "why": "ZMQ 装配与 ready 握手在基类。"},
+   {"symbol": "SyncMPClient", "why": "同步路径（离线默认），线程版输出循环对照。"},
+   {"symbol": "AsyncMPClient", "why": "在线生产路径，本章发送侧主角。"},
+   {"symbol": "EngineIdentity", "why": "identity 类型别名 + core_engines 表。"},
+   {"symbol": "core_engine", "why": "默认目标引擎 identity（消息第 0 帧来源）。"},
+   {"symbol": "input_socket", "why": "client ROUTER（bind）。"},
+   {"symbol": "output_socket", "why": "client PULL（bind）。"},
+   {"symbol": "_send_input", "why": "client 侧打包发送入口（sync/async 各一，同名）。"},
+   {"symbol": "_send_input_message", "why": "(engine,) + message 拼帧 + copy=False 发送。"},
+   {"symbol": "add_request_async", "why": "盖 client_index + ADD 过线（站 5）。"},
+   {"symbol": "abort_requests_async", "why": "ABORT 过线（ch7 断连的上游）。"},
+   {"symbol": "call_utility", "why": "同步版 RPC 配对。"},
+   {"symbol": "call_utility_async", "why": "asyncio 版 RPC 配对。"},
+   {"symbol": "_process_utility_output", "why": "call_id 找回 Future 置结果。"},
+   {"symbol": "_apply_ready_response", "why": "ready 配置回填（max_model_len/num_gpu_blocks）。"},
+   {"symbol": "validate_alive", "why": "单帧死讯→EngineDeadError。"},
+   {"symbol": "ensure_alive", "why": "engine_dead 后快速失败。"},
+   {"symbol": "BackgroundResources", "why": "无环终结清理 + validate_alive 宿主。"},
+   {"symbol": "process_outputs_socket", "why": "输出循环（async 协程 + sync 线程同名）。"},
+   {"symbol": "get_output_async", "why": "前端拉取出口（站 10）。"},
+   {"symbol": "EngineCoreProc", "why": "引擎侧 ZMQ 包装类，IO 线程宿主。"},
+   {"symbol": "ENGINE_CORE_DEAD", "why": "死讯哨兵帧常量。"},
+   {"symbol": "input_queue", "why": "IO 线程→busy loop 解耦点（输入向）。"},
+   {"symbol": "output_queue", "why": "busy loop→IO 线程解耦点（输出向）。"},
+   {"symbol": "aborts_queue", "why": "ABORT 急切通道（双队列之一）。"},
+   {"symbol": "process_input_sockets", "why": "输入 IO 线程：DEALER 收+判型+解码+投队列。"},
+   {"symbol": "process_output_sockets", "why": "输出 IO 线程：PUSH 发+buffer 复用+tracker。"},
+   {"symbol": "preprocess_add_request", "why": "EngineCoreRequest→Request 转换（站 7）。"},
+   {"symbol": "_handle_client_request", "why": "busy loop 按字节标签分派。"},
+   {"symbol": "run_busy_loop", "why": "IPC 另一端消费者/生产者闭环。"},
+   {"symbol": "_process_input_queue", "why": "poll input queue 直到有活。"},
+   {"symbol": "_process_engine_step", "why": "step() 产出→output_queue（站 8）。"},
+   {"symbol": "_send_msg_tracking_payload", "why": "首帧 tracker 手工分帧（引擎侧保活技巧）。"},
+   {"symbol": "_send_engine_dead", "why": "死讯投递 + join 输出线程。"},
+   {"symbol": "_make_ready_response", "why": "认亲帧构造。"},
+   {"symbol": "startup_handshake", "why": "握手 socket 上的 HELLO→地址集→READY。"},
+   {"symbol": "encode", "why": "多帧编码入口（客户端）。"},
+   {"symbol": "encode_into", "why": "复用 buffer 编码入口（引擎输出热路径）。"},
+   {"symbol": "enc_hook", "why": "自定义类型分派（Tensor/ndarray/…）。"},
+   {"symbol": "dec_hook", "why": "解码侧分派。"},
+   {"symbol": "_encode_tensor", "why": "内联/OOB/aux 三分支核心。"},
+   {"symbol": "_decode_tensor", "why": "对偶三分支还原。"},
+   {"symbol": "_encode_ndarray", "why": "ndarray 同款内联/索引分支。"},
+   {"symbol": "_decode_ndarray", "why": "零拷贝视图 + 锁缓冲警告注释。"},
+   {"symbol": "aux_buffers", "why": "零拷贝多帧的机制载体。"},
+   {"symbol": "CUSTOM_TYPE_RAW_VIEW", "why": "内联免拷的 Ext 类型。"},
+   {"symbol": "size_threshold", "why": "256B 内联阈值（VLLM_MSGPACK_ZERO_COPY_THRESHOLD）。"},
+   {"symbol": "tensor_data", "why": "uint8 memoryview 视图而非拷贝。"},
+   {"symbol": "OOBTensorConsumer", "why": "OOB 协议抽象（编码侧）。"},
+   {"symbol": "oob_tensor_consumer", "why": "encoder 构造参数（TensorIpcSender 注入点）。"},
+   {"symbol": "oob_tensor_provider", "why": "decoder 取回钩子（TensorIpcReceiver 注入点）。"},
+   {"symbol": "TensorIpcSender", "why": "OOB 发送端。"},
+   {"symbol": "TensorIpcReceiver", "why": "OOB 接收端 + drain-and-buffer。"},
+   {"symbol": "TensorIpcData", "why": "共享内存载荷结构。"},
+   {"symbol": "make_zmq_socket", "why": "全仓 socket 工厂：HWM=0 + 缓冲 + bind 规则。"},
+   {"symbol": "RCVHWM", "why": "HWM=0 无反压的可检测证据。"},
+   {"symbol": "SNDHWM", "why": "同上。"},
+   {"symbol": "LAST_ENDPOINT", "why": "port-0 占位回填真实端口。"},
+   {"symbol": "reuse_buffers", "why": "引擎输出 buffer 复用池。"},
+   {"symbol": "pending", "why": "(tracker, buffer) 待回收 deque。"},
+   {"symbol": "max_reuse_bufs", "why": "复用池限额。"},
+   {"symbol": "MessageTracker", "why": "zmq 首帧保活类型。"},
+   {"symbol": "get_engine_zmq_addresses", "why": "地址分配（tcp:0 占位）。"},
+   {"symbol": "EngineZmqAddresses", "why": "地址集结构（每前端一条）。"},
+   {"symbol": "EngineHandshakeMetadata", "why": "握手回程载荷。"},
+   {"symbol": "launch_core_engines", "why": "进程编排 + 握手 ROUTER 持有者。"},
+   {"symbol": "CoreEngineProcManager", "why": "子进程生成/回收。"},
+   {"symbol": "VLLM_ENGINE_READY_TIMEOUT_S", "why": "启动超时（600s）。"},
+   {"symbol": "VLLM_ENABLE_V1_MULTIPROCESSING", "why": "多进程默认开启。"},
+   {"symbol": "VLLM_MSGPACK_ZERO_COPY_THRESHOLD", "why": "内联阈值 env（256B）。"}
+  ]
+ },
+ "foreshadow_due": {
+  "source": "v3 伏笔真相源 = book/cartography/pedagogy-plan.json foreshadows（bible.py due 是 v2 旧章号账本，不跑）",
+  "should_plant": [
+   {"id": "F4", "text": "ROUTER 寻址能力", "planted_here": "ch5", "paid_at": 34, "how": "讲 m1/m9 时埋：输入通道选 ROUTER 不是因为它现在（DP=1）有用，而是它的信封帧让『多引擎定向发给 N 个引擎之一』成为可能——每条消息首帧带目标引擎 identity（core_client.py:L887,L1123）、ROUTER 按 identity 精确路由、-1 哨兵可走 coordinator（core.py:L1788-L1792）。ch34 DP 分布式回收：many-to-many（N 前端×M 引擎）与外部 LB 路由正是靠这套寻址能力兑现——DP=1 的部署也在为它用不上的能力付信封帧开销（WC3 cost）。writer 须让读者带走问题：『这条带信封的路，什么时候才真的需要寻址？』"}
+  ],
+  "should_payoff": []
+ },
+ "l2_spec": "book/cartography/l2-specs/ch5.json（同批产出；stations 与本档 stations 同一份账本）"
+}

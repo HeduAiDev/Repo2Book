@@ -1,0 +1,127 @@
+{
+ "driver": "run_m5_zero_copy_keepalive.py",
+ "mechanism": "m5 多帧零拷贝与两侧两种保活 (aux_buffers + copy=False + encode_into 复用 + 首帧 tracker)",
+ "environment": {
+  "platform": "win32",
+  "pyzmq": "25.1.0",
+  "torch": "2.11.0+cu128",
+  "transport_note": "host win32 回环 tcp（HOST SEAM）；拷贝计数与帧语义同 pin",
+  "msgspec_note": "host 无 msgspec 包（CLAUDE.md 硬规则 6 禁 pip 安装）——编码走 _msgspec_seam（真 msgpack 字节）。已知偏差：内联 Ext 载荷 seam 拷一次（真 msgspec 零拷传 memoryview，仅影响 <256B 内联路径）；encode_into 截断语义已在 vllm 容器对真 msgspec 0.21.1 实测一致（truncates=True）"
+ },
+ "config": {
+  "VLLM_MSGPACK_ZERO_COPY_THRESHOLD": 256,
+  "big_tensor": {
+   "numel": 2048,
+   "dtype": "float32",
+   "nbytes": 8192
+  },
+  "small_tensor": {
+   "numel": 8,
+   "dtype": "float32",
+   "nbytes": 32
+  },
+  "linger_engine_output_push": 4000
+ },
+ "pin_container_msgspec_check": {
+  "msgspec_version": "0.21.1",
+  "encode_into_truncates_to_message": true,
+  "note": "容器实测：同一 bytearray 连续 encode_into 两条消息，长度不变、内容被整体替换——引擎输出线程复用 buffer 的前提"
+ },
+ "rounds": [
+  {
+   "round": 1,
+   "name": "编码小张量（32B 内联）",
+   "frames": 1,
+   "main_len": 135,
+   "user_space_copies": 1,
+   "copies_note": "seam 的 Ext 载荷 bytes(...) 拷一次；真 msgspec 传 memoryview 零拷（host 无法直接演示，impl-notes 已知偏差 1①）",
+   "verdict": "32B < 256B 阈值 → CUSTOM_TYPE_RAW_VIEW 内联主帧：1 帧、1 次拷贝（省多帧管理开销）"
+  },
+  {
+   "round": 2,
+   "name": "编码大张量（8192B aux 帧）",
+   "frames": 2,
+   "main_len": 101,
+   "aux_len": 8192,
+   "aux_is_memoryview": true,
+   "alias_proof_mutate_tensor_after_encode": {
+    "tensor0_set_to": 123.5,
+    "aux_first_float_reads": 123.5,
+    "aux_is_live_view": true
+   },
+   "user_space_copies": 0,
+   "verdict": "aux 帧 = tensor_data() 的 uint8 memoryview：张量字节不进主帧、编码零拷贝（活视图物证）"
+  },
+  {
+   "round": 3,
+   "name": "解码零拷贝视图（同存储）",
+   "decoded_numel": 2048,
+   "decoded_data_ptr": 2885513510912,
+   "tensor_data_ptr": 2885513510912,
+   "same_storage_after_decode": true,
+   "note": "share_mem=True 默认：aux 索引路径不 clone——视图直指缓冲（副作用：锁住整条接收消息，serial_utils.py:L389-L392 注释警告）",
+   "verdict": "解码端 torch.frombuffer 建零拷贝视图：data_ptr 相等 → 全程未拷贝张量字节"
+  },
+  {
+   "round": 4,
+   "name": "首帧 tracker · 快路（对端健康）",
+   "tracker_done_right_after_send": true,
+   "frames_received": 1,
+   "frame0_len": 26,
+   "decode_roundtrip_ok": true,
+   "verdict": "done=True（帧即刻被吸收）——buffer 马上可还进 reuse_buffers（core.py L1795-L1810 的 elif 分支）"
+  },
+  {
+   "round": 5,
+   "name": "首帧 tracker · pending 态（zmq 还没放手）",
+   "construction": "只发首帧不补尾：多帧消息不完整 → 滞留发送管道，zmq 攥着 buffer（真实部署中此态出现在管道拥塞时——HWM=0 下 GB 级堆积、m7 取舍面；host 回环小数据无法自然触发，曾试 RCVHWM=1 + 8KB 缓冲 + 2MB 灌注仍被完整吸收）",
+   "check_after_ms": 300,
+   "tracker_done_incomplete_message": false,
+   "tracker_done_after_tail_frame": true,
+   "frames_received": 2,
+   "message_state": "done=False 期间 zmq 仍持有主帧 buffer 的引用——此刻复用 buffer 就是 #50053 修的那类『zmq 还没发完就复用』腐败",
+   "verdict": "pending 态可观测：不完整=done False；补尾投递=done True——『zmq 发完了吗』有了可查询的答案，pending deque 收的就是 (tracker, buffer) 等这一刻"
+  },
+  {
+   "round": 6,
+   "name": "复用同一个 bytearray 连发",
+   "n_messages": 6,
+   "buffer_reused_object": "同一个 bytearray（encode_into 原地截断重写，msgspec 0.21.1 容器实测同语义）",
+   "expected_tokens": [
+    100,
+    101,
+    102,
+    103,
+    104,
+    105
+   ],
+   "received_tokens": [
+    100,
+    101,
+    102,
+    103,
+    104,
+    105
+   ],
+   "all_intact_in_order": true,
+   "verdict": "每条消息等首帧 tracker done 再复用——6 条全部完整按序到达，零腐败"
+  }
+ ],
+ "copy_accounting": {
+  "naive_single_frame": {
+   "copies": 2,
+   "path": "张量转 bytes 拷进单一 buffer（1）+ zmq send 内部拷贝（1）——#13790 之前的旧路径",
+   "per_100MB_video_tensor": "每条消息 2 × 100MB = 200MB 白拷（#13790 PR 原话动机）"
+  },
+  "aux_multiframe_copy_false": {
+   "copies": 0,
+   "path": "tensor_data() 取视图（0）+ aux 独立帧（0）+ send_multipart(copy=False) 把指针交给 zmq（0 用户态拷贝；过内核/跨进程搬运是传输本身）"
+  },
+  "inline_below_threshold": {
+   "seam_copies": 1,
+   "real_msgspec_copies": 0,
+   "path": "小张量一次拷贝换掉一整帧的管理开销——阈值 VLLM_MSGPACK_ZERO_COPY_THRESHOLD=256B"
+  }
+ },
+ "tracker_demo_kernel_bufs_bytes": 8192
+}
