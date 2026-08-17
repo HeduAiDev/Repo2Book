@@ -11,6 +11,7 @@ GitHub slug 规则(近似): 小写 → 去掉非「字母/数字/CJK/下划线/�
 """
 import re
 import sys
+if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8', errors='replace')  # GBK 控制台打印符号免疫(exp-2026-08-17)
 import glob
 import json
 import pathlib

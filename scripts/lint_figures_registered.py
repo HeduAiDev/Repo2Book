@@ -15,6 +15,7 @@ bible/figures.json 没这一条」。这个 linter 把它补成确定性检查�
 """
 import json
 import sys
+if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8', errors='replace')  # GBK 控制台打印符号免疫(exp-2026-08-17)
 import glob
 import re
 import pathlib

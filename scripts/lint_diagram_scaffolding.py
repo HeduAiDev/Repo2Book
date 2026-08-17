@@ -15,6 +15,7 @@ README.md 等)、reader 可见的出处措辞(如「Triton v3.2.0 headless 实�
 """
 import re
 import sys
+if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8', errors='replace')  # GBK 控制台打印符号免疫(exp-2026-08-17)
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))

@@ -13,6 +13,7 @@ primer 章豁免 subtract-only,但参考实现与推导必须锚定论文。
 import json
 import re
 import sys
+if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8', errors='replace')  # GBK 控制台打印符号免疫(exp-2026-08-17)
 from pathlib import Path
 
 ARXIV = re.compile(r'arXiv[:\s/]*(\d{4}\.\d{4,5})', re.I)
