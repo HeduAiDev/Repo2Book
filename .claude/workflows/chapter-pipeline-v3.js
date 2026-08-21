@@ -52,7 +52,12 @@ const BIBLE = REPO + '/instances/vllm/book/bible'
 function mo(base, role, visual) {
   const o = Object.assign({}, base)
   const m = (A.models && A.models[role]) || (visual ? 'fable' : null)
-  if (m) o.model = m
+  if (m) {
+    o.model = m
+    // fable 网关只接受 none/minimal/low/medium/high/xhigh（exp-2026-08-18 ch7：
+    // session effort=max 被继承→InvalidParameter 拉闸三轮）。视觉作业固定 high。
+    if (m === 'fable') o.effort = 'high'
+  }
   return o
 }
 
