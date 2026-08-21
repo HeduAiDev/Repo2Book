@@ -59,21 +59,28 @@ ROLE = {'engine': lc.C_ENG_S, 'gpu': lc.C_GPU_S, 'kv': lc.C_KV_S,
         'api': lc.C_API_S, 'zmq': lc.C_ZMQ_S, 'sample': lc.C_SAM_S,
         'io': lc.C_MUTE, 'plain': lc.C_MUTE, 'beat': lc.C_BEAT_S}
 QUEUE_W = 110                # queue_glyph 固定宽（queue_glyph 自身 h=96）
+NOTE_FIT_TIGHT = 0.928       # note 行 fit_line 有效宽收紧系数（见 comp_draw note 分支头注）
 SHARP = "E:/Laboratory/Repo2Book/node_modules/sharp"
 
 _TOK = re.compile(r'[!-~→·]+|\s+|.')   # ascii 词连串成 token（空格处断开），空白自成 token，其余逐字（CJK 友好断行）
 
 
 def wrap_cn(s, fs, maxw):
-    """贪心断行：CJK 逐字、ascii 连串；超长 token 硬拆。"""
+    """贪心断行：CJK 逐字、ascii 连串；超长 ascii token **不断词**（见下）。"""
     lines, cur = [], ''
     for tk in _TOK.findall(s):
         if not tk:
             continue
-        while lc.tw(tk, fs) > maxw and len(tk) > 1:
-            k = max(1, int(len(tk) * maxw / max(1.0, lc.tw(tk, fs))))
-            lines.append(tk[:k])
-            tk = tk[k:]
+        if lc.tw(tk, fs) > maxw and len(tk) > 1:
+            # ASCII 长 token（代码标识符/路径）禁止中间切断——整体独占一行，绘制层按需
+            # 缩字号（fit_line）。硬拆曾把 EngineCoreRequestType(bytes(type_frame.buffer))
+            # 劈成 bu|ffer、残段再拼进下一行中文注，读作「字节标签判型： ffer))」（ch5 盲审，
+            # 方法名完全失去可读性）。CJK 逐字 token 恒单字、宽 ≤ fs，进不了本分支。
+            if cur.strip():
+                lines.append(cur.rstrip())
+            lines.append(tk)
+            cur = ''
+            continue
         if cur and lc.tw(cur + tk, fs) > maxw:
             lines.append(cur.rstrip())
             cur = tk.lstrip()
@@ -113,12 +120,17 @@ def wrap_cn(s, fs, maxw):
             cut = max((i for i, ch in enumerate(prev) if ord(ch) > 0x2E80), default=-1)
         if cut > 0 and prev[:cut].strip():
             moved = prev[cut:].strip()
-            # 拼接分隔符：CJK↔CJK 边界原文本无空格（ch2 why 注「班车不是|专车」），
-            # 插空格=改动真相源文字；其余（词界）补一个空格还原贪心断行吃掉的词距
-            sep = '' if (ord(moved[-1]) > 0x2E80 and ord(merged[-1][0]) > 0x2E80) else ' '
-            if moved and lc.tw(moved + sep + merged[-1], fs) <= maxw:
-                merged[-2] = prev[:cut].rstrip()
-                merged[-1] = moved + sep + merged[-1]
+            # moved 可为空（cut 落在尾部空白上）：先判空再取 moved[-1]——此前 sep 行
+            # 在 `if moved` 之前索引 moved[-1]，长 ASCII 串窄框换行时（ch7 why 注
+            # 「SSE/accept/add_request」独占行 + 尾行短 token）直接 IndexError 崩渲染。
+            # 判空短路 = 非崩溃输入输出逐字节不变。
+            if moved:
+                # 拼接分隔符：CJK↔CJK 边界原文本无空格（ch2 why 注「班车不是|专车」），
+                # 插空格=改动真相源文字；其余（词界）补一个空格还原贪心断行吃掉的词距
+                sep = '' if (ord(moved[-1]) > 0x2E80 and ord(merged[-1][0]) > 0x2E80) else ' '
+                if lc.tw(moved + sep + merged[-1], fs) <= maxw:
+                    merged[-2] = prev[:cut].rstrip()
+                    merged[-1] = moved + sep + merged[-1]
     return merged or [' ']
 
 
@@ -222,9 +234,28 @@ def comp_lines(c, w):
     return out
 
 
+def file_lines(c, w):
+    """file 行折行判定：floor 缩字后仍放不下（现状=截断丢字，ch7 盲审：「同步面」框底
+    灰字路径尾被裁成 vllm/entrypoint…）→ 按词折行保完整路径。判定与 fit_draw 的缩字
+    路径逐字镜像（放得下=单行原样/缩字；放不下=wrap_cn 折行），comp_h/comp_draw 共用。
+    ASCII 长 token wrap_cn 不切词，两行各按 fit_draw 自缩——只有窄框双路径会进来。"""
+    s = c.get('file')
+    if not s:
+        return []
+    maxw = w - 22
+    w0 = lc.tw(s, 8.5)
+    if w0 <= maxw:
+        return [s]
+    fs2 = max(0.85 * 8.5, 8.5 * maxw / w0 * 0.999)
+    if lc.tw(s, fs2) <= maxw + 0.5:
+        return [s]
+    return wrap_cn(s, 8.5, maxw)
+
+
 def comp_h(c, w):
     st = comp_style(c)
-    return st['top'] + len(comp_lines(c, w)) * st['lh'] + (18 if c.get('file') else 6)
+    fl = len(file_lines(c, w))
+    return st['top'] + len(comp_lines(c, w)) * st['lh'] + (18 + 11.5 * (fl - 1) if fl else 6)
 
 
 def comp_demand(c):
@@ -259,9 +290,18 @@ def comp_draw(x, y, w, c, R):
         lc.text(x + 10, y + 14, c['name'], 9.5, lc.C_MUTE, 'start', True,
                 maxw=w - 20, tag='L2n:' + c['name'][:12])
         yy = y + 28
+        # note 行 fit_line 有效宽收紧 7%（×0.928）：tw 估宽 ASCII=0.58*fs，YaHei 实测全大写+
+        # 下划线串 ≈0.61*fs（ch6 盲审：VLLM_DISABLE_REQUEST_ID_RANDOMIZATION 估 182.4 < maxw 184
+        # 不进缩字档，实际渲染右缘 1879.0 顶到虚线框线 1878.8 零净空——估宽富余 9.6px 被 ASCII
+        # 实际偏宽吃光；rect-rect 盲区、linter 照不到，只能靠亲眼看）。CJK 主导行实测比估宽还窄
+        # ~5%、本就够净空；收紧只让估宽贴上限的 ASCII 行提前缩字到与其余行一致内边距（右缘目标
+        # ≈ wrap 宽 w-22 = 180 → 12px 净空），不换行、不动 note_h/布局。系数推导：实测该行
+        # 实际宽 192.2 / 估宽 182.41 = 1.054 → 需缩到 180/192.2 = 0.936 → eff = 182.41×0.936
+        # = 170.8 = 184×0.928。
         for m in c.get('methods', []):
             for ln in wrap_cn(m, 8.5, w - 22):
-                lc.text(x + 10, yy, ln, 8.5, lc.C_MUTE, 'start', maxw=w - 18, tag='L2nl:' + ln[:10])
+                fit_line(x + 10, yy, ln, 8.5, lc.C_MUTE, 'start', (w - 18) * NOTE_FIT_TIGHT,
+                         'L2nl:' + ln[:10])
                 yy += 12.5
         R[c['name']] = dict(x=x, y=y, w=w, h=h)
         return h
@@ -274,15 +314,20 @@ def comp_draw(x, y, w, c, R):
         # 组件标题 239px 与框内右上徽标 64px 相压（tag-on-title），骑边后标题吃满 w-24
         lc.rect(x + w - bw - 6, y - 8, bw, 17, lc.C_BADGE_F, lc.C_ENG_S, rx=8, sw=1.0)
         lc.text(x + w - bw / 2 - 6, y + 3, badge, 8.5, lc.C_ENG_S, 'middle', True)
+    # 标题缩字下限 0.80（ch7 盲审：②「output_handler 拉批分块」10px 宽 148.3 > 拍片
+    # maxw 122.4，0.83 下限=8.3px 仍 123.1 差 0.2px → 截断成「② output_handler 拉…」
+    # 九张站卡唯一残名；0.80 下限放它缩到 8.24px 完整放下，其余章标题放得下 8.3 者不变）。
     fit_draw(x + 12, y + (17 if st['top'] == 30 else 21), c['name'], st['tfs'], st['tcol'],
-             'start', True, w - 24, 'L2:' + c['name'][:14], floor=0.83)
+             'start', True, w - 24, 'L2:' + c['name'][:14], floor=0.80)
     yy = y + st['top'] + 4
     for ln in comp_lines(c, w):
-        lc.text(x + 12, yy, ln, st['lfs'], st['lcol'], 'start', maxw=w - 22, tag='L2m:' + ln[:12])
+        fit_line(x + 12, yy, ln, st['lfs'], st['lcol'], 'start', w - 22,
+                 'L2m:' + ln[:12])
         yy += st['lh']
-    if c.get('file'):
-        fit_draw(x + 12, y + h - 7, c['file'], 8.5, lc.C_FAINT, 'start', False, w - 22,
-                 'L2f:' + c['name'][:10], floor=0.85)
+    fls = file_lines(c, w)
+    for k, fl in enumerate(fls):
+        fit_draw(x + 12, y + h - 7 - 11.5 * (len(fls) - 1 - k), fl, 8.5, lc.C_FAINT,
+                 'start', False, w - 22, 'L2f:' + c['name'][:10], floor=0.85)
     R[c['name']] = dict(x=x, y=y, w=w, h=h)
     return h
 
@@ -296,7 +341,8 @@ def plain_note_draw(x, y, w, lines):
     lc.rect(x, y, w, h, 'none', lc.C_FAINT, rx=7, sw=1.1, dash=True)
     yy = y + 16
     for ln in ls:
-        lc.text(x + 10, yy, ln, 8.5, lc.C_MUTE, 'start', maxw=w - 18, tag='L2pn:' + ln[:10])
+        fit_line(x + 10, yy, ln, 8.5, lc.C_MUTE, 'start', w - 18,
+                 'L2pn:' + ln[:10])
         yy += 12.5
     return h
 
@@ -316,14 +362,31 @@ def fit_draw(x, y, s, fs, fill, anchor, bold, maxw, tag, floor=0.85):
     239px > 框宽-24=241px 边缘、文件路径 261px > 243px——砍文字=动真相，缩字才是正解）。"""
     w = lc.tw(s, fs, bold)
     if w > maxw:
-        fs2 = max(floor * fs, fs * maxw / w)
-        if lc.tw(s, fs2, bold) <= maxw:
+        # 比例 ×0.999：留 0.1% 净空。fs*maxw/w 的浮点往返会得到比 maxw 大 ~1e-13 的宽度
+        # （ch6 盲审：出港 file 行「…core_client.py」算得缩到 8.23px 恰好放得下、却因
+        #  1-ULP 误差判定失败，退回 8.5px 截断成「core_client…」——文件名残缺最扎眼；
+        #  另 lc.text 的 fit() 对 ≥maxw 才告警，0.1% 净空同时免掉「need 210 > 210」假告警）。
+        fs2 = max(floor * fs, fs * maxw / w * 0.999)
+        if lc.tw(s, fs2, bold) <= maxw + 0.5:
             fs, w = fs2, lc.tw(s, fs2, bold)
         else:
             while s and lc.tw(s + '…', fs, bold) > maxw:
                 s = s[:-1]
             s += '…'
     lc.text(x, y, s, fs, fill, anchor, bold, maxw=maxw, tag=tag)
+
+
+def fit_line(x, y, ln, fs, fill, anchor, maxw, tag, floor=0.8):
+    """wrap_cn 改为「超长 ascii token 不断词、整体独占一行」后的配套绘制层：
+    该行超宽就真缩字号（下限 floor*fs；仍超才走 lc.text 的 fit() 告警）——
+    与 fit_draw 同一原则：内容是真相源不许删字，缩字才是正解。"""
+    w = lc.tw(ln, fs)
+    if w > maxw:
+        # ×0.999 留 0.1% 净空（沿 fit_draw 的 1-ULP 修法）：fs*maxw/w 的浮点往返会得到比
+        # maxw 大 ~1e-13 的估宽，lc.text 的 fit() 对 ≥maxw 才告警 → 假告警「need 171 > 171」
+        # （ch6 note 收紧系数上线后两行命中；与 ch6 出港 file 行的 fit_draw 同病同方）。
+        fs = max(floor * fs, fs * maxw / w * 0.999)
+    lc.text(x, y, ln, fs, fill, anchor, maxw=maxw, tag=tag)
 
 
 def row_layout(comps, x0, w_total):
@@ -348,12 +411,106 @@ def row_layout(comps, x0, w_total):
     return xs, dem, gap
 
 
-def draw_flow(f, R, zone_of, captions, badges=(), note_names=()):
+def _contains(outer, inner):
+    """outer 矩形严格含 inner（±0.5 容差）——frame/center 容器 vs 其内组件。"""
+    return (outer['x'] - 0.5 <= inner['x'] and outer['y'] - 0.5 <= inner['y']
+            and inner['x'] + inner['w'] <= outer['x'] + outer['w'] + 0.5
+            and inner['y'] + inner['h'] <= outer['y'] + outer['h'] + 0.5)
+
+
+def _elbow_flow(f, a, b, lane_y, R, badges, note_names, vsegs=None):
+    """x 区不重叠的跨行流 → 肘形路由（ch6 盲审立的规矩）。
+
+    旧的「重叠中点垂直直落」在两框 x 区不重叠时，x 落在两框之间的空档——线从
+    「正下方无关框」的底边水平处出线、箭头戳进「目标行正下方的另一个无关框」顶边：
+    spec 的 from/to 三元组被静默偷换（ch6：⑨→出港 渲成了 ⑤→why·tokenize、
+    ⑧→线格式 渲成 ⑥→why·不许阻塞、⑦→mm 特征 渲成 ⑧→why·双轨，出港框零入向箭头）。
+    改为按 spec 的真实源/目标框走肘形：源框边中心下探 → 行间通道横走（lane_y，
+    build 侧按目标 x 分道）→ 入目标框对边中心。"""
+    down = b['y'] > a['y']
+    color = lc.C_ENG_S if f.get('up') else ROLE.get(f.get('color_role') or 'plain', lc.C_MUTE)
+    dash = bool(f.get('dash'))
+    ex = a['x'] + a['w'] / 2                    # 源框（下探方向的）边中心出线
+    tx = b['x'] + b['w'] / 2                    # 目标框对边中心入线
+    if down:
+        y0, y1 = a['y'] + a['h'], b['y']
+        # 入点避让目标框顶的站号徽标（骑框顶 y-8..y+9 tab 式，build 侧 badges 同口径）
+        for bd in badges:
+            if b['y'] - 12 < bd[3] and bd[1] < b['y'] + 12 and bd[0] - 6 <= tx <= bd[2] + 6:
+                if bd[0] - 8 >= b['x'] + 10:
+                    tx = bd[0] - 8
+                elif bd[2] + 8 <= b['x'] + b['w'] - 10:
+                    tx = bd[2] + 8
+        if f['to'] in note_names:               # 虚线框落点相位（与直落分支同一招）
+            p = (tx - b['x']) % 10
+            if not 0.5 <= p <= 2.5:
+                d = (1.5 - p) % 10
+                if d > 5:
+                    d -= 10
+                tx += d
+    else:                                       # 上行（南→中）：源框顶中心出、目标框底入
+        y0, y1 = a['y'], b['y'] + b['h']
+    if vsegs is not None:                       # 两竖段记档——下沉说明行避让用（见 draw_flow 头注）
+        vsegs.append((ex, y0, lane_y))
+        vsegs.append((tx, lane_y, y1))
+    lc.parrow([(ex, y0), (ex, lane_y), (tx, lane_y), (tx, y1)],
+              color, 1.8, 'up' if f.get('up') else 'std', dash)
+    label = f.get('label')
+    if label:
+        # 标签优先贴「源框出线竖段」左（段够长 ≥40px 时，读作『从这出、往那去』）；
+        # 出线段太短（行间带窄）则退到通道横线的目标端上方。左越 frame 内界 → 改右侧。
+        if abs(lane_y - y0) >= 40:
+            lx, ly, anchor = ex - 7, (y0 + lane_y) / 2 + 3, 'end'
+            if lx - lc.tw(label, 8.5) < R['frame']['x'] + 12:
+                lx, anchor = ex + 7, 'start'
+        else:
+            lx, ly, anchor = tx - 7, lane_y - 5, 'end'
+            if lx - lc.tw(label, 8.5) < R['frame']['x'] + 12:
+                lx, anchor = tx + 7, 'start'
+        lc.text(lx, ly, label, 8.5, color, anchor, maxw=640, tag='L2fl:' + label[:10])
+
+
+def draw_flow(f, R, zone_of, captions, badges=(), note_names=(), lanes=None, vsegs=None):
     a, b = R[f['from']], R[f['to']]
     color = ROLE.get(f.get('color_role') or 'plain', lc.C_MUTE)
     dash = bool(f.get('dash'))
-    oy0, oy1 = max(a['y'], b['y']), min(a['y'] + a['h'], b['y'] + b['h'])
     label = f.get('label')
+    # 容器流（frame/center 容器 ⇄ 其内组件）不得横穿组件框——ch5 盲审：⑥→frame 命中下方
+    # 「同行→横向」分类，线段从 beat 框左缘 (x=1922.3) 横穿整框、从框内方法名文字正中间
+    # 穿过（删除线效果）、再穿出右框线落到 frame 边 (x=2176)。改为**出场/入场短刺**：从
+    # 组件框离容器最近的边出发、刺到容器对应边，箭头指向流方向（组件→容器 = 交还给容器
+    # 边上的下一站，如 ⑥ PULL 到家 → output_handler 出拍）。
+    if _contains(b, a) or _contains(a, b):
+        inner, outer = (a, b) if _contains(b, a) else (b, a)
+        gaps = {'right': outer['x'] + outer['w'] - (inner['x'] + inner['w']),
+                'left': inner['x'] - outer['x'],
+                'top': inner['y'] - outer['y'],
+                'bottom': outer['y'] + outer['h'] - (inner['y'] + inner['h'])}
+        side = min(gaps, key=gaps.get)
+        yc, xc = inner['y'] + inner['h'] / 2, inner['x'] + inner['w'] / 2
+        p_in, p_out = {'right':  ((inner['x'] + inner['w'], yc), (outer['x'] + outer['w'], yc)),
+                       'left':   ((inner['x'], yc), (outer['x'], yc)),
+                       'top':    ((xc, inner['y']), (xc, outer['y'])),
+                       'bottom': ((xc, inner['y'] + inner['h']),
+                                  (xc, outer['y'] + outer['h']))}[side]
+        # 贴边零长刺防护（ch7 盲审④：①→uplink 首拍片左缘与容器左线 gap=0，p_in==p_out
+        # 的零长线只剩 marker-end 渲染——白缝里凭空一枚无杆深蓝箭簇，系列左缘扫描五图
+        # 均无此件）。刺长 <3px 连箭簇身位（std 箭簇 ≈10.8px）都撑不满，画了=悬空箭簇，
+        # 不画；caption 照发（语义注记不依赖这根刺）。
+        if abs(p_in[0] - p_out[0]) >= 3 or abs(p_in[1] - p_out[1]) >= 3:
+            if inner is a:                  # 组件 → 容器：刺向容器边
+                lc.seg(p_in[0], p_in[1], p_out[0], p_out[1],
+                       lc.C_ENG_S if f.get('up') else color, 1.8,
+                       'up' if f.get('up') else 'std', dash)
+            else:                           # 容器 → 组件：从容器边刺入
+                lc.seg(p_out[0], p_out[1], p_in[0], p_in[1], color, 1.8, 'std', dash)
+            if side in ('top', 'bottom') and vsegs is not None:
+                vsegs.append((xc, p_in[1], p_out[1]))
+        if label:
+            captions.append(((p_in[0] + p_out[0]) / 2, label,
+                             zone_of.get(f['from'] if inner is a else f['to'])))
+        return
+    oy0, oy1 = max(a['y'], b['y']), min(a['y'] + a['h'], b['y'] + b['h'])
     if oy1 - oy0 > 0.4 * min(a['h'], b['h']):          # 同行 → 横向
         if b['x'] > a['x']:
             x1, x2 = a['x'] + a['w'], b['x']
@@ -372,6 +529,11 @@ def draw_flow(f, R, zone_of, captions, badges=(), note_names=()):
                         maxw=(x2 - x1) + 80, tag='L2fl:' + label[:10])
     else:                                              # 跨行 → 纵向
         x = (max(a['x'], b['x']) + min(a['x'] + a['w'], b['x'] + b['w'])) / 2
+        # 两框 x 区不重叠 → 落点必在框外空档，直落=偷换 from/to（见 _elbow_flow 头注）→ 肘形
+        if lanes and id(f) in lanes and not (
+                a['x'] <= x <= a['x'] + a['w'] and b['x'] <= x <= b['x'] + b['w']):
+            _elbow_flow(f, a, b, lanes[id(f)], R, badges, note_names, vsegs)
+            return
         # 虚线框落点相位（ch3 盲审④顺带）：目标为 note（框线 dasharray 6,4）且下行时，
         # 箭头尖恰落进框顶虚线的「洞」里会看似与框线悬空数 px（ch3：compute_hash 盒顶
         # 小箭头）。落点 x 微移 ≤5px 对到 dash 段实在墨迹上——rx=7 圆角使相位起点有
@@ -388,6 +550,8 @@ def draw_flow(f, R, zone_of, captions, badges=(), note_names=()):
             y1, y2 = a['y'] + a['h'], b['y']
         else:
             y1, y2 = a['y'], b['y'] + b['h']
+        if vsegs is not None:               # 直落竖段记档——下沉说明行避让用（见下方 captions 块）
+            vsegs.append((x, y1, y2))
         if f.get('up'):
             color = lc.C_ENG_S
             lc.seg(x, y1, x, y2, color, 1.8, 'up', dash)
@@ -422,7 +586,13 @@ def draw_flow(f, R, zone_of, captions, badges=(), note_names=()):
                             and not any(ov(bb_start, bd) for bd in badges)):
                         lc.text(x + 7, mid, label, 8.5, color, 'start', maxw=640, tag='L2fl:' + label[:10])
                     else:
-                        lc.text(x + 7, y1 - 6, label, 8.5, color, 'start', maxw=640, tag='L2fl:' + label[:10])
+                        # 上行流（目标在源上方）的 y1-6 = 源框顶带，正是站号徽标骑框顶的
+                        # y 带——兜底位照旧=与徽标字形相压（ch7：「yield RequestOutput
+                        # （DELTA）」压「第13站」下半）→ 改贴目标框底之下 13px 的行间
+                        # 走廊（走廊预算见 build 的直落流加宽；下行流 y1-6=源框底内衬，
+                        # 原位本就安全，不动）。
+                        ly = y2 + 13 if y2 < y1 else y1 - 6
+                        lc.text(x + 7, ly, label, 8.5, color, 'start', maxw=640, tag='L2fl:' + label[:10])
 
 
 def build(spec_path):
@@ -451,7 +621,8 @@ def build(spec_path):
     ix, iw = dx0 + INSET, dw - 2 * INSET
 
     comps = spec.get('components', [])
-    R, zone_of, captions = {}, {}, []    # captions: [(gap_center_x, label)] 拍片间标签（下沉说明行）
+    # zone_of 先行（肘形通道预检要在画拍片/南行**之前**跑，那时还没到逐框填 zone 的时点）
+    R, zone_of, captions = {}, {c['name']: c.get('zone') for c in comps}, []    # captions: [(gap_center_x, label)] 拍片间标签（下沉说明行）
 
     # ================= detail（新画；ctx=data-detail） =================
     north = [c for c in comps if c.get('zone') == 'north']
@@ -497,20 +668,82 @@ def build(spec_path):
     chips_y = cfy + cf_pad_top
     chips_bottom = chips_y + chip_h
 
+    # ---- 跨行肘形流预检（画拍片/南行之前：车道分道 + 必要时加高行距） ----
+    # 检测口径与 draw_flow 肘形分支同一条：跨行且「重叠中点」不在两框 x 区内。
+    flows = spec.get('flows', [])
+    chip_pos = {c['name']: (ix + i * (cw_each + CHIP_GAP), cw_each)
+                for i, c in enumerate(center)}
+    south_pos0 = {}
+    if south:
+        sx, sw_, _ = row_layout(south, ix, iw)
+        south_pos0 = {c['name']: (x, w) for c, x, w in zip(south, sx, sw_)}
+
+    def _xw(name):
+        if name in chip_pos:
+            return chip_pos[name]
+        if name in south_pos0:
+            return south_pos0[name]
+        r = R.get(name)
+        return (r['x'], r['w']) if r else (None, None)
+
+    def _elbow_q(f):
+        if f['from'] not in zone_of or f['to'] not in zone_of:
+            return False                     # frame/center 容器伪节点 → 出/入场短刺分支管
+        if zone_of[f['from']] == zone_of[f['to']]:
+            return False                     # 同行 → 横向
+        (ax, aw), (bx, bw) = _xw(f['from']), _xw(f['to'])
+        if ax is None or bx is None:
+            return False
+        x = (max(ax, bx) + min(ax + aw, bx + bw)) / 2
+        return not (ax <= x <= ax + aw and bx <= x <= bx + bw)
+
+    lanes = {}
+
+    def _stack(pool, bottom_lane, step=16):
+        """目标 x 升序分道：目标最靠目标行起始侧（下行=最左）走最贴近目标行的道，
+        其余逐层抬高——远目标走低道，别的流的入线竖段不会横穿它的道。"""
+        for i, f in enumerate(sorted(pool, key=lambda t: _xw(t['to'])[0] + _xw(t['to'])[1] / 2)):
+            lanes[id(f)] = bottom_lane - step * i
+
+    # north↔center 肘形：车道压进行间带 [north_bottom, cfy]；多道时把行距撑成车道带
+    nc = [f for f in flows if _elbow_q(f)
+          and {zone_of[f['from']], zone_of[f['to']]} == {'north', 'center'}]
+    if len(nc) > 1:
+        cfy = max(cfy, north_bottom + 15 + 16 * (len(nc) - 1))
+        chips_y = cfy + cf_pad_top
+        chips_bottom = chips_y + chip_h
+    if nc:
+        _stack(nc, cfy - 9)
+    # 直落跨行流的标签走廊预算：north↔center 直落（非肘形）流带标签时，其标签若两侧
+    # 都被站号徽标占住（draw_flow 沟内标签三连兜底的最后一档），唯一去处是 north↔center
+    # 行间走廊——但走廊默认 18px 放不下一行 8.5px 标签（ch7 盲审：「yield RequestOutput
+    # （DELTA）」旧兜底位贴源框顶 y1-6，正落站号徽标 y 带、与「第13站」字形相压；改落
+    # 走廊后须 ≥31px 才留得下上下各 3px 净空）。无此形态的章 cfy 不动（触发式，逐字节不变）。
+    if any(f.get('label') and not _elbow_q(f)
+           and {zone_of[f['from']], zone_of[f['to']]} == {'north', 'center'}
+           for f in flows if f['from'] in zone_of and f['to'] in zone_of):
+        cfy = max(cfy, north_bottom + 31)
+        chips_y = cfy + cf_pad_top
+        chips_bottom = chips_y + chip_h
+
     # ---- center 拍片 ----
     for i, c in enumerate(center):
         comp_draw(ix + i * (cw_each + CHIP_GAP), chips_y, cw_each, c, R)
-        zone_of[c['name']] = 'center'
     s_center = drain()
 
-    # ---- south 行 ----
+    # ---- south 行（center↔south 有肘形流时，行距加高成泳道通道） ----
+    cs = [f for f in flows if _elbow_q(f)
+          and {zone_of[f['from']], zone_of[f['to']]} == {'center', 'south'}]
     south_h = 0
     if south:
-        sx, sw_, _ = row_layout(south, ix, iw)
         south_y = cfy + cf_h + ROW_GAP
+        if cs:
+            # 泳道带 = 中心容器底边(+8，避开下沉说明行) … 南行框顶(-14，让过骑框顶徽标
+            # 的 y-10 带并留 4px)；行距不足以容纳时加高
+            south_y = max(south_y, cfy + cf_h + 8 + 16 * (len(cs) - 1) + 28)
+            _stack(cs, south_y - 14)
         for c, x, w in zip(south, sx, sw_):
             south_h = max(south_h, comp_draw(x, south_y, w, c, R))
-            zone_of[c['name']] = 'south'
         south_bottom = south_y + south_h
     else:
         south_bottom = cfy + cf_h
@@ -540,8 +773,10 @@ def build(spec_path):
             bw = 14 + 10 * len(bd)
             badges.append((r['x'] + r['w'] - bw - 8, r['y'] - 10, r['x'] + r['w'] - 4, r['y'] + 11))
     note_names = {c['name'] for c in comps if c.get('kind') == 'note'}
-    for f in spec.get('flows', []):
-        draw_flow(f, R, zone_of, captions, badges, note_names)
+    vsegs = []      # 跨行流竖段 (x, y0, y1)——直落竖段/肘形两竖段/上下向容器刺，供下沉说明行避让
+    for f in flows:
+        draw_flow(f, R, zone_of, captions, badges, note_names, lanes, vsegs)
+    loop_vs = []          # 回环两竖段 (x, y0, y1)——下沉说明行避让用（下方 captions 块）
     if nb > 1 and spec.get('loop'):
         # 回环两端锚到首/末拍片的**实际**底边（R 里是真实 rect）——此前统一用 chips_bottom
         # （=最高拍片底），拍片高矮不齐时矮片那端悬空在框内（arrow-inside，ch2 ②-⑦ 高 75..108）
@@ -550,16 +785,95 @@ def build(spec_path):
         c1 = ix + cw_each / 2
         cn = ix + (nb - 1) * (cw_each + CHIP_GAP) + cw_each / 2
         ch_y = max(b1, bn) + 32
+        # 回环横线还须让过肘形流标签：标签贴「源框底→车道」竖段中腰（_elbow_flow），
+        # 拍片高矮不齐时 max(b1,bn)+32 可能落进标签字带正中（ch7：横线 y539 从
+        # 「list.append 分支（queue=None）」整行字中横穿、上邻「put 的合并语义」下缘相触）
+        # → 抬到全部肘形标签字底 +5px 之上。y0/ly 与 _elbow_flow 的标签落位逐字镜像。
+        for f in flows:
+            if id(f) not in lanes or not f.get('label'):
+                continue
+            a = R[f['from']]
+            y0 = (a['y'] + a['h']) if R[f['to']]['y'] > a['y'] else a['y']
+            lane = lanes[id(f)]
+            ly = (y0 + lane) / 2 + 3 if abs(lane - y0) >= 40 else lane - 5
+            ch_y = max(ch_y, ly + 3.7 + 5)
+        # 回环横线+label 对容器底边钳位（exp-2026-08-18 ch7 盲审：ch_y+14 的 label 落到
+        # 容器底边线下 3.7px，橙线从字腰穿过呈删除线效果）。整体上移（竖段随 ch_y 变短），
+        # 保证 label baseline 距最近的容器底边 ≥6px 净空。
+        _bot = ct + frame_h - 6                      # frame 底边内 6px
+        if ccfg.get('name'):
+            _bot = min(_bot, cfy + cf_h - 6)         # center 容器底边（更近者）
+        if ch_y + 14 > _bot:
+            ch_y = _bot - 14
         lc.parrow([(cn, bn), (cn, ch_y), (c1, ch_y), (c1, b1)],
                   lc.C_MUTE, 1.4, 'std')
         lc.text((c1 + cn) / 2, ch_y + 14, spec['loop']['label'], 8.5, lc.C_MUTE,
                 'middle', maxw=iw - 40, tag='L2:loop')
+        loop_vs = [(cn, bn, ch_y), (c1, ch_y, b1)]
     # 下沉说明行：按源行落位（拍片行沉到拍片底+14；north/south 行沉到该行底+13，
-    # 均在行间净空带内、不越 frame 底边 frame_h=south_bottom+INSET）
+    # 均在行间净空带内、不越 frame 底边 frame_h=south_bottom+INSET）。
+    # 同行防撞（ch5 盲审：「PUSH→PULL 回程」与「get_output_async → output_handler…」两条
+    # middle 标签首尾相接、字形相碰，整行融合成一句胡话）+ 出场短刺标签出血（居中
+    # x=2168 越出 frame 右缘）：同行标签先各自钳进 frame 内，再自右向左保证相邻 ≥18px
+    # （≈2 个汉字宽）净空；frame 内实在放不下才把后者沉到第二行（说明行带 56px 内衬容得下）。
+    # 无越界/无相撞的章输出逐字节不变（钳位/推移仅在触发条件命中时改坐标）。
     cap_y = {'center': chips_bottom + 14, 'north': north_bottom + 13,
              'south': south_bottom + 13}
-    for gx, lab, zone in captions:
-        lc.text(gx, cap_y[zone], lab, 8.5, lc.C_MUTE, 'middle',
+    caps = [[gx, lab, zone, 1] for gx, lab, zone in captions]   # [center_x, label, zone, row]
+    lo, hi = dx0 + 10, dx0 + dw - 10
+    zidx = {}
+    for i, c in enumerate(caps):
+        zidx.setdefault(c[2], []).append(i)
+    # 竖段避让清单 = 回环两竖段 + 跨行流竖段（直落/肘形/上下向刺）：后者是 R3 补的
+    # （ch7 盲审②：卡④→detokenizer 工厂的虚线直落竖段 x≈1108 正穿 ③→④ 说明行
+    # 「new_token_ids + finish_reason」字腰——R2 只给回环竖段立了避让，跨行流竖段
+    # 漏网，与回环竖段同一类「竖线穿说明行字带」）。y 带过滤在循环内按 zone 判。
+    avoid_vs = list(loop_vs) + list(vsegs)
+    for zone, idxs in zidx.items():
+        for i in idxs:                       # ① 各自钳进 frame 内
+            w = lc.tw(caps[i][1], 8.5)
+            caps[i][0] = (min(max(caps[i][0], lo + w / 2), hi - w / 2)
+                          if w <= hi - lo else (lo + hi) / 2)
+            # 回环竖段避让（ch7 盲审：右竖段 x≈2087 从「ABORT 帧过线停算（→ ch5）」的
+            # 「帧」字正中穿过；左竖段同理可穿行首说明行）：说明行字带与竖段 y 带相交且
+            # span 跨线 → 让到线某一侧（优先标签原侧；原侧出 frame 内界才换侧），净距 9px。
+            for vx, va, vb in avoid_vs:
+                vy0, vy1 = min(va, vb) - 2, max(va, vb) + 2
+                if not (vy0 <= cap_y[zone] + 4.7 and cap_y[zone] - 9 <= vy1):
+                    continue
+                if caps[i][0] - w / 2 >= vx - 9 or caps[i][0] + w / 2 <= vx + 9:
+                    continue                 # 本就不跨线（含 9px 净距已够）
+                right_c, left_c = vx + 9 + w / 2, vx - 9 - w / 2
+                if caps[i][0] >= vx and right_c + w / 2 <= hi:
+                    caps[i][0] = max(caps[i][0], right_c)
+                elif left_c - w / 2 >= lo:
+                    caps[i][0] = min(caps[i][0], left_c)
+                elif right_c + w / 2 <= hi:
+                    caps[i][0] = right_c
+                else:
+                    caps[i][0] = left_c
+        order = sorted(range(len(idxs)), key=lambda k: caps[idxs[k]][0])
+        for _ in range(8):                   # ② 自右向左级联左推，保相邻 ≥18px
+            moved = False
+            for j in range(len(order) - 2, -1, -1):
+                i, i2 = idxs[order[j]], idxs[order[j + 1]]
+                w0 = lc.tw(caps[i][1], 8.5)
+                lim = caps[i2][0] - lc.tw(caps[i2][1], 8.5) / 2 - 18
+                if caps[i][0] + w0 / 2 > lim + 0.01:
+                    nc = max(lo + w0 / 2, lim - w0 / 2)
+                    if nc < caps[i][0] - 0.01:
+                        caps[i][0] = nc
+                        moved = True
+            if not moved:
+                break
+        for j in range(1, len(order)):       # ③ 仍相撞（frame 放不下）→ 后者沉第二行
+            i, ip = idxs[order[j]], idxs[order[j - 1]]
+            if (caps[i][0] - lc.tw(caps[i][1], 8.5) / 2
+                    < caps[ip][0] + lc.tw(caps[ip][1], 8.5) / 2 + 4 and caps[ip][3] == 1):
+                caps[i][3] = 2
+                print(f'  [warn] L2 下沉说明行仍相撞，『{caps[i][1][:16]}』沉第二行——需人工核图')
+    for gx, lab, zone, row in caps:
+        lc.text(gx, cap_y[zone] + 11 * (row - 1), lab, 8.5, lc.C_MUTE, 'middle',
                 maxw=(cw_each + CHIP_GAP) if zone == 'center' else 260,
                 tag='L2cap:' + lab[:10])
     s_flows = drain()
@@ -616,11 +930,14 @@ def build(spec_path):
             pw = 12 + lc.tw(bd, 8, True) + 8
             lc.rect(mmx, yy - 9, pw, 13, lc.C_BADGE_F, lc.C_ENG_S, rx=6, sw=1.0)
             lc.text(mmx + pw / 2, yy + 1, bd, 8, lc.C_ENG_S, 'middle', True)
-            # 站号账本是 dossier 真相源不许删字——超宽换行续写（ch2 第 16 站 439px > 383px）
-            rls = wrap_cn(f"{st['where']} · {st['what']}", 8.5, MM_W - pw - 12)[:3]
+            # 站号账本是 dossier 真相源不许删字——超宽换行续写（ch2 第 16 站 439px > 383px）。
+            # exp-2026-08-16（ch5 第 3 站）：原 [:3] 截断让超长账本尾部静默丢失（该站英文引文
+            # 掉了 'input back' 尾 10 字符）——与本行注释「不许删字」自相矛盾。改为全量换行：
+            # 轨高与画布 H 本就随行数自增；既有章（ch2/3/4/9 全部 ≤3 行）输出逐字节不变。
+            rls = wrap_cn(f"{st['where']} · {st['what']}", 8.5, MM_W - pw - 12)
             for k, rln in enumerate(rls):
-                lc.text(mmx + pw + 8, yy + 1 + k * 10.5, rln, 8.5, lc.C_MUTE,
-                        'start', maxw=MM_W - pw - 10, tag=f"L2:rail{st['n']}.{k}")
+                fit_line(mmx + pw + 8, yy + 1 + k * 10.5, rln, 8.5, lc.C_MUTE,
+                         'start', MM_W - pw - 10, f"L2:rail{st['n']}.{k}")
             yy += 16.5 + 10.5 * (len(rls) - 1)
         rail_bottom = yy - 10
     else:
