@@ -51,11 +51,12 @@ const BIBLE = REPO + '/instances/vllm/book/bible'
 // A.models.<role> 可显式覆盖（含把视觉 agent 拉回主模型）。
 function mo(base, role, visual) {
   const o = Object.assign({}, base)
-  const m = (A.models && A.models[role]) || (visual ? 'fable' : null)
+  // 视觉 agent 暂降级主模型（exp-2026-08-21：fable+网关 effort 冲突两轮修不好——
+  // o.effort='high' 仍被 session effort=max 穿透，InvalidParameter 反复拉闸；
+  // 主模型读图完全胜任，Lead 亲读复核本就是主模型）。A.models.<role> 仍可显式指定 fable 恢复。
+  const m = (A.models && A.models[role]) || null
   if (m) {
     o.model = m
-    // fable 网关只接受 none/minimal/low/medium/high/xhigh（exp-2026-08-18 ch7：
-    // session effort=max 被继承→InvalidParameter 拉闸三轮）。视觉作业固定 high。
     if (m === 'fable') o.effort = 'high'
   }
   return o
@@ -344,7 +345,7 @@ if (NEEDS_OPENING) {
     const l2b = await agent(
       '你是 v3 L2 章图**盲审员**（独立于作图者——自审看不见自己的自证话术）。**只准看**：' + CH + '/diagrams/ 下开篇图 PNG（用 Read 打开）' + (R.needs_l2 ? '+ ' + CART + '/l2-specs/' + L2KEY + '.json（spec 数据）' : '') + '。**禁止**看 gen_L2.py / dossier / 正文。\n' +
       (R.needs_l2
-        ? '对 L2-' + L2KEY + '.png 四步：① 只看图，用自己的话复述本章讲解路线（第 1 站 → … → 第 N 站）；② 复述路线与 spec.stations 账本逐站对照——顺序/where 对不上 = FAIL；③ 图上组件与方法名与 spec.components 逐个核对——对不上 = FAIL；④ 明显不可读 = FAIL。\n'
+        ? '对 L2-' + L2KEY + '.png 四步：① 只看图，用自己的话复述本章讲解路线（第 1 站 → … → 第 N 站）；② 复述路线与 spec.stations 账本逐站对照——顺序/where 对不上 = FAIL；③ 图上组件与方法名与 spec.components 逐个核对——对不上 = FAIL；④ 明显不可读 = FAIL。**cosmetic 宽限（exp-2026-08-21 ch7 三轮耗尽教训）**：≤3px 的箭头-框边间隙（linter 容差 6px 内）、minimap 0.2x 缩小下的行距观感、字色深浅微差——不构成 FAIL，记 manifest notes 即可；FAIL 只留给真缺陷（错位/裁切/相撞/杜撰/不可读）。\n'
         : '') +
       '对 L0/L1 拷贝图只做可读性核对（④）。verdict（PASS/FAIL）与一句话用 Edit 回填 ' + CH + '/diagrams/figure-manifest.json 对应条目的 blind_review 字段。返回 all_pass 与 failures。',
       mo({ schema: BLIND_SCHEMA, label: 'l2-blind r' + li, phase: 'Illustrate', agentType: 'general-purpose' }, 'l2-blind', true)

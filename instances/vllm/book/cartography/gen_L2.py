@@ -418,7 +418,7 @@ def _contains(outer, inner):
             and inner['y'] + inner['h'] <= outer['y'] + outer['h'] + 0.5)
 
 
-def _elbow_flow(f, a, b, lane_y, R, badges, note_names, vsegs=None):
+def _elbow_flow(f, a, b, lane_y, R, badges, note_names, vsegs=None, label_adj=None):
     """x 区不重叠的跨行流 → 肘形路由（ch6 盲审立的规矩）。
 
     旧的「重叠中点垂直直落」在两框 x 区不重叠时，x 落在两框之间的空档——线从
@@ -459,18 +459,27 @@ def _elbow_flow(f, a, b, lane_y, R, badges, note_names, vsegs=None):
     if label:
         # 标签优先贴「源框出线竖段」左（段够长 ≥40px 时，读作『从这出、往那去』）；
         # 出线段太短（行间带窄）则退到通道横线的目标端上方。左越 frame 内界 → 改右侧。
-        if abs(lane_y - y0) >= 40:
-            lx, ly, anchor = ex - 7, (y0 + lane_y) / 2 + 3, 'end'
-            if lx - lc.tw(label, 8.5) < R['frame']['x'] + 12:
-                lx, anchor = ex + 7, 'start'
-        else:
+        # label_adj（build 预算，见其「肘形流标签防撞预算」块）：'target' = 源柱无路、
+        # 让位目标端（短竖段同款位 lane-5）；数值 = 清障后的源柱基线。
+        adj = (label_adj or {}).get(id(f))
+        if isinstance(adj, tuple):
+            # 让位目标端（build 预算 A/B 位，附基线与锚侧）：贴入场竖段旁。
+            ly, anchor = adj[1], adj[2]
+            lx = (tx - 7) if anchor == 'end' else (tx + 7)
+        elif abs(lane_y - y0) < 40:
             lx, ly, anchor = tx - 7, lane_y - 5, 'end'
             if lx - lc.tw(label, 8.5) < R['frame']['x'] + 12:
                 lx, anchor = tx + 7, 'start'
+        else:
+            ly = adj if adj is not None else (y0 + lane_y) / 2 + 3
+            lx, anchor = ex - 7, 'end'
+            if lx - lc.tw(label, 8.5) < R['frame']['x'] + 12:
+                lx, anchor = ex + 7, 'start'
         lc.text(lx, ly, label, 8.5, color, anchor, maxw=640, tag='L2fl:' + label[:10])
 
 
-def draw_flow(f, R, zone_of, captions, badges=(), note_names=(), lanes=None, vsegs=None):
+def draw_flow(f, R, zone_of, captions, badges=(), note_names=(), lanes=None, vsegs=None,
+              label_adj=None):
     a, b = R[f['from']], R[f['to']]
     color = ROLE.get(f.get('color_role') or 'plain', lc.C_MUTE)
     dash = bool(f.get('dash'))
@@ -532,7 +541,7 @@ def draw_flow(f, R, zone_of, captions, badges=(), note_names=(), lanes=None, vse
         # 两框 x 区不重叠 → 落点必在框外空档，直落=偷换 from/to（见 _elbow_flow 头注）→ 肘形
         if lanes and id(f) in lanes and not (
                 a['x'] <= x <= a['x'] + a['w'] and b['x'] <= x <= b['x'] + b['w']):
-            _elbow_flow(f, a, b, lanes[id(f)], R, badges, note_names, vsegs)
+            _elbow_flow(f, a, b, lanes[id(f)], R, badges, note_names, vsegs, label_adj)
             return
         # 虚线框落点相位（ch3 盲审④顺带）：目标为 note（框线 dasharray 6,4）且下行时，
         # 箭头尖恰落进框顶虚线的「洞」里会看似与框线悬空数 px（ch3：compute_hash 盒顶
@@ -760,22 +769,180 @@ def build(spec_path):
     if ccfg.get('name'):
         R[ccfg['name']] = dict(x=ix, y=cfy, w=iw, h=cf_h)
 
-    # ---- 流 + 回环（全部 rect 已知后画，浮于组件之上） ----
-    # 站号徽标矩形（含 ±2 余量，与 lc.rect 发射的 bbox 同口径）：draw_flow 的沟内标签
-    # 避撞用。徽标只画在 comp（queue/note 无）右上、骑框顶 y-8..y+9（tab 式）。
+    # 站号徽标矩形（含 ±2 余量，与 lc.rect 发射的 bbox 同口径）：draw_flow 沟内标签
+    # 与肘形标签预算（防撞判定）共用。徽标只画在 comp（queue/note 无）右上、骑框顶
+    # y-8..y+9（tab 式）。徽标由 stations 驱动（exp-2026-08-16 ch3 盲审：note 类带
+    # stations 也必须画——站号轨道断轨=读者沿账本找不到挂点；无 stations 才不画，
+    # kind 只控框样式）。
     badges = []
     for c in comps:
-        # 徽标由 stations 驱动（exp-2026-08-16 ch3 盲审：note 类带 stations 也必须画——
-        # 站号轨道断轨=读者沿账本找不到挂点；无 stations 才不画，kind 只控框样式）
         bd = badge_text(c.get('stations', []))
         if bd and c['name'] in R:
             r = R[c['name']]
             bw = 14 + 10 * len(bd)
             badges.append((r['x'] + r['w'] - bw - 8, r['y'] - 10, r['x'] + r['w'] - 4, r['y'] + 11))
     note_names = {c['name'] for c in comps if c.get('kind') == 'note'}
+
+    # ---- 肘形流标签防撞预算（ch7 盲审②续修，触发式：不触发不写 adj、落位逐字节不变） ----
+    # 病灶：同源同向两条肘形流车道只差 16px（_stack 阶差）→ 两条标签都贴「源框出线
+    # 竖段」中腰 (y0+lane)/2+3，基线只差 8px、8.5px 字带整行互叠（ch7：⑦ 单槽邮箱双流
+    # 「put 的合并语义」549 /「list.append 分支（queue=None）」557）；且回环横线被容器
+    # 底边钳回时（raise 565.7 输给 clamp 556）恰从下标签字腰横穿、距上标签字底仅 3.3px。
+    # 源柱走廊（ch7 实测）三重挤压：说明行带 [525.2,537.7] / 回环横线 556 / 车道横线
+    # 598、614——任两线之间都塞不进「12.5px 字带 + 两侧 9px 净空」，解只能分层让位：
+    #   源柱候选（按序）：自然中腰 → 清回环线上提（基线 line-13）→ 说明行带上沿之上
+    #     （基线 cap_top-9.7）；组内基线间距 <15px 顺次下推；候选全灭 → 目标端让位；
+    #   目标端两位序：A = 车道拐点上方（基线 lane-13）；B = 目标框顶-6（直落标签同款
+    #     惯例位）。两位均须过 _spot_ok 全障检查（全部车道横线按 x 跨距 + 入场/出线
+    #     竖段 + 站号徽标 + frame 内界）；均无路 → 自然位 + 告警（需人工核图）。
+    # 只对 seg_long 标签预算（短竖段标签本就贴目标端、不占源柱）。
+    label_adj = {}
+    # 回环横线 y（与下方回环块逐字镜像：自然 ly 抬升 + 容器底钳位——回环块维持自然 ly
+    # 口径不动：adjusted 标签已离柱/在安全侧，自然值只可能把线抬得更高、无害）
+    ch_y_ = None
+    if nb > 1 and spec.get('loop'):
+        ch_y_ = max(R[center[0]['name']]['y'] + R[center[0]['name']]['h'],
+                    R[center[-1]['name']]['y'] + R[center[-1]['name']]['h']) + 32
+        for f in flows:
+            if id(f) not in lanes or not f.get('label'):
+                continue
+            a_, b_ = R[f['from']], R[f['to']]
+            y0_ = (a_['y'] + a_['h']) if b_['y'] > a_['y'] else a_['y']
+            lane_ = lanes[id(f)]
+            ly_ = (y0_ + lane_) / 2 + 3 if abs(lane_ - y0_) >= 40 else lane_ - 5
+            ch_y_ = max(ch_y_, ly_ + 3.7 + 5)
+        _bot_ = ct + frame_h - 6
+        if ccfg.get('name'):
+            _bot_ = min(_bot_, cfy + cf_h - 6)
+        if ch_y_ + 14 > _bot_:
+            ch_y_ = _bot_ - 14
+    # 中排下沉说明行带：center 区同行流/容器流 caption 的落位带（镜像 draw_flow 的
+    # caption 来源判据，保守取全宽——caption 级联左右推移后仍必在带内）
+    cap_band = None
+    if any(f.get('label') and 'center' in (
+            zone_of.get(f['from']), zone_of.get(f['to'])) for f in flows):
+        cap_band = (chips_bottom + 14 - 8.8, chips_bottom + 14 + 3.7)
+    cf_bottom = cfy + cf_h if ccfg.get('name') else -1e9
+    # 走廊静态障碍：肘形流全体（含**别家**流）的车道横线（按真实 x 跨距）+ 出线/入场
+    # 竖段——目标端近框位（B）会被「目标更远的车道横线」跨过头顶（ch7：put 让位到
+    # why 注框顶时，→同步面 车道（x 682.7–1721.9）横穿其上 0.8px，只查自车道漏网）
+    lane_obs = []
+    for gf in flows:
+        if id(gf) not in lanes:
+            continue
+        ga, gb = R[gf['from']], R[gf['to']]
+        gdown = gb['y'] > ga['y']
+        gy0 = (ga['y'] + ga['h']) if gdown else ga['y']
+        gex, gtx = ga['x'] + ga['w'] / 2, gb['x'] + gb['w'] / 2
+        gly = lanes[id(gf)]
+        lane_obs.append(('h', min(gex, gtx), max(gex, gtx), gly))
+        lane_obs.append(('v', gex, min(gy0, gly), max(gy0, gly)))
+        gy1 = gb['y'] if gdown else gb['y'] + gb['h']
+        lane_obs.append(('v', gtx, min(gly, gy1), max(gly, gy1)))
+
+    def _spot_ok(x0, x1, b0, b1):
+        """目标端候选位全障检查：横线按 x 跨距（两侧 9px）、竖段按 y 带（两侧 7px，
+        与贴线并行的惯例净空同口径）、徽标零压、不出 frame 内界。"""
+        if x0 < R['frame']['x'] + 12:
+            return False
+        for kind, oa, ob, oc in lane_obs:
+            if kind == 'h':
+                if x0 < ob and oa < x1 and not (oc <= b0 - 9 or oc >= b1 + 9):
+                    return False
+            else:
+                if b0 < oc and ob < b1 and not (oa <= x0 - 7 or oa >= x1 + 7):
+                    return False
+        return not any(ov((x0, b0, x1, b1), bd) for bd in badges)
+
+    def _yield_target(lane_, f):
+        a_, b_ = R[f['from']], R[f['to']]
+        wlab = lc.tw(f['label'], 8.5)
+        tx_ = b_['x'] + b_['w'] / 2
+        for bd in badges:
+            if b_['y'] - 12 < bd[3] and bd[1] < b_['y'] + 12 and bd[0] - 6 <= tx_ <= bd[2] + 6:
+                if bd[0] - 8 >= b_['x'] + 10:
+                    tx_ = bd[0] - 8
+                elif bd[2] + 8 <= b_['x'] + b_['w'] - 10:
+                    tx_ = bd[2] + 8
+        lx_e, lx_s = tx_ - 7, tx_ + 7
+        if ((ch_y_ is None or not (lane_ - 30.8 <= ch_y_ <= lane_ - 0.3))
+                and lane_ - 13 - 8.8 >= cf_bottom + 2):
+            b0, b1 = lane_ - 21.8, lane_ - 9.3
+            for x0, x1, anc in ((lx_e - wlab, lx_e, 'end'), (lx_s, lx_s + wlab, 'start')):
+                if _spot_ok(x0, x1, b0, b1):
+                    label_adj[id(f)] = ('target', lane_ - 13, anc)
+                    return
+        bt = b_['y']
+        if lane_ <= bt - 23.8:
+            b0, b1 = bt - 14.8, bt - 2.3
+            for x0, x1, anc in ((lx_e - wlab, lx_e, 'end'), (lx_s, lx_s + wlab, 'start')):
+                if _spot_ok(x0, x1, b0, b1):
+                    label_adj[id(f)] = ('target', bt - 6, anc)
+                    return
+        print(f'  [warn] L2 肘形标签『{f["label"][:14]}』源柱/目标端两位均无路，'
+              f'保持自然位——需人工核图')
+
+    groups = {}
+    for f in flows:
+        if id(f) not in lanes or not f.get('label'):
+            continue
+        a_, b_ = R[f['from']], R[f['to']]
+        down_ = b_['y'] > a_['y']
+        y0_ = (a_['y'] + a_['h']) if down_ else a_['y']
+        lane_ = lanes[id(f)]
+        if abs(lane_ - y0_) < 40:
+            continue                          # 短竖段标签天然在目标端，不占源柱
+        groups.setdefault((f['from'], down_), []).append(
+            ((y0_ + lane_) / 2 + 3, y0_, lane_, f))
+    for (_src_, down_), items in groups.items():
+        items.sort(key=lambda t: t[0])
+        prev = None
+        near_lane = min(t[2] for t in items) if down_ else max(t[2] for t in items)
+
+        def _col_ok(c, nat_c=False):
+            """源柱候选位校验。nat_c=自然位：只查爬源框/撞回环线（本预算要修的缺陷类），
+            不查说明行带/车道净空——存量章自然位本就干净，逐字节不变。"""
+            if (down_ and c - 8.8 < y0_ + 4.2) or (not down_ and c + 3.7 > y0_ - 4.2):
+                return False
+            if ch_y_ is not None and c - 14.3 < ch_y_ < c + 9.2:
+                return False
+            if not nat_c:
+                if (cap_band is not None and c - 8.8 < cap_band[1] + 2
+                        and c + 3.7 > cap_band[0] - 2):
+                    return False
+                if down_ and c + 3.7 > near_lane - 1.3:
+                    return False
+            return True
+
+        for nat_, y0_, lane_, f in items:
+            cands = [nat_]
+            if ch_y_ is not None and nat_ - 14.3 < ch_y_ < nat_ + 9.2:
+                cands.append(min(nat_, ch_y_ - 13.0))     # 清回环线上提
+            if cap_band is not None:
+                cands.append(cap_band[0] - 9.7)           # 说明行带上沿之上 6px
+            placed = None
+            for cand in cands:
+                if not _col_ok(cand, nat_c=(cand == nat_)):
+                    continue
+                c = cand
+                if prev is not None and c - prev < 15:    # 组内间距 → 下推
+                    c = prev + 15
+                    if not _col_ok(c):
+                        continue
+                placed = c
+                break
+            if placed is None:
+                _yield_target(lane_, f)
+                continue
+            if placed != nat_:
+                label_adj[id(f)] = placed
+            prev = placed
+
+    # ---- 流 + 回环（全部 rect 已知后画，浮于组件之上） ----
+    # （badges / note_names 已上移至「肘形流标签防撞预算」之前——预算的防撞判定要用）
     vsegs = []      # 跨行流竖段 (x, y0, y1)——直落竖段/肘形两竖段/上下向容器刺，供下沉说明行避让
     for f in flows:
-        draw_flow(f, R, zone_of, captions, badges, note_names, lanes, vsegs)
+        draw_flow(f, R, zone_of, captions, badges, note_names, lanes, vsegs, label_adj)
     loop_vs = []          # 回环两竖段 (x, y0, y1)——下沉说明行避让用（下方 captions 块）
     if nb > 1 and spec.get('loop'):
         # 回环两端锚到首/末拍片的**实际**底边（R 里是真实 rect）——此前统一用 chips_bottom

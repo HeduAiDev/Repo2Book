@@ -592,13 +592,13 @@ def build_l0():
     text(MX, FY, '读图：请求自顶部 users 进 API 进程（蓝）下行——tokenize → 双轨 id → EngineCoreRequest；穿 ZMQ 边界（紫）进引擎（橙）；'
                  '引擎逐拍 ①→⑤ 循环；新 token 沿橙线上行回 API——detokenize → SSE 流出。',
          10, C_MUTE, 'start', maxw=CW, tag='ft:read')
-    text(MX, FY + 20, '第一原则：GPU 是最贵的员工，一切 CPU 活不让它等（tokenize / detokenize 挪出进程 · bitmask 藏进 GPU 窗口 · 固定地址 + CUDA Graph · 异步调度）；'
+    text(MX, FY + 28, '第一原则：GPU 是最贵的员工，一切 CPU 活不让它等（tokenize / detokenize 挪出进程 · bitmask 藏进 GPU 窗口 · 固定地址 + CUDA Graph · 异步调度）；'
                       '第二原则：显存是共享账本，一切调度先对账（token 预算 + 块池）。',
          10, C_MUTE, 'start', maxw=CW, tag='ft:principle')
 
     # ========== 底部两块：启动视角（图内左下） + 多实例视角（图外放大镜，右下） ==========
     # l0_part_map #9/#10：两个「视角」不是进程块，是回望整图的两副眼镜——虚线框待遇。
-    VY, VH = FY + 40, 96
+    VY, VH = FY + 48, 96
     BOOT_W = 760
     rect(MX, VY, BOOT_W, VH, '#ffffff', C_MUTE, rx=8, sw=1.2, dash=True)
     text(MX + 16, VY + 24, '启动视角：EngineArgs → VllmConfig', 11.5, C_TXT, 'start', True,
@@ -654,7 +654,8 @@ def build_l0():
     text(lx0 + 15, ly + 1, '①', 9, C_ENG_S, 'middle', True)
     text(lx0 + 32, ly + 1, '= EngineCore.step() 第几拍', 9.5, C_TXT, 'start')
     lx0 += 32 + tw('= EngineCore.step() 第几拍', 9.5) + 18
-    text(lx0, ly + 1, '框内灰字 = 规范源码路径', 9.5, C_MUTE, 'start')
+    text(lx0, ly + 1, '框内灰字 = 规范源码路径', 9.5, C_MUTE, 'start',
+         maxw=W - MX - 16 - lx0)   # 钳进右边界(≥16px 余量;0.2x minimap 下贴边=裁切风险,exp-2026-08-21 ch7 盲审)
 
     H = ly + 32
     GEO = dict(W=W, H=H, MX=MX, CW=CW, BXR=BXR, UY=UY, UH=UH, UW=UW, UX0=UX0,
