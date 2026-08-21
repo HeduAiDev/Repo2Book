@@ -60,7 +60,7 @@
         prompt_extras: dict[str, Any] | None = None,
         skip_mm_cache: bool = False,
     ):
-        arrival_time = time.time()
+        arrival_time = time.time()  # L1080
 
         if tok_params is None:
             tok_params = self.default_chat_tok_params

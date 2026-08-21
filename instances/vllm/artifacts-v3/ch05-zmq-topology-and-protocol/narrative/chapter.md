@@ -352,7 +352,7 @@ class EngineCoreRequest(
                     else:
                         request = generic_decoder.decode(data_frames)
 
-                        if request_type == EngineCoreRequestType.ABORT:
+                        if request_type == EngineCoreRequestType.ABORT:  # L1733
                             # Aborts are added to *both* queues, allows us to eagerly
                             # process aborts while also ensuring ordering in the input
                             # queue to avoid leaking requests. This is ok because
@@ -360,7 +360,7 @@ class EngineCoreRequest(
                             self.aborts_queue.put_nowait(request)
 
                     # Push to input queue for core busy loop.
-                    self.input_queue.put_nowait((request_type, request))
+                    self.input_queue.put_nowait((request_type, request))  # L1741
 ```
 
 读法四步。第一步 `recv_multipart` 收到的 `frames[0]` 恒为标签帧——ROUTER 的信封在投递时被吃掉了（发送侧 4 帧、引擎实收 3 帧，下文实测表轮 3 可见），所以判型从第 0 帧开始。第二步 `EngineCoreRequestType(bytes(...))`——字节到 enum 是有限集上的双射（六个值两两不同），不存在「判不出型」的合法消息。第三步**按型选 decoder**：ADD 用专属的 `add_request_decoder`，其余用 `generic_decoder`——这就是「标签免编码」的第二重收益，类型与载荷分帧，先看一眼标签就知道用哪套拆包工具。第四步卸货进 `input_queue`（站 7）：`preprocess_add_request` 把 `EngineCoreRequest` 变成引擎自己的 `Request` 实体（语法初始化这类重活在这一步做掉、不占忙循环——「语法」指结构化输出请求要把「输出必须匹配这个格式」的约束编译成能逐 token 判合法的对象，编译是 CPU 大户，后文约束解码章的主场；预处理抛错走 `_handle_request_preproc_error` 给这个请求单独回一条 ERROR 输出，不炸引擎），从此这个对象归引擎进程独占可变。（两支控制面分支初读可跳：`b"READY"` 是 DP coordinator 发来的通知——DP coordinator 是 DP>1 部署时单独起的那个协调进程，夹在多台引擎与前端之间收发负载统计、协调波次，细节 Part VIII 展开；发它用的 `coord_socket` 就是装配段省略的 XSUB 分支建的那条 DP 订阅 socket，只有它收得到、所以那行 assert 敢断言来源；`FT_UTILITY_METHOD` 是容错信令，也属 Part VIII。ABORT 的双队列投递本章末节讲。）
@@ -487,7 +487,7 @@ vLLM 真正干活的库不是 msgpack 官方 Python 库，是 **msgspec**——m
         with ExitStack() as stack, zmq.Context() as ctx:
             sockets = [
                 stack.enter_context(
-                    make_zmq_socket(ctx, output_path, zmq.PUSH, linger=4000)
+                    make_zmq_socket(ctx, output_path, zmq.PUSH, linger=4000)  # L1763
                 )
                 for output_path in output_paths
             ]
@@ -687,7 +687,7 @@ def make_zmq_socket(
     buf_size = int(0.5 * 1024**3) if total_mem > 32 and available_mem > 16 else -1
 
     if bind is None:
-        bind = socket_type not in (zmq.PUSH, zmq.SUB, zmq.XSUB)
+        bind = socket_type not in (zmq.PUSH, zmq.SUB, zmq.XSUB)  # L308
 
     if socket_type in (zmq.PULL, zmq.DEALER, zmq.ROUTER):
         socket.setsockopt(zmq.RCVHWM, 0)

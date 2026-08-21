@@ -260,21 +260,21 @@ ADD 分支做两件事：decode 出 `EngineCoreRequest`（字节 → 带类型�
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
-        scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-        future = self.model_executor.execute_model(scheduler_output, non_block=True)
-        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())  # L595
+        future = self.model_executor.execute_model(scheduler_output, non_block=True)  # L596
+        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)  # L597
         with (
             # … 省略：capture_iteration_details / log_error_detail
             #       两个观测性上下文管理器 …
         ):
-            model_output = future.result()
+            model_output = future.result()  # L602
             if model_output is None:
-                model_output = self.model_executor.sample_tokens(grammar_output)
+                model_output = self.model_executor.sample_tokens(grammar_output)  # L604
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
-        engine_core_outputs = self.scheduler.update_from_output(
+        engine_core_outputs = self.scheduler.update_from_output(  # L609
             scheduler_output, model_output
         )
 
@@ -457,11 +457,11 @@ token 有了，现在把它送回家。回程走 L0 图紫带的上行方向，�
         request_outputs: list[RequestOutput | PoolingRequestOutput] = []
         reqs_to_abort: list[str] = []
         for engine_core_output in engine_core_outputs:
-            req_id = engine_core_output.request_id
+            req_id = engine_core_output.request_id  # L620
             req_state = self.request_states.get(req_id)
             if req_state is None:
                 # Ignore output for already-aborted request.
-                continue
+                continue  # L624
 
             # 1) Compute stats for this iteration.
             # … 省略：stats 计算与 MoE/disagg 等专题字段搬运 …

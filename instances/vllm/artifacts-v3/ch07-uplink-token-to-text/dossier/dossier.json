@@ -1,0 +1,1097 @@
+{
+  "chapter_id": "ch07",
+  "part": "II",
+  "title": "上行：从 token 到文字",
+  "pin": "vLLM v0.27.1 (6e448d0ea)",
+  "chapter_kind": "code",
+  "note_on_kind": "标准代码章（非 primer）：走 implementer 精简版 + lint_fidelity 全链。本章把 L0 的 API 进程上行泳道放大：引擎回程的一串 token id 在前端进程内被变回文字、按请求拆流、流到各自的消费者手上；客户端断连时反向 abort 把请求从引擎里抠掉。",
+  "hook_suggestion": "「引擎每步只送回一串 token id——谁把它变回文字？一条回程消息混着上百个请求的新 token，怎么拆回各自的流？客户端读得慢，中间输出堆在哪？用户中途关掉页面，谁去喊停还在烧 GPU 的请求？」（从 Part II hook『一千个并发，怎么让 GPU 永不等 CPU？』+ 本章主题『API 进程上行泳道』+ deepread/api-entry why_chains[2]『单槽 Collector』、[3]『output_handler 分块让出』、[4]『三态契约』、[6]『断连反向 abort』提炼）",
+  "scope_note": "本章解读上行泳道：EngineCoreOutputs 过线之后到 yield RequestOutput 之前发生在 API 进程内的一切。主线 = 回程到港（EngineCoreOutputQueueTask → outputs_queue）→ output_handler 拉批分块（chunk=128 + sleep(0)）→ process_outputs 唯一单循环（demux → 增量去 token + 停止串 → 造输出）→ make_request_output 三道闸（FINAL_ONLY / stream_interval / n>1 父聚合）→ 单槽 RequestOutputCollector → generate() 消费 yield。增量去 token 化展开到 Fast（DecodeStream）/Slow（双 offset 窗口）两路 decode_next、byte-fallback UTF-8 边界、stop-string holdback 与窗口查找。边界：回程 socket 侧（PUSH/PULL/解码帧序）ch5 已讲透，本章自 outputs_queue 起步；双轨 id 的出发侧 ch6 已讲，本章只讲回程出口（external 写回 + abort 双轨）；logprobs 的增量累积与 raw 语义归 ch8（本章只留调用点占位）；SSE 格式 ch2 已立（本章 yield 之后一句话带过，serving 层全貌归 ch38）；引擎侧五拍与 EngineCoreOutputs 怎么产出归 ch9；n>1 的扇出发点在 add_request（async_llm.py:L401-L418，ch6 只留了分支名），扇出+聚合在本章成对讲完。",
+  "code_spine": [
+    "vllm/v1/engine/async_llm.py:L395-L418 — 邮箱先行：RequestOutputCollector(output_kind, 内部id) 诞生 + n>1 扇出（ParentRequest.get_child_info 盖 idx_ 前缀子 id，n 个子请求共用一个 collector）",
+    "vllm/v1/engine/output_processor.py:L525-L554 — 本进程登记：RequestState.from_new_request（三路 detokenizer 工厂、per-request stream_interval clamp）+ external_req_ids 外→内映射登记",
+    "vllm/v1/engine/core_client.py:L1037-L1102 — 回程到港：EngineCoreOutputQueueTask（PULL + msgpack 解码）→ outputs_queue（asyncio.Queue）；get_output_async 供 output_handler 取",
+    "vllm/v1/engine/async_llm.py:L657-L727 — output_handler 常驻单任务：拉一批 EngineCoreOutputs → 按 VLLM_V1_OUTPUT_PROC_CHUNK_SIZE=128 切片、片间 await asyncio.sleep(0) 让出事件循环 → stop-string 反向 abort",
+    "vllm/v1/engine/output_processor.py:L589-L711 — process_outputs：唯一遍历整批的单循环（NOTE FOR DEVELOPERS）——demux → 增量去 token + 停止串 → 造输出 → 分发分叉 → 完成清理",
+    "vllm/v1/engine/detokenizer.py:L96-L143 — BaseIncrementalDetokenizer.update：跳 stop token → 逐 token decode_next → min_tokens 推进 stop_check_offset → check_stop_strings 窗口查找截断",
+    "vllm/v1/engine/detokenizer.py:L149-L165 — get_next_output_text：DELTA 从 _last_output_text_offset 切片；未完成时尾部扣留 stop_buffer_length 个字符（holdback）",
+    "vllm/v1/engine/output_processor.py:L276-L340 — RequestState.make_request_output 三道闸：FINAL_ONLY 未完不构造 / stream_interval 节流（DELTA 从 sent_tokens_offset 切）/ n>1 父聚合（ParentRequest.get_outputs）",
+    "vllm/v1/engine/output_processor.py:L45-L106 — RequestOutputCollector：单槽 + asyncio.Event + put 合并（不是 asyncio.Queue）",
+    "vllm/outputs.py:L152-L181 — RequestOutput.add：DELTA 归并的真正实现（按 CompletionOutput.index 配对：拼接 text/token_ids 或替换）",
+    "vllm/v1/engine/async_llm.py:L577-L616 — generate() 消费循环：out = q.get_nowait() or await q.get() → yield；断连 CancelledError/GeneratorExit → abort",
+    "vllm/v1/engine/async_llm.py:L729-L738 — abort 两跳：本进程 OutputProcessor.abort_requests（移状态 + 放 ABORT 终态解阻塞）→ engine_core.abort_requests_async 跨进程停算"
+  ],
+  "stations": [
+    {
+      "n": 1,
+      "where": "async_llm.py:L396",
+      "what": "邮箱先行：RequestOutputCollector(output_kind, 内部id) 在 add_request 里、请求过线之前诞生——『先本进程』保证回程到达时表已存在"
+    },
+    {
+      "n": 2,
+      "where": "async_llm.py:L401-L418",
+      "what": "n>1 扇出：n=1 直连；否则 ParentRequest + get_child_info(idx) 盖 idx_ 前缀子 id（parallel_sampling.py:L92）、末子复用原对象——n 个子请求共用同一个 collector"
+    },
+    {
+      "n": 3,
+      "where": "output_processor.py:L525-L554",
+      "what": "本进程登记：RequestState.from_new_request 建 per-request 状态（detokenize=False→tokenizer=None L224-225；per-request stream_interval clamp L227-229）+ 外→内 id 映射登记（L553-554）"
+    },
+    {
+      "n": 4,
+      "where": "core_client.py:L1037-L1102",
+      "what": "回程到港：EngineCoreOutputQueueTask 常驻协程 PULL 收帧 → validate_alive → msgpack 解码 EngineCoreOutputs → outputs_queue.put_nowait（L1082-1083）；get_output_async 从 asyncio.Queue 取（L1093-1102）"
+    },
+    {
+      "n": 5,
+      "where": "async_llm.py:L680-L703",
+      "what": "output_handler 拉批分块：await get_output_async() 取整批 → 按 VLLM_V1_OUTPUT_PROC_CHUNK_SIZE=128（envs.py:L160）切片逐片 process_outputs、片间 await asyncio.sleep(0) 让出事件循环"
+    },
+    {
+      "n": 6,
+      "where": "output_processor.py:L619-L624",
+      "what": "demux：按 EngineCoreOutput.request_id（内部 id）查 request_states；查不到 = 已 abort，静默跳过（abort 与回程在途输出的竞态用幂等跳过兜住）"
+    },
+    {
+      "n": 7,
+      "where": "output_processor.py:L652-L661",
+      "what": "去 token + 停止串：detokenizer.update(new_token_ids, stop_terminated) 返回 stop_string → 改写 finish_reason=STOP / stop_reason=串；若引擎未自停 → reqs_to_abort 回发 abort（L696-699 → async_llm.py:L705-709）"
+    },
+    {
+      "n": 8,
+      "where": "detokenizer.py:L96-L143",
+      "what": "update 内循环：stop_terminated 且不含停止串→弹末 token 不解码；逐 token decode_next 累积 output_text（min_tokens 期间推进 stop_check_offset）；check_stop_strings 命中则截断"
+    },
+    {
+      "n": 9,
+      "where": "detokenizer.py:L149-L165",
+      "what": "取文本：get_next_output_text(finished, delta)——delta 从 _last_output_text_offset 切片推进；未完成时尾部扣留 stop_buffer_length = max(len(s))-1 个字符（holdback），finished 才全吐"
+    },
+    {
+      "n": 10,
+      "where": "output_processor.py:L276-L340",
+      "what": "造输出三道闸：FINAL_ONLY 未完直接 return None（中间输出零构造）；stream_interval>1 只在 完成/首token/攒够 才发（DELTA 从 sent_tokens_offset 切）；n>1 走 ParentRequest.get_outputs 父聚合"
+    },
+    {
+      "n": 11,
+      "where": "output_processor.py:L679-L684",
+      "what": "分发分叉：req_state.queue 非空（AsyncLLM）→ queue.put(request_output)；为 None（LLMEngine 同步面）→ request_outputs.append 返回列表（step L296-334，_run_engine 只收 finished、按 int(request_id) 排序）"
+    },
+    {
+      "n": 12,
+      "where": "output_processor.py:L62-L76",
+      "what": "单槽邮箱 put：槽空或 Exception → 占槽 + set Event；槽已满且双 RequestOutput → output.add(output, aggregate) 就地合并（DELTA 拼接，outputs.py:L152-L181；Pooling 直接替换）"
+    },
+    {
+      "n": 13,
+      "where": "async_llm.py:L596-L606",
+      "what": "generate() 消费：out = q.get_nowait() or await q.get()（非阻塞 drain 优先）→ 非 STREAM_FINISHED 才 yield；out.finished 终止 → SSE generator 消费（serving.py:L485，SSE 格式 ch2 已讲）"
+    },
+    {
+      "n": 14,
+      "where": "async_llm.py:L611-L616 → L729-L738",
+      "what": "断连反向 abort（F5 埋，ch38 服务面回收）：CancelledError/GeneratorExit → abort(q.request_id, internal=True)：移状态 + 投 ABORT 终态解阻塞（output_processor.py:L494-L515）→ 跨进程停算"
+    }
+  ],
+  "stations_note": "站号 = 一个流式 chat 请求上行段流经顺序：1-3 站是上行登记（add_request 时刻，回程到达前 collector/RequestState 必已就位），4 站回程消息到港，5-12 站是 output_handler→process_outputs 的解包流水（去 token→取文本→三道闸→分发→单槽邮箱），13 站 generate 消费 yield，14 站断连反向 abort。与 ch4 衔接：双登记在那里立骨架，本章展开『先本进程』那半边的内容物。与 ch5 衔接：第 4 站自 PULL 解码后起步，socket/帧序/死讯哨兵已讲。与 ch6 衔接：双轨 id 的出发侧（assign_request_id）已讲，本章讲出口侧（external 写回 + abort 双轨）；ch6 留下的 n>1 扇出分支在本章第 2 站兑现。与 ch8 衔接：logprobs 的增量累积（output_processor.py:L663-665 调用点）与 raw logprobs 语义归 ch8。同步离线面（LLMEngine）与异步面共用同一个 OutputProcessor，差异只在第 11 站的分叉（queue 有无）。",
+  "key_classes": [
+    {
+      "name": "RequestOutputCollector",
+      "file": "vllm/v1/engine/output_processor.py",
+      "responsibility": "per-request 单槽邮箱：连接 output_handler 生产者与 generate() 消费者。单槽 self.output + asyncio.Event self.ready；put 非阻塞（空槽/Exception 占槽置位；槽满且双 RequestOutput → add() 就地合并，aggregate=DELTA）；get 阻塞等事件、get_nowait 非阻塞快取。构造签名 (output_kind, request_id)——request_id 是内部 id，abort 用。刻意不是 asyncio.Queue（api-entry why_chains[2]）。"
+    },
+    {
+      "name": "OutputProcessor",
+      "file": "vllm/v1/engine/output_processor.py",
+      "responsibility": "上行解包总入口：持 request_states（内部id→RequestState）、parent_requests、external_req_ids（外部id→[内部id]）三张表。process_outputs 是唯一遍历整批 EngineCoreOutputs 的单循环；abort_requests 双轨皆可且父请求联动 abort 子请求；propagate_error 把 output_handler 的异常广播给全部在飞请求的 collector；_finish_request 注销三张表。同时服务 AsyncLLM（queue.put）与 LLMEngine（返回列表）两条路径。"
+    },
+    {
+      "name": "RequestState",
+      "file": "vllm/v1/engine/output_processor.py",
+      "responsibility": "per-request 上行累积状态：detokenizer、logprobs_processor（ch8）、queue、parent_req、output_kind、stream_interval/sent_tokens_offset、is_prefilling、num_cached_tokens。make_request_output 把本步增量变成（或不变成）RequestOutput——三道闸全在此；from_new_request 是工厂（选 detokenizer、clamp per-request stream_interval、detokenize=False 时 tokenizer 置 None 走空壳）。"
+    },
+    {
+      "name": "IncrementalDetokenizer",
+      "file": "vllm/v1/engine/detokenizer.py",
+      "responsibility": "层级根 + 空壳实现（无 tokenizer 或 detokenize=False）：只累积 token_ids，update 返回 None、get_next_output_text 恒空串。持工厂 from_new_request 三路分派：tokenizer None→空壳；USE_FAST_DETOKENIZER 且 isinstance(tokenizer, TokenizersBackend)→Fast；否则→Slow。"
+    },
+    {
+      "name": "BaseIncrementalDetokenizer",
+      "file": "vllm/v1/engine/detokenizer.py",
+      "responsibility": "抽象基类：与具体 tokenizer 无关的公共逻辑——stop/min_tokens/include_stop_str_in_output 解析、stop_buffer_length = max(len(s))-1 holdback 计算、update 主流程（跳 stop token、逐 token decode_next、min_tokens 推进 stop_check_offset、check_stop_strings 截断）、get_next_output_text 的 delta/全量取文本与尾字符扣留。decode_next 抽象，Fast/Slow 各自实现。"
+    },
+    {
+      "name": "FastIncrementalDetokenizer",
+      "file": "vllm/v1/engine/detokenizer.py",
+      "responsibility": "快路径：tokenizers 库 DecodeStream（构造时以 prompt_token_ids 做 native prefill 预热）；decode_next → _protected_step → stream.step；_protected_step 兜两类异常——(OverflowError, TypeError) 吞掉返回 None，'Invalid prefix encountered' 则重建 DecodeStream 恢复（非单调/无效 UTF-8 输出破坏内部状态，issue #17448）。可选抑制相邻特殊 token 间空格。"
+    },
+    {
+      "name": "SlowIncrementalDetokenizer",
+      "file": "vllm/v1/engine/detokenizer.py",
+      "responsibility": "慢路径（纯 Python 回退，非 TokenizersBackend 或 tokenizers<0.22.0）：以 prompt 预填 tokens 并算初始 prefix_offset/read_offset（embeds 请求退化为占位——源码自注 'cannot be detokenized, in general'）；decode_next 调 detokenize_incrementally 维护双 offset 窗口。覆写 output_token_ids/num_output_tokens 减去 prompt_len（token_ids 含 prompt，与 Fast 路径口径不同）。"
+    },
+    {
+      "name": "ParentRequest",
+      "file": "vllm/v1/engine/parallel_sampling.py",
+      "responsibility": "n>1 并行采样的父请求聚合器：get_child_info 产 idx_ 前缀子 id + 子 sampling_params（seed 非空时逐子克隆唯一 seed，否则缓存复用）；get_outputs 子→父聚合（流式逐子转发 / FINAL_ONLY 攒齐 n 个一次返回，already_finished_and_returned 防重复）；child_requests 集合决定整体 finished。"
+    },
+    {
+      "name": "RequestOutput / CompletionOutput",
+      "file": "vllm/outputs.py",
+      "responsibility": "对外的输出对象：RequestOutput.request_id 写回外部 id（output_processor.py:L374 注释 'request_id is what was provided externally'）；add(next_output, aggregate) 是单槽合并的真正实现——按 CompletionOutput.index 配对，DELTA 拼接 text/token_ids/logprobs、CUMULATIVE 整体替换、新 index append（n>1 子序列不互相覆盖）。STREAM_FINISHED 哨兵对象（流式输入专用，L200-208）。"
+    },
+    {
+      "name": "AsyncLLM（上行侧）",
+      "file": "vllm/v1/engine/async_llm.py",
+      "responsibility": "上行侧三件事：add_request 建 collector + n>1 扇出（L395-418）；_run_output_handler 常驻单任务拉批分块喂 OutputProcessor、stop-string 反向 abort、异常 propagate_error（L657-727）；generate() 消费循环 + 断连/异常路径全部 abort(internal=True)（L577-655）+ abort 两跳落地（L729-738）。output_handler eager/lazy 双启动（事件循环内 __init__ 即启 L173-179，否则首个 add_request 懒启 L390-393——注释原话 'handle startup failure gracefully in the OpenAI server'）。"
+    },
+    {
+      "name": "EngineCoreOutputQueueTask（AsyncMPClient 内协程）",
+      "file": "vllm/v1/engine/core_client.py",
+      "responsibility": "回程到港任务（名字即 create_task 的 name 参数 L1089-1091）：PULL 收帧 → validate_alive（单帧死讯→EngineDeadError）→ decoder.decode(EngineCoreOutputs) → outputs_queue.put_nowait；异常也进队列由 get_output_async 转抛。本章自它起步，socket 侧归 ch5。"
+    },
+    {
+      "name": "check_stop_strings",
+      "file": "vllm/v1/engine/detokenizer.py",
+      "responsibility": "模块级函数：仅在新增字符窗口内 find（起点 1-new_char_count-len(stop_str)，负索引回看）避免每步重扫全文；多条命中取『完成最早』者（v0.27.x 新语义——投机解码一步多 token 时结果与逐 token 追加一致，docstring 明言）；按 include_in_output 决定截到 stop 串首或尾，返回 (stop_str, truncate_to|-1)。"
+    }
+  ],
+  "data_flow": [
+    "（上行段素材直接引用 deepread 卡，本章不重挖：deepread/api-entry.json data_flow 步 9-13 + deepread/ipc-stage.json data_flow 步 8-9 的回程半段）",
+    "1. 上行登记先行（add_request 时刻，async_llm.py:L390-418）：懒启动 output_handler → 建 RequestOutputCollector(params.output_kind, 内部id)（L396）→ n=1 直连 / n>1 扇出（ParentRequest.get_child_info 盖 idx_ 前缀，L405-418）→ _add_request 双登记的『先本进程』半边：output_processor.add_request 建 RequestState + 外→内映射（output_processor.py:L525-554）。此后才跨进程发 EngineCoreRequest（ch6 已讲）。",
+    "2. 回程到港：引擎输出线程按 client_index 选 PUSH socket 发 EngineCoreOutputs（ch5/ch9 领域）→ 前端 EngineCoreOutputQueueTask PULL + msgpack 解码 → outputs_queue（core_client.py:L1037-1091）；死讯/异常也走该队列（validate_alive / except→put(e)）。",
+    "3. output_handler 常驻任务（async_llm.py:L676-727）：await engine_core.get_output_async()（L680 → core_client.py:L1093-1102）→ 按 chunk_size=128 切片逐片 process_outputs、片间 await asyncio.sleep(0)（L691-703）→ 断言异步面 request_outputs 必空（L698-699）→ reqs_to_abort（stop-string 命中而引擎未自停的请求）反向 abort_requests_async（L705-709）→ 异常 propagate_error 广播（L723-725）。",
+    "4. process_outputs 单循环（output_processor.py:L619-706）：内部 req_id 查 RequestState（L619-624，查不到=已 abort 跳过）→ stats → prefill 翻转（L642-650）→ detokenizer.update 增量解码 + stop-string 判定（L652-661）→ logprobs_processor.update_from_output（L663-665，ch8）→ make_request_output 造输出（L667-675）→ queue.put / list.append 分叉（L679-684）→ finish 则 _finish_request 注销 + reqs_to_abort（L686-706）。",
+    "5. 去token 内部（detokenizer.py）：update（L96-143）逐 token decode_next——Fast=DecodeStream.step（L211-248，无效前缀重建恢复）/ Slow=detokenize_incrementally 双 offset 窗口（L292-307 → detokenizer_utils.py:L176-268，末尾 U+FFFD 吐空串等下一 token）→ check_stop_strings 窗口查找截断（L310-362）→ get_next_output_text（L149-165）按 delta 切片 + 尾部 holdback。",
+    "6. 造输出三道闸（output_processor.py:L276-340）：FINAL_ONLY 未完 return None（L286-290）→ stream_interval 节流（L292-313，DELTA 从 sent_tokens_offset 切）→ _new_completion_output（L388-423，delta 文本/token/logprobs 切尾）→ n>1 父聚合 ParentRequest.get_outputs（parallel_sampling.py:L100-126）→ _new_request_output 写回外部 id 组装 RequestOutput（L342-386，L374）。",
+    "7. 单槽邮箱与消费：collector.put 占槽或 add() 合并（L62-76 → outputs.py:L152-181）→ generate() 循环 out = q.get_nowait() or await q.get() yield（async_llm.py:L596-606）→ SSE generator 消费 yield data: {json}\\n\\n（serving.py:L485、L542；delta_text = output.text L602）。",
+    "8. 断连/异常出径（async_llm.py:L608-655）：CancelledError/GeneratorExit/InputStreamError/意外 Exception → abort(q.request_id, internal=True)（L611-616 等）→ OutputProcessor.abort_requests 移状态 + 投 ABORT 终态（output_processor.py:L494-515）→ engine_core.abort_requests_async（L738）；finally q.close()（L653-655）。路由层第一跳 = with_cancellation 竞速（api_utils.py:L52-94，挂 chat 路由 api_router.py:L51-53）。"
+  ],
+  "why_chains": [
+    {
+      "id": "WC1",
+      "card": "deepread/api-entry.json why_chains[2]",
+      "decision": "RequestOutputCollector = 单槽 + asyncio.Event + 生产侧合并——刻意不用 asyncio.Queue",
+      "old_design": "v0 AsyncStream 每请求一条无界 asyncio.Queue（历史 e19bce40a~1：`self._queue: asyncio.Queue = asyncio.Queue()`，每条 RequestOutput put_nowait 排队）。v1 初版（PR #9826，2024-11）仍沿用 asyncio.Queue；#12298（2025-01）先在 generate() 消费侧加合并；#15156（2025-03-24 '[V1][Perf] Simpler request output queues'，commit 9d72daf4c，git log -S 'class RequestOutputCollector' 唯一命中）才落成今天的单槽 collector。",
+      "pain": "SSE 消费者会滞后（TCP 背压、慢客户端、事件循环忙）——无界队列把每一条中间 RequestOutput 都留在内存：高并发 × 长生成的中间态全部滞留；CUMULATIVE 模式每条快照持有全量已生成文本，滞留代价是 O(len^2) 级；asyncio.Queue 的 put/get 每次还有锁与 future 的固定开销。",
+      "solution": "RequestOutputCollector（output_processor.py:L45-106）：构造 (output_kind, request_id)（L54-60，aggregate = DELTA）；单槽 self.output + self.ready（Event）；put() 槽空或 Exception → 占槽置位（L64-66，错误无条件抢槽）；槽非空且双 RequestOutput → output.add(output, aggregate=) 就地合并（L67-72 → vllm/outputs.py:L152-181：DELTA 把增量 text/token_ids/logprobs 拼进滞留对象、CUMULATIVE 替换同 index 输出）；PoolingRequestOutput → 直接替换（L73-76）；消费侧 get() 等事件（L78-86）、get_nowait() 非阻塞快路径（L88-96）；generate() 里 `out = q.get_nowait() or await q.get()`（async_llm.py:L599，注释 'avoids task switching under load which helps performance'）。消费者无论滞后多久，每请求驻留内存 O(1)。",
+      "cost": "单槽 = 慢消费者在 CUMULATIVE 模式下永远看不到中间快照（只有最新态幸存，语义正确但失去逐步视图）；DELTA 合并让消费者收到融合大块而非逐 step 小块（省内存但失去节拍粒度）；错误抢槽会覆盖未取走的正常输出（错误优先的设计取舍）；`get_nowait() or await get()` 依赖 RequestOutput 恒真值——outputs.py 的 RequestOutput 未定义 __bool__/__len__（已核 grep 无匹配），将来若加 __len__ 空输出变假值，此行会静默错乱，是埋着的地雷；close/__del__ 还要收拾流式输入的 _input_stream_task（L98-106）。"
+    },
+    {
+      "id": "WC2",
+      "card": "deepread/api-entry.json why_chains[3]",
+      "decision": "回程分发 = 单个长驻 output_handler 任务做 1→N 多路分发，按 VLLM_V1_OUTPUT_PROC_CHUNK_SIZE 分块并在片间让出事件循环",
+      "old_design": "v0 的输出分发内嵌在引擎循环里同步做（同进程，RequestTracker.process_request_output 逐条 put）；v1 初版 output_handler 一口气处理整批 EngineCoreOutputs（PR #12287 之前无分块，diff 已在 v0.21.0 深读核对）。",
+      "pain": "v1 里 API 进程只有一条 ZMQ 输出流，每步带回整批所有被调度请求的 EngineCoreOutputs；process_outputs 是纯 Python CPU 活（逐请求 detokenize + logprobs + 组装 RequestOutput），一批数百请求一口气做完会长时间独占事件循环——期间不能 accept 新 HTTP、不能写任何 SSE、不能跑 add_request，所有请求一起被这一批拖住（事件循环头阻塞，直接伤 P99 延迟）。",
+      "solution": "_run_output_handler（async_llm.py:L657-727）：单任务循环 await engine_core.get_output_async()（L680 → core_client.py:L1093-1102，由名为 'EngineCoreOutputQueueTask' 的后台任务喂，core_client.py:L1089-1091）→ 按 chunk_size 切片（默认 128，envs.py:L160；async_llm.py:L674,L691-697）逐片 process_outputs，片间 await asyncio.sleep(0)（L702-703）让事件循环喘气；异步面断言返回列表必空——输出全走队列（L698-699 `assert not processed_outputs.request_outputs`）；stop-string 触发的收尾反向 abort（L705-709）；process_outputs 内部按内部 req_id demux 到每请求自己的 collector（output_processor.py:L620-624 → L679-684）——'NOTE FOR DEVELOPERS' 注释钉死全批遍历只许这一处（L607-614）。闭包捕获局部变量避免反向引用 self 挡 GC（L663-674；logger 经可变 list _logger_ref 传递以支持弹性 EP 期重建 logger，L668-672）。eager/lazy 双启动：__init__ 在事件循环内就启动（L173-179），否则首个 add_request 懒启动（L390-393，注释原话 'so we can call __init__ before the event loop, which enables us to handle startup failure gracefully in the OpenAI server'）。",
+      "cost": "每个输出多两级中转（ZMQ → outputs_queue → output_handler → collector → SSE）；分块 + sleep(0) 在高负载下增加任务切换次数（用切换换公平）；单任务分发意味着 detokenize 仍是单核瓶颈（吞吐上限 = 一个 CPU 核的解码速度，靠 chunk 化摊薄延迟而非扩容）；eager/lazy 双启动 + is_running 在 handler 为 None 时返回 True（L1085-1088）这类生命周期特例是理解成本。"
+    },
+    {
+      "id": "WC3",
+      "card": "deepread/api-entry.json why_chains[4]",
+      "decision": "RequestOutputKind 三态契约（DELTA / CUMULATIVE / FINAL_ONLY）：使用面在入口声明消费方式，引擎照单裁剪输出流量",
+      "old_design": "v0 没有这个维度——引擎对每个请求每步都产完整输出，流式与否的差异全靠 API 层消化；v1 初版的 SamplingParams 也没有 output_kind（PR 历史中后补）。",
+      "pain": "离线批处理与非流式 HTTP 根本不需要每 token 的中间输出——照样生产、照样跨进程传、照样排队，是每 token 每请求的纯浪费（CPU + IPC + 内存）；流式 SSE 恰恰相反，要的就是增量。",
+      "solution": "SamplingParams.output_kind 三态枚举（vllm/sampling_params.py:L182-188），使用面在入口设定：OpenAI chat/completion stream=True→DELTA、stream=False→FINAL_ONLY（chat_completion/protocol.py:L722-724；completion/protocol.py:L375-377）；离线 LLM 强制 FINAL_ONLY（vllm/entrypoints/offline_utils.py:L560-561，注释 'We only care about the final output'）。OutputProcessor 按单裁剪：FINAL_ONLY 且未结束 → make_request_output 直接返回 None，中间输出根本不构造（output_processor.py:L286-290）；DELTA 只发增量（_new_completion_output L388-423，detokenizer.get_next_output_text(finished, delta) 切文本、logprobs 切尾）；collector 的合并模式也由它决定（L55 aggregate = DELTA）。v0.27.1 另有 stream_interval 节流（引擎级 scheduler_config.stream_interval 传入 OutputProcessor，async_llm.py:L144；per-request SamplingParams.stream_interval 在 RequestState.from_new_request clamp 取 max，output_processor.py:L227-229，PR #49754；>1 时每 N token 才发，output_processor.py:L292-313）。",
+      "cost": "所有下游（logprobs 切片、routed_experts 拼接、metrics）都要感知这个第三轴；与 n>1 并行采样（ParentRequest 扇出/汇合，vllm/v1/engine/parallel_sampling.py:L13+；async_llm.py:L405-418）和流式输入叠加时分支组合爆炸；CUMULATIVE 这个中间态实际使用面很窄（库用户同步迭代），却是读者必须懂的三态之一。"
+    },
+    {
+      "id": "WC4",
+      "card": "deepread/api-entry.json why_chains[6]",
+      "decision": "客户端断连 = 取消 generate 协程 = 反向 abort：把「没人看的请求」从引擎里抠掉",
+      "old_design": "v0 AsyncStream.generator 在 GeneratorExit 时 cancel（依赖生成器被关闭才触发）；HTTP 层没有主动监听断连的统一机制。",
+      "pain": "HTTP 客户端中途断开（用户关页面、超时、重试换路）后，若不显式 abort，引擎会继续为幽灵请求逐 token 烧 GPU——batch 场景下这是真实吞吐损失：每个断连请求白白占一个 batch 位直到 max_tokens。",
+      "solution": "三层接力：① 路由层 with_cancellation 让 handler 任务与 listen_for_disconnect 竞速，断连则 cancel handler（vllm/entrypoints/serve/utils/api_utils.py:L52-94 与 L37-49——v0.27.1 已从 entrypoints/utils.py 移到 serve/utils/；挂在 POST /v1/chat/completions 上，chat_completion/api_router.py:L51-53）；② StreamingResponse 取消传导为 generate() 的 CancelledError/GeneratorExit → await self.abort(q.request_id, internal=True)（async_llm.py:L611-616）；③ abort 两跳落地（async_llm.py:L729-738）——本进程 OutputProcessor.abort_requests 移状态并给 collector 放一条 finish_reason=ABORT 的终态输出（防止还在等的消费者卡死，output_processor.py:L494-515），再 engine_core.abort_requests_async 跨进程通知引擎停算（core_client.py:L1150-1152）。非流式全量路径同样接 CancelledError → 'Client disconnected' 错误响应（chat_completion/serving.py:L862-863）。",
+      "cost": "每请求多一个竞速任务（listen_for_disconnect 持续读 receive 通道）；abort 是异步的——断连到引擎真停之间还差一次 IPC + 引擎当前 step，期间仍会算出若干废 token（浪费有界但不为零）；abort 的终态输出依赖 collector 还活着（generate 的 finally q.close() async_llm.py:L653-655 与 abort 的时序竞争由 internal id 与 put 的幂等性兜住）。"
+    },
+    {
+      "id": "WC5",
+      "card": "deepread/ipc-stage.json why_chains[7]",
+      "decision": "输出按步聚合：每个 forward step 每客户端只发一条 EngineCoreOutputs（整批所有请求的新 token 打包）",
+      "old_design": "朴素做法（多数自研推理服务第一版）：逐请求、逐 token 发事件/回调。",
+      "pain": "每条消息有固定开销（ZMQ 帧 + msgpack 头 + 解码出的对象 + 前端事件循环唤醒）；小模型 5ms/step、批内几十上百请求时逐 token 发消息的 IPC 次数爆炸。",
+      "solution": "EngineCoreOutputs = outputs: list[EngineCoreOutput]（每请求一条：request_id + new_token_ids + finish_reason 等，vllm/v1/engine/__init__.py:L184-215 单条、L230-258 聚合；代码里留着 NOTE(Nick) 'We could consider ways to make this more compact, e.g. columnwise layout'——行式布局尚未榨干）；step() 返回 dict[client_index → EngineCoreOutputs]（core.py:L584-L614，scheduler.update_from_output 产出）；busy loop 逐 (client_index, outputs) 入 output_queue（core.py:L1441-L1442）；前端 output_handler 整取后按 VLLM_V1_OUTPUT_PROC_CHUNK_SIZE=128 切片喂 OutputProcessor、块间 await asyncio.sleep(0) 让出事件循环（async_llm.py:L676-L703，envs.py:L160）。",
+      "cost": "单条消息变大 → 解码与 detokenize 若一口气做完会长时间独占前端事件循环，逼出 chunk+sleep(0) 机制（这正是 #12287 的动机之一；其 A100/Llama-3.2-1B/6000 请求基准，上一轮深读经 GitHub API 核对：req/s 63.62→67.72（+6.4%），mean TTFT 229.23→197.34ms（−14%），mean TPOT 30.02→28.30ms，p99 TPOT 68.90→47.38ms（−31%））；行式序列化密度低于列式（NOTE 承认）。"
+    },
+    {
+      "id": "WC6",
+      "card": "deepread/api-entry.json why_chains[5]（回程出口半边；出发半边 ch6 WC3 已讲）",
+      "decision": "request_id 双轨的回程侧：OutputProcessor 维护外→内映射，出口写回外部 id，abort 双轨皆可",
+      "old_design": "v0 一切以用户提供的 request_id 为键（RequestTracker._request_streams dict），重复 id 直接 KeyError 或错路由。",
+      "pain": "真实世界用户会重试/复用 id（浏览器、SDK 重连）；n>1 扇出的 n 个子请求要能汇回一条流——单轨 id 一撞就污染 demux 表。",
+      "solution": "InputProcessor.assign_request_id 在出发侧改双轨（ch6）；本章的回程侧：OutputProcessor 持 external_req_ids: defaultdict[str, list[str]] 外→内映射（output_processor.py:L445；登记 L553-554），输出组装时把外部 id 写回 RequestOutput（L315、L374 注释 'request_id is what was provided externally'）；abort 双轨皆可（abort_requests docstring L462-476：外部 id 一律展开为其全部内部 id，内部 id 单删，L477-492；父请求 id 则联动 abort 全部子请求 L516-522）。generate() 断连走 abort(q.request_id, internal=True)——q 持内部 id（async_llm.py:L611-616）。",
+      "cost": "每个请求两套 id，日志与调试都要过一遍映射脑内换算；映射表本身的增删要精确跟随请求生命周期（_finish_request L717-720），错位即泄漏。"
+    }
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/engine/output_processor.py",
+      "lines": "L45-L96",
+      "code": "class RequestOutputCollector:\n    \"\"\"\n    Collects streamed RequestOutputs per individual request,\n    for hand-off to the consuming asyncio generate task.\n\n    When streaming deltas, RequestOutputs are merged if the\n    producer gets ahead of the consumer.\n    \"\"\"\n\n    def __init__(self, output_kind: RequestOutputKind, request_id: str):\n        self.aggregate = output_kind == RequestOutputKind.DELTA\n        self.request_id = request_id\n        self.output: RequestOutput | PoolingRequestOutput | Exception | None = None\n        self.ready = asyncio.Event()\n\n        self._input_stream_task: asyncio.Task | None = None\n\n    def put(self, output: RequestOutput | PoolingRequestOutput | Exception) -> None:\n        \"\"\"Non-blocking put operation.\"\"\"\n        if self.output is None or isinstance(output, Exception):\n            self.output = output\n            self.ready.set()\n        elif isinstance(self.output, RequestOutput) and isinstance(\n            output, RequestOutput\n        ):\n            # This ensures that request outputs with different request indexes\n            # (if n > 1) do not override each other.\n            self.output.add(output, aggregate=self.aggregate)\n        elif isinstance(self.output, PoolingRequestOutput) and isinstance(\n            output, PoolingRequestOutput\n        ):\n            self.output = output\n\n    async def get(self) -> RequestOutput | PoolingRequestOutput:\n        \"\"\"Get operation blocks on put event.\"\"\"\n        while (output := self.output) is None:\n            await self.ready.wait()\n        self.output = None\n        self.ready.clear()\n        if isinstance(output, Exception):\n            raise output\n        return output\n\n    def get_nowait(self) -> RequestOutput | PoolingRequestOutput | None:\n        \"\"\"Non-blocking get operation.\"\"\"\n        output = self.output\n        if output is not None:\n            self.output = None\n            self.ready.clear()\n        if isinstance(output, Exception):\n            raise output\n        return output",
+      "elide": [
+        "close/__del__/_input_stream_task（L98-106）属流式输入任务清理，正文一句带过（流式输入不进精简版）；Pooling 分支（L73-76）正文一句带过（池化模型另一条产品线）"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/output_processor.py",
+      "lines": "L589-L711",
+      "code": "    def process_outputs(\n        self,\n        engine_core_outputs: list[EngineCoreOutput],\n        engine_core_timestamp: float | None = None,\n        iteration_stats: IterationStats | None = None,\n    ) -> OutputProcessorOutput:\n        \"\"\"\n        Process the EngineCoreOutputs:\n        1) Compute stats for logging\n        2) Detokenize\n        3) Create and handle RequestOutput objects:\n            * If there is a queue (for usage with AsyncLLM),\n              put the RequestOutput objects into the queue for\n              handling by the per-request generate() tasks.\n\n            * If there is no queue (for usage with LLMEngine),\n              return a list of RequestOutput objects.\n\n        NOTE FOR DEVELOPERS\n\n        vLLM V1 minimizes the number of python loops over the full\n        batch to ensure system overheads are minimized. This is the\n        only function that should loop over EngineCoreOutputs.\n\n        If you need to touch every element of the batch, do it from\n        within the loop below.\n        \"\"\"\n\n        request_outputs: list[RequestOutput | PoolingRequestOutput] = []\n        reqs_to_abort: list[str] = []\n        for engine_core_output in engine_core_outputs:\n            req_id = engine_core_output.request_id\n            req_state = self.request_states.get(req_id)\n            if req_state is None:\n                # Ignore output for already-aborted request.\n                continue\n\n            # 1) Compute stats for this iteration.\n            self._update_stats_from_output(\n                req_state, engine_core_output, engine_core_timestamp, iteration_stats\n            )\n\n            new_token_ids = engine_core_output.new_token_ids\n            pooling_output = engine_core_output.pooling_output\n            finish_reason = engine_core_output.finish_reason\n            stop_reason = engine_core_output.stop_reason\n            kv_transfer_params = engine_core_output.kv_transfer_params\n            ec_transfer_params = engine_core_output.ec_transfer_params\n            if engine_core_output.routed_experts is not None:\n                req_state.routed_experts_chunks.append(\n                    engine_core_output.routed_experts\n                )\n\n            if req_state.is_prefilling:\n                if engine_core_output.prefill_stats is not None:\n                    req_state.num_cached_tokens = (\n                        engine_core_output.prefill_stats.num_cached_tokens\n                    )\n                    req_state.num_cache_creation_tokens = (\n                        engine_core_output.prefill_stats.num_cache_creation_tokens\n                    )\n                req_state.is_prefilling = False\n\n            if pooling_output is None:\n                assert req_state.detokenizer is not None\n                assert req_state.logprobs_processor is not None\n                # 2) Detokenize the token ids into text and perform stop checks.\n                stop_string = req_state.detokenizer.update(\n                    new_token_ids, finish_reason == FinishReason.STOP\n                )\n                if stop_string:\n                    finish_reason = FinishReason.STOP\n                    stop_reason = stop_string\n\n                # 3) Compute sample and prompt logprobs for request,\n                # if required.\n                req_state.logprobs_processor.update_from_output(engine_core_output)\n\n            # 4) Create and handle RequestOutput objects.\n            if request_output := req_state.make_request_output(\n                new_token_ids,\n                pooling_output,\n                finish_reason,\n                stop_reason,\n                kv_transfer_params,\n                ec_transfer_params,\n            ):\n                if req_state.streaming_input:\n                    request_output.finished = False\n\n                if req_state.queue is not None:\n                    # AsyncLLM: put into queue for handling by generate().\n                    req_state.queue.put(request_output)\n                else:\n                    # LLMEngine: return list of RequestOutputs.\n                    request_outputs.append(request_output)\n\n            # Free completed requests.\n            if finish_reason is not None:\n                if req_state.streaming_input:\n                    if req_state.input_chunk_queue:\n                        update = req_state.input_chunk_queue.popleft()\n                        req_state.apply_streaming_update(update)\n                    else:\n                        req_state.input_chunk_queue = None\n                else:\n                    self._finish_request(req_state)\n                    if not engine_core_output.finished:\n                        # If req not finished in EngineCore, but Detokenizer\n                        # detected stop string, abort needed in EngineCore.\n                        reqs_to_abort.append(req_id)\n\n                    # Track per-request stats\n                    self._update_stats_from_finished(\n                        req_state, finish_reason, iteration_stats\n                    )\n                    if self.tracing_enabled:\n                        self.do_tracing(engine_core_output, req_state, iteration_stats)\n\n        return OutputProcessorOutput(\n            request_outputs=request_outputs,\n            reqs_to_abort=reqs_to_abort,\n        )",
+      "elide": [
+        "stats 调用（L626-629、L701-706）与 routed_experts 累积（L637-640）可各压一行带过；pooling 分支（pooling_output 非 None 时跳过 detokenize/logprobs）一句带过；streaming_input 分支（L676-677、L688-693）是边角特性，一句带过：完成时不立即注销而是消费 input_chunk_queue 的下一个输入块；kv_transfer_params/ec_transfer_params 透传字段（ch36）不展开"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/output_processor.py",
+      "lines": "L276-L340",
+      "code": "    def make_request_output(\n        self,\n        new_token_ids: list[int],\n        pooling_output: torch.Tensor | None,\n        finish_reason: FinishReason | None,\n        stop_reason: int | str | None,\n        kv_transfer_params: dict[str, Any] | None = None,\n        ec_transfer_params: dict[str, Any] | None = None,\n    ) -> RequestOutput | PoolingRequestOutput | None:\n        finished = finish_reason is not None\n        final_only = self.output_kind == RequestOutputKind.FINAL_ONLY\n\n        if not finished and final_only:\n            # Only the final output is required in FINAL_ONLY mode.\n            return None\n\n        if self.stream_interval > 1:\n            assert self.detokenizer is not None\n\n            # Send output request only when\n            # 1. It has finished, or\n            # 2. It is the first token, or\n            # 3. It has reached the stream interval number of tokens\n            if not (\n                finished\n                or self.sent_tokens_offset == 0\n                or self.detokenizer.num_output_tokens() - self.sent_tokens_offset\n                >= self.stream_interval\n            ):\n                return None\n\n            if self.output_kind == RequestOutputKind.DELTA:\n                # Send tokens from the offset in DELTA mode, otherwise all\n                # tokens are sent.\n                new_token_ids = self.detokenizer.output_token_ids[\n                    self.sent_tokens_offset :\n                ]\n                self.sent_tokens_offset = self.detokenizer.num_output_tokens()\n\n        external_req_id = self.external_req_id\n\n        if pooling_output is not None:\n            return self._new_request_output(\n                external_req_id,\n                [self._new_pooling_output(pooling_output)],\n                finished,\n            )\n\n        output = self._new_completion_output(new_token_ids, finish_reason, stop_reason)\n\n        if self.parent_req is None:\n            outputs = [output]\n        else:\n            outputs, finished = self.parent_req.get_outputs(self.request_id, output)\n            if not outputs:\n                return None\n            external_req_id = self.parent_req.external_req_id\n\n        return self._new_request_output(\n            external_req_id,\n            outputs,\n            finished,\n            kv_transfer_params,\n            ec_transfer_params,\n        )",
+      "elide": [
+        "pooling 分支（L317-322）正文一句带过"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/output_processor.py",
+      "lines": "L388-L423",
+      "code": "    def _new_completion_output(\n        self,\n        token_ids: list[int],\n        finish_reason: FinishReason | None,\n        stop_reason: int | str | None,\n    ) -> CompletionOutput:\n        assert self.detokenizer is not None\n        assert self.logprobs_processor is not None\n        finished = finish_reason is not None\n        delta = self.output_kind == RequestOutputKind.DELTA\n\n        # Prepare text and token_ids, based on delta mode\n        text = self.detokenizer.get_next_output_text(finished, delta)\n        if not delta:\n            token_ids = self.detokenizer.output_token_ids\n\n        # Prepare logprobs, based on delta mode\n        logprobs = self.logprobs_processor.logprobs\n        if delta and logprobs:\n            logprobs = logprobs[-len(token_ids) :]\n\n        # Concatenate routed experts on finish\n        routed_experts = None\n        if finished and self.routed_experts_chunks:\n            routed_experts = np.concatenate(self.routed_experts_chunks, axis=0)\n\n        return CompletionOutput(\n            index=self.request_index,\n            text=text,\n            token_ids=token_ids,\n            routed_experts=routed_experts,\n            logprobs=logprobs,\n            cumulative_logprob=self.logprobs_processor.cumulative_logprob,\n            finish_reason=str(finish_reason) if finished else None,\n            stop_reason=stop_reason if finished else None,\n        )",
+      "elide": [
+        "logprobs 准备段（L404-407）是 ch8 的接点，本章只讲『delta 下只取尾段』这一句；routed_experts 拼接（L409-412）属 MoE 正交特性，一句带过"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/output_processor.py",
+      "lines": "L462-L523",
+      "code": "    def abort_requests(self, request_ids: Iterable[str], internal: bool) -> list[str]:\n        \"\"\"Abort a list of requests.\n\n        The request_ids may be either external request IDs (those passed to\n        InputProcessor.process_inputs()) or internal request IDs (those randomly\n        generated when creating the EngineCoreRequest).\n\n        If an external request ID is provided, and that external request ID\n        was used for multiple requests, all requests associated with that external\n        request ID are aborted.\n\n        In the case of parallel sampling, a request ID may be used to identify\n        a parent request, in which case the associated child requests are aborted\n        also.\n        \"\"\"\n        internal_req_ids = []\n        for request_id in request_ids:\n            if internal:\n                # Internal ID - this may be a parent request\n                internal_req_ids.append(request_id)\n\n                # Remove internal ID from the external->internal mapping\n                if req_state := self.request_states.get(request_id):\n                    external_req_id = req_state.external_req_id\n                    internal_ids = self.external_req_ids[external_req_id]\n                    internal_ids.remove(request_id)\n                    if not internal_ids:\n                        del self.external_req_ids[external_req_id]\n            elif internal_ids := self.external_req_ids.pop(request_id, []):\n                # External ID - abort all requests in the external->internal mapping\n                internal_req_ids.extend(internal_ids)\n\n        request_ids_to_abort = []\n        for request_id in internal_req_ids:\n            req_state = self.request_states.pop(request_id, None)\n            if req_state is not None:\n                self.lora_states.request_finished(request_id, req_state.lora_name)\n                request_ids_to_abort.append(request_id)\n                # Produce final abort output.\n                if req_state.queue is not None and (\n                    request_output := req_state.make_request_output(\n                        new_token_ids=[],\n                        # Set pooling_output is not None to\n                        # correctly enter the abort pooling branch\n                        pooling_output=EMPTY_CPU_TENSOR\n                        if req_state.detokenizer is None\n                        else None,\n                        finish_reason=FinishReason.ABORT,\n                        stop_reason=None,\n                        kv_transfer_params=None,\n                        ec_transfer_params=None,\n                    )\n                ):\n                    req_state.queue.put(request_output)\n            elif parent := self.parent_requests.get(request_id):\n                # Abort children prior to removing the parent.\n                if parent.child_requests:\n                    child_reqs = list(parent.child_requests)\n                    child_reqs = self.abort_requests(child_reqs, internal=True)\n                    request_ids_to_abort.extend(child_reqs)\n                self.parent_requests.pop(request_id, None)\n        return request_ids_to_abort",
+      "elide": [
+        "EMPTY_CPU_TENSOR 三元（L506-508）只为让 pooling 请求走对 abort 分支，正文一句带过；lora_states.request_finished（L498）观测性调用一句带过"
+      ]
+    },
+    {
+      "path": "vllm/outputs.py",
+      "lines": "L152-L181",
+      "code": "    def add(self, next_output: \"RequestOutput\", aggregate: bool) -> None:\n        \"\"\"Merge subsequent RequestOutput into this one\"\"\"\n\n        self.finished |= next_output.finished\n        self.kv_transfer_params = next_output.kv_transfer_params\n        self.ec_transfer_params = next_output.ec_transfer_params\n\n        for next_completion in next_output.outputs:\n            for i, completion in enumerate(self.outputs):\n                if completion.index == next_completion.index:\n                    if aggregate:\n                        # Merge outputs with same index\n                        completion.text += next_completion.text\n                        if not isinstance(completion.token_ids, MutableSequence):\n                            completion.token_ids = list(completion.token_ids)\n                        completion.token_ids.extend(next_completion.token_ids)\n                        if next_completion.logprobs:\n                            assert completion.logprobs is not None\n                            completion.logprobs.extend(next_completion.logprobs)  # type: ignore[arg-type]\n                        completion.cumulative_logprob = (\n                            next_completion.cumulative_logprob\n                        )\n                        completion.finish_reason = next_completion.finish_reason\n                        completion.stop_reason = next_completion.stop_reason\n                    else:\n                        # Replace the output with the new one\n                        self.outputs[i] = next_completion\n                    break\n            else:\n                self.outputs.append(next_completion)",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/detokenizer.py",
+      "lines": "L31-L66",
+      "code": "class IncrementalDetokenizer:\n    def __init__(self):\n        self.token_ids: list[int] = []\n\n    @property\n    def output_token_ids(self) -> list[int]:\n        return self.token_ids\n\n    def num_output_tokens(self) -> int:\n        return len(self.token_ids)\n\n    def update(self, new_token_ids: list[int], stop_terminated: bool) -> str | None:\n        self.token_ids.extend(new_token_ids)\n        return None\n\n    def get_next_output_text(self, finished: bool, delta: bool) -> str:\n        return \"\"\n\n    @classmethod\n    def from_new_request(\n        cls,\n        tokenizer: TokenizerLike | None,\n        request: EngineCoreRequest,\n    ) -> \"IncrementalDetokenizer\":\n        assert request.sampling_params is not None\n\n        if tokenizer is None:\n            # No tokenizer => skipping detokenization.\n            return IncrementalDetokenizer()\n\n        if USE_FAST_DETOKENIZER and isinstance(tokenizer, TokenizersBackend):\n            # Fast tokenizer => use tokenizers library DecodeStream.\n            return FastIncrementalDetokenizer(tokenizer, request)\n\n        # Fall back to slow python-based incremental detokenization.\n        return SlowIncrementalDetokenizer(tokenizer, request)",
+      "elide": [
+        "L61 的判据是 isinstance(tokenizer, TokenizersBackend)（v0.27.1 的 tokenizer 后端类，transformers 导入 L10）——v0.21.0 时代的 PreTrainedTokenizerFast 判据已过时，迁移旧讲法时必须换"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/detokenizer.py",
+      "lines": "L69-L94",
+      "code": "class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):\n    def __init__(self, request: EngineCoreRequest):\n        super().__init__()\n\n        # Stop strings\n        params = request.sampling_params\n        assert params is not None\n        if params.stop is None:\n            self.stop = []\n        elif isinstance(params.stop, str):\n            self.stop = [params.stop]\n        else:\n            self.stop = params.stop\n        self.min_tokens = params.min_tokens\n        self.include_stop_str_in_output = params.include_stop_str_in_output\n\n        # Number of chars to hold back when stop strings are to be excluded\n        # from streamed output.\n        if self.stop and not self.include_stop_str_in_output:\n            self.stop_buffer_length = max(len(s) for s in self.stop) - 1\n        else:\n            self.stop_buffer_length = 0\n        self._last_output_text_offset: int = 0\n\n        # Generation data\n        self.output_text = \"\"",
+      "elide": [
+        "stop 参数归一化（str→[str]）一句带过；stop_buffer_length 的 -1 是 holdback 正确性的题眼，正文必讲"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/detokenizer.py",
+      "lines": "L96-L143",
+      "code": "    def update(self, new_token_ids: list[int], stop_terminated: bool) -> str | None:\n        \"\"\"\n        Update RequestState for the request_id by:\n            1) Detokenize the new token ids incrementally.\n            2) Evaluate stop criteria.\n\n        Return matched stop string or None.\n        \"\"\"\n        if not new_token_ids:\n            # Skip detokenization if no new token ids.\n            return None\n\n        if stop_terminated and not self.include_stop_str_in_output:\n            # If stop-terminated, exclude last token from detokenization\n            # based on include_stop_str_in_output parameter.\n            skipped_stop_token_id = new_token_ids[-1]\n            new_token_ids = new_token_ids[:-1]\n        else:\n            skipped_stop_token_id = None\n\n        # 1) Detokenize the new token ids incrementally.\n        stop_check_offset = len(self.output_text)\n        for new_token_id in new_token_ids:\n            self.token_ids.append(new_token_id)\n            self.output_text += self.decode_next(new_token_id)\n            # Support min_tokens, see https://github.com/vllm-project/vllm/pull/22014\n            if self.min_tokens and self.num_output_tokens() <= self.min_tokens:\n                stop_check_offset = len(self.output_text)\n\n        if skipped_stop_token_id is not None:\n            # Cleanup after skipping detokenization.\n            self.token_ids.append(skipped_stop_token_id)\n\n        # 2) Evaluate stop strings.\n        stop_string = None\n        if self.stop and self.num_output_tokens() > self.min_tokens:\n            stop = check_stop_strings(\n                output_text=self.output_text,\n                new_char_count=len(self.output_text) - stop_check_offset,\n                stop=self.stop,\n                include_in_output=self.include_stop_str_in_output,\n            )\n            if stop is not None:\n                stop_string, truncate_to = stop\n                if truncate_to != -1:\n                    self.output_text = self.output_text[:truncate_to]\n\n        return stop_string",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/detokenizer.py",
+      "lines": "L149-L165",
+      "code": "    def get_next_output_text(self, finished: bool, delta: bool) -> str:\n        \"\"\"If delta is True, only new text since the last call to\n        this method is returned\"\"\"\n\n        # We return the full output text if the sequence is finished.\n        buffer_length = 0 if finished else self.stop_buffer_length\n        if not delta:\n            if not buffer_length:\n                return self.output_text\n            return self.output_text[:-buffer_length]\n\n        length = len(self.output_text) - buffer_length\n        last_offset = self._last_output_text_offset\n        if last_offset < length:\n            self._last_output_text_offset = length\n            return self.output_text[last_offset:length]\n        return \"\"",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/detokenizer.py",
+      "lines": "L169-L209",
+      "code": "    def __init__(self, tokenizer: TokenizersBackend, request: EngineCoreRequest):\n        super().__init__(request)\n\n        sampling_params = request.sampling_params\n        assert sampling_params is not None\n\n        self.request_id = request.request_id\n        self.skip_special_tokens = sampling_params.skip_special_tokens\n\n        self.tokenizer: Tokenizer = tokenizer._tokenizer\n\n        # Use native prefill to prime the decode stream with prompt tokens.\n        # Look up DecodeStream on the module so backend patches (e.g. the\n        # fastokens shim that replaces ``tokenizers.decoders.DecodeStream``)\n        # are honored regardless of import order.\n        self.stream = tokenizers.decoders.DecodeStream(\n            ids=request.prompt_token_ids,\n            skip_special_tokens=self.skip_special_tokens,\n        )\n\n        self.spaces_between_special_tokens = (\n            sampling_params.skip_special_tokens\n            or sampling_params.spaces_between_special_tokens\n        )\n\n        if not self.spaces_between_special_tokens:\n            # Store dict of added token ids so that we can suppress\n            # the spaces between them.\n            added_token_ids = getattr(self.tokenizer, \"added_token_ids\", None)\n            if added_token_ids is None:\n                self.tokenizer.added_token_ids = added_token_ids = {\n                    tid: tok.content\n                    for tid, tok in self.tokenizer.get_added_tokens_decoder().items()\n                }\n\n            if added_token_ids:\n                self.last_special = False\n                self.added_token_ids = added_token_ids\n            else:\n                # No added tokens.\n                self.spaces_between_special_tokens = True",
+      "elide": [
+        "L189-209 的 spaces_between_special_tokens=False 空格抑制分支（added_token_ids 预计算）是可选优化，正文一句话说明存在即可；native prefill（L184-187）与模块查找注释（L181-183）必讲"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/detokenizer.py",
+      "lines": "L211-L248",
+      "code": "    def decode_next(self, next_token_id: int) -> str:\n        token = self._protected_step(next_token_id)\n\n        if not self.spaces_between_special_tokens:\n            special_token = self.added_token_ids.get(next_token_id)\n            is_special = special_token is not None\n            if is_special and self.last_special:\n                # Return raw token string without any prefixed spaces.\n                token = special_token\n            self.last_special = is_special\n\n        return token or \"\"\n\n    def _protected_step(self, next_token_id: int) -> str | None:\n        try:\n            token = self.stream.step(self.tokenizer, next_token_id)\n        except (OverflowError, TypeError):\n            # Handle rare observed overflow, still to be diagnosed.\n            # See https://github.com/vllm-project/vllm/issues/21951.\n            logger.exception(\"Encountered invalid token id: %r\", next_token_id)\n            token = None\n        except Exception as e:\n            if not str(e).startswith(INVALID_PREFIX_ERR_MSG):\n                raise e\n            # Recover from edge case where tokenizer can produce non-monotonic,\n            # invalid UTF-8 output, which breaks the internal state of\n            # tokenizers' DecodeStream.\n            # See https://github.com/vllm-project/vllm/issues/17448.\n            logger.warning(\n                \"Encountered invalid prefix detokenization error\"\n                \" for request %s, resetting decode stream.\",\n                self.request_id,\n            )\n            self.stream = tokenizers.decoders.DecodeStream(\n                skip_special_tokens=self.skip_special_tokens\n            )\n            token = self.stream.step(self.tokenizer, next_token_id)\n        return token",
+      "elide": [
+        "decode_next 的空格抑制段（L214-220）与 __init__ 的分支同进退；_protected_step 两类异常恢复（OverflowError/TypeError 吞掉；Invalid prefix 重建流重放）是 Fast 路径的容错主角，必须讲"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/detokenizer.py",
+      "lines": "L252-L307",
+      "code": "    def __init__(self, tokenizer: TokenizerLike, request: EngineCoreRequest):\n        super().__init__(request)\n\n        self.tokenizer = tokenizer\n        params = request.sampling_params\n        assert params is not None\n\n        self.prompt_len = length_from_prompt_token_ids_or_embeds(\n            request.prompt_token_ids, request.prompt_embeds\n        )\n\n        # Metadata for incremental detokenization.\n        if request.prompt_token_ids is not None:\n            self.tokens, self.prefix_offset, self.read_offset = (\n                convert_prompt_ids_to_tokens(\n                    tokenizer=tokenizer,\n                    prompt_ids=request.prompt_token_ids,\n                    skip_special_tokens=params.skip_special_tokens,\n                )\n            )\n        else:\n            # Prompt embedding requests cannot be detokenized, in general.\n            self.tokens = [\"\"] * self.prompt_len\n            self.prefix_offset = 0\n            self.read_offset = 0\n\n        self.token_ids.extend(request.prompt_token_ids or [0] * self.prompt_len)\n\n        self.skip_special_tokens = params.skip_special_tokens\n        self.spaces_between_special_tokens = params.spaces_between_special_tokens\n\n    @property\n    def output_token_ids(self) -> list[int]:\n        if self.prompt_len:\n            return self.token_ids[self.prompt_len :]\n        return self.token_ids\n\n    def num_output_tokens(self) -> int:\n        return len(self.token_ids) - self.prompt_len\n\n    def decode_next(self, next_token_id: int) -> str:\n        new_tokens, decoded_text, prefix_offset, read_offset = detokenize_incrementally(\n            tokenizer=self.tokenizer,\n            all_input_ids=self.token_ids,\n            prev_tokens=self.tokens,\n            prefix_offset=self.prefix_offset,\n            read_offset=self.read_offset,\n            skip_special_tokens=self.skip_special_tokens,\n            spaces_between_special_tokens=self.spaces_between_special_tokens,\n        )\n\n        self.tokens.extend(new_tokens)\n        self.prefix_offset = prefix_offset\n        self.read_offset = read_offset\n\n        return decoded_text",
+      "elide": [
+        "embeds 兜底分支（L272-276：源码自注 'cannot be detokenized, in general'）与 L278 的 [0]*prompt_len 占位一句带过（mixed-mode 输入 ch6 已讲）；覆写 output_token_ids/num_output_tokens 减 prompt_len 是 Fast/Slow 口径差异的题眼"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/detokenizer.py",
+      "lines": "L310-L362",
+      "code": "def check_stop_strings(\n    output_text: str,\n    new_char_count: int,\n    stop: list[str],\n    include_in_output: bool,\n) -> tuple[str, int] | None:\n    \"\"\"Check if any stop strings are matched and truncate sequence\n    output text accordingly.\n\n    Returns tuple (stop_string, offset) if matched or else None.\n\n    Where stop_string is the matched stop string and offset is the\n    length to which output_text should be truncated, or -1 for no\n    truncation.\n\n    When several stop strings match within the newly generated text (for\n    example when speculative decoding appends multiple tokens in a single\n    step), the stop string that completes earliest in the text is selected,\n    so the result matches appending one token at a time. Ties are broken by\n    stop-list order.\n    \"\"\"\n    if not new_char_count or not stop:\n        return None\n\n    best_stop_str: str | None = None\n    best_stop_index = 0\n    best_end = sys.maxsize\n    for stop_str in stop:\n        stop_string_len = len(stop_str)\n        # Avoid searching already-searched text.\n        stop_index = output_text.find(stop_str, 1 - new_char_count - stop_string_len)\n        if stop_index == -1:\n            continue\n\n        # Prefer the stop string that completes earliest in the text.\n        end = stop_index + stop_string_len\n        if end < best_end:\n            best_stop_str = stop_str\n            best_stop_index = stop_index\n            best_end = end\n\n    if best_stop_str is None:\n        return None\n\n    if include_in_output:\n        # Truncate to end of stop string.\n        if best_end >= len(output_text):\n            # No truncation required.\n            return best_stop_str, -1\n        return best_stop_str, best_end\n\n    # Truncate the output text to the beginning of the stop string.\n    return best_stop_str, best_stop_index",
+      "elide": [
+        "v0.27.x 新语义：多条命中取『完成最早』者（best_end），docstring 点名投机解码一步多 token 的场景——与 v0.21.0『按 stop 列表序首个命中』不同，迁移旧讲法必须换"
+      ]
+    },
+    {
+      "path": "vllm/tokenizers/detokenizer_utils.py",
+      "lines": "L119-L140",
+      "code": "def convert_prompt_ids_to_tokens(\n    tokenizer: TokenizerLike,\n    prompt_ids: list[int],\n    skip_special_tokens: bool = False,\n) -> tuple[list[str], int, int]:\n    \"\"\"Converts the prompt ids to tokens and returns the tokens and offsets\n    for incremental detokenization.\n\n    Note that not all tokens are converted to strings. Only the tokens that\n    are necessary for incremental detokenization are converted to strings.\n    \"\"\"\n    # We do not need to convert the whole prompt to tokens.\n    # Offset a little more in case we have special tokens.\n    new_tokens = tokenizer.convert_ids_to_tokens(\n        prompt_ids[-INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET - 2 :],\n        skip_special_tokens=skip_special_tokens,\n    )\n    read_offset = len(new_tokens)\n    prefix_offset = max(read_offset - INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET, 0)\n    # This is required to guard against out-of-vocab prompt token ids\n    _replace_none_with_empty(new_tokens)  # type: ignore[arg-type]\n    return new_tokens, prefix_offset, read_offset",
+      "elide": [
+        "INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET = 5（L57-59，模块常量）配此段读：初始窗口 = 尾部 7 个 token、prefix 再退 5"
+      ]
+    },
+    {
+      "path": "vllm/tokenizers/detokenizer_utils.py",
+      "lines": "L176-L268",
+      "code": "def detokenize_incrementally(\n    tokenizer: TokenizerLike,\n    all_input_ids: list[int],\n    prev_tokens: list[str] | None,\n    prefix_offset: int,\n    read_offset: int,\n    skip_special_tokens: bool = False,\n    spaces_between_special_tokens: bool = True,\n) -> tuple[list[str], str, int, int]:\n    \"\"\"Detokenizes the input ids incrementally and returns the new tokens\n    and the new text.\n\n    If `prev_tokens` is None, this function will convert the input ids to\n    tokens and return the tokens and the new text. Otherwise, it will return the\n    new tokens and the new text.\n\n    This function will also return the new prefix offset and the new read\n    offset to be used in the next iteration.\n\n    The offsets are necessary to defeat cleanup algorithms in the decode which\n    decide to add a space or not depending on the surrounding ids.\n\n    Args:\n        tokenizer: The tokenizer to use.\n        all_input_ids: The input ids. The last id is the new token id.\n        prev_tokens: The previous tokens. If None, this function will convert\n            the input ids to tokens and return the tokens and the new text.\n        prefix_offset: The prefix offset.\n        read_offset: The read offset.\n        skip_special_tokens: Whether to skip special tokens.\n        spaces_between_special_tokens: Whether to add spaces between special\n            tokens.\n    \"\"\"\n    new_token_id = all_input_ids[-1]\n    # This is the first iteration for this sequence\n    is_first_iter = prev_tokens is None\n    if is_first_iter:\n        (prev_tokens, prefix_offset, read_offset) = convert_prompt_ids_to_tokens(\n            tokenizer, all_input_ids[:-1], skip_special_tokens=skip_special_tokens\n        )\n    assert prev_tokens is not None\n\n    # If the new token id is out of bounds, return an empty string.\n    if 0 <= new_token_id < len(tokenizer):\n        # Put new_token_id in a list so skip_special_tokens is respected\n        new_tokens = tokenizer.convert_ids_to_tokens(\n            [new_token_id], skip_special_tokens=skip_special_tokens\n        )\n        if isinstance(new_tokens, str):\n            new_tokens = [new_tokens]\n        else:\n            # This is required to guard against out-of-vocab prompt token ids\n            # (for example when using dummy weights)\n            _replace_none_with_empty(new_tokens)  # type: ignore[arg-type]\n    else:\n        new_tokens = [\"\"]\n    output_tokens = prev_tokens + new_tokens\n\n    # If this is the first iteration, return all tokens.\n    if is_first_iter:\n        new_tokens = output_tokens\n\n    # The prefix text is necessary only to defeat cleanup algorithms in\n    # the decode which decide to add a space or not depending on the\n    # surrounding ids.\n    if tokenizer.is_fast or not tokenizer.get_added_vocab():\n        prefix_text = tokenizer.convert_tokens_to_string(\n            output_tokens[prefix_offset:read_offset]\n        )\n        new_text = tokenizer.convert_tokens_to_string(output_tokens[prefix_offset:])\n    else:\n        prefix_text = _convert_tokens_to_string_with_added_encoders(\n            tokenizer,\n            output_tokens[prefix_offset:read_offset],\n            skip_special_tokens=skip_special_tokens,\n            spaces_between_special_tokens=spaces_between_special_tokens,\n        )\n        new_text = _convert_tokens_to_string_with_added_encoders(\n            tokenizer,\n            output_tokens[prefix_offset:],\n            skip_special_tokens=skip_special_tokens,\n            spaces_between_special_tokens=spaces_between_special_tokens,\n        )\n\n    if len(new_text) <= len(prefix_text) or new_text.endswith(\"�\"):\n        # utf-8 char at the end means it's a potential unfinished byte sequence\n        # from byte fallback tokenization.\n        # If it's in the middle, it's probably a real invalid id generated\n        # by the model\n        return new_tokens, \"\", prefix_offset, read_offset\n\n    new_text = new_text[len(prefix_text) :]\n    return new_tokens, new_text, read_offset, len(output_tokens)",
+      "elide": [
+        "else 分支（L246-258，非 fast 且有 added vocab 的 tokenizer 走 _convert_tokens_to_string_with_added_encoders）逻辑同构只是逐 added-token 切段，正文一句带过；L260 的 endswith(\"\\ufffd\") 判定（源码即字面替换字符）是 byte-fallback 的题眼，必讲"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/parallel_sampling.py",
+      "lines": "L36-L50",
+      "code": "    def __init__(self, request: EngineCoreRequest) -> None:\n        assert request.external_req_id is not None\n        sampling_params = request.params\n        self.request_id = request.request_id\n        self.external_req_id = request.external_req_id\n        self.sampling_params = sampling_params\n\n        self.child_requests = set()\n        self.output_aggregator = (\n            [cast(CompletionOutput, None)] * sampling_params.n\n            if (sampling_params.output_kind == RequestOutputKind.FINAL_ONLY)\n            else []\n        )\n        self.max_num_generation_tokens = 0\n        self.cached_child_sampling_params = None",
+      "elide": [
+        "max_num_generation_tokens/cached_child_sampling_params 是 stats 与 params 复用细节，一句带过；FINAL_ONLY 才预分配 output_aggregator 是聚合模式的题眼"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/parallel_sampling.py",
+      "lines": "L83-L126",
+      "code": "    def get_child_info(self, index: int) -> tuple[str, SamplingParams]:\n        \"\"\"Get child request ID and sampling params.\n\n        Args:\n          index: index within `n` child requests.\n\n        Returns:\n          (request ID, sampling_params) tuple\n        \"\"\"\n        child_req_id = f\"{index}_{self.request_id}\"\n        self.child_requests.add(child_req_id)\n        return child_req_id, self._get_child_sampling_params(index)\n\n    @property\n    def n(self) -> int:\n        return self.sampling_params.n\n\n    def get_outputs(\n        self,\n        child_request_id: str,\n        completion_output: CompletionOutput,\n    ) -> tuple[list[CompletionOutput], bool]:\n        already_finished_and_returned: bool = False\n        if completion_output.finished():\n            if child_request_id in self.child_requests:\n                self.child_requests.remove(child_request_id)\n            else:\n                # child request ID is not available in child_requests\n                # which means the request had finished in previous\n                # batch step and returned to the client earlier\n                already_finished_and_returned = True\n\n        if self.sampling_params.output_kind != RequestOutputKind.FINAL_ONLY:\n            # If streaming, just return the current output\n            #\n            # DO NOT output finished and already returned child request to client again\n            outputs = [] if already_finished_and_returned else [completion_output]\n        else:\n            # If not streaming, aggregate the n final outputs.\n            self.output_aggregator[completion_output.index] = completion_output\n            outputs = [] if self.child_requests else self.output_aggregator\n\n        finished = not self.child_requests\n        return outputs, finished",
+      "elide": [
+        "_get_child_sampling_params（L52-81）属请求拆分侧：seed 非空时逐子克隆唯一 seed、否则缓存复用——正文一段带过即可，聚合侧（get_outputs）才是本章主角"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/async_llm.py",
+      "lines": "L390-L418",
+      "code": "        # We start the output_handler on the first call to add_request() so\n        # we can call __init__ before the event loop, which enables us\n        # to handle startup failure gracefully in the OpenAI server.\n        self._run_output_handler()\n\n        # Create a new output collector for the request.\n        queue = RequestOutputCollector(params.output_kind, request.request_id)\n\n        # Use cloned params that may have been updated in process_inputs()\n        params = request.params\n\n        if is_pooling or params.n == 1:\n            await self._add_request(request, prompt_text, None, 0, queue)\n            return queue\n\n        parent_params = params\n        assert isinstance(parent_params, SamplingParams)\n\n        # Fan out child requests (for n>1).\n        parent_request = ParentRequest(request)\n        for idx in range(parent_params.n):\n            request_id, child_params = parent_request.get_child_info(idx)\n            child_request = request if idx == parent_params.n - 1 else copy(request)\n            child_request.request_id = request_id\n            child_request.sampling_params = child_params\n            await self._add_request(\n                child_request, prompt_text, parent_request, idx, queue\n            )\n        return queue",
+      "elide": [
+        "开头三行注释（L390-392）是 lazy 启动的动机原话，必须保留；末子复用原 request 对象（L412 的 request if idx == n-1）省 n-1 次拷贝，值得点一句"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/async_llm.py",
+      "lines": "L577-L616",
+      "code": "        q: RequestOutputCollector | None = None\n        try:\n            q = await self.add_request(\n                request_id,\n                prompt,\n                sampling_params,\n                lora_request=lora_request,\n                tokenization_kwargs=tokenization_kwargs,\n                trace_headers=trace_headers,\n                priority=priority,\n                data_parallel_rank=data_parallel_rank,\n                prompt_text=prompt_text,\n                reasoning_ended=reasoning_ended,\n                reasoning_parser_kwargs=reasoning_parser_kwargs,\n            )\n\n            # The output_handler task pushes items into the queue.\n            # This task pulls from the queue and yields to caller.\n            finished = False\n            while not finished:\n                # Note: drain queue without await if possible (avoids\n                # task switching under load which helps performance).\n                out = q.get_nowait() or await q.get()\n\n                # Note: both OutputProcessor and EngineCore handle their\n                # own request cleanup based on finished.\n                assert isinstance(out, RequestOutput)\n                finished = out.finished\n                if out is not STREAM_FINISHED:\n                    yield out\n\n        # If the request is disconnected by the client, generate()\n        # is cancelled or the generator is garbage collected. So,\n        # we abort the request if we end up here.\n        except (asyncio.CancelledError, GeneratorExit):\n            if q is not None:\n                await self.abort(q.request_id, internal=True)\n            if self.log_requests:\n                logger.info(\"Request %s aborted.\", request_id)\n            raise",
+      "elide": [
+        "add_request 的 11 个透传参数（L579-591）可折叠；两条注释（L593-598 与 L601-602）是生产者-消费者与清理职责的原话，必须保留；L608-610 的注释是 F5 断连链的锚；后续 except（EngineDeadError L619-622 / VLLMClientError L625-628 / InputStreamError L631-636 / 意外 Exception→EngineGenerateError L639-652 / finally q.close() L653-655）正文按错误层级一段讲"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/async_llm.py",
+      "lines": "L657-L727",
+      "code": "    def _run_output_handler(self):\n        \"\"\"Background loop: pulls from EngineCore and pushes to AsyncStreams.\"\"\"\n\n        if self.output_handler is not None:\n            return\n\n        # Ensure that the task doesn't have a circular ref back to the AsyncLLM\n        # object, or else it won't be garbage collected and cleaned up properly.\n        engine_core = self.engine_core\n        output_processor = self.output_processor\n        log_stats = self.log_stats\n        # We use a mutable list for logger_manager so that it can be updated\n        # during elastic EP scaling (see scale_elastic_ep) without creating\n        # a circular reference via self.\n        self._logger_ref = [self.logger_manager]\n        logger_ref = self._logger_ref\n        renderer = self.renderer\n        chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE\n\n        async def output_handler():\n            try:\n                while True:\n                    # 1) Pull EngineCoreOutputs from the EngineCore.\n                    outputs = await engine_core.get_output_async()\n                    num_outputs = len(outputs.outputs)\n\n                    iteration_stats = (\n                        IterationStats() if (log_stats and num_outputs) else None\n                    )\n\n                    # Split outputs into chunks of at most\n                    # VLLM_V1_OUTPUT_PROC_CHUNK_SIZE, so that we don't block the\n                    # event loop for too long.\n                    engine_core_outputs = outputs.outputs\n                    for start in range(0, num_outputs, chunk_size):\n                        end = start + chunk_size\n                        outputs_slice = engine_core_outputs[start:end]\n                        # 2) Process EngineCoreOutputs.\n                        processed_outputs = output_processor.process_outputs(\n                            outputs_slice, outputs.timestamp, iteration_stats\n                        )\n                        # NOTE: RequestOutputs are pushed to their queues.\n                        assert not processed_outputs.request_outputs\n\n                        # Allow other asyncio tasks to run between chunks\n                        if end < num_outputs:\n                            await asyncio.sleep(0)\n\n                        # 3) Abort any reqs that finished due to stop strings.\n                        if processed_outputs.reqs_to_abort:\n                            await engine_core.abort_requests_async(\n                                processed_outputs.reqs_to_abort\n                            )\n\n                    output_processor.update_scheduler_stats(outputs.scheduler_stats)\n\n                    # 4) Logging.\n                    # TODO(rob): make into a coroutine and launch it in\n                    # background thread once Prometheus overhead is non-trivial.\n                    if logger_ref[0]:\n                        logger_ref[0].record(\n                            engine_idx=outputs.engine_index,\n                            scheduler_stats=outputs.scheduler_stats,\n                            iteration_stats=iteration_stats,\n                            mm_cache_stats=renderer.stat_mm_cache(),\n                        )\n            except Exception as e:\n                logger.exception(\"AsyncLLM output_handler failed.\")\n                output_processor.propagate_error(e)\n\n        self.output_handler = asyncio.create_task(output_handler())",
+      "elide": [
+        "闭包捕获段（L663-674）讲『为什么不用 self』一句即可；第 4 步 Logging（L713-722）与 update_scheduler_stats（L711）属观测性，一句带过；except→propagate_error（L723-725）必须讲（错误广播）"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/async_llm.py",
+      "lines": "L729-L738",
+      "code": "    async def abort(\n        self, request_id: str | Iterable[str], internal: bool = False\n    ) -> None:\n        \"\"\"Abort RequestId in OutputProcessor and EngineCore.\"\"\"\n\n        request_ids = (\n            (request_id,) if isinstance(request_id, str) else as_list(request_id)\n        )\n        all_request_ids = self.output_processor.abort_requests(request_ids, internal)\n        await self.engine_core.abort_requests_async(all_request_ids)",
+      "elide": [
+        "两跳顺序即语义：先本进程（解阻塞消费者）后跨进程（停算）——与 add_request 双登记同构的反向操作"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/core_client.py",
+      "lines": "L1082-L1102",
+      "code": "                    if outputs.outputs or outputs.scheduler_stats:\n                        outputs_queue.put_nowait(outputs)\n            except Exception as e:\n                outputs_queue.put_nowait(e)\n            except asyncio.CancelledError:\n                outputs_queue.put_nowait(EngineDeadError())\n\n        resources.output_queue_task = asyncio.create_task(\n            process_outputs_socket(), name=\"EngineCoreOutputQueueTask\"\n        )\n\n    async def get_output_async(self) -> EngineCoreOutputs:\n        self._ensure_output_queue_task()\n        # If an exception arises in process_outputs_socket task,\n        # it is forwarded to the outputs_queue so we can raise it\n        # from this (run_output_handler) task to shut down the server.\n        assert self.outputs_queue is not None\n        outputs = await self.outputs_queue.get()\n        if isinstance(outputs, Exception):\n            raise self._format_exception(outputs) from None\n        return outputs",
+      "elide": [
+        "上游 process_outputs_socket 主体（L1037-1081：PULL recv → validate_alive → decode → utility/EEP/FT 分支）ch5 已讲帧侧，本章只嵌入尾部入队与取队两段；『异常也走队列』设计（死讯/错误从 IO 协程经队列转交给 output_handler 抛出）值得点一句"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/__init__.py",
+      "lines": "L184-L215",
+      "code": "class EngineCoreOutput(\n    msgspec.Struct,\n    array_like=True,  # type: ignore[call-arg]\n    omit_defaults=True,  # type: ignore[call-arg]\n    gc=False,\n):  # type: ignore[call-arg]\n    request_id: str\n    new_token_ids: list[int]\n\n    new_logprobs: LogprobsLists | None = None\n    new_prompt_logprobs_tensors: LogprobsTensors | None = None\n\n    pooling_output: torch.Tensor | None = None\n\n    finish_reason: FinishReason | None = None\n    stop_reason: int | str | None = None\n    events: list[EngineCoreEvent] | None = None\n    kv_transfer_params: dict[str, Any] | None = None\n    ec_transfer_params: dict[str, Any] | None = None\n\n    trace_headers: Mapping[str, str] | None = None\n\n    prefill_stats: PrefillStats | None = None\n\n    routed_experts: np.ndarray | None = None\n    # The number of NaNs in logits.\n    # A value greater than 0 indicates that the output is corrupted.\n    num_nans_in_logits: int = 0\n\n    @property\n    def finished(self) -> bool:\n        return self.finish_reason is not None",
+      "elide": [
+        "上行消费的最小字段集 = request_id + new_token_ids + finish_reason/stop_reason + .finished；logprobs/pooling/trace/transfer/experts 字段各归各章，表格化带过即可"
+      ]
+    },
+    {
+      "path": "vllm/sampling_params.py",
+      "lines": "L182-L188",
+      "code": "class RequestOutputKind(Enum):\n    # Return entire output so far in every RequestOutput\n    CUMULATIVE = 0\n    # Return only deltas in each RequestOutput\n    DELTA = 1\n    # Do not return intermediate RequestOutput\n    FINAL_ONLY = 2",
+      "elide": []
+    },
+    {
+      "path": "vllm/entrypoints/openai/chat_completion/protocol.py",
+      "lines": "L722-L725",
+      "code": "            output_kind=(\n                RequestOutputKind.DELTA if self.stream else RequestOutputKind.FINAL_ONLY\n            ),\n            stream_interval=self.stream_interval,",
+      "elide": [
+        "completion/protocol.py:L375-377 同构（DELTA if stream else FINAL_ONLY）；离线面 offline_utils.py:L560-561 强制 FINAL_ONLY（注释 'We only care about the final output'）——三个使用面的入口声明各引一句"
+      ]
+    },
+    {
+      "path": "vllm/entrypoints/serve/utils/api_utils.py",
+      "lines": "L37-L49",
+      "code": "async def listen_for_disconnect(request: Request) -> None:\n    \"\"\"Returns if a disconnect message is received\"\"\"\n    while True:\n        message = await request.receive()\n        if message[\"type\"] == \"http.disconnect\":\n            # If load tracking is enabled *and* the counter exists, decrement\n            # it. Combines the previous nested checks into a single condition\n            # to satisfy the linter rule.\n            if getattr(\n                request.app.state, \"enable_server_load_tracking\", False\n            ) and hasattr(request.app.state, \"server_load_metrics\"):\n                request.app.state.server_load_metrics -= 1\n            break",
+      "elide": [
+        "load tracking decrement（L44-50）观测性旁支，一句带过"
+      ]
+    },
+    {
+      "path": "vllm/entrypoints/serve/utils/api_utils.py",
+      "lines": "L77-L94",
+      "code": "    async def wrapper(*args, **kwargs):\n        # The request is either the second positional arg or `raw_request`\n        request = args[1] if len(args) > 1 else kwargs[\"raw_request\"]\n\n        handler_task = asyncio.create_task(handler_func(*args, **kwargs))\n        cancellation_task = asyncio.create_task(listen_for_disconnect(request))\n\n        done, pending = await asyncio.wait(\n            [handler_task, cancellation_task], return_when=asyncio.FIRST_COMPLETED\n        )\n        for task in pending:\n            task.cancel()\n\n        if handler_task in done:\n            return handler_task.result()\n        return None\n\n    return wrapper",
+      "elide": [
+        "这是 with_cancellation 装饰器的内层 wrapper（外层 def 在 L52-76，docstring 讲清『两个任务竞速、断连先到则 cancel handler』的设计——正文引 docstring 要点）；@with_cancellation 挂在 POST /v1/chat/completions（api_router.py:L51-53）"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/llm_engine.py",
+      "lines": "L296-L334",
+      "code": "    def step(self) -> list[RequestOutput | PoolingRequestOutput]:\n        if self.should_execute_dummy_batch:\n            self.should_execute_dummy_batch = False\n            self.engine_core.execute_dummy_batch()\n            return []\n\n        # 1) Get EngineCoreOutput from the EngineCore.\n        with record_function_or_nullcontext(\"llm_engine step: get_output\"):\n            outputs = self.engine_core.get_output()\n\n        # 2) Process EngineCoreOutputs.\n        with record_function_or_nullcontext(\"llm_engine step: process_outputs\"):\n            iteration_stats = IterationStats() if self.log_stats else None\n            processed_outputs = self.output_processor.process_outputs(\n                outputs.outputs,\n                engine_core_timestamp=outputs.timestamp,\n                iteration_stats=iteration_stats,\n            )\n            self.output_processor.update_scheduler_stats(outputs.scheduler_stats)\n\n        # 3) Abort any reqs that finished due to stop strings.\n        with record_function_or_nullcontext(\"llm_engine step: abort_requests\"):\n            self.engine_core.abort_requests(processed_outputs.reqs_to_abort)\n\n        # 4) Record stats\n        with record_function_or_nullcontext(\"llm_engine step: record_stats\"):\n            if (\n                self.logger_manager is not None\n                and outputs.scheduler_stats is not None\n                and len(outputs.outputs) > 0\n            ):\n                self.logger_manager.record(\n                    scheduler_stats=outputs.scheduler_stats,\n                    iteration_stats=iteration_stats,\n                    mm_cache_stats=self.renderer.stat_mm_cache(),\n                )\n                self.do_log_stats_with_interval()\n\n        return processed_outputs.request_outputs",
+      "elide": [
+        "dummy_batch 分支（L297-300）是 DP 场景的占位批，一句带过；step 四步 = 异步面 output_handler 一轮的无 await 镜像——对照讲『同一个 OutputProcessor 两种驱动』；第 4 步 stats 一句带过"
+      ]
+    }
+  ],
+  "theory": [
+    {
+      "topic": "单槽 vs 无界队列的内存账（为什么不是 asyncio.Queue）",
+      "detail": "设并发 R、每请求生成长 L、CUMULATIVE 每条快照持全量文本：无界队列在消费者滞后时滞留 O(R·L) 条快照、字节数 O(R·L²) 级（每条平均 L/2 字符 × L 条）；单槽 collector 无论滞后多久每请求驻留恰 1 个 RequestOutput——DELTA 模式下合并后的滞留对象也是增量的并集（总量 ≤ 一次全量），内存 O(R·L)。代价面：CUMULATIVE 慢消费者失去中间快照、DELTA 失去节拍粒度（WC1 cost）。#12298→#15156 两步演进：先消费侧合并、再把合并搬进生产侧的单槽。"
+    },
+    {
+      "topic": "holdback 长度 max(len(s))-1 的正确性",
+      "detail": "设最长 stop 串长 L_max。任意 stop 串完整出现前，其留在缓冲里未见天日的前缀长度 ≤ L_max-1。流式时若尾部扣住 L_max-1 个字符不吐，则任何尚未完整出现的 stop 串前缀都还在 output_text 里；一旦完整出现，check_stop_strings 在同一次 update 内命中并截断，被截字符尚未流出，故无需扣到 L_max。-1 的另一个理由：扣 L_max 会把『恰好完整出现』的正常文本也多压一步。include_stop_str_in_output=True 时 stop 串本来就要给用户看，无需扣（stop_buffer_length=0）。"
+    },
+    {
+      "topic": "增量去 token 的复杂度：双 offset 窗口",
+      "detail": "朴素做法每步 decode(全序列) 是每步 O(n)、总 O(n²)。双窗口（prefix_offset/read_offset）把每步的 convert_tokens_to_string 限制在 [prefix_offset:] 的尾部（上下文 ~INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET=5 个 token 量级），摊还接近 O(1) 上下文/步、总 O(n)。窗口存在的唯一理由是给 tokenizer 的空格 cleanup 算法提供相邻 token 上下文（decode 串 [prefix:read] 得 prefix_text、decode 串 [prefix:] 得 new_text，相减即增量）——不是正确性必需的全量重解。Fast 路径把这整套窗口逻辑下沉进 Rust DecodeStream（构造时 native prefill），Python 侧只剩 stream.step。"
+    },
+    {
+      "topic": "byte-fallback 的 UTF-8 多字节边界",
+      "detail": "byte-fallback tokenizer 把一个多字节 UTF-8 字符拆到多个 token 上（每个 token 是 <0xNN> 字节类 token），单 token 解码得到半个字符 → 显示为 U+FFFD 替换字符 '�'。判定规则（detokenizer_utils.py:L260-265）：new_text 末尾 endswith('\\ufffd') = 字节序列可能未完成 → 本步吐空串、不推进 read_offset，等下一 token 补全；中间的替换字符才是模型真生成的非法 id（照常输出）。new_text 长度未超过 prefix_text 时同样吐空串（cleanup 算法把空格吃掉导致无增量）。Fast 路径对应物是 DecodeStream 的内部状态 + 'Invalid prefix encountered' 异常恢复（detokenizer.py:L232-247）。"
+    },
+    {
+      "topic": "check_stop_strings 的窗口下界与『完成最早』语义",
+      "detail": "find 的 start 参数取负索引 1-new_char_count-L：只回看『本次新增 new_char_count 个字符 + 可能与旧文本拼成 stop 串的 L-1 个旧字符』，避免每步重扫全文——每步 O(新增+L) 而非 O(全文)。v0.27.x 新增多命中仲裁：一步多 token（投机解码/chunked 输出）时多个 stop 串可能同时命中，取『在文本中完成位置最早』者（best_end 最小），等价于逐 token 追加时先触发的那条；并列按 stop 列表序（best_end 严格小于才替换）。截断规则：include_in_output=False 截到串首（best_stop_index）、True 截到串尾（best_end）、串尾恰在文末则 -1 不截。"
+    },
+    {
+      "topic": "事件循环分块账：chunk=128 + sleep(0)",
+      "detail": "一批 N 条 EngineCoreOutput 的 process_outputs 是纯 Python CPU 活（detokenize+组装）；事件循环单线程，一口气做完 = 所有连接的 SSE 写出/accept/add_request 全停。按 128 切片、片间 await asyncio.sleep(0) 让出控制权，把『一次长停顿』摊成 ceil(N/128) 次短停顿——公平性换吞吐。#12287 基准（A100/Llama-3.2-1B/6000 并发，ipc-stage 卡核对）：req/s 63.62→67.72（+6.4%）、mean TTFT 229.23→197.34ms（−14%）、p99 TPOT 68.90→47.38ms（−31%）。边界认知：sleep(0) 只让出同级就绪任务，不解决单核吞吐上限（detokenize 仍是单核）。"
+    },
+    {
+      "topic": "n>1 扇出账：1 个 collector 服务 n 条流",
+      "detail": "add_request 侧：n 份 EngineCoreRequest（idx_ 前缀子 id、child params n=1、seed 逐子 +index 克隆）过线，OutputProcessor 侧 n 个 RequestState 各自 detokenize；汇合点 = 每子 CompletionOutput.index（=request_index=idx）——collector 的 add() 按 index 配对合并，新 index append（outputs.py:L159-181），所以 n 条流天然汇回一个 RequestOutput.outputs 列表而互不覆盖（put 的注释原话 L70-71）。流式模式逐子转发（不攒）；FINAL_ONLY 攒齐 n 个（output_aggregator[index]）才一次返回、finished = child_requests 空。"
+    },
+    {
+      "topic": "stream_interval 节流的账",
+      "detail": "interval=k 把每请求发送频率降到 ~1/k（完成与首 token 强制发），换更低的 per-token 序列化/事件循环/SSE 帧开销。DELTA 语义不破：sent_tokens_offset 记录已发偏移，攒批后一次发 [offset:] 的全部增量——无重叠、无丢失。引擎级 scheduler_config.stream_interval 进 OutputProcessor 构造（async_llm.py:L144），per-request SamplingParams.stream_interval 在 from_new_request 取 max clamp（output_processor.py:L227-229，PR #49754）——引擎级是下限不是覆盖。"
+    },
+    {
+      "topic": "三态契约的信息流：FINAL_ONLY 是『零构造』不是『过滤』",
+      "detail": "make_request_output 在 FINAL_ONLY 且未 finished 时直接 return None（output_processor.py:L286-290）——中间的 RequestOutput 对象根本不构造、不进 collector、不占槽：省的是对象构造 + put/add + Event 唤醒整条链，而不只是省网络。对照：流式 DELTA 每步必构造；CUMULATIVE 每步构造全量快照（库用户同步迭代用，OpenAI 面不用）。三态在入口由使用面声明（chat/completion 的 stream 二值映射、离线强制 FINAL_ONLY），引擎侧不感知——消费方式是前端契约不是引擎开关。"
+    },
+    {
+      "topic": "abort 的异步窗口（断连到停算之间）",
+      "detail": "断连检测（listen_for_disconnect 胜出）→ cancel handler → generate 抛 CancelledError → await abort() 两次跨边界（本进程移状态 + ABORT 消息过线）→ 引擎输入线程收 ABORT 入 aborts_queue/input_queue（ch5 双队列）→ busy loop 模型执行后处理 → scheduler.finish_requests(FINISHED_ABORTED)。全程 = 1 次事件循环切换 + 1 次 IPC + 引擎当前 step 的剩余时间——期间引擎仍会为该请求算出有界个废 token。防卡死设计：OutputProcessor.abort_requests 在移状态前给 collector 投一条 finish_reason=ABORT 的终态输出（L500-515），让还在 await q.get() 的消费者立即解阻塞拿到 finished=True 而非挂死。"
+    },
+    {
+      "topic": "get_nowait() or await get() 的快路径与真值地雷",
+      "detail": "消费循环先非阻塞取（槽有货直接拿、不进事件循环调度），空槽才 await——高负载下减少任务切换（async_llm.py:L597-598 注释原话）。`or` 依赖 RequestOutput 恒真：outputs.py 的 RequestOutput 未定义 __bool__/__len__（已核 v0.27.1 grep 无匹配），默认对象恒真成立；若将来加 __len__ 且空输出 len=0 变假值，`out = q.get_nowait() or await q.get()` 会把合法的『空 outputs 但 finished』对象误判为无货——WC1 cost 点名的地雷。"
+    }
+  ],
+  "mechanisms": [
+    {
+      "id": "m1",
+      "name": "回程到港：EngineCoreOutputQueueTask 把 ZMQ 帧变成 asyncio.Queue 里的 EngineCoreOutputs（异常/死讯也走队列）",
+      "kind": "dataflow",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/v1/engine/core_client.py:L1037-L1091",
+        "vllm/v1/engine/core_client.py:L1093-L1102"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m2",
+      "name": "output_handler 常驻单任务拉批分块：chunk=128 + await asyncio.sleep(0) 让出事件循环；eager/lazy 双启动",
+      "kind": "dataflow",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/engine/async_llm.py:L657-L727",
+        "vllm/v1/engine/async_llm.py:L173-L179",
+        "vllm/v1/engine/async_llm.py:L390-L393",
+        "vllm/envs.py:L160"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m3",
+      "name": "process_outputs 唯一单循环：demux 按内部 id 查 RequestState、查不到=已 abort 幂等跳过；『NOTE FOR DEVELOPERS』全批遍历只许这一处",
+      "kind": "dataflow",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/engine/output_processor.py:L589-L711",
+        "vllm/v1/engine/output_processor.py:L619-L624"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m4",
+      "name": "增量去 token 化 update 主流程：跳 stop token → 逐 token decode_next 累积 output_text → min_tokens 推进 stop_check_offset → check_stop_strings 命中截断并返回 stop_string",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/engine/detokenizer.py:L96-L143",
+        "vllm/v1/engine/output_processor.py:L652-L661"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true
+    },
+    {
+      "id": "m5",
+      "name": "detokenizer 三路工厂：无 tokenizer/detokenize=False→空壳；USE_FAST_DETOKENIZER 且 TokenizersBackend→Fast（DecodeStream）；否则→Slow（纯 Python）",
+      "kind": "layout",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/engine/detokenizer.py:L31-L66",
+        "vllm/v1/engine/detokenizer.py:L23-L25",
+        "vllm/v1/engine/output_processor.py:L223-L237"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m6",
+      "name": "Fast 路径：DecodeStream native prefill（以 prompt_token_ids 预热）+ stream.step 逐 token；'Invalid prefix encountered' 重建流恢复（非单调无效 UTF-8，issue #17448）",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/engine/detokenizer.py:L169-L209",
+        "vllm/v1/engine/detokenizer.py:L211-L248"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true
+    },
+    {
+      "id": "m7",
+      "name": "Slow 路径：prefix/read 双 offset 窗口对抗 decode 的空格 cleanup 算法（convert_prompt_ids_to_tokens 初始窗口 = 尾部 7 token、prefix 退 5）",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/engine/detokenizer.py:L252-L307",
+        "vllm/tokenizers/detokenizer_utils.py:L119-L140",
+        "vllm/tokenizers/detokenizer_utils.py:L176-L268"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true
+    },
+    {
+      "id": "m8",
+      "name": "byte-fallback UTF-8 边界：new_text 末尾 '\\ufffd' 或未增长 → 吐空串、不推进 read_offset，等下一 token 补全；中间的替换字符才是真非法 id",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/tokenizers/detokenizer_utils.py:L260-L265"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true
+    },
+    {
+      "id": "m9",
+      "name": "stop-string holdback：stop_buffer_length = max(len(s))-1 尾字符扣留（include_stop_str_in_output 时不扣），finished 才全吐；get_next_output_text 的 delta 偏移切片",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/engine/detokenizer.py:L85-L91",
+        "vllm/v1/engine/detokenizer.py:L149-L165"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true
+    },
+    {
+      "id": "m10",
+      "name": "check_stop_strings 窗口查找 + 完成最早仲裁：find 起点 1-new_char_count-L 只回看新增窗口；多条命中取完成位置最早者（投机解码一步多 token 语义）；include_in_output 截首/截尾",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/engine/detokenizer.py:L310-L362"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true
+    },
+    {
+      "id": "m11",
+      "name": "min_tokens 守卫双生效：解码循环内持续把 stop_check_offset 推到文末 + 仅 num_output_tokens()>min_tokens 才查 stop（PR #22014）",
+      "kind": "config",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/v1/engine/detokenizer.py:L121-L123",
+        "vllm/v1/engine/detokenizer.py:L131"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m12",
+      "name": "stop token 排除：stop_terminated 且 not include_stop_str_in_output 时弹末 token 不解码（文本与 id 两本账分开），事后补回 token_ids",
+      "kind": "protocol",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/v1/engine/detokenizer.py:L108-L127"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m13",
+      "name": "三态契约 RequestOutputKind：使用面入口声明（stream 二值映射/离线强制 FINAL_ONLY），OutputProcessor 照单裁剪——FINAL_ONLY 中间输出零构造、DELTA 只发增量（text/token/logprobs 切尾）",
+      "kind": "protocol",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/sampling_params.py:L182-L188",
+        "vllm/entrypoints/openai/chat_completion/protocol.py:L722-L724",
+        "vllm/entrypoints/offline_utils.py:L560-L561",
+        "vllm/v1/engine/output_processor.py:L286-L290",
+        "vllm/v1/engine/output_processor.py:L388-L423"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true
+    },
+    {
+      "id": "m14",
+      "name": "stream_interval 节流：完成/首 token/攒够 interval 才发；DELTA 从 sent_tokens_offset 切防重叠；引擎级与 per-request 取 max clamp（PR #49754）",
+      "kind": "config",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/engine/output_processor.py:L292-L313",
+        "vllm/v1/engine/output_processor.py:L227-L229",
+        "vllm/v1/engine/async_llm.py:L141-L146",
+        "vllm/entrypoints/openai/chat_completion/protocol.py:L725"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true
+    },
+    {
+      "id": "m15",
+      "name": "n>1 扇出与父聚合：add_request 盖 idx_ 前缀子 id 扇出 n 份（末子复用原对象、seed 逐子克隆）；ParentRequest.get_outputs 流式逐子转发 / FINAL_ONLY 攒齐 n 个；collector.add 按 CompletionOutput.index 合并",
+      "kind": "dataflow",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/engine/async_llm.py:L401-L418",
+        "vllm/v1/engine/parallel_sampling.py:L36-L50",
+        "vllm/v1/engine/parallel_sampling.py:L83-L126",
+        "vllm/v1/engine/output_processor.py:L326-L332",
+        "vllm/outputs.py:L159-L181"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true
+    },
+    {
+      "id": "m16",
+      "name": "单槽邮箱 RequestOutputCollector：单槽 + asyncio.Event；put 空槽占位/槽满 add() 合并（aggregate=DELTA）/Exception 无条件抢槽；get 阻塞 / get_nowait 快路径——刻意不是 asyncio.Queue",
+      "kind": "layout",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/engine/output_processor.py:L45-L106",
+        "vllm/outputs.py:L152-L181"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true
+    },
+    {
+      "id": "m17",
+      "name": "生产者-消费者解耦：output_handler 单生产者扇出到 N 个 collector、generate() 每请求一协程消费（get_nowait() or await get() 快路径）；finished 驱动终止",
+      "kind": "dataflow",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/engine/async_llm.py:L577-L616",
+        "vllm/v1/engine/async_llm.py:L676-L711"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m18",
+      "name": "断连反向 abort 三层接力（F5 埋）：with_cancellation 双任务竞速 → CancelledError/GeneratorExit → abort(internal=True) 两跳（先本进程移状态+投 ABORT 终态解阻塞，后跨进程停算）",
+      "kind": "protocol",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/entrypoints/serve/utils/api_utils.py:L37-L53",
+        "vllm/entrypoints/serve/utils/api_utils.py:L52-L94",
+        "vllm/entrypoints/openai/chat_completion/api_router.py:L53",
+        "vllm/v1/engine/async_llm.py:L608-L616",
+        "vllm/v1/engine/async_llm.py:L729-L738",
+        "vllm/v1/engine/output_processor.py:L494-L515"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m19",
+      "name": "stop-string 反向 abort：detokenizer 命中而引擎未自停 → reqs_to_abort 回发（文本层停止引擎看不见，必须反向通知释放 KV）",
+      "kind": "protocol",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/v1/engine/output_processor.py:L686-L699",
+        "vllm/v1/engine/async_llm.py:L705-L709"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m20",
+      "name": "错误广播 propagate_error：output_handler 异常 → 每个在飞请求的 collector put(Exception)（错误无条件抢槽），消费者 get 时 raise——等待者全部退出而非挂死",
+      "kind": "protocol",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/v1/engine/async_llm.py:L723-L725",
+        "vllm/v1/engine/output_processor.py:L455-L460",
+        "vllm/v1/engine/output_processor.py:L64-L66"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m21",
+      "name": "同步面回程：LLMEngine.step 四步（get_output 阻塞取 → process_outputs 返回 list → abort stop-string → stats）；_run_engine 只收 finished、按 int(request_id) 排序还原输入序——同一个 OutputProcessor 两种驱动",
+      "kind": "dataflow",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/v1/engine/llm_engine.py:L296-L334",
+        "vllm/entrypoints/offline_utils.py:L594-L626",
+        "vllm/v1/engine/output_processor.py:L679-L684"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m22",
+      "name": "双轨 id 的回程出口：RequestOutput.request_id 写回外部 id；abort 双轨皆可（外部 id 展开全部内部 id / 内部 id 单删 / 父 id 联动子）",
+      "kind": "protocol",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/v1/engine/output_processor.py:L315",
+        "vllm/v1/engine/output_processor.py:L374",
+        "vllm/v1/engine/output_processor.py:L462-L523"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    }
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {
+        "what": "LogprobsProcessor 的增量累积与字段准备：process_outputs 里 req_state.logprobs_processor.update_from_output 调用行（output_processor.py:L663-665）、_new_completion_output 的 logprobs 准备段（L404-407 与 L420）、_new_request_output 的 prompt_logprobs 分支（L366-371 简化为 None）、LogprobsProcessor 类本体（vllm/v1/engine/logprobs.py，精简版不实现）",
+        "why_safe": "logprobs 增量累积与 raw 语义归 ch8 全章展开；本章主线（token→text→分发）在 logprobs 恒 None 时行为完整：delta 切尾分支 `if delta and logprobs` 空列表自然短路。RequestState 保留 logprobs_processor 字段名（结构不变），仅不再喂它。"
+      },
+      {
+        "what": "pooling 分支：pooling_output 全链（process_outputs 的 pooling 处理、make_request_output L317-322、_new_pooling_output L425-426、PoolingRequestOutput 分支、abort_requests 里 EMPTY_CPU_TENSOR 三元 L504-508）、EMPTY_CPU_TENSOR 常量（L41-42）",
+        "why_safe": "池化/嵌入模型是另一条产品线（v2 ch08 同款删法）；生成式 completion 主路径不触碰这些分支。"
+      },
+      {
+        "what": "流式输入（resumable）：StreamingUpdate/apply_streaming_update/_update_streaming_request_state/input_chunk_queue 全部（output_processor.py:L115-127、L186-209、L556-587、process_outputs 里 streaming_input 分支 L676-677 与 L688-693）、RequestOutputCollector 的 _input_stream_task/close/__del__（L60、L98-106）、generate() 的 STREAM_FINISHED 判产行（async_llm.py:L605）与 InputStreamError 分支（L631-636）、AsyncLLM._add_streaming_input_request 全方法（L437-521）",
+        "why_safe": "流式输入是边角实验特性，与上行输出主线正交（v2 ch08 同款删法）；删后普通一次性 prompt 请求路径完整正确，generate() 循环退化为直 yield。"
+      },
+      {
+        "what": "LoRA 状态：lora_request/lora_name/lora_states 与 abort 里的 lora_states.request_finished 调用（output_processor.py:L157-158、L446、L498）",
+        "why_safe": "LoRA 是正交特性，单请求输出处理正确性不依赖它。"
+      },
+      {
+        "what": "stats/tracing 观测性：do_tracing 全方法（L730-790）、_update_stats_from_output/_update_stats_from_finished 内部（保留调用点、iteration_stats 传 None 走早返回）、update_scheduler_stats（L727-728）、RequestState.stats 字段、output_handler 里 update_scheduler_stats 与第 4 步 Logging（async_llm.py:L711-722）、ParentRequest.observe_finished_request/observe_num_generation_tokens（parallel_sampling.py:L128-150）",
+        "why_safe": "观测性子系统独立（metrics 章/附录级）；iteration_stats=None 时全部早返回，主控制流不变。"
+      },
+      {
+        "what": "routed_experts 累积（output_processor.py:L179-180、L637-640、L409-412）与 kv_transfer_params/ec_transfer_params 透传字段",
+        "why_safe": "MoE 专家路由记录与 P/D 分离 KV 传输参数是正交特性（ch36/后文领域），删后 CompletionOutput/RequestOutput 核心字段完整。"
+      },
+      {
+        "what": "FastIncrementalDetokenizer 的 spaces_between_special_tokens=False 分支：__init__ 的 added_token_ids 预计算（detokenizer.py:L189-209）与 decode_next 的空格抑制段（L214-220）",
+        "why_safe": "skip_special_tokens 或 spaces_between_special_tokens 任一为真（绝大多数请求）即短路为 True；删后 decode_next 退化为 return (token or 空串)，UTF-8/stop 行为不变（v2 ch09 同款删法）。"
+      },
+      {
+        "what": "detokenizer_utils 的非主线辅助：_convert_tokens_to_string_with_added_encoders（L17-54）与 detokenize_incrementally 的 else 分支（L246-258 退化为统一 convert_tokens_to_string）、_get_leading_space_marker/_restore_leading_spaces/convert_ids_list_to_tokens（L62-170）",
+        "why_safe": "added-vocab 切段逻辑与 fast 路径行为等价（同 convert_tokens_to_string 只是逐段）；marker 三件套服务 logprobs 域的 convert_ids_list_to_tokens（ch8 用），detokenize_incrementally 主线不经过。"
+      },
+      {
+        "what": "SlowIncrementalDetokenizer 的 prompt_embeds 兜底（detokenizer.py:L272-276 的 else 分支与 L278 的 or [0]*prompt_len 占位——退化为只接受 prompt_token_ids）",
+        "why_safe": "embeds 请求『cannot be detokenized, in general』（源码自注 L273），兜底本就产占位空转；精简版聚焦 token 主线（mixed-mode 输入 ch6 已讲）。"
+      },
+      {
+        "what": "output_handler 的 logger_ref/_logger_ref 弹性 EP 机制（async_llm.py:L668-672、L716-722）与 renderer.stat_mm_cache 引用",
+        "why_safe": "弹性 EP 期重建 logger 是分布式域特例（ch34/39）；精简版 logger 直接局部持有。"
+      },
+      {
+        "what": "core_client 的 process_outputs_socket 里 utility/EEP/FT 分支（core_client.py:L1043-1078）与 output_handler 回调参数、_self_ref 弱引用机制",
+        "why_safe": "控制面 RPC 回执与弹性通知归 ch5/ch34/ch39 域；精简版只保留 recv → validate_alive → decode → outputs_queue.put_nowait 主干（异常入队语义保留）。"
+      },
+      {
+        "what": "generate() 的意外 Exception 分支日志构造（async_llm.py:L639-652 的 try/except 打印压缩为 raise EngineGenerateError() from e）与 log_requests 日志行",
+        "why_safe": "纯日志/错误文案，不改变 abort 与上抛语义。"
+      },
+      {
+        "what": "serving/SSE 层整体不进精简版：chat_completion/serving.py 的 stream/full generator、api_utils.py 的 with_cancellation/listen_for_disconnect、chat_completion/completion protocol 的 to_sampling_params",
+        "why_safe": "SSE 组装与断连监听的 HTTP 侧归 ch38 服务面（F5 回收时全展开）；本章 F5 第一跳以叙事+锚点引用即可，generate() 的 CancelledError 路径不需要 HTTP 层就能被测试驱动（直接 cancel 任务）。"
+      },
+      {
+        "what": "LLMEngine/离线面同步驱动（llm_engine.py step 四步、offline_utils._run_engine）",
+        "why_safe": "精简版以 AsyncLLM 异步面驱动即可完整展示上行主线；同步面与异步面共用同一 OutputProcessor（L679-684 分叉），叙事对照讲、代码不重复实现。"
+      }
+    ],
+    "must_keep": [
+      {
+        "symbol": "RequestOutputCollector",
+        "why": "单槽邮箱本体（本章 introduces『单槽 Collector』），全部行为在 L45-106"
+      },
+      {
+        "symbol": "RequestOutputCollector.put",
+        "why": "生产者侧：空槽/Exception 占位、槽满 add() 合并——机制核心"
+      },
+      {
+        "symbol": "RequestOutputCollector.get",
+        "why": "消费者侧阻塞取 + asyncio.Event 唤醒"
+      },
+      {
+        "symbol": "RequestOutputCollector.get_nowait",
+        "why": "generate() 的非阻塞快路径（get_nowait() or await get() 的前半）"
+      },
+      {
+        "symbol": "RequestOutputCollector.ready",
+        "why": "asyncio.Event 同步原语本体"
+      },
+      {
+        "symbol": "aggregate",
+        "why": "DELTA 合并开关（output_kind==DELTA），决定 put 走 add 还是替换"
+      },
+      {
+        "symbol": "RequestOutput.add",
+        "why": "DELTA 归并的真正实现（outputs.py:L152-181），按 CompletionOutput.index 配对"
+      },
+      {
+        "symbol": "OutputProcessor",
+        "why": "上行解包总入口与三张映射表持有者"
+      },
+      {
+        "symbol": "OutputProcessor.process_outputs",
+        "why": "唯一遍历整批的单循环，读者必须看到完整主线（demux→去token→造输出→分发→完成清理）"
+      },
+      {
+        "symbol": "OutputProcessor.abort_requests",
+        "why": "abort 双轨 + 父联动 + ABORT 终态解阻塞（F5 落点）"
+      },
+      {
+        "symbol": "OutputProcessor.propagate_error",
+        "why": "错误广播——等待中的消费者全部退出"
+      },
+      {
+        "symbol": "OutputProcessor.add_request",
+        "why": "RequestState 诞生 + 外→内映射登记（回程对账的表）"
+      },
+      {
+        "symbol": "OutputProcessor._finish_request",
+        "why": "完成注销三张表，生命周期收尾"
+      },
+      {
+        "symbol": "external_req_ids",
+        "why": "外→内映射表本体（abort 双轨的依据）"
+      },
+      {
+        "symbol": "RequestState",
+        "why": "per-request 上行状态容器"
+      },
+      {
+        "symbol": "RequestState.from_new_request",
+        "why": "工厂：detokenize=False→tokenizer=None、per-request stream_interval clamp"
+      },
+      {
+        "symbol": "RequestState.make_request_output",
+        "why": "三道闸全在此（FINAL_ONLY/stream_interval/父聚合）"
+      },
+      {
+        "symbol": "RequestState._new_completion_output",
+        "why": "DELTA 的 text/token_ids 产出（get_next_output_text(finished, delta) 调用点）"
+      },
+      {
+        "symbol": "RequestState._new_request_output",
+        "why": "外部 id 写回 + RequestOutput 组装（L374）"
+      },
+      {
+        "symbol": "output_kind",
+        "why": "三态契约的字段（贯穿 collector aggregate/闸门/delta 切片）"
+      },
+      {
+        "symbol": "stream_interval",
+        "why": "节流参数（本章 introduces）"
+      },
+      {
+        "symbol": "sent_tokens_offset",
+        "why": "节流下 DELTA 攒批不重叠的偏移账"
+      },
+      {
+        "symbol": "queue",
+        "why": "RequestState.queue——异步/同步面分叉的判据（None 与否）"
+      },
+      {
+        "symbol": "IncrementalDetokenizer",
+        "why": "层级根 + 空壳 + 三路工厂（from_new_request）"
+      },
+      {
+        "symbol": "from_new_request",
+        "why": "工厂分派逻辑（TokenizersBackend 判据）"
+      },
+      {
+        "symbol": "USE_FAST_DETOKENIZER",
+        "why": "tokenizers>=0.22.0 版本闸"
+      },
+      {
+        "symbol": "BaseIncrementalDetokenizer",
+        "why": "公共逻辑承载者（update/holdback/min_tokens/get_next_output_text）"
+      },
+      {
+        "symbol": "FastIncrementalDetokenizer",
+        "why": "DecodeStream 快路径"
+      },
+      {
+        "symbol": "SlowIncrementalDetokenizer",
+        "why": "纯 Python 慢路径（双 offset 窗口主角）"
+      },
+      {
+        "symbol": "IncrementalDetokenizer.update",
+        "why": "（基类覆写）主流程：跳 stop token/逐 token/min_tokens/查 stop"
+      },
+      {
+        "symbol": "decode_next",
+        "why": "抽象方法，Fast/Slow 各自实现"
+      },
+      {
+        "symbol": "_protected_step",
+        "why": "Fast 路径 UTF-8 无效前缀恢复（重建 DecodeStream）"
+      },
+      {
+        "symbol": "DecodeStream",
+        "why": "Rust tokenizers 增量解码流（native prefill 预热）"
+      },
+      {
+        "symbol": "INVALID_PREFIX_ERR_MSG",
+        "why": "错误恢复分支判别字符串"
+      },
+      {
+        "symbol": "stop_buffer_length",
+        "why": "holdback 长度 max(len(s))-1，流式扣字符核心"
+      },
+      {
+        "symbol": "min_tokens",
+        "why": "stop 命中下限守卫"
+      },
+      {
+        "symbol": "include_stop_str_in_output",
+        "why": "决定扣留/截断到串首尾的开关"
+      },
+      {
+        "symbol": "get_next_output_text",
+        "why": "delta/全量取文本 + holdback 释放"
+      },
+      {
+        "symbol": "check_stop_strings",
+        "why": "stop 匹配 + 窗口查找 + 完成最早仲裁 + 截断 offset"
+      },
+      {
+        "symbol": "detokenize_incrementally",
+        "why": "Slow 路径增量解码（双 offset + UTF-8 边界）"
+      },
+      {
+        "symbol": "convert_prompt_ids_to_tokens",
+        "why": "Slow 路径初始 prefix/read offset 计算"
+      },
+      {
+        "symbol": "prefix_offset",
+        "why": "增量解码上下文窗口左界"
+      },
+      {
+        "symbol": "read_offset",
+        "why": "窗口右界/已读位"
+      },
+      {
+        "symbol": "INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET",
+        "why": "初始窗口常量 5"
+      },
+      {
+        "symbol": "num_output_tokens",
+        "why": "输出 token 计数（min_tokens/节流门控依赖；Slow 覆写剔 prompt）"
+      },
+      {
+        "symbol": "output_token_ids",
+        "why": "对外输出 token 列表（stream_interval 切片源；Slow 覆写）"
+      },
+      {
+        "symbol": "ParentRequest",
+        "why": "n>1 父聚合器（本章 introduces『n>1 扇出』的汇合半边）"
+      },
+      {
+        "symbol": "ParentRequest.get_child_info",
+        "why": "idx_ 前缀子 id + 子 params（扇出半边）"
+      },
+      {
+        "symbol": "ParentRequest.get_outputs",
+        "why": "子→父聚合核心（流式转发/FINAL_ONLY 攒齐）"
+      },
+      {
+        "symbol": "child_requests",
+        "why": "整体 finished 判据的子集合"
+      },
+      {
+        "symbol": "output_aggregator",
+        "why": "FINAL_ONLY 按 index 攒 n 个的数组"
+      },
+      {
+        "symbol": "AsyncLLM.add_request（collector 诞生 + n>1 扇出段）",
+        "why": "L395-418：上行登记入口"
+      },
+      {
+        "symbol": "AsyncLLM._run_output_handler",
+        "why": "常驻单任务（拉批分块/反向 abort/错误广播）"
+      },
+      {
+        "symbol": "AsyncLLM.output_handler",
+        "why": "任务句柄字段（eager/lazy 双启动判据）"
+      },
+      {
+        "symbol": "AsyncLLM.generate",
+        "why": "消费循环 + 断连/异常 abort 路径"
+      },
+      {
+        "symbol": "AsyncLLM.abort",
+        "why": "abort 两跳落地（internal 参数）"
+      },
+      {
+        "symbol": "reqs_to_abort",
+        "why": "stop-string 反向 abort 的载体"
+      },
+      {
+        "symbol": "RequestOutputKind",
+        "why": "三态枚举本体"
+      },
+      {
+        "symbol": "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE",
+        "why": "分块大小的环境闸（默认 128）"
+      },
+      {
+        "symbol": "EngineCoreOutputQueueTask",
+        "why": "回程到港任务名（create_task name 参数，素材锚点）"
+      }
+    ]
+  },
+  "foreshadow_due": {
+    "source": "v3 伏笔真相源 = book/cartography/pedagogy-plan.json foreshadows（bible.py due 是 v2 旧章号账本，不跑）",
+    "should_plant": [
+      {
+        "id": "F5",
+        "text": "断连反向 abort",
+        "planted": 7,
+        "paid": 38,
+        "how": "本章在 m18/站 14 完整展开三层接力（with_cancellation 竞速 → CancelledError → abort 两跳），埋下『abort 是异步的、引擎侧还有双队列与 FINISHED_ABORTED 一拍』的半句话；ch38 服务面回收时展开 HTTP 层全貌（StreamingResponse 取消传导、非流式 Client disconnected 响应）与 abort 终态输出的时序竞争细节。writer 在断连小节结尾留钩子：『引擎那一侧收到 abort 之后发生什么，到第 38 章服务面再展开』。"
+      }
+    ],
+    "should_payoff": [],
+    "note": "pedagogy-plan.foreshadows 仅 F5 planted=7（本章）；无 paid=7 条目——本章不回收任何伏笔。ch4 已立的『双登记』与 ch6 已立的『双轨 id 出发侧/EngineCoreRequest 字段』按回指处理（非伏笔）：writer 在对应位置显式回指 ch4 的『先本进程』与 ch6 的 assign_request_id，不作为本章回收项。ch6 留下的 n>1 扇出分支（async_llm.py:L405-418）在本章站 2 兑现——这是章间交接不是伏笔。"
+  },
+  "l2_spec": "book/cartography/l2-specs/ch7.json（同批产出；stations 与本档 stations 同一份账本）"
+}

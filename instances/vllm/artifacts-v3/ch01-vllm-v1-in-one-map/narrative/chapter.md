@@ -102,7 +102,7 @@ self.output_processor = OutputProcessor(
     tracing_enabled=tracing_endpoint is not None,
 )
 
-# EngineCore (starts the engine in background process).
+# EngineCore (starts the engine in background process).  # L148
 self.engine_core = EngineCoreClient.make_async_mp_client(
     vllm_config=vllm_config,
     executor_class=executor_class,
@@ -245,23 +245,23 @@ def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
 
     # Check for any requests remaining in the scheduler - unfinished,
     # or finished and not yet removed from the batch.
-    if not self.scheduler.has_requests():
+    if not self.scheduler.has_requests():  # L593
         return {}, False
-    scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-    future = self.model_executor.execute_model(scheduler_output, non_block=True)
-    grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+    scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())  # L595
+    future = self.model_executor.execute_model(scheduler_output, non_block=True)  # L596
+    grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)  # L597
     with (
         self.capture_iteration_details(scheduler_output) as iteration_details,
         self.log_error_detail(scheduler_output),
     ):
-        model_output = future.result()
+        model_output = future.result()  # L602
         if model_output is None:
-            model_output = self.model_executor.sample_tokens(grammar_output)
+            model_output = self.model_executor.sample_tokens(grammar_output)  # L604
 
     # Before processing the model output, process any aborts that happened
     # during the model execution.
     self._process_aborts_queue()
-    engine_core_outputs = self.scheduler.update_from_output(
+    engine_core_outputs = self.scheduler.update_from_output(  # L609
         scheduler_output, model_output
     )
     self._attach_iteration_details(engine_core_outputs, iteration_details)
@@ -293,7 +293,7 @@ def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
 
 ```python
 # vllm/v1/core/sched/scheduler.py:L441-L450
-# NOTE(woosuk) on the scheduling algorithm:
+# NOTE(woosuk) on the scheduling algorithm:  # L441
 # There's no "decoding phase" nor "prefill phase" in the scheduler.
 # Each request just has the num_computed_tokens and
 # num_tokens_with_spec. num_tokens_with_spec =

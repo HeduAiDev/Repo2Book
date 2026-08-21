@@ -142,9 +142,9 @@
         vllm_config = engine_args.create_engine_config(usage_context)
         executor_class = Executor.get_class(vllm_config)
 
-        if envs.VLLM_ENABLE_V1_MULTIPROCESSING:
+        if envs.VLLM_ENABLE_V1_MULTIPROCESSING:  # L174
             logger.debug("Enabling multiprocessing for LLMEngine.")
-            enable_multiprocessing = True
+            enable_multiprocessing = True  # L176
 
         # Create the LLMEngine.
         return cls(
@@ -444,7 +444,7 @@ V0-style、进程内、no busy loop——busy loop 指「引擎自己常驻一�
                 buffer = reuse_buffers.pop() if reuse_buffers else bytearray()
                 buffers = encoder.encode_into(outputs, buffer)
                 tracker = self._send_msg_tracking_payload(
-                    sockets[client_index], buffers
+                    sockets[client_index], buffers  # L1804
                 )
 ```
 
