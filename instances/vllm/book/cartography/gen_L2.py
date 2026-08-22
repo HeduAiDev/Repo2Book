@@ -601,7 +601,26 @@ def draw_flow(f, R, zone_of, captions, badges=(), note_names=(), lanes=None, vse
                         # 走廊（走廊预算见 build 的直落流加宽；下行流 y1-6=源框底内衬，
                         # 原位本就安全，不动）。
                         ly = y2 + 13 if y2 < y1 else y1 - 6
-                        lc.text(x + 7, ly, label, 8.5, color, 'start', maxw=640, tag='L2fl:' + label[:10])
+                        # 走廊 'start' 锚还须过 frame 右缘关（ch8：⑩→出门 上行流箭头
+                        # x≈2096，253px 标签 start 锚只能伸出框右缘 180px、越画布被裁——
+                        # 上一档 bb_start 分支自带右缘判定，本兜底位漏了同一检查）。
+                        # 右侧放不下 → 改 'end' 锚贴箭头左侧（走廊带无徽标/无框，恒净空；
+                        # 左侧也放不下 = 标签比半幅框还长，维持原位靠 maxw 收）。触发式：
+                        # 放得下的章输出逐字节不变。
+                        _lw = lc.tw(label, 8.5)
+                        _bb_s = (x + 5, ly - 8.8, x + 9 + _lw, ly + 3.7)
+                        _bb_e = (x - 9 - _lw, ly - 8.8, x - 5, ly + 3.7)
+                        if (_bb_s[2] <= R['frame']['x'] + R['frame']['w'] - 12
+                                and not any(ov(_bb_s, bd) for bd in badges)):
+                            lc.text(x + 7, ly, label, 8.5, color, 'start', maxw=640,
+                                    tag='L2fl:' + label[:10])
+                        elif (_bb_e[0] >= R['frame']['x'] + 12
+                                and not any(ov(_bb_e, bd) for bd in badges)):
+                            lc.text(x - 7, ly, label, 8.5, color, 'end', maxw=640,
+                                    tag='L2fl:' + label[:10])
+                        else:
+                            lc.text(x + 7, ly, label, 8.5, color, 'start', maxw=640,
+                                    tag='L2fl:' + label[:10])
 
 
 def build(spec_path):
@@ -743,6 +762,14 @@ def build(spec_path):
     # ---- south 行（center↔south 有肘形流时，行距加高成泳道通道） ----
     cs = [f for f in flows if _elbow_q(f)
           and {zone_of[f['from']], zone_of[f['to']]} == {'center', 'south'}]
+    # south↔north 跨双行流（exp-ch17：『output_rank 收割+FutureWrapper → 出·ModelRunnerOutput』
+    # 的 up 流）——与 nc/cs 同症：两框 x 区不重叠时直落中点落在两框空档，竖线整段横穿
+    # 中排拍片区（ch17 实测直落 x=1299.3 正穿 ③ 拍片 238×188 框，geometry linter
+    # arrow-crossed 红）。同方：肘形。车道压在 cs 车道之上（每条 ns 再抬 16px + 6px
+    # 层距）、中排容器底边之下；入场竖段走拍片间空档由目标框中心 x 决定（与 nc/cs
+    # 肘形同一约定）；行距相应加高。触发式：无 ns 流的章渲染逐字节不变。
+    ns = [f for f in flows if _elbow_q(f)
+          and {zone_of[f['from']], zone_of[f['to']]} == {'north', 'south'}]
     south_h = 0
     if south:
         south_y = cfy + cf_h + ROW_GAP
@@ -751,6 +778,12 @@ def build(spec_path):
             # 的 y-10 带并留 4px)；行距不足以容纳时加高
             south_y = max(south_y, cfy + cf_h + 8 + 16 * (len(cs) - 1) + 28)
             _stack(cs, south_y - 14)
+        if ns:
+            # ns 泳道带同口径再加 ns 层数（cs 顶层之上每条 16px 车道 + 6px 层距）
+            south_y = max(south_y, cfy + cf_h + 8
+                          + 16 * (len(cs) + len(ns) - 1) + 28 + 6 * len(ns))
+            _stack(cs, south_y - 14)
+            _stack(ns, south_y - 14 - 16 * len(cs) - 6)
         for c, x, w in zip(south, sx, sw_):
             south_h = max(south_h, comp_draw(x, south_y, w, c, R))
         south_bottom = south_y + south_h

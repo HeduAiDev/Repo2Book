@@ -1,0 +1,1029 @@
+{
+  "chapter_id": "ch17",
+  "part": "V",
+  "title": "执行三层",
+  "pin": "vLLM v0.27.1 (6e448d0ea)",
+  "chapter_kind": "code",
+  "note_on_kind": "标准代码章（非 primer）：走 implementer 精简版 + lint_fidelity 全链。本章把 L0 的 GPU 执行臂上层放大：调度器扔过墙的差量指令（SchedulerOutput）在墙那头穿 Executor/Worker/ModelRunner 三层变成 kernel，再变回 ModelRunnerOutput 扔回来。Part V《GPU 不等 Python》开篇——先立『执行臂的骨架』，持久批次/固定地址归 ch18，编译与捕获归 ch19。",
+  "hook_suggestion": "「差量指令扔过墙之后，墙那头是谁在接？一次前向要穿 Executor/Worker/ModelRunner 三层——为什么拆三层而不是一层，GPU 却没被这趟 Python 之旅拖住？」（从 Part V hook『Python 写的 attention 变成 CUDA graph 重播的 kernel』+ 本章 l0_zoom『GPU 执行臂上层』+ deepread/gpu-exec why_chains[0]『三层解耦』、[2]『控制面/数据面分离』提炼；Part 级反问『为什么一个 GPU 引擎的大部分代码是 CPU Python』由 deepread first_read_suggestion 给出，本章以它开场、以三层解耦作第一个答案）",
+  "scope_note": "本章解读执行臂上层：EngineCore.step ②④ 两次调用之间发生的一切『控制面』事务。主线一（启动装配，站 1-6）= Executor.get_class 工厂分发 → mp 后端建 SHM 广播 MQ + spawn WorkerProc 子进程 → 子进程内 WorkerWrapperBase 延迟初始化（worker_cls 字符串 → 真类）→ Worker.init_device（分布式先于显存快照）→ Worker 生命周期三锚点（load_model / determine_available_memory / initialize_from_config，两个 CuMem 池 tag）。主线二（一拍穿越，站 7-13）= executor.execute_model 只是 collective_rpc 薄封装 → mp 一次 enqueue 广播全部 worker → worker_busy_loop dequeue getattr 派发 → Worker.execute_model（PP 接力）→ GPUModelRunner.execute_model 打包 ExecuteModelState 返回 None → bitmask 窗口后 executor.sample_tokens → 解包采样 → 只从 output_rank 收割、FutureWrapper FIFO 排空回 EngineCore。控制面/数据面分离（collective_rpc 契约）与两段式契约（None → sample_tokens）是本章两大 protocol 机制。边界：SchedulerOutput 差量协议的字段语义与 InputBatch 调和归 ch18；CustomOp/piecewise 编译/CUDA Graph/forward context 归 ch19；注意力后端归 ch21；slot_mapping/block_table 归 ch22；TP/PP/DP 通信全貌与 ray 后端归 ch34（本章 PP 只到 irecv/isend 接力一层）；显存 profile 的账本细节 ch14 已讲（本章只认三锚点的归属）；异步调度的调度器侧（batch_queue/影子状态）ch12 已立（本章只给 supports_async_scheduling 声明面）；spec decode drafter 装配归 ch33；Model Runner V2（vllm/v1/worker/gpu/，README 自述 experimental）全书锚定 V1 正典、V2 仅作展望脚注（gpu_worker.py:L174、L384-L423、README:L1-L3）。",
+  "code_spine": [
+    "vllm/v1/engine/core.py:L584-L614 — 上游每拍：step() 的 ② execute_model(non_block=True)（L596）→ bitmask 夹缝（L597）→ future.result()（L602）→ None 则 ④ sample_tokens（L603-L604）→ ⑤ update_from_output（L609-L611）；本章主线即 ②④ 两次调用之间的墙内世界",
+    "vllm/v1/engine/core.py:L132 — EngineCore.__init__：self.model_executor = executor_class(vllm_config)——执行臂在此诞生（executor_class 由前端 Executor.get_class 解析后随握手传入，async_llm.py:L246 / llm_engine.py:L172）",
+    "vllm/v1/executor/abstract.py:L47-L92 — Executor.get_class()：按 distributed_executor_backend 分发 type/ray/mp/uni/external_launcher/自定义 qualname——第一层只答『在哪跑』",
+    "vllm/v1/executor/uniproc_executor.py:L26-L106 — UniProcExecutor：最简形态——driver_worker 就在本进程，collective_rpc 退化为 run_method 直调；AsyncOutputFuture 把异步输出包装成 Future",
+    "vllm/v1/executor/multiproc_executor.py:L70-L100 — FutureWrapper：future.result() 沿 futures_queue（deque）顺序排空先于自己的 future——MQ 是 FIFO，配对靠顺序不靠 id",
+    "vllm/v1/executor/multiproc_executor.py:L110-L234 — MultiprocExecutor._init_executor：建 rpc_broadcast_mq（SHM 广播队列）→ 逐 local_rank spawn WorkerProc → wait_for_ready 握手 → 起监控线程 → 装配 response_mqs → futures_queue",
+    "vllm/v1/executor/multiproc_executor.py:L279-L319 — start_worker_monitor + register_failure_callback：sentinel 监控进程死亡 → is_failed → shutdown → 回调引擎（EXECUTOR_FAILED）",
+    "vllm/v1/executor/multiproc_executor.py:L354-L416 — mp collective_rpc：enqueue((method,args,kwargs,output_rank)) 一次广播 → get_response 只 dequeue 应答 MQ → FutureWrapper 包装；kv_output_aggregator 聚合分支（PD 解耦，ch36）",
+    "vllm/v1/executor/multiproc_executor.py:L509-L527 — _get_output_rank：world_size - tp_size*pcp_size = 最后 PP 段的 TP rank0——应答单点收割；supports_async_scheduling=True",
+    "vllm/v1/executor/multiproc_executor.py:L607-L670 — WorkerProc.__init__（子进程内）：WorkerWrapperBase(rpc_rank, global_rank) → init_worker（解析真 Worker 类）→ init_device → load_model → （异步调度）起 async_output_copy_thread",
+    "vllm/v1/executor/multiproc_executor.py:L820-L944 — WorkerProc.worker_main（子进程入口）：信号处理 → WorkerProc 构造 → READY 握手（带回 response MQ handle）→ wait_until_ready → worker_busy_loop；异常按启动期/运行期分流",
+    "vllm/v1/executor/multiproc_executor.py:L946-L1022 — ResponseStatus/enqueue_output/handle_output/worker_busy_loop：dequeue RPC → getattr(self.worker, method) 或反序列化 callable → 执行 → 仅 output_rank 匹配者回写（异常转 FAILURE）",
+    "vllm/v1/worker/worker_base.py:L39-L43, L138-L157 — WorkerBase：硬件无关 worker 接口（docstring 自述使命）+ 两段式契约 docstring（『If this method returns None, sample_tokens should be called immediately after』）",
+    "vllm/v1/worker/worker_base.py:L187-L334 — WorkerWrapperBase：延迟初始化——构造只记 rpc_rank/global_rank；init_worker 才 resolve_obj_by_qualname(worker_cls) 动态构造（envs → 插件 → 实例化的顺序硬约束）；__getattr__ 透传；execute_model 先 _apply_mm_cache",
+    "vllm/v1/worker/gpu_worker.py:L303-L423 — Worker.init_device：DP local_rank 修正（L309-L326）→ 选卡（L364-L368）→ 分布式初始化刻意先于显存快照（L372-L382，注释『This ensures NCCL buffers are allocated before we measure available memory』）→ 构造 GPUModelRunner（V1 正典 L418-L423）",
+    "vllm/v1/worker/gpu_worker.py:L435-L450, L459-L611, L649-L676 — Worker 生命周期三锚点：load_model（CuMem 池 tag=weights）→ determine_available_memory（profile 定 KV 账，ch14 已讲）→ initialize_from_config（tag=kv_cache 池内分配；先 ensure_kv_transfer_initialized）",
+    "vllm/v1/worker/gpu_worker.py:L678-L853 — compile_or_warm_up_model：warmup→kernel 调优→capture→sampler 预热→inductor 惰性初始化→JIT 纠察→freeze_gc→enable_gpu_sync_check——启动期前移全编排（深讲归 ch19）",
+    "vllm/v1/worker/gpu_worker.py:L1010-L1107 — Worker.execute_model / sample_tokens：@with_gpu_sync_check；先收割上拍 PP isend（L1022-L1026）→ 非首 PP rank irecv 成 AsyncIntermediateTensors（L1064-L1076）→ 转调 model_runner（L1078-L1081）→ 非末 rank isend 中间张量返回 None（L1100-L1107）",
+    "vllm/v1/worker/gpu_model_runner.py:L4165-L4175, L4516-L4535, L4552-L4589 — GPUModelRunner 两段式：入口状态机断言（State error）→ 前向算完打包 ExecuteModelState 暂存 return None → sample_tokens 解包即清 → apply_grammar_bitmask → _sample",
+    "vllm/platforms/cuda.py:L307-L313 — 平台插件轴：worker_cls=='auto' → 'vllm.v1.worker.gpu_worker.Worker'——硬件适配的分发点不在执行器而在平台",
+    "vllm/v1/serial_utils.py:L486-L514 — run_method：str→getattr / bytes→cloudpickle 反序列化 / callable→直接调——uni 直调与 worker_busy_loop 的派发同构"
+  ],
+  "stations": [
+    {
+      "n": 1,
+      "where": "abstract.py:L48",
+      "what": "Executor.get_class()：按 distributed_executor_backend 分发 type/ray/mp/uni/external_launcher/自定义 qualname——执行臂第一问『在哪跑』，启动期一次（前端 async_llm.py:L246 解析，core.py:L132 在 EngineCore 进程内构造）"
+    },
+    {
+      "n": 2,
+      "where": "multiproc_executor.py:L151-L201",
+      "what": "mp：建 rpc_broadcast_mq（SHM 广播队列，一次 enqueue 全 worker 可见）→ 逐 local_rank spawn WorkerProc 子进程 → wait_for_ready 握手；uni：driver_worker 就在本进程（uniproc_executor.py:L46-L69）——同一契约两种拓扑"
+    },
+    {
+      "n": 3,
+      "where": "multiproc_executor.py:L879-L903",
+      "what": "子进程出生：worker_main → WorkerProc 构造（init_worker→init_device→load_model 全完成）→ 经 ready_pipe 发 READY（带回 response MQ handle）→ wait_until_ready → 进 worker_busy_loop 服役"
+    },
+    {
+      "n": 4,
+      "where": "worker_base.py:L250-L259",
+      "what": "WorkerWrapperBase.init_worker：worker_cls 字符串 qualname → resolve_obj_by_qualname 动态构造真 Worker（延迟初始化；只收字符串不收类——'auto'→vllm.v1.worker.gpu_worker.Worker，platforms/cuda.py:L312-L313）"
+    },
+    {
+      "n": 5,
+      "where": "gpu_worker.py:L304-L423",
+      "what": "Worker.init_device：DP local_rank 修正 → 选卡 → 分布式初始化刻意先于显存快照（NCCL buffer 计入已用，防 KV 账虚高）→ 构造 GPUModelRunner（V1 正典；use_v2_model_runner 默认关）"
+    },
+    {
+      "n": 6,
+      "where": "gpu_worker.py:L435-L676",
+      "what": "Worker 显存三锚点：load_model（CuMem 池 tag=weights）→ determine_available_memory（profile 定 KV 账，ch14 已见此账）→ initialize_from_config（tag=kv_cache 池内分配）——设备显存的一生都归 Worker 管"
+    },
+    {
+      "n": 7,
+      "where": "core.py:L596 → abstract.py:L221-L227",
+      "what": "每拍②：EngineCore.step 调 executor.execute_model(scheduler_output, non_block=True)——execute_model 只是 collective_rpc 的薄封装（控制面唯一入口；mp 侧覆写带 unique_reply_rank=output_rank）"
+    },
+    {
+      "n": 8,
+      "where": "multiproc_executor.py:L388",
+      "what": "rpc_broadcast_mq.enqueue((method,args,kwargs,output_rank)) 一次广播；worker 侧 worker_busy_loop dequeue → getattr(self.worker, method) 派发（L997-L1022，与 uni 的 run_method 同构）；callable 则 cloudpickle 整函数序列化发过去"
+    },
+    {
+      "n": 9,
+      "where": "gpu_worker.py:L1019-L1107",
+      "what": "Worker.execute_model：@with_gpu_sync_check（v0.27 运行期同步纠察）；先收割上拍 PP isend 句柄 → 非首 PP rank irecv 中间张量成 AsyncIntermediateTensors（懒同步）→ 转调 model_runner.execute_model"
+    },
+    {
+      "n": 10,
+      "where": "gpu_model_runner.py:L4516-L4535",
+      "what": "GPUModelRunner.execute_model：前向算完 → 打包 ExecuteModelState（scheduler_output+logits+hidden_states 等 10 字段）暂存单槽 → return None（契约：返回 None 则立刻调 sample_tokens，worker_base.py:L142-L157）"
+    },
+    {
+      "n": 11,
+      "where": "core.py:L603-L604 → abstract.py:L241-L247",
+      "what": "每拍④：grammar bitmask 已在 GPU 窗口里算完（ch9 已立夹缝时序）→ executor.sample_tokens(grammar_output)——同样只是 collective_rpc 薄封装（第二次广播）"
+    },
+    {
+      "n": 12,
+      "where": "gpu_model_runner.py:L4553-L4589",
+      "what": "sample_tokens：解包暂存即清（与 execute_model 入口断言双向防乱序）→ apply_grammar_bitmask 施加到 logits → _sample → ModelRunnerOutput"
+    },
+    {
+      "n": 13,
+      "where": "multiproc_executor.py:L509-L523",
+      "what": "应答只从 output_rank（world_size - tp_size*pcp_size = 最后 PP 段 TP rank0）收割；FutureWrapper.result() 沿 futures_queue FIFO 排空 → 回 EngineCore ⑤ update_from_output（core.py:L609-L611）"
+    }
+  ],
+  "stations_note": "站号 = 启动装配（1-6 站，只走一次）+ 一拍穿越（7-13 站，每拍心跳）。与 ch9 衔接：ch9 立了五拍的时序骨架（② execute_model / ④ sample_tokens 是其中两拍），本章打开这两拍的墙内世界——②④ 之间 EngineCore 侧只插了一段 bitmask 计算（站 11 的前提），其余全在执行臂里。与 ch12 衔接：异步调度的调度器侧（batch_queue/影子状态）已立，本章给 supports_async_scheduling 的声明面（uni L145-L147 / mp L525-L527）与 worker 侧 async_output_copy_thread。与 ch14 衔接：显存 profile 的账本已讲，本章只认三锚点（站 6）的归属——Worker 是设备生命周期的持有人。与 ch18/19 衔接：execute_model 内部的 _update_states/_prepare_inputs（差量调和与固定地址）→ ch18；CustomOp/编译/CUDA Graph 捕获 → ch19（站 9-10 之间的前向是个黑盒，本章只立接口）。与 ch34 衔接：PP irecv/isend 接力（站 9）只讲到『中间张量懒同步』一层，TP/DP/ray 全貌归分布式章。uni 与 mp 的分工：全书正文默认 mp 后端为叙事主线（vLLM 服务器默认 TP>1 时 mp、单卡 uni），uni 是读者理解控制面最小成本的对照形态。",
+  "key_classes": [
+    {
+      "name": "Executor",
+      "file": "vllm/v1/executor/abstract.py",
+      "responsibility": "执行器抽象基类——执行臂第一层，只答『在哪跑』。静态工厂 get_class() 按 distributed_executor_backend 分发（L47-L92）；__init__ 摊平 config 后把拉起 worker 的活留给 _init_executor() 抽象钩子（L95-L116）；execute_model/sample_tokens/initialize_from_config/compile_or_warm_up_model/determine_available_memory/add_lora/sleep/check_health… 全部引擎指令统一实现为 collective_rpc 调用（控制面唯一入口）；compile_or_warm_up_model 还把 worker 侧 CompilationTimes 汇回主进程取 max（L122-L137）。"
+    },
+    {
+      "name": "UniProcExecutor",
+      "file": "vllm/v1/executor/uniproc_executor.py",
+      "responsibility": "单进程执行器——控制面的最简形态：driver_worker（WorkerWrapperBase）就在本进程，collective_rpc 退化为 run_method 同进程直调；non_block 路径同步算完、把 AsyncModelRunnerOutput 包进 AsyncOutputFuture（延迟到 result() 才等 D2H 事件，L26-L42）；execute_model 覆写带 single_value=True 并在 non_block 下提前内联抛异常（L108-L121）；supports_async_scheduling=True（L145-L147）。"
+    },
+    {
+      "name": "MultiprocExecutor",
+      "file": "vllm/v1/executor/multiproc_executor.py",
+      "responsibility": "多进程执行器——1 个执行器进程 + N 个 WorkerProc 子进程的星形拓扑。_init_executor 建 rpc_broadcast_mq（SHM 广播 MessageQueue，L151-L157）→ spawn 全部 worker → READY 握手 → 监控线程（L279-L319）；collective_rpc 一次 enqueue 广播 + FutureWrapper 异步收回复（L354-L416）；execute_model/sample_tokens 覆写带 unique_reply_rank=self.output_rank 与超时（L321-L343）；shutdown 关 death_writer → graceful/SIGTERM/SIGKILL 三级 → 关全部 MQ（L470-L503）；weakref.finalize 兜底防泄漏（L113）。"
+    },
+    {
+      "name": "FutureWrapper",
+      "file": "vllm/v1/executor/multiproc_executor.py",
+      "responsibility": "concurrent.futures.Future 子类：把『worker 回复尚未到达』包成 future。构造时 appendleft 进 futures_queue；result() 先 while 循环 pop 排空队列中先于自己的 future（底层 response MQ 是 FIFO，回复顺序=发出顺序，无需给每个 RPC 配 id）；_wait_for_response 里 aggregate（KV 输出聚合，PD 解耦用）后 set_result/set_exception，InvalidStateError 静默（L70-L100）。"
+    },
+    {
+      "name": "WorkerProc",
+      "file": "vllm/v1/executor/multiproc_executor.py",
+      "responsibility": "把一个 Worker 跑在独立子进程里的包装：__init__ 在子进程内经 WorkerWrapperBase 延迟初始化真 Worker 并完成 init_device/load_model（L607-L670）；worker_main 是子进程入口（信号→构造→READY 握手→busy_loop，L820-L944）；worker_busy_loop 是服役主循环（dequeue→getattr 派发→执行→output_rank 过滤回写，L997-L1022）；enqueue_output 把结果/异常转 (SUCCESS/FAILURE) 回 MQ（L946-L967）；monitor_death_pipe 让子进程感知父进程退出（L795-L818）；异步调度时 async_output_busy_loop 线程把 D2H 拷贝挪出主循环（L979-L995）。"
+    },
+    {
+      "name": "UnreadyWorkerProcHandle / WorkerProcHandle",
+      "file": "vllm/v1/executor/multiproc_executor.py",
+      "responsibility": "父进程侧对 worker 子进程的句柄（L530-L565）：进程对象、rank、ready_pipe、death_writer；READY 后从 handle 转成 WorkerProcHandle（附 worker_response_mq 与跨节点 peer_worker_response_mqs）。death_writer 由父进程持有——父进程退出时 death_reader 得 EOFError，子进程自清理（防孤儿 worker）。"
+    },
+    {
+      "name": "WorkerWrapperBase",
+      "file": "vllm/v1/worker/worker_base.py",
+      "responsibility": "进程内对 worker 的延迟初始化包装（L187-L334）：构造只记 rpc_rank/global_rank（rpc_rank 是执行器内 rank，SPMD 多执行器时≠分布式 rank——docstring 自述）；update_environment_variables 先注入环境；init_worker 才按 worker_cls 字符串 qualname 解析真 Worker 类实例化（envs→插件→实例化的顺序硬约束；只收字符串、明确拒绝传类 L255-L259），可经 worker_extension_cls 动态注入基类扩展 collective_rpc 面（L261-L287）；mm 处理器 shm 接收缓存在此挂接（L295-L315）；__getattr__ 透传（L333-L334）——collective_rpc 的 getattr(self.worker, method) 由此命中；execute_model 覆写先 _apply_mm_cache（L346-L351）。"
+    },
+    {
+      "name": "WorkerBase",
+      "file": "vllm/v1/worker/worker_base.py",
+      "responsibility": "硬件无关的 worker 接口（L39-L43 docstring 自述使命：'allows vLLM to cleanly separate implementations for different hardware'）——执行臂第二层的契约来源：init_device/load_model/execute_model/sample_tokens/get_kv_cache_spec/compile_or_warm_up_model/determine_available_memory… 全是纯虚；两段式契约钉死在 execute_model/sample_tokens 的 docstring（L142-L157：返回 None 则必须立刻调 sample_tokens，自注结构输出并行化重构时可能改变）。"
+    },
+    {
+      "name": "Worker",
+      "file": "vllm/v1/worker/gpu_worker.py",
+      "responsibility": "WorkerBase 的 GPU/CUDA 具体实现——设备生命周期的持有人：init_device（DP local_rank 修正→选卡→分布式先于显存快照→构造 runner，L303-L423）；load_model 套 CuMem 池 tag=weights（L435-L450）；determine_available_memory profile 定 KV 账（L459-L611，ch14）；initialize_from_config 在 tag=kv_cache 池内分配、先 ensure_kv_transfer_initialized（L649-L676）；compile_or_warm_up_model 启动期前移全编排（L678-L853）；execute_model/sample_tokens 包 runner 并持 PP 接力（L1010-L1107）；sleep/wake_up、weight transfer、profiler 等生产特性亦在此（本章不展开）。"
+    },
+    {
+      "name": "GPUModelRunner",
+      "file": "vllm/v1/worker/gpu_model_runner.py",
+      "responsibility": "执行臂第三层——批次执行（只答『这一拍怎么算』）：execute_model 状态机（入口断言 L4171-L4175）+ 两段式（打包 ExecuteModelState L4516-L4527 → return None L4535；sample_tokens 解包即清 L4566-L4580 → bitmask → _sample L4582-L4589）。内部 _update_states/_prepare_inputs/_build_attention_metadata（差量调和、固定地址缓冲、metadata 构建）归 ch18-19；本章只立接口与暂存协议。全书锚定此 V1 实现（7928 行），vllm/v1/worker/gpu/ 的 V2 仍是 experimental。"
+    },
+    {
+      "name": "AsyncIntermediateTensors",
+      "file": "vllm/v1/worker/gpu_worker.py",
+      "responsibility": "PP 中间激活的懒同步包装（L96-L125）：非首 PP rank irecv 到的 tensor_dict + comm handles；__getattribute__ 拦截 .tensors 访问、首次访问才 wait_for_comm——PP 通信等待被推迟到真正要用中间张量之时，与异步调度重叠窗口配合。"
+    },
+    {
+      "name": "run_method",
+      "file": "vllm/v1/serial_utils.py",
+      "responsibility": "uni 直调的派发底层（L486-L514）：method 是 str→getattr(obj, method)（AttributeError 转 NotImplementedError）、bytes→cloudpickle 反序列化后 partial(fn, obj)、callable→直接调——与 mp 侧 worker_busy_loop 的三分支同构，『一个抽象两种拓扑』的最小证据。"
+    }
+  ],
+  "data_flow": [
+    "构造选型（一次性）：前端 Executor.get_class(vllm_config)（async_llm.py:L246 / llm_engine.py:L172，工厂本体 abstract.py:L47-L92）→ executor_class 随握手传入 EngineCore 进程 → EngineCore.__init__：self.model_executor = executor_class(vllm_config)（core.py:L132）→ Executor.__init__ 调 _init_executor()（abstract.py:L95-L116）",
+    "mp 拉起（一次性）：_init_executor 建 rpc_broadcast_mq + export_handle（multiproc_executor.py:L151-L157）→ 逐 local_rank make_worker_process spawn WorkerProc（L176-L195）→ 子进程 worker_main → WorkerProc.__init__：wrapper.init_worker（解析真 Worker）→ init_device → load_model（L607-L670）→ READY 握手（L887-L899）→ 父进程 wait_for_ready 收齐（L746-L782）→ 监控线程 + response_mqs + futures_queue（L204-L232）",
+    "每拍下行（控制面）：EngineCore.step ② executor.execute_model(scheduler_output, non_block=True)（core.py:L596 → abstract.py:L221-L227 → mp 覆写 L321-L331 带 output_rank+超时）→ collective_rpc enqueue 一次广播（multiproc_executor.py:L388）→ 每个 worker 的 worker_busy_loop dequeue → getattr(self.worker, method)（L1001-L1010；uni 则 run_method 同进程直调 uniproc_executor.py:L91-L106）→ WorkerWrapperBase.__getattr__/execute_model（先 _apply_mm_cache）→ Worker.execute_model（gpu_worker.py:L1019）→ GPUModelRunner.execute_model（gpu_model_runner.py:L4166）",
+    "每拍上行（收割）：GPUModelRunner.sample_tokens 产出 ModelRunnerOutput（L4553-L4589）→ worker 侧 handle_output/enqueue_output 仅 output_rank 匹配者回写 worker_response_mq（multiproc_executor.py:L950-L977, L1012-L1013）→ 父进程 FutureWrapper.result() FIFO 排空 + get_response dequeue（L83-L100, L394-L410）→ EngineCore ⑤ scheduler.update_from_output（core.py:L609-L611）。失败路：方法异常→(FAILURE, str) 回 MQ→collective_rpc 抛 RuntimeError（L404-L408）；进程死亡→sentinel→failure_callback→input_queue 投 EXECUTOR_FAILED（multiproc_executor.py:L279-L313；入队点 = EngineCoreProc.__init__ 的 executor_fail_callback lambda，core.py:L1029-L1031，经 core.py:L134-L135 register_failure_callback 注册）",
+    "（执行臂内部的完整逐拍数据流——_update_states 差量调和、_prepare_inputs 固定地址、set_forward_context、采样与 bookkeeping——见 deepread/gpu-exec.json data_flow 第 4a-4e/5/7-8 步，本章不重挖：其中 4a/4b 归 ch18、4c-4e/5 归 ch18-19、7 的采样细节归 ch29）"
+  ],
+  "why_chains": [
+    {
+      "id": "WC1",
+      "card": "deepread/gpu-exec.json why_chains[0]",
+      "decision": "三层解耦：Executor=进程拓扑 / Worker=设备生命周期 / ModelRunner=批次执行",
+      "old_design": "v0：LLMEngine 直接持有 executor→worker，worker 内焊死 GPU 逻辑，执行接口以 SequenceGroup 列表为中心。v1 起源 PR 6c5af09b3 \"[V1] Implement vLLM V1 [1/N] (#9289)\"（2024-10-22）才拆出 gpu_worker.py 与 executor/gpu_executor.py（git diff-filter=A 实证）；executor/abstract.py 工厂与 multiproc_executor.py 由 28b3a1c7e5 \"[V1] Multiprocessing Tensor Parallel Support for v1 (#9856)\"（2024-12-10）新增——Executor 抽象基类与 mp 后端同批落地。单层设计里『在哪台进程跑』『这块卡怎么初始化』『这一拍怎么算』是同一坨代码。",
+      "pain": "两个独立变化的轴被焊死：进程编排轴（单机单卡/单机多卡 mp/多机 ray/external_launcher/自定义 qualname）× 硬件适配轴（CUDA/ROCm/CPU/XPU/TPU + OOT 插件）。v0 里每加一种硬件都要碰进程管理代码；反过来换 ray 后端也不能复用设备初始化。WorkerBase docstring 自述使命：\"Worker interface that allows vLLM to cleanly separate implementations for different hardware\"（vllm/v1/worker/worker_base.py:L40-L43）。",
+      "solution": "Executor 只答『在哪跑』：Executor.get_class() 按 distributed_executor_backend 分发 uni/mp/ray/external_launcher/自定义 qualname（vllm/v1/executor/abstract.py:L48-L92；v0.27 新增 VLLM_USE_RAY_V2_EXECUTOR_BACKEND 开关走 RayExecutorV2 L61-L64）。Worker 只答『设备归谁管』：init_device（vllm/v1/worker/gpu_worker.py:L304：DP local_rank 修正 L309-L326、设备选择 L364-L368、分布式初始化刻意先于显存快照 L372-L382——注释 \"This ensures NCCL buffers are allocated before we measure available memory\"、快照 L390-L400）、load_model（L435-L450，套 CuMem 内存池 tag=weights）、determine_available_memory（L460-L611）、initialize_from_config（L650-L676，tag=kv_cache 池内分配）。ModelRunner 只答『这一拍怎么算』：execute_model→sample_tokens（gpu_model_runner.py:L4166 / L4553）。平台插件把 worker_cls 字符串解析到对应类（vllm/platforms/cuda.py:L312-L313：'auto'→vllm.v1.worker.gpu_worker.Worker）。v0.27 起同文件并存两条 runner 实现线：use_v2_model_runner（gpu_worker.py:L174、L384-L423）可选 vllm/v1/worker/gpu/model_runner.py，但其 README 自述 \"[Experimental] Model Runner V2 ... under active development\"（vllm/v1/worker/gpu/README.md:L1-L3）——全书锚定 V1。",
+      "cost": "一次 execute_model 要穿三层 + RPC 抽象：uniproc 是直调近乎零成本（uniproc_executor.py:L91-L106，non_block 路径同步直调 + AsyncOutputFuture 包装异步输出），mp 是共享内存队列一广播（multiproc_executor.py:L388）。worker_cls 只收 qualname 字符串不收类（worker_base.py:L250-L259 明确拒绝 \"passing worker_cls is no longer supported\"）；调试栈里多一层 __getattr__ 字符串解析（worker_base.py:L333-L334）。"
+    },
+    {
+      "id": "WC2",
+      "card": "deepread/gpu-exec.json why_chains[1]",
+      "decision": "WorkerWrapperBase 延迟初始化：executor 先拿壳，环境就绪后才构造真 Worker",
+      "old_design": "在 executor 进程里直接实例化 worker 对象再发给子进程——GPU 资源无法跨进程序列化，且 spawn 出的 worker 进程必须先注入环境变量（CUDA_VISIBLE_DEVICES、平台 envs）才能 import 平台插件/设 CUDA context，父进程构造则插件与环境全错。",
+      "pain": "环境注入与对象构造的先后顺序是硬约束：update_environment_variables → load_general_plugins → Worker.__init__，顺序错了平台分发全盘皆错。",
+      "solution": "vllm/v1/worker/worker_base.py:L187-L226：Wrapper 构造只记 rpc_rank/global_rank（L196-L215，docstring 自述 \"lazily initializing the worker\"）；init_worker()（L230-L319）才 resolve_obj_by_qualname(worker_cls) 动态构造（L250-L259），并支持 worker_extension_cls 动态注入基类扩展 collective_rpc 面（L261-L287）；mm 处理器 shm 接收缓存在此挂接（L295-L315，shared_worker_lock 缺失时按 mm_processor_cache_type='shm' 与否 warning/raise）；v0.27 新增 assigned_physical_gpu_ids 传递（L289-L293）。",
+      "cost": "一层 __getattr__ 魔法转发（L333-L334）——init_worker 前任何属性访问都是未定义行为（靠约定不靠类型）；属性查找失败的报错定位更绕。"
+    },
+    {
+      "id": "WC3",
+      "card": "deepread/gpu-exec.json why_chains[2]",
+      "decision": "控制面/数据面分离：一切经 collective_rpc，大数据不走 RPC；结果只从 output_rank 收割",
+      "old_design": "v0：对每个 worker 单独 pickle-RPC（pipe 逐个发），命令和数据混在同一通道。",
+      "pain": "TP>1 时同一条指令要序列化 N 份、发 N 次；SchedulerOutput 若带全量请求状态则每拍 IPC 字节量随 batch 线性涨。",
+      "solution": "契约写在 Executor.collective_rpc docstring：\"It is recommended to use this API to only pass control messages, and set up data-plane communication to pass data\"（vllm/v1/executor/abstract.py:L181-L183）。配套两件事：(1) mp 后端用共享内存 MessageQueue：rpc_broadcast_mq.enqueue 一次广播给全部 worker（multiproc_executor.py:L388），每 worker 一条 response MQ（L575-L605 单节点分支），FutureWrapper 用 deque 保序 lazy 收割（L70-L100：result() 先排干队列中先于自己的 future）；(2) execute_model/sample_tokens 只从单一 output_rank 收结果（L509-L523：world_size - tp_size*pcp_size，即最后 PP 段的 TP rank0）。execute_model/sample_tokens 是 abstract 上的薄封装（abstract.py:L221-L227、L241-L247）。SchedulerOutput 的差量化（见持久批次链）保证广播字节量不随 batch 膨胀。",
+      "cost": "mp 模式下一个完整引擎拍 = execute_model + sample_tokens 两次 RPC 广播/收割；SchedulerOutput 仍需 pickle 一次广播（差量化后很小，但仍是每拍固定开销）；异步调度要求 executor 声明 supports_async_scheduling（uni/mp 均 True：uniproc_executor.py:L145-L147、multiproc_executor.py:L525-L527）且 EngineCore 侧用 batch_queue 流水（core.py:L625 起 step_with_batch_queue）。"
+    },
+    {
+      "id": "WC4",
+      "card": "deepread/gpu-exec.json why_chains[4]",
+      "decision": "execute_model 两阶段：forward 后返回 None，sample_tokens 补采样",
+      "old_design": "v1 早期（及 v0）execute_model 一步到位：forward→sample→bookkeeping 同步做完再返回。结构化输出的 grammar bitmask 在采样前算（CPU），这段时间 GPU 已算完 forward 在空等。",
+      "pain": "xgrammar bitmask 是 CPU 计算；串行排布『forward 完成→bitmask→采样』每拍多出一段 GPU 空转。两阶段拆分正是为了让 bitmask 的消费入口（采样）成为独立调用，从而能夹在 GPU forward 期间并行算。",
+      "solution": "契约写在 WorkerBase.execute_model docstring：\"If this method returns None, sample_tokens should be called immediately after\"（vllm/v1/worker/worker_base.py:L142-L151，仍自注 \"may be changed in future if/when structured outputs parallelism is re-architected\"）。EngineCore.step 的编排即此契约的用法（vllm/v1/engine/core.py:L584-L614）：execute_model(scheduler_output, non_block=True)（L596）→ get_grammar_bitmask 夹在中间 CPU 并行算（L597）→ future.result()（L602）→ 返回 None 则 sample_tokens(grammar_output)（L603-L604）。runner 侧：ExecuteModelState NamedTuple（gpu_model_runner.py:L437-L451；单槽 self.execute_model_state 于 L941 初始化，注释 \"Ephemeral state transferred between execute_model() and sample_tokens()\"）在 postprocess 段打包 (scheduler_output, logits, spec 元数据×2, hidden_states, sample_hidden_states, aux_hidden_states, ec_connector_output, cudagraph_stats, slot_mappings)（L4516-L4527）后 return None（L4535）；sample_tokens（L4553）解包即清（L4566-L4580）→ apply_grammar_bitmask（L4582-L4586）→ _sample → bookkeeping。双向断言强制配对（L4171-L4175 / L4556-L4564）。",
+      "cost": "API 形变（docstring 自认）；跨进程时 sample_tokens 是第二次完整 RPC（mp 下两跳）；ExecuteModelState 是隐藏的隐式参数传递——读 execute_model 签名看不到 logits 去了哪；非末 PP rank 的 sample_tokens 变纯透传早退分支（L4556-L4564），控制流多一条腿。"
+    },
+    {
+      "id": "WC5",
+      "card": "v2 ch17 dossier design_decisions[5][6][7]（迁移候选，锚点已对 v0.27.1 现核）",
+      "decision": "失败两路 + 关停三级：RPC 级错误走 MQ 回报，进程级死亡走 sentinel 监控；关停 graceful→SIGTERM→SIGKILL 且子进程能感知父进程退出",
+      "old_design": "（无对应旧设计——这是 v1 mp 后端与生俱来的可靠性设计；对照面是『worker 崩了引擎静默挂死』的朴素多进程服务。）",
+      "pain": "多进程服务两类故障必居其一被漏掉：方法抛异常（进程还活着，要能把异常带回调用方）与进程被 OS 杀死（OOM/segfault，根本到不了 except）；父进程先退时子进程会变孤儿继续占 GPU。",
+      "solution": "方法异常：worker_busy_loop 捕获 → e.add_note(traceback) → enqueue (FAILURE, str(output))（multiproc_executor.py:L1004-L1022、enqueue_output L950-L967）→ collective_rpc 的 get_response 见非 SUCCESS 抛 RuntimeError（L404-L408）。进程死亡：监控线程 multiprocessing.connection.wait 阻塞在全部 sentinel 上（L279-L313），任一死亡→is_failed=True→shutdown()→failure_callback 通知引擎（callback 本体是 EngineCoreProc.__init__ 构造的 executor_fail_callback lambda：self.input_queue.put_nowait((EngineCoreRequestType.EXECUTOR_FAILED, b\"\"))，core.py:L1029-L1031；经 EngineCore.__init__ 的 register_failure_callback（core.py:L134-L135）注册进 executor——super().__init__（L1074-L1078）只是把 lambda 传下去的通道）。父进程退出：make_worker_process 建 death pipe（L683-L687），子进程 monitor_death_pipe 阻塞 recv、EOFError 即 shutdown_requested + 关 MQ（L795-L818）。关停：shutdown 先关各 worker 的 death_writer 信号→_ensure_worker_termination 等 graceful→SIGTERM→SIGKILL（L470-L503、L418-L468）；Executor 侧 weakref.finalize(self, self.shutdown) 兜底即便被 GC 也触发（L113）。",
+      "cost": "监控线程常驻（weakref 防 executor 无法 GC）；两类失败路径不同意味着排查要分清『方法失败』还是『进程没了』；death pipe 每 worker 一对 fd，fork 模式还要 inherited_fds 显式关闭防 EOF 失效（L688-L690、L860-L868）。"
+    }
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L584-L614",
+      "code": "    def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:\n        \"\"\"Schedule, execute, and make output.\n\n        Returns tuple of outputs and a flag indicating whether the model\n        was executed.\n        \"\"\"\n\n        # Check for any requests remaining in the scheduler - unfinished,\n        # or finished and not yet removed from the batch.\n        if not self.scheduler.has_requests():\n            return {}, False\n        scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())\n        future = self.model_executor.execute_model(scheduler_output, non_block=True)\n        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)\n        with (\n            self.capture_iteration_details(scheduler_output) as iteration_details,\n            self.log_error_detail(scheduler_output),\n        ):\n            model_output = future.result()\n            if model_output is None:\n                model_output = self.model_executor.sample_tokens(grammar_output)\n\n        # Before processing the model output, process any aborts that happened\n        # during the model execution.\n        self._process_aborts_queue()\n        engine_core_outputs = self.scheduler.update_from_output(\n            scheduler_output, model_output\n        )\n        self._attach_iteration_details(engine_core_outputs, iteration_details)\n\n        return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0",
+      "elide": [
+        "has_requests 早退（L593-L594）与 capture_iteration_details/log_error_detail 两个上下文管理器（L598-L601）是观测性包装，正文一句带过；这段是上游契约：②发起→bitmask 夹缝→result→None 则 ④采样→⑤收尾（ch9 已按拍拆讲，本章只取 ②④ 两拍的墙内侧）"
+      ]
+    },
+    {
+      "path": "vllm/v1/executor/abstract.py",
+      "lines": "L47-L92",
+      "code": "    @staticmethod\n    def get_class(vllm_config: VllmConfig) -> type[\"Executor\"]:\n        executor_class: type[Executor]\n        parallel_config = vllm_config.parallel_config\n        distributed_executor_backend = parallel_config.distributed_executor_backend\n        # distributed_executor_backend must be set in VllmConfig.__post_init__\n        if isinstance(distributed_executor_backend, type):\n            if not issubclass(distributed_executor_backend, Executor):\n                raise TypeError(\n                    \"distributed_executor_backend must be a subclass of \"\n                    f\"Executor. Got {distributed_executor_backend}.\"\n                )\n            executor_class = distributed_executor_backend\n        elif distributed_executor_backend == \"ray\":\n            if envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:\n                from vllm.v1.executor.ray_executor_v2 import RayExecutorV2\n\n                executor_class = RayExecutorV2\n            else:\n                from vllm.v1.executor.ray_executor import RayDistributedExecutor\n\n                executor_class = RayDistributedExecutor\n        elif distributed_executor_backend == \"mp\":\n            from vllm.v1.executor.multiproc_executor import MultiprocExecutor\n\n            executor_class = MultiprocExecutor\n        elif distributed_executor_backend == \"uni\":\n            from vllm.v1.executor.uniproc_executor import UniProcExecutor\n\n            executor_class = UniProcExecutor\n        elif distributed_executor_backend == \"external_launcher\":\n            # TODO: make v1 scheduling deterministic\n            # to support external launcher\n            executor_class = ExecutorWithExternalLauncher\n        elif isinstance(distributed_executor_backend, str):\n            executor_class = resolve_obj_by_qualname(distributed_executor_backend)\n            if not issubclass(executor_class, Executor):\n                raise TypeError(\n                    \"distributed_executor_backend must be a subclass of \"\n                    f\"Executor. Got {executor_class}.\"\n                )\n        else:\n            raise ValueError(\n                f\"Unknown distributed executor backend: {distributed_executor_backend}\"\n            )\n        return executor_class",
+      "elide": [
+        "ray 分支两条具体实现（RayExecutorV2/RayDistributedExecutor）只需点到分发存在，内部归 ch34；isinstance(...,type) 与末尾 str qualname 分支是『用户自定义 Executor 子类』扩展点，讲一句即可"
+      ]
+    },
+    {
+      "path": "vllm/v1/executor/abstract.py",
+      "lines": "L118-L150",
+      "code": "    def initialize_from_config(self, kv_cache_configs: list[KVCacheConfig]) -> None:\n        \"\"\"Initialize the KV caches on the underlying workers.\"\"\"\n        self.collective_rpc(\"initialize_from_config\", args=(kv_cache_configs,))\n\n    def compile_or_warm_up_model(self) -> None:\n        \"\"\"Compile/warm up the model and capture cudagraphs on workers.\"\"\"\n        compilation_times: list[CompilationTimes] = self.collective_rpc(\n            \"compile_or_warm_up_model\"\n        )\n        # Propagate compilation time from workers back to the main process.\n        # With TP>1, compilation happens in worker processes, so the main\n        # process config is never updated. Use max across workers since they\n        # compile in parallel.\n        if compilation_times:\n            self.vllm_config.compilation_config.compilation_time = max(\n                t.language_model for t in compilation_times\n            )\n            self.vllm_config.compilation_config.encoder_compilation_time = max(\n                t.encoder for t in compilation_times\n            )\n\n    def register_failure_callback(self, callback: FailureCallback):  # noqa: B027\n        \"\"\"\n        Register a function to be called if the executor enters a permanent\n        failed state.\n        \"\"\"\n        pass\n\n    def determine_available_memory(self) -> list[int]:  # in bytes\n        return self.collective_rpc(\"determine_available_memory\")\n\n    def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:\n        return self.collective_rpc(\"get_kv_cache_spec\")",
+      "elide": [
+        "compile_or_warm_up_model 里 CompilationTimes 取 max 汇回（L131-L137）值得讲一句（TP 下编译发生在 worker 进程、主进程 config 永远不更新）；register_failure_callback 基类空实现是 uni（进程内不需要）与 mp（监控线程要回调）的分野"
+      ]
+    },
+    {
+      "path": "vllm/v1/executor/abstract.py",
+      "lines": "L152-L247",
+      "code": "    @overload\n    def collective_rpc(\n        self,\n        method: str | Callable[[WorkerBase], _R],\n        timeout: float | None = None,\n        args: tuple = (),\n        kwargs: dict | None = None,\n        non_block: Literal[False] = False,\n    ) -> list[_R]:\n        \"\"\"\n        Execute an RPC call on all workers.\n\n        Args:\n            method: Name of the worker method to execute, or a callable that\n                is serialized and sent to all workers to execute.\n\n                If the method is a callable, it should accept an additional\n                `self` argument, in addition to the arguments passed in `args`\n                and `kwargs`. The `self` argument will be the worker object.\n            timeout: Maximum time in seconds to wait for execution. Raises a\n                [`TimeoutError`][] on timeout. `None` means wait indefinitely.\n            args: Positional arguments to pass to the worker method.\n            kwargs: Keyword arguments to pass to the worker method.\n            non_block: If `True`, returns a list of Futures instead of waiting\n                for the results.\n\n        Returns:\n            A list containing the results from each worker.\n\n        Note:\n            It is recommended to use this API to only pass control messages,\n            and set up data-plane communication to pass data.\n        \"\"\"\n        pass\n\n    @overload\n    def collective_rpc(\n        self,\n        method: str | Callable[[WorkerBase], _R],\n        timeout: float | None = None,\n        args: tuple = (),\n        kwargs: dict | None = None,\n        non_block: Literal[True] = True,\n    ) -> Future[list[_R]]:\n        pass\n\n    @abstractmethod\n    def collective_rpc(\n        self, method, timeout=None, args=(), kwargs=None, non_block: bool = False\n    ):\n        raise NotImplementedError\n\n    def get_kv_connector_handshake_metadata(\n        self,\n    ) -> list[dict[tuple[int, int], KVConnectorHandshakeMetadata]]:\n        return self.collective_rpc(\"get_kv_connector_handshake_metadata\")\n\n    @overload\n    def execute_model(\n        self, scheduler_output: SchedulerOutput, non_block: Literal[False] = False\n    ) -> ModelRunnerOutput | None:\n        pass\n\n    @overload\n    def execute_model(\n        self, scheduler_output: SchedulerOutput, non_block: Literal[True] = True\n    ) -> Future[ModelRunnerOutput | None]:\n        pass\n\n    def execute_model(\n        self, scheduler_output: SchedulerOutput, non_block: bool = False\n    ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:\n        output = self.collective_rpc(  # type: ignore[call-overload]\n            \"execute_model\", args=(scheduler_output,), non_block=non_block\n        )\n        return output[0]\n\n    @overload\n    def sample_tokens(\n        self, grammar_output: GrammarOutput | None, non_block: Literal[False] = False\n    ) -> ModelRunnerOutput:\n        pass\n\n    @overload\n    def sample_tokens(\n        self, grammar_output: GrammarOutput | None, non_block: Literal[True] = True\n    ) -> Future[ModelRunnerOutput]:\n        pass\n\n    def sample_tokens(\n        self, grammar_output: GrammarOutput | None, non_block: bool = False\n    ) -> ModelRunnerOutput | Future[ModelRunnerOutput]:\n        output = self.collective_rpc(  # type: ignore[call-overload]\n            \"sample_tokens\", args=(grammar_output,), non_block=non_block\n        )\n        return output[0]",
+      "elide": [
+        "两个 @overload 签名只是类型层面精确化（non_block False/True 返回 list/Future），正文一句话概括即可；docstring 的 Note 段（L181-L183）是控制面/数据面分离契约的原文，必须逐字讲；get_kv_connector_handshake_metadata（L204-L207）是 KV connector 握手透传，一句带过归 ch16/36"
+      ]
+    },
+    {
+      "path": "vllm/v1/executor/uniproc_executor.py",
+      "lines": "L26-L106",
+      "code": "class AsyncOutputFuture(Future):\n    def __init__(self, async_output: AsyncModelRunnerOutput, single_value: bool):\n        self.async_output = async_output\n        self.single_value = single_value\n        super().__init__()\n\n    def result(self, timeout=None):\n        if timeout is not None:\n            raise RuntimeError(\"timeout not implemented\")\n\n        if not super().done():\n            try:\n                output = self.async_output.get_output()\n                self.set_result(output if self.single_value else [output])\n            except Exception as e:\n                self.set_exception(e)\n        return super().result()\n\n\nclass UniProcExecutor(Executor):\n    def _init_executor(self) -> None:\n        \"\"\"Initialize the worker and load the model.\"\"\"\n        self.driver_worker = WorkerWrapperBase(rpc_rank=0)\n        distributed_init_method, rank, local_rank = self._distributed_args()\n        kwargs = dict(\n            vllm_config=self.vllm_config,\n            local_rank=local_rank,\n            rank=rank,\n            distributed_init_method=distributed_init_method,\n            is_driver_worker=True,\n            shared_worker_lock=Lock(),\n        )\n\n        # Set net device env vars for the worker if VLLM_GPU_NIC_PCIE_MAPPING is set\n        set_worker_net_device(local_rank, self.vllm_config)\n\n        self.driver_worker.init_worker(all_kwargs=[kwargs])\n        self.driver_worker.init_device()\n\n        if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:\n            self.driver_worker.elastic_ep_execute(\"load_model\")\n        else:\n            self.driver_worker.load_model()\n        current_platform.update_block_size_for_backend(self.vllm_config)\n\n    def _distributed_args(self) -> tuple[str, int, int]:\n        \"\"\"Return (distributed_init_method, rank, local_rank).\"\"\"\n        distributed_init_method = get_distributed_init_method(get_ip(), get_open_port())\n        # set local rank as the device index if specified\n        device_info = self.vllm_config.device_config.device.__str__().split(\":\")\n        local_rank = int(device_info[1]) if len(device_info) > 1 else 0\n        return distributed_init_method, 0, local_rank\n\n    def collective_rpc(  # type: ignore[override]\n        self,\n        method: str | Callable,\n        timeout: float | None = None,\n        args: tuple = (),\n        kwargs: dict | None = None,\n        non_block: bool = False,\n        single_value: bool = False,\n    ) -> Any:\n        if kwargs is None:\n            kwargs = {}\n\n        if not non_block:\n            result = run_method(self.driver_worker, method, args, kwargs)\n            if isinstance(result, AsyncModelRunnerOutput):\n                result = result.get_output()\n            return result if single_value else [result]\n\n        try:\n            result = run_method(self.driver_worker, method, args, kwargs)\n            if isinstance(result, AsyncModelRunnerOutput):\n                return AsyncOutputFuture(result, single_value)\n            future = Future[Any]()\n            future.set_result(result if single_value else [result])\n        except Exception as e:\n            future = Future[Any]()\n            future.set_exception(e)\n        return future",
+      "elide": [
+        "set_worker_net_device（L59-L60）是 NIC 亲和平台适配，一句带过；VLLM_ELASTIC_EP_SCALE_UP_LAUNCH 分支（L65-L68）是弹性 EP 特性开关，删；non_block 分支的要点：uni 没有真异步——同步算完，把 AsyncModelRunnerOutput 包进 AsyncOutputFuture（延迟到 result() 才等 D2H 事件），普通结果直接塞进已完成的 Future"
+      ]
+    },
+    {
+      "path": "vllm/v1/executor/multiproc_executor.py",
+      "lines": "L70-L100",
+      "code": "class FutureWrapper(Future):\n    def __init__(\n        self,\n        futures_queue: deque[\"FutureWrapper\"],\n        get_response: Callable[[], Any],\n        aggregate: Callable = lambda x: x,\n    ):\n        self.futures_queue = futures_queue\n        self.get_response = get_response\n        self.aggregate = aggregate\n        super().__init__()\n        self.futures_queue.appendleft(self)\n\n    def result(self, timeout=None):\n        if timeout is not None:\n            raise RuntimeError(\"timeout not implemented\")\n\n        # Drain any futures ahead of us in the queue.\n        while not self.done():\n            future = self.futures_queue.pop()\n            future._wait_for_response()\n        return super().result()\n\n    def _wait_for_response(self):\n        try:\n            response = self.aggregate(self.get_response())\n            with suppress(InvalidStateError):\n                self.set_result(response)\n        except Exception as e:\n            with suppress(InvalidStateError):\n                self.set_exception(e)",
+      "elide": [
+        "无可省略分支——小而完整的类；appendleft/pop 的 FIFO 配对与 result() 的 while 排空是 m12 worked example 的对象，必须逐行讲"
+      ]
+    },
+    {
+      "path": "vllm/v1/executor/multiproc_executor.py",
+      "lines": "L131-L234",
+      "code": "        self.rpc_broadcast_mq: MessageQueue | None = None\n        scheduler_output_handle: Handle | None = None\n        # Initialize worker and set up message queues for SchedulerOutputs\n        # and ModelRunnerOutputs\n        if self.parallel_config.node_rank_within_dp == 0:\n            # For leader node within each dp rank,\n            # each dp will have its own leader multiproc executor.\n            max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024\n            mq_connect_ip = get_ip()\n            logger.info(\n                \"DP group leader: node_rank=%d, node_rank_within_dp=%d, \"\n                \"master_addr=%s, mq_connect_ip=%s (local), \"\n                \"world_size=%d, local_world_size=%d\",\n                self.parallel_config.node_rank,\n                self.parallel_config.node_rank_within_dp,\n                self.parallel_config.master_addr,\n                mq_connect_ip,\n                self.world_size,\n                self.local_world_size,\n            )\n            self.rpc_broadcast_mq = MessageQueue(\n                self.world_size,\n                self.local_world_size,\n                max_chunk_bytes=max_chunk_bytes,\n                connect_ip=mq_connect_ip,\n            )\n            scheduler_output_handle = self.rpc_broadcast_mq.export_handle()\n        # Create workers\n        context = get_mp_context()\n        shared_worker_lock = context.Lock()\n        unready_workers: list[UnreadyWorkerProcHandle] = []\n        success = False\n        try:\n            global_start_rank = (\n                self.local_world_size * self.parallel_config.node_rank_within_dp\n            )\n            # When using fork, keep track of socket file descriptors that are\n            # inherited by the worker, so that we can close them in subsequent\n            # workers\n            inherited_fds: list[int] | None = (\n                [] if context.get_start_method() == \"fork\" else None\n            )\n\n            # For CPU backend only, to setup OpenMP threads affinity\n            cpu_omp_manager = OMPProcessManager(self.vllm_config)\n            for local_rank in range(self.local_world_size):\n                global_rank = global_start_rank + local_rank\n                is_driver_worker = self._is_driver_worker(global_rank)\n                with cpu_omp_manager.configure_omp_envs(\n                    rank=global_rank, local_rank=local_rank\n                ):\n                    unready_worker_handle = WorkerProc.make_worker_process(\n                        vllm_config=self.vllm_config,\n                        local_rank=local_rank,\n                        rank=global_rank,\n                        distributed_init_method=distributed_init_method,\n                        input_shm_handle=scheduler_output_handle,\n                        shared_worker_lock=shared_worker_lock,\n                        is_driver_worker=is_driver_worker,\n                        inherited_fds=inherited_fds,\n                    )\n                unready_workers.append(unready_worker_handle)\n                if inherited_fds is not None:\n                    inherited_fds.append(unready_worker_handle.death_writer.fileno())\n                    inherited_fds.append(unready_worker_handle.ready_pipe.fileno())\n\n            # Workers must be created before wait_for_ready to avoid\n            # deadlock, since worker.init_device() does a device sync.\n\n            # Wait for all local workers to be ready.\n            self.workers = WorkerProc.wait_for_ready(unready_workers)\n\n            # Start background thread to monitor worker health if not in headless mode.\n            if self.monitor_workers:\n                self.start_worker_monitor()\n\n            self.response_mqs = []\n            # Only leader node have remote response mqs\n            if self.parallel_config.node_rank_within_dp == 0:\n                for rank in range(self.world_size):\n                    if rank < self.local_world_size:\n                        local_message_queue = self.workers[rank].worker_response_mq\n                        assert local_message_queue is not None\n                        self.response_mqs.append(local_message_queue)\n                    else:\n                        remote_message_queue = self.workers[0].peer_worker_response_mqs[\n                            rank\n                        ]\n                        assert remote_message_queue is not None\n                        self.response_mqs.append(remote_message_queue)\n\n            # Ensure message queues are ready. Will deadlock if re-ordered\n            # Must be kept consistent with the WorkerProc.\n\n            # Wait for all input mqs to be ready.\n            if self.rpc_broadcast_mq is not None:\n                self.rpc_broadcast_mq.wait_until_ready()\n            # Wait for all remote response mqs to be ready.\n            for response_mq in self.response_mqs:\n                response_mq.wait_until_ready()\n\n            self.futures_queue = deque[FutureWrapper]()\n\n            self._post_init_executor()",
+      "elide": [
+        "DP-leader 日志（L140-L150）、cpu_omp_manager 上下文（L174-L181）、inherited_fds fork 适配（L167-L172、L193-L195）均为平台适配，压成一行注释；跨节点 response_mqs 装配（L215-L220）只留单节点分支（rank < local_world_size 取本节点 MQ）；『Workers must be created before wait_for_ready to avoid deadlock』注释（L197-L198）值得讲——init_device 里有集合通信、会做设备同步"
+      ]
+    },
+    {
+      "path": "vllm/v1/executor/multiproc_executor.py",
+      "lines": "L279-L319",
+      "code": "    def start_worker_monitor(self, inline=False) -> None:\n        workers = self.workers\n        self_ref = weakref.ref(self)\n\n        # Monitors worker process liveness. If any die unexpectedly,\n        # logs an error, shuts down the executor and invokes the failure\n        # callback to inform the engine.\n        def monitor_workers():\n            sentinels = [h.proc.sentinel for h in workers]\n            died = multiprocessing.connection.wait(sentinels)\n            _self = self_ref()\n            if not _self or getattr(_self, \"shutting_down\", False):\n                logger.debug(\"MultiprocWorkerMonitor: shutdown already initiated\")\n                return\n            _self.is_failed = True\n            proc = next(h.proc for h in workers if h.proc.sentinel == died[0])\n            logger.error(\n                \"Worker proc %s died unexpectedly (exit code: %s), \"\n                \"shutting down executor.\",\n                proc.name,\n                proc.exitcode,\n            )\n            _self.shutdown()\n            callback = _self.failure_callback\n            if callback is not None:\n                _self.failure_callback = None\n                callback()\n\n        if not inline:\n            Thread(\n                target=monitor_workers, daemon=True, name=\"MultiprocWorkerMonitor\"\n            ).start()\n            return\n\n        monitor_workers()\n\n    def register_failure_callback(self, callback: FailureCallback):\n        if self.is_failed:\n            callback()\n        else:\n            self.failure_callback = callback",
+      "elide": [
+        "weakref.ref 防 GC、inline 参数测试用，各一句带过；重点两行：sentinel 就绪→is_failed→shutdown→callback，与 EXECUTOR_FAILED 入引擎输入队列（core.py:L1029-L1031 的 executor_fail_callback lambda，经 core.py:L134-L135 注册）连成死亡传播链"
+      ]
+    },
+    {
+      "path": "vllm/v1/executor/multiproc_executor.py",
+      "lines": "L321-L416",
+      "code": "    def execute_model(  # type: ignore[override]\n        self, scheduler_output: SchedulerOutput, non_block: bool = False\n    ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:\n        return self.collective_rpc(\n            \"execute_model\",\n            args=(scheduler_output,),\n            unique_reply_rank=self.output_rank,\n            non_block=non_block,\n            timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,\n            kv_output_aggregator=self.kv_output_aggregator,\n        )\n\n    def sample_tokens(  # type: ignore[override]\n        self, grammar_output: GrammarOutput | None, non_block: bool = False\n    ) -> ModelRunnerOutput | Future[ModelRunnerOutput]:\n        return self.collective_rpc(\n            \"sample_tokens\",\n            args=(grammar_output,),\n            unique_reply_rank=self.output_rank,\n            non_block=non_block,\n            timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,\n            kv_output_aggregator=self.kv_output_aggregator,\n        )\n\n    def execute_dummy_batch(self) -> None:\n        self.collective_rpc(\"execute_dummy_batch\", unique_reply_rank=self.output_rank)\n\n    def take_draft_token_ids(self) -> DraftTokenIds | None:\n        # OPTIMIZATION: Get output only from a single worker (output_rank)\n        return self.collective_rpc(\n            \"take_draft_token_ids\", unique_reply_rank=self.output_rank\n        )\n\n    def collective_rpc(  # type: ignore[override]\n        self,\n        method: str | Callable,\n        timeout: float | None = None,\n        args: tuple = (),\n        kwargs: dict | None = None,\n        non_block: bool = False,\n        unique_reply_rank: int | None = None,\n        kv_output_aggregator: KVOutputAggregator | None = None,\n    ) -> Any:\n        \"\"\"Returns single result if unique_reply_rank and/or kv_output_aggregator\n        is provided, otherwise list.\"\"\"\n        assert self.rpc_broadcast_mq is not None, (\n            \"collective_rpc should not be called on follower node\"\n        )\n        if self.is_failed:\n            raise RuntimeError(\"Executor failed.\")\n\n        deadline = None if timeout is None else time.monotonic() + timeout\n        kwargs = kwargs or {}\n\n        if kv_output_aggregator is not None:\n            output_rank = None\n            aggregate: Callable[[Any], Any] = partial(\n                kv_output_aggregator.aggregate, output_rank=unique_reply_rank or 0\n            )\n        else:\n            output_rank = unique_reply_rank\n            aggregate = lambda x: x\n\n        if isinstance(method, str):\n            send_method = method\n        else:\n            send_method = cloudpickle.dumps(method, protocol=pickle.HIGHEST_PROTOCOL)\n        self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))\n\n        response_mqs: Sequence[MessageQueue] = self.response_mqs\n        if output_rank is not None:\n            response_mqs = (response_mqs[output_rank],)\n\n        def get_response():\n            responses = []\n            for mq in response_mqs:\n                dequeue_timeout = (\n                    None if deadline is None else max(0.0, deadline - time.monotonic())\n                )\n                try:\n                    status, result = mq.dequeue(timeout=dequeue_timeout)\n                except TimeoutError as e:\n                    raise TimeoutError(f\"RPC call to {method} timed out.\") from e\n                if status != WorkerProc.ResponseStatus.SUCCESS:\n                    raise RuntimeError(\n                        f\"Worker failed with error '{result}', please check the\"\n                        \" stack trace above for the root cause\"\n                    )\n                responses.append(result)\n            return responses[0] if output_rank is not None else responses\n\n        future = FutureWrapper(\n            self.futures_queue, get_response=get_response, aggregate=aggregate\n        )\n\n        return future if non_block else future.result()",
+      "elide": [
+        "execute_model/sample_tokens 覆写（L321-L343）带 unique_reply_rank=self.output_rank 与 VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS 超时——与 uni 的 single_value=True 对照；kv_output_aggregator 分支（L375-L382）属 PD 解耦（ch16/36），删；cloudpickle.dumps（L387）对应『method 是 callable 时整函数序列化发过去』的能力"
+      ]
+    },
+    {
+      "path": "vllm/v1/executor/multiproc_executor.py",
+      "lines": "L509-L523",
+      "code": "    def _get_output_rank(self) -> int:\n        # Only returns ModelRunnerOutput from TP rank=0 and PP rank=-1\n        # (the first TP worker of the last PP stage).\n        # Example:\n        # Assuming TP=8, PP=4, then the world_size=32\n        # 0-7, PP rank 0\n        # 8-15, PP rank 1\n        # 16-23, PP rank 2\n        # 24-31, PP rank 3\n        # so world_size - tp_size = 32 - 8 = 24 should be PP rank = -1 (i.e. 3)\n        return (\n            self.world_size\n            - self.parallel_config.tensor_parallel_size\n            * self.parallel_config.prefill_context_parallel_size\n        )",
+      "elide": [
+        "无省略——注释里的 TP=8/PP=4 算例是讲 output_rank 公式的现成教具"
+      ]
+    },
+    {
+      "path": "vllm/v1/executor/multiproc_executor.py",
+      "lines": "L607-L670",
+      "code": "    @instrument(span_name=\"Worker init\")\n    def __init__(\n        self,\n        vllm_config: VllmConfig,\n        local_rank: int,\n        rank: int,\n        distributed_init_method: str,\n        input_shm_handle: Handle,\n        shared_worker_lock: LockType,\n        is_driver_worker: bool,\n    ):\n        self.rank = rank\n        wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)\n        # TODO: move `init_worker` to executor level as a collective rpc call\n        all_kwargs: list[dict] = [\n            {} for _ in range(vllm_config.parallel_config.world_size)\n        ]\n        all_kwargs[local_rank] = {\n            \"vllm_config\": vllm_config,\n            \"local_rank\": local_rank,\n            \"rank\": rank,\n            \"distributed_init_method\": distributed_init_method,\n            \"is_driver_worker\": is_driver_worker,\n            \"shared_worker_lock\": shared_worker_lock,\n        }\n        wrapper.init_worker(all_kwargs)\n        self.worker = wrapper\n\n        self.setup_proc_title_and_log_prefix(\n            enable_ep=vllm_config.parallel_config.enable_expert_parallel\n        )\n\n        # Load model\n        self.worker.init_device()\n        # Update process title now that parallel groups are initialized\n        self.setup_proc_title_and_log_prefix(\n            enable_ep=vllm_config.parallel_config.enable_expert_parallel\n        )\n        if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:\n            self.worker.elastic_ep_execute(\"load_model\")\n        else:\n            self.worker.load_model()\n\n        scheduler_config = vllm_config.scheduler_config\n        self.use_async_scheduling = scheduler_config.async_scheduling\n        if self.use_async_scheduling:\n            self.async_output_queue: queue.Queue = queue.Queue()\n            self.async_output_copy_thread = Thread(\n                target=self.async_output_busy_loop,\n                daemon=True,\n                name=\"WorkerAsyncOutputCopy\",\n            )\n            self.async_output_copy_thread.start()\n\n        # Set block size based on the attention backends\n        current_platform.update_block_size_for_backend(vllm_config)\n\n        # Initialize message queues after init_device() since multi-node setups\n        # (nnodes_within_dp > 1) require distributed groups to be initialized\n        self._init_message_queues(input_shm_handle, vllm_config)\n\n        # Enable environment variable cache (e.g. assume no more\n        # environment variable overrides after this point)\n        enable_envs_cache()",
+      "elide": [
+        "all_kwargs 用 world_size 长度占位、只填本 rpc_rank 槽（L621-L631）是为兼容 SPMD 多执行器，讲一句；VLLM_ELASTIC_EP_SCALE_UP_LAUNCH（L645-L648）删；async_output_copy_thread（L652-L659）是 ch12 异步调度的 worker 半边——正文回指"
+      ]
+    },
+    {
+      "path": "vllm/v1/executor/multiproc_executor.py",
+      "lines": "L820-L944",
+      "code": "    @staticmethod\n    def worker_main(*args, **kwargs):\n        \"\"\"Worker initialization and execution loops.\n        This runs a background process\"\"\"\n\n        # Signal handler used for graceful termination.\n        # SystemExit exception is only raised once to allow this and worker\n        # processes to terminate without error\n        shutdown_requested = threading.Event()\n\n        def signal_handler(signum, frame):\n            nonlocal shutdown_requested\n            if not shutdown_requested.is_set():\n                shutdown_requested.set()\n                logger.debug(\n                    \"WorkerProc handling signal %d, raising SystemExit\", signum\n                )\n                raise SystemExit()\n\n        # Either SIGTERM or SIGINT will terminate the worker\n        signal.signal(signal.SIGTERM, signal_handler)\n        signal.signal(signal.SIGINT, signal_handler)\n\n        # Publish the logical-to-physical mapping early so topology helpers\n        # work before init_device (needed by set_worker_net_device below).\n        assigned_physical_gpu_ids = kwargs[\n            \"vllm_config\"\n        ].parallel_config.assigned_physical_gpu_ids\n        if assigned_physical_gpu_ids is not None:\n            from vllm.platforms.interface import set_assigned_physical_gpu_ids\n\n            set_assigned_physical_gpu_ids(assigned_physical_gpu_ids)\n\n        # Set net device env vars for the worker if VLLM_GPU_NIC_PCIE_MAPPING is set\n        set_worker_net_device(kwargs.get(\"local_rank\", 0), kwargs[\"vllm_config\"])\n\n        worker = None\n        ready_writer = kwargs.pop(\"ready_pipe\")\n        death_pipe = kwargs.pop(\"death_pipe\", None)\n\n        # Close inherited pipes from parent (incl. other worker pipes)\n        # Explicitly passing in existing pipes and closing them makes the pipe\n        # behave when using fork. Otherwise, a hidden reference to the pipes\n        # exist in the child process and prevents EOF closure.\n        for fd in kwargs.pop(\"inherited_fds\", []):\n            try:\n                os.close(fd)\n            except Exception as e:\n                logger.warning(\"Error closing inherited connection: %s: %s\", type(e), e)\n\n        try:\n            # Initialize tracer\n            rank = kwargs.get(\"rank\", 0)\n            maybe_init_worker_tracer(\n                instrumenting_module_name=\"vllm.worker\",\n                process_kind=\"worker\",\n                process_name=f\"Worker_{rank}\",\n            )\n\n            worker = WorkerProc(*args, **kwargs)\n            assert worker.worker_response_mq is not None\n            if kwargs[\"vllm_config\"].parallel_config.numa_bind:\n                numa_utils.log_current_affinity_state(f\"Worker_{worker.rank}\")\n\n            worker.monitor_death_pipe(death_pipe, shutdown_requested)\n\n            # Send READY once we know everything is loaded\n            ready_writer.send(\n                {\n                    \"status\": WorkerProc.READY_STR,\n                    \"handle\": worker.worker_response_mq.export_handle(),\n                    \"peer_response_handles\": worker.peer_response_handles,\n                }\n            )\n\n            # Ensure message queues are ready. Will deadlock if re-ordered.\n            # Must be kept consistent with the Executor\n            if worker.rpc_broadcast_mq is not None:\n                worker.rpc_broadcast_mq.wait_until_ready()\n            worker.worker_response_mq.wait_until_ready()\n            ready_writer.close()\n            ready_writer = None\n\n            worker.worker_busy_loop()\n\n        except Exception:\n            # NOTE: if an Exception arises in busy_loop, we send\n            # a FAILURE message over the MQ RPC to notify the Executor,\n            # which triggers system shutdown.\n            # TODO(rob): handle case where the MQ itself breaks.\n\n            if ready_writer is not None:\n                logger.exception(\"WorkerProc failed to start.\")\n            elif shutdown_requested.is_set():\n                logger.debug_once(\n                    \"[shutdown] WorkerProc: exiting after shutdown request\"\n                )\n            else:\n                logger.exception(\"WorkerProc failed.\")\n\n            # The parent sends a SIGTERM to all worker processes if\n            # any worker dies. Set this value so we don't re-throw\n            # SystemExit() to avoid zmq exceptions in __del__.\n            shutdown_requested.set()\n\n        except SystemExit as e:\n            # SystemExit is raised on SIGTERM or SIGKILL, which usually indicates that\n            # the graceful shutdown process did not succeed\n            if shutdown_requested.is_set():\n                logger.debug_once(\n                    \"[shutdown] WorkerProc: terminated by shutdown signal\"\n                )\n            else:\n                logger.warning(\"WorkerProc was terminated\")\n            # SystemExit must never be ignored\n            raise e\n\n        finally:\n            if ready_writer is not None:\n                ready_writer.close()\n            if death_pipe is not None:\n                death_pipe.close()\n            # Clean up once worker exits busy loop\n            if worker is not None:\n                worker.shutdown()",
+      "elide": [
+        "信号处理（L828-L841）压两行；assigned_physical_gpu_ids/set_worker_net_device 前置段（L843-L854）平台适配删；maybe_init_worker_tracer/numa（L871-L882）删；要点：ready_writer 是否为 None 区分『启动期失败 vs 运行期失败』（L911-L918）、finally 的三段清理（L937-L944）"
+      ]
+    },
+    {
+      "path": "vllm/v1/executor/multiproc_executor.py",
+      "lines": "L946-L1022",
+      "code": "    class ResponseStatus(Enum):\n        SUCCESS = auto()\n        FAILURE = auto()\n\n    def enqueue_output(self, output: Any):\n        \"\"\"Prepares output from the worker and enqueues it to the\n        worker_response_mq. If the output is an Exception, it is\n        converted to a FAILURE response.\n        \"\"\"\n        if isinstance(output, AsyncModelRunnerOutput):\n            try:\n                output = output.get_output()\n            except Exception as e:\n                logger.exception(\"Error getting async model runner output\")\n                output = e\n\n        if isinstance(output, Exception):\n            result = (WorkerProc.ResponseStatus.FAILURE, str(output))\n        else:\n            result = (WorkerProc.ResponseStatus.SUCCESS, output)\n        if (response_mq := self.worker_response_mq) is not None:\n            response_mq.enqueue(result)\n\n    def handle_output(self, output: Any):\n        \"\"\"Handles output from the worker. If async scheduling is enabled,\n        it is passed to the async_output_busy_loop thread. Otherwise, it is\n        enqueued directly to the worker_response_mq.\n        \"\"\"\n        if self.use_async_scheduling:\n            self.async_output_queue.put(output)\n        else:\n            self.enqueue_output(output)\n\n    def async_output_busy_loop(self):\n        \"\"\"Entrypoint for the thread which handles outputs asynchronously.\"\"\"\n\n        # set device to the worker device for the thread.\n        # a thread will not inherit the context of the main thread.\n        # when calling any cuda runtime functions, it will implicitly\n        # create a new cuda context on device 0, consuming extra memory.\n        # here we set the device to the worker device for the thread,\n        # enforcing the context to be the same as the main thread.\n        from vllm.platforms import current_platform\n\n        if hasattr(self.worker, \"device\"):\n            current_platform.set_device(self.worker.device)\n\n        while True:\n            output = self.async_output_queue.get()\n            self.enqueue_output(output)\n\n    def worker_busy_loop(self):\n        \"\"\"Main busy loop for Multiprocessing Workers\"\"\"\n        assert self.rpc_broadcast_mq is not None\n        while True:\n            method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(\n                indefinite=True\n            )\n            try:\n                if isinstance(method, str):\n                    func = getattr(self.worker, method)\n                elif isinstance(method, bytes):\n                    func = partial(cloudpickle.loads(method), self.worker)\n\n                output = func(*args, **kwargs)\n\n                if output_rank is None or self.rank == output_rank:\n                    self.handle_output(output)\n            except Exception as e:\n                # Notes have been introduced in python 3.11\n                if hasattr(e, \"add_note\"):\n                    e.add_note(traceback.format_exc())\n                logger.exception(\"WorkerProc hit an exception.\")\n                # exception might not be serializable, so we convert it to\n                # string, only for logging purpose.\n                if output_rank is None or self.rank == output_rank:\n                    self.handle_output(e)",
+      "elide": [
+        "enqueue_output 的 AsyncModelRunnerOutput get_output 分支（L955-L960）是异步输出在 MQ 侧的落地，讲一句；async_output_busy_loop（L979-L995）线程的 set_device 注释值得讲（线程不继承 CUDA context，防在设备 0 上多建 context）；busy_loop 三分支派发与 run_method 同构是重点"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/worker_base.py",
+      "lines": "L114-L157",
+      "code": "    def init_device(self) -> None:\n        \"\"\"Initialize device state, such as loading the model or other on-device\n        memory allocations.\n        \"\"\"\n        raise NotImplementedError\n\n    def reset_mm_cache(self) -> None:\n        reset_fn = getattr(self.model_runner, \"reset_mm_cache\", None)\n        if callable(reset_fn):\n            reset_fn()\n\n    def get_model(self) -> nn.Module:\n        raise NotImplementedError\n\n    def apply_model(self, fn: Callable[[nn.Module], _R]) -> _R:\n        \"\"\"Apply a function on the model inside this worker.\"\"\"\n        return fn(self.get_model())\n\n    def get_model_inspection(self) -> str:\n        \"\"\"Return a transformers-style hierarchical view of the model.\"\"\"\n        from vllm.model_inspection import format_model_inspection\n\n        return format_model_inspection(self.get_model())\n\n    def load_model(self, *, load_dummy_weights: bool = False) -> None:\n        \"\"\"Load model onto target device.\"\"\"\n        raise NotImplementedError\n\n    def execute_model(\n        self, scheduler_output: SchedulerOutput\n    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:\n        \"\"\"If this method returns None, sample_tokens should be called immediately after\n        to obtain the ModelRunnerOutput.\n\n        Note that this design may be changed in future if/when structured outputs\n        parallelism is re-architected.\n        \"\"\"\n        raise NotImplementedError\n\n    def sample_tokens(\n        self, grammar_output: GrammarOutput\n    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:\n        \"\"\"Should be called immediately after execute_model iff it returned None.\"\"\"\n        raise NotImplementedError",
+      "elide": [
+        "init_device/load_model 等纯虚桩（L114-L140）列表即可；两段式契约的两段 docstring（L142-L157）必须逐字讲——『If this method returns None, sample_tokens should be called immediately after』与自注『may be changed in future if/when structured outputs parallelism is re-architected』"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/worker_base.py",
+      "lines": "L187-L334",
+      "code": "class WorkerWrapperBase:\n    \"\"\"\n    This class represents one process in an executor/engine. It is responsible\n    for lazily initializing the worker and handling the worker's lifecycle.\n    We first instantiate the WorkerWrapper, which remembers the worker module\n    and class name. Then, when we call `update_environment_variables`, and the\n    real initialization happens in `init_worker`.\n    \"\"\"\n\n    def __init__(\n        self,\n        rpc_rank: int = 0,\n        global_rank: int | None = None,\n    ) -> None:\n        \"\"\"\n        Initialize the worker wrapper with the given vllm_config and rpc_rank.\n        Note: rpc_rank is the rank of the worker in the executor. In most cases,\n        it is also the rank of the worker in the distributed group. However,\n        when multiple executors work together, they can be different.\n        e.g. in the case of SPMD-style offline inference with TP=2,\n        users can launch 2 engines/executors, each with only 1 worker.\n        All workers have rpc_rank=0, but they have different ranks in the TP\n        group.\n        \"\"\"\n        self.rpc_rank: int = rpc_rank\n        self.global_rank: int = self.rpc_rank if global_rank is None else global_rank\n\n        # Initialized after init_worker is called\n        self.worker: WorkerBase\n        self.vllm_config: VllmConfig\n\n    def shutdown(self) -> None:\n        if self.worker is not None:\n            self.worker.shutdown()\n\n    def update_environment_variables(\n        self,\n        envs_list: list[dict[str, str]],\n    ) -> None:\n        envs = envs_list[self.rpc_rank]\n        update_environment_variables(envs)\n\n    @instrument(span_name=\"Worker init\")\n    def init_worker(self, all_kwargs: list[dict[str, Any]]) -> None:\n        \"\"\"\n        Here we inject some common logic before initializing the worker.\n        Arguments are passed to the worker class constructor.\n        \"\"\"\n        kwargs = all_kwargs[self.rpc_rank]\n\n        vllm_config: VllmConfig | None = kwargs.get(\"vllm_config\")\n        assert vllm_config is not None, (\n            \"vllm_config is required to initialize the worker\"\n        )\n        self.vllm_config = vllm_config\n\n        vllm_config.enable_trace_function_call_for_thread()\n\n        from vllm.plugins import load_general_plugins\n\n        load_general_plugins()\n\n        parallel_config = vllm_config.parallel_config\n        if isinstance(parallel_config.worker_cls, str):\n            worker_class: type[WorkerBase] = resolve_obj_by_qualname(\n                parallel_config.worker_cls\n            )\n        else:\n            raise ValueError(\n                \"passing worker_cls is no longer supported. \"\n                \"Please pass keep the class in a separate module \"\n                \"and pass the qualified name of the class as a string.\"\n            )\n\n        if parallel_config.worker_extension_cls:\n            worker_extension_cls = resolve_obj_by_qualname(\n                parallel_config.worker_extension_cls\n            )\n            extended_calls = []\n            if worker_extension_cls not in worker_class.__bases__:\n                # check any conflicts between worker and worker_extension_cls\n                for attr in dir(worker_extension_cls):\n                    if attr.startswith(\"__\"):\n                        continue\n                    assert not hasattr(worker_class, attr), (\n                        f\"Worker class {worker_class} already has an attribute\"\n                        f\" {attr}, which conflicts with the worker\"\n                        f\" extension class {worker_extension_cls}.\"\n                    )\n                    if callable(getattr(worker_extension_cls, attr)):\n                        extended_calls.append(attr)\n                # dynamically inherit the worker extension class\n                worker_class.__bases__ = worker_class.__bases__ + (\n                    worker_extension_cls,\n                )\n                logger.info(\n                    \"Injected %s into %s for extended collective_rpc calls %s\",\n                    worker_extension_cls,\n                    worker_class,\n                    extended_calls,\n                )\n\n        assigned_physical_gpu_ids = kwargs.pop(\"assigned_physical_gpu_ids\", None)\n        if assigned_physical_gpu_ids is not None:\n            vllm_config.parallel_config.assigned_physical_gpu_ids = (\n                assigned_physical_gpu_ids\n            )\n\n        shared_worker_lock = kwargs.pop(\"shared_worker_lock\", None)\n        if shared_worker_lock is None:\n            msg = (\n                \"Missing `shared_worker_lock` argument from executor. \"\n                \"This argument is needed for mm_processor_cache_type='shm'.\"\n            )\n\n            mm_config = vllm_config.model_config.multimodal_config\n            if mm_config and mm_config.mm_processor_cache_type == \"shm\":\n                raise ValueError(msg)\n            else:\n                logger.warning_once(msg)\n\n            self.mm_receiver_cache = None\n        else:\n            self.mm_receiver_cache = (\n                MULTIMODAL_REGISTRY.worker_receiver_cache_from_config(\n                    vllm_config,\n                    shared_worker_lock,\n                )\n            )\n\n        with set_current_vllm_config(self.vllm_config):\n            # To make vLLM config available during worker initialization\n            self.worker = worker_class(**kwargs)\n\n    def initialize_from_config(self, kv_cache_configs: list[Any]) -> None:\n        kv_cache_config = kv_cache_configs[self.global_rank]\n        assert self.vllm_config is not None\n        with set_current_vllm_config(self.vllm_config):\n            self.worker.initialize_from_config(kv_cache_config)  # type: ignore\n\n    def init_device(self):\n        assert self.vllm_config is not None\n        with set_current_vllm_config(self.vllm_config):\n            # To make vLLM config available during device initialization\n            self.worker.init_device()  # type: ignore\n\n    def __getattr__(self, attr: str):\n        return getattr(self.worker, attr)",
+      "elide": [
+        "update_environment_variables（L222-L227）是顺序约束第一步；worker_extension_cls 动态注入（L261-L287）压三行（OOT 扩展点，m19）；assigned_physical_gpu_ids（L289-L293）与 mm_receiver_cache 构建（L295-L315）压注释；__getattr__（L333-L334）一行但承重——collective_rpc 的 getattr 由此命中"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_worker.py",
+      "lines": "L303-L423",
+      "code": "    @instrument(span_name=\"Init device\")\n    def init_device(self):\n        if self.device_config.device_type == \"cuda\":\n            # This env var set by Ray causes exceptions with graph building.\n            os.environ.pop(\"NCCL_ASYNC_ERROR_HANDLING\", None)\n            parallel_config = self.parallel_config\n            if (\n                parallel_config.distributed_executor_backend\n                not in (\"ray\", \"external_launcher\")\n                and parallel_config.data_parallel_backend != \"ray\"\n                and parallel_config.nnodes_within_dp == 1\n            ):\n                # Use local DP rank if available, otherwise use global DP rank.\n                dp_local_rank = self.parallel_config.data_parallel_rank_local\n                if dp_local_rank is None:\n                    dp_local_rank = self.parallel_config.data_parallel_index\n\n                tp_pp_world_size = (\n                    self.parallel_config.pipeline_parallel_size\n                    * self.parallel_config.tensor_parallel_size\n                )\n\n                # DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK\n                self.local_rank += dp_local_rank * tp_pp_world_size\n\n            # Publish the logical-to-physical mapping for topology queries\n            # such as NIC affinity and P2P checks.\n            assigned_physical_gpu_ids = parallel_config.assigned_physical_gpu_ids\n            if assigned_physical_gpu_ids is not None:\n                from vllm.platforms.interface import set_assigned_physical_gpu_ids\n\n                set_assigned_physical_gpu_ids(assigned_physical_gpu_ids)\n                assert self.local_rank < len(assigned_physical_gpu_ids), (\n                    f\"local_rank {self.local_rank} is out of bounds for \"\n                    f\"assigned_physical_gpu_ids {assigned_physical_gpu_ids}\"\n                )\n                # NOTE(patch pr45026): local_world_size is derived from\n                # parallel_config.nnodes, which is only set for the \"mp\"\n                # multi-node backend. With the \"ray\"/\"external_launcher\"\n                # backends nnodes stays 1, so local_world_size collapses to\n                # the full world_size and this check wrongly fires on\n                # cross-node deployments. assigned_physical_gpu_ids is already\n                # per-node and the local_rank bound above fully validates the\n                # mapping for these backends, so skip the check for them.\n                if parallel_config.distributed_executor_backend not in (\n                    \"ray\",\n                    \"external_launcher\",\n                ):\n                    assert self.parallel_config.local_world_size <= len(\n                        assigned_physical_gpu_ids\n                    ), (\n                        f\"local_world_size ({self.parallel_config.local_world_size})\"\n                        \" exceeds assigned_physical_gpu_ids count \"\n                        f\"({len(assigned_physical_gpu_ids)})\"\n                    )\n            else:\n                assert self.local_rank < torch.accelerator.device_count(), (\n                    f\"DP adjusted local rank {self.local_rank} is out of \"\n                    f\"bounds for {torch.accelerator.device_count()} devices.\"\n                )\n\n            visible_device_index = (\n                current_platform.logical_device_id_to_visible_device_id(self.local_rank)\n            )\n            self.device = torch.device(f\"cuda:{visible_device_index}\")\n            torch.accelerator.set_device_index(self.device)\n\n            current_platform.check_if_supports_dtype(self.model_config.dtype)\n\n            # Initialize the distributed environment BEFORE taking\n            # memory snapshot\n            # This ensures NCCL buffers are allocated before we measure\n            # available memory\n            init_worker_distributed_environment(\n                self.vllm_config,\n                self.rank,\n                self.distributed_init_method,\n                self.local_rank,\n                current_platform.dist_backend,\n            )\n\n            if self.use_v2_model_runner:\n                logger.info_once(\"Using V2 Model Runner\")\n\n            # Set random seed.\n            set_random_seed(self.model_config.seed)\n\n            # Now take memory snapshot after NCCL is initialized\n            gc.collect()\n            torch.accelerator.empty_cache()\n\n            # take current memory snapshot\n            self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)\n            self.requested_memory = request_memory(init_snapshot, self.cache_config)\n            logger.debug(\"worker init memory snapshot: %r\", self.init_snapshot)\n            logger.debug(\n                \"worker requested memory: %sGiB\", format_gib(self.requested_memory)\n            )\n        else:\n            raise RuntimeError(f\"Unsupported device type: {self.device_config.device}\")\n\n        # Initialize workspace manager\n        num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1\n        init_workspace_manager(self.device, num_ubatches)\n\n        # Construct the model runner\n        if self.use_v2_model_runner:\n            from vllm.v1.worker.gpu.model_runner import (\n                GPUModelRunner as GPUModelRunnerV2,\n            )\n\n            # HACK(woosuk): This is a temporary fix to avoid type errors.\n            self.model_runner: GPUModelRunner = GPUModelRunnerV2(  # type: ignore\n                self.vllm_config, self.device\n            )\n        else:\n            from vllm.v1.worker.gpu_model_runner import (\n                GPUModelRunner as GPUModelRunnerV1,\n            )\n\n            self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)",
+      "elide": [
+        "NCCL_ASYNC_ERROR_HANDLING 清理（L306-L307）一句带过；assigned_physical_gpu_ids 块（L328-L357，含 pr45026 补丁注释）整体压一行；workspace manager（L404-L406）与 usage stats（L425-L427）删；use_v2_model_runner 分支（L384-L385、L409-L417）留作『V2 实验线并存、全书锚定 V1』的脚注证据"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_worker.py",
+      "lines": "L435-L450",
+      "code": "    def load_model(self, *, load_dummy_weights: bool = False) -> None:\n        with (\n            self._maybe_get_memory_pool_context(tag=\"weights\"),\n            set_current_vllm_config(self.vllm_config),\n            # 20 MiB is the minimum PyTorch allows for max_split_size_mb.\n            self._scoped_allocator_max_split(max_split_size_mb=20),\n        ):\n            self.model_runner.load_model(load_dummy_weights=load_dummy_weights)\n\n        if self.vllm_config.weight_transfer_config is not None:\n            self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(\n                self.vllm_config.weight_transfer_config,\n                self.vllm_config,\n                self.device,\n                self.model_runner.get_model(),\n            )",
+      "elide": [
+        "weight_transfer_engine（L444-L450）是 RL 权重热更，删；要点是 _maybe_get_memory_pool_context(tag='weights')——CuMem 池让 sleep/wake 能整池归还"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_worker.py",
+      "lines": "L649-L676",
+      "code": "    @instrument(span_name=\"Allocate KV cache\")\n    def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:\n        \"\"\"Allocate GPU KV cache with the specified kv_cache_config.\"\"\"\n\n        # Update local config with adjusted num blocks after profiling,\n        # so that it's available to the warmup stage.\n        self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks\n\n        # Init kv cache connector here, because it requires\n        # `kv_cache_config`.\n        # NOTE(Kuntai): This need to be done before `initialize_kv_cache`,\n        # because `initialize_kv_cache` will inject kv cache groups not\n        # related to kv cache connector (e.g. kv cache sharing layers).\n        ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)\n\n        with self._maybe_get_memory_pool_context(tag=\"kv_cache\"):\n            self.model_runner.initialize_kv_cache(kv_cache_config)\n\n        if self.model_config.enable_return_routed_experts:\n            self.model_runner.init_routed_experts_capturer()\n\n        # Build KV-zero metadata outside the CuMem pool so the bookkeeping\n        # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch\n        # allocator and are not discarded during sleep/wake cycles.\n        if kv_cache_config.needs_kv_cache_zeroing and hasattr(\n            self.model_runner, \"_init_kv_zero_meta\"\n        ):\n            self.model_runner._init_kv_zero_meta()",
+      "elide": [
+        "ensure_kv_transfer_initialized 先于 initialize_kv_cache 的 NOTE（L657-L662）值得讲（KV connector 要先看到 config，ch16 接点）；routed_experts/KV-zero 尾部（L667-L676）各一句带过"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_worker.py",
+      "lines": "L678-L717",
+      "code": "    @instrument(span_name=\"Warmup (GPU)\")\n    def compile_or_warm_up_model(self) -> CompilationTimes:\n        warmup_sizes: list[int] = []\n\n        if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:\n            # warm up sizes that are not in cudagraph capture sizes,\n            # but users still want to compile for better performance,\n            # e.g. for the max-num-batched token size in chunked prefill.\n            compile_sizes = self.vllm_config.compilation_config.compile_sizes\n            warmup_sizes = compile_sizes.copy() if compile_sizes is not None else []  # type: ignore[assignment]\n            cg_capture_sizes: list[int] = []\n\n            if self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:\n                cg_sizes = self.vllm_config.compilation_config.cudagraph_capture_sizes\n                cg_capture_sizes = [] if cg_sizes is None else cg_sizes\n                warmup_sizes = [x for x in warmup_sizes if x not in cg_capture_sizes]\n\n            compile_ranges = self.vllm_config.compilation_config.get_compile_ranges()\n            # For each compile_range, if none of the batch sizes\n            # in warmup_sizes or cudagraph_capture_sizes are in the range,\n            # add the end of the range to ensure compilation/warmup.\n            all_sizes = set(cg_capture_sizes)\n            all_sizes.update([x for x in warmup_sizes if isinstance(x, int)])\n            for compile_range in compile_ranges:\n                if not any(x in compile_range for x in all_sizes):\n                    warmup_sizes.append(compile_range.end)\n\n        # We skip EPLB here since we don't want to record dummy metrics\n        for size in sorted(warmup_sizes, reverse=True):\n            logger.info(\"Compile and warming up model for size %d\", size)\n            self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)\n        self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)\n\n        # Warmup and tune the kernels used during model execution before\n        # cuda graph capture.\n        kernel_warmup(self)\n\n        cuda_graph_memory_bytes = 0\n        if not self.model_config.enforce_eager:\n            cuda_graph_memory_bytes = self.model_runner.capture_model()",
+      "elide": [
+        "compile_ranges 补边界尺寸（L695-L703）压两行；本段讲 warmup 编排『从大到小』与 kernel_warmup→capture_model 次序——为什么 warmup 在 capture 前（先让 JIT/调优发生再录图）"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_worker.py",
+      "lines": "L793-L853",
+      "code": "        if self.use_v2_model_runner:\n            # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.\n            warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)\n        elif get_pp_group().is_last_rank:\n            # V1: Warm up sampler and preallocate memory buffer for logits and other\n            # sampling related tensors of max possible shape to avoid memory\n            # fragmentation issue.\n            # NOTE: This is called after `capture_model` on purpose to prevent\n            # memory buffers from being cleared by `torch.accelerator.empty_cache`.\n            max_num_reqs = min(\n                self.scheduler_config.max_num_seqs,\n                self.scheduler_config.max_num_batched_tokens,\n            )\n\n            # We skip EPLB here since we don't want to record dummy metrics\n            hidden_states, last_hidden_states = self.model_runner._dummy_run(\n                num_tokens=max_num_reqs,\n                skip_eplb=True,\n                cudagraph_runtime_mode=CUDAGraphMode.NONE,\n            )\n            if self.model_runner.is_pooling_model:\n                self.model_runner._dummy_pooler_run(hidden_states)\n            else:\n                self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)\n\n        # Reset the seed to ensure that the random state is not affected by\n        # the model initialization and profiling.\n        set_random_seed(self.model_config.seed)\n\n        # Eagerly trigger inductor's once-per-process lazy inits during\n        # warmup (rather than on a later compile cache-miss at runtime).\n        c_config = self.compilation_config\n        if c_config.mode != CompilationMode.NONE and c_config.backend == \"inductor\":\n            from vllm.compilation.compiler_interface import (\n                trigger_inductor_lazy_init,\n            )\n\n            trigger_inductor_lazy_init(self.device)\n\n        # All warmup is done — start monitoring for unexpected JIT\n        # compilations that would cause latency spikes during inference.\n        from vllm.utils.jit_monitor import activate as activate_jit_monitor\n\n        activate_jit_monitor(\n            mode=self.observability_config.jit_monitor_mode,\n            verbose=self.observability_config.jit_monitor_verbose,\n        )\n\n        # Freeze the worker heap so the GC won't scan static objects\n        # (model weights, KV caches, CUDA graphs) during inference.\n        freeze_gc_heap()\n        maybe_attach_gc_debug_callback()\n\n        # Warmup / first-compile is done — activate the `VLLM_GPU_SYNC_CHECK`\n        # gate so subsequent `execute_model` / `sample_tokens` calls enforce it.\n        enable_gpu_sync_check()\n\n        return CompilationTimes(\n            language_model=self.compilation_config.compilation_time,\n            encoder=self.compilation_config.encoder_compilation_time,\n        )",
+      "elide": [
+        "150MiB 冗余缓冲与 kv-cache-memory 建议日志（L735-L791）归 ch14 显存账，删；本段收尾链：_dummy_sampler_run 在 capture 之后是有意的（NOTE 原话防 empty_cache 清缓冲）→ inductor 惰性初始化前移 → JIT 纠察 → freeze_gc → enable_gpu_sync_check——『运行期零惊喜』的收口"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_worker.py",
+      "lines": "L1010-L1107",
+      "code": "    @torch.inference_mode()\n    @with_gpu_sync_check\n    def sample_tokens(\n        self, grammar_output: \"GrammarOutput | None\"\n    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:\n        return self.model_runner.sample_tokens(grammar_output)\n\n    @torch.inference_mode()\n    @with_gpu_sync_check\n    def execute_model(\n        self, scheduler_output: \"SchedulerOutput\"\n    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:\n        # ensure any previous non-blocking PP sends are complete\n        if self._pp_send_work:\n            for handle in self._pp_send_work:\n                handle.wait()\n            self._pp_send_work = []\n\n        intermediate_tensors = None\n        forward_pass = scheduler_output.total_num_scheduled_tokens > 0\n        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens\n        all_gather_tensors = {}\n        compilation_config = self.vllm_config.compilation_config\n        parallel_config = self.vllm_config.parallel_config\n\n        if (\n            parallel_config.pipeline_parallel_size > 1\n            and compilation_config.pass_config.enable_sp\n            and forward_pass\n        ):\n            # currently only supported by V1 GPUModelRunner\n            assert not self.use_v2_model_runner\n            num_scheduled_tokens_np = np.array(\n                list(scheduler_output.num_scheduled_tokens.values()),\n                dtype=np.int32,\n            )\n            # TODO(lucas): This is pretty gross; ideally we should only ever call\n            # `_determine_batch_execution_and_padding` once (will get called again\n            # in `execute_model`) but this requires a larger refactor of PP.\n            _, batch_desc, _, _, _ = (\n                self.model_runner._determine_batch_execution_and_padding(\n                    num_tokens=num_scheduled_tokens,\n                    num_reqs=len(num_scheduled_tokens_np),\n                    num_scheduled_tokens_np=num_scheduled_tokens_np,\n                    max_num_scheduled_tokens=num_scheduled_tokens_np.max(),\n                    use_cascade_attn=False,  # TODO(lucas): Handle cascade attention\n                )\n            )\n            all_gather_tensors = {\n                \"residual\": not is_residual_scattered_for_sp(\n                    self.vllm_config, batch_desc.num_tokens\n                )\n            }\n\n        if forward_pass and not get_pp_group().is_first_rank:\n            tensor_dict, comm_handles, comm_postprocess = (\n                get_pp_group().irecv_tensor_dict(\n                    all_gather_group=get_tp_group(),\n                    all_gather_tensors=all_gather_tensors,\n                )\n            )\n            assert tensor_dict is not None\n            intermediate_tensors = AsyncIntermediateTensors(\n                tensor_dict,\n                comm_handles=comm_handles,\n                comm_postprocess=comm_postprocess,\n            )\n\n        with self.annotate_profile(scheduler_output):\n            output = self.model_runner.execute_model(\n                scheduler_output, intermediate_tensors\n            )\n            if (\n                self.use_v2_model_runner\n                and self.model_runner.is_pooling_model\n                and output is None\n            ):\n                output = self.model_runner.pool()  # type: ignore\n            if isinstance(\n                output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType\n            ):\n                return output\n\n        assert isinstance(output, IntermediateTensors)\n        parallel_config = self.vllm_config.parallel_config\n        assert (\n            parallel_config.distributed_executor_backend != \"external_launcher\"\n            and not get_pp_group().is_last_rank\n        )\n\n        # launch non-blocking send of intermediate tensors\n        self._pp_send_work = get_pp_group().isend_tensor_dict(\n            output.tensors,\n            all_gather_group=get_tp_group(),\n            all_gather_tensors=all_gather_tensors,\n        )\n\n        return None",
+      "elide": [
+        "enable_sp 序列并行分支（L1035-L1062）删（实验特性）；annotate_profile（L1078）一句带过；要点三条：@with_gpu_sync_check 装饰（v0.27 运行期同步 tripwire）、_pp_send_work 收割→irecv→转调的三段接力、非末 rank isend 后 return None"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L437-L451",
+      "code": "class ExecuteModelState(NamedTuple):\n    \"\"\"Ephemeral cached state transferred between execute_model() and\n    sample_tokens(), after execute_model() returns None.\"\"\"\n\n    scheduler_output: \"SchedulerOutput\"\n    logits: torch.Tensor\n    spec_decode_metadata: SpecDecodeMetadata | None\n    spec_decode_common_attn_metadata: CommonAttentionMetadata | None\n    hidden_states: torch.Tensor\n    sample_hidden_states: torch.Tensor\n    aux_hidden_states: list[torch.Tensor] | None\n    ec_connector_output: ECConnectorOutput | None\n    cudagraph_stats: CUDAGraphStat | None\n    slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None",
+      "elide": [
+        "无省略——两段之间的暂存协议本体；10 个字段里本章只需讲 scheduler_output/logits/hidden_states 三件，spec 元数据归 ch33、slot_mappings 归 ch22、cudagraph_stats 归 ch19"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L4165-L4178",
+      "code": "    @torch.inference_mode()\n    def execute_model(\n        self,\n        scheduler_output: \"SchedulerOutput\",\n        intermediate_tensors: IntermediateTensors | None = None,\n    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:\n        if self.execute_model_state is not None:\n            raise RuntimeError(\n                \"State error: sample_tokens() must be called \"\n                \"after execute_model() returns None.\"\n            )\n\n        if self.routed_experts_initialized:\n            self.routed_experts_capturer.clear_buffer()",
+      "elide": [
+        "断言原文『State error: sample_tokens() must be called after execute_model() returns None.』是双向契约的入口半边（出口半边在 L4556-L4564 的 execute_model_state is None 早退）；routed_experts 两行（L4177-L4178）删"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L4506-L4535",
+      "code": "                model_output_broadcast_data: dict[str, Any] = {}\n                if logits is not None:\n                    model_output_broadcast_data[\"logits\"] = logits.contiguous()\n\n                broadcasted = get_pp_group().broadcast_tensor_dict(\n                    model_output_broadcast_data, src=len(get_pp_group().ranks) - 1\n                )\n                assert broadcasted is not None\n                logits = broadcasted[\"logits\"]\n\n        self.execute_model_state = ExecuteModelState(\n            scheduler_output,\n            logits,\n            spec_decode_metadata,\n            spec_decode_common_attn_metadata,\n            hidden_states,\n            sample_hidden_states,\n            aux_hidden_states,\n            ec_connector_output,\n            cudagraph_stats,\n            slot_mappings,\n        )\n        self.kv_connector_output = kv_connector_output\n\n        # Now the batch has been launched we can wait for corrections from the\n        # previous model forward without breaking async scheduling.\n        if deferred_state_corrections_fn:\n            deferred_state_corrections_fn()\n\n        return None",
+      "elide": [
+        "PP logits broadcast 段（L4506-L4514，非末段把 logits 汇回末段）一句带过归 ch34；打包→kv_connector_output 暂存→延迟纠偏回调（L4529-L4533，ch12 异步调度的纠偏尾巴）→return None 是本章正片"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L4552-L4592",
+      "code": "    @torch.inference_mode\n    def sample_tokens(\n        self, grammar_output: \"GrammarOutput | None\"\n    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:\n        if self.execute_model_state is None:\n            kv_connector_output = self.kv_connector_output\n            self.kv_connector_output = None\n            # receive sampled token ids from the last PP rank.\n            if self.use_async_scheduling and not get_pp_group().is_last_rank:\n                self._pp_receive_prev_sampled_token_ids_to_input_batch()\n            # In case of PP with kv transfer, we need to pass through the\n            # kv_connector_output\n            return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)\n\n        # Unpack ephemeral state.\n        (\n            scheduler_output,\n            logits,\n            spec_decode_metadata,\n            spec_decode_common_attn_metadata,\n            hidden_states,\n            sample_hidden_states,\n            aux_hidden_states,\n            ec_connector_output,\n            cudagraph_stats,\n            slot_mappings,\n        ) = self.execute_model_state\n        # Clear ephemeral state.\n        self.execute_model_state = None\n\n        # Apply structured output bitmasks if present.\n        if grammar_output is not None:\n            apply_grammar_bitmask(\n                scheduler_output, grammar_output, self.input_batch, logits\n            )\n\n        with record_function_or_nullcontext(\"gpu_model_runner: sample\"):\n            sampler_output = self._sample(logits, spec_decode_metadata)\n\n        self._update_states_after_model_execute(\n            sampler_output.sampled_token_ids, scheduler_output",
+      "elide": [
+        "execute_model_state is None 的早退分支（L4556-L4564）含两义：非末 PP rank 纯透传 + KV connector 输出直通——讲第一义即可；解包即清（L4579-L4580）→bitmask（L4582-L4586）→_sample（L4588-L4589）三连是正片；_update_states_after_model_execute 之后（L4591 起）的 PP 广播/drafter/bookkeeping 分别归 ch34/ch33/ch18"
+      ]
+    },
+    {
+      "path": "vllm/platforms/cuda.py",
+      "lines": "L307-L313",
+      "code": "    @classmethod\n    def check_and_update_config(cls, vllm_config: VllmConfig) -> None:\n        parallel_config = vllm_config.parallel_config\n        model_config = vllm_config.model_config\n\n        if parallel_config.worker_cls == \"auto\":\n            parallel_config.worker_cls = \"vllm.v1.worker.gpu_worker.Worker\"",
+      "elide": [
+        "无省略——worker_cls='auto' 的解析点：硬件适配轴的分发不在执行器而在平台插件（CUDA 平台给出 gpu_worker.Worker；ROCm/XPU/CPU 平台各给各的）"
+      ]
+    },
+    {
+      "path": "vllm/v1/serial_utils.py",
+      "lines": "L486-L514",
+      "code": "def run_method(\n    obj: Any,\n    method: str | bytes | Callable,\n    args: tuple[Any, ...],\n    kwargs: dict[str, Any],\n) -> Any:\n    \"\"\"\n    Run a method of an object with the given arguments and keyword arguments.\n    If the method is string, it will be converted to a method using getattr.\n    If the method is serialized bytes and will be deserialized using\n    cloudpickle.\n    If the method is a callable, it will be called directly.\n    \"\"\"\n    if isinstance(method, bytes):\n        func = partial(cloudpickle.loads(method), obj)\n    elif isinstance(method, str):\n        try:\n            func = getattr(obj, method)\n        except AttributeError:\n            raise NotImplementedError(\n                f\"Method {method!r} is not implemented.\"\n            ) from None\n    else:\n        func = partial(method, obj)  # type: ignore\n    return func(*args, **kwargs)\n\n\nclass PydanticMsgspecMixin:\n    \"\"\"Make a ``msgspec.Struct`` compatible with Pydantic for both",
+      "elide": [
+        "无省略——uni 直调的派发底层：str→getattr / bytes→cloudpickle / callable→直接调，与 worker_busy_loop（multiproc L1004-L1010）逐分支同构——『一个抽象两种拓扑』的最小证据"
+      ]
+    }
+  ],
+  "theory": [
+    {
+      "topic": "三层职责的正交性：两个变化轴为什么互不牵连",
+      "detail": "进程编排轴（uni/mp/ray/external_launcher/自定义 qualname，枚举在 get_class 的 elif 链）× 硬件适配轴（worker_cls 字符串 → 平台插件解析，platforms/cuda.py:L312-L313）。加一种硬件 = 换 worker_cls 字符串，executor 代码零改动；换 ray 编排 = 换 executor 类，worker/runner 复用。第三问『这一拍怎么算』（ModelRunner）对前两问完全无感——它只认 (scheduler_output, intermediate_tensors) 签名，不知道自己跑在第几个进程。正交的代价 = 调用栈变深：一次 execute_model 要穿 executor 薄封装 → collective_rpc（uni 直调 / mp 广播）→ wrapper __getattr__ → Worker → runner，共 5 层间接。"
+    },
+    {
+      "topic": "星形广播的 IO 账：一次 enqueue vs N 份 pickle",
+      "detail": "v0 逐 worker pickle-RPC：同一指令序列化 N 份、走 N 条 pipe，O(N) 发送；mp 的 SHM MessageQueue 让 N 个 reader 共享同一块广播数据，enqueue 一次 O(1)。应答侧不对称：广播 1 条 MQ、应答 N 条 MQ（每 worker 一条 MessageQueue(1,1)，multiproc_executor.py:L585）；execute_model 经 output_rank 把应答收敛回 1 条（只 dequeue response_mqs[output_rank]，L391-L392）。每引擎拍 mp 下共两次广播（execute_model + sample_tokens）+ 两次单点收割。SchedulerOutput 差量化保证广播字节不随 batch 线性涨（字段级差量的展开归 ch18）。"
+    },
+    {
+      "topic": "FutureWrapper FIFO 配对的正确性论证",
+      "detail": "futures_queue 用 appendleft 入队、result() 里 pop 出队（两端配合即 FIFO），与底层 response MQ 的 FIFO 同序。不变量：只要每个 FutureWrapper.result() 在取自己之前先排空队列中更早的 future（while not self.done(): future = pop(); future._wait_for_response()），就保证『第 k 个发出的 RPC 对应第 k 次 dequeue 的回复』——无需给每个 RPC 配 id 或独立通道。non_block 连发多个 RPC 时，后发的 future 在 result() 时顺手替先发的收尸，延迟被摊平。边界：timeout 未实现（result(timeout) 直接 raise）；aggregate 聚合只发生在 KV 输出场景（PD 解耦）。"
+    },
+    {
+      "topic": "两类失败的覆盖性",
+      "detail": "worker 方法抛异常（进程活着）：busy_loop 的 except 捕获 → (FAILURE, str) 回 MQ → get_response 抛 RuntimeError——同步、可定位（add_note 带回子进程栈）、引擎可决策。worker 进程被 OS 杀死（OOM kill/segfault，except 根本执行不到）：sentinel 就绪 → 监控线程 wait 返回 → is_failed + shutdown + failure_callback——异步、致命。两路并存才既报『方法错』又报『进程没了』；只有前者则 OOM 后 collective_rpc 永久阻塞在 dequeue；只有后者则普通异常也整机下线。"
+    },
+    {
+      "topic": "延迟初始化的时序约束为什么是硬的",
+      "detail": "子进程继承父进程环境后，平台插件（load_general_plugins，worker_base.py:L245-L247）可能注册/覆盖平台实现，而 CUDA context 绑定在第一次 torch.cuda 调用上——若 Worker 类在环境变量（CUDA_VISIBLE_DEVICES 等）注入前实例化，import 期解析的设备与实际可见设备错位。因此 Wrapper 把『记住身份』（rpc_rank/global_rank）与『真正实例化』（init_worker）拆成两步，中间留出 update_environment_variables 与插件加载的窗口。worker_cls 只收 qualname 字符串（L255-L259 明确拒绝传类）正是为了让类解析发生在子进程、正确的插件环境里。"
+    },
+    {
+      "topic": "NCCL 先于显存快照：一笔显存账",
+      "detail": "init_device 的注释（gpu_worker.py:L372-L375）自述动机：分布式初始化会分配 NCCL 通信 buffer（TP>1 时可达数百 MiB）；若先快照后初始化，这部分『已用』没被计入，determine_available_memory 算出的 KV 可用账会虚高，运行期才 OOM。顺序：init_worker_distributed_environment（L376-L382）→ gc.collect + empty_cache（L391-L392）→ MemorySnapshot（L395）。同型思路在 ch14 显存账本已立（profile 三步定账），本章角度是『这个顺序是 Worker 的责任』。"
+    },
+    {
+      "topic": "两段式的 GPU 空转账（从 runner 侧看契约收益）",
+      "detail": "串行排布『forward 完成→bitmask（CPU）→采样』下，每拍 GPU 多空转 T_bitmask（xgrammar 对大 batch 可观）。拆成 execute_model 返回 None + sample_tokens 独立调用后，EngineCore 在 ②发起后立刻算 bitmask（core.py:L597），等 future.result()（L602）时 forward 与 bitmask 并行——GPU 只等其中较大者。代价是契约形变 + mp 下第二个 RPC 跳 + ExecuteModelState 的隐式参数传递（10 个字段不走签名，读代码要追单槽 self.execute_model_state）。双向断言（L4171-L4175 / L4556-L4564）把『必须配对』升级为运行期硬约束。"
+    },
+    {
+      "topic": "uni 与 mp 的同构性：一个 run_method 三分支",
+      "detail": "uni 的 collective_rpc 落到 run_method（serial_utils.py:L486-L514）：str→getattr、bytes→cloudpickle.loads 后 partial(fn, obj)、callable→直接调；mp 的 worker_busy_loop（L1004-L1010）是同一三分支的跨进程版。这证明控制面抽象与拓扑无关：『方法名字符串 + 参数元组』是唯一跨线协议，worker 侧只多一层 __getattr__。AsyncOutputFuture（uniproc L26-L42）与 FutureWrapper（multiproc L70-L100）则分别封装『异步输出何时算好』——uni 等的是 D2H 事件、mp 等的是 MQ 回复。"
+    }
+  ],
+  "mechanisms": [
+    {
+      "id": "m1",
+      "name": "三层解耦职责分工：Executor 只答『在哪跑』/ Worker 只答『设备归谁管』/ ModelRunner 只答『这一拍怎么算』",
+      "kind": "layout",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/executor/abstract.py:L37-L48",
+        "vllm/v1/worker/worker_base.py:L39-L43",
+        "vllm/v1/worker/gpu_model_runner.py:L4166",
+        "vllm/platforms/cuda.py:L307-L313"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m2",
+      "name": "Executor.get_class 工厂分发：backend 字符串/type/自定义 qualname → Executor 子类",
+      "kind": "config",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/v1/executor/abstract.py:L47-L92"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m3",
+      "name": "UniProcExecutor：uni 直调形态（run_method 三分支 + AsyncOutputFuture 延迟等 D2H）——控制面最简对照",
+      "kind": "dataflow",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/v1/executor/uniproc_executor.py:L26-L42",
+        "vllm/v1/executor/uniproc_executor.py:L79-L121",
+        "vllm/v1/serial_utils.py:L486-L514"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m4",
+      "name": "MultiprocExecutor 拉起：SHM 广播 MQ + 逐 local_rank spawn WorkerProc + READY 握手 + 监控线程装配",
+      "kind": "dataflow",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/executor/multiproc_executor.py:L110-L234",
+        "vllm/v1/executor/multiproc_executor.py:L672-L723"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m5",
+      "name": "WorkerWrapperBase 延迟初始化：qualname 字符串解析 + envs→插件→实例化顺序约束 + __getattr__ 透传",
+      "kind": "protocol",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/worker/worker_base.py:L187-L226",
+        "vllm/v1/worker/worker_base.py:L230-L334"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m6",
+      "name": "平台插件轴：worker_cls='auto' 经 current_platform 解析到具体 Worker 类——硬件适配与进程编排解耦的分发点",
+      "kind": "config",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/platforms/cuda.py:L307-L313",
+        "vllm/v1/worker/worker_base.py:L250-L259"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m7",
+      "name": "Worker.init_device：DP local_rank 修正→选卡→分布式初始化刻意先于显存快照（NCCL buffer 计入已用）→构造 ModelRunner",
+      "kind": "dataflow",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/worker/gpu_worker.py:L303-L423",
+        "vllm/v1/worker/gpu_worker.py:L1347-L1389"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m8",
+      "name": "Worker 显存生命周期三锚点：load_model（CuMem tag=weights）/ determine_available_memory（profile）/ initialize_from_config（tag=kv_cache）",
+      "kind": "layout",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/v1/worker/gpu_worker.py:L435-L450",
+        "vllm/v1/worker/gpu_worker.py:L459-L611",
+        "vllm/v1/worker/gpu_worker.py:L649-L676"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m9",
+      "name": "compile_or_warm_up_model 启动期前移编排：warmup→kernel 调优→capture→sampler 预热→inductor 惰性初始化→JIT 纠察→freeze_gc→sync 纠察（深讲归 ch19，本章作为 Worker 生命周期收尾锚点）",
+      "kind": "dataflow",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/v1/worker/gpu_worker.py:L678-L853"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m10",
+      "name": "collective_rpc 控制面契约：一切引擎指令的统一入口 + 『only pass control messages, set up data-plane』——控制面/数据面分离",
+      "kind": "protocol",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/executor/abstract.py:L152-L202",
+        "vllm/v1/executor/abstract.py:L118-L150"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m11",
+      "name": "mp collective_rpc：enqueue 一次广播 → get_response 单点 dequeue → FutureWrapper 包装；callable 经 cloudpickle 整函数序列化",
+      "kind": "dataflow",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/executor/multiproc_executor.py:L321-L416"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m12",
+      "name": "FutureWrapper FIFO 排空：appendleft/pop 配对 + result() 先排干先于自己的 future——MQ FIFO 序即配对序",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/executor/multiproc_executor.py:L70-L100",
+        "vllm/v1/executor/multiproc_executor.py:L232"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true
+    },
+    {
+      "id": "m13",
+      "name": "worker_busy_loop 派发闭环：dequeue → getattr/反序列化 → 执行 → output_rank 过滤回写；异常 add_note 转 FAILURE",
+      "kind": "dataflow",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/executor/multiproc_executor.py:L946-L1022"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m14",
+      "name": "output_rank 单点收割：_get_output_rank = world_size - tp_size*pcp_size（最后 PP 段 TP rank0）——TP 冗余输出只收一份",
+      "kind": "dataflow",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/v1/executor/multiproc_executor.py:L509-L523",
+        "vllm/v1/executor/multiproc_executor.py:L321-L343"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m15",
+      "name": "两段式契约：execute_model 打包 ExecuteModelState 暂存返回 None → sample_tokens 解包即清→bitmask→_sample；双向断言防乱序",
+      "kind": "protocol",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/worker/worker_base.py:L142-L157",
+        "vllm/v1/engine/core.py:L584-L614",
+        "vllm/v1/worker/gpu_model_runner.py:L437-L451",
+        "vllm/v1/worker/gpu_model_runner.py:L4165-L4175",
+        "vllm/v1/worker/gpu_model_runner.py:L4516-L4535",
+        "vllm/v1/worker/gpu_model_runner.py:L4552-L4589"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true
+    },
+    {
+      "id": "m16",
+      "name": "Worker 的 PP 接力：上拍 isend 句柄收割 → 非首 rank irecv 成 AsyncIntermediateTensors（__getattribute__ 懒同步）→ 非末 rank isend 中间张量（全貌归 ch34）",
+      "kind": "dataflow",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/v1/worker/gpu_worker.py:L96-L125",
+        "vllm/v1/worker/gpu_worker.py:L1017-L1107"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m17",
+      "name": "失败两路：方法异常→(FAILURE,str) 回 MQ→RuntimeError；进程死亡→sentinel 监控→failure_callback→EXECUTOR_FAILED 入引擎输入队列",
+      "kind": "protocol",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/v1/executor/multiproc_executor.py:L279-L319",
+        "vllm/v1/executor/multiproc_executor.py:L394-L410",
+        "vllm/v1/engine/core.py:L1029-L1031",
+        "vllm/v1/engine/core.py:L134-L135"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m18",
+      "name": "关停协议：death pipe 父进程退出感知（EOFError→自清理）+ shutdown 关 death_writer→graceful→SIGTERM→SIGKILL 三级 + weakref.finalize 兜底",
+      "kind": "protocol",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/v1/executor/multiproc_executor.py:L683-L687",
+        "vllm/v1/executor/multiproc_executor.py:L795-L818",
+        "vllm/v1/executor/multiproc_executor.py:L470-L503",
+        "vllm/v1/executor/multiproc_executor.py:L418-L468"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m19",
+      "name": "worker_extension_cls 动态注入：把扩展类塞进 worker_class.__bases__ 扩展 collective_rpc 可调面（OOT/RL 插件扩展点）",
+      "kind": "config",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/v1/worker/worker_base.py:L261-L287"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m20",
+      "name": "supports_async_scheduling 声明面 + worker 侧 async_output_copy_thread：把 D2H 输出拷贝挪出 busy loop（消费侧 batch_queue 流水 ch12 已立）",
+      "kind": "config",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/v1/executor/uniproc_executor.py:L145-L147",
+        "vllm/v1/executor/multiproc_executor.py:L525-L527",
+        "vllm/v1/executor/multiproc_executor.py:L650-L659",
+        "vllm/v1/executor/multiproc_executor.py:L969-L995"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    }
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {
+        "what": "ray 后端两条分支（RayExecutorV2 / RayDistributedExecutor 及 VLLM_USE_RAY_V2_EXECUTOR_BACKEND 判断，abstract.py:L60-L68）与 ExecutorWithExternalLauncher 全类（uniproc_executor.py:L150-L196）",
+        "why_safe": "本章以 uni/mp 讲清工厂分发与控制平面；ray 是另一套编排（ch34 分布式章展开）、external_launcher 是 torchrun 离线特例。删后 get_class 保留 type/mp/uni/自定义 qualname 四条分支即可示范分发语义，uni/mp 控制流完全自洽"
+      },
+      {
+        "what": "多节点路径：DP-leader 日志（multiproc_executor.py:L135-L150）、peer_worker_response_mqs 跨节点装配（L209-L220）、_init_message_queues 的 else 分支（L587-L605）、get_response_mqs（L249-L258）",
+        "why_safe": "精简版聚焦单节点（nnodes_within_dp==1）：worker_response_mq = MessageQueue(1,1) 这条路径自洽；删跨节点装配不破坏单节点广播/应答闭环（v2 ch17 同款删法）"
+      },
+      {
+        "what": "kv_output_aggregator 聚合分支（collective_rpc 内 partial(aggregate) 与 KVOutputAggregator，multiproc_executor.py:L375-L382；Executor.init_kv_output_aggregator abstract.py:L280-L284）",
+        "why_safe": "属 PD 解耦/KV 连接器（ch16/ch36）主题；default aggregate=lambda x:x 时控制面完全等价，删聚合保留 unique_reply_rank 单 rank 应答即可"
+      },
+      {
+        "what": "平台/可观测性/特性开关装饰：OMPProcessManager 与 cpu_omp_manager 上下文（L174-L181）、inherited_fds fork 适配（L167-L195、L688-L690、L860-L868 保留 else 空表行为）、numa_utils 绑定（L712-L716、L881-L882）、set_worker_net_device（uniproc L59-L60、multiproc L853-L854）、VLLM_ELASTIC_EP_SCALE_UP_LAUNCH 分支（uniproc L65-L68、multiproc L645-L648）、maybe_init_worker_tracer（L871-L877）、setup_proc_title_and_log_prefix 全方法（L1024-L1058）、set_multiprocessing_worker_envs 的 OMP 调优体（L1061-L1089）、enable_envs_cache 保留调用可留",
+        "why_safe": "均为平台适配/可观测性/特性开关，与『拉起 worker→广播 RPC→收结果→失败/关停』主控制流正交；删后默认路径（CUDA 单节点同步调度）行为不变"
+      },
+      {
+        "what": "Worker 的生产特性面：sleep/wake_up/checkpoint_prepare/checkpoint_restore/_get_sleep_mode_backend（gpu_worker.py:L181-L254）、weight_transfer_engine 相关（L159-L162、L444-L450）、profiler/profile/annotate_profile（L164-L172、L984-L1008、L1112+）、worker_sentinel/handle_ft_command（L152-L154、L429-L431）、AsyncIntermediateTensors 之外的 SP/enable_sp 分支（L1035-L1062）、update_config/reload_weights/update_max_model_len（L452-L457、L637-L647）",
+        "why_safe": "这些是弹性/RL 权重传输/观测/序列并行/微调接口，正交于执行臂主线；删后 execute_model/sample_tokens/三锚点骨架完整。SP 分支删后 execute_model 从收割 isend 直接进 irecv 判定，控制流对 PP>1 基本路径仍正确"
+      },
+      {
+        "what": "GPUModelRunner 内部全部执行细节：_update_states/_prepare_inputs/_build_attention_metadata/_preprocess/_model_forward/postprocess 的 logits 提取细节/set_forward_context/持久缓冲/采样 bookkeeping/PP 广播分支（gpu_model_runner.py 除 L437-L451、L941、L4165-L4175、L4506-L4535、L4552-L4592 外的方法体全部退化为注释占位）",
+        "why_safe": "ch18（差量调和/固定地址）与 ch19（编译/捕获）全章展开的对象；本章精简版只需两段式状态机骨架：断言→（前向占位注释）→打包暂存→None；解包→（bitmask+_sample 调用保留）→返回。占位不改变契约行为可讲性（本章精简版以 executor/worker 控制面为主体，runner 只保接口）"
+      },
+      {
+        "what": "compile_or_warm_up_model 的内部细节：compile_ranges 补边界（L695-L703）、cudagraph 估算对比日志（L719-L733）、startup_plan 建议与落盘（L735-L791）、V2 warmup_kernels 分支（L793-L795）、pooling 分支（L813-L814）",
+        "why_safe": "保留编排骨架（warmup_sizes 循环 _dummy_run→kernel_warmup→capture_model→_dummy_sampler_run→trigger_inductor_lazy_init→activate_jit_monitor→freeze_gc_heap→enable_gpu_sync_check→返回 CompilationTimes）即可讲『启动期前移』的编排思想；细节归 ch19（编译/捕获）与 ch14（显存账）"
+      },
+      {
+        "what": "worker_extension_cls 动态注入体（worker_base.py:L261-L287）与 mm_receiver_cache 的构建分支（L295-L315 只留 shared_worker_lock 缺失时的 warning 早退）",
+        "why_safe": "OOT 扩展与多模态 shm 缓存是正交特性；_apply_mm_cache 在 mm_receiver_cache=None 时是 no-op（L336-L339），删构建分支后控制流不变"
+      }
+    ],
+    "must_keep": [
+      {
+        "symbol": "Executor.get_class",
+        "why": "工厂分发是本章主线第一站，mp/uni/自定义三条分支必须可见"
+      },
+      {
+        "symbol": "Executor._init_executor",
+        "why": "抽象钩子：连接 __init__ 与各 Executor 拉起逻辑的关键"
+      },
+      {
+        "symbol": "Executor.collective_rpc",
+        "why": "控制面唯一抽象入口，其 docstring 契约（L181-L183）必须逐字可见"
+      },
+      {
+        "symbol": "Executor.execute_model",
+        "why": "薄封装示范（abstract L221-L227）——一切指令皆 collective_rpc 的证据"
+      },
+      {
+        "symbol": "Executor.sample_tokens",
+        "why": "两段式第二入口的薄封装（abstract L241-L247）"
+      },
+      {
+        "symbol": "Executor.initialize_from_config",
+        "why": "KV 初始化也走控制面的示范（L118-L120）"
+      },
+      {
+        "symbol": "Executor.compile_or_warm_up_model",
+        "why": "启动期编排入口 + CompilationTimes 汇回（L122-L137）"
+      },
+      {
+        "symbol": "UniProcExecutor",
+        "why": "最简对照形态，读者理解控制面的起点"
+      },
+      {
+        "symbol": "UniProcExecutor._init_executor",
+        "why": "uni 拉起：driver_worker 在本进程 + init_worker/init_device/load_model 调用序（L46-L69）"
+      },
+      {
+        "symbol": "UniProcExecutor.collective_rpc",
+        "why": "直调三分支：not non_block 直调 / non_block 同步算完包 Future（L91-L106）"
+      },
+      {
+        "symbol": "AsyncOutputFuture",
+        "why": "uni 异步输出的包装：result() 才 get_output()（L26-L42）"
+      },
+      {
+        "symbol": "run_method",
+        "why": "str/bytes/callable 三分支派发底层，与 busy_loop 同构的最小证据"
+      },
+      {
+        "symbol": "MultiprocExecutor",
+        "why": "本章主角执行器：广播 MQ/握手/监控/关停全在此"
+      },
+      {
+        "symbol": "MultiprocExecutor._init_executor",
+        "why": "拉起主线：broadcast MQ→spawn→wait_for_ready→monitor→response_mqs→futures_queue（L110-L234）"
+      },
+      {
+        "symbol": "MultiprocExecutor.collective_rpc",
+        "why": "mp 控制面实现：enqueue/get_response/FutureWrapper（L354-L416）"
+      },
+      {
+        "symbol": "MultiprocExecutor.execute_model",
+        "why": "覆写带 unique_reply_rank=self.output_rank + 超时（L321-L331）"
+      },
+      {
+        "symbol": "MultiprocExecutor.sample_tokens",
+        "why": "两段式第二入口的 mp 覆写：unique_reply_rank=self.output_rank + 超时（L333-L343），与 execute_model 覆写成对出现"
+      },
+      {
+        "symbol": "MultiprocExecutor._get_output_rank",
+        "why": "单点收割公式 world_size - tp_size*pcp_size（L509-L523）"
+      },
+      {
+        "symbol": "FutureWrapper",
+        "why": "FIFO 排空巧思，核心算法机制（m12 worked example 的对象）"
+      },
+      {
+        "symbol": "futures_queue",
+        "why": "deque FIFO 配对正确性的载体（L232 构造）"
+      },
+      {
+        "symbol": "rpc_broadcast_mq",
+        "why": "SHM 广播实体：一次 enqueue 全 worker 可见"
+      },
+      {
+        "symbol": "response_mqs",
+        "why": "多对一应答通道（单节点=各 worker 的 worker_response_mq）"
+      },
+      {
+        "symbol": "output_rank",
+        "why": "应答收敛到单 rank 的字段（L247 装配）"
+      },
+      {
+        "symbol": "WorkerProc",
+        "why": "worker 子进程包装：出生/服役/死亡全在此类"
+      },
+      {
+        "symbol": "WorkerProc.__init__",
+        "why": "子进程出生主线：wrapper→init_worker→init_device→load_model（L607-L670）"
+      },
+      {
+        "symbol": "WorkerProc.worker_main",
+        "why": "子进程入口：信号→构造→READY→busy_loop、启动期/运行期失败分流（L820-L944）"
+      },
+      {
+        "symbol": "WorkerProc.worker_busy_loop",
+        "why": "服役主循环：dequeue→派发→执行→过滤回写（L997-L1022）"
+      },
+      {
+        "symbol": "WorkerProc.enqueue_output",
+        "why": "结果/异常→(SUCCESS/FAILURE) 协议（L950-L967）"
+      },
+      {
+        "symbol": "WorkerProc.handle_output",
+        "why": "同步直写/异步队列分叉（L969-L977）"
+      },
+      {
+        "symbol": "WorkerProc.ResponseStatus",
+        "why": "SUCCESS/FAILURE 枚举：失败回报协议"
+      },
+      {
+        "symbol": "WorkerProc.wait_for_ready",
+        "why": "READY 握手：父进程等 worker 全就绪（L746-L782）"
+      },
+      {
+        "symbol": "WorkerProc.make_worker_process",
+        "why": "spawn + ready/death pipe 建立（L672-L723）"
+      },
+      {
+        "symbol": "UnreadyWorkerProcHandle",
+        "why": "父进程侧 READY 前的 worker 句柄 dataclass（L531）：spawn 后 wait_for_ready 前的两态载体"
+      },
+      {
+        "symbol": "WorkerProcHandle",
+        "why": "READY 后的 worker 句柄 dataclass（L541）：worker_response_mq 在此挂接——父进程收割应答通道的来源"
+      },
+      {
+        "symbol": "WorkerProc.monitor_death_pipe",
+        "why": "父进程退出感知：EOFError→自清理（L795-L818）"
+      },
+      {
+        "symbol": "MultiprocExecutor.start_worker_monitor",
+        "why": "sentinel 进程级监控（L279-L313）"
+      },
+      {
+        "symbol": "MultiprocExecutor.register_failure_callback",
+        "why": "死亡传播给引擎的回调注册（L315-L319）"
+      },
+      {
+        "symbol": "MultiprocExecutor.shutdown",
+        "why": "关停编排：关 death_writer→三级终止→关 MQ（L470-L503）"
+      },
+      {
+        "symbol": "MultiprocExecutor._ensure_worker_termination",
+        "why": "graceful→SIGTERM→SIGKILL 三级（L418-L468）"
+      },
+      {
+        "symbol": "WorkerWrapperBase",
+        "why": "延迟初始化包装，本章四大主题之一"
+      },
+      {
+        "symbol": "WorkerWrapperBase.init_worker",
+        "why": "qualname 解析 + 顺序约束 + 实例化点（L230-L319）"
+      },
+      {
+        "symbol": "WorkerWrapperBase.update_environment_variables",
+        "why": "顺序约束第一步（L222-L227）"
+      },
+      {
+        "symbol": "WorkerWrapperBase.__getattr__",
+        "why": "透传魔法：collective_rpc getattr 命中的根基（L333-L334）"
+      },
+      {
+        "symbol": "WorkerWrapperBase.execute_model",
+        "why": "覆写先 _apply_mm_cache（L346-L351）——wrapper 在执行路径上的存在感"
+      },
+      {
+        "symbol": "resolve_obj_by_qualname",
+        "why": "字符串→类的解析函数（延迟初始化的机制件）"
+      },
+      {
+        "symbol": "WorkerBase",
+        "why": "硬件无关接口 + 两段式契约 docstring（L39-L43, L142-L157）"
+      },
+      {
+        "symbol": "WorkerBase.execute_model",
+        "why": "两段式契约文本本体"
+      },
+      {
+        "symbol": "WorkerBase.sample_tokens",
+        "why": "『iff execute_model returned None』配对文本（L153-L157）"
+      },
+      {
+        "symbol": "Worker",
+        "why": "GPU 具体 Worker：设备生命周期持有人"
+      },
+      {
+        "symbol": "Worker.init_device",
+        "why": "出生关键步：DP 修正→选卡→分布式先于快照→构造 runner（L303-L423）"
+      },
+      {
+        "symbol": "Worker.load_model",
+        "why": "tag=weights 池上下文（L435-L450）"
+      },
+      {
+        "symbol": "Worker.determine_available_memory",
+        "why": "profile 定 KV 账入口（骨架保留，账本细节 ch14）"
+      },
+      {
+        "symbol": "Worker.initialize_from_config",
+        "why": "tag=kv_cache 池内分配 + 先 ensure_kv_transfer_initialized（L649-L676）"
+      },
+      {
+        "symbol": "Worker.compile_or_warm_up_model",
+        "why": "启动期前移编排骨架（L678-L853）"
+      },
+      {
+        "symbol": "Worker.execute_model",
+        "why": "PP 接力 + 转调 runner（L1017-L1107）"
+      },
+      {
+        "symbol": "Worker.sample_tokens",
+        "why": "@with_gpu_sync_check + 直转 runner（L1010-L1015）"
+      },
+      {
+        "symbol": "with_gpu_sync_check",
+        "why": "v0.27 运行期同步纠察装饰器：gpu_sync_debug.py:L131 定义（CUDA 分支，非 CUDA 分支 L164 为 no-op），gpu_worker.py:L1011/L1018 装在 sample_tokens/execute_model 上，compile_or_warm_up_model 尾部 L848 enable_gpu_sync_check 开闸——启动期不查、运行期才查"
+      },
+      {
+        "symbol": "GPUModelRunner",
+        "why": "第三层主角（精简版只保两段式骨架）"
+      },
+      {
+        "symbol": "GPUModelRunner.execute_model",
+        "why": "入口状态机断言 + 打包暂存 + return None（L4165-L4175, L4516-L4535）"
+      },
+      {
+        "symbol": "GPUModelRunner.sample_tokens",
+        "why": "解包即清→bitmask→_sample（L4552-L4592）"
+      },
+      {
+        "symbol": "ExecuteModelState",
+        "why": "两段之间的暂存 NamedTuple（L437-L451）"
+      },
+      {
+        "symbol": "execute_model_state",
+        "why": "单槽字段：构造于 L941，双向断言的判据"
+      },
+      {
+        "symbol": "apply_grammar_bitmask",
+        "why": "bitmask 施加点（L4582-L4586）——与 ch9 ③拍 的接点"
+      },
+      {
+        "symbol": "AsyncIntermediateTensors",
+        "why": "PP 懒同步包装（L96-L125）"
+      },
+      {
+        "symbol": "init_worker_distributed_environment",
+        "why": "init_device 调的分布式初始化函数（L1347-L1389）"
+      },
+      {
+        "symbol": "supports_async_scheduling",
+        "why": "异步调度声明面（uni L145-L147 / mp L525-L527 / 基类默认 False L363-L368）"
+      }
+    ]
+  },
+  "foreshadow_due": {
+    "source": "v3 伏笔真相源 = book/cartography/pedagogy-plan.json foreshadows（bible.py due 是 v2 旧章号账本，不跑）",
+    "should_plant": [],
+    "should_payoff": [],
+    "note": "pedagogy-plan.foreshadows 无 planted=17 / paid=17 条目——本章不埋不收硬伏笔。本章是 Part V《GPU 不等 Python》开篇，天然携带前向指针（写作时以回指/展望处理，非伏笔登记）：① execute_model 内部的前向对读者是黑盒——站 10 返回 None 之前的 _update_states/_prepare_inputs（差量调和、固定地址缓冲）→ ch18 打开；② 编译与捕获（CustomOp/piecewise/CUDA Graph/forward context）→ ch19；③ 站 9 的 PP irecv/isend 接力只讲到懒同步一层 → ch34 分布式全貌；④ Worker 侧 async_output_copy_thread 与 supports_async_scheduling 是 ch12 已立异步调用的 worker 半边——写作时回指 ch12；⑤ spec drafter 在 sample_tokens 内跑 → ch33。反向衔接：ch9 已立五拍时序与两段式的外壳（②④拍），本章展开其墙内实现——写作时开篇即回指。"
+  },
+  "l2_spec": "book/cartography/l2-specs/ch17.json（同批产出；stations 与本档 stations 同一份账本）"
+}
