@@ -2864,8 +2864,18 @@ class InprocClient(EngineCoreClient):
     #   (ch4-ch7); this chapter stops once the EngineCore is assembled.
 
 
+# SOURCE: vllm/v1/engine/core_client.py:L503 MPClient (marker stub)
+class MPClient(EngineCoreClient):
+    # SUBTRACTED: shared mp machinery — ZMQ context + input/output sockets,
+    #   EngineCore process spawn + startup handshake, background output
+    #   handling (vllm/v1/engine/core_client.py:L503-L801) — the mp topology
+    #   is ch5; the hierarchy slot is kept so Sync/AsyncMPClient sit on their
+    #   real base class.
+    pass
+
+
 # SOURCE: vllm/v1/engine/core_client.py:L802 SyncMPClient (marker stub)
-class SyncMPClient(EngineCoreClient):
+class SyncMPClient(MPClient):
     # SUBTRACTED: ZMQ socket setup + EngineCore process spawn + background
     #   output thread (vllm/v1/engine/core_client.py:L802+) — the mp topology
     #   is ch5; on the host seam the client only records its inputs.
@@ -2877,7 +2887,7 @@ class SyncMPClient(EngineCoreClient):
 
 
 # SOURCE: vllm/v1/engine/core_client.py:L974 AsyncMPClient (marker stub)
-class AsyncMPClient(EngineCoreClient):
+class AsyncMPClient(MPClient):
     # SUBTRACTED: ZMQ asyncio sockets + engine process spawn + output_handler
     #   task (vllm/v1/engine/core_client.py:L974+) — same treatment as sync.
     def __init__(self, vllm_config, executor_class, log_stats,
@@ -3195,7 +3205,7 @@ class LLM:
     """Offline inference face: collects ~100 kwargs into EngineArgs, then
     walks the same assembly line as vllm serve."""
 
-    # SOURCE: vllm/entrypoints/llm.py:L295-L345 LLM.__init__ (kwarg subset)
+    # SOURCE: vllm/entrypoints/llm.py:L295-L345 EngineArgs collection in LLM.__init__ (def L177)
     def __init__(
         self,
         model: str,

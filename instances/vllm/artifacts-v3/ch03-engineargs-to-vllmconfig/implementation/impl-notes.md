@@ -30,6 +30,7 @@
 | `Executor.get_class` + `supports_async_scheduling` | vllm/v1/executor/abstract.py:L47-L92, L363-L368 | 查表逐字（type/ray/mp/uni/external_launcher）；ray-v2 子开关（L61-L64）与 qualname（L81-L87）删；Uni/Multiproc 覆写 True（uniproc:L146 / multiproc:L526 现核） | delete 项 7；工厂① |
 | `EngineCoreClient.make_client` / `make_async_mp_client` | vllm/v1/engine/core_client.py:L89-L139 | mp×asyncio 二维表逐字（async+非mp→NotImplementedError）；make_async_mp_client 的 DP 分流（L133-L138）删→直接 AsyncMPClient | delete 项 9；工厂③ |
 | `InprocClient` | core_client.py:L306-L317 | `__init__ = EngineCore(*args)` 逐字；请求面删 | must_keep：逃生舱格子 |
+| `MPClient` / `SyncMPClient` / `AsyncMPClient` | core_client.py:L503 / L802 / L974 | 层级保留（Sync/Async 继承 MPClient，与真实树一致）；MPClient 的 ZMQ/spawn 机身（L503-L801）与两客户端请求面删，stub 只记录入参（签名逐字对齐 L805-L815 / L977-L995） | 工厂③产物类；mp 拓扑属 ch5 |
 | `EngineCore.__init__` | vllm/v1/engine/core.py:L106-L234 | 装配主干保留：executor_class 实例化（L132）→ `_initialize_kv_caches`（L143，GPU profiling 删→stand-in seam）→ StructuredOutputManager → get_scheduler_cls（L147）→ 无 KV 守卫 → resolve_kv_cache_block_sizes → Scheduler(...) 装配（L160-L168）；spec/批队列/握手/step_fn 绑定删 | 章终点＝装配完成；运行循环属 ch9/ch12 |
 | `LLMEngine.from_engine_args` / `from_vllm_config` / `__init__` | vllm/v1/engine/llm_engine.py:L51-L186 | from_engine_args 逐字（含 VLLM_ENABLE_V1_MULTIPROCESSING 翻转 L174-L176）；__init__ 只保留 make_client(asyncio_mode=False) 调用，三件套删 | code_spine 起点；WC2 |
 | `AsyncLLM.from_engine_args` / `from_vllm_config` | vllm/v1/engine/async_llm.py:L205-L257 | 两个 classmethod 逐字；__init__ 只保留 make_async_mp_client（L149-L156） | 双使用面同一装配线证据 |
