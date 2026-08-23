@@ -167,9 +167,9 @@ docstring 自己说明用途：「post-initialization config that may differ fro
         return req, request.current_wave
 ```
 
-docstring 原话：「allow request initialization running in parallel with Model forward」。`Request.from_engine_core_request` 把线格式请求变成引擎自己的 `Request` 实体（顺带算好前缀哈希——前缀缓存要用的那本账，Part IV 展开）；带结构化输出约束的请求在这里启动 `grammar_init`（语法编译，异步的，编译完才允许被调度）。这些都是 CPU 大户，全放在 IO 线程做掉，忙循环只消费结果——这是「慢操作出循环」清单的第一笔，后面还会看到 encoding、detokenize、GC 各归各位。两段「Note on thread safety: no race condition」注释值得多看一眼：它们不是拍胸脯，是在说明**为什么**无竞态——这个方法只在输入线程被调用、编译又是异步的，忙循环摸到请求时编译早已在别处排队。预处理抛错也不炸引擎，走该请求自己的 ERROR 回程（`_handle_request_preproc_error`，`core.py:L1829-L1836`）。
+docstring 原话：「allow request initialization running in parallel with Model forward」。`Request.from_engine_core_request` 把线格式请求变成引擎自己的 `Request` 实体（顺带算好前缀哈希——前缀缓存要用的那本账，Part IV 展开）；带结构化输出约束的请求在这里启动 `grammar_init`（语法编译，异步的，编译完才允许被调度）。这些都是 CPU 大户，全放在 IO 线程做掉，忙循环只消费结果——这是「慢操作出循环」清单的第一笔，后面还会看到 encoding、detokenize、GC（garbage collection，Python 垃圾回收）各归各位。两段「Note on thread safety: no race condition」注释值得多看一眼：它们不是拍胸脯，是在说明**为什么**无竞态——这个方法只在输入线程被调用、编译又是异步的，忙循环摸到请求时编译早已在别处排队。预处理抛错也不炸引擎，走该请求自己的 ERROR 回程（`_handle_request_preproc_error`，`core.py:L1829-L1836`）。
 
-数据从此归位：IO 线程把 `(request_type, request)` 投进 `input_queue`，这个对象此后归引擎进程独占可变（第 1 站到此）。忙循环消费侧的分派函数 `_handle_client_request`（`core.py:L1507-L1540`）按消息类型走：ADD 转 `EngineCore.add_request` 校验后交调度器登记进 waiting 队尾（`scheduler.py:L2213-L2231`），ABORT 落 `abort_requests`，UTILITY 走[第 5 章](../../ch05-zmq-topology-and-protocol/narrative/chapter.md)讲过的反射薄 RPC，WAKEUP 哨兵直接 return（它的戏在收场一节）。
+数据从此归位：IO 线程把 `(request_type, request)` 投进 `input_queue`，这个对象此后归引擎进程独占可变（第 1 站到此）。忙循环消费侧的分派函数 `_handle_client_request`（`core.py:L1507-L1540`）按消息类型走：ADD 转 `EngineCore.add_request` 校验后交调度器登记进 waiting 队尾（`scheduler.py:L2213-L2231`；章图同一锚标到 L2235——那是整个函数体，尾四行是 KV connector 钩子与统计事件，本论断只到登记入队），ABORT 落 `abort_requests`，UTILITY 走[第 5 章](../../ch05-zmq-topology-and-protocol/narrative/chapter.md)讲过的反射薄 RPC，WAKEUP 哨兵直接 return（它的戏在收场一节）。
 
 ## 轮子：忙循环，专职而不空转
 
@@ -230,7 +230,8 @@ vLLM 三种各用在各自该在的地方。看骨架（[第 1 章](../../ch01-v
                 # Drain aborts queue; all aborts are also processed via input_queue.
                 with self.aborts_queue.mutex:
                     self.aborts_queue.queue.clear()
-                # … 省略：两行 DEBUG 日志（"waiting for work" / waited 标记）…
+                # … 省略：两行 DEBUG 日志（"waiting for work" / waited 标记），
+                #       及循环外睡醒补记的 "EngineCore loop active." 日志行 …
             block = self.process_input_queue_block
             try:
                 req = self.input_queue.get(block=block)
@@ -282,7 +283,7 @@ vLLM 三种各用在各自该在的地方。看骨架（[第 1 章](../../ch01-v
 
 ### CPU 占用账：三种状态，没有一种空转
 
-把忙循环的 CPU 占用按状态结一遍账：**有请求时**，一拍的耗时由 `step_fn` 主导（GPU 忙，单线程 Python 跟着 GPU 的拍子走）；**空闲时**，阻塞在 `input_queue.get(block=True)` 上，占用为零；**等远端 KV 的窄场景**，1ms 限频轮询，占用有界且低频。同一个「慢操作出循环」的纪律还有两笔零碎：启动期把 GC 堆冻结（`freeze_gc_heap`，`core.py:L240-L242`——权重、KV cache 这些启动期分配的大对象不再被反复扫描，GC（Python 垃圾回收，回收时全场停一下造成卡顿）的停顿随之变短变少）、环境变量读取缓存——都是把「可能让循环停顿的东西」提前搬走。
+把忙循环的 CPU 占用按状态结一遍账：**有请求时**，一拍的耗时由 `step_fn` 主导（GPU 忙，单线程 Python 跟着 GPU 的拍子走）；**空闲时**，阻塞在 `input_queue.get(block=True)` 上，占用为零；**等远端 KV 的窄场景**，1ms 限频轮询，占用有界且低频。同一个「慢操作出循环」的纪律还有两笔零碎：启动期把 GC 堆冻结（`freeze_gc_heap`，`core.py:L240-L242`——权重、KV cache 这些启动期分配的大对象不再被反复扫描，GC 回收时全场停一下的那种卡顿随之变短变少）、环境变量读取缓存——都是把「可能让循环停顿的东西」提前搬走。
 
 ### 先说破：你马上要学的不是默认版
 
@@ -346,7 +347,7 @@ vLLM 三种各用在各自该在的地方。看骨架（[第 1 章](../../ch01-v
 这个顺序本身就是本章第一号设计决策，why 链四笔账：
 
 - **旧设计**：朴素单线程引擎——v0 `LLMEngine.step` 把 tokenize、调度、前向、采样、后处理串在一个同步循环里，做一步等一步；更早的 v1 `step()` 也是 `execute_model` 同步等完再采样。
-- **痛点**：忙循环单线程，任何阻塞都让 GPU 空转。一步 forward 只有几十毫秒（2048-8192 token 预算量级）；10ms 串行 CPU 杂务叠上去，吞吐损失约 20%。而 GPU 越快这笔账越狠：vLLM 官方 V1 alpha 博客实测 Llama-8B 在 H100 上单步低至约 5ms——真到那个速度，同样 10ms 杂务就是两倍的损失。
+- **痛点**：忙循环单线程，任何阻塞都让 GPU 空转。一步 forward 只有几十毫秒（2048-8192 token 预算量级）；10ms 串行 CPU 杂务叠上去，按 50ms 前向算每拍变 60ms、吞吐掉约 17%。而 GPU 越快这笔账越狠：vLLM 官方 V1 alpha 博客实测 Llama-8B 在 H100 上单步低至约 5ms——真到那个速度，同样 10ms 杂务把每拍拖成 15ms，吞吐只剩纯 GPU 节奏的三分之一。
 - **v1 方案**：就是上面这段顺序。所有可能慢、可能触发抢占的决策放在 GPU 启动**前**（①）；`execute_model` 只发起不等待（②）；CPU 活塞进 GPU 计算窗口（③）；连「执行」都劈成两段，两段之间隔着那个窗口（②④）。循环外缘同一纪律：请求构造和语法编译在 IO 线程（上一节）、msgpack 编码在输出线程、detokenize 干脆在前端进程（[第 7 章](../../ch07-uplink-token-to-text/narrative/chapter.md)）。
 - **代价**（诚实记）：执行劈两段，worker 带上跨调用暂存态，中间态出错归属变模糊——要用专门的状态防御和错误兜底把模糊钉回去（下一节整节就是它）；执行期到达的撤单必须双投递才不丢（[第 5 章](../../ch05-zmq-topology-and-protocol/narrative/chapter.md)已拆）；「GPU 空转」的边界情形仍有一处残留（等远端 KV 时的 1ms 让路，上一节已见）。
 
@@ -356,7 +357,7 @@ vLLM 三种各用在各自该在的地方。看骨架（[第 1 章](../../ch01-v
 
 ![五拍时间轴：一拍五段在 CPU/GPU 双轨上的排布](../diagrams/ch09-fig-five-beats-timeline.png)
 
-> *图注：放大自 L2 章图中间的五拍行。上轨是 CPU 忙循环（单线程），下轨是 GPU：① schedule 约 0.05ms，② 发起前向——host 建模里②同步等完 6.041ms 才返回（图内虚线注），真实引擎发起即返回；③ 掩码、④ 采样、⑤ 记账合计约 0.29ms——全部 CPU 段加起来不足前向的 6%。GPU 长条占满、CPU 段全是窄缝，这个形状就是本章论点本身。*
+> *图注：放大自 L2 章图中间的五拍行。上轨是 CPU 忙循环（单线程），下轨是 GPU：① schedule 约 0.05ms，② 发起前向——host 建模里②同步等完 6.041ms 才返回（图内虚线注），真实引擎发起即返回；③④⑤全挤在前向之后的窄缝里（③起步 6.098ms，拍末 6.387ms，逐段账在图右）——全部 CPU 段加起来不足建模前向的 6%（横幅口径 ≈0.35ms）。GPU 长条占满、CPU 段全是窄缝，这个形状就是本章论点本身。*
 
 实测场景：req-A（prompt 3 个 token，`max_tokens=3`）先到，一拍后 req-B（prompt 4 个 token，`max_tokens=2`）赶到——一个请求的一生加一个迟到者，五拍走完：
 
@@ -369,11 +370,11 @@ vLLM 三种各用在各自该在的地方。看骨架（[第 1 章](../../ch01-v
 | 4 | {}（flush：finished_ids={req-A, req-B} 随批下发） | —（0-token 批空跑，不前向） | None | 跳过（model_output 非 None） | finished 簿记冲刷，无输出 | executed=False |
 | 5 | 未到达（空转守卫先返回） | — | — | — | — | outputs={}，executed=False，executor 零调用 |
 
-（采样为 temperature=0 的贪婪 argmax——脚本化 logits 行里分数最高者即采样结果，词表 16。表中「②发起→③间隔」就是那一步被建模的前向时长——host 建模里 ② 睡完前向才返回、③ 排在窗口之后；真实引擎 ② 发起即返回，③ 在前向进行中就算、藏进窗口。这个先后差是 host 建模的痕迹，不是同步版与重叠版的差别——真实同步版 `step()` 的 ③ 同样在窗内；不变的是「③ 在 ② 之后、④ 之前」的顺序约束。）逐拍读：拍 1 是 req-A 的 prefill，整拍 3 个 token；拍 2 是**混相批**——req-A 逐 token decode（1 个）与 req-B 的 prefill（4 个）同批，这正是[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md)「调度器没有 prefill 批与 decode 批之分」的账面证据；拍 3 双双到达长度上限，同一拍里两个请求一起完成、一起释放；拍 4 是个 0-token 的空批——它的存在有讲究：拍 3 里完成的请求要等下一拍的 `schedule()` 把 finished 名单随批下发给 worker 清缓存，所以「完成之后、清账之前」还有一拍，这拍 `has_requests()` 仍为真（已完成未摘除也算）、但批是空的、不碰 GPU——②的调用照走，只是 worker 的 `execute_model` 对 0-token 批走空批早退分支（`vllm/v1/worker/gpu_model_runner.py:L4218-L4233`，注释原话「Return empty ModelRunnerOutput if no work to do」），不发起前向、直接返回非 None 的空结果 `EMPTY_MODEL_RUNNER_OUTPUT`；④的 `future.result()` 拿到它非 None、`sample_tokens` 整段跳过——表里拍 4 那行④列的「跳过」正是这么来的。拍 5 守卫拦下，引擎回到队列上睡觉。
+（采样为 temperature=0 的贪婪 argmax——脚本化 logits 行里分数最高者即采样结果，词表 16。表中「②发起→③间隔」就是那一步被建模的前向时长——host 建模里 ② 睡完前向才返回、③ 排在窗口之后；真实引擎 ② 发起即返回，③ 在前向进行中就算、藏进窗口。这个先后差是 host 建模的痕迹，不是同步版与重叠版的差别——真实同步版 `step()` 的 ③ 同样在窗内；不变的是「③ 在 ② 之后、④ 之前」的顺序约束。）逐拍读：拍 1 是 req-A 的 prefill，整拍 3 个 token；拍 2 是**混相批**——req-A 逐 token decode（1 个）与 req-B 的 prefill（4 个）同批，这正是[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md)「调度器没有 prefill 批与 decode 批之分」的账面证据；拍 3 双双到达长度上限，同一拍里两个请求一起完成、一起释放；拍 4 是个 0-token 的空批——它的存在有讲究：拍 3 里完成的请求要等下一拍的 `schedule()` 把 finished 名单随批下发给 worker 清缓存，所以「完成之后、清账之前」还有一拍，这拍 `has_requests()` 仍为真（已完成未摘除也算）、但批是空的、不碰 GPU——②的调用照走，只是 worker 的 `execute_model` 对 0-token 批走空批早退分支（`vllm/v1/worker/gpu_model_runner.py:L4218-L4233`，注释原话「Return empty ModelRunnerOutput if no work to do」——此早退被「无 KV 传输组」守卫，本章场景与常态部署即如此；配了 KV connector 的部署这一拍改走 `kv_connector_no_forward` 交给传输组处置，特例归 KV 传输篇），不发起前向、直接返回非 None 的空结果 `EMPTY_MODEL_RUNNER_OUTPUT`；④的 `future.result()` 拿到它非 None、`sample_tokens` 整段跳过——表里拍 4 那行④列的「跳过」正是这么来的。拍 5 守卫拦下，引擎回到队列上睡觉。
 
 这张表还立着一条不变式（**拍序不变式**）：每次 `step()` 五段至多各执行一次、顺序固定；`has_requests()` 为假时先于①早退、executor 零调用。论证用单调量：任一请求的产出 token 数每拍至多加一、被 `max_tokens` 钉死上界，所以每请求有限拍内完成；完成者当拍释放、finished 名单恰被下一拍冲刷——最后一个请求 flush 完，`has_requests()` 转假，守卫接手。上表五拍账目闭合：拍 3 双完成 → 拍 4 恰一次 flush → 拍 5 守卫，无泄漏、无多余。
 
-量级也顺手结了：本例一拍全程 6.387ms（时间轴刻度 0.003 → 6.387），CPU 段合计约 0.35ms、不足建模前向的 6%。把这笔账代回真实引擎：若 10ms 级 CPU 杂务串行堆在前向后，一步 50ms 前向的引擎每拍变 60ms，吞吐掉约 17%；前向 5ms（V1 alpha 博客的 H100 数字）时同样 10ms 就是两倍损失。**GPU 越快，五拍的排布越值钱**——这正是重叠版要进一步消灭的串行段，账留到 Part III 末章算。
+量级也顺手结了：本例一拍全程 6.387ms（时间轴刻度 0.003 → 6.387），CPU 段合计约 0.35ms——口径是拍全程减前向（6.387 − 6.041 ≈ 0.35，即图上横幅那个数）、不足建模前向的 6%。把这笔账代回真实引擎：若 10ms 级 CPU 杂务串行堆在前向后，一步 50ms 前向的引擎每拍变 60ms，吞吐掉约 17%；前向 5ms（V1 alpha 博客的 H100 数字）时同样 10ms 把每拍拖成 15ms，吞吐只剩三分之一。**GPU 越快，五拍的排布越值钱**——这正是重叠版要进一步消灭的串行段，账留到 Part III 末章算。
 
 下面四节逐段下潜（②与④共用一节——它们本就是一份契约的两半）。①的黑盒边界、⑤的内景深处各有一章等着（组批内部归下一章、抢占与请求状态机归 Part III 第三、四章），本章按「循环本体」的边界走。
 
@@ -455,7 +456,7 @@ executor（单机执行器的转发层）把两拍都转发给 worker：
         )
 ```
 
-`non_block=True` 时拿到的是一个 `AsyncOutputFuture`；若任务已经失败，当场把异常抛出来（「surface any exception as early as possible」——早失败早暴露，不留给④拍一个坏 Future）。这个 Future 的 `result()` 有讲究：
+`non_block=True` 的收货规则在转发层 `collective_rpc` 的两条支（`vllm/v1/executor/uniproc_executor.py:L91-L106`）：worker 交回 `AsyncModelRunnerOutput`（自带「结果还在 GPU、拷贝未完」语义的异步输出对象）就包成 `AsyncOutputFuture`；交回普通值——②拍同步版路径里 worker 暂存后返回的 `None` 正是——则装进一个 **已 done 的普通 Future**。若任务已经失败，当场把异常抛出来（「surface any exception as early as possible」——早失败早暴露，不留给④拍一个坏 Future）。前一种 Future 的 `result()` 有讲究：
 
 ```python
 # vllm/v1/executor/uniproc_executor.py:L26-L42
@@ -478,7 +479,12 @@ class AsyncOutputFuture(Future):
         return super().result()
 ```
 
-`result()` 惰性调 `async_output.get_output()`——那是在等 **D2H 拷贝事件**（D2H：device to host，GPU 显存到 CPU 内存的拷贝），不是在等前向计算。前向计算早在②拍就发起了；到④拍，CPU 只等「结果搬回内存」这个事件。**只等搬运、不等计算**——但这句话要说准，别读成「等待变短了」：拷贝事件排在前向之后才置位，④的墙钟等待（实际花的时间）照样要等掉前向余尾，几十毫秒照等。两段式买到的不是更短的等待，而是等待的**方式与位置**：线程挂在事件上（零 CPU、释放 GIL），且等待被挪到③之后——②发起即返回、③趁 GPU 还在算的空档把掩码活干完，④才去取货。亚毫秒（下表实测的 0.142ms）只是事件就绪后的取货开销。
+`result()` 惰性调 `async_output.get_output()`——那是在等 **D2H 拷贝事件**（D2H：device to host，GPU 显存到 CPU 内存的拷贝），不是在等前向计算。这套「挂事件收货」的装备属于异步面（异步调度版专用，下面实测表的「异步半边」实测的就是它）；本章同步版 `step()` 的④是两行拼成的，各等什么按源码钉死——全章时序最密、也最容易拼错的一处就在这：
+
+- **L602 的 `future.result()`：正常拍立即兑现 `None`。** ②拍里 worker 的 `execute_model` 本就在忙循环线程内跑完、kernel 入队即返回 `None`，这个 `None` 走的是上面那条「已 done 的普通 Future」支——`result()` 不挂任何事件，只把「前向已发射、采样欠着」这个信号领出来。`if model_output is None` 正是拿它当 L604 条件调用的依据；空批早退那一拍兑现的则是非 None 的 `EMPTY_MODEL_RUNNER_OUTPUT`（「一拍五段」实测表拍 4 ④列的「跳过」），采样整段绕开。
+- **L604 的 `sample_tokens(grammar_output)`——不带 non_block 的阻塞调用：真正罩住前向余尾的墙钟等待在这里。** worker 盖掩码、把采样 kernel 排进前向后面的 GPU 队列，随后内部记账段发起 D2H 拷贝并在事件上同步等它（sync 路径行为，源码注释自注，`gpu_model_runner.py:L4782-L4786`）——GPU 上前向余尾、采样、搬运一条龙跑完，CPU 线程才从这次调用里醒来。
+
+所以 **「只等搬运、不等计算」** 说的是等的内容、不是等的时长：拷贝排在前向之后才就绪，墙钟照样要等掉前向余尾，几十毫秒照等。两段式买到的不是更短的等待，而是等待的**方式与位置**——同步版里线程睡在 L604 内部的拷贝同步点上（零 CPU、释放 GIL）；异步面更进一步把等待 Future 化、连取货时点都能推迟：②发起即返回、③趁 GPU 还在算的空档把掩码活干完，④才去取货。亚毫秒（下表实测的 0.142ms）只是事件就绪后的取货开销。
 
 ### worker 半边：暂存态与店规
 
@@ -588,7 +594,7 @@ class ExecuteModelState(NamedTuple):
 | ④ 异步半边 | executor.sample_tokens(non_block=True) | — | AsyncOutputFuture（done=False） | result() 只等 D2H 事件，不等计算 |
 | D2H 完成 | 挂起 0.25s 后事件置位 | — | 置位后 0.142ms 返回；二次 result() 0.008ms | 阻塞期间无返回=True；采样=[[4]] |
 
-不变式（**暂存态不变式**）：`execute_model_state` 非 None 当且仅当恰有一拍前向的采样欠着；两次 `execute_model` 之间必恰有一次 `sample_tokens`。基例是初始 None；归纳步就是上面那对入口防御——非空时引擎不可能发起第二拍前向。等待账也顺表可见：异步面事件未置位时 `result()` 阻塞 0.25s 零返回（这 0.25s 是脚本注入的拷贝延迟——真实引擎里这段等待罩着前向余尾加拷贝，几十毫秒量级），置位后 0.142ms 交出，二次 `result()` 0.008ms（Future 已 done，纯缓存读）。**「只等搬运」的真实含义**：等的墙钟不短（罩着前向余尾），等的方式便宜（挂起、零 CPU、释放 GIL），且等待排在③之后——亚毫秒只是就绪后的取货价。
+不变式（**暂存态不变式**）：`execute_model_state` 非 None 当且仅当恰有一拍前向的采样欠着；两次 `execute_model` 之间必恰有一次 `sample_tokens`。基例是初始 None；归纳步就是上面那对入口防御——非空时引擎不可能发起第二拍前向。等待账也顺表可见：异步面事件未置位时 `result()` 阻塞 0.25s 零返回（这 0.25s 是脚本注入的拷贝延迟——真实引擎的异步调度版里这段等待罩着前向余尾加拷贝，几十毫秒量级），置位后 0.142ms 交出，二次 `result()` 0.008ms（Future 已 done，纯缓存读）。**「只等搬运」的真实含义**：等的墙钟不短（罩着前向余尾），等的方式便宜（挂起、零 CPU、释放 GIL），且等待排在③之后——亚毫秒只是就绪后的取货价。
 
 两段式的故障兜底补一笔：中间态出错时，`step()` 里那个 `log_error_detail` 上下文会连带 `dump_engine_exception` 把两段各自的状态现场倒出来（`core.py:L493-L507`）——「中间态出错归属变模糊」这个代价，用专门的诊断出口把模糊钉回去。
 
@@ -684,7 +690,8 @@ vLLM v0.27.1 里这张表由默认后端 xgrammar 提供（版本钉 `xgrammar >
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
             # … 省略：num_in_flight_tokens 记账与 stale 份额排干两行（抢占协议，
-            #       Part III 第三、四章）…
+            #       Part III 第三、四章）与 failed_kv_load 跳过分支（KV connector
+            #       装载失败/待重排的请求不进本拍账——KV 传输域，他章）…
             if request is None or request.is_finished():
                 # The request is already finished. This can happen if the
                 # request is aborted while the model is executing it (e.g.,
@@ -702,7 +709,7 @@ vLLM v0.27.1 里这张表由默认后端 xgrammar 提供（版本钉 `xgrammar >
             )
 ```
 
-注释原话承认：批内请求数可以到一千以上，这个循环是公认的性能瓶颈，循环体内必须避免昂贵操作。循环体对每个当拍调度的请求恰处理一次：`req_id_to_index`（请求 id → 批内行号的路由表）定位它的采样行，追加 token、`check_stop` 判停（EOS、stop token、长度上限——[第 2 章](../../ch02-request-lifecycle/narrative/chapter.md)站 14 讲过判停条件表），停止的请求当场释放资源并记进 finished 名单。中间那段跳过分支是真实案例级的注释：「aborted while the model is executing it」——撤单到达时它可能正在 GPU 上被执行，④已经把它的采样行算出来了，⑤在这里把行丢弃、零输出。收尾按 `client_index` 分桶组装 `EngineCoreOutputs`（`scheduler.py:L2014-L2031`）、把 finished 名单塞进对应前端的包裹——名单随后随**下一拍**的批下发给 worker 清缓存（「一拍五段」一节的实测表里拍 4 那次 flush 就是它的账面身影）。
+注释原话承认：批内请求数可以到一千以上，这个循环是公认的性能瓶颈，循环体内必须避免昂贵操作。循环体对每个当拍调度的请求恰处理一次：`req_id_to_index`（请求 id → 批内行号的路由表）定位它的采样行，追加 token、`check_stop` 判停（EOS、stop token、长度上限——[第 2 章](../../ch02-request-lifecycle/narrative/chapter.md)站 14 讲过判停条件表），停止的请求当场释放资源并记进 finished 名单。中间那段跳过分支是真实案例级的注释：「aborted while the model is executing it」——撤单到达时它可能正在 GPU 上被执行，④已经把它的采样行算出来了，⑤在这里把行丢弃、零输出。收尾按 `client_index` 分桶组装 `EngineCoreOutputs`（`scheduler.py:L2014-L2031`——前四行的分桶推导式就是章图上标的 L2014-2017，L2019 起把 finished 名单塞进对应前端的包裹）——名单随后随**下一拍**的批下发给 worker 清缓存（「一拍五段」一节的实测表里拍 4 那次 flush 就是它的账面身影）。
 
 ### 撤单的急件通道
 
@@ -898,7 +905,7 @@ docstring 自己招供「no busy loop」：`get_output` 直接调 `step_fn()` �
         # … 省略：统计记录 …
 ```
 
-引擎代码全同、五拍一支不少——没有 ZMQ、没有双队列、没有守护线程，用户每调一次 `step()` 就是一拍。这是「心脏与外壳分离」最干净的证据：本章拆的是心脏，外壳（进程、线程、队列）按需装配。
+摘录开头那个 `should_execute_dummy_batch` 分支是多引擎（DP，数据并行）部署的同步要求：别的引擎还有活、本引擎已空时，`has_unfinished_requests_dp` 把旗立起来（`llm_engine.py:L197-L203`），下一拍空跑一个 dummy 批让各引擎的 GPU 集合通信保持同拍、返回空列表——单引擎部署这行永不触发。除此之外引擎代码全同、五拍一支不少——没有 ZMQ、没有 input_queue/output_queue 这对交接队列、没有守护线程，用户每调一次 `step()` 就是一拍。这是「心脏与外壳分离」最干净的证据：本章拆的是心脏，外壳（进程、线程、队列）按需装配。
 
 第三种驱动就是开头说破的重叠版。它的演进有三步 git 证据：d4d309409（2025-07）实现异步调度，当时还是 opt-in 开关（要用户显式打开才生效）；c2ff33cc8（2025-12）把它翻转为默认——就是前面引过的「Enable async scheduling unless there is an incompatible option」；3e440786a（2026-01）打通异步与流水线并行，commit 标题自带数字：端到端吞吐 +30.8%、TPOT（每 token 生成时间）缩短 31.8%（标题原文『31.8% TPOT improvement』，improvement 指更快）。机制一句话：`max_concurrent_batches > 1` 时装上批队列（`core.py:L206-L212`）、`step_fn` 绑定 `step_with_batch_queue`——批 A 在 GPU 上跑的同时，CPU 同步调度批 B，填队列优先于取输出，CPU 调度时间从 GPU 执行时间**之后**挪到了**旁边**。代价也真实：调度器状态领先真实进度（乐观推进），一连串补偿机制全是这笔账——投机解码拒绝回扣、过期输出排空、延迟释放的栅栏、缺 token 的延迟采样分支——本 pin 前三个月里就有三个此域的修复 PR。用状态机复杂度换 GPU 利用率，30% 级的吞吐是价签。拆解归 Part III 末章。
 
