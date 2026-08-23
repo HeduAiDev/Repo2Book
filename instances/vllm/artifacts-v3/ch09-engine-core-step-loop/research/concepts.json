@@ -1,0 +1,133 @@
+{
+  "chapter_id": "ch09",
+  "chapter_title": "EngineCore 的逐拍循环",
+  "pin": "vLLM v0.27.1 (6e448d0ea)",
+  "generated_by": "researcher",
+  "generated_date": "2026-08-22",
+  "note": "本章 introduces 四项的立项裁决：「五拍」与「EngineCoreProc 启动握手」是纯内部机制——dossier（m1/m8）是它们的真相源，不产研究条目；握手的外部地基（ZMQ ROUTER/DEALER、DEALER 先发言认亲、两层握手、linger、死讯三重保险、ABORT 双投、引擎两层队列解耦）已全部由 ch05 正文与 ch05 图建立（见 book/bible/concepts-v3.json 的 ch05 条目），GIL 三层与 V1 alpha 博客 ~5ms/CPU overhead 原话已由 ch01 研究建立（ch01 research 的 python-gil 与 vllm-v0-single-process 条目，博客已于 2026-08-16 核到原话）——writer 回指即可，本章零重产。本章立项 6 条：2 新研（busy loop 术语的反直觉处——introduces 命名项里唯一需要外部背景撑的；Orca 36.9x 外证——WC2 点名引用的数字必须可溯源）+4 复用改锚（bitmask 极简背景（F6 埋点，复用 v2 ch12 条目并压到词汇级+改锚 v0.27.1 pin xgrammar>=0.2.1）、concurrent.futures.Future（复用 v2 ch12 条目，本轮重核文档）、信号处理器不可拿锁/self-pipe trick（复用 v2 ch11 条目，改锚 v0.27.1 的 SignalCallback/wakeup_engine 并新增 queue 文档「锁不处理重入」一手证据）、NIXL（复用 v2 ch11 条目，改锚 pin nixl==1.3.1 并复核仓库现状））。刻意不立项：ZMQ linger（ch5 已讲透——「死讯保镖」图+setsockopt 原文）、迭代级调度的完整谱系（Orca/Sarathi 血统是 ch10 introduces 主场，本章只给「引 36.9x 时的一句话出处」级条目）、multiprocessing spawn 与 daemon thread（Python 标准库常识，正文一句括注足够）、IntEnum/deque/queue.Queue 线程安全（stdlib 常识；其中「queue 锁不可重入」的官方文档证据已并入信号条目）。复核记录（同日第二轮独立复核，全部逐条重抓验证成立）：7 个 pin 锚点（sched/interface.py:59 busy loop docstring、requirements/common.txt:27 xgrammar>=0.2.1、kv_connectors.txt:5 nixl==1.3.1、engine/core.py:1324-1325 non-reentrant 注释、engine/utils.py:253 SignalCallback、structured_output/backend_xgrammar.py:128-129/196 allocate/fill、structured_output/utils.py:161-175 apply）；6 条外部引文（vLLM 架构文档 busy loop 原话·Engine Core Process 小节、Friendli Orca 页 36.9x/iteration-level scheduling/selective batching·OSDI 2022、Python queue 文档含 Windows 不可中断等待注、signal 文档锁死锁警告、concurrent.futures Future 三句、NIXL README 定位句+插件清单+Apache-2.0/Linux-only/~1.2k stars）；2 条跨章回指（bible concepts-v3.json ch05 十三条含 ROUTER/DEALER/两层握手/死讯三重保险/ABORT 双投/两层队列解耦；ch01 research python-gil 与 vllm-v0-single-process 含 V1 alpha 博客 ~5ms 原话，2026-08-16 已核）。",
+  "concepts": [
+    {
+      "id": "busy-loop-vs-busy-wait",
+      "term": "busy loop（忙循环）——名字里的「忙」不等于 busy-waiting 的「空转」",
+      "kind": "external_concept",
+      "one_line": "操作系统教科书里 busy-waiting（自旋空等）是要避开的反模式——反复检查条件、白烧 CPU；vLLM 的 run_busy_loop 只借了这个名字，实现是「有活就转、没活就阻塞睡在队列上」，一行空转都没有。",
+      "what_it_is": "先立教科书定义（Wikipedia「Busy waiting」，本轮逐字核对）：busy-waiting 是「a technique in which a process repeatedly checks to see if a condition is true」的技术——循环体里唯一的事就是反复问「好了没」，被明确称为「an anti-pattern and should be avoided」，因为「processor time that could be used to execute a different task is instead wasted on useless activity」（本可拿去干别的的 CPU 时间被白白烧掉）。正解是阻塞等待：操作系统提供「block the process on an event, such as lock acquisition, timer changes, I/O availability or signals」的系统调用，能拿到「simplest, most efficient, fair, and race-free result」——线程睡着不占 CPU，事件到达由内核唤醒。busy-waiting 也有合法场景（SMP 上的 spinlock、等几个时钟周期的极短等待），但那是「确认等待比睡眠唤醒还短」时的特例。再看 vLLM：官方架构文档对 EngineCore 的描述原话就是「It runs a busy loop that continuously schedules requests and dispatches work to the GPU workers」（本轮重核，2026-08-22），调度器接口 docstring 也写「called repeatedly by a busy loop in the engine」（本仓 pin vllm/v1/core/sched/interface.py）——所以「busy loop」是官方用词，不是本书自造。但它的三个运行状态没有一个是 busy-waiting：①有请求时，循环由 step_fn 主导，单线程 Python 跟着 GPU 拍子走（GPU bound）；②空闲时阻塞在 input_queue.get(block=True) 上——Python 官方文档原话「block if necessary until an item is available」，线程睡眠、CPU 占用为零；③「无模型执行但 scheduler 仍有活」的窄场景（如等远端 KV 传输）用 time.sleep(0.001) 限频轮询——介于自旋与阻塞之间的折中，把轮询频率压到 ~1000Hz 并让出 GIL。「busy」的准确含义是：这条线程专职驱动引擎、从出生转到退出、不干任何别的事——「忙于本职」，不是「忙等」。顺带一个文档级细节：Python queue 文档注明 Windows 上无超时的阻塞 get 会「go into an uninterruptible wait on an underlying lock」（信号打断不了它）——这正是 vLLM 关停时不能靠信号打断阻塞、而要往 input_queue 投 WAKEUP 哨兵「用消息叫醒」的文档依据之一（接 m9）。",
+      "background": "这个命名传统来自事件驱动编程的「loop」家族：asyncio 的事件循环（event loop）同样「永真循环、空转时阻塞在 epoll/select 上」——「循环永真」与「空转烧 CPU」从来不是一回事。vLLM 文档与源码注释用 busy loop 描述「专职驱动引擎的那条循环」，与 asyncio loop 同一血统。对初学者，真正要防的误读只有一个：把 busy loop 读成 busy-wait（自旋），进而以为引擎空闲时也在烧一个核——只要把「忙等反模式 / 阻塞正解 / 限频折中」三层摆开，这个误读就没有立足之地，而且 vLLM 恰好三种等待各用在了对的地方（空闲阻塞 / 窄场景限频 / 其余交给 GPU 拍子）。",
+      "example": "三种等待方式的 Python 最小对照（纯标准库，可直接跑；说明性例子，非源码）：\n```python\nimport queue, time\nq = queue.Queue()\n\n# ① busy-waiting（反模式）：烧着 CPU 反复看\nwhile q.empty():      # 每次检查都占着 CPU——等多久就白烧多久\n    pass\n\n# ② 阻塞等待（正解）：没消息就睡着，消息来了被操作系统唤醒\nitem = q.get(block=True)   # 文档原话：block if necessary until an item is available\n\n# ③ 限频轮询（折中）：把「反复看」的频率压到固定值\nwhile q.empty():\n    time.sleep(0.001)      # 轮询频率上限 ~1000Hz，其余时间片让给别人\n```\n逐行看：①在循环里反复调 empty()，条件不满足也绝不睡——这就是教科书定义的 busy-waiting；②get(block=True) 让线程在队列的锁/条件变量上睡眠，等待期间的 CPU 占用为零——run_busy_loop 空闲时走的就是这条路；③仍是「反复看」，但每轮主动睡 1ms，把 CPU 让给其他线程——vLLM 只在「无模型执行但 scheduler 有活」的窄场景用它（GPU 此刻本来就闲，让时间片给后台 KV 传输线程）。",
+      "links": [
+        "https://en.wikipedia.org/wiki/Busy_waiting",
+        "https://docs.python.org/3/library/queue.html",
+        "https://docs.vllm.ai/en/latest/design/arch_overview/"
+      ],
+      "sources": [
+        {"url": "https://en.wikipedia.org/wiki/Busy_waiting", "note": "busy-waiting 定义原话（repeatedly checks to see if a condition is true）、anti-pattern 定性（processor time ... wasted on useless activity）、阻塞替代（block the process on an event ... simplest, most efficient, fair, and race-free）、spinlock 等合法场景。WebFetch 核实，访问 2026-08-22"},
+        {"url": "https://docs.python.org/3/library/queue.html", "note": "Queue.get 原话：block=true 且 timeout=None 时「block if necessary until an item is available」；queue.Empty 语义；「implements all the required locking semantics」；Windows 上无超时阻塞 get 「goes into an uninterruptible wait on an underlying lock」。WebFetch 核实，访问 2026-08-22"},
+        {"url": "https://docs.vllm.ai/en/latest/design/arch_overview/", "note": "vLLM 官方架构文档对 engine core 的原话「It runs a busy loop that continuously schedules requests and dispatches work to the GPU workers」——busy loop 是官方用词的直接证据。WebFetch 核实，访问 2026-08-22（ch01 研究曾于 2026-08-16 核过同页）"},
+        {"url": "vllm/v1/core/sched/interface.py（本仓 pin v0.27.1 源码，本地核实 2026-08-22）", "note": "schedule() docstring 原话「this method is called repeatedly by a busy loop in the engine」——接口契约层面对 busy loop 的书面指认"}
+      ],
+      "confidence": "high",
+      "writer_note": "introduces「busy loop」首现处建议给「三层区分」半段+上面的三行对照（忙等反模式 / 阻塞正解 / 限频折中），一句话点破「忙=专职，不是空转」；可顺带引官方架构文档那句 busy loop 原话立「名字是官方的、但别望文生义」。Windows 上阻塞 get 不可被信号打断的文档注脚，恰好接 m9 的 WAKEUP 哨兵——一句话点到即可，别展开成操作系统课。"
+    },
+    {
+      "id": "grammar-bitmask-min",
+      "term": "语法位掩码（grammar bitmask）：采样前盖在 logits 上的一张「允许 / 禁止」开关表",
+      "kind": "notation",
+      "one_line": "结构化输出的执法手段：对词表的每个 token 位算一个开关——「禁止」位在采样前被压成负无穷，softmax 后概率归零，模型就不可能吐出语法非法的 token。",
+      "what_it_is": "bitmask（位掩码）是计算机科学通用词：一串位（bit），每一位当一个独立的开/关。在 LLM 约束解码语境里，它是「批内每个结构化输出请求一行 × 词表每个 token 一位」的允许表——第 i 位是 1 表示「这个位置允许采样 token i」，是 0 表示禁止。执法动作发生在采样之前：把掩码「盖」到模型刚算出的 logits 上，被禁位的分数被压到 -inf，softmax 之后概率恰好为零，采样器无论怎么随机都只能落在合法 token 上——不改模型权重、不改采样算法，只在最后一步把门。vLLM v0.27.1 里这张表由默认后端 xgrammar 提供（requirements/common.txt:27 钉「xgrammar >= 0.2.1, < 1.0.0」，本地核实；官方 structured outputs 文档列 xgrammar/guidance 两个后端、默认 auto 按请求特征选择），pin 源码的调用链三步齐整：allocate_token_bitmask（按 max_num_seqs×词表分配掩码，backend_xgrammar.py L128-129）→ fill_next_token_bitmask（按语法当前状态逐请求填表，L196）→ apply_token_bitmask_inplace（盖到 logits 上，structured_output/utils.py L161-175，GPU/CPU 两条路）——三步函数名即工作流（本地核实 2026-08-22）。本章只需要这个词汇级理解：③拍 get_grammar_bitmask 算出的就是这张表，④拍 sample_tokens 里 apply_grammar_bitmask 把它盖上去。",
+      "background": "「采样前掩码盖 logits」是约束解码（constrained/structured decoding，也叫 guided decoding）的通行做法：把目标语法（JSON schema、正则、EBNF）预先编译成能逐 token 判断合法性的状态机，每生成一个 token 推进一次状态、算出下一步的允许集（即掩码）。vLLM 把「语法→状态机→位掩码」的编译链收在 StructuredOutputManager 与后端契约里——那是第 30 章《约束解码 I：语法编译》的整章主场（pedagogy-plan 明确 ch30 回收本章 F6 伏笔并 introduces「xgrammar/guidance/outlines 生态」）。本章按伏笔纪律（foreshadow_due：F6 只讲「窗口」这个时序事实）绝不打开那只盒子：掩码怎么算、xgrammar 与 guidance 怎么选、异步编译门怎么挡调度，全部留钩子给 ch30。",
+      "example": "5-token 词表的最小例子（说明性，非源码；真实掩码还带批维——每请求一行——内部表示归 ch30）：\n```python\nimport torch\n\nlogits  = torch.tensor([0.2, 1.0, 0.8, 0.6, 0.4])          # 词表 {0:\"你\",1:\"好\",2:\",\",3:\"世\",4:\"!\"}\nbitmask = torch.tensor([0,   0,   1,   1,   0  ], dtype=torch.bool)  # 语法此刻只允许 \",\" 和 \"世\"\nlogits  = logits.masked_fill(~bitmask, float(\"-inf\"))       # -> [-inf, -inf, 0.8, 0.6, -inf]\nprobs   = torch.softmax(logits, dim=-1)                      # 概率全部落在 token 2、3 上\n```\n逐行看：bitmask 与词表等长、每位一个开关；masked_fill 把开关为 0（禁止）的位置填上 -inf——这正是 apply_token_bitmask_inplace 干的事；softmax 后 -inf 位概率恰为零，采样器不可能选中非法 token。这张表为什么必须在本拍算好：它依赖调度结果（批里有哪些请求、各排几个 token），又必须在采样作用 logits 之前到位——「夹缝时序」就是 F6 埋的窗口。",
+      "links": [
+        "https://xgrammar.mlc.ai/",
+        "https://docs.vllm.ai/en/latest/features/structured_outputs.html",
+        "https://github.com/mlc-ai/xgrammar"
+      ],
+      "sources": [
+        {"url": "vllm/v1/structured_output/backend_xgrammar.py L128-129/L196 · vllm/v1/structured_output/__init__.py L232 · vllm/v1/structured_output/utils.py L151-175（本仓 pin v0.27.1 源码，本地 Grep/Read 核实 2026-08-22）", "note": "pin 一手证据：allocate_token_bitmask → fill_next_token_bitmask → apply_token_bitmask_inplace 三步调用链真实存在且按此顺序；GPU/CPU 两条应用路径都调 xgr.apply_token_bitmask_inplace(logits, grammar_bitmask, indices=...)"},
+        {"url": "https://xgrammar.mlc.ai/docs/tutorials/workflow_of_xgrammar.html", "note": "xgrammar 官方工作流教程（本轮页面 404/空渲染，引文经搜索索引转引，2026-08-22）：「Use xgr.apply_token_bitmask_inplace to apply the bitmask to the logits of the LLM. It will modify the logits in place.」；搜索摘要另述该工作流把禁位 logits 置 -inf——此 -inf 措辞未直接打开教程页核对，另经多方（API 索引摘要、第三方实操 walkthrough）一致佐证，机制本身（禁位不可能被采到）由 pin 调用链+通行技术确证"},
+        {"url": "https://xgrammar.mlc.ai/", "note": "xgrammar 官网（WebFetch 核实 2026-08-22）：MLC AI 生态开源项目、「Efficient, Flexible and Portable Structured Generation」、README 自述 near-zero overhead——定位句一手核实；-inf 细节不在首页"},
+        {"url": "https://docs.vllm.ai/en/latest/features/structured_outputs.html", "note": "vLLM 官方文档（WebFetch 核实 2026-08-22）：「supports the generation of structured outputs using xgrammar or guidance as backends」、默认 backend=auto 按请求细节选；该页无 bitmask 机制描述（机制细节靠 pin 源码与 xgrammar 文档）"},
+        {"url": "instances/vllm/source/requirements/common.txt:27（本地核实 2026-08-22）", "note": "pin 版本锚：xgrammar >= 0.2.1, < 1.0.0（带平台条件）——v2 ch12 条目写作时（v0.21.0 pin）为 >=0.2.0，本章已按 v0.27.1 改锚"}
+      ],
+      "confidence": "high",
+      "writer_note": "F6 纪律（dossier foreshadow_due 原话：只讲「窗口」这个时序事实与它为何能藏）：正文 bitmask 一句话+最多一个 5-token 脚注级例子就够——「一张每 token 一位的允许表，采样前盖上、禁位概率归零」；窗口时序（依赖调度结果、又必须先于采样、藏在前向窗口里）才是本章正题。xgrammar/guidance 怎么选、语法→FSM 编译、异步编译门、掩码内部表示，全部一句钩子留给 ch30，绝不展开。"
+    },
+    {
+      "id": "python-future-notation",
+      "term": "concurrent.futures.Future（.done() / .result()）",
+      "kind": "notation",
+      "one_line": "「异步任务结果的占位符」：提交任务立刻拿到一个 Future（不用等结果），需要时再 .result() 阻塞等它——本章 step() ②拍 execute_model(non_block=True) 拿到的、④拍 future.result() 等的，就是这个标准库物件。",
+      "what_it_is": "Future 是 Python 标准库 concurrent.futures 里代表「一次尚未（或刚刚）完成的异步调用」的对象，官方文档原话：「The Future class encapsulates the asynchronous execution of a callable. Future instances are created by Executor.submit()」。典型用法：提交任务时立刻拿到占位符，先去做别的事，之后随时查询——done() 非阻塞地问一句「算完了吗」（「Return True if the call was successfully cancelled or finished running」）；result(timeout=None) 阻塞等到有结果再返回（「Return the value returned by the call. If the call hasn't yet completed then this method will wait up to timeout seconds」），若任务执行时抛了异常，result() 会「raise the same exception」——同一个异常在调用处重新抛出，不吞不掉。这个「提交即拿提货单、之后才决定何时等」的模式，正是本章两段式契约（②发起前向拿 Future→③趁窗口算掩码→④future.result() 收货）能成立的语法地基：没有「占位符」，②③就得串成一个调用。注意一个 vLLM 特有的变形：AsyncOutputFuture 是 Future 的子类，却不是 Executor.submit() 创建的（uniproc_executor.py L26-L42，result() 惰性等 D2H 拷贝事件）——那是 vLLM 的自定义语义，归正文（m3）讲，本条只给标准库原型。",
+      "background": "Future 是几十年历史的并发编程抽象（Java 1.5 的 java.util.concurrent.Future、C++11 的 std::future 同名同义），Python 3.2 引入 concurrent.futures（PEP 3148）把它带进标准库。本条目从 v2 映射章（artifacts/ch12-engine-core）复用，文档本轮重核逐字有效（2026-08-22）。",
+      "example": "```python\nfrom concurrent.futures import ThreadPoolExecutor\n\nwith ThreadPoolExecutor() as pool:\n    fut = pool.submit(lambda: 1 + 1)   # 立刻返回提货单，不等任务跑完\n    print(fut.done())                   # 可能是 False（任务可能还没跑完）\n    print(fut.result())                 # 阻塞直到有结果 -> 2\n```\n逐行看：submit() 不等 1+1 算完——它把计算扔给线程池、立刻给调用方一张「提货单」；done() 是「不排队，先问一句好了没」；result() 是「愿意排队等，直到货到手」。对照本章五拍：②拍 execute_model(non_block=True) 相当于 submit（发起前向、立刻返回 Future），③拍 get_grammar_bitmask 相当于「拿到提货单先去干别的」，④拍 future.result() 才去收货——CPU 的活（算掩码）被塞进了 GPU 计算的等待窗口里。",
+      "links": [
+        "https://docs.python.org/3/library/concurrent.futures.html#future-objects"
+      ],
+      "sources": [
+        {"url": "https://docs.python.org/3/library/concurrent.futures.html#future-objects", "note": "Python 3 官方文档 Future 对象节，本轮 WebFetch 逐字核对（2026-08-22）：「encapsulates the asynchronous execution of a callable」「instances are created by Executor.submit()」、done() 语义、result() 等待与超时/取消/异常透传（raise the same exception）。v2 ch12 研究曾于 2026-07-24 核过同页，本轮复用并重核"}
+      ],
+      "confidence": "high",
+      "writer_note": "m3 讲两段式契约时半段带过「Future=提货单」（可复用上面的线程池最小例）即可——完全没写过 Python 并发的读者需要这句地基。防混提醒：AsyncOutputFuture「只等 D2H、不等计算」的惰性 result() 是 vLLM 自定义语义（anapist/explainer 的地盘），别把它混进 stdlib 背景里说成 Python 官方行为。"
+    },
+    {
+      "id": "orca-iteration-level-evidence",
+      "term": "Orca（OSDI 2022）：迭代级调度的学术出处与「36.9x」外证",
+      "kind": "external_concept",
+      "one_line": "「每次 forward 前重新决定批里装谁」这个思想的源头论文——首尔大学团队 2022 年提出 iteration-level scheduling，在 GPT-3 175B 上对 NVIDIA FasterTransformer 拿到同延迟下最高 36.9 倍吞吐。",
+      "what_it_is": "旧世界是请求级批处理（request-level batching）：攒一批请求、pad 到最长序列、整批全部生成完才整批换血——两个病：先做完的请求不能提前走（陪着空转），新来的请求必须等整批腾位。Orca（OSDI 2022）把调度粒度从「整个请求」降到「一次迭代（=一次 forward）」：iteration-level scheduling，配合 selective batching（「applies batching only to a selected set of operations」——只对可批的算子做批，采样等不可批操作单独处理）。论文摘要的战绩原话：GPT-3 175B 上对 NVIDIA FasterTransformer「36.9x throughput improvement at the same level of latency」（同延迟水平下 36.9 倍吞吐提升）。这套做法后来被业界称作连续批处理（continuous batching），vLLM v1 调度器每拍产出 {req_id: num_tokens} 的 token 账、完成的请求当拍退出、新请求同拍可入，正是它在引擎侧的形态——本章 WC2 拿它当「请求级批处理有多痛」的外证，正文引用 36.9x 时以本条为出处。",
+      "background": "Orca 出自首尔大学 Byung-Gon Chun 组（作者 Gyeong-In Yu、Joo Seong Jeong 等），发表于 USENIX OSDI 2022；论文不走 arXiv，一手文本在 USENIX 官网（本轮 bot 抓取被 403 拦截，canonical 链接给出），摘要由作者自家的公司 Friendli AI（Orca 是其商业产品的技术基础）完整托管（本轮抓到并逐字核对）。它把「批是活的」带进 LLM serving，是 vLLM、SGLang、TGI 等现代推理引擎共同的血统起点。注意分工：完整谱系（Orca 之后 Sarathi 的 chunked prefill、vLLM 的取舍与变形）是本书第 10 章《连续批处理与 chunked prefill》的主场——pedagogy-plan 在 ch10 的 notes 里点名「Orca 36.9x/Sarathi 血统」；本章只消费「这个思想有学术出处、这个数字有论文背书」这一层。",
+      "links": [
+        "https://www.usenix.org/conference/osdi22/presentation/yu",
+        "https://friendli.ai/research/orca"
+      ],
+      "sources": [
+        {"url": "https://friendli.ai/research/orca", "note": "Orca 作者自家公司托管的论文页（WebFetch 核实 2026-08-22）：摘要含「36.9x throughput improvement at the same level of latency」、对照组 NVIDIA FasterTransformer、GPT-3 175B 场景、iteration-level scheduling 与 selective batching（applies batching only to a selected set of operations）两术语原词"},
+        {"url": "https://www.usenix.org/conference/osdi22/presentation/yu", "note": "USENIX OSDI 2022 官方论文页（canonical 一手出处；本轮 WebFetch 被 403 拦截未取到正文，内容经 Friendli 一手摘要+多个独立二级源（检索摘要 2026-08-22）互证一致：36.9x/FasterTransformer/两术语/作者与 venue）"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文引用「最高 36.9x」时给一句出处即可：「Orca 论文（OSDI 2022），GPT-3 175B 上同延迟水平对 FasterTransformer」；request-level vs iteration-level 的对比叙述本章一两句带过（先做完的不能走、新来的等整批两点足矣），机制展开与 Sarathi/chunked prefill 谱系全部留给 ch10——本章战场是循环本体，不是调度算法。"
+    },
+    {
+      "id": "signal-handler-lock-safety-self-pipe",
+      "term": "信号处理器的「不可拿锁」铁律 / self-pipe trick（自管道技巧）",
+      "kind": "external_concept",
+      "one_line": "Unix/Python 的一条通用铁律：信号处理器可能在程序任意一条字节码之间插入执行，里面不能碰锁（会死锁）——标准解法是处理器只做最小动作，真正的活挪到主循环/另一条线程去干；本章 m9 的 wakeup_engine+SignalCallback 正是这条铁律的一个变体实现。",
+      "what_it_is": "信号处理器（signal handler）是一段可能在程序任意执行点被插入运行的代码——Python 官方文档的原话：低层 C 处理器只「sets a flag」，Python 处理器「at a later point (for example, at the next bytecode instruction)」才执行，而那个「任意字节码之间」可能是主线程正攥着一把锁的那一刻。官方文档对锁的警告逐字（本轮重核）：「Synchronization primitives such as threading.Lock should not be used within signal handlers. Doing so can lead to unexpected deadlocks」——处理器若再去拿主线程已持有的同一把锁，就自己等自己，经典死锁。官方推荐范式（文档 HTTP 服务器示例）：处理器里只往 socketpair 写一个字节（interrupt_write.send(b'\\0')），主循环用 selector 监听可读事件、在正常线程上下文里做真正的事。业界对这个模式的通称是 self-pipe trick（自管道技巧，D. J. Bernstein 推广得名）；Python 还内置了 signal.set_wakeup_fd()——「the signal number is written as a single byte into the fd」，专用于唤醒阻塞在 poll/select 上的循环，asyncio 的信号处理即基于此。vLLM 侧的对应物（pin v0.27.1，本地核实）：wakeup_engine 的注释原话「Not safe in a signal handler - we may interrupt the main thread while it is holding the non-reentrant input_queue.mutex」——input_queue 是 queue.Queue，而 Python queue 文档明确其内部锁「are not designed to handle reentrancy within a thread」（本轮逐字核到，正好是这条源码注释的官方文档依据）；解法与铁律一致：signal_handler 只置 shutdown_state=REQUESTED 并触发 SignalCallback（vllm/v1/engine/utils.py L253-L277：一条阻塞在 threading.Event.wait() 上的守护线程，trigger() 只做 event.set()），真正的「往 input_queue 投 WAKEUP 哨兵」在信号上下文之外执行。",
+      "background": "为什么会有这条铁律：信号是操作系统「中断」语义的延伸，处理器与主线程共享同一份全局状态（包括锁的持有状态）却不受正常调度/同步保证。早期 C 程序员就在信号处理器里调 malloc/printf 这类内部带锁的函数吃过随机死锁的亏，POSIX 由此总结出 async-signal-safe 函数白名单（write() 在表内，加锁、内存分配、大多数库函数不在）——self-pipe trick 就是白名单约束下的通用绕法：用「写一个字节唤醒主循环」替代「在处理器里直接操作共享状态」。Python 的 set_wakeup_fd 与 asyncio 的信号处理是这一 Unix 惯用法的现代翻译；vLLM 的 SignalCallback（Event+守护线程）是它的又一个变体——把「写管道字节」换成「set 一个 Event」，核心思路「处理器只做最小动作、真正的活挪出信号上下文」完全一致。本条目从 v2 映射章（artifacts/ch11-engine-core）复用并改锚 v0.27.1（SignalCallback 位置从 core.py 移到了 engine/utils.py，机制未变，本地核实）。",
+      "example": "Python 官方文档推荐范式的骨架（signal 文档 HTTP 服务器示例的抽象，本轮重核原文一致）：\n```python\nimport signal, socket\n\ninterrupt_read, interrupt_write = socket.socketpair()\n\ndef handler(signum, frame):\n    interrupt_write.send(b'\\0')   # 处理器里唯一的动作：写一个字节（无锁、async-signal-safe）\n\nsignal.signal(signal.SIGINT, handler)\n# 主循环：selector 监听 interrupt_read 可读事件，\n# 事件到达后才在正常线程上下文里做「真正要做的事」\n```\n逐行看：socketpair() 建一对相连的 socket；handler 里的 send 是唯一在信号上下文执行的代码、不涉及任何锁；真正的响应逻辑被推迟到主循环收到可读事件之后——已脱离「打断任意持锁代码」的雷区。对照 vLLM（说明性对照，源码细节见 dossier m9）：「写一个字节」对应 SignalCallback.trigger() 的 event.set()，「selector 监听」对应阻塞在 Event.wait() 的守护线程，「真正要做的事」（往 input_queue 投 WAKEUP）在那条线程里执行——绝不在信号处理器里碰队列锁。",
+      "links": [
+        "https://docs.python.org/3/library/signal.html",
+        "https://docs.python.org/3/library/queue.html",
+        "https://github.com/ccazabon/self-pipe"
+      ],
+      "sources": [
+        {"url": "https://docs.python.org/3/library/signal.html", "note": "Python 官方 signal 文档（本轮 WebFetch 逐字重核 2026-08-22）：锁死锁警告原话「Synchronization primitives such as threading.Lock should not be used within signal handlers. Doing so can lead to unexpected deadlocks」、低层只置标志/下一字节码边界执行的机制说明、socketpair+selector 官方示例、set_wakeup_fd 描述。v2 ch11 研究曾于 2026-07-24 核过同页，本轮复用并重核"},
+        {"url": "https://docs.python.org/3/library/queue.html", "note": "Python 官方 queue 文档（WebFetch 核实 2026-08-22）：队列内部「use locks to temporarily block competing threads; however, they are not designed to handle reentrancy within a thread」——vLLM wakeup_engine 注释里 non-reentrant input_queue.mutex 一词的官方文档依据（新增于本轮，v2 条目未引）"},
+        {"url": "https://github.com/ccazabon/self-pipe", "note": "self-pipe trick 纯 Python 实现仓库，描述明确将其归功 D. J. Bernstein 推广——术语出处与命名惯例的佐证（v2 已核 2026-07-24，沿用；命名史实稳定）"},
+        {"url": "vllm/v1/engine/core.py（wakeup_engine/signal_handler，pin v0.27.1）· vllm/v1/engine/utils.py L253-L277（SignalCallback）（本地核实 2026-08-22）", "note": "pin 一手锚点：SignalCallback 为 Event+守护线程变体（trigger 只 event.set()），与 v2 条目描述的机制一致；v0.27.1 中类位置在 engine/utils.py（v2 写作时在 core.py），已改锚"}
+      ],
+      "confidence": "high",
+      "writer_note": "m9 讲 SIGTERM→REQUESTED+WAKEUP 时，用一句「这是 Unix『信号处理器不能拿锁』铁律的标准解法（self-pipe trick）的一个变体」+链接点过即可——vLLM 侧的具体实现（SignalCallback 的 Event 线程、WAKEUP 哨兵、_handle_shutdown 两模式）正文有源码自己讲透，外部背景不抢戏。queue 文档「锁不处理重入」那句原话可作脚注级证据，把源码注释的 non-reentrant 一词落到实处。"
+    },
+    {
+      "id": "nixl-kv-transfer",
+      "term": "NIXL（NVIDIA Inference Xfer Library）：WAITING_FOR_REMOTE_KVS 在等的那位搬运工",
+      "kind": "external_project",
+      "one_line": "NVIDIA 开源的跨节点内存传输库，vLLM 用它在「拆分角色的多台机器」之间搬 KV cache——本章忙循环里 time.sleep(0.001) 分支注释提到的「等远端 KV」（WAITING_FOR_REMOTE_KVS），等的就是它（或同类 KV connector）的后台搬运。",
+      "what_it_is": "NIXL 是 NVIDIA 开源、托管在 ai-dynamo 组织的点对点数据传输库，README 定位句原话（本轮重核）：「NIXL is targeted for accelerating point to point communications in AI inference frameworks such as NVIDIA Dynamo」。它本身不是通信协议，而是一层统一抽象——同一套 API 下可插拔切换传输后端（README 列出 UCX（默认主传输，v1.22.x 测试）、GDS/GDS_MT（GPU 直连存储）、POSIX、Mooncake、UCCL、LibFabric、GPUNETIO 等；ROCm 主机自动跳过 CUDA 依赖插件）；仓库的 KVBench 基准直接瞄准 KV cache 搬运工作流。多数生产配置下实际搬运靠 RDMA（远程直接内存访问）——网络硬件级的「单边」操作：发起方直接指定对端内存地址读写，全程不需对端 CPU 参与，延迟远低于走完整协议栈+对端 CPU 的「双边」收发（如 TCP send/recv）。vLLM 侧的落地是 NixlConnector 这类 kv-transfer 连接器插件；本仓 pin（v0.27.1）requirements/kv_connectors.txt:5 钉「nixl == 1.3.1」（本地核实）。本章只在 _process_engine_step 的窄分支碰到它：无模型执行但 scheduler 有活（如请求在 WAITING_FOR_REMOTE_KVS）时，忙循环 time.sleep(0.001) 让出 GIL，给 NixlConnector 的后台传输线程留时间片——此刻 GPU 本来就闲，让的不是 GPU 的时间。",
+      "background": "为什么会需要这样的库：vLLM（以及 Dynamo、Mooncake、DistServe 等同类系统）支持「分离式预填充」（disaggregated prefill / PD 分离）——prefill（算 prompt 的 KV，算力密集）与 decode（逐 token 生成，显存带宽密集）分池部署各把硬件用满，代价是 prefill 算出的 KV cache 必须整块搬到 decode 机器，搬慢了就白拆分。NIXL 补的正是「怎么快速搬」：把 RDMA/NVMe-oF 等硬件通道统一封装成一套简单 API，让推理框架不必各自对接底层网络库。本条目从 v2 映射章（artifacts/ch11-engine-core）复用——v2 正是为同一场景（v2 ch11 §11.4 的 1ms sleep 与 WAITING_FOR_REMOTE_KVS）研究并查透的；本轮改锚 v0.27.1（依赖从 v0.21.0 pin 的 nixl>=1.1.0 变为 nixl==1.3.1）并复核仓库现状（2026-08-22：ai-dynamo 托管、Apache-2.0、Linux-only、约 1.2k stars、插件列表如上）。",
+      "example": null,
+      "links": [
+        "https://github.com/ai-dynamo/nixl",
+        "https://docs.vllm.ai/en/stable/features/nixl_connector_usage/"
+      ],
+      "sources": [
+        {"url": "https://github.com/ai-dynamo/nixl", "note": "官方仓库 README（本轮 WebFetch 重核 2026-08-22）：定位句原文「NIXL is targeted for accelerating point to point communications in AI inference frameworks such as NVIDIA Dynamo」、ai-dynamo 组织、插件清单（UCX v1.22.x/GDS/GDS_MT/POSIX/Mooncake/UCCL/LibFabric/GPUNETIO/OBJ/AZURE_BLOB/HF3FS/GUSLI）、KVBench 面向 KV cache、Apache-2.0/Linux-only/约 1.2k stars"},
+        {"url": "https://docs.vllm.ai/en/stable/features/nixl_connector_usage/", "note": "vLLM 官方文档：NixlConnector 定位为高性能 KV cache 传输连接器、UCX 为 NIXL 默认主传输（v2 已核 2026-07-24，沿用——定位性描述稳定，本轮未重抓）"},
+        {"url": "instances/vllm/source/requirements/kv_connectors.txt:5（本地核实 2026-08-22）", "note": "pin v0.27.1 版本锚：nixl == 1.3.1（v2 条目时为 nixl>=1.1.0@v0.21.0 pin，已改锚）"},
+        {"url": "https://link.springer.com/article/10.1007/s13222-020-00355-7", "note": "RDMA 通信模式综述（Datenbank-Spektrum）：「单边」verbs（READ/WRITE/原子操作，不经对端 CPU）与「双边」verbs（SEND/RECV，需双方 CPU 协同）的区分——RDMA 单边读术语准确性的出处（v2 已核 2026-07-24，沿用——学术综述，内容稳定）"}
+      ],
+      "confidence": "high",
+      "writer_note": "本章只在 time.sleep(0.001) 的注释场景碰到「等远端 KV」——一句括注即可：「等的是 NIXL 这类 KV 传输库的后台搬运（pin 钉 nixl==1.3.1），第 36 章 P/D 分离细讲」；PD 分离动机、RDMA 细节、连接器契约全部归 ch36，本章绝不展开。"
+    }
+  ]
+}

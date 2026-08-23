@@ -1,0 +1,169 @@
+{
+ "chapter_id": "ch09",
+ "chapter_title": "EngineCore 的逐拍循环",
+ "pin": "vLLM v0.27.1 (6e448d0ea)",
+ "trace_environment": "本章有精简版 companion（implementation/engine_loop.py 单文件 + _msgspec_seam.py，只做减法、# SOURCE 逐行锚 v0.27.1，48 项 host 测试绿，见 impl-notes.md）。四个驱动脚本全部 host python 实跑、trace_source=run，脚本与原始输出在 explainer/traces/（纯控制流：CPU host、真 torch/pyzmq/msgpack；无 vllm 包、无 GPU、无 xgrammar——seam 代行）。与 pin 真实环境的结构性差异（均就近标注）：① 前向是 ENGINE SEAM（ch17 边界）：驱动经真实 UTILITY 反射 RPC 注入脚本化 logits 行，环内不伪造 forward；seam 以 5ms sleep 建模一步前向（真实几十 ms，2048-8192 token 预算），故同步模式下 ③ 排在 ② 返回之后——真实引擎 ② 发起即返回、③ 在前向进行中计算；trace 证明的是顺序约束（②发起 < ③ < ④ 应用 < 采样）与掩码/记账的数学，『掩码藏进窗口』的等待侧由 m3 的 AsyncOutputFuture『只等 D2H 不等计算』实测兑现。② grammar 位掩码行经 ch30 边界 seam 注入（真实 FSM 编译器归 ch30）；apply_grammar_bitmask 与 greedy argmax 为真码。③ Scheduler 是 ch10/ch11 边界的同签名最小桩（dossier delete 项 11 批准）：头（woosuk 注释）／尾（_update_after_schedule 记账）／get_grammar_bitmask／update_from_output 热循环骨架／判停／分桶／finished 簿记逐字，组批循环体（RUNNING/WAITING 内部、抢占）换成最小 token 账——深水归 ch10/ch11。④ 已知 seam 缺口（m4 trace 的 seam_gap_note 如实标注）：精简版 InputBatch seam 不为已入批（cached）请求刷新 num_computed_tokens，prefill 跨多拍的请求采样行会永远清空（引擎无限步进）；tests 的多拍用例只断言首拍、未触达此径。m4 场景因此取『一拍收官的 prefill』+ 独立排除探针（与 test_prefill_chunk_rows_excluded 同形）；多拍 prefill 收官本就归 ch10（dossier 域边界）。建议 implementer 在 seam InputBatch.update 为 cached 请求补 num_computed 刷新（一行级修复，不影响任何 # SOURCE 逐字段）。⑤ 取证环境：host Windows CPU、torch 2.11.0（CPU 路径）、pyzmq——与 pin 的 Linux/CUDA 差异不触及本章任何观测值（无 GPU 特定行为被测量；PIN_MEMORY=False、xgrammar CPU 内核 seam 与文档语义一致、容器内真内核自动接管）。行号基线 v0.27.1：impl # SOURCE 已逐行核，本 explainer 新引用锚点均为 dossier 账本项或 impl 逐字段。外部数字（Llama-8B@H100 单步 ~5ms 的 V1 alpha 博客、Orca 36.9x）只出现在 intuition/quantified 叙述里、明标外证，不进数值表。",
+ "figure_policy": "dossier needs_figure=true 两机制 m1/m4 各配 1 张 figure_spec，均为 FIGURE-SYSTEM §3.3 允许的正文机制图——每张 spec 的 l0_zoom 字段显式回答「它是 L0 哪一块的放大」：本章 l0_zoom=循环框放大（loop_box 锚），两张图分别是 L2 章图（cartography/l2-specs/ch9.json，gen_L2 渲染）center 五拍拍片行的『时间维展开』（m1：一拍五段双轨时间轴）与『③拍窗口放大』（m4：掩码时序约束+掩码数学）——L2 画结构顺序、这两张画时间与数值，非新架构画法，架构归属回指 L0/L2。开篇图=本章 L2 章图（Map 站职责，gen_L2 已渲染），不归本 explainer。其余 11 机制不提新图（needs_figure 均 false）：m2 忙循环骨架由 L2 站号轨道+正文内嵌 run_busy_loop 代码承担；m3 两段式由 m1 时间轴的 ②④ 两段+正文内嵌 ExecuteModelState 承担；m5-m11/m13 为流程/配置/契约事实，L2 拍片与并排代码引文（dossier embed_excerpts 已备 27 段）承担。",
+ "mechanisms": [
+  {
+   "mechanism_id": "m1",
+   "intuition": "把衣服扔进洗衣机就走开：发起（②）不等洗完，趁机器转的时候干别的活（③ 算掩码），机器叫了再回来收（④ 采样），收完记账（⑤）。EngineCore.step 的五拍顺序就是把一切能并行的 CPU 活都塞进『机器转的那段时间』，不让 GPU 干等一段 Python。",
+   "worked_example": {
+    "params": {
+     "场景": "req-A（prompt 3 token，max_tokens=3）先到；beat 1 后 req-B（prompt 4 token，max_tokens=2）到达——一个请求的一生 + 迟到者同场，5 拍走完：prefill→混相批→双双完成→flush→空转守卫",
+     "机制本体": "EngineCore.step()（vllm/v1/engine/core.py:L584-L614，impl 逐字；①schedule→②execute_model(non_block=True)→③get_grammar_bitmask→④future.result+条件sample_tokens→aborts→⑤update_from_output）",
+     "驱动脚本": "traces/run_m1_five_beats.py → traces/m1_five_beats.json",
+     "采样": "temperature=0（贪婪 argmax：脚本化 logits 行的 favorite 即采样结果）；vocab=16"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m1_five_beats.json",
+    "table": {
+     "columns": ["拍", "① schedule 批 {req: num}", "② 发起→③ 间隔(ms)", "③ bitmask", "④ 采样产出", "⑤ 记账（输出/完成）", "step 返回"],
+     "rows": [
+      ["1", "{'req-A': 3}", "6.041", "None（无结构化请求，快速返回）", "req-A→[7]", "client0 收 1 条；无人完成", "executed=True"],
+      ["2", "{'req-A': 1, 'req-B': 4}", "5.392", "None", "req-A→[8]，req-B→[6]", "client0 收 2 条；无人完成", "executed=True"],
+      ["3", "{'req-A': 1, 'req-B': 1}", "5.418", "None", "req-A→[9]，req-B→[6]", "A LENGTH(3/3)、B LENGTH(2/2)→同拍释放", "executed=True"],
+      ["4", "{}（flush：finished_ids={req-A, req-B} 随批下发）", "—（0-token 批空跑，不前向）", "None", "跳过（model_output 非 None）", "finished 簿记冲刷，无输出", "executed=False"],
+      ["5", "未到达（空转守卫先返回）", "—", "—", "—", "—", "outputs={}，executed=False，executor 零调用"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "拍序不变式：每次 step() 至多按 ①→②→③→④(aborts)→⑤ 各执行一次且顺序固定；has_requests()==False 时先于 ① 早退 ({}, False)、executor 零调用。",
+    "argument": "单调量论证：任一请求 num_output_tokens 每产一个 token 严格 +1 且被 max_tokens 上界钉死 → 每请求有限拍内 FINISHED；完成者当拍被 _free_request 释放、finished_req_ids 恰被下一拍 schedule 冲刷 → 最后一个请求 flush 完 has_requests() 转 False → 空转守卫（L593）先于 ① 返回。本例 5 拍账目闭合：beat 3 双双 LENGTH → beat 4 flush（{A,B} 随 0-token 批下发 worker 清缓存）→ beat 5 守卫（trace beats[4]：runner_events 为空 = executor 零调用）。"
+   },
+   "quantified": "一拍的延迟构成（本例实测，trace beat1_timeline_ms）：① schedule ≈0.05ms（0.003→0.057）→ ② seam 前向 6.041ms（建模一步真实前向，真实几十 ms）→ ③④⑤ 合计 ≈0.29ms（6.098→6.387），一拍全程 6.387ms——CPU 段合计不足前向的 6%。代入 WC1 的账：若 10ms 级 CPU 杂务串行堆在前向后，一步 50ms 前向的引擎每拍变 60ms（吞吐 ≈-17%）；Llama-8B@H100 单步低至 ~5ms（V1 alpha 博客，外证）时同样 10ms 就是 2 倍损失——GPU 越快，五拍排布越值钱；这正是 ch12 重叠版（v0.27.1 服务默认）要进一步消灭的串行段。",
+   "figure_specs": [
+    {
+     "figure_id": "ch09-fig-five-beats-timeline",
+     "template": "swimlane",
+     "l0_zoom": "放大 L0 的循环框（loop_box）——即 L2 章图 center『run_busy_loop → EngineCore.step() 一拍五段（L584-614）』拍片行的时间维展开：L2 画五拍的结构顺序与站号，本图把同一拍放到 CPU/GPU 双轨时间轴上，回答『每段何时发生、各占多久、谁跟谁重叠』。非新架构画法，架构归属回指 L0/L2。",
+     "claim": "一拍五段在 CPU/GPU 双轨时间轴上严格有序（①schedule→②发起前向→③掩码→④采样→⑤记账），全部 CPU 段合计 ≈0.35ms、不足建模前向 6.041ms 的 6%——五拍的顺序本身就是『不许任何 CPU 活让 GPU 干等』的性能设计。",
+     "numbers": [
+      {"value": "beat 1 时间轴：①schedule@0.003ms → ②execute_model@0.057ms → ③bitmask@6.098ms → ④sample@6.125ms → ⑤update@6.32ms，全程 6.387ms", "provenance": "traces/m1_five_beats.json beat1_timeline_ms + beats[0].wall_ms"},
+      {"value": "②→③ 间隔 6.041ms = 建模的一步前向（真实几十 ms，2048-8192 token 预算）", "provenance": "traces/m1_five_beats.json beats[0].gap_launch_to_bitmask_ms + sync_mode_note；真实量级 dossier theory[0]"},
+      {"value": "五拍批形状：{A:3} → {A:1,B:4} → {A:1,B:1} → {} flush → 空转守卫（5 拍走完一个请求的一生+迟到者）", "provenance": "traces/m1_five_beats.json beats[].batch / beats[3].finished_req_ids_riding_batch / beats[4].runner_events(空)"},
+      {"value": "② 每拍 non_block=True（spy 4 次全 True）", "provenance": "traces/m1_five_beats.json non_block_spy"},
+      {"value": "beat 3 同拍两个 LENGTH：A 3/3、B 2/2；beat 4 为 0-token flush（execute 空批早退、不采样）", "provenance": "traces/m1_five_beats.json beats[2].outputs_by_client / beats[3]（total=0、runner_events 仅 execute_model）"}
+     ],
+     "caption_draft": "五拍不是五步流水，是一拍内的时序设计（core.py:L584-L614）：① schedule 在 GPU 启动前把所有可能慢/可能触发抢占的决策做完，② execute_model(non_block=True) 发起前向即返回，③ 语法掩码排在前向窗口里，④ 只等 D2H 就采样，⑤ 记账分桶出件——本例实测 5 拍（prefill→混相批→双双完成→flush→空转守卫），一拍 6.387ms 里 CPU 段合计不足 0.4ms。这是 ch1 循环框五拍伏笔（F1）的逐拍兑现：顺序本身就是性能哲学。",
+     "illustrator_notes": "双轨泳道（上轨=CPU 忙循环单线程，下轨=GPU），一拍从左到右按 beat 1 实测时刻布局：① CPU 窄块（0.003→0.057）、② CPU 发起短线 + GPU 长条（0.057→≈6.098，标『前向 6.041ms（建模的一步前向；真实几十 ms）』）、③ CPU 块画在 GPU 条正下方（标『真实引擎藏进窗口；host 建模排在返回后——时序约束相同』）、④ CPU 块（bitmask→sample 0.029ms + D2H 边界注）、⑤ CPU 块（update→拍末）。右端小回环箭头标『下一拍』。时间轴刻度取 trace 实测值，CPU 块按真实比例极窄——视觉上『GPU 长条 vs CPU 窄段』正是本章论点。"
+    }
+   ],
+   "caveats": "trace 为同步 step()（教学主线，m11：v0.27.1 服务默认心跳已是重叠版 step_with_batch_queue，本章同步版是理解重叠版的唯一地基）；②→③ 间隔在本 trace 中 = seam 前向全程（同步模式前向在 execute_model 内完成），真实引擎该间隔≈0（③ 在前向进行中计算）——表列名如实叫『②发起→③间隔』。"
+  },
+  {
+   "mechanism_id": "m3",
+   "intuition": "两段式像餐厅的传菜口：前厨把菜做好（logits 算完）不装盘，先挂在传菜口（ExecuteModelState 暂存），等服务员来取（sample_tokens）才算一道菜上桌——服务员没取走之前前厨不许开下一道菜（State error 就是这条店规）；而叫服务员的铃铛只等『装盘托盘送到』（D2H 拷贝事件），不需要重炒一遍。",
+   "worked_example": {
+    "params": {
+     "场景": "直接驱动三面：worker 面（暂存→误用→解包清态→复用）、executor 面（non_block Future + 内联早抛）、异步面（AsyncOutputFuture 只等 D2H 事件：挂起 0.25s 无返回、事件置位后毫秒内交出）",
+     "机制本体": "execute_model/sample_tokens 两段式契约（vllm/v1/worker/gpu_model_runner.py:L4166-L4589 + vllm/v1/executor/uniproc_executor.py:L26-L131，impl 逐字）",
+     "驱动脚本": "traces/run_m3_two_phase.py → traces/m3_two_phase.json",
+     "采样": "temperature=0 贪婪 argmax；vocab=8"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m3_two_phase.json",
+    "table": {
+     "columns": ["阶段", "动作", "execute_model_state", "返回", "判定"],
+     "rows": [
+      ["② 第一段", "execute_model(批{'req-1': 3})", "暂存 10 字段（logits 1×8）", "None", "前向算完、采样欠着"],
+      ["误用防御", "再来一次 execute_model", "非 None（上一拍未消费）", "RuntimeError：State error（原文见 trace）", "worker 自己炸，不产出错数据"],
+      ["④ 第二段", "sample_tokens(None)", "解包→清 None", "sampled=[[1]]（argmax=favorite 1）", "掩码位→贪心采样，态已清"],
+      ["再次 ②", "消费后再 execute_model（批含新 req-2）", "重新暂存（新批）", "None", "合法：sampled=[[1], [2]]（req-1 续 decode + req-2 新入批）"],
+      ["④ 异步半边", "executor.sample_tokens(non_block=True)", "—", "AsyncOutputFuture（done=False）", "result() 只等 D2H 事件，不等计算"],
+      ["D2H 完成", "挂起 0.25s 后事件置位", "—", "置位后 0.142ms 返回；二次 result() 0.008ms", "阻塞期间无返回=True；采样=[[4]]"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "暂存态不变式：execute_model_state ≠ None ⟺ 恰有一拍前向的采样欠着；两次 execute_model 之间必恰有一次 sample_tokens，误序由 worker 入口的 State error 防御拦下。",
+    "argument": "基例：初始为 None。归纳步：execute_model 入口检查旧值非 None 即 raise（gpu_model_runner.py:L4171-L4175，本例原文触发），唯一成功路径是写入新暂存；sample_tokens 唯一入口先解包再立即置 None（L4578-L4580，本例实测清空）——两个入口一置一清、互斥推进，态非空时引擎不可能发起第二拍前向，因此『前向算完、采样欠着』的中间态永不重叠。"
+   },
+   "quantified": "等待账：② 发起即拿 Future（本例构建 0.117ms、同步模式下返回时已就绪）；异步模式 ④ 的 result() 只等 D2H 拷贝事件——事件未置位时阻塞 250ms 零返回（实测 result_still_blocked_after_window=True），置位后 0.142ms 交出结果、二次 result() 0.008ms（Future 已 done，纯缓存读）。暂存代价 = 1 个 10 字段 NamedTuple 的引用（0 次拷贝）；防御代价 = 入口 1 条 raise。对照：若 ④ 要『等计算』而非『等事件』，阻塞时长就是前向本身（几十 ms）而非事件置位（亚毫秒）。",
+   "figure_specs": [],
+   "caveats": "异步面用 async_scheduling=True 的 config seam（v0.27.1 服务默认即 True，本章教学主线走同步版——m11）；AsyncGPUModelRunnerOutput 的 D2H 在 CPU host 上由 threading.Event seam 代行（get_output 语义逐字：阻塞至拷贝完成、invalid 行清空、回填 sampled_token_ids；CUDA copy stream 本体归 ch12/ch17）。"
+  },
+  {
+   "mechanism_id": "m4",
+   "intuition": "像考卷上『只允许圈选的部分题』：模型最想圈第 5 题（logit 9.0 最高），但规则表只准圈 {1,4}——掩码在落笔（采样）之前把不许选的选项分数涂成 -∞。而这张规则表不必等卷子印完（GPU 前向）才开算：它只依赖『这拍谁在考、考到第几题』（调度结果），所以 ② 发起之后就能准备，只要赶在落笔前放到桌上。",
+   "worked_example": {
+    "params": {
+     "场景": "三场景对照——主场景（结构化 g，一拍收官 prefill + 2 decode 到顶）、排除探针（预算 2 < prompt 3 → 首拍非末块 chunk）、无掩码对照（同 logits 行、无结构化标记）",
+     "机制本体": "③ get_grammar_bitmask（vllm/v1/core/sched/scheduler.py:L1646-L1668）+ worker 半边 apply_grammar_bitmask（vllm/v1/structured_output/utils.py:L86-L175，impl 逐字；④ 内应用于 logits）",
+     "logits 行": "[0.0, 3.0, 0.0, 0.0, 7.0, 9.0, 0.0, 0.0]——favorite=5@9.0、次高 4@7.0、1@3.0，vocab=8",
+     "位掩码字": "0b00010010（bits 1、4 置位）→ 允许集 {1,4}；经 ch30 边界 seam 注入（真实 FSM 编译归 ch30）",
+     "驱动脚本": "traces/run_m4_bitmask_window.py → traces/m4_bitmask_window.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m4_bitmask_window.json",
+    "table": {
+     "columns": ["场景/拍", "① 批", "is_prefill_chunk", "③ 掩码", "④ 采样（贪婪想选 5@9.0）", "输出/判定"],
+     "rows": [
+      ["探针（预算 2）", "{p: 2}", "True（2/3 未完）", "排除（grammar manager 零调用）", "采样行被清空（无采样行）", "无输出（部分 prefill 不出活）"],
+      ["主场景拍 1", "{g: 3}（一拍收官）", "False（3/3）", "算出·允许集 {1, 4}", "5 被禁（置 -inf）→ 选 4（7.0）", "client0 收 [4]（首 token）"],
+      ["主场景拍 2", "{g: 1}", "False", "算出·允许集 {1, 4}", "选 4", "[4]"],
+      ["主场景拍 3", "{g: 1}", "False", "算出·允许集 {1, 4}", "选 4", "[4]→LENGTH（3/3）"],
+      ["对照", "{ctrl: 2}（无结构化标记）", "False", "None（快速返回）", "无掩码 → 贪婪选 favorite → [5]", "同一行 logits，掩码是唯一变量"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "窗口不变式：apply_bitmask 的执行时刻严格落在（execute_model 发起之后，greedy_sample 之前）；且凡结构化请求产出的 token 必 ∈ 本拍掩码允许集——被禁 token 的 logit 为 -inf，argmax 永不选中。",
+    "argument": "时序半边：③ 的输入依赖本拍 scheduler_output（哪些请求在批里、各排几 token——非末块 prefill 直接排除，探针实测 manager 零调用），又必须在 _sample 作用 logits 之前到位（core.py:L596-L604 固定调用顺序；trace beat1_event_order 八事件实测有序：execute_model < get_grammar_bitmask < apply_bitmask < greedy_sample）。数学半边：位清零 → -inf 的内核语义使被禁项在任何 tie-break 下都不可能胜出——本例 favorite 5（9.0）被禁、三拍采样恒 4，对照场景无掩码采样 5（掩码是唯一变量）。"
+   },
+   "quantified": "窗口收益 = min(bitmask 耗时, forward 耗时)：本例 ③ 发起后 0.049ms 即完成应用（gap_bitmask_to_apply_ms），远小于 seam 前向 5.756ms → 全掩盖（真实引擎前向几十 ms、位掩码每拍按批算一遍，更富余）；若不藏进窗口而串行排在采样前，每拍白加一整段 bitmask 时长。约束的代价方向：允许集从 8 缩到 2（vocab 8、允许 {1,4}），9.0 分的 favorite 5 让位给 7.0 分的 4——结构化输出用『分数』换『合法』，正确性压过 argmax。异步调度下 bitmask 还需要上拍采样 token、缺 token 走 deferred 采样分支（core.py:L665-L677/L719-L737，一句话预告 ch12）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch09-fig-bitmask-window",
+     "template": "before-after",
+     "l0_zoom": "放大 L0 循环框（loop_box）内的 ③拍窗口——即 L2 章图 center ③ get_grammar_bitmask 拍片的时序放大：回答『掩码为什么必须卡在 ② 之后 ④ 之前、它对采样行做了什么』。与 m1 时间轴图（同一拍的全景）互为缩放关系，非新架构画法，架构归属回指 L0/L2。",
+     "claim": "同一条 logits 行 [0,3,0,0,7,9,0,0]，无掩码贪婪选 5（9.0 最高）；③ 在 ② 发起之后、④ 采样之前把允许集外的 token 置 -inf（本例允许 {1,4}）→ 改选 4——掩码是唯一变量（对照实测选 5），且非末块 prefill 请求被 ③ 整体排除（探针零调用）。",
+     "numbers": [
+      {"value": "logits 行 [0.0, 3.0, 0.0, 0.0, 7.0, 9.0, 0.0, 0.0]：favorite=5@9.0、次高 4@7.0、1@3.0（vocab=8）", "provenance": "traces/m4_bitmask_window.json scripted_logits_row / scripted_logits_note"},
+      {"value": "掩码字 0b00010010 → 允许集 {1,4}；位清零的 token 置 -inf", "provenance": "traces/m4_bitmask_window.json scripted_bitmask_word0_binary / scripted_bitmask_allowed_set / mask_semantics"},
+      {"value": "主场景三拍采样恒 [4]、[4]、[4]→LENGTH(3/3)；对照（同行、无标记）采样 [5]", "provenance": "traces/m4_bitmask_window.json main_beats[].outputs / control_unmasked.sampled"},
+      {"value": "窗口时序实测（主场景拍 1）：execute@0.05ms < bitmask@5.806ms < apply@5.855ms < greedy@6.245ms", "provenance": "traces/m4_bitmask_window.json beat1_timeline_ms / beat1_event_order"},
+      {"value": "排除探针：预算 2 < prompt 3 → is_prefill_chunk=True、grammar manager 零调用、无输出", "provenance": "traces/m4_bitmask_window.json probe_beat（batch {p:2}、manager_events 空、outputs 空）"},
+      {"value": "③ 算出 → 应用 0.049ms，远小于 5.756ms 的建模前向窗口（真实引擎整段藏得进）", "provenance": "traces/m4_bitmask_window.json beat1_window.gap_bitmask_to_apply_ms / gap_launch_to_bitmask_ms"}
+     ],
+     "caption_draft": "为什么掩码可以不等前向算完、采样却非等掩码不可（core.py:L596-L604 + scheduler.py:L1646-L1668）：③ 只依赖『这拍谁在批里、各几 token』——调度结果在 ② 发起时已定，非末块 prefill 甚至直接排除（探针零调用），所以能塞进前向窗口里算；但它必须赶在 ④ 的 argmax 之前把允许集外的 logit 涂成 -inf——同一条 [0,3,0,0,7,9,0,0] 行，无掩码选 5、有掩码（允许 {1,4}）恒选 4。这张位掩码从哪来、怎么算，第 30 章回收（F6 埋点）。",
+     "illustrator_notes": "上下两半 before-after：上半『应用掩码前』——8 列 token 柱状（0..7，高=logit：0,3,0,0,7,9,0,0），token 5 柱最高标 favorite、argmax 箭头指向 5；下半『应用后』——token 5 柱打红叉标 -inf、token 4 柱高亮为 argmax、允许集 {1,4} 外的柱淡出。中部夹一条窄时间条（主场景拍 1 实测：execute→bitmask→apply→greedy 四刻度），两端各一个约束括注：左『③ 依赖 ①的批（非末块 prefill 排除）』、右『③ 必须先于 ④ 的采样』。右下小框：探针（预算 2<3 → chunk → ③ 跳过、无输出）。"
+    }
+   ],
+   "caveats": "位掩码行经 ch30 边界 seam 注入（真实由 grammar FSM 编译器在输入线程异步编译产出——grammar_init 不占忙循环）；多拍 prefill 的续拍收官在精简版 InputBatch seam 有已知缺口（见顶层 trace_environment ④与 trace 的 seam_gap_note），故主场景取一拍收官、探针止步首拍——多拍 chunk 语义归 ch10。"
+  },
+  {
+   "mechanism_id": "m12",
+   "intuition": "像旅行团一天行程收尾的逐人点名：导游（⑤ 热循环）按当拍名单挨个过——在场的记一笔新见闻（append token）、到站离团的当场办退房（判停+释放+记账）、名单上已划掉的直接跳过（abort/已完成的 continue，点名不复活）；最后按『哪家旅行社』（client_index）分袋装单寄出，离团名单另抄一份随明天的行程单发给酒店（finished_req_ids 随下拍批下发、worker 清缓存）。",
+   "worked_example": {
+    "params": {
+     "场景": "a（client0，max_tokens=2）、b（client1，max_tokens=4）、c（client0，max_tokens=8）同场；beat 2 前 aborts_queue 投 ['c']——急切通道在 ④⑤ 之间落地（core.py:L606-L608），c 的采样行已被 ④ 算出却在 ⑤ 被跳过",
+     "机制本体": "⑤ update_from_output（vllm/v1/core/sched/scheduler.py:L1670-L1762 热循环 + L2014-L2029 分桶，impl 骨架逐字）",
+     "驱动脚本": "traces/run_m12_update_from_output.py → traces/m12_update_from_output.json",
+     "采样": "temperature=0 贪婪；favorites a→7/8、b→6、c→5；vocab=16"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m12_update_from_output.json",
+    "table": {
+     "columns": ["拍", "⑤ 输入批", "逐请求动作", "状态转移/回收", "分桶输出（client0 | client1）", "finished_ids 随下拍批"],
+     "rows": [
+      ["1", "{a:1, b:1, c:1}", "3 请求定位行→append→判停（a→7, b→6, c→5）", "3×RUNNING 续跑", "a[7], c[5] | b[6]", "∅"],
+      ["2", "{a:1, b:1, c:1}（c 的行已被 ④ 采样）", "a: append→LENGTH→释放；b: append；c: 已 abort→跳过（行丢弃）", "a→LENGTH(2/2)、c→ABORTED；b 续", "a[8]+length | b[6]", "{a, c}"],
+      ["3", "{b:1}（批已剔除 a/c）", "b: 定位行→append", "b 续（3/4）", "∅ | b[6]", "∅"],
+      ["4", "{b:1}", "b: append→LENGTH→释放", "b→length(4/4)", "∅ | b[6]+length", "{b}"],
+      ["5", "{}（flush）", "无请求可记账，冲刷 finished 簿记", "—", "∅ | ∅", "∅"],
+      ["6", "未到达（空转守卫）", "—", "—", "—", "—"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "守恒不变式：⑤ 对每个当拍调度的 req_id 恰处理一次——已 abort/已完成的跳过（不产出、不复活）；每个 FINISHED 请求恰进一次 finished_req_ids，且恰被下一拍 schedule 冲刷进 SchedulerOutput 通知 worker 清缓存。",
+    "argument": "计数论证：热循环遍历 num_scheduled_tokens 每键恰一次（L1735 起）；request is None 或 is_finished() → continue（L1747-L1755，『aborted while the model is executing it』的真实注释案例——本例 c 的行被 ④ 采出却零输出即此分支）；停止路径唯一：check_stop 置 FINISHED_* → _handle_stopped_request → _free_request 恰 add 一次 finished_req_ids 并 del requests[req_id]，幂等判据（is_finished）使二次进入不可能。本例 6 拍账目闭合：a、c 同拍出账且 {a,c} 恰在 beat 3 批上出现一次；b 的 {b} 恰在 beat 5 出现一次；beat 6 守卫——无泄漏、无重复。"
+   },
+   "quantified": "热循环成本线性于批内请求数：每请求循环体 = 1 次字典定位（req_id_to_index[req_id]）+ append + check_stop（判 finished 是一次整数比较 status > PREEMPTED）。本例 3 请求的 ⑤ 段为亚毫秒级（单请求参照 m1 trace：update@6.320ms→拍末 6.387ms ≈0.07ms）；woosuk 自注上限——len(num_scheduled_tokens) 可到 1000+，此循环是公认性能瓶颈、循环内必须避免昂贵操作（scheduler.py:L1728-L1730）；按 0.07ms/请求线性外推千级批 ≈70ms/拍，正是 ch12 重叠版要把 schedule/update 挪出关键路径的动机之一（ch10 域的 remove_all 快路径、ConstantList 只读视图是同一条纪律的后续）。",
+   "figure_specs": [],
+   "caveats": "c 的 abort 走 aborts_queue 急切通道（beat 2 的 ④⑤ 之间落地）；input_queue 里的 ABORT 副本随后经 _handle_client_request 到达时由 finish_requests 幂等判据吸收（trace 里 c 只出现一次 finish_call）。抢占/stale drain/spec 回扣等深水分支属 ch11/ch12（dossier delete 项 7/11）。"
+  }
+ ]
+}
