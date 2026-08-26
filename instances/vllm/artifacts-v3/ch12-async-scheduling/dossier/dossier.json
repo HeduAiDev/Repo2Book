@@ -1,0 +1,971 @@
+{
+ "chapter_id": "ch12",
+ "part": "III",
+ "title": "异步调度",
+ "pin": "vLLM v0.27.1 (6e448d0ea)",
+ "chapter_kind": "code",
+ "note_on_kind": "标准代码章（非 primer）：走 implementer 精简版 + lint_fidelity 全链。本章把 L0 的循环框+执行臂接缝放大：ch9 立了同步五拍骨架，ch10 打开了①拍 schedule() 的 token 账本，ch11 讲了抢占与请求一生——本章讲 v0.27.1 服务场景的默认心跳：step_with_batch_queue 批队列重叠版 + AsyncScheduler 占位调度 + worker 侧『采样 token 不落 CPU』的影子状态。叙事角度按 pedagogy-plan：『v0.27.1 默认开启——默认心跳』——重叠版不是选修深水区，是读者跑起 vLLM 服务就在转的那个循环。",
+ "hook_suggestion": "「GPU 一步前向几十毫秒就算完了，可它每出一个 token 都要干等 Python 把下一步怎么排批算完——CPU 调度那几毫秒，能不能藏进 GPU 的计算时间里？更进一步：调度器还没拿到上一步的输出 token，它凭什么敢把下一步排出去？排多了谁记账、排错了谁兜底？」（从 Part III hook『调度器只认 token 数不认请求数』+ 本章主题『异步调度·默认心跳』+ deepread/engine-loop.json why_chains[5]『批队列+异步调度默认开启』与 deepread/gpu-exec.json why_chains[5]『调度下一拍与执行当前拍完全重叠，采样 token 不落 CPU』提炼）",
+ "scope_note": "主线 = v0.27.1 的默认心跳三件套：(A) step_with_batch_queue（core.py:L625-L739）两态循环——上半段『填管道优先』（盲调度→发起前向→立即采样或推迟→appendleft 入队→队未满直接 return None），下半段『pop 最老批收结果』（future.result→aborts→update_from_output→deferred 补采重新入队）；(B) AsyncScheduler（async_scheduler.py 全文件 70 行）两把钥匙——_update_after_schedule 占位 +1（num_output_placeholders += num_sampled_tokens_per_step + spec 数）、_update_request_with_output 真 token 到达扣减 + cache_blocks 把乐观块转正；(C) worker 执行臂的影子状态——采样 token 留 GPU（prev_sampled_token_ids）、token_ids_cpu 只写 -1 占位、下一拍 _prepare_input_ids 在 GPU 上 scatter 回填、AsyncGPUModelRunnerOutput 专用 copy stream 异步 D2H。默认值链路全讲：async_scheduling=None → VllmConfig 仲裁为 True（vllm.py:L1095-L1143）→ get_scheduler_cls 换 AsyncScheduler（config/scheduler.py:L170-L178）→ max_concurrent_batches=2（vllm.py:L539-L550）→ batch_queue 建立、step_fn 静态绑定（core.py:L206-L233）。\n边界与邻章分工：ch9 已立五拍骨架/忙循环/IO 线程/execute_model 两段式契约（返回 None=暂存等采样）——本章不再展开 step() 五拍内部与启动握手；ch10 已立 schedule() 两阶段 token 账本与追赶公式——本章只讲公式的 num_output_placeholders 项怎么从恒 0 灌上占位数（L516-L520），以及 async 专属的 early-stop 剪枝（L488-L502）；ch11（抢占与请求的一生）拥有 _preempt_request/check_stop/RequestStatus 状态机全内景——本章只看 async 账单半边：stale 标记（num_stale_output_tokens = num_in_flight_tokens）、占位清零、update_from_output 锁步 drain（L1296-L1308 / L1736-L1743）；ch17 已立 Executor/Worker/ModelRunner 三层——本章用其两段式契约与 collective_rpc 但不重讲；ch18（持久批次与固定地址）拥有 InputBatch/CpuGpuBuffer 内景——本章只用 prev_sampled_token_ids / prev_req_id_to_index 两个影子字段（gpu_input_batch.py:L310-L311）与 token_ids_cpu 的 -1 占位行；ch22（slot_mapping 与 block_table）回收『D2H 斩断异步调度之忌』——本章只立『同步禁区』纪律与 VLLM_GPU_SYNC_CHECK tripwire；ch30/ch31 结构化输出——本章只讲 deferred sampling 分支与 bitmask 时序耦合，掩码怎么算归 ch30；ch33 spec decode——本章只讲占位数怎么表达 spec token、拒绝回扣（L1769-L1784）、post_step 的 worker 侧 draft 更新（core.py:L616-L623），drafter 生态归 ch33。\n外证口径：async+PP 完全支持的 30.8% E2E 吞吐 / 31.8% TPOT 出自 commit 3e440786a 的标题（git 证据，非论文数字）；Orca/Sarathi 血统数字属 ch10，不在本章。\nv2 迁移警示（逐段现核后才可迁移）：v2 ch12（批队列，v0.21.0 基线）三处已漂移——①max_concurrent_batches 从 executor 上移到 VllmConfig（v0.21 是 uniproc_executor.py:L76-L78 / multiproc_executor.py:L474-L478 各自声明，v0.27.1 唯一出处 vllm/config/vllm.py:L540，EngineCore 直读 vllm_config core.py:L206）；②填管道优先判定条件已改：v0.21 是 `len<size and not batch_queue[-1][0].done()`，v0.27.1 是 `len<size and (model_executed or self.scheduler.has_requests())`（core.py:L682-L684）；③deferred 分支 use_spec_decode 改名 check_for_draft_tokens 且 take_draft_token_ids 可返回 None（core.py:L722-L730 现在带 None 守卫）。v2 ch19 的 worker 侧两段式/影子状态段同样须按 v0.27.1 行号重核后迁移。",
+ "code_spine": [
+  "vllm/config/scheduler.py:L148-L151 —— async_scheduling 配置位：None=默认，交给 VllmConfig 仲裁；显式 True 硬失败检查在 vllm.py:L1064-L1093",
+  "vllm/config/vllm.py:L1095-L1143 —— 默认仲裁：None → True（pooling 模型 / 非 EAGLE 系 spec 方法 / executor 不支持 / ROCm DBO 才降 False）——『默认心跳』的出处",
+  "vllm/config/vllm.py:L539-L550 —— max_concurrent_batches 深度仲裁：async+单 PP→2（重叠双缓冲）· V2 runner→pp_size+1 · 纯 PP→pp_size",
+  "vllm/config/scheduler.py:L170-L178 —— get_scheduler_cls：async → AsyncScheduler（占位调度版调度器）",
+  "vllm/v1/engine/core.py:L206-L233 —— 装配：batch_queue_size = vllm_config.max_concurrent_batches；>1 建 deque(maxlen)；step_fn 静态绑定 step_with_batch_queue",
+  "vllm/v1/engine/core.py:L584-L614 —— 同步 step()（ch9 主角，本章只作重叠的背景板与对照）",
+  "vllm/v1/engine/core.py:L625-L687 —— step_with_batch_queue 上半段：盲调度 → execute_model(non_block) → 立即采样/deferred → appendleft 入队 → 填管道优先 return",
+  "vllm/v1/engine/core.py:L689-L739 —— step_with_batch_queue 下半段：pop 最老批 → future.result → aborts → update_from_output → deferred 补采重新入队",
+  "vllm/v1/core/sched/async_scheduler.py:L19-L49 —— AsyncScheduler._update_after_schedule：非 prefill-chunk 请求占位 +1、spec_token_ids 换 -1 占位列表",
+  "vllm/v1/core/sched/async_scheduler.py:L51-L70 —— AsyncScheduler._update_request_with_output：真 token 扣减占位（stale 不扣）+ cache_blocks 转正乐观块",
+  "vllm/v1/core/sched/scheduler.py:L516-L520 —— 追赶公式：+ num_output_placeholders 项在 async 下灌上占位数（ch10 立公式、本章灌值）",
+  "vllm/v1/core/sched/scheduler.py:L488-L502 —— RUNNING 循环 early-stop 剪枝（async 专属：确信上拍已达 max_tokens 就不排多余一步）",
+  "vllm/v1/core/sched/scheduler.py:L1296-L1308 —— _preempt_request 的 async 账单：stale=在飞数、占位清零（抢占内景归 ch11）",
+  "vllm/v1/core/sched/scheduler.py:L1736-L1743 —— update_from_output 热循环：num_in_flight_tokens 扣减 + stale 锁步 drain",
+  "vllm/v1/core/sched/scheduler.py:L1769-L1784 —— spec 拒绝回扣：num_computed_tokens 与 num_output_placeholders 同步回退（stale 不回扣）",
+  "vllm/v1/core/sched/output.py:L235-L241 —— SchedulerOutput 两个 async 标志：has_structured_output_requests / pending_structured_output_tokens",
+  "vllm/v1/worker/gpu_model_runner.py:L3797-L3813 —— worker 影子①：sampled_token_ids 缓存进 input_batch.prev_sampled_token_ids（GPU 张量）+ prev_req_id_to_index",
+  "vllm/v1/worker/gpu_model_runner.py:L3815-L3842 —— worker 影子②：token_ids_cpu 行只写占位 -1（num_tokens_no_spec 照常推进）——『采样 token 不落 CPU』",
+  "vllm/v1/worker/gpu_model_runner.py:L1784-L1877 —— _prepare_input_ids：正常拍直拷；async 拍 prev_positions 映射 + common-case 单 slice 直拷",
+  "vllm/v1/worker/gpu_model_runner.py:L1878-L1891 —— scatter 兜底：批次变过时按 index scatter 回填 input_ids.gpu（spec draft 再补一轮 L1893-L1913）",
+  "vllm/v1/worker/gpu_model_runner.py:L2081-L2105 —— optimistic_seq_lens（假定 draft 全接受）+ discard_request_mask",
+  "vllm/v1/worker/gpu_model_runner.py:L259-L350 —— AsyncGPUModelRunnerOutput：专用 copy stream wait_stream(default) → non_blocking D2H → event.record；get_output event.synchronize",
+  "vllm/v1/executor/uniproc_executor.py:L26-L42 —— AsyncOutputFuture：result() 才 get_output（惰性收割，只等事件不等计算）",
+  "vllm/v1/engine/core.py:L616-L623 —— post_step：async 下 draft token 在 worker 进程更新、不回传主进程",
+  "vllm/v1/engine/core.py:L1365-L1371 —— has_work：bool(batch_queue) 让在飞批保活忙循环",
+  "vllm/v1/engine/core_client.py:L306-L322 —— InprocClient：离线 LLM() 门面直调 step_fn（无忙循环，但默认配置下驱动的同样是重叠版）"
+ ],
+ "stations": [
+  {
+   "n": 1,
+   "where": "core.py:L206-L212",
+   "what": "启动装配·队列：batch_queue_size = vllm_config.max_concurrent_batches（默认配置=2）；>1 才建 batch_queue = deque(maxlen=2)——两个批同时在飞的物质基础"
+  },
+  {
+   "n": 2,
+   "where": "vllm/config/vllm.py:L539-L550",
+   "what": "深度从哪来：max_concurrent_batches——async+单 PP→2（CPU 调度与 GPU 执行双缓冲）；纯 PP→pp_size（填流水线）；V2 runner→pp_size+1。v0.21 在 executor 侧、v0.27.1 上移到 VllmConfig"
+  },
+  {
+   "n": 3,
+   "where": "vllm/config/vllm.py:L1095-L1143",
+   "what": "默认仲裁：async_scheduling=None → True——pooling 模型/非 EAGLE 系 spec 方法/executor 不支持（ray）/ROCm DBO 才降 False。v0.27.1 生成服务的默认心跳就是重叠版"
+  },
+  {
+   "n": 4,
+   "where": "vllm/config/scheduler.py:L170-L178",
+   "what": "调度器换型：get_scheduler_cls——async → AsyncScheduler（会做占位调度的那个 Scheduler 子类）"
+  },
+  {
+   "n": 5,
+   "where": "core.py:L652-L653",
+   "what": "心跳上半段 A（批 B）：AsyncScheduler.schedule() 盲调度——此刻批 A 还在 GPU 上跑、输出未回，调度器凭占位数先排本拍"
+  },
+  {
+   "n": 6,
+   "where": "core.py:L654-L657",
+   "what": "发起批 B 前向：execute_model(scheduler_output, non_block=True) 立即返回 exec_future——不等 GPU；worker 侧把请求差量落进持久 InputBatch 后跑前向"
+  },
+  {
+   "n": 7,
+   "where": "async_scheduler.py:L19-L49",
+   "what": "占位 +1（AsyncScheduler._update_after_schedule）：非 prefill-chunk 请求 num_output_placeholders += num_sampled_tokens_per_step + spec 数；spec_token_ids 整体换成 -1 占位列表（真 token 由 worker 原地替换）"
+  },
+  {
+   "n": 8,
+   "where": "core.py:L665-L677",
+   "what": "采样排程：无 pending_structured_output_tokens → 立即 get_grammar_bitmask + sample_tokens(grammar_output, non_block=True)（bitmask 夹缝时序随队列保持）；有 pending → 存 deferred_scheduler_output 推迟"
+  },
+  {
+   "n": 9,
+   "where": "core.py:L679-L687",
+   "what": "入队+填管道优先：appendleft((future, scheduler_output, exec_future)) 三元组；队未满且还有活可调 → return (None, model_executed)——不等结果，忙循环转下一圈继续调度"
+  },
+  {
+   "n": 10,
+   "where": "gpu_model_runner.py:L3797-L3813",
+   "what": "worker 影子①：采样结果不落 CPU——sampled_token_ids 缓存进 input_batch.prev_sampled_token_ids（GPU 张量，注释 'avoid CPU sync'）+ 记 prev_req_id_to_index 上拍槽位表"
+  },
+  {
+   "n": 11,
+   "where": "gpu_model_runner.py:L3821-L3842",
+   "what": "worker 影子②：token_ids_cpu 对应行只写占位 -1（is_token_ids=True、num_tokens_no_spec 照常推进）——CPU 侧账本在走，真 token 在 GPU 上"
+  },
+  {
+   "n": 12,
+   "where": "core.py:L695-L706",
+   "what": "心跳下半段 B（收批 A）：pop 最老批 → future.result()——AsyncOutputFuture 只等异步 D2H 拷贝事件（AsyncGPUModelRunnerOutput.event.synchronize），不等计算；None ⇒ execute_model 失败，重抛真异常"
+  },
+  {
+   "n": 13,
+   "where": "core.py:L708-L713",
+   "what": "真记账：_process_aborts_queue 批量落地执行期到达的 abort → update_from_output(scheduler_output, model_output) 逐请求推进状态机"
+  },
+  {
+   "n": 14,
+   "where": "async_scheduler.py:L51-L70",
+   "what": "占位 -1（AsyncScheduler._update_request_with_output）：真 token 到达 num_output_placeholders -= len(new_token_ids)（assert ≥0，stale 不扣）；cache_blocks(request, num_computed_tokens - num_output_placeholders) 把乐观块转正式——差值=真实已算"
+  },
+  {
+   "n": 15,
+   "where": "gpu_model_runner.py:L1868-L1891",
+   "what": "闭环：下一拍 _prepare_input_ids 在 GPU 上把 prev_sampled_token_ids 写进 input_ids.gpu——批次未变走单 slice 直拷（L1868-L1877），变过按 index scatter（L1878-L1891）——真 token 全程没经过 CPU"
+  }
+ ],
+ "stations_note": "站号 = 一轮重叠心跳的代码顺序：第 1-4 站是启动期装配（默认即重叠的三级链路：深度→仲裁→调度器换型→队列建立），第 5-9 站是心跳上半段（批 B 盲调度→发起前向→采样排程→入队→填管道优先返回），第 10-11 站是 worker 执行臂的影子状态（与上半段同时发生：批 B 在 CPU 调度、批 A 在 GPU 上算并采样），第 12-14 站是心跳下半段（两轮之后 pop 最老的批 A 收结果、真记账、占位扣减），第 15 站回到 worker——下一拍前向的输入由 GPU 直接回填，闭环。教学建议（沿 deepread first_read_suggestion）：先立同步 step() 四段串行的骨架（ch9 已立），再讲『为什么要重叠』的三段相加账，然后拆两态循环，最后讲占位账本与影子状态——它们是同一枚硬币的两面：调度器侧用占位数盲走，worker 侧用 GPU 张量留真值。与 ch11 衔接：第 12-14 站之间的 stale drain、抢占时占位清零是 ch11 抢占机制的 async 半边。与 ch18 衔接：第 10-11 站的 prev_sampled_token_ids/token_ids_cpu 是持久批次的两个影子字段，容器内景归 ch18。",
+ "key_classes": [
+  {
+   "name": "EngineCore.step_with_batch_queue",
+   "file": "vllm/v1/engine/core.py",
+   "responsibility": "本章主角。v0.27.1 服务默认心跳：维护深度=max_concurrent_batches 的 deque，新批 appendleft 入队、最老批 pop 取结果；『填满流水线优先于取模型输出』——队未满且还有活就 return (None, model_executed) 让忙循环继续调度。返回 (outputs|None, model_executed)。"
+  },
+  {
+   "name": "EngineCore.batch_queue / batch_queue_size / step_fn / async_scheduling",
+   "file": "vllm/v1/engine/core.py",
+   "responsibility": "batch_queue = deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]]（maxlen=batch_queue_size），元素=(采样结果 future, 该批 SchedulerOutput, execute_model future) 三元组；batch_queue_size = vllm_config.max_concurrent_batches（L206）；step_fn 在 __init__ 静态绑定（L231-L233）——EngineCore 不直接看 async_scheduling 标志选 step，看的是队列建没建；async_scheduling 落地为实例字段（L234），post_step 用它短路 draft 回传。"
+  },
+  {
+   "name": "VllmConfig.max_concurrent_batches",
+   "file": "vllm/config/vllm.py",
+   "responsibility": "批队列深度的唯一出处（L539-L550 property）：async+V1 runner+单 PP→2；V2 runner→pp_size+1；纯 PP→pp_size；无 async 无 PP→1（不建队列）。v0.21 时在 executor 侧各自声明（迁移陷阱）。"
+  },
+  {
+   "name": "SchedulerConfig.async_scheduling + get_scheduler_cls",
+   "file": "vllm/config/scheduler.py",
+   "responsibility": "async_scheduling: bool | None = None（L148-L151）——None 交给 VllmConfig 默认仲裁；get_scheduler_cls（L170-L178）按它返回 AsyncScheduler 或 Scheduler——async 不只换 step，连调度器类一起换。"
+  },
+  {
+   "name": "AsyncScheduler",
+   "file": "vllm/v1/core/sched/async_scheduler.py",
+   "responsibility": "Scheduler 子类（全文件 70 行），只覆写两个方法：_update_after_schedule（占位 +1：num_output_placeholders += num_sampled_tokens_per_step + spec 数；spec_token_ids 换 -1 占位；置 pending_structured_output_tokens）与 _update_request_with_output（占位 -1 + cache_blocks 转正乐观块）。盲调度的账本引擎。"
+  },
+  {
+   "name": "Request（异步计数器字段群）",
+   "file": "vllm/v1/request.py",
+   "responsibility": "L150-L162 四个 async 字段：num_output_placeholders（占位数，同步恒 0）、num_in_flight_tokens（在飞步的 token 数——computed 乐观计入的部分）、num_stale_output_tokens（被抢时在飞的输出，恢复后照送但不许动已清零的计数器）、drop_stale_output（同拍抢+恢复时整段丢弃）。请求的一生在 async 下就是这四个标量加 num_computed_tokens 的消长。"
+  },
+  {
+   "name": "SchedulerOutput（async 标志对）",
+   "file": "vllm/v1/core/sched/output.py",
+   "responsibility": "has_structured_output_requests（注释明说 'Set only in async scheduling case'）与 pending_structured_output_tokens（本批还缺算 bitmask 所需的输出 token）——后者是触发 deferred sampling 的开关；num_spec_tokens_to_schedule 供占位列表定长。"
+  },
+  {
+   "name": "InputBatch.prev_sampled_token_ids / prev_req_id_to_index",
+   "file": "vllm/v1/worker/gpu_input_batch.py",
+   "responsibility": "影子状态两个字段（L310-L311 定义）：前者是上拍采样 token 的 GPU 张量缓存（真 token 的 GPU 住所），后者是上拍 req_id→槽位的映射（下一拍 scatter 的索引来源）。容器本体归 ch18。"
+  },
+  {
+   "name": "AsyncGPUModelRunnerOutput / AsyncOutputFuture",
+   "file": "vllm/v1/worker/gpu_model_runner.py + vllm/v1/executor/uniproc_executor.py",
+   "responsibility": "异步输出对：前者在专用 async_output_copy_stream 上 wait_stream(default) 后 non_blocking D2H + event.record（构造即发起拷贝、不等待）；后者的 result() 才调 get_output()→event.synchronize——EngineCore 阻塞点从『等计算』缩成『等一次 D2H 拷贝事件』。"
+  },
+  {
+   "name": "GPUModelRunner（本章相关方法群）",
+   "file": "vllm/v1/worker/gpu_model_runner.py",
+   "responsibility": "_prepare_input_ids（L1784-L1913：GPU 回填）、_bookkeeping_sync async 分支（L3797-L3842：token 留 GPU + -1 占位）、optimistic_seq_lens_cpu/discard_request_mask（L2081-L2105：乐观 seq_lens）、_compute_prev_positions（L1769-L1782：槽位映射）、synchronize_input_prep（L3864-L3877：等上拍 pinned buffer DMA）。全貌归 ch17/ch18，本章只取 async 接缝。"
+  },
+  {
+   "name": "UniProcExecutor",
+   "file": "vllm/v1/executor/uniproc_executor.py",
+   "responsibility": "单进程直调后端：supports_async_scheduling()=True（L146-L147）；execute_model/sample_tokens 的 non_block 路径同步直调 worker 再把 AsyncModelRunnerOutput 包成 AsyncOutputFuture（L88-L107）——『异步』在这里只是懒收割，不是另一个线程。"
+  }
+ ],
+ "data_flow": [
+  "总述：本章数据流 = deepread/engine-loop.json data_flow 第 5 步后半（默认 async 配置下这一切发生在 step_with_batch_queue）+ deepread/gpu-exec.json data_flow 第 7-8 步（异步模式 token 留 GPU / AsyncGPUModelRunnerOutput 异步 D2H / 下一拍 schedule 已在跑），不重挖——下面按一轮重叠心跳重排（站号对 stations 账本）：",
+  "1. 启动期（第 1-4 站）：async_scheduling=None → VllmConfig 仲裁 True（vllm.py:L1141-L1143）→ get_scheduler_cls 返回 AsyncScheduler → max_concurrent_batches=2 → EngineCore 建 batch_queue=deque(maxlen=2)、step_fn 绑定 step_with_batch_queue（core.py:L206-L233）。",
+  "2. 忙循环某圈 = 心跳上半段（第 5-9 站，此刻队列里已有批 A 在 GPU 上）：has_requests → AsyncScheduler.schedule() 盲调度出批 B 的 SchedulerOutput（追赶公式里占位项灌上值，scheduler.py:L516-L520；确信到 max_tokens 的请求被 early-stop 剪枝跳过 L488-L502）→ schedule 尾部 _update_after_schedule 占位 +1（async_scheduler.py:L38-L44）→ execute_model(non_block=True) 拿 exec_future（core.py:L655-L657）→ 无 pending 则 get_grammar_bitmask + sample_tokens(non_block=True) 立即拿采样 future（L665-L673；有 pending 则存 deferred L674-L677）→ appendleft((future, scheduler_output, exec_future)) 入队（L681）→ 队未满且有活 → return (None, model_executed)（L682-L687），忙循环立刻转下一圈。",
+  "3. 同时在 worker（第 10-11 站，与上半段并行）：批 A 的 sample_tokens 在 worker 内完成采样 → _bookkeeping_sync async 分支把 sampled_token_ids 缓存进 prev_sampled_token_ids（GPU 张量，gpu_model_runner.py:L3802-L3813）、token_ids_cpu 行只写 -1（L3821-L3842）→ 包 AsyncGPUModelRunnerOutput：专用 copy stream 上 non_blocking D2H + event.record（L286-L306）——EngineCore 的 future 里躺着这个还没完成的拷贝。",
+  "4. 忙循环再下一圈 = 心跳下半段（第 12-14 站，队列已满 [批B, 批A]）：上半段先照常调度批 C（若有活），然后 pop 最老批 A → future.result()（AsyncOutputFuture → get_output → event.synchronize，只等 D2H）→ _process_aborts_queue → update_from_output 真记账（scheduler.py:L1670）→ AsyncScheduler 版逐请求扣减占位 + cache_blocks 转正（async_scheduler.py:L61-L69）；spec 拒绝的话同步回扣 computed/placeholders（scheduler.py:L1780-L1784）；被抢请求走 stale drain（L1740-L1743）。",
+  "5. 闭环（第 15 站）：批 C 的 execute_model 在 worker 侧 _prepare_inputs → _prepare_input_ids 发现 prev_sampled_token_ids 非空 → 批次未变单 slice 直拷 / 变过 scatter 进 input_ids.gpu（gpu_model_runner.py:L1868-L1891）——批 A 采出的 token 在 GPU 上直接变成批 C 的输入，全程没落到 CPU；token 出门给用户走的是另一条路（第 3 站的异步 D2H）。",
+  "6. 输出侧：update_from_output 攒好的 EngineCoreOutputs 按 client 分组 → output_queue → IO 线程 msgpack+ZMQ 出进程（ch9 第 7 站已讲，本章不重走）。稳态：深度 2 的队列一进一出，GPU 计算与 CPU 调度互相藏在对方的时间里。"
+ ],
+ "why_chains": [
+  {
+   "id": "WC1",
+   "card": "deepread/engine-loop.json why_chains[5]",
+   "decision": "批队列 + 异步调度默认开启：v0.27.1 的心跳就是重叠版",
+   "old_design": "同步 step()：必须等 update_from_output 拿到采样 token 才能算出下一步 num_new_tokens、才能 schedule 下一拍——CPU 调度时间完全串行叠加在 GPU 执行时间之后。v1 早期 async scheduling 是 opt-in 开关（d4d309409 '[Core] Implement Async Scheduling' #19970, 2025-07-14 实现）；v2 旧卡（v0.21.0 基线）也仍把它当『本域最深层、放 Part 尾部』的选修讲。",
+   "pain": "单拍延迟 = GPU forward + CPU 调度 + IPC 三段相加。千级并发下 schedule()/update_from_output 的 Python 循环达毫秒级（scheduler.py:L1728-L1730 woosuk 自认瓶颈），GPU 每 10-20ms 空转一次等 CPU，稳态吞吐直接打折。",
+   "solution": "演进三步走（git 证据链）：d4d309409（2025-07-14）实现 AsyncScheduler + num_output_placeholders；c2ff33cc8 '[Core] Enable async scheduling by default'（#27614, 2025-12-29）翻转为默认——vllm/config/scheduler.py:L148-L151 `async_scheduling: bool | None = None` + vllm/config/vllm.py:L1095-L1143 'Enable async scheduling unless there is an incompatible option'（pooling 模型/部分 spec 方法/部分 executor 后端才降为 False）；3e440786a（2026-01-28）async+PP 完全支持，commit 标题自带数字：30.8% E2E 吞吐 / 31.8% TPOT 提升。机制：max_concurrent_batches（vllm/config/vllm.py:L539-L550：async+V1+pp≤1 → 2；V2 runner → pp_size+1；纯 PP → pp_size；仅无 PP 且无 async 才 = 1）> 1 时 EngineCore 装批队列（core.py:L206-L212 deque(maxlen=...)）并把 step_fn 静态绑定 step_with_batch_queue（L231-L233）——批 A 在 GPU 跑时同时调度批 B，填队列优先于取输出（L632-L687 docstring + 实现）。核心机制 num_output_placeholders：AsyncScheduler._update_after_schedule 给每个非 prefill-chunk 请求 num_output_placeholders += num_sampled_tokens_per_step + spec 数（async_scheduler.py:L38-L44），下一拍调度 num_new_tokens 把占位算进去（scheduler.py:L516-L520）；真 token 到达时扣减并把已算块真缓存（async_scheduler.py:L51-L70，cache_blocks 用 num_computed_tokens - num_output_placeholders 抵消乐观计数）；spec 草稿的具体 token id 在 worker 侧原地替换（async_scheduler.py:L42-L44 注释）。**v0.27.1 的关键事实：服务场景的默认心跳就是重叠版 step_with_batch_queue**；同步 step() 退化为例外路径（pooling/不兼容 spec 方法等 async 被禁且无 PP 时）与离线 LLM() 的同步门面（InprocClient core_client.py:L306-L322 从 LLMEngine.step() llm_engine.py:L296-L322 直接调 step_fn，无忙循环——但默认配置下 step_fn 同样是重叠版，『同步』只是没有忙循环）。",
+   "cost": "调度器状态领先真实进度（乐观推进），一连串补偿机制全是这个代价的账单：①spec 拒绝时回扣 num_computed_tokens / num_output_placeholders（scheduler.py:L1780-L1784）；②被抢请求的 in-flight 输出成 stale——仍要送出（丢会扰动 spec-decode acceptance）但不得改动已清零的计数器：num_stale_output_tokens 锁步 drain（request.py:L150-L162 字段定义；_preempt_request scheduler.py:L1297-L1308 赋值；update_from_output L1736-L1759 每拍扣减 + drop-mode 丢弃）；③early-stop 判定成算术谜题（L489-L502：num_computed_tokens + 2 - num_output_placeholders >= num_prompt_tokens + max_tokens 就别再多调度一步）；④结构化输出 + async 时 bitmask 缺 token 必须推迟采样（pending_structured_output_tokens，async_scheduler.py:L31-L33 置位 + core.py:L665-L677 分流 + L719-L737 deferred 补采分支）——step_with_batch_queue 代码路径近乎翻倍。诚实账单：本 pin 前三个月就有三个本域 underflow/staleness 修复（#42117 2026-05-19、#46066 2026-07-06、#48245 2026-07-29）——这是用状态机复杂度换 GPU 利用率的真实价格。"
+  },
+  {
+   "id": "WC2",
+   "card": "deepread/gpu-exec.json why_chains[5]",
+   "decision": "异步调度的 worker 侧落地：采样 token 留 GPU、异步 D2H 输出、乐观假设+GPU 纠偏（『GPU 不等 Python』的旗舰落地）",
+   "old_design": "同步调度：schedule()（CPU）→ execute_model（GPU）→ 等结果回 CPU → update_from_output → 下一拍 schedule。GPU 在 CPU 准备下一批的整段时间空转；decode 小 batch 一拍 GPU 计算量极小，整拍时长被 CPU 端（Python 调度 + 输入准备 + bookkeeping 的 D2H sync）支配。",
+   "pain": "『GPU 等 Python』是 vLLM 一整条 PR 线的靶子（git log 实证）：98f47f2a40 \"[V1] Optimize the CPU overheads in FlashAttention custom op (#10733)\"（2024-11-28）、3b61cb450d（2024-12-09）、dae6896977（2025-03-06，两周后 revert——这条战线有多脆弱）——全在砍『kernel 之间那点 Python 时间』。CommonAttentionMetadata 两个 deprecated 属性的措辞即纪律成文：\"Prefer using device seq_lens directly to avoid implicit H<>D sync which breaks full async scheduling\"（vllm/v1/attention/backend.py:L506-L530）。v0.27 新增运行期纠察：VLLM_GPU_SYNC_CHECK 在 warmup 完成后开启（gpu_worker.py:L846-L848），execute_model/sample_tokens 被 @with_gpu_sync_check 包住（L1010-L1019），任何 CPU<->GPU sync 直接抛 \"GPU<->CPU sync detected - avoid it or wrap with gpu_sync_allowed()\"（vllm/utils/gpu_sync_debug.py:L11-L13）——纪律从注释升级为运行期 tripwire。",
+   "solution": "三件套。(1) 采样 token 留 GPU：_bookkeeping_sync 异步分支不把 sampled_token_ids 拉回 CPU，缓存在 input_batch.prev_sampled_token_ids（gpu_model_runner.py:L3797-L3813，注释 \"Cache the sampled tokens on the GPU and avoid CPU sync\"），CPU 侧 token_ids_cpu 行只写占位 -1（L3821-L3842）；下一拍 _prepare_input_ids（L1784-L1913）用 GPU 张量直接写 input_ids.gpu——common-case 优化是单 slice 直拷（L1868-L1877），否则按 index scatter（L1879-L1891），spec draft token 再补一轮 scatter（L1893-L1913）。(2) 异步输出：AsyncGPUModelRunnerOutput（L259-L350）在专用 async_output_copy_stream 上 wait_stream(default) 后 non_blocking D2H + event record（L286-L306；event 用 blocking=True 的 sleep 语义而非自旋——L741-L743 注释 \"under TP contention that spin can balloon and make the rank a straggler\"）；uniproc 的 AsyncOutputFuture 延迟到 result() 才 get_output()→event.synchronize（uniproc_executor.py:L26-L42）；routed_experts 异步路径必须 clone 出私有快照防 copy stream 读到撕裂数据（L4794-L4818，注释 \"Without clones, the copy stream would read torn data\"）。(3) 乐观假设+延迟纠偏：seq_lens 用乐观值（假定上拍 draft 全接受，L2081-L2090 optimistic_seq_lens_cpu），spec decode 纠偏回调 correct_spec_decode_token_counts 推迟到 forward 发起之后执行（注释 \"Now the batch has been launched we can wait for corrections ... without breaking async scheduling\"）；GPU 侧 update_num_computed_tokens_for_batch_change kernel 用上拍 valid_sampled_token_count_gpu 修正 num_computed_tokens（L2152-L2173，spec 深挖归 ch33）。pinned buffer 防踩协议：synchronize_input_prep contextmanager 等上拍 prepare_inputs_event（L3864-L3877）。",
+   "cost": "状态机复杂度暴涨：需要 prev_req_id_to_index/prev_positions/discard_request_mask/optimistic_seq_lens_cpu 等一整套『上一拍』影子状态（_update_states 膨胀到 ~375 行）；调度器必须盲调度（看不到上拍真实结果），错了要在 GPU 端纠；PP 场景要把采样 token 从末段 GPU 广播回首段（_pp_broadcast_prev_sampled_token_ids L4842-L4859）；异步路径输出张量的数据所有权延迟到 event.synchronize 之后才可读（契约见 get_output L308-L314）。"
+  },
+  {
+   "id": "WC3",
+   "card": "v2 ch12-engine-core dossier design_decisions 迁移候选（对 v0.27.1 逐段现核：行号已更新、use_spec_decode→check_for_draft_tokens、take_draft_token_ids 带 None 守卫）",
+   "decision": "deferred sampling：结构化输出 + async 时，缺 token 的批把采样推迟到 pop 出上拍结果之后",
+   "old_design": "同步版里 bitmask 的时序很简单：execute_model 发起 → CPU 算 bitmask → future.result() → sample_tokens 前应用掩码（ch9 五拍的 ②③④ 夹缝）。采样所需的全部 token 位置在本拍 schedule() 时已经确定。",
+   "pain": "async 下调度新批时，上一拍的输出 token 可能还没处理完（在队列里/还在 D2H）：结构化输出的 grammar bitmask 要基于本批将采样的位置（含 spec 草稿 token）计算——缺 token 就算不出正确掩码，立即采样会采出违反语法的 token。",
+   "solution": "两半开关 + 一条支线：AsyncScheduler._update_after_schedule 在置 has_structured_output_requests 的同时，若请求 use_structured_output 且占位数 >0 就置 pending_structured_output_tokens（async_scheduler.py:L31-L33；字段定义 output.py:L235-L241 注释明说 'Set only in async scheduling case'）。step_with_batch_queue 上半段看到 pending 就不采样，把 scheduler_output 存进 deferred_scheduler_output（core.py:L674-L677）——批先入队等着（exec_future 已发起，前向不浪费）；下半段 pop 完上拍结果、update_from_output 之后，此时 token 齐了：spec 场景先 take_draft_token_ids + update_draft_token_ids_in_output 过滤无效草稿（-1 填充被 bitmask 计算跳过，L722-L730），再 get_grammar_bitmask（scheduler.py:L1646-L1668，依赖 scheduled_spec_decode_tokens）→ sample_tokens(non_block=True) → appendleft 重新入队待后续轮次 pop（L731-L737）。NOTE(nick) 自注取舍：deferred 也可以存字段等下一轮再处理，『后者略偏 TTFT』（L716-L718）。",
+   "cost": "step_with_batch_queue 的代码路径近乎翻倍（每个采样动作都要问『现在采还是待会儿采』）；deferred 批在队列里多躺一轮，其请求的 TPOT 多一段排队延迟；spec+structured 两个特性叠加时还要跨进程取草稿 token 再回填——三个特性（async/spec/structured）两两组合各有专属代码路径，测试矩阵爆炸。"
+  },
+  {
+   "id": "WC4",
+   "card": "本章新链（v2 ch12 dossier 的间接链迁移 + v0.21↔v0.27.1 对比现核）",
+   "decision": "批队列深度上移 VllmConfig：『标志 → 深度 → 队列 → step』三级间接决定绑哪个心跳",
+   "old_design": "v0.21：max_concurrent_batches 是 executor 的 @cached_property——abstract 基类默认 1（v2 dossier：abstract.py:L256-L258）、UniProcExecutor 覆写为 async?2:1、MultiprocExecutor 覆写为 pp≤1 and async?2:pp_size（uniproc_executor.py:L76-L78 / multiproc_executor.py:L474-L478）；EngineCore 经 self.model_executor.max_concurrent_batches 间接读。",
+   "pain": "批队列深度其实是『拓扑（PP/几段流水线）+ 调度模式（async）+ runner 代际（V1/V2）』三者的函数——executor 只知道拓扑的一半；同一仲裁逻辑要在每个 executor 后端重复实现，新后端（ray 等）容易漏掉 async 分支；EngineCore 读的是执行器的属性，跨后端行为漂移无一处可查全。",
+   "solution": "v0.27.1 把深度上移为 VllmConfig.max_concurrent_batches property（vllm/config/vllm.py:L539-L550，一处看全 async/use_v2_model_runner/pp_size 三个输入；executor 侧同名属性已删，EngineCore 侧唯一直读点 core.py:L206（另 scheduler.py:L154 经 multiple_inflight_batches 旁路消费、config/vllm.py:L560 / ec_connector cpu scheduler / V2 model_runner 等 3 处旁路） 与 max_in_flight_tokens L560）；EngineCore 直读 vllm_config（core.py:L206）→ batch_queue_size>1 才建 deque（L210-L212）→ step_fn 静态绑定只看队列建没建（L231-L233）。于是默认链路：async_scheduling=None →VllmConfig 仲裁→ True → 深度 2 → 队列建立 → step_fn=step_with_batch_queue。executor 只剩一票否决权：supports_async_scheduling()（abstract.py:L364-L368 默认 False；uniproc L146-L147 / multiproc L526-L527 为 True，ray 未覆写=False → 默认禁 async）。",
+   "cost": "①读 step_fn 绑定代码（L231-L233）看不到 async_scheduling 字样，要追两级（标志→深度→队列）才知道默认绑的是重叠版——v2 读者按旧代码找 executor.max_concurrent_batches 会扑空（迁移陷阱实锤）；②VllmConfig 又多一个依赖三处配置的派生 property，配置哈希与兼容矩阵要维护；③executor 否决权与 VllmConfig 仲裁分裂在两处（仲裁在 vllm.py:L1095-L1143，否决标志在 executor 类方法），排查『为什么我的 async 没开』要两头看。"
+  }
+ ],
+ "embed_excerpts": [
+  {
+   "path": "vllm/v1/engine/core.py",
+   "lines": "L595-L614",
+   "code": "        scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())\n        future = self.model_executor.execute_model(scheduler_output, non_block=True)\n        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)\n        with (\n            self.capture_iteration_details(scheduler_output) as iteration_details,\n            self.log_error_detail(scheduler_output),\n        ):\n            model_output = future.result()\n            if model_output is None:\n                model_output = self.model_executor.sample_tokens(grammar_output)\n\n        # Before processing the model output, process any aborts that happened\n        # during the model execution.\n        self._process_aborts_queue()\n        engine_core_outputs = self.scheduler.update_from_output(\n            scheduler_output, model_output\n        )\n        self._attach_iteration_details(engine_core_outputs, iteration_details)\n\n        return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0",
+   "what": "同步 step() 的串行脊柱（对照用，ch9 已全文内嵌）：schedule→execute→bitmask→future.result→sample→update，每段等上一段——重叠版要拆掉的正是这条依赖链上『等结果才能调度下一拍』的环节。",
+   "elide": [
+    "L598-L601 capture_iteration_details/log_error_detail 诊断上下文与 L612 _attach_iteration_details 可省——纯观测",
+    "ch9 已全文内嵌过 step()；本章内嵌是为对照，writer 可只引 L595-L604 主干"
+   ]
+  },
+  {
+   "path": "vllm/v1/engine/core.py",
+   "lines": "L206-L212",
+   "code": "        self.batch_queue_size = vllm_config.max_concurrent_batches\n        self.batch_queue: (\n            deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None\n        ) = None\n        if self.batch_queue_size > 1:\n            logger.debug(\"Batch queue is enabled with size %d\", self.batch_queue_size)\n            self.batch_queue = deque(maxlen=self.batch_queue_size)",
+   "what": "批队列装配：batch_queue_size = vllm_config.max_concurrent_batches（v0.27.1 从 executor 上移到 VllmConfig）；>1 才建 deque(maxlen)。注释自述双重动机：异步调度与 PP 消气泡。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/engine/core.py",
+   "lines": "L231-L234",
+   "code": "        self.step_fn = (\n            self.step if self.batch_queue is None else self.step_with_batch_queue\n        )\n        self.async_scheduling = vllm_config.scheduler_config.async_scheduling",
+   "what": "step_fn 静态绑定 + async_scheduling 落地：EngineCore 不直接看 async 标志选 step——看 batch_queue 是否存在；async_scheduling 实例字段供 post_step 短路 draft 回传。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/engine/core.py",
+   "lines": "L616-L623",
+   "code": "    def post_step(self, model_executed: bool) -> None:\n        # When using async scheduling we can't get draft token ids in advance,\n        # so we update draft token ids in the worker process and don't\n        # need to update draft token ids here.\n        if self.check_for_draft_tokens and not self.async_scheduling and model_executed:\n            draft_token_ids = self.model_executor.take_draft_token_ids()\n            if draft_token_ids is not None:\n                self.scheduler.update_draft_token_ids(draft_token_ids)",
+   "what": "post_step：async 下 draft token ids 在 worker 进程内更新、不回传主进程——三条件短路（check_for_draft_tokens and not async_scheduling and model_executed）。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/engine/core.py",
+   "lines": "L625-L687",
+   "code": "    def step_with_batch_queue(\n        self,\n    ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:\n        \"\"\"Schedule and execute batches with the batch queue.\n        Note that if nothing to output in this step, None is returned.\n\n        The execution flow is as follows:\n        1. Try to schedule a new batch if the batch queue is not full.\n        If a new batch is scheduled, directly return an empty engine core\n        output. In other words, fulfilling the batch queue has a higher priority\n        than getting model outputs.\n        2. If there is no new scheduled batch, meaning that the batch queue\n        is full or no other requests can be scheduled, we block until the first\n        batch in the job queue is finished.\n        3. Update the scheduler from the output.\n        \"\"\"\n\n        batch_queue = self.batch_queue\n        assert batch_queue is not None\n\n        # Try to schedule a new batch if the batch queue is not full, but\n        # the scheduler may return an empty batch if all requests are scheduled.\n        # Note that this is not blocking.\n        assert len(batch_queue) < self.batch_queue_size\n\n        model_executed = False\n        deferred_scheduler_output = None\n        if self.scheduler.has_requests():\n            scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())\n            with self.log_error_detail(scheduler_output):\n                exec_future = self.model_executor.execute_model(\n                    scheduler_output, non_block=True\n                )\n            if self.is_ec_consumer:\n                model_executed = scheduler_output.total_num_scheduled_tokens > 0\n\n            if self.is_pooling_model or not model_executed:\n                # No sampling required (no requests scheduled).\n                future = cast(Future[ModelRunnerOutput], exec_future)\n            else:\n                if not scheduler_output.pending_structured_output_tokens:\n                    # We aren't waiting for any tokens, get any grammar output\n                    # and sample immediately.\n                    grammar_output = self.scheduler.get_grammar_bitmask(\n                        scheduler_output\n                    )\n                    future = self.model_executor.sample_tokens(\n                        grammar_output, non_block=True\n                    )\n                else:\n                    # We need to defer sampling until we have processed the model output\n                    # from the prior step.\n                    deferred_scheduler_output = scheduler_output\n\n            if not deferred_scheduler_output:\n                # Add this step's future to the queue.\n                batch_queue.appendleft((future, scheduler_output, exec_future))\n                if len(batch_queue) < self.batch_queue_size and (\n                    model_executed or self.scheduler.has_requests()\n                ):\n                    # Don't block on next worker response unless the queue is full\n                    # or there are no more requests to schedule.\n                    return None, model_executed",
+   "what": "step_with_batch_queue 上半段（本章主角·前半）：docstring 三步走 → 盲调度 → execute_model(non_block) → 立即采样（bitmask 先算）或 deferred → appendleft 三元组入队 → 填管道优先：队未满且（真调度了 token 或还有请求）→ return (None, model_executed) 不等结果。",
+   "elide": [
+    "is_ec_consumer 分支（L658-L659）：分布式 encoder cache 的非消费端小众场景，常规部署恒 True，一句带过即可",
+    "is_pooling_model 分支（L661-L663）：pooling 模型无采样、exec_future 直接当最终 future——非生成路径，正文点一句即可",
+    "log_error_detail（L654）为诊断上下文，无功能影响"
+   ]
+  },
+  {
+   "path": "vllm/v1/engine/core.py",
+   "lines": "L689-L739",
+   "code": "        elif not batch_queue:\n            # Queue is empty. We should not reach here since this method should\n            # only be called when the scheduler contains requests or the queue\n            # is non-empty.\n            return None, False\n\n        # Block until the next result is available.\n        future, scheduler_output, exec_model_fut = batch_queue.pop()\n        with (\n            self.capture_iteration_details(scheduler_output) as iteration_details,\n            self.log_error_detail(scheduler_output),\n        ):\n            model_output = future.result()\n            if model_output is None:\n                # None from sample_tokens() implies that the original execute_model()\n                # call failed - raise that exception.\n                exec_model_fut.result()\n                raise RuntimeError(\"unexpected error\")\n\n        # Before processing the model output, process any aborts that happened\n        # during the model execution.\n        self._process_aborts_queue()\n        engine_core_outputs = self.scheduler.update_from_output(\n            scheduler_output, model_output\n        )\n        self._attach_iteration_details(engine_core_outputs, iteration_details)\n\n        # NOTE(nick): We can either handle the deferred tasks here or save\n        # in a field and do it immediately once step_with_batch_queue is\n        # re-called. The latter slightly favors TTFT over TPOT/throughput.\n        if deferred_scheduler_output:\n            # When draft tokens are used with structured output, validate them\n            # before computing the grammar bitmask for the deferred request.\n            if self.check_for_draft_tokens:\n                draft_token_ids = self.model_executor.take_draft_token_ids()\n                if draft_token_ids is not None:\n                    # Update the draft token ids in the scheduler output to\n                    # filter out the invalid spec tokens, which will be padded\n                    # with -1 and skipped by the grammar bitmask computation.\n                    self.scheduler.update_draft_token_ids_in_output(\n                        draft_token_ids, deferred_scheduler_output\n                    )\n            # We now have the tokens needed to compute the bitmask for the\n            # deferred request. Get the bitmask and call sample tokens.\n            grammar_output = self.scheduler.get_grammar_bitmask(\n                deferred_scheduler_output\n            )\n            future = self.model_executor.sample_tokens(grammar_output, non_block=True)\n            batch_queue.appendleft((future, deferred_scheduler_output, exec_future))\n\n        return engine_core_outputs, model_executed",
+   "what": "step_with_batch_queue 下半段（本章主角·后半）：pop 最老批 → future.result()（None ⇒ execute 失败，重抛真异常）→ 批量 abort → update_from_output 真记账 → deferred 补采：spec 草稿先回填、bitmask 现在有齐 token 了 → sample_tokens(non_block) → 重新 appendleft 入队（复用同一个 exec_future，不重跑前向）。",
+   "elide": [
+    "capture_iteration_details/log_error_detail/L714 _attach_iteration_details 为观测，可省",
+    "L722-L730 的 take_draft_token_ids None 守卫是 spec+structured 小众叠加，正文可压缩为一句"
+   ]
+  },
+  {
+   "path": "vllm/config/vllm.py",
+   "lines": "L539-L550",
+   "code": "    @property\n    def max_concurrent_batches(self) -> int:\n        # PP requires PP-size concurrent batches to fill the pipeline.\n        # Async scheduling requires 2 concurrent batches to overlap.\n        pp_size = self.parallel_config.pipeline_parallel_size\n        if self.scheduler_config.async_scheduling:\n            if self.use_v2_model_runner:\n                return pp_size + 1\n            # V1 Model Runner does not fully support async scheduling with PP.\n            if pp_size <= 1:\n                return 2\n        return pp_size",
+   "what": "max_concurrent_batches 深度仲裁（v0.27.1 唯一出处）：async+V2 runner→pp_size+1；async+V1+单 PP→2；其余 pp_size。注释自带两句设计动机：PP 要 pp_size 个并发批填流水线，async 要 2 个做重叠。",
+   "elide": []
+  },
+  {
+   "path": "vllm/config/vllm.py",
+   "lines": "L1095-L1143",
+   "code": "        elif self.scheduler_config.async_scheduling is None:\n            # Enable async scheduling unless there is an incompatible option.\n            if (\n                self.model_config is not None\n                and self.model_config.runner_type == \"pooling\"\n            ):\n                # The current implementation of asynchronous scheduling negatively\n                # impacts performance of pooling models, so we disable by default.\n                logger.debug(\n                    \"Disabling asynchronous scheduling by default for pooling model.\"\n                )\n                self.scheduler_config.async_scheduling = False\n            elif (\n                self.speculative_config is not None\n                and self.speculative_config.method not in get_args(EagleModelTypes)\n                and self.speculative_config.method not in get_args(NgramGPUTypes)\n                and self.speculative_config.method != \"dspark\"\n            ):\n                logger.warning_once(\n                    \"Async scheduling not supported with %s-based \"\n                    \"speculative decoding and will be disabled.\",\n                    self.speculative_config.method,\n                )\n                self.scheduler_config.async_scheduling = False\n            elif (\n                self.speculative_config is not None\n                and self.speculative_config.disable_padded_drafter_batch\n            ):\n                logger.warning_once(\n                    \"Async scheduling is not compatible with \"\n                    \"disable_padded_drafter_batch=True and will be disabled.\",\n                )\n                self.scheduler_config.async_scheduling = False\n            elif not executor_supports_async_sched:\n                logger.warning_once(\n                    \"Async scheduling will be disabled because it is not supported \"\n                    \"with the `%s` distributed executor backend. \",\n                    executor_backend,\n                )\n                self.scheduler_config.async_scheduling = False\n            elif uses_rocm_deepep_ht_dbo:\n                logger.warning_once(\n                    \"Async scheduling is disabled for ROCm DeepEP \"\n                    \"high-throughput DBO because that combination can corrupt \"\n                    \"DP+EP generation accuracy.\"\n                )\n                self.scheduler_config.async_scheduling = False\n            else:\n                self.scheduler_config.async_scheduling = True",
+   "what": "默认仲裁（『默认心跳』的出处）：async_scheduling=None 时——pooling 模型降 False（异步反而拖慢）、非 EAGLE 系 spec 方法降 False、disable_padded_drafter_batch 降 False、executor 不支持降 False、ROCm DeepEP DBO 降 False（损精度），否则 True。",
+   "elide": [
+    "四个降级 elif 各留一句即可（正文重点在『默认 True、例外才关』的结构）",
+    "前面的显式 True 分支（L1064-L1093 硬失败检查）可只提一句：显式开启时不兼容直接 raise"
+   ]
+  },
+  {
+   "path": "vllm/config/scheduler.py",
+   "lines": "L148-L152",
+   "code": "    async_scheduling: bool | None = None\n    \"\"\"If set to False, disable async scheduling. Async scheduling helps to\n    avoid gaps in GPU utilization, leading to better latency and throughput.\n    \"\"\"\n",
+   "what": "async_scheduling 配置位：None=默认（交给 VllmConfig 仲裁）；docstring 一句话讲动机——避免 GPU 利用率出现空隙。",
+   "elide": []
+  },
+  {
+   "path": "vllm/config/scheduler.py",
+   "lines": "L170-L178",
+   "code": "    def get_scheduler_cls(self) -> type[\"SchedulerInterface\"]:\n        if self.scheduler_cls is None:\n            if self.async_scheduling:\n                from vllm.v1.core.sched.async_scheduler import AsyncScheduler\n\n                return AsyncScheduler\n            from vllm.v1.core.sched.scheduler import Scheduler\n\n            return Scheduler",
+   "what": "get_scheduler_cls：async → AsyncScheduler，否则 Scheduler——async 不只换 step，连调度器类一起换。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/core/sched/async_scheduler.py",
+   "lines": "L19-L49",
+   "code": "    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:\n        super()._update_after_schedule(scheduler_output)\n        spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens\n        # Use the latest num of scheduled draft tokens in next step as placeholder.\n        self._spec_token_placeholders = [\n            -1\n        ] * scheduler_output.num_spec_tokens_to_schedule\n        for req_id in scheduler_output.num_scheduled_tokens:\n            request = self.requests[req_id]\n            if request.is_prefill_chunk:\n                continue\n\n            scheduler_output.pending_structured_output_tokens |= (\n                request.use_structured_output and request.num_output_placeholders > 0\n            )\n            # The request will generate num_sampled_tokens_per_step new tokens\n            # plus num_spec_tokens in this scheduling step. Diffusion has no AR\n            # bonus token (num_sampled_tokens_per_step == 0) — only the canvas\n            # (spec) tokens.\n            cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))\n            request.num_output_placeholders += (\n                self.num_sampled_tokens_per_step + cur_num_spec_tokens\n            )\n            # Add placeholders for the new draft/spec tokens.\n            # We will update the actual spec token ids in the worker process.\n            request.spec_token_ids = self._spec_token_placeholders\n\n            if self.use_v2_model_runner:\n                # Set the next step index in which this request is eligible to be\n                # scheduled for decode (for PP microbatching).\n                request.next_decode_eligible_step = self.current_step + self.pp_size",
+   "what": "AsyncScheduler._update_after_schedule（占位 +1）：先跑基类乐观推进，再给每个非 prefill-chunk 请求 num_output_placeholders += num_sampled_tokens_per_step + spec 数；spec_token_ids 整体换成 -1 占位列表（真 token 由 worker 原地替换）；同时置 pending_structured_output_tokens。全文件 70 行——本章两个主角方法之一。",
+   "elide": [
+    "L46-L49 use_v2_model_runner 的 next_decode_eligible_step（V2+PP 步距）是 V2 runner 专属，正文一句带过"
+   ]
+  },
+  {
+   "path": "vllm/v1/core/sched/async_scheduler.py",
+   "lines": "L51-L70",
+   "code": "    def _update_request_with_output(\n        self, request: Request, new_token_ids: list[int], is_stale: bool = False\n    ) -> tuple[list[int], bool]:\n        status_before_update = request.status\n        new_token_ids, stopped = super()._update_request_with_output(\n            request, new_token_ids\n        )\n\n        # Placeholders were zeroed at preemption; a stale delivery must not\n        # decrement them (it would underflow).\n        if not is_stale:\n            request.num_output_placeholders -= len(new_token_ids)\n            assert request.num_output_placeholders >= 0\n\n        # Cache the new tokens. Preempted requests should be skipped.\n        if status_before_update == RequestStatus.RUNNING:\n            self.kv_cache_manager.cache_blocks(\n                request, request.num_computed_tokens - request.num_output_placeholders\n            )\n        return new_token_ids, stopped",
+   "what": "AsyncScheduler._update_request_with_output（占位 -1 + 块转正）：真 token 到达扣减占位（assert ≥0；stale 不扣——抢占时已清零，扣了就 underflow）；RUNNING 状态下 cache_blocks(request, num_computed_tokens - num_output_placeholders) 把乐观块转正式——差值就是真实已算数。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/request.py",
+   "lines": "L150-L162",
+   "code": "        # Used in async scheduling.\n        self.num_output_placeholders = 0\n        # Tokens of output in flight when the request was preempted: delivered\n        # on return, but must not mutate the reset counters.\n        self.num_stale_output_tokens = 0\n        # Drop the stale output instead, for same-step preempt + resume\n        # (reset_prefix_cache).\n        self.drop_stale_output = False\n\n        # Tokens of steps whose output is not yet processed (async scheduling\n        # and PP run ahead of the GPU); `num_computed_tokens` counts them\n        # optimistically.\n        self.num_in_flight_tokens = 0",
+   "what": "Request 的四个异步计数器字段定义：num_output_placeholders（占位）、num_stale_output_tokens（被抢时的在飞输出，恢复后照送但不动已清零的计数器）、drop_stale_output（同拍抢+恢复整段丢弃）、num_in_flight_tokens（在飞步 token——computed 乐观计入的部分）。注释自述语义。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/core/sched/scheduler.py",
+   "lines": "L488-L502",
+   "code": "            if (\n                request.num_output_placeholders > 0\n                # This is (num_computed_tokens + 1) - (num_output_placeholders - 1).\n                # Since output placeholders are also included in the computed tokens\n                # count, we subtract (num_output_placeholders - 1) to remove any draft\n                # tokens, so that we can be sure no further steps are needed even if\n                # they are all rejected.\n                and request.num_computed_tokens + 2 - request.num_output_placeholders\n                >= request.num_prompt_tokens + request.max_tokens\n            ):\n                # Async scheduling: Avoid scheduling an extra step when we are sure that\n                # the previous step has reached request.max_tokens. We don't schedule\n                # partial draft tokens since this prevents uniform decode optimizations.\n                req_index += 1\n                continue",
+   "what": "RUNNING 循环的 async early-stop 剪枝：num_computed_tokens + 2 - num_output_placeholders >= num_prompt_tokens + max_tokens 就跳过——确信上拍已达 max_tokens 就不排多余一步；不减 (占位-1) 是为了把 draft token 全拒的极端情况也盖住。注释自述不排 partial draft 的原因（保 uniform decode 优化）。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/core/sched/scheduler.py",
+   "lines": "L516-L520",
+   "code": "            num_new_tokens = (\n                request.num_tokens_with_spec\n                + request.num_output_placeholders\n                - request.num_computed_tokens\n            )",
+   "what": "追赶公式（ch10 已立，本章灌值）：num_new_tokens = num_tokens_with_spec + num_output_placeholders - num_computed_tokens——同步版占位恒 0，async 下这一项让调度器在输出未回时也能算出『本拍该排 1 个位置』。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/core/sched/scheduler.py",
+   "lines": "L1296-L1309",
+   "code": "            request.spec_token_ids = []\n        # Async scheduling: mark all in-flight output as stale. Its tokens are\n        # still delivered on return (dropping them would perturb spec-decode\n        # acceptance) but must not mutate the reset counters; each step drains\n        # its share in update_from_output. num_in_flight_tokens already\n        # includes any undrained stale share, so assign rather than accumulate.\n        # An undrained drop-mode share stays dropped: its positions have\n        # already been resampled.\n        request.drop_stale_output = drop_stale_output or (\n            request.drop_stale_output and request.num_stale_output_tokens > 0\n        )\n        request.num_stale_output_tokens = request.num_in_flight_tokens\n        request.num_output_placeholders = 0\n        request.num_preemptions += 1",
+   "what": "_preempt_request 的 async 账单（抢占内景归 ch11，本章只看异步这半边）：所有在飞输出标记 stale（num_stale_output_tokens = num_in_flight_tokens，赋值不累加）；占位清零；恢复后这些 token 照送（丢会扰动 spec-decode acceptance）但不许动已清零的计数器。",
+   "elide": [
+    "drop_stale_output 的同拍抢+恢复整段丢弃语义（L1304-L1306）一句话带过——requires_kv_delivery 场景"
+   ]
+  },
+  {
+   "path": "vllm/v1/core/sched/scheduler.py",
+   "lines": "L1736-L1743",
+   "code": "            output_is_stale = False\n            if request is not None:\n                request.num_in_flight_tokens -= num_tokens_scheduled\n                # Drain any stale share (see _preempt_request) in lockstep.\n                if request.num_stale_output_tokens > 0:\n                    output_is_stale = True\n                    request.num_stale_output_tokens -= num_tokens_scheduled\n                    assert request.num_stale_output_tokens >= 0",
+   "what": "update_from_output 热循环开头的两笔扣账：num_in_flight_tokens -= 本拍调度数（在飞落地）；num_stale_output_tokens > 0 则本拍输出标 stale 并锁步扣减（assert ≥0）——stale 输出照送但后续分支不得回扣计数器。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/core/sched/scheduler.py",
+   "lines": "L1769-L1784",
+   "code": "            if scheduled_spec_token_ids and (\n                generated_token_ids or self.num_sampled_tokens_per_step == 0\n            ):\n                num_draft_tokens = len(scheduled_spec_token_ids)\n                num_sampled = self.num_sampled_tokens_per_step\n                num_accepted = max(len(generated_token_ids) - num_sampled, 0)\n                num_rejected = num_draft_tokens - num_accepted\n                # Rejections roll back num_computed_tokens (and, under async\n                # scheduling, num_output_placeholders, which covers the spec\n                # tokens). A stale rejection count predates the preemption\n                # rollback and must not apply.\n                if not output_is_stale:\n                    if request.num_computed_tokens > 0:\n                        request.num_computed_tokens -= num_rejected\n                    if request.num_output_placeholders > 0:\n                        request.num_output_placeholders -= num_rejected",
+   "what": "spec 拒绝回扣：num_rejected = 草稿数 - 接受数；非 stale 时 num_computed_tokens 与 num_output_placeholders 同步回退——注释原话 'Rejections roll back num_computed_tokens (and, under async scheduling, num_output_placeholders, which covers the spec tokens)'。spec 机制本体归 ch33。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/core/sched/output.py",
+   "lines": "L235-L241",
+   "code": "    # Whether any of the scheduled requests use structured output.\n    # Set only in async scheduling case.\n    has_structured_output_requests: bool = False\n\n    # Whether the scheduled requests have all the output tokens they\n    # need to perform grammar bitmask computation.\n    pending_structured_output_tokens: bool = False",
+   "what": "SchedulerOutput 的两个 async 标志：has_structured_output_requests（注释明说 'Set only in async scheduling case'）与 pending_structured_output_tokens（本批还缺算 bitmask 所需输出 token——deferred sampling 的开关）。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L3797-L3813",
+   "code": "        else:\n            valid_sampled_token_ids = []\n            invalid_req_indices = discard_sampled_tokens_req_indices.tolist()\n            invalid_req_indices_set = set(invalid_req_indices)\n\n            # Cache the sampled tokens on the GPU and avoid CPU sync.\n            # These will be copied into input_ids in the next step\n            # when preparing inputs.\n            # With spec decoding, this is done in propose_draft_token_ids().\n            if self.input_batch.prev_sampled_token_ids is None:\n                assert sampled_token_ids.shape[-1] == 1\n                self.input_batch.prev_sampled_token_ids = sampled_token_ids\n            self.input_batch.prev_req_id_to_index = {\n                req_id: i\n                for i, req_id in enumerate(self.input_batch.req_ids)\n                if i not in invalid_req_indices_set\n            }",
+   "what": "worker 影子①（_bookkeeping_sync 异步分支）：不做 _to_list 的 D2H——sampled_token_ids 整个张量缓存进 input_batch.prev_sampled_token_ids（注释 'Cache the sampled tokens on the GPU and avoid CPU sync'），记 prev_req_id_to_index 上拍槽位表；spec 场景由 propose_draft_token_ids 接管。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L3815-L3842",
+   "code": "        # Cache the sampled tokens in the model runner, so that the scheduler\n        # doesn't need to send them back.\n        # NOTE(woosuk): As an exception, when using PP, the scheduler sends\n        # the sampled tokens back, because there's no direct communication\n        # between the first-stage worker and the last-stage worker.\n        req_ids = self.input_batch.req_ids\n        for req_idx in range(num_sampled_tokens):\n            if self.use_async_scheduling:\n                sampled_ids = [-1] if req_idx not in invalid_req_indices_set else None\n            else:\n                sampled_ids = valid_sampled_token_ids[req_idx]\n\n            num_sampled_ids: int = len(sampled_ids) if sampled_ids else 0\n\n            if not sampled_ids:\n                continue\n\n            start_idx = self.input_batch.num_tokens_no_spec[req_idx]\n            end_idx = start_idx + num_sampled_ids\n            assert end_idx <= self.max_model_len, (\n                \"Sampled token IDs exceed the max model length. \"\n                f\"Total number of tokens: {end_idx} > max_model_len: \"\n                f\"{self.max_model_len}\"\n            )\n\n            self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids\n            self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True\n            self.input_batch.num_tokens_no_spec[req_idx] = end_idx",
+   "what": "worker 影子②：写回循环里 async 分支 sampled_ids = [-1]——token_ids_cpu 对应行只写占位 -1（is_token_ids=True、num_tokens_no_spec 照常推进、output_token_ids 由调度器侧 update_from_output 增长）——CPU 账本在走、真 token 在 GPU。woosuk 注释：例外是 PP 要回传（首末段无直连）。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L1784-L1877",
+   "code": "    def _prepare_input_ids(\n        self,\n        scheduler_output: \"SchedulerOutput\",\n        num_reqs: int,\n        total_num_scheduled_tokens: int,\n        cu_num_tokens: np.ndarray,\n    ) -> None:\n        \"\"\"Prepare the input IDs for the current batch.\n\n        Carefully handles the `prev_sampled_token_ids` which can be cached\n        from the previous engine iteration, in which case those tokens on the\n        GPU need to be copied into the corresponding slots into input_ids.\n\n        Uses self.prev_positions[:num_reqs] which maps current pos -> prev pos\n        (-1 for new requests).\n        \"\"\"\n\n        if self.input_batch.prev_sampled_token_ids is None:\n            # Normal scheduling case\n            self.input_ids.copy_to_gpu(total_num_scheduled_tokens)\n            if self.enable_prompt_embeds:\n                self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)\n                self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)\n            return\n\n        # Async scheduling case, where some decode requests from the previous\n        # iteration won't have entries in input_ids_cpu and need to be copied\n        # on the GPU from prev_sampled_token_ids.\n        prev_positions = self.prev_positions.np[:num_reqs]\n        scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens\n        sample_flattened_indices: list[int] = []\n        spec_flattened_indices: list[int] = []\n        prev_draft_token_indices: list[int] = []\n        prev_indices: list[int] = []\n        common_indices_match = True\n        max_flattened_index = -1\n        total_num_spec_tokens = 0\n\n        for cur_index in range(num_reqs):\n            prev_index = prev_positions[cur_index]\n            if prev_index < 0:\n                continue\n            prev_indices.append(prev_index)\n            req_id = self.input_batch.req_ids[cur_index]\n            # We need to compute the flattened input_ids index of the\n            # last token in each common request.\n            draft_len = len(scheduled_spec_tokens.get(req_id, ()))\n            total_num_spec_tokens += draft_len\n            flattened_index = cu_num_tokens[cur_index].item() - 1\n            # example: cu_num_tokens = [2, 5, 8], draft_tokens = [1, 2, 2]\n            # sample_flattened_indices = [0, 2, 5]\n            # spec_flattened_indices = [1,   3, 4,    6, 7]\n            sample_flattened_indices.append(flattened_index - draft_len)\n            spec_flattened_indices.extend(\n                range(flattened_index - draft_len + 1, flattened_index + 1)\n            )\n            start = prev_index * self.prev_num_spec_tokens\n            # prev_draft_token_indices is used to find which draft_tokens_id\n            # should be copied to input_ids\n            # example: prev draft_tokens_id [[1,2], [3,4], [5, 6]]\n            # flatten draft_tokens_id [1,2,3,4,5,6]\n            # draft_len of each request [1, 2, 1]\n            # then prev_draft_token_indices is [0,   2, 3,   4]\n            prev_draft_token_indices.extend(range(start, start + draft_len))\n            common_indices_match &= prev_index == flattened_index\n            max_flattened_index = max(max_flattened_index, flattened_index)\n\n        num_common_tokens = len(sample_flattened_indices)\n        total_without_spec = total_num_scheduled_tokens - total_num_spec_tokens\n        if self.enable_prompt_embeds:\n            # The multimodal embed path reads is_token_ids.gpu; its .cpu copy is\n            # refreshed every step but the async fast paths below only scatter\n            # input_ids.gpu, so refresh is_token_ids.gpu here too.\n            self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)\n        if num_common_tokens < total_without_spec:\n            # If not all requests are decodes from the last iteration,\n            # we need to copy the input_ids_cpu to the GPU first.\n            self.input_ids.copy_to_gpu(total_num_scheduled_tokens)\n            if self.enable_prompt_embeds:\n                self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)\n        if num_common_tokens == 0:\n            # No requests in common with the previous iteration\n            # So input_ids.cpu will have all the input ids.\n            return\n        if common_indices_match and max_flattened_index == (num_common_tokens - 1):\n            # Common-case optimization: the batch is unchanged\n            # and no reordering happened.\n            # The indices are both the same permutation of 0..N-1 so\n            # we can copy directly using a single slice.\n            self.input_ids.gpu[:num_common_tokens].copy_(\n                self.input_batch.prev_sampled_token_ids[:num_common_tokens, 0],\n                non_blocking=True,\n            )\n            return",
+   "what": "_prepare_input_ids（本章 worker 侧主角）：prev_sampled_token_ids 为 None 是正常拍（直接 copy_to_gpu）；非空即 async 拍——遍历当前批算 flattened 索引与上拍槽位映射（注释给了 cu_num_tokens/draft 的 worked example），批次与上拍无交集就直拷了事；common-case 优化：批次未变未重排时单 slice 直拷 prev_sampled_token_ids 进 input_ids.gpu。",
+   "elide": [
+    "L1807-L1820 的 spec draft 索引细算（sample/spec_flattened_indices、prev_draft_token_indices）spec 章再展开，本章只取『采样 token 一列 + 草稿 token 若干列』的形状",
+    "enable_prompt_embeds 的两处补拷（L1805-L1809/L1862-L1863）为多模态分支，可省"
+   ]
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L1878-L1891",
+   "code": "        # Upload the index tensors asynchronously so the scatter can be non-blocking.\n        sampled_tokens_index_tensor = torch.tensor(\n            sample_flattened_indices, dtype=torch.int64, pin_memory=PIN_MEMORY\n        ).to(self.device, non_blocking=True)\n        prev_common_req_indices_tensor = torch.tensor(\n            prev_indices, dtype=torch.int64, pin_memory=PIN_MEMORY\n        ).to(self.device, non_blocking=True)\n        self.input_ids.gpu.scatter_(\n            dim=0,\n            index=sampled_tokens_index_tensor,\n            src=self.input_batch.prev_sampled_token_ids[\n                prev_common_req_indices_tensor, 0\n            ],\n        )",
+   "what": "_prepare_input_ids 的 scatter 兜底：批次变过/重排过时，索引张量异步上传后 input_ids.gpu.scatter_ 按 index 从 prev_sampled_token_ids 取行回填——全部在 GPU 上完成，无 CPU 同步点。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L286-L314",
+   "code": "        # Initiate the copy on a separate stream, but do not synchronize it.\n        default_stream = torch.cuda.current_stream()\n        with torch.cuda.stream(async_output_copy_stream):\n            async_output_copy_stream.wait_stream(default_stream)\n            self.sampled_token_ids_cpu = self._sampled_token_ids.to(\n                \"cpu\", non_blocking=True\n            )\n            self._logprobs_tensors_cpu = (\n                self._logprobs_tensors.to_cpu_nonblocking()\n                if self._logprobs_tensors\n                else None\n            )\n            self._routed_experts_cpu = (\n                self._routed_experts.to_cpu_nonblocking()\n                if self._routed_experts is not None\n                else None\n            )\n            if check_ep_fault:\n                has_fault = get_ep_all2all_manager().query_fault()\n                self._has_fault = has_fault.to(\"cpu\", non_blocking=True)\n            self.async_copy_ready_event.record()\n\n    def get_output(self) -> ModelRunnerOutput:\n        \"\"\"Copy the device tensors to the host and return a ModelRunnerOutput.\n\n        This function blocks until the copy is finished.\n        \"\"\"\n        max_gen_len = self.sampled_token_ids_cpu.shape[-1]\n        self.async_copy_ready_event.synchronize()",
+   "what": "AsyncGPUModelRunnerOutput：构造即在专用 copy stream 上发起 non_blocking D2H + event.record（不等待）；get_output 才 event.synchronize 并转 list——EngineCore 的阻塞点从『等计算』缩成『等一次拷贝事件』。注释自述 event 用 blocking=True 防 TP 争锁自旋。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/executor/uniproc_executor.py",
+   "lines": "L26-L42",
+   "code": "class AsyncOutputFuture(Future):\n    def __init__(self, async_output: AsyncModelRunnerOutput, single_value: bool):\n        self.async_output = async_output\n        self.single_value = single_value\n        super().__init__()\n\n    def result(self, timeout=None):\n        if timeout is not None:\n            raise RuntimeError(\"timeout not implemented\")\n\n        if not super().done():\n            try:\n                output = self.async_output.get_output()\n                self.set_result(output if self.single_value else [output])\n            except Exception as e:\n                self.set_exception(e)\n        return super().result()",
+   "what": "AsyncOutputFuture：result() 才调 async_output.get_output()（触发 event.synchronize）——惰性收割；『异步』在 uniproc 不是另一个线程，是推迟的等待。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/engine/core.py",
+   "lines": "L1365-L1371",
+   "code": "    def has_work(self) -> bool:\n        \"\"\"Returns true if the engine should be stepped.\"\"\"\n        return (\n            self.engines_running\n            or self.scheduler.has_requests()\n            or bool(self.batch_queue)\n        )",
+   "what": "has_work：bool(self.batch_queue) 算有活——队列里还有在飞的批时忙循环不睡，必须继续转去 pop 收结果。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/engine/core_client.py",
+   "lines": "L306-L322",
+   "code": "class InprocClient(EngineCoreClient):\n    \"\"\"\n    InprocClient: client for in-process EngineCore. Intended\n    for use in LLMEngine for V0-style add_request() and step()\n        EngineCore setup in this process (no busy loop).\n\n        * pushes EngineCoreRequest directly into the EngineCore\n        * pulls EngineCoreOutputs by stepping the EngineCore\n    \"\"\"\n\n    def __init__(self, *args, **kwargs):\n        self.engine_core = EngineCore(*args, **kwargs)\n\n    def get_output(self) -> EngineCoreOutputs:\n        outputs, model_executed = self.engine_core.step_fn()\n        self.engine_core.post_step(model_executed=model_executed)\n        return outputs and outputs.get(0) or EngineCoreOutputs()",
+   "what": "InprocClient（离线对照）：LLM() 无忙循环门面——get_output 直接调 engine_core.step_fn() 并 post_step；默认配置下 step_fn 同样是重叠版（InprocClient 处理 outputs 为 None 的情形：or EngineCoreOutputs()）。",
+   "elide": []
+  }
+ ],
+ "theory": [
+  {
+   "topic": "三段相加 vs 取最大值：重叠的吞吐账",
+   "detail": "同步一拍 = T_gpu（前向）+ T_cpu（schedule+update 的 Python 循环+输入准备）+ T_ipc（下发/取回）串行相加；千级并发下 T_cpu 达毫秒级（woosuk 自注 scheduler.py:L1728-L1730 'performance bottleneck'），GPU 每 10-20ms 空转一次。重叠后稳态节拍 ≈ max(T_gpu, T_cpu+T_ipc)——批 A 在 GPU 跑的整段时间里，CPU 在调度批 B、收批 A-1 的结果。git 证据：3e440786a（async+PP 完全支持，2026-01-28）commit 标题自带 30.8% E2E 吞吐 / 31.8% TPOT 提升（git 证据，非论文数字——写作时明标出处形态）。"
+  },
+  {
+   "topic": "深度 2 的双缓冲算术（worked example 载体）",
+   "detail": "单卡 async 的队列深度=2 恰好构成双缓冲：拍 k 调度批 B 时批 A 在 GPU；批 B 入队后队列满 [B,A]，同一次调用下半段 pop A 收结果——稳态下每次 step_with_batch_queue 调用都『调度一个新批 + 收掉一个旧批』，GPU 与 CPU 互为对方的掩体。PP 场景深度=pp_size（每段流水线都要有活在算），V2 runner=pp_size+1（消末段气泡，e15f20258）。"
+  },
+  {
+   "topic": "占位账本走一遍（prompt=2、max_tokens=2、无 spec、num_sampled_tokens_per_step=1）",
+   "detail": "四拍推演（computed=乐观已算、ph=num_output_placeholders、tws=num_tokens_with_spec、真实已算=computed−ph）：拍1（批A，prefill）：追赶=2+0−0=2，全 prompt 排入；update_after_schedule：computed=2；AsyncScheduler：ph=0+1=1（is_prefill_chunk 在基类重算时仍用旧 ph=0 → False）。拍2（批B）：追赶=tws(2)+ph(1)−computed(2)=1——排下一个位置（此刻 t2 还没采样回来，位置先占上）；computed=3、ph=2；入队后队列满，pop 批A：update_from_output 追加 t2 → tws=3；Async 扣减 ph=2−1=1；cache_blocks(3−1=2)=真实前缀 [t0,t1] 转正。拍3：剪枝判定 computed(3)+2−ph(1)=4 ≥ prompt(2)+max_tokens(2)=4 → 跳过——不再排多余一步（追赶=3+1−3=1 若不剪就白算一拍）。稳态不变式：computed−ph=真实已算；ph 在 {1,2} 之间振荡（上界≈队列深度×(1+spec数)）。这张表是 m5/m6/m7/m8 共用的 worked example，也解释 cache_blocks 参数为什么是差值。"
+  },
+  {
+   "topic": "一个 token 的两条消费路径（影子状态的本质）",
+   "detail": "async 下批 A 采出的 token t 有两个消费者、走两条路：(a) 喂下一拍前向——留在 GPU 的 prev_sampled_token_ids，被批 C 的 _prepare_input_ids scatter 进 input_ids.gpu（快路，不过 CPU）；(b) 出门给用户——AsyncGPUModelRunnerOutput 在 copy stream 上异步 D2H，future.result() 时 event.synchronize 落地成 list，update_from_output 才能追加进 output_token_ids/判停。两条路异步并行，但判停/回扣全在 (b) 侧——CPU 世界慢半拍，占位数就是这半拍的记账。prev_sampled_token_ids 被 _prepare_input_ids 消费后在下一拍 sample_tokens 里置 None（gpu_model_runner.py:L4609）。"
+  },
+  {
+   "topic": "乐观纠错的 GPU 化（spec 场景，深挖归 ch33）",
+   "detail": "async+spec 下 CPU 侧 seq_lens 用乐观值（假定上拍 draft 全接受，L2081-L2090 optimistic_seq_lens_cpu），discard_request_mask 按乐观长度标记不该采样的请求；纠偏两级：CPU 侧 correct_spec_decode_token_counts 回调推迟到前向发起之后（『批已发出去，现在等修正不再破坏异步』），GPU 侧 update_num_computed_tokens_for_batch_change kernel 用上拍 valid_sampled_token_count_gpu 修正 num_computed_tokens（L2152-L2173）。模式总结：把『等结果再准备输入』改成『先乐观准备、错误在 GPU 上纠』。"
+  },
+  {
+   "topic": "稳态不变式与它的三次破防（诚实账单）",
+   "detail": "全部补偿机制（early-stop 剪枝 L488-L502 / spec 拒绝回扣 L1780-L1784 / 抢占 stale 锁步 drain L1296-L1308+L1740-L1743 / deferred 采样）都在守同一条不变式：num_computed_tokens − num_output_placeholders = 真实已算，且占位数恒 ≥0。本 pin 前三个月三个修复全是它被打破的案例：#42117（2026-05-19，暂停+清缓存后丢 token）、#46066（2026-07-06，占位数 underflow）、#48245（2026-07-29，抢占时占位数 underflow）——async_scheduler.py:L59-L63 的注释 'a stale delivery must not decrement them (it would underflow)' 就是 #48245 类问题的防线。写作时用这张账单压住『重叠白拿性能』的错觉。"
+  }
+ ],
+ "mechanisms": [
+  {
+   "id": "m1",
+   "name": "默认即重叠：async_scheduling=None → True 的仲裁链（pooling/部分 spec/executor 不支持/ROCm DBO 四类才降 False）",
+   "kind": "config",
+   "difficulty": "core",
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/config/vllm.py:L1095-L1143",
+    "vllm/config/scheduler.py:L148-L151"
+   ],
+   "paper_origin": {
+    "paper": "https://github.com/vllm-project/vllm/pull/27614",
+    "sections": [
+     "PR #27614: Enable async scheduling by default（c2ff33cc8, 2025-12-29）——默认翻转的出处"
+    ]
+   }
+  },
+  {
+   "id": "m2",
+   "name": "批队列深度仲裁：max_concurrent_batches（async+单 PP→2 / V2→pp_size+1 / 纯 PP→pp_size）+ v0.21 executor 侧上移 VllmConfig 的迁移史",
+   "kind": "config",
+   "difficulty": "core",
+   "needs_figure": false,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/config/vllm.py:L539-L550",
+    "vllm/v1/engine/core.py:L206-L212"
+   ]
+  },
+  {
+   "id": "m3",
+   "name": "step_fn 静态绑定三级间接：标志→深度→队列→step（EngineCore 不看 async_scheduling 选 step，看队列建没建）",
+   "kind": "config",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/v1/engine/core.py:L206-L212",
+    "vllm/v1/engine/core.py:L231-L234"
+   ],
+   "paper_origin": {
+    "paper": "https://github.com/vllm-project/vllm/pull/19970",
+    "sections": [
+     "PR #19970: Implement Async Scheduling（d4d309409, 2025-07-14）——AsyncScheduler+num_output_placeholders+批队列的出处"
+    ]
+   }
+  },
+  {
+   "id": "m4",
+   "name": "step_with_batch_queue 上半段：盲调度→发起前向→（立即采样/deferred）→appendleft 入队→填管道优先 return (None, model_executed)",
+   "kind": "algorithm",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/v1/engine/core.py:L625-L687"
+   ],
+   "paper_origin": {
+    "paper": "https://github.com/vllm-project/vllm/pull/19970",
+    "sections": [
+     "PR #19970: step_with_batch_queue 原始实现（v0.27.1 判定条件已改）"
+    ]
+   }
+  },
+  {
+   "id": "m5",
+   "name": "step_with_batch_queue 下半段：pop 最老批→future.result（None⇒重抛 execute 异常）→aborts→update_from_output→deferred 补采重新入队",
+   "kind": "algorithm",
+   "difficulty": "core",
+   "needs_figure": false,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/v1/engine/core.py:L689-L739"
+   ],
+   "paper_origin": {
+    "paper": "https://github.com/vllm-project/vllm/pull/19970",
+    "sections": [
+     "PR #19970: step_with_batch_queue 原始实现（v0.27.1 已演进）"
+    ]
+   }
+  },
+  {
+   "id": "m6",
+   "name": "num_output_placeholders 占位调度：AsyncScheduler._update_after_schedule 给非 prefill-chunk 请求 +（num_sampled_tokens_per_step + spec 数）、spec_token_ids 换 -1 占位列表",
+   "kind": "algorithm",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/v1/core/sched/async_scheduler.py:L19-L49",
+    "vllm/v1/request.py:L150-L151"
+   ],
+   "paper_origin": {
+    "paper": "https://github.com/vllm-project/vllm/pull/19970",
+    "sections": [
+     "PR #19970: num_output_placeholders 机制出处"
+    ]
+   }
+  },
+  {
+   "id": "m7",
+   "name": "占位扣减与块转正：AsyncScheduler._update_request_with_output —=len(new_token_ids)（stale 不扣，防 underflow）+ cache_blocks(computed−placeholders) 转正乐观块",
+   "kind": "algorithm",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/v1/core/sched/async_scheduler.py:L51-L70"
+   ],
+   "paper_origin": {
+    "paper": "https://github.com/vllm-project/vllm/pull/19970",
+    "sections": [
+     "PR #19970: 占位扣减+块转正的出处"
+    ]
+   }
+  },
+  {
+   "id": "m8",
+   "name": "追赶公式的占位项：num_new_tokens = num_tokens_with_spec + num_output_placeholders − num_computed_tokens（ch10 立公式、本章灌值）",
+   "kind": "algorithm",
+   "difficulty": "core",
+   "needs_figure": false,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/v1/core/sched/scheduler.py:L516-L520"
+   ],
+   "paper_origin": {
+    "paper": "https://github.com/vllm-project/vllm/pull/9289",
+    "sections": [
+     "PR #9289: v1 首提交 6c5af09b3——追赶公式 NOTE(woosuk)；占位项由 #19970 灌值"
+    ]
+   }
+  },
+  {
+   "id": "m9",
+   "name": "early-stop 剪枝（async 专属）：computed+2−placeholders ≥ prompt+max_tokens 就不排多余一步——『确信上拍已到 max_tokens』的算术",
+   "kind": "algorithm",
+   "difficulty": "core",
+   "needs_figure": false,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/v1/core/sched/scheduler.py:L488-L502"
+   ],
+   "paper_origin": {
+    "paper": "https://github.com/vllm-project/vllm/pull/19970",
+    "sections": [
+     "PR #19970: async 调度避免多余一步的剪枝"
+    ]
+   }
+  },
+  {
+   "id": "m10",
+   "name": "采样 token 不落 CPU（worker 影子①②）：prev_sampled_token_ids 留 GPU + token_ids_cpu 行只写 -1 占位（num_tokens_no_spec 照常推进）",
+   "kind": "dataflow",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/v1/worker/gpu_model_runner.py:L3797-L3813",
+    "vllm/v1/worker/gpu_model_runner.py:L3815-L3842",
+    "vllm/v1/worker/gpu_input_batch.py:L310-L311"
+   ]
+  },
+  {
+   "id": "m11",
+   "name": "下一拍 GPU 回填：_prepare_input_ids——prev_positions 槽位映射、common-case 单 slice 直拷、变过按 index scatter（spec draft 再补一轮 → ch33）",
+   "kind": "algorithm",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/v1/worker/gpu_model_runner.py:L1769-L1782",
+    "vllm/v1/worker/gpu_model_runner.py:L1784-L1877",
+    "vllm/v1/worker/gpu_model_runner.py:L1878-L1891"
+   ],
+   "paper_origin": {
+    "paper": "https://github.com/vllm-project/vllm/pull/23569",
+    "sections": [
+     "PR #23569: Fully overlap model execution（cee182b29）——token 留 GPU+scatter 回填的出处"
+    ]
+   }
+  },
+  {
+   "id": "m12",
+   "name": "AsyncGPUModelRunnerOutput 异步输出：专用 copy stream wait_stream(default)→non_blocking D2H→event.record；get_output event.synchronize；blocking=True 防 TP 自旋",
+   "kind": "protocol",
+   "difficulty": "supporting",
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/v1/worker/gpu_model_runner.py:L259-L350",
+    "vllm/v1/worker/gpu_model_runner.py:L735-L743"
+   ]
+  },
+  {
+   "id": "m13",
+   "name": "AsyncOutputFuture 惰性收割：result() 才 get_output→event.synchronize——EngineCore 阻塞点缩成一次 D2H 事件",
+   "kind": "protocol",
+   "difficulty": "supporting",
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/v1/executor/uniproc_executor.py:L26-L42",
+    "vllm/v1/executor/uniproc_executor.py:L88-L107"
+   ]
+  },
+  {
+   "id": "m14",
+   "name": "deferred sampling：pending_structured_output_tokens 置位→本拍不采样→pop 后补 bitmask+sample_tokens 重新入队（spec 草稿先回填；bitmask 算法归 ch30）",
+   "kind": "protocol",
+   "difficulty": "supporting",
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/v1/core/sched/async_scheduler.py:L31-L33",
+    "vllm/v1/core/sched/output.py:L235-L241",
+    "vllm/v1/engine/core.py:L665-L677",
+    "vllm/v1/engine/core.py:L719-L737",
+    "vllm/v1/core/sched/scheduler.py:L1646-L1668"
+   ]
+  },
+  {
+   "id": "m15",
+   "name": "spec 拒绝回扣：num_rejected 同步回退 num_computed_tokens 与 num_output_placeholders（stale 不回扣）——占位覆盖 spec token 的对账（机制本体 → ch33）",
+   "kind": "algorithm",
+   "difficulty": "supporting",
+   "needs_figure": false,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/v1/core/sched/scheduler.py:L1769-L1784"
+   ],
+   "paper_origin": {
+    "paper": "https://github.com/vllm-project/vllm/pull/24799",
+    "sections": [
+     "PR #24799: Async Scheduling × Spec Decoding Compatibility（d8874c61a）——拒绝回扣占位的出处"
+    ]
+   }
+  },
+  {
+   "id": "m16",
+   "name": "抢占的 stale 账：num_stale_output_tokens = num_in_flight_tokens、占位清零；输出照送（保 spec acceptance）但锁步 drain、不动已清零计数器（抢占内景归 ch11）",
+   "kind": "protocol",
+   "difficulty": "supporting",
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/v1/core/sched/scheduler.py:L1296-L1308",
+    "vllm/v1/core/sched/scheduler.py:L1736-L1743",
+    "vllm/v1/request.py:L152-L157"
+   ]
+  },
+  {
+   "id": "m17",
+   "name": "post_step 的 spec 分叉：async 下 draft token 在 worker 进程更新、不回传主进程（take_draft_token_ids 只在同步版走）",
+   "kind": "config",
+   "difficulty": "supporting",
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/v1/engine/core.py:L616-L623"
+   ]
+  },
+  {
+   "id": "m18",
+   "name": "worker 乐观纠错群：optimistic_seq_lens_cpu（假定 draft 全接受）+ discard_request_mask + GPU 修正 kernel update_num_computed_tokens_for_batch_change + synchronize_input_prep pinned 防踩（spec 深挖 → ch33）",
+   "kind": "dataflow",
+   "difficulty": "supporting",
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/v1/worker/gpu_model_runner.py:L2081-L2105",
+    "vllm/v1/worker/gpu_model_runner.py:L2152-L2173",
+    "vllm/v1/worker/gpu_model_runner.py:L3864-L3877"
+   ]
+  },
+  {
+   "id": "m19",
+   "name": "同步禁区 tripwire：VLLM_GPU_SYNC_CHECK——warmup 后开启、execute_model/sample_tokens 全包住、任何 CPU↔GPU sync 直接抛（纪律从注释升级为运行期纠察）",
+   "kind": "config",
+   "difficulty": "supporting",
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/v1/worker/gpu_worker.py:L846-L848",
+    "vllm/v1/worker/gpu_worker.py:L1010-L1019",
+    "vllm/utils/gpu_sync_debug.py:L9-L17"
+   ]
+  },
+  {
+   "id": "m20",
+   "name": "队列保活与离线对照：has_work 把 bool(batch_queue) 算有活；InprocClient 直调 step_fn（无忙循环，默认配置下同样是重叠版）；同步 step() 只剩例外路径",
+   "kind": "config",
+   "difficulty": "supporting",
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/v1/engine/core.py:L1365-L1371",
+    "vllm/v1/engine/core_client.py:L306-L322",
+    "vllm/v1/engine/core.py:L584-L614"
+   ]
+  },
+  {
+   "id": "m21",
+   "name": "deque 三元组 FIFO：(future, SchedulerOutput, exec_future)——采样 future 出 None 时靠 exec_future 重抛真异常；appendleft 进/pop 出=先调度的批先取结果",
+   "kind": "layout",
+   "difficulty": "supporting",
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/v1/engine/core.py:L207-L212",
+    "vllm/v1/engine/core.py:L681",
+    "vllm/v1/engine/core.py:L696-L706"
+   ]
+  }
+ ],
+ "subtraction_plan": {
+  "delete": [
+   {
+    "what": "is_ec_consumer 分支（core.py:L658-L659）——非 encoder-cache 消费端把 model_executed 置 False 的逻辑",
+    "why_safe": "仅分布式 encoder cache transfer 的非消费端（ec_transfer_config 配置）走到；常规部署 is_ec_consumer 恒 True，精简版可直接令 model_executed = total_num_scheduled_tokens > 0"
+   },
+   {
+    "what": "is_pooling_model 快路（core.py:L661-L663 中 is_pooling_model 条件）",
+    "why_safe": "pooling/embedding 模型无采样，exec_future 直接当最终 future——本章聚焦生成路径的重叠机制，保留 not model_executed 那支即可覆盖『没调度到 token 无需采样』"
+   },
+   {
+    "what": "capture_iteration_details / log_error_detail / _attach_iteration_details / _make_iteration_details_stats（core.py 全部观测上下文）",
+    "why_safe": "纯诊断/观测上下文管理器，不改变控制流与数值；删掉后 step_with_batch_queue 的两态骨架不变"
+   },
+   {
+    "what": "V2 runner 分支（async_scheduler.py:L46-L49 use_v2_model_runner 的 next_decode_eligible_step；scheduler.py 中 V2 相关残余）",
+    "why_safe": "vllm/v1/worker/gpu/ 的 Model Runner V2 仍是实验性（README 自述），全书锚定 V1；默认 use_v2_model_runner=False 该分支不执行"
+   },
+   {
+    "what": "DP/PP 扩展分支（_should_throttle_prefills 参数与 DP 覆写、_pp_broadcast_prev_sampled_token_ids/_pp_receive_prev_sampled_token_ids_to_input_batch、broadcast_pp_output、use_pp 的 new_token_ids 回传）",
+    "why_safe": "单机单卡（pp_size=1、is_last_rank 恒真、world_size=1）这些分支不触发；PP 广播路径本章只作脚注提及"
+   },
+   {
+    "what": "spec 深层分支（_prepare_input_ids 的 spec draft 二段 scatter L1893-L1913、update_num_computed_tokens_for_batch_change、propose_draft_token_ids 闭包、valid_sampled_token_count_gpu、_copy_draft_token_ids_to_cpu）——保留调用点与 -1 占位语义",
+    "why_safe": "无 spec 配置（speculative_config=None）时 num_spec_tokens=0、draft 路径不执行；占位公式里的 spec 项保留（cur_num_spec_tokens=0）不影响主线"
+   },
+   {
+    "what": "worker 侧正交分支（routed_experts 初始化与快照、mm/encoder 输入、LoRA、mamba、cascade attention、enable_prompt_embeds 补拷）",
+    "why_safe": "分别是 MoE 诊断/多模态/LoRA/混合模型/可选注意力/嵌入输入特性，默认配置全不触发；_bookkeeping_sync/_prepare_input_ids 的 async 主线不依赖它们"
+   },
+   {
+    "what": "deferred 分支里 check_for_draft_tokens 的内层块（core.py:L722-L730）可压缩为一行注释保留调用点",
+    "why_safe": "spec+structured 双叠加是小众路径；deferred 主干（pending→存单→补采→重新入队）不依赖内层细节——但方法名 take_draft_token_ids/update_draft_token_ids_in_output 保留在注释中以存证"
+   }
+  ],
+  "must_keep": [
+   {
+    "symbol": "step_with_batch_queue",
+    "why": "本章绝对主角：v0.27.1 默认心跳，必须原样保留方法名与两态控制流"
+   },
+   {
+    "symbol": "batch_queue",
+    "why": "deque 缓冲本体，appendleft/pop 都作用于它"
+   },
+   {
+    "symbol": "batch_queue_size",
+    "why": "队列深度=max_concurrent_batches，填管道判定的阈值"
+   },
+   {
+    "symbol": "appendleft",
+    "why": "新批入队操作；与 pop 配成 FIFO"
+   },
+   {
+    "symbol": "pop",
+    "why": "取最老批操作；填管道 vs 取结果两态切换的标志动作"
+   },
+   {
+    "symbol": "deferred_scheduler_output",
+    "why": "deferred sampling 的核心变量：推迟采样与重新入队"
+   },
+   {
+    "symbol": "pending_structured_output_tokens",
+    "why": "触发 deferred 的开关标志（output.py 定义、async_scheduler 置位）"
+   },
+   {
+    "symbol": "has_structured_output_requests",
+    "why": "bitmask 快返与 deferred 时序的另一只标志"
+   },
+   {
+    "symbol": "sample_tokens",
+    "why": "采样非阻塞调用：立即采样与 deferred 补采都靠它"
+   },
+   {
+    "symbol": "execute_model",
+    "why": "non_block=True 发起前向拿 exec_future；deferred 复用同一 future"
+   },
+   {
+    "symbol": "get_grammar_bitmask",
+    "why": "deferred 路径补算掩码；依赖本步草稿 token——defer 的根因"
+   },
+   {
+    "symbol": "update_from_output",
+    "why": "pop 后真记账、产出 EngineCoreOutputs"
+   },
+   {
+    "symbol": "has_work",
+    "why": "bool(batch_queue) 在飞批保活忙循环"
+   },
+   {
+    "symbol": "model_executed",
+    "why": "返回值第二位 & 填管道判定条件"
+   },
+   {
+    "symbol": "max_concurrent_batches",
+    "why": "深度唯一出处（VllmConfig property）——async→2 的落点"
+   },
+   {
+    "symbol": "step_fn",
+    "why": "静态绑定 step / step_with_batch_queue——三级间接的最后一环"
+   },
+   {
+    "symbol": "async_scheduling",
+    "why": "配置位与实例字段：None 默认仲裁 + post_step 短路"
+   },
+   {
+    "symbol": "get_scheduler_cls",
+    "why": "async → AsyncScheduler 的换型点"
+   },
+   {
+    "symbol": "AsyncScheduler",
+    "why": "占位调度调度器：本章两个主角方法的宿主"
+   },
+   {
+    "symbol": "_update_after_schedule",
+    "why": "占位 +1 的方法名（AsyncScheduler 覆写版）"
+   },
+   {
+    "symbol": "_update_request_with_output",
+    "why": "占位 -1 + cache_blocks 转正的方法名（AsyncScheduler 覆写版）"
+   },
+   {
+    "symbol": "num_output_placeholders",
+    "why": "占位数本身——盲调度的账本核心"
+   },
+   {
+    "symbol": "num_in_flight_tokens",
+    "why": "在飞 token 计数：stale 的来源、热循环第一笔扣账"
+   },
+   {
+    "symbol": "num_stale_output_tokens",
+    "why": "抢占 stale 账：照送但不许动计数器"
+   },
+   {
+    "symbol": "cache_blocks",
+    "why": "乐观块转正式：参数 computed−placeholders 是不变式的化身"
+   },
+   {
+    "symbol": "prev_sampled_token_ids",
+    "why": "真 token 的 GPU 住所——『采样 token 不落 CPU』的载体"
+   },
+   {
+    "symbol": "prev_req_id_to_index",
+    "why": "上拍槽位表：GPU scatter 的索引来源"
+   },
+   {
+    "symbol": "_prepare_input_ids",
+    "why": "下一拍 GPU 回填的方法：直拷/scatter 两路"
+   },
+   {
+    "symbol": "_compute_prev_positions",
+    "why": "当前槽→上拍槽映射（-1=新请求）"
+   },
+   {
+    "symbol": "_bookkeeping_sync",
+    "why": "写回持久批次的方法：async 分支写 -1 占位"
+   },
+   {
+    "symbol": "AsyncGPUModelRunnerOutput",
+    "why": "异步输出：copy stream D2H + event"
+   },
+   {
+    "symbol": "async_copy_ready_event",
+    "why": "D2H 完成事件——future.result() 等的就是它"
+   },
+   {
+    "symbol": "AsyncOutputFuture",
+    "why": "uniproc 惰性收割 future"
+   },
+   {
+    "symbol": "get_output",
+    "why": "event.synchronize 后才 tolist 的契约方法"
+   },
+   {
+    "symbol": "optimistic_seq_lens_cpu",
+    "why": "乐观 seq_lens（假定 draft 全接受）——影子状态代表"
+   },
+   {
+    "symbol": "discard_request_mask",
+    "why": "按乐观长度标记不采样的请求"
+   },
+   {
+    "symbol": "take_draft_token_ids",
+    "why": "deferred+spec 取上一步草稿 token（可压缩但名字要存证）"
+   },
+   {
+    "symbol": "check_for_draft_tokens",
+    "why": "post_step 与 deferred 的 spec 门（v0.27.1 对 v0.21 use_spec_decode 的改名——迁移证据）"
+   }
+  ]
+ },
+ "foreshadow_due": {
+  "source": "v3 伏笔真相源 = book/cartography/pedagogy-plan.json foreshadows（bible.py due 是 v2 旧章号账本，取回必错，不跑）",
+  "should_plant": [],
+  "should_payoff": [],
+  "note": "pedagogy-plan.foreshadows 无 planted=12 亦无 paid=12 的条目——本章不埋不收。邻章伏笔路过点（写作时顺带提钩子但不登记）：①ch9 埋的 F6（grammar bitmask 窗口→ch30）在本章 deferred sampling 分支再次路过——本章只讲『缺 token 必须推迟』的时序半边，掩码怎么算留给 ch30；②收尾回指：Part III 至此收束（心跳的骨架→账本→抢占→重叠），下一章进 Part IV『显存是主角：分页 KV』——调度器全程只借还块 id、不知道块里怎么放，这个悬念是 ch13 的天然种子（hook：『显存就那么多，KV cache 必须活到最后』）；③worker 侧深水区（持久批次/CUDA graph/slot_mapping）分别由 ch18/19/22 打开，结尾各留一句指路即可。"
+ },
+ "l2_spec": "book/cartography/l2-specs/ch12.json（同目录 stations 与本档案 stations 同一份账本）"
+}
