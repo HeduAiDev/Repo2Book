@@ -1,0 +1,204 @@
+{
+  "chapter_id": "ch17",
+  "chapter_title": "执行三层",
+  "pin": "vLLM v0.27.1 (6e448d0ea)",
+  "generated_by": "researcher",
+  "generated_date": "2026-08-22",
+  "note": "本章 introduces 三项的立项裁决：「Executor/Worker/ModelRunner」与「collective_rpc」是纯内部机制——dossier（m1/m5/m7/m10 与 WC1 的 v0→v1 git 考古）是它们的真相源，不产研究条目；「控制面/数据面分离」是三项里唯一需要外部背景的——立项新研（网络世界的出身 + 术语向通用基础设施软件的迁移 + vLLM 契约原文的对应），另为 WC2 点名的 SPMD（worker_base docstring 原文出现的术语）立项一条。本章立项 8 条 = 2 新研 + 6 复用改锚（自 v2 映射章 artifacts/ch17-worker-and-executor，sources 均沿用并按需重核）：NCCL（重核官方概述与 communicators 页，v2 条目里『所有 rank 同时参与握手避免死锁』的措辞本轮换成了两条可逐字核的引文——overview 的 tight synchronization 句 + communicators 页的 host-side launches 保序句）、cloudpickle（重核 README 四句原话）、执行器后端族（重大改锚：v0.27.1 里 ray 后端默认已是 RayExecutorV2——pin envs 运行时默认 +1 与官方 API 文档『Inherits from MultiprocExecutor to reuse the MQ-based control plane and NCCL data plane』双证，v2 引的 RFC #35848 愿景已兑现）、sentinel 存活检测（重核 Python 文档 verbatim）、RLHF 权重同步（v2 源沿用未重抓）、PCP（重大改锚：v2 时还是 open RFC，现核 PR #28718 已于 2025-11-19 合并、pin 里已是 config 字段+pcp_manager）。回指（零重产）：Future=提货单已由 ch09 python-future-notation 立透（FutureWrapper/AsyncOutputFuture 的 stdlib 原型——writer 回指即可）；multiprocessing start methods fork/spawn 与『fork 毒、碰 CUDA 强制 spawn』已由 ch05 立透（get_mp_context/_maybe_force_spawn/inherited_fds 的全部外部依据，ch05 已引 PyTorch 2.13 multiprocessing 注记原话）；weakref.finalize 已由 ch05 立透（multiproc L113 兜底与监控线程 weakref.ref 的外部依据）；busy loop 命名已由 ch09 立透（worker_busy_loop 沿用）；『大数据不走控制通道』在前端边界的先例（ZMQ 载荷 + mm 大载荷 OOB shm 旁路）已由 ch05 立透——控制面条目里直接回指。刻意不立项：CuMem 池 tag（本章只认三锚点归属，sleep/wake 已被减法删除，深讲不在本层）；MessageQueue/shm_broadcast（内部机制，ch05 已立 shm 旁路概念）；torchrun（external_launcher 条目内一句带过）；deque 的 FIFO 语义与 Future 的 InvalidStateError（stdlib 常识，正文一句括注足够）；Ray 框架本体（执行器族条目内一个 alternative 足够，ray 内部归 ch34）。pin 本地核实记录（2026-08-22）：envs.py 双层机制——顶部 if TYPE_CHECKING 块的字段默认值（L64 的 False）只是类型注解、运行时真值在 environment_variables 字典（L908-L910：VLLM_USE_RAY_V2_EXECUTOR_BACKEND 默认 '1'→True，注释 'When True and distributed_executor_backend=\"ray\", use RayExecutorV2 (MQ-based) instead of RayDistributedExecutor (compiled-graph backend)'；L920-L921 VLLM_WORKER_MULTIPROC_METHOD 默认 'fork'）；utils/system_utils.py get_mp_context（L168-L181）+ _maybe_force_spawn（L126-L165：Ray actor/--numa-bind/CUDA 已初始化/WSL 四种情形强制 spawn，注释自引官方 troubleshooting 文档）；ray_executor_v2.py L24-L28 直接 import MultiprocExecutor 的 WorkerProc/FutureWrapper；config/parallel.py:126 prefill_context_parallel_size 默认 1；multiproc_executor.py:522 _get_output_rank 公式用 pcp。",
+  "concepts": [
+    {
+      "id": "control-plane-data-plane",
+      "term": "控制面/数据面分离（control plane / data plane separation）",
+      "kind": "external_concept",
+      "one_line": "从网络设备世界来的老原则：把「下指令的慢通道」（控制面）与「搬数据的快通道」（数据面）拆成两条各自优化的通道——vLLM 在执行臂上做的正是这件事，collective_rpc 的 docstring 原文就写着这句话。",
+      "what_it_is": "一个分布式系统里同时存在两类完全不同的通信：**控制面**传的是指令与决策——低频、小报文、在乎的是「可靠、有序、让每个参与者都知道该干什么」；**数据面**传的是业务数据本身——高频、大流量、在乎的是「快、带宽满、别让计算等传输」。两条通道的性能要求与变化节奏完全不同，混在同一条管道里就会互相拖累：小指令被大流量挤住，大流量又为每个报文付出指令通道的封装开销。「分离」就是把它们显式拆开：控制面走一条便宜可靠的窄路，数据面专门为吞吐铺路。网络界权威机构 ONF（Open Networking Foundation）对 SDN 的官方定义原文就是：\"The physical separation of the network control plane from the forwarding plane, and where a control plane controls several devices\"（网络控制面与转发面的物理分离，一个控制面控制多台设备），并把「decouples the network control and forwarding functions」列为直接可编程的来源。落到本章：EngineCore→worker 的 collective_rpc 是控制面（广播的是几 KB 的差量 SchedulerOutput），GPU 之间的 NCCL all-reduce / PP irecv-isend 是数据面（每层流动的是 MB 级激活张量）——同一个引擎拍里两条通道并行、互不挤占。vLLM 把这条原则写进了契约原文：Executor.collective_rpc 的 docstring「It is recommended to use this API to only pass control messages, and set up data-plane communication to pass data」（pin vllm/v1/executor/abstract.py:L181-L183，本地核实）。",
+      "background": "来龙去脉三步：① **出身在网络设备**。传统路由器内部本来就有两个平面——控制面跑路由协议算出转发表，数据面（转发面）由 ASIC 按表逐包转发——但被包在一台设备里。SDN（软件定义网络）运动把「分离」升级为显式架构主张：控制面抽出来集中成控制器、经 OpenFlow 之类协议远程编程交换机（ONF 定义与 OpenFlow 原文见 sources），这是该术语的现代出处。② **术语迁移到通用基础设施软件**。如今遍地都是：Kubernetes 官方文档原话「A Kubernetes cluster consists of a control plane and one or more worker nodes」（控制面组件做全局决策，worker 节点跑实际负载）；服务网格 Istio 官方文档同样自述——控制面「takes your desired configuration, and its view of the services, and dynamically programs the proxy servers」（istiod 把规则编进每个 envoy），数据面「is the communication between services」（envoy 代理拦截真实流量）。③ **ML 系统沿用**。训练/推理引擎普遍把「调度/协调」与「张量搬运」分面：vLLM 执行臂的 collective_rpc（控制消息）与 torch.distributed/NCCL（张量数据）就是一对；本书 ch05 已立过同一原则在前端边界的先例——API↔EngineCore 之间 ZMQ 只传小载荷、多模态大特征走 OOB 共享内存旁路。两处是同一个思想的两个剖面。",
+      "example": "同一原则在三个系统里的逐行对照（每行上下两个角色一一对应）：\n\n| 系统 | 控制面（慢通道：指令/决策） | 数据面（快通道：真实数据） |\n| SDN 交换机 | OpenFlow 流表下发（控制器→交换机，低频配置） | ASIC 按表逐包转发（线速） |\n| Istio 服务网格 | istiod 把路由规则编程进 envoy（「dynamically programs the proxy servers」） | envoy 拦截并转发服务间全部流量（「intercept all your network traffic」） |\n| vLLM mp 执行臂（本章） | rpc_broadcast_mq 广播 (method, args, output_rank)——execute_model/sample_tokens 两次/拍，载荷是差量 SchedulerOutput | NCCL all-reduce（TP 每层）与 PP irecv/isend（中间激活）——MB 级张量，从不进 MQ |\n\n账面感受：TP=4 的一次前向里，控制面总流量是两条共享内存队列上的两次小广播，数据面是每个 transformer 层各一次的激活张量 all-reduce——相差三个数量级，这就是「only pass control messages」的分量。",
+      "links": [
+        "https://opennetworking.org/sdn-definition/",
+        "https://istio.io/latest/docs/overview/what-is-istio/",
+        "https://kubernetes.io/docs/concepts/overview/components/"
+      ],
+      "sources": [
+        {"url": "https://opennetworking.org/sdn-definition/", "note": "ONF 官方 SDN 定义页（WebFetch 核实 2026-08-22）：定义原话 \"The physical separation of the network control plane from the forwarding plane, and where a control plane controls several devices\"；\"decouples the network control and forwarding functions\" 使控制 directly programmable；OpenFlow 是 foundational element。术语出处的最权威一手出处。"},
+        {"url": "https://istio.io/latest/docs/overview/what-is-istio/", "note": "Istio 官方文档（WebFetch 核实 2026-08-22）：控制面 \"takes your desired configuration, and its view of the services, and dynamically programs the proxy servers\"；数据面 \"is the communication between services\"、\"uses a proxy to intercept all your network traffic\"——术语迁移到服务网格的权威例证。"},
+        {"url": "https://kubernetes.io/docs/concepts/overview/components/", "note": "Kubernetes 官方组件文档（WebFetch 核实 2026-08-22）：\"A Kubernetes cluster consists of a control plane and one or more worker nodes\"——术语在通用基础设施软件里的最广为熟知用法（页面近期改版为紧凑格式，此句仍在）。"},
+        {"url": "vllm/v1/executor/abstract.py:L181-L183（本仓 pin v0.27.1 源码，本地核实 2026-08-22）", "note": "vLLM 侧契约原文：collective_rpc docstring 的 Note 段 \"It is recommended to use this API to only pass control messages, and set up data-plane communication to pass data\"——外部原则被写进接口契约的一手证据。"}
+      ],
+      "confidence": "high",
+      "writer_note": "introduces 首现处（m10 collective_rpc docstring 逐字讲）配半段外部背景就够：两条通道、各自优化、ONF 一句定义点出身；ch05 的 OOB 旁路回指一句（「同一原则我们在前端边界已见过一次」）；三行对照表可压缩成一句括注（SDN/Istio/K8s 任选其一作例证），NCCL 那行的账面感受（数量级差）比表格本身更值得写进正文；SDN 历史绝对不展开，链接留给想深挖的读者。"
+    },
+    {
+      "id": "spmd-term",
+      "term": "SPMD（Single Program, Multiple Data，单程序多数据）",
+      "kind": "external_concept",
+      "one_line": "「同一份程序复制 N 份、各自在各自的数据上跑、只在通信点对齐」的并行形态——vLLM 把每个 GPU worker 进程都跑成同一个 worker_busy_loop，就是教科书式的 SPMD。",
+      "what_it_is": "SPMD 是并行计算的经典编程模型：多个进程执行**同一份程序**，但各进程处理**各自的数据**、各自按自己的节奏推进。Wikipedia 的定义原文：\"multiple autonomous processors simultaneously execute the same program at independent points, rather than in the lockstep\"（多个自治处理器同时执行同一程序，各自处于不同进度点，而非步调一致）——后半句正是与 SIMD 的分界：SIMD 是同一条指令在同一时刻施于多条数据（GPU warp 的 SIMT 就是 lockstep），而 SPMD 在 Flynn 分类法下是 MIMD 的子类（\"refers to MIMD execution of a given ('single') program\"），各进程可以走进不同的分支——Darema 的原始表述是处理器 \"self-schedule themselves to execute different instructions and act on different data\"（自调度地执行不同指令、处理不同数据）。程序只有一份，进程间的差异全靠启动时注入的「身份」（rank / local_rank 环境变量）。MPI 程序 \"is commonly used to implement SPMD\"，CUDA 编程模型 \"follows an SPMD/SIMT model\"——现代深度学习的分布式训练/推理拉起方式（torchrun 起 N 份同一脚本）全是这个形态。vLLM 语境的对应物：v1 设计 RFC #8779 的架构表述原文就是 \"Driver process + SPMD workers\"（ch01 已引）；本章读者亲眼看到的 SPMD 化身是——WorkerProc.worker_main 这一份入口程序被 spawn N 次、每个进程按 rank 选卡后进入同一个 worker_busy_loop 服役；worker_cls='auto' 对所有 rank 解析到同一个 Worker 类。「SPMD-style offline inference」（本章嵌入的 worker_base.py docstring 原文）则是另一种用法：N 个引擎/执行器各自只带 1 个 worker（rpc_rank 全是 0、分布式 rank 各不同）——「同程序」还在，只是每份程序自带完整引擎而非引擎的一份分片。",
+      "background": "术语 1983 年由两组人独立提出：IBM 的 Frederica Darema 提出了后来成为主流的模型（为 IBM EPEX/FORTRAN 系统设计），法国的 Auguin 与 Larbey 同年提出的是另一种基于 fork-join 的 SIMD 型方案；规范引文是 Darema, George, Norton, Pfister 1988 年发表于 Parallel Computing vol.7 的 \"A single-program-multiple-data computational model for EPEX/FORTRAN\"（1987 年 4 月收到）。它之后成为 MPI 世界的事实标准形态，又随 GPU 计算进入深度学习。vLLM 的 Driver+SPMD workers 架构直接继承这条线：调度决策集中在 EngineCore（driver），worker 进程复制同一份程序各管一张卡——对照 v0 时代引擎与 worker 焊在同一进程的形态，v1 的「拆」正是向 SPMD 的回归（dossier WC1 的 git 考古是 vLLM 侧证据）。",
+      "example": "torchrun 式最小例（说明性，非源码）：\n```python\n# torchrun --nproc_per_node=4 demo.py —— 同一份 demo.py 被 4 个进程各执行一遍\nimport os, torch\nrank = int(os.environ[\"RANK\"])          # 程序只有一份；进程差异全靠启动时注入的身份\ntorch.cuda.set_device(rank)             # 同一程序，不同设备/不同数据——SPMD\ndist = torch.distributed\n# ... 各进程自由推进，直到集合通信点才必须对齐：\ndist.init_process_group(\"nccl\")         # 全体 rank 在此握手对齐（非 lockstep，只在此同步）\n```\n逐行看：文件只有一份，4 个进程执行的是同一行行代码；唯一的「不同」来自环境变量注入的 rank；进程之间平时各自为政（一个可能在 prefill、另一个在 decode），只在集合通信点（init_process_group / all-reduce）对齐——「independent points, rather than in the lockstep」。对照 SIMD：GPU warp 里 32 个线程同一时钟执行同一条指令，那才是 lockstep；worker 进程们的 busy loop 各转各的，只在 dequeue 到同一批广播指令时天然同拍。",
+      "links": [
+        "https://en.wikipedia.org/wiki/Single_program,_multiple_data",
+        "https://link.springer.com/rwe/10.1007/978-0-387-09766-4_26",
+        "https://github.com/vllm-project/vllm/issues/8779"
+      ],
+      "sources": [
+        {"url": "https://en.wikipedia.org/wiki/Single_program,_multiple_data", "note": "Wikipedia SPMD 条目（WebFetch 核实 2026-08-22）：定义原话 \"multiple autonomous processors simultaneously execute the same program at independent points, rather than in the lockstep\"；MIMD 子类表述；Darema 自调度原话 \"self-schedule themselves to execute different instructions and act on different data\"；1983 双组独立提出（Darema@IBM 主流 + Auguin/Larbey@法国）；\"MPI is commonly used to implement SPMD\"；\"CUDA follows an SPMD/SIMT model\"。"},
+        {"url": "https://link.springer.com/rwe/10.1007/978-0-387-09766-4_26", "note": "Springer 并行计算百科 'SPMD Computational Model' 词条（检索摘要 2026-08-22）：引 Darema et al. 1988（Parallel Computing vol.7）为规范出处——论文原文未直接打开，引文线索经 Wikipedia 与百科条目双重一致。"},
+        {"url": "https://github.com/vllm-project/vllm/issues/8779", "note": "vLLM v1 架构 RFC（ch01 研究已于 2026-08-16 核实）：\"Driver process + SPMD workers\" 原话——vLLM 自家用 SPMD 描述自家架构的一手出处。"}
+      ],
+      "confidence": "medium",
+      "writer_note": "定义与谱系经 Wikipedia 逐字核实、带 Darema 1988 论文出处（论文原文未直接打开，已注明）——confidence 标 medium 的原因在此，正文引用定义措辞没问题，别引「1983 两个组」这类史实细节进正文脚注即可（要引就引年份+人名最简版）。首现处（WC2 讲 rpc_rank vs global_rank 的 docstring 原文，或 worker_main 被 spawn N 次处）给半段：定义一句 + 「GPU warp 是 lockstep 的 SIMD、worker 进程是各自为政的 SPMD」对照一句；RFC #8779 的 Driver+SPMD workers 措辞 ch01 已引，回指即可，别重复讲 RFC。"
+    },
+    {
+      "id": "nccl-collective-communication",
+      "term": "NCCL（NVIDIA Collective Communications Library）",
+      "kind": "external_project",
+      "one_line": "NVIDIA 官方的多 GPU/多机通信库，all-reduce、broadcast 这类「集合通信」操作的事实标准实现——PyTorch 分布式的 NCCL 后端底层就是它，vLLM 的 TP/PP 数据面全靠它搬张量。",
+      "what_it_is": "NCCL 官方概述第一句原文：\"The NVIDIA Collective Communications Library (NCCL, pronounced 'Nickel') is a library providing inter-GPU communication\"——注意读音（nickel，镍）。它自述定位 \"a library focused on accelerating inter-GPU communication\"、\"not a full-blown parallel programming framework\"：只做通信这一件事，实现 AllReduce、Broadcast、Reduce、AllGather、ReduceScatter、AlltoAll、Gather、Scatter 八种集合原语外加点对点 send/recv。它对硬件拓扑有感知——\"It supports a variety of interconnect technologies including PCIe, NVLINK, InfiniBand Verbs, and IP sockets\"——会按机型自动选算法与路径，开发者不必手调。PyTorch 官方文档对分布式后端的选择建议原文：\"Use the NCCL backend for distributed training with CUDA GPU\"、\"Use NCCL, since it currently provides the best distributed GPU training performance\"、\"Use NCCL, since it's the only backend that currently supports InfiniBand and GPUDirect\"——vLLM 的 torch.distributed 初始化（init_worker_distributed_environment）选的就是它。与本章直接相关的两条官方性质：① 集合通信天然要求全体参与者同步——概述原文 \"Tight synchronization between communicating processors is a key aspect of collective communication\"；② 通信发起顺序必须各 rank 一致——communicators 文档原文 \"to remain deadlock free, users must ensure the order of host-side launches matches for all devices\"。这两条合起来，正是「全部 worker 必须先拉起、再 wait_for_ready」（multiproc 注释：init_device 里有集合通信与设备同步）的外部依据。",
+      "background": "模型规模超出单卡显存后，张量并行/流水线并行都要靠「把多张卡上的部分结果汇总或广播」撑起来。早期用面向 CPU 集群的 MPI 集合通信库跑 GPU，对 GPU 间互联拓扑（谁和谁有 NVLink、谁得走 PCIe/IB）没有感知，效率不高；NVIDIA 推出 NCCL 专做 GPU 拓扑感知的通信，此后成为 PyTorch、DeepSpeed 等几乎所有主流框架的默认 GPU 通信后端。本条目从 v2 映射章（artifacts/ch17）复用，官方文档本轮重核（2026-08-22）并做了一处修正：v2 条目曾把「所有 rank 须同时参与握手以建立拓扑避免死锁」归到 overview 页，本轮核该页无此句——已换成上面两条可逐字核的引文（概述的 tight synchronization + communicators 的保序要求），断言更强而不是更弱。",
+      "example": null,
+      "links": [
+        "https://github.com/NVIDIA/nccl",
+        "https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/overview.html",
+        "https://docs.pytorch.org/docs/2.13/distributed.html"
+      ],
+      "sources": [
+        {"url": "https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/overview.html", "note": "NCCL 官方概述（WebFetch 核实 2026-08-22）：全称与读音原话、八种集合原语清单、互联技术清单（PCIe/NVLINK/InfiniBand Verbs/IP sockets）、\"not a full-blown parallel programming framework\"、\"Tight synchronization between communicating processors is a key aspect of collective communication\"。v2 研究曾于 2026-07-24 核过同页，本轮重核并补齐引文。"},
+        {"url": "https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/communicators.html", "note": "NCCL 通信器文档（WebFetch 核实 2026-08-22）：\"to remain deadlock free, users must ensure the order of host-side launches matches for all devices\"（多 communicator 场景的保序要求）——集合通信的参与/顺序约束的官方原文。"},
+        {"url": "https://docs.pytorch.org/docs/2.13/distributed.html", "note": "PyTorch 2.13 分布式文档（WebFetch 核实 2026-08-22）：\"Use the NCCL backend for distributed training with CUDA GPU\"、\"best distributed GPU training performance\"、\"the only backend that currently supports InfiniBand and GPUDirect\"、\"torch.distributed supports four built-in backends\"——NCCL 在 PyTorch 生态地位的一手出处（v2 条目此句未带出处，本轮补齐）。"},
+        {"url": "https://github.com/NVIDIA/nccl", "note": "官方仓库：Optimized primitives for collective multi-GPU communication（v2 已核 2026-07-24，定位句稳定，沿用）。"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文 m7 讲「分布式初始化刻意先于显存快照（NCCL buffer 计入已用）」时给一句括注即可：「NCCL 是 NVIDIA 的 GPU 间集合通信库（all-reduce 等），PyTorch 分布式后端的底层就是它」；「为什么必须全部拉起再等 READY」的死锁论证用 tight synchronization 那一句点过——机制细节（ring/tree 拓扑）留给链接，绝不展开成 NCCL 教程。"
+    },
+    {
+      "id": "cloudpickle-serialization",
+      "term": "cloudpickle",
+      "kind": "external_project",
+      "one_line": "比标准库 pickle 更能装的序列化库——lambda、闭包、REPL 里临时定义的类都能按值打包带走，是「把一段代码发到别的进程去执行」的关键工具。",
+      "what_it_is": "标准库 pickle 序列化函数/类时是「按引用」——只记「这个东西在哪个模块、叫什么名字」，反序列化时按路径重新 import。README 的对照原话：\"cloudpickle can serialize a function or class by value, whereas pickle can only serialize it by reference\"（cloudpickle 按值序列化，pickle 只能按引用）。按引用对 lambda、嵌套函数、Notebook/REPL 里临时定义的类完全无效——它们没有可 import 回来的模块路径，pickle.dumps 直接抛 PicklingError。cloudpickle 改为按值：把函数的字节码和闭包变量整个打包，任何进程 loads 回来就能调。README 自述典型场景 \"especially useful for cluster computing where Python code is shipped over the network to execute on remote hosts\"（把 Python 代码经网络发到远程主机执行）——Ray、PySpark、Dask 都用它发任务闭包。两条边界（README 原话）：\"Cloudpickle can only be used to send objects between the exact same version of Python\"；\"Using cloudpickle for long-term object storage is not supported and strongly discouraged\"。vLLM 的 collective_rpc 在 method 是 callable 时干的正是它的本行：`cloudpickle.dumps(method)` 把整个函数序列化发进广播队列，worker 侧 `cloudpickle.loads(method)` 复原后以 worker 对象为 self 执行（本仓 pin v0.27.1：vllm/v1/executor/multiproc_executor.py worker_busy_loop 的 bytes 分支与 vllm/v1/serial_utils.py run_method L486-L514 同构三分支，本地核实）——用户可以在引擎侧临时写一个函数（哪怕闭包）下发到每个 worker 上跑，而不必是 worker 类上已定义好的方法。",
+      "background": "cloudpickle 最初由 Cloudpipe/PiCloud 项目为「把 Python 代码通过网络发到远程主机执行」这类集群计算场景开发，后被 Ray、PySpark、Dask 等分布式计算框架广泛复用，成为跨进程/跨机器发送任务闭包的事实标准序列化器。worker_extension_cls（m19，OOT/RL 插件扩展点）扩展出的方法面之所以能被 collective_rpc 调到，靠的也是这层「名字字符串 + 必要时整函数打包」的通道（与 rlhf-weight-sync 条目互指）。",
+      "example": "标准库失败、cloudpickle 能过的最小对照（可直接跑）：\n```python\nimport pickle, cloudpickle\nf = lambda x: x + 1\npickle.dumps(f)       # 抛 PicklingError：Can't pickle local object（lambda 没有模块路径可按引用引用）\ncloudpickle.dumps(f)  # 成功：按值打包字节码，任何进程 loads 回来即可调用\n```\n逐行看：pickle 找不到 f 的「可 import 身份」直接拒绝；cloudpickle 不问身份、连人带行李整个装箱——这就是 collective_rpc 的 method 参数能收「任意可序列化 callable」的底层原因。",
+      "links": [
+        "https://github.com/cloudpipe/cloudpickle",
+        "https://pypi.org/project/cloudpickle/"
+      ],
+      "sources": [
+        {"url": "https://github.com/cloudpipe/cloudpickle", "note": "官方 README（WebFetch 重核 2026-08-22）：\"makes it possible to serialize Python constructs not supported by the default pickle module\"；按值 vs 按引用原话；cluster computing 场景原话；同 Python 版本限制与不建议长期存储原话。v2 研究曾于 2026-07-24 核过，本轮重核一致。"},
+        {"url": "vllm/v1/serial_utils.py:L486-L514 · vllm/v1/executor/multiproc_executor.py:L1004-L1010（本仓 pin v0.27.1 源码，本地核实 2026-08-22）", "note": "pin 一手锚点：run_method 与 worker_busy_loop 的 str→getattr / bytes→cloudpickle.loads 后 partial(fn, obj) / callable→直接调 三分支同构——cloudpickle 用武之地在 bytes 分支。"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文 m11/m13 讲「method 是 callable 时整函数序列化发过去」时给「pickle 差一个字」的对比例半段（上面的两行例子）即可，帮读者一句话建立「为什么不用标准 pickle」的直觉；cloudpickle 内部实现（字节码怎么打包）不展开，链接留给读者。"
+    },
+    {
+      "id": "executor-backend-family",
+      "term": "vLLM 执行器后端族：uni / mp / ray / external_launcher / 自定义",
+      "kind": "competing_set",
+      "one_line": "同一份 collective_rpc 接口下，五种「怎么把 worker 拉起来、怎么编排进程」的选择——差异全被 Executor.get_class() 工厂收敛，对上层引擎表现成同一个接口；本章深入 uni 和 mp 两条。",
+      "what_it_is": "distributed_executor_backend 是 vLLM 选进程编排策略的配置项。五种形态对上层都表现成同一个 collective_rpc 接口（这就是「三层解耦」里 Executor 只答『在哪跑』的含义）。据 vLLM 官方文档（2026-08-22 核）：\"The default distributed runtimes are Ray for multi-node inference and native Python multiprocessing for single-node inference\"——多机默认 Ray、单机默认 Python multiprocessing（mp）；文档页只文档化 mp/ray 两个取值，uni 与 external_launcher 是源码级选项（get_class 分支里都真实存在，本仓 pin abstract.py:L48-L92 核实）。",
+      "alternatives": [
+        {
+          "name": "uni（UniProcExecutor）",
+          "distinctive_feature": "单进程：driver_worker（WorkerWrapperBase）就在引擎进程里，collective_rpc 退化为 run_method 同进程直调，没有子进程、没有共享内存队列。",
+          "when_to_choose": "单卡推理（tp×pp=1）与本地调试——本章的「控制面最简对照」形态，读懂 uni 再读 mp 的成本最低。"
+        },
+        {
+          "name": "mp（MultiprocExecutor）",
+          "distinctive_feature": "本章主角：1 个执行器进程 spawn/fork 出 N 个 WorkerProc 子进程，rpc_broadcast_mq（SHM 广播队列）一次 enqueue 全 worker 可见，应答各走一条 response MQ。",
+          "when_to_choose": "单机多卡——据官方文档这是单机默认（多机才换 ray）。"
+        },
+        {
+          "name": "ray",
+          "distinctive_feature": "据本仓 pin v0.27.1（本地核实）：选 ray 默认得到 RayExecutorV2——envs 运行时默认开（VLLM_USE_RAY_V2_EXECUTOR_BACKEND 默认 '1'，注释原文 \"use RayExecutorV2 (MQ-based) instead of RayDistributedExecutor (compiled-graph backend)\"），官方 API 文档自述 \"Ray-based distributed executor using MessageQueue communication\"、\"Inherits from MultiprocExecutor to reuse the MQ-based control plane and NCCL data plane\"、\"Workers are Ray actors\"——Ray 只管 actor 生命周期与放置（PlacementGroupSchedulingStrategy），控制面整个复用 mp 的 MessageQueue、数据面照旧 NCCL。v2 研究引的 RFC #35848（让 Ray 只做进程拉起+放置、控制面与 mp 一致）正是这个愿景，如今已在 pin 里兑现；旧 RayDistributedExecutor（compiled-graph）成为 env 置 0 的退路（其已过时的说法见 Ray issue #62505 转述，二级源）。",
+          "when_to_choose": "跨多机部署、或要 Ray 生态的弹性调度/容错时；因为 V2 复用 mp 的控制面，讲透 mp（本章）就讲透了 ray 的核——ray 全貌归 ch34。"
+        },
+        {
+          "name": "external_launcher（ExecutorWithExternalLauncher）",
+          "distinctive_feature": "假定外部进程管理器（典型 torchrun）已设好 RANK/WORLD_SIZE/MASTER_ADDR 等环境变量，vLLM 每个进程只起「自己那一个」worker，无中央执行器广播。",
+          "when_to_choose": "RLHF 等需要 vLLM 推理进程与训练进程共存于同一套 torchrun 编排的场景——PR #12071 的动机原文即 RLHF 社区要求 co-locate（与 rlhf-weight-sync 条目呼应）。"
+        },
+        {
+          "name": "自定义（type 或 qualname 字符串）",
+          "distinctive_feature": "get_class 的 isinstance(..., type) 分支收 Executor 子类、str 分支收任意可 import 的 qualname——第三方/用户自己的执行器从这里接入。",
+          "when_to_choose": "需要完全自定义进程编排时（如特定集群调度器集成）——本章点到分发存在即可。"
+        }
+      ],
+      "links": [
+        "https://docs.vllm.ai/en/stable/serving/parallelism_scaling/",
+        "https://docs.vllm.ai/en/latest/api/vllm/v1/executor/ray_executor_v2/",
+        "https://github.com/vllm-project/vllm/pull/12071",
+        "https://github.com/vllm-project/vllm/issues/35848"
+      ],
+      "sources": [
+        {"url": "https://docs.vllm.ai/en/stable/serving/parallelism_scaling/", "note": "vLLM 官方并行文档（WebFetch 重核 2026-08-22）：\"The default distributed runtimes are Ray for multi-node inference and native Python multiprocessing for single-node inference\"；可用 distributed_executor_backend 覆盖，\"Use mp for multiprocessing or ray for Ray\"；本页只文档化 mp/ray 两值。v2 研究曾于 2026-07-24 核过同页，默认口径未变。"},
+        {"url": "https://docs.vllm.ai/en/latest/api/vllm/v1/executor/ray_executor_v2/", "note": "vLLM 官方 API 文档（WebFetch 核实 2026-08-22）：类摘要 \"Ray-based distributed executor using MessageQueue communication\"；\"Inherits from MultiprocExecutor to reuse the MQ-based control plane and NCCL data plane\"；\"Workers are Ray actors\"；初始化经 initialize_ray_cluster+placement group 放置——ray V2 复用 mp 控制面的一手自述。"},
+        {"url": "vllm/envs.py:L906-L910 · vllm/v1/executor/ray_executor_v2.py:L24-L28 · vllm/v1/executor/abstract.py:L48-L92（本仓 pin v0.27.1 源码，本地核实 2026-08-22）", "note": "pin 一手证据：envs 运行时默认 '1'（顶部 TYPE_CHECKING 块里的 False 只是类型注解）；RayExecutorV2 直接 import MultiprocExecutor 的 WorkerProc/FutureWrapper/MessageQueue；get_class 五路分发（type/ray(两代)/mp/uni/external_launcher/qualname）真实存在。"},
+        {"url": "https://github.com/vllm-project/vllm/issues/35848", "note": "RFC: Revamp Ray Distributed Executor Backend（v2 已核 2026-07-24，沿用）：提议让 Ray 只做进程启动+放置、控制面与 mp 一致——pin 的 RayExecutorV2 即其兑现。"},
+        {"url": "https://github.com/vllm-project/vllm/pull/12071", "note": "external_launcher 引入 PR（v2 已核 2026-07-24，沿用）：动机 RLHF co-locate、靠 torchrun 环境变量、要求各 rank 调度确定一致。"},
+        {"url": "https://github.com/ray-project/ray/issues/62505", "note": "Ray 仓库 issue（检索摘要 2026-08-22，二级源）：述 revamped Ray executor 不再用 Ray compiled graph、旧 compiled-graph 执行器 deprecated——vLLM 侧公告未直接核，置信度见 writer_note。"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文 get_class 分发处一句话点齐五个名字即可；最值得给的一句脚注是「v0.27.1 起 ray 后端默认已是 RayExecutorV2，官方自述『继承 MultiprocExecutor 复用 MQ 控制面与 NCCL 数据面』」——它把本章边界声明（ray 全貌归 ch34、讲透 mp 即讲透 ray 的核）从姿态变成事实；旧 compiled-graph 后端的 deprecated 说法只有二级源，正文别写成定论（说「成为退路」即可）。external_launcher 一句带过并与 RLHF 条目呼应。"
+    },
+    {
+      "id": "process-sentinel-liveness",
+      "term": "multiprocessing.Process.sentinel + multiprocessing.connection.wait",
+      "kind": "external_concept",
+      "one_line": "Python 标准库检测「一批子进程里谁意外死了」的推荐手法——每个进程对象自带一个 OS 级哨兵句柄，进程一退出就变可读，可以像等 socket 一样同时等一堆。",
+      "what_it_is": "multiprocessing.Process 实例有 .sentinel 属性，官方文档原文：\"A numeric handle of a system object which will become 'ready' when the process ends\"——进程活着时不可读，一退出（正常 return、异常、被 kill）就变可读。平台差异文档也写明：\"On Windows, this is an OS handle usable with the WaitForSingleObject and WaitForMultipleObjects family of API calls. On POSIX, this is a file descriptor usable with primitives from the select module.\"（Windows 上是 OS 句柄、POSIX 上是可供 select 族使用的文件描述符）。官方推荐的用法原文：\"You can use this value if you want to wait on several events at once using multiprocessing.connection.wait(). Otherwise calling join() is simpler.\"——join 一次只能等一个，要「N 个子进程谁先退出就先返回」就把各自的 sentinel 喂给 multiprocessing.connection.wait(object_list)：它同时等一批句柄（含 Pipe/Connection），任何一个变可读立刻返回。本质是把「进程退出」降维成一个可等待的 I/O 事件，接入与管道/socket 同一套多路复用原语。multiproc_executor 的 start_worker_monitor 正是这条推荐路径：sentinels = [h.proc.sentinel for h in workers] → multiprocessing.connection.wait(sentinels) 阻塞等待，任一 worker 死亡（OOM kill/segfault 这类 except 根本接不住的死法）立刻醒来进入 shutdown+failure_callback。",
+      "background": "检测单个子进程死活最直接的是 Process.join(timeout) 轮询，但一次只能盯一个；标准库没有「join 一批、谁先退就报谁」的现成 API，官方文档给出的替代方案就是 sentinel + connection.wait。vLLM 用它守全部 worker 的存活（m17 失败两路里的「进程级死亡」路），与「方法级异常走 MQ 回报」互补——两路并存才能既报『方法抛异常』又报『进程没了』。本条目从 v2 映射章复用，Python 文档本轮重核（2026-08-22）引文逐字有效；connection.wait 函数详情段（Listeners and Clients 节）本轮抓取被截断，v2 已核（2026-07-24）语义不变，沿用。",
+      "example": "最小可核例子（说明性）：\n```python\nimport multiprocessing as mp\n\np1 = mp.Process(target=worker_fn); p1.start()\np2 = mp.Process(target=worker_fn); p2.start()\n\ndied = mp.connection.wait([p1.sentinel, p2.sentinel])  # 阻塞，直到任一进程退出\n# died 是「变得可读」的 sentinel 列表；逐个比对 p.sentinel == died[0] 反查是谁死了\n```\n逐行看：两个子进程运行期间 sentinel 均不可读，wait 阻塞不烧 CPU；任一进程退出（含被 kill -9）其 sentinel 变可读，wait 立刻返回非空列表——不需要 join(timeout) 式轮询；反查身份用「拿返回的 sentinel 与每个进程的 sentinel 比对」，与 vLLM 监控线程里 `next(h.proc for h in workers if h.proc.sentinel == died[0])` 同一招。",
+      "links": [
+        "https://docs.python.org/3/library/multiprocessing.html#multiprocessing.Process.sentinel",
+        "https://docs.python.org/3/library/multiprocessing.html#multiprocessing.connection.wait"
+      ],
+      "sources": [
+        {"url": "https://docs.python.org/3/library/multiprocessing.html", "note": "Python 官方 multiprocessing 文档（WebFetch 重核 2026-08-22）：sentinel 四句原文（numeric handle/become ready/Windows WaitForSingleObject/POSIX select fd/wait on several events at once using connection.wait/否则 join 更简单）。v2 研究曾于 2026-07-24 核过同页。"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文 m17 讲 start_worker_monitor 时一句「这是 stdlib 自带的推荐检测手法，不是 vLLM 自创的黑科技」+上面四行例子的骨架即可；select/poll 原理不展开，Windows 句柄/POSIX fd 的平台差异对本仓 Windows 读者可作半句彩蛋，链接留给想读官方文档的读者。"
+    },
+    {
+      "id": "rlhf-weight-sync",
+      "term": "RLHF 训练侧权重同步（collective_rpc「下发任意 callable」能力的现实驱动力）",
+      "kind": "external_concept",
+      "one_line": "人类反馈强化学习（RLHF）训练循环里，训练进程要把刚更新的模型权重实时推进正在服役的 vLLM worker——collective_rpc 能收「任意可序列化 callable」这项能力，正是被这个现实需求逼出来的。",
+      "what_it_is": "RLHF（Reinforcement Learning from Human Feedback）是大模型对齐训练范式：一边用当前策略模型生成大量候选回答（rollout，追吞吐，常年是训练里最慢的部分），一边用训练循环按奖励信号更新策略参数，反复交替。据 vLLM 官方博客（2025-04-23，引 OpenRLHF 实测）：生成长思维链输出可能占到 RLHF 总训练时间的 90%——所以业界普遍把 vLLM 这类高吞吐推理引擎接进训练循环专门做 rollout，而不是用训练框架自带的低效生成路径。每轮训练权重一变，worker 手里的模型就「过时」了，必须同步：vLLM 侧的接口正是本章的 collective_rpc——method 参数允许传任意可序列化 callable（配合 worker_extension_cls 动态注入扩展方法面，m19），训练框架把「接收权重分片、原地覆盖」这个函数序列化后广播给所有 worker 执行；权重本体常经 NCCL 或 CUDA IPC 从训练进程直传 worker 显存，绕开磁盘/网络序列化。开源框架 OpenRLHF（自称首个基于 Ray + vLLM + DeepSpeed ZeRO-3 的开源 RLHF 框架）是这套模式的代表实践。",
+      "background": "这条需求与 external_launcher 后端同源（PR #12071 动机原文就是 RLHF 社区要求把 vLLM 进程与训练进程 co-locate）：训练框架用 torchrun 编排全家桶，vLLM 以 external_launcher 形态长在同一编排里，权重同步则靠 collective_rpc 的 callable 通道。本条目从 v2 映射章复用（v2 研究已于 2026-07-24 核实全部引文）；本轮未重抓（博客与时点性 PR 内容稳定），沿用旧核。",
+      "example": null,
+      "links": [
+        "https://vllm.ai/blog/2025-04-23-openrlhf-vllm",
+        "https://github.com/OpenRLHF/OpenRLHF",
+        "https://github.com/vllm-project/vllm/pull/12071"
+      ],
+      "sources": [
+        {"url": "https://vllm.ai/blog/2025-04-23-openrlhf-vllm", "note": "vLLM 官方博客（v2 已核 2026-07-24，沿用）：生成可占 RLHF 训练总时 90%、权重同步走 NCCL/CUDA IPC、依赖自定义 WorkerExtension 类、OpenRLHF 定位（首个 Ray+vLLM+ZeRO-3 开源 RLHF 框架、被 Google/字节采用）。"},
+        {"url": "https://github.com/vllm-project/vllm/pull/12071", "note": "external_launcher 引入 PR（v2 已核 2026-07-24，沿用）：动机「RLHF 社区要求 co-locate」。"}
+      ],
+      "confidence": "medium",
+      "writer_note": "v3 本章的接点是 m19（worker_extension_cls 动态注入扩展 collective_rpc 面）与 m11 的 callable 序列化——正文一句钩子即可：「为什么 collective_rpc 要支持下发任意 callable？现实驱动力是 RLHF 训练循环的权重热同步（OpenRLHF 等）」；vLLM 自家 sleep/weight_transfer 的三段式接口在本章被减法删除，不要展开，OpenRLHF 细节留链接。confidence 沿 v2 的 medium（博客与 PR 均一手，但 OpenRLHF 生态现状未复核）。"
+    },
+    {
+      "id": "prefill-context-parallel",
+      "term": "Prefill Context Parallel（PCP）：output_rank 公式里那个 pcp_size",
+      "kind": "external_concept",
+      "one_line": "vLLM 在 TP/PP/DP 之外新增的并行维度——把长 prompt 的 prefill 计算按序列长度切分到多张卡，专攻长上下文的首 token 延迟（TTFT）；本章它只在「最后 PP 段 TP rank0」的公式里出现。",
+      "what_it_is": "PCP 把 prefill 阶段的输入序列沿「长度」维切到 pcp_size 张卡并行计算。官方文档的描述（2026-08-22 核）：长请求 T 个 token、N 张 GPU 时 \"we can split the request into N chunks, and each GPU computes one chunk of the query/key/value tensors\"，目标 \"control the TTFT (time to first token) by amortizing the computation time of the prefill across query tokens\"；两种策略（partial query full K/V 的 all-gather 版 vs partial query partial K/V 的 ring-attention 版）页面自注 \"Both approaches are under active development\"。它扩 world size：本章 _get_output_rank 公式 world_size − tp_size×pcp_size 里的 pcp 因子正因此存在（PCP 组占的 rank 要从「最后一个 PP 段」的推算里扣掉），pin 的 multiproc_executor.py:L522 本地核实。落地状态（本轮现核，较 v2 条目重大改锚）：RFC #25749（2025-09-26）→ PR #28718 \"[Feature] Prefill Context Parallel (PCP) basic support\"（2025-11-19 合并，作者 pisceskkk，自更大的 #26864 拆出，PR 自述 \"PCP enhances long-sequence inference capabilities by partitioning the sequence dimension during the prefill stage\"）→ 本仓 pin v0.27.1 已有 config 字段 prefill_context_parallel_size（config/parallel.py:126，默认 1，本地核实）与 vllm/v1/worker/gpu/pcp_manager.py——从 RFC 变成了真实存在但仍在活跃开发的基础支持。",
+      "background": "在此之前 vLLM 已实现 Decode Context Parallel（DCP，PR #23734）——只把 decode 阶段的 KV cache 按序列维切开分摊；PCP 把同样思路搬到 prefill 阶段（RFC 原案：序列 pad 到 2×pcp_size 后均分、首尾配对分配以均衡计算量；prefill 后 all-gather 拼回完整 KV，decode 复用 DCP）。这一类「把序列长度当第 N 个可切分的轴、与 TP/PP 正交」的方法在 ML 系统文献里属 context/sequence parallelism 家族（Ring Attention、DeepSpeed Ulysses 是知名思路），PCP 是 vLLM 的自家实现。官方文档现设 \"Context Parallel Deployment\" 页统一讲 PCP+DCP（据 vllm-ascend 文档与 AMD ATOM 指南，生态侧也已跟进）。",
+      "example": null,
+      "links": [
+        "https://docs.vllm.ai/en/latest/serving/context_parallel_deployment/",
+        "https://github.com/vllm-project/vllm/issues/25749",
+        "https://github.com/vllm-project/vllm/pull/28718"
+      ],
+      "sources": [
+        {"url": "https://docs.vllm.ai/en/latest/serving/context_parallel_deployment/", "note": "vLLM 官方 Context Parallel 文档（WebFetch 核实 2026-08-22）：split N chunks/每卡算一份 QKV、TTFT 目标句、两种策略、「Both approaches are under active development」自注；注意本页显式文档化的 CLI 旗标只有 -dcp（decode），PCP 侧以 config 字段存在（pin 核实）。"},
+        {"url": "https://github.com/vllm-project/vllm/pull/28718", "note": "PCP 合并 PR（WebFetch 核实 2026-08-22）：标题 \"[Feature] Prefill Context Parallel (PCP) basic support\"、2025-11-19 合并、作者 pisceskkk、自 #26864 拆出、细节依 RFC #25749、新增 pcp_group 通信组与 PCP 命令行参数。"},
+        {"url": "vllm/config/parallel.py:126 · vllm/v1/executor/multiproc_executor.py:L522 · vllm/v1/worker/gpu/pcp_manager.py（本仓 pin v0.27.1 源码，本地核实 2026-08-22）", "note": "pin 一手锚点：prefill_context_parallel_size 默认 1 的 config 字段、_get_output_rank 公式的 pcp 因子、pcp_manager 模块存在。"},
+        {"url": "https://github.com/vllm-project/vllm/issues/25749", "note": "RFC（v2 已核 2026-07-24，沿用）：通信域独立于 TP、pad 到 2×pcp_size 首尾配对、prefill 后 all-gather、decode 复用 DCP——算法细节的原始出处。"}
+      ],
+      "confidence": "high",
+      "writer_note": "本章 PCP 只在 _get_output_rank 公式（m14）出现——一句脚注足够：「pcp_size 是 vLLM 第四个并行维度（序列维切分，2025-11 合并的基础支持），它扩 world size 所以公式里要扣掉」；公式讲解直接用源码注释自带的 TP=8/PP=4 算例（现成教具），PCP 算法（pad/首尾配对/all-gather）与 DCP 谱系全部留给 ch34，绝不展开。"
+    }
+  ]
+}

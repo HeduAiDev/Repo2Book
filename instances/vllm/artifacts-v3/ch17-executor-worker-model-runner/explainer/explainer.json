@@ -1,0 +1,291 @@
+{
+ "chapter_id": "ch17",
+ "chapter_title": "执行三层（Part V · GPU 不等 Python · 开篇）",
+ "pin": "vLLM v0.27.1 (6e448d0ea)",
+ "trace_environment": "本章有精简版 companion（implementation/ 包布局镜像源码树——executor/{abstract,uniproc_executor,multiproc_executor}.py、worker/{worker_base,gpu_worker,gpu_model_runner}.py、serial_utils.py、platforms/cuda.py、structured_output/utils.py + _host_seams.py/_shm_broadcast_seam.py，只做减法、# SOURCE 逐行锚 v0.27.1，84 项 host 测试绿，见 impl-notes.md）。三个驱动脚本全部 host python 实跑、trace_source=run，脚本与原始输出在 explainer/traces/（run_m4_bringup.py / run_m12_futurewrapper_fifo.py / run_m15_two_phase.py）。与 pin 真实环境的结构性差异（均就近标注）：① mp e2e 跑在 win32 spawn 上（真实 unix 按 VLLM_WORKER_MULTIPROC_METHOD 默认 fork/spawn；观测契约一致——WorkerProc 在独立进程经真实 make_worker_process/worker_main/READY 握手出生）；m4 拉起实测 1823.8ms 大半是 spawn 解释器冷启动，fork 部署会快得多——此数只当量级感，不当性能结论。② 广播/应答 MQ 是 ZMQ loopback tcp 的 seam（真实为 SHM 环形缓冲 + ipc://；控制面载荷微小、一次 enqueue 全读者 FIFO 收到/超时/集体握手契约一致，见 impl-notes Seam 清单）——m15 Part C 每拍两跳的毫秒数是该 seam 上的实测，只取『每拍两次广播收割』的结构结论与量级感，不能当真实部署延迟数。③ e2e 的 worker 侧是 tests/_worker_double.py 替身（经真 qualname 机制解析、真 spawn/真广播 MQ/真 busy loop 驱动）——真 GPU Worker 需要 CUDA 设备，host 无 vLLM 包无 CUDA（vLLM 相关运行须进容器，本组 trace 全部为控制面行为、不触及 CUDA）。④ m15 的前向深水是删除项 6（ch18/19 域）：companion 把打包局部变量绑 None，驱动经 ExecuteModelState._replace 注入脚本 logits 行（与 tests m15 同款惯例）；断言/10 字段打包/return None/解包即清/apply_grammar_bitmask 施加/_sample 调用位全部 companion 真码。⑤ m12 Part B 的『背靠背两 RPC 在飞』不是杜撰形态——是真实 step_with_batch_queue（vllm/v1/engine/core.py:L661-L672，v0.27.1 异步调度默认心跳）的连发形状，且在飞上界由 max_concurrent_batches=2 钉死（vllm/config/vllm.py:L539-L548）。⑥ 取证环境：Windows CPU host、真 torch/pyzmq/cloudpickle——无 GPU 特定行为被测量；本 explainer 新引用锚点均为 dossier 账本项或 impl 逐字段核过。",
+ "figure_policy": "dossier needs_figure=true 三机制 m1/m4/m12 各配 1 张 figure_spec，均为 FIGURE-SYSTEM §3.3 允许的正文机制图——每张 spec 的 l0_zoom 字段显式回答「它是 L0 哪一块的放大」（本章 pedagogy l0_zoom=GPU 执行臂上层，l2-specs/ch17.json 的 l0_region= gpu_column）：m1=放大 L0 执行臂三层行的『问题域切分』（三问正交），m4=放大 Executor 块的拉起时序（星形装配），m12=放大 Executor 收割半边（L2 south『output_rank 收割 + FutureWrapper』组件站 13）的配对算法。L2 章图（cartography/l2-specs/ch17.json，gen_L2 已渲染 L2-ch17.png/svg）画三层结构与 13 站号；这三张分别画职责切分/装配时序/队列配对，非新架构画法，架构归属一律回指 L0/L2。开篇图=本章 L2 章图（Map 站职责），不归本 explainer。其余 17 机制不提新图（needs_figure 均 false）：m2 工厂分发/m5 延迟初始化/m10 控制面契约/m11 广播收割/m13 busy loop 派发/m14 output_rank/m17 失败两路/m18 关停/m19 扩展注入/m20 异步声明面——由 L2 站号轨道 + 正文内嵌 dossier embed_excerpts 的真源码承担；m15 两段式由 L2 center ⑤⑥ 拍片 + 回指 ch9 已画的五拍时间轴/bitmask 窗口两图承担（②④ 两拍的时序与掩码数学 ch9 已立图，本章只补 runner 侧状态机与 mp 两跳实测账）；m16 PP 懒同步/m7 init_device/m8 三锚点/m9 warmup 编排均有正文内嵌代码锚，不另立图。",
+ "mechanisms": [
+  {
+   "mechanism_id": "m1",
+   "intuition": "三层像医院的分诊台、专科诊室、手术室：分诊台只答『去哪栋楼』（Executor 只答在哪跑——单机单卡/单机多卡/多机 ray/自定义）；专科诊室对这台设备的一生负责（Worker 只答设备归谁管——选卡、分布式、显存三锚点、加载）；手术室只管眼前这台手术怎么做（ModelRunner 只答这一拍怎么算——它只认 (scheduler_output, intermediate_tensors) 签名，不知道自己跑在第几个进程）。换一家医院（ray 编排）不必换手术室，进一台新设备（ROCm/XPU）不必动分诊台——两个独立变化的方向各改各的。",
+   "quantified": "两个变化轴的枚举账：进程编排轴=Executor.get_class 一条 elif 链 6 条分发路径（type 子类 / ray / mp / uni / external_launcher / 自定义 qualname，abstract.py:L48-L92）；硬件适配轴=worker_cls 一个字符串经平台插件解析（'auto'→'vllm.v1.worker.gpu_worker.Worker'，platforms/cuda.py:L308-L313——适配的分发点不在执行器而在平台）。正交的实测证据（traces/m4_bringup.json）：1 次 enqueue 广播→world_size=2 个 worker 全收到（broadcast_probe：rpc_calls=1、reply_count=2、ranks [0,1]）——编排与 worker 面互不见面。代价=一次 execute_model 穿 5 层间接（execute_model 薄封装→collective_rpc→wrapper __getattr__→Worker→runner，dossier theory[0]），调试栈里多一层字符串解析。",
+   "figure_specs": [
+    {
+     "figure_id": "ch17-fig-three-layers-three-questions",
+     "template": "layout",
+     "l0_zoom": "放大 L0 EngineCore 进程框（engine_band 下段）里的执行臂行『Executor(进程拓扑) → Worker(设备生命周期) → GPUModelRunner(批次执行)』（gpu_column 上段）——即 L2 章图 center『three_layers』框的职责维度展开。L2 画三层的组件与站号，本图画三层的『问题域切分』：每层只答一问、两个变化轴在哪里交叉。非新架构画法，架构归属回指 L0/L2。",
+     "claim": "三层各答一问且两轴正交：Executor 只答『在哪跑』（get_class 6 路分发）、Worker 只答『设备归谁管』（worker_cls 字符串经平台插件解析、三锚点持有一生）、ModelRunner 只答『这一拍怎么算』（对前两问无感）——加一种硬件=改一个字符串、换一种编排=换一个 executor 类，互不牵连；代价是一次 execute_model 穿 5 层间接。",
+     "numbers": [
+      {
+       "value": "get_class 分发 6 条路径：type 子类 / ray / mp / uni / external_launcher / 自定义 qualname（未知值 ValueError）",
+       "provenance": "vllm/v1/executor/abstract.py:L48-L92（dossier embed_excerpts[1]）"
+      },
+      {
+       "value": "worker_cls='auto' → 'vllm.v1.worker.gpu_worker.Worker'（平台插件给出，不在执行器）",
+       "provenance": "vllm/platforms/cuda.py:L308-L313（dossier embed_excerpts[20]）"
+      },
+      {
+       "value": "一次 enqueue 广播 → world_size=2 个 worker 全收到（rpc_calls=1、reply_count=2、ranks [0,1]）",
+       "provenance": "traces/m4_bringup.json broadcast_probe"
+      },
+      {
+       "value": "一次 execute_model 穿 5 层间接：薄封装 → collective_rpc → wrapper __getattr__ → Worker → runner",
+       "provenance": "dossier theory[0]；锚点链 abstract.py:L221-L227 / multiproc_executor.py:L354-L416 / worker_base.py:L333-L334 / gpu_worker.py:L1019 / gpu_model_runner.py:L4166"
+      },
+      {
+       "value": "同一契约两种拓扑：uni run_method 同进程直调（三分支与 mp busy_loop 同构）vs mp SHM 广播一跳",
+       "provenance": "vllm/v1/serial_utils.py:L486-L514 与 multiproc_executor.py:L997-L1022（dossier embed_excerpts[21]、theory[7]）"
+      },
+      {
+       "value": "WorkerBase 自述使命原文：'allows vLLM to cleanly separate implementations for different hardware'",
+       "provenance": "vllm/v1/worker/worker_base.py:L40-L43（dossier why_chains WC1 pain）"
+      }
+     ],
+     "caption_draft": "为什么拆三层而不是一层（worker_base.py:L40-L43 自述使命）：进程编排轴（单机单卡/单机多卡 mp/多机 ray/自定义）× 硬件适配轴（CUDA/ROCm/CPU/XPU/TPU+OOT）本是两个独立变化的方向，v0 把它们焊在同一坨代码里——每加一种硬件都要碰进程管理，换 ray 后端又不能复用设备初始化（v1 起源 PR #9289 才拆出 gpu_worker.py，mp 后端 #9856 同批落地 Executor 抽象）。拆开后 Executor 只答『在哪跑』、Worker 只答『设备归谁管』、ModelRunner 只答『这一拍怎么算』：加硬件=改 worker_cls 一个字符串（'auto' 经平台插件解析），换编排=换 executor 类——实测 1 次广播 2 个 worker 全收到，worker 面零感知。代价：一次 execute_model 穿 5 层间接 + __getattr__ 字符串透传的调试税。",
+     "illustrator_notes": "三横带布局（与 L2 center 拍片行同序、配色走 l0_common：C_ENG_S 橙系进程框/C_GPU_S 绿系执行）：上带 Executor（答『在哪跑』——带内左列 6 个分发小标签 type/ray/mp/uni/ext/qualname 汇入一个工厂框 get_class）；中带 WorkerWrapperBase+Worker（答『设备归谁管』——左缘标 worker_cls 字符串经 current_platform 解析的箭头、带内三个锚点小框 load_model/profile/initialize）；下带 GPUModelRunner（答『这一拍怎么算』——带内只写方法签名 execute_model(scheduler_output, intermediate_tensors)，下缘注『不知道自己跑在第几个进程』）。右侧两条正交轴竖箭头：进程编排轴（贯穿上带、标『换 executor 类』）与硬件适配轴（只落在中带入口、标『换 worker_cls 字符串』），交叉点画在 spawn 边上并标『两条轴在这里交叉一次、此后互不相见』。左下角两个缩略小框：uni=同进程直调 / mp=广播 MQ 一跳。"
+    }
+   ],
+   "caveats": "精简版 get_class 删了 ray/external_launcher 两分支（删除项 1，ray 归 ch34）——删除后 'ray' 落到 qualname 分支报错，是测试断言过的既定后果；图上画的是 pin 真码的 6 路分发、引 abstract.py:L48-L92 原文。v2 map.json 的『uniproc=ThreadPoolExecutor for async scheduling』口径在本 pin 不成立（deepread first_read_suggestion 风险 (a)）：uni 的 non_block 路径是同步直调 + AsyncOutputFuture 包装异步输出。Model Runner V2（vllm/v1/worker/gpu/）在 pin 仍是 experimental（README:L1-L3），全书锚定 V1——init_device 的 use_v2_model_runner 分支留作脚注证据即可。"
+  },
+  {
+   "mechanism_id": "m4",
+   "intuition": "mp 拉起像开连锁分店：总部（executor 进程）先架一条内部广播电台（rpc_broadcast_mq，SHM 广播队列），再逐个招聘店员（逐 local_rank spawn WorkerProc 子进程）；每个店员上岗前必须完成全部培训——init_worker（解析真 Worker 类）→ init_device（选卡+分布式）→ load_model（装载权重）——才按铃报到（经 ready_pipe 发 READY，附上自己的对讲机频道 response MQ handle）；总部收齐全部 READY 才正式开张（wait_for_ready → 监控线程 → 装配应答通道 → futures_queue）。此后每道指令电台播一次全体店员都听得到，但只有被点名的收银台（output_rank）回单。",
+   "quantified": "world_size=2 全真拉起实测（traces/m4_bringup.json，真 spawn/真握手/真 ZMQ 广播 MQ）：拉起 1823.8ms（win32 spawn 解释器冷启动占大头——量级感非性能结论）；2 个子进程 pid 35228/36668 互异且都≠父进程 19260；READY 的语义=子进程内培训已完成（2 个 worker 全部 loaded=True、应答 pid 与 spawn pid 一致——READY 发出点在 WorkerProc.__init__ 完成之后，worker_main L870-L877）；拓扑账=1 条广播 MQ + 2 条应答 MQ（MessageQueue(1,1) 每 worker 一条，L585）+ 空 futures_queue + 1 条 MultiprocWorkerMonitor 监控线程；广播效率=1 次 enqueue→2 个应答（ranks [0,1]，L388 单次 enqueue 全读者可见）；callable 经 cloudpickle 整函数下发、在子进程 pid 内执行（executed_in_child_pids=True——busy_loop 的 bytes 分支）；关停 304.3ms 后 2 子进程全退、广播 MQ 置 None、应答 MQ 归 0。星形不对称：下行 1 条广播通道、上行 N 条应答通道。",
+   "figure_specs": [
+    {
+     "figure_id": "ch17-fig-mp-bringup-star",
+     "template": "flow",
+     "l0_zoom": "放大 L0 执行臂行（gpu_column）的 Executor 块——即 L2 章图 center ① Executor 拍片（站 2-3）的拉起时序展开：L2 画三层的静态组件与站号，本图把 mp 后端的星形装配画成带时序的流程（广播 MQ 建立 → 逐 rank spawn → 子进程内培训链 → READY 握手 → 开张装配）。非新架构画法，架构归属回指 L0/L2。",
+     "claim": "mp 拉起是一次性的星形装配：建 1 条 SHM 广播 MQ → 逐 local_rank spawn 子进程（每个子进程内 init_worker→init_device→load_model 全部完成才经 ready_pipe 发 READY、附 response MQ handle）→ 父进程收齐 READY 才装监控线程与 N 条应答 MQ、futures_queue 起空——实测 world_size=2：拉起 1823.8ms 出 2 个互异 pid 的子进程，READY 时全部 loaded=True 且应答 pid 与 spawn pid 一致，之后 1 次广播 2 个应答。",
+     "numbers": [
+      {
+       "value": "拉起 1823.8ms → 2 个子进程（pid 35228 / 36668，互异且≠父进程 19260）",
+       "provenance": "traces/m4_bringup.json bringup_ms / workers / pids_distinct / parent_pid"
+      },
+      {
+       "value": "READY 语义：2 个 worker 全部 loaded=True、应答 pid 与 spawn pid 一致（培训完成才报到）",
+       "provenance": "traces/m4_bringup.json ready_probe（loaded_before_ready=true、child_pids_match_workers=true）；发出点 multiproc_executor.py:L870-L877"
+      },
+      {
+       "value": "拓扑账：1 条广播 MQ + 2 条应答 MQ + futures_queue 空 deque + 监控线程 MultiprocWorkerMonitor + output_rank=0",
+       "provenance": "traces/m4_bringup.json topology；应答 MQ 构造 MessageQueue(1,1) multiproc_executor.py:L585"
+      },
+      {
+       "value": "广播效率：rpc_calls=1 → reply_count=2（ranks [0,1]，一次 enqueue 全读者可见）",
+       "provenance": "traces/m4_bringup.json broadcast_probe；enqueue 点 multiproc_executor.py:L388"
+      },
+      {
+       "value": "callable 经 cloudpickle 整函数下发、在子进程 pid 内执行（bytes 分支）",
+       "provenance": "traces/m4_bringup.json callable_probe（executed_in_child_pids=true）"
+      },
+      {
+       "value": "关停 304.3ms：2 子进程全退、广播 MQ 置 None、应答 MQ 归 0",
+       "provenance": "traces/m4_bringup.json shutdown"
+      },
+      {
+       "value": "output_rank = world_size - tp×pcp = 2-2×1 = 0（最后 PP 段 TP rank0 单点收割）",
+       "provenance": "traces/m4_bringup.json topology.output_rank；公式与 TP=8/PP=4→24 算例 multiproc_executor.py:L509-L523"
+      }
+     ],
+     "caption_draft": "星形是怎么立起来的（multiproc_executor.py:L110-L234 + worker_main L820-L944）：广播电台先于店员存在——rpc_broadcast_mq 建好、句柄 export 出去，才逐 local_rank spawn 子进程；每个子进程在 READY 之前必须走完 init_worker（qualname 解析真 Worker）→ init_device（选卡+分布式）→ load_model 的全部培训，然后把『我的应答频道』（response MQ handle）随 READY 报给父进程；父进程收齐 2 个 READY 才起监控线程、装配 2 条应答 MQ、开出空的 futures_queue。此后控制面的形状就固定了：指令一次 enqueue 全员可见（实测 1 次广播 2 个应答）、应答各走各的频道、只有 output_rank（=2-2×1=0）那份被收割。注释里那句 'Workers must be created before wait_for_ready to avoid deadlock' 的原因也在这张图上：init_device 里有集合通信、会做设备同步。",
+     "illustrator_notes": "左右双栏时序：左栏父进程（executor）竖带——①建 rpc_broadcast_mq（广播电台图标，标『1 条』）→②逐 rank spawn（两条箭头射向右栏）→③wait_for_ready（收齐 2 个 READY 的汇聚点）→④开张装配：MultiprocWorkerMonitor 监控线程 + response_mqs×2 + futures_queue(空) + output_rank=0；右栏两个子进程竖带（VllmWorker-0/VllmWorker-1，标真实 pid）——各自内部三步培训链 init_worker→init_device→load_model（竖排小框）→READY（带 response MQ handle 附件图标，箭头回射左栏 ③）。下行广播用一条粗总线箭头（父→全部子，标『1 次 enqueue』），上行应答用两条细箭头（各子→父，标『MessageQueue(1,1)×2』，其中 rank0 那条加粗标 output_rank 单点收割）。角注小卡：callable 分支（cloudpickle 整函数下发、在子 pid 内执行）与关停（death_writer 关→graceful→304.3ms 全退）。配色：父进程 C_ENG_S 橙、子进程 C_GPU_S 绿、MQ 紫系。"
+    }
+   ],
+   "caveats": "spawn 冷启动的 1823.8ms 只代表本 host（win32 spawn；真实 unix 默认 fork/spawn 按 VLLM_WORKER_MULTIPROC_METHOD）——只当量级感；监控线程与 death pipe 在图上只画一眼（死亡传播链的正主是 m17/m18，正文另节讲）；跨节点 peer_worker_response_mqs 装配是删除项 2（单节点 MessageQueue(1,1) 闭环自洽，多节点归 ch34）。"
+  },
+  {
+   "mechanism_id": "m12",
+   "intuition": "FutureWrapper 的队列像食堂取餐口的两条队：订单按发出顺序排一条队（futures_queue：appendleft 从左进、pop 从右出=先进先出），菜按做好顺序从同一个窗口出（每个 worker 的应答 MQ 也是 FIFO）——你到窗口取自己的菜时，如果台上还有前面订单没取走的菜，顺手帮他们端走（result() 先排干先于自己的 future）。于是第 k 次出餐必然对应第 k 张订单，餐票上根本不用印编号——RPC 不带 id，配对靠的是两条队列天然同序。",
+   "worked_example": {
+    "params": {
+     "场景": "三面：A 纯队列机制（真实 FutureWrapper+deque，脚本化应答记录排空序+异常/超时边界）；B 真执行器上的异步调度形态（execute_model+sample_tokens 背靠背 non_block 连发两 RPC 在飞——core.py step_with_batch_queue L661-L672 的真实形状）；C 两对在飞（4 个 future——max_concurrent_batches=2 的异步稳态）",
+     "机制本体": "FutureWrapper appendleft/pop 配对 + result() 先排干先于自己的 future（vllm/v1/executor/multiproc_executor.py:L70-L100，impl 逐字）",
+     "驱动脚本": "traces/run_m12_futurewrapper_fifo.py → traces/m12_futurewrapper_fifo.json",
+     "参数": "world_size=2（TP=2，output_rank=0）；round1 total=3 / round2 total=7（带 grammar）/ round3 两对 total=5、9"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m12_futurewrapper_fifo.json",
+    "table": {
+     "columns": [
+      "轮",
+      "发起（在飞 RPC）",
+      "futures_queue",
+      "收割动作",
+      "排空/收割顺序",
+      "结果配对"
+     ],
+     "rows": [
+      [
+       "A·纯队列",
+       "f1→f2→f3 依次构造（appendleft）",
+       "3（队内序 f3,f2,f1：左进右出=FIFO）",
+       "f3.result()（最新者先收）",
+       "drain_order=[1,2,3]（f3 替 f1、f2 收尸）",
+       "resp-1/resp-2/resp-3 各归各，三 future 全 done"
+      ],
+      [
+       "A·边界",
+       "异常应答 f_exc / 超时 f_to",
+       "—",
+       "result()",
+       "—",
+       "异常转出（RuntimeError: mq says no）；timeout 未实现（原文实测）"
+      ],
+      [
+       "B·round1",
+       "②exec(total=3)→④sample(None) 背靠背",
+       "1→2（连发两跳均未收割）",
+       "fut_samp.result()",
+       "exec 先被排空（得 None）→sample",
+       "scheduled=3、grammar=False；exec future 顺手变 done"
+      ],
+      [
+       "B·round2",
+       "②exec(total=7)→④sample(grammar)",
+       "2",
+       "先收最旧（engine 序：future 得 None 才触发 ④）",
+       "exec(None)→sample",
+       "scheduled=7、grammar=True——7 不串到 round1 的 3：第 k 次 dequeue=第 k 个 RPC"
+      ],
+      [
+       "C·两对在飞",
+       "exec(5)→sample→exec(9)→sample 连发 4 个",
+       "4（0.05ms 连发、全 pending）",
+       "只收最新的 fut_s4.result()",
+       "一次排空 4 个：None→{5}→None→{9}",
+       "4 个全 done、队清空；排空共 0.18ms"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "配对不变式：第 k 次 dequeue 应答 MQ 得到的必是第 k 个发出的 RPC 的回复——全程无需给 RPC 配 id、配独立通道或应答携带序号。",
+    "argument": "归纳论证，三条 FIFO 同序是根基：广播 MQ 单写多读 FIFO（worker 按发出序处理，busy_loop 逐条 dequeue）、每 worker 的应答 MQ FIFO（回复序=处理序=发出序）、futures_queue appendleft/pop 配对即 FIFO（构造序=发出序）。归纳步：future k 调 result() 时，while 循环每轮 pop 恰弹出一个比自己更早入队的 future 并对它做恰一次 get_response（=恰一次 dequeue），单调量=队列中先于自己且未完成的 future 数，每轮严格减 1、非负整数必清零——轮到自己时全局恰完成第 k 次 dequeue，读到第 k 份回复。实测三证：round2 的 scheduled=7（round2 的 total）而非 3；round3 连发 4 个后只调一次 result()，4 个 future 全 done、各得各值（None/{5}/None/{9}）、队列清空。"
+   },
+   "quantified": "实测三笔账（traces/m12_futurewrapper_fifo.json）：① 连发侧近乎免费——4 个 non_block RPC 连发共 0.05ms（issue_ms_nonblocking：enqueue+包 Future，不等待任何应答）；② 收割侧才付等待——round3 一次 result() 排空 4 个 future 共 0.18ms（drain_ms），后发者替先发者收尸、延迟被摊平；③ 在飞上界是设计钉死的——max_concurrent_batches=2（async_scheduling 下 V1 runner，vllm/config/vllm.py:L539-L548，注释原话 'Async scheduling requires 2 concurrent batches to overlap'），即至多两对/4 个 future 在飞，round3 即此稳态。对照：若走配 id 方案，每 RPC 要发 id、应答要携带 id、父进程要查表重组——FIFO 用『两条队列天然同序』换掉这整本账；代价是 timeout 在两代实现里都没实现（result(timeout) 直接 raise），聚合 aggregate 只服务 KV 输出场景（ch16/36 域）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch17-fig-futurewrapper-fifo",
+     "template": "state-table",
+     "l0_zoom": "放大 L0 执行臂行（gpu_column）Executor 块的收割半边——即 L2 章图 south『output_rank 收割 + FutureWrapper』组件（站 13）的机制展开：L2 画它在收割链上的位置，本图画 futures_queue 的状态迁移（appendleft 左进 / pop 右出 / result() 先排干先于自己）与『第 k 次 dequeue=第 k 个 RPC』的配对论证。非新架构画法，架构归属回指 L0/L2。",
+     "claim": "两条 FIFO（每 worker 应答 MQ、futures_queue）天然同序，result() 先排干先于自己的 future——第 k 次 dequeue 必是第 k 个 RPC 的回复：实测 4 个 RPC 背靠背连发 0.05ms 后只收最新者，一次 result() 排空全部 4 个（None/{5}/None/{9} 各归各、队列清空），全程没有一个 RPC id。",
+     "numbers": [
+      {
+       "value": "队内序演进 [f1] → [f2,f1] → [f3,f2,f1]（appendleft 左进、pop 右出=deque 是 FIFO）",
+       "provenance": "traces/m12_futurewrapper_fifo.json part_a_queue_mechanics.queue_after_each_appendleft"
+      },
+      {
+       "value": "f3.result()（最新者先收）→ drain_order=[1,2,3]、三个 future 全 done、各自 result 正确",
+       "provenance": "traces/m12_futurewrapper_fifo.json part_a drain_order / done_after_collect / results"
+      },
+      {
+       "value": "round1 背靠背两 RPC：q_len 1→2，收 sample 时顺手排空 exec（None、done=true）",
+       "provenance": "traces/m12_futurewrapper_fifo.json part_b round1（q_len_after_exec/q_len_after_sample/exec_drained_by_sample_result）"
+      },
+      {
+       "value": "round2 配对证据：scheduled=7（round2 的 total，不是 round1 的 3）",
+       "provenance": "traces/m12_futurewrapper_fifo.json part_b round2.sample_result"
+      },
+      {
+       "value": "round3 两对在飞：4 个 RPC 连发 0.05ms、一次 result() 排空 4 个共 0.18ms、q_len 归 0",
+       "provenance": "traces/m12_futurewrapper_fifo.json part_b round3（issue_ms_nonblocking / drain_ms / q_len_after_drain）"
+      },
+      {
+       "value": "在飞上界=2 对（max_concurrent_batches=2，异步调度 V1 runner；step_with_batch_queue 背靠背连发形态 core.py:L661-L672）",
+       "provenance": "vllm/config/vllm.py:L539-L548 注释 'Async scheduling requires 2 concurrent batches to overlap'；vllm/v1/engine/core.py:L661-L672"
+      },
+      {
+       "value": "边界：异常经 set_exception 转出（RuntimeError 'mq says no'）；timeout 未实现（原文 'timeout not implemented'）",
+       "provenance": "traces/m12_futurewrapper_fifo.json part_a exception_probe / timeout_probe"
+      }
+     ],
+     "caption_draft": "配对不靠 id 靠顺序（multiproc_executor.py:L70-L100）：广播 MQ 是 FIFO（worker 按发出序处理）、应答 MQ 是 FIFO（回复序=处理序）、futures_queue appendleft/pop 也是 FIFO——三条队列天然同序，future.result() 只要把先于自己的 future 排干（while not done: pop → _wait_for_response），第 k 次 dequeue 就必然对上第 k 个 RPC，RPC 协议里因此一个 id 都没有。这不是玩具场景：v0.27.1 默认心跳 step_with_batch_queue（core.py:L661-L672）就是 execute_model 与 sample_tokens 背靠背 non_block 连发，max_concurrent_batches=2（config/vllm.py:L539-L548）钉死至多两对在飞——实测 4 个 RPC 0.05ms 连发、只收最新的一个 future，一次排空全部：后收者替先收者收尸，延迟被摊平。",
+     "illustrator_notes": "状态表五行=trace 五轮（A 纯队列 / A 边界 / B round1 / B round2 / C 两对在飞）：中列画 deque 长条——左端箭头标 appendleft『新 future 进』、右端箭头标 pop『最旧先出』，每轮一行给队内快照（f1/f2/f3 小方块，从右到左为老到新），被排空的方块染实色并挂回复气泡（None / {scheduled=3} / {scheduled=7} / {5} / {9}），正在收割的 future 用高亮描边；右列每轮的收割动作（f3.result() / fut_samp.result() / 只收 fut_s4）。底部窄时序条：round3 的 4 连发（0.05ms 一小段）→ 一次 result() 排空（0.18ms 一小段），右侧标 q_len 4→0。角注框：三条 FIFO 同序（广播 MQ / 应答 MQ / futures_queue）⇒『第 k 次 dequeue = 第 k 个 RPC』+ 两个边界（异常转出 / timeout not implemented）。配色：deque 紫系（MQ 家族）、future 方块橙系、回复气泡绿系。"
+    }
+   ],
+   "caveats": "timeout 在实现里就是没实现（result(timeout) 直接 raise，边界实测原文）——写正文时照实说、别脑补超时语义；aggregate 聚合分支是删除项 3（KV 输出场景归 ch16/36，default 恒等）；FAILURE 会毒化应答 MQ（FIFO 设计的前提是失败后引擎停机、不再发 RPC，impl-notes 已知偏差 5），故 e2e 不做异常轮、异常面只在 Part A 的 FutureWrapper set_exception 半边验证；Part B 毫秒数是 ZMQ loopback seam 实测、只取结构结论（连发/排空/清零）与量级感。"
+  },
+  {
+   "mechanism_id": "m15",
+   "intuition": "两段式像自助餐厅的出餐与结账分离：厨师把菜做好先挂出餐口（execute_model 把 scheduler_output、logits 等 10 样东西打包进 ExecuteModelState 暂存、返回 None——『菜好了、还没结账』），收银员趁出餐的间隙去核优惠券（EngineCore 在 ② 与 ④ 之间于 CPU 上算 grammar bitmask），再喊一声结账（sample_tokens）才解包、把掩码刷到菜价上、真正装盘（_sample）。出餐口一次只挂一单（单槽 execute_model_state）：厨师想挂下一单必须等上一单被取走（槽非空再挂 = State error 当场炸），取走即清（解包第一件事就是置 None）——挂单与取单严格交替。",
+   "worked_example": {
+    "params": {
+     "场景": "三面：A runner 状态机（真 GPUModelRunner 契约面+真 apply_grammar_bitmask+真 torch logits——打包→误用→解包清态→bitmask→_sample 调用位→复用→空槽早退）；B Worker 层委托序；C mp e2e 每拍两跳计时",
+     "机制本体": "两段式契约（vllm/v1/worker/worker_base.py:L142-L157 docstring + vllm/v1/worker/gpu_model_runner.py:L4166-L4175 入口断言 / L4516-L4535 打包暂存 / L4553-L4589 解包即清→bitmask→_sample，impl 逐字）",
+     "驱动脚本": "traces/run_m15_two_phase.py → traces/m15_two_phase.json",
+     "logits 行": "[0.0, 3.0, 0.0, 0.0, 7.0, 9.0, 0.0, 0.0]——favorite=5@9.0、次高 4@7.0、vocab=8（与 ch9 m4 同一行 logits，跨章一致）",
+     "掩码字": "0b00010010（bits 1、4 置位）→ 允许集 {1,4}"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m15_two_phase.json",
+    "table": {
+     "columns": [
+      "阶段",
+      "动作",
+      "execute_model_state",
+      "返回/异常",
+      "观测"
+     ],
+     "rows": [
+      [
+       "② beat1 打包",
+       "execute_model(批 {'g': 3})",
+       "ExecuteModelState 10 字段（logits 占位 None → _replace 注入真行）",
+       "None",
+       "前向算完、采样欠着——读 execute_model 签名看不到 logits 去了哪"
+      ],
+      [
+       "误用防御",
+       "槽非空再来一次 execute_model",
+       "非 None（beat1 未消费）",
+       "RuntimeError：State error: sample_tokens() must be called after execute_model() returns None.（原文实测）",
+       "入口断言先炸，不产出错数据"
+      ],
+      [
+       "④ beat1 解包",
+       "sample_tokens(grammar 允许 {1,4})",
+       "解包→立即清 None",
+       "None（骨架返回；真采样栈不在本章）",
+       "调用序 [_sample, _update_states_after_model_execute]；采样器看到的行 argmax=4、token5 已 -inf——favorite 5 让位给 4"
+      ],
+      [
+       "② beat2 复用",
+       "清空后再 execute_model(批 {'g': 1})",
+       "重新暂存（新批）",
+       "None",
+       "槽已清→合法；④ sample_tokens(None) 无掩码也照走配对"
+      ],
+      [
+       "空槽早退",
+       "新 runner 直接 sample_tokens(None)",
+       "None（从未打包）",
+       "EMPTY ModelRunnerOutput（req_ids=[]）",
+       "非末 PP rank 的纯透传分支形状"
+      ],
+      [
+       "Worker 层委托",
+       "Worker.execute_model → Worker.sample_tokens",
+       "—",
+       "None → 'MRO'",
+       "委托序 [runner.execute_model, runner.sample_tokens]（Worker 不碰槽）"
+      ],
+      [
+       "mp 两跳计时",
+       "beat1/2/3 各 ②+④（total 3/1/1）",
+       "—",
+       "None → dict",
+       "② 0.36/0.16/0.15ms + ④ 0.18/0.15/0.12ms——每拍两次完整广播收割"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "单槽配对不变式：execute_model_state 非 None ⟺ 恰有一拍前向的采样欠着；② 与 ④ 必须严格交替，乱序由双向断言拦下（② 入口 raise + ④ 出口空槽早退）——契约从 docstring 约定升级为运行期硬约束。",
+    "argument": "基例：初始 None（单槽字段构造于 gpu_model_runner.py:L941，注释 'Ephemeral state transferred between execute_model() and sample_tokens()'）。归纳步：② 入口断言在旧值非 None 时直接 raise（L4171-L4175，本例误用行原文触发）——唯一成功路径是写入新暂存并 return None；④ 唯一消费入口先解包、第一步就置 None（L4578-L4580，本例实测清空），之后才 bitmask/_sample。两个入口一置一清、互斥推进：槽非空时第二次 ② 不可能成功，槽空时 ④ 走透传早退（本例空槽行返回 EMPTY 输出）——『前向算完、采样欠着』的中间态永不重叠也永不丢失。Worker/executor 两层的 ②④ 薄封装不触碰槽（Part B 委托序实测只有两条 runner 调用）；mp 跨进程时契约靠『② 返回 None』这一信号本身传播（Part C e2e 三拍全配对：None→scheduled=3/1/1）。"
+   },
+   "quantified": "收益与代价三笔账：① 收益=bitmask 藏进前向窗口（ch9 已立时序）——串行排布『forward 完成→bitmask→采样』每拍多出一段 GPU 空转 T_bitmask，拆两段后 EngineCore 在 ② 发起后立刻算掩码、等 future.result() 时前向与掩码并行，GPU 只等 max(T_forward, T_bitmask)；本例 ④ 的施加在 8 词表行上、µs 级。② 代价=mp 下每拍两次完整广播收割（WC4 自认）——实测 3 拍：② 0.36/0.16/0.15ms + ④ 0.18/0.15/0.12ms（ZMQ loopback seam 上的量级，真实部署贵在序列化不在跳数本身）；对照 uni 直调一次就在本进程、无第二跳。③ 暂存成本=1 个 10 字段 NamedTuple 的引用传递（0 拷贝）——但它是隐式参数：读 execute_model 签名看不到 logits 去了哪（WC4 代价自认），非末 PP rank 的 ④ 因此多一条纯透传早退腿。",
+   "figure_specs": [],
+   "caveats": "前向深水是删除项 6（ch18/19 域）——logits 经 ExecuteModelState._replace 注入脚本行（与 tests m15 同惯例），断言/打包/解包/清/bitmask/_sample 调用位全真码；_sample 与 _update_states_after_model_execute 是同签名最小桩（真采样栈归 ch29、记账归 ch18）；Part C 毫秒数是 ZMQ seam 实测、只取『每拍两跳』的结构结论与量级感；空槽早退分支的第二义（KV connector 输出直通）归 ch16/36；PP 非末段 isend/irecv 接力（m16）与 bitmask 的计算侧（ch9/ch30）都在本章边界外。"
+  }
+ ]
+}
