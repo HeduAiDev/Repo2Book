@@ -103,7 +103,7 @@ records = [run_case(i, t, kw) for i, t, kw in cases]
 doc = {
     "pin": "vLLM v0.27.1 (6e448d0ea); trace source = faithful-subset companion implementation/config_wiring.py on host",
     "mechanism": "O0-O3 优化级: 预设字典 + 谓词默认值 + 递归只填 None (vllm/config/vllm.py:L104-L327, L811-L853, L1272-L1300)",
-    "environment_note": "host 平台 seam: 谓词函数体降为通用 CUDA 路径默认值(与真实通用路径 custom_ops=none 时的求值一致); fuse_allreduce_rms 真实谓词还门控 Hopper/Blackwell+flashinfer 探测(vllm.py:L160-L174), host seam 只保留 TP>1 前置——绝对值 True/False 在 TP>1 且无 flashinfer 的真机上可能为 False, writer 需就近挑明",
+    "environment_note": "host 平台 seam: 谓词函数体降为通用 CUDA 路径默认值(与真实通用路径 custom_ops=none 时的求值一致); fuse_allreduce_rms 真实谓词还门控 Hopper/Blackwell+flashinfer 探测(vllm.py:L155-L175), host seam 只保留 TP>1 前置——绝对值 True/False 在 TP>1 且无 flashinfer 的真机上可能为 False, writer 需就近挑明",
     "anchors": [
         "vllm/config/vllm.py:L104-L116",
         "vllm/config/vllm.py:L229-L251",
@@ -119,5 +119,5 @@ doc = {
 }
 
 out = Path(__file__).resolve().parent / "ch03-optimization-levels.json"
-out.write_text(json.dumps(doc, indent=1, ensure_ascii=False), encoding="utf-8")
+out.write_text(json.dumps(doc, indent=1, ensure_ascii=False), encoding="utf-8", newline="\n")
 print(json.dumps(doc, indent=1, ensure_ascii=False))

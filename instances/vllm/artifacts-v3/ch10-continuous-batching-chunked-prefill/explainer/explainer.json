@@ -1,0 +1,1190 @@
+{
+ "chapter_id": "ch10",
+ "chapter_title": "连续批处理与 chunked prefill",
+ "pin": "vLLM v0.27.1 (6e448d0ea)",
+ "trace_environment": "本章有精简版 companion（implementation/ 8 文件，只做减法、# SOURCE 逐行锚 v0.27.1，host 25 项测试绿，见 impl-notes.md）。十一个驱动脚本全部 host `python` 实跑、trace_source=run，脚本与原始输出在 explainer/traces/（纯控制流，无需 vLLM 运行时/GPU/容器）。与 pin 真实环境的结构性差异（均就近标注）：① KVCacheManager 是接口契约面而非分页器（dossier.scope_note「当黑盒契约面用」）：空闲块计数 + 每请求持有块账，块 id 是合成顺序整数（真实 = GPU 显存物理槽位，ch13）；get_computed_blocks 恒返回 0 命中（等价关前缀缓存；命中折算的调度器消费语义由测试打桩注入 64 命中验证，tests/test_scheduler.py test_hit_tokens_counted_as_computed）；watermark/CoW/链式哈希全删（ch13/14/15）。② ⑤ 拍（update_from_output/check_stop/finish）不在本章精简范围（ch9 已立语义、ch11 展开）：驱动脚本以真实方法 request.append_output_token_ids 手工模拟采样回填、以 running.remove + kv_cache_manager.free + finished_req_ids.add 手工模拟完成退场——与 tests 同一模式（impl-notes「测试覆盖」节明示）；因此 num_in_flight_tokens 在本精简版只增不降（真实同步引擎由 ⑤ 拍消耗），验证的是 _update_after_schedule 的记账方向而非全生命周期。③ m6 的零差距状态由驱动侧模拟「⑤ 拍回填延迟」触发——真实同步引擎 sample 恒回填，四种真实零差距触发（PP 未完/async 到顶/encoder 预算尽/mamba 对齐）见源码注释 scheduler.py:L558-L567；continue-not-break 的控制流本体逐字在 impl。④ allocate_slots 调用序列由驱动侧代理包装记录（包一层 log，不改语义）——抢占重试环的轮次由此可观测。⑤ 同步 Scheduler 讲公式（追赶公式 num_output_placeholders 恒 0）：v0.27.1 服务默认实际是 AsyncScheduler/step_with_batch_queue（ch12），本表全部数字属同步版语义。⑥ 行号基线 v0.27.1（dossier/impl # SOURCE 已逐行核；本 explainer 新引用锚点均为 dossier 账本项或 impl-notes 1:1 Source Map 项）。外部论文数字（Orca 36.9×、Sarathi-Serve）只出现在 intuition/quantified 叙述里、明标外证，不进数值表。",
+ "figure_policy": "dossier needs_figure=true 九机制 m1/m2/m3/m5/m8/m10/m14/m15/m16 各配 1 张 figure_spec，均为 FIGURE-SYSTEM §3.3 允许的正文机制图——每张 spec 的 l0_zoom 字段显式回答「它是 L0 哪一块的放大」：本章 l0_region=kv_column（L0 右列『调度 · 显存账本』青色列），l0_zoom『调度账本列上半』= 该列上半的 Scheduler 调度账本框（第ⅢPart 行程区，ch10-12 打开；下半 KVCacheManager/BlockPool 归 Part IV ch13-16）。每张图 = L2 章图（cartography/l2-specs/ch10.json，已渲染 L2-ch10.png）center ①-⑦ 拍片中某拍片的机制展开，非新架构画法、架构归属回指 L0/L2。开篇图=本章 L2 章图（Map 站职责，gen_L2 已渲染），不归本 explainer。其余 11 机制不提新图：m4 预算地形是配置事实（三行配置表/引文比图有力，L2 south『why · 只认 token 数』注已备 2048/16384/8192 数字）；m7 抢占环由 m8 图的门控状态机 + m16 表格承担（dossier m7 needs_figure=false）；m9 前缀折算黑盒（L2 章图 ③ 拍片 get_computed_blocks 虚线已画）；m11 准入门反差用 m10 图第三闸的准入分支标注 + 正文对照表；m12 落位/m13 断言/m17 双队列/m18 PauseState/m19 装配/m20 spec pad 均为流程/配置事实，L2 站号轨道与并排代码引文（dossier embed_excerpts 已备）承担。",
+ "mechanisms": [
+  {
+   "mechanism_id": "m1",
+   "intuition": "食堂打菜窗口不限「几个人」限「几份菜」：256 个人各打 1 份和 1 个人打 256 份，对窗口是同一回事——窗口只数份数。schedule() 每拍交出的批就是这样一张「份数账单」{req_id: num_tokens}：谁来了记谁的名字，但约束是份数合计（token 预算），不是人头数。同一张账单里，一个人的份数可以是 1（decode）、可以是几百（新 prompt 或 chunk）——这就是『批的上限按 token 数算』。",
+   "worked_example": {
+    "params": {
+     "预算": "max_num_batched_tokens=32（最小可心算规模；config ClassVar 默认 2048、服务端 8192/16384 见 m4）",
+     "请求": "r1/r2/r3 各 8-token prompt（拍 1 全量进批）+ r4 64-token prompt（拍 2 到达）",
+     "机制本体": "Scheduler.schedule()（scheduler.py:L439，impl 逐字）产出 {req_id: num_scheduled_tokens}",
+     "驱动脚本": "traces/run_m1_contract.py → traces/m1_contract.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m1_contract.json",
+    "table": {
+     "columns": [
+      "拍",
+      "批组成 {req_id: num_tokens}",
+      "批内请求数",
+      "批 token 合计",
+      "预算余额",
+      "关键观察"
+     ],
+     "rows": [
+      [
+       "1",
+       "{r1:8, r2:8, r3:8}",
+       "3",
+       "24",
+       "8",
+       "三个新 prompt 同拍全量进批（WAITING 收新）"
+      ],
+      [
+       "2",
+       "{r1:1, r2:1, r3:1, r4:29}",
+       "4",
+       "32",
+       "0",
+       "3 个 decode 各 1 + 新 prompt 首 chunk 29——恰好打满"
+      ],
+      [
+       "3",
+       "{r1:1, r2:1, r3:1, r4:29}",
+       "4",
+       "32",
+       "0",
+       "r4 续 chunk 又领 29（预算又只剩 29）"
+      ],
+      [
+       "4",
+       "{r1:1, r2:1, r3:1, r4:6}",
+       "4",
+       "9",
+       "23",
+       "r4 尾 chunk 6，prefill 收官——批不再打满"
+      ],
+      [
+       "5",
+       "{r1:1, r2:1, r3:1, r4:1}",
+       "4",
+       "4",
+       "28",
+       "全 decode 稳态：每人恰 1"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "每拍 Σ num_scheduled_tokens ≤ max_num_scheduled_tokens 且 token_budget ≥ 0（scheduler.py:L1108-L1111 守恒断言每拍机器自检）——批的 token 合计被预算钉死，与请求数无关。",
+    "argument": "构造性而非事后校验：两处入账点（L631-L638 RUNNING / L1069-L1075 WAITING）都是先把 num_new_tokens 钳到 min(num_new_tokens, token_budget) 再扣减 token_budget −= n；RUNNING 循环与 WAITING 循环的入环条件都含 token_budget > 0。归纳：拍首 budget = max（基例），每个成员入账后 budget 单调不增且 ≥ 0（每步扣减 ≤ 当前余额）→ 拍末 Σ = 初值 − 余额 ≤ 初值。断言只是最后一道机器自检。"
+   },
+   "quantified": "本例 32 预算装下 4 请求/32 token。真实刻度：config 默认 2048（vllm/config/scheduler.py:L42，docstring 自认「主要为测试便利」）；服务部署按硬件仲裁（arg_utils.py:L2541-L2563）：≥70GiB 且非 A100 → LLM 16384 / API server 8192、max_num_seqs 1024，否则 8192/2048、256——单步 forward 的计算量 ≈ 预算 token 数，预算就是单步延迟水位线（dossier theory「token 预算守恒」）。外证（非源码）：request-level batching 与迭代级调度的吞吐差距最高 36.9×（Orca，OSDI'22，USENIX 页面 https://www.usenix.org/conference/osdi22/presentation/yu——无 arXiv 预印本，2103.00071 是错误编号）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch10-fig-batch-is-token-ledger",
+     "template": "state-table",
+     "l0_zoom": "放大 L0 右列『调度 · 显存账本』（kv_column，青色列）上半的 Scheduler 调度账本框——即 L2 章图 center ⑦ 『断言 · 组装 · 乐观推进』拍片产出的 num_scheduled_tokens 账本的机制展开（产出面）。非新架构画法，架构归属回指 L0/L2。",
+     "claim": "同一个 running 批，五拍里批组成从「3 请求 / 24 token」到「4 请求 / 32 token」再到「4 请求 / 4 token」——schedule() 产出的批以 {req_id: num_tokens} 记账、以 token 合计受预算约束，请求数从来不是约束。",
+     "numbers": [
+      {
+       "value": "五拍批形状 3 请求/24 token → 4 请求/32 → 4/32 → 4/9 → 4/4",
+       "provenance": "traces/m1_contract.json beats 1-5（requests_in_batch 3/4/4/4/4 与 total 24/32/32/9/4）"
+      },
+      {
+       "value": "r4 一生领到的份数：29（首 chunk，被余 29 截）→ 29 → 6（尾）→ 1（decode）",
+       "provenance": "traces/m1_contract.json r4_sizes_across_life"
+      },
+      {
+       "value": "预算 32，拍 2/3 恰打满（余额 0），拍 4 余额 23",
+       "provenance": "traces/m1_contract.json budget/budget_left 字段"
+      },
+      {
+       "value": "契约原文：num_tokens 可为整段 prompt、可为 1、可居中（chunked prefill/prefix caching/spec decoding）",
+       "provenance": "vllm/v1/core/sched/interface.py:L61-L67 docstring（dossier embed_excerpts[0]）"
+      }
+     ],
+     "caption_draft": "批不是「一桌人」是「一张账单」（interface.py:L54-L67 + scheduler.py:L1108-L1111）：调度器每拍交出 {req_id: num_tokens}，同一批里 decode 请求各 1 份、新 prompt 首拍 29 份、续 chunk 又 29 份、尾 chunk 6 份——账单合计被 32 的预算钉死（拍 2/3 恰好打满），请求数只在旁边看热闹。这就是「调度器只认 token 数不认请求数」的机器形态。",
+     "illustrator_notes": "五行状态表（一拍一行）：左列拍号；中列批账单（每个 req_id 一行小票据，票据宽度 ∝ num_tokens——decode 票据窄条 1，chunk 票据宽条 29/6，用同色系深浅区分 decode/prefill）；右列预算标尺（0..32 竖条，拍 2/3 染到顶、拍 4 染 9/32）。底部一行合计行：请求数列与 token 合计列并排——请求数列恒 3→4，token 列 24→32→32→9→4，视觉上「恒定的人数 vs 波动的份数」。"
+    }
+   ],
+   "caveats": [
+    "预算 32 是为心算缩小的示教值；真实默认 2048（测试便利）/8192/16384（硬件仲裁）见 m4——图注/正文引用本表数字时须带「32 为示教预算」一句。"
+   ]
+  },
+  {
+   "mechanism_id": "m2",
+   "intuition": "看视频的进度条：num_computed_tokens 是已看进度，num_tokens_with_spec 是片长，每拍播放推进不超过「剩余带宽」（预算）。新片（prompt）一次看不完就分几次看（chunk），追更的剧每集只有 1 分钟（decode 每拍 1 token）——播放器不关心你在看新片还是追更，它只做一件事：把进度往片长推。调度器同理：没有 prefill 相位、没有 decode 相位，只有一条追赶公式。",
+   "worked_example": {
+    "params": {
+     "请求": "单条 8192-token prompt，max_model_len=16384",
+     "预算": "max_num_batched_tokens=2048（config 默认值）",
+     "机制本体": "追赶公式 num_new_tokens = num_tokens_with_spec + num_output_placeholders − num_computed_tokens（scheduler.py:L516-L520；字段定义 request.py:L271-L277），三重钳制 L521-L532",
+     "驱动脚本": "traces/run_m2_catchup.py → traces/m2_catchup.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m2_catchup.json",
+    "table": {
+     "columns": [
+      "拍",
+      "特例",
+      "num_tokens_with_spec",
+      "+占位",
+      "−已算",
+      "原始差",
+      "生效的闸",
+      "本拍领到",
+      "拍后已算"
+     ],
+     "rows": [
+      [
+       "1",
+       "新 prompt（WAITING 侧切块）",
+       "8192",
+       "0",
+       "0",
+       "8192",
+       "预算 2048",
+       "2048",
+       "2048"
+      ],
+      [
+       "2",
+       "续 chunk（RUNNING 侧同公式）",
+       "8192",
+       "0",
+       "2048",
+       "6144",
+       "预算 2048",
+       "2048",
+       "4096"
+      ],
+      [
+       "3",
+       "续 chunk（同拍 2，差再减 2048）",
+       "8192",
+       "0",
+       "4096",
+       "4096",
+       "预算 2048",
+       "2048",
+       "6144"
+      ],
+      [
+       "4",
+       "末 chunk",
+       "8192",
+       "0",
+       "6144",
+       "2048",
+       "无（差恰等于预算）",
+       "2048",
+       "8192"
+      ],
+      [
+       "5",
+       "decode",
+       "8193",
+       "0",
+       "8192",
+       "1",
+       "无",
+       "1",
+       "8193"
+      ],
+      [
+       "6",
+       "decode",
+       "8194",
+       "0",
+       "8193",
+       "1",
+       "无",
+       "1",
+       "8194"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "prefill 段：每拍差距减 min(差距, 预算) ≥ 1，⌈prompt/预算⌉ 拍内追平；decode 段：差距恒回到 1（稳态即目的，不再收敛）——终止性由 max_tokens/stop 判定（ch11）兜底，不由追赶公式兜底。",
+    "argument": "prefill 段：入账 n = min(差距, threshold?, 预算) ≥ 1（assert L914 / RUNNING 侧同构），_update_after_schedule 把 n 全额计入 computed（L1330）→ 差距严格递减、非负整数 → 有限拍归零（基例：首拍差距 = prompt；归纳步：每拍减 ≥1）。decode 段：每拍 ⑤ 拍回填使 with_spec +1、上拍的 1 已被乐观推进计入 → 差距恢复 1——这是不变量不是收敛量；请求生命的终止靠 max_tokens 上界（Request 构造 L106-L129）与 check_stop（ch11），诚实分界。"
+   },
+   "quantified": "本例 8192/2048 = 恰 4 拍 prefill（⌈8192/2048⌉）+ 每拍 1 decode。同公式三个刻度：8192-token prompt 在 API server 默认预算 8192 下 1 拍完（arg_utils.py:L2541-L2563）、LLM 默认 16384 下 1 拍完、2048 下 4 拍；32k prompt 在 8192 预算 = 4 拍。公式本体 O(1) 每请求每拍；woosuk 注释（L441-L450）自 v1 首提交 6c5af09b3 逐字沿用——「general enough to cover chunked prefills, prefix caching, speculative decoding, and the jump decoding optimization in the future」。",
+   "figure_specs": [
+    {
+     "figure_id": "ch10-fig-catchup-ruler",
+     "template": "tiling",
+     "l0_zoom": "放大 L0『调度 · 显存账本』列上半 Scheduler 框的「token 预算 · RUNNING 先行」格——即 L2 章图 center ① 『RUNNING 先行 · 追赶公式』拍片内公式的机制展开。",
+     "claim": "一条追赶公式三种形状：8192-token 的进度带被 2048 预算切成 4 块瓷砖（新 prompt 一块 + 续 chunk 三块），追平后每拍只铺 1 格——进度带总长 = num_tokens_with_spec，铺过的高亮 = num_computed_tokens，每拍新铺的长度 = 公式结果被预算钳制后的 n。",
+     "numbers": [
+      {
+       "value": "进度带 8192 格，四拍各铺 2048（拍 1-4），拍 5-7 各铺 1",
+       "provenance": "traces/m2_catchup.json chunk_sizes [2048,2048,2048,2048,1,1,1] 与 computed_progression [2048..8195]"
+      },
+      {
+       "value": "各拍原始差 8192 → 6144 → 4096 → 2048 → 1 → 1",
+       "provenance": "traces/m2_catchup.json raw_gap 字段（beats 1-6）"
+      },
+      {
+       "value": "占位项恒 0（同步版；async 才灌值，ch12）",
+       "provenance": "traces/m2_catchup.json num_output_placeholders 全 0；request.py:L151"
+      },
+      {
+       "value": "公式原文行号：scheduler.py:L516-L520，字段定义 request.py:L271-L277",
+       "provenance": "dossier embed_excerpts（impl scheduler.py # SOURCE 同锚）"
+      }
+     ],
+     "caption_draft": "追赶公式的进度带（scheduler.py:L516-L520）：8192-token prompt 在 2048 预算下被切成四段——首段走 WAITING 侧切块（num_tokens − 0 被预算截 2048），后三段走 RUNNING 侧同一公式（差 6144/4096/2048 各被预算截 2048），拍 4 追平、is_prefill_chunk 翻 False；拍 5 起每拍差恒 1。没有 prefill 相位也没有 decode 相位，只有「已算追片长」一件事。",
+     "illustrator_notes": "横条进度带（8192 格按比例缩为 ~16cm）：已铺段实色、未铺段浅色；每拍一行（7 行），行末标注公式代入值（8192+0−0=8192→钳 2048 …）。decode 拍（5-7）的行几乎全实色、只差 1 格白边，右侧放大镜气泡展示这 1 格——「每拍恰 1」的视觉锤。拍 4 与拍 5 之间画一条 is_prefill_chunk 翻转的分隔线。"
+    }
+   ],
+   "caveats": [
+    "max_model_len 保险钳（L527-L532：max_model_len − computed − num_sampled_tokens_per_step）在本例不触发（headroom ≥10239，trace max_model_len_headroom 字段）——它是 spec/边界场景的保险，正文点到即可。"
+   ]
+  },
+  {
+   "mechanism_id": "m3",
+   "intuition": "一张全家共用的饭卡：额度 32，先刷的先扣，刷完为止——本轮谁后到谁只能刷剩余额度。RUNNING 和 WAITING 两个阶段刷的是同一张卡（同一个 token_budget 变量），不是各发一张：阶段一在途请求先刷，阶段二新请求刷余额，卡里的数字一路单调下降、永远不为负。拍末对账：本拍刷掉的合计 = 额度 − 余额，且必然 ≤ 额度。",
+   "worked_example": {
+    "params": {
+     "场景 B（心算刻度）": "预算 4：r1 2-token prompt + r2 8-token prompt——r2 被切成 [2, 3, 3] 后转 decode",
+     "场景 A（32 刻度）": "预算 32：三个 8-token prompt + 64-token 新请求（复现 m1 的混合批，从池的视角记录）",
+     "机制本体": "token_budget = max_num_scheduled_tokens（L459）跨两阶段递减（L523/L636-L637/L913/L1073）+ 守恒断言（L1108-L1113）",
+     "驱动脚本": "traces/run_m3_budget_pool.py → traces/m3_budget_pool.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m3_budget_pool.json",
+    "table": {
+     "columns": [
+      "场景·拍",
+      "本拍账单（谁·领多少）",
+      "花销",
+      "拍末余额",
+      "守恒断言"
+     ],
+     "rows": [
+      [
+       "B·拍1",
+       "r1 全量 2；r2 首 chunk 2（需求 8 被余 2 截）",
+       "4",
+       "0",
+       "Σ=4 ≤ 4 ✓"
+      ],
+      [
+       "B·拍2",
+       "r1 decode 1；r2 续 chunk 3（差 6 被余 3 截）",
+       "4",
+       "0",
+       "Σ=4 ≤ 4 ✓"
+      ],
+      [
+       "B·拍3",
+       "r1 decode 1；r2 续 chunk 3（差 3 恰等于余 3）",
+       "4",
+       "0",
+       "Σ=4 ≤ 4 ✓"
+      ],
+      [
+       "B·拍4",
+       "r1 decode 1；r2 转 decode 领 1",
+       "2",
+       "2",
+       "Σ=2 ≤ 4 ✓"
+      ],
+      [
+       "A·拍2",
+       "三个 decode 各 1；r4 首 chunk 29",
+       "32",
+       "0",
+       "Σ=32 = 32 ✓"
+      ],
+      [
+       "A·拍4",
+       "三个 decode 各 1；r4 尾 chunk 6",
+       "9",
+       "23",
+       "Σ=9 ≤ 32 ✓"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "token_budget 是拍内单调不增的非负整数，拍末 Σ num_scheduled_tokens = 初值 − 余额 ≤ max_num_scheduled_tokens，且余额 ≥ 0（断言 L1111）。",
+    "argument": "所有扣减点共用同一变量：RUNNING 侧 L523 min(num_new, token_budget) → L637 扣减；WAITING 侧 L913 min(num_new, token_budget) → L1073 扣减；两个循环的入环条件都含 token_budget > 0（L484/L687）→ 每次扣减额 ≤ 当前余额（基例：拍首 = max；归纳步：扣减后仍 ≥ 0）。守恒断言（L1108-L1111）是把这条归纳链机器化，不是唯一的保障。"
+   },
+   "quantified": "每拍记账 O(running + waiting) 次、每次 O(1)；千级并发下这个 Python 循环本身就是瓶颈——woosuk 注释 scheduler.py:L1728-L1730 原话「the below loop can be a performance bottleneck. We should do our best to avoid expensive operations inside the loop」（本例 2-4 成员）。预算三个来源的地形见 m4；PAUSED_ALL 可把预算短路为 0（m18）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch10-fig-one-budget-two-phases",
+     "template": "state-table",
+     "l0_zoom": "放大 L0『调度 · 显存账本』列上半 Scheduler 框的「token 预算」格——即 L2 章图 center ①-⑥ 拍片共用的那条预算水位线（跨拍片贯穿线）的机制展开。",
+     "claim": "一个 token_budget 变量跨 RUNNING/WAITING 两阶段分账：预算 4 的心算例里，拍 1 全家刷 4（r1 全量 2 + r2 首 chunk 2）、拍 2/3 又各刷 4、拍 4 只刷 2——每拍水位降到 0 或停在中途，拍拍守恒。",
+     "numbers": [
+      {
+       "value": "场景 B 四拍水位：花销 4/4/4/2，余额 0/0/0/2",
+       "provenance": "traces/m3_budget_pool.json scenario_B beats 1-4（total 与 budget_left）"
+      },
+      {
+       "value": "r2 的 chunk 尺寸 [2, 3, 3]（8-token prompt 被余额切成三段）后转 decode 领 1",
+       "provenance": "traces/m3_budget_pool.json scenario_B r2_chunk_sizes [2,3,3,1,1]"
+      },
+      {
+       "value": "场景 A 拍 2 花销 32 恰打满、拍 4 只花 9 余 23",
+       "provenance": "traces/m3_budget_pool.json scenario_A beats 2/4"
+      },
+      {
+       "value": "扣减点行号：L459 初始化 / L523+L637 RUNNING / L913+L1073 WAITING / L1108-L1111 断言",
+       "provenance": "dossier code_spine（impl scheduler.py # SOURCE 同锚）"
+      }
+     ],
+     "caption_draft": "两阶段刷一张卡（scheduler.py:L459→L637→L1073→L1108）：预算 4 的最小例——阶段一在途请求先扣（decode 各 1），阶段二新请求只领余额（8-token prompt 被切成 2+3+3 三段进后续拍），每拍合计恰好 ≤ 4 且余额不为负；拍末的守恒断言把这条账律写成机器自检。预算就是单步计算量的水位线：一拍批多大，这张卡说了算。",
+     "illustrator_notes": "上：一张竖直「饭卡/水位条」（刻度 0..4），左列四拍（B 场景）每拍一行：行内两个小票（r1、r2 的领取额）+ 水位条染色到扣减后位置；拍 4 染到 2/4 留白标注「chunk 收官·批不满」。下：同构的 32 刻度小图（A 场景拍 2/4）对照——同一画法两种刻度，标「32 为示教预算，真实 2048/8192/16384」。"
+    }
+   ],
+   "caveats": [
+    "「花销恰等于预算」的两拍（A·拍2/3、B·拍1-3）是选参使预算被打满的非平凡分支（不是巧合：r4/r2 的原始差大于余额才触发截断）——A·拍4 与 B·拍4 刻意保留「批不满」对照行。"
+   ]
+  },
+  {
+   "mechanism_id": "m4",
+   "intuition": "同一个 vLLM 在不同显卡上默认预算不一样——预算不是拍脑袋常数，是「单步延迟水位线 × 硬件吞吐特性」的乘积。config 里的 2048 只是测试便利的占位；真实部署的数字在 EngineArgs 里按「显存多大 + 是不是 A100 + 当 LLM 用还是当 API server 用」三问仲裁。",
+   "quantified": "三层来源（impl arg_utils.py 保留决策表逐字，测试 test_get_batch_defaults_* 三档覆盖）：① config ClassVar：DEFAULT_MAX_NUM_BATCHED_TOKENS=2048、DEFAULT_MAX_NUM_SEQS=128（vllm/config/scheduler.py:L42-L44，docstring 自认默认值主要为测试便利）；② EngineArgs.create_engine_config 按硬件与场景覆盖（vllm/engine/arg_utils.py:L2541-L2563）：显存 ≥70GiB 且非 A100 → LLM 16384 / API server 8192、max_num_seqs 1024；否则 LLM 8192 / API 2048、seqs 256——A100 反例注释原话「Setting large max_num_batched_tokens for A100 reduces throughput, see PR #17885」；③ max_num_scheduled_tokens 可再压（缺省回落 max_num_batched_tokens，vllm/config/scheduler.py:L56-L61——spec 场景 worker 会往批里加 token，调度器可发行量要更小）。读者带走：2048 是纸面默认，8192/16384 才是服务现实。",
+   "figure_specs": [],
+   "caveats": [
+    "dossier m4 needs_worked_example=false：数值全部来自配置常量与仲裁表（impl # SOURCE 逐字），无需运行取证；三档测试（big-gpu-not-a100 / a100-exception / small-gpu）即行为证据。"
+   ]
+  },
+  {
+   "mechanism_id": "m5",
+   "intuition": "高速公路 ETC 闸口：已经在路上的车（RUNNING）先过闸——每辆只占一格（decode 每拍 1 token）；新上高速的车（WAITING）用剩下的通行能力，不够就分批放行（chunk）。在途车的车速（TPOT）不被新车流挤兑，代价是新车的等待（TTFT）没有上界——这是把延迟压力显式从一头挪到另一头。",
+   "worked_example": {
+    "params": {
+     "预算": "16",
+     "请求": "r1/r2/r3 各 4-token prompt（拍 1 进批、拍 2 起 decode）+ r4 20-token prompt（拍 2 到达）",
+     "机制本体": "『First, schedule the RUNNING requests』（scheduler.py:L483-L485）固定两阶段顺序 + allocate 顺序代理实测",
+     "驱动脚本": "traces/run_m5_running_first.py → traces/m5_running_first.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m5_running_first.json",
+    "table": {
+     "columns": [
+      "拍",
+      "RUNNING 先吃（allocate 实测顺序）",
+      "WAITING 后收",
+      "批合计",
+      "r4 到手",
+      "关键观察"
+     ],
+     "rows": [
+      [
+       "2",
+       "r1:1 → r2:1 → r3:1（先付 3）",
+       "r4 首 chunk 13（需求 20 截到 13）",
+       "16",
+       "13",
+       "三个 decode 本拍都有 token；r4 首拍只拿到 65%"
+      ],
+      [
+       "3",
+       "r1:1 → r2:1 → r3:1",
+       "r4 尾 chunk 7",
+       "10",
+       "7",
+       "r4 prefill 收官"
+      ],
+      [
+       "4",
+       "r1:1 → r2:1 → r3:1 → r4:1",
+       "——（waiting 空）",
+       "4",
+       "1",
+       "r4 转 decode，四人同拍各 1"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "只要预算 ≥ 在场 decode 数且各差距 ≥ 1，每个在途 decode 每拍必领到 1 token——新请求的存在只能压缩自己的 chunk，不能压缩 decode 的 1。",
+    "argument": "RUNNING 循环严格先于 WAITING 段执行（L483 在 L683 前）；decode 差距恒 1（m2 特例二：每拍回填 +1、上拍已乐观计入）→ 每个decode 的 min(1, token_budget) 只要余额 ≥1 即得 1；K 个 decode 共扣 K ≤ 预算后新请求才进场，其领取被 min(token_budget) 钳到余额（基例拍首余额=max；归纳步沿 running 列表序递减）。反向情形（预算 < K）按 FCFS 序先到先得、队尾 decode 落空——源码无额外保护，这是诚实边界。"
+   },
+   "quantified": "本例 16−3=13（r4 首拍拿 65%）；一般式：新请求首 chunk = B−K（B 预算、K 在场 decode 数）。反事实算术（非 trace）：若顺序倒置且 r4 先领 min(20,16)=16，余额 0——三个 decode 全部落空一拍，TPOT 出现一个尖峰。代价面（WC3）：老请求绝对优先 → 高负载下 waiting 无 admission control 无上界增长、TTFT 无上界；抢占拍连收新都暂停（m8）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch10-fig-running-first-lanes",
+     "template": "swimlane",
+     "l0_zoom": "放大 L0『调度 · 显存账本』列上半 Scheduler 框的「RUNNING 先行」格——即 L2 章图 center ① 拍片『First, schedule the RUNNING requests』与 ③ 拍片之间顺序关系的机制展开。",
+     "claim": "allocate 实测顺序：拍 2 里 r1→r2→r3 三个 decode 先各领 1（预算 16 掉到 13），新到的 r4 只能领 13——RUNNING 先行使在途请求的 1 token 永远先入账。",
+     "numbers": [
+      {
+       "value": "拍 2 分配顺序 [r1:1, r2:1, r3:1, r4:13]（allocate_slots 调用序列）",
+       "provenance": "traces/m5_running_first.json beats[1].allocation_order"
+      },
+      {
+       "value": "r4 首拍：需求 20、被截到 13（65%）",
+       "provenance": "traces/m5_running_first.json r4_first_chunk_cut（raw_need 20 / chunk 13 / cut_fraction_pct 65）"
+      },
+      {
+       "value": "r4 的 chunk 序列 [13, 7, 1, 1]（尾 chunk 7 收官后转 decode）",
+       "provenance": "traces/m5_running_first.json r4_chunk_sizes"
+      },
+      {
+       "value": "预算 16，拍 2 合计 16 恰打满、拍 3 合计 10",
+       "provenance": "traces/m5_running_first.json beats total 字段"
+      }
+     ],
+     "caption_draft": "谁先刷卡（scheduler.py:L483-L485）：allocate_slots 的实测调用序把两阶段顺序钉死——拍 2 三个在途 decode 先各领 1（预算 16→13），20-token 的新 prompt 首拍只领到 13（65%）、拍 3 尾 chunk 7 补齐、拍 4 起四人同拍各 1。RUNNING 先行 = 在途请求的 TPOT 优先，新请求的 TTFT 用 chunk 分期来付。",
+     "illustrator_notes": "双泳道横向时间轴（一拍一列）：上泳道 RUNNING（r1/r2/r3 三个窄票据 1），下泳道 WAITING（r4 宽票据 13→7→1）；泳道之间一条共享预算标尺（0..16），上泳道每票据向下抽一格、下泳道票据抽剩余宽度；拍 2 列在标尺 13 处画一条「先付 3」的分割线并放大标注。底部一句 why 注（虚线框）：「顺序 = TPOT 优先于 TTFT（WC3）」。"
+    }
+   ],
+   "caveats": [
+    "「65%」是驱动脚本由 13/20 计算记录的字段（cut_fraction_pct），非源码常量。"
+   ]
+  },
+  {
+   "mechanism_id": "m6",
+   "intuition": "超市结账队：排在前面的人购物车临时出问题（差距 0，没什么可扫），收银员不关台（不 break），直接说「下一位」（continue）——队不会因为一个人卡住而整队停摆。woosuk 在源码注释里明说：这是不严格 FCFS——卡住的高优先请求不阻塞后面的低优先请求。",
+   "worked_example": {
+    "params": {
+     "请求": "r1 6-token prompt、r2 8-token prompt，预算 32",
+     "触发": "驱动侧模拟 r1 的 ⑤ 拍采样回填延迟（真实同步引擎的四种零差距触发见 scheduler.py:L558-L567 注释：PP 未完/async 到顶/encoder 预算尽/mamba 对齐）",
+     "机制本体": "num_new_tokens==0 → req_index += 1; continue（scheduler.py:L557-L573，注释原句 we do not strictly follow the FCFS scheduling policy）",
+     "驱动脚本": "traces/run_m6_zero_continue.py → traces/m6_zero_continue.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m6_zero_continue.json",
+    "table": {
+     "columns": [
+      "拍",
+      "r1（tokens/已算/拍前差）",
+      "r1 判定",
+      "r2（tokens/已算/拍前差）",
+      "r2 判定",
+      "本拍产出"
+     ],
+     "rows": [
+      [
+       "A·拍2",
+       "6/6/0",
+       "continue",
+       "9/8/1",
+       "排 1",
+       "{r2:1}"
+      ],
+      [
+       "A·拍3",
+       "6/6/0",
+       "continue",
+       "10/9/1",
+       "排 1",
+       "{r2:1}"
+      ],
+      [
+       "A·拍4",
+       "7/6/1",
+       "排 1",
+       "11/10/1",
+       "排 1",
+       "{r1:1, r2:1}"
+      ],
+      [
+       "B·拍2",
+       "6/6/0",
+       "continue",
+       "8/8/0",
+       "continue",
+       "{}（空拍）"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "差距 0 的请求 continue 不阻塞后续请求，也不产生无限循环：RUNNING 循环至多 len(running) 次迭代必终止。",
+    "argument": "单调量 = req_index：continue 分支唯一动作 req_index += 1（L571-L572），循环条件 req_index < len(self.running) → index 严格递增的非负整数 → 有限步出循环；后续请求照常评估差距（trace A·拍2/3：r1 差 0 continue，r2 照领 1）。全员差 0 的极端情形退化为一次空拍（B·拍2），schedule() 仍正常返回、断言全过——「心跳空转」是合法状态。"
+   },
+   "quantified": "每次 continue 代价 O(1)；最坏一拍 O(len(running)) 次零差距评估（全卡死批）。真实触发面（源码注释四因）里本章同步路径几乎不遇（PP/async/encoder/mamba 都属邻章特性），但 continue-not-break 的顺序语义每拍都在生效——它同时保证了「预算耗尽时队头不白占评估」的路径不会被误当 FCFS 破坏（FCFS 的保证在队列选择，不在循环 break 点）。",
+   "figure_specs": [],
+   "caveats": [
+    "驱动以「延迟回填」制造零差距是取证手段，非真实触发路径；表格判定列（continue/排 1）是循环控制流的直接观测（产出字典里有/无该请求），非杜撰。"
+   ]
+  },
+  {
+   "mechanism_id": "m7",
+   "intuition": "剧场满座时一位必须落座的来客（请求要续 chunk/decode 的下一个 token）：剧场请走「最晚进场、重看损失最小」的观众（FCFS 抢 running 队尾 = 最年轻请求），座位腾给来客；而且这一场从此不再检票（本拍抢占过 → 阶段二关闸，m8）。被请走的观众不退票——下次从片头重看（recompute-only，v1 没有 swap）。",
+   "worked_example": {
+    "params": {
+     "块池": "num_gpu_blocks=2、block_size=16（32 token 槽位），整序列准入门开（默认）",
+     "请求": "r1/r2 各 16-token prompt（拍 1 各持 1 块、池空）",
+     "机制本体": "allocate_slots None → self.running.pop()（FCFS 抢队尾，L615）→ _preempt_request → 重试，直到成功或把自己抢掉（L576-L629）",
+     "驱动脚本": "traces/run_m7_preempt_retry.py → traces/m7_preempt_retry.json（allocate 代理记录每轮调用）"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m7_preempt_retry.json",
+    "table": {
+     "columns": [
+      "拍",
+      "allocate_slots 实调序列",
+      "结果",
+      "被抢者/重入者账面",
+      "池（空闲块）"
+     ],
+     "rows": [
+      [
+       "2",
+       "(r1,1)→None；(r1,1)→OK",
+       "r1 领 1；FCFS 队尾 r2 被抢（队尾=最年轻）",
+       "r2：已算 16→0 · num_preemptions 0→1 · 回 waiting 队头",
+       "0→1→0"
+      ],
+      [
+       "3",
+       "(r1,1)→OK；(r2,17)→None",
+       "r1 领 1；r2 重入被整序列门拒（需 2 块 > 空闲 0）→ break",
+       "r2 留 waiting（WAITING 绝不触发抢占）",
+       "0"
+      ],
+      [
+       "4",
+       "(r1,1)→OK；(r2,17)→None",
+       "同拍 3——r2 的重算需求一直得不到满足",
+       "r2 继续等",
+       "0"
+      ],
+      [
+       "5",
+       "(r2,17)→OK",
+       "r2 以 resumed 重入：整段重算 17（16 prompt + 1 旧输出成了输入）",
+       "r2 已算 0→17 · resumed 增量走整体替换语义",
+       "2→0"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "抢占重试环必终止（至多 len(running) 轮）且不破坏账本一致性：被 FCFS 抢掉的队尾在本拍必然尚未记账，无需回滚。",
+    "argument": "单调量 = len(self.running)：每轮 None 后 pop 一个成员（严格 −1、非负）→ 至多初始长度轮后 preempted_req == request → break（L598-L600）。无回滚的论证：FCFS 下 running 列表序 = 入序，循环 req_index 递增，队尾 index ≥ req_index → 队尾要么还没被本轮处理（未记账）、要么就是当前请求（同样未记账）→ 抢它不会留下已入账的孤儿条目（真实源码里需要回滚 token/块/预算的 PRIORITY 分支 L590-L613 恰恰打破了这条性质——本精简版随 dossier.delete 第 6 条删去，只留 FCFS）。"
+   },
+   "quantified": "每轮抢占 O(1)（list.pop 尾）；最坏一拍 O(len(running)) 轮。被抢代价 = 整段重算 O(num_tokens)：本例 r2 重算 17 token（16 prompt + 1 输出——输出 token 成了重跑输入）；真实系统有前缀缓存兜底时「重算」常是「部分重算」（被 free 的满块留哈希，get_computed_blocks 重新命中，ch15），最坏（块被逐出）才是完整 prefill 重来（WC4/engine-loop 卡 why_chains[3]）。v1 从首提交起只有 recompute、无 swap（git 6c5af09b3 证据，engine-loop 卡 history_evidence）。",
+   "figure_specs": [],
+   "caveats": [
+    "拍 5 的 r1 退场是驱动侧手工模拟（running.remove + kv free + finished_req_ids 登记，模拟 ch9/ch11 的 ⑤ 拍完成路径，trace manual_retire_note 字段）——⑤ 拍生命周期不在本章精简范围。",
+    "抢占深挖（stale 输出/恢复时序/PRIORITY 变体）归 ch11；本章只到『None → 抢队尾 → 重试 → preempted_reqs 成为阶段二守卫条件』因果层。"
+   ]
+  },
+  {
+   "mechanism_id": "m8",
+   "intuition": "刚发生过让座事件的剧场这一场不再检票：门口挂「暂停入场」牌（守卫 not preempted_reqs），哪怕门口还有空位、演出还有余量——因为「刚抢过人」本身就是内存紧张的信号，这时候再放新人进来等于制造下一轮让座。另外剧场还有消防限容（max_num_running_reqs）：在座人数到顶，门口队伍再长也不放。",
+   "worked_example": {
+    "params": {
+     "场景 a（守卫）": "块池 3 块：r1 16-token（1 块）+ r2 32-token（2 块）在跑，r3 16-token 排队；拍 2 r1 需第 2 块 → 抢 r2 → 抢占拍",
+     "场景 b（封顶）": "max_num_seqs=2，三条 16-token prompt 排队",
+     "机制本体": "if not preempted_reqs and self._pause_state == PauseState.UNPAUSED（L684）+ num_running >= max_num_running_reqs → break（L690-L692）",
+     "驱动脚本": "traces/run_m8_guard_caps.py → traces/m8_guard_caps.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m8_guard_caps.json",
+    "table": {
+     "columns": [
+      "场景·拍",
+      "本拍抢占？",
+      "waiting 队列",
+      "allocate 实调",
+      "收新结果",
+      "解读"
+     ],
+     "rows": [
+      [
+       "a·拍2",
+       "是（r2）",
+       "[r3]",
+       "(r1,1)→None；(r1,1)→OK",
+       "0 个——守卫关闸，r3 连被 peek 都没有",
+       "空闲 1 块、预算余 2047 也绝不收"
+      ],
+      [
+       "a·拍3",
+       "否",
+       "[r2, r3]",
+       "(r1,1)→OK；(r2,33)→None",
+       "0 个——r2 在队头需 3 块 > 1 → break",
+       "被抢者 prepend 回队头，压住 r3"
+      ],
+      [
+       "a·拍5",
+       "否",
+       "[r3]",
+       "(r2,33)→OK；(r3,16)→None",
+       "r2 resumed 33；r3 仍被拒（r2 用光 3 块）",
+       "队头优先：老请求先恢复"
+      ],
+      [
+       "b·拍1",
+       "否",
+       "[r3]",
+       "——",
+       "收 r1、r2 后 num_running=2 ≥ cap → break",
+       "r3 留 waiting"
+      ],
+      [
+       "b·拍2",
+       "否",
+       "[r3]",
+       "——",
+       "r1/r2 各 decode 1；仍在座 2 ≥ cap",
+       "r3 继续等"
+      ],
+      [
+       "b·拍3",
+       "否",
+       "[]",
+       "——",
+       "r1 退场后 num_running 1 < 2 → r3 进批 16",
+       "腾位才收"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "抢占拍内 waiting 只进不出（零收新）——守卫作用域恰一拍；封顶判据 num_running ≥ max_num_running_reqs 使 len(running) 恒 ≤ cap（断言 L1113）。",
+    "argument": "守卫：preempted_reqs 在阶段一内只增不减（每轮抢占 append），阶段二入口是唯一收新通道且要求 not preempted_reqs（L684）→ 抢占拍构造性零准入；下一拍 preempted_reqs 重新初始化为空列表（L194）→ 恢复收新。单调量：守卫不跨拍累积，代价恰为「突发新请求至少多等一拍」。封顶：WAITING 循环每轮先查 num_running ≥ max（L690-L692）再评估队头 → 收新使 len(running) 至多 +1 且只在 < cap 时发生 → 不变式 len(running) ≤ cap 由构造保持（断言兜底）。"
+   },
+   "quantified": "守卫的代价下界 = 1 拍（本例 a·拍2：空闲 1 块 + 预算 2047 token 剩余都救不了 r3 的入场）；一拍 ≈ 预算量级 token 的一次 forward（几十 ms 量级——不把具体毫秒当常数，正文以预算口径表述）。cap 默认 128（DEFAULT_MAX_NUM_SEQS，config L44），服务端 256/1024（arg_utils L2541-L2563）。PAUSED_ALL 第三态把预算直接置 0（m18）——守卫的极端亲戚。",
+   "figure_specs": [
+    {
+     "figure_id": "ch10-fig-admission-gate-and-cap",
+     "template": "state-machine",
+     "l0_zoom": "放大 L0『调度 · 显存账本』列上半 Scheduler 框的「RUNNING 先行/抢占」格到「WAITING 收新」格之间的闸门——即 L2 章图 center ② 拍片『preempted_reqs 空？』判定菱形与 ③ 拍片守卫行的机制展开。",
+     "claim": "两道门决定收不收新：① 本拍抢占过（preempted_reqs 非空）→ 整拍关闸——实测拍 2 里 r3 连一次 allocate 询问都没有，尽管空闲 1 块、预算剩 2047；② len(running) ≥ max_num_seqs → break——实测 cap=2 下 r3 等到有人退场才进。",
+     "numbers": [
+      {
+       "value": "a·拍2：r3 零 allocate 调用（r3_ever_asked_this_beat=false），空闲 1 块、预算余 2047",
+       "provenance": "traces/m8_guard_caps.json scenario_a_guard beats[1]（allocate_calls 仅 r1 两条 / free_blocks_after 1 / budget_left 2047）"
+      },
+      {
+       "value": "被抢者 r2 prepend 回队头：拍 3 waiting 序 [r2, r3]，r2 需 3 块 > 1 → break 挡住 r3",
+       "provenance": "traces/m8_guard_caps.json scenario_a_guard beats[2]（waiting_order / allocate_calls r2 33 None）"
+      },
+      {
+       "value": "b 场景：num_running 2/2 → r3 等两拍；r1 退场后拍 3 收 r3（16 token 全量）",
+       "provenance": "traces/m8_guard_caps.json scenario_b_cap beats 1-3（num_running / new_admissions）"
+      },
+      {
+       "value": "cap 默认 128（DEFAULT_MAX_NUM_SEQS，config/scheduler.py:L44）、服务端 256/1024",
+       "provenance": "vllm/config/scheduler.py:L44 + vllm/engine/arg_utils.py:L2541-L2563（impl 逐字，tests test_config_classvar_baselines）"
+      }
+     ],
+     "caption_draft": "收新的两道闸（scheduler.py:L684 + L690-L692）：第一道问「本拍抢过人吗」——抢过就整拍不检票（实测 r3 连被询问都没有，尽管有 1 块空闲和 2047 预算剩余；被抢的 r2 还 prepend 回队头压住了 r3 两拍）；第二道问「在座满了吗」——len(running) 到 max_num_seqs 就 break，r3 等到 r1 退场才进场。两道闸都把延迟压力推向 TTFT 一侧。",
+     "illustrator_notes": "状态机图：左态『阶段一 RUNNING』→ 菱形『preempted_reqs 空？』→ 否 → 右上态『整拍不收新（闸关，标暂停检票牌图标）』/ 是 → 菱形『num_running < max？』→ 否 → 右下态『break（限容满）』/ 是 → 底态『收新（闸开）』。三个态旁各贴一行实测小字（a·拍2 / a·拍3 / b·拍1-3 的数字）。闸关态用暖色强调、闸开态用青色。"
+    }
+   ],
+   "caveats": [
+    "b·拍3 的 r1 退场为驱动侧手工模拟（trace manual_retire_note），对应 ch9/ch11 的 ⑤ 拍完成路径。",
+    "PAUSED_ALL 不在守卫图里画（m18 一句带过，弹性场景归 ch39）。"
+   ]
+  },
+  {
+   "mechanism_id": "m9",
+   "intuition": "老顾客第二次来，前几家店吃过的菜直接免单：get_computed_blocks 查前缀缓存，命中多少 token 就当「已经算过多少」——被减数直接缩小，剩下的才是要付的账。调度器只消费一个整数（命中数），链式哈希怎么算出这个数归 ch15。",
+   "quantified": "消费现场（scheduler.py:L744-L766）：num_computed_tokens==0 时调 get_computed_blocks，命中 token 数当『已算』——num_new_tokens = num_tokens − 命中数（L879），准入落位时 num_computed_tokens 先记命中数（L1075）、乐观推进再 += 实排（L1330）。行为证据（精简版 kv 契约面默认 0 命中，测试打桩注入 64 命中）：tests/test_scheduler.py test_hit_tokens_counted_as_computed——256-token prompt 命中 64 → 本拍只排 256−64=192，schedule() 返回时账面 64 命中 + 192 已排 = 256 全量。上限约定（engine-loop 卡 contracts）：max_cache_hit_length = num_tokens − 1——全命中也必须重算最后一个 token 才有 logits（kv_cache_manager.py:L253-L259）。",
+   "figure_specs": [],
+   "caveats": [
+    "dossier m9 needs_worked_example=false（黑盒调用）：本章不挖哈希内部（ch15）；命中折算的消费语义证据在测试侧，不另起驱动。"
+   ]
+  },
+  {
+   "mechanism_id": "m10",
+   "intuition": "切蛋糕的三道闸：刀最长能切多长（long_prefill_token_threshold）、允不允许切着吃（enable_chunked_prefill）、盘子里还剩多少（token_budget）。同一块 70-token 的蛋糕，三道闸的不同配置给出三种命运：按盘切 32+32+6、按刀切 16×4+6、或者干脆整块拒收（不切且装不下就一拍都不收）。",
+   "worked_example": {
+    "params": {
+     "蛋糕": "单条 70-token prompt",
+     "三种配置": "a) 预算 32、threshold 0、chunked 开；b) 预算 2048、threshold 16、chunked 开；c) 预算 32、threshold 0、chunked 关",
+     "机制本体": "num_new = num_tokens − num_computed → threshold 钳制（L899-L901）→ chunked 关且超预算 break（L903-L911）→ min(token_budget)（L913）",
+     "驱动脚本": "traces/run_m10_chunk_gates.py → traces/m10_chunk_gates.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m10_chunk_gates.json",
+    "table": {
+     "columns": [
+      "场景·拍",
+      "原始差",
+      "闸1 threshold",
+      "闸2 chunked 开关",
+      "闸3 min(预算)",
+      "本拍 chunk",
+      "拍后已算"
+     ],
+     "rows": [
+      [
+       "a·拍1",
+       "70",
+       "0（不钳）",
+       "开",
+       "32",
+       "32",
+       "32"
+      ],
+      [
+       "a·拍2",
+       "38",
+       "0（不钳）",
+       "开",
+       "32",
+       "32",
+       "64"
+      ],
+      [
+       "a·拍3",
+       "6",
+       "0（不钳）",
+       "开",
+       "6",
+       "6",
+       "70"
+      ],
+      [
+       "b·拍1",
+       "70",
+       "16",
+       "开",
+       "不截（16 < 2048）",
+       "16",
+       "16"
+      ],
+      [
+       "b·拍5",
+       "6",
+       "不钳（6 < 16）",
+       "开",
+       "6",
+       "6",
+       "70"
+      ],
+      [
+       "c·拍1",
+       "70",
+       "0",
+       "关且 70 > 32 → break",
+       "——",
+       "未进批",
+       "0"
+      ],
+      [
+       "c·拍2",
+       "70",
+       "0",
+       "同",
+       "——",
+       "未进批",
+       "0"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "三闸保持每个 chunk ∈ [1, min(原始差, threshold?, 预算)] 且非空（assert num_new_tokens > 0，L914）；chunked 关时要么整段收、要么整拍不收——不存在半截批。",
+    "argument": "单调量 = num_computed_tokens：每拍 chunk ≥ 1 全额乐观计入 → 已算严格递增、以 num_tokens 为上界 → 有限拍追平（⌈差/min(闸)⌉ 拍）。非空性：入环前提 token_budget > 0 且原始差 > 0（waiting 里的请求必有未算 token），三闸全是 min 型下钳不会把正数钳成 0（threshold=0 表示禁用而非钳到 0，判据 0 < threshold）；chunked 关分支在超预算时直接 break——把「装不下」显式化为一拍零收，而不是偷偷切一块。"
+   },
+   "quantified": "⌈70/32⌉=3 拍（预算闸）vs ⌈70/16⌉=5 拍（threshold 闸）vs 0 拍（关闸饿等）。threshold 的用途：限制单拍 chunk 上限以护 TPOT（每拍插入的计算量被钉住），代价是 prefill 拍数变多；v1 默认 enable_chunked_prefill=True（config/scheduler.py:L74——与 v0 时代的显式开关相反，encoder-decoder 才被关）即把「TTFT 换 TPOT」这笔交易设为默认（Sarathi-Serve arXiv:2308.16369 混相批理论，外证）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch10-fig-three-gates",
+     "template": "flow",
+     "l0_zoom": "放大 L0『调度 · 显存账本』列上半 Scheduler 框的「chunked prefill 切块」格——即 L2 章图 center ④ 拍片『切块三闸』的机制展开。",
+     "claim": "同一 70-token prompt 过三道串行闸的三种命运：预算闸切成 [32,32,6]、threshold 闸切成 [16,16,16,16,6]、chunked 关闸则每拍 break 整体拒收——三闸全是 min 型下钳，只决定「这一拍切多大」，不改变追赶目标。",
+     "numbers": [
+      {
+       "value": "场景 a：chunk [32, 32, 6]，原始差 70/38/6",
+       "provenance": "traces/m10_chunk_gates.json scenario_a_budget_gate（chunk_sizes 与 beats raw_gap）"
+      },
+      {
+       "value": "场景 b：threshold 16 → chunk [16,16,16,16,6]，拍 5 差 6 < 16 不再钳",
+       "provenance": "traces/m10_chunk_gates.json scenario_b_threshold_gate（beats after_threshold/final_chunk）"
+      },
+      {
+       "value": "场景 c：chunked 关 + 70 > 32 → 每拍 break，状态一直 WAITING、已算恒 0",
+       "provenance": "traces/m10_chunk_gates.json scenario_c_chunked_off（chunk_sizes [null]、beats status WAITING/computed 0）"
+      },
+      {
+       "value": "闸序行号：threshold L899-L901 → 开关 break L903-L911 → min(token_budget) L913 + assert L914",
+       "provenance": "dossier embed_excerpts（impl scheduler.py # SOURCE 同锚）"
+      }
+     ],
+     "caption_draft": "切块三闸（scheduler.py:L874-L914）：num_new_tokens 先算原始差（num_tokens − 已算），再依次过「刀长」threshold（16 把 70 钳成 16）、「允不允许切」开关（关且超预算 → 整拍 break，70-token prompt 在 32 预算下一拍都不收）、「盘余」min(token_budget)（32 预算把 70 钳成 32）。三闸只决定本拍切多大——三种配置给出 [32,32,6]、[16,16,16,16,6] 和永远 0。",
+     "illustrator_notes": "横向三段闸门管道：入口「原始差」数字球（70）滚入 → 闸1 threshold（刀片图标，标注 0=不钳/16）→ 闸2 开关（闸刀图标，关=旁路直通 break 出口）→ 闸3 预算（量杯图标 min(token_budget)）→ 出口 chunk。管道下方三条走线各配一行 chunk 序列条（a 三段/b 五段/c 空转箭头循环回 waiting）。v1 默认开关=开 用高亮标注。"
+    }
+   ],
+   "caveats": [
+    "threshold 闸在 RUNNING 侧续 chunk 时同样生效（scheduler.py:L521-L522 同一钳制）——b 场景拍 2-5 实际走 RUNNING 阶段，trace 的 beats 记录不分侧，正文讲时点明。"
+   ]
+  },
+  {
+   "mechanism_id": "m11",
+   "intuition": "酒店前台接团前先确认「整团住到退房都够房间」（整序列准入门），而不是「今晚够就先接」——先接了才发现后面住不下，只能把整团请出去重新找酒店（recompute 抢占），已住的几晚全白费。另一条铁律：门口拒绝客人时绝不拆已在住的房间（WAITING 侧 None → break，绝不触发抢占）。",
+   "worked_example": {
+    "params": {
+     "块池": "4 块 × 16 = 64 token 槽位；r1/r2 各 16-token（各 1 块）在跑；r3 = 48-token prompt（整条需 3 块，空闲只有 2）",
+     "两种门": "a) scheduler_reserve_full_isl=True（默认）：整序列检查；b) False：只查本 chunk；b 场景预算 64 → 首 chunk = min(48, 64−16−16) = 32",
+     "机制本体": "allocate_slots(full_sequence_must_fit=…)（L982）→ None → break（L987-L994，WAITING 绝不抢占）",
+     "驱动脚本": "traces/run_m11_admission_gate.py → traces/m11_admission_gate.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m11_admission_gate.json",
+    "table": {
+     "columns": [
+      "场景·拍",
+      "准入判定",
+      "r3 状态/已算",
+      "在场 r1/r2",
+      "代价"
+     ],
+     "rows": [
+      [
+       "门开·拍2",
+       "整条 48 需 3 块 > 空闲 2 → None → break",
+       "WAITING / 0",
+       "无恙（0 抢占）",
+       "0 浪费"
+      ],
+      [
+       "门开·拍3",
+       "同——每拍重试每拍拒",
+       "WAITING / 0",
+       "无恙",
+       "0 浪费"
+      ],
+      [
+       "门关·拍1",
+       "首 chunk 32 需 2 块 ≤ 2 → 收",
+       "RUNNING / 32",
+       "r1、r2 照跑",
+       "暂 0"
+      ],
+      [
+       "门关·拍2",
+       "续 chunk 需 1 块 > 0 → 自抢占（FCFS 队尾 = r3 自己）",
+       "PREEMPTED / 0",
+       "无恙",
+       "32 token prefill 白算"
+      ],
+      [
+       "门关·拍3",
+       "重入 48 需 3 块 > 2 → 拒",
+       "PREEMPTED / 0",
+       "无恙",
+       "r3 悬置"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "WAITING 侧 allocate None 的唯一后果是 break——不改任何在途请求状态（零抢占），被拒者完整留在 waiting 等下一拍重试。",
+    "argument": "该分支的全部动作是一条 break（impl 对应 L987-L994 删枝后仅剩 break；真实源码同位置只多一个 encoder 缓存 un-touch）：不触 self.running、不触 preempted_reqs、不扣 token_budget（尚未入账）→ 调度器状态除「本拍少收一个」外零变化（对照 m7：RUNNING 侧 None 进抢占环）。重试活性：waiting 队列不动，下一拍同判据重评——若磁盘……不，块池状况变化（有人退场/释放）即被收——本例 a 场景每拍重试可见。"
+   },
+   "quantified": "门开 = 0 token 浪费、在座请求零打扰；门关最坏 = 白算整个首 chunk（本例 32 token）+ 一次自抢占 + 被拒悬置。「首 chunk 装得下 ≠ 整条装得下」即 WC4：chunked prefill 只查首 chunk 的旧做法是死锁/中途 OOM 的温床（issue #39734；v0.27.1 由 scheduler_reserve_full_isl 默认 True 回应，config/scheduler.py:L130-L134 注释原话 Prevents over-admission and KV cache thrashing with chunked prefill）。块数怎么算/水位怎么扣归 ch13/14。",
+   "figure_specs": [],
+   "caveats": [
+    "m11 needs_figure=false：反差（门开 vs 门关）由 m10 图的闸2 分支标注 + 本表承担；全序列门的块数算术归 ch14。"
+   ]
+  },
+  {
+   "mechanism_id": "m12",
+   "intuition": "检票后落座：pop 出 waiting、name 牌挂进 running、状态 WAITING→RUNNING、账本记下命中数、这一拍吃的 chunk 记进 _inflight_prefills——一串落位动作在十几行里一口气完成，没有中间态。",
+   "quantified": "落位点 scheduler.py:L1022-L1082：pop_request（L1022）→ running.append（L1055）→ 状态分流 WAITING→scheduled_new_reqs / PREEMPTED→scheduled_resumed_reqs（L1060-L1065，else raise RuntimeError）→ get_blocks + num_scheduled_tokens + token_budget −= chunk（L1069-L1073）→ status=RUNNING + num_computed_tokens=命中数（L1074-L1075）→ 未完 chunk 记 _inflight_prefills（L1080-L1082）。行为证据：m7 trace 拍 5（r2 resumed：running_order ['r2']、resumed_req_ids ['r2']、已算 0→17）；m1 trace 拍 2（r4 new：new_req_ids ['r4']、is_prefill_chunk true）。dossier m12 needs_worked_example=false——落位动作在各驱动 trace 里作为伴随证据记录，不单独立表。",
+   "figure_specs": [],
+   "caveats": [
+    "load_kv_async 的 WAITING_FOR_REMOTE_KVS 分支（L1023-L1053）已随 connector 删除（dossier.delete 第 1 条）——本章默认路径直接走 running.append。"
+   ]
+  },
+  {
+   "mechanism_id": "m13",
+   "intuition": "打烊前对账：账本合计不超额、余额不为负、在座人数不超容、排班表不超过在座人数——四条断言一拍一查，任何一条破了引擎当场 AssertionError，绝不带病发车。",
+   "quantified": "scheduler.py:L1108-L1119 四断言：Σ num_scheduled_tokens ≤ max_num_scheduled_tokens、token_budget ≥ 0、len(running) ≤ max_num_running_reqs、调度数（new+resumed+running）≤ len(running)。全部 11 份驱动 trace 每拍隐式验证（schedule() 正常返回 = 断言全过；m3 trace 显式记录 sum_le_budget_assert/conservation_asserts_passed 字段）。这是「批大小 = token 数」的机器自检形态——守恒是构造出来的（m3 不变量的归纳链），断言是最后一道保险丝。",
+   "figure_specs": [],
+   "caveats": [
+    "dossier m13 needs_worked_example=false：断言行为由每份 trace 的「正常返回」整体背书，不单独立表。"
+   ]
+  },
+  {
+   "mechanism_id": "m14",
+   "intuition": "快递首件 vs 补件：新客户第一次发货要寄全套装备（整段 prompt、完整块表、采样参数），老客户后续只寄增量（这一拍的新块、几个 token）——收件方（worker）把全套装备存在自己仓库里，从此每一拍只收 diff。",
+   "quantified": "二分现场（scheduler.py:L1131-L1163 + output.py:L193-L205）：scheduled_new_reqs = NewRequestData.from_request（首次全量：prompt_token_ids/sampling_params/block_ids，注释原话 We cache the request data in each worker process, so that we do not need to re-send it every scheduling step）；scheduled_cached_reqs = CachedRequestData（增量：new_block_ids/num_computed_tokens，注释 we only send the diff）；prev_step_scheduled_req_ids 每拍刷新（L1160-L1163）判定「上拍没调度过的才补 all_token_ids」（L1448-L1450）。实测量级（m1 trace 拍 2 wire_payload）：新 r4 首发全量 64 token + 2 块表项 + 采样参数；三个老请求合计只发 3 个「1 token」记账 + 0 新块 + 空 token 表。深挖（持久批次/差量协议/worker 侧缓存）归 ch18。",
+   "figure_specs": [
+    {
+     "figure_id": "ch10-fig-new-full-cached-diff",
+     "template": "before-after",
+     "l0_zoom": "放大 L0『调度 · 显存账本』列上半 Scheduler 框的「增量下发 new/cached」格——即 L2 章图 center ⑦ 拍片『SchedulerOutput：new 全量 / cached 增量』的机制展开（产出面 → ch18 的调度器侧半边）。",
+     "claim": "同一拍里两种包裹：首次调度的 r4 发全量（64 个 prompt token + 2 个块表项 + 采样参数），三个在途请求只发增量（各 1 个 token 记账、0 个新块、连 token 表都不带）——worker 缓存全量、调度器只发 diff。",
+     "numbers": [
+      {
+       "value": "新 r4 首发全量：prompt_token_ids 64 个 + block_ids 2 项 + 采样参数 1 份",
+       "provenance": "traces/m1_contract.json beats[1].wire_payload.new_reqs（prompt_token_ids_len 64 / block_ids_len 2 / carries_sampling_params true）"
+      },
+      {
+       "value": "三个老请求增量：各 num_scheduled 1、new_block_ids 各 0 项、all_token_ids 表空",
+       "provenance": "traces/m1_contract.json beats[1].wire_payload.cached_reqs（num_scheduled_per_cached [1,1,1] / new_block_ids_lens [[0],[0],[0]] / all_token_ids_keys []）"
+      },
+      {
+       "value": "注释原文：We cache the request data in each worker process / we only send the diff",
+       "provenance": "vllm/v1/core/sched/output.py:L194-L200（dossier embed_excerpts；impl output.py # SOURCE 同锚）"
+      },
+      {
+       "value": "resumed 请求的 new_block_ids 是整体替换而非追加（output.py:L118-L121 注释）",
+       "provenance": "vllm/v1/core/sched/output.py:L118-L121 注释（dossier WC5 cost；m7 trace 拍 5 resumed_req_ids ['r2'] 为行为伴随证据）"
+      }
+     ],
+     "caption_draft": "首件全量、补件只发 diff（scheduler.py:L1131-L1163 + output.py:L193-L205）：拍 2 的 SchedulerOutput 里，新到的 r4 拿到的是整箱装备——64 个 prompt token、2 项块表、采样参数，worker 从此替它保管；三个 decode 的老请求每人只有一张 1 token 的记账条，块表和 token 表一概不发（上拍调度过的连 all_token_ids 都省）。IPC 的浪费被压到每拍真正变化的那一点。",
+     "illustrator_notes": "左右对照两栏：左「首次调度 NewRequestData」画一只装满的货箱（三层：prompt token 条 64 格 / 块表 2 项 / 采样参数卡），标注 worker 仓库存档图标；右「已调度 CachedRequestData」画三张窄票据（各 1 token 记账、0 新块、无 token 表），中间箭头标「只发 diff」。底部一行：resumed 特例小注（整体替换语义 → ch18）。"
+    }
+   ],
+   "caveats": [
+    "dossier m14 needs_worked_example=false：实测量级取自 m1 trace 的 wire_payload 伴随记录（同一拍两种包裹并排可数），不另立表。"
+   ]
+  },
+  {
+   "mechanism_id": "m15",
+   "intuition": "记账先于发货：schedule() 刚返回、GPU 还一个数没算，账本上已经写好「本拍已算 n」——因为下一车货（下一拍的调度）只看账本不看货。发货出错（spec token 被拒）再回头冲账（update_from_output 调整，⑤ 拍）。这是用「乐观」换「prefill 请求下一拍立即能再被调度」。",
+   "worked_example": {
+    "params": {
+     "A 段（chunk 生命周期）": "预算 16、40-token prompt → chunks [16, 16, 8]",
+     "B 段（集合换新不 clear）": "块池 2、两条 16-token prompt，拍 2 抢占 a2",
+     "机制本体": "_update_after_schedule：computed += n / in_flight += n / is_prefill_chunk 标记 / finished·preempted 集合换新（scheduler.py:L1317-L1343 + L1361-L1365）",
+     "驱动脚本": "traces/run_m15_optimistic.py → traces/m15_optimistic.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m15_optimistic.json",
+    "table": {
+     "columns": [
+      "段·拍",
+      "本拍 chunk",
+      "拍前已算",
+      "schedule() 返回时已算",
+      "in_flight 累计",
+      "is_prefill_chunk",
+      "_inflight_prefills"
+     ],
+     "rows": [
+      [
+       "A·拍1",
+       "16",
+       "0",
+       "16",
+       "16",
+       "True",
+       "在"
+      ],
+      [
+       "A·拍2",
+       "16",
+       "16",
+       "32",
+       "32",
+       "True",
+       "在"
+      ],
+      [
+       "A·拍3",
+       "8",
+       "32",
+       "40",
+       "40",
+       "False",
+       "移出"
+      ],
+      [
+       "B·拍2",
+       "a1 领 1（抢 a2）",
+       "——",
+       "输出持旧集 {a2}；调度器侧已换新空集（same_object=True）",
+       "——",
+       "——",
+       "——"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "乐观推进不越界：推进后 num_computed_tokens ≤ num_tokens_with_spec + 占位（is_prefill_chunk 恰是「还没追平」的判定）；输出的 finished/preempted 集合与调度器当前集合隔离（换新不 clear）。",
+    "argument": "界：入账 n ≤ 差距（min 钳制，m3）且 computed 推进的是「差距的那部分」→ 归纳：拍首 computed ≤ with_spec，拍末 computed + n ≤ with_spec + 差距 = with_spec + (with_spec − computed)… 直接论证：computed_末 = computed_初 + n ≤ computed_初 + (with_spec − computed_初) = with_spec（n ≤ 差距）。is_prefill_chunk = computed < num_tokens + 占位（L1335-L1337）→ 追平即翻 False、移出 _inflight_prefills。集合隔离：_update 末尾 self.reset_preempted_req_ids = set()（换新对象，L1361-L1365），SchedulerOutput 持旧对象引用 → 互不影响（trace B：same_object=True 且调度器侧为空、输出侧仍 {a2}）；若就地 clear() 则输出跟着变空——worker 就收不到抢占通知（注释原话 We should not just clear() here because it will also affect the scheduler output）。"
+   },
+   "quantified": "推进 O(1) 每记账成员、无任何 GPU 同步等待。注释三条理由（L1317-L1327 原文）：①本拍 output 要用原始数定输入；②让 prefill 请求下一拍立即再可调度（chunked prefill 连拍的关键）；③被拒时在 update_from_output 回调。async 版乐观跨度更大、num_output_placeholders 由此而生（ch12）；本精简版无 ⑤ 拍故 in_flight 只增（trace drain_note 标注），验证记账方向。",
+   "figure_specs": [
+    {
+     "figure_id": "ch10-fig-ledger-before-gpu",
+     "template": "before-after",
+     "l0_zoom": "放大 L0『调度 · 显存账本』列上半 Scheduler 框的「账本」本体——即 L2 章图 center ⑦ 拍片『GPU 还没算先记账 · is_prefill_chunk 标记』的机制展开。",
+     "claim": "schedule() 返回的那一刻，账本已推进而 GPU 未动：40-token prompt 三拍间已算 0→16→32→40 全部发生在 schedule() 内部（in_flight 同步累计 16/32/40），第三拍 is_prefill_chunk 翻 False、移出 _inflight_prefills；抢占拍的 preempted 集合「换新不 clear」——输出持旧集 {a2}，调度器侧已是新空集。",
+     "numbers": [
+      {
+       "value": "三拍已算 0→16→32→40（schedule() 返回时读数），chunk [16,16,8]",
+       "provenance": "traces/m15_optimistic.json part_a_chunk_lifecycle beats（computed_after_schedule_returns / chunk_sizes）"
+      },
+      {
+       "value": "in_flight 累计 16/32/40；is_prefill_chunk True/True/False；第三拍移出 _inflight_prefills",
+       "provenance": "traces/m15_optimistic.json part_a_chunk_lifecycle beats（in_flight_after / is_prefill_chunk / in_inflight_prefills）"
+      },
+      {
+       "value": "集合换新：输出侧 {a2} 不变、same_object=True、调度器侧 []",
+       "provenance": "traces/m15_optimistic.json part_b_set_swap（beat2_preempted_on_output / output_set_is_scheduler_set_object / scheduler_set_after）"
+      },
+      {
+       "value": "注释三条理由原文（①输入用原始数 ②下一拍立即可再调度 ③被拒回调）",
+       "provenance": "vllm/v1/core/sched/scheduler.py:L1317-L1327（dossier embed_excerpts；impl # SOURCE 同锚）"
+      }
+     ],
+     "caption_draft": "账本先记、GPU 后算（scheduler.py:L1317-L1343）：三拍 chunk [16,16,8] 的已算读数在每次 schedule() 返回时就已到位（此刻没有任何执行调用），is_prefill_chunk 在追平拍翻 False 并移出在途集合——chunked prefill「下一拍立即续上」的全部秘密就在这十行注释里。抢占拍的集合「换新不 clear」：SchedulerOutput 握着旧集 {a2} 不受影响，调度器已换新空集——就地 clear 会让 worker 收不到通知。",
+     "illustrator_notes": "before-after 双栏：左「schedule() 返回时刻」——账本列（computed 16/32/40 递进三格）+ GPU 列（灰暗、标「未动」）；右「（对照）⑤ 拍之后」——GPU 列点亮、in_flight 归零方向箭头（标 ch9/ch11 范围，虚化）。底部小条：集合换新示意（两个 set 气泡：旧集 {a2} 连着 SchedulerOutput 箭头、新空集连着 scheduler，中间剪刀图标标「换新而非 clear」）。"
+    }
+   ],
+   "caveats": [
+    "本精简版无 ⑤ 拍（ch9/ch11 范围），in_flight 只增不降；真实同步引擎由 update_from_output 消耗——图上右栏以虚化对照呈现，数字不标。"
+   ]
+  },
+  {
+   "mechanism_id": "m16",
+   "intuition": "环形跑道上的混编接力：每圈老队员各跑固定 1 米（decode 每 token），新队员按剩余体力跑大段（chunk），跑完分配额就加入老队员行列——跑道每圈总里程有上限（预算），队员进进出出但从不停摆。这就是连续批处理的稳态：批的组成在变，批的「token 合计 ≤ 预算」不变。",
+   "worked_example": {
+    "params": {
+     "预算": "32；r1/r2 各 16-token prompt（拍 1 进批）、r3 64-token prompt（拍 2 到达）",
+     "机制本体": "is_prefill_chunk 请求继续在 RUNNING 阶段被切（L516-L520 同公式）+ decode 差恒 1 闭环（L1335-L1337 标记翻转）",
+     "驱动脚本": "traces/run_m16_steady_state.py → traces/m16_steady_state.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m16_steady_state.json",
+    "table": {
+     "columns": [
+      "拍",
+      "r1",
+      "r2",
+      "r3（chunk 燃尽轨迹）",
+      "批合计",
+      "预算",
+      "关键观察"
+     ],
+     "rows": [
+      [
+       "2",
+       "1",
+       "1",
+       "30（首 chunk）",
+       "32",
+       "32",
+       "RUNNING 先吃 2，新请求领剩余 30"
+      ],
+      [
+       "3",
+       "1",
+       "1",
+       "30（差 34 截到 30）",
+       "32",
+       "32",
+       "混合批再次打满——同一形状复现"
+      ],
+      [
+       "4",
+       "1",
+       "1",
+       "4（尾 chunk 收官）",
+       "6",
+       "32",
+       "r3 已算 64/64，is_prefill_chunk 翻 False"
+      ],
+      [
+       "5",
+       "1",
+       "1",
+       "1",
+       "3",
+       "32",
+       "纯 decode 稳态：三人各恰 1"
+      ],
+      [
+       "6",
+       "1",
+       "1",
+       "1",
+       "3",
+       "32",
+       "稳态延续——与拍 5 同形，差恒 1 的闭环自持"
+      ],
+      [
+       "7",
+       "1",
+       "1",
+       "1",
+       "3",
+       "32",
+       "稳态不变——差恒 1 的闭环"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "稳态闭环：decode 请求每拍差距恢复恰 1（回填 +1 与上拍乐观计入 +1 相抵）；chunk 请求差距每拍减 min(差距, 余额) ≥ 1，≤ ⌈剩余/预算⌉ 拍追平后并入 decode 集合；批合计恒 ≤ 预算。",
+    "argument": "decode 闭环（基例+归纳）：追平拍末 computed = with_spec；下一拍 ⑤ 拍回填使 with_spec +1 → 差距 = 1；本拍领 1、乐观计入 → 拍末又追平 → 归纳成立（差距是恢复型不变量，不是收敛量）。chunk 收敛：单调量 = 剩余差距（非负整数、每拍严格减 ≥1）→ 有限拍归零 → is_prefill_chunk 翻 False（L1335-L1337）→ 移出 _inflight_prefills，此后走 decode 闭环。批合计：m3 的守恒归纳链每拍重演。"
+   },
+   "quantified": "批组成通式：K 个 decode × 1 + Σ chunks ≤ B——本例 2×1+30 = 32 连续两拍、2×1+4 = 6、随后 3×1 = 3 永续；r3 的 prefill 占 3 拍（⌈64/30⌉ 按逐拍余额 30/30/4）。连续批处理的吞吐意义：每拍批都装着「当时正好有活干的每个人」，无空转拍（m6 空拍是全员无活的合法例外）——外证口径：Orca 的迭代级调度 + Sarathi-Serve 的混相批是这套稳态的两篇血统论文（数字见 m1 quantified）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch10-fig-steady-state-burn-down",
+     "template": "state-table",
+     "l0_zoom": "放大 L0『调度 · 显存账本』列上半 Scheduler 框整体（token 预算 + RUNNING 先行 + chunked 切块三格合观的稳态视图）——即 L2 章图 center ①-⑦ 拍片带 + loop 回环箭头『下一拍：chunk 未完的请求已住 running…decode 请求恰 1 token』的机制展开。",
+     "claim": "连续批处理稳态批组成表：五拍里 [1,1,30] → [1,1,30] → [1,1,4] → [1,1,1] → [1,1,1]——decode 的 1 恒定、chunk 按预算燃尽（30/30/4）后并入 decode，批合计恒 ≤ 32 且两拍恰好打满。",
+     "numbers": [
+      {
+       "value": "批合计轨迹 32/32/32/6/3/3/3（拍 1-7；拍 1 为两条 16 全量）",
+       "provenance": "traces/m16_steady_state.json batch_totals"
+      },
+      {
+       "value": "r3 chunk 序列 [30, 30, 4]（差 34 截到 30、追平 64/64）",
+       "provenance": "traces/m16_steady_state.json r3_chunk_sizes 与 beats note（差 34 → 截 30）/ ledger（computed 64）"
+      },
+      {
+       "value": "拍 5-7 纯 decode：三人各 1、合计 3",
+       "provenance": "traces/m16_steady_state.json beats 5-7 num_scheduled_tokens"
+      },
+      {
+       "value": "预算 32（示教刻度；服务端 8192/16384 见 m4）",
+       "provenance": "traces/m16_steady_state.json config.max_num_batched_tokens"
+      }
+     ],
+     "caption_draft": "稳态批的燃尽表（scheduler.py:L516-L520 + L1335-L1337）：预算 32 下，拍 2/3 的批是 [decode 1, decode 1, chunk 30]——两拍形状一模一样但那个 30 是同一请求在烧自己的 64-token prompt（差 34 被余额 30 截）；拍 4 尾 chunk 4 收官、拍 5 起三人全是 1。批的组成一直在换血，批的 token 合计从来没破 32——这就是「连续」二字的机器含义：没有人离场时需要等整批，也没有人进场时需要等空位。",
+     "illustrator_notes": "六行状态表（拍 2-7）：每行三格票据（r1/r2 恒窄条 1，r3 宽条 30/30/4/1/1/1 用渐变色随燃尽变窄）+ 行末合计徽章（32/32/6/3/3）+ 右侧预算竖标尺。r3 列画一条竖向「燃尽」虚线连接三拍宽条的对角，终点标 is_prefill_chunk=False 翻转。拍 5-7 三行同形——视觉上「稳态=形状不再变化」。"
+    }
+   ],
+   "caveats": [
+    "拍 1 的 32（两条 16 全量）也在 batch_totals 里但表从拍 2 起（r3 到达后的混合视图才是本机制主角）。"
+   ]
+  },
+  {
+   "mechanism_id": "m17",
+   "intuition": "两条候诊队列：普通号（waiting）和暂不能叫号的特殊号（skipped_waiting，阻塞态隔离）——FCFS 下普通号队头先叫；被抢占的病人插回普通队头（prepend），下次优先恢复。",
+   "quantified": "容器语义（request_queue.py:L75-L93，impl 逐字）：FCFSRequestQueue 是 deque 子类——add_request=append（队尾进）、pop_request=popleft（队头出）、peek_request 看队头不取、prepend_request=appendleft（抢占回队头靠它，ch11）。调度侧选队 _select_waiting_queue_for_scheduling（scheduler.py:L2064-L2066）：FCFS 时 skipped 优先。行为证据：m7 trace 拍 2 抢占后 waiting_order ['r2']（prepend 生效）；m8 trace 拍 3 waiting_order ['r2','r3']（被抢者压住后到者）。双队列的阻塞态细节（WAITING_FOR_* 三态）归 ch11（dossier m17 needs_worked_example=false）。",
+   "figure_specs": [],
+   "caveats": [
+    "本精简版 skipped_waiting 恒空（阻塞态来源子系统全删，dossier.delete 第 13 条），结构保留——行为证据全部来自 waiting 单队列。"
+   ]
+  },
+  {
+   "mechanism_id": "m18",
+   "intuition": "总闸拉掉：PAUSED_ALL 时预算直接置 0——两个循环的入环条件都含 token_budget > 0，于是 RUNNING 不跑、WAITING 不收，一拍空转返回（不是崩溃，是可恢复的暂停）。",
+   "quantified": "scheduler.py:L460-L462：`if self._pause_state == PauseState.PAUSED_ALL: token_budget = 0`——预算短路使 L484/L687 两个入环条件同时失效，schedule() 返回空批（m6 场景 B 的空拍同构）。PauseState 三态 UNPAUSED/PAUSED_NEW/PAUSED_ALL 定义在 interface.py:L24-L35。行为证据：tests/test_scheduler.py test_paused_all_short_circuits_budget。三态全貌与弹性场景归 ch39（dossier m18 needs_worked_example=false；本章只演示「预算可被外部归零」这一层）。",
+   "figure_specs": [],
+   "caveats": [
+    "守卫图（m8）只画 preempted 门与 cap 门，PAUSED_ALL 以 m8 图旁一行小字带过，不另立图。"
+   ]
+  },
+  {
+   "mechanism_id": "m19",
+   "intuition": "开机装配时的两行回落逻辑：调度器可发行的 token 上限（max_num_scheduled_tokens）没单独配就回落到 max_num_batched_tokens；在座请求上限（max_num_running_reqs）直接取 max_num_seqs——一个名字两个佩戴处。",
+   "quantified": "Scheduler.__init__（scheduler.py:L109-L114，impl 逐字）：max_num_running_reqs = scheduler_config.max_num_seqs；max_num_scheduled_tokens = config.max_num_scheduled_tokens if not None else config.max_num_batched_tokens。回落理由（config/scheduler.py:L56-L61 docstring）：spec 场景 worker 会往批里追加 token，调度器可发行量要更小——通常相等。行为证据：tests/test_scheduler.py test_max_num_scheduled_tokens_fallback_to_batched（dossier m19 needs_worked_example=false，装配事实测试背书）。",
+   "figure_specs": [],
+   "caveats": [
+    "num_sampled_tokens_per_step 的 diffusion 特判（恒 1，impl L67-L69）属另章——本章 max_model_len 保险钳里用到它，一句带过。"
+   ]
+  },
+  {
+   "mechanism_id": "m20",
+   "intuition": "「宁可不排，也不排不齐」：spec decode 场景里新 decode 请求要 pad 到统一的 spec 尺寸以保住 CUDA graph——预算不够把整条 pad 放进来时，源码选择整拍不收（break），而不是排一条尺寸不齐的进批毁了全批的图捕获。",
+   "quantified": "scheduler.py:L881-L897（真实源码，dossier WC2 cost 清单证据；随 dossier.delete 第 9 条从精简版删去——默认 num_spec_tokens=0 不触发）：条件 num_spec_tokens>0 且 num_new_tokens==1 且已有 running 无 prefill 时 pad 到 1+num_spec_tokens，若超预算或超 max_model_len 则注释原话 Prefer to not schedule than schedule un-padded → break。混相批代价的源码自供：统一 decode 优化的优先级高于多收一条请求。同类证据另一处：async 下不调度 partial draft tokens（L498-L500 注释 this prevents uniform decode optimizations）。归 ch33 展开。",
+   "figure_specs": [],
+   "caveats": [
+    "本章只在 WC2 代价清单里引用原文（外证=源码注释本身），不运行为它造场景——spec 簿记属 ch33。"
+   ]
+  }
+ ]
+}

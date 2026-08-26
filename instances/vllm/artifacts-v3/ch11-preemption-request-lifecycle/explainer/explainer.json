@@ -1,0 +1,670 @@
+{
+ "chapter_id": "ch11",
+ "chapter_title": "抢占与请求的一生",
+ "pin": "vLLM v0.27.1 (6e448d0ea)",
+ "trace_environment": "本章有精简版 companion（implementation/ 9 文件，只做减法、# SOURCE 逐行锚 v0.27.1，host 42 项测试绿，见 impl-notes.md）。十六个驱动脚本全部 host `python` 实跑、trace_source=run，脚本与原始输出在 explainer/traces/（纯控制流，无需 vLLM 运行时/GPU/容器）。与 pin 真实环境的结构性差异（均就近标注）：① KVCacheManager 是接口契约面而非分页器（dossier.key_classes「当黑盒契约面用」）：空闲块计数 + 每请求持有块账 + 满块哈希表；块 id 是合成顺序整数（真实=GPU 显存物理槽位，ch13）；cached_block_hashes 无 LRU 驱逐（真实 BlockPool 的驱逐/劈分/逆序归还归 ch13/15——m7 表格只演示『free 不清哈希→重命中』这半边，『块被逐出→全量重算』的最坏情况不可运行、归 ch15）；前缀命中块记 -1 占位（真实为引用计数+CoW，归 ch13/15）。② 同步 Scheduler 语义（num_output_placeholders 恒 0）：v0.27.1 服务默认实际是 AsyncScheduler/step_with_batch_queue（ch12）——m4 的 stale 协议、m14 的被抢当拍完成、m15 的 resumable 假终点都只在 async/流式下咬合，驱动脚本以『人工置 in_flight / 调度后输出回来前手工 _preempt_request / 手工置阻塞态』模拟 async 交错，每处明标；m4 P4 用同一 scheduler_output 二次回账模拟第 2 个在途步返回。③ 手工入队的请求（m6 的 older/newer）同时补登 requests 账本（add_request 的另一半）。④ 采样行为由驱动注入（真实在 worker 侧 sample_tokens，ch9 第 5 拍）；mid-prefill chunk 的空采样行按真实契约注入（model runner 对未完 chunk 返回空行）。⑤ FinishReason 是 IntEnum 且 STOP=0——观测代码判空须用 is not None（driver 踩过的坑，正文如引用注意）。⑥ 行号基线 v0.27.1（dossier/impl # SOURCE 已逐行核；本 explainer 新引用锚点均为 dossier 账本项或 impl-notes 1:1 Source Map 项）。外部证据（v0 swap 死法 git 旧档、watermark.sh 复现配置、#42117/#46066/#48245 修复史）只出现在 intuition/quantified/caveats 叙述里、明标出处，不进数值表。",
+ "figure_policy": "dossier needs_figure=true 八机制 m1/m2/m3/m4/m6/m7/m8/m10 各配 1 张 figure_spec，均为 FIGURE-SYSTEM §3.3 允许的正文机制图——每张 spec 的 l0_zoom 字段显式回答「它是 L0 哪一块的放大」：本章 l0_region=kv_column（L0 右列『调度 · 显存账本』青色列），l0_zoom『调度账本+状态机』= 该列上半 Scheduler 调度账本/状态机位的 ch11 放大区（第ⅢPart 行程区，ch10-12 打开；下半 KVCacheManager/BlockPool 归 Part IV ch13-16）。每张图 = L2 章图（cartography/l2-specs/ch11.json，已渲染 L2-ch11.png）center ①-⑧ RUNNING↔PREEMPTED 环的某拍片或 south 行某框的机制展开，非新架构画法、架构归属回指 L0/L2。开篇图=本章 L2 章图（Map 站职责，gen_L2 已渲染），不归本 explainer。其余机制不提新图：m5 守卫 why 由 m1 图的 WAITING 侧对照小框 + m5 表格承担（dossier m5 needs_figure=false）；m9 resumed 协议用 m7 图 + 正文对照表（m9 needs_figure=false）；m11-m15/m17/m19/m20 均流程/协议事实，L2 south 行（update_from_output 热循环 / check_stop 五连判 / RequestStatus 状态机 / abort 外部死法框）与并排代码引文（dossier embed_excerpts 已备）承担。",
+ "mechanisms": [
+  {
+   "mechanism_id": "m1",
+   "intuition": "食堂拼桌：你要的位子不够时不是站着干等，而是请最晚入座的那桌让位，让完立刻再试一次；如果让来让去只剩下自己还没位子，这一轮干脆不吃（整拍放弃），去门口排第一个（waiting 队头）等下一轮。而门口新来的客人分不到位子时只会继续排队，绝没有『为了给新客腾位赶走堂食客』的事。",
+   "worked_example": {
+    "params": {
+     "池": "场景 A 4 块 × block_size 16；场景 B 1 块（唯一块）",
+     "请求": "A：r1/r2/r3 各 16-token prompt（token id 互不重叠防哈希串台）；B：单请求 16-token",
+     "机制本体": "scheduler.py:L575-L630 抢占重试环（impl 逐字保留，含 preempted_req==request 自我放弃与 new_blocks None 整拍 break）",
+     "驱动脚本": "traces/run_m1_preempt_ring.py → traces/m1_preempt_ring.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m1_preempt_ring.json",
+    "table": {
+     "columns": ["拍", "allocate 调用序列 (req,ask)→结果", "动作", "池空闲", "本拍被抢", "本拍调度"],
+     "rows": [
+      ["A-1", "(r1,16)→OK,(r2,16)→OK,(r3,16)→OK", "三请求首拍全量准入", "4→1", "[]", "{r1:16,r2:16,r3:16}"],
+      ["A-2", "(r1,1)→OK,(r2,1)→None,(r2,1)→OK", "r1 领走末块；r2 差 1 → 抢队尾 r3 腾块 → 原样重试成功", "1→0", "[r3]", "{r1:1,r2:1}"],
+      ["A-3", "(r1,1)→OK,(r2,1)→OK,(r3,1)→None", "r3 恢复重命中 16 只差 1 新块 > 空闲 0：None 只 break，绝不抢占", "0", "[]", "{r1:1,r2:1}"],
+      ["B-2", "(r1,1)→None", "抢到自己（唯一在场者）→ break 整拍放弃", "0→1", "[r1]", "{}"],
+      ["B-3", "(r1,1)→OK", "下一拍经 WAITING 准入恢复：重命中 16+补 1（resumed）", "1→0", "[]", "{r1:1}"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "抢占重试环必在有限轮内终止，且终止后要么本请求拿到块、要么整拍放弃（new_blocks 仍 None → break 出整个 RUNNING 循环）。",
+    "argument": "环每迭代一次必 self.running.pop() 一个成员——环内对 running 只 pop 不 append，len(running) 是严格递减的自然数单调量 → 至多初始 len(running) 轮后队尾轮到 request 自身，触发 preempted_req==request 的 break（源码注释 'No more request to preempt'）；另一出口是某轮重试 allocate 成功——每次 pop 必先 free 一份块，free 只增不减，需求不变，free 越过需求即成功。"
+   },
+   "quantified": "本例 4 块池、3 请求即触发 1 次抢占；放弃≠死亡：B-2 整拍放弃后 B-3 同一请求带着 16 命中+1 补算回来。真实刻度：抢占在 v1 是设计内的稀有事件而非异常——v0.27.1 用两层护栏压频率（scheduler_reserve_full_isl 默认 True 防 mid-prefill 抢占、watermark 可配压 decode 抖动，config/scheduler.py:L130-L141，见 m8）；官方 decode-heavy 复现里未开护栏时呈『短时超收→池尽→抢占→重 prefill→再抢占』循环（benchmarks/kv_cache_watermark.sh:L7-L16 原话）。B-2 的细节：即使自己 free 后池里已有 1 块、算术上够用，环也不在本拍重试——恢复统一走下一拍 WAITING 准入（整序列门+水位都在那条路上），语义与账本才一致。",
+   "figure_specs": [
+    {
+     "figure_id": "ch11-fig-preempt-retry-ring",
+     "template": "flow",
+     "l0_zoom": "放大 L0 右列『调度 · 显存账本』（kv_column 青色列）上半 Scheduler 框的『调度账本+状态机』位（第ⅢPart 行程区 ch11 放大区）——即 L2 章图（L2-ch11.png）center ② allocate_slots→None → ③ 抢谁 → ⑤ 环终止·守卫关闸 拍片的机制展开；非新架构画法，架构归属回指 L0/L2。",
+     "claim": "RUNNING 侧 allocate_slots 一返回 None 就进 while True：抢占 FCFS 队尾腾块后原样重试，抢到自己仍分不到才整拍放弃——同一个 None 在 WAITING 侧只 break。",
+     "numbers": [
+      {"value": "A-2 调用序列 (r1,1)→OK、(r2,1)→None、(r2,1)→OK：抢队尾 r3 腾块后原样重试成功", "provenance": "traces/m1_preempt_ring.json scenario_A.beats[A-2].allocate_calls"},
+      {"value": "B-2 抢到自己：唯一调用 (r1,1)→None 后整拍放弃（sched={}、preempted=[r1]、池空闲 0→1）", "provenance": "traces/m1_preempt_ring.json scenario_B.beats[B-2]"},
+      {"value": "放弃≠死亡：B-3 经 WAITING 准入恢复，重命中 16 + 补 1（num_scheduled={r1:1}）", "provenance": "traces/m1_preempt_ring.json scenario_B.beats[B-3]"},
+      {"value": "WAITING 侧反差：同信号 None → break，在场请求绝不被抢（A-3 的 r3 恢复被拒即此出口）", "provenance": "traces/m1_preempt_ring.json scenario_A.beats[A-3] + vllm/v1/core/sched/scheduler.py:L987-L994"}
+     ],
+     "caption_draft": "内存见底那一拍，RUNNING 请求的 allocate_slots 返回 None 是抢占的唯一触发信号（scheduler.py:L575-L630）：先抢 FCFS 队尾（最年轻者）腾块、原样重试；把自己都抢了仍分不到就整拍放弃——但放弃不是死亡，被抢者回 waiting 队头，下一拍经 WAITING 准入（整序列门与水位都在那条路上）恢复。同一个 None 到了 WAITING 侧只 break：新请求绝不赶走老请求。",
+     "illustrator_notes": "环形流程图：allocate_slots 菱形（None/OK 两出口）→ None 进抢占框（running.pop 队尾，标『最年轻』）→ 沿回边重试 allocate_slots；preempted_req==request 出口 → break 框（整拍放弃→waiting 队头）；OK 出口 → 调度成功框。右下角 WAITING 侧对照小框（None→break，虚线）。三个数字标注钉在环上（A-2/B-2/B-3）。"
+    }
+   ],
+   "caveats": [
+    "场景 B-2 的『自己 free 后池里已有 1 块但不再重试』是行为事实（break 先于重试），解释归正文（恢复须走 WAITING 准入通道）——表里只陈述现象。"
+   ]
+  },
+  {
+   "mechanism_id": "m2",
+   "intuition": "撤桌撤『刚坐下』的那桌：等得最久的客人（队头）永远先被服务，牺牲品固定是最晚入座的那位——对 FCFS 公平序破坏最小、已投入的重算成本通常也最少；占桌最多的客人反而安全，因为『抢谁』只看座次不看块数。",
+   "worked_example": {
+    "params": {
+     "池": "5 块 × block_size 16",
+     "请求": "r1=32-token prompt（2 块，最大占用者）、r2/r3=16-token（各 1 块，同尺寸——r2/r3 唯一差别是入列顺序，r3 最晚到达 arrival=1002.0）",
+     "机制本体": "scheduler.py:L588-L615 的 FCFS 半边 self.running.pop()（impl 原样）；PRIORITY 半边 max((priority, arrival_time))+回滚 随 dossier.delete 第 1 条删",
+     "驱动脚本": "traces/run_m2_victim_choice.py → traces/m2_victim_choice.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m2_victim_choice.json",
+    "table": {
+     "columns": ["拍", "running 序（入列序=FCFS 序）", "受害者与理由", "各请求持块 r1/r2/r3", "各请求被抢次数"],
+     "rows": [
+      ["1", "[r1,r2,r3]", "—（三请求全准入）", "2/1/1", "0/0/0"],
+      ["2", "[r1,r2]（r3 被弹走）", "r3=队尾=最晚到达（1002.0）；触发者 r2 与最大占用者 r1 均不被选", "3/2/0", "0/0/1"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "victim 恒为 running 尾元素，且抢占后剩余成员的相对顺序不变（pop 只去尾）——等得最久者（队头）永不被此环选中，除非全场只剩它自己（退化为 m1 的自我抢占）。",
+    "argument": "选择器是 self.running.pop()（deque 尾），输入只有列表位置；列表位置由入列（调度准入）顺序 append 决定且环内无 append → 选择与『谁触发分配失败』『谁占块多』均无关。单调量：len(running) 每 pop 严格减 1。"
+   },
+   "quantified": "本例 r1（3 块最大占用者）毫发无损、r2（触发分配失败者本人）也不被抢——被抢的是与其同尺寸但更年轻的 r3：选择器只看入列序。理论依据（dossier theory[1]）：队尾=最晚加入=对 FCFS 序破坏最小、已投入 forward 通常最少；v1 不做精确『重算成本』比较（那要每请求维护成本模型）——选序即策略。PRIORITY 策略（真实源码 scheduler.py:L588-L613，精简版删不可运行）换判据：max(running, key=(priority, arrival_time)) 且要把被抢者本拍已领的 token/块/预算全部回滚——同一 while True 环的另一种『最不应保留』定义。",
+   "figure_specs": [
+    {
+     "figure_id": "ch11-fig-victim-youngest",
+     "template": "before-after",
+     "l0_zoom": "放大 L0 右列『调度 · 显存账本』（kv_column 青色列）上半 Scheduler 框的『调度账本+状态机』位——即 L2 章图 center ③ 抢谁 拍片的机制展开；非新架构画法，架构归属回指 L0/L2。",
+     "claim": "FCFS 抢占的受害者恒是 running 队尾（最年轻者）：本拍最大占用者 r1（3 块）与触发分配失败的 r2 都不被选，被弹走的是同尺寸但最晚入列的 r3。",
+     "numbers": [
+      {"value": "before：running=[r1,r2,r3]，持块 2/1/1（r1 最大占用）", "provenance": "traces/m2_victim_choice.json beats[0].running_order + blocks_held"},
+      {"value": "after：running=[r1,r2]，持块 3/2/0，被抢次数 0/0/1", "provenance": "traces/m2_victim_choice.json beats[1]（preempted_req_ids=[r3]、num_preemptions）"},
+      {"value": "受害者身份：arrival_time=1002.0（三者最晚）", "provenance": "traces/m2_victim_choice.json victim_events[0]"},
+      {"value": "PRIORITY 对照（源码引文，不可运行）：max((priority, arrival_time)) + 回滚本拍已领", "provenance": "vllm/v1/core/sched/scheduler.py:L588-L613（dossier embed_excerpts[0] 同段）"}
+     ],
+     "caption_draft": "抢谁不看占桌多少、也不看是谁触发的——FCFS 下 running.pop() 恒取队尾：最晚入列的 r3 让位（对公平序破坏最小、重算损失通常最少），最大占用者 r1 与触发者 r2 都安全（scheduler.py:L615）。PRIORITY 策略只是换了一种『最不应保留』的定义：按 (priority, arrival_time) 取最大并回滚其本拍已领资源。",
+     "illustrator_notes": "左右对照两张 running 长条：左（拍 1）r1/r2/r3 三格（宽度∝持块 2/1/1，r1 标『最大占用』）；右（拍 2）r3 格弹出为受害者（虚线框+箭头去 waiting 队头），r1 变宽（3 块）、r2 变宽（2 块）。底部一行小字：选择判据=列表位置（arrival 1002.0 最晚）+ PRIORITY 对照引文框。"
+    }
+   ],
+   "caveats": [
+    "PRIORITY 分支随 dossier.delete 第 1 条从精简版删除，表格数字全为 FCFS 半边；PRIORITY 语义以源码引文呈现（figure numbers 第 4 项）。"
+   ]
+  },
+  {
+   "mechanism_id": "m3",
+   "intuition": "退房六件事：交还房间钥匙（块归池，但门卡指纹/块哈希不清）、住宿登记改成『已退订但候位』（PREEMPTED）、清掉已消费记录（num_computed_tokens=0——重算的意思）、作废未用赠券（清 spec_token_ids）、把在途快递标成『照常送达但别再改登记』（stale=in_flight）、前台记一笔被赶次数（+1）并把客人排到候位第一位（prepend 回队头）。",
+   "worked_example": {
+    "params": {
+     "池": "2 块 × block_size 16",
+     "请求": "r1/r2 各 16-token prompt；w1 在 r2 之后入 waiting（验证 prepend 到队头而非队尾）",
+     "预置": "beat 2 前 r2.spec_token_ids=[9,9]（验证『清 spec』）、r2.num_in_flight_tokens=2（模拟 async 深度 2 使 stale 赋值可见；同步引擎此处为 0 → stale 自中和，对照 traces/m1_preempt_ring.json B-2）",
+     "机制本体": "scheduler.py:L1274-L1315（impl 六件事全保留）",
+     "驱动脚本": "traces/run_m3_six_things.py → traces/m3_six_things.json（_preempt_request 包装快照前后账）"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m3_six_things.json",
+    "table": {
+     "columns": ["拍·时点", "r2.status", "computed", "spec_token_ids", "stale", "in_flight", "持块/池空闲", "waiting 队列", "被抢次数", "cached 哈希"],
+     "rows": [
+      ["2·抢占前", "RUNNING", "16", "[9,9]", "0", "2", "1 / 0", "[w1]", "0", "2"],
+      ["2·_preempt_request 后", "PREEMPTED", "0", "[]", "2", "2", "0 / 1", "[r2,w1]", "1", "2"],
+      ["2·r1 重试落定", "PREEMPTED", "0", "[]", "2", "2", "0 / 0", "[r2,w1]", "1", "2"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "六件事把请求带回『与首调度同构的可调度初态』：computed=0 ∧ 块=∅ ∧ status=PREEMPTED ∧ waiting 队头——恢复路径因此复用首调度的同一通道（get_computed_blocks→allocate_slots，见 m7）。",
+    "argument": "六件事在同一函数内顺序完成、无 yield/IO/异常出口（唯一的 assert 是 status==RUNNING 入口守卫）→ 中途不可观测；num_preemptions 严格 +1 且从不回零（一生的累计伤疤），块归池使 num_free_blocks 单调回升（本例 0→1，随即被 r1 重试消费回 0），cached 哈希表尺寸不变（free 不清哈希——F2 事实锚）。"
+   },
+   "quantified": "本例 r2 已算 16 token（1 块）被一把清零；stale 赋值 2=in_flight（assign 而非累加——源码注释明言 num_in_flight_tokens 已含未排干 stale 份额）。真实刻度：num_preemptions 是请求字段（request.py:L199-L200），官方 benchmark 用它观测护栏效果；v0 的另一条路 SWAP 在 v1 从未存在（首提交 6c5af09b3 即 num_computed_tokens=0 的 recompute-only，git 证据，dossier WC1）——v0 swap 的死法 'Aborted due to the lack of CPU swap space' 全引擎崩（git c99db8c8d^ 旧档，现行源码无此代码）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch11-fig-preempt-six-things",
+     "template": "state-table",
+     "l0_zoom": "放大 L0 右列『调度 · 显存账本』（kv_column 青色列）上半 Scheduler 框的『调度账本+状态机』位——即 L2 章图 center ④ _preempt_request·六件事 拍片的机制展开；非新架构画法，架构归属回指 L0/L2。",
+     "claim": "_preempt_request 一口气做六件事，把请求带回与首调度同构的初态：free 块（哈希留表）/ PREEMPTED / computed=0 / 清 spec / stale←in_flight / preemptions+1 → 回 waiting 队头。",
+     "numbers": [
+      {"value": "computed 16→0；spec [9,9]→[]；stale 0→2（=in_flight，assign 不累加）；preemptions 0→1", "provenance": "traces/m3_six_things.json preempt_snapshot.before/after"},
+      {"value": "持块 1→0、池空闲 0→1（r1 重试后回 0）；cached 哈希 2→2（不清——F2）", "provenance": "traces/m3_six_things.json preempt_snapshot"},
+      {"value": "归宿：waiting [w1]→[r2,w1]（prepend 到队头）", "provenance": "traces/m3_six_things.json preempt_snapshot.waiting_order"},
+      {"value": "recompute-only 从未有过 swap：首提交即 num_computed_tokens=0", "provenance": "git 6c5af09b3:vllm/v1/core/scheduler.py L102（dossier WC1 / deepread engine-loop history_evidence）"}
+     ],
+     "caption_draft": "被抢占不是被删除，是退房重排（scheduler.py:L1274-L1315）：六件事原子完成——块归池但哈希留表（恢复时重命中的伏笔，→ch15）、账本清零（recompute-only 的语义本体）、stale 在途输出照常送达但不得改已清零的计数器、被赶次数 +1，最后 prepend 回 waiting 队头等下一拍恢复。v1 从未有过 v0 的 swap：丢弃重算是自首提交起的唯一路径。",
+     "illustrator_notes": "六行两列状态表：左列『抢占前』右列『_preempt_request 后』，六行分别是①持块/空闲②status③computed④spec⑤stale/in_flight⑥preemptions/waiting 队列；第①行旁挂小注『cached 哈希 2→2 不清』。底部窄条画 waiting 队列 [w1]→[r2,w1] 的 prepend 箭头。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m4",
+   "intuition": "退房后已在路上的快递仍会送达（凭空吞掉会扰乱统计），但新地址的登记不能再改（计数器已清零）——前台挂一本『在途冲销账』，每来一批冲销一份，清零之前不许重新入住（推迟恢复）；另一形态 drop-mode 连快递一起作废（同拍抢占+恢复的场景：那些位置反正要重采）。",
+   "worked_example": {
+    "params": {
+     "池": "4 块 × block_size 16；r1 16-token prompt",
+     "async 模拟": "P1 在 schedule() 之后、输出回来之前把 in_flight 人工置 2（模拟 async 批队列深度 2——同步真实引擎此处为 1，且若输出已回账则为 0）；P4 用同一 scheduler_output 二次回账模拟第 2 个在途步返回",
+     "机制本体": "request.py:L150-L162 字段 + scheduler.py:L1297-L1308 赋值（assign）/ L1737-L1743 锁步 drain / L713-L722 推迟恢复 / L1757-L1759 drop-mode（impl 全保留）",
+     "驱动脚本": "traces/run_m4_stale_protocol.py → traces/m4_stale_protocol.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m4_stale_protocol.json",
+    "table": {
+     "columns": ["阶段", "动作", "in_flight", "stale", "drop", "送达", "状态"],
+     "rows": [
+      ["P1", "调度后、输出回来前被抢（async 模拟）", "2", "2", "false", "—", "PREEMPTED·回 waiting 队头"],
+      ["P2", "第 1 个在途输出到达", "2→1", "2→1", "false", "[42]", "PREEMPTED"],
+      ["P3", "下一拍 schedule：stale>0 且非 drop", "1", "1", "false", "[]", "推迟恢复→skipped_waiting"],
+      ["P4", "第 2 个在途输出到达（同一 out 二次回账）", "1→0", "1→0", "false", "[43]", "PREEMPTED（已排空）"],
+      ["P5", "下一拍恢复", "0", "0", "false", "[44]", "RUNNING·resumed（重命中 16+补 3）"],
+      ["P6", "drop-mode 抢占（同拍抢占+恢复形态）", "1→0", "1→0", "true", "[]", "整段丢弃：42 不送达不入账"],
+      ["P7", "同步版自中和（对照）", "0", "0", "false", "—", "上拍已回账→stale 恒 0"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "stale 排空有限且不透支：assign 后 stale=in_flight，此后每个在途步回账恰冲销其 num_scheduled_tokens（assert stale≥0 防透支），而全部在途步的 num_scheduled 之和恰为 in_flight → 至多 pipeline 深度拍内 stale 必到 0，恢复推迟不会永久。",
+    "argument": "单调量：num_stale_output_tokens 每次回账减 min(本拍调度数, 剩余 stale) 且非负整数严格递减（排空前）→ 有限步归零；恢复条件 stale==0 与该递减共同保证活性。为什么仍要送达而不丢：丢掉会扰动 spec-decode acceptance 统计（源码注释原话）；为什么不得改计数器：num_computed_tokens 已清零、num_output_placeholders 已置 0，再扣就是 underflow（async_scheduler.py:L60-L63 注释）。"
+   },
+   "quantified": "本例深度 2：两拍排空、第三拍恢复（P2/P4/P5）。真实语义窗口 ≤ pipeline 深度（async 批队列默认 2，config/vllm.py max_concurrent_batches——ch12 展开）；drop-mode 两来源：reset_prefix_cache 的同拍抢占+恢复（位置已被重采，交付反而乱序）与 connector 未决交接（ch16）。同步调度下自中和（P7）：抢占发生在上拍输出已回账之后、in_flight=0——协议只在 async（v0.27.1 服务默认）与 PP 下咬合。代价实证：本 pin 前三个月三个本域 underflow/staleness 修复（#42117 2026-05-19 / #46066 2026-07-06 / #48245 2026-07-29，deepread engine-loop history_evidence）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch11-fig-stale-drain",
+     "template": "swimlane",
+     "l0_zoom": "放大 L0 右列『调度 · 显存账本』（kv_column 青色列）上半 Scheduler 框的『调度账本+状态机』位——即 L2 章图 center ④ 六件事拍片的 stale 标注 + south『stale · async 交叉面』注框的机制展开；非新架构画法，架构归属回指 L0/L2。",
+     "claim": "被抢请求的在途输出走一条『照常送达+锁步冲销』的平行账：每来一批冲销一份（stale 2→1→0），排空前恢复被推迟，排空后下一拍 resumed——drop-mode 则整段丢弃。",
+     "numbers": [
+      {"value": "stale 计量线 2→1→0（P1 赋值 2=in_flight；P2/P4 各冲销 1）", "provenance": "traces/m4_stale_protocol.json phases P1/P2/P4 的 num_stale_output_tokens"},
+      {"value": "送达不中断：P2 外送 [42]、P4 外送 [43]、P5 恢复后外送 [44]", "provenance": "traces/m4_stale_protocol.json phases emitted 字段"},
+      {"value": "推迟窗口：P3 整拍落 skipped_waiting（stale=1>0）", "provenance": "traces/m4_stale_protocol.json phases P3.skipped_waiting"},
+      {"value": "drop-mode：42 不外送也不入账（emitted_count=0）", "provenance": "traces/m4_stale_protocol.json phases P6"},
+      {"value": "同步自中和对照：stale 恒 0", "provenance": "traces/m4_stale_protocol.json phases P7"}
+     ],
+     "caption_draft": "抢占不清在途输出，只给它换一本账（request.py:L150-L162）：stale=in_flight（assign），每个在途步回账时锁步冲销其份额、token 照常送达——因为丢掉会扰动 spec acceptance，而计数器已清零不能再扣。排空前恢复被推迟一拍（否则会重采输出稍后要送的位置），窗口不超过 pipeline 深度；drop-mode（同拍抢占+恢复）才整段作废。同步引擎里这套协议自中和——它是 async（v0.27.1 服务默认）的账单。",
+     "illustrator_notes": "双泳道时间轴：上泳道=调度器拍（P1..P7 竖线），下泳道=输出管线（在途步 42/43 的到达箭头）。中央一条 stale 水位条（0/1/2 刻度）随拍下降：P1 置 2 → P2 降 1 → P3 停（推迟恢复标注）→ P4 降 0 → P5 恢复。右下角小框：drop-mode 对照（42 进垃圾桶图标）。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m5",
+   "intuition": "店里刚赶过人的那一拍索性不再迎新：再迎一位，多半下一拍还得再赶一位（刚腾的位子立刻又被占），徒增抖动——干脆关闸一拍让场内先稳住；而候位的新客分不到位子时只会继续等，绝不会有『为给新客腾位赶走堂食客』的事。",
+   "worked_example": {
+    "params": {
+     "场景 A": "池 8 块：r1=16-token（1 块）、r2=112-token（7 块，队尾）——守卫 load-bearing 场景：抢占后空闲 6 足够 r2 恢复，守卫仍然关闸",
+     "场景 B": "池 2 块：r1=32-token（2 块）、victim=16-token——不对称场景：WAITING 侧 None 只 break；RUNNING 侧同信号才抢占",
+     "机制本体": "scheduler.py:L683-L692 守卫（impl 原样 `if not preempted_reqs and UNPAUSED`）+ L987-L994 WAITING 侧 None→break",
+     "驱动脚本": "traces/run_m5_guard_asymmetry.py → traces/m5_guard_asymmetry.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m5_guard_asymmetry.json",
+    "table": {
+     "columns": ["拍", "本拍调度", "池空闲", "被抢", "守卫/不对称判定"],
+     "rows": [
+      ["A-1", "{r1:16,r2:112}", "8→0", "[]", "双准入：r1 占 1 块 + r2 占 7 块"],
+      ["A-2", "{r1:1}", "0→6", "[r2]", "守卫关闸：空闲 6 足够 r2 恢复（重命中 112 只差 1 新块），本拍仍不收——再收必再抢"],
+      ["A-3", "{r1:1,r2:1}", "6→5", "[]", "守卫开（下一拍）：r2 重命中 112+补 1 → resumed"],
+      ["B-1", "{r1:32}", "2→0", "[]", "victim 准入需 1 块 > 空闲 0 → None 只 break：在场请求无人被抢"],
+      ["B-2", "{}", "0→2", "[r1]", "RUNNING 侧同信号才触发抢占：r1 自我牺牲；victim 仍 WAITING、被抢 0 次"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "守卫只关一拍：判定用的是 schedule() 的局部变量 preempted_reqs（本拍现象），步末 _update_after_schedule 把集合换新（注释明言不能就地 clear——SchedulerOutput 还引用着旧集合）→ 下一拍守卫必开（除非又发生抢占）。",
+    "argument": "两出口的不对称是结构性的：RUNNING 循环里 None 进 while True 抢占环（m1），WAITING 循环里 None 直接 break（L987-L994，环根本不在那条路上）——在场请求的结构性安全由代码布局保证，不靠运行时检查。"
+   },
+   "quantified": "本例 A-2 的代价可见且有限：牺牲一拍延迟（r2 晚一拍恢复）换掉一次几乎必然的再抢占（若无守卫，r2 同拍恢复后 r1 下一拍增长立刻再次触发抢占——thrash 环）。真实刻度：这是 TPOT→TTFT 的显式转嫁（dossier WC5 cost）——老请求绝对优先、『抢占过就不收新』让突发新请求至少多等一拍，高负载下 TTFT 无上界（无 admission control 拒绝）；与水位连讲：关闸治标（本拍现象）、水位治本（准入就留余量，m8）。",
+   "caveats": []
+  },
+  {
+   "mechanism_id": "m6",
+   "intuition": "候位区分两条队：『马上能上桌』和『在等外部电话』。每轮先看等电话的队头一眼（好了就上桌，没好就跳过）——绝不会被一个等电话的堵死整条队；被跳过的收进小本本，打烊前按跳过顺序统一放回等电话队的队头，下轮最先重试他们（不饿死）。",
+   "worked_example": {
+    "params": {
+     "角色": "older=WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR（阻塞态→skipped_waiting）；newer=PREEMPTED+stale=1（async 模拟在途未排干→waiting 队）；ready=普通 WAITING",
+     "机制本体": "scheduler.py:L687-L722 双队列遍历 + L2050-L2074 路由/择队 + L1099-L1101 步末重排（impl 全保留；_try_promote 坍缩 return False=『仍在等』——三个提升分支属已删子系统：grammar→ch30、远程 KV→ch16、流式→本章 manual m15）",
+     "驱动脚本": "traces/run_m6_dual_queue.py → traces/m6_dual_queue.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m6_dual_queue.json",
+    "table": {
+     "columns": ["拍", "动作", "对象", "队列变化", "结果"],
+     "rows": [
+      ["0", "初始路由", "older/newer/ready", "skipped=[older]；waiting=[newer,ready]", "阻塞态隔离进 skipped"],
+      ["1", "peek older：阻塞且 promote 失败", "older", "skipped 队头弹出→step_skipped", "跳过不卡队头"],
+      ["1", "peek newer：stale>0 且非 drop", "newer", "waiting 弹出→step_skipped", "推迟恢复一拍（stale 协议素材）"],
+      ["1", "peek ready：可调度", "ready", "waiting 弹出→running", "准入 {ready:16}"],
+      ["1", "步末重排", "step_skipped=[newer,older]", "prepend 回 skipped（extendleft 再反转）", "skipped=[older,newer]=本拍跳过序"],
+      ["2", "peek older 仍阻塞；newer stale 已排干", "older/newer", "older 再跳过；newer 准入", "resumed=[newer]；skipped=[older]"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "无饥饿双保证：①每个阻塞请求每拍恰被 peek 一次（O(1) 尝试后跳过），ready 请求最晚本拍被服务——队头阻塞只花一次 peek、不上锁；②步末 step_skipped_waiting 整体 prepend 回 skipped 队头，且 extendleft 的反转恰抵消收集时 prepend 的反转 → 重试序=本拍跳过序，刚跳过的最先重试。",
+    "argument": "遍历是 while 循环逐队头 peek：每个成员每拍至多一次 O(1) 判定；重排次序论证：收集用 prepend（后跳者在前）得 [newer,older]，extendleft 逐个 appendleft 再反转一次 → [older,newer]，两次反转相消 = 跳过发生序（trace 两拍实测）。"
+   },
+   "quantified": "本例 2 拍内三类请求各得其所（阻塞者每拍 1 次 O(1) 重试、推迟者下一拍恢复、ready 当拍准入）。单队列反事实：older 卡在队头则 newer/ready 全体饿死——双队列把阻塞态的代价从『堵住整条队』降为『每拍一次 peek』。FCFS 下择队规则 skipped 优先（L2065-L2066）；PRIORITY 换成两队队头比较（L2068-L2073，精简版删）。skipped_waiting 的三个运行时来源（grammar 编译/远程 KV/流式输入）分别归 ch30/ch16/ch12 语境，本章只立『阻塞子态可被隔离与提升回来』这个状态机事实。",
+   "figure_specs": [
+    {
+     "figure_id": "ch11-fig-dual-queue",
+     "template": "layout",
+     "l0_zoom": "放大 L0 右列『调度 · 显存账本』（kv_column 青色列）上半 Scheduler 框的『调度账本+状态机』位——即 L2 章图 north 行三容器（running/waiting/skipped_waiting）+ center ⑥ 双队列遍历拍片的机制展开；非新架构画法，架构归属回指 L0/L2。",
+     "claim": "双队列把『等外部事件』与『马上能调度』隔离开：阻塞队头每拍只花一次 peek 就被跳过，绝不堵死 ready 请求；本拍跳过者步末按跳过序插回 skipped 队头，下轮最先重试。",
+     "numbers": [
+      {"value": "初始：skipped=[older]、waiting=[newer,ready]", "provenance": "traces/m6_dual_queue.json initial_queues"},
+      {"value": "拍 1 结局：ready 准入 {ready:16}；步末重排后 skipped=[older,newer]（=跳过序，extendleft 反转抵消 prepend 反转）", "provenance": "traces/m6_dual_queue.json beats[0]"},
+      {"value": "拍 2：older 仍阻塞再跳过；newer 以 resumed 恢复（resumed=[newer]）", "provenance": "traces/m6_dual_queue.json beats[1]"}
+     ],
+     "caption_draft": "一条队会让一个『等语法编译/等远程 KV/等流式输入』的请求堵死后面所有人——v1 把它们隔离进 skipped_waiting（scheduler.py:L2050-L2062 路由、L687-L722 遍历）：每拍先 peek 一下队头好了没（O(1)），没好就跳过；本拍跳过的收集进 step_skipped_waiting，步末整体插回 skipped 队头且次序恰为跳过序——被跳过的反而是下轮最先重试的，不饿死。",
+     "illustrator_notes": "布局图：上方两个队列框（waiting=[newer,ready]、skipped_waiting=[older]，阻塞者用灰底+等待图标），下方一个 step_skipped_waiting 收集框；中间遍历指针箭头（peek→跳过/准入三色边）；步末一条粗箭头从收集框指回 skipped 队头，标注『extendleft 反转×prepend 反转=跳过序』。右下小时间轴显示拍 1/拍 2 两行的队列状态快照。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m7",
+   "intuition": "图书馆还书不销毁书卡：你借过还回去的书仍在目录里，下次你（或别人）借同一本直接按卡取，只有最后一页必须亲手再翻一遍（要有新的读后感——logits）。被抢占的请求就像来还书的读者：书立刻可借出（块归池），但目录（哈希表）留着它的指纹。",
+   "worked_example": {
+    "params": {
+     "场景 A": "池 4 块、r1 64-token prompt（恰 4 块）——自我被抢后恢复：重命中自己的全部 4 块，只补 1 token",
+     "场景 B": "池 8 块、rA/rB 同 64-token prompt——rA 跑完 free 后 rB 准入：cap=num_tokens-1 的块对齐效应",
+     "机制本体": "scheduler.py:L744-L766 恢复查缓存 + kv_cache_manager.py:L229-L259（cap=num_tokens-1 的 NOTE 原文）+ block_pool.py:L719-L742（free 只动 ref_cnt/自由队列、哈希不清——F2 证据锚）",
+     "驱动脚本": "traces/run_m7_prefix_rehit.py → traces/m7_prefix_rehit.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m7_prefix_rehit.json",
+    "table": {
+     "columns": ["拍", "事件", "命中 token", "补算 token", "cached 哈希", "备注"],
+     "rows": [
+      ["A-2", "自我被抢：4 块归还池", "—", "—", "4（不清）", "池空闲 0→4，哈希留表"],
+      ["A-3", "恢复：重命中自己的 4 块", "64", "1", "4", "cap=64；无前缀缓存的世界=65 全量重算"],
+      ["B-1", "rA 完成 free（max_tokens=1 长度封顶）", "—", "—", "4（不清）", "终点的哈希=下一个请求的可命中前缀"],
+      ["B-2", "rB 同 prompt 准入", "48", "16", "4", "cap=63→按块向下取 3 块：第 4 块整块重算（哈希在表也被 cap 挡下）"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "命中的前缀性与必重算性：链式哈希保证『miss 之后必 miss』（每块哈希含父链——前缀任何一处改动后面全失效）→ 连续命中计数无需回溯即是最长可命中前缀；cap=num_tokens-1 保证至少重算 1 个 token 才有 logits，块对齐把这笔最小重算放大到整块。",
+    "argument": "链式性质来自 hash_i=H(parent_{i-1}, tokens_i)（kv_cache_utils.py:L596-L623 的增量结构，impl 的 get_request_block_hasher 同构）：第 i 块哈希指纹覆盖前 0..i 块全部内容 → 逐块查表遇第一个 miss 即可停（其后不可能命中）；cap 的存在理由写在 kv_cache_manager.py:L253-L259 NOTE 原话——全命中也必须重算最后一个 token 才有 logits，而 num_computed_tokens 必须块对齐，于是重算放大为整块。"
+   },
+   "quantified": "本例 A：65 token 的账单只补 1（重算降到约 1.5%）；B：同 prompt 新请求命中 48/64=75%（cap 63 → 3 块）。『重算』实为『重载元数据+补算未命中尾段』——这是 v1 recompute-only 赌注的承重墙：抢占的期望代价=未命中尾段而非全长。最坏情况无界：若被抢期间块被 LRU 逐出（尾块先逐=前缀从尾巴丢起），重算退化为全量 O(prompt+output)——精简版哈希表无驱逐演不了这半边，归 ch15（F2 在彼处回收：链式哈希怎么算、驱逐顺序两个不变量）。A-3 恢复时命中块以 -1 记账（真实为引用计数+1 复用，CoW 归 ch13/15）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch11-fig-prefix-rehit",
+     "template": "before-after",
+     "l0_zoom": "放大 L0 右列『调度 · 显存账本』（kv_column 青色列）——上半 Scheduler 框『调度账本+状态机』位的 ch11 放大区：L2 章图 center ⑥ 双队列遍历·前缀重命中拍片 + south『KVCacheManager（契约面·黑盒）』框 free/get_computed_blocks 两条虚线的机制展开；非新架构画法，架构归属回指 L0/L2。",
+     "claim": "free 归还块但不清哈希——被抢者恢复时重命中自己的前缀：65 token 只补 1；同 prompt 的新请求命中 48/64（cap=num_tokens-1 使第 4 块整块重算）。",
+     "numbers": [
+      {"value": "A-2→A-3：4 块归还（空闲 0→4）但 cached 哈希 4 条留表；恢复调度 {r1:1}（命中 64+补 1）", "provenance": "traces/m7_prefix_rehit.json scenario_A.beats[A-2/A-3]"},
+      {"value": "对照：无前缀缓存=65 token 全量重算", "provenance": "traces/m7_prefix_rehit.json scenario_A.recompute_accounting"},
+      {"value": "B-1→B-2：rA 终点 free 哈希 4 条留表；rB 命中 3 块=48、整第 4 块 16 重算（表里有 4 条哈希、cap 挡下第 4 条）", "provenance": "traces/m7_prefix_rehit.json scenario_B.beats + hit_accounting"},
+      {"value": "cap 规则原文：max_cache_hit_length = prompt_length-1，块对齐放大到整块", "provenance": "vllm/v1/core/kv_cache_manager.py:L253-L259 NOTE（impl 同文保留）"}
+     ],
+     "caption_draft": "抢占敢扔 KV，是因为扔了还能捡回来：free 只归还块、从不擦哈希表（block_pool.py:L719-L742 只动 ref_cnt 和自由队列）——被抢请求恢复时 get_computed_blocks 沿自己的块哈希重命中全部前缀，65 token 只补 1（scheduler.py:L744-L766）。同一个机制也让『终点』成为下一个请求的礼物：rA 完成后留下的哈希让同 prompt 的 rB 命中 48/64。『重算』从来是『重载+补算』——链式哈希与驱逐顺序的细节在 ch15 展开。",
+     "illustrator_notes": "左右两联：左联=被抢拍（块 4 格从请求账上飞回池，哈希表格子里 4 枚指纹亮着盖『不清』章）；右联=恢复拍（4 枚指纹匹配回 4 格命中 + 1 格新块，账单标 64 命中+1 补算 vs 虚线灰字『无缓存=65 全量』）。底部窄条：B 场景小图（rB 的 4 块里 3 块绿命中、第 4 块橙重算，cap=63 标注）。"
+    }
+   ],
+   "caveats": [
+    "精简版 cached_block_hashes 无 LRU 驱逐——『块被逐出→全量重算』的最坏情况（WC3 cost②/F2 另一头）不可运行，正文以源码事实陈述并指向 ch15。",
+    "命中块在精简版记 -1 占位；真实为引用计数+1 共享与 CoW 换块（ch13/15）。"
+   ]
+  },
+  {
+   "mechanism_id": "m8",
+   "intuition": "水库的防洪库容：平时放水到死水位（不留余量，吞吐最大）；汛情将到的时节留一块库容不接新客——但只在『新客进闸』时留、只在『场内已有发电机组』时留：空库时不留（否则水库永远蓄不起来），场内机组自己的用水也不归它管（否则正常发电被压）。",
+   "worked_example": {
+    "params": {
+     "池": "10 块 × block_size 16，watermark=0.5 → watermark_blocks=5（对照 0.0=默认关）",
+     "请求": "r1=128-token prompt（8 块）；small=16-token（1 块）",
+     "机制本体": "kv_cache_manager.py:L463-L470 准入门 + L521-L527 分配门两处水位原文（impl 全保留）+ config/scheduler.py:L136-L141 配置（默认 0.0，区间 [0.0,1.0)）",
+     "驱动脚本": "traces/run_m8_watermark.py → traces/m8_watermark.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m8_watermark.json",
+    "table": {
+     "columns": ["拍", "调用（对象·身份）", "池空闲", "required=need+水位", "判定"],
+     "rows": [
+      ["A-1", "r1 准入（WAITING·running 空）", "10", "8+0=8", "8≤10 放行——首拍不吃水位（误计入则 8+5=13>10 永不起步）"],
+      ["A-2", "r1 decode 增长（RUNNING）", "2", "1+0=1", "1≤2 放行——RUNNING 增长不吃水位"],
+      ["A-3", "small 准入（WAITING·有在场者）", "1", "1+5=6", "6>1 拒之门外，small 留 WAITING；r1 照常 decode"],
+      ["A-3'", "small2 准入（同形对照·watermark=0.0）", "1", "1+0=1", "1≤1 放行——默认关"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "水位只抬高门槛、不反转判定方向：required=need+watermark_blocks 与 free 比较，wb≥0 单调 → 只会把『恰好放行』变『拒绝』，绝不会把『拒绝』变『放行』；三限定（仅准入侧、仅 WAITING/PREEMPTED、仅 has_scheduled_reqs）各自防一个死锁/误伤。",
+    "argument": "若首拍（running 空）也计入：空引擎的第一个请求就要 need+wb≤free，池小或水位大时永不满足——活性死锁；若 RUNNING 增长也计入：每个 decode 步都要过水位门，正常增长被系统性压制——所以限定恰好圈住『新准入』这一个口子。算术：wb=int(watermark×num_blocks)（L170-L171，int 截断）。"
+   },
+   "quantified": "本例 10 块池水位 0.5 → 5 块 headroom：small 需 1 块被拒（1+5=6>1），关掉水位即放行（1≤1）——吞吐换稳定的旋钮，默认关。算术刻度：int(0.5×10)=5、int(0.3×10)=3、int(0.3×100)=30（trace arithmetic 节）。动机与官方复现（WC3）：decode-heavy（output >> input）高并发下『准入时只预留了输入、输出长度未知』→ 短时超收 → 全体增长 → 池尽 → 抢占刚准入者 → 重 prefill → 再抢占（benchmarks/kv_cache_watermark.sh:L5-L16 原话，复现配置并发 128-200、input~1000、output~5000、池压到均值需求 ~1.5×）；与 v0 全局静态垫片（默认 1%）的差异=『精修版』三限定。关闸（m5）治标、水位治本。",
+   "figure_specs": [
+    {
+     "figure_id": "ch11-fig-watermark-three-limits",
+     "template": "state-table",
+     "l0_zoom": "放大 L0 右列『调度 · 显存账本』（kv_column 青色列）——上半 Scheduler 框『调度账本+状态机』位与下半 KVCacheManager 框的交界：L2 章图 center ⑦ 恢复准入·水位 watermark 拍片 + south『KVCacheManager（契约面·黑盒）』框 watermark_blocks 的机制展开；非新架构画法，架构归属回指 L0/L2。",
+     "claim": "水位是只对『新准入』生效的 headroom：同一池 10 块、水位 5——首拍准入不吃（8+0≤10）、RUNNING 增长不吃（1+0≤2）、WAITING 准入吃（1+5=6>1 拒）；watermark=0.0（默认）时同一请求放行。",
+     "numbers": [
+      {"value": "三行判定：A-1 首拍 8+0=8≤10 放行；A-2 RUNNING 1+0=1≤2 放行；A-3 WAITING 1+5=6>1 拒", "provenance": "traces/m8_watermark.json scenario.beats A-1/A-2/A-3（allocate_calls 含身份与实参）"},
+      {"value": "对照行 A-3'：watermark=0.0 时 1+0=1≤1 放行", "provenance": "traces/m8_watermark.json scenario.beats[A-3']"},
+      {"value": "算术：int(0.5×10)=5 / int(0.3×10)=3 / int(0.3×100)=30 / 默认 0.0", "provenance": "traces/m8_watermark.json arithmetic + vllm/config/scheduler.py:L136-L141"},
+      {"value": "抖动机理引文：『admitted based on KV cache they need at admission time … output length is unknown and unreserved』", "provenance": "benchmarks/kv_cache_watermark.sh:L5-L16（dossier embed_excerpts[8]）"}
+     ],
+     "caption_draft": "水位钟摆（kv_cache_manager.py:L463-L470）：v0 有全局静态垫片 → v1 拿掉换精确预测 → decode-heavy 负载打出抢占抖动 → v0.27.1 加回精修版——只对准入生效、只对 WAITING/PREEMPTED、只在本步已有在场者时计入 required_blocks。留 5 块不接客是吞吐换稳定：decode 增长有缓冲，刚准入者不再被反复抢占；默认 0.0=把这道取舍留给用户按负载调。",
+     "illustrator_notes": "状态表四行（A-1/A-2/A-3/A-3'）：每行左侧身份徽章（WAITING·空场 / RUNNING / WAITING·在场 / WAITING·在场·水位关），中间一道竖直块池标尺（10 格：已用染青、watermark 5 格染黄斜纹、need 染橙），右侧判定勾叉。A-3 行标尺同时显示 need 1 与水位 5 的叠加=6>1。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m9",
+   "intuition": "退房又回头的客人不发新房卡——前台把他的整套房卡记录整份重写一遍（替换），而不是在旧记录后面添一张；正常续住的客人每天只在记录后面添当天的卡（追加）。两种语义由同一个名单（resumed_req_ids）区分。",
+   "worked_example": {
+    "params": {
+     "池": "3 块 × block_size 16；r1 48-token prompt（恰 3 块）",
+     "机制本体": "scheduler.py:L1055-L1075 回流落位 + L1447 resumed_req_ids 登记 + output.py:L115-L121『整体替换而非追加』注释（impl 全保留）",
+     "驱动脚本": "traces/run_m9_resumed_reentry.py → traces/m9_resumed_reentry.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m9_resumed_reentry.json",
+    "table": {
+     "columns": ["拍", "r1 状态", "调度 token", "new_block_ids 条目", "resumed?", "worker 侧语义"],
+     "rows": [
+      ["3", "PREEMPTED→RUNNING", "1", "[-1,-1,-1,3]", "true", "整体替换：4 项全量表（3 命中占位 + 1 新块）"],
+      ["4", "RUNNING", "1", "[]", "false", "追加：本拍 0 新块，什么都不追加"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "resumed 协议二态完备：CachedRequestData 的每个 req_id 要么在 resumed_req_ids（替换语义）要么不在（追加语义），无第三态——worker 侧按同一集合分叉，两侧永远对齐。",
+    "argument": "登记发生在 _make_cached_request_data（L1446-L1447）：凡 scheduled_resumed_reqs 的成员（来时状态==PREEMPTED 的分流，L1060-L1065）入集合；分流条件与状态机一一对应（else 分支直接 raise RuntimeError 拒绝第三态）→ 集合与『被抢后拉起』事件严格等价。"
+   },
+   "quantified": "本例恢复拍发整表 4 项、相邻下一拍发 0 项——同一请求两拍通信量差=整表 vs 空。为什么必须替换：被抢时旧块表已全部归还（m3 六件事之一），恢复后的块号组合与旧表无继承关系（命中块是共享指纹挂账、新块是新拨的号）——追加会把失效旧表拼在新表后面。output.py:L118-L121 注释原话：'For those in the set, new_block_ids will be used as the request block IDs instead of appending'。",
+   "caveats": []
+  },
+  {
+   "mechanism_id": "m10",
+   "intuition": "一枚进度条式的整数：1 到 6 是人生前半场（等、阻塞、跑、被抢），7 起是已完结。判断一个请求完没完事不看任何名单，只问一句『这个数大于 6 吗』——一次整数比较，比查表、走属性链都快一个量级。",
+   "worked_example": {
+    "params": {
+     "枚举": "RequestStatus 全 12 态（enum.auto() 从 1 连续编号）+ FinishReason 5 值（STOP=0..REPETITION=4）",
+     "机制本体": "request.py:L348-L390（impl 全状态+_FINISHED_REASON_MAP 原样保留；顺序即语义不可重排）",
+     "驱动脚本": "traces/run_m10_status_enum.py → traces/m10_status_enum.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m10_status_enum.json",
+    "table": {
+     "columns": ["状态", "值", ">PREEMPTED?", "FinishReason 映射"],
+     "rows": [
+      ["WAITING", "1", "false", "—"],
+      ["WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR", "2", "false", "—"],
+      ["WAITING_FOR_REMOTE_KVS", "3", "false", "—"],
+      ["WAITING_FOR_STREAMING_REQ", "4", "false", "STOP（特例）"],
+      ["RUNNING", "5", "false", "—"],
+      ["PREEMPTED", "6", "false（分界）", "—"],
+      ["FINISHED_STOPPED", "7", "true", "STOP"],
+      ["FINISHED_LENGTH_CAPPED", "8", "true", "LENGTH"],
+      ["FINISHED_ABORTED", "9", "true", "ABORT"],
+      ["FINISHED_IGNORED", "10", "true", "LENGTH"],
+      ["FINISHED_ERROR", "11", "true", "ERROR"],
+      ["FINISHED_REPETITION", "12", "true", "REPETITION"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "全序不变量：枚举数值序=生命周期偏序（未完成区 < PREEMPTED=6 < 终态区），is_finished 等价于 v>6 当且仅当任何新状态都插在 PREEMPTED 的正确一侧——顺序即语义，且全仓无断言保护。",
+    "argument": "枚举用 enum.auto() 连续赋值 → 数值序即声明序；is_finished 是一次整数比较（L369-L371），其正确性完全依赖『终态永远声明在 PREEMPTED 之后』这条注释级约定（L357-L358 'anything after PREEMPTED will be considered as a finished status'）——在中间插状态不报错、只静默改变 is_finished 含义（WC2 cost①：隐式 API）。"
+   },
+   "quantified": "热循环每请求每拍至少一次 is_finished 判断（m11 的幂等跳过、m17 的入口过滤），千级请求 × 每秒上百拍 = 每秒十万次级（dossier theory[3]）——一次整数比较纳秒级；转移点集中四处（WAITING→RUNNING 调度准入 / RUNNING→PREEMPTED 抢占 / RUNNING→FINISHED_* check_stop / 外部 abort finish_requests，WC2 solution）。特例映射：WAITING_FOR_STREAMING_REQ（值 4，未完成）也映射 STOP——流式会话挂起时对外仍报『停』（m15 的伏笔与对接口径）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch11-fig-status-intenum",
+     "template": "state-machine",
+     "l0_zoom": "放大 L0 右列『调度 · 显存账本』（kv_column 青色列）上半 Scheduler 框的『调度账本+状态机』位——即 L2 章图 south『RequestStatus 单 IntEnum』框（站号 1，全章地图）的机制展开；非新架构画法，架构归属回指 L0/L2。",
+     "claim": "请求的一生是一枚整数的取值变化：1..6 未完成（含三个阻塞子态与 PREEMPTED 中转），7..12 终态——is_finished 就是一次『>6』比较，枚举顺序本身是隐式 API。",
+     "numbers": [
+      {"value": "全序值表：WAITING=1 → 三阻塞子态 2/3/4 → RUNNING=5 → PREEMPTED=6 → 六终态 7..12", "provenance": "traces/m10_status_enum.json statuses（12 行值列）"},
+      {"value": "分界：PREEMPTED=6 未完成、FINISHED_STOPPED=7 完成——is_finished = v>6", "provenance": "traces/m10_status_enum.json boundary + vllm/v1/request.py:L369-L371"},
+      {"value": "特例映射：WAITING_FOR_STREAMING_REQ（4，未完成）→ STOP", "provenance": "traces/m10_status_enum.json statuses[3].finished_reason"},
+      {"value": "注释级约定：'anything after PREEMPTED will be considered as a finished status'（无断言保护）", "provenance": "vllm/v1/request.py:L357-L358"}
+     ],
+     "caption_draft": "全章地图（request.py:L348-L375）：一个请求从生到死就是这枚 IntEnum 的取值轨迹——WAITING 起步、可能绕道三个阻塞子态、RUNNING↔PREEMPTED 之间被抢占与恢复、最后落进六个 FINISHED_* 之一。判完成只问『大于 6 吗』：热循环每秒十万次级的调用只付一次整数比较。代价是把枚举顺序变成了隐式 API——新状态必须插在 PREEMPTED 的正确一侧，插错不报错、只静默改语义。",
+     "illustrator_notes": "阶梯式状态机：横轴=整数值 1..12（每阶一格，格内状态名），6/7 之间画一道粗分界线（『>6 即完成』标注，左区青色右区橙红）；RUNNING↔PREEMPTED 双向弧标『抢占/恢复』；三个阻塞子态格加等待图标；WAITING_FOR_STREAMING_REQ 格加小标『→STOP 特例』。转移点四处用小旗标注（调度/抢占/check_stop/abort）。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m11",
+   "intuition": "收银台对账：每单先按小票行号定位（req_id_to_index），把预扣的份额核销（扣 in_flight），再逐件过机（token）；还没上架的商品（mid-prefill chunk）小票是空行——跳过但不报错；对账中途被告知订单已取消的，直接翻过这页（continue），绝不让整本账对不下去。",
+   "worked_example": {
+    "params": {
+     "预算": "max_num_batched_tokens=80；r1=16-token prompt、r2=128-token prompt（chunked 64+64）",
+     "机制本体": "scheduler.py:L1670-L1764（impl 保留：定位采样行/扣在途/stale 锁步 drain/abort 期 continue/空行跳过；woosuk 自注 L1728-L1730 原文）",
+     "驱动脚本": "traces/run_m11_hotloop.py → traces/m11_hotloop.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m11_hotloop.json",
+    "table": {
+     "columns": ["拍", "本拍调度", "采样行定位", "在途核销", "外送"],
+     "rows": [
+      ["1", "{r1:16,r2:64}", "r1→0 有行；r2→1 空行", "r1:16→0；r2:64→0", "{r1:[1]}（r2 mid-chunk 不外送）"],
+      ["2", "{r1:1,r2:64}", "r1→0；r2→1（chunk 末有 logits）", "1→0；64→0", "{r1:[2],r2:[5]}"],
+      ["3", "{r1:1,r2:1}", "r1→0；r2→1", "1→0；1→0", "{r1:[3],r2:[6]}"],
+      ["4", "{r1:1,r2:1}（执行期 abort r1）", "r1→0；r2→1", "r2:1→0；r1 已除名跳过", "{r2:[7]}（r1 无输出不报错）"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "在途守恒：schedule 时每请求 +num_scheduled（_update_after_schedule 乐观推进），update 时恰 −num_scheduled（循环对 num_scheduled_tokens 每成员恰访一次）→ 稳态归零；requests.get→None 或 is_finished 的 continue 分支保证删名/已完成请求不破坏循环。",
+    "argument": "两侧共用同一本字典（SchedulerOutput.num_scheduled_tokens）：加账在 _update_after_schedule（L1723），减账在 update_from_output 首段（L1745）——键集合相同、各加减一次，代数和为零；abort 场景：finish_requests 先 del requests[req_id]，循环里 request 为 None → continue（L1756-L1762），幂等不炸——这正是 ch9 abort 双投递成立的引擎侧前提。"
+   },
+   "quantified": "woosuk 自注（scheduler.py:L1728-L1730 原话）：'As len(num_scheduled_tokens) can be up to 1K or more, the below loop can be a performance bottleneck. We should do our best to avoid expensive operations inside the loop.'——千级请求 × 每秒上百拍的循环体纪律，配套微优化见 m20（remove_all 快路径 / 'Avoid list(set)'）。本例 4 拍各演示热循环的一个动作面：定位（req_id_to_index）/核销/空行跳过/幂等 continue。",
+   "caveats": []
+  },
+  {
+   "mechanism_id": "m12",
+   "intuition": "逐件过安检：每件行李先登记再检测；查出违禁品的那件也登记（用户要看到触发词），但它后面的行李全部退回（截断）——外送清单与入账清单永远同步终止。",
+   "worked_example": {
+    "params": {
+     "场景 A": "r1 16-token prompt、eos_token_id=6；拍 2 喂 3-token 采样行 [5,6,7]（spec/jump decoding 会产出多 token 行）",
+     "场景 B": "block_size=4、prompt 6 token——看 append_output_token_ids 连带的增量块哈希（F2 伏线）",
+     "机制本体": "scheduler.py:L2094-L2111（impl 逐字保留）+ request.py:L249-L265（append→update_block_hashes）",
+     "驱动脚本": "traces/run_m12_token_trim.py → traces/m12_token_trim.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m12_token_trim.json",
+    "table": {
+     "columns": ["场景·拍", "输入行", "逐 token 动作", "判停/满块", "外送或哈希"],
+     "rows": [
+      ["A-1", "[1]", "1 入账后 check_stop", "未停", "外送 [1]"],
+      ["A-2", "[5,6,7]", "5 入账未停→6 入账命中 EOS→停止即截断", "FINISHED_STOPPED", "外送 [5,6]；7 不入账不外送"],
+      ["B-构造", "prompt 6 token", "构造时算满块哈希（block_size=4）", "—", "block_hashes 1"],
+      ["B-append 8", "[8]", "第 8 token：第 2 块满", "—", "block_hashes 2"],
+      ["B-append 12", "[12]", "第 12 token：第 3 块满", "—", "block_hashes 3"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "截断下标一致性：停止发生在行内第 num_new 个 token 时，del new_token_ids[num_new:] 使外送=入账前缀（两者同源同长）——停止 token 本身入账（用户要看到触发词）、其后 token 既不入账也不外送。",
+    "argument": "循环体顺序固定：append_output_token_ids(t) → check_stop → 若停则 del 后 break——判定永远基于最新账本（先记后判），截断发生在已入账前缀的右端点；两份清单（output_token_ids 与外送 new_token_ids）由同一下标切割，构造性同步。"
+   },
+   "quantified": "本例行内 3 token 只送 2——多 token 行（spec decode/jump decoding 常态）的截断粒度=token 级；入账 [1,5,6] 与外送 [5,6] 恰差历史部分。增量哈希：append 每次顺手 extend block_hashes（request.py:L260）——B 场景 6→8→12 token 时哈希 1→2→3（每满 4 token 一枚）：前缀恢复的伏线在每次输出时都在续（F2→ch15）。",
+   "caveats": []
+  },
+  {
+   "mechanism_id": "m13",
+   "intuition": "五道关卡按固定顺序过：先验『未成年人禁入』（min_tokens 门槛），再验指纹（EOS）、黑名单（stop_token_ids）、里程上限（长度封顶）、复读机检测（重复）——顺序即优先级：前面拦住就轮不到后面。这里只有 token 编号；字面意义的『敏感词』（stop string）不在这道关卡，在前端 detokenizer。",
+   "worked_example": {
+    "params": {
+     "构造": "直接单测 check_stop（prompt 4 token；max_model_len 按场景 8/8192；min_tokens/eos/stop_token_ids/max_tokens/repetition_detection 各场景独立）",
+     "机制本体": "utils.py:L94-L130（impl 无删除，130 行全保留；check_sequence_repetition 同文件 L10-L70）",
+     "驱动脚本": "traces/run_m13_check_stop.py → traces/m13_check_stop.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m13_check_stop.json",
+    "table": {
+     "columns": ["判", "场景", "关键输入", "返回", "置态", "stop_reason"],
+     "rows": [
+      ["1", "min_tokens=3 拦 EOS", "输出 [5]（1<3）而末位=EOS", "False", "（未变）", "—"],
+      ["1", "min_tokens=3 拦 EOS", "输出 [5,5]（2<3）", "False", "（未变）", "—"],
+      ["1→2", "3≥3 放行后 EOS 生效", "输出 [5,5,5]", "True", "FINISHED_STOPPED", "—"],
+      ["2", "EOS 命中", "输出 [1,9]，eos=9", "True", "FINISHED_STOPPED", "—"],
+      ["3", "stop_token_ids 命中", "输出 [1,7]，stop=[7]", "True", "FINISHED_STOPPED", "7"],
+      ["4a", "长度封顶（模型上限）", "num_tokens 8 ≥ max_model_len 8", "True", "FINISHED_LENGTH_CAPPED", "—"],
+      ["4b", "长度封顶（输出上限）", "output 2 ≥ max_tokens 2", "True", "FINISHED_LENGTH_CAPPED", "—"],
+      ["5", "重复检测", "输出 [1,2]×3，参数 (2,1,3)", "True", "FINISHED_REPETITION", "repetition_detected"],
+      ["—", "无命中", "输出 [5]", "False", "（未变）", "—"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "五连判按固定顺序短路——唯一的否定性门槛是 min_tokens（返回 False 并拦截后续四判），其余四判命中即置终态返回 True；每 token 至多 5 次谓词调用、无循环无回溯。",
+    "argument": "源码是五段顺序 if（L100-L128），每段要么 return False（仅第一判）要么命中置态 return True，要么落到下一段——控制流本身即优先级证明；J1 三行用例专门证 min_tokens 先于 EOS（纵使末位是 EOS，1<3 与 2<3 都拦下，第三行 3≥3 才放行）。"
+   },
+   "quantified": "本例 9 用例覆盖五判全分支+顺序证明。规模感：热循环里每输出 token 一次（m11→m12 链路），千级并发每秒十万次级（同 m10）；第五判的 N-gram 匹配 O(模式长×重复数) 只在配置 repetition_detection 时才付（默认 None 短路）。澄清点（writer 必讲）：stop string 不在 check_stop——字符串子串匹配在前端 detokenizer 文本空间（Part II），发现后回调 finish_requests（interface.py:L151-L156 列明第 2 种调用情形）；check_stop 只看整型 token id。",
+   "caveats": []
+  },
+  {
+   "mechanism_id": "m14",
+   "intuition": "离店登记先抄原因再办手续：办手续可能把客人转成『续住』（流式会话改回 WAITING），先把离店原因抄下来才不会丢；从哪个区离场（堂食区 running / 候位区 waiting）决定从哪个名单划掉——被抢当拍完成的罕见客人从候位名单划。",
+   "worked_example": {
+    "params": {
+     "场景 A": "r1 16-token、eos=99——正常 decode 停止（先抓 reason 再 handle → free → 摘 running → 下拍通告 worker）",
+     "场景 B": "rB 16-token、eos=42——async 模拟：本拍已调度、输出回来前被抢，在途 token 恰是 EOS（被抢当拍完成的罕见路径）",
+     "机制本体": "scheduler.py:L1895-L1907 停止分流 + L1946-L1951 批量摘除（impl 原样；_handle_stopped_request 坍缩恒 True——流式删，见 m15）",
+     "驱动脚本": "traces/run_m14_stop_fork.py → traces/m14_stop_fork.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m14_stop_fork.json",
+    "table": {
+     "columns": ["场景", "停止时身份", "finish_reason", "handle 返回", "摘除名单", "终点"],
+     "rows": [
+      ["A", "RUNNING（正常 decode 停止）", "STOP（先抓）", "True→free", "running（remove_all）", "del requests；下拍 finished_req_ids 通告 worker"],
+      ["B", "PREEMPTED（被抢当拍完成）", "STOP（先抓）", "True→free", "waiting+skipped（罕见路径）", "del requests；输出仍带 [42] 与 STOP"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "finish_reason 必须在 _handle_stopped_request 之前抓取：handle 可能改 status（真实流式版改回 WAITING，而 WAITING 系非终态大多无 reason 映射），先抓后改保证 reason 与用户可见输出一致；分流二分（status_before_stop==RUNNING 与否）覆盖全部到达路径且摘除幂等。",
+    "argument": "status_before_stop 在 _update_request_with_output 之前读取（L1799），停止后 finish_reason=get_finished_reason() 在 handle 之前（L1897-L1899 注释原话 'Capture finish_reason BEFORE _handle_stopped_request, which may reset the status to WAITING for streaming requests that continue'）；else 分支兜住 PREEMPTED 与一切非 RUNNING 到达路径（含 B 的罕见路径），stopped_preempted 从 waiting 与 skipped_waiting 双队列摘除——集合语义天然幂等。"
+   },
+   "quantified": "场景 B 是源码自注的 'rare case'（L1946-L1952 'This is a rare case and unlikely to impact performance'）——async 重叠下才可达（同步引擎里被抢请求本拍不在 num_scheduled 中）；本例 B 的输出仍带 finish_reason=STOP 且请求被从 waiting 摘除并 free——『先抓再 handle』的时序让这条罕见路径的对外行为与正常路径完全一致。精简版 handle 恒 True：时序约束的『为什么』见 m15 manual 素材。",
+   "caveats": []
+  },
+  {
+   "mechanism_id": "m15",
+   "intuition": "长住客的『退房』可能是换房：前台一看还有下一段住宿合同（streaming_queue 有下一段），就不真退房，改房卡续住（重写 prompt 回 WAITING）；只有合同到头（队列终点）才算真离店——所以『停止』不等于『完成』，得问过前台才知道。",
+   "worked_example": {
+    "params": {
+     "机制本体": "scheduler.py:L2076-L2092（真实源码：resumable/streaming_queue/_update_request_as_session/WAITING_FOR_STREAMING_REQ）+ L1367-L1408 会话续接",
+     "取材": "手工推演真实源码（见 manual_reason）；非流式恒 True 的运行证据在 traces/m14_stop_fork.json（A/B 两场景均 handle=True→free）"
+    },
+    "trace_source": "manual",
+    "manual_reason": "流式输入会话（resumable/streaming_queue/_update_request_as_session）随 dossier.delete 第 5 条从精简版删除——impl 的 _handle_stopped_request 坍缩为 return True，『假终点』两分支无法在精简版运行；本表按真实源码 scheduler.py:L2076-L2092 手工推演（分支结构为源码原文，非杜撰）。",
+    "table": {
+     "columns": ["场景", "_handle_stopped_request 动作", "返回", "请求去向"],
+     "rows": [
+      ["非流式请求停止", "not resumable → 直接 return True", "True", "_free_request 真终点"],
+      ["流式会话·有下一段", "popleft 下一段 update → _update_request_as_session 重写 prompt → 重新入队", "False", "回 WAITING 续跑（假终点）"],
+      ["流式会话·队列空", "转 WAITING_FOR_STREAMING_REQ + 计数递增 → 重新入队", "False", "挂起等输入（另一形态假终点）"],
+      ["流式会话·队列终点", "popleft 得 None → return True", "True", "真终点"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "返回值三分完备：True（非 resumable 或队列终点）→ free；False+有续段 → 留在 waiting（prompt 已重写）；False+空队列 → 留在 skipped（WAITING_FOR_STREAMING_REQ）。无论哪条，stopped 摘除都会把它从 running 拿走——不会双重在场；但只有 True 才 del requests。",
+    "argument": "状态图不是单向 DAG（WC2 cost③）：『stop→又回 WAITING 续跑』的回流正发生在返回 False 的两条分支上——这也逼出 m14 的时序约束（finish_reason 先抓）：handle 改回 WAITING 后 get_finished_reason(WAITING_FOR_STREAMING_REQ) 走的是特例映射 STOP（m10 表），不先抓就丢因或错因。"
+   },
+   "quantified": "真实源码四行三分（L2078-L2092）；WAITING_FOR_STREAMING_REQ→STOP 的特例映射（m10 表值 4）正是为挂起态准备的对外口径——客户端断开时 finish_requests 对挂起者置 FINISHED_ABORTED（m17）。精简版/一次性输入的绝大多数部署恒走第一行（返回 True 即真完成）。",
+   "caveats": [
+    "本机制为 manual 素材：分支结构与语义对真实源码逐行核（锚 L2076-L2092），无数值 trace；运行侧只有『非流式恒 True』可验（m14 trace）。"
+   ]
+  },
+  {
+   "mechanism_id": "m17",
+   "intuition": "客人失联时前台强制销户：三个名单（在住 running / 候位 waiting / 隔离 skipped）全划掉、房间收回、台账除名——重复销户无害（已销的跳过），销错人无害（查无此人跳过）。",
+   "worked_example": {
+    "params": {
+     "池": "4 块（场景 C 用 1 块触发自我抢占）",
+     "场景": "A：RUNNING abort（str 形）+二次幂等；B：WAITING abort（list 形）；C：PREEMPTED abort；D：None=全量（shutdown drain 形态）；执行期 abort 的 update 幂等半边见 traces/m11_hotloop.json 拍 4",
+     "机制本体": "scheduler.py:L2237-L2298（impl 两遍法/三队列摘除/幂等原样保留；REMOTE_KVS 延迟释放判定随 connector 删）",
+     "驱动脚本": "traces/run_m17_finish_requests.py → traces/m17_finish_requests.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m17_finish_requests.json",
+    "table": {
+     "columns": ["场景", "入参形", "停止前状态", "返回", "摘除", "终点动作"],
+     "rows": [
+      ["A", "str 'r1'", "RUNNING", "[r1]", "running", "FINISHED_ABORTED→free：块归池（空闲 4）、del requests、finished_req_ids={r1}"],
+      ["A'", "str 'r1'（重复）/ghost", "已 FINISHED / 不存在", "[] / []", "—", "no-op（幂等：abort 双投递成立前提）"],
+      ["B", "list ['r2']", "WAITING", "[r2]", "waiting+skipped", "同上 free"],
+      ["C", "list ['r3']", "PREEMPTED", "[r3]", "waiting+skipped", "同上 free（被抢者住在 waiting）"],
+      ["D", "None", "WAITING", "[r4]", "waiting+skipped", "全量 finish（shutdown drain 形态）"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "幂等：第一遍收集即过滤 `request is None or request.is_finished()`，二次调用对已 finish 者no-op；三队列摘除先于置态+free——free 时请求已不在任何队列，无悬挂引用。",
+    "argument": "入口断言 is_finished(finished_status) 保证只接受终态入参；两遍法（先收集摘除、再统一置态 free）使队列操作与 free 的顺序无关性成立——单遍边遍历边删才是悬挂引用的温床；幂等性正是 ch9 abort 双投递（input_queue 保序 + aborts_queue 及时）成立的引擎侧前提（m11 拍 4 的 continue 是另一半）。"
+   },
+   "quantified": "调用链：前端断连 → aborts_queue 在每次 update_from_output 之前批量落地（core.py:L608→L741-L749）→ finish_requests(FINISHED_ABORTED)；stop string 由前端 detokenizer 发现后也回调这里（interface.py:L151-L156 第 2 种情形）；语法编译失败→FINISHED_ERROR 同路（真实 L1954-L1962，精简版随 structured 删）。本例 D 形（request_ids=None）即 shutdown drain 用的全量形态。",
+   "caveats": []
+  },
+  {
+   "mechanism_id": "m19",
+   "intuition": "预支工资的月底纠偏：调度时按乐观账本先发了（computed + 1 真采样 + 草稿数），采样验证只认可真正被接受的部分——多发的当场从账上划回，账本永远回到『真实产出』。",
+   "worked_example": {
+    "params": {
+     "设定": "一个 decode 步带 3 个 spec 草稿 token：追赶公式把 1+3=4 都排进去、_update_after_schedule 乐观推进 computed+4",
+     "机制本体": "scheduler.py:L1766-L1784 spec 拒绝回扣（真实源码语义手工推演，见 manual_reason）",
+     "锚点": "源码注释原话（L1780-L1784）：'Rejections roll back num_computed_tokens (and, under async scheduling, num_output_placeholders, which covers the spec tokens)'"
+    },
+    "trace_source": "manual",
+    "manual_reason": "spec 拒绝回扣分支（scheduler.py:L1766-L1784）随 dossier.delete 第 6 条从精简版删除（spec decode 归 ch12/spec 章）——不可运行；本表按真实源码语义手工推演，数字为源码字段算术（锚 L1766-L1784），非 trace 观测。",
+    "table": {
+     "columns": ["时点", "动作", "num_computed_tokens", "num_output_placeholders（async）"],
+     "rows": [
+      ["调度后", "_update_after_schedule 乐观推进（1 真+3 草稿）", "+4", "+4（async 占位）"],
+      ["采样回账", "验证接受 1、拒绝 3（num_rejected=3）", "回扣 −3（净 +1）", "回扣 −3（净 +1）"],
+      ["下一拍", "追赶公式重算差值", "差=3（恰为重算量）", "—"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "回扣量=被拒量：追赶公式 computed 追 num_tokens_with_spec——被拒 token 不再计入 with_spec（spec_token_ids 清/收），computed 回扣同量 → 下拍 num_new_tokens 恰为重算量；乐观账与真实账每拍收敛。",
+    "argument": "这是追赶公式（ch10 已立）的一致性补偿：spec decode 把『一拍多 token』引入乐观记账，拒绝回扣把多记的部分原额划回——无 spec 时差恒 ≤1（每拍 1 token），有 spec 时差=本拍被拒数，下一拍的调度即重算。"
+   },
+   "quantified": "本例 4 记 1 收：净 +1 = 真实接受量。安全网定位（dossier m19 scope）：spec 拒绝回扣深挖归 ch12/spec 章，本章只在热循环里路过——与 stale 协议（m4）同为『乐观记账的补偿机制』家族，但作用对象不同（m4 保输出一致性、m19 保账本收敛）。",
+   "caveats": [
+    "manual 素材：数字为源码字段算术演示，非运行观测；正文引用时明标『按源码语义推演』。"
+   ]
+  },
+  {
+   "mechanism_id": "m20",
+   "intuition": "名单上只划一个名字时直接铅笔划掉（原地改，不重抄名单）；要划一批才重抄整份。热路径上每拍通常只停一个请求——铅笔划就是常态。",
+   "worked_example": {
+    "params": {
+     "构造": "remove_all 三形态直测（空集合/单元素/多元素）",
+     "机制本体": "utils.py:L62-L91（impl 无删除）+ 调用点 scheduler.py:L1946-L1952（update_from_output 摘除停止者）与 L2117-L2118 'OPTIMIZATION: Avoid list(set)'",
+     "驱动脚本": "traces/run_m20_remove_all.py → traces/m20_remove_all.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m20_remove_all.json",
+    "table": {
+     "columns": ["形态", "removed", "返回对象", "列表变化"],
+     "rows": [
+      ["空集合", "0", "原对象（is lst）", "不动（3 项原样）"],
+      ["单元素 {b}", "1", "原对象（is lst）", "原地删 1 项得 [a,c]（零新分配）"],
+      ["多元素 {a,c}", "2", "新列表（is not lst）", "重建 [b,d]；原 4 项不动"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "两路径语义等价：输出集合恒等于 lst−items；差异仅在对象身份（in-place vs 新建）与分配次数——单元素路径 list.remove 至多删一个（集合恰一元素）无过删；调用方必须用返回值。",
+    "argument": "docstring 明言 'Callers should use the returned value'：多元素路径返回新列表、原列表不动——身份差异是契约的一部分而非实现细节；单元素快路径省去整表重建与逐元素集合成员测试，是一次 list.remove（O(n) 内部扫描，无 Python 级循环）。"
+   },
+   "quantified": "调用点量级：update_from_output 每拍 remove_all(running, stopped_running)（scheduler.py:L1946-L1948）——千级列表 × 每秒上百拍，且每拍至多停 1 个请求（常态），快路径即主路径；同款尾部纪律：'OPTIMIZATION: Avoid list(set)'（L2117-L2118，连 set(list) 都省）。这是 woosuk 瓶颈自注（L1728-L1730，见 m11）在utils里的落点例证——Python 热路径连函数调用与分配都要省。",
+   "caveats": []
+  }
+ ]
+}

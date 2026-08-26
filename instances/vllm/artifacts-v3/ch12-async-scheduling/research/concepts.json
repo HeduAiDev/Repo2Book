@@ -1,0 +1,128 @@
+{
+  "chapter_id": "ch12",
+  "chapter_title": "异步调度",
+  "pin": "vLLM v0.27.1 (6e448d0ea)",
+  "generated": "2026-08-27",
+  "scope_note": "本章三个 introduces 项的外部背景映射：num_output_placeholders → concepts[0]（机制来龙去脉+官方 PR 口径）；采样 token 不落 CPU → concepts[0]（PR #23569 出处）+ concepts[1]（CUDA 流/事件/锁页三件套原语）；影子状态 → concepts[2]（双缓冲类比 + 术语考证：本书概括用词，vLLM 源码无此名，但 CPU-side shadow 惯用语在代码库另有实证）。复用与重锚定：python-collections-deque / speculative-decoding-minimal / pipeline-parallelism-bubble 三条复用自 v2 ch12 的 research/concepts.json（其 sources 访问日期 2026-07-24，本轮未重抓 arXiv；论文存在性/标题/结论为稳定学术事实）；deque 条目已剔除 v0.21.0 的 batch_queue[-1][0].done() 旧忙闲判据（v0.27.1 判定条件已换，据本章 dossier 锚点 core.py:L625-L687 重写）；spec-decode 条目 writer_note 由 v2 的 §12.5 改指本书 ch32/33。刻意不做（他章已讲或主场在后）：Future/异步回执（ch9 已教）、语法 bitmask 窗口（ch9）、CUDA Graph（ch19）、continuous batching/Orca/Sarathi（ch10）、PagedAttention（ch13）、spec decode 机制深挖（ch32/33）、TP/PP/DP 本体（ch34）。版本纪律：凡说「现在怎样」均锚 v0.27.1 + 本轮抓取日期（2026-08-27 或逐条标注）；commit 3e440786a 标题里的 30.8%/31.8% 是 commit 标题自报数字（本轮已一手抓取核实标题原文，但非论文级基准），写作引用时须明标出处形态。",
+  "concepts": [
+    {
+      "id": "vllm-async-scheduling-lineage",
+      "term": "vLLM 异步调度（async scheduling）与 output placeholder 机制",
+      "kind": "custom_pattern",
+      "one_line": "vLLM 官方机制「async scheduling」：让 CPU 调度器比 GPU 执行抢先跑一步，为还没采样出来的 token 记一笔「output placeholder（输出占位符）」欠账——本章的 num_output_placeholders、采样 token 不落 CPU、深度 2 批队列，全是这套机制的实现细节。",
+      "what_it_is": "机制本质按作者 PR 原话（#19970）：“The primary goal is to minimize scheduler overhead by overlapping scheduling with model execution. This is achieved by making the scheduler operate one step ahead of the current execution.”——调度器不等上一拍结果落 CPU，直接为下一拍组 batch；账务核心是 “The key addition is an ‘output placeholder,’ representing tokens scheduled but not yet generated.”（每个被调度但尚未生成完的请求，输出区先记欠条——即本章字段 num_output_placeholders）。性能口径（作者自报）：“Async scheduling increases throughput by 3-15%.”（且小模型/大 batch 更明显），代价是 “async scheduling generally reduces TPOT but slightly increases TTFT”——因为新请求要多等一个调度步。两个易混点：①这里的 async ≠ Python asyncio——作者明说 “the scheduler and GPU worker must run in separate processes for parallel execution”，靠进程分工 + Future 回执（回收 ch9 已讲的 Future 背景）而非协程；②学术近亲作者自述 “similar to the approach described in the NanoFlow paper”（arXiv 2408.12757，设备内 nano-batch 流水线重叠），不是从零发明。",
+      "background": "演进时间线（各步均一手抓取 PR/commit 页核实）：① 2025-07-15 PR #19970 “Implement Async Scheduling” 合入（WoosukKwon，merge commit d4d3094）——AsyncScheduler + 占位账本 + 批队列的初版，默认关闭；② 2025-09-06 PR #23569 “[Perf][V1] Fully overlap model execution” 合入——第二跳「采样 token 不落 CPU」：作者原话 “return a CUDA tensor reference to the sampled token ids, instead of the pythonized token ids”、“the output_token_ids and token_ids_cpu are no longer updated after the sampling step.”，自报 “Expected speedup is 5-10% over the current async scheduling.”；③ 2025-11-17 PR #24799 “[Core] Async Scheduling X Spec Decoding Compatibility” 合入（njhill）——兼容性逐一拆除：“we won't copy draft token ids to scheduler any more, but cache it in gpu_model_runner”（先只支持 EAGLE）；④ 2025-12-29 PR #27614 “[Core] Enable async scheduling by default” 合入（mgoin，作者 njhill：“All blockers have now been resolved”）——默认翻转，本书 pin 的 v0.27.1 里 async_scheduling 默认 None=开启（不兼容特性自动降级），故本章叙事角度是「默认心跳」；⑤ 2026-01-28 commit 3e440786a（PR #32618）“[Feature] Fully support for async scheduling + PP, 30.8% E2E throughput improvement, 31.8% TPOT improvement”——async+PP 这块最后的兼容缺口也补上了。v0.27.1 官方文档口径（docs.vllm.ai，2026-08-25 抓取）：“If set to False, disable async scheduling. Async scheduling helps to avoid gaps in GPU utilization, leading to better latency and throughput.”——从文档措辞即可看出它已是默认行为。",
+      "example": "最小占位账本走查（说明性数字，与 dossier worked example 严格一致：prompt=2、max_tokens=2、无 spec、每拍采 1 个 token；ph=num_output_placeholders，tws=num_tokens_with_spec（token 总数账面），computed=乐观已算，真实已算=computed−ph）：拍1（批A·prefill）：追赶公式 2+0−0=2，整段 prompt 排入；调度后 computed=2，AsyncScheduler 记账 ph=0+1=1——此刻批A 一个 token 都没采出来，但欠条已立。拍2（批B）：追赶公式 2+1−2=1——t2 还没采回来，位置先占上；computed=3、ph=2；队列满，同一次调用下半段 pop 批A 收结果：t2 到账（tws=3）、ph=2−1=1、cache_blocks(3−1=2) 把真实前缀 [t0,t1] 转正。拍3：剪枝判定 computed(3)+2−ph(1)=4 ≥ prompt(2)+max_tokens(2)=4，不再排多余一步。贯穿不变式：computed−ph=真实已算；稳态 ph 在 {1,2} 间振荡（上界约为队列深度×每拍采样数）。",
+      "links": [
+        "https://github.com/vllm-project/vllm/pull/19970",
+        "https://github.com/vllm-project/vllm/pull/27614",
+        "https://arxiv.org/abs/2408.12757"
+      ],
+      "sources": [
+        {"url": "https://github.com/vllm-project/vllm/pull/19970", "note": "PR 原文：机制/占位/NanoFlow/separate processes/3-15%/TPOT↓TTFT↑ 全部逐字核实；merged 2025-07-15 by WoosukKwon, d4d3094（访问日期 2026-08-27）"},
+        {"url": "https://github.com/vllm-project/vllm/pull/23569", "note": "PR 原文：CUDA tensor reference / 不再更新 output_token_ids 与 token_ids_cpu / 5-10% 逐字核实；merged 2025-09-06（访问日期 2026-08-27）"},
+        {"url": "https://github.com/vllm-project/vllm/pull/24799", "note": "PR 原文：spec 兼容、草稿 token 不回传调度器改缓存在 gpu_model_runner、先支持 EAGLE；merged 2025-11-17 by njhill（访问日期 2026-08-27）"},
+        {"url": "https://github.com/vllm-project/vllm/pull/27614", "note": "PR 页：标题 '[Core] Enable async scheduling by default'、njhill 'All blockers have now been resolved'、merged 2025-12-29 by mgoin（访问日期 2026-08-27）"},
+        {"url": "https://github.com/vllm-project/vllm/commit/3e440786a", "note": "commit 标题原文 '[Feature] Fully support for async scheduling + PP, 30.8% E2E throughput improvement, 31.8% TPOT improvement'，对应 PR #32618（访问日期 2026-08-27；数字为 commit 标题自报，非论文基准）"},
+        {"url": "https://docs.vllm.ai/en/latest/api/vllm/config/scheduler/", "note": "vLLM 官方文档（对应 pin 版 docstring）：async_scheduling 默认 None=开启的官方措辞 'If set to False, disable async scheduling...'（访问日期 2026-08-25）"}
+      ],
+      "confidence": "high",
+      "writer_note": "这是「默认心跳」叙事的总纲背景：正文讲机制细节时点名一句「这套机制 2025-07 进仓（PR #19970，学术近亲 NanoFlow 论文）、2025-12-29 起默认开启（PR #27614）」即可给读者历史坐标；3-15%/5-10%/TPOT↓TTFT↑ 正好支撑「三段相加→取最大值」的收益账，而 30.8%/31.8% 是 commit 标题自报的 git 证据、引用时明标出处形态；「async ≠ asyncio」（进程分工+Future 回执）务必在术语首现时点破，正好回收 ch9 的 Future 伏笔。"
+    },
+    {
+      "id": "cuda-streams-events-pinned-memory",
+      "term": "CUDA 流 / 事件 / 锁页内存——异步执行三件套",
+      "kind": "notation",
+      "one_line": "PyTorch/CUDA 的三件标准设施：流（stream，操作排队的车道）、事件（event，跨流对齐的哨兵）、锁页内存（pinned memory，异步主机↔GPU 拷贝的前提）——AsyncGPUModelRunnerOutput 里 wait_stream/non_blocking/record/synchronize 的组合拳全是它们的官方语法。",
+      "what_it_is": "流：官方定义 “A CUDA stream is a linear sequence of execution that belongs to a specific device.”——同一流内 “Operations inside each stream are serialized in the order they are created”，不同流的操作 “can execute concurrently in any relative order, unless explicit synchronization functions” 显式对齐——这就是「专设一条 copy stream」能与其他 GPU 工作并行的全部依据。事件：“CUDA events are synchronization markers that can be used to monitor the device's progress”；构造签名 torch.cuda.Event(enable_timing=False, blocking=False, interprocess=False, external=False)，其中 blocking 参数 “if True, wait() will be blocking (default: False)”——默认 False 意味着等待是 CPU 自旋轮询（忙等）而非睡眠，本章忙循环语境下这恰是要的语义；wait() 官方释义 “Make all future work submitted to the given stream wait for this event”（“a wrapper around cudaStreamWaitEvent()”）——注意它约束的是 GPU 侧后续工作，synchronize() 才是 CPU 线程等。锁页内存：“Host to GPU copies are much faster when they originate from pinned (page-locked) memory.”，且 “once you pin a tensor or storage, you can use asynchronous GPU copies. Just pass an additional non_blocking=True”——官方明言 “This can be used to overlap data transfers with computation.”——异步 D2H 必须落到锁页缓冲才成立，这正是 AsyncGPUModelRunnerOutput 要预锁页输出缓冲的原因。跨流顺序原语：wait_stream——官方示例释义 “The torch.cuda.Stream.wait_stream() call ensures that the [上游流] execution has finished before we start running [本流后续算子]”。三件套的教科书组合就是「侧流传输 + 事件对齐 + 锁页缓冲」的 overlap 模式（PyTorch 官方 CUDA 语义文档的异步练习即此模式）。",
+      "background": "CUDA 从设计之初就是异步执行模型：CPU 提交 kernel/拷贝后立即返回，GPU 按流排队执行——流与事件是 NVIDIA 运行时的原生概念，PyTorch 把它们包成 torch.cuda.Stream / torch.cuda.Event / tensor.pin_memory() 露给 Python 层。vLLM 没有发明任何新东西，只是按官方语义把三件套组合在「采样结果张量」上：token 从此留在 GPU、按需异步 D2H。给初学者的三个意象：流=车道（每条道内顺序走，不同道可并行）、事件=哨兵（谁先到谁等着对齐）、锁页=异步搬运的前提（普通内存会被操作系统换页，GPU 没法保证异步搬运途中地址有效）。",
+      "example": "最小 torch 片段（说明性，可在任意有 CUDA 的环境照跑核对）：\nimport torch\na_pin = torch.randn(1024).pin_memory()             # 1) 锁页：之后才能异步 H2D\ns = torch.cuda.Stream()                            # 2) 侧流：专用「拷贝车道」\nwith torch.cuda.stream(s):\n    gpu_src = a_pin.to(\"cuda\", non_blocking=True)  # 3) 异步拷贝：提交即返回，CPU 不等\ntorch.cuda.current_stream().wait_stream(s)         # 4) 默认流等侧流：数据就位才继续\nout = gpu_src * 2                                  # 5) 计算放心用这份数据\ntorch.cuda.synchronize()                           # 6) CPU 等全部落定\n逐行对照本章：第 2/3 步=专用 copy stream + non_blocking 传输（AsyncGPUModelRunnerOutput 的 D2H 正是此形态，只是方向反成 GPU→锁页 CPU）；第 4 步=消费方流对拷贝流的 wait_stream；第 6 步=event.synchronize 的角色——future.result() 时才真正落地成 Python list。",
+      "links": [
+        "https://docs.pytorch.org/docs/2.13/notes/cuda.html",
+        "https://docs.pytorch.org/docs/2.13/generated/torch.cuda.Event.html",
+        "https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html"
+      ],
+      "sources": [
+        {"url": "https://docs.pytorch.org/docs/2.13/notes/cuda.html", "note": "PyTorch 2.13 官方 CUDA 语义：流定义/流内串流间并发/锁页/非阻塞拷贝/overlap/wait_stream 用法逐字核实（访问日期 2026-08-27）"},
+        {"url": "https://docs.pytorch.org/docs/2.13/generated/torch.cuda.Event.html", "note": "torch.cuda.Event 构造签名、blocking 参数 'if True, wait() will be blocking (default: False)'、wait()/synchronize() 释义、事件总述逐字核实（访问日期 2026-08-27）"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文读 AsyncGPUModelRunnerOutput 时按需点一句三个原语各自的官方语义（尤其 blocking=False 的自旋等待与本章忙循环的呼应、wait() 管 GPU 侧顺序而 synchronize() 才管 CPU），不必整段展开——初学者建立「流=车道、事件=哨兵、锁页=异步搬运的前提」三个意象即可，深挖交给链接；NVIDIA 官方 CUDA Programming Guide 收在链接里作门，正文不必引。"
+    },
+    {
+      "id": "double-buffering-and-shadow-state",
+      "term": "双缓冲（double buffering）与「影子状态」",
+      "kind": "external_concept",
+      "one_line": "图形学的老发明：画下一帧的同时显示上一帧（front/back buffer 每帧交换角色），读的一方永远拿到完整版本——vLLM 深度 2 的批队列、worker 侧为上一拍保留的镜像状态（本书称「影子状态」），都是这个思想在 GPU 推理里的转世。",
+      "what_it_is": "经典定义（Wikipedia）：multiple buffering “is the use of more than one buffer to hold a block of data, so that a ‘reader’ will see a complete (though perhaps old) version of the data instead of a partially updated version”——多份缓冲交替，读方永远读到一份完整（哪怕旧一拍）的数据。图形学的经典形态是页翻转：“one buffer is actively being displayed by the monitor, while the other, background buffer is being drawn”——可见的叫 front buffer、后台被绘制的叫 back buffer，每帧交换角色；再添一个后台缓冲（三缓冲）后 “the software and the graphics card are completely independent and can run at their own pace”。映射到本章（本书类比，非 vLLM 官方术语）：batch_queue 的两个槽位（maxlen=2）正是 front/back——一个批正在 GPU 上「放映」（执行），另一个正在 CPU 侧「绘制」（调度），稳态下每次 step_with_batch_queue 都「调度一个新批 + 收掉一个旧批」，GPU 与 CPU 互为对方的掩体；worker 侧的 prev_sampled_token_ids / prev_req_id_to_index 等上一拍镜像，则让调度器读到的进度永远是完整但滞后一拍的版本——滞后量恰由占位账本记着，两条数据路径（快路留 GPU 喂下一拍前向 / 慢路异步 D2H 出门给用户）并行不悖。术语考证：「影子状态」是本书的概括用词，vLLM 源码没有用它命名本章这套字段；但 “CPU-side shadow” 作为系统编程惯用语确实存在于 vLLM 代码库——如 vllm/v1/spec_decode/llm_base_proposer.py 的注释 “Invalidate the CPU-side shadows to avoid H<>D sync.”（指同一族模式：CPU 侧保留 GPU 状态的镜像、避免同步）。",
+      "background": "双缓冲源自 1970s 起的图形显示硬件（页翻转消除撕裂），此后成为 producer/consumer 解耦的通用模式（环形缓冲、双缓冲 DMA）；GPU 编程里「传输与计算重叠」（PyTorch 官方语 “This can be used to overlap data transfers with computation.”）是它的流水线化变体。本章的深度算术：单卡 async 深度=2 恰好构成双缓冲（一放映一绘制）；PP 场景深度=pp_size（每段流水线都要有活在算）、V2 runner=pp_size+1（消末段气泡）——同一思想在不同拓扑下的取值不同。",
+      "example": "双帧交替最小走查（说明性）：帧1——buffer A 送显（front）、buffer B 被绘制（back）→ 垂直空白期翻转 → 帧2——B 送显、A 被绘制，如此往复；对应本章：第 k 拍批 A 在 GPU 执行（front），批 B 在 CPU 被调度（back）→ B 入队后 pop A 收结果，角色交换。关键共同点：送显方/执行方永远拿到一份「完整」的状态，新旧交替的瞬间不存在半新半旧。",
+      "links": [
+        "https://en.wikipedia.org/wiki/Multiple_buffering",
+        "https://docs.pytorch.org/docs/2.13/notes/cuda.html",
+        "https://arxiv.org/abs/2408.12757"
+      ],
+      "sources": [
+        {"url": "https://en.wikipedia.org/wiki/Multiple_buffering", "note": "multiple buffering 定义句 / front-back buffer 页翻转 / 三缓冲 'completely independent' 句逐字核实（访问日期 2026-08-27）"},
+        {"url": "https://docs.pytorch.org/docs/2.13/notes/cuda.html", "note": "overlap data transfers with computation 官方措辞（访问日期 2026-08-27）"}
+      ],
+      "confidence": "high",
+      "writer_note": "「影子状态」首现时务必点明：这是本书的教学概括词，vLLM 源码里没有这个名字（可顺带提 spec_decode 里 'CPU-side shadows' 注释佐证这是惯用语家族）；双缓冲类比给读者一个熟悉的意象即可，别把类比当机制证明——机制真相源在 dossier；三缓冲那句 'run at their own pace' 与「深度为什么是 2 而不是 3」的讨论别混淆，本章不展开深度上限议题。"
+    },
+    {
+      "id": "python-collections-deque",
+      "term": "collections.deque（双端队列）",
+      "kind": "notation",
+      "one_line": "Python 标准库的双端队列（发音 “deck”，double-ended queue 缩写）——本章 batch_queue 拿它当深度 2 的传送带：appendleft 进新批、pop 出最老批（左进右出的 FIFO），maxlen=2 给深度上了物理保险。",
+      "what_it_is": "官方定义：“Deques are a generalization of stacks and queues”（栈和队列的推广），且 “Deques support thread-safe, memory efficient appends and pops from either side of the deque with approximately the same O(1) performance in either direction”——两端进出都是 O(1)，这是 list 做不到的（官方文档明说 list 的 pop(0)/insert(0,v) “incur O(n) memory movement costs”）。本章三个用法要点：①左进右出 FIFO——appendleft((future, scheduler_output, exec_future)) 把最新批放左端、pop() 从右端取最老批，与 ch10 已见的 append/popleft（右进左出）方向相反、FIFO 本质相同；②定容——deque(maxlen=...) 官方语义 “Once a bounded length deque is full, when new items are added, a corresponding number of items are discarded from the opposite end”，batch_queue 用 maxlen=2（=max_concurrent_batches）保证深度不越界；③v0.27.1 的填充条件是 len(batch_queue) < self.batch_queue_size and (model_executed or self.scheduler.has_requests())——入队前查长度而非窥视队尾 future 的完成状态（v0.21.0 旧实现曾以 batch_queue[-1][0].done() 判忙闲，据 v2 章节基于 v0.21.0 的记录；v0.27.1 已演进为此式，且循环入口的断言保证入队前未满、maxlen 只是兜底保险）。",
+      "background": "deque 自 Python 2.4 时代进入 collections 标准库，底层是分块链表而非连续数组——这正是两端 O(1) 的原因。vLLM 拿它当「有 maxlen 兜底的固定深度传送带」，与 ch10 waiting 队列的「无限长 FIFO」用法是同一容器的两种姿态。",
+      "example": "from collections import deque\nq = deque(maxlen=2)      # 深度上限 2：物理保险\nq.appendleft((\"批C\",))   # 新批从左端进（对应 appendleft 三元组）\nq.appendleft((\"批D\",))   # 再进一个，长度 2——满了\nq.appendleft((\"批E\",))   # 若硬塞第三个：右端最老的 批C 被自动挤掉（maxlen 语义）\noldest = q.pop()         # 正常路径：从右端取最老批收结果——此刻弹出的是 批D\n注意正常循环里第 3 次 appendleft 不会发生（入队前查长度/断言保证未满）——maxlen 是兜底保险，不是正常路径的一部分。",
+      "links": [
+        "https://docs.python.org/3/library/collections.html#deque-objects"
+      ],
+      "sources": [
+        {"url": "https://docs.python.org/3/library/collections.html#deque-objects", "note": "Python 3 官方文档：deque 定义/O(1) 双端性能/maxlen 满时对端丢弃语义/list 的 O(n) 对比，逐字核实（访问日期 2026-08-27）"}
+      ],
+      "confidence": "high",
+      "writer_note": "ch10 已向读者介绍过 deque（append/popleft 作 FCFS 队列），本章只讲增量：「方向反过来（左进右出）+ maxlen 语义 + 它在 v0.27.1 是深度保险而非忙闲判据」；千万别把 v0.21 的 batch_queue[-1][0].done() 旧写法带进正文——v0.27.1 判定条件已换（见 what_it_is 第 3 点）。"
+    },
+    {
+      "id": "speculative-decoding-minimal",
+      "term": "投机解码（speculative decoding）——最小背景",
+      "kind": "external_concept",
+      "one_line": "「小模型先猜、大模型一次验证」的解码加速法：草稿模型一口气猜 k 个 token，目标模型一次前向全部验证，猜对的部分等于白赚了多倍解码速度，且数学上保证输出分布与直接用大模型完全一致。",
+      "what_it_is": "自回归解码每生成一个 token 都要跑一次完整大模型前向，这是延迟的根本来源。投机解码让小而快的草稿模型先连续猜出 k 个草稿 token，再让大模型用一次前向并行验证这 k 个（transformer 前向本身可并行，验证 k 个不比生成 1 个慢多少）；按接受准则保留猜对的前缀、丢弃第一个错处之后的全部，再从修正后的分布补采一个 token。只要草稿与大模型分布足够接近，每拍平均落袋多个 token——吞吐成倍提升，且最终输出分布与只用大模型完全相同（这是两篇奠基论文的核心定理）。两篇独立奠基文献：Leviathan et al.（Google，ICML 2023，arXiv 2211.17192）与 Chen et al.（DeepMind，arXiv 2302.01318）。本章只需要到这个深度：async 账本对它有两处扩展——占位按「本拍采样数+草稿数」记账、草稿被拒时 computed 与占位同步回退（spec 拒绝回扣），且 PR #24799 后草稿 token 干脆不回传调度器、缓存在 gpu_model_runner（见 concepts[0]）。",
+      "background": "名字里的 speculative（投机）取自体系结构的投机执行：先乐观执行、错了再回滚。2022 年底两篇论文把它带进 LLM 推理，此后成为各家推理引擎的标配；vLLM 内部发展出 EAGLE/Medusa/ngram 等草稿方法族。机制本体（草稿方法、接受准则数学）是本书 ch32/33 的主场，早于本章两章位置——本章读到它时读者还没系统学过，只需一句话级别。",
+      "example": "k=3 的直觉走查（说明性）：草稿模型猜 [你, 好, 呀]，大模型一次前向验证发现前 2 个接受、第 3 个拒绝 → 本拍落袋 2 个 token + 从修正分布补采 1 个 → 下轮草稿从头再猜。拒绝得越多越接近每拍 1 个 token 的普通速度，但不会更慢。",
+      "links": [
+        "https://arxiv.org/abs/2211.17192",
+        "https://arxiv.org/abs/2302.01318"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/abs/2211.17192", "note": "Leviathan et al. 'Fast Inference from Transformers via Speculative Decoding'（ICML 2023）摘要页（v2 会话访问日期 2026-07-24，本轮复用未重抓；论文标题/结论为稳定学术事实）"},
+        {"url": "https://arxiv.org/abs/2302.01318", "note": "Chen et al. 'Accelerating Large Language Model Decoding with Speculative Sampling'（DeepMind）摘要页（v2 会话访问日期 2026-07-24，本轮复用未重抓）"}
+      ],
+      "confidence": "high",
+      "writer_note": "本章只在「账本对 spec 的扩展（占位+草稿数、拒绝回扣）」和「#24799 兼容史」两处需要它，一句话级别即可，并明示「机制本体后两章（ch32/33）专讲」；别提前展开接受准则数学。"
+    },
+    {
+      "id": "pipeline-parallelism-bubble",
+      "term": "流水线气泡（pipeline bubble）",
+      "kind": "external_concept",
+      "one_line": "把模型按层切成多段分给多卡后，各段并非总在干活——启动「填充」与收尾「排空」阶段的空转窗口就叫气泡，它吃掉的正是理论加速比。",
+      "what_it_is": "流水线并行（PP）把大模型按层切成 pp_size 段、每段住一张卡，一个 batch 的前向像流水线一样逐段流过。但流水线需要填充（第一段先算、后面各段干等）与排空（最后一段收尾、前面各段没事干）——这些空转窗口就是 bubble。两个奠基工作：GPipe（arXiv 1811.06965）用 micro-batch 切分摊薄气泡——m 个 micro-batch 时气泡占比压到 (p−1)/(m+p−1)；PipeDream（arXiv 1806.03352）用 1F1B 调度让各段稳态中前向/反向交替不空转。与本章的连接：批队列深度不足=流水线某段没有独立在飞的活可算——这正是 vLLM 把 PP 场景的 max_concurrent_batches 定为 pp_size、V2 runner 定为 pp_size+1（消末段气泡）的动机。",
+      "background": "GPipe（2018，Google）与 PipeDream（2018-19，CMU/微软）确立了 micro-batch + 1F1B 范式；vLLM 的批队列深度仲裁（max_concurrent_batches 按 async/PP/V2 场景取不同值）是这一思想在推理引擎里的落地。PP 本体（切分策略/通信/与 TP 的比较）是本书 ch34 的主场。",
+      "example": "p=4 段、m=1 个 batch 的时间线（说明性）：段1 在 T1 干活、段2 等 T2、段3 等 T3、段4 等 T4——填充期 3 拍全空；总时长 7 拍里有效计算 4 拍、气泡 3 拍。m 变大后按 (p−1)/(m+p−1) 递减（m=8、p=4 时约 27%）。",
+      "links": [
+        "https://arxiv.org/abs/1811.06965",
+        "https://arxiv.org/abs/1806.03352"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/abs/1811.06965", "note": "GPipe 摘要页：micro-batch 流水线与气泡占比公式（v2 会话访问日期 2026-07-24，本轮复用未重抓；公式为论文稳定结论）"},
+        {"url": "https://arxiv.org/abs/1806.03352", "note": "PipeDream 摘要页：1F1B/稳态流水线调度（v2 会话访问日期 2026-07-24，本轮复用未重抓）"}
+      ],
+      "confidence": "high",
+      "writer_note": "仅当正文展开 max_concurrent_batches 的 PP 支线（为什么纯 PP 取 pp_size、V2 取 +1）时用「气泡」给一个直觉即可——公式与 1F1B 细节别在本章展开，那是 ch34 的主场。"
+    }
+  ]
+}

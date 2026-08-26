@@ -1,0 +1,889 @@
+{
+ "chapter_id": "ch12",
+ "chapter_title": "异步调度",
+ "pin": "vLLM v0.27.1 (6e448d0ea)",
+ "trace_environment": "本章有精简版 companion（implementation/ 23 文件，只做减法、# SOURCE 逐行锚 v0.27.1，host 39 项测试绿，见 impl-notes.md）。十一个驱动脚本全部 host `python` 实跑、trace_source=run，脚本与原始输出在 explainer/traces/（纯控制流+CPU 张量，无需 vLLM 运行时/GPU/容器）。与 pin 真实环境的结构性差异（均就近标注在 trace 与表旁）：① HOST SEAM：HostEvent/HostCopyStream 站 torch.cuda.Event(blocking=True)/stream 的契约位——record=入队未完成、synchronize=阻塞、set=测试模拟 D2H DMA 完成（真实由 copy stream 硬件推进）；采样张量在 host 是 CPU 张量（.to(\"cpu\") 返回自身，拷贝语义由 clone 快照承载）——『留 GPU』的可观测证据是 prev_sampled_token_ids 与采样输出张量 is 同一对象（未 _to_list），真实语义见源码注释 'avoid CPU sync'（gpu_model_runner.py:L3802）。② 前向是脚本化 logits 行（ch17 边界 ENGINE SEAM）：每步 {req_id: logits 行}，greedy argmax（sampler.py:L239-L241 逐字）采出可预测 token；不在环内伪造 forward。③ KVCacheManager 是契约面（ch13/ch15 边界）：块 id 是合成顺序整数、cache_blocks 只记调用账不写哈希、前缀命中恒 0。④ 结构化输出 bitmask 恒全 1（ch30 seam，=无约束，数值不变）。⑤ spec 面已随 dossier.delete 第 6 条删（深水归 ch33）：m15 按 tests/test_spec_rejection_rolls_back_computed_and_placeholders 的同一模式人灌 spec 状态对账（impl-notes『账本口径备注』声明）。⑥ 行号基线 v0.27.1（dossier/impl # SOURCE 已逐行核；本 explainer 引用锚点均为 dossier 账本项或 impl-notes 1:1 Source Map 项）。外证数字（3e440786a commit 标题自带 30.8% E2E 吞吐 / 31.8% TPOT、Orca/Sarathi 血统）只出现在 intuition/quantified 叙述里、明标 git 证据/外证形态，不进数值表。",
+ "figure_policy": "dossier needs_figure=true 八机制 m3/m4/m6/m7/m10/m11/m14/m21 各配 1 张 figure_spec，均为 FIGURE-SYSTEM §3.3 允许的正文机制图——每张 spec 的 l0_zoom 字段显式回答「它是 L0 哪一块的放大」：本章 l0_region=loop_box+gpu_column（l2-specs/ch12.json，『循环框+执行臂接缝』）。调度器/两态循环侧六张（m3/m4/m6/m7/m14/m21）放大 loop_box——L2 章图 center 的 ①-⑥ 拍片中对应环节的机制展开；worker 影子侧两张（m10/m11）放大 gpu_column 接缝——L2 south『worker 影子 · token 不落 CPU』框的展开。全部架构性内容回指 L0/L2，不另立架构画法。开篇图=本章 L2 章图（cartography/l2-specs/ch12.json，L2-ch12.png 已渲染），不归本 explainer。其余 13 机制不提新图：m1 五类降级是配置事实（m2 trace 的 default_arbitration 段落数据 + 正文引文比图有力）；m5 的 pop/重抛由 m21 图的三元组结构 + m4 图的下半段行承担；m12/m13 的 D2H/惰性收割数字在 m10 图的慢路泳道标注；m16 stale 账在 m7 图的 stale 分支；m17/m18/m19/m20 是流程/纪律事实，L2 south 注释框（代价账单/纪律 tripwire）与正文引文承担。",
+ "mechanisms_pointer_note": "不需要 worked example/figure 的 9 个机制，其可引用数字的落点：m1（默认仲裁）数字全在 traces/m2_depth.json 的 default_arbitration/explicit_true_hard_fail 段；m12（AsyncGPUModelRunnerOutput）与 m13（AsyncOutputFuture 惰性收割）的行为由 m4 e2e 的 oldest_batch_d2h_pending 字段佐证（pop 前事件未完成=拷贝异步）；m16（stale 账）数字在 traces/m7_delivery_convert.json 的 stale_delivery 段；m17（post_step 三条件短路）在 tests 的 take_draft_calls 计数（0 vs 1）；m18（乐观纠错群）数字在 traces/m10_shadow.json 的 discard 场景（optimistic< num_tokens 的行不采样）；m19（tripwire）是 gpu_sync_debug.py:L11-L13 的抛错文案（file:Lxxx 引用）；m20（has_work 保活）在 traces/m4_e2e_heartbeat.json 的 beats[3]/beats[4]（请求已终、队列非空→has_work True）与 terminal_state。",
+ "mechanisms": [
+  {
+   "mechanism_id": "m2",
+   "intuition": "工厂流水线的在制品上限不是车间主任拍脑袋定的，是三张图纸一起算的：要不要双工位（async）、几段流水线（PP）、第几代设备（runner 代际）。max_concurrent_batches 这个 property 就是那张唯一图纸——v0.21 时每个车间（executor）自己估、各报各的数，v0.27.1 收归设计科（VllmConfig）一处出图：async+单 PP 给 2（一个工位在算、一个在备料），纯 PP 给 pp_size（每段都得有活在算），V2 runner 再多给 1 消末段气泡。EngineCore 拿到图纸只做一件事：数字大于 1 才造缓冲架（deque），架上架子以后连心跳函数都换掉。",
+   "worked_example": {
+    "params": {
+     "输入面": "async_scheduling ∈ {None→仲裁, True, False} × pp_size ∈ {1,4} × use_v2_model_runner ∈ {False,True}",
+     "机制本体": "VllmConfig.max_concurrent_batches property（vllm/config/vllm.py:L539-L550，逐字）+ EngineCore 装配（core.py:L206-L212 建队列 / L231-L233 绑 step_fn）",
+     "驱动脚本": "traces/run_m2_depth.py → traces/m2_depth.json（仲裁链含显式 True 硬失败与五类降级同 trace）"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m2_depth.json",
+    "table": {
+     "columns": [
+      "配置场景",
+      "async（仲裁后）",
+      "pp_size",
+      "runner",
+      "max_concurrent_batches",
+      "装配落点"
+     ],
+     "rows": [
+      [
+       "默认生成服务（None → 仲裁 True）",
+       "True",
+       "1",
+       "V1",
+       "2",
+       "建 deque(maxlen=2)、step_fn=step_with_batch_queue"
+      ],
+      [
+       "显式 True + V2 runner + PP=4",
+       "True",
+       "4",
+       "V2",
+       "5",
+       "pp_size+1（消末段气泡）"
+      ],
+      [
+       "显式 True + V1 + PP=4",
+       "True",
+       "4",
+       "V1",
+       "4",
+       "落 pp_size（V1 不完全支持 async+PP）"
+      ],
+      [
+       "async=False + PP=4",
+       "False",
+       "4",
+       "V1",
+       "4",
+       "纯 PP：填流水线"
+      ],
+      [
+       "async=False + 单 PP",
+       "False",
+       "1",
+       "V1",
+       "1",
+       "不建队列、step_fn=step（同步版）"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "深度是三输入的纯函数且装配后终身不变：max_concurrent_batches = f(async, use_v2_model_runner, pp_size) 唯一出处 vllm.py:L539-L550；队列只在 >1 时建、maxlen 建后固定。",
+    "argument": "property 无副作用、输入三字段在配置期冻结 → 同输入恒同输出（纯函数）；EngineCore 只在 __init__ 消费一次（core.py:L206），之后 batch_queue.maxlen 无人改写——deque(maxlen=d) 的容量是构造期常量，运行期只在其间吞吐，不会漂移。"
+   },
+   "quantified": "代入本表：默认服务（async+V1+pp=1）→ 2 = 恰好双缓冲（一拍在 GPU 算、一拍在 CPU 调度，theory『深度 2 的双缓冲算术』）；4 卡 PP 的 V1 → 4 段流水线每段有活；V2+PP4 → 5 = 4+1。深度 d 的代价 = 最多 d 份 (SchedulerOutput+future) 在飞（d=2 即双份差量元数据），换来 GPU 空转窗口从『每拍 T_cpu』缩到稳态 max(T_gpu, T_cpu)——外证：3e440786a（2026-01-28，async+PP 完全支持）commit 标题自带 30.8% E2E 吞吐 / 31.8% TPOT 提升（git 证据，非论文数字）。"
+  },
+  {
+   "mechanism_id": "m3",
+   "figure_specs": [
+    {
+     "figure_id": "ch12-fig-step-binding-chain",
+     "template": "flow",
+     "l0_zoom": "放大 L0 循环框（loop_box）的入口装配段——L2 章图 north『启动装配 · 默认即重叠』框的机制展开：从配置位到心跳函数绑定的一条链，架构归属回指 L0/L2。",
+     "claim": "从 async_scheduling=None 到 step_fn=step_with_batch_queue 要走三级间接——标志仲裁成 True → 深度算出 2 → 建 deque(maxlen=2) → 绑定只看队列建没建（读绑定代码看不到 async 字样）。",
+     "numbers": [
+      {
+       "value": "深度矩阵：async+V1+pp1→2 · V2+pp4→5 · V1+async+pp4→4 · 纯PP pp4→4 · 无async无PP→1",
+       "provenance": "traces/m2_depth.json depth_matrix（5 行案例实测）"
+      },
+      {
+       "value": "默认链：scheduler_cls=AsyncScheduler · queue_built=True · maxlen=2 · step_fn_name=step_with_batch_queue；pooling 降级链：queue_built=False · step_fn_name=step",
+       "provenance": "traces/m2_depth.json assembly 段两行对照"
+      },
+      {
+       "value": "五类降级各走一环：pooling→False / medusa→False / eagle→True / disable_padded_drafter_batch→False / ray→False；显式 True+ray 直接 ValueError（不做静默降级）",
+       "provenance": "traces/m2_depth.json default_arbitration + explicit_true_hard_fail"
+      },
+      {
+       "value": "v0.21→v0.27.1 迁移：深度从 executor 各自声明上移 VllmConfig 唯一出处（vllm.py:L540），EngineCore 直读 core.py:L206",
+       "provenance": "traces/m2_depth.json migration_note + dossier WC4（git 证据链）"
+      }
+     ],
+     "caption_draft": "为什么在 step_fn 的绑定代码里搜 async_scheduling 会扑空：EngineCore 不看标志、看队列建没建（core.py:L231-L233）——『标志 True → 深度 2 → deque 建立 → 绑重叠版』的链条故意藏起第一环，深度仲裁（vllm.py:L539-L550）才是唯一出图纸的地方；默认生成服务的 None 在第一环就被仲裁成 True（L1142-L1143），pooling/非 EAGLE 系 spec/disable_padded_drafter_batch/ray 后端/ROCm DBO 五类才降 False——v2 读者按旧代码找 executor.max_concurrent_batches 必扑空。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m4",
+   "intuition": "单人厨房做完一道菜才想下一道菜做什么（同步 step）：灶台（GPU）在你想菜谱（CPU 调度）的整段时间里是熄火的。双缓冲厨房（step_with_batch_queue）：灶台上永远炖着一锅（批 A 在 GPU），你手里永远备着下一锅的料（批 B 在调度）——而且规矩是『先把备料区填上，再去揭锅盖』：备料区（深度 2 的队列）没满就不许停下来等菜。调度器凭什么敢在上一锅还没出锅时就备下一锅的料？因为它给每道还没出锅的菜记了一个『欠条』（占位）——账上先记着，出锅再销。",
+   "worked_example": {
+    "params": {
+     "参数": "prompt=2（[1,2]）、max_tokens=2、无 spec、num_sampled_tokens_per_step=1、队列深度 2——dossier theory[2]『占位账本走一遍』的实跑版",
+     "机制本体": "EngineCore.step_with_batch_queue（core.py:L625-L739，impl 逐字）全链：EngineCore→UniProcExecutor→GPUWorker→GPUModelRunner（seam 前向）",
+     "驱动脚本": "traces/run_m4_e2e_heartbeat.py → traces/m4_e2e_heartbeat.json（D2H 完成由 release() 显式放行——HOST SEAM，真实由 copy stream 硬件推进）"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m4_e2e_heartbeat.json",
+    "table": {
+     "columns": [
+      "心跳调用",
+      "队列变化（老→新）",
+      "上半段排入",
+      "盲调度证据",
+      "下半段动作",
+      "返回",
+      "拍末 computed/ph（真实已算）"
+     ],
+     "rows": [
+      [
+       "1",
+       "[] → [A]",
+       "批A {req-0:2}（全量 prefill）",
+       "—（首拍无在飞）",
+       "无（队未满不进下半段）",
+       "(None, True)",
+       "2/1（1）"
+      ],
+      [
+       "2",
+       "[A] → [B,A] → pop A",
+       "批B {req-0:1}",
+       "schedule 时 ph=1、输出空、批A 的 D2H 事件未完成",
+       "pop A → update_from_output 交货 [7]",
+       "outputs",
+       "3/1（2）"
+      ],
+      [
+       "3",
+       "[B] → [C,B] → pop B",
+       "批C {}（early-stop 4≥4 剪枝）",
+       "ph=1 但确信到顶",
+       "pop B 交货 [9] → LENGTH 终态",
+       "outputs",
+       "3/0（3）"
+      ],
+      [
+       "4",
+       "[C] → [D,C] → pop C",
+       "批D {}（flush finished_req_ids 空批）",
+       "—（无真调度）",
+       "pop C（plain future，通知 worker 清缓存）",
+       "outputs（空）",
+       "3/0（3）"
+      ],
+      [
+       "5",
+       "[D] → pop D",
+       "无（has_requests=False）",
+       "—",
+       "pop D 排空",
+       "({}, False)",
+       "3/0（3）——has_work 转 False"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "每次调用要么恰一次 appendleft 后返回 None（填管道优先），要么 pop 恰一次收结果——队列长度恒在 [0,2]，且 has_work()=False 当且仅当队空且调度器无请求。",
+    "argument": "appendleft 前有 assert len<batch_queue_size（core.py:L210）；pop 使长度严格减 1、非负。终止性（基例+归纳步）：每个请求的 num_output_tokens 每交货一拍严格 +1 且上界 max_tokens → 有限次交货后 FINISHED → _free_request 进 finished_req_ids → 下一次 schedule 以空批 flush（trace 拍 4）→ has_requests 转 False；队列按 FIFO 排空（trace 拍 5）后 has_work()=False——归纳于请求集大小，全部请求走完即引擎静止。"
+   },
+   "quantified": "本例 5 次心跳调用里真前向只有 2 次（批A/批B）、3 次是剪枝空拍+flush 空拍+排空拍——单请求小例的固定开销占比高是刻意的（max_tokens=2 最小心算规模）；稳态多请求下空拍被其他请求的调度摊薄：深度 2 队列一进一出，GPU 计算与 CPU 调度互相藏进对方时间（theory『三段相加 vs 取最大值』：同步 T_gpu+T_cpu+T_ipc 串行 → 重叠 max(T_gpu, T_cpu+T_ipc)）。盲调度的窗口由 trace 直接实证：拍 2 schedule 时刻 ph=1>0、output_token_ids 空、最老批 D2H 事件 pending=True——同步版此处公式值为 0、无 token 可排（m8 对照表）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch12-fig-two-state-queue",
+     "template": "state-table",
+     "l0_zoom": "放大 L0 循环框（loop_box）的心跳节拍——L2 章图 center 两态拍片（①-④ 填管道优先 · ⑤-⑥ pop 收结果）在『时间×队列水位』维度的展开，架构归属回指 L0/L2。",
+     "claim": "深度 2 的批队列让每次心跳调用『调度一个新批 + 收掉一个旧批』——填管道优先于取输出：5 次调用走出 2 次真前向 + 剪枝/flush/排空 3 次空拍，批 A 的 D2H 未完成时批 B 已在调度。",
+     "numbers": [
+      {
+       "value": "队列水位逐拍：[] → [A] → [B,A]→pop A → [C,B]→pop B → [D,C]→pop C → pop D → []",
+       "provenance": "traces/m4_e2e_heartbeat.json beats[].queue_before/queue_after（LabelledDeque 记账镜像）"
+      },
+      {
+       "value": "返回值序列：(None, True) / outputs / outputs / outputs（空）/ ({}, False)——填管道优先的第一拍 return None 不等结果",
+       "provenance": "traces/m4_e2e_heartbeat.json beats[].outputs/executed"
+      },
+      {
+       "value": "盲调度实证：拍2 schedule 时 ph=1、output_token_ids 空、批A D2H 事件 pending=True",
+       "provenance": "traces/m4_e2e_heartbeat.json blind_schedule_proof + schedule_log[1]"
+      },
+      {
+       "value": "交货：拍2 [7]、拍3 [9]（LENGTH 终态）；early-stop 4≥4 剪出拍3 的空批C",
+       "provenance": "traces/m4_e2e_heartbeat.json beats[].outputs + schedule_log[2].early_stop_lhs/rhs"
+      },
+      {
+       "value": "深度 2 = 双缓冲：稳态每拍一进一出（appendleft 恰一次 + pop 恰一次）",
+       "provenance": "traces/m4_e2e_heartbeat.json config.batch_queue_size + dossier theory[1]"
+      }
+     ],
+     "caption_draft": "两态心跳的逐拍状态表（core.py:L625-L739）：上半段『填管道优先』——队未满且有活就 return (None, model_executed) 不等结果，忙循环立刻转下一圈；队满（或无活可调）才进下半段 pop 最老批收结果。深度恰为 2 时每次调用调度一个新批的同时收掉一个旧批——批 B 在 CPU 排队入场的那段时间，批 A 正在 GPU 上算：CPU 调度时间被藏进 GPU 计算时间里（同步版的串行脊柱见 ch9 图对照）。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m5",
+   "intuition": "食堂取餐口的两摞餐盘：新出餐的盘子摞上面（appendleft），顾客只从最底下拿（pop）——先做好的先被取走，秩序靠容器方向倒着用保证。餐盘上贴三张便签（三元组）：这张餐对应哪个采样 future、当时的排菜单（SchedulerOutput）、以及后厨的原始故障单（exec_future）——前两张丢了最多丢一顿饭，第三张是出事时唯一能告诉你『到底哪步炸了』的证据：采样 future 递过来一个空便签（None），就翻出故障单把真异常当面重抛，绝不吞成一句『unexpected error』。",
+   "worked_example": {
+    "params": {
+     "参数": "prompt=2、max_tokens=8、脚本采样行 [7]/[8]/[9] 逐拍交货；失败路径独立引擎注入 RuntimeError",
+     "机制本体": "step_with_batch_queue 下半段（core.py:L689-L739）：pop → future.result → aborts → update_from_output（deferred 补采归 m14）",
+     "驱动脚本": "traces/run_m5_pop_fifo_reraise.py → traces/m5_pop_fifo_reraise.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m5_pop_fifo_reraise.json",
+    "table": {
+     "columns": [
+      "调用",
+      "队列动作",
+      "future.result()",
+      "交货/异常",
+      "拍末队列",
+      "output_token_ids"
+     ],
+     "rows": [
+      [
+       "1",
+       "appendleft 批A 三元组",
+       "—（return None 不等）",
+       "无",
+       "[A]",
+       "[]"
+      ],
+      [
+       "2",
+       "appendleft 批B → pop 批A",
+       "[7]",
+       "t7 到账",
+       "[B]",
+       "[7]"
+      ],
+      [
+       "3",
+       "appendleft 批C → pop 批B",
+       "[8]",
+       "t8 到账（FIFO：t7 先于 t8）",
+       "[C]",
+       "[7, 8]"
+      ],
+      [
+       "失败路径",
+       "appendleft 批B′ → pop 批A′（sample future=None）",
+       "None → exec_model_fut.result()",
+       "重抛 RuntimeError('real worker failure')",
+       "—",
+       "—"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "FIFO 保序 + 异常不吞：每个 appendleft 的批恰被 pop 一次且按调度序；pop 得 None 必重抛 exec_future 的真异常——错误不可能静默丢失。",
+    "argument": "deque 的 appendleft 进 index0、pop 出末尾——LIFO 容器倒用即 FIFO，序由数据结构保证（无需任何簿记）；None 分支（core.py:L701-L706）在抛 RuntimeError 前先 exec_model_fut.result()，而该 future 的 set_exception 已在 execute_model 调用内完成——重抛的异常必然是原始异常对象本身。"
+   },
+   "quantified": "一次调用至多 1 次 appendleft + 1 次 pop（队列容量 2），EngineCore 每圈的簿记开销 O(1) 摊还；trace 正常路 3 次调用按序交货 2 个 token（第 3 个在飞的 [9] 属批C），失败路 2 次调用内定位并重抛真异常——对比：若没有 exec_future 这第三张便签，None 只能翻成 'unexpected error'（core.py:L705 的兜底文案），故障定位要多走一轮日志考古。"
+  },
+  {
+   "mechanism_id": "m6",
+   "intuition": "图书馆的『预留座』：你还没到馆，管理员先把座位牌翻成『已订』（占位 +1）——别人看到牌就不抢；你到馆销牌（交货扣减），座位归你。prefill 还在分章搬运的时候（chunk）不算订座——书还没搬完，谈不上『下一次要坐哪个位』；只有完整走完一步、即将产出下一个 token 的请求才订位。占位数就是调度器开出的空头支票张数：GPU 上每有一个在飞的采样位，账上就有一个 +1。",
+   "worked_example": {
+    "params": {
+     "参数": "场景A prompt=2 全量 prefill；场景B prompt=6、max_num_scheduled_tokens=4（chunked）——对照 is_prefill_chunk 的 continue 分支",
+     "机制本体": "AsyncScheduler._update_after_schedule（async_scheduler.py:L19-L49，impl 逐字；基类乐观推进先行）",
+     "驱动脚本": "traces/run_m6_placeholder_plus.py → traces/m6_placeholder_plus.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m6_placeholder_plus.json",
+    "table": {
+     "columns": [
+      "场景",
+      "拍",
+      "排入 token",
+      "computed",
+      "is_prefill_chunk",
+      "ph",
+      "判定"
+     ],
+     "rows": [
+      [
+       "A 全量 prefill",
+       "1",
+       "2",
+       "2",
+       "False",
+       "1",
+       "非 chunk → ph += 1"
+      ],
+      [
+       "A",
+       "2",
+       "1",
+       "3",
+       "False",
+       "2",
+       "盲排下一位置 → ph=2"
+      ],
+      [
+       "B chunked",
+       "1",
+       "4",
+       "4",
+       "True",
+       "0",
+       "chunk → continue 不占位"
+      ],
+      [
+       "B",
+       "2",
+       "2",
+       "6",
+       "False",
+       "1",
+       "排完余位 → 非 chunk → ph=1"
+      ],
+      [
+       "B",
+       "3",
+       "1",
+       "7",
+       "False",
+       "2",
+       "盲排下一位置 → ph=2"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "占位只加在完整步上：ph 的增量 = num_sampled_tokens_per_step + spec 数 ≥ 1，当且仅当该请求本拍非 prefill-chunk；chunk 拍 ph 严格不变。",
+    "argument": "is_prefill_chunk 在基类 _update_after_schedule 用『computed < num_tokens + ph』重算（scheduler.py:L1335-L1337——占位项进判据，async 下全量 prefill 也能判 False）；prefill 排入使 computed 追上 num_tokens+ph → 判 False → AsyncScheduler 的循环才轮到它 +1。归纳：从判 False 的那拍起，每拍 computed += 追赶值（无 spec=1）、ph += 1——ph 与『已发起未交货的完整采样步数』一一对应，交货（m7）逐张销账 → ph 回落。"
+   },
+   "quantified": "无 spec 时占位步长恰 1：本例 ph 在 {1,2} 振荡，上界 = 队列深度 2 × (num_sampled 1 + spec 0) = 2；spec 场景步长 1+k（k=草稿数，ph 灌值口径见 m15 人灌对账：1 bonus + 3 spec = 4）；chunked 场景 prefill 期间 ph 恒 0——占位总数永远不超过在飞批数 × 步长，账单有界。",
+   "figure_specs": [
+    {
+     "figure_id": "ch12-fig-placeholder-ledger",
+     "template": "state-table",
+     "l0_zoom": "放大 L0 循环框（loop_box）里调度器账本位（kv_column 左邻的 Scheduler 记账区）——L2 章图 center ①『盲调度 · 占位+1』与 ⑥『真记账 · 占位-1』两拍片共用的账本表展开，架构归属回指 L0/L2。",
+     "claim": "占位账本四拍消长——computed 乐观推进、ph 随完整步 +1 随交货 −1，computed−ph 恒等于真实已算（1→2→2→3）且 cache_blocks 只按差值转正。",
+     "numbers": [
+      {
+       "value": "四拍账本：拍1 (computed=2, ph=1, 真实=1) → 拍2 (3,1,2) → 拍3 (3,0,3) → 终态 (3,0,3)",
+       "provenance": "traces/m4_e2e_heartbeat.json invariant_check_per_beat + terminal_state"
+      },
+      {
+       "value": "cache_blocks 参数（差值）序列：2 → 3（随交货单调涨）",
+       "provenance": "traces/m4_e2e_heartbeat.json cache_blocks_calls + traces/m7_delivery_convert.json delivery.cache_blocks_calls"
+      },
+      {
+       "value": "占位步长：无 spec = 1（ph 在 {1,2} 振荡）；prefill-chunk 拍不占位（ph=0）",
+       "provenance": "traces/m6_placeholder_plus.json scenario_a rows + scenario_b rows[0]"
+      },
+      {
+       "value": "交货扣减：ph 2−1=1（扣 len(new_token_ids)=1）；stale 不扣（防 underflow）",
+       "provenance": "traces/m7_delivery_convert.json delivery.state_before_pop/state_after_pop + stale_delivery"
+      }
+     ],
+     "caption_draft": "盲调度凭什么敢排、排错了谁兜底——一张表看完全部答案（async_scheduler.py:L19-L70 + scheduler.py:L516-L520）：ph 是调度器开出的欠条，GPU 上每有一个在飞采样位账上 +1，真 token 到账销一张；computed−ph 这列就是『敢担保的真实已算』——cache_blocks 只按它转正 KV 块。欠条有界（≤ 队列深度×步长）、销账有 assert（≥0 防线），本 pin 前三个月的三个 underflow 修复（#42117/#46066/#48245）全是这张表被打破的案例——重叠的白拿性能不存在，存在的是这本精密的账。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m7",
+   "intuition": "装修队的进度表 vs 实际完工：项目经理按计划把 3 个房间都标了『完工』（乐观 computed），但只敢给房东担保 2 个（cache_blocks 只转正差值）——第 3 个的油漆还没干（在飞采样位）。等验收报告到了（真 token 交货），欠条销一张（ph −1），担保数长一截。被业主临时叫停的房间（抢占）另立一本『遗留账』（stale）：后来补交的验收单照收（token 照送）但绝不动已经清零的进度表——动了就是负数，账本就崩了。",
+   "worked_example": {
+    "params": {
+     "参数": "prompt=2、max_tokens=8；拍1 prefill（ph=1）、拍2 盲排（ph=2, computed=3）；对批A 交货 [7]。stale 段独立请求：抢占后 stale 送达",
+     "机制本体": "AsyncScheduler._update_request_with_output（async_scheduler.py:L51-L70，impl 逐字）+ kv_cache_manager.cache_blocks 记账",
+     "驱动脚本": "traces/run_m7_delivery_convert.py → traces/m7_delivery_convert.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m7_delivery_convert.json",
+    "table": {
+     "columns": [
+      "事件",
+      "ph",
+      "computed",
+      "cache_blocks 参数（computed−ph）",
+      "output_token_ids"
+     ],
+     "rows": [
+      [
+       "拍1+拍2 调度后（pop 前）",
+       "2",
+       "3",
+       "1（未交货，只敢担保 1 个真算位）",
+       "[]"
+      ],
+      [
+       "pop 批A 交货 [7]",
+       "1",
+       "3",
+       "2（3−1，转正 2 个真算位）",
+       "[7]"
+      ],
+      [
+       "对照：抢占后 stale 送达 [7]",
+       "0（不扣）",
+       "0",
+       "跳过（PREEMPTED 不转正）",
+       "[7]（照送）"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "交货不变式：非 stale 交货使 ph -= len(new_token_ids) 且 assert ph ≥ 0；cache_blocks 的参数 computed − ph 恒等于真实已算数、单调不减（spec 拒绝回扣除外——m15 的安全网）。",
+    "argument": "配对论证：调度侧对每个发起的采样位 +1（m6），交货侧对每个到达的真 token −1——同一位置先加后减，故 ph = 在飞未交货位数 ≥ 0（assert 是防线不是装饰：#48245 抢占时占位 underflow 修复的正是有人少加多减）；computed 交货不动、ph 单调减 → 差值（真实已算）单调不减——KV 块只『转正』不回退，缓存一致性有账可依。"
+   },
+   "quantified": "本例 pop 批A：ph 2→1、担保数 3−1=2 = t0,t1 两个 prompt 位（t7 位仍在 D2H 路上）；若 stale 误扣：0−1=−1 当场 assert 崩——m7 trace 的 stale 段实测 ph_unchanged=0、token 照收（丢会扰动 spec-decode acceptance，源码注释原话）。e2e 全程（m4 trace）：cache_blocks 参数 2→3 随交货单调涨，终态 computed−ph=3 = 有确认 KV 的位置数。",
+   "figure_specs": [
+    {
+     "figure_id": "ch12-fig-block-convert",
+     "template": "before-after",
+     "l0_zoom": "放大 L0 循环框（loop_box）调度器账本位与 kv_column（显存账本列）的交界——L2 章图 center ⑥『真记账 · 占位-1』拍片向 KVCacheManager.cache_blocks 的那一次调用的前后对照，架构归属回指 L0/L2。",
+     "claim": "交货前 cache_blocks 只敢按差值转正——乐观计数 computed=3 里只有 2 个位置有真 KV，ph=1 就是那笔还没到账的 1。",
+     "numbers": [
+      {
+       "value": "before（pop 前）：computed=3、ph=2、在飞=3、tws=2、持块=1",
+       "provenance": "traces/m7_delivery_convert.json delivery.state_before_pop"
+      },
+      {
+       "value": "after（交货 [7] 后）：ph=1、tws=3、cache_blocks(req-0, 3−1=2) —— 2 个真算位转正",
+       "provenance": "traces/m7_delivery_convert.json delivery.state_after_pop + cache_blocks_calls"
+      },
+      {
+       "value": "stale 分支：抢占后 ph=0、computed=0、stale=3；stale 送达 [7] 照收但 ph_unchanged=0（扣了就 underflow）",
+       "provenance": "traces/m7_delivery_convert.json stale_delivery.preempt_state + stale_delivery.stale_delivery"
+      },
+      {
+       "value": "e2e 终态：computed=3、ph=0、差值=3 = 有确认 KV 的位置数（2 prompt 位 + 1 decode 位）",
+       "provenance": "traces/m4_e2e_heartbeat.json terminal_state.final_computed/final_ph/invariant_final_real_computed"
+      }
+     ],
+     "caption_draft": "cache_blocks 的参数为什么是差值而不是 computed 本身（async_scheduler.py:L65-L69）：调度器的 computed 是乐观值——占位也计入其中；被抢过的请求（PREEMPTED）整行跳过转正。左图 pop 前的账本：3 个已算位里只有 2 个有真 KV 在块里，差的那 1 个正在 D2H 路上；右图交货 [7] 后欠条销到 1、担保数涨到 2——KV 缓存的正式身份永远跟着『真算』走，不跟着乐观计数走。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m8",
+   "intuition": "接力赛的交接棒测算：教练算『本棒要跑多少米』用的是『总赛程（tws）+ 队友已跑到但没交棒的里程（占位 ph）− 我自己已经跑过的里程（computed）』。同步教练没有占位概念——队友没交棒他就当那米数不存在，只能干等；异步教练把『在途的棒』也算进账，所以永远算得出下一棒该跑多少。公式一行没改，改的是 ph 从恒 0 变成真有数——这就是『ch10 立公式、本章灌值』的全部含义。",
+   "worked_example": {
+    "params": {
+     "参数": "prompt=2、max_tokens=8、无 spec；两拍连调 schedule()（中间不交货——模拟批A 还在 GPU 上）。对照：同一请求在同步 Scheduler 下走同两拍",
+     "机制本体": "追赶公式（scheduler.py:L516-L520，逐字）：num_new_tokens = num_tokens_with_spec + num_output_placeholders − num_computed_tokens",
+     "驱动脚本": "traces/run_m8_catchup.py → traces/m8_catchup.json（AsyncScheduler 与同步 Scheduler 双引擎对照）"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m8_catchup.json",
+    "table": {
+     "columns": [
+      "调度器",
+      "拍",
+      "tws",
+      "ph",
+      "computed",
+      "公式值 = 排入",
+      "拍末 ph/computed/in_flight"
+     ],
+     "rows": [
+      [
+       "AsyncScheduler",
+       "1",
+       "2",
+       "0",
+       "0",
+       "2（全量 prefill）",
+       "1/2/2"
+      ],
+      [
+       "AsyncScheduler",
+       "2",
+       "2",
+       "1",
+       "2",
+       "1（盲排下一位置）",
+       "2/3/3"
+      ],
+      [
+       "Scheduler（同步对照）",
+       "1",
+       "2",
+       "0",
+       "0",
+       "2",
+       "0/2/2"
+      ],
+      [
+       "Scheduler（同步对照）",
+       "2",
+       "2",
+       "0",
+       "2",
+       "0（continue，无 token 可排）",
+       "0/2/2"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "占位项恰补偿『computed 领先 tws』的差距：async 下公式值 > 0 ⇔ 存在已发起未交货的采样位；同步版 ph 恒 0 且每拍 update 后 computed == tws，差距恒 0。",
+    "argument": "归纳于完整循环：schedule 使 computed += 公式值；AsyncScheduler 使 ph += num_sampled(+spec)；交货使 tws += len(delivered) 且 ph −= len(delivered)——三个量满足 tws + ph − computed 的每循环净变化 = 新发起位数 − 已交货位数 = 当前在飞数，非负且 ≤ 队列深度×步长（有界）。同步版每拍末尾 update 恰好把 computed 拉平 tws（无在飞）→ 差距 0 是它的退化形态而非另一条公式。"
+   },
+   "quantified": "同一请求同一拍的天壤之别：async 拍2 公式 2+1−2=1（排 1 个位置），同步拍2 公式 2+0−2=0（continue）——重叠版每个在飞步多推进 1 个位置，这正是 GPU 不空转的直接来源（theory『三段相加 → 取最大值』里省掉的那段 T_cpu）；in_flight 同步 3（2 prompt + 1 盲排）——交货逐拍销账后归零（m4 trace 终态 in_flight=0）。"
+  },
+  {
+   "mechanism_id": "m9",
+   "intuition": "考试交卷前的最后一遍检查：如果算出『就算最后一题全错也稳过线』（computed+2−ph ≥ prompt+max_tokens），就不再申请附加题（不排多余一步）——『+2−ph』那点保守量就是防『附加题全白做』的保险。这不是猜测是算术：占位也算进 computed，减掉 (ph−1) 把草稿位的影响摘干净，剩下的就是『确定已算+1』。注释还交代了为什么不排半个草稿步：那会破坏统一 decode 的批形状优化（uniform decode optimizations）。",
+   "worked_example": {
+    "params": {
+     "参数": "两案例同路：prompt=2、拍1 prefill、拍2 盲排、pop 批A 交货 [7] 后看拍3 判定；max_tokens=2（到顶）vs max_tokens=8（远未到顶）",
+     "机制本体": "RUNNING 循环 early-stop 剪枝（scheduler.py:L488-L502，逐字）",
+     "驱动脚本": "traces/run_m9_early_stop.py → traces/m9_early_stop.json"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m9_early_stop.json",
+    "table": {
+     "columns": [
+      "案例",
+      "判定时 computed/ph",
+      "lhs = computed+2−ph",
+      "rhs = prompt+max_tokens",
+      "判定",
+      "拍3 排入"
+     ],
+     "rows": [
+      [
+       "max_tokens=2（确信到顶）",
+       "3/1",
+       "4",
+       "4",
+       "4≥4 → 剪枝",
+       "{}（total=0）"
+      ],
+      [
+       "max_tokens=8（远未到顶）",
+       "3/1",
+       "4",
+       "10",
+       "4<10 → 照排",
+       "{req-0:1}"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "剪枝只跳『确定冗余』的步：lhs ≥ rhs 时无论上拍采样接受多少（哪怕 draft 全拒）都不再有前向需要；lhs < rhs 时一步不剪。",
+    "argument": "代数论证（注释原文的展开）：lhs = (computed+1) − (ph−1)——computed 含占位，减 (ph−1) 摘除草稿位影响后即『确定已算 + 1』；若它 ≥ prompt+max_tokens，则上拍产出的最后一个位置已把长度预算用尽，本拍任何调度都产生不出会被消费的 token。终止性：剪枝使该请求本拍 0 排入，其终局由在飞批的交货判定完成（trace 拍3 pop 批B 即 LENGTH）——剪枝不创建新状态，只是拒绝冗余动作。"
+   },
+   "quantified": "max_tokens=2 例：剪掉 1 次前向（若不剪，追赶公式 3+1−3=1 个白算位置——m4 e2e 的批C 空拍正是剪枝产物）；max_tokens=8 例：lhs 4 vs rhs 10，6 个 token 的余量——判定对『差多少』敏感、对『猜得准不准』零依赖。注：判定的前提是 ph>0（同步版 ph 恒 0、此分支不可达——async 专属名副其实）。"
+  },
+  {
+   "mechanism_id": "m10",
+   "intuition": "快递的两条分拣线：同一家仓库出货（采样张量），一条线原地转交给下一班生产（留 GPU 的 prev_sampled_token_ids——同一托盘、零搬运）；另一条线打包发客户（copy stream 异步 D2H 出门）。仓库台账（token_ids_cpu）上只写一个『货已发』的 −1 记号——真实货号在生产线上，台账只管位置不管内容。同步模式则相反：出货必先过台账登记真货号（_to_list），一条线串到底。",
+   "worked_example": {
+    "params": {
+     "参数": "场景1 单请求（prompt=[1,2,3]、采样 [[9]]）；场景2 三请求、中间行被 discard（乐观纠错下游）；场景3 同步对照",
+     "机制本体": "_bookkeeping_sync 的 async 分支（gpu_model_runner.py:L3797-L3842，impl 逐字）+ InputBatch 影子字段（gpu_input_batch.py:L309-L316）",
+     "驱动脚本": "traces/run_m10_shadow.py → traces/m10_shadow.json（HOST SEAM：『留 GPU』的证据 = is 同一张量对象）"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m10_shadow.json",
+    "table": {
+     "columns": [
+      "场景/行",
+      "token_ids_cpu 行（前几位）",
+      "num_tokens_no_spec",
+      "prev 槽位表",
+      "证据"
+     ],
+     "rows": [
+      [
+       "async·req-0（采样 [[9]]）",
+       "[1,2,3,-1]（位置3 是占位）",
+       "3→4",
+       "{req-0:0}",
+       "prev_sampled_token_ids 与采样张量 is 同一对象"
+      ],
+      [
+       "async·3 请求、req-1 被 discard",
+       "row0=[1,-1] row1=[2,0]（未动） row2=[3,-1]",
+       "[2,1,2]",
+       "{req-0:0, req-2:2}（row1 不进表）",
+       "invalid 行不写占位（continue）"
+      ],
+      [
+       "同步对照（同输入）",
+       "[1,2,3,9]（真 token 落 CPU）",
+       "3→4",
+       "无（None）",
+       "分叉点 = use_async_scheduling 判定"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "CPU 账本行长照走、内容为占位：async 分支每个有效采样行写 −1 且 is_token_ids=True、num_tokens_no_spec +1；真 token 的唯一权威住所是 GPU 张量 prev_sampled_token_ids（is 同一、无任何 D2H）。",
+    "argument": "写回循环（L3821-L3842）对 async 恒 sampled_ids=[-1]（invalid 行 None→continue）——行长推进与 token 值解耦；prev_sampled_token_ids 只在 sample_tokens 开头置 None、_bookkeeping_sync 重新缓存（L4609/L3802-L3808）——每拍至多一份影子、不跨拍泄漏（tests 的 resample 用例验证）。归纳：行长 = num_prompt + 已发起完整步数，与调度器侧 tws 的推进严格同步（m4 e2e 的 row=[1,2,-1,-1] 对应 tws=4 时的形状）。"
+   },
+   "quantified": "每拍省下的就是那条 D2H：async 分支 0 次同步拷贝（prev is 同一对象），同步分支 1 次 _to_list（场景3 的 [1,2,3,9] 里那个 9 就是走过 PCIe 的货号）；3 请求例中 2 行有效写 −1、1 行 invalid 完全不动——浪费面积为 0。规模感（外证，deepread/gpu-exec）：decode 小 batch 一拍 GPU 计算量极小、整拍时长被 CPU 端支配，这条 D2H 是被砍对象清单上的头几项（VLLM_GPU_SYNC_CHECK tripwire 把纪律升级为运行期纠察）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch12-fig-token-two-paths",
+     "template": "tensor-flow",
+     "l0_zoom": "放大 L0 执行臂列（gpu_column）与循环框的接缝——L2 章图 south『worker 影子 · token 不落 CPU』框的数据流展开：一个采样 token 从采样器出发的两条消费路径，架构归属回指 L0/L2。",
+     "claim": "一个采样 token 有两个消费者走两条路——留 GPU 的 prev_sampled_token_ids（与采样张量 is 同一对象、零拷贝）喂下一拍前向，copy stream 异步 D2H 出门给用户；CPU 侧账本行只写 −1 占位、行长照走。",
+     "numbers": [
+      {
+       "value": "快路证据：prev_sampled_token_ids 与采样张量 is 同一对象=True；token_ids_cpu 行 [1,2,3,-1]（位置3 是占位）、num_tokens_no_spec 3→4",
+       "provenance": "traces/m10_shadow.json shadow_case_single（is_same_object/row/num_tokens_no_spec）"
+      },
+      {
+       "value": "慢路证据：e2e 拍2 pop 批A 时 D2H 事件 pending=True → future.result() 只等这个拷贝事件；交货 [7] 后 update_from_output 才能判停",
+       "provenance": "traces/m4_e2e_heartbeat.json beats[1].oldest_batch_d2h_pending_before_release + outputs"
+      },
+      {
+       "value": "闭环：下一拍 input_ids.gpu 首位=7（批A 采出的 token 在 GPU 上直接变成批B 的输入）；token_ids_cpu 行同期=[1,2,-1,-1]",
+       "provenance": "traces/m4_e2e_heartbeat.json beats[1].worker_input_ids_gpu_prefix + worker_token_ids_cpu_row_prefix"
+      },
+      {
+       "value": "同步对照：同输入下 token_ids_cpu 行=[1,2,3,9]（真 token 落 CPU）、prev=None——分叉点就是 use_async_scheduling 判定",
+       "provenance": "traces/m10_shadow.json sync_control"
+      },
+      {
+       "value": "discard 行不进槽位表：{req-0:0, req-2:2}（row1 被剔除）、invalid 行不写占位",
+       "provenance": "traces/m10_shadow.json shadow_case_discard"
+      }
+     ],
+     "caption_draft": "『采样 token 不落 CPU』不是比喻，是两张张量图的分工（gpu_model_runner.py:L3797-L3842）：async 分支把整张采样张量原样缓存在 GPU（注释 'avoid CPU sync'——host 上的证据就是 is 同一对象），CPU 侧 token_ids_cpu 只写 −1 占位、行长照走。喂下一拍前向走快路（m11 的 GPU 回填），判停/回扣走慢路（AsyncGPUModelRunnerOutput 的 copy stream 异步 D2H，EngineCore 的 future.result() 等的只是一次拷贝事件）——两条路异步并行，CPU 世界慢半拍，占位数（m6/m7）就是这半拍的记账。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m11",
+   "intuition": "机场转机的三种到登机口方式：第一次来（新请求/正常拍）走普通通道把行李全托运（整段 copy_to_gpu）；常客且座位没变（批次未变的 decode 稳态）——地勤直接把你的『随身物品』从上一班机原封不动挪过来，一条传送带一趟搞定（单 slice 直拷）；换了登机口或插了新人（重排/新请求）——系统按登机牌号把每件行李分别投递到新位置（按 index scatter），你的行李从旧仓位直达新仓位，全程不过海关（CPU）。",
+   "worked_example": {
+    "params": {
+     "参数": "路径1 正常拍（prev=None）；路径2 批次未变 2 请求、CPU 侧故意清零证伪；路径3 重排（req-2 提前 + 新请求 req-x 插中间 + req-1 离场）、CPU 侧放 [100,101,102]",
+     "机制本体": "_prepare_input_ids 三岔口（gpu_model_runner.py:L1784-L1891，impl 逐字）+ _compute_prev_positions（L1769-L1782）",
+     "驱动脚本": "traces/run_m11_gpu_backfill.py → traces/m11_gpu_backfill.json（HOST SEAM：CPU 张量对代 pinned+DMA 面，索引算术逐字同 pin）"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m11_gpu_backfill.json",
+    "table": {
+     "columns": [
+      "路径",
+      "prev_positions",
+      "CPU 侧 input_ids",
+      "GPU 结果",
+      "token 来源"
+     ],
+     "rows": [
+      [
+       "正常拍（prev=None）",
+       "—",
+       "[1,2]",
+       "[1,2]",
+       "copy_to_gpu（CPU 账本）"
+      ],
+      [
+       "common-case 单 slice（批次未变）",
+       "[0,1]",
+       "[0,0]（故意清零）",
+       "[7,8]",
+       "prev_sampled_token_ids（GPU 直拷）"
+      ],
+      [
+       "scatter（重排 + 新请求）",
+       "[2,-1,0]",
+       "[100,101,102]",
+       "[9,101,7]",
+       "位置0/2 从 prev 行 2/0；位置1 保留 CPU（新请求）"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "回填完备且无重复：本拍每个 decode 请求的输入 token 要么来自 CPU 侧账本（新请求/预填窗口），要么恰一次来自 prev_sampled_token_ids 的对应行；prev_positions 为 −1 的行不参与回填。",
+    "argument": "每个当前槽位经 prev_req_id_to_index 得唯一 prev 槽或 −1（L1769-L1782：字典查询，无匹配即 −1）；scatter 的 index 与 src 逐元素配对（sample_flattened_indices[i] ← prev_indices[i]），而 cu_num_tokens 严格递增保证 flattened 采样位互不相同——每个目标位恰写一次；common-case 判定（prev_index == flattened_index 且 max_flattened == N−1）只是同一映射的恒等特例，可安全退化为一条 slice 拷贝。"
+   },
+   "quantified": "common-case 1 条 copy 指令完成 2 个 token 回填（无索引张量上传）；重排场景 2 个索引张量上传 + 1 次 scatter kernel 处理 3 行（其中 1 行 −1 免采、1 行保留 CPU）——kernel launch 次数 O(1) 于批内请求规模，没有 per-token 的 CPU 循环；路径2 的证伪设计：CPU 侧清零后 GPU 结果仍是 [7,8]——token 只可能来自 GPU 侧 prev（真 token 未过 CPU 的直接证据，m4 e2e 里 input_ids.gpu=[7,...] 同款）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch12-fig-gpu-backfill",
+     "template": "tensor-flow",
+     "l0_zoom": "放大 L0 执行臂列（gpu_column）内部的输入准备段——L2 章图 south『worker · 下一拍 GPU 回填』框的三岔口展开：_prepare_input_ids 对 input_ids.gpu 的三条写入路径，架构归属回指 L0/L2。",
+     "claim": "下一拍输入的三岔口——正常拍整段 H2D、批次未变单 slice 直拷、变过按 index scatter；重排例 CPU 侧 [100,101,102] + GPU 侧 prev[7,8,9] → GPU 结果 [9,101,7]，证明采样 token 从 GPU 直达 GPU。",
+     "numbers": [
+      {
+       "value": "路径1 正常拍：CPU [1,2] → copy_to_gpu → GPU [1,2]（prev=None）",
+       "provenance": "traces/m11_gpu_backfill.json cases[0]"
+      },
+      {
+       "value": "路径2 common-case：prev_positions=[0,1]、CPU 侧故意清零 [0,0] → GPU [7,8]（单 slice 直拷 L1868-L1877）——token 只能来自 prev",
+       "provenance": "traces/m11_gpu_backfill.json cases[1]"
+      },
+      {
+       "value": "路径3 scatter：prev_positions=[2,-1,0]、CPU [100,101,102] → GPU [9,101,7]——位置0 从 prev 行2、位置2 从 prev 行0、位置1（新请求）保留 CPU",
+       "provenance": "traces/m11_gpu_backfill.json cases[2]"
+      },
+      {
+       "value": "判定输入：cu_num_tokens=[1,2]（路径2）/ [1,2,3]（路径3）；common_indices_match 且 max_flattened==N−1 才走单 slice",
+       "provenance": "traces/m11_gpu_backfill.json cases[].cu_num_tokens + gpu_model_runner.py:L1868-L1877 判定"
+      }
+     ],
+     "caption_draft": "上一拍采出的 token 怎么变成这一拍的输入（gpu_model_runner.py:L1769-L1891）：_compute_prev_positions 先给当前批每个槽位找上拍槽号（−1=新请求），三岔口按『批次与上拍的重合度』选路——decode 稳态（批次未变未重排）一条 slice 拷贝完成全部回填；重排/进出批时按 index scatter，索引张量异步上传、全部在 GPU 端完成。路径2/3 的证伪设计（CPU 侧清零/放占位值）说明回填的 token 来源只能是 GPU 侧的 prev_sampled_token_ids——真 token 全程没经过 CPU。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m14",
+   "intuition": "戴着口罩进无菌室算数：语法掩码（bitmask）这道工序必须拿到『本批要采样的每个位置的真实前文』才能算——async 下上一拍的 token 可能还在传送带上（D2H 在途），现在就戴口罩（立即采样）会算错掩码、采出违规 token。所以流水线把这一道工序挪到『收完上一批货』之后：批先排上去（前向已发起不浪费）、等 pop 完上一批、账本更新完（token 齐了），再回来补掩码和采样——批重新排队等下一轮取结果。",
+   "worked_example": {
+    "params": {
+     "参数": "prompt=2、max_tokens=8、use_structured_output=True（bitmask 由 ch30 seam 恒全 1，数值不变）；观察同一次调用内 update/sample 的先后序",
+     "机制本体": "pending_structured_output_tokens 置位（async_scheduler.py:L31-L33）→ 上半段分流（core.py:L665-L677）→ 下半段补采重新入队（core.py:L719-L737，复用同一 exec_future）",
+     "驱动脚本": "traces/run_m14_deferred.py → traces/m14_deferred.json（真实链 e2e，D2H 由 release() 放行）"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m14_deferred.json",
+    "table": {
+     "columns": [
+      "拍",
+      "pending 置位?",
+      "调用内顺序",
+      "交货 token",
+      "拍末队列",
+      "ph"
+     ],
+     "rows": [
+      [
+       "1 prefill",
+       "False（ph=0 不置位）",
+       "[sample]",
+       "无（填管道优先 return None）",
+       "1",
+       "1"
+      ],
+      [
+       "2 decode",
+       "True（ph=1>0）",
+       "[update, sample]",
+       "[7]（pop 批A 交货）",
+       "1（deferred 批重新入队）",
+       "1"
+      ],
+      [
+       "3 pop deferred 批",
+       "True（又一轮 decode）",
+       "[update, sample]",
+       "[8]（拍2 补采的 token 到账）",
+       "1",
+       "1"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "deferred 批不丢不重：上半段 pending 时必不 appendless 入队、下半段必在 update_from_output 之后恰一次 appendleft（复用同一 exec_future，不重跑前向）——队列长度守恒、bitmask 计算时 token 必齐。",
+    "argument": "控制流配对：deferred_scheduler_output 非 None 时 L679-L687 的 appendleft 整块跳过，下半段 L731-L737 无条件补采入队——一跳一补恰抵；bitmask 依赖的 scheduled_spec_decode_tokens/tws 在 update_from_output 后已在账本（交货使 tws 增长）——『update → sample』的顺序是正确性约束不是风格选择（trace 逐拍验证）。"
+   },
+   "quantified": "structured 请求的每个 decode 拍都走 deferred（pending 置位条件 = use_structured_output and ph>0，decode 稳态 ph 恒 ≥1）——代价：每个 structured decode 批在队列里多躺一轮、token 到账晚 1 拍（trace：拍2 补采的 [8] 拍3 到账），TPOT 多一段排队延迟（WC3 cost 原话：『deferred 也可以存字段等下一轮，后者略偏 TTFT』NOTE(nick)）；换来：掩码永远基于齐全 token 计算，零违规采样。三个特性（async/spec/structured）两两组合各有专属路径——测试矩阵爆炸是这条设计线的真实账单。",
+   "figure_specs": [
+    {
+     "figure_id": "ch12-fig-deferred-sampling",
+     "template": "flow",
+     "l0_zoom": "放大 L0 循环框（loop_box）的采样排程分支——L2 章图 center ③『采样排程 · 立即/推迟』拍片与 ⑥ 后补采支线的时序展开，架构归属回指 L0/L2。",
+     "claim": "structured+async 的每次 decode 拍都推迟采样——上半段见 pending 不采样（批先入队、前向不浪费），pop+update_from_output 之后才补 bitmask+sample_tokens 重新入队，调用内顺序恒为 update → sample。",
+     "numbers": [
+      {
+       "value": "置位条件：use_structured_output 且 ph>0 → 拍1（prefill, ph=0）不置位、拍2 起（decode, ph=1）恒置位",
+       "provenance": "traces/m14_deferred.json beats[].req_ph（async_scheduler.py:L31-L33 条件的实测映射）"
+      },
+      {
+       "value": "调用内顺序：拍1 [sample]；拍2/拍3 [update, sample]——补采必在 update 之后",
+       "provenance": "traces/m14_deferred.json beats[].order_this_call"
+      },
+      {
+       "value": "token 到账晚一拍：拍2 补采出的 [8] 在拍3 pop 到账；队列长度恒 1（deferred 批重新入队）",
+       "provenance": "traces/m14_deferred.json beats[2].delivered_tokens + queue_len_after"
+      }
+     ],
+     "caption_draft": "为什么缺 token 必须推迟采样（core.py:L665-L677/L719-L737）：结构化输出的 grammar bitmask 要基于本批将采样的位置（含 spec 草稿）计算，async 下上一拍的 token 可能还在 D2H 路上——立即采样会采出违反语法的 token。所以批先排上去（exec_future 已发起、前向不浪费），等 pop 完上批、update_from_output 把 token 记齐，再补掩码+采样、批重新 appendleft 入队（复用同一 exec_future）。代价写进 WC3：每个 structured decode 批在队列里多躺一轮，TPOT 多一段排队延迟。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m15",
+   "intuition": "草稿被批注退回：你交了一页正式内容加三页草稿（1 bonus + 3 spec 占位），审稿人只认那一页正式的和零页草稿——账房必须两头同时回滚：进度表退回三格（computed −3）、欠条撕掉三张（ph −3），然后正式页到账再销一张。只退一头，进度表和欠条就对不上账（computed−ph 不再等于真实已算）——下一拍调度就会在错位的地基上开工。被抢过的房间（stale）例外：那份退稿单作废——它记的是回滚之前的旧账。",
+   "worked_example": {
+    "params": {
+     "参数": "prompt=5、max_tokens=8、num_sampled_tokens_per_step=1、draft k=3；采样结果只有 bonus token [7]（0 草稿被接受）",
+     "机制本体": "spec 拒绝回扣（scheduler.py:L1769-L1784，逐字）：num_rejected = k − accepted；非 stale 时 computed 与 ph 同步回退",
+     "驱动脚本": "traces/run_m15_spec_rollback.py → traces/m15_spec_rollback.json（人灌模式：spec 登记分支已随 dossier.delete 第 6 条删，按 tests 同一模式注入——impl-notes『账本口径备注』声明）"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/m15_spec_rollback.json",
+    "table": {
+     "columns": [
+      "事件",
+      "computed",
+      "ph",
+      "说明"
+     ],
+     "rows": [
+      [
+       "prefill 后（拍1）",
+       "5",
+       "1",
+       "impl 基线（无 spec 分支）"
+      ],
+      [
+       "人灌 spec 状态（1 bonus + 3 draft）",
+       "5",
+       "4",
+       "与 _update_after_schedule 灌值口径一致"
+      ],
+      [
+       "交货：0 草稿接受 → num_rejected=3",
+       "2",
+       "1",
+       "computed −3、ph −3（双回退）"
+      ],
+      [
+       "delivery [7] 扣位",
+       "2",
+       "0",
+       "cache_blocks(2−0=2) 转正"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "双回退守恒：num_rejected 同时从 computed 与 ph 扣除 → 差值 computed − ph（真实已算）在回扣前后不变；stale 的拒绝数不应用（它先于抢占回滚）。",
+    "argument": "代数：回扣前 (c) − (p)，回扣后 (c−r) − (p−r) = c − p——被拒的位置本来就没产出有效 KV，真实已算不因拒绝改变；随后的 delivery 再从 ph 单侧扣（那张欠条对应的是真到账的 bonus 位）→ 差值单调涨。stale 分支（`if not output_is_stale`）注释原话：'A stale rejection count predates the preemption rollback and must not apply'——抢占已把两个计数器清零/重置，旧拒绝数再扣就翻负。"
+   },
+   "quantified": "本例 k=3 全拒：computed 5→2、ph 4→3→0（回扣 3 + delivery 1）；接受 a 个时 num_rejected = k−a = 3−a——回扣量随接受数线性下降，全接受（a=3）时回扣 0（那 3 个位置真实已算）。机制本体（草稿怎么提、怎么拒）归 ch33；本章只看账本侧：占位覆盖 spec token（PR #24799 的对账语义），拒绝回扣是追赶公式的安全网。"
+  },
+  {
+   "mechanism_id": "m21",
+   "figure_specs": [
+    {
+     "figure_id": "ch12-fig-queue-triple",
+     "template": "layout",
+     "l0_zoom": "放大 L0 循环框（loop_box）中 EngineCore 与执行臂之间的队列位——L2 章图 north 的 batch_queue 组件框（appendleft · pop）的容器内景展开：三层抽屉的三元组结构与 FIFO 方向，架构归属回指 L0/L2。",
+     "claim": "队列元素是三元组 (采样 future, SchedulerOutput, exec_future) 的抽屉柜——appendleft 进/pop 出配成 FIFO，采样 future 出 None 时靠第三层抽屉里的 exec_future 重抛真异常。",
+     "numbers": [
+      {
+       "value": "三元组层数 3：future / scheduler_output / exec_future",
+       "provenance": "traces/m5_pop_fifo_reraise.json part1_fifo.steps[0].triple_arity + triple_fields"
+      },
+      {
+       "value": "FIFO 实测：pop 顺序 t7 → t8（output_token_ids [7] → [7,8]，批 A 先于批 B 到账）",
+       "provenance": "traces/m5_pop_fifo_reraise.json part1_fifo.steps[].popped_tokens + terminal.token_arrival_order"
+      },
+      {
+       "value": "None ⇒ 重抛：sample future=None → exec_model_fut.result() → RuntimeError('real worker failure')",
+       "provenance": "traces/m5_pop_fifo_reraise.json part2_failure.step2"
+      },
+      {
+       "value": "队列容量 deque(maxlen=2)；稳态每拍 appendleft 一次 + pop 一次",
+       "provenance": "traces/m4_e2e_heartbeat.json config.deque_maxlen + beats[].queue_before/queue_after"
+      }
+     ],
+     "caption_draft": "为什么队列里躺的是三元组而不是一个 future（core.py:L207-L212/L681/L696）：采样 future 只回答『这一批采出了什么』，它返回 None 时真答案在 exec_future 里——execute_model 早在上半段就失败了，异常躺在第三层抽屉等 pop 侧翻出来当面重抛（core.py:L701-L706），绝不吞成 'unexpected error'；第二层 SchedulerOutput 让下半段 update_from_output 知道这批当初排了谁——三个抽屉对应一次 pop 的三件事：收采样、对账单、验故障。"
+    }
+   ]
+  }
+ ]
+}

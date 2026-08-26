@@ -86,7 +86,10 @@ def init_logger(name: str):
         log.addHandler(logging.NullHandler())
     seen: set[str] = set()
 
-    # SOURCE: vllm/logger.py LoggingContext once-messaging (info_once/warning_once)
+    # SOURCE: vllm/logger.py once-messaging — lru_cache'd _print_*_once
+    #   helpers (L76-L94) + _VllmLogger.{info,warning}_once methods (L118-L145,
+    #   patched onto Logger at L150-L151); the seen set below re-derives the
+    #   same once-filter on this host seam.
     class _Once:
         # SOURCE: vllm/logger.py once-messaging wrapper
         def __init__(self, fn):
@@ -132,8 +135,11 @@ class envs:
         return None
 
 
-# SOURCE: vllm/usage/usage_lib.py:L112-L118 UsageContext
+# SOURCE: vllm/usage/usage_lib.py:L111-L117 UsageContext
 class UsageContext(str, Enum):
+    # SUBTRACTED: UNKNOWN_CONTEXT / API_SERVER / OPENAI_BATCH_RUNNER members
+    #   (vllm/usage/usage_lib.py:L112/L114/L116) — not keys this chapter's
+    #   default tables read.
     LLM_CLASS = "LLM_CLASS"
     OPENAI_API_SERVER = "OPENAI_API_SERVER"
     ENGINE_CONTEXT = "ENGINE_CONTEXT"
@@ -165,7 +171,7 @@ class Platform:
     def is_cpu(self) -> bool:
         return False
 
-    # SOURCE: vllm/platforms/interface.py Platform.device_count
+    # SOURCE: vllm/platforms/cuda.py:L608 CudaPlatform.device_count (interface.py declares no base device_count)
     def device_count(self) -> int:
         return self._device_count
 
@@ -181,7 +187,7 @@ class Platform:
             raise RuntimeError("no device on the host platform seam")
         return self._device_name
 
-    # SOURCE: vllm/platforms/cpu.py CpuArchEnum (marker only)
+    # SOURCE: vllm/platforms/interface.py:L972 Platform.get_cpu_architecture (CpuArchEnum: interface.py:L79)
     def get_cpu_architecture(self) -> str:
         return "x86"
 
@@ -273,6 +279,8 @@ class CUDAGraphMode(IntEnum):
 # SOURCE: vllm/config/cache.py:L44 CacheConfig (field subset)
 @dataclass
 class CacheConfig:
+    """Configuration for the KV cache."""
+
     block_size: Optional[int] = None                       # L49
     prefix_match_unit: Optional[int] = None                # L56
     gpu_memory_utilization: float = 0.92                   # L68
@@ -646,7 +654,7 @@ class SchedulerConfig:
         return SchedulerConfig(**kwargs)
 
     # SOURCE: vllm/config/scheduler.py:L170-L191 SchedulerConfig.get_scheduler_cls
-    def get_scheduler_cls(self) -> type:
+    def get_scheduler_cls(self) -> type["SchedulerInterface"]:
         if self.scheduler_cls is None:
             if self.async_scheduling:
                 # SUBTRACTED: real lazy import (vllm/v1/core/sched/...)
@@ -761,6 +769,8 @@ class SchedulerConfig:
 # SOURCE: vllm/config/parallel.py:L118 ParallelConfig (field subset)
 @dataclass
 class ParallelConfig:
+    """Configuration for the distributed execution."""
+
     pipeline_parallel_size: int = 1                         # L122
     tensor_parallel_size: int = 1                           # L124
     prefill_context_parallel_size: int = 1                  # L126
@@ -929,7 +939,7 @@ class ParallelConfig:
             and self.data_parallel_size > 1
         )
 
-    # SOURCE: vllm/config/parallel.py:L774-L830 ParallelConfig.compute_hash
+    # SOURCE: vllm/config/parallel.py:L774-L829 ParallelConfig.compute_hash
     def compute_hash(self):
         """Hash of the configs that affect the computation graph structure.
 
@@ -947,6 +957,9 @@ class ParallelConfig:
             "data_parallel_hybrid_lb",
             "data_parallel_master_ip",
             "data_parallel_master_port",
+            # SUBTRACTED: "_data_parallel_master_port_list" / "_coord_store_port"
+            #   entries (vllm/config/parallel.py) — ignored-factor rows for two
+            #   init=False derived fields that are themselves subtracted here.
             "data_parallel_rpc_port",
             "rank",
             "master_addr",
@@ -1224,7 +1237,7 @@ class VllmConfig:
 
     @property
     def max_concurrent_batches(self) -> int:
-        # SOURCE: vllm/config/vllm.py:L539-L550 max_concurrent_batches
+        # SOURCE: vllm/config/vllm.py:L540-L550 max_concurrent_batches
         # PP requires PP-size concurrent batches to fill the pipeline.
         # Async scheduling requires 2 concurrent batches to overlap.
         pp_size = self.parallel_config.pipeline_parallel_size
@@ -1336,8 +1349,8 @@ class VllmConfig:
 
         If the user configuration does not specify a value for a default field
         and if the default field is still None after all user selections are
-        applied, then default values will be applied to the field. User
-        specified fields will not be overridden by the default.
+        applied, then default values will be applied to the field. User specified
+        fields will not be overridden by the default.
 
         Args:
             defaults: Dictionary of default values to apply.
@@ -1739,6 +1752,18 @@ class DeviceConfig:
 # SOURCE: vllm/config/compilation.py:L107 PassConfig (fusion-flag subset)
 @dataclass
 class PassConfig:
+    """Configuration for custom Inductor passes.
+
+    This is separate from general `CompilationConfig` so that inductor passes
+    don't all have access to full configuration - that would create a cycle as
+    the `PassManager` is set as a property of config.
+
+    You must pass PassConfig to VLLmConfig constructor via the CompilationConfig
+    constructor. VllmConfig's post_init does further initialization.
+    If used outside of the VllmConfig, some fields may be left in an
+    improper state.
+    """
+
     # SOURCE: vllm/config/compilation.py:L107 PassConfig
     fuse_norm_quant: Optional[bool] = None                  # L121
     fuse_act_quant: Optional[bool] = None
@@ -1760,11 +1785,18 @@ class PassConfig:
 # SOURCE: vllm/config/compilation.py:L398 CompilationConfig (field subset)
 @dataclass
 class CompilationConfig:
-    """`torch.compile` and cudagraph capture configuration for the model.
+    """Configuration for compilation.
 
-    As a shorthand, one can append compilation arguments via
-    -cc.parameter=argument such as `-cc.mode=3` (same as `-cc='{"mode":3}'`).
+    You must pass CompilationConfig to VllmConfig constructor.
+    VllmConfig's post_init does further initialization. If used outside of the
+    VllmConfig, some fields will be left in an improper state.
+
+    It contains PassConfig, which controls the custom fusion/transformation passes.
+    The rest has three parts:
     """
+    # SUBTRACTED: field-index list + cudagraph-vs-inductor size rationale tail
+    #   of the real docstring (vllm/config/compilation.py:L408-L444) — a map
+    #   over compilation fields that are ch19 territory.
 
     mode: Optional[CompilationMode] = None                  # L447
     cudagraph_mode: Optional[CUDAGraphMode] = None          # L607
@@ -1947,11 +1979,7 @@ class AsyncScheduler(Scheduler):
 # SOURCE: vllm/engine/arg_utils.py:L421 EngineArgs
 @dataclass
 class EngineArgs:
-    """Arguments for vLLM engine.
-
-    Each field default references the matching sub-Config attribute, so CLI
-    defaults and sub-config defaults stay a single source of truth.
-    """
+    """Arguments for vLLM engine."""
 
     model: str = ModelConfig.model
     enable_return_routed_experts: bool = ModelConfig.enable_return_routed_experts
@@ -2031,11 +2059,11 @@ class EngineArgs:
         VllmConfig, "structured_outputs_config"
     )
     reasoning_parser: Optional[str] = StructuredOutputsConfig.reasoning_parser
-    speculative_config: Optional[dict] = None
-    spec_method: Optional[str] = None
-    spec_model: Optional[str] = None
-    spec_tokens: Optional[int] = None
-    diffusion_config: Optional[dict] = None
+    speculative_config: dict[str, Any] | None = None
+    spec_method: str | None = None
+    spec_model: str | None = None
+    spec_tokens: int | None = None
+    diffusion_config: dict[str, Any] | None = None
     scheduling_policy: str = SchedulerConfig.policy
     scheduler_cls: Any = SchedulerConfig.scheduler_cls
     compilation_config: CompilationConfig = get_field(VllmConfig, "compilation_config")
@@ -2268,7 +2296,7 @@ class EngineArgs:
     # SOURCE: vllm/engine/arg_utils.py:L1896 EngineArgs.create_engine_config
     def create_engine_config(
         self,
-        usage_context: Optional[UsageContext] = None,
+        usage_context: UsageContext | None = None,
         headless: bool = False,
     ) -> VllmConfig:
         """
@@ -2345,7 +2373,9 @@ class EngineArgs:
         # SUBTRACTED: DP load-balancer derivation block (hybrid/external/rank/
         #   size_local/address, vllm/engine/arg_utils.py:L2016-L2189) —
         #   dossier delete item. DP=1 defaults substituted inline below
-        #   (mirrors the else-branches at L2158-L2161/L2177-L2179/L2185-L2189).
+        #   (mirrors the else-branches at L2158-L2161/L2177-L2179/L2185-L2189;
+        #   the address else-branch's `self.master_addr or` fallback folds
+        #   away — master_addr defaults to None on this traced path).
         data_parallel_external_lb = (
             self.data_parallel_external_lb or self.data_parallel_rank is not None
         )
@@ -2542,9 +2572,9 @@ class EngineArgs:
     def get_batch_defaults(  # SOURCE: vllm/engine/arg_utils.py:L2515 EngineArgs.get_batch_defaults
         cls,
         world_size: int,
-    ) -> tuple[dict, dict]:
-        default_max_num_batched_tokens: dict
-        default_max_num_seqs: dict
+    ) -> tuple[dict[UsageContext | None, int], dict[UsageContext | None, int]]:
+        default_max_num_batched_tokens: dict[UsageContext | None, int]
+        default_max_num_seqs: dict[UsageContext | None, int]
 
         # When no user override, set the default values based on the usage
         # context.
@@ -2683,7 +2713,7 @@ class EngineArgs:
     # SOURCE: vllm/engine/arg_utils.py:L2712 _set_default_max_num_seqs_and_batched_tokens_args
     def _set_default_max_num_seqs_and_batched_tokens_args(
         self,
-        usage_context: Optional[UsageContext],
+        usage_context: UsageContext | None,
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
     ):
@@ -2781,9 +2811,7 @@ class AsyncEngineArgs(EngineArgs):
 
 # SOURCE: vllm/v1/engine/core_client.py:L77 EngineCoreClient
 class EngineCoreClient:
-    """Abstract base class for EngineCore IPC clients.
-
-    Subclasses handle different methods for pushing
+    """EngineCoreClient: subclasses handle different methods for pushing
     and pulling from the EngineCore for asyncio / multiprocessing.
 
     Subclasses:
@@ -2798,7 +2826,7 @@ class EngineCoreClient:
         multiprocess_mode: bool,
         asyncio_mode: bool,
         vllm_config: VllmConfig,
-        executor_class: type,
+        executor_class: type[Executor],
         log_stats: bool,
     ) -> "EngineCoreClient":
         # TODO: support this for debugging purposes.
@@ -2819,12 +2847,14 @@ class EngineCoreClient:
         return InprocClient(vllm_config, executor_class, log_stats)
 
     # SOURCE: vllm/v1/engine/core_client.py:L114-L139 EngineCoreClient.make_async_mp_client
+    # SUBTRACTED: @instrument(span_name="Overall Loading") decorator
+    #   (vllm/v1/engine/core_client.py:L115) — observability seam.
     @staticmethod
     def make_async_mp_client(  # SOURCE: vllm/v1/engine/core_client.py:L116 EngineCoreClient.make_async_mp_client
         vllm_config: VllmConfig,
-        executor_class: type,
+        executor_class: type[Executor],
         log_stats: bool,
-        client_addresses: Optional[dict] = None,
+        client_addresses: dict[str, Any] | None = None,
         client_count: int = 1,
         client_index: int = 0,
     ) -> "AsyncMPClient":
@@ -2866,6 +2896,17 @@ class InprocClient(EngineCoreClient):
 
 # SOURCE: vllm/v1/engine/core_client.py:L503 MPClient (marker stub)
 class MPClient(EngineCoreClient):
+    """MPClient: base client for multi-proc EngineCore.
+    EngineCore runs in a background process busy loop, getting
+    new EngineCoreRequests and returning EngineCoreOutputs
+
+    * pushes EngineCoreRequests via input_socket
+    * pulls EngineCoreOutputs via output_socket
+
+    * AsyncMPClient subclass for AsyncLLM usage
+    * SyncMPClient subclass for LLM usage
+    """
+
     # SUBTRACTED: shared mp machinery — ZMQ context + input/output sockets,
     #   EngineCore process spawn + startup handshake, background output
     #   handling (vllm/v1/engine/core_client.py:L503-L801) — the mp topology
@@ -2876,11 +2917,14 @@ class MPClient(EngineCoreClient):
 
 # SOURCE: vllm/v1/engine/core_client.py:L802 SyncMPClient (marker stub)
 class SyncMPClient(MPClient):
-    # SUBTRACTED: ZMQ socket setup + EngineCore process spawn + background
-    #   output thread (vllm/v1/engine/core_client.py:L802+) — the mp topology
-    #   is ch5; on the host seam the client only records its inputs.
+    """Synchronous client for multi-proc EngineCore."""
+
+    # SUBTRACTED: @instrument decorator (vllm/v1/engine/core_client.py:L805)
+    #   + super().__init__ ZMQ socket setup / EngineCore process spawn /
+    #   background output thread (L503-L801 MPClient machinery) — the mp
+    #   topology is ch5; on the host seam the client only records its inputs.
     def __init__(self, vllm_config, executor_class, log_stats):
-        # SOURCE: vllm/v1/engine/core_client.py:L802 SyncMPClient.__init__
+        # SOURCE: vllm/v1/engine/core_client.py:L806 SyncMPClient.__init__
         self.vllm_config = vllm_config
         self.executor_class = executor_class
         self.log_stats = log_stats
@@ -2888,11 +2932,15 @@ class SyncMPClient(MPClient):
 
 # SOURCE: vllm/v1/engine/core_client.py:L974 AsyncMPClient (marker stub)
 class AsyncMPClient(MPClient):
-    # SUBTRACTED: ZMQ asyncio sockets + engine process spawn + output_handler
-    #   task (vllm/v1/engine/core_client.py:L974+) — same treatment as sync.
+    """Asyncio-compatible client for multi-proc EngineCore."""
+
+    # SUBTRACTED: @instrument decorator (vllm/v1/engine/core_client.py:L977)
+    #   + super().__init__ ZMQ asyncio sockets / engine process spawn /
+    #   output_handler task (L503-L801 MPClient machinery) — same treatment
+    #   as sync; ch5 opens the topology.
     def __init__(self, vllm_config, executor_class, log_stats,
                  client_addresses=None, client_count=1, client_index=0):
-        # SOURCE: vllm/v1/engine/core_client.py:L974 AsyncMPClient.__init__
+        # SOURCE: vllm/v1/engine/core_client.py:L978 AsyncMPClient.__init__
         self.vllm_config = vllm_config
         self.executor_class = executor_class
         self.log_stats = log_stats
@@ -2917,13 +2965,13 @@ class StructuredOutputManager:
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
-    # SOURCE: vllm/v1/engine/core.py:L106-L234 EngineCore.__init__
+    # SOURCE: vllm/v1/engine/core.py:L106-L248 EngineCore.__init__
     def __init__(
         self,
         vllm_config: VllmConfig,
-        executor_class: type,
+        executor_class: type[Executor],
         log_stats: bool,
-        executor_fail_callback=None,
+        executor_fail_callback: Callable | None = None,
         include_finished_set: bool = False,
     ):
         # plugins need to be loaded at the engine/scheduler level too
@@ -2958,7 +3006,7 @@ class EngineCore:
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
         # Setup scheduler.
-        SchedulerCls = vllm_config.scheduler_config.get_scheduler_cls()
+        Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
 
         if len(kv_cache_config.kv_cache_groups) == 0:  # noqa: SIM102
             # Encoder models without KV cache don't support
@@ -2971,7 +3019,7 @@ class EngineCore:
             kv_cache_config, vllm_config
         )
 
-        self.scheduler = SchedulerCls(
+        self.scheduler: SchedulerInterface = Scheduler(
             vllm_config=vllm_config,
             kv_cache_config=kv_cache_config,
             structured_output_manager=self.structured_output_manager,
@@ -2981,10 +3029,10 @@ class EngineCore:
             hash_block_size=hash_block_size,
         )
         # SUBTRACTED: EngineCore.__init__ tail (vllm/v1/engine/core.py:L169-
-        #   L234) — spec-decode flags, KV-connector handshake, batch queue
-        #   (max_concurrent_batches), prefix hasher, step_fn static binding:
-        #   the busy loop and async overlap are ch9/ch12; this chapter ends at
-        #   "Scheduler(...) assembled".
+        #   L248) — spec-decode flags, KV-connector handshake, batch queue
+        #   (max_concurrent_batches), prefix hasher, step_fn static binding,
+        #   idle-state callbacks + freeze_gc_heap: the busy loop and async
+        #   overlap are ch9/ch12; this chapter ends at "Scheduler(...) assembled".
 
     # SOURCE: vllm/v1/engine/core.py EngineCore._initialize_kv_caches (seam)
     def _initialize_kv_caches(self, vllm_config: VllmConfig):
@@ -3002,10 +3050,10 @@ class EngineCore:
         return _KVCacheConfig()
 
 
-# SOURCE: vllm/v1/kv_cache_interface.py resolve_kv_cache_block_sizes (seam)
+# SOURCE: vllm/v1/core/kv_cache_utils.py:L626 resolve_kv_cache_block_sizes (seam)
 def resolve_kv_cache_block_sizes(kv_cache_config, vllm_config):
     # SUBTRACTED: per-backend scheduler/hash block-size arithmetic
-    #   (vllm/v1/kv_cache_interface.py resolve_kv_cache_block_sizes body) —
+    #   (vllm/v1/core/kv_cache_utils.py:L626 resolve_kv_cache_block_sizes body) —
     #   hybrid-attention detail (ch14); reduced to the stand-in block size for
     #   both scheduler and hash granularity on the traced path.
     return kv_cache_config.block_size, kv_cache_config.block_size
@@ -3016,15 +3064,15 @@ def resolve_kv_cache_block_sizes(kv_cache_config, vllm_config):
 # ============================================================================
 
 
-# SOURCE: vllm/v1/engine/llm_engine.py:L50 LLMEngine
+# SOURCE: vllm/v1/engine/llm_engine.py:L48 LLMEngine
 class LLMEngine:
-    """v1 synchronous engine facade — the start of this chapter's data flow."""
+    """Legacy LLMEngine for backwards compatibility."""
 
     # SOURCE: vllm/v1/engine/llm_engine.py:L51-L141 LLMEngine.__init__ (reduced)
     def __init__(
         self,
         vllm_config: VllmConfig,
-        executor_class: type,
+        executor_class: type[Executor],
         log_stats: bool,
         aggregate_engine_logging: bool = False,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
@@ -3104,13 +3152,13 @@ class LLMEngine:
 
 # SOURCE: vllm/v1/engine/async_llm.py AsyncLLM (facade subset)
 class AsyncLLM:
-    """v1 online async facade — same assembly line, async driver only (WC1)."""
+    """An asynchronous wrapper for the vLLM engine."""
 
     # SOURCE: vllm/v1/engine/async_llm.py AsyncLLM.__init__ (reduced)
     def __init__(
         self,
         vllm_config: VllmConfig,
-        executor_class: type,
+        executor_class: type[Executor],
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         log_requests: bool = True,
         log_stats: bool = True,
@@ -3202,10 +3250,23 @@ class AsyncLLM:
 
 # SOURCE: vllm/entrypoints/llm.py:L67 LLM (entry subset)
 class LLM:
-    """Offline inference face: collects ~100 kwargs into EngineArgs, then
-    walks the same assembly line as vllm serve."""
+    # SUBTRACTED: mixin bases BeamSearchOfflineMixin / PoolingOfflineMixin /
+    #   OfflineInferenceMixin (vllm/entrypoints/llm.py:L67) — their
+    #   generate()/chat()/tokenize surfaces are the subtracted request path.
 
-    # SOURCE: vllm/entrypoints/llm.py:L295-L345 EngineArgs collection in LLM.__init__ (def L177)
+    """An LLM for generating texts from given prompts and sampling parameters.
+
+    This class includes a tokenizer, a language model (possibly distributed
+    across multiple GPUs), and GPU memory space allocated for intermediate
+    states (aka KV cache). Given a batch of prompts and sampling parameters,
+    this class generates texts from the model, using an intelligent batching
+    mechanism and efficient memory management.
+    """
+    # SUBTRACTED: per-kwarg Args block of the real docstring
+    #   (vllm/entrypoints/llm.py:L76-L174) — documents the ~90 kwargs that the
+    #   entry subset below does not carry.
+
+    # SOURCE: vllm/entrypoints/llm.py:L295-L341 EngineArgs collection in LLM.__init__ (def L177)
     def __init__(
         self,
         model: str,
@@ -3268,6 +3329,15 @@ class LLM:
         #   structured/profiler instance pre-construction
         #   (vllm/entrypoints/llm.py:L160-L294) — same flat->EngineArgs
         #   repacking; log_non_default_args (L337) is a logging nicety.
+        # Note: 9 of the explicit kwargs above (max_model_len /
+        #   max_num_batched_tokens / max_num_seqs / enable_chunked_prefill /
+        #   async_scheduling / optimization_level / performance_mode /
+        #   distributed_executor_backend / speculative_config) are **kwargs-
+        #   pass-throughs in the real entry (llm.py:L177-L294); they are
+        #   promoted to explicit params here to show this chapter's knobs.
+        #   compilation_config None routing: real _make_config(None) ->
+        #   CompilationConfig() fresh default; omitted kwarg -> EngineArgs
+        #   default_factory gives the same fresh default.
 
         self.llm_engine = LLMEngine.from_engine_args(
             engine_args=engine_args, usage_context=UsageContext.LLM_CLASS

@@ -1,0 +1,953 @@
+{
+  "chapter_id": "ch10",
+  "part": "III",
+  "title": "连续批处理与 chunked prefill",
+  "pin": "vLLM v0.27.1 (6e448d0ea)",
+  "chapter_kind": "code",
+  "note_on_kind": "标准代码章（非 primer）：走 implementer 精简版 + lint_fidelity 全链。本章把 L0 的调度·显存账本列上半（Scheduler 框）放大：ch9 立了五拍骨架，本章打开第 ① 拍 schedule() 的内部——迭代级调度怎么把『批』从请求数改写成 token 数账本，RUNNING 先于 WAITING 的两阶段怎么分账，chunked prefill 怎么把长 prompt 切进预算。",
+  "hook_suggestion": "「256 个 decode 请求各出 1 个 token，和 1 个 8192-token 的新 prompt——在『请求数』口径下都是 1，计算量却差 32 倍：批的上限到底该按请求数还是 token 数算？长 prompt 切成块混进 decode 批，谁在付账？」（从 Part III hook『调度器只认 token 数不认请求数』+ 本章主题『连续批处理与 chunked prefill』+ deepread/engine-loop.json why_chains[0]『迭代级调度』、[1]『只认 token 数』提炼；Orca 36.9×/Sarathi 血统见 theory）",
+  "scope_note": "主线 = Scheduler.schedule()（scheduler.py:L439-L1253）一拍两阶段：RUNNING 先行（L483-L671，追赶公式 + 预算钳制 + allocate_slots 失败进抢占重试环）→ WAITING 收新（L683-L1101，守卫 + 前缀命中折算 + chunked 切块 + 准入 + 入 running）→ 守恒断言（L1108-L1119）→ SchedulerOutput 组装（L1208-L1229）→ _update_after_schedule 乐观推进（L1317-L1343）。token 预算的三个来源（config 默认 2048 / arg_utils 按硬件与场景上调 / max_num_scheduled_tokens 覆盖）与 long_prefill_token_threshold、enable_chunked_prefill 两个旋钮全讲。边界与邻章分工：ch9 已立五拍骨架与忙循环——本章只展开 ① 拍内部，execute/sample/update_from_output 不再展开；抢占本身（_preempt_request 的 recompute-only、stale 输出、回 waiting 队头）与请求状态机/check_stop 归 ch11——本章只讲到『allocate_slots 返回 None 会触发抢占、本拍抢占过则整拍不收新』这一层因果；num_output_placeholders 只作为追赶公式的一项出现（同步版恒 0），占位调度与异步重叠归 ch12；KVCacheManager 当黑盒契约面用（get_computed_blocks 返回命中 token 数 / allocate_slots 返回 None=不够），分页块池内部归 ch13、显存账本与准入门深挖归 ch14、前缀缓存链式哈希归 ch15；SchedulerOutput 的 new 全量/cached 增量二分在本章只立『产出什么』，worker 侧持久批次与差量协议深挖归 ch18；update_from_output 的状态推进 ch9 已讲（⑤ 拍），本章不重复。外证口径：Orca（arXiv:2103.00071）36.9× 与 Sarathi-Serve（arXiv:2308.16369）token 预算混相批是设计血统——讲法上必须明标『外部论文证据，非源码』。",
+  "code_spine": [
+    "vllm/v1/core/sched/interface.py:L54-L67 —— schedule() 契约 docstring：调度决策在迭代级做，每步=一次 forward；产出 {req_id: num_tokens}，可大可小可居中（chunked prefill 居中档）",
+    "vllm/v1/core/sched/scheduler.py:L2213-L2235 —— add_request：requests[req_id] 登记 + _enqueue_waiting_request 入 waiting 队尾 + record_event(QUEUED)（本章入口）",
+    "vllm/v1/core/sched/scheduler.py:L439-L462 —— schedule() 开场：woosuk 注释『没有 decoding/prefill 相位，只有 num_computed_tokens 追赶 num_tokens_with_spec』+ token_budget = max_num_scheduled_tokens（PAUSED_ALL 置 0）",
+    "vllm/v1/core/sched/scheduler.py:L483-L538 —— 阶段一 RUNNING 先行：追赶公式 num_new_tokens = num_tokens_with_spec + num_output_placeholders − num_computed_tokens，钳 long_prefill_token_threshold / token_budget / max_model_len",
+    "vllm/v1/core/sched/scheduler.py:L557-L573 —— num_new_tokens==0 时 continue 而非 break：不严格 FCFS，让低优先请求也有机会",
+    "vllm/v1/core/sched/scheduler.py:L576-L629 —— allocate_slots 抢占重试环：None → FCFS 抢 running 队尾 → 重试；本拍抢占集合 preempted_reqs 是阶段二的守卫条件（抢占细节归 ch11）",
+    "vllm/v1/core/sched/scheduler.py:L631-L638 —— RUNNING 记账：num_scheduled_tokens[req_id]=n · token_budget −= n",
+    "vllm/v1/core/sched/scheduler.py:L683-L711 —— 阶段二 WAITING 收新：守卫 `not preempted_reqs and UNPAUSED` + max_num_running_reqs 上限 + 阻塞态跳过（skipped 双队列）",
+    "vllm/v1/core/sched/scheduler.py:L744-L766 —— 前缀缓存折算：num_computed_tokens==0 → get_computed_blocks，命中 token 数直接当『已算』（无 connector 走 else 分支）",
+    "vllm/v1/core/sched/scheduler.py:L874-L914 —— 新请求切块：num_new_tokens = num_tokens − num_computed_tokens → long_prefill_token_threshold 钳制 → enable_chunked_prefill 关且超预算则整拍 break → min(token_budget)",
+    "vllm/v1/core/sched/scheduler.py:L965-L994 —— allocate_slots 准入：拿不到块返回 None → 直接 break（WAITING 阶段绝不触发抢占）",
+    "vllm/v1/core/sched/scheduler.py:L1022-L1082 —— 出队入 running：WAITING→RUNNING 状态转移 + num_computed_tokens 记命中数 + token_budget −= chunk + 未完 chunk 记 _inflight_prefills",
+    "vllm/v1/core/sched/scheduler.py:L1108-L1119 —— 账本守恒断言：Σ num_scheduled_tokens ≤ max_num_scheduled_tokens、len(running) ≤ max_num_running_reqs",
+    "vllm/v1/core/sched/scheduler.py:L1131-L1163 —— 组装：scheduled_new_reqs → NewRequestData.from_request（全量）；scheduled_running/resumed → _make_cached_request_data（增量）；刷新 prev_step_scheduled_req_ids",
+    "vllm/v1/core/sched/scheduler.py:L1208-L1229 —— SchedulerOutput 落袋：num_scheduled_tokens + total + finished_req_ids + preempted_req_ids",
+    "vllm/v1/core/sched/scheduler.py:L1317-L1343 —— _update_after_schedule 乐观推进：num_computed_tokens += n（GPU 还没算）+ is_prefill_chunk 标记——chunked prefill 下一拍立即续上的关键",
+    "vllm/config/scheduler.py:L42-L44, L49-L61, L70-L80 —— 预算真相源：DEFAULT_MAX_NUM_BATCHED_TOKENS=2048 / max_num_scheduled_tokens 缺省回落 / long_prefill_token_threshold=0 / enable_chunked_prefill=True",
+    "vllm/engine/arg_utils.py:L2541-L2563 —— 默认值按硬件与使用场景：≥70GiB 且非 A100 → LLM 16384 / API server 8192、seqs 1024；否则 8192/2048、256（A100 大预算反降吞吐 #17885）",
+    "vllm/v1/request.py:L272-L277 —— 账本字段真相源：num_tokens = len(_all_token_ids)；num_tokens_with_spec = len(_all_token_ids) + len(spec_token_ids)"
+  ],
+  "stations": [
+    {
+      "n": 1,
+      "where": "scheduler.py:L2213-L2235",
+      "what": "add_request 登记进 waiting 队尾：requests[req_id] 建档 · status=WAITING · record_event(QUEUED)——请求从 ch9 第 1 站的 input_queue 落进调度账本"
+    },
+    {
+      "n": 2,
+      "where": "core.py:L595",
+      "what": "EngineCore.step() 第 ① 拍调 schedule()（ch9 立的五拍骨架，本章打开这一拍内部）"
+    },
+    {
+      "n": 3,
+      "where": "scheduler.py:L439-L459",
+      "what": "schedule() 开场：token_budget = max_num_scheduled_tokens（config 默认 2048；服务端按硬件上调 8192/16384；PAUSED_ALL 置 0）"
+    },
+    {
+      "n": 4,
+      "where": "scheduler.py:L483-L485",
+      "what": "阶段一 RUNNING 先行：『First, schedule the RUNNING requests』——在途请求先吃预算，本拍新请求还不在 running"
+    },
+    {
+      "n": 5,
+      "where": "scheduler.py:L516-L532",
+      "what": "追赶公式：num_new_tokens = num_tokens_with_spec + num_output_placeholders − num_computed_tokens，钳 long_prefill_token_threshold / token_budget / max_model_len——decode 请求≈1 个 token"
+    },
+    {
+      "n": 6,
+      "where": "scheduler.py:L636-L637",
+      "what": "记账入册：num_scheduled_tokens[req_id] = n · token_budget −= n——{req_id: num_tokens} 账本本体"
+    },
+    {
+      "n": 7,
+      "where": "scheduler.py:L683-L684",
+      "what": "阶段二 WAITING 守卫：`if not preempted_reqs and UNPAUSED`——本拍发生过抢占就整个跳过收新（抢占细节 → ch11）"
+    },
+    {
+      "n": 8,
+      "where": "scheduler.py:L744-L766",
+      "what": "前缀缓存折算：num_computed_tokens==0 → get_computed_blocks，命中 token 数直接当『已算』（链式哈希内部 → ch15）"
+    },
+    {
+      "n": 9,
+      "where": "scheduler.py:L874-L914",
+      "what": "新请求切块：num_new_tokens = num_tokens − num_computed_tokens → threshold 钳制 → chunked 开=截 token_budget（切成多拍）/ 关=超预算整拍不收"
+    },
+    {
+      "n": 10,
+      "where": "scheduler.py:L973-L994",
+      "what": "allocate_slots 准入：拿不到块 None → break——WAITING 阶段绝不触发抢占（全序列准入门 → ch14）"
+    },
+    {
+      "n": 11,
+      "where": "scheduler.py:L1022-L1075",
+      "what": "出队入 running：pop 出 waiting · self.running.append · WAITING→RUNNING · num_computed_tokens 记命中数 · token_budget −= chunk"
+    },
+    {
+      "n": 12,
+      "where": "scheduler.py:L1108-L1119",
+      "what": "账本守恒断言：Σ num_scheduled_tokens ≤ max_num_scheduled_tokens · len(running) ≤ max_num_running_reqs（=max_num_seqs）"
+    },
+    {
+      "n": 13,
+      "where": "scheduler.py:L1208-L1229",
+      "what": "组装 SchedulerOutput：scheduled_new_reqs 全量（NewRequestData）/ 老请求增量（CachedRequestData）+ num_scheduled_tokens（差量协议深挖 → ch18）"
+    },
+    {
+      "n": 14,
+      "where": "scheduler.py:L1317-L1343",
+      "what": "_update_after_schedule 乐观推进：num_computed_tokens += n（GPU 还没算！）+ is_prefill_chunk 标记——下一拍 chunk 立即续上、decode 追赶公式闭合"
+    }
+  ],
+  "stations_note": "站号 = 一条新请求首拍流经 schedule() 的代码顺序：第 1 站入队（ch9 第 1 站的下游）、第 2 站被 ① 拍唤起、第 3-6 站是阶段一 RUNNING 的账本动作（此刻它还不在 running，看到的是老请求们怎么分账）、第 7-11 站是阶段二 WAITING 的收新-切块-准入-落位、第 12-14 站收尾（断言 → 组装 → 乐观推进）。下一拍起该请求住进 running，走第 4-6 站的追赶公式（decode 恰 1 token；chunk 未完继续切）。与 ch9 衔接：五拍骨架已立，① 拍在这里展开成 14 站。与 ch11 衔接：第 7 站守卫里的 preempted_reqs、第 10 站『WAITING 不抢占』的反差，是 ch11 抢占机制的两个钩子。与 ch12 衔接：第 5 站公式里的 num_output_placeholders 在同步版恒为 0，ch12 给它灌上占位数。与 ch18 衔接：第 13 站产出的 new/cached 二分是差量协议的调度器侧半边。",
+  "key_classes": [
+    {
+      "name": "Scheduler",
+      "file": "vllm/v1/core/sched/scheduler.py",
+      "responsibility": "本章主角。持三容器：requests（req_id→Request 全量档案）、waiting/skipped_waiting（FCFS deque，create_request_queue 按 policy 建）、running（list[Request]，入序即优先序）。schedule() 两阶段按单一 token 预算分账；_update_after_schedule 乐观推进 num_computed_tokens；_make_cached_request_data 产增量下发数据。max_num_scheduled_tokens 缺省回落 max_num_batched_tokens（L110-L114）、max_num_running_reqs = max_num_seqs（L109）。"
+    },
+    {
+      "name": "SchedulerInterface",
+      "file": "vllm/v1/core/sched/interface.py",
+      "responsibility": "契约面：schedule() docstring 写明『调度决策在迭代级做、每步 = 一次 forward、产出 {req_id: num_tokens}』——连续批处理的一句话契约；num_tokens 可为整个 prompt、可为 1、可居中（chunked prefill/prefix caching/spec decode）。另定义 PauseState（UNPAUSED/PAUSED_NEW/PAUSED_ALL）。"
+    },
+    {
+      "name": "Request（账本字段群）",
+      "file": "vllm/v1/request.py",
+      "responsibility": "调度只读它的计数器：num_computed_tokens（已算，L173）、num_tokens = len(_all_token_ids)（L271-L273）、num_tokens_with_spec = +spec（L275-L277）、num_output_placeholders（async 占位，L151，同步恒 0）、is_prefill_chunk（L188，chunk 未完标记）。请求的一生就是这几个标量的消长。"
+    },
+    {
+      "name": "FCFSRequestQueue / create_request_queue",
+      "file": "vllm/v1/core/sched/request_queue.py",
+      "responsibility": "waiting/skipped_waiting 的容器：FCFS 是 deque 子类（add_request=append、pop_request=popleft、peek_request 看队头、prepend_request=appendleft——ch11 抢占回队头靠它）；PRIORITY 是堆。默认 policy='fcfs'（config/scheduler.py:L99-L105）。"
+    },
+    {
+      "name": "SchedulerOutput",
+      "file": "vllm/v1/core/sched/output.py",
+      "responsibility": "一拍调度的产物（L193-L227）：num_scheduled_tokens {req_id: n} 与 total（账本本体）+ scheduled_new_reqs（NewRequestData 首次全量：prompt_token_ids/sampling_params/block_ids——worker 缓存它）vs scheduled_cached_reqs（CachedRequestData 只发 diff）+ finished_req_ids/preempted_req_ids。增量协议的深挖归 ch18。"
+    },
+    {
+      "name": "SchedulerConfig（本章旋钮）",
+      "file": "vllm/config/scheduler.py",
+      "responsibility": "预算与切块的配置真相源：max_num_batched_tokens（默认 2048，『主要为测试便利』）、max_num_scheduled_tokens（缺省回落 batched）、max_num_seqs（DEFAULT_MAX_NUM_SEQS=128，running 上界）、long_prefill_token_threshold（0=不钳）、enable_chunked_prefill（v1 默认 True！encoder-decoder 才关）、scheduler_reserve_full_isl（默认 True，全序列准入门 → ch14）。"
+    },
+    {
+      "name": "EngineArgs（默认值仲裁）",
+      "file": "vllm/engine/arg_utils.py",
+      "responsibility": "真实部署的预算不来自 config 默认而在 create_engine_config：≥70GiB 且非 A100 → LLM 16384 / API server 8192、max_num_seqs 1024；否则 8192/2048、256（L2541-L2563）。A100 反例注释（PR #17885）：大预算反而降吞吐。"
+    },
+    {
+      "name": "AsyncScheduler（占位预告）",
+      "file": "vllm/v1/core/sched/async_scheduler.py",
+      "responsibility": "v0.27.1 服务默认实际用的是它（get_scheduler_cls：async_scheduling → AsyncScheduler）。本章按同步版讲公式（追赶公式里 num_output_placeholders 恒 0）；占位机制与重叠循环归 ch12。"
+    }
+  ],
+  "data_flow": [
+    "总述：本章数据流 = deepread/engine-loop.json data_flow 的 schedule 段（第 2-3 步 + 第 8 步首句），不重挖——一条 256-token prompt 的新请求首次被调度的一拍：",
+    "1. 入队：ch9 第 1 站 IO 线程构造 Request → 忙循环 add_request（core.py:L1514-L1518）→ Scheduler.add_request（scheduler.py:L2213-L2235）：requests[req_id] 登记、status=WAITING、入 waiting 队尾、record_event(QUEUED)。（本章第 1 站）",
+    "2. schedule() 开场（scheduler.py:L439）：current_step+=1、token_budget = max_num_scheduled_tokens、kv_cache_manager.new_step_starts()。RUNNING 阶段（L484-L671）先消耗预算：每个在途请求按追赶公式领 token（decode≈1、续 chunk 走 threshold/budget 钳制）、allocate_slots 失败进抢占重试环（L576-L629，细节 ch11）。（第 3-6 站）",
+    "3. WAITING 阶段（L684 守卫通过——本拍未发生抢占）：队头请求 num_computed_tokens==0 → get_computed_blocks 查前缀命中（L745-L766）；num_new_tokens = num_tokens − num_computed_tokens，受 long_prefill_token_threshold（L899-L901）与 token_budget（L913）钳制——8192-token prompt 在 2048 预算下首拍只领 2048，剩下的进后续拍（chunked prefill）；allocate_slots 拿块（L973-L985，全序列准入门在 kv_cache_manager 侧）；L1022 出队 → L1055 入 running、status: WAITING→RUNNING（L1060-L1075）、num_computed_tokens 记命中数。（第 7-11 站）",
+    "4. 收尾：守恒断言（L1108-L1119）→ SchedulerOutput 组装（L1208-L1229：new 全量/cached 增量 + num_scheduled_tokens）→ _update_after_schedule（L1317-L1343）乐观推进 num_computed_tokens += num_new_tokens、is_prefill_chunk 标记——此刻 GPU 还没算。（第 12-14 站）",
+    "5. 交棒：SchedulerOutput → execute_model(non_block=True)（core.py:L596，② 拍，ch9 已讲）——本章止于此；采样 token 怎么回来推进状态机（⑤ 拍 update_from_output）ch9 已讲、停止判定与生命周期 ch11 展开。",
+    "6. 后续每拍：请求住 running，走 RUNNING 阶段追赶公式 num_new_tokens = num_tokens_with_spec + num_output_placeholders − num_computed_tokens = 1（scheduler.py:L516-L520）——decode 一拍一 token；chunk 未完的请求 is_prefill_chunk=True，同公式继续切大块，直到 num_computed_tokens 追平 num_tokens。"
+  ],
+  "why_chains": [
+    {
+      "id": "WC1",
+      "card": "deepread/engine-loop.json why_chains[0]",
+      "decision": "迭代级调度：每次 forward 前重新组批（continuous batching 的引擎侧形态）",
+      "old_design": "请求级批处理（request-level batching）：vLLM 之前的主流服务形态（FasterTransformer/Triton 类）攒一批请求、pad 到最长序列、整批全部生成完才整批换血。外证：Orca 论文（arXiv:2103.00071 §2.2）对 request-level batching 的批评是 v1 设计的直系思想来源。v1 首提交 6c5af09b3 '[V1] Implement vLLM V1 [1/N]'（#9289, 2024-10-22）即以此形态落地：一拍 = 一次 schedule() = 一次 forward（vllm/v1/core/sched/interface.py:L55-L59 docstring 原话 'The scheduling decision is made at the iteration level. Each scheduling step corresponds to a single forward pass of the model. Therefore, this method is called repeatedly by a busy loop in the engine.'）。",
+      "pain": "GPU 利用率与内存两头卡：短请求陪长请求空转到整批结束（Orca 实测对 request-level 系统的吞吐差距最高 36.9x，FasterTransformer 对比，外证）；padding 浪费显存；新请求必须等整批腾位，排队延迟高。",
+      "solution": "vllm/v1/core/sched/scheduler.py:L439 schedule() 每拍产出 {req_id: num_scheduled_tokens} 的调度决定；完成的请求当拍退出并释放块（update_from_output 侧，ch9/ch11），新请求同拍可入（L683-L1097 WAITING 阶段）；EngineCore.step()（core.py:L584-L614）把这个决定交给 executor 执行一次 forward。接口契约一句话讲完连续批处理（interface.py:L61-L67）：'num_tokens can be as large as the number of prompt tokens for new requests, or it can be 1 for the requests that are auto-regressively generating new tokens one by one. Otherwise, it can be somewhere in between in case of chunked prefills, prefix caching, speculative decoding'。",
+      "cost": "每生成一个 token 都要过一遍 CPU 调度：调度逻辑本身成为吞吐上限——源码自己承认这条成本（scheduler.py:L1728-L1730 woosuk 注释 'As len(num_scheduled_tokens) can be up to 1K or more, the below loop can be a performance bottleneck. We should do our best to avoid expensive operations inside the loop.'）；且要求 KV 存储必须支持任意请求任意拍进出——没有 PagedAttention 式分块 KV 就没有安全的逐拍进出（本域与 KV cache 域的强耦合，allocate_slots 块粒度借还即其接口，ch13 打开）。"
+    },
+    {
+      "id": "WC2",
+      "card": "deepread/engine-loop.json why_chains[1]",
+      "decision": "调度只认 token 数不认请求数：单一 token 预算，无 prefill/decode 相位",
+      "old_design": "v0 scheduler（git c99db8c8d^:vllm/core/scheduler.py，'[V0 Deprecation] Remove V0 core' #25321 于 2025-09-20 删除）是双相位调度：_schedule_default（decode 批）/ _schedule_chunked_prefill（prefill 批）两条路径 + waiting/running/swapped 三队列 + SequenceGroup/Sequence 两层结构；chunked prefill 是后补特例。朴素做法更直接：批次上限 = 请求数，prefill/decode 分开跑。",
+      "pain": "请求数无法预测一步计算量：256 个 decode 请求各 1 token = 256 token，1 个 8K prompt = 8192 token——同样算 1 个请求，工作量差 32 倍。按请求数限批要么 GPU 饿死（全 decode 小批），要么单步延迟爆炸（混入大 prefill，在场所有请求的下一个 token 都被拖住，TPOT 失控）。Sarathi-Serve（arXiv:2308.16369，外证）证明把 prefill 切块混进每一步（token 预算混相批）才能同时保 GPU 利用率与 TPOT 上界；v0 双相位实现里 chunked prefill 路径复杂易错。",
+      "solution": "scheduler.py:L441-L450（woosuk 注释，自 v1 首提交 6c5af09b3 逐字沿用至今）：'There is no \"decoding phase\" nor \"prefill phase\" in the scheduler. Each request just has the num_computed_tokens and num_tokens_with_spec... the scheduler tries to assign tokens to the requests so that each request's num_computed_tokens can catch up its num_tokens_with_spec. This is general enough to cover chunked prefills, prefix caching, speculative decoding, and the \"jump decoding\" optimization in the future.'。每拍只有一个 token_budget = max_num_scheduled_tokens（L459；RUNNING 侧 L523 与 WAITING 侧 L913 钳制共用这一个预算分账）。预算默认 2048（vllm/config/scheduler.py:L42-L44 DEFAULT_MAX_NUM_BATCHED_TOKENS），按硬件与使用场景上调（vllm/engine/arg_utils.py:L2541-L2563：≥70GiB 且非 A100 → LLM 16384 / API server 8192 token、max_num_seqs 1024；否则 8192/2048、seqs 256——注释明说 A100 大预算反而降吞吐 #17885）。",
+      "cost": "①长 prompt 被切成多拍：TTFT 换 TPOT（chunked prefill 的本质交易，见 theory）；②混相批削弱纯 decode 优化——源码两处侧面承认：async 下不调度 partial draft tokens 因为 'this prevents uniform decode optimizations'（scheduler.py:L498-L500 注释），spec decode 场景 'Prefer to not schedule than schedule un-padded'（L884-L897：新 decode 请求 pad 到统一 spec 尺寸以保 CUDA graph，预算不够宁可整拍不收）；③一切特性必须能表达为『token 差距』这单一模型——spec decode 的草稿 token 只能用 num_output_placeholders 占位数表达（L516-L520 计入 num_new_tokens，ch12 展开），复杂度被转嫁到状态机与 worker，而不是消失。"
+    },
+    {
+      "id": "WC3",
+      "card": "deepread/engine-loop.json why_chains[2]",
+      "decision": "RUNNING 先于 WAITING + 本拍抢占过就整拍不收新请求",
+      "old_design": "朴素 FCFS 一条队：新 prompt 到了直接插队跑 prefill，把正在 decode 的请求挤出内存。v0 的版本：swapped 队列优先于 waiting 队列，woosuk 在 v0 源码里自己标注 FIXME 'This makes our scheduling policy a bit bizarre'（git c99db8c8d^:vllm/core/scheduler.py:1757）。",
+      "pain": "在途请求的 TPOT 与抖动：若无反压，内存紧张时『先收新再抢老』会让请求刚恢复又被抢占（thrash）；decode 中的请求被新 prefill 反复打断，单个请求的 token 间隔方差失控。",
+      "solution": "schedule() 固定两阶段：L483 注释 'First, schedule the RUNNING requests.'（循环体 L484-L671，含 allocate_slots 失败→抢占最不应保留者→重试的 while True 环 L577-L629）；L683 注释 'Next, schedule the WAITING requests.'，且入口守卫 L684 `if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:`——本拍发生过抢占（= 内存紧张的信号）就整个跳过收新阶段；WAITING 阶段 allocate_slots 失败直接 break（L987-L994），绝不触发抢占。",
+      "cost": "老请求绝对优先 → 高负载下 TTFT 无上界（无 admission control 拒绝，到达率超服务能力时 waiting 队列线性增长）；『抢占过就不收新』让突发新请求至少多等一拍；且 RUNNING 循环里 woosuk 明注不严格 FCFS（L569-L573：num_new_tokens==0 时 continue 而非 break，'we do not strictly follow the FCFS scheduling policy and allow the lower-priority requests to be scheduled'）。这是把延迟压力显式从 TPOT 转嫁给 TTFT 的取舍，源码无一处文字粉饰。"
+    },
+    {
+      "id": "WC4",
+      "card": "deepread/memory-kv.json why_chains[4]（本章只取其准入门半边；抢占路径本身归 ch11）",
+      "decision": "chunked prefill 的准入护栏：整序列准入门（scheduler_reserve_full_isl）压住『收进来才发现装不下』",
+      "old_design": "chunked prefill 只检查第一个 chunk 的块需求——一条比池还长的请求可能被放进来，prefill 中途才发现装不下（死锁/中途 OOM 的温床，issue #39734）。",
+      "pain": "被卡的指标是活性（不崩溃）与并发利用率的平衡：门太松死锁、太紧浪费容量。裸 recompute 抢占下，decode-heavy 负载会『短时超收 → 全体增长 → 池尽 → 抢占刚准入的请求 → 重 prefill → 再抢占』循环抖动（benchmarks/kv_cache_watermark.sh:L7-L16 官方论证，外证）。v0.27.1 用 scheduler_reserve_full_isl（默认 True，dc78c2c933 2026-03-24 #37307 引入）+ 可配 watermark（默认 0.0=关）回应。",
+      "solution": "allocate_slots 先按整序列算块数对比空闲块（kv_cache_manager.py:L472-L488），全序列放不下直接 None 拒之门外——调度器侧表现为 scheduler.py:L982 `full_sequence_must_fit=self.scheduler_reserve_full_isl` 传入、L987-L994 None → break。config/scheduler.py:L130-L134 注释原话：'Prevents over-admission and KV cache thrashing with chunked prefill'。",
+      "cost": "整序列门更保守 = batch 可能装不满（吞吐换活性）；被拒请求在 waiting 排队，TTFT 变长——本章只讲调度器侧的 None→break 因果，块数怎么算、水位怎么扣、抢占怎么执行分别在 ch13/ch14/ch11 展开。"
+    },
+    {
+      "id": "WC5",
+      "card": "deepread/engine-loop.json why_chains[5]（本章只取 schedule() 产出面；worker 侧消费归 ch18）",
+      "decision": "增量下发协议（persistent batch）：worker 缓存请求全量数据，调度器每拍只发 diff",
+      "old_design": "v0 每步把全批 SequenceGroupMetadata（全量 token ids、完整 block 表、采样参数）序列化发给 worker；更朴素的做法是每步从零重建整个批次对象树。",
+      "pain": "IPC 序列化带宽与 CPU 时间随『请求数 × prompt 长度』爆炸：decode 稳态下每拍 99% 的下发内容与上一拍相同，全量重发是纯浪费；千级并发时这一项足以吃掉调度预算。",
+      "solution": "vllm/v1/core/sched/output.py:L193-L205 SchedulerOutput 二分：scheduled_new_reqs = NewRequestData（首次全量：prompt_token_ids、sampling_params、block_ids，注释 'We cache the request data in each worker process, so that we do not need to re-send it every scheduling step'）与 scheduled_cached_reqs = CachedRequestData（增量：new_block_ids、num_computed_tokens，注释 'we only send the diff to minimize the communication cost'）。prev_step_scheduled_req_ids（scheduler.py:L106 初始化，L1161-L1163 每拍刷新）标记上拍已调度者。组装点在 schedule() 收尾（L1131-L1163 + L1208-L1229）。",
+      "cost": "①worker 必须维护匹配的缓存与失效逻辑——两进程请求视图可能漂移；②协议状态语义分叉：resumed（抢占恢复）请求的 new_block_ids 是整体替换而非追加（output.py:L118-L121 注释明说 'For those in the set, new_block_ids will be used as the request block IDs instead of appending'）；本章只需立『产出什么』，深挖归 ch18。"
+    }
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/core/sched/interface.py",
+      "lines": "L53-L67",
+      "code": "    @abstractmethod\n    def schedule(self, throttle_prefills: bool = False) -> \"SchedulerOutput\":\n        \"\"\"Schedule the requests to process in this scheduling step.\n\n        The scheduling decision is made at the iteration level. Each scheduling\n        step corresponds to a single forward pass of the model. Therefore, this\n        method is called repeatedly by a busy loop in the engine.\n\n        Essentially, the scheduler produces a dictionary of {req_id: num_tokens}\n        that specifies how many tokens to process for each request in this\n        scheduling step. For example, num_tokens can be as large as the number\n        of prompt tokens for new requests, or it can be 1 for the requests that\n        are auto-regressively generating new tokens one by one. Otherwise, it\n        can be somewhere in between in case of chunked prefills, prefix caching,\n        speculative decoding, etc.",
+      "what": "schedule() 契约 docstring（上半）：迭代级调度的一句话定义——每步=一次 forward，产出 {req_id: num_tokens}，num_tokens 可大（整个 prompt）可小（decode 的 1）可居中（chunked prefill）。",
+      "elide": [
+        "docstring 后半（L68-L82 的 throttle_prefills/Returns 描述）不内嵌——DP prefill balancing 是 ch34 的话头"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L439-L462",
+      "code": "    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:\n        self.current_step += 1\n        # NOTE(woosuk) on the scheduling algorithm:\n        # There's no \"decoding phase\" nor \"prefill phase\" in the scheduler.\n        # Each request just has the num_computed_tokens and\n        # num_tokens_with_spec. num_tokens_with_spec =\n        # len(prompt_token_ids) + len(output_token_ids) + len(spec_token_ids).\n        # At each step, the scheduler tries to assign tokens to the requests\n        # so that each request's num_computed_tokens can catch up its\n        # num_tokens_with_spec. This is general enough to cover\n        # chunked prefills, prefix caching, speculative decoding,\n        # and the \"jump decoding\" optimization in the future.\n\n        scheduled_new_reqs: list[Request] = []\n        scheduled_resumed_reqs: list[Request] = []\n        scheduled_running_reqs: list[Request] = []\n        preempted_reqs: list[Request] = []\n\n        req_to_new_blocks: dict[str, KVCacheBlocks] = {}\n        num_scheduled_tokens: dict[str, int] = {}\n        token_budget = self.max_num_scheduled_tokens\n        if self._pause_state == PauseState.PAUSED_ALL:\n            # Do not schedule any requests when paused.\n            token_budget = 0",
+      "what": "schedule() 开场：woosuk 的调度算法注（没有 decoding/prefill 相位，只有追赶）+ 四个结果列表 + token_budget 初始化（PAUSED_ALL 置 0）。本章的『单一账本』宣言就在这 10 行注释里。",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L483-L532",
+      "code": "        # First, schedule the RUNNING requests.\n        req_index = 0\n        while req_index < len(self.running) and token_budget > 0:\n            request = self.running[req_index]\n\n            if (\n                request.num_output_placeholders > 0\n                # This is (num_computed_tokens + 1) - (num_output_placeholders - 1).\n                # Since output placeholders are also included in the computed tokens\n                # count, we subtract (num_output_placeholders - 1) to remove any draft\n                # tokens, so that we can be sure no further steps are needed even if\n                # they are all rejected.\n                and request.num_computed_tokens + 2 - request.num_output_placeholders\n                >= request.num_prompt_tokens + request.max_tokens\n            ):\n                # Async scheduling: Avoid scheduling an extra step when we are sure that\n                # the previous step has reached request.max_tokens. We don't schedule\n                # partial draft tokens since this prevents uniform decode optimizations.\n                req_index += 1\n                continue\n\n            if self.current_step < request.next_decode_eligible_step:\n                # V2+PP+async: enforce `pp_size` steps between same-req decodes\n                # to match worker-side sampled-tokens broadcast slot ring cadence.\n                req_index += 1\n                continue\n\n            if defer_prefills and request.is_prefill_chunk:\n                # DP prefill balancing: defer this in-progress prefill chunk to a\n                # cadence-aligned step; decodes still run to fill this step.\n                req_index += 1\n                continue\n\n            num_new_tokens = (\n                request.num_tokens_with_spec\n                + request.num_output_placeholders\n                - request.num_computed_tokens\n            )\n            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:\n                num_new_tokens = self.scheduler_config.long_prefill_token_threshold\n            num_new_tokens = min(num_new_tokens, token_budget)\n\n            # Make sure the input position does not exceed the max model len.\n            # This is necessary when using spec decoding.\n            num_new_tokens = min(\n                num_new_tokens,\n                self.max_model_len\n                - request.num_computed_tokens\n                - self.num_sampled_tokens_per_step,\n            )",
+      "what": "阶段一 RUNNING 先行 + 追赶公式。L516-L520 是全章核心公式；L521-L523 threshold/预算双钳制；L527-L532 max_model_len 保险（spec 场景）。",
+      "elide": [
+        "L488-L502 async 调度的提前剪枝（num_output_placeholders>0 且必达 max_tokens 则跳过）——ch12 展开，writer 讲同步版可省",
+        "L504-L514 两处 continue（next_decode_eligible_step=V2+PP+async 的步距；defer_prefills=DP prefill balancing）——ch34 的话头，同步单机版不触发"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L557-L573",
+      "code": "            if num_new_tokens == 0:\n                # The request cannot be scheduled because one of the following\n                # reasons:\n                # 1. No new tokens to schedule. This may happen when\n                #    (1) PP>1 and we have already scheduled all prompt tokens\n                #    but they are not finished yet.\n                #    (2) Async scheduling and the request has reached to either\n                #    its max_total_tokens or max_model_len.\n                # 2. The encoder budget is exhausted.\n                # 3. The encoder cache is exhausted.\n                # 4. Insufficient budget for a block-aligned chunk in hybrid\n                #    models with mamba cache mode \\\"align\\\".\n                # NOTE(woosuk): Here, by doing `continue` instead of `break`,\n                # we do not strictly follow the FCFS scheduling policy and\n                # allow the lower-priority requests to be scheduled.\n                req_index += 1\n                continue",
+      "what": "num_new_tokens==0 的四种原因 + woosuk 的 continue-not-break 注：不严格 FCFS，卡住的请求不阻塞后面的低优先请求。",
+      "elide": [
+        "四条原因里 1.(1) PP、1.(2) async、4. mamba 对齐是邻章特性，正文可只取『预算/缓存耗尽』两条"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L576-L629",
+      "code": "            with record_function_or_nullcontext(\"schedule: allocate_slots\"):\n                while True:\n                    new_blocks = self.kv_cache_manager.allocate_slots(\n                        request,\n                        num_new_tokens,\n                        num_lookahead_tokens=self.num_lookahead_tokens,\n                    )\n\n                    if new_blocks is not None:\n                        # The request can be scheduled.\n                        break\n\n                    # The request cannot be scheduled.\n                    # Preempt the lowest-priority request.\n                    if self.policy == SchedulingPolicy.PRIORITY:\n                        preempted_req = max(\n                            self.running,\n                            key=lambda r: (r.priority, r.arrival_time),\n                        )\n                        self.running.remove(preempted_req)\n                        if preempted_req in scheduled_running_reqs:\n                            preempted_req_id = preempted_req.request_id\n                            scheduled_running_reqs.remove(preempted_req)\n                            token_budget += num_scheduled_tokens.pop(preempted_req_id)\n                            req_to_new_blocks.pop(preempted_req_id)\n                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)\n                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(\n                                preempted_req_id, None\n                            )\n                            if preempted_encoder_inputs:\n                                # Restore encoder compute budget if the preempted\n                                # request had encoder inputs scheduled in this step.\n                                num_embeds_to_restore = sum(\n                                    preempted_req.get_num_encoder_embeds(i)\n                                    for i in preempted_encoder_inputs\n                                )\n                                encoder_compute_budget += num_embeds_to_restore\n                            req_index -= 1\n                    else:\n                        preempted_req = self.running.pop()\n\n                    self._preempt_request(\n                        preempted_req,\n                        scheduled_timestamp,\n                        drop_stale_output=self.requires_kv_delivery,\n                    )\n                    preempted_reqs.append(preempted_req)\n                    if preempted_req == request:\n                        # No more request to preempt. Cannot schedule this request.\n                        break\n\n            if new_blocks is None:\n                # Cannot schedule this request.\n                break",
+      "what": "allocate_slots 抢占重试环（RUNNING 侧）：None → FCFS 抢 running 队尾（PRIORITY 抢最低优先级）→ _preempt_request → 重试，直到成功或把自己抢掉。本章只立『preempted_reqs 非空 = 内存紧张信号』这层因果；_preempt_request 内部（recompute-only/回队头/stale 输出）归 ch11。",
+      "elide": [
+        "L590-L613 PRIORITY 分支的 token/块/预算回滚细节压缩讲（默认 policy=fcfs，走 L615 self.running.pop() 抢队尾即可）",
+        "record_function_or_nullcontext 是 profiling 探针，无功能影响"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L631-L638",
+      "code": "            # Schedule the request.\n            scheduled_running_reqs.append(request)\n            prefill_scheduled |= request.is_prefill_chunk\n            request_id = request.request_id\n            req_to_new_blocks[request_id] = new_blocks\n            num_scheduled_tokens[request_id] = num_new_tokens\n            token_budget -= num_new_tokens\n            req_index += 1",
+      "what": "RUNNING 记账入册：进 scheduled_running_reqs、prefill_scheduled 累计、num_scheduled_tokens[req_id]=n、token_budget −= n——{req_id: num_tokens} 账本本体 + 预算扣减。",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L683-L711",
+      "code": "        # Next, schedule the WAITING requests.\n        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:\n            step_skipped_waiting = create_request_queue(self.policy)\n\n            while (self.waiting or self.skipped_waiting) and token_budget > 0:\n                # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not\n                # in `running` but still hold a model-runner request slot.\n                num_running = len(self.running) + self.num_waiting_for_streaming_input\n                if num_running >= self.max_num_running_reqs:\n                    break\n\n                request_queue = self._select_waiting_queue_for_scheduling()\n                assert request_queue is not None\n\n                request = request_queue.peek_request()\n                request_id = request.request_id\n\n                # try to promote blocked statuses while traversing skipped queue.\n                if self._is_blocked_waiting_status(\n                    request.status\n                ) and not self._try_promote_blocked_waiting_request(request):\n                    if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:\n                        logger.debug(\n                            \"%s is still in WAITING_FOR_REMOTE_KVS state.\",\n                            request_id,\n                        )\n                    request_queue.pop_request()\n                    step_skipped_waiting.prepend_request(request)\n                    continue",
+      "what": "阶段二 WAITING 收新：守卫 `not preempted_reqs and UNPAUSED`（本拍抢占过就整拍不收新）+ max_num_running_reqs 上限 + 双队列选队 + 阻塞态跳过。",
+      "elide": [
+        "L700-L711 阻塞态提升（WAITING_FOR_REMOTE_KVS 等）与 L704-L708 debug 日志——skipped 双队列的完整展开归 ch11，此处一句带过即可"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L744-L766",
+      "code": "                # Get already-cached tokens.\n                if request.num_computed_tokens == 0:\n                    did_prefix_cache_lookup = True\n                    hit_diverged = False\n                    # Get locally-cached tokens.\n                    if self.connector is not None:\n                        # A KV connector transfers the missing suffix, which needs a\n                        # hybrid-aware lookup that can diverge across groups.\n                        (\n                            new_computed_blocks,\n                            num_new_local_computed_tokens,\n                            request.shared_prefix_boundary,\n                            hit_diverged,\n                        ) = self.kv_cache_manager.get_computed_blocks_for_connector(\n                            request\n                        )\n                    else:\n                        (\n                            new_computed_blocks,\n                            num_new_local_computed_tokens,\n                            # Marconi shared-prefix junction to pin; 0 if none.\n                            request.shared_prefix_boundary,\n                        ) = self.kv_cache_manager.get_computed_blocks(request)",
+      "what": "前缀缓存折算：num_computed_tokens==0 时 get_computed_blocks，命中 token 数直接当『已算』——WAITING 公式的被减数从这来（无 connector 默认走 else 分支）。",
+      "elide": [
+        "L749-L759 connector 分支（get_computed_blocks_for_connector，hybrid-aware 查找）——P/D 场景 ch36/37 展开，默认 connector=None",
+        "request.shared_prefix_boundary 是 Marconi 钉住字段，ch15 的话头，本章可无视"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L874-L914",
+      "code": "                else:\n                    # Number of tokens to be scheduled.\n                    # We use `request.num_tokens` instead of\n                    # `request.num_prompt_tokens` to consider the resumed\n                    # requests, which have output tokens.\n                    num_new_tokens = request.num_tokens - num_computed_tokens\n\n                    # Pad new decode requests to uniform spec decoding size to\n                    # preserve full cudagraph for this step.\n                    # Not for diffusion where draft tokens can't be padded.\n                    if (\n                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)\n                        and self.num_sampled_tokens_per_step > 0\n                        and num_new_tokens == 1\n                        and (scheduled_running_reqs and not prefill_scheduled)\n                    ):\n                        num_new_tokens = 1 + self.num_spec_tokens\n                        if (\n                            num_new_tokens > token_budget\n                            or num_computed_tokens + num_new_tokens > self.max_model_len\n                        ):\n                            # Prefer to not schedule than schedule un-padded here.\n                            break\n                        pad_spec_decode = True\n\n                    threshold = self.scheduler_config.long_prefill_token_threshold\n                    if 0 < threshold < num_new_tokens:\n                        num_new_tokens = threshold\n\n                    # chunked prefill has to be enabled explicitly to allow\n                    # pooling requests to be chunked\n                    if (\n                        not self.scheduler_config.enable_chunked_prefill\n                        and num_new_tokens > token_budget\n                    ):\n                        # If chunked_prefill is disabled,\n                        # we can stop the scheduling here.\n                        break\n\n                    num_new_tokens = min(num_new_tokens, token_budget)\n                    assert num_new_tokens > 0",
+      "what": "新请求的 num_new_tokens 与切块三闸：num_tokens − num_computed_tokens（用 num_tokens 而非 num_prompt_tokens 是为了 resumed 请求带输出）→ spec pad（默认无 spec 不触发）→ long_prefill_token_threshold 钳制 → enable_chunked_prefill 开关（关且超预算=整拍不收）→ min(token_budget)。",
+      "elide": [
+        "L881-L897 spec decode 均匀 pad 分支（'Prefer to not schedule than schedule un-padded' 保 CUDA graph）——ch33 话头，默认 num_spec_tokens=0 不触发，但 WC2 的代价清单要引用它",
+        "L870-L873 defer_prefills break（DP prefill balancing）——ch34"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L965-L994",
+      "code": "                reserved_blocks = 0\n                if load_kv_async:\n                    # An async load holds its blocks for the whole transfer with\n                    # no forward progress and isn't preemptible here. Admit it\n                    # only if it fits in (free - other in-flight reservations), to\n                    # avoid deadlock and predictable preemptions.\n                    reserved_blocks = self._inflight_prefill_reserved_blocks()\n\n                new_blocks = self.kv_cache_manager.allocate_slots(\n                    request,\n                    num_new_tokens,\n                    num_new_computed_tokens=num_new_local_computed_tokens,\n                    new_computed_blocks=new_computed_blocks,\n                    num_lookahead_tokens=effective_lookahead_tokens,\n                    num_external_computed_tokens=num_external_computed_tokens,\n                    delay_cache_blocks=load_kv_async,\n                    num_encoder_tokens=num_encoder_tokens,\n                    full_sequence_must_fit=self.scheduler_reserve_full_isl,\n                    reserved_blocks=reserved_blocks,\n                    has_scheduled_reqs=bool(self.running),\n                )\n\n                if new_blocks is None:\n                    # The request cannot be scheduled.\n\n                    # NOTE: we need to untouch the request from the encode cache\n                    # manager\n                    if request.has_encoder_inputs:\n                        self.encoder_cache_manager.free(request)\n                    break",
+      "what": "allocate_slots 准入（WAITING 侧）：全参数调用（full_sequence_must_fit=scheduler_reserve_full_isl）+ None → break——WAITING 阶段绝不触发抢占，与 RUNNING 侧抢占环的鲜明反差。",
+      "elide": [
+        "L965-L971 reserved_blocks（async KV load 的在途预约护轨）——connector 场景 ch36，默认 0",
+        "L948-L963 lookahead/encoder 计数在区间前，未内嵌"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1022-L1082",
+      "code": "                request = request_queue.pop_request()\n                if load_kv_async:\n                    # If loading async, allocate memory and put request\n                    # into the WAITING_FOR_REMOTE_KV state.\n                    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS\n                    step_skipped_waiting.prepend_request(request)\n                    # Set num_computed_tokens even though KVs are not yet loaded.\n                    # request.num_computed_tokens will not be used anywhere until\n                    # the request finished the KV transfer.\n                    #\n                    # If a transfer error is reported by the connector,\n                    # request.num_computed_tokens will be re-set accordingly in\n                    # _update_requests_with_invalid_blocks.\n                    #\n                    # When the transfer is finished, either successfully or not,\n                    # request.num_computed_tokens will correctly reflect the number\n                    # of computed tokens.\n                    # _update_waiting_for_remote_kv will then cache\n                    # only the successfully loaded tokens.\n                    request.num_computed_tokens = num_computed_tokens\n                    self._inflight_prefills.add(request)\n                    if self.needs_kv_cache_zeroing:\n                        # Skip zeroing of the blocks the async load will\n                        # overwrite; the zeroing could race the write.\n                        self._skip_zero_block_ids.update(\n                            self.kv_cache_manager.get_zeroing_block_ids_in_range(\n                                request.request_id,\n                                num_new_local_computed_tokens,\n                                num_computed_tokens,\n                            )\n                        )\n                    continue\n\n                self.running.append(request)\n                if self.log_stats:\n                    request.record_event(\n                        EngineCoreEventType.SCHEDULED, scheduled_timestamp\n                    )\n                if request.status == RequestStatus.WAITING:\n                    scheduled_new_reqs.append(request)\n                elif request.status == RequestStatus.PREEMPTED:\n                    scheduled_resumed_reqs.append(request)\n                else:\n                    raise RuntimeError(f\"Invalid request status: {request.status}\")\n\n                if self.lora_config and request.lora_request:\n                    scheduled_loras.add(request.lora_request.lora_int_id)\n                req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(\n                    request_id\n                )\n                num_scheduled_tokens[request_id] = num_new_tokens\n                token_budget -= num_new_tokens\n                request.status = RequestStatus.RUNNING\n                request.num_computed_tokens = num_computed_tokens\n                if pad_spec_decode:\n                    scheduled_spec_decode_tokens[request_id] = [\n                        -1\n                    ] * self.num_spec_tokens\n                # Only track requests that will still be prefilling after this chunk.\n                if num_computed_tokens + num_new_tokens < request.num_tokens:\n                    self._inflight_prefills.add(request)",
+      "what": "出队入 running：load_kv_async 分支（默认不走）后——self.running.append、SCHEDULED 事件、WAITING→scheduled_new_reqs / PREEMPTED→scheduled_resumed_reqs 分流、get_blocks、num_scheduled_tokens、token_budget −= chunk、status=RUNNING、num_computed_tokens=命中数、未完 chunk 记 _inflight_prefills。",
+      "elide": [
+        "L1023-L1053 load_kv_async 的 WAITING_FOR_REMOTE_KVS 整段（KV transfer 特性）——ch36/37，默认 connector=None 时 request 直接走 L1055",
+        "L1067-L1068 LoRA 登记与 L1084-L1097 encoder 两段——正交特性"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1108-L1119",
+      "code": "        # Check if the scheduling constraints are satisfied.\n        total_num_scheduled_tokens = sum(num_scheduled_tokens.values())\n        assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens\n\n        assert token_budget >= 0\n        assert len(self.running) <= self.max_num_running_reqs\n        # Since some requests in the RUNNING queue may not be scheduled in\n        # this step, the total number of scheduled requests can be smaller than\n        # len(self.running).\n        assert len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(\n            scheduled_running_reqs\n        ) <= len(self.running)",
+      "what": "账本守恒断言：Σ num_scheduled_tokens ≤ max_num_scheduled_tokens、token_budget ≥ 0、len(running) ≤ max_num_running_reqs、调度数 ≤ running 数。连续批处理『批大小=token 数』的机器自检。",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1131-L1163",
+      "code": "        # Construct the scheduler output.\n        if self.use_v2_model_runner:\n            scheduled_new_reqs.extend(scheduled_resumed_reqs)\n            scheduled_resumed_reqs.clear()\n            new_reqs_data = [\n                NewRequestData.from_request(\n                    req,\n                    req_to_new_blocks[req.request_id].get_block_ids(),\n                    req._all_token_ids,\n                )\n                for req in scheduled_new_reqs\n            ]\n        else:\n            new_reqs_data = [\n                NewRequestData.from_request(\n                    req, req_to_new_blocks[req.request_id].get_block_ids()\n                )\n                for req in scheduled_new_reqs\n            ]\n\n        with record_function_or_nullcontext(\"schedule: make_cached_request_data\"):\n            cached_reqs_data = self._make_cached_request_data(\n                scheduled_running_reqs,\n                scheduled_resumed_reqs,\n                num_scheduled_tokens,\n                scheduled_spec_decode_tokens,\n                req_to_new_blocks,\n            )\n\n        # Record the request ids that were scheduled in this step (MRV1-only).\n        if not self.use_v2_model_runner:\n            self.prev_step_scheduled_req_ids.clear()\n            self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())",
+      "what": "组装输出（上半）：use_v2_model_runner 分支后 NewRequestData.from_request 全量打包；_make_cached_request_data 增量打包；prev_step_scheduled_req_ids 每拍刷新（MRV1-only）。",
+      "elide": [
+        "L1132-L1142 use_v2_model_runner 分支（实验 V2 runner，合并 resumed 进 new、附 _all_token_ids）——ch18 话头",
+        "L1144-L1149 为默认分支"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1208-L1229",
+      "code": "        scheduler_output = SchedulerOutput(\n            scheduled_new_reqs=new_reqs_data,\n            scheduled_cached_reqs=cached_reqs_data,\n            num_scheduled_tokens=num_scheduled_tokens,\n            total_num_scheduled_tokens=total_num_scheduled_tokens,\n            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,\n            scheduled_encoder_inputs=scheduled_encoder_inputs,\n            scheduled_encoder_input_stats=scheduled_encoder_input_stats,\n            num_common_prefix_blocks=num_common_prefix_blocks,\n            preempted_req_ids=self.reset_preempted_req_ids,\n            # finished_req_ids is an existing state in the scheduler,\n            # instead of being newly scheduled in this step.\n            # It contains the request IDs that are finished in between\n            # the previous and the current steps.\n            finished_req_ids=self.finished_req_ids,\n            free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),\n            new_block_ids_to_zero=self._get_new_block_ids_to_zero(),\n            kv_cache_block_copies=pending_kv_cache_block_copies,\n            partial_tail_offloads=pending_partial_tail_offloads,\n            num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,\n            ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),\n        )",
+      "what": "SchedulerOutput 落袋：num_scheduled_tokens/total + preempted_req_ids + finished_req_ids（注释：跨拍通知 worker 清缓存）。schedule() 的返回值=下一拍 execute_model 的全部输入依据。",
+      "elide": [
+        "L1213-L1215 spec/encoder 字段与 L1224-L1228 zero/CoW/connector 元数据——各归邻章（ch31/33、ch18、ch14、ch36）"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1317-L1343",
+      "code": "    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:\n        # Advance the number of computed tokens for the request AFTER\n        # the request is scheduled.\n        # 1. The scheduler_output of the current step has to include the\n        #    original number of scheduled tokens to determine input IDs.\n        # 2. Advance the number of computed tokens here allowing us to\n        #    schedule the prefill request again immediately in the next\n        #    scheduling step.\n        # 3. If some tokens (e.g. spec tokens) are rejected later, the number of\n        #    computed tokens will be adjusted in update_from_output.\n        num_scheduled_tokens = scheduler_output.num_scheduled_tokens\n        for req_id, num_scheduled_token in num_scheduled_tokens.items():\n            request = self.requests[req_id]\n            request.num_computed_tokens += num_scheduled_token\n            request.num_in_flight_tokens += num_scheduled_token\n            if self.defer_block_free:\n                # Record the in-flight step, to fence deferred block freeing.\n                request.last_sched_seq = self.sched_step_seq\n            request.is_prefill_chunk = request.num_computed_tokens < (\n                request.num_tokens + request.num_output_placeholders\n            )\n            scheduler_output.has_structured_output_requests |= (\n                request.use_structured_output and not request.is_prefill_chunk\n            )\n            # Drop from the in-flight-prefill set once it's no longer prefilling.\n            if not request.is_prefill_chunk:\n                self._inflight_prefills.discard(request)",
+      "what": "_update_after_schedule 乐观推进：num_computed_tokens += n（注释第 2 条明说——为了让 prefill 请求下一拍立即再被调度）+ is_prefill_chunk 标记 + finished/preempted 集合换新不 clear。chunked prefill『下一拍续上』的全部秘密。",
+      "elide": [
+        "L1332-L1334 defer_block_free 的 last_sched_seq 记录——ch11/ch12 的延迟释放栅栏，一句带过",
+        "L1338-L1340 structured output 的 has_structured_output_requests——ch30",
+        "L1345-L1359 routed experts 快照——ch28 后的话头"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1410-L1457",
+      "code": "    def _make_cached_request_data(\n        self,\n        running_reqs: list[Request],\n        resumed_reqs: list[Request],\n        num_scheduled_tokens: dict[str, int],\n        spec_decode_tokens: dict[str, list[int]],\n        req_to_new_blocks: dict[str, KVCacheBlocks],\n    ) -> CachedRequestData:\n        req_ids: list[str] = []\n        new_token_ids: list[list[int]] = []\n        new_block_ids: list[tuple[list[int], ...] | None] = []\n        all_token_ids: dict[str, list[int]] = {}\n        num_computed_tokens: list[int] = []\n        num_output_tokens: list[int] = []\n        resumed_req_ids = set()\n\n        num_running_reqs = len(running_reqs)\n        for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):\n            req_id = req.request_id\n            req_ids.append(req_id)\n            # NOTE: In PP+async scheduling, we consume token ids via a direct GPU\n            # broadcast path (`input_batch.prev_sampled_token_ids`), so we can\n            # omit this payload.\n            if self.use_pp and not self.scheduler_config.async_scheduling:\n                # When using PP, the scheduler sends the sampled tokens back,\n                # because there's no direct communication between the first-\n                # stage worker and the last-stage worker. Otherwise, we don't\n                # need to send the sampled tokens back because the model runner\n                # will cache them.\n                num_tokens = num_scheduled_tokens[req_id] - len(\n                    spec_decode_tokens.get(req_id, ())\n                )\n                token_ids = req.all_token_ids[\n                    req.num_computed_tokens : req.num_computed_tokens + num_tokens\n                ]\n                new_token_ids.append(token_ids)\n            if idx >= num_running_reqs:\n                resumed_req_ids.add(req_id)\n            if not self.use_v2_model_runner:  # noqa: SIM102\n                if req_id not in self.prev_step_scheduled_req_ids:\n                    all_token_ids[req_id] = req.all_token_ids.copy()\n            new_block_ids.append(\n                req_to_new_blocks[req_id].get_block_ids(allow_none=True)\n            )\n            num_computed_tokens.append(req.num_computed_tokens)\n            num_output_tokens.append(\n                req.num_output_tokens + req.num_output_placeholders\n            )",
+      "what": "_make_cached_request_data：增量下发的构造现场——running+resumed 链在一起打包、PP 才带 new_token_ids、prev_step 没调度过的才补 all_token_ids、new_block_ids 本步新块、num_computed_tokens 摊平发。差量协议深挖归 ch18，本章只到『schedule() 产出的另一半』。",
+      "elide": [
+        "L1430-L1445 use_pp 的 new_token_ids 回传分支——PP 场景 ch34；L1448-L1450 use_v2_model_runner 条件——ch18"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L109-L123",
+      "code": "        self.max_num_running_reqs = self.scheduler_config.max_num_seqs\n        self.max_num_scheduled_tokens = (\n            self.scheduler_config.max_num_scheduled_tokens\n            if self.scheduler_config.max_num_scheduled_tokens is not None\n            else self.scheduler_config.max_num_batched_tokens\n        )\n        self.max_model_len = vllm_config.model_config.max_model_len\n        self.enable_kv_cache_events = (\n            self.kv_events_config is not None\n            and self.kv_events_config.enable_kv_cache_events\n        )\n        # Diffusion models may not sample any tokens for a denoising step.\n        self.num_sampled_tokens_per_step = (\n            1 if not vllm_config.model_config.is_diffusion else 0\n        )",
+      "what": "Scheduler.__init__ 的预算与上限解析：max_num_running_reqs = max_num_seqs；max_num_scheduled_tokens 缺省回落 max_num_batched_tokens；num_sampled_tokens_per_step（diffusion 特判 0）。",
+      "elide": [
+        "L116-L119 kv events 与 L120-L123 diffusion 特判可一句带过"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/output.py",
+      "lines": "L192-L227",
+      "code": "@dataclass\nclass SchedulerOutput:\n    # list of the requests that are scheduled for the first time.\n    # We cache the request's data in each worker process, so that we don't\n    # need to re-send it every scheduling step.\n    scheduled_new_reqs: list[NewRequestData]\n    # list of the requests that have been scheduled before.\n    # Since the request's data is already cached in the worker processes,\n    # we only send the diff to minimize the communication cost.\n    scheduled_cached_reqs: CachedRequestData\n\n    # req_id -> num_scheduled_tokens\n    # Number of tokens scheduled for each request.\n    num_scheduled_tokens: dict[str, int]\n    # Total number of tokens scheduled for all requests.\n    # Equal to sum(num_scheduled_tokens.values())\n    total_num_scheduled_tokens: int\n    # req_id -> spec_token_ids\n    # If a request does not have any spec decode tokens, it will not be\n    # included in the dictionary.\n    scheduled_spec_decode_tokens: dict[str, list[int]]\n    # req_id -> encoder input indices that need processing.\n    # E.g., if a request has [0, 1], it could mean the vision encoder needs\n    # to process that the request's 0-th and 1-th images in the current step.\n    scheduled_encoder_inputs: dict[str, list[int]]\n    # Number of common prefix blocks for all requests in each KV cache group.\n    # This can be used for cascade attention.\n    num_common_prefix_blocks: list[int]\n\n    # Request IDs that are finished in between the previous and the current\n    # steps. This is used to notify the workers about the finished requests\n    # so that they can free the cached states for those requests.\n    finished_req_ids: set[str]\n    # list of mm_hash strings associated with the encoder outputs to be\n    # freed from the encoder cache.\n    free_encoder_mm_hashes: list[str]",
+      "what": "SchedulerOutput 数据类（核心字段注释区）：new 全量 vs cached 增量的两条注释 + num_scheduled_tokens/total 字段注释 + finished_req_ids 注释。WC5 的证据现场。",
+      "elide": [
+        "L229 起的默认值字段（preempted/structured/spec/connector/zero/CoW）各归邻章"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/request_queue.py",
+      "lines": "L75-L93",
+      "code": "class FCFSRequestQueue(deque[Request], RequestQueue):\n    \"\"\"A first-come-first-served queue that supports deque operations.\"\"\"\n\n    def add_request(self, request: Request) -> None:\n        \"\"\"Add a request to the queue according to FCFS policy.\"\"\"\n        self.append(request)\n\n    def pop_request(self) -> Request:\n        \"\"\"Pop a request from the queue according to FCFS policy.\"\"\"\n        return self.popleft()\n\n    def peek_request(self) -> Request:\n        \"\"\"Peek at the next request in the queue without removing it.\"\"\"\n        if not self:\n            raise IndexError(\"peek from an empty queue\")\n        return self[0]\n\n    def prepend_request(self, request: Request) -> None:\n        \"\"\"Prepend a request to the front of the queue.\"\"\"",
+      "what": "FCFSRequestQueue：deque 子类——add_request=append、pop_request=popleft、peek_request 看队头、prepend_request=appendleft（ch11 抢占回队头靠最后这个）。",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/request.py",
+      "lines": "L271-L278",
+      "code": "    @property\n    def num_tokens(self) -> int:\n        return len(self._all_token_ids)\n\n    @property\n    def num_tokens_with_spec(self) -> int:\n        return len(self._all_token_ids) + len(self.spec_token_ids)\n",
+      "what": "账本字段真相源：num_tokens = len(_all_token_ids)（prompt+output）；num_tokens_with_spec = + spec 草稿。追赶公式的被减数与减数定义在此。",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/request.py",
+      "lines": "L150-L173",
+      "code": "        # Used in async scheduling.\n        self.num_output_placeholders = 0\n        # Tokens of output in flight when the request was preempted: delivered\n        # on return, but must not mutate the reset counters.\n        self.num_stale_output_tokens = 0\n        # Drop the stale output instead, for same-step preempt + resume\n        # (reset_prefix_cache).\n        self.drop_stale_output = False\n\n        # Tokens of steps whose output is not yet processed (async scheduling\n        # and PP run ahead of the GPU); `num_computed_tokens` counts them\n        # optimistically.\n        self.num_in_flight_tokens = 0\n\n        # V2+PP+async: Enforces `pp_size` cadence between same-request decode steps\n        # so the worker's broadcast slot ring stays consistent.\n        self.next_decode_eligible_step = 0\n\n        # Seq of the most recent step this request was scheduled in; fences\n        # deferred block freeing (see Scheduler._free_request_blocks).\n        self.last_sched_seq = 0\n\n        self.spec_token_ids: list[int] = []\n        self.num_computed_tokens = 0",
+      "what": "Request 计数器字段群（上半）：num_output_placeholders（async 占位，同步恒 0——ch12 灌值）、num_stale_output_tokens/drop_stale_output（ch11）、num_in_flight_tokens、spec_token_ids、num_computed_tokens=0 出厂值。",
+      "elide": [
+        "L164-L170 next_decode_eligible_step/last_sched_seq 两字段——V2+PP+async 与 defer free 的簿记，一句带过"
+      ]
+    },
+    {
+      "path": "vllm/v1/request.py",
+      "lines": "L187-L200",
+      "code": "        # True if this request is scheduled as a non-final prefill chunk.\n        self.is_prefill_chunk = False\n\n        # Block-aligned token position of a proven shared prefix worth pinning\n        # in the (sparse) prefix cache; 0 means none. Set at admission for\n        # hybrid/Mamba models when a shared prefix is detected (Marconi-style).\n        self.shared_prefix_boundary = 0\n\n        # The number of NaNs in logits. A value greater than 0\n        # indicates that the output is corrupted\n        self.num_nans_in_logits = 0\n\n        # The number of times this request has been preempted by the scheduler.\n        self.num_preemptions = 0",
+      "what": "is_prefill_chunk 出厂值 False + 注释（『被调度为非最终 prefill chunk 时为 True』）+ num_preemptions（ch11 用）。chunked prefill 的请求侧标记。",
+      "elide": [
+        "L190-L193 shared_prefix_boundary（Marconi 钉住）与 L195-L197 num_nans_in_logits——ch15/ch39 话头"
+      ]
+    },
+    {
+      "path": "vllm/config/scheduler.py",
+      "lines": "L42-L44",
+      "code": "    DEFAULT_MAX_NUM_BATCHED_TOKENS: ClassVar[int] = 2048\n    DEFAULT_MAX_NUM_BATCHED_TOKENS_FOR_BATCHED_DP: ClassVar[int] = 256\n    DEFAULT_MAX_NUM_SEQS: ClassVar[int] = 128",
+      "what": "三个 ClassVar 默认：DEFAULT_MAX_NUM_BATCHED_TOKENS=2048 / FOR_BATCHED_DP=256 / DEFAULT_MAX_NUM_SEQS=128——『config 默认只是测试便利』的基线。",
+      "elide": []
+    },
+    {
+      "path": "vllm/config/scheduler.py",
+      "lines": "L49-L61",
+      "code": "    max_num_batched_tokens: int = Field(default=DEFAULT_MAX_NUM_BATCHED_TOKENS, ge=1)\n    \"\"\"Maximum number of tokens that can be processed in a single iteration.\n\n    The default value here is mainly for convenience when testing.\n    In real usage, this should be set in `EngineArgs.create_engine_config`.\n    \"\"\"\n\n    max_num_scheduled_tokens: int | None = Field(default=None, ge=0)\n    \"\"\"Maximum number of tokens that the scheduler may issue in a single iteration.\n    \n    This is usually equal to max_num_batched_tokens, but can be smaller in cases\n    when the model might append tokens into the batch (such as speculative decoding).\n    Defaults to max_num_batched_tokens.\"\"\"",
+      "what": "max_num_batched_tokens 字段（docstring 自认『默认值主要为测试便利，真实使用应在 EngineArgs.create_engine_config 设』）+ max_num_scheduled_tokens（缺省回落，spec 场景才比 batched 小）。",
+      "elide": []
+    },
+    {
+      "path": "vllm/config/scheduler.py",
+      "lines": "L70-L80",
+      "code": "    long_prefill_token_threshold: int = Field(default=0, ge=0)\n    \"\"\"For chunked prefill, a request is considered long if the prompt is\n    longer than this number of tokens. 0 disables the cap (default).\"\"\"\n\n    enable_chunked_prefill: bool = True\n    \"\"\"If True, prefill requests can be chunked based\n    on the remaining `max_num_batched_tokens`.\n\n    The default value here is mainly for convenience when testing.\n    In real usage, this should be set in `EngineArgs.create_engine_config`.\n    \"\"\"",
+      "what": "两个 chunked 旋钮：long_prefill_token_threshold（0=不钳，『长 prompt』判定线）+ enable_chunked_prefill（v1 默认 True——与 v0 时代的显式开关相反；encoder-decoder 才被 __post_init__ 关掉 L228-L236）。",
+      "elide": []
+    },
+    {
+      "path": "vllm/engine/arg_utils.py",
+      "lines": "L2541-L2563",
+      "code": "        # NOTE(Kuntai): Setting large `max_num_batched_tokens` for A100 reduces\n        # throughput, see PR #17885 for more details.\n        # So here we do an extra device name check to prevent such regression.\n        if device_memory >= 70 * GiB_bytes and \"a100\" not in device_name:\n            # For GPUs like H100 and MI300x, use larger default values.\n            default_max_num_batched_tokens = {\n                UsageContext.LLM_CLASS: 16384,\n                UsageContext.OPENAI_API_SERVER: 8192,\n            }\n            default_max_num_seqs = {\n                UsageContext.LLM_CLASS: 1024,\n                UsageContext.OPENAI_API_SERVER: 1024,\n            }\n        else:\n            # TODO(woosuk): Tune the default values for other hardware.\n            default_max_num_batched_tokens = {\n                UsageContext.LLM_CLASS: 8192,\n                UsageContext.OPENAI_API_SERVER: 2048,\n            }\n            default_max_num_seqs = {\n                UsageContext.LLM_CLASS: 256,\n                UsageContext.OPENAI_API_SERVER: 256,\n            }",
+      "what": "真实部署的预算仲裁：A100 反例注释（PR #17885：大预算反降吞吐）+ ≥70GiB 非 A100 → LLM 16384 / API 8192、seqs 1024；否则 8192/2048、256。『同一个 vLLM，不同卡不同默认』。",
+      "elide": []
+    }
+  ],
+  "theory": [
+    {
+      "topic": "追赶公式与它的三个特例",
+      "detail": "num_new_tokens = num_tokens_with_spec + num_output_placeholders − num_computed_tokens（scheduler.py:L516-L520；字段定义 request.py:L271-L277）。特例一（新请求，WAITING 侧）：num_computed_tokens=前缀命中数（可能为 0），差=剩余 prompt——被 chunked 切小；特例二（decode 稳态）：每拍 _update_after_schedule 已把上拍的 1 计入 computed，差恒 = 1（+spec 数）；特例三（续 chunk）：is_prefill_chunk=True 的请求差 = 剩余未算 prompt，继续被 threshold/budget 切。三条路径一个公式——这就是『无相位』的数学含义。"
+    },
+    {
+      "topic": "token 预算守恒与批组成的算术",
+      "detail": "一拍批组成 = {K1 个 decode 各 1 token} + {K2 个 prefill chunk 各数百 token}，约束 Σ ≤ max_num_scheduled_tokens 且 len(running) ≤ max_num_seqs（断言 L1108-L1113）。例：预算 2048、256 个 decode 在场 → 剩 1792 给新 prefill chunk。『批大小=token 数』的直接推论：GPU 一步的计算量 ≈ 本拍 token 数（attention 部分另计 KV 长度，正文点到即可），预算就是单步延迟的水位线。"
+    },
+    {
+      "topic": "256×1 vs 1×8192：请求数口径失灵的算术",
+      "detail": "256 个 decode 请求各 1 token = 256 token；1 个 8192-token prompt = 1 个请求。按请求数限批（如 max=32）：前者 GPU 一步只算 32 个 token（饿死），后者混进来则在场所有请求的下一 token 等 8192-token 的 forward（TPOT 爆炸）。按 token 限批（2048）：decode 们照常各领 1 个，大 prompt 切成 ⌈8192/2048⌉=4 拍混进来——每拍单步延迟被预算钉住。这是 Part III hook『调度器只认 token 数不认请求数』的量化版。"
+    },
+    {
+      "topic": "chunked prefill 的账单：TTFT ↔ TPOT 交易",
+      "detail": "长 prompt 切成多拍：该请求的 TTFT 增加（要等全部 chunk 跑完才出首 token，且每拍之间还插着别人的 decode）；换来的是在场 decode 请求的 TPOT 有上界（不再被一次性大 prefill 拖住整拍）。Sarathi-Serve（arXiv:2308.16369，外证）给出理论依据：token 预算混相批（mixed-phase batching）同时保 GPU 利用率与 TPOT 上界。v1 默认 enable_chunked_prefill=True（config/scheduler.py:L74）即把这笔交易设为默认。"
+    },
+    {
+      "topic": "RUNNING 先于 WAITING 的延迟转嫁",
+      "detail": "两阶段固定顺序 + 抢占拍不收新（L684 守卫）= 在途请求（TPOT）绝对优先于新请求（TTFT）。代价显式可列：高负载下 waiting 队列无上界增长（无 admission control 拒绝机制）、突发新请求至少多等一拍、num_new_tokens==0 的 continue 让 FCFS 变『不严格 FCFS』（L569-L573）。设计哲学：与其两头都抖，不如把延迟压力显式压到一头（WC3）。"
+    },
+    {
+      "topic": "预算默认值的地形图",
+      "detail": "三层来源：①config ClassVar 2048（自认测试便利，config/scheduler.py:L42, L52-L54）；②EngineArgs.create_engine_config 按显存+场景覆盖（arg_utils.py:L2541-L2563：≥70GiB 非 A100 → LLM 16384/API 8192 + seqs 1024；否则 8192/2048 + 256；A100 例外因 PR #17885 大预算反降吞吐）；③max_num_scheduled_tokens 可再压（spec 场景 worker 会往批里加 token，config L56-L61）。读者该带走：预算不是拍脑袋常数，是『单步延迟水位线 × 硬件吞吐特性』的乘积。"
+    },
+    {
+      "topic": "乐观推进的时序账",
+      "detail": "_update_after_schedule 在 GPU 还没算时就把 num_scheduled_token 计入 num_computed_tokens（L1330，注释三条理由：①本拍 output 要用原始数定输入；②让 prefill 下一拍立即可再调度；③被拒时在 update_from_output 回调回）。同步版下这个乐观在⑤拍被真实输出覆盖/修正；async 版（ch12）乐观跨度更大，占位数由此而生。本章只需立『账本先记、GPU 后算』的心智模型。"
+    },
+    {
+      "topic": "Orca/Sarathi 血统（外部论文证据，非源码）",
+      "detail": "迭代级调度（iteration-level scheduling）+ 选择性批处理：Orca（OSDI'22，USENIX 页面——无 arXiv 预印本，arXiv:2103.00071 是错误编号）实测 request-level batching 系统的吞吐差距最高 36.9×（vs FasterTransformer）——v1 interface.py docstring 的每拍组批思想直系来源。chunked prefill + token 预算混相批：Sarathi-Serve（arXiv:2403.02310；2308.16369 是原版 Sarathi，勿混）证明摊平 prefill 计算才能同时保利用率和 TPOT。写作口径：这两个数字是外部论文证据（讲清来龙去脉+差异+如何选），源码里没有 36.9 这个数。"
+    }
+  ],
+  "mechanisms": [
+    {
+      "id": "m1",
+      "name": "迭代级调度契约：schedule() 每拍 = 一次 forward，产出 {req_id: num_tokens}",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/sched/interface.py:L54-L67",
+        "vllm/v1/engine/core.py:L584-L614"
+      ],
+      "paper_origin": {
+        "paper": "https://www.usenix.org/conference/osdi22/presentation/yu",
+        "sections": ["Abstract（iteration-level scheduling 两句原话出处；Orca 无 arXiv 预印本，引用走 USENIX 页面）"]
+      }
+    },
+    {
+      "id": "m2",
+      "name": "无 prefill/decode 相位：num_computed_tokens 追赶 num_tokens_with_spec（追赶公式三特例：新 prompt/decode 1 token/续 chunk）",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L441-L450",
+        "vllm/v1/core/sched/scheduler.py:L516-L532",
+        "vllm/v1/request.py:L272-L277"
+      ],
+      "paper_origin": {
+        "paper": "https://github.com/vllm-project/vllm/pull/9289",
+        "sections": ["PR #9289: v1 首提交 6c5af09b3（2024-10-22）——无相位追赶公式的 NOTE(woosuk) 算法注"]
+      }
+    },
+    {
+      "id": "m3",
+      "name": "单一 token 预算池：token_budget = max_num_scheduled_tokens 跨 RUNNING/WAITING 两阶段分账 + 守恒断言",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L459-L462",
+        "vllm/v1/core/sched/scheduler.py:L523",
+        "vllm/v1/core/sched/scheduler.py:L636-L637",
+        "vllm/v1/core/sched/scheduler.py:L913",
+        "vllm/v1/core/sched/scheduler.py:L1073",
+        "vllm/v1/core/sched/scheduler.py:L1108-L1113"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2403.02310",
+        "sections": ["§4.2"]
+      }
+    },
+    {
+      "id": "m4",
+      "name": "预算默认值地形：config 2048（测试便利）→ arg_utils 按显存/场景上调（A100 反例 #17885）→ max_num_scheduled_tokens 可再压",
+      "kind": "config",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/config/scheduler.py:L42-L44",
+        "vllm/config/scheduler.py:L49-L61",
+        "vllm/engine/arg_utils.py:L2541-L2563"
+      ]
+    },
+    {
+      "id": "m5",
+      "name": "RUNNING 先行（阶段一）：在途 decode 每请求 1 token 先吃预算——TPOT 优先的两阶段顺序",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L483-L485"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2403.02310",
+        "sections": ["§4.2"]
+      }
+    },
+    {
+      "id": "m6",
+      "name": "num_new_tokens==0 continue-not-break：不严格 FCFS，卡住的请求不阻塞后面的",
+      "kind": "algorithm",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L557-L573"
+      ]
+    },
+    {
+      "id": "m7",
+      "name": "RUNNING 侧 allocate_slots 抢占重试环（None→抢队尾→重试；本拍抢占集合成为阶段二守卫条件）——表面因果，深挖归 ch11",
+      "kind": "algorithm",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L576-L629"
+      ]
+    },
+    {
+      "id": "m8",
+      "name": "WAITING 守卫：本拍抢占过（preempted_reqs 非空）+ PAUSED 就整拍不收新；max_num_running_reqs 上限",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L683-L692"
+      ]
+    },
+    {
+      "id": "m9",
+      "name": "前缀命中折算已算：num_computed_tokens==0 → get_computed_blocks 命中数直接当已算（WAITING 公式的减数来源）——黑盒调用，深挖归 ch15",
+      "kind": "dataflow",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L744-L766"
+      ]
+    },
+    {
+      "id": "m10",
+      "name": "chunked prefill 切块三闸：long_prefill_token_threshold 钳制 → enable_chunked_prefill 开关（关且超预算整拍 break）→ min(token_budget)",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L874-L914",
+        "vllm/config/scheduler.py:L70-L80"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2308.16369",
+        "sections": ["§4.2", "§4.3"]
+      }
+    },
+    {
+      "id": "m11",
+      "name": "WAITING 侧 allocate_slots 准入：None → break，绝不触发抢占（与 RUNNING 侧抢占环的反差）+ full_sequence_must_fit 全序列准入门（→ ch14）",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L965-L994",
+        "vllm/config/scheduler.py:L130-L134"
+      ],
+      "paper_origin": {
+        "paper": "https://github.com/vllm-project/vllm/pull/37307",
+        "sections": ["PR #37307: scheduler_reserve_full_isl 全序列准入门"]
+      }
+    },
+    {
+      "id": "m12",
+      "name": "准入落位：出队入 running、WAITING→RUNNING 状态转移、num_computed_tokens 记命中数、首拍 chunk 未完记 _inflight_prefills",
+      "kind": "dataflow",
+      "difficulty": "core",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L1022-L1082"
+      ]
+    },
+    {
+      "id": "m13",
+      "name": "账本守恒断言：Σ num_scheduled ≤ 预算、token_budget ≥ 0、running ≤ max_num_seqs、调度数 ≤ running 数",
+      "kind": "protocol",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L1108-L1119"
+      ]
+    },
+    {
+      "id": "m14",
+      "name": "SchedulerOutput 二分产出：scheduled_new_reqs 全量（NewRequestData，worker 缓存）/ scheduled_cached_reqs 增量（CachedRequestData）+ prev_step_scheduled_req_ids 每拍刷新——产出面，深挖归 ch18",
+      "kind": "protocol",
+      "difficulty": "supporting",
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L1131-L1163",
+        "vllm/v1/core/sched/scheduler.py:L1208-L1229",
+        "vllm/v1/core/sched/output.py:L193-L227",
+        "vllm/v1/core/sched/scheduler.py:L1410-L1457"
+      ]
+    },
+    {
+      "id": "m15",
+      "name": "乐观推进：_update_after_schedule 在 GPU 未算时 num_computed_tokens += n + is_prefill_chunk 标记（下一拍 chunk 立即续上的机制）+ finished/preempted 集合换新不 clear",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L1317-L1343"
+      ]
+    },
+    {
+      "id": "m16",
+      "name": "下一拍续 chunk / decode 闭环：is_prefill_chunk 请求继续在 RUNNING 阶段被切；decode 请求差恒 1——连续批处理的稳态",
+      "kind": "dataflow",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L516-L520",
+        "vllm/v1/core/sched/scheduler.py:L1335-L1337"
+      ]
+    },
+    {
+      "id": "m17",
+      "name": "waiting/skipped_waiting 双队列与 FCFSRequestQueue 容器语义（append/popleft/peek/prepend）——调度侧只取『队头先收』，双队列深挖归 ch11",
+      "kind": "layout",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/v1/core/sched/request_queue.py:L75-L93",
+        "vllm/v1/core/sched/scheduler.py:L187-L190"
+      ]
+    },
+    {
+      "id": "m18",
+      "name": "PauseState 三态对预算的短路：PAUSED_ALL → token_budget=0（一拍全停）",
+      "kind": "config",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L460-L462",
+        "vllm/v1/core/sched/interface.py:L24-L35"
+      ]
+    },
+    {
+      "id": "m19",
+      "name": "max_num_scheduled_tokens/max_num_running_reqs 的装配：Scheduler.__init__ 的回落解析（scheduled→batched；running→max_num_seqs）",
+      "kind": "config",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L109-L114"
+      ]
+    },
+    {
+      "id": "m20",
+      "name": "spec 均匀 pad 的『宁可不排』（'Prefer to not schedule than schedule un-padded'）：混相批代价的源码自供——默认无 spec 不触发，作为 WC2 代价清单证据",
+      "kind": "config",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L881-L897"
+      ]
+    }
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {
+        "what": "KVConnector/ECConnector 全部分支（self.connector、load_kv_async、get_computed_blocks_for_connector、外部命中合并 L769-L826、WAITING_FOR_REMOTE_KVS 状态处理 L1023-L1053、_update_waiting_for_remote_kv、_handle_invalid_blocks、reserved_blocks/_inflight_prefill_reserved_blocks、partial_tail_offloads、kv_cache_block_copies/CoW 保留块、connector_prefix_cache_stats）",
+        "why_safe": "P/D 与远程 KV 是独立子系统（ch36/37）；默认 connector=None，单机调度逻辑完整自洽，相关字段默认 None/空"
+      },
+      {
+        "what": "encoder/多模态分支（has_encoder_inputs、_try_schedule_encoder_inputs、encoder_compute_budget、scheduled_encoder_inputs、encoder_cache_manager.allocate/free、num_encoder_tokens、ec_connector）",
+        "why_safe": "纯文本请求 has_encoder_inputs=False 整段不进；多模态属 ch6/mm 章，删后文本路径不变"
+      },
+      {
+        "what": "structured output grammar 分支（structured_output_manager 推进、has_structured_output_requests 的 |= 行、pending_structured_output_tokens）",
+        "why_safe": "约束解码是独立特性（ch30/31）；普通采样请求不触发，_update_after_schedule 主干不变"
+      },
+      {
+        "what": "mamba/混合模型分支（need_mamba_block_aligned_split、_mamba_block_aligned_split、needs_kv_cache_zeroing、_get_new_block_ids_to_zero、new_block_ids_to_zero、_skip_zero_block_ids）",
+        "why_safe": "仅 Mamba/SSM/混合模型用（ch25/26）；标准 Transformer 不进该分支"
+      },
+      {
+        "what": "LoRA 分支（lora_config、scheduled_loras、max_loras 约束两处）",
+        "why_safe": "无 LoRA 时 lora_config=None 整段跳过"
+      },
+      {
+        "what": "PRIORITY 调度策略分支（抢占时 max(running, key=(priority, arrival_time)) 及其 token/块/预算回滚 L590-L613；_select_waiting_queue_for_scheduling 的 PRIORITY 比较分支）——保留 FCFS",
+        "why_safe": "默认 policy='fcfs'；只保留 self.running.pop() 抢队尾即可讲清『RUNNING 可抢占、WAITING 绝不』的反差，PRIORITY 是同构变体（ch11 可再提）"
+      },
+      {
+        "what": "DP prefill balancing（throttle_prefills 参数、defer_prefills 三处 continue/break、prefill_capacity_bound、prefill_schedule_interval）",
+        "why_safe": "单机部署 throttle_prefills 恒 False（core.py:L580-L582 默认返回 False），defer_prefills 恒 False；DP 是 ch34 的话头"
+      },
+      {
+        "what": "PP 与 V2 runner 分支（use_pp 的 new_token_ids 回传 L1430-L1445、use_v2_model_runner 的 resumed 合并 L1132-L1142、next_decode_eligible_step 的 continue L504-L508）",
+        "why_safe": "单卡无 PP 时 use_pp=False、new_token_ids 恒空；V2 runner 是实验路径（ch18）"
+      },
+      {
+        "what": "spec decode 的统计与均匀 pad（make_spec_decoding_stats、pad_spec_decode 分支 L881-L897、num_spec_tokens_to_schedule/dynamic_sd_lookup、scheduled_spec_decode_tokens 的登记 L641-L656 与 L1076-L1079）——保留追赶公式里的 spec 项与 num_output_placeholders 项",
+        "why_safe": "默认 num_spec_tokens=0，pad 分支条件不成立；公式两项是追赶公式原文的一部分必须保留（同步版恒 0），但 spec 的簿记细节属 ch33"
+      },
+      {
+        "what": "流式输入会话（resumable、streaming_queue、WAITING_FOR_STREAMING_REQ、num_waiting_for_streaming_input、add_request 的重复 id 续跑分支 L2214-L2226、_update_request_as_session）",
+        "why_safe": "一次性一问一答请求 resumable=False；add_request 保留 else 主路径（登记+入队+QUEUED）即完整正确"
+      },
+      {
+        "what": "可观测性/统计（record_event/QUEUED/SCHEDULED、log_stats、prefill_stats、record_function_or_nullcontext 探针、make_stats、connector_prefix_cache_stats、routed_experts 快照 L1345-L1359、scheduled_encoder_input_stats、capture_iteration_details）",
+        "why_safe": "日志与统计不改变调度决策，删后控制流不变"
+      },
+      {
+        "what": "async 调度残留（num_output_placeholders>0 的提前剪枝 L488-L502、defer_block_free/last_sched_seq 记录 L1332-L1334、AsyncScheduler 类本身不进精简版）",
+        "why_safe": "精简版用同步 Scheduler：num_output_placeholders 恒 0、剪枝条件永不成立、defer_block_free 恒 False；占位机制整体归 ch12（公式里的占位项保留为 0）"
+      },
+      {
+        "what": "skipped 双队列的阻塞态细节（_try_promote_blocked_waiting_request、WAITING_FOR_* 三态的分流与 debug 日志 L700-L711、step_skipped_waiting 的收集与回插 L1099-L1101）——保留双队列结构本身",
+        "why_safe": "阻塞态全部来自 connector/grammar/streaming（已删），删后 skipped_waiting 恒空但结构保留——ch11 展开；_is_blocked_waiting_status 保留返回 False 的空壳或直接保留原判（对已删状态无副作用）"
+      },
+      {
+        "what": "pause 状态机深挖（set_pause_state/PAUSED_NEW 的收新侧语义）——保留 PAUSED_ALL→budget=0 短路",
+        "why_safe": "本章只用 PAUSED_ALL 演示预算可被外部归零；三态全貌归 ch39 弹性章"
+      }
+    ],
+    "must_keep": [
+      {
+        "symbol": "schedule",
+        "why": "本章主角：一拍调度的入口"
+      },
+      {
+        "symbol": "token_budget",
+        "why": "token 预算池——『批大小=token 数』的载体，须展示跨两阶段递减（L459/L523/L637/L913/L1073）"
+      },
+      {
+        "symbol": "max_num_scheduled_tokens",
+        "why": "预算上界来源与回落解析（L110-L114）"
+      },
+      {
+        "symbol": "num_scheduled_tokens",
+        "why": "schedule() 的核心产物 {req_id: num_tokens}，契约本身"
+      },
+      {
+        "symbol": "total_num_scheduled_tokens",
+        "why": "守恒断言对象（L1109-L1110）"
+      },
+      {
+        "symbol": "num_new_tokens",
+        "why": "预算分配的核心变量：追赶公式与切块公式的结果"
+      },
+      {
+        "symbol": "num_tokens_with_spec",
+        "why": "追赶公式被减数（request.py:L275-L277）"
+      },
+      {
+        "symbol": "num_computed_tokens",
+        "why": "追赶公式减数；_update_after_schedule 乐观推进它；准入时记前缀命中数（L1075）"
+      },
+      {
+        "symbol": "num_output_placeholders",
+        "why": "追赶公式的中间项（同步恒 0，ch12 灌值）——公式原文完整性"
+      },
+      {
+        "symbol": "long_prefill_token_threshold",
+        "why": "chunk 切块第一闸（L521-L522/L899-L901；config L70-L72）"
+      },
+      {
+        "symbol": "enable_chunked_prefill",
+        "why": "chunk 开关与整拍 break 语义（L905-L911；v1 默认 True）"
+      },
+      {
+        "symbol": "running",
+        "why": "RUNNING 队列：阶段一遍历对象、抢占 pop 对象、准入 append 落点"
+      },
+      {
+        "symbol": "waiting",
+        "why": "WAITING 队列：阶段二收新来源、新请求入队落点"
+      },
+      {
+        "symbol": "skipped_waiting",
+        "why": "双队列结构（阻塞态隔离）——结构保留，细节 ch11"
+      },
+      {
+        "symbol": "scheduled_new_reqs",
+        "why": "首次调度请求 → NewRequestData 全量"
+      },
+      {
+        "symbol": "scheduled_resumed_reqs",
+        "why": "抢占恢复请求 → resumed_req_ids 替换语义（与 new 对照）"
+      },
+      {
+        "symbol": "scheduled_running_reqs",
+        "why": "本拍调度的在途请求 → CachedRequestData 增量"
+      },
+      {
+        "symbol": "preempted_reqs",
+        "why": "本拍抢占集合：阶段二守卫 `not preempted_reqs` 的依据（L684）"
+      },
+      {
+        "symbol": "allocate_slots",
+        "why": "KV 块分配：None=不够（RUNNING 侧触发抢占 / WAITING 侧 break）——调度与显存的耦合点"
+      },
+      {
+        "symbol": "get_computed_blocks",
+        "why": "前缀命中折算已算（L745-L766 黑盒调用）"
+      },
+      {
+        "symbol": "new_step_starts",
+        "why": "每拍对 KV 管理器的新步通知（L475，账本翻页动作）"
+      },
+      {
+        "symbol": "_make_cached_request_data",
+        "why": "增量下发的构造（L1410-L1457，含 prev_step 判定）"
+      },
+      {
+        "symbol": "prev_step_scheduled_req_ids",
+        "why": "判定『上一拍没调度过』→ 补传 all_token_ids（L1160-L1163/L1448-L1450）"
+      },
+      {
+        "symbol": "_update_after_schedule",
+        "why": "乐观推进 num_computed_tokens + is_prefill_chunk——chunked prefill 下一拍续上的关键（L1317-L1343）"
+      },
+      {
+        "symbol": "is_prefill_chunk",
+        "why": "chunk 未完标记（L1335-L1337；request.py:L187-L188）"
+      },
+      {
+        "symbol": "num_in_flight_tokens",
+        "why": "乐观推进的在途计数（L1331，request.py:L159-L162）"
+      },
+      {
+        "symbol": "_inflight_prefills",
+        "why": "还在 prefill 的已准入请求集合（L1080-L1082/L1341-L1343）——chunk 续切的依据"
+      },
+      {
+        "symbol": "SchedulerOutput",
+        "why": "一拍产物数据类（output.py:L192-L227）"
+      },
+      {
+        "symbol": "NewRequestData",
+        "why": "首次调度全量数据类（worker 缓存它）"
+      },
+      {
+        "symbol": "CachedRequestData",
+        "why": "已调度增量数据类（只发 diff）"
+      },
+      {
+        "symbol": "max_num_running_reqs",
+        "why": "running 上界 = max_num_seqs（L109/L690-L692/L1113）"
+      },
+      {
+        "symbol": "DEFAULT_MAX_NUM_BATCHED_TOKENS",
+        "why": "预算默认值真相源（config L42）"
+      },
+      {
+        "symbol": "DEFAULT_MAX_NUM_SEQS",
+        "why": "请求上限默认值真相源（config L44）"
+      },
+      {
+        "symbol": "FCFSRequestQueue",
+        "why": "waiting 容器：append/popleft/peek/prepend 四操作语义"
+      },
+      {
+        "symbol": "create_request_queue",
+        "why": "按 policy 建队的工厂（L187/L685）"
+      },
+      {
+        "symbol": "PauseState",
+        "why": "PAUSED_ALL→budget=0 短路（L460-L462）"
+      },
+      {
+        "symbol": "add_request",
+        "why": "请求入账本入口（L2213-L2235 主路径）"
+      },
+      {
+        "symbol": "_enqueue_waiting_request",
+        "why": "按阻塞态分流两队列的路由（结构保留）"
+      },
+      {
+        "symbol": "full_sequence_must_fit",
+        "why": "全序列准入门参数名（L982，scheduler_reserve_full_isl 的传入现场）"
+      }
+    ],
+    "scope_note": "精简版范围 = Scheduler 的 schedule() 主线 + _update_after_schedule + _make_cached_request_data + add_request 主路径 + 相关 config 解析（同步 Scheduler；AsyncScheduler/PREEMPT 深挖/update_from_output 生命周期分别归 ch12/ch11 的精简版，不在本章实现范围）。update_from_output/check_stop/finish_requests 不在本章精简范围（ch9 已有⑤拍语义、ch11 展开），但 must_keep 中 SchedulerOutput 侧符号须出现在精简版的组装现场。"
+  },
+  "foreshadow_due": {
+    "source": "v3 伏笔真相源 = book/cartography/pedagogy-plan.json foreshadows（bible.py due 是 v2 旧章号账本，取回必错，不跑）",
+    "should_plant": [],
+    "should_payoff": [],
+    "note": "pedagogy-plan.foreshadows 无 planted=10 亦无 paid=10 的条目——本章不埋不收。邻章伏笔路过点（写作时顺带提钩子但不登记）：ch9 埋的 F6（bitmask 窗口→ch30）不在本章路径；ch11 将埋 F2（抢占恢复撞前缀缓存→ch15）——本章第 8 站 get_computed_blocks 与第 10 站『WAITING 不抢占』恰是 ch11 的两个天然钩子，结尾留一句『内存不够了怎么办』的悬念即可。"
+  },
+  "l2_spec": "book/cartography/l2-specs/ch10.json（同目录 stations 与本档案 stations 同一份账本）"
+}

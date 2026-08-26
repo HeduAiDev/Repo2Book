@@ -1,0 +1,89 @@
+{
+ "chapter": "ch11-preemption-request-lifecycle",
+ "generated": "2026-08-27",
+ "pin": "vLLM v0.27.1 (6e448d0ea)",
+ "scope_note": "本章三个 introduces（recompute-only、单 IntEnum 状态机、水位）逐项研究，另从 v2 映射章（v2 ch14-scheduler）复用两条已查透且本章确实会用到的条目（swap-vs-recompute 强化升级、队头阻塞），全部 sources 于 2026-08-27 重新一手核实。本章是纯内部调度机制章：投机解码只在热循环路过（深挖归 ch12/spec 章，v2 那条 spec 研究不搬）、前缀缓存只埋 F2 伏笔（归 ch15）、KVConnector/Mooncake 生态只点名（归 ch16），均不产外部背景。无 competing_set 条目——本章没有『几个竞争性外部项目』的对比面。",
+ "concepts": [
+  {
+   "id": "preemption-recovery-recompute-only",
+   "term": "抢占恢复的两条路：swap（换出到 CPU）与 recompute（丢弃重算）——vLLM V1 只留后者（recompute-only）",
+   "kind": "external_concept",
+   "one_line": "显存池见底、必须赶走一个正在跑的请求时，它算到一半的 KV 缓存有两条经典处置：搬到 CPU 内存存着以后搬回来（swap），或者直接扔掉、回来时重新算（recompute）——这套二选一框架正是 vLLM 自己的奠基论文提出的，V1 架构删掉了 swap、只留 recompute 一条腿。",
+   "what_it_is": "先说『抢占』本身：操作系统语境里，抢占指外层调度器『不经任务自身配合』就中断一个正在执行的任务、并打算稍后恢复它（Wikipedia 定义原话：'the act performed by an external scheduler — without assistance or cooperation from the task — of temporarily interrupting an executing task, with the intention of resuming it at a later time'），与之相对的是协作式（cooperative）——任务必须主动让出。LLM 推理引擎里的抢占是同一件事在显存维度的翻版：KV 块不够了，调度器强制挂起某个正在 decode 的请求。被挂起请求的 KV 缓存怎么办，就是 swap 与 recompute 的分岔：**swap** 把它的 KV 块物理拷贝（序列化）到 CPU 内存存着，重新调度时原样拷回 GPU——代价是两次 PCIe 搬运加 CPU 侧一块镜像内存；**recompute** 干脆不存，把块全部释放、请求的进度记账清零，等它重新被调度时，把已生成的 token 拼回原 prompt 当一个『新 prompt』，用一次 prefill 迭代把所有位置的 KV 批量重算出来——注意不是逐 token 慢慢重跑 decode，所以论文说重算延迟『可以显著低于当初逐 token 生成的原始延迟』。本章看到的 _preempt_request——free 块 + num_computed_tokens=0，没有任何拷 CPU 的动作——走的正是 recompute 这条路，而且是 V1 唯一的一条路。",
+   "background": "两条路是 vLLM 奠基论文《Efficient Memory Management for Large Language Model Serving with PagedAttention》（Kwon et al., SOSP 2023, arXiv:2309.06180）§4.5 并列提出的：swapping 类比虚拟内存的换页（'In our case, we copy evicted blocks to the CPU memory'），recomputation 则是 'we simply recompute the KV cache when the preempted sequences are rescheduled'，且 'recomputation latency can be significantly lower than the original latency, as the tokens generated at decoding can be concatenated with the original user prompt as a new prompt'、其 KV 'can be generated in one prompt phase iteration'。论文还实测了两者的适用面：swap 在小块尺寸下反而吃亏——'swapping incurs excessive overhead with small block sizes'（大量小块 CPU-GPU 传输吃不满 PCIe 带宽），而 'the overhead of recomputation remains constant across different block sizes'，块大小 16-64 区间两者相当；摘要层面的结论是 swap 作为恢复机制总体占优、尤其大模型（重跑 prefill 贵）。工程化后的 v0 一直双模并存：vllm/config.py 的 SchedulerConfig.preemption_mode（v0.6.6 与 v0.9.1 一手核实，类型 Literal[\"swap\", \"recompute\"]），不指定时自动选择——docstring 原话：recomputation 是默认（开销更低），swapping 用于 beam search 这类多序列场景。转折在 V1：官方文档《Optimization and Tuning》现文（2026-08-27 访问 stable）明确 'In vLLM V1, the default preemption mode is RECOMPUTE rather than SWAP, as recomputation has lower overhead in the V1 architecture'，且该页再无任何 preemption_mode 配置项——只剩 RECOMPUTE 一种。v1 从首提交起就没有 swap/PreemptionMode 字样、v0 swap 空间不足直接 RuntimeError 崩引擎这两条 git 考古证据由本章 dossier（analyst 一手 git 考古）提供，写作时须按 dossier 要求标注『历史证据，现行源码无此代码』。",
+   "example": "【说明性例子】请求 A：prompt 500 token、已生成 200 token（共 700 token 的 KV 在显存块里）。池子见底，A 被抢占：swap 路径——A 的全部 KV 块拷贝到 CPU swap 空间，A 挂起；恢复时再把这 700 token 的 KV 拷回 GPU，从第 701 个 token 续算（两次 PCIe 搬运，零重算）。recompute 路径（V1 实际做法）——A 的 KV 块直接释放回池子（块哈希留在表里，见本章 F2 伏笔），进度记账清零，A 回等待队列队头；恢复时把 prompt 500 + 已生成 200 拼成一个 700 token 的『新 prompt』一次 prefill 批量重算——若前缀缓存命中自己刚释放的块，实为『重载元数据 + 补算尾段』而非全量重算。",
+   "links": [
+    "https://arxiv.org/abs/2309.06180",
+    "https://docs.vllm.ai/en/stable/configuration/optimization/"
+   ],
+   "sources": [
+    {"url": "https://ar5iv.labs.arxiv.org/html/2309.06180", "note": "PagedAttention 论文 §4.5 原话：swap 换 CPU 内存 / recompute 重算 / 重算延迟显著低于原始延迟（生成 token 拼回 prompt 一次 prefill 迭代算完）/ 小块下 swap 开销过大、recompute 开销与块大小无关；WebFetch 核实于 2026-08-27"},
+    {"url": "https://docs.vllm.ai/en/stable/configuration/optimization/", "note": "官方文档确认 V1 默认抢占模式 RECOMPUTE 而非 SWAP（原话 'recomputation has lower overhead in the V1 architecture'），且该页无 preemption_mode 配置项；WebFetch 核实于 2026-08-27"},
+    {"url": "https://raw.githubusercontent.com/vllm-project/vllm/v0.9.1/vllm/config.py", "note": "v0 时代 SchedulerConfig.preemption_mode 一手核实：Literal[\"swap\",\"recompute\"]，不指定时自动选——recompute 默认（低开销）、swap 用于 beam search 多序列；WebFetch 核实于 2026-08-27（v0.6.6 同字段同语义）"},
+    {"url": "https://en.wikipedia.org/wiki/Preemption_(computing)", "note": "OS 抢占定义（外层调度器不经任务配合中断之、稍后恢复）与协作式对照；WebFetch 核实于 2026-08-27"}
+   ],
+   "confidence": "high",
+   "writer_note": "本章 introduces『recompute-only』的正名处。建议在抢占段先给一句 OS 类比（调度器可不经任务同意中断它——抢占这个词的出身），再摆论文里 swap/recompute 两条路的出身与实测（小块 swap 吃亏一句带过即可），然后落『V1 只留一条腿』（docs 原话可引）。dossier 的 v0 swap 死法引语必须标『历史证据，git 旧档，现行源码无此代码』；『为什么 V1 敢删 swap』的工程答案（前缀缓存兜底→ch15、准入控制压频率→ch14）是本章后半的钩子，别在前半提前展开。"
+  },
+  {
+   "id": "hol-blocking",
+   "term": "队头阻塞（Head-of-Line Blocking, HOL blocking）",
+   "kind": "external_concept",
+   "one_line": "排在队列最前面的一项卡住走不动，会连累它后面本来可以立刻处理的所有项目一起被拖住——一个在网络与系统领域反复出现的经典问题。",
+   "what_it_is": "HOL blocking 描述这样一个场景：一个 FIFO（先进先出）队列里，只有队头的元素能被检查/处理；如果队头这一项因为某个外部条件没满足而暂时处理不了，即便队列后面排着大把『现在就能处理』的元素，它们也必须干等队头让开。结果是吞吐大幅下降、后面本不该等待的请求被无辜拖慢，最坏情况（队头长期卡死）吞吐塌缩到接近 0。本章站 8（waiting/skipped_waiting 双队列遍历）描述的场景——一个等 grammar 编译/等远程 KV/等流式输入的请求卡在 waiting 队头，后面一堆『随时能跑』的请求被迫等它——就是这个问题在调度器里的具体形态；vLLM 的解法（把阻塞态请求隔离到 skipped_waiting 第二队列）本质上是网络界处理 HOL blocking 的经典思路（虚拟输出队列的同源想法：给不同『去向』的东西分开排）的调度器版本。",
+   "background": "这个词最早出现在 1980~90 年代的电路/包交换网络研究里：输入缓冲交换机用单一 FIFO 缓存待转发的包，理论分析显示（Karol, Hluchyj & Morgan 1987 的经典结果）均匀随机目的地、链路数趋大时这种交换机的吞吐上限只有约 58.6%。业界标准解法是虚拟输出队列（Virtual Output Queueing, VOQ）——给每个目标端口分别开一个队列，从根源上避免相互阻塞。这个概念此后被反复复用：可靠字节流（TCP）里一个丢包会让它之后所有已到达的数据都无法交付；HTTP/1.1 的单连接顺序响应；HTTP/2 应用层多路复用解决了应用层 HOL、但 TCP 层的仍在（这也是 HTTP/3 改用 QUIC/UDP 的动机之一）。vLLM 调度器的 waiting/skipped_waiting 双队列，正是『别让一种去向堵住另一种』思路在请求调度场景的应用——这里的『去向』是『可调度』与『阻塞态』两类。",
+   "example": null,
+   "links": [
+    "https://en.wikipedia.org/wiki/Head-of-line_blocking"
+   ],
+   "sources": [
+    {"url": "https://en.wikipedia.org/wiki/Head-of-line_blocking", "note": "HOL blocking 定义（'a performance-limiting phenomenon that occurs when a queue of packets is held up by the first packet in the queue'）、输入缓冲交换机 58.6% 吞吐上限（Karol, Hluchyj & Morgan 1987）、VOQ 解法、HTTP/1.1→HTTP/2→HTTP/3 演进；WebFetch 重新核实于 2026-08-27（该页不涉 CPU 调度语境——本章类比由我们自己做）"}
+   ],
+   "confidence": "high",
+   "writer_note": "本章站 8/机制 m6（双队列防队头阻塞）讲到 skipped_waiting 时，首次出现『队头阻塞』应夹注英文 head-of-line blocking，让读者知道这不是 vLLM 自造词，而是网络交换机/HTTP 领域的经典问题，解法（分开排队）也是经典思路（VOQ 同源）。一句『这在网络交换机、HTTP/2 里也是经典问题，解法都是分开排队』足够，历史细节留给链接。"
+  },
+  {
+   "id": "intenum-single-state-machine",
+   "term": "单 IntEnum 状态机：把一生的状态排上数轴，一次比较判终态",
+   "kind": "custom_pattern",
+   "one_line": "Python 的 IntEnum 让每个枚举成员就是一个整数，于是可以把请求一生的全部状态按生命周期顺序排在一条数轴上（enum.auto() 按声明顺序 1,2,3… 编号）——判『是否已终局』就退化成一次整数比较 status > PREEMPTED。",
+   "what_it_is": "IntEnum 是 Python 标准库 enum 模块提供的基类，官方文档原话：成员『也是整数，可以在任何能用整数的地方使用』（是 int 的子类）。这带来一个关键能力：枚举成员之间可以用 > < 比大小——普通 Enum 成员不是整数，做不了这种排序比较。再配上 enum.auto()（不写数值、由解释器按声明顺序从 1 起每个 +1 赋值），『声明顺序』就直接等于『数值大小』。vLLM 把这两点合成一个设计：RequestStatus 一个枚举全程跟随请求的一生，状态按生命周期排好——前段是各种活着的态、PREEMPTED 之后全是 FINISHED_* 终态——于是『是否终局』不用查集合、不用 switch，一个 status > PREEMPTED 一次整数比较搞定（热循环里每请求每拍都要判，这个设计把判断压到最便宜）。代价是把『枚举数值顺序』变成了隐式 API：新状态必须永远插在 PREEMPTED 的正确一侧，插错不报错、只静默改变『终态判定』的语义。这个模式的本质是『顺序即语义』：数值本身没有外部含义，但排列顺序承担了状态机的分界语义。",
+   "background": "enum 模块是 Python 3.4 才进标准库的（官方文档 'Added in version 3.4'，PEP 435），enum.auto() 是 3.6 加的。标准库自己大量用 IntEnum 给老的整型常量补类型，最著名的例子之一是 http.HTTPStatus（Python 3.5 起，官方文档原话 'A subclass of enum.IntEnum that defines a set of HTTP status codes'——OK=200、NOT_FOUND=404，所以 HTTPStatus.OK == 200 成立）。HTTPStatus 与 RequestStatus 恰好是 IntEnum 的两种用法对照：HTTPStatus 的数值有外部语义（HTTP 规范定的状态码），数值大小本身没有『生命周期』含义；RequestStatus 反过来——数值纯内部（auto() 顺序号），但排列顺序被 is_finished 依赖、承担了语义。同一个『成员即整数』特性，一边用来对齐外部协议，一边用来编码状态分界。",
+   "example": "【可自己跑的最小例】\n\n```python\n>>> import enum\n>>> class TaskStatus(enum.IntEnum):\n...     QUEUED = enum.auto()    # 1\n...     RUNNING = enum.auto()   # 2\n...     PAUSED = enum.auto()    # 3   <- 分界：此后都是终态\n...     DONE = enum.auto()      # 4\n...     FAILED = enum.auto()    # 5\n\n>>> TaskStatus.DONE > TaskStatus.PAUSED   # True：判『终态』= 一次整数比较（4 > 3）\nTrue\n>>> TaskStatus.RUNNING == 2               # True：成员本来就是 int\nTrue\n```\n\n逐行点：`enum.auto()` 不写数值，按声明顺序从 1 起每个 +1（官方文档：'for Enum and IntEnum that appropriate value will be the last value plus one'），所以声明顺序=数值顺序；`DONE > PAUSED` 实际执行的是整数 4>3；`RUNNING == 2` 成立因为 IntEnum 成员是 int 的子类。风险也在这个例子里：若在 PAUSED 与 DONE 之间插入一个新的非终态 `WAITING_INPUT = enum.auto()`，它会拿到 4、DONE 顺延成 5——`WAITING_INPUT > PAUSED` 为 True，『终态判定』对它静默误判，任何不碰这条路径的测试都发现不了。『新状态插在分界线哪一侧』从此是所有后来者的隐式契约。",
+   "links": [
+    "https://docs.python.org/3/library/enum.html",
+    "https://docs.python.org/3/library/http.html#http.HTTPStatus"
+   ],
+   "sources": [
+    {"url": "https://docs.python.org/3/library/enum.html", "note": "IntEnum 定义原话（成员 'are also integers and can be used anywhere that an integer can be used'，int 子类）、auto() 语义（'last value plus one'，IntEnum 从 1 起递增）、enum 模块 3.4 加入、auto 3.6 加入；WebFetch 核实于 2026-08-27"},
+    {"url": "https://docs.python.org/3/library/http.html#http.HTTPStatus", "note": "HTTPStatus 类文档原话 'A subclass of enum.IntEnum that defines a set of HTTP status codes'，OK=200/NOT_FOUND=404，文档自带 HTTPStatus.OK == 200 示例；WebFetch 核实于 2026-08-27"}
+   ],
+   "confidence": "high",
+   "writer_note": "本章 introduces『单 IntEnum 状态机』——站 1 立状态机地图时，用两三句把初学者未必知道的机制讲掉：IntEnum 成员就是整数（所以能比大小）、enum.auto() 按声明顺序从 1 编号（所以声明顺序=数值顺序）、于是 status > PREEMPTED 一次比较就判终态。热循环经济学（每秒十万次级比较）与『插错侧=静默 bug』的代价是 dossier WC2/m10 的源码叙事，由 writer 按源码注释展开；HTTPStatus 对照可作一句彩蛋，深入留给链接。"
+  },
+  {
+   "id": "watermark",
+   "term": "水位（watermark / high-water mark）：给资源池划一条警戒线",
+   "kind": "external_concept",
+   "one_line": "系统工程里的『水位』借自洪水退去留在墙上的刻度线：在缓冲区/资源池上预先划一条（或一对）阈值，用量越过或跌破这条线就触发动作（暂停收新、开始回收、恢复接收）——vLLM 用它做『准入时留余量』防抢占抖动。",
+   "what_it_is": "computing 语境的『水位』有两个相关但不同的用法：其一是**峰值记录**——high-water mark 指资源历史最高用量那条线（HPC 记账里的 per-process memory high-water mark、经典 malloc 的高水位分配策略都是这类）；其二是**控制阈值**——给缓冲区/队列划一条（或高/低一对）刻度线，越过就触发动作。第二种最常见的形态是高/低水位一对（中间留迟滞带）：例如 Netty 的写缓冲区水位（WriteBufferWaterMark，官方 javadoc 原话：'If the number of bytes queued in the write buffer exceeds the high water mark, Channel.isWritable() will start to return false'，跌回低水位之下才恢复 true）——用一对阈值给生产者施加背压、又避免在单阈值附近反复开关抖动。vLLM 的 watermark 是单阈值、准入侧的用法：新收一个 waiting/preempted 请求时，除了它要的块，还要求『收完后剩余空闲块 ≥ 总块数 × watermark』——宁可晚收，不让已在跑的请求的增长撞墙。当前官方 CLI 文档（2026-08-27 访问 stable）原话：'Fraction of total KV cache blocks to keep free (the watermark) when admitting waiting or preempted requests into the running queue'，范围 [0.0, 1.0)、默认 0.0 即关闭——与本章 pin v0.27.1 的 docstring 逐字一致。",
+   "background": "词源是字面的：high water mark 本义是『水体在陆地上到达的最高点』（Wikipedia），洪水/潮汐退去留下的那条线——人们还常在墙上做标记记录年份，美国法律甚至用它划产权与联邦管辖边界。工程界借这个意象几十年了。vLLM 自己的水位史（本条全部一手核实）：**v0 时代就有**——块管理器 BlockSpaceManager 的构造参数 watermark 默认 0.01（1%），v0.2.7 源码一手核实：`watermark_blocks = int(watermark * num_gpu_blocks)`，can_allocate 里注释原话 'Use watermark to avoid frequent cache eviction'，要求分配后剩余 ≥ watermark_blocks 才放行（can_swap_in 同样用它）——一个静态全局垫片，恒定生效。**V1 出生时没有水位**（v1 的 kv_cache_manager 起初无此参数）。**2026-06-11 PR #44594 把水位加回 V1**：动机是饱和负载下『准入时只预留了输入长度、输出长度未知』导致短时超收→全体增长→池尽→抢占刚准入的请求→re-prefill（PR 基准注明被抢请求恢复时要重算 ~3500 tokens）的循环抖动；作者报告（Qwen2.5-7B/GB200、KV 池近临界单点配置）watermark 0.05 下抢占 -82%、ITL p99 -56%、端到端 p50 -7%、吞吐 +5.1%。这段落地还有个小插曲：#44594 漏改了一个测试 mock 导致 CI 红，有人开了 revert（#45344），维护者选择前向修测试（#45345）而非移除特性——水位留了下来。v0.27.x 的最终形态是『精修版』：只在准入 waiting/preempted 请求时计入、且本步已有在场请求才生效、默认 0.0 关——与 v0 的『全局静态、恒开 1%』三点都不同。",
+   "example": "【说明性例子】池共 100 块，watermark = 0.10 → watermark_blocks = 10。此刻空闲 30 块，队头来了一个要 25 块的 WAITING 请求：裸判断 30 ≥ 25，收；带水位判断 30 − 25 = 5 < 10，拒（推迟准入，等池子更空）。被拒的请求只是继续排队——那 10 块余量留给已在跑的请求们每拍 +1 token 的 decode 增长用。对照 Netty 的成对水位：那是『涨过 64KB 关阀、跌回 32KB 开阀』的迟滞带；vLLM 只在『收新』这一个动作上设单一阈值——不是控制开关抖动，而是给准入留 headroom。",
+   "links": [
+    "https://netty.io/4.1/api/io/netty/channel/WriteBufferWaterMark.html",
+    "https://github.com/vllm-project/vllm/pull/44594",
+    "https://docs.vllm.ai/en/stable/cli/serve/"
+   ],
+   "sources": [
+    {"url": "https://netty.io/4.1/api/io/netty/channel/WriteBufferWaterMark.html", "note": "HWM/LWM 成对阈值的标准工程形态：超过高水位 isWritable() 变 false、跌回低水位之下恢复 true——写缓冲背压；WebFetch 核实于 2026-08-27"},
+    {"url": "https://en.wikipedia.org/wiki/High_water_mark", "note": "字面词源：水体在陆地上到达的最高点、洪水线、墙上标记、法律划界（该页只讲字面义，computing 义是我们的引申类比）；WebFetch 核实于 2026-08-27"},
+    {"url": "https://github.com/vllm-project/vllm/pull/44594", "note": "V1 水位的出生 PR（2026-06-11 合入）：动机（超收→抢占→re-prefill ~3500 tokens 抖动）、语义（准入时保留总块数比例的 buffer）、默认关闭、作者报告的实测数字（watermark 0.05：抢占 -82% 等，单点配置）；WebFetch 核实于 2026-08-27"},
+    {"url": "https://github.com/vllm-project/vllm/pull/45344", "note": "revert PR（因测试 mock 未更新 CI 红），被维护者关闭、以 #45345 前向修测试收场——特性保留；WebFetch 核实于 2026-08-27"},
+    {"url": "https://raw.githubusercontent.com/vllm-project/vllm/v0.2.7/vllm/core/block_manager.py", "note": "v0 水位一手核实：BlockSpaceManager 构造参数 watermark=0.01、watermark_blocks=int(watermark*num_gpu_blocks)、can_allocate 注释 'Use watermark to avoid frequent cache eviction'（另用于 can_swap_in）——全局静态垫片；WebFetch 核实于 2026-08-27"},
+    {"url": "https://docs.vllm.ai/en/stable/cli/serve/", "note": "当前 stable CLI 文档的 --watermark 描述与 pin v0.27.1 docstring 逐字一致（准入 waiting/preempted 时保留的总块数比例，[0.0,1.0)，默认 0.0 关）；同页 --scheduler-reserve-full-isl 默认 True 亦核实；WebFetch 核实于 2026-08-27"}
+   ],
+   "confidence": "high",
+   "writer_note": "本章 introduces『水位』。正文站 10/机制 m8 讲机制前，先用一两句通用概念铺垫（洪水线→缓冲区阈值；Netty 成对水位是背压、vLLM 单阈值是准入 headroom，一句对照即可）；vLLM 水位史（v0 块管理器 1% 静态垫片→V1 没有→#44594 精修版加回）适合做背景框或脚注，主线别展开；#44594 的实测数字（抢占 -82%/ITL p99 -56%）是好素材，可作正文一句或脚注，注意标注是作者报告的单点配置；decode-heavy 抖动机理与 benchmarks/kv_cache_watermark.sh 复现脚本是 pin 内资产、由 writer 按 dossier 讲。"
+  }
+ ]
+}

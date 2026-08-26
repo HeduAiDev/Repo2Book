@@ -1,7 +1,7 @@
 # Driver: ch03-compute-hash worked example.
 # Builds five configs that differ in exactly one hash-relevant/irrelevant knob
 # each (vllm/config/vllm.py:L431-L537; scheduler.py:L193-L219; parallel.py:
-# L774-L830) and records total + per-subconfig hashes through the
+# L774-L829) and records total + per-subconfig hashes through the
 # faithful-subset companion. Also checks determinism (fresh rebuild).
 import json
 import sys
@@ -48,10 +48,10 @@ records = [
               "SchedulerConfig.compute_hash 只收 max_num_batched_tokens (scheduler.py:L193-L219, #29585)",
               dict(BASE, max_num_seqs=512)),
     summarize(3, "改 backend: None(->uni) -> 显式 mp (world_size 仍 1)",
-              "ParallelConfig.compute_hash 的 ignored_factors 含 distributed_executor_backend (parallel.py:L774-L830)",
+              "ParallelConfig.compute_hash 的 ignored_factors 含 distributed_executor_backend (parallel.py:L774-L829)",
               dict(BASE, distributed_executor_backend="mp")),
     summarize(4, "改 TP 1->2 (在场景3 的 mp 配置上, 单变量隔离)",
-              "tensor_parallel_size 进 ParallelConfig 因子: 集体通信进计算图",
+              "tensor_parallel_size 进 ParallelConfig 因子: 集体通信进计算图; 且 TP=2 使 O2 预设谓词 fuse_allreduce_rms (vllm.py:L155-L175) 翻 True -> pass_config 入 CompilationConfig.compute_hash (compilation.py:L780, default-include 声明字段) -> compilation 子 hash 连带变(单变量输入的派生涟漪)",
               dict(BASE, distributed_executor_backend="mp", tensor_parallel_size=2)),
     summarize(5, "改 max_num_batched_tokens 16384->8192",
               "LoRA 静态缓冲尺寸 + Inductor 32/64 位索引选择 (#29585)",
@@ -77,12 +77,12 @@ doc = {
     "anchors": [
         "vllm/config/vllm.py:L431-L537",
         "vllm/config/scheduler.py:L193-L219",
-        "vllm/config/parallel.py:L774-L830",
+        "vllm/config/parallel.py:L774-L829",
         "vllm/compilation/backends.py:L1034",
     ],
     "scenarios": records,
 }
 
 out = Path(__file__).resolve().parent / "ch03-compute-hash.json"
-out.write_text(json.dumps(doc, indent=1, ensure_ascii=False), encoding="utf-8")
+out.write_text(json.dumps(doc, indent=1, ensure_ascii=False), encoding="utf-8", newline="\n")
 print(json.dumps(doc, indent=1, ensure_ascii=False))

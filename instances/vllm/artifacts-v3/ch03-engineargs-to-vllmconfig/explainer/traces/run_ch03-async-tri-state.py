@@ -68,7 +68,7 @@ doc = {
         "vllm/v1/executor/abstract.py:L364",
         "vllm/v1/executor/uniproc_executor.py:L146",
         "vllm/v1/executor/multiproc_executor.py:L526",
-        "vllm/config/vllm.py:L539-L550",
+        "vllm/config/vllm.py:L540-L550",
         "vllm/config/scheduler.py:L170-L190",
         "vllm/config/scheduler.py:L148-L151",
     ],
@@ -76,5 +76,5 @@ doc = {
 }
 
 out = Path(__file__).resolve().parent / "ch03-async-tri-state.json"
-out.write_text(json.dumps(doc, indent=1, ensure_ascii=False), encoding="utf-8")
+out.write_text(json.dumps(doc, indent=1, ensure_ascii=False), encoding="utf-8", newline="\n")
 print(json.dumps(doc, indent=1, ensure_ascii=False))

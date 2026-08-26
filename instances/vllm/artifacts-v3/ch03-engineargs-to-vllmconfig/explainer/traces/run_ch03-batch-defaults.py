@@ -1,6 +1,6 @@
 # Driver: ch03-batch-defaults worked example.
 # Runs get_batch_defaults + _set_default_max_num_seqs_and_batched_tokens_args
-# (vllm/engine/arg_utils.py:L2515-L2596, L2712-L2802) on injected platform
+# (vllm/engine/arg_utils.py:L2515-L2596, L2712-L2801) on injected platform
 # probes (H100 / A100 / RTX 4090) across usage contexts and performance modes.
 import json
 import sys
@@ -66,16 +66,17 @@ cw.current_platform = DEFAULT_PLATFORM
 
 doc = {
     "pin": "vLLM v0.27.1 (6e448d0ea); trace source = faithful-subset companion implementation/config_wiring.py on host",
-    "mechanism": "批大小默认按显存×设备名×使用场景推导 (vllm/engine/arg_utils.py:L2515-L2596 + L2712-L2802)",
-    "environment_note": "平台探针为 host seam 注入(设备名/显存字符串), 分支逻辑与常量逐字来自 arg_utils.py GPU 主线; get_batch_defaults 的 TPU/CPU 平台分支是 dossier delete 项、不在本 trace",
+    "mechanism": "批大小默认按显存×设备名×使用场景推导 (vllm/engine/arg_utils.py:L2515-L2596 + L2712-L2801)",
+    "environment_note": "平台探针为 host seam 注入(设备名/显存字符串), 分支逻辑与常量逐字来自 arg_utils.py GPU 主线; get_batch_defaults 的 TPU/CPU 平台分支是 dossier delete 项、不在本 trace; 各默认场景的 enable_chunked_prefill=true 是更上游 _set_default_chunked_prefill_and_prefix_caching_args(L2598-L2670) 按模型能力推导的默认",
     "anchors": [
         "vllm/engine/arg_utils.py:L2515-L2596",
-        "vllm/engine/arg_utils.py:L2712-L2802",
+        "vllm/engine/arg_utils.py:L2598-L2670",
+        "vllm/engine/arg_utils.py:L2712-L2801",
         "vllm/config/scheduler.py:L42-L44",
     ],
     "scenarios": records,
 }
 
 out = Path(__file__).resolve().parent / "ch03-batch-defaults.json"
-out.write_text(json.dumps(doc, indent=1, ensure_ascii=False), encoding="utf-8")
+out.write_text(json.dumps(doc, indent=1, ensure_ascii=False), encoding="utf-8", newline="\n")
 print(json.dumps(doc, indent=1, ensure_ascii=False))
