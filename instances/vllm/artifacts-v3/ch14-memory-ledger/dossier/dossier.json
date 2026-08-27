@@ -1,0 +1,1088 @@
+{
+  "chapter_id": "ch14",
+  "part": "IV",
+  "title": "显存账本",
+  "pin": "vLLM v0.27.1 (6e448d0ea)",
+  "chapter_kind": "code",
+  "note_on_kind": "标准代码章（非 primer）：走 implementer 精简版 + lint_fidelity 全链。Part IV 第二章——ch13 已把池的内部（块/表/槽位恒等式/引用计数）打开，本章回答池的上一级问题：池多大、谁定的、门多紧。L0 缩放 = KV 账本列+启动（kv_column + boot 两块）。叙事角度按 pedagogy-plan：『profile 三步定账 / 准入门 / 混合注意力组化』三 introduces，notes 给了 #39734 死锁教训作 why 锚。",
+  "hook_suggestion": "「ch13 把池立起来了，可这池到底该多大？vLLM 启动先跑一次 dummy 前向，把权重、激活峰、CUDA graph 全称一遍，剩下的才分给 KV——一笔账凭什么一次算清、算少了浪费算多了炸？账定了 num_blocks，请求进门时凭什么担保整条序列装得下——chunked prefill 只查第一块的超收漏洞曾让请求 prefill 到一半装不下死锁（issue #39734），是怎么被一道准入门和『启动定账与运行准入必须同源』的铁律根治的？还有混合模型：一层要全部历史、一层只要个滑窗，一个池子怎么切才不浪费？」（从 Part IV hook『显存就那么多，KV cache 必须活到最后』+ 本章主题『显存账本』+ deepread/memory-kv.json why_chains[1]（三步定账）、why_chains[8]（护栏组合/#39734）、why_chains[6]（混合组化）提炼）",
+  "scope_note": "主线 = 账本三问『饼多大 / 怎么切 / 门多紧』：(A) profile 三步定账——request_memory（预算=总显存×util，默认 0.92 per-instance）→ determine_available_memory（memory_profiling 三类显存 + dummy 前向测激活峰 + cudagraph 估计 → available_kv = requested − non_kv − cudagraph）→ get_kv_cache_configs（护栏四道：check_enough 至少装下一条 max_model_len / 二分估可行长度 / auto-fit / override 折算；num_blocks = available // page_size // group_size；PP 取最小）→ 同一份 config 喂调度器（拍平）与 worker（CuMem 池分配），容量/并发写回 cache_config。(B) 准入门——full-ISL 门（scheduler_reserve_full_isl 默认 True：整序列预留，堵 chunked prefill 只查第一 chunk 的超收）+ 回收感知准入上限（SWA/chunked-local 的 max_admission_blocks_per_request 与启动期池大小器单源——#39734 死锁教训：预测器与池大小器漂移=死锁或 mid-prefill OOM）+ 水位（watermark 默认 0 关：decode-heavy 超收→抢占→重 prefill→再抢占的抖动，headroom 换稳定）。(C) 混合注意力组化——KVCacheSpec 每层自报 → get_kv_cache_groups 分组（页大小统一：调大较小块/Mamba pad；组数等量化 padding + 1.5 启发式 + PP 交错分派）→ 张量共享布局（通用 group_size 池每组出一层 / 单组异宽逐层 / packed 重叠只点名）→ resolve_kv_cache_block_sizes（scheduler=LCM / hash=GCD 或 prefix_match_unit）→ 运行期一个 BlockPool + 每组一 manager；SWA 窗外块回收 + null_block 原位占位；worker 侧 MultiGroupBlockTable + map_to_kernel_blocks 细分。边界与邻章分工：池内分页本体/槽位恒等式/引用计数/free 队列归 ch13；链式哈希/前缀命中/LRU 驱逐/块内 CoW 归 ch15；KVConnector 双面契约/P-D/offload 归 ch16；CUDA graph 捕获内景归 ch19；kernel 块大小的后端协商归 ch21；block_table/slot_mapping 的 PAD/CP 深讲归 ch22。前缀缓存在本章只作为 enable_caching 一个布尔出现（哈希机制→ch15）。",
+  "code_spine": [
+    "vllm/v1/worker/gpu_worker.py:L372-L396 —— init_device：NCCL 初始化刻意先于显存快照（注释 \"This ensures NCCL buffers are allocated before we measure available memory\"）→ init_snapshot → requested_memory = request_memory(init_snapshot, cache_config)",
+    "vllm/v1/worker/utils.py:L409-L429 —— request_memory：requested = ceil(总显存 × gpu_memory_utilization)（默认 0.92 per-instance）；free < requested 直接 raise",
+    "vllm/v1/worker/gpu_worker.py:L459-L611 —— determine_available_memory：kv_cache_memory_bytes 手动凌驾早退 / memory_profiling 里 profile_run 测 non_kv / cudagraph 估计 / available_kv = requested − non_kv − cudagraph（L544-L548）",
+    "vllm/utils/mem_utils.py:L233-L326 —— memory_profiling 上下文：三类显存（非本实例 / torch / 非 torch）；non_kv_cache_memory = total_consumed + transient_peak_headroom（L317-L326）",
+    "vllm/v1/worker/gpu_model_runner.py:L6433-L6506 —— profile_run：max_num_tokens 假数据跑真前向 + 采样器，测激活峰值",
+    "vllm/v1/worker/gpu_model_runner.py:L7800-L7837 —— get_kv_cache_spec：遍历 attention 层收 KVCacheSpec（每层自报形状）",
+    "vllm/v1/kv_cache_interface.py:L211-L226 —— AttentionSpec.real_page_size_bytes = 2×block_size×num_kv_heads×head_dim×dtype_bytes（页物理公式）",
+    "vllm/v1/engine/core.py:L250-L359 —— _initialize_kv_caches：收 spec（L257）→ determine_available_memory（L293）→ get_kv_cache_configs（L304-L306）→ auto-fit 同步（L311-L313）→ 拍平喂调度器 + 写回 cache_config（L315-L326）→ initialize_from_config（L330）",
+    "vllm/v1/core/kv_cache_utils.py:L2094-L2242 —— get_kv_cache_configs：合并 spec → 分组 → override 折算（L2159-L2179）→ auto-fit（L1988-L2049）→ 逐 worker 护栏（L2186-L2195）→ 出 config → PP 取最小并缩张量（L2210-L2223）→ 容量/并发日志",
+    "vllm/v1/core/kv_cache_utils.py:L993-L1010 —— get_num_blocks：num_blocks = available // page_size // num_layers（多组时 = group_size）",
+    "vllm/v1/core/kv_cache_utils.py:L751-L788 + L800-L851 —— 护栏：至少装下一条 max_model_len（_check_enough）+ 二分估可行长度（estimate_max_model_len）",
+    "vllm/v1/core/kv_cache_utils.py:L1781-L1852 —— get_kv_cache_groups：uniform 单组 / 混合多组（页统一 L1070-L1132 + 等量 padding L1233-L1279）/ disable 回退（L1568-L1589）",
+    "vllm/v1/core/kv_cache_utils.py:L1361-L1443 —— get_kv_cache_config_from_groups：张量共享布局（通用 group_size 池 / 单组异宽逐层 / packed 重叠）",
+    "vllm/v1/core/kv_cache_utils.py:L626-L688 —— resolve_kv_cache_block_sizes：scheduler_block_size=LCM / hash_block_size=GCD 或 prefix_match_unit（可除性校验）",
+    "vllm/v1/engine/core.py:L156-L168 —— 启动装配序：resolve_kv_cache_block_sizes → Scheduler(...)（内部建 KVCacheManager）",
+    "vllm/v1/core/sched/scheduler.py:L276-L290 —— KVCacheManager 构造：enable_caching/watermark（L289）等参数落地",
+    "vllm/v1/core/kv_cache_coordinator.py:L60-L128 —— coordinator：一个 BlockPool（L90-L96）+ 每组一个 SingleTypeKVCacheManager（L106-L120）",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L1836-L1878 —— get_manager_for_kv_cache_spec：spec→manager 注册表 + 准入上限注入（L1861-L1877）",
+    "vllm/v1/core/sched/scheduler.py:L965-L985 —— 准入调用点：full_sequence_must_fit=scheduler_reserve_full_isl / reserved_blocks / has_scheduled_reqs 三预算显式传入",
+    "vllm/v1/core/kv_cache_manager.py:L463-L527 —— allocate_slots 门段：水位条件计入（L463-L470）→ full-ISL 门（L472-L488）→ required ≤ free−reserved−watermark（L510-L527）",
+    "vllm/v1/kv_cache_interface.py:L519-L546 + L587-L618 —— 回收感知准入上限：ChunkedLocal/SWA 的 max_admission_blocks_per_request（启动池大小与运行准入单源）",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L178-L192 —— apply_admission_cap 夹取 + #39734 铁律注释",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L622-L672 —— remove_skipped_blocks / get_num_skipped_tokens：窗外块回收 + null 占位（SWA 实现于 L1057-L1083）",
+    "vllm/v1/worker/gpu_worker.py:L649-L676 —— initialize_from_config：CuMem tag=\"kv_cache\" 池内分配、num_gpu_blocks 写回",
+    "vllm/v1/worker/gpu_model_runner.py:L7541-L7594 + L7624-L7655 —— initialize_kv_cache(_tensors)：按 config 分配张量绑到层、kernel_block_sizes 细分（L7644-L7651 注释 256→4×64）",
+    "vllm/v1/worker/block_table.py:L221-L248 + L270-L336 —— map_to_kernel_blocks 细分换算 + MultiGroupBlockTable 每组一张表",
+    "benchmarks/kv_cache_watermark.sh:L5-L27 —— 水位动机的官方可复现论证（decode-heavy 抖动机理 + 复现配置）"
+  ],
+  "stations": [
+    {
+      "n": 1,
+      "where": "gpu_worker.py:L390-L396",
+      "what": "快照定预算：init_device 刻意先建 NCCL 再拍显存快照（L372-L382 注释原话 \"This ensures NCCL buffers are allocated before we measure available memory\"——不然后测出的 available 偏大）→ init_snapshot → request_memory（worker/utils.py:L409-L429）：requested = ceil(总显存×gpu_memory_utilization)，free < requested 直接 raise。预算先于一切"
+    },
+    {
+      "n": 2,
+      "where": "gpu_worker.py:L498-L504",
+      "what": "dummy 前向测峰值：memory_profiling 上下文（mem_utils.py:L233-L326）里 profile_run（gpu_model_runner.py:L6433-L6506）以 max_num_tokens 假数据跑一遍真前向+采样；峰值账 non_kv_cache_memory = total_consumed + transient_peak_headroom（L317-L326）——权重/激活峰/NCCL 等 non-torch 全计入，KV 之前的全部债主先还清"
+    },
+    {
+      "n": 3,
+      "where": "gpu_worker.py:L544-L548",
+      "what": "差价定可用：CUDA graph 若启用先 profile_cudagraph_memory 估图池（VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS 默认开，envs.py:L295；等价 util 日志 L568-L605 提示 0.92 已含图池账）→ available_kv = requested − non_kv_cache_memory − cudagraph 估计——一行减法定出 KV 池的全部本金"
+    },
+    {
+      "n": 4,
+      "where": "gpu_model_runner.py:L7800-L7837",
+      "what": "每层自报形状：get_kv_cache_spec 遍历模型 attention 层收 KVCacheSpec（FullAttention/SlidingWindow/ChunkedLocal/Mamba…）；每层每块页物理公式 real_page_size_bytes = 2×block_size×kv_heads×head_dim×dtype（kv_cache_interface.py:L211-L226）——分组与字节换块数的原料都在 spec 里"
+    },
+    {
+      "n": 5,
+      "where": "kv_cache_utils.py:L1781-L1852",
+      "what": "混合组化：get_kv_cache_groups——uniform 模型全层一组（多数模型）；混合模型按 spec 分桶合并，页大小先统一（L1070-L1132：调大较小层 block_size / Mamba 按状态形状 pad），组数等量化加 padding 层（L1248-L1256 警告 \"may waste at most N% KV cache memory\"）；--disable-hybrid-kv-cache-manager 回退全按 full 分配（L1568-L1589 警告不做省显存优化）"
+    },
+    {
+      "n": 6,
+      "where": "kv_cache_utils.py:L2094-L2242",
+      "what": "定账与护栏：get_kv_cache_configs——护栏四道（check_enough 至少装下一条 max_model_len L854-L879、不够二分估可行长度 L800-L851、auto-fit max_model_len=-1 L1988-L2049、override 折算不漂账 L2159-L2179）→ num_blocks = available // page_size // group_size（get_num_blocks L993-L1010）→ PP 各 rank 取最小并按比例缩张量（L2210-L2223）→ 容量/并发日志（L2225-L2240）"
+    },
+    {
+      "n": 7,
+      "where": "engine/core.py:L304-L332",
+      "what": "一份账喂两侧：同一份 KVCacheConfig 是唯一真相——调度器侧 generate_scheduler_kv_cache_config（L1855-L1874）拍平成代表 spec；worker 侧 initialize_from_config（gpu_worker.py:L650-L676）在 CuMem tag=\"kv_cache\" 池内真分配张量；auto-fit 缩了 max_model_len 要 collective_rpc 同步 worker（L311-L313）；num_gpu_blocks/block_size/容量写回 cache_config（L315-L326）——两侧 num_blocks 必须一致，单源即防漂"
+    },
+    {
+      "n": 8,
+      "where": "scheduler.py:L276-L290",
+      "what": "账本就位：resolve_kv_cache_block_sizes（kv_cache_utils.py:L626-L688：多组时 scheduler_block_size=各组块 LCM、hash_block_size=GCD 或 prefix_match_unit 覆盖、须整除否则回退/报错）→ KVCacheManager(watermark=scheduler_config.watermark)（L289）→ coordinator 装配：一个 BlockPool + 每组一个 manager（kv_cache_coordinator.py:L90-L120），get_manager_for_kv_cache_spec 顺手给 SWA/chunked-local 注入准入上限（single_type:L1861-L1877）"
+    },
+    {
+      "n": 9,
+      "where": "scheduler.py:L973-L985",
+      "what": "入场过门（full-ISL）：allocate_slots(full_sequence_must_fit=scheduler_reserve_full_isl——默认 True，config/scheduler.py:L130-L134) → kv_cache_manager.py:L472-L488 按整条序列算块对比 free——chunked prefill 只查第一个 chunk 的超收漏洞（#39734 死锁温床）由这道门堵上；回收型 spec 同时夹到准入上限（single_type:L178-L192，铁律注释见机制账 m11）"
+    },
+    {
+      "n": 10,
+      "where": "kv_cache_manager.py:L521-L527",
+      "what": "水位与稳态门：watermark_blocks = watermark × num_blocks（L168-L171，默认 0.0 即关）；只在本步已有调度请求且状态 ∈ {WAITING, PREEMPTED} 时计入（L463-L470——精修版水位，非 v0 全局垫片）；required = 块数+watermark ≤ free − reserved，否则 None（→ ch11 抢占；decode-heavy 抖动机理与复现配置 benchmarks/kv_cache_watermark.sh:L7-L19）"
+    },
+    {
+      "n": 11,
+      "where": "single_type_kv_cache_manager.py:L622-L659",
+      "what": "窗外回收与 null 占位：SWA 的 get_num_skipped_tokens = max(0, computed − sliding_window + 1)（L1057-L1083，docstring 自带 ASCII 图）→ remove_skipped_blocks 把窗外整块 free 归池、原位换 null_block——块表第 i 块仍对应第 i×block_size 个 token（docstring 例 [NULL, NULL, block7, block8]），位置对齐不断裂；full attention 基类恒 0 从不回收"
+    },
+    {
+      "n": 12,
+      "where": "block_table.py:L270-L336",
+      "what": "worker 多组落地：MultiGroupBlockTable 每 KV 组一张表；分配块大小 ≠ kernel 块大小时 map_to_kernel_blocks（L221-L248）细分——32-token 内存块拆 2×16 kernel 块（gpu_model_runner.py:L7644-L7651 注释举 256→4×64 例）；张量按 config 的 shared_by 跨组共享（get_kv_cache_config_from_groups 通用分支 L1411-L1437：每池由每组各出一层）——账本块号与 kernel 视图在此对齐"
+    }
+  ],
+  "stations_note": "站号 = 账本从诞生到把门的过程顺序：第 1-4 站是启动期一次性测量（快照定预算 → dummy 前向测峰值 → cudagraph 估计差价 → 每层自报 spec）；第 5-8 站是定账与装配（组化 → 护栏+定块数 → 一份账喂两侧 → 账本就位）；第 9-10 站是运行期请求入场要过的两道门（full-ISL 准入门 → 水位门——门的所有预算参数都来自启动账本，运行期不再重算）；第 11-12 站是运行期账本的动态面（SWA 窗外回收+null 占位、worker 侧多组/kernel 细分落地）。正文按讲解需要编排——建议先立『饼多大』（profile 三步）再立『门多紧』（准入门+水位），混合组化可作第三幕；#39734 死锁教训作为门的 why 锚点贯穿。",
+  "key_classes": [
+    {
+      "name": "MemorySnapshot / MemoryProfilingResult / memory_profiling",
+      "file": "vllm/utils/mem_utils.py",
+      "responsibility": "显存测量的三件套：快照（torch 峰值/已分配/空闲/total/non-torch 六类读数）、profile 结果（non_kv_cache_memory = total_consumed + transient_peak_headroom）、上下文管理器（前测/跑 profile_run/后测/算差）。docstring 自带 1GiB/2GiB/0.5GiB 三类显存量级例。"
+    },
+    {
+      "name": "Worker.request_memory / determine_available_memory / initialize_from_config",
+      "file": "vllm/v1/worker/gpu_worker.py + vllm/v1/worker/utils.py",
+      "responsibility": "账本的 worker 侧三步：request_memory 定预算（total×util，free 不足 raise）；determine_available_memory 跑 profile_run + cudagraph 估计出 available_kv 字节；initialize_from_config 按 config 在 CuMem tag=\"kv_cache\" 池内分配张量并把 num_blocks 写回 cache_config。"
+    },
+    {
+      "name": "KVCacheSpec 家族（AttentionSpec/FullAttentionSpec/SlidingWindowSpec/ChunkedLocalAttentionSpec/MambaSpec…）",
+      "file": "vllm/v1/kv_cache_interface.py",
+      "responsibility": "每层注意力的自报形状：页物理公式 real_page_size_bytes = 2×block_size×kv_heads×head_dim×dtype；回收型 spec（SWA/chunked-local）带 max_admission_blocks_per_request——启动池大小与运行准入的单一事实源。spec 是组化与字节换块数的全部原料。"
+    },
+    {
+      "name": "get_kv_cache_groups / unify_kv_cache_spec_page_size / _get_kv_cache_groups_uniform_page_size",
+      "file": "vllm/v1/core/kv_cache_utils.py",
+      "responsibility": "混合组化：按 spec 分桶（可 merge 的同型层合桶）、页大小统一（调大较小块/Mamba 状态 pad/stride pad）、组数等量化（padding 层+1.5 启发式+PP layers[i::num_groups] 交错）；六条假设 docstring 是一池共享的硬约束清单。disable 回退 unify_hybrid_kv_cache_specs 把 SWA 当 full 分配。"
+    },
+    {
+      "name": "get_kv_cache_configs / get_kv_cache_config_from_groups / get_num_blocks",
+      "file": "vllm/v1/core/kv_cache_utils.py",
+      "responsibility": "定账总控：合并全 worker spec → 分组 → override 折算 → auto-fit → 逐 worker 护栏（_check_enough + 二分估长）→ 出 KVCacheConfig（张量布局三型：通用 group_size 池/单组异宽逐层/packed）→ PP 取最小缩张量 → 容量/并发日志。get_num_blocks 的 //page//layers 是字节换块数的总算术。"
+    },
+    {
+      "name": "KVCacheConfig / KVCacheGroupSpec / KVCacheTensor",
+      "file": "vllm/v1/kv_cache_interface.py",
+      "responsibility": "账本的产物与传递形态：num_blocks（池块数）、kv_cache_groups（每组=同 spec 层名表+merged spec）、kv_cache_tensors（哪几层共享哪块张量+size/offset/block_stride）。一份 config 双喂：调度器侧 generate_scheduler_kv_cache_config 拍平，worker 侧按张量布局分配。"
+    },
+    {
+      "name": "resolve_kv_cache_block_sizes",
+      "file": "vllm/v1/core/kv_cache_utils.py",
+      "responsibility": "定两个对齐粒度：scheduler_block_size（多组=各组块 LCM，num_computed_tokens 对齐不变量）与 hash_block_size（GCD 或 prefix_match_unit 覆盖；无缓存/无 connector 或 mamba 非 align 时回退 scheduler 粒度）。"
+    },
+    {
+      "name": "KVCacheManager（水位）",
+      "file": "vllm/v1/core/kv_cache_manager.py",
+      "responsibility": "对调度器的门面 + 本章的两道门：watermark_blocks = watermark×num_blocks（L168-L171）；allocate_slots 的 full-ISL 门（L472-L488）与 required ≤ free−reserved−watermark 判定（L510-L527）。"
+    },
+    {
+      "name": "KVCacheCoordinator / get_manager_for_kv_cache_spec",
+      "file": "vllm/v1/core/kv_cache_coordinator.py + vllm/v1/core/single_type_kv_cache_manager.py",
+      "responsibility": "装配形态：一个 BlockPool + 每组一个 SingleTypeKVCacheManager（get_manager_for_kv_cache_spec 按 spec 类型查注册表；SWA/chunked-local 构造时注入准入上限——运行期门与启动期定账的同源装配点）。"
+    },
+    {
+      "name": "SlidingWindowManager（窗外回收）",
+      "file": "vllm/v1/core/single_type_kv_cache_manager.py",
+      "responsibility": "每层类型自知历史的账本落点：get_num_skipped_tokens = max(0, computed − window + 1)；remove_skipped_blocks 把窗外整块 free 归池、原位换 null_block 保块表位置对齐（[NULL, NULL, block7, block8]）。"
+    },
+    {
+      "name": "BlockTable / MultiGroupBlockTable / map_to_kernel_blocks",
+      "file": "vllm/v1/worker/block_table.py",
+      "responsibility": "worker 侧多组落地：每组一张块表；分配块大小≠kernel 块大小时的细分换算（[0,1,2]→[0,1,2,3,4,5]）。kernel 块大小由注意力后端能力决定（协商内景 → ch21）。"
+    },
+    {
+      "name": "EngineCore._initialize_kv_caches",
+      "file": "vllm/v1/engine/core.py",
+      "responsibility": "启动装配总编排：收 spec → determine_available_memory → get_kv_cache_configs → auto-fit 同步 → 拍平喂调度器+写回 cache_config → initialize_from_config。单一事实源注释：两侧 num_blocks 必须一致。"
+    }
+  ],
+  "data_flow": [
+    "总述：本章数据流 = deepread/memory-kv.json data_flow 的 [启动] 段 + deepread/gpu-exec.json why_chains[0]（init_device 三步：DP rank 修正→设备选择→分布式初始化刻意先于显存快照）与 why_chains[12] 的显存对偶半条（determine_available_memory 用 profile_run + profile_cudagraph_memory 把激活峰值与图池都计入 KV cache 预算），引用不重挖。",
+    "【启动·定账】EngineCore.__init__（engine/core.py:L143）→ _initialize_kv_caches（L250）：L257 get_kv_cache_specs（每层 spec，经 gpu_worker.py:L634-L635 转发到 gpu_model_runner.py:L7800）→ L293 determine_available_memory（worker 侧：init_device 早已拍好 init_snapshot/requested_memory gpu_worker.py:L390-L396；profile_run 测 non_kv；cudagraph 估计）→ L304-L306 get_kv_cache_configs（分组+护栏+定块数）→ L311-L313 auto-fit 同步（collective_rpc update_max_model_len）→ L315-L326 generate_scheduler_kv_cache_config 拍平 + num_gpu_blocks/block_size/kv_cache_size_tokens/kv_cache_max_concurrency 写回 cache_config → L330 initialize_from_config（worker 在 CuMem tag=\"kv_cache\" 池内分配，gpu_worker.py:L650-L676）。",
+    "【装配·账本就位】core.py:L156-L158 resolve_kv_cache_block_sizes → L160-L168 Scheduler(...) → scheduler.py:L276-L290 KVCacheManager（watermark L289）→ kv_cache_coordinator.py:L90-L120：一个 BlockPool + 每组 get_manager_for_kv_cache_spec（single_type:L1836-L1878，SWA/chunked-local 注入准入上限）。",
+    "【运行·入场过门】schedule() WAITING 循环（scheduler.py:L973-L985）→ allocate_slots（kv_cache_manager.py:L344）：水位条件计入（L463-L470）→ full-ISL 门（L472-L488，回收型 spec 夹准入上限）→ remove_skipped_blocks 先回收窗外块（L504-L508）→ required ≤ free−reserved−watermark 否则 None（L510-L527）——None 即 ch11 抢占信号的内因。",
+    "【运行·窗口移动】RUNNING 循环 allocate_slots（scheduler.py:L576-L629）每拍调 remove_skipped_blocks（single_type:L622-L659）：SWA 窗外块 free 归池、原位换 null_block——满块哈希保留在表（→ ch15 复用前提）。",
+    "【worker·多组落地】initialize_from_config（gpu_worker.py:L650-L676）→ initialize_kv_cache（gpu_model_runner.py:L7624-L7655）：prepare_kernel_block_sizes 细分（注释 256→4×64）→ initialize_kv_cache_tensors（L7541：按 config 张量布局分配+reshape+bind_kv_cache 绑到层）→ MultiGroupBlockTable 每组一行（block_table.py:L270-L336，append_row 时 map_to_kernel_blocks L221-L248 细分）。"
+  ],
+  "why_chains": [
+    {
+      "id": "WC1",
+      "card": "deepread/memory-kv.json why_chains[1]",
+      "decision": "显存账本：启动时 profile 一次，倒推 num_blocks，配准入护栏与 auto-fit",
+      "old_design": "无系统内账本：直觉是「权重之外全给缓存」，但没有公式回答「到底能开多大 batch/几条并发」；过量分配→中途 OOM，不足→容量浪费压吞吐。",
+      "pain": "被卡的指标是并发容量与稳定性：KV 池是全部 batch 的共享预算，预算错 = OOM 或空转。量级感受（计算例，非源码断言）：Llama-2-7B FP16 每 token KV = 2(K,V)×32 层×32 kv_head×128 head_dim×2B ≈ 0.5 MB/token——24GB 卡权重吃 14GB 后池只剩 ~8GB。",
+      "solution": "启动三步定账：① vllm/v1/worker/gpu_worker.py:L460-L548 determine_available_memory：requested = 总显存×gpu_memory_utilization，跑一次 dummy forward 记峰值，available_kv = requested − 非 KV 占用 − cudagraph 估计（L544-L548；cudagraph 估计默认开启，vllm/envs.py:L295 VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=True）；② vllm/v1/core/kv_cache_utils.py:L2094-L2242 get_kv_cache_configs 把字节换成块数：num_blocks = available // page_size // num_layers（L993-L1010 get_num_blocks），page_size/层 = 2×block_size×num_kv_heads×head_dim×dtype_bytes（vllm/v1/kv_cache_interface.py:L212-L226 AttentionSpec.real_page_size_bytes）；③ 护栏：check_enough_kv_cache_memory 保证至少装下一条 max_model_len 请求（L854-L879）、装不下时二分估计可行长度（L800-L851）、max_model_len=-1 时 auto-fit（L1988-L2049）、PP 各 rank 取最小 num_blocks 并按比例缩张量（L2210-L2223）；num_gpu_blocks_override 可人工凌驾且账本同步折算（L962-L969 + L2165-L2179）。单一事实源：engine/core.py:L304-L306 调用，同一份 config 喂调度器与全部 worker。",
+      "cost": "profile 是快照不是保证——真实负载激活峰可能超过 dummy run，只能靠 gpu_memory_utilization<1 留头寸；cudagraph 估计占账（默认 0.92 util 已含）；override 配错 = OOM（源码在 L2165-L2179 专门折算避免账本漂移，但数值本身仍靠人）。"
+    },
+    {
+      "id": "WC2",
+      "card": "deepread/memory-kv.json why_chains[6]（本章消费组化/页统一/null_block/kernel 细分半条；不动点命中归 ch15）",
+      "decision": "混合注意力模型：一个 BlockPool、每组一张块表、null_block 占位、不动点收敛的多组最长命中",
+      "old_design": "早期 v1 只有一张块表；混合模型（Gemma3 5:1 SWA:full、LLaMA4 3:1 local:full、Mamba 混合）要么不支持，要么退化为「全部按 full attention 分配」。这条退路今天仍在：--disable-hybrid-kv-cache-manager 时 unify_hybrid_kv_cache_specs 打 warning 原话「we do not enable any optimizations for saving KV cache memory (e.g., dropping the KV cache outside the sliding window)」（kv_cache_utils.py:L1568-L1589）。",
+      "pain": "SWA 层只需要窗口内 token，按 full 分配时窗口外的块全在白占显存——混合模型的可用并发被显存虚耗直接卡死。",
+      "solution": "按 KVCacheSpec 把层分成 kv_cache_groups（get_kv_cache_groups，kv_cache_utils.py:L1781-L1852），每组一个 SingleTypeKVCacheManager 子类（spec→manager 注册表 single_type_kv_cache_manager.py:L1836-L1942），各组共用一个 BlockPool（kv_cache_coordinator.py:L90-L96；硬约束=每组每块物理字节数相等，假设清单 kv_cache_utils.py:L1169-L1198）。页大小不等时先统一：调大较小层 block_size、Mamba 按状态形状 pad（unify_kv_cache_spec_page_size，L1070-L1132）。SWA 窗口外的块被释放并原地换成 null_block 占位以保持块表与 token 位置对齐（remove_skipped_blocks，single_type:L622-L659；命中表形如 [NULL, NULL, block7, block8]，docstring L588-L591）。跨类型最长命中用迭代不动点：每种注意力类型要么接受当前候选长度要么收缩之，full attention 排最前因其向下封闭（HybridKVCacheCoordinator.find_longest_cache_hit，kv_cache_coordinator.py:L685-L817；简单混合一轮即收敛 L717-L720；full 组只查一次后纯裁剪 L738-L745）。对齐粒度：scheduler_block_size = 各组块大小 LCM、hash_block_size = GCD（或 prefix_match_unit 覆盖）——resolve_kv_cache_block_sizes（kv_cache_utils.py:L626-L688）；粗块哈希用「链尾即前缀指纹」惰性重串：16 粒度的第 2 个哈希已经覆盖 0-31，可直接当 32 粒度哈希用（BlockHashListWithBlockSize，L2245-L2315，docstring 带图表）。GPU 侧 MultiGroupBlockTable 每组一张表、必要时把大块拆成 kernel 块（vllm/v1/worker/block_table.py:L270-L376、L221-L248 map_to_kernel_blocks）。",
+      "cost": "① 等量化组要加 padding 层——12 SW+13 full 补成 13/13，warning 明说「may waste at most N% KV cache memory」（L1248-L1265，1.5 启发式）；② 不动点最坏多轮往返；③ 官方承认 find_longest_cache_hit 只干净支持「full + 恰好一种其它类型」（假设 6，L1189-L1194）；④ null_block 的 ref_cnt 不维护需处处特判（block_pool.py:L187-L191）；⑤ 混合下 hash_block_size < block_size 引出细粒度命中/CoW 整套复杂度（→ ch15）。"
+    },
+    {
+      "id": "WC3",
+      "card": "deepread/memory-kv.json why_chains[8]（本章消费①准入门+②回收感知上限；③新块清零已归 ch13 第 8 站、④CoW→ch15、⑤指标作注脚）",
+      "decision": "护栏组合：整序列准入门 + 回收感知准入上限 + 新块清零 + CoW 拷贝管线 + 采样式驻留指标",
+      "old_design": "chunked prefill 只检查第一个 chunk 的块需求——一条比池还长的请求可能被放进来，prefill 中途才发现装不下（死锁/中途 OOM 的温床，issue #39734）。回收型 spec（SWA）的稳态块数远小于全长，但准入门若按全长算会把并发压到浪费，若按 chunk 算又可能超收。",
+      "pain": "被卡的指标是活性（不崩溃）与并发利用率的平衡：门太松死锁、太紧浪费容量。",
+      "solution": "① full-ISL 准入门：allocate_slots 先按整序列算块数对比空闲块（含水位），不够直接 None 拒之门外（kv_cache_manager.py:L472-L488；scheduler_reserve_full_isl 默认 True，vllm/config/scheduler.py:L130；传入 scheduler.py:L982）。② 回收感知准入上限：SWA/chunked-local 的 admission cap = cdiv(window-1+max_in_flight_tokens, block_size)+1，与启动期池大小器同源（vllm/v1/kv_cache_interface.py:L522-L546、L587-L608 docstring「Single source of truth for both startup pool sizing and the runtime admission gate」；运行时应用于 get_num_blocks_to_allocate 的 apply_admission_cap，single_type:L179-L191）。③ 新块清零：调度器每步 drain 新块 id（take_new_block_ids kv_cache_manager.py:L796-L801 → scheduler.py:L1260-L1272 _get_new_block_ids_to_zero，含 async-load 覆写区跳过集合 _skip_zero_block_ids L1043-L1052），worker 用 KVBlockZeroer 清零，理由注释原话「to prevent stale NaN/data from corrupting attention or SSM computation」（gpu_model_runner.py:L1219-L1222）；加载失败区补登记 record_blocks_for_zeroing（start_token 必须块对齐，kv_cache_manager.py:L817-L829）。④ CoW 拷贝管线：kv_cache_block_copies 跨进程到 worker 原地拷贝（gpu_model_runner.py:L1223-L1228）。⑤ 1% 采样驻留指标（vllm/v1/core/kv_cache_metrics.py:L46-L96：块生命周期/空闲时长/复用间隔，驱逐时落账；access_history 限长 4）。",
+      "cost": "① 整序列门更保守 = batch 可能装不满（吞吐换活性）；SWA 用准入上限换回部分并发；② 清零 kernel 每步一次、即将被 prefill 全量覆写的块也被清 = 浪费带宽（部分由 skip 集合缓解）；③ 指标是抽样非全量，只够调参用；④ CoW 拷贝管线让调度器输出多一类负载体、worker 多一类副作用，两端必须对账（retained 块的释放带步序栅栏）。"
+    },
+    {
+      "id": "WC4",
+      "card": "deepread/memory-kv.json why_chains[5]（本章消费「预测器与分配器严格同构 + 准入上限单源化」半条；slots/引用计数/GC 优化已归 ch13）",
+      "decision": "调度器侧纯 CPU 元数据账本 + 引用计数共享 + 预测器与分配器严格同构",
+      "old_design": "v0 的 BlockSpaceManager：watermark 全局静态垫片（默认 1%）、per-SequenceGroup 块核算、PhysicalTokenBlock 对象反复分配。",
+      "pain": "v1 主战场是调度器 CPU 时间：高并发下每步为几百个请求算块需求，dict/对象分配/GC 会压垮调度循环；保守垫片直接浪费容量。",
+      "solution": "整个账本是纯 CPU 元数据：KVCacheBlock 为 slots dataclass，仅 block_id/ref_cnt/_block_hash/_block_hash_num_tokens/prev/next/is_null 七个字段（vllm/v1/core/kv_cache_utils.py:L117-L138）。共享靠引用计数：新请求命中同哈希前缀时 touch 使 ref_cnt+1 并把块从自由队列摘出（block_pool.py:L702-L717）；free 使 ref_cnt-1、归零才回自由队列（L719-L742）。需求预测与实际分配共用同一套数学：get_num_blocks_to_allocate（single_type_kv_cache_manager.py:L144-L230）把「可驱逐的命中块也要占容量」数进去（L221-L230 num_evictable_blocks），先预测后分配，不够则 None→抢占，不再需要静态垫片。可回收 spec（SWA/chunked-local）加 per-request 准入上限且与启动期池大小器同源（L179-L191 + vllm/v1/kv_cache_interface.py:L522-L546、L587-L608；注释明言「Drift between the two would re-introduce the deadlock from issue #39734 or, worse, mid-prefill OOM」）。对外只暴露 KVCacheBlocks 包装，docstring 原话「to hide KVCacheManager's internal data structure from the Scheduler」（kv_cache_manager.py:L32-L53）；预构空对象 empty_kv_cache_blocks 避免 GC（L180-L187）。",
+      "cost": "① 预测器必须与分配器严格同构——漂移即死锁/OOM，靠注释+准入上限单源化防御，无运行时校验；② 每请求每步 O(块数) Python 循环仍在，靠侵入式链表+slots+预构空对象压 GC，是持续性能战场；③ 元数据与 GPU 真相分离，需要 block_id 跨进程契约兜底（ch13 已讲）。"
+    },
+    {
+      "id": "WC5",
+      "card": "deepread/memory-kv.json why_chains[4]（本章消费水位半条；抢占外部行为已归 ch11、free 保留哈希→ch15）",
+      "decision": "分配失败→抢占：只重算（recompute-only），前缀缓存让重算变便宜；v0.27.1 重新引入水位（watermark）抑制抢占抖动",
+      "old_design": "v0 双模抢占：PreemptionMode.SWAP（KV 换到 CPU pinned 内存）/ RECOMPUTE（丢弃重算），两路都维护（v0.6.6 vllm/core/scheduler.py 可考）。v1 只留 recompute，v0.21.0 把 swap_space 参数直接回「deprecated and ignored」（vllm/entrypoints/llm.py v0.21.0 tag）。但 v1 裸奔两代后发现新痛点（见 pain）——v0.27.1 用「精修版水位」回应：只在准入 waiting/preempted 请求且本步已有调度请求时才保留 headroom，而非 v0 那种全局静态垫片。",
+      "pain": "裸 recompute 的死穴是准入时的信息缺口：输入长度有 full-ISL 准入门兜底，但输出长度未知不预留。decode-heavy 负载（output >> input）高并发下「短时超收 → 全体增长 → 池尽 → 抢占刚准入的请求 → 重 prefill → 再抢占」循环抖动。官方 benchmark 脚本头部写明此机理（benchmarks/kv_cache_watermark.sh:L7-L16 原话「the scheduler preempts (recompute) recently-admitted requests, re-prefills them later, and repeats」；复现配置：并发 128-200、input ~1000、output ~5000、KV 池压到均值需求的 ~1.5×）。commit 4085ff7cb 2026-06-11 \"[Core] Add kvcache watermark to reduce preemptions (#44594)\"。",
+      "solution": "抢占路径：allocate_slots 返回 None 即触发（vllm/v1/core/sched/scheduler.py:L576-L629）——FCFS 弹 running 队尾（PRIORITY 策略选 priority 最大者，L590-L613）；_preempt_request（L1274-L1315）：释放全部块、num_computed_tokens=0、num_preemptions+1、塞回 waiting 队头。重算之所以付得起：free 掉的满块不清哈希（free_blocks 不动 block_hash，block_pool.py:L719-L742），仍留哈希表当驱逐候选——被抢占请求重新调度时 get_computed_blocks（scheduler.py:L745-L766）会重新命中自己的前缀，「重算」变成「重载元数据+补算」。水位路径：watermark_blocks = watermark × num_blocks（vllm/v1/core/kv_cache_manager.py:L168-L171）；只在 has_scheduled_reqs 且请求状态 ∈ {WAITING, PREEMPTED} 时计入 required_blocks（L463-L470 + L521-L527）；配置项默认 0.0 即关闭（vllm/config/scheduler.py:L136-L141，scheduler.py:L289 传入）。",
+      "cost": "① 水位 = 吞吐换稳定：headroom 块位空闲不接客，解码增长才有缓冲——默认关闭、留给用户按负载调；② 抢占最坏情况无界：若被抢占期间块已被挤出哈希表，重算就是完整 prefill 重来；③ 被抢占请求 TTBT 直接受损（公平换活性）；④ 正确性依赖「块表 append-only + 哈希保留」隐式链路，任何一环清哈希都退化为全量重算。"
+    },
+    {
+      "id": "WC6",
+      "card": "deepread/gpu-exec.json why_chains[12]（本章消费显存对偶半条：profile 把激活峰与图池计入 KV 预算；warmup/编译/捕获编排归 ch19）",
+      "decision": "编译/捕获/warmup/防退化全部前移启动期，运行期零惊喜",
+      "old_design": "惰性编译/首次触发捕获：第一个真实请求承受 JIT 编译与图捕获的长尾延迟（首 token 延迟尖刺数百 ms～秒级）。",
+      "pain": "Triton JIT / inductor 编译 / 意外 cudagraph 捕获 / GC 暂停 / CPU-GPU sync，任何一样在服务期触发 = 单拍延迟尖刺，对 SLO 是事故。",
+      "solution": "Worker.compile_or_warm_up_model 编排启动流水（vllm/v1/worker/gpu_worker.py:L678-L853）：warmup_sizes 逐个 _dummy_run（L680-L709，compile_ranges 补边界尺寸 L695-L703）→ kernel_warmup 调优 kernel（L713）→ capture_model 逐形状捕获（L715-L717；实际 vs 估计图池对比日志 L719-L733）→ V1 路径：末 PP 段 _dummy_sampler_run 预分配 logits/采样缓冲（L796-L816，NOTE \"This is called after capture_model on purpose to prevent memory buffers from being cleared by empty_cache\"）→ trigger_inductor_lazy_init 预热 inductor 进程级惰性初始化（L822-L830，注释 \"rather than on a later compile cache-miss at runtime\"）→ activate_jit_monitor 任何意外 JIT 编译直接暴露（L832-L839）→ freeze_gc_heap 冻结堆停止 GC 扫描静态对象（L841-L844）→ enable_gpu_sync_check 开同步纠察（L846-L848）。显存侧对偶：determine_available_memory 用 profile_run + profile_cudagraph_memory 把激活峰值与图池都计入 KV cache 预算（L459-L611）。v0.27 新增 startup_plan（import L76-L79、maybe_apply_startup_plan L472、maybe_save_startup_plan L791）：把测得的 KV 内存建议落盘，复跑时提示直接用 --kv-cache-memory 跳过 profiling 漂移。",
+      "cost": "启动时间显著拉长（warmup+编译+捕获 5-20s+，CompileTimes 专门回传 abstract.py:L122-L137）；启动期 dummy 数据的形状假设若与真实流量不符，运行期踩到未捕获形状（回退 eager，性能突降）；profile 的显存估计偏保守会吃掉 KV cache 空间（150MiB 冗余缓冲 gpu_worker.py:L749）。"
+    }
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/worker/utils.py",
+      "lines": "L409-L429",
+      "what": "request_memory：预算先于一切。requested = ceil(总显存 × gpu_memory_utilization)（默认 0.92，per-instance：同卡跑两个 vLLM 各设 0.5 互不干扰）；free < requested 直接 raise——还没 profile 就先回答『你最多能用多少』。",
+      "code": "def request_memory(init_snapshot: MemorySnapshot, cache_config: CacheConfig) -> int:\n    \"\"\"\n    Calculate the amount of memory required by vLLM, then validate\n    that the current amount of free memory is sufficient for that.\n    \"\"\"\n    requested_memory = math.ceil(\n        init_snapshot.total_memory * cache_config.gpu_memory_utilization\n    )\n\n    if init_snapshot.free_memory < requested_memory:\n        raise ValueError(\n            f\"Free memory on device {init_snapshot.device_} \"\n            f\"({format_gib(init_snapshot.free_memory)}/\"\n            f\"{format_gib(init_snapshot.total_memory)} GiB) on startup \"\n            f\"is less than desired GPU memory utilization \"\n            f\"({cache_config.gpu_memory_utilization}, \"\n            f\"{format_gib(requested_memory)} GiB). Decrease GPU memory \"\n            f\"utilization or reduce GPU memory used by other processes.\"\n        )\n\n    return requested_memory",
+      "elide": [
+        "docstring 可压缩为一句：计算并校验本实例的显存预算"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_worker.py",
+      "lines": "L498-L548",
+      "what": "determine_available_memory 的核心段：memory_profiling 上下文里跑一次 profile_run（dummy 前向）测非 KV 占用；CUDA graph 若启用则预捕估图池；最后一行减法定出 KV 池本金 available_kv = requested − non_kv_cache_memory − cudagraph_memory_estimate_applied。",
+      "code": "        # Execute a forward pass with dummy inputs to profile the memory usage\n        # of the model.\n        with memory_profiling(\n            self.init_snapshot,\n            weights_memory=int(self.model_runner.model_memory_usage),\n        ) as profile_result:\n            self.model_runner.profile_run()\n\n        # Profile CUDA graph memory if graphs will be captured.\n        # ROCm is included: #44825 moved the profiler to\n        # torch.accelerator.get_memory_info (reliable on ROCm, as used by\n        # the AMD-CI mem tests), and graph_pool_handle resolves to the same\n        # torch.cuda handle the live capture path already uses on ROCm.\n        # XPU stays excluded (see #39977).\n        cudagraph_memory_estimate = 0\n        if (\n            current_platform.is_cuda_alike()\n            and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE\n        ):\n            cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()\n\n        # Respect the opt-in flag as originally designed.\n        cudagraph_memory_estimate_applied = (\n            cudagraph_memory_estimate\n            if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS\n            else 0\n        )\n\n        self.total_consumed = profile_result.total_consumed\n        self.peak_activation_memory = (\n            profile_result.transient_peak_headroom + cudagraph_memory_estimate_applied\n        )\n        self.cudagraph_memory_estimate = cudagraph_memory_estimate\n\n        free_gpu_memory = profile_result.after_profile.free_memory\n        # NOTE(woosuk): Here we assume that the other processes using the same\n        # GPU did not change their memory usage during the profiling.\n        assert self.init_snapshot.free_memory >= free_gpu_memory, (\n            \"Error in memory profiling. \"\n            f\"Initial free memory {format_gib(self.init_snapshot.free_memory)} GiB, \"\n            f\"current free memory {format_gib(free_gpu_memory)} GiB. \"\n            \"This happens when other processes sharing the same container \"\n            \"release GPU memory while vLLM is profiling during initialization. \"\n            \"To fix this, ensure consistent GPU memory allocation or \"\n            \"isolate vLLM in its own container.\"\n        )\n        self.available_kv_cache_memory_bytes = (\n            self.requested_memory\n            - profile_result.non_kv_cache_memory\n            - cudagraph_memory_estimate_applied\n        )",
+      "elide": [
+        "L500-L511 ROCm/XPU 注释块只说明平台差异，可一句话带过",
+        "L520-L524 VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS 开关读取（envs.py:L295 默认 True）",
+        "等价 util 提示日志（L568-L605）是教学金句但非控制流，正文引用、精简版可省"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L993-L1010",
+      "what": "get_num_blocks：字节换块数的总算术。num_blocks = available // page_size // num_layers（多组时 num_layers=group_size，见 get_kv_cache_config_from_groups L1426-L1428）；max(num_blocks,0) 防负；may_override_num_blocks 让 num_gpu_blocks_override 人工凌驾（测试抢占用）。",
+      "code": "def get_num_blocks(\n    vllm_config: VllmConfig,\n    num_layers: int,\n    available_memory: int,\n    page_size: int,\n) -> int:\n    \"\"\"\n    Get the number of kv cache blocks.\n\n    Args:\n        vllm_config: The global VllmConfig\n        num_layers: The number of layers\n        available_memory: Memory available for KV cache in bytes.\n        page_size: The page size of the KV cache.\n    \"\"\"\n    num_blocks = int(available_memory // page_size // num_layers)\n    num_blocks = max(num_blocks, 0)\n    return may_override_num_blocks(vllm_config, num_blocks)",
+      "elide": [
+        "may_override_num_blocks（L962-L969）单独一函数只为 override 记日志一次，可并作一行"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L751-L788",
+      "what": "_check_enough_kv_cache_memory：第一道护栏——池至少要装得下一条 max_model_len 的请求。装不下时调 estimate_max_model_len 二分估一个可行长度写进报错（『Based on the available memory, the estimated maximum model length is …』），引导用户调 util 或降 max_model_len。",
+      "code": "def _check_enough_kv_cache_memory(\n    available_memory: int,\n    get_needed_memory: Callable[[], int],\n    max_model_len: int,\n    estimate_max_model_len: Callable[[int], int],\n):\n    if available_memory <= 0:\n        raise ValueError(\n            \"No available memory for the cache blocks. \"\n            \"Try increasing `gpu_memory_utilization` when initializing the engine \"\n            \"(this flag also controls CPU memory reservation on the CPU \"\n            \"backend, despite its name). \"\n            \"See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ \"\n            \"for more details.\"\n        )\n\n    needed_memory = get_needed_memory()\n\n    if needed_memory > available_memory:\n        estimated_max_len = estimate_max_model_len(available_memory)\n        estimated_msg = \"\"\n        if estimated_max_len > 0:\n            estimated_msg = (\n                \"Based on the available memory, \"\n                f\"the estimated maximum model length is {estimated_max_len}. \"\n            )\n\n        raise ValueError(\n            f\"To serve at least one request with the model's max seq len \"\n            f\"({max_model_len}), ({format_gib(needed_memory)} GiB KV \"\n            f\"cache is needed, which is larger than the available KV cache \"\n            f\"memory ({format_gib(available_memory)} GiB). {estimated_msg}\"\n            f\"Try increasing `gpu_memory_utilization` (which also controls \"\n            f\"CPU memory on the CPU backend) or decreasing `max_model_len` \"\n            f\"when initializing the engine. \"\n            f\"See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ \"\n            f\"for more details.\"\n        )",
+      "elide": [
+        "报错文案里的官网链接可省"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L820-L851",
+      "what": "estimate_max_model_len：二分搜索可行长度。fits_in_memory 临时改写 max_model_len 再算 max_memory_usage_bytes —— 内存需求随长度单调不减，二分 O(log L) 收敛；finally 恢复原值保无副作用。",
+      "code": "    # Save the original max_model_len to restore after estimation\n    original_max_model_len = vllm_config.model_config.max_model_len\n\n    # Define a function to check if a given model length fits in memory\n    def fits_in_memory(model_len: int) -> bool:\n        # Temporarily modify the max_model_len for this calculation\n        vllm_config.model_config.max_model_len = model_len\n        # Calculate memory needed for the given model length\n        memory_needed = max_memory_usage_bytes(vllm_config, kv_cache_spec.values())\n        return memory_needed <= available_memory\n\n    try:\n        # Binary search for the maximum model length\n        left, right = 1, original_max_model_len\n\n        # If even the smallest model length doesn't fit, return 0\n        if not fits_in_memory(left):\n            return 0\n\n        # Binary search for the maximum model length that fits\n        result = 1\n        while left <= right:\n            mid = (left + right) // 2\n            if fits_in_memory(mid):\n                result = mid\n                left = mid + 1\n            else:\n                right = mid - 1\n        return result\n    finally:\n        # Always restore the original max_model_len to avoid side effects\n        vllm_config.model_config.max_model_len = original_max_model_len",
+      "elide": [
+        "L820-L823 保存原值的样板可压缩"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L2129-L2184",
+      "what": "get_kv_cache_configs 前半：五步流程的 docstring（合并全 worker spec → 全模型分组 → auto-fit/护栏按 per-worker 投影 → 逐 worker 出 config → PP 取最小）+ 实现：合并断言同层同 spec → get_kv_cache_groups → PP 投影 → override 时把 available_memory 折算成 override×每块字节（账本不漂移）→ auto-fit。",
+      "code": "    # Merge the KV cache specs of all workers. Different PP stages may have\n    # different layer names, and different TP ranks of the same PP stage should\n    # have the same KV cache spec.\n    merged_kv_cache_specs: dict[str, KVCacheSpec] = {}\n    for kv_cache_spec_one_worker in kv_cache_specs:\n        for layer_name, layer_spec in kv_cache_spec_one_worker.items():\n            if layer_name not in merged_kv_cache_specs:\n                merged_kv_cache_specs[layer_name] = layer_spec\n            else:\n                assert merged_kv_cache_specs[layer_name] == layer_spec, (\n                    \"The KV cache specs for the same layer are different \"\n                    \"across workers. This is not supported yet.\"\n                )\n\n    # Check if the KV cache specs are registered correctly.\n    # This is to prevent that some layers are initialized with unregistered specs.\n    KVCacheSpecRegistry.check_kv_cache_spec_registry(merged_kv_cache_specs)\n    # Get global KV cache groups. This also handles spec unification for\n    # hybrid models when disable_hybrid_kv_cache_manager is enabled.\n    # After this call, merged_kv_cache_specs may be modified in-place.\n    global_kv_cache_groups = get_kv_cache_groups(vllm_config, merged_kv_cache_specs)\n\n    # If original_max_model_len was -1, automatically\n    # determine the maximum model length that fits in available GPU memory.\n    # We use per-worker projected groups to account for PP sharding.\n    projected_groups_per_worker = [\n        _project_kv_cache_groups_to_worker(global_kv_cache_groups, worker_spec)\n        for worker_spec in kv_cache_specs\n    ]\n\n    # If `num_gpu_blocks_override` is set, the cache size that will actually\n    # be allocated is decoupled from the profiled `available_memory`:\n    # `may_override_num_blocks` in `get_kv_cache_config_from_groups` clamps\n    # `num_blocks` to the override. Reflect that in `available_memory` here so\n    # auto-fit, the admission check, and the per-worker config builder all\n    # plan against the same effective capacity.\n    override = vllm_config.cache_config.num_gpu_blocks_override\n    if override is not None:\n        adjusted_memory: list[int] = []\n        for groups, avail_mem in zip(projected_groups_per_worker, available_memory):\n            if not groups:\n                adjusted_memory.append(avail_mem)\n                continue\n            bytes_per_block = _pool_bytes_per_block(vllm_config, groups)\n            logger.info(\n                \"Overriding num_gpu_blocks=%d with num_gpu_blocks_override=%d\",\n                avail_mem // bytes_per_block,\n                override,\n            )\n            adjusted_memory.append(override * bytes_per_block)\n        available_memory = adjusted_memory\n\n    if vllm_config.model_config.original_max_model_len == -1:\n        _auto_fit_max_model_len(\n            vllm_config, projected_groups_per_worker, available_memory\n        )",
+      "elide": [
+        "L2138-L2141 跨 worker spec 不一致的 assert 可保留一句",
+        "L2143-L2145 spec 注册表检查（防未注册层）可一句话带过"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L2186-L2242",
+      "what": "get_kv_cache_configs 后半：逐 worker 护栏 → get_kv_cache_config_from_groups 出 KVCacheConfig → PP 各 rank 取最小 num_blocks 并按比例缩张量（不空耗显存）→ 容量日志：GPU KV cache size（tokens）与最大并发倍数（max_concurrency = num_blocks / 每请求块和，混合布局按组求和也正确）。",
+      "code": "    # Check if the available memory is enough per worker.\n    for groups, avail_mem in zip(projected_groups_per_worker, available_memory):\n        if not groups:\n            continue\n        _check_enough_kv_cache_memory(\n            avail_mem,\n            partial(_max_memory_usage_bytes_from_groups, vllm_config, groups),\n            vllm_config.model_config.max_model_len,\n            partial(_estimate_max_model_len_from_groups, vllm_config, groups),\n        )\n\n    kv_cache_configs: list[KVCacheConfig] = []\n    for projected_groups, kv_cache_spec_one_worker, available_memory_one_worker in zip(\n        projected_groups_per_worker, kv_cache_specs, available_memory\n    ):\n        assert sum(len(group.layer_names) for group in projected_groups) == len(\n            kv_cache_spec_one_worker\n        ), \"Some layers are not assigned to any group.\"\n        kv_cache_configs.append(\n            get_kv_cache_config_from_groups(\n                vllm_config, projected_groups, available_memory_one_worker\n            )\n        )\n\n    # Change the num_blocks of each rank to the smallest among all ranks.\n    # We also need to shrink the tensor size proportionally to avoid\n    # allocating unused memory.\n    min_num_blocks = min(\n        kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs\n    )\n    for kv_cache_config in kv_cache_configs:\n        num_blocks_old = kv_cache_config.num_blocks\n        kv_cache_config.num_blocks = min_num_blocks\n\n        # Shrink tensor size proportionally\n        for tensor in kv_cache_config.kv_cache_tensors:\n            assert tensor.size % num_blocks_old == 0\n            tensor.size = tensor.size // num_blocks_old * min_num_blocks\n\n        if len(kv_cache_config.kv_cache_groups) > 0:\n            max_model_len = vllm_config.model_config.max_model_len\n            # GPU KV cache size in tokens = max_concurrency * max_model_len:\n            # the total tokens of context the pool can hold at peak\n            # utilization. Sourcing this from the concurrency calculation\n            # handles hybrid layouts correctly.\n            num_tokens, max_concurrency = get_kv_cache_capacity(\n                vllm_config, kv_cache_config\n            )\n\n            logger.info_once(\"GPU KV cache size: %s tokens\", f\"{num_tokens:,}\")\n            logger.info_once(\n                \"Maximum concurrency for %s tokens per request: %.2fx\",\n                f\"{max_model_len:,}\",\n                max_concurrency,\n            )\n\n    return kv_cache_configs",
+      "elide": [
+        "L2201-L2203 assert 可省"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L1091-L1132",
+      "what": "unify_kv_cache_spec_page_size 的换算主体：页大小不齐时以最大页为基准——普通注意力层调大 block_size（页随块线性放大）；Mamba 层页由状态形状决定不随块缩放、改为物理 pad；不能整除且后端不支持按 stride 索引则 NotImplementedError。",
+      "code": "    page_sizes = {layer.page_size_bytes for layer in kv_cache_spec.values()}\n    if len(page_sizes) <= 1:\n        # All layers have the same page size, no need to unify.\n        return kv_cache_spec\n\n    max_page_size = max(page_sizes)\n    new_kv_cache_spec = {}\n    for layer_name, layer_spec in kv_cache_spec.items():\n        if layer_spec.page_size_bytes == max_page_size:\n            new_kv_cache_spec[layer_name] = layer_spec\n        elif isinstance(layer_spec, MambaSpec):\n            # MambaSpec's page size is determined by its state shapes and does\n            # not scale with block_size, so pad the page instead. This is the\n            # same padding mechanism the platform uses to align Mamba pages\n            # with the main model's attention page size; it is needed here\n            # when another layer (e.g. from a draft model) has a larger page\n            # than the already-aligned Mamba page.\n            new_spec: KVCacheSpec = replace(layer_spec, page_size_padded=max_page_size)\n            assert new_spec.page_size_bytes == max_page_size\n            new_kv_cache_spec[layer_name] = new_spec\n        else:\n            layer_page_size = layer_spec.page_size_bytes\n            if max_page_size % layer_page_size == 0:\n                ratio = max_page_size // layer_page_size\n                new_block_size = layer_spec.block_size * ratio\n                new_spec = replace(layer_spec, block_size=new_block_size)\n            elif (\n                isinstance(layer_spec, AttentionSpec)\n                and layer_spec.indexes_kv_by_block_stride\n            ):\n                new_spec = replace(layer_spec, page_size_padded=max_page_size)\n            else:\n                raise NotImplementedError(\n                    f\"Layer {layer_name}: page size is not divisible by the \"\n                    \"maximum page size and cannot be padded. Padding is only \"\n                    \"supported for attention layers whose backend indexes KV \"\n                    \"pages by the block stride (indexes_kv_by_block_stride is \"\n                    \"True).\"\n                )\n            assert new_spec.page_size_bytes == max_page_size\n            new_kv_cache_spec[layer_name] = new_spec\n    return new_kv_cache_spec",
+      "elide": [
+        "L1101-L1110 Mamba pad 的注释块讲历史缘由，可留一句"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L1169-L1198",
+      "what": "_get_kv_cache_groups_uniform_page_size 的六条假设（docstring）：等物理块字节 across 组、组内同 block_size、每 token 每层字节由模型定、每组层数相同（padding 补齐）、组内同注意力类型、find_longest_cache_hit 只干净支持 full+恰一种其它类型（假设 6 官方自认）。三条『层数/token 字节/每组层数相同』共同保证每组每块物理字节相等——一池共享的硬约束。",
+      "code": "    To simplify the implementation, we make the following assumptions:\n    1. Physical memory per block: Must be the same across all KV cache groups.\n    Breaking this assumption is non-trivial due to memory fragmentation concerns\n    when allocating blocks of different sizes.\n    2. Tokens per block (block_size): Currently, we directly use\n    `CacheConfig.block_size` for all layers. It can be extended to vary by KV\n    cache group, but within each KV cache group, all layers must share the same\n    block size.\n    3. Physical memory per token per layer: This property is decided by model\n    config. Currently we only support models that have the same physical memory\n    per token per layer for all layers. Can be relaxed with a simple extension,\n    but still need to keep physical memory per block the same for all groups.\n    4. Number of layers per group: Currently assumed the same for all layers.\n    Can be relaxed with a simple extension, but still need to keep physical\n    memory per block the same for all groups.\n    5. Attention type within groups: All layers in a group must share the same\n    attention type. One exception is that, when\n    `--disable-hybrid-kv-cache-manager` is true, the single group for full\n    attention layers may also include attention layers using sliding window or\n    LLaMA 4 local attention. See `unify_hybrid_kv_cache_specs` for more details.\n    6. Support for multiple attention types: The design for most components is\n    general to an arbitrary number of attention types. But\n    `find_longest_cache_hit` only supports one attention type or two\n    types of full-attention plus exactly one another type. The general\n    implementation of this function is feasible but we don't know how to\n    implement it cleanly yet.\n\n    As we assume tokens per block, physical memory per token per layer, and\n    number of layers per group are the same now, we can ensure that physical\n    memory per block is the same for all groups.",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L1233-L1279",
+      "what": "等量化组与 PP 交错：各类型层数补齐到同一 group_size（padding 层触发 warning『may waste at most N% KV cache memory』）；组大小取各类型层数最小值（开源混合模型全是 n:1 模式），1.5 启发式让 12 SW+13 full 补成 13/13 而非 12/24；PP 时用 layers[i::num_groups] 交错分派避免某 stage 出空组。",
+      "code": "    # Split each group into smaller groups, to make the number of layers in each\n    # group identical. Add padding to the last group of each type if necessary.\n    # E.g., (full.0, full.1), (sw.0, sw.1, sw.2)\n    # split to 3 groups with 2 layers each:\n    # (full.0, full.1), (sw.0, sw.2), (sw.1, padding).\n    # FIXME(Chen): At the moment of writing this code (2025-06-02), all\n    # open-source hybrid model follows a n:1 pattern between different attention\n    # types (e.g., Gemma3 5:1 between sw and full, LLaMA4 3:1 between local and\n    # full), so we can use the \"1\" in the n:1 pattern as the group size, which\n    # is the minimum number of layers among all attention types. Need a better\n    # strategy if we want to support more complex patterns (e.g., 20 full + 30\n    # sw, where the group size should be 10).\n    min_num_layers = min([len(layers) for layers in layer_buckets])\n    group_size = min_num_layers\n    max_num_layers = max([len(layers) for layers in layer_buckets])\n    if max_num_layers < min_num_layers * 1.5:\n        # If the number of layers is not much larger than the minimum number of\n        # layers, use the maximum number of layers as the group size to avoid\n        # too many padding layers. A typical example is gpt-oss-20b + eagle,\n        # with 12 sw + 13 full. We pad it to (13 sw, 13 full) instead of\n        # (12 sw, 24 full). 1.5 is a heuristic to avoid too many padding\n        # layers while accommodating speculative decoding drafters that add\n        # extra layers to one attention type.\n        group_size = max_num_layers\n    grouped_layers = []\n    for layers in layer_buckets:\n        num_padding_layers = group_size - len(layers) % group_size\n        if num_padding_layers != group_size:\n            logger.warning(\n                \"Add %d padding layers, may waste at most %.2f%% KV cache memory\",  # noqa\n                num_padding_layers,\n                num_padding_layers / len(layers) * 100,\n            )\n        num_groups = cdiv(len(layers), group_size)\n        # In PP case, say if we have\n        # - stage 0: full.0, sw.0, sw.1\n        # - stage 1: full.1, sw.2, sw.3\n        # We should have 3 groups: (full.0, full.1), (sw.0, sw.2), (sw.1, sw.3)\n        # It can't be (full.0, full.1), (sw.0, sw.1), (sw.2, sw.3) because\n        # the 3 groups in stage 0 will be (full.0), (sw.0, sw.1), (empty group)\n        # and it will be padded to (full.0, padding), (sw.0, sw.1),\n        # (padding, padding) to ensure the number of layers in each group is\n        # the same and will cause memory waste.\n        # To avoid this, we assign layers[i::num_groups] to the i-th group\n        # instead of layers[i * group_size: (i + 1) * group_size]\n        for i in range(num_groups):\n            grouped_layers.append(layers[i::num_groups])",
+      "elide": [
+        "L1266-L1275 PP 注释块举例讲为什么交错，教学可用图复述"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L1568-L1589",
+      "what": "unify_hybrid_kv_cache_specs：--disable-hybrid-kv-cache-manager 的回退——把 SWA 当 full 分配，warning 原话『we do not enable any optimizations for saving KV cache memory (e.g., dropping the KV cache outside the sliding window)』：窗口外 KV 白占显存，但滑窗计算本身仍省。这条退路今天仍在。",
+      "code": "def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):\n    \"\"\"\n    This function tries to convert the KV cache specs to one type if the model\n    is a hybrid model with multiple type of KV cache. It will convert all\n    SlidingWindowSpec to FullAttentionSpec if both types are present.\n\n    Args:\n        kv_cache_spec: The kv cache spec of each attention layer in the model\n    \"\"\"\n\n    if is_kv_cache_spec_uniform(\n        kv_cache_spec\n    ) or UniformTypeKVCacheSpecs.is_uniform_type(kv_cache_spec):\n        return\n\n    logger.warning(\n        \"Hybrid KV cache manager is disabled for this hybrid model, \"\n        \"This means we do not enable any optimizations for saving KV cache \"\n        \"memory (e.g., dropping the KV cache outside the sliding window). \"\n        \"The compute of layers like sliding window is still saved.\"\n    )\n    kv_cache_spec.update(_promote_local_kv_cache_specs(kv_cache_spec))",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L1411-L1437",
+      "what": "get_kv_cache_config_from_groups 通用分支：group_size 个内存池、每池由每组各出一层共享（注释带三组两层的 ASCII 图例 full.0/sw.0/sw.1 共一张、full.1/sw.2 共一张）；num_blocks = available // page_size // group_size；每组块表不同、物理上却可以共享张量——因为一个 block_id 同一时刻只归一个组用。",
+      "code": "    else:\n        # General case:\n        # We will have group_size memory pools, each is shared by one layer from\n        # each group. As layers of different groups have different block table,\n        # they will use different parts of the shared Tensor.\n        # The memory layout for 3 groups (full.0, full.1), (sw.0, sw.2),\n        # (sw.1, padding) will be: (group_size = 2)\n        # full.0, sw.0, sw.1: share a Tensor with size=available_memory//2\n        # full.1, sw.2: share another Tensor with size=available_memory//2\n        group_size = max(len(group.layer_names) for group in kv_cache_groups)\n\n        page_size = get_uniform_page_size(\n            [group.kv_cache_spec for group in kv_cache_groups]\n        )\n        assert group_size > 0, \"group_size must be greater than 0\"\n        num_blocks = get_num_blocks(\n            vllm_config, group_size, available_memory, page_size\n        )\n        kv_cache_tensors = []\n        for i in range(group_size):\n            shared_by = []\n            for j in range(len(kv_cache_groups)):\n                if i < len(kv_cache_groups[j].layer_names):\n                    shared_by.append(kv_cache_groups[j].layer_names[i])\n            kv_cache_tensors.append(\n                KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)\n            )",
+      "elide": [
+        "L1417-L1419 ASCII 图例建议正文配图复述"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L626-L688",
+      "what": "resolve_kv_cache_block_sizes：定 (scheduler_block_size, hash_block_size)。单组时两者都 = block_size×dcp；多组时 scheduler = 各组块的 LCM（num_computed_tokens 对齐不变量），hash = prefix_match_unit 覆盖或各组块 GCD（每个组的块大小都必须整除它，否则 ValueError）；无前缀缓存也无 connector 时 hash 退回 scheduler 粒度；mamba 非 align 模式破坏整除性也回退。",
+      "code": "def resolve_kv_cache_block_sizes(\n    kv_cache_config: KVCacheConfig,\n    vllm_config: VllmConfig,\n) -> tuple[int, int]:\n    \"\"\"Resolve (scheduler_block_size, hash_block_size).\n\n    - ``scheduler_block_size`` is the token-alignment invariant used by the\n      scheduler (e.g. for ``num_computed_tokens`` rounding). Single group:\n      ``cache_config.block_size * dcp``. Multiple groups: LCM of every\n      group's effective block size. Attention groups are scaled by DCP;\n      Mamba groups keep their full per-rank state and are not scaled.\n    - ``hash_block_size`` is the granularity at which ``Request.block_hashes``\n      is computed. Single group: equals scheduler block size. Multiple groups:\n      ``cache_config.prefix_match_unit`` override if set, else the GCD of\n      group block sizes; every group's block size must be divisible by it.\n      Returns the scheduler block size (i.e. disables finer hashing) if block\n      hashing is inactive or a mamba group's block size diverges from the\n      cache block size (mamba_cache_mode != \"align\").\n    \"\"\"\n    cache_config = vllm_config.cache_config\n    dcp = vllm_config.parallel_config.decode_context_parallel_size\n    groups = kv_cache_config.kv_cache_groups\n\n    if len(groups) <= 1:\n        bs = cache_config.block_size * dcp\n        return bs, bs\n\n    group_block_sizes = [\n        g.kv_cache_spec.block_size * dcp\n        if isinstance(g.kv_cache_spec, AttentionSpec)\n        else g.kv_cache_spec.block_size\n        for g in groups\n    ]\n    scheduler_block_size = math.lcm(*group_block_sizes)\n\n    # Block hashes are only consumed by prefix caching and KV connectors\n    # (P/D, offloading); when neither is active, keep hash_block_size equal\n    # to the scheduler block size.\n    connector_enabled = vllm_config.kv_transfer_config is not None\n    if not (cache_config.enable_prefix_caching or connector_enabled):\n        return scheduler_block_size, scheduler_block_size\n\n    # Mamba groups with block_size != cache_config.block_size\n    # (mamba_cache_mode != \"align\") break divisibility; back off to the\n    # scheduler block size.\n    if any(\n        isinstance(g.kv_cache_spec, MambaSpec)\n        and g.kv_cache_spec.block_size != cache_config.block_size\n        for g in groups\n    ):\n        return scheduler_block_size, scheduler_block_size\n\n    requested = cache_config.prefix_match_unit\n    hash_block_size = (\n        requested if requested is not None else math.gcd(*group_block_sizes)\n    )\n    if any(bs % hash_block_size != 0 for bs in group_block_sizes):\n        raise ValueError(\n            f\"Invalid prefix_match_unit={hash_block_size}; all KV cache group \"\n            f\"block sizes must be divisible by prefix_match_unit. \"\n            f\"Got group block sizes={group_block_sizes}.\"\n        )\n    return scheduler_block_size, hash_block_size",
+      "elide": [
+        "L645-L647 与 L664-L667 的 dcp/connector 判定可各留一句"
+      ]
+    },
+    {
+      "path": "vllm/v1/kv_cache_interface.py",
+      "lines": "L587-L618",
+      "what": "SlidingWindowSpec.max_admission_blocks_per_request：回收感知准入上限 = cdiv(sliding_window−1 + max_in_flight_tokens, block_size) + 1。docstring 原话『Single source of truth for both startup pool sizing (`max_memory_usage_bytes`) and the runtime admission gate』——同一个方法喂启动期池大小器与运行期准入门，漂移即 #39734 死锁。max_memory_usage_bytes 直接拿它乘页大小。+1 的理由见注释：窗口可能不从块首开始（block_size 4 存 6-token 窗口 [CDEF] 要两块 [XXCD][EF]）。",
+      "code": "    def max_admission_blocks_per_request(\n        self, max_in_flight_tokens: int, max_model_len: int\n    ) -> int:\n        \"\"\"Per-request admission cap, in blocks.\n\n        Single source of truth for both startup pool sizing\n        (`max_memory_usage_bytes`) and the runtime admission gate. Per-request\n        real-held blocks plateau at this bound because\n        `SlidingWindowManager.remove_skipped_blocks` runs from `allocate_slots`\n        before each chunk's `get_num_blocks_to_allocate`.\n\n        `max_in_flight_tokens` is the max tokens scheduled but not yet settled\n        (one batch per concurrent step); see `VllmConfig.max_in_flight_tokens`.\n        \"\"\"\n        # During chunked prefill, we hold KV for the last `sliding_window-1`\n        # computed tokens plus the in-flight tokens (frees happen on the\n        # processed-token basis); never more than `max_model_len`.\n        num_tokens = min(self.sliding_window - 1 + max_in_flight_tokens, max_model_len)\n        # +1 because the sliding window may not start from the beginning of\n        # the block. E.g. block size 4 and num_token 4 needs two blocks\n        # [XXCD][EF] to store the 6-token window [CDEF].\n        return cdiv(num_tokens, self.block_size) + 1\n\n    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:\n        assert vllm_config.parallel_config.decode_context_parallel_size == 1, (\n            \"DCP not support sliding window.\"\n        )\n        max_blocks = self.max_admission_blocks_per_request(\n            max_in_flight_tokens=vllm_config.max_in_flight_tokens,\n            max_model_len=vllm_config.model_config.max_model_len,\n        )\n        return max_blocks * self.page_size_bytes",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+      "lines": "L178-L192",
+      "what": "get_num_blocks_to_allocate 的准入夹取段：apply_admission_cap=True 时 num_required_blocks 夹到 _max_admission_blocks_per_request。注释是本章的『铁律』原文：remove_skipped_blocks 在每 chunk 的预测前先跑 ⇒ 每请求峰值实持块 ≤ cap ⇒ sum(预约)≤pool ⇔ sum(峰值实持)≤pool；『Drift between the two would re-introduce the deadlock from issue #39734 or, worse, mid-prefill OOM』。",
+      "code": "        num_required_blocks = cdiv(num_tokens, self.block_size)\n        if apply_admission_cap and self._max_admission_blocks_per_request is not None:\n            # Recycling-aware specs (SWA, chunked-local) cap the per-request\n            # reservation here so admission matches the startup pool sizer\n            # (`SlidingWindowSpec.max_admission_blocks_per_request` / its\n            # chunked-local counterpart). `remove_skipped_blocks` runs from\n            # `allocate_slots` before each chunk's `get_num_blocks_to_allocate`,\n            # so per-request peak real-held blocks <= this cap, which keeps\n            # `sum(reservations) <= pool` <=> `sum(peak_real_held) <= pool`.\n            # Drift between the two would re-introduce the deadlock from\n            # issue #39734 or, worse, mid-prefill OOM.\n            num_required_blocks = min(\n                num_required_blocks, self._max_admission_blocks_per_request\n            )\n        num_req_blocks = len(self.req_to_blocks.get(request_id, ()))",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+      "lines": "L1861-L1878",
+      "what": "get_manager_for_kv_cache_spec：按 spec 类型查注册表建 manager；SlidingWindow/ChunkedLocal 顺手把 spec.max_admission_blocks_per_request(...) 注入构造参数——运行期准入上限与启动期池大小器同源的装配点（注释再次强调 single source of truth: the spec method）。R-SWA 不需要独立 cap（prefix+window ≤ max_model_len，继承 full 界）。",
+      "code": "    # SlidingWindow / ChunkedLocalAttention managers recycle blocks;\n    # the runtime admission cap must match the recycling-aware bound the\n    # startup pool sizer uses (single source of truth: the spec method).\n    # R-SWA also recycles gap blocks but peak physical KV still fits the\n    # full-attention bound (prefix + window <= max_model_len), so it inherits\n    # FullAttentionSpec sizing without a separate admission cap.\n    if isinstance(\n        kv_cache_spec,\n        (SlidingWindowSpec, ChunkedLocalAttentionSpec),\n    ):\n        kwargs[\"max_admission_blocks_per_request\"] = (\n            kv_cache_spec.max_admission_blocks_per_request(\n                max_in_flight_tokens=max_in_flight_tokens,\n                max_model_len=max_model_len,\n            )\n        )\n    manager = manager_class(kv_cache_spec, **kwargs)\n    return manager",
+      "elide": [
+        "L1857-L1860 注册表查找与 assert 可压缩"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_manager.py",
+      "lines": "L463-L527",
+      "what": "allocate_slots 的门段：水位只在本步已有调度请求且请求状态 ∈ {WAITING, PREEMPTED} 时计入（精修版水位——不是 v0 的全局静态垫片）；full_sequence_must_fit 先按整条序列算块（含 cap）对比 free；随后 remove_skipped_blocks 先回收窗外块、再按本 chunk 算块，required = 块数 + watermark_blocks ≤ free − reserved_blocks，否则 None = ch11 抢占信号的出生地。",
+      "code": "        watermark_blocks = 0\n        # The watermark is applied to waiting/preempted requests only, and only\n        # when there's at least one request already scheduled.\n        if has_scheduled_reqs and request.status in (\n            RequestStatus.WAITING,\n            RequestStatus.PREEMPTED,\n        ):\n            watermark_blocks = self.watermark_blocks\n\n        if full_sequence_must_fit:\n            # First check and fail if the full request sequence won't fit.\n            full_num_tokens = min(request.num_tokens, self.max_model_len)\n\n            num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(\n                request_id=request.request_id,\n                num_tokens=full_num_tokens,\n                new_computed_blocks=new_computed_block_list,\n                num_encoder_tokens=num_encoder_tokens,\n                total_computed_tokens=total_computed_tokens,\n                num_local_computed_tokens=num_local_computed_tokens,\n                num_tokens_main_model=full_num_tokens,\n                apply_admission_cap=True,\n            )\n            required_blocks = num_blocks_to_allocate + watermark_blocks\n            if required_blocks > self.block_pool.get_num_free_blocks():\n                return None\n\n        num_tokens_main_model = total_computed_tokens + num_new_tokens\n        num_tokens_need_slot = min(\n            num_tokens_main_model + num_lookahead_tokens, self.max_model_len\n        )\n\n        # Free the blocks that are skipped during the attention computation\n        # (e.g., tokens outside the sliding window).\n        # We can do this even if we cannot schedule this request due to\n        # insufficient free blocks.\n        # Should call this function before allocating new blocks to reduce\n        # the number of evicted blocks.\n        # Free on the processed-token basis: in-flight steps' attention windows\n        # still read blocks below the optimistic boundary, and rejected spec\n        # tokens can roll it back.\n        self.coordinator.remove_skipped_blocks(\n            request.request_id,\n            max(0, total_computed_tokens - request.num_in_flight_tokens),\n            num_prompt_tokens=request.num_prompt_tokens,\n        )\n\n        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(\n            request_id=request.request_id,\n            num_tokens=num_tokens_need_slot,\n            new_computed_blocks=new_computed_block_list,\n            num_encoder_tokens=num_encoder_tokens,\n            total_computed_tokens=num_local_computed_tokens\n            + num_external_computed_tokens,\n            num_local_computed_tokens=num_local_computed_tokens,\n            num_tokens_main_model=num_tokens_main_model,\n        )\n\n        # Keep `reserved_blocks` free for other in-flight sequences, and an\n        # additional watermark of headroom for waiting/preempted admissions.\n        available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks\n        required_blocks = num_blocks_to_allocate + watermark_blocks\n        if required_blocks > available_blocks:\n            # Cannot allocate new blocks\n            return None",
+      "elide": [
+        "L495-L508 remove_skipped_blocks 调用带 processed-token 基准（在途步还在读的块不能回收）——细节归 SWA 回收机制，此处一句话",
+        "L529-L547 挂命中块/分新块两段归 ch13 已讲，本段止步于门"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L965-L985",
+      "what": "调度器侧的传门参数：async KV load 时 reserved_blocks = 其它在途 prefill 的预约（防异步加载挤死在途序列）；allocate_slots(..., full_sequence_must_fit=self.scheduler_reserve_full_isl, reserved_blocks=…, has_scheduled_reqs=bool(self.running))——门的三种预算（整序列/预约/水位）全在调用点显式传入。",
+      "code": "                reserved_blocks = 0\n                if load_kv_async:\n                    # An async load holds its blocks for the whole transfer with\n                    # no forward progress and isn't preemptible here. Admit it\n                    # only if it fits in (free - other in-flight reservations), to\n                    # avoid deadlock and predictable preemptions.\n                    reserved_blocks = self._inflight_prefill_reserved_blocks()\n\n                new_blocks = self.kv_cache_manager.allocate_slots(\n                    request,\n                    num_new_tokens,\n                    num_new_computed_tokens=num_new_local_computed_tokens,\n                    new_computed_blocks=new_computed_blocks,\n                    num_lookahead_tokens=effective_lookahead_tokens,\n                    num_external_computed_tokens=num_external_computed_tokens,\n                    delay_cache_blocks=load_kv_async,\n                    num_encoder_tokens=num_encoder_tokens,\n                    full_sequence_must_fit=self.scheduler_reserve_full_isl,\n                    reserved_blocks=reserved_blocks,\n                    has_scheduled_reqs=bool(self.running),\n                )",
+      "elide": [
+        "L945-L963 lookahead 与 encoder 判定可各留一句"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+      "lines": "L622-L659",
+      "what": "remove_skipped_blocks：窗口外块回收。get_num_skipped_tokens 按注意力类型算（基类恒 0=full attention 从不丢）；窗外整块逆序换 null_block 并 free_blocks 归池——null 占位保住『块表第 i 块 ↔ 第 i×block_size 个 token』的位置对齐，注意力照常按表读、读到 null 的位置本来就在窗外不读。",
+      "code": "    def remove_skipped_blocks(\n        self,\n        request_id: str,\n        processed_computed_tokens: int,\n        num_prompt_tokens: int | None = None,\n    ) -> None:\n        \"\"\"\n        Remove and free the blocks that are no longer needed for attention computation.\n        The removed blocks should be replaced by null_block.\n\n        This function depends on `get_num_skipped_tokens`, which need to be implemented\n        differently for each attention type.\n\n        Args:\n            request_id: The request ID.\n            processed_computed_tokens: Computed-token prefix length covering\n                fully processed and committed tokens only (safe to free).\n            num_prompt_tokens: Optional prompt length for attention types (e.g.\n                R-SWA) that evict a middle gap rather than a head prefix. Ignored\n                by the default implementation.\n        \"\"\"\n        del num_prompt_tokens\n        # Remove the blocks that will be skipped during attention computation.\n        num_skipped_tokens = self.get_num_skipped_tokens(processed_computed_tokens)\n        if num_skipped_tokens <= 0:\n            # This indicates that ALL tokens are inside attention window.\n            # Thus we do not need to free any blocks outside attention window.\n            # A typical case is full attention that we never free any token\n            # before the request is finished.\n            return\n        blocks = self.req_to_blocks[request_id]\n        num_skipped_blocks = num_skipped_tokens // self.block_size\n        # `num_skipped_tokens` may include tokens that haven't been allocated yet\n        # (e.g., when the attention window moves into the external computed tokens\n        # range), so we must cap to the number of blocks that currently exist for\n        # this request.\n        num_skipped_blocks = min(num_skipped_blocks, len(blocks))\n        self._remove_blocks_in_range(request_id, 0, num_skipped_blocks)",
+      "elide": [
+        "L643 del num_prompt_tokens（R-SWA 用）可省"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+      "lines": "L1057-L1083",
+      "what": "SlidingWindowManager.get_num_skipped_tokens：max(0, num_computed_tokens − sliding_window + 1)，docstring 自带 8-token 序列、窗口 4、computed 7 的 ASCII 图：tokens 0-3 在窗外被跳过。这是『每层注意力类型自己知道自己要多少历史』在账本侧的落点。",
+      "code": "    def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:\n        \"\"\"\n        Get the number of tokens that will be skipped for attention computation.\n\n        For sliding window, this corresponds to the tokens that are prior to\n        the current sliding window.\n\n        Example:\n        sliding_window=4, num_computed_tokens=7\n\n        Tokens:   [ 0  1  2  3  4  5  6  7 ]\n                  | ---- computed -----|\n                                         ^ next token to be computed\n                               |-----------| sliding window for next token\n                  |--skipped---|\n\n        The current window contains tokens 4~7. Tokens 0~3 will be skipped for\n        attention computation since they are outside the sliding window.\n        Thus, get_num_skipped_tokens(7) == 4.\n\n        Args:\n            num_computed_tokens: The number of tokens that have been computed.\n\n        Returns:\n            The number of tokens that will be skipped for attention computation.\n        \"\"\"\n        return max(0, num_computed_tokens - self.sliding_window + 1)",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/worker/block_table.py",
+      "lines": "L220-L248",
+      "what": "map_to_kernel_blocks：账本块号 → kernel 块号的细分换算。kv_manager 用 32-token 块、kernel 只认 16-token 块时，块 id [0,1,2] 展开成 [0,1,2,3,4,5]——reshape(-1,1)×blocks_per_kv_block + arange 的纯 numpy 算术，append_row 时逐行执行。",
+      "code": "    @staticmethod\n    def map_to_kernel_blocks(\n        kv_manager_block_ids: np.ndarray,\n        blocks_per_kv_block: int,\n        kernel_block_arange: np.ndarray,\n    ) -> np.ndarray:\n        \"\"\"Convert kv_manager_block_id IDs to kernel block IDs.\n\n        Example:\n            # kv_manager_block_ids: 32 tokens,\n            # Kernel block size: 16 tokens\n            # blocks_per_kv_block = 2\n            >>> kv_manager_block_ids = np.array([0, 1, 2])\n            >>> Result: [0, 1, 2, 3, 4, 5]\n\n            # Each kv_manager_block_id maps to 2 kernel block id:\n            # kv_manager_block_id 0 → kernel block id [0, 1]\n            # kv_manager_block_id 1 → kernel block id [2, 3]\n            # kv_manager_block_id 2 → kernel block id [4, 5]\n        \"\"\"\n        if blocks_per_kv_block == 1:\n            return kv_manager_block_ids\n\n        kernel_block_ids = (\n            kv_manager_block_ids.reshape(-1, 1) * blocks_per_kv_block\n            + kernel_block_arange\n        )\n\n        return kernel_block_ids.reshape(-1)",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L301-L330",
+      "what": "_initialize_kv_caches 收尾：auto-fit 若缩了 max_model_len 要 collective_rpc 同步 worker（worker 先于 profile 启动、缓存的是旧值）；generate_scheduler_kv_cache_config 把 worker config 拍平成代表 spec 喂调度器；num_gpu_blocks / block_size / kv_cache_size_tokens / kv_cache_max_concurrency 写回 cache_config（前端日志与 API 看到的就是这些值）；validate_block_size 后 initialize_from_config 让 worker 真正分配张量。",
+      "code": "        # Track max_model_len before KV cache config to detect auto-fit changes\n        max_model_len_before = vllm_config.model_config.max_model_len\n\n        kv_cache_configs = get_kv_cache_configs(\n            vllm_config, kv_cache_specs, available_gpu_memory\n        )\n\n        # If auto-fit reduced max_model_len, sync the new value to workers.\n        # This is needed because workers were spawned before memory profiling\n        # and have the original (larger) max_model_len cached.\n        max_model_len_after = vllm_config.model_config.max_model_len\n        if max_model_len_after != max_model_len_before:\n            self.collective_rpc(\"update_max_model_len\", args=(max_model_len_after,))\n\n        scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)\n        vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks\n        kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups\n        if kv_cache_groups:\n            vllm_config.cache_config.block_size = min(\n                g.kv_cache_spec.block_size for g in kv_cache_groups\n            )\n            num_tokens, max_concurrency = get_kv_cache_capacity(\n                vllm_config, scheduler_kv_cache_config\n            )\n            vllm_config.cache_config.kv_cache_size_tokens = num_tokens\n            vllm_config.cache_config.kv_cache_max_concurrency = max_concurrency\n\n        vllm_config.validate_block_size()\n\n        self.model_executor.initialize_from_config(kv_cache_configs)",
+      "elide": []
+    },
+    {
+      "path": "benchmarks/kv_cache_watermark.sh",
+      "lines": "L5-L27",
+      "what": "水位的官方可复现论证（脚本头注释）：准入只预留输入长度（full-ISL 门管住）但输出长度未知不预留——decode-heavy（output≫input）高并发先超收、后集体长大、池尽抢占刚准入的请求、re-prefill、再抢占循环抖动；水位留一块 headroom 让 running 请求有处可长。默认复现配置：并发 128、input ~1000、output ~5000、KV 池压到均值需求 ~1.5×。",
+      "code": "# Reproducible demonstration of the KV cache watermark (`--watermark`) for\n# reducing preemption thrashing.\n#\n# The watermark is the fraction of total KV cache blocks the scheduler keeps\n# free when admitting a waiting/preempted request into the running queue.\n#\n# Why this workload triggers thrashing:\n#   Requests are admitted based on the KV cache they need *at admission time*.\n#   With `--scheduler-reserve-full-isl` (default) the input length is reserved up\n#   front, but the *output* length is unknown and unreserved. A decode-heavy\n#   workload (output >> input) at high concurrency therefore over-admits while\n#   requests are short, then runs out of KV cache as they all grow during decode\n#   -> the scheduler preempts (recompute) recently-admitted requests, re-prefills\n#   them later, and repeats. The watermark keeps a block of KV cache free so\n#   running requests can grow into it instead of triggering this churn.\n#\n# This script launches `vllm serve` under a deliberately KV-constrained config\n# and a decode-heavy workload, sweeping the watermark across several values, and\n# reports the preemption count (scraped from /metrics), throughput, and latency\n# percentiles for each. It then plots the results.\n#\n# Default workload: concurrency 200, input ~300 tokens, output ~4000 tokens\n# (+/- 20% variance), sized to run each config for ~5 minutes.",
+      "elide": [
+        "L21-L24 实验编排一句话带过"
+      ]
+    },
+    {
+      "path": "vllm/config/scheduler.py",
+      "lines": "L130-L141",
+      "what": "两个门参数的定义：scheduler_reserve_full_isl 默认 True（整序列准入检查，防 chunked prefill 只查第一 chunk 的超收）；watermark 默认 0.0 关闭（[0,1) 区间，『admitting waiting or preempted requests into the running queue』时保留的空闲块比例）。",
+      "code": "    scheduler_reserve_full_isl: bool = True\n    \"\"\"If True, the scheduler checks whether the full input sequence length\n    fits in the KV cache before admitting a new request, rather than only\n    checking the first chunk. Prevents over-admission and KV cache thrashing\n    with chunked prefill.\"\"\"\n\n    watermark: float = Field(default=0.0, ge=0.0, lt=1.0)\n    \"\"\"Fraction of total KV cache blocks to keep free (the watermark) when\n    admitting waiting or preempted requests into the running queue. This headroom\n    helps avoid frequent KV cache eviction and the resulting repeated preemption\n    of requests when GPU memory is scarce. Must be in the range [0.0, 1.0); 0.0\n    (the default) disables the watermark.\"\"\"",
+      "elide": []
+    }
+  ],
+  "theory": [
+    "每 token KV 显存公式：per_token = 2(K,V) × L 层 × kv_heads × head_dim × dtype_bytes。计算例（非源码断言，deepread 卡口径）：Llama-2-7B FP16 = 2×32×32×128×2B = 524288B ≈ 0.5MB/token；每层每 token = 16KB。『显存是主角』的量化起点。",
+    "块数换算 worked example：block_size=16（DEFAULT_BLOCK_SIZE，config/cache.py:L47），Llama-7B 每层每块页 = 16×16KB = 256KB（real_page_size_bytes）。若 profile 出 available_kv = 8GiB、全 attention 单组 group_size=32 层：num_blocks = 8×2^30 // 262144 // 32 = 1024 块；池容量 = 1024×16 = 16384 token；max_model_len=4096 时最大并发 ≈ 1024 / cdiv(4096,16)=256 = 4 条（get_max_concurrency_for_kv_cache_config 的算法，kv_cache_utils.py:L937-L959）。",
+    "回收感知准入上限推导：SWA 稳态每请求实持 = 窗口内 + 在途 = cdiv(sliding_window−1+max_in_flight_tokens, block_size)+1。+1 的块内错位：块大小 4、窗口 6 token [CDEF] 需两块 [XXCD][EF]（kv_cache_interface.py:L604-L608 注释原例）。单源铁律的不等式（single_type:L183-L186 注释）：remove_skipped_blocks 每拍先跑 ⇒ 每请求峰值实持 ≤ cap ⇒ sum(预约) ≤ pool ⇔ sum(峰值实持) ≤ pool——启动期与运行期用同一个方法算 cap，漂移即 #39734 死锁或 mid-prefill OOM。",
+    "水位经济学：准入时信息缺口——输入长度有 full-ISL 门预留，输出长度未知不预留。decode-heavy（output≫input）高并发：短时超收 → 集体增长 → 池尽 → 抢占刚准入者 → 重 prefill → 再抢占（benchmarks/kv_cache_watermark.sh:L7-L19 官方论证；复现配置并发 128、input ~1000、output ~5000、KV ~1.5×均值需求）。headroom = watermark×num_blocks 空闲不接客，换 running 请求有处可长；默认 0.0 关闭——吞吐换稳定，交给用户按负载调。",
+    "LCM/GCD 对齐：多组时调度对齐粒度 scheduler_block_size = lcm(各组 block_size)（num_computed_tokens 必须对所有组的块边界对齐）；哈希粒度 hash_block_size = gcd 或 prefix_match_unit 覆盖（每组块大小都必须整除它，否则 ValueError，kv_cache_utils.py:L682-L687）。计算例：组块 16 与 32 → scheduler=32 / hash=16；mamba 非 align 模式破坏整除性 → 回退 scheduler 粒度（L671-L676）。",
+    "等量化组 padding 的浪费上界：组大小 = 各类型层数的最小值（开源混合模型均为 n:1 模式，FIXME 注释 L1238-L1244）；层数比 < 1.5 时取 max 免得 padding 过多（12 SW+13 full → 13/13 而非 12/24，L1248-L1256）；浪费 ≤ padding层数/组内层数，warning 原话「may waste at most N% KV cache memory」（L1261-L1265）。",
+    "二分估可行长度的正确性：fits(len) = max_memory_usage_bytes(len) ≤ available 随 len 单调不减（每层 KV 只增不减）→ 标准 upper-bound 二分 O(log max_model_len)；auto-fit 在各 worker 投影组上分别二分取最小（limiting worker，L2016-L2025），全程 try/finally 恢复原值。",
+    "一份账两侧一致性的结构保证：get_kv_cache_configs 是唯一产出 KVCacheConfig 的地方（engine/core.py:L304-L306 单点调用）；调度器侧拿 generate_scheduler_kv_cache_config 拍平版（UniformTypeKVCacheSpecs 任取代表层）、worker 侧按 kv_cache_tensors 布局分配；PP 取最小 num_blocks（L2210-L2223）保证各 rank 相同——调度器与所有 worker 看到的 num_blocks 永远相等，靠结构而非运行时对账。"
+  ],
+  "mechanisms": [
+    {
+      "id": "m1",
+      "name": "启动三步定账：request_memory（预算）→ determine_available_memory（profile 差价）→ get_kv_cache_configs（字节换块数）——饼有多大一次算清",
+      "kind": "config",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/worker/utils.py:L409-L429",
+        "vllm/v1/worker/gpu_worker.py:L459-L548",
+        "vllm/v1/core/kv_cache_utils.py:L2094-L2242",
+        "vllm/v1/engine/core.py:L293-L306"
+      ]
+    },
+    {
+      "id": "m2",
+      "name": "memory_profiling 三类显存与峰值账：non_kv_cache_memory = total_consumed + transient_peak_headroom（权重/激活峰/非 torch 全计入）",
+      "kind": "algorithm",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/utils/mem_utils.py:L233-L326",
+        "vllm/utils/mem_utils.py:L317-L326",
+        "vllm/v1/worker/gpu_model_runner.py:L6433-L6506"
+      ]
+    },
+    {
+      "id": "m3",
+      "name": "CUDA graph 内存估计入账：profile_cudagraph_memory 估图池 + VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS（默认开，等价 util 日志）——图池吃 KV 预算",
+      "kind": "config",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/v1/worker/gpu_worker.py:L506-L548",
+        "vllm/v1/worker/gpu_model_runner.py:L6508-L6532",
+        "vllm/envs.py:L295"
+      ]
+    },
+    {
+      "id": "m4",
+      "name": "护栏四道：check_enough（至少装下一条 max_model_len）+ 二分估可行长度 + auto-fit（max_model_len=-1）+ override 折算 + PP 取最小缩张量",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_utils.py:L751-L788",
+        "vllm/v1/core/kv_cache_utils.py:L800-L851",
+        "vllm/v1/core/kv_cache_utils.py:L1988-L2049",
+        "vllm/v1/core/kv_cache_utils.py:L2159-L2179",
+        "vllm/v1/core/kv_cache_utils.py:L2210-L2223"
+      ]
+    },
+    {
+      "id": "m5",
+      "name": "混合组化 get_kv_cache_groups：spec 分桶可合并 / 组数等量化（padding 层 + 1.5 启发式 + PP layers[i::n] 交错）/ disable 回退不省显存",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_utils.py:L1781-L1852",
+        "vllm/v1/core/kv_cache_utils.py:L1205-L1279",
+        "vllm/v1/core/kv_cache_utils.py:L1248-L1265",
+        "vllm/v1/core/kv_cache_utils.py:L1568-L1589"
+      ]
+    },
+    {
+      "id": "m6",
+      "name": "页大小统一 unify_kv_cache_spec_page_size：调大较小层 block_size / Mamba 状态 pad / stride pad——每组每块物理字节相等的硬约束（六条假设）",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_utils.py:L1070-L1132",
+        "vllm/v1/core/kv_cache_utils.py:L1169-L1198"
+      ]
+    },
+    {
+      "id": "m7",
+      "name": "张量共享布局三型：通用 group_size 池每池各组出一层（一个 block_id 同时刻只归一组）/ 单组异宽逐层各一 / packed 重叠别名",
+      "kind": "layout",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_utils.py:L1361-L1443",
+        "vllm/v1/core/kv_cache_utils.py:L1411-L1437",
+        "vllm/v1/core/kv_cache_utils.py:L1283-L1358"
+      ]
+    },
+    {
+      "id": "m8",
+      "name": "resolve_kv_cache_block_sizes：scheduler_block_size=各组块 LCM（对齐不变量）/ hash_block_size=GCD 或 prefix_match_unit（整除校验；无缓存或 mamba 非 align 回退）",
+      "kind": "algorithm",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_utils.py:L626-L688",
+        "vllm/v1/engine/core.py:L156-L158"
+      ]
+    },
+    {
+      "id": "m9",
+      "name": "一份账喂两侧：generate_scheduler_kv_cache_config 拍平喂调度器 / worker initialize_from_config 在 CuMem tag=kv_cache 池分配 / num_gpu_blocks·block_size·容量写回 cache_config",
+      "kind": "protocol",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_utils.py:L1855-L1874",
+        "vllm/v1/worker/gpu_worker.py:L649-L676",
+        "vllm/v1/engine/core.py:L304-L332"
+      ]
+    },
+    {
+      "id": "m10",
+      "name": "full-ISL 准入门：整序列预留 vs 只查第一 chunk 的超收漏洞（scheduler_reserve_full_isl 默认 True）——#39734 的第一半根治",
+      "kind": "protocol",
+      "difficulty": "core",
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L973-L985",
+        "vllm/v1/core/kv_cache_manager.py:L472-L488",
+        "vllm/config/scheduler.py:L130-L134"
+      ]
+    },
+    {
+      "id": "m11",
+      "name": "回收感知准入上限 max_admission_blocks_per_request：cdiv(window−1+max_in_flight_tokens, bs)+1，启动池大小与运行准入单源（spec 方法）——预测器=分配器同构铁律（#39734 注释原文）",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/kv_cache_interface.py:L519-L546",
+        "vllm/v1/kv_cache_interface.py:L587-L618",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L178-L192",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L1861-L1877"
+      ]
+    },
+    {
+      "id": "m12",
+      "name": "精修版水位 watermark：watermark_blocks=watermark×num_blocks，只对 WAITING/PREEMPTED 且本步已有调度请求保留 headroom——吞吐换稳定（默认 0 关；decode-heavy 抖动机理官方脚本论证）",
+      "kind": "config",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_manager.py:L168-L171",
+        "vllm/v1/core/kv_cache_manager.py:L463-L470",
+        "vllm/v1/core/kv_cache_manager.py:L521-L527",
+        "vllm/config/scheduler.py:L136-L141",
+        "benchmarks/kv_cache_watermark.sh:L5-L27"
+      ]
+    },
+    {
+      "id": "m13",
+      "name": "SWA 窗外回收与 null_block 原位占位：get_num_skipped_tokens=max(0,computed−window+1) → 窗外整块 free 归池换 null，块表位置对齐不断裂（[NULL,NULL,block7,block8]）",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/single_type_kv_cache_manager.py:L622-L659",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L1057-L1083",
+        "vllm/v1/core/block_pool.py:L187-L191"
+      ]
+    },
+    {
+      "id": "m14",
+      "name": "kernel 块细分与多组块表：map_to_kernel_blocks（32-token 内存块拆 2×16 kernel 块，[0,1,2]→[0..5]）+ MultiGroupBlockTable 每组一表（后端协商内景 → ch21）",
+      "kind": "layout",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/worker/block_table.py:L221-L248",
+        "vllm/v1/worker/block_table.py:L270-L336",
+        "vllm/v1/worker/gpu_model_runner.py:L7644-L7655"
+      ]
+    },
+    {
+      "id": "m15",
+      "name": "并发容量核算：max_concurrency = num_blocks / Σ_groups cdiv(每请求字节, page)（混合布局按组求和也正确）；kv_cache_size_tokens = 并发×max_model_len 写回 config 与日志",
+      "kind": "algorithm",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_utils.py:L937-L959",
+        "vllm/v1/core/kv_cache_utils.py:L1877-L1887",
+        "vllm/v1/engine/core.py:L322-L326"
+      ]
+    },
+    {
+      "id": "m16",
+      "name": "gpu_memory_utilization 语义与 profile 快照局限：per-instance 预算（默认 0.92，同卡多实例各设各的）；profile 是快照不是保证——其他进程显存变化被 assert 拒、真实负载峰可能超 dummy run，靠 util<1 留头寸",
+      "kind": "config",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/config/cache.py:L68-L75",
+        "vllm/v1/worker/gpu_worker.py:L533-L543",
+        "vllm/v1/worker/utils.py:L414-L427"
+      ]
+    }
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {
+        "what": "profile_run 里的 multimodal encoder profiling 段（gpu_model_runner.py:L6434-L6490：mm_budget/encoder cache/嵌入-only 模式各分支）",
+        "why_safe": "纯文本主线不触发多模态；删后 profile_run = dummy 前向 + 采样器，控制流不变"
+      },
+      {
+        "what": "determine_available_memory 的 kv_cache_memory_bytes 手动凌驾早退分支（gpu_worker.py:L474-L496）与 maybe_apply_startup_plan（L472）",
+        "why_safe": "手动指定 KV 内存的旁路（复跑建议路径，WC6）；删除后默认 profile 主线不变；startup_plan 的落盘/复用同理（maybe_save_startup_plan）"
+      },
+      {
+        "what": "reserve_mm_ipc_gpu_memory 包装（L492-L496 / L607-L611）",
+        "why_safe": "多模态 IPC 显存预留的包装函数，主线返回值语义不变（取 int 即可）"
+      },
+      {
+        "what": "DeepSeekV4/SlidingWindowMLA 特路：group_and_unify_kv_cache_specs + _get_kv_cache_groups_uniform_groups + _approximate_gcd + _annotate_eagle_groups_deepseek_v4 + packed 布局三件（_get_packed_kv_cache_layout/_use_packed_kv_cache_config/_get_kv_cache_config_packed）",
+        "why_safe": "单一模型家族的特化路径；正文以 why 注一句话点名 packed 重叠布局即可；通用分组+通用张量布局足以完整演示账本"
+      },
+      {
+        "what": "R-SWA（RSWASpec/RSWAManager）、SinkFullAttention、CrossAttention、HiddenStateCacheSpec 相关分组分支与 manager",
+        "why_safe": "扩展注意力类型，主路径（full+SWA+chunked-local+mamba 点名）已覆盖组化的全部原理"
+      },
+      {
+        "what": "eagle/投机解码相关（eagle_group_ids、is_eagle_group 判定、_annotate_eagle_groups_deepseek_v4）",
+        "why_safe": "投机解码草稿层专用标注，不影响定账与门"
+      },
+      {
+        "what": "retention_interval 校验（_validate_prefix_cache_retention_interval，coordinator L30-L57）与 VLLM_PREFIX_CACHE_RETENTION_INTERVAL",
+        "why_safe": "稀疏驻留属 ch15 前缀缓存域"
+      },
+      {
+        "what": "DCP/PCP 乘子（decode_context_parallel_size/prefill_context_parallel_size 的缩放）与 CP 交错",
+        "why_safe": "上下文并行的缩放因子，单卡恒 1"
+      },
+      {
+        "what": "metrics_collector / KVCacheMetricsCollector / enable_kv_cache_events 全部调用",
+        "why_safe": "统计与事件旁路，删除后行为不变"
+      },
+      {
+        "what": "engine/core.py 的 non_causal 检查段（L259-L279）与 VLLM_ELASTIC_EP_SCALE_UP_LAUNCH 弹性分支（L139-L140、L283-L289、L331）",
+        "why_safe": "Prefix LM 专用与弹性 EP 专用分支，主线启动装配序不变"
+      },
+      {
+        "what": "gpu_worker.py 的 weight_transfer_config 段（L444-L450）与 debug/等价 util 日志块（L550-L562；L568-L605 教学引用可保留在正文、精简版可省）",
+        "why_safe": "RL 权重传输与日志，无控制流影响"
+      },
+      {
+        "what": "_project_kv_cache_groups_to_worker 中 UniformTypeKVCacheSpecs 的逐层重建内景（L2076-L2083）",
+        "why_safe": "PP 投影对 DSV4 型组规格的重建细节；保留函数与过滤逻辑即可"
+      },
+      {
+        "what": "kv_cache_manager.py allocate_slots 中 lookahead/encoder/external (connector) 参数分支（L490-L547 的 lookahead 封顶与 external 分配）",
+        "why_safe": "本章只讲到门（L463-L527）；挂块/分块的门内部分归 ch13 已建精简版——implementer 若做本章精简版，以门段+组化+定账为骨架"
+      }
+    ],
+    "must_keep": [
+      {
+        "symbol": "request_memory",
+        "why": "预算第一步：total×util + free 不足 raise——『预算先于一切』"
+      },
+      {
+        "symbol": "gpu_memory_utilization",
+        "why": "0.92 默认、per-instance 语义（config/cache.py:L68-L75），读者要会调"
+      },
+      {
+        "symbol": "init_snapshot",
+        "why": "显存快照基线（NCCL 先行的理由挂它）"
+      },
+      {
+        "symbol": "requested_memory",
+        "why": "requested = total×util 的实例字段"
+      },
+      {
+        "symbol": "determine_available_memory",
+        "why": "profile 差价的三步主函数"
+      },
+      {
+        "symbol": "profile_run",
+        "why": "dummy 前向测激活峰（max_num_tokens 假数据跑真前向）"
+      },
+      {
+        "symbol": "memory_profiling",
+        "why": "三类显存的上下文管理器（before/after 快照差）"
+      },
+      {
+        "symbol": "MemoryProfilingResult",
+        "why": "峰值账的载体"
+      },
+      {
+        "symbol": "non_kv_cache_memory",
+        "why": "= total_consumed + transient_peak_headroom——KV 之前全部债主的总账"
+      },
+      {
+        "symbol": "transient_peak_headroom",
+        "why": "激活峰值预留（GC 后也还着的部分）"
+      },
+      {
+        "symbol": "total_consumed",
+        "why": "mem_get_info 口径的总消耗（可穿 pluggable allocator）"
+      },
+      {
+        "symbol": "profile_cudagraph_memory",
+        "why": "图池估计（为何图池吃 KV 预算）"
+      },
+      {
+        "symbol": "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS",
+        "why": "估计开关（默认 True，等价 util 日志）"
+      },
+      {
+        "symbol": "available_kv_cache_memory_bytes",
+        "why": "一行减法的产物：KV 池本金"
+      },
+      {
+        "symbol": "get_kv_cache_spec",
+        "why": "每层自报形状的入口"
+      },
+      {
+        "symbol": "KVCacheSpec",
+        "why": "组化与换算的原料类型"
+      },
+      {
+        "symbol": "AttentionSpec",
+        "why": "页公式所在的基类"
+      },
+      {
+        "symbol": "FullAttentionSpec",
+        "why": "最常见 spec（全历史）"
+      },
+      {
+        "symbol": "SlidingWindowSpec",
+        "why": "回收型 spec 代表（带准入上限）"
+      },
+      {
+        "symbol": "ChunkedLocalAttentionSpec",
+        "why": "另一回收型 spec"
+      },
+      {
+        "symbol": "MambaSpec",
+        "why": "状态型页（pad 统一的特例）"
+      },
+      {
+        "symbol": "real_page_size_bytes",
+        "why": "页物理公式 2×bs×kv_heads×head_dim×dtype"
+      },
+      {
+        "symbol": "page_size_bytes",
+        "why": "pad 后的实际页（unify 的目标）"
+      },
+      {
+        "symbol": "max_memory_usage_bytes",
+        "why": "护栏的『需要多少』口径（回收型=cap×页）"
+      },
+      {
+        "symbol": "get_kv_cache_groups",
+        "why": "组化总入口（uniform/混合/回退三路）"
+      },
+      {
+        "symbol": "unify_kv_cache_spec_page_size",
+        "why": "页统一（等字节硬约束的执行者）"
+      },
+      {
+        "symbol": "get_uniform_page_size",
+        "why": "统一页大小断言（多组共享的前提）"
+      },
+      {
+        "symbol": "create_kv_cache_group_specs",
+        "why": "组规格构造（merge 同组 spec）"
+      },
+      {
+        "symbol": "KVCacheGroupSpec",
+        "why": "组=同 spec 层名表+merged spec"
+      },
+      {
+        "symbol": "KVCacheConfig",
+        "why": "账本产物（num_blocks+groups+tensors）"
+      },
+      {
+        "symbol": "KVCacheTensor",
+        "why": "哪几层共享哪块张量（shared_by/size）"
+      },
+      {
+        "symbol": "get_kv_cache_configs",
+        "why": "定账总控（五步 docstring 是本章大纲）"
+      },
+      {
+        "symbol": "get_kv_cache_config_from_groups",
+        "why": "张量布局三型的产出点"
+      },
+      {
+        "symbol": "get_num_blocks",
+        "why": "字节换块数总算术 //page//layers"
+      },
+      {
+        "symbol": "may_override_num_blocks",
+        "why": "override 凌驾点（账本同步折算的另一半）"
+      },
+      {
+        "symbol": "num_gpu_blocks_override",
+        "why": "人工凌驾配置（测试抢占用）"
+      },
+      {
+        "symbol": "check_enough_kv_cache_memory",
+        "why": "护栏外包装（至少一条 max_model_len）"
+      },
+      {
+        "symbol": "_check_enough_kv_cache_memory",
+        "why": "护栏本体（含可行长度提示）"
+      },
+      {
+        "symbol": "estimate_max_model_len",
+        "why": "二分估可行长度（单调性收敛）"
+      },
+      {
+        "symbol": "_estimate_max_model_len_from_groups",
+        "why": "per-worker 投影组的二分版（get_kv_cache_configs 实际用）"
+      },
+      {
+        "symbol": "_auto_fit_max_model_len",
+        "why": "max_model_len=-1 自动适配（取各 worker 最小）"
+      },
+      {
+        "symbol": "_max_memory_usage_bytes_from_groups",
+        "why": "护栏的按组求和口径"
+      },
+      {
+        "symbol": "_project_kv_cache_groups_to_worker",
+        "why": "PP 投影（worker 只算自己那层）"
+      },
+      {
+        "symbol": "generate_scheduler_kv_cache_config",
+        "why": "拍平喂调度器（代表 spec）"
+      },
+      {
+        "symbol": "get_kv_cache_capacity",
+        "why": "容量=并发×max_model_len"
+      },
+      {
+        "symbol": "get_max_concurrency_for_kv_cache_config",
+        "why": "并发=num_blocks/每请求块和（混合按组求和）"
+      },
+      {
+        "symbol": "resolve_kv_cache_block_sizes",
+        "why": "LCM/GCD 两个对齐粒度"
+      },
+      {
+        "symbol": "scheduler_block_size",
+        "why": "调度对齐不变量（num_computed_tokens 粒度）"
+      },
+      {
+        "symbol": "hash_block_size",
+        "why": "哈希粒度（GCD 或 prefix_match_unit；细粒度命中→ch15 的前置）"
+      },
+      {
+        "symbol": "prefix_match_unit",
+        "why": "哈希粒度覆盖配置（32 vs 1024 例）"
+      },
+      {
+        "symbol": "kv_cache_size_tokens",
+        "why": "容量写回（前端可见）"
+      },
+      {
+        "symbol": "kv_cache_max_concurrency",
+        "why": "并发写回（前端可见）"
+      },
+      {
+        "symbol": "initialize_from_config",
+        "why": "worker 按 config 真分配（CuMem tag=kv_cache）"
+      },
+      {
+        "symbol": "initialize_kv_cache",
+        "why": "runner 侧分配+绑层+kernel 块细分"
+      },
+      {
+        "symbol": "use_memory_pool",
+        "why": "CuMem 池隔离（weights/kv_cache 两池）"
+      },
+      {
+        "symbol": "num_gpu_blocks",
+        "why": "写回 cache_config 的块数（启动后全局可见的账）"
+      },
+      {
+        "symbol": "update_max_model_len",
+        "why": "auto-fit 后同步 worker"
+      },
+      {
+        "symbol": "_initialize_kv_caches",
+        "why": "启动装配总编排（单一事实源注释所在）"
+      },
+      {
+        "symbol": "watermark",
+        "why": "配置项（默认 0.0；[0,1)）"
+      },
+      {
+        "symbol": "watermark_blocks",
+        "why": "= watermark×num_blocks；精修版只对 WAITING/PREEMPTED"
+      },
+      {
+        "symbol": "scheduler_reserve_full_isl",
+        "why": "full-ISL 门开关（默认 True）"
+      },
+      {
+        "symbol": "full_sequence_must_fit",
+        "why": "allocate_slots 的门参数"
+      },
+      {
+        "symbol": "has_scheduled_reqs",
+        "why": "水位的触发条件（本步已有调度）"
+      },
+      {
+        "symbol": "reserved_blocks",
+        "why": "异步 KV load 的在途预约（防挤死 prefill）"
+      },
+      {
+        "symbol": "allocate_slots",
+        "why": "两道门所在的分配入口（门段 L463-L527）"
+      },
+      {
+        "symbol": "max_admission_blocks_per_request",
+        "why": "回收型准入上限（spec 方法=单一事实源）"
+      },
+      {
+        "symbol": "_max_admission_blocks_per_request",
+        "why": "manager 侧注入的上限字段"
+      },
+      {
+        "symbol": "apply_admission_cap",
+        "why": "夹取开关（只由 full-ISL 门传 True）"
+      },
+      {
+        "symbol": "get_manager_for_kv_cache_spec",
+        "why": "spec→manager 注册表 + 上限注入装配点"
+      },
+      {
+        "symbol": "register_all_kvcache_specs",
+        "why": "内置 spec 注册（engine core 进程先注册）"
+      },
+      {
+        "symbol": "get_num_blocks_to_allocate",
+        "why": "预测器（与分配器同构的铁律载体）"
+      },
+      {
+        "symbol": "get_kv_cache_coordinator",
+        "why": "coordinator 工厂（按组数/caching 三态）"
+      },
+      {
+        "symbol": "KVCacheManager",
+        "why": "门面+水位持有者"
+      },
+      {
+        "symbol": "KVCacheCoordinator",
+        "why": "一个 BlockPool+每组一 manager 的装配形态"
+      },
+      {
+        "symbol": "SingleTypeKVCacheManager",
+        "why": "每组一个的类型化账本"
+      },
+      {
+        "symbol": "SlidingWindowManager",
+        "why": "窗外回收实现（get_num_skipped_tokens）"
+      },
+      {
+        "symbol": "remove_skipped_blocks",
+        "why": "窗外块回收+null 换位"
+      },
+      {
+        "symbol": "get_num_skipped_tokens",
+        "why": "各类型自知历史的落点（基类 0）"
+      },
+      {
+        "symbol": "_remove_blocks_in_range",
+        "why": "逆序 null 换位实现（遇 null 早停）"
+      },
+      {
+        "symbol": "null_block",
+        "why": "占位块（ref_cnt 不维护、处处特判）"
+      },
+      {
+        "symbol": "is_null",
+        "why": "占位标记（free/清零/usage 分母都特判它）"
+      },
+      {
+        "symbol": "map_to_kernel_blocks",
+        "why": "账本块→kernel 块细分换算"
+      },
+      {
+        "symbol": "blocks_per_kv_block",
+        "why": "细分比例（32/16=2）"
+      },
+      {
+        "symbol": "use_hybrid_blocks",
+        "why": "细分启用标志"
+      },
+      {
+        "symbol": "MultiGroupBlockTable",
+        "why": "每组一张表的容器"
+      },
+      {
+        "symbol": "BlockTable",
+        "why": "单组块表（kernel_block_size 参数）"
+      },
+      {
+        "symbol": "disable_hybrid_kv_cache_manager",
+        "why": "组化回退开关（回退=不省显存）"
+      },
+      {
+        "symbol": "unify_hybrid_kv_cache_specs",
+        "why": "回退实现（SWA 当 full 分配的 warning）"
+      },
+      {
+        "symbol": "DEFAULT_BLOCK_SIZE",
+        "why": "16——页粒度默认值（ch13 已立，本章作换算常量）"
+      },
+      {
+        "symbol": "_max_in_flight_tokens / max_in_flight_tokens",
+        "why": "准入上限的输入（在途 token 上界；未设时回退 max_model_len）"
+      },
+      {
+        "symbol": "get_usage",
+        "why": "池使用率（分母扣 null_block）——账本的读数出口"
+      }
+    ]
+  },
+  "foreshadow_due": {
+    "source": "v3 伏笔真相源 = book/cartography/pedagogy-plan.json foreshadows（bible.py due 是 v2 旧章号账本，取回必错，不跑）",
+    "should_plant": [],
+    "should_payoff": [],
+    "note": "pedagogy-plan.foreshadows 中无 planted=14 或 paid 含 14 的条目——本章不埋不收。邻章钩子路过点：ch13 第 1/3/12 站三次点名『→ ch14 显存账本』（池多大、水位、null_block 占位语义、kernel 块细分、多组块表、packed 别名布局），本章全部接住；F7（block_table 间接寻址，ch13 埋、ch22 收）路过本章第 12 站的 map_to_kernel_blocks 时可顺笔一句但不展开；ch9 第 2 站的『post-init 配置回传 num_gpu_blocks/max_model_len auto-fit』在本书视角下正是本章第 7 站的内景。F8（KVConnector 双面契约）planted=16——本章只在 reserved_blocks/异步预约处留一句『→ ch16』即可，不算埋点。"
+  },
+  "l2_spec": "book/cartography/l2-specs/ch14.json（stations 与本档案 stations 同一份账本）"
+}

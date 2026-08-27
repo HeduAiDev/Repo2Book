@@ -20,7 +20,7 @@
 
 读法建议：想知道「凭什么利用率能顶到满」，从[「三源浪费」](#三源浪费旧系统只用了两三成显存)读起；只想看账本三件套长什么样，跳[「池的出生」](#池的出生一秒发完全部身份证站-1)和[「自由队列」](#自由队列指针长在块身上站-1-续)；关心[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)那个 None 的出生地，直奔[「入场要块」](#入场要块allocate_slots-三段式站-2-4)；想弄懂一个 token 的 KV 到底放进显存哪个格子，看[「槽位恒等式」](#槽位恒等式一个位置号怎么变成一个物理槽位站-9)；想跟全程，按序读。
 
-还有一句环境交代，全章的数值表都适用：本章实测来自配套精简版——按 v0.27.1 只做减法抽出的「账本三件套 + worker 页表」，host 上实跑纯控制流，不依赖 GPU 与 vLLM 运行时。它与真实引擎有三处刻意差别，后文碰到会就近再提：其一，精简版关掉前缀缓存跑（`enable_prefix_caching=False`，cache 配置里的正交开关——真实部署默认开，vllm/config/cache.py:L93），所以本章 `allocate_slots` 里「挂命中块」一段恒空、「写回满块」一段早退，这两段的戏在前缀缓存章；其二，host 无 CUDA——槽位换算走 kernel 的逐行 CPU 镜像（同一恒等式、同一变量名，CUDA 分支逐字保留），新块清零走 CPU 分支；其三，真实系统里调度器与 worker 是两个进程，块表过线天然各持一份，单进程驱动脚本在打包时刻手工快照防就地改动。凡表内数字都是实跑输出，一个没改。
+还有一句环境交代，全章的数值表都适用：本章实测来自配套精简版——按 v0.27.1 只做减法抽出的「账本三件套 + worker 页表」，host 上实跑纯控制流，不依赖 GPU 与 vLLM 运行时。它与真实引擎有三处刻意差别，后文碰到会就近再提：其一，精简版关掉前缀缓存跑（`enable_prefix_caching=False`，cache 配置里的正交开关——真实部署默认开，vllm/config/cache.py:L93），所以本章 `allocate_slots` 里「挂命中块」一段恒空、「写回满块」一段早退，这两段的戏在前缀缓存章；其二，host 无 CUDA——槽位换算走 kernel 的逐行 CPU 镜像（同一恒等式、同一变量名，CUDA 分支逐字保留），新块清零走 CPU 分支；其三，多卡部署里调度器与 worker 分属两个进程（单卡默认部署两者同住一个进程，同一条消息契约照样成立），块表过线天然各持一份，单进程驱动脚本在打包时刻手工快照防就地改动。凡表内数字都是实跑输出，一个没改。
 
 ## 显存为什么是主角：一个 token 的 KV 有多大
 
@@ -60,7 +60,7 @@ class AttentionSpec(KVCacheSpec):
         )                                                              # L226
 ```
 
-`AttentionSpec`（注意力的形状描述）把三个数字带到这个乘法里：块大小、KV 头数、每头维度。无量化时 `real_page_size_bytes`（真页字节数）就是全部——因子 2 的意思是「一页装 block_size 个 token 的 K 一份、V 一份」；至于 K、V 在页内怎么摆（分成上下两半页，还是逐 token 相邻打包），这笔字节账管不着——页内形状由注意力后端仲裁，下一段马上遇到。
+`AttentionSpec`（注意力的形状描述）把三个数字带到这个乘法里：块大小、KV 头数、每头维度。无量化时 `real_page_size_bytes`（真页字节数）就是全部——因子 2 的意思是「一页装 block_size 个 token 的 K 一份、V 一份」；至于 K、V 在页内怎么摆（分成上下两半页，还是逐 token 相邻打包），这笔字节账管不着——页内形状由注意力后端（vLLM 里按模型结构与 GPU 平台插拔选用的注意力 kernel 实现模块；怎么选，执行篇讲）仲裁，下一段马上遇到。
 
 物理池的出生在 worker 侧，两步。第一步按字节数要原始缓冲：
 
@@ -143,7 +143,7 @@ class AttentionSpec(KVCacheSpec):
 
 ## 药方：把操作系统的分页搬进显存
 
-论文的药方，摘要原话是 "an attention algorithm inspired by the classical virtual memory and paging techniques in operating systems"（受操作系统经典虚拟内存与分页技术启发的注意力算法）。这个类比值得当真，因为它是逐件落地的——先把操作系统那边 60 秒补完。
+论文的药方，摘要原话是 "we propose PagedAttention, an attention algorithm inspired by the classical virtual memory and paging techniques in operating systems"（我们提出 PagedAttention——一种受操作系统经典虚拟内存与分页技术启发的注意力算法）。这个类比值得当真，因为它是逐件落地的——先把操作系统那边 60 秒补完。
 
 **操作系统的分页**。每个进程都以为自己独占一段连续的内存地址空间——这是操作系统造的假象。做法：把虚拟地址空间切成固定大小的**页**（page），物理内存切成同样大小的**帧**（frame），中间一张**页表**（page table）做翻译——「存储虚拟地址到物理地址映射的数据结构」（维基 Page table 的定义句）。翻译是一次拆分加一次拼装：虚拟地址切成两段，**虚页号 + 页内偏移**；查表把虚页号换成物理帧号；物理地址 = 帧号 × page_size + 偏移。一个说明性小例（16 位虚拟地址、页大小 256 字节）：虚拟地址 0x0317 拆成虚页号 0x03、偏移 0x17（低 8 位）；查页表第 3 项得帧号 0x0C；物理地址 = 0x0C × 0x100 + 0x17 = 0x0C17。
 
@@ -286,7 +286,7 @@ null 块从此渗进口径里：分母是 num_gpu_blocks − 1。6 块的小池�
 
 ![块的身份证与池的出生](../diagrams/ch13-fig-block-id-card.png)
 
-> *图注：池的出生三件事 + 一张身份证（vllm/v1/core/kv_cache_utils.py:L118-L138 与 vllm/v1/core/block_pool.py:L162-L191）：启动时一次预构全部 KVCacheBlock——七字段 slots 卡片，五行高亮是本章主角，两行哈希账位灰暗标给前缀缓存章；自由队列把整串卡片串起来，队头 0 号卡被 popleft 抽出贴 is_null 封条当 null_block，ref_cnt 不维护、处处特判。此后出租从 1 号开始，观测口径 get_usage 的分母也永远少记这一块（6 块池分 2 块：1 − 3/5 = 0.4）。*
+> *图注：池的出生三件事 + 一张身份证（vllm/v1/core/kv_cache_utils.py:L117-L138 与 vllm/v1/core/block_pool.py:L162-L191）：启动时一次预构全部 KVCacheBlock——七字段 slots 卡片，五行高亮是本章主角，两行哈希账位灰暗标给前缀缓存章；自由队列把整串卡片串起来，队头 0 号卡被 popleft 抽出贴 is_null 封条当 null_block，ref_cnt 不维护、处处特判。此后出租从 1 号开始，观测口径 get_usage 的分母也永远少记这一块（6 块池分 2 块：1 − 3/5 = 0.4）。*
 
 ## 自由队列：指针长在块身上（站 1 续）
 
@@ -302,8 +302,8 @@ class FreeKVCacheBlockQueue:
     implemented in C++, this class does not allocate any Python objects when
     manipulating the linked list. Instead, this class manipulates the
     prev_free_block and next_free_block attributes of the given blocks.
-    # … 省略：LRU 两条次序规则的 docstring 段——驱逐策略的伏笔，
-    #       本章只用「队头取、队尾还」的分配语义 ……
+    # … 省略：LRU（least recently used，最久没用的先逐出）两条次序规则的
+    #       docstring 段——驱逐策略的伏笔，本章只用「队头取、队尾还」的分配语义 ……
 
     Args:
         blocks: A list of KVCacheBlock objects.
@@ -415,7 +415,7 @@ class FreeKVCacheBlockQueue:
 
 > *图注：指针长在块上（vllm/v1/core/kv_cache_utils.py:L184-L234、L273-L324）：自由队列不是容器、是长在块身上的侵入式双向链表——fake_head/fake_tail 两个哨兵（block_id=−1）保证每个真实块都有邻居，摘谁都不判边界。六拍手术 [0,1,2,3,4]→[1,2,3,4]→[1,3,4]→[1,3,4,0]→[3,4,0]→[1,3,4,0]，每步只重接两三个块上字段、全程零对象分配（trace 里 7 个对象的 id 集合不变）。为什么不用 deque：中间删除 O(n) 付不起，而前缀缓存的 touch 天天要从队中间捞人（下两章见）。*
 
-到这里，本章第二条 why 链可以完整摆出——主角是纯 CPU 元数据账本（第一条是分页本身：三源浪费到药方那条；第三条到站 9「槽位恒等式」才现身）。**旧设计**：v0 的 BlockSpaceManager——全局静态水位垫片（默认预留 1% 空间不敢动）、按请求组核算块、PhysicalTokenBlock 对象在运行期反复分配释放。**痛点**：v1 的主战场是调度器的 CPU 时间——高并发下每拍要为几百个请求算块需求，dict/对象分配/GC（垃圾回收）会把调度循环压垮；而保守垫片本身就是容量浪费。**v1 方案**：整个账本是纯 CPU 元数据——KVCacheBlock 七字段 slots 卡片（L118-L138）、侵入式链表零分配（L184-L234）、预构空对象避免 GC（`empty_kv_cache_blocks`，kv_cache_manager.py:L180-L187，分配失败的请求一律复用同一个空结果对象，不现场造）。对调度器则只暴露 KVCacheBlocks 包装——docstring 原话 "to hide KVCacheManager's internal data structure from the Scheduler"（对调度器隐藏内部结构，kv_cache_manager.py:L32-L53）：调度器拿到的只是「块指派」，摸不到块对象。**代价**（诚实账）：每请求每步 O(块数) 的 Python 循环仍在，只能靠上述纪律压着，是持续的性能战场；更要命的是账本与 GPU 真相从此是两份——需要一条跨进程契约兜底，那是站 5-8 的戏。
+到这里，本章第二条 why 链可以完整摆出——主角是纯 CPU 元数据账本（第一条是分页本身：三源浪费到药方那条；第三条到站 9「槽位恒等式」才现身）。**旧设计**：v0 的 BlockSpaceManager——全局静态水位垫片（默认预留 1% 空间不敢动）、按请求组核算块、PhysicalTokenBlock 对象在运行期反复分配释放。**痛点**：v1 的主战场是调度器的 CPU 时间——高并发下每拍要为几百个请求算块需求，dict/对象分配/GC（垃圾回收）会把调度循环压垮；而保守垫片本身就是容量浪费。**v1 方案**：整个账本是纯 CPU 元数据——KVCacheBlock 七字段 slots 卡片（L117-L138）、侵入式链表零分配（L184-L234）、预构空对象避免 GC（`empty_kv_cache_blocks`，kv_cache_manager.py:L180-L187——结果是零块的调用一律复用同一个预构空对象、不现场造，decode 里块内还有空位、不领新块的拍就是常客；分配失败走的则是 None，不在这条路上）。对调度器则只暴露 KVCacheBlocks 包装——docstring 原话 "to hide KVCacheManager's internal data structure from the Scheduler"（对调度器隐藏内部结构，kv_cache_manager.py:L32-L53）：调度器拿到的只是「块指派」，摸不到块对象。**代价**（诚实账）：每请求每步 O(块数) 的 Python 循环仍在，只能靠上述纪律压着，是持续的性能战场；更要命的是账本与 GPU 真相从此是两份——需要一条跨进程契约兜底，那是站 5-8 的戏。
 
 ## 入场要块：allocate_slots 三段式（站 2-4）
 
@@ -616,7 +616,7 @@ class FreeKVCacheBlockQueue:
 
 ### 三段式全景：None 意味着零半截账
 
-把整条路拼起来。「三段式」是社区沿用的叫法（数块、拿块、记账），源码里实际走四步：容量检查 → 挂命中块 → 分新块 → 写回满块——本章主路径上第 2、4 步恒空或早退，占位即可：
+把整条路拼起来。「三段式」是社区沿用的叫法（数块、拿块、记账），源码里实际走四步：容量检查 → 挂命中块 → 分新块 → 写回满块。两套叫法对位：数块＝容量检查、拿块＝分新块（挂账 ref_cnt 在取块里顺手完成）、记账＝写回满块；挂命中块是缓存路径多出的一步——本章主路径上第 2、4 步恒空或早退，占位即可：
 
 ```python
 # vllm/v1/core/kv_cache_manager.py:L529-L565
@@ -656,7 +656,7 @@ class FreeKVCacheBlockQueue:
         return self.create_kv_cache_blocks(new_blocks)
 ```
 
-第二段判空用的是 `is not self.empty_kv_cache_blocks.blocks`——拿预构空对象的内部元组做同一性比较，连「空」都不新建对象（GC 纪律的最后一小块）。五次调用实跑（10 块池、块大小 16；换一组剧本专打容量边界——r1 仍是 100-token，r2 这次要 128，r3 只要 16，与 m1 的剧本不同）：
+注释里的 P/D 是 prefill/decode 分离部署的缩写——prefill 与 decode 拆到不同实例跑、块的 KV 要从远端收，delay_cache_blocks 就是为这种转运留的开关（块先分下去、KV 下一步才到，写缓存的账推迟到那时；KVConnector 章）；本章主路径上它恒假，早退只靠关缓存那半边。第二段判空用的是 `is not self.empty_kv_cache_blocks.blocks`——拿预构空对象的内部元组做同一性比较，连「空」都不新建对象（GC 纪律的最后一小块）。五次调用实跑（10 块池、块大小 16；换一组剧本专打容量边界——r1 仍是 100-token，r2 这次要 128，r3 只要 16，与 m1 的剧本不同）：
 
 <!-- trace: m6 -->
 | 调用 | 侧 | token 目标 | 预测需块 | 空闲 | 判定 | 分到的块 | 拍后空闲 |
@@ -914,7 +914,7 @@ CPU 算法得先把 positions 从 GPU 拉回来（D2H 同步，device to host—
         )
 ```
 
-grid 是 `(num_reqs + 1,)`——每个程序实例处理一个请求的 token 区间（query_start_loc 切段），**多出来的最后一个程序专职填 PAD 尾**。kernel 本体（单卡版——CP 上下文并行的分片三处按常数 1 烘干后就是它；分片原貌归执行篇）：
+开头 NONE 分支点名的 GDN 是 Gated DeltaNet（门控 Delta 网络）——与 Mamba 同路、以循环状态代替 KV 的模型，它们的块表整组当循环状态索引用、不做逐 token 槽位换算（混合模型章见）。grid 是 `(num_reqs + 1,)`——每个程序实例处理一个请求的 token 区间（query_start_loc 切段），**多出来的最后一个程序专职填 PAD 尾**。kernel 本体（单卡版——CP 上下文并行的分片三处按常数 1 烘干后就是它；分片原貌归执行篇）：
 
 ```python
 # vllm/v1/worker/block_table.py:L379-L442
@@ -982,7 +982,7 @@ slot = block_table[req][pos // block_size] × block_size + pos % block_size
 
 ![槽位恒等式：一条算术接通两层](../diagrams/ch13-fig-slot-identity.png)
 
-> *图注：槽位恒等式（vllm/v1/worker/block_table.py:L380-L442）：上带逻辑位置 0..47 连续，中间一张块表行 [3,1,7]，下带物理槽位 0..127——三段各接一块：pos 0-15 → 块 3 → 48..63、pos 16-31 → 块 1 → 16..31、pos 32-47 → 块 7 → 112..127，中段槽位低于左段的错位就是间接寻址脱钩的直接可视化。换算是 GPU 上的 Triton kernel（positions 本身是 GPU 张量、全程不落 CPU），尾部 [num_tokens, max) 每拍重填 -1 保 CUDA graph。写腿存进 slot、读腿翻块表——同一条恒等式两条腿共用。*
+> *图注：槽位恒等式（vllm/v1/worker/block_table.py:L379-L442）：上带逻辑位置 0..47 连续，中间一张块表行 [3,1,7]，下带物理槽位 0..127——三段各接一块：pos 0-15 → 块 3 → 48..63、pos 16-31 → 块 1 → 16..31、pos 32-47 → 块 7 → 112..127，中段槽位低于左段的错位就是间接寻址脱钩的直接可视化。换算是 GPU 上的 Triton kernel（positions 本身是 GPU 张量、全程不落 CPU），尾部 [num_tokens, max) 每拍重填 -1 保 CUDA graph。写腿存进 slot、读腿翻块表——同一条恒等式两条腿共用。*
 
 **代价**也照例诚实：一次 kernel launch 有固定的微秒级开销（小 batch 也是它）；kernel 内逻辑被 CP 分片和混合布局细分复杂化；PAD 的值语义贯穿全栈——PAD_SLOT_ID（-1）、NULL_BLOCK_ID（0）各有分工，哪个 kernel 吃哪个 pad 要记牢（深挖归执行篇）。vLLM 为什么认这笔账——回去看痛点那条 D2H：不落 CPU 省下的不只是 Python 循环，是整条同步链。
 
@@ -1048,7 +1048,7 @@ slot = block_table[req][pos // block_size] × block_size + pos % block_size
                 break
 ```
 
-环的内部[第 11 章](../../ch11-preemption-request-lifecycle/narrative/chapter.md)拆完了，本章只看块侧的节奏。fast-path 的算术（cdiv 差值、负数归零——`max(num_required_blocks - num_req_blocks, 0)`）决定了一切：箱内还有空位的那些拍，差值是 0——**免账拍**，不领块、不发增量、worker 无动作；总 token 越过 16 倍数后的第一拍，差值变 1——**块界拍**，领一块、发一条增量电报。两条 30-token 请求的长大全程（8 块池）：
+环的内部[第 11 章](../../ch11-preemption-request-lifecycle/narrative/chapter.md)拆完了，本章只看块侧的节奏。fast-path 的算术（cdiv 差值、负数归零——`max(num_required_blocks - num_req_blocks, 0)`）决定了一切：箱内还有空位的那些拍，差值是 0——**免账拍**，不领块、不发增量、worker 无动作；总 token 越过 16 倍数后的第一拍，差值变 1——**块界拍**，领一块、发一条增量电报。两条 30-token 请求的长大（8 块池，六拍精选）：
 
 <!-- trace: m11 -->
 | 拍 | 请求 | token 总数 | cdiv(·,16) | 已持 | 本拍新块 | 拍后空闲 |
@@ -1059,6 +1059,8 @@ slot = block_table[req][pos // block_size] × block_size + pos % block_size
 | 3 | r1 | 52 | 4 | 3 | [6] | 1 |
 | 4 | r2 | 46 | 3 | 2 | [7] | 0 |
 | 5 | r1（触发抢占环） | 65 | 5 | 4 | [7]（弹 r2 后重试所得） | 2 |
+
+（表里 token 数一拍跳好几个——decode 稳态每拍本只 +1，驱动脚本为快进每拍多喂几个 token、专在块界前后落脚，免账拍与块界拍各留了样本，r2 的中间拍省略未列；「token 总数」列是 num_computed_tokens + 本拍喂入数的合计，真实引擎里由调度器乐观记账推进——[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)，驱动脚本手工维护。）
 
 节奏总账（实测的完整刻度）：30 → 2 块、31/32 仍 2 块、33..48 → 3 块、49..64 → 4 块、65..80 → 5 块——相邻两次领块恰好隔 16 个 token，持有块数恒等于 cdiv(总 token, 16)。拍 2 是免账拍的样本（44 ≤ 48，块内还有 4 个空位）；拍 5 是池干的那拍：r1 要第 5 块、空闲 0，None 进抢占环，r2（队尾最年轻）被弹走、3 块按 [7,4,3] 逆序回池，r1 原样重试拿到 7 号——被抢者的代价（重算语义）[第 11 章](../../ch11-preemption-request-lifecycle/narrative/chapter.md)算过。宏观感受一下这套节奏为什么必须精确：decode 每 token 0.5 MB（Llama-2-7B 口径的计算例），1000 条并发各涨 1 个 token 就是 0.5 GB——「每 16 个 token 多要一块」错一拍，就是几十上百 MB 级的账差。
 

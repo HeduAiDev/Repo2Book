@@ -8,7 +8,7 @@ decode 稳态里，每个请求每拍只多要一个 token 的显存——一章
 
 ![L2 章图：Scheduler——RUNNING↔PREEMPTED 环与一生的收尾](../diagrams/L2-ch11.png)
 
-> *图注：本章放大的是[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md) L0 图左下「调度 · 显存账本」列的上半——Scheduler 那个框，就是[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)翻开过账本、本章继续住人的同一块。上一章立的是一拍两阶段怎么分 token 预算，本章打开的是它留下的两扇门：内存见底那一拍的抢占内环，以及[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)五拍循环里第 ⑤ 拍一直收着的「请求生命周期」内景。图上三段读：上排是请求的三个居所（running 在途、waiting 排队、skipped_waiting 阻塞隔离）与两拍入口；中排 ①-⑧ 八张拍片是一条请求被抢又恢复的一整圈——从 allocate_slots 返回 None 到回流落位 RUNNING，F2 伏笔埋在第 ⑥ 拍片；下排是状态机账本、⑤ 拍内景的一生收尾、KVCacheManager 契约面与三笔 why 注。站号 1-18 = 请求流经代码的顺序（第 1 站状态机 · 第 2-7 站被抢的一拍 · 第 8-11 站恢复的下一拍 · 第 12-17 站一生的收尾 · 第 18 站外部 abort），正文按讲解需要编排、不必照站号读。*
+> *图注：本章放大的是[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md) L0 图左下「调度 · 显存账本」列的上半——Scheduler 那个框，就是[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)翻开过账本、本章继续住人的同一块。上一章立的是一拍两阶段怎么分 token 预算，本章打开的是它留下的两扇门：内存见底那一拍的抢占内环，以及[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)五拍循环里第 ⑤ 拍一直收着的「请求生命周期」内景。图上三段读：上排是请求的三个居所（running 在途、waiting 排队、skipped_waiting 阻塞隔离）与两拍入口；中排 ①-⑧ 八张拍片是一条请求被抢又恢复的一整圈——从 allocate_slots 返回 None 到回流落位 RUNNING，「抢占恢复撞前缀缓存」的伏笔（F2，第 15 章回收）埋在第 ⑥ 拍片；下排是状态机账本、⑤ 拍内景的一生收尾、KVCacheManager 契约面与四笔虚线小注（两笔 why：recompute-only、水位钟摆；另有 abort 外部死法、stale async 交叉面）。站号 1-18 = 请求流经代码的顺序（第 1 站状态机 · 第 2-7 站被抢的一拍 · 第 8-11 站恢复的下一拍 · 第 12-17 站一生的收尾 · 第 18 站外部 abort），正文按讲解需要编排、不必照站号读。*
 
 读法建议：只想看「被抢之后怎么活着回来」，直奔[「恢复第一步：捡回自己的前缀」](#恢复第一步捡回自己的前缀站-9)；关心引擎凭什么敢扔 KV、扔了有什么代价，从[「池子见底那一拍」](#池子见底那一拍抢占环站-2-3-与-6)读起；想调参压抢占抖动的，跳[「恢复第二步：准入与水位」](#恢复第二步准入与水位站-10)；想跟一条请求从生到死的全程，按序读。
 
@@ -44,11 +44,15 @@ class RequestStatus(enum.IntEnum):
     @staticmethod
     def is_finished(status: "RequestStatus") -> bool:
         return status > RequestStatus.PREEMPTED                     # 一次整数比较 # L371
+
+    # … 省略：get_finished_reason（L373-L375）——终态→FinishReason 的映射，
+    #       查表 _FINISHED_REASON_MAP（L378 起）；下面站 1 总表「FinishReason
+    #       映射」列与站 15「先抓原因」的时序约束，出处都在这 ……
 ```
 
 这个设计值得停三分钟讲透，因为它初看不起眼——「一个枚举而已」——却同时回答了「怎么判死活」和「为什么这样排」两个问题。
 
-第一，`IntEnum` 的成员**本身就是整数**。Python 标准库的约定：继承 `IntEnum` 的枚举成员是 `int` 的子类，可以在任何能用整数的地方使用（[官方文档](https://docs.python.org/3/library/enum.html)原话 "are also (and always) integers"）。普通 `Enum` 成员之间做不了 `>` `<` 排序比较，`IntEnum` 可以。标准库自己最著名的用例是 `http.HTTPStatus`（`HTTPStatus.OK == 200` 成立）——不过那里数值有外部语义（HTTP 规范定的状态码），`RequestStatus` 正相反：数值纯属内部编号，真正承重的是**排列顺序**。
+第一，`IntEnum` 的成员**本身就是整数**。Python 标准库的约定：继承 `IntEnum` 的枚举成员是 `int` 的子类，可以在任何能用整数的地方使用（[官方文档](https://docs.python.org/3/library/enum.html)原话 "are also integers and can be used anywhere that an integer can be used"）——而且永远是 int，不会视语境漂移。普通 `Enum` 成员之间做不了 `>` `<` 排序比较，`IntEnum` 可以。标准库自己最著名的用例是 `http.HTTPStatus`（`HTTPStatus.OK == 200` 成立）——不过那里数值有外部语义（HTTP 规范定的状态码），`RequestStatus` 正相反：数值纯属内部编号，真正承重的是**排列顺序**。
 
 第二，`enum.auto()` 按声明顺序从 1 起每个 +1 赋值（文档原话 "the appropriate value will be the last value plus one"），所以**声明顺序就是数值顺序**。上面代码里我标在注释里的 1..12 就是这么来的。两条合起来：把一生的全部状态按生命周期排在一条数轴上，「是否终局」就退化成一次整数比较——`status > PREEMPTED`，即「大于 6 吗」。拿一个可以自己跑的最小例看穿它（说明性例子，非 vLLM 源码）：
 
@@ -160,7 +164,7 @@ True
                 break                                                # 整拍放弃      # L629
 ```
 
-读法顺着环走：`allocate_slots` 返回 None 是抢占的**唯一触发信号**——没有别的条件会走到这个环里。None 之后不报错、不等待，立刻抢一个「最不应保留者」（FCFS 下就是队尾）腾块，然后**原样重试**同一次分配。注意环的两个出口：重试成功（break 出环，请求照常调度）；或者抢来抢去轮到 `preempted_req == request`——把自己都抢了还是分不到（此时 running 已空、没有更不该留的人了），break 放弃本请求。出了环还有一道判定：`new_blocks is None` 说明整个 RUNNING 循环都收摊了，本拍就到这里。
+读法顺着环走：**调度路径上**，`allocate_slots` 返回 None 是抢占的**唯一触发信号**——没有别的条件会走到这个环里（环外另有抢占发起者：管理接口 `reset_prefix_cache`，站 5 的 drop-mode 处见到）。None 之后不报错、不等待，立刻抢一个「最不应保留者」（FCFS 下就是队尾）腾块，然后**原样重试**同一次分配。注意环的两个出口：重试成功（break 出环，请求照常调度）；或者抢来抢去轮到 `preempted_req == request`——把自己都抢了还是分不到（此时 running 已空、没有更不该留的人了），break 放弃本请求。出了环还有一道判定：`new_blocks is None` 说明整个 RUNNING 循环都收摊了，本拍就到这里。环里顺手传下去的两个实参不参与本章主线，各给一句交代：`num_lookahead_tokens` 是投机解码的前瞻 token 数（配置了投机解码才非 0，本环只把它原样转给分配器）；`drop_stale_output=self.requires_kv_delivery` 是 KV 传输连接器的旗标——配置了连接器、且其递交的 KV 必须可靠送达时为真（调度器初始化时从 connector 拷来，L158），被抢请求的在途输出因此要走整段丢弃的 drop-mode，站 5 对表。
 
 这个环为什么停得下来，值得一句不变量级的论证：环内对 `self.running` 只减不增（每迭代必 pop 掉一个成员），`len(running)` 是严格递减的自然数——至多初始长度轮之后，队尾必然轮到 `request` 自己，触发 `preempted_req == request` 的 break；另一条路是某轮重试成功（每次 pop 必先 free 一份块，空闲只增不减而需求不变，越过需求即成功）。两条路都在有限轮内，不存在无限抢占。
 
@@ -168,9 +172,9 @@ True
 
 环里真正的宣言在 `_preempt_request` 里（下一节全文走读），它做的事翻译成人话是：把被抢请求的 KV 缓存**全部扔掉**。这是本章三个要讲透的概念里最重的一个——**recompute-only（只重算）**：v1 对被抢请求的唯一处置方式，不搬运、不换出，恢复时把 prompt 拼上已生成的 token 当一个「新 prompt」重算。它不是拍脑袋，是一条有出处的取舍。
 
-两条经典处置路是 vLLM 自己的奠基论文（《Efficient Memory Management for Large Language Model Serving with PagedAttention》，[SOSP 2023，arXiv:2309.06180](https://arxiv.org/abs/2309.06180) 的 Section 4.5）并列提出的：**swap**（换出）把被抢请求的 KV 块物理拷贝到 CPU 内存存着、恢复时原样拷回 GPU——代价是两次 PCIe 搬运加 CPU 侧一块镜像内存；**recompute**（重算）干脆不存，块全部释放、进度记账清零，恢复时用一次 prefill 迭代把所有位置的 KV 批量重算——注意不是逐 token 慢慢重跑 decode，论文原话 "recomputation latency can be significantly lower than the original latency, as the tokens generated at decoding can be concatenated with the original user prompt as a new prompt"。拿一个说明性构造走一遍：请求 A 有 500-token prompt、已生成 200 token。swap 路径：700 token 的 KV 拷去 CPU，恢复时拷回，从第 701 个 token 续算（两次搬运，零重算）。recompute 路径（v1 实际做法）：KV 块直接释放回池子，A 回等待队列；恢复时把 500+200 拼成 700-token 的「新 prompt」一次 prefill 重算——若前缀缓存命中自己刚释放的块，实为「重载元数据+补算尾段」而非全量重算（站 9 展开，这是 v1 敢扔的另一半底气）。论文还实测了两者的适用面：小块尺寸下 swap 反而吃亏（"swapping incurs excessive overhead with small block sizes"，大量小块传输吃不满 PCIe 带宽），而重算的开销与块大小无关（"the overhead of recomputation remains constant across different block sizes"）。
+两条经典处置路是 vLLM 自己的奠基论文（《Efficient Memory Management for Large Language Model Serving with PagedAttention》，[SOSP 2023，arXiv:2309.06180](https://arxiv.org/abs/2309.06180) 的 Section 4.5）并列提出的：**swap**（换出）把被抢请求的 KV 块物理拷贝到 CPU 内存存着、恢复时原样拷回 GPU——代价是两次 PCIe 搬运（PCIe：GPU 与 CPU 之间传数据的那条总线，这里就是把 KV 在显存与内存之间对拷）加 CPU 侧一块镜像内存；**recompute**（重算）干脆不存，块全部释放、进度记账清零，恢复时用一次 prefill 迭代把所有位置的 KV 批量重算——注意不是逐 token 慢慢重跑 decode，论文原话 "recomputation latency can be significantly lower than the original latency, as the tokens generated at decoding can be concatenated with the original user prompt as a new prompt"。拿一个说明性构造走一遍：请求 A 有 500-token prompt、已生成 200 token。swap 路径：700 token 的 KV 拷去 CPU，恢复时拷回，从第 701 个 token 续算（两次搬运，零重算）。recompute 路径（v1 实际做法）：KV 块直接释放回池子，A 回等待队列；恢复时把 500+200 拼成 700-token 的「新 prompt」一次 prefill 重算——若前缀缓存命中自己刚释放的块，实为「重载元数据+补算尾段」而非全量重算（站 9 展开，这是 v1 敢扔的另一半底气）。论文还在 §7.3 的消融实验里实测了两者的适用面：小块尺寸下 swap 反而吃亏（"swapping incurs excessive overhead with small block sizes"，大量小块传输吃不满 PCIe 带宽），而重算的开销与块大小无关（"the overhead of recomputation remains constant across different block sizes"）。
 
-工程化后的 v0 一直双模并存：`SchedulerConfig.preemption_mode` 接受 `"swap"`/`"recompute"` 二选一，不指定时自动选——recompute 是默认（开销更低），swap 留给 beam search 这类多序列场景（v0.6.6/v0.9.1 源码一手核实）。转折在 v1：[官方文档](https://docs.vllm.ai/en/stable/configuration/optimization/)现文明说 "In vLLM V1, the default preemption mode is RECOMPUTE rather than SWAP, as recomputation has lower overhead in the V1 architecture"，而且整页再无 `preemption_mode` 这个配置项——不是换默认，是删掉了另一条腿。两条 git 考古证据钉死这件事（均为历史证据，现行源码无此代码）：其一，v1 首提交（6c5af09b3，2024-10）的调度器里抢占就一行 `preempted_req.num_computed_tokens = 0`，全文件无 swap/PreemptionMode 字样——v1 从出生起就没写过换出；其二，v0 时代 swap 空间不足的死法是整个引擎崩：`RuntimeError: Aborted due to the lack of CPU swap space. Please increase the swap space to avoid this error.`（git 旧档 `vllm/core/block_manager.py:L1833`，c99db8c8d^ 版本）——不是降级、不是丢一个请求，是全引擎停摆。v0 双模加三队列也被作者自认是调度器最难维护的部分（woosuk 在 v0 源码里的自注 "a bit bizarre"，上一章引过）。v1 删掉它的理由链完整了：v1 取消 SequenceGroup/beam search 多序列，swap 存在的最大理由消失；swap 耗尽是致命故障而非优雅降级；再加上前缀缓存兜底（站 9）与准入控制压频率（站 10）两道护栏。**代价**同样要诚实记下：被抢请求恢复 = 一次（部分）prefill 重算，该请求的吐字节奏出现尖刺、系统烧掉的 forward 不产出新 token（吞吐净损失）；极端反复抢占时纯属浪费。对单请求延迟极敏感、KV 又恰好放得进 CPU 的场景，swap 理论上仍可更优——v1 用「重算换简洁」的赌注删掉了它，赌注的兜底就是后面两站的戏。
+工程化后的 v0 一直双模并存：`SchedulerConfig.preemption_mode` 接受 `"swap"`/`"recompute"` 二选一，不指定时自动选——recompute 是默认（开销更低），swap 留给 beam search 这类多序列场景（v0.6.6/v0.9.1 源码一手核实）。转折在 v1：[官方文档](https://docs.vllm.ai/en/stable/configuration/optimization/)现文明说 "In vLLM V1, the default preemption mode is RECOMPUTE rather than SWAP, as recomputation has lower overhead in the V1 architecture"，而且整页再无 `preemption_mode` 这个配置项——不是换默认，是删掉了另一条腿。两条 git 考古证据钉死这件事（均为历史证据，现行源码无此代码）：其一，v1 首提交（6c5af09b3，2024-10）的调度器里抢占就一行 `preempted_req.num_computed_tokens = 0`，全文件无 swap/PreemptionMode 字样——v1 从出生起就没写过换出；其二，v0 时代 swap 空间不足的死法是整个引擎崩：`RuntimeError: Aborted due to the lack of CPU swap space. Please increase the swap space to avoid this error.`（git 旧档 `vllm/core/block_manager.py:L1833`，c99db8c8d^ 版本）——不是降级、不是丢一个请求，是全引擎停摆。v0 双模加三队列也被作者自认是调度器最难维护的部分（woosuk 在 v0 源码里的自注 "a bit bizarre"，上一章引过）。v1 删掉它的理由链完整了：v1 取消 SequenceGroup/beam search 多序列，swap 存在的最大理由消失；swap 耗尽是致命故障而非优雅降级；再加上前缀缓存兜底（站 9）与准入控制压频率（站 10）这两重兜底。**代价**同样要诚实记下：被抢请求恢复 = 一次（部分）prefill 重算，该请求的吐字节奏出现尖刺、系统烧掉的 forward 不产出新 token（吞吐净损失）；极端反复抢占时纯属浪费。对单请求延迟极敏感、KV 又恰好放得进 CPU 的场景，swap 理论上仍可更优——v1 用「重算换简洁」的赌注删掉了它，赌注的兜底就是后面两站的戏。
 
 ### 实测：4 块池子的两幕
 
@@ -185,7 +189,7 @@ True
 | B-2 | (r1,1)→None | 抢到自己（唯一在场者）→ break 整拍放弃 | 0→1 | [r1] | {} |
 | B-3 | (r1,1)→OK | 下一拍经 WAITING 准入恢复：重命中 16+补 1（resumed） | 1→0 | [] | {r1:1} |
 
-五行的戏眼各有其主。A-2 是环的标准动作：`(r2,1)→None`、抢队尾 r3、`(r2,1)→OK`——同一请求同一需求，前后两次调用之间只隔一次抢占。A-3 是与 WAITING 侧的对照：同一个 None 信号，发生在恢复准入（r3 重回队头后下一拍来领块）时只 break——**新来的、排队的，绝不赶走在场的**。B-2 是自我放弃：r1 是唯一在场者，被抢的就是它自己，`preempted_req == request` 触发 break；注意紧接着的细节——此时 r1 自己 free 的块已回到池里（空闲 0→1）、算术上够它领 1 个 token，但环**不在本拍重试**：break 发生在重试之前。恢复统一走下一拍的 WAITING 准入通道（整序列门与水位都在那条路上，站 10），语义与账本才一致。B-3 兑现：同一请求带着 16 token 命中 + 1 个补算回来了——**放弃不是死亡**。整个环的样子一张图：
+五行的看点各有其主。A-2 是环的标准动作：`(r2,1)→None`、抢队尾 r3、`(r2,1)→OK`——同一请求同一需求，前后两次调用之间只隔一次抢占。A-3 是与 WAITING 侧的对照：同一个 None 信号，发生在恢复准入（r3 重回队头后下一拍来领块）时只 break——**新来的、排队的，绝不赶走在场的**。B-2 是自我放弃：r1 是唯一在场者，被抢的就是它自己，`preempted_req == request` 触发 break；注意紧接着的细节——此时 r1 自己 free 的块已回到池里（空闲 0→1）、算术上够它领 1 个 token，但环**不在本拍重试**：break 发生在重试之前。恢复统一走下一拍的 WAITING 准入通道（整序列门与水位都在那条路上，站 10），语义与账本才一致。B-3 兑现：同一请求带着 16 token 命中 + 1 个补算回来了——**放弃不是死亡**。整个环的样子一张图：
 
 ![抢占重试环](../diagrams/ch11-fig-preempt-retry-ring.png)
 
@@ -211,14 +215,14 @@ True
                             token_budget += num_scheduled_tokens.pop(preempted_req_id)
                             req_to_new_blocks.pop(preempted_req_id) # 回滚 token/块  # L598-L600
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
-                            # … 省略：encoder 输入的预算归还六行（L602-L612，
+                            # … 省略：encoder 输入的预算归还十一行（L602-L612，
                             #       多模态正交）……
                             req_index -= 1                          # 扫描点回退一格 # L613
                     else:
                         preempted_req = self.running.pop()          # FCFS 抢队尾    # L615
 ```
 
-FCFS 抢队尾的理由，上一章给过直觉（剧场请走最晚进场的观众），这里补全论证。running 列表按调度准入顺序 `append`，队尾就是**最晚加入者**——最「年轻」的请求。抢它两头都划算：对 FCFS 公平序破坏最小（等得最久的队头永远安全）；已投入的 forward 通常最少（刚完成 prefill 或刚恢复），重算损失通常最小。但注意这是启发式不是最优：一个跑了很久、输出很长的老请求，重算成本可以远超一个新请求——v1 不做精确的「重算成本」比较（那要给每个请求维护成本模型），**选序即策略**，位置就是全部判据。PRIORITY 策略换成 `(priority, arrival_time)` 字典序取最大——优先级最低者、同级里最晚到者——并且因为被抢者可能排在本拍扫描点**之前**（已经领过 token、块、预算），必须把这些本拍已领资源一样样退回来（`token_budget +=`、`req_to_new_blocks.pop`、`req_index -= 1`）；FCFS 没有这个负担：队尾必然排在扫描点之后、本拍还没记过账，抢它零回滚。实测把「只看座次」钉死（配套精简版；池 5 块，r1 是 32-token prompt（2 块，最大占用者）、r2/r3 各 16-token（各 1 块，唯一差别是入列顺序——r3 的 arrival_time 1002.0 三者最晚））：
+FCFS 抢队尾的理由，上一章给过直觉（剧场请走最晚进场的观众），这里补全论证。running 列表按调度准入顺序 `append`，队尾就是**最晚加入者**——最「年轻」的请求。抢它两头都划算：对 FCFS 公平序破坏最小（等得最久的队头永远安全）；已投入的 forward 通常最少（刚完成 prefill 或刚恢复），重算损失通常最小。但注意这是启发式不是最优：一个跑了很久、输出很长的老请求，重算成本可以远超一个新请求——v1 不做精确的「重算成本」比较（那要给每个请求维护成本模型），**选序即策略**，位置就是全部判据。PRIORITY 策略换成 `(priority, arrival_time)` 字典序取最大——优先级最低者、同级里最晚到者（vLLM 约定 priority 数值越小优先级越高，类似 Unix 的 nice 值——所以取最大恰是挑优先级最低者）——并且因为被抢者可能排在本拍扫描点**之前**（已经领过 token、块、预算），必须把这些本拍已领资源一样样退回来（`token_budget +=`、`req_to_new_blocks.pop`、`req_index -= 1`）；FCFS 没有这个负担：队尾必然排在扫描点之后、本拍还没记过账，抢它零回滚。实测把「只看座次」钉死（配套精简版；池 5 块，r1 是 32-token prompt（2 块，最大占用者）、r2/r3 各 16-token（各 1 块，唯一差别是入列顺序——r3 的 arrival_time 1002.0 三者最晚））：
 
 <!-- trace: m2 -->
 | 拍 | running 序（入列序=FCFS 序） | 受害者与理由 | 各请求持块 r1/r2/r3 | 各请求被抢次数 |
@@ -234,7 +238,7 @@ FCFS 抢队尾的理由，上一章给过直觉（剧场请走最晚进场的观
 
 ## 六件事：退房的全部手续（站 5）
 
-选好了受害者，接下来执行。`_preempt_request` 是本章第一主角的完整副词表——被抢不是被删除，是**退房重排**：
+选好了受害者，接下来执行。`_preempt_request` 是被抢那一瞬的完整动作清单——被抢不是被删除，是**退房重排**：
 
 ```python
 # vllm/v1/core/sched/scheduler.py:L1274-L1315
@@ -284,7 +288,7 @@ FCFS 抢队尾的理由，上一章给过直觉（剧场请走最晚进场的观
                                                    #    登记本拍被抢集（通告 worker） # L1315
 ```
 
-六件事（①归块、②置态、③清零、④清草稿、⑤stale 平行账、⑥记账回队头，顺手还有撤挂账、清占位、登记通告三笔）一口气在同一函数内顺序完成，无 IO、无异常出口——中途不可观测，外界看到的永远是「之前」或「之后」。逐件读：**①归还全部块**是「扔 KV」的执行现场，注意 `_free_request_blocks` 走到块池那层只动引用计数和自由队列、**块哈希留在表里**——这一笔是站 9 前缀重命中的全部伏笔，此处按住不表。**③进度清零**是 recompute-only 的语义本体：`num_computed_tokens = 0`，恢复时这条请求与新请求在账本上无法区分（除了状态是 PREEMPTED 不是 WAITING）。**⑤在途输出记入平行账**单独开一小节讲，它是本章最精巧的协议。**⑥被抢次数 +1** 是只增不减的字段——请求一生的累计伤疤，官方基准脚本用它观测护栏效果（站 10 见）；紧接着的**回 waiting 队头**用的正是上一章埋过伏笔的 `prepend_request`（`appendleft`）：被抢者优先恢复，别让它在队尾再排一遍队。登记进 `reset_preempted_req_ids` 的那一笔，拍末随 `SchedulerOutput.preempted_req_ids` 发给 worker（`vllm/v1/core/sched/scheduler.py:L1217`）——跨进程的「此人被抢」通告。docstring 里那句 NOTE 也值得记：调用方必须先把请求从 running 里 pop 出来，本函数不管队列——职责切得干净。实测把六件事的前后账面拍成快照（配套精简版；池 2 块，r1/r2 各 16-token，w1 在 r2 之后入 waiting；拍 2 前预置 r2.spec_token_ids=[9,9]、r2.num_in_flight_tokens=2——后者是人工置位模拟异步交错，同步引擎此处为 0）：
+六件事（①归块、②置态、③清零、④清草稿、⑤stale 平行账、⑥记账回队头，顺手还有撤挂账、清占位、登记通告三笔）一口气在同一函数内顺序完成，除入口断言外无 IO、无异常出口——中途不可观测，外界看到的永远是「之前」或「之后」。逐件读：**①归还全部块**是「扔 KV」的执行现场，注意 `_free_request_blocks` 走到块池那层只动引用计数和自由队列、**块哈希留在表里**——这一笔是站 9 前缀重命中的全部伏笔，此处按住不表。**③进度清零**是 recompute-only 的语义本体：`num_computed_tokens = 0`，恢复时这条请求与新请求在账本上无法区分（除了状态是 PREEMPTED 不是 WAITING）。**⑤在途输出记入平行账**单独开一小节讲，它是本章最精巧的协议。**⑥被抢次数 +1** 是只增不减的字段——请求一生的累计伤疤，官方基准脚本用它观测护栏效果（站 10 见）。紧随其后那两行 `if self.log_stats: record_event(PREEMPTED)` 是生命周期事件埋点（QUEUED/SCHEDULED/PREEMPTED 三类，随输出回传前端，用于算排队时长与首 token 延迟；`log_stats` 开着才记）——一个请求的一生，除账本之外还留这一份对外的时间线；紧接着的**回 waiting 队头**用的正是上一章埋过伏笔的 `prepend_request`（`appendleft`）：被抢者优先恢复，别让它在队尾再排一遍队。登记进 `reset_preempted_req_ids` 的那一笔，拍末随 `SchedulerOutput.preempted_req_ids` 发给 worker（`vllm/v1/core/sched/scheduler.py:L1217`）——跨进程的「此人被抢」通告。docstring 里那句 NOTE 也值得记：调用方必须先把请求从 running 里 pop 出来，本函数不管队列——职责切得干净。实测把六件事的前后账面拍成快照（配套精简版；池 2 块，r1/r2 各 16-token，w1 在 r2 之后入 waiting；拍 2 前预置 r2.spec_token_ids=[9,9]、r2.num_in_flight_tokens=2——后者是人工置位模拟异步交错，同步引擎此处为 0）：
 
 <!-- trace: m3 -->
 | 拍·时点 | r2.status | computed | spec_token_ids | stale | in_flight | 持块/池空闲 | waiting 队列 | 被抢次数 | cached 哈希 |
@@ -303,20 +307,20 @@ FCFS 抢队尾的理由，上一章给过直觉（剧场请走最晚进场的观
 
 六件事里最反直觉的是⑤：被抢请求「已经发出去还没回来」的输出 token 怎么办？直觉的答案要么「照常送达」要么「扔掉」，v1 的答案是**两条都要，但记账分开**：token 照常送达，账本一刀切开——`num_stale_output_tokens = num_in_flight_tokens`（L1307）。
 
-为什么不能直接扔？源码注释给了理由（L1297-L1299 原话的逻辑）："dropping them would perturb spec-decode acceptance"——投机解码的接受率统计要数「草稿对了几个」，凭空吞掉在途 token 会让统计失真，而这套统计是动态调草稿数的依据。为什么送达却又不能记正常的账？因为③刚把 `num_computed_tokens` 清零、把 `num_output_placeholders` 置 0——这些计数器已经归零，stale 输出再走正常路径去扣它们就是 underflow（下一章 AsyncScheduler 的覆写里有对应的断言注释）。所以协议是：**送达不动账，另立一本冲销账**——stale 记下份额，此后每个在途步的输出回来时，热循环按当拍调度数「锁步冲销」一份（站 12 见 L1737-L1743 原文），份额清零之前**恢复被推迟**（站 8 见 L713-L722）。还有一个源码注释里点破的细节：赋值用的是 `=` 不是 `+=`——注释原话 "num_in_flight_tokens already includes any undrained stale share, so assign rather than accumulate"（在途计数本就含着未排干的旧 stale 份额，赋值即可、累加会重复计）。第二条形态是 **drop-mode**：`drop_stale_output` 旗标立起时整段丢弃、不送达——两种来源，一是同拍抢占+恢复（reset_prefix_cache 管理接口的场景：那些位置反正马上要重采，交付反而乱序；docstring 原话 "whose same-step resume would otherwise deliver tokens out of order"），二是 KV connector 有未决交接时（P/D 场景，Part IV 末章点到即止）。全协议七幕实测（配套精简版；深度 2 的异步模拟——P1 在调度后、输出回来前人工置 in_flight=2 模拟批队列深度，P4 用同一 scheduler_output 二次回账模拟第 2 个在途步返回；同步引擎的对照见 P7）：
+为什么不能直接扔？源码注释给了理由（L1297-L1299 原话的逻辑）："dropping them would perturb spec-decode acceptance"——投机解码的接受率统计要数「草稿对了几个」，凭空吞掉在途 token 会让统计失真，而这套统计是动态调草稿数的依据。为什么送达却又不能记正常的账？因为③刚把 `num_computed_tokens` 清零、把 `num_output_placeholders` 置 0——这些计数器已经归零，stale 输出再走正常路径去扣它们就是 underflow（下溢——把已经归零的计数器再往下扣成负数；下一章 AsyncScheduler 的覆写里有对应的断言注释）。所以协议是：**送达不动账，另立一本冲销账**——stale 记下份额，此后每个在途步的输出回来时，热循环按当拍调度数「锁步冲销」一份（站 12 见 L1737-L1743 原文），份额清零之前**恢复被推迟**（站 8 见 L713-L722）。还有一个源码注释里点破的细节：赋值用的是 `=` 不是 `+=`——注释原话 "num_in_flight_tokens already includes any undrained stale share, so assign rather than accumulate"（在途计数本就含着未排干的旧 stale 份额，赋值即可、累加会重复计）。第二条形态是 **drop-mode**：`drop_stale_output` 旗标立起时整段丢弃、不送达。来源有两种。一是同拍抢占+恢复：`reset_prefix_cache` 是清前缀缓存的管理接口（scheduler.py:L2423-L2449），它会当场把全部在场请求逆序抢占、又在同一步内放回重调度（源码注释原话 "forcing preemption + resumption in the same step"）——「抢」与「恢复」挤进同一拍，那些位置反正马上要重采，交付反而乱序（docstring 原话 "whose same-step resume would otherwise deliver tokens out of order"）。二是 KV connector 有未决交接（P/D——prefill 与 decode 分离部署的场景，Part IV 末章点到即止）：判据正是抢占环里传的 `requires_kv_delivery`——被抢后块已还池、未决交接随之失效，在途输出只能整段丢弃。全协议七幕实测（配套精简版；深度 2 的异步模拟——P1 在调度后、输出回来前人工置 in_flight=2 模拟两步在途，P4 用同一 scheduler_output 二次回账模拟第 2 个在途步返回；同步引擎的对照见 P7）：
 
 <!-- trace: m4 -->
 | 阶段 | 动作 | in_flight | stale | drop | 送达 | 状态 |
 |---|---|---|---|---|---|---|
 | P1 | 调度后、输出回来前被抢（async 模拟） | 2 | 2 | false | — | PREEMPTED·回 waiting 队头 |
 | P2 | 第 1 个在途输出到达 | 2→1 | 2→1 | false | [42] | PREEMPTED |
-| P3 | 下一拍 schedule：stale>0 且非 drop | 1 | 1 | false | [] | 推迟恢复→skipped_waiting |
+| P3 | 下一拍 schedule：stale>0 且非 drop | 1 | 1 | false | [] | 推迟恢复→skipped_waiting（候位隔离队，「两条队」一节展开） |
 | P4 | 第 2 个在途输出到达（同一 out 二次回账） | 1→0 | 1→0 | false | [43] | PREEMPTED（已排空） |
 | P5 | 下一拍恢复 | 0 | 0 | false | [44] | RUNNING·resumed（重命中 16+补 3） |
 | P6 | drop-mode 抢占（同拍抢占+恢复形态） | 1→0 | 1→0 | true | [] | 整段丢弃：42 不送达不入账 |
 | P7 | 同步版自中和（对照） | 0 | 0 | false | — | 上拍已回账→stale 恒 0 |
 
-P1→P5 是主形态：份额 2→1→0 两拍排空、第三拍恢复，期间 P2/P4 的 token [42][43] 照常送达，P5 恢复后新输出 [44] 接上——用户侧输出流不断流。P3 那一拍是「推迟恢复」：stale 还有 1 未排干，此刻恢复会**重采一个稍后要送达的位置**（正确性窗口不超过管线深度）。P6 是 drop-mode：整段作废。P7 是最重要的一行对照——**同步调度下这套协议自中和**：抢占发生在第 ① 拍、而上一拍的第 ⑤ 拍早已把在途账清零，被抢那一刻 in_flight 恒 0、stale 恒 0，协议空转。它是给异步调度（下一章主角、v0.27.1 服务的默认形态）与流水线并行预备的账单——本 pin 前三个月里此域就有三个修复（#42117、#46066、#48245，外部 PR 史），精巧的协议也是修出来的。双泳道一张图：
+P1→P5 是主形态：份额 2→1→0 两拍排空、第三拍恢复，期间 P2/P4 的 token [42][43] 照常送达，P5 恢复后新输出 [44] 接上——用户侧输出流不断流。P5 行「补 3、只送 1」的差额正是协议的收口：补的三个位置（prefill 顺手产出的首 token 与 42、43）都已送达过，此刻只是重建 KV 的输入、不再重复送达；一次算 3 个位置的 forward 只在末位采出新 token（44）——同 recompute「prompt 拼上已生成 token 当新 prompt」的输入化口径。P3 那一拍是「推迟恢复」：stale 还有 1 未排干，此刻恢复会**重采一个稍后要送达的位置**（正确性窗口不超过管线深度——「管线深度」指同时在途、未回账的步数，本模拟为 2；与后文「流水线并行」的「流水线」同一个词）。P6 是 drop-mode：整段作废。P7 是最重要的一行对照——**同步调度下这套协议自中和**：抢占发生在第 ① 拍、而上一拍的第 ⑤ 拍早已把在途账清零，被抢那一刻 in_flight 恒 0、stale 恒 0，协议空转。它是给异步调度（下一章主角、v0.27.1 服务的默认形态）与流水线并行（把模型按层切成几段、分到多卡接力执行的部署形态，第 34 章展开）预备的账单——本 pin 前三个月里此域就有三个修复（#42117、#46066、#48245，外部 PR 史），精巧的协议也是修出来的。双泳道一张图：
 
 ![stale 输出的平行账](../diagrams/ch11-fig-stale-drain.png)
 
@@ -338,7 +342,7 @@ P1→P5 是主形态：份额 2→1→0 两拍排空、第三拍恢复，期间 
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
                 if num_running >= self.max_num_running_reqs:
-                    break                          # 在座封顶（上一章第二道闸）    # L691
+                    break                          # 在座封顶（上一章第二道闸）    # L692
 
                 request_queue = self._select_waiting_queue_for_scheduling()
                 assert request_queue is not None
@@ -349,7 +353,9 @@ P1→P5 是主形态：份额 2→1→0 两拍排空、第三拍恢复，期间 
                 if self._is_blocked_waiting_status(
                     request.status
                 ) and not self._try_promote_blocked_waiting_request(request):
-                    # … 省略：REMOTE_KVS 的 debug 日志三行（L704-L708）……
+                    # … 省略：request_id 取行（L698，消费者就是下面
+                    #       那条日志）与 REMOTE_KVS 的 debug 日志（L704-L708
+                    #       五行）……
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue                        # 阻塞态：跳过，不卡队头        # L711
@@ -366,7 +372,7 @@ P1→P5 是主形态：份额 2→1→0 两拍排空、第三拍恢复，期间 
                     continue                        # stale 未排空：推迟恢复一拍    # L722
 ```
 
-`if not preempted_reqs` 是上一章「第一道闸」的正身：本拍发生过抢占（被抢集非空）= 显存紧张的信号，整个收新阶段跳过。上一章给的是现象与直觉（刚赶过人再迎新客，多半下一拍还得再赶），本章补全因果链与代价账。因果：刚被抢者回到 waiting 队头，此刻若继续收新，新请求进来立刻分走刚腾出的块——被抢者的恢复遥遥无期，而新请求自己也会在下一次池子见底时被抢（它最年轻）。守卫用「一拍不收新」把这个抖动环剪断。代价也真实：突发新请求至少多等一拍；更根本的，RUNNING 绝对优先 + 无准入拒客（到达率超服务能力时只排队不拒绝）意味着高负载下排队延迟没有上界——这是[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)立过的「TPOT 优先、TTFT 让路」取舍在抢占侧的延长线。还有一条上一章见过的机制在此闭环：守卫**只关一拍**——判定用的是本拍局部变量 `preempted_reqs`，步末 `_update_after_schedule` 把调度器侧的集合**换新而非清空**（上一章实测过：输出握着旧集引用，就地 clear 会连带清空通告），下一拍守卫必开。守卫的实测（配套精简版；场景 A：池 8 块，r1=16-token（1 块）、r2=112-token（7 块，队尾）；场景 B：池 2 块，r1=32-token、victim=16-token）：
+`if not preempted_reqs` 是上一章「第一道闸」的正身：本拍发生过抢占（被抢集非空）= 显存紧张的信号，整个收新阶段跳过。条件里还并着另一个合取项 `self._pause_state == PauseState.UNPAUSED`——引擎级暂停开关（三态：正常 / 暂停收新 / 全停，管理接口用），本章路径恒为正常态，机制不属本章，略。上一章给的是现象与直觉（刚赶过人再迎新客，多半下一拍还得再赶），本章补全因果链与代价账。因果：刚被抢者回到 waiting 队头，此刻若继续收新，新请求进来立刻分走刚腾出的块——被抢者的恢复遥遥无期，而新请求自己也会在下一次池子见底时被抢（它最年轻）。守卫用「一拍不收新」把这个抖动环剪断。代价也真实：突发新请求至少多等一拍；更根本的，RUNNING 绝对优先 + 无准入拒客（到达率超服务能力时只排队不拒绝）意味着高负载下排队延迟没有上界——这是[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)立过的「TPOT 优先、TTFT 让路」取舍在抢占侧的延长线。还有一条上一章见过的机制在此闭环：守卫**只关一拍**——判定用的是本拍局部变量 `preempted_reqs`，步末 `_update_after_schedule` 把调度器侧的 `reset_preempted_req_ids` **换新而非清空**（上一章实测过：输出握着旧集引用，就地 clear 会连带清空通告），下一拍守卫必开。「本拍被抢」这条信息至此三个化身串成一线：环内局部列表 `preempted_reqs`（守卫判据）→ 调度器字段 `reset_preempted_req_ids`（站 5 六件事里逐笔登记，步末在此换新而非清空）→ 拍末打包的 `SchedulerOutput.preempted_req_ids`（发给 worker 的跨进程通告）——谁在哪一拍读哪个集合，顺着这条线走。守卫的实测（配套精简版；场景 A：池 8 块，r1=16-token（1 块）、r2=112-token（7 块，队尾）；场景 B：池 2 块，r1=32-token、victim=16-token）：
 
 <!-- trace: m5 -->
 | 拍 | 本拍调度 | 池空闲 | 被抢 | 守卫/不对称判定 |
@@ -377,7 +383,7 @@ P1→P5 是主形态：份额 2→1→0 两拍排空、第三拍恢复，期间 
 | B-1 | {r1:32} | 2→0 | [] | victim 准入需 1 块 > 空闲 0 → None 只 break：在场请求无人被抢 |
 | B-2 | {} | 0→2 | [r1] | RUNNING 侧同信号才触发抢占：r1 自我牺牲；victim 仍 WAITING、被抢 0 次 |
 
-A-2 是守卫的 load-bearing 场景：抢占后空闲明明还有 6 块、足够 r2 恢复（重命中 112 只差 1 个新块），守卫照样关闸——它不问余量、只问「本拍抢过没有」。多等一拍的延迟，换掉一次几乎必然的再抢占。B 场景是两扇门的不对称闭环：WAITING 侧 victim 分不到块只 break、在场者无人被抢；同一信号在 RUNNING 侧（B-2）才触发抢占。这个不对称是**结构性的**——抢占环只写在 RUNNING 循环里（L577-L629），WAITING 循环里 None 的出口只有 break（L987-L994，站 10 见原文）——不靠运行时检查，靠代码布局保证。
+A-2 是守卫的承重场景：抢占后空闲明明还有 6 块、足够 r2 恢复（重命中 112 只差 1 个新块），守卫照样关闸——它不问余量、只问「本拍抢过没有」。多等一拍的延迟，换掉一次几乎必然的再抢占。B 场景是两扇门的不对称闭环：WAITING 侧 victim 分不到块只 break、在场者无人被抢；同一信号在 RUNNING 侧（B-2）才触发抢占。这个不对称是**结构性的**——抢占环只写在 RUNNING 循环里（L577-L629），WAITING 循环里 None 的出口只有 break（L987-L994，站 10 见原文）——不靠运行时检查，靠代码布局保证。
 
 ### 两条队：阻塞态的隔离区
 
@@ -403,7 +409,7 @@ A-2 是守卫的 load-bearing 场景：抢占后空闲明明还有 6 块、足�
         if self.policy == SchedulingPolicy.FCFS:
             return self.skipped_waiting or self.waiting or None    # FCFS：skipped 优先 # L2066
         # PRIORITY mode: compare queue heads when both queues are non-empty.
-        # … 省略：PRIORITY 的两队队头比较五行（L2068-L2073，默认不走）……
+        # … 省略：PRIORITY 的两队队头比较五行（L2069-L2073，默认不走）……
 ```
 
 三个阻塞子态（状态机表里值 2/3/4 的那三位）在**入队时**就被路由进 `skipped_waiting` 隔离队；每拍收新先看隔离队（FCFS 下 skipped 优先）。遍历到阻塞队头时，花一次 `peek` + 一次提升尝试（`_try_promote_blocked_waiting_request`——条件满足就把状态提回 WAITING/PREEMPTED，不满足返回 False），失败就 pop 进本拍的临时收集队 `step_skipped_waiting`、继续下一位——**队头阻塞的代价从「堵住整条队」降为「每拍一次 O(1) 的张望」**。被跳过的也不饿死：步末整批插回隔离队队头——
@@ -457,7 +463,9 @@ A-2 是守卫的 load-bearing 场景：抢占后空闲明明还有 6 块、足�
                                                           # 沿自己的块哈希查前缀命中 # L766
 ```
 
-新请求查缓存，查的是「有没有**别的**请求算过同样的开头」；被抢者查缓存，查的是「有没有**我自己**刚扔下的开头」。而答案是大概率有——因为六件事之①归还块时，块池只做了减引用计数、挂回自由队列这两件事，**块哈希从头到尾没被清过**：
+（摘录第三项的源码注释点到了 Marconi shared-prefix junction——一个外部共享前缀缓存方案，`shared_prefix_boundary` 记它要钉住的共享前缀边界；[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)立过，本章路径恒 0，Part IV 再见。）
+
+新请求查缓存，查的是「有没有**别的**请求算过同样的开头」；被抢者查缓存，查的是「有没有**我自己**刚扔下的开头」。而答案是大概率有——因为六件事之①归还块时，块池只做了减引用计数、挂回自由队列（那条队列按 LRU 排——LRU 即 least recently used，最近最少使用：最久没人用的块排最前、新分配先拿它）这两件事，**块哈希从头到尾没被清过**：
 
 ```python
 # vllm/v1/core/block_pool.py:L719-L742
@@ -474,10 +482,10 @@ A-2 是守卫的 load-bearing 场景：抢占后空闲明明还有 6 块、足�
         blocks_without_hash = []
         for block in ordered_blocks:
             block.ref_cnt -= 1                          # 只动引用计数              # L731
-            if block.ref_cnt == 0 and not block.is_null:
+            if block.ref_cnt == 0 and not block.is_null:  # is_null：无真实 KV 的占位块 # L732
                 # When caching is disabled we always append for better
                 # GPU cache locality from reusing recently used blocks
-                if block.block_hash is None and self.enable_caching:
+                if block.block_hash is None and self.enable_caching:  # L735
                     blocks_without_hash.append(block)   # 无哈希块：先驱逐          # L736
                 else:
                     blocks_with_hash.append(block)      # 有哈希块：挂 LRU 尾       # L738
@@ -487,7 +495,7 @@ A-2 是守卫的 load-bearing 场景：抢占后空闲明明还有 6 块、足�
         self.free_block_queue.append_n(blocks_with_hash)
 ```
 
-整个函数没有一行碰 `block_hash` 与哈希表——被抢请求的满块留在表里当驱逐候选，恢复时 `get_computed_blocks` 沿它自己的 `block_hashes`（每产出一个 token 都在增量续算的指纹，站 13 还会见到）逐块查表，大概率一路命中到只剩尾段。查询侧还有一条上限规则，写在 KVCacheManager 的 NOTE 里：
+整个函数没有一行改写 `block_hash`、也没有一行把它从哈希表摘除——它只在 L735 的分类判定里被读取一次，用来决定释放的块归哪个堆（无哈希块先驱逐）。（代码注释里的 APC 是 automatic prefix caching 的缩写——自动前缀缓存，这套满块哈希表机制的名字。）被抢请求的满块留在表里当驱逐候选，恢复时 `get_computed_blocks` 沿它自己的 `block_hashes`（每产出一个 token 都在增量续算的指纹，站 13 还会见到）逐块查表，大概率一路命中到只剩尾段。查询侧还有一条上限规则，写在 KVCacheManager 的 NOTE 里：
 
 ```python
 # vllm/v1/core/kv_cache_manager.py:L246-L259
@@ -507,15 +515,15 @@ A-2 是守卫的 load-bearing 场景：抢占后空闲明明还有 6 块、足�
         max_cache_hit_length = request.num_tokens - 1    # 命中上限=全长-1         # L259
 ```
 
-上限 `num_tokens − 1` 的道理上一章立过（全命中也要重算最后一个 token，否则没有 logits）；NOTE 的后半句是新的：命中数必须**块对齐**，于是「重算最后 1 个 token」会放大成「重算最后**一块**」。命中为什么是连续前缀、查到第一个 miss 为什么能停？这依赖块哈希的**链式结构**——每块哈希把父块哈希和本块 token 一起算进去（`hash_i = H(parent_{i-1}, tokens_i)`），前缀任何一处变了、后面全部失效，所以 miss 之后必 miss、连续命中计数无需回溯就是最长可命中前缀。链式哈希怎么增量算、驱逐顺序的两个不变量，是 Part IV 前缀缓存站的正戏，本章只立「free 不清哈希」这一条事实。两个场景实测（配套精简版；场景 A：池 4 块、r1 64-token prompt 恰 4 块——自我被抢后恢复；场景 B：池 8 块、rA/rB 同 64-token prompt——rA 跑完退场后 rB 准入）：
+上限 `num_tokens − 1` 的道理上一章立过（全命中也要重算最后一个 token，否则没有 logits）；NOTE 的后半句是新的：命中数必须**块对齐**，于是「重算最后 1 个 token」会放大成「重算最后**一块**」。命中为什么是连续前缀、查到第一个 miss 为什么能停？这依赖块哈希的**链式结构**——每块哈希把父块哈希和本块 token 一起算进去（$`hash_i = H(parent_{i-1}, tokens_i)`$），前缀任何一处变了、后面全部失效，所以 miss 之后必 miss、连续命中计数无需回溯就是最长可命中前缀。链式哈希怎么增量算、驱逐顺序的两个不变量，是 Part IV 前缀缓存站的正戏；本章只立「free 不清哈希」这一条事实——[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)留的那半句「被 free 的块为什么还能命中」，先把事实这一半还上，机制正戏仍归 Part IV。两个场景实测（配套精简版；场景 A：池 4 块、r1 的 64-token prompt 恰占 4 块——注意 prefill 拍已顺手产出首个输出 token，被抢时账面是 65 token（64 prompt + 1 output），decode 正要为第 65 个位置领第 5 块才见底，自我被抢后恢复；场景 B：池 8 块、rA/rB 同 64-token prompt——rA 跑完退场后 rB 准入，rB 是全新请求、账面恰 64 token）：
 
 <!-- trace: m7 -->
 | 拍 | 事件 | 命中 token | 补算 token | cached 哈希 | 备注 |
 |---|---|---|---|---|---|
 | A-2 | 自我被抢：4 块归还池 | — | — | 4（不清） | 池空闲 0→4，哈希留表 |
-| A-3 | 恢复：重命中自己的 4 块 | 64 | 1 | 4 | cap=64；无前缀缓存的世界=65 全量重算 |
+| A-3 | 恢复：重命中自己的 4 块 | 64 | 1 | 4 | cap=64（=num_tokens-1=65-1）；无前缀缓存的世界=65 全量重算 |
 | B-1 | rA 完成 free（max_tokens=1 长度封顶） | — | — | 4（不清） | 终点的哈希=下一个请求的可命中前缀 |
-| B-2 | rB 同 prompt 准入 | 48 | 16 | 4 | cap=63→按块向下取 3 块：第 4 块整块重算（哈希在表也被 cap 挡下） |
+| B-2 | rB 同 prompt 准入 | 48 | 16 | 4 | cap=63（=num_tokens-1=64-1）→按块向下取 3 块：第 4 块整块重算（哈希在表也被 cap 挡下） |
 
 A 场景是「v1 敢扔」的直接答案：65 token 的重算账单，实际只补 1——「重算」从来是「重载元数据 + 补算未命中尾段」，抢占的期望代价是尾段而非全长。B 场景是同一机制的另一面：rA 走完一生退场时留下的哈希，让同 prompt 的 rB 命中 48/64——**终点即下一个请求的礼物**。但最坏情况也必须看全：哈希留表不等于永远留表——块池的自由队列是 LRU 驱逐序，新分配吃紧时这些块会被真正分走，届时被抢者恢复就是全量重算（O(prompt+output) 的 GPU 重跑）。驱逐从哪头吃起、为什么尾块先当驱逐候选，同样归 Part IV——本章先把两头事实都放在这：**命中率极高时重算近乎免费，块被逐出时重算无界**，真实代价落在这两者之间，由负载决定。一张图收拢：
 
@@ -532,7 +540,7 @@ A 场景是「v1 敢扔」的直接答案：65 token 的重算账单，实际只
 ```python
 # vllm/v1/core/sched/scheduler.py:L965-L994
                 reserved_blocks = 0
-                # … 省略：load_kv_async 的在途预约护轨五行（L966-L971，
+                # … 省略：load_kv_async 的在途预约护轨六行（L966-L971，
                 #       connector 场景防死锁，Part IV 末章）……
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
@@ -559,9 +567,9 @@ A 场景是「v1 敢扔」的直接答案：65 token 的重算账单，实际只
 
 `full_sequence_must_fit`（整序列必须装得下）上一章整节立过：整条序列的块需求对比空闲、放不下直接 None——它在**源头**上让「prefill 跑到一半发现住不下」的 mid-prefill 抢占变稀有。`has_scheduled_reqs`（本步已有在场者）是本章新主角的开关——**水位（watermark）**，本章三个讲透概念的最后一个。先讲概念本身。
 
-「水位」在系统工程里借自洪水退去留在墙上的那道刻度线（high water mark 的字面本义）：在缓冲区或资源池上预先划一条阈值，用量越过或跌破就触发动作。工程里最常见的形态是**成对阈值**——比如 Netty 的写缓冲水位（[官方 javadoc](https://netty.io/4.1/api/io/netty/channel/WriteBufferWaterMark.html)：排队字节超过高水位，`Channel.isWritable()` 开始返回 false；跌回低水位之下才恢复 true）——一对阈值中间留出迟滞带，避免在单一临界点附近反复开关抖动，本质是给生产者施加背压。vLLM 的水位是**单阈值、准入侧**的用法：新收一个 waiting/preempted 请求时，除了它要的块，还要求「收完后剩余空闲块 ≥ 总块数 × watermark」——宁可不收，不让在跑请求的增长撞墙。拿一个说明性例子走：池共 100 块、watermark=0.10，此刻空闲 30 块，队头来了要 25 块的请求——裸判断 30 ≥ 25 收；带水位判断 30 − 25 = 5 < 10，拒（推迟准入，等池子更空）。被拒的请求只是继续排队，那 10 块余量留给已在跑的请求们每拍 +1 token 的增长。与 Netty 的对照一句话：那边是「涨过 64KB 关阀、跌回 32KB 开阀」的迟滞带，这边是只在「收新」这一个动作上设单阈值——不是防开关抖动，是给准入留余量。
+「水位」在系统工程里借自洪水退去留在墙上的那道刻度线（high water mark 的字面本义）：在缓冲区或资源池上预先划一条阈值，用量越过或跌破就触发动作。工程里最常见的形态是**成对阈值**——比如 Netty（Java 生态用得最广的网络框架）的写缓冲水位（[官方 javadoc](https://netty.io/4.1/api/io/netty/channel/WriteBufferWaterMark.html)：排队字节超过高水位，`Channel.isWritable()` 开始返回 false；跌回低水位之下才恢复 true）——一对阈值中间留出迟滞带，避免在单一临界点附近反复开关抖动。vLLM 的水位是**单阈值、准入侧**的用法：新收一个 waiting/preempted 请求时，除了它要的块，还要求「收完后剩余空闲块 ≥ 总块数 × watermark」——宁可不收，不让在跑请求的增长撞墙。拿一个说明性例子走：池共 100 块、watermark=0.10，此刻空闲 30 块，队头来了要 25 块的请求——裸判断 30 ≥ 25 收；带水位判断 30 − 25 = 5 < 10，拒（推迟准入，等池子更空）。被拒的请求只是继续排队，那 10 块余量留给已在跑的请求们每拍 +1 token 的增长。与 Netty 的对照一句话：那边是「涨过 64KB 关阀、跌回 32KB 开阀」的迟滞带，这边是只在「收新」这一个动作上设单阈值——不是防开关抖动，是给准入留余量。
 
-vLLM 自己的水位史本身一条钟摆线（旧版源码与 PR 均为一手核实的外部证据）：**v0 出生就带**——块管理器的构造参数 `watermark` 默认 0.01（1%），`watermark_blocks = int(watermark * num_gpu_blocks)`，分配检查里注释原话 "Use watermark to avoid frequent cache eviction"，要求分配后剩余 ≥ watermark_blocks 才放行——一个恒定生效的全局静态垫片。**v1 出生时删掉了**——v1 起初的 KVCacheManager 没有这个参数，思路是换成精确预测（整序列准入门）。**2026 年 6 月又加了回来**（PR [#44594](https://github.com/vllm-project/vllm/pull/44594)，commit 4085ff7cb），动机是精确预测补不上的缺口：输入长度有整序列门兜底，**输出长度未知、不预留**——decode-heavy 负载（输出远长于输入）高并发下，请求都还短时被大量收进来，随后全体增长、池尽、抢占刚收进来的请求、重 prefill、再抢占，循环抖动。PR 作者报告（单点配置：Qwen2.5-7B、KV 池压到近临界）watermark 0.05 时抢占次数 −82%、token 间隔 p99 −56%、端到端 p50 −7%、吞吐 +5.1%——数字是作者报告的单点测量，量级做参考。加回来时的形态与 v0 有三点不同，恰好圈出「精修版」的边界：
+vLLM 自己的水位史本身一条钟摆线（旧版源码与 PR 均为一手核实的外部证据）：**v0.2.7 即已核实带**——块管理器的构造参数 `watermark` 默认 0.01（1%），`watermark_blocks = int(watermark * num_gpu_blocks)`，分配检查里注释原话 "Use watermark to avoid frequent cache eviction"，要求分配后剩余 ≥ watermark_blocks 才放行——一个恒定生效的全局静态垫片。**v1 出生时删掉了**——v1 起初的 KVCacheManager 没有这个参数，思路是换成精确预测（整序列准入门）。**2026 年 6 月又加了回来**（PR [#44594](https://github.com/vllm-project/vllm/pull/44594)，commit 4085ff7cb），动机是精确预测补不上的缺口：输入长度有整序列门兜底，**输出长度未知、不预留**——decode-heavy 负载（输出远长于输入）高并发下，请求都还短时被大量收进来，随后全体增长、池尽、抢占刚收进来的请求、重 prefill、再抢占，循环抖动。PR 作者报告（单点配置：Qwen2.5-7B、KV 池压到近临界）watermark 0.05 时抢占次数 −82%、token 间隔 p99（尾部）−56%、端到端 p50（中位）−7%、吞吐 +5.1%——数字是作者报告的单点测量，量级做参考。加回来时的形态与 v0 有三点不同，恰好圈出「精修版」的边界：
 
 ```python
 # vllm/v1/core/kv_cache_manager.py:L463-L488
@@ -582,7 +590,7 @@ vLLM 自己的水位史本身一条钟摆线（旧版源码与 PR 均为一手�
                 request_id=request.request_id,
                 num_tokens=full_num_tokens,
                 new_computed_blocks=new_computed_block_list,
-                # … 省略：块数预测的参数五行（L479-L484）——「算出需要的块数」，
+                # … 省略：块数预测的参数四行（L480-L483）——「算出需要的块数」，
                 #       预测数学归 Part IV ……
                 apply_admission_cap=True,
             )
@@ -592,7 +600,7 @@ vLLM 自己的水位史本身一条钟摆线（旧版源码与 PR 均为一手�
                 return None                            # 不够，拒之门外           # L488
 ```
 
-三个限定各自防一个坑。**只对 WAITING/PREEMPTED 生效**：RUNNING 请求的 decode 增长不走水位门——若增长也吃水位，每个 decode 步都要过一遍余量检查，正常生成被系统性压制。**只在 has_scheduled_reqs 时生效**：引擎空转后的第一个请求不吃水位——若首拍也计入，空引擎的第一个请求就要「需求 + 水位 ≤ 空闲」，池小或水位大时永不满足，引擎永远起步不了（活性死锁）。**只抬高门槛、不反转判定**：`required = need + watermark_blocks` 与空闲比较，水位非负，只会把「恰好放行」变「拒绝」，绝不会把「拒绝」变「放行」——它是过滤器不是配额。块数换算一行算术：`watermark_blocks = int(watermark × num_blocks)`（构造期一次算好，`vllm/v1/core/kv_cache_manager.py:L170-L171`）。配置面与默认值：
+三个限定各自防一个坑。**只对 WAITING/PREEMPTED 生效**：RUNNING 请求的 decode 增长不走水位门——若增长也吃水位，每个 decode 步都要过一遍余量检查，正常生成被系统性压制。**只在 has_scheduled_reqs 时生效**：引擎空转后的第一个请求不吃水位——若首拍也计入，空引擎的第一个请求就要「需求 + 水位 ≤ 空闲」，池小或水位大时永不满足，引擎永远起步不了（活性死锁）。**只抬高门槛、不反转判定**：`required = need + watermark_blocks` 与空闲比较，水位非负，只会把「恰好放行」变「拒绝」，绝不会把「拒绝」变「放行」——它是过滤器不是配额。对着源码 diff 的读者还会在同函数里撞见第二处 `watermark_blocks`：过了准入门之后，常规分配检查也会把它并入需求、对 `空闲 − reserved_blocks` 的余量再判一次（L521-L527）——两道门用的是同一份 `watermark_blocks`（准入门处按三限定算好），同一限定生效两次，不是重复计费。块数换算一行算术：`watermark_blocks = int(watermark × num_blocks)`（构造期一次算好，`vllm/v1/core/kv_cache_manager.py:L170-L171`）。配置面与默认值：
 
 ```python
 # vllm/config/scheduler.py:L130-L141
@@ -641,7 +649,7 @@ vLLM 自己的水位史本身一条钟摆线（旧版源码与 PR 均为一手�
 #   running requests can grow into it instead of triggering this churn.
 ```
 
-脚本自带可复现配置：并发 200、输入约 300 token、输出约 4000 token（±20% 抖动），KV 池压到约 1.5 倍均值需求——一个「故意把引擎推到抢占抖动」的展示台。到此本章的两道护栏可以合起来看了：守卫（站 7）与水位是同一类病的两层药——**关闸治标**（本拍发生过的紧张，下一拍不收新，一拍即愈）、**水位治本**（准入时就留余量，让增长有处可去）；整序列门管输入长度、水位管输出未知，两道门一起把抢占从「常态」压成「稀有事件」。一张图收拢三限定：
+脚本自带可复现配置：并发 128、输入约 1000 token、输出约 5000 token（±20% 抖动），KV 池压到约 1.5 倍均值需求——一个「故意把引擎推到抢占抖动」的展示台（小坑：脚本头注仍写着旧数字「concurrency 200, input ~300, output ~4000」，环境变量默认值才是实际生效的，以运行为准）。到此本章的护栏可以合起来看了：守卫（站 7）与水位是同一类病的两层药——**关闸治标**（本拍发生过的紧张，下一拍不收新，一拍即愈）、**水位治本**（准入时就留余量，让增长有处可去）；准入侧另有两道门——整序列门管输入长度、水位管输出未知——一起把抢占从「常态」压成「稀有事件」。一张图收拢三限定：
 
 ![水位三限定](../diagrams/ch11-fig-watermark-three-limits.png)
 
@@ -689,7 +697,7 @@ class CachedRequestData:
     resumed_req_ids: set[str]
 ```
 
-注释说尽协议：不在 `resumed_req_ids` 里的请求，本拍新块**追加**到既有块表后；在集合里的，本拍块表**整体替换**旧表。登记发生在拍末打包（`scheduler.py:L1446-L1447`：批次里排在既有成员之后的——被抢重入者必然如此——进集合）。为什么必须替换：被抢时旧块表已全部归还（六件事之①），恢复后的块号组合（命中块挂共享指纹的账、新块是新拨的号）与旧表没有任何继承关系——追加等于把一张已失效的旧表拼在新表后面。实测看通信量的差（配套精简版；池 3 块，r1 48-token prompt 恰 3 块）：
+注释说尽协议（[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)差量协议的代价清单里点过这一句——resumed 请求的 `new_block_ids` 整体替换而非追加、追加语义对不上全变的块表；这里从被抢者的视角补全登记点与通信量）：不在 `resumed_req_ids` 里的请求，本拍新块**追加**到既有块表后；在集合里的，本拍块表**整体替换**旧表。登记发生在拍末打包（`scheduler.py:L1446-L1447`：批次里排在既有成员之后的——被抢重入者必然如此——进集合）。为什么必须替换：被抢时旧块表已全部归还（六件事之①），恢复后的块号组合（命中块挂共享指纹的账、新块是新拨的号）与旧表没有任何继承关系——追加等于把一张已失效的旧表拼在新表后面。实测看通信量的差（配套精简版；池 3 块，r1 48-token prompt 恰 3 块——prefill 拍已顺手产出首个输出 token、账面 49 token（同 m7 场景 A 的口径），cap=48、命中恰 3 块）：
 
 <!-- trace: m9 -->
 | 拍 | r1 状态 | 调度 token | new_block_ids 条目 | resumed? | worker 侧语义 |
@@ -860,6 +868,8 @@ def remove_all(lst: list, items_to_remove: set) -> list:
 | 单元素 {b} | 1 | 原对象（is lst） | 原地删 1 项得 [a,c]（零新分配） |
 | 多元素 {a,c} | 2 | 新列表（is not lst） | 重建 [b,d]；原 4 项不动 |
 
+三条路径语义等价、身份不等价：多元素路径返回新表、原列表原地不动——所以调用方必须接住返回值（docstring 原话 "Callers should use the returned value"）。后面站 15 收尾的 `self.running = remove_all(self.running, stopped_running_reqs)` 正是这么写的；漏写等号，摘除就静默失效。
+
 热循环里还路过一族「乐观记账的补偿机制」，spec 拒绝回扣——投机解码一拍排了 1 真 + 3 草稿、采样只接受了部分时，多记的账要原额划回（`scheduler.py:L1766-L1784`，源码注释原话 "Rejections roll back num_computed_tokens (and, under async scheduling, num_output_placeholders...)"）。它与 stale 协议同族不同职：stale 保输出一致性，回扣保账本收敛。按源码语义推演一例（非运行观测——回扣分支随投机解码从精简版删除，下一章与投机解码章展开）：
 
 <!-- trace: m19 -->
@@ -914,7 +924,7 @@ def check_stop(request: Request, max_model_len: int) -> bool:
     return False
 ```
 
-五判按固定顺序短路：**判 1** 是唯一的否定性门槛——输出还没到 `min_tokens`（用户要求的最低输出长度）时直接 return False，纵使末位已是 EOS 也拦下；**判 2** EOS（模型自带的结束符）、**判 3** stop_token_ids（用户在采样参数里点名的结束 token，命中记进 `stop_reason`）、**判 4** 长度封顶（总长触 `max_model_len` 或输出触 `max_tokens`，两条钳制保证每个请求有限拍必停——[第 2 章](../../ch02-request-lifecycle/narrative/chapter.md)证过）、**判 5** 复读机检测（输出尾部出现指定模式的最小重复次数即停，`check_sequence_repetition` 的 N-gram 匹配在同文件 L10-L59，只在配置了 `repetition_detection` 时才付这个开销，默认 None 短路）。每 token 至多五次谓词、无循环无回溯。命中即置终态——注意置的全是状态机橙带里的 `FINISHED_*`，回写的位置就是站 1 那张表。一个必须再钉一遍的澄清（[第 2 章](../../ch02-request-lifecycle/narrative/chapter.md)立过「两地判停」、此处是引擎侧的正身）：**这里只有 token 编号**——字面意义上的停止词（stop string，字符串子串匹配）不在这道关卡，它在前端 detokenizer 的文本空间里判、发现后反向调 `finish_requests` 通知引擎停火（站 18 见到这个入口）。九个用例覆盖五判全分支与顺序（实测——配套精简版直测 check_stop）：
+五判按固定顺序短路：**判 1** 是唯一的否定性门槛——输出还没到 `min_tokens`（用户要求的最低输出长度）时直接 return False，纵使末位已是 EOS 也拦下；**判 2** EOS（模型自带的结束符）、**判 3** stop_token_ids（用户在采样参数里点名的结束 token，命中记进 `stop_reason`）、**判 4** 长度封顶（总长触 `max_model_len` 或输出触 `max_tokens`，两条钳制保证每个请求有限拍必停——[第 2 章](../../ch02-request-lifecycle/narrative/chapter.md)证过）、**判 5** 复读机检测（输出尾部出现指定模式的最小重复次数即停。参数是个三元组 `RepetitionDetectionParams(max_pattern_size, min_pattern_size, min_count)`：在 min_pattern_size..max_pattern_size 的模式长度里逐个试，尾部连续重复满 min_count 遍即命中。`check_sequence_repetition` 的 N-gram 匹配在同文件 L10-L59，只在配置了 `repetition_detection` 时才付这个开销，默认 None 短路）。每 token 至多五次谓词、无循环无回溯。命中即置终态——注意置的全是状态机橙带里的 `FINISHED_*`，回写的位置就是站 1 那张表。一个必须再钉一遍的澄清（[第 2 章](../../ch02-request-lifecycle/narrative/chapter.md)立过「两地判停」、此处是引擎侧的正身）：**这里只有 token 编号**——字面意义上的停止词（stop string，字符串子串匹配）不在这道关卡，它在前端 detokenizer 的文本空间里判、发现后反向调 `finish_requests` 通知引擎停火（站 18 见到这个入口）。九个用例覆盖五判全分支与顺序（实测——配套精简版直测 check_stop）：
 
 <!-- trace: m13 -->
 | 判 | 场景 | 关键输入 | 返回 | 置态 | stop_reason |
@@ -926,7 +936,7 @@ def check_stop(request: Request, max_model_len: int) -> bool:
 | 3 | stop_token_ids 命中 | 输出 [1,7]，stop=[7] | True | FINISHED_STOPPED | 7 |
 | 4a | 长度封顶（模型上限） | num_tokens 8 ≥ max_model_len 8 | True | FINISHED_LENGTH_CAPPED | — |
 | 4b | 长度封顶（输出上限） | output 2 ≥ max_tokens 2 | True | FINISHED_LENGTH_CAPPED | — |
-| 5 | 重复检测 | 输出 [1,2]×3，参数 (2,1,3) | True | FINISHED_REPETITION | repetition_detected |
+| 5 | 重复检测 | 输出 [1,2]×3；参数 (2,1,3)=（模式最长 2、最短 1、重复满 3 遍） | True | FINISHED_REPETITION | repetition_detected |
 | — | 无命中 | 输出 [5] | False | （未变） | — |
 
 前三行是顺序证明：纵使末位是 EOS，1<3 与 2<3 都被判 1 拦下，第三行 3≥3 放行后判 2 才生效——min_tokens 先于 EOS，写死的。
@@ -1024,12 +1034,13 @@ def check_stop(request: Request, max_model_len: int) -> bool:
         assert request.is_finished()
 
         self._inflight_prefills.discard(request)
-        # … 省略：connector/ec_connector 的收尾钩子与延迟释放判定（L2306-L2323，
+        # … 省略：connector/ec_connector 的收尾钩子（L2306-L2316，
         #       KVConnector 未决交接归 Part IV 末章）……
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
                                                           # 登记已完成集          # L2319
+        # … 省略：多前端分桶登记两行与 delay_free_blocks 并算（L2320-L2323）……
         if not delay_free_blocks:
             self._free_blocks(request)
 
@@ -1131,7 +1142,7 @@ def check_stop(request: Request, max_model_len: int) -> bool:
 | C | list ['r3'] | PREEMPTED | [r3] | waiting+skipped | 同上 free（被抢者住在 waiting） |
 | D | None | WAITING | [r4] | waiting+skipped | 全量 finish（shutdown drain 形态） |
 
-A 与 A' 是幂性的正反两面：第一遍有效、第二遍空手而归；C 行顺带验证被抢者住在 waiting——死法面前人人平等，无论住哪个居所，三队列摘除全覆盖。
+A 与 A' 是幂等性的正反两面：第一遍有效、第二遍空手而归；C 行顺带验证被抢者住在 waiting——死法面前人人平等，无论住哪个居所，三队列摘除全覆盖。
 
 ## 总结：调度器的全副内景
 
@@ -1139,6 +1150,6 @@ A 与 A' 是幂性的正反两面：第一遍有效、第二遍空手而归；C 
 
 1. **抢占是一套完整的事故预案，不是一行 if**。触发（allocate_slots 返回 None，唯一信号）→ 选择（队尾/字典序最大）→ 执行（六件事带回与首调度同构的初态）→ 止损（守卫关闸一拍、推迟恢复到 stale 排空）→ 恢复（前缀重命中 → 水位准入 → resumed 整表替换）。环必有限轮终止（running 只减不增），恢复复用首调度通道（零特判）。
 2. **乐观记账的每一笔都有对账出口**。账本先记 GPU 后算（computed/in_flight 每拍核销归零）、在途输出走平行账（stale 赋值不累加、锁步冲销、排空前不恢复）、spec 拒绝原额回扣——三本账彼此独立，混账就是 underflow，本 pin 前三个月三个修复修的都是这条线上的缝。
-3. **两道护栏把抢占压成稀有事件**。整序列门管输入长度（首块装得下不等于整条装得下）、水位管输出未知（三道限定：只认准入身份（RUNNING 增长不吃）、只在有在场者时计入、默认 0.0 关——吞吐换稳定的旋钮留给用户）；关闸治标、水位治本。守卫与 TPOT→TTFT 的转嫁同源——老请求绝对优先的代价是排队延迟无上界。
+3. **护栏把抢占压成稀有事件**。准入两道门——整序列门管输入长度（首块装得下不等于整条装得下）、水位管输出未知（三道限定：只认准入身份（RUNNING 增长不吃）、只在有在场者时计入、默认 0.0 关——吞吐换稳定的旋钮留给用户）；止损两层药——守卫关闸治标（本拍抢过就一拍不收新）、水位治本（准入留余量）。守卫与 TPOT→TTFT 的转嫁同源——老请求绝对优先的代价是排队延迟无上界。
 
 但调度器的故事还差最后一块：本章反复出现的那几个「同步版里恒 0」的字段——`num_output_placeholders`（异步占位）、stale 协议的真正咬合面、推迟恢复的管线深度——全是为**异步调度**预备的账单，而 v0.27.1 的服务默认跑的就是那个形态。调度器凭什么敢在上一拍的输出还没回来时就把下一拍排出去？[第 12 章《异步调度》](../../ch12-async-scheduling/narrative/chapter.md)拆这颗心脏的重叠版心跳——Part III 的收官一站。
