@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ch03 机制图 2 · O0-O3 优化级预设落地（figure_spec ch03-fig-optimization-levels，模板 state-table）
 
-放大自 L0 启动视角（boot）第 12 站——即本章 L2 章图 center 拍片 ⑥ 『O0-O3 落地』的机制展开。
+放大自 L0 启动视角（boot）第 12 站——即本章 L2 章图 center 节拍 ⑥ 『O0-O3 落地』的机制展开。
 架构归属回指 L2/L0（FIGURE-SYSTEM §3.3）：图右上角指北小签。编译与 CUDA Graph 机制本身
 是 ch19 的门牌，本图只画『旋钮档位如何落到字段终值』。
 
@@ -31,7 +31,7 @@ lc.text(MX, 34, '模式转盘 -O0..-O3：预设递归只填 None——你拧过�
         16.5, lc.C_TXT, 'start', True, maxw=980, tag='title')
 lc.text(MX, 58, 'O0 全关立即启动，O2 默认 VLLM_COMPILE + FULL_AND_PIECEWISE + autotune——用户显式与 enforce_eager 永远压过预设；同一档还能按整份 config 现算（谓词）',
         10.5, lc.C_MUTE, 'start', maxw=1020, tag='subtitle')
-_ch = '放大自 L2 拍片 ⑥ O0-O3 落地 · L0：启动视角（boot）'
+_ch = '放大自 L2 节拍 ⑥ O0-O3 落地 · L0：启动视角（boot）'
 _cw = lc.chip_w(_ch)
 lc.rect(BXR - _cw, 12, _cw, 20, '#ffffff', lc.C_MUTE, rx=9, sw=1.1, dash=True)
 lc.text(BXR - _cw / 2, 26.5, _ch, 9.5, lc.C_BEAT_T, 'middle', True, maxw=_cw - 4, tag='chip')

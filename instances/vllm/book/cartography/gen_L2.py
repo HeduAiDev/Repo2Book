@@ -640,15 +640,16 @@ def draw_flow(f, R, zone_of, captions, badges=(), note_names=(), lanes=None, vse
         # 入点避让目标框顶的站号徽标（exp-2026-08-27 ch11 盲审②带出：直落竖线从
         # waiting→⑥ 落在重叠中点 x=1709.2，恰从 ⑥ 框顶「第8-9站」徽标药丸正中穿过
         # ——_elbow_flow 的入点早有同款避让，直落分支漏网）。位移钳在两框 x 重叠区内
-        # （直落语义不变）。触发式：落点不压徽标的章 x 逐字节不变。
-        if b['y'] > a['y']:
+        # （直落语义不变）；ns 流（南北跨行、竖线穿中排拍片区）不做此避让——其落点已
+        # 由拍片缝让位专管，再挪会破「不穿片」纪律。触发式：落点不压徽标的章逐字节不变。
+        if b['y'] > a['y'] and {zone_of.get(f['from']), zone_of.get(f['to'])} != {'north', 'south'}:
             ox0_, ox1_ = max(a['x'], b['x']), min(a['x'] + a['w'], b['x'] + b['w'])
             for bd in badges:
                 if b['y'] - 12 < bd[3] and bd[1] < b['y'] + 12 and bd[0] - 6 <= x <= bd[2] + 6:
-                    if bd[0] - 8 >= ox0_ + 2:
-                        x = bd[0] - 8
-                    elif bd[2] + 8 <= ox1_ - 2:
-                        x = bd[2] + 8
+                    nx_ = bd[0] - 8 if bd[0] - 8 >= ox0_ else (
+                        bd[2] + 8 if bd[2] + 8 <= ox1_ else x)
+                    if nx_ != x:
+                        x = nx_
         if b['y'] > a['y']:
             y1, y2 = a['y'] + a['h'], b['y']
         else:
@@ -1367,7 +1368,8 @@ def build(spec_path):
             _hx.append(
                 f'<text x="{tx_:.1f}" y="{ty_:.1f}" font-family="{lc.FONT}" font-size="{fs_}" '
                 f'fill="#ffffff" stroke="#ffffff" stroke-width="{sw_:.1f}" stroke-linejoin="round" '
-                f'paint-order="stroke" text-anchor="{anc_}"{b_}>{body_}</text>' + s_)
+                f'paint-order="stroke" text-anchor="{anc_}" data-halo="1"{b_}>{body_}</text>'
+                + s_.replace('>', ' data-halo="1">', 1))
     detail_strings = ([ef_rect] + s_north + [cf_rect] + s_cf_hdr + s_center
                       + s_south + s_flows + s_ef_hdr + _hx)
     warns += lc.WARN

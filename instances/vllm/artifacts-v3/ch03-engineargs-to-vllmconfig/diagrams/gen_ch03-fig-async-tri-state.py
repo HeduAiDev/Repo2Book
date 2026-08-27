@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ch03 机制图 1 · async_scheduling 三态决策（figure_spec ch03-fig-async-tri-state，模板 state-machine）
 
-放大自 L0 启动视角（boot）第 11 站——即本章 L2 章图 center 拍片 ⑤ 『async 三态决策』的机制展开。
+放大自 L0 启动视角（boot）第 11 站——即本章 L2 章图 center 节拍 ⑤ 『async 三态决策』的机制展开。
 架构归属回指 L2/L0（FIGURE-SYSTEM §3.3）：图右上角指北小签。
 
 claim：async_scheduling 进场为 None(默认)时五类不兼容条件全不命中则落到 True，显式 True 对同类
@@ -37,7 +37,7 @@ lc.text(MX, 34, '三态开关：None 逐条排除、True 硬校验即 raise、Fa
         16.5, lc.C_TXT, 'start', True, maxw=980, tag='title')
 lc.text(MX, 58, 'async_scheduling 在 VllmConfig.__post_init__ 里定值——v0.27.1 服务默认心跳（AsyncScheduler + 批队列重叠）的出生地',
         10.5, lc.C_MUTE, 'start', maxw=1020, tag='subtitle')
-_ch = '放大自 L2 拍片 ⑤ async 三态决策 · L0：启动视角（boot）'
+_ch = '放大自 L2 节拍 ⑤ async 三态决策 · L0：启动视角（boot）'
 _cw = lc.chip_w(_ch)
 lc.rect(BXR - _cw, 12, _cw, 20, '#ffffff', lc.C_MUTE, rx=9, sw=1.1, dash=True)
 lc.text(BXR - _cw / 2, 26.5, _ch, 9.5, lc.C_BEAT_T, 'middle', True, maxw=_cw - 4, tag='chip')
@@ -288,7 +288,7 @@ lc.text(R_X + 14, OUT_Y + 98, '用户显式值要么全过、要么 raise，绝�
 LEG_Y = OUT_Y + OUT_H + 26
 lx = MX
 items = [
-    ('beat', '__post_init__ 推导主线（L2 拍片 ⑤ 的机制展开）'),
+    ('beat', '__post_init__ 推导主线（L2 节拍 ⑤ 的机制展开）'),
     ('gpu', '执行器能力反问（工厂① 首调）'),
     ('mut', '命中 → 静默置 False'),
     ('red', '命中 → raise（装配中止）'),
