@@ -64,7 +64,7 @@ NoPrefixCache(...)` 是源码原生路径（kv_cache_coordinator.py:L864-L876）
 | `gpu_model_runner _update_states` | `gpu_model_runner.py:L1190-L1494` | KV 切面：L1202-L1217 清档 / L1219-L1222 清零 / L1266-L1309 新请求建档 / L1355-L1361 循环头 / L1441-L1452 差量 extend+整表替换 / L1471-L1474 落行——各块逐字；spec/async/ngram/PP 删 | 第 4/5/7/9 条；m7 第 7 站 |
 | `gpu_model_runner _prepare_inputs` | `gpu_model_runner.py:L1960-L2201` | L1977-L1979 commit 第一句逐字（"overlap the copy"）/ L2188-L2191 positions GPU 组装逐字 / L2197-L2201 compute_slot_mapping 派发逐字；token/采样组装删 | m15/m9/m14 |
 | `gpu_model_runner _get_block_table` | `gpu_model_runner.py:L2325-L2341` | 逐字（EncoderOnly 分支删）；NULL_BLOCK_ID 填 pad 行 | 第 4 条；m14/F7 |
-| `gpu_model_runner _allocate/_reshape` | `gpu_model_runner.py:L7312-L7353、L7400-L7413` | 每层一块 int8 缓冲 + num_blocks=numel//page_size_bytes 逐字；视图用标准布局 [num_blocks, **2**, block_size, kv_heads, head_dim]（2×=K/V 两半——real_page_size_bytes 公式的 2×；backend 形状仲裁 → ch21）；packed 删 | 第 4 条；m10 |
+| `gpu_model_runner _allocate/_reshape` | `gpu_model_runner.py:L7312-L7353、L7400-L7413` | 每层一块 int8 缓冲 + num_blocks=numel//page_size_bytes 逐字；视图用说明性布局 [num_blocks, **2**, block_size, kv_heads, head_dim]（2×=K/V 各一份——real_page_size_bytes 公式的 2×；backend 形状仲裁 → ch21：主流后端 (num_blocks, kv_heads, block_size, 2*head_size)、K/V 打进内容维，页字节数不变）；packed 删 | 第 4 条；m10 |
 | `block_table append_row/commit` | `block_table.py:L138-L154、L213-L214` | 逐字（hybrid 细分删） | 第 4 条；m7/m15 |
 | `block_table _compute_slot_mapping_kernel` | `block_table.py:L379-L442` | PAD 尾 program + 恒等式主干逐字；CP 三处（TOTAL_CP_WORLD_SIZE/is_local/local_block_offsets/tl.where PAD）按常数 1 烘干删；BLOCKS_PER_KV_BLOCK=1 乘子保留 | 第 6 条；m9 must_keep |
 | `worker_utils KVBlockZeroer` | `worker/utils.py:L44-L213` | kernel + 段表预计算 + zero_block_ids 逐字（CPU 分支 HOST SEAM） | m8 |
@@ -80,8 +80,8 @@ NoPrefixCache(...)` 是源码原生路径（kv_cache_coordinator.py:L864-L876）
   拷贝）——双镜像契约（CPU 写 .np / commit 拷 .gpu[:n] 活跃行）逐字成立。
 - **_StandardLayoutBackend / _Ctx**（gpu_model_runner.py）：真实 backend 由
   注意力后端注册表装配（→ ch21）、static_forward_context 来自 compilation_config；
-  切面用全注意力标准布局（block_dim=0/1 由 duck type 提供）承载同一
-  `get_kv_cache_block_dim` 契约位。
+  切面用 2(K,V) 显式的说明性布局（block_dim=0/1 由 duck type 提供）承载同一
+  `get_kv_cache_block_dim` 契约位——真实主流后端为内容维打包（→ ch21）。
 - **Scheduler / GPUModelRunner 站点抽块**（ENGINE SEAM，ch12 同款纪律）：从
   schedule()/_update_states/_prepare_inputs 的内联块抽出为方法以便单测——抽出
   而非改写，控制流逐字；整章 schedule() 的 token 预算面归 ch10/11。

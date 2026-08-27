@@ -13,7 +13,9 @@
 #   （L1408-L1439/L1476-L1494——ch17）；encoder/mamba/LORA/mm（第 4 条）；
 #   packed 别名分配（L7326-L7336——ch14）；layer_packing（L7383-L7404
 #   ——ch14）；attn_backend.get_kv_cache_shape 的形状仲裁（L7421-L7453
-#   ——ch21，切面用全注意力标准布局）；MambaSpec 支（L7455-L7468——ch14）。
+#   ——ch21，主流后端为 [num_blocks, kv_heads, block_size, 2*head_dim]、
+#   K/V 打进内容维；切面换用 2(K,V) 显式的说明性布局，页字节数不变）；
+#   MambaSpec 支（L7455-L7468——ch14）。
 # HOST SEAM：device=CPU 时 KV 池/块表/清零全走 CPU 镜像（BlockTable/
 #   KVBlockZeroer 的 HOST SEAM 承载）；容器内为真 GPU。
 import numpy as np
@@ -31,11 +33,13 @@ from .worker_utils import AttentionGroup, KVBlockZeroer
 
 # SOURCE: vllm/v1/worker/gpu_model_runner.py:L~2250 _StandardLayoutBackend 的
 #   契约位（HOST SEAM 装配切面：真实 backend 由注意力后端注册表装配 → ch21；
-#   全注意力标准布局 = 块最外层（block_dim=0），每层一块
-#   [num_blocks, 2, block_size, kv_heads, head_dim] 张量——m10 视图）
+#   说明性布局 = 块最外层（block_dim=0），每层一块
+#   [num_blocks, 2, block_size, kv_heads, head_dim] 张量——m10 视图；
+#   真实主流后端 get_kv_cache_shape 是 (num_blocks, kv_heads, block_size,
+#   2*head_size)——K/V 打进内容维 → ch21，页字节数不变）
 class _StandardLayoutBackend:
     # HOST SEAM 装配切面：真实 backend 由注意力后端注册表装配（→ ch21）；
-    #   标准布局取值 = 块最外层（1 段/缓冲）
+    #   说明性布局取值 = 块最外层（1 段/缓冲）
     # SOURCE: vllm/v1/worker/gpu_model_runner.py:L~2250 get_kv_cache_block_dim
     def get_kv_cache_block_dim(
         self, kernel_block_size: int, num_kv_heads: int, head_size: int,
@@ -420,8 +424,8 @@ class GPUModelRunner:
         # SUBTRACTED: kernel_block_sizes 参数与 per-group kernel 块细分
         #   （L7367、L7393-L7396——第 4 条）、layer_packing（L7383-L7404
         #   ——ch14）、attn_backend.get_kv_cache_shape/stride_order 的形状
-        #   仲裁（L7421-L7453——ch21：全注意力标准布局即
-        #   [num_blocks, block_size, kv_heads, head_dim]）、MambaSpec 支
+        #   仲裁（L7421-L7453——ch21：主流后端 [num_blocks, kv_heads,
+        #   block_size, 2*head_dim]，K/V 打进内容维）、MambaSpec 支
         #   （L7455-L7468——ch14）。
         kv_caches: dict[str, torch.Tensor] = {}
         for group in self._kv_cache_spec_attn_group_iterator():
@@ -438,9 +442,12 @@ class GPUModelRunner:
                 # SOURCE: vllm/v1/worker/gpu_model_runner.py:L7408-L7413（isinstance
                 #   AttentionSpec 判定与 blocks_per_kv_block=1 的细分乘子删）
                 if isinstance(kv_cache_spec, AttentionSpec):
-                    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L7433-L7439 的
-                    #   标准布局视图：[num_blocks, 2(K,V), block_size, kv_heads,
-                    #   head_dim]——real_page_size_bytes 的 2× 即 K/V 两半
+                    # SOURCE: vllm/v1/worker/gpu_model_runner.py:L7433-L7439
+                    #   （get_kv_cache_shape 形状仲裁）的 host 说明性视图：
+                    #   [num_blocks, 2(K,V), block_size, kv_heads, head_dim]——
+                    #   real_page_size_bytes 的 2× 取成显式两半；真实主流后端
+                    #   为 (num_blocks, kv_heads, block_size, 2*head_size)、
+                    #   K/V 打进内容维（flash_attn.py:L143），页字节数不变
                     kv_caches[layer_name] = raw_tensor.view(kv_cache_spec.dtype).view(
                         num_blocks,
                         2,
