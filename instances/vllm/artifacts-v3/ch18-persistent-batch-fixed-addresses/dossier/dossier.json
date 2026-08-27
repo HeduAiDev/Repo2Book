@@ -1,0 +1,825 @@
+{
+  "chapter_id": "ch18-persistent-batch-fixed-addresses",
+  "title": "持久批次与固定地址",
+  "source_pin": "vllm v0.27.1 (6e448d0ea9bf3d88d898b65449ca6dc2aec170ac)",
+  "one_line": "GPUModelRunner 每拍以 SchedulerOutput 差量调和一个跨拍存活的 InputBatch（新请求首次全量建 CachedRequestState 快照、老请求只追加块号），所有喂给 GPU 的张量都写进启动期一次分配、地址永不变的 CpuGpuBuffer 固定缓冲——这是 ch19 CUDA graph 回放的地基，也是『调度器每拍只发 diff』协议在 worker 侧的对偶半边。",
+  "code_spine": [
+    "vllm/v1/core/sched/output.py:L193-L205  SchedulerOutput 差量协议：scheduled_new_reqs 全量 vs scheduled_cached_reqs 只发 diff（注释原文）",
+    "vllm/v1/worker/gpu_model_runner.py:L4166-L4208  execute_model 入口：ngram-GPU 可变性裁决（replace() 浅拷贝）→ synchronize_input_prep 内 _update_states",
+    "vllm/v1/worker/gpu_model_runner.py:L1192-L1566  _update_states：差量调和（移除 finished/unscheduled → 新请求建快照 → 老请求 append 块号 → add_request 落位 → condense 压实 → 重排 → 刷元数据）",
+    "vllm/v1/worker/gpu_input_batch.py:L324-L348  InputBatch._register_add_request：pop_removed 复用最小空 slot",
+    "vllm/v1/worker/gpu_input_batch.py:L350-L501  InputBatch.add_request：CachedRequestState 写进 slot 的各 CPU 镜像列",
+    "vllm/v1/worker/gpu_input_batch.py:L530-L584  InputBatch.remove_request：打洞标记，不搬数据（must be followed by condense）",
+    "vllm/v1/worker/gpu_input_batch.py:L708-L838  InputBatch.condense：尾部活请求滑入空洞，[0, num_reqs) 连续",
+    "vllm/v1/worker/gpu_model_runner.py:L1960-L2282  _prepare_inputs：commit_block_table 先行 → np.repeat/index_select 扁平收集 → query_start_loc/positions/seq_lens/slot_mapping 装配",
+    "vllm/v1/utils.py:L110-L149  CpuGpuBuffer：cpu(pinned)+gpu+np 三视图固定双端缓冲，copy_to_gpu(n) 只传活跃前缀",
+    "vllm/v1/worker/gpu_model_runner.py:L763-L810  __init__ 持久缓冲一次分配（'Persistent buffers for CUDA graphs'）",
+    "vllm/v1/worker/gpu_model_runner.py:L3723-L3846  _bookkeeping_sync 写回：采样 token 写进 token_ids_cpu 行，持久批次自闭环（异步时留 GPU）"
+  ],
+  "stations": [
+    {
+      "n": 1,
+      "where": "gpu_model_runner.py:L4166",
+      "what": "入口·差量协议过线：execute_model 收 SchedulerOutput（scheduled_new_reqs 首次全量 / scheduled_cached_reqs 只带 new_block_ids+num_computed_tokens）；ngram-GPU 开启时先 replace() 浅拷贝两个 dict——可变性裁决：调和阶段要就地裁剪 token 账，先护住引擎进程侧原件（L4180-L4195）"
+    },
+    {
+      "n": 2,
+      "where": "gpu_model_runner.py:L1203-L1253",
+      "what": "_update_states·移除：finished_req_ids 出 requests 缓存+出批次；unscheduled（被抢占/本拍未排）出批次但留缓存——『移出批次 ≠ 删快照』，恢复请求靠缓存重建。末尾 NOTE 自白持久批次的核心假设：批次间高重叠"
+    },
+    {
+      "n": 3,
+      "where": "gpu_model_runner.py:L1295-L1310",
+      "what": "_update_states·新请求建快照：scheduled_new_reqs（prompt_token_ids/block_ids/采样参数全量）→ CachedRequestState 存 self.requests——worker 从此缓存该请求全量，此后只收差量"
+    },
+    {
+      "n": 4,
+      "where": "gpu_model_runner.py:L1441-L1474",
+      "what": "_update_states·老请求调和：num_computed_tokens 就地覆盖；new_block_ids append 进 req_state.block_ids 与批次块表（resumed_from_preemption 则整体替换——差量协议的 resumed 语义在此消费）；不在批次内的（恢复/上拍未排）入 reqs_to_add"
+    },
+    {
+      "n": 5,
+      "where": "gpu_model_runner.py:L1509-L1520",
+      "what": "_update_states·收尾落位：reqs_to_add 逐个 add_request（pop_removed 复用最小空 slot）→ condense 压实空洞 → _may_reorder_batch（注意力后端可重排批次）→ refresh_metadata 重建采样元数据"
+    },
+    {
+      "n": 6,
+      "where": "gpu_model_runner.py:L1977-L1979",
+      "what": "_prepare_inputs·先行拷块表：第一句 commit_block_table 只拷活跃行 H2D——让 PCIe 拷贝与随后的 CPU 计算重叠（源码 OPTIMIZATION 注释原文）"
+    },
+    {
+      "n": 7,
+      "where": "gpu_model_runner.py:L1983-L2024",
+      "what": "_prepare_inputs·扁平收集：np.repeat 把 [2,5,3] 展开成 req_indices；positions=num_computed+请求内偏移；token_indices=pos+req_index·M（二维坐标编一维）；torch.index_select 从 token_ids_cpu 扁平视图一次收齐 input_ids（注释实测远快于 np.take）"
+    },
+    {
+      "n": 8,
+      "where": "gpu_model_runner.py:L2073-L2209",
+      "what": "_prepare_inputs·装配：query_start_loc CU 偏移（尾部 pad 非递减，FlashAttention 要求）→ GPU 端算最终 positions/seq_lens → compute_slot_mapping（position→物理 slot 的 Triton 数学 → ch22）→ _prepare_input_ids 固定地址前缀上载"
+    },
+    {
+      "n": 9,
+      "where": "gpu_model_runner.py:L4450-L4456",
+      "what": "前向：set_forward_context 内 _model_forward——所有输入都落在固定地址持久 buffer 上；编译图/CUDA graph 按地址回放（回放前 DEBUG 断言 data_ptr 与捕获时一致，cuda_graph.py:L346-L355；编译与捕获全章 → ch19）"
+    },
+    {
+      "n": 10,
+      "where": "gpu_model_runner.py:L3815-L3846",
+      "what": "写回·持久批次自闭环：sample_tokens 内 _bookkeeping_sync（调用点 L4725）把采样 token 写进 token_ids_cpu 对应 slot 行、output_token_ids 增长——持久批次自产自销，调度器无需回传 token（异步调度时真 token 留 GPU 缓存进 prev_sampled_token_ids，深讲 ch12 已立）"
+    }
+  ],
+  "key_classes": [
+    {
+      "name": "GPUModelRunner",
+      "file": "vllm/v1/worker/gpu_model_runner.py",
+      "responsibility": "每拍编排器：execute_model 在 synchronize_input_prep 上下文内先 _update_states（差量调和）、再 _prepare_inputs（收集装配）；持有 self.requests（req_id→CachedRequestState 全量缓存，L676）与 self.input_batch（持久批次，L704）；__init__ 一次分配全部 CpuGpuBuffer 持久缓冲（L763-L810）。"
+    },
+    {
+      "name": "InputBatch",
+      "file": "vllm/v1/worker/gpu_input_batch.py:L92",
+      "responsibility": "跨拍存活的多请求容器：token_ids_cpu [max_num_reqs, max_model_len] int32 全长缓冲（一行一请求，L130-L140）、num_prompt_tokens/num_tokens_no_spec/num_computed_tokens_cpu 等 CPU 镜像列、MultiGroupBlockTable、全套采样参数列、req_id_to_index 映射。增删走 add_request/remove_request + condense，slot 复用靠 batch_update_builder。"
+    },
+    {
+      "name": "CachedRequestState",
+      "file": "vllm/v1/worker/gpu_input_batch.py:L35",
+      "responsibility": "worker 端单请求快照（dataclass）：prompt_token_ids/output_token_ids/block_ids（每 KV group 一个 list）/num_computed_tokens/sampling_params/generator。num_tokens = num_prompt_tokens + len(output_token_ids)。让 worker 缓存请求全量、调度器后续只发差量的根本载体。"
+    },
+    {
+      "name": "BatchUpdateBuilder",
+      "file": "vllm/v1/sample/logits_processor/state.py:L18",
+      "responsibility": "本拍批次变更记录器：docstring 保证 removed 恒降序、pop_removed()/peek_removed() 返回当前最小空 slot；added/moved 供 logitsprocs 增量重建状态（get_and_reset 产出 BatchUpdate）。slot 复用与压实的索引真相源。"
+    },
+    {
+      "name": "CpuGpuBuffer",
+      "file": "vllm/v1/utils.py:L110",
+      "responsibility": "cpu（pinned）+ gpu + np 三视图一体的固定形状双端缓冲：copy_to_gpu(n)/copy_to_cpu(n) 只传活跃前缀、non_blocking。全 runner per-step 张量的地址稳定器——CUDA graph 回放对『地址永不变』要求的直接供给。"
+    },
+    {
+      "name": "SchedulerOutput / NewRequestData / CachedRequestData",
+      "file": "vllm/v1/core/sched/output.py:L193 / L35 / L116",
+      "responsibility": "差量协议三类载体：新请求全量（prompt/block_ids/采样参数）、老请求 diff（new_block_ids/num_computed_tokens，resumed 语义分叉注释 L118-L121）、finished 通知（让 worker 清缓存）。"
+    },
+    {
+      "name": "MultiGroupBlockTable / BlockTable",
+      "file": "vllm/v1/worker/block_table.py:L270 / L48",
+      "responsibility": "按 KV cache group 持多个 BlockTable。BlockTable 维护 CpuGpuBuffer 块表：append_row/add_row 改 CPU 镜像、clear_row/move_row/swap_row 服务批次变更、commit_block_table 每拍只拷活跃行到 GPU、compute_slot_mapping 启 Triton kernel（本章只到双镜像与先行拷贝，position→slot 数学 → ch22）。"
+    }
+  ],
+  "data_flow": [
+    "【引用 deepread/gpu-exec.json data_flow §4a】_update_states（execute_model L4208 → L1192）：新块 GPU 置零（L1219-L1222）、finished 移除（L1203-L1217）、新请求建 CachedRequestState（L1266-L1330）、老请求 append 新块进 BlockTable（L1441-L1474）、add_request 填行 + condense 压实 + refresh_metadata（L1509-L1520）。",
+    "【引用 deepread/gpu-exec.json data_flow §4b】_prepare_inputs（L4250 → L1960）：第一句 commit_block_table 让 H2D 与 CPU 计算重叠（L1977-L1979）；req_indices/cu_num_tokens/query_pos 全在预分配 numpy 缓冲上算（L1983-L1989）；positions 在 CPU 算一份（L1992-L1995）；torch.index_select 从 token_ids_cpu 扁平视图 gather 出 input_ids（L2016-L2024）；query_start_loc 填非递减 + copy_to_gpu（L2073-L2078）；GPU 上算最终 positions/seq_lens（L2188-L2195）；compute_slot_mapping 在 GPU 上算 slot_mapping（L2197-L2201 → block_table.py Triton kernel，→ ch22）；_prepare_input_ids 前缀上载（L2204-L2209 → L1784-L1913）。",
+    "【引用 deepread/gpu-exec.json data_flow §7】sample_tokens（L4553）→ _bookkeeping_sync（调用点 L4725 → L3723）：同步模式 _to_list D2H 取 valid_sampled_token_ids、写回 token_ids_cpu 行（L3815-L3846）；异步模式 token 留 GPU（L3797-L3813，缓存进 prev_sampled_token_ids + prev_req_id_to_index 快照）。",
+    "【本章新增核验（deepread 卡之后补充的 v0.27 细节）】入口可变性裁决先于上述一切（L4180-L4195）：ngram-GPU 时 dataclasses.replace 浅拷贝 num_scheduled_tokens/scheduled_spec_decode_tokens 两 dict；就地裁剪实现在 vllm/v1/spec_decode/ngram_proposer_gpu.py:L475-L515（update_scheduler_for_invalid_drafts，等异步 D2H 事件后按每请求有效 draft 数回退 token 账）。"
+  ],
+  "why_chains": [
+    {
+      "decision": "持久批次 InputBatch：批次容器跨引擎拍存活，只按 SchedulerOutput 差量调和",
+      "old_design": "v0：每 step 从 SequenceGroup 对象列表重建整批张量——Python 逐请求循环、临时张量全量新建、全量 H2D。",
+      "pain": "大 batch decode 时每拍 O(num_reqs) 的 Python 对象遍历 + 全量重建/传输，CPU 时间随 batch 线性涨，喂不上 GPU；新请求全量元数据若每拍都传则 IPC 膨胀。",
+      "solution": "vllm/v1/worker/gpu_input_batch.py:L92 InputBatch：固定形状 CPU 镜像一次分配——token_ids_cpu [max_num_reqs, max_model_len] int32（L130-L140，TODO(woosuk) 自认 \"could be too large if max_model_len is big\"）+ is_token_ids/num_tokens_no_spec/采样参数列 + MultiGroupBlockTable；CachedRequestState（L35）是 requests 字典的值类型。GPUModelRunner._update_states（vllm/v1/worker/gpu_model_runner.py:L1192-L1566）只做差量：finished 移除（L1203-L1217，含 abort 后同 ID 重提交的边界注释 L1211-L1215）、unscheduled 移出批次（L1233-L1253）、新请求建 CachedRequestState 入表（L1266-L1330）、老请求 append new_block_ids 进 BlockTable（L1441-L1474）、非末 PP rank 补写 token_ids_cpu（L1478-L1499）、结束请求 remove 打洞、批末 condense 压实（L1516）+ refresh_metadata（L1520）。v0.27 新增差量动作：新分配块 GPU 置零防脏数据（new_block_ids_to_zero → _zero_block_ids L1219-L1222）、块级 in-place 拷贝（kv_cache_block_copies → copy_kv_cache_blocks_inplace L1223-L1228）、按注意力后端需求重排批次（_may_reorder_batch L1115-L1140）。调度器侧对应地只发差量（scheduled_cached_reqs 只带 new_block_ids/num_computed_tokens）。",
+      "cost": "(1) 内存按 max 预留：token_ids_cpu 是 max_num_reqs×max_model_len 的 2D 大数组；(2) 强假设批次间高重叠——NOTE(woosuk) \"The persistent batch optimization assumes that consecutive batches contain mostly the same requests. If batches have low request overlap ... this optimization becomes very inefficient\"（gpu_model_runner.py:L1248-L1251）；(3) slot 复用/压实/重排的索引簿记复杂度，是本域 bug 高发区。",
+      "source_card": "deepread/gpu-exec.json why_chains[3]"
+    },
+    {
+      "decision": "CpuGpuBuffer 固定双端缓冲：所有 per-step 张量预分配、地址永不变",
+      "old_design": "每拍按实际 batch shape 新建 tensor 再 .to(device)——地址每拍不同、非 pinned 慢速 H2D、分配器抖动。",
+      "pain": "(1) CUDA graph 回放要求输入张量地址与捕获时完全一致（见 CUDA graph 链的 DEBUG 断言）；(2) 动态分配引入 cudaMalloc/cudaFree 与碎片；(3) 非 pinned 内存 H2D 走可分页路径慢一个量级。",
+      "solution": "vllm/v1/utils.py:L110-L149 CpuGpuBuffer：cpu（pinned）+ gpu + np 三视图一体的固定形状缓冲，copy_to_gpu(n) 只传活跃前缀、non_blocking。GPUModelRunner.__init__ 一次分配全部持久缓冲（gpu_model_runner.py:L763-L810，首行注释 \"Persistent buffers for CUDA graphs\"）：input_ids/positions/query_start_loc/seq_lens/num_computed_tokens/req_indices/prev_positions/num_scheduled_tokens/discard_request_mask/num_decode_draft_tokens/num_accepted_tokens/encoder_seq_lens...；arange 类张量缓存复用（L838-L845，注释 \"Cache the arange tensors rather than creating them every step\"）；mrope/xdrope positions 特例（L812-L833，多一列 dummy 保非连续以兼容 torch.compile，附 PR 12128 讨论链接）。",
+      "cost": "峰值内存按 max_num_tokens/max_num_seqs 预留而非按需；pinned CPU 内存是稀缺资源；复用同一块 buffer 的代价是必须自管同步（prepare_inputs_event 见 __init__ L735-L743 / async_copy_ready_event 属 AsyncGPUModelRunnerOutput L276 / num_accepted_tokens_event 见 __init__ L916-L919——一整套 event 协议）。",
+      "source_card": "deepread/gpu-exec.json why_chains[6]"
+    },
+    {
+      "decision": "增量下发协议（persistent batch）：worker 缓存请求全量数据，调度器每拍只发 diff",
+      "old_design": "v0 每步把全批 SequenceGroupMetadata（全量 token ids、完整 block 表、采样参数）序列化发给 worker；更朴素的做法是每步从零重建整个批次对象树。",
+      "pain": "IPC 序列化带宽与 CPU 时间随『请求数 × prompt 长度』爆炸：decode 稳态下每拍 99% 的下发内容与上一拍相同，全量重发是纯浪费；千级并发时这一项足以吃掉调度预算。",
+      "solution": "vllm/v1/core/sched/output.py:L193-L205 SchedulerOutput 二分：scheduled_new_reqs = NewRequestData（首次全量：prompt_token_ids、sampling_params、block_ids，注释 L194-L197 'We cache the request data in each worker process, so that we do not need to re-send it every scheduling step'）与 scheduled_cached_reqs = CachedRequestData（增量：new_block_ids、num_computed_tokens，注释 L198-L200 'we only send the diff to minimize the communication cost'）。prev_step_scheduled_req_ids（scheduler.py:L106 初始化，L1161-L1163 每拍刷新）标记上拍已调度者——连 all_token_ids 都省（L1448-L1450，MRV1-only）；finished_req_ids 随下拍下发让 worker 清缓存（L1218-L1222 + output.py:L221-L224 注释）；preempted_req_ids 同理通知 V2 runner（L1217 + output.py:L231-L233）。GPU 侧对应物是持久存活的 InputBatch 与槽位复用（model runner 域）。",
+      "cost": "①worker 必须维护匹配的缓存与失效逻辑——两进程请求视图可能漂移；②协议状态语义分叉：resumed（抢占恢复）请求的 new_block_ids 是整体替换而非追加（output.py:L118-L121 注释明说 'For those in the set, new_block_ids will be used as the request block IDs instead of appending'），理解成本高；③PP 模式还得专门回传 new_token_ids（scheduler.py:L1432-L1445 use_pp 分支，注释解释『首末 stage 无直连、采样 token 必须由 scheduler 送回』，async+PP 则走 GPU 广播路径可省）；④finished/preempted 集合的清空时点成为跨拍不变量（scheduler.py:L1361-L1365 注释 'We shouldn't just clear() here because it will also affect the scheduler output'——换新 set 而非就地 clear）。",
+      "source_card": "deepread/engine-loop.json why_chains[6]"
+    },
+    {
+      "decision": "固定地址的下游约束：CUDA graph 回放要求输入张量地址与捕获时完全一致——本章一切固定缓冲设计的 why 终点",
+      "old_design": "eager 每拍重新 launch 全部 kernel（Python dispatch + cudaLaunchKernel × 每层数十次）。",
+      "pain": "（卡中原话·为什么形状/地址必须精确匹配的本质）CUDA graph 录的是『对这块固定地址的显存执行这串 kernel launch』——kernel 的 grid/block 配置、指针、乃至宿主端分支（如 FA3 的 scheduler_metadata 计算）都在捕获时烤死在图里；replay 不会重新读取张量的 shape 元数据。形状或地址变了，图执行的就是错误的工作量/错误的数据。所以回放命中条件 = BatchDescriptor 全等 AND 输入张量地址不变。",
+      "solution": "回放前 DEBUG 模式逐 data_ptr 断言与捕获时一致（vllm/compilation/cuda_graph.py:L346-L355 \"Input addresses for cudagraphs are different during replay\"）；一切输入必须写回捕获时的固定 buffer——即本章的 CpuGpuBuffer 持久缓冲与持久批次写回。",
+      "cost": "（卡中 cost(4) 原话）一切输入必须写回捕获时的固定 buffer——这是 CpuGpuBuffer/持久批次整条设计链的下游约束，设计间环环相扣。",
+      "source_card": "deepread/gpu-exec.json why_chains[10]（决策『CUDA Graph 捕获回放』——本章摘引其『本质』段与 cost(4)；完整链归 ch19）"
+    },
+    {
+      "decision": "采样 token 不落 CPU 与 pinned buffer 防踩：持久批次在默认异步调度下的两个配套",
+      "old_design": "同步调度：schedule()（CPU）→ execute_model（GPU）→ 等结果回 CPU → update_from_output → 下一拍 schedule。GPU 在 CPU 准备下一批的整段时间空转。",
+      "pain": "『GPU 等 Python』是 vLLM 一整条 PR 线的靶子；decode 小 batch 一拍 GPU 计算量极小，整拍时长被 CPU 端支配。",
+      "solution": "(1) 采样 token 留 GPU：_bookkeeping_sync 异步分支不把 sampled_token_ids 拉回 CPU，缓存在 input_batch.prev_sampled_token_ids（gpu_model_runner.py:L3797-L3813，注释 \"Cache the sampled tokens on the GPU and avoid CPU sync\"），CPU 侧 token_ids_cpu 行只写占位 -1（L3821-L3842）；下一拍 _prepare_input_ids（L1784-L1913）用 GPU 张量直接写 input_ids.gpu——common-case 优化是单 slice 直拷（L1868-L1877），否则按 index scatter（L1879-L1891）。(2) pinned buffer 防踩协议：synchronize_input_prep contextmanager 等上拍 prepare_inputs_event（L3864-L3877）——复用同一块 CPU buffer 的跨拍同步纪律。",
+      "cost": "状态机复杂度暴涨：需要 prev_req_id_to_index/prev_positions/discard_request_mask/optimistic_seq_lens_cpu 等一整套『上一拍』影子状态（_update_states 膨胀到 ~375 行）；调度器必须盲调度，错了要在 GPU 端纠。",
+      "source_card": "deepread/gpu-exec.json why_chains[5]（决策『异步调度』——本章摘引其 solution(1) 与 pinned buffer 防踩段；完整链 ch12 已立）"
+    }
+  ],
+  "theory": [
+    {
+      "topic": "持久批次增量维护的复杂度",
+      "content": "设 max_num_reqs=R、max_model_len=L、本拍变更（增+删+移）请求数 ΔN。全量重建每拍 O(R·L) 写入；增量维护：remove O(删数)、add O(增数·该请求列数)、condense 最多搬 O(空洞数) 个请求且每个只拷活跃前缀 num_tokens 列（token_ids_cpu[empty, :num_tokens] = token_ids_cpu[last, :num_tokens]）。当 ΔN≪R 且批次重叠度高时，单拍成本从 O(R·L) 降到 ~O(ΔN·avg_tokens)——这正是 NOTE 假设『consecutive batches contain mostly the same requests』的算术根据；请求集合交替时退化为打洞+压实来回搬。"
+    },
+    {
+      "topic": "token 收集的二维→一维扁平化",
+      "content": "token_ids_cpu 形状 (R, L) 行优先存储，元素 (r, p) 的扁平偏移 = r·L + p。本拍要算的 token 由 (req_indices[i], positions[i]) 给出，故 token_indices[i] = positions[i] + req_indices[i]·L。一次 index_select 即把 total_num_scheduled_tokens 个分散 token 收集成连续 input_ids。np.repeat 负责把每请求 num_scheduled_tokens 展开成 req_indices（[2,5,3]→[0,0,1,1,1,1,1,2,2,2]），_get_cumsum_and_arange 产出 CU 偏移 [2,7,10] 与请求内偏移 arange [0,1,0,1,2,3,4,0,1,2]（等价于 concatenate([arange(n)]) 但在预分配缓冲上原地写）。positions = num_computed_tokens_cpu[req_indices] + 请求内偏移——无 prefill/decode 相位之分的统一形态，chunked prefill 与 decode 只是 num_scheduled_tokens 大小不同。"
+    },
+    {
+      "topic": "固定地址与 CUDA graph 回放的耦合原理",
+      "content": "CUDA graph 捕获时把 kernel launch 的全部参数（含张量指针、grid/block 形状）烤死在图里；replay 不重读张量 shape/地址元数据。因此回放命中 = BatchDescriptor（num_tokens/num_reqs/...）全等 AND 输入张量 data_ptr 不变。两条件分别由『padding 到捕获形状』（ch19）与『一切输入写回固定 buffer』（本章 CpuGpuBuffer + 持久批次写回）满足。DEBUG 模式下 cuda_graph.py:L346-L355 逐 data_ptr 断言即这条不变量的运行期验证。"
+    },
+    {
+      "topic": "copy_to_gpu(n) 前缀拷贝语义：固定形状 + 活跃前缀",
+      "content": "缓冲按 max 形状一次分配（CUDA graph 捕获的是 max 形状），每拍只把 [0, n) 活跃前缀拷上 GPU（non_blocking + pinned）：带宽按需、地址恒定。commit_block_table(num_reqs) 只拷活跃行、input_ids.copy_to_gpu(total_num_scheduled_tokens) 只拷活跃 token、query_start_loc 尾部 pad 非递减值维持 max 形状的可捕获性——『尾部 pad』与『前缀拷贝』是同一设计在读写两侧的配对。"
+    }
+  ],
+  "mechanisms": [
+    {
+      "id": "ch18-m01",
+      "name": "SchedulerOutput 差量协议（new 全量 / cached diff / finished 通知 / resumed 语义分叉）",
+      "kind": "protocol",
+      "source_anchors": [
+        "vllm/v1/core/sched/output.py:L193-L205",
+        "vllm/v1/core/sched/output.py:L115-L131"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "ch18-m02",
+      "name": "持久批次差量调和 _update_states（移除→建快照→老请求 append→落位→压实→重排→刷元数据）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/v1/worker/gpu_model_runner.py:L1192-L1253",
+        "vllm/v1/worker/gpu_model_runner.py:L1295-L1310",
+        "vllm/v1/worker/gpu_model_runner.py:L1441-L1474",
+        "vllm/v1/worker/gpu_model_runner.py:L1509-L1520"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "ch18-m03",
+      "name": "slot 复用与压实算法（remove 打洞 → pop_removed 复用最小空 slot → condense 尾部滑入，双指针 + 降序 removed）",
+      "kind": "algorithm",
+      "source_anchors": [
+        "vllm/v1/worker/gpu_input_batch.py:L324-L348",
+        "vllm/v1/worker/gpu_input_batch.py:L530-L548",
+        "vllm/v1/worker/gpu_input_batch.py:L708-L743",
+        "vllm/v1/sample/logits_processor/state.py:L18-L37"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "ch18-m04",
+      "name": "InputBatch 内存布局（token_ids_cpu R×L 固定全长 + 列式 CPU 镜像 + 采样参数列）",
+      "kind": "layout",
+      "source_anchors": [
+        "vllm/v1/worker/gpu_input_batch.py:L127-L172",
+        "vllm/v1/worker/gpu_input_batch.py:L350-L398"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "ch18-m05",
+      "name": "CpuGpuBuffer 固定双端缓冲（cpu pinned + gpu + np 三视图；copy_to_gpu(n) 活跃前缀）与 runner 持久缓冲块",
+      "kind": "layout",
+      "source_anchors": [
+        "vllm/v1/utils.py:L110-L149",
+        "vllm/v1/worker/gpu_model_runner.py:L763-L810"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "ch18-m06",
+      "name": "token 扁平收集（np.repeat 展开 + cumsum/arange + token_indices = pos + req_index·L + index_select）",
+      "kind": "algorithm",
+      "source_anchors": [
+        "vllm/v1/worker/gpu_model_runner.py:L1743-L1767",
+        "vllm/v1/worker/gpu_model_runner.py:L1977-L2024"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "ch18-m07",
+      "name": "query_start_loc CU 偏移与非递减 pad（固定形状缓冲的尾部 pad 惯例）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/v1/worker/gpu_model_runner.py:L2073-L2078"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "ch18-m08",
+      "name": "block_table 双镜像与先行拷贝（append_row CPU 增量 / commit_block_table 活跃行 H2D 与 CPU 重叠；slot 数学 → ch22）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/v1/worker/gpu_model_runner.py:L1977-L1979",
+        "vllm/v1/worker/block_table.py:L138-L155",
+        "vllm/v1/worker/block_table.py:L213-L214"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "ch18-m09",
+      "name": "写回闭环（采样 token 写 token_ids_cpu 行 + output_token_ids 增长；异步时留 GPU prev_sampled_token_ids）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/v1/worker/gpu_model_runner.py:L3815-L3846",
+        "vllm/v1/worker/gpu_model_runner.py:L3797-L3813",
+        "vllm/v1/worker/gpu_model_runner.py:L1784-L1807"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "ch18-m10",
+      "name": "可变性裁决（ngram-GPU 就地裁剪 SchedulerOutput token 账 + execute_model 入口 replace() 浅拷贝防御）",
+      "kind": "protocol",
+      "source_anchors": [
+        "vllm/v1/worker/gpu_model_runner.py:L4180-L4195",
+        "vllm/v1/spec_decode/ngram_proposer_gpu.py:L475-L515"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "ch18-m11",
+      "name": "resumed 语义分叉（new_block_ids 常规 append vs 抢占恢复整体替换）",
+      "kind": "protocol",
+      "source_anchors": [
+        "vllm/v1/core/sched/output.py:L118-L121",
+        "vllm/v1/worker/gpu_model_runner.py:L1441-L1452"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "ch18-m12",
+      "name": "批次重排钩子（_may_reorder_batch 按 attention backend 分组需求重排 + swap_states 只交换活跃前缀）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/v1/worker/gpu_model_runner.py:L1115-L1138",
+        "vllm/v1/worker/gpu_input_batch.py:L586-L653"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "ch18-m13",
+      "name": "pinned buffer 防踩协议（synchronize_input_prep 等上拍 prepare_inputs_event）",
+      "kind": "protocol",
+      "source_anchors": [
+        "vllm/v1/worker/gpu_model_runner.py:L3864-L3877",
+        "vllm/v1/worker/gpu_model_runner.py:L735-L743"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "ch18-m14",
+      "name": "固定地址 → CUDA graph 回放前提（回放命中 = BatchDescriptor 全等 AND 地址不变；DEBUG data_ptr 断言）",
+      "kind": "protocol",
+      "source_anchors": [
+        "vllm/compilation/cuda_graph.py:L346-L355",
+        "vllm/v1/worker/gpu_model_runner.py:L763-L764"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    }
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {
+        "what": "M-RoPE / XD-RoPE 分支：_init_mrope_positions/_init_xdrope_positions/_calc_mrope_positions/_calc_xdrope_positions 调用与 uses_mrope/uses_xdrope_dim 守卫（gpu_model_runner.py L812-L833, L1320-L1325, L1997-L2005, L2211-L2230）",
+        "why_safe": "仅多模态/特定模型（Qwen2-VL/HunYuan-VL）用；删后纯文本模型 positions 计算路径完整无缺。"
+      },
+      {
+        "what": "prompt_embeds 路径：InputBatch.req_prompt_embeds 与 add_request 的 embeds 分支（gpu_input_batch.py L150-L151, L383-L388）、runner 的 inputs_embeds/is_token_ids 缓冲与收集填充（gpu_model_runner.py L795-L801, L2025-L2070）",
+        "why_safe": "仅 enable_prompt_embeds 时启用；token-only 主线不触及。"
+      },
+      {
+        "what": "pooling 模型分支：is_pooling_model 早退与 pooling_params/pooling_states 装填（gpu_input_batch.py L120, L306-L307, L473-L481, L560-L563, L660-L663, L792-L795, L843-L847；gpu_model_runner.py L1286-L1293）。注意：L112-L119 不是 pooling——那是 thinking budget state holder（L112-L118 thinking_budget_state_holder / L119 thinking_token_budget_reqs，归 delete[6] 删）；L306-L307（pooling_params/pooling_states 两 dict）此前漏列",
+        "why_safe": "生成式主线为 sampling 路径；pooling 是 embedding/分类模型独立分支。"
+      },
+      {
+        "what": "LoRA：request_lora_mapping/lora_id_to_* 装填与 set_active_loras（gpu_input_batch.py L259-L262, L488-L499, L550-L558, L655-L658, L788-L790；gpu_model_runner.py L2269-L2277）",
+        "why_safe": "可选适配器特性，删后基础推理完整。"
+      },
+      {
+        "what": "async spec decode 乐观纠偏链：prev_num_draft_len 记账（gpu_model_runner.py L1337-L1339 + L1352-L1403、L1504-L1507 恢复段）、deferred_spec_decode_corrections 闭包（L1534-L1566：if 块、else 行与 return None 一并删——_update_states 隐式返回 None，调用点 L4208/L4324/L4532 判空使用，行为等价）、num_accepted_tokens 事件门控同步（L2111-L2137：needs_cpu_accepted_counts 门 + if 支 + else 行，段前注释 L2107-L2110 一并删；else 体默认填充 L2138-L2141 原样保留、去缩进降为无条件 fill(1)）、update_num_computed_tokens_for_batch_change GPU 修正（L2152-L2174：注释 + if 支 + else 行；else 体默认拷贝 L2175-L2178 原样保留、去缩进降为无条件）",
+        "why_safe": "逐段门控核验：(a) prev_num_draft_len 记账需 req_state.prev_num_draft_len>0 且 use_async_scheduling（L1363）——无 spec 时 prev_num_draft_len 恒 0、条件恒 False；L1352-L1353 需 use_async_spec_decode。(b) num_accepted_tokens 同步需 num_accepted_tokens_event 非 None（__init__ L916 默认 None，仅 num_spec_tokens>0 时 L919 创建）→ 精简配置恒走 else 默认填充，删门后保留 else 体（L2138-L2141）为无条件 fill(1)，与默认路径逐字节一致。(c) update_num_computed_tokens_for_batch_change 需 use_async_spec_decode 且 valid_sampled_token_count_gpu 非 None 且 prev_req_id_to_index（L2156-L2159）→ 恒走 else。**不删（无条件默认路径，误删即坏）**：L2081-L2105 的 optimistic_seq_lens_cpu 与 discard_request_mask 装配（discard_request_mask 被 sample_tokens/写回多处消费 L3745/L4667/L4692/L4873，与 spec 无关）；else 体默认填充 L2138-L2141；else 体默认拷贝 L2175-L2178——num_computed_tokens 的 CPU→GPU 镜像、L2188 positions 计算的数据源，删了 positions/seq_lens 全错；普通异步调度分支（prev_sampled_token_ids/_prepare_input_ids/synchronize_input_prep）是 v0.27.1 默认服务路径。保留的 L1340-L1351 ngram 守卫块（见 delete[5]）内 L1344-L1345 对 original_num_spec_per_req 的填充仅在 ngram-GPU 开启时执行——精简版不启用，惰性无害。"
+      },
+      {
+        "what": "ngram-GPU drafter 镜像维护：update_ngram_gpu_tensors_incremental 调用与 _ngram_pinned_idx_buf/_ngram_pinned_val_buf（gpu_model_runner.py L1522-L1532）与 token_ids_gpu_tensor 相关初始化",
+        "why_safe": "drafter 的 GPU 张量镜像维护，仅 use_ngram_gpu() 分支内；精简版不启用 ngram drafter。可变性裁决协议本身保留（execute_model 的 replace 段 L4180-L4195 与 update_scheduler_for_invalid_drafts 调用 L1340-L1351，唯一调用点 L1346——正文要讲且 speculative_config None 时不触发；L1504-L1507 是 prev_num_draft_len 恢复段非调用点，归 delete[4] 删）。"
+      },
+      {
+        "what": "KV/EC connector 与 encoder cache、late_interaction_runner、thinking budget、replayssm、num_decode_draft_tokens（GDN CG 特例）、kv_sharing_fast_prefill、cascade attention 等守卫块（gpu_model_runner.py L1198-L1231 相关、L2107-L2141 中 mamba/hybrid 分支、L2143-L2150、L2255-L2267；gpu_input_batch.py L112-L119 thinking budget holder（L112-L118 thinking_budget_state_holder / L119 thinking_token_budget_reqs——reasoning_config 门控，非 pooling）, L174-L183, L290, L392-L395）",
+        "why_safe": "均为可选/特定后端/特定模型特性，与持久批次+固定地址主干正交。"
+      },
+      {
+        "what": "PP 非末 rank 回填与广播：new_token_ids 补写（gpu_model_runner.py L1408-L1428）、token_ids_cpu 增量（L1478-L1499）、AsyncIntermediateTensors 相关（类定义与构造在 vllm/v1/worker/gpu_worker.py L96/L1072，不在 gpu_model_runner.py）",
+        "why_safe": "单机单卡纯文本主线（is_last_rank=True）不经过；协议字段保留定义。"
+      },
+      {
+        "what": "CP/DCP 上下文并行分片与 hybrid kernel block 细分（block_table.py 的 map_to_kernel_blocks（L221）与 slot_mapping Triton kernel 内的 CP 分片局部变量 is_local/local_block_offsets（L421-L441，kernel 局部变量、非模块符号）；dcp_local_seq_lens 在 gpu_model_runner.py——L792 分配、L2452-L2462 消费，不在 block_table.py）",
+        "why_safe": "TOTAL_CP_WORLD_SIZE=1 时退化为恒等；kernel block == kv block 时细分路径完全跳过。块表数学 → ch22 主场。"
+      }
+    ],
+    "must_keep": [
+      {
+        "symbol": "_update_states",
+        "why": "本章主方法：用 SchedulerOutput 差量调和持久批次。"
+      },
+      {
+        "symbol": "_prepare_inputs",
+        "why": "本章主方法：token 收集/位置/slot_mapping/装配。"
+      },
+      {
+        "symbol": "_prepare_input_ids",
+        "why": "固定地址前缀上载与异步 prev_sampled_token_ids 消费点。"
+      },
+      {
+        "symbol": "synchronize_input_prep",
+        "why": "pinned buffer 防踩协议（M13）。"
+      },
+      {
+        "symbol": "execute_model",
+        "why": "入口：可变性裁决 + 调和/收集编排。"
+      },
+      {
+        "symbol": "sample_tokens",
+        "why": "写回闭环发生的阶段（ch17 已立，本章衔接）。"
+      },
+      {
+        "symbol": "_bookkeeping_sync",
+        "why": "写回：采样 token 写进 token_ids_cpu 行（M9）。"
+      },
+      {
+        "symbol": "InputBatch",
+        "why": "持久批次容器，全章围绕它。"
+      },
+      {
+        "symbol": "CachedRequestState",
+        "why": "worker 端请求快照，新请求/恢复请求的载体。"
+      },
+      {
+        "symbol": "BatchUpdateBuilder",
+        "why": "removed/added/moved 记录器，slot 复用与压实的索引真相源。"
+      },
+      {
+        "symbol": "pop_removed",
+        "why": "返回最小空 slot——slot 复用的关键调用。"
+      },
+      {
+        "symbol": "peek_removed",
+        "why": "condense 找最小空洞。"
+      },
+      {
+        "symbol": "removed_append",
+        "why": "remove 打洞的登记入口。"
+      },
+      {
+        "symbol": "add_request",
+        "why": "把请求写进 slot（含采样参数列）。"
+      },
+      {
+        "symbol": "_register_add_request",
+        "why": "pop_removed 复用最小空 slot 的实现点。"
+      },
+      {
+        "symbol": "remove_request",
+        "why": "打洞标记移除；与 condense 配对。"
+      },
+      {
+        "symbol": "condense",
+        "why": "压实空洞使 [0, num_reqs) 连续。"
+      },
+      {
+        "symbol": "swap_states",
+        "why": "重排时的行交换（只交换活跃前缀）。"
+      },
+      {
+        "symbol": "_get_active_token_count",
+        "why": "活跃前缀长度的定义（搬移/交换只拷前缀）。"
+      },
+      {
+        "symbol": "refresh_metadata",
+        "why": "批次变更后重建采样元数据的收尾。"
+      },
+      {
+        "symbol": "update_req_spec_token_ids",
+        "why": "spec draft 占位写行（写回闭环的 spec 分支）。"
+      },
+      {
+        "symbol": "token_ids_cpu",
+        "why": "持久全长 token 缓冲——收集与搬移的对象。"
+      },
+      {
+        "symbol": "num_tokens_no_spec",
+        "why": "活跃 token 计数，收集/搬移/写回的前缀长度。"
+      },
+      {
+        "symbol": "num_computed_tokens_cpu",
+        "why": "位置计算与 seq_lens 的基准，跨拍累积。"
+      },
+      {
+        "symbol": "num_prompt_tokens",
+        "why": "prompt/output 分界列。"
+      },
+      {
+        "symbol": "req_id_to_index",
+        "why": "req_id→slot 映射，增量调和的索引基础。"
+      },
+      {
+        "symbol": "block_table",
+        "why": "持久批次内的 KV 块表（对象）。"
+      },
+      {
+        "symbol": "MultiGroupBlockTable",
+        "why": "按 KV group 持多块表的封装。"
+      },
+      {
+        "symbol": "BlockTable",
+        "why": "单 group 块表，CPU/GPU 双镜像。"
+      },
+      {
+        "symbol": "append_row",
+        "why": "向块表行追加新块号（老请求差量）。"
+      },
+      {
+        "symbol": "add_row",
+        "why": "重置并写入块表行（新增/恢复请求）。"
+      },
+      {
+        "symbol": "move_row",
+        "why": "condense 时同步搬块表行。"
+      },
+      {
+        "symbol": "clear_row",
+        "why": "remove 打洞时清块表行。"
+      },
+      {
+        "symbol": "commit_block_table",
+        "why": "块表 CPU→GPU 镜像前缀拷贝（先行重叠）。"
+      },
+      {
+        "symbol": "compute_slot_mapping",
+        "why": "启动 Triton kernel 算物理 slot（数学 → ch22，入口保留）。"
+      },
+      {
+        "symbol": "CpuGpuBuffer",
+        "why": "固定双端缓冲——本章标题之一。"
+      },
+      {
+        "symbol": "copy_to_gpu",
+        "why": "活跃前缀 non_blocking 上载语义。"
+      },
+      {
+        "symbol": "_make_buffer",
+        "why": "runner 持久缓冲的分配入口。"
+      },
+      {
+        "symbol": "input_ids",
+        "why": "持久缓冲（收集输出）。"
+      },
+      {
+        "symbol": "positions",
+        "why": "持久缓冲（每 token 绝对位置）。"
+      },
+      {
+        "symbol": "query_start_loc",
+        "why": "CU 偏移 + 非递减 pad。"
+      },
+      {
+        "symbol": "seq_lens",
+        "why": "每请求序列长（attention metadata 用）。"
+      },
+      {
+        "symbol": "num_computed_tokens",
+        "why": "runner 侧每请求已算数（GPU 端 positions 基准）。"
+      },
+      {
+        "symbol": "req_indices",
+        "why": "np.repeat 展开的每 token 请求索引。"
+      },
+      {
+        "symbol": "query_pos",
+        "why": "请求内偏移缓冲。"
+      },
+      {
+        "symbol": "arange_np",
+        "why": "预分配 arange 源（缓存复用）。"
+      },
+      {
+        "symbol": "_get_cumsum_and_arange",
+        "why": "CU 偏移与请求内 arange 的原地展开。"
+      },
+      {
+        "symbol": "index_select",
+        "why": "token 收集的实际算子（扁平索引）。"
+      },
+      {
+        "symbol": "_may_reorder_batch",
+        "why": "attention backend 重排钩子。"
+      },
+      {
+        "symbol": "prev_sampled_token_ids",
+        "why": "异步写回：采样 token 留 GPU 的缓存槽。"
+      },
+      {
+        "symbol": "prev_req_id_to_index",
+        "why": "上一拍索引快照（异步影子状态）。"
+      },
+      {
+        "symbol": "SchedulerOutput",
+        "why": "差量协议载体。"
+      },
+      {
+        "symbol": "NewRequestData",
+        "why": "新请求全量字段。"
+      },
+      {
+        "symbol": "CachedRequestData",
+        "why": "老请求 diff 字段（含 resumed 语义）。"
+      },
+      {
+        "symbol": "scheduled_new_reqs",
+        "why": "协议字段：全量。"
+      },
+      {
+        "symbol": "scheduled_cached_reqs",
+        "why": "协议字段：diff。"
+      },
+      {
+        "symbol": "num_scheduled_tokens",
+        "why": "协议字段：token 账。"
+      },
+      {
+        "symbol": "total_num_scheduled_tokens",
+        "why": "协议字段：总 token 账（可变性裁决的裁剪对象）。"
+      },
+      {
+        "symbol": "finished_req_ids",
+        "why": "协议字段：worker 清缓存通知。"
+      },
+      {
+        "symbol": "new_block_ids",
+        "why": "协议字段：块差量（append/替换分叉）。"
+      },
+      {
+        "symbol": "resumed_req_ids",
+        "why": "协议字段：resumed 语义分叉的标记集。"
+      },
+      {
+        "symbol": "update_scheduler_for_invalid_drafts",
+        "why": "可变性裁决的就地裁剪实现（本章要讲的 v0.27 机制）。"
+      },
+      {
+        "symbol": "GPUModelRunner",
+        "why": "本章舞台类。"
+      }
+    ]
+  },
+  "foreshadow_due": {
+    "should_plant": [],
+    "should_payoff": [],
+    "note": "v3 伏笔真相源 = pedagogy-plan.foreshadows：本章（no=18）无应埋/应回收项。衔接注（非登记伏笔）：(1) 固定地址是 ch19『编译与捕获』CUDA graph 回放的地基（M14/ch18-m14 桥接）；(2) block_table 双镜像的 position→slot Triton 数学归 ch22（本章只到双镜像与先行拷贝）；(3) 异步写回 prev_sampled_token_ids 深讲已在 ch12；(4) SchedulerOutput 差量协议的上游（调度器为何只发 diff）已由 ch10/ch12 立过，本章是 worker 侧对偶半边。"
+  },
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/core/sched/output.py",
+      "lines": "L192-L212",
+      "what": "SchedulerOutput 差量协议头：新请求全量 vs 老请求只发 diff 的注释原文（协议二分）+ token 账字段。",
+      "code": "@dataclass\nclass SchedulerOutput:\n    # list of the requests that are scheduled for the first time.\n    # We cache the request's data in each worker process, so that we don't\n    # need to re-send it every scheduling step.\n    scheduled_new_reqs: list[NewRequestData]\n    # list of the requests that have been scheduled before.\n    # Since the request's data is already cached in the worker processes,\n    # we only send the diff to minimize the communication cost.\n    scheduled_cached_reqs: CachedRequestData\n\n    # req_id -> num_scheduled_tokens\n    # Number of tokens scheduled for each request.\n    num_scheduled_tokens: dict[str, int]\n    # Total number of tokens scheduled for all requests.\n    # Equal to sum(num_scheduled_tokens.values())\n    total_num_scheduled_tokens: int\n    # req_id -> spec_token_ids\n    # If a request does not have any spec decode tokens, it will not be\n    # included in the dictionary.\n    scheduled_spec_decode_tokens: dict[str, list[int]]",
+      "elide": [
+        "L213-L269 其余字段各归其主：spec/encoder/connector/零块/CoW——正文按需点名（new_block_ids_to_zero L256 与 kv_cache_block_copies L259 在 §调和 一句话带过）"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/output.py",
+      "lines": "L115-L130",
+      "what": "CachedRequestData 字段群：resumed 语义注释（append vs 整体替换）、new_block_ids/num_computed_tokens——『老请求只发 diff』的具体形状。",
+      "code": "@dataclass\nclass CachedRequestData:\n    req_ids: list[str]\n    # For request ids not in resumed_req_ids, new_block_ids will be appended to\n    # the request's block IDs. For those in the set, new_block_ids will be used as the\n    # request's block IDs instead of appending to the existing block IDs.\n    resumed_req_ids: set[str]\n    # NOTE(woosuk): new_token_ids is only used for pipeline parallelism.\n    # When PP is not used, new_token_ids will be empty.\n    new_token_ids: list[list[int]]\n    # MRV1-only: For requests not scheduled in the last step, propagate the token ids\n    # to the connector. Won't contain requests scheduled in the prior step.\n    all_token_ids: dict[str, list[int]]\n    new_block_ids: list[tuple[list[int], ...] | None]\n    num_computed_tokens: list[int]\n    num_output_tokens: list[int]",
+      "elide": [
+        "L122-L127 new_token_ids（仅 PP 用，首末 stage 无直连时 scheduler 送回采样 token）与 all_token_ids（MRV1-only）——分布式边角，正文一句话点名"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L4180-L4195",
+      "what": "execute_model 入口的可变性裁决：ngram-GPU 开启时先 replace() 浅拷贝 num_scheduled_tokens/scheduled_spec_decode_tokens 两个 dict——因为后面（§调和内）会就地裁剪它们，先护住引擎进程侧的原件。注释自评 replace 远快于 deepcopy。",
+      "code": "        # If ngram_gpu is used, we need to copy the scheduler_output to avoid\n        # the modification has influence on the scheduler_output in engine core process.\n        # The replace is much faster than deepcopy.\n        if (\n            self.speculative_config is not None\n            and self.speculative_config.use_ngram_gpu()\n        ):\n            num_scheduled_tokens_copy = scheduler_output.num_scheduled_tokens.copy()\n            spec_decode_tokens_copy = (\n                scheduler_output.scheduled_spec_decode_tokens.copy()\n            )\n            scheduler_output = replace(\n                scheduler_output,\n                num_scheduled_tokens=num_scheduled_tokens_copy,\n                scheduled_spec_decode_tokens=spec_decode_tokens_copy,\n            )",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/spec_decode/ngram_proposer_gpu.py",
+      "lines": "L475-L515",
+      "what": "可变性裁决的另一端：update_scheduler_for_invalid_drafts 在 GPU 产出的每请求有效 draft 数（异步 D2H 事件同步）指导下就地裁剪 scheduler_output——token 账（total/num_scheduled_tokens）与 scheduled_spec_decode_tokens 双双回退。这是全代码库罕见的『worker 改写调度器输出』点。",
+      "code": "def update_scheduler_for_invalid_drafts(\n    num_valid_draft_tokens_event: torch.cuda.Event,\n    num_valid_draft_tokens_cpu: torch.Tensor,\n    scheduler_output: \"SchedulerOutput\",\n    req_id_to_index: dict[str, int],\n) -> None:\n    \"\"\"Trim invalid speculative slots using per-request valid draft counts.\n\n    Args:\n        num_valid_draft_tokens_event: Event for async D2H completion.\n        num_valid_draft_tokens_cpu: CPU buffer of valid draft counts.\n        scheduler_output: Scheduler metadata to update in-place.\n        req_id_to_index: Request-id to batch-index mapping.\n    \"\"\"\n    req_data = scheduler_output.scheduled_cached_reqs\n    num_valid_draft_tokens_event.synchronize()\n\n    for req_id in req_data.req_ids:\n        req_index = req_id_to_index.get(req_id)\n        if req_index is None:\n            continue\n\n        spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)\n        if spec_token_ids is None:\n            continue\n\n        scheduled_k = len(spec_token_ids)\n\n        valid_k = int(num_valid_draft_tokens_cpu[req_index].item())\n        valid_k = max(0, min(valid_k, scheduled_k))\n\n        tokens_to_trim = scheduled_k - valid_k\n        scheduler_output.total_num_scheduled_tokens -= tokens_to_trim\n        scheduler_output.num_scheduled_tokens[req_id] -= tokens_to_trim\n\n        if valid_k == 0:\n            scheduler_output.scheduled_spec_decode_tokens.pop(req_id, None)\n        else:\n            scheduler_output.scheduled_spec_decode_tokens[req_id] = spec_token_ids[\n                :valid_k\n            ]",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L1202-L1217",
+      "what": "_update_states 第一段：移除已完成请求——先出 self.requests 全量缓存，再出持久批次（remove_request 打洞）。NOTE 记录 abort 后同 ID 重提交的边界：视为两个不同请求。",
+      "code": "        # Remove finished requests from the cached states.\n        for req_id in scheduler_output.finished_req_ids:\n            req_state = self.requests.pop(req_id, None)\n            self._on_request_state_removed(req_id, req_state)\n            self.num_prompt_logprobs.pop(req_id, None)\n        self.late_interaction_runner.on_requests_finished(\n            scheduler_output.finished_req_ids\n        )\n        # Remove the finished requests from the persistent batch.\n        # NOTE(woosuk): There could be an edge case where finished_req_ids and\n        # scheduled_req_ids overlap. This happens when a request is aborted and\n        # then resubmitted with the same ID. In this case, we treat them as two\n        # distinct requests - clearing the cached states for the first request\n        # and handling the second as a new request.\n        for req_id in scheduler_output.finished_req_ids:\n            self.input_batch.remove_request(req_id)",
+      "elide": [
+        "L1207-L1209 late_interaction_runner（迟交互池化路径）；L1219-L1231 新块 GPU 置零/块级 CoW 拷贝/encoder cache 释放——三个 v0.27 差量动作，正文各一句话带过"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L1233-L1253",
+      "what": "_update_states 第二段：移除未调度请求（被抢占或本拍未排）——出批次但保留 self.requests 缓存（未来还会回来）。末尾 NOTE(woosuk) 是持久批次的核心假设自白：批次间高重叠，否则本优化非常低效。",
+      "code": "        # Remove the unscheduled requests from the persistent batch.\n        # NOTE(woosuk): The unscheduled requests are either preempted requests\n        # or running requests that are not scheduled in this step. We remove\n        # them from the persistent batch but keep their cached states since\n        # they will be scheduled again sometime in the future.\n        scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()\n        cached_req_ids = self.input_batch.req_id_to_index.keys()\n        resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids\n        # NOTE(zhuohan): cached_req_ids and resumed_req_ids are usually disjoint,\n        # so `(scheduled_req_ids - resumed_req_ids) == scheduled_req_ids` holds\n        # apart from the forced-preemption case in reset_prefix_cache. And in\n        # that case we include the resumed_req_ids in the unscheduled set so\n        # that they get cleared from the persistent batch before being re-scheduled\n        # in the normal resumed request path.\n        unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)\n        # NOTE(woosuk): The persistent batch optimization assumes that\n        # consecutive batches contain mostly the same requests. If batches\n        # have low request overlap (e.g., alternating between two distinct\n        # sets of requests), this optimization becomes very inefficient.\n        for req_id in unscheduled_req_ids:\n            self.input_batch.remove_request(req_id)",
+      "elide": [
+        "L1240-L1246 resumed_req_ids 与 reset_prefix_cache 强制抢占的集合差注释——保留要旨：unscheduled = cached - (scheduled - resumed)"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L1295-L1310",
+      "what": "_update_states 第三段（核心）：为 scheduled_new_reqs 构造 CachedRequestState 存入 self.requests——worker 缓存请求全量的落点。此后该请求只需差量。",
+      "code": "            req_state = CachedRequestState(\n                req_id=req_id,\n                prompt_token_ids=new_req_data.prompt_token_ids,\n                prompt_embeds=new_req_data.prompt_embeds,\n                prompt_is_token_ids=new_req_data.prompt_is_token_ids,\n                mm_features=new_req_data.mm_features,\n                sampling_params=sampling_params,\n                pooling_params=pooling_params,\n                generator=generator,\n                block_ids=new_req_data.block_ids,\n                num_computed_tokens=new_req_data.num_computed_tokens,\n                output_token_ids=[],\n                lora_request=new_req_data.lora_request,\n            )\n            self.requests[req_id] = req_state\n            self.late_interaction_runner.register_request(req_id, pooling_params)",
+      "elide": [
+        "上游 L1266-L1294：streaming 同 req_id 复用分支、RANDOM_SEED generator 构造、pooling 模型 pooler 更新——特性分支",
+        "下游 L1312-L1330：prompt_logprobs 登记、M-RoPE/XD-RoPE 初始化、ngram_gpu 新请求跟踪——特性分支"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L1441-L1474",
+      "what": "_update_states 第四段：老请求差量调和——num_computed_tokens 就地覆盖；new_block_ids：常规 append 进 req_state.block_ids，resumed（抢占恢复）则整体替换（协议注释的消费者）；不在批次内的入 reqs_to_add 等落位。",
+      "code": "            # Update the block IDs.\n            if not resumed_from_preemption:\n                if new_block_ids is not None:\n                    # Append the new blocks to the existing block IDs.\n                    for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):\n                        block_ids.extend(new_ids)\n            else:\n                assert req_index is None\n                assert new_block_ids is not None\n                # The request is resumed from preemption.\n                # Replace the existing block IDs with the new ones.\n                req_state.block_ids = new_block_ids\n\n            if req_index is None:\n                # The request is not in the persistent batch.\n                # The request was either preempted and resumed later, or was not\n                # scheduled in the previous step and needs to be added again.\n\n                if self.use_async_scheduling and num_output_tokens > 0:\n                    # We must recover the output token ids for resumed requests in the\n                    # async scheduling case, so that correct input_ids are obtained.\n                    resumed_token_ids = req_data.all_token_ids[req_id]\n                    req_state.output_token_ids = resumed_token_ids[-num_output_tokens:]\n\n                reqs_to_add.append(req_state)\n                # Track resumed requests for ngram_gpu full tensor copy\n                if is_ngram_gpu:\n                    ngram_gpu_new_reqs.append(req_state)\n                continue\n\n            # Update the persistent batch.\n            self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens\n            if new_block_ids is not None:\n                self.input_batch.block_table.append_row(new_block_ids, req_index)",
+      "elide": [
+        "L1408-L1439（本段之前）：非末 PP rank 的 token 回填与 KV-load 失败回滚对齐——分布式边角",
+        "L1459-L1463 异步调度恢复请求的 output_token_ids 重建分支——ch12 已立，一句话点名",
+        "L1476-L1499（本段之后）：非末 PP rank 补写 token_ids_cpu 增量——PP 专用，末 rank 由采样直接写"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L1509-L1520",
+      "what": "_update_states 收尾四连：reqs_to_add 逐个 add_request（小空洞优先被复用）→ condense 压实 → _may_reorder_batch（注意力后端可重排）→ refresh_metadata（重建采样元数据）。",
+      "code": "        # Add the new or resumed requests to the persistent batch.\n        # The smaller empty indices are filled first.\n        for request in reqs_to_add:\n            self.input_batch.add_request(request)\n            self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)\n\n        # Condense the batched states if there are gaps left by removed requests\n        self.input_batch.condense()\n        # Allow attention backend to reorder the batch, potentially\n        self._may_reorder_batch(scheduler_output)\n        # Refresh batch metadata with any pending updates.\n        self.input_batch.refresh_metadata()",
+      "elide": [
+        "L1522-L1532 ngram-GPU GPU 张量镜像增量更新（update_ngram_gpu_tensors_incremental）——drafter 侧镜像维护，正文点名即可；L1534-L1566 async spec decode 乐观纠偏闭包——ch12/ch33 边角"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_input_batch.py",
+      "lines": "L324-L348",
+      "what": "_register_add_request：slot 复用的机制核心——优先弹出最小『已移除空 slot』（pop_removed），没有才追加到末尾。同时把 (index, 采样参数, token) 记进 added 供 logitsprocs 重建状态。",
+      "code": "    def _register_add_request(self, request: \"CachedRequestState\") -> int:\n        \"\"\"Track add-request operations for logits processors.\n        Not applicable to pooling models.\n        \"\"\"\n\n        # Fill the next empty index if there is one.\n        if (new_req_index := self.batch_update_builder.pop_removed()) is None:\n            # Append to end otherwise.\n            new_req_index = self.num_reqs\n\n        assert new_req_index < self.max_num_reqs\n        self.batch_update_builder.batch_changed = True\n        if request.sampling_params:\n            # Detailed added request metadata is only required for non-pooling\n            # models, to support logitsprocs.\n            self.batch_update_builder.added.append(\n                (\n                    new_req_index,\n                    request.sampling_params,\n                    request.prompt_token_ids,\n                    request.output_token_ids,\n                )\n            )\n\n        return new_req_index",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/worker/gpu_input_batch.py",
+      "lines": "L354-L398",
+      "what": "add_request 写入核心：req_index 落位（复用或追加）→ 把 prompt/output token 写进 token_ids_cpu 该 slot 行 → 记 num_prompt_tokens/num_tokens_no_spec/num_computed_tokens_cpu 三列 → block_table.add_row。展示『一行 = 一个请求的全长 token 缓冲』内存布局。",
+      "code": "        req_index = self._register_add_request(request)\n\n        req_id = request.req_id\n        if req_index == len(self._req_ids):\n            self._req_ids.append(req_id)\n            self.req_output_token_ids.append(request.output_token_ids)\n            self.spec_token_ids.append([])\n        else:\n            self._req_ids[req_index] = req_id\n            self.req_output_token_ids[req_index] = request.output_token_ids\n            self.spec_token_ids[req_index].clear()\n\n        self.req_id_to_index[req_id] = req_index\n\n        # Copy the prompt token ids and output token ids.\n        num_prompt_tokens = length_from_prompt_token_ids_or_embeds(\n            request.prompt_token_ids, request.prompt_embeds\n        )\n        self.num_prompt_tokens[req_index] = num_prompt_tokens\n        start_idx = num_prompt_tokens\n        end_idx = start_idx + len(request.output_token_ids)\n        if request.prompt_token_ids is not None:\n            self.token_ids_cpu[req_index, :num_prompt_tokens] = request.prompt_token_ids\n            if request.prompt_is_token_ids is not None:\n                self.is_token_ids[req_index, :num_prompt_tokens] = (\n                    request.prompt_is_token_ids\n                )\n            else:\n                self.is_token_ids[req_index, :num_prompt_tokens] = True\n        else:\n            self.is_token_ids[req_index, :num_prompt_tokens] = False\n        if request.prompt_embeds is not None:\n            self.req_prompt_embeds[req_index] = request.prompt_embeds\n        self.token_ids_cpu[req_index, start_idx:end_idx] = request.output_token_ids\n        self.is_token_ids[req_index, start_idx:end_idx] = True\n        # Number of tokens without spec decode tokens.\n        self.num_tokens_no_spec[req_index] = request.num_tokens\n\n        if self.use_replayssm:\n            # Ring origin = full context at (re)admission (prompt + any resumed\n            # output), so a resumed request re-anchors past the prompt.\n            self.replayssm_decode_base[req_index] = request.num_tokens\n\n        self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens\n        self.block_table.add_row(request.block_ids, req_index)",
+      "elide": [
+        "L357-L364 _req_ids 追加 vs 复用两分支的列表簿记（req_output_token_ids/spec_token_ids 同步）",
+        "L377-L388 prompt_is_token_ids/prompt_embeds 混合模式标记——多模态边角",
+        "L392-L395 use_replayssm（Mamba 环形起点）——Mamba 专用",
+        "L400-L499 采样参数装填（temperature/top_p/top_k/penalties/generators/logprobs/allowed_token_ids/bad_words/LoRA）+ pooling 分支——结构对称，正文摘要『把该请求全部采样参数写进对应 slot 列』"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_input_batch.py",
+      "lines": "L530-L548",
+      "what": "remove_request：移除只是『打洞标记 + 解绑映射 + 清块表行』，不搬数据。docstring 明言 must always be followed by condense()——配 condense 成『先打洞、批末统一压实』两段式。",
+      "code": "    def remove_request(self, req_id: str) -> int | None:\n        \"\"\"This method must always be followed by a call to condense().\n\n        Args:\n          req_id: request to remove\n\n        Returns:\n          Removed request index, or `None` if `req_id` not recognized\n        \"\"\"\n\n        req_index = self.req_id_to_index.pop(req_id, None)\n        if req_index is None:\n            return None\n\n        self.batch_update_builder.removed_append(req_index)\n        self._req_ids[req_index] = None\n        self.req_output_token_ids[req_index] = None\n        self.spec_token_ids[req_index].clear()\n        self.block_table.clear_row(req_index)",
+      "elide": [
+        "L550-L583 LoRA 解绑、pooling 早退、各采样参数集合 discard、prev_req_id_to_index 清理——对称清理，摘要即可"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_input_batch.py",
+      "lines": "L718-L743",
+      "what": "condense 骨架：removed 已被 add 填平则零成本早退；空批次早退；NOTE 假设 removed 降序；双指针（最大活索引 last_req_index 从尾降、最小空洞 peek_removed 从头取）把尾部活请求滑入前部空洞，使 [0, num_reqs) 连续。",
+      "code": "        num_reqs = self.num_reqs\n\n        if not (empty_req_indices := self.batch_update_builder.removed):\n            # All removed requests were replaced by added requests, or else no\n            # requests were removed at all. No condense() needed\n            return\n        if num_reqs == 0:\n            # The batched states are empty.\n            self._req_ids.clear()\n            self.req_output_token_ids.clear()\n            self.spec_token_ids.clear()\n            return\n\n        # NOTE(woosuk): This function assumes that the empty_req_indices\n        # is sorted in descending order.\n        last_req_index = num_reqs + len(empty_req_indices) - 1\n        while empty_req_indices:\n            # Find the largest non-empty index.\n            while last_req_index in empty_req_indices:\n                last_req_index -= 1\n\n            # Find the smallest empty index.\n            empty_index = self.batch_update_builder.peek_removed()\n            assert empty_index is not None\n            if empty_index >= last_req_index:\n                break",
+      "elide": [
+        "L745-L833 while 循环体逐列搬移（token_ids_cpu 只拷 num_tokens 活跃前缀、块表 move_row、采样参数列、generator/bad_words）——对称搬移，正文讲清『只拷活跃前缀』即可",
+        "L835-L838 尾部列表截断到 num_reqs"
+      ]
+    },
+    {
+      "path": "vllm/v1/utils.py",
+      "lines": "L110-L149",
+      "what": "CpuGpuBuffer 全文：cpu（pinned）+ gpu + np 三视图一体的固定形状双端缓冲；copy_to_gpu(n) 只传活跃前缀、non_blocking。全 runner per-step 张量的地址稳定器。",
+      "code": "class CpuGpuBuffer:\n    \"\"\"Buffer to easily copy tensors between CPU and GPU.\"\"\"\n\n    def __init__(\n        self,\n        *size: int | torch.SymInt,\n        dtype: torch.dtype,\n        device: torch.device,\n        pin_memory: bool = PIN_MEMORY,\n        with_numpy: bool = True,\n    ) -> None:\n        # these buffers are mutable runtime state, so allocate them as normal\n        with torch.inference_mode(False):\n            self.cpu = torch.zeros(\n                *size, dtype=dtype, device=\"cpu\", pin_memory=pin_memory\n            )\n            self.gpu = torch.zeros_like(self.cpu, device=device)\n        self.np: np.ndarray\n        # To keep type hints simple (avoiding generics and subclasses), we\n        # only conditionally create the numpy array attribute. This can cause\n        # AttributeError if `self.np` is accessed when `with_numpy=False`.\n        if with_numpy:\n            if dtype == torch.bfloat16:\n                raise ValueError(\n                    \"Bfloat16 torch tensors cannot be directly cast to a \"\n                    \"numpy array, so call CpuGpuBuffer with with_numpy=False\"\n                )\n            self.np = self.cpu.numpy()\n\n    def copy_to_gpu(self, n: int | None = None) -> torch.Tensor:\n        if n is None:\n            return self.gpu.copy_(self.cpu, non_blocking=True)\n        return self.gpu[:n].copy_(self.cpu[:n], non_blocking=True)\n\n    def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:\n        \"\"\"NOTE: Because this method is non-blocking, explicit synchronization\n        is needed to ensure the data is copied to CPU.\"\"\"\n        if n is None:\n            return self.cpu.copy_(self.gpu, non_blocking=True)\n        return self.cpu[:n].copy_(self.gpu[:n], non_blocking=True)",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L763-L810",
+      "what": "GPUModelRunner.__init__ 的持久缓冲块（首行注释 'Persistent buffers for CUDA graphs'）：input_ids/positions/query_start_loc/seq_lens/num_computed_tokens/prev_num_draft_tokens/req_indices/prev_positions/num_scheduled_tokens 等一次分配——地址从此永不变。",
+      "code": "        # Persistent buffers for CUDA graphs.\n        self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)\n        self.positions = torch.zeros(\n            self.max_num_tokens, dtype=torch.int64, device=self.device\n        )\n        self.query_start_loc = self._make_buffer(\n            self.max_num_reqs + 1, dtype=torch.int32\n        )\n        self.seq_lens = torch.zeros(\n            self.max_num_reqs, dtype=torch.int32, device=self.device\n        )\n        self.optimistic_seq_lens_cpu = torch.zeros(\n            self.max_num_reqs, dtype=torch.int32, pin_memory=PIN_MEMORY\n        )\n        self.num_computed_tokens = torch.zeros(\n            self.max_num_reqs, dtype=torch.int32, device=self.device\n        )\n        self.prev_num_draft_tokens = self._make_buffer(\n            self.max_num_reqs, dtype=torch.int32\n        )\n        self.req_indices = self._make_buffer(self.max_num_tokens, dtype=torch.int64)\n        # Maps current batch position -> previous batch position (-1 for new reqs)\n        self.prev_positions = self._make_buffer(self.max_num_reqs, dtype=torch.int64)\n        self.num_scheduled_tokens = self._make_buffer(\n            self.max_num_reqs, dtype=torch.int32\n        )\n\n        self.encoder_seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)\n        if self.dcp_world_size > 1:\n            self.dcp_local_seq_lens = self._make_buffer(\n                self.max_num_reqs, dtype=torch.int32\n            )\n        # Because inputs_embeds may be bfloat16 and we don't need a numpy\n        # version of this tensor, avoid a RuntimeError by not creating a\n        # numpy buffer.\n        self.inputs_embeds = self._make_buffer(\n            self.max_num_tokens, self.inputs_embeds_size, dtype=self.dtype, numpy=False\n        )\n        self.is_token_ids = self._make_buffer(self.max_num_tokens, dtype=torch.bool)\n        self.discard_request_mask = self._make_buffer(\n            self.max_num_reqs, dtype=torch.bool\n        )\n        self.num_decode_draft_tokens = self._make_buffer(\n            self.max_num_reqs, dtype=torch.int32\n        )\n        self.num_accepted_tokens = self._make_buffer(\n            self.max_num_reqs, dtype=torch.int32\n        )",
+      "elide": [
+        "L790-L794 encoder_seq_lens 与 dcp_local_seq_lens（encoder-decoder/CP 边角）",
+        "L795-L810 inputs_embeds/is_token_ids/discard_request_mask/num_decode_draft_tokens/num_accepted_tokens——同批分配的同类缓冲，点名即可",
+        "（后接）L812-L845 mrope/xdrope 特例与 arange 缓存（'Cache the arange tensors rather than creating them every step'）——正文一句话"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L1977-L2024",
+      "what": "_prepare_inputs 收集主段：第一句 commit_block_table（H2D 与 CPU 计算重叠）→ np.repeat 把 [2,5,3] 展开成 req_indices → _get_cumsum_and_arange 产 cu_num_tokens 与请求内偏移 → positions_np = num_computed + 偏移 → token_indices = positions + req_index·M（二维坐标编一维扁平索引）→ torch.index_select 一次收齐 input_ids（注释实测远快于 np.take）。",
+      "code": "        # OPTIMIZATION: Start copying the block table first.\n        # This way, we can overlap the copy with the following CPU operations.\n        self.input_batch.block_table.commit_block_table(num_reqs)\n\n        # Get request indices.\n        # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]\n        req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)\n\n        # cu_num_tokens: [2, 5, 3] -> [2, 7, 10]\n        # self.query_pos.np[:10]: [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]\n        cu_num_tokens = self._get_cumsum_and_arange(\n            num_scheduled_tokens, self.query_pos.np\n        )\n\n        # Get positions.\n        positions_np = (\n            self.input_batch.num_computed_tokens_cpu[req_indices]\n            + self.query_pos.np[: cu_num_tokens[-1]]\n        )\n\n        # Calculate M-RoPE positions.\n        # Only relevant for models using M-RoPE (e.g, Qwen2-VL)\n        if self.uses_mrope:\n            self._calc_mrope_positions(scheduler_output)\n\n        # Calculate XD-RoPE positions.\n        # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)\n        if self.uses_xdrope_dim > 0:\n            self._calc_xdrope_positions(scheduler_output)\n\n        # Get token indices.\n        # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]\n        # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]\n        # where M is the max_model_len.\n        token_indices = (\n            positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]\n        )\n        token_indices_tensor = torch.from_numpy(token_indices)\n\n        # NOTE(woosuk): We use torch.index_select instead of np.take here\n        # because torch.index_select is much faster than np.take for large\n        # tensors.\n        torch.index_select(\n            self.input_batch.token_ids_cpu_tensor.flatten(),\n            0,\n            token_indices_tensor,\n            out=self.input_ids.cpu[:total_num_scheduled_tokens],\n        )",
+      "elide": [
+        "L1997-L2005 M-RoPE/XD-RoPE position 计算——多模态",
+        "L2025-L2070 prompt_embeds 的 is_token_ids 收集与逐请求 embeds 填充——prompt_embeds 特性"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L2072-L2090",
+      "what": "query_start_loc 装配：CU 偏移 + 尾部 pad 成非递减（FlashAttention 等 kernel 的要求）——固定形状缓冲的尾部 pad 惯例；optimistic_seq_lens_cpu 乐观序列长（假定上拍 draft 全接受，异步 spec decode 影子状态）。",
+      "code": "        # Prepare the attention metadata.\n        self.query_start_loc.np[0] = 0\n        self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens\n        # Note: pad query_start_loc to be non-decreasing, as kernels\n        # like FlashAttention requires that\n        self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])\n        self.query_start_loc.copy_to_gpu()\n        query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]\n\n        # Compute optimistic seq_lens (assumes all draft tokens from previous\n        # iteration accepted). Store in optimistic_seq_lens_cpu for use by\n        # _build_attention_metadata (max_seq_len) and discard_request_mask.\n        # seq_lens (GPU) will be computed later using the same optimistic values.\n        torch.add(\n            self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],\n            torch.from_numpy(num_scheduled_tokens),\n            out=self.optimistic_seq_lens_cpu[:num_reqs],\n        )\n        self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)",
+      "elide": [
+        "L2092-L2105 prev_positions 映射与 discard_request_mask——异步 spec decode 影子状态（ch12 已立），一句话点名"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L2188-L2209",
+      "what": "_prepare_inputs 收束：GPU 端算最终 positions（num_computed_tokens[req_indices_gpu] + query_pos.gpu）与 seq_lens → block_table.compute_slot_mapping（position→物理 slot 的 Triton 数学 → ch22）→ _prepare_input_ids 前缀上载（固定地址 copy_to_gpu）。",
+      "code": "        self.positions[:total_num_scheduled_tokens] = (\n            self.num_computed_tokens[req_indices_gpu].to(torch.int64)\n            + self.query_pos.gpu[:total_num_scheduled_tokens]\n        )\n        self.seq_lens[:num_reqs] = (\n            self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu\n        )\n        self.seq_lens[num_reqs:].fill_(0)\n\n        self.input_batch.block_table.compute_slot_mapping(\n            num_reqs,\n            self.query_start_loc.gpu[: num_reqs + 1],\n            self.positions[:total_num_scheduled_tokens],\n        )\n\n        # Copy the tensors to the GPU.\n        self._prepare_input_ids(\n            scheduler_output,\n            num_reqs,\n            total_num_scheduled_tokens,\n            cu_num_tokens,\n        )",
+      "elide": [
+        "L2211-L2230 mrope/xdrope GPU 拷贝与漂移修正——多模态/异步 spec 边角",
+        "L2232-L2277 spec_decode 元数据构建与 LoRA 热切换——投机章/ch17 边角"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L3815-L3846",
+      "what": "_bookkeeping_sync 写回循环：采样 token 写进 token_ids_cpu 对应 slot 行（start_idx=num_tokens_no_spec）、num_tokens_no_spec 前移、req_state.output_token_ids 增长——持久批次自产自销，注释明言『scheduler 不需要送回』（PP 例外）。异步调度时行内只写占位 -1、真 token 留 GPU（prev_sampled_token_ids）。",
+      "code": "        # Cache the sampled tokens in the model runner, so that the scheduler\n        # doesn't need to send them back.\n        # NOTE(woosuk): As an exception, when using PP, the scheduler sends\n        # the sampled tokens back, because there's no direct communication\n        # between the first-stage worker and the last-stage worker.\n        req_ids = self.input_batch.req_ids\n        for req_idx in range(num_sampled_tokens):\n            if self.use_async_scheduling:\n                sampled_ids = [-1] if req_idx not in invalid_req_indices_set else None\n            else:\n                sampled_ids = valid_sampled_token_ids[req_idx]\n\n            num_sampled_ids: int = len(sampled_ids) if sampled_ids else 0\n\n            if not sampled_ids:\n                continue\n\n            start_idx = self.input_batch.num_tokens_no_spec[req_idx]\n            end_idx = start_idx + num_sampled_ids\n            assert end_idx <= self.max_model_len, (\n                \"Sampled token IDs exceed the max model length. \"\n                f\"Total number of tokens: {end_idx} > max_model_len: \"\n                f\"{self.max_model_len}\"\n            )\n\n            self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids\n            self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True\n            self.input_batch.num_tokens_no_spec[req_idx] = end_idx\n\n            req_id = req_ids[req_idx]\n            req_state = self.requests[req_id]\n            req_state.output_token_ids.extend(sampled_ids)",
+      "elide": [
+        "L3797-L3813（本段之前）异步分支：token 留 GPU 缓存进 prev_sampled_token_ids + prev_req_id_to_index 快照——ch12 已立，本章引用为『持久批次在默认心跳下的配套』",
+        "L3829-L3838 空 sampled_ids 跳过与 max_model_len 断言——正文带过"
+      ]
+    }
+  ]
+}
