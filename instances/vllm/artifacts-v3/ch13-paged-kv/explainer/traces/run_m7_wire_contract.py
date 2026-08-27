@@ -149,9 +149,12 @@ def main():
     full1 = b1.get_block_ids()
     zero1 = sched._get_new_block_ids_to_zero()  # uniform 单组 → None
     new_data1 = sched.make_new_reqs_data([r1], {r1.request_id: b1})
+    # 过线快照：真实两进程经 IPC 序列化（天然拷贝）；单进程 driver 手工快照，
+    # 防 worker 侧 extend 就地改动共享 list 污染记录
+    wire1_snapshot = [list(x) for x in new_data1[0].block_ids]
     partA.append({
         "beat": "1 新请求 r1（33 token）",
-        "wire_new_reqs_block_ids": new_data1[0].block_ids,
+        "wire_new_reqs_block_ids": wire1_snapshot,
         "wire_payload": "全量块表 ([1,2,3],) + prompt_token_ids 33 个 + num_computed_tokens——首帧整箱装备",
         "worker_mirror_after": None,
         "page_table_row": None,
@@ -161,7 +164,7 @@ def main():
     runner._update_states(sched_output(new_data1, cached_data([], [], []), {"r1": 33}, zero1))
     row1 = runner.input_batch.req_id_to_index["r1"]
     partA[-1]["worker_mirror_after"] = [list(x) for x in runner.requests["r1"].block_ids]
-    partA[-1]["page_table_row"] = list(runner.input_batch.block_table.block_table.np[row1][:3])
+    partA[-1]["page_table_row"] = [int(x) for x in runner.input_batch.block_table.block_table.np[row1][:3]]
 
     # 拍1.5：在跑请求无新块 → allow_none=True → None（不占带宽）
     r1.status = RequestStatus.RUNNING
@@ -185,9 +188,8 @@ def main():
     })
     runner._update_states(sched_output([], cd2, {"r1": 16}, None))
     partA[-1]["worker_mirror_after"] = [list(x) for x in runner.requests["r1"].block_ids]
-    partA[-1]["page_table_row"] = list(
-        runner.input_batch.block_table.block_table.np[row1][:4]
-    )
+    partA[-1]["page_table_row"] = [int(x) for x in
+        runner.input_batch.block_table.block_table.np[row1][:4]]
     partA[-1]["num_blocks_per_row"] = int(runner.input_batch.block_table.num_blocks_per_row[row1])
     partA[-1]["mirror_note"] = "差量：block_ids[0].extend([4]) + block_table.append_row([4], row0)——行内偏移由 num_blocks_per_row 记账"
 
@@ -198,16 +200,17 @@ def main():
         [r1], [], {r1.request_id: 1}, {r1.request_id: empty}
     )
     new_data2 = sched.make_new_reqs_data([r2], {r2.request_id: b3})
+    wire2_snapshot = [list(x) for x in new_data2[0].block_ids]
     partA.append({
         "beat": "3 新请求 r2（16 token）",
-        "wire_new_reqs_block_ids": new_data2[0].block_ids,
+        "wire_new_reqs_block_ids": wire2_snapshot,
         "same_frame_cached_new_block_ids": [str(x) for x in cd3_running.new_block_ids],
         "note": "同一帧里 r2 全量 ([5],)、r1 增量 None——两种包裹同帧过江",
     })
     runner._update_states(sched_output(new_data2, cd3_running, {"r1": 1, "r2": 16}, None))
     row2 = runner.input_batch.req_id_to_index["r2"]
-    partA[-1]["page_table_row_r2"] = list(runner.input_batch.block_table.block_table.np[row2][:1])
-    partA[-1]["page_table_row_r1"] = list(runner.input_batch.block_table.block_table.np[row1][:4])
+    partA[-1]["page_table_row_r2"] = [int(x) for x in runner.input_batch.block_table.block_table.np[row2][:1]]
+    partA[-1]["page_table_row_r1"] = [int(x) for x in runner.input_batch.block_table.block_table.np[row1][:4]]
 
     # m15 证据：commit 只拷活跃行
     bt = runner.input_batch.block_table
@@ -216,7 +219,7 @@ def main():
     m15 = {
         "scene": "2 个活跃请求（行 0/1），行 3 被 CPU 侧写脏但不活跃",
         "commit_active_rows": 2,
-        "gpu_row0_after": bt.block_table.gpu[0][:4].tolist(),
+        "gpu_row0_after": [int(x) for x in bt.block_table.gpu[0][:4]],
         "gpu_row3_after": int(bt.block_table.gpu[3][0].item()),
         "cpu_row3": int(bt.block_table.cpu[3][0].item()),
         "first_line_anchor": "_prepare_inputs 第一句就是 commit_block_table（gpu_model_runner.py:L1977-L1979，注释原话 OPTIMIZATION: Start copying the block table first … overlap the copy with the following CPU operations）",
@@ -246,6 +249,7 @@ def main():
     for name, kv in runner2.kv_caches.items():
         kv.view(torch.int32).fill_(7)
     new_datab = sched2.make_new_reqs_data([rb], {rb.request_id: bb})
+    wireb_snapshot = [list(x) for x in new_datab[0].block_ids]
     runner2._update_states(sched_output(new_datab, cached_data([], [], []), {"rb": 33}, zb))
     spec0 = runner2.kv_cache_config.kv_cache_groups[0].kv_cache_spec
     spec1 = runner2.kv_cache_config.kv_cache_groups[1].kv_cache_spec
@@ -258,7 +262,7 @@ def main():
 
     partB = {
         "config": "两组混合精度（fp16 + fp32）→ needs_kv_cache_zeroing=True（kv_cache_interface.py:L1013-L1022）",
-        "wire_new_reqs_block_ids": [list(x) for x in ids2],
+        "wire_new_reqs_block_ids": wireb_snapshot,
         "new_block_ids_to_zero_beat1": zb,
         "stale_bytes_before": 7,
         "stale_note": "块从自由队列回收，上一任主人留下的字节还躺在显存里（注释原话 to prevent stale NaN/data from corrupting attention or SSM computation，gpu_model_runner.py:L1219-L1222）",
@@ -293,12 +297,12 @@ def main():
     row_c = runner3.input_batch.req_id_to_index["rc"]
     before_preempt = {
         "rc_block_ids": [list(x) for x in runner3.requests["rc"].block_ids],
-        "page_table_row": list(runner3.input_batch.block_table.block_table.np[row_c][:1]),
+        "page_table_row": [int(x) for x in runner3.input_batch.block_table.block_table.np[row_c][:1]],
     }
     # 抢占（ch11 外部行为；块侧两件事：free 全部块 + computed 归零）
     sched3._preempt_request(rc)
-    # worker 侧同步清档（真实由 preempted_req_ids 通知——本章 facet 手工模拟）
-    runner3.requests.pop("rc")
+    # worker 侧摘批（真实由 preempted_req_ids 通知——本章 facet 手工模拟；
+    # CachedRequestState 留在 requests 里，恢复时复用——真实语义如此）
     runner3.input_batch.remove_request("rc")
     # 恢复：重算整段（17 token → 2 块）
     rc.status = RequestStatus.PREEMPTED
@@ -310,7 +314,8 @@ def main():
     runner3._update_states(sched_output([], cdr, {"rc": 17}, None))
     partC = {
         "before_preempt": before_preempt,
-        "preempt_freed": [4, 1],
+        "preempt_freed": [1],
+        "preempt_note": "rc 原持 [1]（1 块）；逆序归还挂队尾，恢复重算 17 token 拿到新鲜块 [2,3]",
         "resumed_wire": {
             "resumed_req_ids": list(cdr.resumed_req_ids),
             "new_block_ids": [str(x) for x in cdr.new_block_ids],
@@ -330,8 +335,8 @@ def main():
     assert cd2.new_block_ids == [([4],)]
     assert new_data2[0].block_ids == ([5],)
     assert m15["gpu_row3_after"] == 0 and m15["gpu_row0_after"] == [1, 2, 3, 4]
-    assert partA[1]["worker_mirror_after"] == [[1, 2, 3, 4]]
-    assert partA[2]["page_table_row_r1"] == [1, 2, 3, 4]
+    assert partA[2]["worker_mirror_after"] == [[1, 2, 3, 4]]
+    assert partA[3]["page_table_row_r1"] == [1, 2, 3, 4]
     assert padded[2][0].item() == 0 and padded[3][0].item() == 0
     assert ids2 == ([1, 2, 3], [4, 5, 6]) and zb == [1, 2, 3, 4, 5, 6]
     assert partB["after_zero"]["layer0_block1_nonzero"] == 0
@@ -339,8 +344,8 @@ def main():
     assert partB["after_zero"]["layer0_block0_nonzero_stale_kept"] > 0
     assert partB["drain_semantics"]["second_call"] is None
     assert before_preempt["rc_block_ids"] == [[1]]
-    assert resumed_ids == ([4, 1],)
-    assert partC["worker_after"]["rc_block_ids"] == [[4, 1]]
+    assert resumed_ids == ([2, 3],)
+    assert partC["worker_after"]["rc_block_ids"] == [[2, 3]]
 
     dst = Path(__file__).resolve().parent / "m7_wire_contract.json"
     with open(dst, "w", encoding="utf-8", newline="\n") as f:

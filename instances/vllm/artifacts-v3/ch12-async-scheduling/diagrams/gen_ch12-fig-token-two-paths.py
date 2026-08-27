@@ -60,7 +60,7 @@ lc.text(FX + 16, LANE_Y0 + 22, '快路 · 留 GPU（零拷贝）——喂下一�
         True, maxw=LANE_W - 30, tag='f:t')
 FAST_BOXES = [
     ('prev_sampled_token_ids', ['与采样张量 is 同一对象 = True', '整张张量原样缓存在 GPU', '（L3802 注释：avoid CPU sync）']),
-    ('下一拍 input_ids.gpu', ['首位 = 7（批A 采出的 token', '直接变成批B 的输入）', 'CPU 侧同期行 = [1,2,-1,-1]']),
+    ('下一拍 input_ids.gpu（e2e 例）', ['首位 = 7——e2e 拍2 例的数字', '（m10 快路例里同位是 9）', 'CPU 侧同期行 = [1,2,-1,-1]']),
 ]
 fbx = FX + 18
 fbw = (LANE_W - 36 - 20) / 2

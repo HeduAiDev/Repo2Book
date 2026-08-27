@@ -81,6 +81,15 @@ def collect(root):
                 anchor = el.get('text-anchor', 'start')
                 s = ''.join(el.itertext()).strip()
                 if s:
+                    # 白 halo 叠层（gen_L2 2026-08-27 起：被连线穿出的文字在流层之上补
+                    # 「白描边同字 + 原样重绘」两层，均带 data-halo="1"，连线在文字处
+                    # 视觉断开）——与正文孪生同位同宽，是渲染叠层而非独立内容：不收集，
+                    # 否则 text-text/tag-on-title 把每对 halo 判成自撞。正文孪生照常全量
+                    # 检查（白描边层兜底识别 fill=stroke=#ffffff，防他处手写漏标）。
+                    if (el.get('data-halo') or (el.get('fill') == '#ffffff'
+                                                and el.get('stroke') == '#ffffff')):
+                        stack.extend((ch, ctx) for ch in el)
+                        continue
                     w = text_w(s, size)
                     x0 = x - w / 2 if anchor == 'middle' else (x - w if anchor == 'end' else x)
                     texts.append({'s': s, 'x0': x0, 'x1': x0 + w, 'yt': y - 0.78 * size,

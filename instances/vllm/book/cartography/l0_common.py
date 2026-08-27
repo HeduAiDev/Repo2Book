@@ -104,11 +104,11 @@ def seg(x1, y1, x2, y2, color, sw=1.8, marker=None, dash=False):
 
 
 def parrow(pts, color, sw=1.8, marker='std', dash=False):
-    """折线箭头：pts = [(x,y),...]"""
+    """折线箭头：pts = [(x,y),...]；marker=None 表示无箭头（连线用）"""
     d = ' stroke-dasharray="6,4"' if dash else ''
+    m = f' marker-end="url(#{marker})"' if marker else ''
     path = ' '.join(f'{"M" if i == 0 else "L"}{p[0]:.1f},{p[1]:.1f}' for i, p in enumerate(pts))
-    s = (f'<path d="{path}" fill="none" stroke="{color}" stroke-width="{sw}"{d} '
-         f'marker-end="url(#{marker})"/>')
+    s = (f'<path d="{path}" fill="none" stroke="{color}" stroke-width="{sw}"{d}{m}/>')
     xs_ = [p[0] for p in pts]
     ys_ = [p[1] for p in pts]
     ELEMS.append(((min(xs_) - 8, min(ys_) - 8, max(xs_) + 8, max(ys_) + 8), s))
