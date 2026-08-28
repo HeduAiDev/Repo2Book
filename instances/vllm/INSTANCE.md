@@ -98,3 +98,4 @@ ch04（async-engine，`vllm/v1/engine/`）：
 ## 本章地图(2026-07-09 全量生效)
 - 36 章每章开篇均有「本章地图」源码剖面图(diagrams/chapter-map.{py,svg,png}):入口→真实符号走线→出口、§/标题词讲解站牌、底部阅读路线;正文在开篇导航与 hook 段后插图引+选读指引。
 - 门禁:lint_chapter_map --require(徽标↔标题/符号防杜撰/画布预算 宽≤1500 比例≤2.6:1/开篇位置+指引)已进质量闸门;新章由 chapter-pipeline Map 站保证;重编号后重跑受影响章 gen 脚本再渲染(引擎已重写 §号,见补章 SOP §4)。
+- **rsvg-convert 坏桩**(2026-08-29):exit 49 零输出且不报错不写文件(与 python3 WindowsApps 坏桩同族)——画图转 PNG 一律降级 cairosvg(`python -c "import cairosvg;cairosvg.svg2png(url='X.svg',write_to='X.png',scale=2)`,尺寸/字体与 rsvg 一致),渲染后必须字节比对/mtime 验证 PNG 真更新。

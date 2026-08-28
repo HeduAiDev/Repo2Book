@@ -27,6 +27,9 @@ color: purple
    `diagrams/gen_<figure_id>.py` —— 全部坐标由循环/常量计算,零手写魔数;文本全 esc()。
 2. 渲染:`python3 gen_<id>.py` → `xmllint --noout <id>.svg` →
    `rsvg-convert -z 2 <id>.svg -o <id>.png`(勿用 ImageMagick convert,丢中文/错位)。
+   ⚠️ **本机 rsvg-convert 已坏**(2026-08-29 实锤:WindowsApps 坏桩,exit 49 零输出且**不报错不写文件**——曾致「已渲好」误报)——改用 cairosvg:
+   `python -c "import cairosvg;cairosvg.svg2png(url='<id>.svg',write_to='<id>.png',scale=2)"`(尺寸/字体与 rsvg 一致)。
+   无论用哪个渲染器,**必须验证 PNG 真更新**(字节比对或 mtime),不许信「命令返回了=渲好了」。
 3. **用 Read 工具打开 <id>.png 亲眼看**,按 skill v2 六项逐项如实判定:
    claim_readable_10s / numbers_match_spec(逐个数字对 spec)/ no_overlap /
    arrows_attached / cjk_rendered / reading_order_clear。

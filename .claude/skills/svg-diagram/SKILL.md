@@ -15,7 +15,7 @@ description: >
 # SVG Diagram Generator v2 — 画一张"好图"的完整方案
 
 一张好图 = **论点 + 数据 + 版式 + 双重验收**。本 skill 定义从 figure-spec 到验收的全流程。
-渲染管线不变:Python 生成 SVG → xmllint 校验 → rsvg-convert 转 PNG。
+渲染管线不变:Python 生成 SVG → xmllint 校验 → rsvg-convert 转 PNG(本机 rsvg-convert 坏桩 exit 49 时降级 cairosvg:python -c "import cairosvg;cairosvg.svg2png(url='X.svg',write_to='X.png',scale=2)",并字节比对确认 PNG 真更新——坏桩不报错不写文件)。
 
 ## Step 0:先有 figure-spec,再动笔(无 spec 不绘图)
 
@@ -85,7 +85,7 @@ L.append('</svg>')
 python3 gen_<figure_id>.py                       # 生成 <figure_id>.svg
 xmllint --noout <figure_id>.svg                  # 1a. XML 语法
 python3 .claude/skills/svg-diagram/scripts/validate_svg.py <figure_id>.svg  # 1b. 语义(双转义/裁剪/缺箭头)
-rsvg-convert -z 2 <figure_id>.svg -o <figure_id>.png   # 勿用 ImageMagick convert(丢中文/错位)
+rsvg-convert -z 2 <figure_id>.svg -o <figure_id>.png   # 勿用 ImageMagick convert(丢中文/错位);本机坏桩时降级 cairosvg(scale=2,见上)
 ```
 
 2. **视觉自查(必须做,没看过渲染结果的图 = 未完成)**:用 Read 工具打开 **PNG**(不是 SVG),
